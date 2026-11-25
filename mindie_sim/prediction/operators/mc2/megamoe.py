@@ -28,14 +28,35 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Geometry, OperatorPlan, PlannedRecipe, Work
 from ...ownership import read_role, unit_group
 from ...program import KernelProgram, ParallelProgram, Stage
 from ..grouped_moe.lowering import element_bytes, mx_scale_bytes
 
+TARGET_BACKEND = "ascend"
+_OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/mega_moe/op_kernel/arch35/mega_moe_layered.h",
+        source_sha256="1b26cc064e7b3916bda2ac480a785cb2405b5e1787e0f571b2a0f588b64c2fea",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/mega_moe/op_kernel/arch22/mega_moe.cpp",
+        source_sha256="0a8d7824e28e93aef07c4c2b67a50afdc29989bd55820e397d3580d88baecd4c",
+    ),
+)
+
 RECIPE = "megamoe_arch35"
 NATIVE_KIND = "aclnnMegaMoe"
+MSD_INT4_PASSES = 2
+MSD_MERGE_OPS_PER_ELEM = 3
+_INT4_WEIGHT_FORMATS = frozenset({"int4", "w4a8"})
 
 #: Stock shipping CANN ``dispatch_ffn_combine`` / ``aclnnMegaMoe`` activations.
 #: Custom gated variants (``situ``, ``situglu``, ``swigluoai``, ``geglu``,
@@ -47,6 +68,7 @@ EXTENDED_ABI_ACTIVATIONS = frozenset({
 })
 SUPPORTED_ACTIVATIONS = SHIPPING_SUPPORTED_ACTIVATIONS
 ALL_ACTIVATIONS = SHIPPING_SUPPORTED_ACTIVATIONS | EXTENDED_ABI_ACTIVATIONS
+_ELEMENTWISE_ACTIVATIONS = frozenset({"gelu", "gelu_tanh"})
 FUSED_MC2_ROUTED_MODE = 2
 FUSED_MC2_SHARED_MODE = 3
 SUPPORTED_FUSED_MC2_MODES = frozenset({0, FUSED_MC2_ROUTED_MODE, FUSED_MC2_SHARED_MODE})
@@ -117,26 +139,68 @@ def _effective_l2(geometry: Geometry) -> float:
 _UNQUANTIZED_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"})
 
 
+def _gmm2_in_dim(inter: int, activation: str) -> int:
+    """Elementwise activations preserve ``2 * inter``; gated activations halve to ``inter``."""
+    return 2 * inter if str(activation or "").lower() in _ELEMENTWISE_ACTIVATIONS else inter
+
+
 def _mx_row_bytes(elements: int, payload_dtype: str) -> float:
-    """Packed operand row: payload elements plus E8M0 MX scales when quantized."""
+    """Packed operand row: payload plus per-token FP32 (INT8) or E8M0 MX scales."""
     if elements <= 0:
         return 0.0
     dt = str(payload_dtype or "fp8_e4m3").lower()
     payload = element_bytes(elements, dt)
-    scales = 0 if dt in _UNQUANTIZED_DTYPES else mx_scale_bytes(elements)
-    return float(payload + scales)
+    if dt in _UNQUANTIZED_DTYPES:
+        return float(payload)
+    if dt == "int8":
+        return float(payload + FP32_BYTES)
+    return float(payload + mx_scale_bytes(elements))
+
+
+def _merge_matrix_flops_entries(*entries: tuple[str, float]) -> dict[str, float]:
+    """Sum physical Cube FLOPs across one or more ``(dtype, flops)`` entries."""
+    matrix: dict[str, float] = {}
+    for dtype_name, flops in entries:
+        if flops > 0.0:
+            matrix[dtype_name] = matrix.get(dtype_name, 0.0) + flops
+    return matrix
 
 
 def _merge_matrix_flops(
     routed_dt: str, routed_flops: float, shared_dt: str, shared_flops: float,
 ) -> dict[str, float]:
     """Combine routed and optional shared Cube FLOPs under their own operand dtypes."""
-    matrix: dict[str, float] = {}
-    if routed_flops > 0.0:
-        matrix[routed_dt] = routed_flops
-    if shared_flops > 0.0:
-        matrix[shared_dt] = matrix.get(shared_dt, 0.0) + shared_flops
-    return matrix
+    return _merge_matrix_flops_entries((routed_dt, routed_flops), (shared_dt, shared_flops))
+
+
+def _is_w4a8_msd(meta: Mapping[str, Any]) -> bool:
+    """Return True when a grouped GEMM uses Arch22 INT8 activation x INT4 weight MSD."""
+    return (
+        str(meta.get("activation_format") or "").lower() == "int8"
+        and str(meta.get("weight_format") or "").lower() in _INT4_WEIGHT_FORMATS
+    )
+
+
+def _resolve_megamoe_precisions(spec: Mapping[str, Any], comp_dt: str, sh_inter: int) -> dict[str, Any]:
+    """Resolve independent GMM1/GMM2 and shared-expert precision ABIs and MSD flags."""
+    g1_msd = bool(spec.get("gmm1_msd_w4a8", False))
+    g2_msd = bool(spec.get("gmm2_msd_w4a8", False))
+    g1_act_dt = str(spec.get("gmm1_compute_dtype") or comp_dt)
+    g2_act_dt = str(spec.get("gmm2_compute_dtype") or comp_dt)
+    g1_dt = "int4" if g1_msd else g1_act_dt
+    g2_dt = "int4" if g2_msd else g2_act_dt
+    sh_g1_dt = str(spec.get("shared_compute_dtype") or g1_dt) if sh_inter > 0 else g1_dt
+    sh_g2_dt = (
+        str(spec.get("shared_gmm2_compute_dtype") or spec.get("shared_compute_dtype") or g2_dt)
+        if sh_inter > 0 else g2_dt
+    )
+    return {
+        "g1_msd": g1_msd, "g2_msd": g2_msd,
+        "g1_act_dt": "int8" if g1_msd else g1_act_dt,
+        "g2_act_dt": "int8" if g2_msd else g2_act_dt,
+        "g1_dt": g1_dt, "g2_dt": g2_dt,
+        "sh_g1_dt": sh_g1_dt, "sh_g2_dt": sh_g2_dt,
+    }
 
 
 def _check_buffers(geometry: Geometry) -> dict[str, int]:
@@ -235,6 +299,11 @@ def make_op(
     shared_w13_bytes: float = 0.0,
     shared_w2_bytes: float = 0.0,
     shared_compute_dtype: str | None = None,
+    gmm1_compute_dtype: str | None = None,
+    gmm2_compute_dtype: str | None = None,
+    shared_gmm2_compute_dtype: str | None = None,
+    gmm1_msd_w4a8: bool = False,
+    gmm2_msd_w4a8: bool = False,
     allow_abi_extension: bool = False,
     activation_params: Mapping[str, Any] | None = None,
     extra_metadata: tuple[tuple[str, Any], ...] = (),
@@ -250,12 +319,26 @@ def make_op(
         raise ModelingError(f"megamoe_arch35_unsupported_fused_mc2:{mc2_mode}")
     tok, width, inter, k_sel = max(0, int(tokens)), max(1, int(hidden)), max(1, int(moe_inter)), max(1, int(top_k))
     r_rows, shape = max(0.0, float(routed_rows)), (max(0, int(tokens)), max(1, int(hidden)))
-    routed_flops = 2.0 * r_rows * width * (2 * inter) + 2.0 * r_rows * inter * width
+    gmm2_in = _gmm2_in_dim(inter, act)
+    r_gmm1_flops = 2.0 * r_rows * width * (2 * inter)
+    r_gmm2_flops = 2.0 * r_rows * gmm2_in * width
     sh_inter = int(shared_inter) if mc2_mode == FUSED_MC2_SHARED_MODE else 0
-    sh_comp_dt = str(shared_compute_dtype or compute_dtype) if sh_inter > 0 else compute_dtype
-    shared_flops = (2.0 * tok * width * (2 * sh_inter) + 2.0 * tok * sh_inter * width if sh_inter > 0 else 0.0)
-    total_flops = routed_flops + shared_flops
-    matrix_flops_map = _merge_matrix_flops(compute_dtype, routed_flops, sh_comp_dt, shared_flops)
+    sh_gmm2_in = _gmm2_in_dim(sh_inter, act) if sh_inter > 0 else 0
+    s_gmm1_flops = 2.0 * tok * width * (2 * sh_inter) if sh_inter > 0 else 0.0
+    s_gmm2_flops = 2.0 * tok * sh_gmm2_in * width if sh_inter > 0 else 0.0
+    total_flops = r_gmm1_flops + r_gmm2_flops + s_gmm1_flops + s_gmm2_flops
+    g1_msd, g2_msd = bool(gmm1_msd_w4a8), bool(gmm2_msd_w4a8)
+    g1_dt = "int4" if g1_msd else str(gmm1_compute_dtype or compute_dtype)
+    g2_dt = "int4" if g2_msd else str(gmm2_compute_dtype or compute_dtype)
+    sh_comp_dt = str(shared_compute_dtype or g1_dt) if sh_inter > 0 else g1_dt
+    sh_g2_dt = str(shared_gmm2_compute_dtype or shared_compute_dtype or g2_dt) if sh_inter > 0 else g2_dt
+    r_gmm1_phys = r_gmm1_flops * (MSD_INT4_PASSES if g1_msd else 1)
+    r_gmm2_phys = r_gmm2_flops * (MSD_INT4_PASSES if g2_msd else 1)
+    matrix_flops_map = _merge_matrix_flops_entries(
+        (g1_dt, r_gmm1_phys), (g2_dt, r_gmm2_phys),
+        (sh_comp_dt, s_gmm1_flops), (sh_g2_dt, s_gmm2_flops),
+    )
+    physical_flops = sum(matrix_flops_map.values())
     out_elem = float(dtype_bytes(output_dtype))
     in_aiv_bytes = float(tok * (width * out_elem + k_sel * (FP32_BYTES + INT32_BYTES)))
     out_aiv_bytes = float(tok * width * out_elem)
@@ -265,10 +348,15 @@ def make_op(
     mte3_b, hbm_b = out_aiv_bytes, mte2_b + out_aiv_bytes
     has_ep_comm = mc2_mode >= FUSED_MC2_ROUTED_MODE and int(ep) > 1
     link_b = (float(dispatch_link_bytes) + float(combine_link_bytes)) if has_ep_comm else 0.0
+    msd_merge_ops = (
+        (r_rows * (2 * inter) * MSD_MERGE_OPS_PER_ELEM if g1_msd else 0.0)
+        + (r_rows * width * MSD_MERGE_OPS_PER_ELEM if g2_msd else 0.0)
+    )
     vec_ops = (
         float(tok * width * MX_QUANT_OPS_PER_ELEM)
-        + (r_rows * inter + (tok * sh_inter if sh_inter > 0 else 0.0)) * _activation_ops(act)
+        + (r_rows * gmm2_in + (tok * sh_gmm2_in if sh_inter > 0 else 0.0)) * _activation_ops(act)
         + float(tok * width * (k_sel * COMBINE_REDUCE_OPS_PER_ELEM + (1 if sh_inter > 0 else 0)))
+        + msd_merge_ops
     )
     ep_axis, ep_collective = str(group_axis or "ep"), str(collective or "alltoall")
     megamoe_geo: dict[str, Any] = {
@@ -279,7 +367,15 @@ def make_op(
         "output_dtype": output_dtype, "dispatch_link_bytes": float(dispatch_link_bytes),
         "combine_link_bytes": float(combine_link_bytes), "shared_intermediate": sh_inter,
         "shared_w13_bytes": sh_w13_b, "shared_w2_bytes": sh_w2_b,
+        **({"logical_flops": total_flops} if g1_msd or g2_msd else {}),
+        **({"gmm1_compute_dtype": gmm1_compute_dtype}
+           if gmm1_compute_dtype and gmm1_compute_dtype != compute_dtype else {}),
+        **({"gmm2_compute_dtype": gmm2_compute_dtype}
+           if gmm2_compute_dtype and gmm2_compute_dtype != compute_dtype else {}),
         **({"shared_compute_dtype": sh_comp_dt} if sh_inter > 0 and sh_comp_dt != compute_dtype else {}),
+        **({"shared_gmm2_compute_dtype": sh_g2_dt} if sh_inter > 0 and sh_g2_dt != sh_comp_dt else {}),
+        **({"gmm1_msd_w4a8": True} if g1_msd else {}),
+        **({"gmm2_msd_w4a8": True} if g2_msd else {}),
     }
     if has_ep_comm:
         megamoe_geo["group_axis"] = ep_axis
@@ -295,11 +391,13 @@ def make_op(
         peer_volume_basis=peer_volume_basis, dispatch_peer_traffic=dispatch_peer_traffic,
         combine_peer_traffic=combine_peer_traffic, act=act, extra_metadata=extra_metadata,
     )
+    if g1_msd or g2_msd:
+        spec_meta["logical_flops"] = total_flops
     return OpSpec(
         op_id=op_id, deps=deps, family="grouped_gemm", recipe=RECIPE,
         phase=phase, stage=stage, layer=layer, requests=requests,
         semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
-        dtype=output_dtype, flops=total_flops, matrix_flops=tuple(matrix_flops_map.items()),
+        dtype=output_dtype, flops=physical_flops, matrix_flops=tuple(matrix_flops_map.items()),
         vector_ops=vec_ops, hbm_bytes=hbm_b, mte2_bytes=mte2_b, mte3_bytes=mte3_b,
         link_bytes=link_b, source_boundary="kernel", metadata=tuple(sorted(spec_meta.items())),
     )
@@ -383,9 +481,8 @@ def _build_megamoe_program(
     disp_wire, comb_wire = _resolve_phase_links(context, disp_link, comb_link)
 
     def per_core(core: int):
-        aiv_idx = min(aiv_units - 1, 2 * core if aiv_units >= 2 * cores else core)
         aic_owned = context.owned(core, cores, ("cube", "mte1", "fixpipe", c_aic_pipe))
-        aiv_owned = context.owned(aiv_idx, aiv_units, ("vector", c_aiv_pipe, "mte3"))
+        aiv_owned = context.owned(core, cores, ("vector", c_aiv_pipe, "mte3"))
         allocs = tuple(
             context.allocate(
                 f"megamoe_{core}_{pool}", pool, size,
@@ -467,7 +564,7 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     w13 = float(spec.get("w13_bytes", 2.0 * inter * width))
     w2 = float(spec.get("w2_bytes", width * inter))
     sh_inter = int(spec.get("shared_intermediate", 0)) if mc2_mode == FUSED_MC2_SHARED_MODE else 0
-    sh_comp_dt = str(spec.get("shared_compute_dtype") or comp_dt) if sh_inter > 0 else comp_dt
+    prec = _resolve_megamoe_precisions(spec, comp_dt, sh_inter)
     sh_w13 = float(spec.get("shared_w13_bytes", 0.0)) if sh_inter > 0 else 0.0
     sh_w2 = float(spec.get("shared_w2_bytes", 0.0)) if sh_inter > 0 else 0.0
     disp_link = (
@@ -484,9 +581,11 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     out_aiv_bytes = float(tok * width * out_elem)
 
     # Routed + optional shared weight/operand reads on AIC; MX rows follow each projection's dtype.
-    mx_row_bytes = _mx_row_bytes(width, comp_dt)
-    inter_mx_bytes = _mx_row_bytes(inter, comp_dt)
-    sh_row_bytes = _mx_row_bytes(width, sh_comp_dt) if sh_inter > 0 else 0.0
+    gmm2_in = _gmm2_in_dim(inter, act)
+    sh_gmm2_in = _gmm2_in_dim(sh_inter, act) if sh_inter > 0 else 0
+    mx_row_bytes = _mx_row_bytes(width, prec["g1_act_dt"])
+    inter_mx_bytes = _mx_row_bytes(gmm2_in, prec["g2_act_dt"])
+    sh_row_bytes = _mx_row_bytes(width, prec["sh_g1_dt"]) if sh_inter > 0 else 0.0
     aic_act_read = r_rows * mx_row_bytes + (tok * sh_row_bytes if sh_inter > 0 else 0.0)
     aic_weight_read = w13 + w2 + sh_w13 + sh_w2
     aic_read_total = aic_act_read + aic_weight_read
@@ -501,30 +600,36 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     gmm2_gm_read = gmm2_read_total
     aic_gm_read = gmm1_gm_read + gmm2_gm_read
 
-    r_gmm1_flops = 2.0 * r_rows * width * (2 * inter)
+    r_gmm1_phys = 2.0 * r_rows * width * (2 * inter) * (MSD_INT4_PASSES if prec["g1_msd"] else 1)
     s_gmm1_flops = 2.0 * tok * width * (2 * sh_inter) if sh_inter > 0 else 0.0
-    r_gmm2_flops = 2.0 * r_rows * inter * width
-    s_gmm2_flops = 2.0 * tok * sh_inter * width if sh_inter > 0 else 0.0
-    gmm1_matrix = _merge_matrix_flops(comp_dt, r_gmm1_flops, sh_comp_dt, s_gmm1_flops)
-    gmm2_matrix = _merge_matrix_flops(comp_dt, r_gmm2_flops, sh_comp_dt, s_gmm2_flops)
+    r_gmm2_phys = 2.0 * r_rows * gmm2_in * width * (MSD_INT4_PASSES if prec["g2_msd"] else 1)
+    s_gmm2_flops = 2.0 * tok * sh_gmm2_in * width if sh_inter > 0 else 0.0
+    gmm1_matrix = _merge_matrix_flops_entries((prec["g1_dt"], r_gmm1_phys), (prec["sh_g1_dt"], s_gmm1_flops))
+    gmm2_matrix = _merge_matrix_flops_entries((prec["g2_dt"], r_gmm2_phys), (prec["sh_g2_dt"], s_gmm2_flops))
     l0_gmm1 = aic_act_read + w13 + sh_w13
     l0_gmm2 = r_rows * inter_mx_bytes + w2 + sh_w2 + (
-        tok * _mx_row_bytes(sh_inter, sh_comp_dt) if sh_inter > 0 else 0.0
+        tok * _mx_row_bytes(sh_gmm2_in, prec["sh_g2_dt"]) if sh_inter > 0 else 0.0
     )
     # GMM1 epilogue writes the quantized activation (data + E8M0 scales) to the GMM2 input
     # workspace (MTE3); GMM2 reads it back on the AIC GM path.  L2 residency only splits tiers.
     act2 = max(0.0, l0_gmm2 - w2 - sh_w2)
     act2_hot = min(act2, l2_cap) if l2_cap > 0.0 else 0.0
     act2_cold = act2 - act2_hot
-    fix_gmm1 = 2.0 * r_rows * inter * BF16_BYTES + (
+    fix_gmm1 = 2.0 * r_rows * inter * BF16_BYTES * (MSD_INT4_PASSES if prec["g1_msd"] else 1) + (
         2.0 * tok * sh_inter * BF16_BYTES if sh_inter > 0 else 0.0
     )
-    fix_gmm2 = r_rows * width * BF16_BYTES + (
+    fix_gmm2 = r_rows * width * BF16_BYTES * (MSD_INT4_PASSES if prec["g2_msd"] else 1) + (
         tok * width * BF16_BYTES if sh_inter > 0 else 0.0
     )
-    act_vec_ops = (r_rows * inter + (tok * sh_inter if sh_inter > 0 else 0.0)) * _activation_ops(act)
+    act_vec_ops = (
+        (r_rows * gmm2_in + (tok * sh_gmm2_in if sh_inter > 0 else 0.0)) * _activation_ops(act)
+        + (r_rows * (2 * inter) * MSD_MERGE_OPS_PER_ELEM if prec["g1_msd"] else 0.0)
+    )
     pack_vec_ops = float(tok * width * MX_QUANT_OPS_PER_ELEM)
-    comb_vec_ops = float(tok * width * (k_sel * COMBINE_REDUCE_OPS_PER_ELEM + (1 if sh_inter > 0 else 0)))
+    comb_vec_ops = (
+        float(tok * width * (k_sel * COMBINE_REDUCE_OPS_PER_ELEM + (1 if sh_inter > 0 else 0)))
+        + (r_rows * width * MSD_MERGE_OPS_PER_ELEM if prec["g2_msd"] else 0.0)
+    )
 
     cores = max(1, int(geometry.compute_units))
     aiv_units = max(1, int((geometry.resource_units or {}).get("vector", 2 * cores)))
@@ -547,8 +652,9 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
         plan_res["l2"] = l2_hit + 2.0 * act2_hot
     if disp_link + comb_link > 0.0:
         plan_res["link"] = disp_link + comb_link
-    matrix_map = _merge_matrix_flops(
-        comp_dt, r_gmm1_flops + r_gmm2_flops, sh_comp_dt, s_gmm1_flops + s_gmm2_flops,
+    matrix_map = _merge_matrix_flops_entries(
+        (prec["g1_dt"], r_gmm1_phys), (prec["g2_dt"], r_gmm2_phys),
+        (prec["sh_g1_dt"], s_gmm1_flops), (prec["sh_g2_dt"], s_gmm2_flops),
     )
     total_work = Work(matrix=matrix_map, resources={k: v for k, v in plan_res.items() if v > 0.0})
 
@@ -731,9 +837,10 @@ def try_lower_fused_frame(
         if (fused_lvl >= FUSED_MC2_SHARED_MODE and not allow_int8_arch22)
         else FUSED_MC2_ROUTED_MODE
     )
-    moe_inter = int(e_down.local_shape[-1])
+    down_k = int(e_down.local_shape[-1])
+    moe_inter = max(1, down_k // 2) if act_kind in _ELEMENTWISE_ACTIVATIONS else down_k
     w13_b = float(up_meta.get("packed_weight_bytes") or max(0.0, e_up.mte2_bytes - received_assignments * width))
-    w2_b = float(down_meta.get("packed_weight_bytes") or max(0.0, e_down.mte2_bytes - received_assignments * moe_inter))
+    w2_b = float(down_meta.get("packed_weight_bytes") or max(0.0, e_down.mte2_bytes - received_assignments * down_k))
     sh_ops = [item for item in ops if item.op_id.startswith(prefix + ".shared.")]
     join_op = by_id.get(prefix + ".join")
     sh_up, sh_down = by_id.get(prefix + ".shared.gate_up"), by_id.get(prefix + ".shared.down")
@@ -787,13 +894,18 @@ def try_lower_fused_frame(
     source_stage = dispatch_meta.get("source_stage", combine_meta.get("source_stage"))
     peer_volume_basis = dispatch_meta.get("peer_volume_basis")
 
+    gmm1_dt = _payload_dtype(up_meta)
+    gmm2_dt = _payload_dtype(down_meta)
     mega_op = make_op(
         op_id=target_id, deps=tuple(mega_deps), stage=unpack.stage, layer=unpack.layer,
         requests=unpack.requests, phase=unpack.phase, tokens=int(tokens), hidden=int(width),
         moe_inter=moe_inter, top_k=int(top_k), routed_rows=float(received_assignments),
         w13_bytes=w13_b, w2_bytes=w2_b,
         enable_fused_mc2=fused_lvl if fuse_shared else FUSED_MC2_ROUTED_MODE,
-        ep=int(ep), activation=act_kind, compute_dtype=_payload_dtype(up_meta), output_dtype=dtype,
+        ep=int(ep), activation=act_kind, compute_dtype=gmm1_dt, output_dtype=dtype,
+        gmm1_compute_dtype=gmm1_dt, gmm2_compute_dtype=gmm2_dt,
+        gmm1_msd_w4a8=(allow_int8_arch22 and _is_w4a8_msd(up_meta)),
+        gmm2_msd_w4a8=(allow_int8_arch22 and _is_w4a8_msd(down_meta)),
         dispatch_link_bytes=float(dispatch.link_bytes), combine_link_bytes=float(combine.link_bytes),
         group_axis=group_axis, collective=collective_family,
         dispatch_peer_traffic=dispatch_meta.get("peer_traffic"),
@@ -801,7 +913,8 @@ def try_lower_fused_frame(
         source_stage=int(source_stage) if source_stage is not None else None,
         peer_volume_basis=str(peer_volume_basis) if peer_volume_basis is not None else None,
         shared_inter=sh_inter, shared_w13_bytes=sh_w13, shared_w2_bytes=sh_w2,
-        shared_compute_dtype=(_payload_dtype(dict(sh_up.metadata)) if fuse_shared else None),
+        shared_compute_dtype=(_payload_dtype(sh_up_meta) if fuse_shared else None),
+        shared_gmm2_compute_dtype=(_payload_dtype(sh_down_meta) if fuse_shared else None),
         allow_abi_extension=allow_ext, activation_params=act_meta.get("activation_params"),
         extra_metadata=(("device_kernel_group", {
             "id": prefix + ".megamoe", "entry": True, "exit": True, "kernel": NATIVE_KIND,

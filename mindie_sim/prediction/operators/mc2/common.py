@@ -45,9 +45,27 @@ GEMM_DIMENSIONS = 3
 MAX_MC2_INTERNAL_CHUNKS = 1024
 ALLREDUCE_PHASE_MULTIPLIER = 2
 DOUBLE_BUFFER_RING_DEPTH = 2
+TARGET_BACKEND = "ascend"
+_OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/all_gather_matmul_v2/op_kernel/arch35/all_gather_quant_bmm.h",
+        source_sha256="3545852317c4123f13137538166a572339d1f848f0ae9a7bce90f01710253cc1",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/matmul_all_reduce/op_host/op_tiling/matmul_all_reduce_tiling_base.cpp",
+        source_sha256="79834c659e17f7b15dfaea84bac12a64ffdd3d9411d6b1df202871f8c518e13d",
+    ),
+)
+A5_AI_CPU = "a5_ai_cpu"
 FLOAT_ROWS = frozenset({"bf16", "fp16"})
 FP8_ROWS = frozenset({"fp8_e4m3", "fp8_e5m2"})
 FP4_ROWS = frozenset({"fp4_e2m1", "fp4"})
+_FLOAT_DTYPE_ALIASES = {"bfloat16": "bf16", "float16": "fp16"}
 AGMM = "all_gather_matmul"
 MMRS = "matmul_reduce_scatter"
 MMAR = "matmul_all_reduce"
@@ -71,9 +89,15 @@ ABI_ALIASES = {
     **{f"mc2_{abi}": abi for abi in NATIVE_ABIS},
 }
 TRANSPORTS = frozenset({
-    "auto", "a2_hccl_client", A2_MTE, "a3_sio_hccs", "a5_shmem", "a5_mte", "a5_ccu", A5_ROCE,
+    "auto", "a2_hccl_client", A2_MTE, "a3_sio_hccs", "a5_shmem", "a5_mte", "a5_ccu", A5_ROCE, A5_AI_CPU,
 })
 ALGORITHMS = frozenset({"fullmesh", "ring", "two_tier", "direct_peer"})
+
+
+def geometry_has_l2(geometry) -> bool:
+    """Return True when the target die profile declares a positive L2 service rate."""
+    rates = getattr(geometry, "rates", None) or {}
+    return bool(float(rates.get("l2", 0.0) or 0.0) > 0.0)
 
 
 def validate_native_dispatch_quant(raw: Mapping) -> None:
@@ -237,6 +261,8 @@ class Mc2Contract:
     cohorts: tuple[Mc2CohortSlice, ...] = ()
     # Each record holds an exact cohort ID, source rank, destination rank and row count.
     assignments: tuple[tuple[int, int, int, int], ...] = ()
+    activation_scale_bytes: int | float = 0
+    weight_scale_bytes: int | float = 0
 
     @property
     def world_size(self) -> int:
@@ -247,18 +273,48 @@ class Mc2Contract:
         if self.abi in COLLECTIVES:
             if self.world_size == 1:
                 return 0
-            mult = ALLREDUCE_PHASE_MULTIPLIER if self.abi == MMAR else 1
-            return mult * (self.world_size - 1) * self.shard_bytes(self.m)
+            if self.abi == MMAR:
+                my_idx = self.ranks.index(self.rank)
+                rs_total = sum(
+                    self.shard_bytes_for_owner(self.m, idx)
+                    for idx in range(self.world_size) if idx != my_idx
+                )
+                ag_total = (self.world_size - 1) * self.shard_bytes_for_owner(self.m, my_idx)
+                return rs_total + ag_total
+            return (self.world_size - 1) * self.shard_bytes(self.m)
         if self.row_layout is None:
             return 0
         framed, _, _, _ = _peer_framing(self, self.transport_abi)
         return sum(cohort.remote_assignments for cohort in self.cohorts) * framed
+
+    def shard_bytes_for_owner(self, rows: int, owner_index: int) -> int | float:
+        if not self.m:
+            return 0
+        if self.world_size == 1:
+            return self.gathered_bytes * rows / self.m
+        if self.abi == MMAR:
+            if self.gathered_bytes % 1:
+                raise ModelingError("mc2_uneven_shard_not_integer")
+            total_bytes = int(self.gathered_bytes) * rows
+            if total_bytes % self.m:
+                raise ModelingError("mc2_uneven_shard_not_integer")
+            row_bytes = total_bytes // self.m
+            elem_bytes = dtype_bytes(self.operand_dtype or self.output_dtype or self.dtype)
+            if elem_bytes >= 1 and row_bytes % int(elem_bytes) == 0:
+                elems = row_bytes // int(elem_bytes)
+                quot, rem = divmod(elems, self.world_size)
+                return (quot + (1 if owner_index < rem else 0)) * int(elem_bytes)
+            quot, rem = divmod(row_bytes, self.world_size)
+            return quot + (1 if owner_index < rem else 0)
+        return self.shard_bytes(rows)
 
     def shard_bytes(self, rows: int) -> int | float:
         if not self.m:
             return 0
         if self.world_size == 1:
             return self.gathered_bytes * rows / self.m
+        if self.abi == MMAR:
+            return self.shard_bytes_for_owner(rows, self.ranks.index(self.rank))
         if self.m % self.world_size or self.gathered_bytes % 1:
             raise ModelingError("mc2_uneven_shard_not_integer")
         shard, remainder = divmod(int(self.gathered_bytes) * rows, self.m * self.world_size)
@@ -561,12 +617,26 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> Mc2Contract:
     handles = fields.get("independent_handles", False)
     if chunks > MAX_MC2_INTERNAL_CHUNKS or type(buffers) is not bool or type(handles) is not bool:
         raise ModelingError("mc2_invalid_chunk_binding")
-    dtype = fields.get("compute_dtype", op.dtype or "bf16")
-    out_dtype = fields.get("output_dtype", op.dtype or "bf16")
+    raw_dtype = fields.get("compute_dtype", op.dtype or "bf16")
+    raw_out = fields.get("output_dtype", op.dtype or "bf16")
+    dtype = _FLOAT_DTYPE_ALIASES.get(str(raw_dtype).lower(), raw_dtype) if isinstance(raw_dtype, str) else raw_dtype
+    out_dtype = _FLOAT_DTYPE_ALIASES.get(str(raw_out).lower(), raw_out) if isinstance(raw_out, str) else raw_out
     contract = Mc2Contract(abi, transport, algorithm, ranks, rank, chunks, buffers, handles, dtype, output_dtype=out_dtype)
     dtype_bytes(dtype)
     dtype_bytes(out_dtype)
     if abi in COLLECTIVES:
+        pabi = getattr(op, "precision_abi", None)
+        raw_weight = fields.get("weight_format") or (getattr(pabi, "weight_dtype", None) if pabi is not None else "")
+        raw_act = fields.get("activation_format") or (getattr(pabi, "input_dtype", None) if pabi is not None else "")
+        weight_fmt = _FLOAT_DTYPE_ALIASES.get(str(raw_weight or "").strip().lower(), str(raw_weight or "").strip().lower())
+        act_fmt = _FLOAT_DTYPE_ALIASES.get(str(raw_act or "").strip().lower(), str(raw_act or "").strip().lower())
+        if abi == MMAR:
+            if dtype not in FLOAT_ROWS or out_dtype != dtype:
+                raise capability_gap(op, ctx, "matmul_all_reduce_requires_matching_float_dtype")
+            if (weight_fmt and weight_fmt != dtype) or (act_fmt and act_fmt != dtype):
+                raise capability_gap(op, ctx, f"matmul_all_reduce_operand_dtype_mismatch:{act_fmt}:{weight_fmt}")
+        if dtype in FLOAT_ROWS and weight_fmt in {"int4", "w4a16", "w4a8"}:
+            raise capability_gap(op, ctx, f"collective_weight_format_unsupported:{weight_fmt}")
         shape = tuple(op.local_shape or op.semantic_shape)
         dims = shape if len(shape) == GEMM_DIMENSIONS else (shape[0] if shape else None, None, shape[-1] if shape else None)
         m = _integer(fields.get("m", fields.get("global_tokens", dims[0])), "m")
@@ -574,10 +644,45 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> Mc2Contract:
         n = _integer(fields.get("n", fields.get("n_dim", dims[-1])), "n")
         operand = fields.get("operand_dtype", fields.get("gather_dtype", dtype if abi == AGMM else out_dtype))
         row_bytes = (k if abi == AGMM else n) * dtype_bytes(operand)
-        gathered = fields.get("gathered_bytes", fields.get("operand_bytes", m * row_bytes))
+        scale_bytes: int | float = 0
+        w_scale_bytes: int | float = 0
+        if abi == AGMM:
+            scale_fmt = str(fields.get("activation_scale_format", "")).lower()
+            is_mx_agmm = (
+                fields.get("quant_mode") == "mx"
+                or scale_fmt in {"fp8_e8m0", "e8m0"}
+                or fields.get("activation_group_size") == MX_GROUP_SIZE
+            )
+            if is_mx_agmm:
+                if "activation_scale_bytes" in fields and fields["activation_scale_bytes"] is not None:
+                    scale_bytes = fields["activation_scale_bytes"]
+                elif k > 0:
+                    scale_bytes = m * align_up(math.ceil(k / MX_GROUP_SIZE), 2)
+                if "weight_scale_bytes" in fields and fields["weight_scale_bytes"] is not None:
+                    w_scale_bytes = fields["weight_scale_bytes"]
+                elif k > 0 and n > 0:
+                    w_scale_bytes = n * align_up(math.ceil(k / MX_GROUP_SIZE), 2)
+            if (
+                type(scale_bytes) not in {int, float}
+                or not math.isfinite(scale_bytes)
+                or scale_bytes < 0
+                or (not m and scale_bytes)
+            ):
+                raise ModelingError("mc2_invalid_activation_scale_bytes")
+            if isinstance(scale_bytes, float) and scale_bytes.is_integer():
+                scale_bytes = int(scale_bytes)
+            if isinstance(w_scale_bytes, float) and w_scale_bytes.is_integer():
+                w_scale_bytes = int(w_scale_bytes)
+        default_gathered = m * row_bytes + scale_bytes
+        if isinstance(default_gathered, float) and default_gathered.is_integer():
+            default_gathered = int(default_gathered)
+        gathered = fields.get("gathered_bytes", fields.get("operand_bytes", default_gathered))
         if type(gathered) not in {int, float} or not math.isfinite(gathered) or gathered < 0 or (not m and gathered):
             raise ModelingError("mc2_invalid_gathered_operand_bytes")
-        contract = replace(contract, m=m, k=k, n=n, gathered_bytes=gathered, operand_dtype=operand)
+        contract = replace(
+            contract, m=m, k=k, n=n, gathered_bytes=gathered, operand_dtype=operand,
+            activation_scale_bytes=scale_bytes, weight_scale_bytes=w_scale_bytes,
+        )
         contract.shard_bytes(m)
         return contract
     if op.recipe == "arch22_v2_caller_local" and "mc2_v2_local" in fields:
@@ -660,19 +765,76 @@ def build_cohort_transport_stages(
 
 
 def _matrix_fragment(contract: Mc2Contract, name: str, after: tuple[str, ...], rows: int,
-                     *, b_bytes: int | float, slot: tuple = (), ub_output: bool = False) -> Phase:
+                     *, b_bytes: int | float, slot: tuple = (), ub_output: bool = False,
+                     has_l2: bool = True) -> Phase:
     a_bytes = (contract.gathered_bytes * rows / contract.m if contract.abi == AGMM and contract.m
                else rows * contract.k * dtype_bytes(contract.dtype))
-    load = read_work(a_bytes + b_bytes, aic=True, l2=True)
+    load = read_work(a_bytes + b_bytes, aic=True, l2=has_l2)
     partial = rows * contract.n * dtype_bytes(contract.output_dtype)
-    write = Work(resources={"fixpipe": partial}) if ub_output else store_work(partial, fixpipe=True, l2=True)
+    write = Work(resources={"fixpipe": partial}) if ub_output else store_work(partial, fixpipe=True, l2=has_l2)
     return Phase(name, after, load + write + Work(
         matrix={contract.dtype: 2 * rows * contract.k * contract.n},
         resources={"mte1": a_bytes + b_bytes}), "aic", slot)
 
 
+def _mmar_chunk_comm(
+    contract: Mc2Contract, transport: Transport, *, comm: str, comm_deps: tuple[str, ...],
+    rows: int, tag: tuple, ub_output: bool, temp_gm: bool, has_l2: bool,
+    publish_dep: str,
+) -> tuple[list[Phase], Phase]:
+    """Emit causally ordered RS -> AIV Reduce -> AG -> output store for one MMAR chunk."""
+    world = contract.world_size
+    routes = transport.routes
+    rank_indices = {member: idx for idx, member in enumerate(contract.ranks)}
+    my_idx = rank_indices[contract.rank]
+    rs_payloads = [(route, contract.shard_bytes_for_owner(rows, rank_indices[route.destination])) for route in routes]
+    own_payload = contract.shard_bytes_for_owner(rows, my_idx)
+    rs_data_bytes = sum(amount for _, amount in rs_payloads)
+    rs_wire_window = sum(transport.peer_bytes(amount) for _, amount in rs_payloads)
+    chunk_phases: list[Phase] = []
+    if temp_gm and rs_wire_window:
+        read = comm + "_hccl_read"
+        temp_res = {"hbm": rs_data_bytes, **({"l2": rs_data_bytes} if has_l2 else {})}
+        chunk_phases.append(Phase(read, comm_deps, Work(resources=temp_res), metadata=tag))
+        comm_deps = (read,)
+    rs_names: list[str] = []
+    for route, amount in rs_payloads:
+        name = f"{comm}_rs_peer_{route.destination}"
+        credit = (rs_names[-transport.credits],) if len(rs_names) >= transport.credits else ()
+        chunk_phases.extend(peer_stages(
+            name, (*comm_deps, *credit), route, transport, amount, tag, couple_gm_bounce=True,
+        ))
+        rs_names.append(name)
+    base_own, rem_own = divmod(rows * contract.n, world)
+    own_elems = base_own + (1 if my_idx < rem_own else 0)
+    own_bytes = own_elems * dtype_bytes(contract.output_dtype)
+    reduced = (world - 1) * own_elems
+    reduce_name = f"{comm}_reduce"
+    reduce_work = (
+        read_work((0 if temp_gm else rs_wire_window) + (0 if ub_output else own_bytes), l2=has_l2)
+        + Work(resources={"vector": reduced})
+        if world > 1 else Work()
+    )
+    chunk_phases.append(Phase(reduce_name, (publish_dep, *rs_names), reduce_work, "aiv", tag))
+    ag_names: list[str] = []
+    for route in routes:
+        ag_name = f"{comm}_ag_peer_{route.destination}"
+        credit = (ag_names[-transport.credits],) if len(ag_names) >= transport.credits else ()
+        chunk_phases.extend(peer_stages(
+            ag_name, (reduce_name, *credit), route, transport, own_payload, tag, couple_gm_bounce=True,
+        ))
+        ag_names.append(ag_name)
+    out_bytes = rows * contract.n * dtype_bytes(contract.output_dtype)
+    store_phase = Phase(
+        comm, (reduce_name, *ag_names),
+        store_work(out_bytes, l2=has_l2) if world > 1 else Work(), "aiv", tag,
+    )
+    return chunk_phases, store_phase
+
+
 def _chunked_stages(contract: Mc2Contract, transport: Transport, *,
-                    ub_output: bool = False, temp_gm: bool = False) -> tuple[Phase, ...]:
+                    ub_output: bool = False, temp_gm: bool = False,
+                    has_l2: bool = True) -> tuple[Phase, ...]:
     gathering = contract.abi == AGMM
     all_reducing = contract.abi == MMAR
     chunks = contract.internal_chunks
@@ -682,11 +844,20 @@ def _chunked_stages(contract: Mc2Contract, transport: Transport, *,
     phases: list[Phase] = []
     world = contract.world_size
     routes = transport.routes
-    local_rows = contract.m // world
-    base_local, rem_local = divmod(local_rows, chunks)
+    if all_reducing:
+        base_rows, rem_rows = divmod(contract.m, chunks)
+        base_local = rem_local = 0
+    else:
+        base_local, rem_local = divmod(contract.m // world, chunks)
+        base_rows = rem_rows = 0
     comm_prefix = "ag_" if gathering else ("ar_" if all_reducing else "rs_")
     for index in range(chunks):
-        rows = contract.m if chunks == 1 else (base_local + (1 if index < rem_local else 0)) * world
+        if chunks == 1:
+            rows = contract.m
+        elif all_reducing:
+            rows = base_rows + (1 if index < rem_rows else 0)
+        else:
+            rows = (base_local + (1 if index < rem_local else 0)) * world
         suffix = f"chunk{index}"
         tag = (("chunk", index), ("slot", ring.slot(index)), ("cross_core", transport.ccu))
         comm = comm_prefix + suffix
@@ -700,54 +871,65 @@ def _chunked_stages(contract: Mc2Contract, transport: Transport, *,
         comm_gate = events.credit if gathering else events.publish
         previous = (f"{comm_prefix}chunk{index - 1}",) if index else ()
         comm_deps = (comm_gate, *previous)
+        b_bytes = (
+            contract.k * contract.n * dtype_bytes(contract.dtype)
+            + (contract.weight_scale_bytes if gathering else 0)
+        ) if rows else 0
+        if all_reducing:
+            previous_gemm = (f"gemm_chunk{index - 1}",) if index else ()
+            fragments[events.write] = _matrix_fragment(
+                contract, gemm, (events.credit, *previous_gemm), rows,
+                b_bytes=b_bytes, slot=tag, ub_output=ub_output, has_l2=has_l2,
+            )
+            mmar_phases, store_phase = _mmar_chunk_comm(
+                contract, transport, comm=comm, comm_deps=comm_deps, rows=rows, tag=tag,
+                ub_output=ub_output, temp_gm=temp_gm, has_l2=has_l2, publish_dep=events.publish,
+            )
+            phases.extend(mmar_phases)
+            fragments[events.read_done[0]] = store_phase
+            continue
         payload = contract.shard_bytes(rows)
         wire_window = len(routes) * transport.peer_bytes(payload)
         if temp_gm and wire_window:
             read = comm + "_hccl_read"
             data_bytes = len(routes) * payload
-            phases.append(Phase(read, comm_deps, Work(resources={"hbm": data_bytes, "l2": data_bytes}),
-                                metadata=tag))
+            temp_res = {"hbm": data_bytes, **({"l2": data_bytes} if has_l2 else {})}
+            phases.append(Phase(read, comm_deps, Work(resources=temp_res), metadata=tag))
             comm_deps = (read,)
         names = []
         for route in routes:
-            name = f"{comm}_rs_peer_{route.destination}" if all_reducing else f"{comm}_peer_{route.destination}"
+            name = f"{comm}_peer_{route.destination}"
             credit = (names[-transport.credits],) if len(names) >= transport.credits else ()
             phases.extend(peer_stages(
                 name, (*comm_deps, *credit), route, transport, payload, tag, couple_gm_bounce=True,
             ))
             names.append(name)
-        if all_reducing and routes:
-            ag_names = []
-            ag_deps = tuple(names)
-            for route in routes:
-                ag_name = f"{comm}_ag_peer_{route.destination}"
-                credit = (ag_names[-transport.credits],) if len(ag_names) >= transport.credits else ()
-                phases.extend(peer_stages(
-                    ag_name, (*ag_deps, *credit), route, transport, payload, tag, couple_gm_bounce=True,
-                ))
-                ag_names.append(ag_name)
-            names = ag_names
-        b_bytes = contract.k * contract.n * dtype_bytes(contract.dtype) if rows else 0
         if gathering:
             local_rows_chunk = rows // world
             remote = rows - local_rows_chunk
             b_local = (b_bytes * local_rows_chunk / rows) if rows else 0
             b_remote = b_bytes - b_local
             local = f"local_gemm_{suffix}"
-            phases.append(_matrix_fragment(contract, local, (), local_rows_chunk, b_bytes=b_local, slot=tag))
+            phases.append(_matrix_fragment(
+                contract, local, (), local_rows_chunk, b_bytes=b_local, slot=tag, has_l2=has_l2,
+            ))
             fragments[events.read_done[0]] = _matrix_fragment(
-                contract, gemm, (events.publish,), remote, b_bytes=b_remote if remote else 0, slot=tag)
-            fragments[events.write] = Phase(comm, (events.credit, *names),
-                                            Work(resources={"hbm": wire_window, "l2": wire_window}), metadata=tag)
+                contract, gemm, (events.publish,), remote,
+                b_bytes=b_remote if remote else 0, slot=tag, has_l2=has_l2,
+            )
+            ag_res = {"hbm": wire_window, **({"l2": wire_window} if has_l2 else {})}
+            fragments[events.write] = Phase(comm, (events.credit, *names), Work(resources=ag_res), metadata=tag)
         else:
             previous_gemm = (f"gemm_chunk{index - 1}",) if index else ()
-            fragments[events.write] = _matrix_fragment(contract, gemm, (events.credit, *previous_gemm), rows,
-                                                        b_bytes=b_bytes, slot=tag, ub_output=ub_output)
-            own_bytes = rows // world * contract.n * dtype_bytes(contract.output_dtype)
-            reduced = (world - 1) * (rows // world) * contract.n
-            out_bytes = rows * contract.n * dtype_bytes(contract.output_dtype) if all_reducing else own_bytes
-            work = read_work((0 if temp_gm else wire_window) + (0 if ub_output else own_bytes), l2=True)
-            work += store_work(out_bytes, l2=True) + Work(resources={"vector": reduced})
+            fragments[events.write] = _matrix_fragment(
+                contract, gemm, (events.credit, *previous_gemm), rows,
+                b_bytes=b_bytes, slot=tag, ub_output=ub_output, has_l2=has_l2,
+            )
+            own_elems = (rows // world) * contract.n
+            own_bytes = own_elems * dtype_bytes(contract.output_dtype)
+            reduced = (world - 1) * own_elems
+            work = read_work((0 if temp_gm else wire_window) + (0 if ub_output else own_bytes), l2=has_l2)
+            work += store_work(own_bytes, l2=has_l2) + Work(resources={"vector": reduced})
             fragments[events.read_done[0]] = Phase(
                 comm, (events.publish, *names), work if world > 1 else Work(), "aiv", tag)
     for node in ring.to_stages():
@@ -755,28 +937,32 @@ def _chunked_stages(contract: Mc2Contract, transport: Transport, *,
     return tuple(replace(phase, after=tuple(aliases.get(dep, dep) for dep in phase.after)) for phase in phases)
 
 
-def build_chunked_agmm_stages(contract: Mc2Contract, transport: Transport) -> tuple[Phase, ...]:
-    return _chunked_stages(contract, transport)
+def build_chunked_agmm_stages(contract: Mc2Contract, transport: Transport, *,
+                              has_l2: bool = True) -> tuple[Phase, ...]:
+    return _chunked_stages(contract, transport, has_l2=has_l2)
 
 
 def build_chunked_mmrs_stages(contract: Mc2Contract, transport: Transport, *,
-                              ub_output: bool = False, temp_gm: bool = False) -> tuple[Phase, ...]:
-    return _chunked_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm)
+                              ub_output: bool = False, temp_gm: bool = False,
+                              has_l2: bool = True) -> tuple[Phase, ...]:
+    return _chunked_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm, has_l2=has_l2)
 
 
 def build_chunked_mmar_stages(contract: Mc2Contract, transport: Transport, *,
-                              ub_output: bool = False, temp_gm: bool = False) -> tuple[Phase, ...]:
-    return _chunked_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm)
+                              ub_output: bool = False, temp_gm: bool = False,
+                              has_l2: bool = True) -> tuple[Phase, ...]:
+    return _chunked_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm, has_l2=has_l2)
 
 
 def build_transport_stages(contract: Mc2Contract, transport: Transport, *,
-                           ub_output: bool = False, temp_gm: bool = False) -> tuple[Phase, ...]:
+                           ub_output: bool = False, temp_gm: bool = False,
+                           has_l2: bool = True) -> tuple[Phase, ...]:
     if contract.abi == AGMM:
-        return build_chunked_agmm_stages(contract, transport)
+        return build_chunked_agmm_stages(contract, transport, has_l2=has_l2)
     if contract.abi == MMRS:
-        return build_chunked_mmrs_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm)
+        return build_chunked_mmrs_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm, has_l2=has_l2)
     if contract.abi == MMAR:
-        return build_chunked_mmar_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm)
+        return build_chunked_mmar_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm, has_l2=has_l2)
     phases = []
     for index, cohort in enumerate(contract.cohorts):
         reuse = index - transport.slot_depth

@@ -19,12 +19,13 @@ from mindie_sim.prediction.operators.mc2 import mc2_local_caller
 from ...mechanism import OperatorPlan, Work
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from .common import (
-    COLLECTIVES, COMBINE, Mc2Contract, PeerRoute, Phase, Transport, build_transport_stages, capability_gap,
-    contract_fields, make_plan, native_protocol_peer_transport, topology_hops,
-    validate_contract, validate_native_dispatch_quant,
+    COLLECTIVES, COMBINE, DISPATCH, FLOAT_ROWS, MMAR, Mc2Contract, PeerRoute, Phase, Transport,
+    build_transport_stages, capability_gap, contract_fields, geometry_has_l2, make_plan,
+    native_protocol_peer_transport, topology_hops, validate_contract, validate_native_dispatch_quant,
 )
 from .lowering import A2_MTE, SIO_HCCS, declared_incoming_routes
 
+TARGET_BACKEND = "ascend"
 _OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
 _SKILLS_REVISION = "750045df251d031bf708de9dc1614c2202eed6dd"
 _XLLM_REVISION = "c77a313bfdd59c0f6e312558808c0de7d2a8d019"
@@ -50,6 +51,12 @@ SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
         repository="cann/ops-transformer",
         revision=_OPS_REVISION,
+        relative_path="mc2/moe_distribute_dispatch_v2/op_host/op_tiling/arch22/moe_distribute_dispatch_v2_tiling_arch22.cpp",
+        source_sha256="d3322d5b3a664c7f0e2cd3bab9718a464b8f15be09426d3fa5c0ad001334aa91",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
         relative_path="mc2/moe_distribute_dispatch_v2/op_kernel/arch22/moe_distribute_dispatch_v2_a2.cpp",
         source_sha256="37716ea752cfe9792948004633b9ec16d8b68952c0bf12e5d634a429a97bacde",
     ),
@@ -70,6 +77,12 @@ SOURCES: tuple[SourceRef, ...] = (
         revision=_OPS_REVISION,
         relative_path="mc2/moe_distribute_combine_v2/op_kernel/arch22/moe_distribute_combine_v2_a3.cpp",
         source_sha256="b7eb67de6390df7688ce9f24b4ecbc08172d66fa5e2b2a0f664d2c4f15169466",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/mega_moe/op_kernel/arch22/mega_moe.cpp",
+        source_sha256="0a8d7824e28e93aef07c4c2b67a50afdc29989bd55820e397d3580d88baecd4c",
     ),
     SourceRef(
         repository="cann/ascendc-mc2-best-practice",
@@ -101,6 +114,8 @@ SOURCES: tuple[SourceRef, ...] = (
 HCCL_CLIENT = "a2_hccl_client"
 ARCH_TRANSPORTS = frozenset({HCCL_CLIENT, SIO_HCCS, A2_MTE})
 SERVER_MODES = frozenset({"server", "aicpu", "aiv", "hccl_server_type_aicpu", "hccl_server_type_aiv"})
+_ARCH22_COLLECTIVE_WORLD_SIZES = frozenset({1, 2, 4, 8})
+_ARCH22_COLLECTIVE_DTYPES = FLOAT_ROWS | {"int8", "int4"}
 
 
 def _placement(raw, ranks, op, ctx, field):
@@ -209,6 +224,31 @@ def _transport(contract: Mc2Contract, op: OpSpec, ctx: OperatorPlanningContext) 
     )
 
 
+def _validate_arch22_contract(contract: Mc2Contract, op: OpSpec, ctx: OperatorPlanningContext) -> None:
+    if contract.abi in COLLECTIVES:
+        if contract.world_size not in _ARCH22_COLLECTIVE_WORLD_SIZES:
+            raise capability_gap(op, ctx, f"arch22_collective_world_size_unsupported:{contract.world_size}")
+        if contract.dtype not in _ARCH22_COLLECTIVE_DTYPES:
+            raise capability_gap(op, ctx, f"arch22_collective_dtype_unsupported:{contract.dtype}")
+    if contract.abi == DISPATCH and contract.row_layout is not None:
+        layout = contract.row_layout
+        unquantized_float = (
+            layout.quant_mode == "none"
+            and layout.input_dtype in FLOAT_ROWS
+            and layout.payload_dtype == layout.input_dtype
+            and layout.input_scale_bytes == 0
+        )
+        per_token_int8 = (
+            layout.quant_mode == "per_token"
+            and layout.input_dtype in FLOAT_ROWS
+            and layout.payload_dtype == "int8"
+        )
+        if not (unquantized_float or per_token_int8):
+            raise capability_gap(
+                op, ctx, f"arch22_dispatch_quant_unsupported:{layout.quant_mode}:{layout.payload_dtype}",
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class _Strategy:
     arch_id: ArchId = ArchId("npu_arch_2201")
@@ -219,7 +259,9 @@ class _Strategy:
         if ctx.compute_arch.arch_id != self.arch_id:
             return False
         try:
-            _transport(validate_contract(op, ctx), op, ctx)
+            contract = validate_contract(op, ctx)
+            _validate_arch22_contract(contract, op, ctx)
+            _transport(contract, op, ctx)
         except ModelingError:
             return False
         return True
@@ -228,11 +270,12 @@ class _Strategy:
         if ctx.compute_arch.arch_id != self.arch_id:
             raise capability_gap(op, ctx, "unsupported_compute_architecture")
         contract = validate_contract(op, ctx)
+        _validate_arch22_contract(contract, op, ctx)
         transport = _transport(contract, op, ctx)
         fields = contract_fields(op)
         local = fields.get("mc2_v2_local") if op.recipe == "arch22_v2_caller_local" else None
         if local is None:
-            phases = build_transport_stages(contract, transport)
+            phases = build_transport_stages(contract, transport, has_l2=geometry_has_l2(ctx.geometry))
         else:
             group = dict(fields.get("device_kernel_group", ()))
             name = "caller_publish" if group.get("exit") else "caller_pack"
@@ -325,10 +368,12 @@ def native_protocol_recipes(selected):
 def _rebind_fused_mc2_op(ops, fused_level: int, weight_dtype: str):
     """Project Arch22 (A3) fused MoE native binding onto the lowered fused MC2 op."""
     from dataclasses import replace
+    from . import megamoe as mc2_megamoe
 
     binding = fused_mc2_native_binding(weight_dtype, fused_level=fused_level)
     public_name = binding["public_name"]
     api = binding["api"]
+    is_w4 = str(weight_dtype or "int8").strip().lower() in _INT4_WEIGHT_FORMATS
     rebuilt = []
     for item in ops:
         if item.recipe != "megamoe_arch35":
@@ -345,7 +390,22 @@ def _rebind_fused_mc2_op(ops, fused_level: int, weight_dtype: str):
             "kernels": ({"name": public_name, "role": "fused_moe_mc2", "evidence": "source_declared"},),
             "execution_core": binding["execution_core"],
         }
-        rebuilt.append(replace(item, metadata=tuple(meta.items())))
+        op_flops = item.flops
+        matrix_flops = item.matrix_flops
+        if is_w4:
+            geo = dict(meta.get("megamoe_geometry") or {})
+            if not (geo.get("gmm1_msd_w4a8") and geo.get("gmm2_msd_w4a8")):
+                logical = float(geo.get("logical_flops") or item.flops)
+                geo["gmm1_msd_w4a8"] = True
+                geo["gmm2_msd_w4a8"] = True
+                geo["logical_flops"] = logical
+                meta["megamoe_geometry"] = geo
+                meta["logical_flops"] = logical
+                op_flops = logical * mc2_megamoe.MSD_INT4_PASSES
+                matrix_flops = (("int4", op_flops),)
+            meta["compute_format"] = "int4"
+            meta["msd_w4a8"] = True
+        rebuilt.append(replace(item, flops=op_flops, matrix_flops=matrix_flops, metadata=tuple(meta.items())))
     return rebuilt
 
 
