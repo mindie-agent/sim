@@ -45,7 +45,7 @@ def _resolve_offload_ratios(case: CaseSpec, policy: MemoryPolicy) -> dict[str, f
 
     def pick(name: str) -> float:
         declared = getattr(policy, name)
-        if declared != 0.0:
+        if declared is not None:
             return _offload_ratio(name, declared)
         if name in metadata:
             return _offload_ratio(name, metadata[name])
@@ -95,33 +95,24 @@ def _routed_expert_bytes_by_stage(
         payload[stage] += routed_payload
         num_exp = int(plan.num_experts)
         k = min(num_exp, max(1, int(plan.top_k)))
+        ep_dp = max(1, int(getattr(parallel, "ep_dp_width", 1) or 1))
+        routed_budget = tokens * ep_dp * k
         if slots is not None:
-            # ``routed`` is already this rank's physical slot bank, so the active
-            # staging of this rank is
-            #   sum_{slot in rank} W[logical(slot)] * p[logical(slot)]
-            # with NO further EP division: ``active_total`` is already local.
-            copies = slots.copies_per_expert()
+            # Hard per-rank staging capacity must cover the worst-case integral
+            # count of local expert slots that can be routed in one step.
             local_slots = max(1, base_count + extra_count)
             per_slot = routed / float(local_slots)
-            row_share = float(k) / float(num_exp)
-            best_active = 0.0
-            for ids in slots.expert_ids_by_rank:
-                active = 0.0
-                for expert in ids:
-                    share = row_share / float(copies.get(int(expert), 0) or 1)
-                    if 0.0 < share < 1.0:
-                        active += -math.expm1(float(tokens) * math.log1p(-share))
-                    else:
-                        active += float(share >= 1.0)
-                best_active = max(best_active, active)
-            active_layer_bytes = min(routed, per_slot * best_active)
-        else:
-            active_total = float(num_exp) if k >= num_exp else float(num_exp) * (
-                1.0 - ((1.0 - float(k) / float(num_exp)) ** float(tokens))
+            worst_slots = max(
+                (min(len(ids), routed_budget) for ids in slots.expert_ids_by_rank),
+                default=0,
             )
+            active_layer_bytes = min(routed, per_slot * float(worst_slots))
+        else:
             local_exp = max(1, (num_exp + ep - 1) // ep)
-            active_layer_bytes = (active_total / float(ep)) * (
-                routed / float(local_exp))
+            worst_local = min(local_exp, routed_budget)
+            active_layer_bytes = min(
+                routed, float(worst_local) * (routed / float(local_exp)),
+            )
         staging[stage] = max(staging[stage], min(routed, active_layer_bytes))
     return result, payload, staging
 
@@ -166,11 +157,57 @@ def _weight_ledger_by_stage(
 
 
 class _MemoryWorkspaceMixin:
+    def _max_speculative_proposals(self) -> int:
+        from mindie_sim.catalog.speculative_state import resolve_speculative_proposals
+        import json
+        from mindie_sim.schema.speculative import SpeculativeSpec
+
+        runtime = self.case.runtime
+        meta = dict(getattr(runtime, "metadata", ()) or ())
+        spec_method = str(meta.get("spec_method", "") or "").strip().lower()
+        mode = str(meta.get("draft_mode", "") or "").strip().lower()
+        if spec_method == "none" or mode == "none":
+            return 0
+        proposal = int(resolve_speculative_proposals(runtime))
+        if proposal <= 0:
+            raw_spec = meta.get("speculative")
+            if raw_spec:
+                spec_map = json.loads(raw_spec) if isinstance(raw_spec, str) else raw_spec
+                proposal = int(SpeculativeSpec.from_mapping(spec_map).draft_len)
+        if proposal <= 0:
+            mtp = getattr(getattr(self.case.model, "auxiliary", None), "mtp", None)
+            non_neural = spec_method in {"ngram", "ngram_gpu"} or mode in {"ngram", "ngram_gpu"}
+            if (not non_neural and mtp is not None
+                    and (mode or spec_method or float(getattr(runtime, "mtp_acceptance_length", 1.0) or 1.0) > 1.0)):
+                proposal = int(getattr(mtp, "proposal_tokens", 0) or 0)
+        return max(0, proposal)
+
     def _resolve_workspace_tokens(self, tokens=None) -> int:
         runtime = self.case.runtime
         if tokens is None:
-            return min(runtime.max_num_batched_tokens, sum(
-                max(1, min(r.prompt_tokens, runtime.max_num_batched_tokens)) for r in self.case.workload.requests))
+            max_batched = int(runtime.max_num_batched_tokens)
+            requests = self.case.workload.requests
+            prefill_tokens = min(max_batched, sum(
+                max(1, min(r.prompt_tokens, max_batched)) for r in requests))
+            proposal = self._max_speculative_proposals()
+            if proposal <= 0:
+                return prefill_tokens
+            max_seqs = max(1, int(getattr(runtime, "max_num_seqs", 1) or 1))
+            per_req_max = sorted(
+                (
+                    max(
+                        max(1, min(int(r.prompt_tokens), max_batched)),
+                        (
+                            1 + min(proposal, max(0, int(r.output_tokens) - 2), max(0, max_batched - 1))
+                            if int(r.output_tokens) > 1 else 0
+                        ),
+                    )
+                    for r in requests
+                ),
+                reverse=True,
+            )[:max_seqs]
+            mixed_tokens = min(max_batched, sum(per_req_max))
+            return max(prefill_tokens, mixed_tokens)
         if type(tokens) is not int or tokens < 0:
             raise ValueError("memory_workspace_tokens_require_nonnegative_integer")
         return tokens

@@ -213,7 +213,7 @@ def index_selection_cost(
     if not (plan.indexer or plan.owns_topk or plan.index_query_per_layer):
         return IndexReadCost(0, 0, 0, 0.0, 0.0, 0, 0.0, 0, 0.0)
     owner = plan.index_k_owner_layer_id
-    producer = model.layer_plans[owner] if owner >= 0 else plan
+    producer = model.layer_plans[owner] if 0 <= owner < len(model.layer_plans) else plan
     ratio = max(1, int(producer.compress_ratio or 1), int(producer.index_kpool or 1))
     if context_tokens is not None or query_tokens is not None:
         q = max(0, int(query_tokens if query_tokens is not None else 0))
@@ -237,7 +237,7 @@ def index_selection_cost(
     scored = min(rows, candidates) if plan.candidate_filter else rows
     limit = plan.index_topk // max(1, plan.index_kpool)
     selected = min(scored, limit) if plan.index_topk else scored
-    width = index_row_bytes(model, plan.index_dim, plan=plan, phase=phase)
+    width = index_row_bytes(model, producer.index_dim, plan=producer, phase=phase)
     writes = new_completed_rows(ctx, q, ratio) if plan.owns_index_k else 0
     tail_rows = 0
     tail_bytes = 0.0

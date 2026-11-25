@@ -187,9 +187,9 @@ class MemoryPolicy:
     async_delayed_release_steps: int | None = None
     async_in_flight_lookahead_steps: int | None = None
     async_workspace_buffer_multiplier: float | None = None
-    expert_ddr_ratio: float = 0.0
-    kvc_ddr_ratio: float = 0.0
-    kvc_ssd_ratio: float = 0.0
+    expert_ddr_ratio: float | None = None
+    kvc_ddr_ratio: float | None = None
+    kvc_ssd_ratio: float | None = None
     #: Number of implementation workspaces that are simultaneously live
     #: (for example independent streams).  The base workspace is multiplied by
     #: this count; async/expert staging reserves remain their own components.

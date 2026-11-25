@@ -64,7 +64,12 @@ class _MemoryGrantsMixin:
             "ranges": raw_ranges,
             "event": raw.get("event", defaults["event"]),
             "host_bytes": host,
-            "physical_key": str(raw.get("physical_key", name) or name),
+            "physical_key": str(
+                raw.get("alias_of")
+                or raw.get("physical_backing_id")
+                or raw.get("physical_key", name)
+                or name
+            ),
             "_ranges": ref_ranges,
         }
         return result
@@ -125,47 +130,82 @@ class _MemoryGrantsMixin:
         ]
         hbm, host = self._state_usage(extra_holders=new_holders)
         current_hbm, current_host = self._state_usage()
+        cand_hbm, cand_host = self._candidate_only_usage(new_holders)
+        releasable_hbm = [
+            [
+                [
+                    max(0.0, float(hbm[rep][st][rk]) - float(cand_hbm[rep][st][rk]))
+                    for rk in range(self.width)
+                ]
+                for st in range(p.pp)
+            ]
+            for rep in range(p.dp)
+        ]
+        releasable_host = [
+            max(0.0, float(host[rep]) - float(cand_host[rep]))
+            for rep in range(p.dp)
+        ]
         return parsed, self._grant_decision_payload(
-            replica, hbm, host, current_hbm, current_host, parsed)
+            replica, hbm, host, current_hbm, current_host, parsed,
+            releasable_hbm=releasable_hbm, releasable_host=releasable_host)
 
     def _grant_decision_payload(
         self, replica: int, hbm, host, current_hbm, current_host,
         parsed: list[dict], *, exclude_request: tuple[int, str] | None = None,
+        releasable_hbm=None, releasable_host=None,
     ) -> dict:
         """Explain an atomic grant decision without mutating the ledger."""
         p = self.case.runtime.parallel
         ok = self._usage_budget_ok(hbm, host)
+        rel_hbm = current_hbm if releasable_hbm is None else releasable_hbm
+        rel_host = current_host if releasable_host is None else releasable_host
         shortfall = [[0.0] * self.width for _ in range(p.pp)]
         releasable = [[0.0] * self.width for _ in range(p.pp)]
         recoverable = True
-        for stage in range(p.pp):
-            capacities = self.rank_capacity[replica][stage]
-            for rank in range(self.width):
-                cap = capacities[rank]
-                used = float(hbm[replica][stage][rank])
-                base = max(0.0, float(current_hbm[replica][stage][rank]))
-                if used > cap + max(1e-9, abs(cap) * 1e-12):
-                    shortfall[stage][rank] = used - cap
-                    releasable[stage][rank] = base
-                    if shortfall[stage][rank] > base + max(
-                            1e-9, abs(cap) * 1e-12):
-                        recoverable = False
-        host_cap = self.host_dram_capacity[replica]
-        host_used = float(host[replica])
-        host_base = max(0.0, float(current_host[replica]))
+        affected_replicas: set[int] = {replica}
+        for rep in range(p.dp):
+            for stage in range(p.pp):
+                capacities = self.rank_capacity[rep][stage]
+                for rank in range(self.width):
+                    cap = capacities[rank]
+                    used = float(hbm[rep][stage][rank])
+                    base = max(0.0, float(rel_hbm[rep][stage][rank]))
+                    if used > cap + max(1e-9, abs(cap) * 1e-12):
+                        affected_replicas.add(rep)
+                        diff = used - cap
+                        if rep == replica:
+                            shortfall[stage][rank] = diff
+                            releasable[stage][rank] = base
+                        elif diff > shortfall[stage][rank]:
+                            shortfall[stage][rank] = diff
+                            releasable[stage][rank] = base
+                        if diff > base + max(1e-9, abs(cap) * 1e-12):
+                            recoverable = False
+            rep_host_cap = self.host_dram_capacity[rep]
+            rep_host_used = float(host[rep])
+            rep_host_base = max(0.0, float(rel_host[rep]))
+            if rep_host_used > rep_host_cap + max(1e-9, abs(rep_host_cap) * 1e-12):
+                affected_replicas.add(rep)
+                if rep_host_used - rep_host_cap > rep_host_base + max(
+                        1e-9, abs(rep_host_cap) * 1e-12):
+                    recoverable = False
         host_shortfall = 0.0
         host_releasable = 0.0
-        if host_used > host_cap + max(1e-9, abs(host_cap) * 1e-12):
-            host_shortfall = host_used - host_cap
-            host_releasable = host_base
-            if host_shortfall > host_base + max(1e-9, abs(host_cap) * 1e-12):
-                recoverable = False
+        for rep in range(p.dp):
+            rep_host_cap = self.host_dram_capacity[rep]
+            rep_host_used = float(host[rep])
+            rep_host_base = max(0.0, float(rel_host[rep]))
+            if rep_host_used > rep_host_cap + max(1e-9, abs(rep_host_cap) * 1e-12):
+                rep_diff = rep_host_used - rep_host_cap
+                if rep == replica or rep_diff > host_shortfall:
+                    host_shortfall = rep_diff
+                    host_releasable = rep_host_base
         wakeable = (not ok) and recoverable
         permanent = (not ok) and not recoverable
         wake_events = []
         if not ok:
             for (rep, name), binding in sorted(self.grant_bindings.items()):
-                if rep != replica or binding.get("event") is None:
+                if rep not in affected_replicas or binding.get("event") is None:
                     continue
                 wake_events.append({
                     "kind": "grant", "name": name,
@@ -174,7 +214,7 @@ class _MemoryGrantsMixin:
                     "event": binding["event"],
                 })
             for (rep, grant), readers in sorted(self.grant_readers.items()):
-                if rep != replica:
+                if rep not in affected_replicas:
                     continue
                 for consumer, snapshot in sorted(readers.items()):
                     if snapshot.get("event") is None:
@@ -184,9 +224,11 @@ class _MemoryGrantsMixin:
                         "consumer": consumer,
                         "event": snapshot["event"],
                     })
+            cohort_map = getattr(self, "_cohort_owner_ranks", {})
             for (rep, request), holds in sorted(
                     self.async_consumer_holds.items()):
-                if rep != replica or (rep, request) == exclude_request:
+                held_reps = set(cohort_map.get((rep, request), ())) | {rep}
+                if not (held_reps & affected_replicas) or (rep, request) == exclude_request:
                     continue
                 for consumer, snapshot in sorted(holds.items()):
                     binding = dict(snapshot.binding)
@@ -296,33 +338,33 @@ class _MemoryGrantsMixin:
                 "physical_key": spec["physical_key"],
             }
             self.grant_records[(replica, spec["name"])] = dict(spec)
+        self._typed_grants.update(typed)
         if parsed:
             self._sync_usage()
             self.budget_version += 1
-        self._typed_grants.update(typed)
         return True
 
     def _remove_grant(
         self, replica: int, name: str, binding: dict, *,
         sync: bool = True,
     ) -> float:
+        before_hbm, before_host = self._state_usage()
         typed = self._typed_grants.pop((replica, str(name)), ())
         if typed and self.ledger_domain is not None:
             from ..runtime.ledger import Ledger as _Ledger
             for allocation in typed:
                 _Ledger.release(self.runtime_state, allocation,
                                 after=self._ledger_boundary())
-        before = self._replica_occupied(replica)
-        before_host = self.host_occupied_bytes(replica)
         self._set_ref((replica, "grant", name), ())
         self.grant_records.pop((replica, name), None)
         self.grants.pop((replica, name), None)
         self.grant_bindings.pop((replica, name), None)
         self.grant_hosts.pop((replica, name), None)
-        after = self._replica_occupied(replica)
-        after_host = self.host_occupied_bytes(replica)
-        released = max(0.0, before - after)
-        released_total = released + max(0.0, before_host - after_host)
+        after_hbm, after_host = self._state_usage()
+        released = self._freed_replica_hbm(replica, before_hbm, after_hbm)
+        released_total = released + max(
+            0.0, float(before_host[replica]) - float(after_host[replica]),
+        )
         if sync:
             self._sync_usage()
             self.budget_version += 1
@@ -390,8 +432,11 @@ class _MemoryGrantsMixin:
                 if self.selected_reserved[replica][stage]
             ],
             "shared": [
-                {"replica": replica, "owner": owner, **record}
-                for (replica, owner), record in sorted(self.shared_pages.items())
+                {"replica": key[0], "owner": key[1], **record}
+                for key, record in sorted(
+                    self.shared_pages.items(),
+                    key=lambda item: (item[0][0], item[0][1], len(item[0]), item[0]),
+                )
             ],
             "async_consumers": [
                 {"replica": key[0], "request": key[1], "consumer": consumer,

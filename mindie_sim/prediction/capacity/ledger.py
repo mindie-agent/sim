@@ -14,7 +14,7 @@
 """
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 import math
 from typing import Any
@@ -32,6 +32,7 @@ from ..runtime.contracts import (
     AllocationKey,
     BackingKey,
     CapacityDomainState,
+    GrantResult,
     OccurrenceKey,
     PoolKey,
 )
@@ -61,6 +62,8 @@ class ResidentGrantEntry:
     valid_bytes: int = 0
     lifetime: str = "persistent"
     billed_once_bytes: int = 0
+    reclaimable: bool = False
+    release_event: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -76,12 +79,14 @@ class ResidentGrantEntry:
             "valid_bytes": int(self.valid_bytes),
             "lifetime": self.lifetime,
             "billed_once_bytes": int(self.billed_once_bytes),
+            "reclaimable": bool(self.reclaimable),
+            "release_event": str(self.release_event),
         }
 
 
 @dataclass(frozen=True)
 class DieResidentReceipt:
-    """Simultaneous live and peak HBM residency on one physical die."""
+    """Simultaneous live, reclaimable, and peak HBM residency on one physical die."""
 
     replica: int
     stage: int
@@ -108,6 +113,39 @@ class DieResidentReceipt:
     free_hbm_headroom_bytes: int
     host_dram_bytes: int
     grants: tuple[ResidentGrantEntry, ...] = ()
+    reclaimable_hbm_bytes: int = 0
+    reclaimable_release_events: tuple[str, ...] = ()
+
+    @property
+    def usable_bytes(self) -> int:
+        return int(self.usable_hbm_bytes)
+
+    @property
+    def current_live_bytes(self) -> int:
+        return int(self.simultaneous_live_hbm_bytes)
+
+    @property
+    def reclaimable_bytes(self) -> int:
+        return int(self.reclaimable_hbm_bytes)
+
+    @property
+    def historical_peak_bytes(self) -> int:
+        return int(self.simultaneous_peak_hbm_bytes)
+
+    @property
+    def immediate_free_hbm_headroom_bytes(self) -> int:
+        return int(self.usable_hbm_bytes - self.simultaneous_live_hbm_bytes)
+
+    @property
+    def post_reclaim_free_hbm_headroom_bytes(self) -> int:
+        return int(
+            self.usable_hbm_bytes
+            - (self.simultaneous_live_hbm_bytes - self.reclaimable_hbm_bytes)
+        )
+
+    @property
+    def historical_free_hbm_headroom_bytes(self) -> int:
+        return int(self.usable_hbm_bytes - self.simultaneous_peak_hbm_bytes)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -131,9 +169,14 @@ class DieResidentReceipt:
             "staging_bytes": int(self.staging_bytes),
             "dynamic_grant_bytes": int(self.dynamic_grant_bytes),
             "simultaneous_live_hbm_bytes": int(self.simultaneous_live_hbm_bytes),
+            "reclaimable_hbm_bytes": int(self.reclaimable_hbm_bytes),
+            "reclaimable_release_events": list(self.reclaimable_release_events),
             "simultaneous_peak_hbm_bytes": int(self.simultaneous_peak_hbm_bytes),
             "load_peak_hbm_bytes": int(self.load_peak_hbm_bytes),
             "free_hbm_headroom_bytes": int(self.free_hbm_headroom_bytes),
+            "immediate_free_hbm_headroom_bytes": self.immediate_free_hbm_headroom_bytes,
+            "post_reclaim_free_hbm_headroom_bytes": self.post_reclaim_free_hbm_headroom_bytes,
+            "historical_free_hbm_headroom_bytes": self.historical_free_hbm_headroom_bytes,
             "host_dram_bytes": int(self.host_dram_bytes),
             "grants": [grant.to_dict() for grant in self.grants],
         }
@@ -150,12 +193,32 @@ class ResidentMemoryReceipt:
     dies: tuple[DieResidentReceipt, ...]
 
     @property
+    def live_die_hbm_bytes(self) -> int:
+        return max((die.simultaneous_live_hbm_bytes for die in self.dies), default=0)
+
+    @property
+    def reclaimable_die_hbm_bytes(self) -> int:
+        return max((die.reclaimable_hbm_bytes for die in self.dies), default=0)
+
+    @property
     def peak_die_hbm_bytes(self) -> int:
         return max((die.simultaneous_peak_hbm_bytes for die in self.dies), default=0)
 
     @property
     def min_free_hbm_headroom_bytes(self) -> int:
         return min((die.free_hbm_headroom_bytes for die in self.dies), default=0)
+
+    @property
+    def min_immediate_free_hbm_headroom_bytes(self) -> int:
+        return min((die.immediate_free_hbm_headroom_bytes for die in self.dies), default=0)
+
+    @property
+    def min_post_reclaim_free_hbm_headroom_bytes(self) -> int:
+        return min((die.post_reclaim_free_hbm_headroom_bytes for die in self.dies), default=0)
+
+    @property
+    def min_historical_free_hbm_headroom_bytes(self) -> int:
+        return min((die.historical_free_hbm_headroom_bytes for die in self.dies), default=0)
 
     def die_receipt(self, replica: int, stage: int, rank: int) -> DieResidentReceipt:
         for die in self.dies:
@@ -169,8 +232,13 @@ class ResidentMemoryReceipt:
             "phase": self.phase,
             "occurrence": self.occurrence,
             "vision_accounting": self.vision_accounting,
+            "live_die_hbm_bytes": self.live_die_hbm_bytes,
+            "reclaimable_die_hbm_bytes": self.reclaimable_die_hbm_bytes,
             "peak_die_hbm_bytes": self.peak_die_hbm_bytes,
             "min_free_hbm_headroom_bytes": self.min_free_hbm_headroom_bytes,
+            "min_immediate_free_hbm_headroom_bytes": self.min_immediate_free_hbm_headroom_bytes,
+            "min_post_reclaim_free_hbm_headroom_bytes": self.min_post_reclaim_free_hbm_headroom_bytes,
+            "min_historical_free_hbm_headroom_bytes": self.min_historical_free_hbm_headroom_bytes,
             "dies": [die.to_dict() for die in self.dies],
         }
 
@@ -378,6 +446,8 @@ def _deduplicate_grant_entries(
             valid_bytes=entry.valid_bytes,
             lifetime=entry.lifetime,
             billed_once_bytes=delta,
+            reclaimable=bool(entry.reclaimable),
+            release_event=str(entry.release_event),
         ))
     return tuple(resolved_entries), sum(billed_peaks.values())
 
@@ -420,6 +490,13 @@ class _MemoryLedgerMixin:
         self._ledger_serial += 1
         return _LedgerBoundary(self._ledger_serial)
 
+    def _backing_physical_rank(self, replica: int, stage: int, rank: int, tier: str) -> int:
+        """Globally unique physical die rank for ``BackingKey`` so distinct DP/PP pools never collide."""
+        if str(tier or "hbm").lower() == "host":
+            return -(int(replica) + 1)
+        pp = max(1, int(self.case.runtime.parallel.pp))
+        return (int(replica) * pp + int(stage)) * self.width + int(rank)
+
     def _typed_spec_bindings(self, replica: int, spec: dict):
         """Construct typed ``AllocationBinding`` records with exact integer half-open ranges."""
         if self.ledger_domain is None:
@@ -431,14 +508,34 @@ class _MemoryLedgerMixin:
         amount = float(spec.get("bytes", 0.0))
         generation = self._ledger_generation(spec.get("generation"))
         occurrence = self._ledger_occurrence(replica, stage, rank)
-        tier = str(spec.get("tier", "hbm"))
+        tier = str(spec.get("tier", "hbm")).lower()
+        backing_id = str(
+            spec.get("alias_of")
+            or spec.get("physical_backing_id")
+            or spec.get("physical_key")
+            or spec.get("name", "")
+        )
+        backing_rank = self._backing_physical_rank(replica, stage, account_rank, tier)
         backing = BackingKey(
             physical_domain=self.ledger_domain.domain_id,
-            rank=account_rank,
+            rank=backing_rank,
             tier=tier,
-            storage_id=str(spec.get("physical_key", "")),
+            storage_id=backing_id,
             generation=generation,
         )
+        if tier == "host":
+            primary_pool = PoolKey(
+                physical_domain=self.ledger_domain.domain_id,
+                rank=-1,
+                tier="host",
+                name="host",
+                unit=int(replica),
+            )
+        else:
+            primary_pool = self.ledger_pool(
+                replica, stage, account_rank, tier=tier,
+                domain=self.ledger_domain.domain_id,
+            )
         ranges = _exact_half_open_int_ranges(spec.get("_ranges"), spec.get("bytes", 0))
         key = AllocationKey(
             occurrence=occurrence,
@@ -449,15 +546,12 @@ class _MemoryLedgerMixin:
         )
         result = [AllocationBinding(
             key=key,
-            pool=self.ledger_pool(
-                replica, stage, account_rank, tier=tier,
-                domain=self.ledger_domain.domain_id,
-            ),
+            pool=primary_pool,
             amount=amount,
             backing=backing,
             byte_ranges=ranges,
-            owner=str(spec.get("owner", "")),
-            storage=str(spec.get("storage", "")),
+            owner=str(spec.get("owner") or ""),
+            storage=str(spec.get("storage") or ""),
             access="readwrite",
         )]
         host_raw = spec.get("host_bytes", 0)
@@ -484,14 +578,14 @@ class _MemoryLedgerMixin:
                 amount=host,
                 backing=BackingKey(
                     physical_domain=self.ledger_domain.domain_id,
-                    rank=-1,
+                    rank=self._backing_physical_rank(replica, stage, -1, "host"),
                     tier="host",
-                    storage_id=str(spec.get("physical_key", "")) + "#host",
+                    storage_id=backing_id + "#host",
                     generation=generation,
                 ),
                 byte_ranges=((0, host_int),),
-                owner=str(spec.get("owner", "")),
-                storage=str(spec.get("storage", "")),
+                owner=str(spec.get("owner") or ""),
+                storage=str(spec.get("storage") or ""),
                 access="readwrite",
             ))
         return tuple(result)
@@ -524,7 +618,93 @@ class _MemoryLedgerMixin:
         state.claim_capacity_domain(domain)
         self.runtime_state = state
         self.ledger_domain = domain
+        self._sync_domain_occupancy()
         return domain
+
+    def _sync_domain_occupancy(self) -> None:
+        """Mirror non-domain occupancy (KV, staging, selected, prepared weights) into ``ledger_domain``."""
+        domain = self.ledger_domain
+        if domain is None or self.runtime_state is None:
+            return
+        shadow_map: dict[PoolKey, tuple[AllocationKey, float]] = getattr(
+            self, "_domain_shadow_grants", None,
+        )
+        if shadow_map is None:
+            shadow_map = {}
+            self._domain_shadow_grants = shadow_map
+        hbm_full, host_full = self._state_usage()
+        for pool, cap in list(domain.capacities.items()):
+            parsed = self._parse_ledger_pool(pool)
+            if parsed is None:
+                continue
+            tier_kind, rep, st, rk = parsed
+            prev_key, prev_amt = shadow_map.get(pool, (None, 0.0))
+            prev_live = (
+                prev_key is not None
+                and prev_key in domain.grants
+                and not domain.grants[prev_key].released
+            )
+            eff_prev = float(prev_amt) if prev_live else 0.0
+            domain_real = max(0.0, float(domain.current.get(pool, 0.0)) - eff_prev)
+            if tier_kind == "host":
+                target_total = float(host_full[rep])
+                prep_delta = 0.0
+            else:
+                target_total = float(hbm_full[rep][st][rk])
+                prep_delta = max(0.0, float(cap) - float(self.rank_capacity[rep][st][rk]))
+            missing = max(0.0, (target_total + prep_delta) - domain_real)
+            if abs(missing - eff_prev) <= 1e-9 and (prev_live or missing <= 1e-9):
+                continue
+            if prev_live and prev_key is not None:
+                Ledger.release(
+                    self.runtime_state, prev_key, after=self._ledger_boundary(),
+                )
+            shadow_map.pop(pool, None)
+            if missing <= 1e-9:
+                continue
+            avail = max(0.0, float(cap) - float(domain.current.get(pool, 0.0)))
+            acq_amt = min(missing, avail) if math.isfinite(float(cap)) else missing
+            if acq_amt <= 1e-9:
+                continue
+            occ = self._ledger_occurrence(rep, st, rk)
+            s_key = AllocationKey(
+                occurrence=occ,
+                scope_kind="memory_occupancy",
+                scope_ordinal=st,
+                symbol=self._ledger_serial,
+                generation=0,
+            )
+            binding = AllocationBinding(
+                key=s_key,
+                pool=pool,
+                amount=acq_amt,
+                backing=None,
+                byte_ranges=(),
+                owner="memory:occupancy",
+                storage="occupancy",
+                access="readwrite",
+            )
+            res = Ledger.try_acquire(
+                self.runtime_state, (binding,), holder=occ, at=self._ledger_boundary(),
+            )
+            if res.granted:
+                shadow_map[pool] = (s_key, acq_amt)
+
+    def _domain_peak_hbm(self, replica: int, stage: int, rank: int) -> float:
+        """Read historical dynamic HBM peak recorded on ``self.ledger_domain`` for one die."""
+        domain = self.ledger_domain
+        if domain is None:
+            return 0.0
+        pool = self.ledger_pool(replica, stage, rank, domain=domain.domain_id)
+        raw_peak = float(domain.peaks.get(pool, 0.0))
+        if raw_peak <= 0.0:
+            return 0.0
+        cap = domain.capacities.get(pool)
+        prep_delta = (
+            max(0.0, float(cap) - float(self.rank_capacity[replica][stage][rank]))
+            if cap is not None and math.isfinite(float(cap)) else 0.0
+        )
+        return max(0.0, raw_peak - prep_delta)
 
     def typed_binding(
         self, replica: int, name: str, *, tier: str = "hbm",
@@ -552,7 +732,14 @@ class _MemoryLedgerMixin:
             raise ValueError("memory_stage_out_of_range")
         value = float(record.get("bytes", 0.0) if amount is None else amount)
         domain_id = self.ledger_domain.domain_id
-        pool = self.ledger_pool(replica, stage, rank, tier=tier, domain=domain_id)
+        tier_norm = str(tier or "hbm").lower()
+        if tier_norm == "host":
+            pool = PoolKey(
+                physical_domain=domain_id, rank=-1, tier="host",
+                name="host", unit=int(replica),
+            )
+        else:
+            pool = self.ledger_pool(replica, stage, rank, tier=tier_norm, domain=domain_id)
         occurrence = occurrence or OccurrenceKey(
             runtime_uid=str(getattr(self.runtime_state, "uid", "memory")),
             launch=0, ordinal=scope_ordinal, replica=replica, rank=rank,
@@ -564,7 +751,9 @@ class _MemoryLedgerMixin:
         backing = None
         if backing_key is not None:
             backing = BackingKey(
-                physical_domain=domain_id, rank=int(rank), tier=tier,
+                physical_domain=domain_id,
+                rank=self._backing_physical_rank(replica, stage, int(rank), tier_norm),
+                tier=tier_norm,
                 storage_id=str(backing_key), generation=int(generation))
         raw = ranges if ranges is not None else record.get("ranges")
         byte_ranges = _half_open_ranges(raw, value)
@@ -575,28 +764,137 @@ class _MemoryLedgerMixin:
             storage=str(storage or record.get("storage", "")),
             access=access, acquire=acquire)
 
+    def _parse_ledger_pool(self, pool: PoolKey) -> tuple[str, int, int, int] | None:
+        if self.ledger_domain is None or pool.physical_domain != self.ledger_domain.domain_id:
+            return None
+        p = self.case.runtime.parallel
+        tier = str(pool.tier or "hbm").lower()
+        rep = int(pool.unit)
+        if not 0 <= rep < p.dp:
+            return None
+        if tier == "host":
+            return ("host", rep, 0, -1)
+        if tier in {"hbm", ""} and str(pool.name).startswith("stage"):
+            try:
+                stage = int(str(pool.name)[5:])
+            except ValueError:
+                return None
+            rank = int(pool.rank)
+            if 0 <= stage < p.pp and 0 <= rank < self.width:
+                return ("hbm", rep, stage, rank)
+        return None
+
+    def _mirrored_typed_keys(self) -> tuple[set, set]:
+        mirrored_allocs = {
+            alloc for keys in self._typed_grants.values() for alloc in keys
+        }
+        shadow_map = getattr(self, "_domain_shadow_grants", None)
+        if shadow_map:
+            for s_key, _amt in shadow_map.values():
+                mirrored_allocs.add(s_key)
+        mirrored_readers = {
+            rk
+            for readers in self.grant_readers.values()
+            for snap in readers.values()
+            for rk in snap.get("readers", ())
+        }
+        return mirrored_allocs, mirrored_readers
+
+    def _typed_preflight_blocked(self, items: tuple) -> list[PoolKey]:
+        """Check unified physical HBM/host budget for incoming typed bindings."""
+        extra_holders = []
+        unbacked_hbm: list[tuple[int, int, int, float, PoolKey]] = []
+        unbacked_host: list[tuple[int, float, PoolKey]] = []
+        pool_for_loc: dict[tuple[str, int, int, int], PoolKey] = {}
+        for idx, item in enumerate(items):
+            if not isinstance(item, AllocationBinding) or not item.acquire:
+                continue
+            if item.reservation_parent is not None:
+                continue
+            parsed = self._parse_ledger_pool(item.pool)
+            if parsed is None:
+                continue
+            tier_kind, rep, st, rk = parsed
+            pool_for_loc[(tier_kind, rep, st, rk)] = item.pool
+            if item.backing is None:
+                if tier_kind == "host":
+                    unbacked_host.append((rep, float(item.amount), item.pool))
+                else:
+                    unbacked_hbm.append((rep, st, rk, float(item.amount), item.pool))
+                continue
+            ref_ranges = _half_open_ranges(item.byte_ranges, float(item.amount))
+            if not ref_ranges:
+                continue
+            ref = _PhysicalRef(
+                rank=rk if tier_kind == "hbm" else 0,
+                stage=st,
+                storage=str(item.storage or ""),
+                tier=tier_kind,
+                physical_key=str(item.backing.storage_id),
+                generation=_hashable_generation(item.backing.generation),
+                ranges=ref_ranges if tier_kind == "hbm" else (),
+                host_ranges=ref_ranges if tier_kind == "host" else (),
+            )
+            extra_holders.append(((rep, "typed_cand", str(idx)), (ref,)))
+        if not extra_holders and not unbacked_hbm and not unbacked_host:
+            return []
+        hbm, host = self._state_usage(extra_holders=extra_holders)
+        for rep, st, rk, amt, _pool in unbacked_hbm:
+            hbm[rep][st][rk] += amt
+        for rep, amt, _pool in unbacked_host:
+            host[rep] += amt
+        blocked: list[PoolKey] = []
+        for (tier_kind, rep, st, rk), pool in pool_for_loc.items():
+            if tier_kind == "host":
+                cap = self.host_dram_capacity[rep]
+                if host[rep] > cap + max(1e-9, abs(cap) * 1e-12):
+                    blocked.append(pool)
+            else:
+                cap = self.rank_capacity[rep][st][rk]
+                if hbm[rep][st][rk] > cap + max(1e-9, abs(cap) * 1e-12):
+                    blocked.append(pool)
+        return blocked
+
     def grant_typed(self, bindings, *, holder, at):
         """Atomic typed grant against the adopted RuntimeState domain."""
         if self.ledger_domain is None:
             raise ValueError("memory_ledger_not_bound")
-        return Ledger.try_acquire(self.runtime_state, tuple(bindings),
-                                  holder=holder, at=at)
+        items = tuple(bindings)
+        blocked = self._typed_preflight_blocked(items)
+        if blocked:
+            return GrantResult(
+                granted=False, allocations=(), blocked_pools=tuple(blocked),
+            )
+        result = Ledger.try_acquire(
+            self.runtime_state, items, holder=holder, at=at,
+        )
+        if result.granted and result.allocations:
+            self._sync_usage()
+            self.budget_version += 1
+        return result
 
     def retain_reader_typed(self, allocation: AllocationKey, *, reader,
                             ranges=(), expected_generation=None):
         if self.ledger_domain is None:
             raise ValueError("memory_ledger_not_bound")
-        return Ledger.retain_reader(
+        lease = Ledger.retain_reader(
             self.runtime_state, allocation, reader=reader, ranges=ranges,
             expected_generation=expected_generation)
+        self._sync_usage()
+        self.budget_version += 1
+        return lease
 
     def release_typed(self, allocation: AllocationKey, *, after,
                       expected_generation=None):
         if self.ledger_domain is None:
             raise ValueError("memory_ledger_not_bound")
-        return Ledger.release(
+        result = Ledger.release(
             self.runtime_state, allocation, after=after,
             expected_generation=expected_generation)
+        if result.released or result.deferred:
+            self._sync_usage()
+            self.budget_version += 1
+        return result
 
     def ledger_usage(self) -> dict[PoolKey, float]:
         if self.ledger_domain is None:
@@ -651,6 +949,8 @@ class _MemoryLedgerMixin:
         by_name = dict(items)
         refs: dict[str, _PhysicalRef] = {}
         for item in items.values():
+            if not item.live:
+                continue
             source = item
             if item.pool:
                 # A suballocation is inside its declared pool reservation.
@@ -767,6 +1067,53 @@ class _MemoryLedgerMixin:
         self._accumulate_owner_map(result, self.staging_owner_ranks, self._cohort_staging_ranks)
         return result
 
+    def _cohort_logical_maps(self) -> tuple[dict, dict, dict]:
+        log_res = getattr(self, "_cohort_logical_owner_ranks", None)
+        if log_res is None:
+            log_res = {}
+            self._cohort_logical_owner_ranks = log_res
+        log_stg = getattr(self, "_cohort_logical_staging_ranks", None)
+        if log_stg is None:
+            log_stg = {}
+            self._cohort_logical_staging_ranks = log_stg
+        holds = getattr(self, "_cohort_hold_snapshots", None)
+        if holds is None:
+            holds = {}
+            self._cohort_hold_snapshots = holds
+        return log_res, log_stg, holds
+
+    def _union_cohort_maps(
+        self,
+        base_map: Mapping[int, tuple[tuple[float, ...], ...]],
+        extra_maps: Sequence[Mapping[int, tuple[tuple[float, ...], ...]]],
+    ) -> dict[int, tuple[tuple[float, ...], ...]]:
+        """Element-wise max across all peer replicas, stages, and local ranks."""
+        p = self.case.runtime.parallel
+        merged: dict[int, list[list[float]]] = {}
+        for mapping in (base_map, *extra_maps):
+            for peer_rep, rows in mapping.items():
+                dst = merged.get(peer_rep)
+                if dst is None:
+                    dst = [[0.0] * self.width for _ in range(p.pp)]
+                    merged[peer_rep] = dst
+                for st, row in enumerate(rows):
+                    for rk, val in enumerate(row):
+                        fv = float(val)
+                        if fv > dst[st][rk]:
+                            dst[st][rk] = fv
+        return {rep: tuple(tuple(row) for row in rows) for rep, rows in merged.items()}
+
+    def _freed_total_bytes(self, before_hbm, before_host, after_hbm, after_host) -> float:
+        """Sum positive per-die HBM and per-replica host byte reductions across all replicas."""
+        p = self.case.runtime.parallel
+        freed = 0.0
+        for rep in range(p.dp):
+            freed += max(0.0, float(before_host[rep]) - float(after_host[rep]))
+            for st in range(p.pp):
+                for rk in range(self.width):
+                    freed += max(0.0, float(before_hbm[rep][st][rk]) - float(after_hbm[rep][st][rk]))
+        return freed
+
     def _resident_admission(
         self, replica: int, request: str, tokens: int,
         *, query_tokens: int | None = None, proposal_tokens: int | None = None,
@@ -780,24 +1127,72 @@ class _MemoryLedgerMixin:
         eff_q = self._resolve_request_query_tokens(
             key, query_tokens=query_tokens, proposal_tokens=proposal_tokens,
         )
-        res_all, stg_all, res_map, stg_map = self._kv_residency_cohort(
-            replica, tokens, query_tokens=eff_q,
-        )
-        own_res = res_map[int(replica)]
-        own_stg = stg_map[int(replica)]
-        demand = tuple(max(row) for row in own_res)
-        demand_staging = tuple(max(row) for row in own_stg)
+        p = self.case.runtime.parallel
+        if p.pp > 1:
+            dp_width = max(1, int(getattr(p, "dcp_dp_width", 1) or 1))
+            cohort_start = (int(replica) // dp_width) * dp_width
+            cohort_end = min(int(p.dp), cohort_start + dp_width)
+            res_map: dict[int, tuple[tuple[float, ...], ...]] = {}
+            stg_map: dict[int, tuple[tuple[float, ...], ...]] = {}
+            for peer_rep in range(cohort_start, cohort_end):
+                peer_res = [[0.0] * self.width for _ in range(p.pp)]
+                peer_stg = [[0.0] * self.width for _ in range(p.pp)]
+                for rk in range(self.width):
+                    cohort_rk = ((peer_rep - cohort_start) * p.pp) * self.width + rk
+                    if peer_rep == int(replica):
+                        gross = self._rank_cache_bytes(
+                            tokens, padded=True, rank=cohort_rk, query_tokens=eff_q,
+                        )
+                    else:
+                        gross = self._dp_cohort_extra_by_stage(
+                            tokens, padded=True, rank=cohort_rk,
+                            query_tokens=eff_q, peer_count_override=1,
+                        )
+                    layer_max = (
+                        self._rank_max_layer_cache_bytes(tokens, cohort_rk, query_tokens=eff_q)
+                        if self.kvc_hbm_ratio < 1.0 else (0.0,) * p.pp
+                    )
+                    for st in range(p.pp):
+                        if self.kvc_hbm_ratio == 1.0:
+                            peer_res[st][rk] = float(gross[st])
+                        else:
+                            peer_res[st][rk] = float(gross[st]) * self.kvc_hbm_ratio
+                            peer_stg[st][rk] = float(layer_max[st]) * (1.0 - self.kvc_hbm_ratio)
+                res_map[peer_rep] = tuple(tuple(row) for row in peer_res)
+                stg_map[peer_rep] = tuple(tuple(row) for row in peer_stg)
+        else:
+            _ra, _sa, res_map, stg_map = self._kv_residency_cohort(
+                replica, tokens, query_tokens=eff_q,
+            )
+        logical_res_map = dict(res_map)
+        logical_stg_map = dict(stg_map)
+        _, _, cohort_holds = self._cohort_logical_maps()
+        hold_snaps = cohort_holds.get(key, {})
+        if hold_snaps:
+            res_map = self._union_cohort_maps(
+                logical_res_map, [snap[0] for snap in hold_snaps.values()],
+            )
+            stg_map = self._union_cohort_maps(
+                logical_stg_map, [snap[1] for snap in hold_snaps.values()],
+            )
+        own_logical_res = logical_res_map[int(replica)]
+        own_logical_stg = logical_stg_map[int(replica)]
+        demand = tuple(max(row) for row in own_logical_res)
+        demand_staging = tuple(max(row) for row in own_logical_stg)
         host_demand = self.host_dram_cache_bytes(tokens) if self.sparse_offload else 0.0
         (physical, host_physical, physical_staging,
          physical_ranks, physical_staging_ranks) = self._physical_union(
             key, demand, host_demand, demand_staging,
-            demand_ranks=own_res, staging_ranks=own_stg,
+            demand_ranks=res_map[int(replica)], staging_ranks=stg_map[int(replica)],
         )
         res_map[int(replica)] = physical_ranks
         stg_map[int(replica)] = physical_staging_ranks
-        res_all[int(replica)] = [list(row) for row in physical_ranks]
-        stg_all[int(replica)] = [list(row) for row in physical_staging_ranks]
-        p = self.case.runtime.parallel
+        res_all = [[[0.0] * self.width for _ in range(p.pp)] for _ in range(p.dp)]
+        stg_all = [[[0.0] * self.width for _ in range(p.pp)] for _ in range(p.dp)]
+        for peer_rep, rows in res_map.items():
+            res_all[peer_rep] = [list(row) for row in rows]
+        for peer_rep, rows in stg_map.items():
+            stg_all[peer_rep] = [list(row) for row in rows]
         host_request = [0.0] * p.dp
         host_request[replica] = float(host_physical)
         hbm, host = self._state_usage(
@@ -808,13 +1203,15 @@ class _MemoryLedgerMixin:
         return {
             "demand": demand, "physical": physical,
             "physical_ranks": physical_ranks,
-            "demand_ranks": own_res,
+            "demand_ranks": own_logical_res,
             "demand_staging": demand_staging,
-            "demand_staging_ranks": own_stg,
+            "demand_staging_ranks": own_logical_stg,
             "physical_staging": physical_staging,
             "physical_staging_ranks": physical_staging_ranks,
             "cohort_owner_ranks": res_map,
             "cohort_staging_ranks": stg_map,
+            "cohort_logical_owner_ranks": logical_res_map,
+            "cohort_logical_staging_ranks": logical_stg_map,
             "host_demand": float(host_demand),
             "host_physical": float(host_physical),
             "query_tokens": int(resolved_q),
@@ -847,6 +1244,9 @@ class _MemoryLedgerMixin:
             or self.staging_owners.get(key) != candidate["physical_staging"]
             or self.request_query_tokens.get(key) != candidate["query_tokens"]
         )
+        log_res, log_stg, _ = self._cohort_logical_maps()
+        log_res[key] = candidate["cohort_logical_owner_ranks"]
+        log_stg[key] = candidate["cohort_logical_staging_ranks"]
         self._cohort_owner_ranks[key] = candidate["cohort_owner_ranks"]
         self._cohort_staging_ranks[key] = candidate["cohort_staging_ranks"]
         self._set_physical(
@@ -866,15 +1266,217 @@ class _MemoryLedgerMixin:
             self.budget_version += 1
         return True
 
+    def hold_for_async_consumer(
+        self, replica: int, request: str, consumer: str, *,
+        storage: str | None = None, ranges=None, generation: int | None = None,
+        event=None, grant: str | None = None, rank: int | None = None,
+    ) -> bool:
+        key = (replica, request)
+        log_res, log_stg, cohort_holds = self._cohort_logical_maps()
+        had_snap = grant is None and consumer in cohort_holds.get(key, {})
+        ok = super().hold_for_async_consumer(
+            replica, request, consumer, storage=storage, ranges=ranges,
+            generation=generation, event=event, grant=grant, rank=rank,
+        )
+        if ok and grant is None and not had_snap and key in self._cohort_owner_ranks:
+            snap_res = dict(log_res.get(key, self._cohort_owner_ranks[key]))
+            snap_stg = dict(log_stg.get(key, self._cohort_staging_ranks.get(key, {})))
+            cohort_holds.setdefault(key, {})[consumer] = (snap_res, snap_stg)
+        return ok
+
+    def release(self, replica: int, request: str) -> None:
+        key = (replica, request)
+        log_res, log_stg, cohort_holds = self._cohort_logical_maps()
+        if key in self._cohort_owner_ranks and self.async_consumer_holds.get(key):
+            p = self.case.runtime.parallel
+            zeros = tuple((0.0,) * self.width for _ in range(p.pp))
+            log_res[key] = {rep: zeros for rep in self._cohort_owner_ranks[key]}
+            log_stg[key] = {rep: zeros for rep in self._cohort_staging_ranks.get(key, self._cohort_owner_ranks[key])}
+            snaps = cohort_holds.get(key, {})
+            if snaps:
+                self._cohort_owner_ranks[key] = self._union_cohort_maps(
+                    log_res[key], [s[0] for s in snaps.values()],
+                )
+                self._cohort_staging_ranks[key] = self._union_cohort_maps(
+                    log_stg[key], [s[1] for s in snaps.values()],
+                )
+        super().release(replica, request)
+
     def _free_request(self, replica: int, request: str) -> None:
         key = (replica, request)
+        before_hbm, before_host = self._state_usage()
+        sizes = self.owners.get(key, (0.0,) * len(self.weights))
+        events_before = len(self.release_events)
+        log_res, log_stg, cohort_holds = self._cohort_logical_maps()
         self._cohort_owner_ranks.pop(key, None)
         self._cohort_staging_ranks.pop(key, None)
+        log_res.pop(key, None)
+        log_stg.pop(key, None)
+        cohort_holds.pop(key, None)
         super()._free_request(replica, request)
+        after_hbm, after_host = self._state_usage()
+        freed_all = self._freed_total_bytes(before_hbm, before_host, after_hbm, after_host)
+        if len(self.release_events) > events_before:
+            self.release_events[-1]["released_bytes"] = freed_all
+        elif freed_all > 0.0:
+            self.budget_version += 1
+            self.release_events.append({
+                "kind": "request", "replica": replica, "request": request,
+                "stages": sizes, "released_bytes": freed_all,
+            })
+
+    def release_async_consumer(
+        self, replica: int, request: str, consumer: str, *,
+        generation: int | None = None, event=None, rank: int | None = None,
+    ) -> bool:
+        key = (replica, request)
+        before_hbm, before_host = self._state_usage()
+        events_before = len(self.release_events)
+        ok = super().release_async_consumer(
+            replica, request, consumer, generation=generation, event=event, rank=rank,
+        )
+        if not ok:
+            return False
+        log_res, log_stg, cohort_holds = self._cohort_logical_maps()
+        snaps = cohort_holds.get(key)
+        if snaps is not None:
+            snaps.pop(consumer, None)
+            if not snaps:
+                cohort_holds.pop(key, None)
+        if key in self._cohort_owner_ranks:
+            rem_snaps = cohort_holds.get(key, {})
+            new_res = self._union_cohort_maps(
+                log_res.get(key, {}), [s[0] for s in rem_snaps.values()],
+            )
+            new_stg = self._union_cohort_maps(
+                log_stg.get(key, {}), [s[1] for s in rem_snaps.values()],
+            )
+            self._cohort_owner_ranks[key] = new_res
+            self._cohort_staging_ranks[key] = new_stg
+            if int(replica) in new_res:
+                own_res = new_res[int(replica)]
+                own_stg = new_stg.get(int(replica), self.staging_owner_ranks.get(key))
+                self.owner_ranks[key] = own_res
+                self.owners[key] = tuple(max(row) for row in own_res)
+                if own_stg is not None:
+                    self.staging_owner_ranks[key] = own_stg
+                    self.staging_owners[key] = tuple(max(row) for row in own_stg)
+            self._sync_usage()
+        after_hbm, after_host = self._state_usage()
+        freed_all = self._freed_total_bytes(before_hbm, before_host, after_hbm, after_host)
+        if len(self.release_events) > events_before:
+            self.release_events[-1]["released_bytes"] = freed_all
+        return True
+
+    def _add_typed_domain_usage(
+        self,
+        backing_ranges: dict[tuple, list],
+        host_ranges: dict[tuple, list],
+        hbm: list[list[list[float]]],
+        host: list[float],
+        *,
+        skip_reclaimable: bool = False,
+    ) -> None:
+        """Fold live non-mirrored ``self.ledger_domain`` grants & reader pins into usage."""
+        if self.ledger_domain is None:
+            return
+        mirrored_allocs, mirrored_readers = self._mirrored_typed_keys()
+        backing_storage: dict[BackingKey, str] = {}
+        for grant in self.ledger_domain.grants.values():
+            if grant.released or grant.key in mirrored_allocs:
+                continue
+            if skip_reclaimable and (grant.deferred or grant.last_use is not None):
+                continue
+            parsed = self._parse_ledger_pool(grant.pool)
+            if parsed is None:
+                continue
+            tier_kind, rep, st, rk = parsed
+            if grant.backing is None:
+                if grant.acquire:
+                    if tier_kind == "host":
+                        host[rep] += float(grant.amount)
+                    else:
+                        hbm[rep][st][rk] += float(grant.amount)
+                continue
+            storage_str = str(grant.storage or "")
+            backing_storage.setdefault(grant.backing, storage_str)
+            if grant.acquire and grant.ranges:
+                pairs = [(float(lo), float(hi)) for lo, hi in grant.ranges]
+                gen = _hashable_generation(grant.backing.generation)
+                if tier_kind == "host":
+                    host_ranges.setdefault(
+                        (rep, 0, st, storage_str, str(grant.backing.storage_id), gen), []
+                    ).extend(pairs)
+                else:
+                    backing_ranges.setdefault(
+                        (rep, rk, st, storage_str, tier_kind, str(grant.backing.storage_id), gen), []
+                    ).extend(pairs)
+        for backing_rec in self.ledger_domain.backings.values():
+            parsed = self._parse_ledger_pool(backing_rec.pool)
+            if parsed is None:
+                continue
+            tier_kind, rep, st, rk = parsed
+            storage_str = backing_storage.get(backing_rec.key, "")
+            gen = _hashable_generation(backing_rec.key.generation)
+            for reader_key, r_ranges in backing_rec.reader_pins.items():
+                if reader_key in mirrored_readers or not r_ranges:
+                    continue
+                if skip_reclaimable:
+                    continue
+                pairs = [(float(lo), float(hi)) for lo, hi in r_ranges]
+                if tier_kind == "host":
+                    host_ranges.setdefault(
+                        (rep, 0, st, storage_str, str(backing_rec.key.storage_id), gen), []
+                    ).extend(pairs)
+                else:
+                    backing_ranges.setdefault(
+                        (rep, rk, st, storage_str, tier_kind, str(backing_rec.key.storage_id), gen), []
+                    ).extend(pairs)
+
+    def _candidate_only_usage(self, extra_holders):
+        """Evaluate HBM/host usage of ONLY ``extra_holders`` (all live holders released)."""
+        p = self.case.runtime.parallel
+        hbm = [[[0.0] * self.width for _ in range(p.pp)] for _ in range(p.dp)]
+        host = [0.0] * p.dp
+        backing_ranges: dict[tuple, list] = {}
+        host_ranges: dict[tuple, list] = {}
+        for holder, refs in extra_holders:
+            replica = holder[0]
+            for ref in refs:
+                if ref.tier == "host":
+                    if ref.host_ranges:
+                        host_ranges.setdefault((
+                            replica, ref.rank, ref.stage, ref.storage,
+                            ref.physical_key, ref.generation), []).extend(ref.host_ranges)
+                    continue
+                if ref.tier not in {"hbm", ""}:
+                    continue
+                backing_ranges.setdefault((
+                    replica, ref.rank, ref.stage, ref.storage, ref.tier,
+                    ref.physical_key, ref.generation), []).extend(ref.ranges)
+                if ref.host_ranges:
+                    host_ranges.setdefault((
+                        replica, ref.rank, ref.stage, ref.storage,
+                        ref.physical_key, ref.generation), []).extend(ref.host_ranges)
+        for (replica, rank, stage, _storage, _tier, _key, _generation), ranges in backing_ranges.items():
+            hbm[replica][stage][rank] += _union_bytes(ranges)
+        for (replica, _rank, _stage, _storage, _key, _generation), ranges in host_ranges.items():
+            host[replica] += _union_bytes(ranges)
+        return hbm, host
+
+    def _freed_replica_hbm(self, replica: int, before_hbm, after_hbm) -> float:
+        """Sum positive per-(stage, rank) physical HBM byte reductions on ``replica``."""
+        p = self.case.runtime.parallel
+        freed = 0.0
+        for st in range(p.pp):
+            for rk in range(self.width):
+                freed += max(0.0, float(before_hbm[replica][st][rk]) - float(after_hbm[replica][st][rk]))
+        return freed
 
     def _state_usage(
         self, *, extra_holders=(), drop_holders=(), exclude_request=None,
         request_usage=None, staging_usage=None, host_request=None,
+        include_typed_domain: bool = True,
     ):
         """Candidate HBM/host usage without mutating any ledger state."""
         p = self.case.runtime.parallel
@@ -911,6 +1513,8 @@ class _MemoryLedgerMixin:
                         replica, ref.rank, ref.stage, ref.storage,
                         ref.physical_key, ref.generation), []).extend(
                             ref.host_ranges)
+        if include_typed_domain:
+            self._add_typed_domain_usage(backing_ranges, host_ranges, hbm, host)
         for (replica, rank, stage, _storage, _tier, _key, _generation), ranges in \
                 backing_ranges.items():
             hbm[replica][stage][rank] += _union_bytes(ranges)
@@ -990,6 +1594,44 @@ class _MemoryLedgerMixin:
                 entry = backings.setdefault(key, {"ranges": [], "kinds": set()})
                 entry["ranges"].extend(ref.ranges)
                 entry["kinds"].add(category)
+        if self.ledger_domain is not None:
+            mirrored_allocs, mirrored_readers = self._mirrored_typed_keys()
+            backing_storage: dict[BackingKey, str] = {}
+            for grant in self.ledger_domain.grants.values():
+                if grant.released or grant.key in mirrored_allocs:
+                    continue
+                parsed = self._parse_ledger_pool(grant.pool)
+                if parsed is None or parsed[0] != "hbm":
+                    continue
+                _tk, rep, st, rk = parsed
+                if grant.backing is None:
+                    if grant.acquire:
+                        granted[rep][st][rk] += float(grant.amount)
+                    continue
+                storage_str = str(grant.storage or "")
+                backing_storage.setdefault(grant.backing, storage_str)
+                if grant.acquire and grant.ranges:
+                    key = (rep, rk, st, storage_str, "hbm",
+                           str(grant.backing.storage_id),
+                           _hashable_generation(grant.backing.generation))
+                    entry = backings.setdefault(key, {"ranges": [], "kinds": set()})
+                    entry["ranges"].extend((float(lo), float(hi)) for lo, hi in grant.ranges)
+                    entry["kinds"].add("grant")
+            for backing_rec in self.ledger_domain.backings.values():
+                parsed = self._parse_ledger_pool(backing_rec.pool)
+                if parsed is None or parsed[0] != "hbm":
+                    continue
+                _tk, rep, st, rk = parsed
+                storage_str = backing_storage.get(backing_rec.key, "")
+                gen = _hashable_generation(backing_rec.key.generation)
+                for reader_key, r_ranges in backing_rec.reader_pins.items():
+                    if reader_key in mirrored_readers or not r_ranges:
+                        continue
+                    key = (rep, rk, st, storage_str, "hbm",
+                           str(backing_rec.key.storage_id), gen)
+                    entry = backings.setdefault(key, {"ranges": [], "kinds": set()})
+                    entry["ranges"].extend((float(lo), float(hi)) for lo, hi in r_ranges)
+                    entry["kinds"].add("reader")
         for (replica, rank, stage, _storage, _tier, _key, _generation), entry in \
                 backings.items():
             value = _union_bytes(entry["ranges"])
@@ -1055,6 +1697,7 @@ class _MemoryLedgerMixin:
                     shared[replica][stage])
                 self.granted[replica][stage] = max(granted[replica][stage])
         self._rebuild_grant_backings()
+        self._sync_domain_occupancy()
 
     def _rebuild_grant_backings(self) -> None:
         backings: dict[tuple, dict] = {}
@@ -1188,19 +1831,400 @@ class _MemoryLedgerMixin:
             self.capacity[replica] = [
                 min(row) for row in self.rank_capacity[replica]
             ]
+        self._sync_domain_occupancy()
         self.budget_version += 1
+
+    @staticmethod
+    def _describe_release_event(event: Any) -> str:
+        if event is None:
+            return ""
+        if isinstance(event, str):
+            return event.strip()
+        seq = getattr(event, "sequence", None)
+        if seq is not None:
+            return f"event:{seq}"
+        return repr(event)
+
+    def _collect_reclaimable_holders_and_events(self):
+        """Identify live holders backed by explicit release events/boundaries."""
+        p = self.case.runtime.parallel
+        drop_holders: set = set()
+        events_by_die = [
+            [[set() for _ in range(self.width)] for _ in range(p.pp)]
+            for _ in range(p.dp)
+        ]
+
+        def _add_ev(rep: int, st: int, rk: int, label: str) -> None:
+            if label and 0 <= rep < p.dp and 0 <= st < p.pp and 0 <= rk < self.width:
+                events_by_die[rep][st][rk].add(label)
+
+        for (rep, name), binding in self.grant_bindings.items():
+            ev_desc = self._describe_release_event(binding.get("event"))
+            if not ev_desc:
+                continue
+            holder = (rep, "grant", name)
+            drop_holders.add(holder)
+            for ref in self._refs.get(holder, ()):
+                if ref.tier in {"hbm", ""} and ref.ranges:
+                    _add_ev(rep, ref.stage, ref.rank, f"grant:{name}:{ev_desc}")
+        for (rep, grant), readers in self.grant_readers.items():
+            for consumer, snap in readers.items():
+                ev_desc = self._describe_release_event(snap.get("event"))
+                if not ev_desc:
+                    continue
+                holder = (rep, "grant_reader", f"{grant}::{consumer}")
+                drop_holders.add(holder)
+                for ref in self._refs.get(holder, ()):
+                    if ref.tier in {"hbm", ""} and ref.ranges:
+                        _add_ev(rep, ref.stage, ref.rank, f"grant_reader:{grant}:{consumer}:{ev_desc}")
+        for (rep, st, name), binding in self.effect_bindings.items():
+            ev_desc = self._describe_release_event(binding.get("event"))
+            if not ev_desc:
+                continue
+            holder = (rep, "selected", st, name)
+            drop_holders.add(holder)
+            for ref in self._refs.get(holder, ()):
+                if ref.tier in {"hbm", ""} and ref.ranges:
+                    _add_ev(rep, ref.stage, ref.rank, f"selected:{name}:{ev_desc}")
+        if self.ledger_domain is not None:
+            mirrored_allocs, _mirrored_readers = self._mirrored_typed_keys()
+            for grant in self.ledger_domain.grants.values():
+                if grant.released or grant.key in mirrored_allocs:
+                    continue
+                if not (grant.deferred or grant.last_use is not None):
+                    continue
+                parsed = self._parse_ledger_pool(grant.pool)
+                if parsed is None or parsed[0] != "hbm":
+                    continue
+                _tk, rep, st, rk = parsed
+                ev_label = (
+                    f"typed_grant:{grant.key.symbol}:{grant.last_use}"
+                    if grant.last_use is not None else f"typed_grant:{grant.key.symbol}:deferred"
+                )
+                _add_ev(rep, st, rk, ev_label)
+        return drop_holders, events_by_die
+
+    @staticmethod
+    def _record_nonzero_rank_events(
+        events_by_die, replica: int, rows, labels: Sequence[str],
+    ) -> None:
+        for st, row in enumerate(rows):
+            for rk, val in enumerate(row):
+                if float(val) > 0.0:
+                    events_by_die[replica][st][rk].update(labels)
+
+    @staticmethod
+    def _add_rank_rows(target, replica: int, rows) -> None:
+        for st, row in enumerate(rows):
+            for rk, val in enumerate(row):
+                target[replica][st][rk] += float(val)
+
+    def _split_request_async_holds(self, key: tuple[int, str]):
+        """Split ``async_consumer_holds[key]`` into unbounded vs explicit event-bound holds."""
+        _rep, req = key
+        holds = self.async_consumer_holds.get(key, {})
+        unbounded: list[tuple[str, Any]] = []
+        event_labels: list[str] = []
+        for cons, snap in sorted(holds.items()):
+            ev_desc = self._describe_release_event(dict(snap.binding).get("event"))
+            if ev_desc:
+                event_labels.append(f"async_consumer:{req}:{cons}:{ev_desc}")
+            else:
+                unbounded.append((cons, snap))
+        return unbounded, tuple(event_labels)
+
+    def _max_rank_rows(self, rows_list) -> list[list[float]]:
+        p = self.case.runtime.parallel
+        out = [[0.0] * self.width for _ in range(p.pp)]
+        for rows in rows_list:
+            for st, row in enumerate(rows):
+                for rk, val in enumerate(row):
+                    fv = float(val)
+                    if fv > out[st][rk]:
+                        out[st][rk] = fv
+        return out
+
+    def _record_reclaim_diff_events(
+        self, events_by_die, replica: int, phys_rows, ret_rows, labels: Sequence[str],
+    ) -> None:
+        if not labels:
+            return
+        for st, (p_row, r_row) in enumerate(zip(phys_rows, ret_rows)):
+            for rk, (pv, rv) in enumerate(zip(p_row, r_row)):
+                if float(pv) > float(rv) + 1e-9:
+                    events_by_die[replica][st][rk].update(labels)
+
+    def _fold_single_request_retention(
+        self, key: tuple[int, str], phys_rows, retained_hbm, events_by_die,
+    ) -> None:
+        """Retain logical + eventless hold ranges for one request and collect bound events."""
+        rep, req = key
+        p = self.case.runtime.parallel
+        zeros = tuple((0.0,) * self.width for _ in range(p.pp))
+        cohort_map = self._cohort_owner_ranks.get(key)
+        stg_cohort = self._cohort_staging_ranks.get(key)
+        log_res_all, log_stg_all, cohort_holds = self._cohort_logical_maps()
+        unbounded, ev_labels = self._split_request_async_holds(key)
+        if key in self.delayed_owners:
+            rem, _sizes = self.delayed_owners[key]
+            labels = (f"delayed_release:{req}:steps={int(rem)}",) + ev_labels
+            if not unbounded:
+                if cohort_map is not None:
+                    for peer_rep, peer_rows in cohort_map.items():
+                        self._record_nonzero_rank_events(events_by_die, peer_rep, peer_rows, labels)
+                else:
+                    self._record_nonzero_rank_events(events_by_die, rep, phys_rows, labels)
+                return
+        else:
+            labels = ev_labels
+        retired = key in self.retired_requests or key in self.delayed_owners
+        if cohort_map is not None:
+            base_res = {r: zeros for r in cohort_map} if retired else log_res_all.get(key, cohort_map)
+            base_stg = (
+                {r: zeros for r in (stg_cohort or cohort_map)}
+                if retired else log_stg_all.get(key, stg_cohort or {})
+            )
+            snaps = cohort_holds.get(key, {})
+            unb_res = [snaps[c][0] for c, _ in unbounded if c in snaps]
+            unb_stg = [snaps[c][1] for c, _ in unbounded if c in snaps]
+            ret_res = self._union_cohort_maps(base_res, unb_res)
+            ret_stg = self._union_cohort_maps(base_stg, unb_stg)
+            for peer_rep, peer_rows in cohort_map.items():
+                r_rows = ret_res.get(peer_rep, zeros)
+                s_rows = ret_stg.get(peer_rep, zeros)
+                self._add_rank_rows(retained_hbm, peer_rep, r_rows)
+                self._add_rank_rows(retained_hbm, peer_rep, s_rows)
+                p_stg = stg_cohort.get(peer_rep, zeros) if stg_cohort is not None else zeros
+                phys_sum = [[float(a) + float(b) for a, b in zip(pr, ps)] for pr, ps in zip(peer_rows, p_stg)]
+                ret_sum = [[float(a) + float(b) for a, b in zip(rr, rs)] for rr, rs in zip(r_rows, s_rows)]
+                self._record_reclaim_diff_events(events_by_die, peer_rep, phys_sum, ret_sum, labels)
+            return
+        base_r = zeros if retired else self.logical_owner_ranks.get(key, phys_rows)
+        stg_rows = self.staging_owner_ranks.get(key, zeros)
+        base_s = zeros if retired else self.logical_staging_rank.get(key, stg_rows)
+        unb_r = [snap.rank_stages or self._replicate_ranks(snap.stages) for _, snap in unbounded]
+        unb_s = [snap.rank_staging or self._replicate_ranks(snap.staging) for _, snap in unbounded]
+        ret_r = self._max_rank_rows((base_r, *unb_r))
+        ret_s = self._max_rank_rows((base_s, *unb_s))
+        self._add_rank_rows(retained_hbm, rep, ret_r)
+        self._add_rank_rows(retained_hbm, rep, ret_s)
+        phys_sum = [[float(a) + float(b) for a, b in zip(pr, ps)] for pr, ps in zip(phys_rows, stg_rows)]
+        ret_sum = [[float(a) + float(b) for a, b in zip(rr, rs)] for rr, rs in zip(ret_r, ret_s)]
+        self._record_reclaim_diff_events(events_by_die, rep, phys_sum, ret_sum, labels)
+
+    def _fold_request_reclaimable_retention(self, retained_hbm, events_by_die) -> None:
+        """Retain non-reclaimable request demand and record explicit release events."""
+        for key, phys_rows in self.owner_ranks.items():
+            self._fold_single_request_retention(key, phys_rows, retained_hbm, events_by_die)
+
+    @staticmethod
+    def _norm_receipt_gen(value) -> Any:
+        if value is None:
+            return 0
+        if isinstance(value, int) and not isinstance(value, bool):
+            return int(value)
+        return _hashable_generation(value)
+
+    def _collect_non_request_backings(self):
+        """Per-die live & retained non-request HBM backing maps and explicit release events."""
+        p = self.case.runtime.parallel
+        drop_holders, _holder_events = self._collect_reclaimable_holders_and_events()
+        per_die = [
+            [
+                [
+                    {
+                        "unbacked_live": 0.0,
+                        "unbacked_ret": 0.0,
+                        "unbacked_events": set(),
+                        "all_ranges": {},
+                        "ret_ranges": {},
+                        "events": {},
+                    }
+                    for _ in range(self.width)
+                ]
+                for _ in range(p.pp)
+            ]
+            for _ in range(p.dp)
+        ]
+        holder_ev_label: dict[Any, str] = {}
+        for (rep, name), binding in self.grant_bindings.items():
+            ev_desc = self._describe_release_event(binding.get("event"))
+            if ev_desc:
+                holder_ev_label[(rep, "grant", name)] = f"grant:{name}:{ev_desc}"
+        for (rep, grant), readers in self.grant_readers.items():
+            for consumer, snap in readers.items():
+                ev_desc = self._describe_release_event(snap.get("event"))
+                if ev_desc:
+                    holder_ev_label[(rep, "grant_reader", f"{grant}::{consumer}")] = (
+                        f"grant_reader:{grant}:{consumer}:{ev_desc}"
+                    )
+        for (rep, st, name), binding in self.effect_bindings.items():
+            ev_desc = self._describe_release_event(binding.get("event"))
+            if ev_desc:
+                holder_ev_label[(rep, "selected", st, name)] = f"selected:{name}:{ev_desc}"
+
+        for holder, refs in self._refs.items():
+            rep = holder[0]
+            is_drop = holder in drop_holders
+            ev_lbl = holder_ev_label.get(holder, "")
+            for ref in refs:
+                if ref.tier not in {"hbm", ""} or not ref.ranges:
+                    continue
+                slot = per_die[rep][ref.stage][ref.rank]
+                bkey = (
+                    str(ref.storage or ""),
+                    str(ref.physical_key or ""),
+                    self._norm_receipt_gen(ref.generation),
+                    str(ref.tier or "hbm").lower() or "hbm",
+                )
+                slot["all_ranges"].setdefault(bkey, []).extend(ref.ranges)
+                if not is_drop:
+                    slot["ret_ranges"].setdefault(bkey, []).extend(ref.ranges)
+                elif ev_lbl:
+                    slot["events"].setdefault(bkey, set()).add(ev_lbl)
+
+        if self.ledger_domain is not None:
+            self._fold_typed_domain_non_request_backings(per_die)
+        return per_die
+
+    def _fold_typed_domain_non_request_backings(self, per_die) -> None:
+        """Fold non-mirrored ``ledger_domain`` grants and reader pins into ``per_die``."""
+        mirrored_allocs, mirrored_readers = self._mirrored_typed_keys()
+        backing_storage: dict[BackingKey, str] = {}
+        for grant in self.ledger_domain.grants.values():
+            if grant.released or grant.key in mirrored_allocs:
+                continue
+            parsed = self._parse_ledger_pool(grant.pool)
+            if parsed is None or parsed[0] != "hbm":
+                continue
+            _tk, rep, st, rk = parsed
+            slot = per_die[rep][st][rk]
+            is_recl = bool(grant.deferred or grant.last_use is not None)
+            ev_lbl = (
+                f"typed_grant:{grant.key.symbol}:{grant.last_use}"
+                if grant.last_use is not None else f"typed_grant:{grant.key.symbol}:deferred"
+            )
+            if grant.backing is None:
+                if grant.acquire:
+                    slot["unbacked_live"] += float(grant.amount)
+                    if not is_recl:
+                        slot["unbacked_ret"] += float(grant.amount)
+                    else:
+                        slot["unbacked_events"].add(ev_lbl)
+                continue
+            storage_str = str(grant.storage or "")
+            backing_storage.setdefault(grant.backing, storage_str)
+            if grant.acquire and grant.ranges:
+                pairs = [(float(lo), float(hi)) for lo, hi in grant.ranges]
+                bkey = (storage_str, str(grant.backing.storage_id), self._norm_receipt_gen(grant.backing.generation), "hbm")
+                slot["all_ranges"].setdefault(bkey, []).extend(pairs)
+                if not is_recl:
+                    slot["ret_ranges"].setdefault(bkey, []).extend(pairs)
+                else:
+                    slot["events"].setdefault(bkey, set()).add(ev_lbl)
+        for backing_rec in self.ledger_domain.backings.values():
+            parsed = self._parse_ledger_pool(backing_rec.pool)
+            if parsed is None or parsed[0] != "hbm":
+                continue
+            _tk, rep, st, rk = parsed
+            slot = per_die[rep][st][rk]
+            storage_str = backing_storage.get(backing_rec.key, "")
+            bkey = (storage_str, str(backing_rec.key.storage_id), self._norm_receipt_gen(backing_rec.key.generation), "hbm")
+            for reader_key, r_ranges in backing_rec.reader_pins.items():
+                if reader_key in mirrored_readers or not r_ranges:
+                    continue
+                pairs = [(float(lo), float(hi)) for lo, hi in r_ranges]
+                slot["all_ranges"].setdefault(bkey, []).extend(pairs)
+                slot["events"].setdefault(bkey, set()).add(f"typed_reader:{reader_key}")
+
+    def _request_reclaimable_usage_and_events(self):
+        """Per-die request-only ``(reclaimable_bytes, sorted_events)`` from active/retired requests."""
+        p = self.case.runtime.parallel
+        req_live = self._request_usage_ranks()
+        stg_live = self._staging_usage_ranks()
+        retained_req = [[[0.0] * self.width for _ in range(p.pp)] for _ in range(p.dp)]
+        events_by_die = [
+            [[set() for _ in range(self.width)] for _ in range(p.pp)]
+            for _ in range(p.dp)
+        ]
+        self._fold_request_reclaimable_retention(retained_req, events_by_die)
+        reclaimable = [
+            [
+                [
+                    max(0, int(round(
+                        float(req_live[rep][st][rk]) + float(stg_live[rep][st][rk])
+                        - float(retained_req[rep][st][rk])
+                    )))
+                    for rk in range(self.width)
+                ]
+                for st in range(p.pp)
+            ]
+            for rep in range(p.dp)
+        ]
+        sorted_events = [
+            [
+                [
+                    tuple(sorted(events_by_die[rep][st][rk])) if reclaimable[rep][st][rk] > 0 else ()
+                    for rk in range(self.width)
+                ]
+                for st in range(p.pp)
+            ]
+            for rep in range(p.dp)
+        ]
+        return reclaimable, sorted_events
+
+    def _reclaimable_usage_and_events(self):
+        """Per-die ``(reclaimable_hbm_bytes, sorted_release_events)`` via exact backing union."""
+        p = self.case.runtime.parallel
+        req_recl, req_events = self._request_reclaimable_usage_and_events()
+        non_req = self._collect_non_request_backings()
+        reclaimable = [[[0] * self.width for _ in range(p.pp)] for _ in range(p.dp)]
+        sorted_events = [[[() for _ in range(self.width)] for _ in range(p.pp)] for _ in range(p.dp)]
+        for rep in range(p.dp):
+            for st in range(p.pp):
+                for rk in range(self.width):
+                    slot = non_req[rep][st][rk]
+                    nr_live = slot["unbacked_live"] + sum(_union_bytes(r) for r in slot["all_ranges"].values())
+                    nr_ret = slot["unbacked_ret"] + sum(_union_bytes(r) for r in slot["ret_ranges"].values())
+                    nr_recl = max(0, int(round(nr_live - nr_ret)))
+                    total = int(req_recl[rep][st][rk]) + nr_recl
+                    reclaimable[rep][st][rk] = total
+                    if total <= 0:
+                        continue
+                    evs = set(req_events[rep][st][rk])
+                    if slot["unbacked_live"] > slot["unbacked_ret"] + 1e-9:
+                        evs.update(slot["unbacked_events"])
+                    for bkey, b_evs in slot["events"].items():
+                        if _union_bytes(slot["all_ranges"].get(bkey, ())) > _union_bytes(slot["ret_ranges"].get(bkey, ())) + 1e-9:
+                            evs.update(b_evs)
+                    sorted_events[rep][st][rk] = tuple(sorted(evs))
+        return reclaimable, sorted_events
 
     def free_hbm_headroom_bytes(
         self,
         replica: int = 0,
         stage: int | None = None,
         rank: int | None = None,
+        *,
+        mode: str = "historical",
     ) -> int:
-        """Authoritative free HBM headroom on the bottleneck (or addressed) die."""
+        """Authoritative free HBM headroom on the bottleneck (or addressed) die.
+
+        ``mode`` selects the margin basis:
+          * ``"historical"`` (default): ``usable - max(current_live, historical_peak)``
+          * ``"immediate"``: ``usable - current_live``
+          * ``"post_reclaim"``: ``usable - (current_live - reclaimable)``
+        """
+        if mode not in {"historical", "immediate", "post_reclaim"}:
+            raise ValueError(f"memory_headroom_mode_invalid:{mode!r}")
         p = self.case.runtime.parallel
         if not 0 <= int(replica) < p.dp:
             raise ValueError("memory_grant_index_out_of_range")
         hbm, _ = self._state_usage()
+        reclaimable = (
+            self._reclaimable_usage_and_events()[0]
+            if mode == "post_reclaim" else None
+        )
         stages = (int(stage),) if stage is not None else tuple(range(p.pp))
         ranks = (self._account_rank(rank),) if rank is not None else tuple(range(self.width))
         headrooms: list[int] = []
@@ -1209,7 +2233,18 @@ class _MemoryLedgerMixin:
                 raise ValueError("memory_stage_out_of_range")
             for rk in ranks:
                 cap = float(self.rank_capacity[replica][st][rk])
-                used = max(float(hbm[replica][st][rk]), float(self.peak_rank[replica][st][rk]))
+                live = float(hbm[replica][st][rk])
+                if mode == "immediate":
+                    used = live
+                elif mode == "post_reclaim":
+                    recl = float(reclaimable[replica][st][rk]) if reclaimable is not None else 0.0
+                    used = max(0.0, live - recl)
+                else:
+                    used = max(
+                        live,
+                        float(self.peak_rank[replica][st][rk]),
+                        self._domain_peak_hbm(replica, st, rk),
+                    )
                 headrooms.append(int(math.floor(cap - used)))
         return min(headrooms, default=0)
 
@@ -1303,6 +2338,7 @@ class _MemoryLedgerMixin:
         *,
         rank: int | None = None,
         phase: str = "decode",
+        include_dp_cohort_extra: bool = True,
     ) -> tuple[list[dict[str, Any]], Any]:
         """Exact per-stage integer cache pools and component breakdowns for one physical rank."""
         from .cache import _COMPONENT_POOL_MAP
@@ -1312,7 +2348,10 @@ class _MemoryLedgerMixin:
         b_int = int(batch_per_dp)
         is_prefill = str(phase or "decode").strip().lower() == "prefill"
         q_tok = 1 if is_prefill else self._effective_cache_query_tokens(query_tokens)
-        hybrid_b = self._hybrid_pool_receipt(seq, num_requests=b_int, query_tokens=q_tok, phase=phase)
+        hybrid_b = (
+            self._hybrid_pool_receipt(seq, num_requests=b_int, query_tokens=q_tok, phase=phase)
+            if include_dp_cohort_extra else None
+        )
         hybrid_1 = (
             self._hybrid_pool_receipt(seq, num_requests=1, query_tokens=q_tok, phase=phase)
             if hybrid_b is not None else None
@@ -1338,18 +2377,27 @@ class _MemoryLedgerMixin:
             self.pages.metadata_stage_bytes(seq, self.case.runtime.max_model_len, p.pp)
             if self.pages.groups else None
         )
-        cohort_alloc_parts = self._dp_cohort_extra_parts_by_stage(
-            seq, padded=True, rank=rank, query_tokens=q_tok, phase=phase,
-        )
-        cohort_valid_parts = self._dp_cohort_extra_parts_by_stage(
-            seq, padded=False, rank=rank, query_tokens=q_tok, phase=phase,
-        )
-        rank_base_per_req = (
-            None if hybrid_b is not None
-            else self._rank_dp_cohort_cache_bytes(
+        if include_dp_cohort_extra:
+            cohort_alloc_parts = self._dp_cohort_extra_parts_by_stage(
                 seq, padded=True, rank=rank, query_tokens=q_tok, phase=phase,
             )
-        )
+            cohort_valid_parts = self._dp_cohort_extra_parts_by_stage(
+                seq, padded=False, rank=rank, query_tokens=q_tok, phase=phase,
+            )
+            rank_base_per_req = (
+                None if hybrid_b is not None
+                else self._rank_dp_cohort_cache_bytes(
+                    seq, padded=True, rank=rank, query_tokens=q_tok, phase=phase,
+                )
+            )
+        else:
+            cohort_alloc_parts = [{"kv": 0.0, "index": 0.0, "draft": 0.0} for _ in range(p.pp)]
+            cohort_valid_parts = [{"kv": 0.0, "index": 0.0, "draft": 0.0} for _ in range(p.pp)]
+            rank_base_per_req = (
+                list(self.cache_bytes(seq, padded=True, query_tokens=q_tok))
+                if rank is None
+                else self._rank_cache_bytes(seq, padded=True, rank=int(rank), query_tokens=q_tok)
+            )
         c8_static_stages = tuple(getattr(self, "c8_static_channel_scale_by_stage", (0,) * p.pp))
         hbm_ratio = float(self.kvc_hbm_ratio)
         if hbm_ratio < 1.0:
@@ -1559,6 +2607,354 @@ class _MemoryLedgerMixin:
             for st in stages
         ]
 
+    def _extract_ragged_request_specs(
+        self,
+        views: Sequence[Any],
+        *,
+        default_phase: str,
+    ) -> tuple[tuple[int, int, int, str, int], ...]:
+        """Extract logical ``(seq_len, q_len, prefix_tokens, prefix_key, gen)`` per active view."""
+        specs: list[tuple[int, int, int, str, int]] = []
+        norm_default = str(default_phase or "decode").strip().lower()
+        for view in views:
+            if isinstance(view, Mapping):
+                if bool(view.get("padding", False)):
+                    continue
+                v_phase = str(view.get("phase", norm_default) or norm_default).strip().lower()
+                global_q = int(view.get("global_q_len") or 0)
+                local_q = int(view.get("q_len") or 0)
+                prop = int(view.get("draft_proposal_tokens") or 0)
+                ctx = int(view.get("context") or 0)
+                raw_kv = int(view.get("kv_len") or 0)
+                p_tok = int(view.get("prefix_tokens") or 0)
+                p_key = str(view.get("prefix_cache_key") or "")
+                p_gen = int(view.get("prefix_generation") or view.get("generation") or 0)
+            else:
+                if bool(getattr(view, "padding", False)):
+                    continue
+                v_phase = str(getattr(view, "phase", norm_default) or norm_default).strip().lower()
+                global_q = int(getattr(view, "global_q_len", 0) or 0)
+                local_q = int(getattr(view, "q_len", 0) or 0)
+                prop = int(getattr(view, "draft_proposal_tokens", 0) or 0)
+                ctx = int(getattr(view, "context", 0) or 0)
+                raw_kv = int(getattr(view, "kv_len", 0) or 0)
+                p_tok = int(getattr(view, "prefix_tokens", 0) or 0)
+                p_key = str(getattr(view, "prefix_cache_key", "") or "")
+                p_gen = int(getattr(view, "prefix_generation", None) or getattr(view, "generation", 0) or 0)
+            if v_phase == "decode":
+                q_v = max(1, global_q) if global_q > 0 else max(1, (local_q or 1) + max(0, prop))
+                seq_v = max(0, max(raw_kv, ctx + q_v))
+            else:
+                eff_q = global_q if global_q > 0 else local_q
+                q_v = 1
+                seq_v = max(0, max(raw_kv, ctx + max(1, eff_q)))
+            specs.append((seq_v, q_v, max(0, min(p_tok, seq_v)), p_key, p_gen))
+        return tuple(specs)
+
+    def _ragged_shared_prefix_dedup(
+        self,
+        acc: list[dict[str, Any]],
+        specs: Sequence[tuple[int, int, int, str, int]],
+        *,
+        rank: int | None,
+        phase: str,
+        include_dp_cohort_extra: bool = True,
+        peer_dcp_only: bool = False,
+    ) -> None:
+        """Deduplicate ONLY live, window-resident, shareable physical prefix pages (never draft)."""
+        if (
+            getattr(self.case.runtime, "prefix_cache_mode", "private") != "shared"
+            or len(specs) <= 1
+            or not self.case.model.layer_plans
+        ):
+            return
+        from mindie_sim.catalog.cache import DEFAULT_CACHE_BLOCK_SIZE
+        from mindie_sim.catalog.cache_ownership import (
+            SHARING_SHARED,
+            _union_elementary_spans,
+            cache_component_ranges,
+        )
+        from mindie_sim.catalog.context_parallel import (
+            cp_interleave,
+            dcp_indexer_sharded,
+            layer_dcp_factors,
+        )
+        from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
+        from .cache import _COMPONENT_POOL_MAP, _DCP_KV_SHARDED_COMPONENTS
+
+        model, p = self.case.model, self.case.runtime.parallel
+        block = max(1, int(getattr(self.case.runtime, "kv_block_size", 0) or DEFAULT_CACHE_BLOCK_SIZE))
+        interleave = cp_interleave(self.case.runtime)
+        sharded_idx = dcp_indexer_sharded(model, self.case.runtime)
+        hbm_ratio = float(self.kvc_hbm_ratio)
+        shared_spans: dict[tuple, list[tuple[int, int, float]]] = {}
+        gross_shared: dict[tuple, float] = {}
+        for seq_v, q_v, p_tok, p_key, p_gen in specs:
+            if seq_v <= 0 or p_tok <= 0:
+                continue
+            ckey = canonical_prefix_cache_key("shared", p_key)
+            for layer in model.layer_plans:
+                _, _, layer_dp = layer_dcp_factors(layer, p)
+                if peer_dcp_only and layer_dp <= 1:
+                    continue
+                ranges = cache_component_ranges(
+                    model, layer, p, sequence_tokens=int(seq_v),
+                    prefix_tokens=int(p_tok), interleave=interleave,
+                    block_size=block, rank=rank, capacity_padded=False,
+                    runtime=self.case.runtime, query_tokens=int(q_v),
+                    generation=int(p_gen), phase=phase,
+                )
+                st = self.layer_stage[int(layer.index)]
+                for item in ranges:
+                    if item.sharing != SHARING_SHARED or item.valid_bytes <= 0.0:
+                        continue
+                    is_dcp_comp = (
+                        item.component in _DCP_KV_SHARDED_COMPONENTS
+                        or (item.component == "index_k" and sharded_idx)
+                    )
+                    if peer_dcp_only and not is_dcp_comp:
+                        continue
+                    dp_mult = float(layer_dp) if (include_dp_cohort_extra and not peer_dcp_only and is_dcp_comp and layer_dp > 1) else 1.0
+                    span_len = max(1, item.end_token - item.start_token)
+                    rate = (float(item.valid_bytes) * dp_mult * hbm_ratio) / float(span_len)
+                    pool_kind = "idx" if _COMPONENT_POOL_MAP.get(item.component) == "indexer_k_bytes" else "kv"
+                    grp = (int(item.layer), item.component, ckey, int(p_gen), st, pool_kind)
+                    shared_spans.setdefault(grp, []).append((int(item.start_token), int(item.end_token), rate))
+                    gross_shared[grp] = gross_shared.get(grp, 0.0) + float(item.valid_bytes) * dp_mult * hbm_ratio
+        for (_lyr, comp, _ckey, _gen, st, pool_kind), spans in shared_spans.items():
+            saved = int(round(max(0.0, gross_shared[(_lyr, comp, _ckey, _gen, st, pool_kind)] - _union_elementary_spans(spans))))
+            if saved <= 0:
+                continue
+            if pool_kind == "idx":
+                acc[st]["idx_alloc"] = max(0, acc[st]["idx_alloc"] - saved)
+                acc[st]["idx_valid"] = max(0, acc[st]["idx_valid"] - saved)
+            else:
+                acc[st]["kv_alloc"] = max(0, acc[st]["kv_alloc"] - saved)
+                acc[st]["kv_valid"] = max(0, acc[st]["kv_valid"] - saved)
+            if comp in acc[st]["components_batch"]:
+                acc[st]["components_batch"][comp] = max(0, acc[st]["components_batch"][comp] - saved)
+
+    def _empty_projected_stage_acc(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "kv_alloc": 0, "kv_valid": 0, "idx_alloc": 0, "idx_valid": 0,
+                "rec": 0, "draft": 0, "page_group_reserve": 0, "proj_staging": 0,
+                "components_batch": {}, "components_per_req": {},
+            }
+            for _ in range(self.case.runtime.parallel.pp)
+        ]
+
+    def _merge_stage_acc(self, dst: list[dict[str, Any]], src: list[dict[str, Any]]) -> None:
+        for st in range(self.case.runtime.parallel.pp):
+            for key in ("kv_alloc", "kv_valid", "idx_alloc", "idx_valid", "rec", "draft", "page_group_reserve", "proj_staging"):
+                dst[st][key] += int(src[st][key])
+            for comp_name, val in src[st].get("components_batch", {}).items():
+                dst[st]["components_batch"][comp_name] = dst[st]["components_batch"].get(comp_name, 0) + int(val)
+
+    def _projected_ragged_die_cache_pools(
+        self,
+        specs: Sequence[tuple[int, int, int, str, int]],
+        *,
+        rank: int | None,
+        phase: str,
+        include_dp_cohort_extra: bool = True,
+        include_c8: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Sum exact integer cache pools over ragged logical KV lengths (charging C8 once)."""
+        p = self.case.runtime.parallel
+        c8_stages = tuple(getattr(self, "c8_static_channel_scale_by_stage", (0,) * p.pp))
+        buckets: dict[tuple[int, int], int] = {}
+        for seq_v, q_v, _p_tok, _p_key, _p_gen in specs:
+            if seq_v <= 0:
+                continue
+            buckets[(int(seq_v), int(q_v))] = buckets.get((int(seq_v), int(q_v)), 0) + 1
+        acc = self._empty_projected_stage_acc()
+        for (seq_v, q_v), count in sorted(buckets.items()):
+            stages, _ = self._projected_die_cache_pools(
+                seq_v, count, q_v, rank=rank, phase=phase,
+                include_dp_cohort_extra=include_dp_cohort_extra,
+            )
+            for st in range(p.pp):
+                c8_b = int(c8_stages[st]) if st < len(c8_stages) else 0
+                entry = stages[st]
+                acc[st]["kv_alloc"] += max(0, int(entry["kv_alloc"]) - c8_b)
+                acc[st]["kv_valid"] += max(0, int(entry["kv_valid"]) - c8_b)
+                acc[st]["idx_alloc"] += int(entry["idx_alloc"])
+                acc[st]["idx_valid"] += int(entry["idx_valid"])
+                acc[st]["rec"] += int(entry["rec"])
+                acc[st]["draft"] += int(entry["draft"])
+                acc[st]["page_group_reserve"] += int(entry["page_group_reserve"])
+                acc[st]["proj_staging"] += int(entry["proj_staging"])
+                for comp_name, val in entry.get("components_batch", {}).items():
+                    if comp_name == "c8_static_channel_scale":
+                        continue
+                    acc[st]["components_batch"][comp_name] = (
+                        acc[st]["components_batch"].get(comp_name, 0) + int(val)
+                    )
+        self._ragged_shared_prefix_dedup(
+            acc, specs, rank=rank, phase=phase,
+            include_dp_cohort_extra=include_dp_cohort_extra,
+        )
+        if include_c8:
+            for st in range(p.pp):
+                c8_b = int(c8_stages[st]) if st < len(c8_stages) else 0
+                if c8_b > 0:
+                    acc[st]["kv_alloc"] += c8_b
+                    acc[st]["kv_valid"] += c8_b
+                    acc[st]["components_batch"]["c8_static_channel_scale"] = c8_b
+        return acc
+
+    def _projected_peer_dcp_specs(
+        self,
+        specs: Sequence[tuple[int, int, int, str, int]],
+        *,
+        rank: int,
+        phase: str,
+    ) -> list[dict[str, Any]]:
+        """Per-stage DCP-sharded bytes placed on a peer die for one source replica's specs."""
+        p = self.case.runtime.parallel
+        hbm_ratio = float(self.kvc_hbm_ratio)
+        acc = self._empty_projected_stage_acc()
+        buckets: dict[tuple[int, int], int] = {}
+        for seq_v, q_v, _p_tok, _p_key, _p_gen in specs:
+            if seq_v > 0:
+                buckets[(int(seq_v), int(q_v))] = buckets.get((int(seq_v), int(q_v)), 0) + 1
+        for (seq_v, q_v), count in sorted(buckets.items()):
+            a_parts = self._dp_cohort_extra_parts_by_stage(
+                seq_v, padded=True, rank=rank, query_tokens=q_v,
+                phase=phase, peer_count_override=1,
+            )
+            v_parts = self._dp_cohort_extra_parts_by_stage(
+                seq_v, padded=False, rank=rank, query_tokens=q_v,
+                phase=phase, peer_count_override=1,
+            )
+            layer_max = (
+                self._rank_max_layer_cache_bytes(seq_v, rank, query_tokens=q_v)
+                if hbm_ratio < 1.0 else (0.0,) * p.pp
+            )
+            for st in range(p.pp):
+                kv_a = int(round(float(a_parts[st]["kv"]) * hbm_ratio * count))
+                kv_v = int(round(float(v_parts[st]["kv"]) * hbm_ratio * count))
+                idx_a = int(round(float(a_parts[st]["index"]) * hbm_ratio * count))
+                idx_v = int(round(float(v_parts[st]["index"]) * hbm_ratio * count))
+                drf_a = int(round(float(a_parts[st]["draft"]) * hbm_ratio * count))
+                acc[st]["kv_alloc"] += kv_a
+                acc[st]["kv_valid"] += kv_v
+                acc[st]["idx_alloc"] += idx_a
+                acc[st]["idx_valid"] += idx_v
+                acc[st]["draft"] += drf_a
+                if hbm_ratio < 1.0:
+                    acc[st]["proj_staging"] += int(round(float(layer_max[st]) * (1.0 - hbm_ratio) * count))
+                if kv_a > 0:
+                    acc[st]["components_batch"]["dcp_dp_cohort_kv"] = (
+                        acc[st]["components_batch"].get("dcp_dp_cohort_kv", 0) + kv_a
+                    )
+                if idx_a > 0:
+                    acc[st]["components_batch"]["dcp_dp_cohort_index"] = (
+                        acc[st]["components_batch"].get("dcp_dp_cohort_index", 0) + idx_a
+                    )
+                if drf_a > 0:
+                    acc[st]["components_batch"]["dcp_dp_cohort_draft"] = (
+                        acc[st]["components_batch"].get("dcp_dp_cohort_draft", 0) + drf_a
+                    )
+        self._ragged_shared_prefix_dedup(
+            acc, specs, rank=rank, phase=phase,
+            include_dp_cohort_extra=False, peer_dcp_only=True,
+        )
+        return acc
+
+    def _scatter_dp_cohort_projected(
+        self,
+        per_rep_specs: Mapping[int, tuple[tuple[int, int, int, str, int], ...]],
+        *,
+        dp_width: int,
+        phase: str,
+    ) -> dict[tuple[int, int], list[dict[str, Any]]]:
+        """Scatter each source replica's requests onto its true destination cohort dies."""
+        p = self.case.runtime.parallel
+        c8_stages = tuple(getattr(self, "c8_static_channel_scale_by_stage", (0,) * p.pp))
+        resolved: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for src_rep, specs in per_rep_specs.items():
+            if not specs:
+                continue
+            cohort_start = (int(src_rep) // dp_width) * dp_width
+            cohort_end = min(int(p.dp), cohort_start + dp_width)
+            for dst_rep in range(cohort_start, cohort_end):
+                for local_rk in range(self.width):
+                    phys_rk = ((dst_rep - cohort_start) * p.pp) * self.width + local_rk
+                    key = (dst_rep, local_rk)
+                    if key not in resolved:
+                        resolved[key] = self._empty_projected_stage_acc()
+                    if dst_rep == int(src_rep):
+                        part = self._projected_ragged_die_cache_pools(
+                            specs, rank=phys_rk, phase=phase,
+                            include_dp_cohort_extra=False, include_c8=False,
+                        )
+                    else:
+                        part = self._projected_peer_dcp_specs(
+                            specs, rank=phys_rk, phase=phase,
+                        )
+                    self._merge_stage_acc(resolved[key], part)
+        for stages in resolved.values():
+            for st in range(p.pp):
+                c8_b = int(c8_stages[st]) if st < len(c8_stages) else 0
+                if c8_b > 0:
+                    stages[st]["kv_alloc"] += c8_b
+                    stages[st]["kv_valid"] += c8_b
+                    stages[st]["components_batch"]["c8_static_channel_scale"] = c8_b
+        return resolved
+
+    def _merge_die_non_request_and_extra_grants(
+        self,
+        die_backings: Mapping[str, Any],
+        dedup_grants: Sequence[ResidentGrantEntry],
+        base_gids: set[str],
+    ) -> tuple[int, int, set[str]]:
+        """Unify live non-request ledger backings with ``extra_grants`` by physical identity."""
+        all_ranges: dict[tuple, list] = {k: list(v) for k, v in die_backings["all_ranges"].items()}
+        ret_ranges: dict[tuple, list] = {k: list(v) for k, v in die_backings["ret_ranges"].items()}
+        events_map: dict[tuple, set[str]] = {k: set(v) for k, v in die_backings["events"].items()}
+        fixed_backings = {
+            (str(g.physical_backing_id), int(g.generation), str(g.tier or "hbm").lower() or "hbm")
+            for g in dedup_grants
+            if g.grant_id in base_gids or g.grant_id.startswith("prepared:")
+        }
+        key_by_bgt: dict[tuple[str, Any, str], tuple] = {}
+        for bkey in all_ranges:
+            key_by_bgt.setdefault((bkey[1], bkey[2], bkey[3]), bkey)
+        for g in dedup_grants:
+            if g.grant_id in base_gids or g.grant_id.startswith("prepared:"):
+                continue
+            tier_norm = str(g.tier or "hbm").lower() or "hbm"
+            if tier_norm != "hbm" or g.lifetime == "load_peak_only":
+                continue
+            bgt = (str(g.physical_backing_id), int(g.generation), tier_norm)
+            if bgt in fixed_backings and int(g.billed_once_bytes) <= 0:
+                continue
+            raw_b = float(int(g.allocated_bytes or g.runtime_bytes))
+            if raw_b <= 0.0:
+                continue
+            bkey = key_by_bgt.get(bgt, ("", bgt[0], bgt[1], bgt[2]))
+            key_by_bgt.setdefault(bgt, bkey)
+            all_ranges.setdefault(bkey, []).append((0.0, raw_b))
+            ev = str(g.release_event).strip()
+            if g.reclaimable and ev:
+                events_map.setdefault(bkey, set()).add(ev)
+            else:
+                ret_ranges.setdefault(bkey, []).append((0.0, raw_b))
+        unb_live = float(die_backings["unbacked_live"])
+        unb_ret = float(die_backings["unbacked_ret"])
+        live_total = unb_live + sum(_union_bytes(r) for r in all_ranges.values())
+        ret_total = unb_ret + sum(_union_bytes(r) for r in ret_ranges.values())
+        recl_total = max(0, int(round(live_total - ret_total)))
+        evs: set[str] = set()
+        if unb_live > unb_ret + 1e-9:
+            evs.update(die_backings["unbacked_events"])
+        for bkey, b_evs in events_map.items():
+            if _union_bytes(all_ranges.get(bkey, ())) > _union_bytes(ret_ranges.get(bkey, ())) + 1e-9:
+                evs.update(b_evs)
+        return int(round(live_total)), recl_total, evs
+
     def _build_die_receipt(
         self,
         *,
@@ -1579,6 +2975,9 @@ class _MemoryLedgerMixin:
         req_b: int,
         stg_b: int,
         host_b: int,
+        die_backings: Mapping[str, Any],
+        req_reclaimable_b: int = 0,
+        req_reclaim_events: Sequence[str] = (),
     ) -> DieResidentReceipt:
         usable = int(math.floor(die_obj.hbm_bytes * self.case.runtime.gpu_memory_utilization))
         ws_b = int(round(self.workspace[stage] + self.temporary_dequant[stage]))
@@ -1626,19 +3025,29 @@ class _MemoryLedgerMixin:
         raw_entries.extend(extra_grants)
         dedup_grants, _ = _deduplicate_grant_entries(raw_entries)
         base_gids = {ckpt_gid, vis_gid, term_gid, c8_gid}
-        extra_only_billed = sum(
-            g.billed_once_bytes for g in dedup_grants
-            if g.grant_id not in base_gids and not g.grant_id.startswith("prepared:")
+        combined_grant_live, non_req_recl, non_req_evs = (
+            self._merge_die_non_request_and_extra_grants(die_backings, dedup_grants, base_gids)
         )
+        extra_delta = max(0, combined_grant_live - dyn_grant_only)
         prep_total = term_prep_b + prep_persist_b
         fixed_total = ckpt_b + vision_b + prep_total + ws_b + res_b
         if projected is not None:
             eff_stg_b = int(projected.get("proj_staging", 0)) if self.kvc_hbm_ratio < 1.0 else stg_b
-            live_dyn = kv_a + idx_a + rec_b + drf_b + dyn_grant_only + eff_stg_b + extra_only_billed
+            live_dyn = kv_a + idx_a + rec_b + drf_b + eff_stg_b + combined_grant_live
+            total_reclaimable = min(live_dyn, max(0, int(non_req_recl)))
+            combined_reclaim_events = tuple(sorted(non_req_evs)) if total_reclaimable > 0 else ()
         else:
             eff_stg_b = stg_b
-            live_dyn = dyn_live_b + c8_static_b + extra_only_billed
-        peak_dyn = max(live_dyn, dyn_peak_b + c8_static_b + extra_only_billed)
+            live_dyn = req_b + stg_b + c8_static_b + combined_grant_live
+            total_reclaimable = min(
+                live_dyn,
+                max(0, int(req_reclaimable_b)) + max(0, int(non_req_recl)),
+            )
+            combined_reclaim_events = (
+                tuple(sorted(set(req_reclaim_events) | non_req_evs))
+                if total_reclaimable > 0 else ()
+            )
+        peak_dyn = max(live_dyn, dyn_peak_b + c8_static_b + extra_delta)
         sim_live = fixed_total + live_dyn
         sim_peak = fixed_total + peak_dyn
         return DieResidentReceipt(
@@ -1660,14 +3069,138 @@ class _MemoryLedgerMixin:
             workspace_bytes=ws_b,
             reserve_bytes=res_b,
             staging_bytes=eff_stg_b,
-            dynamic_grant_bytes=dyn_grant_only + extra_only_billed,
+            dynamic_grant_bytes=combined_grant_live,
             simultaneous_live_hbm_bytes=sim_live,
             simultaneous_peak_hbm_bytes=sim_peak,
             load_peak_hbm_bytes=sim_peak + prep_load_b,
             free_hbm_headroom_bytes=usable - sim_peak,
             host_dram_bytes=host_b,
             grants=dedup_grants,
+            reclaimable_hbm_bytes=total_reclaimable,
+            reclaimable_release_events=combined_reclaim_events,
         )
+
+    def _resolve_receipt_projected_by_replica(
+        self,
+        *,
+        phase: str,
+        sequence_tokens: int | None,
+        batch_per_dp: int | Sequence[int],
+        query_tokens: int | None,
+        request_views: Sequence[Any] | None,
+        request_views_by_replica: Mapping[int, Sequence[Any]] | Sequence[Sequence[Any]] | None,
+        sequence_lengths: Sequence[int] | None,
+        query_lengths: Sequence[int] | None,
+        dp_width: int,
+        spans_dp: bool,
+    ) -> dict[tuple[int, int], list[dict[str, Any]]]:
+        """Resolve projected per-stage cache pools keyed by ``(replica, rank_slot)``."""
+        p = self.case.runtime.parallel
+        rank_divergent = (
+            self.rank_token_owners is not None or int(getattr(p, "cp", 1) or 1) > 1
+        )
+        per_rep_specs: dict[int, tuple[tuple[int, int, int, str, int], ...]] = {}
+        is_asymmetric_views = False
+        if request_views_by_replica is not None:
+            is_asymmetric_views = True
+            for rep in range(p.dp):
+                if isinstance(request_views_by_replica, Mapping):
+                    raw_views = request_views_by_replica.get(rep, ())
+                else:
+                    raw_views = request_views_by_replica[rep] if rep < len(request_views_by_replica) else ()
+                specs = self._extract_ragged_request_specs(raw_views, default_phase=phase)
+                if specs:
+                    per_rep_specs[rep] = specs
+        elif request_views is not None:
+            specs = self._extract_ragged_request_specs(request_views, default_phase=phase)
+            if specs:
+                for rep in range(p.dp):
+                    per_rep_specs[rep] = specs
+        elif sequence_lengths is not None:
+            seq_list = [int(s) for s in sequence_lengths]
+            if query_lengths is not None:
+                q_list = [int(q) for q in query_lengths]
+                if len(q_list) != len(seq_list):
+                    raise ValueError("memory_receipt_query_lengths_mismatch")
+            else:
+                default_q = 1 if str(phase or "decode").strip().lower() == "prefill" else self._effective_cache_query_tokens(query_tokens)
+                q_list = [default_q] * len(seq_list)
+            specs = tuple((max(0, s), max(1, q), 0, "", 0) for s, q in zip(seq_list, q_list) if s > 0)
+            if specs:
+                for rep in range(p.dp):
+                    per_rep_specs[rep] = specs
+
+        if per_rep_specs:
+            if spans_dp and is_asymmetric_views:
+                return self._scatter_dp_cohort_projected(
+                    per_rep_specs, dp_width=dp_width, phase=str(phase),
+                )
+            resolved: dict[tuple[int, int], list[dict[str, Any]]] = {}
+            cache_by_key: dict[tuple, list[dict[str, Any]]] = {}
+            for rep, specs in per_rep_specs.items():
+                if rank_divergent:
+                    for local_rk in range(self.width):
+                        phys_rk = ((rep % dp_width) * p.pp) * self.width + local_rk if spans_dp else local_rk
+                        ckey = ("ragged", specs, phys_rk)
+                        if ckey not in cache_by_key:
+                            cache_by_key[ckey] = self._projected_ragged_die_cache_pools(
+                                specs, rank=phys_rk, phase=str(phase),
+                            )
+                        resolved[(rep, local_rk)] = cache_by_key[ckey]
+                else:
+                    ckey = ("ragged", specs, None)
+                    if ckey not in cache_by_key:
+                        cache_by_key[ckey] = self._projected_ragged_die_cache_pools(
+                            specs, rank=None, phase=str(phase),
+                        )
+                    for local_rk in range(self.width):
+                        resolved[(rep, local_rk)] = cache_by_key[ckey]
+            return resolved
+
+        if sequence_tokens is None:
+            return {}
+        if isinstance(batch_per_dp, Sequence) and not isinstance(batch_per_dp, (str, bytes)):
+            if len(batch_per_dp) != p.dp:
+                raise ValueError("memory_receipt_batch_per_dp_length_mismatch")
+            batches = [int(v) for v in batch_per_dp]
+        else:
+            batches = [int(batch_per_dp)] * p.dp
+        seq_int = int(sequence_tokens)
+        if spans_dp and any(
+            batches[rep] != batches[(rep // dp_width) * dp_width]
+            for rep in range(p.dp)
+        ):
+            eff_q = 1 if str(phase or "decode").strip().lower() == "prefill" else self._effective_cache_query_tokens(query_tokens)
+            asym_specs = {
+                rep: ((seq_int, int(eff_q), 0, "", 0),) * b_int
+                for rep, b_int in enumerate(batches) if b_int > 0 and seq_int > 0
+            }
+            return self._scatter_dp_cohort_projected(
+                asym_specs, dp_width=dp_width, phase=str(phase),
+            )
+        resolved = {}
+        cache_by_key = {}
+        for rep, b_int in enumerate(batches):
+            if b_int <= 0:
+                continue
+            if rank_divergent:
+                for local_rk in range(self.width):
+                    phys_rk = ((rep % dp_width) * p.pp) * self.width + local_rk if spans_dp else local_rk
+                    ckey = ("uniform", seq_int, b_int, query_tokens, phys_rk)
+                    if ckey not in cache_by_key:
+                        cache_by_key[ckey] = self._projected_die_cache_pools(
+                            seq_int, b_int, query_tokens, rank=phys_rk, phase=str(phase),
+                        )[0]
+                    resolved[(rep, local_rk)] = cache_by_key[ckey]
+            else:
+                ckey = ("uniform", seq_int, b_int, query_tokens, None)
+                if ckey not in cache_by_key:
+                    cache_by_key[ckey] = self._projected_die_cache_pools(
+                        seq_int, b_int, query_tokens, rank=None, phase=str(phase),
+                    )[0]
+                for local_rk in range(self.width):
+                    resolved[(rep, local_rk)] = cache_by_key[ckey]
+        return resolved
 
     def resident_memory_receipt(
         self,
@@ -1676,8 +3209,12 @@ class _MemoryLedgerMixin:
         phase: str = "decode",
         occurrence: str = "steady",
         sequence_tokens: int | None = None,
-        batch_per_dp: int = 0,
+        batch_per_dp: int | Sequence[int] = 0,
         query_tokens: int | None = None,
+        request_views: Sequence[Any] | None = None,
+        request_views_by_replica: Mapping[int, Sequence[Any]] | Sequence[Sequence[Any]] | None = None,
+        sequence_lengths: Sequence[int] | None = None,
+        query_lengths: Sequence[int] | None = None,
         vision_accounting: str | None = None,
         prepared_weights: Sequence[PreparedWeightSpec] = (),
         extra_grants: Sequence[ResidentGrantEntry] = (),
@@ -1696,6 +3233,8 @@ class _MemoryLedgerMixin:
         hbm_live, host_live = self._state_usage()
         request_ranks = self._request_usage_ranks()
         staging_ranks = self._staging_usage_ranks()
+        req_recl_ranks, req_recl_events = self._request_reclaimable_usage_and_events()
+        non_req_backings = self._collect_non_request_backings()
         ckpt_by_stage: list[int] = []
         term_prep_by_stage: list[int] = []
         for st in range(p.pp):
@@ -1704,39 +3243,32 @@ class _MemoryLedgerMixin:
             term_prep_by_stage.append(tp_b)
         dp_width = max(1, int(getattr(p, "dcp_dp_width", 1) or 1))
         spans_dp = bool(getattr(p, "cp_spans_dp", False)) and dp_width > 1 and self.rank_token_owners is None
-        projected_by_rank: list[list[dict[str, Any]]] | None = None
-        if sequence_tokens is not None and int(batch_per_dp) > 0:
-            rank_divergent = (
-                self.rank_token_owners is not None or int(getattr(p, "cp", 1) or 1) > 1
-            )
-            if rank_divergent:
-                cohort_ranks = dp_width * self.width if spans_dp else self.width
-                projected_by_rank = [
-                    self._projected_die_cache_pools(
-                        int(sequence_tokens), int(batch_per_dp), query_tokens,
-                        rank=rk, phase=str(phase),
-                    )[0]
-                    for rk in range(cohort_ranks)
-                ]
-            else:
-                uniform_stages, _ = self._projected_die_cache_pools(
-                    int(sequence_tokens), int(batch_per_dp), query_tokens,
-                    rank=None, phase=str(phase),
-                )
-                projected_by_rank = [uniform_stages for _ in range(self.width)]
+        projected_map = self._resolve_receipt_projected_by_replica(
+            phase=str(phase),
+            sequence_tokens=sequence_tokens,
+            batch_per_dp=batch_per_dp,
+            query_tokens=query_tokens,
+            request_views=request_views,
+            request_views_by_replica=request_views_by_replica,
+            sequence_lengths=sequence_lengths,
+            query_lengths=query_lengths,
+            dp_width=dp_width,
+            spans_dp=spans_dp,
+        )
         dies: list[DieResidentReceipt] = []
         for replica in range(p.dp):
             for stage in range(p.pp):
                 stage_dies = self._stage_dies(replica, stage)
                 host_b = int(round(host_live[replica] + self.engram_host_dram_bytes[stage]))
                 for rank in range(self.width):
-                    proj_rk = (replica % dp_width) * self.width + rank if spans_dp else rank
-                    projected = (
-                        projected_by_rank[proj_rk][stage]
-                        if projected_by_rank is not None else None
-                    )
+                    proj_stages = projected_map.get((replica, rank))
+                    projected = proj_stages[stage] if proj_stages is not None else None
                     dyn_live_b = int(round(hbm_live[replica][stage][rank]))
-                    dyn_peak_b = max(dyn_live_b, int(round(self.peak_rank[replica][stage][rank])))
+                    dyn_peak_b = max(
+                        dyn_live_b,
+                        int(round(self.peak_rank[replica][stage][rank])),
+                        int(round(self._domain_peak_hbm(replica, stage, rank))),
+                    )
                     dies.append(self._build_die_receipt(
                         replica=replica, stage=stage, rank=rank, die_obj=stage_dies[rank],
                         ckpt_b=ckpt_by_stage[stage], vision_b=vision_stage[stage],
@@ -1747,6 +3279,9 @@ class _MemoryLedgerMixin:
                         req_b=int(round(request_ranks[replica][stage][rank])),
                         stg_b=int(round(staging_ranks[replica][stage][rank])),
                         host_b=host_b,
+                        die_backings=non_req_backings[replica][stage][rank],
+                        req_reclaimable_b=req_recl_ranks[replica][stage][rank],
+                        req_reclaim_events=req_recl_events[replica][stage][rank],
                     ))
         return ResidentMemoryReceipt(
             scenario=scenario or str(getattr(self.case.model, "name", "")),
