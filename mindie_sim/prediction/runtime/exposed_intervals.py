@@ -35,12 +35,27 @@ ROLE_VECTOR = "vector"
 ROLE_MEMORY = "memory"
 ROLE_COMMUNICATION = "communication"
 ROLE_CONTROL = "control"
+CUBE_RESOURCES = frozenset({"cube", "matrix", "pipe_m"})
+CUBE_PREFIXES = ("cube_", "matrix_", "pipe_m_")
 MEMORY_RESOURCES = frozenset({
-    "hbm", "mte2", "mte2_aic", "mte2_aiv", "mte3", "l1", "l0a", "l0b",
-    "l0c", "ub",
+    "hbm", "memory", "l2", "l1", "l0a", "l0b", "l0c", "ub",
+    "mte1", "mte2", "mte2_aic", "mte2_aiv", "mte3", "fixpipe", "dma",
 })
-VECTOR_RESOURCES = frozenset({"vector", "scalar", "reg_alu_lanes"})
-COMMUNICATION_RESOURCES = frozenset({"link"})
+MEMORY_PREFIXES = (
+    "hbm_", "memory_", "l2_", "l1_", "l0", "ub_", "mte", "fixpipe_", "dma_",
+)
+VECTOR_RESOURCES = frozenset({
+    "vector", "scalar", "reg_alu_lanes", "simt", "pipe_v", "pipe_s",
+})
+VECTOR_PREFIXES = ("vec_", "vector_", "scalar_", "simt_", "pipe_v_", "pipe_s_")
+COMMUNICATION_RESOURCES = frozenset({
+    "link", "switch", "port", "pair", "d2h", "h2d", "rd2h", "rh2d", "host_rc", "host_solo", "transport",
+})
+COMMUNICATION_PREFIXES = (
+    "link_", "switch_", "port_", "pair_", "d2h_", "h2d_", "rd2h_", "rh2d_", "host_rc_", "host_solo_", "transport_",
+)
+CONTROL_NAMESPACES = frozenset({"stars", "host", "scheduler"})
+_DIRECTION_SUFFIXES = frozenset({"r", "w", "read", "write"})
 ROLE_BY_PREFIX = {
     "memory@": ROLE_MEMORY,
     "link:": ROLE_COMMUNICATION,
@@ -62,15 +77,26 @@ class IntervalClocks:
 
 def service_role(name: str) -> str:
     """Semantic role of a physical resource or service name."""
-    value = str(name)
-    if value in MEMORY_RESOURCES or value.startswith("memory@"):
-        return ROLE_MEMORY
-    if value in VECTOR_RESOURCES:
-        return ROLE_VECTOR
-    if value in COMMUNICATION_RESOURCES or value.startswith("link:"):
+    value = str(name).strip().lower()
+    base = value.split("@", 1)[0]
+    parts = [part for part in base.split(":") if part]
+    if not parts:
+        return ROLE_CONTROL
+    if any(part in COMMUNICATION_RESOURCES for part in parts):
         return ROLE_COMMUNICATION
-    if value == "cube":
+    if any(part in CONTROL_NAMESPACES for part in parts):
+        return ROLE_CONTROL
+    if len(parts) > 1 and parts[-1] in _DIRECTION_SUFFIXES:
+        parts = parts[:-1]
+    stem = parts[-1]
+    if stem in MEMORY_RESOURCES or stem.startswith(MEMORY_PREFIXES):
+        return ROLE_MEMORY
+    if stem in CUBE_RESOURCES or stem.startswith(CUBE_PREFIXES):
         return ROLE_CUBE
+    if stem in VECTOR_RESOURCES or stem.startswith(VECTOR_PREFIXES):
+        return ROLE_VECTOR
+    if stem in COMMUNICATION_RESOURCES or stem.startswith(COMMUNICATION_PREFIXES):
+        return ROLE_COMMUNICATION
     for prefix, role in ROLE_BY_PREFIX.items():
         if value.startswith(prefix):
             return role

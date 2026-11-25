@@ -282,6 +282,7 @@ class ExecutionStateSnapshot:
     queue_credits: tuple[tuple[str, int], ...] = ()
     state_versions: tuple[tuple[str, Any], ...] = ()
     active_allocations: tuple[tuple[str, int], ...] = ()
+    stars_state: tuple[tuple[str, Any], ...] = ()
 
     @classmethod
     def capture(
@@ -292,6 +293,7 @@ class ExecutionStateSnapshot:
         bank_state: Mapping[str, Any] | Sequence[tuple[str, Any]] = (),
         owner_queues: Mapping[str, int] | Sequence[tuple[str, int]] = (),
         queue_credits: Mapping[str, int] | Sequence[tuple[str, int]] = (),
+        stars_queues: Mapping[Any, Sequence[tuple[int, Any]]] | None = None,
     ) -> "ExecutionStateSnapshot":
         now_ms = float(getattr(engine, "now", getattr(engine, "now_ms", 0.0)) or 0.0)
         now_ns = int(round(now_ms * NS_PER_MS))
@@ -332,6 +334,34 @@ class ExecutionStateSnapshot:
             (str(k), int(v)) for k, v in (allocs_raw.items() if isinstance(allocs_raw, Mapping) else ())
             if int(v) > 0
         ))
+        stars_items: list[tuple[str, Any]] = []
+        busy_raw = getattr(engine, "busy_ms", None) or {}
+        if stars_queues:
+            seen_q: set[int] = set()
+            for entries in stars_queues.values():
+                for _die_rank, queue in entries:
+                    if id(queue) in seen_q:
+                        continue
+                    seen_q.add(id(queue))
+                    credits_used = int(round(float(allocs_raw.get(queue.credit_pool, 0.0))))
+                    lane_busy_ns = tuple(
+                        int(round(float(busy_raw.get(ln, 0.0)) * NS_PER_MS))
+                        for ln in queue.lane_names
+                    )
+                    stars_items.append((
+                        str(queue.scope_key),
+                        (
+                            len(getattr(queue, "_active_records", ()) or ()),
+                            credits_used,
+                            len(getattr(queue, "_replay_first_charged", ()) or ()),
+                            lane_busy_ns,
+                        ),
+                    ))
+        elif isinstance(busy_raw, Mapping):
+            for res_name, b_val in busy_raw.items():
+                if "stars:" in str(res_name):
+                    stars_items.append((str(res_name), int(round(float(b_val) * NS_PER_MS))))
+        stars_items.sort(key=lambda item: item[0])
         return cls(
             l2_residency=l2_res,
             l2_dirty=l2_dirty,
@@ -341,6 +371,7 @@ class ExecutionStateSnapshot:
             queue_credits=qc_items,
             state_versions=versions,
             active_allocations=allocs,
+            stars_state=tuple(stars_items),
         )
 
 
@@ -978,32 +1009,38 @@ def _price_depth_varying_ops(
     *,
     evaluation: Any,
     recipes: Any,
-) -> dict[tuple[Any, ...], float]:
-    from mindie_sim.prediction.execution.operator_replay import operator_costs
-    from mindie_sim.prediction.operator_analysis import physical_id
-    from mindie_sim.prediction.program import RecipeBook
+    replica: int = 0,
+    replica_ids: Sequence[int] | None = None,
+) -> tuple[dict[tuple[Any, ...], float], dict[tuple[Any, ...], dict[str, Any]]]:
+    from mindie_sim.prediction.graph_analysis import graph_costs
 
     if not diff_ops_by_key:
-        return {}
+        return {}, {}
+    reps = tuple(sorted(int(r) for r in (replica_ids or (replica,))))
     pkey_dur_ms: dict[tuple[Any, ...], float] = {}
-    missing_ops: list[Any] = []
-    pid_to_pkeys: dict[tuple[int, str], list[tuple[Any, ...]]] = {}
+    pkey_info: dict[tuple[Any, ...], dict[str, Any]] = {}
     for pkey, op in diff_ops_by_key.items():
-        missing_ops.append(op)
-        pid_to_pkeys.setdefault((int(op.stage), physical_id(op)), []).append(pkey)
-    if missing_ops:
-        book = recipes or RecipeBook.from_mapping(eff_case.runtime.kernels)
-        oc = operator_costs(
-            eff_case, missing_ops,
-            recipes=book, evaluation=evaluation, replica=0,
+        solo = replace(op, deps=())
+        solo_graphs = {r: (solo,) for r in reps}
+        rep = graph_costs(
+            eff_case, solo_graphs, recipes=recipes, evaluation=evaluation,
+            isolated=False, fast_span_only=True,
+            layer_span_body_ids={solo.op_id: ("diff", 0)},
         )
-        for row in oc["operators"]:
-            row_stage = int(dict(row.get("operator") or {}).get("stage", 0) or 0)
-            row_pid = str(row["physical_id"])
-            val = float(row["duration_ms"])
-            for pkey in pid_to_pkeys.get((row_stage, row_pid), ()):
-                pkey_dur_ms[pkey] = val
-    return pkey_dur_ms
+        ex = rep.get("execution") or {}
+        recipes_map = {str(k): int(v) for k, v in (ex.get("recipes") or {}).items()}
+        fp_a, fp_b = rep.get("l2_residency_fingerprints") or ("", "")
+        dur = float(rep["duration_ms"])
+        pkey_dur_ms[pkey] = dur
+        pkey_info[pkey] = {
+            "duration_ms": dur,
+            "l2_touched": bool(fp_a and fp_b and fp_a != fp_b),
+            "work": {str(k): float(v) for k, v in (ex.get("work") or {}).items() if float(v)},
+            "recipes": recipes_map,
+            "completed_tasks": int(ex.get("completed_tasks", 0) or 0),
+            "iso_rep_count": max(1, sum(recipes_map.values())),
+        }
+    return pkey_dur_ms, pkey_info
 
 
 def _price_depth_varying_op_reports(
@@ -1028,13 +1065,16 @@ def _price_depth_varying_op_reports(
         rep = graph_costs(
             eff_case, solo_graphs, recipes=recipes, evaluation=evaluation,
             isolated=False, fast_span_only=False, timeline_replicas=(r0,),
+            layer_span_body_ids={solo.op_id: ("diff", 0)},
         )
         ex = rep.get("execution") or {}
         recipes_map = {str(k): int(v) for k, v in (ex.get("recipes") or {}).items()}
         iso_rep_count = max(1, sum(recipes_map.values()))
         basis = rep.get("exposed_breakdown_basis") or {}
+        fp_a, fp_b = rep.get("l2_residency_fingerprints") or ("", "")
         reports[pkey] = {
             "duration_ms": float(rep["duration_ms"]),
+            "l2_touched": bool(fp_a and fp_b and fp_a != fp_b),
             "serviced": {str(k): float(v) for k, v in (ex.get("serviced") or {}).items() if float(v)},
             "busy_ms": {str(k): float(v) for k, v in (ex.get("resource_busy_ms") or {}).items() if float(v)},
             "work": {str(k): float(v) for k, v in (ex.get("work") or {}).items() if float(v)},
@@ -1080,6 +1120,7 @@ def _verify_full_cohort_diff_ops(
     rep_tracked = red_report.get("replica_tracked_op_elapsed_ms")
     tracked_elapsed = red_report.get("tracked_op_elapsed_ms") or {}
     rep_ids = sorted((red_report.get("replica_layer_bounds") or {0: {}}).keys())
+    primary_rep = rep_ids[0] if rep_ids else 0
     need_exposed = bool((red_report.get("exposed_breakdown_basis") or {}).get("available"))
     checked_rep_pos: set[tuple[tuple[str, int], int]] = set()
     for l_key, diffs in layer_diffs.items():
@@ -1092,6 +1133,8 @@ def _verify_full_cohort_diff_ops(
             info_l = pid_reports.get(pid_l)
             if info_r is None or info_l is None:
                 return False
+            if info_r.get("l2_touched") or info_l.get("l2_touched"):
+                return False
             if need_exposed and (not info_r.get("exposed_available") or not info_l.get("exposed_available")):
                 return False
             if (rep_key, pos) in checked_rep_pos:
@@ -1102,19 +1145,20 @@ def _verify_full_cohort_diff_ops(
             for r_i in rep_ids:
                 obs_ms = (
                     rep_tracked.get((r_i, oid)) if rep_tracked is not None
-                    else (tracked_elapsed.get(oid) if r_i == 0 else None)
+                    else (tracked_elapsed.get(oid) if r_i == primary_rep else None)
                 )
                 if obs_ms is None or abs(float(obs_ms) - dur_r) > eps:
                     return False
-            row_r = rows_by_id.get(oid)
-            if row_r is None or abs(float(row_r["elapsed_ms"]) - dur_r) > eps:
-                return False
-            r_lo, r_hi = float(row_r["ready_ms"]), float(row_r["complete_ms"])
-            for other in rep_rows:
-                if str(other["op_id"]) == oid:
-                    continue
-                if float(other["ready_ms"]) + eps < r_hi and float(other["complete_ms"]) > r_lo + eps:
+            if rep_rows:
+                row_r = rows_by_id.get(oid)
+                if row_r is None or abs(float(row_r["elapsed_ms"]) - dur_r) > eps:
                     return False
+                r_lo, r_hi = float(row_r["ready_ms"]), float(row_r["complete_ms"])
+                for other in rep_rows:
+                    if str(other["op_id"]) == oid:
+                        continue
+                    if float(other["ready_ms"]) + eps < r_hi and float(other["complete_ms"]) > r_lo + eps:
+                        return False
     return True
 
 
@@ -1138,6 +1182,7 @@ def _emit_skipped_layer_rows(
         if pos is None or pos >= len(lyr_ops):
             continue
         op_l = lyr_ops[pos]
+        rep_i = int(row.get("replica", 0) or 0)
         rel_ready = float(row["ready_ms"]) - rep_base
         elapsed = float(row["elapsed_ms"])
         diff_pair = diffs.get(pos)
@@ -1154,29 +1199,39 @@ def _emit_skipped_layer_rows(
             eff_end = eff_ready + elapsed
         clone = dict(row)
         clone.update({
-            "id": f"r0:{op_l.op_id}",
+            "id": f"r{rep_i}:{op_l.op_id}",
             "op_id": op_l.op_id,
             "layer": lyr,
-            "predecessors": [f"r0:{d}" for d in op_l.deps],
+            "predecessors": [f"r{rep_i}:{d}" for d in op_l.deps],
             "ready_ms": eff_ready,
             "complete_ms": eff_end,
             "elapsed_ms": elapsed,
         })
+        from mindie_sim.prediction.native_binding import bind_native_call
+        native_call = bind_native_call(op_l)
+        if native_call is not None:
+            clone["native_call"] = native_call.to_dict()
+        else:
+            clone.pop("native_call", None)
         emitted.append(clone)
     return emitted, rep_span + intra_shift
 
 
-def _expand_cohort_timeline(
-    red_timeline: Sequence[Mapping[str, Any]],
+_REPLICA_PRED_RE = re.compile(r"^r(\d+):(.+)$")
+
+
+def _expand_single_replica_timeline(
+    rep_timeline: Sequence[Mapping[str, Any]],
     body_key_by_op: Mapping[str, tuple[str, int]],
     by_layer: Mapping[tuple[str, int], Sequence[Any]],
     skip_map: Mapping[tuple[str, int], tuple[str, int]],
     layer_diffs: Mapping[tuple[str, int], Mapping[int, tuple[tuple[Any, ...], tuple[Any, ...]]]],
     pid_dur_ms: Mapping[tuple[Any, ...], float],
     orig_ops_by_id: Mapping[str, Any] | None = None,
+    peer_reps_out: dict[tuple[int, str], tuple[int, ...]] | None = None,
 ) -> list[dict[str, Any]]:
     tl_by_layer: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
-    for row in red_timeline:
+    for row in rep_timeline:
         bkey = body_key_by_op.get(str(row.get("op_id", "")))
         if bkey is not None:
             tl_by_layer.setdefault(bkey, []).append(row)
@@ -1195,12 +1250,27 @@ def _expand_cohort_timeline(
         st_i = int(row_item.get("stage", 0) or 0)
         stream_s = str(row_item.get("stream", "") or "main")
         skey = (rep_i, st_i, stream_s)
-        orig_op = orig_ops_by_id.get(str(row_item.get("op_id", ""))) if orig_ops_by_id else None
+        op_id = str(row_item.get("op_id", ""))
+        old_preds = row_item.get("predecessors") or ()
+        peer_reps: list[int] = []
+        non_rep_preds: list[str] = []
+        for pred in old_preds:
+            match = _REPLICA_PRED_RE.match(str(pred))
+            if match is not None:
+                p_rep = int(match.group(1))
+                if p_rep != rep_i and p_rep not in peer_reps:
+                    peer_reps.append(p_rep)
+            else:
+                non_rep_preds.append(str(pred))
+        if peer_reps and peer_reps_out is not None:
+            peer_reps_out[(rep_i, op_id)] = tuple(peer_reps)
+        orig_op = orig_ops_by_id.get(op_id) if orig_ops_by_id else None
         if orig_op is not None:
             preds = [f"r{rep_i}:{d}" for d in orig_op.deps]
             prev_s = stream_tail.get(skey)
             if prev_s is not None:
                 preds.append(prev_s)
+            preds.extend(non_rep_preds)
             row_item["predecessors"] = list(dict.fromkeys(preds))
         stream_tail[skey] = str(row_item["id"])
         expanded.append(row_item)
@@ -1231,7 +1301,7 @@ def _expand_cohort_timeline(
         cursors[scope_name] = cur
 
     active_scope: str | None = None
-    for row in red_timeline:
+    for row in rep_timeline:
         bkey = body_key_by_op.get(str(row.get("op_id", "")))
         if bkey is not None:
             if active_scope is not None and active_scope != bkey[0]:
@@ -1251,6 +1321,55 @@ def _expand_cohort_timeline(
             last_end_by_scope[bkey[0]] = c_ms
     if active_scope is not None:
         _flush_scope(active_scope, None)
+    return expanded
+
+
+def _expand_cohort_timeline(
+    red_timeline: Sequence[Mapping[str, Any]],
+    body_key_by_op: Mapping[str, tuple[str, int]],
+    by_layer: Mapping[tuple[str, int], Sequence[Any]],
+    skip_map: Mapping[tuple[str, int], tuple[str, int]],
+    layer_diffs: Mapping[tuple[str, int], Mapping[int, tuple[tuple[Any, ...], tuple[Any, ...]]]],
+    pid_dur_ms: Mapping[tuple[Any, ...], float],
+    orig_ops_by_id: Mapping[str, Any] | None = None,
+    *,
+    by_layer_by_rep: Mapping[int, Mapping[tuple[str, int], Sequence[Any]]] | None = None,
+    orig_ops_by_rep: Mapping[int, Mapping[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    by_rep: dict[int, list[Mapping[str, Any]]] = {}
+    for row in red_timeline:
+        rep_i = int(row.get("replica", 0) or 0)
+        by_rep.setdefault(rep_i, []).append(row)
+    expanded: list[dict[str, Any]] = []
+    peer_reps_by_key: dict[tuple[int, str], tuple[int, ...]] = {}
+    for rep_i, rep_rows in by_rep.items():
+        rep_layers_map = by_layer_by_rep.get(rep_i, by_layer) if by_layer_by_rep else by_layer
+        rep_orig_map = orig_ops_by_rep.get(rep_i, orig_ops_by_id) if orig_ops_by_rep else orig_ops_by_id
+        expanded.extend(_expand_single_replica_timeline(
+            rep_rows, body_key_by_op, rep_layers_map, skip_map,
+            layer_diffs, pid_dur_ms, orig_ops_by_id=rep_orig_map,
+            peer_reps_out=peer_reps_by_key,
+        ))
+    if peer_reps_by_key:
+        local_preds: dict[tuple[int, str], list[str]] = {
+            (int(row["replica"]), str(row["op_id"])): list(row.get("predecessors") or ())
+            for row in expanded
+        }
+        for row in expanded:
+            key = (int(row["replica"]), str(row["op_id"]))
+            peers = peer_reps_by_key.get(key)
+            if not peers:
+                continue
+            participants = sorted({key[0], *peers})
+            merged: list[str] = []
+            for p_rep in participants:
+                p_preds = local_preds.get((p_rep, key[1]))
+                if p_preds is not None:
+                    merged.extend(p_preds)
+                elif orig_ops_by_rep and key[1] in orig_ops_by_rep.get(p_rep, ()):
+                    p_op = orig_ops_by_rep[p_rep][key[1]]
+                    merged.extend(f"r{p_rep}:{d}" for d in p_op.deps)
+            row["predecessors"] = list(dict.fromkeys(merged))
     return expanded
 
 
@@ -1677,24 +1796,46 @@ def _layer_has_cross_dp_collective(ops: Sequence[Any]) -> bool:
     return False
 
 
+def _graph_has_cross_dp_collective(
+    eff_case: Any,
+    graphs: Mapping[int, Sequence[Any]],
+) -> bool:
+    """True when active replicas share any cross-replica collective join anywhere in the graph."""
+    if len(graphs) <= 1:
+        return False
+    from mindie_sim.prediction.sharding.local_tp import collective_requires_cohort
+    from mindie_sim.prediction.topology import Topology
+
+    topology = Topology(eff_case.machine, eff_case.runtime.parallel)
+    for r_ops in graphs.values():
+        for op in r_ops:
+            axis = dict(getattr(op, "metadata", ()) or ()).get("group_axis")
+            if axis in _CROSS_DP_GROUP_AXES or collective_requires_cohort(op, topology):
+                return True
+    return False
+
+
 def _verify_cohort_steady_deltas(
     red_report: Mapping[str, Any],
     by_layer: Mapping[tuple[str, int], Sequence[Any]],
     skip_map: Mapping[tuple[str, int], tuple[str, int]],
     *,
     require_aligned: bool,
+    has_cross_dp_collective: bool = False,
 ) -> Mapping[Any, Mapping[str, Any]] | None:
-    """Verify per-representative L2 residency invariance (and alignment when needed)."""
+    """Verify per-representative L2/STARS invariance (and alignment when needed)."""
     rep_targets = sorted(set(skip_map.values()))
     deltas = red_report.get("cohort_layer_deltas")
     if deltas:
         for rk in rep_targets:
             d_info = deltas.get(rk)
-            if not d_info or not d_info.get("l2_steady"):
+            if not d_info or not d_info.get("l2_steady") or not d_info.get("stars_steady", True):
                 return None
             if require_aligned and not d_info.get("aligned"):
                 return None
-            if not d_info.get("aligned") and _layer_has_cross_dp_collective(by_layer.get(rk, ())):
+            if not d_info.get("aligned") and (
+                has_cross_dp_collective or _layer_has_cross_dp_collective(by_layer.get(rk, ()))
+            ):
                 return None
         return deltas
     fp_before, fp_after = red_report.get("l2_residency_fingerprints") or ("", "")
@@ -1712,8 +1853,10 @@ def _verify_replica_bounds_and_expand(
     probe_order: Sequence[tuple[tuple[str, int], tuple[str, int]]],
     layer_diffs: Mapping[tuple[str, int], Mapping[int, tuple[tuple[Any, ...], tuple[Any, ...]]]],
     pid_dur_ms: Mapping[tuple[Any, ...], float],
-) -> tuple[float, float] | None:
-    """Validate non-overlap per replica and return expanded ``(total_ms, end_ms)``."""
+    *,
+    has_cross_dp_collective: bool = False,
+) -> tuple[float, float, dict[int, float], dict[int, dict[tuple[str, int], float]]] | None:
+    """Validate non-overlap across scopes/streams per replica and return expanded ends."""
     rep_bounds_by_rep = red_report.get("replica_layer_bounds")
     if not rep_bounds_by_rep:
         single = red_report.get("layer_bounds")
@@ -1731,10 +1874,13 @@ def _verify_replica_bounds_and_expand(
     eps = COHORT_CROSS_LAYER_OVERLAP_EPS_MS
     rep_targets = set(skip_map.values())
     probe_prev = dict(probe_order)
-    expanded_ends: list[float] = []
+    expanded_ends: dict[int, float] = {}
+    added_by_rep: dict[int, float] = {}
+    skipped_dur_by_rep: dict[int, dict[tuple[str, int], float]] = {}
     for rep_i, bounds in rep_bounds_by_rep.items():
         prev_by_scope_stage: dict[tuple[str, int], float] = {}
-        rep_intervals: list[tuple[float, float]] = []
+        rep_intervals_by_scope: dict[str, list[tuple[float, float]]] = {}
+        scope_intervals: dict[str, list[tuple[float, float]]] = {}
         for l_key in sorted(rep_layers):
             entry = bounds.get(l_key)
             if entry is None:
@@ -1745,16 +1891,25 @@ def _verify_replica_bounds_and_expand(
             if prev_end is not None and lo_ms + eps < prev_end:
                 return None
             prev_by_scope_stage[ss] = hi_ms
+            scope_intervals.setdefault(l_key[0], []).append((float(lo_ms), float(hi_ms)))
             if l_key in rep_targets:
                 prev_k = probe_prev.get(l_key)
                 if prev_k is not None:
                     prev_entry = bounds.get(prev_k)
                     if prev_entry is None or abs(float(lo_ms) - float(prev_entry[2])) > eps:
                         return None
-                rep_intervals.append((float(lo_ms), float(hi_ms)))
-        if _has_non_body_overlap(non_body_by_rep.get(rep_i, ()), rep_intervals):
-            return None
-        end_r = float(rep_complete_by_rep.get(rep_i, default_complete))
+                rep_intervals_by_scope.setdefault(l_key[0], []).append((float(lo_ms), float(hi_ms)))
+        non_body_ivs = list(non_body_by_rep.get(rep_i, ()))
+        for sc, rep_ivs in rep_intervals_by_scope.items():
+            other_ivs = list(non_body_ivs)
+            for other_sc, ivs in scope_intervals.items():
+                if other_sc != sc:
+                    other_ivs.extend(ivs)
+            if _has_non_body_overlap(other_ivs, rep_ivs):
+                return None
+        base_end = float(rep_complete_by_rep.get(rep_i, default_complete))
+        rep_added = 0.0
+        rep_skip_durs: dict[tuple[str, int], float] = {}
         for l_key, rep_key in skip_map.items():
             entry = bounds.get(rep_key)
             if entry is None:
@@ -1763,12 +1918,19 @@ def _verify_replica_bounds_and_expand(
                 float(pid_dur_ms[pid_l]) - float(pid_dur_ms[pid_r])
                 for pid_r, pid_l in layer_diffs.get(l_key, {}).values()
             )
-            end_r += (float(entry[2]) - float(entry[1])) + delta
-        expanded_ends.append(end_r)
+            layer_ms = (float(entry[2]) - float(entry[1])) + delta
+            rep_skip_durs[l_key] = layer_ms
+            rep_added += layer_ms
+        expanded_ends[int(rep_i)] = base_end + rep_added
+        added_by_rep[int(rep_i)] = rep_added
+        skipped_dur_by_rep[int(rep_i)] = rep_skip_durs
     if not expanded_ends:
         return None
-    end_ms = max(expanded_ends)
-    return end_ms - input_ready_ms, end_ms
+    if has_cross_dp_collective and len(added_by_rep) > 1:
+        if (max(added_by_rep.values()) - min(added_by_rep.values())) > eps:
+            return None
+    end_ms = max(expanded_ends.values())
+    return end_ms - input_ready_ms, end_ms, expanded_ends, skipped_dur_by_rep
 
 
 def _strip_internal_cohort_fields(out: dict[str, Any]) -> None:
@@ -1782,38 +1944,310 @@ def _strip_internal_cohort_fields(out: dict[str, Any]) -> None:
         "tracked_op_elapsed_ms",
         "replica_tracked_op_elapsed_ms",
         "cohort_layer_deltas",
+        "_dedup_recorded_replicas",
+        "_replica_step_windows",
     ):
         out.pop(key, None)
+
+
+def _shifted_replica_windows(
+    graphs: Mapping[int, Sequence[Any]] | None,
+    body_key_by_op: Mapping[str, tuple[str, int]],
+    skip_map: Mapping[tuple[str, int], tuple[str, int]],
+    skipped_dur_by_rep: Mapping[int, Mapping[tuple[str, int], float]],
+    added_ms_by_rep: Mapping[int, float],
+    raw_windows: Mapping[int, Mapping[str, Mapping[str, float]]],
+    recorded_reps: Sequence[int],
+) -> dict[int, tuple[list[float], list[float]]]:
+    """Shift reduced commit and delivery timestamps by transitive ancestor skipped layers."""
+    out: dict[int, tuple[list[float], list[float]]] = {}
+    if not raw_windows:
+        return out
+    skip_set = set(skip_map)
+    for rep_i in recorded_reps:
+        win = raw_windows.get(rep_i)
+        if not win:
+            continue
+        commits_raw = win.get("commits") or {}
+        deliveries_raw = win.get("deliveries") or {}
+        rep_ops = graphs.get(rep_i, ()) if graphs else ()
+        ops_by_id = {op.op_id: op for op in rep_ops}
+        req_commit_ops: dict[str, list[Any]] = {}
+        for op in rep_ops:
+            if getattr(op, "family", "") == "token_commit":
+                for req in (getattr(op, "requests", ()) or ()):
+                    req_commit_ops.setdefault(str(req), []).append(op)
+        rep_skip_durs = skipped_dur_by_rep.get(rep_i) or {}
+        req_shift: dict[str, float] = {}
+        shifted_commits: list[float] = []
+        for req, ts in commits_raw.items():
+            c_ops = req_commit_ops.get(str(req), ())
+            if c_ops and rep_skip_durs:
+                visited: set[str] = set()
+                stack = [d for op in c_ops for d in op.deps]
+                anc_skipped: set[tuple[str, int]] = set()
+                while stack:
+                    cur = stack.pop()
+                    if cur in visited:
+                        continue
+                    visited.add(cur)
+                    lk = body_key_by_op.get(cur)
+                    if lk in skip_set:
+                        anc_skipped.add(lk)
+                    cur_op = ops_by_id.get(cur)
+                    if cur_op is not None:
+                        stack.extend(cur_op.deps)
+                shift = sum(float(rep_skip_durs.get(lk, 0.0)) for lk in anc_skipped)
+            elif c_ops:
+                shift = 0.0
+            else:
+                shift = float(added_ms_by_rep.get(rep_i, 0.0))
+            req_shift[str(req)] = shift
+            shifted_commits.append(float(ts) + shift)
+        shifted_deliveries = [
+            float(ts) + float(req_shift.get(str(req), added_ms_by_rep.get(rep_i, 0.0)))
+            for req, ts in deliveries_raw.items()
+        ]
+        out[rep_i] = (shifted_commits, shifted_deliveries)
+    return out
+
+
+def _update_step_totals_block(
+    block: Mapping[str, Any],
+    *,
+    added_ops: int,
+    added_ms: float,
+    step_durations: Sequence[float],
+    commit_times: Sequence[float] | None = None,
+    delivery_times: Sequence[float] | None = None,
+) -> dict[str, Any]:
+    updated = dict(block)
+    updated["operators"] = int(updated.get("operators", 0)) + int(added_ops)
+    updated["device_duration_sum_ms"] = float(updated.get("device_duration_sum_ms", 0.0)) + float(added_ms)
+    dur = updated.get("duration_ms")
+    if isinstance(dur, Mapping):
+        new_dur = dict(dur)
+        steps = int(updated.get("steps", 0) or 0)
+        if step_durations and steps == len(step_durations):
+            total_sum = sum(float(v) for v in step_durations)
+            new_dur["sum"] = total_sum
+            new_dur["mean"] = total_sum / steps if steps else None
+            new_dur["min"] = min(float(v) for v in step_durations)
+            new_dur["max"] = max(float(v) for v in step_durations)
+        else:
+            new_sum = float(new_dur.get("sum", 0.0) or 0.0) + float(added_ms)
+            new_dur["sum"] = new_sum
+            new_dur["mean"] = new_sum / steps if steps else None
+            if new_dur.get("min") is not None and steps == 1:
+                new_dur["min"] = new_sum
+            if new_dur.get("max") is not None and steps == 1:
+                new_dur["max"] = new_sum
+        updated["duration_ms"] = new_dur
+    win = updated.get("request_event_windows_ms")
+    if isinstance(win, Mapping) and (commit_times or delivery_times):
+        new_win = dict(win)
+        if commit_times:
+            new_win["first_commit"] = min(float(v) for v in commit_times)
+            new_win["last_commit"] = max(float(v) for v in commit_times)
+        if delivery_times:
+            new_win["first_delivery"] = min(float(v) for v in delivery_times)
+            new_win["last_delivery"] = max(float(v) for v in delivery_times)
+        updated["request_event_windows_ms"] = new_win
+    return updated
+
+
+def _reconstruct_cohort_step_summary(
+    ex: dict[str, Any],
+    red_report: Mapping[str, Any],
+    by_layer: Mapping[tuple[str, int], Sequence[Any]],
+    skip_map: Mapping[tuple[str, int], tuple[str, int]],
+    expanded_ends_by_rep: Mapping[int, float],
+    *,
+    by_layer_by_rep: Mapping[int, Mapping[tuple[str, int], Sequence[Any]]] | None = None,
+    graphs: Mapping[int, Sequence[Any]] | None = None,
+    body_key_by_op: Mapping[str, tuple[str, int]] = (),  # type: ignore[assignment]
+    skipped_dur_by_rep: Mapping[int, Mapping[tuple[str, int], float]] = (),  # type: ignore[assignment]
+) -> None:
+    """Reconstruct ``execution.step_summary`` from full-depth skipped ops and replica durations."""
+    ss = ex.get("step_summary")
+    if not isinstance(ss, Mapping):
+        return
+    all_rep_ids = sorted(int(r) for r in (red_report.get("replicas") or expanded_ends_by_rep.keys() or (0,)))
+    recorded_raw = red_report.get("_dedup_recorded_replicas")
+    rep_ids = sorted(int(r) for r in recorded_raw) if recorded_raw else all_rep_ids
+    input_ready_ms = float(red_report.get("input_ready_ms", 0.0) or 0.0)
+    default_red_end = float(red_report.get("complete_ms", input_ready_ms + float(red_report.get("duration_ms", 0.0))))
+    red_complete_by_rep = red_report.get("replica_complete_ms") or {}
+    skipped_ops_by_rep: dict[int, int] = {}
+    added_ms_by_rep: dict[int, float] = {}
+    dur_by_rep: dict[int, float] = {}
+    skipped_op_list: list[Any] = []
+    for rep_i in rep_ids:
+        rep_layers_map = by_layer_by_rep.get(rep_i, by_layer) if by_layer_by_rep else by_layer
+        rep_skipped = [op for l_key in skip_map for op in rep_layers_map.get(l_key, ())]
+        skipped_ops_by_rep[rep_i] = len(rep_skipped)
+        skipped_op_list.extend(rep_skipped)
+        red_end = float(red_complete_by_rep.get(rep_i, default_red_end))
+        exp_end = float(expanded_ends_by_rep.get(rep_i, red_end))
+        added_ms_by_rep[rep_i] = exp_end - red_end
+        dur_by_rep[rep_i] = exp_end - input_ready_ms
+
+    shifted_wins = _shifted_replica_windows(
+        graphs, body_key_by_op, skip_map, skipped_dur_by_rep,
+        added_ms_by_rep, red_report.get("_replica_step_windows") or {}, rep_ids,
+    )
+    all_commits = [t for r in rep_ids for t in shifted_wins.get(r, ([], []))[0]]
+    all_deliveries = [t for r in rep_ids for t in shifted_wins.get(r, ([], []))[1]]
+    new_ss = dict(ss)
+    if isinstance(new_ss.get("total"), Mapping):
+        new_ss["total"] = _update_step_totals_block(
+            new_ss["total"],
+            added_ops=sum(skipped_ops_by_rep.values()),
+            added_ms=sum(added_ms_by_rep.values()),
+            step_durations=[dur_by_rep[r] for r in rep_ids],
+            commit_times=all_commits,
+            delivery_times=all_deliveries,
+        )
+    groups_raw = new_ss.get("groups")
+    if isinstance(groups_raw, list) and groups_raw:
+        scope_by_rep = red_report.get("replay_scope_by_replica") or {}
+        new_groups = []
+        for grp in groups_raw:
+            if not isinstance(grp, Mapping):
+                new_groups.append(grp)
+                continue
+            if len(groups_raw) == 1:
+                g_reps = rep_ids
+            else:
+                g_scope = grp.get("replay_scope")
+                g_reps = [r for r in rep_ids if scope_by_rep.get(r) == g_scope] or rep_ids
+            g_commits = [t for r in g_reps for t in shifted_wins.get(r, ([], []))[0]]
+            g_deliveries = [t for r in g_reps for t in shifted_wins.get(r, ([], []))[1]]
+            new_groups.append(_update_step_totals_block(
+                grp,
+                added_ops=sum(skipped_ops_by_rep.get(r, 0) for r in g_reps),
+                added_ms=sum(added_ms_by_rep.get(r, 0.0) for r in g_reps),
+                step_durations=[dur_by_rep[r] for r in g_reps],
+                commit_times=g_commits,
+                delivery_times=g_deliveries,
+            ))
+        new_ss["groups"] = new_groups
+    sels_raw = new_ss.get("implementation_selections")
+    if isinstance(sels_raw, list) and skipped_op_list:
+        from mindie_sim.prediction.implementation_selection import graph_selections
+        extra_calls: dict[tuple[Any, ...], int] = {}
+        for dec in graph_selections(skipped_op_list):
+            key = (dec["selector"], dec["case"], dec["implementation"], dec["coverage"], dec["model_scope"])
+            extra_calls[key] = extra_calls.get(key, 0) + 1
+        if extra_calls:
+            new_sels = []
+            for item in sels_raw:
+                if isinstance(item, Mapping):
+                    key = (
+                        item.get("selector"), item.get("case"),
+                        item.get("implementation"), item.get("coverage"), item.get("model_scope"),
+                    )
+                    inc = extra_calls.get(key, 0)
+                    if inc:
+                        item = {**item, "calls": int(item.get("calls", 0)) + inc}
+                new_sels.append(item)
+            new_ss["implementation_selections"] = new_sels
+    ex["step_summary"] = new_ss
+
+
+def _scale_fast_cohort_execution_counters(
+    ex: dict[str, Any],
+    deltas: Mapping[Any, Mapping[str, Any]],
+    skip_map: Mapping[tuple[str, int], tuple[str, int]],
+    layer_diffs: Mapping[tuple[str, int], Mapping[int, tuple[tuple[Any, ...], tuple[Any, ...]]]],
+    diff_info: Mapping[tuple[Any, ...], Mapping[str, Any]],
+) -> None:
+    """Conserve ``execution.work`` and ``execution.recipes`` across skipped layers in fast mode."""
+    if not deltas:
+        return
+    skip_counts: dict[tuple[str, int], int] = {}
+    for rep_key in skip_map.values():
+        skip_counts[rep_key] = skip_counts.get(rep_key, 0) + 1
+    add_work: dict[str, float] = {}
+    add_recipes: dict[str, int] = {}
+    add_tasks = 0
+    for rk, cnt in skip_counts.items():
+        d_info = deltas.get(rk)
+        if not d_info:
+            continue
+        for k, v in (d_info.get("work") or {}).items():
+            add_work[k] = add_work.get(k, 0.0) + cnt * float(v)
+        for k, v in (d_info.get("recipes") or {}).items():
+            add_recipes[k] = add_recipes.get(k, 0) + cnt * int(v)
+        add_tasks += cnt * int(d_info.get("completed_tasks", 0) or 0)
+    for l_key, diffs in layer_diffs.items():
+        d_info = deltas.get(skip_map[l_key])
+        active_reps = max(1, int((d_info or {}).get("active_rep_count", 1) or 1))
+        for pid_r, pid_l in diffs.values():
+            ir = diff_info.get(pid_r)
+            il = diff_info.get(pid_l)
+            if ir is None or il is None:
+                continue
+            r_scale = float(active_reps) / float(max(1, int(ir.get("iso_rep_count", 1) or 1)))
+            l_scale = float(active_reps) / float(max(1, int(il.get("iso_rep_count", 1) or 1)))
+            for k in set(ir["work"]) | set(il["work"]):
+                add_work[k] = add_work.get(k, 0.0) + l_scale * float(il["work"].get(k, 0.0)) - r_scale * float(ir["work"].get(k, 0.0))
+            for k in set(ir["recipes"]) | set(il["recipes"]):
+                add_recipes[k] = add_recipes.get(k, 0) + int(round(
+                    l_scale * int(il["recipes"].get(k, 0)) - r_scale * int(ir["recipes"].get(k, 0))
+                ))
+            add_tasks += int(round(
+                l_scale * int(il.get("completed_tasks", 0)) - r_scale * int(ir.get("completed_tasks", 0))
+            ))
+    if isinstance(ex.get("work"), Mapping) and add_work:
+        wk = dict(ex["work"])
+        for k, dv in add_work.items():
+            wk[k] = float(wk.get(k, 0.0)) + dv
+        ex["work"] = wk
+    if isinstance(ex.get("recipes"), Mapping) and add_recipes:
+        rc = dict(ex["recipes"])
+        for k, dv in add_recipes.items():
+            rc[k] = int(rc.get(k, 0)) + dv
+        ex["recipes"] = rc
+    if "completed_tasks" in ex and add_tasks:
+        ex["completed_tasks"] = int(ex["completed_tasks"]) + add_tasks
 
 
 def _assemble_fast_cohort_report(
     eff_case: Any,
     red_report: Mapping[str, Any],
+    body_key_by_op: Mapping[str, tuple[str, int]],
     by_layer: Mapping[tuple[str, int], Sequence[Any]],
     rep_layers: set[tuple[str, int]],
     skip_map: Mapping[tuple[str, int], tuple[str, int]],
     probe_order: Sequence[tuple[tuple[str, int], tuple[str, int]]],
     layer_diffs: Mapping[tuple[str, int], Mapping[int, tuple[tuple[Any, ...], tuple[Any, ...]]]],
     diff_ops_by_key: Mapping[tuple[Any, ...], Any],
+    graphs: Mapping[int, Sequence[Any]],
     *,
     evaluation: Any,
     recipes: Any,
+    primary_rep: int = 0,
+    by_layer_by_rep: Mapping[int, Mapping[tuple[str, int], Sequence[Any]]] | None = None,
 ) -> dict[str, Any] | None:
+    has_cross_dp = _graph_has_cross_dp_collective(eff_case, graphs)
     deltas = _verify_cohort_steady_deltas(
         red_report, by_layer, skip_map, require_aligned=False,
+        has_cross_dp_collective=has_cross_dp,
     )
     if deltas is None:
         return None
-    pid_dur_ms = (
-        _price_depth_varying_ops(
-            eff_case, diff_ops_by_key, evaluation=evaluation, recipes=recipes,
-        )
-        if layer_diffs else {}
-    )
+    rep_ids = sorted((red_report.get("replica_layer_bounds") or {primary_rep: {}}).keys())
     if layer_diffs:
+        pid_dur_ms, pid_info = _price_depth_varying_ops(
+            eff_case, diff_ops_by_key, evaluation=evaluation, recipes=recipes,
+            replica=primary_rep, replica_ids=rep_ids,
+        )
+        if any(info.get("l2_touched") for info in pid_info.values()):
+            return None
         rep_tracked = red_report.get("replica_tracked_op_elapsed_ms")
         tracked_elapsed = red_report.get("tracked_op_elapsed_ms") or {}
-        rep_ids = sorted((red_report.get("replica_layer_bounds") or {0: {}}).keys())
+        first_rep = rep_ids[0] if rep_ids else primary_rep
         for l_key, diffs in layer_diffs.items():
             rep_ops = by_layer[skip_map[l_key]]
             for pos, (pid_r, _pid_l) in diffs.items():
@@ -1821,19 +2255,34 @@ def _assemble_fast_cohort_report(
                 for r_i in rep_ids:
                     obs_ms = (
                         rep_tracked.get((r_i, oid)) if rep_tracked is not None
-                        else (tracked_elapsed.get(oid) if r_i == 0 else None)
+                        else (tracked_elapsed.get(oid) if r_i == first_rep else None)
                     )
                     if (obs_ms is None
                             or abs(float(obs_ms) - float(pid_dur_ms[pid_r]))
                             > COHORT_CROSS_LAYER_OVERLAP_EPS_MS):
                         return None
+    else:
+        pid_dur_ms, pid_info = {}, {}
     expanded_span = _verify_replica_bounds_and_expand(
         red_report, rep_layers, skip_map, probe_order, layer_diffs, pid_dur_ms,
+        has_cross_dp_collective=has_cross_dp,
     )
     if expanded_span is None:
         return None
-    total_ms, end_ms = expanded_span
+    total_ms, end_ms, expanded_ends_by_rep, skipped_dur_by_rep = expanded_span
     out = dict(red_report)
+    if isinstance(out.get("execution"), Mapping):
+        ex = dict(out["execution"])
+        ex["time_ms"] = end_ms
+        _scale_fast_cohort_execution_counters(ex, deltas, skip_map, layer_diffs, pid_info)
+        _reconstruct_cohort_step_summary(
+            ex, red_report, by_layer, skip_map, expanded_ends_by_rep,
+            by_layer_by_rep=by_layer_by_rep,
+            graphs=graphs,
+            body_key_by_op=body_key_by_op,
+            skipped_dur_by_rep=skipped_dur_by_rep,
+        )
+        out["execution"] = ex
     _strip_internal_cohort_fields(out)
     out["duration_ms"] = total_ms
     out["complete_ms"] = end_ms
@@ -2021,43 +2470,58 @@ def _assemble_full_cohort_report(
     probe_order: Sequence[tuple[tuple[str, int], tuple[str, int]]],
     layer_diffs: Mapping[tuple[str, int], Mapping[int, tuple[tuple[Any, ...], tuple[Any, ...]]]],
     diff_ops_by_key: Mapping[tuple[Any, ...], Any],
-    orig_r0_ops: Sequence[Any],
+    graphs: Mapping[int, Sequence[Any]],
     *,
     evaluation: Any,
     recipes: Any,
+    primary_rep: int = 0,
+    by_layer_by_rep: Mapping[int, Mapping[tuple[str, int], Sequence[Any]]] | None = None,
 ) -> dict[str, Any] | None:
+    has_cross_dp = _graph_has_cross_dp_collective(eff_case, graphs)
     deltas = _verify_cohort_steady_deltas(
         red_report, by_layer, skip_map, require_aligned=True,
+        has_cross_dp_collective=has_cross_dp,
     )
     if deltas is None:
         return None
     red_timeline = red_report.get("timeline") or ()
-    tl_by_layer: dict[tuple[str, int], list[Mapping[str, Any]]] = {}
-    non_body_intervals: list[tuple[float, float]] = []
+    tl_by_rep_layer: dict[int, dict[tuple[str, int], list[Mapping[str, Any]]]] = {}
+    non_body_by_rep: dict[int, list[tuple[float, float]]] = {}
     for row in red_timeline:
+        rep_i = int(row.get("replica", primary_rep) or 0)
         bkey = body_key_by_op.get(str(row.get("op_id", "")))
         if bkey is not None:
-            tl_by_layer.setdefault(bkey, []).append(row)
+            tl_by_rep_layer.setdefault(rep_i, {}).setdefault(bkey, []).append(row)
         else:
-            non_body_intervals.append((float(row["ready_ms"]), float(row["complete_ms"])))
-    if _has_cross_layer_overlap(tl_by_layer, sorted(rep_layers)):
-        return None
-    rep_intervals = [
-        (
-            min(float(r["ready_ms"]) for r in tl_by_layer[rk]),
-            max(float(r["complete_ms"]) for r in tl_by_layer[rk]),
-        )
-        for rk in sorted(set(skip_map.values()))
-        if tl_by_layer.get(rk)
-    ]
-    if _has_non_body_overlap(non_body_intervals, rep_intervals):
-        return None
+            non_body_by_rep.setdefault(rep_i, []).append((float(row["ready_ms"]), float(row["complete_ms"])))
+    rep_targets = sorted(set(skip_map.values()))
+    ordered_rep_layers = sorted(rep_layers)
+    for rep_i, rep_tl_layers in tl_by_rep_layer.items():
+        if _has_cross_layer_overlap(rep_tl_layers, ordered_rep_layers):
+            return None
+        scope_ivs: dict[str, list[tuple[float, float]]] = {}
+        rep_ivs_by_scope: dict[str, list[tuple[float, float]]] = {}
+        for lk, lk_rows in rep_tl_layers.items():
+            iv = (min(float(r["ready_ms"]) for r in lk_rows), max(float(r["complete_ms"]) for r in lk_rows))
+            scope_ivs.setdefault(lk[0], []).append(iv)
+            if lk in rep_targets:
+                rep_ivs_by_scope.setdefault(lk[0], []).append(iv)
+        nb_ivs = non_body_by_rep.get(rep_i, [])
+        for sc, rep_ivs in rep_ivs_by_scope.items():
+            other_ivs = list(nb_ivs)
+            for other_sc, ivs in scope_ivs.items():
+                if other_sc != sc:
+                    other_ivs.extend(ivs)
+            if _has_non_body_overlap(other_ivs, rep_ivs):
+                return None
+    primary_tl_rep = primary_rep if primary_rep in tl_by_rep_layer else next(iter(tl_by_rep_layer), primary_rep)
+    tl_by_layer = tl_by_rep_layer.get(primary_tl_rep, {})
     pid_reports: dict[tuple[Any, ...], dict[str, Any]] = {}
     pid_dur_ms: dict[tuple[Any, ...], float] = {}
     if layer_diffs:
         if not deltas:
             return None
-        replica_ids = tuple(sorted(int(r) for r in (red_report.get("replicas") or (0,))))
+        replica_ids = tuple(sorted(int(r) for r in (red_report.get("replicas") or (primary_rep,))))
         pid_reports = _price_depth_varying_op_reports(
             eff_case, diff_ops_by_key, replica_ids, evaluation=evaluation, recipes=recipes,
         )
@@ -2069,12 +2533,14 @@ def _assemble_full_cohort_report(
     if red_report.get("replica_layer_bounds"):
         expanded_span = _verify_replica_bounds_and_expand(
             red_report, rep_layers, skip_map, probe_order, layer_diffs, pid_dur_ms,
+            has_cross_dp_collective=has_cross_dp,
         )
         if expanded_span is None:
             return None
-        total_ms, end_ms = expanded_span
+        total_ms, end_ms, expanded_ends_by_rep, skipped_dur_by_rep = expanded_span
     else:
         total_ms = float(red_report["duration_ms"])
+        skip_durs_single: dict[tuple[str, int], float] = {}
         for l_key, rep_key in skip_map.items():
             rows_rep = tl_by_layer.get(rep_key, ())
             if not rows_rep:
@@ -2083,27 +2549,44 @@ def _assemble_full_cohort_report(
                 float(pid_dur_ms[pid_l]) - float(pid_dur_ms[pid_r])
                 for pid_r, pid_l in layer_diffs.get(l_key, {}).values()
             )
-            total_ms += (
+            layer_ms = (
                 max(float(r["complete_ms"]) for r in rows_rep)
                 - min(float(r["ready_ms"]) for r in rows_rep)
             ) + delta
+            skip_durs_single[l_key] = layer_ms
+            total_ms += layer_ms
         end_ms = float(red_report.get("input_ready_ms", 0.0) or 0.0) + total_ms
+        expanded_ends_by_rep = {int(r): end_ms for r in (red_report.get("replicas") or (primary_rep,))}
+        skipped_dur_by_rep = {int(r): skip_durs_single for r in expanded_ends_by_rep}
     out = dict(red_report)
     if deltas and not _rebuild_full_cohort_counters(
         out, deltas, skip_map, total_ms, end_ms,
         layer_diffs=layer_diffs, pid_reports=pid_reports,
     ):
         return None
+    if isinstance(out.get("execution"), Mapping):
+        ex = dict(out["execution"])
+        ex["time_ms"] = end_ms
+        _reconstruct_cohort_step_summary(
+            ex, red_report, by_layer, skip_map, expanded_ends_by_rep,
+            by_layer_by_rep=by_layer_by_rep,
+            graphs=graphs,
+            body_key_by_op=body_key_by_op,
+            skipped_dur_by_rep=skipped_dur_by_rep,
+        )
+        out["execution"] = ex
     _strip_internal_cohort_fields(out)
     out["duration_ms"] = total_ms
     out["complete_ms"] = end_ms
-    orig_ops_by_id = {op.op_id: op for op in orig_r0_ops}
+    orig_ops_by_rep = {int(r): {op.op_id: op for op in r_ops} for r, r_ops in graphs.items()}
     expanded = _expand_cohort_timeline(
         red_timeline, body_key_by_op, by_layer, skip_map, layer_diffs, pid_dur_ms,
-        orig_ops_by_id=orig_ops_by_id,
+        orig_ops_by_id=orig_ops_by_rep.get(primary_rep),
+        by_layer_by_rep=by_layer_by_rep,
+        orig_ops_by_rep=orig_ops_by_rep,
     )
     out["timeline"] = expanded
-    n_reps = max(1, len(red_report.get("replicas") or (0,)))
+    n_reps = max(1, len(red_report.get("replicas") or (primary_rep,)))
     skipped_non_barrier = sum(
         1 for l_key in skip_map for op in by_layer[l_key] if op.family != "barrier"
     )
@@ -2127,12 +2610,14 @@ def _execute_native_cohort_attempt(
     request_views: Any,
     padded_tokens: int,
     sequence_layout: str,
+    timeline_replicas: Sequence[int] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[int, tuple[Any, ...]] | None, dict[str, str], bool]:
     from mindie_sim.prediction.graph_analysis import graph_costs
     from mindie_sim.prediction.operator_analysis import TargetGraphSet
 
+    primary_rep = min(graphs)
     planned = _plan_native_cohort_reduction(
-        eff_case, graphs[0], plan, reuse_preceding_warmup=reuse_preceding_warmup,
+        eff_case, graphs[primary_rep], plan, reuse_preceding_warmup=reuse_preceding_warmup,
     )
     if planned is None:
         return None, None, {}, False
@@ -2154,6 +2639,14 @@ def _execute_native_cohort_attempt(
     )
     if reduced_map is None:
         return None, None, {}, False
+    by_layer_by_rep: dict[int, dict[tuple[str, int], list[Any]]] = {}
+    for rep_i, r_ops in graphs.items():
+        r_layers: dict[tuple[str, int], list[Any]] = {}
+        for op in r_ops:
+            bkey = body_key_by_op.get(op.op_id)
+            if bkey is not None:
+                r_layers.setdefault(bkey, []).append(op)
+        by_layer_by_rep[int(rep_i)] = r_layers
     reduced_arg: Any = (
         TargetGraphSet(
             reduced_map,
@@ -2175,20 +2668,22 @@ def _execute_native_cohort_attempt(
         fast_span_only=fast_span_only, stream_plans=stream_plans,
         request_views=request_views, padded_tokens=padded_tokens,
         sequence_layout=sequence_layout,
-        timeline_replicas=None if fast_span_only else (0,),
+        timeline_replicas=(None if fast_span_only else timeline_replicas),
         layer_span_body_ids=body_key_by_op, fast_track_op_ids=track_ids,
         cohort_probe_order=probe_order, cohort_probe_sinks=probe_sinks,
     )
     if fast_span_only:
         assembled = _assemble_fast_cohort_report(
-            eff_case, red_report, by_layer, rep_layers, skip_map, probe_order,
-            layer_diffs, diff_ops_by_key, evaluation=evaluation, recipes=recipes,
+            eff_case, red_report, body_key_by_op, by_layer, rep_layers, skip_map, probe_order,
+            layer_diffs, diff_ops_by_key, graphs, evaluation=evaluation, recipes=recipes,
+            primary_rep=primary_rep, by_layer_by_rep=by_layer_by_rep,
         )
     else:
         assembled = _assemble_full_cohort_report(
             eff_case, red_report, body_key_by_op, by_layer, rep_layers,
-            skip_map, probe_order, layer_diffs, diff_ops_by_key, graphs[0],
+            skip_map, probe_order, layer_diffs, diff_ops_by_key, graphs,
             evaluation=evaluation, recipes=recipes,
+            primary_rep=primary_rep, by_layer_by_rep=by_layer_by_rep,
         )
     if assembled is not None:
         return assembled, reduced_map, op_rep_map, False
@@ -2217,7 +2712,7 @@ def execute_native_cohort_graph(
     request_views: Any = None,
     padded_tokens: int = 0,
     sequence_layout: str = "",
-    timeline_replicas: Sequence[int] | None = (0,),
+    timeline_replicas: Sequence[int] | None = None,
 ) -> tuple[dict[str, Any], dict[int, tuple[Any, ...]] | None, dict[str, str]]:
     """Execute native ``0..L-1 + final`` graphs via certified cohort reduction on ONE Engine.
 
@@ -2239,7 +2734,7 @@ def execute_native_cohort_graph(
         )
         return rep, None, {}
 
-    if isolated or compact or 0 not in graphs:
+    if isolated or compact or not graphs:
         return _literal_run()
     plan = cohort_plan if isinstance(cohort_plan, LayerCohortPlan) else discover_layer_cohorts(eff_case)
     attempt_kw = {
@@ -2248,6 +2743,7 @@ def execute_native_cohort_graph(
         "evaluation": evaluation, "fast_span_only": fast_span_only,
         "stream_plans": stream_plans, "request_views": request_views,
         "padded_tokens": padded_tokens, "sequence_layout": sequence_layout,
+        "timeline_replicas": timeline_replicas,
     }
     assembled, reduced_map, op_rep_map, l2_warmup_miss = _execute_native_cohort_attempt(
         eff_case, graphs, plan, reuse_preceding_warmup=True, **attempt_kw,

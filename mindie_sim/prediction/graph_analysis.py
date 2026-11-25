@@ -975,12 +975,23 @@ def _precedence_bound(rows, external, start):
     while cursor in parents:
         path.append(cursor)
         cursor = parents[cursor]
+    has_joint = any(
+        row.get("joint_collective")
+        or row.get("isolation_boundary") == "complete_collective_cohort"
+        for row in rows
+    )
+    has_warm = any("precedence_ms" in row for row in rows)
     return {
         "duration_ms": ends[leaf] if leaf is not None else 0,
         "operators": list(reversed(path)),
-        "basis": ("local_dependencies_with_zero_joint_transport_cost"
-                  if any("precedence_ms" in row for row in rows)
-                  else "isolated_costs_with_data_stream_and_collective_dependencies"),
+        "basis": (
+            "local_dependencies_with_zero_joint_transport_cost"
+            if has_joint else (
+                "warm_admissible_isolated_costs_with_data_stream_and_collective_dependencies"
+                if has_warm else
+                "isolated_costs_with_data_stream_and_collective_dependencies"
+            )
+        ),
     }
 
 
@@ -1069,15 +1080,90 @@ def _replica_l2_digest(engine, die_ids: Sequence[int]) -> str:
     return "|".join(f"{int(d)}:{fn(int(d))}" for d in sorted(set(die_ids)))
 
 
+def _stars_boundary_state(engine, execution=None) -> tuple[bool, tuple]:
+    """Capture STARS descriptor queue state and whether timed STARS issue is active."""
+    queues_map = getattr(execution, "stars_queues", None) if execution is not None else None
+    if not queues_map:
+        return False, ()
+    seen: set[int] = set()
+    entries: list[tuple] = []
+    timing_active = False
+    allocated = getattr(engine, "allocated", None) or {}
+    busy_ms = getattr(engine, "busy_ms", None) or {}
+    for stage_entries in queues_map.values():
+        for _die_rank, queue in stage_entries:
+            qid = id(queue)
+            if qid in seen:
+                continue
+            seen.add(qid)
+            spec = queue.spec
+            q_timed = (
+                float(spec.issue_interval_us) > 0.0
+                or float(spec.first_issue_us) > 0.0
+                or str(spec.release_policy) != "descriptor_ready"
+            )
+            if q_timed:
+                timing_active = True
+            credits_used = round(float(allocated.get(queue.credit_pool, 0.0)), 6)
+            lane_busy = tuple(
+                round(float(busy_ms.get(lane, 0.0)), 9)
+                for lane in queue.lane_names
+            )
+            active_recs = len(getattr(queue, "_active_records", ()) or ())
+            first_charged = len(getattr(queue, "_replay_first_charged", ()) or ())
+            entries.append((
+                str(queue.scope_key), active_recs, credits_used,
+                first_charged, lane_busy, q_timed,
+            ))
+    entries.sort(key=lambda item: item[0])
+    return timing_active, tuple(entries)
+
+
 def _capture_engine_snapshot(engine, execution=None) -> dict[str, Any]:
+    stars_timing_active, stars_state = _stars_boundary_state(engine, execution)
     return {
         "l2_fp": _l2_residency_digest(engine),
+        "stars_timing_active": stars_timing_active,
+        "stars_state": stars_state,
         "serviced": dict(engine.serviced),
         "busy_ms": dict(engine.busy_ms),
         "completed_tasks": int(getattr(engine, "completed_count", 0) or 0),
         "work": dict(getattr(execution, "work", {}) or {}) if execution is not None else {},
         "recipes": dict(getattr(execution, "recipes_used", {}) or {}) if execution is not None else {},
     }
+
+
+def _layer_op_accounting_delta(
+    execution,
+    layer_ops: Sequence[tuple[int, str, Any, str]],
+    dedup_mult: Mapping[int, int],
+) -> tuple[dict[str, float], dict[str, int]]:
+    """Compute exact per-layer work and recipe totals from executed operators."""
+    op_acct = getattr(execution, "_op_accounting", None) or {}
+    prep_ops = getattr(execution, "prepared_ops", None) or {}
+    work_acc = {"flops": 0.0, "vector_ops": 0.0, "hbm_bytes": 0.0, "link_bytes": 0.0}
+    recipes_acc: dict[str, int] = {}
+    for rep_i, op_id, orig_op, prog_name in layer_ops:
+        mult = int(dedup_mult.get(rep_i, 1))
+        acct = op_acct.get((rep_i, op_id))
+        if acct is not None:
+            rec_name, fl, vo, hb, lb = acct
+        else:
+            p_op = prep_ops.get((rep_i, op_id), orig_op)
+            rec_name = str(getattr(p_op, "recipe", "") or prog_name)
+            fl = float(getattr(p_op, "flops", 0.0))
+            vo = float(getattr(p_op, "vector_ops", 0.0))
+            hb = float(getattr(p_op, "hbm_bytes", 0.0))
+            lb = float(getattr(p_op, "link_bytes", 0.0))
+        recipes_acc[rec_name] = recipes_acc.get(rec_name, 0) + mult
+        work_acc["flops"] += fl * mult
+        work_acc["vector_ops"] += vo * mult
+        work_acc["hbm_bytes"] += hb * mult
+        work_acc["link_bytes"] += lb * mult
+    return (
+        {k: v for k, v in work_acc.items() if v},
+        {k: v for k, v in recipes_acc.items() if v},
+    )
 
 
 def _finalize_cohort_layer_deltas(
@@ -1090,11 +1176,17 @@ def _finalize_cohort_layer_deltas(
     observed_reps: Sequence[int],
     *,
     fast_span_only: bool,
+    layer_ops_seen: Mapping[Any, Sequence[tuple[int, str, Any, str]]] | None = None,
 ) -> dict[Any, dict[str, Any]]:
-    """Build per-representative-layer L2 invariance and work deltas from boundary probes."""
+    """Build per-representative-layer L2/STARS invariance and work deltas from boundary probes."""
     if not cohort_probe_order:
         return {}
     dedup_meta = getattr(execution, "_dedup_cohorts", None) or ()
+    dedup_mult = {
+        int(entry["canonical"]): 1 + len(entry["peers"])
+        for entry in dedup_meta
+    }
+    has_eager_acct = bool(getattr(execution, "_op_accounting", None))
     deltas: dict[Any, dict[str, Any]] = {}
     eps = 1e-9
     for rep_key, prev_key in cohort_probe_order:
@@ -1118,6 +1210,11 @@ def _finalize_cohort_layer_deltas(
             fp_before = str(before_g["l2_fp"])
             fp_after = str(after_g["l2_fp"])
             l2_steady = bool(fp_before) and fp_before == fp_after
+            stars_steady = (
+                not bool(before_g.get("stars_timing_active"))
+                and not bool(after_g.get("stars_timing_active"))
+                and before_g.get("stars_state") == after_g.get("stars_state")
+            )
         else:
             per_rep_ok = all(
                 bool(replica_snaps[(r, prev_key)]["die_l2_fp"])
@@ -1127,6 +1224,8 @@ def _finalize_cohort_layer_deltas(
             fp_before = "|".join(str(replica_snaps[(r, prev_key)]["die_l2_fp"]) for r in rep_present)
             fp_after = "|".join(str(replica_snaps[(r, rep_key)]["die_l2_fp"]) for r in rep_present)
             l2_steady = bool(per_rep_ok)
+            stars_timing_active, _ = _stars_boundary_state(engine, execution)
+            stars_steady = not stars_timing_active
         serviced_delta: dict[str, float] = {}
         busy_delta: dict[str, float] = {}
         work_delta: dict[str, float] = {}
@@ -1153,6 +1252,15 @@ def _finalize_cohort_layer_deltas(
                 for k in after_g["recipes"]
                 if int(after_g["recipes"][k]) != int(before_g["recipes"].get(k, 0))
             }
+            layer_ops = (layer_ops_seen or {}).get(rep_key, ())
+            if layer_ops and (has_eager_acct or (not work_delta and not recipes_delta)):
+                op_work_d, op_rec_d = _layer_op_accounting_delta(
+                    execution, layer_ops, dedup_mult,
+                )
+                if op_work_d or not work_delta:
+                    work_delta = op_work_d
+                if op_rec_d or not recipes_delta:
+                    recipes_delta = op_rec_d
             completed_delta = int(after_g["completed_tasks"]) - int(before_g["completed_tasks"])
             if not fast_span_only and dedup_meta:
                 from types import SimpleNamespace
@@ -1170,11 +1278,18 @@ def _finalize_cohort_layer_deltas(
                     )
                 serviced_delta = {k: v for k, v in proxy.serviced.items() if v}
                 busy_delta = {k: v for k, v in proxy.busy_ms.items() if v}
+        else:
+            layer_ops = (layer_ops_seen or {}).get(rep_key, ())
+            if layer_ops:
+                work_delta, recipes_delta = _layer_op_accounting_delta(
+                    execution, layer_ops, dedup_mult,
+                )
         deltas[rep_key] = {
             "prev_key": prev_key,
             "fp_before": fp_before,
             "fp_after": fp_after,
             "l2_steady": l2_steady,
+            "stars_steady": stars_steady,
             "aligned": aligned,
             "active_rep_count": len(rep_present),
             "serviced": serviced_delta,
@@ -1191,8 +1306,14 @@ def _build_cohort_probe_observer(
     body_id_map: Mapping[str, Any],
     cohort_probe_order: Sequence[tuple[Any, Any | None]],
     cohort_probe_sinks: Mapping[Any, frozenset[str]] | None = None,
-) -> tuple[Callable[..., None], list[Any], dict[tuple[int, Any], dict[str, Any]], dict[Any, dict[str, Any]]]:
-    """Wrap ``on_operator`` to snapshot L2 & work counters at exact layer exit boundaries."""
+) -> tuple[
+    Callable[..., None],
+    list[Any],
+    dict[tuple[int, Any], dict[str, Any]],
+    dict[Any, dict[str, Any]],
+    dict[Any, list[tuple[int, str, Any, str]]],
+]:
+    """Wrap ``on_operator`` to snapshot L2, STARS & work counters at exact layer exit boundaries."""
     probe_keys = {k for pair in cohort_probe_order for k in pair if k is not None}
     ctx_ref: list[Any] = [None, None, False]
     pending_rep: dict[tuple[int, Any], int] = {}
@@ -1200,6 +1321,7 @@ def _build_cohort_probe_observer(
     replica_die_ids: dict[int, set[int]] = {}
     replica_snaps: dict[tuple[int, Any], dict[str, Any]] = {}
     global_snaps: dict[Any, dict[str, Any]] = {}
+    layer_ops_seen: dict[Any, list[tuple[int, str, Any, str]]] = {}
 
     def _on_op(op, replica, program, ready, complete):
         if base_observer is not None:
@@ -1207,10 +1329,11 @@ def _build_cohort_probe_observer(
         lk = body_id_map.get(op.op_id)
         if lk not in probe_keys:
             return
+        rep_i = int(replica)
+        layer_ops_seen.setdefault(lk, []).append((rep_i, str(op.op_id), op, str(program)))
         execution, engine = ctx_ref[0], ctx_ref[1]
         if engine is None:
             return
-        rep_i = int(replica)
         die_set = replica_die_ids.setdefault(rep_i, set())
         if execution is not None and hasattr(execution, "topology"):
             die_set.update(int(d) for d in execution.topology.ranks(rep_i, int(op.stage)))
@@ -1234,7 +1357,7 @@ def _build_cohort_probe_observer(
 
         engine.on_complete(complete, _on_done, native_hook=True)
 
-    return _on_op, ctx_ref, replica_snaps, global_snaps
+    return _on_op, ctx_ref, replica_snaps, global_snaps, layer_ops_seen
 
 
 def _finalize_run_graph_artifacts(
@@ -1242,7 +1365,7 @@ def _finalize_run_graph_artifacts(
     cp_spans, non_observed_peer_events, group_for, replica_observer,
     layer_events_by_replica, non_body_by_replica, tracked_by_replica,
     cohort_probe_order, replica_snaps, global_snaps, initial_snap,
-    cohort_layer_deltas_out, filtered_non_barrier,
+    cohort_layer_deltas_out, filtered_non_barrier, layer_ops_seen=None,
 ):
     skipped_occurrences = filtered_non_barrier
     dedup_cohorts = getattr(execution, "_dedup_cohorts", None)
@@ -1274,6 +1397,7 @@ def _finalize_run_graph_artifacts(
         cohort_layer_deltas_out.update(_finalize_cohort_layer_deltas(
             execution, engine, cohort_probe_order, replica_snaps, global_snaps,
             initial_snap, obs_reps, fast_span_only=fast_span_only,
+            layer_ops_seen=layer_ops_seen,
         ))
     if non_observed_peer_events and group_for is not None:
         from .topology import Topology
@@ -1325,9 +1449,12 @@ def _run_graph(
 
     records, streams = [], {}
     filter_at_observe = timeline_replicas is not None and not compact
-    replica_observer = ExposedObserver(
-        observed_replicas=timeline_replicas if filter_at_observe else None,
+    observe_replicas = (
+        (frozenset(timeline_replicas) | {group[0] for group in groups if group[0] in graphs})
+        if (filter_at_observe and len(graphs) > 1)
+        else (timeline_replicas if filter_at_observe else None)
     )
+    replica_observer = ExposedObserver(observed_replicas=observe_replicas)
     filtered_non_barrier = 0
     ep_spans = bool(case.runtime.parallel.ep_spans_dp)
     from .sharding.local_tp import local_tp_spans_dp
@@ -1389,21 +1516,17 @@ def _run_graph(
             observe(op, replica, program, ready, complete)
     else:
         on_op = observe
-    probe_ctx_ref: list[Any] | None = None
-    replica_snaps: dict[tuple[int, Any], dict[str, Any]] = {}
-    global_snaps: dict[Any, dict[str, Any]] = {}
+    probe_ctx_ref, replica_snaps, global_snaps, layer_ops_seen = None, {}, {}, {}
     if cohort_probe_order and body_id_map is not None:
-        on_op, probe_ctx_ref, replica_snaps, global_snaps = _build_cohort_probe_observer(
+        on_op, probe_ctx_ref, replica_snaps, global_snaps, layer_ops_seen = _build_cohort_probe_observer(
             on_op, body_id_map, cohort_probe_order, cohort_probe_sinks=cohort_probe_sinks,
         )
     execution = Execution(case, ctx.cost, recipes=book, bindings=ctx.bindings,
                           ledger=CostLedger(), include_submission=include_submission,
-                          on_operator=on_op,
-                          trace_limit=trace_limit, evaluation=ctx,
+                          on_operator=on_op, trace_limit=trace_limit, evaluation=ctx,
                           accel_eager_attach=op_count >= EAGER_GRAPH_MIN_OPS,
                           stream_plans=stream_plans)
-    execution._compact_step = not execution.legacy_diagnostics
-    execution.engine._compact_step = execution._compact_step
+    execution._compact_step = execution.engine._compact_step = not execution.legacy_diagnostics
     execution._fast_span_only = bool(fast_span_only)
     views_source = request_views if request_views is not None else getattr(ops, "request_views", None)
     eff_padded = int(padded_tokens or getattr(ops, "padded_tokens", 0) or 0)
@@ -1411,8 +1534,7 @@ def _run_graph(
     execution._active_layout = str(sequence_layout or getattr(ops, "sequence_layout", "") or "")
     engine = execution.engine
     if probe_ctx_ref is not None:
-        probe_ctx_ref[0] = execution
-        probe_ctx_ref[1] = engine
+        probe_ctx_ref[0], probe_ctx_ref[1] = execution, engine
     initial_snap = _capture_engine_snapshot(engine, execution) if cohort_probe_order else {}
     if l2_fingerprints is not None:
         l2_fingerprints["before"] = _l2_residency_digest(engine)
@@ -1454,6 +1576,7 @@ def _run_graph(
         global_snaps=global_snaps, initial_snap=initial_snap,
         cohort_layer_deltas_out=cohort_layer_deltas_out,
         filtered_non_barrier=filtered_non_barrier,
+        layer_ops_seen=layer_ops_seen,
     )
     return execution, engine, records, steps, stream_plans, skipped_occurrences, replica_observer
 
@@ -1522,7 +1645,7 @@ def _bind_collective_readiness(case, records, group_for, execution, replica_obse
 
 def _price_isolated_graph(case, graphs, joins, scopes, book, primitives, ctx, stream_plans):
     from .operator_analysis import cohort_operator_costs, operator_costs, physical_id
-    costs, durations, cohort_cache = [], {}, {}
+    costs, durations, warm_durations, cohort_cache = [], {}, {}, {}
     for participants in joins.values():
         if not participants[0].get("joint_collective"):
             continue
@@ -1553,18 +1676,58 @@ def _price_isolated_graph(case, graphs, joins, scopes, book, primitives, ctx, st
         local = tuple(op for op in items if (r, op.op_id) not in joint_nodes)
         report = operator_costs(case, local, recipes=book, primitives=primitives,
                                 replay_scope=scopes[r], replica=r,
-                                evaluation=ctx, stream_plans=stream_plans)
+                                evaluation=ctx, stream_plans=stream_plans,
+                                _compute_warm=True)
         for row in report["operators"]:
             costs.append({"replica": r, **row})
             row_stream = (row["operator"].get("stream") or "main") if stream_plans else ""
-            durations[r, row["operator"]["stage"], row["physical_id"], row_stream] = row["duration_ms"]
+            key = (r, row["operator"]["stage"], row["physical_id"], row_stream)
+            cold_ms = float(row["duration_ms"])
+            durations[key] = cold_ms
+            warm_durations[key] = float(row.get("warm_duration_ms", cold_ms))
     isolated_sum = sum(row["total_ms"] for row in costs)
-    return costs, durations, isolated_sum, cohort_cache
+    return costs, durations, warm_durations, isolated_sum, cohort_cache
+
+
+def _compulsory_cold_roots(records: Sequence[Mapping[str, Any]]) -> frozenset[str]:
+    """Return IDs of records guaranteed to start with cold die-local L2 cache."""
+    by_stage: dict[tuple[int, int], list[Mapping[str, Any]]] = {}
+    for rec in records:
+        if rec.get("_peer_only"):
+            continue
+        by_stage.setdefault((int(rec["replica"]), int(rec["op"].stage)), []).append(rec)
+    cold_roots: set[str] = set()
+    for group in by_stage.values():
+        ids = {rec["id"] for rec in group}
+        succ: dict[str, list[str]] = {rid: [] for rid in ids}
+        roots: list[str] = []
+        for rec in group:
+            rid = rec["id"]
+            preds = [p for p in rec["predecessors"] if p in ids]
+            if not preds:
+                roots.append(rid)
+            for p in preds:
+                succ[p].append(rid)
+        if len(roots) != 1:
+            continue
+        root = roots[0]
+        seen = {root}
+        queue = deque([root])
+        while queue:
+            cur = queue.popleft()
+            for nxt in succ.get(cur, ()):
+                if nxt not in seen:
+                    seen.add(nxt)
+                    queue.append(nxt)
+        if len(seen) == len(ids):
+            cold_roots.add(root)
+    return frozenset(cold_roots)
 
 
 def _accumulate_compact_record(profile, record, ready_ms, complete_ms, elapsed,
                                metadata, boundary, native_payload,
-                               isolated, durations, stream_plans, physical_id):
+                               isolated, durations, warm_durations, cold_roots,
+                               stream_plans, physical_id):
     op, r = record["op"], record["replica"]
     profile["operator_events"] += 1
     family = profile["by_family"].setdefault(
@@ -1646,9 +1809,13 @@ def _accumulate_compact_record(profile, record, ready_ms, complete_ms, elapsed,
                         isolation_boundary="complete_collective_cohort")
         else:
             op_stream = (op.stream or "main") if stream_plans else ""
-            iso = (0 if op.family == "barrier"
-                   else durations[r, op.stage, physical_id(op), op_stream])
+            key = (r, op.stage, physical_id(op), op_stream)
+            iso = 0 if op.family == "barrier" else durations[key]
             record["isolated_ms"] = iso
+            if op.family != "barrier" and record["id"] not in cold_roots:
+                warm_ms = warm_durations.get(key, iso)
+                if warm_ms + 1e-12 < iso:
+                    record["precedence_ms"] = warm_ms
         rank["isolated_ms"] = rank.get("isolated_ms", 0.0) + iso
         stats["isolated_ms"] = stats.get("isolated_ms", 0.0) + iso
         family["isolated_ms"] = family.get("isolated_ms", 0.0) + iso
@@ -1661,8 +1828,9 @@ def _accumulate_compact_record(profile, record, ready_ms, complete_ms, elapsed,
     family_rank["complete_ms"] = max(family_rank["complete_ms"], complete_ms)
 
 
-def _graph_operator_rows(records, duration, compact, isolated, durations, stream_plans):
+def _graph_operator_rows(records, duration, compact, isolated, durations, warm_durations, stream_plans):
     from .operator_analysis import physical_id
+    cold_roots = _compulsory_cold_roots(records) if isolated else frozenset()
     profile = None
     if compact:
         profile = {
@@ -1687,7 +1855,8 @@ def _graph_operator_rows(records, duration, compact, isolated, durations, stream
             _accumulate_compact_record(
                 profile, record, ready_ms, complete_ms, elapsed,
                 metadata, boundary, native_payload,
-                isolated, durations, stream_plans, physical_id)
+                isolated, durations, warm_durations, cold_roots,
+                stream_plans, physical_id)
             continue
         row = {
             "id": record["id"], "replica": r, "op_id": op.op_id, "family": op.family,
@@ -1721,8 +1890,13 @@ def _graph_operator_rows(records, duration, compact, isolated, durations, stream
                     isolation_boundary="complete_collective_cohort")
             else:
                 op_stream = (op.stream or "main") if stream_plans else ""
-                row["isolated_ms"] = (0 if op.family == "barrier"
-                                      else durations[r, op.stage, physical_id(op), op_stream])
+                key = (r, op.stage, physical_id(op), op_stream)
+                cold_ms = 0 if op.family == "barrier" else durations[key]
+                row["isolated_ms"] = cold_ms
+                if op.family != "barrier" and record["id"] not in cold_roots:
+                    warm_ms = warm_durations.get(key, cold_ms)
+                    if warm_ms + 1e-12 < cold_ms:
+                        row["precedence_ms"] = warm_ms
         rows.append(row)
     return rows, profile
 
@@ -1911,8 +2085,30 @@ def _assemble_graph_result(
     return result
 
 
+def _cohort_step_context(execution, graphs, steps):
+    dedup_meta = getattr(execution, "_dedup_cohorts", None) or ()
+    dedup_peers = {int(peer) for entry in dedup_meta for peer in entry.get("peers", ())}
+    recorded = [int(r) for r in graphs if int(r) not in dedup_peers]
+    windows = {}
+    for rep_i, step in (steps or {}).items():
+        commits = {
+            str(req): float(ev.time)
+            for req, ev in (getattr(step, "declared_commits", None) or {}).items()
+            if getattr(ev, "time", None) is not None
+        }
+        deliveries = {
+            str(req): float(ev.time)
+            for req, ev in (getattr(step, "client_deliveries", None) or {}).items()
+            if getattr(ev, "time", None) is not None
+        }
+        if commits or deliveries:
+            windows[int(rep_i)] = {"commits": commits, "deliveries": deliveries}
+    return recorded, windows
+
+
 def _build_fast_span_result(
     case, execution, engine, graphs, replay_scope, *,
+    scopes=None, steps=None,
     include_submission, input_ready_ms, end, duration,
     replica_bounds_map, replica_non_body_map, replica_complete_map,
     tracked_by_rep, l2_fingerprints, cohort_layer_deltas,
@@ -1924,6 +2120,7 @@ def _build_fast_span_result(
         "input_ready_ms": input_ready_ms, "complete_ms": end,
         "duration_ms": duration, "replicas": list(graphs),
         "replay_scope": replay_scope,
+        **({"replay_scope_by_replica": scopes} if scopes is not None else {}),
         "operator_occurrences": 0, "resources": [],
         "execution": summary,
         "engine_backend": summary.get("accel_backend"),
@@ -1937,6 +2134,10 @@ def _build_fast_span_result(
         out_fast["non_body_bounds"] = (replica_non_body_map or {}).get(r0, [])
         out_fast["replica_non_body_bounds"] = replica_non_body_map or {}
         out_fast["replica_complete_ms"] = replica_complete_map
+        recorded, windows = _cohort_step_context(execution, graphs, steps)
+        out_fast["_dedup_recorded_replicas"] = recorded
+        if windows:
+            out_fast["_replica_step_windows"] = windows
         if tracked_by_rep:
             out_fast["tracked_op_elapsed_ms"] = {
                 oid: float(c.time) - float(r.time)
@@ -1961,7 +2162,7 @@ def _attach_cohort_graph_metadata(
     assembled, graphs, records, execution, body_id_map,
     l2_fingerprints, replica_bounds_map, replica_non_body_map,
     replica_complete_map, cohort_layer_deltas,
-    tracked_by_rep=None,
+    tracked_by_rep=None, steps=None,
 ):
     if l2_fingerprints is not None:
         assembled["l2_residency_fingerprints"] = (
@@ -1972,6 +2173,10 @@ def _attach_cohort_graph_metadata(
         assembled["replica_layer_bounds"] = replica_bounds_map
         assembled["replica_non_body_bounds"] = replica_non_body_map or {}
         assembled["replica_complete_ms"] = replica_complete_map
+        recorded, windows = _cohort_step_context(execution, graphs, steps)
+        assembled["_dedup_recorded_replicas"] = recorded
+        if windows:
+            assembled["_replica_step_windows"] = windows
     if tracked_by_rep:
         r0 = min(replica_bounds_map, default=0) if replica_bounds_map else min(graphs, default=0)
         assembled["tracked_op_elapsed_ms"] = {
@@ -2084,6 +2289,7 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     if fast_span_only:
         return _build_fast_span_result(
             case, execution, engine, graphs, replay_scope,
+            scopes=scopes, steps=steps,
             include_submission=include_submission, input_ready_ms=input_ready_ms,
             end=end, duration=duration, replica_bounds_map=replica_bounds_map,
             replica_non_body_map=replica_non_body_map, replica_complete_map=replica_complete_map,
@@ -2091,15 +2297,17 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             cohort_layer_deltas=cohort_layer_deltas,
         )
     joins = _bind_collective_readiness(case, records, group_for, execution, replica_observer=replica_observer)
-    costs, durations, isolated_sum, cohort_cache = [], {}, 0.0, {}
+    costs, durations, warm_durations, isolated_sum, cohort_cache = [], {}, {}, 0.0, {}
     if isolated:
-        costs, durations, isolated_sum, cohort_cache = _price_isolated_graph(
+        costs, durations, warm_durations, isolated_sum, cohort_cache = _price_isolated_graph(
             case, graphs, joins, scopes, book, primitives, ctx, stream_plans)
     row_records = (
         [record for record in records if not record.get("_peer_only") and record["replica"] in keep_replicas]
         if (keep_replicas is not None and not compact) else records
     )
-    rows, profile = _graph_operator_rows(row_records, duration, compact, isolated, durations, stream_plans)
+    rows, profile = _graph_operator_rows(
+        row_records, duration, compact, isolated, durations, warm_durations, stream_plans,
+    )
     isolated_profile = None
     if compact and isolated:
         isolated_profile = _isolated_operator_profile(costs, isolated_sum)
@@ -2134,5 +2342,5 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         assembled, graphs, records, execution, body_id_map,
         l2_fingerprints, replica_bounds_map, replica_non_body_map,
         replica_complete_map, cohort_layer_deltas,
-        tracked_by_rep=tracked_by_rep,
+        tracked_by_rep=tracked_by_rep, steps=steps,
     )

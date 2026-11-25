@@ -289,7 +289,57 @@ class StageProfile:
 
     @property
     def profile_key(self) -> tuple:
-        return (int(self.stage), self.geometry, self.primitive_identity)
+        stage_ranks = frozenset(int(d.rank) for d in self.dies)
+        die_sig = tuple(
+            (
+                str(d.sku), float(d.launch_us), _freeze_key(d.kernel_invocations),
+                _freeze_key(d.memory_access),
+                d.hbm_read_bytes_per_s, d.hbm_write_bytes_per_s, d.hbm_rw_alpha,
+                int(d.simt_ub_carveout_bytes), _freeze_key(d.subtile_wave),
+                _freeze_key(d.dispatch_sync),
+            )
+            for d in self.dies
+        )
+        dp_sig = None
+        if self.datapath is not None:
+            ub_edges = getattr(self.datapath, "ub_peer_edges", ()) or ()
+            in_stage_ub = sum(1 for src, dst in ub_edges if src in stage_ranks and dst in stage_ranks)
+            out_stage_ub = sum(1 for src, dst in ub_edges if src in stage_ranks and dst not in stage_ranks)
+            dp_sig = self.datapath._signature((in_stage_ub, out_stage_ub))
+        arch_sig = None
+        if self.compute_arch is not None:
+            from mindie_sim.schema.datapath import _arch_capability_key
+            arch_sig = (
+                _arch_capability_key(self.compute_arch),
+                tuple(
+                    (rt.name, rt.provides, _freeze_key(rt.conditions))
+                    for rt in self.compute_arch.runtimes
+                ),
+            )
+        rc_sig = tuple(sorted(
+            (
+                str(res.name).rsplit(":", 1)[-1],
+                float(res.rate), str(res.unit), str(res.policy), int(res.units),
+            )
+            for res in self.host_rc_resources
+        ))
+        return (
+            int(self.stage),
+            self.geometry,
+            self.primitive_identity,
+            tuple(sorted((str(k), (float(r), str(u))) for k, (r, u) in self.rates.items())),
+            tuple(sorted((str(k), float(v)) for k, v in self.compute_peaks.items())),
+            tuple(sorted((str(k), float(v)) for k, v in self.pool_capacities.items())),
+            tuple(sorted((str(k), (str(role), float(r))) for k, (role, r) in self.service_modes.items())),
+            _freeze_key(self.store_queues),
+            getattr(self.physical_mechanisms, "signature", None),
+            tuple(sorted((str(k), int(v)) for k, v in self.units.items())),
+            tuple(sorted((str(k), int(v)) for k, v in self.pool_units_by_name.items())),
+            rc_sig,
+            die_sig,
+            dp_sig,
+            arch_sig,
+        )
 
 
 def _resolve_stage_service_modes(
@@ -345,13 +395,18 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                          replicas=None, primitive_table: Any = None) -> tuple[StageProfile, ...]:
     """Resolve every stage's immutable hardware binding exactly once."""
     p = case.runtime.parallel
+    placement = case.machine.validate_placement(p)
     width = p.tp * p.pcp
     selected = range(p.dp) if replicas is None else tuple(replicas)
+    total_replicas = max(1, int(p.external_dp) * int(p.dp))
     profiles: list[StageProfile] = []
     for replica in selected:
+        rep_i = int(replica)
+        if rep_i < 0 or rep_i >= total_replicas:
+            raise ModelingError("placement_exceeds_physical_devices")
         for stage in range(p.pp):
-            start = (int(replica) * p.pp + stage) * width
-            dies = tuple(case.machine.dies[start:start + width])
+            ranks = placement.stage_ranks(rep_i, stage)
+            dies = tuple(placement.die_for_rank(rank) for rank in ranks)
             if len(dies) != width:
                 raise ModelingError("placement_exceeds_physical_devices")
             geometry = _execution_geometry(dies[0])
@@ -364,6 +419,7 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                 dies, links=case.machine.links,
                 transfer_channels=case.machine.transfer_channels,
             )
+            peak_aliases = dict(dies[0].compute_peak_aliases)
             roles = dict(dies[0].rates)
             work_units = {**NATIVE_WORK_UNITS, **dict(dies[0].work_units)}
             orig_rates_s = {
@@ -382,7 +438,11 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                     role: (min(val, orig_rates_s[role]) if orig_rates_s.get(role, 0.0) > 0.0 else val)
                     for role, val in overlay.rates
                 }
-                overlay_peaks = dict(overlay.compute_peaks)
+                overlay_peaks = {
+                    dt: pk for dt, pk in dict(overlay.compute_peaks).items()
+                    if dt not in peak_aliases
+                    and (not compute_arch.has_native_modes() or compute_arch.supports_native("matrix", dt))
+                }
                 hbm_cap_s = orig_rates_s.get("hbm", 0.0)
                 dp_updates: dict[str, Any] = {}
                 if overlay.hbm_read_bytes_per_s is not None:
@@ -397,8 +457,9 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                     )
                 if overlay.hbm_rw_alpha is not None:
                     dp_updates["hbm_rw_alpha"] = overlay.hbm_rw_alpha
-                merged_caps = {**dict(datapath.compute_peaks), **overlay_peaks}
-                dp_updates["compute_peaks"] = tuple(sorted(merged_caps.items()))
+                if overlay_peaks:
+                    merged_caps = {**dict(datapath.compute_peaks), **overlay_peaks}
+                    dp_updates["compute_peaks"] = tuple(sorted(merged_caps.items()))
                 datapath = replace(datapath, **dp_updates)
             rates = {
                 role: (overlay_rates.get(role, orig_rates_s[role]) / MS_PER_S,
@@ -426,16 +487,12 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
                 pools[key] = min(dict(die.buffers)[pool] for die in dies)
                 pool_units[key] = dies[0].pool_units(pool)
                 stage_pools[str(pool)] = key
-            peak_aliases = dict(dies[0].compute_peak_aliases)
             orig_compute_peaks = {
                 dtype: min(die.peak(dtype) for die in dies)
                 for dtype, _ in dies[0].compute_peaks
                 if dtype not in peak_aliases
             }
-            compute_peaks = dict(orig_compute_peaks)
-            for dt, peak in overlay_peaks.items():
-                if dt in compute_peaks or dt not in peak_aliases:
-                    compute_peaks[dt] = peak
+            compute_peaks = {**orig_compute_peaks, **overlay_peaks}
             orig_service_modes = {
                 mode: (role, min(dict(die.service_modes)[mode][1] for die in dies))
                 for mode, (role, _) in dies[0].service_modes
@@ -587,6 +644,11 @@ class _ContextMixin:
             op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
             op.mte3_bytes, op.vector_ops, op.hbm_bytes, op.link_bytes,
             op.link_scope, op.source_boundary, op.returns,
+            _freeze_key(op.precision_abi),
+            _freeze_key(op.kernel_binding),
+            _freeze_key(op.owner_schedule),
+            _freeze_key(op.logical_precision_reqs),
+            op.coverage,
             self._op_key(op),
             getattr(geom, "physical_mechanisms").signature
             if getattr(geom, "physical_mechanisms", None) is not None else None,
@@ -1054,6 +1116,11 @@ class _ContextMixin:
             op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
             op.mte3_bytes, op.vector_ops, op.hbm_bytes, op.link_bytes,
             op.link_scope, op.source_boundary, op.returns,
+            _freeze_key(op.precision_abi),
+            _freeze_key(op.kernel_binding),
+            _freeze_key(op.owner_schedule),
+            _freeze_key(op.logical_precision_reqs),
+            op.coverage,
             self._op_key(op), context.setup_ms, context.minimum_ms,
             (inv_t.startup_ms, inv_t.minimum_ms) if inv_t is not None else None,
             _freeze_key(context.joint_native_service),
