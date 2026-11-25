@@ -330,6 +330,14 @@ class _TopologyPlansMixin:
             return plan
         for replica in participants:
             self.clear_oneshot_plan(op, replica)
+        explicit_ops = getattr(self, "_explicit_joint_ops", None)
+        if explicit_ops is None:
+            explicit_ops = {}
+            self._explicit_joint_ops = explicit_ops
+        if len(explicit_ops) >= MAX_TRANSPORT_BINDINGS:
+            explicit_ops.clear()
+        explicit_ops[id(op)] = algorithm
+        explicit_ops[getattr(op, "op_id", id(op))] = algorithm
         if algorithm == "ring":
             if "peer_traffic" in metadata:
                 raise ModelingError(
@@ -622,8 +630,97 @@ class _TopologyPlansMixin:
         return tuple(MessageFlow(flow.source, flow.destination, size,
                                  flow.messages) for size in sizes)
 
+    def _band_plan_accounting(self, plan, *, source_ranks=None):
+        """Account a ``BandCollectivePlan``, optionally restricted to ``source_ranks``."""
+        if source_ranks is None or set(plan.ranks) <= source_ranks:
+            return plan.accounting()
+        from .protocol import MS_PER_S
+
+        useful_by_rank: dict[int, float] = {}
+        useful_by_res: dict[str, float] = {}
+        wire_by_res: dict[str, float] = {}
+        transactions: dict[str, int] = {}
+        transaction_frames: dict[str, tuple[int, int]] = {}
+        message_count = 0
+        routed_useful = 0.0
+        physical_wire = 0.0
+        setup_ms = 0.0
+        max_path_latency = 0.0
+
+        for group in plan.groups:
+            lowered = group.lowered
+            band = lowered.band
+            frame_pair = (
+                int(band.payload_bytes_per_frame),
+                int(band.wire_bytes_per_frame),
+            )
+            hop_startup_ms = (
+                0.0
+                if lowered.uses_calibrated_startup
+                else (band.startup_us / MS_PER_S if band.startup_scope == "hop" else 0.0)
+            )
+            group_setup = lowered.collective_startup_us / MS_PER_S
+            group_matched = False
+            for phase in lowered.phases:
+                round_latencies: dict[int, float] = {}
+                phase_matched = False
+                for transfer in phase.transfers:
+                    if transfer.source not in source_ranks:
+                        continue
+                    group_matched = True
+                    phase_matched = True
+                    message_count += 1
+                    useful_by_rank[transfer.source] = (
+                        useful_by_rank.get(transfer.source, 0.0)
+                        + transfer.payload_bytes
+                    )
+                    path_lat = 0.0
+                    for hop in transfer.hops:
+                        routed_useful += transfer.payload_bytes
+                        physical_wire += transfer.wire_bytes
+                        for res in hop.resources:
+                            useful_by_res[res] = (
+                                useful_by_res.get(res, 0.0) + transfer.payload_bytes
+                            )
+                            wire_by_res[res] = (
+                                wire_by_res.get(res, 0.0) + transfer.wire_bytes
+                            )
+                            transactions[res] = (
+                                transactions.get(res, 0) + transfer.frames
+                            )
+                            transaction_frames[res] = frame_pair
+                        if lowered.uses_calibrated_startup:
+                            hop_lat = hop.switch_propagation_ms
+                        elif band.startup_us > 0.0:
+                            hop_lat = hop_startup_ms + hop.switch_propagation_ms
+                        else:
+                            hop_lat = hop.propagation_ms
+                        path_lat += hop_lat
+                    max_path_latency = max(max_path_latency, path_lat)
+                    round_latencies[transfer.round_index] = max(
+                        round_latencies.get(transfer.round_index, 0.0), path_lat
+                    )
+                if phase_matched:
+                    group_setup += phase.startup_us / MS_PER_S
+                    group_setup += sum(round_latencies.values())
+            if group_matched:
+                setup_ms = max(setup_ms, group_setup)
+
+        return self._work_with_capacity(CommunicationWork(
+            useful_by_rank,
+            useful_by_res,
+            wire_by_res,
+            transactions,
+            transaction_frames,
+            message_count,
+            setup_ms,
+            routed_useful,
+            physical_wire,
+            max_path_latency,
+        ))
+
     def accounting(self, op, replica, *, volume=None, transport=None,
-                   recipe=None):
+                   recipe=None, band_plan=None):
         """Account the one selected physical plan."""
         mesh = self.bound_mesh_plan(op, replica)
         if mesh is not None:
@@ -635,6 +732,11 @@ class _TopologyPlansMixin:
         if oneshot is not None:
             source_stage = int(dict(op.metadata).get("source_stage", op.stage))
             return self._work_with_capacity(oneshot.accounting(source_ranks=self.ranks(replica, source_stage)))
+        if band_plan is not None:
+            source_stage = int(dict(op.metadata).get("source_stage", op.stage))
+            return self._band_plan_accounting(
+                band_plan, source_ranks=frozenset(self.ranks(replica, source_stage)),
+            )
         if transport is None and recipe is not None:
             from mindie_sim.prediction.operators.collectives.direct_peer import resolve_transport_options
             transport = resolve_transport_options(recipe, op)
@@ -642,16 +744,44 @@ class _TopologyPlansMixin:
             transport = self._transport_bindings.get(id(op))
         if transport is None:
             transport = self._transport_bindings.get(getattr(op, "op_id", None))
+        resolved_volume = op.link_bytes if volume is None else volume
+        raw_meta = dict(op.metadata)
+        explicit_ops = getattr(self, "_explicit_joint_ops", None)
+        has_explicit_joint = bool(
+            explicit_ops
+            and (id(op) in explicit_ops or getattr(op, "op_id", id(op)) in explicit_ops)
+        )
+        if (recipe is not None and resolved_volume and not has_explicit_joint
+                and not isinstance(raw_meta.get("megamoe_geometry"), Mapping)):
+            from . import plan_options as collective_plan_options
+
+            plan_algo = recipe_algo or "auto"
+            if (plan_algo in {"ring", "pairwise", "auto"}
+                    and not collective_plan_options(recipe, op)):
+                resolved_band = None
+                try:
+                    resolved_band = self.band_collective_plan(
+                        op, {replica: resolved_volume}, algorithm=plan_algo,
+                        transport=transport,
+                    )
+                except ModelingError as exc:
+                    if not str(exc).startswith("joint_collective_group_membership"):
+                        raise
+                if resolved_band is not None:
+                    source_stage = int(raw_meta.get("source_stage", op.stage))
+                    return self._band_plan_accounting(
+                        resolved_band,
+                        source_ranks=frozenset(self.ranks(replica, source_stage)),
+                    )
         if transport is not None:
             options = TransportOptions.from_mapping(transport)
             chunk = options.chunk_bytes
             max_physical_chunks = options.max_physical_chunks
         else:
-            metadata = dict(op.metadata)
-            chunk = metadata.get("transport_chunk_bytes")
-            max_physical_chunks = metadata.get(
+            chunk = raw_meta.get("transport_chunk_bytes")
+            max_physical_chunks = raw_meta.get(
                 "transport_max_physical_chunks", DEFAULT_MAX_PHYSICAL_CHUNKS)
-        volume = op.link_bytes if volume is None else volume
+        volume = resolved_volume
         if chunk is not None:
             try:
                 chunk = float(chunk)
@@ -713,7 +843,11 @@ class _TopologyPlansMixin:
             if (opts.chunk_bytes is not None
                     or float(opts.hop_startup_us or 0.0) > 0.0
                     or opts.receive_capacity_bytes_per_peer is not None
-                    or opts.receive_buffer_id is not None):
+                    or opts.receive_buffer_id is not None
+                    or (opts.max_inflight_per_rank is not None
+                        and int(opts.max_inflight_per_rank) != 1)
+                    or (opts.max_physical_chunks is not None
+                        and int(opts.max_physical_chunks) != DEFAULT_MAX_PHYSICAL_CHUNKS)):
                 return None
         from .band_plan import build_band_collective_plan
         from .protocol import SUPPORTED_COLLECTIVES, _candidate_bands, _infer_group_scope

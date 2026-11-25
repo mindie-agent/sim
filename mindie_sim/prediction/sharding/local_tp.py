@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -22,6 +23,7 @@ from mindie_sim.catalog.projection_placement import (
     ROLE_SHARED_EXPERT_DOWN, ROLE_SHARED_EXPERT_UP,
     _padded_local, role_from_category, role_width,
 )
+from mindie_sim.catalog.weight_terms import vocab_parallel_rows
 from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.runtime_features import LOCAL_TP_AXIS_NAMES
@@ -521,11 +523,40 @@ def _slice_local(item: Mapping[str, Any], width: int, quant: Any = None) -> int:
     return _local_output_width(size, width)
 
 
+def _is_replicated_slice(item: Mapping[str, Any], width: int) -> bool:
+    if item.get("replicated"):
+        return True
+    if str(item.get("shard", "")) == "kv_out" and width > 1:
+        shape = tuple(item.get("shape", ()))
+        size = int(shape[-1]) if shape else 0
+        return size > 0 and _slice_local(item, width) == size
+    return False
+
+
 def _replicated_local_width(metadata: Mapping[str, Any], width: int) -> int:
     """Local output columns every owner already holds without a collective."""
     slices = metadata.get("packed_projection_slices") or ()
     return sum(int(tuple(item.get("shape", (0, 0)))[-1])
-               for item in slices if item.get("replicated"))
+               for item in slices if _is_replicated_slice(item, width))
+
+
+def _remote_exchange_width(
+    metadata: Mapping[str, Any], width: int, local_n: int, full_n: int,
+    quant: Any = None, *, is_logits: bool = False,
+) -> int:
+    """Distinct remote output columns each rank needs to restore its full row."""
+    if is_logits:
+        return max(0, (int(width) - 1) * int(local_n))
+    slices = metadata.get("packed_projection_slices")
+    if slices:
+        remote = 0
+        for item in slices:
+            shape = tuple(item.get("shape", ()))
+            size = int(shape[-1]) if shape else 0
+            local_size = _slice_local(item, width, quant)
+            remote += max(0, size - local_size)
+        return remote
+    return max(0, int(full_n) - int(local_n))
 
 
 def _packed_local_width(
@@ -534,9 +565,16 @@ def _packed_local_width(
 ) -> int:
     slices = metadata.get("packed_projection_slices")
     if not slices:
+        if role in {ROLE_LOGITS, ROLE_DRAFT_LOGITS}:
+            explicit_pad = int(metadata.get("vocab_padding_size") or 0)
+            width_i = max(1, int(width))
+            if explicit_pad > 0:
+                alignment = math.lcm(explicit_pad, width_i)
+                return int(align_up(int(total), alignment)) // width_i
+            return vocab_parallel_rows(total, width_i)
         if role in {
-            ROLE_LOGITS, ROLE_DRAFT_LOGITS, ROLE_ATTENTION_INPUT,
-            ROLE_LINEAR_INPUT, ROLE_DENSE_MLP_UP, ROLE_SHARED_EXPERT_UP,
+            ROLE_ATTENTION_INPUT, ROLE_LINEAR_INPUT,
+            ROLE_DENSE_MLP_UP, ROLE_SHARED_EXPERT_UP,
         }:
             return _local_output_width(total, width)
         return _local_dimension(total, width, quant)
@@ -558,8 +596,11 @@ def _localize_packed_slices(
     for item, local_size in zip(slices, local_sizes):
         shape = tuple(item.get("shape", ()))
         out_rows = int(rows) if rows is not None else (int(shape[0]) if shape else 0)
-        local_slices.append({**dict(item), "shape": (out_rows, local_size),
-                             "strides": (packed_width, 1), "offset_elements": offset})
+        entry = {**dict(item), "shape": (out_rows, local_size),
+                 "strides": (packed_width, 1), "offset_elements": offset}
+        if _is_replicated_slice(item, width):
+            entry["replicated"] = True
+        local_slices.append(entry)
         offset += local_size
     metadata["packed_projection_slices"] = tuple(local_slices)
 
@@ -1030,23 +1071,32 @@ def _rewrite_single_projection(
         return (gemm, restore)
     if partition == ROLE_COLUMN:
         full_n = n
-        if role in {ROLE_LOGITS, ROLE_DRAFT_LOGITS} and stride > 1:
-            tp_gather = _logits_tp_gather(op, by_id, users)
-            padded_v = int(metadata.get("vocab_padded_size") or 0)
-            if padded_v > 0:
-                full_n = padded_v
-            elif tp_gather is not None and len(tp_gather.local_shape) >= 2 and int(tp_gather.local_shape[1]) > n:
-                full_n = int(tp_gather.local_shape[1])
-            elif role == ROLE_LOGITS and model is not None and int(getattr(model, "vocab_size", 0) or 0) > 0:
+        is_logits = role in {ROLE_LOGITS, ROLE_DRAFT_LOGITS}
+        is_draft = str(metadata.get("layer_scope") or "") == "draft"
+        if is_logits:
+            if role == ROLE_LOGITS and not is_draft and model is not None and int(getattr(model, "vocab_size", 0) or 0) > 0:
                 full_n = int(model.vocab_size)
-            elif not _is_globally_replicated(op, role, metadata, SimpleNamespace(metadata=()), model):
-                full_n = n * stride
+            elif stride > 1:
+                tp_gather = _logits_tp_gather(op, by_id, users)
+                padded_v = int(metadata.get("vocab_padded_size") or 0)
+                if padded_v > 0:
+                    full_n = padded_v
+                elif tp_gather is not None and len(tp_gather.local_shape) >= 2 and int(tp_gather.local_shape[1]) > n:
+                    full_n = int(tp_gather.local_shape[1])
+                elif not _is_globally_replicated(op, role, metadata, SimpleNamespace(metadata=()), model):
+                    full_n = n * stride
         local_n = _packed_local_width(metadata, factor, full_n, quant, role=role)
-        replicated_n = _replicated_local_width(metadata, factor)
+        remote_n = _remote_exchange_width(
+            metadata, factor, local_n, full_n, quant, is_logits=is_logits,
+        )
         col_rows = (
-            factor * pad_tok if role in {ROLE_LOGITS, ROLE_DRAFT_LOGITS}
+            factor * pad_tok if is_logits
             else total_tok
         )
+        restore_n = factor * local_n if is_logits else full_n
+        if is_logits and (restore_n != full_n or "vocab_padded_size" in metadata):
+            metadata["vocab_padded_size"] = restore_n
+            metadata["vocab_cols_per_rank"] = local_n
         _localize_packed_slices(metadata, factor, quant, rows=col_rows)
         gather = _collective(op, suffix="gather", family="allgather", recipe="ring_allgather",
                              payload=float((factor - 1) * pad_tok * k) * dtype_bytes(act), shape=(col_rows, k),
@@ -1055,10 +1105,9 @@ def _rewrite_single_projection(
         gemm = _rewrite_matrix(op, gemm_id=gemm_id, rows=col_rows, cols=local_n, reduced=k,
                                role=role, width=factor, dep_ids=(gather.op_id,),
                                weight_ratio=float(local_n) / float(max(1, n)), quant=quant, extra_metadata=metadata)
-        exchanged_n = max(0, local_n - replicated_n)
         restore = _collective(op, suffix="exchange", family="alltoall", recipe="alltoall",
-                              payload=float((factor - 1) * pad_tok * exchanged_n)
-                                      * dtype_bytes(out), shape=(m, full_n),
+                              payload=float(pad_tok * remote_n) * dtype_bytes(out),
+                              shape=(m, restore_n),
                               role=role, group=group, width=factor, deps=(gemm.op_id,), scope=op_scope,
                               dtype=out, public_id=op.op_id, stride=stride)
         return (gather, gemm, restore)

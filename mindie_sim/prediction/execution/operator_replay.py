@@ -327,18 +327,33 @@ def cohort_operator_costs(case, ops, *, recipes, primitives=None,
     engine.advance(until=tuple(item.completion for item in participants), first=False)
     rows, attributed = [], {}
     duration = max(item.completion.time for item in participants) - input_ready_ms
+    cohort_band_plan = None
+    if participants:
+        from ..collectives import plan_options as collective_options
+
+        first = participants[0]
+        first_algo = getattr(first.recipe, "algorithm", None)
+        if first_algo in {"ring", "pairwise"} and not collective_options(first.recipe, first.context.op):
+            participants_vol = {
+                item.replica: item.context.native_work.get("link", 0)
+                for item in participants
+            }
+            cohort_band_plan = execution.topology.band_collective_plan(
+                first.context.op, participants_vol, algorithm=first_algo,
+            )
     for item in participants:
         context = item.context
         transport = execution.transport_options_for(
             context.op, item.replica, replica_scopes.get(item.replica, "none"))
         accounting = execution.topology.accounting(
             context.op, item.replica, volume=context.native_work.get("link", 0),
-            transport=transport, recipe=item.recipe)
+            transport=transport, recipe=item.recipe, band_plan=cohort_band_plan)
         for resource, amount in accounting.wire_by_resource.items():
             attributed[resource] = attributed.get(resource, 0) + amount
         row_context = (
             replace(context, work=dict(accounting.wire_by_resource))
-            if (getattr(item.recipe, "algorithm", None) == "oneshot"
+            if ((getattr(item.recipe, "algorithm", None) == "oneshot"
+                 or cohort_band_plan is not None)
                 and context.joint_native_service is None)
             else context
         )
@@ -357,9 +372,13 @@ def cohort_operator_costs(case, ops, *, recipes, primitives=None,
         })
     actual = {key: value for key, value in engine.serviced.items()
               if value and "stream_quota@" not in key}
-    if any(not math.isclose(attributed.get(key, 0), actual.get(key, 0),
+    expected_service = dict(attributed)
+    if cohort_band_plan is not None:
+        for key, amount in _band_plan_aux_service(cohort_band_plan).items():
+            expected_service[key] = expected_service.get(key, 0.0) + amount
+    if any(not math.isclose(expected_service.get(key, 0), actual.get(key, 0),
                             rel_tol=1e-12, abs_tol=1e-9)
-           for key in attributed.keys() | actual.keys()):
+           for key in expected_service.keys() | actual.keys()):
         raise ValueError("collective_cohort_source_wire_accounting_mismatch")
     return {
         "boundary": "complete_collective_cohort",
@@ -464,6 +483,35 @@ def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_m
     }
 
 
+def _band_plan_aux_service(plan) -> dict[str, float]:
+    """Derive die-injection and SDMA-flow engine service for a ``BandCollectivePlan``."""
+    from ..collectives.ports import die_injection_resource_name, sdma_flow_resource_name
+
+    aux: dict[str, float] = {}
+    for group in plan.groups:
+        lowered = group.lowered
+        ns = str(getattr(lowered, "namespace", "") or "")
+        group_ranks = frozenset(lowered.group)
+        has_inj = lowered.die_injection_ceiling_bytes_per_ms is not None
+        for phase in lowered.phases:
+            for transfer in phase.transfers:
+                for hop in transfer.hops:
+                    if has_inj:
+                        if hop.source in group_ranks:
+                            tx = die_injection_resource_name(hop.source, "tx", namespace=ns)
+                            aux[tx] = aux.get(tx, 0.0) + transfer.wire_bytes
+                        if hop.destination in group_ranks:
+                            rx = die_injection_resource_name(hop.destination, "rx", namespace=ns)
+                            aux[rx] = aux.get(rx, 0.0) + transfer.wire_bytes
+                    if transfer.flow_cap_bytes_per_ms is not None:
+                        sdma_ms = transfer.wire_bytes / float(transfer.flow_cap_bytes_per_ms)
+                        stx = sdma_flow_resource_name(hop.source, "tx", namespace=ns)
+                        srx = sdma_flow_resource_name(hop.destination, "rx", namespace=ns)
+                        aux[stx] = aux.get(stx, 0.0) + sdma_ms
+                        aux[srx] = aux.get(srx, 0.0) + sdma_ms
+    return aux
+
+
 def _replay_scope(ops, declared):
     if declared is not None:
         return declared
@@ -515,13 +563,20 @@ def _evaluate_isolated_group(
     duration = complete.time - input_ready_ms
     hw_serviced = {k: v for k, v in engine.serviced.items() if "stream_quota@" not in k}
     l2_after = str(l2_fp_fn()) if callable(l2_fp_fn) else ""
-    comm_accounting = (
-        execution.topology.accounting(
+    from mindie_sim.prediction.collectives.band_plan import BandCollectivePlan
+
+    if (context.native_work.get("link")
+            and isinstance(cp_plan, BandCollectivePlan)
+            and context.joint_native_service is None
+            and not isinstance(program, NativeProgram)):
+        comm_accounting = cp_plan.accounting()
+    elif context.native_work.get("link"):
+        comm_accounting = execution.topology.accounting(
             op, replica, volume=context.native_work["link"],
             transport=execution.transport_options_for(op, replica, replay_scope),
             recipe=recipe)
-        if context.native_work.get("link") else None
-    )
+    else:
+        comm_accounting = None
     row_context = (
         replace(context, work=dict(comm_accounting.wire_by_resource))
         if (comm_accounting is not None

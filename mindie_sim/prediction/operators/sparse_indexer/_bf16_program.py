@@ -122,6 +122,11 @@ def _build(op, geometry):
                    else None)
     gm_capacity = (int(geometry.buffers["gm"])
                    if "gm" in geometry.buffers else None)
+    seq_spans = ledger.get("sequence_layout_spans", ())
+    span_keys = (
+        tuple(kv_offset for _, _, _, kv_offset, _ in seq_spans)
+        if len(seq_spans) == len(spans) else None
+    )
     access = _key_access_plan(
         spans, compression=compression, key_row_bytes=key_row_bytes,
         q_row_bytes=q_row_bytes, q_tile_rows=QUERY_TILE_ROWS,
@@ -129,7 +134,8 @@ def _build(op, geometry):
         ub_capacity=int(geometry.buffers.get("ub", 0) or 0),
         l1_capacity=l1_capacity, l2_capacity=l2_capacity, owner=owner,
         identity_prefix=f"{op.op_id}|layer={op.layer}|stage={op.stage}|phase={op.phase}",
-        gm_capacity=gm_capacity, exchange_grant=ledger.get("exchange_grant"))
+        gm_capacity=gm_capacity, exchange_grant=ledger.get("exchange_grant"),
+        span_keys=span_keys)
     exchange_bytes = sum(tile["exchange_bytes"] for tile in access["tiles"])
     merge_ops = sum(tile["merge_ops"] for tile in access["tiles"])
     lists = sum(tile["lists"] * (tile["q_end"] - tile["q_start"])
