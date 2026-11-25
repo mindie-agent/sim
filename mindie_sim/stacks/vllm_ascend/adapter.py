@@ -1200,6 +1200,108 @@ def _select_indexer_binding(
     return None
 
 
+def _select_sparse_kv_offload_binding(
+    model: ModelSpec,
+    raw_config: Any,
+) -> tuple[str, str, tuple[tuple[str, Any], ...]] | None:
+    """Validate and bind ``vllm_ascend_sparse_kv_offload`` strictly within its declared domain."""
+    if raw_config is None or raw_config is False:
+        return None
+    if raw_config is True:
+        opts_dict: dict[str, Any] = {}
+    elif isinstance(raw_config, Mapping):
+        opts_dict = dict(raw_config)
+    elif isinstance(raw_config, Sequence) and not isinstance(raw_config, (str, bytes)):
+        try:
+            opts_dict = dict(raw_config)
+        except (TypeError, ValueError) as exc:
+            raise ModelingError(f"sparse_kv_offload_option_invalid:{raw_config!r}") from exc
+    else:
+        raise ModelingError(f"sparse_kv_offload_option_invalid:{raw_config!r}")
+
+    if "enabled" in opts_dict:
+        enabled_val = opts_dict.pop("enabled")
+        if not isinstance(enabled_val, bool):
+            raise ModelingError(f"sparse_kv_offload_enabled_invalid:{enabled_val!r}")
+        if not enabled_val:
+            return None
+
+    from mindie_sim.prediction.operators.sparse_indexer.sparse_kv_offload import (
+        IMPLEMENTATION as SPARSE_KV_OFFLOAD_IMPL,
+        _resolve_options as resolve_sparse_kv_offload_options,
+    )
+    from mindie_sim.prediction.program.implementation_registry import select as select_implementation
+
+    select_implementation(
+        {"sparse_kv_offload": {"implementation": SPARSE_KV_OFFLOAD_IMPL, "options": opts_dict}},
+        "sparse_kv_offload",
+    )
+    resolved = resolve_sparse_kv_offload_options(opts_dict)
+    mla_layers = tuple(
+        p for p in model.layer_plans
+        if str(p.attention).lower() == "mla"
+        and str(getattr(p, "mla_variant", "") or "") == "latent_mla"
+    )
+    indexed_layers = tuple(p for p in mla_layers if int(p.index_topk or 0) > 0)
+    layerwise = bool(resolved["layerwise_kv_offload"])
+    if not mla_layers or (not indexed_layers and not layerwise):
+        return None
+    return ("sparse_kv_offload", SPARSE_KV_OFFLOAD_IMPL, tuple(sorted(opts_dict.items())))
+
+
+_GENERAL_TIER_OFFLOAD_KEYS = frozenset({"kvc_ddr_ratio", "kvc_ssd_ratio", "expert_ddr_ratio"})
+
+
+def _resolve_sparse_kv_offload_option(
+    model: ModelSpec,
+    *,
+    track: StackTrack,
+    requested_options: Mapping[str, Any],
+    dispositions: list[tuple[str, str, str]],
+) -> tuple[tuple[str, Any], ...] | None:
+    """Resolve optional ``sparse_kv_offload`` / ``kv_offload`` config without altering default digests."""
+    raw_sparse = requested_options.get("sparse_kv_offload")
+    raw_kv = requested_options.get("kv_offload")
+    if raw_sparse is None and raw_kv is None:
+        return None
+    raw_cfg = raw_sparse if raw_sparse is not None else raw_kv
+    if raw_cfg is False:
+        return None
+    if raw_sparse is None and isinstance(raw_cfg, Mapping) and raw_cfg:
+        filtered = {k: v for k, v in raw_cfg.items() if k not in _GENERAL_TIER_OFFLOAD_KEYS}
+        if not filtered:
+            return None
+        raw_cfg = filtered
+    if isinstance(raw_cfg, Mapping) and "enabled" in raw_cfg:
+        en = raw_cfg["enabled"]
+        if not isinstance(en, bool):
+            raise ModelingError(f"sparse_kv_offload_enabled_invalid:{en!r}")
+        if not en:
+            return None
+    binding = _select_sparse_kv_offload_binding(model, raw_cfg)
+    excluded = {
+        str(x).strip()
+        for x in (requested_options.get("exclude_optimizations") or ())
+        if str(x).strip()
+    }
+    if "sparse_kv_offload" in excluded or "vllm_ascend_sparse_kv_offload" in excluded:
+        dispositions.append(("sparse_kv_offload", "rejected", "excluded_by_request"))
+        return None
+    if track == "eager":
+        dispositions.append(("sparse_kv_offload", "rejected", "eager_track_disables_sparse_kv_offload"))
+        return None
+    if binding is None:
+        dispositions.append((
+            "sparse_kv_offload",
+            "rejected",
+            "sparse_kv_offload_requires_indexed_mla_or_layerwise_offload",
+        ))
+        return None
+    layerwise = bool(dict(binding[2]).get("layerwise_kv_offload", False))
+    dispositions.append(("sparse_kv_offload", "accepted", "layerwise" if layerwise else "indexed_decode"))
+    return binding[2]
+
+
 def _select_recipe_bindings(
     model: ModelSpec,
     *,
@@ -1289,6 +1391,18 @@ def _select_recipe_bindings(
         mc2_lvl = int(eff_opts["enable_fused_mc2"])
         bindings.append(("moe_mc2", "cann_megamoe_fusion", (("enable_fused_mc2", mc2_lvl),)))
         origins.append(("moe_mc2", "stack_profile"))
+
+    if (
+        track != "eager"
+        and "sparse_kv_offload" in eff_opts
+        and eff_opts["sparse_kv_offload"] is not None
+        and "sparse_kv_offload" not in excluded
+        and "vllm_ascend_sparse_kv_offload" not in excluded
+    ):
+        sparse_binding = _select_sparse_kv_offload_binding(model, eff_opts["sparse_kv_offload"])
+        if sparse_binding is not None:
+            bindings.append(sparse_binding)
+            origins.append((sparse_binding[0], "stack_profile"))
 
     return tuple(bindings), tuple(passes), tuple(dict.fromkeys(origins)), manifest_hits
 
@@ -1460,6 +1574,10 @@ class VllmAscendStackAdapter:
         )
         dispositions.extend(mc2_disps)
 
+        sparse_offload_opts = _resolve_sparse_kv_offload_option(
+            model, track=track, requested_options=requested_options, dispositions=dispositions,
+        )
+
         capture_rule, pd_mode, pd_transport = _resolve_capture_and_pd_options(
             requested_options, track=track, role_norm=role_norm,
             eff_k=eff_k, draft_eager=draft_eager,
@@ -1509,6 +1627,8 @@ class VllmAscendStackAdapter:
             ("target_quant_projection", str(requested_options.get("target_quant_projection") or "")),
             ("field_origin_count", len(field_origins)),
         ]
+        if sparse_offload_opts is not None:
+            effective_mechanisms.append(("sparse_kv_offload", sparse_offload_opts))
         requested_pairs = tuple(
             sorted((str(k), v) for k, v in requested_options.items() if not isinstance(v, SpeculativeSpec))
         )
