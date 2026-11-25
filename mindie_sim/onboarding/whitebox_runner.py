@@ -81,7 +81,10 @@ _BLOCK_TABLE_PAIR_LEN = 2
 _MIN_DCP_PARTIALS = 2
 _P90_QUANTILE = 0.90
 _TOPO_TOKEN_RE = re.compile(r"(tp|pp|dp|ep|pcp|dcp)(\d+)")
-_GEMM_FAMILIES = frozenset({"gemm", "grouped_gemm", "gate_up_projection", "down_projection"})
+_GEMM_FAMILIES = frozenset({"gemm", "grouped_gemm", "qkv_projection", "output_projection", "gate_up_projection", "down_projection"})
+_INDEXER_FAMILIES = frozenset({"indexer", "lightning_indexer", "sparse_indexer"})
+_UNQUANTIZED_GEMM_MODES = frozenset({"none", "dense"})
+_QUANT_MODE_ALIASES: Mapping[str, str] = {"mxfp8": "mx_fp8", "mxfp4": "mx_fp4"}
 _ACTUAL_SEQ_SHAPE_KEYS = frozenset({"q_len", "query_tokens", "seq_len", "kv_len", "context_len"})
 _MLA_RECIPES = frozenset({
     "ascend_paged_mla_decode_arch22", "ascend_paged_mla_decode_arch35",
@@ -139,10 +142,11 @@ def temporary_scaffold_profile(sku: str, profile_override: Mapping[str, Any] | N
 
 def materialize_sku_hardware(sku: str, *, profile_override: Mapping[str, Any] | None = None) -> Hardware:
     if profile_override is not None:
+        rpn = int(profile_override.get("physical_ranks_per_node") or profile_override.get("ranks_per_node") or 1)
         return Hardware.from_mapping({
             "sku": sku, "architecture": profile_override["architecture"],
             "dies_per_package": profile_override["dies_per_package"],
-            "ranks_per_node": int(profile_override.get("ranks_per_node", 1)),
+            "ranks_per_node": rpn, "physical_ranks_per_node": rpn,
             "num_devices": 1, "device": deepcopy(profile_override["device"]),
             "transfer_channels": deepcopy(profile_override.get("transfer_channels", {})),
         })
@@ -466,25 +470,48 @@ def _verify_attention_binding(op: Any, sim_case: Any, nb: Mapping[str, Any], act
     _assert_bind_eq(cid, "heads", _opt_pos_int(actual.get("heads"), nb.get("heads")), max(1, int(getattr(sim_case.model, "num_heads", 1) or 1) // tp))
 
 
+def _norm_quant_mode(raw: Any) -> str:
+    tok = str(raw or "").strip().lower().replace("-", "_")
+    return _QUANT_MODE_ALIASES.get(tok, tok)
+
+
 def _verify_gemm_binding(op: Any, nb: Mapping[str, Any], n_act: Mapping[str, Any], *, cid: str, oid: str) -> None:
     meta = dict(getattr(op, "metadata", ()) or ())
+    pabi = getattr(op, "precision_abi", None)
     _assert_bind_eq(cid, f"matrix_groups:{oid}", _opt_pos_int(n_act.get("matrix_groups"), n_act.get("e"), nb.get("matrix_groups"), nb.get("e")), max(1, int(meta.get("matrix_weight_bank_groups") or meta.get("matrix_groups") or 1)))
     loc = tuple(getattr(op, "local_shape", ()) or ())
     if len(loc) >= _MIN_GEMM_RANK:
         for idx, dk in enumerate(("m", "n", "k")):
             _assert_bind_eq(cid, f"weight_{dk}:{oid}", _opt_pos_int(n_act.get(dk), nb.get(dk)), int(loc[idx]))
-    low_dt = str(getattr(op, "dtype", "") or "bf16").strip().lower()
-    low_wdt = str(meta.get("weight_dtype") or low_dt).strip().lower()
-    low_q = str(meta.get("quant_mode") or meta.get("quantization") or "none").strip().lower()
-    act_dt = str(n_act.get("dtype") or n_act.get("input_dtype") or nb.get("dtype") or "").strip().lower() or None
-    act_wdt = str(n_act.get("weight_dtype") or "").strip().lower() or None
-    act_q = str(n_act.get("quant_mode") or n_act.get("quantization") or "").strip().lower()
-    _assert_bind_eq(cid, f"dtype:{oid}", act_dt, low_dt or None)
-    _assert_bind_eq(cid, f"weight_dtype:{oid}", act_wdt, low_wdt or None)
-    if act_q and act_q not in {"", "none", "dense", low_q, low_dt}:
+    p_attr = (lambda k: getattr(pabi, k, "") if pabi is not None else "")
+    low_dt = str(p_attr("input_dtype") or getattr(op, "dtype", "") or "bf16").strip().lower()
+    low_wdt = str(p_attr("weight_dtype") or meta.get("weight_dtype") or meta.get("weight_format") or low_dt).strip().lower()
+    low_odt = str(p_attr("output_dtype") or meta.get("output_format") or "").strip().lower() or None
+    low_q = _norm_quant_mode(p_attr("linear_method") or meta.get("linear_method") or meta.get("quant_mode") or meta.get("quantization") or "dense")
+    _mstr = lambda *ks: next((str(v).strip().lower() for src in (n_act, nb) for k in ks if str(v := src.get(k) or "").strip()), "")
+    _assert_bind_eq(cid, f"dtype:{oid}", _mstr("dtype", "input_dtype") or None, low_dt or None)
+    _assert_bind_eq(cid, f"weight_dtype:{oid}", _mstr("weight_dtype") or None, low_wdt or None)
+    _assert_bind_eq(cid, f"output_dtype:{oid}", _mstr("output_dtype") or None, low_odt)
+    act_q = _norm_quant_mode(_mstr("quant_mode", "quantization"))
+    is_unquant = low_q in _UNQUANTIZED_GEMM_MODES
+    if act_q and act_q not in ((_UNQUANTIZED_GEMM_MODES | {low_dt}) if is_unquant else {low_q}):
         raise ModelingError(f"whitebox_measured_binding_mismatch:{cid}:quant_mode:{oid}:measured={act_q}:lowered={low_q}")
-    if (n_act.get("has_scales") is True or str(n_act.get("scale_dtype") or "").strip()) and low_q in {"", "none", "dense"}:
+    low_ws = str(p_attr("weight_scale_dtype") or meta.get("weight_scale_format") or "").strip().lower()
+    low_as = str(p_attr("act_scale_dtype") or meta.get("activation_scale_format") or "").strip().lower()
+    wmeta = dict(getattr(pabi, "weight_metadata", ()) or ()) if pabi is not None else {}
+    low_scale_dts = {str(x).strip().lower() for x in (low_ws, low_as, wmeta.get("storage_scale_format", ""), meta.get("weight_scale_storage_format", "")) if str(x or "").strip()}
+    low_needs_scales = bool(low_scale_dts) or (pabi is not None and int(getattr(pabi, "weight_scale_bytes", 0) or 0) > 0)
+    act_scale_dt, act_ws, act_as = _mstr("scale_dtype"), _mstr("weight_scale_dtype"), _mstr("act_scale_dtype", "activation_scale_dtype")
+    act_has_scales = n_act.get("has_scales") if "has_scales" in n_act else nb.get("has_scales")
+    if not low_needs_scales and (act_has_scales is True or act_scale_dt or act_ws or act_as):
         raise ModelingError(f"whitebox_measured_binding_mismatch:{cid}:unexpected_quant_scales:{oid}")
+    if low_needs_scales:
+        if act_has_scales is False:
+            raise ModelingError(f"whitebox_measured_binding_mismatch:{cid}:missing_quant_scales:{oid}")
+        _assert_bind_eq(cid, f"weight_scale_dtype:{oid}", act_ws or None, low_ws or None)
+        _assert_bind_eq(cid, f"act_scale_dtype:{oid}", act_as or None, low_as or None)
+        if act_scale_dt and low_scale_dts and act_scale_dt not in low_scale_dts:
+            raise ModelingError(f"whitebox_measured_binding_mismatch:{cid}:scale_dtype:{oid}:measured={act_scale_dt}:lowered={sorted(low_scale_dts)}")
 
 
 def _verify_measured_binding(
@@ -510,9 +537,9 @@ def _verify_measured_binding(
         n_act = node_shapes.get(oid, actual if (expected_level == "L1" or not node_shapes) else {})
         if op.family == "attention":
             _verify_attention_binding(op, sim_case, nb, n_act, local_kv=local_kv, cid=cid, step_tokens=step_tokens, step_seqs=step_seqs)
-        elif op.family in _GEMM_FAMILIES and (nb or n_act):
+        elif (op.family in _GEMM_FAMILIES or getattr(op, "precision_abi", None) is not None) and (nb or n_act):
             _verify_gemm_binding(op, nb, n_act, cid=cid, oid=oid)
-        elif op.family == "indexer":
+        elif op.family in _INDEXER_FAMILIES:
             meta = dict(getattr(op, "metadata", ()) or ())
             sgs = meta.get("structure_subgraphs")
             tv = sgs[0].get("tensor_view") if isinstance(sgs, Sequence) and sgs and isinstance(sgs[0], Mapping) and isinstance(sgs[0].get("tensor_view"), Mapping) else {}
@@ -525,14 +552,26 @@ def _verify_measured_binding(
                 if md and ld and md != ld:
                     raise ModelingError(f"whitebox_measured_binding_mismatch:{cid}:{dt_k}:measured={md}:lowered={ld}")
         elif op.family == "attention_merge" and (nb or n_act):
-            dcp = max(1, int(getattr(sim_case.runtime.parallel, "dcp", 1) or 1))
+            meta = dict(getattr(op, "metadata", ()) or ())
+            low_p = _opt_pos_int(meta.get("partial_count")) or max(1, int(getattr(sim_case.runtime.parallel, "dcp", 1) or 1))
             got_p = _opt_pos_int(n_act.get("partial_count"), nb.get("partial_count"))
-            if dcp >= _MIN_DCP_PARTIALS and got_p is not None and got_p != dcp:
-                raise ModelingError(f"whitebox_measured_binding_mismatch:{cid}:partial_count:{oid}:measured={got_p}:lowered={dcp}")
+            if got_p is not None and (meta.get("partial_count") is not None or low_p >= _MIN_DCP_PARTIALS) and got_p != low_p:
+                raise ModelingError(f"whitebox_measured_binding_mismatch:{cid}:partial_count:{oid}:measured={got_p}:lowered={low_p}")
             got_dt = str(n_act.get("dtype") or nb.get("dtype") or "").strip().lower()
             low_dt = str(getattr(op, "dtype", "") or "fp32").strip().lower()
             if got_dt and low_dt and got_dt != low_dt:
                 raise ModelingError(f"whitebox_measured_binding_mismatch:{cid}:dtype:{oid}:measured={got_dt}:lowered={low_dt}")
+
+
+def _is_fused_indexer_op(op: Any) -> bool:
+    if op.family == "lightning_indexer":
+        return True
+    sgs = dict(getattr(op, "metadata", ()) or ()).get("structure_subgraphs") if op.family in _INDEXER_FAMILIES else None
+    return bool(isinstance(sgs, Sequence) and sgs and isinstance(sgs[0], Mapping) and isinstance(sgs[0].get("tensor_view"), Mapping) and sgs[0]["tensor_view"].get("topk") is not None)
+
+
+def _family_matches(op: Any, target_fam: str) -> bool:
+    return _is_fused_indexer_op(op) if target_fam in {"lightning_indexer", "sparse_indexer"} else (op.family == target_fam or (target_fam == "indexer" and _is_fused_indexer_op(op)))
 
 
 def _select_level_ops(all_ops: tuple[Any, ...], *, level: str, payload: Mapping[str, Any], cid: str) -> tuple[Any, ...]:
@@ -542,11 +581,11 @@ def _select_level_ops(all_ops: tuple[Any, ...], *, level: str, payload: Mapping[
         binding = payload.get("measured_binding") if isinstance(payload.get("measured_binding"), Mapping) else {}
         tid = str(payload.get("target_op_id") or binding.get("target_op_id") or "").strip()
         tfam = str(payload.get("target_family") or binding.get("family") or "").strip()
-        matches = [o for o in all_ops if o.op_id == tid] if tid else ([o for o in all_ops if o.family == tfam] if tfam else ([all_ops[0]] if len(all_ops) == 1 else []))
+        matches = [o for o in all_ops if o.op_id == tid] if tid else ([o for o in all_ops if _family_matches(o, tfam)] if tfam else ([all_ops[0]] if len(all_ops) == 1 else []))
         if not matches:
             raise ModelingError(f"whitebox_l1_target_not_found:{cid}:{tid or tfam}")
         chosen = matches[0]
-        if tfam and chosen.family != tfam:
+        if tfam and not _family_matches(chosen, tfam):
             raise ModelingError(f"whitebox_l1_family_mismatch:{cid}:expected={tfam}:got={chosen.family}")
         return (replace(chosen, deps=()),)
     if level == "L2":

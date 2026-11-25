@@ -374,6 +374,8 @@ def materialize(raw):
     phys_rpn = int(
         raw.get("physical_ranks_per_node")
         or preset.get("ranks_per_node")
+        or profile.get("physical_ranks_per_node")
+        or profile.get("ranks_per_node")
         or default_ranks_per_node(raw["sku"])
     )
     per_node = int(merged.get("ranks_per_node", min(count, phys_rpn)))
