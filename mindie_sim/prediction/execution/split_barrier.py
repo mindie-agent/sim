@@ -29,6 +29,7 @@ import math
 from mindie_sim.schema.common import ModelingError
 from ..collectives.ports import (
     GBPS_TO_BYTES_PER_MS,
+    host_solo_resource_name,
     host_transfer_demand,
     root_complex_resources_for_dies,
 )
@@ -145,12 +146,15 @@ class EagerSplitBarrier:
     ) -> tuple[str, str | None, str, str]:
         """Ensure per-die D2H, per-transfer pageable cap, RC, host, and device rows."""
         rank = int(getattr(die, "rank", 0))
-        d2h_name = d2h_rank_resource or f"{namespace}d2h@rank{rank}"
+        solo_name = host_solo_resource_name(die, "d2h", namespace=namespace)
+        d2h_name = d2h_rank_resource or solo_name
         host_name = host_service_resource or f"{namespace}host@rank{rank}"
         vec_name = device_vector_resource or f"{namespace}vector@rank{rank}"
         pinned_rate, pageable_rate, _ = cls._d2h_channel_params(machine)
         add_res = []
-        if d2h_name not in engine.resources:
+        if solo_name not in engine.resources:
+            add_res.append(Resource(solo_name, pinned_rate, "bytes"))
+        if d2h_name != solo_name and d2h_name not in engine.resources:
             add_res.append(Resource(d2h_name, pinned_rate, "bytes"))
         pageable_name: str | None = None
         if not pinned and pageable_rate is not None:
@@ -211,10 +215,13 @@ class EagerSplitBarrier:
         )
 
         # Branch A: local counts sum -> input_splits D2H (overlaps AllGather)
+        solo_name = host_solo_resource_name(die, "d2h", namespace=namespace)
         in_demand = host_transfer_demand(
             machine, die, "d2h", spec.input_splits_bytes,
-            namespace=namespace, rank_resource=d2h_name,
+            namespace=namespace, rank_resource=solo_name,
         )
+        if d2h_name != solo_name:
+            in_demand[d2h_name] = float(spec.input_splits_bytes)
         if pageable_name is not None:
             in_demand[pageable_name] = float(spec.input_splits_bytes)
         in_svc = engine.submit(
@@ -248,8 +255,10 @@ class EagerSplitBarrier:
         out_after = (ag_done,) if spec.non_blocking else (ag_done, input_d2h)
         out_demand = host_transfer_demand(
             machine, die, "d2h", spec.output_splits_bytes,
-            namespace=namespace, rank_resource=d2h_name,
+            namespace=namespace, rank_resource=solo_name,
         )
+        if d2h_name != solo_name:
+            out_demand[d2h_name] = float(spec.output_splits_bytes)
         if pageable_name is not None:
             out_demand[pageable_name] = float(spec.output_splits_bytes)
         out_svc = engine.submit(

@@ -251,7 +251,15 @@ class PDHandoff:
         memory = (tuple(memory_work.items()) if isinstance(memory_work, Mapping)
                   else tuple(memory_work))
         if receive_pool_capacity_bytes is None:
-            pool_capacity = capacity
+            buf_map = dict(buffers)
+            grouped_cap = defaultdict(int)
+            for rank, value in capacity:
+                buf_id = buf_map.get(rank, f"{request_id}:rank{rank}")
+                grouped_cap[buf_id] += value
+            pool_capacity = tuple(
+                (rank, grouped_cap[buf_map.get(rank, f"{request_id}:rank{rank}")])
+                for rank, _value in capacity
+            )
         elif isinstance(receive_pool_capacity_bytes, Mapping):
             pool_capacity = tuple(sorted(
                 (int(rank), _strict_positive_int(value, "pd_handoff_pool_capacity"))
@@ -296,6 +304,29 @@ class PDHandoff:
             if destination == rank:
                 return float(value)
         return None
+
+    def resolved_receive_pools(self):
+        """Return per-destination bindings and per-pool aggregate footprints."""
+        capacities = dict(self.receive_capacity_bytes)
+        pool_capacities = dict(self.receive_pool_capacity_bytes)
+        buffers = dict(self.receive_buffer_ids)
+        per_rank = {}
+        by_buffer = {}
+        for destination, footprint in sorted(capacities.items()):
+            buffer_id = buffers.get(
+                destination, f"{self.request_id}:rank{destination}")
+            pool_cap = pool_capacities.get(destination, footprint)
+            per_rank[destination] = (buffer_id, int(footprint), int(pool_cap))
+            entry = by_buffer.get(buffer_id)
+            if entry is None:
+                by_buffer[buffer_id] = [int(footprint), int(pool_cap), [destination]]
+            else:
+                entry[0] += int(footprint)
+                entry[2].append(destination)
+        return per_rank, {
+            buf_id: (vals[0], vals[1], tuple(vals[2]))
+            for buf_id, vals in by_buffer.items()
+        }
 
 
 def _normalize_releases(release_events):

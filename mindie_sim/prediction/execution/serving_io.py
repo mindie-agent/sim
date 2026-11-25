@@ -166,31 +166,25 @@ class ServingIO:
         dies = execution.stage_dies.get((replica, stage), ())
         machine = getattr(execution.case, "machine", None)
         if volume > 0.0 and dies and machine is not None:
-            from mindie_sim.prediction.collectives.ports import GBPS_TO_BYTES_PER_MS, RootComplexKey
-            die0 = dies[0]
-            solo_gbps = (
-                machine.host_solo_bw_gbps(direction)
-                if hasattr(machine, "host_solo_bw_gbps")
-                else None
+            from mindie_sim.prediction.collectives.ports import (
+                host_dma_resources_for_dies,
+                host_transfer_demand,
             )
-            if solo_gbps is not None and float(solo_gbps) > 0.0:
-                solo_name = f"{execution.namespace}host_solo:{direction}:d{int(getattr(die0, 'rank', replica))}"
-                if solo_name not in execution.engine.resources:
-                    execution.engine.extend([
-                        Resource(solo_name, float(solo_gbps) * GBPS_TO_BYTES_PER_MS, "bytes")
-                    ])
-                demand[solo_name] = float(volume)
+            missing = [
+                res for res in host_dma_resources_for_dies(
+                    machine, dies, namespace=execution.namespace,
+                )
+                if res.name not in execution.engine.resources
+            ]
+            if missing:
+                execution.engine.extend(missing)
+            host_demand = host_transfer_demand(
+                machine, dies[0], direction, float(volume),
+                namespace=execution.namespace, dies=dies,
+            )
+            if host_demand:
+                demand.update(host_demand)
                 coupled = True
-            if (hasattr(machine, "host_root_complex_ceiling_gbps")
-                    and machine.host_root_complex_ceiling_gbps(direction)):
-                rc_name = RootComplexKey(
-                    node=int(getattr(die0, "node", 0)),
-                    root_complex_id=str(getattr(die0, "root_complex_id", "") or "rc0"),
-                    direction=direction,
-                ).resource_name(execution.namespace)
-                if rc_name in execution.engine.resources:
-                    demand[rc_name] = float(volume)
-                    coupled = True
         copied = execution.engine.submit(
             prefix + ":" + direction + ":payload",
             demand,
