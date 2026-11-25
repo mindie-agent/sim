@@ -16,7 +16,7 @@ from mindie_sim.catalog.weights import layer_weight_terms
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.schema.case import Case as CaseSpec
 
-from .policy import _offload_memory_for, _submit_offload_transfer
+from .policy import _host_ddr_work, _offload_memory_for, _submit_offload_transfer
 
 
 def _moe_geometry(parsed: CaseSpec, memory: Memory, batch_tokens: int) -> dict[str, Any]:
@@ -111,34 +111,103 @@ def _resolve_active_experts_from_op(op: Any) -> float | None:
     return None
 
 
+def _resolve_rank_active_experts_from_op(op: Any) -> tuple[int, ...] | None:
+    """Return per-EP-rank active expert counts when ``routing_realization`` supplies them."""
+    if op is None:
+        return None
+    op_meta = dict(getattr(op, "metadata", ()) or ())
+    sem_meta = op_meta.get("semantic_metadata")
+    sources = (op_meta, dict(sem_meta) if isinstance(sem_meta, Mapping) else {})
+    for meta in sources:
+        realization = meta.get("routing_realization")
+        if not isinstance(realization, Mapping):
+            continue
+        rank_rows = realization.get("rank_expert_rows")
+        if not isinstance(rank_rows, (list, tuple)) or not rank_rows:
+            continue
+        counts = []
+        for bank_rows in rank_rows:
+            if not isinstance(bank_rows, (list, tuple)):
+                return None
+            counts.append(sum(1 for rows in bank_rows if rows > 0))
+        return tuple(counts)
+    return None
+
+
+def _ep_rank_indices_for_stage(
+    execution: Any, replica: int, stage: int, stage_dies: tuple[Any, ...], ep_count: int,
+) -> dict[int, int]:
+    """Map each physical die rank in ``stage_dies`` to its EP rank index."""
+    mapping: dict[int, int] = {}
+    topo = getattr(execution, "topology", None)
+    if topo is not None and hasattr(topo, "groups"):
+        try:
+            groups = topo.groups("ep", replica, stage)
+        except (KeyError, ValueError, TypeError):
+            groups = ()
+        for group in groups:
+            for pos, rank in enumerate(group):
+                mapping[int(rank)] = int(pos)
+    result: dict[int, int] = {}
+    for idx, die in enumerate(stage_dies):
+        rank_id = int(getattr(die, "rank", idx))
+        result[rank_id] = mapping.get(rank_id, idx % ep_count) % ep_count
+    return result
+
+
 def schedule_expert_layer_offload(
     execution: Any, prefix: str, replica: int, stage: int, layer: int,
     valid_tokens: int, input_ready: Any, op: Any = None,
 ) -> Any | None:
-    """Submit per-MoE-layer DDR expert fetch contended on the stage FIFO DDR bus."""
+    """Submit per-MoE-layer DDR expert fetch contended on per-die DDR + RC buses."""
     policy = getattr(execution, "offload_policy", None)
+    rank_active = _resolve_rank_active_experts_from_op(op)
     active_override = _resolve_active_experts_from_op(op)
-    if policy is None or policy.expert_ddr_ratio <= 0.0 or (valid_tokens <= 0 and not active_override):
+    has_active = bool(active_override) or (rank_active is not None and any(rank_active))
+    if policy is None or policy.expert_ddr_ratio <= 0.0 or (valid_tokens <= 0 and not has_active):
         return None
     memory = _offload_memory_for(execution)
     moe = _moe_geometry(execution.case, memory, max(1, int(valid_tokens)))
     layer_info = next((item for item in moe["layers"] if item["layer"] == layer), None)
     if layer_info is None:
         return None
-    active_experts = float(active_override) if active_override is not None else float(layer_info["active_experts_per_rank"])
-    ddr_bytes = float(
-        active_experts * layer_info["one_expert_bytes_per_rank"]
-        * policy.expert_ddr_ratio * (1.0 - policy.mtp_ffn_hit_rate)
+    unit_ddr = float(
+        layer_info["one_expert_bytes_per_rank"]
+        * policy.expert_ddr_ratio
+        * (1.0 - policy.mtp_ffn_hit_rate)
     )
-    if ddr_bytes <= 0.0:
+    if unit_ddr <= 0.0:
         return None
-    ddr_res = f"{execution.namespace}offload_ddr@r{replica}:s{stage}"
-    hbm_res = execution.stage_names[replica, stage]["hbm"]
+    stage_dies = tuple(getattr(execution, "stage_dies", {}).get((replica, stage), ()) or ())
+    rank_ddr_bytes: dict[int | None, float] | None = None
+    if rank_active is not None and stage_dies:
+        ep_map = _ep_rank_indices_for_stage(execution, replica, stage, stage_dies, len(rank_active))
+        rank_ddr_bytes = {
+            rank_id: float(rank_active[ep_idx]) * unit_ddr
+            for rank_id, ep_idx in ep_map.items()
+            if rank_active[ep_idx] > 0
+        }
+        if not rank_ddr_bytes:
+            return None
+        ddr_bytes = max(rank_ddr_bytes.values())
+    else:
+        active_experts = (
+            float(active_override)
+            if active_override is not None
+            else float(layer_info["active_experts_per_rank"])
+        )
+        ddr_bytes = float(active_experts) * unit_ddr
+        if ddr_bytes <= 0.0:
+            return None
+    work = _host_ddr_work(
+        execution, replica, stage, "h2d", ddr_bytes, rank_ddr_bytes=rank_ddr_bytes,
+    )
     return _submit_offload_transfer(
         execution.engine,
         f"{prefix}:s{stage}.l{layer}:expert_ddr_offload",
-        {ddr_res: ddr_bytes, hbm_res: ddr_bytes},
+        work,
         after=(input_ready,),
-        latency_us=policy.ddr_latency_us,
+        latency_us=policy.ddr_startup_latency_us("h2d"),
         owner=f"replica:{replica}",
+        coupled=len(work) > 1,
     )

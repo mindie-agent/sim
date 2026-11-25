@@ -20,16 +20,21 @@ from mindie_sim.prediction.engine import Event
 
 _PROJECTED_FIELDS = (
     "occurrence", "producer", "request", "stage", "layer", "direction",
-    "position", "output", "storage", "state_version", "span", "rank",
-    "scope", "bytes", "source", "reader", "grant", "decision", "last_use",
+    "position", "output", "storage", "state_version", "span", "span_format",
+    "byte_span", "byte_span_format", "span_unit", "persistent", "temporary",
+    "rank", "scope", "bytes", "source", "reader", "grant", "decision",
+    "last_use",
 )
 # Producer-owned metadata that T08/Memory needs but SERVICE does not accept.
 _MEMORY_FIELDS = (
-    "unit", "row_stride", "row_span", "byte_span", "purpose", "action",
-    "port", "owner", "persistent", "temporary", "representation", "tier",
-    "rows", "request_slot", "physical_key", "generation", "host_bytes",
-    "source_ready", "grant_ready", "decision_event", "last_use_event",
+    "unit", "row_stride", "row_span", "byte_span", "span_format", "line_bytes",
+    "line_segments", "byte_segments", "ranges_complete", "coverage_bytes",
+    "purpose", "action", "port", "owner", "persistent", "temporary",
+    "representation", "tier", "rows", "request_slot", "physical_key",
+    "generation", "host_bytes", "source_ready", "grant_ready",
+    "decision_event", "last_use_event",
 )
+_CACHE_STORAGE_PREFIXES = ("kv:", "kv/", "gqa_kv", "draft_kv", "mla_kv", "paged_latent_kv", "index_pool_tail")
 
 
 @dataclass(frozen=True)
@@ -73,7 +78,16 @@ def _first_valid(requests: Sequence[str], padding: set[str]) -> str:
     return str(requests[0]) if requests else "*"
 
 
-def _bytes_and_span(record: Mapping, op: Any, direction: str) -> tuple[float, tuple]:
+def _wrap_span_sequence(raw: Any) -> Any:
+    """Wrap a single flat numeric span tuple into a 1-element sequence."""
+    if isinstance(raw, (tuple, list)) and raw and isinstance(raw[0], int) and not isinstance(raw[0], bool):
+        return (raw,)
+    return raw
+
+
+def _bytes_and_span(
+    record: Mapping, op: Any, direction: str,
+) -> tuple[float, tuple, str, tuple, str, str | None]:
     value = record.get("bytes")
     if value is None:
         value = record.get("write_bytes" if direction == "write" else "read_bytes")
@@ -86,17 +100,38 @@ def _bytes_and_span(record: Mapping, op: Any, direction: str) -> tuple[float, tu
         meta = dict(getattr(op, "metadata", ()) or ())
         value = meta.get("state_write_bytes" if direction == "write"
                          else "state_read_bytes", 0.0)
-    from mindie_sim.prediction.offload import _normalize_span
+    from mindie_sim.prediction.offload.accesses import _canonical_span_format, _normalize_span
+    span_format = str(record.get("span_format") or "half_open")
+    byte_fmt = str(record.get("byte_span_format") or span_format)
+    raw_byte_span = record.get("byte_span")
+    norm_byte_span: tuple = ()
+    canonical_byte_fmt = "half_open"
+    if raw_byte_span:
+        norm_byte_span = _normalize_span(_wrap_span_sequence(raw_byte_span), span_format=byte_fmt)
+        canonical_byte_fmt = _canonical_span_format(norm_byte_span, byte_fmt)
+    declared_unit = record.get("unit") or record.get("span_unit")
     span = record.get("span")
     if span:
-        return float(value or 0.0), _normalize_span(span)
+        normalized = _normalize_span(_wrap_span_sequence(span), span_format=span_format)
+        canonical_fmt = _canonical_span_format(normalized, span_format)
+        return (
+            float(value or 0.0), normalized, canonical_fmt,
+            norm_byte_span, canonical_byte_fmt, declared_unit,
+        )
     row_span = record.get("row_span")
     if row_span:
-        return float(value or 0.0), ((int(row_span[0]), int(row_span[1])),)
-    byte_span = record.get("byte_span")
-    if byte_span:
-        return float(value or 0.0), ((int(byte_span[0]), int(byte_span[1])),)
-    return float(value or 0.0), ()
+        normalized = _normalize_span(_wrap_span_sequence(row_span), span_format=span_format)
+        canonical_fmt = _canonical_span_format(normalized, span_format)
+        return (
+            float(value or 0.0), normalized, canonical_fmt,
+            norm_byte_span, canonical_byte_fmt, declared_unit or "rows",
+        )
+    if norm_byte_span:
+        return (
+            float(value or 0.0), norm_byte_span, canonical_byte_fmt,
+            norm_byte_span, canonical_byte_fmt, declared_unit or "bytes",
+        )
+    return float(value or 0.0), (), "half_open", (), "half_open", declared_unit
 
 
 def _normalise_one(record: Any, op: Any, work: Any, *,
@@ -131,15 +166,21 @@ def _normalise_one(record: Any, op: Any, work: Any, *,
     direction = str(data.get("direction") or "read")
     if direction not in {"read", "write", "alias"}:
         raise ValueError(f"state_access_direction_invalid:{direction}")
-    position = data.get("position")
-    if not position:
-        storage = str(data.get("storage") or meta.get("state_layout") or "")
-        position = "cache" if storage.startswith("kv:") else "local"
     storage = str(data.get("storage") or meta.get(
         "state_layout", "kv" if meta.get("cache_kind") else "state"))
+    position = data.get("position")
+    if not position:
+        low_storage = storage.strip().lower()
+        if (low_storage == "kv"
+                or any(low_storage.startswith(prefix) for prefix in _CACHE_STORAGE_PREFIXES)
+                or meta.get("cache_kind")):
+            position = "cache"
+        else:
+            position = "local"
     output = str(data.get("output") or meta.get("cache_kind") or "")
     producer = str(data.get("producer") or occurrence)
-    bytes_value, span = _bytes_and_span(data, op, direction)
+    (bytes_value, span, canonical_fmt,
+     norm_byte_span, canonical_byte_fmt, inferred_unit) = _bytes_and_span(data, op, direction)
     version = data.get("state_version")
     if version is None:
         key = ("state_write_versions" if direction == "write"
@@ -151,6 +192,9 @@ def _normalise_one(record: Any, op: Any, work: Any, *,
     if rank is None:
         rank = meta.get("rank")
     scope = str(data.get("scope") or "target")
+    temporary = bool(data.get("temporary", False))
+    raw_persistent = data.get("persistent")
+    persistent = (not temporary) if raw_persistent is None else bool(raw_persistent)
     access = StateAccess(
         occurrence=str(data.get("occurrence") or occurrence),
         producer=producer,
@@ -163,6 +207,12 @@ def _normalise_one(record: Any, op: Any, work: Any, *,
         storage=storage,
         state_version=(None if version is None else int(version)),
         span=span,
+        span_format=canonical_fmt,
+        byte_span=norm_byte_span,
+        byte_span_format=canonical_byte_fmt,
+        span_unit=str(inferred_unit or ""),
+        persistent=persistent,
+        temporary=temporary,
         rank=(None if rank is None else int(rank)),
         scope=scope,
         bytes=bytes_value,
@@ -174,6 +224,8 @@ def _normalise_one(record: Any, op: Any, work: Any, *,
     )
     memory = {key: _freeze(data[key]) for key in _MEMORY_FIELDS
               if key in data and data[key] is not None}
+    if inferred_unit is not None and "unit" not in memory:
+        memory["unit"] = str(inferred_unit)
     return BoundAccess(access, tuple(sorted(memory.items())))
 
 
