@@ -49,6 +49,7 @@ _MC2_TOKENS_PER_RANK_LIMIT = 512
 _DENSITY_MC2_MAX_EXPERTS_PER_DEVICE = 24
 _DENSITY_MC2_MIN_WORLD_SIZE = 16
 _FUSED_OR_CAPACITY_MAX_FUSED_WORLD_SIZE = 32
+_FUSED_OR_CAPACITY_MAX_MEGAMOE_WORLD_SIZE = 64
 _FUSED_MC2_MODE_MEGAMOE_ROUTED = 2
 _FUSED_MC2_MODE_MEGAMOE_SHARED = 3
 NO_DRAFT_TOKENS = 0
@@ -88,12 +89,33 @@ def _capture_sizes(values: Any) -> tuple[int, ...]:
     return tuple(item for item in raw if item > 0)
 
 
+def _is_decode_only_node(meta: Mapping[str, Any], additional: Mapping[str, Any]) -> bool:
+    """Match vLLM-Ascend ``_is_decode_only_node`` (consumer/bench + recompute scheduler)."""
+    kv_cfg = meta.get("kv_transfer_config")
+    if not isinstance(kv_cfg, Mapping):
+        return False
+    is_decode_bench = kv_cfg.get("kv_connector") == "DecodeBenchConnector"
+    kv_role = kv_cfg.get("kv_role")
+    is_kv_consumer = (
+        kv_role == "kv_consumer"
+        if kv_role is not None
+        else bool(kv_cfg.get("is_kv_consumer", False) and not kv_cfg.get("is_kv_producer", False))
+    )
+    if not (is_decode_bench or is_kv_consumer):
+        return False
+    sched_cfg = additional.get("scheduler_config")
+    if not isinstance(sched_cfg, Mapping):
+        sched_cfg = meta.get("scheduler_config")
+    return bool(isinstance(sched_cfg, Mapping) and sched_cfg.get("recompute_scheduler_enable", False))
+
+
 def source_mc2_tokens_capacity(*, max_num_reqs: int, uniform_decode_query_len: int,
                                capture_sizes: tuple[int, ...], tp: int,
                                enable_prefill_mc2: bool,
                                max_num_batched_tokens: int,
                                enable_fused_mc2: bool,
-                               mega_moe_supported: bool) -> int:
+                               mega_moe_supported: bool,
+                               is_decode_only_node: bool = False) -> int:
     """Exact source ``set_mc2_tokens_capacity`` reduction.
 
     This is the capacity of the shared MC2/MegaMoe reservation, not a generic
@@ -104,11 +126,7 @@ def source_mc2_tokens_capacity(*, max_num_reqs: int, uniform_decode_query_len: i
         raise ModelingError("mc2_tokens_capacity_tp_invalid")
     if max_num_reqs < 0 or uniform_decode_query_len < 0:
         raise ModelingError("mc2_tokens_capacity_request_invalid")
-    if enable_prefill_mc2 or mega_moe_supported:
-        # The second disjunct is the source's "MegaMoe and not a
-        # decode-only node" branch.  The adapter has no separate decode-only
-        # declaration; a caller that sets the mega capability can supply the
-        # batched budget.  It never changes the ordinary path.
+    if enable_prefill_mc2 or (mega_moe_supported and not is_decode_only_node):
         if max_num_batched_tokens < 1:
             raise ModelingError("mc2_tokens_capacity_prefill_budget_missing")
         max_tokens = int(max_num_batched_tokens)
@@ -188,7 +206,9 @@ class MoeCommConfig:
                 return MC2
             return ALLGATHER
         if self.policy == FUSED_OR_CAPACITY:
-            if self.mega_moe_supported and allow_plain_mc2:
+            if (self.enable_fused_mc2
+                    and self.mega_moe_supported
+                    and self.world_size <= _FUSED_OR_CAPACITY_MAX_MEGAMOE_WORLD_SIZE):
                 return FUSED_MC2
             if (allow_plain_mc2
                     and self.enable_fused_mc2
@@ -198,16 +218,10 @@ class MoeCommConfig:
                 return MC2
             return ALLTOALL
         if self.policy == CAPACITY_AND_WORLD_SIZE:
-            if self.enable_fused_mc2 and self.mega_moe_supported:
-                if (self.is_draft_model and not self.draft_quant_supported):
-                    # Source fall-through for an unsupported MTP draft quant.
-                    capacity = min(self.capacity,
-                                   _MC2_TOKENS_PER_RANK_LIMIT * self.tp)
-                else:
-                    return FUSED_MC2
-            else:
-                capacity = self.capacity
-            if allow_plain_mc2 and num_tokens <= capacity and self.world_size > 1:
+            if (self.enable_fused_mc2 and self.mega_moe_supported
+                    and not (self.is_draft_model and not self.draft_quant_supported)):
+                return FUSED_MC2
+            if allow_plain_mc2 and num_tokens <= self.capacity and self.world_size > 1:
                 return MC2
             if self.world_size <= self.top_k:
                 return ALLGATHER
@@ -283,13 +297,17 @@ class MoeCommConfig:
         effective_fused_level = raw_fused
         if arch != "A5" and effective_fused_level >= _FUSED_MC2_MODE_MEGAMOE_SHARED:
             effective_fused_level = _FUSED_MC2_MODE_MEGAMOE_ROUTED
-        mega = bool(int(
-            additional.get("enable_mega_moe", 0) or
-            meta.get("moe_mega_moe_supported", 0) or 0))
-        if arch == "A3" and effective_fused_level == _FUSED_MC2_MODE_MEGAMOE_ROUTED:
-            mega = True
-        if arch == "A5" and effective_fused_level >= _FUSED_MC2_MODE_MEGAMOE_ROUTED:
-            mega = True
+        explicit_mega = meta.get("moe_mega_moe_supported")
+        if explicit_mega is not None and not bool(int(explicit_mega or 0)):
+            mega = False
+        else:
+            mega = bool(int(
+                additional.get("enable_mega_moe", 0) or
+                (explicit_mega or 0)))
+            if arch == "A3" and effective_fused_level == _FUSED_MC2_MODE_MEGAMOE_ROUTED:
+                mega = True
+            if arch == "A5" and effective_fused_level >= _FUSED_MC2_MODE_MEGAMOE_ROUTED:
+                mega = True
         provenance = bool(meta.get("source_lowerings") or meta.get("moe_comm_mode"))
         if not mode and declared_mode in {DYNAMIC, ALWAYS_MC2}:
             mode = declared_mode
@@ -310,20 +328,29 @@ class MoeCommConfig:
             BASE_DECODE_QUERY_LEN + draft) or BASE_DECODE_QUERY_LEN
         max_batched = _positive_int(meta.get("max_num_batched_tokens"), 0)
         enable_prefill = bool(int(additional.get("enable_prefill_mc2", 0) or 0))
-        if mega and not enable_prefill and max_batched < 1:
+        tp = max(1, int(getattr(features, "tp", 1) or 1))
+        world = max(1, int(ep))
+        lora = bool(int(meta.get("lora", 0) or 0))
+        decode_only = _is_decode_only_node(meta, additional)
+        use_mega_capacity = (
+            enable_fused
+            and mega
+            and not lora
+            and 1 < world <= _FUSED_OR_CAPACITY_MAX_MEGAMOE_WORLD_SIZE
+        )
+        if use_mega_capacity and not decode_only and not enable_prefill and max_batched < 1:
             max_batched = (
                 max(capture_sizes) if capture_sizes
                 else max(1, max_num_reqs * uniform)
             )
-        tp = max(1, int(getattr(features, "tp", 1) or 1))
-        world = max(1, int(ep))
         capacity = source_mc2_tokens_capacity(
             max_num_reqs=max_num_reqs, uniform_decode_query_len=uniform,
             capture_sizes=capture_sizes, tp=tp,
             enable_prefill_mc2=enable_prefill,
             max_num_batched_tokens=max_batched,
             enable_fused_mc2=enable_fused or mode == ALWAYS_MC2,
-            mega_moe_supported=mega)
+            mega_moe_supported=use_mega_capacity,
+            is_decode_only_node=decode_only)
         raw_draft_quant = meta.get("draft_quant_supported")
         draft_quant_ok = True if raw_draft_quant is None else bool(int(raw_draft_quant))
         return cls(
@@ -336,7 +363,7 @@ class MoeCommConfig:
             enable_prefill_mc2=enable_prefill,
             max_num_batched_tokens=max_batched, max_num_reqs=max_num_reqs,
             uniform_decode_query_len=uniform, capture_sizes=capture_sizes,
-            lora=bool(int(meta.get("lora", 0) or 0)),
+            lora=lora,
             is_draft_model=bool(int(meta.get("is_draft_model", 0) or 0)),
             draft_quant_supported=draft_quant_ok,
         )

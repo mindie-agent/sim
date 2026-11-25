@@ -103,6 +103,18 @@ def lower(ops, *, selected, runtime, prefix, tokens, top_k, width, experts, ep,
     by_id = {op.op_id: op for op in ops}
     pack, dispatch, combine, unpack = (by_id[prefix + suffix]
         for suffix in (".pack", ".dispatch", ".combine", ".unpack"))
+    pack_quant = by_id.get(prefix + ".pack.quantize")
+    if pack_quant is not None:
+        qmeta = dict(pack_quant.metadata)
+        if (pack_quant.plan_required
+                or pack_quant.deps != (pack.op_id,)
+                or qmeta.get("quantization_scope") != "moe_dispatch_expert_input"
+                or qmeta.get("output_format") != "int8"
+                or qmeta.get("activation_group_size") != width
+                or qmeta.get("activation_scale_format") != "fp32"
+                or any(pack_quant.op_id in item.deps and item.op_id != dispatch.op_id
+                       for item in ops)):
+            raise ModelingError("arch22_v2_cannot_absorb_external_pack_quantizer")
     # InferShape: a = globalBsReal * min(localExpertNum, topK). Capacity is
     # neither an observed group_list nor permission to load all padded rows.
     # TPxDP without an explicit slice still publishes one source rank's rows.
@@ -134,12 +146,19 @@ def lower(ops, *, selected, runtime, prefix, tokens, top_k, width, experts, ep,
         prefix, tokens, top_k, width, experts, ep, dtype, source_partitions, received_assignments, source_routing, valid_source_tokens, global_bs, capacity, pack, dispatch, combine, unpack,
     )
 
-    forward = native("dispatch", dispatch, pack.op_id, dispatch.op_id, pack.deps, ())
+    absorbed_ids = {pack.op_id, *((pack_quant.op_id,) if pack_quant is not None else ())}
+    dispatch_extra_deps = tuple(dep for dep in dispatch.deps if dep not in absorbed_ids)
+    forward = native(
+        "dispatch", dispatch, pack.op_id, dispatch.op_id,
+        tuple(dict.fromkeys(pack.deps + dispatch_extra_deps)), (),
+    )
     weights = tuple(d for d in unpack.deps if d not in {pack.op_id, combine.op_id})
     backward = native("combine", combine, combine.op_id, unpack.op_id,
                       tuple(dict.fromkeys(combine.deps + (dispatch.op_id,) + weights)), ())
     replacement = {pack.op_id: forward, dispatch.op_id: (),
                    combine.op_id: backward, unpack.op_id: ()}
+    if pack_quant is not None:
+        replacement[pack_quant.op_id] = ()
     return [item for op in ops for item in replacement.get(op.op_id, (by_id[op.op_id],))]
 
 

@@ -170,18 +170,27 @@ def _contract(gate, down, dispatch):
                 or ledger.get("allocated_global_tokens") != source_rows * ep
                 or source.get("source_force_eplb") != ledger):
             raise ModelingError("mc2_unfused_padded_call_requires_explicit_source_mask_ledger")
-    storages = set()
+    storage_by_op = {}
     for op, meta in ((gate, gm), (down, dm)):
-        storages.add(_scale_storage(meta))
+        storage_by_op[op.op_id] = _scale_storage(meta)
         if (meta.get("activation_format") != "int8" or meta.get("weight_format") != "int8"
                 or meta.get("output_format") != "bf16" or meta.get("bias")
                 or meta.get("activation_scale_format") != "fp32"
                 or meta.get("activation_group_size") != op.local_shape[-1]
                 or tuple(meta.get("activation_scale_shape", ())) != (rows,)):
             raise ModelingError("mc2_unfused_requires_int8_bf16_and_per_row_fp32_scales")
-    if len(storages) != 1:
-        raise ModelingError("mc2_unfused_requires_one_weight_scale_storage_representation")
-    storage_format, storage_bytes = storages.pop()
+    unique_storages = set(storage_by_op.values())
+    if len(unique_storages) == 1:
+        storage_format, storage_bytes = next(iter(unique_storages))
+    else:
+        storage_format, storage_bytes = "mixed", None
+    storage_map = {
+        op_id: {"format": fmt, "bytes": nbytes}
+        for op_id, (fmt, nbytes) in storage_by_op.items()
+    }
+    cast_required_by_op = {
+        op_id: fmt == "fp32" for op_id, (fmt, _) in storage_by_op.items()
+    }
     capacity = source_rows * ep * min(len(counts), top_k)
     if capacity < rows:
         raise ModelingError("mc2_unfused_valid_rows_exceed_receive_capacity")
@@ -193,7 +202,9 @@ def _contract(gate, down, dispatch):
             "group_list_values": counts, "group_list_basis": gm.get("routing_basis"),
             "weight_scale_storage_format": storage_format,
             "weight_scale_storage_bytes": storage_bytes,
-            "weight_scale_cast_required": storage_format == "fp32",
+            "weight_scale_cast_required": any(cast_required_by_op.values()),
+            "weight_scale_storage_by_op": storage_map,
+            "weight_scale_cast_required_by_op": cast_required_by_op,
             "source": SOURCE}
 
 
@@ -208,13 +219,14 @@ def _matrix(op, contract, *, scale_producer=None):
     weight = payload + scales
     read = op.mte2_bytes - old_weight + weight
     epilogue = {**meta["matrix_epilogue"], "column_scale_bytes": scales}
+    op_storage = contract["weight_scale_storage_by_op"][op.op_id]
     meta.update({METADATA: contract, "native_kind": "GroupedMatmul",
                  "input_capacity_shape": (capacity, k), "output_capacity_shape": (capacity, n),
                  "activation_scale_capacity_shape": (capacity,),
                  "weight_scale_shape": (contract["local_experts"], n),
                  "weight_scale_format": "bf16", "weight_scale_bytes": 2.0,
-                 "weight_scale_storage_format": contract["weight_scale_storage_format"],
-                 "weight_scale_storage_bytes": contract["weight_scale_storage_bytes"],
+                 "weight_scale_storage_format": op_storage["format"],
+                 "weight_scale_storage_bytes": op_storage["bytes"],
                  "weight_payload_bytes": payload, "packed_weight_bytes": weight,
                  "weight_bytes": weight, "matrix_epilogue": epilogue,
                  "int8_weight_metadata": "scale_only",
@@ -223,8 +235,13 @@ def _matrix(op, contract, *, scale_producer=None):
     if scale_producer:
         meta["weight_scale_producer"] = scale_producer
         deps = (*deps, scale_producer)
+    precision_abi = (
+        replace(op.precision_abi, weight_scale_dtype="bf16", weight_scale_bytes=2)
+        if op.precision_abi is not None else None
+    )
     return replace(op, deps=deps, padded_shape=(capacity, n, k), mte2_bytes=read,
-                   hbm_bytes=read + op.mte3_bytes, metadata=tuple(meta.items()))
+                   hbm_bytes=read + op.mte3_bytes, precision_abi=precision_abi,
+                   metadata=tuple(meta.items()))
 
 
 def _pointwise(op, contract, *, quantize=False):
@@ -259,15 +276,16 @@ def _pointwise(op, contract, *, quantize=False):
 
 def _scale_cast(op, contract, columns, *, inherited):
     banks = contract["local_experts"]
+    op_storage = contract["weight_scale_storage_by_op"][op.op_id]
     cast = vector_op(
         op_id=op.op_id + ".weight_scale_cast", deps=op.deps, stage=op.stage,
         layer=op.layer, requests=op.requests, phase=op.phase, dtype="bf16",
         family="cast", recipe="expert_weight_scale_cast", elements=banks * columns,
         ops_per_element=1, shape=(banks, columns),
-        read_bytes_override=banks * columns * contract["weight_scale_storage_bytes"],
+        read_bytes_override=banks * columns * op_storage["bytes"],
         write_bytes_override=banks * columns * 2,
         metadata=tuple({**inherited, METADATA: contract, "native_kind": "Cast",
-                        "input_format": contract["weight_scale_storage_format"],
+                        "input_format": op_storage["format"],
                         "output_format": "bf16",
                         "storage_to_runtime_scale_representation": True}.items()))
     return replace(cast, stream=op.stream)
@@ -286,14 +304,12 @@ def _rewrite(ops, gate):
     inherited = {key: value for key, value in gate.metadata if key in {
         "structure_block", "structure_role", "graph_active_query_rows", "graph_physical_query_rows"}}
     casts = {}
-    if contract["weight_scale_cast_required"]:
-        # W8A8 dynamic loads both expert matrices' per-channel scales from the
-        # declared FP32 storage and converts each matrix's bank to the BF16
-        # runtime scale.  One shared gate bank cannot describe the down width.
-        casts[gate.op_id] = _scale_cast(
-            gate, contract, gate.local_shape[1], inherited=inherited)
-        casts[down.op_id] = _scale_cast(
-            down, contract, down.local_shape[1], inherited=inherited)
+    for proj in (gate, down):
+        if contract["weight_scale_cast_required_by_op"][proj.op_id]:
+            # W8A8 dynamic loads each expert matrix's per-channel scales from
+            # declared storage and casts only FP32 banks to the BF16 runtime scale.
+            casts[proj.op_id] = _scale_cast(
+                proj, contract, proj.local_shape[1], inherited=inherited)
     contract = {**contract,
                 "weight_scale_cast_ops": {key: op.op_id for key, op in casts.items()}}
     dm = dict(dispatch.metadata)
