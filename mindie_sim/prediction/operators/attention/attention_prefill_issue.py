@@ -46,6 +46,12 @@ _FP32 = 4
 _WINDOWS = {"simplified": 4, "gqa": 3}
 _LAGS = {"simplified": 3, "gqa": 2}
 C2_GM_WORKSPACE_BYTES = 12_582_912
+C2_DV_ALIGN_64 = 64
+C2_DV_ALIGN_128 = 128
+C2_DV_ALIGN_256 = 256
+C2_DV_ALIGN_512 = 512
+C2_PRELOAD_SLOTS = 3
+DEFAULT_CV_RATIO = 2
 
 
 def source_issue_operand(reconstruct: bool | None) -> str | None:
@@ -274,6 +280,50 @@ def bmm_call(s1: int, s2: int, d: int, dv: int) -> dict:
     return {"qk": qk, "pv": pv}
 
 
+def c2_fixpipe_policy(source, c1_handoff, spec):
+    """Resolve PV C2 handoff from ``source_c2_path`` independently of score C1."""
+    from .attention_kv_access import FixpipeHandoffPolicy
+
+    if not c1_handoff.enabled or c1_handoff.via_gm:
+        return c1_handoff
+    # CANN GetC2Position (flash_attention_noquant_block_vec_base_fused_infer.h:75)
+    # and SetWorkspace (fused_infer_attention_score_tiling_impl.cpp:1565) dispatch on Dv.
+    v_dim = getattr(spec, "v_head_dim", spec.head_dim)
+    c2 = source_c2_path(v_dim, spec.query_tile, spec.key_tile, spec.reconstruct)
+    if c2 is None or c2.get("path") != "gm_workspace":
+        return c1_handoff
+    if v_dim <= C2_DV_ALIGN_64:
+        dv_block = C2_DV_ALIGN_64
+    elif v_dim <= C2_DV_ALIGN_128:
+        dv_block = C2_DV_ALIGN_128
+    elif v_dim <= C2_DV_ALIGN_256:
+        dv_block = C2_DV_ALIGN_256
+    else:
+        dv_block = C2_DV_ALIGN_512
+    bmm2_bytes = spec.query_tile * dv_block * _FP32
+    vec2_bytes = bmm2_bytes if dv_block > C2_DV_ALIGN_256 else 0
+    units = getattr(source, "resource_units", None) or {}
+    aiv_num = int(
+        units.get("vector")
+        or units.get("mte2_aiv")
+        or (getattr(source, "compute_units", 0) or getattr(source, "core_count", 0) or 1) * DEFAULT_CV_RATIO
+    )
+    ws = (bmm2_bytes + vec2_bytes) * C2_PRELOAD_SLOTS * max(1, aiv_num)
+    names = getattr(source, "resource_names", None)
+    if names is not None:
+        has_l2 = "l2" in names
+    else:
+        has_l2 = "l2" in getattr(source, "rates", ()) or "l2" in units
+    mech = getattr(source, "physical_mechanisms", None)
+    hierarchy = getattr(mech, "memory_hierarchy", None)
+    buffers = getattr(source, "buffers", None)
+    if buffers is None:
+        buffers = getattr(source, "pool_capacities", {})
+    l2_cap = int(getattr(hierarchy, "effective_l2_bytes", buffers.get("l2", 0)) or 0)
+    mem_tier = ("l2" if has_l2 else None) if (l2_cap > 0 and ws <= l2_cap) else "hbm"
+    return FixpipeHandoffPolicy(enabled=True, via_gm=True, mem_tier=mem_tier)
+
+
 class IssueCursor:
     """Bounded cross-M issue cursor.  One instance is one core."""
 
@@ -287,12 +337,14 @@ class IssueCursor:
         self.kind = kind
         self.window = _WINDOWS[kind]
         self.lag = _LAGS[kind]
+        self.v_dim = getattr(spec, "v_head_dim", spec.head_dim)
+        self.output_bytes = getattr(spec, "output_bytes", spec.query_bytes)
         policy = l1_operand_capacity(max(1, spec.query_tile), spec.key_tile,
-                                     spec.head_dim)
+                                     spec.head_dim, self.v_dim)
         self.k_count = policy["k_count"]
         self.v_count = policy["v_count"]
         self.l0c = l0c_policy(max(1, spec.query_tile), spec.key_tile,
-                              spec.head_dim)
+                              self.v_dim)
         self.tiles = []
         self.segments = []
         for segment in segments:
@@ -333,6 +385,7 @@ class IssueCursor:
         self._handoff = gqa_fixpipe_policy(
             self.context, prefill_handoff_workspace_bytes(self.spec, admitted_cores(self.context)),
         )
+        self._pv_handoff = c2_fixpipe_policy(self.context, self._handoff, self.spec)
         self.page_scale = {}
         self.events = {}
         self.next_step = 0
@@ -567,21 +620,27 @@ class IssueCursor:
             f"t{tile}:vec1", step, tile, "vec1",
             {"vector": SOFTMAX_OPS_PER_SCORE * rect + rows},
             after=(self.events[tile]["qk"], self.last_vector),
-            acquire=p_buf + prob, roles=("vector",))
+            acquire=prob, roles=("vector",))
+        p_xfer = self._post(
+            f"t{tile}:p_transfer", step, tile, "p_transfer",
+            {self._write: p_bytes} if (self._write and p_bytes) else {},
+            after=(vec,), acquire=p_buf,
+            roles=(self._write,) if (self._write and p_bytes) else ())
         self.last_vector = vec
         self.events[tile]["vec1"] = vec
+        self.events[tile]["p_transfer"] = p_xfer
         self.events[tile]["p"] = p_buf
         self.events[tile]["prob"] = prob
-        return [vec]
+        return [vec, p_xfer]
 
     def _pv(self, step: int, tile: int):
         found = self._tile(tile)
         if found is None or "vec1" not in self.events.get(tile, {}):
             return []
         _seg_i, seg, _local, valid = found
-        rows, dim = seg["rows"], self.spec.head_dim
+        rows, v_dim = seg["rows"], self.v_dim
         cache = self.spec.kv_cache
-        kv = valid * dim * self.spec.kv_bytes
+        kv = valid * v_dim * self.spec.kv_bytes
         rect = rows * valid
         v_slot = tile % self.v_count
         v_after = (self.events[tile]["vec1"], self.v_free[v_slot],
@@ -645,23 +704,24 @@ class IssueCursor:
         p_op = self._post(
             f"t{tile}:p_operand", step, tile, "p_operand",
             {"mte1": p_mte} if self._operand else {},
-            after=(self.events[tile]["vec1"],),
+            after=(self.events[tile]["p_transfer"],),
             roles=(self._operand,))
         l0c_slot = tile % self.l0c["count"]
-        pv_buf = self._bufs(("l0c", f"c{l0c_slot}", rows * dim * _FP32))
+        pv_buf = self._bufs(("l0c", f"c{l0c_slot}", rows * v_dim * _FP32))
         pv_free = (
             tuple(v_acquire) + tuple(self.events[tile].get("p", ()))
-            + (() if self._handoff.enabled else tuple(pv_buf))
+            + (() if self._pv_handoff.enabled else tuple(pv_buf))
         )
         pv = self._post(
             f"t{tile}:pv", step, tile, "pv", {},
-            matrix={self.spec.query_dtype: 2 * dim * rect},
+            matrix={self.spec.query_dtype: 2 * v_dim * rect},
             after=(v_ready, p_op, self.last_cube),
             acquire=pv_buf, free=pv_free, roles=("cube",))
         self.last_cube = pv
         self.v_free[v_slot] = pv
         pv_ready, handoff_events = self._post_handoff(
-            "pv", step, tile, pv, rows * dim * _FP32, pv_buf,
+            "pv", step, tile, pv, rows * v_dim * _FP32, pv_buf,
+            policy=self._pv_handoff,
         )
         self.events[tile]["pv"] = pv_ready
         self.events[tile]["pv_buf"] = pv_buf
@@ -672,10 +732,10 @@ class IssueCursor:
         if found is None or "pv" not in self.events.get(tile, {}):
             return []
         seg_i, seg, _local, _valid = found
-        rows, dim = seg["rows"], self.spec.head_dim
+        rows, v_dim = seg["rows"], self.v_dim
         vec = self._post(
             f"t{tile}:vec2", step, tile, "vec2",
-            {"vector": rows * (ONLINE_UPDATE_OPS_PER_VALUE * dim + ONLINE_UPDATE_STATE_OPS)},
+            {"vector": rows * (ONLINE_UPDATE_OPS_PER_VALUE * v_dim + ONLINE_UPDATE_STATE_OPS)},
             after=(self.events[tile]["pv"], self.last_vector),
             free=tuple(self.events[tile].get("prob", ())),
             roles=("vector",))
@@ -689,15 +749,15 @@ class IssueCursor:
     def _store(self, step: int, tile: int, seg: dict):
         from mindie_sim.prediction.operators.attention.attention_prefill import _FP32_BYTES
 
-        rows, dim = seg["rows"], self.spec.head_dim
+        rows, v_dim = seg["rows"], self.v_dim
         if seg["partial"]:
-            part = rows * dim * _FP32_BYTES
+            part = rows * v_dim * _FP32_BYTES
             lse = rows * 2 * _FP32_BYTES
             resources = {"hbm": part + lse, "mte3": part + lse,
-                         "vector": rows * (dim + 2)}
+                         "vector": rows * (v_dim + 2)}
         else:
-            out = rows * dim * self.spec.query_bytes
-            resources = {"hbm": out, "mte3": out, "vector": rows * (dim + 1)}
+            out = rows * v_dim * self.output_bytes
+            resources = {"hbm": out, "mte3": out, "vector": rows * (v_dim + 1)}
         free = ()
         if tile == seg["last"]:
             # The segment's page-scale buffer is dead after its last consumer.
@@ -708,21 +768,23 @@ class IssueCursor:
             after=(self.events[tile]["vec2"],), free=free,
             roles=(self._write, "vector"))
 
-    def _post_handoff(self, prefix: str, step: int, tile: int, producer, nbytes: int, release):
-        if not self._handoff.enabled:
+    def _post_handoff(self, prefix: str, step: int, tile: int, producer, nbytes: int, release,
+                      *, policy=None):
+        active = self._handoff if policy is None else policy
+        if not active.enabled:
             return producer, []
         posted = []
         handoff = self._post(
             f"t{tile}:{prefix}_handoff", step, tile, f"{prefix}_handoff",
-            self._handoff.handoff_resources(nbytes),
+            active.handoff_resources(nbytes),
             after=(producer,), free=tuple(release), roles=("fixpipe",),
         )
         posted.append(handoff)
-        if not self._handoff.via_gm:
+        if not active.via_gm:
             return handoff, posted
         read_ev = self._post(
             f"t{tile}:{prefix}_read", step, tile, f"{prefix}_read",
-            self._handoff.read_resources(nbytes, self._vread),
+            active.read_resources(nbytes, self._vread),
             after=(handoff,), roles=(self._vread,),
         )
         posted.append(read_ev)

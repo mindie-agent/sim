@@ -72,8 +72,10 @@ SUPPORTED_ROTARY_DTYPES: frozenset[str] = frozenset({"fp16", "bf16", "fp32"})
 # Muls(sin, -1, halfD) = 0.5 + Mul(x, cos) = 1.0 + Mul(xNew, sin) = 1.0 + Add(xNew, x) = 1.0.
 ROTARY_OPS_PER_ELEMENT = 3.5
 COS_SIN_TENSOR_COUNT = 2
+FOUR_DIM_RANK = 4
 BSND_MIN_RANK = 3
 TWO_DIM_RANK = 2
+BSD_THREE_DIM_LAYOUTS: frozenset[str] = frozenset({"BSD", "BSH"})
 MS_PER_SECOND = 1000.0
 AIV_DRAM_SERVICE_MODE = "mte2_aiv_dram"
 
@@ -86,6 +88,33 @@ def _has_declared_work(work: Work) -> bool:
     )
 
 
+def _rotary_tokens(shape: tuple[int, ...], layout: str) -> int:
+    """Extract cos/sin token extent using CANN RoPE layout axis order."""
+    norm_layout = str(layout or "").strip().upper()
+    if len(shape) == FOUR_DIM_RANK:
+        # rope_regbase_tiling_base.cpp:166-168,359-380: 1SND=(1,N,S,D), BNSD=(B,N,S,D) vs BSND/SBND.
+        if norm_layout == "1SND":
+            return shape[1] * shape[2]
+        return shape[0] * shape[2] if norm_layout == "BNSD" else shape[0] * shape[1]
+    if len(shape) == BSND_MIN_RANK:
+        return shape[0] * shape[1] if norm_layout in BSD_THREE_DIM_LAYOUTS else shape[0]
+    if len(shape) > FOUR_DIM_RANK:
+        return math.prod(shape[:-2])
+    if len(shape) == TWO_DIM_RANK:
+        return shape[0]
+    return 1
+
+
+def _rotary_coeff_elements(op: OpSpec, shape: tuple[int, ...]) -> int:
+    """Return single cos/sin table element count, honoring declared coefficient shapes."""
+    meta = dict(op.metadata or ())
+    for key in ("cos_shape", "sin_shape", "coeff_shape"):
+        raw = meta.get(key)
+        if isinstance(raw, (list, tuple)) and raw:
+            return math.prod(int(dim) for dim in raw)
+    return _rotary_tokens(shape, op.layout) * shape[-1]
+
+
 def _derive_rotary_work(op: OpSpec) -> Work:
     """Derive exact rotate-half byte/vector work from local shape and dtype."""
     shape = tuple(int(dim) for dim in (op.local_shape or op.semantic_shape or ()))
@@ -95,15 +124,9 @@ def _derive_rotary_work(op: OpSpec) -> Work:
         return Work()
     elem_bytes = dtype_bytes(op.dtype or "bf16")
     elements = math.prod(shape)
-    rotary_dim = shape[-1]
-    if len(shape) >= BSND_MIN_RANK:
-        tokens = math.prod(shape[:-2])
-    elif len(shape) == TWO_DIM_RANK:
-        tokens = shape[0]
-    else:
-        tokens = 1
+    coeff_elements = _rotary_coeff_elements(op, shape)
     tensor_bytes = float(elements * elem_bytes)
-    coeff_bytes = float(COS_SIN_TENSOR_COUNT * tokens * rotary_dim * elem_bytes)
+    coeff_bytes = float(COS_SIN_TENSOR_COUNT * coeff_elements * elem_bytes)
     read_bytes = tensor_bytes + coeff_bytes
     write_bytes = tensor_bytes
     return Work(resources={

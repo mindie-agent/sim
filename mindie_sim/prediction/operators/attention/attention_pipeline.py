@@ -184,10 +184,11 @@ def decode_handoff_workspace_bytes(spec: _Spec, core_count: int) -> int:
     """Simultaneous die-wide FP32 score + PV workspace bytes for staged GQA decode."""
     if not spec.outputs:
         return 0
+    v_dim = getattr(spec, "v_head_dim", spec.head_dim)
     max_rows = max(output.rows for output in spec.outputs)
     max_tile = min(spec.key_tile, max(1, max(output.horizon for output in spec.outputs)))
     active = min(max(1, int(core_count)), sum(len(o.contributions) for o in spec.outputs))
-    return active * spec.slots * max_rows * (max_tile + spec.head_dim) * _FP32_BYTES
+    return active * spec.slots * max_rows * (max_tile + v_dim) * _FP32_BYTES
 
 
 def append_gqa_handoff_stages(
@@ -386,7 +387,10 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
                       peer_counts: tuple[int, ...] | None = None,
                       periodic_specs: list[PeriodicPipelineSpec] | None = None) -> KernelProgram:
     _query, context_len = spec.requests[output.request]
-    dim, rows = spec.head_dim, output.rows
+    dim = spec.head_dim
+    v_dim = getattr(spec, "v_head_dim", dim)
+    out_elem = getattr(spec, "output_bytes", spec.query_bytes)
+    rows = output.rows
     q_bytes = rows * dim * spec.query_bytes
     read = _read_role(context)
     write = _write_role(context)
@@ -400,7 +404,7 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
     q_l1 = _allocation(context, core, "l1", "q_l1", q_bytes)
     q_l0a = _allocation(context, core, "l0a", "q_l0a", q_bytes)
     ub_state = _allocation(context, core, "ub", "online_state",
-                           rows * _partial_row_bytes(dim))
+                           rows * _partial_row_bytes(v_dim))
     persistent = _allocations((q_l1, q_l0a, ub_state))
 
     q_work = {"hbm": q_bytes, read: q_bytes}
@@ -507,8 +511,8 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
         stages.append(Stage("page_scale_release", after=("key_tiles",),
                             free=_allocations((page_scale_ub,))))
     if contributions == 1:
-        out_bytes = rows * dim * spec.query_bytes
-        final_resources = {"hbm": out_bytes, "vector": rows * (dim + 1)}
+        out_bytes = rows * v_dim * out_elem
+        final_resources = {"hbm": out_bytes, "vector": rows * (v_dim + 1)}
         if write:
             final_resources[write] = out_bytes
         final = Work(resources=final_resources)
@@ -519,7 +523,7 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
                        **_placement(context, core, *vector)},
         ))
     else:
-        partial_bytes = rows * _partial_row_bytes(dim)
+        partial_bytes = rows * _partial_row_bytes(v_dim)
         stages.append(Stage(
             "partial_store", after=("key_tiles",),
             work=context.bind(Work(resources={
@@ -666,6 +670,7 @@ def _decode_tile_stages(
                  if cache.scale_scope == "row" else 0)
     value_scale = (valid * cache.value_scale_row
                    if cache.scale_scope == "row" else 0)
+    v_dim = getattr(spec, "v_head_dim", dim)
     suffix = f"s{slot}"
     scores = _allocation(context, core, "l0c", f"scores_{suffix}",
                          rows * max_tile * _FP32_BYTES)
@@ -674,7 +679,7 @@ def _decode_tile_stages(
     p_l0a = _allocation(context, core, "l0a", f"p_l0a_{suffix}",
                        rows * valid * spec.query_bytes)
     pv_acc = _allocation(context, core, "l0c", f"pv_acc_{suffix}",
-                         rows * dim * _FP32_BYTES)
+                         rows * v_dim * _FP32_BYTES)
     score_buffer = _allocations((scores,))
     prob_buffer = _allocations((probs,))
     pv_acc_buffer = _allocations((pv_acc,))
@@ -684,10 +689,10 @@ def _decode_tile_stages(
         resources={"vector": 2 * pairs},
     )
     softmax = Work(resources={"vector": DECODE_SOFTMAX_OPS_PER_PAIR * pairs + active_rows})
-    pv = Work(matrix={spec.query_dtype: 2 * dim * pairs})
+    pv = Work(matrix={spec.query_dtype: 2 * v_dim * pairs})
     # Combine the tile-local numerator with the running numerator using
     # their maxima: two scalings plus one add per output element.
-    online = Work(resources={"vector": active_rows * (DECODE_OUTPUT_UPDATE_OPS_PER_VALUE * dim + DECODE_ONLINE_STATE_OPS)})
+    online = Work(resources={"vector": active_rows * (DECODE_OUTPUT_UPDATE_OPS_PER_VALUE * v_dim + DECODE_ONLINE_STATE_OPS)})
     stages_local = []
 
     k_ready, k_free = _append_decode_key_load(
@@ -706,6 +711,18 @@ def _decode_tile_stages(
         "softmax", context.bind(softmax), after=(score_ready,),
         acquire=prob_buffer, free=softmax_free,
         placement=_placement(context, core, *vector)))
+    prob_bytes = pairs * spec.query_bytes
+    p_l1_buffer = _allocations((
+        _allocation(context, core, "l1", f"p_l1_{suffix}", prob_bytes)
+        if (write and prob_bytes) else None,
+    ))
+    stages_local.append(Stage(
+        "probability_transfer",
+        context.bind(Work(resources=({write: prob_bytes} if (write and prob_bytes) else {}))),
+        after=("softmax",),
+        acquire=p_l1_buffer,
+        placement=_placement(context, core, *copy_out) if (write and prob_bytes) else {},
+    ))
 
     # V mirrors K; PV consumes the materialized V operand and probability.
     if value_needs:
@@ -771,13 +788,14 @@ def _decode_tile_stages(
     stages_local.extend((
         Stage("probability_operand", context.bind(Work(resources=(
                   {operand: pairs * spec.query_bytes} if operand else {}))),
-              after=("softmax",), acquire=_allocations((p_l0a,)),
+              after=("probability_transfer",), acquire=_allocations((p_l0a,)),
+              free=p_l1_buffer,
               placement=_placement(context, core, *operand_role)),
         Stage("pv", context.bind(pv), after=(v_ready, "probability_operand"),
               free=pv_free, placement=_placement(context, core, *cube)),
     ))
     pv_ready, _ = append_gqa_handoff_stages(
-        stages_local, "pv", "pv", active_rows * dim * _FP32_BYTES,
+        stages_local, "pv", "pv", active_rows * v_dim * _FP32_BYTES,
         pv_acc_buffer, handoff, context, core, vector_copy_in[0],
     )
     stages_local.append(Stage(

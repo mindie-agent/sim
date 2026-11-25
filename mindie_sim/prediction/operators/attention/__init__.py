@@ -22,8 +22,8 @@ from ...results import OpOccurrence
 from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOperator
 from . import arch22, arch35
 from ._cp_tiling import (
-    HISTORY_DECODE_SITE, OUTPUT_LSE_EXCHANGE_RECIPE, cp_decode_suffix, cp_operators, history_decode_contract,
-    with_collectives,
+    HISTORY_DECODE_SITE, HISTORY_PREFILL_SITE, OUTPUT_LSE_EXCHANGE_RECIPE, cp_decode_suffix,
+    cp_operators, history_decode_contract, history_output_shape, with_collectives,
 )
 from .common import (
     ARCH22, ARCH35, BF16_BYTES, C8_ABI, C8_LATENT_DIM, C8_ROPE_DIM, C8_V1_ABI, C8_VLLM_ABI, C8_VLLM_ROW_BYTES,
@@ -182,11 +182,15 @@ def build(op: OpSpec, ctx: OperatorPlanningContext | Geometry, /) -> OperatorPla
         caller_files.update((binding.caller_site.split(".", 1)[0] + ".py", binding.stack_revision)
                             for binding in contract.cp_plan)
         caller_files.update(("dcp_a2a.py", binding.stack_revision) for binding in contract.cp_plan
-                            if binding.caller_site == HISTORY_DECODE_SITE)
+                            if binding.caller_site in {HISTORY_DECODE_SITE, HISTORY_PREFILL_SITE})
         sources = tuple(ref for ref in arch35.CP_SOURCES
                         if (ref.relative_path.rsplit("/", 1)[-1], ref.revision) in caller_files)
-        plan = with_collectives(plan, cp_operators(normalized, contract.cp_plan),
-                                cp_decode_suffix(normalized, contract), sources)
+        plan = with_collectives(
+            plan,
+            cp_operators(normalized, contract.cp_plan, restored_query_tokens=contract.query_tokens),
+            cp_decode_suffix(normalized, contract),
+            sources,
+        )
     return plan
 
 
@@ -215,9 +219,11 @@ def register_family() -> OperatorFamilySpec:
 
 def _kernels(op: OpSpec) -> tuple[OpSpec, ...]:
     contract = _contract(op, None)
-    gathers = cp_operators(op, contract.cp_plan or ())
+    gathers = cp_operators(op, contract.cp_plan or (), restored_query_tokens=contract.query_tokens)
+    kernel_shape = (contract.query_tokens, contract.num_heads, contract.v_head_dim)
     kernel = replace(
         op, op_id="attention", deps=(gathers[-1].op_id,) if gathers else (), source_boundary="kernel",
+        semantic_shape=kernel_shape, local_shape=kernel_shape, padded_shape=kernel_shape, launch_shape=kernel_shape,
         returns=tuple(dict.fromkeys((*op.returns, "lse"))) if contract.return_lse else op.returns,
         metadata=tuple({**dict(op.metadata), "attention_contract": asdict(replace(contract, cp_plan=None))}.items()),
     )
@@ -286,7 +292,7 @@ def make_attention_op(
     """Create a JSON-compatible source kernel declaration from the typed contract."""
     return_lse = contract.return_lse
     contract = history_decode_contract(contract)
-    shape = (contract.query_tokens, contract.num_heads, contract.v_head_dim)
+    shape = history_output_shape(contract)
     family = "mla" if contract.abi in {C8_ABI, C8_V1_ABI, C8_VLLM_ABI, NOPE_ABI} else "attention"
     matrix_dtype = dtype
     if contract.quant_mode == QUANT_MODE_MXFP8 or _is_gbsa_fp8_quant(contract) or (
@@ -324,7 +330,7 @@ def make_gbsa_op(
     if context_tokens is not None and query_tokens > 0 and batch > 0:
         groups = min(query_tokens, batch)
         quotient, remainder = divmod(query_tokens, groups)
-        sequences = tuple((quotient + (rank < remainder), max(context_tokens, selected_tokens))
+        sequences = tuple((quotient + (rank < remainder), context_tokens)
                           for rank in range(groups))
     contract = AttentionContract(
         query_tokens, num_heads, num_kv_heads, head_dim, head_dim if v_head_dim is None else v_head_dim,
