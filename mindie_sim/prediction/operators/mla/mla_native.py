@@ -33,6 +33,14 @@ GROUPED_OUTPUT_SOURCE = {
     "symbol": "npu_transpose_batchmatmul",
     "scope": "independent_source_semantics; not_capture_binary_identity",
 }
+RMS_NORM_SOURCE = {
+    "repository": "vllm-project/vllm-ascend",
+    "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+    "relative_path": "vllm_ascend/models/deepseek_v41/indexer.py",
+    "source_sha256": "45ec4290a41c25497d3cadfdb40c7466b5a40ae467a76200d82d4fa34b15fa02",
+    "symbol": "DeepseekV41Indexer.k_norm",
+    "scope": "independent_source_semantics; not_capture_binary_identity",
+}
 
 
 def batched_matrix_metadata(*, tokens, heads, input_width, output_width, role):
@@ -64,7 +72,38 @@ def batched_matrix_metadata(*, tokens, heads, input_width, output_width, role):
 NATIVE_LAYER_NORM_KIND = "aclnnLayerNorm"
 NATIVE_LAYER_NORM_KINDS = ("LayerNormV3",)
 NATIVE_LAYER_NORM_OPS = 8
+NATIVE_RMS_NORM_KIND = "aclnnRmsNorm"
+NATIVE_RMS_NORM_KINDS = ("RmsNorm",)
+NATIVE_RMS_NORM_OPS = 5
 FP32_BYTES = int(dtype_bytes("fp32"))
+
+
+def index_rms_norm(builder, *, source, rows, width, input_dtype=None,
+                   output_dtype=None, weight_dtype=None):
+    """Normalize the indexer key with RMSNorm and BF16/native gain (zero beta)."""
+    dtype = input_dtype or builder.model.activation_dtype
+    output_dtype = output_dtype or dtype
+    w_dtype = weight_dtype or dtype
+    elements = rows * width
+    gamma_bytes = width * int(dtype_bytes(w_dtype))
+    parameters = {"gamma": gamma_bytes, "beta": 0}
+    return builder.vector(
+        "index_norm", (source,), elements, NATIVE_RMS_NORM_OPS,
+        family="rmsnorm", dtype=dtype, shape=(rows, width),
+        read_bytes_override=elements * dtype_bytes(dtype) + (gamma_bytes if rows else 0),
+        write_bytes_override=elements * dtype_bytes(output_dtype),
+        metadata=(("reduction_width", width), ("norm_has_weight", True),
+                  ("norm_has_bias", False), ("norm_eps", builder.model.norm_eps),
+                  ("norm_parameter_dtype", w_dtype),
+                  ("norm_weight_dtype", w_dtype),
+                  ("parameter_read_bytes", parameters),
+                  ("norm_gamma_runtime_bytes", gamma_bytes),
+                  ("output_format", output_dtype),
+                  ("aclnn_symbol", NATIVE_RMS_NORM_KIND),
+                  ("native_kind", NATIVE_RMS_NORM_KIND),
+                  ("native_kinds", NATIVE_RMS_NORM_KINDS),
+                  ("zero_external_casts", True),
+                  ("native_source", RMS_NORM_SOURCE)))
 
 
 def index_layer_norm(builder, *, source, rows, width, input_dtype=None,

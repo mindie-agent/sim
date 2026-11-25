@@ -17,6 +17,7 @@ from typing import Literal
 
 from mindie_sim.catalog.attention_common import (
     _causal_pairs, _long_selected_pairs, active_dcp_degree, min_positive,
+    store_dcp_degree,
 )
 from mindie_sim.catalog.cache import (
     completed_rows, index_row_bytes, packed_region_row_bytes,
@@ -63,6 +64,7 @@ INDEX_IDENTITY_COMPRESSION = 1
 DEFAULT_BLOCK_SIZE = 128
 CANDIDATE_BYTES = 8
 FP32_BYTES = 4
+BF16_BYTES = 2
 INT32_BYTES = 4
 MIN_LOG_TOPK = 2
 EMPTY_INDEX_ROWS = 0
@@ -205,6 +207,57 @@ def _owned_completed_rows_for_rank(tokens, compression, cp, interleave, rank):
         if (((j + 1) * ratio - 1) // stride) % degree == rank
     )
     return full_cycles * cycle_owned + rem_owned
+
+
+def _compressed_causal_pairs_prefix(tokens, compression, cp, interleave, rank):
+    """Exact ``sum_{t=1..tokens} _owned_completed_rows_for_rank(t, R, D, I, rank)`` in O(period)."""
+    n_tok = int(tokens)
+    if n_tok <= 0:
+        return 0
+    ratio = max(INDEX_IDENTITY_COMPRESSION, int(compression))
+    degree = max(INDEX_IDENTITY_COMPRESSION, int(cp))
+    stride = max(INDEX_IDENTITY_COMPRESSION, int(interleave))
+    m, rem = divmod(n_tok, ratio)
+    if m <= 0:
+        return 0
+    if degree <= 1:
+        return ratio * (m * (m - 1) // 2) + (rem + 1) * m
+    tail_owned = _owned_completed_rows_for_rank(n_tok, ratio, degree, stride, rank)
+    if m <= 1:
+        return (rem + 1) * tail_owned
+    limit = m - 1
+    period = math.lcm(stride * degree, ratio) // ratio
+    full_periods, rem_rows = divmod(limit, period)
+    s0 = s1 = rem_sum = 0
+    for u in range(period):
+        if (((u + 1) * ratio - 1) // stride) % degree == rank:
+            s0 += 1
+            s1 += u
+            if u < rem_rows:
+                rem_sum += rem_rows - u
+    inner = (
+        full_periods * limit * s0
+        - period * (full_periods * (full_periods - 1) // 2) * s0
+        - full_periods * s1
+        + rem_sum
+    )
+    return ratio * inner + (rem + 1) * tail_owned
+
+
+def _compressed_causal_pairs_by_rank(parts, compression, eff_cp, interleave):
+    """Exact causal compressed KV pairs per rank conserving store-on-completion ownership."""
+    degree = max(INDEX_IDENTITY_COMPRESSION, int(eff_cp))
+    totals = [0.0] * degree
+    for q_part, c_part in parts:
+        q_i, c_i = int(q_part), int(c_part)
+        if q_i <= 0:
+            continue
+        for rank in range(degree):
+            totals[rank] += float(
+                _compressed_causal_pairs_prefix(c_i + q_i, compression, degree, interleave, rank)
+                - _compressed_causal_pairs_prefix(c_i, compression, degree, interleave, rank)
+            )
+    return totals
 
 
 def _index_owner_rows(tokens, compression, cp, interleave):
@@ -374,11 +427,22 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
         # quant_lightning_indexer_tiling.cpp:468-491 requires fp16 weights for INT8 Q/K.
         weight_dtype = "fp16"
     weight_meta = (("weight_dtype", weight_dtype),) if weight_dtype else ()
+    # Sharded DCP local selection returns both INT32 candidate IDs and local scores
+    # (BF16 on A5 per device_op.py:1778, FP32 on A3 per sharded_indexer.py:42).
+    if local:
+        from .mla_epilogs import _is_a5_runtime
+        score_dtype = "bf16" if _is_a5_runtime(runtime, machine) else "fp32"
+        score_bytes = BF16_BYTES if score_dtype == "bf16" else FP32_BYTES
+        selection_write_bytes = valid * plan.index_topk * (INT32_BYTES + score_bytes)
+        score_out_meta = (("selection_score_dtype", score_dtype), ("selection_emits_scores", True))
+    else:
+        selection_write_bytes = valid * plan.index_topk * INT32_BYTES
+        score_out_meta = ()
     if native_fused:
         # One CANN kernel consumes Q, head weights and the candidate cache rows
-        # and writes only the token indices; dispatch QuantLightningIndexerV2
-        # only when index Q/K operands are actually quantized, else BF16
-        # npu_lightning_indexer.
+        # and writes only the token indices (plus scores when sharded); dispatch
+        # QuantLightningIndexerV2 only when index Q/K operands are quantized,
+        # else BF16 npu_lightning_indexer.
         op_name = "index_quant_lightning" if quantized_index else "index_lightning"
         op_recipe = "quant_lightning_indexer" if quantized_index else "index_scores"
         native_kind = (
@@ -391,7 +455,7 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                     + rows * math.log2(max(MIN_LOG_TOPK, plan.index_topk)) / divisor),
             read=operand_bytes + refill_rows * row_b / divisor,
             hbm_read=operand_bytes + hbm_rows * row_b / divisor,
-            write=valid * plan.index_topk * INT32_BYTES,
+            write=selection_write_bytes,
             family="indexer", dtype=index_arithmetic_dtype(model, quant, plan=plan, phase=sel_phase),
             recipe=op_recipe,
             metadata=(("native_kind", native_kind),
@@ -405,7 +469,7 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                       ("index_score_shards", max(MIN_INDEX_FACTOR, int(shard))),
                       ("index_context_partitions", cp),
                       ("index_candidate_filter", bool(plan.candidate_filter)),
-                      ("index_head_reduction", "complete_local")) + weight_meta)
+                      ("index_head_reduction", "complete_local")) + score_out_meta + weight_meta)
         if shared_reads and union_rows < private_rows:
             fused_op = b.ops[-1]
             b.ops[-1] = replace(fused_op, metadata=fused_op.metadata + _prefix_reuse_meta(
@@ -434,13 +498,13 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
     topk = b.work("index_topk", (scores,), (valid, plan.index_topk),
                  vector=rows * math.log2(max(MIN_LOG_TOPK, plan.index_topk)) / divisor,
                  read=rows * FP32_BYTES / divisor,
-                 write=valid * plan.index_topk * INT32_BYTES,
+                 write=selection_write_bytes,
                  family="topk", dtype="fp32",
                  metadata=(("selection_output_dtype", "int32"),
                            ("selected_token_rows", float(sum(selected_by_view))),
                            ("selected_request_ids",
                             tuple(view.request_id for view in views)),
-                           ("selected_tokens_by_request", tuple(selected_by_view))))
+                           ("selected_tokens_by_request", tuple(selected_by_view))) + score_out_meta)
     declare_indexer(b.ops, prefix=prefix, plan=plan, parallel=parallel, model=model,
                     quant=quant, views=views, padded_tokens=padded_tokens,
                     scores=scores, topk=topk)
@@ -568,19 +632,49 @@ def _dense_window_tile_spans(parts, view, plan, query_tile):
             yield lo, hi
 
 
+def _merge_intervals(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Exact disjoint sorted union of half-open ``[lo, hi)`` intervals."""
+    ordered = sorted((int(lo), int(hi)) for lo, hi in spans if int(hi) > int(lo))
+    if not ordered:
+        return []
+    merged = [ordered[0]]
+    for lo, hi in ordered[1:]:
+        prev_lo, prev_hi = merged[-1]
+        if lo <= prev_hi:
+            merged[-1] = (prev_lo, max(prev_hi, hi))
+        else:
+            merged.append((lo, hi))
+    return merged
+
+
+def _causal_horizon(parts, view, plan) -> int:
+    """Maximum KV position visible across this rank's owned query parts."""
+    if plan.noncausal_attention:
+        return int(view.kv_len)
+    return max(
+        (int(c_part) + int(q_part) for q_part, c_part in parts),
+        default=int(view.kv_len),
+    )
+
+
 def _window_unique_rows(win_spans, view, plan, eff_cp, interleave):
-    """Unique rank-owned KV rows bounded by dense sliding window when active."""
+    """Unique rank-owned KV rows bounded by exact union of sliding-window spans."""
     if plan.window > 0 and win_spans:
-        u_lo = min(lo for lo, _ in win_spans)
-        u_hi = max(hi for _, hi in win_spans)
+        merged = _merge_intervals(win_spans)
         if eff_cp > 1:
-            return [owned_positions(u_lo, u_hi - 1, eff_cp, interleave, rank)
-                    for rank in range(eff_cp)]
-        return [max(0, u_hi - u_lo)]
+            return [
+                sum(owned_positions(lo, hi - 1, eff_cp, interleave, rank)
+                    for lo, hi in merged)
+                for rank in range(eff_cp)
+            ]
+        return [sum(hi - lo for lo, hi in merged)]
+    horizon = min(int(view.kv_len), _causal_horizon(visible_parts(view), view, plan))
+    if horizon <= 0:
+        return [0] * eff_cp
     if eff_cp > 1:
-        return [owned_positions(0, view.kv_len - 1, eff_cp, interleave, rank)
+        return [owned_positions(0, horizon - 1, eff_cp, interleave, rank)
                 for rank in range(eff_cp)]
-    return [math.ceil(view.kv_len / eff_cp)] * eff_cp
+    return [horizon]
 
 
 def _noncausal_window_rank_pairs(
@@ -627,13 +721,37 @@ def _sparse_window_partition(parts, view, plan, query_tile, eff_cp, interleave):
     return win_pairs, win_sweeps
 
 
+def _rebalance_completion_sparse_split(
+    comp_rows, total_pairs, total_sweeps, eff_q, n_tiles,
+):
+    """Enforce exact store-on-completion compressed row ownership for sparse pairs/sweeps."""
+    total_rows = sum(comp_rows)
+    if total_rows <= 0:
+        zeros = [0.0] * len(comp_rows)
+        return zeros, [0] * len(comp_rows)
+    pair_caps = [float(eff_q * rows) for rows in comp_rows]
+    sweep_caps = [int(n_tiles * rows) for rows in comp_rows]
+    raw_pairs = [
+        min(pair_caps[r], float(total_pairs) * (float(comp_rows[r]) / float(total_rows)))
+        for r in range(len(comp_rows))
+    ]
+    raw_sweeps = [
+        min(float(sweep_caps[r]), float(total_sweeps) * (float(comp_rows[r]) / float(total_rows)))
+        for r in range(len(comp_rows))
+    ]
+    int_sweeps = round_sparse_dcp_counts(raw_sweeps, int(total_sweeps), sweep_caps)
+    return raw_pairs, int_sweeps
+
+
 def _partition_sparse_view(
     view, plan, parts, eff_q, pairs, sweeps, eff_cp, query_tile, interleave, runtime,
 ):
     """Per-rank sparse Top-K DCP partition for one view plus pooling descriptor."""
-    ratio = 1 if plan.cache_kind == "dense" else max(1, int(plan.compress_ratio or 1))
+    raw_ratio = int(plan.compress_ratio or 0)
+    ratio = 1 if plan.cache_kind == "dense" else max(1, raw_ratio)
+    max_horizon = _causal_horizon(parts, view, plan)
     always_tail = (
-        int(view.kv_len) % int(plan.index_kpool)
+        int(max_horizon) % int(plan.index_kpool)
         if int(plan.index_kpool) > 1 and bool(plan.index_kpool_always_select_tail)
         else 0
     )
@@ -642,18 +760,21 @@ def _partition_sparse_view(
     sparse_pairs_total = max(0.0, float(pairs) - sum(win_pairs))
     sparse_sweeps_total = max(0, int(sweeps) - sum(win_sweeps))
     pairs_seq = sparse_dcp_sequence_for_total(
-        view.kv_len, sparse_pairs_total, eff_q,
+        max_horizon, sparse_pairs_total, eff_q,
         compress_ratio=ratio, always_select_tail=always_tail)
     sweeps_seq = sparse_dcp_sequence_for_total(
-        view.kv_len, sparse_sweeps_total, eff_q,
+        max_horizon, sparse_sweeps_total, eff_q,
         compress_ratio=ratio, always_select_tail=always_tail)
     p_split = split_sparse_dcp_batch((pairs_seq,), eff_cp, interleave, runtime=runtime, unit="pairs")
     s_split = split_sparse_dcp_batch((sweeps_seq,), eff_cp, interleave, runtime=runtime, unit="sweeps")
     s_caps = sparse_dcp_capacities(sweeps_seq, eff_cp, interleave)
     s_ints = round_sparse_dcp_counts(s_split.per_rank, sparse_sweeps_total, s_caps)
-    v_pairs = [win_pairs[r] + p_split.per_rank[r] for r in range(eff_cp)]
-    v_sweeps = [win_sweeps[r] + s_ints[r] for r in range(eff_cp)]
-    v_shared = [0] * eff_cp
+    completion_rebalance = False
+    comp_rows_wc = [0] * eff_cp
+    n_tiles = sum(
+        max(1, math.ceil(int(q_part) / max(1, int(query_tile))))
+        for q_part, _ in parts if int(q_part) > 0
+    )
     if plan.cache_kind == "window_compressed":
         win_spans_wc = [
             (lo, hi) for lo, hi in _dense_window_tile_spans(parts, view, plan, query_tile)
@@ -663,19 +784,36 @@ def _partition_sparse_view(
             _window_unique_rows(win_spans_wc, view, plan, eff_cp, interleave)
             if win_spans_wc else [0] * eff_cp
         )
-        comp_rows_wc = [
-            _owned_completed_rows_for_rank(view.kv_len, ratio, eff_cp, interleave, rank)
-            for rank in range(eff_cp)
-        ]
+        if raw_ratio > 0:
+            comp_rows_wc = [
+                _owned_completed_rows_for_rank(max_horizon, raw_ratio, eff_cp, interleave, rank)
+                for rank in range(eff_cp)
+            ]
         v_rows = [win_rows_wc[r] + comp_rows_wc[r] for r in range(eff_cp)]
+        if raw_ratio > 1 and eff_cp > 1 and (interleave % raw_ratio != 0 or any(c == 0 for c in comp_rows_wc)):
+            completion_rebalance = True
+            p_per_rank, s_ints = _rebalance_completion_sparse_split(
+                comp_rows_wc, sparse_pairs_total, sparse_sweeps_total, eff_q, n_tiles,
+            )
+            v_pairs = [win_pairs[r] + p_per_rank[r] for r in range(eff_cp)]
+        else:
+            v_pairs = [win_pairs[r] + p_split.per_rank[r] for r in range(eff_cp)]
     else:
-        v_rows = [owned_positions(0, view.kv_len - 1, eff_cp, interleave, rank) for rank in range(eff_cp)]
+        v_rows = [owned_positions(0, max_horizon - 1, eff_cp, interleave, rank) for rank in range(eff_cp)]
+        v_pairs = [win_pairs[r] + p_split.per_rank[r] for r in range(eff_cp)]
+    v_sweeps = [win_sweeps[r] + s_ints[r] for r in range(eff_cp)]
+    v_shared = [0] * eff_cp
     spec = {
         "pairs_seq": pairs_seq,
         "sweeps_seq": sweeps_seq,
+        "pairs_total": sparse_pairs_total,
         "sweeps_total": sparse_sweeps_total,
         "win_pairs": tuple(win_pairs),
         "win_sweeps": tuple(win_sweeps),
+        "completion_rebalance": completion_rebalance,
+        "comp_rows_wc": tuple(comp_rows_wc),
+        "eff_q": int(eff_q),
+        "n_tiles": int(n_tiles),
     }
     return v_pairs, v_sweeps, v_shared, v_rows, spec
 
@@ -705,8 +843,16 @@ def pool_sparse_view_records(
         spec = specs[pos]
         win_p = spec["win_pairs"]
         win_s = spec["win_sweeps"]
-        view_records[rec_idx]["v_pairs"] = [win_p[r] + pairs_per_seq[pos][r] for r in range(eff_cp)]
-        view_records[rec_idx]["v_sweeps"] = [win_s[r] + sweeps_matrix[pos][r] for r in range(eff_cp)]
+        if spec.get("completion_rebalance"):
+            re_p, re_s = _rebalance_completion_sparse_split(
+                spec["comp_rows_wc"], spec["pairs_total"], spec["sweeps_total"],
+                spec["eff_q"], spec["n_tiles"],
+            )
+            view_records[rec_idx]["v_pairs"] = [win_p[r] + re_p[r] for r in range(eff_cp)]
+            view_records[rec_idx]["v_sweeps"] = [win_s[r] + re_s[r] for r in range(eff_cp)]
+        else:
+            view_records[rec_idx]["v_pairs"] = [win_p[r] + pairs_per_seq[pos][r] for r in range(eff_cp)]
+            view_records[rec_idx]["v_sweeps"] = [win_s[r] + sweeps_matrix[pos][r] for r in range(eff_cp)]
 
 
 def _partition_unindexed_window_compressed_view(
@@ -715,7 +861,7 @@ def _partition_unindexed_window_compressed_view(
     """Exact rank-owned window + store-on-completion compressed rows for unindexed CP>1."""
     win_pairs, win_sweeps = _sparse_window_partition(
         parts, view, plan, query_tile, eff_cp, interleave)
-    ratio = max(1, int(plan.compress_ratio or 1))
+    raw_ratio = int(plan.compress_ratio or 0)
     win_spans_wc = [
         (lo, hi) for lo, hi in _dense_window_tile_spans(parts, view, plan, query_tile)
         if hi > lo
@@ -725,27 +871,26 @@ def _partition_unindexed_window_compressed_view(
         if win_spans_wc else [0] * eff_cp
     )
     comp_sweeps = [0] * eff_cp
-    for q_part, c_part in parts:
-        for start in range(0, q_part, query_tile):
-            horizon = (view.kv_len if plan.noncausal_attention
-                       else c_part + min(q_part, start + query_tile))
-            for rank in range(eff_cp):
-                comp_sweeps[rank] += _owned_completed_rows_for_rank(
-                    horizon, ratio, eff_cp, interleave, rank,
-                )
-    comp_rows = [
-        _owned_completed_rows_for_rank(view.kv_len, ratio, eff_cp, interleave, rank)
-        for rank in range(eff_cp)
-    ]
-    comp_pairs_total = max(0.0, float(pairs) - sum(win_pairs))
-    comp_rows_sum = sum(comp_rows)
+    if raw_ratio > 0:
+        for q_part, c_part in parts:
+            for start in range(0, q_part, query_tile):
+                horizon = (view.kv_len if plan.noncausal_attention
+                           else c_part + min(q_part, start + query_tile))
+                for rank in range(eff_cp):
+                    comp_sweeps[rank] += _owned_completed_rows_for_rank(
+                        horizon, raw_ratio, eff_cp, interleave, rank,
+                    )
+        max_horizon = _causal_horizon(parts, view, plan)
+        comp_rows = [
+            _owned_completed_rows_for_rank(max_horizon, raw_ratio, eff_cp, interleave, rank)
+            for rank in range(eff_cp)
+        ]
+    else:
+        comp_rows = [0] * eff_cp
     if plan.noncausal_attention:
         comp_pairs = [float(eff_q * comp_rows[r]) for r in range(eff_cp)]
-    elif comp_rows_sum > 0:
-        comp_pairs = [
-            comp_pairs_total * (float(comp_rows[r]) / float(comp_rows_sum))
-            for r in range(eff_cp)
-        ]
+    elif raw_ratio > 0:
+        comp_pairs = _compressed_causal_pairs_by_rank(parts, raw_ratio, eff_cp, interleave)
     else:
         comp_pairs = [0.0] * eff_cp
     v_pairs = [win_pairs[r] + comp_pairs[r] for r in range(eff_cp)]
@@ -769,7 +914,8 @@ def _single_rank_view_rows(
             _window_unique_rows(win_spans_wc1, view, plan, eff_cp, interleave)
             if win_spans_wc1 else [0] * eff_cp
         )
-        comp_u1 = completed_rows(view.kv_len, max(1, int(plan.compress_ratio or 1)))
+        max_horizon = _causal_horizon(parts, view, plan)
+        comp_u1 = completed_rows(max_horizon, plan.compress_ratio)
         return [win_u1[r] + comp_u1 for r in range(eff_cp)]
     return [math.ceil(view.kv_len / eff_cp)] * eff_cp
 
@@ -1062,30 +1208,81 @@ def attention_tensor_view(plan, view, heads, model, quant, parallel, *, eff_cp=N
     return ()
 
 
-def owned_store_rows(rows_by_view, views, parallel, block, *, contexts=None):
-    """Worst-rank rows written by DCP-owned stores for the supplied view rows."""
-    degrees = [active_dcp_degree(parallel, view.phase) for view in views]
+def owned_store_rows(
+    rows_by_view, views, parallel, block, *, contexts=None,
+    rank_candidates=None, storage_degrees=None, ratio: int = 1,
+):
+    """Rows written by DCP-owned stores (rank-exact when ``rank_candidates`` is given)."""
+    degrees = (
+        [max(1, int(degree)) for degree in storage_degrees]
+        if storage_degrees is not None
+        else [store_dcp_degree(parallel, view.phase) for view in views]
+    )
     starts = [int(view.context) for view in views] if contexts is None else list(contexts)
     max_degree = max(degrees, default=1)
     block = max(1, int(block))
+    comp_ratio = max(1, int(ratio or 1))
+    ranks = (
+        tuple(int(rank) for rank in rank_candidates)
+        if rank_candidates is not None else tuple(range(max_degree))
+    )
+    if not ranks:
+        return 0
     best = 0
-    for rank in range(max_degree):
+    for rank in ranks:
         total = 0
-        for start, rows, degree in zip(starts, rows_by_view, degrees):
+        for view, start, rows, degree in zip(views, starts, rows_by_view, degrees):
             rows = max(0, int(rows))
             if not rows:
                 continue
-            if degree <= 1:
+            ranges = getattr(view, "query_ranges", ()) if contexts is None else ()
+            if comp_ratio > 1:
+                if degree <= 1:
+                    if ranges:
+                        total += sum(
+                            completed_rows(int(start) + int(hi), comp_ratio)
+                            - completed_rows(int(start) + int(lo), comp_ratio)
+                            for lo, hi in ranges if int(hi) > int(lo)
+                        )
+                    else:
+                        total += (
+                            completed_rows(int(start) + rows, comp_ratio)
+                            - completed_rows(int(start), comp_ratio)
+                        )
+                elif 0 <= rank < degree:
+                    if ranges:
+                        total += sum(
+                            _owned_completed_rows_for_rank(int(start) + int(hi), comp_ratio, degree, block, rank)
+                            - _owned_completed_rows_for_rank(int(start) + int(lo), comp_ratio, degree, block, rank)
+                            for lo, hi in ranges if int(hi) > int(lo)
+                        )
+                    else:
+                        total += (
+                            _owned_completed_rows_for_rank(int(start) + rows, comp_ratio, degree, block, rank)
+                            - _owned_completed_rows_for_rank(int(start), comp_ratio, degree, block, rank)
+                        )
+            elif degree <= 1:
                 total += rows
-            elif rank < degree:
-                total += owned_positions(
-                    int(start), int(start) + rows - 1, degree, block, rank)
+            elif 0 <= rank < degree:
+                if ranges:
+                    total += sum(
+                        owned_positions(
+                            int(start) + int(lo), int(start) + int(hi) - 1,
+                            degree, block, rank,
+                        )
+                        for lo, hi in ranges if int(hi) > int(lo)
+                    )
+                else:
+                    total += owned_positions(
+                        int(start), int(start) + rows - 1, degree, block, rank)
         best = max(best, total)
     return best
 
 
-def sharded_index_visible_rows(views, parallel, block, ratio, *, sharded_dcp=None):
-    """Worst-rank visible index rows under a sharded indexer."""
+def sharded_index_visible_rows(
+    views, parallel, block, ratio, *, sharded_dcp=None, rank_candidates=None,
+):
+    """Rank-exact (or worst-rank) visible index rows under a sharded indexer."""
     if sharded_dcp is not None:
         degrees = [max(1, int(sharded_dcp)) for _ in views]
     else:
@@ -1108,13 +1305,18 @@ def sharded_index_visible_rows(views, parallel, block, ratio, *, sharded_dcp=Non
                     per_rank[rank] += int(split.per_rank[rank])
             continue
         for offset in range(q_len):
-            horizon = completed_rows(view.context + offset + 1, ratio)
-            if horizon <= 0:
+            horizon = view.context + offset + 1
+            if completed_rows(horizon, ratio) <= 0:
                 continue
             if degree <= 1:
-                per_rank = [value + horizon for value in per_rank]
+                per_rank = [value + completed_rows(horizon, ratio) for value in per_rank]
             else:
                 for rank in range(degree):
-                    per_rank[rank] += owned_positions(
-                        0, horizon - 1, degree, block, rank)
+                    per_rank[rank] += _owned_completed_rows_for_rank(
+                        horizon, ratio, degree, block, rank)
+    if rank_candidates is not None:
+        return max(
+            (per_rank[int(r)] for r in rank_candidates if 0 <= int(r) < max_degree),
+            default=0.0,
+        )
     return max(per_rank, default=0.0)
