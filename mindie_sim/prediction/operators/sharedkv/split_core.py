@@ -179,11 +179,10 @@ def _eval_split_plan(
 
         # 2. Assign individual S2 tiles when streamK / FlashDecode is active.
         if stream_k and row_idx < len(rows):
+            took_cur_row = False
             while row_idx < len(rows):
                 t_cost = rows[row_idx].tile_cost(tile_idx)
                 if limit + t_cost // FA_TOLERANCE_RATIO >= cur_cost + t_cost:
-                    if cur_blocks == 0 or tile_idx == 0 or splits_per_row[row_idx] == 0:
-                        pass
                     cur_cost += t_cost
                     cur_blocks += 1
                     tile_idx += 1
@@ -191,14 +190,17 @@ def _eval_split_plan(
                     rem_row_cost -= t_cost
                     if rem_row_tiles == 0:
                         splits_per_row[row_idx] += 1
+                        took_cur_row = False
                         row_idx += 1
                         if row_idx < len(rows):
                             tile_idx = 0
                             rem_row_tiles = rows[row_idx].tiles
                             rem_row_cost = rows[row_idx].total_cost
+                    else:
+                        took_cur_row = True
                 else:
                     break
-            if tile_idx > 0 and row_idx < len(rows):
+            if took_cur_row and row_idx < len(rows):
                 splits_per_row[row_idx] += 1
 
         # 3. Force at least one block (or row if no streamK) to guarantee progress.
@@ -281,20 +283,43 @@ def _build_rows(
     group_size: int,
     m_tile: int,
     s2_tile: int,
+    *,
+    causal: bool = False,
+    is_s1g: bool = True,
 ) -> tuple[_RowSpec, ...]:
     rows: list[_RowSpec] = []
     for q_len, kv_len in sequences:
+        if q_len <= 0 or kv_len <= 0:
+            continue
         total_m = q_len * group_size
         m_rects = ceil(total_m / m_tile)
-        tiles = ceil(kv_len / s2_tile) if kv_len > 0 else 0
-        tail_s2 = kv_len - max(0, tiles - 1) * s2_tile if tiles > 0 else 0
+        full_tiles = ceil(kv_len / s2_tile)
+        tail_s2 = kv_len - (full_tiles - 1) * s2_tile
         for _ in range(num_kv_heads):
             for r_idx in range(m_rects):
-                m_rows = min(m_tile, total_m - r_idx * m_tile)
+                m_first = r_idx * m_tile
+                m_rows = min(m_tile, total_m - m_first)
+                if causal:
+                    # split_core_v2.cpp:125-165 & split_core.cpp:128-166:
+                    # right-aligned causal upper bound per M-tile (isS1G vs BNSD).
+                    m_last = m_first + m_rows - 1
+                    if is_s1g:
+                        s1_last = m_last // group_size
+                    elif m_first // q_len == m_last // q_len:
+                        s1_last = m_last % q_len
+                    else:
+                        s1_last = q_len
+                    s2_last = s1_last + (kv_len - q_len)
+                    if s2_last < 0:
+                        continue
+                    tiles = min(s2_last, kv_len - 1) // s2_tile + 1
+                else:
+                    tiles = full_tiles
+                row_tail_s2 = tail_s2 if tiles == full_tiles else s2_tile
                 rows.append(_RowSpec(
                     tiles=tiles,
                     normal_cost=block_cost(m_rows, s2_tile),
-                    tail_cost=block_cost(m_rows, tail_s2 or s2_tile),
+                    tail_cost=block_cost(m_rows, row_tail_s2),
                 ))
     return tuple(rows)
 
@@ -308,6 +333,7 @@ def resolve_arch22_fia_gqa_tiling(
     paged: bool,
     aic_count: int,
     layout: str,
+    causal: bool = False,
 ) -> CorePartition:
     """Replay Arch22 FiaTilingNonQuant + split_core::SplitCore."""
     group = num_heads // num_kv_heads
@@ -338,7 +364,8 @@ def resolve_arch22_fia_gqa_tiling(
         s_inner = min(ARCH22_GQA_PREFILL_SINNER, max(1, max_s2))
         m_base = ARCH22_GQA_PREFILL_M_BASE
 
-    rows = _build_rows(sequences, num_kv_heads, group, m_base, s_inner)
+    is_s1g = layout != "BNSD"
+    rows = _build_rows(sequences, num_kv_heads, group, m_base, s_inner, causal=causal, is_s1g=is_s1g)
     allow_stream_k = (len(sequences) * num_kv_heads < aic_count) if splitfuse_ragged else True
     used, max_cost, splits, fd_on = _search_split_core(
         rows, aic_count, stream_k=allow_stream_k, fd_tolerance_blocks=0, fd_least_blocks=0,
@@ -364,6 +391,7 @@ def resolve_arch35_fia_gqa_tiling(
     l2_bytes: int,
     causal: bool,
     is_decode: bool = True,
+    layout: str | None = None,
 ) -> CorePartition:
     """Replay Arch35 FiaTilingNonQuantArch35 + CheckS1OutSplit fallback + split_core_v2."""
     group = num_heads // num_kv_heads
@@ -413,7 +441,8 @@ def resolve_arch35_fia_gqa_tiling(
         s_outer = ARCH35_SOUTER_64
         s_inner = ARCH35_SINNER_128
     m_base = s_outer * ARCH35_CV_RATIO
-    rows = _build_rows(sequences, num_kv_heads, group, m_base, s_inner)
+    is_s1g = layout != "BNSD"
+    rows = _build_rows(sequences, num_kv_heads, group, m_base, s_inner, causal=causal, is_s1g=is_s1g)
     m_fd = min(max_s1 * group, m_base)
     used, max_cost, splits, fd_on = _search_split_core(
         rows, aic_count, stream_k=True,
