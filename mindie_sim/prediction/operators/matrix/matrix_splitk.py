@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
+import re
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from .matrix_mapping import matrix_geometry
@@ -173,6 +174,30 @@ def router_matrix_operand_bytes(op, geometry, *, recipe=None) -> float:
             + weight_bytes * -(-m // recipe.tile_m))
 
 
+_RESOURCE_RANK_RE = re.compile(r"@r(\d+)(?::|$)")
+
+
+def _resolve_l2_rank(obj, explicit_rank: int | None = None) -> int:
+    if explicit_rank is not None:
+        return int(explicit_rank)
+    rank = getattr(obj, "rank", None)
+    if rank is not None:
+        return int(rank)
+    names = getattr(obj, "resource_names", None) or {}
+    for key in ("l2", "hbm", "cube"):
+        res_name = names.get(key)
+        if isinstance(res_name, str):
+            match = _RESOURCE_RANK_RE.search(res_name)
+            if match is not None:
+                return int(match.group(1))
+    for res_name in names.values():
+        if isinstance(res_name, str):
+            match = _RESOURCE_RANK_RE.search(res_name)
+            if match is not None:
+                return int(match.group(1))
+    return 0
+
+
 def _geometry_partials_l2_resident(geometry, partial_bytes: float) -> bool:
     """True when the die's live available L2 budget fits the FP32 partials."""
     units = getattr(geometry, "resource_units", None) or {}
@@ -180,7 +205,7 @@ def _geometry_partials_l2_resident(geometry, partial_bytes: float) -> bool:
         return False
     view = getattr(geometry, "admission_memory_view", None)
     if view is not None:
-        rank = int(getattr(geometry, "rank", 0) or 0)
+        rank = _resolve_l2_rank(geometry)
         avail = int(view.effective_l2_bytes(rank))
         return avail > 0 and partial_bytes <= float(avail)
     l2_bytes = int((getattr(geometry, "buffers", None) or {}).get("l2", 0) or 0)
@@ -190,15 +215,15 @@ def _geometry_partials_l2_resident(geometry, partial_bytes: float) -> bool:
     return l2_bytes > 0 and partial_bytes <= float(l2_bytes)
 
 
-def _partials_l2_resident(context, partial_bytes: float) -> bool:
+def _partials_l2_resident(context, partial_bytes: float, *, rank: int | None = None) -> bool:
     """True when FP32 Split-K partials fit live available die L2 and L2 pipe exists."""
     names = getattr(context, "resource_names", None) or {}
     if "l2" not in names or partial_bytes <= 0.0:
         return False
     view = getattr(context, "admission_memory_view", None)
     if view is not None:
-        rank = int(getattr(context, "rank", 0) or 0)
-        avail = int(view.effective_l2_bytes(rank))
+        eff_rank = _resolve_l2_rank(context, explicit_rank=rank)
+        avail = int(view.effective_l2_bytes(eff_rank))
         return avail > 0 and partial_bytes <= float(avail)
     from .matrix_mapping_owners import primitive_l2_params
     l2_bytes, _ = primitive_l2_params(context)
@@ -290,7 +315,7 @@ def build_router_splitk(op, geometry):
             vector_ops=declared_vector,
         )
         live_l2 = (
-            _partials_l2_resident(context, partial)
+            _partials_l2_resident(context, partial, rank=getattr(geometry, "rank", None))
             if getattr(context, "admission_memory_view", None) is not None
             else ws_l2
         )

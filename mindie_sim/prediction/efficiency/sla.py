@@ -229,6 +229,7 @@ class _SLASizingRun:
         self.evaluation_context = evaluation_context
         self.scaled_cases: dict[tuple[float, ...], CaseSpec] = {}
         self.eval_contexts: dict[tuple[float, ...], Any] = {}
+        self.floor_caps_cache: dict[tuple[float, ...], Any] = {}
         self.graphs_by_b: dict[int, Any] = {}
         self.vram_by_cap: dict[float, tuple[int, int, int]] = {}
         self.graph_cache: dict[tuple[tuple[float, ...], int, bool], tuple[Any, CaseSpec, dict[str, Any]]] = {}
@@ -465,42 +466,69 @@ class _SLASizingRun:
             secant_estimate, certified_optimal=certified_optimal, hi_cut=hi_cut)
 
     @staticmethod
-    def _hardware_floor_caps(eff_case: CaseSpec):
+    def _hardware_floor_caps(eff_case: CaseSpec, eval_ctx: Any = None):
         dies = getattr(getattr(eff_case, "machine", None), "dies", ()) or ()
+        pt = getattr(eval_ctx, "primitive_table", None) if eval_ctx is not None else None
+        datapath_fn = overlay_fn = None
+        if pt is not None:
+            from ..execution.context import datapath_for_devices as datapath_fn
+            from mindie_sim.primitives.loader import resolve_sim_rate_overlay as overlay_fn
         max_hbm_ms = 0.0
         max_vec_ms = 0.0
         max_l2_bytes = 0.0
         cube_peaks_ms: dict[str, float] = {}
         custom_inv = bool((getattr(eff_case.runtime, "kernels", None) or {}).get("invocations"))
-        cube_invs: list[float] = []
-        vec_invs: list[float] = []
+        invs_per_die: list[dict[str, float]] = []
+        links = getattr(getattr(eff_case, "machine", None), "links", ()) or ()
+        tchannels = getattr(getattr(eff_case, "machine", None), "transfer_channels", ()) or ()
         for die in dies:
             rates = dict(getattr(die, "rates", ()) or ())
-            for fmt, val in dict(die.compute_peaks).items():
-                f_ms = float(val or 0.0) / 1000.0
-                if f_ms > cube_peaks_ms.get(str(fmt).lower(), 0.0):
-                    cube_peaks_ms[str(fmt).lower()] = f_ms
-            max_vec_ms = max(max_vec_ms, float(rates.get("vector", 0.0) or 0.0) / 1000.0)
+            peaks = dict(die.compute_peaks)
             hbm_s = float(rates.get("hbm", 0.0) or 0.0)
+            vec_s = float(rates.get("vector", 0.0) or 0.0)
             dp = getattr(die, "datapath", None)
             hbm_r = float(getattr(dp, "hbm_read_bytes_per_s", 0.0) or 0.0) if dp is not None else 0.0
             hbm_w = float(getattr(dp, "hbm_write_bytes_per_s", 0.0) or 0.0) if dp is not None else 0.0
+            if pt is not None and datapath_fn is not None and overlay_fn is not None:
+                _, dp_eff = datapath_fn((die,), links=links, transfer_channels=tchannels)
+                ov = overlay_fn(pt, dp_eff, sku=die.sku)
+                ov_rates = dict(ov.rates)
+                if "hbm" in ov_rates:
+                    hbm_s = min(float(ov_rates["hbm"]), hbm_s) if hbm_s > 0.0 else float(ov_rates["hbm"])
+                if "vector" in ov_rates:
+                    vec_s = min(float(ov_rates["vector"]), vec_s) if vec_s > 0.0 else float(ov_rates["vector"])
+                if ov.hbm_read_bytes_per_s is not None:
+                    raw_h = float(rates.get("hbm", 0.0) or 0.0)
+                    hbm_r = min(float(ov.hbm_read_bytes_per_s), raw_h) if raw_h > 0.0 else float(ov.hbm_read_bytes_per_s)
+                if ov.hbm_write_bytes_per_s is not None:
+                    raw_h = float(rates.get("hbm", 0.0) or 0.0)
+                    hbm_w = min(float(ov.hbm_write_bytes_per_s), raw_h) if raw_h > 0.0 else float(ov.hbm_write_bytes_per_s)
+                peaks.update(dict(ov.compute_peaks))
+            for fmt, val in peaks.items():
+                f_ms = float(val or 0.0) / 1000.0
+                if f_ms > cube_peaks_ms.get(str(fmt).lower(), 0.0):
+                    cube_peaks_ms[str(fmt).lower()] = f_ms
+            max_vec_ms = max(max_vec_ms, vec_s / 1000.0)
             max_hbm_ms = max(max_hbm_ms, max(hbm_s, hbm_r, hbm_w) / 1000.0)
             max_l2_bytes = max(max_l2_bytes, float(dict(getattr(die, "buffers", ()) or ()).get("l2", 0.0) or 0.0))
             if not custom_inv:
-                invs = dict(getattr(die, "kernel_invocations", ()) or ())
-                cube_invs.append(float(getattr(invs.get("cube"), "minimum_ms", 0.0) or 0.0))
-                vec_invs.append(float(getattr(invs.get("vector"), "minimum_ms", 0.0) or 0.0))
-        min_cube_inv = min(cube_invs, default=0.0) if (not custom_inv and len(cube_invs) == len(dies)) else 0.0
-        min_vec_inv = min(vec_invs, default=0.0) if (not custom_inv and len(vec_invs) == len(dies)) else 0.0
-        links = getattr(getattr(eff_case, "machine", None), "links", ()) or ()
+                invs_per_die.append({
+                    str(k): float(getattr(v, "minimum_ms", 0.0) or 0.0)
+                    for k, v in dict(getattr(die, "kernel_invocations", ()) or ()).items()
+                })
+        min_inv_by_class: dict[str, float] = {}
+        if not custom_inv and invs_per_die and len(invs_per_die) == len(dies):
+            shared_classes = set.intersection(*(set(m) for m in invs_per_die))
+            for cls in shared_classes:
+                min_inv_by_class[cls] = min(m[cls] for m in invs_per_die)
         per_rank_egress: dict[int, float] = {}
         min_link_lat_ms = math.inf
+        has_pos_cap = any(float(getattr(item, "capacity_bytes_per_ms", 0.0) or 0.0) > 0.0 for item in links)
         for lk in links:
             cap = float(getattr(lk, "capacity_bytes_per_ms", 0.0) or 0.0)
             lat_us = float(getattr(lk, "latency_us", 0.0) or 0.0)
-            if lat_us > 0.0:
-                min_link_lat_ms = min(min_link_lat_ms, lat_us / 1000.0)
+            if cap > 0.0 or not has_pos_cap:
+                min_link_lat_ms = min(min_link_lat_ms, max(0.0, lat_us) / 1000.0)
             members = tuple(getattr(lk, "members", ()) or ())
             sem = str(getattr(lk, "semantics", "") or "").lower()
             mult = max(1, len(members) - 1) if (sem == "per_pair" or not sem) and len(members) > 1 else 1
@@ -510,8 +538,128 @@ class _SLASizingRun:
         hop_lat_ms = 0.0 if not math.isfinite(min_link_lat_ms) else min_link_lat_ms
         return (
             max_hbm_ms, max_vec_ms, cube_peaks_ms, max(cube_peaks_ms.values(), default=0.0),
-            max_link_ms, hop_lat_ms, max_l2_bytes, min_cube_inv, min_vec_inv, links,
+            max_link_ms, hop_lat_ms, max_l2_bytes, min_inv_by_class, links,
         )
+
+    @staticmethod
+    def _op_floor_contribution(
+        op: Any,
+        *,
+        b: int,
+        inv_b: float,
+        phase: str,
+        context: int,
+        runtime_shared_prefix: bool,
+        caps: tuple[Any, ...],
+        attn_fams: frozenset[str],
+        non_kernel_fams: frozenset[str],
+        stage_wb: dict[int, float],
+        stage_gg: dict[int, float],
+        stage_kv: dict[int, float],
+        stage_cube: dict[int, float],
+        stage_vec: dict[int, float],
+        stage_link: dict[int, float],
+    ) -> tuple[float, float, bool]:
+        """Accumulate one op's stage work floors and return ``(a_op, c_op, used_gg)``."""
+        (
+            max_hbm_ms, max_vec_ms, cube_peaks_ms, max_cube_ms,
+            max_link_ms, hop_lat_ms, _max_l2_bytes, min_inv_by_class, _links,
+        ) = caps
+        min_cube_inv = min_inv_by_class.get("cube", 0.0)
+        min_vec_inv = min_inv_by_class.get("vector", 0.0)
+        st = int(getattr(op, "stage", 0) or 0)
+        sem = getattr(op, "semantic_shape", ()) or ()
+        loc = getattr(op, "local_shape", ()) or ()
+        sem_scale = (
+            min(1.0, float(sem[0]) / float(loc[0]))
+            if (sem and loc and float(loc[0]) > 0.0 and float(sem[0]) > 0.0)
+            else 1.0
+        )
+        md = dict(getattr(op, "metadata", ()) or ())
+        op_hbm = float(getattr(op, "hbm_bytes", 0.0) or 0.0)
+        wb = float(md.get("packed_weight_bytes") or md.get("weight_bytes") or 0.0)
+        fam = str(getattr(op, "family", "") or "")
+        if op_hbm > 0.0 and wb <= 0.0 and fam == "native_fusion":
+            phases = md.get("fusion_phases") or ()
+            if isinstance(phases, Sequence) and not isinstance(phases, (str, bytes)):
+                wb = sum(
+                    float(
+                        ph.get("packed_weight_bytes") or ph.get("weight_bytes")
+                        or dict(ph.get("metadata") or ()).get("packed_weight_bytes")
+                        or dict(ph.get("metadata") or ()).get("weight_bytes")
+                        or 0.0
+                    )
+                    for ph in phases if isinstance(ph, Mapping)
+                )
+        a_op, c_op, used_gg = 0.0, 0.0, False
+        if op_hbm > 0.0 and wb > 0.0:
+            w_eff = min(wb, op_hbm)
+            stage_wb[st] = stage_wb.get(st, 0.0) + w_eff
+            if max_hbm_ms > 0.0:
+                a_op = w_eff / max_hbm_ms
+        elif op_hbm > 0.0 and wb <= 0.0 and fam == "grouped_gemm":
+            gg_eff = op_hbm * sem_scale
+            stage_gg[st] = stage_gg.get(st, 0.0) + gg_eff
+            if max_hbm_ms > 0.0:
+                a_op = gg_eff / max_hbm_ms
+                used_gg = True
+        elif (op_hbm > 0.0 and wb <= 0.0 and phase == "decode"
+              and context > 0 and fam in attn_fams):
+            kv_b = min(float(md.get("kv_read_bytes") or op_hbm), op_hbm) * sem_scale
+            op_shared_prefix = (
+                runtime_shared_prefix
+                or str(md.get("prefix_cache_mode", "") or "").strip().lower() == "shared"
+            )
+            if op_shared_prefix:
+                stage_wb[st] = stage_wb.get(st, 0.0) + kv_b
+                if max_hbm_ms > 0.0:
+                    a_op = kv_b / max_hbm_ms
+            else:
+                stage_kv[st] = stage_kv.get(st, 0.0) + kv_b
+                if max_hbm_ms > 0.0:
+                    c_op = (kv_b / max_hbm_ms) * inv_b
+        mflops = getattr(op, "matrix_flops", ()) or ()
+        c_ms = 0.0
+        if mflops and max_cube_ms > 0.0:
+            c_ms = sum(
+                float(fl or 0.0) * sem_scale / cube_peaks_ms.get(str(fmt).lower(), max_cube_ms)
+                for fmt, fl in mflops
+                if float(fl or 0.0) > 0.0
+            )
+        else:
+            fl = float(getattr(op, "flops", 0.0) or 0.0)
+            if fl > 0.0 and max_cube_ms > 0.0:
+                fmt = str(md.get("compute_format") or getattr(op, "dtype", "") or "").lower()
+                c_ms = fl * sem_scale / cube_peaks_ms.get(fmt, max_cube_ms)
+        if c_ms > 0.0:
+            stage_cube[st] = stage_cube.get(st, 0.0) + c_ms
+            if c_ms > a_op + c_op * float(b):
+                a_op, c_op = 0.0, c_ms * inv_b
+        vops = float(getattr(op, "vector_ops", 0.0) or 0.0)
+        if vops > 0.0 and max_vec_ms > 0.0:
+            stage_vec[st] = stage_vec.get(st, 0.0) + (vops * sem_scale / max_vec_ms)
+        lbytes = float(getattr(op, "link_bytes", 0.0) or 0.0)
+        if lbytes > 0.0 and max_link_ms > 0.0:
+            # Full-duplex compulsory send volume across all incident peer links of a die.
+            compulsory_link_ms = (0.5 * lbytes * sem_scale) / max_link_ms
+            stage_link[st] = stage_link.get(st, 0.0) + compulsory_link_ms
+            if hop_lat_ms + compulsory_link_ms > a_op + c_op * float(b):
+                a_op, c_op = hop_lat_ms, compulsory_link_ms * inv_b
+        if (lbytes <= 0.0 and fam not in non_kernel_fams
+                and getattr(op, "coverage", "") != "pool_release"
+                and getattr(op, "source_boundary", "") != "host"
+                and md.get("service_boundary", "device_kernel") == "device_kernel"):
+            pe = md.get("program_execution")
+            exp_cls = md.get("invocation_class") or (pe.get("execution_class") if isinstance(pe, Mapping) else None)
+            if exp_cls and (c_ms > 0.0 or vops > 0.0 or op_hbm > 0.0 or getattr(op, "source_boundary", "") == "kernel"):
+                inv_min = min_inv_by_class.get(str(exp_cls), 0.0)
+            elif not exp_cls:
+                inv_min = max(min_cube_inv if c_ms > 0.0 else 0.0, min_vec_inv if vops > 0.0 else 0.0)
+            else:
+                inv_min = 0.0
+            if inv_min > a_op + c_op * float(b):
+                a_op, c_op = inv_min, 0.0
+        return a_op, c_op, used_gg
 
     def _work_floor_rays(
         self, s_key: tuple[float, ...], b: int, step_ms: float,
@@ -527,10 +675,12 @@ class _SLASizingRun:
         dies = getattr(getattr(eff_case, "machine", None), "dies", ()) or ()
         if not ops_0 or not dies:
             return ()
-        (
-            max_hbm_ms, max_vec_ms, cube_peaks_ms, max_cube_ms,
-            max_link_ms, hop_lat_ms, max_l2_bytes, min_cube_inv, min_vec_inv, _links,
-        ) = self._hardware_floor_caps(eff_case)
+        caps = self.floor_caps_cache.get(s_key)
+        if caps is None:
+            caps = self._hardware_floor_caps(eff_case, self.get_eval_context(s_key))
+            self.floor_caps_cache[s_key] = caps
+        max_hbm_ms = caps[0]
+        max_l2_bytes = caps[6]
         stage_wb: dict[int, float] = {}
         stage_gg: dict[int, float] = {}
         stage_kv: dict[int, float] = {}
@@ -540,76 +690,22 @@ class _SLASizingRun:
         dp_val: dict[str, float] = {}
         dp_ray: dict[str, tuple[float, float]] = {}
         dag_used_gg = False
-        attn_fams = {"attention", "mla_attention", "indexed_attention", "paged_mla_attention"}
-        non_kernel_fams = {"collective", "barrier", "token_commit", "prefetch", "pool_release"}
+        attn_fams = frozenset({"attention", "mla_attention", "indexed_attention", "paged_mla_attention"})
+        non_kernel_fams = frozenset({"collective", "barrier", "token_commit", "prefetch", "pool_release"})
+        runtime_shared_prefix = (
+            str(getattr(eff_case.runtime, "prefix_cache_mode", "") or "").strip().lower() == "shared"
+        )
         inv_b = 1.0 / float(b)
         for op in ops_0:
-            st = int(getattr(op, "stage", 0) or 0)
-            sem = getattr(op, "semantic_shape", ()) or ()
-            loc = getattr(op, "local_shape", ()) or ()
-            sem_scale = (
-                min(1.0, float(sem[0]) / float(loc[0]))
-                if (sem and loc and float(loc[0]) > 0.0 and float(sem[0]) > 0.0)
-                else 1.0
+            a_op, c_op, used_gg = self._op_floor_contribution(
+                op, b=b, inv_b=inv_b, phase=self.phase, context=self.context,
+                runtime_shared_prefix=runtime_shared_prefix, caps=caps,
+                attn_fams=attn_fams, non_kernel_fams=non_kernel_fams,
+                stage_wb=stage_wb, stage_gg=stage_gg, stage_kv=stage_kv,
+                stage_cube=stage_cube, stage_vec=stage_vec, stage_link=stage_link,
             )
-            md = dict(getattr(op, "metadata", ()) or ())
-            op_hbm = float(getattr(op, "hbm_bytes", 0.0) or 0.0)
-            wb = float(md.get("packed_weight_bytes") or md.get("weight_bytes") or 0.0)
-            fam = str(getattr(op, "family", "") or "")
-            a_op, c_op = 0.0, 0.0
-            if op_hbm > 0.0 and wb > 0.0:
-                w_eff = min(wb, op_hbm)
-                stage_wb[st] = stage_wb.get(st, 0.0) + w_eff
-                if max_hbm_ms > 0.0:
-                    a_op = w_eff / max_hbm_ms
-            elif op_hbm > 0.0 and wb <= 0.0 and fam == "grouped_gemm":
-                gg_eff = op_hbm * sem_scale
-                stage_gg[st] = stage_gg.get(st, 0.0) + gg_eff
-                if max_hbm_ms > 0.0:
-                    a_op = gg_eff / max_hbm_ms
-                    dag_used_gg = True
-            elif (op_hbm > 0.0 and wb <= 0.0 and self.phase == "decode"
-                  and self.context > 0 and fam in attn_fams):
-                kv_b = min(float(md.get("kv_read_bytes") or op_hbm), op_hbm) * sem_scale
-                stage_kv[st] = stage_kv.get(st, 0.0) + kv_b
-                if max_hbm_ms > 0.0:
-                    c_op = (kv_b / max_hbm_ms) * inv_b
-            mflops = getattr(op, "matrix_flops", ()) or ()
-            c_ms = 0.0
-            if mflops and max_cube_ms > 0.0:
-                c_ms = sum(
-                    float(fl or 0.0) * sem_scale / cube_peaks_ms.get(str(fmt).lower(), max_cube_ms)
-                    for fmt, fl in mflops
-                    if float(fl or 0.0) > 0.0
-                )
-            else:
-                fl = float(getattr(op, "flops", 0.0) or 0.0)
-                if fl > 0.0 and max_cube_ms > 0.0:
-                    fmt = str(md.get("compute_format") or getattr(op, "dtype", "") or "").lower()
-                    c_ms = fl * sem_scale / cube_peaks_ms.get(fmt, max_cube_ms)
-            if c_ms > 0.0:
-                stage_cube[st] = stage_cube.get(st, 0.0) + c_ms
-                if c_ms > a_op + c_op * float(b):
-                    a_op, c_op = 0.0, c_ms * inv_b
-            vops = float(getattr(op, "vector_ops", 0.0) or 0.0)
-            if vops > 0.0 and max_vec_ms > 0.0:
-                stage_vec[st] = stage_vec.get(st, 0.0) + (vops * sem_scale / max_vec_ms)
-            lbytes = float(getattr(op, "link_bytes", 0.0) or 0.0)
-            if lbytes > 0.0 and max_link_ms > 0.0:
-                # Full-duplex compulsory send volume across all incident peer links of a die.
-                compulsory_link_ms = (0.5 * lbytes * sem_scale) / max_link_ms
-                stage_link[st] = stage_link.get(st, 0.0) + compulsory_link_ms
-                if hop_lat_ms + compulsory_link_ms > a_op + c_op * float(b):
-                    a_op, c_op = hop_lat_ms, compulsory_link_ms * inv_b
-            if (lbytes <= 0.0 and fam not in non_kernel_fams
-                    and getattr(op, "coverage", "") != "pool_release"
-                    and getattr(op, "source_boundary", "") != "host"
-                    and not md.get("invocation_class")
-                    and not (isinstance(md.get("program_execution"), Mapping)
-                             and md["program_execution"].get("execution_class"))):
-                inv_min = min_cube_inv if c_ms > 0.0 else (min_vec_inv if vops > 0.0 else 0.0)
-                if inv_min > a_op + c_op * float(b):
-                    a_op, c_op = inv_min, 0.0
+            if used_gg:
+                dag_used_gg = True
             best_v, best_r = 0.0, (0.0, 0.0)
             for dep in getattr(op, "deps", ()) or ():
                 dv = dp_val.get(dep, 0.0)
@@ -792,8 +888,12 @@ class _SLASizingRun:
 
         def _interval_ub(lo_i: int, hi_i: int) -> float:
             b_top = hi_i - 1
-            rays = rays_map.get(lo_i, ())
-            fl_top = self._eval_rays(rays, b_top) if rays else floors.get(lo_i, 0.0)
+            fl_top = floors.get(lo_i, 0.0)
+            for b_e, rays_e in rays_map.items():
+                if b_e <= lo_i and rays_e:
+                    val_e = self._eval_rays(rays_e, b_top)
+                    if val_e > fl_top:
+                        fl_top = val_e
             return math.inf if fl_top <= 0.0 else float(b_top) / fl_top
 
         def _is_dominated(lo_i: int, hi_i: int) -> bool:

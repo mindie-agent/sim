@@ -111,8 +111,9 @@ def _mode_rows(mode, *, evidence, intercept, slope):
 
 def _chain(condition, dtype="int8", **kw):
     return {"condition": condition, "status": "ok", "dtype": dtype, "ranks": 2, "experts": 64, "global_tokens": 512,
-            "chain_ms": 4.0, "legs_ms": {"dispatch": 1.0, "gate_up": 1.0, "swiglu_quant": 1.0,
-                                         "down": 1.0, "combine": 1.0}, **kw}
+            "chain_ms": 4.0, "paired_overlap_ms": 1.0,
+            "legs_ms": {"dispatch": 1.0, "gate_up": 1.0, "swiglu_quant": 1.0,
+                        "down": 1.0, "combine": 1.0}, **kw}
 
 def _comm_case(*, hardware=comm.A5_SKU, tp=8, dp=1, ep=8):
     raw = compose_case(TARGET_MODEL, hardware=hardware, tp=tp, dp=dp, ep=ep,

@@ -219,6 +219,7 @@ def _extract_subgraph_contract(declaration, ordered_nodes) -> dict:
     )
     out_raw = _first_present(
         view.get("output_dtype"), declaration.get("output_dtype"), impl.get("output_dtype"),
+        view.get("dtype") if role == "router_selection" else None,
         last_meta.get("output_format"), last_meta.get("output_dtype"),
         node_ops[-1].get("dtype") if node_ops else None,
         in_raw,
@@ -274,16 +275,24 @@ def _extract_subgraph_contract(declaration, ordered_nodes) -> dict:
         view.get("tokens"), shape0[0] if len(shape0) >= 2 else None,
     )
     in_w_raw = _first_present(
-        view.get("input_width"), view.get("hidden"), view.get("width"),
+        view.get("input_width"), view.get("hidden"), view.get("experts"), view.get("width"),
         shape0[-1] if len(shape0) >= 2 else None,
     )
     out_w_raw = _first_present(
-        view.get("intermediate_width"), view.get("output_width"), in_w_raw,
+        view.get("intermediate_width"), view.get("output_width"),
+        view.get("topk"), view.get("top_k"), in_w_raw,
     )
     rows = int(rows_raw) if rows_raw is not None else _SUBGRAPH_DEFAULT_ROWS
     in_w = int(in_w_raw) if in_w_raw is not None else _SUBGRAPH_DEFAULT_DIM
     out_w = int(out_w_raw) if out_w_raw is not None else in_w
-    experts = max(1, int(_first_present(view.get("local_experts"), first_meta.get("local_experts"), 1)))
+    experts = max(1, int(_first_present(
+        view.get("experts"), view.get("local_experts"),
+        first_meta.get("experts"), first_meta.get("local_experts"), 1,
+    )))
+    top_k = max(0, int(_first_present(
+        view.get("topk"), view.get("top_k"),
+        first_meta.get("topk"), first_meta.get("top_k"), 0,
+    )))
     world_size = max(1, int(_first_present(
         view.get("world_size"), declaration.get("world_size"),
         first_meta.get("world_size"), 1,
@@ -299,7 +308,7 @@ def _extract_subgraph_contract(declaration, ordered_nodes) -> dict:
         "wt_qmode": wt_qmode, "wt_grp": wt_grp, "wt_sc": wt_sc,
         "out_scale": out_scale,
         "act_kind": act_kind, "has_bias": has_bias,
-        "rows": rows, "in_w": in_w, "out_w": out_w, "experts": experts,
+        "rows": rows, "in_w": in_w, "out_w": out_w, "experts": experts, "top_k": top_k,
         "world_size": world_size,
         "rank_placement": str(_first_present(
             view.get("rank_placement"), declaration.get("rank_placement"), "local",
@@ -362,10 +371,13 @@ def _build_subgraph_abi_query(entry, target_arch: str, contract: dict) -> AbiQue
             quant_mode=qm, group_shape=grp, scale_dtype=sc, scale_shape=sc_shape,
         ))
     outputs: list[OperandPortSig] = []
+    has_y_out = any(_parse_port_template(tok)[0].lower() == "y" for tok in out_template)
     for token in out_template:
         role, tpl_dt, tpl_lay, _, _, _ = _parse_port_template(token)
         low_role = role.lower()
-        if low_role in _SUBGRAPH_PRIMARY_OUT_ROLES:
+        if low_role == "softmax_result" or (low_role == "out" and has_y_out):
+            dt, lay, shape = tpl_dt, tpl_lay, (rows, in_w)
+        elif low_role in _SUBGRAPH_PRIMARY_OUT_ROLES:
             dt = contract["out_dt"] or tpl_dt
             lay = str(contract["out_layout"] or tpl_lay or "ND")
             shape = (rows, out_w)
@@ -408,7 +420,7 @@ def _build_subgraph_abi_query(entry, target_arch: str, contract: dict) -> AbiQue
         has_active_mask=False,
         dispatch_quant_mode=0,
         shared_experts_per_rank=0,
-        top_k=0,
+        top_k=contract["top_k"],
         moe_expert_num=contract["experts"],
         qk_rope_head_dim=0,
         mla_variant="none",

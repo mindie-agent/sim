@@ -840,6 +840,31 @@ def _chain_stage_durations_ms(chain: Mapping) -> tuple[float, float, float]:
 _MIN_CHAIN_SPAN_MS = 1e-12
 
 
+def _paired_chain_overlap_ms(chain: Mapping) -> tuple[float, str]:
+    """Return ``(verified_overlap_ms, overlap_basis)`` from paired run evidence only."""
+    explicit = chain.get("paired_overlap_ms", chain.get("observed_overlap_ms"))
+    if explicit is not None:
+        return max(0.0, float(explicit)), "paired_observation"
+    paired_runs = chain.get("paired_runs")
+    if paired_runs:
+        overlaps: list[float] = []
+        for run in paired_runs:
+            if isinstance(run, Mapping):
+                run_legs = run.get("legs_ms") or {}
+                run_span = float(run.get("chain_ms", run.get("span_ms", 0.0)) or 0.0)
+                run_sum = sum(float(v) for v in run_legs.values()) if isinstance(run_legs, Mapping) else sum(float(v) for v in run_legs)
+            elif isinstance(run, (tuple, list)) and len(run) >= 2:
+                run_sum = sum(float(v) for v in run[:-1])
+                run_span = float(run[-1])
+            else:
+                continue
+            if run_span > 0.0 and run_sum > 0.0:
+                overlaps.append(max(0.0, run_sum - run_span))
+        if overlaps:
+            return float(median(overlaps)), "paired_runs"
+    return 0.0, "unpaired_medians_overlap_unidentified"
+
+
 def evaluate_a5_mc2_chains(ingested=None):
     """Evaluate MC2 chain overlap and Engine + Topology + DirectPeerCollective contention."""
     data = _data_for(ingested)
@@ -852,7 +877,8 @@ def evaluate_a5_mc2_chains(ingested=None):
         if not math.isfinite(sum_ms) or sum_ms <= 0.0:
             raise ModelingError(f"a5_mc2_chain_nonpositive_sum:{chain.get('condition')}")
         ratio = chain_ms / sum_ms
-        observed_overlap_ms = max(0.0, sum_ms - chain_ms)
+        median_sum_gap_ms = max(0.0, sum_ms - chain_ms)
+        observed_overlap_ms, overlap_basis = _paired_chain_overlap_ms(chain)
         if any(key in chain for key in ("observed_expansion_mode",
                                         "requested_expansion_mode",
                                         "profiler_evidence")):
@@ -863,12 +889,8 @@ def evaluate_a5_mc2_chains(ingested=None):
         else:
             mode = _mode(chain.get("regime"))
         quant_ms, gmm_ms, comm_ms = _chain_stage_durations_ms(chain)
-        # Price contention strictly from shared-resource demand:
-        # - AIV vector contention exists only when AIV comm overlaps vector compute
-        #   (or explicit vector demand is supplied).
-        # - MTE/HBM contention is priced only when explicit shared MTE/HBM demand
-        #   is declared; when only leg medians & chain span exist, report observed
-        #   overlap without inventing HBM contention.
+        # Price contention strictly from verified paired overlap or explicit shared
+        # resource demand — never infer overlap/contention from unpaired medians.
         explicit_vec = chain.get("concurrent_vector_util", chain.get("shared_vector_util"))
         explicit_mte = chain.get("concurrent_mte_util", chain.get("shared_mte_util"))
         explicit_hbm = chain.get("concurrent_hbm_util", chain.get("shared_hbm_util"))
@@ -900,7 +922,9 @@ def evaluate_a5_mc2_chains(ingested=None):
             "sum_leg_p50_ms": sum_ms,
             "overlap_ratio": ratio,
             "chain_over_sum": ratio,
+            "median_sum_gap_ms": median_sum_gap_ms,
             "observed_overlap_ms": observed_overlap_ms,
+            "overlap_basis": overlap_basis,
             "expansion_regime": mode,
             "contention_basis": (
                 "shared_resource_demand" if has_shared_demand else "observed_overlap_only"

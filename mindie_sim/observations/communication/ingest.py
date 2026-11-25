@@ -522,7 +522,7 @@ def _chain_row(values, campaign, origin, default_dtype, default_observed,
     ep = values.get("ranks") or values.get("ep") or values.get("world_size") or 1
     rep = int(values.get("repeat_index")
               if values.get("repeat_index") is not None else default_repeat)
-    return _chain_record(
+    record = _chain_record(
         campaign, origin, dtype, int(ep), values.get("experts"),
         values.get("global_tokens"), normalized, float(chain_ms),
         values.get("condition") or values.get("chain_id") or campaign,
@@ -531,6 +531,15 @@ def _chain_row(values, campaign, origin, default_dtype, default_observed,
         values.get("profiler_evidence", default_evidence),
         run_id=values.get("run_id") or default_run_id, repeat_index=rep,
         chain_id=values.get("chain_id") or None)
+    for opt_key in (
+        "paired_overlap_ms", "observed_overlap_ms", "paired_runs",
+        "concurrent_vector_util", "shared_vector_util",
+        "concurrent_mte_util", "shared_mte_util",
+        "concurrent_hbm_util", "shared_hbm_util",
+    ):
+        if opt_key in values and values[opt_key] is not None:
+            record[opt_key] = values[opt_key]
+    return record
 
 
 def _chain_record(campaign, origin, dtype, ep, experts, tokens, legs, chain_ms,
@@ -966,7 +975,6 @@ def _extract_rank_id(rank_document, rank_origin: str, parent_origin: str) -> int
     return None
 
 
-_ANON_DEDUPE_DIGITS = 12
 _P2P_PAIR_RANKS = 2
 
 
@@ -1038,18 +1046,7 @@ def _parent_document(path, document):
             for rid in sorted(by_rank)
         ]
         if anonymous_rows:
-            seen_anon: list[float] = []
-            seen_keys: set[tuple] = set()
-            for sample in anonymous_rows:
-                anon_key = (
-                    round(float(sample["per_op_ms"]), _ANON_DEDUPE_DIGITS),
-                    sample.get("run_id"),
-                    sample.get("repeat_index"),
-                )
-                if anon_key not in seen_keys:
-                    seen_keys.add(anon_key)
-                    seen_anon.append(float(sample["per_op_ms"]))
-            per_rank_values.extend(seen_anon)
+            per_rank_values.extend(float(sample["per_op_ms"]) for sample in anonymous_rows)
         group = [row for _, row in tagged_group]
         med = median(per_rank_values)
         base = {k: v for k, v in group[0].items()

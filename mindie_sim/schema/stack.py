@@ -1613,7 +1613,6 @@ class RuntimeStackAdapter(Protocol):
 
 _DEFAULT_KV_BLOCK_SIZE = 128
 _MX_BLOCK_ELEMENTS = 32
-_MX_KV_SCALE_GROUP_SIZE = 64
 _MX_KV_SCALE_VALUES_PER_GROUP = 2
 _MX_KV_NZ_DIM_FRAG = 32
 _MX_K_SCALE_NZ_TOKEN_FRAG = 16
@@ -1834,11 +1833,25 @@ def _resolve_gqa_kv_planes(
         )
     if upper in {"QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL", "MXFP8", "FP8", "FP8_E4M3", "FP8_DYNAMIC"}:
         blk = max(1, int(kv_block_size or _DEFAULT_KV_BLOCK_SIZE))
+        k_groups = max(1, head_dim // _MX_BLOCK_ELEMENTS)
+        v_groups = max(1, blk // _MX_BLOCK_ELEMENTS)
         k_bytes = heads * blk * head_dim
-        ks_bytes = heads * blk * head_dim // _MX_BLOCK_ELEMENTS
+        ks_bytes = heads * blk * k_groups
         v_bytes = heads * blk * head_dim
-        vs_bytes = heads * blk * head_dim // _MX_BLOCK_ELEMENTS
+        vs_bytes = heads * head_dim * v_groups
         pitch = k_bytes + ks_bytes + v_bytes + vs_bytes
+        k_tok_frag = min(blk, _MX_K_SCALE_NZ_TOKEN_FRAG)
+        k_pair = (
+            _MX_KV_SCALE_VALUES_PER_GROUP
+            if (k_groups >= _MX_KV_SCALE_VALUES_PER_GROUP and k_groups % _MX_KV_SCALE_VALUES_PER_GROUP == 0)
+            else 1
+        )
+        v_dim_frag = min(head_dim, _MX_V_SCALE_NZ_DIM_FRAG)
+        v_pair = (
+            _MX_KV_SCALE_VALUES_PER_GROUP
+            if (v_groups >= _MX_KV_SCALE_VALUES_PER_GROUP and v_groups % _MX_KV_SCALE_VALUES_PER_GROUP == 0)
+            else 1
+        )
         return (
             CachePlaneABI(
                 plane_id="k_payload",
@@ -1859,13 +1872,13 @@ def _resolve_gqa_kv_planes(
                 plane_id="k_scale",
                 plane_kind="scale",
                 logical_axes=("head", "token", "group"),
-                logical_shape=(heads, blk, max(1, head_dim // _MX_BLOCK_ELEMENTS)),
+                logical_shape=(heads, blk, k_groups),
                 physical_shape=(
                     heads,
-                    max(1, blk // _MX_K_SCALE_NZ_TOKEN_FRAG),
-                    max(1, head_dim // _MX_KV_SCALE_GROUP_SIZE),
-                    _MX_K_SCALE_NZ_TOKEN_FRAG,
-                    _MX_KV_SCALE_VALUES_PER_GROUP,
+                    max(1, blk // k_tok_frag),
+                    max(1, k_groups // k_pair),
+                    k_tok_frag,
+                    k_pair,
                 ),
                 dtype="e8m0",
                 layout="PA_NZ",
@@ -1875,7 +1888,7 @@ def _resolve_gqa_kv_planes(
                 offset_in_page=k_bytes,
                 alignment=_MX_K_SCALE_NZ_TOKEN_FRAG,
                 page_pitch=pitch,
-                allocation_frequency="token",
+                allocation_frequency="page",
                 write_trigger="append",
                 bytes_per_unit=ks_bytes,
             ),
@@ -1898,13 +1911,13 @@ def _resolve_gqa_kv_planes(
                 plane_id="v_scale",
                 plane_kind="scale",
                 logical_axes=("head", "dim", "block_group"),
-                logical_shape=(heads, head_dim, max(1, blk // _MX_BLOCK_ELEMENTS)),
+                logical_shape=(heads, head_dim, v_groups),
                 physical_shape=(
                     heads,
-                    max(1, head_dim // _MX_V_SCALE_NZ_DIM_FRAG),
-                    max(1, blk // _MX_KV_SCALE_GROUP_SIZE),
-                    _MX_V_SCALE_NZ_DIM_FRAG,
-                    _MX_KV_SCALE_VALUES_PER_GROUP,
+                    max(1, head_dim // v_dim_frag),
+                    max(1, v_groups // v_pair),
+                    v_dim_frag,
+                    v_pair,
                 ),
                 dtype="e8m0",
                 layout="PA_NZ",
@@ -2080,14 +2093,15 @@ def _resolve_recurrent_cache_abi(
     shard_axis = "tp*pcp" if use_pcp else "tp"
     v_heads = max(1, int(plan.linear_value_heads or plan.linear_heads or 1))
     local_heads = max(1, v_heads // shard_div)
-    h_dim = max(1, int(plan.linear_head_dim or _DEFAULT_LINEAR_HEAD_DIM))
+    v_dim = max(1, int(plan.linear_head_dim or _DEFAULT_LINEAR_HEAD_DIM))
+    k_dim = max(1, int(plan.linear_key_head_dim or v_dim))
     rec_dtype = str(plan.recurrent_state_dtype or "fp32").lower()
-    rec_bytes = int(math.ceil(local_heads * h_dim * h_dim * dtype_bytes(rec_dtype)))
+    rec_bytes = int(math.ceil(local_heads * k_dim * v_dim * dtype_bytes(rec_dtype)))
 
     conv_k = max(_MIN_CONV_KERNEL_SIZE, int(plan.conv_kernel or _DEFAULT_CONV_KERNEL_SIZE))
     history_slots = conv_k - 1
     conv_w = int(plan.conv_width or (plan.conv_state_elements // max(1, history_slots)) or 0)
-    local_conv_w = max(1, conv_w // shard_div) if conv_w > 0 else max(1, local_heads * h_dim)
+    local_conv_w = max(1, conv_w // shard_div) if conv_w > 0 else max(1, local_heads * v_dim)
     conv_dtype = str(plan.conv_state_dtype or "bf16").lower()
     conv_bytes = int(math.ceil(local_conv_w * history_slots * dtype_bytes(conv_dtype)))
 
@@ -2101,8 +2115,8 @@ def _resolve_recurrent_cache_abi(
                 plane_id="recurrent_state",
                 plane_kind="payload",
                 logical_axes=("head", "k_dim", "v_dim"),
-                logical_shape=(local_heads, h_dim, h_dim),
-                physical_shape=(local_heads, h_dim, h_dim),
+                logical_shape=(local_heads, k_dim, v_dim),
+                physical_shape=(local_heads, k_dim, v_dim),
                 dtype=rec_dtype,
                 layout="ND",
                 allocation_frequency="request_slot",

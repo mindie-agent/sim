@@ -1176,6 +1176,7 @@ def _finalize_cohort_layer_deltas(
             "fp_after": fp_after,
             "l2_steady": l2_steady,
             "aligned": aligned,
+            "active_rep_count": len(rep_present),
             "serviced": serviced_delta,
             "busy_ms": busy_delta,
             "work": work_delta,
@@ -1189,10 +1190,11 @@ def _build_cohort_probe_observer(
     base_observer: Callable[..., None] | None,
     body_id_map: Mapping[str, Any],
     cohort_probe_order: Sequence[tuple[Any, Any | None]],
+    cohort_probe_sinks: Mapping[Any, frozenset[str]] | None = None,
 ) -> tuple[Callable[..., None], list[Any], dict[tuple[int, Any], dict[str, Any]], dict[Any, dict[str, Any]]]:
     """Wrap ``on_operator`` to snapshot L2 & work counters at exact layer exit boundaries."""
     probe_keys = {k for pair in cohort_probe_order for k in pair if k is not None}
-    ctx_ref: list[Any] = [None, None]
+    ctx_ref: list[Any] = [None, None, False]
     pending_rep: dict[tuple[int, Any], int] = {}
     pending_global: dict[Any, int] = {}
     replica_die_ids: dict[int, set[int]] = {}
@@ -1212,19 +1214,22 @@ def _build_cohort_probe_observer(
         die_set = replica_die_ids.setdefault(rep_i, set())
         if execution is not None and hasattr(execution, "topology"):
             die_set.update(int(d) for d in execution.topology.ranks(rep_i, int(op.stage)))
+        sink_ids = cohort_probe_sinks.get(lk) if cohort_probe_sinks is not None else None
+        if sink_ids is not None and op.op_id not in sink_ids:
+            return
         rk = (rep_i, lk)
         pending_rep[rk] = pending_rep.get(rk, 0) + 1
         pending_global[lk] = pending_global.get(lk, 0) + 1
 
         def _on_done(_ev, _rep_i=rep_i, _lk=lk, _rk=rk):
             pending_rep[_rk] -= 1
-            if pending_rep[_rk] == 0:
+            if pending_rep[_rk] == 0 and ctx_ref[2]:
                 replica_snaps[_rk] = {
                     "now": float(engine.now),
                     "die_l2_fp": _replica_l2_digest(engine, tuple(replica_die_ids.get(_rep_i, ()))),
                 }
             pending_global[_lk] -= 1
-            if pending_global[_lk] == 0:
+            if pending_global[_lk] == 0 and ctx_ref[2]:
                 global_snaps[_lk] = _capture_engine_snapshot(engine, execution)
 
         engine.on_complete(complete, _on_done, native_hook=True)
@@ -1235,7 +1240,7 @@ def _build_cohort_probe_observer(
 def _finalize_run_graph_artifacts(
     case, execution, engine, records, graphs, *, fast_span_only, timeline_replicas,
     cp_spans, non_observed_peer_events, group_for, replica_observer,
-    layer_events_by_replica, non_body_by_replica,
+    layer_events_by_replica, non_body_by_replica, tracked_by_replica,
     cohort_probe_order, replica_snaps, global_snaps, initial_snap,
     cohort_layer_deltas_out, filtered_non_barrier,
 ):
@@ -1251,12 +1256,19 @@ def _finalize_run_graph_artifacts(
             r0 = int(entry["canonical"])
             r0_layers = layer_events_by_replica.get(r0)
             r0_nb = non_body_by_replica.get(r0) if non_body_by_replica is not None else None
+            r0_tracked = (
+                {oid: pair for (rep_k, oid), pair in tracked_by_replica.items() if rep_k == r0}
+                if tracked_by_replica else {}
+            )
             for peer in entry["peers"]:
                 peer_i = int(peer)
                 if r0_layers is not None and peer_i not in layer_events_by_replica:
                     layer_events_by_replica[peer_i] = r0_layers
                 if non_body_by_replica is not None and r0_nb is not None and peer_i not in non_body_by_replica:
                     non_body_by_replica[peer_i] = r0_nb
+                if tracked_by_replica is not None and r0_tracked:
+                    for oid, pair in r0_tracked.items():
+                        tracked_by_replica.setdefault((peer_i, oid), pair)
     if cohort_probe_order and cohort_layer_deltas_out is not None:
         obs_reps = sorted({r for r, _ in replica_snaps})
         cohort_layer_deltas_out.update(_finalize_cohort_layer_deltas(
@@ -1302,9 +1314,11 @@ def _run_graph(
     isolated=False, group_for=None, fast_observer=None,
     l2_fingerprints: dict[str, str] | None = None,
     cohort_probe_order: Sequence[tuple[Any, Any | None]] = (),
+    cohort_probe_sinks: Mapping[Any, frozenset[str]] | None = None,
     body_id_map: Mapping[str, Any] | None = None,
     layer_events_by_replica: dict[int, dict[Any, list[tuple[int, Any, Any]]]] | None = None,
     non_body_by_replica: dict[int, list[tuple[Any, Any]]] | None = None,
+    tracked_by_replica: dict[tuple[int, str], tuple[Any, Any]] | None = None,
     cohort_layer_deltas_out: dict[Any, dict[str, Any]] | None = None,
 ):
     from .runtime.exposed_observer import ExposedObserver
@@ -1319,13 +1333,11 @@ def _run_graph(
     from .sharding.local_tp import local_tp_spans_dp
     ltp_spans = bool(local_tp_spans_dp(case.runtime.parallel))
     cp_spans = bool(case.runtime.parallel.cp_spans_dp)
-    cross_dp_axes = set()
-    if ep_spans:
-        cross_dp_axes.add("ep")
-    if ltp_spans:
-        cross_dp_axes.add("local_tp")
-    if cp_spans:
-        cross_dp_axes.update({"cp", "dcp_dp", "dcp_a2a"})
+    cross_dp_axes = (
+        ({"ep"} if ep_spans else set())
+        | ({"local_tp"} if ltp_spans else set())
+        | ({"cp", "dcp_dp", "dcp_a2a"} if cp_spans else set())
+    )
     non_observed_peer_events: list[tuple[Any, int, Any, str]] = []
 
     def observe(op, replica, program, ready, complete):
@@ -1382,7 +1394,7 @@ def _run_graph(
     global_snaps: dict[Any, dict[str, Any]] = {}
     if cohort_probe_order and body_id_map is not None:
         on_op, probe_ctx_ref, replica_snaps, global_snaps = _build_cohort_probe_observer(
-            on_op, body_id_map, cohort_probe_order,
+            on_op, body_id_map, cohort_probe_order, cohort_probe_sinks=cohort_probe_sinks,
         )
     execution = Execution(case, ctx.cost, recipes=book, bindings=ctx.bindings,
                           ledger=CostLedger(), include_submission=include_submission,
@@ -1424,6 +1436,8 @@ def _run_graph(
         implementation_selections=graph_selections(items),
     ) for r, items in graphs.items()}
     steps = _submit_graph_steps(execution, works, groups, input_ready_ms, inputs)
+    if probe_ctx_ref is not None:
+        probe_ctx_ref[2] = True
     unique_completions = tuple(dict.fromkeys(step.completion for step in steps.values()))
     engine.advance(until=unique_completions, first=False)
     if l2_fingerprints is not None:
@@ -1435,6 +1449,7 @@ def _run_graph(
         replica_observer=replica_observer,
         layer_events_by_replica=layer_events_by_replica,
         non_body_by_replica=non_body_by_replica,
+        tracked_by_replica=tracked_by_replica,
         cohort_probe_order=cohort_probe_order, replica_snaps=replica_snaps,
         global_snaps=global_snaps, initial_snap=initial_snap,
         cohort_layer_deltas_out=cohort_layer_deltas_out,
@@ -1946,6 +1961,7 @@ def _attach_cohort_graph_metadata(
     assembled, graphs, records, execution, body_id_map,
     l2_fingerprints, replica_bounds_map, replica_non_body_map,
     replica_complete_map, cohort_layer_deltas,
+    tracked_by_rep=None,
 ):
     if l2_fingerprints is not None:
         assembled["l2_residency_fingerprints"] = (
@@ -1956,6 +1972,17 @@ def _attach_cohort_graph_metadata(
         assembled["replica_layer_bounds"] = replica_bounds_map
         assembled["replica_non_body_bounds"] = replica_non_body_map or {}
         assembled["replica_complete_ms"] = replica_complete_map
+    if tracked_by_rep:
+        r0 = min(replica_bounds_map, default=0) if replica_bounds_map else min(graphs, default=0)
+        assembled["tracked_op_elapsed_ms"] = {
+            oid: float(c.time) - float(r.time)
+            for (rep_i, oid), (r, c) in tracked_by_rep.items()
+            if rep_i == r0
+        }
+        assembled["replica_tracked_op_elapsed_ms"] = {
+            (rep_i, oid): float(c.time) - float(r.time)
+            for (rep_i, oid), (r, c) in tracked_by_rep.items()
+        }
     if not cohort_layer_deltas:
         return assembled
     observed_reps = {record["replica"] for record in records if not record.get("_peer_only")}
@@ -1988,7 +2015,8 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
                 fast_span_only=False, stream_plans=None,
                 request_views=None, padded_tokens=0, sequence_layout="",
                 timeline_replicas=None, layer_span_body_ids=None,
-                fast_track_op_ids=(), cohort_probe_order=()):
+                fast_track_op_ids=(), cohort_probe_order=(),
+                cohort_probe_sinks=None):
     """Run a declared DAG or replica->DAG mapping without a request scheduler."""
     from .body_defaults import consume_target_declaration
     case = consume_target_declaration(parse_case(case), ops)
@@ -2029,9 +2057,11 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         group_for=group_for, fast_observer=fast_observer,
         l2_fingerprints=l2_fingerprints,
         cohort_probe_order=cohort_probe_order,
+        cohort_probe_sinks=cohort_probe_sinks,
         body_id_map=body_id_map,
         layer_events_by_replica=layer_events_by_rep,
         non_body_by_replica=non_body_by_rep,
+        tracked_by_replica=tracked_by_rep,
         cohort_layer_deltas_out=cohort_layer_deltas)
     end = max((step.completion.time for step in steps.values()), default=input_ready_ms)
     duration = end - input_ready_ms
@@ -2104,4 +2134,5 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         assembled, graphs, records, execution, body_id_map,
         l2_fingerprints, replica_bounds_map, replica_non_body_map,
         replica_complete_map, cohort_layer_deltas,
+        tracked_by_rep=tracked_by_rep,
     )

@@ -136,12 +136,15 @@ def _evaluate_sku(payload: Mapping[str, Any]) -> dict[str, Any]:
     case_dict = payload["case"]
     parsed = parse_case(case_dict)
     geometry = payload["geometry"]
+    from .prediction.evaluation import EvaluationContext
+    eval_ctx = EvaluationContext.create(parsed)
     effective = analyze_network_efficiency(
         parsed, phase=payload["phase"],
         tokens=geometry["query_tokens_per_sequence"],
         context=geometry["context"],
         sequences=geometry["sequences_per_dp"],
         scope=payload["scope"],
+        evaluation_context=eval_ctx,
     )
     sla = solve_sla_sizing(
         parsed, sla_ms=payload["sla_ms"], context=geometry["context"],
@@ -149,6 +152,7 @@ def _evaluate_sku(payload: Mapping[str, Any]) -> dict[str, Any]:
         max_sequences_per_dp=payload["max_batch"], phase=payload["phase"],
         scope=payload["scope"], scenarios=[payload["scenario"]],
         sensitivity=payload["sensitivity"], jobs=1, base_b_hint=1,
+        evaluation_context=eval_ctx,
     )
     return {
         "sku": payload["sku"],
