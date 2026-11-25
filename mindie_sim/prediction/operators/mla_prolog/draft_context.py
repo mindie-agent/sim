@@ -229,6 +229,51 @@ def _prolog_work(op, geometry=None):
     return Work(matrix, resources)
 
 
+def _prolog_cube_shares(context, meta: dict) -> tuple[float, float]:
+    """Rate-weighted ``(qkv_a, qb_wuk)`` Cube service shares from per-dtype matrix work."""
+    qa_raw = meta.get("qa_kva_matrix_flops")
+    qb_raw = meta.get("qb_wuk_matrix_flops")
+    if qa_raw is None or qb_raw is None:
+        op = context.op
+        raw_share = min(1.0, max(0.0, float(meta.get("qa_kva_cube_share", PROLOG_CUBE_SHARE))))
+        matrix_flops = tuple(getattr(op, "matrix_flops", ()) or ())
+        if len(matrix_flops) > 1:
+            by_dtype: dict[str, float] = {}
+            for dt, fl in matrix_flops:
+                if float(fl) > 0.0:
+                    by_dtype[str(dt)] = by_dtype.get(str(dt), 0.0) + float(fl)
+            total_fl = sum(by_dtype.values())
+            op_dt = str(getattr(op, "dtype", "") or "")
+            if total_fl > 0.0 and op_dt in by_dtype:
+                qa_fl = raw_share * total_fl
+                if qa_fl <= by_dtype[op_dt] + 1e-6:
+                    qa_raw = ((op_dt, qa_fl),)
+                    rem_same = max(0.0, by_dtype[op_dt] - qa_fl)
+                    qb_raw = tuple(
+                        (dt, rem_same if dt == op_dt else fl)
+                        for dt, fl in by_dtype.items()
+                        if (rem_same if dt == op_dt else fl) > 0.0
+                    )
+    if qa_raw is not None and qb_raw is not None:
+        qa_matrix = {str(dt): float(fl) for dt, fl in qa_raw if float(fl) > 0.0}
+        qb_matrix = {str(dt): float(fl) for dt, fl in qb_raw if float(fl) > 0.0}
+        dtypes = set(qa_matrix) | set(qb_matrix)
+        if len(dtypes) == 1:
+            qa_fl = sum(qa_matrix.values())
+            qb_fl = sum(qb_matrix.values())
+            total_fl = qa_fl + qb_fl
+            if total_fl > 0.0:
+                return qa_fl / total_fl, qb_fl / total_fl
+        elif len(dtypes) > 1 and "cube" in getattr(context, "resource_names", ()):
+            qa_svc = sum(context.bind(Work(matrix=qa_matrix)).values()) if qa_matrix else 0.0
+            qb_svc = sum(context.bind(Work(matrix=qb_matrix)).values()) if qb_matrix else 0.0
+            total_svc = qa_svc + qb_svc
+            if total_svc > 0.0:
+                return qa_svc / total_svc, qb_svc / total_svc
+    qa_share = min(1.0, max(0.0, float(meta.get("qa_kva_cube_share", PROLOG_CUBE_SHARE))))
+    return qa_share, max(0.0, PROLOG_CUBE_SHARE - qa_share)
+
+
 def _prolog_program(context):
     op = context.op
     meta = dict(getattr(op, "metadata", ()) or ())
@@ -239,8 +284,7 @@ def _prolog_program(context):
         fixpipe_hbm = max(0.0, 1.0 - read_hbm - mte3_hbm)
     else:
         read_hbm, fixpipe_hbm, mte3_hbm = 1.0, 0.0, 0.0
-    qa_kva_share = min(1.0, max(0.0, float(meta.get("qa_kva_cube_share", PROLOG_CUBE_SHARE))))
-    qb_uk_share = max(0.0, PROLOG_CUBE_SHARE - qa_kva_share)
+    qa_kva_share, qb_uk_share = _prolog_cube_shares(context, meta)
     pre_qb_vec_share = min(1.0, max(0.0, float(meta.get("pre_qb_vector_share", PROLOG_VECTOR_SHARE))))
     q_rope_vec_share = max(0.0, PROLOG_VECTOR_SHARE - pre_qb_vec_share)
     has_fixpipe = any(
@@ -474,9 +518,18 @@ def _build_prolog_v3_op(
     total_flops = qa_kva_flops + qb_flops + uk_flops
     if prolog_dtype == "bf16":
         matrix_flops = (("bf16", total_flops),) if total_flops else ()
+        qa_kva_matrix_flops = (("bf16", qa_kva_flops),) if qa_kva_flops else ()
+        qb_wuk_matrix_flops = (
+            (("bf16", qb_flops + uk_flops),) if (qb_flops + uk_flops) else ()
+        )
     else:
         matrix_flops = tuple(
             (dt, fl) for dt, fl in ((prolog_dtype, qa_kva_flops + qb_flops), ("bf16", uk_flops))
+            if fl
+        )
+        qa_kva_matrix_flops = ((prolog_dtype, qa_kva_flops),) if qa_kva_flops else ()
+        qb_wuk_matrix_flops = tuple(
+            (dt, fl) for dt, fl in ((prolog_dtype, qb_flops), ("bf16", uk_flops))
             if fl
         )
     if rows > 0:
@@ -540,6 +593,8 @@ def _build_prolog_v3_op(
                   ("prepared_heads", prepared_heads),
                   ("query_fixpipe_bytes", q_nope_out_bytes),
                   ("qa_kva_cube_share", qa_kva_cube_share),
+                  ("qa_kva_matrix_flops", qa_kva_matrix_flops),
+                  ("qb_wuk_matrix_flops", qb_wuk_matrix_flops),
                   ("pre_qb_vector_share", pre_qb_vec_share),
                   ("query_outputs_discarded", True),
                   ("direct_cache_write", not staging_scatter),

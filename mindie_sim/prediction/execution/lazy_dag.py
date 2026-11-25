@@ -25,9 +25,12 @@ import json
 from typing import Any
 
 from mindie_sim.schema.common import ModelingError
-from ..program import NativeProgram
+from ..program import KernelProgram, NativeProgram
+from ..program.invocation import _declared_launch_count
 from .context import _admission_l2_cache_key
 from .streams import _meta_patch
+
+INV_CELL_LAUNCHES_IDX = 4
 
 
 def live_stage_l2_state(execution, replica: int, stage: int):
@@ -45,16 +48,18 @@ def live_stage_l2_state(execution, replica: int, stage: int):
     return view, _admission_l2_cache_key(view, die_id)
 
 
-def undo_invocation_record(execution, inv_record) -> None:
+def undo_invocation_record(execution, inv_record, *, launch_count: int = 1) -> None:
     """Roll back one superseded invocation count by invocation record dict."""
-    if inv_record is not None:
+    launches = max(0, int(launch_count))
+    if inv_record is not None and launches > 0:
         inv_id = inv_record.get("id")
         if inv_id is not None:
             cost_invs = execution.cost.invocations
             rec = cost_invs.get(inv_id)
             if rec is not None and rec["invocations"] > 0:
-                if rec["invocations"] > 1:
-                    rec["invocations"] -= 1
+                remaining = rec["invocations"] - launches
+                if remaining > 0:
+                    rec["invocations"] = remaining
                 else:
                     rec["invocations"] = 0
                     cost_invs.pop(inv_id, None)
@@ -65,43 +70,166 @@ def undo_invocation_record(execution, inv_record) -> None:
 def undo_superseded_invocation(execution, inv_cell) -> None:
     """Roll back one speculative invocation count when L2 state supersedes a prep."""
     if inv_cell is not None:
-        cost_invs = execution.cost.invocations
-        rec = inv_cell[3] if inv_cell[2] is cost_invs else cost_invs.get(inv_cell[0])
-        if rec is not None and rec["invocations"] > 0:
-            if rec["invocations"] > 1:
-                rec["invocations"] -= 1
-            else:
-                rec["invocations"] = 0
-                cost_invs.pop(inv_cell[0], None)
-                if inv_cell[2] is cost_invs:
-                    inv_cell[3] = None
+        launches = (
+            max(0, int(inv_cell[INV_CELL_LAUNCHES_IDX]))
+            if len(inv_cell) > INV_CELL_LAUNCHES_IDX else 1
+        )
+        if launches > 0:
+            cost_invs = execution.cost.invocations
+            rec = inv_cell[3] if inv_cell[2] is cost_invs else cost_invs.get(inv_cell[0])
+            if rec is not None and rec["invocations"] > 0:
+                remaining = rec["invocations"] - launches
+                if remaining > 0:
+                    rec["invocations"] = remaining
+                else:
+                    rec["invocations"] = 0
+                    cost_invs.pop(inv_cell[0], None)
+                    if inv_cell[2] is cost_invs:
+                        inv_cell[3] = None
     if execution.cost.counts.get("analytic_work", 0) > 0:
         execution.cost.counts["analytic_work"] -= 1
+
+
+def _invocation_startup_ms(prog) -> float:
+    return max(
+        (prog.timing.startup_ms, *(c.startup_ms for c in prog.constraints)),
+        default=prog.timing.startup_ms,
+    )
+
+
+def _extract_boundary_stage_bodies(program, *, compact_exec: bool) -> dict[str, Any]:
+    """Map named boundary stages from a freshly lowered program to single-stage bodies."""
+    if not isinstance(program, KernelProgram):
+        return {}
+    stages = program.stages
+    if (len(stages) == 2 and stages[0].name == "setup"
+            and stages[1].name == "body" and isinstance(stages[1].program, KernelProgram)):
+        stages = stages[1].program.stages
+    coalesce = None
+    if compact_exec:
+        from ..program import coalesce_execution_program
+        coalesce = coalesce_execution_program
+    bodies: dict[str, Any] = {}
+    for stage in stages:
+        body = KernelProgram((replace(stage, after=()),))
+        bodies[stage.name] = coalesce(body) if coalesce is not None else body
+    return bodies
+
+
+def _wrap_boundary_startup_program(
+    program, *, execution, replica: int, scope: str, compact_exec: bool,
+    op, prev_res_op, inv_record, live_view, live_l2_key,
+    prepare_op_context=None, launch_count: int = 1,
+):
+    """Attach shared live L2 rebind resolvers to named multi-launch boundary stages."""
+    from ..program.invocation import InvocationProgram, _FloorJoinProgram
+
+    if isinstance(program, _FloorJoinProgram):
+        wrapped_inner = _wrap_boundary_startup_program(
+            program.body, execution=execution, replica=replica, scope=scope,
+            compact_exec=compact_exec, op=op, prev_res_op=prev_res_op,
+            inv_record=inv_record, live_view=live_view, live_l2_key=live_l2_key,
+            prepare_op_context=prepare_op_context, launch_count=launch_count,
+        )
+        return program if wrapped_inner is program.body else replace(program, body=wrapped_inner)
+    if not isinstance(program, KernelProgram):
+        return program
+    if (len(program.stages) == 2 and program.stages[0].name == "setup"
+            and program.stages[1].name == "body" and program.stages[1].program is not None):
+        wrapped_body = _wrap_boundary_startup_program(
+            program.stages[1].program, execution=execution, replica=replica, scope=scope,
+            compact_exec=compact_exec, op=op, prev_res_op=prev_res_op,
+            inv_record=inv_record, live_view=live_view, live_l2_key=live_l2_key,
+            prepare_op_context=prepare_op_context, launch_count=launch_count,
+        )
+        if wrapped_body is program.stages[1].program:
+            return program
+        return replace(program, stages=(program.stages[0], replace(program.stages[1], program=wrapped_body)))
+    if not any(
+        isinstance(st.program, InvocationProgram) and _invocation_startup_ms(st.program) > 0.0
+        for st in program.stages
+    ):
+        return program
+
+    state: dict[str, Any] = {
+        "view": live_view,
+        "key": live_l2_key,
+        "prev_res_op": prev_res_op,
+        "inv_record": inv_record,
+        "launch_count": launch_count,
+        "fresh_stages": None,
+    }
+
+    def _make_stage_resolver(stage_name: str, orig_body):
+        def resolve_stage_body():
+            cur_view, cur_l2_key = live_stage_l2_state(execution, replica, op.stage)
+            if cur_view is state["view"] and cur_l2_key == state["key"]:
+                fresh_map = state["fresh_stages"]
+                return fresh_map.get(stage_name, orig_body) if fresh_map is not None else orig_body
+            undo_invocation_record(execution, state["inv_record"], launch_count=state["launch_count"])
+            if prepare_op_context is not None:
+                cur_res_op, cur_recipe, cur_ctx = prepare_op_context(op)
+            else:
+                cur_res_op, cur_recipe = execution.prepare(op, replica)
+                cur_ctx = execution._context(cur_res_op, replica, scope, recipe=cur_recipe)
+            for key in execution.work:
+                delta = float(getattr(cur_res_op, key)) - float(getattr(state["prev_res_op"], key))
+                if delta != 0.0:
+                    execution.work[key] += delta
+            fresh = cur_recipe.lower(replace(cur_ctx, minimum_ms=0, invocation_timing=None))
+            fresh = execution._apply_resource_service_program(cur_ctx, fresh)
+            fresh = execution._apply_stream_owners_program(cur_ctx, fresh)
+            fresh_map = _extract_boundary_stage_bodies(fresh, compact_exec=compact_exec)
+            cur_inv = execution._last_invocation_record
+            state["view"] = cur_view
+            state["key"] = cur_l2_key
+            state["prev_res_op"] = cur_res_op
+            state["inv_record"] = cur_inv
+            state["launch_count"] = (
+                _declared_launch_count(cur_ctx.program_recipe or cur_recipe, cur_ctx)
+                if cur_inv is not None else 0
+            )
+            state["fresh_stages"] = fresh_map
+            return fresh_map.get(stage_name, orig_body)
+
+        return resolve_stage_body
+
+    new_stages = tuple(
+        replace(
+            st,
+            program=replace(st.program, body_resolver=_make_stage_resolver(st.name, st.program.body)),
+        )
+        if (isinstance(st.program, InvocationProgram) and _invocation_startup_ms(st.program) > 0.0)
+        else st
+        for st in program.stages
+    )
+    return replace(program, stages=new_stages)
 
 
 def _wrap_live_startup_program(
     program, *, execution, replica: int, scope: str, compact_exec: bool,
     op, prev_res_op, inv_record, live_view, live_l2_key,
-    prepare_op_context=None,
+    prepare_op_context=None, launch_count: int = 1,
 ):
     """Re-bind an InvocationProgram body after startup if live L2 state changed."""
     if live_view is None:
         return program
     from ..program.invocation import InvocationProgram
     if not isinstance(program, InvocationProgram):
-        return program
-    eff_startup = max(
-        (program.timing.startup_ms, *(c.startup_ms for c in program.constraints)),
-        default=program.timing.startup_ms,
-    )
-    if eff_startup <= 0.0:
+        return _wrap_boundary_startup_program(
+            program, execution=execution, replica=replica, scope=scope,
+            compact_exec=compact_exec, op=op, prev_res_op=prev_res_op,
+            inv_record=inv_record, live_view=live_view, live_l2_key=live_l2_key,
+            prepare_op_context=prepare_op_context, launch_count=launch_count,
+        )
+    if _invocation_startup_ms(program) <= 0.0:
         return program
 
     def resolve_body():
         cur_view, cur_l2_key = live_stage_l2_state(execution, replica, op.stage)
         if cur_view is live_view and cur_l2_key == live_l2_key:
             return program.body
-        undo_invocation_record(execution, inv_record)
+        undo_invocation_record(execution, inv_record, launch_count=launch_count)
         if prepare_op_context is not None:
             cur_res_op, cur_recipe, cur_ctx = prepare_op_context(op)
         else:
@@ -313,13 +441,17 @@ def _lower_and_start_uncached(
         if transport is None:
             return program.program.start(engine, name, ready_ev)
         return program.start(engine, name, ready_ev, transport=transport)
+    inv_launches = (
+        _declared_launch_count(ctx.program_recipe or recipe, ctx)
+        if inv_record is not None else 0
+    )
     program = _wrap_live_startup_program(
         program, execution=execution, replica=replica, scope=scope,
         compact_exec=compact_exec,
         op=cur_res_op if orig_op is None else orig_op,
         prev_res_op=cur_res_op, inv_record=inv_record,
         live_view=live_view, live_l2_key=live_l2_key,
-        prepare_op_context=prepare_op_context,
+        prepare_op_context=prepare_op_context, launch_count=inv_launches,
     )
     return program.start(engine, name, ready_ev, owner=owner)
 
@@ -351,6 +483,11 @@ def run_cached_bundle(execution, engine, replica, owner, compact_exec,
         )
     inv_cell = fast_entry[0][7]
     inv_rec = inv_cell[1] if inv_cell is not None else None
+    inv_launches = (
+        max(0, int(inv_cell[INV_CELL_LAUNCHES_IDX]))
+        if (inv_cell is not None and len(inv_cell) > INV_CELL_LAUNCHES_IDX)
+        else (1 if inv_cell is not None else 0)
+    )
     prog_bundle = fast_entry[1]
     if prog_bundle is not None:
         (program, mapped_entries, svc_calls,
@@ -394,7 +531,7 @@ def run_cached_bundle(execution, engine, replica, owner, compact_exec,
             program, execution=execution, replica=replica, scope=scope,
             compact_exec=compact_exec, op=op, prev_res_op=res_op_tmpl,
             inv_record=inv_rec, live_view=live_view, live_l2_key=live_l2_key,
-            prepare_op_context=prepare_op_context,
+            prepare_op_context=prepare_op_context, launch_count=inv_launches,
         )
         return run_prog.start(engine, name, ready_ev, owner=owner)
 
@@ -464,6 +601,6 @@ def run_cached_bundle(execution, engine, replica, owner, compact_exec,
         program, execution=execution, replica=replica, scope=scope,
         compact_exec=compact_exec, op=op, prev_res_op=cur_res_op,
         inv_record=inv_rec, live_view=live_view, live_l2_key=live_l2_key,
-        prepare_op_context=prepare_op_context,
+        prepare_op_context=prepare_op_context, launch_count=inv_launches,
     )
     return run_prog.start(engine, name, ready_ev, owner=owner)

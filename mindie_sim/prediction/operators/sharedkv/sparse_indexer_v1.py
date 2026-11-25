@@ -44,6 +44,7 @@ from ..sparse_indexer.common import (
     PAIR_BYTES,
     SCORE_SLOTS,
     SparseIndexerContract,
+    _span_scanned_rows,
     request_contracts,
     unsupported,
 )
@@ -220,25 +221,39 @@ def _invalid_fill_program(
 
 def _request_q_kv(
     op: OpSpec, contract: SparseIndexerContract, ctx: OperatorPlanningContext | None = None,
-) -> tuple[tuple[int, int, bool], ...]:
-    if ctx is not None and ctx.requests:
+) -> tuple[tuple[int, int, bool, int], ...]:
+    if ctx is not None and (ctx.requests or contract.request_spans):
         out_req = tuple(
-            (rc.query_tokens, max(0, int(rc.scanned_rows)), rc.causal)
+            (rc.query_tokens, max(0, int(rc.scanned_rows)), rc.causal, max(0, int(rc.residual_tokens)))
             for rc in request_contracts(contract, ctx)
             if rc.query_tokens > 0
         )
         if out_req:
             return out_req
+    if contract.request_spans:
+        out_spans = tuple(
+            (q_len, max(0, int(scanned)), contract.causal, max(0, int(residual)))
+            for q_len, kv_len in contract.request_spans
+            if q_len > 0
+            for scanned, residual in (_span_scanned_rows(
+                kv_len, contract.scanned_rows, contract.compress_ratio, contract.residual_tokens,
+            ),)
+        )
+        if out_spans:
+            return out_spans
     q_base, q_rem = divmod(contract.query_tokens, contract.batch_size)
     raw_kv = dict(op.metadata).get("kv_lens")
     if isinstance(raw_kv, (list, tuple)) and len(raw_kv) == contract.batch_size:
         return tuple(
-            (q_len, max(0, int(kv)), contract.causal)
+            (q_len, max(0, int(scanned)), contract.causal, max(0, int(residual)))
             for req_i, kv in enumerate(raw_kv)
             if (q_len := q_base + (1 if req_i < q_rem else 0)) > 0
+            for scanned, residual in (_span_scanned_rows(
+                int(kv), contract.scanned_rows, contract.compress_ratio, contract.residual_tokens,
+            ),)
         )
     return tuple(
-        (q_len, max(0, int(contract.scanned_rows)), contract.causal)
+        (q_len, max(0, int(contract.scanned_rows)), contract.causal, max(0, int(contract.residual_tokens)))
         for req_i in range(contract.batch_size)
         if (q_len := q_base + (1 if req_i < q_rem else 0)) > 0
     )
@@ -252,7 +267,9 @@ def _query_groups(
     ctx: OperatorPlanningContext | None = None,
 ) -> tuple[_QueryGroup, ...]:
     groups: list[_QueryGroup] = []
-    for req_q, req_kv, req_causal in _request_q_kv(op, contract, ctx):
+    step = max(1, int(contract.compress_ratio))
+    for req_q, req_kv, req_causal, req_residual in _request_q_kv(op, contract, ctx):
+        total_orig = req_kv * step + req_residual
         for s1_offset in range(0, req_q, s1_base):
             q_rows = min(s1_base, req_q - s1_offset)
             if req_kv <= 0:
@@ -261,11 +278,20 @@ def _query_groups(
                 groups.append(_QueryGroup(q_rows, req_kv, (req_kv,) * q_rows, req_q))
             else:
                 # lightning_indexer_v2_kernel_base_arch35.h:39-55 & kernel_arch22.h:244-256
-                group_valid_s2 = min(req_kv, max(1, (req_kv - req_q) + s1_offset + s1_base))
-                s2_blocks = ceil_div(group_valid_s2, s2_tile)
+                group_end_orig = (total_orig - req_q) + s1_offset + s1_base
+                group_valid_s2 = (
+                    min(req_kv, max(1, group_end_orig))
+                    if step == 1
+                    else (min(req_kv, group_end_orig // step) if group_end_orig > 0 else 0)
+                )
+                s2_blocks = ceil_div(group_valid_s2, s2_tile) if group_valid_s2 > 0 else 0
                 loop_s2_rows = min(req_kv, s2_blocks * s2_tile)
                 row_valid = tuple(
-                    max(0, min(req_kv, (req_kv - req_q) + s1_offset + i + 1))
+                    (
+                        min(req_kv, end_orig // step)
+                        if (end_orig := (total_orig - req_q) + s1_offset + i + 1) > 0
+                        else 0
+                    )
                     for i in range(q_rows)
                 )
                 groups.append(_QueryGroup(q_rows, loop_s2_rows, row_valid, req_q))

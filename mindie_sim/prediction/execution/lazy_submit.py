@@ -32,7 +32,9 @@ from mindie_sim.schema.common import ModelingError
 from ..engine import Event
 from ..execution.state import memory_bindings_for
 from ..program import KernelProgram
+from ..program.invocation import _declared_launch_count
 from .lazy_dag import (
+    INV_CELL_LAUNCHES_IDX,
     _lower_and_start_uncached,
     build_verified_dag,
     collect_begin_after,
@@ -490,18 +492,24 @@ class _LazyFrontier:
                 if not same_step_op:
                     trans_opts[(scope_str, op.op_id, replica)] = transport_options
                 if inv_cell is not None:
-                    if (inv_cell[2] is cost_invs and inv_cell[3] is not None
-                            and inv_cell[3]["invocations"] > 0):
-                        inv_cell[3]["invocations"] += 1
-                    elif inv_cell[0] in cost_invs:
-                        li = cost_invs[inv_cell[0]]
-                        inv_cell[2] = cost_invs
-                        inv_cell[3] = li
-                        li["invocations"] += 1
-                    else:
-                        execution.cost.record_invocation(inv_cell[1])
-                        inv_cell[2] = cost_invs
-                        inv_cell[3] = cost_invs.get(inv_cell[0])
+                    launches = (
+                        max(0, int(inv_cell[INV_CELL_LAUNCHES_IDX]))
+                        if len(inv_cell) > INV_CELL_LAUNCHES_IDX else 1
+                    )
+                    if launches > 0:
+                        if (inv_cell[2] is cost_invs and inv_cell[3] is not None
+                                and inv_cell[3]["invocations"] > 0):
+                            inv_cell[3]["invocations"] += launches
+                        elif inv_cell[0] in cost_invs:
+                            li = cost_invs[inv_cell[0]]
+                            inv_cell[2] = cost_invs
+                            inv_cell[3] = li
+                            li["invocations"] += launches
+                        else:
+                            for _ in range(launches):
+                                execution.cost.record_invocation(inv_cell[1])
+                            inv_cell[2] = cost_invs
+                            inv_cell[3] = cost_invs.get(inv_cell[0])
                 name = prefix_colon + op.op_id
                 return (entry, op, name, submit, None)
 
@@ -523,10 +531,14 @@ class _LazyFrontier:
             )
             transport_options = trans_opts[(scope_str, res_op.op_id, replica)]
             inv_record = execution._last_invocation_record
+            inv_launches = (
+                _declared_launch_count(context.program_recipe or recipe, context)
+                if inv_record is not None else 0
+            )
             inv_cell = (
                 [inv_record["id"], inv_record, cost_invs,
-                 cost_invs.get(inv_record["id"])]
-                if inv_record is not None else None
+                 cost_invs.get(inv_record["id"]), inv_launches]
+                if inv_record is not None and inv_launches > 0 else None
             )
             recipe_name = res_op.recipe or type(recipe).__name__
             obs_prog_name = (
@@ -768,7 +780,11 @@ class _LazyFrontier:
             cur_inv_rec = prep_inv_rec
             cur_view, cur_l2_key = live_stage_l2_state(execution, replica, op.stage)
             if cur_view is not prep_view or cur_l2_key != prep_l2_key:
-                undo_invocation_record(execution, prep_inv_rec)
+                prep_launches = (
+                    _declared_launch_count(context.program_recipe or recipe, context)
+                    if prep_inv_rec is not None else 0
+                )
+                undo_invocation_record(execution, prep_inv_rec, launch_count=prep_launches)
                 cur_res_op, cur_recipe, cur_ctx = self._prepare_op_context(op)
                 cur_inv_rec = execution._last_invocation_record
                 for key in exec_work:
@@ -859,7 +875,11 @@ class _LazyFrontier:
             )
         else:
             if live_view is not None and (live_view is not prep_view or live_l2_key != prep_l2_key):
-                undo_invocation_record(execution, prep_inv_rec)
+                prep_launches = (
+                    _declared_launch_count(context.program_recipe or recipe, context)
+                    if prep_inv_rec is not None else 0
+                )
+                undo_invocation_record(execution, prep_inv_rec, launch_count=prep_launches)
                 res_op, recipe, context = self._prepare_op_context(op)
             if observer is None:
                 ready = None
