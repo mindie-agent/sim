@@ -11,13 +11,31 @@ from dataclasses import dataclass
 from functools import lru_cache
 from itertools import groupby
 from types import MappingProxyType
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import Work
 from .mxfp4_registers import (
     B8_BITWISE_OPS_PER_ELEMENT, CLASSES, TRANSPOSE_INDEX_BYTES, transpose, widen,
 )
 from mindie_sim.prediction.instructions import InstructionInventory
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul/op_host/op_tiling/arch35/grouped_weight_quant_batch_matmul_tiling.cpp",
+        source_sha256="82955b2ada5947e89e62c6f52383f9b4eb391bb00213431c383224fa03b05789",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/weight_quant_basic_block.h",
+        source_sha256="0751980abfbea9c3dbf0a414509d51cbb22c20e4d1db535c9c7999518c959d08",
+    ),
+)
 
 NZ_N_GRANULE = 32
 N_TILE_COLUMNS = 256
@@ -154,13 +172,19 @@ L2_EFFECTIVE_FRACTION = 0.75
 
 
 def effective_l2_bytes(geometry):
-    """Typed effective L2 capacity, or the declared profile fallback."""
+    """Typed effective L2 capacity bounded by live AdmissionMemoryView headroom."""
     mechanisms = getattr(geometry, "physical_mechanisms", None)
     hierarchy = getattr(mechanisms, "memory_hierarchy", None)
     if hierarchy is not None:
-        return float(hierarchy.effective_l2_bytes)
-    buffers = getattr(geometry, "buffers", {}) or {}
-    return L2_EFFECTIVE_FRACTION * float(buffers.get("l2", 0))
+        base = float(hierarchy.effective_l2_bytes)
+    else:
+        buffers = getattr(geometry, "buffers", {}) or {}
+        base = L2_EFFECTIVE_FRACTION * float(buffers.get("l2", 0))
+    view = getattr(geometry, "admission_memory_view", None)
+    if view is not None:
+        die = int(getattr(geometry, "rank", None) or 0)
+        return min(base, float(view.effective_l2_bytes(die)))
+    return base
 
 
 def activation_bank_bytes(config):

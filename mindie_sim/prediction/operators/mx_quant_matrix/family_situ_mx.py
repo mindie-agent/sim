@@ -14,21 +14,44 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Mapping
+from typing import Literal, Mapping
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
+from mindie_sim.prediction.operators.matrix.matrix_mapping_owners import is_arch35_context
 from mindie_sim.prediction.ownership import read_role, unit_group
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 PROFILE = "situ_mx_quant_arch35"
 RECIPE = PROFILE
 ROLE = "situ_quant"
 SOURCE_REVISION = "175ef4d49c2072f9233619636f0309f4f88b4e2c"
 SOURCE_STATE = "added_in_index"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="csrc/moe/situ_mx_quant/op_host/arch35/situ_mx_quant_tiling_arch35.cpp",
+        source_sha256="a2c44c27ef9f4230b7bb558c31976b920bff12f278cdb4f7909d97486e2c6582",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="csrc/moe/situ_mx_quant/op_kernel/arch35/situ_mx_quant_axis_last.h",
+        source_sha256="056cde7fddf2a03b02e869850cb9f5cf3de3591b445ff95786def3783f08c95a",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="csrc/moe/situ_mx_quant/op_host/situ_mx_quant_def.cpp",
+        source_sha256="c4c9e30dd13cf759fc036b188360cb022e167ac209eeb5f86a020256e7d07367",
+    ),
+)
 SOURCE = {
     "repository": "vllm-ascend",
     "base_revision": SOURCE_REVISION,
@@ -375,6 +398,8 @@ def _known(config, view=None):
 
 def build(op, geometry):
     """Bind the complete source call to actual device UB and AIV geometry."""
+    if not is_arch35_context(geometry):
+        raise ModelingError("situ_mx_quant_requires_arch35_device")
     metadata = dict(op.metadata)
     raw = metadata.get("fusion_situ_config")
     if raw is None:

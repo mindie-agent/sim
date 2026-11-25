@@ -12,14 +12,35 @@ No BF16 workspace, no supply-only elapsed, no second kernel IR.
 from collections import Counter
 from dataclasses import dataclass, replace
 from math import ceil
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
-from .mxfp4_geometry import CUBE_MN_FRACTAL, Config as GeoConfig, panel_sizes, panel_work
+from .mxfp4_geometry import (
+    CUBE_MN_FRACTAL, MX_SCALE_GROUP, MX_SCALE_PUBLISH_K, Config as GeoConfig,
+    activation_scale_bytes, align, panel_sizes, panel_work,
+)
 from mindie_sim.prediction.operators.grouped_moe.gmmsq_quant_typed import work as gmmsq_widen_work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage, RecipeBook
-from mindie_sim.prediction.operators.grouped_moe import grouped_gemm
+from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, check_live_buffers
 from mindie_sim.prediction.operators.mx_quant_matrix import mxfp4_supply
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul_swiglu_quant_v2/op_kernel/arch35/weight_quant_basic_block/gmmsq_weight_quant_vcv_basic_block.h",
+        source_sha256="f5f482267ac8347fc6b4bc1805d2fe27fc299fdb3d6b1d3c337a6b14b5e65a24",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul_swiglu_quant_v2/op_kernel/arch35/weight_quant_basic_block/gmmsq_weight_quant_cube_compute.h",
+        source_sha256="cc915f8b7b639b4f41b49f36b84d4bf6d1b22d153ff8387e4a425f5ec1c6e863",
+    ),
+)
 FP32_BYTES = 4
 
 DEFAULT_L1_K = 256
@@ -86,6 +107,14 @@ def build(op, geometry):
             or cfg.k < SOURCE_K_ALIGNMENT or cfg.k % SOURCE_K_ALIGNMENT or cfg.l1_k < BASE_TILE_K
             or cfg.l1_k % BASE_TILE_K):
         raise ModelingError("mxfp4_gate_requires_integer_rows_N64_K64_L1K128")
+    check_live_buffers(
+        (
+            LiveBufferSpec("mxfp4_gate_ub", "ub", mxfp4_supply.UB_BYTES, 0, 1, owner_kind="aiv"),
+            LiveBufferSpec("mxfp4_gate_l1_span", "l1", mxfp4_supply.L1_FIXED_SLOT_SPAN_BYTES, 0, 1, owner_kind="aic"),
+        ),
+        geometry,
+        family=RECIPE,
+    )
     if not sum(cfg.rows):
         return OperatorPlan(Work(), lambda context: ParallelProgram(()), {
             "implementation": RECIPE, "source": SOURCE,
@@ -190,12 +219,116 @@ def build(op, geometry):
     })
 
 
+def _append_tile_stages(stages, ctx, stage, owner_id, tile_index, m, n, cfg, aiv, previous):
+    geo = GeoConfig(cfg.k, 2 * n, (m,))
+    kb, ka, _ = panel_sizes(m, 2 * n)
+    offsets = tuple(range(0, cfg.k, kb))
+    panel_prev = last_cube = current_a_read = current_ascale_read = previous
+    prev_a_free = prev_ascale_free = previous
+    active_a_alloc = active_ascale_alloc = None
+    for idx, offset in enumerate(offsets):
+        a_work, vectors, micros = panel_work(geo, m, 2 * n, offset)
+        a_scale_bytes = activation_scale_bytes(geo, m, offset)
+        a_payload_bytes = a_work - a_scale_bytes
+        if a_work:
+            a_acquire, a_deps = [], [panel_prev]
+            nz_rows = align(m, CUBE_MN_FRACTAL)
+            if a_payload_bytes:
+                a_l1_bytes = nz_rows * min(ka, cfg.k - offset)
+                active_a_alloc = ctx.allocate(
+                    f"gate_a_l1_{owner_id}_t{tile_index}_k{offset}",
+                    "l1", a_l1_bytes, (owner_id,))
+                a_acquire.append(active_a_alloc)
+                a_deps.append(prev_a_free)
+            if a_scale_bytes:
+                ascale_l1_bytes = nz_rows * (min(MX_SCALE_PUBLISH_K, cfg.k - offset) // MX_SCALE_GROUP)
+                active_ascale_alloc = ctx.allocate(
+                    f"gate_ascale_l1_{owner_id}_t{tile_index}_k{offset}",
+                    "l1", ascale_l1_bytes, (owner_id,))
+                a_acquire.append(active_ascale_alloc)
+                a_deps.append(prev_ascale_free)
+            a_stage = stage(
+                f"owner{owner_id}:t{tile_index}:k{offset}:a_read",
+                Work(resources={"hbm": a_work, "mte2_aic": a_work}),
+                owner_id,
+                after=tuple(dict.fromkeys(a_deps)),
+                acquire=tuple(a_acquire),
+            )
+            stages.append(a_stage)
+            if a_payload_bytes:
+                current_a_read = a_stage.name
+            if a_scale_bytes:
+                current_ascale_read = a_stage.name
+            panel_prev = a_stage.name
+        scale_total = sum(v["scale"] for v in vectors)
+        if scale_total:
+            sc = stage(f"owner{owner_id}:t{tile_index}:k{offset}:wscale",
+                       Work(resources={"hbm": scale_total,
+                                       "mte2_aic": scale_total}),
+                       owner_id, after=(panel_prev,))
+            stages.append(sc)
+            panel_prev = sc.name
+        publishes = []
+        for sub, vector in enumerate(vectors):
+            prefix = f"owner{owner_id}:t{tile_index}:k{offset}:s{sub}"
+            read = stage(prefix + ":read", Work(resources={
+                "hbm": vector["weight"],
+                "mte2_aiv": vector["weight"]}),
+                2 * owner_id + sub, aiv, after=(panel_prev,))
+            groups = vector["weight"] // WIDEN_PACKED_GROUP_BYTES
+            typed, _, _ = gmmsq_widen_work(groups)
+            widen_stage = stage(prefix + ":widen",
+                                typed, 2 * owner_id + sub, aiv,
+                                after=(prefix + ":read",))
+            publish = stage(prefix + ":publish",
+                            Work(resources={"mte3": vector["expanded"]}),
+                            2 * owner_id + sub, aiv,
+                            after=(prefix + ":widen",))
+            stages.extend((read, widen_stage, publish))
+            publishes.append(prefix + ":publish")
+        is_last_panel = idx + 1 == len(offsets)
+        next_offset = None if is_last_panel else offsets[idx + 1]
+        free_allocs = []
+        if active_a_alloc is not None and (is_last_panel or next_offset % ka == 0):
+            free_allocs.append(active_a_alloc)
+            active_a_alloc = None
+        if active_ascale_alloc is not None and (
+                is_last_panel or next_offset % MX_SCALE_PUBLISH_K == 0):
+            free_allocs.append(active_ascale_alloc)
+            active_ascale_alloc = None
+        load_deps = tuple(dict.fromkeys(
+            (*publishes, panel_prev, current_a_read, current_ascale_read)))
+        load = stage(f"owner{owner_id}:t{tile_index}:k{offset}:load",
+                     Work(resources={
+                         "mte1": sum(left + right for left, right, _ in micros)}),
+                     owner_id, after=load_deps, free=tuple(free_allocs))
+        stages.append(load)
+        if active_a_alloc is None:
+            prev_a_free = load.name
+        if active_ascale_alloc is None:
+            prev_ascale_free = load.name
+        for micro_index, (_, _, flops) in enumerate(micros):
+            cube = stage(
+                f"owner{owner_id}:t{tile_index}:k{offset}:c{micro_index}",
+                Work({"fp8_e4m3": flops}), owner_id,
+                after=tuple(dict.fromkeys((load.name, last_cube))))
+            stages.append(cube)
+            last_cube = cube.name
+        panel_prev = load.name
+    fix = stage(f"owner{owner_id}:t{tile_index}:fixpipe",
+                Work(resources={"fixpipe": 2 * (2 * ((m + 1) // 2)) * n * FP32_BYTES}),
+                owner_id, after=(last_cube,))
+    stages.append(fix)
+    return fix.name
+
+
 def _make_gate_up_program(owners, cfg, cores, aiv):
     def lower(ctx):
         def stage(name, work, owner, units=None, **kwargs):
             roles = set(work.resources) - {"hbm"} | ({"cube"} if work.matrix else set())
             return Stage(name, ctx.bind(work),
                          placement=ctx.owned(owner, units or cores, roles), **kwargs)
+
         def one(owner_id, items):
             if not items:
                 return KernelProgram(())
@@ -207,72 +340,14 @@ def _make_gate_up_program(owners, cfg, cores, aiv):
                                mxfp4_supply.UB_BYTES, (2 * owner_id + 1,))
             stages = [Stage(f"owner{owner_id}:reserve",
                             acquire=(allocation, ub0, ub1))]
-            a_total = 0
-            for _, m, n, _, _ in items:
-                geo = GeoConfig(cfg.k, 2 * n, (m,))
-                for offset in range(0, cfg.k, panel_sizes(m, 2 * n)[0]):
-                    a, _, _ = panel_work(geo, m, 2 * n, offset)
-                    a_total += a
-            a = stage(f"owner{owner_id}:a_read",
-                      Work(resources={"hbm": a_total, "mte2_aic": a_total}),
-                      owner_id)
-            stages.append(a)
-            previous = f"owner{owner_id}:a_read"
+            previous = f"owner{owner_id}:reserve"
             for tile_index, (_, m, n, _, _) in enumerate(items):
-                geo = GeoConfig(cfg.k, 2 * n, (m,))
-                kb, ka, micro = panel_sizes(m, 2 * n)
-                panel_prev = previous
-                last_cube = previous
-                for offset in range(0, cfg.k, kb):
-                    a_work, vectors, micros = panel_work(geo, m, 2 * n, offset)
-                    scale_total = sum(v["scale"] for v in vectors)
-                    if scale_total:
-                        sc = stage(f"owner{owner_id}:t{tile_index}:k{offset}:wscale",
-                                   Work(resources={"hbm": scale_total,
-                                                   "mte2_aic": scale_total}),
-                                   owner_id, after=(panel_prev,))
-                        stages.append(sc)
-                        panel_prev = sc.name
-                    publishes = []
-                    for sub, vector in enumerate(vectors):
-                        prefix = f"owner{owner_id}:t{tile_index}:k{offset}:s{sub}"
-                        read = stage(prefix + ":read", Work(resources={
-                            "hbm": vector["weight"],
-                            "mte2_aiv": vector["weight"]}),
-                            2 * owner_id + sub, aiv, after=(panel_prev,))
-                        groups = vector["weight"] // WIDEN_PACKED_GROUP_BYTES
-                        typed, _, _ = gmmsq_widen_work(groups)
-                        widen_stage = stage(prefix + ":widen",
-                                            typed, 2 * owner_id + sub, aiv,
-                                            after=(prefix + ":read",))
-                        publish = stage(prefix + ":publish",
-                                        Work(resources={"mte3": vector["expanded"]}),
-                                        2 * owner_id + sub, aiv,
-                                        after=(prefix + ":widen",))
-                        stages.extend((read, widen_stage, publish))
-                        publishes.append(prefix + ":publish")
-                    load = stage(f"owner{owner_id}:t{tile_index}:k{offset}:load",
-                                 Work(resources={
-                                     "mte1": sum(left + right for left, right, _ in micros)}),
-                                 owner_id, after=tuple(publishes + [panel_prev]))
-                    stages.append(load)
-                    for micro_index, (left, right, flops) in enumerate(micros):
-                        issued = flops
-                        cube = stage(
-                            f"owner{owner_id}:t{tile_index}:k{offset}:c{micro_index}",
-                            Work({"fp8_e4m3": issued}), owner_id,
-                            after=(load.name,))
-                        stages.append(cube)
-                        last_cube = cube.name
-                    panel_prev = load.name
-                fix = stage(f"owner{owner_id}:t{tile_index}:fixpipe",
-                            Work(resources={"fixpipe": 2 * (2 * ((m + 1) // 2)) * n * FP32_BYTES}),
-                            owner_id, after=(last_cube,))
-                stages.append(fix)
-                previous = fix.name
+                previous = _append_tile_stages(
+                    stages, ctx, stage, owner_id, tile_index, m, n, cfg, aiv, previous)
             stages.append(Stage(f"owner{owner_id}:release", after=(previous,),
                                 free=(allocation, ub0, ub1)))
             return KernelProgram(tuple(stages))
+
         return ParallelProgram(tuple(one(i, items)
                                      for i, items in enumerate(owners)))
 

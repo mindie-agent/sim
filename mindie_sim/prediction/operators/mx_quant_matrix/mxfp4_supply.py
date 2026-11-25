@@ -9,13 +9,38 @@
 [Side-Effect Policy] Build immutable programs; no capture, I/O or device access.
 """
 from dataclasses import dataclass
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.ownership import read_role
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage, RecipeBook
+from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, check_live_buffers
 from .mxfp4_geometry import MX_SCALE_GROUP, MX_SCALE_GROUP_PAIR
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="csrc/moe/grouped_matmul_situ_quant/op_host/grouped_matmul_situ_quant_tiling.cpp",
+        source_sha256="c7b5f964966744cf65b48e2d1c8c88377f6c151b5752d528865e7b0ba2007e76",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul_swiglu_quant_v2/op_kernel/arch35/weight_quant_basic_block/gmmsq_weight_quant_vcv_basic_block.h",
+        source_sha256="f5f482267ac8347fc6b4bc1805d2fe27fc299fdb3d6b1d3c337a6b14b5e65a24",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul_swiglu_quant_v2/op_kernel/arch35/weight_quant_basic_block/gmmsq_weight_quant_vec_compute.h",
+        source_sha256="84ea65cc99d9076d71b9f1d161ed1463de7f6e7016583802fcc9dfc46f6c1c28",
+    ),
+)
 
 OUTPUT_TILE_ALIGNMENT = 64
 DUAL_ROLE_MIN_ROWS = 34
@@ -41,6 +66,9 @@ SOURCE = {
 }
 UB_BYTES = 64 * 1024 + 128 * 1024 + 3 * 64 * 64 * 2 + 64 * 64 + 3 * 1024 * 2
 L1_WEIGHT_BYTES = 2 * 256 * 256
+# gmmsq_weight_quant_vcv_basic_block.h:128,301 places slot 1 at fixed L1
+# offset 512 KiB - 64 KiB = 458,752 B, requiring a full 512 KiB L1 span.
+L1_FIXED_SLOT_SPAN_BYTES = 512 * 1024
 
 
 @dataclass(frozen=True)
@@ -134,8 +162,14 @@ def build(op, geometry: Geometry):
     aiv = geometry.resource_units.get("vector", 0)
     if aiv != 2 * aic:
         raise ModelingError("mxfp4_supply_requires_source_one_aic_two_aiv_ownership")
-    if geometry.buffers.get("ub", 0) < UB_BYTES or geometry.buffers.get("l1", 0) < L1_WEIGHT_BYTES:
-        raise ModelingError("mxfp4_supply_source_buffers_exceed_device_capacity")
+    check_live_buffers(
+        (
+            LiveBufferSpec("mxfp4_supply_ub", "ub", UB_BYTES, 0, 1, owner_kind="aiv"),
+            LiveBufferSpec("mxfp4_supply_l1_span", "l1", L1_FIXED_SLOT_SPAN_BYTES, 0, 1, owner_kind="aic"),
+        ),
+        geometry,
+        family=RECIPE,
+    )
     read = read_role(geometry.resource_units, aiv=0)
     if read != "mte2_aiv" or "mte3" not in geometry.resource_units:
         raise ModelingError("mxfp4_supply_requires_split_aiv_read_and_write_pipes")

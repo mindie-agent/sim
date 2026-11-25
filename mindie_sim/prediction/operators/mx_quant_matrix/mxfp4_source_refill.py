@@ -8,22 +8,37 @@
 [Side-Effect Policy] Pure source IR plus existing bounded nominal Engine control.
 """
 from dataclasses import replace
+from typing import Literal
 
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import Work
-from .mxfp4_geometry import MX_SCALE_GROUP, MX_SCALE_PUBLISH_K, Config, panel_sizes, panel_work
+from .mxfp4_geometry import (
+    MX_SCALE_GROUP, MX_SCALE_PUBLISH_K, Config,
+    panel_sizes, panel_work,
+)
 from .mxfp4_pipeline import Panel, Dependencies, pipeline_cycle
 from mindie_sim.prediction.program import KernelProgram, Stage
 from mindie_sim.prediction.operators.matrix.refill_steady import _duration, producer_duration
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/weight_quant_basic_block.h",
+        source_sha256="0751980abfbea9c3dbf0a414509d51cbb22c20e4d1db535c9c7999518c959d08",
+    ),
+)
+
 
 def source_panel(context, *, k, m, n, repeat, index, owner, cores, aivs, directional,
-                 ownership=None, activation_l2=0.0, weight_l2=0.0):
-    from .mxfp4_panels import panel_parts
+                 ownership=None, activation_l2=0.0, weight_l2=0.0, l2_die=None):
+    from .mxfp4_panels import _l2_permitted, panel_parts
     loads, micros = panel_parts(context, k=k, m=m, n=n, repeat=repeat, index=index,
                                owner=owner, cores=cores, aivs=aivs,
                                directional=directional, ownership=ownership,
                                activation_l2=activation_l2,
-                               weight_l2=weight_l2)
+                               weight_l2=weight_l2, l2_die=l2_die)
     kb, ka, _ = panel_sizes(m, n)
     offset = index * kb
     a = m * min(ka, k-offset) if offset % ka == 0 else 0
@@ -34,8 +49,7 @@ def source_panel(context, *, k, m, n, repeat, index, owner, cores, aivs, directi
         return Stage(name, context.bind(Work(resources={'hbm': amount*repeat,
                      'mte2_aic': amount*repeat})), placement=loads[0].placement) if amount else None
     shared = min(1.0, max(0.0, float(activation_l2)))
-    resident = context.resource_names.get('l2')
-    if not a or resident is None:
+    if not a or not _l2_permitted(context, l2_die=l2_die):
         shared = 0.0
     activation_work = {'hbm': a * repeat * (1.0 - shared),
                        'mte2_aic': a * repeat}

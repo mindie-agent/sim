@@ -9,17 +9,40 @@
 """
 from functools import partial
 from collections import Counter
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
-from .mxfp4_geometry import (MX_SCALE_GROUP, MX_SCALE_PUBLISH_K, Config,
-                              activation_l2_fraction, align, columns,
-                              effective_l2_bytes, geometry_ledger, panel_sizes,
-                              resplit_columns, tile_runs, weight_l2_fraction)
+from mindie_sim.prediction.operators.matrix.matrix_precision import EXPLICIT_ORIGINS
+from .mxfp4_geometry import (
+    MX_SCALE_GROUP, MX_SCALE_GROUP_PAIR, MX_SCALE_PUBLISH_K, Config,
+    activation_l2_fraction, align, ceildiv, columns,
+    effective_l2_bytes, geometry_ledger, panel_sizes,
+    resplit_columns, tile_runs, weight_l2_fraction,
+)
 from .mxfp4_registers import CLASSES, TABLES, TRANSPOSE_INDEX_BYTES
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
 from .mxfp4_panels import compiled_panels, panel_parts
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul/op_host/op_tiling/arch35/grouped_weight_quant_batch_matmul_tiling.cpp",
+        source_sha256="82955b2ada5947e89e62c6f52383f9b4eb391bb00213431c383224fa03b05789",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/grouped_matmul_weight_quant_resplit_controller.h",
+        source_sha256="c3503c5ffd29ac851663c9659deb49dc53fcdcee0ad54f8ac1e47e408ee3a9d9",
+    ),
+)
+ACTIVATION_SCALE_RANK = 3
+ACTIVATION_SCALE_PAIR_DIM = 2
 
 L1_BYTES = 512 * 1024
 L0_OPERAND_BYTES = 64 * 1024
@@ -82,7 +105,33 @@ def matches_source_interface(op):
         return False
     if any(meta.get(key) != value for key, value in SOURCE_INTERFACE.items() if key != "compute_format"):
         return False
-    if meta.get("compute_format") not in _ACCEPTED_COMPUTE_FORMATS:
+    compute_format = meta.get("compute_format")
+    if compute_format not in _ACCEPTED_COMPUTE_FORMATS:
+        return False
+    abi = getattr(op, "precision_abi", None)
+    if abi is not None and abi.compute_dtype and abi.compute_dtype != "fp8_e4m3":
+        return False
+    if op.matrix_flops and any(dt != "fp8_e4m3" and val > 0 for dt, val in op.matrix_flops):
+        return False
+    if compute_format != "fp8_e4m3" and str(meta.get("compute_format_origin", "")) in EXPLICIT_ORIGINS:
+        return False
+    if len(op.local_shape) < ACTIVATION_SCALE_RANK:
+        return False
+    m, _n, k = op.local_shape[-3:]
+    k_pairs = ceildiv(int(k), MX_SCALE_GROUP_PAIR)
+    expected_scale_shape = (int(m), k_pairs, ACTIVATION_SCALE_PAIR_DIM)
+    scale_shape = meta.get("activation_scale_shape")
+    if int(m) > 0:
+        if (not isinstance(scale_shape, (tuple, list))
+                or tuple(scale_shape) != expected_scale_shape):
+            return False
+    elif scale_shape is not None and (
+            not isinstance(scale_shape, (tuple, list))
+            or tuple(scale_shape) != expected_scale_shape):
+        return False
+    if meta.get("activation_scale_pack") not in (None, ACTIVATION_SCALE_PAIR_DIM):
+        return False
+    if abi is not None and abi.act_scale_pack and abi.act_scale_pack != f"pack{ACTIVATION_SCALE_PAIR_DIM}":
         return False
     if meta.get("weight_block") not in {None, MX_SCALE_GROUP}:
         return False
@@ -127,7 +176,11 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
         raise ModelingError("mxa8w4_nznk_source_static_buffers_exceed_device_capacity")
     # InitMx loads the 256-byte transpose permutation on every AIV, even when
     # that owner receives no expert tile. Scalar group-list caches are unknown.
-    l2_bytes = int(effective_l2_bytes(geometry))
+    l2_die = int(getattr(geometry, "rank", None) or 0)
+    l2_bytes = (
+        int(effective_l2_bytes(geometry))
+        if "l2" in geometry.resource_units else 0
+    )
     # ``N_FIRST_TAIL_RESPLIT`` narrows the 256-column tiling into a 32-owner
     # 128/160-column traversal and keeps the source DYNAMIC_BUFFER4 producer
     # with its finite per-tile window.  Wide 256-column runs retain the compact
@@ -160,7 +213,8 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
             m, n, repeat = schedule[index]
             arguments = dict(k=config.k, m=m, n=n, repeat=repeat,
                              owner=owner, cores=cores, aivs=aivs, directional=directional,
-                             activation_l2=activation_l2, weight_l2=weight_l2)
+                             activation_l2=activation_l2, weight_l2=weight_l2,
+                             l2_die=l2_die)
             if panel_compact:
                 # Only immutable physical IR is shared. Engine events, output
                 # stores and pool ownership belong to this particular call.

@@ -8,11 +8,36 @@
 [Side-Effect Policy] Creates immutable metadata, weight views and programs only.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
 from mindie_sim.prediction.program import KernelProgram, Stage
+from mindie_sim.prediction.values.typed import rebind_op_precision
 from .mxfp8_grouped import MX_SCALE_GROUP, MX_SCALE_GROUP_PAIR, NZ_N_GRANULE
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="vllm_ascend/quantization/methods/w8a8/w8a8_mxfp8.py",
+        source_sha256="f9d03f16ae93fb678da5ff0135848226b585960dc1abe45252719ce7eb29e65a",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="vllm_ascend/attention/dsa_v1.py",
+        source_sha256="8683fcf83e4b38890035af373e185c001cc874eae055b11554c88e98148edc65",
+    ),
+    SourceRef(
+        repository="cann/ops-nn",
+        revision="238f76a0",
+        relative_path="samples/matmul/quant_matmul/quant_batch_matmul_mx.py",
+        source_sha256="37c9d7f034ae249d2d8fcfe5b310ec6197a6df711736e2ab04ae7e2cdb3ed74e",
+    ),
+)
 
 IMPLEMENTATION = "ascend_prepared_mx32_matrix"
 PROFILE = "prepared_mx32_aic_matrix"
@@ -120,9 +145,32 @@ def apply(ops, selection, *, local_tokens=None):
                         weight_stride=(k*n, n, 1),
                         permutation_scope="native_strided_addressing; no_GM_transpose_copy")
             md["native_tensor_view"] = view
-        result.append(replace(op, recipe=PROFILE, layout=md["weight_representation"], mte3_bytes=0,
-                              hbm_bytes=op.hbm_bytes + delta, mte2_bytes=op.mte2_bytes + delta,
-                              metadata=tuple(md.items())))
+        if "weight_block" in md:
+            md["prepared_checkpoint_weight_block"] = md["weight_block"]
+        if "weight_scale_format" in md:
+            md["prepared_checkpoint_weight_scale_format"] = md["weight_scale_format"]
+        if "weight_scale_bytes" in md:
+            md["prepared_checkpoint_weight_scale_bytes"] = md["weight_scale_bytes"]
+        md["weight_block"] = (1, MX_SCALE_GROUP)
+        md["weight_scale_format"] = "fp8_e8m0"
+        md["weight_scale_bytes"] = 1
+        updated = replace(op, recipe=PROFILE, layout=md["weight_representation"], mte3_bytes=0,
+                          hbm_bytes=op.hbm_bytes + delta, mte2_bytes=op.mte2_bytes + delta,
+                          metadata=tuple(md.items()))
+        if op.precision_abi is not None:
+            md.setdefault("prepared_checkpoint_weight_block", op.precision_abi.weight_block)
+            md.setdefault("prepared_checkpoint_weight_scale_format", op.precision_abi.weight_scale_dtype)
+            md.setdefault("prepared_checkpoint_weight_scale_bytes", op.precision_abi.weight_scale_bytes)
+            md["prepared_checkpoint_weight_layout"] = op.precision_abi.weight_layout
+            new_abi = replace(
+                op.precision_abi,
+                weight_layout=md["weight_representation"],
+                weight_block=(1, MX_SCALE_GROUP),
+                weight_scale_dtype="fp8_e8m0",
+                weight_scale_bytes=1,
+            )
+            updated = rebind_op_precision(updated, new_abi, metadata=md)
+        result.append(updated)
     if roles - seen and local_tokens != 0:
         raise ModelingError("prepared_mx32_projection_unmatched:" + ",".join(sorted(roles-seen)))
     return tuple(result)
@@ -149,13 +197,19 @@ class MXMatrix:
         fixpipe = context.resource_names.get("fixpipe")
         if fixpipe is None:
             raise ModelingError("prepared_mx32_fixpipe_rate_required")
-        # Reuse the generic output-cost slot for scoring, mapped to the actual
-        # physical pipe and its owner count; no AIV MTE3 resource is submitted.
+        # Reuse the generic output-cost slot for scoring and Stream-K final_store,
+        # mapped to the actual physical Fixpipe pipe and its owner count; no AIV
+        # MTE3 resource is submitted. SteadyMatmul excludes names["mte3"] from
+        # compute on non-Split-K paths so FixpipeOutput remains the sole publisher.
+        fixpipe_bytes = float(meta["fixpipe_bytes"])
+        inner_work = {k: v for k, v in context.work.items() if k != fixpipe}
+        if fixpipe_bytes > 0:
+            inner_work[fixpipe] = fixpipe_bytes
         inner = replace(context, op=replace(context.op, mte3_bytes=meta["fixpipe_bytes"]),
                         resource_names={**context.resource_names, "mte3": fixpipe},
                         resource_units={**context.resource_units, "mte3":
                                         context.resource_units.get("fixpipe", context.core_count)},
-                        work={k: v for k, v in context.work.items() if k != fixpipe})
+                        work=inner_work)
         return SteadyMatmul().lower(inner, output=FixpipeOutput())
 
 
