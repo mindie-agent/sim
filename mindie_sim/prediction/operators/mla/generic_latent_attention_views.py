@@ -10,8 +10,10 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 import math
+from typing import Literal
 
 from mindie_sim.catalog.attention_common import (
     _causal_pairs, _long_selected_pairs, active_dcp_degree, min_positive,
@@ -34,9 +36,26 @@ from mindie_sim.catalog.context_parallel import (
     split_sparse_dcp_batch_per_sequence,
 )
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 
 from mindie_sim.prediction.operators.sparse_indexer.batch_prefix_indexer import RECIPE_NAME as BATCH_INDEXER_RECIPE
 from .mla_structure import declare_indexer
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "vllm_ascend/attention/mla_v1.py",
+        "f7f672e001651a748d2e88ef0f36797ef78db63321ac657f1c7a944c0f561c22",
+    ),
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "vllm_ascend/models/deepseek_v41/indexer.py",
+        "45ec4290a41c25497d3cadfdb40c7466b5a40ae467a76200d82d4fa34b15fa02",
+    ),
+)
 
 INDEX_QUERY_TILE = 128
 INDEX_NO_ROWS = 0
@@ -94,35 +113,49 @@ def stack_compressor_kind(model, plan):
     return next(iter(kinds)) if len(kinds) == 1 else ""
 
 
-def index_cache_format(model):
+def _has_declared_index_k(model, *, plan=None, phase=None) -> bool:
+    meta = dict(getattr(model, "metadata", ()) or ())
+    keys = (f"index_k:{phase}", "index_k") if phase else ("index_k",)
+    if plan is not None:
+        per_layer = meta.get("layer_cache_representations")
+        if isinstance(per_layer, Mapping):
+            layer_map = per_layer.get(str(plan.index))
+            if layer_map is None:
+                layer_map = per_layer.get(plan.index)
+            if isinstance(layer_map, Mapping) and any(layer_map.get(k) is not None for k in keys):
+                return True
+    global_regions = meta.get("cache_representations")
+    return isinstance(global_regions, Mapping) and any(global_regions.get(k) is not None for k in keys)
+
+
+def index_cache_format(model, *, plan=None, phase=None):
     """Declared index-cache representation, or the declared index precision.
 
     The index key region has its own representation. When the model does not
     declare one, the fallback is the declared *indexer* dtype, never the
     attention KV dtype: those are separate cache regions of the same case.
     """
-    raw = dict(getattr(model, "metadata", ())).get("cache_representations", {})
-    if "index_k" in raw:
-        return cache_format(model, "index_k")
+    if _has_declared_index_k(model, plan=plan, phase=phase):
+        return cache_format(model, "index_k", plan=plan, phase=phase)
     declared = str(getattr(getattr(model, "quant", None), "index_dtype", "") or "int8")
     return CacheFormat(declared)
 
 
-def index_cache_is_packed(model):
+def index_cache_is_packed(model, *, plan=None, phase=None):
     """True when one index-cache storage byte holds more than one element."""
-    return index_cache_format(model).packed_elements > 1
+    return index_cache_format(model, plan=plan, phase=phase).packed_elements > 1
 
 
-def index_arithmetic_dtype(model, quant):
+def index_arithmetic_dtype(model, quant, *, plan=None, phase=None):
     """Logical indexer arithmetic dtype, distinct from packed row storage."""
-    if index_cache_is_packed(model):
+    if index_cache_is_packed(model, plan=plan, phase=phase):
         return PACKED_INDEX_ARITHMETIC_DTYPE
     return quant.index_dtype
 
 
-def index_cache_dtype(model):
+def index_cache_dtype(model, *, plan=None, phase=None):
     """Resolved index-cache storage dtype of the declared index region."""
-    return index_cache_format(model).dtype
+    return index_cache_format(model, plan=plan, phase=phase).dtype
 
 
 def visible_parts(view):
@@ -326,10 +359,21 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
             spill = max(0.0, 1 - float(l2_bytes) / working)
             hbm_rows += max(0.0, float(refill_rows) - hbm_rows) * spill
     native_fused, quantized_index = _resolve_native_indexer_mode(runtime, machine, quant, model)
+    sel_phase = b.common.get("phase")
+    packed_index = index_cache_is_packed(model, plan=plan, phase=sel_phase)
     # Query and head-weight operands are real reads in both lowerings.
     by_id = {op.op_id: op for op in b.ops}
     operand_bytes = sum(float(by_id[dep].mte3_bytes)
                         for dep in deps[:2] if dep in by_id)
+    weight_op = by_id.get(deps[1]) if len(deps) > 1 else None
+    weight_dtype = (
+        str(dict(weight_op.metadata).get("output_format") or weight_op.dtype or "").strip().lower()
+        if weight_op is not None else ""
+    )
+    if native_fused and quantized_index and quant.index_dtype == "int8" and not packed_index:
+        # quant_lightning_indexer_tiling.cpp:468-491 requires fp16 weights for INT8 Q/K.
+        weight_dtype = "fp16"
+    weight_meta = (("weight_dtype", weight_dtype),) if weight_dtype else ()
     if native_fused:
         # One CANN kernel consumes Q, head weights and the candidate cache rows
         # and writes only the token indices; dispatch QuantLightningIndexerV2
@@ -348,7 +392,7 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
             read=operand_bytes + refill_rows * row_b / divisor,
             hbm_read=operand_bytes + hbm_rows * row_b / divisor,
             write=valid * plan.index_topk * INT32_BYTES,
-            family="indexer", dtype=index_arithmetic_dtype(model, quant),
+            family="indexer", dtype=index_arithmetic_dtype(model, quant, plan=plan, phase=sel_phase),
             recipe=op_recipe,
             metadata=(("native_kind", native_kind),
                       ("fused_members", ("index_scores", "index_topk")),
@@ -361,7 +405,7 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                       ("index_score_shards", max(MIN_INDEX_FACTOR, int(shard))),
                       ("index_context_partitions", cp),
                       ("index_candidate_filter", bool(plan.candidate_filter)),
-                      ("index_head_reduction", "complete_local")))
+                      ("index_head_reduction", "complete_local")) + weight_meta)
         if shared_reads and union_rows < private_rows:
             fused_op = b.ops[-1]
             b.ops[-1] = replace(fused_op, metadata=fused_op.metadata + _prefix_reuse_meta(
