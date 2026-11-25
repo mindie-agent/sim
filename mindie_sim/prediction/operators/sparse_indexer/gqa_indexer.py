@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 
-from mindie_sim.catalog.attention_common import _long_selected_pairs, local_kv_heads
+from mindie_sim.catalog.attention_common import _floor_sum, _long_selected_pairs, local_kv_heads
 from mindie_sim.catalog.cache import (
     completed_rows,
     index_row_bytes,
@@ -53,8 +53,15 @@ from mindie_sim.prediction.structure_groups import declare_group
 
 INDEX_SCORE_VECTOR_OPS_PER_ROW: int = 3
 TOPK_OPS_PER_ELEMENT: int = 4
+INDEX_RMSNORM_OPS: float = 5.0
+INDEX_LAYERNORM_OPS: float = 8.0
+INDEX_ROPE_OPS: float = 6.0
+INDEX_QUANT_OPS: float = 4.0
+WEIGHT_CAST_SCALE_OPS: float = 2.0
 DEFAULT_KV_BLOCK_SIZE: int = 128
 DEFAULT_INDEX_DIM: int = 64
+REGION_CSA_DEFAULT_ROPE_DIM: int = 32
+REGION_WS_MIN_STRIDE: int = 8
 FP32_SCORE_BYTES: int = 4
 INT32_INDEX_BYTES: int = 4
 MSA_SCORE_ALIGN_COLS: int = 16
@@ -227,9 +234,12 @@ def _emit_index_store(
     phase: str,
     rows: int,
     completed_rows: int | None = None,
+    views=None,
     row_bytes: float,
     idx_dim: int,
     idx_kv_heads: int = 1,
+    cache_dtype: str | None = None,
+    scale_dtype: str | None = None,
     plan,
     model,
     quant,
@@ -260,9 +270,12 @@ def _emit_index_store(
             phase=phase,
             rows=rows,
             completed_rows=completed_rows,
+            views=views,
             dim=idx_dim,
             index_dim=idx_dim,
             heads=idx_kv_heads,
+            cache_dtype=cache_dtype,
+            scale_dtype=scale_dtype,
             row_bytes=row_bytes,
             plan=plan,
             model=model,
@@ -286,7 +299,7 @@ def _emit_index_store(
         recipe="index_store",
         rows=fallback_rows,
         row_bytes=max(1, int(round(row_bytes))),
-        dtype=quant.index_dtype,
+        dtype=cache_dtype or quant.index_dtype,
         kind="index",
     )
     return (fallback,)
@@ -351,6 +364,13 @@ def lower_gqa_indexer(
     requests = tuple(view.request_id for view in views)
     if eff_topk > 0 and (plan.indexer or plan.owns_index_k or plan.owns_topk):
         tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+        if _is_region_csa_indexer(plan):
+            attn_local_kv = local_kv_heads(max(1, int(getattr(plan, "num_kv_heads", 1) or 1)), tp)
+            if attn_local_kv != 1:
+                raise ModelingError(
+                    f"step5_region_csa_requires_single_local_kv_head:"
+                    f"num_kv_heads={plan.num_kv_heads}:tp={tp}:local={attn_local_kv}"
+                )
         raw_idx_kv_heads = max(
             1,
             int(getattr(plan, "index_kv_heads", 0)
@@ -366,7 +386,7 @@ def lower_gqa_indexer(
             model, plan, views, idx_ratio, valid, block_size,
             local_idx_kv_heads=local_idx_kv_heads, parallel=parallel, eff_dcp=eff_dcp,
             tp=tp, runtime=runtime)
-        idx_wq, idx_wk, store_ops, pcp_idx_ops, idx_store_id, idx_ready = _index_cache_inputs(
+        prep_ops, q_ready_id, weights_ready_id, store_ops, pcp_idx_ops, idx_store_id, idx_ready = _index_cache_inputs(
             prefix, deps, stage, plan, requests, padded_tokens, idx_heads, idx_dim,
             model, quant, mode, valid, new_idx_rows, row_bytes, runtime, machine,
             pcp_prefill, views, idx_ratio, parallel, local_idx_kv_heads=local_idx_kv_heads)
@@ -386,7 +406,8 @@ def lower_gqa_indexer(
             rows_by_view=rows_by_view,
             shared_idx_by_view=shared_idx_by_view,
             scored_rows=scored_rows,
-            idx_wq_id=idx_wq.op_id,
+            idx_wq_id=q_ready_id,
+            idx_weights_id=weights_ready_id,
             idx_ready=idx_ready,
             idx_ratio=idx_ratio,
             sel_topk=sel_topk,
@@ -396,7 +417,7 @@ def lower_gqa_indexer(
             eff_dcp=eff_dcp,
             cp_stride=(cp_interleave(runtime) if runtime is not None else block_size),
         )
-        ops.extend((idx_wq, idx_wk, *store_ops, *pcp_idx_ops, *tail_ops))
+        ops.extend((*prep_ops, *store_ops, *pcp_idx_ops, *tail_ops))
         _declare_gqa_indexer_group(
             ops, prefix=prefix, plan=plan, parallel=parallel, model=model,
             quant=quant, views=views, padded_tokens=padded_tokens,
@@ -545,6 +566,7 @@ def _build_qsa_fused_indexer_op(
 ) -> OpSpec:
     """Fused QSA aclnnLightningIndexerV2 op (scores + TopK in one kernel, zero TopKV2)."""
     id_write_bytes = float(valid * sel_topk * INT32_INDEX_BYTES)
+    weights_read_bytes = float(valid * idx_heads * FP32_SCORE_BYTES)
     idx_scores = OpSpec(
         op_id=prefix + ".index_scores",
         family="indexer",
@@ -561,8 +583,8 @@ def _build_qsa_fused_indexer_op(
             INDEX_SCORE_VECTOR_OPS_PER_ROW * scored_rows * idx_heads
             + scored_rows * TOPK_OPS_PER_ELEMENT
         ),
-        hbm_bytes=float(l2_bounded_index_read + q_idx_bytes + id_write_bytes),
-        mte2_bytes=float(scored_rows * row_bytes + q_idx_bytes),
+        hbm_bytes=float(l2_bounded_index_read + q_idx_bytes + weights_read_bytes + id_write_bytes),
+        mte2_bytes=float(scored_rows * row_bytes + q_idx_bytes + weights_read_bytes),
         mte3_bytes=id_write_bytes,
         deps=(idx_wq_id, idx_ready),
         recipe="index_scores",
@@ -680,6 +702,51 @@ def _build_msa_score_and_topk_ops(
     return (idx_s, idx_t), idx_s.op_id, idx_t.op_id, False
 
 
+def _qsa_pack_read_groups(views, *, idx_ratio: int, sel_topk: int) -> int:
+    """Exact group IDs loaded by _pack_qsa_group_indices_kernel across live query rows."""
+    ratio = max(1, int(idx_ratio))
+    total = 0
+    for v in views:
+        if getattr(v, "padding", False) or int(v.q_len) <= 0:
+            continue
+        seq_cap = min(sel_topk, int(v.kv_len) // ratio)
+        if seq_cap <= 0:
+            continue
+        for s_p, e_p in (v.query_ranges or ((0, int(v.q_len)),)):
+            if e_p <= s_p:
+                continue
+            lo_pos = int(v.context) + int(s_p)
+            hi_pos = int(v.context) + int(e_p)
+            sat_pos = seq_cap * ratio - 1
+            ramp_hi = min(hi_pos, max(lo_pos, sat_pos))
+            if ramp_hi > lo_pos:
+                total += _floor_sum(ramp_hi - lo_pos, ratio, 1, lo_pos + 1)
+            if hi_pos > ramp_hi:
+                total += (hi_pos - ramp_hi) * seq_cap
+    return total
+
+
+def _region_csa_reload_rows(views, *, idx_ratio: int, sel_topk: int) -> tuple[int, int]:
+    """Return (max_regions_per_token, sum_reload_rows_above_topk) for Step-5 region CSA."""
+    ratio = max(1, int(idx_ratio))
+    max_regions = 0
+    reload_rows = 0
+    threshold_pos = (sel_topk + 1) * ratio
+    for v in views:
+        if getattr(v, "padding", False) or int(v.q_len) <= 0:
+            continue
+        for s_p, e_p in (v.query_ranges or ((0, int(v.q_len)),)):
+            if e_p <= s_p:
+                continue
+            lo_pos = int(v.context) + int(s_p)
+            hi_pos = int(v.context) + int(e_p)
+            max_regions = max(max_regions, (hi_pos - 1) // ratio)
+            sel_lo = max(lo_pos, threshold_pos)
+            if hi_pos > sel_lo:
+                reload_rows += _floor_sum(hi_pos - sel_lo, ratio, 1, sel_lo)
+    return max_regions, reload_rows
+
+
 def _build_index_score_and_topk_ops(
     *,
     prefix: str,
@@ -703,6 +770,7 @@ def _build_index_score_and_topk_ops(
     sel_topk: int,
     user_pinned_idx: bool,
     runtime,
+    idx_weights_id: str | None = None,
     pairs_by_view: Sequence[int] | None = None,
     eff_dcp: int = 1,
     cp_stride: int = 1,
@@ -723,7 +791,37 @@ def _build_index_score_and_topk_ops(
             sel_topk=sel_topk, user_pinned_idx=user_pinned_idx, runtime=runtime,
             q_idx_bytes=q_idx_bytes, l2_bounded_index_read=l2_bounded_index_read, shape=shape,
         )
-        return (fused,), fused.op_id, fused.op_id, True
+        packed_width = sel_topk + max(1, idx_ratio) - 1
+        wrapper_output_width = sel_topk * max(1, idx_ratio) + max(1, idx_ratio) - 1
+        read_groups = _qsa_pack_read_groups(views, idx_ratio=idx_ratio, sel_topk=sel_topk)
+        group_read_bytes = float(read_groups * INT32_INDEX_BYTES)
+        packed_write_bytes = float(valid * packed_width * INT32_INDEX_BYTES)
+        pack = vector_op(
+            op_id=prefix + ".index_pack",
+            deps=(fused.op_id,),
+            stage=stage,
+            layer=plan.index,
+            requests=requests,
+            elements=valid * packed_width,
+            ops_per_element=1.0,
+            dtype="int32",
+            family="elementwise",
+            phase=mode,
+            recipe="index_pack",
+            read_bytes_override=group_read_bytes,
+            write_bytes_override=packed_write_bytes,
+            shape=(valid, packed_width),
+            metadata=(
+                ("native_kind", "_pack_qsa_group_indices_kernel"),
+                ("selection_output_dtype", "int32"),
+                ("packed_width", packed_width),
+                ("wrapper_output_width", wrapper_output_width),
+                ("valid_group_reads", read_groups),
+                ("compress_ratio", idx_ratio),
+                ("sel_topk", sel_topk),
+            ),
+        )
+        return (fused, pack), fused.op_id, pack.op_id, True
     if _is_block_msa_indexer(plan):
         return _build_msa_score_and_topk_ops(
             prefix=prefix, plan=plan, views=views, stage=stage, requests=requests,
@@ -737,10 +835,25 @@ def _build_index_score_and_topk_ops(
         )
     topk_write_bytes = float(valid * sel_topk * INT32_INDEX_BYTES)
     if is_region:
-        # Upstream step5/ops/indexer_region_score.py:72: npu_indexer_region_score.ids_out
-        # fuses region scoring + top_k selection in UB and writes int32 IDs directly.
+        # Upstream indexer_region_score.cpp:52-70 + select.h:474-503 allocates a
+        # minimum 8-float stride workspace, writes FP32 scores, and reloads for
+        # radix TopK only on rows with history > topk (FillUnderKIds otherwise).
+        region_dtype = "fp8_e4m3"
+        region_q_bytes = float(valid * idx_heads * idx_dim) * dtype_bytes(region_dtype) if scored_rows else 0.0
+        weights_read_bytes = float(valid * idx_heads * FP32_SCORE_BYTES) if scored_rows else 0.0
+        max_req_regions, reload_score_rows = _region_csa_reload_rows(
+            views, idx_ratio=idx_ratio, sel_topk=sel_topk,
+        )
+        ws_stride = max(REGION_WS_MIN_STRIDE, align_up(max_req_regions, REGION_WS_MIN_STRIDE))
+        score_ws_capacity = float(valid * ws_stride * FP32_SCORE_BYTES)
+        score_write_bytes = float(scored_rows * FP32_SCORE_BYTES)
+        score_reload_bytes = float(reload_score_rows * FP32_SCORE_BYTES)
+        score_flops = float(2 * scored_rows * idx_heads * idx_dim)
+        score_deps = tuple(dep for dep in (idx_wq_id, idx_weights_id, idx_ready) if dep)
         fused_meta: tuple[tuple[str, object], ...] = (
-            ("score_materialization", "fused_in_ub_no_gm_scores"),
+            ("score_materialization", "gm_score_workspace_then_radix_topk"),
+            ("gm_score_workspace_bytes", score_ws_capacity),
+            ("gm_score_reload_bytes", score_reload_bytes),
             ("selection_output_dtype", "int32"),
             ("fused_topk", True),
             ("indexer_kind", "region_csa_score"),
@@ -750,15 +863,22 @@ def _build_index_score_and_topk_ops(
             op_id=prefix + ".index_scores", family="indexer", phase=mode, stage=stage,
             layer=plan.index, requests=requests, semantic_shape=shape, local_shape=shape,
             padded_shape=shape, launch_shape=shape,
-            flops=float(2 * scored_rows * idx_heads * idx_dim),
+            flops=score_flops,
+            matrix_flops=((region_dtype, score_flops),) if score_flops else (),
             vector_ops=float(
-                (INDEX_SCORE_VECTOR_OPS_PER_ROW * idx_heads + TOPK_OPS_PER_ELEMENT)
-                * scored_rows
+                INDEX_SCORE_VECTOR_OPS_PER_ROW * idx_heads * scored_rows
+                + TOPK_OPS_PER_ELEMENT * reload_score_rows
             ),
-            hbm_bytes=float(l2_bounded_index_read + q_idx_bytes + topk_write_bytes),
-            mte2_bytes=float(scored_rows * row_bytes + q_idx_bytes),
-            mte3_bytes=topk_write_bytes, deps=(idx_wq_id, idx_ready), recipe="index_scores",
-            dtype=quant.index_dtype, metadata=fused_meta,
+            hbm_bytes=float(
+                l2_bounded_index_read + region_q_bytes + weights_read_bytes
+                + score_write_bytes + score_reload_bytes + topk_write_bytes
+            ),
+            mte2_bytes=float(
+                scored_rows * row_bytes + region_q_bytes + weights_read_bytes + score_reload_bytes
+            ),
+            mte3_bytes=float(score_write_bytes + topk_write_bytes),
+            deps=score_deps, recipe="index_scores",
+            dtype=region_dtype, metadata=fused_meta,
         )
         idx_scores = apply_indexer_prefix_reads(
             idx_scores, views=views, rows_by_view=rows_by_view,
@@ -833,7 +953,15 @@ def _declare_gqa_indexer_group(
         {"query": v.q_len, "context": v.context, "kv_length": v.kv_len}
         for v in views
     )
-    members = (scores_id,) if fused_topk else (scores_id, topk_id)
+    members = (scores_id,) if scores_id == topk_id else (scores_id, topk_id)
+    single_op = fused_topk and scores_id == topk_id
+    is_region = _is_region_csa_indexer(plan)
+    is_qsa = _is_qsa_pooled_indexer(plan)
+    eff_query_dtype = "fp8_e4m3" if is_region else quant.index_dtype
+    eff_weight_dtype = (
+        "fp32" if (is_region or is_qsa)
+        else ("fp16" if quant.index_dtype == "int8" else model.activation_dtype)
+    )
     declare_group(
         ops, key=prefix + "." + role, role=role, family=family,
         members=members, entries=(scores_id,), anchor=topk_id,
@@ -842,9 +970,9 @@ def _declare_gqa_indexer_group(
             "tokens": sum(v.q_len for v in views), "physical_tokens": padded_tokens,
             "sequence_partition": partition, "compression_ratio": max(1, idx_ratio),
             "heads": idx_heads, "width": idx_dim, "topk": sel_topk,
-            "query_dtype": quant.index_dtype,
-            "weight_dtype": "fp16" if quant.index_dtype == "int8" else model.activation_dtype,
-            "cache_dtype": quant.index_dtype,
+            "query_dtype": eff_query_dtype,
+            "weight_dtype": eff_weight_dtype,
+            "cache_dtype": eff_query_dtype,
             "selection_output_dtype": "int32",
             "scale_dtype": quant.index_scale_dtype,
         },
@@ -854,14 +982,17 @@ def _declare_gqa_indexer_group(
                 "cp": int(parallel.cp), "pcp": int(parallel.pcp),
                 "candidate_filter": bool(plan.candidate_filter),
                 "source_selection": "gqa_fused_score_topk" if fused_topk else "gqa_semantic_score_and_topk_projection",
-                "timing_boundary": "fused_single_op" if fused_topk else "separate_declared_operators",
+                "timing_boundary": "fused_single_op" if single_op else "separate_declared_operators",
             },
         },
         source={"kind": "semantic_builder",
                 "module": "mindie_sim.prediction.operators.sparse_indexer.gqa_indexer"},
-        fusion_status="fused_single_op" if fused_topk else "unfused_decomposed",
-        fusion_reason="qsa_lightning_indexer_v2_fused_topk" if fused_topk else "gqa_indexer_separate_score_and_topk",
-        native_fusion_eligible=fused_topk,
+        fusion_status="fused_single_op" if single_op else "unfused_decomposed",
+        fusion_reason=(
+            "region_csa_single_op" if (single_op and is_region)
+            else ("qsa_lightning_indexer_v2_fused_topk_then_pack" if fused_topk else "gqa_indexer_separate_score_and_topk")
+        ),
+        native_fusion_eligible=single_op,
     )
 
 
@@ -873,7 +1004,13 @@ def _index_view_work(
     cost = index_selection_cost(
         model, plan, max((v.kv_len for v in views), default=0)
     )
-    row_bytes_per_head = cost.index_row_bytes or index_row_bytes(model, plan.index_dim)
+    idx_dim = max(1, int(plan.index_dim or DEFAULT_INDEX_DIM))
+    if _is_region_csa_indexer(plan):
+        scale_dt = str(getattr(model.quant, "index_scale_dtype", "none") or "none").strip().lower()
+        scale_b = float(dtype_bytes(scale_dt)) if scale_dt not in {"", "none"} else 0.0
+        row_bytes_per_head = float(idx_dim) * float(dtype_bytes("fp8_e4m3")) + scale_b
+    else:
+        row_bytes_per_head = cost.index_row_bytes or index_row_bytes(model, plan.index_dim)
     row_bytes = row_bytes_per_head * max(1, int(local_idx_kv_heads))
     raw_idx_heads = max(1, int(plan.index_heads or 1))
     idx_heads = (
@@ -881,7 +1018,6 @@ def _index_view_work(
         if _is_block_msa_indexer(plan)
         else raw_idx_heads
     )
-    idx_dim = max(1, int(plan.index_dim or DEFAULT_INDEX_DIM))
     cand_cap = (
         plan.candidate_topk_blocks * plan.candidate_block_size
         if plan.candidate_filter
@@ -920,22 +1056,32 @@ def _index_view_work(
     rows_by_view: list[int] = []
     shared_idx_by_view: list[int] = []
     pairs_by_view: list[int] = []
+    is_region = _is_region_csa_indexer(plan)
     for v in views:
         v_ranges = v.query_ranges or ((0, v.q_len),)
-        v_scored = int(
-            sum(
-                _long_selected_pairs(
-                    e_p - s_p,
-                    v.context + s_p,
-                    idx_ratio,
-                    cand_cap,
-                    noncausal=bool(plan.noncausal_attention),
-                    kv_len=v.kv_len,
+        if is_region:
+            v_scored = int(
+                sum(
+                    _floor_sum(e_p - s_p, idx_ratio, 1, int(v.context) + s_p)
+                    for s_p, e_p in v_ranges
+                    if e_p > s_p
                 )
-                for s_p, e_p in v_ranges
-                if e_p > s_p
             )
-        )
+        else:
+            v_scored = int(
+                sum(
+                    _long_selected_pairs(
+                        e_p - s_p,
+                        v.context + s_p,
+                        idx_ratio,
+                        cand_cap,
+                        noncausal=bool(plan.noncausal_attention),
+                        kv_len=v.kv_len,
+                    )
+                    for s_p, e_p in v_ranges
+                    if e_p > s_p
+                )
+            )
         raw_pref = max(
             0, min(int(getattr(v, "prefix_tokens", 0) or 0), int(v.context))
         )
@@ -992,11 +1138,149 @@ def _index_view_work(
     )
 
 
+def _region_csa_prep_ops(
+    *, prefix: str, deps: str, stage: int, plan, requests: tuple[str, ...],
+    padded_tokens: int, idx_heads: int, idx_dim: int, local_k_heads: int,
+    idx_wq: OpSpec, idx_wk: OpSpec, model, quant, mode: str,
+) -> tuple[tuple[OpSpec, ...], str, str, tuple[str, ...]]:
+    """Emit Step-5 region CSA Z/weight projections, Q/K norms, RoPE, and FP8 query quant."""
+    act_dtype = str(getattr(model, "activation_dtype", "bf16") or "bf16")
+    act_bytes = float(dtype_bytes(act_dtype))
+    idx_wz = gemm_op(
+        op_id=prefix + ".index_wz",
+        deps=(deps,),
+        stage=stage,
+        layer=plan.index,
+        requests=requests,
+        m=padded_tokens,
+        n=local_k_heads * idx_dim,
+        k=model.hidden_size,
+        quant=quant,
+        category="indexer",
+        phase=mode,
+        recipe="index_wz",
+        family="index_projection",
+    )
+    idx_weights = gemm_op(
+        op_id=prefix + ".index_weights",
+        deps=(deps,),
+        stage=stage,
+        layer=plan.index,
+        requests=requests,
+        m=padded_tokens,
+        n=idx_heads,
+        k=model.hidden_size,
+        quant=quant,
+        category="indexer.weights",
+        phase=mode,
+        recipe="index_weights",
+        family="index_projection",
+    )
+    prep: list[OpSpec] = [idx_wq, idx_wk, idx_wz, idx_weights]
+    w_elems = padded_tokens * idx_heads
+    weights_ready_op = vector_op(
+        op_id=prefix + ".index_weights_fp32",
+        deps=(idx_weights.op_id,),
+        stage=stage,
+        layer=plan.index,
+        requests=requests,
+        elements=w_elems,
+        ops_per_element=WEIGHT_CAST_SCALE_OPS,
+        dtype="fp32",
+        family="cast",
+        phase=mode,
+        recipe="index_weights_fp32",
+        read_bytes_override=float(w_elems) * act_bytes,
+        write_bytes_override=float(w_elems) * float(FP32_SCORE_BYTES),
+        shape=(padded_tokens, idx_heads),
+        metadata=(("input_format", act_dtype), ("output_format", "fp32")),
+    )
+    prep.append(weights_ready_op)
+    q_elems = padded_tokens * idx_heads * idx_dim
+    k_elems = padded_tokens * local_k_heads * idx_dim
+    q_norm = vector_op(
+        op_id=prefix + ".index_q_norm",
+        deps=(idx_wq.op_id,),
+        stage=stage,
+        layer=plan.index,
+        requests=requests,
+        elements=q_elems,
+        ops_per_element=INDEX_RMSNORM_OPS,
+        dtype=act_dtype,
+        family="rmsnorm",
+        phase=mode,
+        recipe="index_q_norm",
+        read_bytes_override=float(q_elems) * act_bytes + float(idx_dim * FP32_SCORE_BYTES),
+        write_bytes_override=float(q_elems) * act_bytes,
+        shape=(padded_tokens, idx_heads, idx_dim),
+    )
+    k_norm = vector_op(
+        op_id=prefix + ".index_k_norm",
+        deps=(idx_wk.op_id,),
+        stage=stage,
+        layer=plan.index,
+        requests=requests,
+        elements=k_elems,
+        ops_per_element=INDEX_LAYERNORM_OPS,
+        dtype=act_dtype,
+        family="layernorm",
+        phase=mode,
+        recipe="index_k_norm",
+        read_bytes_override=float(k_elems) * act_bytes + float(2 * idx_dim * FP32_SCORE_BYTES),
+        write_bytes_override=float(k_elems) * act_bytes,
+        shape=(padded_tokens, local_k_heads, idx_dim),
+    )
+    qk_elems = q_elems + k_elems
+    declared_rope = int(
+        getattr(plan, "index_rope_dim", 0)
+        or getattr(plan, "sparse_indexer_rope_dim", 0)
+        or REGION_CSA_DEFAULT_ROPE_DIM
+    )
+    rope_dim = min(idx_dim, max(1, declared_rope))
+    rope_elems = padded_tokens * (idx_heads + local_k_heads) * rope_dim
+    qk_rope = vector_op(
+        op_id=prefix + ".index_qk_rope",
+        deps=(q_norm.op_id, k_norm.op_id),
+        stage=stage,
+        layer=plan.index,
+        requests=requests,
+        elements=rope_elems,
+        ops_per_element=INDEX_ROPE_OPS,
+        dtype=act_dtype,
+        family="rotary",
+        phase=mode,
+        recipe="index_qk_rope",
+        read_bytes_override=float(qk_elems) * act_bytes + float(padded_tokens * rope_dim) * act_bytes,
+        write_bytes_override=float(qk_elems) * act_bytes,
+        shape=(padded_tokens, idx_heads + local_k_heads, idx_dim),
+    )
+    q_quant = vector_op(
+        op_id=prefix + ".index_q_quant",
+        deps=(qk_rope.op_id,),
+        stage=stage,
+        layer=plan.index,
+        requests=requests,
+        elements=q_elems,
+        ops_per_element=INDEX_QUANT_OPS,
+        dtype="fp8_e4m3",
+        family="quantize",
+        phase=mode,
+        recipe="index_q_quant",
+        read_bytes_override=float(q_elems) * act_bytes,
+        write_bytes_override=float(q_elems) * float(dtype_bytes("fp8_e4m3")),
+        shape=(padded_tokens, idx_heads, idx_dim),
+        metadata=(("input_format", act_dtype), ("output_format", "fp8_e4m3")),
+    )
+    prep.extend((q_norm, k_norm, qk_rope, q_quant))
+    return tuple(prep), q_quant.op_id, weights_ready_op.op_id, (qk_rope.op_id, idx_wz.op_id)
+
+
 def _index_cache_inputs(
     prefix, deps, stage, plan, requests, padded_tokens, idx_heads, idx_dim, model, quant, mode,
     valid, new_idx_rows, row_bytes, runtime, machine, pcp_prefill, views, idx_ratio, parallel,
     *, local_idx_kv_heads: int = 1,
 ):
+    local_k_heads = max(1, int(local_idx_kv_heads))
     idx_wq = gemm_op(
         op_id=prefix + ".index_wq",
         deps=(deps,),
@@ -1019,7 +1303,7 @@ def _index_cache_inputs(
         layer=plan.index,
         requests=requests,
         m=padded_tokens,
-        n=max(1, int(local_idx_kv_heads)) * idx_dim,
+        n=local_k_heads * idx_dim,
         k=model.hidden_size,
         quant=quant,
         category="indexer",
@@ -1027,18 +1311,40 @@ def _index_cache_inputs(
         recipe="index_wk",
         family="index_projection",
     )
+    is_region = _is_region_csa_indexer(plan)
+    if is_region:
+        prep_ops, q_ready_id, weights_ready_id, store_deps = _region_csa_prep_ops(
+            prefix=prefix, deps=deps, stage=stage, plan=plan, requests=requests,
+            padded_tokens=padded_tokens, idx_heads=idx_heads, idx_dim=idx_dim,
+            local_k_heads=local_k_heads, idx_wq=idx_wq, idx_wk=idx_wk,
+            model=model, quant=quant, mode=mode,
+        )
+        k_ready_id = store_deps[0]
+        store_cache_dtype: str | None = "fp8_e4m3"
+        store_scale_dtype: str | None = quant.index_scale_dtype
+    else:
+        prep_ops = (idx_wq, idx_wk)
+        q_ready_id = idx_wq.op_id
+        weights_ready_id = None
+        k_ready_id = idx_wk.op_id
+        store_deps = (k_ready_id,)
+        store_cache_dtype = None
+        store_scale_dtype = None
     store_ops = _emit_index_store(
         prefix=prefix,
-        deps=(idx_wk.op_id,),
+        deps=store_deps,
         stage=stage,
         layer=plan.index,
         requests=requests,
         phase=mode,
         rows=valid,
         completed_rows=new_idx_rows,
+        views=views,
         row_bytes=row_bytes,
         idx_dim=idx_dim,
-        idx_kv_heads=max(1, int(local_idx_kv_heads)),
+        idx_kv_heads=local_k_heads,
+        cache_dtype=store_cache_dtype,
+        scale_dtype=store_scale_dtype,
         plan=plan,
         model=model,
         quant=quant,
@@ -1047,7 +1353,7 @@ def _index_cache_inputs(
     )
     idx_store_id = store_ops[-1].op_id if store_ops else None
     pcp_idx_ops: tuple[OpSpec, ...] = ()
-    idx_ready = idx_store_id or idx_wk.op_id
+    idx_ready = idx_store_id or k_ready_id
     if pcp_prefill:
         if plan.index_kpool > 1:
             global_idx_rows = sum(
@@ -1080,4 +1386,4 @@ def _index_cache_inputs(
         )
         pcp_idx_ops = (idx_gather,)
         idx_ready = idx_gather.op_id
-    return idx_wq, idx_wk, store_ops, pcp_idx_ops, idx_store_id, idx_ready
+    return prep_ops, q_ready_id, weights_ready_id, store_ops, pcp_idx_ops, idx_store_id, idx_ready

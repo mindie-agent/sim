@@ -107,7 +107,33 @@ def _build(op, context: Geometry | OperatorPlanningContext):
         return _build_program(op, geometry)
     ledger = dict(raw)
     compression = ledger["compression"]
-    lengths = tuple((q, kv - q) for q, kv, _, _, _ in spans)
+    lengths = []
+    expanded_spans = []
+    unique_key_rows = 0
+    for request, (q, kv, q_offset, kv_offset, padding) in zip(context.requests, spans, strict=True):
+        if padding or q <= 0:
+            continue
+        ranges = tuple(
+            (int(start), int(end))
+            for start, end in (getattr(request, "query_ranges", ()) or ())
+            if int(end) > int(start)
+        )
+        if ranges:
+            local_q_offset = q_offset
+            for start, end in ranges:
+                chunk_q = end - start
+                chunk_ctx = int(request.context) + start
+                lengths.append((chunk_q, chunk_ctx))
+                expanded_spans.append((chunk_q, chunk_ctx + chunk_q, local_q_offset, kv_offset, False))
+                local_q_offset += chunk_q
+            max_extent = int(request.context) + max(end for _, end in ranges)
+            unique_key_rows += max_extent // compression
+        else:
+            lengths.append((q, kv - q))
+            expanded_spans.append((q, kv, q_offset, kv_offset, False))
+            unique_key_rows += kv // compression
+    lengths = tuple(lengths)
+    expanded_spans = tuple(expanded_spans)
     queries = sum(q for q, _ in lengths)
     pairs = sum(causal_pairs(q, c, compression) for q, c in lengths if q)
     heads, kv_heads = ledger["heads"], ledger["kv_heads"]
@@ -119,13 +145,13 @@ def _build(op, context: Geometry | OperatorPlanningContext):
         ledger["l2_capacity_bytes"] = capacity if declared is None else min(declared, capacity)
     ledger.update(
         sequence_partition=lengths, query_rows=queries,
+        query_key_pairs=pairs,
         weighted_head_reduce_ops=_weighted_vector_ops(pairs, heads, kv_heads),
-        unique_key_bytes=sum((q + c) // compression for q, c in lengths)
-        * kv_heads * ledger["head_dim"] * dtype_bytes("bf16"),
+        unique_key_bytes=unique_key_rows * kv_heads * ledger["head_dim"] * dtype_bytes("bf16"),
         head_weight_bytes=queries * heads * dtype_bytes(ledger["weight_dtype"]),
-        metadata_read_bytes=len(spans) * (2 + ledger["block_table_columns"]) * _INDEX_ELEMENT_BYTES if queries else 0,
+        metadata_read_bytes=len(lengths) * (2 + ledger["block_table_columns"]) * _INDEX_ELEMENT_BYTES if queries else 0,
         selection_output_bytes=queries * kv_heads * ledger["topk"] * _INDEX_ELEMENT_BYTES,
-        sequence_layout_spans=spans,
+        sequence_layout_spans=expanded_spans,
     )
     metadata["lightning_indexer_work"] = ledger
     bound = replace(op, flops=flops, matrix_flops=(("bf16", flops),) if flops else (), metadata=tuple(metadata.items()))

@@ -134,7 +134,8 @@ def _with_l2_slot_hbm(op: OpSpec, slot_bytes: float) -> OpSpec:
 def emit_index_cache_write(
     *, mode: str = "auto", op_id: str = "", prefix: str = "", deps: tuple[str, ...] = (),
     stage: int = 0, layer: int = 0, requests: tuple[str, ...] = (), phase: str = "decode",
-    rows: int, completed_rows: int | None = None, dim: int = 0, index_dim: int | None = None,
+    rows: int, completed_rows: int | None = None, raw_rows: int | None = None,
+    views: Any = None, dim: int = 0, index_dim: int | None = None,
     heads: int = 1, input_dtype: str | None = None, cache_dtype: str | None = None,
     scale_dtype: str | None = None, group_size: int = DEFAULT_SCALE_GROUP_WIDTH,
     compress_ratio: int | None = None, block_size: int | None = None,
@@ -152,6 +153,7 @@ def emit_index_cache_write(
         return []
     resolved_op_id = str(op_id or (f"{prefix}.index_store" if prefix else "index_store"))
     total_rows, head_count = max(0, int(rows)), max(1, int(heads))
+    written_rows = max(0, int(completed_rows)) if completed_rows is not None else total_rows
     resolved_in_dtype = str(input_dtype or (getattr(model, "activation_dtype", None) if model is not None else None) or "bf16")
     default_cache = "int8" if arch22 else "fp8_e4m3"
     resolved_cache_dtype = str(cache_dtype or (getattr(quant, "index_dtype", None) if quant is not None else None) or default_cache)
@@ -175,13 +177,13 @@ def emit_index_cache_write(
     )
 
     if selected in {"scatter_pa_kv_cache", "bf16_scatter_pa"}:
-        payload, slot_bytes = float(total_rows * head_count * width), float(total_rows * SLOT_INDEX_BYTES)
-        write_bytes = float(total_rows) * float(row_bytes) if row_bytes is not None else payload * out_elem
+        payload, slot_bytes = float(written_rows * head_count * width), float(written_rows * SLOT_INDEX_BYTES)
+        write_bytes = float(written_rows) * float(row_bytes) if row_bytes is not None else payload * out_elem
         return [_with_l2_slot_hbm(vector_op(
             op_id=resolved_op_id, deps=deps, stage=stage, layer=layer, requests=requests, phase=phase,
             family=KV_CACHE_WRITE_FAMILY, recipe=SCATTER_PA_KV_RECIPE, dtype=resolved_cache_dtype,
             elements=int(payload), ops_per_element=0.0, read_bytes_override=payload * in_bytes + slot_bytes,
-            write_bytes_override=write_bytes, shape=(total_rows, head_count, width),
+            write_bytes_override=write_bytes, shape=(written_rows, head_count, width),
             metadata=metadata + extra_meta + (
                 ("native_kind", "aclnnScatterPaKvCache"), ("read_pipe", "aiv"),
                 ("slot_table_bytes", slot_bytes), ("zero_external_casts", True), ("native_source", SCATTER_PA_KV_SOURCE),
@@ -190,17 +192,42 @@ def emit_index_cache_write(
 
     if selected == "qsa_dual_pages":
         ratio = max(1, int(resolved_ratio or DEFAULT_QSA_COMPRESS_RATIO))
-        comp_rows = max(0, int(completed_rows)) if completed_rows is not None else (math.ceil(total_rows / ratio) if total_rows > 0 else 0)
-        raw_tail_rows = min(total_rows, 2 * ratio)
+        live_views = (
+            tuple(v for v in views if not getattr(v, "padding", False))
+            if views is not None else None
+        )
+        if completed_rows is not None:
+            comp_rows = max(0, int(completed_rows))
+        elif live_views is not None:
+            comp_rows = sum(
+                max(0, (int(v.context) + max(0, int(v.q_len))) // ratio - int(v.context) // ratio)
+                for v in live_views
+            )
+        else:
+            comp_rows = total_rows // ratio
+        if live_views is not None:
+            raw_tail_rows = sum(min(max(0, int(v.q_len)), 2 * ratio) for v in live_views)
+        elif raw_rows is not None:
+            raw_tail_rows = max(0, int(raw_rows))
+        else:
+            raw_tail_rows = min(total_rows, max(1, len(requests)) * 2 * ratio)
+        group = max(1, int(group_size or width))
+        groups = max(1, math.ceil(width / group))
+        comp_per_row = (
+            float(row_bytes)
+            if row_bytes is not None
+            else float(head_count) * (width * out_elem + groups * scale_bytes)
+        )
         slot_bytes = float(total_rows * SLOT_INDEX_BYTES)
-        read_bytes = float(total_rows * width * in_bytes) + slot_bytes
-        write_bytes = float(raw_tail_rows * width * in_bytes + comp_rows * width * out_elem)
+        elements = total_rows * head_count * width
+        read_bytes = float(elements * in_bytes) + slot_bytes
+        write_bytes = float(raw_tail_rows * head_count * width * in_bytes) + float(comp_rows) * comp_per_row
         return [_with_l2_slot_hbm(vector_op(
             op_id=resolved_op_id, deps=deps, stage=stage, layer=layer, requests=requests, phase=phase,
             family=KV_CACHE_WRITE_FAMILY, recipe=QSA_DUAL_CACHE_RECIPE, dtype=resolved_cache_dtype,
-            elements=total_rows * width, ops_per_element=float(POOL_REDUCE_OPS_PER_ELEMENT),
+            elements=elements, ops_per_element=float(POOL_REDUCE_OPS_PER_ELEMENT),
             read_bytes_override=read_bytes, write_bytes_override=write_bytes,
-            shape=(max(total_rows, comp_rows), width),
+            shape=(max(total_rows, comp_rows), head_count, width),
             metadata=metadata + (
                 ("read_pipe", "aiv"), ("slot_table_bytes", slot_bytes), ("compress_ratio", ratio),
                 ("raw_circular_rows", raw_tail_rows), ("compressed_rows", comp_rows), ("native_source", QSA_CACHE_SOURCE),
@@ -230,13 +257,13 @@ def emit_index_cache_write(
         group = max(1, int(group_size or width))
         groups = max(1, math.ceil(width / group))
         per_row = float(row_bytes) if row_bytes is not None else head_count * (width * out_elem + groups * scale_bytes)
-        slot_bytes, payload = float(total_rows * SLOT_INDEX_BYTES), total_rows * head_count * width
+        slot_bytes, payload = float(written_rows * SLOT_INDEX_BYTES), written_rows * head_count * width
         return [_with_l2_slot_hbm(vector_op(
             op_id=resolved_op_id, deps=deps, stage=stage, layer=layer, requests=requests, phase=phase,
             family=INDEXER_QUANT_CACHE_FAMILY, recipe=C8_INDEXER_CACHE_RECIPE, dtype=resolved_cache_dtype,
             elements=payload, ops_per_element=float(QUANT_OPS_PER_ELEMENT),
             read_bytes_override=float(payload) * in_bytes + slot_bytes,
-            write_bytes_override=float(total_rows) * per_row, shape=(total_rows, head_count, width),
+            write_bytes_override=float(written_rows) * per_row, shape=(written_rows, head_count, width),
             metadata=metadata + extra_meta + (
                 ("native_kind", "aclnnIndexerQuantCache"), ("read_pipe", "aiv"),
                 ("slot_table_bytes", slot_bytes), ("payload_dtype", resolved_cache_dtype),
