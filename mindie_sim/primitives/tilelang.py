@@ -69,10 +69,10 @@ _REQUIRED_ATTAINMENT_KEYS = (
     "eta_simt_ub_fma_vs_p11",
     "eta_simd_sfu_exp_vs_p08",
 )
-_FP8_DTYPE_NAMES = frozenset({"fp8", "fp8_e4m3", "fp8_e4m3fn", "fp8_e5m2"})
+_FP8_E4M3_DTYPE_NAMES = frozenset({"fp8", "fp8_e4m3", "fp8_e4m3fn"})
 _MXFP8_DTYPE_NAMES = frozenset({"mxfp8", "mxfp8_e4m3", "paired_e8m0"})
 _FP32_DTYPE_NAMES = frozenset({"fp32", "float32"})
-_BF16_FP16_DTYPE_NAMES = frozenset({"bf16", "bfloat16", "fp16", "float16"})
+_BF16_DTYPE_NAMES = frozenset({"bf16", "bfloat16"})
 _VALID_CUBE_EPILOGUES = frozenset({"fixpipe", "dual_copy", "atomic_add"})
 
 
@@ -254,9 +254,19 @@ class TileLangCalibration:
         epi = str(epilogue or "").strip().lower()
         if epi not in _VALID_CUBE_EPILOGUES:
             raise ModelingError(f"tilelang_cube_attainment_epilogue_unsupported:{epi}")
-        if blockscaled or dt in _MXFP8_DTYPE_NAMES:
+        if blockscaled:
+            if dt not in _MXFP8_DTYPE_NAMES and dt not in _FP8_E4M3_DTYPE_NAMES:
+                raise ModelingError(f"tilelang_cube_attainment_dtype_unsupported:{dt}:blockscaled")
+            if hf32:
+                raise ModelingError(f"tilelang_cube_attainment_unsupported:{dt}:hf32")
+            if epi != "fixpipe":
+                raise ModelingError(f"tilelang_cube_attainment_unsupported:{dt}:{epi}")
             raw = self.eta_cube_mxfp8_blockscaled
-        elif dt in _FP8_DTYPE_NAMES:
+        elif dt in _MXFP8_DTYPE_NAMES:
+            raise ModelingError(f"tilelang_cube_attainment_dtype_unsupported:{dt}:non_blockscaled")
+        elif hf32 and dt not in _FP32_DTYPE_NAMES:
+            raise ModelingError(f"tilelang_cube_attainment_unsupported:{dt}:hf32")
+        elif dt in _FP8_E4M3_DTYPE_NAMES:
             if epi == "atomic_add":
                 raise ModelingError(f"tilelang_cube_attainment_unsupported:{dt}:{epi}")
             raw = self.eta_cube_fp8_dualcopy_fp32 if epi == "dual_copy" else self.eta_cube_fp8_fixpipe
@@ -264,7 +274,7 @@ class TileLangCalibration:
             if epi != "fixpipe":
                 raise ModelingError(f"tilelang_cube_attainment_unsupported:{dt}:{epi}")
             raw = self.eta_cube_hf32 if hf32 else self.eta_cube_fp32_ieee
-        elif dt in _BF16_FP16_DTYPE_NAMES:
+        elif dt in _BF16_DTYPE_NAMES:
             if epi == "dual_copy":
                 raw = self.eta_cube_bf16_dualcopy_fp32
             elif epi == "atomic_add":
@@ -319,12 +329,9 @@ class TileLangCalibration:
         else:
             table = {
                 "ub_stream": self.simd_ub_stream_vadd_gops_per_aiv,
-                "ub_fma": self.simd_ub_stream_vadd_gops_per_aiv,
                 "reg_alu": self.simd_reg_alu_gops_per_aiv,
-                "reg_fma": self.simd_reg_alu_gops_per_aiv,
                 "sfu_exp": self.simd_sfu_exp_gops_per_aiv,
                 "exp": self.simd_sfu_exp_gops_per_aiv,
-                "reduce": self.simd_ub_stream_vadd_gops_per_aiv,
             }
         rate = table.get(kind)
         if rate is None:
