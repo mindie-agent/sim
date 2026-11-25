@@ -9,12 +9,15 @@
 
 [Invariants]
   * ``communicator_id`` and ``coset_id`` are attribution/rendezvous metadata
-    only; two cosets touching the same ``PortKey`` contend on one Engine row.
+    only; two cosets touching the same ``PortKey`` or physical directional die
+    injection/SDMA ceiling contend on one Engine row.
   * Distinct physical rails on the same node/endpoint emit distinct ``PortKey``
     rows and overlap without artificial serialization.
-  * Host bus contention builds one ``RootComplexKey`` resource per unique
-    ``(node, root_complex_id, direction)`` across all active dies; a solo die
-    keeps its full solo ceiling without pre-division by configured die count.
+  * Host bus contention binds one physical directional solo resource
+    ``host_solo:{h2d,d2h}:d{rank}`` per die plus one ``RootComplexKey`` resource
+    per unique ``(node, root_complex_id, direction)`` across participating dies;
+    a solo die keeps its full solo ceiling without pre-division by configured
+    die count.
 
 [Timeouts & Locks]
   Pure in-memory key normalization and resource table construction; no I/O.
@@ -311,27 +314,124 @@ def root_complex_resources_for_dies(
     return tuple(resources)
 
 
+def die_injection_resource_name(
+    rank: int, direction: str, *, namespace: str = ""
+) -> str:
+    """Canonical physical directional die-injection resource name."""
+    if direction not in VALID_PORT_DIRECTIONS:
+        raise ModelingError(f"port_key_direction_invalid:{direction}")
+    return f"{namespace}ub_inj:{direction}:r{int(rank)}"
+
+
+def sdma_flow_resource_name(
+    rank: int, direction: str, *, namespace: str = ""
+) -> str:
+    """Canonical physical directional per-die SDMA flow-cap resource name."""
+    if direction not in VALID_PORT_DIRECTIONS:
+        raise ModelingError(f"port_key_direction_invalid:{direction}")
+    return f"{namespace}sdma_flow:{direction}:r{int(rank)}"
+
+
+def host_solo_resource_name(
+    die_or_rank, direction: str, *, namespace: str = ""
+) -> str:
+    """Canonical physical directional per-die host DMA resource name."""
+    if direction not in VALID_HOST_DIRECTIONS:
+        raise ModelingError(f"host_transfer_direction_invalid:{direction}")
+    rank = (
+        int(die_or_rank)
+        if isinstance(die_or_rank, int) and not isinstance(die_or_rank, bool)
+        else int(getattr(die_or_rank, "rank", 0))
+    )
+    return f"{namespace}host_solo:{direction}:d{rank}"
+
+
+def host_solo_resources_for_dies(
+    machine, dies, *, namespace: str = ""
+) -> tuple[Resource, ...]:
+    """Build per-die directional ``host_solo:{h2d,d2h}:d{rank}`` resources."""
+    if machine is None or not dies or not hasattr(machine, "host_solo_bw_gbps"):
+        return ()
+    seen: set[int] = set()
+    ordered_ranks: list[int] = []
+    for die in dies:
+        rank = int(getattr(die, "rank", 0))
+        if rank not in seen:
+            seen.add(rank)
+            ordered_ranks.append(rank)
+
+    resources: list[Resource] = []
+    for direction in ("h2d", "d2h"):
+        solo_gbps = machine.host_solo_bw_gbps(direction)
+        if solo_gbps is None or float(solo_gbps) <= 0.0:
+            continue
+        rate_bytes_per_ms = float(solo_gbps) * GBPS_TO_BYTES_PER_MS
+        for rank in ordered_ranks:
+            resources.append(
+                Resource(
+                    host_solo_resource_name(rank, direction, namespace=namespace),
+                    rate_bytes_per_ms,
+                    "bytes",
+                )
+            )
+    return tuple(resources)
+
+
+def host_dma_resources_for_dies(
+    machine, dies, *, namespace: str = ""
+) -> tuple[Resource, ...]:
+    """Build unified per-die solo + shared root-complex host DMA resources."""
+    die_tuple = tuple(dies) if dies is not None else ()
+    return (
+        *host_solo_resources_for_dies(machine, die_tuple, namespace=namespace),
+        *root_complex_resources_for_dies(machine, die_tuple, namespace=namespace),
+    )
+
+
 def host_transfer_demand(
     machine, die, direction: str, payload_bytes: float, *,
-    namespace: str = "", rank_resource: str | None = None,
+    namespace: str = "", rank_resource: str | None = None, dies=None,
 ) -> dict[str, float]:
-    """Build coupled per-die solo + shared root-complex Engine demand dict."""
+    """Build coupled per-die solo + shared root-complex Engine demand dict.
+
+    Bills ``1x`` ``payload_bytes`` onto each participating die's physical
+    directional solo channel ``host_solo:{h2d,d2h}:d{rank}`` (or an explicit
+    caller ``rank_resource`` override) and accumulates ``payload_bytes`` per
+    participating die onto each die's
+    ``RootComplexKey(node, root_complex_id, direction)``.
+    """
     if direction not in VALID_HOST_DIRECTIONS:
         raise ModelingError(f"host_transfer_direction_invalid:{direction}")
     payload = float(payload_bytes)
     if payload <= 0.0:
         return {}
+    participants = tuple(dies) if dies is not None else ((die,) if die is not None else ())
     demand: dict[str, float] = {}
-    if rank_resource:
-        demand[rank_resource] = payload
+    if rank_resource is not None:
+        if rank_resource:
+            demand[rank_resource] = payload
+    elif participants:
+        solo_gbps = (
+            machine.host_solo_bw_gbps(direction)
+            if machine is not None and hasattr(machine, "host_solo_bw_gbps")
+            else None
+        )
+        if machine is None or (solo_gbps is not None and float(solo_gbps) > 0.0):
+            for participant in participants:
+                solo_name = host_solo_resource_name(
+                    participant, direction, namespace=namespace
+                )
+                demand[solo_name] = demand.get(solo_name, 0.0) + payload
     ceiling_gbps = (
         machine.host_root_complex_ceiling_gbps(direction)
         if machine is not None and hasattr(machine, "host_root_complex_ceiling_gbps")
         else None
     )
-    if ceiling_gbps is not None and ceiling_gbps > 0:
-        node = int(getattr(die, "node", 0))
-        rc_id = str(getattr(die, "root_complex_id", "") or "rc0")
-        key = RootComplexKey(node=node, root_complex_id=rc_id, direction=direction)
-        demand[key.resource_name(namespace)] = payload
+    if ceiling_gbps is not None and ceiling_gbps > 0 and participants:
+        for participant in participants:
+            node = int(getattr(participant, "node", 0))
+            rc_id = str(getattr(participant, "root_complex_id", "") or "rc0")
+            key = RootComplexKey(node=node, root_complex_id=rc_id, direction=direction)
+            rc_name = key.resource_name(namespace)
+            demand[rc_name] = demand.get(rc_name, 0.0) + payload
     return demand

@@ -24,8 +24,9 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
+import math
 
 from mindie_sim.schema.common import ModelingError
 from ..communication import CommunicationWork
@@ -39,6 +40,155 @@ from .protocol import (
 from .ring_pairwise import _joint_complete, _ready_by_rank
 
 TWO_PHASES = 2
+_POST_NETWORK_STAGE_NAMES = frozenset({
+    "reduce_scatter", "all_gather", "peer_exchange", "unpack_store",
+})
+
+
+def _unwrap_collective_stages(stages_in):
+    from ..program import KernelProgram
+
+    if (len(stages_in) == TWO_PHASES
+            and stages_in[0].name == "setup"
+            and isinstance(stages_in[1].program, KernelProgram)):
+        return stages_in[1].program.stages
+    return stages_in
+
+
+def _strip_stage_links(
+    stg, after: tuple[str, ...], link_names: frozenset[str], *, exclude_band_plan: bool = False,
+):
+    if exclude_band_plan and (
+        isinstance(stg.program, BandCollectivePlan) or stg.name == "band_collective:local_hbm"
+    ):
+        return None
+    local_work = {k: v for k, v in stg.work.items() if k not in link_names}
+    local_caps = {k: v for k, v in stg.caps.items() if k not in link_names}
+    local_place = {k: v for k, v in stg.placement.items() if k not in link_names}
+    local_units = {k: v for k, v in stg.work_units.items() if k not in link_names}
+    local_widened = tuple(k for k in stg.cohort_widened if k not in link_names)
+    local_members = {k: v for k, v in stg.cohort_members.items() if k not in link_names}
+    local_deliv = tuple((k, v) for k, v in stg.deliveries if k not in link_names)
+    has_prog = (
+        stg.program is not None and not isinstance(stg.program, BandCollectivePlan)
+        if exclude_band_plan else stg.program is not None
+    )
+    has_local = bool(
+        local_work or stg.metadata or local_deliv or stg.acquire
+        or stg.free or stg.latency > 0.0 or has_prog or stg.fragment is not None
+    )
+    if not has_local:
+        return None
+    return replace(
+        stg,
+        work=local_work,
+        caps=local_caps,
+        placement=local_place,
+        work_units=local_units,
+        cohort_widened=local_widened,
+        cohort_members=local_members,
+        deliveries=local_deliv,
+        coupled=stg.coupled and bool(local_work),
+        after=after,
+        keep_empty=True,
+    )
+
+
+def _remap_stage_after(
+    raw: tuple[str, ...], inherited: dict[str, tuple[str, ...]], valid: set[str]
+) -> tuple[str, ...]:
+    deps: list[str] = []
+    for dep in raw:
+        for target in inherited.get(dep, (dep,)):
+            if target in valid and target not in deps:
+                deps.append(target)
+    return tuple(deps)
+
+
+def _partition_pre_post_stages(stages_in, link_names: frozenset[str]):
+    """Split stages into pre-network vs link-coupled/post-network stages."""
+    pre_stages = []
+    post_stages = []
+    post_names: set[str] = set()
+    for stg in stages_in:
+        is_post = (
+            isinstance(stg.program, BandCollectivePlan)
+            or stg.name == "band_collective:local_hbm"
+            or stg.name in _POST_NETWORK_STAGE_NAMES
+            or bool(set(stg.work) & link_names)
+            or any(dep in post_names for dep in stg.after)
+        )
+        if is_post:
+            post_names.add(stg.name)
+            post_stages.append(stg)
+        else:
+            pre_stages.append(stg)
+    return pre_stages, post_stages
+
+
+def _with_recomputed_phases(
+    lowered: LoweredCollective, phases, **extra,
+) -> LoweredCollective:
+    """Replace phases on ``lowered`` and recompute wire/payload totals."""
+    per_rank = {rank: 0.0 for rank in lowered.group}
+    total_wire = 0.0
+    for phase in phases:
+        for transfer in phase.transfers:
+            if transfer.source in per_rank:
+                per_rank[transfer.source] += transfer.payload_bytes
+            total_wire += transfer.wire_bytes
+    return replace(
+        lowered,
+        phases=tuple(phases),
+        total_payload_bytes=math.fsum(per_rank.values()),
+        total_wire_bytes=total_wire,
+        per_rank_payload_bytes=tuple((r, per_rank[r]) for r in lowered.group),
+        **extra,
+    )
+
+
+def _phase_slice_plan(plan: BandCollectivePlan, phase_index: int) -> BandCollectivePlan:
+    """Slice one phase out of a multi-phase plan, charging collective startup once."""
+    sliced_groups = tuple(
+        replace(
+            group,
+            lowered=_with_recomputed_phases(
+                group.lowered,
+                (group.lowered.phases[phase_index],),
+                collective_startup_us=(
+                    group.lowered.collective_startup_us if phase_index == 0 else 0.0
+                ),
+            ),
+        )
+        for group in plan.groups
+    )
+    return replace(plan, groups=sliced_groups)
+
+
+def _integer_peer_row(raw_row: Sequence[float], row_idx: int) -> tuple[int, ...]:
+    """Apportion non-negative peer cells to integers conserving exact row sum."""
+    n_ranks = len(raw_row)
+    result = [0] * n_ranks
+    diag = int(round(raw_row[row_idx])) if n_ranks else 0
+    if n_ranks:
+        result[row_idx] = diag
+    off_cols = [c for c in range(n_ranks) if c != row_idx]
+    if not off_cols:
+        return tuple(result)
+    off_vals = [float(raw_row[c]) for c in off_cols]
+    target = int(round(math.fsum(off_vals)))
+    floors = [int(math.floor(v)) for v in off_vals]
+    rem = target - sum(floors)
+    for c, base_val in zip(off_cols, floors):
+        result[c] = base_val
+    if rem > 0:
+        order = sorted(
+            range(len(off_cols)),
+            key=lambda i: (-(off_vals[i] - floors[i]), (off_cols[i] - row_idx) % n_ranks),
+        )
+        for i in order[:rem]:
+            result[off_cols[i]] += 1
+    return tuple(result)
 
 
 def api_bytes_from_link_volume(
@@ -236,8 +386,10 @@ class BandCollectivePlan:
             lowered = group.lowered
             scoped_phases = []
             for phase in lowered.phases:
-                sourced = [t for t in phase.transfers if t.source in local_ranks]
-                chosen = sourced or [t for t in phase.transfers if t.destination in local_ranks]
+                chosen = [
+                    t for t in phase.transfers
+                    if t.source in local_ranks or t.destination in local_ranks
+                ]
                 kept_transfers = []
                 for transfer in chosen:
                     kept_hops = []
@@ -249,87 +401,15 @@ class BandCollectivePlan:
                         kept_transfers.append(replace(transfer, hops=tuple(kept_hops)))
                 scoped_phases.append(replace(phase, transfers=tuple(kept_transfers)))
             scoped_groups.append(
-                replace(group, lowered=replace(lowered, phases=tuple(scoped_phases)))
+                replace(group, lowered=_with_recomputed_phases(lowered, scoped_phases))
             )
         if not scoped_groups:
             return None
         return replace(self, groups=tuple(scoped_groups))
 
-    def lower_with_local_work(self, context, base_program):
-        """Wrap this lowered collective plan inside preserved local stages."""
-        from ..mechanism import Work
-        from ..program import KernelProgram, Stage
+    def _append_local_hbm(self, context, out: list, after: tuple[str, ...]) -> tuple[str, ...]:
+        from ..program import Stage
 
-        if any(stg.program is self for stg in base_program.stages):
-            return base_program
-        link_names = frozenset(self.accounting().wire_by_resource)
-        stages_in = base_program.stages
-        # Unwrap outer setup -> body container from TopologyCollectiveRecipe
-        if (len(stages_in) == TWO_PHASES
-                and stages_in[0].name == "setup"
-                and isinstance(stages_in[1].program, KernelProgram)):
-            stages_in = stages_in[1].program.stages
-
-        def _strip_links(stg: Stage, after: tuple[str, ...]) -> Stage | None:
-            local_work = {k: v for k, v in stg.work.items() if k not in link_names}
-            local_caps = {k: v for k, v in stg.caps.items() if k not in link_names}
-            local_place = {k: v for k, v in stg.placement.items() if k not in link_names}
-            local_units = {k: v for k, v in stg.work_units.items() if k not in link_names}
-            local_widened = tuple(k for k in stg.cohort_widened if k not in link_names)
-            local_members = {k: v for k, v in stg.cohort_members.items() if k not in link_names}
-            local_deliv = tuple((k, v) for k, v in stg.deliveries if k not in link_names)
-            has_local = bool(
-                local_work or stg.metadata or local_deliv or stg.acquire
-                or stg.free or stg.latency > 0.0 or stg.program is not None
-                or stg.fragment is not None
-            )
-            if not has_local:
-                return None
-            return replace(
-                stg,
-                work=local_work,
-                caps=local_caps,
-                placement=local_place,
-                work_units=local_units,
-                cohort_widened=local_widened,
-                cohort_members=local_members,
-                deliveries=local_deliv,
-                coupled=stg.coupled and bool(local_work),
-                after=after,
-                keep_empty=True,
-            )
-
-        def _remap_after(raw: tuple[str, ...], inherited: dict[str, tuple[str, ...]], valid: set[str]) -> tuple[str, ...]:
-            deps: list[str] = []
-            for dep in raw:
-                for target in inherited.get(dep, (dep,)):
-                    if target in valid and target not in deps:
-                        deps.append(target)
-            return tuple(deps)
-
-        pre_mid = [s for s in stages_in if s.name != "unpack_store"]
-        unpack_stages = [s for s in stages_in if s.name == "unpack_store"]
-
-        out: list[Stage] = []
-        valid: set[str] = set()
-        inherited: dict[str, tuple[str, ...]] = {}
-        consumed_by_downstream: set[str] = set()
-        for stg in pre_mid:
-            eff_after = _remap_after(stg.after, inherited, valid)
-            kept = _strip_links(stg, eff_after)
-            if kept is None:
-                inherited[stg.name] = eff_after
-                continue
-            out.append(kept)
-            valid.add(kept.name)
-            consumed_by_downstream.update(eff_after)
-
-        terminals = tuple(s.name for s in out if s.name not in consumed_by_downstream)
-        reserved = valid | {s.name for s in unpack_stages}
-        plan_name = "band_collective" if "band_collective" not in reserved else "band_collective:plan"
-        out.append(Stage(plan_name, after=terminals, program=self, keep_empty=True))
-
-        post_root = plan_name
         local_hbm = max(
             (float(g.lowered.local_hbm_bytes_per_rank) for g in self.groups),
             default=0.0,
@@ -342,16 +422,113 @@ class BandCollectivePlan:
             out.append(Stage(
                 hbm_stage_name,
                 work=bind_fn(Work(resources={"hbm": local_hbm})),
-                after=(plan_name,),
+                after=after,
             ))
-            post_root = hbm_stage_name
+            return (hbm_stage_name,)
+        return after
 
-        post_valid: set[str] = {post_root}
+    def _can_interleave_two_phase_ar(self, post_stages, link_names: frozenset[str]) -> bool:
+        if not self.groups:
+            return False
+        if not all(
+            len(g.lowered.phases) == TWO_PHASES
+            and not any(p.pipelined_slices for p in g.lowered.phases)
+            and g.lowered.phases[0].name == "reduce_scatter"
+            and g.lowered.phases[1].name == "all_gather"
+            for g in self.groups
+        ):
+            return False
+        return any(
+            stg.name == "reduce_scatter"
+            and _strip_stage_links(stg, (), link_names) is not None
+            for stg in post_stages
+        )
+
+    def lower_with_local_work(self, context, base_program):
+        """Wrap this lowered collective plan inside causally ordered local stages."""
+        from ..program import KernelProgram, Stage
+
+        if any(isinstance(stg.program, BandCollectivePlan) for stg in base_program.stages):
+            return base_program
+        link_names = frozenset(self.accounting().wire_by_resource)
+        stages_in = _unwrap_collective_stages(base_program.stages)
+        pre_stages, post_stages = _partition_pre_post_stages(stages_in, link_names)
+        mid_stages = [s for s in post_stages if s.name != "unpack_store"]
+        unpack_stages = [s for s in post_stages if s.name == "unpack_store"]
+
+        out: list[Stage] = []
+        valid: set[str] = set()
+        inherited: dict[str, tuple[str, ...]] = {}
+        consumed_by_downstream: set[str] = set()
+        for stg in pre_stages:
+            eff_after = _remap_stage_after(stg.after, inherited, valid)
+            kept = _strip_stage_links(stg, eff_after, link_names)
+            if kept is None:
+                inherited[stg.name] = eff_after
+                continue
+            out.append(kept)
+            valid.add(kept.name)
+            consumed_by_downstream.update(eff_after)
+
+        pre_terminals = tuple(s.name for s in out if s.name not in consumed_by_downstream)
+        reserved = valid | {s.name for s in post_stages}
+        if self._can_interleave_two_phase_ar(mid_stages, link_names):
+            rs_net = "band_collective:rs_net"
+            ag_net = "band_collective:ag_net"
+            rs_idx = next(i for i, s in enumerate(mid_stages) if s.name == "reduce_scatter")
+            out.append(Stage(
+                rs_net, after=pre_terminals, program=_phase_slice_plan(self, 0), keep_empty=True,
+            ))
+            rs_valid: set[str] = {rs_net}
+            rs_inherited: dict[str, tuple[str, ...]] = {}
+            rs_consumed: set[str] = set()
+            rs_added: list[str] = []
+            for stg in mid_stages[:rs_idx + 1]:
+                internal = _remap_stage_after(stg.after, rs_inherited, rs_valid)
+                eff_after = internal or (rs_net,)
+                kept = _strip_stage_links(stg, eff_after, link_names)
+                if kept is None:
+                    rs_inherited[stg.name] = eff_after
+                    continue
+                out.append(kept)
+                rs_valid.add(kept.name)
+                rs_consumed.update(eff_after)
+                rs_added.append(kept.name)
+            rs_terminals = tuple(name for name in rs_added if name not in rs_consumed) or (rs_net,)
+            out.append(Stage(
+                ag_net, after=rs_terminals, program=_phase_slice_plan(self, 1), keep_empty=True,
+            ))
+            net_root = ag_net
+            remaining_mid = mid_stages[rs_idx + 1:]
+        else:
+            plan_name = "band_collective" if "band_collective" not in reserved else "band_collective:plan"
+            out.append(Stage(plan_name, after=pre_terminals, program=self, keep_empty=True))
+            net_root = plan_name
+            remaining_mid = mid_stages
+
+        post_valid: set[str] = {net_root}
         post_inherited: dict[str, tuple[str, ...]] = {}
+        post_consumed: set[str] = set()
+        mid_added: list[str] = []
+        for stg in remaining_mid:
+            internal = _remap_stage_after(stg.after, post_inherited, post_valid)
+            eff_after = internal or (net_root,)
+            kept = _strip_stage_links(stg, eff_after, link_names)
+            if kept is None:
+                post_inherited[stg.name] = eff_after
+                continue
+            out.append(kept)
+            post_valid.add(kept.name)
+            post_consumed.update(eff_after)
+            mid_added.append(kept.name)
+
+        mid_terminals = tuple(name for name in mid_added if name not in post_consumed) or (net_root,)
+        hbm_roots = self._append_local_hbm(context, out, mid_terminals)
+        post_valid.update(hbm_roots)
         for stg in unpack_stages:
-            internal = _remap_after(stg.after, post_inherited, post_valid)
-            eff_after = internal if post_root in internal else (post_root, *internal)
-            kept = _strip_links(stg, eff_after)
+            internal = _remap_stage_after(stg.after, post_inherited, post_valid)
+            eff_after = tuple(dict.fromkeys((*hbm_roots, *internal)))
+            kept = _strip_stage_links(stg, eff_after, link_names)
             if kept is None:
                 post_inherited[stg.name] = eff_after
                 continue
@@ -367,96 +544,51 @@ class BandCollectivePlan:
 
         Used by cohort-wide scheduling so each replica executes its local pack
         stages before ONE shared ``BandCollectivePlan`` network submission and
-        runs its local HBM/unpack stages once its rank completions resolve.
+        runs its local reduction/HBM/unpack stages strictly after rank arrivals.
         """
-        from ..program import KernelProgram, Stage
+        from ..program import KernelProgram
 
         link_names = frozenset(self.accounting().wire_by_resource) | frozenset(extra_link_names)
-        stages_in = base_program.stages
-        if (len(stages_in) == TWO_PHASES
-                and stages_in[0].name == "setup"
-                and isinstance(stages_in[1].program, KernelProgram)):
-            stages_in = stages_in[1].program.stages
+        stages_in = _unwrap_collective_stages(base_program.stages)
+        pre_stages, post_stages = _partition_pre_post_stages(stages_in, link_names)
+        mid_stages = [s for s in post_stages if s.name != "unpack_store"]
+        unpack_stages = [s for s in post_stages if s.name == "unpack_store"]
 
-        def _strip_links(stg: Stage, after: tuple[str, ...]) -> Stage | None:
-            local_work = {k: v for k, v in stg.work.items() if k not in link_names}
-            local_caps = {k: v for k, v in stg.caps.items() if k not in link_names}
-            local_place = {k: v for k, v in stg.placement.items() if k not in link_names}
-            local_units = {k: v for k, v in stg.work_units.items() if k not in link_names}
-            local_widened = tuple(k for k in stg.cohort_widened if k not in link_names)
-            local_members = {k: v for k, v in stg.cohort_members.items() if k not in link_names}
-            local_deliv = tuple((k, v) for k, v in stg.deliveries if k not in link_names)
-            has_local = bool(
-                local_work or stg.metadata or local_deliv or stg.acquire
-                or stg.free or stg.latency > 0.0
-                or (stg.program is not None and not isinstance(stg.program, BandCollectivePlan))
-                or stg.fragment is not None
-            )
-            if not has_local:
-                return None
-            return replace(
-                stg,
-                work=local_work,
-                caps=local_caps,
-                placement=local_place,
-                work_units=local_units,
-                cohort_widened=local_widened,
-                cohort_members=local_members,
-                deliveries=local_deliv,
-                coupled=stg.coupled and bool(local_work),
-                after=after,
-                keep_empty=True,
-            )
-
-        def _remap_after(raw: tuple[str, ...], inherited: dict[str, tuple[str, ...]], valid: set[str]) -> tuple[str, ...]:
-            deps: list[str] = []
-            for dep in raw:
-                for target in inherited.get(dep, (dep,)):
-                    if target in valid and target not in deps:
-                        deps.append(target)
-            return tuple(deps)
-
-        pre_out: list[Stage] = []
+        pre_out = []
         pre_valid: set[str] = set()
         pre_inherited: dict[str, tuple[str, ...]] = {}
-        for stg in stages_in:
-            if stg.name == "unpack_store" or stg.name == "band_collective:local_hbm" or isinstance(stg.program, BandCollectivePlan):
-                continue
-            eff_after = _remap_after(stg.after, pre_inherited, pre_valid)
-            kept = _strip_links(stg, eff_after)
+        for stg in pre_stages:
+            eff_after = _remap_stage_after(stg.after, pre_inherited, pre_valid)
+            kept = _strip_stage_links(stg, eff_after, link_names, exclude_band_plan=True)
             if kept is None:
                 pre_inherited[stg.name] = eff_after
                 continue
             pre_out.append(kept)
             pre_valid.add(kept.name)
 
-        post_out: list[Stage] = []
+        post_out = []
         post_valid: set[str] = set()
         post_inherited: dict[str, tuple[str, ...]] = {}
-        local_hbm = max(
-            (float(g.lowered.local_hbm_bytes_per_rank) for g in self.groups),
-            default=0.0,
-        )
-        op_hbm = float(getattr(getattr(context, "op", None), "hbm_bytes", 0.0) or 0.0)
-        bind_fn = getattr(context, "bind", None)
-        res_names = getattr(context, "resource_names", ()) or ()
-        hbm_root: tuple[str, ...] = ()
-        if local_hbm > 0.0 and op_hbm <= 0.0 and callable(bind_fn) and "hbm" in res_names:
-            hbm_stage_name = "band_collective:local_hbm"
-            post_out.append(Stage(
-                hbm_stage_name,
-                work=bind_fn(Work(resources={"hbm": local_hbm})),
-                after=(),
-            ))
-            post_valid.add(hbm_stage_name)
-            hbm_root = (hbm_stage_name,)
-
-        for stg in stages_in:
-            if stg.name != "unpack_store":
+        post_consumed: set[str] = set()
+        mid_added: list[str] = []
+        for stg in mid_stages:
+            eff_after = _remap_stage_after(stg.after, post_inherited, post_valid)
+            kept = _strip_stage_links(stg, eff_after, link_names, exclude_band_plan=True)
+            if kept is None:
+                post_inherited[stg.name] = eff_after
                 continue
-            internal = _remap_after(stg.after, post_inherited, post_valid)
-            eff_after = tuple(dict.fromkeys((*hbm_root, *internal)))
-            kept = _strip_links(stg, eff_after)
+            post_out.append(kept)
+            post_valid.add(kept.name)
+            post_consumed.update(eff_after)
+            mid_added.append(kept.name)
+
+        mid_terminals = tuple(name for name in mid_added if name not in post_consumed)
+        hbm_roots = self._append_local_hbm(context, post_out, mid_terminals)
+        post_valid.update(hbm_roots)
+        for stg in unpack_stages:
+            internal = _remap_stage_after(stg.after, post_inherited, post_valid)
+            eff_after = tuple(dict.fromkeys((*hbm_roots, *internal)))
+            kept = _strip_stage_links(stg, eff_after, link_names, exclude_band_plan=True)
             if kept is None:
                 post_inherited[stg.name] = eff_after
                 continue
@@ -511,10 +643,26 @@ def build_band_collective_plan(
         if family == "alltoallv" or peer is not None:
             if peer is None:
                 raise ModelingError("pairwise_collective_alltoallv_requires_explicit_peer_matrix")
-            matrix = tuple(
-                tuple(int(round(peer.payload(r, c))) for c in range(len(ranks)))
-                for r in range(len(ranks))
-            )
+            n_ranks = len(ranks)
+            if getattr(peer, "direction", "forward") == "transpose":
+                fwd_peer = peer.transposed()
+                fwd_matrix = tuple(
+                    _integer_peer_row(
+                        tuple(fwd_peer.payload(r, c) for c in range(n_ranks)), r
+                    )
+                    for r in range(n_ranks)
+                )
+                matrix = tuple(
+                    tuple(fwd_matrix[c][r] for c in range(n_ranks))
+                    for r in range(n_ranks)
+                )
+            else:
+                matrix = tuple(
+                    _integer_peer_row(
+                        tuple(peer.payload(r, c) for c in range(n_ranks)), r
+                    )
+                    for r in range(n_ranks)
+                )
             send_splits = tuple(sum(row) for row in matrix)
             recv_splits = tuple(
                 sum(matrix[r][c] for r in range(len(ranks)))
@@ -536,9 +684,12 @@ def build_band_collective_plan(
                     raise ModelingError("ring_collective_requires_equal_per_rank_volume")
                 n_ranks = len(ranks)
                 matrix = tuple(
-                    tuple(
-                        0 if r_i == c_i else int(round(volumes[ranks[r_i]] / float(n_ranks - 1)))
-                        for c_i in range(n_ranks)
+                    _integer_peer_row(
+                        tuple(
+                            0.0 if r_i == c_i else volumes[ranks[r_i]] / float(n_ranks - 1)
+                            for c_i in range(n_ranks)
+                        ),
+                        r_i,
                     )
                     for r_i in range(n_ranks)
                 )

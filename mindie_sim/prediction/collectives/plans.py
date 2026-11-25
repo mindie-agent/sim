@@ -299,6 +299,8 @@ class _TopologyPlansMixin:
         resolved = TransportOptions(
             chunk_bytes=chunk_bytes, hop_startup_us=hop_startup_us,
             receive_capacity_bytes_per_peer=receive_capacity_bytes_per_peer,
+            receive_buffer_id=receive_buffer_id,
+            max_inflight_per_rank=max_inflight_per_rank,
             max_physical_chunks=max_physical_chunks)
         if len(self._transport_bindings) >= MAX_TRANSPORT_BINDINGS:
             self._transport_bindings.clear()
@@ -410,7 +412,13 @@ class _TopologyPlansMixin:
                                if startup is not None else rounds)
                 groups.append(WaveGroup(
                     ranks, tuple(totals), wave_rounds, self, peer_traffic=peer,
-                    max_inflight_per_rank=max_inflight_per_rank))
+                    max_inflight_per_rank=max_inflight_per_rank,
+                    chunk_bytes=chunk_bytes,
+                    hop_startup_us=hop_startup_us,
+                    receive_capacity_bytes_per_peer=(
+                        receive_capacity_bytes_per_peer),
+                    receive_buffer_id=receive_buffer_id,
+                    max_physical_chunks=max_physical_chunks))
             else:
                 groups.append(PairwiseGroup(
                     ranks, tuple(totals), rounds, self, peer_traffic=peer))
@@ -746,11 +754,19 @@ class _TopologyPlansMixin:
             return None
         if not unique_groups or all(len(ranks) <= 1 for ranks in unique_groups):
             return None
+        exp = expansion_mode or metadata.get("expansion_mode")
         if not any(
             _candidate_bands(ranks, self, _infer_group_scope(ranks, self))
             for ranks in unique_groups
             if len(ranks) > 1
         ):
+            if exp:
+                first_group = next(r for r in unique_groups if len(r) > 1)
+                scope = _infer_group_scope(first_group, self)
+                raise ModelingError(
+                    f"collective_band_missing:{norm_family}:scope={scope}:"
+                    f"group={len(first_group)}:expansion={exp}"
+                )
             return None
         if algorithm == "ring":
             if "peer_traffic" in metadata:
@@ -797,7 +813,6 @@ class _TopologyPlansMixin:
                         return None
         elif norm_family == "alltoallv":
             return None
-        exp = expansion_mode or metadata.get("expansion_mode")
         stack_id = str(metadata.get("stack_id") or stack or "default")
         try:
             return build_band_collective_plan(
@@ -805,7 +820,7 @@ class _TopologyPlansMixin:
                 peer=peer, stack=stack_id, expansion_mode=exp,
             )
         except ModelingError as exc:
-            if str(exc).startswith("collective_band_missing"):
+            if not exp and str(exc).startswith("collective_band_missing"):
                 return None
             raise
 

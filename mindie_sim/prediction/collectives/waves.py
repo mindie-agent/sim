@@ -32,6 +32,7 @@ from typing import Any
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.prediction.communication import MessageFlow
+from .transport import DEFAULT_MAX_PHYSICAL_CHUNKS, TransportOptions
 
 
 REL_TOL = 1e-12
@@ -115,6 +116,58 @@ class WaveGroup:
     topology: object = field(repr=False, compare=False)
     peer_traffic: object | None = field(default=None, repr=False, compare=False)
     max_inflight_per_rank: int | None = DEFAULT_MAX_INFLIGHT
+    chunk_bytes: float | None = None
+    hop_startup_us: float = 0.0
+    receive_capacity_bytes_per_peer: float | None = None
+    receive_buffer_id: str | None = None
+    max_physical_chunks: int | None = DEFAULT_MAX_PHYSICAL_CHUNKS
+
+    @property
+    def _uses_chunked_transport(self) -> bool:
+        return (
+            self.chunk_bytes is not None
+            or bool(self.hop_startup_us)
+            or self.receive_capacity_bytes_per_peer is not None
+        )
+
+    def _submit_chunked_peer(
+        self, engine, prefix: str, source: int, destination: int, payload: float,
+        ready, dest_ready, *, owner: str, on_send_done, on_recv_done,
+    ) -> None:
+        recv_cap = (
+            {destination: self.receive_capacity_bytes_per_peer}
+            if self.receive_capacity_bytes_per_peer is not None else None
+        )
+        recv_buf = None
+        if self.receive_capacity_bytes_per_peer is not None:
+            buf_id = (
+                self.receive_buffer_id
+                or f"{getattr(self.topology, 'namespace', '')}peer:{source}>{destination}"
+            )
+            recv_buf = {destination: buf_id}
+        plan = self.topology.transport_plan(
+            (MessageFlow(source, destination, payload),),
+            chunk_bytes=self.chunk_bytes,
+            hop_startup_us=self.hop_startup_us,
+            receive_capacity_bytes=recv_cap,
+            receive_buffer_id=recv_buf,
+            max_physical_chunks=self.max_physical_chunks,
+        )
+        run = plan.start(
+            engine, prefix, {source: ready, destination: dest_ready}, owner=owner,
+        )
+        engine.submit(
+            prefix + ":sent",
+            after=(run.send_completions[0],),
+            owner=owner,
+            on_complete=on_send_done,
+        )
+        engine.submit(
+            prefix + ":received",
+            after=(run.completions[0], dest_ready),
+            owner=owner,
+            on_complete=on_recv_done,
+        )
 
     def _payload(self, source_index: int, destination_index: int, count: int) -> float:
         if self.peer_traffic is not None:
@@ -210,6 +263,14 @@ class WaveGroup:
                 metadata={"source_rank": source,
                           "destination_rank": destination,
                           "wave": wave, "offset": offset})
+            if payload and self._uses_chunked_transport:
+                self._submit_chunked_peer(
+                    engine, prefix, source, destination, payload,
+                    ready, initial[destination], owner=owner,
+                    on_send_done=lambda arrival, src_i=index: send_done(src_i, arrival),
+                    on_recv_done=lambda arrival, dst_i=destination_index, w=wave: deliver(dst_i, w, arrival),
+                )
+                return
             received_after = []
             if payload:
                 message = self.topology.route_message(MessageFlow(
@@ -321,13 +382,34 @@ class StartupWaves:
         rounds = getattr(plan, "startup_rounds", None)
         if rounds is None:
             raise ModelingError("startup_waves_requires_resolved_startup_rounds")
-        options = getattr(context, "transport_options", None)
-        window = getattr(options, "max_inflight_per_rank", None)
+        raw_options = getattr(context, "transport_options", None)
+        options = (
+            TransportOptions.from_mapping(raw_options)
+            if raw_options is not None else None
+        )
+
+        def _pick(group, attr: str, default):
+            val = getattr(options, attr, None)
+            if val is not None and (attr != "hop_startup_us" or val):
+                return val
+            return getattr(group, attr, default)
+
         groups = tuple(
             WaveGroup(
                 group.ranks, group.volumes, rounds, group.topology,
                 peer_traffic=group.peer_traffic,
-                max_inflight_per_rank=window,
+                max_inflight_per_rank=_pick(group, "max_inflight_per_rank", DEFAULT_MAX_INFLIGHT),
+                chunk_bytes=_pick(group, "chunk_bytes", None),
+                hop_startup_us=_pick(group, "hop_startup_us", 0.0),
+                receive_capacity_bytes_per_peer=_pick(
+                    group, "receive_capacity_bytes_per_peer", None
+                ),
+                receive_buffer_id=_pick(group, "receive_buffer_id", None),
+                max_physical_chunks=(
+                    options.max_physical_chunks
+                    if options is not None
+                    else getattr(group, "max_physical_chunks", DEFAULT_MAX_PHYSICAL_CHUNKS)
+                ),
             )
             for group in getattr(plan, "groups", ())
         )
