@@ -54,7 +54,9 @@ class BatchBinding:
 def cohorts(parallel, machine=None):
     if machine is not None:
         from mindie_sim.prediction.sharding.local_tp import local_tp_replica_cohorts, local_tp_spans_dp
-        if local_tp_spans_dp(parallel):
+        if local_tp_spans_dp(parallel) or (
+            int(parallel.dp) > 1 and bool(getattr(parallel, "has_local_tp", False))
+        ):
             from mindie_sim.prediction.execution.rank_ledger import replica_cohorts
             return replica_cohorts(machine, parallel, list(local_tp_replica_cohorts(machine, parallel)))
     width = 1 if parallel.rank_table is not None else parallel.ep_dp_width
@@ -62,10 +64,17 @@ def cohorts(parallel, machine=None):
         combined = math.lcm(width, int(parallel.dcp_dp_width))
         if int(parallel.dp) % combined == 0:
             width = combined
+    from mindie_sim.schema.runtime_features import LOCAL_TP_AXIS_NAMES
     tp = max(1, int(parallel.tp))
-    for candidate in parallel.local_tp_widths:
-        if candidate > tp and candidate % tp == 0:
+    for axis in LOCAL_TP_AXIS_NAMES:
+        candidate = max(1, int(getattr(parallel, axis, 1) or 1))
+        if axis == "lm_head_tp":
+            factor = candidate if candidate > 1 else 1
+        elif candidate > tp and candidate % tp == 0:
             factor = candidate // tp
+        else:
+            factor = 1
+        if factor > 1:
             combined = math.lcm(width, factor)
             if int(parallel.dp) % combined == 0:
                 width = combined
@@ -429,6 +438,65 @@ def _cohort_lowering_context(case, schedulers, local, *, is_frontend):
     return logical_local, {**context, **route_context}
 
 
+def _ep_scoped_context(case, schedulers, local, logical_local, base_context, replica):
+    """Scope EP routing totals to ``replica``'s physical EP group inside a wider cohort."""
+    from mindie_sim.prediction.execution.rank_ledger import ep_replica_group
+
+    cohort_reps = tuple(local)
+    ep_reps = ep_replica_group(case.runtime.parallel, case.machine, cohort_reps, replica)
+    if ep_reps == cohort_reps:
+        return dict(base_context)
+    call_context = dict(base_context)
+    if len(ep_reps) <= 1:
+        call_context.pop("global_tokens", None)
+        call_context.pop("routing_global_tokens", None)
+        call_context["source_rows_by_replica"] = (
+            sum(v.q_len + v.draft_proposal_tokens for v in logical_local[replica].requests),
+        )
+        return call_context
+    ep_local = {r: local[r] for r in ep_reps}
+    ep_logical = {r: logical_local[r] for r in ep_reps}
+    ep_source = tuple(
+        sum(v.q_len + v.draft_proposal_tokens for v in ep_logical[r].requests)
+        for r in ep_reps
+    )
+    valid_ep = sum(ep_source)
+    sp_padding = case.runtime.kernels.get("sequence_parallel", {}).get("padding")
+    if case.runtime.routing.get("policy") == "balanced" or sp_padding == "right_to_tp":
+        from mindie_sim.prediction.sharding.routing import cohort_padded_tokens
+        ep_global_tokens = cohort_padded_tokens(
+            (plan.requests for plan in ep_local.values()), case.runtime)
+    else:
+        ep_global_tokens = sum(
+            v.q_len + v.draft_proposal_tokens
+            for plan in ep_local.values() for v in plan.requests
+        )
+    call_context["global_tokens"] = ep_global_tokens
+    call_context["routing_global_tokens"] = valid_ep
+    if "sequence_parallel" in case.runtime.kernels and case.runtime.parallel.rank_table is None:
+        from mindie_sim.prediction.sharding.sequence_parallel import select as select_sp
+        from mindie_sim.prediction.graph import GraphPolicy
+        physical_rows = []
+        for r in ep_reps:
+            expanded = tuple(
+                replace(v, q_len=v.q_len + v.draft_proposal_tokens)
+                for v in ep_logical[r].requests)
+            rows = sum(v.q_len for v in expanded)
+            padded = rows
+            if sp_padding == "right_to_tp" and expanded:
+                bucket, _ = GraphPolicy().select(expanded, case.runtime)
+                padded = max(rows, int(bucket or 0))
+            sp = select_sp(
+                schedulers[r].next_runtime(ep_local[r]), case.model, expanded,
+                tokens=padded, global_tokens=valid_ep)
+            if sp is not None:
+                physical_rows.extend(sp.valid_per_tp)
+        if physical_rows:
+            ep_source = tuple(physical_rows)
+    call_context["source_rows_by_replica"] = ep_source
+    return call_context
+
+
 def _bind_reverse_collective_traffic(case, works):
     from mindie_sim.prediction.execution import mark_no_rev_collective, meta_scan_flags
     has_any_rev = False
@@ -534,7 +602,11 @@ def submit_batch(case, schedulers, plans, execution, lower, now, *,
         )
         for replica, plan in local.items():
             binding = batch_bindings[replica]
-            call_context = dict(context)
+            call_context = (
+                _ep_scoped_context(case, schedulers, local, logical_local, context, replica)
+                if (isinstance(lower, Frontend) and len(local) > 1)
+                else dict(context)
+            )
             model, machine = case.model, case.machine
             runtime = schedulers[replica].next_runtime(plan)
             declaration = None

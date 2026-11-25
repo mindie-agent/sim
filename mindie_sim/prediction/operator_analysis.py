@@ -64,6 +64,8 @@ def _selected_group(case, selected_replica=None, cohort=None):
 def _group_sequences(sequences, group, parallel):
     if type(sequences) is int:
         return sequences
+    if not isinstance(sequences, (list, tuple)):
+        raise ValueError("cohort_sequences_require_positive_scalar_or_complete_nonnegative_counts")
     values = tuple(sequences)
     if len(values) == len(group):
         return values
@@ -140,25 +142,43 @@ class ModelGraphSet(dict):
         return self._attached[key]
 
 
+_UNSET = object()
+
+
 def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body",
                      media_tokens_per_sequence=None, resource_fusion=True,
                      draft_prepare=False, apply_body_defaults=True,
                      routing_views=None, physical_rank=None, query_position=None,
                      selected_replica=None, cohort=None, pure_model=False,
                      layer_limit=None):
-    from .execution.dispatch import cohorts
-
     case = parse_model(case) if pure_model else parse_case(case)
-    _check_geometry(phase, tokens, sequences, context, scope)
+    _check_geometry(phase, tokens, 1, context, scope)
     case, selection = effective_body_declaration(
         case, phase, tokens=tokens, scope=scope, enabled=apply_body_defaults)
     _check_draft_preparation(case, phase, scope, draft_prepare)
     group = _selected_group(case, selected_replica, cohort)
     sequences = _group_sequences(sequences, group, case.runtime.parallel)
+    counts = cohort_sequence_counts(sequences, group)
     selected = (int(selected_replica) if selected_replica is not None
                 else group[0])
-    view_count = (int(sequences) if type(sequences) is int else
-                  int(sequences[group.index(selected)]))
+    if len(group) > 1:
+        # Any coupled multi-DP cohort (EP spanning DP, rank tables, SP,
+        # Local-TP, or cross-DP DCP) must share one cohort routing owner.
+        graphs = target_graphs(
+            case, phase=phase, tokens=tokens, context=context,
+            sequences=sequences, scope=scope,
+            media_tokens_per_sequence=media_tokens_per_sequence,
+            resource_fusion=resource_fusion, draft_prepare=draft_prepare,
+            apply_body_defaults=False, routing_views=routing_views,
+            physical_rank=physical_rank, query_position=query_position,
+            selected_replica=selected_replica, cohort=group,
+            pure_model=pure_model, layer_limit=layer_limit,
+        )
+        result = tuple(op for op in graphs[selected] if op.family != "barrier")
+        return (TargetOperators(result, kernels=case.runtime.kernels,
+                                selection=selection, scope=scope)
+                if scope == "body" else result)
+    view_count = counts[selected]
     views = tuple(
         analysis_view(
             case, f"analysis{index}", tokens, context, scope, phase,
@@ -168,35 +188,14 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
         for index in range(max(0, view_count))
     )
     case = _media_case(case, views, scope, media_tokens_per_sequence)
-    from .sharding.local_tp import local_tp_spans_dp
-    if (len(group) > 1
-            and (case.runtime.kernels.get("sequence_parallel")
-                 or local_tp_spans_dp(case.runtime.parallel)
-                 or case.runtime.parallel.cp_spans_dp)):
-        # A single rank cannot resolve cross-DP SP without the complete
-        # cohort's query totals. Delegate only the cohort graph binding.
-        graphs = target_graphs(
-            case, phase=phase, tokens=tokens, context=context,
-            sequences=sequences, scope=scope,
-            media_tokens_per_sequence=media_tokens_per_sequence,
-            resource_fusion=resource_fusion, draft_prepare=draft_prepare,
-            apply_body_defaults=False, routing_views=routing_views,
-            physical_rank=physical_rank, query_position=query_position,
-            selected_replica=selected_replica, cohort=group,
-            layer_limit=layer_limit,
-        )
-        selected = (int(selected_replica) if selected_replica is not None
-                    else group[0])
-        result = tuple(op for op in graphs[selected] if op.family != "barrier")
-        return (TargetOperators(result, kernels=case.runtime.kernels,
-                                selection=selection, scope=scope)
-                if scope == "body" else result)
     replica = selected
     explicit_rank = physical_rank is not None
     physical = physical_rank if explicit_rank else _physical_rank_for(case, replica)
     result = tuple(op for op in _target_ops(
         case, views, scope, resource_fusion=resource_fusion,
-        routing_views=routing_views, physical_rank=physical,
+        routing_views=routing_views,
+        cohort_views_by_replica={replica: views},
+        physical_rank=physical,
         explicit_physical_rank=explicit_rank,
         query_position=query_position, replica=replica, layer_limit=layer_limit)
                    if op.family != "barrier")
@@ -237,7 +236,7 @@ def _check_draft_preparation(case, phase, scope, enabled):
 
 
 def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
-                cohort_tokens=None, phase=None, replica=0, active_rows=None,
+                cohort_tokens=_UNSET, phase=None, replica=0, active_rows=None,
                 source_rows_by_replica=None, routing_global_tokens=None,
                 routing_views=None, cohort_views_by_replica=None,
                 physical_rank=None, explicit_physical_rank: bool = False,
@@ -254,9 +253,11 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
     frontend = Frontend(
         attention_policy=AttentionPolicy(**case.runtime.attention_policy),
         features=features)
-    global_tokens = (cohort_tokens if cohort_tokens is not None else
-                     sum(v.q_len + v.draft_proposal_tokens for v in global_views)
-                     if global_views is not None else None)
+    if cohort_tokens is _UNSET:
+        global_tokens = (sum(v.q_len + v.draft_proposal_tokens for v in global_views)
+                         if global_views is not None else None)
+    else:
+        global_tokens = cohort_tokens
     if scope == "model":
         program = frontend.program(
             IterationPlan(views), case.model, case.runtime, case.machine,
@@ -565,16 +566,15 @@ def _can_reuse_replica_graph(
             "source_owner", "query_position"))
         for item in (case.runtime.routing.get("realizations") or ()))
     return (
-        case.runtime.parallel.rank_table is None
+        case.machine.homogeneous
+        and case.runtime.parallel.rank_table is None
         and not case.runtime.parallel.cp_spans_dp
+        and not case.runtime.kernels.get("force_eplb_source")
+        and not isinstance(routing_views, Mapping)
         and len(set(counts.values())) <= UNIFORM_COUNT_CARDINALITY
         and (scope != "model" or (
-            case.machine.homogeneous
-            and case.runtime.parallel.rank_table is None
-            and not case.runtime.routing
-            and not case.runtime.kernels.get("force_eplb_source")
+            not case.runtime.routing
             and not local_tp_spans_dp(case.runtime.parallel)
-            and not case.runtime.parallel.cp_spans_dp
             and routing_views is None
             and query_position is None
             and all(
@@ -598,6 +598,59 @@ def _can_reuse_replica_graph(
             for item in (case.runtime.routing.get("realizations") or ())
         )
     )
+
+
+def _ep_owner_for_replica(case, replica, topology=None):
+    """Resolve ``replica``'s EP group ordinal from its physical rank position."""
+    from .execution.rank_ledger import ep_groups
+    p = case.runtime.parallel
+    phys_rank = _physical_rank_for(case, replica, topology)
+    ep_degree = max(UNIFORM_COUNT_CARDINALITY, int(p.ep))
+    if phys_rank is None:
+        return int(replica) % ep_degree
+    try:
+        _, groups = ep_groups(p, case.machine, replica, FIRST_PARTICIPANT)
+    except (ModelingError, ValueError, KeyError, IndexError):
+        return int(phys_rank) % ep_degree
+    group = next((g for g in groups if phys_rank in g), ())
+    return group.index(phys_rank) if group else int(phys_rank) % ep_degree
+
+
+def _ep_routing_geometry_by_replica(
+    case, participants, logical_views, active_rows_by_replica,
+    allgather_padded_cohort,
+):
+    """Compute EP-group-scoped routing geometry for each replica in ``participants``."""
+    from .execution.rank_ledger import ep_replica_group
+
+    cache: dict[tuple[int, ...], tuple] = {}
+    by_replica: dict[int, tuple] = {}
+    for replica in participants:
+        ep_reps = ep_replica_group(
+            case.runtime.parallel, case.machine, participants, replica)
+        if ep_reps not in cache:
+            ep_logical = {d: logical_views[d] for d in ep_reps}
+            ep_active = {d: active_rows_by_replica[d] for d in ep_reps}
+            ep_global_views = (
+                tuple(v for d in ep_reps for v in ep_logical[d])
+                if len(ep_reps) > 1 else None
+            )
+            ep_allgather = (
+                allgather_padded_cohort
+                if ep_reps == participants
+                else (len(ep_reps) * max(ep_active.values(), default=0)
+                      if (allgather_padded_cohort is not None and len(ep_reps) > 1)
+                      else None)
+            )
+            padded_ep, source_rows, routing_tokens = _cohort_routing_geometry(
+                case, ep_reps, ep_logical, ep_global_views, ep_active, ep_allgather)
+            cohort_tokens = (
+                padded_ep if padded_ep is not None
+                else (sum(ep_active.values()) if len(ep_reps) > 1 else None)
+            )
+            cache[ep_reps] = (cohort_tokens, source_rows, routing_tokens)
+        by_replica[replica] = cache[ep_reps]
+    return by_replica
 
 
 def _finalize_target_graph_set(case, graphs, views, *, scope, selection,
@@ -673,8 +726,8 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                        scope, media_tokens_per_sequence)
     global_views = (tuple(v for group in logical_views.values() for v in group)
                     if len(logical_views) > 1 else None)
-    padded_cohort, source_rows_by_replica, routing_global_tokens = _cohort_routing_geometry(
-        case, participants, logical_views, global_views, active_rows_by_replica,
+    ep_routing_by_r = _ep_routing_geometry_by_replica(
+        case, participants, logical_views, active_rows_by_replica,
         allgather_padded_cohort)
     uniform_replicas = (
         physical_rank is None
@@ -685,16 +738,16 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     program_bindings = {}
     program_owners = {}
     cohort_topology = _build_topology(case)
-    ep_degree = max(UNIFORM_COUNT_CARDINALITY, int(case.runtime.parallel.ep))
     if uniform_replicas and participants:
         first_r = participants[FIRST_PARTICIPANT]
+        first_cohort_tokens, first_source_rows, first_routing_tokens = ep_routing_by_r[first_r]
         base_ops = _target_ops(
             case, views[first_r], scope, global_views=global_views,
-            resource_fusion=resource_fusion, cohort_tokens=padded_cohort,
+            resource_fusion=resource_fusion, cohort_tokens=first_cohort_tokens,
             phase=phase, replica=first_r,
             active_rows=active_rows_by_replica[first_r],
-            source_rows_by_replica=source_rows_by_replica,
-            routing_global_tokens=routing_global_tokens,
+            source_rows_by_replica=first_source_rows,
+            routing_global_tokens=first_routing_tokens,
             routing_views=_routing_views_for(routing_views, first_r),
             cohort_views_by_replica=logical_views,
             physical_rank=_physical_rank_for(case, first_r, cohort_topology),
@@ -710,8 +763,7 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
             if (scope == "model" and peer_replicas) else {}
         )
         for r in peer_replicas:
-            owner_rank = int(
-                _physical_rank_for(case, r, cohort_topology) or r) % ep_degree
+            owner_rank = _ep_owner_for_replica(case, r, cohort_topology)
             if scope == "model":
                 # Only the graph is rebound here.  The attached program is
                 # materialized from this replica's final cohort-bound graph on
@@ -728,11 +780,12 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     else:
         raw_graphs = {
             r: _target_ops(case, group, scope, global_views=global_views,
-                           resource_fusion=resource_fusion, cohort_tokens=padded_cohort,
+                           resource_fusion=resource_fusion,
+                           cohort_tokens=ep_routing_by_r[r][0],
                            phase=phase, replica=r,
                            active_rows=active_rows_by_replica[r],
-                           source_rows_by_replica=source_rows_by_replica,
-                           routing_global_tokens=routing_global_tokens,
+                           source_rows_by_replica=ep_routing_by_r[r][1],
+                           routing_global_tokens=ep_routing_by_r[r][2],
                            routing_views=_routing_views_for(routing_views, r),
                            cohort_views_by_replica=logical_views,
                             physical_rank=(physical_rank if r == (participants[0] if selected_replica is None else selected_replica) and
@@ -799,6 +852,7 @@ def model_program(value, *, phase, tokens, context=0, sequences=1,
     case, _selection = effective_body_declaration(
         case, phase, tokens=tokens, scope="model", enabled=apply_body_defaults)
     participants = _selected_group(case, selected_replica, cohort)
+    sequences = _group_sequences(sequences, participants, case.runtime.parallel)
     counts = cohort_sequence_counts(sequences, participants)
     selected = (int(selected_replica) if selected_replica is not None
                 else participants[0])
@@ -815,6 +869,8 @@ def model_program(value, *, phase, tokens, context=0, sequences=1,
     global_views = (tuple(view for replica in participants
                           for view in views_by_replica[replica])
                     if len(participants) > 1 else None)
+    if len(participants) > 1 and "cohort_views_by_replica" not in options:
+        options = {**options, "cohort_views_by_replica": views_by_replica}
     features = FeatureConfig.from_runtime(case.runtime, case.model,
                                            machine=case.machine)
     frontend = Frontend(
