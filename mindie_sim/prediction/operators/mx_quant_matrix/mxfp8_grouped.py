@@ -18,7 +18,7 @@ from mindie_sim.prediction.operators.matrix.matrix_cycle import matrix_cycle
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
-from mindie_sim.prediction.operators.matrix.matrix_traffic import FP32_BYTES
+FP32_BYTES = 4
 
 CUBE_MN_FRACTAL = 16
 N_TILE_COLUMNS = 256
@@ -249,28 +249,27 @@ def owner_tiles(rows, n, tile, cores):
 #: declared cycles are the source UB recurrences; no measured multiplier.
 SWIGLU_MX_AIV_UNITS = 64
 SWIGLU_MX_GROUP = 32
-SWIGLU_MX_PROLOGUE_DRAIN_CYCLES = 4538
 SWIGLU_MS_PER_SECOND = 1000
 SWIGLU_MX_STAGES = ("load_gate_up", "swiglu_amax_ue8m0",
                     "store_payload_scale")
 
 
-def _require_swiglu_clock_hz(context, geometry) -> float:
-    for owner in (
-        getattr(context, "compute_arch", None),
-        getattr(context, "datapath", None),
-        getattr(geometry, "compute_arch", None),
-    ):
-        val = getattr(owner, "clock_hz", None)
-        if val is not None and not isinstance(val, bool) and float(val) > 0.0:
-            return float(val)
-    raise ModelingError("swiglu_mx_clock_hz_missing")
-
-
 def _a5_row_wave(geometry) -> bool:
-    """The 64-AIV arch35 row domain, read from device ownership only."""
-    units = getattr(geometry, "resource_units", {}) or {}
-    return int(units.get("vector", 0)) >= SWIGLU_MX_AIV_UNITS
+    """Gate A5 row wave strictly on canonical ComputeArch / PrimitiveTable (no vector>=64 sniffing)."""
+    compute_arch = getattr(geometry, "compute_arch", None)
+    if compute_arch is None:
+        compute_arch = getattr(getattr(geometry, "datapath", None), "compute_arch", None)
+    if compute_arch is not None:
+        arch_id = str(getattr(compute_arch, "arch_id", "") or "").strip().lower()
+        preset = str(getattr(compute_arch, "preset", "") or "").strip().lower()
+        if arch_id or preset:
+            return arch_id in {"arch35", "dav_3510", "npu_arch_3510"} or preset == "npu_arch_3510"
+    pt = getattr(geometry, "primitive_table", None)
+    if pt is not None:
+        arch = str(getattr(pt, "arch_preset", "") or "").strip().lower()
+        if arch:
+            return arch == "npu_arch_3510"
+    return False
 
 
 def _mx_group32(op) -> bool:
@@ -281,12 +280,26 @@ def _mx_group32(op) -> bool:
     return group == SWIGLU_MX_GROUP and scale in {"fp8_e8m0", "e8m0"}
 
 
+def _swiglu_mx_setup_ms(context) -> float:
+    """Calibrated AIV dispatch + MTE/flag setup strictly from bound PrimitiveTable."""
+    if getattr(context, "primitive_table", None) is None:
+        return 0.0
+    from mindie_sim.prediction.operators.matrix.matrix_mapping_owners import _primitive_band_ms
+
+    return (
+        _primitive_band_ms(context, "P15_rts_stars", "aiv_first_issue_ns")
+        + _primitive_band_ms(context, "P12_intracore_flag", "flag_mte2_v_ns")
+        + _primitive_band_ms(context, "P12_intracore_flag", "flag_v_mte3_ns")
+    )
+
+
 def build_swiglu_mx_quant(op, geometry):
-    """A5 group-32 row program; otherwise the registered Class D quantize plan."""
+    """A5 group-32 row program priced from PrimitiveTable + exact UB/vector work."""
     from mindie_sim.prediction.mechanism import OperatorPlan, Work
     from mindie_sim.prediction.physical_recipe_base import build_plan, work_from_op
     from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
     from mindie_sim.prediction.operators.vector.vector_pipeline import AIVTiledVectorAndGatherRecipe
+
     if not (_a5_row_wave(geometry) and _mx_group32(op)):
         return build_plan(AIVTiledVectorAndGatherRecipe(), op, geometry)
     base = work_from_op(op)
@@ -294,27 +307,24 @@ def build_swiglu_mx_quant(op, geometry):
     read = float(op.mte2_bytes)
     write = float(op.mte3_bytes)
     vector = float(op.vector_ops)
-    waves = max(1, -(-rows // SWIGLU_MX_AIV_UNITS))
+    aiv_units = max(1, int((getattr(geometry, "resource_units", None) or {}).get("vector") or SWIGLU_MX_AIV_UNITS))
+    waves = max(1, -(-rows // aiv_units))
 
     def program(context):
-        clock_ms = _require_swiglu_clock_hz(context, geometry) / SWIGLU_MS_PER_SECOND
-        multi_wave = rows >= SWIGLU_MX_AIV_UNITS
+        multi_wave = rows >= aiv_units
         read_role = "mte2"
         if multi_wave and context.service_rate("mte2_aiv_dram") is not None:
             read_role = "mte2_aiv_dram"
         placement = context.owned(0, 1, ("mte2_aiv", "vector", "mte3"))
 
         def tile(index):
-            start = index * SWIGLU_MX_AIV_UNITS
-            covered = min(SWIGLU_MX_AIV_UNITS, rows - start)
+            start = index * aiv_units
+            covered = min(aiv_units, rows - start)
             scale = covered / rows
             load = read * scale
             store = write * scale
             compute = vector * scale
             return (
-                # A row buffer is consumed by the same wave's store before the
-                # next load may address it; the two declared slots bound the
-                # producer but never invert the finite row order.
                 Stage("load_gate_up", context.bind(Work(
                     resources={"hbm": load, read_role: load})),
                     placement=placement, previous=("store_payload_scale",)),
@@ -326,21 +336,26 @@ def build_swiglu_mx_quant(op, geometry):
                     after=("swiglu_amax_ue8m0",), placement=placement),
             )
 
-        drain_ms = (SWIGLU_MX_PROLOGUE_DRAIN_CYCLES / clock_ms) if multi_wave else 0.0
+        setup_ms = float(context.setup_ms or 0.0) + _swiglu_mx_setup_ms(context)
+        if setup_ms > 0.0:
+            return KernelProgram((
+                Stage("kernel_setup", latency=setup_ms),
+                Stage("row_tiles", after=("kernel_setup",),
+                      program=PipelineProgram(waves, 2, tile)),
+            ))
         return KernelProgram((
-            Stage("kernel_prologue_drain", latency=drain_ms,
-                  keep_empty=drain_ms <= 0.0),
-            Stage("row_tiles", after=("kernel_prologue_drain",),
-                  program=PipelineProgram(waves, 2, tile)),
+            Stage("row_tiles", program=PipelineProgram(waves, 2, tile)),
         ))
 
     return OperatorPlan(base, program, {
         "fused_kernel": "npu_swiglu_mx_quant",
         "row_tiles": waves,
-        "row_program": {"aiv_units": SWIGLU_MX_AIV_UNITS,
-                        "group_size": SWIGLU_MX_GROUP,
-                        "stages": SWIGLU_MX_STAGES,
-                        "prologue_drain_cycles": SWIGLU_MX_PROLOGUE_DRAIN_CYCLES},
+        "row_program": {
+            "aiv_units": aiv_units,
+            "group_size": SWIGLU_MX_GROUP,
+            "stages": SWIGLU_MX_STAGES,
+            "setup_source": "primitive_table",
+        },
     })
 
 

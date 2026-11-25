@@ -128,8 +128,7 @@ def capabilities() -> dict[str, Any]:
     """Machine-readable registry of the declarations behind this wrapper."""
     from mindie_sim.prediction.implementations import IMPLEMENTATIONS
 
-    # Registry entries can refer to the original module during the move.
-    modules = {__package__, "mindie_sim.prediction.family_mindie_sd_ops"}
+    modules = {__package__}
     implementations = {
         name: item for name, item in IMPLEMENTATIONS.items() if item.module in modules}
     selector_operators = {

@@ -292,12 +292,13 @@ def analyze_network_efficiency(
     evaluation = None
     if operator_report is None:
         from ..evaluation import EvaluationContext
-        evaluation = EvaluationContext.create(parsed)
+        evaluation = (evaluation_context if evaluation_context is not None
+                      else EvaluationContext.create(parsed))
         operator_report, auto_graph = fast_reports_fn(
             parsed, phase=phase, tokens=tokens, context=context,
             sequences=sequences, scope=scope, run_graph=run_graph,
             precomputed_graph=_precomputed_graph,
-            evaluation_context=evaluation_context or evaluation,
+            evaluation_context=evaluation,
             **({"timeline_replicas": timeline_replicas} if timeline_replicas is not None else {}))
         graph_report = auto_graph if graph_report is None else graph_report
 

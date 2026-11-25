@@ -27,7 +27,7 @@ from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.observations.calibration import bind_activation_condition
 from mindie_sim.observations.captures import iter_conditions
 from mindie_sim.prediction import call_builders as calls_activation, instructions
-from mindie_sim.prediction.operators.vector import dynamic_quant_schedule, family_ascend_norm, mx_dynamic_quant
+from mindie_sim.prediction.operators.vector import family_ascend_norm, mx_dynamic_quant
 from mindie_sim.prediction.call_builders import call_costs
 from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
@@ -588,12 +588,3 @@ def test_sort_capacity_survives_clock_and_supply_roundtrip():
                            placement={"mte2_aiv": (0,)})
     engine.advance(until=(first, second))
     assert first.time == second.time == pytest.approx(.032)
-def test_dynamic_quant_engine_program_covers_tail_rows():
-    for row_len, mode in ((1234, "full_db"), (200000, "large")):
-        report = dynamic_quant_schedule.quant_timeline(
-            rates={"vector": 1e6, "mte2": 1e6, "mte3": 1e6, "hbm": 1e6},
-            units={"vector": 4, "mte2": 4, "mte3": 4}, rows=7, row_len=row_len,
-            source_bytes=2, y_bytes=1, scale_bytes=4, ub_bytes=64 * 1024, aiv=4)
-        assert report["mode"] == mode and report["launched"] == 4 and (
-            report["rows_per_head"], report["rows_per_tail"]) == (2, 1)
-        assert report["mte2_bytes"] + report["mte3_bytes"] == report["hbm_bytes"] > 0

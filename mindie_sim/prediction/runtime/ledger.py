@@ -26,6 +26,7 @@ from .contracts import (
     CapacityDomainState,
     EventKey,
     GrantResult,
+    LocalBoundaryToken,
     PoolKey,
     ReaderKey,
     ReleaseResult,
@@ -121,10 +122,17 @@ def _event_key(state, event, *, generation: int = 0) -> EventKey:
     sequence = getattr(event, "sequence", None)
     if isinstance(sequence, bool) or not isinstance(sequence, int):
         raise LedgerError("event_sequence_invalid")
-    runtime_uid = str(getattr(state, "uid", "")
-                      or getattr(state, "runtime_uid", "") or "runtime")
+    event_uid = getattr(event, "runtime_uid", None)
+    if not isinstance(event_uid, str) or not event_uid:
+        if isinstance(event, LocalBoundaryToken):
+            state_uid = str(getattr(state, "uid", "") or "")
+            if not state_uid:
+                raise LedgerError("event_runtime_uid_missing")
+            event_uid = f"local_boundary:{state_uid}"
+        else:
+            raise LedgerError("event_runtime_uid_missing")
     return EventKey(
-        runtime_uid=runtime_uid, sequence=sequence,
+        runtime_uid=str(event_uid), sequence=sequence,
         generation=int(getattr(event, "generation", generation) or generation),
     )
 
@@ -132,11 +140,8 @@ def _event_key(state, event, *, generation: int = 0) -> EventKey:
 def _event_done(event) -> bool:
     if event is None:
         return False
-    try:
-        if bool(event.done):
-            return True
-    except Exception:  # pragma: no cover - defensive duck typing
-        pass
+    if bool(getattr(event, "done", False)):
+        return True
     return getattr(event, "time", None) is not None
 
 
@@ -210,6 +215,7 @@ class _Grant:
     acquired_at: EventKey
     last_use: EventKey | None = None
     last_use_done: bool = False
+    pending_uses: set[EventKey] = field(default_factory=set)
     readers: set[ReaderKey] = field(default_factory=set)
     children: set[AllocationKey] = field(default_factory=set)
     children_pool_bytes: float = 0.0
@@ -295,8 +301,6 @@ class Ledger:
         exact = domains.get(pool.physical_domain)
         if exact is not None:
             return exact
-        if len(domains) == 1:
-            return next(iter(domains.values()))
         raise LedgerError("capacity_domain_missing")
 
     @staticmethod
@@ -306,6 +310,70 @@ class Ledger:
             if grant is not None:
                 return domain, grant
         return None, None
+
+    @staticmethod
+    def _stage_backing_delta(
+        domain: CapacityDomainState,
+        item: AllocationBinding,
+        grant: _Grant,
+        ranges: tuple[tuple[int, int], ...],
+        amount: float,
+        backings: dict[BackingKey, BackingRecord],
+        deltas: dict[tuple[str, PoolKey], float],
+        prepared: Sequence[tuple[CapacityDomainState, _Grant]] = (),
+    ) -> None:
+        if item.backing is None:
+            if item.reservation_parent is not None:
+                raise LedgerError("reservation_parent_requires_backing")
+            delta = amount if item.acquire else 0.0
+            slot = (domain.domain_id, item.pool)
+            deltas[slot] = deltas.get(slot, 0.0) + float(delta)
+            return
+        if item.backing.generation != grant.key.generation:
+            raise LedgerError("backing_generation_mismatch")
+        record = backings.get(item.backing)
+        if record is None:
+            live = domain.backings.get(item.backing)
+            if live is None:
+                record = BackingRecord(key=item.backing, pool=item.pool,
+                                       parent=item.reservation_parent)
+            else:
+                if live.pool != item.pool:
+                    raise LedgerError("backing_pool_mismatch")
+                record = BackingRecord(
+                    key=live.key, pool=live.pool,
+                    holders=dict(live.holders),
+                    segments=live.segments, parent=live.parent)
+            backings[item.backing] = record
+        elif record.pool != item.pool:
+            raise LedgerError("backing_pool_mismatch")
+        if record.parent is not None and item.reservation_parent != record.parent:
+            raise LedgerError("backing_parent_mismatch")
+        if item.reservation_parent is not None:
+            parent = domain.grants.get(item.reservation_parent)
+            if parent is None:
+                parent = next(
+                    (g for d, g in prepared if d is domain and g.key == item.reservation_parent),
+                    None,
+                )
+            if parent is None or parent.backing != item.backing:
+                raise LedgerError("reservation_parent_invalid")
+            if not ranges:
+                raise LedgerError("reservation_slice_empty")
+            if union_ranges((*parent.ranges, *ranges)) != parent.ranges:
+                raise LedgerError("reservation_not_backed")
+            record.holders[grant.key] = ranges
+            if record.rebuild():
+                # A slice inside its parent must never add pool bytes.
+                raise LedgerError("reservation_not_backed")
+            grant.ranges = ranges
+        elif grant.acquire:
+            if not ranges and amount > 0:
+                raise LedgerError("backing_ranges_required")
+            record.holders[grant.key] = ranges
+            delta = record.rebuild()
+            slot = (domain.domain_id, item.pool)
+            deltas[slot] = deltas.get(slot, 0.0) + float(delta)
 
     # -------------------------------------------------------------- grants
     @classmethod
@@ -327,8 +395,7 @@ class Ledger:
         if not items:
             return GrantResult(granted=True, allocations=())
         allocation_key = _event_key(state, at)
-        holder_id = getattr(holder, "runtime_uid", None)
-        holder_id = str(holder) if holder_id is None else str(holder)
+        holder_id = str(holder)
         keys: set[AllocationKey] = set()
         domains: list[CapacityDomainState] = []
         prepared: list[tuple[CapacityDomainState, _Grant]] = []
@@ -357,6 +424,14 @@ class Ledger:
             if item.backing is not None and not isinstance(
                     item.backing, BackingKey):
                 raise LedgerError("backing_key_required")
+            last_use_key = (_event_key(state, item.last_use)
+                            if item.last_use is not None else None)
+            last_use_done = (_event_done(item.last_use)
+                             if item.last_use is not None else False)
+            pending_uses = (
+                {last_use_key}
+                if (last_use_key is not None and not last_use_done) else set()
+            )
             grant = _Grant(
                 key=key,
                 pool=item.pool,
@@ -370,58 +445,13 @@ class Ledger:
                 acquire=bool(item.acquire),
                 reservation_parent=item.reservation_parent,
                 acquired_at=allocation_key,
-                last_use=(_event_key(state, item.last_use)
-                          if item.last_use is not None else None),
+                last_use=last_use_key,
+                last_use_done=last_use_done,
+                pending_uses=pending_uses,
             )
-            if item.backing is not None:
-                if item.backing.generation != key.generation:
-                    raise LedgerError("backing_generation_mismatch")
-                record = backings.get(item.backing)
-                if record is None:
-                    live = domain.backings.get(item.backing)
-                    if live is None:
-                        record = BackingRecord(key=item.backing, pool=item.pool,
-                                               parent=item.reservation_parent)
-                    else:
-                        if live.pool != item.pool:
-                            raise LedgerError("backing_pool_mismatch")
-                        record = BackingRecord(
-                            key=live.key, pool=live.pool,
-                            holders=dict(live.holders),
-                            segments=live.segments, parent=live.parent)
-                    backings[item.backing] = record
-                if record.parent is not None and item.reservation_parent != record.parent:
-                    raise LedgerError("backing_parent_mismatch")
-                if item.reservation_parent is not None:
-                    parent = domain.grants.get(item.reservation_parent)
-                    if parent is None or parent.backing != item.backing:
-                        raise LedgerError("reservation_parent_invalid")
-                    if not ranges:
-                        raise LedgerError("reservation_slice_empty")
-                    record.holders[key] = ranges
-                    new_bytes = record.rebuild()
-                    if new_bytes:
-                        # A slice inside its parent must never add pool bytes.
-                        raise LedgerError("reservation_not_backed")
-                    parent.children.add(key)
-                    grant.ranges = ranges
-                elif grant.acquire:
-                    if not ranges and amount > 0:
-                        raise LedgerError("backing_ranges_required")
-                    record.holders[key] = ranges
-                    delta = record.rebuild()
-                    slot = (domain.domain_id, item.pool)
-                    deltas[slot] = deltas.get(slot, 0.0) + float(delta)
-                else:
-                    # Externally supplied reference: binding alone never
-                    # reacquires bytes or creates a second physical charge.
-                    record = None
-            else:
-                if item.reservation_parent is not None:
-                    raise LedgerError("reservation_parent_requires_backing")
-                delta = amount if item.acquire else 0.0
-                slot = (domain.domain_id, item.pool)
-                deltas[slot] = deltas.get(slot, 0.0) + float(delta)
+            cls._stage_backing_delta(
+                domain, item, grant, ranges, amount, backings, deltas, prepared,
+            )
             prepared.append((domain, grant))
 
         # Validate complete envelope on transaction-local deltas.
@@ -530,13 +560,13 @@ class Ledger:
         del domain.readers[reader]
         grant.readers.discard(reader)
         result = ReleaseResult(released=False, epoch=domain.epoch)
-        if (grant.deferred and not grant.readers
-                and (grant.last_use is None or grant.last_use_done)):
+        if (grant.deferred and not grant.readers and not grant.children
+                and not grant.pending_uses):
             result = cls._complete_release(state, domain, grant)
         return result
 
     @classmethod
-    def settle(cls, state, completed: Iterable[event] = ()) -> tuple[ReleaseResult, ...]:
+    def settle(cls, state, completed: Iterable[object] = ()) -> tuple[ReleaseResult, ...]:
         """Complete deferred releases whose last-use events are really done."""
         done = set()
         for event in completed:
@@ -544,13 +574,19 @@ class Ledger:
         results: list[ReleaseResult] = []
         for domain in cls.domains(state).values():
             for grant in tuple(domain.grants.values()):
-                if not grant.deferred or grant.readers:
-                    continue
-                if grant.last_use is not None and grant.last_use not in done:
-                    continue
-                if grant.last_use is not None:
+                if grant.pending_uses and done:
+                    grant.pending_uses.difference_update(done)
+                if not grant.pending_uses and grant.last_use is not None:
                     grant.last_use_done = True
-                results.append(cls._complete_release(state, domain, grant))
+            progressed = True
+            while progressed:
+                progressed = False
+                for grant in tuple(domain.grants.values()):
+                    if (not grant.deferred or grant.readers or grant.children
+                            or grant.pending_uses):
+                        continue
+                    results.append(cls._complete_release(state, domain, grant))
+                    progressed = True
         return tuple(results)
 
     # -------------------------------------------------------------- release
@@ -574,17 +610,19 @@ class Ledger:
             raise LedgerError("generation_mismatch")
         if grant.released:
             return ReleaseResult(released=False, epoch=domain.epoch)
-        if grant.children:
-            grant.deferred = True
-            return ReleaseResult(released=False, deferred=True,
-                                 epoch=domain.epoch)
-        grant.last_use = _event_key(state, after) if after is not None else None
-        grant.last_use_done = _event_done(after)
-        if grant.readers:
-            grant.deferred = True
-            return ReleaseResult(released=False, deferred=True,
-                                 epoch=domain.epoch)
-        if after is not None and not _event_done(after):
+        if after is not None:
+            after_key = _event_key(state, after)
+            after_done = _event_done(after)
+            if not after_done:
+                grant.pending_uses.add(after_key)
+                grant.last_use = after_key
+                grant.last_use_done = False
+            else:
+                grant.pending_uses.discard(after_key)
+                if not grant.pending_uses:
+                    grant.last_use = after_key
+                    grant.last_use_done = True
+        if grant.children or grant.readers or grant.pending_uses:
             grant.deferred = True
             return ReleaseResult(released=False, deferred=True,
                                  epoch=domain.epoch)

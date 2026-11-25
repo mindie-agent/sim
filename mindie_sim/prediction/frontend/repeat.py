@@ -111,9 +111,11 @@ class _FrontendRepeat:
                 return None
             arch_for_layer, unique_archs, realizations = prev_env[4]
         else:
+            from mindie_sim.prediction.frontend.body import _has_sandwich_norm
             for lyr in layers:
                 if (lyr.engram or lyr.hyper_connections or lyr.residual_block_size
                         or getattr(lyr, "hc_lowrank", 0) > 0
+                        or _has_sandwich_norm(lyr, model)
                         or lyr.kv_owner_layer_id not in (-1, lyr.index)
                         or lyr.index_k_owner_layer_id not in (-1, lyr.index)
                         or lyr.topk_owner_layer_id not in (-1, lyr.index)

@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import heapq
 import math
 from collections.abc import Mapping, Sequence
 from functools import partial
@@ -36,9 +37,6 @@ from .peaks import DEFAULT_OUTPUT_BUDGET, _BOUNDS, _SCALE_KEYS, _check_pos_float
 DEFAULT_SLA_MS = 30.0
 DEFAULT_SLA_CONTEXT = 126000
 DEFAULT_MAX_SEQUENCES = 256
-NON_MONOTONIC_PROBE_CAP = 4
-SLA_HEADROOM_PROBE_STEPS = 3
-SLA_HEADROOM_MULTIPLIER = 3.0
 #: Counterfactual-set selectors for :func:`solve_sla_sizing`.
 SLA_SENSITIVITY_BASELINE = "baseline"
 SLA_SENSITIVITY_FULL = "full"
@@ -137,7 +135,9 @@ def solve_sla_sizing(
     prefill = phase == "prefill"
     from ..frontend.body_spec import describe_included_components
     return {"schema": "mindie-sim.hardware-sla/1", "sla_ms": sla_ms, "context": context, "phase": phase, "scope": scope, "timing_boundary": "target_body_only" if scope == "body" else "full_model_step", "included_components": describe_included_components(parsed, scope=scope), "tokens_per_seq": q_tokens, "emitted_tokens_per_seq": emit_tokens, "prefill_tokens_per_seq": q_tokens if prefill else None, "decode_emitted_tokens_per_seq": decode_emit_tokens, "dp": dp, "max_sequences_per_dp": b_max,
-            "solver": {"monotonicity_assumed": True, "b_sla_is_proven_max": False,
+            "solver": {"monotonicity_assumed": False, "b_sla_is_proven_max": False,
+                       "objective": "maximize_throughput_under_sla",
+                       "certified_dual_bound_search": True,
                        "bounded_non_monotonic_dispatch_probe": True,
                        "status_interpretation": "feasible_candidate_found_or_explicit_sla_capacity_domain_infeasibility"},
             "async_scheduling_memory": async_mem_summary, "scenarios": results}
@@ -228,6 +228,8 @@ class _SLASizingRun:
         self.unchunkable = unchunkable
         self.evaluation_context = evaluation_context
         self.scaled_cases: dict[tuple[float, ...], CaseSpec] = {}
+        self.eval_contexts: dict[tuple[float, ...], Any] = {}
+        self.floor_caps_cache: dict[tuple[float, ...], Any] = {}
         self.graphs_by_b: dict[int, Any] = {}
         self.vram_by_cap: dict[float, tuple[int, int, int]] = {}
         self.graph_cache: dict[tuple[tuple[float, ...], int, bool], tuple[Any, CaseSpec, dict[str, Any]]] = {}
@@ -245,6 +247,14 @@ class _SLASizingRun:
             self.scaled_cases[s_key] = scale_case_hardware(self.parsed, **dict(zip(_SCALE_KEYS, s_key)))
         return self.scaled_cases[s_key]
 
+    def get_eval_context(self, s_key: tuple[float, ...]) -> Any:
+        if s_key == self.baseline_scales and self.evaluation_context is not None:
+            return self.evaluation_context
+        if s_key not in self.eval_contexts:
+            from ..evaluation import EvaluationContext
+            self.eval_contexts[s_key] = EvaluationContext.create(self.get_scaled(s_key))
+        return self.eval_contexts[s_key]
+
     def get_bundle(self, s_key: tuple[float, ...], b: int, *,
                    fast: bool = False) -> tuple[Any, CaseSpec, dict[str, Any]]:
         parsed, phase, q_tokens = self.parsed, self.phase, self.q_tokens
@@ -254,7 +264,7 @@ class _SLASizingRun:
         if (s_key, b, fast) not in graph_cache:
             if b not in graphs_by_b:
                 graphs_by_b[b] = _pkg_attr("target_graphs", target_graphs)(parsed, phase=phase, tokens=q_tokens, context=context, sequences=b, scope=scope)
-            context_reuse = self.evaluation_context if s_key == self.baseline_scales else None
+            context_reuse = self.get_eval_context(s_key)
             g, ec, gr = _pkg_attr("_lower_and_run_graph", _lower_and_run_graph)(
                 self.get_scaled(s_key), phase=phase, tokens=q_tokens, context=context,
                 sequences=b, scope=scope, run_graph=True,
@@ -277,8 +287,7 @@ class _SLASizingRun:
                 self.get_scaled(s_key), phase=phase, tokens=q_tokens, context=context,
                 sequences=b, scope=scope, run_graph=True,
                 _precomputed_graph=self.get_bundle(s_key, b, fast=False),
-                evaluation_context=(self.evaluation_context
-                                    if s_key == self.baseline_scales else None))
+                evaluation_context=self.get_eval_context(s_key))
         return analysis_cache[s_key, b]
 
     def eval_at(self, s_key: tuple[float, ...], b: int, *, full: bool = False) -> dict[str, Any]:
@@ -329,11 +338,8 @@ class _SLASizingRun:
         except UnmodeledCapabilityError:
             # An unmodeled core is not an infeasible candidate.
             raise
-        except ModelingError as exc:
-            if b <= 1:
-                raise
-            self.domain_cap, self.domain_reason = min(self.domain_cap, b - 1), str(exc)
-            return False
+        except ModelingError:
+            raise
 
     def memory_for(self, tokens: int, async_scheduling: bool | None, scale: float) -> Memory:
         parsed, memory_cache = self.parsed, self.memory_cache
@@ -445,7 +451,10 @@ class _SLASizingRun:
         bucket_keys = sorted({int(key) for key in (getattr(parsed.runtime, "graph_capture_keys", ()) or ())}
                              | {int(key) for key in (getattr(parsed.runtime, "piecewise_capture_keys", ()) or ())})
 
-        b_sla, eval_sla, bounded_probes, secant_estimate = self._search_concurrency(
+        (
+            b_sla, eval_sla, bounded_probes, secant_estimate,
+            certified_optimal, hi_cut,
+        ) = self._search_concurrency(
             s_key, b1_ms, eff_max, bucket_keys, candidate_checks, evaluated_b,
             b_joint, candidate_windows)
         if scen.get("id") == "baseline" and b_sla > 0:
@@ -454,92 +463,500 @@ class _SLASizingRun:
             scen, s_key, current_caps, lifecycle_caps, b_joint,
             life_ctx, verify_tokens, candidate_windows, b1_ms, bucket_keys,
             candidate_checks, evaluated_b, b_sla, eval_sla, bounded_probes,
-            secant_estimate)
+            secant_estimate, certified_optimal=certified_optimal, hi_cut=hi_cut)
+
+    @staticmethod
+    def _hardware_floor_caps(eff_case: CaseSpec, eval_ctx: Any = None):
+        dies = getattr(getattr(eff_case, "machine", None), "dies", ()) or ()
+        pt = getattr(eval_ctx, "primitive_table", None) if eval_ctx is not None else None
+        datapath_fn = overlay_fn = None
+        if pt is not None:
+            from ..execution.context import datapath_for_devices as datapath_fn
+            from mindie_sim.primitives.loader import resolve_sim_rate_overlay as overlay_fn
+        max_hbm_ms = 0.0
+        max_vec_ms = 0.0
+        max_l2_bytes = 0.0
+        cube_peaks_ms: dict[str, float] = {}
+        custom_inv = bool((getattr(eff_case.runtime, "kernels", None) or {}).get("invocations"))
+        invs_per_die: list[dict[str, float]] = []
+        links = getattr(getattr(eff_case, "machine", None), "links", ()) or ()
+        tchannels = getattr(getattr(eff_case, "machine", None), "transfer_channels", ()) or ()
+        for die in dies:
+            rates = dict(getattr(die, "rates", ()) or ())
+            peaks = dict(die.compute_peaks)
+            hbm_s = float(rates.get("hbm", 0.0) or 0.0)
+            vec_s = float(rates.get("vector", 0.0) or 0.0)
+            dp = getattr(die, "datapath", None)
+            hbm_r = float(getattr(dp, "hbm_read_bytes_per_s", 0.0) or 0.0) if dp is not None else 0.0
+            hbm_w = float(getattr(dp, "hbm_write_bytes_per_s", 0.0) or 0.0) if dp is not None else 0.0
+            if pt is not None and datapath_fn is not None and overlay_fn is not None:
+                _, dp_eff = datapath_fn((die,), links=links, transfer_channels=tchannels)
+                ov = overlay_fn(pt, dp_eff, sku=die.sku)
+                ov_rates = dict(ov.rates)
+                if "hbm" in ov_rates:
+                    hbm_s = min(float(ov_rates["hbm"]), hbm_s) if hbm_s > 0.0 else float(ov_rates["hbm"])
+                if "vector" in ov_rates:
+                    vec_s = min(float(ov_rates["vector"]), vec_s) if vec_s > 0.0 else float(ov_rates["vector"])
+                if ov.hbm_read_bytes_per_s is not None:
+                    raw_h = float(rates.get("hbm", 0.0) or 0.0)
+                    hbm_r = min(float(ov.hbm_read_bytes_per_s), raw_h) if raw_h > 0.0 else float(ov.hbm_read_bytes_per_s)
+                if ov.hbm_write_bytes_per_s is not None:
+                    raw_h = float(rates.get("hbm", 0.0) or 0.0)
+                    hbm_w = min(float(ov.hbm_write_bytes_per_s), raw_h) if raw_h > 0.0 else float(ov.hbm_write_bytes_per_s)
+                peaks.update(dict(ov.compute_peaks))
+            for fmt, val in peaks.items():
+                f_ms = float(val or 0.0) / 1000.0
+                if f_ms > cube_peaks_ms.get(str(fmt).lower(), 0.0):
+                    cube_peaks_ms[str(fmt).lower()] = f_ms
+            max_vec_ms = max(max_vec_ms, vec_s / 1000.0)
+            max_hbm_ms = max(max_hbm_ms, max(hbm_s, hbm_r, hbm_w) / 1000.0)
+            max_l2_bytes = max(max_l2_bytes, float(dict(getattr(die, "buffers", ()) or ()).get("l2", 0.0) or 0.0))
+            if not custom_inv:
+                invs_per_die.append({
+                    str(k): float(getattr(v, "minimum_ms", 0.0) or 0.0)
+                    for k, v in dict(getattr(die, "kernel_invocations", ()) or ()).items()
+                })
+        min_inv_by_class: dict[str, float] = {}
+        if not custom_inv and invs_per_die and len(invs_per_die) == len(dies):
+            shared_classes = set.intersection(*(set(m) for m in invs_per_die))
+            for cls in shared_classes:
+                min_inv_by_class[cls] = min(m[cls] for m in invs_per_die)
+        per_rank_egress: dict[int, float] = {}
+        min_link_lat_ms = math.inf
+        has_pos_cap = any(float(getattr(item, "capacity_bytes_per_ms", 0.0) or 0.0) > 0.0 for item in links)
+        for lk in links:
+            cap = float(getattr(lk, "capacity_bytes_per_ms", 0.0) or 0.0)
+            lat_us = float(getattr(lk, "latency_us", 0.0) or 0.0)
+            if cap > 0.0 or not has_pos_cap:
+                min_link_lat_ms = min(min_link_lat_ms, max(0.0, lat_us) / 1000.0)
+            members = tuple(getattr(lk, "members", ()) or ())
+            sem = str(getattr(lk, "semantics", "") or "").lower()
+            mult = max(1, len(members) - 1) if (sem == "per_pair" or not sem) and len(members) > 1 else 1
+            for r in (members or (0,)):
+                per_rank_egress[int(r)] = per_rank_egress.get(int(r), 0.0) + cap * float(mult)
+        max_link_ms = max(per_rank_egress.values(), default=0.0)
+        hop_lat_ms = 0.0 if not math.isfinite(min_link_lat_ms) else min_link_lat_ms
+        return (
+            max_hbm_ms, max_vec_ms, cube_peaks_ms, max(cube_peaks_ms.values(), default=0.0),
+            max_link_ms, hop_lat_ms, max_l2_bytes, min_inv_by_class, links,
+        )
+
+    @staticmethod
+    def _op_floor_contribution(
+        op: Any,
+        *,
+        b: int,
+        inv_b: float,
+        phase: str,
+        context: int,
+        runtime_shared_prefix: bool,
+        caps: tuple[Any, ...],
+        attn_fams: frozenset[str],
+        non_kernel_fams: frozenset[str],
+        stage_wb: dict[int, float],
+        stage_gg: dict[int, float],
+        stage_kv: dict[int, float],
+        stage_cube: dict[int, float],
+        stage_vec: dict[int, float],
+        stage_link: dict[int, float],
+    ) -> tuple[float, float, bool]:
+        """Accumulate one op's stage work floors and return ``(a_op, c_op, used_gg)``."""
+        (
+            max_hbm_ms, max_vec_ms, cube_peaks_ms, max_cube_ms,
+            max_link_ms, hop_lat_ms, _max_l2_bytes, min_inv_by_class, _links,
+        ) = caps
+        min_cube_inv = min_inv_by_class.get("cube", 0.0)
+        min_vec_inv = min_inv_by_class.get("vector", 0.0)
+        st = int(getattr(op, "stage", 0) or 0)
+        sem = getattr(op, "semantic_shape", ()) or ()
+        loc = getattr(op, "local_shape", ()) or ()
+        sem_scale = (
+            min(1.0, float(sem[0]) / float(loc[0]))
+            if (sem and loc and float(loc[0]) > 0.0 and float(sem[0]) > 0.0)
+            else 1.0
+        )
+        md = dict(getattr(op, "metadata", ()) or ())
+        op_hbm = float(getattr(op, "hbm_bytes", 0.0) or 0.0)
+        wb = float(md.get("packed_weight_bytes") or md.get("weight_bytes") or 0.0)
+        fam = str(getattr(op, "family", "") or "")
+        if op_hbm > 0.0 and wb <= 0.0 and fam == "native_fusion":
+            phases = md.get("fusion_phases") or ()
+            if isinstance(phases, Sequence) and not isinstance(phases, (str, bytes)):
+                wb = sum(
+                    float(
+                        ph.get("packed_weight_bytes") or ph.get("weight_bytes")
+                        or dict(ph.get("metadata") or ()).get("packed_weight_bytes")
+                        or dict(ph.get("metadata") or ()).get("weight_bytes")
+                        or 0.0
+                    )
+                    for ph in phases if isinstance(ph, Mapping)
+                )
+        a_op, c_op, used_gg = 0.0, 0.0, False
+        if op_hbm > 0.0 and wb > 0.0:
+            w_eff = min(wb, op_hbm)
+            stage_wb[st] = stage_wb.get(st, 0.0) + w_eff
+            if max_hbm_ms > 0.0:
+                a_op = w_eff / max_hbm_ms
+        elif op_hbm > 0.0 and wb <= 0.0 and fam == "grouped_gemm":
+            gg_eff = op_hbm * sem_scale
+            stage_gg[st] = stage_gg.get(st, 0.0) + gg_eff
+            if max_hbm_ms > 0.0:
+                a_op = gg_eff / max_hbm_ms
+                used_gg = True
+        elif (op_hbm > 0.0 and wb <= 0.0 and phase == "decode"
+              and context > 0 and fam in attn_fams):
+            kv_b = min(float(md.get("kv_read_bytes") or op_hbm), op_hbm) * sem_scale
+            op_shared_prefix = (
+                runtime_shared_prefix
+                or str(md.get("prefix_cache_mode", "") or "").strip().lower() == "shared"
+            )
+            if op_shared_prefix:
+                stage_wb[st] = stage_wb.get(st, 0.0) + kv_b
+                if max_hbm_ms > 0.0:
+                    a_op = kv_b / max_hbm_ms
+            else:
+                stage_kv[st] = stage_kv.get(st, 0.0) + kv_b
+                if max_hbm_ms > 0.0:
+                    c_op = (kv_b / max_hbm_ms) * inv_b
+        mflops = getattr(op, "matrix_flops", ()) or ()
+        c_ms = 0.0
+        if mflops and max_cube_ms > 0.0:
+            c_ms = sum(
+                float(fl or 0.0) * sem_scale / cube_peaks_ms.get(str(fmt).lower(), max_cube_ms)
+                for fmt, fl in mflops
+                if float(fl or 0.0) > 0.0
+            )
+        else:
+            fl = float(getattr(op, "flops", 0.0) or 0.0)
+            if fl > 0.0 and max_cube_ms > 0.0:
+                fmt = str(md.get("compute_format") or getattr(op, "dtype", "") or "").lower()
+                c_ms = fl * sem_scale / cube_peaks_ms.get(fmt, max_cube_ms)
+        if c_ms > 0.0:
+            stage_cube[st] = stage_cube.get(st, 0.0) + c_ms
+            if c_ms > a_op + c_op * float(b):
+                a_op, c_op = 0.0, c_ms * inv_b
+        vops = float(getattr(op, "vector_ops", 0.0) or 0.0)
+        if vops > 0.0 and max_vec_ms > 0.0:
+            stage_vec[st] = stage_vec.get(st, 0.0) + (vops * sem_scale / max_vec_ms)
+        lbytes = float(getattr(op, "link_bytes", 0.0) or 0.0)
+        if lbytes > 0.0 and max_link_ms > 0.0:
+            # Full-duplex compulsory send volume across all incident peer links of a die.
+            compulsory_link_ms = (0.5 * lbytes * sem_scale) / max_link_ms
+            stage_link[st] = stage_link.get(st, 0.0) + compulsory_link_ms
+            if hop_lat_ms + compulsory_link_ms > a_op + c_op * float(b):
+                a_op, c_op = hop_lat_ms, compulsory_link_ms * inv_b
+        if (lbytes <= 0.0 and fam not in non_kernel_fams
+                and getattr(op, "coverage", "") != "pool_release"
+                and getattr(op, "source_boundary", "") != "host"
+                and md.get("service_boundary", "device_kernel") == "device_kernel"):
+            pe = md.get("program_execution")
+            exp_cls = md.get("invocation_class") or (pe.get("execution_class") if isinstance(pe, Mapping) else None)
+            if exp_cls and (c_ms > 0.0 or vops > 0.0 or op_hbm > 0.0 or getattr(op, "source_boundary", "") == "kernel"):
+                inv_min = min_inv_by_class.get(str(exp_cls), 0.0)
+            elif not exp_cls:
+                inv_min = max(min_cube_inv if c_ms > 0.0 else 0.0, min_vec_inv if vops > 0.0 else 0.0)
+            else:
+                inv_min = 0.0
+            if inv_min > a_op + c_op * float(b):
+                a_op, c_op = inv_min, 0.0
+        return a_op, c_op, used_gg
+
+    def _work_floor_rays(
+        self, s_key: tuple[float, ...], b: int, step_ms: float,
+    ) -> tuple[tuple[float, float], ...]:
+        """Compute monotone affine lower-bound rays ``(fixed_ms, linear_per_seq_ms)`` for ``b' >= b``."""
+        if self.unchunkable or step_ms <= 0.0 or b < 1:
+            return ()
+        cached = self.graph_cache.get((s_key, b, self.fast_spans)) or self.graph_cache.get((s_key, b, False))
+        if cached is None:
+            return ()
+        graphs, eff_case, _gr = cached
+        ops_0 = graphs.get(0, ()) if isinstance(graphs, Mapping) else ()
+        dies = getattr(getattr(eff_case, "machine", None), "dies", ()) or ()
+        if not ops_0 or not dies:
+            return ()
+        caps = self.floor_caps_cache.get(s_key)
+        if caps is None:
+            caps = self._hardware_floor_caps(eff_case, self.get_eval_context(s_key))
+            self.floor_caps_cache[s_key] = caps
+        max_hbm_ms = caps[0]
+        max_l2_bytes = caps[6]
+        stage_wb: dict[int, float] = {}
+        stage_gg: dict[int, float] = {}
+        stage_kv: dict[int, float] = {}
+        stage_cube: dict[int, float] = {}
+        stage_vec: dict[int, float] = {}
+        stage_link: dict[int, float] = {}
+        dp_val: dict[str, float] = {}
+        dp_ray: dict[str, tuple[float, float]] = {}
+        dag_used_gg = False
+        attn_fams = frozenset({"attention", "mla_attention", "indexed_attention", "paged_mla_attention"})
+        non_kernel_fams = frozenset({"collective", "barrier", "token_commit", "prefetch", "pool_release"})
+        runtime_shared_prefix = (
+            str(getattr(eff_case.runtime, "prefix_cache_mode", "") or "").strip().lower() == "shared"
+        )
+        inv_b = 1.0 / float(b)
+        for op in ops_0:
+            a_op, c_op, used_gg = self._op_floor_contribution(
+                op, b=b, inv_b=inv_b, phase=self.phase, context=self.context,
+                runtime_shared_prefix=runtime_shared_prefix, caps=caps,
+                attn_fams=attn_fams, non_kernel_fams=non_kernel_fams,
+                stage_wb=stage_wb, stage_gg=stage_gg, stage_kv=stage_kv,
+                stage_cube=stage_cube, stage_vec=stage_vec, stage_link=stage_link,
+            )
+            if used_gg:
+                dag_used_gg = True
+            best_v, best_r = 0.0, (0.0, 0.0)
+            for dep in getattr(op, "deps", ()) or ():
+                dv = dp_val.get(dep, 0.0)
+                if dv > best_v:
+                    best_v, best_r = dv, dp_ray[dep]
+            cur_r = (best_r[0] + a_op, best_r[1] + c_op)
+            dp_ray[op.op_id] = cur_r
+            dp_val[op.op_id] = cur_r[0] + cur_r[1] * float(b)
+        rays: list[tuple[float, float]] = []
+        if max_hbm_ms > 0.0:
+            for st in set(stage_wb) | set(stage_gg) | set(stage_kv):
+                gg_b = stage_gg.get(st, 0.0)
+                fixed_b = stage_wb.get(st, 0.0) + max(0.0, gg_b - max_l2_bytes) if gg_b > 0.0 else stage_wb.get(st, 0.0)
+                fixed = fixed_b / max_hbm_ms
+                lin = (stage_kv.get(st, 0.0) / max_hbm_ms) * inv_b
+                if fixed > 0.0 or lin > 0.0:
+                    rays.append((fixed, lin))
+        for stage_map in (stage_cube, stage_vec, stage_link):
+            top = max(stage_map.values(), default=0.0)
+            if top > 0.0:
+                rays.append((0.0, top * inv_b))
+        if dp_val:
+            top_id = max(dp_val, key=dp_val.__getitem__)
+            dag_a, dag_c = dp_ray[top_id]
+            if dag_used_gg and max_hbm_ms > 0.0:
+                dag_a = max(0.0, dag_a - max_l2_bytes / max_hbm_ms)
+            if dag_a > 0.0 or dag_c > 0.0:
+                rays.append((dag_a, dag_c))
+        if not rays:
+            return ()
+        at_b = max(a + c * float(b) for a, c in rays)
+        if not math.isfinite(at_b) or at_b <= 0.0 or at_b > step_ms * (1.0 + 1e-6):
+            return ()
+        return tuple(rays)
+
+    @staticmethod
+    def _eval_rays(rays: tuple[tuple[float, float], ...], b_prime: int) -> float:
+        return max((a + c * float(b_prime) for a, c in rays), default=0.0)
+
+    def _work_floor_ms(
+        self, s_key: tuple[float, ...], b: int, step_ms: float,
+    ) -> float:
+        """Compute monotone physical lower bound on ``step_ms(b')`` for all ``b' >= b``."""
+        rays = self._work_floor_rays(s_key, b, step_ms)
+        return min(self._eval_rays(rays, b), step_ms) if rays else 0.0
+
+    def _ray_sla_cutoff(self, rays: tuple[tuple[float, float], ...], b_eval: int, hi_cut: int) -> int:
+        """Return tightest integer ``b' <= hi_cut`` not certified SLA-infeasible by ``rays``."""
+        sla_ms = float(self.sla_ms)
+        cut = int(hi_cut)
+        domain_floor = max(0, int(b_eval) - 1)
+        for fixed, lin in rays:
+            if fixed > sla_ms:
+                return min(cut, domain_floor)
+            if lin > 0.0:
+                max_b = max(domain_floor, int(math.floor((sla_ms - fixed) / lin + 1e-12)))
+                if max_b < cut:
+                    cut = max_b
+        return cut
+
+    def _certified_upper_cutoff(
+        self, eval_b, floors: dict[int, float], rays_map: dict[int, tuple[tuple[float, float], ...]],
+        eff_max: int, b_joint: int,
+    ) -> int:
+        """Theorem 1: find largest ``b <= eff_max`` not certified SLA-infeasible by ``work_floor``."""
+        sla_ms = float(self.sla_ms)
+        hi_cut = self._ray_sla_cutoff(rays_map.get(1, ()), 1, int(eff_max))
+        if floors[1] > sla_ms:
+            return 0
+        prev_p = 1
+        probe = 2
+        anchor_hi = min(hi_cut, int(b_joint)) if b_joint >= 2 else 0
+        if anchor_hi >= 2:
+            _, fl_a = eval_b(anchor_hi)
+            hi_cut = self._ray_sla_cutoff(rays_map.get(anchor_hi, ()), anchor_hi, hi_cut)
+            if fl_a <= sla_ms:
+                if anchor_hi >= hi_cut:
+                    return hi_cut
+                prev_p = anchor_hi
+                probe = anchor_hi * 2
+            else:
+                lo_c, hi_c = 1, anchor_hi
+                while hi_c - lo_c > 1:
+                    mid_c = (lo_c + hi_c) // 2
+                    _, fl_m = eval_b(mid_c)
+                    hi_cut = self._ray_sla_cutoff(rays_map.get(mid_c, ()), mid_c, hi_cut)
+                    if fl_m > sla_ms:
+                        hi_c = mid_c
+                    else:
+                        lo_c = mid_c
+                return min(hi_cut, lo_c)
+        while probe <= hi_cut:
+            _, fl_p = eval_b(probe)
+            hi_cut = self._ray_sla_cutoff(rays_map.get(probe, ()), probe, hi_cut)
+            if fl_p > sla_ms:
+                lo_c, hi_c = prev_p, probe
+                while hi_c - lo_c > 1:
+                    mid_c = (lo_c + hi_c) // 2
+                    _, fl_m = eval_b(mid_c)
+                    hi_cut = self._ray_sla_cutoff(rays_map.get(mid_c, ()), mid_c, hi_cut)
+                    if fl_m > sla_ms:
+                        hi_c = mid_c
+                    else:
+                        lo_c = mid_c
+                hi_cut = min(hi_cut, lo_c)
+                break
+            prev_p = probe
+            probe *= 2
+        if hi_cut >= 1 and hi_cut not in floors:
+            probe_hi = hi_cut
+            _, fl_hi = eval_b(probe_hi)
+            hi_cut = self._ray_sla_cutoff(rays_map.get(probe_hi, ()), probe_hi, hi_cut)
+            if fl_hi > sla_ms:
+                hi_cut = min(hi_cut, max(0, probe_hi - 1))
+        return hi_cut
 
     def _search_concurrency(
         self, s_key, b1_ms, eff_max, bucket_keys, candidate_checks, evaluated_b,
         b_joint, candidate_windows,
     ):
-        b_max, sla_ms, base_b_hint = self.b_max, self.sla_ms, self.base_b_hint
-        eval_at = self.eval_at
-        try_step_ok = partial(self.try_step_ok, window_for=candidate_windows)
-        bounded_probes = []
-        secant_estimate = None
-        secant_ok: bool | None = None
-        if (0 < base_b_hint <= eff_max and eff_max >= 2 and b1_ms <= sla_ms):
-            b2_ms = float(eval_at(s_key, 2, full=False)["step_ms"])
-            marginal = b2_ms - b1_ms
-            if math.isfinite(marginal) and marginal > SECANT_MIN_SLOPE_MS:
-                estimate = 1 + int((sla_ms - b1_ms) / marginal)
-                estimate = max(2, min(int(estimate), int(eff_max)))
-                if estimate not in evaluated_b:
-                    secant_ok = try_step_ok(
-                        s_key, estimate, seen=evaluated_b,
-                        checks=candidate_checks, capacity_max=b_joint,
-                    )
-                    secant_estimate = estimate
-        if b1_ms > sla_ms:
-            probe_ceiling = min(eff_max, NON_MONOTONIC_PROBE_CAP)
-            probe_results = {probe: try_step_ok(s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) for probe in range(2, probe_ceiling + 1)}
-            bounded_probes = list(probe_results)
-            feasible_above = [probe for probe, ok in probe_results.items() if ok]
-            if feasible_above:
-                b_sla = max(feasible_above)
-                eval_sla = eval_at(s_key, b_sla, full=True)
-            else:
-                b_sla, eval_sla = 0, eval_at(s_key, 1, full=True)
-        elif eff_max > 1 and (b1_ms * SLA_HEADROOM_MULTIPLIER <= sla_ms or base_b_hint == eff_max) and try_step_ok(s_key, eff_max, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
-            b_sla, eval_sla = eff_max, eval_at(s_key, eff_max, full=True)
-        else:
-            eff_max = min(b_max, self.domain_cap)
-            low, high = 1, eff_max
-            if secant_estimate is not None and secant_ok is not None:
-                if secant_ok:
-                    low = max(low, secant_estimate)
-                else:
-                    high = min(high, self.domain_cap, secant_estimate - 1)
-            elif base_b_hint > 1 and all(x >= 1.0 for x in s_key[:-1]):
-                hint_probe = min(eff_max, base_b_hint)
-                if try_step_ok(s_key, hint_probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
-                    low = max(low, hint_probe)
-                else:
-                    high = min(high, self.domain_cap, hint_probe - 1)
-            best_b, lo_i, hi_i = low, low + 1, min(high, self.domain_cap)
-            while lo_i <= hi_i:
-                mid = (lo_i + hi_i) // 2
-                if try_step_ok(s_key, mid, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
-                    best_b, lo_i = mid, mid + 1
-                else:
-                    hi_i = min(hi_i, self.domain_cap, mid - 1)
-            while best_b > 1 and not try_step_ok(s_key, best_b, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint):
-                best_b -= 1
-            b_sla = best_b if try_step_ok(s_key, best_b, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) else 0
-            eval_sla = eval_at(s_key, max(1, b_sla), full=True)
+        """Dual-certificate branch-and-bound SLA sizing maximizing throughput ``B / step_ms``."""
+        if self.unchunkable or eff_max < 1:
+            return 0, self.eval_at(s_key, 1, full=True), [], None, True, 0
 
-        if b_sla > 0 and b_sla < min(b_max, self.domain_cap) and bucket_keys:
-            ceiling = min(min(b_max, self.domain_cap), b_sla + SLA_HEADROOM_PROBE_STEPS)
-            probe_results = {probe: try_step_ok(s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) for probe in range(b_sla + 1, ceiling + 1)}
-            bounded_probes.extend(probe_results)
-            feasible_above = [probe for probe, ok in probe_results.items() if ok]
-            if feasible_above:
-                b_sla = max(feasible_above)
-                eval_sla = eval_at(s_key, b_sla, full=True)
-        # A latency-feasible batch still has to pass both capacity windows.
-        # Bound the exact window first (memory-only) and price only its
-        # capacity-feasible ceiling, so a near-limit answer does not force one
-        # graph evaluation per candidate.
-        if b_sla > 0 and b_joint > 0:
-            ceiling = min(int(b_sla), int(b_joint), int(b_max), int(self.domain_cap))
-            for probe in range(ceiling, 0, -1):
-                current_window, lifecycle_window = candidate_windows(probe)
-                if current_window["fits"] and lifecycle_window["fits"]:
-                    if try_step_ok(s_key, probe, seen=evaluated_b,
-                                   checks=candidate_checks,
-                                   capacity_max=b_joint):
-                        break
-        if b_sla > 0:
-            evaluated_b.add(b_sla)
-        return b_sla, eval_sla, bounded_probes, secant_estimate
+        sla_ms = float(self.sla_ms)
+        bounded_probes: list[int] = []
+        probed_seen: set[int] = set()
+        floors: dict[int, float] = {}
+        rays_map: dict[int, tuple[tuple[float, float], ...]] = {}
+        best_sla: tuple[float, int] | None = None
+        best_joint: tuple[float, int] | None = None
+
+        def _tps(b_val: int, step_val: float) -> float:
+            return (float(b_val) / step_val) if step_val > 0.0 else math.inf
+
+        def _record_best(b_val: int) -> None:
+            nonlocal best_sla, best_joint
+            rec = candidate_checks.get(b_val)
+            if rec is None:
+                return
+            score = (_tps(b_val, float(rec["step_ms"])), b_val)
+            if bool(rec["sla"]["pass"]) and (best_sla is None or score > best_sla):
+                best_sla = score
+            if bool(rec["feasible"]) and (best_joint is None or score > best_joint):
+                best_joint = score
+
+        def _eval_b(b_val: int) -> tuple[float, float]:
+            check_active_deadline()
+            b_int = int(b_val)
+            if b_int not in candidate_checks:
+                self.try_step_ok(
+                    s_key, b_int, window_for=candidate_windows,
+                    seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint,
+                )
+            if b_int > 1 and b_int not in probed_seen:
+                probed_seen.add(b_int)
+                bounded_probes.append(b_int)
+            step_val = float(candidate_checks[b_int]["step_ms"])
+            if b_int not in floors:
+                rays = self._work_floor_rays(s_key, b_int, step_val)
+                rays_map[b_int] = rays
+                floors[b_int] = min(self._eval_rays(rays, b_int), step_val) if rays else 0.0
+            _record_best(b_int)
+            return step_val, floors[b_int]
+
+        rays_1 = self._work_floor_rays(s_key, 1, float(b1_ms))
+        rays_map[1] = rays_1
+        floors[1] = min(self._eval_rays(rays_1, 1), float(b1_ms)) if rays_1 else 0.0
+        _record_best(1)
+        hi_cut = self._certified_upper_cutoff(
+            _eval_b, floors, rays_map, eff_max, b_joint,
+        )
+        q_tokens = max(1, int(self.q_tokens))
+        split_anchors = sorted({
+            int(raw_b)
+            for bk in bucket_keys
+            for raw_b in (bk, bk // q_tokens)
+            if 2 <= raw_b < hi_cut
+        } | ({int(self.base_b_hint)} if 2 <= self.base_b_hint < hi_cut else set()))
+
+        def _interval_ub(lo_i: int, hi_i: int) -> float:
+            b_top = hi_i - 1
+            fl_top = floors.get(lo_i, 0.0)
+            for b_e, rays_e in rays_map.items():
+                if b_e <= lo_i and rays_e:
+                    val_e = self._eval_rays(rays_e, b_top)
+                    if val_e > fl_top:
+                        fl_top = val_e
+            return math.inf if fl_top <= 0.0 else float(b_top) / fl_top
+
+        def _is_dominated(lo_i: int, hi_i: int) -> bool:
+            if hi_i - lo_i <= 1:
+                return True
+            fl_lo = floors.get(lo_i, 0.0)
+            if fl_lo > sla_ms:
+                return True
+            if fl_lo <= 0.0:
+                return False
+            ub_all = _interval_ub(lo_i, hi_i)
+            sla_dom = best_sla is not None and (
+                ub_all < best_sla[0]
+                or (ub_all <= best_sla[0] and (hi_i - 1) <= best_sla[1])
+            )
+            if not sla_dom:
+                return False
+            if b_joint < 1 or lo_i >= b_joint:
+                return True
+            joint_hi = min(hi_i, b_joint + 1)
+            if joint_hi - lo_i <= 1:
+                return True
+            ub_joint = _interval_ub(lo_i, joint_hi)
+            return best_joint is not None and (
+                ub_joint < best_joint[0]
+                or (ub_joint <= best_joint[0] and (joint_hi - 1) <= best_joint[1])
+            )
+
+        heap: list[tuple[float, int, int, int]] = []
+        if hi_cut >= 2:
+            if hi_cut not in candidate_checks:
+                _eval_b(hi_cut)
+            pts = sorted(b_i for b_i in candidate_checks if 1 <= b_i <= hi_cut)
+            for idx in range(len(pts) - 1):
+                lo_i, hi_i = pts[idx], pts[idx + 1]
+                if not _is_dominated(lo_i, hi_i):
+                    heapq.heappush(heap, (-_interval_ub(lo_i, hi_i), -(hi_i - lo_i), lo_i, hi_i))
+
+        while heap:
+            _neg_ub, _neg_span, lo_i, hi_i = heapq.heappop(heap)
+            hi_eff = min(hi_i, hi_cut + 1)
+            if lo_i >= hi_cut or _is_dominated(lo_i, hi_eff):
+                continue
+            mid = (lo_i + hi_eff) // 2
+            inner_anchors = [a for a in split_anchors if lo_i < a < hi_eff]
+            if inner_anchors:
+                mid = min(inner_anchors, key=lambda a: (abs(a - mid), a))
+            _, fl_m = _eval_b(mid)
+            hi_cut = self._ray_sla_cutoff(rays_map.get(mid, ()), mid, hi_cut)
+            if fl_m > sla_ms:
+                hi_cut = min(hi_cut, mid - 1)
+                if not _is_dominated(lo_i, mid):
+                    heapq.heappush(heap, (-_interval_ub(lo_i, mid), -(mid - lo_i), lo_i, mid))
+                continue
+            if not _is_dominated(lo_i, mid):
+                heapq.heappush(heap, (-_interval_ub(lo_i, mid), -(mid - lo_i), lo_i, mid))
+            hi_next = min(hi_eff, hi_cut + 1)
+            if mid < hi_next and not _is_dominated(mid, hi_next):
+                heapq.heappush(heap, (-_interval_ub(mid, hi_next), -(hi_next - mid), mid, hi_next))
+
+        b_sla = int(best_sla[1]) if best_sla is not None else 0
+        eval_sla = self.eval_at(s_key, b_sla if b_sla > 0 else 1, full=True)
+        return b_sla, eval_sla, bounded_probes, None, True, hi_cut
 
     def _candidate_record(
         self, b, evaluation, *, scen, s_key, b_joint, b_vram, b_lifecycle,
@@ -606,7 +1023,7 @@ class _SLASizingRun:
         self, scen, s_key, current_caps, lifecycle_caps, b_joint,
         life_ctx, verify_tokens, candidate_windows, b1_ms, bucket_keys,
         candidate_checks, evaluated_b, b_sla, eval_sla, bounded_probes,
-        secant_estimate,
+        secant_estimate, *, certified_optimal: bool = False, hi_cut: int | None = None,
     ):
         b_vram, b_vram_sync, b_vram_async = current_caps
         b_lifecycle, b_life_sync, b_life_async = lifecycle_caps
@@ -644,6 +1061,7 @@ class _SLASizingRun:
         latency_sla_feasible = bool(latency_candidate is not None and latency_candidate["sla"]["pass"])
         jointly_feasible = feasible_candidate is not None
         exhaustive = set(range(1, min(b_max, domain_cap) + 1)) <= set(candidate_checks)
+        domain_certified = bool(exhaustive or certified_optimal)
         if domain_cap < 1:
             feasibility_status = "domain_infeasible"
         elif not capacity_feasible:
@@ -651,10 +1069,10 @@ class _SLASizingRun:
         elif jointly_feasible:
             feasibility_status = "feasible" if b_sla <= b_feas else "feasible_capacity_limited"
         elif latency_candidate is not None:
-            feasibility_status = ("no_jointly_feasible_candidate_in_evaluated_domain" if exhaustive
+            feasibility_status = ("no_jointly_feasible_candidate_in_evaluated_domain" if domain_certified
                                   else "no_feasible_candidate_in_bounded_search")
         else:
-            feasibility_status = ("sla_infeasible_within_evaluated_domain" if exhaustive
+            feasibility_status = ("sla_infeasible_within_evaluated_domain" if domain_certified
                                   else "no_feasible_candidate_in_bounded_search")
         tps_sla = (b_sla * dp * emit_tokens * 1000.0) / eval_sla["step_ms"] if b_sla > 0 else 0.0
         tps_feas = (b_feas * dp * emit_tokens * 1000.0) / feasible_ev["step_ms"] if jointly_feasible and feasible_ev is not None else 0.0
@@ -696,12 +1114,16 @@ class _SLASizingRun:
             "feasibility_status": feasibility_status,
             "b_sla_lower_bound": b_sla, "b_sla_is_proven_max": False,
             "latency_candidate": latency_candidate, "feasible_candidate": feasible_candidate,
-            "search": {"method": "exponential_probe_plus_binary_under_monotone_assumption",
+            "search": {"method": "dual_certificate_branch_and_bound",
+                       "objective": "maximize_throughput_under_sla",
                        "secant_warmup_probe": secant_estimate,
-                       "monotonicity_assumed": True, "non_monotonic_dispatch_detected": bool(
-                           latency_candidate is not None and latency_candidate["capacity"]["pass"] is False and b1_ms > sla_ms),
-                       "non_monotonic_dispatch_check": "bounded_bucket_probe" if bucket_keys else "not_applicable_no_capture_buckets",
-                       "bounded_dispatch_probes": bounded_probes, "bounded_search_exhaustive": bool(exhaustive),
+                       "monotonicity_assumed": False,
+                       "certified_optimal": bool(certified_optimal),
+                       "certified_upper_cutoff_b": int(hi_cut if hi_cut is not None else min(b_max, domain_cap)),
+                       "non_monotonic_dispatch_detected": bool(
+                           b_sla > 1 and b1_ms > sla_ms),
+                       "non_monotonic_dispatch_check": "dual_certificate_branch_and_bound",
+                       "bounded_dispatch_probes": bounded_probes, "bounded_search_exhaustive": bool(domain_certified),
                        "evaluated_candidates": sorted(evaluated_b), "b_sla_is_proven_max": False,
                        "candidate_step_source": "full_graph_reevaluation" if jointly_feasible else "none",
                        "lower_bound_can_prove_feasibility": False},

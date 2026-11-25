@@ -297,9 +297,11 @@ def _export_resource_operators(resource_graphs, resource_geometries, subgraphs, 
                         "operator_ids": [resource["node_id"]],
                         "kind": "selected_native_fusion"}
             group["resource_boundary"] = boundary
+            geom = resource_geometries.get((replica, op.stage))
+            geom_arch = getattr(geom, "arch_family", None) if geom is not None else None
             f_status, f_reason = resolve_subgraph_fusion_status(
                 group, [by_id[member_id] for member_id in group["node_ids"]],
-                resource_bound=True)
+                resource_bound=True, arch=geom_arch)
             group["fusion_status"] = f_status
             group["fusion_reason"] = f_reason
             group.update({field: resource[field]

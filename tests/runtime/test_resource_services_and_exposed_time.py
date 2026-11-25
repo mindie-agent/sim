@@ -41,8 +41,6 @@ from mindie_sim.prediction.efficiency import (
     resource_attribution as attribution, roofline_graph as roof)
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.operators.matrix.matrix import TiledMatmul
-from mindie_sim.prediction.operators.matrix.matrix_traffic import (
-    MatrixGeometry, MatrixSchedule, plan_matrix_traffic)
 from mindie_sim.prediction.mechanism import (
     Geometry as PlanGeometry, OperatorPlan, PlannedRecipe, Work)
 from mindie_sim.prediction.operator_analysis import target_operators
@@ -405,11 +403,6 @@ def test_traffic_plans_conserve_shared_prefix_and_selected_rows():
                                 private_tokens=(128, 128, 128, 128), row_bytes=576),
         hierarchy, traffic.IndexSchedule(batch_tile=True))
     assert prefix.hbm_read_bytes == (4096 + 512) * 576 and prefix.l2_hit_bytes > 0
-    plan = plan_matrix_traffic(
-        mechanism_op(shape=(32, 32, 7168)), MatrixGeometry(32, 32, 7168),
-        MatrixSchedule(32, 32, 256, 16, 16, 16, 28, 1, 1, 2, 2, "gm"), hierarchy)
-    assert plan.hbm_read_bytes == 32 * 7168 * 2 + 7168 * 32 * 2
-    assert plan.partial_bytes > 0 and plan.private_refill_bytes >= plan.hbm_read_bytes
     work = summarize_work(Params.parse({
         "lengths": (1,), "heads": 4, "key_heads": 2, "dk": 128, "dv": 128,
         "dtype": "bf16", "state_dtype": "fp32"}), PlanGeometry(

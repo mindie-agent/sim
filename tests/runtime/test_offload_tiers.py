@@ -566,7 +566,7 @@ def test_sparse_mla_offload_decode_and_host_dram_budget():
                              context=8192, sequences=[1], scope="body")[0]
     h2d_ops = [op for op in long_ops if op.recipe == "memfabric_sparse_copy_h2d"]; layer0 = dict(h2d_ops[0].metadata)
     layer1 = dict(h2d_ops[1].metadata)
-    assert layer0["memfabric_call"]["tokens"] == math.ceil(2048 * 0.2); assert layer0["shared_indexer_reuse"] is False and layer1["shared_indexer_reuse"] is True; assert layer1["skip_topk"] is True; assert layer0["hardware_support"]["memfabric_acc_offload"] == "host_gva_dma_modeled"; assert layer0["hardware_support"]["abi_verification"] == "deferred_to_abi_registry"; assert layer0["hardware_support"]["copy_sfa_attention"] == "analytical_model"
+    assert layer0["memfabric_call"]["tokens"] == math.ceil(2048 * 0.2); assert layer0["shared_indexer_reuse"] is False and layer1["shared_indexer_reuse"] is True; assert layer1["skip_topk"] is True; assert layer0["hardware_support"]["memfabric_acc_offload"] == "host_gva_dma_modeled"; assert layer0["hardware_support"]["abi_verification"] == "verified_via_probed_abi_registry"; assert layer0["hardware_support"]["copy_sfa_attention"] == "analytical_model"
     base_raw = sparse_mla_case(context_tokens=4096); offload_raw = sparse_mla_case(context_tokens=4096, offloading={
         "implementation": "vllm_ascend_sparse_kv_offload",
         "options": {"dram_size_per_dp_gb": 0.02, "keep_device_kv_cache": False}})

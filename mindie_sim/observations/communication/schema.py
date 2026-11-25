@@ -875,7 +875,7 @@ def _protocol_key(value):
 
 def _same_canary(expected, observed):
     if expected is None or observed is None:
-        return True
+        return False
     if isinstance(expected, Mapping) and isinstance(observed, Mapping):
         return all(key in observed and _same_canary(value, observed[key])
                    for key, value in expected.items())
@@ -893,10 +893,13 @@ def _canary_issue(value):
     if isinstance(value, str):
         return None if value.strip().lower() in _CANARY_OK else f"canary={value!r}"
     if isinstance(value, Mapping):
+        if "expected" not in value or "observed" not in value:
+            return f"canary_incomplete={value!r}"
         expected, observed = value.get("expected"), value.get("observed")
-        if expected is not None and not _same_canary(expected, observed):
+        if expected is None or observed is None or not _same_canary(expected, observed):
             return f"canary={expected!r}!={observed!r}"
-    return None
+        return None
+    return f"canary_invalid={value!r}"
 
 
 def _status_issue(document):

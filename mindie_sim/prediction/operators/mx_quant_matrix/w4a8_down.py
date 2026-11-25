@@ -49,7 +49,7 @@ from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import KernelProgram, Stage
 from .w4a8 import Config, _geometry_owners, _role_work
 from .w4a8_matrix import matrix_program, matrix_work
-from mindie_sim.prediction.operators.matrix.matrix_traffic import FP32_BYTES
+FP32_BYTES = 4
 from .w4a8_schedule import (
     COLUMN_SCALE_BYTES, DOWN_BASE_M, DOWN_BASE_M_TALL, DOWN_SHORT_M,
     GROUP_COUNT_BYTES, MSD_FLOPS_PER_K_STEP, MSD_WORKSPACE_BYTES_PER_OUTPUT,

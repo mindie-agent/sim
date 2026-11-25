@@ -72,6 +72,8 @@ from mindie_sim.schema.stack import (
     WaitForEvent,
     WorkUnitKind,
     WorkloadDomain,
+    resolve_checkpoint_cache_abis,
+    resolve_checkpoint_tensor_abi,
 )
 from mindie_sim.schema.workload import IterationPlan, RequestView
 
@@ -183,122 +185,7 @@ def _validate_adapter(adapter: Any) -> StackCapabilitySpec:
     return cap
 
 
-def _manifest_abi_for_tag(
-    raw_tag: str,
-    native_dtype: str,
-    rule: TensorQuantRule | None = None,
-) -> TensorPrecisionABI:
-    upper = raw_tag.strip().upper().replace("-", "_")
-    if upper in {"", "FLOAT", "BF16", "BFLOAT16"}:
-        return TensorPrecisionABI(
-            linear_method="dense",
-            input_dtype=native_dtype,
-            weight_dtype=native_dtype,
-            output_dtype=native_dtype,
-            compute_dtype=native_dtype,
-        )
-    if upper in {"FP16", "FLOAT16"}:
-        return TensorPrecisionABI(
-            linear_method="dense",
-            input_dtype="fp16",
-            weight_dtype="fp16",
-            output_dtype="fp16",
-            compute_dtype="fp16",
-        )
-    if upper in {"W8A8_MXFP8", "W8A8_MXFP", "W8A8_MXFP8_MXFP8", "MXFP8"}:
-        blk = rule.group_size if (rule is not None and rule.group_size) else (1, MX_BLOCK_ELEMENTS)
-        return TensorPrecisionABI(
-            linear_method="mx_fp8",
-            input_dtype="fp8_e4m3",
-            weight_dtype="fp8_e4m3",
-            output_dtype=native_dtype,
-            compute_dtype="fp8_e4m3",
-            accum_dtype="fp32",
-            weight_block=blk,
-            weight_scale_dtype="e8m0",
-            weight_scale_bytes=E8M0_SCALE_BYTES,
-            act_group_size=blk[-1],
-            act_scale_dtype="e8m0",
-            act_scale_pack="2",
-        )
-    if upper in {
-        "W4A8_MXFP", "W4A8_MXFP4", "W4A8_MXFP4_DYNAMIC", "W4A4_MXFP",
-        "W4A4_MXFP4", "W4A4", "W4A4F4_DAOS", "MXFP4", "FP4",
-        "MXFP4_ROUTED_ONLY", "MXFP4_ALL", "MXFP8_MXFP4",
-    }:
-        blk = rule.group_size if (rule is not None and rule.group_size) else (1, MX_BLOCK_ELEMENTS)
-        act = (
-            "fp8_e4m3"
-            if ("A8" in upper or upper in {"MXFP4", "MXFP4_ROUTED_ONLY", "MXFP4_ALL", "MXFP8_MXFP4"})
-            else "fp4_e2m1"
-        )
-        return TensorPrecisionABI(
-            linear_method="mx_fp4",
-            input_dtype=act,
-            weight_dtype="fp4_e2m1",
-            output_dtype=native_dtype,
-            compute_dtype="fp4_e2m1",
-            accum_dtype="fp32",
-            weight_block=blk,
-            weight_scale_dtype="e8m0",
-            weight_scale_bytes=E8M0_SCALE_BYTES,
-            act_group_size=blk[-1],
-            act_scale_dtype="e8m0",
-            act_scale_pack="2",
-        )
-    if upper in {"W8A8_FP8", "FP8", "FP8_DYNAMIC", "FP8_E4M3", "FP8_BLOCK"}:
-        blk = rule.group_size if (rule is not None and rule.group_size) else (FP8_BLOCK_ELEMENTS, FP8_BLOCK_ELEMENTS)
-        return TensorPrecisionABI(
-            linear_method="fp8",
-            input_dtype="fp8_e4m3",
-            weight_dtype="fp8_e4m3",
-            output_dtype=native_dtype,
-            compute_dtype="fp8_e4m3",
-            accum_dtype="fp32",
-            weight_block=blk,
-            weight_scale_dtype="fp32",
-            weight_scale_bytes=FP32_SCALE_BYTES,
-            act_group_size=blk[-1],
-            act_scale_dtype="fp32",
-        )
-    if upper in {"W8A8", "W8A8_INT8", "W8A8_DYNAMIC", "W8A8_MIX", "INT8"}:
-        return TensorPrecisionABI(
-            linear_method="w8a8",
-            input_dtype="int8",
-            weight_dtype="int8",
-            output_dtype=native_dtype,
-            compute_dtype="int8",
-            accum_dtype="int32",
-            weight_scale_dtype="fp32",
-            weight_scale_bytes=FP32_SCALE_BYTES,
-            act_scale_dtype="fp32",
-        )
-    if upper in {"W4A8", "W4A8_DYNAMIC"}:
-        return TensorPrecisionABI(
-            linear_method="w4a8",
-            input_dtype="int8",
-            weight_dtype="int4",
-            output_dtype=native_dtype,
-            compute_dtype="int8",
-            accum_dtype="int32",
-            weight_scale_dtype="fp32",
-            weight_scale_bytes=FP32_SCALE_BYTES,
-            act_scale_dtype="fp32",
-        )
-    if upper in {"W4A16", "INT4", "AWQ", "GPTQ"}:
-        blk = rule.group_size if (rule is not None and rule.group_size) else (1, INT4_GROUP_ELEMENTS)
-        return TensorPrecisionABI(
-            linear_method="w4a16",
-            input_dtype=native_dtype,
-            weight_dtype="int4",
-            output_dtype=native_dtype,
-            compute_dtype=native_dtype,
-            accum_dtype="fp32",
-            weight_block=blk,
-            weight_scale_dtype=native_dtype,
-            weight_scale_bytes=FP16_SCALE_BYTES,
-        )
-    raise ModelingError(f"unknown_checkpoint_quant_tag:{raw_tag}")
+_manifest_abi_for_tag = resolve_checkpoint_tensor_abi
 
 
 def _parse_manifest_capture_mode(raw: Any) -> tuple[CaptureMode, str]:
@@ -588,47 +475,23 @@ class ManifestStackAdapter:
             _manifest_abi_for_tag(rule.raw_tag, native_dtype, rule)
         for exc in checkpoint.layer_exceptions:
             _manifest_abi_for_tag(exc.raw_tag, native_dtype)
-        kv_abis: list[CacheStateABI] = []
-        if not is_diffusion:
-            ckpt_digest = checkpoint.digest()
-            for plan in layers:
-                native_id = plan.native_layer_id if plan.native_layer_id >= 0 else plan.index
-                total_kv = plan.num_kv_heads or plan.num_heads or 1
-                local_kv = local_kv_heads(total_kv, parallel.tp)
-                h_dim = plan.head_dim or 1
-                kv_abis.append(
-                    CacheStateABI(
-                        scope="target",
-                        native_layer=native_id,
-                        component_role="kv_combined",
-                        producer_key=f"target.l{native_id}.kv_combined",
-                        planes=(
-                            CachePlaneABI(
-                                plane_id="kv_payload",
-                                plane_kind="payload",
-                                logical_axes=("kv", "head", "dim"),
-                                logical_shape=(KV_CACHE_PLANES, local_kv, h_dim),
-                                physical_shape=(KV_CACHE_PLANES, local_kv, h_dim),
-                                dtype=native_dtype,
-                                allocation_frequency="page",
-                                write_trigger="append",
-                            ),
-                        ),
-                        phase=phase,
-                        deployment_role=role,
-                        checkpoint_digest=ckpt_digest,
-                        kv_block_size=DEFAULT_KV_BLOCK_SIZE,
-                        placement=CachePlacementRule(head_range=(0, local_kv), state_shard_axis="tp"),
-                    )
-                )
+        if is_diffusion:
+            kv_abis: tuple[CacheStateABI, ...] = ()
+            idx_abis: tuple[CacheStateABI, ...] = ()
+            rec_abis: tuple[CacheStateABI, ...] = ()
+        else:
+            kv_abis, idx_abis, rec_abis = resolve_checkpoint_cache_abis(
+                layers, checkpoint, parallel, native_dtype,
+                role=role, phase=phase, kv_block_size=DEFAULT_KV_BLOCK_SIZE,
+            )
         return RuntimeQuantPlan(
             checkpoint_digest=checkpoint.digest(),
             stack_id=self._capabilities.stack_id,
             port_abis=tuple(port_abis),
             packed_groups=(),
-            kv_cache_abi=tuple(kv_abis),
-            index_cache_abi=(),
-            recurrent_state_abi=(),
+            kv_cache_abi=kv_abis,
+            index_cache_abi=idx_abis,
+            recurrent_state_abi=rec_abis,
             prepared_weights=(),
             dispositions=tuple(dispositions),
             provenance=checkpoint.provenance.origin,
@@ -781,12 +644,7 @@ class RuntimeStackRegistry:
             self._discover_entry_points_locked()
 
     def _discover_entry_points_locked(self) -> None:
-        try:
-            eps = importlib_metadata.entry_points(group=STACK_ENTRY_POINT_GROUP)
-        except TimeoutError:
-            raise
-        except Exception:
-            return
+        eps = importlib_metadata.entry_points(group=STACK_ENTRY_POINT_GROUP)
         for ep in eps:
             loaded = ep.load()
             adapter = loaded() if callable(loaded) else loaded

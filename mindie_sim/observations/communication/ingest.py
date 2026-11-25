@@ -522,7 +522,7 @@ def _chain_row(values, campaign, origin, default_dtype, default_observed,
     ep = values.get("ranks") or values.get("ep") or values.get("world_size") or 1
     rep = int(values.get("repeat_index")
               if values.get("repeat_index") is not None else default_repeat)
-    return _chain_record(
+    record = _chain_record(
         campaign, origin, dtype, int(ep), values.get("experts"),
         values.get("global_tokens"), normalized, float(chain_ms),
         values.get("condition") or values.get("chain_id") or campaign,
@@ -531,6 +531,15 @@ def _chain_row(values, campaign, origin, default_dtype, default_observed,
         values.get("profiler_evidence", default_evidence),
         run_id=values.get("run_id") or default_run_id, repeat_index=rep,
         chain_id=values.get("chain_id") or None)
+    for opt_key in (
+        "paired_overlap_ms", "observed_overlap_ms", "paired_runs",
+        "concurrent_vector_util", "shared_vector_util",
+        "concurrent_mte_util", "shared_mte_util",
+        "concurrent_hbm_util", "shared_hbm_util",
+    ):
+        if opt_key in values and values[opt_key] is not None:
+            record[opt_key] = values[opt_key]
+    return record
 
 
 def _chain_record(campaign, origin, dtype, ep, experts, tokens, legs, chain_ms,
@@ -952,6 +961,32 @@ def _rank_rows(document, origin, p2p_pair=None, default_run_id=None, default_rep
     return rows
 
 
+def _extract_rank_id(rank_document, rank_origin: str, parent_origin: str) -> int | None:
+    """Return explicit non-negative integer rank identity, or ``None`` if anonymous."""
+    if "rank" in rank_document:
+        raw_rank = rank_document.get("rank")
+        if isinstance(raw_rank, int) and not isinstance(raw_rank, bool) and raw_rank >= 0:
+            return raw_rank
+        return None
+    if rank_origin != parent_origin:
+        match = re.search(r"\.rank(\d+)\.json$", Path(rank_origin).name)
+        if match is not None:
+            return int(match.group(1))
+    return None
+
+
+_P2P_PAIR_RANKS = 2
+
+
+def _expected_rank_membership(row: Mapping, expected_ranks: int) -> set[int]:
+    """Expected participating rank IDs for coverage certification."""
+    if row.get("collective") == "p2p_send_recv":
+        match = re.fullmatch(r"(\d+)->(\d+)", str(row.get("pair") or ""))
+        if match is not None and expected_ranks == _P2P_PAIR_RANKS:
+            return {int(match.group(1)), int(match.group(2))}
+    return set(range(expected_ranks))
+
+
 def _parent_document(path, document):
     origin = str(path) if path is not None else "memory"
     stem = (path.name[:-len(".parent.json")]
@@ -976,11 +1011,13 @@ def _parent_document(path, document):
         "boundary", "single",
     )
     defaults = {key: document[key] for key in inherited_keys if key in document}
-    for rank_document, rank_origin in chain(
+    rank_sources = list(chain(
         ((_load_json(item), str(item)) for item in rank_files), reports
-    ):
+    ))
+    for rank_document, rank_origin in rank_sources:
         rank_document = _merge_obs(defaults, rank_document)
         _validate_campaign(rank_document, rank_origin)
+        rank_id = _extract_rank_id(rank_document, rank_origin, origin)
         rank_rows = _rank_rows(
             rank_document, rank_origin, pair, default_run_id=parent_run,
             default_repeat=document.get("repeat_index", 0))
@@ -991,22 +1028,45 @@ def _parent_document(path, document):
                 row["regime"], row.get("boundary"), row["run_id"],
                 row["repeat_index"], row.get("stack"), row.get("cann"),
                 row.get("algorithm"), _protocol_key(row.get("protocol")),
-            )].append(row)
+            )].append((rank_id, row))
     rows = []
-    for _key, group in sorted(grouped.items(), key=str):
-        med = median(row["per_op_ms"] for row in group)
+    expected_ranks = max(1, int(world))
+    for _key, tagged_group in sorted(grouped.items(), key=str):
+        by_rank: dict[int, list[dict]] = defaultdict(list)
+        anonymous_rows: list[dict] = []
+        for rank_id, row in tagged_group:
+            if rank_id is None:
+                anonymous_rows.append(row)
+            else:
+                by_rank[rank_id].append(row)
+        # Deduplicate/aggregate each identified rank first so duplicate reports
+        # from one rank cannot skew the cross-rank median or fake coverage.
+        per_rank_values = [
+            median(sample["per_op_ms"] for sample in by_rank[rid])
+            for rid in sorted(by_rank)
+        ]
+        if anonymous_rows:
+            per_rank_values.extend(float(sample["per_op_ms"]) for sample in anonymous_rows)
+        group = [row for _, row in tagged_group]
+        med = median(per_rank_values)
         base = {k: v for k, v in group[0].items()
                 if k not in {"_repeats", "_weights"} or len(group) == 1}
         extra = (
             {"_weights": [(med, sum(w for _, w in group[0]["_weights"]))]}
             if len(group) > 1 and "_weights" in group[0] else {}
         )
+        expected_set = _expected_rank_membership(group[0], expected_ranks)
+        complete_coverage = (not anonymous_rows) and (set(by_rank) == expected_set)
+        canary_value = "all_ranks_matched" if complete_coverage else base.get("canary")
         rows.append({
             **base,
             "campaign": document.get("label") or stem,
             "per_op_ms": med,
             **extra,
-            "canary": "all_ranks_matched",
+            "canary": canary_value,
+            "all_ranks_matched": complete_coverage,
+            "observed_ranks": len(by_rank),
+            "expected_ranks": expected_ranks,
             "source": origin,
         })
     return [({**document, "conditions": rows,
@@ -1017,16 +1077,6 @@ def _list_document(values, origin):
     if not values:
         return []
     if all(isinstance(value, Mapping) for value in values):
-        keys = set(values[0])
-        base = {
-            "label": Path(origin).stem, "status": "completed",
-            "canary_ok": True, "hardware_key": A5_HARDWARE_KEY,
-            "arch_family": A5_ARCH_FAMILY,
-        }
-        if {"condition", "legs_ms"} <= keys or {"chain_ms", "legs_ms"} <= keys:
-            return [({**base, "chains": values}, origin)]
-        if {"payload_bytes", "per_op_ms"} <= keys or {"size_bytes", "median_ms"} <= keys:
-            return [({**base, "conditions": values}, origin)]
         if any({"label", "conditions", "series", "chains", "families"} & set(value)
                for value in values):
             return [(value, origin) for value in values]

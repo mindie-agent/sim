@@ -253,7 +253,7 @@
       },
       "lowerings": {
         "mqsmla_attention": {
-          "implementation": "dsl_mixed_quant_sparse_flash_mla",
+          "implementation": "aclnn_mixed_quant_sparse_flash_mla",
           "options": {
             "metadata_support_fd": false,
             "addressing": "scalar",
@@ -1318,7 +1318,7 @@
           "id": "retained-service-9826e8d5425e0732",
           "match": {
             "hardware": "Ascend950DT_9582",
-            "recipe": "dsl_mixed_quant_sparse_flash_mla",
+            "recipe": "aclnn_mixed_quant_sparse_flash_mla",
             "family": "attention",
             "dtype": "bf16",
             "metadata.native_kind": "MqsmlaKernel___call__",
@@ -1369,7 +1369,7 @@
           "id": "retained-service-7abf72c757a21a48",
           "match": {
             "hardware": "Ascend950DT_9582",
-            "recipe": "dsl_mixed_quant_sparse_flash_mla",
+            "recipe": "aclnn_mixed_quant_sparse_flash_mla",
             "family": "attention",
             "dtype": "bf16",
             "metadata.native_kind": "MqsmlaKernel___call__",
@@ -1420,7 +1420,7 @@
           "id": "retained-service-4aa0d0d7f87d7430",
           "match": {
             "hardware": "Ascend950DT_9582",
-            "recipe": "dsl_mixed_quant_sparse_flash_mla",
+            "recipe": "aclnn_mixed_quant_sparse_flash_mla",
             "family": "attention",
             "dtype": "bf16",
             "metadata.native_kind": "MqsmlaKernel___call__",

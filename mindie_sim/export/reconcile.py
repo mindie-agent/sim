@@ -110,7 +110,7 @@ def load_kernel_details_csv(path: str | Path) -> tuple[KernelObservationRow, ...
             start_raw = raw.get(selected["start_us"], "") if selected["start_us"] else ""
             start_us = _parse_float(start_raw, "start_us") if _clean_text(start_raw) else float(idx)
             rows.append(KernelObservationRow(
-                index=idx,
+                index=len(rows),
                 name=name,
                 op_type=_clean_text(raw.get(selected["op_type"])) if selected["op_type"] else "",
                 core=_clean_text(raw.get(selected["core"])) if selected["core"] else "",
@@ -146,6 +146,7 @@ def load_observation_bundle(
         if not csv_path.is_absolute():
             csv_path = (target.parent / csv_path).resolve()
         kernels.extend(load_kernel_details_csv(csv_path))
+    next_index = max((k.index for k in kernels), default=-1) + 1
     for idx, entry in enumerate(payload.get("kernels", ()) or ()):
         if not isinstance(entry, Mapping):
             continue
@@ -153,7 +154,7 @@ def load_observation_bundle(
         if dur <= 0.0 or not math.isfinite(dur):
             continue
         kernels.append(KernelObservationRow(
-            index=len(kernels),
+            index=next_index,
             name=str(entry.get("name", f"kernel_{idx}")),
             op_type=str(entry.get("op_type", entry.get("type", ""))),
             core=str(entry.get("core", "")),
@@ -164,6 +165,7 @@ def load_observation_bundle(
             input_shapes=str(entry.get("input_shapes", "")),
             input_dtypes=str(entry.get("input_dtypes", "")),
         ))
+        next_index += 1
     for group in (payload.get("mappings") or payload.get("groups") or ()):
         if not isinstance(group, Mapping):
             continue
@@ -180,16 +182,17 @@ def load_observation_bundle(
                 if kname and kdur > 0.0:
                     names.append(kname)
                     kernels.append(KernelObservationRow(
-                        index=len(kernels), name=kname,
+                        index=next_index, name=kname,
                         op_type=str(k_entry.get("op_type", "")),
                         core=str(k_entry.get("core", "")),
-                        start_us=float(k_entry.get("start_us", len(kernels)) or len(kernels)),
+                        start_us=float(k_entry.get("start_us", next_index) or next_index),
                         duration_us=kdur,
                         stream_id=str(k_entry.get("stream_id", "")),
                         task_id=str(k_entry.get("task_id", "")),
                         input_shapes=str(k_entry.get("input_shapes", "")),
                         input_dtypes=str(k_entry.get("input_dtypes", "")),
                     ))
+                    next_index += 1
         if names:
             explicit_map[sim_id] = tuple(names)
     return tuple(kernels), explicit_map

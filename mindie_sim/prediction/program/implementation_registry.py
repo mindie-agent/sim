@@ -74,14 +74,11 @@ IMPLEMENTATIONS = {
         options=("dispatch", "retained_kv_rows", "native_query_capacity")),
     "vllm_ascend_mla_head_padding": Implementation(
         "mindie_sim.prediction.operators.mla.mla_head_padding", blocks=("mla_head_padding",)),
-    # CANN 9.2.1 official mixed-quant sparse MLA plus its archived prototype DSL alias.
+    # CANN 9.2.1 official mixed-quant sparse MLA.
     "aclnn_mixed_quant_sparse_flash_mla": Implementation(
         "mindie_sim.prediction.operators.paged_mla.family_mqsmla", blocks=("mqsmla_attention",),
         options=("metadata_support_fd", "addressing", "return_softmax_lse")),
     "mixed_quant_sparse_flash_mla": Implementation(
-        "mindie_sim.prediction.operators.paged_mla.family_mqsmla", blocks=("mqsmla_attention",),
-        options=("metadata_support_fd", "addressing", "return_softmax_lse")),
-    "dsl_mixed_quant_sparse_flash_mla": Implementation(
         "mindie_sim.prediction.operators.paged_mla.family_mqsmla", blocks=("mqsmla_attention",),
         options=("metadata_support_fd", "addressing", "return_softmax_lse")),
     "vllm_ascend_cann_compressor": Implementation(

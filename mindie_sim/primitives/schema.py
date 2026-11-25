@@ -528,8 +528,10 @@ def _scratch_resources(rows, ctx, caps=None):
             role = role_by_row.get(row, row)
             units = units_map.get(row, units_map.get(role, 1))
             out.append(Resource(row, float(rates[row]), units=int(units)))
+        elif row in caps:
+            out.append(Resource(row, float(caps[row])))
         else:
-            out.append(Resource(row, float(caps.get(row, 1.0))))
+            raise ModelingError(f"missing_resource_rate:{row}")
     return out
 
 
@@ -595,7 +597,7 @@ class PrimitiveLoweringResult:
 
     def _start_lowered(self, engine, after, memory_state, pattern, name_prefix):
         """Submit the lowered DAG with live admission or STARS descriptor queue."""
-        from mindie_sim.prediction.engine import Resource
+        from mindie_sim.prediction.runtime.engine import Resource
         from mindie_sim.prediction.program.stages import scope_allocations
 
         name = name_prefix or self.primitive_id
@@ -634,63 +636,18 @@ class PrimitiveLoweringResult:
         return sinks[0] if len(sinks) == 1 else engine.boundary(f"{name}:complete", after=sinks)
 
 
-class _PrimitiveAddressPlan(AddressRunPlan):
-    """Use one DRAM charge per sector across overlapping physical runs."""
-    __slots__ = ()
-
-    def dram_sector_and_service(self, burst_rules=()):
-        sec = self.sector_bytes
-        runs = [run for run in self.runs if run.rows and run.row_bytes]
-        bounds = sorted((run.base_byte // sec * sec,
-                         align_up(run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes, sec))
-                        for run in runs)
-        if all(left[1] <= right[0] for left, right in zip(bounds, bounds[1:])):
-            return super().dram_sector_and_service(burst_rules)
-
-        def boundaries(run, ordinal):
-            intervals = AddressRunPlan((run,), sector_bytes=sec).sector_intervals()
-            if not intervals:
-                intervals = ((addr // sec * sec, align_up(addr + run.row_bytes, sec))
-                             for addr in range(run.base_byte, run.base_byte + run.rows * run.stride_bytes,
-                                               run.stride_bytes))
-            wire = run.sector_union_bytes(sec)
-            weight = _burst_service_bytes(self, wire, run, burst_rules) / wire
-            end = None
-            for lo, hi in intervals:
-                if end is None or lo > end:
-                    if end is not None:
-                        yield end, ordinal, 0.0
-                    yield lo, ordinal, weight
-                end = hi
-            if end is not None:
-                yield end, ordinal, 0.0
-
-        sector_bytes = service = previous = 0
-        active = {}
-        for address, ordinal, weight in heapq.merge(*(boundaries(run, i) for i, run in enumerate(runs)),
-                                                     key=lambda event: event[0]):
-            if active:
-                sector_bytes += address - previous
-                service += (address - previous) * max(active.values())
-            if weight:
-                active[ordinal] = weight
-            else:
-                active.pop(ordinal)
-            previous = address
-        scale = align_up(self.scale_bytes, sec)
-        return sector_bytes + scale, service + scale
-
-
 def _address_plan(values, integer, size=None, *, sector_bytes=None):
     runs = values("runs")
     if isinstance(runs, AddressRunPlan):
-        return _PrimitiveAddressPlan(**{
-            item.name: getattr(runs, item.name) for item in fields(AddressRunPlan) if item.init
-        } | {"sector_bytes": sector_bytes if runs._default_sector else runs.sector_bytes})
+        if sector_bytes is not None and runs._default_sector:
+            return AddressRunPlan(**{
+                item.name: getattr(runs, item.name) for item in fields(AddressRunPlan) if item.init
+            } | {"sector_bytes": sector_bytes})
+        return runs
     if runs is None:
         row = integer("row_bytes", size if size is not None else values("payload_bytes", values("bytes", 0)))
         runs = (AddressRun(integer("base_byte"), integer("rows", 1), row, integer("stride_bytes", row)),)
-    return _PrimitiveAddressPlan(
+    return AddressRunPlan(
         tuple(run if isinstance(run, AddressRun) else AddressRun(**run) for run in runs),
         integer("alignment_bytes", DEFAULT_SECTOR_BYTES, 1), integer("scale_bytes"),
         sector_bytes,

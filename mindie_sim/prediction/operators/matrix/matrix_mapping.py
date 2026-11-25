@@ -43,7 +43,7 @@ from .matrix_mapping_owners import (
 )
 from mindie_sim.prediction.mechanism import Work as _Work
 from mindie_sim.prediction.ownership import read_role
-from .matrix_traffic import FP32_BYTES
+FP32_BYTES = 4
 
 GEMM_SHAPE_AXES = 3
 
@@ -51,9 +51,6 @@ GEMM_SHAPE_AXES = 3
 REFILL_M = 128
 MIN_NARROW_N = 32
 MAX_SPLIT_K = 32
-A5_L2_MTE2_RATE = 1e13
-A5_BF16_PEAK_FLOOR = 4e14
-_BF16_SUBTILE_REFERENCE = _Work(matrix={"bf16": A5_BF16_PEAK_FLOOR / 1000})
 #: Upstream DAV_3510 Stream-K thresholds (arch35/matmul_v3_basic_streamk_tiling.cpp:257-262).
 STREAM_K_MIN_K_BYTES = 8192
 STREAM_K_PER_AIC_K_BYTES = 256
@@ -70,7 +67,6 @@ ARCH35_MACRO_MIN_K = 2048
 
 DEFAULT_CANDIDATES = ((128, 128, 64), (128, 128, 128), (128, 256, 64), (128, 256, 128),
                       (256, 128, 64), (256, 128, 128), (256, 256, 64), (256, 256, 128))
-LEGACY_128_CANDIDATES = ((128, 128, 128), (128, 128, 64))
 NARROW_CANDIDATES = ((16, 16, 64), (32, 16, 64), (64, 16, 64),
                      (16, 32, 64), (32, 32, 64), (64, 32, 64))
 # FP32 projections may expose smaller independent M/N blocks. Ordinary low
@@ -631,16 +627,8 @@ def _op_matrix_key(op):
 
 
 def _has_subtile_supply(context) -> bool:
-    """Apply the existing copy or BF16 service budget for candidate screening."""
-    if float(context.rates.get("mte2_aic", 0)) >= A5_L2_MTE2_RATE:
-        return True
-    # Screen a fixed amount of BF16 work against a one-ms budget regardless
-    # of the operator precision. The binding also works for rate-only devices.
-    try:
-        demand = context.bind(_BF16_SUBTILE_REFERENCE)
-    except (ModelingError, ZeroDivisionError):
-        return False
-    return 0 <= demand[context.resource_names["cube"]] <= 1
+    """Gate automatic subtile supply strictly on canonical ComputeArch identity."""
+    return is_arch35_context(context)
 
 
 def _resolve_select_candidates(mapper, host_ctx, *, m, n, k, groups, compute_format, rows_key):
@@ -671,10 +659,7 @@ def _resolve_select_candidates(mapper, host_ctx, *, m, n, k, groups, compute_for
               if mapper.underfilled_candidates is None else mapper.underfilled_candidates)
     )
     underfilled = underfilled if default_grid < host_ctx.core_count else ()
-    use_default_tiling = (
-        mapper.candidates is None
-        or tuple(tuple(t) for t in mapper.candidates) == LEGACY_128_CANDIDATES
-    )
+    use_default_tiling = mapper.candidates is None
     candidates = [(tile, False) for tile in
                   (DEFAULT_CANDIDATES if use_default_tiling else mapper.candidates)]
     if (not is_arch35_context(host_ctx) and groups > 1
@@ -796,14 +781,35 @@ class MappedMatmul:
         steady path (a caller that has no mapping observer).  Selection itself
         is identical: the same cached recipe object is returned either way.
         """
-        host_ctx = (
-            replace(context, primitive_table=None)
-            if getattr(context, "primitive_table", None) is not None
-            else context
-        )
+        is_arch35 = is_arch35_context(context)
+        compute_arch = getattr(context, "compute_arch", None)
+        if compute_arch is None:
+            compute_arch = getattr(getattr(context, "datapath", None), "compute_arch", None)
+        pt = getattr(context, "primitive_table", None)
+        if compute_arch is None and pt is not None:
+            arch_preset = str(getattr(pt, "arch_preset", "") or "").strip()
+            if arch_preset:
+                from mindie_sim.schema.compute_arch import ComputeArchSpec
+                compute_arch = ComputeArchSpec(preset=arch_preset)
+        if pt is not None:
+            host_ctx = (
+                replace(context, primitive_table=None, compute_arch=compute_arch)
+                if getattr(context, "compute_arch", None) is None and compute_arch is not None
+                else replace(context, primitive_table=None)
+            )
+        else:
+            host_ctx = context
         rows_key = tuple(int(v) for v in group_rows) if group_rows is not None else None
+        arch_key = (
+            getattr(compute_arch, "arch_id", None),
+            getattr(compute_arch, "preset", None),
+            getattr(compute_arch, "clock_hz", None),
+            is_arch35,
+        )
         cache_key = (
             _matmul_recipe_key(self), _op_matrix_key(host_ctx.op), host_ctx.core_count,
+            arch_key,
+            tuple(sorted(host_ctx.compute_peaks.items())),
             tuple(sorted(host_ctx.resource_names.items())),
             tuple(sorted(host_ctx.rates.items())),
             tuple(sorted(host_ctx.work.items())),
@@ -829,7 +835,9 @@ class MappedMatmul:
             if groups < 1:
                 raise ModelingError("matrix_groups_require_positive_integer")
             m = max(rows_key, default=0)
-        compute_format = meta.get("compute_format", host_ctx.op.dtype or "bf16")
+        compute_format = meta.get("compute_format") or host_ctx.op.dtype
+        if not compute_format:
+            raise ModelingError("matrix_mapping_compute_format_missing")
         n = host_ctx.op.local_shape[(-2)]
         k = host_ctx.op.local_shape[(-1)]
         candidates, default_grid, automatic_subtiles, arch35_macro_streamk, underfilled = (

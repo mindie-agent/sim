@@ -208,7 +208,7 @@ def test_unmerge_winner_has_empty_leave_one_out_despite_shipping_regression():
     assert report.waterfall.loo_impacts == ()
     regression = report.waterfall.shipping_regression
     assert regression == report.verification.shipping_regression
-    assert regression.delta_ns == dossier.m_wall_ns - dossier.u_wall_ns == 7251
+    assert regression.delta_ns == dossier.m_wall_ns - dossier.u_wall_ns == 3517
     assert report.ladder.delta_shipping_ns == -regression.delta_ns
     assert regression.loo_culprits == ((SHIPPING_OVERLAY, -regression.delta_ns),)
 

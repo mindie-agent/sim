@@ -38,7 +38,7 @@ def _unpack_phase(write_share, after):
 
 def _mesh_phases(context, phases, family):
     """Physical phase weights around the plan-owned peer transports."""
-    read_share = io_weight(context, "hbm")
+    read_share = io_weight(context, "hbm_read")
     write_share = io_weight(context, "hbm_write")
     result = [_pack_phase(read_share)]
     reduce = (REDUCE_VECTOR_SHARE if family in ALLREDUCE_FAMILIES
@@ -67,7 +67,7 @@ class TopologyCollectiveRecipe:
         if getattr(binding, "algorithm", None) == MESH_ALGORITHM:
             return _lower_mesh(context, binding())
         family = str(getattr(context.op, "family", ""))
-        read_share = io_weight(context, "hbm")
+        read_share = io_weight(context, "hbm_read")
         write_share = io_weight(context, "hbm_write")
         if family in ALLREDUCE_FAMILIES:
             phases = (

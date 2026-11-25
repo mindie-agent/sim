@@ -464,7 +464,7 @@ def test_common_math_stack_track_structural_layer_and_kernel_backends() -> None:
         LayerPlan(index=0, attention="gdn", gdn_layout="unknown")
 
     for backend in ("CANN", "Triton", "TileLang", "AscendC", "Catlass"):
-        assert KernelBinding(kernel_id=f"k_{backend}", backend=backend, arch_family="dav_3510").backend == backend  # type: ignore[arg-type]
+        assert KernelBinding(kernel_id=f"k_{backend}", backend=backend, arch_family="dav_3510", readiness="shipping").backend == backend  # type: ignore[arg-type]
 
 
 def test_ub_admission_dual_tier_engine_receipt_and_native_binding_codec() -> None:
@@ -569,9 +569,10 @@ def test_ub_admission_dual_tier_engine_receipt_and_native_binding_codec() -> Non
             **binding.to_dict(), "evidence": {"entry": "established"},
         }})
 
-    assert mqsmla_mod.LEGACY_RECIPE == "dsl_mixed_quant_sparse_flash_mla"
-    assert mqsmla_mod.LEGACY_SOURCE["repository"] == "archived-prototype-dsl"
-    assert "dsl_mixed_quant_sparse_flash_mla" in implementation_registry.IMPLEMENTATIONS
+    assert mqsmla_mod.RECIPE == "aclnn_mixed_quant_sparse_flash_mla"
+    assert not hasattr(mqsmla_mod, "LEGACY_RECIPE") and not hasattr(mqsmla_mod, "LEGACY_SOURCE")
+    assert "aclnn_mixed_quant_sparse_flash_mla" in implementation_registry.IMPLEMENTATIONS
+    assert "dsl_mixed_quant_sparse_flash_mla" not in implementation_registry.IMPLEMENTATIONS
 
 
 def test_zero_uncalibrated_runtime_states_across_package_ast() -> None:

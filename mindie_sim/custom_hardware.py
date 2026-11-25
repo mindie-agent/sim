@@ -844,15 +844,11 @@ def compose_custom_case(
     machine = build_custom_hardware_machine(
         spec, num_devices=num_devices, **hardware_overrides,
     )
-    # ``compose_case`` validates hardware SKUs against public profiles. Feed it
-    # the already-built neutral resources under a registered placeholder name,
-    # then replace the machine with the private SKU identity.
-    compose_hardware = {**machine, "sku": "Ascend910_9392"}
     from mindie_sim.compose import compose_case
 
     case = compose_case(
         model=model,
-        hardware=compose_hardware,
+        hardware=machine,
         tp=int(tp), dp=int(dp), ep=int(ep), pp=int(pp), pcp=int(pcp),
         dcp=int(cp), num_devices=num_devices,
         quant=quantization,
@@ -863,7 +859,6 @@ def compose_custom_case(
         max_model_len=int(max_model_len),
         async_scheduling=bool(async_scheduling),
     )
-    case["machine"] = machine
     parse_case(case)
     return case
 

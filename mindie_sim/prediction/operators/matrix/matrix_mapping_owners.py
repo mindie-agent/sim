@@ -17,8 +17,6 @@ from mindie_sim.schema.common import ModelingError
 
 
 _FRACTAL_ROWS = 16
-#: DAV_3510 (A5) L0C accumulator capacity (256 KiB vs 128 KiB on DAV_2201).
-ARCH35_L0C_BYTES = 256 * 1024
 #: L2 cache sector widths for DAV_2201 (512 B) and DAV_3510 (128 B).
 DAV2201_L2_SECTOR_BYTES = 512
 DAV3510_L2_SECTOR_BYTES = 128
@@ -272,40 +270,46 @@ def physical_owner_rate(context, resource, placement=None):
 
 
 def is_arch35_context(context) -> bool:
-    """True when the execution context targets DAV_3510 (A5, 256 KiB L0C)."""
+    """True iff the execution context explicitly targets DAV_3510 via ComputeArch / PrimitiveTable."""
+    compute_arch = getattr(context, "compute_arch", None)
+    if compute_arch is None:
+        datapath = getattr(context, "datapath", None)
+        compute_arch = getattr(datapath, "compute_arch", None)
+    if compute_arch is not None:
+        arch_id = str(getattr(compute_arch, "arch_id", "") or "").strip().lower()
+        preset = str(getattr(compute_arch, "preset", "") or "").strip().lower()
+        if arch_id or preset:
+            return arch_id in {"arch35", "dav_3510", "npu_arch_3510"} or preset == "npu_arch_3510"
     pt = getattr(context, "primitive_table", None)
     if pt is not None:
-        arch = str(getattr(pt, "arch_preset", "") or "")
+        arch = str(getattr(pt, "arch_preset", "") or "").strip().lower()
         if arch:
             return arch == "npu_arch_3510"
-    l0c = int((getattr(context, "pool_capacities", None) or {}).get("l0c", 0))
-    return l0c >= ARCH35_L0C_BYTES
+    return False
 
 
 def _table_cell(context, primitive_id: str):
-    """Return the declared primitive cell when a PrimitiveTable is bound."""
+    """Return the declared primitive cell when a PrimitiveTable is bound (fail-closed)."""
     pt = getattr(context, "primitive_table", None)
     cell_fn = getattr(pt, "cell", None)
     if cell_fn is None:
         return None
-    try:
-        return cell_fn(primitive_id)
-    except ModelingError:
-        return None
+    return cell_fn(primitive_id)
 
 
 def primitive_core_clock_hz(context) -> float | None:
-    """Derive AIC core frequency in Hz from certified P02_load_data L0A bus."""
-    cell = _table_cell(context, "P02_load_data")
-    if cell is None:
-        return None
-    try:
-        band = cell.band("l1_to_l0a_bytes_per_s_per_aic")
-        cap = float(getattr(band, "certified_upper_capacity", 0.0) or 0.0)
-        if cap > 0.0:
-            return cap / LOAD_DATA_L0A_BYTES_PER_CYCLE
-    except (ModelingError, KeyError, AttributeError):
-        return None
+    """Read AIC core frequency in Hz strictly from declared ComputeArch/Datapath."""
+    for owner in (
+        getattr(context, "compute_arch", None),
+        getattr(context, "datapath", None),
+        getattr(getattr(context, "datapath", None), "compute_arch", None),
+    ):
+        val = getattr(owner, "clock_hz", None)
+        if val is None:
+            continue
+        if isinstance(val, bool) or float(val) <= 0.0:
+            raise ModelingError(f"compute_arch_clock_hz_invalid:{val!r}")
+        return float(val)
     return None
 
 
@@ -448,13 +452,20 @@ def primitive_l2_params(context) -> tuple[int, int]:
 
 
 def _primitive_band_ms(context, primitive_id: str, metric: str) -> float:
-    """Calibrated primitive latency band in ms (0.0 when absent or unmeasured)."""
+    """Calibrated primitive latency band in ms (0.0 when explicitly unmeasured)."""
     pt = getattr(context, "primitive_table", None)
     if pt is None:
+        raise ModelingError(f"matrix_primitive_table_required:{primitive_id}:{metric}")
+    cell_fn = getattr(pt, "cell", None)
+    if cell_fn is None:
         return 0.0
-    from mindie_sim.primitives.loader import _table_band_p50
-    ns = _table_band_p50(pt, primitive_id, metric)
-    return float(ns) / NS_PER_MS if ns is not None and float(ns) > 0.0 else 0.0
+    cell = cell_fn(primitive_id)
+    band = cell.band(metric)
+    if band.p50 is None:
+        return 0.0
+    if float(band.p50) <= 0.0:
+        raise ModelingError(f"matrix_primitive_band_invalid:{primitive_id}:{metric}")
+    return float(band.p50) / NS_PER_MS
 
 
 def primitive_p13_sync_ms(context, metric: str) -> float:
@@ -702,10 +713,9 @@ def streamk_fixup_latency_ms(
     if clock_hz is not None and clock_hz > 0.0:
         cycles = float(k_splits) * STREAMK_NEG_CYCLES_PER_SPLIT + STREAMK_NEG_BASE_CYCLES
         neg_ms = (cycles / clock_hz) * MS_PER_SECOND * (float(cores) / float(used))
-    sync_ms = (
-        primitive_p13_sync_ms(context, "mode0_aiv_barrier_ns")
-        + primitive_p13_sync_ms(context, "mode4_intra_block_ns")
-    )
+    sync_ms = primitive_p13_sync_ms(context, "mode0_aiv_barrier_ns")
+    if is_arch35_context(context):
+        sync_ms += primitive_p13_sync_ms(context, "mode4_intra_block_ns")
     if sync_ms <= 0.0:
         sync_ms = primitive_p13_sync_ms(context, "mode0_aic_barrier_ns")
     return neg_ms + sync_ms

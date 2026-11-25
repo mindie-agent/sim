@@ -564,10 +564,7 @@ def _p01_cold_curve_info(context, *, warm: bool = False) -> tuple[list[tuple[int
     if any("silicon_profile_conflict" in str(w) for w in (getattr(pt, "warnings", ()) or ())):
         return None
     key = "mte2_aic_warm_scaling_bps" if warm else "mte2_aic_cold_scaling_bps"
-    try:
-        cell = pt.cell("P01_datacopy")
-    except Exception:
-        return None
+    cell = pt.cell("P01_datacopy")
     if getattr(cell, "status", None) != "calibrated":
         return None
     params = cell.parameters or {}

@@ -157,13 +157,21 @@ def _indexer_kernel_binding(
     geometry=None,
     op=None,
 ) -> KernelBinding:
-    # Step 2: refine readiness via mindie_sim.backends.abi_registry.ProbedAbiRegistry once W1 merges.
     arch = _geometry_arch_family(geometry)
     explicit = str(dict(getattr(op, "metadata", ()) or ()).get("readiness") or "").strip() if op is not None else ""
     if explicit and explicit in KERNEL_READINESS_VALUES:
         readiness = explicit
-    elif arch == "A5" or (arch in {"A2", "A3"} and recipe_id in {"sparse_indexer", "index_scores"}):
-        readiness = "shipping"
+    elif arch in {"A2", "A3", "A5"}:
+        from mindie_sim.backends.abi_registry import default_abi_registry
+
+        reg = default_abi_registry()
+        if reg.is_shipping_available(kernel_id, arch) or (
+            recipe_id in {"sparse_indexer", "index_scores"}
+            and reg.is_shipping_available("aclnnLightningIndexer", arch)
+        ):
+            readiness = "shipping"
+        else:
+            readiness = "synthesized_target"
     else:
         readiness = "synthesized_target"
     return KernelBinding(

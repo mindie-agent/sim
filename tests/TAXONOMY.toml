@@ -203,14 +203,6 @@ path = "runtime/test_fragment_executor.py"
 tier = "tier0"
 owns = ["mindie_sim/observations/resource_services.py", "mindie_sim/prediction/capacity", "mindie_sim/prediction/efficiency/cost.py", "mindie_sim/prediction/engine.py"]
 [[module]]
-path = "runtime/test_remote_exec.py"
-tier = "tier0"
-owns = ["mindie_sim/remote_exec.py"]
-[[module]]
-path = "runtime/test_remote_exec_batch.py"
-tier = "tier1"
-owns = ["mindie_sim/remote_exec.py", "mindie_sim/prediction/runtime/accel_build.py", "mindie_sim/prediction/runtime/accel_loader.py"]
-[[module]]
 path = "runtime/test_formal_lean_locks.py"
 tier = "tier0"
 owns = ["formal/MindIESimSpec", "formal/AxiomCheck.lean", "mindie_sim/prediction/efficiency/exposed_breakdown.py", "mindie_sim/prediction/execution/weight_prefetch.py", "mindie_sim/prediction/sharding/local_tp.py", "mindie_sim/prediction/operators/recurrent/recover_ssm_work.py", "mindie_sim/prediction/collectives/startup.py", "mindie_sim/prediction/efficiency/roofline_graph.py", "mindie_sim/optimization/dual_bound.py", "mindie_sim/prediction/runtime/reload_bounds.py"]
@@ -236,7 +228,7 @@ owns = ["mindie_sim/catalog/ops.py", "mindie_sim/prediction/collectives/readines
 [[module]]
 path = "collectives/test_hccl_algorithms.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/engine.py", "mindie_sim/prediction/operators/collectives/hccl_aicpu.py", "mindie_sim/prediction/operators/collectives/hccl_alltoallv.py", "mindie_sim/prediction/operators/collectives/hccl_analytic_hierarchy.py"]
+owns = ["mindie_sim/prediction/engine.py", "mindie_sim/prediction/operators/collectives/hccl_aicpu.py", "mindie_sim/prediction/operators/collectives/hccl_analytic_hierarchy.py"]
 [[module]]
 path = "collectives/test_collective_volume_conservation.py"
 tier = "tier0"

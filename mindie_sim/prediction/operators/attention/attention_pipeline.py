@@ -82,7 +82,7 @@ class TiledFlashAndPagedAttentionRecipe:
         return build_plan(self, op, geometry)
 
     def lower(self, context):
-        read_share = io_weight(context, "hbm")
+        read_share = io_weight(context, "hbm_read")
         write_share = io_weight(context, "hbm_write")
         qk_weight, pv_weight = _matrix_phase_weights(context.op)
         phases = (

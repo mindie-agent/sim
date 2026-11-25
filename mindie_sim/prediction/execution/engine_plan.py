@@ -15,6 +15,7 @@ import heapq
 import math
 from typing import Any, Iterable, Mapping
 
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution.weight_prefetch import (
     PREFETCH_TASK_PRIORITY, PrefetchDecision,
@@ -713,9 +714,7 @@ def evaluate_plan(nodes: tuple[PlanNode, ...], hardware: HardwareProfile, *,
             _work(totals))
     except TimeoutError:
         raise
-    except TimeoutError:
-        raise
-    except Exception as exc:  # Engine contract errors are recorded, never scored as zero
+    except (ModelingError, ValueError) as exc:  # Engine/capacity errors are recorded, never scored as zero
         return EngineEvaluation("failed", math.inf, 0, 0.0, 0.0, 0.0,
                                 reason=f"{type(exc).__name__}:{exc}")
 

@@ -16,12 +16,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
 import math
+import re
 from typing import Any, Mapping
 
 from mindie_sim.schema.operators import OpSpec
 
 from mindie_sim.prediction.fusion.graph import (
-    DTYPE_BYTES, FeasibilityError, OpNode, TensorValue, TypedGraph, dtype_bytes,
+    FeasibilityError, NATIVE_AXIS_LAYOUTS, OpNode, TensorValue, TypedGraph, dtype_bytes,
 )
 from mindie_sim.prediction.fusion.ports import (
     control_dependency_names, declared_control_names, full_operand_ports,
@@ -29,6 +30,28 @@ from mindie_sim.prediction.fusion.ports import (
 )
 
 _STATE_SCALAR_BYTES = 4
+_PACKED_LINEAR_LAYOUTS = frozenset({
+    "bf16", "bfloat16", "fp16", "float16", "fp32", "float32",
+    "int8_per_channel", "int4_packed_per_channel", "fp8_rowwise",
+})
+_PACKED_BLOCK_LAYOUT_RE = re.compile(
+    r"^(?:fp8_block\d+x\d+_[a-z0-9_]+|(?:fp4|int4)_group\d+_packed)$"
+)
+
+
+def _normalize_tensor_layout(raw: str, *, op_id: str, allow_strided: bool = False) -> str:
+    """Map canonical physical or catalog-packed weight/op layouts to ``TensorValue.layout``."""
+    text = str(raw or "").strip().lower()
+    if text in {"nz", "fractal_nz"} or "fractal_nz" in text:
+        return "nz"
+    if text in {"contiguous", "nd"} or text in NATIVE_AXIS_LAYOUTS:
+        return text
+    if allow_strided and text in {"strided", "view"}:
+        return text
+    if text in _PACKED_LINEAR_LAYOUTS or _PACKED_BLOCK_LAYOUT_RE.match(text):
+        return "contiguous"
+    kind = "output" if allow_strided else "weight"
+    raise FeasibilityError(f"projection_{kind}_layout_unsupported:{op_id}:{text}")
 
 _FAMILY_KIND = {
     "rmsnorm": "rms_norm", "layernorm": "rms_norm", "norm": "rms_norm",
@@ -148,8 +171,9 @@ def _activation_bytes(op: OpSpec, meta: dict) -> int:
         if isinstance(value, (int, float)) and value > 0:
             return int(value)
     shape, _ = _shapes(op, _family_kind(op.family))
-    dtype = op.dtype or "bf16"
-    return max(0, int(math.prod(shape)) * dtype_bytes(dtype))
+    if not op.dtype:
+        raise FeasibilityError(f"projection_activation_dtype_missing:{op.op_id}")
+    return max(0, int(math.ceil(int(math.prod(shape)) * dtype_bytes(op.dtype))))
 
 
 def _declared_state(meta: dict) -> tuple[dict[str, int | None], dict[str, int | None]]:
@@ -204,6 +228,20 @@ def _state_target(op: OpSpec, meta: dict) -> str:
     return f"{op.op_id}:state"
 
 
+def _resolve_weight_dtype(op: OpSpec, meta: Mapping, fallback_dtype: str = "") -> str:
+    """Resolve one canonical physical weight dtype from metadata or typed precision ABI."""
+    abi = getattr(op, "precision_abi", None)
+    weight_dt = str(
+        meta.get("weight_format")
+        or meta.get("weight_dtype")
+        or (abi.weight_dtype if abi is not None else fallback_dtype)
+        or ""
+    ).strip()
+    if not weight_dt:
+        raise FeasibilityError(f"projection_weight_dtype_missing:{op.op_id}")
+    return weight_dt
+
+
 def _weight_identity(op: OpSpec, kind: str, in_shape: tuple[int, ...],
                      out_shape: tuple[int, ...], meta: Mapping) -> tuple[int, str]:
     """Local static weight bytes from declared identity, never ``hbm - read``.
@@ -225,8 +263,8 @@ def _weight_identity(op: OpSpec, kind: str, in_shape: tuple[int, ...],
         base, basis = int(packed), "packed_weight_bytes"
     elif kind in {"matmul", "grouped_matmul"} and len(in_shape) >= 2 \
             and len(out_shape) >= 2 and op.family != "native_fusion":
-        element = DTYPE_BYTES.get(str(meta.get("weight_dtype", op.dtype or "bf16")), 2)
-        base = int(in_shape[-1]) * int(out_shape[-1]) * element
+        weight_dt = _resolve_weight_dtype(op, meta, op.dtype or "")
+        base = int(math.ceil(int(in_shape[-1]) * int(out_shape[-1]) * dtype_bytes(weight_dt)))
         basis = "shape_k_times_n"
     else:
         return 0, "no_static_weight"
@@ -471,31 +509,27 @@ def _project_weights(op, meta, kind, in_shape, out_shape, dtype,
     if weight_bytes:
         weight_id = f"{op.op_id}:weight"
         abi = getattr(op, "precision_abi", None)
-        weight_dtype = str(
-            meta.get("weight_format")
-            or meta.get("weight_dtype")
-            or (abi.weight_dtype if abi is not None else dtype)
-        )
-        element = int(DTYPE_BYTES.get(weight_dtype, 2))
+        weight_dtype = _resolve_weight_dtype(op, meta, dtype)
+        element = dtype_bytes(weight_dtype)
         if kind in {"matmul", "grouped_matmul"} and len(in_shape) >= 2:
             weight_shape = (int(in_shape[-1]), int(out_shape[-1]))
         else:
-            weight_shape = (1, weight_bytes // max(1, element))
-        layout = str(
+            weight_shape = (1, int(weight_bytes / element))
+        raw_layout = str(
             meta.get("weight_layout")
-            or (abi.weight_layout.lower() if abi is not None else "contiguous")
+            or (abi.weight_layout if abi is not None else "contiguous")
         )
+        layout = _normalize_tensor_layout(raw_layout, op_id=op.op_id, allow_strided=False)
         values[weight_id] = TensorValue(
             weight_id, weight_dtype, weight_shape, role="weight",
-            storage_bytes=weight_bytes, sharded=True, layout=layout
-            if layout in {"contiguous", "nd", "nz"} else "contiguous")
+            storage_bytes=weight_bytes, sharded=True, layout=layout)
         input_ids.append(weight_id)
     if kind in _NORM_KINDS and meta.get("norm_has_weight") is not False:
         gamma_id = f"{op.op_id}:gamma"
         hidden = int(in_shape[-1]) if in_shape else 1
         values[gamma_id] = TensorValue(
             gamma_id, dtype, (hidden,), role="weight",
-            storage_bytes=hidden * dtype_bytes(dtype), sharded=True)
+            storage_bytes=int(math.ceil(hidden * dtype_bytes(dtype))), sharded=True)
         input_ids.append(gamma_id)
 
 
@@ -504,7 +538,7 @@ def _project_outputs(op, meta, dtype, out_dtype, out_shape, values):
         value_id = f"{op.op_id}:return:{index}"
         values[value_id] = TensorValue(
             value_id, dtype, (1,), role="scale", producer=op.op_id,
-            storage_bytes=dtype_bytes(dtype), sharded=True)
+            storage_bytes=int(math.ceil(dtype_bytes(dtype))), sharded=True)
     output_ids: list[str] = []
     primary_id = f"{op.op_id}:out"
     port_records = projected_ports(op.metadata)
@@ -512,17 +546,20 @@ def _project_outputs(op, meta, dtype, out_dtype, out_shape, values):
         (record for record in port_records if record.port_id == primary_id),
         None)
     if primary_record is not None:
+        prim_layout = _normalize_tensor_layout(
+            primary_record.layout, op_id=op.op_id, allow_strided=True,
+        )
         values[primary_id] = TensorValue(
             primary_id, primary_record.dtype, primary_record.shape,
             role=("output" if primary_record.public or not op.deps
                   else "activation"),
             producer=op.op_id, storage_bytes=primary_record.storage_bytes,
             sharded=True,
-            layout=(primary_record.layout
-                    if primary_record.layout in
-                    {"contiguous", "nd", "nz", "strided", "view"}
-                    else "contiguous"), public=primary_record.public)
+            layout=prim_layout, public=primary_record.public)
     else:
+        op_layout = _normalize_tensor_layout(
+            op.layout or "contiguous", op_id=op.op_id, allow_strided=True,
+        )
         values[primary_id] = TensorValue(
             primary_id, out_dtype, out_shape,
             role="output" if not op.deps else "activation",
@@ -531,21 +568,20 @@ def _project_outputs(op, meta, dtype, out_dtype, out_shape, values):
                            if int(meta.get("write_bytes", 0) or 0) > 0
                            else None),
             sharded=True,
-            layout=(op.layout if op.layout in
-                    {"contiguous", "nd", "nz", "strided", "view"}
-                    else "contiguous"))
+            layout=op_layout)
     output_ids.append(primary_id)
     for record in port_records:
         if record.port_id == primary_id:
             continue
+        rec_layout = _normalize_tensor_layout(
+            record.layout, op_id=op.op_id, allow_strided=True,
+        )
         values[record.port_id] = TensorValue(
             record.port_id, record.dtype, record.shape,
             role="output" if record.public else "activation",
             producer=op.op_id, storage_bytes=record.storage_bytes,
             sharded=True,
-            layout=(record.layout if record.layout in
-                    {"contiguous", "nd", "nz", "strided", "view"}
-                    else "contiguous"), public=record.public)
+            layout=rec_layout, public=record.public)
         output_ids.append(record.port_id)
     return output_ids
 
@@ -607,7 +643,11 @@ def project_graph(case, ops: tuple[OpSpec, ...], *,
     external: list[str] = []
     opaque = frozenset(opaque_ops)
     external_names = frozenset(external_data)
-    dtype = str(getattr(getattr(case, "model", None), "activation_dtype", "bf16"))
+    dtype = str(getattr(getattr(case, "model", None), "activation_dtype", "") or "").strip()
+    if not dtype and case is None and ops and all(getattr(op, "dtype", None) for op in ops):
+        dtype = str(ops[0].dtype).strip()
+    if not dtype:
+        raise FeasibilityError("projection_model_activation_dtype_missing")
     tensor_parallel = int(getattr(getattr(case, "runtime", None), "parallel", None)
                           and getattr(case.runtime.parallel, "tp", 1) or 1)
     state_outputs: dict[tuple[str, int], str] = {}

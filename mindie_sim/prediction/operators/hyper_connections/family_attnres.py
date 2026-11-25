@@ -51,13 +51,9 @@ RECIPE = "attn_res_fwd"
 NATIVE_KIND = "AttnResFwd"
 GROUP_ROLE = "attn_res_prefix_point"
 
-# Retained image identity. This is a source-compatible declaration; it does not
-# prove the captured events loaded this library or these scalar flags.
-IMAGE_SHA256 = "883670fcc91cbd75a7070b00501be0ecd81a266b81366a21bf02139d8e6a33e1"
 CALLER_SHA256 = "be9adc792774f919f443caf483eb2e04e4453617465381f47a482dd4736ec63f"
 SOURCE = {
     "repository": "vllm-ascend",
-    "image_id": "sha256:" + IMAGE_SHA256,
     "caller_sha256": CALLER_SHA256,
     "caller": {
         "path": "vllm_ascend/models/kimi_k3.py",
@@ -179,13 +175,28 @@ def source_eligible(model, arch, phase):
     return not any(p.engram or p.hyper_connections for p in model.layer_plans)
 
 
-def source_image_match(runtime):
-    """True only when the retained source image is actually declared.
+def source_image_match(runtime, *, machine=None) -> bool:
+    """Gate AttnResFwd availability strictly on ``ProbedAbiRegistry`` ``ArchId`` (no image_id)."""
+    arch = str(
+        (getattr(machine, "arch_family", "") if machine is not None else "")
+        or dict(getattr(runtime, "metadata", ()) or ()).get("arch_family")
+        or ""
+    ).strip().upper()
+    return _attnres_arch_supported(arch)
 
-    A matching model shape/flag is not an image/source authentication.
-    """
-    image = dict(runtime.metadata).get("image_id")
-    return image == SOURCE["image_id"]
+
+def is_excluded(runtime) -> bool:
+    """True when runtime exclusions or execution policy disable auto AttnRes prefix fusion."""
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    report = meta.get("feature_track_report")
+    if isinstance(report, dict):
+        excluded = report.get("explicit_excluded") or ()
+        if "attn_res_prefix_fusion" in excluded:
+            return True
+    policy = meta.get("execution_policy")
+    if isinstance(policy, dict) and policy.get("automatic_optional_fusions") is False:
+        return True
+    return False
 
 
 def explicit_generic(kernels):
@@ -224,9 +235,7 @@ def selection(runtime, *, model=None, phase=None, machine=None):
         if not isinstance(value, bool):
             raise ModelingError("attn_res_optimize_prefill_must_be_boolean")
         return {"optimize_prefill": value}
-    if model is None or phase is None or explicit_generic(runtime.kernels):
-        return None
-    if not source_image_match(runtime):
+    if model is None or phase is None or explicit_generic(runtime.kernels) or is_excluded(runtime):
         return None
     if not source_eligible(model, arch, phase):
         return None

@@ -109,8 +109,8 @@ def capacity_window(
     q_tokens, b = max(1, int(tokens_per_seq)), int(sequences)
     workspace_tokens = max(1, b * q_tokens)
     ledger = memory if memory is not None else Memory(scaled, workspace_tokens=workspace_tokens)
-    if memory is not None and int(memory.case.runtime.parallel.pp) != int(scaled.runtime.parallel.pp):
-        raise ValueError("capacity_window_ledger_stage_mismatch")
+    if memory is not None and memory.case != scaled:
+        raise ValueError("capacity_window_ledger_case_mismatch")
     prefill = phase == "prefill"
     output_eff = 0 if prefill else max(0, int(output_budget))
     if prefill:
@@ -331,25 +331,10 @@ def _vram_max_sequences_per_dp(
 
 def _resolve_speculative_tokens(case: CaseSpec, *, output_budget: int, tokens_per_seq: int | None, emitted_tokens_per_seq: float | None) -> tuple[int, float]:
     """Resolve query tokens per sequence and committed tokens per step aligned with DraftPolicy."""
-    meta, req, policy_proposal, policy_mean = dict(case.runtime.metadata), RequestSpec(request_id="sla", prompt_tokens=1, output_tokens=max(1, output_budget), arrival_ms=0.0), 0, 1.0
-    try:
-        dp_pol = DraftPolicy.for_request(case, req)
-        if dp_pol.proposal > 0:
-            policy_proposal, policy_mean = dp_pol.proposal, dp_pol.mean
-    except ValueError:
-        pass
-    if policy_proposal == 0:
-        raw_spec = meta.get("speculative")
-        if raw_spec:
-            spec = SpeculativeSpec.from_mapping(json.loads(raw_spec) if isinstance(raw_spec, str) else raw_spec)
-            policy_proposal, policy_mean = spec.draft_len, spec.expected_committed_tokens()
-        elif isinstance(meta.get("speculation"), Mapping):
-            s_map, rates = meta["speculation"], list(meta["speculation"].get("synthetic_acceptance_rates") or ())
-            policy_proposal = int(s_map.get("num_speculative_tokens", len(rates)) or meta.get("draft_proposal_tokens", 0) or 0)
-            policy_mean = (1.0 + sum(float(x) for x in rates[:policy_proposal])) if (rates and policy_proposal > 0) else 1.0
-        elif int(meta.get("draft_proposal_tokens", 0) or 0) > 0:
-            policy_proposal = int(meta["draft_proposal_tokens"])
-            policy_mean = float(dict(case.runtime.mtp_acceptance_by_output_tokens).get(max(1, output_budget), case.runtime.mtp_acceptance_length))
+    req = RequestSpec(request_id="sla", prompt_tokens=1, output_tokens=max(1, output_budget), arrival_ms=0.0)
+    dp_pol = DraftPolicy.for_request(case, req)
+    policy_proposal = dp_pol.proposal if dp_pol.proposal > 0 else 0
+    policy_mean = dp_pol.mean if dp_pol.proposal > 0 else 1.0
     resolved_q = int(tokens_per_seq) if tokens_per_seq is not None else (1 + policy_proposal if policy_proposal > 0 else 1)
     if isinstance(tokens_per_seq, bool) or resolved_q < 1:
         raise ValueError(f"tokens_per_seq_must_be_positive_int:{tokens_per_seq}")
@@ -361,9 +346,18 @@ def _resolve_speculative_tokens(case: CaseSpec, *, output_budget: int, tokens_pe
 
 
 def select_jointly_feasible_candidate(records: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
-    """Return the highest-B candidate that passed both SLA and capacity in its own evaluation."""
+    """Return the throughput-maximizing candidate that passed both SLA and capacity."""
     feasible = [record for record in records if record and bool(record.get("feasible"))]
-    return max(feasible, key=lambda record: int(record["b"])) if feasible else None
+    if not feasible:
+        return None
+
+    def _objective(record: Mapping[str, Any]) -> tuple[float, int]:
+        b = int(record["b"])
+        step_ms = float(record.get("step_ms") or 0.0)
+        tps = (float(b) / step_ms) if step_ms > 0.0 else math.inf
+        return (tps, b)
+
+    return max(feasible, key=_objective)
 
 
 def apply_sla_baseline_gains(results: Sequence[dict[str, Any]],

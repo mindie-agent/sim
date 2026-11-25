@@ -95,14 +95,16 @@ def _compute_pool_unit_masks(
 
 
 class Event:
-    __slots__ = ("sequence", "name", "time", "started", "_waiters", "_callbacks")
+    __slots__ = ("sequence", "name", "time", "started", "runtime_uid", "_waiters", "_callbacks")
 
     def __init__(self, sequence: int, name: str,
-                 time: float | None = None, started: float | None = None):
+                 time: float | None = None, started: float | None = None,
+                 runtime_uid: str = ""):
         self.sequence = sequence
         self.name = name
         self.time = time
         self.started = started
+        self.runtime_uid = str(runtime_uid) if runtime_uid else ""
         self._waiters: list[int] = []
         self._callbacks: list | None = None
 

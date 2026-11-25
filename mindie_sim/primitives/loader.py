@@ -311,10 +311,7 @@ def _table_band_p50(table: PrimitiveTable, primitive_id: str, metric: str, *, mo
 
 
 def _cap_cube_peak(datapath: DatapathCapabilitySpec, dtype: str, peak: float) -> float:
-    try:
-        arch_peak = datapath.cube_peak(dtype)
-    except ModelingError:
-        return peak
+    arch_peak = datapath.cube_peak(dtype)
     return min(peak, arch_peak) if arch_peak > 0.0 else peak
 
 
@@ -324,7 +321,9 @@ def is_sku_compatible_with_table(
     """True when ``sku`` is explicitly compatible with ``table`` per shipped manifest."""
     table_sku = str(getattr(table, "sku", "") or "")
     target_sku = str(sku or "")
-    if not table_sku or not target_sku or table_sku == target_sku:
+    if not table_sku or not target_sku:
+        return False
+    if table_sku == target_sku:
         return True
     try:
         entries = load_manifest(default_primitives_dir() if primitives_dir is None else Path(primitives_dir))["tables"]
@@ -455,9 +454,9 @@ def resolve_sim_rate_overlay(
             if per_aic is None:
                 gaps.append(f"P06_mmad:{mode}")
                 continue
-            peak = per_aic * aic
+            peak = _cap_cube_peak(datapath, mode, per_aic * aic)
             for dt in dtypes:
-                peaks_map[dt] = _cap_cube_peak(datapath, dt, peak)
+                peaks_map[dt] = peak
     return CalibratedRateOverlay(
         sku=table.sku,
         cann_version=table.cann_version,

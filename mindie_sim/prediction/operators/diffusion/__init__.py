@@ -50,7 +50,6 @@ from .contracts import (
 )
 from .lowering import (
     compute_mindie_sd_effective_denoising_steps,
-    lower_mindie_sd_custom_op,
     lower_op,
 )
 from .registry import (
@@ -79,7 +78,6 @@ __all__ = [
     "MINDIE_SD_VENDOR",
     "capabilities",
     "compute_mindie_sd_effective_denoising_steps",
-    "lower_mindie_sd_custom_op",
     "lower_op",
     "recipes",
 ]

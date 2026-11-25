@@ -834,29 +834,62 @@ def _burst_service_bytes(plan: AddressRunPlan, sectors: int, run: AddressRun, ru
     return sectors * max(1.0, rows * granule / wire)
 
 
+def _canonical_dram_runs(
+    plan: AddressRunPlan, burst_rules: Sequence[BurstTurnRule] = (),
+) -> tuple[AddressRun, ...]:
+    """Return deduplicated active runs in canonical burst-cost order independent of input order."""
+    nonempty = [run for run in plan.runs if run.rows > 0 and run.row_bytes > 0]
+    if len(nonempty) <= 1:
+        return tuple(nonempty)
+    # Deduplicate proven alias groups deterministically before cost ordering.
+    nonempty.sort(
+        key=lambda r: (
+            r.base_byte, r.rows, r.row_bytes, r.stride_bytes, r.layout,
+            r.proven_alias_group or "",
+        )
+    )
+    deduped: list[AddressRun] = []
+    seen_aliases: set[str] = set()
+    for run in nonempty:
+        if run.proven_alias_group is not None:
+            if run.proven_alias_group in seen_aliases:
+                continue
+            seen_aliases.add(run.proven_alias_group)
+        deduped.append(run)
+    if len(deduped) <= 1:
+        return tuple(deduped)
+
+    sec = plan.sector_bytes
+
+    def _order_key(run: AddressRun) -> tuple[float, int, int, int, int, int, str]:
+        wire = run.sector_union_bytes(sec)
+        svc = _burst_service_bytes(plan, wire, run, burst_rules) if wire > 0 else 0.0
+        ratio = (svc / float(wire)) if wire > 0 else 1.0
+        return (ratio, -wire, run.base_byte, run.rows, run.row_bytes, run.stride_bytes, run.layout)
+
+    deduped.sort(key=_order_key)
+    return tuple(deduped)
+
+
 def _dram_service_segments(
     plan: AddressRunPlan, covered: SectorCoverage,
+    burst_rules: Sequence[BurstTurnRule] = (),
 ) -> Iterator[tuple[int, int, int]]:
     """Yield missed bytes and burst geometry; width zero denotes scale metadata."""
-    for span, width, stride, _ in _dram_segments(plan, covered):
+    for span, width, stride, _ in _dram_segments(plan, covered, burst_rules=burst_rules):
         yield span, width, stride
 
 
 def _dram_segments(
     plan: AddressRunPlan, covered: SectorCoverage,
+    *, burst_rules: Sequence[BurstTurnRule] = (),
 ) -> Iterator[tuple[int, int, int, AddressRun | None]]:
     partial = not covered.empty
     sec = plan.sector_bytes
-    seen_aliases: set[str] = set()
+    ordered = _canonical_dram_runs(plan, burst_rules)
     missed_sectors = False
-    for run in plan.runs:
-        if run.rows == 0 or run.row_bytes == 0:
-            continue
-        if run.proven_alias_group is not None:
-            if run.proven_alias_group in seen_aliases:
-                continue
-            seen_aliases.add(run.proven_alias_group)
-        if not partial and len(plan.runs) == 1:
+    for run in ordered:
+        if not partial and len(ordered) == 1:
             missed_sectors = True
             yield run.sector_union_bytes(sec), run.row_bytes, run.stride_bytes, run
             continue
@@ -879,7 +912,7 @@ def _dram_segments(
                     missed_sectors = True
                     stride = run.stride_bytes
                     yield span, span, stride if stride == 0 or stride > run.row_bytes else span, run
-        if len(plan.runs) > 1:
+        if len(ordered) > 1:
             covered = covered.union(run_cov)
     if missed_sectors and plan.scale_bytes:
         yield ((plan.scale_bytes + sec - 1) // sec) * sec, 0, 0, None
@@ -889,7 +922,7 @@ def _missed_dram_sector_and_service(
     plan: AddressRunPlan, resident_cov: SectorCoverage, burst_rules: Sequence[BurstTurnRule],
 ) -> tuple[int, float]:
     sector_total, service_total = 0, 0.0
-    for span, width, stride, run in _dram_segments(plan, resident_cov):
+    for span, width, stride, run in _dram_segments(plan, resident_cov, burst_rules=burst_rules):
         sector_total += span
         service_total += span if run is None else _burst_service_bytes(
             plan, span, run, burst_rules, width=width, stride=stride,

@@ -259,7 +259,7 @@
       },
       "lowerings": {
         "mqsmla_attention": {
-          "implementation": "dsl_mixed_quant_sparse_flash_mla",
+          "implementation": "aclnn_mixed_quant_sparse_flash_mla",
           "options": {
             "metadata_support_fd": false,
             "addressing": "scalar",

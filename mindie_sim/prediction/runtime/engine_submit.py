@@ -87,7 +87,7 @@ class _EngineSubmitMixin:
         task_ledger = (ledger if (acq or fr or alloc_demands
                                   or bindings is not None) else None)
         self._sequence += 1
-        event = Event(self._sequence, name)
+        event = Event(self._sequence, name, runtime_uid=self.uid)
         waiting_count = (1 if pending_one is not None
                          else (0 if pending is None else len(pending)))
         deliv_tuple = (
@@ -344,8 +344,8 @@ class _EngineSubmitMixin:
         seq_launch = self._sequence + 1
         seq_obs = seq_launch + 1
         self._sequence = seq_obs
-        launch = Event(seq_launch, name)
-        obs = Event(seq_obs, obs_name)
+        launch = Event(seq_launch, name, runtime_uid=self.uid)
+        obs = Event(seq_obs, obs_name, runtime_uid=self.uid)
         self._promises[seq_obs] = obs
         waiting_count = (1 if pending_one is not None
                          else (0 if pending is None else len(pending)))
@@ -410,12 +410,12 @@ class _EngineSubmitMixin:
         """Create an already-completed causal boundary at ``self.now``."""
         self._sequence += 1
         now = self.now
-        return Event(self._sequence, name, time=now, started=now)
+        return Event(self._sequence, name, time=now, started=now, runtime_uid=self.uid)
 
     def future(self, name: str) -> Event:
         """A completion handle for a lazily generated finite program."""
         self._sequence += 1
-        event = Event(self._sequence, name)
+        event = Event(self._sequence, name, runtime_uid=self.uid)
         self._promises[event.sequence] = event
         return event
 
@@ -441,13 +441,13 @@ class _EngineSubmitMixin:
         if task.started is not None:
             self._sequence += 1
             event = Event(self._sequence, label, time=task.started,
-                          started=task.started)
+                          started=task.started, runtime_uid=self.uid)
             return event
         t_obj = self._tasks.get(task.sequence)
         if t_obj is None:
             raise ExecutionError(f"start_boundary_requires_active_task:{task.name}")
         self._sequence += 1
-        event = Event(self._sequence, label)
+        event = Event(self._sequence, label, runtime_uid=self.uid)
         self._promises[event.sequence] = event
         self._start_waiters.setdefault(task.sequence, []).append(event)
         return event

@@ -106,10 +106,6 @@ def kv_element_bytes(model: Any) -> float:
     return dtype_bytes(str(dtype or getattr(model, "kv_dtype", "bf16")))
 
 
-def kv_bytes_for(model: Any, elements: float) -> float:
-    return float(elements) * kv_element_bytes(model)
-
-
 def cache_row_parts(
     model: Any,
     region: str,
@@ -119,7 +115,7 @@ def cache_row_parts(
     phase: str | None = None,
 ) -> tuple[int, int, int]:
     """Exact integer ``(payload_bytes, scale_bytes, padding_bytes)`` per row."""
-    parts = packed_row_parts(model, region, width)
+    parts = packed_row_parts(model, region, width, plan=plan, phase=phase)
     if parts is not None:
         data, scales, padding = parts
         return int(data), int(scales), int(padding)
@@ -252,34 +248,6 @@ def _facts(model: Any) -> dict[str, Any]:
     return dict(getattr(model, "catalog_facts", ()) or ())
 
 
-def attention_rows(model: Any, plan: Any, sequence_tokens: int) -> tuple[int, int, int]:
-    del model
-    seq = max(0, int(sequence_tokens))
-    if plan.attention in _LINEAR_ATTENTION_KINDS or plan.cache_kind == "recurrent_unmodeled":
-        return 0, 0, 0
-    if plan.cache_kind == "dense":
-        return min(seq, plan.window) if plan.window else seq, 0, 0
-    window = window_rows(seq, plan.window)
-    rows = completed_rows(seq, plan.compress_ratio)
-    if plan.index_topk and (plan.indexer or plan.topk_owner_layer_id >= 0):
-        rows = min(rows, plan.index_topk)
-    return 0, rows, window
-
-
-def _local_state_sharded(plan: Any, tp: int) -> tuple[float, float]:
-    tp = max(1, int(tp))
-    recurrent = float(plan.recurrent_state_elements) / tp
-    conv = float(plan.conv_state_elements) / tp
-    return recurrent, conv
-
-
-def _context_shard_rows(rows: int, cp: int) -> int:
-    """Block-interleaved context rows owned by one rank (exact integer ceil)."""
-    if cp <= 1:
-        return max(0, int(rows))
-    return _ceil_div(max(0, int(rows)), int(cp))
-
-
 def _context_shard_blocks(seq: int, block: int, cp: int) -> int:
     rows = max(0, int(seq))
     blk = max(1, int(block))
@@ -287,28 +255,6 @@ def _context_shard_blocks(seq: int, block: int, cp: int) -> int:
         return block_round(rows, blk)
     blocks = _ceil_div(rows, blk)
     return _ceil_div(blocks, int(cp)) * blk
-
-
-def owned_block_rows(rows: int, block: int, cp: int, rank: int) -> int:
-    """Exact token rows this physical rank owns under block interleave."""
-    rows = max(0, int(rows))
-    block = max(1, int(block))
-    cp = max(1, int(cp))
-    rank = int(rank)
-    if not 0 <= rank < cp:
-        raise ModelingError(f"cache_owner_rank_out_of_range:{rank}")
-    if cp == 1:
-        return block_round(rows, block)
-    blocks = _ceil_div(rows, block) if rows else 0
-    if rank >= blocks:
-        return 0
-    count = (blocks - 1 - rank) // cp + 1
-    last = rank + (count - 1) * cp
-    owned = count * block
-    tail = rows - last * block
-    if tail < block:
-        owned -= block - tail
-    return int(owned)
 
 
 def owned_token_rows(rows: int, owner_spans: Any, rank: int, *,
@@ -709,29 +655,6 @@ def request_cache_breakdown(
     return out
 
 
-def state_bytes_per_request_per_rank(model: Any, parallel: ParallelSpec,
-                                     runtime: Any = None) -> float:
-    total = 0
-    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
-    axis = str(dict(getattr(runtime, "metadata", ()) or ()).get(
-        "kda_parallel_axis", ""))
-    for plan in model.layer_plans:
-        if plan.attention not in _LINEAR_ATTENTION_KINDS:
-            continue
-        shards = max(1, int(parallel.tp)) * (
-            pcp if (axis == "tp_x_pcp" and plan.attention == "kda") else 1
-        )
-        total += exact_element_bytes(
-            _ceil_div(int(plan.recurrent_state_elements), shards),
-            str(plan.recurrent_state_dtype),
-        )
-        total += exact_element_bytes(
-            _ceil_div(int(plan.conv_state_elements), shards),
-            str(plan.conv_state_dtype),
-        )
-    return float(total)
-
-
 def cache_bytes_per_token_estimate(
     model: Any, parallel: ParallelSpec, sequence_tokens: int,
     *, draft_kind: str | None = None, interleave: int = INDEX_INTERLEAVE_TOKENS,
@@ -746,53 +669,20 @@ def cache_bytes_per_token_estimate(
     return (max(stage_bytes) / seq if stage_bytes else 0.0), total
 
 
-def peak_live_tokens(workload: WorkloadSpec) -> int:
-    """Largest single-request committed token span, never lifetime sum."""
-    if not workload.requests:
-        return 0
-    return max(int(request.prompt_tokens) + int(request.output_tokens) for request in workload.requests)
-
-
-def live_request_cache_peak(
-    model: Any, parallel: ParallelSpec, workload: WorkloadSpec,
-    *, block_size: int = DEFAULT_CACHE_BLOCK_SIZE, media_tokens: int = 0,
-) -> dict[str, Any]:
-    per_request = []
-    for index, request in enumerate(workload.requests):
-        seq = int(request.prompt_tokens) + int(request.output_tokens) + (
-            int(media_tokens) if index == 0 else 0
-        )
-        breakdown = request_cache_breakdown(model, parallel, seq)
-        per_request.append({
-            "request_id": request.request_id,
-            "sequence_tokens": seq,
-            "cache_bytes": breakdown["total_bytes"],
-            "max_stage_bytes": breakdown["max_stage_bytes"],
-            "block_rounded_tokens": block_round(seq, block_size),
-        })
-    return {
-        "per_request": per_request,
-        "peak_bytes": max((item["cache_bytes"] for item in per_request), default=0.0),
-        "peak_max_stage_bytes": max((item["max_stage_bytes"] for item in per_request), default=0.0),
-        "basis": "single live request peak; not a lifetime sum over sequential requests",
-    }
-
-
 __all__ = [
     "INDEX_INTERLEAVE_TOKENS",
     "IndexReadCost", "completed_rows", "new_completed_rows", "window_rows",
     "candidate_valid_rows", "block_round", "index_element_bytes",
     "index_k_block_rows", "index_k_capacity_rows", "index_k_owned_block_rows",
     "index_k_ownership_rows", "index_k_store_rows",
-    "index_row_bytes", "index_row_parts", "index_scale_bytes", "kv_bytes_for", "kv_element_bytes",
+    "index_row_bytes", "index_row_parts", "index_scale_bytes", "kv_element_bytes",
     "local_kv_heads", "cp_plan_kind",
-    "index_selection_cost", "attention_rows", "cache_row_parts", "cache_row_split",
+    "index_selection_cost", "cache_row_parts", "cache_row_split",
     "packed_region_row_bytes",
     "cache_component_parts", "cache_component_split", "layer_cache_components",
     "layer_cache_decomposition", "layer_stage_map", "stage_cache_components",
     "request_cache_breakdown",
     "gbsa_cache_layout", "target_mla_page_bytes", "separate_pool_page_pitches",
     "request_pool_page_pitches",
-    "state_bytes_per_request_per_rank", "cache_bytes_per_token_estimate",
-    "peak_live_tokens", "live_request_cache_peak",
+    "cache_bytes_per_token_estimate",
 ]

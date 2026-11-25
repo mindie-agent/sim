@@ -34,7 +34,6 @@ from mindie_sim.prediction.runtime.contracts import (
     AllocationSpec, BindingFrame, EdgeSpec, FiniteProgramSpec, HostProgramSpec, ProgramCatalog, ReleaseSpec, StageClass, StageSpec, WorkTerm,
 )
 from mindie_sim.prediction.runtime.host import HostCursor
-from mindie_sim.prediction.runtime.periodic import IntervalSummary
 from mindie_sim.prediction.runtime.state import RuntimeState
 from mindie_sim.prediction.efficiency.step_metrics import StepSummary
 from mindie_sim.prediction.structure import parse_case
@@ -589,14 +588,6 @@ def test_binding_frame_snapshots_nested_mappings():
 ])
 def test_capped_max_min_fairness(rate, caps, expected):
     assert fair_rates(rate, caps) == pytest.approx(expected)
-
-def test_periodic_summary_peaks_do_not_multiply():
-    first = IntervalSummary(dt=2.0, completed=2, service={"cpu": 4.0}, peak_allocated={"hbm": 8.0})
-    second = IntervalSummary(dt=1.0, completed=1, service={"cpu": 2.0}, peak_allocated={"hbm": 5.0})
-    combined, scaled = first.plus(second), first.scaled(3)
-    assert (combined.dt, combined.completed, combined.service["cpu"]) == (3.0, 3, 6.0)
-    assert combined.peak_allocated["hbm"] == scaled.peak_allocated["hbm"] == 8.0
-    assert scaled.service["cpu"] == 3 * 4.0
 
 def test_prepared_work_uses_the_public_submission_api():
     from unittest.mock import Mock

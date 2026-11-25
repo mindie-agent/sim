@@ -115,6 +115,20 @@ def _gemma4_norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     return terms
 
 
+_SANDWICH_NORM_MIN_COUNT = 4
+
+
+def _has_sandwich_norm(plan: LayerPlan, model: ModelSpec) -> bool:
+    if bool(getattr(plan, "has_sandwich_norm", False)):
+        return True
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    norm_cfg = facts.get("normalization")
+    return (
+        isinstance(norm_cfg, Mapping)
+        and int(norm_cfg.get("norms_per_layer", 0) or 0) >= _SANDWICH_NORM_MIN_COUNT
+    )
+
+
 def _norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     h = model.hidden_size
     terms = ([] if plan.hc_lowrank > 0 else
@@ -130,7 +144,7 @@ def _norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
             terms.append(_t("k_norm", plan.head_dim, 1, "norm"))
     elif plan.attention == "gdn":
         terms.append(_t("gdn_norm", plan.linear_head_dim, 1, "norm"))
-    if plan.architecture == "gemma4":
+    if _has_sandwich_norm(plan, model):
         terms.extend(_gemma4_norm_terms(plan, model))
     if plan.residual_block_size:
         terms.extend([
@@ -186,15 +200,6 @@ def _mhc_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     return terms
 
 
-def _model_profile_name(model: ModelSpec) -> str:
-    facts = dict(getattr(model, "catalog_facts", ()) or ())
-    profile = str(facts.get("profile", "") or "").strip().lower()
-    if profile:
-        return profile
-    meta = dict(getattr(model, "metadata", ()) or ())
-    return str(meta.get("source_model_type", "") or "").strip().lower()
-
-
 def _step5_csa_indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     """Step-5 CSA indexer weights: Q, K, Z, W projections plus norms and ssmax."""
     h = model.hidden_size
@@ -215,9 +220,9 @@ def _indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
         return []
     if plan.index_heads <= 0 or plan.index_dim <= 0:
         raise ModelingError(f"indexer_dimensions_missing:{plan.index}")
-    profile = _model_profile_name(model)
     if plan.attention == "gqa" and plan.index_kpool > 1:
-        if "step5" in profile:
+        kind = str(getattr(plan, "indexer_kind", "") or "").strip().lower()
+        if kind == "region_csa":
             return _step5_csa_indexer_terms(plan, model)
         from mindie_sim.catalog.qwen4_exp import qsa_indexer_terms
         return qsa_indexer_terms(plan, model)
@@ -248,7 +253,7 @@ def _indexer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
                     _t("indexer_pool_ape", plan.index_kpool, plan.index_dim, "param_fp32"),
                 ])
     if plan.indexer or plan.owns_topk or plan.index_query_per_layer:
-        wq_sharded = plan.attention == "gqa" and ("minimax" in profile or plan.candidate_block_size > 1)
+        wq_sharded = plan.attention == "gqa" and plan.candidate_block_size > 1
         wq_term = (
             _t("indexer_wq", plan.index_heads * plan.index_dim,
                plan.q_lora_rank or model.hidden_size, "indexer.wq", "kv_out",

@@ -280,14 +280,29 @@ def sparse_kv_offload_memory_budget(
     if h2d_bw_gbps is None or d2h_bw_gbps is None:
         raise ModelingError("sparse_kv_offload_host_channel_bw_missing")
 
-    # Step 2: verify exact kernel availability via backends.abi_registry.ProbedAbiRegistry once W1 merges.
+    arch_upper = str(arch_family or "").strip().upper()
+    if arch_upper in {"A2", "A3", "A5"}:
+        from mindie_sim.backends.abi_registry import default_abi_registry
+
+        reg = default_abi_registry()
+        indexer_shipping = reg.is_shipping_available("aclnnLightningIndexer", arch_upper)
+        sfa_shipping = reg.is_shipping_available("aclnnSparseFlashAttention", arch_upper)
+        abi_verification = "verified_via_probed_abi_registry"
+    else:
+        indexer_shipping = False
+        sfa_shipping = False
+        abi_verification = "unprobed_non_ascend_arch"
     hardware_support = {
         "soc_family": soc_family,
         "arch_family": arch_family,
-        "abi_verification": "deferred_to_abi_registry",
+        "abi_verification": abi_verification,
         "memfabric_acc_offload": "host_gva_dma_modeled",
-        "npu_lightning_indexer": "native_indexer_modeled",
-        "npu_sparse_flash_attention": "native_sfa_modeled",
+        "npu_lightning_indexer": (
+            "probed_abi_shipping" if indexer_shipping else "native_indexer_modeled"
+        ),
+        "npu_sparse_flash_attention": (
+            "probed_abi_shipping" if sfa_shipping else "native_sfa_modeled"
+        ),
         "fused_lightning_indexer_manage": (
             "arch22_aclnn_binary" if arch_family in {"A2", "A3"} else "analytical_model"
         ),

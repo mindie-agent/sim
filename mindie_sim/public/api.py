@@ -54,13 +54,13 @@ from .api_support import (
     _gap_kind,
     _handler,
     _invoke,
-    _legacy_profiled,
     _machine_reference,
     _merge_builder,
     _number,
     _ops,
     _ops_replay,
     _profile,
+    _profile_environment,
     _provider,
     _report,
     _require_schema,
@@ -84,12 +84,10 @@ def simulate_operator(case: Any, ops: Any, *, extensions: Any = None,
                       **kwargs: Any) -> dict[str, Any]:
     """Price isolated operators from a Case or declared hardware environment."""
     allow_unbound = bool(kwargs.pop("allow_unbound_formula", False))
+    if allow_unbound:
+        raise ExtensionError("simulation_mode_forbids_unbound_formula_ops:simulate_operator")
     context = _context(extensions)
     selected = _provider("operator", provider, context)
-    enforce_simulation_binding_guard(
-        ops, capability="operator", entry="simulate_operator",
-        allow_unbound_formula=allow_unbound, has_bound_provider=(selected is not None),
-    )
     environment = _environment(case)
     selected_profile = _profile(profile)
     replay = {"entry": "simulate_operator", "ops": _ops_replay(ops),
@@ -105,34 +103,47 @@ def simulate_operator(case: Any, ops: Any, *, extensions: Any = None,
             selected.factory, context, case=environment or case, ops=ops,
             **profile_kwargs, **kwargs)
         built_ops, merged = _merge_builder(built, kwargs)
-        if environment is not None:
+        enforce_simulation_binding_guard(
+            built_ops, capability="operator", entry="simulate_operator",
+            allow_unbound_formula=allow_unbound, has_bound_provider=False,
+        )
+        active_env = environment or (
+            _profile_environment(case, built_ops)
+            if selected_profile is not None else None
+        )
+        if active_env is not None:
             return _core(
-                "operator", "simulate_operator", lambda: environment.operator_report(
+                "operator", "simulate_operator", lambda: active_env.operator_report(
                     _ops(built_ops), profile=selected_profile,
                     service_id=service_id,
                     input_ready_ms=merged.get("input_ready_ms", 0),
                     recipes=merged.get("recipes"),
                     replica=merged.get("replica", 0)),
                 affected_results=affected, minimal_replay_input=replay)
-        normalized, recipes = _legacy_profiled(
-            case, built_ops, selected_profile, service_id)
-        if merged.get("recipes") is not None:
-            recipes = merged["recipes"]
+        recipes = merged.get("recipes")
         call_kwargs = dict(merged)
         call_kwargs.pop("recipes", None)
         call_kwargs.pop("execution", None)
         return _core(
             "operator", "simulate_operator", lambda: operator_costs(
-                case, normalized if recipes is not None else built_ops,
+                case, built_ops,
                 **({"recipes": recipes} if recipes is not None else {}),
                 **call_kwargs),
             affected_results=affected, minimal_replay_input=replay)
+    enforce_simulation_binding_guard(
+        ops, capability="operator", entry="simulate_operator",
+        allow_unbound_formula=allow_unbound, has_bound_provider=(selected is not None),
+    )
     handler = selected.factory if selected is not None else None
     if handler is not None:
         return dict(_check_operator(_invoke(
             handler, context, case=environment or case, ops=ops,
             **profile_kwargs, **kwargs)))
-    if environment is not None:
+    active_env = environment or (
+        _profile_environment(case, ops)
+        if selected_profile is not None else None
+    )
+    if active_env is not None:
         input_ready_ms = kwargs.pop("input_ready_ms", 0)
         recipes = kwargs.pop("recipes", None)
         replica = kwargs.pop("replica", 0)
@@ -141,15 +152,9 @@ def simulate_operator(case: Any, ops: Any, *, extensions: Any = None,
                 "standalone_operator_unsupported_keywords:"
                 + ",".join(sorted(kwargs)))
         return _core(
-            "operator", "simulate_operator", lambda: environment.operator_report(
+            "operator", "simulate_operator", lambda: active_env.operator_report(
                 _ops(ops), profile=selected_profile, service_id=service_id,
                 input_ready_ms=input_ready_ms, recipes=recipes, replica=replica),
-            affected_results=affected, minimal_replay_input=replay)
-    normalized, recipes = _legacy_profiled(case, ops, selected_profile, service_id)
-    if recipes is not None:
-        return _core(
-            "operator", "simulate_operator",
-            lambda: operator_costs(case, normalized, recipes=recipes, **kwargs),
             affected_results=affected, minimal_replay_input=replay)
     return _core(
         "operator", "simulate_operator", lambda: operator_costs(case, ops, **kwargs),
@@ -162,12 +167,10 @@ def simulate_native_call(case: Any, ops: Any, *, extensions: Any = None,
                          **kwargs: Any) -> dict[str, Any]:
     """Compose an already-declared native call through the ordinary engine."""
     allow_unbound = bool(kwargs.pop("allow_unbound_formula", False))
+    if allow_unbound:
+        raise ExtensionError("simulation_mode_forbids_unbound_formula_ops:simulate_native_call")
     context = _context(extensions)
     selected = _provider("native", provider, context)
-    enforce_simulation_binding_guard(
-        ops, capability="native", entry="simulate_native_call",
-        allow_unbound_formula=allow_unbound, has_bound_provider=(selected is not None),
-    )
     environment = _environment(case)
     selected_profile = _profile(profile)
     replay = {"entry": "simulate_native_call", "ops": _ops_replay(ops),
@@ -183,7 +186,15 @@ def simulate_native_call(case: Any, ops: Any, *, extensions: Any = None,
             selected.factory, context, case=environment or case, ops=ops,
             **profile_kwargs, **kwargs)
         built_ops, merged = _merge_builder(built, kwargs)
-        if environment is not None:
+        enforce_simulation_binding_guard(
+            built_ops, capability="native", entry="simulate_native_call",
+            allow_unbound_formula=allow_unbound, has_bound_provider=False,
+        )
+        active_env = environment or (
+            _profile_environment(case, built_ops)
+            if selected_profile is not None else None
+        )
+        if active_env is not None:
             options = dict(merged)
             input_ready_ms = options.pop("input_ready_ms", 0)
             recipes = options.pop("recipes", None)
@@ -196,31 +207,36 @@ def simulate_native_call(case: Any, ops: Any, *, extensions: Any = None,
                     + ",".join(sorted(outside)))
             return _core(
                 "native", "simulate_native_call",
-                lambda: environment.call_report(
+                lambda: active_env.call_report(
                     _ops(built_ops), profile=selected_profile,
                     service_id=service_id, input_ready_ms=input_ready_ms,
                     recipes=recipes, replica=replica, **options),
                 affected_results=affected, minimal_replay_input=replay)
-        normalized, recipes = _legacy_profiled(
-            case, built_ops, selected_profile, service_id)
-        if merged.get("recipes") is not None:
-            recipes = merged["recipes"]
+        recipes = merged.get("recipes")
         call_kwargs = dict(merged)
         call_kwargs.pop("recipes", None)
         call_kwargs.pop("execution", None)
         return _core(
             "native", "simulate_native_call", lambda: call_costs(
-                case, normalized if recipes is not None else built_ops,
+                case, built_ops,
                 **({"recipes": recipes} if recipes is not None else {}),
                 **call_kwargs),
             affected_results=affected, minimal_replay_input=replay)
+    enforce_simulation_binding_guard(
+        ops, capability="native", entry="simulate_native_call",
+        allow_unbound_formula=allow_unbound, has_bound_provider=(selected is not None),
+    )
     handler = selected.factory if selected is not None else None
     if handler is not None:
         return dict(_check_graph(_invoke(
             handler, context, case=environment or case, ops=ops,
             **profile_kwargs, **kwargs),
             capability="native", schema="mindie-sim.call-costs/1"))
-    if environment is not None:
+    active_env = environment or (
+        _profile_environment(case, ops)
+        if selected_profile is not None else None
+    )
+    if active_env is not None:
         input_ready_ms = kwargs.pop("input_ready_ms", 0)
         recipes = kwargs.pop("recipes", None)
         replica = kwargs.pop("replica", 0)
@@ -230,16 +246,10 @@ def simulate_native_call(case: Any, ops: Any, *, extensions: Any = None,
                 "standalone_native_unsupported_keywords:"
                 + ",".join(sorted(outside)))
         return _core(
-            "native", "simulate_native_call", lambda: environment.call_report(
+            "native", "simulate_native_call", lambda: active_env.call_report(
                 _ops(ops), profile=selected_profile, service_id=service_id,
                 input_ready_ms=input_ready_ms, recipes=recipes,
                 replica=replica, **kwargs),
-            affected_results=affected, minimal_replay_input=replay)
-    normalized, recipes = _legacy_profiled(case, ops, selected_profile, service_id)
-    if recipes is not None:
-        return _core(
-            "native", "simulate_native_call",
-            lambda: call_costs(case, normalized, recipes=recipes, **kwargs),
             affected_results=affected, minimal_replay_input=replay)
     return _core(
         "native", "simulate_native_call", lambda: call_costs(case, ops, **kwargs),
@@ -301,12 +311,10 @@ def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
                    **kwargs: Any) -> dict[str, Any]:
     """Compose a declared dependency graph on shared device resources."""
     allow_unbound = bool(kwargs.pop("allow_unbound_formula", False))
+    if allow_unbound:
+        raise ExtensionError("simulation_mode_forbids_unbound_formula_ops:simulate_graph")
     context = _context(extensions)
     selected = _provider("graph", provider, context)
-    enforce_simulation_binding_guard(
-        ops, capability="graph", entry="simulate_graph",
-        allow_unbound_formula=allow_unbound, has_bound_provider=(selected is not None),
-    )
     environment = _environment(case)
     selected_profile = _profile(profile)
     replay = {"entry": "simulate_graph", "ops": _ops_replay(ops),
@@ -322,9 +330,17 @@ def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
             selected.factory, context, case=environment or case, ops=ops,
             **profile_kwargs, **kwargs)
         built_ops, merged = _merge_builder(built, kwargs)
-        if environment is not None:
+        enforce_simulation_binding_guard(
+            built_ops, capability="graph", entry="simulate_graph",
+            allow_unbound_formula=allow_unbound, has_bound_provider=False,
+        )
+        active_env = environment or (
+            _profile_environment(case, built_ops)
+            if selected_profile is not None else None
+        )
+        if active_env is not None:
             return _core(
-                "graph", "simulate_graph", lambda: environment.graph_report(
+                "graph", "simulate_graph", lambda: active_env.graph_report(
                     _ops(built_ops), profile=selected_profile,
                     service_id=service_id,
                     input_ready_ms=merged.get("input_ready_ms", 0),
@@ -333,26 +349,31 @@ def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
                     replica=merged.get("replica", 0),
                     recipes=merged.get("recipes")),
                 affected_results=affected, minimal_replay_input=replay)
-        normalized, recipes = _legacy_profiled(
-            case, built_ops, selected_profile, service_id)
-        if merged.get("recipes") is not None:
-            recipes = merged["recipes"]
+        recipes = merged.get("recipes")
         call_kwargs = dict(merged)
         call_kwargs.pop("recipes", None)
         call_kwargs.pop("execution", None)
         call_kwargs.pop("replica", None)
         return _core(
             "graph", "simulate_graph", lambda: graph_costs(
-                case, normalized if recipes is not None else built_ops,
+                case, built_ops,
                 **({"recipes": recipes} if recipes is not None else {}),
                 **call_kwargs),
             affected_results=affected, minimal_replay_input=replay)
+    enforce_simulation_binding_guard(
+        ops, capability="graph", entry="simulate_graph",
+        allow_unbound_formula=allow_unbound, has_bound_provider=(selected is not None),
+    )
     handler = selected.factory if selected is not None else None
     if handler is not None:
         return dict(_check_graph(_invoke(
             handler, context, case=environment or case, ops=ops,
             **profile_kwargs, **kwargs)))
-    if environment is not None:
+    active_env = environment or (
+        _profile_environment(case, ops)
+        if selected_profile is not None else None
+    )
+    if active_env is not None:
         input_ready_ms = kwargs.pop("input_ready_ms", 0)
         external_inputs = kwargs.pop("external_inputs", None)
         execution = kwargs.pop("execution", None)
@@ -363,16 +384,10 @@ def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
                 "standalone_graph_unsupported_keywords:"
                 + ",".join(sorted(kwargs)))
         return _core(
-            "graph", "simulate_graph", lambda: environment.graph_report(
+            "graph", "simulate_graph", lambda: active_env.graph_report(
                 _ops(ops), profile=selected_profile, service_id=service_id,
                 input_ready_ms=input_ready_ms, external_inputs=external_inputs,
                 execution=execution, replica=replica, recipes=recipes),
-            affected_results=affected, minimal_replay_input=replay)
-    normalized, recipes = _legacy_profiled(case, ops, selected_profile, service_id)
-    if recipes is not None:
-        return _core(
-            "graph", "simulate_graph",
-            lambda: graph_costs(case, normalized, recipes=recipes, **kwargs),
             affected_results=affected, minimal_replay_input=replay)
     return _core(
         "graph", "simulate_graph", lambda: graph_costs(case, ops, **kwargs),

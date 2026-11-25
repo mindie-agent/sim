@@ -72,9 +72,11 @@ REFERENCE_KEYS = frozenset({
     "gdn_state_effects",
     "input_conversion_subgraphs",
     "input_ports",
+    "input_state_version",
     "inverse_index_producer",
     "kda_recurrent_params",
     "output_port_aliases",
+    "output_state_version",
     "primary_anchor_id",
     "recover_ssm_geometry",
     "prefix_cache_reads",
@@ -86,6 +88,8 @@ REFERENCE_KEYS = frozenset({
     "payload_producer",
     "quantizer_op",
     "receive_allocation",
+    "request_input_state_versions",
+    "request_output_state_versions",
     "reverse_of_collective",
     "semantic_metadata",
     "storage",
@@ -123,6 +127,7 @@ _LAYER_GROUP = 3
 _LAYER_REFERENCE_GROUP = 2
 _STATE_FAMILY_GROUP = 1
 _CONTEXT_KV_GROUP = 2
+_STATE_LAYER_TOKEN_GROUP = 1
 _OCCURRENCE = re.compile(
     r"(?<![\w.])(?P<draft>draft(?:\d+|_prefill)\.)?s(\d+)\.l(\d+)(?=\.|$)")
 _LAYER_REFERENCE = re.compile(r"(?<![\w.])(kda|gdn)\.layer\[(\d+)\]")
@@ -132,6 +137,7 @@ _LAYER_REFERENCE = re.compile(r"(?<![\w.])(kda|gdn)\.layer\[(\d+)\]")
 #: (``_OCCURRENCE``'s capture groups stay untouched).
 _CONTEXT_KV_OCCURRENCE = re.compile(
     r"(?<![\w])(?P<draft>draft(?:\d+|_prefill)\.)?context_kv(\d+)(?=\.|$)")
+_STATE_LAYER_TOKEN = re.compile(r"(?<![\w.])layer(\d+)(?=:|$)")
 
 #: Identity field order.  A stable declaration, not a per-call inspection.
 IDENTITY_FIELDS = (
@@ -158,7 +164,8 @@ def normalize_reference(value: str, stage: int, layer: int) -> str:
     has_occ = ".l" in value
     has_layer_ref = ".layer[" in value
     has_ctx_kv = "context_kv" in value
-    if not (has_occ or has_layer_ref or has_ctx_kv):
+    has_layer_tok = "layer" in value
+    if not (has_occ or has_layer_ref or has_ctx_kv or has_layer_tok):
         return value
 
     def _rename(match: "re.Match[str]") -> str:
@@ -174,11 +181,16 @@ def normalize_reference(value: str, stage: int, layer: int) -> str:
         return (f"{match.group('draft') or ''}context_kv"
                 f"{int(match.group(_CONTEXT_KV_GROUP)) - int(layer)}")
 
+    def _layer_token(match: "re.Match[str]") -> str:
+        return f"layer{int(match.group(_STATE_LAYER_TOKEN_GROUP)) - int(layer)}"
+
     renamed = _OCCURRENCE.sub(_rename, value) if has_occ else value
     if has_layer_ref:
         renamed = _LAYER_REFERENCE.sub(_layer, renamed)
     if has_ctx_kv:
         renamed = _CONTEXT_KV_OCCURRENCE.sub(_context_kv, renamed)
+    if has_layer_tok:
+        renamed = _STATE_LAYER_TOKEN.sub(_layer_token, renamed)
     return renamed
 
 

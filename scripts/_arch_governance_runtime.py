@@ -253,12 +253,8 @@ _AG011_DISPATCH_ROOTS = frozenset({
     "mindie_sim.stacks.registry",
     "mindie_sim.templates.registry",
 })
-#: Ratcheted legacy standalone operator contract modules (budget=3; zero new orphans allowed).
-_LEGACY_UNREACHABLE_OPERATOR_MODULES = frozenset({
-    "mindie_sim/prediction/operators/collectives/hccl_alltoallv.py",
-    "mindie_sim/prediction/operators/matrix/steady_pipeline.py",
-    "mindie_sim/prediction/operators/vector/dynamic_quant_schedule.py",
-})
+#: Ratcheted legacy standalone operator contract modules (budget=0; all legacy orphans retired).
+_LEGACY_UNREACHABLE_OPERATOR_MODULES: frozenset[str] = frozenset()
 _FLAT_PLAN_INFRA_FILES = frozenset({
     "mindie_sim/prediction/graph_analysis.py",
     "mindie_sim/prediction/mechanism.py",

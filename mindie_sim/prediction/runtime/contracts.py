@@ -49,6 +49,19 @@ class EventKey:
     sequence: int
     generation: int = 0
 
+
+@dataclass(frozen=True)
+class LocalBoundaryToken:
+    """Completed synthetic boundary marker scoped to the owning RuntimeState."""
+
+    sequence: int
+    time: float = 0.0
+    runtime_uid: str = ""
+
+    @property
+    def done(self) -> bool:
+        return True
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class PoolKey:
     physical_domain: str
@@ -99,7 +112,7 @@ class AllocationBinding:
     amount: float
     backing: BackingKey | None = None
     byte_ranges: tuple[tuple[int, int], ...] = ()
-    reservation_parent: BackingKey | None = None
+    reservation_parent: AllocationKey | None = None
     owner: str = ''
     storage: str = ''
     access: str = 'readwrite'

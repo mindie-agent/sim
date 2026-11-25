@@ -201,8 +201,8 @@ class _MemoryReportingMixin:
                 for (replica, name), binding in sorted(self.grant_bindings.items())
             ],
             "onchip_effects": [
-                {"replica": replica, "name": name, **binding}
-                for (replica, name), binding in sorted(self.onchip_effects.items())
+                {"replica": replica, "stage": stage, "name": name, **binding}
+                for (replica, stage, name), binding in sorted(self.onchip_effects.items())
             ],
             "selected_plan_bytes_per_replica_stage": self.selected_reserved,
             "shared_page_bytes_per_replica_stage": self.shared_reserved,
@@ -367,8 +367,8 @@ class _MemoryReportingMixin:
                 for (replica, name), binding in sorted(self.grant_bindings.items())
             ],
             "onchip_effects": [
-                {"replica": replica, "name": name, **binding}
-                for (replica, name), binding in sorted(self.onchip_effects.items())
+                {"replica": replica, "stage": stage, "name": name, **binding}
+                for (replica, stage, name), binding in sorted(self.onchip_effects.items())
             ],
             "physical_rank_capacity_bytes_per_replica_stage": [
                 [[die.hbm_bytes * self.case.runtime.gpu_memory_utilization

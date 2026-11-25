@@ -15,7 +15,6 @@ import inspect
 import math
 from typing import Any
 
-from mindie_sim.prediction.body_defaults import TargetOperators
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
@@ -73,6 +72,16 @@ def _profile(value: Any) -> UserProfile | None:
     if not isinstance(value, UserProfile):
         raise ExtensionError("user_profile_requires_load_user_profile")
     return value
+
+
+def _profile_environment(case: Any, ops: Any) -> ExecutionEnvironment:
+    """Bind a case onto the unified ``ExecutionEnvironment`` for profile pricing."""
+    if isinstance(ops, Mapping):
+        raise ExtensionError("user_profile_supports_sequence_ops_only")
+    parsed = parse_case(case)
+    return ExecutionEnvironment.from_hardware(
+        parsed.machine, runtime=parsed.runtime,
+    )
 
 
 def _ops(value: Any) -> tuple[OpSpec, ...]:
@@ -185,25 +194,6 @@ def _core(capability: str, entry: str, call: Any, *,
             message=reason, affected_results=affected_results,
             minimal_replay_input=minimal_replay_input,
             fallback="not_attempted", cause=exc) from exc
-
-
-def _legacy_profiled(case: Any, ops: Any, profile: UserProfile | None,
-                     service_id: str | None):
-    if profile is None:
-        return ops, None
-    if isinstance(ops, Mapping):
-        raise ExtensionError("user_profile_supports_sequence_ops_only")
-    parsed = parse_case(case)
-    environment = ExecutionEnvironment.from_hardware(
-        parsed.machine, runtime=parsed.runtime)
-    probe = environment.execution(recipes=None)
-    normalized, recipes = environment._profiled(
-        _ops(ops), profile, service_id, probe)
-    if isinstance(ops, TargetOperators):
-        normalized = TargetOperators(
-            normalized, kernels=ops.effective_kernels,
-            selection=ops.default_selection)
-    return normalized, recipes
 
 
 def _context(value: Any) -> ExtensionContext | None:

@@ -111,8 +111,9 @@ def _mode_rows(mode, *, evidence, intercept, slope):
 
 def _chain(condition, dtype="int8", **kw):
     return {"condition": condition, "status": "ok", "dtype": dtype, "ranks": 2, "experts": 64, "global_tokens": 512,
-            "chain_ms": 4.0, "legs_ms": {"dispatch": 1.0, "gate_up": 1.0, "swiglu_quant": 1.0,
-                                         "down": 1.0, "combine": 1.0}, **kw}
+            "chain_ms": 4.0, "paired_overlap_ms": 1.0,
+            "legs_ms": {"dispatch": 1.0, "gate_up": 1.0, "swiglu_quant": 1.0,
+                        "down": 1.0, "combine": 1.0}, **kw}
 
 def _comm_case(*, hardware=comm.A5_SKU, tp=8, dp=1, ep=8):
     raw = compose_case(TARGET_MODEL, hardware=hardware, tp=tp, dp=dp, ep=ep,
@@ -425,7 +426,12 @@ def test_contention_slowdown_chained_moe_and_followup_manifest(embedded):
 
 
 def test_directory_ingest_chunked_streaming_and_window_isolation(tmp_path, monkeypatch):
-    (tmp_path / "chain-validation.json").write_text(json.dumps([_chain("c1")]), encoding="utf-8")
+    bad_list = tmp_path / "bad-list.json"
+    bad_list.write_text(json.dumps([_chain("c1")]), encoding="utf-8")
+    with pytest.raises(ValueError, match="a5_campaign_source_list_not_a_campaign"):
+        comm.ingest_a5_campaign_data(bad_list)
+    bad_list.unlink()
+    (tmp_path / "chain-validation.json").write_text(json.dumps(_campaign("chain-validation", [], chains=[_chain("c1")])), encoding="utf-8")
     (tmp_path / "comm-lane.json").write_text(json.dumps({"raw_points": [
         {"dtype": "int8", "ep": 2, "link_bytes": 1024, "ms": 0.5},
         {"dtype": "int8", "ep": 2, "link_bytes": 2048, "ms": 0.7}]}), encoding="utf-8")

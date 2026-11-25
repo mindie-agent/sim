@@ -108,6 +108,7 @@ from mindie_sim.prediction.efficiency import (
     evaluate_fixed_plan, prepare_fixed_plan, solve_sla_sizing,
 )
 from mindie_sim.schema.case import Case as CaseSpec
+from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.sweep.engine import BASELINE_SCENARIO, LOCKED_STAGE, parallel_report
@@ -262,6 +263,7 @@ import time
 from collections.abc import Mapping
 from typing import Any
 
+from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.parallel import ParallelSpec
 
@@ -294,6 +296,8 @@ def _evaluate(job: Mapping[str, Any], stage: str) -> dict[str, Any]:
             q_tokens=probe["q_tokens"], emit_tokens=probe["emit_tokens"],
             output_budget=probe["output_budget"],
             max_sequences_per_dp=probe["max_sequences_per_dp"])
+    except UnmodeledCapabilityError:
+        raise
     except (ModelingError, ValueError) as exc:
         return static_row(common, reason=str(exc), kind="topology",
                           elapsed_ms=EMPTY_BUDGET_S)

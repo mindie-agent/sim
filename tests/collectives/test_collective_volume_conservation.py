@@ -33,15 +33,13 @@ from mindie_sim import (
 from mindie_sim.prediction.execution.cohort_traffic import bind_cohort_traffic
 from mindie_sim.prediction.collectives import PairwiseCollective
 from mindie_sim.prediction.operators.collectives.direct_peer import DirectPeerGroup
-from mindie_sim.prediction.engine import Allocation, Engine, Resource
-from mindie_sim.prediction.operators.collectives.hccl_alltoallv import AlltoAllVGroup
+from mindie_sim.prediction.engine import Engine
 from mindie_sim.prediction.operators.collectives.hccl_ccu_two_die import TEMPLATE
-from mindie_sim.prediction.operators.collectives.hccl_contracts import select as hccl_select
 from mindie_sim.prediction.operators.collectives.hccl_graph import lower as hccl_lower
 from mindie_sim.prediction.operators.moe_routing.moe_token_partition import ALLTOALL_KIND
 from mindie_sim.prediction.pd_connector import PDConnector, PDHandoff, PDTransfer
 from mindie_sim.prediction.collectives.peer_traffic import PeerTraffic
-from mindie_sim.prediction.program import RecipeBook, RecipeContext
+from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
@@ -131,17 +129,6 @@ def _ccu_case(preset: str) -> dict:
         "signal_bytes": 8, "channel_die_map": [[None if src == dst else
             int(((dst - src) % 8) >= 4) for dst in range(8)] for src in range(8)]}}}
     return raw
-
-def _leaf_contexts(topology, ranks):
-    resources = list(topology.resources())
-    bindings = {}
-    for rank in ranks:
-        rates = {"hbm": 1e9, "hccl_copy": 1e9, "hccl_control": 1e9}
-        names = {role: f"{role}:{rank}" for role in rates}
-        resources.extend(Resource(names[role], rate) for role, rate in rates.items())
-        bindings[rank] = RecipeContext(None, {}, names, {names[role]: rate for role, rate in rates.items()}, 1,
-            resource_units={name: 1 for name in names.values()})
-    return resources, bindings
 
 def test_peer_framing_is_charged_per_message_and_per_hop():
     raw = case(tp=4)
@@ -359,58 +346,6 @@ def test_ccu_leaf_placement_changes_route_and_sharing_domain():
     pod_wire = sum(value for name, value in reports["a5_pod"]["execution"]["serviced"].items()
                    if name.startswith("link:") and ":tx:port" in name)
     assert server_wire == pytest.approx(pod_wire)
-
-def test_alltoallv_leaf_chunk_credit_and_consumer_release():
-    count, cell = 4, 30
-    matrix = tuple(tuple(0 if source == destination else cell for destination in range(count))
-                   for source in range(count))
-    topo = per_pair_topology(count, capacity=64)
-    selection = hccl_select({"expansion": "AICPU_TS", "template": "mesh_write",
-                             "dtype_bytes": 1}, collective="alltoallv", ranks=count,
-                            payload_bytes=cell * (count - 1))
-    def run(group, tag):
-        resources, bindings = _leaf_contexts(topo, tuple(range(count)))
-        engine = Engine(resources, trace_limit=5000)
-        ready = {rank: engine.submit(f"{tag}:ready{rank}") for rank in range(count)}
-        done = group.start_participants(engine, tag, ready, bindings)
-        engine.advance(until=tuple(done.values()), first=False)
-        return done, engine
-    plan_done, plan_engine = run(AlltoAllVGroup( selection, matrix, tuple(range(count)), topo, chunk_bytes=16,
-        hop_startup_us=1, receive_capacity_bytes_per_peer=16), "plan")
-    tasks = [row["task"] for row in plan_engine.trace if ":transport:flow0:" in row["task"]]
-    assert any(":chunk1:" in task for task in tasks)
-    assert any(task.endswith(":chunk0:hop0:startup") for task in tasks)
-    assert not any(":chunk1:hop0:startup" in task for task in tasks)
-    assert all(event.done for event in plan_done.values())
-    assert _prefix(plan_engine, "hbm:") == pytest.approx(16 * 30 * 3)
-
-@pytest.mark.parametrize("empty_consumer", (False, True))
-def test_alltoallv_leaf_consumer_release_holds_receive_pool(empty_consumer):
-    topo = per_pair_topology(2, capacity=64)
-    selection = hccl_select({"expansion": "AICPU_TS", "template": "mesh_write",
-                             "dtype_bytes": 1}, collective="alltoallv", ranks=2,
-                            payload_bytes=64)
-    resources, bindings = _leaf_contexts(topo, (0, 1))
-    engine = Engine(resources, trace_limit=1000)
-    ready = {rank: engine.submit(f"ready{rank}") for rank in (0, 1)}
-    releases = {rank: engine.future(f"release{rank}") for rank in (0, 1)}
-    done = AlltoAllVGroup( selection, ((0, 64), (64, 0)), (0, 1), topo, chunk_bytes=32,
-        receive_capacity_bytes_per_peer=64,
-        receive_buffer_ids=((0, "channel0"), (1, "channel1"))).start_participants(
-            engine, "hccl", ready, bindings,
-            release_events={rank: (() if empty_consumer else (releases[rank],)) for rank in (0, 1)})
-    engine.advance(until=tuple(done.values()), first=False)
-    tasks = {row["task"] for row in engine.trace}
-    assert {"transport:rx:channel0", "transport:rx:channel1"} <= set(engine.pools)
-    if empty_consumer:
-        assert all(f"hccl:{rank}->{other}:receive_release" not in tasks for rank, other in ((0, 1), (1, 0)))
-        return
-    consumers = tuple(engine.submit( f"consume{rank}", after=(done[rank],), latency=1,
-        on_complete=lambda _event, target=releases[rank]: None
-        if target.done else engine.resolve(target)) for rank in (0, 1))
-    engine.advance(until=consumers, first=False)
-    assert "hccl:0->1:receive_release" in {row["task"] for row in engine.trace}
-    assert _prefix(engine, "link:") == pytest.approx(128.0)
 
 def test_pd_whole_message_grants_are_atomic_and_avoid_deadlock():
     connector = PDConnector({"link": {"name": "handoff", "capacity_bytes_per_ms": 128,

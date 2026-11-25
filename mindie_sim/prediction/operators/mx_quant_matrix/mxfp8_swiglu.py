@@ -16,7 +16,7 @@ from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
 from mindie_sim.prediction.operators.matrix.refill_steady import compact_refill
-from mindie_sim.prediction.operators.matrix.matrix_traffic import FP32_BYTES
+FP32_BYTES = 4
 from .mxfp8_grouped import (
     ASWT_M_WINDOW_TILES, CUBE_MN_FRACTAL, GROUP_LIST_ENTRY_BYTES, MX_SCALE_GROUP,
     MX_SCALE_GROUP_PAIR, N_TILE_ALIGNMENT, N_TILE_COLUMNS, Mapping, align, panel_work,

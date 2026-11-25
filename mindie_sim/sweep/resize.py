@@ -171,27 +171,46 @@ def extract_model_geometry(
                     if isinstance(raw_model.get("metadata"), Mapping) else {})
         mla_replicate = bool(raw_model.get("mla_replicate", False)
                              or raw_meta.get("mla_replicate", False))
-        try:
-            info = extract_model_geometry(ModelSpec.from_mapping(raw_model))
-            info["mla_replicate"] = info["mla_replicate"] or mla_replicate
-            return info
-        except (ModelingError, ValueError, TypeError, KeyError):
-            canon = ModelSpec.canonical_fields(raw_model)
-            heads = int(canon.get("num_heads", 0) or 0)
-            kv_heads = int(canon.get("num_kv_heads",
-                                     canon.get("num_heads", 0)) or 0)
-            experts = int(canon.get("num_experts", 0) or 0)
-            attention = str(
-                canon.get("attention")
-                or ("mla" if ("mla" in canon or "kv_lora_rank" in canon)
-                    else "gqa")).strip().lower()
+        minimal_keys = frozenset({
+            "num_attention_heads", "num_heads",
+            "num_key_value_heads", "num_kv_heads",
+            "n_routed_experts", "num_experts",
+            "num_hidden_layers", "layers",
+            "mla_replicate", "replicated_cache_dcp_disallowed",
+        })
+        if (raw_model and "hidden_size" not in raw_model
+                and set(raw_model).issubset(minimal_keys)):
+            heads_raw = raw_model.get("num_heads", raw_model.get("num_attention_heads"))
+            if heads_raw is None or isinstance(heads_raw, bool) or int(heads_raw) < 1:
+                raise ModelingError("model.num_heads_required")
+            num_heads = int(heads_raw)
+            kv_raw = raw_model.get("num_kv_heads", raw_model.get("num_key_value_heads", num_heads))
+            if kv_raw is None or isinstance(kv_raw, bool) or int(kv_raw) < 1:
+                raise ModelingError("model.num_kv_heads_invalid")
+            num_kv_heads = int(kv_raw)
+            exp_raw = raw_model.get("num_experts", raw_model.get("n_routed_experts", 0))
+            if exp_raw is None or isinstance(exp_raw, bool) or int(exp_raw) < 0:
+                raise ModelingError("model.num_experts_invalid")
+            layers_raw = raw_model.get("layers", raw_model.get("num_hidden_layers", 1))
+            if layers_raw is None or isinstance(layers_raw, bool) or int(layers_raw) < 1:
+                raise ModelingError("model.layers_invalid")
             return {
-                "num_heads": heads, "num_kv_heads": kv_heads,
-                "num_experts": experts, "attention": attention,
-                "attention_types": {attention},
-                "layers": int(canon.get("layers", 1) or 1),
+                "num_heads": num_heads,
+                "num_kv_heads": num_kv_heads,
+                "gqa_kv_heads": (num_kv_heads,),
+                "has_mla": False,
+                "replicated_cache_dcp_disallowed": bool(
+                    raw_model.get("replicated_cache_dcp_disallowed", False)
+                ),
+                "num_experts": int(exp_raw),
+                "attention": "gqa",
+                "attention_types": ("gqa",),
+                "layers": int(layers_raw),
                 "mla_replicate": mla_replicate,
             }
+        info = extract_model_geometry(ModelSpec.from_mapping(raw_model))
+        info["mla_replicate"] = info["mla_replicate"] or mla_replicate
+        return info
     raise TypeError(
         f"unsupported_case_or_model_type:{type(case_or_model).__name__}")
 

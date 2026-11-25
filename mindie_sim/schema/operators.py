@@ -179,10 +179,18 @@ class TensorPrecisionABI:
             self.linear_method == other.linear_method
             and self.input_dtype == other.input_dtype
             and self.weight_dtype == other.weight_dtype
+            and self.output_dtype == other.output_dtype
             and self.compute_dtype == other.compute_dtype
+            and self.accum_dtype == other.accum_dtype
+            and self.weight_layout == other.weight_layout
+            and self.weight_block == other.weight_block
+            and self.weight_scale_dtype == other.weight_scale_dtype
+            and self.weight_scale_bytes == other.weight_scale_bytes
             and self.act_group_size == other.act_group_size
             and self.act_scale_dtype == other.act_scale_dtype
-            and self.weight_scale_dtype == other.weight_scale_dtype
+            and self.act_scale_pack == other.act_scale_pack
+            and self.explicit_cast_on_entry == other.explicit_cast_on_entry
+            and self.explicit_cast_on_exit == other.explicit_cast_on_exit
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -218,7 +226,7 @@ class KernelBinding:
     arch_family: str
     submodule: str = ""
     macro_module: str = ""
-    readiness: KernelReadiness = "shipping"
+    readiness: KernelReadiness = field(kw_only=True)
     source_ref: SourceRef | None = None
     recipe_id: str = ""
     template_id: str = ""

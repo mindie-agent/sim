@@ -372,14 +372,20 @@ def _recurrent_values(operator, contract, context=None):
         (meta.get("program_execution") or {}).get("state_contract")
         if isinstance(meta.get("program_execution"), dict) else None) or {}
     layout = state.get("state_layout")
-    active_count = len(state.get("active_slots") or ()) or state.get("slots") or 1
+    raw_active_slots = state.get("active_slots")
+    if raw_active_slots is not None:
+        active_count = len(raw_active_slots)
+    elif state.get("slots") is not None:
+        active_count = int(state["slots"])
+    else:
+        active_count = None
     capacity = state.get("state_capacity")
     if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity < 1:
         capacity = None
     active_shape = None
-    if layout == "V,K":
+    if active_count is not None and layout == "V,K":
         active_shape = [active_count, heads, dv, dk]
-    elif layout == "K,V":
+    elif active_count is not None and layout == "K,V":
         active_shape = [active_count, heads, dk, dv]
     capacity_shape = None
     if active_shape is not None and capacity is not None:

@@ -436,11 +436,11 @@ def test_executable_birth_binding_and_four_stage_three_owner_waterfall() -> None
 
     retired_dsl = "cann" + "bot"
     with pytest.raises(ModelingError, match="kernel_binding_banned_backend"):
-        KernelBinding(kernel_id="kda_fused", backend=f"{retired_dsl}-dsl", arch_family="dav_3510")  # type: ignore[arg-type]
+        KernelBinding(kernel_id="kda_fused", backend=f"{retired_dsl}-dsl", arch_family="dav_3510", readiness="shipping")  # type: ignore[arg-type]
     with pytest.raises(ModelingError, match="kernel_binding_banned_kernel_id"):
-        KernelBinding(kernel_id=f"{retired_dsl}_mixed_quant_sparse_flash_mla", backend="CANN", arch_family="dav_3510")
+        KernelBinding(kernel_id=f"{retired_dsl}_mixed_quant_sparse_flash_mla", backend="CANN", arch_family="dav_3510", readiness="shipping")
     with pytest.raises(ModelingError, match="kernel_binding_backend_unknown"):
-        KernelBinding(kernel_id="kda_fused", backend="retired-legacy-dsl", arch_family="dav_3510")  # type: ignore[arg-type]
+        KernelBinding(kernel_id="kda_fused", backend="retired-legacy-dsl", arch_family="dav_3510", readiness="shipping")  # type: ignore[arg-type]
     with pytest.raises(ModelingError, match="owner_residency_ub_overflow"):
         OwnerMemoryResidency(ub_live_bytes=300_000, ub_capacity_bytes=262_144)
 

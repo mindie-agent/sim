@@ -78,11 +78,15 @@ def _workload_geometry(parsed, *, context: int | None,
                         else max(prompts or [0]))
     resolved_query = (int(query_tokens) if query_tokens is not None
                       else DEFAULT_QUERY_TOKENS)
+    dp_replicas = max(1, int(parallel.dp))
+    per_dp_requests = (
+        (len(prompts) + dp_replicas - 1) // dp_replicas
+        if prompts else int(parsed.runtime.max_num_seqs)
+    )
     return {
         "context": resolved_context,
         "query_tokens_per_sequence": resolved_query,
-        "sequences_per_dp": max(1, min(int(parsed.runtime.max_num_seqs),
-                                      int(parallel.dp))),
+        "sequences_per_dp": max(1, min(int(parsed.runtime.max_num_seqs), per_dp_requests)),
     }
 
 
@@ -132,12 +136,15 @@ def _evaluate_sku(payload: Mapping[str, Any]) -> dict[str, Any]:
     case_dict = payload["case"]
     parsed = parse_case(case_dict)
     geometry = payload["geometry"]
+    from .prediction.evaluation import EvaluationContext
+    eval_ctx = EvaluationContext.create(parsed)
     effective = analyze_network_efficiency(
         parsed, phase=payload["phase"],
         tokens=geometry["query_tokens_per_sequence"],
         context=geometry["context"],
         sequences=geometry["sequences_per_dp"],
         scope=payload["scope"],
+        evaluation_context=eval_ctx,
     )
     sla = solve_sla_sizing(
         parsed, sla_ms=payload["sla_ms"], context=geometry["context"],
@@ -145,6 +152,7 @@ def _evaluate_sku(payload: Mapping[str, Any]) -> dict[str, Any]:
         max_sequences_per_dp=payload["max_batch"], phase=payload["phase"],
         scope=payload["scope"], scenarios=[payload["scenario"]],
         sensitivity=payload["sensitivity"], jobs=1, base_b_hint=1,
+        evaluation_context=eval_ctx,
     )
     return {
         "sku": payload["sku"],
@@ -216,12 +224,41 @@ def compare_skus(
     base_kwargs = _compose_kwargs(model, compose_options)
     if quant is not None:
         base_kwargs["quant"] = quant
+    from .schema.common import ModelingError
+
     resolved: list[tuple[str, dict[str, Any]]] = []
     for spec in skus:
         label = _resolve_sku_label(spec)
-        composed = compose_case(hardware=spec if isinstance(spec, str) else
-                                str(spec.get("base_hardware") or "a5"),
-                                **base_kwargs)
+        if isinstance(spec, str):
+            hardware_target: Any = spec
+        elif isinstance(spec, Mapping):
+            base_hw = spec.get("base_hardware")
+            has_inline_hw = (
+                ("device" in spec and "links" in spec)
+                or any(k in spec for k in (
+                    "archetype", "hbm_gb", "hbm_bw_gbps", "cube_fp16_tflops",
+                ))
+            )
+            if base_hw:
+                extras = {
+                    k: v for k, v in spec.items()
+                    if k not in {"name", "base_hardware"}
+                }
+                if extras:
+                    hardware_target = {**extras, "sku": str(spec.get("sku") or base_hw)}
+                else:
+                    hardware_target = str(base_hw)
+            elif spec.get("sku") or has_inline_hw:
+                hardware_target = dict(spec)
+                if not hardware_target.get("sku"):
+                    hardware_target["sku"] = str(spec.get("name") or "CUSTOM_INLINE_SKU")
+            else:
+                raise ModelingError(
+                    f"sku_comparison_hardware_spec_missing:{label}"
+                )
+        else:
+            raise ModelingError(f"sku_comparison_invalid_spec:{spec!r}")
+        composed = compose_case(hardware=hardware_target, **base_kwargs)
         resolved.append((label, composed))
     geometry = _workload_geometry(parse_case(resolved[0][1]), context=context,
                                   query_tokens=query_tokens_per_sequence)
@@ -230,10 +267,9 @@ def compare_skus(
                  else list(DEFAULT_SLA_SCENARIOS))
     has_sla = sla_ms is not None and float(sla_ms) > 0.0
     per_sku_tasks = len(resolved) if has_sla else 0
-    work_units = max(1, per_sku_tasks * max(1, len(scenarios))) + len(resolved)
+    work_units = max(1, per_sku_tasks * max(1, len(scenarios)) + len(resolved))
     workers = runtime_advisor.resolve_jobs(
-        jobs, task_count=max(1, per_sku_tasks * max(1, len(scenarios))
-                             + len(resolved)),
+        jobs, task_count=work_units,
         per_worker_ram_gib=PER_WORKER_RAM_GIB)
     if emit_advisory:
         runtime_advisor.emit_heavy_run_notice(
@@ -249,15 +285,16 @@ def compare_skus(
     reports = _run_tasks(baseline_tasks, workers)
     hints = {row["sku"]: int(row.get("base_b_hint") or 1) for row in reports}
     follow_tasks = []
-    for label, case_dict in resolved:
-        for scenario in scenarios[1:]:
-            follow_tasks.append((_evaluate_scenario, {
-                "sku": label, "case": case_dict, "sla_ms": sla_ms,
-                "context": geometry["context"],
-                "query_tokens_per_sequence": geometry["query_tokens_per_sequence"],
-                "max_batch": max_batch, "phase": phase, "scope": scope,
-                "scenario": scenario, "sensitivity": sensitivity,
-                "base_b_hint": hints.get(label, 1)}))
+    if has_sla:
+        for label, case_dict in resolved:
+            for scenario in scenarios[1:]:
+                follow_tasks.append((_evaluate_scenario, {
+                    "sku": label, "case": case_dict, "sla_ms": sla_ms,
+                    "context": geometry["context"],
+                    "query_tokens_per_sequence": geometry["query_tokens_per_sequence"],
+                    "max_batch": max_batch, "phase": phase, "scope": scope,
+                    "scenario": scenario, "sensitivity": sensitivity,
+                    "base_b_hint": hints.get(label, 1)}))
     extra = _run_tasks(follow_tasks, workers) if follow_tasks else []
     by_sku = {row["sku"]: row for row in reports}
     for row in extra:

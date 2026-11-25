@@ -581,7 +581,7 @@ def test_grouped_matmul_aclnn_group_list_cache_disable_and_wave_hbm():
 
 def test_uncalibrated_matrix_helpers_return_neutral_defaults():
     from mindie_sim.prediction.call_builders import build_aclnn_call
-    from mindie_sim.prediction.operators.matrix.matrix_mapping import LEGACY_128_CANDIDATES, MappedMatmul
+    from mindie_sim.prediction.operators.matrix.matrix_mapping import MappedMatmul
     from mindie_sim.prediction.operators.matrix.matrix_mapping_owners import (
         matrix_kernel_floor_ms, matrix_kernel_setup_ms, primitive_cold_hbm_bps,
         primitive_p05_stride_conflict_bps, primitive_wave_cold_hbm_per_owner_bps, streamk_fixup_latency_ms,
@@ -597,8 +597,8 @@ def test_uncalibrated_matrix_helpers_return_neutral_defaults():
     assert primitive_cold_hbm_bps(big_ctx, **kw) > primitive_cold_hbm_bps(cal_ctx, **kw)
     cd_lg = build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": 4, "n": 4096, "k": 4096})
     cal_lg = ctx_of(cd_lg.ops[0])
-    cal_sel = MappedMatmul(candidates=LEGACY_128_CANDIDATES).select(cal_lg)[0]
-    assert cal_sel.tile_n == 256 and MappedMatmul(candidates=LEGACY_128_CANDIDATES).select(replace(cal_lg, primitive_table=None))[0] == cal_sel
+    cal_sel = MappedMatmul().select(cal_lg)[0]
+    assert cal_sel.tile_n == 256 and MappedMatmul().select(replace(cal_lg, primitive_table=None))[0] == cal_sel
     cd_big = build_aclnn_call({"api": "aclnnMatmul", "dtype": "bf16", "m": 1024, "n": 32768, "k": 8192})
     _, _, ctx_a5 = _calibrated_case_and_eval(DT_SKUS[0], cd_big.recipes)
     ctx_big = ctx_a5(cd_big.ops[0])

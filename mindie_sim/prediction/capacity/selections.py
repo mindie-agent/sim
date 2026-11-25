@@ -23,9 +23,9 @@ class _MemorySelectionsMixin:
         plan.resolve()
         refs = self._selected_refs(replica, stage, items)
         old_names = set(self.selected_items.get((replica, stage), {}))
-        drop = {(replica, "selected", name) for name in old_names}
+        drop = {(replica, "selected", stage, name) for name in old_names}
         extra = [
-            ((replica, "selected", name), (ref,))
+            ((replica, "selected", stage, name), (ref,))
             for name, ref in refs.items()
         ]
         hbm, host = self._state_usage(
@@ -33,9 +33,9 @@ class _MemorySelectionsMixin:
         if not self._usage_budget_ok(hbm, host):
             return False
         for name in old_names - set(refs):
-            self._set_ref((replica, "selected", name), ())
+            self._set_ref((replica, "selected", stage, name), ())
         for name, ref in refs.items():
-            self._set_ref((replica, "selected", name), (ref,))
+            self._set_ref((replica, "selected", stage, name), (ref,))
         self.selected_items[(replica, stage)] = dict(items)
         self.selected_plans[(replica, stage)] = plan
         self.selected_physical = {
@@ -121,7 +121,7 @@ class _MemorySelectionsMixin:
             name = f"selected:{getattr(effect, 'name', '')}"
             action = getattr(effect, "action", "")
             if action == "release":
-                staged_onchip.pop((replica, name), None)
+                staged_onchip.pop((replica, stage, name), None)
                 items = self._release_selected_item(replica, stage, items, name)
                 continue
             if action != "acquire":
@@ -129,7 +129,7 @@ class _MemorySelectionsMixin:
             if getattr(effect, "unit", "bytes") != "bytes":
                 return False
             if self._effect_is_onchip(effect):
-                staged_onchip[(replica, name)] = {
+                staged_onchip[(replica, stage, name)] = {
                     "pool": getattr(effect, "pool", ""),
                     "size": float(getattr(effect, "size", 0.0)),
                     "lifetime": getattr(effect, "lifetime", ""),
@@ -165,11 +165,12 @@ class _MemorySelectionsMixin:
         self.onchip_effects = staged_onchip
         for name, binding in bindings.items():
             if name in items:
-                self.effect_bindings[(replica, name)] = binding
+                self.effect_bindings[(replica, stage, name)] = binding
                 self.selected_released.discard((replica, stage, name))
-        for name in list(self.effect_bindings):
-            if name[0] == replica and name[1] not in items:
-                self.effect_bindings.pop(name, None)
+        for binding_key in list(self.effect_bindings):
+            if (binding_key[0] == replica and binding_key[1] == stage
+                    and binding_key[2] not in items):
+                self.effect_bindings.pop(binding_key, None)
         return True
 
     def _release_selected_item(
@@ -223,7 +224,8 @@ class _MemorySelectionsMixin:
                 "name": name, "released_bytes": released,
             })
         for binding_key in list(self.effect_bindings):
-            if binding_key[0] == replica and binding_key[1] not in items:
+            if (binding_key[0] == replica and binding_key[1] == stage
+                    and binding_key[2] not in items):
                 self.effect_bindings.pop(binding_key, None)
         return True
 

@@ -31,6 +31,7 @@ from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 
 from mindie_sim.prediction.execution.capture_barriers import normalized_capture_metadata
@@ -118,7 +119,7 @@ def _opaque_ids(ops: tuple[OpSpec, ...], book: RecipeBook) -> tuple[str, ...]:
             recipe = book.select(op)
         except TimeoutError:
             raise
-        except Exception:
+        except ModelingError:
             continue
         if isinstance(recipe, PlannedRecipe) and not getattr(
             recipe, "traffic_rewrite_capable", False
@@ -215,7 +216,9 @@ def fused_op_spec(candidate, *, phase: str | None = None,
         link += dict(op.work).get("link", 0.0)
     declared_matrix = sum(matrix.values())
     if cube > declared_matrix:
-        dtype = first.dtype or "bf16"
+        if not first.dtype:
+            raise ModelingError(f"fused_op_missing_dtype:{first.op_id}")
+        dtype = first.dtype
         matrix[dtype] = matrix.get(dtype, 0.0) + (cube - declared_matrix)
     flops = sum(matrix.values())
     allocations = tuple(analysis.worksheet.allocations) + tuple(
@@ -303,7 +306,8 @@ def fused_op_spec(candidate, *, phase: str | None = None,
     )
     return OpSpec(
         op_id=fused_id, family="native_fusion",
-        phase=phase or first.phase, stage=first.stage, layer=first.stage,
+        phase=phase or first.phase, stage=first.stage,
+        layer=(leader.layer if leader is not None else int(first.param("layer", 0))),
         requests=(), semantic_shape=semantic_shape,
         local_shape=local_shape, padded_shape=padded_shape,
         launch_shape=launch_shape,
@@ -438,12 +442,19 @@ def add_prefetch(plan: CanonicalPlan, decision: PrefetchDecision,
     if prefetch_id in existing or release_id in existing:
         return None
     holder = PoolHolder(prefetch_id)
+    raw_layout = str(consumer.layout or "contiguous").strip().lower()
+    if raw_layout == "fractal_nz":
+        prefetch_layout = "nz"
+    elif raw_layout in {"contiguous", "nd", "nz", "strided", "view"}:
+        prefetch_layout = raw_layout
+    else:
+        prefetch_layout = "contiguous"
     prefetch = OpSpec(
         op_id=prefetch_id, family="prefetch", phase=consumer.phase,
         stage=consumer.stage, layer=consumer.layer, requests=(),
         semantic_shape=(1,), local_shape=(1,), padded_shape=(1,), launch_shape=(1,),
         hbm_bytes=float(decision.target_bytes), matrix_flops=(),
-        dtype=consumer.dtype, layout=consumer.layout, recipe=prefetch_id,
+        dtype=consumer.dtype, layout=prefetch_layout, recipe=prefetch_id,
         coverage="analytical_prototype", stream="prefetch",
         metadata=(("prefetch_target", decision.op_id),
                   ("prefetch_priority", decision.priority),
@@ -460,7 +471,7 @@ def add_prefetch(plan: CanonicalPlan, decision: PrefetchDecision,
         # Hold the L1 grant until both the consumer kernel and the producer
         # copy have retired; the consumer alone can outlive a delayed copy.
         deps=(consumer.op_id, prefetch_id), recipe=release_id, coverage="pool_release",
-        dtype=consumer.dtype, layout=consumer.layout, stream=consumer.stream or "main",
+        dtype=consumer.dtype, layout=prefetch_layout, stream=consumer.stream or "main",
         metadata=(("prefetch_release_for", prefetch_id),
                   ("prefetch_target", decision.op_id),
                   ("prefetch_priority", decision.priority),

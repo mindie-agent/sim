@@ -416,6 +416,12 @@ def declare_gate_up_fusion_group(*, ops, runtime, prefix, activation, gate_ops,
         "lines": list(SITU_OVERLAY_ADAPTER_LINES), "symbol": "RunV2Core",
         "scope": "independent_source_semantics; not_capture_binary_identity",
     }
+    f_status, f_reason = _probe_grouped_moe_fusion_status(
+        runtime=runtime, activation=activation, gate=gate,
+        gate_meta=gate_meta, down_meta=down_meta,
+        latent=latent, expert_width=expert_width,
+        local_experts=local_experts, situ_mx_domain=situ_mx_domain,
+    )
     declare_group(
         ops, key=group_key, role=group_role, family="moe",
         members=(*(g.op_id for g in gate_ops), activation.op_id),
@@ -449,13 +455,209 @@ def declare_gate_up_fusion_group(*, ops, runtime, prefix, activation, gate_ops,
                            else "complete_subgraph"),
                   "limitations": ["native_binary_and_scalar_flags_not_established",
                                   "expected_expert_counts_are_not_observed_routing"]},
-        fusion_status=("fused_new_kernel_required"
-                       if activation.family == "situ" else "fused_framework_enable"),
-        fusion_reason=("situ_mx_grouped_gate_up_target_fusion"
-                       if activation.family == "situ"
-                       else "grouped_matmul_swiglu_quant_eligible"),
+        fusion_status=f_status,
+        fusion_reason=f_reason,
     )
     return True
+
+
+def _normalize_abi_dtype(dtype: str) -> str:
+    low = str(dtype or "").strip().lower()
+    aliases = {
+        "fp8_e4m3": "fp8_e4m3fn",
+        "fp8": "fp8_e4m3fn",
+        "mxfp4": "fp4_e2m1",
+        "fp4": "fp4_e2m1",
+        "e8m0": "fp8_e8m0",
+        "bfloat16": "bf16",
+        "float16": "fp16",
+        "float32": "fp32",
+    }
+    return aliases.get(low, low)
+
+
+def _build_moe_abi_query(
+    *,
+    target_arch: str,
+    sku: str,
+    abi_id: str,
+    act_kind: str,
+    rows: int,
+    latent: int,
+    expert_width: int,
+    local_experts: int,
+    in_dt: str,
+    w_dt: str,
+    out_dt: str,
+    in_scale: str,
+    out_scale: str,
+    in_group: tuple[int, ...],
+):
+    from mindie_sim.schema.abi import AbiQueryKey, OperandPortSig
+
+    if abi_id == "aclnnGroupedMatmulSwigluQuant":
+        w_qmode = "w4a8_int" if w_dt == "int4" else "per_channel_int8"
+        ws_dt = "uint64" if w_dt == "int4" else "fp32"
+        ws_qmode = "none" if w_dt == "int4" else "dense"
+        operands = (
+            OperandPortSig(
+                role="x", dtype=in_dt, layout="ND", transposed=False,
+                shape=(rows, latent), quant_mode="per_token_int8",
+                group_shape=(), scale_dtype="fp32", scale_shape=(rows,),
+            ),
+            OperandPortSig(
+                role="weight", dtype=w_dt, layout="FRACTAL_NZ", transposed=False,
+                shape=(latent, 2 * expert_width), quant_mode=w_qmode,
+                group_shape=(), scale_dtype="fp32", scale_shape=(2 * expert_width,),
+            ),
+            OperandPortSig(
+                role="weight_scale", dtype=ws_dt, layout="ND", transposed=False,
+                shape=(2 * expert_width,), quant_mode=ws_qmode,
+                group_shape=(), scale_dtype="none", scale_shape=(),
+            ),
+            OperandPortSig(
+                role="x_scale", dtype="fp32", layout="ND", transposed=False,
+                shape=(rows,), quant_mode="dense",
+                group_shape=(), scale_dtype="none", scale_shape=(),
+            ),
+            OperandPortSig(
+                role="group_list", dtype="int64", layout="ND", transposed=False,
+                shape=(max(1, local_experts),), quant_mode="none",
+                group_shape=(), scale_dtype="none", scale_shape=(),
+            ),
+        )
+    else:
+        if in_dt == "fp8_e4m3fn":
+            x_qmode, w_qmode = "mx_fp8", ("mx_fp4" if w_dt == "fp4_e2m1" else "mx_fp8")
+        elif in_dt == "fp4_e2m1":
+            x_qmode, w_qmode = "mx_fp4", "mx_fp4"
+        elif in_dt in {"bf16", "fp16", "fp32"}:
+            x_qmode, w_qmode = "dense", "dense"
+        else:
+            x_qmode = "per_token_int8"
+            w_qmode = "w4a8_int" if w_dt == "int4" else "per_channel_int8"
+        operands = (
+            OperandPortSig(
+                role="x", dtype=in_dt, layout="ND", transposed=False,
+                shape=(rows, latent), quant_mode=x_qmode,
+                group_shape=in_group, scale_dtype=in_scale, scale_shape=(rows,),
+            ),
+            OperandPortSig(
+                role="w", dtype=w_dt, layout="FRACTAL_NZ", transposed=False,
+                shape=(latent, 2 * expert_width), quant_mode=w_qmode,
+                group_shape=in_group, scale_dtype=in_scale,
+                scale_shape=(2 * expert_width,),
+            ),
+        )
+    outputs = (
+        OperandPortSig(
+            role="y", dtype=out_dt, layout="ND", transposed=False,
+            shape=(rows, expert_width), quant_mode="dense",
+            group_shape=(), scale_dtype="none", scale_shape=(),
+        ),
+        OperandPortSig(
+            role="y_scale", dtype=out_scale, layout="ND", transposed=False,
+            shape=(rows,), quant_mode="none",
+            group_shape=(), scale_dtype="none", scale_shape=(),
+        ),
+    )
+    return AbiQueryKey(
+        soc_arch=target_arch,  # type: ignore[arg-type]
+        sku_id=sku,
+        abi_id=abi_id,
+        graph_motif=f"moe_grouped_gate_up_{act_kind}_quant",
+        model_scope="target",
+        draft_quant_mode="none",
+        pr_track="shipping",
+        operands=operands,
+        outputs=outputs,
+        rank_placement="local",
+        world_size=1,
+        comm_group_id="local",
+        comm_domain_width=1,
+        comm_dtype="none",
+        reduction_kind="none",
+        activation_kind=act_kind,
+        activation_params=(),
+        has_bias=False,
+        has_active_mask=False,
+        dispatch_quant_mode=0,
+        shared_experts_per_rank=0,
+        top_k=0,
+        moe_expert_num=max(1, local_experts),
+        qk_rope_head_dim=0,
+        mla_variant="none",
+        sfa_dcp_active=False,
+        pcp_size=1,
+        kv_cache_dtype="none",
+        has_kpool_indexer=False,
+        dcp_size=1,
+        is_act_and_mul=True,
+        enabled_stack_passes=frozenset(),
+    )
+
+
+def _probe_grouped_moe_fusion_status(
+    *,
+    runtime,
+    activation,
+    gate,
+    gate_meta,
+    down_meta,
+    latent: int,
+    expert_width: int,
+    local_experts: int,
+    situ_mx_domain: bool,
+) -> tuple[str, str]:
+    """Query canonical ``ProbedAbiRegistry.verify()`` for grouped MoE fusion status."""
+    from mindie_sim.backends.abi_registry import default_abi_registry
+    from mindie_sim.schema.abi import SOC_ARCHS
+
+    rt_meta = dict(getattr(runtime, "metadata", ()) or ())
+    arch = str(rt_meta.get("arch_family") or "").strip().upper()
+    sku = str(rt_meta.get("hardware_sku") or "generic_sku").strip().lower()
+    if arch and arch not in SOC_ARCHS:
+        return "fused_new_kernel_required", f"probed_abi_unsupported_arch:{arch}"
+
+    rows = max(1, int(gate.local_shape[0]) if getattr(gate, "local_shape", ()) else 1)
+    in_dt = _normalize_abi_dtype(gate_meta["activation_format"])
+    w_dt = _normalize_abi_dtype(gate_meta["weight_format"])
+    out_dt = _normalize_abi_dtype(down_meta["activation_format"])
+    in_scale = _normalize_abi_dtype(gate_meta.get("activation_scale_format") or "fp32")
+    out_scale = _normalize_abi_dtype(down_meta.get("activation_scale_format") or "fp32")
+    in_group = (
+        (MX32_SCALE_GROUP,)
+        if int(gate_meta.get("activation_group_size") or 0) == MX32_SCALE_GROUP
+        else ()
+    )
+    del situ_mx_domain
+    act_kind = "situ" if activation.family == "situ" else "swiglu"
+    # Grouped gate-up + activation fusion strictly requires an ABI with both
+    # input and weight ports (never activation-only ``aclnnDequantSituQuant``).
+    candidates = (
+        ("GroupedMatmulSituQuant",)
+        if activation.family == "situ"
+        else ("aclnnGroupedMatmulSwigluQuantV2", "aclnnGroupedMatmulSwigluQuant")
+    )
+    registry = default_abi_registry()
+    target_archs = (arch,) if arch in SOC_ARCHS else ("A5", "A3", "A2")
+    last_reason = "probed_abi_rejected"
+    for target_arch in target_archs:
+        for abi_id in candidates:
+            query = _build_moe_abi_query(
+                target_arch=target_arch, sku=sku, abi_id=abi_id, act_kind=act_kind,
+                rows=rows, latent=latent, expert_width=expert_width,
+                local_experts=local_experts, in_dt=in_dt, w_dt=w_dt,
+                out_dt=out_dt, in_scale=in_scale, out_scale=out_scale,
+                in_group=in_group,
+            )
+            verdict = registry.verify(query)
+            if verdict.status == "admitted_shipping":
+                return "fused_framework_enable", f"probed_abi_shipping:{verdict.matched_entry_id}"
+            if verdict.status == "admitted_proposed_pr":
+                return "fused_framework_enable", f"probed_abi_proposed:{verdict.matched_entry_id}"
+            last_reason = verdict.rejection_reason or last_reason
+    return "fused_new_kernel_required", f"probed_abi_rejected:{last_reason}"
 
 
 def routed_expert_work(op, *, n, k, weights, weight_kind, local_rows,
@@ -512,31 +714,71 @@ def routed_expert_work(op, *, n, k, weights, weight_kind, local_rows,
                    metadata=tuple(metadata.items()) + routing_metadata)
 
 
+_MX_QUANT_DTYPES = frozenset({"fp8_e4m3fn", "fp4_e2m1"})
+_MX_SCALE_DTYPES = frozenset({"fp8_e8m0", "e8m0", "uint8"})
+_SWIGLU_INT8_INPUT_DTYPES = frozenset({"bf16", "fp16"})
+_SITU_INT8_INPUT_DTYPES = frozenset({"int8", "int32"})
+
+
+def _resolve_activation_quant_abi(
+    act, quant, source_dtype: str,
+) -> tuple[str, dict | None] | None:
+    """Return ``(fused_kernel, row_program_or_none)`` strictly when ABI matches."""
+    q_meta = dict(quant.metadata)
+    in_fmt = _normalize_abi_dtype(str(act.dtype or source_dtype or ""))
+    out_fmt = _normalize_abi_dtype(str(q_meta.get("output_format") or quant.dtype or ""))
+    scale_fmt = _normalize_abi_dtype(str(
+        q_meta.get("activation_scale_format") or q_meta.get("scale_format") or ""
+    ))
+    group_size = int(q_meta.get("activation_group_size") or 0)
+    if act.family == "swiglu":
+        if (out_fmt in _MX_QUANT_DTYPES
+                and group_size == SWIGLU_MX_GROUP
+                and scale_fmt in _MX_SCALE_DTYPES):
+            return (
+                "npu_swiglu_mx_quant",
+                {"aiv_units": SWIGLU_MX_AIV_UNITS,
+                 "group_size": SWIGLU_MX_GROUP,
+                 "stages": SWIGLU_MX_STAGES},
+            )
+        if out_fmt == "int8" and in_fmt in _SWIGLU_INT8_INPUT_DTYPES and scale_fmt in {"fp32", ""}:
+            return ("aclnnSwiGluQuant", None)
+        return None
+    if act.family == "situ":
+        if out_fmt == "int8" and in_fmt in _SITU_INT8_INPUT_DTYPES and scale_fmt in {"fp32", ""}:
+            return ("aclnnDequantSituQuant", None)
+        return None
+    return None
+
+
 def activation_quant_fusion(ops, source_dtype):
-    """Fuse ``swiglu``/``situ``/``geglu`` + ``dynamic_quantize`` into one vector op."""
-    del source_dtype
+    """Fuse activation + ``dynamic_quantize`` only when activation & quant ABI match."""
     by_id, users = {op.op_id: op for op in ops}, users_map(ops)
     replacements, removed, aliases = {}, set(), {}
     for quant in ops:
         if quant.plan_required or quant.family != "quantize" or len(quant.deps) != 1:
             continue
         act = by_id.get(quant.deps[0])
-        if (act is None or act.plan_required or act.family not in {"swiglu", "situ", "geglu"}
+        if (act is None or act.plan_required or act.family not in {"swiglu", "situ"}
                 or float(dict(act.metadata).get("activation_limit", 0.0) or 0.0) > 0.0
                 or act.stage != quant.stage or act.stream != quant.stream):
             continue
         if users[act.op_id] != [quant.op_id]:
             continue
+        abi_match = _resolve_activation_quant_abi(act, quant, source_dtype)
+        if abi_match is None:
+            continue
+        fused_kernel, row_program = abi_match
         read = float(act.mte2_bytes)
         write = float(quant.mte3_bytes)
-        meta = dict(merge_meta(act, quant, extra=(
+        extra_meta = [
             ("fused_from", (act.family, "quantize")),
             ("primary_output", "payload"),
-            ("fused_kernel", "npu_swiglu_mx_quant"),
-            ("row_program", {"aiv_units": SWIGLU_MX_AIV_UNITS,
-                             "group_size": SWIGLU_MX_GROUP,
-                             "stages": SWIGLU_MX_STAGES}),
-        )))
+            ("fused_kernel", fused_kernel),
+        ]
+        if row_program is not None:
+            extra_meta.append(("row_program", row_program))
+        meta = dict(merge_meta(act, quant, extra=tuple(extra_meta)))
         append_audit(
             meta, kind="transform_boundary", op_id=quant.op_id,
             boundary={

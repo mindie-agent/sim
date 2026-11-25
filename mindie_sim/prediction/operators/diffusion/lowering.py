@@ -153,54 +153,6 @@ def lower_op(
     )
 
 
-def lower_mindie_sd_custom_op(
-    op_spec: OpSpec,
-    hardware: Mapping[str, Any] | None = None,
-    **options: Any,
-) -> dict[str, Any]:
-    """Lower one operator and return its work plus a disclosed Roofline view.
-
-    No hardware rate is defaulted.  Without declared ``cube_tflops``,
-    ``vector_tflops`` and ``hbm_bandwidth_gbps`` the result carries work and a
-    basis string instead of an invented duration.
-    """
-    lowered = lower_op(op_spec, **options)
-    meta = dict(lowered.metadata)
-    result: dict[str, Any] = {
-        "op_name": meta["mindie_sd_custom_op"],
-        "native_kind": meta["native_kind"],
-        "family": lowered.family,
-        "bound": meta["bound"],
-        "cube_flops": lowered.flops,
-        "vector_flops": lowered.vector_ops,
-        "memory_bytes": lowered.hbm_bytes,
-        "sparsity_ratio": float(meta.get("sparsity_ratio", 0.0)),
-        **({"laurel_rank": meta["laurel_rank"]} if "laurel_rank" in meta else {}),
-        "hardware": dict(hardware or {}),
-        "estimate_basis": "requires_declared_hardware_rates",
-        "estimated_us": None,
-    }
-    hw = dict(hardware or {})
-    required = ("cube_tflops", "vector_tflops", "hbm_bandwidth_gbps")
-    if hw:
-        if any(key not in hw for key in required):
-            result["estimate_basis"] = "declared_hardware_rates_incomplete"
-            result["lowered_op"] = lowered
-            return result
-        cube_tflops = float(hw["cube_tflops"])
-        vec_tflops = float(hw["vector_tflops"])
-        hbm_gbps = float(hw["hbm_bandwidth_gbps"])
-        if min(cube_tflops, vec_tflops, hbm_gbps) <= 0:
-            raise ModelingError("mindie_sd_hardware_rates_must_be_positive")
-        cube_us = lowered.flops / (cube_tflops * 1e6)
-        vec_us = lowered.vector_ops / (vec_tflops * 1e6)
-        mem_us = lowered.hbm_bytes / (hbm_gbps * 1e3)
-        result["estimated_us"] = max(cube_us, vec_us, mem_us)
-        result["estimate_basis"] = "declared_hardware_roofline"
-    result["lowered_op"] = lowered
-    return result
-
-
 def compute_mindie_sd_effective_denoising_steps(
     infer_steps: int,
     warmup_steps: int = 2,

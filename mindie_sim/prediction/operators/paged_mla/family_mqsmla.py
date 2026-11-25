@@ -13,16 +13,12 @@ from dataclasses import replace
 from mindie_sim.catalog.cache_format import CacheFormat, cache_format
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.prediction.mechanism import PlannedRecipe
-from .common import DSL_MQS_ABI
 from .mqsmla import (
     COMPRESSED_CACHE_ROW_BYTES,
     KV_QUANT_BF16,
     KV_QUANT_FP8,
     KV_QUANT_MXFP8,
     KV_QUANT_ROW_BYTES,
-    LEGACY_NATIVE_KIND,
-    LEGACY_RECIPE,
-    LEGACY_SOURCE,
     MQSMLA_HEAD_WIDTH,
     MQSMLA_ROPE_WIDTH,
     NATIVE_KIND,
@@ -32,8 +28,6 @@ from .mqsmla import (
     SUPPORTED_PHASES,
     supported_heads,
     build,
-    query_rows,
-    selective_fd_excluded,
 )
 #: The CANN 9.2.1 source-symbol spelling retained as an explicit alias.
 SOURCE_RECIPE = "mixed_quant_sparse_flash_mla"
@@ -99,9 +93,8 @@ def declared_quant_mode(op):
 
 
 def recipes():
-    """The official CANN recipe, its source-name alias and the archived prototype DSL."""
-    return {RECIPE: PlannedRecipe(build), SOURCE_RECIPE: PlannedRecipe(build),
-            LEGACY_RECIPE: PlannedRecipe(build)}
+    """The official CANN recipe and its source-name alias."""
+    return {RECIPE: PlannedRecipe(build), SOURCE_RECIPE: PlannedRecipe(build)}
 
 
 def query_shape(views, plan, *, topk_present=False):
@@ -155,15 +148,7 @@ def unsupported_reason(*, views, plan, parallel, model, padded_tokens,
            or (v.query_ranges and v.query_ranges != ((QUERY_ORIGIN, v.q_len),))
            for v in views):
         return "mqsmla_binding_requires_contiguous_unpadded_decode_or_draft_rows"
-    if cores is not None and implementation == LEGACY_RECIPE:
-        # ``SELECTIVE_FD_72`` is a retired custom-DSL geometry. The
-        # official CANN program accepts the same rows, so the refusal follows
-        # the explicitly selected implementation, never the row count alone.
-        rows = tuple(query_rows(query_shape(views, plan, topk_present=topk_present)))
-        if selective_fd_excluded(cores, rows):
-            return "mqsmla_selective_72_row_fd_branch_not_modeled"
-    if (implementation != LEGACY_RECIPE
-            and quant_mode_of(model, plan.head_dim) in {KV_QUANT_FP8, KV_QUANT_MXFP8}):
+    if quant_mode_of(model, plan.head_dim) in {KV_QUANT_FP8, KV_QUANT_MXFP8}:
         # A declared packed-quantized representation is itself the contract.  A
         # BF16 cache keeps the plain attention path: the packed native kernel is
         # a quantized-cache binding, never a relabel of a BF16 declaration.
@@ -188,6 +173,17 @@ def validate(*, views, plan, parallel, model, padded_tokens,
         raise ModelingError(reason)
 
 
+def _matches_dsl_formats(op) -> bool:
+    view = dict(getattr(op, "metadata", ()) or ()).get("attention_tensor_view") or {}
+    regions = view.get("cache_representations")
+    if not isinstance(regions, dict) or not regions:
+        return True
+    return all(
+        _region_format(regions.get(region)) == CacheFormat(**declaration)
+        for region, declaration in FORMATS.items()
+    )
+
+
 def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefix,
                     parallel=None, runtime=None):
     ids = set(outputs)
@@ -200,10 +196,9 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
     effective_ratio = (plan.compress_ratio if topk_present or plan.owns_long_kv
                        else NO_COMPRESSED_ROWS)
     implementation = str(getattr(selection, "name", RECIPE))
-    legacy = implementation == LEGACY_RECIPE
     quant_mode = declared_quant_mode(members[0])
-    if legacy and quant_mode is not None:
-        raise ModelingError("mqsmla_legacy_dsl_requires_mixed_fp8_fp4_cache")
+    if quant_mode is None and not _matches_dsl_formats(members[0]):
+        raise ModelingError("mqsmla_cache_representation_contract_required")
     shape = {"sequences": rows, "window": plan.window, "ratio": effective_ratio,
              "topk": plan.index_topk if topk_present else 0, "heads": heads,
              "width": MQSMLA_HEAD_WIDTH, "metadata_support_fd": False,
@@ -221,7 +216,13 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
             "implementation_binding": {
                 "selector": "mqsmla_attention", "implementation": implementation,
                 "capture_binary_identity": "not_established",
-                "source": LEGACY_SOURCE if legacy else SOURCE,
+                "abi_registry_verified": False,
+                "layout_contract": (
+                    "aclnn_packed_kv_mode"
+                    if quant_mode in {KV_QUANT_FP8, KV_QUANT_MXFP8}
+                    else "mixed_fp8_fp4_544_320"
+                ),
+                "source": SOURCE,
                 "coverage": "conditional_source_program",
                 "caller_unmodeled": ["separate_aicpu_metadata_generation",
                                       "original_window_index_generation"]},
@@ -235,35 +236,26 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
                 if quant_mode is not None else COMPRESSED_CACHE_ROW_BYTES,
                 "kv_quant_mode": quant_mode,
                 "compressed_cache": effective_ratio > 0},
-            "native_kind": LEGACY_NATIVE_KIND if legacy else NATIVE_KIND,
-            "aclnn_symbol": None if legacy else NATIVE_KIND,
+            "native_kind": NATIVE_KIND,
+            "aclnn_symbol": NATIVE_KIND,
             "native_call": {
                 "api": {
-                    "namespace": "cann_kernel" if legacy else "aclnn",
-                    "entry": (
-                        DSL_MQS_ABI
-                        if legacy else "cann_ops_transformer.ops.mixed_quant_sparse_flash_mla"
-                    ),
-                    "aclnn_symbol": None if legacy else NATIVE_KIND,
+                    "namespace": "aclnn",
+                    "entry": "cann_ops_transformer.ops.mixed_quant_sparse_flash_mla",
+                    "aclnn_symbol": NATIVE_KIND,
                 },
-                "source": LEGACY_SOURCE if legacy else SOURCE,
+                "source": SOURCE,
                 "kernels": [{
                     "name": "MixedQuantSparseFlashMla",
                     "role": "mix",
-                    "source_path": (
-                        LEGACY_SOURCE["kernel"]["path"]
-                        if legacy else SOURCE["path"]
-                    ),
-                    "source_sha256": (
-                        LEGACY_SOURCE["kernel"]["sha256"]
-                        if legacy else None
-                    ),
+                    "source_path": SOURCE["path"],
+                    "source_sha256": None,
                     "evidence": "source_declared",
                 }],
                 "execution_core": "mix",
             }}
     result = replace(members[0], op_id=prefix + ".mqsmla",
-                     recipe=LEGACY_RECIPE if legacy else RECIPE,
+                     recipe=RECIPE,
                      deps=tuple(dict.fromkeys(dep for op in members for dep in op.deps)),
                      semantic_shape=query,
                      local_shape=query,

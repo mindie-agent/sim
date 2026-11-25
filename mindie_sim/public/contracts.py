@@ -428,6 +428,9 @@ def _import_workspace_module(path: Path) -> tuple[Any, str]:
         sys.meta_path.insert(0, _SnapshotFinder(root, snapshot))
         try:
             spec.loader.exec_module(module)
+        except TimeoutError:
+            sys.modules.pop(module_name, None)
+            raise
         except ExtensionError:
             sys.modules.pop(module_name, None)
             raise
@@ -472,6 +475,8 @@ def _installed(value: Any, *, package: str = "") -> Extension:
     entry_point = _entry_point(value)
     try:
         loaded = entry_point.load()
+    except TimeoutError:
+        raise
     except ExtensionError:
         raise
     except Exception as exc:

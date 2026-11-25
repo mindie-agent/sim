@@ -380,8 +380,8 @@ _VALID_READINESS: frozenset[str] = frozenset({
 })
 
 
-def _resolve_readiness(runtime: Any, *, family_kind: str) -> str:
-    """Resolve KernelBinding readiness strictly from explicit metadata or canonical StackTrack."""
+def _resolve_readiness(runtime: Any, *, family_kind: str, arch_family: str = "") -> str:
+    """Resolve KernelBinding readiness strictly from explicit metadata, StackTrack, or ProbedAbiRegistry."""
     rt_meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
     if bool(rt_meta.get("raw_eager", False)):
         raise ModelingError("recover_ssm_incompatible_with_eager_track")
@@ -417,7 +417,13 @@ def _resolve_readiness(runtime: Any, *, family_kind: str) -> str:
             return stack_track
         if stack_track in _TRACK_TO_READINESS:
             return _TRACK_TO_READINESS[stack_track]
-    # Hook point for Step 2 wiring against mindie_sim/backends/abi_registry.py.
+    arch = str(arch_family or rt_meta.get("arch_family") or "").strip().upper()
+    if arch in {"A2", "A3", "A5"}:
+        from mindie_sim.backends.abi_registry import default_abi_registry
+
+        kernel_id = GDN_COMMIT_KERNEL_ID if family_kind == "gdn" else KDA_COMMIT_KERNEL_ID
+        if default_abi_registry().is_shipping_available(kernel_id, arch):
+            return "shipping"
     raise ModelingError(f"recover_ssm_readiness_unresolved:{family_kind}")
 
 
@@ -431,7 +437,7 @@ def _commit_kernel_binding(
         arch_family=arch_family,
         submodule="recurrent_state",
         macro_module="attention",
-        readiness=_resolve_readiness(runtime, family_kind=family_kind),  # type: ignore[arg-type]
+        readiness=_resolve_readiness(runtime, family_kind=family_kind, arch_family=arch_family),  # type: ignore[arg-type]
         recipe_id="recover_ssm_commit",
     )
 

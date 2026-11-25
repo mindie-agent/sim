@@ -40,10 +40,11 @@ def conditions_context(context, identity=None) -> dict[str, Any]:
     # conditions use declared roles and the hardware units (for example
     # ``rates.hbm`` in B/s).  Publish both views, with the role view converted
     # exactly once from the same physical rate.
-    rates = dict(context.rates or {})
+    raw_rates = dict(context.rates or {})
+    rates = dict(raw_rates)
     for role, physical in dict(context.resource_names or {}).items():
-        if physical in rates:
-            rates[role] = float(rates[physical]) * 1000.0
+        if physical in raw_rates:
+            rates[role] = float(raw_rates[physical]) * 1000.0
     return {
         **identity,
         "hardware": hardware.get("key") or hardware.get("architecture") or "",

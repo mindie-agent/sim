@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
+import re
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from .matrix_mapping import matrix_geometry
@@ -48,7 +49,6 @@ ROUTER_TILE_N = 256
 #: Split-K slices are nonempty integer K elements; a split grid may never price
 #: more partials than the K extent can populate.
 ROUTER_K_GRANULE = 1
-ROUTER_PROLOGUE_DRAIN_CYCLES = 8250
 A5_AIC_UNITS = 32
 
 
@@ -125,19 +125,30 @@ def _router_recipe(op, geometry):
     rates = {names[role]: float(rate) / MS_PER_SECOND
              for role, rate in declared_rates.items() if role in names}
     peaks = dict(getattr(geometry, "compute_peaks", ()))
-    compute = str(dict(op.metadata).get("compute_format", op.dtype or "bf16"))
-    try:
-        peak = float(peaks[compute])
-    except KeyError:
-        cube = 0.0
+    compute = str(dict(op.metadata).get("compute_format") or op.dtype or "").strip()
+    if not compute:
+        raise ModelingError("router_compute_format_missing")
+    datapath = getattr(geometry, "datapath", None)
+    if datapath is not None and hasattr(datapath, "cube_peak"):
+        peak = float(datapath.cube_peak(compute))
     else:
+        try:
+            peak = float(peaks[compute])
+        except KeyError as exc:
+            raise ModelingError(f"router_compute_peak_missing:{compute}") from exc
+    try:
         cube = MS_PER_SECOND * float(op.flops) / peak
+    except ZeroDivisionError as exc:
+        raise ModelingError(f"router_compute_peak_invalid:{compute}") from exc
     context = RecipeContext(
         op, {names["cube"]: cube} if cube else {}, names, rates,
         int(getattr(geometry, "compute_units", A5_AIC_UNITS)),
         resource_units=units, compute_peaks=peaks,
         pool_capacities=dict(getattr(geometry, "buffers", {}) or ()),
-        physical_mechanisms=getattr(geometry, "physical_mechanisms", None))
+        physical_mechanisms=getattr(geometry, "physical_mechanisms", None),
+        compute_arch=getattr(geometry, "compute_arch", None),
+        datapath=getattr(geometry, "datapath", None),
+        primitive_table=getattr(geometry, "primitive_table", None))
     recipe, _record = SteadyMatmul().select(context, include_record=False)
     return recipe
 
@@ -152,20 +163,51 @@ def router_matrix_operand_bytes(op, geometry, *, recipe=None) -> float:
     """
     m, n, k = (int(value) for value in op.local_shape[-LOCAL_SHAPE_DIMS:])
     meta = dict(op.metadata)
-    input_bytes = float(m * k * dtype_bytes(
-        meta.get("input_format", op.dtype or "bf16")))
-    weight_bytes = float(n * k * dtype_bytes(
-        meta.get("weight_format", op.dtype or "bf16")))
+    input_fmt = str(meta.get("input_format") or op.dtype or "").strip()
+    weight_fmt = str(meta.get("weight_format") or op.dtype or "").strip()
+    if not input_fmt or not weight_fmt:
+        raise ModelingError("router_operand_format_missing")
+    input_bytes = float(m * k * dtype_bytes(input_fmt))
+    weight_bytes = float(n * k * dtype_bytes(weight_fmt))
     recipe = _router_recipe(op, geometry) if recipe is None else recipe
     return (input_bytes * -(-n // recipe.tile_n)
             + weight_bytes * -(-m // recipe.tile_m))
 
 
+_RESOURCE_RANK_RE = re.compile(r"@r(\d+)(?::|$)")
+
+
+def _resolve_l2_rank(obj, explicit_rank: int | None = None) -> int:
+    if explicit_rank is not None:
+        return int(explicit_rank)
+    rank = getattr(obj, "rank", None)
+    if rank is not None:
+        return int(rank)
+    names = getattr(obj, "resource_names", None) or {}
+    for key in ("l2", "hbm", "cube"):
+        res_name = names.get(key)
+        if isinstance(res_name, str):
+            match = _RESOURCE_RANK_RE.search(res_name)
+            if match is not None:
+                return int(match.group(1))
+    for res_name in names.values():
+        if isinstance(res_name, str):
+            match = _RESOURCE_RANK_RE.search(res_name)
+            if match is not None:
+                return int(match.group(1))
+    return 0
+
+
 def _geometry_partials_l2_resident(geometry, partial_bytes: float) -> bool:
-    """True when the die declares an L2 resource large enough for FP32 partials."""
+    """True when the die's live available L2 budget fits the FP32 partials."""
     units = getattr(geometry, "resource_units", None) or {}
     if "l2" not in units or partial_bytes <= 0.0:
         return False
+    view = getattr(geometry, "admission_memory_view", None)
+    if view is not None:
+        rank = _resolve_l2_rank(geometry)
+        avail = int(view.effective_l2_bytes(rank))
+        return avail > 0 and partial_bytes <= float(avail)
     l2_bytes = int((getattr(geometry, "buffers", None) or {}).get("l2", 0) or 0)
     if l2_bytes <= 0:
         hierarchy = getattr(getattr(geometry, "physical_mechanisms", None), "memory_hierarchy", None)
@@ -173,11 +215,16 @@ def _geometry_partials_l2_resident(geometry, partial_bytes: float) -> bool:
     return l2_bytes > 0 and partial_bytes <= float(l2_bytes)
 
 
-def _partials_l2_resident(context, partial_bytes: float) -> bool:
-    """True when FP32 Split-K partials fit die L2 and the Engine exposes an L2 pipe."""
+def _partials_l2_resident(context, partial_bytes: float, *, rank: int | None = None) -> bool:
+    """True when FP32 Split-K partials fit live available die L2 and L2 pipe exists."""
     names = getattr(context, "resource_names", None) or {}
     if "l2" not in names or partial_bytes <= 0.0:
         return False
+    view = getattr(context, "admission_memory_view", None)
+    if view is not None:
+        eff_rank = _resolve_l2_rank(context, explicit_rank=rank)
+        avail = int(view.effective_l2_bytes(eff_rank))
+        return avail > 0 and partial_bytes <= float(avail)
     from .matrix_mapping_owners import primitive_l2_params
     l2_bytes, _ = primitive_l2_params(context)
     if l2_bytes <= 0:
@@ -221,7 +268,9 @@ def build_router_splitk(op, geometry):
     resources["mte2"] = matrix_mte2
     matrix = dict(base.matrix)
     if not any(float(val) > 0.0 for val in matrix.values()) and float(op.flops) > 0.0:
-        compute_fmt = str(dict(op.metadata).get("compute_format") or "bf16")
+        compute_fmt = str(dict(op.metadata).get("compute_format") or op.dtype or "").strip()
+        if not compute_fmt:
+            raise ModelingError("router_compute_format_missing")
         matrix = {compute_fmt: float(op.flops)}
     base = Work(matrix=matrix, resources=resources)
     m, n, k = (int(value) for value in op.local_shape[-LOCAL_SHAPE_DIMS:])
@@ -251,24 +300,31 @@ def build_router_splitk(op, geometry):
     plan_work = base + extra
 
     def program(context):
-        clock_ms = _require_clock_hz(context, geometry) / MS_PER_SECOND
         extra_demand = context.bind(extra)
-        matrix_demand = {key: value - extra_demand.get(key, 0)
-                         for key, value in context.work.items()}
-        matrix_demand = {key: value for key, value in matrix_demand.items()
-                         if value > 0}
+        matrix_demand = {
+            key: value - extra_demand.get(key, 0.0)
+            for key, value in context.work.items()
+        }
+        matrix_demand = {
+            key: value for key, value in matrix_demand.items() if value > 0.0
+        }
         matrix_op = replace(
-            context.op, mte2_bytes=declared_mte2,
+            context.op,
+            mte2_bytes=declared_mte2,
             hbm_bytes=declared_mte2 + declared_mte3,
-            vector_ops=declared_vector)
-        body = splitk_program(
-            replace(context, op=matrix_op, work=matrix_demand), splits,
-            recipe=recipe, ws_l2_resident=ws_l2)
-        return KernelProgram((
-            Stage("router_prologue_drain",
-                  latency=ROUTER_PROLOGUE_DRAIN_CYCLES / clock_ms),
-            Stage("split_k", after=("router_prologue_drain",), program=body),
-        ))
+            vector_ops=declared_vector,
+        )
+        live_l2 = (
+            _partials_l2_resident(context, partial, rank=getattr(geometry, "rank", None))
+            if getattr(context, "admission_memory_view", None) is not None
+            else ws_l2
+        )
+        return splitk_program(
+            replace(context, op=matrix_op, work=matrix_demand),
+            splits,
+            recipe=recipe,
+            ws_l2_resident=live_l2,
+        )
 
     return OperatorPlan(plan_work, program, {
         "execution_abstraction": "finite_split_k_workspace",
@@ -657,8 +713,10 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
     vector_merge = (float(splits - 1) * total_m * n
                     if vector is not None else 0)
     pt = getattr(context, "primitive_table", None)
-    elem_bytes = int(dtype_bytes(dict(context.op.metadata).get(
-        "compute_format", context.op.dtype or "bf16")))
+    compute_fmt = str(dict(context.op.metadata).get("compute_format") or context.op.dtype or "").strip()
+    if not compute_fmt:
+        raise ModelingError("splitk_compute_format_missing")
+    elem_bytes = int(dtype_bytes(compute_fmt))
     tile_m_dim = min(total_m, float(recipe.tile_m)) if recipe is not None else total_m
     tile_n_dim = min(n, float(recipe.tile_n)) if recipe is not None else n
     tile_k_dim = int(recipe.tile_k) if recipe is not None else 0

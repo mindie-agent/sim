@@ -72,6 +72,8 @@ _REQUIRED_ATTAINMENT_KEYS = (
 _FP8_DTYPE_NAMES = frozenset({"fp8", "fp8_e4m3", "fp8_e4m3fn", "fp8_e5m2"})
 _MXFP8_DTYPE_NAMES = frozenset({"mxfp8", "mxfp8_e4m3", "paired_e8m0"})
 _FP32_DTYPE_NAMES = frozenset({"fp32", "float32"})
+_BF16_FP16_DTYPE_NAMES = frozenset({"bf16", "bfloat16", "fp16", "float16"})
+_VALID_CUBE_EPILOGUES = frozenset({"fixpipe", "dual_copy", "atomic_add"})
 
 
 def compute_tilelang_envelope_sha256(payload: Mapping[str, Any]) -> str:
@@ -246,20 +248,31 @@ class TileLangCalibration:
         hf32: bool = False,
     ) -> float:
         """Return capped (<= 1.0) Cube attainment multiplier vs AscendC L0."""
-        dt = str(dtype or "bf16").strip().lower()
-        epi = str(epilogue or "fixpipe").strip().lower()
+        dt = str(dtype or "").strip().lower()
+        if not dt:
+            raise ModelingError("tilelang_cube_attainment_dtype_required")
+        epi = str(epilogue or "").strip().lower()
+        if epi not in _VALID_CUBE_EPILOGUES:
+            raise ModelingError(f"tilelang_cube_attainment_epilogue_unsupported:{epi}")
         if blockscaled or dt in _MXFP8_DTYPE_NAMES:
             raw = self.eta_cube_mxfp8_blockscaled
         elif dt in _FP8_DTYPE_NAMES:
+            if epi == "atomic_add":
+                raise ModelingError(f"tilelang_cube_attainment_unsupported:{dt}:{epi}")
             raw = self.eta_cube_fp8_dualcopy_fp32 if epi == "dual_copy" else self.eta_cube_fp8_fixpipe
         elif dt in _FP32_DTYPE_NAMES:
+            if epi != "fixpipe":
+                raise ModelingError(f"tilelang_cube_attainment_unsupported:{dt}:{epi}")
             raw = self.eta_cube_hf32 if hf32 else self.eta_cube_fp32_ieee
-        elif epi == "dual_copy":
-            raw = self.eta_cube_bf16_dualcopy_fp32
-        elif epi == "atomic_add":
-            raw = self.eta_cube_bf16_atomic_fp32
+        elif dt in _BF16_FP16_DTYPE_NAMES:
+            if epi == "dual_copy":
+                raw = self.eta_cube_bf16_dualcopy_fp32
+            elif epi == "atomic_add":
+                raw = self.eta_cube_bf16_atomic_fp32
+            else:
+                raw = self.eta_cube_bf16_fixpipe
         else:
-            raw = self.eta_cube_bf16_fixpipe
+            raise ModelingError(f"tilelang_cube_attainment_dtype_unsupported:{dt}")
         return min(1.0, float(raw))
 
     def dma_attainment(

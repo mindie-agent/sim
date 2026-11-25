@@ -825,3 +825,67 @@ def test_wildcard_checkpoint_rules_resolve_across_eager_and_ideal_stacks_and_leg
     for retired in ("stack_registry", "stack_tracks", "runtime_profiles"):
         assert not (repo_root / "mindie_sim" / f"{retired}.py").exists()
         assert importlib.util.find_spec(f"mindie_sim.{retired}") is None
+
+
+def test_unified_cache_state_abi_preserves_bf16_and_ideal_target_avoids_1_plus_2k_double_count() -> None:
+    """Unified CacheStateABI preserves explicit BF16 (never fp16) and ideal-target avoids 1+2K double-counting."""
+    from mindie_sim.schema.checkpoint import CheckpointProvenance
+    from mindie_sim.schema.model import LayerPlan
+    from mindie_sim.schema.stack import IterationSchedulerState, resolve_checkpoint_cache_abis
+    from mindie_sim.schema.workload import IterationPlan
+
+    ckpt_bf16 = CheckpointQuantMap(
+        provenance=CheckpointProvenance(
+            checkpoint_id="fixture/bf16-cache",
+            source_format="explicit_synthetic_preset",
+            origin="explicit_synthetic_preset",
+        ),
+        native_float_dtype="fp16",
+        model_quant_type="FP16",
+        rules=(),
+        cache_rule=CacheQuantRule(kv_tag="BF16", index_tag="BF16"),
+    )
+    layers = (
+        LayerPlan(index=0, attention="gqa", num_heads=8, num_kv_heads=2, head_dim=128),
+        LayerPlan(index=1, attention="mla", num_heads=8, num_kv_heads=1, head_dim=512,
+                  kv_lora_rank=512, qk_rope_head_dim=64, indexer=True, index_dim=64, index_heads=4),
+    )
+    case = _minimal_case()
+    kv_abis, idx_abis, _ = resolve_checkpoint_cache_abis(
+        layers, ckpt_bf16, case.runtime.parallel, native_dtype="fp16", role="colocated", phase="decode",
+    )
+    assert kv_abis[0].planes[0].dtype == "bf16"
+    assert kv_abis[1].planes[0].dtype == "bf16"
+    assert idx_abis[0].planes[0].dtype == "bf16"
+    for stack_id, track in (("raw-eager", "eager"), ("ideal-target", "target")):
+        adapter = get_stack(stack_id)
+        s_opts = adapter.resolve_options(
+            case.model, case.machine, case.runtime.parallel,
+            role="colocated", track=track, requested_options={}, field_origins={},
+        )
+        qplan = adapter.resolve_quant_instantiation(
+            case.model, ckpt_bf16, case.machine, case.runtime.parallel, s_opts,
+            role="colocated", phase="decode",
+        )
+        assert qplan.kv_cache_abi and qplan.kv_cache_abi[0].planes[0].dtype == "bf16"
+
+    # Ideal-target speculative decode must emit q_len=1 and draft_proposal_tokens=K (total 1+K=4, never 1+2K=7).
+    ideal = get_stack("ideal-target")
+    opts = ideal.resolve_options(
+        case.model, case.machine, case.runtime.parallel,
+        role="colocated", track="target", requested_options={"speculative_k": 3}, field_origins={},
+    )
+    state = IterationSchedulerState(
+        now_ms=0.0,
+        ready_request_ids=("r0",),
+        request_priorities=(("r0", 0),),
+        request_progress=(("r0", 16, 8),),
+        max_num_seqs=4,
+        max_num_batched_tokens=4,
+    )
+    decision = ideal.plan_iteration(case.model, state, opts, phase="decode")
+    assert isinstance(decision, IterationPlan)
+    assert len(decision.requests) == 1
+    view = decision.requests[0]
+    assert view.q_len == 1 and view.draft_proposal_tokens == 3
+    assert view.q_len + view.draft_proposal_tokens == 4

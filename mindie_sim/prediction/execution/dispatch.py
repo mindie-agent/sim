@@ -471,8 +471,11 @@ def _complete_batch(execution, schedulers, plans, steps):
     for replica, items in steps.items():
         completion = execution.engine.submit(
             f"{execution.namespace}r{replica}:batch_complete", after=tuple(s.completion for s in items))
+        plan = plans[replica]
         result[replica] = replace(
-            items[0], completion=completion, operators=sum(s.operators for s in items),
+            items[0],
+            iteration=int(plan.iteration) if plan is not None else items[0].iteration,
+            completion=completion, operators=sum(s.operators for s in items),
             valid_tokens=sum(s.valid_tokens for s in items), padded_tokens=sum(s.padded_tokens for s in items),
             commits={request: event for item in items for request, event in item.commits.items()},
             declared_commits={request: event for item in items
