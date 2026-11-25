@@ -23,6 +23,11 @@ from typing import Any
 
 from mindie_sim.backends.ascend import DERIVED_ASCEND_SKUS
 from mindie_sim.prediction.capacity import Memory
+from mindie_sim.prediction.collectives.ports import (
+    VALID_HOST_DIRECTIONS,
+    host_dma_resources_for_dies,
+    host_transfer_demand,
+)
 from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.common import ModelingError
 
@@ -262,8 +267,22 @@ def resolve_sku_host_dma_rates(machine: Any) -> dict[str, Any]:
     elif isinstance(d2h_ch, Mapping) and d2h_ch.get("alpha_us") is not None:
         d2h_lat_us = float(d2h_ch["alpha_us"])
 
+    d2h_host_mem_bps: float | None = None
+    if dev_rates.get("host_memory", 0.0) > 0.0:
+        d2h_host_mem_bps = dev_rates["host_memory"]
+    elif p20.get("host_rc_d2h_bps"):
+        d2h_host_mem_bps = float(p20["host_rc_d2h_bps"])
+    elif isinstance(d2h_ch, Mapping):
+        node_peak = d2h_ch.get("node_peak_bw_gbps")
+        if node_peak is not None and not isinstance(node_peak, bool) and float(node_peak) > 0.0:
+            d2h_host_mem_bps = float(node_peak) * BYTES_PER_GB
+    if d2h_host_mem_bps is None:
+        d2h_host_mem_bps = host_mem_bps
+
     ddr_candidates = [v for v in (h2d_bps, host_mem_bps) if v is not None and v > 0.0]
     ddr_eff_gbps = (min(ddr_candidates) / BYTES_PER_GB) if ddr_candidates else None
+    d2h_candidates = [v for v in (d2h_bps, d2h_host_mem_bps) if v is not None and v > 0.0]
+    ddr_d2h_eff_gbps = (min(d2h_candidates) / BYTES_PER_GB) if d2h_candidates else None
     return {
         "sku": sku,
         "h2d_bps": h2d_bps,
@@ -278,6 +297,7 @@ def resolve_sku_host_dma_rates(machine: Any) -> dict[str, Any]:
         "h2d_is_effective": h2d_effective,
         "d2h_is_effective": d2h_effective,
         "ddr_effective_bw_gbps": ddr_eff_gbps,
+        "ddr_d2h_effective_bw_gbps": ddr_d2h_eff_gbps,
     }
 
 
@@ -299,6 +319,12 @@ class OffloadPolicy:
     kvc_prefetch_version: str = "v3"
     mtp_ffn_hit_rate: float = 0.0
     mtp_kvc_hit_rate: float = 0.0
+    ddr_h2d_bw_gbps: float | None = None
+    ddr_d2h_bw_gbps: float | None = None
+    ddr_h2d_bw_util: float | None = None
+    ddr_d2h_bw_util: float | None = None
+    ddr_h2d_latency_us: float | None = None
+    ddr_d2h_latency_us: float | None = None
 
     def __post_init__(self) -> None:
         for name in ("expert_offload_enabled", "force_expert_offload"):
@@ -309,18 +335,46 @@ class OffloadPolicy:
             _ratio(name, getattr(self, name))
         for name in ("ddr_bw_util", "ssd_bw_util"):
             _utilization(name, getattr(self, name))
-        if self.ddr_bw_gbps is not None:
-            _positive("ddr_bw_gbps", self.ddr_bw_gbps)
-        if self.ssd_bw_gbps is not None:
-            _positive("ssd_bw_gbps", self.ssd_bw_gbps)
+        for name in ("ddr_h2d_bw_util", "ddr_d2h_bw_util"):
+            if getattr(self, name) is not None:
+                _utilization(name, getattr(self, name))
+        for name in ("ddr_bw_gbps", "ddr_h2d_bw_gbps", "ddr_d2h_bw_gbps", "ssd_bw_gbps"):
+            if getattr(self, name) is not None:
+                _positive(name, getattr(self, name))
         for name in ("ddr_latency_us", "ssd_latency_us"):
             _nonnegative(name, getattr(self, name))
+        for name in ("ddr_h2d_latency_us", "ddr_d2h_latency_us"):
+            if getattr(self, name) is not None:
+                _nonnegative(name, getattr(self, name))
         if self.kvc_prefetch_version not in _PREFETCH_VERSIONS:
             raise ValueError(f"offload_policy_invalid_prefetch_version:{self.kvc_prefetch_version}")
         if self.kvc_ddr_ratio + self.kvc_ssd_ratio > 1.0 + 1e-12:
             raise ValueError("offload_policy_kvc_ratios_exceed_unity")
         if self.kvc_ssd_ratio > 0.0 and self.ssd_bw_gbps is None:
             raise missing_scenario_error(("ssd_bw_gbps",))
+
+    def ddr_bandwidth_gbps(self, direction: str) -> float | None:
+        """Resolved DDR bandwidth (GB/s) for one host DMA direction."""
+        if direction not in VALID_HOST_DIRECTIONS:
+            raise ModelingError(f"host_transfer_direction_invalid:{direction}")
+        specific = self.ddr_h2d_bw_gbps if direction == "h2d" else self.ddr_d2h_bw_gbps
+        return self.ddr_bw_gbps if specific is None else specific
+
+    def ddr_effective_rate_bytes_per_ms(self, direction: str) -> float | None:
+        """Resolved effective DDR transfer rate (bytes/ms) for one direction."""
+        bw = self.ddr_bandwidth_gbps(direction)
+        if bw is None:
+            return None
+        specific_util = self.ddr_h2d_bw_util if direction == "h2d" else self.ddr_d2h_bw_util
+        util = self.ddr_bw_util if specific_util is None else specific_util
+        return float(bw) * float(util) * BYTES_PER_MS_PER_GBPS
+
+    def ddr_startup_latency_us(self, direction: str) -> float:
+        """Resolved DDR startup latency (us) for one host DMA direction."""
+        if direction not in VALID_HOST_DIRECTIONS:
+            raise ModelingError(f"host_transfer_direction_invalid:{direction}")
+        specific = self.ddr_h2d_latency_us if direction == "h2d" else self.ddr_d2h_latency_us
+        return float(self.ddr_latency_us if specific is None else specific)
 
     @classmethod
     def from_mapping(cls, mapping: Mapping[str, Any] | None = None) -> "OffloadPolicy":
@@ -389,21 +443,55 @@ def resolve_case_offload_policy(case: CaseSpec, memory_policy: Any = None) -> Of
             merged[key] = getattr(memory_policy, key)
     if not merged:
         return None
-    ddr_active = (
+    h2d_needed = (
         float(merged.get("expert_ddr_ratio", 0.0) or 0.0) > 0.0
         or float(merged.get("kvc_ddr_ratio", 0.0) or 0.0) > 0.0
         or bool(merged.get("force_expert_offload", False))
     )
-    if ddr_active and merged.get("ddr_bw_gbps") is None:
+    d2h_needed = float(merged.get("kvc_ddr_ratio", 0.0) or 0.0) > 0.0
+    common_bw = merged.get("ddr_bw_gbps")
+    need_sku_h2d = h2d_needed and common_bw is None and merged.get("ddr_h2d_bw_gbps") is None
+    need_sku_d2h = d2h_needed and common_bw is None and merged.get("ddr_d2h_bw_gbps") is None
+    if need_sku_h2d or need_sku_d2h:
+        caller_set_dir_bw = (
+            merged.get("ddr_h2d_bw_gbps") is not None
+            or merged.get("ddr_d2h_bw_gbps") is not None
+        )
         host_rates = resolve_sku_host_dma_rates(case.machine)
-        sku_ddr_gbps = host_rates.get("ddr_effective_bw_gbps")
-        if sku_ddr_gbps is None or float(sku_ddr_gbps) <= 0.0:
-            raise ModelingError("missing_required_hardware_host_dma_rate:ddr_bw_gbps")
-        merged["ddr_bw_gbps"] = float(sku_ddr_gbps)
-        if "ddr_bw_util" not in merged and host_rates.get("h2d_is_effective"):
-            merged["ddr_bw_util"] = 1.0
-        if "ddr_latency_us" not in merged and host_rates.get("h2d_latency_us") is not None:
-            merged["ddr_latency_us"] = float(host_rates["h2d_latency_us"])
+        sku_h2d_gbps = host_rates.get("ddr_effective_bw_gbps")
+        sku_d2h_gbps = host_rates.get("ddr_d2h_effective_bw_gbps")
+        has_h2d = sku_h2d_gbps is not None and float(sku_h2d_gbps) > 0.0
+        has_d2h = sku_d2h_gbps is not None and float(sku_d2h_gbps) > 0.0
+        if need_sku_h2d and not has_h2d:
+            field = "ddr_h2d_bw_gbps" if has_d2h else "ddr_bw_gbps"
+            raise ModelingError(f"missing_required_hardware_host_dma_rate:{field}")
+        if need_sku_d2h and not has_d2h:
+            field = "ddr_d2h_bw_gbps" if has_h2d else "ddr_bw_gbps"
+            raise ModelingError(f"missing_required_hardware_host_dma_rate:{field}")
+        h2d_eff = bool(host_rates.get("h2d_is_effective"))
+        d2h_eff = bool(host_rates.get("d2h_is_effective"))
+        if need_sku_h2d:
+            merged["ddr_h2d_bw_gbps"] = float(sku_h2d_gbps)
+            if "ddr_bw_util" not in merged and "ddr_h2d_bw_util" not in merged:
+                merged["ddr_h2d_bw_util"] = 1.0 if h2d_eff else _DEFAULT_DDR_BANDWIDTH_UTILIZATION
+            if ("ddr_latency_us" not in merged
+                    and "ddr_h2d_latency_us" not in merged
+                    and host_rates.get("h2d_latency_us") is not None):
+                merged["ddr_h2d_latency_us"] = float(host_rates["h2d_latency_us"])
+        if need_sku_d2h:
+            merged["ddr_d2h_bw_gbps"] = float(sku_d2h_gbps)
+            if "ddr_bw_util" not in merged and "ddr_d2h_bw_util" not in merged:
+                merged["ddr_d2h_bw_util"] = 1.0 if d2h_eff else _DEFAULT_DDR_BANDWIDTH_UTILIZATION
+            if ("ddr_latency_us" not in merged
+                    and "ddr_d2h_latency_us" not in merged
+                    and host_rates.get("d2h_latency_us") is not None):
+                merged["ddr_d2h_latency_us"] = float(host_rates["d2h_latency_us"])
+        if not caller_set_dir_bw and need_sku_h2d:
+            merged["ddr_bw_gbps"] = float(sku_h2d_gbps)
+            if "ddr_bw_util" not in merged and h2d_eff and (not need_sku_d2h or d2h_eff):
+                merged["ddr_bw_util"] = 1.0
+            if "ddr_latency_us" not in merged and host_rates.get("h2d_latency_us") is not None:
+                merged["ddr_latency_us"] = float(host_rates["h2d_latency_us"])
     policy = OffloadPolicy.from_mapping(merged)
     if (policy.expert_ddr_ratio <= 0.0 and policy.kvc_ddr_ratio <= 0.0
             and policy.kvc_ssd_ratio <= 0.0 and not policy.force_expert_offload):
@@ -412,26 +500,37 @@ def resolve_case_offload_policy(case: CaseSpec, memory_policy: Any = None) -> Of
 
 
 def offload_resources(policy: OffloadPolicy | None, namespace: str, dp: int, pp: int) -> list[Any]:
-    """Build host DDR and SSD transfer resources for Execution when offload is active."""
+    """Build full-duplex host DDR (H2D/D2H) and SSD transfer resources for Execution."""
     if policy is None:
         return []
     from mindie_sim.prediction.engine import Resource
-    ddr_active = (
+    h2d_needed = (
         policy.expert_ddr_ratio > 0.0
         or policy.kvc_ddr_ratio > 0.0
         or policy.force_expert_offload
     )
-    if ddr_active and policy.ddr_bw_gbps is None:
-        raise ModelingError("missing_required_hardware_host_dma_rate:ddr_bw_gbps")
+    d2h_needed = policy.kvc_ddr_ratio > 0.0
+    h2d_rate = policy.ddr_effective_rate_bytes_per_ms("h2d")
+    d2h_rate = policy.ddr_effective_rate_bytes_per_ms("d2h")
+    if h2d_needed and h2d_rate is None:
+        field = "ddr_h2d_bw_gbps" if d2h_rate is not None else "ddr_bw_gbps"
+        raise ModelingError(f"missing_required_hardware_host_dma_rate:{field}")
+    if d2h_needed and d2h_rate is None:
+        field = "ddr_d2h_bw_gbps" if h2d_rate is not None else "ddr_bw_gbps"
+        raise ModelingError(f"missing_required_hardware_host_dma_rate:{field}")
     if policy.kvc_ssd_ratio > 0.0 and policy.ssd_bw_gbps is None:
         raise missing_scenario_error(("ssd_bw_gbps",))
     resources = []
     for replica in range(max(1, dp)):
         for stage in range(max(1, pp)):
-            if policy.ddr_bw_gbps is not None:
-                ddr_rate = policy.ddr_bw_gbps * policy.ddr_bw_util * BYTES_PER_MS_PER_GBPS
-                resources.append(Resource(f"{namespace}offload_ddr@r{replica}:s{stage}",
-                                          ddr_rate, "bytes", "fifo"))
+            if h2d_rate is not None:
+                resources.append(Resource(
+                    f"{namespace}offload_ddr_h2d@r{replica}:s{stage}",
+                    h2d_rate, "bytes", "fifo"))
+            if d2h_rate is not None:
+                resources.append(Resource(
+                    f"{namespace}offload_ddr_d2h@r{replica}:s{stage}",
+                    d2h_rate, "bytes", "fifo"))
             if policy.ssd_bw_gbps is not None:
                 ssd_rate = policy.ssd_bw_gbps * policy.ssd_bw_util * BYTES_PER_MS_PER_GBPS
                 resources.append(Resource(f"{namespace}offload_ssd@r{replica}:s{stage}",
@@ -439,15 +538,148 @@ def offload_resources(policy: OffloadPolicy | None, namespace: str, dp: int, pp:
     return resources
 
 
+def _ensure_host_dma_resources(execution: Any, machine: Any, dies: Sequence[Any]) -> None:
+    """Register physical directional host solo and RC Engine rows if missing."""
+    if machine is None or not dies:
+        return
+    host_res = host_dma_resources_for_dies(
+        machine, dies, namespace=execution.namespace
+    )
+    missing = [res for res in host_res if res.name not in execution.engine.resources]
+    if missing:
+        execution.engine.extend(missing)
+
+
+def _die_ddr_resource_name(execution: Any, replica: int, stage: int, direction: str, rank_id: int) -> str:
+    return f"{execution.namespace}offload_ddr_{direction}@r{replica}:s{stage}:d{rank_id}"
+
+
+def _ensure_die_ddr_resources(
+    execution: Any, replica: int, stage: int, direction: str, dies: Sequence[Any],
+) -> None:
+    """Register per-die directional FIFO DDR ports so distinct dies never serialize."""
+    if not dies:
+        return
+    stage_res_name = f"{execution.namespace}offload_ddr_{direction}@r{replica}:s{stage}"
+    stage_res = execution.engine.resources.get(stage_res_name)
+    rate = float(stage_res.rate) if stage_res is not None else None
+    if rate is None:
+        policy = getattr(execution, "offload_policy", None)
+        rate = policy.ddr_effective_rate_bytes_per_ms(direction) if policy is not None else None
+    if rate is None or rate <= 0.0:
+        return
+    from mindie_sim.prediction.engine import Resource
+    missing = []
+    seen: set[str] = set()
+    for idx, die in enumerate(dies):
+        rank_id = int(getattr(die, "rank", idx))
+        name = _die_ddr_resource_name(execution, replica, stage, direction, rank_id)
+        if name not in execution.engine.resources and name not in seen:
+            seen.add(name)
+            missing.append(Resource(name, rate, "bytes", "fifo"))
+    if missing:
+        execution.engine.extend(missing)
+
+
+def _host_ddr_work(
+    execution: Any,
+    replica: int,
+    stage: int,
+    direction: str,
+    ddr_bytes: float,
+    *,
+    rank_ddr_bytes: Mapping[int | None, float] | None = None,
+) -> dict[str, float]:
+    """Build coupled directional offload DDR + physical host_solo + RC + HBM work.
+
+    For uniform per-rank payloads across ``stage_dies``, charges ``1x`` payload
+    per die's directional DDR port and ``host_solo:{direction}:d{rank}``, ``1x``
+    onto HBM, and sums per-die payloads onto each die's
+    ``RootComplexKey(node, root_complex_id, direction)``. On multi-die stages,
+    each die owns an independent directional FIFO DDR port so distinct dies
+    transfer concurrently up to their shared Root Complex ceiling.
+    """
+    if direction not in VALID_HOST_DIRECTIONS:
+        raise ModelingError(f"host_transfer_direction_invalid:{direction}")
+    ddr_res = f"{execution.namespace}offload_ddr_{direction}@r{replica}:s{stage}"
+    hbm_res = execution.stage_names[replica, stage]["hbm"]
+    machine = getattr(getattr(execution, "case", None), "machine", None)
+    stage_dies = tuple(getattr(execution, "stage_dies", {}).get((replica, stage), ()) or ())
+    if machine is None or not stage_dies:
+        return {ddr_res: float(ddr_bytes), hbm_res: float(ddr_bytes)}
+    multi_die = len(stage_dies) > 1
+
+    if not rank_ddr_bytes or (len(rank_ddr_bytes) == 1 and None in rank_ddr_bytes):
+        _ensure_host_dma_resources(execution, machine, stage_dies)
+        demand = host_transfer_demand(
+            machine, stage_dies[0], direction, float(ddr_bytes),
+            namespace=execution.namespace, dies=stage_dies,
+        )
+        if multi_die:
+            _ensure_die_ddr_resources(execution, replica, stage, direction, stage_dies)
+            for idx, die in enumerate(stage_dies):
+                rank_id = int(getattr(die, "rank", idx))
+                demand[_die_ddr_resource_name(execution, replica, stage, direction, rank_id)] = float(ddr_bytes)
+        else:
+            demand[ddr_res] = float(ddr_bytes)
+        demand[hbm_res] = float(ddr_bytes)
+        return demand
+
+    unranked = float(rank_ddr_bytes.get(None, 0.0))
+    die_by_rank = {int(getattr(die, "rank", idx)): die for idx, die in enumerate(stage_dies)}
+    all_dies_by_rank = {
+        int(getattr(die, "rank", idx)): die
+        for idx, die in enumerate(getattr(machine, "dies", ()) or ())
+    }
+    per_die: dict[int, tuple[Any, float]] = {}
+    if unranked > 0.0:
+        for idx, die in enumerate(stage_dies):
+            rank_id = int(getattr(die, "rank", idx))
+            per_die[rank_id] = (die, unranked)
+    for rank, amount in rank_ddr_bytes.items():
+        if rank is None or float(amount) <= 0.0:
+            continue
+        rank_int = int(rank)
+        die = die_by_rank.get(rank_int)
+        if die is None and 0 <= rank_int < len(stage_dies):
+            die = stage_dies[rank_int]
+        if die is None:
+            die = all_dies_by_rank.get(rank_int, stage_dies[0])
+        rank_id = int(getattr(die, "rank", 0))
+        prev_die, prev_amt = per_die.get(rank_id, (die, 0.0))
+        per_die[rank_id] = (prev_die, prev_amt + float(amount))
+
+    participants = tuple(die for die, _ in per_die.values())
+    _ensure_host_dma_resources(execution, machine, participants)
+    if multi_die:
+        _ensure_die_ddr_resources(execution, replica, stage, direction, participants)
+    demand: dict[str, float] = {}
+    for rank_id, (die, amount) in per_die.items():
+        part = host_transfer_demand(
+            machine, die, direction, amount, namespace=execution.namespace,
+        )
+        for key, val in part.items():
+            demand[key] = demand.get(key, 0.0) + val
+        if multi_die:
+            die_res = _die_ddr_resource_name(execution, replica, stage, direction, rank_id)
+            demand[die_res] = demand.get(die_res, 0.0) + amount
+    solo_bytes = max((amt for _, amt in per_die.values()), default=float(ddr_bytes))
+    if not multi_die:
+        demand[ddr_res] = solo_bytes
+    demand[hbm_res] = solo_bytes
+    return demand
+
+
 def _submit_offload_transfer(
     engine: Any, name: str, work: Mapping[str, float], *,
     after: tuple[Any, ...], latency_us: float, owner: str,
+    coupled: bool = False,
 ) -> Any:
     startup_ms = float(latency_us) / NS_PER_US
     if startup_ms > 0.0:
         start = engine.submit(f"{name}:startup", after=after, latency=startup_ms, owner=owner)
-        return engine.submit(name, work, after=(start,), owner=owner)
-    return engine.submit(name, work, after=after, owner=owner)
+        return engine.submit(name, work, after=(start,), owner=owner, coupled=coupled)
+    return engine.submit(name, work, after=after, owner=owner, coupled=coupled)
 
 
 def _offload_memory_for(execution: Any) -> Memory:

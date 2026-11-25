@@ -16,23 +16,96 @@ from .policy import OffloadPolicy
 
 
 _INDEX_POOL_TAIL_COMPONENT_BYTES = 4
+_STRIDED_SPAN_ARITY = 4
+_RECURRENT_STATE_3D_RANK = 3
+_RECURRENT_STATE_4D_RANK = 4
+_SPAN_FORMATS = frozenset({"half_open", "start_count", "start_width_stride_count"})
+_PERSISTENT_STATE_POSITIONS = frozenset({"cache", "state", "tail", "layout"})
+_TRANSIENT_STORAGE_PREFIXES = (
+    "moe.act:", "moe.rx:", "act:", "activation:", "scratch:", "workspace:",
+    "tmp:", "temp:", "caller:",
+)
+_TRANSIENT_STORAGE_SUFFIXES = (":staging", "@candidate", ":tmp", ":temp")
 
 
-def _normalize_span(value) -> tuple[tuple[int, int], ...]:
-    """Stable hashable range identity for mapping and dataclass inputs."""
+def is_persistent_offload_access(access: "StateAccess") -> bool:
+    """True strictly for persistent cache/state storage eligible for DDR/SSD offload."""
+    if access.temporary or not access.persistent:
+        return False
+    if str(access.position) not in _PERSISTENT_STATE_POSITIONS:
+        return False
+    storage = str(access.storage or "").strip().lower()
+    if any(storage.startswith(prefix) for prefix in _TRANSIENT_STORAGE_PREFIXES):
+        return False
+    if any(storage.endswith(suffix) for suffix in _TRANSIENT_STORAGE_SUFFIXES):
+        return False
+    return True
+
+
+def _canonical_span_format(normalized: tuple[tuple[int, ...], ...], fmt: str) -> str:
+    """Canonical span format after normalizing contiguous spans to ``half_open``."""
+    if fmt == "start_width_stride_count" and any(
+        len(item) == _STRIDED_SPAN_ARITY for item in normalized
+    ):
+        return "start_width_stride_count"
+    return "half_open"
+
+
+def _normalize_span(
+    value, *, span_format: str = "half_open",
+) -> tuple[tuple[int, ...], ...]:
+    """Stable hashable span identity across half_open, start_count, and strided forms.
+
+    - ``"half_open"``: ``(start, end)`` pairs with ``0 <= start <= end``.
+    - ``"start_count"``: ``(start, count)`` pairs with ``start >= 0, count >= 0``,
+      converted once at the boundary to canonical half-open ``(start, start + count)``.
+    - ``"start_width_stride_count"``: symbolic ``(start, width, stride, count)``
+      descriptors with ``start >= 0, width > 0, count > 0, stride >= width``;
+      when every descriptor is contiguous (``count == 1`` or ``stride == width``),
+      canonicalizes directly to ``half_open`` ``(start, start + width * count)``.
+    """
+    fmt = str(span_format or "half_open")
+    if fmt not in _SPAN_FORMATS:
+        raise ValueError(f"state_access_span_format_invalid:{fmt}")
     if not value:
         return ()
-    normalized = []
+    if fmt == "start_width_stride_count":
+        quads: list[tuple[int, int, int, int]] = []
+        for item in value:
+            if isinstance(item, (str, bytes)):
+                raise ValueError("state_access_span_range_invalid")
+            raw = tuple(item)
+            if any(isinstance(part, bool) for part in raw):
+                raise ValueError("state_access_span_range_invalid")
+            if len(raw) != _STRIDED_SPAN_ARITY:
+                raise ValueError("state_access_span_strided_requires_quad")
+            start, width, stride, count = (
+                int(raw[0]), int(raw[1]), int(raw[2]), int(raw[3]),
+            )
+            if start < 0 or width <= 0 or count <= 0 or stride < width:
+                raise ValueError("state_access_span_range_invalid")
+            quads.append((start, width, width if count == 1 else stride, count))
+        if all(count == 1 or stride == width for _, width, stride, count in quads):
+            return tuple((start, start + width * count) for start, width, _, count in quads)
+        return tuple(quads)
+    normalized: list[tuple[int, ...]] = []
     for item in value:
         if isinstance(item, (str, bytes)):
             raise ValueError("state_access_span_range_invalid")
-        pair = tuple(item)
-        if len(pair) != 2:
-            raise ValueError("state_access_span_range_requires_pair")
-        start, end = int(pair[0]), int(pair[1])
-        if start < 0 or end < start:
+        raw = tuple(item)
+        if any(isinstance(part, bool) for part in raw):
             raise ValueError("state_access_span_range_invalid")
-        normalized.append((start, end))
+        if len(raw) != 2:
+            raise ValueError("state_access_span_range_requires_pair")
+        first, second = int(raw[0]), int(raw[1])
+        if fmt == "start_count":
+            if first < 0 or second < 0:
+                raise ValueError("state_access_span_range_invalid")
+            normalized.append((first, first + second))
+        else:
+            if first < 0 or second < first:
+                raise ValueError("state_access_span_range_invalid")
+            normalized.append((first, second))
     return tuple(normalized)
 
 
@@ -56,7 +129,7 @@ class StateAccess:
     output: str = ""
     storage: str = ""
     state_version: int | None = None
-    span: tuple[tuple[int, int], ...] = ()
+    span: tuple[tuple[int, ...], ...] = ()
     rank: int | None = None
     scope: str = "target"
     bytes: float = 0.0
@@ -65,9 +138,25 @@ class StateAccess:
     grant: str = ""
     decision: str = ""
     last_use: str = ""
+    span_format: str = "half_open"
+    byte_span: tuple[tuple[int, ...], ...] = ()
+    byte_span_format: str = "half_open"
+    span_unit: str = ""
+    persistent: bool = True
+    temporary: bool = False
 
     def __post_init__(self):
-        object.__setattr__(self, "span", _normalize_span(self.span))
+        fmt = str(self.span_format or "half_open")
+        norm_span = _normalize_span(self.span, span_format=fmt)
+        object.__setattr__(self, "span", norm_span)
+        object.__setattr__(self, "span_format", _canonical_span_format(norm_span, fmt))
+        bfmt = str(self.byte_span_format or "half_open")
+        norm_bspan = _normalize_span(self.byte_span, span_format=bfmt) if self.byte_span else ()
+        object.__setattr__(self, "byte_span", norm_bspan)
+        object.__setattr__(self, "byte_span_format", _canonical_span_format(norm_bspan, bfmt))
+        object.__setattr__(self, "span_unit", str(self.span_unit or ""))
+        object.__setattr__(self, "persistent", bool(self.persistent))
+        object.__setattr__(self, "temporary", bool(self.temporary))
         if self.direction not in {"read", "write", "alias"}:
             raise ValueError(f"state_access_direction_invalid:{self.direction}")
         if not self.occurrence or not self.producer:
@@ -79,12 +168,13 @@ class StateAccess:
     @property
     def key(self) -> tuple:
         # One outer occurrence can carry several physical writers.  The
-        # producer and stage are part of the physical access identity so two
-        # different stores under the same call are not collapsed into one
-        # issued write.
+        # producer, stage, and exact byte coverage are part of the physical
+        # access identity so disjoint slices within one cache line are never
+        # collapsed while equivalent span encodings deduplicate identically.
         return (self.occurrence, self.producer, self.stage, self.output,
-                self.storage, self.state_version, self.span, self.direction,
-                self.rank, self.request, self.scope)
+                self.storage, self.state_version, self.span, self.byte_span,
+                self.span_unit, self.direction, self.rank, self.request,
+                self.scope)
 
     def to_dict(self) -> dict:
         return {
@@ -93,6 +183,12 @@ class StateAccess:
             "direction": self.direction, "position": self.position,
             "output": self.output, "storage": self.storage,
             "state_version": self.state_version, "span": self.span,
+            "span_format": self.span_format,
+            "byte_span": self.byte_span,
+            "byte_span_format": self.byte_span_format,
+            "span_unit": self.span_unit,
+            "persistent": self.persistent,
+            "temporary": self.temporary,
             "rank": self.rank, "scope": self.scope, "bytes": self.bytes,
             "source": self.source, "reader": self.reader, "grant": self.grant,
             "decision": self.decision, "last_use": self.last_use,
@@ -112,7 +208,20 @@ def _as_access(value: Any) -> StateAccess:
         data.setdefault("output", "")
         data.setdefault("storage", "")
         data.setdefault("scope", "target")
-        data["span"] = _normalize_span(data.get("span", ()))
+        fmt = str(data.get("span_format") or "half_open")
+        norm_span = _normalize_span(data.get("span", ()), span_format=fmt)
+        data["span"] = norm_span
+        data["span_format"] = _canonical_span_format(norm_span, fmt)
+        raw_bspan = data.get("byte_span", ())
+        bfmt = str(data.get("byte_span_format") or fmt)
+        norm_bspan = _normalize_span(raw_bspan, span_format=bfmt) if raw_bspan else ()
+        data["byte_span"] = norm_bspan
+        data["byte_span_format"] = _canonical_span_format(norm_bspan, bfmt)
+        data["span_unit"] = str(data.get("span_unit") or data.pop("unit", "") or "")
+        temporary = bool(data.get("temporary", False))
+        raw_persistent = data.get("persistent")
+        data["temporary"] = temporary
+        data["persistent"] = (not temporary) if raw_persistent is None else bool(raw_persistent)
         data.setdefault("rank", None)
         data.setdefault("state_version", None)
         data.setdefault("source", "")
@@ -179,10 +288,22 @@ def _accesses_from_ops(work: Any, physical_ops=None) -> tuple[StateAccess, ...]:
            else tuple(getattr(work, "ops", ()) or ()))
     if not ops:
         return ()
+    all_ops = tuple(getattr(work, "ops", ()) or ()) or ops
+    cache_views_by_owner: dict[tuple[int, int, str], Mapping] = {}
+    for candidate in all_ops:
+        if str(getattr(candidate, "family", "")) != "cache_store":
+            continue
+        c_meta = dict(getattr(candidate, "metadata", ()) or ())
+        ctv = c_meta.get("cache_tensor_view")
+        if isinstance(ctv, Mapping):
+            c_scope = "draft" if c_meta.get("producer_scope") == "draft" else "target"
+            c_key = (int(getattr(candidate, "stage", 0)), int(getattr(candidate, "layer", -1)), c_scope)
+            cache_views_by_owner.setdefault(c_key, ctv)
     plan = getattr(work, "plan", None)
-    padding_ids = {str(view.request_id) for view in
-                   (getattr(plan, "requests", ()) or ())
+    plan_views = tuple(getattr(plan, "requests", ()) or ())
+    padding_ids = {str(view.request_id) for view in plan_views
                    if getattr(view, "padding", False)}
+    views_by_id = {str(view.request_id): view for view in plan_views}
     result = []
     for op in ops:
         meta = dict(getattr(op, "metadata", ()) or ())
@@ -219,24 +340,24 @@ def _accesses_from_ops(work: Any, physical_ops=None) -> tuple[StateAccess, ...]:
         if bool(meta.get("shared_owner", False)):
             continue
         if kind and str(getattr(op, "family", "")) == "cache_store":
-            write = float(getattr(op, "mte3_bytes", 0.0) or 0.0)
-            if write <= 0:
-                write = float(getattr(op, "hbm_bytes", 0.0) or 0.0) / 2.0
-            for request in requests:
-                result.append(StateAccess(
-                    occurrence=occurrence, producer=producer,
-                    request=request, stage=stage, layer=layer,
-                    direction="write", position="cache",
-                    output=bound_output or kind, storage=kind,
-                    bytes=write / max(1, len(requests)), scope=scope,
-                    source=producer,
-                ))
+            _append_cache_store_accesses(
+                result, op, meta, raw_requests, requests, views_by_id,
+                bound_output, kind, occurrence, producer, stage, layer, scope)
+            continue
+        sibling_ctv = cache_views_by_owner.get((stage, layer, scope))
+        gqa = meta.get("gqa_decode") or meta.get("gqa_prefill")
+        if not isinstance(gqa, Mapping):
+            gqa = _mixed_gqa_contract(op, meta, sibling_ctv)
+        if isinstance(gqa, Mapping):
+            _append_gqa_history_accesses(
+                result, meta, gqa, sibling_ctv, raw_requests, padding_ids,
+                bound_output, occurrence, producer, stage, layer, scope)
             continue
         contract = meta.get("gdn_state_contract")
         if contract:
             _append_gdn_state_accesses(
-                result, meta, contract, raw_requests, padding_ids, bound_output,
-                occurrence, producer, stage, layer, scope)
+                result, op, meta, contract, raw_requests, padding_ids,
+                bound_output, occurrence, producer, stage, layer, scope)
             continue
         read = float(meta.get("state_read_bytes", 0.0) or 0.0)
         write = float(meta.get("state_write_bytes", 0.0) or 0.0)
@@ -269,25 +390,392 @@ def _accesses_from_ops(work: Any, physical_ops=None) -> tuple[StateAccess, ...]:
     return tuple(result)
 
 
-def _append_gdn_state_accesses(
-    result, meta, contract, raw_requests, padding_ids, bound_output,
+def _request_cache_store_rows(view: Any, *, scope: str) -> int:
+    """Logical rows written to KV cache by one request view (0 for padding)."""
+    if getattr(view, "padding", False):
+        return 0
+    logical = int(getattr(view, "logical_q_len", getattr(view, "q_len", 0)) or 0)
+    if scope == "target" and getattr(view, "draft_verify", True):
+        proposal = int(getattr(view, "draft_proposal_tokens", 0) or 0)
+        if proposal > 0:
+            if getattr(view, "phase", "") == "decode":
+                return max(logical, 1 + proposal)
+            return logical + proposal
+    return max(0, logical)
+
+
+def _draft_cache_store_rows(meta: Mapping) -> dict[str, int]:
+    """Extract per-request draft row counts attached by ``_tag_draft_ops``."""
+    raw = meta.get("draft_rows_by_request")
+    if isinstance(raw, Mapping):
+        return {str(req): max(0, int(cnt or 0)) for req, cnt in raw.items()}
+    if isinstance(raw, (tuple, list)):
+        rows: dict[str, int] = {}
+        for item in raw:
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                rows[str(item[0])] = max(0, int(item[1] or 0))
+        return rows
+    return {}
+
+
+def _append_cache_store_accesses(
+    result, op, meta, raw_requests, requests, views_by_id,
+    bound_output, kind, occurrence, producer, stage, layer, scope,
+):
+    write = float(getattr(op, "mte3_bytes", 0.0) or 0.0)
+    if write <= 0.0:
+        write = float(getattr(op, "hbm_bytes", 0.0) or 0.0) / 2.0
+    ctv = meta.get("cache_tensor_view")
+    row_bytes = float(ctv.get("cache_row_bytes", 0.0) or 0.0) if isinstance(ctv, Mapping) else 0.0
+    if scope == "draft":
+        draft_rows = _draft_cache_store_rows(meta)
+        if draft_rows:
+            if row_bytes > 0.0:
+                for req in requests:
+                    req_bytes = float(draft_rows.get(str(req), 0)) * row_bytes
+                    if req_bytes > 0.0:
+                        result.append(StateAccess(
+                            occurrence=occurrence, producer=producer,
+                            request=req, stage=stage, layer=layer,
+                            direction="write", position="cache",
+                            output=bound_output or kind, storage=kind,
+                            bytes=req_bytes, scope=scope, source=producer,
+                        ))
+                return
+            if write > 0.0:
+                total_draft = 0
+                for req in raw_requests:
+                    key = str(req)
+                    if key in draft_rows:
+                        total_draft += draft_rows[key]
+                    elif key in views_by_id and getattr(views_by_id[key], "padding", False):
+                        total_draft += max(0, int(getattr(views_by_id[key], "q_len", 0) or 0))
+                if total_draft > 0:
+                    for req in requests:
+                        req_bytes = write * (float(draft_rows.get(str(req), 0)) / float(total_draft))
+                        if req_bytes > 0.0:
+                            result.append(StateAccess(
+                                occurrence=occurrence, producer=producer,
+                                request=req, stage=stage, layer=layer,
+                                direction="write", position="cache",
+                                output=bound_output or kind, storage=kind,
+                                bytes=req_bytes, scope=scope, source=producer,
+                            ))
+                    return
+
+    all_active_known = all(str(req) in views_by_id for req in requests)
+    all_raw_known = all(str(req) in views_by_id for req in raw_requests)
+
+    if row_bytes > 0.0 and scope == "target" and all_active_known:
+        for req in requests:
+            rows = _request_cache_store_rows(views_by_id[str(req)], scope=scope)
+            req_bytes = float(rows) * row_bytes
+            if req_bytes <= 0.0:
+                continue
+            result.append(StateAccess(
+                occurrence=occurrence, producer=producer,
+                request=req, stage=stage, layer=layer,
+                direction="write", position="cache",
+                output=bound_output or kind, storage=kind,
+                bytes=req_bytes, scope=scope, source=producer,
+            ))
+        return
+
+    if all_raw_known and write > 0.0:
+        total_phys = 0
+        for req in raw_requests:
+            view = views_by_id[str(req)]
+            if getattr(view, "padding", False):
+                total_phys += max(0, int(getattr(view, "q_len", 0) or 0))
+            else:
+                total_phys += _request_cache_store_rows(view, scope=scope)
+        if total_phys > 0:
+            for req in requests:
+                rows = _request_cache_store_rows(views_by_id[str(req)], scope=scope)
+                req_bytes = write * (float(rows) / float(total_phys))
+                if req_bytes <= 0.0:
+                    continue
+                result.append(StateAccess(
+                    occurrence=occurrence, producer=producer,
+                    request=req, stage=stage, layer=layer,
+                    direction="write", position="cache",
+                    output=bound_output or kind, storage=kind,
+                    bytes=req_bytes, scope=scope, source=producer,
+                ))
+            return
+
+    if write <= 0.0:
+        return
+    for req in requests:
+        result.append(StateAccess(
+            occurrence=occurrence, producer=producer,
+            request=req, stage=stage, layer=layer,
+            direction="write", position="cache",
+            output=bound_output or kind, storage=kind,
+            bytes=write / max(1, len(requests)), scope=scope,
+            source=producer,
+        ))
+
+
+def _is_plain_gqa_cache_representations(reprs: Any) -> bool:
+    """True when ``cache_representations`` declares only plain unpacked rows."""
+    if not isinstance(reprs, Mapping):
+        return False
+    for cfg in reprs.values():
+        if not isinstance(cfg, Mapping):
+            return False
+        if int(cfg.get("group_size", 0) or 0) > 0:
+            return False
+        scale = str(cfg.get("scale_dtype", "none") or "none").strip().lower()
+        if scale not in {"", "none"}:
+            return False
+        if int(cfg.get("suffix_elements", 0) or 0) > 0:
+            return False
+        if int(cfg.get("packed_elements", 1) or 1) != 1:
+            return False
+        if int(cfg.get("alignment", 1) or 1) > 1:
+            return False
+        if str(cfg.get("dtype", "") or "").strip().lower() == "fp4_e2m1":
+            return False
+    return True
+
+
+def _plain_cache_tensor_row_bytes(ctv: Mapping | None) -> float | None:
+    """Return exact plain unpacked KV row bytes from a sibling ``cache_tensor_view``.
+
+    Returns ``None`` if ``ctv`` is absent, or ``0.0`` if ``ctv`` declares
+    packed, block-quantized, scaled, or padded rows that must stay gated.
+    """
+    if not isinstance(ctv, Mapping):
+        return None
+    if int(ctv.get("cache_group_size", 0) or 0) > 0:
+        return 0.0
+    scale = str(ctv.get("cache_scale_dtype", "none") or "none").strip().lower()
+    if scale not in {"", "none"}:
+        return 0.0
+    key_dtype = str(ctv.get("key_dtype") or "").strip().lower()
+    val_dtype = str(ctv.get("value_dtype") or "").strip().lower()
+    if not key_dtype or not val_dtype or "fp4_e2m1" in {key_dtype, val_dtype}:
+        return 0.0
+    key_shape = ctv.get("key_shape")
+    if not isinstance(key_shape, (tuple, list)) or len(key_shape) < _RECURRENT_STATE_3D_RANK:
+        return None
+    kv_heads = int(key_shape[1] or 0)
+    head_dim = int(key_shape[2] or 0)
+    if kv_heads <= 0 or head_dim <= 0:
+        return None
+    from mindie_sim.schema.common import dtype_bytes
+    plain = float(kv_heads * head_dim) * (
+        float(dtype_bytes(key_dtype)) + float(dtype_bytes(val_dtype))
+    )
+    declared = float(ctv.get("cache_row_bytes", 0.0) or 0.0)
+    if declared > 0.0 and abs(declared - plain) > 1e-6:
+        return 0.0
+    return declared if declared > 0.0 else plain
+
+
+def _mixed_gqa_contract(
+    op: Any, meta: Mapping, sibling_ctv: Mapping | None,
+) -> dict[str, Any] | None:
+    """Build a plain GQA history contract for mixed prefill+decode attention ops."""
+    if str(getattr(op, "family", "")) != "attention":
+        return None
+    req_shapes = meta.get("request_shapes")
+    if not req_shapes:
+        return None
+    cp_pairs = meta.get("cp_per_rank_pairs") or ()
+    cp = len(cp_pairs) if isinstance(cp_pairs, (tuple, list)) and cp_pairs else 1
+    if cp > 1 or float(meta.get("selection_read_bytes", 0.0) or 0.0) > 0.0:
+        return None
+    if meta.get("prefix_shared_rows") or meta.get("prefix_read") or meta.get("sparse_prefix_unknown"):
+        return None
+    # Detect sliding-window truncation when local_shape records fewer rows than full causal kv_len.
+    local_shape = tuple(getattr(op, "local_shape", ()) or ())
+    full_rows = sum(
+        int(pair[0] or 0) + int(pair[1] or 0)
+        for pair in req_shapes
+        if isinstance(pair, (tuple, list)) and len(pair) >= 2
+    )
+    if len(local_shape) >= 2 and full_rows > 0 and int(local_shape[1] or 0) < full_rows:
+        return None
+    atv = meta.get("attention_tensor_view")
+    kv_heads = 0
+    head_dim = 0
+    if isinstance(atv, Mapping):
+        if str(atv.get("kv_storage") or "") == "none":
+            return None
+        kv_heads = int(atv.get("local_kv_heads", 0) or 0)
+        head_dim = int(atv.get("head_dim", 0) or 0)
+    if (kv_heads <= 0 or head_dim <= 0) and isinstance(sibling_ctv, Mapping):
+        key_shape = sibling_ctv.get("key_shape")
+        if isinstance(key_shape, (tuple, list)) and len(key_shape) >= _RECURRENT_STATE_3D_RANK:
+            kv_heads = int(key_shape[1] or 0)
+            head_dim = int(key_shape[2] or 0)
+    if kv_heads <= 0 or head_dim <= 0:
+        return None
+    return {
+        "requests": tuple(req_shapes),
+        "kv_heads": kv_heads,
+        "head_dim": head_dim,
+        "window": int(meta.get("window", 0) or 0),
+        "cp": cp,
+    }
+
+
+def _append_gqa_history_accesses(
+    result, meta, gqa, sibling_ctv, raw_requests, padding_ids, bound_output,
     occurrence, producer, stage, layer, scope,
 ):
-    # The original-slot contract is the physical access authority.
-    # Aggregate state_read/write_bytes are validated against a
-    # per-slot formula when the producer declared one; a conv contract
-    # that only declares state_write_bytes explicitly is split across
-    # its real active slots instead of being dropped.
-    state_dtype = str(contract.get("state_dtype")
-                      or meta.get("state_dtype") or "fp32")
+    """Bind plain dense/ragged GQA historical KV read spans from GQA contracts.
+
+    Packed/quantized K/V, shared prefixes, sliding windows, and CP ownership
+    bind through explicit physical ``memory_accesses``/``state_accesses`` emitted
+    by the attention lowering owner (``W2-OP01`` ``gqa_contracts.py``).
+    """
+    req_shapes = tuple(gqa.get("requests", ()) or ())
+    kv_heads = int(gqa.get("kv_heads", 0) or 0)
+    head_dim = int(gqa.get("head_dim", 0) or 0)
+    if not req_shapes or kv_heads <= 0 or head_dim <= 0:
+        return
+    if int(gqa.get("window", 0) or 0) > 0 or int(gqa.get("cp", 1) or 1) > 1:
+        return
+    atv = meta.get("attention_tensor_view")
+    if isinstance(atv, Mapping) and atv.get("cache_representations"):
+        if not _is_plain_gqa_cache_representations(atv["cache_representations"]):
+            return
+    ctv_row_bytes = _plain_cache_tensor_row_bytes(sibling_ctv)
+    if ctv_row_bytes == 0.0:
+        return
+    from mindie_sim.schema.common import dtype_bytes
+    if ctv_row_bytes is not None and ctv_row_bytes > 0.0:
+        row_bytes = ctv_row_bytes
+    elif isinstance(atv, Mapping) and atv.get("key_dtype") and atv.get("value_dtype"):
+        row_bytes = float(kv_heads * head_dim) * (
+            float(dtype_bytes(str(atv["key_dtype"])))
+            + float(dtype_bytes(str(atv["value_dtype"])))
+        )
+    else:
+        kv_dtype = str(gqa.get("kv_dtype") or "bf16")
+        row_bytes = float(2 * kv_heads * head_dim) * float(dtype_bytes(kv_dtype))
+    if row_bytes <= 0.0:
+        return
+    for slot, shape_pair in enumerate(req_shapes):
+        if not isinstance(shape_pair, (tuple, list)) or len(shape_pair) < 2:
+            continue
+        context = int(shape_pair[1] or 0)
+        if context <= 0:
+            continue
+        req = (
+            str(raw_requests[slot])
+            if slot < len(raw_requests)
+            else (str(raw_requests[0]) if len(raw_requests) == 1 else f"req:{slot}")
+        )
+        if req in padding_ids:
+            continue
+        result.append(StateAccess(
+            occurrence=occurrence, producer=producer,
+            request=req, stage=stage, layer=layer,
+            direction="read", position="cache",
+            output=bound_output or "gqa_kv", storage="gqa_kv",
+            span=((0, context),),
+            scope=scope, bytes=float(context) * row_bytes,
+            source=producer,
+        ))
+
+
+def _gdn_value_input_shapes(meta: Mapping, contract: Mapping) -> tuple[tuple[int, ...], ...]:
+    """Extract typed tensor layout shapes declared on a GDN state op."""
+    shapes: list[tuple[int, ...]] = []
+    for raw in (meta.get("state_value_inputs"), contract.get("value_inputs")):
+        if not isinstance(raw, (tuple, list)):
+            continue
+        for entry in raw:
+            if not isinstance(entry, Mapping):
+                continue
+            layout = entry.get("layout")
+            shape = layout.get("shape") if isinstance(layout, Mapping) else None
+            if isinstance(shape, (tuple, list)) and shape:
+                shapes.append(tuple(int(dim or 0) for dim in shape))
+    return tuple(shapes)
+
+
+def _gdn_conv_channels(op: Any, meta: Mapping, contract: Mapping) -> int:
+    """Resolve conv channel width without misreading flattened 1D ``local_shape``."""
+    for shape in _gdn_value_input_shapes(meta, contract):
+        if len(shape) >= 2 and shape[-1] > 0:
+            return int(shape[-1])
+    local_shape = tuple(getattr(op, "local_shape", ()) or ())
+    if len(local_shape) >= 2 and int(local_shape[-1] or 0) > 0:
+        return int(local_shape[-1])
+    return int(meta.get("channels", 0) or 0)
+
+
+def _gdn_recurrent_state_bytes(op: Any, meta: Mapping, contract: Mapping, element: float) -> float:
+    """Resolve per-request recurrent state bytes from contract dims or typed tensor shape."""
     heads = int(meta.get("heads", contract.get("heads", 0)) or 0)
     dk = int(meta.get("dk", contract.get("dk", 0)) or 0)
     dv = int(meta.get("dv", contract.get("dv", 0)) or 0)
+    if heads > 0 and dk > 0 and dv > 0:
+        return float(heads * dk * dv) * element
+    local_shape = tuple(int(dim or 0) for dim in (getattr(op, "local_shape", ()) or ()))
+    candidates = (local_shape,) + _gdn_value_input_shapes(meta, contract)
+    for shape in candidates:
+        if len(shape) >= _RECURRENT_STATE_4D_RANK:
+            elems = shape[1] * shape[2] * shape[3]
+            if elems > 0:
+                return float(elems) * element
+        if len(shape) == _RECURRENT_STATE_3D_RANK:
+            elems = shape[0] * shape[1] * shape[2]
+            if elems > 0:
+                return float(elems) * element
+    return 0.0
+
+
+def _append_gdn_state_accesses(
+    result, op, meta, contract, raw_requests, padding_ids, bound_output,
+    occurrence, producer, stage, layer, scope,
+):
+    # The original-slot contract is the physical access authority.
+    # Local chunk banks carry scope="local" and never hit host cache tiers;
+    # gather/scatter split cache_read and cache_publish directions explicitly.
+    contract_scope = str(contract.get("scope") or "").strip().lower()
+    target_kind = str(contract.get("target_kind") or "").strip().lower()
+    if contract_scope == "local" or target_kind == "local":
+        return
+    allow_read = contract_scope != "cache_publish"
+    allow_write = contract_scope != "cache_read"
+
+    from mindie_sim.schema.common import dtype_bytes
+    is_conv = (
+        target_kind == "conv"
+        or str(getattr(op, "family", "")) == "short_convolution"
+    )
+    if is_conv:
+        state_dtype = str(
+            meta.get("state_dtype") or contract.get("conv_state_dtype") or "bf16"
+        )
+        storage = str(
+            meta.get("state_layout")
+            or contract.get("conv_state_layout")
+            or contract.get("state_layout")
+            or "state"
+        )
+    else:
+        state_dtype = str(
+            contract.get("state_dtype") or meta.get("state_dtype") or "fp32"
+        )
+        storage = str(contract.get("state_layout", "state"))
     element = float(meta.get("state_element_bytes", 0.0) or 0.0)
     if not element:
-        from mindie_sim.schema.common import dtype_bytes
         element = float(dtype_bytes(state_dtype))
-    state_bytes = float(heads * dk * dv) * element
+    state_bytes = 0.0 if is_conv else _gdn_recurrent_state_bytes(op, meta, contract, element)
+    history_slots = int(meta.get("state_history_slots", contract.get("state_history_slots", 0)) or 0)
+    kernel_width = int(meta.get("kernel_width", contract.get("conv_kernel", 0)) or 0)
+    base_history = (kernel_width - 1) if kernel_width > 1 else history_slots
+    channels = _gdn_conv_channels(op, meta, contract) if is_conv else 0
+    conv_speculative = bool(meta.get("speculative", False))
+    conv_row_bytes = float(channels) * element if (is_conv and channels > 0 and base_history > 0) else 0.0
+    queries = tuple(contract.get("queries", ()) or meta.get("sequence_tokens", ()) or ())
     read_versions = tuple(contract.get("read_versions", ()))
     checkpoints = tuple(contract.get("checkpoints", ()))
     targets = tuple(contract.get("targets", ()))
@@ -307,33 +795,56 @@ def _append_gdn_state_accesses(
                                 else None),
             "checkpoint": (int(checkpoints[slot])
                            if slot < len(checkpoints) else 0),
+            "query": (int(queries[slot]) if slot < len(queries) else 1),
         })
-    for row in slot_rows:
-        row["read"] = (state_bytes
-                       if state_bytes > 0.0
-                       and row["read_version"] is not None else 0.0)
-        row["write"] = (state_bytes * row["checkpoint"]
-                        if state_bytes > 0.0 else 0.0)
+    if conv_row_bytes > 0.0:
+        for row in slot_rows:
+            row["read"] = (
+                float(base_history) * conv_row_bytes
+                if (allow_read and row["read_version"] is not None) else 0.0
+            )
+            if allow_write and row["checkpoint"] > 0:
+                write_slots = (
+                    base_history + max(0, row["query"] - 1)
+                    if (conv_speculative and kernel_width > 1)
+                    else base_history
+                )
+                row["write"] = float(write_slots) * conv_row_bytes
+            else:
+                row["write"] = 0.0
+    else:
+        for row in slot_rows:
+            row["read"] = (
+                state_bytes
+                if (allow_read and state_bytes > 0.0 and row["read_version"] is not None)
+                else 0.0
+            )
+            row["write"] = (
+                state_bytes * row["checkpoint"]
+                if (allow_write and state_bytes > 0.0) else 0.0
+            )
     aggregate_read = float(meta.get("state_read_bytes", 0.0) or 0.0)
     aggregate_write = float(meta.get("state_write_bytes", 0.0) or 0.0)
-    if state_bytes > 0.0:
+    if state_bytes > 0.0 or conv_row_bytes > 0.0:
         contract_read = sum(row["read"] for row in slot_rows)
         contract_write = sum(row["write"] for row in slot_rows)
-        for direction, aggregate, total in (
-                ("read", aggregate_read, contract_read),
-                ("write", aggregate_write, contract_write)):
+        checks = []
+        if allow_read:
+            checks.append(("read", aggregate_read, contract_read))
+        if allow_write:
+            checks.append(("write", aggregate_write, contract_write))
+        for direction, aggregate, total in checks:
             if aggregate > 0.0 and abs(aggregate - total) > 1e-9:
                 raise ValueError(
                     f"state_access_contract_total_mismatch:{direction}:"
                     f"{aggregate}:{total}")
-    else:
-        if slot_rows:
-            if aggregate_read > 0.0:
-                for row in slot_rows:
-                    row["read"] = aggregate_read / len(slot_rows)
-            if aggregate_write > 0.0:
-                for row in slot_rows:
-                    row["write"] = aggregate_write / len(slot_rows)
+    elif slot_rows:
+        if allow_read and aggregate_read > 0.0:
+            for row in slot_rows:
+                row["read"] = aggregate_read / len(slot_rows)
+        if allow_write and aggregate_write > 0.0:
+            for row in slot_rows:
+                row["write"] = aggregate_write / len(slot_rows)
     for row in slot_rows:
         if row["read"] > 0.0:
             result.append(StateAccess(
@@ -341,7 +852,7 @@ def _append_gdn_state_accesses(
                 request=row["request"], stage=stage, layer=layer,
                 direction="read", position="state",
                 output=row["target"],
-                storage=str(contract.get("state_layout", "state")),
+                storage=storage,
                 state_version=row["read_version"], span=((0, 1),),
                 scope=scope, bytes=row["read"], source=producer))
         if row["write"] > 0.0:
@@ -350,7 +861,7 @@ def _append_gdn_state_accesses(
                 request=row["request"], stage=stage, layer=layer,
                 direction="write", position="state",
                 output=row["target"],
-                storage=str(contract.get("state_layout", "state")),
+                storage=storage,
                 state_version=row["publish_version"],
                 span=((0, 1),), scope=scope, bytes=row["write"],
                 source=producer, decision=producer))
@@ -359,13 +870,16 @@ def _append_gdn_state_accesses(
 def project_state_tiers(
     accesses: Any, policy: OffloadPolicy, *, expected_bytes: float | None = None,
 ) -> tuple[dict, ...]:
-    """Project bound accesses into per-occurrence issued tier bytes.
+    """Project persistent cache/state accesses into per-occurrence issued tier bytes.
 
-    The returned records preserve request/rank/occurrence/output/storage/
-    version/span/direction and the source/reader/grant/decision/last-use
-    references.  No model layer or whole-request total is consulted.
+    Transient local activations (e.g. ``position="local"`` or ``moe.act:*``)
+    are excluded from host-tier offload projection while remaining intact in the
+    general execution memory ledger.
     """
-    bound = _unique_accesses(_as_accesses(accesses))
+    bound = tuple(
+        access for access in _unique_accesses(_as_accesses(accesses))
+        if is_persistent_offload_access(access)
+    )
     if expected_bytes is not None:
         if (isinstance(expected_bytes, bool)
                 or not isinstance(expected_bytes, (int, float))
@@ -376,10 +890,13 @@ def project_state_tiers(
             raise ValueError("state_access_total_bytes_mismatch")
     records = []
     for access in bound:
-        read = access.direction == "read"
-        scale = (1.0 - policy.mtp_kvc_hit_rate) if read else 1.0
-        ddr = access.bytes * policy.kvc_ddr_ratio * scale
-        ssd = access.bytes * policy.kvc_ssd_ratio * scale
+        if access.direction == "alias":
+            ddr = ssd = 0.0
+        else:
+            read = access.direction == "read"
+            scale = (1.0 - policy.mtp_kvc_hit_rate) if read else 1.0
+            ddr = access.bytes * policy.kvc_ddr_ratio * scale
+            ssd = access.bytes * policy.kvc_ssd_ratio * scale
         records.append({
             **access.to_dict(),
             "ddr_bytes": ddr, "ssd_bytes": ssd, "hbm_bytes": ddr + ssd,

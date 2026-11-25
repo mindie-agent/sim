@@ -324,6 +324,8 @@ class CacheExecution:
             "byte_span": byte_span,
             "span_format": ("start_count" if summary.ranges_complete
                             else "start_width_stride_count"),
+            "unit": "lines",
+            "line_bytes": self.state.geometry.line_bytes,
             "line_segments": [list(item.to_tuple()) for item in line_segments],
             "byte_segments": [list(item.to_tuple()) for item in byte_segments],
             "coverage_bytes": summary.coverage_bytes,

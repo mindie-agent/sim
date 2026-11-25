@@ -10,8 +10,14 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from .policy import _submit_offload_transfer
-from .accesses import StateAccess, _access_bytes, _as_accesses, _unique_accesses
+from .policy import _host_ddr_work, _submit_offload_transfer
+from .accesses import (
+    StateAccess,
+    _access_bytes,
+    _as_accesses,
+    _unique_accesses,
+    is_persistent_offload_access,
+)
 from .events import (
     _access_registry,
     _accesses_for_work,
@@ -41,9 +47,18 @@ def is_kv_or_state_entry_op(op: Any) -> bool:
     } or getattr(op, "recipe", "") in {"short_convolution", "causal_conv1d_update"}
 
 
+def _rank_bytes(accesses) -> dict[int | None, float]:
+    by_rank: dict[int | None, float] = {}
+    for access in _unique_accesses(accesses):
+        if access.bytes > 0.0:
+            by_rank[access.rank] = by_rank.get(access.rank, 0.0) + access.bytes
+    return by_rank
+
+
 def _submit_kv_tier_transfers(
     execution: Any, stem: str, replica: int, stage: int, kv_bytes: float,
-    anchor: tuple[Any, ...], *, discount_hit: bool,
+    anchor: tuple[Any, ...], *, discount_hit: bool, direction: str = "h2d",
+    rank_bytes: Mapping[int | None, float] | None = None,
 ) -> tuple[Any, ...]:
     if kv_bytes <= 0.0:
         return ()
@@ -51,18 +66,29 @@ def _submit_kv_tier_transfers(
     scale = (1.0 - policy.mtp_kvc_hit_rate) if discount_hit else 1.0
     hbm_res = execution.stage_names[replica, stage]["hbm"]
     events = []
-    ddr_bytes = kv_bytes * policy.kvc_ddr_ratio * scale
+    ddr_factor = policy.kvc_ddr_ratio * scale
+    ddr_bytes = kv_bytes * ddr_factor
     if ddr_bytes > 0.0:
-        ddr_res = f"{execution.namespace}offload_ddr@r{replica}:s{stage}"
+        rank_ddr = (
+            {rank: amt * ddr_factor for rank, amt in rank_bytes.items() if amt * ddr_factor > 0.0}
+            if rank_bytes else None
+        )
+        ddr_work = _host_ddr_work(
+            execution, replica, stage, direction, ddr_bytes,
+            rank_ddr_bytes=rank_ddr,
+        )
         events.append(_submit_offload_transfer(
-            execution.engine, f"{stem}_ddr", {ddr_res: ddr_bytes, hbm_res: ddr_bytes},
-            after=anchor, latency_us=policy.ddr_latency_us, owner=f"replica:{replica}"))
+            execution.engine, f"{stem}_ddr", ddr_work,
+            after=anchor, latency_us=policy.ddr_startup_latency_us(direction),
+            owner=f"replica:{replica}", coupled=len(ddr_work) > 1))
     ssd_bytes = kv_bytes * policy.kvc_ssd_ratio * scale
     if ssd_bytes > 0.0:
         ssd_res = f"{execution.namespace}offload_ssd@r{replica}:s{stage}"
+        ssd_work = {ssd_res: ssd_bytes, hbm_res: ssd_bytes}
         events.append(_submit_offload_transfer(
-            execution.engine, f"{stem}_ssd", {ssd_res: ssd_bytes, hbm_res: ssd_bytes},
-            after=anchor, latency_us=policy.ssd_latency_us, owner=f"replica:{replica}"))
+            execution.engine, f"{stem}_ssd", ssd_work,
+            after=anchor, latency_us=policy.ssd_latency_us,
+            owner=f"replica:{replica}", coupled=len(ssd_work) > 1))
     return tuple(events)
 
 
@@ -143,7 +169,7 @@ def _submit_writeback_groups(execution: Any, stem: str, replica: int,
         name = stem if not multiple else f"{stem}:{index}"
         submitted = _submit_kv_tier_transfers(
             execution, name, replica, stage, write_bytes, (event,),
-            discount_hit=False)
+            discount_hit=False, direction="d2h", rank_bytes=_rank_bytes(group))
         _register_access_events(execution, work, group, submitted)
         events.extend(submitted)
     return tuple(events)
@@ -165,6 +191,7 @@ def schedule_kv_layer_offload(
                                 else _accesses_for_work(execution, work))
     selected = [access for access in accesses
                 if access.direction == "read" and access.stage == stage
+                and is_persistent_offload_access(access)
                 and (state_accesses is not None or access.scope == "target")
                 and (access.layer == layer or access.layer < 0)]
     registry = _access_registry(execution, work)
@@ -188,7 +215,8 @@ def schedule_kv_layer_offload(
         anchor = tuple(dict.fromkeys((*anchor, prev_kv_done)))
     events = _submit_kv_tier_transfers(
         execution, f"{prefix}:s{stage}.l{layer}:kv_offload", replica, stage,
-        kv_bytes, anchor, discount_hit=True)
+        kv_bytes, anchor, discount_hit=True, direction="h2d",
+        rank_bytes=_rank_bytes(pending))
     _register_access_events(execution, work, pending, events)
     return tuple(dict.fromkeys((*existing, *events)))
 
@@ -213,6 +241,7 @@ def schedule_kv_layer_writeback(
                                 else _accesses_for_work(execution, work))
     selected = [access for access in accesses
                 if access.direction == "write" and access.stage == stage
+                and is_persistent_offload_access(access)
                 and access.scope == "target"
                 and (access.layer == layer or access.layer < 0)]
     registry = _access_registry(execution, work)
@@ -252,6 +281,7 @@ def schedule_draft_kv_writeback(
                                 else _accesses_for_work(execution, work))
     selected = [access for access in accesses
                 if access.direction == "write" and access.stage == stage
+                and is_persistent_offload_access(access)
                 and access.scope == "draft"]
     registry = _access_registry(execution, work)
     existing = _registered_events(execution, work, selected)
@@ -303,7 +333,8 @@ def schedule_kv_iteration_offload(
     writers = _writer_occurrences(physical_ops)
     done = set(scheduled_accesses or ()) | set(registry)
     pending = [access for access in accesses
-               if access.key not in done and access.direction == "write"]
+               if access.key not in done and access.direction == "write"
+               and is_persistent_offload_access(access)]
     pp = max(1, int(execution.case.runtime.parallel.pp))
     groups: dict[tuple[Any, int], list[StateAccess]] = {}
     for access in pending:
@@ -337,7 +368,7 @@ def schedule_kv_iteration_offload(
             stem = f"{stem}:{index}"
         submitted_events = _submit_kv_tier_transfers(
             execution, stem, replica, stage, write_bytes, (producer_event,),
-            discount_hit=False)
+            discount_hit=False, direction="d2h", rank_bytes=_rank_bytes(group))
         _register_access_events(execution, work, group, submitted_events)
         events.extend(submitted_events)
     return tuple(events)
