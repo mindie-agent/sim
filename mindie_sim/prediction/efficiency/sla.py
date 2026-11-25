@@ -42,6 +42,7 @@ SLA_SENSITIVITY_BASELINE = "baseline"
 SLA_SENSITIVITY_FULL = "full"
 #: A per-sequence marginal step below this is flat (or negative): no secant.
 SECANT_MIN_SLOPE_MS = 1e-9
+_MIN_ROW_LEADING_DIMS = 2
 
 DEFAULT_SLA_SCENARIOS: tuple[dict[str, Any], ...] = (
     {"id": "baseline", "label": "1x HBM, 1x Compute", "hbm_bw_scale": 1.0, "cube_flops_scale": 1.0, "vector_ops_scale": 1.0, "link_bw_scale": 1.0},
@@ -93,13 +94,17 @@ def solve_sla_sizing(
 
     assert_timing_supported(case, entry="solve_sla_sizing")
     parsed = parse_case(case)
-    q_tokens, emit_tokens = _resolve_speculative_tokens(parsed, output_budget=output_budget, tokens_per_seq=tokens_per_seq, emitted_tokens_per_seq=emitted_tokens_per_seq)
+    q_tokens, emit_tokens = _resolve_speculative_tokens(
+        parsed, output_budget=output_budget, tokens_per_seq=tokens_per_seq,
+        emitted_tokens_per_seq=(None if phase == "prefill" else emitted_tokens_per_seq),
+        phase=phase)
     # A prefill step processes its query; the following decode step commits its
     # own accepted tokens.  Keep both quantities: the lifecycle capacity must
     # use the decode commit, never the prompt-processing volume.
     decode_q_tokens, decode_emit_tokens = _resolve_speculative_tokens(
         parsed, output_budget=output_budget, tokens_per_seq=None,
-        emitted_tokens_per_seq=None)
+        emitted_tokens_per_seq=(emitted_tokens_per_seq if phase == "prefill" else None),
+        phase="decode")
     _validate_geometry(phase, q_tokens, context, 1, scope)
     batch_budget = int(parsed.runtime.max_num_batched_tokens)
     unchunkable = (not parsed.runtime.enable_chunked_prefill
@@ -109,17 +114,16 @@ def solve_sla_sizing(
         # A chunked prompt may exceed the per-step budget and still admit one
         # sequence; only the unchunked declaration preserves the zero.
         rt_max_b = max(1, rt_max_b)
-    if phase == "decode" and parsed.runtime.graph_capture_mode == "full" and parsed.runtime.graph_capture_keys and dict(parsed.runtime.metadata).get("captured_execution_mode") == "FULL_DECODE_ONLY":
-        rt_max_b = min(rt_max_b,
-                       max(1, max(parsed.runtime.graph_capture_keys) // q_tokens))
-    b_max, dp = min(int(max_sequences_per_dp), rt_max_b), parsed.runtime.parallel.dp
+    b_max = min(int(max_sequences_per_dp), rt_max_b)
+    dp = int(parsed.runtime.parallel.dp)
+    fleet_dp = dp * max(1, int(getattr(parsed.runtime.parallel, "external_dp", 1) or 1))
 
 
     run = _SLASizingRun(
         parsed, sla_ms=sla_ms, context=context, phase=phase, scope=scope,
         output_budget=output_budget, q_tokens=q_tokens, emit_tokens=emit_tokens,
         decode_q_tokens=decode_q_tokens, decode_emit_tokens=decode_emit_tokens,
-        b_max=b_max, dp=dp, unchunkable=unchunkable, base_b_hint=base_b_hint,
+        b_max=b_max, dp=fleet_dp, unchunkable=unchunkable, base_b_hint=base_b_hint,
         fast_span_probes=fast_span_probes, evaluation_context=evaluation_context)
 
     results = [run.solve_one(scen) for scen in scenario_list]
@@ -205,6 +209,130 @@ def _sla_async_memory(parsed, base_r, phase, context, q_tokens, emit_tokens,
     }
 
 
+def _cohort_die_ranks(case: CaseSpec, group: tuple[int, ...]) -> tuple[int, ...]:
+    p = case.runtime.parallel
+    width = max(1, int(p.tp) * int(p.pcp))
+    ranks = sorted({
+        (int(replica) * int(p.pp) + stage) * width + rank
+        for replica in group
+        for stage in range(int(p.pp))
+        for rank in range(width)
+    })
+    return tuple(rk for rk in ranks if rk < len(case.machine.dies))
+
+
+def _cohort_hw_signature(case: CaseSpec, group: tuple[int, ...]) -> tuple[Any, ...]:
+    """Canonical die, placement-partition, and routed link-supply signature for one cohort."""
+    from ..collectives.topology import Topology
+    ranks = _cohort_die_ranks(case, group)
+    local_idx = {rk: idx for idx, rk in enumerate(ranks)}
+    die_sigs = tuple(case.machine.dies[rk].resource_signature for rk in ranks)
+    topo = Topology(case.machine, case.runtime.parallel)
+    node_ids: dict[Any, int] = {}
+    pkg_ids: dict[Any, int] = {}
+    placement_part = tuple(
+        (
+            node_ids.setdefault(topo._node_of(rk), len(node_ids)),
+            pkg_ids.setdefault(topo._package_key(rk), len(pkg_ids)),
+        )
+        for rk in ranks
+    )
+    link_alias: dict[str, int] = {}
+    hop_cache: dict[tuple[str, int, int], tuple[Any, ...]] = {}
+
+    def _shared_external(lk: Any) -> int:
+        if (lk.semantics == "shared"
+                or lk.switch_capacity_bytes_per_ms is not None
+                or bool(lk.root_complex_id)):
+            return sum(1 for member in lk.members if int(member) not in local_idx)
+        return 0
+
+    def _hop_sig(name: str, src: int, dst: int) -> tuple[Any, ...]:
+        key = (name, src, dst)
+        cached = hop_cache.get(key)
+        if cached is not None:
+            return cached
+        lk = topo.links[name]
+        sig = (
+            link_alias.setdefault(name, len(link_alias)),
+            str(lk.channel), str(lk.protocol), str(lk.semantics),
+            str(lk.scope), float(lk.capacity_at(src)), float(lk.capacity_at(dst)),
+            float(lk.capacity_bytes_per_ms), lk.peak_capacity_bytes_per_ms,
+            float(lk.bw_utilization), float(lk.propagation_us),
+            lk.switch_capacity_bytes_per_ms, lk.transaction_bytes,
+            int(lk.alignment_bytes), int(lk.protocol_overhead_bytes),
+            lk.protocol_bands, _shared_external(lk),
+        )
+        hop_cache[key] = sig
+        return sig
+
+    route_sigs: list[tuple[int, int, tuple[Any, ...]]] = []
+    for i, src in enumerate(ranks):
+        for j, dst in enumerate(ranks):
+            if i == j:
+                continue
+            try:
+                hops = tuple(
+                    _hop_sig(name, h_src, h_dst)
+                    for name, h_src, h_dst in topo.route(src, dst)
+                )
+            except ValueError:
+                hops = (("missing",),)
+            route_sigs.append((i, j, hops))
+
+    host_sigs = tuple(sorted(
+        (
+            str(lk.channel), str(lk.protocol), str(lk.semantics), str(lk.scope),
+            float(lk.capacity_bytes_per_ms), float(lk.propagation_us),
+            tuple(sorted(
+                (local_idx[int(m)], float(lk.capacity_at(int(m))))
+                for m in lk.members if int(m) in local_idx
+            )),
+            _shared_external(lk),
+        )
+        for lk in case.machine.links
+        if any(int(member) in local_idx for member in lk.members)
+        and (
+            len(lk.members) == 1
+            or str(lk.scope or "") in {"host", "h2d", "d2h", "cpu", "pcie"}
+            or any(tag in str(lk.channel).lower() for tag in ("host", "h2d", "d2h", "pcie", "dma"))
+        )
+    ))
+    return (die_sigs, placement_part, tuple(route_sigs), host_sigs)
+
+
+def _distinct_eval_cohorts(case: CaseSpec) -> tuple[tuple[int, ...], ...]:
+    """Return one representative cohort per distinct die+link hardware class across DP replicas."""
+    from ..execution.dispatch import cohorts
+    groups = tuple(tuple(int(r) for r in group) for group in cohorts(case.runtime.parallel, case.machine))
+    if not groups or len(groups) == 1:
+        return groups[:1]
+    seen: set[tuple[Any, ...]] = set()
+    distinct: list[tuple[int, ...]] = []
+    for group in groups:
+        sig = _cohort_hw_signature(case, group)
+        if sig not in seen:
+            seen.add(sig)
+            distinct.append(group)
+    return tuple(distinct)
+
+
+def _prefill_chunk_schedule(parsed: CaseSpec, *, phase: str, context: int, q_tokens: int) -> tuple[tuple[int, int], ...]:
+    """Split a chunked prefill prompt exceeding ``max_num_batched_tokens`` into ordered chunks."""
+    budget = max(1, int(parsed.runtime.max_num_batched_tokens))
+    if phase != "prefill" or not parsed.runtime.enable_chunked_prefill or q_tokens <= budget:
+        return ((int(context), int(q_tokens)),)
+    chunks: list[tuple[int, int]] = []
+    cur_ctx = int(context)
+    remaining = int(q_tokens)
+    while remaining > 0:
+        width = min(remaining, budget)
+        chunks.append((cur_ctx, width))
+        cur_ctx += width
+        remaining -= width
+    return tuple(chunks)
+
+
 class _SLASizingRun:
     """Own graph and memory reuse, plus the search domain shared by the scenarios."""
 
@@ -227,10 +355,13 @@ class _SLASizingRun:
         self.dp = dp
         self.unchunkable = unchunkable
         self.evaluation_context = evaluation_context
+        self.eval_cohorts = _distinct_eval_cohorts(parsed)
+        self.prefill_chunks = _prefill_chunk_schedule(
+            parsed, phase=phase, context=context, q_tokens=q_tokens)
         self.scaled_cases: dict[tuple[float, ...], CaseSpec] = {}
         self.eval_contexts: dict[tuple[float, ...], Any] = {}
-        self.floor_caps_cache: dict[tuple[float, ...], Any] = {}
-        self.graphs_by_b: dict[int, Any] = {}
+        self.floor_caps_cache: dict[tuple[Any, ...], Any] = {}
+        self.graphs_by_b: dict[Any, Any] = {}
         self.vram_by_cap: dict[float, tuple[int, int, int]] = {}
         self.graph_cache: dict[tuple[tuple[float, ...], int, bool], tuple[Any, CaseSpec, dict[str, Any]]] = {}
         self.fast_spans = bool(fast_span_probes)
@@ -255,23 +386,71 @@ class _SLASizingRun:
             self.eval_contexts[s_key] = EvaluationContext.create(self.get_scaled(s_key))
         return self.eval_contexts[s_key]
 
-    def get_bundle(self, s_key: tuple[float, ...], b: int, *,
-                   fast: bool = False) -> tuple[Any, CaseSpec, dict[str, Any]]:
-        parsed, phase, q_tokens = self.parsed, self.phase, self.q_tokens
-        context, scope = self.context, self.scope
-        graphs_by_b, graph_cache = self.graphs_by_b, self.graph_cache
-        check_active_deadline()
-        if (s_key, b, fast) not in graph_cache:
-            if b not in graphs_by_b:
-                graphs_by_b[b] = _pkg_attr("target_graphs", target_graphs)(parsed, phase=phase, tokens=q_tokens, context=context, sequences=b, scope=scope)
-            context_reuse = self.get_eval_context(s_key)
+    def _run_one_geometry(
+        self, s_key: tuple[float, ...], b: int, *,
+        chunk_ctx: int, chunk_tok: int, fast: bool,
+    ) -> tuple[Any, CaseSpec, dict[str, Any]]:
+        parsed, phase, scope = self.parsed, self.phase, self.scope
+        graphs_by_b = self.graphs_by_b
+        context_reuse = self.get_eval_context(s_key)
+        scaled_case = self.get_scaled(s_key)
+        multi_chunk = len(self.prefill_chunks) > 1
+        if len(self.eval_cohorts) <= 1:
+            g_key: Any = (b, chunk_ctx, chunk_tok) if multi_chunk else b
+            if g_key not in graphs_by_b:
+                graphs_by_b[g_key] = _pkg_attr("target_graphs", target_graphs)(
+                    parsed, phase=phase, tokens=chunk_tok, context=chunk_ctx,
+                    sequences=b, scope=scope)
             g, ec, gr = _pkg_attr("_lower_and_run_graph", _lower_and_run_graph)(
-                self.get_scaled(s_key), phase=phase, tokens=q_tokens, context=context,
+                scaled_case, phase=phase, tokens=chunk_tok, context=chunk_ctx,
                 sequences=b, scope=scope, run_graph=True,
-                lowered_graphs=graphs_by_b[b], evaluation_context=context_reuse,
+                lowered_graphs=graphs_by_b[g_key], evaluation_context=context_reuse,
                 fast_span_only=bool(fast))
             assert gr is not None
-            graph_cache[s_key, b, fast] = (g, ec, gr)
+            return g, ec, gr
+        slowest: tuple[Any, CaseSpec, dict[str, Any]] | None = None
+        for group in self.eval_cohorts:
+            g_key = (b, chunk_ctx, chunk_tok, group) if multi_chunk else (b, group)
+            if g_key not in graphs_by_b:
+                graphs_by_b[g_key] = _pkg_attr("target_graphs", target_graphs)(
+                    parsed, phase=phase, tokens=chunk_tok, context=chunk_ctx,
+                    sequences=b, scope=scope, cohort=group)
+            g, ec, gr = _pkg_attr("_lower_and_run_graph", _lower_and_run_graph)(
+                scaled_case, phase=phase, tokens=chunk_tok, context=chunk_ctx,
+                sequences=b, scope=scope, run_graph=True,
+                lowered_graphs=graphs_by_b[g_key], evaluation_context=context_reuse,
+                fast_span_only=bool(fast))
+            assert gr is not None
+            if slowest is None or float(gr["duration_ms"]) > float(slowest[2]["duration_ms"]):
+                slowest = (g, ec, gr)
+        assert slowest is not None
+        return slowest
+
+    def get_bundle(self, s_key: tuple[float, ...], b: int, *,
+                   fast: bool = False) -> tuple[Any, CaseSpec, dict[str, Any]]:
+        graph_cache = self.graph_cache
+        check_active_deadline()
+        if (s_key, b, fast) not in graph_cache:
+            if len(self.prefill_chunks) == 1:
+                chunk_ctx, chunk_tok = self.prefill_chunks[0]
+                graph_cache[s_key, b, fast] = self._run_one_geometry(
+                    s_key, b, chunk_ctx=chunk_ctx, chunk_tok=chunk_tok, fast=fast)
+            else:
+                total_ms = 0.0
+                chunk_bundles: list[tuple[Any, CaseSpec, dict[str, Any]]] = []
+                for chunk_ctx, chunk_tok in self.prefill_chunks:
+                    bundle = self._run_one_geometry(
+                        s_key, b, chunk_ctx=chunk_ctx, chunk_tok=chunk_tok, fast=fast)
+                    total_ms += float(bundle[2]["duration_ms"])
+                    chunk_bundles.append(bundle)
+                last_g, last_ec, last_gr = chunk_bundles[-1]
+                agg_gr = {
+                    **last_gr,
+                    "duration_ms": total_ms,
+                    "chunk_durations_ms": [float(item[2]["duration_ms"]) for item in chunk_bundles],
+                    "_chunk_bundles": chunk_bundles,
+                }
+                graph_cache[s_key, b, fast] = (last_g, last_ec, agg_gr)
         return graph_cache[s_key, b, fast]
 
     def get_analysis(self, s_key: tuple[float, ...], b: int) -> dict[str, Any]:
@@ -279,15 +458,57 @@ class _SLASizingRun:
         analysis_cache = self.analysis_cache
         check_active_deadline()
         if (s_key, b) not in analysis_cache:
-            # ``b1_analysis`` is retained only for API compatibility.  It does not
-            # carry the case plan/boundary identity needed to prove the same input,
-            # so it may never replace an execution evaluated here.  The graph cache
-            # above is the only reuse boundary.
-            analysis_cache[s_key, b] = _pkg_attr("analyze_network_efficiency", analyze_network_efficiency)(
-                self.get_scaled(s_key), phase=phase, tokens=q_tokens, context=context,
-                sequences=b, scope=scope, run_graph=True,
-                _precomputed_graph=self.get_bundle(s_key, b, fast=False),
-                evaluation_context=self.get_eval_context(s_key))
+            if len(self.prefill_chunks) == 1:
+                analysis_cache[s_key, b] = _pkg_attr("analyze_network_efficiency", analyze_network_efficiency)(
+                    self.get_scaled(s_key), phase=phase, tokens=q_tokens, context=context,
+                    sequences=b, scope=scope, run_graph=True,
+                    _precomputed_graph=self.get_bundle(s_key, b, fast=False),
+                    evaluation_context=self.get_eval_context(s_key))
+            else:
+                agg_bundle = self.get_bundle(s_key, b, fast=False)
+                chunk_bundles = agg_bundle[2]["_chunk_bundles"]
+                chunk_reports = [
+                    _pkg_attr("analyze_network_efficiency", analyze_network_efficiency)(
+                        self.get_scaled(s_key), phase=phase, tokens=chunk_tok,
+                        context=chunk_ctx, sequences=b, scope=scope, run_graph=True,
+                        _precomputed_graph=chunk_bundle,
+                        evaluation_context=self.get_eval_context(s_key))
+                    for (chunk_ctx, chunk_tok), chunk_bundle in zip(self.prefill_chunks, chunk_bundles)
+                ]
+                total_graph = sum(float(rep["graph_duration_ms"]) for rep in chunk_reports)
+                total_op_sum = sum(float(rep["operator_sum_ms"]) for rep in chunk_reports)
+                safe_g = max(total_graph, 1e-12)
+                safe_op = max(total_op_sum, 1e-12)
+                tot_hbm = sum(float(rep.get("total_hbm_ideal_ms", 0.0) or 0.0) for rep in chunk_reports)
+                tot_cube = sum(float(rep.get("total_cube_ideal_ms", 0.0) or 0.0) for rep in chunk_reports)
+                tot_vec = sum(float(rep.get("total_vec_ideal_ms", 0.0) or 0.0) for rep in chunk_reports)
+                tot_link = sum(float(rep.get("total_link_ideal_ms", 0.0) or 0.0) for rep in chunk_reports)
+                tot_roof = sum(float(rep.get("total_roofline_ideal_ms", 0.0) or 0.0) for rep in chunk_reports)
+                bound_totals = {
+                    bound: sum(
+                        float(rep["breakdown_by_bound"][bound]["total_ms"])
+                        for rep in chunk_reports
+                    )
+                    for bound in _BOUNDS
+                }
+                analysis_cache[s_key, b] = {
+                    **chunk_reports[-1],
+                    "graph_duration_ms": total_graph,
+                    "operator_sum_ms": total_op_sum,
+                    "network_mbu": tot_hbm / safe_g,
+                    "network_cube_mfu": tot_cube / safe_g,
+                    "network_vec_mfu": tot_vec / safe_g,
+                    "network_link_util": tot_link / safe_g,
+                    "network_roofline_efficiency": tot_roof / safe_g,
+                    "breakdown_by_bound": {
+                        bound: {
+                            **chunk_reports[-1]["breakdown_by_bound"][bound],
+                            "total_ms": bound_totals[bound],
+                            "share_of_operator_sum": bound_totals[bound] / safe_op,
+                        }
+                        for bound in _BOUNDS
+                    },
+                }
         return analysis_cache[s_key, b]
 
     def eval_at(self, s_key: tuple[float, ...], b: int, *, full: bool = False) -> dict[str, Any]:
@@ -466,8 +687,8 @@ class _SLASizingRun:
             secant_estimate, certified_optimal=certified_optimal, hi_cut=hi_cut)
 
     @staticmethod
-    def _hardware_floor_caps(eff_case: CaseSpec, eval_ctx: Any = None):
-        dies = getattr(getattr(eff_case, "machine", None), "dies", ()) or ()
+    def _hardware_floor_caps(eff_case: CaseSpec, eval_ctx: Any = None, *, dies: Sequence[Any] | None = None):
+        dies = tuple(dies) if dies is not None else (getattr(getattr(eff_case, "machine", None), "dies", ()) or ())
         pt = getattr(eval_ctx, "primitive_table", None) if eval_ctx is not None else None
         datapath_fn = overlay_fn = None
         if pt is not None:
@@ -547,6 +768,8 @@ class _SLASizingRun:
         *,
         b: int,
         inv_b: float,
+        q_tokens: int,
+        graph_sp_padded_rows: int,
         phase: str,
         context: int,
         runtime_shared_prefix: bool,
@@ -576,9 +799,30 @@ class _SLASizingRun:
             else 1.0
         )
         md = dict(getattr(op, "metadata", ()) or ())
+        fam = str(getattr(op, "family", "") or "")
+        active_rows = int(md.get("graph_active_query_rows") or (int(b) * max(1, int(q_tokens))))
+        tokens_global = int(md.get("tokens_global") or 0)
+        phys_rows = max(
+            int(md.get("graph_physical_query_rows") or 0),
+            tokens_global,
+            int(graph_sp_padded_rows),
+        )
+        if active_rows > 0 and phys_rows > active_rows:
+            # Unpadded multi-dim ops (attention, logits) keep leading dim <= active_rows
+            # and tokens_global <= active_rows; captured and SP-padded ops carry padded rows.
+            op_unpadded = (
+                len(sem) >= _MIN_ROW_LEADING_DIMS
+                and float(sem[0]) <= float(active_rows)
+                and (not loc or float(loc[0]) <= float(active_rows))
+                and tokens_global <= active_rows
+            )
+            if not op_unpadded:
+                sem_scale = min(sem_scale, float(active_rows) / float(phys_rows))
+        if (active_rows > 0 and fam != "grouped_gemm"
+                and len(sem) >= _MIN_ROW_LEADING_DIMS and float(sem[0]) > float(active_rows)):
+            sem_scale = min(sem_scale, float(active_rows) / float(sem[0]))
         op_hbm = float(getattr(op, "hbm_bytes", 0.0) or 0.0)
         wb = float(md.get("packed_weight_bytes") or md.get("weight_bytes") or 0.0)
-        fam = str(getattr(op, "family", "") or "")
         if op_hbm > 0.0 and wb <= 0.0 and fam == "native_fusion":
             phases = md.get("fusion_phases") or ()
             if isinstance(phases, Sequence) and not isinstance(phases, (str, bytes)):
@@ -594,6 +838,8 @@ class _SLASizingRun:
         a_op, c_op, used_gg = 0.0, 0.0, False
         if op_hbm > 0.0 and wb > 0.0:
             w_eff = min(wb, op_hbm)
+            if fam == "grouped_gemm" or md.get("active_experts") is not None:
+                w_eff *= sem_scale
             stage_wb[st] = stage_wb.get(st, 0.0) + w_eff
             if max_hbm_ms > 0.0:
                 a_op = w_eff / max_hbm_ms
@@ -665,20 +911,28 @@ class _SLASizingRun:
         self, s_key: tuple[float, ...], b: int, step_ms: float,
     ) -> tuple[tuple[float, float], ...]:
         """Compute monotone affine lower-bound rays ``(fixed_ms, linear_per_seq_ms)`` for ``b' >= b``."""
-        if self.unchunkable or step_ms <= 0.0 or b < 1:
+        if self.unchunkable or len(self.prefill_chunks) > 1 or step_ms <= 0.0 or b < 1:
             return ()
         cached = self.graph_cache.get((s_key, b, self.fast_spans)) or self.graph_cache.get((s_key, b, False))
         if cached is None:
             return ()
         graphs, eff_case, _gr = cached
-        ops_0 = graphs.get(0, ()) if isinstance(graphs, Mapping) else ()
-        dies = getattr(getattr(eff_case, "machine", None), "dies", ()) or ()
-        if not ops_0 or not dies:
+        ops_0 = next(iter(graphs.values()), ()) if isinstance(graphs, Mapping) else ()
+        all_dies = getattr(getattr(eff_case, "machine", None), "dies", ()) or ()
+        if not ops_0 or not all_dies:
             return ()
-        caps = self.floor_caps_cache.get(s_key)
+        if len(self.eval_cohorts) > 1 and isinstance(graphs, Mapping):
+            cohort_group = tuple(sorted(int(r) for r in graphs.keys()))
+            die_ranks = _cohort_die_ranks(eff_case, cohort_group)
+            dies = tuple(all_dies[rk] for rk in die_ranks) or all_dies
+            caps_key: tuple[Any, ...] = (s_key, die_ranks)
+        else:
+            dies = all_dies
+            caps_key = (s_key, None)
+        caps = self.floor_caps_cache.get(caps_key)
         if caps is None:
-            caps = self._hardware_floor_caps(eff_case, self.get_eval_context(s_key))
-            self.floor_caps_cache[s_key] = caps
+            caps = self._hardware_floor_caps(eff_case, self.get_eval_context(s_key), dies=dies)
+            self.floor_caps_cache[caps_key] = caps
         max_hbm_ms = caps[0]
         max_l2_bytes = caps[6]
         stage_wb: dict[int, float] = {}
@@ -696,9 +950,16 @@ class _SLASizingRun:
             str(getattr(eff_case.runtime, "prefix_cache_mode", "") or "").strip().lower() == "shared"
         )
         inv_b = 1.0 / float(b)
+        graph_sp_padded_rows = max(
+            (int(dict(getattr(op, "metadata", ()) or ()).get("tokens_global") or 0)
+             for op in ops_0),
+            default=0,
+        )
         for op in ops_0:
             a_op, c_op, used_gg = self._op_floor_contribution(
-                op, b=b, inv_b=inv_b, phase=self.phase, context=self.context,
+                op, b=b, inv_b=inv_b, q_tokens=self.q_tokens,
+                graph_sp_padded_rows=graph_sp_padded_rows,
+                phase=self.phase, context=self.context,
                 runtime_shared_prefix=runtime_shared_prefix, caps=caps,
                 attn_fams=attn_fams, non_kernel_fams=non_kernel_fams,
                 stage_wb=stage_wb, stage_gg=stage_gg, stage_kv=stage_kv,

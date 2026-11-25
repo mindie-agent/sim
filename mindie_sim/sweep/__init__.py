@@ -56,9 +56,10 @@ from mindie_sim.sweep.engine import (
     set_deadline, static_row, timeout_row, validate_candidate_statically,
 )
 from mindie_sim.runtime_advisor import resolve_jobs
+from mindie_sim.prediction.efficiency.sla import _cohort_hw_signature, _distinct_eval_cohorts
 from mindie_sim.sweep.stage import (
-    STAGE_FULL, STAGE_SCREEN, checkpoint_index, open_checkpoint,
-    read_checkpoint_row, write_checkpoint_row,
+    STAGE_FULL, STAGE_SCREEN, checkpoint_index, checkpoint_stage_index,
+    open_checkpoint, read_checkpoint_row, write_checkpoint_row,
 )
 from mindie_sim.sweep.stage import (
     locked_row as _locked_row, prepare_locked_plan as _prepare_locked_plan,
@@ -117,12 +118,12 @@ def _derivation_key(parsed: CaseSpec) -> str:
                       sort_keys=True, default=repr)
 
 
-def _load_checkpoint(path: Path) -> dict[str, Any]:
-    """Index the committed rows of an existing checkpoint (streamed)."""
+def _load_checkpoint_stages(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Index committed latest and screen rows of an existing checkpoint."""
     if not path.exists():
-        return {}
+        return {}, {}
     with path.open("r+b") as stream:
-        return checkpoint_index(stream)
+        return checkpoint_stage_index(stream)
 
 
 def _open_stream(path: Path | None, resume: bool):
@@ -173,13 +174,9 @@ def _resolve_sweep_scenario_inputs(
     context: int | None,
     output_budget: int | None,
     phase: str,
+    tokens_per_seq: int | None = None,
 ) -> tuple[float, int, int]:
     """Enforce Domain-1 fail-fast on sweep SLA/context/output_budget inputs."""
-    resolved_sla = sla_ms
-    if resolved_sla is None:
-        resolved_sla = (
-            parsed.slo.ttft_ms if phase == "prefill" else parsed.slo.tpot_ms
-        )
     resolved_output = output_budget
     if resolved_output is None:
         meta = dict(parsed.runtime.metadata)
@@ -187,6 +184,19 @@ def _resolve_sweep_scenario_inputs(
         reqs = tuple(parsed.workload.requests or ())
         if declared and reqs and reqs[0].request_id != "__structure_probe__":
             resolved_output = int(reqs[0].output_tokens)
+    resolved_sla = sla_ms
+    if resolved_sla is None:
+        if phase == "prefill":
+            resolved_sla = parsed.slo.ttft_ms
+        elif parsed.slo.tpot_ms is not None:
+            _, emit_tokens = _resolve_speculative_tokens(
+                parsed,
+                output_budget=int(resolved_output or 0),
+                tokens_per_seq=tokens_per_seq,
+                emitted_tokens_per_seq=None,
+                phase="decode",
+            )
+            resolved_sla = float(parsed.slo.tpot_ms) * float(emit_tokens)
     missing = [
         name for name, val in (
             ("sla_ms", resolved_sla),
@@ -199,16 +209,23 @@ def _resolve_sweep_scenario_inputs(
     return float(resolved_sla), int(context), int(resolved_output)
 
 
-def _sweep_hardware_derivations(base, derivations, *, output_jsonl, resume, **sweep_options):
+def _sweep_hardware_derivations(
+    base, derivations, *, output_jsonl, resume, _raw_case=None, **sweep_options,
+):
     for derivation_index, derivation in enumerate(derivations):
         from mindie_sim.hardware_derivation import derived_machine
         declare = dict(derivation)
         sku = str(declare.pop("sku", base.machine.sku or "derived"))
         derived = derived_machine(base.machine, {**declare, "sku": sku})
         sub_case = replace(base, machine=derived)
+        sub_raw = (
+            sub_case if "ranks_per_node" in declare
+            else (_raw_case if _raw_case is not None else sub_case)
+        )
         for row in sweep_topologies_iter(
             sub_case, output_jsonl=output_jsonl,
             resume=(resume or (output_jsonl is not None and derivation_index > 0)),
+            _raw_case=sub_raw,
             **sweep_options,
         ):
             row["derived_sku"] = sku
@@ -263,15 +280,18 @@ def sweep_topologies_iter(
     isolate_workers: bool = False,
     jobs: int | str = 1,
     _finalist_sink: list | None = None,
+    _raw_case: CaseSpec | Mapping[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Stream deterministic candidate rows, optionally checkpointing each row."""
     output_jsonl = _checkpoint_path(output_jsonl, checkpoint_jsonl)
     if lock_program and not lock_parallel:
         raise ModelingError(LOCKED_PROGRAM_ERROR)
+    raw_source = _raw_case if _raw_case is not None else case
     parsed_pre = parse_case(case)
     sla_ms, context, output_budget = _resolve_sweep_scenario_inputs(
         parsed_pre, sla_ms=sla_ms, context=context,
         output_budget=output_budget, phase=phase,
+        tokens_per_seq=tokens_per_seq,
     )
     _validate_sweep_arguments(
         sla_ms=sla_ms, context=context, output_budget=output_budget,
@@ -294,9 +314,22 @@ def sweep_topologies_iter(
         base = parse_case(case)
         base_q, base_emit = _resolve_speculative_tokens(
             base, output_budget=output_budget, tokens_per_seq=tokens_per_seq,
-            emitted_tokens_per_seq=None)
+            emitted_tokens_per_seq=None, phase=phase)
+        locked_for_derivations = _locked_plan
+        if lock_parallel and locked_for_derivations is None:
+            _validate_locked_arguments(
+                base, candidates=candidates, fixed_parallel=fixed_parallel,
+                num_devices=num_devices, candidate_tps=candidate_tps,
+                ep_candidates=ep_candidates, pp_candidates=pp_candidates,
+                pcp_candidates=pcp_candidates, dcp_candidates=dcp_candidates)
+            locked_for_derivations = _prepare_locked_plan(
+                base, sla_ms=sla_ms, context=context, phase=phase,
+                scope=scope, tokens_per_seq=base_q,
+                output_budget=output_budget,
+                max_sequences_per_dp=max_sequences_per_dp)
         yield from _sweep_hardware_derivations(
             base, hardware_derivations, output_jsonl=output_jsonl, resume=resume,
+            _raw_case=raw_source,
             candidates=candidates, num_devices=num_devices, num_devices_grid=num_devices_grid,
             sla_ms=sla_ms, context=context, phase=phase, scope=scope,
             tokens_per_seq=tokens_per_seq, output_budget=output_budget,
@@ -309,6 +342,7 @@ def sweep_topologies_iter(
             fixed_parallel=fixed_parallel, lock_program=lock_program,
             two_stage=two_stage, candidate_timeout_s=candidate_timeout_s,
             deadline_monotonic=deadline_monotonic, progress_callback=progress_callback,
+            _locked_plan=locked_for_derivations,
             finalist_top_k=finalist_top_k, isolate_workers=isolate_workers,
             jobs=jobs, _finalist_sink=finalist_sink,
         )
@@ -329,7 +363,7 @@ def sweep_topologies_iter(
     cache = SweepEvaluationCache()
     base_q, base_emit = _resolve_speculative_tokens(
         parsed, output_budget=output_budget, tokens_per_seq=tokens_per_seq,
-        emitted_tokens_per_seq=None)
+        emitted_tokens_per_seq=None, phase=phase)
     grids = devices_grid or ((num_devices,) if num_devices is not None
                              else (len(parsed.machine.dies),))
     for grid_index, grid in enumerate(grids):
@@ -358,6 +392,7 @@ def sweep_topologies_iter(
                 isolate_workers=isolate_workers,
                 jobs=jobs,
                 finalist_sink=finalist_sink,
+                raw_case=raw_source,
                 pinned_devices=(num_devices is not None
                                 or bool(devices_grid))):
             yield row
@@ -373,20 +408,29 @@ def sweep_topologies_iter(
             max_sequences_per_dp=max_sequences_per_dp)
 
 
-LOCAL_TP_CANDIDATE_KEYS = (
-    "q_proj_tp", "o_proj_tp", "linear_proj_tp", "dcp_linear_tp",
-    "mlp_tp", "shared_expert_tp", "lm_head_tp", "redundant_experts_per_rank",
-)
+_SWEEP_ONLY_CANDIDATE_KEYS = frozenset({"num_devices"})
+
+
+def _candidate_parallel_spec(raw_candidate: Mapping[str, Any]) -> ParallelSpec:
+    """Parse one candidate mapping into its full canonical ``ParallelSpec``."""
+    payload = {
+        str(key): value for key, value in dict(raw_candidate).items()
+        if str(key) not in _SWEEP_ONLY_CANDIDATE_KEYS
+    }
+    return ParallelSpec.from_mapping(payload)
 
 
 def _parallel_batch_eval(
     parsed, cache, *, cand_list, devices, pinned_devices, phase, scope,
     context, base_q, base_emit, output_budget, sla_ms, max_sequences_per_dp,
     allow_dp, allow_ep, allow_pp, allow_pcp, two_stage, fixed_parallel,
-    checkpoint, resume, stream, progress_callback, workers,
+    checkpoint, resume, stream, progress_callback, workers, raw_case=None,
 ):
     """Evaluate independent candidates in parallel using pickle-safe plain dicts."""
     case_dict = parsed.to_dict()
+    raw_case_payload = (
+        dict(raw_case) if isinstance(raw_case, Mapping) else None
+    )
     probe = {
         "phase": phase, "scope": scope, "context": int(context),
         "q_tokens": int(base_q), "emit_tokens": float(base_emit),
@@ -397,12 +441,7 @@ def _parallel_batch_eval(
     pending_indices: list[int] = []
     pending_tasks: list[dict[str, Any]] = []
     for raw_candidate in cand_list:
-        cand_dict = {key: int(raw_candidate.get(key, 1))
-                     for key in ("dp", "tp", "ep", "pp", "pcp")}
-        cand_dict.update({key: raw_candidate[key]
-                          for key in ("cp", "dcp", "cp_plan", *LOCAL_TP_CANDIDATE_KEYS)
-                          if key in raw_candidate})
-        cand_p = ParallelSpec.from_mapping(cand_dict)
+        cand_p = _candidate_parallel_spec(raw_candidate)
         part = (parsed.runtime.pp_layer_partition
                 if len(parsed.runtime.pp_layer_partition) == cand_p.pp else ())
         cand_devices = (
@@ -410,7 +449,7 @@ def _parallel_batch_eval(
             else int(raw_candidate["num_devices"]) if raw_candidate.get("num_devices")
             else cand_p.world_size
         )
-        ranks = resolve_ranks_per_node(parsed, cand_devices)
+        ranks = resolve_ranks_per_node(parsed, cand_devices, raw_case=raw_case)
         cand_id = compute_sweep_candidate_id(
             parsed, cand_p, cand_devices=cand_devices, ranks_per_node=ranks,
             phase=phase, scope=scope, context=context, q_tokens=base_q,
@@ -455,6 +494,7 @@ def _parallel_batch_eval(
         pending_indices.append(len(prepared))
         pending_tasks.append({
             "case_dict": case_dict,
+            "raw_case": raw_case_payload,
             "parallel_spec": cand_p.to_dict(),
             "num_devices": int(cand_devices),
             "part": tuple(part or ()),
@@ -497,17 +537,11 @@ def _parallel_batch_eval(
 def _sweep_candidate_description(
     parsed, raw_candidate, locked, *, devices, pinned_devices, phase, scope, context,
     base_q, base_emit, output_budget, sla_ms, max_sequences_per_dp, lock_parallel,
-    allow_dp, allow_ep, allow_pp, allow_pcp, two_stage, fixed_parallel,
+    allow_dp, allow_ep, allow_pp, allow_pcp, two_stage, fixed_parallel, raw_case=None,
 ):
-    cand_dict = {key: int(raw_candidate.get(key, 1))
-                 for key in ("dp", "tp", "ep", "pp", "pcp")}
-    cand_dict.update({key: raw_candidate[key]
-                      for key in ("cp", "dcp", "cp_plan",
-                                  *LOCAL_TP_CANDIDATE_KEYS)
-                      if key in raw_candidate})
     cand_p = locked["parallel"] if locked is not None else None
     if cand_p is None:
-        cand_p = ParallelSpec.from_mapping(cand_dict)
+        cand_p = _candidate_parallel_spec(raw_candidate)
         part = (parsed.runtime.pp_layer_partition
                 if len(parsed.runtime.pp_layer_partition) == cand_p.pp
                 else ())
@@ -522,14 +556,14 @@ def _sweep_candidate_description(
     else:
         cand_devices = cand_p.world_size
         part = locked["pp_layer_partition"]
-    ranks = resolve_ranks_per_node(parsed, cand_devices)
+    ranks = resolve_ranks_per_node(parsed, cand_devices, raw_case=raw_case)
     cand_id = compute_sweep_candidate_id(
         parsed, cand_p, cand_devices=cand_devices,
         ranks_per_node=ranks, phase=phase, scope=scope,
         context=context, q_tokens=base_q, emit_tokens=base_emit,
         output_budget=output_budget, sla_ms=sla_ms,
         max_sequences_per_dp=max_sequences_per_dp,
-        lock_parallel=lock_parallel)
+        lock_parallel=lock_parallel, locked_plan=locked)
     meta = {
         "num_devices": int(cand_devices), "sla_ms": float(sla_ms),
         "context": int(context), "phase": phase, "scope": scope,
@@ -593,17 +627,28 @@ def _evaluate_validated_sweep_candidate(
                      "meta": dict(meta)})
         else:
             key = None
-            if (not cand_p.ep_spans_dp
+            if (cand_case.machine.homogeneous
+                    and not cand_p.ep_spans_dp
                     and not local_tp_spans_dp(cand_p)
                     and not cand_p.cp_spans_dp
-                    and cand_p.rank_table is None):
+                    and cand_p.rank_table is None
+                    and int(cand_p.external_dp) == 1
+                    and len(_distinct_eval_cohorts(cand_case)) == 1):
+                cohort_sig = _cohort_hw_signature(cand_case, (0,))
                 key = (
-                    _derivation_key(parsed), phase, scope,
+                    _derivation_key(parsed), cohort_sig, phase, scope,
                     int(context), int(base_q), float(base_emit),
                     int(output_budget), float(sla_ms), eff_max,
                     int(cand_p.tp), int(cand_p.ep),
                     int(cand_p.pp), int(cand_p.pcp),
                     int(cand_p.cp),
+                    str(cand_p.pcp_lane_policy),
+                    str(cand_p.cp_plan),
+                    str(cand_p.prefill_cp_plan or ""),
+                    str(cand_p.decode_cp_plan or ""),
+                    bool(cand_p.enable_dsa_cp),
+                    cand_p.expert_tp,
+                    cand_p.expert_dp,
                     tuple(cand_p.local_tp_widths),
                     int(cand_p.redundant_experts_per_rank),
                     tuple(part or ()),
@@ -634,7 +679,7 @@ def _run_sweep_candidate(
     parsed, cache, cand_p, cand_devices, part, ranks, cand_id, meta, promoted, *,
     locked, index, phase, scope, context, base_q, base_emit, sla_ms, output_budget,
     max_sequences_per_dp, two_stage, isolate_workers, candidate_timeout_s,
-    deadline_monotonic, stream, progress_callback,
+    deadline_monotonic, stream, progress_callback, raw_case=None,
 ):
     common = {
         CANDIDATE_ID_KEY: cand_id,
@@ -662,7 +707,8 @@ def _run_sweep_candidate(
                 output_budget, max_sequences_per_dp,
                 stage=(STAGE_SCREEN if two_stage else STAGE_FULL),
                 timeout_s=candidate_timeout_s,
-                deadline_monotonic=deadline_monotonic)
+                deadline_monotonic=deadline_monotonic,
+                raw_case=raw_case)
             if row.get("evaluation_stage") == STATIC_STAGE:
                 if row.get("feasibility_status") == "capacity_infeasible":
                     cache.static_capacity_rejections += 1
@@ -672,12 +718,14 @@ def _run_sweep_candidate(
                 promoted.append({**dict(row),
                                  "part": tuple(part or ()),
                                  "parsed": parsed,
+                                 "raw_case": raw_case,
                                  "meta": dict(meta)})
         else:
+            raw_for_resize = raw_case if raw_case is not None else parsed
             machine = cache.machine(
                 _derivation_key(parsed), cand_devices,
                 lambda: materialize_machine_for_devices(
-                    parsed, parsed, cand_devices))
+                    parsed, raw_for_resize, cand_devices))
             if index > 0:
                 cache.model_spec_reuses += 1
             cand_case = build_candidate_case(
@@ -818,9 +866,11 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
                             output_jsonl, resume, progress_callback, base_q,
                             base_emit, locked_plan, pinned_devices,
                             finalist_top_k=None, isolate_workers=False,
-                            jobs=1, finalist_sink=None):
+                            jobs=1, finalist_sink=None, raw_case=None):
     path = Path(output_jsonl) if output_jsonl is not None else None
-    checkpoint = _load_checkpoint(path) if (resume and path is not None) else {}
+    checkpoint, screen_checkpoint = (
+        _load_checkpoint_stages(path) if (resume and path is not None) else ({}, {})
+    )
     stream = _open_stream(path, resume)
     locked = locked_plan
     if lock_parallel:
@@ -828,7 +878,7 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
             parsed, candidates=candidates, fixed_parallel=fixed_parallel,
             num_devices=devices, candidate_tps=candidate_tps,
             ep_candidates=ep_candidates, pp_candidates=pp_candidates,
-            pcp_candidates=pcp_candidates)
+            pcp_candidates=pcp_candidates, dcp_candidates=dcp_candidates)
         if locked is None:
             locked = _prepare_locked_plan(
                 parsed, sla_ms=sla_ms, context=context, phase=phase,
@@ -857,12 +907,7 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
         cand_list = expanded
     if locked is None:
         for raw_candidate in cand_list:
-            cand_dict = {key: int(raw_candidate.get(key, 1))
-                         for key in ("dp", "tp", "ep", "pp", "pcp")}
-            cand_dict.update({key: raw_candidate[key]
-                              for key in ("cp", "dcp", "cp_plan", *LOCAL_TP_CANDIDATE_KEYS)
-                              if key in raw_candidate})
-            ParallelSpec.from_mapping(cand_dict)
+            _candidate_parallel_spec(raw_candidate)
     resolved_jobs = resolve_jobs(jobs, task_count=max(1, len(cand_list)))
     promoted: list[dict[str, Any]] = []
     try:
@@ -879,7 +924,8 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
                 allow_pcp=allow_pcp, two_stage=two_stage,
                 fixed_parallel=fixed_parallel, checkpoint=checkpoint,
                 resume=resume, stream=stream,
-                progress_callback=progress_callback, workers=resolved_jobs)
+                progress_callback=progress_callback, workers=resolved_jobs,
+                raw_case=raw_case)
             return
         for index, raw_candidate in enumerate(cand_list):
             if (deadline_monotonic is not None
@@ -891,10 +937,22 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
                 output_budget=output_budget, sla_ms=sla_ms, max_sequences_per_dp=max_sequences_per_dp,
                 lock_parallel=lock_parallel, allow_dp=allow_dp, allow_ep=allow_ep,
                 allow_pp=allow_pp, allow_pcp=allow_pcp, two_stage=two_stage,
-                fixed_parallel=fixed_parallel,
+                fixed_parallel=fixed_parallel, raw_case=raw_case,
             )
             if (resume and cand_id in checkpoint
                     and checkpoint[cand_id].stage != STAGE_SCREEN):
+                if two_stage and cand_id in screen_checkpoint:
+                    screen_row = read_checkpoint_row(stream, screen_checkpoint[cand_id])
+                    screen_row["resumed_from_checkpoint"] = True
+                    screen_row["elapsed_ms"] = 0.0
+                    _screen_row_meta(screen_row, cache, meta)
+                    if finalist_sink is not None:
+                        retain_finalist(
+                            finalist_sink,
+                            {**screen_row, "_already_evaluated": True},
+                            finalist_top_k,
+                        )
+                    yield screen_row
                 row = read_checkpoint_row(stream, checkpoint[cand_id])
                 row["resumed_from_checkpoint"] = True
                 row["elapsed_ms"] = 0.0
@@ -907,7 +965,8 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
                 base_q=base_q, base_emit=base_emit, sla_ms=sla_ms, output_budget=output_budget,
                 max_sequences_per_dp=max_sequences_per_dp, two_stage=two_stage,
                 isolate_workers=isolate_workers, candidate_timeout_s=candidate_timeout_s,
-                deadline_monotonic=deadline_monotonic, stream=stream, progress_callback=progress_callback,
+                deadline_monotonic=deadline_monotonic, stream=stream,
+                progress_callback=progress_callback, raw_case=raw_case,
             )
         if two_stage and promoted and finalist_sink is not None:
             for item in promoted:
@@ -932,7 +991,9 @@ def num_devices_grid_hint(raw: Mapping[str, Any]) -> bool:
 def reconstruct_sweep_summary(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     """Reconstruct the exact aggregate report from streamed/checkpoint rows."""
     compacted: dict[str, dict[str, Any]] = {}
+    screened_b1: dict[str, dict[str, Any]] = {}
     order: list[str] = []
+    screened_order: list[str] = []
     meta: dict[str, Any] = {}
     final_meta: dict[str, Any] = {}
     for raw in rows:
@@ -947,6 +1008,10 @@ def reconstruct_sweep_summary(rows: Iterable[Mapping[str, Any]]) -> dict[str, An
             row[CANDIDATE_ID_KEY] = candidate_id
         if candidate_id not in compacted:
             order.append(candidate_id)
+        if row.get("evaluation_stage") == B1_STAGE:
+            if candidate_id not in screened_b1:
+                screened_order.append(candidate_id)
+            screened_b1[candidate_id] = dict(row)
         compacted[candidate_id] = row
     final_rows = []
     for candidate_id in order:
@@ -958,18 +1023,24 @@ def reconstruct_sweep_summary(rows: Iterable[Mapping[str, Any]]) -> dict[str, An
         final_rows.append(row)
     pareto = compute_pareto_frontier(final_rows)
     two_stage = bool(meta.get("two_stage", False))
-    b1_rows = [dict(row) for row in final_rows
-               if row.get("evaluation_stage") == B1_STAGE]
+    b1_rows = []
+    for candidate_id in screened_order:
+        b1_row = dict(screened_b1[candidate_id])
+        b1_row.pop("sweep_meta", None)
+        b1_row["elapsed_ms"] = 0.0
+        b1_rows.append(b1_row)
     b1_front = _b1_pareto(b1_rows) if two_stage else []
     static_rejected = sum(1 for row in final_rows
                           if row.get("evaluation_stage") == STATIC_STAGE)
     promoted = sum(1 for row in final_rows
                    if row.get("evaluation_stage") == FULL_STAGE)
-    b1_evaluated = sum(1 for row in final_rows
-                       if row.get("evaluation_stage") == B1_STAGE) + promoted
-    b1_rejected = sum(1 for row in final_rows
-                      if row.get("evaluation_stage") == B1_STAGE
-                      and row.get("b1_sla_pass") is False)
+    b1_evaluated = (
+        len(b1_rows) if b1_rows
+        else sum(1 for row in final_rows
+                 if row.get("evaluation_stage") == B1_STAGE) + promoted
+    )
+    b1_rejected = sum(1 for row in b1_rows
+                      if row.get("b1_sla_pass") is False)
     locked = any(row.get("evaluation_stage") == LOCKED_STAGE
                  for row in final_rows)
     report = _sweep_report(

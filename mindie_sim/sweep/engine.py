@@ -103,6 +103,7 @@ def compute_sweep_candidate_id(
     ranks_per_node: int, phase: str, scope: str, context: int,
     q_tokens: int, emit_tokens: float, output_budget: int, sla_ms: float,
     max_sequences_per_dp: int, lock_parallel: bool,
+    locked_plan: Mapping[str, Any] | None = None,
 ) -> str:
     """Deterministic 32-hex identity before any static or graph evaluation."""
     model = parsed.model
@@ -130,12 +131,18 @@ def compute_sweep_candidate_id(
         "max_sequences_per_dp": int(max_sequences_per_dp),
         "lock_parallel": bool(lock_parallel),
     }
-    return _digest({
+    payload: dict[str, Any] = {
         "model_runtime_digest": _digest(model_runtime),
         "hardware_identity": hardware_identity,
         "phase_boundary": phase_boundary,
         "parallel_spec": parallel_report(cand_p),
-    })[:CANDIDATE_ID_HEX_LEN]
+    }
+    if locked_plan is not None:
+        payload["locked_plan"] = {
+            "b": int(locked_plan["b"]),
+            "plan_identity": str(locked_plan["plan_identity"]),
+        }
+    return _digest(payload)[:CANDIDATE_ID_HEX_LEN]
 
 
 def parallel_report(spec: ParallelSpec) -> dict[str, Any]:
@@ -315,24 +322,42 @@ def validate_candidate_statically(
                                             pp_layer_partition=tuple(part or ())))
         validate_local_projection_tp(cand_case)
     runtime = parsed.runtime
+    runtime_meta = dict(runtime.metadata)
+    offload_meta = runtime_meta.get("offload")
+    has_weight_offload = bool(
+        isinstance(offload_meta, Mapping) and (
+            float(offload_meta.get("expert_ddr_ratio") or 0.0) > 0.0
+            or float(offload_meta.get("weight_ddr_ratio") or 0.0) > 0.0
+        )
+    ) or bool(runtime_meta.get("offload_policy"))
     include_draft = model.auxiliary is not None
-    weights = stage_weight_bytes(
-        model, cand_p, cand_machine.ranks_per_node,
-        include_draft=include_draft,
-        include_engram_tables=not bool(getattr(runtime, "engram_cpu_offload", False)),
-        layer_partition=part or None,
-        enable_shared_expert_dp=bool(dict(runtime.metadata).get(
-            "enable_shared_expert_dp", False)),
-    )
-    usable = min(float(die.memory_bytes) for die in cand_machine.dies) \
-        * float(runtime.gpu_memory_utilization)
-    if weights and max(weights) > usable:
-        return {
-            "ok": False, "kind": "capacity",
-            "reason": "capacity_exceeded:weights_exceed_usable_hbm",
-            "weight_bytes": float(max(weights)),
-            "memory": None, "b_vram_max_joint": 0,
-        }
+    if not has_weight_offload:
+        weights = stage_weight_bytes(
+            model, cand_p, cand_machine.ranks_per_node,
+            include_draft=include_draft,
+            include_engram_tables=not bool(getattr(runtime, "engram_cpu_offload", False)),
+            layer_partition=part or None,
+            enable_shared_expert_dp=bool(runtime_meta.get(
+                "enable_shared_expert_dp", False)),
+        )
+        if weights:
+            util = float(runtime.gpu_memory_utilization)
+            width = max(1, int(cand_p.tp) * int(cand_p.pcp))
+            total_replicas = max(1, int(cand_p.dp) * int(cand_p.external_dp))
+            for replica in range(total_replicas):
+                for stage in range(min(int(cand_p.pp), len(weights))):
+                    first = (replica * int(cand_p.pp) + stage) * width
+                    stage_dies = cand_machine.dies[first:first + width]
+                    if not stage_dies:
+                        continue
+                    stage_usable = min(float(die.memory_bytes) for die in stage_dies) * util
+                    if float(weights[stage]) > stage_usable:
+                        return {
+                            "ok": False, "kind": "capacity",
+                            "reason": "capacity_exceeded:weights_exceed_usable_hbm",
+                            "weight_bytes": float(weights[stage]),
+                            "memory": None, "b_vram_max_joint": 0,
+                        }
     cand_case = replace(parsed, machine=cand_machine,
                         runtime=replace(parsed.runtime, parallel=cand_p,
                                         pp_layer_partition=tuple(part or ())))
@@ -350,12 +375,12 @@ def validate_candidate_statically(
         emitted_tokens_per_seq=emit_tokens, memory=memory)
     decode_q, decode_emit = _resolve_speculative_tokens(
         cand_case, output_budget=output_budget, tokens_per_seq=None,
-        emitted_tokens_per_seq=None)
+        emitted_tokens_per_seq=None, phase="decode")
     if phase == "prefill":
         lifecycle = capacity_window(
             cand_case, phase="decode", context=context + int(q_tokens),
             tokens_per_seq=decode_q, sequences=1, output_budget=output_budget,
-            emitted_tokens_per_seq=decode_emit, memory=memory)
+            emitted_tokens_per_seq=decode_emit, memory=None)
         fits = bool(b1["fits"] and lifecycle["fits"])
     else:
         fits = bool(b1["fits"])
@@ -374,19 +399,23 @@ def validate_candidate_statically(
         cand_case, context=context, tokens_per_seq=q_tokens,
         output_budget=output_budget, emitted_tokens_per_seq=emit_tokens,
         async_scheduling=True, phase=phase, memory=memory)
-    b_joint = min(b_sync, b_async)
+    if cand_case.runtime.memory:
+        b_active = _vram_max_sequences_per_dp(
+            cand_case, context=context, tokens_per_seq=q_tokens,
+            output_budget=output_budget, emitted_tokens_per_seq=emit_tokens,
+            async_scheduling=None, phase=phase, memory=memory)
+    else:
+        b_active = b_async if cand_case.runtime.async_scheduling else b_sync
+    b_joint = b_active
     if phase == "prefill":
-        life_sync = _vram_max_sequences_per_dp(
+        life_active = _vram_max_sequences_per_dp(
             cand_case, context=context + int(q_tokens),
             tokens_per_seq=decode_q, output_budget=output_budget,
-            emitted_tokens_per_seq=decode_emit, async_scheduling=False,
+            emitted_tokens_per_seq=decode_emit,
+            async_scheduling=(None if cand_case.runtime.memory
+                              else bool(cand_case.runtime.async_scheduling)),
             phase="decode")
-        life_async = _vram_max_sequences_per_dp(
-            cand_case, context=context + int(q_tokens),
-            tokens_per_seq=decode_q, output_budget=output_budget,
-            emitted_tokens_per_seq=decode_emit, async_scheduling=True,
-            phase="decode")
-        b_joint = min(b_joint, life_sync, life_async)
+        b_joint = min(b_joint, life_active)
     return {
         "ok": b_joint > 0, "kind": "ok" if b_joint > 0 else "capacity",
         "reason": None if b_joint > 0 else
@@ -395,6 +424,8 @@ def validate_candidate_statically(
         "memory": memory,
         "kv_bytes_per_token": float(max(memory.cache_bytes(
             max(1, int(context)), padded=False))) / max(1, int(context)),
+        "b_vram_max_sync": max(0, int(min(b_sync, max_sequences_per_dp))),
+        "b_vram_max_async": max(0, int(min(b_async, max_sequences_per_dp))),
         "b_vram_max_joint": max(0, int(min(b_joint, max_sequences_per_dp))),
     }
 
@@ -474,7 +505,12 @@ def b1_screen(parsed: CaseSpec, cand_case: CaseSpec, cand_p: ParallelSpec,
         sequences=SCREEN_BATCH, scope=scope, run_graph=False,
         precomputed_graph=(graphs, effective, None), evaluation_context=ctx)
     step = float(operators["operator_sum_ms"])
-    tps = (cand_p.dp * float(emit_tokens) * MS_PER_S / step
+    screen_lb_ms = max(
+        (float(op.get("duration_ms") or 0.0) for op in (operators.get("operators") or ())),
+        default=0.0,
+    )
+    fleet_dp = int(cand_p.dp) * max(1, int(getattr(cand_p, "external_dp", 1) or 1))
+    tps = (fleet_dp * float(emit_tokens) * MS_PER_S / step
            if step > 0.0 else 0.0)
     eff_max = max(0, min(int(max_sequences_per_dp), int(b_vram_max)))
     return {
@@ -494,9 +530,11 @@ def b1_screen(parsed: CaseSpec, cand_case: CaseSpec, cand_p: ParallelSpec,
         "step_ms_at_b1": step, "step_ms_feasible": None,
         "tps_at_b1": tps, "tps_screen_b1": tps,
         "tps_feasible": 0.0, "tps_per_die": 0.0,
-        "max_concurrency_bound": eff_max * int(cand_p.dp),
+        "max_concurrency_bound": eff_max * fleet_dp,
         "upper_tps_per_die": (eff_max * tps / float(common["num_devices"])
                               if common["num_devices"] else 0.0),
+        "screen_sla_ms": float(sla_ms),
+        "screen_lower_bound_ms": screen_lb_ms,
         "operator_sum_screen_ms": step,
         "graph_step_ms": None,
         "graph_ttft_ms": (step if (phase, scope) == ("prefill", "model")
@@ -532,6 +570,7 @@ def full_row(parsed: CaseSpec, cand_case: CaseSpec, cand_p: ParallelSpec,
     tps_feasible = (float(candidate["tps_feasible"])
                     if candidate is not None and "tps_feasible" in candidate
                     else float(scen["tps_feasible"]))
+    fleet_dp = int(cand_p.dp) * max(1, int(getattr(cand_p, "external_dp", 1) or 1))
     row = {
         **dict(common),
         "status": "feasible" if feasible else "sla_or_vram_exceeded",
@@ -547,7 +586,7 @@ def full_row(parsed: CaseSpec, cand_case: CaseSpec, cand_p: ParallelSpec,
         "b_sla": b_sla, "b_vram_max": b_vram, "b_feasible": b_feasible,
         "b_sla_is_proven_max": scen.get("search", {}).get(
             "b_sla_is_proven_max", False),
-        "total_feasible_concurrency": b_feasible * int(cand_p.dp),
+        "total_feasible_concurrency": b_feasible * fleet_dp,
         "latency_candidate": scen.get("latency_candidate"),
         "feasible_candidate": candidate,
         "step_ms_at_b1": float(scen["step_ms_at_b1"]),
@@ -578,6 +617,26 @@ def full_row(parsed: CaseSpec, cand_case: CaseSpec, cand_p: ParallelSpec,
     return row
 
 
+def finalist_rank_key(row: Mapping[str, Any]) -> tuple[int, float, float, str]:
+    """Rank screened finalists by throughput upper bound, excluding only on proven lower bounds."""
+    step = float(row["operator_sum_screen_ms"])
+    sla_limit = row.get("screen_sla_ms")
+    if sla_limit is None and isinstance(row.get("sweep_meta"), Mapping):
+        sla_limit = row["sweep_meta"].get("sla_ms")
+    lb_ms = row.get("screen_lower_bound_ms")
+    proven_over_sla = (
+        sla_limit is not None and lb_ms is not None
+        and float(lb_ms) > float(sla_limit)
+    )
+    upper_tps = float(row.get("upper_tps_per_die") or 0.0)
+    return (
+        1 if proven_over_sla else 0,
+        0.0 if proven_over_sla else -upper_tps,
+        step,
+        str(row.get(CANDIDATE_ID_KEY, "")),
+    )
+
+
 def select_finalists(
     promoted: Sequence[Mapping[str, Any]], finalist_top_k: int,
 ) -> list[Mapping[str, Any]]:
@@ -586,8 +645,7 @@ def select_finalists(
         row for row in promoted
         if row.get("operator_sum_screen_ms") is not None
     ]
-    ranked.sort(key=lambda row: (float(row["operator_sum_screen_ms"]),
-                                 str(row.get(CANDIDATE_ID_KEY, ""))))
+    ranked.sort(key=finalist_rank_key)
     return ranked[:int(finalist_top_k)]
 
 
@@ -595,7 +653,9 @@ def project_replica_row(base: Mapping[str, Any], *,
                         cand_p: ParallelSpec, devices: int,
                         ranks_per_node: int, candidate_id: str) -> dict[str, Any]:
     """Project a per-replica result to one homogeneous DP cohort."""
-    base_dp = max(1, int(dict(base["parallel"]).get("dp", 1)))
+    base_spec = dict(base.get("parallel_spec") or base["parallel"])
+    base_dp = max(1, int(base_spec.get("dp", 1)) * max(1, int(base_spec.get("external_dp", 1) or 1)))
+    fleet_dp = int(cand_p.dp) * max(1, int(getattr(cand_p, "external_dp", 1) or 1))
     row = dict(base)
     row.update({
         CANDIDATE_ID_KEY: candidate_id,
@@ -608,9 +668,9 @@ def project_replica_row(base: Mapping[str, Any], *,
     base_b = int(base.get("b_feasible", 0))
     base_tps = float(base.get("tps_feasible", 0.0))
     base_tps_b1 = float(base.get("tps_at_b1", 0.0))
-    row["total_feasible_concurrency"] = base_b * int(cand_p.dp)
-    row["tps_feasible"] = base_tps / float(base_dp) * int(cand_p.dp)
-    row["tps_at_b1"] = base_tps_b1 / float(base_dp) * int(cand_p.dp)
+    row["total_feasible_concurrency"] = base_b * fleet_dp
+    row["tps_feasible"] = base_tps / float(base_dp) * fleet_dp
+    row["tps_at_b1"] = base_tps_b1 / float(base_dp) * fleet_dp
     row["tps_per_die"] = row["tps_feasible"] / float(devices)
     return row
 
@@ -665,8 +725,9 @@ def build_candidate_case(parsed: CaseSpec, machine: Any,
 def candidate_devices(raw: Mapping[str, Any], num_devices: int | None) -> int:
     if num_devices is not None:
         return int(num_devices)
+    ext_dp = int(raw.get("external_dp", raw.get("external_data_parallel_size", 1)))
     return max(1, int(raw.get("dp", 1)) * int(raw.get("tp", 1))
-               * int(raw.get("pp", 1)) * int(raw.get("pcp", 1)))
+               * int(raw.get("pp", 1)) * int(raw.get("pcp", 1)) * ext_dp)
 
 
 def enumerate_case_candidates(
@@ -699,7 +760,8 @@ def evaluate_candidate_worker(task: Mapping[str, Any]) -> dict[str, Any]:
     part = tuple(task["part"] or ())
     common = dict(task["common"])
     probe = dict(task["probe"])
-    machine = materialize_machine_for_devices(parsed, parsed, cand_devices)
+    raw_case = task.get("raw_case") if task.get("raw_case") is not None else parsed
+    machine = materialize_machine_for_devices(parsed, raw_case, cand_devices)
     cand_case = build_candidate_case(parsed, machine, cand_p, part)
     from mindie_sim.public.errors import UnmodeledCapabilityError
 
@@ -738,7 +800,7 @@ __all__ = [
     "SweepEvaluationCache", "b1_screen", "build_candidate_case",
     "candidate_devices", "compute_pareto_frontier",
     "compute_sweep_candidate_id", "enumerate_case_candidates",
-    "evaluate_candidate_worker", "full_row", "kv_replication_fields",
+    "evaluate_candidate_worker", "finalist_rank_key", "full_row", "kv_replication_fields",
     "parallel_report", "project_replica_row", "select_finalists",
     "set_deadline", "static_row", "timeout_row",
     "validate_candidate_statically",

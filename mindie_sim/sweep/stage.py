@@ -40,9 +40,10 @@ def _stage_of(row: Mapping[str, Any]) -> str:
     return STAGE_SCREEN if row.get("evaluation_stage") == B1_STAGE else STAGE_FULL
 
 
-def checkpoint_index(stream) -> dict[str, CheckpointRef]:
-    """Index complete lines and truncate one incomplete trailing line."""
-    index: dict[str, CheckpointRef] = {}
+def checkpoint_stage_index(stream) -> tuple[dict[str, CheckpointRef], dict[str, CheckpointRef]]:
+    """Index committed latest rows and screen rows separately, truncating torn tails."""
+    latest: dict[str, CheckpointRef] = {}
+    screens: dict[str, CheckpointRef] = {}
     while stream is not None:
         offset = stream.tell()
         line = stream.readline(MAX_CHECKPOINT_ROW_BYTES)
@@ -51,8 +52,6 @@ def checkpoint_index(stream) -> dict[str, CheckpointRef]:
         if not line.endswith(b"\n"):
             if len(line) == MAX_CHECKPOINT_ROW_BYTES:
                 raise ValueError("checkpoint_row_too_large")
-            # The writer flushes complete rows; a tail without its newline is
-            # an interrupted append and is removed before new rows are written.
             stream.seek(offset)
             stream.truncate()
             break
@@ -63,11 +62,20 @@ def checkpoint_index(stream) -> dict[str, CheckpointRef]:
                 or not row.get(CANDIDATE_ID_KEY)
                 or _stage_of(row) not in STAGES):
             raise ValueError("invalid_sweep_checkpoint_row")
-        index[str(row[CANDIDATE_ID_KEY])] = CheckpointRef(
-            offset, _stage_of(row))
-        if len(index) > CHECKPOINT_INDEX_LIMIT:
+        cid = str(row[CANDIDATE_ID_KEY])
+        stage = _stage_of(row)
+        ref = CheckpointRef(offset, stage)
+        latest[cid] = ref
+        if stage == STAGE_SCREEN:
+            screens[cid] = ref
+        if len(latest) > CHECKPOINT_INDEX_LIMIT:
             raise ValueError("checkpoint_index_limit_exceeded")
-    return index
+    return latest, screens
+
+
+def checkpoint_index(stream) -> dict[str, CheckpointRef]:
+    """Index complete lines and truncate one incomplete trailing line."""
+    return checkpoint_stage_index(stream)[0]
 
 
 def read_checkpoint_row(stream, ref: CheckpointRef) -> dict[str, Any]:
@@ -105,7 +113,8 @@ import hashlib
 
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.efficiency import (
-    evaluate_fixed_plan, prepare_fixed_plan, solve_sla_sizing,
+    _resolve_speculative_tokens, capacity_window, evaluate_fixed_plan,
+    prepare_fixed_plan, solve_sla_sizing,
 )
 from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.public.errors import UnmodeledCapabilityError
@@ -154,7 +163,8 @@ def prepare_locked_plan(parsed: CaseSpec, *, sla_ms: float, context: int,
 
 def validate_locked_arguments(parsed: CaseSpec, *, candidates, fixed_parallel,
                               num_devices, candidate_tps, ep_candidates,
-                              pp_candidates, pcp_candidates) -> None:
+                              pp_candidates, pcp_candidates,
+                              dcp_candidates=None) -> None:
     base = parsed.runtime.parallel
     for label, value in (("fixed_parallel", fixed_parallel),
                          ("candidates", candidates)):
@@ -172,7 +182,8 @@ def validate_locked_arguments(parsed: CaseSpec, *, candidates, fixed_parallel,
     for name, value, domain in (("tp", base.tp, candidate_tps),
                                 ("ep", base.ep, ep_candidates),
                                 ("pp", base.pp, pp_candidates),
-                                ("pcp", base.pcp, pcp_candidates)):
+                                ("pcp", base.pcp, pcp_candidates),
+                                ("dcp", base.dcp, dcp_candidates)):
         if domain is not None and value not in {int(item) for item in domain}:
             raise ModelingError(
                 f"lock_parallel_{name}_candidates_conflict_with_baseline:{value}")
@@ -190,8 +201,21 @@ def locked_row(cand_case: CaseSpec, locked: Mapping[str, object], *,
     capacity = analysis["capacity"]
     step = float(analysis["graph_duration_ms"])
     b_vram, sla_ok = int(capacity["b_vram_max_configured"]), step <= sla_ms
-    feasible = bool(sla_ok and batch <= b_vram and capacity["is_vram_feasible"])
-    tps = ((batch * spec.dp * float(locked["emitted"]) * MS_PER_S / step)
+    lifecycle_fits = True
+    if str(geometry.get("phase") or "") == "prefill":
+        decode_q, decode_emit = _resolve_speculative_tokens(
+            cand_case, output_budget=output_budget, tokens_per_seq=None,
+            emitted_tokens_per_seq=None, phase="decode")
+        lifecycle_win = capacity_window(
+            cand_case, phase="decode",
+            context=int(geometry["context"]) + int(geometry["tokens"]),
+            tokens_per_seq=decode_q, sequences=batch,
+            output_budget=output_budget, emitted_tokens_per_seq=decode_emit)
+        lifecycle_fits = bool(lifecycle_win["fits"])
+    vram_ok = bool(batch <= b_vram and capacity["is_vram_feasible"] and lifecycle_fits)
+    feasible = bool(sla_ok and vram_ok)
+    fleet_dp = int(spec.dp) * max(1, int(getattr(spec, "external_dp", 1) or 1))
+    tps = ((batch * fleet_dp * float(locked["emitted"]) * MS_PER_S / step)
            if feasible and step > 0.0 else 0.0)
     probe = max(1, int(geometry["context"]))
     memory = Memory(cand_case, workspace_tokens=1)
@@ -243,7 +267,7 @@ def locked_row(cand_case: CaseSpec, locked: Mapping[str, object], *,
         "search": {"method": "retained_baseline_batch_no_reselection",
                    "b_sla_is_proven_max": False,
                    "evaluated_candidates": [batch]},
-        "total_feasible_concurrency": (batch if feasible else 0) * spec.dp,
+        "total_feasible_concurrency": (batch if feasible else 0) * fleet_dp,
         "step_ms_feasible": step if feasible else None,
         "tps_feasible": tps, "tps_per_die": tps / float(devices),
         "network_mbu": analysis.get("network_mbu"),
@@ -287,7 +311,8 @@ def _evaluate(job: Mapping[str, Any], stage: str) -> dict[str, Any]:
     devices = int(job["num_devices"])
     part = tuple(job["part"] or ())
     parallel = ParallelSpec.from_mapping(job["parallel_spec"])
-    machine = materialize_machine_for_devices(base, base, devices)
+    raw_case = job.get("_raw_case") if job.get("_raw_case") is not None else base
+    machine = materialize_machine_for_devices(base, raw_case, devices)
     case = build_candidate_case(base, machine, parallel, part)
     try:
         static = validate_candidate_statically(
@@ -369,8 +394,8 @@ from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.sweep.engine import (
-    CANDIDATE_ID_KEY, FULL_STAGE, select_finalists, set_deadline, static_row,
-    timeout_row,
+    CANDIDATE_ID_KEY, FULL_STAGE, finalist_rank_key, select_finalists,
+    set_deadline, static_row, timeout_row,
 )
 
 
@@ -387,8 +412,7 @@ def retain_finalist(sink: list, item: Mapping[str, Any], top_k: int) -> list:
     if item.get("operator_sum_screen_ms") is None:
         return sink
     sink.append(item)
-    sink.sort(key=lambda row: (float(row["operator_sum_screen_ms"]),
-                               str(row.get(CANDIDATE_ID_KEY, ""))))
+    sink.sort(key=finalist_rank_key)
     del sink[int(top_k):]
     return sink
 
@@ -439,7 +463,7 @@ def screen_row_meta(row: dict[str, Any], cache: Any,
 def isolated_row(parsed, cand_p, cand_devices, part, common, phase, scope,
                  context, q_tokens, emit_tokens, sla_ms, output_budget,
                  max_sequences_per_dp, *, stage, timeout_s,
-                 deadline_monotonic):
+                 deadline_monotonic, raw_case=None):
     """Evaluate one candidate behind a killable process boundary."""
     from mindie_sim.sweep.stage import evaluate_sweep_job
 
@@ -448,6 +472,7 @@ def isolated_row(parsed, cand_p, cand_devices, part, common, phase, scope,
         budgets.append(max(0.0, float(deadline_monotonic) - time.monotonic()))
     job = {
         "_case": parsed,
+        "_raw_case": raw_case,
         "parallel_spec": cand_p.to_dict(),
         "num_devices": int(cand_devices),
         "part": tuple(part or ()),
@@ -469,6 +494,8 @@ def evaluate_finalists(items, *, finalist_top_k, cache, stream, full_row_fn,
                        max_sequences_per_dp, meta=None):
     """Evaluate the retained finalists and stream their complete rows."""
     for item in select_finalists(items, finalist_top_k):
+        if item.get("_already_evaluated"):
+            continue
         common = {key: item[key] for key in FINALIST_COMMON_KEYS if key in item}
         cand_p = ParallelSpec.from_mapping(item["parallel_spec"])
         item_meta = item.get("meta") or meta or {}
@@ -482,7 +509,8 @@ def evaluate_finalists(items, *, finalist_top_k, cache, stream, full_row_fn,
                     q_tokens, emit_tokens, sla_ms, output_budget,
                     max_sequences_per_dp, stage=STAGE_FULL,
                     timeout_s=candidate_timeout_s,
-                    deadline_monotonic=deadline_monotonic)
+                    deadline_monotonic=deadline_monotonic,
+                    raw_case=item.get("raw_case"))
             else:
                 row = full_row_fn(
                     item["parsed"], item["cand_case"], cand_p, common=common,
