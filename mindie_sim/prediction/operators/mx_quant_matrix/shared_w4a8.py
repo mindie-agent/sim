@@ -16,8 +16,10 @@ from __future__ import annotations
 
 from collections import Counter
 from functools import partial
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
@@ -31,6 +33,16 @@ from .mxfp4_grouped import (
 )
 from .mxfp4_panels import compiled_panels
 from .mxfp4_registers import B8_WIDEN_BLOCK_ELEMENTS, CLASSES, TABLES
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="vllm_ascend/quantization/methods/w4a8/w4a8_mxfp4.py",
+        source_sha256="3d23f23d108ac0718ad85fe0c25b2fc9ebc7699cd640bc74e9967819192bc19b",
+    ),
+)
 
 MX_SCALE_PAIR_ROUNDUP = MX_SCALE_GROUP_PAIR - 1
 OUTPUT_N_ALIGNMENT = 64
@@ -82,7 +94,7 @@ SOURCE_INTERFACE = {
     "compute_format": "fp8_e4m3",
     "output_format": "bf16",
 }
-_ACCEPTED_COMPUTE_FORMATS = frozenset({"fp8_e4m3", "bf16"})
+_NATIVE_COMPUTE_DTYPES = frozenset({"", "fp8_e4m3", "fp8_e4m3fn"})
 SHARED_FAMILIES = ("gate_up_projection", "down_projection")
 
 
@@ -136,9 +148,10 @@ def matches_source_interface(op):
         return False
     if meta.get("native_fusion_group") or meta.get("native_fusion"):
         return False
-    if any(meta.get(key) != value for key, value in SOURCE_INTERFACE.items() if key != "compute_format"):
+    if any(meta.get(key) != value for key, value in SOURCE_INTERFACE.items()):
         return False
-    if meta.get("compute_format") not in _ACCEPTED_COMPUTE_FORMATS:
+    abi = getattr(op, "precision_abi", None)
+    if abi is not None and str(getattr(abi, "compute_dtype", "") or "").lower() not in _NATIVE_COMPUTE_DTYPES:
         return False
     if meta.get("weight_block") not in (None, MX_SCALE_GROUP):
         return False

@@ -9,16 +9,42 @@
 [Side-Effect Policy] Submit ordinary Engine work; no device or calibration I/O.
 """
 from dataclasses import dataclass
-from math import ceil
+from math import ceil, prod
 from itertools import groupby
 from collections import Counter
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.compute_arch_presets import CAPABILITY_PRESETS
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.operators.matrix.matrix_cycle import matrix_cycle
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
 FP32_BYTES = 4
+BF16_ELEMENT_BYTES = 2
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul/op_host/op_tiling/arch35/grouped_quant_matmul_tiling.cpp",
+        source_sha256="cfea3917793e5c2589956f4b3cff006f099f82df7fa2a00bec77bad1ca803d12",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/common/cgmct/block/block_mmad_mx.h",
+        source_sha256="5916126d45f67f593e796391d6c275cfaf7921a0c9655f5017da37a8b32f881c",
+    ),
+    SourceRef(
+        repository="cann/ops-nn",
+        revision="238f76a06d0cfc5ee90071e2c08310e2b517c3a6",
+        relative_path="quant/swiglu_mx_quant/op_host/arch35/swiglu_mx_quant_tiling_arch35.cpp",
+        source_sha256="b3401bb4d57f9f99050ed727c6c87dbbbef717193d2040946a3ceb9007bf8219",
+    ),
+)
 
 CUBE_MN_FRACTAL = 16
 N_TILE_COLUMNS = 256
@@ -27,6 +53,13 @@ K_TILE_DEPTH = 128
 AUTO_L1_K_LIMIT = 256
 ASWT_M_WINDOW_TILES = 4
 GROUP_LIST_ENTRY_BYTES = 8
+MIN_NZ_DIMENSION = 2
+SWIGLU_MX_BASE_N = 256
+_SWIGLU_MX_INPUT_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16"})
+_SWIGLU_MX_OUTPUT_DTYPES = frozenset({
+    "fp8_e4m3", "fp8_e4m3fn", "fp8_e5m2", "fp4_e2m1", "fp4_e1m2", "mxfp8", "mxfp4",
+})
+_SWIGLU_MX_FP4_DTYPES = frozenset({"fp4_e2m1", "fp4_e1m2", "mxfp4"})
 
 SOURCE = {
     'repository': 'https://gitcode.com/cann/ops-transformer',
@@ -58,21 +91,57 @@ M_TILE_ROWS = 256
 L2_EFFECTIVE_FRACTION = 0.75
 
 
+def fp8_subtile_dims(geometry) -> tuple[int, int, int]:
+    """Resolve registered FP8 Cube subtile ``(tile_m, tile_n, tile_k)``."""
+    datapath = getattr(geometry, "datapath", None)
+    waves = getattr(datapath, "subtile_wave", ()) if datapath is not None else ()
+    for wave in waves:
+        if getattr(wave, "native_mode", "") in {"fp8_e4m3", "mxfp8"}:
+            return (
+                int(wave.independently_issuable_m),
+                int(wave.tile_n),
+                int(wave.tile_k),
+            )
+    preset_wave = next(
+        w for w in CAPABILITY_PRESETS["npu_arch_3510"]["subtile_waves"]
+        if w.native_mode == "fp8_e4m3"
+    )
+    return (
+        int(preset_wave.independently_issuable_m),
+        int(preset_wave.tile_n),
+        int(preset_wave.tile_k),
+    )
+
+
 def effective_l2_bytes(geometry):
-    """Typed effective L2 capacity, or the declared profile fallback."""
+    """Typed effective L2 capacity, bounded by AdmissionMemoryView when present."""
+    res_units = getattr(geometry, "resource_units", None)
+    if res_units is not None and "l2" not in res_units:
+        return 0.0
     mechanisms = getattr(geometry, "physical_mechanisms", None)
     hierarchy = getattr(mechanisms, "memory_hierarchy", None)
     if hierarchy is not None:
-        return float(hierarchy.effective_l2_bytes)
-    buffers = getattr(geometry, "buffers", {}) or {}
-    return L2_EFFECTIVE_FRACTION * float(buffers.get("l2", 0))
+        base = float(hierarchy.effective_l2_bytes)
+    else:
+        buffers = getattr(geometry, "buffers", {}) or {}
+        base = L2_EFFECTIVE_FRACTION * float(buffers.get("l2", 0))
+    view = getattr(geometry, "admission_memory_view", None)
+    if view is not None and hasattr(view, "effective_l2_bytes"):
+        die = getattr(geometry, "rank", None)
+        die_id = 0 if die is None else int(die)
+        view_cap = float(view.effective_l2_bytes(die_id))
+        return max(0.0, min(base, view_cap))
+    return max(0.0, base)
 
 
 def weight_bank_bytes(rows, n, k):
-    """Aligned NZ weight payload plus MX scale pairs over every expert bank."""
-    payload = sum(align(n, NZ_N_GRANULE) * align(k, NZ_K_GRANULE) for _ in rows)
+    """Aligned NZ weight payload plus MX scale pairs over active (rows > 0) banks."""
+    active = tuple(m for m in rows if m > 0)
+    if not active:
+        return 0.0
+    payload = len(active) * align(n, NZ_N_GRANULE) * align(k, NZ_K_GRANULE)
     scales = sum((m + n) * MX_SCALE_PAIR_BYTES
-                 * ceil(k / MX_SCALE_GROUP_PAIR) for m in rows)
+                 * ceil(k / MX_SCALE_GROUP_PAIR) for m in active)
     return float(payload + scales)
 
 
@@ -113,7 +182,10 @@ def l2_fractions(rows, n, k, column_tiles, l2_bytes):
             panel_share)
 
 
-def panel_work(m, n, kd, bk, *, activation_l2=0.0, weight_l2=0.0):
+def panel_work(
+    m, n, kd, bk, *, activation_l2=0.0, weight_l2=0.0,
+    subtile_m=CUBE_MN_FRACTAL, subtile_n=CUBE_MN_FRACTAL, subtile_k=MX_SCALE_GROUP_PAIR,
+):
     """Physical NZ reads, MX scale-pair reads, and aligned L1-to-L0 service.
 
     ``activation_l2`` is the declared share of the activation slice already
@@ -134,16 +206,21 @@ def panel_work(m, n, kd, bk, *, activation_l2=0.0, weight_l2=0.0):
     if share > 0 or wshare > 0:
         load['l2'] = activation * share + weight * wshare
     load = Work(resources=load)
+    k_granule = max(MX_SCALE_GROUP_PAIR, int(subtile_k))
+    issued_m = align(m, int(subtile_m))
+    issued_n = align(n, int(subtile_n))
     steps = []
     for kk in range(0, kd, bk):
-        # MX MMAD K and operand representation are padded to 64, unlike M/N.
-        mk = align(min(bk, kd - kk), MX_SCALE_GROUP_PAIR)
+        # MX MMAD K and operand representation are padded to 64; physical Cube
+        # issue pads M and N to the registered FP8 subtile (16x16 on Arch35).
+        mk = align(min(bk, kd - kk), k_granule)
         # B uses transposed 2D loads: N32 payload, while the MX side
         # scale path uses N16. Odd N16 tails issue several data-only loads.
         operand = (align(m, CUBE_MN_FRACTAL) + align(n, NZ_N_GRANULE)) * mk
         operand += ((align(m, CUBE_MN_FRACTAL) + align(n, CUBE_MN_FRACTAL))
-                    * 2 * ceil(mk / MX_SCALE_GROUP_PAIR))
-        steps.append((Work(resources={'mte1': operand}), Work({'fp8_e4m3': 2 * m * n * mk})))
+                    * MX_SCALE_PAIR_BYTES * ceil(mk / MX_SCALE_GROUP_PAIR))
+        steps.append((Work(resources={'mte1': operand}),
+                      Work({'fp8_e4m3': 2 * issued_m * issued_n * mk})))
     return load, tuple(steps)
 
 
@@ -280,6 +357,55 @@ def _mx_group32(op) -> bool:
     return group == SWIGLU_MX_GROUP and scale in {"fp8_e8m0", "e8m0"}
 
 
+def _is_swiglu_mx_quant(op) -> bool:
+    """Require explicit SwiGLU fusion provenance and paired E8M0 2N->N ABI."""
+    if str(getattr(op, "recipe", "")) != "swiglu_quantize" or not _mx_group32(op):
+        return False
+    meta = dict(op.metadata)
+    fused_from = meta.get("fused_from")
+    fused_tokens = (
+        {str(tok) for tok in fused_from}
+        if isinstance(fused_from, (tuple, list))
+        else ({str(fused_from)} if fused_from else set())
+    )
+    has_swiglu_provenance = (
+        meta.get("fused_kernel") == "npu_swiglu_mx_quant"
+        or "swiglu" in fused_tokens
+        or "swiglu_quantize" in fused_tokens
+    )
+    if not has_swiglu_provenance:
+        return False
+    in_fmt = str(meta.get("input_format") or getattr(op, "dtype", "") or "").lower()
+    if in_fmt and in_fmt not in _SWIGLU_MX_INPUT_DTYPES:
+        return False
+    out_fmt = str(meta.get("output_format") or "").lower()
+    if out_fmt and out_fmt not in _SWIGLU_MX_OUTPUT_DTYPES:
+        return False
+    shape = tuple(getattr(op, "local_shape", ()) or ())
+    if len(shape) >= 2:
+        leading = tuple(int(d) for d in shape[:-1])
+        rows = prod(leading)
+        width = int(shape[-1])
+        if rows > 0 and width > 0:
+            expected_scale_tail = (ceil(width / MX_SCALE_GROUP_PAIR), MX_SCALE_PAIR_BYTES)
+            expected_scale_bytes = rows * expected_scale_tail[0] * MX_SCALE_PAIR_BYTES
+            scale_shape = meta.get("activation_scale_shape")
+            if scale_shape is not None and tuple(int(d) for d in scale_shape) != (*leading, *expected_scale_tail):
+                return False
+            scale_bytes = meta.get("activation_scale_bytes")
+            if scale_bytes is not None and int(scale_bytes) != expected_scale_bytes:
+                return False
+            payload_row = ceil(width / 2) if out_fmt in _SWIGLU_MX_FP4_DTYPES else width
+            mte3 = float(getattr(op, "mte3_bytes", 0.0) or 0.0)
+            if mte3 > 0.0 and mte3 < rows * payload_row + expected_scale_bytes:
+                return False
+            if not meta.get("onchip_handoff_from"):
+                mte2 = float(getattr(op, "mte2_bytes", 0.0) or 0.0)
+                if mte2 > 0.0 and mte2 < rows * 2 * width * BF16_ELEMENT_BYTES:
+                    return False
+    return True
+
+
 def _swiglu_mx_setup_ms(context) -> float:
     """Calibrated AIV dispatch + MTE/flag setup strictly from bound PrimitiveTable."""
     if getattr(context, "primitive_table", None) is None:
@@ -293,6 +419,31 @@ def _swiglu_mx_setup_ms(context) -> float:
     )
 
 
+def _swiglu_mx_tile_grid(rows: int, width: int, aiv_count: int) -> tuple[int, int, int]:
+    """Host AIV grid from swiglu_mx_quant_tiling_arch35.cpp:592,618."""
+    if rows <= 0:
+        return 0, 1, 0
+    dim_n_blocks = max(1, ceil(max(1, width) / SWIGLU_MX_BASE_N))
+    bm_cores = min(rows, aiv_count)
+    n_cores = min(aiv_count // bm_cores, dim_n_blocks) if bm_cores < aiv_count else 1
+    return bm_cores, max(1, n_cores), max(1, ceil(rows / bm_cores))
+
+
+def _swiglu_mx_col_splits(width: int, n_cores: int) -> tuple[int, ...]:
+    """Column elements owned by each N-split AIV (BASE_DIM1=256 blocks)."""
+    dim_n_blocks = max(1, ceil(max(1, width) / SWIGLU_MX_BASE_N))
+    base_blocks, rem_blocks = divmod(dim_n_blocks, max(1, n_cores))
+    splits = []
+    offset = 0
+    for idx in range(max(1, n_cores)):
+        blocks = base_blocks + (1 if idx < rem_blocks else 0)
+        cols = min(blocks * SWIGLU_MX_BASE_N, max(0, width - offset))
+        if cols > 0:
+            splits.append(cols)
+        offset += cols
+    return tuple(splits) or (max(1, width),)
+
+
 def build_swiglu_mx_quant(op, geometry):
     """A5 group-32 row program priced from PrimitiveTable + exact UB/vector work."""
     from mindie_sim.prediction.mechanism import OperatorPlan, Work
@@ -300,51 +451,101 @@ def build_swiglu_mx_quant(op, geometry):
     from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
     from mindie_sim.prediction.operators.vector.vector_pipeline import AIVTiledVectorAndGatherRecipe
 
-    if not (_a5_row_wave(geometry) and _mx_group32(op)):
+    if not (_a5_row_wave(geometry) and _is_swiglu_mx_quant(op)):
         return build_plan(AIVTiledVectorAndGatherRecipe(), op, geometry)
     base = work_from_op(op)
-    rows = int(op.local_shape[0])
+    if len(op.local_shape) >= 2:
+        rows = prod(int(d) for d in op.local_shape[:-1])
+        width = int(op.local_shape[-1])
+    else:
+        rows = int(op.local_shape[0]) if op.local_shape else 0
+        width = SWIGLU_MX_BASE_N
     read = float(op.mte2_bytes)
     write = float(op.mte3_bytes)
     vector = float(op.vector_ops)
     aiv_units = max(1, int((getattr(geometry, "resource_units", None) or {}).get("vector") or SWIGLU_MX_AIV_UNITS))
-    waves = max(1, -(-rows // aiv_units))
+    bm_cores, n_cores, waves = _swiglu_mx_tile_grid(rows, width, aiv_units)
+    used_aivs = bm_cores * n_cores
 
     def program(context):
-        multi_wave = rows >= aiv_units
+        owners = getattr(context, "stream_owners", None)
+        if owners is not None and getattr(owners, "aiv", None):
+            aiv_pool = tuple(int(u) for u in owners.aiv)
+        else:
+            avail = min(aiv_units, max(1, int(context.effective_aiv_cores)))
+            aiv_pool = tuple(range(avail))
+        eff_bm, eff_n, eff_waves = _swiglu_mx_tile_grid(rows, width, len(aiv_pool))
+        if eff_waves == 0:
+            setup_ms = float(context.setup_ms or 0.0)
+            return KernelProgram((Stage("kernel_setup", latency=setup_ms),)) if setup_ms > 0.0 else KernelProgram(())
+        multi_wave = rows >= len(aiv_pool)
         read_role = "mte2"
         if multi_wave and context.service_rate("mte2_aiv_dram") is not None:
             read_role = "mte2_aiv_dram"
-        placement = context.owned(0, 1, ("mte2_aiv", "vector", "mte3"))
+        col_splits = _swiglu_mx_col_splits(width, eff_n)
+        uniform_cols = len(set(col_splits)) <= 1
+
+        def _place(units):
+            placement = {}
+            for role in (read_role, "mte2_aiv", "vector", "mte3"):
+                phys = context.physical_role(role)
+                if phys in context.resource_names:
+                    res_name = context.resource_names[phys]
+                    cap = max(1, int(context.resource_units.get(phys, len(aiv_pool))))
+                    placement[res_name] = tuple(u for u in units if u < cap) or (0,)
+            return placement
 
         def tile(index):
-            start = index * aiv_units
-            covered = min(aiv_units, rows - start)
-            scale = covered / rows
-            load = read * scale
-            store = write * scale
-            compute = vector * scale
-            return (
-                Stage("load_gate_up", context.bind(Work(
-                    resources={"hbm": load, read_role: load})),
-                    placement=placement, previous=("store_payload_scale",)),
-                Stage("swiglu_amax_ue8m0", context.bind(Work(
-                    resources={"vector": compute})),
-                    after=("load_gate_up",), placement=placement),
-                Stage("store_payload_scale", context.bind(Work(
-                    resources={"hbm": store, "mte3": store})),
-                    after=("swiglu_amax_ue8m0",), placement=placement),
-            )
+            start = index * eff_bm
+            covered = min(eff_bm, rows - start)
+            row_scale = covered / rows
+            if uniform_cols:
+                wave_aivs = max(1, min(len(aiv_pool), covered * len(col_splits)))
+                placement = _place(aiv_pool[:wave_aivs])
+                load, store, compute = read * row_scale, write * row_scale, vector * row_scale
+                return (
+                    Stage("load_gate_up", context.bind(Work(
+                        resources={"hbm": load, read_role: load})),
+                        placement=placement, previous=("store_payload_scale",)),
+                    Stage("swiglu_amax_ue8m0", context.bind(Work(
+                        resources={"vector": compute})),
+                        after=("load_gate_up",), placement=placement),
+                    Stage("store_payload_scale", context.bind(Work(
+                        resources={"hbm": store, "mte3": store})),
+                        after=("swiglu_amax_ue8m0",), placement=placement),
+                )
+            stages = []
+            for col_idx, cols in enumerate(col_splits):
+                frac = row_scale * (cols / width)
+                load, store, compute = read * frac, write * frac, vector * frac
+                unit_start = col_idx * covered
+                unit_slice = aiv_pool[unit_start:unit_start + covered] or aiv_pool[:1]
+                placement = _place(unit_slice)
+                ld_name = f"load_gate_up_c{col_idx}"
+                op_name = f"swiglu_amax_ue8m0_c{col_idx}"
+                st_name = f"store_payload_scale_c{col_idx}"
+                stages.extend((
+                    Stage(ld_name, context.bind(Work(
+                        resources={"hbm": load, read_role: load})),
+                        placement=placement, previous=(st_name,)),
+                    Stage(op_name, context.bind(Work(
+                        resources={"vector": compute})),
+                        after=(ld_name,), placement=placement),
+                    Stage(st_name, context.bind(Work(
+                        resources={"hbm": store, "mte3": store})),
+                        after=(op_name,), placement=placement),
+                ))
+            return tuple(stages)
 
         setup_ms = float(context.setup_ms or 0.0) + _swiglu_mx_setup_ms(context)
         if setup_ms > 0.0:
             return KernelProgram((
                 Stage("kernel_setup", latency=setup_ms),
                 Stage("row_tiles", after=("kernel_setup",),
-                      program=PipelineProgram(waves, 2, tile)),
+                      program=PipelineProgram(eff_waves, 2, tile)),
             ))
         return KernelProgram((
-            Stage("row_tiles", program=PipelineProgram(waves, 2, tile)),
+            Stage("row_tiles", program=PipelineProgram(eff_waves, 2, tile)),
         ))
 
     return OperatorPlan(base, program, {
@@ -352,6 +553,7 @@ def build_swiglu_mx_quant(op, geometry):
         "row_tiles": waves,
         "row_program": {
             "aiv_units": aiv_units,
+            "used_aiv_units": used_aivs,
             "group_size": SWIGLU_MX_GROUP,
             "stages": SWIGLU_MX_STAGES,
             "setup_source": "primitive_table",
@@ -366,7 +568,7 @@ class ScopedSwigluRecipe(PlannedRecipe):
     traffic_rewrite_capable: bool = True
 
     def prepare(self, op, geometry):
-        if not (_a5_row_wave(geometry) and _mx_group32(op)):
+        if not (_a5_row_wave(geometry) and _is_swiglu_mx_quant(op)):
             from mindie_sim.prediction.physical_recipe_registry import VECTOR
             return op, VECTOR
         return super().prepare(op, geometry)
@@ -379,6 +581,8 @@ def build(op, geometry, *, l1_k=None, compact=True, compact_outputs=True):
     if (not rows or any(type(v) is not int or v < 0 for v in rows)
             or sum(rows) != total or min(n, k) <= 0):
         raise ModelingError('mxfp8_grouped_requires_integer_rows')
+    if min(n, k) < MIN_NZ_DIMENSION:
+        raise ModelingError('mxfp8_grouped_nz_requires_n_and_k_gt_1')
     if any(md.get(key, op.dtype) != 'fp8_e4m3' for key in ('input_format', 'weight_format', 'compute_format')):
         raise ModelingError('mxfp8_grouped_requires_e4m3_operands')
     if (md.get('output_format') != 'bf16' or md.get('activation_group_size') != MX_SCALE_GROUP
@@ -395,6 +599,7 @@ def build(op, geometry, *, l1_k=None, compact=True, compact_outputs=True):
         if geometry.buffer_units.get(pool) != cores:
             raise ModelingError('mxfp8_grouped_requires_aic_buffers:' + pool)
     owners = owner_tiles(rows, n, tile, cores)
+    subtile_m, subtile_n, subtile_k = fp8_subtile_dims(geometry)
     # The rolling ASWT window re-reads one [m, K] slice per output column tile
     # and re-issues each bank's 256-column B panel for its second M tile.  The
     # resident shares follow the declared effective-L2 capacity and this
@@ -411,9 +616,12 @@ def build(op, geometry, *, l1_k=None, compact=True, compact_outputs=True):
         panel_retention * m_tile_second_pass(m) for m in rows)
 
     def load_panel(bank, m, width, kd):
-        return panel_work(m, width, kd, tile.k,
-                          activation_l2=activation_l2,
-                          weight_l2=weight_l2_by_bank[bank])
+        return panel_work(
+            m, width, kd, tile.k,
+            activation_l2=activation_l2,
+            weight_l2=weight_l2_by_bank[bank],
+            subtile_m=subtile_m, subtile_n=subtile_n, subtile_k=subtile_k,
+        )
 
     scalar = Work(resources={'hbm': len(rows) * GROUP_LIST_ENTRY_BYTES})
     total_work = scalar.scaled(cores)
@@ -435,6 +643,8 @@ def build(op, geometry, *, l1_k=None, compact=True, compact_outputs=True):
 
     return OperatorPlan(total_work, program, {
         'execution_class': 'cube', 'source_program': SOURCE,
+        'logical_flops': 2 * sum(rows) * n * k,
+        'issued_cube_flops': total_work.matrix.get('fp8_e4m3', 0),
         'source_mapping': {'base_m': tile.m, 'base_n': tile.n, 'base_k': tile.k,
             'equal_refill_k': tile.l1_k, 'scale_refill_k': tile.scale_k, 'l1_refill_basis': 'declared' if l1_k else 'host_full_k_le_256',
             'output_tiles_by_owner': tuple(len(v) for v in owners), 'group_rows': rows,
@@ -450,7 +660,6 @@ def build(op, geometry, *, l1_k=None, compact=True, compact_outputs=True):
         'approximation': 'serial_output_tiles;compact_external_contention_fluid;all_reads_offchip',
         'unmodeled_source_features': ['descriptor_and_flag_instruction_latency',
             'ND_to_NZ_transaction_efficiency', 'K_tail_L1_init_instruction_service',
-            'small_M_mmad_issue_cycles',
             'cross_output_tile_prefetch', 'capture_binary_tiling_identity'],
     })
 
@@ -460,17 +669,32 @@ def _make_grouped_program(
 ):
     def program(context):
         active_owners = sum(bool(items) for items in owners)
+        units_by_key = {
+            physical: max(1, int(context.resource_units.get(role, 1)))
+            for role, physical in context.resource_names.items()
+        }
+        shared_keys = {
+            context.resource_names[role]
+            for role in ('hbm', 'l2')
+            if role in context.resource_names
+            and units_by_key.get(context.resource_names[role], 1) == 1
+        }
 
         def one(owner, items):
             def stage(name, work, **kwargs):
-                roles = set(work.resources) - {'hbm'} | ({'cube'} if work.matrix else set())
+                roles = set(work.resources) - {'hbm', 'l2'} | ({'cube'} if work.matrix else set())
                 return Stage(name, context.bind(work), placement=context.owned(owner, cores, roles), **kwargs)
 
             def duration(s, share_memory=False):
-                return max((v / (context.rates[key] * (len(s.placement[key]) / cores
-                    if key in s.placement else 1) / (active_owners if share_memory and
-                    key == context.resource_names['hbm'] else 1))
-                    for key, v in s.work.items()), default=0)
+                return max((
+                    v / (
+                        context.rates[key]
+                        * (len(s.placement[key]) / units_by_key.get(key, cores)
+                           if key in s.placement else 1.0)
+                        / (active_owners if share_memory and key in shared_keys and active_owners > 1 else 1.0)
+                    )
+                    for key, v in s.work.items()
+                ), default=0.0)
 
             runs = tuple((key, sum(1 for _ in group))
                          for key, group in groupby(
@@ -535,9 +759,9 @@ def _make_grouped_program(
                 else:
                     full, end = parts(tile.l1_k) if count else None, parts(tail) if tail else None
                     first, last = (full or end)[0], (end or full)[1][-1][1]
-                    cycle = matrix_cycle(duration(full[0]) if full else 0,
+                    cycle = matrix_cycle(duration(full[0], True) if full else 0,
                         tuple((duration(a), duration(b)) for a, b in (full or end)[1]), count, 2, 2,
-                        tail_load_ms=duration(end[0]) if end else None,
+                        tail_load_ms=duration(end[0], True) if end else None,
                         tail_micro_steps=tuple((duration(a), duration(b)) for a, b in end[1]) if end else None)
                     work, placement = {}, {}
                     for repeat, piece in ((count, full), (int(bool(tail)), end)):
@@ -550,7 +774,9 @@ def _make_grouped_program(
                         for key, value in s.work.items():
                             work[key] -= value
                     work = {key: value for key, value in work.items() if value > 0}
-                    span = max(0, cycle.span_ms - duration(first) - duration(last))
+                    span = max(0, cycle.span_ms - duration(first, True) - duration(last))
+                    interior = Stage('steady', work, placement=placement)
+                    span = max(span, duration(interior))
                     stages = (first,
                         Stage('steady', work, after=('load',), placement=placement, coupled=True,
                               caps={key: value / span for key, value in work.items()} if span else {}),

@@ -6,9 +6,28 @@
 [Timeouts & Locks] Bounded member/metadata inspection; no locks or I/O.
 [Side-Effect Policy] Immutable declarations only; no source or capture reads.
 """
+from typing import Literal
+
 from mindie_sim.schema.common import ModelingError
-from .mxfp8_grouped import MX_SCALE_GROUP, MX_SCALE_GROUP_PAIR
+from mindie_sim.schema.datapath import SourceRef
+from .mxfp8_grouped import MX_SCALE_GROUP, MX_SCALE_GROUP_PAIR, MX_SCALE_PAIR_BYTES
 from .mxfp8_swiglu import L1_K_GRANULE, OUTPUT_N_ALIGNMENT, PROFILE, RECIPE, ROLE, SOURCE
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul_swiglu_quant_v2/op_host/op_tiling/arch35/grouped_matmul_swiglu_quant_v2_basic_tiling.cpp",
+        source_sha256="85b86162c25c80dc626b643182a6bad3f11dab5d6ddc3ab6538ad30f813d36a0",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/common/cgmct/kernel/kernel_gmm_swiglu_mxquant.h",
+        source_sha256="799f7caf064cb129177529d70210bc8cbc94e2d314bc08cb6b13924b2f13c54e",
+    ),
+)
 
 CAPABILITIES = frozenset({
     "A5", "decode", "mxfp8", "mx32", "e4m3", "grouped_gate_up",
@@ -65,6 +84,11 @@ def bind(declaration, members, outputs, selection, options):
     width,k=view['intermediate_width'],view['input_width']
     if width % OUTPUT_N_ALIGNMENT or k % MX_SCALE_GROUP_PAIR:
         raise ModelingError('mxfp8_swiglu_requires_N64_K64_geometry')
+    expected_in_tail = (k // MX_SCALE_GROUP_PAIR, MX_SCALE_PAIR_BYTES)
+    expected_out_tail = (width // MX_SCALE_GROUP_PAIR, MX_SCALE_PAIR_BYTES)
+    if (tuple(view.get('input_scale_tail', ())) != expected_in_tail
+            or tuple(view.get('output_scale_tail', ())) != expected_out_tail):
+        raise ModelingError('mxfp8_swiglu_requires_paired_e8m0_scales')
     if (not rows or sum(rows) != matrix.local_shape[-3] or len(rows) != view['local_experts']
             or matrix.local_shape[-2:] != (2*width,k)
             or md.get('weight_representation') != 'fp8_block1x32_fp8_e8m0'
@@ -72,6 +96,16 @@ def bind(declaration, members, outputs, selection, options):
             or matrix.op_id not in activation.deps or activation.op_id not in quant.deps
             or set(outputs) != {quant.op_id}):
         raise ModelingError('mxfp8_swiglu_requires_complete_integer_grouped_chain_no_external_intermediate')
+    in_scale_shape = md.get('activation_scale_shape')
+    if in_scale_shape is not None and tuple(in_scale_shape) != (sum(rows), *expected_in_tail):
+        raise ModelingError('mxfp8_swiglu_requires_paired_e8m0_scales')
+    w_scale_shape = md.get('weight_scale_shape')
+    expected_w_scale_shape = (view['local_experts'], k // MX_SCALE_GROUP_PAIR, 2 * width, MX_SCALE_PAIR_BYTES)
+    if w_scale_shape is not None and tuple(w_scale_shape) != expected_w_scale_shape:
+        raise ModelingError('mxfp8_swiglu_requires_paired_e8m0_weight_scales')
+    out_scale_shape = dict(quant.metadata).get('activation_scale_shape')
+    if out_scale_shape is not None and tuple(out_scale_shape) != (sum(rows), *expected_out_tail):
+        raise ModelingError('mxfp8_swiglu_requires_paired_e8m0_scales')
     if set(options)-{'l1_k','compact'} or type(options.get('l1_k')) is not int:
         raise ModelingError('mxfp8_swiglu_requires_explicit_l1_k')
     if options['l1_k'] < L1_K_GRANULE or options['l1_k'] % L1_K_GRANULE:

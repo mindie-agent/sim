@@ -10,8 +10,10 @@
 from collections import Counter
 from dataclasses import dataclass
 from math import ceil
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
@@ -19,7 +21,24 @@ from mindie_sim.prediction.operators.matrix.refill_steady import compact_refill
 FP32_BYTES = 4
 from .mxfp8_grouped import (
     ASWT_M_WINDOW_TILES, CUBE_MN_FRACTAL, GROUP_LIST_ENTRY_BYTES, MX_SCALE_GROUP,
-    MX_SCALE_GROUP_PAIR, N_TILE_ALIGNMENT, N_TILE_COLUMNS, Mapping, align, panel_work,
+    MX_SCALE_GROUP_PAIR, N_TILE_ALIGNMENT, N_TILE_COLUMNS, Mapping, align,
+    fp8_subtile_dims, panel_work,
+)
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/common/cgmct/kernel/kernel_gmm_swiglu_mxquant.h",
+        source_sha256="799f7caf064cb129177529d70210bc8cbc94e2d314bc08cb6b13924b2f13c54e",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/common/cgmct/block/block_mmad_mx.h",
+        source_sha256="5916126d45f67f593e796391d6c275cfaf7921a0c9655f5017da37a8b32f881c",
+    ),
 )
 
 OUTPUT_N_ALIGNMENT = MX_SCALE_GROUP_PAIR
@@ -94,10 +113,15 @@ def vector_work(rows, width):
     return Work(resources={'vector': operations}), Work(resources={'hbm': writes, 'mte3': writes})
 
 
-def matrix_work(m, n, k, tile):
+def matrix_work(
+    m, n, k, tile, *, subtile_m=CUBE_MN_FRACTAL, subtile_n=CUBE_MN_FRACTAL, subtile_k=MX_SCALE_GROUP_PAIR,
+):
     total = Work(resources={'fixpipe': FP32_BYTES*m*n})
     for start in range(0,k,tile.l1_k):
-        load, steps = panel_work(m,n,min(tile.l1_k,k-start),tile.k)
+        load, steps = panel_work(
+            m, n, min(tile.l1_k, k - start), tile.k,
+            subtile_m=subtile_m, subtile_n=subtile_n, subtile_k=subtile_k,
+        )
         total += load
         for operand, compute in steps:
             total += operand+compute
@@ -134,11 +158,15 @@ def build(op, geometry):
                 or geometry.buffer_units.get(pool) != cores*(2 if pool == 'ub' else 1)):
             raise ModelingError('mxfp8_swiglu_buffer_capacity_or_owners:'+pool)
     owners=owner_tiles(cfg.rows,cfg.width,tile,cores)
+    subtile_m, subtile_n, subtile_k = fp8_subtile_dims(geometry)
     # Each AIC and its two AIVs executes the bank loop and reads int64 group_list.
     scalar=Work(resources={'hbm':len(cfg.rows)*GROUP_LIST_ENTRY_BYTES*GROUP_LIST_READER_COUNT})
     total=scalar.scaled(cores)
     for (m,n),count in Counter((item[1],item[2]) for jobs in owners for item in jobs).items():
-        work=matrix_work(m,n,cfg.k,tile).scaled(2)
+        work=matrix_work(
+            m, n, cfg.k, tile,
+            subtile_m=subtile_m, subtile_n=subtile_n, subtile_k=subtile_k,
+        ).scaled(2)
         for rows in ((m+1)//2,m//2):
             if rows:
                 vector,write=vector_work(rows,n);work += vector+write
@@ -157,7 +185,10 @@ def build(op, geometry):
             def matrix(m,n):
                 count,tail=divmod(cfg.k,tile.l1_k)
                 def parts(kd):
-                    load,steps=panel_work(m,n,kd,tile.k)
+                    load,steps=panel_work(
+                        m, n, kd, tile.k,
+                        subtile_m=subtile_m, subtile_n=subtile_n, subtile_k=subtile_k,
+                    )
                     return (stage('load',load),),tuple((stage('operand',a),stage('cube',b,after=('operand',))) for a,b in steps)
                 full=(parts(tile.l1_k),) if count else ()
                 last=(parts(tail),) if tail else ()
@@ -189,6 +220,8 @@ def build(op, geometry):
                 Stage('release',after=('outputs',),free=allocations)))
         return ParallelProgram(tuple(owner(i,items) for i,items in enumerate(owners)))
     return OperatorPlan(total,lower,{'implementation':PROFILE,'source':SOURCE,
+        'logical_flops': 4 * sum(cfg.rows) * cfg.width * cfg.k,
+        'issued_cube_flops': total.matrix.get('fp8_e4m3', 0),
         'source_execution_domain':'cube_vector','source_output_tiles':sum(map(len,owners)),
         'active_aic_owners':sum(bool(items) for items in owners),'buffers_per_owner':buffers,
         'matrix_base_tile':(bm,bn,bk),'l1_k':tile.l1_k,

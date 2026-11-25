@@ -42,23 +42,64 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import KernelProgram, Stage
-from .w4a8 import Config, _geometry_owners, _role_work
+from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, check_live_buffers
+from .w4a8 import Config, _geometry_int4_subtile, _geometry_owners, _role_work
 from .w4a8_matrix import matrix_program, matrix_work
 FP32_BYTES = 4
 from .w4a8_schedule import (
     COLUMN_SCALE_BYTES, DOWN_BASE_M, DOWN_BASE_M_TALL, DOWN_SHORT_M,
     GROUP_COUNT_BYTES, MSD_FLOPS_PER_K_STEP, MSD_WORKSPACE_BYTES_PER_OUTPUT,
-    NZ_N_ALIGNMENT, POST_DEQUANT_OPS_PER_OUTPUT, down_schedule, total_work,
+    NZ_N_ALIGNMENT, POST_DEQUANT_COLUMN_ALIGNMENT, POST_DEQUANT_OPS_PER_OUTPUT,
+    POST_DEQUANT_UB_ELEMENTS, align_up, down_schedule, total_work,
+)
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="vllm_ascend/quantization/methods/w4a8/w4a8.py",
+        source_sha256="51682287230ab8b4e618a8dd7763a22250d8f416730c12a1d7f1f79aa2c7f89e",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul/op_host/op_tiling/grouped_matmul_tiling.cpp",
+        source_sha256="9d328419d2104c17c547fb9614a3a9fa044f63b3d97ca65d8c6c63f0629dd661",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul/op_kernel/grouped_matmul_antiquant_a8w4_msd.h",
+        source_sha256="b092d276255c441542a5d205dbec5718d2ba5ae0ab7f5e637a2dba5fb20ee619",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul/op_kernel/grouped_matmul_antiquant_a8w4_msd_pre.h",
+        source_sha256="3b1f23218f64b7c467d324b37ff53eb226594508104b70fabee2193c4812a85c",
+    ),
 )
 
 DOWN_K_ALIGNMENT = 64
 DOWN_MAX_K = 18_432
 VECTOR_DEQUANT_WHITELIST_SHAPE = (1, 16, 256, 512)
+UB_ALIGN_BYTES = 32
+DOWN_PRE_UB_FP16_BYTES_PER_K = 2
+DOWN_PRE_UB_FP32_BYTES_PER_K = 4
+DOWN_PRE_UB_MASK_BYTES = 256
+DOWN_PRE_UB_WORK_BYTES = 1024
+DOWN_POST_HOST_V_BASE_M = 32
+DOWN_POST_TMP_BUFF_BYTES = 9 * 32 * 256
+DOWN_POST_VEC_IN_BYTES = POST_DEQUANT_UB_ELEMENTS * 2 * 2
+DOWN_POST_VEC_OUT_BYTES = POST_DEQUANT_UB_ELEMENTS * 2
 
 
 RECIPE = "ascend_w4a8_msd_grouped_down"
@@ -275,7 +316,8 @@ def work_from_config(config, *, fixpipe=False, resource_roles=None, geometry=Non
         aic, aiv = _geometry_owners(geometry)
         schedule = down_schedule(
             config.m, config.n, config.k, config.expert_rows,
-            aic_owners=aic, aiv_owners=aiv, fixpipe=fixpipe)
+            aic_owners=aic, aiv_owners=aiv, fixpipe=fixpipe,
+            subtile_wave=_geometry_int4_subtile(geometry))
         phases = {
             name: _role_work(total_work(group), name, resource_roles)
             for name, group in (
@@ -308,7 +350,8 @@ def ledger(config):
                           "+ low cast+add+cast (3MK)",
         },
         "matrix": {
-            "flops_int4": MSD_FLOPS_PER_K_STEP * m * n * k,
+            "flops_int4": reference["matrix"].matrix["int4"],
+            "logical_flops_int4": MSD_FLOPS_PER_K_STEP * m * n * k,
             "read_bytes": reference["matrix"].resources["mte2"],
             "write_bytes": MSD_WORKSPACE_BYTES_PER_OUTPUT * m * n,
             "publication_role": "fixpipe; additional service only when declared",
@@ -333,7 +376,8 @@ def ledger(config):
             "expression": "MN BF16 cast + BF16 store",
         },
         "totals": {
-            "flops_int4": MSD_FLOPS_PER_K_STEP * m * n * k,
+            "flops_int4": total.matrix["int4"],
+            "logical_flops_int4": MSD_FLOPS_PER_K_STEP * m * n * k,
             "hbm_bytes": total.resources["hbm"],
             "mte2_bytes": total.resources["mte2"],
             "mte3_bytes": total.resources["mte3"],
@@ -389,7 +433,30 @@ def _base_program(config, *, fixpipe=False, resource_roles=None):
     return program
 
 
-def _owner_program(schedule):
+def down_phase_ub_bytes(config: Config, schedule) -> tuple[int, int]:
+    """Per-AIV simultaneous aligned InitBuffer UB bytes for down pre and post."""
+    groups = len(config.expert_rows)
+    pre_ub = (
+        align_up(config.k, UB_ALIGN_BYTES)
+        + 2 * align_up(config.k // 2, UB_ALIGN_BYTES)
+        + align_up(DOWN_PRE_UB_FP16_BYTES_PER_K * config.k, UB_ALIGN_BYTES)
+        + align_up(DOWN_PRE_UB_FP32_BYTES_PER_K * config.k, UB_ALIGN_BYTES)
+        + DOWN_PRE_UB_MASK_BYTES
+        + DOWN_PRE_UB_WORK_BYTES
+        + align_up(groups * GROUP_COUNT_BYTES, UB_ALIGN_BYTES)
+        + align_up(groups * FP32_BYTES, UB_ALIGN_BYTES)
+    )
+    post_ub = (
+        FP32_BYTES * schedule.base_n
+        + align_up(DOWN_POST_HOST_V_BASE_M * FP32_BYTES, UB_ALIGN_BYTES)
+        + DOWN_POST_VEC_IN_BYTES
+        + DOWN_POST_VEC_OUT_BYTES
+        + DOWN_POST_TMP_BUFF_BYTES
+    )
+    return pre_ub, post_ub
+
+
+def _owner_program(schedule, *, pre_ub_bytes: int = 0, post_ub_bytes: int = 0):
     order = (("pre", schedule.pre, schedule.aiv_owners, ()),
              ("matrix", schedule.matrix, schedule.aic_owners, "pre"),
              ("post_dequant", schedule.post_dequant, schedule.aiv_owners, "matrix"),
@@ -397,6 +464,14 @@ def _owner_program(schedule):
 
     def program(context):
         stages, barrier = [], {}
+        has_ub = "ub" in context.pool_names
+        launched_aivs = tuple(
+            2 * aic + sub
+            for aic in range(schedule.aic_owners)
+            for sub in range(schedule.aivs_per_aic)
+        )
+        output_owners = {record.owner for record in schedule.output}
+        post_allocs = {}
         for name, group, owners_count, after in order:
             predecessors = barrier.get(after, ()) if after else ()
             if name == "matrix":
@@ -405,7 +480,9 @@ def _owner_program(schedule):
                 barrier[name] = ("matrix",)
                 continue
             names = []
+            seen_owners = set()
             for record in group:
+                seen_owners.add(record.owner)
                 work = _role_work(record.work, name, context.resource_units)
                 bound = context.for_phase(
                     work, kernel=f"grouped_matmul_antiquant_a8w4_msd_{name}",
@@ -415,11 +492,33 @@ def _owner_program(schedule):
                 roles = set(work.resources) - {"hbm"}
                 if work.matrix:
                     roles.add("cube")
+                acq, rel = (), ()
+                if has_ub and name == "pre" and pre_ub_bytes > 0:
+                    alloc = context.allocate(f"pre_ub:{record.owner}", "ub", pre_ub_bytes, (record.owner,))
+                    acq, rel = (alloc,), (alloc,)
+                elif has_ub and name == "post_dequant" and post_ub_bytes > 0:
+                    alloc = context.allocate(f"post_ub:{record.owner}", "ub", post_ub_bytes, (record.owner,))
+                    acq = (alloc,)
+                    if record.owner in output_owners:
+                        post_allocs[record.owner] = alloc
+                    else:
+                        rel = (alloc,)
+                elif has_ub and name == "output" and record.owner in post_allocs:
+                    rel = (post_allocs[record.owner],)
                 stage_name = f"{name}:{record.owner}"
                 stages.append(Stage(
                     stage_name, work=bound.work, after=predecessors,
+                    acquire=acq, free=rel,
                     placement=context.owned(record.owner, owners_count, roles)))
                 names.append(stage_name)
+            if has_ub and name == "post_dequant" and post_ub_bytes > 0:
+                for idle_owner in launched_aivs:
+                    if idle_owner in seen_owners:
+                        continue
+                    alloc = context.allocate(f"post_ub:{idle_owner}", "ub", post_ub_bytes, (idle_owner,))
+                    idle_name = f"post_ub_init:{idle_owner}"
+                    stages.append(Stage(idle_name, after=predecessors, acquire=(alloc,), free=(alloc,)))
+                    names.append(idle_name)
             barrier[name] = tuple(names)
         return KernelProgram(tuple(stages))
 
@@ -439,14 +538,36 @@ def build(op, geometry=None):
     aic, aiv = _geometry_owners(geometry)
     schedule = down_schedule(
         config.m, config.n, config.k, config.expert_rows,
-        aic_owners=aic, aiv_owners=aiv, fixpipe=fixpipe)
+        aic_owners=aic, aiv_owners=aiv, fixpipe=fixpipe,
+        subtile_wave=_geometry_int4_subtile(geometry))
+    pre_ub_bytes, post_ub_bytes = down_phase_ub_bytes(config, schedule)
+    if "ub" in geometry.buffers:
+        check_live_buffers(
+            (
+                LiveBufferSpec(
+                    "w4a8_down_pre_ub", "ub", pre_ub_bytes, 0, 1,
+                    owner_kind="aiv", alignment_bytes=UB_ALIGN_BYTES,
+                ),
+                LiveBufferSpec(
+                    "w4a8_down_post_ub", "ub", post_ub_bytes, 1, 2,
+                    owner_kind="aiv", alignment_bytes=UB_ALIGN_BYTES,
+                ),
+            ),
+            geometry,
+            family=RECIPE,
+            kernel_abi="torch_npu.npu_grouped_matmul",
+            source_guard="w4a8_down_ub_capacity",
+        )
     # Bind each phase with the same read-pipe role used by execution.
     total = Work()
     for name, group in (("pre", schedule.pre), ("matrix", schedule.matrix),
                         ("post_dequant", schedule.post_dequant), ("output", schedule.output)):
         work = matrix_work(schedule, geometry.resource_units) if name == "matrix" else total_work(group)
         total += _role_work(work, name, geometry.resource_units)
-    return OperatorPlan(total, _owner_program(schedule))
+    return OperatorPlan(
+        total,
+        _owner_program(schedule, pre_ub_bytes=pre_ub_bytes, post_ub_bytes=post_ub_bytes),
+    )
 
 
 def lower_op(op):
