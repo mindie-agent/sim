@@ -372,7 +372,7 @@ owns = ["mindie_sim/catalog/ops.py", "mindie_sim/catalog/quant.py", "mindie_sim/
 [[module]]
 path = "operators/test_custom_op_libraries.py"
 tier = "tier0"
-owns = ["mindie_sim/backends/ascend.py", "mindie_sim/catalog/ops.py", "mindie_sim/prediction/call_builders.py", "mindie_sim/prediction/operators/custom_framework"]
+owns = ["mindie_sim/backends/ascend.py", "mindie_sim/catalog/ops.py", "mindie_sim/prediction/call_builders.py"]
 [[module]]
 path = "operators/test_anti_armchair_ground_truth.py"
 tier = "tier1"
@@ -799,4 +799,17 @@ owns = [
   "mindie_sim/prediction/results.py",
   "mindie_sim/prediction/native_binding.py",
   "data/abi/abi_schema_manifest.json",
+]
+
+[[module]]
+path = "product/test_unseen_architecture_generalization.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/schema/serialization.py",
+  "mindie_sim/catalog/media.py",
+  "mindie_sim/catalog/fleet.py",
+  "mindie_sim/prediction/operators/hyper_connections/lowrank_hc_vector.py",
+  "mindie_sim/observations/captures.py",
+  "scripts/check_arch_governance.py",
+  "scripts/_arch_governance_runtime.py",
 ]

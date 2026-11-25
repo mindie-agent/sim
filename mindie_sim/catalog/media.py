@@ -413,117 +413,148 @@ def _lower_vision_layer(
     return ordered, add2.op_id
 
 
-def _lower_vision_projector(
+def _lower_biased_aligner_projector(
     *, merge_id: str, vision: VisionSpec, text_positions: int,
     dtype: str, quant: QuantSpec, mode: str, requests: tuple[str, ...],
-    stage: int, vision_tp: int = 1, prefix: str = "vision.",
-    layer: int | None = None, use_postshuffle_norm: bool = False,
+    stage: int, vision_tp: int, prefix: str, op_layer: int,
+    use_postshuffle_norm: bool = False,
 ) -> tuple[list[OpSpec], str]:
-    """Lower the multimodal spatial-merge projector into the language width."""
-    op_layer = vision.layers if layer is None else int(layer)
-    if vision.kind == "deepseek_v41":
-        proj_tp = vision_tp if (vision_tp > 1 and vision.out_hidden_size % vision_tp == 0) else 1
-        local_mid = vision.out_hidden_size // proj_tp
-        proj1 = gemm_op(
-            op_id=f"{prefix}projector1", deps=(merge_id,), stage=stage,
-            layer=op_layer, requests=requests, m=text_positions,
-            n=local_mid, k=vision.aligner_input_width,
-            quant=quant, category="projector", phase=mode,
-            family="vision_projector", semantic_family="aligner_w1",
-            semantic_shape=(text_positions, vision.out_hidden_size, vision.aligner_input_width),
-        )
-        proj_ops: list[OpSpec] = [proj1]
-        proj1_ready = proj1.op_id
-        proj1_out_dtype = _op_output_dtype(proj1, dtype)
-        if vision.bias:
-            proj1_bias = vector_op(
-                op_id=f"{prefix}projector1_bias", deps=(proj1.op_id,), stage=stage,
-                layer=op_layer, requests=requests,
-                elements=max(1, text_positions * local_mid),
-                ops_per_element=1.0, dtype=proj1_out_dtype, family="elementwise",
-                phase=mode, recipe="catalog_aligner_bias",
-                semantic_family="aligner_w1_bias",
-            )
-            proj_ops.append(proj1_bias)
-            proj1_ready = proj1_bias.op_id
-        proj1_gelu = vector_op(
-            op_id=f"{prefix}projector1_gelu", deps=(proj1_ready,), stage=stage,
+    """Lower a biased two-layer aligner projector (``aligner_hidden_size > 0`` and ``bias``)."""
+    proj_tp = vision_tp if (vision_tp > 1 and vision.out_hidden_size % vision_tp == 0) else 1
+    local_mid = vision.out_hidden_size // proj_tp
+    proj_ops: list[OpSpec] = []
+    proj1_dep = merge_id
+    if use_postshuffle_norm:
+        aligner_norm = vector_op(
+            op_id=f"{prefix}aligner_norm", deps=(merge_id,), stage=stage,
             layer=op_layer, requests=requests,
-            elements=max(1, text_positions * local_mid),
-            ops_per_element=VISION_ACT_OPS_PER_ELEMENT, dtype=dtype,
-            family="gelu", phase=mode, recipe="catalog_aligner_gelu",
-        )
-        proj2 = gemm_op(
-            op_id=f"{prefix}projector2", deps=(proj1_gelu.op_id,), stage=stage,
-            layer=op_layer, requests=requests, m=text_positions,
-            n=vision.out_hidden_size, k=local_mid,
-            quant=quant, category="projector", phase=mode,
-            family="vision_projector", semantic_family="aligner_w2",
-            semantic_shape=(text_positions, vision.out_hidden_size, vision.out_hidden_size),
-        )
-        proj_ops.extend([proj1_gelu, proj2])
-        proj2_ready = proj2.op_id
-        proj2_out_dtype = _op_output_dtype(proj2, dtype)
-        if proj_tp > 1:
-            proj2_ar = _vision_allreduce(
-                op_id=f"{prefix}projector2_allreduce", deps=(proj2_ready,),
-                stage=stage, layer=op_layer, requests=requests,
-                rows=text_positions, cols=vision.out_hidden_size,
-                dtype=proj2_out_dtype, tp=proj_tp, mode=mode,
-                semantic_family="vision_projector_allreduce",
-            )
-            proj_ops.append(proj2_ar)
-            proj2_ready = proj2_ar.op_id
-        aligner_bias = vector_op(
-            op_id=f"{prefix}projector2_bias", deps=(proj2_ready,), stage=stage,
-            layer=op_layer, requests=requests,
-            elements=max(1, text_positions * vision.out_hidden_size),
-            ops_per_element=1.0, dtype=proj2_out_dtype, family="elementwise",
-            phase=mode, recipe="catalog_aligner_bias",
-            semantic_family="aligner_w2_bias",
-        )
-        proj_ops.append(aligner_bias)
-        return proj_ops, aligner_bias.op_id
-    if vision.kind == "kimi_k3":
-        # Native MoonViT PatchMergerV2 uses ReplicatedLinear for both projections.
-        proj0 = gemm_op(
-            op_id=f"{prefix}projector0", deps=(merge_id,), stage=stage,
-            layer=op_layer, requests=requests, m=text_positions,
-            n=vision.aligner_hidden_size, k=vision.aligner_input_width,
-            quant=quant, category="projector", phase=mode,
-            family="vision_projector", semantic_family="patchmergerv2_proj0",
-        )
-        proj0_gelu = vector_op(
-            op_id=f"{prefix}projector0_gelu", deps=(proj0.op_id,), stage=stage,
-            layer=op_layer, requests=requests,
-            elements=max(1, text_positions * vision.aligner_hidden_size),
-            ops_per_element=VISION_ACT_OPS_PER_ELEMENT, dtype=dtype,
-            family="gelu", phase=mode, recipe="catalog_kimi_projector_gelu",
-        )
-        proj2 = gemm_op(
-            op_id=f"{prefix}projector2", deps=(proj0_gelu.op_id,), stage=stage,
-            layer=op_layer, requests=requests, m=text_positions,
-            n=vision.out_hidden_size, k=vision.aligner_hidden_size,
-            quant=quant, category="projector", phase=mode,
-            family="vision_projector", semantic_family="patchmergerv2_proj2",
-        )
-        post_norm = vector_op(
-            op_id=f"{prefix}projector_post_norm", deps=(proj2.op_id,),
-            stage=stage, layer=op_layer, requests=requests,
-            elements=max(1, text_positions * vision.out_hidden_size),
+            elements=max(1, text_positions * vision.aligner_input_width),
             ops_per_element=VISION_NORM_OPS_PER_ELEMENT, dtype=dtype,
-            family="rmsnorm", phase=mode,
-            recipe="catalog_kimi_projector_post_norm",
-            shape=(text_positions, vision.out_hidden_size),
+            family="layernorm" if vision.norm_type == "layernorm" else "rmsnorm",
+            phase=mode, recipe="catalog_aligner_norm",
+            shape=(text_positions, vision.aligner_input_width),
             metadata=(("tokens", text_positions),
-                      ("reduction_width", vision.out_hidden_size),
-                      ("norm_type", "rmsnorm"),
+                      ("reduction_width", vision.aligner_input_width),
+                      ("norm_type", vision.norm_type),
                       ("norm_eps", vision.norm_eps)),
         )
-        return [proj0, proj0_gelu, proj2, post_norm], post_norm.op_id
+        proj_ops.append(aligner_norm)
+        proj1_dep = aligner_norm.op_id
+    proj1 = gemm_op(
+        op_id=f"{prefix}projector1", deps=(proj1_dep,), stage=stage,
+        layer=op_layer, requests=requests, m=text_positions,
+        n=local_mid, k=vision.aligner_input_width,
+        quant=quant, category="projector", phase=mode,
+        family="vision_projector", semantic_family="aligner_w1",
+        semantic_shape=(text_positions, vision.out_hidden_size, vision.aligner_input_width),
+    )
+    proj_ops.append(proj1)
+    proj1_ready = proj1.op_id
+    proj1_out_dtype = _op_output_dtype(proj1, dtype)
+    if vision.bias:
+        proj1_bias = vector_op(
+            op_id=f"{prefix}projector1_bias", deps=(proj1.op_id,), stage=stage,
+            layer=op_layer, requests=requests,
+            elements=max(1, text_positions * local_mid),
+            ops_per_element=1.0, dtype=proj1_out_dtype, family="elementwise",
+            phase=mode, recipe="catalog_aligner_bias",
+            semantic_family="aligner_w1_bias",
+        )
+        proj_ops.append(proj1_bias)
+        proj1_ready = proj1_bias.op_id
+    proj1_gelu = vector_op(
+        op_id=f"{prefix}projector1_gelu", deps=(proj1_ready,), stage=stage,
+        layer=op_layer, requests=requests,
+        elements=max(1, text_positions * local_mid),
+        ops_per_element=VISION_ACT_OPS_PER_ELEMENT, dtype=dtype,
+        family="gelu", phase=mode, recipe="catalog_aligner_gelu",
+    )
+    proj2 = gemm_op(
+        op_id=f"{prefix}projector2", deps=(proj1_gelu.op_id,), stage=stage,
+        layer=op_layer, requests=requests, m=text_positions,
+        n=vision.out_hidden_size, k=local_mid,
+        quant=quant, category="projector", phase=mode,
+        family="vision_projector", semantic_family="aligner_w2",
+        semantic_shape=(text_positions, vision.out_hidden_size, vision.out_hidden_size),
+    )
+    proj_ops.extend([proj1_gelu, proj2])
+    proj2_ready = proj2.op_id
+    proj2_out_dtype = _op_output_dtype(proj2, dtype)
+    if proj_tp > 1:
+        proj2_ar = _vision_allreduce(
+            op_id=f"{prefix}projector2_allreduce", deps=(proj2_ready,),
+            stage=stage, layer=op_layer, requests=requests,
+            rows=text_positions, cols=vision.out_hidden_size,
+            dtype=proj2_out_dtype, tp=proj_tp, mode=mode,
+            semantic_family="vision_projector_allreduce",
+        )
+        proj_ops.append(proj2_ar)
+        proj2_ready = proj2_ar.op_id
+    aligner_bias = vector_op(
+        op_id=f"{prefix}projector2_bias", deps=(proj2_ready,), stage=stage,
+        layer=op_layer, requests=requests,
+        elements=max(1, text_positions * vision.out_hidden_size),
+        ops_per_element=1.0, dtype=proj2_out_dtype, family="elementwise",
+        phase=mode, recipe="catalog_aligner_bias",
+        semantic_family="aligner_w2_bias",
+    )
+    proj_ops.append(aligner_bias)
+    return proj_ops, aligner_bias.op_id
+
+
+def _lower_unbiased_patch_merger_projector(
+    *, merge_id: str, vision: VisionSpec, text_positions: int,
+    dtype: str, quant: QuantSpec, mode: str, requests: tuple[str, ...],
+    stage: int, prefix: str, op_layer: int,
+) -> tuple[list[OpSpec], str]:
+    """Lower an unbiased replicated PatchMergerV2 projector with post-RMSNorm."""
+    proj0 = gemm_op(
+        op_id=f"{prefix}projector0", deps=(merge_id,), stage=stage,
+        layer=op_layer, requests=requests, m=text_positions,
+        n=vision.aligner_hidden_size, k=vision.aligner_input_width,
+        quant=quant, category="projector", phase=mode,
+        family="vision_projector", semantic_family="patchmergerv2_proj0",
+    )
+    proj0_gelu = vector_op(
+        op_id=f"{prefix}projector0_gelu", deps=(proj0.op_id,), stage=stage,
+        layer=op_layer, requests=requests,
+        elements=max(1, text_positions * vision.aligner_hidden_size),
+        ops_per_element=VISION_ACT_OPS_PER_ELEMENT, dtype=dtype,
+        family="gelu", phase=mode, recipe="catalog_kimi_projector_gelu",
+    )
+    proj2 = gemm_op(
+        op_id=f"{prefix}projector2", deps=(proj0_gelu.op_id,), stage=stage,
+        layer=op_layer, requests=requests, m=text_positions,
+        n=vision.out_hidden_size, k=vision.aligner_hidden_size,
+        quant=quant, category="projector", phase=mode,
+        family="vision_projector", semantic_family="patchmergerv2_proj2",
+    )
+    post_norm = vector_op(
+        op_id=f"{prefix}projector_post_norm", deps=(proj2.op_id,),
+        stage=stage, layer=op_layer, requests=requests,
+        elements=max(1, text_positions * vision.out_hidden_size),
+        ops_per_element=VISION_NORM_OPS_PER_ELEMENT, dtype=dtype,
+        family="rmsnorm", phase=mode,
+        recipe="catalog_kimi_projector_post_norm",
+        shape=(text_positions, vision.out_hidden_size),
+        metadata=(("tokens", text_positions),
+                  ("reduction_width", vision.out_hidden_size),
+                  ("norm_type", "rmsnorm"),
+                  ("norm_eps", vision.norm_eps)),
+    )
+    return [proj0, proj0_gelu, proj2, post_norm], post_norm.op_id
+
+
+def _lower_spatial_merger_projector(
+    *, merge_id: str, vision: VisionSpec, text_positions: int,
+    dtype: str, quant: QuantSpec, mode: str, requests: tuple[str, ...],
+    stage: int, vision_tp: int, prefix: str, op_layer: int,
+    use_postshuffle_norm: bool,
+) -> tuple[list[OpSpec], str]:
+    """Lower a spatial-merge MLP projector (``aligner_hidden_size == 0``)."""
     proj_tp = vision_tp if (vision_tp > 1 and vision.aligner_input_width % vision_tp == 0) else 1
     local_mid = vision.aligner_input_width // proj_tp
-    proj_ops = []
+    proj_ops: list[OpSpec] = []
     w1_dep = merge_id
     if use_postshuffle_norm:
         merger_norm = vector_op(
@@ -593,6 +624,35 @@ def _lower_vision_projector(
     )
     proj_ops.append(merger_bias)
     return proj_ops, merger_bias.op_id
+
+
+def _lower_vision_projector(
+    *, merge_id: str, vision: VisionSpec, text_positions: int,
+    dtype: str, quant: QuantSpec, mode: str, requests: tuple[str, ...],
+    stage: int, vision_tp: int = 1, prefix: str = "vision.",
+    layer: int | None = None, use_postshuffle_norm: bool = False,
+) -> tuple[list[OpSpec], str]:
+    """Lower the multimodal spatial-merge projector into the language width."""
+    op_layer = vision.layers if layer is None else int(layer)
+    if int(vision.aligner_hidden_size) > 0 and bool(vision.bias):
+        return _lower_biased_aligner_projector(
+            merge_id=merge_id, vision=vision, text_positions=text_positions,
+            dtype=dtype, quant=quant, mode=mode, requests=requests,
+            stage=stage, vision_tp=vision_tp, prefix=prefix, op_layer=op_layer,
+            use_postshuffle_norm=use_postshuffle_norm,
+        )
+    if int(vision.aligner_hidden_size) > 0:
+        return _lower_unbiased_patch_merger_projector(
+            merge_id=merge_id, vision=vision, text_positions=text_positions,
+            dtype=dtype, quant=quant, mode=mode, requests=requests,
+            stage=stage, prefix=prefix, op_layer=op_layer,
+        )
+    return _lower_spatial_merger_projector(
+        merge_id=merge_id, vision=vision, text_positions=text_positions,
+        dtype=dtype, quant=quant, mode=mode, requests=requests,
+        stage=stage, vision_tp=vision_tp, prefix=prefix, op_layer=op_layer,
+        use_postshuffle_norm=use_postshuffle_norm,
+    )
 
 
 def lower_media(

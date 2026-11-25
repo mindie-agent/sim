@@ -6,9 +6,9 @@
   ``mindie_sim/stacks/vllm_ascend/manifest.json``, while exempting structural
   predicates, fusion-tier constants, docstrings, ``SourceRef`` provenance, and
   narrow config-ingestion adapters.
-[Invariants] Default CLI execution reports AG014 findings in staged warning
-  mode without breaking ``--strict``; ``--strict-ag014`` promotes every AG014
-  finding into a hard failure (exit code 1).
+[Invariants] Default CLI execution and ``--strict`` enforce AG014
+  unconditionally as a hard failure (exit code 1, zero staged warnings);
+  ``--strict-ag014`` remains accepted as a compatibility no-op flag.
 [Timeouts & Locks] Pure Tier-0 in-memory/tmp_path AST and JSON scans.
 [Side-Effect Policy] Writes synthetic fixtures exclusively under ``tmp_path``.
 """
@@ -163,7 +163,7 @@ def test_ag014_allows_structural_predicates_docstrings_sourceref_and_config_exem
     assert arch_gov.scan_repository(proj, include_ag014=True) == ()
 
 
-def test_ag014_cli_staged_warning_default_vs_strict_hard_fail(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_ag014_cli_default_on_strict_and_compat_flag(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     proj = tmp_path / "repo"
     _write(
         proj / "mindie_sim" / "prediction" / "flagged.py",
@@ -173,14 +173,16 @@ def test_ag014_cli_staged_warning_default_vs_strict_hard_fail(tmp_path: Path, ca
 
     rc_default = arch_gov.main(["--root", str(proj)])
     out_default = capsys.readouterr().out
-    assert rc_default == arch_gov.EXIT_OK
-    assert "arch governance AG014 staged warnings: 1" in out_default
-    assert "arch governance violations: 0" in out_default
+    assert rc_default == arch_gov.EXIT_VIOLATIONS
+    assert "AG014" in out_default
+    assert "staged warnings" not in out_default
+    assert "arch governance violations: 1" in out_default
 
     rc_strict = arch_gov.main(["--root", str(proj), "--strict-ag014"])
     out_strict = capsys.readouterr().out
     assert rc_strict == arch_gov.EXIT_VIOLATIONS
     assert "AG014" in out_strict
+    assert "staged warnings" not in out_strict
     assert "arch governance violations: 1" in out_strict
 
     _write(
@@ -188,4 +190,5 @@ def test_ag014_cli_staged_warning_default_vs_strict_hard_fail(tmp_path: Path, ca
         'def pick(has_sandwich_norm: bool) -> int:\n'
         '    return 1 if has_sandwich_norm else 0\n',
     )
+    assert arch_gov.main(["--root", str(proj)]) == arch_gov.EXIT_OK
     assert arch_gov.main(["--root", str(proj), "--strict-ag014"]) == arch_gov.EXIT_OK

@@ -1049,6 +1049,8 @@ def _check_ag013_anti_hardcoding(rel: PurePosixPath, tree: ast.Module) -> list[V
 
 _AG014_CONFIG_EXEMPT_FILES = frozenset({
     "mindie_sim/model_catalog.py",
+    "mindie_sim/catalog/config.py",
+    "mindie_sim/catalog/composable.py",
     "mindie_sim/catalog/hf_config.py",
     "mindie_sim/catalog/specs.py",
     "mindie_sim/catalog/checkpoint_reader.py",
@@ -1059,6 +1061,12 @@ _AG014_CONFIG_EXEMPT_FILES = frozenset({
 _AG014_CONFIG_EXEMPT_PREFIXES = ("mindie_sim/catalog/configs/",)
 _AG014_ALLOWED_TIER_TOKENS = frozenset({
     "K1", "K2", "K3", "K1_shipping", "K1_proposed_pr", "K2_epilogue", "K3_dsl_pipeline",
+})
+#: Verified upstream HuggingFace / vLLM wire-protocol enum tokens (exact match only).
+_AG014_UPSTREAM_WIRE_PROTOCOL_TOKENS = frozenset({
+    "deepseek_mtp",
+    "qwen3_5_mtp",
+    "qwen3_next_mtp",
 })
 _AG014_CAMEL_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 _AG014_MODEL_TOKEN_RE = re.compile(
@@ -1081,10 +1089,10 @@ _AG014_MODEL_TOKEN_RE = re.compile(
 )
 _AG014_IDENTITY_NAMES = frozenset({
     "model_name", "model_id", "canonical_model", "model_type",
-    "architecture", "architectures", "case_id", "model_family", "family_name",
+    "architectures", "case_id", "model_family",
 })
 _AG014_IDENTITY_OWNERS = frozenset({
-    "model", "model_spec", "spec", "target_model", "case", "config", "cfg",
+    "model", "model_spec", "target_model", "case", "config", "cfg",
 })
 _AG014_STR_METHODS = frozenset({"startswith", "endswith", "find", "index"})
 _AG014_REGEX_METHODS = frozenset({"search", "match", "fullmatch"})
@@ -1096,7 +1104,11 @@ _AG014_NATIVE_OP_ABI_RE = re.compile(
 
 def _ag014_match_token(raw: str, *, allow_native_abi: bool = False) -> str | None:
     stripped = raw.strip()
-    if not stripped or stripped in _AG014_ALLOWED_TIER_TOKENS:
+    if (
+        not stripped
+        or stripped in _AG014_ALLOWED_TIER_TOKENS
+        or stripped.lower() in _AG014_UPSTREAM_WIRE_PROTOCOL_TOKENS
+    ):
         return None
     if allow_native_abi and _AG014_NATIVE_OP_ABI_RE.fullmatch(stripped):
         return None
@@ -1207,40 +1219,103 @@ def _ag014_extract_any_str_literals(node: ast.AST, str_consts: Mapping[str, str]
     return set()
 
 
-def _ag014_is_identity_expr(node: ast.AST, tainted: set[str]) -> bool:
+def _ag014_collect_model_spec_aliases(tree: ast.Module) -> frozenset[str]:
+    aliases: set[str] = {"ModelSpec"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "ModelSpec":
+                    aliases.add(alias.asname or alias.name)
+    return frozenset(aliases)
+
+
+def _ag014_annotation_is_model_spec(
+    ann: ast.AST | None,
+    spec_names: frozenset[str] = frozenset({"ModelSpec"}),
+) -> bool:
+    if ann is None:
+        return False
+    for sub in ast.walk(ann):
+        if isinstance(sub, ast.Name) and sub.id in spec_names:
+            return True
+        if isinstance(sub, ast.Attribute) and sub.attr == "ModelSpec":
+            return True
+        if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+            if any(re.search(rf"\b{re.escape(name)}\b", sub.value) for name in spec_names):
+                return True
+    return False
+
+
+def _ag014_owner_is_model(node: ast.AST, var_owners: frozenset[str] = frozenset()) -> bool:
+    if isinstance(node, ast.Name):
+        return node.id in _AG014_IDENTITY_OWNERS or node.id in var_owners
+    if isinstance(node, ast.Attribute):
+        return node.attr in _AG014_IDENTITY_OWNERS
+    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
+        return isinstance(node.slice.value, str) and node.slice.value in _AG014_IDENTITY_OWNERS
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+        and isinstance(node.args[0].value, str)
+    ):
+        return node.args[0].value in _AG014_IDENTITY_OWNERS
+    return False
+
+
+def _ag014_is_identity_expr(
+    node: ast.AST,
+    tainted: set[str],
+    var_owners: frozenset[str] = frozenset(),
+) -> bool:
     if isinstance(node, ast.Name):
         return node.id in tainted or node.id in _AG014_IDENTITY_NAMES
     if isinstance(node, ast.Attribute):
         if node.attr in _AG014_IDENTITY_NAMES:
             return True
-        owner_is_model = (
-            (isinstance(node.value, ast.Name) and node.value.id in _AG014_IDENTITY_OWNERS)
-            or (isinstance(node.value, ast.Attribute) and node.value.attr in _AG014_IDENTITY_OWNERS)
-        )
-        return node.attr == "name" and owner_is_model
-    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
-        return isinstance(node.slice.value, str) and (
-            node.slice.value in _AG014_IDENTITY_NAMES or node.slice.value == "name"
-        )
+        return node.attr == "name" and _ag014_owner_is_model(node.value, var_owners)
+    if isinstance(node, ast.Subscript):
+        if _ag014_is_identity_expr(node.value, tainted, var_owners):
+            return True
+        if isinstance(node.slice, ast.Constant) and isinstance(node.slice.value, str):
+            key = node.slice.value
+            if key in _AG014_IDENTITY_NAMES:
+                return True
+            return key == "name" and _ag014_owner_is_model(node.value, var_owners)
+        return False
     if isinstance(node, ast.Call):
-        return _ag014_call_is_identity(node, tainted)
+        return _ag014_call_is_identity(node, tainted, var_owners)
     return False
 
 
-def _ag014_call_is_identity(node: ast.Call, tainted: set[str]) -> bool:
+def _ag014_call_is_identity(
+    node: ast.Call,
+    tainted: set[str],
+    var_owners: frozenset[str] = frozenset(),
+) -> bool:
     if isinstance(node.func, ast.Attribute):
-        if node.func.attr in {"lower", "upper", "strip", "replace"}:
-            return _ag014_is_identity_expr(node.func.value, tainted)
+        if node.func.attr in {"lower", "upper", "casefold", "strip", "lstrip", "rstrip", "replace", "title"}:
+            return _ag014_is_identity_expr(node.func.value, tainted, var_owners)
         if node.func.attr == "get" and node.args and isinstance(node.args[0], ast.Constant):
             key = node.args[0].value
-            return isinstance(key, str) and (key in _AG014_IDENTITY_NAMES or key == "name")
+            if not isinstance(key, str):
+                return False
+            if key in _AG014_IDENTITY_NAMES:
+                return True
+            return key == "name" and _ag014_owner_is_model(node.func.value, var_owners)
         return False
     if isinstance(node.func, ast.Name):
         if node.func.id == "str" and node.args:
-            return _ag014_is_identity_expr(node.args[0], tainted)
+            return _ag014_is_identity_expr(node.args[0], tainted, var_owners)
         if node.func.id == "getattr" and len(node.args) >= 2 and isinstance(node.args[1], ast.Constant):
             key = node.args[1].value
-            return isinstance(key, str) and (key in _AG014_IDENTITY_NAMES or key == "name")
+            if not isinstance(key, str):
+                return False
+            if key in _AG014_IDENTITY_NAMES:
+                return True
+            return key == "name" and _ag014_owner_is_model(node.args[0], var_owners)
     return False
 
 
@@ -1258,15 +1333,49 @@ def _ag014_scope_stmts(body: Sequence[ast.stmt]):
         stack.extend(reversed(children))
 
 
+def _ag014_extract_compiled_regex(
+    value: ast.AST,
+    str_consts: Mapping[str, str],
+    regex_pats: Mapping[str, str],
+) -> str | None:
+    if isinstance(value, ast.Name):
+        return regex_pats.get(value.id)
+    if isinstance(value, ast.Call):
+        fn = value.func.id if isinstance(value.func, ast.Name) else (
+            value.func.attr if isinstance(value.func, ast.Attribute) else ""
+        )
+        if fn == "compile":
+            pat_arg = value.args[0] if value.args else next(
+                (kw.value for kw in value.keywords if kw.arg == "pattern"), None,
+            )
+            if pat_arg is not None:
+                return _ag014_fold_str(pat_arg, str_consts)
+    return None
+
+
+def _ag014_unwrap_container_alias(value: ast.AST) -> str | None:
+    if isinstance(value, ast.Name):
+        return value.id
+    if isinstance(value, ast.Call) and len(value.args) == 1 and isinstance(value.args[0], ast.Name):
+        fn = value.func.id if isinstance(value.func, ast.Name) else (
+            value.func.attr if isinstance(value.func, ast.Attribute) else ""
+        )
+        if fn in {"frozenset", "set", "tuple", "list", "dict", "MappingProxyType"}:
+            return value.args[0].id
+    return None
+
+
 def _ag014_collect_tables(
     nodes: Sequence[ast.AST],
     base_strs: Mapping[str, str],
     base_tables: Mapping[str, frozenset[str]],
     base_str_sets: Mapping[str, frozenset[str]],
-) -> tuple[dict[str, str], dict[str, frozenset[str]], dict[str, frozenset[str]]]:
+    base_regexes: Mapping[str, str],
+) -> tuple[dict[str, str], dict[str, frozenset[str]], dict[str, frozenset[str]], dict[str, str]]:
     str_consts = dict(base_strs)
     tables = dict(base_tables)
     str_sets = dict(base_str_sets)
+    regex_pats = dict(base_regexes)
     for node in nodes:
         if isinstance(node, ast.Assign):
             targets, value = node.targets, node.value
@@ -1275,8 +1384,20 @@ def _ag014_collect_tables(
         else:
             continue
         folded = _ag014_fold_str(value, str_consts)
-        tokens = _ag014_extract_literal_tokens(value, str_consts, allow_native_abi=True)
-        all_strs = _ag014_extract_any_str_literals(value, str_consts)
+        alias_src = _ag014_unwrap_container_alias(value)
+        tokens = (
+            set(tables[alias_src]) if alias_src and alias_src in tables
+            else _ag014_extract_literal_tokens(value, str_consts, allow_native_abi=True)
+        )
+        all_strs = (
+            set(str_sets[alias_src]) if alias_src and alias_src in str_sets
+            else _ag014_extract_any_str_literals(value, str_consts)
+        )
+        compiled_pat = _ag014_extract_compiled_regex(value, str_consts, regex_pats)
+        is_container_set = bool(
+            (alias_src and alias_src in str_sets)
+            or (all_strs and not isinstance(value, ast.Constant) and folded is None)
+        )
         for target in targets:
             if not isinstance(target, ast.Name):
                 continue
@@ -1284,13 +1405,20 @@ def _ag014_collect_tables(
                 str_consts[target.id] = folded
             if tokens:
                 tables[target.id] = frozenset(tokens)
-            if all_strs and not isinstance(value, ast.Constant):
+            if is_container_set:
                 str_sets[target.id] = frozenset(all_strs)
-    return str_consts, tables, str_sets
+            if compiled_pat is not None:
+                regex_pats[target.id] = compiled_pat
+    return str_consts, tables, str_sets, regex_pats
 
 
-def _ag014_collect_taint(nodes: Sequence[ast.AST], init: set[str]) -> set[str]:
+def _ag014_collect_taint(
+    nodes: Sequence[ast.AST],
+    init: set[str],
+    init_var_owners: frozenset[str] = frozenset(),
+) -> tuple[set[str], frozenset[str]]:
     tainted = set(init)
+    var_owners = set(init_var_owners)
     for node in nodes:
         if isinstance(node, ast.Assign):
             targets, value = node.targets, node.value
@@ -1298,11 +1426,16 @@ def _ag014_collect_taint(nodes: Sequence[ast.AST], init: set[str]) -> set[str]:
             targets, value = (node.target,), node.value
         else:
             continue
-        if _ag014_is_identity_expr(value, tainted):
+        frozen_owners = frozenset(var_owners)
+        if _ag014_owner_is_model(value, frozen_owners):
+            for target in targets:
+                if isinstance(target, ast.Name):
+                    var_owners.add(target.id)
+        if _ag014_is_identity_expr(value, tainted, frozen_owners):
             for target in targets:
                 if isinstance(target, ast.Name):
                     tainted.add(target.id)
-    return tainted
+    return tainted, frozenset(var_owners)
 
 
 def _ag014_tokens_of_operand(
@@ -1332,9 +1465,10 @@ def _ag014_check_match(
     node: ast.Match,
     lineno: int,
     tainted: set[str],
+    var_owners: frozenset[str],
     emit: Callable[[int, str, str, str], None],
 ) -> None:
-    subject_is_id = _ag014_is_identity_expr(node.subject, tainted)
+    subject_is_id = _ag014_is_identity_expr(node.subject, tainted, var_owners)
     for case in node.cases:
         for sub in ast.walk(case.pattern):
             if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
@@ -1355,9 +1489,10 @@ def _ag014_check_lookup(
     tables: Mapping[str, frozenset[str]],
     str_sets: Mapping[str, frozenset[str]],
     tainted: set[str],
+    var_owners: frozenset[str],
     emit: Callable[[int, str, str, str], None],
 ) -> None:
-    key_is_id = key_expr is not None and _ag014_is_identity_expr(key_expr, tainted)
+    key_is_id = key_expr is not None and _ag014_is_identity_expr(key_expr, tainted, var_owners)
     if isinstance(container, ast.Name):
         if container.id in tables:
             for tok in sorted(tables[container.id]):
@@ -1390,14 +1525,16 @@ def _ag014_check_call(
     str_consts: Mapping[str, str],
     tables: Mapping[str, frozenset[str]],
     str_sets: Mapping[str, frozenset[str]],
+    regex_pats: Mapping[str, str],
     tainted: set[str],
+    var_owners: frozenset[str],
     emit: Callable[[int, str, str, str], None],
 ) -> None:
     if not isinstance(node.func, ast.Attribute):
         return
     method = node.func.attr
     if method in _AG014_STR_METHODS:
-        recv_is_id = _ag014_is_identity_expr(node.func.value, tainted)
+        recv_is_id = _ag014_is_identity_expr(node.func.value, tainted, var_owners)
         for arg in node.args:
             tokens = (
                 _ag014_any_strs_of_operand(arg, str_consts, str_sets)
@@ -1409,19 +1546,31 @@ def _ag014_check_call(
                     f"hardcoded model-name .{method}({tok!r}) check forbidden in {rel.as_posix()}; use structural predicates",
                 )
     elif method in _AG014_REGEX_METHODS:
-        pat_arg = node.args[0] if node.args else next(
-            (kw.value for kw in node.keywords if kw.arg == "pattern"), None,
-        )
-        if pat_arg is None:
-            return
-        target_arg = node.args[1] if len(node.args) >= 2 else next(
-            (kw.value for kw in node.keywords if kw.arg == "string"), None,
-        )
-        target_is_id = target_arg is not None and _ag014_is_identity_expr(target_arg, tainted)
-        tokens = (
-            _ag014_any_strs_of_operand(pat_arg, str_consts, str_sets)
-            if target_is_id else _ag014_tokens_of_operand(pat_arg, str_consts, tables, allow_native_abi=True)
-        )
+        compiled_pat = _ag014_extract_compiled_regex(node.func.value, str_consts, regex_pats)
+        if compiled_pat is not None:
+            target_arg = node.args[0] if node.args else next(
+                (kw.value for kw in node.keywords if kw.arg == "string"), None,
+            )
+            target_is_id = target_arg is not None and _ag014_is_identity_expr(target_arg, tainted, var_owners)
+            if target_is_id:
+                tokens = {compiled_pat.strip()} if compiled_pat.strip() else set()
+            else:
+                tok = _ag014_match_token(compiled_pat, allow_native_abi=True)
+                tokens = {tok} if tok else set()
+        else:
+            pat_arg = node.args[0] if node.args else next(
+                (kw.value for kw in node.keywords if kw.arg == "pattern"), None,
+            )
+            if pat_arg is None:
+                return
+            target_arg = node.args[1] if len(node.args) >= 2 else next(
+                (kw.value for kw in node.keywords if kw.arg == "string"), None,
+            )
+            target_is_id = target_arg is not None and _ag014_is_identity_expr(target_arg, tainted, var_owners)
+            tokens = (
+                _ag014_any_strs_of_operand(pat_arg, str_consts, str_sets)
+                if target_is_id else _ag014_tokens_of_operand(pat_arg, str_consts, tables, allow_native_abi=True)
+            )
         for tok in sorted(tokens):
             emit(
                 lineno, "model_name_regex", tok,
@@ -1429,30 +1578,37 @@ def _ag014_check_call(
             )
     elif method == "get":
         key_arg = node.args[0] if node.args else None
-        _ag014_check_lookup(rel, node.func.value, key_arg, lineno, str_consts, tables, str_sets, tainted, emit)
+        _ag014_check_lookup(
+            rel, node.func.value, key_arg, lineno,
+            str_consts, tables, str_sets, tainted, var_owners, emit,
+        )
 
 
 def _ag014_scan_scope(
     rel: PurePosixPath,
     body: Sequence[ast.stmt],
     init_tainted: set[str],
+    init_var_owners: frozenset[str],
     base_strs: Mapping[str, str],
     base_tables: Mapping[str, frozenset[str]],
     base_str_sets: Mapping[str, frozenset[str]],
+    base_regexes: Mapping[str, str],
     docs: set[int],
     parents: Mapping[ast.AST, ast.AST],
     emit: Callable[[int, str, str, str], None],
 ) -> None:
     nodes = list(_ag014_scope_stmts(body))
-    str_consts, tables, str_sets = _ag014_collect_tables(nodes, base_strs, base_tables, base_str_sets)
-    tainted = _ag014_collect_taint(nodes, init_tainted)
+    str_consts, tables, str_sets, regex_pats = _ag014_collect_tables(
+        nodes, base_strs, base_tables, base_str_sets, base_regexes,
+    )
+    tainted, var_owners = _ag014_collect_taint(nodes, init_tainted, init_var_owners)
     for node in nodes:
         if id(node) in docs or _ag014_in_source_ref(node, parents):
             continue
         lineno = int(getattr(node, "lineno", 1))
         if isinstance(node, ast.Compare):
             operands = (node.left, *node.comparators)
-            has_id = any(_ag014_is_identity_expr(op, tainted) for op in operands)
+            has_id = any(_ag014_is_identity_expr(op, tainted, var_owners) for op in operands)
             for operand in operands:
                 tokens = (
                     _ag014_any_strs_of_operand(operand, str_consts, str_sets)
@@ -1464,11 +1620,16 @@ def _ag014_scan_scope(
                         f"hardcoded model-name comparison ({tok!r}) forbidden in {rel.as_posix()}; use structural predicates",
                     )
         elif isinstance(node, ast.Call):
-            _ag014_check_call(rel, node, lineno, str_consts, tables, str_sets, tainted, emit)
+            _ag014_check_call(
+                rel, node, lineno, str_consts, tables, str_sets, regex_pats, tainted, var_owners, emit,
+            )
         elif isinstance(node, ast.Match):
-            _ag014_check_match(rel, node, lineno, tainted, emit)
-        elif isinstance(node, ast.Subscript):
-            _ag014_check_lookup(rel, node.value, node.slice, lineno, str_consts, tables, str_sets, tainted, emit)
+            _ag014_check_match(rel, node, lineno, tainted, var_owners, emit)
+        elif isinstance(node, ast.Subscript) and isinstance(node.ctx, ast.Load):
+            _ag014_check_lookup(
+                rel, node.value, node.slice, lineno,
+                str_consts, tables, str_sets, tainted, var_owners, emit,
+            )
 
 
 def _check_ag014_zero_model_name_branches(rel: PurePosixPath, tree: ast.Module) -> list[Violation]:
@@ -1483,7 +1644,10 @@ def _check_ag014_zero_model_name_branches(rel: PurePosixPath, tree: ast.Module) 
         return []
     docs = _ag014_docstring_ids(tree)
     parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
-    mod_strs, mod_tables, mod_str_sets = _ag014_collect_tables(list(_ag014_scope_stmts(tree.body)), {}, {}, {})
+    spec_names = _ag014_collect_model_spec_aliases(tree)
+    mod_strs, mod_tables, mod_str_sets, mod_regexes = _ag014_collect_tables(
+        list(_ag014_scope_stmts(tree.body)), {}, {}, {}, {},
+    )
     violations: list[Violation] = []
     seen: set[tuple[int, str, str]] = set()
 
@@ -1493,19 +1657,26 @@ def _check_ag014_zero_model_name_branches(rel: PurePosixPath, tree: ast.Module) 
             seen.add(key)
             violations.append(Violation("AG014", rel, line, f"AG014:{kind}:{pos}:{key[2]}", detail))
 
-    _ag014_scan_scope(rel, tree.body, set(), mod_strs, mod_tables, mod_str_sets, docs, parents, _emit)
+    _ag014_scan_scope(
+        rel, tree.body, set(), frozenset(),
+        mod_strs, mod_tables, mod_str_sets, mod_regexes, docs, parents, _emit,
+    )
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            arg_names = {
-                a.arg for a in (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
-                if a.arg in _AG014_IDENTITY_NAMES
-            }
-            _ag014_scan_scope(rel, node.body, arg_names, mod_strs, mod_tables, mod_str_sets, docs, parents, _emit)
+            all_args = (*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs)
+            arg_names = {a.arg for a in all_args if a.arg in _AG014_IDENTITY_NAMES}
+            arg_var_owners = frozenset(
+                a.arg for a in all_args if _ag014_annotation_is_model_spec(a.annotation, spec_names)
+            )
+            _ag014_scan_scope(
+                rel, node.body, arg_names, arg_var_owners,
+                mod_strs, mod_tables, mod_str_sets, mod_regexes, docs, parents, _emit,
+            )
     return violations
 
 
 def check_ag014_manifest(root: Path, *, manifest_text: str | None = None) -> list[Violation]:
-    """Flag any mechanism binding in ``stacks/vllm_ascend/manifest.json`` with non-empty ``models``."""
+    """Flag any model allowlist/denylist in ``stacks/vllm_ascend/manifest.json``."""
     if manifest_text is None:
         disk = root / _AG014_MANIFEST_REL
         if not disk.is_file():
@@ -1523,6 +1694,23 @@ def check_ag014_manifest(root: Path, *, manifest_text: str | None = None) -> lis
         return []
     lines = manifest_text.splitlines()
     violations: list[Violation] = []
+    for top_key in ("supported_models", "unmerged_pr_models"):
+        top_models = payload.get(top_key)
+        has_top = (
+            (isinstance(top_models, list) and any(str(m).strip() for m in top_models))
+            or (isinstance(top_models, Mapping) and any(str(k).strip() for k in top_models))
+            or (isinstance(top_models, str) and bool(top_models.strip()))
+        )
+        if not has_top:
+            continue
+        marker = f'"{top_key}"'
+        line_no = next((n for n, ln in enumerate(lines, start=1) if marker in ln), 1)
+        violations.append(Violation(
+            "AG014", _AG014_MANIFEST_REL, line_no,
+            f"AG014:manifest_top_models:{top_key}",
+            f"manifest.json top-level {top_key!r} specifies non-empty models={top_models!r}; "
+            "use structural capability_predicates instead",
+        ))
     entries = list(payload.get("bindings") or ()) + list(payload.get("mechanisms") or ())
     for idx, entry in enumerate(entries):
         if not isinstance(entry, Mapping):

@@ -690,11 +690,53 @@ def _step5_auxiliary(c, plans, *, hidden: int, heads: int, kv_heads: int,
     return AuxiliarySpec(mtp=spec)
 
 
-def build_fleet_model(key: str, config: Mapping[str, Any], family: str) -> ModelSpec:
+_SANDWICH_SLIDING_SCHEMA_KEYS = frozenset({
+    "global_head_dim", "attention_k_eq_v", "enable_moe_block",
+    "num_kv_shared_layers", "hidden_size_per_layer_input",
+    "use_double_wide_mlp", "num_global_key_value_heads",
+    "top_k_experts", "vocab_size_per_layer_input",
+    "hidden_activation", "final_logit_softcapping",
+})
+_REGION_SPARSE_SCHEDULE_KEYS = frozenset({
+    "sparse_config", "use_head_wise_attn_gate", "swiglu_limits",
+    "swiglu_limits_shared", "moe_layer_list", "moe_layers_enum",
+    "use_moe", "moe_num_experts", "moe_top_k", "num_attention_groups",
+    "need_fp32_gate", "use_moe_router_bias", "moe_router_scaling_factor",
+    "share_expert_dim", "head_dim_full_attention", "head_dim_sliding_attention",
+    "num_sliding_attention_heads", "partial_rotary_factors",
+    "att_impl_type", "attention_other_setting", "yarn_only_types",
+})
+_SANDWICH_WIDE_HEAD_DIM_MIN = 256
+_SANDWICH_SLIDING_WINDOW_MIN = 1024
+
+
+def build_fleet_model(key: str, config: Mapping[str, Any], family: str = "") -> ModelSpec:
     """Lower a fleet HF config through the native structural adapter."""
-    builders = {"gemma4": _gemma4, "minimax_m3": _minimax_m3, "step5": _step5}
-    if family in builders:
-        return builders[family](key, config)
-    raise ModelingError(f"model_catalog_profile_unsupported:{family}")
+    del family
+    c, _, _ = flatten_config(config)
+    layer_types = c.get("layer_types")
+    if (
+        not layer_types
+        or "sparse_attention_config" in c
+        or "num_mtp_modules" in c
+        or str(c.get("hidden_act", "")).strip().lower() == "swigluoai"
+    ):
+        return _minimax_m3(key, config)
+    if any(field in c for field in _SANDWICH_SLIDING_SCHEMA_KEYS):
+        return _gemma4(key, config)
+    if any(field in c for field in _REGION_SPARSE_SCHEDULE_KEYS):
+        return _step5(key, config)
+    act = str(c.get("hidden_act") or c.get("hidden_activation") or "").strip().lower()
+    if "gelu" in act:
+        return _gemma4(key, config)
+    if "silu" in act:
+        return _step5(key, config)
+    if "sliding_attention" in (str(v) for v in layer_types):
+        declared_window = _int(c, "sliding_window")
+        if declared_window >= _SANDWICH_SLIDING_WINDOW_MIN or (
+            declared_window == 0 and _int(c, "head_dim") >= _SANDWICH_WIDE_HEAD_DIM_MIN
+        ):
+            return _gemma4(key, config)
+    return _step5(key, config)
 
 __all__ = ["FLEET_CATALOG_ENTRIES", "FLEET_MODEL_ALIASES", "build_fleet_model"]

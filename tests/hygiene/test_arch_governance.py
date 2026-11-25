@@ -750,3 +750,161 @@ def test_ag013_export_receipts_blocks_canned_prose_paths_targets_and_hybrid_labe
     assert any("export_unbound_guidance" in fp for fp in fps)
     assert any("aiv_ccu_hybrid" in fp for fp in fps)
 
+
+def test_ag014_default_on_strict_catches_model_branches_and_allows_non_model_locals(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    proj = tmp_path / "repo"
+    pred = proj / "mindie_sim" / "prediction"
+    pred.mkdir(parents=True)
+
+    # Positive cases: real model-name tokens and model identity comparisons MUST fail by default.
+    (pred / "bad_model_branches.py").write_text(
+        'def check_models(model, model_family: str, spec: "ModelSpec", raw: dict, tok: str) -> int:\n'
+        '    if model.name == "aurora-dense-gqa":\n'
+        '        return 1\n'
+        '    if model_family == "zephyr-moe":\n'
+        '        return 2\n'
+        '    if spec.name == "nova-hybrid":\n'
+        '        return 3\n'
+        '    if raw["model"]["name"] == "unseen-v1":\n'
+        '        return 4\n'
+        '    if tok == "deepseek" or tok.startswith("qwen") or tok in {"gemma4", "minimax_m3", "step5"}:\n'
+        '        return 5\n'
+        '    if model.name == "deepseek_mtp":\n'
+        '        return 6\n'
+        '    return 0\n',
+        encoding="utf-8",
+    )
+
+    # Negative cases: non-model local variables, hardware/op names, and upstream wire protocol enums MUST pass.
+    (pred / "clean_non_model_locals.py").write_text(
+        'WIRE_METHODS = frozenset({"deepseek_mtp", "qwen3_5_mtp", "qwen3_next_mtp"})\n'
+        'def classify(event: dict, item: dict, profile: dict, op, spec, term, method: str) -> bool:\n'
+        '    if event.get("name") == "Ascend Hardware" or event["name"] == "process_name":\n'
+        '        return True\n'
+        '    if item["name"] in {"weight", "q_scale", "k_scale", "v_scale"}:\n'
+        '        return True\n'
+        '    if profile["architecture"] in {"A2", "A3", "A5"}:\n'
+        '        return True\n'
+        '    family_name = str(getattr(op, "family", ""))\n'
+        '    if family_name == "elementwise" or spec.name == "attention":\n'
+        '        return True\n'
+        '    if str(getattr(term, "name", "")).startswith("kda_"):\n'
+        '        return True\n'
+        '    return method in WIRE_METHODS\n',
+        encoding="utf-8",
+    )
+
+    # Default scan_repository() enforces AG014 unconditionally (include_ag014=True by default).
+    findings = [v for v in arch_gov.scan_repository(proj) if v.rule == "AG014"]
+    assert {v.path.as_posix() for v in findings} == {"mindie_sim/prediction/bad_model_branches.py"}
+    fps = {v.fingerprint for v in findings}
+    for expected_tok in (
+        "aurora-dense-gqa", "zephyr-moe", "nova-hybrid", "unseen-v1",
+        "deepseek", "qwen", "gemma4", "minimax_m3", "step5", "deepseek_mtp",
+    ):
+        assert any(expected_tok in fp for fp in fps), f"missing AG014 catch for {expected_tok!r}: {fps}"
+
+    # Default CLI invocation (without --strict-ag014) hard-fails with 0 staged warnings.
+    rc_default = arch_gov.main(["--root", str(proj)])
+    out_default = capsys.readouterr().out
+    assert rc_default == arch_gov.EXIT_VIOLATIONS
+    assert "AG014" in out_default
+    assert "staged warnings" not in out_default
+
+    # Compatibility --strict-ag014 flag remains accepted and yields the exact same hard failure.
+    rc_compat = arch_gov.main(["--root", str(proj), "--strict-ag014"])
+    out_compat = capsys.readouterr().out
+    assert rc_compat == arch_gov.EXIT_VIOLATIONS
+    assert "staged warnings" not in out_compat
+
+    # Removing the offending file leaves zero violations on the clean non-model fixture.
+    (pred / "bad_model_branches.py").unlink()
+    assert arch_gov.main(["--root", str(proj)]) == arch_gov.EXIT_OK
+    assert "arch governance violations: 0" in capsys.readouterr().out
+    assert arch_gov.main(["--root", str(proj), "--strict-ag014"]) == arch_gov.EXIT_OK
+    assert "arch governance violations: 0" in capsys.readouterr().out
+
+    # Real repository passes default-on AG014 with zero violations.
+    assert arch_gov.scan_ag014(REPO_ROOT) == ()
+
+
+def test_ag014_hardened_ast_edges_base_non_waiver_and_manifest_top_level(
+    tmp_path: Path,
+) -> None:
+    import json
+
+    proj = tmp_path / "repo"
+    pred = proj / "mindie_sim" / "prediction"
+    pred.mkdir(parents=True)
+
+    (pred / "tricky_evasions.py").write_text(
+        'import re\n'
+        'from mindie_sim.schema.model import ModelSpec as MS\n'
+        'T = {"qwen": 1}\n'
+        'D = T\n'
+        'R_KNOWN = re.compile("qwen")\n'
+        'R_NEW = re.compile("aurora")\n'
+        'def check_all(cfg: dict, s: MS, model) -> int:\n'
+        '    if cfg["architectures"][0] == "FalconForCausalLM":\n'
+        '        return 1\n'
+        '    match cfg["architectures"][0]:\n'
+        '        case "OrcaForCausalLM":\n'
+        '            return 2\n'
+        '    if getattr(s, "name") == "deepseek_mtp":\n'
+        '        return 3\n'
+        '    if D.get(model.name, 0) or D[model.name]:\n'
+        '        return 4\n'
+        '    if R_KNOWN.search(model.name) or R_NEW.search(model.name):\n'
+        '        return 5\n'
+        '    if model.name.casefold().startswith("zephyr"):\n'
+        '        return 6\n'
+        '    return 0\n',
+        encoding="utf-8",
+    )
+    (pred / "clean_edges.py").write_text(
+        'from pathlib import Path\n'
+        '_SEED = {"qwen": 1}\n'
+        'def check_path(parent: "ModelSpec", p: Path) -> bool:\n'
+        '    reg = dict(_SEED)\n'
+        '    reg["other"] = 2\n'
+        '    return parent.layers > 0 and p.parent.name == "configs" and bool(reg)\n',
+        encoding="utf-8",
+    )
+    manifest = proj / "mindie_sim" / "stacks" / "vllm_ascend" / "manifest.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(
+        json.dumps(
+            {
+                "supported_models": ["qwen3-32b"],
+                "unmerged_pr_models": ["step-5-preview"],
+                "bindings": [],
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    findings = arch_gov.scan_ag014(proj)
+    by_file: dict[str, set[str]] = {}
+    for item in findings:
+        by_file.setdefault(item.path.as_posix(), set()).add(item.fingerprint)
+
+    assert "mindie_sim/prediction/clean_edges.py" not in by_file
+    py_fps = by_file["mindie_sim/prediction/tricky_evasions.py"]
+    for expected in (
+        "falconforcausallm", "orcaforcausallm", "deepseek_mtp",
+        "d:qwen", "qwen", "aurora", "zephyr",
+    ):
+        assert any(expected in fp for fp in py_fps), f"missing {expected!r}: {py_fps}"
+
+    manifest_fps = by_file["mindie_sim/stacks/vllm_ascend/manifest.json"]
+    assert manifest_fps == {
+        "AG014:manifest_top_models:supported_models",
+        "AG014:manifest_top_models:unmerged_pr_models",
+    }
+
+    # Differential --base subtraction must NEVER waive AG014 violations.
+    assert arch_gov.new_violations(findings, findings) == findings
+
