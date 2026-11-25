@@ -12,8 +12,10 @@ from collections import Counter, OrderedDict
 from bisect import bisect_right
 from dataclasses import replace
 from functools import lru_cache, partial
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.catalog.index_pool import selected_tokens
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.operators.sharedkv.l0_sync import (
@@ -57,6 +59,28 @@ INDEXED_DEQUANT_NONCAST_OPS = 1.5
 INDEXED_DEQUANT_CAST_OPS = 2.5
 
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="8fd0bc4885cb52e58791aaa8efacc571b9bd115d",
+        relative_path="csrc/attention/sparse_flash_attention/op_kernel/arch22/sparse_flash_attention_kernel_mla.h",
+        source_sha256="cec94843ad2144f80e5a504b33f92a682ba8908037435de65da26f5682ce7cdd",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/kv_quant_sparse_flash_attention/op_host/kv_quant_sparse_flash_attention_tiling.cpp",
+        source_sha256="2c75acce70974165d5b087416d724bcd0d09909b2e8dd693370b5860de9dbc6e",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="8c30e4f491f73cba737a1dacc522894e437cdf3d",
+        relative_path="csrc/attention/kv_quant_sparse_flash_attention/op_kernel/kv_quant_sparse_flash_attention_service_vector_mla.h",
+        source_sha256="3eed5ab746e056319bf873a488a3306cffbabe8dd19f70294da85685f4e3cfd3",
+    ),
+)
+BF16_ELEMENT_BYTES = 2
 SOURCE = {
     "repository": "vllm-project/vllm-ascend",
     "revision": "8fd0bc4885cb52e58791aaa8efacc571b9bd115d",
@@ -347,14 +371,25 @@ def build_pipeline(shape, geometry, *, scratch_policy, key_tile=INDEXED_KEY_TILE
             pool_size = shape.get("index_pool_size", 1)
             pool_tail = shape.get("index_pool_tail", False)
             part_seqs = []
+            merge_specs = []
+            empty_rows = []
+            q_flat = 0
             for q_cnt, ctx_len in sequences:
                 for pos in range(q_cnt):
                     k_row = selected_tokens(ctx_len + pos + 1, topk, pool_size, pool_tail)
-                    base_k, rem_k = divmod(k_row, parts)
-                    for p_idx in range(parts):
-                        pk = base_k + (1 if p_idx < rem_k else 0)
-                        if pk > 0:
-                            part_seqs.append((1, pk - 1))
+                    if k_row == 0:
+                        empty_rows.append(q_flat)
+                    else:
+                        base_k, rem_k = divmod(k_row, parts)
+                        active_parts = 0
+                        for p_idx in range(parts):
+                            pk = base_k + (1 if p_idx < rem_k else 0)
+                            if pk > 0:
+                                part_seqs.append((1, pk - 1))
+                                active_parts += 1
+                        if active_parts > 1:
+                            merge_specs.append((q_flat, active_parts))
+                    q_flat += 1
             fd_factory = _FD_PHASES if phase_factory is _phases else phase_factory
             sub_plan = _plan(
                 tuple(part_seqs), topk, heads, latent, rope, geometry.compute_units,
@@ -363,37 +398,55 @@ def build_pipeline(shape, geometry, *, scratch_policy, key_tile=INDEXED_KEY_TILE
                 phase_unit_weights, 1, False,
             )
             state_bytes = heads * (latent + SPLIT_KV_STATE_SCALARS) * FP32_ELEMENT_BYTES
-            per_q_merge = Work(resources={
-                "mte2_aiv": parts * state_bytes,
-                "mte3": state_bytes,
-                "hbm": (parts + 1) * state_bytes,
-                "vector": (parts - 1) * heads * (SPLIT_KV_MERGE_OPS_PER_ELEM * latent + SPLIT_KV_STATE_SCALARS),
-            })
-            merge_work = per_q_merge.scaled(query)
+            row_output_bytes = heads * latent * BF16_ELEMENT_BYTES
+            merge_work = Work()
+            merge_per_q = []
+            for q_idx, active_parts in merge_specs:
+                per_q = Work(resources={
+                    "mte2_aiv": active_parts * state_bytes,
+                    "mte3": state_bytes,
+                    "hbm": (active_parts + 1) * state_bytes,
+                    "vector": (active_parts - 1) * heads * (
+                        SPLIT_KV_MERGE_OPS_PER_ELEM * latent + SPLIT_KV_STATE_SCALARS),
+                })
+                merge_work += per_q
+                merge_per_q.append((q_idx, per_q))
+            empty_per_q = Work(resources={"hbm": row_output_bytes, "mte3": row_output_bytes})
+            empty_work = empty_per_q.scaled(len(empty_rows)) if empty_rows else Work()
             base_lower = sub_plan.program
 
             def _split_kv_lower(ctx):
                 body_prog = base_lower(ctx)
-                q_work = ctx.bind(per_q_merge)
-                merge_branches = tuple(
+                branches = [
                     KernelProgram((Stage(
-                        f"merge_q{q_idx}", q_work,
+                        f"merge_q{q_idx}", ctx.bind(per_q),
                         placement=ctx.owned((q_idx * parts) % geometry.compute_units, geometry.compute_units,
                                             {"mte2_aiv", "mte3", "vector"}),
                         coupled=True,
                     ),))
-                    for q_idx in range(query)
-                )
-                barrier_ms = p13_syncall_ms(ctx)
+                    for q_idx, per_q in merge_per_q
+                ]
+                e_work = ctx.bind(empty_per_q) if empty_rows else {}
+                for q_idx in empty_rows:
+                    e_place = ctx.owned((q_idx * parts) % geometry.compute_units, geometry.compute_units, {"mte3"})
+                    if heads <= SINGLE_AIV_HEAD_LIMIT:
+                        mte3_res = ctx.resource_names[ctx.physical_role("mte3")]
+                        if mte3_res in e_place:
+                            e_place[mte3_res] = e_place[mte3_res][:1]
+                    branches.append(KernelProgram((Stage(
+                        f"empty_q{q_idx}", e_work, placement=e_place, coupled=True,
+                    ),)))
+                barrier_ms = p13_syncall_ms(ctx) if merge_per_q else 0.0
                 stages = [Stage("split_kv_parts", program=body_prog)]
                 prev = "split_kv_parts"
                 if barrier_ms > 0.0:
                     stages.append(Stage("split_kv_barrier", after=(prev,), latency=barrier_ms, keep_empty=True))
                     prev = "split_kv_barrier"
-                stages.append(Stage("split_kv_merge", after=(prev,), program=ParallelProgram(merge_branches)))
+                if branches:
+                    stages.append(Stage("split_kv_merge", after=(prev,), program=ParallelProgram(tuple(branches))))
                 return KernelProgram(tuple(stages))
 
-            return replace(sub_plan, work=sub_plan.work + merge_work, program=_split_kv_lower)
+            return replace(sub_plan, work=sub_plan.work + merge_work + empty_work, program=_split_kv_lower)
     owners = selected_query_owners(query, geometry.compute_units)
     # The source reserves four KV rings and three score/probability/output
     # rings per owner. Cache residency is an explicit conditional placement.
@@ -508,6 +561,20 @@ def _plan(sequences, topk, heads, latent, rope, compute_units,
                 keys = min(key_tile, count - start)
                 yield keys, start == 0, start + keys == count
 
+    def empty_queries(owner):
+        empty = 0
+        for sequence, position in sequence_query_positions(owner, sequences, compute_units):
+            context = sequences[sequence][1]
+            seq_topk = (
+                int(per_sequence_topk[sequence])
+                if per_sequence_topk is not None and sequence < len(per_sequence_topk)
+                else int(topk)
+            )
+            if selected_tokens(context + position + 1, seq_topk,
+                               index_pool_size, index_pool_tail) == 0:
+                empty += 1
+        return empty
+
     @lru_cache(maxsize=TILE_CACHE_ENTRIES)
     def phases(key):
         keys, first, last = key
@@ -515,12 +582,20 @@ def _plan(sequences, topk, heads, latent, rope, compute_units,
                              scratch_policy=scratch_policy, operand_modes=operand_modes)
 
     owner_work = []
+    empty_counts = []
+    row_output_bytes = heads * latent * BF16_ELEMENT_BYTES
     for owner in range(owners):
         work = Work()
         for key, count in Counter(tile_keys(owner)).items():
             for _, phase in phases(key):
                 work += phase.scaled(count)
+        empty = empty_queries(owner)
+        empty_counts.append(empty)
+        if empty:
+            empty_bytes = empty * row_output_bytes
+            work += Work(resources={"hbm": empty_bytes, "mte3": empty_bytes})
         owner_work.append(work)
+    empty_counts = tuple(empty_counts)
     total = Work()
     for work in owner_work:
         total += work
@@ -532,7 +607,7 @@ def _plan(sequences, topk, heads, latent, rope, compute_units,
             ctx, scratch_policy, operand_modes, nominal_cache, heads, phase_unit_weights,
             compute_units, paired_vector_stages, phases, per_owner_scratch,
             vector_buffer_bytes, compact, tile_keys, slots, owner_work, source_items, owners,
-            key_tile, sequences)
+            key_tile, sequences, empty_counts, row_output_bytes)
 
     return OperatorPlan(total, lower)
 
@@ -561,27 +636,35 @@ def _dequant_cast_scale(ctx) -> float:
 def _compact_owner_program(
     ctx, owner, owner_work, bind, phase_unit_weights, heads, tile_keys, phases, nominal, slots,
     phase_caps, duration, _vector_weights, compute_units, buffers,
+    empty_count, row_output_bytes,
 ):
     # Ordered phase recurrence with finite in-flight tiles. Shared
     # physical pipes impose an additional duty bound across streams.
     # Compact mode is a fluid approximation; the expanded control
     # retains exact phase arbitration for counterexample testing.
     all_work, all_placement = bind(owner_work[owner])
-    if phase_unit_weights or heads > SINGLE_AIV_HEAD_LIMIT:
-        # The aggregate may use only units used by its real phases.
-        # A short packed-cache tail can leave the sibling vector
-        # entirely idle even though publish emits metadata on both.
-        actual_units = {}
-        for key in set(tile_keys(owner)):
-            for name, phase in phases(key):
-                _, placement = bind(phase, name, key)
-                for resource, units in placement.items():
-                    actual_units.setdefault(resource, set()).update(units)
+    empty_phase = (
+        Work(resources={"hbm": empty_count * row_output_bytes,
+                        "mte3": empty_count * row_output_bytes})
+        if empty_count else None
+    )
+    empty_key = (0, True, True)
+    # The aggregate may use only physical units used by its real phases
+    # (including single-AIV empty outputs when <=16 heads and no tiles run).
+    actual_units = {}
+    for key in set(tile_keys(owner)):
+        for name, phase in phases(key):
+            _, placement = bind(phase, name, key)
+            for resource, units in placement.items():
+                actual_units.setdefault(resource, set()).update(units)
+    if empty_phase is not None:
+        _, placement = bind(empty_phase, "output", empty_key)
+        for resource, units in placement.items():
+            actual_units.setdefault(resource, set()).update(units)
+    if actual_units:
         all_placement = {resource: tuple(sorted(units))
                          for resource, units in actual_units.items()}
     if owner not in nominal:
-        vec_res = ctx.resource_names.get("vector")
-        dq_scale = _dequant_cast_scale(ctx)
         phase_times = {}
         stream_tail = {}
         retired = [0.0] * slots
@@ -592,14 +675,9 @@ def _compact_owner_program(
                 for name, phase in phases(key):
                     work, placement = bind(phase, name, key)
                     caps = phase_caps(work, name, key)
-                    eff_work = (
-                        {r: (v * dq_scale if r == vec_res else v) for r, v in work.items()}
-                        if (name == "dequantize" and dq_scale < 1.0 and vec_res in work)
-                        else work
-                    )
                     base_dur = max(
-                        duration(eff_work, placement),
-                        max((eff_work[r] / cap for r, cap in caps.items()), default=0.0),
+                        duration(work, placement),
+                        max((work[r] / cap for r, cap in caps.items()), default=0.0),
                     )
                     times.append((name, base_dur + _indexed_phase_sync_ms(ctx, name, key[0])))
                 phase_times[key] = tuple(times)
@@ -612,8 +690,14 @@ def _compact_owner_program(
                 stream_tail[name] = ready
             retired[count % slots] = ready
             end = max(end, ready)
+        if empty_phase is not None:
+            e_work, e_place = bind(empty_phase, "output", empty_key)
+            e_caps = phase_caps(e_work, "output", empty_key)
+            end += max(
+                duration(e_work, e_place),
+                max((e_work[r] / cap for r, cap in e_caps.items()), default=0.0),
+            )
         unit_demand = Counter()
-        eff_unit_demand = Counter()
         for key, count in Counter(tile_keys(owner)).items():
             for name, phase in phases(key):
                 work, placement = bind(phase, name, key)
@@ -622,21 +706,25 @@ def _compact_owner_program(
                     for role, fractions in _vector_weights(name, key).items()}
                 for resource, units in placement.items():
                     raw_amt = work.get(resource, 0) * count
-                    eff_amt = raw_amt * dq_scale if (name == "dequantize" and resource == vec_res and dq_scale < 1.0) else raw_amt
                     fractions = weights.get(resource, (1 / len(units),) * len(units))
                     for unit, fraction in zip(units, fractions):
                         unit_demand[resource, unit] += raw_amt * fraction
-                        eff_unit_demand[resource, unit] += eff_amt * fraction
-        for (resource, _), amount in eff_unit_demand.items():
+        if empty_phase is not None:
+            e_work, e_place = bind(empty_phase, "output", empty_key)
+            e_weights = {ctx.resource_names[ctx.physical_role(role)]: tuple(
+                value for value in fractions if value)
+                for role, fractions in _vector_weights("output", empty_key).items()}
+            for resource, units in e_place.items():
+                raw_amt = e_work.get(resource, 0)
+                fractions = e_weights.get(resource, (1 / len(units),) * len(units))
+                for unit, fraction in zip(units, fractions):
+                    unit_demand[resource, unit] += raw_amt * fraction
+        for (resource, _), amount in unit_demand.items():
             role = next(role for role, name in ctx.resource_names.items()
                         if name == resource)
             end = max(end, amount * ctx.resource_units.get(
                 role, compute_units) / ctx.rates[resource])
-        eff_all_work = {
-            r: (sum(v for (res, _), v in eff_unit_demand.items() if res == r) if r == vec_res and dq_scale < 1.0 else amt)
-            for r, amt in all_work.items()
-        }
-        nominal[owner] = (max(end, duration(eff_all_work, all_placement)), dict(unit_demand))
+        nominal[owner] = (max(end, duration(all_work, all_placement)), dict(unit_demand))
     end, u_demand = nominal[owner]
     caps = {key: amount / end for key, amount in all_work.items()} if end else {}
     has_two_vector_aivs = len(all_placement.get(ctx.resource_names.get("vector", "vector"), ())) == 2
@@ -674,7 +762,7 @@ def _compact_owner_program(
 def _lower_indexed_owner(
     ctx, owner, compute_units, heads, paired_vector_stages, phase_unit_weights, _vector_weights,
     phases, m0, hpad, aiv_read_role, scratch_policy, per_owner_scratch, vector_buffer_bytes,
-    compact, tile_keys, slots, owner_work, nominal,
+    compact, tile_keys, slots, owner_work, nominal, empty_count, row_output_bytes,
 ):
     def bind(phase, name=None, key=None):
         work = ctx.bind(phase)
@@ -722,12 +810,38 @@ def _lower_indexed_owner(
             limits[resource] = amount / (ctx.rates[resource] * fraction)
         return max(limits.values(), default=0)
 
+    def _output_stage(stage_name, work, placement, *, after, previous=(), caps=None):
+        if heads > SINGLE_AIV_HEAD_LIMIT and work:
+            first = m0 / heads
+            branches = []
+            for idx, frac in enumerate((first, 1.0 - first)):
+                if not frac:
+                    continue
+                b_place = dict(placement)
+                for role in ("vector", aiv_read_role, "mte3"):
+                    res = ctx.resource_names.get(ctx.physical_role(role))
+                    if res in b_place and len(b_place[res]) > idx:
+                        b_place[res] = (b_place[res][idx],)
+                branches.append(KernelProgram((Stage(
+                    "aiv", {k: v * frac for k, v in work.items()},
+                    placement=b_place, coupled=True),)))
+            return Stage(stage_name, after=after, previous=previous,
+                         program=ParallelProgram(tuple(branches)))
+        return Stage(stage_name, work, after=after, previous=previous,
+                     placement=placement, caps=caps or {}, coupled=True)
+
     def stage_list(key):
         result = []
+        partial_tail = (
+            "partial_sync" if _indexed_phase_sync_ms(ctx, "partial", key[0]) > 0.0 else "partial"
+        )
         for name, phase in phases(key):
             work, placement = bind(phase, name, key)
             after = (result[-1].name,) if result else ()
-            prev = ("partial",) if name == "nupdate" and not key[1] else ()
+            sync_ms = _indexed_phase_sync_ms(ctx, name, key[0])
+            prev = (partial_tail,) if name == "nupdate" and not key[1] else ()
+            if sync_ms > 0.0:
+                prev = (*prev, f"{name}_sync")
             if heads > SINGLE_AIV_HEAD_LIMIT and name in {"softmax", "probability", "nupdate", "update", "output"} and work:
                 first = m0 / hpad if name == "nupdate" else m0 / heads
                 branches = []
@@ -749,6 +863,9 @@ def _lower_indexed_owner(
                 result.append(Stage(
                     name, work, after=after, previous=prev,
                     placement=placement, caps=phase_caps(work, name, key), coupled=True))
+            if sync_ms > 0.0:
+                result.append(Stage(
+                    f"{name}_sync", after=(name,), latency=sync_ms, keep_empty=True))
         return tuple(result)
 
     buffers = ()
@@ -767,20 +884,34 @@ def _lower_indexed_owner(
         count = len(keys_seq)
         program = PipelineProgram(
             count, slots, lambda idx, keys_seq=keys_seq: stage_list(keys_seq[idx]))
-        return KernelProgram((
+        stages = [
             Stage("reserve", acquire=buffers),
             Stage("tiles", after=("reserve",), program=program),
-            Stage("release", after=("tiles",), free=buffers)))
+        ]
+        tail = "tiles"
+        if empty_count:
+            empty_phase = Work(resources={
+                "hbm": empty_count * row_output_bytes,
+                "mte3": empty_count * row_output_bytes,
+            })
+            e_work, e_place = bind(empty_phase, "output", (0, True, True))
+            stages.append(_output_stage(
+                "empty_output", e_work, e_place, after=(tail,),
+                caps=phase_caps(e_work, "output", (0, True, True))))
+            tail = "empty_output"
+        stages.append(Stage("release", after=(tail,), free=buffers))
+        return KernelProgram(tuple(stages))
 
     return _compact_owner_program(
         ctx, owner, owner_work, bind, phase_unit_weights, heads, tile_keys, phases, nominal,
-        slots, phase_caps, duration, _vector_weights, compute_units, buffers)
+        slots, phase_caps, duration, _vector_weights, compute_units, buffers,
+        empty_count, row_output_bytes)
 
 
 def _lower_indexed_attention(
     ctx, scratch_policy, operand_modes, nominal_cache, heads, phase_unit_weights, compute_units,
     paired_vector_stages, phases, per_owner_scratch, vector_buffer_bytes, compact, tile_keys,
-    slots, owner_work, source_items, owners, key_tile, sequences,
+    slots, owner_work, source_items, owners, key_tile, sequences, empty_counts, row_output_bytes,
 ):
     # Copy latency/issue limits are deliberately not guessed from residuals.
     required = {"mte2_aic", "mte2_aiv", "mte1", "mte3", "fixpipe"}
@@ -797,7 +928,7 @@ def _lower_indexed_attention(
         *tuple(tuple(sorted(mapping.items())) for mapping in (
             ctx.rates, ctx.resource_names, ctx.resource_units,
             ctx.service_modes, ctx.compute_peaks)),
-        p13_paired_ms(ctx), p03_fixpipe_setup_ms(ctx), _dequant_cast_scale(ctx),
+        p13_paired_ms(ctx), p03_fixpipe_setup_ms(ctx),
     )
     if signature not in nominal_cache:
         nominal_cache[signature] = {}
@@ -824,7 +955,7 @@ def _lower_indexed_attention(
             ctx, owner, compute_units, heads, paired_vector_stages, phase_unit_weights,
             _vector_weights, phases, m0, hpad, aiv_read_role, scratch_policy,
             per_owner_scratch, vector_buffer_bytes, compact, tile_keys, slots, owner_work,
-            nominal)
+            nominal, empty_counts[owner], row_output_bytes)
 
     if ctx.record_mapping:
         ctx.record_mapping({

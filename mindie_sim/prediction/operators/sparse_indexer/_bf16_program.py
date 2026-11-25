@@ -6,16 +6,22 @@
 [Timeouts & Locks] Work scales with active tiles and owners; no I/O or locks.
 [Side-Effect Policy] Returns immutable virtual resource programs and plans.
 """
+from typing import Literal
+
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 
 from ._bf16_access import (
-    QUERY_TILE_ROWS, SCORE_ELEMENT_BYTES, _key_access_plan,
-    _panel_selection_ops, _tile_sentinel, _weighted_vector_ops,
+    QUERY_TILE_ROWS, SCORE_ELEMENT_BYTES, SOURCES as _ACCESS_SOURCES,
+    _key_access_plan, _panel_selection_ops, _tile_sentinel, _weighted_vector_ops,
 )
 from ...mechanism import OperatorPlan, Work
 from mindie_sim.prediction.operators.vector.mixed_core import read_role
 from ...ownership import unit_group
 from ...program import KernelProgram, Stage
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = _ACCESS_SOURCES
 
 
 def _split_loads(geometry):
@@ -91,8 +97,10 @@ def _placement(context, owner, roles, *, core_count, aiv_per_aic=1, aiv=False):
 def _build(op, geometry):
     metadata = dict(op.metadata)
     ledger = metadata.get("lightning_indexer_work")
+    matrix_keys = dict(op.matrix_flops).keys()
     if (ledger is None or op.dtype != "bf16"
-            or dict(op.matrix_flops).keys() != {"bf16"}
+            or (matrix_keys and matrix_keys != {"bf16"})
+            or (not matrix_keys and op.flops > 0)
             or op.layout != "TND/PA_BBND" or "native_tensor_view" not in metadata):
         raise ModelingError("bf16_lightning_indexer_native_contract_required")
     spans = tuple(tuple(span) for span in ledger["sequence_partition"])
@@ -134,11 +142,13 @@ def _build(op, geometry):
                 tile, panel, compression, topk, kv_heads)
         comparisons += tile["panel_merge_ops"]
         sentinel += _tile_sentinel(tile, compression, topk, kv_heads)
+    has_panels = any(tile["panels"] for tile in access["tiles"])
     weight_cast_ops = (int(ledger["query_rows"]) * heads
-                       if ledger["weight_dtype"] != "fp32" else 0)
+                       if ledger["weight_dtype"] != "fp32" and has_panels else 0)
     weighted = float(ledger["weighted_head_reduce_ops"]) + weight_cast_ops
     vector = weighted + comparisons + sentinel + merge_ops
     query = int(access["q_bytes"])
+    mte1_query = sum(int(tile["q_bytes"]) for tile in access["tiles"] if tile["panels"])
     metadata_bytes = int(ledger["metadata_read_bytes"])
     weight = int(ledger["head_weight_bytes"])
     output = int(ledger["selection_output_bytes"])
@@ -155,7 +165,7 @@ def _build(op, geometry):
         "hbm": int(access["key_hbm_bytes"]) + query + weight + metadata_bytes
         + output + 2 * exchange_bytes,
         "mte3": output + exchange_bytes, "vector": vector,
-        "mte1": int(access["key_logical_bytes"]) + query,
+        "mte1": int(access["key_logical_bytes"]) + mte1_query,
         "fixpipe": fixpipe, **loads,
     }
     stage_defs, addresses, allocations = _index_stage_definitions(
@@ -190,6 +200,7 @@ def _index_stage_definitions(
     previous = reserve
     previous_exchange_read = None
     metadata_left = metadata_bytes
+    weight_cast_emitted = False
     weight_dtype = "fp32" if ledger["weight_dtype"] == "fp32" else "bf16"
     weight_element_bytes = int(dtype_bytes(weight_dtype))
     for tile_index, tile in enumerate(access["tiles"]):
@@ -220,9 +231,11 @@ def _index_stage_definitions(
                 "hbm": panel["hbm_bytes"], read: panel["gm_bytes"],
             }, (previous,), None))
             qk_name = f"qk_weighted_reduce_{tile_index}_{panel_index}"
+            cast_ops = weight_cast_ops if (weight_cast_ops and not weight_cast_emitted) else 0
+            if cast_ops:
+                weight_cast_emitted = True
             qk_work = {
-                "vector": _weighted_vector_ops(panel["pairs"], heads, kv_heads)
-                + (weight_cast_ops if tile_index == 0 and panel_index == 0 else 0),
+                "vector": _weighted_vector_ops(panel["pairs"], heads, kv_heads) + cast_ops,
                 "mte1": panel["logical_bytes"]
                 + (tile["q_bytes"] if panel_index == 0 else 0),
                 "fixpipe": panel["pairs"] * heads * SCORE_ELEMENT_BYTES,

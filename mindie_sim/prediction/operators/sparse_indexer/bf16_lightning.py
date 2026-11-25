@@ -14,9 +14,11 @@
 """
 from dataclasses import replace
 import math
+from typing import Literal
 
 from mindie_sim.catalog.attention_common import _floor_sum
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 from ...cache_path import CacheGeometry as CacheGeometry, CacheState as CacheState
 from ._bf16_access import (
@@ -42,6 +44,7 @@ from ...ownership import unit_group as unit_group
 from ...program import KernelProgram as KernelProgram, Stage as Stage
 
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 IMPLEMENTATION = "cann_bf16_lightning_indexer_v2_complete"
 RECIPE = "bf16_lightning_indexer_v2"
 SOURCE = {
@@ -53,16 +56,32 @@ SOURCE = {
     "boundary": "one native BF16 LightningIndexerV2 MIX_AIC kernel",
     "dispatch_identity": "caller ABI and profiler boundary; native binary identity not captured",
 }
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=SOURCE["caller_revision"],
+        relative_path=SOURCE["caller_path"],
+        source_sha256="e311aca9e24df6779f549d695321052b292733cb08d36b7e5860a87ef686418b",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/lightning_indexer_v2/op_host/lightning_indexer_v2_tiling.cpp",
+        source_sha256="b8988f5bdc1ccf8900c2a7853c4edf012f8cb99f6e9b5af40af56167bcd9aade",
+    ),
+)
 
 _DEFAULT_COMPRESSION = 4
 _DEFAULT_QUERY_HEADS = 4
+_MAX_QUERY_HEADS = 64
 _DEFAULT_HEAD_DIM = 128
+_NATIVE_KV_HEADS = 1
 _DEFAULT_TOPK = 512
 _DEFAULT_KEY_PAGE_ROWS = 128
 _QUERY_RANK = 3
 _PAGED_KEY_CACHE_RANK = 4
 _CAUSAL_MASK_MODE = 3
-WEIGHT_DTYPES = frozenset({"fp32", "bf16", "fp16"})
+WEIGHT_DTYPES = frozenset({"fp32"})
 _DTYPE_ALIASES = {"bfloat16": "bf16", "float32": "fp32", "float16": "fp16"}
 
 
@@ -109,7 +128,7 @@ def _build(op, context: Geometry | OperatorPlanningContext):
         sequence_layout_spans=spans,
     )
     metadata["lightning_indexer_work"] = ledger
-    bound = replace(op, matrix_flops=(("bf16", flops),), metadata=tuple(metadata.items()))
+    bound = replace(op, flops=flops, matrix_flops=(("bf16", flops),) if flops else (), metadata=tuple(metadata.items()))
     plan = _build_program(bound, geometry)
     return replace(plan, metadata={**plan.metadata, "sequence_layout_spans": spans,
                                    "layout": layout, "padded_tokens": max(context.padded_tokens, padded_rows)})
@@ -229,7 +248,9 @@ def native_op(*, query, key_cache, weights, block_table, query_lengths,
         block_table, "block_table", 2, {"int32"}, {"ND"})
     if q_shape[1] != w_shape[1] or w_shape[0] != q_shape[0]:
         raise ModelingError("bf16_lightning_indexer_native_weight_geometry")
-    if k_shape[3] != q_shape[2]:
+    if k_shape[2] != _NATIVE_KV_HEADS:
+        raise ModelingError("bf16_lightning_indexer_native_kv_heads")
+    if k_shape[3] != q_shape[2] or q_shape[2] != _DEFAULT_HEAD_DIM:
         raise ModelingError("bf16_lightning_indexer_native_head_dim")
     compression = _integer(compression, "compression", minimum=1)
     topk = _integer(topk, "topk", minimum=1)
@@ -340,6 +361,8 @@ def make_op(*, query_rows=None, context=None, op_id="lightning_indexer", deps=()
         _integer(value, name, minimum=1)
     if heads % kv_heads:
         raise ModelingError("bf16_lightning_indexer_kv_heads_must_divide_heads")
+    if kv_heads != _NATIVE_KV_HEADS or head_dim != _DEFAULT_HEAD_DIM or heads > _MAX_QUERY_HEADS:
+        raise ModelingError("bf16_lightning_indexer_v2_domain_mismatch")
     cache_owner = _integer(cache_owner, "cache_owner", minimum=0)
     if l2_capacity_bytes is not None:
         l2_capacity_bytes = _integer(

@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterator
 from dataclasses import asdict, dataclass, field, fields, replace
 from functools import partial
+from typing import Literal
 
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
@@ -29,6 +30,7 @@ from ..attention.common import planning_sequence_spans, sequence_layout_metadata
 from ..contracts import OperatorPlanningContext
 from ._lowering import S1Partition, S2Partition, _DisjointOwnerProgram, align, ceil_div, request_program, sort_ops
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 FAMILY = "sparse_indexer"
 
 LIGHTNING_ABI = "aclnnLightningIndexer"
@@ -83,6 +85,19 @@ DEFAULT_S2_TILE = 512
 SCORE_SLOTS = 2
 SCORE_SLOT_NAME = "index_score"
 DEFAULT_INDEX_DIM = 128
+REGION_INDEX_DIM = 256
+LIGHTNING_V2_MAX_HEAD_GROUP = 64
+ARCH22_QLI_HEADS = 64
+ARCH22_QLI_DIM = 128
+ARCH22_QLI_HEAD_REDUCE_M = 16
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/lightning_indexer_v2/op_host/lightning_indexer_v2_tiling.cpp",
+        source_sha256="b8988f5bdc1ccf8900c2a7853c4edf012f8cb99f6e9b5af40af56167bcd9aade",
+    ),
+)
 
 
 def is_block_msa_indexer(plan) -> bool:
@@ -287,11 +302,33 @@ def indexer_contract(op: OpSpec, ctx: OperatorPlanningContext, default_abi: str)
     return contract
 
 
+def _request_contract_spans(contract: SparseIndexerContract, ctx: OperatorPlanningContext):
+    for q, kv, q_offset, kv_offset, padding in planning_sequence_spans(ctx, "TND"):
+        if padding:
+            continue
+        if contract.abi == REGION_ABI:
+            history_base = max(0, kv - q)
+            step = max(1, contract.compress_ratio)
+            idx = 0
+            while idx < q:
+                regions = (history_base + idx) // step
+                until = min(q, (regions + 1) * step - history_base)
+                yield (
+                    replace(contract, query_tokens=until - idx, batch_size=1, scanned_rows=regions),
+                    (q_offset + idx, kv_offset),
+                )
+                idx = until
+        else:
+            yield (
+                replace(contract, query_tokens=q, batch_size=1,
+                        scanned_rows=min(contract.scanned_rows, kv // contract.compress_ratio)),
+                (q_offset, kv_offset),
+            )
+
+
 def request_contracts(contract: SparseIndexerContract, ctx: OperatorPlanningContext):
-    for q, kv, _, _, padding in planning_sequence_spans(ctx, "TND"):
-        if not padding:
-            yield replace(contract, query_tokens=q, batch_size=1,
-                          scanned_rows=min(contract.scanned_rows, kv // contract.compress_ratio))
+    for request, _ in _request_contract_spans(contract, ctx):
+        yield request
 
 
 def _minimum_indexer_io(contract: SparseIndexerContract) -> tuple[float, float, float, float]:
@@ -303,7 +340,15 @@ def _minimum_indexer_io(contract: SparseIndexerContract) -> tuple[float, float, 
     out_heads = contract.msa_score_heads if contract.abi in MSA_ABIS else 1
     out_elem = float(INT32_BYTES if contract.fused_topk else FP32_BYTES)
     out_bytes = float(contract.query_tokens * out_heads * out_items) * out_elem
-    vec_ops = float(contract.query_tokens * contract.scanned_rows * contract.index_heads)
+    if contract.abi in MSA_ABIS:
+        head_max = (contract.index_heads - contract.msa_score_heads) * contract.scanned_rows
+        block_max = (
+            max(0, contract.scanned_rows - contract.score_items) * contract.msa_score_heads
+            if contract.block_size > 1 else 0
+        )
+        vec_ops = float(contract.query_tokens * (head_max + block_max))
+    else:
+        vec_ops = float(contract.query_tokens * contract.scanned_rows * contract.index_heads)
     read_b = q_bytes + k_bytes
     return read_b + out_bytes, read_b, out_bytes, vec_ops
 
@@ -368,11 +413,17 @@ class Lowering:
     score_row_item_bytes: int = FP32_BYTES
     owner_score_row: bool = False
     handoff_item_bytes: int = FP32_BYTES
-    head_weight_item_bytes: int = BF16_BYTES
+    head_weight_item_bytes: int | None = None
     handoff_alignment: int = 1
     handoff_columns: Callable[[int], int] | None = None
     score_slot_bytes: int = 0
     score_row_read_align: int = 1
+    cube_head_reduce_fp16: bool = False
+
+    def __post_init__(self) -> None:
+        if self.head_weight_item_bytes is None:
+            default = FP32_BYTES if self.implementation == LIGHTNING_V2_ABI else BF16_BYTES
+            object.__setattr__(self, "head_weight_item_bytes", default)
 
     def handoff_bytes(self, rows: int, heads: int, queries: int) -> int:
         if self.gm_key_staging:
@@ -455,6 +506,30 @@ class _SparseIndexerProgramBuilder:
             stages = [PhaseWork("key_load", Work(resources={memory: key, self.aic_read: key}), True)]
         if (scales := valid * c.aiv_scale_bytes):
             stages.append(PhaseWork("key_scale_load", Work(resources={memory: scales, self.aiv_read: scales})))
+        if g.cube_head_reduce_fp16:
+            dequant_l1_bytes = valid * heads * BF16_BYTES
+            weight_ws_bytes = queries * c.index_heads * ARCH22_QLI_HEAD_REDUCE_M * BF16_BYTES
+            reduced_score_bytes = queries * valid * FP32_BYTES
+            weights = heads * g.head_weight_item_bytes if c.has_head_weights else 0
+            stages.extend((
+                PhaseWork("load_operands", Work(resources={"mte1": key + heads * operand_bytes}), True),
+                PhaseWork("cube_scores", Work(matrix={c.matrix_dtype: 2 * physical_rows * heads * c.index_dim}), True),
+                PhaseWork("score_dequant_l1", Work(resources={"fixpipe": dequant_l1_bytes}), True),
+                PhaseWork("head_reduce_fp16", Work(
+                    matrix={"fp16": 2 * queries * ARCH22_QLI_HEAD_REDUCE_M * c.index_heads * valid},
+                    resources={"mte1": dequant_l1_bytes + weight_ws_bytes},
+                ), True),
+                PhaseWork("score_handoff", Work(resources={
+                    "fixpipe": reduced_score_bytes, "hbm": reduced_score_bytes,
+                }), True, {"route": g.score_path, "score_bytes": reduced_score_bytes}),
+                PhaseWork("score_read", Work(resources={
+                    "hbm": reduced_score_bytes + weights, self.aiv_read: reduced_score_bytes + weights,
+                }), metadata={"head_weight_bytes": weights}),
+                vector("key_descale", queries * valid),
+            ))
+            if g.tile_selection is not None:
+                stages.extend(g.tile_selection(c, rows, index, valid, g.tile_size))
+            return tuple(stages)
         stages.extend((
             PhaseWork("load_operands", Work(resources={"mte1": key + heads * operand_bytes}), True),
             PhaseWork("cube_scores", Work(matrix={c.matrix_dtype: 2 * physical_rows * heads * c.index_dim}), True),
@@ -780,6 +855,17 @@ def build_plan(
     lowering: Lowering, owners: tuple[tuple[int, tuple[int, ...]], ...],
     sources: tuple[SourceRef, ...],
 ) -> OperatorPlan:
+    if contract.abi in QUANT_ABIS and contract.cache_dtype == "bf16":
+        raise unsupported("quant_abi_dtype", f"{contract.abi} requires a quantized cache_dtype, not 'bf16'")
+    if contract.abi == LIGHTNING_V2_ABI and (
+        contract.index_dim != DEFAULT_INDEX_DIM or contract.index_heads > LIGHTNING_V2_MAX_HEAD_GROUP
+    ):
+        raise unsupported(
+            "lightning_v2_domain",
+            f"{contract.abi} requires index_dim={DEFAULT_INDEX_DIM} and index_heads<={LIGHTNING_V2_MAX_HEAD_GROUP}",
+        )
+    if contract.abi == REGION_ABI and contract.index_dim != REGION_INDEX_DIM:
+        raise ModelingError(f"sparse_indexer_region_requires_index_dim_{REGION_INDEX_DIM}:{contract.index_dim}")
     if not owners:
         raise unsupported("missing_owners", "Sparse index scoring needs reachable AIC and AIV owners")
     geometry = ctx.geometry
@@ -800,8 +886,7 @@ def build_plan(
     if ctx.requests:
         builders, waves = [], []
         start = wave_start = 0
-        spans = (span[2:4] for span in planning_sequence_spans(ctx, "TND") if not span[-1])
-        for request, offsets in zip(request_contracts(contract, ctx), spans, strict=True):
+        for request, offsets in _request_contract_spans(contract, ctx):
             lanes = min(len(owners), max(1, S2Partition(
                 request.scanned_rows, lowering.tile_size, request.s2_splits,
             ).owners))

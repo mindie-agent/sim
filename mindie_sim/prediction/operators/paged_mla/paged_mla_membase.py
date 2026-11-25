@@ -11,8 +11,10 @@
 from bisect import bisect_right
 from dataclasses import dataclass, replace
 from functools import lru_cache
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.operators.matrix.refill_steady import (
@@ -24,6 +26,8 @@ from .paged_mla_membase_matrix import (
     QK_K_L0, QK_K_L1, QK_N, QK_WIDTH, matrix_program,
 )
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_ARCH22_ARCH_ID = 'npu_arch_2201'
 _HEAD_TILE_CHOICES = (8, 16)
 _SCORE_COLUMN_ALIGNMENT = 32
 _FP32_BYTES = 4
@@ -54,6 +58,15 @@ SOURCE = {
     },
     'scope': 'q1/physical_heads8_or16/S2_512/D512/rope64; source compatible, binary identity unestablished',
 }
+SOURCES: tuple[SourceRef, ...] = tuple(
+    SourceRef(
+        repository=SOURCE['repository'],
+        revision=SOURCE['revision'],
+        relative_path=name if '/' in name else f"{SOURCE['directory']}/{name}",
+        source_sha256=digest,
+    )
+    for name, digest in SOURCE['sha256'].items()
+)
 # Source allocation maxima; FD resets UB to 122112 bytes after the FA barrier.
 BUFFERS = {'l1': 7*128*288*2, 'l0a': 65536, 'l0b': 65536,
            'l0c': 131072, 'ub': 170*1024}
@@ -139,15 +152,28 @@ def merge_work(heads, splits):
     )
 
 
+def validate_domain(contexts, heads, *, page_size=None, retained_kv_rows=0):
+    """Shared admission predicate for Arch22 SplitCore paged MLA."""
+    if (not contexts or any(type(c) is not int or c < KEY_TILE for c in contexts)
+            or heads not in _HEAD_TILE_CHOICES
+            or (page_size is not None
+                and (type(page_size) is not int or page_size < 1 or KEY_TILE % page_size))):
+        raise ModelingError('paged_mla_arch22_requires_q1_heads8_or16_context_ge512_page_divisor512')
+    if type(retained_kv_rows) is not int or not 0 <= retained_kv_rows <= KEY_TILE:
+        raise ModelingError('paged_mla_arch22_retained_rows_must_fit_source_s2_tile')
+
+
 def build(op, geometry):
+    compute_arch = getattr(geometry, 'compute_arch', None) or getattr(
+        getattr(geometry, 'datapath', None), 'compute_arch', None)
+    if compute_arch is not None:
+        arch_id = str(getattr(compute_arch, 'arch_id', '') or getattr(compute_arch, 'preset', '') or '')
+        if arch_id and arch_id != _ARCH22_ARCH_ID:
+            raise ModelingError(f'paged_mla_arch22_unsupported_on_{arch_id}')
     raw = dict(op.metadata)['paged_mla_geometry']
     contexts, heads, page = tuple(raw['contexts']), raw['heads'], raw['page_size']
-    retained = raw.get('retained_kv_rows',0)
-    if (not contexts or any(type(c) is not int or c < KEY_TILE for c in contexts)
-            or heads not in _HEAD_TILE_CHOICES or page < 1 or KEY_TILE % page):
-        raise ModelingError('paged_mla_arch22_requires_q1_heads8_or16_context_ge512_page_divisor512')
-    if type(retained) is not int or not 0 <= retained <= KEY_TILE:
-        raise ModelingError('paged_mla_arch22_retained_rows_must_fit_source_s2_tile')
+    retained = raw.get('retained_kv_rows', 0)
+    validate_domain(contexts, heads, page_size=page, retained_kv_rows=retained)
     declared = raw.get('dispatch')
     dispatch = Dispatch.parse(declared if declared is not None else source_dispatch(
         contexts,heads,geometry.compute_units),contexts,heads,geometry.compute_units)

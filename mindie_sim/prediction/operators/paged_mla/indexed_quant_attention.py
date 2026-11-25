@@ -10,13 +10,37 @@
 """
 from dataclasses import replace
 from functools import lru_cache, partial
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from .indexed_attention import (
-    _align, bind_sustained_dram, build_pipeline, owner_row_tiles, _phases,
+    SINGLE_AIV_HEAD_LIMIT, _align, bind_sustained_dram, build_pipeline, owner_row_tiles, _phases,
 )
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="8c30e4f491f73cba737a1dacc522894e437cdf3d",
+        relative_path="csrc/attention/kv_quant_sparse_flash_attention/op_kernel/kv_quant_sparse_flash_attention_service_vector_mla.h",
+        source_sha256="3eed5ab746e056319bf873a488a3306cffbabe8dd19f70294da85685f4e3cfd3",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/kv_quant_sparse_flash_attention/op_host/kv_quant_sparse_flash_attention_tiling.cpp",
+        source_sha256="2c75acce70974165d5b087416d724bcd0d09909b2e8dd693370b5860de9dbc6e",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_service_vector_mla_arch35.h",
+        source_sha256="f315c56c898a05fb57a47559df399fabb05f389b3374c68483cbe0e214269c4e",
+    ),
+)
 
 
 AIV_KEY_GROUP_ALIGNMENT = 4
@@ -174,6 +198,21 @@ def phase_unit_weights_rope64(name, key):
     return phase_unit_weights(name, key, rope=INDEXED_ROPE_DIM)
 
 
+def _stats_mte3_placement(context, owner_count, *, single_aiv=False, split_g=False):
+    """Distribute LSE statistics stores across every active query owner's MTE3 pipe."""
+    mte3_res = context.resource_names.get(context.physical_role("mte3"))
+    if not mte3_res:
+        return {}
+    phys_count = max(1, owner_count) * (2 if split_g else 1)
+    units = []
+    for phys in range(min(phys_count, context.core_count)):
+        owned = context.owned(phys, context.core_count, {"mte3"}).get(mte3_res, ())
+        if single_aiv and owned:
+            owned = owned[:1]
+        units.extend(owned)
+    return {mte3_res: tuple(dict.fromkeys(units))} if units else {}
+
+
 def build(op, geometry, *, scratch_policy, compact=True, operand_modes=True,
           schedule=SCHEDULE_ARCH22, tile_size=None, slots=None):
     shape = dict(op.metadata).get("indexed_attention_geometry")
@@ -191,8 +230,12 @@ def build(op, geometry, *, scratch_policy, compact=True, operand_modes=True,
     if (geometry.buffer_units.get("ub") != geometry.compute_units * 2
             or geometry.buffers.get("ub", 0) < VECTOR_BUFFER_BYTES):
         raise ModelingError("packed_int8_indexed_attention_requires_declared_vector_scratch")
+    compute_arch = getattr(geometry, "compute_arch", None) or getattr(
+        getattr(geometry, "datapath", None), "compute_arch", None)
+    preset = str(getattr(compute_arch, "preset", "") or getattr(compute_arch, "arch_id", "") or "") or None
+    if preset == "npu_arch_3510" and shape["rope"] != INDEXED_ROPE_DIM:
+        raise ModelingError("packed_int8_indexed_attention_arch35_requires_rope64")
     if schedule == SCHEDULE_ARCH35:
-        preset = geometry.compute_arch.preset if geometry.compute_arch is not None else None
         if preset != "npu_arch_3510":
             raise ModelingError(f"packed_int8_indexed_attention_arch35_unsupported_on_{preset}")
         return arch35_plan(shape, geometry, tile_size=tile_size, slots=slots)
@@ -205,21 +248,36 @@ def build(op, geometry, *, scratch_policy, compact=True, operand_modes=True,
         vector_buffer_bytes=VECTOR_BUFFER_BYTES,
         phase_unit_weights=phase_unit_weights_rope64 if shape["rope"] else phase_unit_weights)
     paired = max(1, int(shape.get("paired_calls", 1)))
-    if paired > 1:
+    stats_bytes = int(shape.get("statistics_bytes", 0) or 0)
+    extra = stats_bytes + int(shape.get("padding_output_bytes", 0) or 0)
+    stats_work = Work(resources={"hbm": extra, "mte3": extra}) if extra else Work()
+    sequences = tuple(tuple(row) for row in shape.get(
+        "sequences", ((shape.get("query", 0), shape.get("context", 0)),)))
+    active_owners = min(sum(row[0] for row in sequences), geometry.compute_units)
+    single_aiv_stats = shape["heads"] <= SINGLE_AIV_HEAD_LIMIT
+    if paired > 1 or stats_work.resources:
         base_program = plan.program
 
-        def _paired_arch22_program(context):
-            stages = tuple(
+        def _wrapped_arch22_program(context):
+            stages = [
                 Stage(
                     f"call{idx}",
                     after=() if idx == 0 else (f"call{idx - 1}",),
                     program=base_program(context),
                 )
                 for idx in range(paired)
-            )
-            return KernelProgram(stages)
+            ]
+            if stats_work.resources:
+                stages.append(Stage(
+                    "lse_statistics",
+                    work=context.bind(stats_work),
+                    after=(f"call{paired - 1}",),
+                    placement=_stats_mte3_placement(
+                        context, active_owners, single_aiv=single_aiv_stats),
+                ))
+            return KernelProgram(tuple(stages))
 
-        plan = replace(plan, work=plan.work.scaled(paired), program=_paired_arch22_program)
+        plan = replace(plan, work=plan.work.scaled(paired) + stats_work, program=_wrapped_arch22_program)
     row_bytes = packed_row_bytes(shape["rope"])
     return replace(plan, metadata={
         "kind": "indexed_attention_packed_int8",
@@ -396,6 +454,8 @@ def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
     sequences = tuple(tuple(row) for row in shape.get(
         "sequences", ((shape.get("query", 0), shape.get("context", 0)),)))
     heads, latent, rope = shape["heads"], shape["latent"], shape["rope"]
+    if rope != INDEXED_ROPE_DIM:
+        raise ModelingError("packed_int8_indexed_attention_arch35_requires_rope64")
     topk, paired = shape["topk"], max(1, int(shape.get("paired_calls", 1)))
     compute_units = geometry.compute_units
     split_g = heads > C8_MAX_SINGLE_CORE_HEADS
@@ -407,6 +467,7 @@ def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
         sequences, topk, owner_units, tile_size,
         shape.get("index_pool_size", 1), shape.get("index_pool_tail", False),
         per_sequence_topk=shape.get("per_sequence_topk"))
+    empty_rows = tuple(sum(1 for _, tiles in parts if not tiles) for parts in streams)
     kv_slot_bytes = tile_size * (latent + rope) * C8_BF16_BYTES
     accumulator_bytes = _align(max(head_splits), C8_HEAD_ALIGN) * latent * C8_FP32_BYTES
     if (geometry.buffer_units.get("l1", 0) < compute_units
@@ -431,6 +492,10 @@ def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
         else:
             for _name, work, _after in _tile_phases(tile, heads, latent, rope):
                 call_work += work.scaled(count)
+    total_empty = sum(empty_rows)
+    if total_empty:
+        empty_bytes = total_empty * heads * latent * C8_BF16_BYTES
+        call_work += Work(resources={"hbm": empty_bytes, "mte3": empty_bytes})
     fill = Work(resources={"hbm": external} if external else {})
     stats_bytes = int(shape.get("statistics_bytes", 0) or 0)
     extra = stats_bytes + int(shape.get("padding_output_bytes", 0))
@@ -440,9 +505,10 @@ def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
         call_work.scaled(paired) + fill + stats_work,
         _arch35_program(streams, head_splits, latent, rope, kv_slot_bytes,
                         accumulator_bytes, fill, paired,
-                        stats_work),
+                        stats_work, empty_rows),
         _arch35_metadata(shape, external, private_rows, sequences, tile_size,
-                         slots, paired, head_splits))
+                         slots, paired, head_splits),
+        context_binder=bind_sustained_dram)
 
 
 def _tile_phases(key, heads, latent, rope):
@@ -452,7 +518,7 @@ def _tile_phases(key, heads, latent, rope):
 
 
 def _arch35_program(streams, head_splits, latent, rope, kv_slot_bytes, accumulator_bytes,
-                    fill, paired, stats_work):
+                    fill, paired, stats_work, empty_rows=()):
     """Cold prefix fill once, then the declared paired query-owner programs."""
     split_g = len(head_splits) == 2
 
@@ -494,11 +560,39 @@ def _arch35_program(streams, head_splits, latent, rope, kv_slot_bytes, accumulat
                             phys_owners[half], context.core_count, roles - {"hbm"})))
                 return tuple(result)
 
-            return KernelProgram((
+            owner_stages = [
                 Stage("reserve", acquire=allocations),
                 Stage("tiles", after=("reserve",), program=PipelineProgram(
                     len(flat), C8_TILE_SLOTS, lambda index: stages(flat[index]))),
-                Stage("release", after=("tiles",), free=allocations)))
+            ]
+            tail = "tiles"
+            owner_empty = empty_rows[owner] if owner < len(empty_rows) else 0
+            if owner_empty:
+                if split_g:
+                    branches = tuple(
+                        KernelProgram((Stage(
+                            f"empty_output_g{half}",
+                            context.bind(Work(resources={
+                                "hbm": owner_empty * h_cnt * latent * C8_BF16_BYTES,
+                                "mte3": owner_empty * h_cnt * latent * C8_BF16_BYTES,
+                            })),
+                            placement=context.owned(phys_owners[half], context.core_count, {"mte3"}),
+                        ),))
+                        for half, h_cnt in enumerate(head_splits)
+                    )
+                    owner_stages.append(Stage(
+                        "empty_output", after=(tail,), program=ParallelProgram(branches)))
+                else:
+                    empty_bytes = owner_empty * head_splits[0] * latent * C8_BF16_BYTES
+                    owner_stages.append(Stage(
+                        "empty_output",
+                        context.bind(Work(resources={"hbm": empty_bytes, "mte3": empty_bytes})),
+                        after=(tail,),
+                        placement=context.owned(phys_owners[0], context.core_count, {"mte3"}),
+                    ))
+                tail = "empty_output"
+            owner_stages.append(Stage("release", after=(tail,), free=allocations))
+            return KernelProgram(tuple(owner_stages))
 
         call = ParallelProgram(tuple(one(owner, parts)
                                      for owner, parts in enumerate(streams)))
@@ -509,7 +603,9 @@ def _arch35_program(streams, head_splits, latent, rope, kv_slot_bytes, accumulat
         if stats_work.resources:
             stages = (*stages, Stage(
                 "lse_statistics", work=context.bind(stats_work),
-                after=(f"call{paired - 1}",)))
+                after=(f"call{paired - 1}",),
+                placement=_stats_mte3_placement(
+                    context, len(streams), split_g=split_g)))
         return KernelProgram(stages)
 
     return program

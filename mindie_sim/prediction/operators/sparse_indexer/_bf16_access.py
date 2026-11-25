@@ -7,11 +7,23 @@
 [Side-Effect Policy] Uses local cache state and returns an access ledger.
 """
 import math
+from typing import Literal
 
 from mindie_sim.catalog.attention_common import _floor_sum
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 
 from ...cache_path import CacheGeometry, CacheState
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/lightning_indexer_v2/op_host/lightning_indexer_v2_tiling.cpp",
+        source_sha256="b8988f5bdc1ccf8900c2a7853c4edf012f8cb99f6e9b5af40af56167bcd9aade",
+    ),
+)
 
 # Native MIX_AIC M tile shared with the quantized sibling. It bounds how many
 # query rows reuse one resident key tile before the next key stream starts.
@@ -97,12 +109,28 @@ def _key_access_plan(spans, *, compression, key_row_bytes, q_row_bytes,
     l1_capacity = max(0, int(l1_capacity or 0))
     l2_capacity = None if l2_capacity is None else max(0, int(l2_capacity))
     gm_capacity = None if gm_capacity is None else max(0, int(gm_capacity))
-    q_tile_rows = max(1, int(q_tile_rows))
+    max_live_q = max((q for q, _ in spans), default=1)
+    q_tile_rows = min(max(1, int(q_tile_rows)), max(1, max_live_q))
     if l1_capacity > 0:
         # Reserve at least half of L1 for K; a smaller Q tile is an
         # analytical sub-tile when the device cannot hold a full M=16 tile.
         q_tile_rows = min(q_tile_rows,
                           max(1, l1_capacity // max(1, 2 * q_row_bytes)))
+    if ub_capacity:
+        max_visible = max((((c + q) // compression) for q, c in spans), default=0)
+        list_rows = max(1, min(topk, max_visible))
+        per_q_ub = (list_rows * kv_heads * LOCAL_LIST_ELEMENT_BYTES
+                    + kv_heads * SCORE_ELEMENT_BYTES)
+        receive_reserve = (
+            topk * kv_heads * LOCAL_LIST_ELEMENT_BYTES
+            if aiv_units > 1 and max_visible > topk else 0
+        )
+        ub_for_tiles = (
+            int(ub_capacity) - receive_reserve
+            if int(ub_capacity) > receive_reserve else int(ub_capacity)
+        )
+        if q_tile_rows * per_q_ub > ub_for_tiles:
+            q_tile_rows = max(1, ub_for_tiles // max(1, per_q_ub))
     q_allocation = q_tile_rows * q_row_bytes if l1_capacity > 0 else 0
     k_capacity = max(0, l1_capacity - q_allocation)
     total_visible = sum(((c + q) // compression) * key_row_bytes
