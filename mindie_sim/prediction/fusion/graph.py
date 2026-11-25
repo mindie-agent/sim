@@ -115,6 +115,15 @@ class TensorValue:
         return self.role in STATE_ROLES or self.state_version is not None
 
 
+def local_nbytes(value: TensorValue, tensor_parallel: int = 1) -> int:
+    """Divide global parameter storage across ranks exactly once."""
+    if tensor_parallel < 1:
+        raise FeasibilityError("tensor_parallel_invalid")
+    if value.sharded or value.role not in {"weight", "parameter"}:
+        return value.nbytes
+    return (value.nbytes + tensor_parallel - 1) // tensor_parallel
+
+
 @dataclass(frozen=True)
 class OpNode:
     """A typed semantic operator projected from one selected ``OpSpec``.

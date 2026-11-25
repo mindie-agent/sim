@@ -19,8 +19,7 @@ import math
 
 from mindie_sim.prediction.program import Stage
 
-from mindie_sim.prediction.fusion.feasibility import local_nbytes
-from mindie_sim.prediction.fusion.graph import Constraint, TypedGraph
+from mindie_sim.prediction.fusion.graph import Constraint, TypedGraph, local_nbytes
 
 _PREFETCH_BANDWIDTH_SAFETY = 0.9
 _PREFETCH_ALIGNMENT_BYTES = 256

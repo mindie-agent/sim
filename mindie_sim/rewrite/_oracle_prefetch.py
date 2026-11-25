@@ -32,7 +32,7 @@ def bind_prefetch_ops(case, replica, ops, book, leases, hardware):
     )
     if not scoped_leases:
         return tuple(ops), book
-    plan = CanonicalPlan(case, ops, None, hardware, (), book)
+    plan = CanonicalPlan(ops=tuple(ops), book=book)
     for lease in scoped_leases:
         target = next((op for op in plan.ops if op.op_id == lease.target_op), None)
         if target is None:
@@ -49,7 +49,7 @@ def bind_prefetch_ops(case, replica, ops, book, leases, hardware):
         if (added := add_prefetch(plan, decision, hardware)) is None:
             raise ModelingError(f"rewrite_prefetch_duplicate_target:{target.op_id}")
         plan, prefetch_id = added
-        if (settled := settle_prefetch_rewrite(plan, decision, prefetch_id, amount, hardware)) is None:
+        if (settled := settle_prefetch_rewrite(plan, decision, prefetch_id, amount)) is None:
             raise ModelingError(f"rewrite_prefetch_settlement_failed:{target.op_id}")
         plan = apply_prefetch_rewrite(plan, settled, prefetch_id)
         plan = replace(plan, ops=tuple(
