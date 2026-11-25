@@ -38,6 +38,7 @@ from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.runtime.dp_cohort_dedup import (
     _has_megamoe_cross_dp_group,
     can_dedup_collective_to_canonical,
+    evaluate_dp_cohort_dedup,
     is_symmetric_dp_cohort,
 )
 from mindie_sim.prediction.structure import parse_case
@@ -204,8 +205,12 @@ def test_dp_cohort_dedup_parity_and_megamoe_peer_collective_synthesis(
                 for rep in sorted(graphs)
             }
             monkeypatch.setenv("MINDIE_SIM_DP_DEDUP", "1")
+            elig = evaluate_dp_cohort_dedup(ex, works)
             assert is_symmetric_dp_cohort(ex, works) is expect_dedup
-            assert can_dedup_collective_to_canonical(ex.topology, ex.engine) is expect_r0_only
+            assert elig.symmetric is expect_dedup
+            assert can_dedup_collective_to_canonical(
+                ex.topology, ex.engine, requires_peer_collectives=elig.requires_peer_collectives,
+            ) is expect_r0_only
         finally:
             accel = getattr(ex.engine, "_accel", None)
             if accel is not None:
@@ -323,3 +328,78 @@ def test_parallel_multiprobe_pd_decode_solver_bit_for_bit_parity() -> None:
     assert sol_1["feasible"] is True
     assert sol_4 == sol_1
     assert multiprocessing.active_children() == []
+
+
+def test_w5b_fleet_pd_cap_stern_brocot_pareto_and_dual_cert_batch_search() -> None:
+    """Exact Fraction SB beats float-eps tie, fleet cap never scales by n_p, dual-cert finds exact B*."""
+    from mindie_sim.sweep import pd as pd_mod
+
+    st = {
+        "infeasible": None, "rps_p": 3e-12, "p_kv_rps_per_inst": 1.0,
+        "rps_d": 4e-12, "d_kv_rps_per_inst": 1.0, "fleet_kv_rps_cap": None,
+        "decode_tps_per_die": 1.0, "decode_budget": 1.0, "raw_rps_d": 4e-12,
+        "decode_step": 1.0, "effective_tpot": 1.0, "first_itl": 1.0,
+    }
+    best_density = pd_mod._solve_optimal_pd_ratio_closed_form(
+        st, total=3, p_dies=1, d_dies=1, output=2, mode="direct_blocking_d2d", objective="density",
+    )
+    assert best_density is not None and best_density["pd_ratio"] == "1P:1D"
+    best_total = pd_mod._solve_optimal_pd_ratio_closed_form(
+        st, total=3, p_dies=1, d_dies=1, output=2, mode="direct_blocking_d2d", objective="total_tps",
+    )
+    assert best_total is not None and best_total["pd_ratio"] == "2P:1D"
+
+    st_cap = {
+        **st, "rps_p": 10.0, "p_kv_rps_per_inst": 100.0,
+        "rps_d": 10.0, "d_kv_rps_per_inst": 100.0, "fleet_kv_rps_cap": 15.0,
+    }
+    row_cap = pd_mod._build_pd_ratio_row(
+        st_cap, n_p=4, n_d=4, total=8, p_dies=1, d_dies=1, output=2, mode="direct_blocking_d2d",
+    )
+    assert row_cap["kv_transfer_rps"] == pytest.approx(15.0)
+    assert row_cap["sustainable_rps"] == pytest.approx(15.0)
+
+    non_mono = {1: 4.0, 2: 6.0, 3: 4.0, 4: 6.0}
+    memo_nm: dict[int, float] = {}
+    pd_mod._search_certified_sla_interval(
+        1, 4, mono_cert=False, tps_cert=False, sla_ms=5.0, memo=memo_nm, probe_fn=lambda b: non_mono[b],
+    )
+    assert pd_mod._select_best_feasible_batch(memo_nm, 4, 5.0)[:2] == (3, 4.0)
+
+    super_lin = {1: 1.0, 2: 1.5, 3: 4.0, 4: 4.9}
+    memo_sl: dict[int, float] = {}
+    pd_mod._search_certified_sla_interval(
+        1, 4, mono_cert=True, tps_cert=False, sla_ms=5.0, memo=memo_sl, probe_fn=lambda b: super_lin[b],
+    )
+    assert pd_mod._select_best_feasible_batch(memo_sl, 4, 5.0)[:2] == (2, 1.5)
+
+
+def test_w5b_integer_pd_handoff_draft_kv_and_cohort_directed_cycle_reject() -> None:
+    """Integer PDTransfer emits draft KV with exact 0 B conservation; directed-cycle rejects dedup."""
+    from types import SimpleNamespace
+    from mindie_sim.prediction.disaggregated.handoff import compute_pd_handoff_plan
+    from mindie_sim.prediction.runtime.dp_cohort_dedup import is_symmetric_native_program
+
+    p_raw = compose_case(
+        "kimi-k3.1", "950dt-96g-pod", role="pd_prefill", dp=1, tp=2, ep=2, pp=1,
+        layers=4, prompt_tokens=1024, output_tokens=64, mtp_proposal_tokens=3,
+    )
+    d_raw = compose_case(
+        "kimi-k3.1", "950dt-96g-pod", role="pd_decode", dp=1, tp=4, ep=4, pp=1,
+        layers=4, prompt_tokens=1024, output_tokens=64, mtp_proposal_tokens=3,
+    )
+    plan = compute_pd_handoff_plan(parse_case(p_raw), parse_case(d_raw), tokens=1024)
+    assert all(isinstance(t.payload_bytes, int) and t.payload_bytes >= 0 for t in plan["transfers"])
+    assert any(t.component.startswith("draft") for t in plan["transfers"])
+    assert int(plan["total_transfer_bytes"]) == sum(int(t.payload_bytes) for t in plan["transfers"])
+
+    cyc_matrix = {0: {1: 4}, 1: {2: 4}, 2: {0: 4}}
+    cyc_inner = SimpleNamespace(
+        peer_count=3,
+        route_matrix=cyc_matrix,
+        start_with_handles=lambda *_a, **_kw: None,
+        frames_for=lambda rk: cyc_matrix[rk],
+        payload_basis_for=lambda _rk: "exact",
+        local_frames_for=lambda _rk: 0,
+    )
+    assert is_symmetric_native_program(SimpleNamespace(program=cyc_inner), 3) is False

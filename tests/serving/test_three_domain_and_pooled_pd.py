@@ -401,7 +401,7 @@ def test_aliases_self_correcting_errors_catalog_cli_parity_and_oneshot_solve(tmp
     assert sol["scenario"]["ttft_slo_ms"] is None
     assert sol["capacity_ledger"]["hbm_capacity_gib"] == pytest.approx(96.0)
     assert sol["recommended_deployment"]["winner_mode"] == "colocated"
-    assert "current_merged" in sol["four_track_waterfall"]["waterfall"]
+    assert "shipping" in sol["four_track_waterfall"]["waterfall"]
     assert sol["bottleneck_roofline"]["top_families"]
     assert sol["bottleneck_roofline"]["included_components"]["target_layers"] == 2
     sdk_sol = sdk_api.solve_deployment(

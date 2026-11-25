@@ -236,6 +236,93 @@ def _allocate_integer_shares(dt: int, weights: Mapping[str, float]) -> dict[str,
     return floors
 
 
+def _attribute_live_slice(
+    dt: int,
+    live: Sequence[ObservedInterval],
+    live_grants: Sequence[ObservedServiceGrant],
+    witness_set: frozenset[str],
+    exposed: dict[str, int],
+    mask_overlap: Mapping[str, dict[str, int]],
+) -> None:
+    """Attribute one concurrent slice ``dt`` ns across active intervals and grants."""
+    witness = _pick_stream0_witness(live, witness_set)
+    live_ids = {iv.occurrence_id for iv in live}
+    grants_by_res: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    for gr in live_grants:
+        if gr.occurrence_id in live_ids:
+            span = float(gr.end_ns - gr.start_ns)
+            if span > 0.0:
+                grants_by_res[gr.resource][gr.occurrence_id] += gr.delivered * (float(dt) / span)
+    contested = [
+        res for res, claimants in grants_by_res.items()
+        if witness.occurrence_id in claimants and len(claimants) >= 2
+    ]
+    if contested:
+        combined: dict[str, float] = defaultdict(float)
+        for res in contested:
+            claimants = grants_by_res[res]
+            res_tot = sum(claimants.values())
+            if res_tot > 0.0:
+                for oid, amt in claimants.items():
+                    combined[oid] += amt / res_tot
+        shares = _allocate_integer_shares(dt, combined)
+        for oid, ns in shares.items():
+            exposed[oid] += ns
+        for iv in live:
+            if iv.occurrence_id not in shares and iv.stream_index != witness.stream_index:
+                mask_overlap[iv.occurrence_id][witness.label] += dt
+        return
+    exposed[witness.occurrence_id] += dt
+    for iv in live:
+        if iv.occurrence_id != witness.occurrence_id and iv.stream_index != witness.stream_index:
+            mask_overlap[iv.occurrence_id][witness.label] += dt
+
+
+def _attribute_live_slice_indexed(
+    dt: int,
+    live_ivs: Mapping[int, ObservedInterval],
+    live_oid_counts: Counter,
+    live_grants_by_res: Mapping[str, Mapping[int, tuple[str, float]]],
+    live_res_by_oid: Mapping[str, Counter],
+    witness_set: frozenset[str],
+    exposed: dict[str, int],
+    mask_overlap: Mapping[str, dict[str, int]],
+) -> None:
+    """Incremental sweep-line attribution touching only witness-active resources."""
+    live = tuple(live_ivs.values())
+    witness = _pick_stream0_witness(live, witness_set)
+    w_res_map = live_res_by_oid.get(witness.occurrence_id)
+    combined: dict[str, float] = defaultdict(float)
+    if w_res_map:
+        for res, cnt in w_res_map.items():
+            if cnt <= 0:
+                continue
+            entries = live_grants_by_res.get(res)
+            if not entries or len(entries) < 2:
+                continue
+            claimants: dict[str, float] = defaultdict(float)
+            for oid, rate in entries.values():
+                if live_oid_counts.get(oid, 0) > 0:
+                    claimants[oid] += rate * float(dt)
+            if witness.occurrence_id in claimants and len(claimants) >= 2:
+                res_tot = sum(claimants.values())
+                if res_tot > 0.0:
+                    for oid, amt in claimants.items():
+                        combined[oid] += amt / res_tot
+    if combined:
+        shares = _allocate_integer_shares(dt, combined)
+        for oid, ns in shares.items():
+            exposed[oid] += ns
+        for iv in live:
+            if iv.occurrence_id not in shares and iv.stream_index != witness.stream_index:
+                mask_overlap[iv.occurrence_id][witness.label] += dt
+        return
+    exposed[witness.occurrence_id] += dt
+    for iv in live:
+        if iv.occurrence_id != witness.occurrence_id and iv.stream_index != witness.stream_index:
+            mask_overlap[iv.occurrence_id][witness.label] += dt
+
+
 def attribute_stream0_intervals(
     intervals: Sequence[ObservedInterval],
     *,
@@ -244,13 +331,140 @@ def attribute_stream0_intervals(
     grants: Sequence[ObservedServiceGrant] = (),
     causal_preds: Mapping[str, Sequence[str]] | None = None,
 ) -> StreamExposureResult:
-    """Assign every half-open ``[t0, t1)`` slice once via O((N+G) log(N+G)) sweep-line."""
-    del intervals, start_ns, terminal_ns, grants, causal_preds
-    raise NotImplementedError(
-        "LEGACY_PURGED: deleted clipped-grant rate inflation (7/3 vs 5/5 split) and "
-        "O(N^2) nested-interval copy/rescan; scale clipped grant delivered proportionally "
-        "to overlap [max(lo, t0), min(hi, t1)) and maintain incremental active-set state "
-        "in O((N+G) log(N+G)) (S6-W5-25)"
+    """Assign every half-open ``[t0, t1)`` slice once via O((N+G) log(N+G)) sweep-line.
+
+    Clipped grants scale ``delivered`` proportionally to the overlap fraction
+    ``(hi - lo) / (orig_hi - orig_lo)`` so clipping never inflates grant rate.
+    """
+    start_i = int(start_ns)
+    term_i = max(start_i, int(terminal_ns))
+    exposed: dict[str, int] = {iv.occurrence_id: 0 for iv in intervals}
+    mask_overlap: dict[str, dict[str, int]] = {
+        iv.occurrence_id: defaultdict(int) for iv in intervals
+    }
+    if term_i <= start_i:
+        return StreamExposureResult(
+            start_i, term_i, exposed, 0, {iv.occurrence_id: "" for iv in intervals}, 0,
+        )
+
+    clamped = [
+        ObservedInterval(
+            iv.occurrence_id, iv.stream, iv.stream_index,
+            max(start_i, min(term_i, int(iv.start_ns))),
+            max(start_i, min(term_i, int(iv.end_ns))),
+            iv.ordinal, iv.label or iv.occurrence_id, iv.replica,
+        )
+        for iv in intervals
+    ]
+    active_ivs = sorted(
+        (iv for iv in clamped if iv.end_ns > iv.start_ns),
+        key=lambda iv: (iv.start_ns, iv.end_ns, iv.ordinal, iv.occurrence_id),
+    )
+    witness_set = _trace_stream0_witness_set(active_ivs, causal_preds)
+    cuts_set: set[int] = {start_i, term_i}
+    for iv in active_ivs:
+        cuts_set.add(iv.start_ns)
+        cuts_set.add(iv.end_ns)
+    clamped_grants: list[tuple[int, int, str, str, float]] = []
+    for gr in grants:
+        orig_lo = int(gr.start_ns)
+        orig_hi = int(gr.end_ns)
+        orig_span = orig_hi - orig_lo
+        if orig_span <= 0 or gr.delivered <= 0.0:
+            continue
+        lo = max(start_i, min(term_i, orig_lo))
+        hi = max(start_i, min(term_i, orig_hi))
+        if hi > lo:
+            rate = float(gr.delivered) / float(orig_span)
+            clamped_grants.append((lo, hi, gr.occurrence_id, gr.resource, rate))
+            cuts_set.add(lo)
+            cuts_set.add(hi)
+    clamped_grants.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+
+    cuts = sorted(cuts_set)
+    idle_wait_ns = 0
+    iv_ptr = gr_ptr = 0
+    n_ivs, n_grants = len(active_ivs), len(clamped_grants)
+    iv_heap: list[tuple[int, int]] = []
+    gr_heap: list[tuple[int, int]] = []
+    live_ivs: dict[int, ObservedInterval] = {}
+    live_oid_counts: Counter = Counter()
+    live_grants_by_res: dict[str, dict[int, tuple[str, float]]] = defaultdict(dict)
+    live_res_by_oid: dict[str, Counter] = defaultdict(Counter)
+
+    for lo, hi in zip(cuts, cuts[1:]):
+        dt = hi - lo
+        if dt <= 0:
+            continue
+        while iv_ptr < n_ivs and active_ivs[iv_ptr].start_ns <= lo:
+            iv = active_ivs[iv_ptr]
+            if iv.end_ns > lo:
+                live_ivs[iv_ptr] = iv
+                live_oid_counts[iv.occurrence_id] += 1
+                heapq.heappush(iv_heap, (iv.end_ns, iv_ptr))
+            iv_ptr += 1
+        while iv_heap and iv_heap[0][0] <= lo:
+            _, expired_idx = heapq.heappop(iv_heap)
+            expired_iv = live_ivs.pop(expired_idx, None)
+            if expired_iv is not None:
+                live_oid_counts[expired_iv.occurrence_id] -= 1
+                if live_oid_counts[expired_iv.occurrence_id] <= 0:
+                    live_oid_counts.pop(expired_iv.occurrence_id, None)
+        while gr_ptr < n_grants and clamped_grants[gr_ptr][0] <= lo:
+            g_lo, g_hi, g_oid, g_res, g_rate = clamped_grants[gr_ptr]
+            del g_lo
+            if g_hi > lo:
+                live_grants_by_res[g_res][gr_ptr] = (g_oid, g_rate)
+                live_res_by_oid[g_oid][g_res] += 1
+                heapq.heappush(gr_heap, (g_hi, gr_ptr))
+            gr_ptr += 1
+        while gr_heap and gr_heap[0][0] <= lo:
+            _, expired_g = heapq.heappop(gr_heap)
+            _, _, g_oid, g_res, _ = clamped_grants[expired_g]
+            res_bucket = live_grants_by_res.get(g_res)
+            if res_bucket is not None:
+                res_bucket.pop(expired_g, None)
+            oid_bucket = live_res_by_oid.get(g_oid)
+            if oid_bucket is not None:
+                oid_bucket[g_res] -= 1
+                if oid_bucket[g_res] <= 0:
+                    oid_bucket.pop(g_res, None)
+
+        if not live_ivs:
+            idle_wait_ns += dt
+            continue
+        if len(live_ivs) == 1:
+            only_iv = next(iter(live_ivs.values()))
+            exposed[only_iv.occurrence_id] += dt
+            continue
+        _attribute_live_slice_indexed(
+            dt, live_ivs, live_oid_counts, live_grants_by_res,
+            live_res_by_oid, witness_set, exposed, mask_overlap,
+        )
+
+    masked_by: dict[str, str] = {}
+    for iv in clamped:
+        dur = max(0, iv.end_ns - iv.start_ns)
+        ov = mask_overlap[iv.occurrence_id]
+        if dur - exposed[iv.occurrence_id] <= 0 or not ov:
+            masked_by[iv.occurrence_id] = ""
+            continue
+        ordered = sorted(ov.items(), key=lambda item: (-item[1], item[0]))
+        top_lbl, top_ov = ordered[0]
+        if len(ordered) > 1 and ordered[1][1] > top_ov * SECONDARY_MASKER_SHARE:
+            masked_by[iv.occurrence_id] = f"{top_lbl} + {ordered[1][0]}"[:MAX_MASKED_LABEL_LEN]
+        else:
+            masked_by[iv.occurrence_id] = top_lbl[:MAX_MASKED_LABEL_LEN]
+
+    total_attributed = sum(exposed.values()) + idle_wait_ns
+    delta_ns = total_attributed - (term_i - start_i)
+    return StreamExposureResult(
+        start_ns=start_i,
+        terminal_ns=term_i,
+        exposed_ns_by_op=exposed,
+        idle_or_wait_ns=idle_wait_ns,
+        masked_by=masked_by,
+        conservation_delta_ns=delta_ns,
     )
 
 
@@ -517,10 +731,19 @@ class ExposedObserver:
             if key in scope.events:
                 scope.refcounts[key] += 1
         if len(scope.events) > self.max_events:
-            raise NotImplementedError(
-                "LEGACY_PURGED: deleted silent max_events FIFO eviction that drops live "
-                "parent completion clocks; retain frontier parent clocks or fail closed (S6-W5-26)"
-            )
+            evictable = [
+                key for key in scope.events
+                if key != event
+                and key in scope.event_time
+                and scope.refcounts.get(key, 0) <= 0
+                and key not in scope.terminals
+            ]
+            for old_key in evictable:
+                if len(scope.events) <= self.max_events:
+                    break
+                scope.events.pop(old_key, None)
+                scope.event_time.pop(old_key, None)
+                scope.metadata.pop(old_key, None)
 
     def on_service_interval(
         self, *, start_ms: float, end_ms: float, services: Mapping[str, float],

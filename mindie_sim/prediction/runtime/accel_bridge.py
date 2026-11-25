@@ -39,7 +39,7 @@ from .accel_sync import (
 from .accel_tables import (
     ABI_VERSION, Arena, B_BUDGET, B_CALLBACK, B_HORIZON, B_IDLE, B_OUTPUT,
     B_STOP, E_ARITH, E_STALL, E_STATE, INT32_MAX, KernelFault, MAX_L, MAX_OWN,
-    MAX_R, MAX_T, MAX_U, _free_ctx_box, _inert_pool_set, _stable_task_payloads,
+    MAX_T, MAX_U, _free_ctx_box, _inert_pool_set, _stable_task_payloads,
     is_inert_trace_entry, needs_external_start, pure_task, resource_table,
     wide_integer,
 )
@@ -47,6 +47,8 @@ from .accel_tables import (
 #: ``auto`` keeps smaller Engines on pure Python: zero build and marshalling.
 AUTO_MIN_TASKS = 64
 AUTO_GRAPH_MIN_TASKS = 16
+#: Dynamic growable C11 resource table ceiling (matching ``MSIM_MAX_RES``).
+MAX_RES_DYNAMIC = 65536
 #: Bounded prepared-stage compatibility memo and ``auto`` overhead guards.
 _PREP_CACHE_MAX = 2048
 _AUTO_CHURN_MIN_CALLS = 512
@@ -99,11 +101,8 @@ def _remaining_shapes_valid(engine, task) -> bool:
         if any(type(unit) is not int or unit < 0 or unit >= limit for unit in units):
             return False
     if task.coupled and task.placement and len(task.remaining) > 1:
-        raise NotImplementedError(
-            "LEGACY_PURGED: deleted divergent _coupled_explicit_placement_proportional; "
-            "wire single canonical C11 eligibility predicate in accel_tables/accel_terms "
-            "treating units=None == all units (S6-W5-19)"
-        )
+        from .accel_terms import coupled_placement_proportional
+        return coupled_placement_proportional(engine, task)
     return True
 
 
@@ -123,7 +122,7 @@ def _task_c11_compatible(
             return False
     if task.callback is not None and not task.native_hook and not allow_non_hook_cb:
         return False
-    if task.cohort_widened and len(task.remaining) > MAX_R:
+    if task.cohort_widened and len(task.remaining) > MAX_RES_DYNAMIC:
         return False
     if not _stable_task_payloads(task, engine):
         return False
@@ -280,7 +279,7 @@ class NativeBackend:
             )
         if not reuse_config:
             rates, units, policy = resource_table(engine)
-            if len(rates) < 1 or len(rates) > MAX_R:
+            if len(rates) < 1 or len(rates) > MAX_RES_DYNAMIC:
                 self.disabled_reason = "resource_count"
                 self.dormant = True
                 return False
@@ -1058,7 +1057,7 @@ class NativeBackend:
         if names == self.res_names:
             self.res_version = engine._resource_version
             return True
-        if engine._native_slots or not 1 <= len(names) <= MAX_R:
+        if engine._native_slots or not 1 <= len(names) <= MAX_RES_DYNAMIC:
             return False
         rates, units, policy = resource_table(engine)
         if not all(math.isfinite(rate) and rate > 0 and 1 <= unit <= MAX_U

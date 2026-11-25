@@ -429,8 +429,8 @@ def test_pd_whole_message_grants_are_atomic_and_avoid_deadlock():
     releases = [engine.future("first_release"), engine.future("second_release")]
     def cross(name, src, grant, release):
         return connector.submit_handoff( engine, PDHandoff.build(
-                name, (PDTransfer(src, 2, 128.0), PDTransfer(src, 3, 128.0)),
-                receive_capacity_bytes={2: 128.0, 3: 128.0},
+                name, (PDTransfer(src, 2, 128), PDTransfer(src, 3, 128)),
+                receive_capacity_bytes={2: 128, 3: 128},
                 receive_buffer_ids={2: "X", 3: "Y"}),
             source_ready_by_rank={src: source}, destination_ready_by_rank=grant,
             release_events={2: (release,), 3: (release,)})
@@ -445,8 +445,8 @@ def test_pd_whole_message_grants_are_atomic_and_avoid_deadlock():
     ready = {0: engine.submit("source"), 1: engine.submit("destination")}
     releases = [engine.future("first"), engine.future("second")]
     def pair(name, release):
-        return pool.submit_handoff( engine, PDHandoff.build(name, (PDTransfer(0, 1, 256.0),),
-                                    receive_capacity_bytes={1: 256.0},
+        return pool.submit_handoff( engine, PDHandoff.build(name, (PDTransfer(0, 1, 256),),
+                                    receive_capacity_bytes={1: 256},
                                     receive_buffer_ids={1: "pool"}),
             source_ready_by_rank={0: ready[0]},
             destination_ready_by_rank={1: ready[1]},
@@ -570,8 +570,8 @@ def test_pd_legacy_connector_charges_transactions_and_consumer_release():
     assert "pd:second:consume" in {row["task"] for row in engine.trace}
 
 def test_pd_handoff_build_normalizes_explicit_pool_capacity_mapping():
-    handoff = PDHandoff.build("r", (PDTransfer(0, 1, 64.0),), receive_pool_capacity_bytes={1: 128.0},
+    handoff = PDHandoff.build("r", (PDTransfer(0, 1, 64),), receive_pool_capacity_bytes={1: 128},
                               receive_buffer_ids={1: "pool"})
-    assert handoff.receive_pool_capacity_bytes == ((1, 128.0),)
-    assert handoff.receive_capacity_bytes == ((1, 64.0),)
+    assert handoff.receive_pool_capacity_bytes == ((1, 128),)
+    assert handoff.receive_capacity_bytes == ((1, 64),)
     assert handoff.receive_buffer_ids == ((1, "pool"),)

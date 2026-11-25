@@ -73,14 +73,16 @@ class _CohortMixin(_CohortNativeMixin):
                 return value[replica]
             return value
 
-        from ..runtime.dp_cohort_dedup import is_symmetric_dp_cohort
-        if is_symmetric_dp_cohort(
+        from ..runtime.dp_cohort_dedup import evaluate_dp_cohort_dedup
+        dedup_elig = evaluate_dp_cohort_dedup(
             self, works, external_inputs=external_inputs,
             emitted_tokens=emitted_tokens, memory_bindings=memory_bindings,
             state_accesses=state_accesses,
-        ):
+        )
+        if dedup_elig.symmetric:
             return self._add_symmetric_group(
                 works, release_ms, external_inputs=external_inputs,
+                requires_peer_collectives=dedup_elig.requires_peer_collectives,
             )
 
         steps = {replica: self.add(
@@ -222,7 +224,10 @@ class _CohortMixin(_CohortNativeMixin):
             ))
         return out
 
-    def _add_symmetric_group(self, works, release_ms, *, external_inputs=None):
+    def _add_symmetric_group(
+        self, works, release_ms, *, external_inputs=None,
+        requires_peer_collectives: bool = False,
+    ):
         """Execute one canonical replica for a provably symmetric DP cohort."""
         from ..runtime.dp_cohort_dedup import (
             can_dedup_collective_to_canonical,
@@ -241,7 +246,10 @@ class _CohortMixin(_CohortNativeMixin):
             works[r0], r0, release_ms,
             external_inputs=(external_inputs or {}).get(r0),
         )
-        can_r0_only = can_dedup_collective_to_canonical(self.topology, self.engine)
+        can_r0_only = can_dedup_collective_to_canonical(
+            self.topology, self.engine,
+            requires_peer_collectives=requires_peer_collectives,
+        )
         used_r0_only_links = False
 
         for key, participants in self._collectives.items():
@@ -265,12 +273,12 @@ class _CohortMixin(_CohortNativeMixin):
                 from ..program import NativeProgram
                 if (isinstance(prog0, NativeProgram)
                         and hasattr(prog0.program, "start_with_handles")):
-                    if can_r0_only and is_symmetric_native_program(prog0, len(peer_replicas)):
-                        if self._start_canonical_native_cohort(
-                            key, item0, prog0, peer_replicas,
-                        ):
-                            used_r0_only_links = True
-                            continue
+                    if can_r0_only and self._start_canonical_native_cohort(
+                        key, item0, prog0, peer_replicas,
+                        is_symmetric_fn=is_symmetric_native_program,
+                    ):
+                        used_r0_only_links = True
+                        continue
                     synth = self._synthesize_cohort_participants(item0, works, peer_replicas)
                     progs = {
                         p.replica: (prog0 if p.replica == r0
@@ -343,26 +351,291 @@ class _CohortMixin(_CohortNativeMixin):
     def _schedule_canonical_native_cohort(
         self, key, item0, peer_replicas, is_symmetric_fn,
     ) -> bool:
-        """Defer-launch one canonical native MC2 rank when routing is symmetric."""
+        """Defer-launch one canonical native MC2 rank when 5-part reciprocity holds."""
         prog0 = self.lower_program(item0.context, item0.recipe)
         from ..program import NativeProgram
         if not (isinstance(prog0, NativeProgram)
-                and is_symmetric_fn(prog0, len(peer_replicas))):
+                and hasattr(prog0.program, "start_with_handles")):
             return False
         return self._start_canonical_native_cohort(
             key, item0, prog0, peer_replicas, defer=True,
+            is_symmetric_fn=is_symmetric_fn,
         )
+
+    def _verify_canonical_cohort_reciprocity(
+        self, prog0, transport, peer_replicas, source_stage, is_symmetric_fn,
+    ) -> tuple[bool, int, tuple[int, ...]]:
+        """5-part physical reciprocity & contention symmetry gate (fail-closed)."""
+        group = tuple(int(rk) for rk in (transport.get("group") or ()))
+        local_sources = tuple(sorted({int(rk) for rk in (transport.get("sources") or ())}))
+        n_reps = len(peer_replicas)
+        if not group or not local_sources or n_reps <= 0:
+            return False, 0, ()
+        ep_width = len(group)
+        local_k = len(local_sources)
+        # Part 1: Isomorphic membership (ep_group_width == n_replicas * len(local_sources)).
+        if n_reps * local_k != ep_width:
+            return False, 0, ()
+        for rep in peer_replicas:
+            if len(self.topology.ranks(rep, source_stage)) != local_k:
+                return False, 0, ()
+        # Part 2: Strict directed matrix reciprocity & replica isomorphism.
+        if is_symmetric_fn is not None and not is_symmetric_fn(
+            prog0, ep_width, local_rank_count=local_k,
+        ):
+            return False, 0, ()
+        # Part 3: Symmetric routed reverse path latency/capacity on cross-replica edges.
+        route = transport.get("route")
+        inner = prog0.program
+        if callable(route) and hasattr(inner, "transport_cells"):
+            from ..communication import MessageFlow
+            local_set = set(local_sources)
+            for _si, _di, src, dst, useful, _frames in inner.transport_cells(transport, count=False):
+                if useful <= 0 or src == dst or (src in local_set and dst in local_set):
+                    continue
+                fwd = route(MessageFlow(src, dst, float(useful)))
+                rev = route(MessageFlow(dst, src, float(useful)))
+                if len(fwd.hops) != len(rev.hops):
+                    return False, 0, ()
+                for hf, hr in zip(fwd.hops, rev.hops):
+                    if hf.latency_ms != hr.latency_ms:
+                        return False, 0, ()
+                    f_rates = tuple(sorted(
+                        self.engine.resources[r].rate
+                        for r in hf.demand if r in self.engine.resources
+                    ))
+                    r_rates = tuple(sorted(
+                        self.engine.resources[r].rate
+                        for r in hr.demand if r in self.engine.resources
+                    ))
+                    if f_rates != r_rates:
+                        return False, 0, ()
+        return True, ep_width, local_sources
+
+    def _build_canonical_launch_view(
+        self, bound, source_view, rank0: int, ep_width: int, res_names,
+    ):
+        """Construct the canonical ``Mc2LaunchView`` and ``(p_frames, p_basis)``."""
+        labels = tuple(i for i in range(ep_width) if i != rank0)
+        node = int(getattr(self.case.machine, "ranks_per_node", 0))
+        frames_for = getattr(bound.program, "frames_for", None)
+        frames_raw = (
+            frames_for(rank0) if callable(frames_for)
+            else getattr(source_view, "payload_frames", None)
+        )
+        if isinstance(frames_raw, _AbcMapping):
+            p_frames = tuple(sorted((int(p), int(f)) for p, f in frames_raw.items() if int(f) > 0))
+        elif frames_raw:
+            p_frames = tuple(sorted((int(x[0]), int(x[1])) for x in frames_raw if int(x[1]) > 0))
+        else:
+            p_frames = ()
+        basis_for = getattr(bound.program, "payload_basis_for", None)
+        p_basis = str(basis_for(rank0) if callable(basis_for)
+                      else getattr(source_view, "payload_basis", "unknown"))
+        local_for = getattr(bound.program, "local_frames_for", None)
+        p_local = int((local_for(rank0) if callable(local_for)
+                       else getattr(source_view, "payload_local_frames", 0)) or 0)
+        view = replace(
+            source_view,
+            rank=rank0, peer_labels=labels,
+            peer_classes=tuple(
+                getattr(source_view, "peer_classes", ()) if source_view.rank == rank0 else ()
+            ),
+            peer_weights=tuple(
+                getattr(source_view, "peer_weights", ()) if source_view.rank == rank0 else ()
+            ),
+            node_ranks=node,
+            intra_latency_ms=getattr(source_view, "intra_latency_ms", 0),
+            inter_latency_ms=getattr(source_view, "inter_latency_ms", 0),
+            resource_names=tuple(sorted((str(k), str(v)) for k, v in dict(res_names).items())),
+            payload_frames=p_frames,
+            payload_packet_bytes=int(getattr(source_view, "payload_packet_bytes", 0) or 0),
+            payload_basis=p_basis,
+            payload_local_frames=p_local,
+        )
+        return view, p_frames, p_basis
+
+    def _record_canonical_group_launch(
+        self, key, item0, bound, view, p_frames, p_basis,
+        peer_replicas, source_stage, transport, phase_names,
+    ) -> None:
+        """Record full-cohort ``native_group_launches`` receipt by exact replica symmetry."""
+        rep_ranks = tuple(sorted(
+            int(rk) for r in peer_replicas
+            if (rk := self.participant_rank_index(r, source_stage)) is not None
+        ))
+        n_reps = len(peer_replicas)
+        phases_set = set(phase_names)
+        inner_prog = bound.program
+        payload_edges_r0 = count_edges_r0 = 0
+        payload_frames_r0 = count_frames_r0 = 0
+        payload_bytes_r0 = count_bytes_r0 = 0.0
+        if hasattr(inner_prog, "transport_cells"):
+            for _si, _di, _src, _dst, useful, c_frames in inner_prog.transport_cells(
+                transport, count=False,
+            ):
+                if useful > 0:
+                    payload_edges_r0 += 1
+                    payload_frames_r0 += int(c_frames)
+                    payload_bytes_r0 += float(useful)
+            if "count_status_exchange" in phases_set:
+                for _si, _di, _src, _dst, useful, c_frames in inner_prog.transport_cells(
+                    transport, count=True,
+                ):
+                    if useful > 0:
+                        count_edges_r0 += 1
+                        count_frames_r0 += int(c_frames)
+                        count_bytes_r0 += float(useful)
+        p_edges = payload_edges_r0 * n_reps
+        c_edges = count_edges_r0 * n_reps
+        p_frames_tot = payload_frames_r0 * n_reps
+        c_frames_tot = count_frames_r0 * n_reps
+        tx_b = (payload_bytes_r0 + count_bytes_r0) * n_reps
+        raw = dict(item0.context.op.metadata).get("mc2_phase", {})
+        self.native_group_launches[key] = {
+            "op_id": key,
+            "kind": str(raw.get("kind", "")),
+            "launch_mode": "cohort",
+            "ranks": rep_ranks,
+            "payload_basis": {f"group:{key}:r{r}": p_basis for r in peer_replicas},
+            "payload_packet_bytes": {
+                f"group:{key}:r{r}": view.payload_packet_bytes for r in peer_replicas
+            },
+            "payload_frames": {f"group:{key}:r{r}": dict(p_frames) for r in peer_replicas},
+            "link_by_phase_by_rank": {},
+            "work_by_rank": {},
+            "transport_by_rank": {},
+            "transport_work_by_rank": {},
+            "transport_tx_bytes": tx_b,
+            "transport_rx_bytes": tx_b,
+            "transport_frames": p_frames_tot + c_frames_tot,
+            "transport_edges": p_edges,
+            "total_edges": p_edges + c_edges,
+            "payload_edges": p_edges,
+            "count_edges": c_edges,
+            "directed_edges": p_edges,
+            "directed_frames": p_frames_tot,
+            "protocol_edges": 0,
+            "unresolved_edges": 0,
+            "partial": (),
+        }
 
     def _start_canonical_native_cohort(
         self, key, item0, prog0, peer_replicas, *, defer: bool = False,
+        is_symmetric_fn=None,
     ) -> bool:
-        """Launch canonical rank-0 MC2 program with full-cohort peer fan-out."""
-        del key, item0, prog0, peer_replicas, defer
-        raise NotImplementedError(
-            "LEGACY_PURGED: deleted reverse future aliasing (peer, rank0, pname)=ev_p, "
-            "forced pending-future resolution, and rank-0 destination-map cloning; preserve "
-            "true directed (src, dst) arrival events or run full cohort (S5-041, P-A10)"
+        """Launch canonical MC2 replica gated by 5-part reciprocity, zero reverse aliasing."""
+        source_stage = int(dict(item0.context.op.metadata).get(
+            "source_stage", item0.context.op.stage))
+        rank0 = self.participant_rank_index(item0.replica, source_stage)
+        if rank0 is None:
+            return False
+        transport = dict(self.native_transport(item0.context.op, item0.replica))
+        ok, ep_width, local_sources = self._verify_canonical_cohort_reciprocity(
+            prog0, transport, peer_replicas, source_stage, is_symmetric_fn,
         )
+        if not ok or not 0 <= rank0 < ep_width:
+            return False
+
+        r0_ranks = tuple(int(rk) for rk in self.topology.ranks(item0.replica, source_stage))
+        r0_hbm = self.destination_window_resource(r0_ranks[0], source_stage) if r0_ranks else None
+        orig_dest_mem = dict(transport.get("destination_memory") or {})
+        if r0_hbm and orig_dest_mem:
+            r0_rank_set = set(r0_ranks)
+            transport["destination_memory"] = {
+                int(rk): (mem_name if int(rk) in r0_rank_set else r0_hbm)
+                for rk, mem_name in orig_dest_mem.items()
+                if mem_name
+            }
+
+        res_names = self.native_resource_names(
+            item0.context, prog0, rank=rank0, replica=item0.replica)
+        bound = _bind_native_resource_view(prog0, res_names, self.engine)
+        source_view = getattr(bound.program, "view", None)
+        if source_view is None:
+            return False
+        view, p_frames, p_basis = self._build_canonical_launch_view(
+            bound, source_view, rank0, ep_width, res_names,
+        )
+        name0 = f"group:{key}:r{item0.replica}"
+        phase_names = tuple(p.name for p in getattr(bound.program, "phases", ()))
+        group = tuple(int(rk) for rk in (transport.get("group") or ()))
+        rank_to_idx = {rk: idx for idx, rk in enumerate(group)}
+        local_idx_set = {rank_to_idx[rk] for rk in local_sources if rk in rank_to_idx}
+
+        def _launch(_event=None):
+            placeholders = {}
+            inner_prog = bound.program
+            if hasattr(inner_prog, "transport_cells"):
+                for pname in phase_names:
+                    is_count = pname == "count_status_exchange"
+                    for si, di, _src, _dst, useful, _frames in inner_prog.transport_cells(
+                        transport, count=is_count,
+                    ):
+                        if useful <= 0 or si == di or si not in local_idx_set:
+                            continue
+                        if di in local_idx_set:
+                            placeholders.setdefault(
+                                (si, di, pname),
+                                self.engine.future(f"{name0}:intra:{si}->{di}:{pname}"),
+                            )
+                        else:
+                            tx_fut = placeholders.setdefault(
+                                (si, di, pname),
+                                self.engine.future(f"{name0}:tx:{si}->{di}:{pname}"),
+                            )
+                            if (di, si, pname) not in placeholders:
+                                rx_fut = self.engine.future(f"{name0}:rx:{di}->{si}:{pname}")
+                                placeholders[(di, si, pname)] = rx_fut
+                                self.engine.on_complete(
+                                    tx_fut,
+                                    lambda _e, target=rx_fut: None if target.done else self.engine.resolve(target),
+                                    native_hook=True,
+                                )
+            elif p_frames:
+                for peer_idx, frames in p_frames:
+                    if frames <= 0 or peer_idx == rank0:
+                        continue
+                    for pname in phase_names:
+                        if pname != "payload_exchange":
+                            continue
+                        tx_fut = placeholders.setdefault(
+                            (rank0, peer_idx, pname),
+                            self.engine.future(f"{name0}:tx:{rank0}->{peer_idx}:{pname}"),
+                        )
+                        if (peer_idx, rank0, pname) not in placeholders:
+                            rx_fut = self.engine.future(f"{name0}:rx:{peer_idx}->{rank0}:{pname}")
+                            placeholders[(peer_idx, rank0, pname)] = rx_fut
+                            self.engine.on_complete(
+                                tx_fut,
+                                lambda _e, target=rx_fut: None if target.done else self.engine.resolve(target),
+                                native_hook=True,
+                            )
+            rank_eng = _RankEngine(self.engine, res_names)
+            finish, _handles = bound.start_with_handles(
+                rank_eng, name0, item0.ready,
+                launch=view, send_placeholders=placeholders, transport=transport,
+            )
+            self.engine.on_complete(
+                finish,
+                lambda _e, promise=item0.completion: self.engine.resolve(promise),
+                native_hook=True,
+            )
+
+        if defer:
+            self.engine.submit(
+                f"group:{key}:native_wait:r{item0.replica}",
+                after=(item0.ready,), owner="expert_group",
+                on_complete=_launch, native_hook=True,
+            )
+        else:
+            _launch()
+
+        self._record_canonical_group_launch(
+            key, item0, bound, view, p_frames, p_basis,
+            peer_replicas, source_stage, transport, phase_names,
+        )
+        return True
 
     def _begin_joint_observation(self, op, key, participants, ready_by_rank,
                                  source_stage):

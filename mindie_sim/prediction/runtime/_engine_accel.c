@@ -138,19 +138,80 @@ static bool is_consumer(const msim_ctx *c, const msim_link *l)
 {
     if (l->rem <= 0.0) return false;
     if (c->task[l->task].state != 1) return false;
-    if (c->res[l->res].mode == 4 && l->rate <= 0.0) return false;
+    if (msim_res_mode_get(c, l->res) == 4 && l->rate <= 0.0) return false;
     return true;
 }
 
+static bool build_order_greater(const msim_ctx *c, int32_t rmode, int32_t a, int32_t b)
+{
+    const msim_link *pa = &c->link[a], *pb = &c->link[b];
+    if (rmode == 4 || rmode == 3) {
+        if (c->task[pa->task].seq != c->task[pb->task].seq)
+            return c->task[pa->task].seq > c->task[pb->task].seq;
+        return a > b;
+    }
+    if (rmode == 2) {
+        int32_t ga = pa->mode >= 0 ? pa->mode : 0;
+        int32_t gb = pb->mode >= 0 ? pb->mode : 0;
+        if (ga != gb) return ga > gb;
+        if (pa->cap != pb->cap) return pa->cap > pb->cap;
+        if (c->task[pa->task].seq != c->task[pb->task].seq)
+            return c->task[pa->task].seq > c->task[pb->task].seq;
+        return a > b;
+    }
+    if (pa->cap != pb->cap) return pa->cap > pb->cap;
+    if (c->task[pa->task].seq != c->task[pb->task].seq)
+        return c->task[pa->task].seq > c->task[pb->task].seq;
+    return a > b;
+}
+
+/* Sparse per-resource consumer ordering over ``res_lhead[r]`` (no scan of ``act_n``). */
 static int32_t build_order(msim_ctx *c, int32_t r, int32_t *n_out)
 {
-    /* LEGACY_PURGED(S6-W5-23): deleted per-resource O(nres*nactive) active-task scan
-     * and insertion-sort order rebuild; implement incremental sparse active-resource
-     * order buckets updated on task admission/completion */
-    (void)c;
-    (void)r;
-    *n_out = 0;
-    return MSIM_E_STATE;
+    int32_t rmode = msim_res_mode_get(c, r);
+    int32_t *order = c->idx, n = 0, li, i;
+    if (c->res_ord_ep[r] == c->ord_epoch) {
+        for (li = c->res_lhead[r]; li >= 0; li = c->link_rnext[li]) {
+            if (n >= MSIM_MAX_L) return MSIM_E_ARITH;
+            order[n++] = li;
+        }
+    }
+    if (n <= 16) {
+        for (i = 1; i < n; i++) {
+            int32_t key = order[i], j = i - 1;
+            while (j >= 0 && build_order_greater(c, rmode, order[j], key)) {
+                order[j + 1] = order[j];
+                j--;
+            }
+            order[j + 1] = key;
+        }
+    } else {
+        for (i = n / 2 - 1; i >= 0; i--) {
+            int32_t root = i;
+            for (;;) {
+                int32_t ch = 2 * root + 1, sw = root;
+                if (ch < n && build_order_greater(c, rmode, order[ch], order[sw])) sw = ch;
+                if (ch + 1 < n && build_order_greater(c, rmode, order[ch + 1], order[sw])) sw = ch + 1;
+                if (sw == root) break;
+                { int32_t tmp = order[root]; order[root] = order[sw]; order[sw] = tmp; }
+                root = sw;
+            }
+        }
+        for (i = n - 1; i > 0; i--) {
+            int32_t tmp = order[0], root = 0;
+            order[0] = order[i]; order[i] = tmp;
+            for (;;) {
+                int32_t ch = 2 * root + 1, sw = root;
+                if (ch < i && build_order_greater(c, rmode, order[ch], order[sw])) sw = ch;
+                if (ch + 1 < i && build_order_greater(c, rmode, order[ch + 1], order[sw])) sw = ch + 1;
+                if (sw == root) break;
+                { int32_t t2 = order[root]; order[root] = order[sw]; order[sw] = t2; }
+                root = sw;
+            }
+        }
+    }
+    *n_out = n;
+    return 0;
 }
 
 #include "_engine_accel_submit.h"

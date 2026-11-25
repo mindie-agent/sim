@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 import importlib
 import json
 from pathlib import Path
@@ -47,20 +48,26 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.scenario import validate_deployment_mode
 from mindie_sim.sweep.mapreduce import map_ordered, resolve_granted_workers
 from mindie_sim.sweep.pd import (
+    _compose_track_arg,
     _prefill_workspace_tokens,
     _reclaim_sweep_memory,
     _single_die_decode_tps,
     _solve_b_vram_max,
+    canonical_deployment_row_key,
     solve_optimal_deployment,
 )
 
 SOLVE_SCHEMA = "mindie-sim.deployment-solution/1"
+WATERFALL_SCHEMA = "mindie-sim.feature-waterfall/1"
 VALID_SOLVE_MODES = frozenset({"simulation", "modeling"})
+_UNQUANTIZED_PRESET_NAMES = frozenset({"bf16", "fp16", "fp32", "none"})
 BYTES_PER_GIB = float(1024 ** 3)
 TOP_RUNNER_UPS = 3
 TOP_BOTTLENECK_FAMILIES = 8
 GIB_DIGITS = 3
 RATIO_DIGITS = 4
+PCT_DIGITS = 2
+PCT_SCALE = 100.0
 MS_DIGITS = 4
 MIN_RATIO_EPS = 1e-12
 
@@ -98,12 +105,63 @@ def _instance_capacity_ledger(
     role: str,
     b_feasible: int = 1,
 ) -> dict[str, Any]:
-    """Compute one instance's HBM ledger from the single physical admission + receipt."""
-    del raw_case, prompt_tokens, output_tokens, role, b_feasible
-    raise NotImplementedError(
-        "LEGACY_PURGED: deleted shadow scalar capacity division int(cap // kv); "
-        "consume integer Memory.admissible_tokens / DieResidentReceipt from prediction.capacity.ledger (S1-017)"
+    """Compute one instance's HBM ledger from canonical integer ``Memory`` + ``DieResidentReceipt``."""
+    parsed = parse_case(raw_case)
+    role_norm = str(role or "colocated").strip().lower()
+    prefill_ws = _prefill_workspace_tokens(parsed, int(prompt_tokens))
+    if role_norm == "pd_prefill":
+        ws_tokens = max(1, prefill_ws)
+        seq_len = int(prompt_tokens) + 1
+        _, kv_by_stage, max_seqs_vram = _solve_b_vram_max(
+            parsed, base_ws=ws_tokens, decode_q=1, seq_len=seq_len, cap_bound=None,
+        )
+        mem = Memory(parsed, workspace_tokens=ws_tokens)
+        phase_name, op_batch, q_tok = "prefill", 1, ws_tokens
+    else:
+        decode_q, _ = _resolve_speculative_tokens(
+            parsed, output_budget=output_tokens,
+            tokens_per_seq=None, emitted_tokens_per_seq=None,
+        )
+        q_tok = max(1, int(decode_q))
+        base_ws = max(1, prefill_ws) if role_norm == "colocated" else q_tok
+        seq_len = int(prompt_tokens) + int(output_tokens)
+        _, kv_by_stage, max_seqs_vram = _solve_b_vram_max(
+            parsed, base_ws=base_ws, decode_q=q_tok, seq_len=seq_len, cap_bound=None,
+        )
+        op_batch = max(1, int(b_feasible))
+        ws_tokens = max(base_ws, op_batch * q_tok)
+        mem = Memory(parsed, workspace_tokens=ws_tokens)
+        phase_name = "decode"
+    receipt = mem.resident_memory_receipt(
+        phase=phase_name, sequence_tokens=seq_len, batch_per_dp=op_batch, query_tokens=q_tok,
     )
+    kv_pool_receipt = mem.resident_memory_receipt(
+        phase=phase_name, sequence_tokens=None, batch_per_dp=0, query_tokens=q_tok,
+    )
+    hbm_bytes = min((int(die.memory_bytes) for die in parsed.machine.dies), default=0)
+    weights_bytes = max(
+        (int(d.checkpoint_weight_bytes) + int(d.prepared_weight_bytes) + int(d.vision_weight_bytes)
+         for d in receipt.dies),
+        default=0,
+    )
+    workspace_bytes = max((int(d.workspace_bytes) for d in receipt.dies), default=0)
+    kv_per_seq_bytes = max((int(round(v)) for v in kv_by_stage), default=0)
+    kv_pool_headroom_bytes = int(kv_pool_receipt.min_free_hbm_headroom_bytes)
+    free_headroom_bytes = int(receipt.min_free_hbm_headroom_bytes)
+    return {
+        "role": role_norm,
+        "parallel": parsed.runtime.parallel.to_dict(),
+        "workspace_tokens": int(ws_tokens),
+        "hbm_capacity_gib": round(float(hbm_bytes) / BYTES_PER_GIB, GIB_DIGITS),
+        "weights_gib": round(float(weights_bytes) / BYTES_PER_GIB, GIB_DIGITS),
+        "workspace_gib": round(float(workspace_bytes) / BYTES_PER_GIB, GIB_DIGITS),
+        "kv_per_seq_gib": round(float(kv_per_seq_bytes) / BYTES_PER_GIB, GIB_DIGITS),
+        "kv_pool_headroom_gib": round(float(max(0, kv_pool_headroom_bytes)) / BYTES_PER_GIB, GIB_DIGITS),
+        "free_hbm_headroom_gib": round(float(max(0, free_headroom_bytes)) / BYTES_PER_GIB, GIB_DIGITS),
+        "max_seqs_per_dp_vram": int(max_seqs_vram),
+        "configured_max_num_seqs": int(parsed.runtime.max_num_seqs),
+        "feasible": bool(kv_pool_headroom_bytes >= 0 and max_seqs_vram >= 1),
+    }
 
 
 def _build_capacity_ledger(
@@ -282,6 +340,66 @@ def _analyze_track_worker(task: tuple[Any, ...]) -> tuple[str, dict[str, Any], d
     )
 
 
+def _pct_delta(base_ms: float, cand_ms: float) -> float:
+    return ((cand_ms - base_ms) / base_ms) * PCT_SCALE if base_ms > MIN_RATIO_EPS else 0.0
+
+
+def _speedup_ratio(base_ms: float, cand_ms: float) -> float:
+    return (base_ms / cand_ms) if cand_ms > MIN_RATIO_EPS else 0.0
+
+
+def _compose_canonical_waterfall_cases(
+    model: Any,
+    *,
+    hardware: str | Mapping[str, Any],
+    runtime_stack: str | Mapping[str, Any],
+    phase: str,
+    cleaned_kwargs: Mapping[str, Any],
+) -> dict[str, dict[str, Any]]:
+    """Compose canonical 4-track cases (``eager``, ``shipping``, ``proposed``, ``target``)."""
+    cases: dict[str, dict[str, Any]] = {}
+    for track in ("shipping", "proposed", "target"):
+        cases[track] = compose_case(
+            model, hardware=hardware, runtime_stack=runtime_stack,
+            feature_track=_compose_track_arg(track), _stack_phase=phase, **cleaned_kwargs,
+        )
+    eager_kw = dict(cleaned_kwargs)
+    ship_meta = (cases["shipping"].get("runtime") or {}).get("metadata") or {}
+    ship_quant = (cases["shipping"].get("model") or {}).get("quant")
+    va_prof = ship_meta.get("va_profile") or {}
+    va_flags = dict(va_prof.get("tutorial_flags") or {})
+    explicit_quant = eager_kw.get("quant")
+    unquantized_override = (
+        isinstance(explicit_quant, str)
+        and explicit_quant.strip().lower() in _UNQUANTIZED_PRESET_NAMES
+    )
+    if "quant" not in eager_kw:
+        if isinstance(ship_quant, Mapping) and ship_quant:
+            eager_kw["quant"] = dict(ship_quant)
+        elif va_prof.get("quant") is not None:
+            eager_kw["quant"] = va_prof["quant"]
+    if not unquantized_override:
+        if "kv_cache_dtype" not in eager_kw:
+            resolved_kv = (
+                (ship_quant.get("kv_dtype") if isinstance(ship_quant, Mapping) else None)
+                or va_flags.get("kv_cache_dtype")
+            )
+            if resolved_kv:
+                eager_kw["kv_cache_dtype"] = str(resolved_kv)
+        if "indexer_kv_dtype" not in eager_kw:
+            resolved_idx = (
+                (ship_quant.get("index_dtype") if isinstance(ship_quant, Mapping) else None)
+                or va_flags.get("indexer_kv_dtype")
+            )
+            if resolved_idx:
+                eager_kw["indexer_kv_dtype"] = str(resolved_idx)
+    cases["eager"] = compose_case(
+        model, hardware=hardware, runtime_stack=runtime_stack,
+        feature_track=_compose_track_arg("eager"), _stack_phase=phase, **eager_kw,
+    )
+    return cases
+
+
 def _compare_feature_tracks_bounded(
     model: Any, *, hardware: str | Mapping[str, Any], runtime_stack: str | Mapping[str, Any],
     phase: str, tokens: int, context: int, sequences: int, scope: str,
@@ -291,17 +409,128 @@ def _compare_feature_tracks_bounded(
     bottleneck_case: Mapping[str, Any] | None = None,
     bottleneck_out: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Evaluate the 4-track waterfall with bounded concurrency and replica-0 memory caps."""
-    del (
-        model, hardware, runtime_stack, phase, tokens, context, sequences, scope,
-        compose_kwargs, use_archetype_folding, precomputed_summaries, granted_workers,
-        bottleneck_case, bottleneck_out,
+    """Evaluate the canonical 4-track waterfall (``eager/shipping/proposed/target``) with bounded memory."""
+    del use_archetype_folding
+    skip_keys = {"feature_track", "optimizations", "exclude_optimizations", "raw_eager", "_stack_phase"}
+    cleaned = {k: v for k, v in compose_kwargs.items() if k not in skip_keys}
+    eff_ctx = 0 if phase == "prefill" else int(context)
+    eff_seq = max(1, int(sequences))
+    eff_workers = resolve_granted_workers(granted_workers)
+
+    summary_cache: dict[str, dict[str, Any]] = {
+        k: dict(v) for k, v in (precomputed_summaries or {}).items()
+    }
+    cases = _compose_canonical_waterfall_cases(
+        model, hardware=hardware, runtime_stack=runtime_stack, phase=phase, cleaned_kwargs=cleaned,
     )
-    raise NotImplementedError(
-        "LEGACY_PURGED: deleted parallel duplicate waterfall builder using expected_ideal & "
-        "MONOTONIC_TOLERANCE_MS; wire canonical PredictionSpine + EngineStepReceipt "
-        "4-track StackTrack (eager/shipping/proposed/target) (S1-015, S1-016)"
-    )
+    track_fps = {track: _case_execution_fingerprint(cases[track]) for track in ("eager", "shipping", "proposed", "target")}
+    bn_fp = _case_execution_fingerprint(bottleneck_case) if bottleneck_case is not None else None
+
+    uncached_tasks: list[tuple[Any, ...]] = []
+    queued_fps: set[str] = set()
+    if bottleneck_case is not None and bn_fp is not None:
+        if bn_fp not in summary_cache or bottleneck_out is not None:
+            queued_fps.add(bn_fp)
+            uncached_tasks.append((
+                bn_fp, bottleneck_case, phase, int(tokens), eff_ctx, eff_seq, scope, bottleneck_out is not None,
+            ))
+    for track in ("eager", "shipping", "proposed", "target"):
+        fp = track_fps[track]
+        if fp in summary_cache or fp in queued_fps:
+            continue
+        queued_fps.add(fp)
+        uncached_tasks.append((fp, cases[track], phase, int(tokens), eff_ctx, eff_seq, scope, False))
+
+    if len(uncached_tasks) > 1 and eff_workers > 1:
+        results = map_ordered(_analyze_track_worker, uncached_tasks, granted_workers=eff_workers)
+    else:
+        results = [_analyze_track_worker(task) for task in uncached_tasks]
+    for fp, summary, bn_payload in results:
+        summary_cache[fp] = summary
+        if bn_payload is not None and bottleneck_out is not None:
+            bottleneck_out.update(bn_payload)
+
+    summaries = {track: summary_cache[track_fps[track]] for track in ("eager", "shipping", "proposed", "target")}
+    reports = {
+        track: ((cases[track].get("runtime") or {}).get("metadata") or {}).get("feature_track_report") or {}
+        for track in ("eager", "shipping", "proposed", "target")
+    }
+    eager_ms = float(summaries["eager"]["step_ms"])
+    ship_ms = float(summaries["shipping"]["step_ms"])
+    prop_ms = float(summaries["proposed"]["step_ms"])
+    target_ms = float(summaries["target"]["step_ms"])
+    roof_1p0_ms = float(summaries["target"]["roof_1p0_ms"])
+    eager_mono = eager_ms >= ship_ms
+    monotonic = eager_mono and ship_ms >= prop_ms and prop_ms >= target_ms and target_ms >= roof_1p0_ms
+
+    return {
+        "schema": WATERFALL_SCHEMA,
+        "model": cases["shipping"]["model"]["name"],
+        "hardware_sku": cases["shipping"]["machine"]["sku"],
+        "runtime_stack": reports["shipping"].get("stack"),
+        "repository": reports["shipping"].get("repository"),
+        "geometry": {
+            "phase": phase, "tokens": int(tokens), "context": eff_ctx,
+            "sequences": eff_seq, "scope": scope,
+        },
+        "monotonic_verified": bool(monotonic),
+        "eager_vs_shipping_monotonic": bool(eager_mono),
+        "waterfall": {
+            "eager": {
+                "step_ms": round(eager_ms, MS_DIGITS),
+                "operator_sum_ms": round(float(summaries["eager"]["operator_sum_ms"]), MS_DIGITS),
+                "hbm_bytes": float(summaries["eager"]["hbm_bytes"]),
+                "network": dict(summaries["eager"]["network"]),
+                "active_mechanisms": [m["id"] for m in reports["eager"].get("active_mechanisms", ())],
+            },
+            "shipping": {
+                "step_ms": round(ship_ms, MS_DIGITS),
+                "operator_sum_ms": round(float(summaries["shipping"]["operator_sum_ms"]), MS_DIGITS),
+                "hbm_bytes": float(summaries["shipping"]["hbm_bytes"]),
+                "network": dict(summaries["shipping"]["network"]),
+                "delta_vs_eager_ms": round(ship_ms - eager_ms, MS_DIGITS),
+                "delta_vs_eager_pct": round(_pct_delta(eager_ms, ship_ms), PCT_DIGITS),
+                "speedup_vs_eager": round(_speedup_ratio(eager_ms, ship_ms), RATIO_DIGITS),
+                "active_mechanisms": [m["id"] for m in reports["shipping"].get("active_mechanisms", ())],
+            },
+            "proposed": {
+                "step_ms": round(prop_ms, MS_DIGITS),
+                "operator_sum_ms": round(float(summaries["proposed"]["operator_sum_ms"]), MS_DIGITS),
+                "hbm_bytes": float(summaries["proposed"]["hbm_bytes"]),
+                "network": dict(summaries["proposed"]["network"]),
+                "delta_vs_shipping_ms": round(prop_ms - ship_ms, MS_DIGITS),
+                "delta_vs_shipping_pct": round(_pct_delta(ship_ms, prop_ms), PCT_DIGITS),
+                "speedup_vs_shipping": round(_speedup_ratio(ship_ms, prop_ms), RATIO_DIGITS),
+                "active_open_prs": [
+                    {"mechanism_id": m["mechanism_id"], "ref": m["ref"], "notes": m["notes"]}
+                    for m in reports["proposed"].get("unmerged_pr_mechanisms", ())
+                ],
+                "single_pr_ablation": [],
+                "leave_one_out_ablation": [],
+            },
+            "target": {
+                "step_ms": round(target_ms, MS_DIGITS),
+                "operator_sum_ms": round(float(summaries["target"]["operator_sum_ms"]), MS_DIGITS),
+                "hbm_bytes": float(summaries["target"]["hbm_bytes"]),
+                "network": dict(summaries["target"]["network"]),
+                "delta_vs_proposed_ms": round(target_ms - prop_ms, MS_DIGITS),
+                "delta_vs_proposed_pct": round(_pct_delta(prop_ms, target_ms), PCT_DIGITS),
+                "delta_vs_shipping_ms": round(target_ms - ship_ms, MS_DIGITS),
+                "delta_vs_shipping_pct": round(_pct_delta(ship_ms, target_ms), PCT_DIGITS),
+                "speedup_vs_shipping": round(_speedup_ratio(ship_ms, target_ms), RATIO_DIGITS),
+                "unimplemented_architectural_gaps": list(reports["target"].get("unimplemented_gaps", ())),
+                "active_mechanisms": [m["id"] for m in reports["target"].get("active_mechanisms", ())],
+            },
+            "hardware_roofline": {
+                "physical_ideal_1p0x_ms": round(roof_1p0_ms, MS_DIGITS),
+                "remaining_kernel_micro_gap_to_1p0x_ms": round(max(0.0, target_ms - roof_1p0_ms), MS_DIGITS),
+            },
+        },
+        "efficiency_reference": {
+            "physical_ideal_ms": round(roof_1p0_ms, MS_DIGITS),
+            "basis": "physical_1p0x_critical_path_roofline",
+        },
+    }
 
 
 def _extract_bottleneck_roofline(
@@ -385,7 +614,7 @@ def _bundle_inputs_for_solution(
     winner_mode = str(solved.get("winner_mode") or solved.get("deployment_mode") or "")
     is_prefill_only = (
         phase == "prefill" if phase is not None
-        else (winner_mode == "pd_prefill" or (winner_mode == "colocated" and int(output_tokens) <= 0))
+        else (winner_mode == "pd_prefill" or (winner_mode != "pd_decode" and int(output_tokens) <= 1))
     )
     best = solved.get("best_configuration") or {}
     rec_case = (
@@ -440,16 +669,83 @@ def _export_solution_artifacts(
     mode: str,
     rewrite_plan: Any = None,
 ) -> dict[str, Any]:
-    """Lazily delegate ``--xlsx`` / ``--trace`` emission with independent Before/After (Parallel, B)."""
-    del (
-        model, hardware, runtime_stack, wf_kw, before_solved, after_solved,
-        prompt_tokens, output_tokens, scope, xlsx_path, trace_path,
-        compare_track, target_track, mode, rewrite_plan,
+    """Lazily emit ``--xlsx`` / ``--trace`` with explicit role-tagged Before/After polarity."""
+    try:
+        export_mod = importlib.import_module("mindie_sim.export")
+    except ModuleNotFoundError as exc:
+        raise ModelingError(
+            "solve_export_requires_mindie_sim_export_package"
+        ) from exc
+    has_target_after = (mode == "modeling") or (rewrite_plan is not None)
+    after_track = target_track if mode == "modeling" else compare_track
+    before_case, before_req, before_meta = _bundle_inputs_for_solution(
+        before_solved, model=model, hardware=hardware, runtime_stack=runtime_stack,
+        base_kw=wf_kw, feature_track=compare_track, prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens, scope=scope,
     )
-    raise NotImplementedError(
-        "LEGACY_PURGED: deleted inverted bidirectional compare_source calls; wire explicit "
-        "(before_bundle, after_bundle, comparison_request) + 3-arg assert_comparison_polarity (S1-014)"
+    before_bundle = export_mod.build_export_bundle(
+        before_case, request=before_req, apply_target_envelope=False,
+        handoff_tpot_ms=before_meta["handoff_tpot_ms"],
+        deployment_total_dies=before_meta["deployment_total_dies"] or None,
+        pd_pool_summary=before_meta["pd_pool_summary"],
     )
+    if has_target_after:
+        after_case, after_req, after_meta = _bundle_inputs_for_solution(
+            after_solved, model=model, hardware=hardware, runtime_stack=runtime_stack,
+            base_kw=wf_kw, feature_track=after_track, prompt_tokens=prompt_tokens,
+            output_tokens=output_tokens, scope=scope,
+        )
+        after_bundle = export_mod.build_export_bundle(
+            after_case, request=after_req,
+            apply_target_envelope=True,
+            rewrite_plan=rewrite_plan,
+            allow_unbound_formula=(mode == "modeling"),
+            handoff_tpot_ms=after_meta["handoff_tpot_ms"],
+            deployment_total_dies=after_meta["deployment_total_dies"] or None,
+            pd_pool_summary=after_meta["pd_pool_summary"],
+        )
+        anchor_fn = getattr(export_mod, "anchor_stage_waterfall", None)
+        if callable(anchor_fn) and getattr(after_bundle, "stage_waterfall", None):
+            after_bundle = replace(
+                after_bundle, stage_waterfall=anchor_fn(before_bundle, after_bundle),
+            )
+    else:
+        after_req, after_meta, after_bundle = before_req, before_meta, before_bundle
+
+    out: dict[str, Any] = {
+        "mode": mode,
+        "compare_track": compare_track,
+        "target_track": after_track,
+        "phase": after_req.phase,
+    }
+    if after_meta["pd_pool_summary"]:
+        out["pd_pool_summary"] = dict(after_meta["pd_pool_summary"])
+    if xlsx_path is not None:
+        cmp_req_cls = getattr(export_mod, "ComparisonRequest", None)
+        assert_pol = getattr(export_mod, "assert_comparison_polarity", None)
+        if cmp_req_cls is not None and has_target_after:
+            cmp_req = cmp_req_cls(
+                before_case_digest=str(getattr(before_bundle, "case_digest", "")),
+                after_case_digest=str(getattr(after_bundle, "case_digest", "")),
+                comparison_policy=(
+                    "signed_comparison" if rewrite_plan is not None else "monotonic_optimization"
+                ),
+                require_model_scope=(scope == "model"),
+            )
+            if callable(assert_pol):
+                assert_pol(cmp_req, before_bundle, after_bundle)
+            receipt = export_mod.export_comparison_xlsx(
+                before_bundle, after_bundle, cmp_req, output_path=xlsx_path,
+            )
+        else:
+            target_bundle = after_bundle if has_target_after else before_bundle
+            receipt = export_mod.export_comparison_xlsx(target_bundle, xlsx_path)
+        out["xlsx"] = receipt.to_dict() if hasattr(receipt, "to_dict") else str(xlsx_path)
+    if trace_path is not None:
+        trace_target = after_bundle if has_target_after else before_bundle
+        receipt = export_mod.export_msprof_trace(trace_target, trace_path)
+        out["trace"] = receipt.to_dict() if hasattr(receipt, "to_dict") else str(trace_path)
+    return out
 
 
 def _evaluate_winner_analysis(
@@ -488,7 +784,7 @@ def _evaluate_winner_analysis(
     parsed_rec = parse_case(rec_case)
     win_mtp = int((best or {}).get("mtp_proposal_tokens", 0) or 0)
     winner_mode = str(solved.get("winner_mode") or solved.get("deployment_mode") or "colocated")
-    is_prefill_only = winner_mode == "pd_prefill" or (winner_mode == "colocated" and int(output) <= 0)
+    is_prefill_only = winner_mode == "pd_prefill" or (winner_mode != "pd_decode" and int(output) <= 1)
     win_phase = "prefill" if is_prefill_only else "decode"
     win_seq = 1 if is_prefill_only else max(1, int((best or {}).get("b_feasible", 1) or 1))
     win_tokens = max(1, int(prompt)) if is_prefill_only else (1 + win_mtp)
@@ -748,6 +1044,7 @@ def solve_deployment(
                 -float(row.get("prefill_rps_per_die", 0.0) or 0.0),
                 int(row.get("used_dies", 0)),
                 float(row.get("ttft_ms", 0.0) or 0.0),
+                canonical_deployment_row_key(row),
             ),
         )
     else:
@@ -758,6 +1055,7 @@ def solve_deployment(
                 int(row.get("used_dies", 0)),
                 -float(row.get("e2e_tps_per_die", row.get("sustainable_tps_per_die", 0.0)) or 0.0),
                 float(row.get("effective_tpot_ms", 0.0) or 0.0),
+                canonical_deployment_row_key(row),
             ),
         )
     runner_ups = feasible_sorted[1:1 + TOP_RUNNER_UPS]

@@ -31,6 +31,7 @@ from .handoff import (
     _pd_handoff_binding,
     _pending_release_targets,
     _register_consumer_release,
+    compute_expected_pd_handoff_demand,
 )
 
 #: Bounded default diagnostic trace sizes for the direct PD entry.
@@ -326,16 +327,108 @@ def _admit_pd_handoff(
     if source_event is None:
         raise ModelingError(
             "pd_handoff_missing_source_ready:" + request)
-    del (
-        connector, engine, execution, published, consumer_release,
-        consumer_callbacks, source_release_state, source_release_callback,
-        transfers, handoff_records,
+    demand = compute_expected_pd_handoff_demand(
+        cases["prefill"], cases["decode"],
+        memory["prefill"], memory["decode"], state.computed,
     )
-    raise NotImplementedError(
-        "LEGACY_PURGED: deleted duplicate target-stage volume loop omitting dcp_dp_width "
-        "and two-endpoint overlapping-rank fallback; consume canonical integer PDHandoff "
-        "plan and per-rank PDTransfer graph directly from disaggregated.handoff (S6-W5-14)"
+    decode_local = demand.decode_local_stage_bytes
+    volume = demand.total_volume_bytes
+    demands = {}
+    for pool in ("prefill", "decode"):
+        replica = placement[pool, request]
+        local = (decode_local if pool == "decode"
+                 else memory[pool].cache_bytes(state.computed, padded=False))
+        for stage, stage_bytes in enumerate(local):
+            roles = execution[pool].stage_names[replica, stage]
+            demands[roles["hbm"]] = stage_bytes
+    handoff, source_ranks, destination_ranks = _pd_handoff_binding(
+        request, state.computed, placement, cases, memory, execution,
+        decode_local, volume, demands,
+        shared_buffer_prefix=(connector.receive_buffer_id
+                              if connector.shared_receive_buffer else None),
+        shared_buffer_capacity=connector.receive_capacity_bytes,
+        published=published,
+        active_draft=demand.active_draft,
     )
+    if not handoff.transfers:
+        transfers[request] = engine.submit(
+            f"pd:{request}", owner=f"request:{request}",
+            metadata={"boundary": "pd_empty_handoff",
+                      "request_id": request})
+        handoff_records.append({
+            "request_id": request, "transport_binding": "empty",
+            "source_ranks": list(source_ranks),
+            "destination_ranks": list(destination_ranks),
+            "transfers": [], "receive_buffer_ids": {},
+            "receive_capacity_bytes": {},
+            "memory_work": dict(demands),
+            "chunk_bytes": connector.chunk_bytes,
+            "transport_event": transfers[request]})
+        state.location = "decode"
+        return None
+    storage_holds = {}
+    if set(source_ranks) & set(destination_ranks):
+        grant = engine.submit(
+            f"pd:{request}:destination_grant",
+            owner=f"decode:r{target}",
+            metadata={"boundary": "pd_destination_admission",
+                      "request_id": request,
+                      "physical_ranks": list(destination_ranks),
+                      "tokens": state.computed + 1})
+        release = engine.future(f"pd:{request}:consumer_release")
+        consumer_release[request] = {1: release}
+        transfers[request] = connector.submit(
+            engine, "pd:" + request, volume, demands,
+            ready=source_event, destination_ready=grant,
+            release_events={1: (release,)})
+        transport_binding = "pool_endpoint_overlapping_ranks"
+    else:
+        transfers[request] = _submit_rank_handoff(
+            engine, connector, handoff, request, source_ranks, destination_ranks,
+            source_event, target, state, memory, placement,
+            consumer_release, consumer_callbacks, source_release_state,
+            source_release_callback, storage_holds)
+        transport_binding = "actual_rank"
+    handoff_records.append({
+        "request_id": request,
+        "transport_binding": transport_binding,
+        "source_ranks": list(source_ranks),
+        "destination_ranks": list(destination_ranks),
+        "transfers": [
+            {"source_rank": item.source_rank,
+             "destination_rank": item.destination_rank,
+             "payload_bytes": item.payload_bytes,
+             "source_stage": item.source_stage,
+             "destination_stage": item.destination_stage,
+             "source_layers": list(item.source_layers),
+             "destination_layers": list(item.destination_layers),
+             "component": item.component,
+             "source_version": item.source_version,
+             "destination_version": item.destination_version,
+             "source_heads": list(item.source_heads),
+             "destination_heads": list(item.destination_heads),
+             "source_token_span": list(item.source_token_span),
+             "destination_token_span": list(item.destination_token_span),
+             "producer": item.producer,
+             "output": item.output,
+             "destination_tier": item.destination_tier,
+             "source_storage": item.source_storage,
+             "destination_storage": item.destination_storage,
+             "source_byte_range": list(item.source_byte_range),
+             "destination_byte_range": list(item.destination_byte_range),
+             "source_scope": item.source_scope,
+             "destination_scope": item.destination_scope}
+            for item in handoff.transfers],
+        "receive_buffer_ids": dict(handoff.receive_buffer_ids),
+        "receive_capacity_bytes": dict(handoff.receive_capacity_bytes),
+        "receive_host_bytes": dict(handoff.receive_host_bytes),
+        "storage_holds": storage_holds,
+        "memory_work": dict(demands),
+        "chunk_bytes": connector.chunk_bytes,
+        "transport_event": transfers[request],
+    })
+    state.location = "transferring"
+    return volume
 
 
 def _submit_rank_handoff(

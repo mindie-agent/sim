@@ -477,3 +477,25 @@ def test_dp_cohort_dedup_fast_span_only_matches_detailed_peer_die_overlap_decisi
     detailed_res = _has_unsynced_peer_die_overlap(detailed_ex, w0, 0)
     fast_res = _has_unsynced_peer_die_overlap(fast_ex, w0, 0)
     assert fast_res is detailed_res is True
+
+
+def test_w5b_c11_sparse_epoch_dynamic_4096_res_exact_parity() -> None:
+    """C11 dynamic resource table (>2048) & sparse active-coeff coupled rates match Python."""
+    from mindie_sim.prediction.runtime.engine import Engine, Resource
+
+    count = 4096
+    res_list = [Resource(f"r{i}", 1.0 + float(i % 7) * 0.25) for i in range(count)]
+    eng_py = Engine(res_list, backend="python")
+    eng_c = Engine(res_list, backend="c")
+    try:
+        ev_py = [eng_py.submit(f"t{i}", {f"r{i}": 1.0, f"r{(i + 1) % count}": 0.5}, coupled=(i % 3 == 0)) for i in range(64)]
+        ev_c = [eng_c.submit(f"t{i}", {f"r{i}": 1.0, f"r{(i + 1) % count}": 0.5}, coupled=(i % 3 == 0)) for i in range(64)]
+        eng_py.advance()
+        eng_c.advance()
+        st = eng_c.accel_status()
+        assert st["fallback_reason"] is None and int(st["native_steps"]) > 0
+        for a, b in zip(ev_py, ev_c, strict=True):
+            assert b.time == pytest.approx(a.time, rel=1e-12, abs=1e-12)
+    finally:
+        _close(eng_py)
+        _close(eng_c)

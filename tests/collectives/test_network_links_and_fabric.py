@@ -537,3 +537,24 @@ def test_channel_projection_keeps_declared_peak_and_drops_placeholders():
     assert project_transfer_channel_input(
         {"semantics": "custom"}, materialized=False)["channel_semantics"] == "custom"
     assert _first_link_by_channel(replace(_machine(GEN3_SKU), links=())) == {}
+
+
+def test_w5b_topology_explicit_scope_no_die_sniffing_and_roce_cross_node():
+    """Topology requires explicit P18/link scope (zero die sniffing) & prices cross-node RoCE TP=16."""
+    from mindie_sim.schema.hardware import Link
+
+    raw_tp16 = compose_case("qwen3-32b", "950dt-96g", tp=16, dp=1, ep=1, layers=1)
+    parsed_tp16 = parse_case(raw_tp16)
+    topo_tp16 = Topology(parsed_tp16.machine, parsed_tp16.runtime.parallel)
+    assert topo_tp16.p18_allreduce_rate_applies("allreduce", tuple(range(16))) is False
+
+    # Undeclared custom multi-node link scope fails fast instead of passing through as "undeclared".
+    base = _machine(GEN3_SKU)
+    bad_link = Link(
+        name="custom_mystery", channel="mystery_unregistered_chan",
+        members=(0, 8), semantics="per_port", capacity_bytes_per_ms=10.0, latency_us=1.0,
+    )
+    bad_hw = replace(base, links=(*base.links, bad_link))
+    bad_topo = Topology(bad_hw, parse_case(compose_case(TINY_MODEL, GEN3_SKU, tp=8, dp=2, layers=1)).runtime.parallel)
+    with pytest.raises(ModelingError, match="link_scope_undeclared"):
+        bad_topo._link_scope(bad_link)

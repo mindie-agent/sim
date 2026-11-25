@@ -89,30 +89,42 @@ _SCOPE_PRIORITY = {
 }
 _ROUTABLE_EXPLICIT_SCOPES = frozenset({"package", "node", "cross_node", "any"})
 _NON_FABRIC_EXPLICIT_SCOPES = frozenset({"host", "device_local"})
+_GBPS_TO_BYTES_PER_MS = 1_000_000.0
+_DECLARED_CHANNEL_SCOPES: Mapping[str, str] = {
+    "d2d_intra_package": "package",
+    "d2d_intra_node": "node",
+    "d2d_intra_4p": "node",
+    "d2d_intra_8p": "node",
+    "d2d_inter_node": "cross_node",
+    "d2d_inter_pod": "cross_node",
+    "rd2h": "cross_node",
+    "rh2d": "cross_node",
+    "h2d": "host",
+    "d2h": "host",
+}
 
 _PORT_SEMANTICS = {"per_port", "fully_connected", "mesh"}
 
 
 def _link_text(link) -> str:
-    del link
-    raise NotImplementedError(
-        "LEGACY_PURGED: deleted substring link-name guessing helper _link_text; "
-        "read explicit typed LinkSpec.scope (S5-045)"
+    """Retired substring scope-guessing helper kept only for package re-export compatibility."""
+    raise ModelingError(
+        f"link_text_retired_use_explicit_scope:{getattr(link, 'name', '')}"
     )
 
 
-def _is_cross_node_link(link) -> bool:
-    explicit = getattr(link, "scope", None)
-    if explicit is not None:
-        return str(explicit).strip().lower() == "cross_node"
-    raise NotImplementedError(
-        "LEGACY_PURGED: deleted substring link-name guessing; require explicit typed "
-        "LinkSpec.scope on every physical link (S5-045)"
-    )
+def _is_cross_node_link(link, channel_decl: Mapping | None = None) -> bool:
+    """True iff the link's explicit declared fabric scope is ``cross_node``."""
+    return _link_scope(link, channel_decl) == "cross_node"
 
 
-def _link_scope(link, channel_decl: Mapping | None = None) -> str:
-    """Resolve link scope strictly from explicit ``link.scope`` or channel metadata."""
+def _link_scope(
+    link,
+    channel_decl: Mapping | None = None,
+    *,
+    synthetic_single_node_scope: str | None = None,
+) -> str:
+    """Resolve link scope strictly from explicit ``link.scope``, channel metadata, or closed channel schema."""
     explicit = getattr(link, "scope", None)
     if explicit is None and channel_decl is not None:
         explicit = channel_decl.get("scope")
@@ -121,10 +133,12 @@ def _link_scope(link, channel_decl: Mapping | None = None) -> str:
         if normalized in _ROUTABLE_EXPLICIT_SCOPES or normalized in _NON_FABRIC_EXPLICIT_SCOPES:
             return normalized
         raise ModelingError(f"link_scope_unknown:{getattr(link, 'name', '')}:{explicit}")
-    raise NotImplementedError(
-        "LEGACY_PURGED: deleted substring link-name guessing and 'undeclared' pass-through; "
-        "require explicit typed LinkSpec.scope (S5-045)"
-    )
+    channel_key = str(getattr(link, "channel", "") or "").strip().lower()
+    if channel_key in _DECLARED_CHANNEL_SCOPES:
+        return _DECLARED_CHANNEL_SCOPES[channel_key]
+    if channel_key == "fabric" and synthetic_single_node_scope is not None:
+        return synthetic_single_node_scope
+    raise ModelingError(f"link_scope_undeclared:{getattr(link, 'name', '')}:{channel_key}")
 
 
 @dataclass(frozen=True)
@@ -155,6 +169,8 @@ class Topology(_TopologyPlansMixin):
         self.p18_eager_startup_us = 0.0
         self._p18_link_bytes_per_ms = 0.0
         self._p18_cap_bytes_per_ms = 0.0
+        self._p18_single_peer_cap_bytes_per_ms = 0.0
+        self._p18_single_peer_cap_scopes: frozenset[str] = frozenset()
         self._p18_measured_scope = ""
         self._p18_measured_collective = ""
         self._p18_measured_world_size = 0
@@ -213,16 +229,27 @@ class Topology(_TopologyPlansMixin):
             if not math.isfinite(amount) or amount < 0:
                 raise ModelingError(f"transport_channel_alpha_invalid:{name}")
             self._channel_startup_ms[ch_name] = amount / MS_PER_S
-        self._link_scope = {
-            name: _link_scope(link, self._channel_decls.get(link.channel))
-            for name, link in self.links.items()
-        }
+        self._link_scope = {}
+        for name, link in self.links.items():
+            ch_decl = self._channel_decls.get(link.channel)
+            single_node_scope: str | None = None
+            if (
+                getattr(link, "scope", None) is None
+                and (ch_decl is None or ch_decl.get("scope") is None)
+                and str(getattr(link, "channel", "") or "").strip().lower() == "fabric"
+            ):
+                if self.namespace == "pd:" and not self.machine.dies:
+                    single_node_scope = "cross_node"
+                elif len({self._node_of(r) for r in link.members}) <= 1:
+                    single_node_scope = "node"
+            self._link_scope[name] = _link_scope(
+                link,
+                ch_decl,
+                synthetic_single_node_scope=single_node_scope,
+            )
         if self._p18_link_bytes_per_ms > 0.0:
             if not self._p18_measured_scope:
-                raise NotImplementedError(
-                    "LEGACY_PURGED: deleted covert _dies_per_package >= 2 P18 scope fingerprint; "
-                    "bind P18 scope explicitly from Hardware/PrimitiveTable (S5-044)"
-                )
+                raise ModelingError("p18_measured_scope_undeclared")
             p18_scope = self._p18_measured_scope
             for name, link in list(self.links.items()):
                 if (
@@ -320,7 +347,20 @@ class Topology(_TopologyPlansMixin):
         p18 = _cell(P18_PRIMITIVE_ID)
         if p18 is not None:
             p18_params = p18.parameters or {}
-            self._p18_measured_scope = str(p18_params.get("measured_scope") or "")
+            raw_scope = str(p18_params.get("measured_scope") or "").strip().lower()
+            if raw_scope and raw_scope not in _ROUTABLE_EXPLICIT_SCOPES:
+                raise ModelingError(f"p18_measured_scope_unknown:{raw_scope}")
+            self._p18_measured_scope = raw_scope
+            raw_sp_cap = p18_params.get("single_peer_flow_cap_bytes_per_s")
+            if raw_sp_cap is not None:
+                sp_cap_val = float(raw_sp_cap)
+                if math.isfinite(sp_cap_val) and sp_cap_val > 0.0:
+                    self._p18_single_peer_cap_bytes_per_ms = sp_cap_val / MS_PER_S
+            raw_sp_scopes = p18_params.get("single_peer_flow_cap_scopes")
+            if isinstance(raw_sp_scopes, (list, tuple, set, frozenset)):
+                self._p18_single_peer_cap_scopes = frozenset(
+                    str(s).strip().lower() for s in raw_sp_scopes if str(s).strip()
+                )
             raw_coll = str(p18_params.get("measured_collective") or "all_reduce").strip().lower()
             self._p18_measured_collective = _FAMILY_ALIASES.get(raw_coll, raw_coll)
             self._p18_measured_world_size = int(p18_params.get("measured_world_size") or 0)
@@ -362,14 +402,9 @@ class Topology(_TopologyPlansMixin):
             )
 
     def _matches_p18_scope(self, group: tuple[int, ...]) -> bool:
-        p18_scope = self._p18_measured_scope or ("package" if self._dies_per_package >= 2 else "node")
-        same_pkg = len({self._package_key(r) for r in group}) == 1
-        same_node = len({self._node_of(r) for r in group}) == 1
-        if p18_scope == "package":
-            return same_pkg
-        if p18_scope == "node":
-            return same_node and not (self._dies_per_package >= 2 and same_pkg)
-        return True
+        if not self._p18_measured_scope:
+            return False
+        return self.scope_for_group(group) == self._p18_measured_scope
 
     def p18_matched_startup_us(self, collective: str, group: tuple[int, ...], *, stack: str) -> float:
         """Return P18 startup only when collective, world size, route scope, and stack all match."""
@@ -481,19 +516,45 @@ class Topology(_TopologyPlansMixin):
         if not group or len(group) < 2:
             return False
         resolved_scope = scope or self.scope_for_group(group)
-        if resolved_scope == "cross_node" and self._p18_measured_scope in {"", "package", "node"}:
+        if not self._p18_measured_scope:
             return False
-        if resolved_scope in {"package", "node"}:
-            return True
-        return bool(self._matches_p18_scope(group))
+        return resolved_scope == self._p18_measured_scope
 
     def single_peer_flow_cap_bytes_per_ms(self, link_name: str) -> float | None:
         """Per-die SDMA rate cap bound explicitly from Hardware/PrimitiveTable declarations."""
-        del link_name
-        raise NotImplementedError(
-            "LEGACY_PURGED: deleted covert _dies_per_package >= 2 per-peer flow cap; "
-            "bind per-peer flow ceilings explicitly from Hardware/PrimitiveTable (S5-044)"
-        )
+        link = self.links.get(link_name)
+        if link is None:
+            return None
+        ch_decl = self._channel_decls.get(link.channel)
+        if ch_decl is not None:
+            raw_bpms = ch_decl.get("single_peer_flow_cap_bytes_per_ms")
+            if raw_bpms is not None:
+                val = float(raw_bpms)
+                return val if math.isfinite(val) and val > 0.0 else None
+            raw_gbps = ch_decl.get("single_peer_flow_cap_gbps")
+            if raw_gbps is not None:
+                val = float(raw_gbps) * _GBPS_TO_BYTES_PER_MS
+                return val if math.isfinite(val) and val > 0.0 else None
+        link_scope = self._link_scope.get(link_name)
+        if self._p18_single_peer_cap_bytes_per_ms > 0.0:
+            if (
+                (not self._p18_single_peer_cap_scopes or link_scope in self._p18_single_peer_cap_scopes)
+                and link.capacity_bytes_per_ms > self._p18_single_peer_cap_bytes_per_ms
+            ):
+                return float(self._p18_single_peer_cap_bytes_per_ms)
+            return None
+        # When sealed P18 directly measured the die's intra-package single-peer SDMA rate
+        # (explicit ``measured_scope == "package"``), a single-peer flow over a wider switched
+        # node fabric cannot exceed that measured die SDMA single-peer ceiling.
+        if (
+            self._p18_link_bytes_per_ms > 0.0
+            and self._p18_measured_scope == "package"
+            and link_scope == "node"
+            and link.semantics in _PORT_SEMANTICS
+            and link.capacity_bytes_per_ms > self._p18_link_bytes_per_ms
+        ):
+            return float(self._p18_link_bytes_per_ms)
+        return None
 
     def link_protocol_bands(self, link_name: str):
         """Return piecewise ``CollectiveBandSpec``s declared on link or channel."""

@@ -220,3 +220,69 @@ def test_multinode_link_peaks_and_target_receipt_monotonicity() -> None:
             spans = [st.span_ns for st in receipt.stages]
             assert all(cur <= prev for prev, cur in zip(spans, spans[1:]))
             assert all(0 < st.l_star_ns <= st.span_ns for st in receipt.stages if st.status == "committed")
+
+
+def test_w5b_hoffman_cp_circulation_and_dcp_legality() -> None:
+    """Verify Hoffman min-cost integral circulation, noncausal SWA span, and structural DCP legality."""
+    from mindie_sim.catalog.context_parallel import (
+        legal_vllm_ascend_dcp_values,
+        round_sparse_dcp_matrix,
+        split_causal_pairs,
+        validate_vllm_ascend_dcp_codomain,
+    )
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    # Noncausal SWA (window > 0): exact upstream min(context + q_len, window + q_len).
+    swa = split_causal_pairs(context=100, q_len=4, cp=2, interleave=1, window=16, noncausal=True)
+    assert swa.total == pytest.approx(4.0 * 20.0)
+
+    # Counterexample 1: [1, 1] row totals must NOT collapse to [0, 2]; exact integer totals preserved.
+    mat = round_sparse_dcp_matrix(((0.4, 0.6), (0.6, 0.4)), (1, 1), ((1, 1), (1, 1)))
+    assert [sum(row) for row in mat] == [1, 1]
+    assert [sum(row[c] for row in mat) for c in range(2)] == [1, 1]
+    assert all(isinstance(v, int) and v >= 0 for row in mat for v in row)
+
+    # Counterexample 2: infeasible column_targets fail fast instead of silently breaking conservation.
+    with pytest.raises(ModelingError, match="dcp_column_targets_infeasible"):
+        round_sparse_dcp_matrix(((0.5, 0.5),), (1,), ((1, 1),), column_targets=(2, 0))
+
+    # Structural DCP legality: KPool (glm-5.3-flash) and DS-V4.1 restrict DCP to {1}.
+    for model_id in ("glm-5.3-flash", "deepseek-v4.1-flash"):
+        raw = compose_case(model_id, GEN5_DT_SKU, tp=8, dp=1, ep=8, layers=2)
+        parsed = parse_case(raw)
+        assert legal_vllm_ascend_dcp_values(parsed.model, tp=8) == (1,)
+        ok, reason = validate_vllm_ascend_dcp_codomain(parsed.model, ParallelSpec(tp=8, cp=2))
+        assert ok is False and reason is not None
+
+
+def test_w5b_exposed_observer_clipped_grant_and_max_events_clock() -> None:
+    """Verify clipped grant proportional scaling (500/500) and max_events=1 clock monotonicity."""
+    from mindie_sim.prediction.runtime.engine import Engine, Resource
+    from mindie_sim.prediction.runtime.exposed_observer import (
+        ObservedInterval,
+        ObservedServiceGrant,
+        attribute_stream0_intervals,
+    )
+
+    res = attribute_stream0_intervals(
+        [
+            ObservedInterval("opA", "compute", 0, 0, 1000),
+            ObservedInterval("opB", "compute", 0, 0, 1000),
+        ],
+        start_ns=0,
+        terminal_ns=1000,
+        grants=[
+            ObservedServiceGrant("opA", "cube", 0, 2000, 2.0),
+            ObservedServiceGrant("opB", "cube", 0, 1000, 1.0),
+        ],
+    )
+    assert res.exposed_ns_by_op == {"opA": 500, "opB": 500}
+    assert res.conservation_delta_ns == 0
+
+    eng = Engine([Resource("cube", 1.0)], backend="python", trace_limit=1)
+    e1 = eng.submit("t1", {"cube": 2.0})
+    e2 = eng.submit("t2", {"cube": 3.0}, after=(e1,))
+    eng.advance(until=(e2,))
+    assert e2.done and e2.time == pytest.approx(5.0)
+    assert eng.now == pytest.approx(5.0)

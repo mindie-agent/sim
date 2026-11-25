@@ -412,7 +412,19 @@ def _has_megamoe_cross_dp_group(ops: Sequence[Any]) -> bool:
     return False
 
 
-def is_symmetric_dp_cohort(
+@dataclasses.dataclass(frozen=True)
+class CohortDedupEligibility:
+    """Typed DP-cohort deduplication eligibility without global side-channels."""
+
+    symmetric: bool
+    requires_peer_collectives: bool = False
+    reason: str = ""
+
+    def __bool__(self) -> bool:
+        return self.symmetric
+
+
+def evaluate_dp_cohort_dedup(
     execution: Any,
     works: Mapping[int, Any],
     *,
@@ -420,10 +432,10 @@ def is_symmetric_dp_cohort(
     emitted_tokens: Any = None,
     memory_bindings: Any = None,
     state_accesses: Any = None,
-) -> bool:
-    """Fail-closed check that all DP replicas in ``works`` are strictly symmetric."""
+) -> CohortDedupEligibility:
+    """Fail-closed typed check that all DP replicas in ``works`` are strictly symmetric."""
     if not dp_dedup_enabled() or len(works) < _MIN_DEDUP_REPLICAS:
-        return False
+        return CohortDedupEligibility(False, reason="disabled_or_singleton")
     engine = execution.engine
     if (execution.readiness_report or execution.participant_profile
             or execution.legacy_diagnostics
@@ -435,23 +447,19 @@ def is_symmetric_dp_cohort(
             or execution._joint_collective_trace is not None
             or engine.memory is not None or engine._memory_grants
             or engine._trace_maxlen > 0 or engine._wave_recorder is not None):
-        return False
+        return CohortDedupEligibility(False, reason="execution_state_active")
     if (emitted_tokens is not None or memory_bindings is not None
             or state_accesses is not None):
-        return False
+        return CohortDedupEligibility(False, reason="per_replica_io_bindings")
 
     replicas = tuple(sorted(works))
     r0 = replicas[_CANONICAL_INDEX]
     w0 = works[r0]
     if w0.mode != "graph":
-        return False
-    if _has_megamoe_cross_dp_group(w0.ops):
-        raise NotImplementedError(
-            "LEGACY_PURGED: deleted module-global WeakSet _ENGINES_REQUIRE_PEER_COLLECTIVES "
-            "side-channel; return explicit typed cohort eligibility result object (S6-W5-29)"
-        )
+        return CohortDedupEligibility(False, reason="non_graph_mode")
+    requires_peer_collectives = _has_megamoe_cross_dp_group(w0.ops)
     if _has_unsynced_peer_die_overlap(execution, w0, r0):
-        return False
+        return CohortDedupEligibility(False, reason="unsynced_peer_die_overlap")
 
     w0_sig = _work_symmetry_signature(w0)
     hw0 = _stage_hardware_signature(execution, r0)
@@ -468,30 +476,78 @@ def is_symmetric_dp_cohort(
     for rep in replicas[1:]:
         wr = works[rep]
         if _work_symmetry_signature(wr) != w0_sig:
-            return False
+            return CohortDedupEligibility(False, reason="work_signature_mismatch")
         if _stage_hardware_signature(execution, rep) != hw0:
-            return False
+            return CohortDedupEligibility(False, reason="hardware_signature_mismatch")
         if _external_input_signature(engine, (external_inputs or {}).get(rep)) != ext0:
-            return False
+            return CohortDedupEligibility(False, reason="external_input_mismatch")
         ranks_r = tuple(
             rk for stg in range(pp) for rk in execution.topology.ranks(rep, stg)
         )
         if _rank_topology_profile(execution.topology, engine, ranks_r) != topo0:
-            return False
+            return CohortDedupEligibility(False, reason="topology_profile_mismatch")
         rep_prefix = f"analysis{rep}:"
         req_map_r = _replica_req_map(wr)
         for op0, op_r in zip(ops0, wr.ops):
             if not _ops_symmetric(op0, op_r, self0, req_map0, rep_prefix, req_map_r):
-                return False
-    return True
+                return CohortDedupEligibility(False, reason="op_asymmetry")
+    return CohortDedupEligibility(
+        True, requires_peer_collectives=requires_peer_collectives,
+    )
 
 
-def is_symmetric_native_program(program: Any, peer_count: int) -> bool:
-    """True when one NativeProgram has identical per-rank routing across peers."""
+def is_symmetric_dp_cohort(
+    execution: Any,
+    works: Mapping[int, Any],
+    *,
+    external_inputs: Mapping[int, Any] | None = None,
+    emitted_tokens: Any = None,
+    memory_bindings: Any = None,
+    state_accesses: Any = None,
+) -> bool:
+    """Boolean convenience wrapper over ``evaluate_dp_cohort_dedup``."""
+    return evaluate_dp_cohort_dedup(
+        execution, works,
+        external_inputs=external_inputs,
+        emitted_tokens=emitted_tokens,
+        memory_bindings=memory_bindings,
+        state_accesses=state_accesses,
+    ).symmetric
+
+
+def _row_frame_map(raw: Any, peer_count: int) -> dict[int, int]:
+    """Normalize a rank's outgoing directed frame map ``dst -> frames``."""
+    out: dict[int, int] = {}
+    items = raw.items() if isinstance(raw, Mapping) else (raw or ())
+    for peer, frames in items:
+        p_idx = int(peer)
+        f_cnt = int(frames)
+        if 0 <= p_idx < peer_count and f_cnt > 0:
+            out[p_idx] = out.get(p_idx, 0) + f_cnt
+    return out
+
+
+def is_symmetric_native_program(
+    program: Any,
+    peer_count: int,
+    *,
+    local_rank_count: int = 1,
+) -> bool:
+    """True iff ``program`` is strictly reciprocal and isomorphic across all EP peers.
+
+    Verifies full directed edge reciprocity ``M[u][v] == M[v][u]`` (rejecting
+    directed cycles such as ``0->1->2->0`` that pass histogram-only checks),
+    identical per-rank local frames/basis, and isomorphic intra/cross-replica
+    slices when ``local_rank_count > 1``.
+    """
     inner = getattr(program, "program", None)
     if inner is None or not hasattr(inner, "start_with_handles"):
         return False
-    if int(getattr(inner, "peer_count", 0) or 0) != peer_count:
+    width = int(getattr(inner, "peer_count", 0) or 0)
+    if width <= 0 or width != int(peer_count):
+        return False
+    local_k = max(1, int(local_rank_count))
+    if width % local_k != 0:
         return False
     route_matrix = getattr(inner, "route_matrix", None)
     if not route_matrix:
@@ -502,22 +558,47 @@ def is_symmetric_native_program(program: Any, peer_count: int) -> bool:
     if not callable(frames_for):
         return False
 
-    def _row_sig(rk: int) -> tuple[Any, ...]:
-        raw = frames_for(rk)
-        if isinstance(raw, Mapping):
-            off = tuple(sorted(int(v) for p, v in raw.items() if int(p) != rk and int(v) > 0))
-        else:
-            off = tuple(sorted(int(v) for p, v in (raw or ()) if int(p) != rk and int(v) > 0))
+    matrix = [_row_frame_map(frames_for(rk), width) for rk in range(width)]
+    # 1) Strict directed reciprocity M[u][v] == M[v][u] for every pair u != v.
+    for u in range(width):
+        for v in range(u + 1, width):
+            if matrix[u].get(v, 0) != matrix[v].get(u, 0):
+                return False
+
+    # 2) Identical per-rank basis, local frames, and off-diagonal frame histogram.
+    def _rank_sig(rk: int) -> tuple[Any, ...]:
+        rep_base = (rk // local_k) * local_k
+        rep_end = rep_base + local_k
+        intra = tuple(sorted(
+            (dst - rep_base, f) for dst, f in matrix[rk].items()
+            if dst != rk and rep_base <= dst < rep_end
+        ))
+        cross = tuple(sorted(
+            f for dst, f in matrix[rk].items()
+            if dst != rk and not (rep_base <= dst < rep_end)
+        ))
         basis = str(basis_for(rk)) if callable(basis_for) else ""
         loc = int(local_for(rk)) if callable(local_for) else 0
-        return (basis, loc, off)
+        return (basis, loc, intra, cross)
 
-    sig0 = _row_sig(0)
-    return all(_row_sig(rk) == sig0 for rk in range(1, peer_count))
+    n_replicas = width // local_k
+    for pos in range(local_k):
+        ref_sig = _rank_sig(pos)
+        for rep in range(1, n_replicas):
+            if _rank_sig(rep * local_k + pos) != ref_sig:
+                return False
+    return True
 
 
-def can_dedup_collective_to_canonical(topology: Any, engine: Any) -> bool:
-    """True when all topology links are symmetric full-duplex port/directed-pair."""
+def can_dedup_collective_to_canonical(
+    topology: Any,
+    engine: Any,
+    *,
+    requires_peer_collectives: bool = False,
+) -> bool:
+    """True when all topology links are symmetric full-duplex and peer collectives are uncoupled."""
+    if requires_peer_collectives:
+        return False
     if getattr(topology, "_shared_switches", None):
         return False
     if getattr(topology, "_link_shared_ports", None):
@@ -613,6 +694,11 @@ def _mirror_replica_resources(
     pair_by_class: dict[tuple[str, float], tuple[float, float]] = {}
     intra_pair_by_pos: dict[tuple[str, int, int, float], tuple[float, float]] = {}
     resources = engine.resources
+    rank_to_rep_pos = {
+        rk: (rep, pos)
+        for rep, rk_list in all_ranks_by_rep.items()
+        for pos, rk in enumerate(rk_list)
+    }
     r0_pos = {rk: pos for pos, rk in enumerate(r0_ranks)}
     for res_name, amt in list(serviced.items()):
         if not amt or "link:" not in res_name:
@@ -624,11 +710,18 @@ def _mirror_replica_resources(
             pfx = m_port.group("pfx")
             direction = m_port.group("dir")
             rk_id = int(m_port.group("rk"))
-            if rk_id in r0_pos:
+            lclass = pfx.rsplit(":", 1)[0] if ":" in pfx else pfx
+            b_val = busy.get(res_name, 0.0)
+            if direction == "rx" and mirror_links:
+                info = rank_to_rep_pos.get(rk_id)
+                if info is not None:
+                    _, pos = info
+                    pkey = (lclass, "rx", pos, rate_val)
+                    prev_amt, prev_busy = port_by_class.get(pkey, (0.0, 0.0))
+                    port_by_class[pkey] = (prev_amt + amt, prev_busy + b_val)
+            elif rk_id in r0_pos:
                 pos = r0_pos[rk_id]
-                lclass = pfx.rsplit(":", 1)[0] if ":" in pfx else pfx
-                pair_val = (amt, busy.get(res_name, 0.0))
-                port_by_class[(lclass, direction, pos, rate_val)] = pair_val
+                port_by_class[(lclass, direction, pos, rate_val)] = (amt, b_val)
             continue
         m_pair = _PAIR_RE.match(res_name)
         if m_pair:
@@ -643,11 +736,6 @@ def _mirror_replica_resources(
                     )
                 elif mirror_links:
                     pair_by_class.setdefault((lclass, rate_val), (amt, busy.get(res_name, 0.0)))
-    rank_to_rep_pos = {
-        rk: (rep, pos)
-        for rep, rk_list in all_ranks_by_rep.items()
-        for pos, rk in enumerate(rk_list)
-    }
     if port_by_class or pair_by_class or intra_pair_by_pos:
         for res_name in list(serviced):
             if "link:" not in res_name:
