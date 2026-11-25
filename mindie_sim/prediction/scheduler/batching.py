@@ -86,11 +86,15 @@ class Scheduler:
             if result not in (_PREEMPTED, _RETRY):
                 return result
 
-    def _resize_memory(self, request_id: str, tokens: int, *, query_tokens: int) -> bool:
+    def _resize_memory(
+        self, request_id: str, tokens: int, *, query_tokens: int,
+        phase: str = "decode", valid_tokens: int | None = None,
+    ) -> bool:
         """Reserve or update per-request KV/state demand with its active verify width."""
         if isinstance(self.memory, Memory):
             return self.memory.resize(
                 self.replica, request_id, tokens, query_tokens=query_tokens,
+                phase=phase, valid_tokens=valid_tokens,
             )
         return self.memory.resize(self.replica, request_id, tokens)
 
@@ -141,10 +145,13 @@ class Scheduler:
             if state.prompt_target - state.computed > min(budget, input_budget):
                 return False
         if hasattr(self.memory, "admission_decision"):
+            admit_kwargs = {"query_tokens": 1}
+            if isinstance(self.memory, Memory):
+                admit_kwargs["phase"] = "decode" if decode else "prefill"
             decision = self.memory.admission_decision(
                 self.replica, state.request.request_id,
                 self._minimum_request_tokens(state),
-                query_tokens=1,
+                **admit_kwargs,
             )
             return not bool(decision.get("permanent", False))
         if not hasattr(self.memory, "cache_bytes") or not hasattr(self.memory, "capacity"):
@@ -294,15 +301,21 @@ class Scheduler:
             # correctness requirement.  If the next-step headroom is missing,
             # execute the current batch with only the rows it really reserves;
             # do not turn a transient async reservation into an unserved request.
+            phase = "decode" if decode else "prefill"
+            valid_tokens = state.computed + allocation
             if not self._resize_memory(
                     state.request.request_id,
-                    state.computed + allocation + lookahead,
-                    query_tokens=verify_width):
+                    valid_tokens + lookahead,
+                    query_tokens=verify_width,
+                    phase=phase,
+                    valid_tokens=valid_tokens):
                 lookahead = 0
                 if not self._resize_memory(
                         state.request.request_id,
-                        state.computed + allocation,
-                        query_tokens=verify_width):
+                        valid_tokens,
+                        query_tokens=verify_width,
+                        phase=phase,
+                        valid_tokens=valid_tokens):
                     continue
             state.pending_context = state.computed + allocation
             state.reserved_tokens = allocation
@@ -405,7 +418,9 @@ class Scheduler:
                 )
                 if not self._resize_memory(
                         view.request_id, state.computed,
-                        query_tokens=verify_width):
+                        query_tokens=verify_width,
+                        phase=view.phase,
+                        valid_tokens=state.computed):
                     raise ModelingError(
                         "committed_kv_state_exceeds_reserved_capacity:"
                         + view.request_id)
@@ -610,10 +625,15 @@ class Scheduler:
                 return True
         if states and hasattr(memory, "admission_decision"):
             for state in states:
+                admit_kwargs = {"query_tokens": 1}
+                if isinstance(memory, Memory):
+                    admit_kwargs["phase"] = (
+                        "decode" if state.computed >= state.prompt_target else "prefill"
+                    )
                 decision = memory.admission_decision(
                     self.replica, state.request.request_id,
                     self._minimum_request_tokens(state),
-                    query_tokens=1,
+                    **admit_kwargs,
                 )
                 if decision.get("wake_events"):
                     return True

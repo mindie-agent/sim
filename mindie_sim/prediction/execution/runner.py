@@ -302,6 +302,17 @@ def _has_eager_moe_split_barrier(execution, physical_ops) -> bool:
     )
 
 
+def _has_mixed_none_capture(work, physical_ops) -> bool:
+    """Return True when a ``scope == "none"`` step carries captured region ops."""
+    if work.recipe != "declared_graph":
+        return any(_metadata_dict(item).get("graph_captured") is True for item in physical_ops)
+    return any(
+        _metadata_dict(item).get("graph_replay_scope") == "none"
+        and _metadata_dict(item).get("graph_captured") is True
+        for item in physical_ops
+    )
+
+
 def try_lazy_add(execution, work, replica, release_ms, *, scope, schedule,
                  prepared, input_ready, physical_ops, prefix, external,
                  emitted_tokens, memory_bindings, state_accesses):
@@ -311,7 +322,8 @@ def try_lazy_add(execution, work, replica, release_ms, *, scope, schedule,
             and execution.offload_policy is None
             and not execution.readiness_report
             and _stars_allows_lazy_fastpath(execution, physical_ops)
-            and not _has_eager_moe_split_barrier(execution, physical_ops)):
+            and not _has_eager_moe_split_barrier(execution, physical_ops)
+            and not _has_mixed_none_capture(work, physical_ops)):
         return None
     safe_cache = execution._lazy_safe_id_cache
 
@@ -1007,6 +1019,7 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         self.hosts: dict[tuple[int, int], Event] = {}
         self.submission_counts = {"eager_invocations": 0, "graph_replays": 0}
         self._stage_graph_replays: dict[tuple[int, int], int] = {}
+        self._stage_eager_invocations: dict[tuple[int, int], int] = {}
         self._eager_split_counts_ag: dict[tuple, tuple[dict[int, Any] | None, dict[int, Any]]] = {}
         self._eager_split_counts_occ: dict[tuple, int] = {}
         self._symmetric_dedup_replicas: tuple[int, ...] = ()
@@ -1205,6 +1218,7 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         self.recipes_used = {}
         self.work = dict.fromkeys(("flops", "vector_ops", "hbm_bytes", "link_bytes"), 0.0)
         self._stage_graph_replays.clear()
+        self._stage_eager_invocations.clear()
         self._eager_split_counts_ag.clear()
         self._eager_split_counts_occ.clear()
         self._symmetric_dedup_replicas = ()
@@ -1503,6 +1517,7 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         last_draft_done: dict[int, Event] = {}
         kernel_groups = KernelGroups(self, physical_ops, replica, prefix)
         step_replay_ids: dict[tuple[int, int], int] = {}
+        allow_mixed_none = _has_mixed_none_capture(work, physical_ops)
 
         for op in physical_ops:
             original = op
@@ -1523,10 +1538,20 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
             context = self._context(op, replica, scope, recipe=recipe)
             context = replace(context, group_buffers=kernel_groups.buffer_scope(op))
             owner = f"replica:{replica}"
-            captured = scope == "full" or (
-                scope == "piecewise" and bool(dict(op.metadata).get("graph_captured")))
-            capture_key = (
-                op.stage, dict(op.metadata).get("graph_segment", 0) if scope == "piecewise" else 0)
+            op_meta = _metadata_dict(op)
+            raw_captured = op_meta.get("graph_captured")
+            raw_segment = op_meta.get("graph_segment")
+            if scope == "full":
+                captured = True if raw_captured is None else bool(raw_captured)
+                capture_key = (op.stage, 0 if raw_segment is None else raw_segment)
+            elif scope == "piecewise" or (
+                scope == "none" and allow_mixed_none and raw_captured is not None
+            ):
+                captured = bool(raw_captured)
+                capture_key = (op.stage, 0 if raw_segment is None else raw_segment)
+            else:
+                captured = False
+                capture_key = (op.stage, 0)
             kernel_group = declaration(op)
             submit = (bool(kernel_group.get("entry")) if kernel_group else
                       bool(context.work or getattr(recipe, "algorithm", None)))
@@ -1658,17 +1683,30 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         else:
             duration = self._stage_launch_ms(stage_key, captured=captured)
             host_deps = (prepared,) + ((self.hosts[stage_key],) if stage_key in self.hosts else ())
-            if captured and scope == "piecewise" and self.submission.piecewise_sync_ms > 0.0:
+            prior_replays = self._stage_graph_replays.get(stage_key, 0)
+            has_eager_break = (
+                scope == "piecewise"
+                or self._stage_eager_invocations.get(stage_key, 0) > 0
+            )
+            if (
+                captured
+                and self.submission.piecewise_sync_ms > 0.0
+                and (has_eager_break or prior_replays > 0)
+            ):
                 if deps:
                     host_deps = tuple(deps) + host_deps
-                if self._stage_graph_replays.get(stage_key, 0) > 0:
+                if prior_replays > 0:
                     duration += float(self.submission.piecewise_sync_ms)
             host_launch = engine.submit(name + ":submit", {names["host"]: duration},
                                         after=host_deps, owner=owner)
             self.hosts[stage_key] = host_launch
             self.submission_counts["graph_replays" if captured else "eager_invocations"] += 1
             if captured:
-                self._stage_graph_replays[stage_key] = self._stage_graph_replays.get(stage_key, 0) + 1
+                self._stage_graph_replays[stage_key] = prior_replays + 1
+            else:
+                self._stage_eager_invocations[stage_key] = (
+                    self._stage_eager_invocations.get(stage_key, 0) + 1
+                )
             start = engine.start_boundary(host_launch, name + ":host_submit")
             if captured:
                 graph_launch[capture_key] = (host_launch, start)

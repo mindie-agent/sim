@@ -129,6 +129,9 @@ def _layer_scatter_rows(
     v_rows = max(0, min(int(rows), int(layer_valid)))
     if v_rows <= 0:
         return None
+    if dcp_sharded and rows_by_view and views and contexts:
+        prefix_flags = (True,) * v_rows + (False,) * max(0, int(rows) - v_rows)
+        return min(store_rows, _owned_masked_rows(prefix_flags, rows_by_view, views, contexts, parallel, block))
     return min(store_rows, v_rows)
 
 
@@ -219,7 +222,7 @@ def prepare_gqa_context(
                 ready_deps.append(kv_ready)
             continue
         slot_count = 0
-        if layer_store_rows == 0 and layer_slot_valid_rows is not None and layer < len(layer_slot_valid_rows):
+        if layer_slot_valid_rows is not None and layer < len(layer_slot_valid_rows):
             raw_slots = layer_slot_valid_rows[layer]
             if isinstance(raw_slots, Sequence) and not isinstance(raw_slots, (str, bytes)):
                 slot_count = len(raw_slots[:int(rows)])
@@ -451,14 +454,13 @@ def _scatter_context_kv(
         recipe=SCATTER_RECIPE,
         **layer_common,
     )
-    if store_rows == 0 and slot_index_count > 0:
+    if slot_index_count > 0:
         slot_bytes = float(slot_index_count * SLOT_INDEX_BYTES)
         stored = replace(
             stored,
-            mte2_bytes=slot_bytes,
-            mte3_bytes=0.0,
-            hbm_bytes=slot_bytes,
-            vector_ops=float(slot_index_count),
+            mte2_bytes=float(stored.mte2_bytes) + slot_bytes,
+            hbm_bytes=float(stored.hbm_bytes) + slot_bytes,
+            vector_ops=float(stored.vector_ops) + float(slot_index_count),
         )
     extra_meta = (("slot_index_count", slot_index_count),) if slot_index_count > 0 else ()
     stored = replace(

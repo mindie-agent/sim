@@ -130,18 +130,26 @@ def optimize_ladder(
     replay: ReplayOptions = ReplayOptions(),
     primitives: PrimitiveStore | None = None,
     primitive_table: Any = None,
-    stack_id: str = "cann93_va_main",
+    stack_id: str | None = None,
     max_trials: int = DEFAULT_OPTIMIZE_TRIALS,
     allow_unbound_formula: bool = False,
 ) -> Any:
     """Solve the certified 5-level primal-dual performance ladder for one step."""
+    from mindie_sim.optimization.ladder import _resolve_ladder_stack_id
+
+    parsed = _to_case(case)
+    eff_stack_id = (
+        str(stack_id).strip()
+        if stack_id is not None and str(stack_id).strip()
+        else _resolve_ladder_stack_id(parsed, None)
+    )
     return default_spine().optimize_ladder(
-        _to_case(case),
+        parsed,
         request,
         replay=replay,
         primitives=primitives,
         primitive_table=primitive_table,
-        stack_id=stack_id,
+        stack_id=eff_stack_id,
         max_trials=max_trials,
         allow_unbound_formula=allow_unbound_formula,
     )

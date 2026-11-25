@@ -798,20 +798,38 @@ def _visible_sequences(
 def _resolve_native_tiling(
     contract: AttentionContract, ctx: OperatorPlanningContext,
     sequences: tuple[tuple[int, int], ...], *, gm_workspace: bool,
+    raw_sequences: tuple[tuple[int, int], ...] | None = None,
 ) -> CorePartition | None:
     if contract.panel_mode != "shipping" or contract.splits > 1 or contract.fia_template is not None:
         return None
     aic_count, paged = ctx.effective_aic_cores, contract.kv_layout in PAGED_LAYOUTS
+    # Native FIA tilers (fia_tiling_nonquant_gqa.cpp:429) select row ordering
+    # from qLayout, not KV cache storage layout.
+    q_layout = str(ctx.layout or contract.kv_layout)
+    # Right-aligned causal truncation (s2_last = s1_last + kv - q) is invalid
+    # when selected_tokens/windowing shortened kv below the raw KV span; every
+    # query tile still sees its bounded visible band and must stay live.
+    base_seqs = raw_sequences if raw_sequences is not None else sequences
+    shortened_by_selected = (
+        contract.selected_tokens is not None
+        and any(vkv < okv for (_, okv), (_, vkv) in zip(base_seqs, sequences))
+    )
+    shortened_below_q = any(
+        vkv < q and okv >= q for (q, okv), (_, vkv) in zip(base_seqs, sequences)
+    )
+    tiling_causal = contract.causal and not shortened_by_selected and not shortened_below_q
     if gm_workspace:
         return resolve_arch22_fia_gqa_tiling(
             sequences=sequences, num_heads=contract.num_heads, num_kv_heads=contract.num_kv_heads,
-            block_size=contract.block_size, paged=paged, aic_count=aic_count, layout=contract.kv_layout,
+            block_size=contract.block_size, paged=paged, aic_count=aic_count,
+            layout=q_layout, causal=tiling_causal,
         )
     return resolve_arch35_fia_gqa_tiling(
         sequences=sequences, num_heads=contract.num_heads, num_kv_heads=contract.num_kv_heads,
         head_dim=contract.head_dim, v_head_dim=contract.v_head_dim, block_size=contract.block_size,
         paged=paged, aic_count=aic_count, l2_bytes=_l2_capacity_bytes(ctx),
-        causal=contract.causal, is_decode=(contract.phase == "decode"),
+        causal=tiling_causal, is_decode=(contract.phase == "decode"),
+        layout=q_layout,
     )
 
 
@@ -878,7 +896,9 @@ def dense_fia(
         raise ModelingError("attention_fia_block_table_coverage_invalid")
     group = contract.num_heads // contract.num_kv_heads
     visible_sequences = _visible_sequences(contract, sequences)
-    native = _resolve_native_tiling(contract, ctx, visible_sequences, gm_workspace=gm_workspace)
+    native = _resolve_native_tiling(
+        contract, ctx, visible_sequences, gm_workspace=gm_workspace, raw_sequences=sequences,
+    )
     m_tile = native.m_tile if native is not None else FIA_TILE
     s2_tile = native.s2_tile if native is not None else FIA_TILE
     eff_splits = native.fd_splits_per_row if native is not None else contract.splits

@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import replace
 import math
 
+from .execution.capture_barriers import has_mutating_state_effect
+
 TOLERANCE = 1e-12
 SHAPE_TRAILING_DIMS = 3
 ROWS_DIM = -3
@@ -93,7 +95,11 @@ class GraphPolicy:
         segment, last_stage, last_captured = 0, None, False
         result = []
         for op in ops:
-            captured = scope == "full" or (op.family not in split and op.recipe not in split)
+            captured = scope == "full" or (
+                op.family not in split
+                and op.recipe not in split
+                and not has_mutating_state_effect(dict(op.metadata))
+            )
             if op.stage != last_stage or captured != last_captured:
                 segment += 1
             result.append(replace(op, metadata=op.metadata + (

@@ -121,6 +121,7 @@ _RANK_5D = 5
 _UINT32_MAX = (1 << 32) - 1
 _MX_BLOCK_SIZE = 32
 _MX_SCALE_ALIGN = 2
+_DUAL_LEVEL_MX_SCALE1_BLOCK = 512
 _KV_COMPRESS_MIN_ARCH22 = 608
 _KV_COMPRESS_MIN_ARCH35 = 584
 _MQSMLA_QUANT_RECORD_DIMS: dict[str, int] = {
@@ -1038,9 +1039,23 @@ def _check_attention_and_fusion_shapes(entry: ProbedAbiEntry, query: AbiQueryKey
             if sc_s != exp_sc:
                 return f"rejected_shape_or_align:quant_46_mxscale_shape_mismatch:{sc_s}!={exp_sc}"
     if entry.abi_id == "catlass_epilogue_dual_level_quant_mx" and query.operands and len(query.outputs) >= _RANK_3D:
-        x_s, sc2_s = query.operands[0].shape, query.outputs[_RANK_2D].shape
-        if x_s and (x_s[-1] % _MX_BLOCK_SIZE != 0 or sc2_s != (*x_s[:-1], x_s[-1] // _MX_BLOCK_SIZE)):
-            return f"rejected_shape_or_align:catlass_mx_scale2_mismatch:{sc2_s}_for_x={x_s}"
+        x_s = query.operands[0].shape
+        y_s, sc1_s, sc2_s = query.outputs[0].shape, query.outputs[1].shape, query.outputs[_RANK_2D].shape
+        if x_s:
+            n_dim = x_s[-1]
+            if n_dim <= 0:
+                return f"rejected_shape_or_align:catlass_mx_x_width_invalid:x={x_s}"
+            if y_s != x_s:
+                return f"rejected_shape_or_align:catlass_mx_y_shape_mismatch:{y_s}!={x_s}"
+            exp_sc1_cols = max(1, (n_dim + _DUAL_LEVEL_MX_SCALE1_BLOCK - 1) // _DUAL_LEVEL_MX_SCALE1_BLOCK)
+            exp_sc1 = (*x_s[:-1], exp_sc1_cols)
+            if sc1_s != exp_sc1:
+                return f"rejected_shape_or_align:catlass_mx_scale1_mismatch:{sc1_s}!={exp_sc1}_for_x={x_s}"
+            sc2_blocks = max(1, (n_dim + _MX_BLOCK_SIZE - 1) // _MX_BLOCK_SIZE)
+            exp_sc2_cols = ((sc2_blocks + _MX_SCALE_ALIGN - 1) // _MX_SCALE_ALIGN) * _MX_SCALE_ALIGN
+            exp_sc2 = (*x_s[:-1], exp_sc2_cols)
+            if sc2_s != exp_sc2:
+                return f"rejected_shape_or_align:catlass_mx_scale2_mismatch:{sc2_s}!={exp_sc2}_for_x={x_s}"
     if entry.abi_id == "aclnnKvCompressEpilog" and query.operands:
         cache_s = query.operands[0].shape
         min_w = _KV_COMPRESS_MIN_ARCH35 if entry.device_arch == "A5" else _KV_COMPRESS_MIN_ARCH22

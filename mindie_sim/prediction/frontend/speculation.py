@@ -287,6 +287,10 @@ def _resolve_draft_tp(runtime, draft) -> int:
     return target_tp
 
 
+def _slot_valid_flags(entries: Sequence, feature_rows: int) -> tuple[bool, ...]:
+    return tuple(s if isinstance(s, bool) else int(s) >= 0 for s in entries[:feature_rows])
+
+
 def _dspark_layer_slot_spec(
     runtime, layer_idx: int, *, feature_rows: int, global_none: bool,
 ) -> int | tuple[bool, ...] | None:
@@ -301,14 +305,14 @@ def _dspark_layer_slot_spec(
             if entry is None:
                 return None
             if isinstance(entry, Sequence) and not isinstance(entry, (str, bytes)):
-                return tuple(int(s) >= 0 for s in entry[:feature_rows])
+                return _slot_valid_flags(entry, feature_rows)
             return max(0, min(feature_rows, int(entry)))
     elif isinstance(per_layer, Sequence) and not isinstance(per_layer, (str, bytes)) and layer_idx < len(per_layer):
         entry = per_layer[layer_idx]
         if entry is None:
             return None
         if isinstance(entry, Sequence) and not isinstance(entry, (str, bytes)):
-            return tuple(int(s) >= 0 for s in entry[:feature_rows])
+            return _slot_valid_flags(entry, feature_rows)
         return max(0, min(feature_rows, int(entry)))
     per_counts = meta.get("dspark_valid_slot_rows_by_layer")
     if isinstance(per_counts, Mapping) and (layer_idx in per_counts or str(layer_idx) in per_counts):
@@ -316,7 +320,7 @@ def _dspark_layer_slot_spec(
         return None if val is None else max(0, min(feature_rows, int(val)))
     slots = meta.get("dspark_slot_mapping")
     if isinstance(slots, Sequence) and not isinstance(slots, (str, bytes)):
-        return tuple(int(s) >= 0 for s in slots[:feature_rows])
+        return _slot_valid_flags(slots, feature_rows)
     if meta.get("dspark_valid_slot_rows") is not None:
         return max(0, min(feature_rows, int(meta["dspark_valid_slot_rows"])))
     return feature_rows
@@ -635,9 +639,9 @@ def lower_dspark_context_kv(
     ]
     if all(v is None for v in per_layer_valid):
         return ops, ctx_ready
-    has_partial_slots = any(
+    has_explicit_slots = any(
         v is None
-        or (isinstance(v, Sequence) and (len(v) < feature_rows or not all(v)))
+        or isinstance(v, Sequence)
         or (isinstance(v, int) and v < feature_rows)
         for v in per_layer_valid
     )
@@ -662,7 +666,7 @@ def lower_dspark_context_kv(
         contexts=[view.context for view in proposal_views],
         block=cp_interleave(runtime),
         use_prolog_v3=context_prolog_v3,
-        layer_slot_valid_rows=per_layer_valid if has_partial_slots else None,
+        layer_slot_valid_rows=per_layer_valid if has_explicit_slots else None,
         requires_staging_scatter=requires_staging_scatter,
     )
     return ops, ctx_ready
