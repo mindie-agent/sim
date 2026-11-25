@@ -1164,6 +1164,8 @@ class FormulaTensorSpec:
     dtype: str
     role: Literal["input", "output", "weight", "workspace"] = "input"
     hbm_resident: bool = True
+    port: str = ""
+    version: int = 0
 
     @property
     def num_elements(self) -> int:
@@ -1188,14 +1190,17 @@ class PipeStageSpec:
     share: float = 1.0
     after: tuple[str, ...] = ()
     row_reduction: bool = False
+    fixpipe_share: float = 0.0
 
 
 def _condense_pipe_nodes(
     elem_nodes: Sequence[tuple[str, Literal["cube", "vector", "link"], float, bool, tuple[str, ...]]],
+    fixpipe_by_id: Mapping[str, float] | None = None,
 ) -> tuple[PipeStageSpec, ...]:
     """Condense elementary pipe DAG without merging nodes whose dependency/consumer sets differ."""
     if not elem_nodes:
         return ()
+    fp_map = fixpipe_by_id or {}
     node_ids = {eid for eid, _, _, _, _ in elem_nodes}
     preds_by_id: dict[str, tuple[str, ...]] = {
         eid: tuple(dict.fromkeys(p for p in preds if p in node_ids and p != eid))
@@ -1228,6 +1233,7 @@ def _condense_pipe_nodes(
     group_first_pos: dict[GroupKey, int] = {}
     group_order: list[GroupKey] = []
     group_work: dict[GroupKey, float] = defaultdict(float)
+    group_fixpipe: dict[GroupKey, float] = defaultdict(float)
     group_red: dict[GroupKey, bool] = defaultdict(bool)
     group_preds: dict[GroupKey, list[GroupKey]] = defaultdict(list)
 
@@ -1247,6 +1253,7 @@ def _condense_pipe_nodes(
     for eid, _pkind, work, is_red, _preds in elem_nodes:
         gk = group_key_by_id[eid]
         group_work[gk] += max(0.0, float(work))
+        group_fixpipe[gk] += max(0.0, float(fp_map.get(eid, 0.0)))
         if is_red:
             group_red[gk] = True
         for p in preds_by_id[eid]:
@@ -1264,18 +1271,21 @@ def _condense_pipe_nodes(
     seen_kind: dict[str, int] = defaultdict(int)
     stage_name: dict[GroupKey, str] = {}
     totals_by_kind: dict[str, float] = defaultdict(float)
+    total_fixpipe = 0.0
     for gk in group_order:
         pkind = gk[1]
         idx = seen_kind[pkind]
         seen_kind[pkind] += 1
         stage_name[gk] = base_names[pkind] if counts_by_kind[pkind] == 1 else f"{base_names[pkind]}_{idx}"
         totals_by_kind[pkind] += group_work[gk]
+        total_fixpipe += group_fixpipe[gk]
 
     stages: list[PipeStageSpec] = []
     for gk in group_order:
         pkind = gk[1]
         tot = totals_by_kind[pkind]
         share = (group_work[gk] / tot) if tot > 0.0 else (1.0 / float(counts_by_kind[pkind]))
+        fp_share = (group_fixpipe[gk] / total_fixpipe) if total_fixpipe > 0.0 else 0.0
         after = tuple(stage_name[pgk] for pgk in group_preds[gk] if pgk in stage_name)
         stages.append(PipeStageSpec(
             name=stage_name[gk],
@@ -1283,6 +1293,7 @@ def _condense_pipe_nodes(
             share=share,
             after=after,
             row_reduction=bool(group_red[gk]) if pkind == "vector" else False,
+            fixpipe_share=fp_share,
         ))
     return tuple(stages)
 
@@ -1292,8 +1303,11 @@ def _derive_pipe_stages_from_ops(ops: Sequence[OpSpec]) -> tuple[PipeStageSpec, 
     ordered = tuple(ops)
     if not ordered:
         return ()
-    member_ids = {op.op_id for op in ordered}
+    by_id = {op.op_id: op for op in ordered}
+    member_ids = set(by_id)
+    is_mat_by_id = {op.op_id: _infer_op_symbolic_kind(op)[1] for op in ordered}
     elem_nodes: list[tuple[str, Literal["cube", "vector", "link"], float, bool, tuple[str, ...]]] = []
+    fixpipe_by_id: dict[str, float] = {}
     exit_eid: dict[str, tuple[str, ...]] = {}
 
     for op in ordered:
@@ -1328,6 +1342,14 @@ def _derive_pipe_stages_from_ops(ops: Sequence[OpSpec]) -> tuple[PipeStageSpec, 
             vid = f"{op.op_id}:vec"
             v_preds = tuple(local_ids) if local_ids else pred_eids
             elem_nodes.append((vid, "vector", max(vec_w, 1.0), is_red, v_preds))
+            fp_b = 0.0
+            for prod_id, pname, ver in ports:
+                src = by_id.get(prod_id)
+                if src is not None and is_mat_by_id.get(prod_id):
+                    fp_b += _op_port_edge_bytes(src, op, pname, ver, src_is_matrix=True)
+            if fp_b > 0.0:
+                cap_b = float(op.mte2_bytes or 0.0)
+                fixpipe_by_id[vid] = min(fp_b, cap_b) if cap_b > 0.0 else fp_b
             local_ids = [vid]
         if link_w > 0.0 or (not local_ids and fam in _COLLECTIVE_FAMILIES):
             lid = f"{op.op_id}:link"
@@ -1335,7 +1357,7 @@ def _derive_pipe_stages_from_ops(ops: Sequence[OpSpec]) -> tuple[PipeStageSpec, 
             elem_nodes.append((lid, "link", max(link_w, 1.0), False, l_preds))
             local_ids = [lid]
         exit_eid[op.op_id] = tuple(local_ids) if local_ids else pred_eids
-    return _condense_pipe_nodes(elem_nodes)
+    return _condense_pipe_nodes(elem_nodes, fixpipe_by_id)
 
 
 def _derive_pipe_stages_from_equations(
@@ -1388,6 +1410,269 @@ def _op_output_shape(op: OpSpec, is_matrix: bool) -> tuple[int, ...]:
     return tuple(int(d) for d in op.local_shape)
 
 
+def _resolve_op_input_dtype(op: OpSpec, meta: Mapping[str, Any] | None = None) -> str:
+    """Resolve activation input dtype honoring canonical ``TensorPrecisionABI`` first."""
+    m = meta if meta is not None else (dict(op.metadata) if op.metadata else {})
+    abi = getattr(op, "precision_abi", None)
+    return str(
+        (getattr(abi, "input_dtype", "") if abi is not None else "")
+        or m.get("activation_format")
+        or m.get("input_format")
+        or m.get("input_dtype")
+        or op.dtype
+    )
+
+
+def _resolve_op_output_dtype(op: OpSpec, meta: Mapping[str, Any] | None = None) -> str:
+    """Resolve primary output dtype honoring canonical ``TensorPrecisionABI`` first."""
+    m = meta if meta is not None else (dict(op.metadata) if op.metadata else {})
+    abi = getattr(op, "precision_abi", None)
+    return str(
+        (getattr(abi, "output_dtype", "") if abi is not None else "")
+        or m.get("output_format")
+        or m.get("output_dtype")
+        or m.get("payload_dtype")
+        or op.dtype
+    )
+
+
+def _shape_from_dims_or_bytes(
+    raw_shape: Any,
+    raw_bytes: float,
+    dtype: str,
+    *,
+    fallback_rows: int = 0,
+    fallback_cols: int = 0,
+) -> tuple[int, ...]:
+    if isinstance(raw_shape, Sequence) and not isinstance(raw_shape, (str, bytes)):
+        dims = tuple(int(d) for d in raw_shape if isinstance(d, int) and not isinstance(d, bool) and d > 0)
+        if dims and len(dims) == len(raw_shape):
+            return dims
+    if raw_bytes > 0.0:
+        elems = max(1, round(raw_bytes / formula_elem_bytes(dtype)))
+        if fallback_rows > 0 and fallback_cols > 0 and fallback_rows * fallback_cols == elems:
+            return (fallback_rows, fallback_cols)
+        return (elems,)
+    return ()
+
+
+def _typed_input_entry(
+    op: OpSpec, prod_id: str, pname: str, ver: int,
+) -> Mapping[str, Any] | None:
+    """Return matching ``typed_inputs`` / ``input_ports`` descriptor for an operand edge."""
+    meta = dict(op.metadata) if op.metadata else {}
+    for key in ("typed_inputs", "input_ports"):
+        raw = meta.get(key, ())
+        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+            continue
+        for entry in raw:
+            if not isinstance(entry, Mapping):
+                continue
+            if str(entry.get("role") or "").strip().lower() in {"weight", "control", "barrier", "event"}:
+                continue
+            ep = entry.get("producer")
+            if isinstance(ep, str) and ep == prod_id:
+                raw_name = str(entry.get("port") or entry.get("output") or entry.get("name") or "output")
+                norm_name = "output" if raw_name == "out" else raw_name
+                e_ver = int(entry.get("version", entry.get("state_version", 0)) or 0)
+                if norm_name == pname and e_ver == ver:
+                    return entry
+    return None
+
+
+def _typed_output_entry(op: OpSpec, pname: str, ver: int) -> Mapping[str, Any] | None:
+    """Return matching ``typed_outputs`` descriptor on producer ``op``."""
+    meta = dict(op.metadata) if op.metadata else {}
+    raw = meta.get("typed_outputs")
+    if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
+        return None
+    for entry in raw:
+        if not isinstance(entry, Mapping):
+            continue
+        raw_name = str(entry.get("port") or entry.get("output") or entry.get("name") or "output")
+        norm_name = "output" if raw_name == "out" else raw_name
+        e_ver = int(entry.get("version", entry.get("state_version", 0)) or 0)
+        if norm_name == pname and e_ver == ver:
+            return entry
+    return None
+
+
+def _entry_byte_size(entry: Mapping[str, Any], default_dtype: str) -> float:
+    nbytes = float(entry.get("bytes", entry.get("nbytes", entry.get("byte_size", 0.0))) or 0.0)
+    if nbytes > 0.0:
+        return nbytes
+    dt = str(entry.get("dtype") or default_dtype)
+    sh = _shape_from_dims_or_bytes(entry.get("shape"), 0.0, dt)
+    return float(prod(sh)) * formula_elem_bytes(dt) if sh else 0.0
+
+
+def _op_port_edge_bytes(
+    src: OpSpec, dst: OpSpec, pname: str, ver: int, *, src_is_matrix: bool,
+) -> float:
+    """Compute exact byte volume flowing across a single ``(src, pname, ver) -> dst`` edge."""
+    in_entry = _typed_input_entry(dst, src.op_id, pname, ver)
+    if in_entry is not None:
+        size = _entry_byte_size(in_entry, _resolve_op_input_dtype(dst))
+        if size > 0.0:
+            return size
+    out_entry = _typed_output_entry(src, pname, ver)
+    if out_entry is not None:
+        size = _entry_byte_size(out_entry, _resolve_op_output_dtype(src))
+        if size > 0.0:
+            return size
+    src_meta = dict(src.metadata) if src.metadata else {}
+    if "scale" in pname and float(src_meta.get("activation_scale_bytes") or 0.0) > 0.0:
+        return float(src_meta["activation_scale_bytes"])
+    sh = _op_output_shape(src, src_is_matrix)
+    if sh:
+        shape_b = float(prod(sh)) * formula_elem_bytes(_resolve_op_output_dtype(src, src_meta))
+        src_b = float(src.mte3_bytes or 0.0)
+        dst_b = float(dst.mte2_bytes or 0.0)
+        caps = [b for b in (shape_b, src_b, dst_b) if b > 0.0]
+        return min(caps) if caps else 0.0
+    return min(float(src.mte3_bytes or 0.0), float(dst.mte2_bytes or 0.0))
+
+
+def _op_declared_outputs(
+    op: OpSpec,
+    sym: str,
+    is_matrix: bool,
+    meta: Mapping[str, Any],
+) -> list[FormulaTensorSpec]:
+    """Emit all declared output port specs (typed outputs, quant scales, state writebacks)."""
+    outs: list[FormulaTensorSpec] = []
+    seen_ports: set[tuple[str, int]] = set()
+    used_names: set[str] = set()
+
+    def _unique_name(base: str) -> str:
+        cand = base
+        suffix = 1
+        while cand in used_names:
+            cand = f"{base}_{suffix}"
+            suffix += 1
+        used_names.add(cand)
+        return cand
+
+    raw_typed = meta.get("typed_outputs")
+    parsed_typed: list[tuple[str, int, tuple[int, ...], str]] = []
+    if isinstance(raw_typed, Sequence) and not isinstance(raw_typed, (str, bytes)):
+        for entry in raw_typed:
+            if not isinstance(entry, Mapping):
+                continue
+            pname = str(entry.get("port") or entry.get("output") or entry.get("name") or "output")
+            norm_port = "output" if pname == "out" else pname
+            ver = int(entry.get("version", entry.get("state_version", 0)) or 0)
+            dt = str(entry.get("dtype") or _resolve_op_output_dtype(op, meta))
+            nbytes = float(entry.get("bytes", entry.get("nbytes", entry.get("byte_size", 0.0))) or 0.0)
+            sh = _shape_from_dims_or_bytes(entry.get("shape"), nbytes, dt)
+            if not sh or (norm_port, ver) in seen_ports:
+                continue
+            seen_ports.add((norm_port, ver))
+            parsed_typed.append((norm_port, ver, sh, dt))
+
+    if parsed_typed:
+        primary_idx = next((i for i, item in enumerate(parsed_typed) if item[0] == "output"), 0)
+        for idx, (norm_port, ver, sh, dt) in enumerate(parsed_typed):
+            tag = re.sub(r"[^A-Za-z0-9_]+", "_", norm_port).strip("_") or "extra"
+            name = _unique_name(sym if idx == primary_idx else f"{sym}_{tag}")
+            outs.append(FormulaTensorSpec(name, sh, dt, "output", port=norm_port, version=ver))
+    else:
+        sh = _op_output_shape(op, is_matrix)
+        if sh:
+            out_dt = _resolve_op_output_dtype(op, meta)
+            seen_ports.add(("output", 0))
+            outs.append(FormulaTensorSpec(_unique_name(sym), sh, out_dt, "output", port="output", version=0))
+
+    scale_bytes = float(meta.get("activation_scale_bytes") or 0.0)
+    scale_shape_raw = meta.get("activation_scale_shape")
+    if (scale_bytes > 0.0 or scale_shape_raw) and not any("scale" in p for p, _ in seen_ports):
+        abi = getattr(op, "precision_abi", None)
+        scale_dt = str(
+            (getattr(abi, "act_scale_dtype", "") if abi is not None else "")
+            or meta.get("activation_scale_format")
+            or meta.get("scale_dtype")
+            or "fp32"
+        )
+        scale_sh = _shape_from_dims_or_bytes(scale_shape_raw, scale_bytes, scale_dt)
+        if scale_sh:
+            seen_ports.add(("activation_scale", 0))
+            outs.append(FormulaTensorSpec(
+                _unique_name(f"{sym}_scale"), scale_sh, scale_dt, "output", port="activation_scale", version=0,
+            ))
+
+    state_bytes = float(meta.get("state_write_bytes") or 0.0)
+    if state_bytes > 0.0 and not any("state" in p for p, _ in seen_ports):
+        contract = meta.get("gdn_state_contract")
+        contract_map = contract if isinstance(contract, Mapping) else {}
+        explicit_state_dt = str(
+            meta.get("state_dtype")
+            or contract_map.get("conv_state_dtype")
+            or contract_map.get("state_dtype")
+            or ""
+        )
+        fallback_state_dt = explicit_state_dt or str(op.dtype)
+        raw_state_outs = meta.get("state_value_outputs") or contract_map.get("value_outputs") or ()
+        state_entries = (
+            tuple(e for e in raw_state_outs if isinstance(e, Mapping))
+            if isinstance(raw_state_outs, Sequence) and not isinstance(raw_state_outs, (str, bytes))
+            else ()
+        )
+        state_rows = int(meta.get("state_rows") or meta.get("state_history_slots") or 0)
+        state_dim = int(meta.get("dim") or 0)
+        if state_entries:
+            resolved_state: list[tuple[int, str, int, str, tuple[int, ...] | None]] = []
+            used_bytes = 0.0
+            missing_indices: list[int] = []
+            for idx, entry in enumerate(state_entries):
+                t_port = str(entry.get("output") or entry.get("port") or entry.get("name") or f"state_{idx}")
+                t_ver = int(entry.get("state_version", entry.get("version", 0)) or 0)
+                t_dt = explicit_state_dt or str(entry.get("dtype") or fallback_state_dt)
+                entry_b = float(entry.get("bytes", entry.get("nbytes", entry.get("byte_size", 0.0))) or 0.0)
+                t_sh = _shape_from_dims_or_bytes(
+                    entry.get("shape"), entry_b, t_dt,
+                    fallback_rows=state_rows, fallback_cols=state_dim,
+                )
+                if t_sh:
+                    used_bytes += float(prod(t_sh)) * formula_elem_bytes(t_dt)
+                    resolved_state.append((idx, t_port, t_ver, t_dt, t_sh))
+                else:
+                    missing_indices.append(idx)
+                    resolved_state.append((idx, t_port, t_ver, t_dt, None))
+            if missing_indices:
+                rem_bytes = max(0.0, state_bytes - used_bytes)
+                elem_b = formula_elem_bytes(fallback_state_dt)
+                total_elems = max(len(missing_indices), round(rem_bytes / elem_b)) if rem_bytes > 0.0 else 0
+                base_elems, extra_elems = divmod(total_elems, len(missing_indices))
+                missing_pos = {idx: pos for pos, idx in enumerate(missing_indices)}
+                for pos_r, (idx, t_port, t_ver, t_dt, t_sh) in enumerate(resolved_state):
+                    if t_sh is not None:
+                        continue
+                    elems = base_elems + (1 if missing_pos[idx] < extra_elems else 0)
+                    if elems <= 0:
+                        continue
+                    sh_fill = (
+                        (state_rows, state_dim)
+                        if (state_rows > 0 and state_dim > 0 and state_rows * state_dim == elems)
+                        else (elems,)
+                    )
+                    resolved_state[pos_r] = (idx, t_port, t_ver, t_dt, sh_fill)
+            for idx, t_port, t_ver, t_dt, t_sh in resolved_state:
+                if not t_sh:
+                    continue
+                t_name = _unique_name(f"{sym}_state" if len(state_entries) == 1 else f"{sym}_state{idx}")
+                outs.append(FormulaTensorSpec(t_name, t_sh, t_dt, "output", port=t_port, version=t_ver))
+        else:
+            st_sh = _shape_from_dims_or_bytes(
+                meta.get("state_shape"), state_bytes, fallback_state_dt,
+                fallback_rows=state_rows, fallback_cols=state_dim,
+            )
+            if st_sh:
+                outs.append(FormulaTensorSpec(
+                    _unique_name(f"{sym}_state"), st_sh, fallback_state_dt, "output", port="state", version=0,
+                ))
+    return outs
+
+
 def _compose_dag_equations_and_ports(
     ops: Sequence[OpSpec],
     *,
@@ -1402,6 +1687,7 @@ def _compose_dag_equations_and_ports(
     infos = tuple(_infer_op_symbolic_kind(op) for op in ordered)
     operand_ports: dict[str, tuple[tuple[str, str, int], ...]] = {}
     internal_users: dict[str, list[str]] = {op.op_id: [] for op in ordered}
+    consumed_ports: dict[str, set[tuple[str, int]]] = {op.op_id: set() for op in ordered}
     unique_ext: list[tuple[tuple[str, str, int], OpSpec, bool]] = []
     seen_ext: set[tuple[str, str, int]] = set()
 
@@ -1413,6 +1699,7 @@ def _compose_dag_equations_and_ports(
         seen_int: set[str] = set()
         for prod_id, pname, ver in ports:
             if prod_id in member_ids:
+                consumed_ports[prod_id].add((pname, ver))
                 if prod_id not in seen_int:
                     internal_users[prod_id].append(op.op_id)
                     seen_int.add(prod_id)
@@ -1427,11 +1714,17 @@ def _compose_dag_equations_and_ports(
     for idx, (ek, op, is_mat) in enumerate(unique_ext):
         sym = "x" if len(unique_ext) == 1 else f"x{idx}"
         ext_sym[ek] = sym
-        sh = _op_input_shape(op, is_mat)
+        meta = dict(op.metadata) if op.metadata else {}
+        entry = _typed_input_entry(op, ek[0], ek[1], ek[2])
+        if entry is not None:
+            in_dt = str(entry.get("dtype") or _resolve_op_input_dtype(op, meta))
+            nbytes = float(entry.get("bytes", entry.get("nbytes", entry.get("byte_size", 0.0))) or 0.0)
+            sh = _shape_from_dims_or_bytes(entry.get("shape"), nbytes, in_dt) or _op_input_shape(op, is_mat)
+        else:
+            sh = _op_input_shape(op, is_mat)
+            in_dt = _resolve_op_input_dtype(op, meta)
         if sh:
-            meta = dict(op.metadata) if op.metadata else {}
-            in_dt = str(meta.get("activation_format") or meta.get("input_dtype") or op.dtype)
-            in_specs.append(FormulaTensorSpec(sym, sh, in_dt, "input"))
+            in_specs.append(FormulaTensorSpec(sym, sh, in_dt, "input", port=ek[1], version=ek[2]))
 
     live_out_ids = [
         op.op_id for op in ordered
@@ -1444,18 +1737,20 @@ def _compose_dag_equations_and_ports(
     temp_idx = 1
     out_idx = 0
     for op, info in zip(ordered, infos):
+        meta = dict(op.metadata) if op.metadata else {}
         if op.op_id in live_out_set:
             sym = "y" if len(live_out_ids) == 1 else f"y{out_idx}"
             out_idx += 1
             sym_by_id[op.op_id] = sym
-            sh = _op_output_shape(op, info[1])
-            if sh:
-                meta = dict(op.metadata) if op.metadata else {}
-                out_dt = str(meta.get("output_format") or meta.get("output_dtype") or op.dtype)
-                out_specs.append(FormulaTensorSpec(sym, sh, out_dt, "output"))
+            out_specs.extend(_op_declared_outputs(op, sym, info[1], meta))
         else:
-            sym_by_id[op.op_id] = f"t{temp_idx}"
+            sym = f"t{temp_idx}"
+            sym_by_id[op.op_id] = sym
             temp_idx += 1
+            consumed = consumed_ports[op.op_id]
+            for spec_out in _op_declared_outputs(op, sym, info[1], meta):
+                if (spec_out.port, spec_out.version) not in consumed:
+                    out_specs.append(spec_out)
 
     equations: list[str] = []
     for op, (kind, _is_mat, _is_red, act_kind, act_params) in zip(ordered, infos):
@@ -1487,7 +1782,7 @@ def _compose_dag_equations_and_ports(
                 meta["op_dtype"] = resolved_dt
         equations.append(_format_dag_equation(
             op.op_id, op.local_shape, kind, tuple(in_syms_list), sym_by_id[op.op_id],
-            output_dtype=str(meta.get("output_format") or op.dtype),
+            output_dtype=_resolve_op_output_dtype(op, meta),
             activation_kind=act_kind,
             activation_params=act_params,
             group_size=int(meta.get("group_size", 0) or 0),
@@ -1499,6 +1794,22 @@ def _compose_dag_equations_and_ports(
         if op.op_id not in live_out_set and internal_users[op.op_id]
     )
     return tuple(equations), tuple(in_specs), tuple(out_specs), elided_ids
+
+
+def _resolve_reduction_order_from_ops(ops: Sequence[OpSpec]) -> str:
+    """Resolve declared floating-point reduction order across absorbed atomic ops."""
+    found: list[tuple[str, str]] = []
+    for op in ops:
+        meta = dict(op.metadata) if op.metadata else {}
+        raw = str(meta.get("reduction_order") or "").strip()
+        if raw:
+            found.append((op.op_id, raw))
+    if not found:
+        return ""
+    unique = tuple(dict.fromkeys(val for _, val in found))
+    if len(unique) == 1:
+        return unique[0]
+    return ",".join(f"{oid}:{val}" for oid, val in found)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1524,6 +1835,7 @@ class FormulaKernelSpec:
     mte2_bytes_override: float | None = None
     mte3_bytes_override: float | None = None
     pipe_stages: tuple[PipeStageSpec, ...] = ()
+    reduction_order: str = ""
 
     def resolved_abi_signature(self) -> str:
         if self.abi_signature_id:
@@ -1532,11 +1844,13 @@ class FormulaKernelSpec:
             {
                 "name": self.name,
                 "equations": list(self.equations),
-                "inputs": [(t.name, list(t.shape), t.dtype) for t in self.inputs],
-                "outputs": [(t.name, list(t.shape), t.dtype) for t in self.outputs],
-                "weights": [(t.name, list(t.shape), t.dtype) for t in self.weights],
+                "inputs": [(t.name, list(t.shape), t.dtype, t.port, int(t.version)) for t in self.inputs],
+                "outputs": [(t.name, list(t.shape), t.dtype, t.port, int(t.version)) for t in self.outputs],
+                "weights": [(t.name, list(t.shape), t.dtype, t.port, int(t.version)) for t in self.weights],
                 "matrix_flops": [[dt, float(fl)] for dt, fl in self.matrix_flops],
                 "row_reduction": bool(self.row_reduction),
+                "uses_simt": bool(self.uses_simt),
+                "reduction_order": str(self.reduction_order),
                 "activation": self.activation,
                 "activation_params": [[k, float(v)] for k, v in self.activation_params],
             },
@@ -1556,6 +1870,8 @@ class FormulaKernelSpec:
         saved_read_bytes: float = 0.0,
         saved_write_bytes: float = 0.0,
         preserve_port_ids: Sequence[str] = (),
+        uses_simt: bool | None = None,
+        reduction_order: str = "",
     ) -> FormulaKernelSpec:
         """Construct a ``FormulaKernelSpec`` directly from absorbed atomic ``OpSpec``s."""
         ordered = tuple(ops)
@@ -1585,6 +1901,16 @@ class FormulaKernelSpec:
         )
         comp_eqs = tuple(equations) if equations else dag_eqs
         pipe_stages = _derive_pipe_stages_from_ops(ordered)
+        if uses_simt is None:
+            inferred_simt = any(
+                bool(m.get("uses_simt"))
+                or str(m.get("backend") or m.get("backend_target") or "").strip().lower()
+                in {"tilelang_simt", "tla_simt"}
+                for m in (dict(op.metadata) if op.metadata else {} for op in ordered)
+            )
+        else:
+            inferred_simt = bool(uses_simt)
+        eff_red_order = str(reduction_order or "").strip() or _resolve_reduction_order_from_ops(ordered)
         return cls(
             name=kernel_name,
             equations=comp_eqs,
@@ -1594,6 +1920,7 @@ class FormulaKernelSpec:
             vector_ops_fp32=vec_ops,
             link_bytes=link_b,
             row_reduction=row_red,
+            uses_simt=inferred_simt,
             atomic_ops=ordered,
             family="rewrite_fused",
             activation=acts[0] if acts else "",
@@ -1602,6 +1929,7 @@ class FormulaKernelSpec:
             mte2_bytes_override=mte2,
             mte3_bytes_override=mte3,
             pipe_stages=pipe_stages,
+            reduction_order=eff_red_order,
         )
 
 

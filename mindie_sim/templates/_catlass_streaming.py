@@ -45,26 +45,47 @@ STREAMING_PANEL_MICRO_THRESHOLD = 2048
 _WAVE_PANEL_BUDGET = 256
 #: Extra safety margin above max ring depth for zero-bubble K-chunk triggers.
 _RING_TRIGGER_MARGIN = 1
+_ANY_SINK_TRIGGER = ("__any_sink__",)
 
 
 class _StreamingReuseLifetimes:
-    """Retain unique template ReuseKeys across streaming windows until kernel finish."""
+    """Retain template ReuseKeys across streaming windows and release at last use."""
 
-    def __init__(self, state: AdmissionMemoryView) -> None:
+    def __init__(
+        self,
+        state: AdmissionMemoryView,
+        pending: Counter[ReuseKey] | None = None,
+    ) -> None:
         self.state = state
+        self.pending = pending
+        self.seen_counts: Counter[ReuseKey] = Counter()
         self.keys: dict[ReuseKey, tuple[ReuseKey, bool]] = {}
 
     def resolve(self, pattern):
         key = pattern.reuse_key
         if key is None:
             return pattern
+        self.seen_counts[key] += 1
         if key not in self.keys:
             resolved = self.state.resolve_reuse_key(key)
             self.keys[key] = (resolved, self.state.retain_template_key(resolved))
         return replace(pattern, reuse_key=self.keys[key][0])
 
     def complete(self, key: ReuseKey | None) -> None:
-        _ = key
+        if key is None or self.pending is None:
+            return
+        self.pending[key] -= 1
+        if self.pending[key] <= 0:
+            self.release(key)
+
+    def release(self, key: ReuseKey | None) -> None:
+        if key is None:
+            return
+        entry = self.keys.pop(key, None)
+        if entry is not None:
+            resolved, owned = entry
+            if owned:
+                self.state.release_template_key(resolved)
 
     def close(self) -> None:
         for resolved, owned in self.keys.values():
@@ -170,20 +191,39 @@ class _StreamingLowering(Lowering):
                 stage = replace(stage, acquire=acquire, free=free, after=stage.after or after)
             self.add(stage)
 
-    def flush_window(self, *, emit: bool = False) -> tuple[Stage, ...]:
+    def flush_window(
+        self, *, emit: bool = False, retire_keys: frozenset[ReuseKey] = frozenset(),
+    ) -> tuple[Stage, ...]:
         """Bind current window accesses, compact obligations, and release retired stages."""
         if not self.stages:
+            for key in retire_keys:
+                self._streaming_lifetimes.release(key)
             return ()
         stages = _ordered_window_stages(self.stages)
         if self.accesses:
+            retire_rem = Counter(
+                p.reuse_key for p in self.accesses.values()
+                if p.reuse_key is not None and p.reuse_key in retire_keys
+            )
             self.stages = []
             for stage in stages:
                 pattern = self.accesses.pop(stage.name, None)
-                self.add(
-                    self._bind_access(stage, pattern, self._streaming_lifetimes)
-                    if pattern is not None else stage
-                )
+                if pattern is not None:
+                    self.add(self._bind_access(stage, pattern, self._streaming_lifetimes))
+                    key = pattern.reuse_key
+                    if key is not None and key in retire_rem:
+                        retire_rem[key] -= 1
+                        if retire_rem[key] <= 0:
+                            self._streaming_lifetimes.release(key)
+                else:
+                    self.add(stage)
+            for key in retire_keys:
+                if key not in retire_rem:
+                    self._streaming_lifetimes.release(key)
             stages = tuple(self.stages)
+        else:
+            for key in retire_keys:
+                self._streaming_lifetimes.release(key)
         self.total_stages += len(stages)
         for st in stages:
             for role, amount in st.work.items():
@@ -213,9 +253,9 @@ def _ring_boundary_names(rings: Sequence[RingBuffer]) -> list[str]:
 
 
 def _emit_chunked_ordinary_wave(
-    lowerer, plan: _StreamingLowering, tiles: Sequence[Any], after: tuple[str, ...],
+    lowerer, plan: _StreamingLowering, tiles: Sequence[Any], tile_afters: Sequence[tuple[str, ...]],
     *, emit: bool,
-) -> Iterator[tuple[tuple[Stage, ...], frozenset[str], tuple[str, ...], tuple[str, ...]]]:
+) -> Iterator[tuple[tuple[Stage, ...], frozenset[str], tuple[str, ...], tuple[tuple[int, str], ...]]]:
     """Stream one wave of ordinary tiles in bounded K-panel chunks when K is deep."""
     from .catlass_lower import _compute_b, _cube_dtype, _issued_ops, _scale
 
@@ -225,7 +265,9 @@ def _emit_chunked_ordinary_wave(
     max_depth = max(s.stages)
     chunk_k = max(max_depth + 2, _WAVE_PANEL_BUDGET // max(1, len(tiles)))
     tile_states = []
-    for tile in tiles:
+    all_initial: set[str] = set()
+    for tile, t_after in zip(tiles, tile_afters):
+        all_initial.update(t_after)
         name = f"tile:{lowerer._tile_index}"
         lowerer._tile_index += 1
         core = tile.owner
@@ -243,21 +285,21 @@ def _emit_chunked_ordinary_wave(
             ), s.stages)
         )
         acc_credit = ring_credit(rings[4], 0)
-        previous: tuple[str, ...] = (*after, acc_credit)
+        previous: tuple[str, ...] = (*t_after, acc_credit)
         if s.has_bias:
             previous = (plan.access(
                 f"{name}:bias", p.c_id + ":bias", packed_bytes(tile.n, s.dtype_acc),
                 owner=core, pipe="mte2_aic", offset=packed_bytes(tile.col, s.dtype_acc), after=previous,
             ),)
-        tile_states.append([tile, name, rings, previous, 0])
+        tile_states.append([tile, name, rings, previous, 0, t_after])
 
     for k_start_panel in range(0, lowerer.gk, chunk_k):
         k_end_panel = min(lowerer.gk, k_start_panel + chunk_k)
         is_final_k = k_end_panel >= lowerer.gk
         triggers: list[str] = []
-        keep: set[str] = set(after)
+        keep: set[str] = set(all_initial)
         for st in tile_states:
-            tile, name, rings, previous, g = st
+            tile, name, rings, previous, g, t_after = st
             l1a, l1b, l0a, l0b, accum = rings
             core = tile.owner
             panel_mmas: list[str] = []
@@ -267,7 +309,7 @@ def _emit_chunked_ordinary_wave(
                 last_load = f"{name}:micro:{g + ceil_div(k_len, lowerer.micro_k) - 1}:loaded"
                 r1 = []
                 for operand, ring in (("a", l1a), ("b", l1b)):
-                    deps = lowerer._fill(f"{name}:k{panel}", tile, k_start, k_len, operand, after, ring, panel)
+                    deps = lowerer._fill(f"{name}:k{panel}", tile, k_start, k_len, operand, t_after, ring, panel)
                     r1.append(lower_generation(
                         ring, panel, "mte2", ("mte1",), producer_extra_after=deps,
                         consumer_extra_after={"mte1": (last_load,)},
@@ -301,7 +343,7 @@ def _emit_chunked_ordinary_wave(
             st[4] = g
             if not is_final_k:
                 for ring in rings:
-                    plan.add_ring_window(ring, after=after, release_slots=False)
+                    plan.add_ring_window(ring, after=t_after, release_slots=False)
                 keep.update(_ring_boundary_names(rings))
                 keep.update(previous)
                 trig_idx = max(0, len(panel_mmas) - 1 - max_depth - _RING_TRIGGER_MARGIN)
@@ -309,18 +351,27 @@ def _emit_chunked_ordinary_wave(
         if not is_final_k:
             yield plan.flush_window(emit=emit), frozenset(keep), tuple(triggers), ()
 
-    terminals: list[str] = []
-    for tile, name, rings, previous, _ in tile_states:
+    owner_terms: list[tuple[int, str]] = []
+    for tile, name, rings, previous, _, t_after in tile_states:
         accum = rings[4]
         event = lower_generation(
             accum, 0, "mma", ("fixpipe",), producer_extra_after=previous,
             consumer_extra_after={"fixpipe": (f"{name}:accumulator_consumed",)},
         )
-        terminals.append(lowerer.finish(tile, name, event.publish))
+        owner_terms.append((tile.owner, lowerer.finish(tile, name, event.publish)))
         for ring in rings:
-            plan.add_ring_window(ring, after=after, release_slots=True)
-    term_tuple = tuple(terminals)
-    yield plan.flush_window(emit=emit), frozenset(term_tuple), (), term_tuple
+            plan.add_ring_window(ring, after=t_after, release_slots=True)
+    term_names = frozenset(term for _, term in owner_terms)
+    yield plan.flush_window(emit=emit), term_names, _ANY_SINK_TRIGGER, tuple(owner_terms)
+
+
+def _expert_reuse_keys(die: int, spec, problem, group_index: int) -> tuple[ReuseKey, ...]:
+    b_alloc = f"{problem.b_id}:expert:{group_index}"
+    keys = [ReuseKey(die, b_alloc, problem.b_version, reuse_stream=f"{b_alloc}:{problem.b_version}")]
+    if spec.mx_scale_group:
+        s_alloc = f"{b_alloc}:scale"
+        keys.append(ReuseKey(die, s_alloc, 0, reuse_stream=f"{s_alloc}:0"))
+    return tuple(keys)
 
 
 def _iter_grouped_slice_windows(
@@ -330,6 +381,7 @@ def _iter_grouped_slice_windows(
     row_start, owner_done = 0, {}
     schedules = iter(grouped_start_cores(problem.groups, n_cols, lowerer.tm, lowerer.tn, cores))
     pending_count = 0
+    retire_keys: set[ReuseKey] = set()
     for rows in problem.groups:
         if not rows:
             continue
@@ -341,13 +393,16 @@ def _iter_grouped_slice_windows(
             )
             owner_done[tile.owner] = lowerer.ordinary(tile, (owner_done.get(tile.owner, launch),))
             pending_count += 1
+            if task_idx == loops - 1:
+                retire_keys.update(_expert_reuse_keys(plan.die, spec, problem, index))
             if pending_count >= cores:
                 keep = frozenset({launch, *owner_done.values()})
-                yield plan.flush_window(emit=emit), keep, ()
+                yield plan.flush_window(emit=emit, retire_keys=frozenset(retire_keys)), keep, _ANY_SINK_TRIGGER
+                retire_keys.clear()
                 pending_count = 0
         row_start += rows
-    if plan.stages:
-        yield plan.flush_window(emit=emit), frozenset(), ()
+    if plan.stages or retire_keys:
+        yield plan.flush_window(emit=emit, retire_keys=frozenset(retire_keys)), frozenset(), ()
 
 
 def _iter_catlass_windows(
@@ -362,8 +417,13 @@ def _iter_catlass_windows(
         launch = lowerer.zero_destination(launch)
     yield plan.flush_window(emit=emit), frozenset({launch}), ()
 
+    if s.dispatch_policy == "MatmulGatherScatterSimt":
+        lowerer.simt_gather_scatter((launch,))
+        yield plan.flush_window(emit=emit), frozenset(), ()
+        return
+
     blocks = ceil_div(p.m, lowerer.tm) * ceil_div(p.n, lowerer.tn)
-    cores = s.aic_budget
+    cores = s.aiv_budget if _is_simt_matrix(s) else s.aic_budget
     can_chunk_k = (
         s.dispatch_policy != "MmadPingpongMutex"
         and s.epilogue_kind != "grouped_swiglu_mx_quant"
@@ -373,7 +433,7 @@ def _iter_catlass_windows(
     def _run_normal_range(
         start: int, stop: int, after: tuple[str, ...], *, extra_keep: tuple[str, ...] = (),
     ) -> Iterator[tuple[Any, ...]]:
-        nonlocal wave_after
+        nonlocal wave_after, wave_owner_done
         if s.dispatch_policy == "MmadPingpongMutex":
             for first in range(start, stop, cores):
                 batch_end = min(first + cores, stop)
@@ -389,24 +449,33 @@ def _iter_catlass_windows(
                 for rings in lowerer.owner_rings.values():
                     keep.update(_ring_boundary_names(rings))
                 yield plan.flush_window(emit=emit), frozenset(keep), ()
+            wave_owner_done = dict(lowerer.fixpipe_tail)
             wave_after = tuple(lowerer.fixpipe_tail.values()) or after
             return
-        cur_after = after
+        owner_done: dict[int, str] = {}
         for first in range(start, stop, cores):
             tiles = tuple(lowerer.tile(i) for i in range(first, min(first + cores, stop)))
+            tile_afters = tuple(
+                (owner_done[tile.owner],) if tile.owner in owner_done else after for tile in tiles
+            )
             if can_chunk_k and len(tiles) * lowerer.gk > _WAVE_PANEL_BUDGET:
                 for w_stages, w_keep, w_trig, w_terms in _emit_chunked_ordinary_wave(
-                    lowerer, plan, tiles, cur_after, emit=emit,
+                    lowerer, plan, tiles, tile_afters, emit=emit,
                 ):
                     if w_terms:
-                        cur_after = w_terms
-                    yield w_stages, (w_keep | frozenset(extra_keep)) if extra_keep else w_keep, w_trig
+                        for owner_id, term_name in w_terms:
+                            owner_done[owner_id] = term_name
+                    merged_keep = w_keep | frozenset((*after, *owner_done.values(), *extra_keep))
+                    yield w_stages, merged_keep, w_trig
             else:
-                cur_after = tuple(lowerer.ordinary(tile, cur_after) for tile in tiles)
-                yield plan.flush_window(emit=emit), frozenset((*cur_after, *extra_keep)), ()
-        wave_after = cur_after
+                for tile, t_after in zip(tiles, tile_afters):
+                    owner_done[tile.owner] = lowerer.ordinary(tile, t_after)
+                yield plan.flush_window(emit=emit), frozenset((*after, *owner_done.values(), *extra_keep)), _ANY_SINK_TRIGGER
+        wave_owner_done = owner_done
+        wave_after = tuple(owner_done.values()) or after
 
     wave_after: tuple[str, ...] = (launch,)
+    wave_owner_done: dict[int, str] = {}
     if s.scheduler == "grouped_slice_m":
         yield from _iter_grouped_slice_windows(lowerer, plan, launch, s, p, cores, emit=emit)
         return
@@ -420,12 +489,12 @@ def _iter_catlass_windows(
                 return
             final = max(0, partition.b_norm - cores)
             yield from _run_normal_range(0, final, (launch,))
-            pre = wave_after
+            pre_by_owner = dict(wave_owner_done)
             stride = packed_bytes(lowerer.tn, s.dtype_acc)
             tile_bytes = lowerer.tm * stride
             part_names: list[str] = []
             for core, (st_idx, en_idx) in enumerate(partition.intervals):
-                c_after = pre
+                c_after = (pre_by_owner[core],) if core in pre_by_owner else (launch,)
                 for part in range(partition.partial_counts[core]):
                     block, panel = divmod(st_idx, lowerer.gk)
                     stop_idx = min(en_idx, (block + 1) * lowerer.gk)
@@ -435,43 +504,43 @@ def _iter_catlass_windows(
                     c_after = (parts[block][-1][1],)
                     part_names.append(c_after[0])
                     st_idx = stop_idx
-            keep = frozenset({*pre, *part_names})
+            keep = frozenset({launch, *pre_by_owner.values(), *part_names})
             yield plan.flush_window(emit=emit), keep, ()
             signal = plan.add(Stage(
                 "cross_core_set_flag", after=tuple(part_names),
                 metadata={"streamk_partial_count": partition.partial_count},
             ))
             yield plan.flush_window(emit=emit), frozenset({signal}), ()
-            # Stream tail normal waves and AIV partial reductions after the same signal
-            # without serializing AIV reductions behind the AIC tail wave.
-            tail_windows = list(_run_normal_range(final, partition.b_norm, (signal,), extra_keep=(signal,)))
-            if tail_windows:
-                for idx, (w_stages, w_keep, w_trig) in enumerate(tail_windows):
-                    if idx == len(tail_windows) - 1:
-                        yield w_stages, w_keep | frozenset({signal}), (signal,)
-                    else:
-                        yield w_stages, w_keep, w_trig
-        else:
-            base, rem = divmod(lowerer.gk, s.splitk_factor)
-            owner_done: dict[int, str] = {}
-            stride = packed_bytes(p.n, s.dtype_acc)
-            matrix_bytes = p.m * stride
-            total_tasks = s.splitk_factor * blocks
-            for first in range(0, total_tasks, cores):
-                for task_id in range(first, min(first + cores, total_tasks)):
-                    split, block = divmod(task_id, blocks)
-                    st_k = split * base + min(split, rem)
-                    en_k = st_k + base + (split < rem)
-                    owner = task_id % cores
-                    tile = replace(lowerer.tile(block), owner=owner)
-                    offset = split * matrix_bytes + tile.row * stride + packed_bytes(tile.col, s.dtype_acc)
-                    _partial(lowerer, parts, block, tile, range(st_k, en_k),
-                             (owner_done.get(owner, launch),), offset, stride)
-                    owner_done[owner] = parts[block][-1][1]
-                keep = frozenset({launch, *owner_done.values()})
-                yield plan.flush_window(emit=emit), keep, ()
-            signal = plan.add(Stage("cross_core_set_flag", after=tuple(owner_done.values())))
-            yield plan.flush_window(emit=emit), frozenset({signal}), ()
+            # Submit AIV partial reductions at t = signal with trigger=(signal,) so pump()
+            # immediately launches the AIC tail wave at the exact same t = signal in parallel.
+            block_keys = list(parts)
+            aiv_step = max(1, s.aiv_budget)
+            for first in range(0, len(block_keys), aiv_step):
+                batch = {b: parts[b] for b in block_keys[first:first + aiv_step]}
+                _reduce_partials(lowerer, batch, signal)
+                yield plan.flush_window(emit=emit), frozenset({signal}), (signal,)
+            yield from _run_normal_range(final, partition.b_norm, (signal,))
+            return
+        base, rem = divmod(lowerer.gk, s.splitk_factor)
+        owner_done: dict[int, str] = {}
+        stride = packed_bytes(p.n, s.dtype_acc)
+        matrix_bytes = p.m * stride
+        total_tasks = s.splitk_factor * blocks
+        for first in range(0, total_tasks, cores):
+            for task_id in range(first, min(first + cores, total_tasks)):
+                split, block = divmod(task_id, blocks)
+                st_k = split * base + min(split, rem)
+                en_k = st_k + base + (split < rem)
+                owner = task_id % cores
+                tile = replace(lowerer.tile(block), owner=owner)
+                offset = split * matrix_bytes + tile.row * stride + packed_bytes(tile.col, s.dtype_acc)
+                _partial(lowerer, parts, block, tile, range(st_k, en_k),
+                         (owner_done.get(owner, launch),), offset, stride)
+                owner_done[owner] = parts[block][-1][1]
+            keep = frozenset({launch, *owner_done.values()})
+            yield plan.flush_window(emit=emit), keep, _ANY_SINK_TRIGGER
+        signal = plan.add(Stage("cross_core_set_flag", after=tuple(owner_done.values())))
+        yield plan.flush_window(emit=emit), frozenset({signal}), ()
         block_keys = list(parts)
         for first in range(0, len(block_keys), max(1, s.aiv_budget)):
             batch = {b: parts[b] for b in block_keys[first:first + max(1, s.aiv_budget)]}
@@ -497,6 +566,7 @@ class _StreamingCatlassProgram:
     summary: FusedRegionSummary
     resource_work: tuple[tuple[str, float], ...] = ()
     burst_rules: tuple[Any, ...] = ()
+    reuse_counts: tuple[tuple[ReuseKey, int], ...] = ()
 
     def with_context(self, datapath, context) -> "_StreamingCatlassProgram":
         """Rebind runtime ``datapath`` and ``context``; re-lower summary on L2/access/burst change."""
@@ -552,7 +622,13 @@ class _StreamingCatlassProgram:
         pending_sinks: list[Any] = []
         delivered = Counter()
         obligations: dict[str, list[Any]] = {"read": [], "write": []}
-        live_lifetimes = _StreamingReuseLifetimes(self.live_state) if live_admission else None
+        live_lifetimes = (
+            _StreamingReuseLifetimes(
+                self.live_state,
+                pending=Counter(dict(self.reuse_counts)) if self.reuse_counts else None,
+            )
+            if live_admission else None
+        )
         window_idx = 0
 
         def scoped(items):
@@ -630,7 +706,13 @@ class _StreamingCatlassProgram:
             sinks = tuple(dict.fromkeys(
                 local_events[st.name] for st in stages if st.name not in consumed
             )) or (ready,)
-            if trigger_names:
+            if pending_sinks:
+                pending_sinks[:] = [ev for ev in pending_sinks if not ev.done]
+            any_wait = trigger_names == _ANY_SINK_TRIGGER
+            if any_wait:
+                wait_on = sinks
+                pending_sinks.extend(ev for ev in sinks if not ev.done)
+            elif trigger_names:
                 wait_on = tuple(dict.fromkeys(
                     local_events[k] if k in local_events else live_events[k]
                     for k in trigger_names
@@ -638,8 +720,6 @@ class _StreamingCatlassProgram:
                 pending_sinks.extend(ev for ev in sinks if not ev.done)
             else:
                 wait_on = sinks
-                if pending_sinks:
-                    pending_sinks[:] = [ev for ev in pending_sinks if not ev.done]
             next_live = {}
             for k in keep_names:
                 if k in local_events:
@@ -649,10 +729,25 @@ class _StreamingCatlassProgram:
             live_events.clear()
             live_events.update(next_live)
             local_events.clear()
-            engine.submit(
-                f"{name}:win{w_idx}:next", after=wait_on, owner=owner,
-                on_complete=pump, native_hook=True,
-            )
+            if (any_wait or trigger_names) and len(wait_on) > 1:
+                fired = False
+
+                def _wake_once(_e=None) -> None:
+                    nonlocal fired
+                    if not fired:
+                        fired = True
+                        pump()
+
+                for s_idx, ev in enumerate(wait_on):
+                    engine.submit(
+                        f"{name}:win{w_idx}:next{s_idx}", after=(ev,), owner=owner,
+                        on_complete=_wake_once, native_hook=True,
+                    )
+            else:
+                engine.submit(
+                    f"{name}:win{w_idx}:next", after=wait_on, owner=owner,
+                    on_complete=pump, native_hook=True,
+                )
 
         pump()
         return complete
@@ -717,5 +812,6 @@ def lower_catlass_streaming(
         live_state=plan.live_state, summary=summary,
         resource_work=tuple(sorted(plan.resource_work.items())),
         burst_rules=plan.burst_rules,
+        reuse_counts=tuple(plan._streaming_lifetimes.seen_counts.items()),
     )
     return TemplateLoweringResult(program, summary, plan.total_stages)

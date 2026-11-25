@@ -18,17 +18,19 @@ from typing import Any, Literal
 
 from mindie_sim.prediction.mechanism import Work
 from mindie_sim.prediction.physical_recipe_base import (
-    IO_HBM_CATEGORY, Phase, _resource_categories, io_weight, phased_program, tiled_phased_program,
+    IO_HBM_CATEGORY, Phase, _phase_amounts, _phase_caps, _resource_categories, _tile_count,
+    io_weight, phased_program, tiled_phased_program,
 )
+from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.program.binding import RecipeContext
-from mindie_sim.prediction.program.stages import KernelProgram, Stage
 from mindie_sim.prediction.runtime.engine import Engine
 from mindie_sim.prediction.runtime.engine_types import Resource
 from mindie_sim.prediction.runtime.l2_residency import _access_plan, cache_policy_for_arch, primitive_working_set_sweep
 from mindie_sim.prediction.runtime.memory_physics import (
     AddressRun, AddressRunPlan, AdmissionMemoryView, BoundAccess, BurstTurnRule, ByteLedger,
     ConstraintTerm, CounterTerm, HbmBusSpec,
-    MemoryAccessPattern, ReuseKey, SectorCoverage, VisibilityContract, bind_memory_access,
+    MemoryAccessPattern, ReuseKey, SectorCoverage, VisibilityContract, _merge_byte_intervals,
+    bind_memory_access,
 )
 from mindie_sim.prediction.runtime.ring_buffer import RingBuffer, lower_generation
 from mindie_sim.prediction.runtime.tile_solver import (
@@ -55,8 +57,9 @@ from .contracts import (
     EdgeRouteBinding, FormulaKernelEvaluation, FormulaKernelSpec, FuseRegionSpec, FusedRegionSummary,
     PipeStageSpec, SemanticWorkItem, TemplateLoweringResult, TensorRangeObligation, TileLangLoweringProfile,
     _derive_pipe_stages_from_equations, _derive_pipe_stages_from_ops, _external_reads,
-    _infer_op_symbolic_kind, _logical_obligation, _obligation_runs,
-    _record_produced, _region_order, _run_end, _split_entry_residency, _topological,
+    _infer_op_symbolic_kind, _logical_obligation, _obligation_runs, _op_port_edge_bytes,
+    _record_produced, _region_order, _resolve_op_input_dtype, _resolve_op_output_dtype,
+    _run_end, _split_entry_residency, _topological,
     _union_obligations, ceil_div, formula_elem_bytes,
 )
 from .fuse_region_live import _BoundTemplateProgram, _LiveAccess, _ReuseLifetimes, _rational_service
@@ -165,7 +168,8 @@ def solve_template_tile(
         family, (candidate,),
         simt_ub_carveout_bytes=simt_carveout,
         subtile_waves=datapath.subtile_wave,
-        active_l2_streams=streams, l2_reserved_bytes=reserved + existing, **options,
+        active_l2_streams=streams, l2_reserved_bytes=reserved + existing,
+        fused=candidate.fused, kernel_abi=candidate.kernel_abi, **options,
     )
     hw = SimpleNamespace(datapath=datapath, buffers=capacity, buffer_units={"l2": 1})
     solution = solve(pipeline, None, hw)
@@ -404,9 +408,15 @@ class Lowering:
         self.hits += ledger.l2_hit_bytes
         self.misses += ledger.dram_miss_copy_bytes
         if ledger.dram_sector_bytes:
+            curves_by_die = getattr(self.state, "_knee_curves_by_die", None)
+            has_knee = bool(
+                curves_by_die.get(self.die)
+                if curves_by_die is not None
+                else getattr(self.state, "_knee_curve", None)
+            )
             if ledger.dram_bus_transaction_bytes == ledger.dram_sector_bytes:
                 self.service += ledger.dram_sector_bytes
-            elif self.burst_rules and not self.state._knee_curve:
+            elif self.burst_rules and not has_knee:
                 resident = resident if ledger.l2_hit_bytes else SectorCoverage()
                 self.service += _rational_service(address_plan, resident, self.burst_rules)
             else:
@@ -592,13 +602,56 @@ def _route_publication(scope, i, edge):
     return f"{scope}:edge:{i}" + (":write" if edge.route_kind == "gm_spill" else "")
 
 
+def _aligned_buffer_bytes(buf: LiveBufferSpec) -> int:
+    align = max(1, int(buf.alignment_bytes))
+    return ceil_div(buf.bytes_per_owner, align) * align * buf.slots
+
+
+def _routed_owner_buffers(
+    backing_views: Mapping[tuple[str, int, str, str, int], list[tuple[int, int, int]]],
+    dest_by_owner: Mapping[tuple[str, str, int], list[LiveBufferSpec]],
+) -> tuple[LiveBufferSpec, ...]:
+    """Union alias byte intervals per backing and pick the aligned worst-case owner per (pool, axis)."""
+    by_pool_axis_owner: dict[tuple[str, str, int], list[LiveBufferSpec]] = defaultdict(list)
+    for (alloc_id, version, pool, axis, owner), entries in backing_views.items():
+        max_slots = max(slots for _, _, slots in entries)
+        layer_extents: list[int] = []
+        for slot_idx in range(max_slots):
+            intervals = [(lo, hi) for lo, hi, slots in entries if slots > slot_idx]
+            merged = _merge_byte_intervals(intervals)
+            layer_extents.append(sum(hi - lo for lo, hi in merged))
+        if len(set(layer_extents)) == 1:
+            by_pool_axis_owner[(pool, axis, owner)].append(LiveBufferSpec(
+                f"producer:{alloc_id}:{version}", pool, layer_extents[0], 0, 1,
+                owner_kind=axis, slots=max_slots,
+            ))
+        else:
+            for slot_idx, extent in enumerate(layer_extents):
+                by_pool_axis_owner[(pool, axis, owner)].append(LiveBufferSpec(
+                    f"producer:{alloc_id}:{version}:s{slot_idx}", pool, extent, 0, 1,
+                    owner_kind=axis, slots=1,
+                ))
+    for key, specs in dest_by_owner.items():
+        by_pool_axis_owner[key].extend(specs)
+    # Select the worst-case physical owner per (pool, axis) using aligned allocation footprints.
+    by_pool_axis: dict[tuple[str, str], list[list[LiveBufferSpec]]] = defaultdict(list)
+    for (pool, axis, _owner), specs in by_pool_axis_owner.items():
+        by_pool_axis[(pool, axis)].append(specs)
+    out: list[LiveBufferSpec] = []
+    for owner_lists in by_pool_axis.values():
+        worst = max(owner_lists, key=lambda items: sum(_aligned_buffer_bytes(b) for b in items))
+        out.extend(worst)
+    return tuple(out)
+
+
 def _route_region_edges(
     datapath, edges, edge_bytes, edge_owners, route_tiles, buffers, tile_count,
-    *, ub_limit: int | None = None,
+    *, ub_limit: int | None = None, alias_views: Mapping[str, tuple[str, int, int]] | None = None,
 ):
     routed = []
-    source_buffers = {}
-    source_slots: dict[tuple, int] = {}
+    backing_views: dict[tuple[str, int, str, str, int], list[tuple[int, int, int]]] = defaultdict(list)
+    dest_by_owner: dict[tuple[str, str, int], list[LiveBufferSpec]] = defaultdict(list)
+    views_map = alias_views or {}
     for idx, edge in enumerate(edges):
         size = edge_bytes.get(edge.view_id, 0)
         if type(size) is not int or size <= 0:
@@ -611,37 +664,59 @@ def _route_region_edges(
         routed.append((idx, edge, size, owners, route))
         if route is not None or edge.route_kind == "ub->ub":
             src_pool = edge.route_kind.split("->")[0]
-            key = (edge.src_op, edge.producer_version, src_pool, edge.src_owner_axis)
-            source_buffers[key] = max(source_buffers.get(key, 0), size)
+            view = views_map.get(edge.view_id)
+            if view is not None:
+                alloc_id, lo, hi = view
+                span = (int(lo), max(int(hi), int(lo) + size))
+            else:
+                alloc_id = f"{edge.src_op}:{edge.view_id}"
+                span = (0, size)
             if route is not None:
-                source_slots.setdefault(key, 1)
-                buffers += (LiveBufferSpec(
+                needed_slots = 1
+                dest_by_owner[(dest_pool, edge.dst_owner_axis, owners[1])].append(LiveBufferSpec(
                     f"edge:{idx}", dest_pool, size, 0, 1, owner_kind=edge.dst_owner_axis,
                     slots=tile_count if edge.iter_kind == "full_barrier" else edge.ring_depth,
-                ),)
+                ))
             else:
                 needed_slots = (
                     tile_count if edge.iter_kind == "full_barrier"
                     else max(1, min(tile_count, int(edge.ring_depth)))
                 )
-                source_slots[key] = max(source_slots.get(key, 1), needed_slots)
-    buffers += tuple(
-        LiveBufferSpec(
-            f"producer:{op}:{version}", pool, size, 0, 1,
-            owner_kind=axis, slots=source_slots.get((op, version, pool, axis), 1),
-        )
-        for (op, version, pool, axis), size in source_buffers.items()
-    )
+            key = (alloc_id, edge.producer_version, src_pool, edge.src_owner_axis, owners[0])
+            backing_views[key].append((span[0], span[1], needed_slots))
+    buffers += _routed_owner_buffers(backing_views, dest_by_owner)
     return routed, buffers
 
 
+def _make_pass_rings(routed, declarations, *, pass_idx: int, die: int, context) -> dict[int, RingBuffer]:
+    prefix = "" if pass_idx == 0 else f"p{pass_idx}:"
+    return {
+        i: RingBuffer(
+            die=die, owner=owners[-1], pool=edge.route_kind.split("->")[-1],
+            allocation=f"{prefix}edge:{i}", depth=edge.ring_depth,
+            slot_bytes=size if route is not None and context is not None else 0,
+        )
+        for i, edge, size, owners, route in routed
+        if edge.iter_kind != "full_barrier" and edge.src_op in declarations and edge.dst_op in declarations
+    }
+
+
 def _lower_region_passes(
-    plan, order, parents, routed, rings, units, op_stages, second, reads, writes,
-    semantic_work, initial, *, region_id, tile_count, context,
+    plan, order, parents, routed, units, op_stages, second, reads, writes,
+    semantic_work, initial, *, region_id, tile_count, context, die: int, launch: str,
 ):
-    releases, moved = _barrier_storage(routed, op_stages, context)
     passes = (op_stages, second) if second else (op_stages,)
+    last_pass_for_op = {
+        op: max(idx for idx, decls in enumerate(passes) if op in decls)
+        for op in order
+    }
     for pass_idx, declarations in enumerate(passes):
+        pass_routed = tuple(
+            item for item in routed
+            if item[1].src_op in declarations and item[1].dst_op in declarations
+        )
+        releases, moved = _barrier_storage(pass_routed, declarations, context)
+        rings = _make_pass_rings(pass_routed, declarations, pass_idx=pass_idx, die=die, context=context)
         completions = []
         for tile in range(tile_count):
             scope = f"p{pass_idx}:t{tile}"
@@ -651,11 +726,10 @@ def _lower_region_passes(
                 return tuple(replace(a, name=f"{scope}:{a.name}", pool=pools.get(a.pool, a.pool))
                              for a in allocations)
 
-            if not pass_idx:
-                for source, allocations in releases.items():
-                    publications = tuple(_route_publication(scope, i, edge) for i, edge, _, _, _ in routed
-                                         if edge.src_op == source and edge.iter_kind != "chunk_carried")
-                    plan.add(Stage(f"{scope}:{source}:released", after=publications, free=scoped(allocations.values())))
+            for source, allocations in releases.items():
+                publications = tuple(_route_publication(scope, i, edge) for i, edge, _, _, _ in pass_routed
+                                     if edge.src_op == source and edge.iter_kind != "chunk_carried")
+                plan.add(Stage(f"{scope}:{source}:released", after=publications, free=scoped(allocations.values())))
             final_names = {op: f"{scope}:{op}:done" for op in declarations}
             for op in order:
                 if op not in declarations:
@@ -663,26 +737,25 @@ def _lower_region_passes(
                 stage = declarations[op]
                 _validate_coupling(stage, units)
                 after = [*initial, *(final_names[p] for p in sorted(parents[op] | set(stage.after)) if p in declarations)]
-                for i, edge, size, owners, route in routed:
-                    if pass_idx or edge.dst_op != op:
+                for i, edge, size, owners, route in pass_routed:
+                    if edge.dst_op != op:
                         continue
                     src_tile = tile - 1 if edge.iter_kind == "chunk_carried" else tile
                     if src_tile < 0:
                         continue
                     src = f"p{pass_idx}:t{src_tile}:{edge.src_op}:done"
                     generation = src_tile
-                    credit = ()
-                    if i in rings:
-                        ring = rings[i]
-                        credit = (ring_credit(ring, generation),)
+                    credit = (ring_credit(rings[i], generation),) if i in rings else ()
                     name = f"{scope}:edge:{i}"
                     dependencies_for_route = (src, *credit)
                     if edge.route_kind == "gm_spill":
                         tensor = f"{region_id}:edge:{i}"
                         pipe = "fixpipe" if edge.src_owner_axis == "aic" else "mte3"
-                        spill = plan.access(name + ":write", tensor, size, direction="write", pipe=pipe,
-                                            after=dependencies_for_route, private=True, owner=owners[0], offset=src_tile * size)
-                        dep = spill
+                        dep = plan.access(
+                            name + ":write", tensor, size, direction="write", pipe=pipe,
+                            after=dependencies_for_route, private=True, owner=owners[0],
+                            offset=src_tile * size, version=pass_idx,
+                        )
                     elif route is not None:
                         owner = owners[0] if route.path.executor == edge.src_owner_axis else owners[1]
                         dep = plan.work(name, route.path.unit, size, after=dependencies_for_route, owner=owner)
@@ -695,8 +768,11 @@ def _lower_region_passes(
                         )
                         dep = plan.add(Stage(name + ":barrier", after=barrier_deps))
                     if edge.route_kind == "gm_spill":
-                        dep = plan.access(name + ":read", tensor, size, pipe=f"mte2_{edge.dst_owner_axis}",
-                                          after=(dep,), private=True, owner=owners[1], offset=src_tile * size)
+                        dep = plan.access(
+                            name + ":read", tensor, size, pipe=f"mte2_{edge.dst_owner_axis}",
+                            after=(dep,), private=True, owner=owners[1],
+                            offset=src_tile * size, version=pass_idx,
+                        )
                     if i in rings:
                         event = lower_generation(
                             rings[i], generation, "route", ("op",), producer_extra_after=(dep,),
@@ -704,19 +780,34 @@ def _lower_region_passes(
                         )
                         dep = event.publish
                     after.append(dep)
+                if pass_idx > 0:
+                    for i, edge, size, owners, _ in routed:
+                        if edge.dst_op != op or edge.src_op in declarations or edge.route_kind != "gm_spill":
+                            continue
+                        src_tile = tile - 1 if edge.iter_kind == "chunk_carried" else tile
+                        if src_tile < 0:
+                            continue
+                        after.append(plan.access(
+                            f"{scope}:edge:{i}:read", f"{region_id}:edge:{i}", size,
+                            pipe=f"mte2_{edge.dst_owner_axis}", after=tuple(initial),
+                            private=True, owner=owners[1], offset=src_tile * size, version=0,
+                        ))
                 for index, obligation in enumerate(reads.get(op, ())):
                     if obligation.initial_residency == "onchip_resident":
                         continue
                     after.append(_obligation_access(plan, scope, op, index, obligation, tile, tile_count, "read", tuple(after)))
                 stage = _bind_declared_work(plan, stage, semantic_work)
-                freed = tuple(a for a in stage.free if pass_idx or (op, a.name) not in moved)
+                freed = tuple(a for a in stage.free if (op, a.name) not in moved)
                 run = plan.add(replace(stage, name=f"{scope}:{op}", after=tuple(dict.fromkeys(after)),
                                        acquire=scoped(stage.acquire), free=scoped(freed)))
                 done = [run]
-                if pass_idx == len(passes) - 1:
+                if pass_idx == last_pass_for_op[op]:
                     for index, obligation in enumerate(writes.get(op, ())):
                         done.append(_obligation_access(plan, scope, op, index, obligation, tile, tile_count, "write", (run,)))
                 completions.append(plan.add(Stage(final_names[op], after=tuple(done))))
+        ring_after = (launch,) if pass_idx == 0 else initial
+        for ring in rings.values():
+            plan.add_ring(ring, after=ring_after)
         if len(passes) > 1 and pass_idx == 0:
             initial = (plan.add(Stage("first_pass_complete", after=tuple(completions))),)
 
@@ -770,9 +861,17 @@ def compile_fuse_region(
         raise ModelingError("fuse_region_two_pass_work_required")
     if any(s.previous or s.program is not None for s in second.values()):
         raise ModelingError("fuse_region_per_tile_stage_required")
-    for stage in (*op_stages.values(), *second.values()):
+    for op_id, stage in (*op_stages.items(), *second.items()):
         if stage.after and not set(stage.after) <= set(order):
             raise ModelingError("fuse_region_stage_dependency_unknown")
+        st_meta = stage.metadata or {}
+        orig_ro = str(st_meta.get("reduction_order") or "").strip()
+        if orig_ro and not bool(st_meta.get("relaxed_numerics")):
+            fused_ro = str(st_meta.get("fused_reduction_order") or "").strip()
+            if (fused_ro and fused_ro != orig_ro) or (
+                reduction_class == "row_split_2pass" and op_id in second and orig_ro == "left_to_right"
+            ):
+                raise ModelingError("fuse_region_numerical_equivalence_failed")
 
     tl_profile: TileLangLoweringProfile | None = None
     tl_cal: TileLangCalibration | None = None
@@ -803,6 +902,7 @@ def compile_fuse_region(
     routed, buffers = _route_region_edges(
         datapath, edges, edge_bytes, edge_owners, route_tiles, buffers, tile_count,
         ub_limit=tl_profile.ub_ceiling_bytes if tl_profile is not None else None,
+        alias_views=alias_views,
     )
     has_cube_stage = any(
         role in {"cube", "matrix"}
@@ -813,10 +913,11 @@ def compile_fuse_region(
         "aic" if (tl_profile is not None and has_cube_stage)
         else ("aiv" if resolved_backend in {"dsl_vec", "tla_simt", "tilelang_simt", "tilelang_simd"} else "aic")
     )
+    owner_count = datapath.aiv_count if owner_axis == "aiv" else datapath.aic_count
     solution = solve_template_tile(datapath, region_id, TileCandidate(
         reduction_class, tile_shape, max((e.ring_depth for e in edges), default=1),
-        (datapath.aic_count, datapath.aiv_count), tile_count, ceil_div(tile_count, max(1, datapath.aic_count)),
-        buffers, uses_simt=uses_simt, owner_axis=owner_axis,
+        (datapath.aic_count, datapath.aiv_count), tile_count, ceil_div(tile_count, max(1, owner_count)),
+        buffers, uses_simt=uses_simt, owner_axis=owner_axis, fused=True,
     ), state=memory_view, die=die, reserved=l2_reservation_bytes, tilelang_profile=tl_profile)
     reads = dict(reads_by_op) if reads_by_op is not None else {order[0]: live_in_obligations}
     writes = dict(writes_by_op) if writes_by_op is not None else {order[-1]: live_out_obligations}
@@ -841,12 +942,6 @@ def compile_fuse_region(
         plan.l2_reservation = (die, l2_reservation_bytes, datapath.usable_bytes("l2"))
     launch = plan.launch()
     initial = plan._writebacks("reservation", (launch,))
-    rings = {
-        i: RingBuffer(die=die, owner=owners[-1], pool=edge.route_kind.split("->")[-1],
-                      allocation=f"edge:{i}", depth=edge.ring_depth,
-                      slot_bytes=size if route is not None and context is not None else 0)
-        for i, edge, size, owners, route in routed if edge.iter_kind != "full_barrier"
-    }
     units = {**dict.fromkeys(_AIC_RESOURCES, datapath.aic_count),
              **dict.fromkeys(_AIV_RESOURCES, datapath.aiv_count), **(resource_units or {})}
     if context is not None:
@@ -854,11 +949,10 @@ def compile_fuse_region(
     plan.reads.extend(read_ranges)
     plan.writes.extend(write_ranges)
     _lower_region_passes(
-        plan, order, parents, routed, rings, units, op_stages, second, reads, writes,
-        semantic_work, initial, region_id=region_id, tile_count=tile_count, context=context,
+        plan, order, parents, routed, units, op_stages, second, reads, writes,
+        semantic_work, initial, region_id=region_id, tile_count=tile_count,
+        context=context, die=die, launch=launch,
     )
-    for ring in rings.values():
-        plan.add_ring(ring, after=(launch,))
     return spec, plan.result("K3", region_id, order, spec, semantic_work, solution)
 
 
@@ -1081,8 +1175,8 @@ class FusedPipelineRecipe:
         return replace(context, service_modes=updated_modes)
 
     def _lower_dag_pipe_stages(
-        self, categories: set[str], has_load: bool,
-    ) -> tuple[list[Phase], tuple[str, ...]]:
+        self, categories: set[str], has_load: bool, *, split_load: bool = False,
+    ) -> tuple[list[Phase], tuple[str, ...], bool]:
         """Emit compute/communication ``Phase`` DAG preserving true operand-DAG order."""
         active_kinds: set[str] = set()
         if categories & {"cube", "mte1"}:
@@ -1091,8 +1185,9 @@ class FusedPipelineRecipe:
             active_kinds.add("vector")
         if "link" in categories:
             active_kinds.add("link")
+        default_loads = ("mte2_aic_load", "mte2_aiv_load") if split_load else (("mte2_load",) if has_load else ())
         if not active_kinds:
-            return [], ("mte2_load",) if has_load else ()
+            return [], default_loads, False
 
         raw_stages: list[PipeStageSpec] = list(self.pipe_stages)
         if not raw_stages:
@@ -1134,8 +1229,25 @@ class FusedPipelineRecipe:
                 tail_names = (st_extra.name,)
 
         share_totals: dict[str, float] = defaultdict(float)
+        kind_by_name = {st.name: st.pipe_kind for st in active_stages}
         for st in active_stages:
             share_totals[st.pipe_kind] += max(0.0, float(st.share))
+
+        handoff_targets = [
+            st for st in active_stages
+            if "fixpipe" in categories and st.pipe_kind == "vector"
+            and any(kind_by_name.get(p) == "cube" for p in eff_preds.get(st.name, ()))
+        ]
+        handoff_names = {st.name for st in handoff_targets}
+        fixpipe_used_in_handoff = bool(handoff_targets)
+        raw_fp_total = sum(max(0.0, float(st.fixpipe_share)) for st in handoff_targets)
+        handoff_weights = {
+            st.name: (
+                (max(0.0, float(st.fixpipe_share)) / raw_fp_total)
+                if raw_fp_total > 0.0 else (1.0 / float(len(handoff_targets)))
+            )
+            for st in handoff_targets
+        }
 
         phases: list[Phase] = []
         term_name: dict[str, str] = {}
@@ -1143,15 +1255,32 @@ class FusedPipelineRecipe:
         for st in active_stages:
             total = share_totals[st.pipe_kind]
             norm_share = (max(0.0, float(st.share)) / total) if total > 0.0 else (1.0 / len(active_stages))
-            preds = tuple(dict.fromkeys(term_name[p] for p in eff_preds.get(st.name, ()) if p in term_name))
-            used_as_pred.update(p for p in eff_preds.get(st.name, ()) if p in term_name)
+            raw_preds = eff_preds.get(st.name, ())
+            preds = tuple(dict.fromkeys(term_name[p] for p in raw_preds if p in term_name))
+            used_as_pred.update(p for p in raw_preds if p in term_name)
             if not preds and has_load:
-                preds = ("mte2_load",)
+                if split_load:
+                    preds = (
+                        ("mte2_aic_load",) if st.pipe_kind == "cube"
+                        else (("mte2_aiv_load",) if st.pipe_kind == "vector" else ("mte2_aic_load", "mte2_aiv_load"))
+                    )
+                else:
+                    preds = ("mte2_load",)
             if st.pipe_kind == "cube":
                 cube_w = {role: norm_share for role in ("cube", "mte1") if role in categories}
                 phases.append(Phase(st.name, cube_w, after=preds))
                 term_name[st.name] = st.name
             elif st.pipe_kind == "vector":
+                if st.name in handoff_names:
+                    cube_preds = tuple(dict.fromkeys(
+                        term_name[p] for p in raw_preds if p in term_name and kind_by_name.get(p) == "cube"
+                    ))
+                    other_preds = tuple(p for p in preds if p not in cube_preds)
+                    fp_name = "fixpipe_handoff" if len(handoff_names) == 1 else f"{st.name}_fixpipe"
+                    phases.append(Phase(fp_name, {"fixpipe": handoff_weights[st.name]}, after=cube_preds))
+                    preds = tuple(dict.fromkeys((*other_preds, fp_name)))
+                if split_load and not any(kind_by_name.get(p) == "vector" for p in raw_preds):
+                    preds = tuple(dict.fromkeys((*preds, "mte2_aiv_load")))
                 if st.row_reduction:
                     r_name = "aiv_reduce" if st.name == "aiv_fp32" else f"{st.name}_reduce"
                     e_name = "aiv_epilogue" if st.name == "aiv_fp32" else f"{st.name}_epilogue"
@@ -1165,9 +1294,58 @@ class FusedPipelineRecipe:
                 phases.append(Phase(st.name, {"link": norm_share}, after=preds))
                 term_name[st.name] = st.name
         sinks = tuple(dict.fromkeys(term_name[st.name] for st in active_stages if st.name not in used_as_pred))
-        return phases, sinks or (("mte2_load",) if has_load else ())
+        return phases, sinks or default_loads, fixpipe_used_in_handoff
 
-    def lower(self, context: RecipeContext) -> KernelProgram:
+    def _lower_split_mte2(
+        self, context: RecipeContext, base_phases: Sequence[Phase],
+        aic_name: str, aiv_name: str, cap: int,
+    ) -> KernelProgram | PipelineProgram:
+        """Emit independent ``mte2_aic_load`` and ``mte2_aiv_load`` phases without cross-gating."""
+        base_amounts = _phase_amounts(context, base_phases)
+        load_amt = base_amounts[0]
+        w_aic = float(load_amt.get(aic_name, 0.0))
+        w_aiv = float(load_amt.get(aiv_name, 0.0))
+        aic_work: dict[str, float] = {aic_name: w_aic}
+        aiv_work: dict[str, float] = {aiv_name: w_aiv}
+        w_sum = w_aic + w_aiv
+        for rname, val in load_amt.items():
+            if rname in {aic_name, aiv_name} or val <= 0.0:
+                continue
+            part_aic = val * (w_aic / w_sum) if w_sum > 0.0 else 0.0
+            part_aiv = val - part_aic
+            if part_aic > 0.0:
+                aic_work[rname] = part_aic
+            if part_aiv > 0.0:
+                aiv_work[rname] = part_aiv
+        final_phases = (Phase("mte2_aic_load", {}), Phase("mte2_aiv_load", {}), *base_phases[1:])
+        final_amounts = [aic_work, aiv_work, *base_amounts[1:]]
+        count = _tile_count(context, cap=cap)
+        if count <= 1:
+            caps = _phase_caps(context, final_amounts, pipelined=False)
+            stages = tuple(
+                Stage(ph.name, {k: v for k, v in amt.items() if v > 0.0},
+                      after=ph.after, caps=cp, keep_empty=True)
+                for ph, amt, cp in zip(final_phases, final_amounts, caps)
+            )
+            return KernelProgram(stages, minimum_ms=context.minimum_ms)
+        eff_slots = max(1, int(self.slots))
+        pipelined = eff_slots > 1
+        head_caps = _phase_caps(context, final_amounts, pipelined=pipelined, tile_index=0, tile_count=count)
+        mid_caps = _phase_caps(context, final_amounts, pipelined=pipelined, tile_index=1, tile_count=count)
+        tail_caps = _phase_caps(context, final_amounts, pipelined=pipelined, tile_index=count - 1, tile_count=count)
+
+        def tile(index: int) -> list[Stage]:
+            tile_caps = head_caps if index == 0 else (tail_caps if index == count - 1 else mid_caps)
+            frac = float(index + 1) / count - float(index) / count
+            return [
+                Stage(ph.name, {k: v * frac for k, v in amt.items() if v > 0.0},
+                      after=ph.after, caps=cp, keep_empty=True)
+                for ph, amt, cp in zip(final_phases, final_amounts, tile_caps)
+            ]
+
+        return PipelineProgram(count, tile, slots=eff_slots, minimum_ms=context.minimum_ms)
+
+    def lower(self, context: RecipeContext) -> KernelProgram | PipelineProgram:
         """Lower declared physical work into a finite multi-pipe tile pipeline."""
         categories = set(_resource_categories(context).values())
         if not categories:
@@ -1176,11 +1354,22 @@ class FusedPipelineRecipe:
         write_share = io_weight(context, "hbm_write")
         if read_share + write_share <= 0.0:
             read_share = write_share = _HALF_SPLIT_RATIO
+        aic_mte2 = context.resource_names.get("mte2_aic", "")
+        aiv_mte2 = context.resource_names.get("mte2_aiv", "")
+        split_load = bool(
+            aic_mte2 and aiv_mte2 and aic_mte2 != aiv_mte2
+            and float(context.work.get(aic_mte2, 0.0)) > 0.0
+            and float(context.work.get(aiv_mte2, 0.0)) > 0.0
+        )
         phases: list[Phase] = []
         has_load = bool(categories & {"hbm", "mte2"}) and (read_share > 0.0 or "mte2" in categories)
-        has_store = bool(categories & {"hbm", "mte3", "fixpipe"}) and (
-            write_share > 0.0 or bool(categories & {"mte3", "fixpipe"})
+        pipe_phases, store_preds, fixpipe_in_handoff = self._lower_dag_pipe_stages(
+            categories, has_load, split_load=split_load,
         )
+        store_has_fixpipe = "fixpipe" in categories and not fixpipe_in_handoff
+        has_store = bool(categories & {"hbm", "mte3"}) and (
+            write_share > 0.0 or "mte3" in categories
+        ) or store_has_fixpipe
         if has_load:
             load_w: dict[str, float] = {}
             if "hbm" in categories and read_share > 0.0:
@@ -1188,7 +1377,6 @@ class FusedPipelineRecipe:
             if "mte2" in categories:
                 load_w["mte2"] = 1.0
             phases.append(Phase("mte2_load", load_w))
-        pipe_phases, store_preds = self._lower_dag_pipe_stages(categories, has_load)
         phases.extend(pipe_phases)
         if has_store:
             store_w: dict[str, float] = {}
@@ -1198,13 +1386,15 @@ class FusedPipelineRecipe:
                     store_w[IO_HBM_CATEGORY] = hbm_w
             if "mte3" in categories:
                 store_w["mte3"] = 1.0
-            if "fixpipe" in categories:
+            if store_has_fixpipe:
                 store_w["fixpipe"] = 1.0
             if store_w:
                 phases.append(Phase("mte3_store", store_w, after=store_preds))
         if not phases:
             return phased_program(context, ())
         cap = self.tile_count if self.tile_count > 0 else self.tile_cap
+        if split_load and has_load:
+            return self._lower_split_mte2(context, phases, aic_mte2, aiv_mte2, cap)
         return tiled_phased_program(context, tuple(phases), slots=max(1, int(self.slots)), cap=cap)
 
 
@@ -1411,10 +1601,10 @@ def _formula_row_sram_bytes(spec: FormulaKernelSpec) -> tuple[bool, bool, int, i
     ext_first_use: dict[tuple[str, str, int], int] = {}
     ext_last_use: dict[tuple[str, str, int], int] = {}
     ext_row_bytes: dict[tuple[str, str, int], int] = {}
-    for idx, (op, (_kind, is_mat, is_red, _act, _params)) in enumerate(zip(spec.atomic_ops, infos)):
+    for idx, (op, (kind, is_mat, is_red, _act, _params)) in enumerate(zip(spec.atomic_ops, infos)):
         meta = dict(op.metadata) if op.metadata else {}
-        in_dt = str(meta.get("activation_format") or meta.get("input_dtype") or op.dtype)
-        out_dt = str(meta.get("output_format") or meta.get("output_dtype") or op.dtype)
+        in_dt = _resolve_op_input_dtype(op, meta)
+        out_dt = _resolve_op_output_dtype(op, meta)
         op_in_raw = formula_elem_bytes(in_dt)
         op_out_raw = formula_elem_bytes(out_dt)
         in_b = max(in_b, op_in_raw)
@@ -1449,7 +1639,14 @@ def _formula_row_sram_bytes(spec: FormulaKernelSpec) -> tuple[bool, bool, int, i
         op_out_row_bytes.append(int(op_out_n * op_out_raw))
         if is_red:
             internal_red_widths.append(op_out_n)
-            op_work_bytes.append(int(op_out_n * (op_in_b + op_out_b + float(FP32_BYTES))))
+            declared_tiles = meta.get("native_norm_fp32_working_tiles")
+            if isinstance(declared_tiles, int) and not isinstance(declared_tiles, bool) and declared_tiles > 0:
+                fp32_working_tiles = declared_tiles
+            elif kind in {"add_rmsnorm", "add_rmsnorm_quant"} and op_in_raw < float(FP32_BYTES):
+                fp32_working_tiles = 2
+            else:
+                fp32_working_tiles = 1
+            op_work_bytes.append(int(op_out_n * (op_in_b + op_out_b + float(fp32_working_tiles) * float(FP32_BYTES))))
         else:
             internal_aiv_widths.append(op_out_n)
             op_work_bytes.append(int(op_out_n * (op_in_b + op_out_b)) if has_row_red else 0)
@@ -1516,7 +1713,8 @@ def solve_formula_sram(
     carveout = max(0, int(datapath.simt_ub_carveout_bytes or 0))
     ub_raw = int(bufs.get("ub", 0) or 0)
     ub_budget = max(0, ub_raw - carveout)
-    l1_budget = int(bufs.get("l1", 0) or 0)
+    is_fused = len(spec.atomic_ops) > 1 or spec.family == "rewrite_fused"
+    l1_budget = int(datapath.usable_bytes("l1", kernel={"fused": is_fused}) or bufs.get("l1", 0) or 0)
     l0_budget = int(bufs.get("l0c", 0) or 0)
     has_cube, has_aiv, tile_n, row_fp32_bytes, l1_tile, l0_tile = _formula_row_sram_bytes(spec)
 
@@ -1563,8 +1761,12 @@ def solve_formula_sram(
             buffers=tuple(live),
             uses_simt=cand_simt,
             owner_axis="aic" if (has_cube and not has_aiv) else "aiv",
+            fused=is_fused,
         ))
-    tile_spec = TilePipelineSpec(spec.family or "formula_kernel", tuple(candidates), simt_ub_carveout_bytes=carveout)
+    tile_spec = TilePipelineSpec(
+        spec.family or "formula_kernel", tuple(candidates),
+        simt_ub_carveout_bytes=carveout, fused=is_fused,
+    )
     hw = SimpleNamespace(
         datapath=eff_dp,
         buffers=eff_bufs,
@@ -1621,6 +1823,75 @@ def _resolve_formula_work_bytes(spec: FormulaKernelSpec) -> tuple[float, float, 
     return max(0.0, mte2), max(0.0, mte3), max(0.0, hbm), max(0.0, vec_ops)
 
 
+def _resolve_formula_owner_pipes(
+    spec: FormulaKernelSpec,
+    datapath: DatapathCapabilitySpec,
+    mte2: float,
+) -> tuple[float, float, float]:
+    """Split ``mte2`` across ``(mte2_aic, mte2_aiv)`` and compute resident L0C->UB ``fixpipe`` bytes."""
+    from .contracts import _extract_op_operand_ports
+
+    ops = spec.atomic_ops
+    if not ops:
+        has_cube = any(fl > 0.0 for _, fl in spec.matrix_flops)
+        return (mte2, 0.0, 0.0) if has_cube else (0.0, mte2, 0.0)
+    is_mat = {op.op_id: _infer_op_symbolic_kind(op)[1] for op in ops}
+    if not (any(is_mat.values()) and any(not v for v in is_mat.values())):
+        return (mte2, 0.0, 0.0) if any(is_mat.values()) else (0.0, mte2, 0.0)
+    by_id = {op.op_id: op for op in ops}
+    raw_aic = sum(float(op.mte2_bytes or 0.0) for op in ops if is_mat[op.op_id])
+    raw_aiv = sum(float(op.mte2_bytes or 0.0) for op in ops if not is_mat[op.op_id])
+    saved_read = max(0.0, (raw_aic + raw_aiv) - mte2)
+    aiv_handoff = 0.0
+    cube_to_vec_handoff = 0.0
+    cube_prod_rem = {
+        op.op_id: float(op.mte3_bytes or 0.0) for op in ops if is_mat[op.op_id]
+    }
+    for op in ops:
+        if is_mat[op.op_id]:
+            continue
+        c_edges = 0.0
+        v_edges = 0.0
+        for prod_id, pname, ver in _extract_op_operand_ports(op):
+            src = by_id.get(prod_id)
+            if src is None:
+                continue
+            edge_b = _op_port_edge_bytes(src, op, pname, ver, src_is_matrix=is_mat[prod_id])
+            if edge_b <= 0.0:
+                continue
+            if is_mat[prod_id]:
+                avail = cube_prod_rem.get(prod_id, 0.0)
+                used = min(edge_b, avail) if avail > 0.0 else edge_b
+                if avail > 0.0:
+                    cube_prod_rem[prod_id] = max(0.0, avail - used)
+                c_edges += used
+            else:
+                v_edges += edge_b
+        op_in_cap = float(op.mte2_bytes or 0.0)
+        tot_edges = c_edges + v_edges
+        if op_in_cap > 0.0 and tot_edges > op_in_cap:
+            ratio = op_in_cap / tot_edges
+            c_edges *= ratio
+            v_edges *= ratio
+            tot_edges = op_in_cap
+        aiv_handoff += tot_edges
+        cube_to_vec_handoff += c_edges
+    aiv_saved = min(raw_aiv, aiv_handoff, saved_read)
+    aic_saved = min(raw_aic, max(0.0, saved_read - aiv_saved))
+    rem_saved = max(0.0, saved_read - aiv_saved - aic_saved)
+    mte2_aiv = max(0.0, raw_aiv - aiv_saved - rem_saved)
+    mte2_aic = max(0.0, mte2 - mte2_aiv)
+    if datapath.has_l0c_to_ub and cube_to_vec_handoff > 0.0 and aiv_saved > 0.0:
+        fixpipe_b = (
+            cube_to_vec_handoff * (aiv_saved / aiv_handoff)
+            if aiv_handoff > 0.0 and aiv_saved < aiv_handoff
+            else min(cube_to_vec_handoff, aiv_saved)
+        )
+    else:
+        fixpipe_b = 0.0
+    return mte2_aic, mte2_aiv, fixpipe_b
+
+
 def _build_formula_engine_inputs(
     spec: FormulaKernelSpec,
     rates: Mapping[str, float],
@@ -1669,15 +1940,19 @@ def _build_formula_engine_inputs(
     else:
         hbm_rate = max(hbm_read_bps, hbm_write_bps, fallback_hbm)
     vec_rate = float(rates.get("vector") or 0.0) * aiv_scale
-    mte2_key = "mte2_aic" if (has_cube and "mte2_aic" in rates) else ("mte2_aiv" if "mte2_aiv" in rates else "mte2")
-    mte2_rate = float(rates.get(mte2_key) or hbm_rate or 0.0) * (aic_scale if mte2_key == "mte2_aic" else aiv_scale)
+    mte2_aic_rate = float(rates.get("mte2_aic") or rates.get("mte2") or hbm_rate or 0.0) * aic_scale
+    mte2_aiv_rate = float(rates.get("mte2_aiv") or rates.get("mte2") or hbm_rate or 0.0) * aiv_scale
     mte3_rate = float(rates.get("mte3") or hbm_rate or 0.0) * aiv_scale
+    fixpipe_rate = float(rates.get("fixpipe") or hbm_rate or 0.0) * aic_scale
     if hbm > 0.0 and hbm_rate <= 0.0:
         raise ModelingError("formula_kernel_hbm_rate_missing")
     if vec_ops > 0.0 and vec_rate <= 0.0:
         raise ModelingError("formula_kernel_vector_rate_missing")
     if spec.link_bytes > 0.0 and fabric_rate <= 0.0:
         raise ModelingError("formula_kernel_link_rate_missing")
+
+    mte2_aic_b, mte2_aiv_b, fixpipe_b = _resolve_formula_owner_pipes(spec, datapath, mte2)
+    split_mte2 = mte2_aic_b > 0.0 and mte2_aiv_b > 0.0
 
     res_list: list[Resource] = [Resource("matrix@0", 1.0, "peak_ms", "fair", aic_eff)]
     res_names: dict[str, str] = {"cube": "matrix@0"}
@@ -1688,13 +1963,21 @@ def _build_formula_engine_inputs(
     if cube_ms > 0.0:
         work_map["matrix@0"] = cube_ms
         native_work["cube"] = total_flops
-    pipe_rows = (
+    pipe_rows: list[tuple[str, str, float, str, int, float]] = [
         ("hbm", "memory@0", hbm_rate, "bytes", 1, hbm),
-        ("mte2", "mte2@0", mte2_rate, "bytes", aic_eff if has_cube else aiv_eff, mte2),
         ("mte3", "mte3@0", mte3_rate, "bytes", aiv_eff, mte3),
         ("vector", "vector@0", vec_rate, "ops", aiv_eff, vec_ops),
         ("link", "link:0", fabric_rate, "bytes", 1, float(spec.link_bytes)),
-    )
+    ]
+    mte2_rate = mte2_aic_rate if (mte2_aic_b > 0.0 or (has_cube and mte2_aiv_b <= 0.0)) else mte2_aiv_rate
+    if split_mte2:
+        pipe_rows.append(("mte2_aic", "mte2_aic@0", mte2_aic_rate, "bytes", aic_eff, mte2_aic_b))
+        pipe_rows.append(("mte2_aiv", "mte2_aiv@0", mte2_aiv_rate, "bytes", aiv_eff, mte2_aiv_b))
+    else:
+        use_aic_mte2 = mte2_aic_b > 0.0 or (has_cube and mte2_aiv_b <= 0.0)
+        pipe_rows.append(("mte2", "mte2@0", mte2_rate, "bytes", aic_eff if use_aic_mte2 else aiv_eff, mte2))
+    if fixpipe_b > 0.0:
+        pipe_rows.append(("fixpipe", "fixpipe@0", fixpipe_rate, "bytes", aic_eff, fixpipe_b))
     for role, rname, rate_s, unit, units, amount in pipe_rows:
         if rate_s <= 0.0 or (role == "link" and amount <= 0.0):
             continue
@@ -1710,8 +1993,18 @@ def _build_formula_engine_inputs(
         "cube": cube_ms * _US_PER_MS,
         "vector": (vec_ops / vec_rate) * _US_PER_SECOND if (vec_ops > 0.0 and vec_rate > 0.0) else 0.0,
         "hbm": (hbm / hbm_rate) * _US_PER_SECOND if (hbm > 0.0 and hbm_rate > 0.0) else 0.0,
-        "mte2": (mte2 / mte2_rate) * _US_PER_SECOND if (mte2 > 0.0 and mte2_rate > 0.0) else 0.0,
+        "mte2": (
+            max(
+                (mte2_aic_b / mte2_aic_rate) * _US_PER_SECOND if (mte2_aic_b > 0.0 and mte2_aic_rate > 0.0) else 0.0,
+                (mte2_aiv_b / mte2_aiv_rate) * _US_PER_SECOND if (mte2_aiv_b > 0.0 and mte2_aiv_rate > 0.0) else 0.0,
+            )
+            if split_mte2 else (
+                (mte2 / mte2_rate) * _US_PER_SECOND
+                if (mte2 > 0.0 and mte2_rate > 0.0) else 0.0
+            )
+        ),
         "mte3": (mte3 / mte3_rate) * _US_PER_SECOND if (mte3 > 0.0 and mte3_rate > 0.0) else 0.0,
+        "fixpipe": (fixpipe_b / fixpipe_rate) * _US_PER_SECOND if (fixpipe_b > 0.0 and fixpipe_rate > 0.0) else 0.0,
         "link": (float(spec.link_bytes) / fabric_rate) * _US_PER_SECOND if (spec.link_bytes > 0.0 and fabric_rate > 0.0) else 0.0,
     }
     return res_list, res_names, res_rates, res_units, work_map, native_work, pipe_times_us, hbm_rate
@@ -1844,10 +2137,15 @@ def resolve_tilelang_dual_tier_bounds(
     simd_gain_ms = min(ceil_gain_ms, before_ms - simd_target_ms)
     simt_prof, _ = resolve_tilelang_profile(datapath, uses_simt=True, calibration=cal)
     simt_ub_ceiling = simt_prof.ub_ceiling_bytes
+    simd_ub_ceiling = simt_prof.simd_ub_ceiling_bytes
     ub_warn = (
         cal.simt_vs_simd_ub_wall_warning(ub_live_bytes)
         if (is_vector_or_norm_region or has_aiv) else None
     )
+    if (is_vector_or_norm_region or has_aiv) and (simd_ub_ceiling <= 0 or ub_live_bytes > simd_ub_ceiling):
+        ub_warn = ub_warn or f"simd_ub_ceiling_exceeded:{ub_live_bytes}>{simd_ub_ceiling}"
+        infeasible_gain = min(0.0, simd_gain_ms)
+        return infeasible_gain, infeasible_gain, ub_warn
     if (is_vector_or_norm_region or has_aiv) and (simt_ub_ceiling <= 0 or ub_live_bytes > simt_ub_ceiling):
         ub_warn = ub_warn or f"simt_ub_ceiling_exceeded:{ub_live_bytes}>{simt_ub_ceiling}"
         return min(0.0, simd_gain_ms), simd_gain_ms, ub_warn

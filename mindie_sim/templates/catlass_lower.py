@@ -8,7 +8,7 @@
 """
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, fields, is_dataclass, replace
 from functools import lru_cache
 from math import prod
@@ -33,6 +33,7 @@ from .fuse_region import Lowering, ring_credit, solve_template_tile
 
 _NOMINAL_BUFFER_ALIGNMENT = 32
 _PURE_LOWER_CACHE_SIZE = 128
+SIMT_WARP_SIZE = 32
 A8W4_PROLOGUE_SUBBLOCK_ALIGNMENT = 32
 A8W4_PROLOGUE_UB_SLOT_BYTES = 2 * 32 * 1024
 GATHER_SCATTER_FULL_LOAD_UB_BYTES = 216 * 1024
@@ -102,6 +103,46 @@ def _visitor_buffers(spec, tm, tn):
     return tuple(buffers)
 
 
+def _axis_tile_counts(extent: int, tile: int) -> tuple[tuple[int, int], ...]:
+    full, rem = divmod(extent, tile)
+    out = []
+    if full > 0:
+        out.append((tile, full))
+    if rem > 0:
+        out.append((rem, 1))
+    return tuple(out)
+
+
+def _total_issued_ops(spec, p, datapath) -> int:
+    """Compute exact total issued Cube FLOPs across full and tail microtiles."""
+    if _is_simt_matrix(spec):
+        return 0
+    tm, tn, tk = spec.l1_tile_shape
+    micro_k = spec.l0_tile_shape[-1]
+    m_counts: Counter[int] = Counter()
+    for rows in (p.groups if p.groups else (p.m,)):
+        if rows > 0:
+            for dim, mult in _axis_tile_counts(rows, tm):
+                m_counts[dim] += mult
+    n_counts: Counter[int] = Counter()
+    if spec.epilogue_kind == "grouped_swiglu_mx_quant":
+        for dim, mult in _axis_tile_counts(p.n // 2, tn):
+            n_counts[dim] += 2 * mult
+    else:
+        for dim, mult in _axis_tile_counts(p.n, tn):
+            n_counts[dim] += mult
+    k_counts: Counter[int] = Counter()
+    for k_len, panel_mult in _axis_tile_counts(p.k, tk):
+        for u_k, u_mult in _axis_tile_counts(k_len, micro_k):
+            k_counts[u_k] += panel_mult * u_mult
+    total = 0
+    for m_dim, mc in m_counts.items():
+        for n_dim, nc in n_counts.items():
+            for u_k, kc in k_counts.items():
+                total += mc * nc * kc * _issued_ops(m_dim, n_dim, u_k, spec, datapath)
+    return total
+
+
 def solve_catlass_tile(spec, problem, datapath, *, memory_view=None, die=0):
     p = matrix_problem(problem)
     validate_catlass_spec(spec, p, datapath)
@@ -155,15 +196,24 @@ def solve_catlass_tile(spec, problem, datapath, *, memory_view=None, die=0):
             datapath.route("l0c", "ub", spec.dtype_acc, (core, lane), (tm, tn))
             if p.k <= GATHER_SCATTER_AIV_MAX_K:
                 datapath.route("ub", "l1", spec.dtype_a, (lane, core))
+    eff_g_n = ceil_div(p.n // 2, tn) if spec.epilogue_kind == "grouped_swiglu_mx_quant" else g_n
     if spec.epilogue_kind in {"evg_ub", "grouped_swiglu_mx_quant"}:
-        owners = min(spec.aic_budget, g_m * (g_n // 2 if spec.epilogue_kind == "grouped_swiglu_mx_quant" else g_n))
+        owners = min(spec.aic_budget, g_m * eff_g_n)
         for aic in range(owners):
             datapath.route("l0c", "ub", dtype_name(spec.dtype_acc),
                            (aic, _paired_aiv(spec, datapath, aic)), (tm, tn))
+    work_items = (
+        p.m * ceil_div(p.n, SIMT_WARP_SIZE)
+        if spec.dispatch_policy == "MatmulGatherScatterSimt"
+        else g_m * eff_g_n * spec.splitk_factor
+    )
+    owner_budget = spec.aiv_budget if simt else spec.aic_budget
     candidate = TileCandidate(
         "resident_1pass", TileShape(lm, ln, lk), max(slots), (spec.aic_budget, spec.aiv_budget),
-        g_m * g_n * spec.splitk_factor, ceil_div(g_m * g_n, spec.aic_budget),
-        buffers, logical_flops=2 * p.m * p.n * p.k, uses_simt=spec.simt_thread_block_dim is not None,
+        work_items, ceil_div(work_items, owner_budget),
+        buffers, logical_flops=2 * p.m * p.n * p.k,
+        issued_flops=_total_issued_ops(spec, p, datapath),
+        uses_simt=spec.simt_thread_block_dim is not None,
         native_mode=_cube_dtype(spec), owner_axis="aiv" if simt else "aic",
     )
     return solve_template_tile(datapath, spec.template_id, candidate, state=memory_view, die=die)
@@ -206,9 +256,10 @@ class _MatrixLowerer:
             self.spec.swizzle_direction, self.spec.swizzle_offset,
         )
         row, col = mi * self.tm, ni * self.tn
+        owner_budget = self.spec.aiv_budget if _is_simt_matrix(self.spec) else self.spec.aic_budget
         return _ProductTile(group, group_start + row, row, col,
                             min(self.tm, rows - row), min(self.tn, n_cols - col),
-                            (index + start_core) % self.spec.aic_budget, rows)
+                            (index + start_core) % owner_budget, rows)
 
     def _rect(self, tensor, dtype, row, col, rows, cols, full_row, **kwargs):
         layout = self.spec.layout_a if tensor == self.p.a_id else self.spec.layout_b
@@ -558,6 +609,124 @@ class _MatrixLowerer:
         return self._write_output(name + ":scatter", tile, (simt,), pipe="mte3", owner=owner,
                                   physical_rows=physical_rows)
 
+    def _simt_b_runs(self, col_lo: int, col_hi: int, repeats: int = 1) -> tuple[list[AddressRun], int]:
+        """Build B-operand warp address runs for contiguous column tiles ``[col_lo, col_hi)``."""
+        p, s = self.p, self.spec
+        runs: list[AddressRun] = []
+        total_bytes = 0
+        if s.layout_b == "RowMajor":
+            stride_b = packed_bytes(p.n, s.dtype_b)
+            align = max(1, int(self.plan.sector))
+            warp_w = packed_bytes(SIMT_WARP_SIZE, s.dtype_b)
+            tail_cols = (p.n % SIMT_WARP_SIZE) or SIMT_WARP_SIZE
+            tail_w = packed_bytes(tail_cols, s.dtype_b)
+            full_row = (
+                col_lo == 0 and col_hi * SIMT_WARP_SIZE >= p.n
+                and not self.plan.burst_rules
+                and (warp_w % align == 0) and (tail_w % align == 0)
+            )
+            if full_row:
+                mat_bytes = p.k * stride_b
+                runs.append(AddressRun(
+                    p.b_base_byte, repeats, mat_bytes, mat_bytes if repeats == 1 else 0, "RowMajor",
+                ))
+                total_bytes += repeats * mat_bytes
+            else:
+                for col_tile in range(col_lo, col_hi):
+                    col_start = col_tile * SIMT_WARP_SIZE
+                    cols = min(SIMT_WARP_SIZE, p.n - col_start)
+                    w_b = packed_bytes(cols, s.dtype_b)
+                    run = AddressRun(p.b_base_byte + packed_bytes(col_start, s.dtype_b), p.k, w_b, stride_b, "RowMajor")
+                    for _ in range(repeats):
+                        runs.append(run)
+                    total_bytes += repeats * p.k * w_b
+        elif s.layout_b == "ColumnMajor":
+            stride_b = packed_bytes(p.k, s.dtype_b)
+            col_start = col_lo * SIMT_WARP_SIZE
+            cols = min(col_hi * SIMT_WARP_SIZE, p.n) - col_start
+            run = AddressRun(p.b_base_byte + col_start * stride_b, cols, stride_b, stride_b, "ColumnMajor")
+            for _ in range(repeats):
+                runs.append(run)
+            total_bytes += repeats * cols * stride_b
+        else:
+            raise ModelingError(f"catlass_address_layout_unsupported:{s.layout_b}")
+        return runs, total_bytes
+
+    def simt_gather_scatter(self, after):
+        """Lower ``MatmulGatherScatterSimt`` across full ``aiv_budget`` warp partitions."""
+        plan, p, s = self.plan, self.p, self.spec
+        column_tiles = ceil_div(p.n, SIMT_WARP_SIZE)
+        total_warps = p.m * column_tiles
+        active_workers = min(s.aiv_budget, total_warps)
+        index_bytes = packed_bytes(1, "int32")
+        stride_a = packed_bytes(p.k, s.dtype_a)
+        stride_c = packed_bytes(p.n, s.dtype_c)
+        x, y, z = s.simt_thread_block_dim
+        done = []
+        for worker in range(active_workers):
+            warp_begin = total_warps * worker // active_workers
+            warp_end = total_warps * (worker + 1) // active_workers
+            name = f"simt:{worker}"
+            row_lo = warp_begin // column_tiles
+            row_hi = (warp_end - 1) // column_tiles + 1
+            idx_stage = plan.access(
+                name + ":indices", p.indices_id, (row_hi - row_lo) * index_bytes,
+                owner=worker, after=after, offset=row_lo * index_bytes,
+                obligation=p.indices is not None or p.physical_m is not None,
+            )
+            a_runs: list[AddressRun] = []
+            b_runs: list[AddressRun] = []
+            c_runs: list[AddressRun] = []
+            a_bytes = 0
+            b_bytes = 0
+            c_bytes = 0
+            worker_ops = 0
+            full_rows = 0
+            for logical_row in range(row_lo, row_hi):
+                col_lo = warp_begin % column_tiles if logical_row == row_lo else 0
+                col_hi = ((warp_end - 1) % column_tiles + 1) if logical_row == row_hi - 1 else column_tiles
+                row_warps = col_hi - col_lo
+                phys_row = logical_row if p.indices is None else p.indices[logical_row]
+                a_runs.append(AddressRun(
+                    phys_row * stride_a, row_warps, stride_a, stride_a if row_warps == 1 else 0,
+                ))
+                a_bytes += row_warps * stride_a
+                c_start = col_lo * SIMT_WARP_SIZE
+                c_cols = min(col_hi * SIMT_WARP_SIZE, p.n) - c_start
+                c_width = packed_bytes(c_cols, s.dtype_c)
+                c_runs.append(AddressRun(
+                    phys_row * stride_c + packed_bytes(c_start, s.dtype_c), 1, c_width, stride_c,
+                ))
+                c_bytes += c_width
+                worker_ops += 2 * c_cols * p.k
+                if col_lo == 0 and col_hi == column_tiles:
+                    full_rows += 1
+                else:
+                    part_runs, part_b = self._simt_b_runs(col_lo, col_hi)
+                    b_runs.extend(part_runs)
+                    b_bytes += part_b
+            if full_rows > 0:
+                full_runs, full_b = self._simt_b_runs(0, column_tiles, repeats=full_rows)
+                b_runs.extend(full_runs)
+                b_bytes += full_b
+            a_stage = plan.access(
+                name + ":gather", p.a_id, a_bytes, owner=worker, pipe="mte2_aiv",
+                after=(idx_stage,), runs=tuple(a_runs),
+            )
+            b_stage = plan.access(
+                name + ":weights", p.b_id, b_bytes, owner=worker, pipe="mte2_aiv",
+                after=after, runs=tuple(b_runs), version=p.b_version,
+            )
+            mac_stage = plan.work(
+                name + ":simt_mac", "aiv_simt", worker_ops, owner=worker, after=(a_stage, b_stage),
+                metadata={"thread_block_x": x, "thread_block_y": y, "thread_block_z": z},
+            )
+            done.append(plan.access(
+                name + ":scatter", p.c_id, c_bytes, runs=tuple(c_runs),
+                direction="write", pipe="mte3", owner=worker, after=(mac_stage,),
+            ))
+        return tuple(done)
+
     def _physical_rows(self, tile):
         indices = self.p.indices
         return range(tile.row, tile.row + tile.m) if indices is None else indices[tile.row:tile.row + tile.m]
@@ -627,13 +796,23 @@ def _partial(lowerer, parts, block, tile, panels, after, offset, row_stride):
     parts[block].append((tile, partial, size, run))
 
 
-def _normal_waves(lowerer, start, stop, after):
+def _normal_waves_by_owner(lowerer, start, stop, after) -> dict[int, str]:
+    owner_done: dict[int, str] = {}
     if lowerer.spec.dispatch_policy == "MmadPingpongMutex":
-        return tuple(lowerer.ordinary(lowerer.tile(i), after) for i in range(start, stop))
-    cores = lowerer.spec.aic_budget
-    for first in range(start, stop, cores):
-        after = tuple(lowerer.ordinary(lowerer.tile(i), after) for i in range(first, min(first + cores, stop)))
-    return after
+        for i in range(start, stop):
+            tile = lowerer.tile(i)
+            owner_done[tile.owner] = lowerer.ordinary(tile, after)
+        return owner_done
+    for i in range(start, stop):
+        tile = lowerer.tile(i)
+        deps = (owner_done[tile.owner],) if tile.owner in owner_done else after
+        owner_done[tile.owner] = lowerer.ordinary(tile, deps)
+    return owner_done
+
+
+def _normal_waves(lowerer, start, stop, after):
+    owner_done = _normal_waves_by_owner(lowerer, start, stop, after)
+    return tuple(owner_done.values()) or after
 
 
 def _split_schedule(lowerer, launch, blocks):
@@ -645,11 +824,11 @@ def _split_schedule(lowerer, launch, blocks):
             _normal_waves(lowerer, 0, blocks, (launch,))
             return
         final = max(0, partition.b_norm - spec.aic_budget)
-        pre = _normal_waves(lowerer, 0, final, (launch,))
+        pre_by_owner = _normal_waves_by_owner(lowerer, 0, final, (launch,))
         stride = packed_bytes(lowerer.tn, spec.dtype_acc)
         tile_bytes = lowerer.tm * stride
         for core, (start, end) in enumerate(partition.intervals):
-            after = pre
+            after = (pre_by_owner[core],) if core in pre_by_owner else (launch,)
             for part in range(partition.partial_counts[core]):
                 block, panel = divmod(start, lowerer.gk)
                 stop = min(end, (block + 1) * lowerer.gk)
@@ -775,6 +954,8 @@ def _lower_catlass_impl(
                 tile = lowerer.tile(task, group=index, group_start=row_start, rows=rows, start_core=start, n_cols=n_cols)
                 owner_done[tile.owner] = lowerer.ordinary(tile, (owner_done.get(tile.owner, launch),))
             row_start += rows
+    elif spec.dispatch_policy == "MatmulGatherScatterSimt":
+        lowerer.simt_gather_scatter((launch,))
     elif spec.scheduler in {"streamk", "multi_core_splitk"}:
         _split_schedule(lowerer, launch, blocks)
     else:

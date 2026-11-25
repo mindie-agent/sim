@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from fractions import Fraction
 
 from mindie_sim.prediction.program.stages import KernelProgram, Stage, scope_allocations
-from mindie_sim.prediction.runtime.l2_residency import _dram_service_segments
+from mindie_sim.prediction.runtime.l2_residency import _dram_segments
 from mindie_sim.prediction.runtime.memory_physics import (
     AdmissionMemoryView, BoundAccess, HbmBusSpec, MemoryAccessPattern, ReuseKey,
     SectorCoverage,
@@ -149,14 +149,28 @@ class _LiveAccess:
         def record(ledger, resident, dirty):
             pattern = self.pattern
             if self.delivered is not None:
+                if ledger.dram_sector_bytes:
+                    rules = self.bound.bind_config[-2]
+                    curves_by_die = getattr(self.state, "_knee_curves_by_die", None)
+                    has_knee = bool(
+                        curves_by_die.get(pattern.die)
+                        if curves_by_die is not None
+                        else getattr(self.state, "_knee_curve", None)
+                    )
+                    if ledger.dram_bus_transaction_bytes == ledger.dram_sector_bytes:
+                        turnaround = Fraction(ledger.dram_sector_bytes)
+                    elif rules and not has_knee:
+                        cov = resident if ledger.l2_hit_bytes else SectorCoverage()
+                        turnaround = _rational_service(pattern.runs, cov, rules)
+                    else:
+                        turnaround = Fraction(ledger.dram_bus_transaction_bytes)
+                else:
+                    turnaround = 0
                 self.delivered.update({
                     "logical_transfer_bytes": ledger.logical_tensor_bytes,
                     "issued_copy_bytes": ledger.aligned_transfer_bytes,
                     "dram_sector_bytes": ledger.dram_sector_bytes + dirty,
-                    "turnaround_service_bytes": dirty + (
-                        _rational_service(pattern.runs, resident, self.bound.bind_config[-2])
-                        if ledger.dram_sector_bytes else 0
-                    ),
+                    "turnaround_service_bytes": dirty + turnaround,
                     "realized_l2_hit_bytes": ledger.l2_hit_bytes,
                     "realized_l2_miss_bytes": ledger.dram_miss_copy_bytes,
                     "realized_hbm_delivered_bytes": ledger.dram_sector_bytes + dirty,
@@ -198,10 +212,27 @@ def _observed_obligations(declared, observed):
 
 def _rational_service(plan, resident: SectorCoverage, rules):
     service = Fraction()
-    for sectors, width, stride in _dram_service_segments(plan, resident):
-        service += sectors
-        if width:
+    for sectors, width, stride, run in _dram_segments(plan, resident, burst_rules=rules):
+        if not width or run is None:
+            service += sectors
+            continue
+        granule = Fraction(0)
+        if run.layout in {"scatter", "scattered", "gather", "indexed"}:
+            granule = Fraction(plan.hbm_scatter_row_open_bytes)
+        if run.stride_bytes > run.row_bytes:
+            granule = max(granule, Fraction(plan.hbm_burst_granule_bytes))
+        if rules:
             penalty = sum((Fraction(str(rule.penalty_bytes)) for rule in rules
                            if rule.matches(width, stride)), Fraction())
-            service += sectors * penalty / width
+            if penalty > 0:
+                if granule <= 0:
+                    service += sectors + sectors * penalty / width
+                    continue
+                granule = max(granule, Fraction(width) + penalty)
+        if granule <= run.row_bytes:
+            service += sectors
+        else:
+            wire = run.sector_union_bytes(plan.sector_bytes)
+            rows = run.rows if run.stride_bytes else 1
+            service += sectors * max(Fraction(1), Fraction(rows) * granule / wire)
     return service
