@@ -9,12 +9,16 @@
 [Side-Effect Policy] Returns immutable operators and a shared Engine recipe.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.catalog.cache_format import CacheFormat, cache_format
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import PlannedRecipe
 from .mqsmla import (
     COMPRESSED_CACHE_ROW_BYTES,
+    DSL_NATIVE_KIND,
+    DSL_SOURCE,
     KV_QUANT_BF16,
     KV_QUANT_FP8,
     KV_QUANT_MXFP8,
@@ -25,10 +29,17 @@ from .mqsmla import (
     ORIGINAL_CACHE_ROW_BYTES,
     RECIPE,
     SOURCE,
+    SOURCE_REFS as _MQSMLA_SOURCE_REFS,
+    SUPPORTED_ADDRESSING,
     SUPPORTED_PHASES,
+    is_abi_admitted,
     supported_heads,
+    verify_mqsmla_abi,
     build,
 )
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = _MQSMLA_SOURCE_REFS
 #: The CANN 9.2.1 source-symbol spelling retained as an explicit alias.
 SOURCE_RECIPE = "mixed_quant_sparse_flash_mla"
 FP8_WINDOW_GROUP_SIZE = 32
@@ -38,7 +49,8 @@ UNIT_CONTEXT_PARALLEL = 1
 MIN_ACTIVE_ROWS = 1
 QUERY_ORIGIN = 0
 NO_COMPRESSED_ROWS = 0
-VALID_ADDRESSING = frozenset({"scalar", "auto", "vector"})
+DEFAULT_PAGE_SIZE = 128
+VALID_ADDRESSING = SUPPORTED_ADDRESSING
 FORMATS = {
     "window": {"dtype": "fp8_e4m3", "group_size": FP8_WINDOW_GROUP_SIZE,
                "scale_dtype": "bf16"},
@@ -177,11 +189,31 @@ def _matches_dsl_formats(op) -> bool:
     view = dict(getattr(op, "metadata", ()) or ()).get("attention_tensor_view") or {}
     regions = view.get("cache_representations")
     if not isinstance(regions, dict) or not regions:
-        return True
+        return False
     return all(
         _region_format(regions.get(region)) == CacheFormat(**declaration)
         for region, declaration in FORMATS.items()
     )
+
+
+def _layout_contract(quant_mode: int | None) -> str:
+    if quant_mode is None:
+        return "mixed_fp8_fp4_544_320"
+    if quant_mode == KV_QUANT_FP8:
+        return "aclnn_packed_kv_608"
+    if quant_mode == KV_QUANT_MXFP8:
+        return "aclnn_packed_kv_584"
+    return "aclnn_dense_bf16"
+
+
+def _abi_options_from_runtime(runtime) -> tuple[str, str | None, str, object | None, tuple]:
+    rt_meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+    soc_arch = str(rt_meta.get("soc_arch") or getattr(runtime, "arch_family", "") or "A5").strip().upper()
+    sku_id = str(rt_meta.get("sku_id") or "").strip().lower() or None
+    track_spec = rt_meta.get("abi_track_spec")
+    pr_track = str(getattr(track_spec, "track", "") or rt_meta.get("abi_pr_track") or "shipping")
+    bindings = tuple(rt_meta.get("abi_manifest_bindings") or ())
+    return soc_arch, sku_id, pr_track, track_spec, bindings
 
 
 def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefix,
@@ -196,60 +228,94 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
     effective_ratio = (plan.compress_ratio if topk_present or plan.owns_long_kv
                        else NO_COMPRESSED_ROWS)
     implementation = str(getattr(selection, "name", RECIPE))
+    addressing = str(dict(getattr(selection, "options", {}) or {}).get("addressing", "scalar"))
+    if addressing not in VALID_ADDRESSING:
+        raise ModelingError("mqsmla_addressing_mode_unsupported")
     quant_mode = declared_quant_mode(members[0])
     if quant_mode is None and not _matches_dsl_formats(members[0]):
         raise ModelingError("mqsmla_cache_representation_contract_required")
+    orig_view = dict(getattr(members[0], "metadata", ()) or ()).get("attention_tensor_view") or {}
+    cache_reps = orig_view.get("cache_representations")
     shape = {"sequences": rows, "window": plan.window, "ratio": effective_ratio,
              "topk": plan.index_topk if topk_present else 0, "heads": heads,
              "width": MQSMLA_HEAD_WIDTH, "metadata_support_fd": False,
              "implementation": implementation,
-             "addressing": str(dict(getattr(selection, "options", {}) or {}).get(
-                 "addressing", "scalar"))}
+             "addressing": addressing}
     if quant_mode is not None:
         shape["kv_quant_mode"] = quant_mode
         shape["packed_row_bytes"] = KV_QUANT_ROW_BYTES[quant_mode]
         shape.update(_prefix_fields(views, runtime))
+    is_dsl = quant_mode is None
+    native_kind = DSL_NATIVE_KIND if is_dsl else NATIVE_KIND
+    source_rec = DSL_SOURCE if is_dsl else SOURCE
+    api_namespace = "third_party_wheel" if is_dsl else "aclnn"
+    api_entry = DSL_NATIVE_KIND if is_dsl else "cann_ops_transformer.ops.mixed_quant_sparse_flash_mla"
+    kernel_name = "MixedQuantSparseFlashMlaDsl" if is_dsl else "MixedQuantSparseFlashMla"
+    soc_arch, sku_id, pr_track, track_spec, bindings = _abi_options_from_runtime(runtime)
+    page_size = int(getattr(runtime, "kv_block_size", 0) or DEFAULT_PAGE_SIZE)
+    abi_verdict = verify_mqsmla_abi(
+        soc_arch=soc_arch,
+        sku_id=sku_id,
+        quant_mode=quant_mode,
+        active_q=active_q,
+        heads=heads,
+        batch=len(rows),
+        compressed_cache=effective_ratio > 0,
+        topk_present=bool(topk_present),
+        topk=plan.index_topk if topk_present else 0,
+        page_size=page_size,
+        pr_track=pr_track,
+        track_spec=track_spec,
+        manifest_bindings=bindings,
+    )
     query = (active_q, heads, MQSMLA_HEAD_WIDTH)
+    tensor_view = {
+        "kind": "mixed_quant_shared_kv", "query_shape": query,
+        "output_shape": query,
+        "query_dtype": "bf16", "output_dtype": "bf16",
+        "original_cache_row_bytes": KV_QUANT_ROW_BYTES[quant_mode]
+        if quant_mode is not None else ORIGINAL_CACHE_ROW_BYTES,
+        "compressed_cache_row_bytes": KV_QUANT_ROW_BYTES[quant_mode]
+        if quant_mode is not None else COMPRESSED_CACHE_ROW_BYTES,
+        "kv_quant_mode": quant_mode,
+        "compressed_cache": effective_ratio > 0,
+    }
+    if isinstance(cache_reps, dict) and cache_reps:
+        tensor_view["cache_representations"] = dict(cache_reps)
+    api_payload = {"namespace": api_namespace, "entry": api_entry}
+    if not is_dsl:
+        api_payload["aclnn_symbol"] = native_kind
     meta = {**dict(members[0].metadata), "mqsmla_geometry": shape,
             "logical_pairs": sum(dict(op.metadata).get("logical_pairs", 0) for op in members),
             "kv_sweeps": sum(dict(op.metadata).get("kv_sweeps", 0) for op in members),
+            "abi_pr_track": pr_track,
+            **({"abi_track_spec": track_spec} if track_spec is not None else {}),
+            **({"abi_manifest_bindings": bindings} if bindings else {}),
+            **({"abi_sku_id": sku_id} if sku_id else {}),
             "implementation_binding": {
                 "selector": "mqsmla_attention", "implementation": implementation,
                 "capture_binary_identity": "not_established",
-                "abi_registry_verified": False,
-                "layout_contract": (
-                    "aclnn_packed_kv_mode"
-                    if quant_mode in {KV_QUANT_FP8, KV_QUANT_MXFP8}
-                    else "mixed_fp8_fp4_544_320"
-                ),
-                "source": SOURCE,
+                "abi_registry_verified": is_abi_admitted(abi_verdict),
+                "abi_verdict_status": abi_verdict.status,
+                "abi_entry_id": abi_verdict.matched_entry_id,
+                "abi_symbol": abi_verdict.symbol_or_kernel or native_kind,
+                "abi_rejection_reason": abi_verdict.rejection_reason,
+                "layout_contract": _layout_contract(quant_mode),
+                "source": source_rec,
                 "coverage": "conditional_source_program",
                 "caller_unmodeled": ["separate_aicpu_metadata_generation",
                                       "original_window_index_generation"]},
-            "attention_tensor_view": {
-                "kind": "mixed_quant_shared_kv", "query_shape": query,
-                "output_shape": query,
-                "query_dtype": "bf16", "output_dtype": "bf16",
-                "original_cache_row_bytes": KV_QUANT_ROW_BYTES[quant_mode]
-                if quant_mode is not None else ORIGINAL_CACHE_ROW_BYTES,
-                "compressed_cache_row_bytes": KV_QUANT_ROW_BYTES[quant_mode]
-                if quant_mode is not None else COMPRESSED_CACHE_ROW_BYTES,
-                "kv_quant_mode": quant_mode,
-                "compressed_cache": effective_ratio > 0},
-            "native_kind": NATIVE_KIND,
-            "aclnn_symbol": NATIVE_KIND,
+            "attention_tensor_view": tensor_view,
+            "native_kind": native_kind,
+            "aclnn_symbol": native_kind,
             "native_call": {
-                "api": {
-                    "namespace": "aclnn",
-                    "entry": "cann_ops_transformer.ops.mixed_quant_sparse_flash_mla",
-                    "aclnn_symbol": NATIVE_KIND,
-                },
-                "source": SOURCE,
+                "api": api_payload,
+                "source": source_rec,
                 "kernels": [{
-                    "name": "MixedQuantSparseFlashMla",
+                    "name": kernel_name,
                     "role": "mix",
-                    "source_path": SOURCE["path"],
-                    "source_sha256": None,
+                    "source_path": source_rec["path"],
+                    "source_sha256": source_rec.get("source_sha256"),
                     "evidence": "source_declared",
                 }],
                 "execution_core": "mix",

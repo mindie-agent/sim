@@ -11,6 +11,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, fields, replace
 from itertools import chain
 from math import ceil
+from typing import Literal
 
 from mindie_sim.observed_contracts.vocabulary import build_unmodeled_onboarding_hint
 from mindie_sim.public.errors import UnmodeledCapabilityError
@@ -20,6 +21,7 @@ from mindie_sim.schema.operators import OpSpec
 from ..contracts import OperatorPlanningContext
 from ..attention.common import planning_sequence_spans
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
 FAMILY = "paged_mla"
 CONTRACT_KEY = "paged_mla_contract"
 FIA_ABI = "aclnnFusedInferAttentionScore"
@@ -38,7 +40,7 @@ ABI_PUBLIC_IDENTITY: Mapping[str, tuple[str, str, str]] = {
     FLASH_ABI: ("FlashMla", FLASH_ENTRY, "aclnn"),
     DSL_FLASH_ABI: ("FlashMla", DSL_FLASH_ABI, "cann_kernel"),
     MQS_ABI: ("MixedQuantSparseFlashMla", MQS_ENTRY, "aclnn"),
-    DSL_MQS_ABI: ("MixedQuantSparseFlashMla", DSL_MQS_ABI, "cann_kernel"),
+    DSL_MQS_ABI: ("MixedQuantSparseFlashMla", DSL_MQS_ABI, "third_party_wheel"),
     SPARSE_FLASH_MLA_ABI: ("SparseFlashMla", SPARSE_FLASH_MLA_ENTRY, "aclnn"),
     FIA_ABI: ("FusedInferAttentionScore", "torch_npu.npu_fused_infer_attention_score", "aclnn"),
 }
@@ -64,6 +66,9 @@ ACLNN_MQS_SCALE_ENCODINGS = {1: "bf16_g64", ACLNN_MQS_SEPARATE_SCALE_MODE: "e8m0
 MQS_PAGED_LAYOUT = "PA_BBND"
 MQS_CONTIGUOUS_LAYOUTS = ("BSND", "TND")
 MQS_MAX_PAGE_SIZE = 1024
+DENSE_MAX_PHYSICAL_HEADS = 128
+DENSE_PAGE_ALIGNMENT = 16
+DENSE_MAX_PAGE_SIZE = MQS_MAX_PAGE_SIZE
 FP32_BYTES = 4
 INDEX_BYTES = 4
 NZ_BLOCK_BYTES = 32
@@ -372,6 +377,24 @@ def capability_gap(code: str, abi: str, arch_id: str = "") -> UnmodeledCapabilit
         ),),
     )
 
+
+def validate_dense_cann_geometry(c: PagedMlaContract, arch_id: str) -> None:
+    """Enforce CANN host checker domain for dense FlashMLA and nonquant FIA MLA."""
+    if c.abi == FLASH_ABI:
+        if c.latent_dim != DEFAULT_LATENT_DIM or c.rope_dim != DEFAULT_ROPE_DIM:
+            raise capability_gap("paged_mla_flash_requires_latent512_rope64", c.abi, arch_id)
+        if not 1 <= c.physical_heads <= DENSE_MAX_PHYSICAL_HEADS:
+            raise capability_gap("paged_mla_flash_heads_out_of_range", c.abi, arch_id)
+        if c.page_size % DENSE_PAGE_ALIGNMENT != 0 or c.page_size > DENSE_MAX_PAGE_SIZE:
+            raise capability_gap("paged_mla_flash_page_size_invalid", c.abi, arch_id)
+    elif c.abi == FIA_ABI:
+        if c.latent_dim != DEFAULT_LATENT_DIM or c.rope_dim != DEFAULT_ROPE_DIM:
+            raise capability_gap("paged_mla_fia_requires_latent512_rope64", c.abi, arch_id)
+        if not 1 <= c.physical_heads <= DENSE_MAX_PHYSICAL_HEADS:
+            raise capability_gap("paged_mla_fia_heads_out_of_range", c.abi, arch_id)
+        if c.page_size % DENSE_PAGE_ALIGNMENT != 0 or c.page_size > DENSE_MAX_PAGE_SIZE:
+            raise capability_gap("paged_mla_fia_page_size_invalid", c.abi, arch_id)
+
 def _tuple_rows(value, depth: int):
     if depth and isinstance(value, (tuple, list)):
         if depth == 1:
@@ -456,16 +479,45 @@ PAGED_MLA_MIN_SOFTMAX_OPS = 4
 def _minimum_contract_io(c: PagedMlaContract, dtype: str) -> tuple[float, float, float, float]:
     """Conservative lower bound on (hbm, mte2, mte3, vector_ops) for L* soundness."""
     tokens = sum(q for q, _ in c.sequences)
+    if c.mixed_quant:
+        active_q_tokens = sum(
+            repeat
+            for seq in range(len(c.sequences))
+            for query, repeat in c.query_runs(seq)
+            if sum(c.bank_counts(seq, query)) > 0
+        )
+    else:
+        active_q_tokens = sum(q for q, kv in c.sequences if q > 0 and kv > 0)
     elem_b = float(dtype_bytes(dtype))
-    q_bytes = float(tokens * c.logical_heads * c.dqk) * elem_b
+    q_bytes = float(active_q_tokens * c.logical_heads * c.dqk) * elem_b
     o_bytes = float(tokens * c.logical_heads * c.dv) * elem_b
     total_pairs = c.selected_pairs
     vector_ops = float(PAGED_MLA_MIN_SOFTMAX_OPS * c.logical_heads * total_pairs)
-    total_kv = sum(kv for _, kv in c.sequences)
-    unique_kv = min(total_kv, total_pairs) if c.mixed_quant else total_kv
+    total_kv = sum(kv for q, kv in c.sequences if q > 0)
+    if c.mixed_quant:
+        unique_kv = min(total_kv, total_pairs)
+        mte2_kv = unique_kv
+    elif c.block_table:
+        page_rows: dict[int, int] = {}
+        for seq, (q, kv) in enumerate(c.sequences):
+            if q <= 0 or kv <= 0:
+                continue
+            table = c.block_table[seq]
+            for page_idx in range(ceil_div(kv, c.page_size)):
+                take = min(c.page_size, kv - page_idx * c.page_size)
+                phys = table[page_idx]
+                prev = page_rows.get(phys, 0)
+                if take > prev:
+                    page_rows[phys] = take
+        unique_kv = sum(page_rows.values())
+        mte2_kv = total_kv
+    else:
+        unique_kv = total_kv
+        mte2_kv = total_kv
     kv_row_b = float(MQS_COMPRESSED_ROW_BYTES if c.mixed_quant else latent_record_bytes(c, dtype=dtype))
-    kv_bytes = float(unique_kv) * kv_row_b
-    return q_bytes + kv_bytes + o_bytes, q_bytes + kv_bytes, o_bytes, vector_ops
+    kv_hbm_bytes = float(unique_kv) * kv_row_b
+    kv_mte2_bytes = float(mte2_kv) * kv_row_b
+    return q_bytes + kv_hbm_bytes + o_bytes, q_bytes + kv_mte2_bytes, o_bytes, vector_ops
 
 
 def make_op(

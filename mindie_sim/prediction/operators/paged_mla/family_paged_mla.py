@@ -15,8 +15,10 @@
 [Side-Effect Policy] Appends immutable ordinary graph operators.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.invocation import Occurrence as Occurrence
 from mindie_sim.schema.operators import (
     FieldDisposition as FieldDisposition, OpSpec, ProgramFragment as ProgramFragment,
@@ -33,18 +35,36 @@ from .common import ABI_PUBLIC_IDENTITY, FIA_ABI, FLASH_ABI
 from .family_paged_mla_contract import _fragment
 from mindie_sim.prediction.mechanism import PlannedRecipe
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
 IMPLEMENTATION = paged_mla.IMPLEMENTATION
 PAGE_TILE = paged_mla.KEY_TILE
 _ARCH35_BRANCH = 'arch35_bf16_noquant_mla'
 _ARCH35_RECIPE = 'mindie_sim.prediction.paged_mla.build'
 _LATENT_WIDTH = 512
 _ROPE_WIDTH = 64
+_FIA_LAYOUTS = ('BNSD', 'PA_BSND', 'NBSD')
+_FLASH_QUERY_LAYOUT = 'TND'
+_FLASH_OUTPUT_LAYOUT = 'TND'
+_FLASH_CACHE_LAYOUTS = frozenset({'PA_BBND'})
+_FIA_OUTPUT_ALIAS = 'NBSD[:logical_heads]; leading-head slice; no copy'
+_FIA_OUTPUT_VIEW = 'NBSD[:logical_heads]; leading-head contiguous slice; no copy'
+_FLASH_OUTPUT_ALIAS = 'TND[:, :logical_heads, :512]; fused TND slice; no copy'
+_FLASH_OUTPUT_VIEW = 'TND[:, :logical_heads, :512]; fused TND contiguous slice; no copy'
 _ARCH22_SOURCE = {
     'repository': 'cann/ops-transformer',
     'revision': '2d3f4f6db0231ac2e9e487cf62e94f6e173eb946',
     'relative_path': 'attention/fused_infer_attention_score/op_kernel/arch22/fia_kernel_nonquant_mla.h',
     'source_sha256': '47c22ec83a6e771df0185add46c91c4404ce87ad7feee1f9666a129190231e92',
 }
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository='cann/ops-transformer',
+        revision='2d3f4f6db0231ac2e9e487cf62e94f6e173eb946',
+        relative_path='attention/fused_infer_attention_score/op_kernel/arch22/fia_kernel_nonquant_mla.h',
+        source_sha256='47c22ec83a6e771df0185add46c91c4404ce87ad7feee1f9666a129190231e92',
+    ),
+    *paged_mla.SOURCE_REFS,
+)
 
 
 def _augment_plan(plan, op):
@@ -124,7 +144,8 @@ def _validate_branch(plan, parallel):
 
 def native_geometry(*, views, plan, parallel, runtime, padded_tokens=None,
                     kv_splits=1, native_query_capacity=None, dispatch=None,
-                    source_host_dispatch=False, retained_kv_rows=0):
+                    source_host_dispatch=False, retained_kv_rows=0,
+                    key_tile=PAGE_TILE):
     """Return active rows, bucket capacity and physical page geometry.
 
     The values are declarations consumed by the native binding and by tests.
@@ -156,7 +177,7 @@ def native_geometry(*, views, plan, parallel, runtime, padded_tokens=None,
     if dispatch is None and not source_host_dispatch:
         split_source = 'declared_kv_splits'
         effective_splits = tuple(
-            min(kv_splits, (length + PAGE_TILE - 1) // PAGE_TILE)
+            min(kv_splits, (length + key_tile - 1) // key_tile)
             for length in kv_lengths)
     else:
         split_source = ('explicit_dispatch' if isinstance(dispatch, dict)
@@ -187,6 +208,14 @@ def native_geometry(*, views, plan, parallel, runtime, padded_tokens=None,
     }
 
 
+def _is_flash_layout(query_layout, cache_layout, output_layout) -> bool:
+    return (
+        query_layout == _FLASH_QUERY_LAYOUT
+        and output_layout == _FLASH_OUTPUT_LAYOUT
+        and cache_layout in _FLASH_CACHE_LAYOUTS
+    )
+
+
 def _declared_operands(*, plan, query_dtype='bf16', cache_dtype='bf16',
                        output_dtype=None, query_layout='BNSD',
                        cache_layout='PA_BSND', output_layout='NBSD',
@@ -202,8 +231,9 @@ def _declared_operands(*, plan, query_dtype='bf16', cache_dtype='bf16',
         raise ModelingError(
             'paged_mla_selected_bf16_branch_requires_bf16:'
             f'{query_dtype}:{cache_dtype}:{output_dtype}')
-    if (query_layout, cache_layout, output_layout) != (
-            'BNSD', 'PA_BSND', 'NBSD'):
+    is_fia = (query_layout, cache_layout, output_layout) == _FIA_LAYOUTS
+    is_flash = _is_flash_layout(query_layout, cache_layout, output_layout)
+    if not (is_fia or is_flash):
         raise ModelingError(
             'paged_mla_selected_branch_layout_mismatch:'
             f'{query_layout}:{cache_layout}:{output_layout}')
@@ -229,6 +259,10 @@ def _build_declaration_metadata(
     kv_owner, owner_source, kv_version, kv_condition, kv_producer, kv_output,
     kv_storage, spans, request_ids, request_rank,
 ):
+    is_flash = abi['aclnn_symbol'] == FLASH_ABI
+    key_tile = paged_mla.FLASH_KEY_TILE if is_flash else paged_mla.KEY_TILE
+    output_alias = _FLASH_OUTPUT_ALIAS if is_flash else _FIA_OUTPUT_ALIAS
+    output_view = _FLASH_OUTPUT_VIEW if is_flash else _FIA_OUTPUT_VIEW
     geometry_meta = {
         'contexts': geometry['contexts'], 'kv_lengths': geometry['kv_lengths'],
         'position_ranges': geometry['position_ranges'], 'heads': physical,
@@ -241,6 +275,8 @@ def _build_declaration_metadata(
         'retained_kv_capacity_owner': geometry['retained_kv_capacity_owner'],
         'active_sequence_count': active, 'native_query_capacity': capacity,
         'inactive_sequence_kv_length': 0,
+        'native_abi': abi['aclnn_symbol'],
+        'key_tile': key_tile,
     }
     if is_arch22:
         geometry_meta.pop('kv_splits', None)
@@ -266,7 +302,7 @@ def _build_declaration_metadata(
         'kv_condition': kv_condition, 'kv_producer': kv_producer, 'kv_output': kv_output,
         'kv_storage': kv_storage, 'kv_span': spans, 'kv_request_ids': request_ids,
         'kv_request_rank': request_rank,
-        'output_alias': 'NBSD[:logical_heads]; leading-head slice; no copy',
+        'output_alias': output_alias,
     }
     binding = {
         'selector': 'paged_mla_attention', 'implementation': implementation,
@@ -286,7 +322,7 @@ def _build_declaration_metadata(
             'span': spans, 'request_ids': request_ids, 'request_rank': request_rank,
             'representation': 'paged_latent_kv', 'readiness': 'producer_complete',
         },
-        'output_view': 'NBSD[:logical_heads]; leading-head contiguous slice; no copy',
+        'output_view': output_view,
     }
 
 
@@ -296,6 +332,22 @@ def _build_native_attention_abi(
     kv_owner, owner_source, kv_version, kv_condition, kv_producer, kv_output,
     kv_storage, spans, request_ids, request_rank,
 ):
+    is_flash = selected_abi == FLASH_ABI
+    qk_width = operands['latent_width'] + operands['rope_width']
+    if is_flash:
+        active_query_shape = (active, physical, qk_width)
+        query_storage_shape = (capacity, physical, qk_width)
+        query_rope_shape = None
+        output_shape = (capacity, physical, operands['latent_width'])
+        cache_head_shape = (1, qk_width)
+        rope_cache_head_shape = None
+    else:
+        active_query_shape = (active, physical, 1, operands['latent_width'])
+        query_storage_shape = (capacity, physical, 1, operands['latent_width'])
+        query_rope_shape = (capacity, physical, 1, operands['rope_width'])
+        output_shape = (physical, capacity, 1, operands['latent_width'])
+        cache_head_shape = (1, operands['latent_width'])
+        rope_cache_head_shape = (1, operands['rope_width'])
     return {
         'call': native_kind, 'aclnn_symbol': selected_abi, 'entry': native_entry,
         'branch': branch, 'implementation': implementation, 'program_recipe': program_recipe,
@@ -303,12 +355,12 @@ def _build_native_attention_abi(
         'cache_layout': operands['cache_layout'], 'query_dtype': operands['query_dtype'],
         'cache_dtype': operands['cache_dtype'], 'output_dtype': operands['output_dtype'],
         'dtype': operands['query_dtype'],
-        'active_query_shape': (active, physical, 1, operands['latent_width']),
-        'query_storage_shape': (capacity, physical, 1, operands['latent_width']),
-        'query_rope_shape': (capacity, physical, 1, operands['rope_width']),
-        'output_shape': (physical, capacity, 1, operands['latent_width']),
-        'cache_head_shape': (1, operands['latent_width']),
-        'rope_cache_head_shape': (1, operands['rope_width']),
+        'active_query_shape': active_query_shape,
+        'query_storage_shape': query_storage_shape,
+        'query_rope_shape': query_rope_shape,
+        'output_shape': output_shape,
+        'cache_head_shape': cache_head_shape,
+        'rope_cache_head_shape': rope_cache_head_shape,
         'latent_width': operands['latent_width'], 'rope_width': operands['rope_width'],
         'page_size': geometry['page_size'], 'page_table_dtype': 'int32',
         'page_entries': geometry['page_entries'], 'position_ranges': geometry['position_ranges'],
@@ -342,27 +394,33 @@ def _declaration(*, views, plan, parallel, runtime, padded_tokens=None,
                  kv_condition='active_contexts_only',
                  kv_producer='', kv_output='kv_cache',
                  kv_storage='paged_latent_kv', kv_span=None,
-                 request_rank=None):
+                 request_rank=None, metadata_producer=''):
     """Normalize the one declaration consumed by graph and bare-native entries."""
     if isinstance(retained_kv_rows, bool) or type(retained_kv_rows) is not int:
         raise ModelingError('paged_mla_retained_kv_rows_requires_nonnegative_int')
     if retained_kv_rows and implementation == IMPLEMENTATION:
         raise ModelingError('paged_mla_arch35_retained_kv_not_supported')
-    geometry = native_geometry(
-        views=views, plan=plan, parallel=parallel, runtime=runtime,
-        padded_tokens=padded_tokens, kv_splits=kv_splits, dispatch=dispatch,
-        native_query_capacity=native_query_capacity,
-        source_host_dispatch=source_host_dispatch,
-        retained_kv_rows=retained_kv_rows)
     operands = _declared_operands(
         plan=plan, query_dtype=query_dtype, cache_dtype=cache_dtype,
         output_dtype=output_dtype, query_layout=query_layout,
         cache_layout=cache_layout, output_layout=output_layout,
         quant_scales=quant_scales, attention_scale=attention_scale,
         attention_scale_source=attention_scale_source)
+    is_arch22 = implementation != IMPLEMENTATION
+    is_flash = operands['query_layout'] == _FLASH_QUERY_LAYOUT
+    if is_arch22 and is_flash:
+        raise ModelingError('paged_mla_flash_mla_requires_arch35')
+    selected_abi = FLASH_ABI if is_flash else FIA_ABI
+    key_tile = paged_mla.FLASH_KEY_TILE if is_flash else paged_mla.KEY_TILE
+    geometry = native_geometry(
+        views=views, plan=plan, parallel=parallel, runtime=runtime,
+        padded_tokens=padded_tokens, kv_splits=kv_splits, dispatch=dispatch,
+        native_query_capacity=native_query_capacity,
+        source_host_dispatch=source_host_dispatch,
+        retained_kv_rows=retained_kv_rows,
+        key_tile=key_tile)
     active, capacity = geometry['active_sequence_count'], geometry['native_query_capacity']
     logical, physical = geometry['logical_heads'], geometry['physical_heads']
-    is_arch22 = implementation != IMPLEMENTATION
     host_dispatch = (
         'source_common_SplitCore_q1_geometry' if dispatch is None
         else 'declared_common_SplitCore_endpoints')
@@ -381,9 +439,13 @@ def _declaration(*, views, plan, parallel, runtime, padded_tokens=None,
         unresolved.append('kv_request_rank_unresolved')
     if operands['attention_scale'] is None:
         unresolved.append('attention_scale_source_unresolved')
-    selected_abi = FIA_ABI if is_arch22 else FLASH_ABI
+    if is_flash and not metadata_producer:
+        unresolved.append('tile_scheduler_metadata_producer_unresolved')
     native_kind, native_entry, native_ns = ABI_PUBLIC_IDENTITY[selected_abi]
-    source_rec = _ARCH22_SOURCE if is_arch22 else paged_mla.SOURCE
+    source_rec = (
+        paged_mla.FLASH_SOURCE if is_flash
+        else (_ARCH22_SOURCE if is_arch22 else paged_mla.SOURCE)
+    )
     source_path = str(source_rec.get('relative_path') or source_rec.get('cube') or '')
     source_sha = str(source_rec.get('source_sha256') or '')
     abi = _build_native_attention_abi(
@@ -426,7 +488,8 @@ def _declaration(*, views, plan, parallel, runtime, padded_tokens=None,
         'kv_owner': kv_owner, 'kv_owner_source': owner_source, 'kv_version': kv_version,
         'kv_condition': kv_condition, 'kv_producer': kv_producer, 'kv_output': kv_output,
         'kv_storage': kv_storage, 'kv_span': spans, 'request_ids': request_ids,
-        'request_rank': request_rank, 'unresolved_fields': tuple(unresolved),
+        'request_rank': request_rank, 'metadata_producer': metadata_producer,
+        'unresolved_fields': tuple(unresolved),
     }
 
 
@@ -462,8 +525,15 @@ def _declaration_op(declaration, *, views, plan, deps=(), op_id='paged_mla_decod
     active = geometry['active_sequence_count']
     capacity = geometry['native_query_capacity']
     physical = geometry['physical_heads']
-    shape = (active, physical, 1, operands['latent_width'])
-    padded = (capacity, physical, 1, operands['latent_width'])
+    is_flash = declaration.get('aclnn_symbol') == FLASH_ABI
+    shape = (
+        (active, physical, operands['latent_width']) if is_flash
+        else (active, physical, 1, operands['latent_width'])
+    )
+    padded = (
+        (capacity, physical, operands['latent_width']) if is_flash
+        else (capacity, physical, 1, operands['latent_width'])
+    )
     flops, vector_ops, hbm_bytes, mte2_bytes, mte3_bytes = _declaration_work_bounds(declaration)
     return OpSpec(
         op_id, 'attention', 'decode', 0, plan.index,
@@ -488,7 +558,7 @@ def native_contract(*, views, plan, parallel, runtime, padded_tokens=None,
                     kv_condition='active_contexts_only',
                     kv_producer='', kv_output='kv_cache',
                     kv_storage='paged_latent_kv', kv_span=None,
-                    request_rank=None, occurrence=None):
+                    request_rank=None, metadata_producer='', occurrence=None):
     """Independent typed contract for the selected paged-MLA native call.
 
     It consumes explicit values and the selected implementation, projects the
@@ -509,7 +579,7 @@ def native_contract(*, views, plan, parallel, runtime, padded_tokens=None,
         kv_version=kv_version, kv_condition=kv_condition,
         kv_producer=kv_producer, kv_output=kv_output,
         kv_storage=kv_storage, kv_span=kv_span,
-        request_rank=request_rank)
+        request_rank=request_rank, metadata_producer=metadata_producer)
     return _fragment(declaration, views=views, plan=plan, occurrence=occurrence)
 
 
@@ -527,7 +597,7 @@ def native_plan(*, views, plan, parallel, runtime, geometry,
                 kv_condition='active_contexts_only',
                 kv_producer='', kv_output='kv_cache',
                 kv_storage='paged_latent_kv', kv_span=None,
-                request_rank=None):
+                request_rank=None, metadata_producer=''):
     """Return the unique recipe OperatorPlan for this same declaration.
 
     The caller supplies physical ``geometry`` and, for arch22, its existing
@@ -548,7 +618,7 @@ def native_plan(*, views, plan, parallel, runtime, geometry,
         kv_version=kv_version, kv_condition=kv_condition,
         kv_producer=kv_producer, kv_output=kv_output,
         kv_storage=kv_storage, kv_span=kv_span,
-        request_rank=request_rank)
+        request_rank=request_rank, metadata_producer=metadata_producer)
     op = _declaration_op(declaration, views=views, plan=plan, deps=deps,
                          op_id=op_id)
     plan = (build or paged_mla.build)(op, geometry)
@@ -582,13 +652,16 @@ def _validate_dispatch(dispatch, *, contexts, heads):
 
 
 def validate(*, views, plan, parallel, model, quant, padded_tokens, kv_splits=1,
-             dispatch=None, native_query_capacity=None):
+             dispatch=None, native_query_capacity=None,
+             query_layout='BNSD', cache_layout='PA_BSND', output_layout='NBSD'):
     _validate_branch(plan, parallel)
     views = _active_views(views)
     active = len(views)
     _declared_operands(
         plan=plan, query_dtype=model.activation_dtype,
-        cache_dtype=quant.kv_dtype, output_dtype=model.activation_dtype)
+        cache_dtype=quant.kv_dtype, output_dtype=model.activation_dtype,
+        query_layout=query_layout, cache_layout=cache_layout,
+        output_layout=output_layout)
     if padded_tokens is not None and padded_tokens < active:
         raise ModelingError('paged_mla_requires_q1_bf16_dense_latent512_rope64')
     if type(kv_splits) is not int or kv_splits < 1:
@@ -609,12 +682,14 @@ def lower_attention(b, *, views, plan, heads, runtime, query, rotary, store,
                     source_host_dispatch=False, retained_kv_rows=0,
                     implementation=IMPLEMENTATION, branch=_ARCH35_BRANCH,
                     program_recipe=_ARCH35_RECIPE,
+                    query_layout='BNSD', cache_layout='PA_BSND',
+                    output_layout='NBSD',
                     attention_scale=None, attention_scale_source='unresolved',
                     kv_owner='', kv_version=None,
                     kv_condition='active_contexts_only',
                     kv_producer='', kv_output='kv_cache',
                     kv_storage='paged_latent_kv', kv_span=None,
-                    request_rank=None):
+                    request_rank=None, metadata_producer=''):
     declaration = _declaration(
         views=views, plan=plan, parallel=runtime.parallel, runtime=runtime,
         padded_tokens=padded_tokens, kv_splits=kv_splits, dispatch=dispatch,
@@ -623,18 +698,21 @@ def lower_attention(b, *, views, plan, heads, runtime, query, rotary, store,
         retained_kv_rows=retained_kv_rows, implementation=implementation,
         branch=branch, program_recipe=program_recipe,
         query_dtype=b.model.activation_dtype, cache_dtype=b.quant.kv_dtype,
-        output_dtype=b.model.activation_dtype, attention_scale=attention_scale,
+        output_dtype=b.model.activation_dtype, query_layout=query_layout,
+        cache_layout=cache_layout, output_layout=output_layout,
+        attention_scale=attention_scale,
         attention_scale_source=attention_scale_source, kv_owner=kv_owner,
         kv_version=kv_version, kv_condition=kv_condition,
         kv_producer=kv_producer, kv_output=kv_output,
         kv_storage=kv_storage, kv_span=kv_span,
-        request_rank=request_rank)
+        request_rank=request_rank, metadata_producer=metadata_producer)
     geometry = declaration['geometry']
     operands = declaration['operands']
     active = geometry['active_sequence_count']
     capacity = geometry['native_query_capacity']
     logical = geometry['logical_heads']
     physical = geometry['physical_heads']
+    is_flash = declaration.get('aclnn_symbol') == FLASH_ABI
     declared_heads = int(heads)
     if declared_heads not in (logical, physical):
         raise ModelingError('paged_mla_caller_heads_must_be_logical_or_physical')
@@ -647,28 +725,67 @@ def lower_attention(b, *, views, plan, heads, runtime, query, rotary, store,
         # Generic prolog has contiguous logical outputs. Only F.pad is needed;
         # the native padded-prolog's strided q_nope copy belongs to its caller.
         byte = dtype_bytes(operands['query_dtype'])
-        packed = []
-        for part, producer, width in (
-                ('nope', query, operands['latent_width']),
-                ('rope', rotary, operands['rope_width'])):
-            packed.append(b.work('paged_mla_query_pad_' + part, (producer,),
-                (capacity, physical, width),
-                read=capacity*declared_heads*width*byte,
-                write=capacity*physical*width*byte, family='copy',
+        if is_flash and rotary is None:
+            qk_width = operands['latent_width'] + operands['rope_width']
+            query = b.work('paged_mla_query_pad_fused', (query,),
+                (capacity, physical, qk_width),
+                read=capacity*declared_heads*qk_width*byte,
+                write=capacity*physical*qk_width*byte, family='copy',
                 dtype=operands['query_dtype'],
                 metadata=(('materialization', 'F.pad logical heads to physical'),
                           ('zero_fill_bytes',
-                           capacity*(physical-declared_heads)*width*byte))))
-        query, rotary = packed
+                           capacity*(physical-declared_heads)*qk_width*byte)))
+        else:
+            packed = []
+            for part, producer, width in (
+                    ('nope', query, operands['latent_width']),
+                    ('rope', rotary, operands['rope_width'])):
+                packed.append(b.work('paged_mla_query_pad_' + part, (producer,),
+                    (capacity, physical, width),
+                    read=capacity*declared_heads*width*byte,
+                    write=capacity*physical*width*byte, family='copy',
+                    dtype=operands['query_dtype'],
+                    metadata=(('materialization', 'F.pad logical heads to physical'),
+                              ('zero_fill_bytes',
+                               capacity*(physical-declared_heads)*width*byte))))
+            query, rotary = packed
+    if is_flash and rotary is not None:
+        # FlashMLA consumes one fused TND-576 query tensor; materialize concat
+        # explicitly whenever separate 512-wide latent and 64-wide rotary producers are supplied.
+        byte = dtype_bytes(operands['query_dtype'])
+        qk_width = operands['latent_width'] + operands['rope_width']
+        concat_bytes = capacity * physical * qk_width * byte
+        query = b.work(
+            'paged_mla_query_concat_tnd', (query, rotary),
+            (capacity, physical, qk_width),
+            read=concat_bytes, write=concat_bytes, family='copy',
+            dtype=operands['query_dtype'],
+            metadata=(('materialization', 'concat q_nope and q_rope into fused TND-576 query'),),
+        )
+        rotary = None
     flops, vector_ops, hbm_bytes, mte2_bytes, mte3_bytes = _declaration_work_bounds(declaration)
-    name = b.work('paged_mla_decode', (query, rotary, store),
-                  (active, physical, 1, operands['latent_width']),
+    out_shape = (
+        (active, physical, operands['latent_width']) if is_flash
+        else (active, physical, 1, operands['latent_width'])
+    )
+    padded_shape = (
+        (capacity, physical, operands['latent_width']) if is_flash
+        else (capacity, physical, 1, operands['latent_width'])
+    )
+    dep_list = [query]
+    if not is_flash or rotary is not None:
+        dep_list.append(rotary)
+    dep_list.append(store)
+    if is_flash and metadata_producer:
+        dep_list.append(metadata_producer)
+    deps = tuple(dep_list)
+    name = b.work('paged_mla_decode', deps, out_shape,
                   flops=flops, vector=vector_ops, read=mte2_bytes,
                   hbm_read=max(0.0, hbm_bytes - mte3_bytes), write=mte3_bytes,
                   family='attention', dtype=operands['query_dtype'])
     b.ops[-1] = replace(
         b.ops[-1], recipe=implementation, source_boundary='kernel',
         metadata=tuple(declaration['metadata'].items()),
-        padded_shape=(capacity, physical, 1, operands['latent_width']),
-        launch_shape=(capacity, physical, 1, operands['latent_width']))
+        padded_shape=padded_shape,
+        launch_shape=padded_shape)
     return name

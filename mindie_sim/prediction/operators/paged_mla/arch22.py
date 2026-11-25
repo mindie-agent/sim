@@ -10,16 +10,21 @@ Upstream-ABI: aclnnFusedInferAttentionScore
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 
+from ...runtime.tile_solver import (
+    LiveBufferSpec, TileCandidate, TileInfeasibleError, TilePipelineSpec, TileShape, solve,
+)
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from ..sharedkv.split_core import resolve_fia_mla_tiling
 from ._lowering import FIA_WORKSPACE_DEPTH, PipelineLayout, make_plan
-from .common import FP32_BYTES, capability_gap, contract_for
+from .common import FP32_BYTES, capability_gap, contract_for, validate_dense_cann_geometry
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
 ARCH_ID = "npu_arch_2201"
 UPSTREAM_ABI = "aclnnFusedInferAttentionScore"
 TASK_RECORD_COUNT = 3
@@ -27,6 +32,17 @@ WORKSPACE_DEPTH = FIA_WORKSPACE_DEPTH
 # The source assigns <=16 live M rows to the first AIV subblock.
 HEAD_TILE = 16
 NATIVE_S2_MIN = 512
+# Fixed compiled L1 and L0C allocations in fia_block_cube_nonquant_mla.h:394,415.
+ARCH22_FIA_L1_BUFFERS = 7
+ARCH22_FIA_L1_ROWS = 128
+ARCH22_FIA_L1_COLS = 288
+ARCH22_FIA_L1_ELEM_BYTES = 2
+ARCH22_FIA_L1_BYTES = (
+    ARCH22_FIA_L1_BUFFERS * ARCH22_FIA_L1_ROWS * ARCH22_FIA_L1_COLS * ARCH22_FIA_L1_ELEM_BYTES
+)
+ARCH22_FIA_L0C_SLOTS = 2
+ARCH22_FIA_L0C_SLOT_BYTES = 65_536
+ARCH22_FIA_L0C_BYTES = ARCH22_FIA_L0C_SLOTS * ARCH22_FIA_L0C_SLOT_BYTES
 CLOCKS = (
     ("q_load", "kv_load", "qk_operands", "qk", "score_store"),
     ("score_read", "softmax", "probability", "pv_load", "pv_operands", "pv",
@@ -88,6 +104,7 @@ class _FiaStrategy:
         c = contract_for(op, ctx)
         if ctx.compute_arch.arch_id != self.arch_id or c.abi != self.abi:
             raise capability_gap("paged_mla_unsupported_abi", c.abi, ctx.compute_arch.arch_id)
+        validate_dense_cann_geometry(c, self.arch_id)
         elem = int(dtype_bytes(op.dtype or "bf16"))
         l2_cap = int(ctx.geometry.buffers.get("l2", dict(ctx.datapath.buffers).get("l2", 0)))
         native_mla = (
@@ -110,6 +127,28 @@ class _FiaStrategy:
                 c = replace(c, splits=tiling.fd_splits_per_row)
         keys = min(s2_tile, max((kv for q, kv in c.sequences if q), default=0))
         heads = min(head_tile, c.physical_heads) if keys or not ctx.requests else 0
+        geometry = replace(
+            ctx.geometry, buffers={**dict(ctx.datapath.buffers), **ctx.geometry.buffers},
+            datapath=ctx.datapath, stream_owners=ctx.stream_owners,
+        )
+        candidate = TileCandidate(
+            "online_reduce",
+            TileShape(max(1, heads), max(1, keys), c.dqk, c.dqk, c.dv),
+            WORKSPACE_DEPTH,
+            (ctx.effective_aic_cores, ctx.effective_aiv_cores),
+            1, 1,
+            (
+                LiveBufferSpec("fia_l1", "l1", ARCH22_FIA_L1_BYTES, 0, TASK_RECORD_COUNT, "aic"),
+                LiveBufferSpec("fia_l0c", "l0c", ARCH22_FIA_L0C_BYTES, 0, TASK_RECORD_COUNT, "aic"),
+            ),
+            issued_flops=c.issued_matrix_flops,
+            source_guard=c.abi,
+        )
+        try:
+            solution = solve(TilePipelineSpec("paged_mla", (candidate,)), op, geometry)
+        except TileInfeasibleError as exc:
+            raise capability_gap("paged_mla_tile_infeasible", c.abi, self.arch_id) from exc
+        peaks = tuple((p.pool, p.peak_bytes, p.capacity_bytes) for p in solution.pool_peaks)
         ws_per_core = WORKSPACE_DEPTH * (
             heads * keys * (FP32_BYTES + elem) + heads * c.dv * (FP32_BYTES + elem)
         )
@@ -132,7 +171,7 @@ class _FiaStrategy:
         return make_plan(
             op, ctx, c, layout, self.sources,
             task_record_count=TASK_RECORD_COUNT, workspace_depth=WORKSPACE_DEPTH,
-            workspace_regions=workspace_regions,
+            workspace_regions=workspace_regions, pool_peaks=peaks,
         )
 
 
