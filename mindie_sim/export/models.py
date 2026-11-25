@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from mindie_sim.prediction.results import FusedPipelineDescriptor, OpOccurrence
+from mindie_sim.schema.common import ModelingError
 
 #: Export bundle schema version and binary/decimal unit divisors.
 EXPORT_BUNDLE_SCHEMA = "mindie-sim.export-bundle/2"
@@ -30,13 +31,16 @@ MAX_OBSERVATION_JSON_BYTES = 50 * MIB_BYTES
 #: Microseconds per millisecond, nanoseconds per microsecond, microseconds per second.
 US_PER_MS = 1000.0
 NS_PER_US = 1000.0
+NS_PER_US_INT = 1_000
+NS_PER_MS = 1_000_000
 US_PER_SECOND = 1_000_000.0
 #: Positive denominator floors.
 MIN_POSITIVE_SECONDS = 1e-12
 MIN_DENOM_EPS = 1e-9
-#: Default number of top gap-radar entries and top existing kernels to optimize.
+#: Default number of top gap-radar entries, top existing kernels to optimize, and target ladder trials.
 DEFAULT_GAP_RADAR_TOP_K = 20
 DEFAULT_TOP_OPTIMIZE_KERNELS = 6
+DEFAULT_EXPORT_TARGET_TRIALS = 3
 #: Absolute tolerance floor (us) and relative APE threshold (%) for reconciliation.
 RECONCILE_ABS_FLOOR_US = 2.0
 RECONCILE_APE_THRESHOLD_PCT = 10.0
@@ -45,17 +49,12 @@ P50_QUANTILE = 0.5
 P90_QUANTILE = 0.9
 #: Minimum semantic token length for automated kernel_details.csv matching.
 MIN_MATCH_TOKEN_LEN = 2
-#: Default context, batching, model-length, scenario, and SLO parameters.
-DEFAULT_EXPORT_CONTEXT_TOKENS = 1024
+#: Default batching, model-length, and scenario prompt/output parameters.
 DEFAULT_MIN_BATCHED_TOKENS = 768
 DEFAULT_MODEL_LEN_HEADROOM = 1024
 DEFAULT_MIN_MODEL_LEN = 4096
 DEFAULT_SCENARIO_PROMPT_TOKENS = 4096
 DEFAULT_SCENARIO_OUTPUT_TOKENS = 128
-DEFAULT_TPOT_SLO_MS = 50.0
-DEFAULT_TTFT_SLO_MS = 5000.0
-#: Default sparse DSA Lightning Indexer top-k fallback when unspecified on layer plan.
-DEFAULT_SPARSE_INDEX_TOPK = 2048
 #: Fallback sort key for any unrecognized archetype ordering.
 ARCHETYPE_ORDER_FALLBACK = 999
 #: Maximum character length for compact concatenated source-ref strings in Sheet 4.
@@ -97,9 +96,12 @@ MODE_MODELING = "modeling"
 
 def format_binding_badge(binding_state: str) -> str:
     """Map canonical ``binding_state`` to its human-readable provenance badge."""
-    if str(binding_state or "").strip() == BINDING_STATE_UNBOUND_FORMULA:
+    state = str(binding_state or "").strip()
+    if state in {BINDING_STATE_BOUND, BINDING_STATE_MEASURED}:
+        return BINDING_BADGE_BOUND
+    if state == BINDING_STATE_UNBOUND_FORMULA:
         return BINDING_BADGE_UNBOUND
-    return BINDING_BADGE_BOUND
+    raise ModelingError(f"unknown_binding_state:{binding_state!r}")
 
 
 #: Strictly banned internal Python simulator recipe class names (never exported).
@@ -196,13 +198,9 @@ MACRO_MOD_MOE_ROUTED = "MoE Routed Experts (GMM1 / Act / GMM2)"
 MACRO_MOD_MOE_SHARED = "MoE Shared Experts (MSO Overlapped vs Exposed)"
 MACRO_MOD_DENSE_FFN = "Dense FFN"
 MACRO_MOD_RESIDUAL_NORM = "Block AttnRes / mHC / RMSNorm"
-#: Backward-compatible alias for ``MACRO_MOD_RESIDUAL_NORM``.
-MACRO_MOD_DENSE_NORM = MACRO_MOD_RESIDUAL_NORM
 MACRO_MOD_COLLECTIVES = "Exposed TP/SP/DCP Collectives"
 MACRO_MOD_DRAFT_LAYERS = "Draft Layers (DSpark / MTP)"
 MACRO_MOD_VERIFY_HEAD = "Verify & LM Head / Embedding"
-#: Backward-compatible alias for ``MACRO_MOD_VERIFY_HEAD``.
-MACRO_MOD_SPEC_HEAD = MACRO_MOD_VERIFY_HEAD
 MACRO_MOD_ENGRAM = "Engram / PLE Memory"
 MACRO_MOD_VISION = "Vision / Multimodal Encoder"
 
@@ -275,7 +273,7 @@ DEPLOYMENT_MODE_LABELS: dict[str, str] = {
     "pd_pooled": "PD 分离 [池化]",
 }
 
-#: Closed-form storage specification matching post-TP local shapes.
+#: Internal pre-W5a merge bridge for untouched W5a memory_ledger/xlsx_memory; not exported in export/__init__.py.
 WEIGHT_QUANT_FORMATS: dict[str, dict[str, float | int]] = {
     "BF16": {"bytes": 2.0, "group": 0, "scale": 0, "aux": 0},
     "FP32": {"bytes": 4.0, "group": 0, "scale": 0, "aux": 0},
@@ -372,6 +370,9 @@ class AscendKernelDescriptor:
     needs_new_kernel: bool
     new_kernel_spec: str
     canonical_op_key: str
+    is_shipping_abi: bool = False
+    abi_entry_id: str = ""
+    binding_origin: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,8 +423,8 @@ class OperatorExportRow:
     repeat_count: int = 1
     logical_role: str = ""
     ascend_kernel: str = ""
-    kernel_backend: str = BACKEND_CANN
-    kernel_status: str = KERNEL_STATUS_EXISTING
+    kernel_backend: str = ""
+    kernel_status: str = ""
     source_ref: str = ""
     tensor_contract: str = ""
     is_overlapped: bool = False
@@ -442,10 +443,13 @@ class OperatorExportRow:
     semantic_atoms: tuple[str, ...] = ()
     comm_domain_tag: str = ""
     kernel_synthesis_spec: Any = None
-    binding_state: str = BINDING_STATE_BOUND
-    is_shipping_abi: bool = True
+    binding_state: str = ""
+    is_shipping_abi: bool = False
     stream_core_budget: str = ""
     formula_eval: Any = None
+    dur_ns: int = 0
+    exposed_ns: int = 0
+    l_star_ns: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -554,7 +558,7 @@ class NewKernelBacklogItem:
     synthesis_spec: Any = None
     math_formula: str = ""
     sram_residency_summary: str = ""
-    binding_state: str = BINDING_STATE_BOUND
+    binding_state: str = ""
     source_row_indices: tuple[int, ...] = ()
     core_budget: str = ""
     attributable_gain_ms: float | None = None
@@ -765,7 +769,7 @@ class ExportBundle:
     deployment_mode: str = ""
     prompt_tokens: int = DEFAULT_SCENARIO_PROMPT_TOKENS
     output_tokens: int = DEFAULT_SCENARIO_OUTPUT_TOKENS
-    tpot_slo_ms: float = DEFAULT_TPOT_SLO_MS
+    tpot_slo_ms: float | None = None
     ttft_slo_ms: float | None = None
     spec_method: str = ""
     spec_proposals: int = 0
@@ -781,11 +785,11 @@ class ExportBundle:
     semantic_audit_triggers: tuple[Any, ...] = ()
     macro_wall_trigger: Any = None
     rewrite_plan_sha256: str = ""
-    rewrite_verification_passed: bool = True
+    rewrite_verification_passed: bool = False
     recommended_checkpoint: Mapping[str, Any] | None = None
     va_serving_rules_summary: Mapping[str, Any] | None = None
     analysis_mode: str = MODE_SIMULATION
-    binding_state: str = BINDING_STATE_BOUND
+    binding_state: str = ""
     has_unbound_formula_ops: bool = False
     handoff_tpot_ms: float = 0.0
     cluster_concurrency: int = 0
@@ -798,3 +802,81 @@ class ExportBundle:
     per_layer_timings: Mapping[tuple[str, int], Mapping[str, Any]] = field(default_factory=dict)
     co_design_opportunities: tuple[Any, ...] = ()
     stage_waterfall: tuple[dict[str, Any], ...] = ()
+    step_span_ns: int = 0
+    idle_or_wait_ns: int = 0
+    step_l_star_ns: int = 0
+    case_digest: str = ""
+    execution_key_sha256: str = ""
+    engine_step_receipt: Any = None
+    reverted_to_native_baseline: bool = False
+    host_launch_us: float = 0.0
+    graph_launch_us: float = 0.0
+    h2d_startup_us: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class ComparisonRequest:
+    """Role-tagged comparison polarity contract locking Before vs After roles."""
+
+    before_case_digest: str
+    after_case_digest: str
+    before_execution_key: str = ""
+    after_execution_key: str = ""
+    before_plan_sha256: str = ""
+    after_plan_sha256: str = ""
+    comparison_policy: str = "monotonic_optimization"
+    require_model_scope: bool = True
+
+
+NS_FLOAT_CONSISTENCY_ABS_NS = 1.0
+NS_FLOAT_CONSISTENCY_REL_TOL = 1e-6
+
+
+def _ns_consistent(stored_ns: int, expected_ns_float: float) -> bool:
+    if stored_ns <= 0:
+        return False
+    tol = max(NS_FLOAT_CONSISTENCY_ABS_NS, NS_FLOAT_CONSISTENCY_REL_TOL * float(stored_ns))
+    return abs(float(stored_ns) - expected_ns_float) <= tol
+
+
+def op_dur_int_ns(op: OperatorExportRow, repeat_count: int) -> int:
+    """Resolve exact integer-ns total duration for ``op`` over ``repeat_count`` calls."""
+    rep = max(1, int(repeat_count))
+    expected = float(op.dur_us) * float(rep) * float(NS_PER_US)
+    stored = int(getattr(op, "dur_ns", 0) or 0)
+    if int(op.repeat_count) == rep and _ns_consistent(stored, expected):
+        return stored
+    return max(0, int(round(expected)))
+
+
+def op_exposed_int_ns(op: OperatorExportRow, repeat_count: int) -> int:
+    """Resolve exact integer-ns exposed duration for ``op`` over ``repeat_count`` calls."""
+    if op.is_overlapped:
+        return 0
+    rep = max(1, int(repeat_count))
+    expected = float(op.exposed_dur_us) * float(rep) * float(NS_PER_US)
+    stored = int(getattr(op, "exposed_ns", 0) or 0)
+    if int(op.repeat_count) == rep and _ns_consistent(stored, expected):
+        return stored
+    return max(0, int(round(expected)))
+
+
+def op_lstar_int_ns(op: OperatorExportRow, repeat_count: int) -> int:
+    """Resolve exact integer-ns L* lower bound for ``op`` over ``repeat_count`` calls."""
+    if op.is_overlapped:
+        return 0
+    rep = max(1, int(repeat_count))
+    expected = float(op.l_star_lean_us) * float(rep) * float(NS_PER_US)
+    stored = int(getattr(op, "l_star_ns", 0) or 0)
+    if int(op.repeat_count) == rep and _ns_consistent(stored, expected):
+        return stored
+    return max(0, int(round(expected)))
+
+
+def bundle_step_int_ns(bundle: ExportBundle) -> int:
+    """Resolve exact integer-ns step span for ``bundle``."""
+    expected = float(bundle.step_span_us) * float(NS_PER_US)
+    stored = int(getattr(bundle, "step_span_ns", 0) or 0)
+    if _ns_consistent(stored, expected):
+        return stored
+    return max(0, int(round(expected)))

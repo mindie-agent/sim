@@ -24,9 +24,12 @@ from typing import Any
 from mindie_sim.schema.common import ModelingError
 
 from .action_plan import (
-    CONSERVATION_EPS_MS, ComparisonPlan, GroupAccounting, WaterfallSummary,
-    anchor_stage_waterfall, build_actionable_roadmap, build_comparison_plan,
+    CONSERVATION_EPS_MS,
+    WF_STAGE_CONFIG, WF_STAGE_FRAMEWORK, WF_STAGE_KERNEL, WF_STAGE_RESIDUAL,
+    ComparisonPlan, GroupAccounting, WaterfallSummary,
+    build_actionable_roadmap, build_comparison_plan,
     build_new_kernel_backlog, build_parallelism_codesign_note, build_pending_kernel_details,
+    classify_waterfall_stage,
 )
 from .agent_brief import (
     AGENT_BRIEF_MAX_BYTES, _compact_agent_brief_to_budget, build_agent_brief,
@@ -37,9 +40,12 @@ from .kernel_catalog import classify_macro_module, extract_semantic_atoms, strip
 from .models import (
     BINDING_STATE_UNBOUND_FORMULA, L1_MOD_RESIDUAL_MEM, MACRO_L1_HIERARCHY,
     MACRO_MOD_DRAFT_LAYERS, MACRO_MOD_MOE_SHARED, MACRO_MOD_VERIFY_HEAD,
-    MIN_DENOM_EPS, OVERLAP_EXPOSED_EPS_US, US_PER_MS, AlignedComparisonRow,
-    ExportBundle, MacroModuleRow, OperatorExportRow,
+    MIN_DENOM_EPS, NS_PER_MS, NS_PER_US, OVERLAP_EXPOSED_EPS_US, US_PER_MS,
+    AlignedComparisonRow, ComparisonRequest, ExportBundle, MacroModuleRow,
+    OperatorExportRow, bundle_step_int_ns, op_dur_int_ns, op_exposed_int_ns,
+    op_lstar_int_ns,
 )
+from .public_view import format_track_label
 
 SLICE_MAX_EXPLICIT_LAYERS = 4
 MIN_GROUP_SIZE = 2
@@ -50,39 +56,13 @@ _DEPTH_NOTE_STRIP_RE = re.compile(
     r"(?:\s*\|\s*)?(?:depth-varying\b[^|]*|L\d+\s*(?:->|→)\s*L\d+，随层深[^|]*)"
 )
 
-#: Canonical 3-stage + residual waterfall stage identifiers for Sheet 4.
-WF_STAGE_CONFIG = "config"
-WF_STAGE_FRAMEWORK = "framework"
-WF_STAGE_KERNEL = "kernel"
-WF_STAGE_RESIDUAL = "residual"
-_FRAMEWORK_REASONS = frozenset({
-    "stream_masking_change",
-    "shipping_fusion_enablement",
-    "subgraph_reassociation",
-    "shipping_route_switch",
-    "framework_graph_edit",
-})
-_PUBLIC_TRACK_LABELS: dict[str, str] = {
-    "merged": "当前栈基线",
-    "unmerged_pr": "提案版本",
-    "expected_ideal": "目标架构预演",
-    "raw_eager": "Eager 基线",
-}
 _UNBOUND_PROJECTION_BADGE = "[未绑定实现 · 硬件物理预演]"
 
 
 def format_public_track_label(bundle: ExportBundle, *, role: str = "") -> str:
-    """Map internal track tokens to clean Chinese public display labels."""
+    """Delegate strictly to canonical ``public_view.format_track_label`` (C-1 StackTrack)."""
     raw = str(getattr(bundle, "feature_track", "") or "").strip()
-    low = raw.lower()
-    if low in _PUBLIC_TRACK_LABELS:
-        base = _PUBLIC_TRACK_LABELS[low]
-    elif not raw:
-        base = "基线配置" if role == "before" else "优化方案"
-    else:
-        base = raw
-        for token, zh in _PUBLIC_TRACK_LABELS.items():
-            base = re.sub(re.escape(token), zh, base, flags=re.IGNORECASE)
+    base = format_track_label(raw) if raw else ("基线配置" if role == "before" else "优化方案")
     has_unbound = bool(getattr(bundle, "has_unbound_formula_ops", False)) or any(
         getattr(op, "binding_state", "") == BINDING_STATE_UNBOUND_FORMULA
         for op in getattr(bundle, "operators", ())
@@ -124,7 +104,7 @@ def _op_exact_key(op: OperatorExportRow) -> str:
 
 def _op_occ_key(op: OperatorExportRow) -> tuple[int, int, int, str]:
     occ = op.occurrence
-    return (int(occ.replica), int(occ.stage), int(occ.rank), str(occ.op_id))
+    return (int(occ.replica), int(occ.stage), (-1 if occ.rank is None else int(occ.rank)), str(occ.op_id))
 
 
 def _op_atoms(op: OperatorExportRow) -> frozenset[str]:
@@ -200,7 +180,7 @@ def _build_side_dag(
     succs: dict[int, set[int]] = {i: set() for i in range(len(ops))}
     for idx, op in enumerate(ops):
         for pred in op.predecessors:
-            pkey = (int(pred.replica), int(pred.stage), int(pred.rank), str(pred.op_id))
+            pkey = (int(pred.replica), int(pred.stage), (-1 if pred.rank is None else int(pred.rank)), str(pred.op_id))
             p_idx = unique_occ.get(pkey)
             if p_idx is None:
                 p_idx = unique_opid.get(str(pred.op_id))
@@ -561,6 +541,15 @@ def _align_archetype_bipartite(
     return rows
 
 
+def _scale_slice_op_count(op: OperatorExportRow, cnt: int) -> OperatorExportRow:
+    if int(op.repeat_count) <= cnt:
+        return op
+    dur_ns = max(0, int(round(float(op.dur_us) * float(cnt) * float(NS_PER_US))))
+    exp_ns = 0 if op.is_overlapped else max(0, int(round(float(op.exposed_dur_us) * float(cnt) * float(NS_PER_US))))
+    ls_ns = 0 if op.is_overlapped else max(0, int(round(float(op.l_star_lean_us) * float(cnt) * float(NS_PER_US))))
+    return replace(op, repeat_count=cnt, dur_ns=dur_ns, exposed_ns=exp_ns, l_star_ns=ls_ns)
+
+
 def _reaggregate_slice_ops(
     bundle: ExportBundle,
     ops: Sequence[OperatorExportRow],
@@ -578,8 +567,9 @@ def _reaggregate_slice_ops(
     for op in ops:
         site = strip_op_prefix(op.op_id)
         durs: list[float] = []
-        exps: list[float] = []
-        lstars: list[float] = []
+        durs_ns: list[int] = []
+        exps_ns: list[int] = []
+        lstars_ns: list[int] = []
         matched_idxs: list[int] = []
         block_size = 0
         for lyr in ordered_idxs:
@@ -592,32 +582,47 @@ def _reaggregate_slice_ops(
             d_val = float(ops_map[site][1])
             durs.append(d_val)
             matched_idxs.append(lyr)
+            dur_ns_map = rec.get("ops_dur_ns")
+            durs_ns.append(
+                int(dur_ns_map[site])
+                if (isinstance(dur_ns_map, Mapping) and site in dur_ns_map)
+                else max(0, int(round(d_val * float(NS_PER_US))))
+            )
+            exp_ns_map = rec.get("ops_exposed_ns")
             exps_map = rec.get("ops_exposed")
-            if isinstance(exps_map, Mapping) and site in exps_map:
-                exps.append(float(exps_map[site]))
+            if isinstance(exp_ns_map, Mapping) and site in exp_ns_map:
+                exps_ns.append(int(exp_ns_map[site]))
+            elif isinstance(exps_map, Mapping) and site in exps_map:
+                exps_ns.append(max(0, int(round(float(exps_map[site]) * float(NS_PER_US)))))
             else:
-                exps.append(0.0 if op.is_overlapped else d_val)
+                exps_ns.append(0 if op.is_overlapped else durs_ns[-1])
+            ls_ns_map = rec.get("ops_lstar_ns")
             ls_map = rec.get("ops_lstar")
-            if isinstance(ls_map, Mapping) and site in ls_map:
-                lstars.append(float(ls_map[site]))
+            if isinstance(ls_ns_map, Mapping) and site in ls_ns_map:
+                lstars_ns.append(int(ls_ns_map[site]))
+            elif isinstance(ls_map, Mapping) and site in ls_map:
+                lstars_ns.append(max(0, int(round(float(ls_map[site]) * float(NS_PER_US)))))
             else:
-                lstars.append(op.l_star_lean_us)
+                lstars_ns.append(max(0, int(round(float(op.l_star_lean_us) * float(NS_PER_US)))))
             bs = int(rec.get("residual_block_size", 0) or 0)
             if bs > 0:
                 block_size = bs
         if not durs:
             if full_arch_len > 0 and int(op.repeat_count) < full_arch_len:
                 continue
-            reagg.append(replace(op, repeat_count=cnt) if int(op.repeat_count) > cnt else op)
+            reagg.append(_scale_slice_op_count(op, cnt))
             continue
         eff_cnt = len(durs)
         if eff_cnt != cnt and not (full_arch_len > 0 and int(op.repeat_count) < full_arch_len):
-            reagg.append(replace(op, repeat_count=cnt) if int(op.repeat_count) > cnt else op)
+            reagg.append(_scale_slice_op_count(op, cnt))
             continue
-        inv = 1.0 / float(eff_cnt)
-        mean_dur = sum(durs) * inv
-        mean_exp = sum(exps) * inv
-        mean_lstar = sum(lstars) * inv
+        tot_dur_ns = sum(durs_ns)
+        tot_exp_ns = sum(exps_ns)
+        tot_lstar_ns = sum(lstars_ns)
+        denom_us = float(eff_cnt) * float(NS_PER_US)
+        mean_dur = float(tot_dur_ns) / denom_us
+        mean_exp = float(tot_exp_ns) / denom_us
+        mean_lstar = float(tot_lstar_ns) / denom_us
         fully_hidden = mean_dur > OVERLAP_EXPOSED_EPS_US and mean_exp <= OVERLAP_EXPOSED_EPS_US
         eff = min(1.0, mean_lstar / mean_dur) if (mean_dur > 0.0 and mean_lstar > 0.0) else None
         base_contract = _DEPTH_NOTE_STRIP_RE.sub("", op.tensor_contract or "").strip(" |")
@@ -643,6 +648,9 @@ def _reaggregate_slice_ops(
             gap_ratio=None if fully_hidden else ((mean_dur / mean_lstar) if mean_lstar > 0.0 else None),
             roofline_efficiency=eff,
             tensor_contract=new_contract,
+            dur_ns=tot_dur_ns,
+            exposed_ns=0 if fully_hidden else tot_exp_ns,
+            l_star_ns=0 if fully_hidden else tot_lstar_ns,
         ))
     return tuple(reagg)
 
@@ -785,23 +793,31 @@ def align_before_after_operators(before_bundle: ExportBundle, after_bundle: Expo
     return tuple(aligned)
 
 
-def _accumulate_macro_stats(bundle: ExportBundle) -> dict[str, dict[str, Any]]:
+MACRO_MOD_IDLE_WAIT = "Idle / Host Wait / Bubble (idle_or_wait)"
+
+
+def _accumulate_macro_stats(bundle: ExportBundle) -> tuple[dict[str, dict[str, Any]], int, int]:
     arch_by_id = {a.archetype_id: a for a in bundle.archetypes}
     stats: dict[str, dict[str, Any]] = {}
+    op_exp_total_ns = 0
     for op in bundle.operators:
         mod = classify_macro_module(op)
         bucket = stats.setdefault(mod, {
-            "exposed_ms": 0.0, "raw_ms": 0.0, "lstar_ms": 0.0, "bound_ms": defaultdict(float),
+            "exposed_ns": 0, "raw_ns": 0, "lstar_ns": 0, "bound_ms": defaultdict(float),
             "masker_ms": defaultdict(float), "target_layer_indices": set(), "draft_layers": 0, "has_head_or_embed": False,
         })
         rep = max(1, int(op.repeat_count))
-        exp_ms = 0.0 if op.is_overlapped else (op.exposed_dur_us * rep / US_PER_MS)
-        raw_ms = op.dur_us * rep / US_PER_MS
+        exp_ns = op_exposed_int_ns(op, rep)
+        raw_ns = op_dur_int_ns(op, rep)
+        ls_ns = op_lstar_int_ns(op, rep)
+        exp_ms = float(exp_ns) / float(NS_PER_MS)
+        raw_ms = float(raw_ns) / float(NS_PER_MS)
         masked_pos_ms = max(0.0, raw_ms - exp_ms)
-        bucket["exposed_ms"] += exp_ms
-        bucket["raw_ms"] += raw_ms
-        bucket["lstar_ms"] += 0.0 if op.is_overlapped else (op.l_star_lean_us * rep / US_PER_MS)
-        if exp_ms > 0.0:
+        bucket["exposed_ns"] += exp_ns
+        bucket["raw_ns"] += raw_ns
+        bucket["lstar_ns"] += ls_ns
+        op_exp_total_ns += exp_ns
+        if exp_ns > 0:
             bucket["bound_ms"][op.bound_display or op.dominant_bound] += exp_ms
         if masked_pos_ms > CONSERVATION_EPS_MS:
             bucket["masker_ms"][op.masked_by or "主计算流并发算子"] += masked_pos_ms
@@ -815,7 +831,9 @@ def _accumulate_macro_stats(bundle: ExportBundle) -> dict[str, dict[str, Any]]:
             bucket["target_layer_indices"].update(int(x) for x in arch.layer_indices)
         else:
             bucket["has_head_or_embed"] = True
-    return stats
+    step_ns = max(bundle_step_int_ns(bundle), op_exp_total_ns)
+    idle_ns = max(0, step_ns - op_exp_total_ns)
+    return stats, step_ns, idle_ns
 
 
 def _format_macro_layer_label(
@@ -852,14 +870,17 @@ def _build_masking_note(
 def build_macro_module_breakdown(
     before_bundle: ExportBundle, after_bundle: ExportBundle | None = None,
 ) -> tuple[MacroModuleRow, ...]:
-    """Aggregate L1/L2 Raw, Masked, Exposed ms and ``us / (tok*die)`` with 100% conservation."""
-    bef_stats = _accumulate_macro_stats(before_bundle)
+    """Aggregate L1/L2 Raw, Masked, Exposed ms and ``us / (tok*die)`` with 0-ns conservation."""
+    bef_stats, tot_bef_ns, idle_b_ns = _accumulate_macro_stats(before_bundle)
     aft_bundle = after_bundle or before_bundle
-    aft_stats = bef_stats if after_bundle is None else _accumulate_macro_stats(after_bundle)
+    if after_bundle is None:
+        aft_stats, tot_aft_ns, idle_a_ns = bef_stats, tot_bef_ns, idle_b_ns
+    else:
+        aft_stats, tot_aft_ns, idle_a_ns = _accumulate_macro_stats(after_bundle)
     b_ntok = max(float(before_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
     a_ntok = max(float(aft_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
-    tot_bef = sum(v["exposed_ms"] for v in bef_stats.values())
-    tot_aft = sum(v["exposed_ms"] for v in aft_stats.values())
+    tot_bef = float(tot_bef_ns) / float(NS_PER_MS)
+    tot_aft = float(tot_aft_ns) / float(NS_PER_MS)
     l1_by_mod = {mod: l1 for l1, mods in MACRO_L1_HIERARCHY for mod in mods}
     ordered_mods = list(dict.fromkeys([*(mod for _, mods in MACRO_L1_HIERARCHY for mod in mods), *bef_stats.keys(), *aft_stats.keys()]))
 
@@ -868,11 +889,16 @@ def build_macro_module_breakdown(
         b_info, a_info = bef_stats.get(mod), aft_stats.get(mod)
         if b_info is None and a_info is None:
             continue
-        bef_ms, aft_ms = float(b_info["exposed_ms"]) if b_info else 0.0, float(a_info["exposed_ms"]) if a_info else 0.0
-        raw_bef, raw_aft = float(b_info["raw_ms"]) if b_info else 0.0, float(a_info["raw_ms"]) if a_info else 0.0
-        lstar_ms = float(a_info["lstar_ms"]) if a_info else 0.0
-        if raw_bef <= 0.0 and raw_aft <= 0.0:
+        bef_ns = int(b_info["exposed_ns"]) if b_info else 0
+        aft_ns = int(a_info["exposed_ns"]) if a_info else 0
+        raw_bef_ns = int(b_info["raw_ns"]) if b_info else 0
+        raw_aft_ns = int(a_info["raw_ns"]) if a_info else 0
+        lstar_ns = int(a_info["lstar_ns"]) if a_info else 0
+        if raw_bef_ns <= 0 and raw_aft_ns <= 0:
             continue
+        bef_ms, aft_ms = float(bef_ns) / float(NS_PER_MS), float(aft_ns) / float(NS_PER_MS)
+        raw_bef, raw_aft = float(raw_bef_ns) / float(NS_PER_MS), float(raw_aft_ns) / float(NS_PER_MS)
+        lstar_ms = float(lstar_ns) / float(NS_PER_MS)
         merged_indices = (set(b_info["target_layer_indices"]) if b_info else set()) | (set(a_info["target_layer_indices"]) if a_info else set())
         d_layers = max(int(b_info["draft_layers"]) if b_info else 0, int(a_info["draft_layers"]) if a_info else 0)
         has_head = bool((b_info and b_info["has_head_or_embed"]) or (a_info and a_info["has_head_or_embed"]))
@@ -883,202 +909,133 @@ def build_macro_module_breakdown(
         else:
             dom_bound = max(bw.items(), key=lambda kv: kv[1])[0] if bw else "已融合 / 100% 掩盖"
         mask_note = _build_masking_note(mod, raw_aft, aft_ms, raw_bef, bef_ms, a_info["masker_ms"] if a_info else {}, b_info["masker_ms"] if b_info else {}, dom_bound)
-        b_upt, a_upt = bef_ms * US_PER_MS / b_ntok, aft_ms * US_PER_MS / a_ntok
+        b_upt = float(bef_ns) / (float(NS_PER_US) * b_ntok)
+        a_upt = float(aft_ns) / (float(NS_PER_US) * a_ntok)
         rows.append(MacroModuleRow(
             module_name=mod, layer_calls_label=layer_lbl, layer_count=layer_cnt,
             before_ms=bef_ms, before_share_pct=(100.0 * bef_ms / tot_bef) if tot_bef > 0.0 else 0.0,
             after_ms=aft_ms, after_share_pct=(100.0 * aft_ms / tot_aft) if tot_aft > 0.0 else 0.0,
-            saved_ms=bef_ms - aft_ms, lstar_ms=lstar_ms, dominant_bound=dom_bound,
+            saved_ms=float(bef_ns - aft_ns) / float(NS_PER_MS), lstar_ms=lstar_ms, dominant_bound=dom_bound,
             raw_before_ms=raw_bef, raw_after_ms=raw_aft, l1_group=l1_by_mod.get(mod, L1_MOD_RESIDUAL_MEM),
-            masked_before_ms=bef_ms - raw_bef, masked_after_ms=aft_ms - raw_aft, masking_note=mask_note,
+            masked_before_ms=float(bef_ns - raw_bef_ns) / float(NS_PER_MS),
+            masked_after_ms=float(aft_ns - raw_aft_ns) / float(NS_PER_MS), masking_note=mask_note,
             before_us_per_tok_die=b_upt, after_us_per_tok_die=a_upt, saved_us_per_tok_die=b_upt - a_upt,
+        ))
+    if idle_b_ns > 0 or idle_a_ns > 0:
+        ib_ms, ia_ms = float(idle_b_ns) / float(NS_PER_MS), float(idle_a_ns) / float(NS_PER_MS)
+        ib_upt = float(idle_b_ns) / (float(NS_PER_US) * b_ntok)
+        ia_upt = float(idle_a_ns) / (float(NS_PER_US) * a_ntok)
+        rows.append(MacroModuleRow(
+            module_name=MACRO_MOD_IDLE_WAIT, layer_calls_label="Step Wall", layer_count=0,
+            before_ms=ib_ms, before_share_pct=(100.0 * ib_ms / tot_bef) if tot_bef > 0.0 else 0.0,
+            after_ms=ia_ms, after_share_pct=(100.0 * ia_ms / tot_aft) if tot_aft > 0.0 else 0.0,
+            saved_ms=float(idle_b_ns - idle_a_ns) / float(NS_PER_MS), lstar_ms=0.0,
+            dominant_bound="Host / Sync / Bubble", raw_before_ms=ib_ms, raw_after_ms=ia_ms,
+            l1_group=L1_MOD_RESIDUAL_MEM, masked_before_ms=0.0, masked_after_ms=0.0,
+            masking_note="Host / Sync / Bubble",
+            before_us_per_tok_die=ib_upt, after_us_per_tok_die=ia_upt, saved_us_per_tok_die=ib_upt - ia_upt,
         ))
     return tuple(rows)
 
 
-def is_same_deployment_config(before_bundle: ExportBundle, after_bundle: ExportBundle) -> bool:
-    """Return True when Before and After share identical parallel/batch/quant/spec config."""
-    bm, am = before_bundle.memory_ledger, after_bundle.memory_ledger
-    return (
-        bm.dp == am.dp
-        and bm.tp == am.tp
-        and bm.ep == am.ep
-        and bm.pp == am.pp
-        and bm.dcp == am.dcp
-        and bm.pcp == am.pcp
-        and bm.concurrency == am.concurrency
-        and bm.weight_quant == am.weight_quant
-        and bm.cache_dtype == am.cache_dtype
-        and before_bundle.spec_proposals == after_bundle.spec_proposals
-        and before_bundle.sequence_parallel == after_bundle.sequence_parallel
-    )
+_CANONICAL_TRACK_RANK: dict[str, int] = {
+    "eager": 0,
+    "shipping": 1,
+    "proposed": 2,
+    "target": 3,
+}
+_VALID_COMPARISON_POLICIES = frozenset({"monotonic_optimization", "signed_comparison"})
 
 
-def _row_pre_edit_receipt_ms(
-    row: AlignedComparisonRow,
-    stage_ops_by_key: Mapping[tuple[str, str], float],
-) -> float | None:
-    """Resolve intermediate pre-kernel-edit exposed ms ``C`` before card materiality filtering."""
-    if not row.after_ops:
-        return None
-    a_rep = row.effective_after_repeat
-    vals: list[float] = []
-    for a_op in row.after_ops:
-        fe = a_op.formula_eval
-        raw = (
-            fe.get("after_pre_edit_exposed_us")
-            if isinstance(fe, Mapping)
-            else getattr(fe, "after_pre_edit_exposed_us", None)
-        )
-        if raw is not None:
-            vals.append(float(raw) * a_rep / US_PER_MS)
-            continue
-        key = (row.archetype_id, strip_op_prefix(a_op.op_id).lower())
-        if key in stage_ops_by_key:
-            vals.append(stage_ops_by_key[key] * a_rep / US_PER_MS)
-            continue
-        return None
-    return sum(vals)
+def _bundle_canonical_track(bundle: ExportBundle) -> str:
+    raw = str(getattr(bundle, "feature_track", "") or "").strip().lower()
+    if not raw:
+        eff_cfg = getattr(bundle, "effective_config", None)
+        if isinstance(eff_cfg, Mapping) and bool(eff_cfg.get("raw_eager")):
+            return "eager"
+        return "target" if bool(getattr(bundle, "target_envelope_applied", False)) else "shipping"
+    if raw not in _CANONICAL_TRACK_RANK:
+        raise ModelingError(f"invalid_comparison_track:{bundle.feature_track!r}")
+    return raw
 
 
-def _index_intermediate_bundle_ops(bundle: ExportBundle | None) -> dict[tuple[str, str], float]:
-    if bundle is None:
-        return {}
-    out: dict[tuple[str, str], float] = {}
-    for op in bundle.operators:
-        key = (op.archetype_id or op.layer_label, strip_op_prefix(op.op_id).lower())
-        out[key] = 0.0 if op.is_overlapped else float(op.exposed_dur_us)
-    return out
-
-
-def classify_waterfall_stage(
-    acc: GroupAccounting,
+def build_default_comparison_request(
     before_bundle: ExportBundle,
     after_bundle: ExportBundle,
-) -> tuple[str, str | None]:
-    """Map one ``GroupAccounting`` row onto ``(primary_stage, pre_edit_stage)`` for Sheet 4."""
-    same_cfg = is_same_deployment_config(before_bundle, after_bundle)
-    if acc.after_pre_edit_ms is not None:
-        pre_stage = WF_STAGE_FRAMEWORK if same_cfg else WF_STAGE_CONFIG
-        post_stage = WF_STAGE_KERNEL if acc.bucket in {"new", "tune"} else WF_STAGE_RESIDUAL
-        return post_stage, pre_stage
-    if acc.bucket in {"new", "tune"}:
-        return WF_STAGE_KERNEL, None
-    if acc.bucket == "config":
-        if same_cfg or acc.reason in _FRAMEWORK_REASONS:
-            return WF_STAGE_FRAMEWORK, None
-        return WF_STAGE_CONFIG, None
-    return WF_STAGE_RESIDUAL, None
-
-
-def enrich_comparison_plan_stage_receipts(
-    plan: ComparisonPlan,
-    before_bundle: ExportBundle,
-    after_bundle: ExportBundle | None,
-    aligned_rows: Sequence[AlignedComparisonRow],
     *,
-    config_bundle: ExportBundle | None = None,
-    framework_bundle: ExportBundle | None = None,
-) -> ComparisonPlan:
-    """Compute/preserve exact intermediate stage ``C`` receipts BEFORE card filtering."""
-    if after_bundle is None or not plan.group_accounting:
-        return plan
-    a_ntok = max(float(after_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
-    stage_ops = _index_intermediate_bundle_ops(framework_bundle or config_bundle)
-    updated_acc: list[GroupAccounting] = []
-    cfg_ms_tot = cfg_upt_tot = 0.0
-    new_ms_tot = new_upt_tot = 0.0
-    tune_ms_tot = tune_upt_tot = 0.0
-    res_ms_tot = res_upt_tot = 0.0
-    for acc in plan.group_accounting:
-        row = aligned_rows[acc.row_index] if 0 <= acc.row_index < len(aligned_rows) else None
-        pre_c = acc.after_pre_edit_ms
-        if pre_c is None and row is not None:
-            pre_c = _row_pre_edit_receipt_ms(row, stage_ops)
-        if pre_c is not None and acc.bucket in {"new", "tune", "residual"}:
-            c_ms = float(pre_c)
-            c_upt = c_ms * US_PER_MS / a_ntok
-            cfg_ms = acc.before_ms - c_ms
-            cfg_upt = acc.before_upt - c_upt
-            kern_ms = acc.saved_ms - cfg_ms
-            kern_upt = acc.saved_upt - cfg_upt
-            if abs(cfg_ms) <= CONSERVATION_EPS_MS and abs(cfg_upt) <= CONSERVATION_EPS_MS:
-                # Zero pre-edit difference: avoid spurious split terms on identical stages.
-                new_acc = replace(
-                    acc, after_pre_edit_ms=None,
-                    config_share_ms=0.0, config_share_upt=0.0,
-                    kernel_share_ms=acc.saved_ms, kernel_share_upt=acc.saved_upt,
-                )
-            else:
-                new_acc = replace(
-                    acc, after_pre_edit_ms=c_ms,
-                    config_share_ms=cfg_ms, config_share_upt=cfg_upt,
-                    kernel_share_ms=kern_ms, kernel_share_upt=kern_upt,
-                )
-        else:
-            new_acc = acc
-        updated_acc.append(new_acc)
-        if new_acc.bucket == "config":
-            cfg_ms_tot += new_acc.saved_ms
-            cfg_upt_tot += new_acc.saved_upt
-        elif new_acc.bucket == "new":
-            cfg_ms_tot += new_acc.config_share_ms
-            cfg_upt_tot += new_acc.config_share_upt
-            new_ms_tot += new_acc.kernel_share_ms
-            new_upt_tot += new_acc.kernel_share_upt
-        elif new_acc.bucket == "tune":
-            cfg_ms_tot += new_acc.config_share_ms
-            cfg_upt_tot += new_acc.config_share_upt
-            tune_ms_tot += new_acc.kernel_share_ms
-            tune_upt_tot += new_acc.kernel_share_upt
-        else:
-            cfg_ms_tot += new_acc.config_share_ms
-            cfg_upt_tot += new_acc.config_share_upt
-            res_ms_tot += new_acc.kernel_share_ms
-            res_upt_tot += new_acc.kernel_share_upt
+    comparison_policy: str = "monotonic_optimization",
+    require_model_scope: bool | None = None,
+) -> ComparisonRequest:
+    """Build a role-tagged ``ComparisonRequest`` binding Before and After bundle digests."""
+    eff_req_model = (
+        bool(require_model_scope)
+        if require_model_scope is not None
+        else (before_bundle.scope == "model" and after_bundle.scope == "model")
+    )
+    return ComparisonRequest(
+        before_case_digest=str(getattr(before_bundle, "case_digest", "") or ""),
+        after_case_digest=str(getattr(after_bundle, "case_digest", "") or ""),
+        before_execution_key=str(getattr(before_bundle, "execution_key_sha256", "") or ""),
+        after_execution_key=str(getattr(after_bundle, "execution_key_sha256", "") or ""),
+        before_plan_sha256=str(getattr(before_bundle, "rewrite_plan_sha256", "") or ""),
+        after_plan_sha256=str(getattr(after_bundle, "rewrite_plan_sha256", "") or ""),
+        comparison_policy=comparison_policy,
+        require_model_scope=eff_req_model,
+    )
 
-    wf = plan.waterfall
-    new_wf = replace(
-        wf,
-        config_saved_ms=cfg_ms_tot,
-        config_saved_upt=cfg_upt_tot,
-        new_kernel_saved_ms=new_ms_tot,
-        new_kernel_saved_upt=new_upt_tot,
-        tune_kernel_saved_ms=tune_ms_tot,
-        tune_kernel_saved_upt=tune_upt_tot,
-        residual_saved_ms=res_ms_tot,
-        residual_saved_upt=res_upt_tot,
-    )
-    stage_ms = {WF_STAGE_CONFIG: 0.0, WF_STAGE_FRAMEWORK: 0.0, WF_STAGE_KERNEL: 0.0, WF_STAGE_RESIDUAL: 0.0}
-    for acc_item in updated_acc:
-        primary_st, pre_st = classify_waterfall_stage(acc_item, before_bundle, after_bundle)
-        if pre_st is None:
-            stage_ms[primary_st] += acc_item.saved_ms
-        else:
-            stage_ms[pre_st] += acc_item.config_share_ms
-            stage_ms[primary_st] += acc_item.kernel_share_ms
-    anchored_stage_wf = anchor_stage_waterfall(
-        before_bundle,
-        after_bundle,
-        config_bridge_span_us=(float(config_bundle.step_span_us) if config_bundle is not None else None),
-        config_saved_us=cfg_ms_tot * US_PER_MS,
-        config_stage_saved_us=stage_ms[WF_STAGE_CONFIG] * US_PER_MS,
-        framework_stage_saved_us=stage_ms[WF_STAGE_FRAMEWORK] * US_PER_MS,
-    )
-    return replace(
-        plan, waterfall=new_wf, group_accounting=tuple(updated_acc), stage_waterfall=anchored_stage_wf,
-    )
+
+def assert_comparison_polarity(
+    before_bundle: ExportBundle,
+    after_bundle: ExportBundle,
+    comparison_request: ComparisonRequest,
+) -> None:
+    """Fail-loud 3-argument role-tagged polarity & scope guard for Before vs After comparisons."""
+    if not isinstance(comparison_request, ComparisonRequest):
+        raise ModelingError("comparison_request_invalid:expected ComparisonRequest")
+    if comparison_request.comparison_policy not in _VALID_COMPARISON_POLICIES:
+        raise ModelingError(f"comparison_policy_invalid:{comparison_request.comparison_policy!r}")
+    b_dig = str(getattr(before_bundle, "case_digest", "") or "")
+    a_dig = str(getattr(after_bundle, "case_digest", "") or "")
+    if comparison_request.before_case_digest and b_dig != comparison_request.before_case_digest:
+        raise ModelingError("export_comparison_reversed_before_after:bundle_case_digest_role_mismatch")
+    if comparison_request.after_case_digest and a_dig != comparison_request.after_case_digest:
+        raise ModelingError("export_comparison_reversed_before_after:bundle_case_digest_role_mismatch")
+    b_ek = str(getattr(before_bundle, "execution_key_sha256", "") or "")
+    a_ek = str(getattr(after_bundle, "execution_key_sha256", "") or "")
+    if comparison_request.before_execution_key and b_ek != comparison_request.before_execution_key:
+        raise ModelingError("export_comparison_reversed_before_after:bundle_execution_key_role_mismatch")
+    if comparison_request.after_execution_key and a_ek != comparison_request.after_execution_key:
+        raise ModelingError("export_comparison_reversed_before_after:bundle_execution_key_role_mismatch")
+    if comparison_request.before_plan_sha256 and before_bundle.rewrite_plan_sha256 != comparison_request.before_plan_sha256:
+        raise ModelingError("export_comparison_reversed_before_after:bundle_plan_sha256_role_mismatch")
+    if comparison_request.after_plan_sha256 and after_bundle.rewrite_plan_sha256 != comparison_request.after_plan_sha256:
+        raise ModelingError("export_comparison_reversed_before_after:bundle_plan_sha256_role_mismatch")
+    if comparison_request.require_model_scope and (before_bundle.scope != "model" or after_bundle.scope != "model"):
+        raise ModelingError(
+            f"export_comparison_requires_model_scope:before={before_bundle.scope},after={after_bundle.scope}"
+        )
+    if before_bundle.scope != after_bundle.scope:
+        raise ModelingError(
+            f"export_comparison_scope_mismatch:before={before_bundle.scope},after={after_bundle.scope}"
+        )
+    if comparison_request.comparison_policy == "monotonic_optimization":
+        b_track = _bundle_canonical_track(before_bundle)
+        a_track = _bundle_canonical_track(after_bundle)
+        if before_bundle.target_envelope_applied and not after_bundle.target_envelope_applied:
+            raise ModelingError("export_comparison_reversed_before_after:target_envelope_inverted")
+        if _CANONICAL_TRACK_RANK[b_track] > _CANONICAL_TRACK_RANK[a_track]:
+            raise ModelingError(f"export_comparison_reversed_before_after:{b_track}>{a_track}")
 
 
 __all__ = [
-    "AGENT_BRIEF_MAX_BYTES", "ComparisonPlan", "GroupAccounting", "WF_STAGE_CONFIG",
-    "WF_STAGE_FRAMEWORK", "WF_STAGE_KERNEL", "WF_STAGE_RESIDUAL", "WaterfallSummary",
-    "_compact_agent_brief_to_budget", "align_before_after_operators", "anchor_stage_waterfall",
-    "build_actionable_roadmap",
-    "build_agent_brief", "build_comparison_plan", "build_macro_module_breakdown",
-    "build_new_kernel_backlog", "build_parallelism_codesign_note",
-    "build_pending_kernel_details", "classify_waterfall_stage",
-    "enrich_comparison_plan_stage_receipts", "export_agent_brief",
+    "AGENT_BRIEF_MAX_BYTES", "ComparisonPlan", "ComparisonRequest", "GroupAccounting",
+    "WF_STAGE_CONFIG", "WF_STAGE_FRAMEWORK", "WF_STAGE_KERNEL", "WF_STAGE_RESIDUAL",
+    "WaterfallSummary", "_compact_agent_brief_to_budget", "align_before_after_operators",
+    "assert_comparison_polarity", "build_actionable_roadmap",
+    "build_agent_brief", "build_comparison_plan", "build_default_comparison_request",
+    "build_macro_module_breakdown", "build_new_kernel_backlog",
+    "build_parallelism_codesign_note", "build_pending_kernel_details",
+    "classify_waterfall_stage", "export_agent_brief",
     "format_executive_digest_markdown", "format_parallelism_codomain_summary",
-    "format_public_track_label", "is_same_deployment_config",
+    "format_public_track_label",
 ]

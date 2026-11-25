@@ -304,7 +304,7 @@ class _TrialSearch:
 
     def compare(self, plans, limit):
         from mindie_sim.rewrite.oracle import evaluate_rewrites
-        from mindie_sim.rewrite.schema import plan_sha256
+        from mindie_sim.rewrite.schema import StreamSchedule, plan_sha256
 
         def unique():
             for plan in plans:
@@ -340,7 +340,17 @@ class _TrialSearch:
                     self.rejection_reasons["missing_wall_estimate"] += 1
                     continue
                 ranked.append((estimated_wall, plan_sha256(plan), plan))
-            for _, _, plan in sorted(ranked):
+            for estimated_wall, _, plan in sorted(ranked):
+                base_entry = self.frontier.get(plan.base_graph_sha256)
+                base_wall = _wall(base_entry[1]) if base_entry is not None else _wall(self.best_eval)
+                if (
+                    plan.edits
+                    and isinstance(plan.edits[-1].operation, StreamSchedule)
+                    and estimated_wall >= base_wall
+                ):
+                    self.rejected += 1
+                    self.rejection_reasons["stream_screen_non_improving"] += 1
+                    continue
                 self.replayed += 1
                 finalized_plan = self._bind_verified_plan(plan)
                 result = self.try_finalize(finalized_plan)
@@ -760,9 +770,42 @@ def _collective_operations(ops, dual_report):
     yield from (entry[-1] for entry in ranked if entry[0])
     yield from dbo[1:]
 
-def _independent(left, right, by_id):
+def _ancestor_bitmasks(ops):
+    """Compute exact transitive ancestor bitmasks over ``ops`` in O(V + E)."""
+    by_id = {op.op_id: op for op in ops}
+    bit = {op.op_id: 1 << idx for idx, op in enumerate(ops)}
+    anc: dict[str, int] = {}
+    visiting: set[str] = set()
+    for op in ops:
+        if op.op_id in anc:
+            continue
+        stack = [(op.op_id, False)]
+        while stack:
+            oid, expanded = stack.pop()
+            if oid in anc:
+                continue
+            if expanded:
+                visiting.discard(oid)
+                mask = 0
+                for dep in by_id[oid].deps:
+                    if dep in bit:
+                        mask |= bit[dep] | anc.get(dep, 0)
+                anc[oid] = mask
+            elif oid not in visiting:
+                visiting.add(oid)
+                stack.append((oid, True))
+                for dep in by_id[oid].deps:
+                    if dep in by_id and dep not in anc and dep not in visiting:
+                        stack.append((dep, False))
+    return bit, anc
+
+
+def _independent(left, right, by_id, *, bit=None, anc=None):
     if left.stage != right.stage:
         return False
+    if bit is not None and anc is not None:
+        lid, rid = left.op_id, right.op_id
+        return not ((anc[rid] & bit[lid]) or (anc[lid] & bit[rid]))
     for source, target in ((left, right), (right, left)):
         pending, visited = list(target.deps), set()
         while pending:
@@ -786,6 +829,7 @@ def _stream_candidates(scenario, ops, op_refs=()):
     aiv = min(path.aiv_count for _, path in paths)
     handles = dict(op_refs)
     by_id = {op.op_id: op for op in ops}
+    bit, anc = _ancestor_bitmasks(ops)
     kinds, sparse = {}, set()
     for op in ops:
         meta = dict(op.metadata)
@@ -803,11 +847,11 @@ def _stream_candidates(scenario, ops, op_refs=()):
     layouts = []
     for transfer in comm:
         for compute in cube_ops:
-            if not _independent(compute, transfer, by_id):
+            if not _independent(compute, transfer, by_id, bit=bit, anc=anc):
                 continue
             for auxiliary in side:
                 if auxiliary.op_id != compute.op_id and all(
-                    _independent(auxiliary, other, by_id) for other in (compute, transfer)
+                    _independent(auxiliary, other, by_id, bit=bit, anc=anc) for other in (compute, transfer)
                 ):
                     layouts.append({transfer.op_id: "comm", auxiliary.op_id: "csa"})
                     break
@@ -817,7 +861,7 @@ def _stream_candidates(scenario, ops, op_refs=()):
             break
     if not layouts:
         for auxiliary in side:
-            if any(compute.op_id != auxiliary.op_id and _independent(compute, auxiliary, by_id)
+            if any(compute.op_id != auxiliary.op_id and _independent(compute, auxiliary, by_id, bit=bit, anc=anc)
                    for compute in cube_ops):
                 layouts.append({auxiliary.op_id: "csa"})
                 break
@@ -930,6 +974,12 @@ def solve_framework(
     if initial_seed is not None:
         seed_plan, seed_eval = initial_seed
         search.seed(seed_plan, seed_eval)
+    elif track_override == "shipping":
+        seed = mainline
+        full = search.try_finalize(seed)
+        if full is None or not _accepted(full) or _wall(full) > m_ns:
+            raise SoundnessInversionError("no fully verified shipping plan meets mainline baseline")
+        search.seed(seed, full)
     else:
         seed = mainline if m_ns <= u_ns else unmerge
         full = search.try_finalize(seed)

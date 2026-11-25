@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
+import re
 from dataclasses import dataclass, replace
 import json
 import os
@@ -47,10 +48,13 @@ from .models import (
     DEFAULT_SCENARIO_PROMPT_TOKENS,
     GIB_BYTES,
     MIN_POSITIVE_SECONDS,
+    NS_PER_US,
     US_PER_SECOND,
     ExportBundle,
     OperatorExportRow,
     TraceScheduleEntry,
+    bundle_step_int_ns,
+    op_exposed_int_ns,
 )
 from .public_view import format_track_label
 
@@ -111,10 +115,8 @@ TID_OVERLAP_FREE = 3
 #: Counter thread ID inside the ``Ascend Metrics`` process.
 TID_METRICS_COUNTER = 0
 
-#: Minimum visible sub-pipe span (1 ns = 0.001 us) and host launch submission duration (us).
+#: Minimum visible sub-pipe span (1 ns = 0.001 us).
 PIPE_MIN_SUBSPAN_US = 0.001
-HOST_GRAPH_LAUNCH_US = 12.0
-HOST_KERNEL_LAUNCH_US = 1.5
 
 #: Canonical ``msprof`` process and thread specification exported for introspection.
 MSPROF_PROCESS_SPEC: dict[str, tuple[tuple[int, str], ...]] = {
@@ -275,37 +277,43 @@ def _iter_metadata_events(
 def _compute_physical_pipe_times(
     op: OperatorExportRow, peaks: Mapping[str, float],
 ) -> dict[str, float]:
-    """Compute true physical pipe busy durations (us) & ``msprof`` ratios from HW peaks."""
-    cube_rate = op.cube_peak_flops_per_s or float(peaks.get("cube_peak_flops_per_s") or 0.0)
-    vec_rate = float(peaks.get("vector_peak_ops_per_s") or 0.0)
-    hbm_rate = float(peaks.get("hbm_peak_bytes_per_s") or 0.0)
-    mte2_rate = float(peaks.get("mte2_peak_bytes_per_s") or hbm_rate)
-    mte3_rate = float(peaks.get("mte3_peak_bytes_per_s") or hbm_rate)
-    fp_rate = float(peaks.get("fixpipe_peak_bytes_per_s") or hbm_rate)
+    """Project physical pipe service durations and ratios from declared work and explicit peaks."""
+    dur = max(0.0, float(op.dur_us))
+    cube_peak = float(op.cube_peak_flops_per_s or peaks.get("cube_peak_flops_per_s") or 0.0)
+    vec_peak = float(peaks.get("vector_peak_ops_per_s") or 0.0)
+    mte2_peak = float(peaks.get("mte2_peak_bytes_per_s") or 0.0)
+    mte3_peak = float(peaks.get("mte3_peak_bytes_per_s") or 0.0)
+    fp_peak = float(peaks.get("fixpipe_peak_bytes_per_s") or 0.0)
+    fp_bytes = max(0.0, float(op.fixpipe_bytes))
 
-    fp_bytes = (
-        op.fixpipe_bytes if op.fixpipe_bytes > 0.0
-        else (op.hbm_write_bytes if (op.flops > 0.0 and op.mte3_bytes <= 0.0) else 0.0)
-    )
-    t_cube = (op.flops / cube_rate) * US_PER_SECOND if (op.flops > 0.0 and cube_rate > 0.0) else 0.0
-    t_vec = (op.vector_ops / vec_rate) * US_PER_SECOND if (op.vector_ops > 0.0 and vec_rate > 0.0) else 0.0
-    t_mte2 = (op.mte2_bytes / mte2_rate) * US_PER_SECOND if (op.mte2_bytes > 0.0 and mte2_rate > 0.0) else 0.0
-    t_mte3 = (op.mte3_bytes / mte3_rate) * US_PER_SECOND if (op.mte3_bytes > 0.0 and mte3_rate > 0.0) else 0.0
-    t_fp = (fp_bytes / fp_rate) * US_PER_SECOND if (fp_bytes > 0.0 and fp_rate > 0.0) else 0.0
+    def _pipe_us(work: float, rate: float) -> float:
+        if work <= 0.0 or rate <= 0.0 or dur <= 0.0:
+            return 0.0
+        return min(dur, (float(work) / float(rate)) * US_PER_SECOND)
 
-    dur = max(op.dur_us, PIPE_MIN_SUBSPAN_US)
+    cube_us = _pipe_us(op.flops, cube_peak)
+    vec_us = _pipe_us(op.vector_ops, vec_peak)
+    mte2_us = _pipe_us(op.mte2_bytes, mte2_peak)
+    mte3_us = _pipe_us(op.mte3_bytes, mte3_peak)
+    fp_us = _pipe_us(fp_bytes, fp_peak)
+
+    def _ratio(span_us: float) -> float:
+        if dur <= 0.0 or span_us <= 0.0:
+            return 0.0
+        return round(min(1.0, span_us / dur), RATIO_DECIMALS)
+
     return {
-        "cube_us": min(op.dur_us, t_cube) if t_cube > 0.0 else 0.0,
-        "vec_us": min(op.dur_us, t_vec) if t_vec > 0.0 else 0.0,
-        "mte2_us": min(op.dur_us, t_mte2) if t_mte2 > 0.0 else 0.0,
-        "mte3_us": min(op.dur_us, t_mte3) if t_mte3 > 0.0 else 0.0,
-        "fp_us": min(op.dur_us, t_fp) if t_fp > 0.0 else 0.0,
+        "cube_us": cube_us,
+        "vec_us": vec_us,
+        "mte2_us": mte2_us,
+        "mte3_us": mte3_us,
+        "fp_us": fp_us,
         "fp_bytes": fp_bytes,
-        "aic_mac_ratio": round(min(1.0, t_cube / dur), RATIO_DECIMALS) if op.dur_us > 0.0 else 0.0,
-        "aiv_vec_ratio": round(min(1.0, t_vec / dur), RATIO_DECIMALS) if op.dur_us > 0.0 else 0.0,
-        "mte2_ratio": round(min(1.0, t_mte2 / dur), RATIO_DECIMALS) if op.dur_us > 0.0 else 0.0,
-        "mte3_ratio": round(min(1.0, t_mte3 / dur), RATIO_DECIMALS) if op.dur_us > 0.0 else 0.0,
-        "fixpipe_ratio": round(min(1.0, t_fp / dur), RATIO_DECIMALS) if op.dur_us > 0.0 else 0.0,
+        "aic_mac_ratio": _ratio(cube_us),
+        "aiv_vec_ratio": _ratio(vec_us),
+        "mte2_ratio": _ratio(mte2_us),
+        "mte3_ratio": _ratio(mte3_us),
+        "fixpipe_ratio": _ratio(fp_us),
     }
 
 
@@ -465,47 +473,21 @@ def _subtract_intervals(
 
 
 def _op_in_entry_repeats(op: OperatorExportRow, sched_count: int) -> int:
-    """Return consecutive calls of ``op`` inside a single schedule entry (e.g. RecoverSSM ×36)."""
-    rep = max(1, int(op.repeat_count))
+    """Return exact integer in-entry repeat divisor (zero heuristic rounded multipliers)."""
     cnt = max(1, int(sched_count))
-    return max(1, int(round(rep / float(cnt)))) if rep > cnt else 1
+    rep = max(1, int(op.repeat_count))
+    if rep > cnt and rep % cnt == 0:
+        return rep // cnt
+    return 1
 
 
 def _expand_effective_trace_schedule(
     bundle: ExportBundle,
 ) -> tuple[tuple[TraceScheduleEntry, ...], dict[str, int]]:
-    """Expand multi-step draft schedule entries whenever draft ops repeat across MTP steps."""
-    raw_sched = tuple(bundle.full_trace_schedule)
-    if not raw_sched:
-        return (), {}
-    max_rep_by_arch: dict[str, int] = {}
-    for op in bundle.operators:
-        aid = op.archetype_id or op.layer_label
-        max_rep_by_arch[aid] = max(max_rep_by_arch.get(aid, 0), max(1, int(op.repeat_count)))
-    raw_counts = Counter(e.archetype_id for e in raw_sched)
-    expanded: list[TraceScheduleEntry] = []
-    idx = 0
-    while idx < len(raw_sched):
-        entry = raw_sched[idx]
-        aid = entry.archetype_id
-        cnt = raw_counts.get(aid, 1)
-        target_rep = max_rep_by_arch.get(aid, 0)
-        if entry.scope == "draft" and aid in {"draft_arch_0", "draft_context_kv"} and target_rep > cnt and cnt > 0 and (target_rep % cnt == 0):
-            block = [entry]
-            scan = idx + 1
-            while scan < len(raw_sched) and raw_sched[scan].archetype_id == aid:
-                block.append(raw_sched[scan])
-                scan += 1
-            steps = target_rep // len(block)
-            for step_i in range(steps):
-                for blk_e in block:
-                    lbl = f"{blk_e.label} [Step {step_i}]" if steps > 1 else blk_e.label
-                    expanded.append(TraceScheduleEntry(blk_e.archetype_id, blk_e.scope, lbl, blk_e.full_layer_index))
-            idx = scan
-            continue
-        expanded.append(entry)
-        idx += 1
-    return tuple(expanded), dict(Counter(e.archetype_id for e in expanded))
+    """Read explicit full-model trace schedule directly from ``ExportBundle``."""
+    entries = tuple(bundle.full_trace_schedule or ())
+    counts = dict(Counter(e.archetype_id for e in entries))
+    return entries, counts
 
 
 def _build_archetype_templates(
@@ -607,10 +589,13 @@ def _emit_op_and_pipes(
     pipeline_info: tuple[int, tuple[str, ...]] | None,
     op_placement: Mapping[Any, tuple[int, int, float, str]],
 ) -> tuple[list[dict[str, Any]], tuple[int, int, float, str], int]:
+    from .kernel_catalog import strip_op_prefix
+
     pid, tid = _op_pid_tid(op, base_pid)
     cat = "Communication" if op.task_type == "HCCL" else "Kernel"
     k_name = op.ascend_kernel or op.logical_role or op.canonical_op_key
-    event_name = f"{k_name} [{op.canonical_op_key}]" if (op.canonical_op_key and op.canonical_op_key != k_name) else k_name
+    op_tag = strip_op_prefix(op.op_id) or op.canonical_op_key
+    event_name = f"{k_name} [{op_tag}]" if (op_tag and op_tag != k_name) else k_name
     pipe_info = _compute_physical_pipe_times(op, bundle.hardware_peaks)
     ts_end = ts_start + op.dur_us
     events: list[dict[str, Any]] = [{
@@ -754,23 +739,106 @@ def _resolve_host_launch_spec(
     *,
     is_graph_mode: bool,
     is_h2d_op: bool,
+    bundle: ExportBundle | None = None,
 ) -> tuple[str, float]:
+    """Resolve host launch API name and calibrated STARS/DMA launch duration (us)."""
+    scope_lbl = str(getattr(entry, "scope", "") or op_eff.model_scope or "target")
     if is_h2d_op:
-        return f"aclrtMemcpyAsync (PLE/Engram H2D: {op_eff.op_id})", HOST_KERNEL_LAUNCH_US
+        dur = float(getattr(bundle, "h2d_startup_us", 0.0) or 0.0) if bundle is not None else 0.0
+        return f"aclrtMemcpyAsync (PLE/Engram H2D: {op_eff.op_id})", max(0.0, dur)
     if is_graph_mode:
-        return f"aclGraphLaunch ({entry.scope.upper()})", HOST_GRAPH_LAUNCH_US
-    label = op_eff.ascend_kernel or op_eff.logical_role or op_eff.op_id
-    return f"aclrtLaunchKernel ({label})", HOST_KERNEL_LAUNCH_US
+        dur = float(getattr(bundle, "graph_launch_us", 0.0) or 0.0) if bundle is not None else 0.0
+        return f"aclGraphLaunch[{scope_lbl}]", max(0.0, dur)
+    dur = float(getattr(bundle, "host_launch_us", 0.0) or 0.0) if bundle is not None else 0.0
+    kern = op_eff.ascend_kernel or op_eff.implementation or op_eff.op_id
+    return f"aclrtLaunchKernel({kern})", max(0.0, dur)
+
+
+_ENTRY_STEP_RE = re.compile(r"\[Step\s+(\d+)\]")
+
+
+def _resolve_entry_layer_rec(
+    entry: Any, per_layer: Mapping[tuple[str, int], Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    m_step = _ENTRY_STEP_RE.search(str(getattr(entry, "label", "") or ""))
+    step_suffix = f"_step{m_step.group(1)}" if m_step is not None else ""
+    aid = str(getattr(entry, "archetype_id", "") or "")
+    if aid in {"target_embed", "target_tail", "draft_pre", "draft_tail"}:
+        if step_suffix:
+            rec = per_layer.get((f"{aid}{step_suffix}", -1))
+            if isinstance(rec, Mapping):
+                return rec
+        rec = per_layer.get((aid, -1))
+        return rec if isinstance(rec, Mapping) else None
+    if entry.full_layer_index is None:
+        return None
+    lyr = int(entry.full_layer_index)
+    if aid == "draft_context_kv":
+        if step_suffix:
+            rec = per_layer.get((f"draft_context_kv{step_suffix}", lyr))
+            if isinstance(rec, Mapping):
+                return rec
+        rec = per_layer.get(("draft_context_kv", lyr))
+        if isinstance(rec, Mapping):
+            return rec
+    if entry.scope == "draft" and step_suffix:
+        rec = per_layer.get((f"draft{step_suffix}", lyr))
+        if isinstance(rec, Mapping):
+            return rec
+    rec = per_layer.get((entry.scope, lyr))
+    return rec if isinstance(rec, Mapping) else None
 
 
 def _entry_layer_span(
     entry: Any, tpl: Any, per_layer: Mapping[tuple[str, int], Mapping[str, Any]],
 ) -> float:
-    if entry.full_layer_index is not None:
-        rec = per_layer.get((entry.scope, int(entry.full_layer_index)))
-        if isinstance(rec, Mapping) and float(rec.get("span_us", 0.0) or 0.0) > 0.0:
-            return float(rec["span_us"])
+    rec = _resolve_entry_layer_rec(entry, per_layer)
+    if isinstance(rec, Mapping) and float(rec.get("span_us", 0.0) or 0.0) > 0.0:
+        return float(rec["span_us"])
     return float(tpl.span_us)
+
+
+def _compute_scheduled_entry_windows(
+    effective_schedule: Sequence[TraceScheduleEntry],
+    templates: Mapping[str, _ArchetypeTemplate],
+    per_layer: Mapping[tuple[str, int], Mapping[str, Any]],
+    bundle: ExportBundle,
+) -> tuple[list[tuple[TraceScheduleEntry, _ArchetypeTemplate, float, float, Mapping[str, Any] | None]], float]:
+    windows: list[tuple[TraceScheduleEntry, _ArchetypeTemplate, float, float, Mapping[str, Any] | None]] = []
+    ts_cursor = 0.0
+    all_have_start = True
+    for entry in effective_schedule:
+        tpl = templates.get(entry.archetype_id)
+        if tpl is None or not tpl.ops:
+            continue
+        rec = _resolve_entry_layer_rec(entry, per_layer)
+        if isinstance(rec, Mapping) and "start_us" in rec:
+            l_start = float(rec["start_us"])
+            layer_span = float(rec.get("span_us", 0.0) or 0.0)
+            ts_cursor = max(ts_cursor, l_start + layer_span)
+        else:
+            all_have_start = False
+            l_start = ts_cursor
+            layer_span = _entry_layer_span(entry, tpl, per_layer)
+            ts_cursor = l_start + layer_span
+        windows.append((entry, tpl, l_start, layer_span, rec))
+    max_end = max((s + d for _, _, s, d, _ in windows), default=0.0)
+    total_span_us = max(max_end, float(bundle.step_span_us or 0.0)) if (windows and all_have_start) else max_end
+    return windows, total_span_us
+
+
+def _lookup_entry_op_timing(
+    op: OperatorExportRow,
+    layer_ops_map: Mapping[str, tuple[float, float]],
+    strip_fn: Any,
+) -> tuple[float, float] | None:
+    hit = layer_ops_map.get(strip_fn(op.op_id))
+    if hit is not None:
+        return hit
+    if op.op_id.startswith("rewrite:") and op.absorbed_source_ops:
+        fused_key = "rewrite_fused:" + "+".join(strip_fn(src) for src in op.absorbed_source_ops)
+        return layer_ops_map.get(fused_key)
+    return None
 
 
 def _emit_entry_op_repeats(
@@ -825,9 +893,8 @@ def _iter_scheduled_full_model_trace(
     effective_schedule, sched_counts = _expand_effective_trace_schedule(bundle)
     templates = _build_archetype_templates(bundle, sched_counts)
     per_layer = dict(getattr(bundle, "per_layer_timings", None) or {})
-    total_span_us = sum(
-        _entry_layer_span(e, templates[e.archetype_id], per_layer)
-        for e in effective_schedule if e.archetype_id in templates
+    entry_windows, total_span_us = _compute_scheduled_entry_windows(
+        effective_schedule, templates, per_layer, bundle,
     )
     track_display = format_track_label(bundle.feature_track, lang="en")
     yield {
@@ -846,28 +913,19 @@ def _iter_scheduled_full_model_trace(
     comm_by_die: dict[int, list[tuple[float, float]]] = defaultdict(list)
     samples_by_die: dict[int, list[tuple[float, float, float, float, float]]] = defaultdict(list)
 
-    ts_cursor = 0.0
     task_id = 1
     flow_id = 1
     launched_scopes: set[str] = set()
     scope_bounds: dict[str, list[float]] = {}
 
-    for entry in effective_schedule:
-        tpl = templates.get(entry.archetype_id)
-        if tpl is None or not tpl.ops:
-            continue
-        layer_rec = (
-            per_layer.get((entry.scope, int(entry.full_layer_index)))
-            if entry.full_layer_index is not None else None
-        )
+    for entry, tpl, l_start, layer_span, layer_rec in entry_windows:
         layer_ops_map = layer_rec.get("ops", {}) if isinstance(layer_rec, Mapping) else {}
-        layer_span = _entry_layer_span(entry, tpl, per_layer)
-        l_start = ts_cursor
-        l_end = ts_cursor + layer_span
+        l_end = l_start + layer_span
         if entry.scope not in scope_bounds:
             scope_bounds[entry.scope] = [l_start, l_end]
         else:
-            scope_bounds[entry.scope][1] = l_end
+            scope_bounds[entry.scope][0] = min(scope_bounds[entry.scope][0], l_start)
+            scope_bounds[entry.scope][1] = max(scope_bounds[entry.scope][1], l_end)
 
         yield {
             "name": entry.label, "cat": "MSTX_Layer", "ph": "X",
@@ -893,7 +951,9 @@ def _iter_scheduled_full_model_trace(
             coord = (op.occurrence.replica, op.occurrence.stage, int(op.occurrence.rank or 0))
             d_idx = die_map.get(coord, 0)
             base = _pid_base(d_idx)
-            exact_timing = layer_ops_map.get(strip_op_prefix(op.op_id)) if layer_ops_map else None
+            exact_timing = _lookup_entry_op_timing(op, layer_ops_map, strip_op_prefix) if layer_ops_map else None
+            if layer_ops_map and exact_timing is None:
+                continue
             if exact_timing is not None:
                 op_ts = l_start + float(exact_timing[0])
                 op_eff = replace(op, dur_us=float(exact_timing[1]), end_us=op.start_us + float(exact_timing[1]))
@@ -904,7 +964,7 @@ def _iter_scheduled_full_model_trace(
             if first_op_for_scope or not is_graph_mode or is_h2d_op:
                 dev_pid, dev_tid = _op_pid_tid(op_eff, base)
                 launch_name, l_dur = _resolve_host_launch_spec(
-                    op_eff, entry, is_graph_mode=is_graph_mode, is_h2d_op=is_h2d_op,
+                    op_eff, entry, is_graph_mode=is_graph_mode, is_h2d_op=is_h2d_op, bundle=bundle,
                 )
                 l_events, flow_id = _emit_host_launch_with_flow(
                     name=launch_name, dev_ts=op_ts, dev_pid=dev_pid, dev_tid=dev_tid,
@@ -934,7 +994,6 @@ def _iter_scheduled_full_model_trace(
             comm_by_die[d0].append((l_start + r_lo * scale_span, l_start + r_hi * scale_span))
         if include_counters and layer_span > 0.0:
             samples_by_die[d0].append(_layer_metric_sample(tpl.ops, l_start + layer_span * MIDPOINT_FRACTION, layer_span, bundle.hardware_peaks))
-        ts_cursor = l_end
 
     for sc_key, (s_lo, s_hi) in scope_bounds.items():
         if s_hi > s_lo:
@@ -950,7 +1009,7 @@ def _iter_scheduled_full_model_trace(
             }
 
     if include_overlap:
-        yield from _iter_overlap_from_intervals(comp_by_die, comm_by_die, sorted(set(die_map.values())), ts_cursor)
+        yield from _iter_overlap_from_intervals(comp_by_die, comm_by_die, sorted(set(die_map.values())), total_span_us)
     if include_counters:
         yield from _iter_counter_events_from_samples(bundle, samples_by_die)
 
@@ -978,18 +1037,23 @@ def _iter_direct_trace(
     layer_spans: list[tuple[str, float, float]] = []
     sub_spans: list[tuple[str, str, float, float]] = []
     flow_id = 1
+    is_graph_mode = bundle.graph_capture_mode.lower() not in {"eager", "none", "off"}
     launched = False
 
     for task_id, op in enumerate(bundle.operators, start=1):
         coord = (op.occurrence.replica, op.occurrence.stage, int(op.occurrence.rank or 0))
         d_idx = die_map.get(coord, 0)
         base = _pid_base(d_idx)
-        if not launched:
+        is_h2d_op = op.family == "engram_rh2d" or "host_uva" in op.op_id.lower()
+        if (not launched) or (not is_graph_mode) or is_h2d_op:
             dev_pid, dev_tid = _op_pid_tid(op, base)
+            launch_name, l_dur = _resolve_host_launch_spec(
+                op, None, is_graph_mode=is_graph_mode, is_h2d_op=is_h2d_op, bundle=bundle,
+            )
             l_events, flow_id = _emit_host_launch_with_flow(
-                name=f"aclGraphLaunch ({bundle.phase.upper()})", dev_ts=op.start_us,
-                dev_pid=dev_pid, dev_tid=dev_tid, launch_dur_us=HOST_GRAPH_LAUNCH_US,
-                flow_id=flow_id, extra_args={"phase": bundle.phase},
+                name=launch_name, dev_ts=op.start_us, dev_pid=dev_pid, dev_tid=dev_tid,
+                launch_dur_us=l_dur, flow_id=flow_id,
+                extra_args={"scope": op.model_scope, "transfer": "H2D" if is_h2d_op else "launch"},
             )
             yield from l_events
             launched = True
@@ -1048,6 +1112,21 @@ def iter_msprof_trace_events(
     coords = _die_coordinates(bundle)
     die_map = {coord: idx for idx, coord in enumerate(coords)}
     yield from _iter_metadata_events(coords)
+    exposed_sum_ns = sum(op_exposed_int_ns(op, op.repeat_count) for op in bundle.operators)
+    step_ns = max(bundle_step_int_ns(bundle), exposed_sum_ns)
+    idle_ns = max(0, step_ns - exposed_sum_ns)
+    yield {
+        "ph": "M",
+        "name": "mindie_sim_step_receipt",
+        "pid": PID_FRAMEWORK,
+        "tid": TID_FW_ENGINE,
+        "args": {
+            "step_span_ns": step_ns,
+            "disjoint_exposed_sum_ns": exposed_sum_ns,
+            "idle_or_wait_ns": idle_ns,
+            "reconciliation_error_ns": step_ns - (exposed_sum_ns + idle_ns),
+        },
+    }
 
     pipeline_by_occ = {
         pipe.owner: (len(pipe.phases), pipe.member_op_ids)
@@ -1129,7 +1208,7 @@ def export_msprof_trace(
     concurrency: int = 1,
     mtp_proposal_tokens: int = 0,
     mtp_acceptance_length: float = 1.0,
-    feature_track: str = "merged",
+    feature_track: str = "shipping",
 ) -> TraceExportSummary:
     """Stream a 1:1 ``msprof`` ``trace_view.json`` to ``output_path`` atomically."""
     if not str(output_path):

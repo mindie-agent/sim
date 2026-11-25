@@ -6,8 +6,8 @@
   receipts):
   - Fixed-order scenario & configuration projection covering ONLY user-facing
     serving, parallelism, quantization, speculative, and runtime fields;
-  - Internal track enum mapper (``merged`` / ``unmerged_pr`` /
-    ``expected_ideal`` / ``raw_eager`` -> clean public labels);
+  - Canonical C-1 StackTrack enum mapper (``shipping`` / ``proposed`` /
+    ``target`` / ``eager`` -> clean public labels);
   - Strict allowlist projectors for ``recommended_checkpoint``,
     ``serving_rules``, ``pd_pool``, ``artifacts``, ``two_step_gain``,
     ``script_audit``, ``action_plan_3_tracks``, ``codesign_opportunities``
@@ -29,6 +29,8 @@ import math
 from pathlib import Path
 import re
 from typing import Any
+
+from mindie_sim.schema.common import ModelingError
 
 from .models import (
     AGENT_BRIEF_SCHEMA,
@@ -55,25 +57,17 @@ DEFAULT_MAX_REFS = 4
 DEFAULT_MAX_OPS = 8
 FLOAT_DIFF_TOL = 1e-6
 
-#: Canonical public display labels for internal feature/stack track enums.
+#: Canonical C-1 public display labels for StackTrack enums.
 TRACK_DISPLAY_LABELS_ZH: Mapping[str, str] = {
-    "merged": "当前栈基线",
     "shipping": "当前栈基线",
-    "unmerged_pr": "提案版本",
     "proposed": "提案版本",
-    "expected_ideal": "目标架构预演",
     "target": "目标架构预演",
-    "raw_eager": "Eager 基线",
     "eager": "Eager 基线",
 }
 TRACK_DISPLAY_LABELS_EN: Mapping[str, str] = {
-    "merged": "Shipping",
     "shipping": "Shipping",
-    "unmerged_pr": "Proposed changes",
     "proposed": "Proposed changes",
-    "expected_ideal": "Target projection",
     "target": "Target projection",
-    "raw_eager": "Eager baseline",
     "eager": "Eager baseline",
 }
 
@@ -203,8 +197,11 @@ PUBLIC_BACKENDS = frozenset({
 })
 _KERNEL_BINDING_BACKEND_MAP: Mapping[str, str] = {
     "cann": BACKEND_CANN,
+    "aclnn": BACKEND_CANN,
+    "cann_aclnn": BACKEND_CANN,
     "cann aclnn/ascendc": BACKEND_CANN,
     "ascendc": BACKEND_ASCENDC,
+    "vllm_ascend_csrc": BACKEND_ASCENDC,
     "tilelang": BACKEND_TILELANG,
     "catlass": BACKEND_CATLASS,
     "triton": BACKEND_TRITON,
@@ -214,10 +211,13 @@ _KERNEL_BINDING_BACKEND_MAP: Mapping[str, str] = {
     "hccl / mc2": BACKEND_HCCL_MC2,
     "hccl": BACKEND_HCCL_MC2,
     "mc2": BACKEND_HCCL_MC2,
+    "hccl_mc2": BACKEND_HCCL_MC2,
     "pytorch-npu": BACKEND_TORCH_NPU,
     "torch_npu": BACKEND_TORCH_NPU,
     "torch_npu custom op": BACKEND_TORCH_NPU,
+    "third_party_wheel": BACKEND_TORCH_NPU,
     "host": BACKEND_TORCH_NPU,
+    "view_reshape": BACKEND_CANN,
     "logical": BACKEND_CANN,
 }
 PUBLIC_PIPE_NAMES = frozenset({
@@ -227,10 +227,7 @@ PUBLIC_PIPE_NAMES = frozenset({
     "vec_alu", "vec_sfu", "vec_reduce",
 })
 
-_INTERNAL_TRACK_WORD_RE = re.compile(r"\b(expected_ideal|unmerged_pr|raw_eager|merged)\b")
 _INTERNAL_KEY_WORD_RE = re.compile(r"\b(feature_track|moe_route|solver_feasible)\b")
-_LEGACY_DSL_REPO_RE = re.compile(r"(?i)\bcann/[a-z0-9_]+-dsl\b")
-_LEGACY_DSL_TOKEN_RE = re.compile(r"(?i)\bcann[_\-]?bot(?:[_\-]?dsl)?\b")
 _PY_DICT_LITERAL_RE = re.compile(r"\{[^{}]*['\"][^'\"]+['\"]\s*:[^{}]*\}")
 
 
@@ -259,60 +256,51 @@ def _is_container(val: Any) -> bool:
 
 
 def format_track_label(raw_track: Any, *, lang: str = "zh") -> str:
-    """Map internal track enum to a clean public label (never emitting raw enum tokens)."""
+    """Map canonical C-1 StackTrack enum to a clean public label (fail-fast on legacy/unknown)."""
     table = TRACK_DISPLAY_LABELS_EN if str(lang).strip().lower() == "en" else TRACK_DISPLAY_LABELS_ZH
-    default_lbl = table["merged"]
-    if not isinstance(raw_track, str):
-        return default_lbl
+    if not isinstance(raw_track, str) or not raw_track.strip():
+        raise ModelingError(f"invalid_stack_track:{raw_track!r}")
     key = raw_track.strip().lower()
     if key in table:
         return table[key]
     if raw_track.strip() in table.values():
         return raw_track.strip()
-    return default_lbl
+    raise ModelingError(f"invalid_stack_track:{raw_track!r}")
 
 
 def normalize_public_backend(raw_backend: Any, *, is_gemm: bool = False) -> str:
-    """Map any backend token onto the public open-source Ascend backend taxonomy."""
+    """Validate and map an explicit canonical backend enum token (fail-closed on unknown/legacy)."""
+    del is_gemm
     if not isinstance(raw_backend, str) or not raw_backend.strip():
-        return BACKEND_CATLASS if is_gemm else BACKEND_TILELANG
-    raw = raw_backend.strip()
-    if raw in PUBLIC_BACKENDS:
-        return raw
-    low = raw.lower()
+        raise ModelingError(f"invalid_public_backend:{raw_backend!r}")
+    token = raw_backend.strip()
+    if token in PUBLIC_BACKENDS:
+        return token
+    low = token.lower()
     if low in _KERNEL_BINDING_BACKEND_MAP:
         return _KERNEL_BINDING_BACKEND_MAP[low]
-    if low in STRUCTURE_BACKEND_MAP:
-        return STRUCTURE_BACKEND_MAP[low]
-    if low.endswith(("_dsl", "-dsl")) or low == "dsl" or _LEGACY_DSL_TOKEN_RE.search(low):
-        return BACKEND_CATLASS if is_gemm else BACKEND_TILELANG
-    return BACKEND_CATLASS if is_gemm else BACKEND_TILELANG
+    raise ModelingError(f"unknown_public_backend:{raw_backend!r}")
 
 
 def sanitize_public_text(val: Any) -> str:
-    """Project a scalar into clean public text, rejecting dicts/containers and internal tokens."""
+    """Project a scalar into clean public text without forging DSL or track provenance."""
     if val is None or _is_container(val):
         return ""
     if isinstance(val, float) and not math.isfinite(val):
         return ""
     text = str(val)
     text = _PY_DICT_LITERAL_RE.sub("", text)
-    text = _LEGACY_DSL_REPO_RE.sub("Ascend/tilelang-ascend", text)
-    text = _LEGACY_DSL_TOKEN_RE.sub(BACKEND_TILELANG, text)
-    text = _INTERNAL_TRACK_WORD_RE.sub(lambda m: TRACK_DISPLAY_LABELS_ZH[m.group(1)], text)
     text = _INTERNAL_KEY_WORD_RE.sub("", text)
     return " ".join(text.split())
 
 
 def sanitize_source_ref(raw_ref: Any) -> str:
-    """Sanitize repository/path source references into clean open-source paths."""
+    """Preserve truthful repository/path source references without forging DSL repos."""
     if not isinstance(raw_ref, str) or not raw_ref.strip():
         return ""
     parts: list[str] = []
     for chunk in raw_ref.split(";"):
-        cleaned = _LEGACY_DSL_REPO_RE.sub("Ascend/tilelang-ascend", chunk.strip())
-        cleaned = _LEGACY_DSL_TOKEN_RE.sub("tilelang-ascend", cleaned)
-        cleaned = _PY_DICT_LITERAL_RE.sub("", cleaned).strip()
+        cleaned = _PY_DICT_LITERAL_RE.sub("", chunk.strip()).strip()
         if cleaned and cleaned not in parts:
             parts.append(cleaned)
     return "; ".join(parts)
@@ -608,8 +596,8 @@ def project_pd_pool(raw: Any) -> dict[str, Any] | None:
     return out or None
 
 
-def project_artifacts(raw: Any, *, basenames_only: bool = False) -> dict[str, str]:
-    """Allowlist-project generated artifact paths (only the 4 public artifact keys)."""
+def project_artifacts(raw: Any, *, basenames_only: bool = True) -> dict[str, str]:
+    """Allowlist-project generated artifact paths (stripping host-absolute paths)."""
     if not isinstance(raw, Mapping):
         return {}
     out: dict[str, str] = {}
@@ -620,7 +608,8 @@ def project_artifacts(raw: Any, *, basenames_only: bool = False) -> dict[str, st
         cleaned = sanitize_public_text(val)
         if not cleaned:
             continue
-        out[key] = Path(cleaned).name if basenames_only else cleaned
+        p = Path(cleaned)
+        out[key] = p.name if (basenames_only or p.is_absolute()) else cleaned
     return out
 
 
@@ -924,17 +913,6 @@ def _project_scenario_block(raw: Any) -> dict[str, Any]:
         pd_val = project_pd_pool(raw.get("pd_pool"))
         if pd_val is not None:
             out["pd_pool"] = pd_val
-    if isinstance(raw.get("calibration_basis"), Mapping):
-        cb_raw = raw["calibration_basis"]
-        cb_out: dict[str, Any] = {}
-        for ck in ("mode", "pt_sku", "cann"):
-            if isinstance(cb_raw.get(ck), str):
-                cb_out[ck] = sanitize_public_text(cb_raw[ck])
-        cal_b = _coerce_strict_bool(cb_raw.get("calibrated"))
-        if cal_b is not None:
-            cb_out["calibrated"] = cal_b
-        if cb_out:
-            out["calibration_basis"] = cb_out
     return out
 
 
@@ -953,6 +931,10 @@ def _project_kpis_block(raw: Any) -> dict[str, Any]:
         fval = _coerce_finite_float(raw.get(key))
         if fval is not None:
             out[key] = fval
+    for int_key in ("saved_step_ns", "reconciliation_error_ns"):
+        ival = _coerce_strict_int(raw.get(int_key))
+        if ival is not None:
+            out[int_key] = ival
     if isinstance(raw.get("waterfall"), Mapping):
         wf_keys = (
             "config_saved_ms", "new_kernel_saved_ms", "tune_kernel_saved_ms",
@@ -1011,7 +993,7 @@ def _project_action_plan_block(raw: Any) -> dict[str, Any]:
             "summary": sanitize_public_text(item.get("summary") or ""),
         }
         if isinstance(item.get("backend"), str) and item["backend"].strip():
-            krec["backend"] = normalize_public_backend(item["backend"])
+            krec["backend"] = sanitize_public_text(item["backend"])
         kern_out.append(krec)
     return {
         "track_labels": dict(THREE_TRACK_LABELS),
@@ -1064,7 +1046,7 @@ def _project_synthesis_and_triggers(raw: Mapping[str, Any], out: dict[str, Any])
                 "math": sanitize_public_text(sp.get("math") or ""),
             }
             if isinstance(sp.get("backend"), str) and sp["backend"].strip():
-                srec["backend"] = normalize_public_backend(sp["backend"])
+                srec["backend"] = sanitize_public_text(sp["backend"])
             specs_out.append(srec)
         out["kernel_synthesis_specs"] = specs_out
     if isinstance(raw.get("semantic_audit_triggers"), Sequence) and not isinstance(raw["semantic_audit_triggers"], (str, bytes)):

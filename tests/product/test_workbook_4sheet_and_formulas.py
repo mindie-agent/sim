@@ -48,7 +48,6 @@ from mindie_sim.export import (
 )
 from mindie_sim.export.action_plan import build_comparison_plan
 from mindie_sim.export.bundle import _collapse_micro_split_ops
-from mindie_sim.export.comparison import enrich_comparison_plan_stage_receipts
 from mindie_sim.export.models import LayerArchetypeSpec
 from mindie_sim.export.ooxml import (
     EXCEL_MAX_FORMULA_ARGS,
@@ -375,17 +374,19 @@ def test_ooxml_geometry_no_hidden_sheets_no_ab_af_and_primitive_cell_guard(tmp_p
     raw_b, req = compose_export_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
         dp=2, tp=2, ep=4, dcp=2, prompt_tokens=1024, output_tokens=64,
-        concurrency=4, mtp_proposal_tokens=3, mtp_acceptance_length=3.0, feature_track="merged",
+        concurrency=4, mtp_proposal_tokens=3, mtp_acceptance_length=3.0, feature_track="shipping",
     )
     raw_a, _ = compose_export_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
         dp=2, tp=2, ep=4, dcp=2, prompt_tokens=1024, output_tokens=64,
-        concurrency=4, mtp_proposal_tokens=3, mtp_acceptance_length=3.0, feature_track="expected_ideal",
+        concurrency=4, mtp_proposal_tokens=3, mtp_acceptance_length=3.0, feature_track="target",
     )
     b_bef = build_export_bundle(raw_b, request=req)
     b_aft = build_export_bundle(raw_a, request=req)
+    assert sum(r.exposed_ns for r in b_bef.operators) + b_bef.idle_or_wait_ns == b_bef.step_span_ns
+    assert sum(r.exposed_ns for r in b_aft.operators) + b_aft.idle_or_wait_ns == b_aft.step_span_ns
     out = tmp_path / "pure_4sheet.xlsx"
-    export_comparison_xlsx(b_bef, out, compare_source=b_aft)
+    export_comparison_xlsx(b_bef, out, after_bundle=b_aft)
 
     sheet_meta, roots, shared = _inspect_xlsx(out)
     assert [name for name, _ in sheet_meta] == [
@@ -400,7 +401,7 @@ def test_ooxml_geometry_no_hidden_sheets_no_ab_af_and_primitive_cell_guard(tmp_p
     assert _sheet_max_col_from_xml(roots[SHEET_PENDING_KERNELS]) <= PENDING_COLS
 
     s2_cells = _sheet_cells(roots[SHEET_BREAKDOWN], shared)
-    assert s2_cells["AA2"][0] == "绑定状态 (Binding State)"
+    assert s2_cells["AA2"][0] == "Binding State"
     assert not any(ref.startswith(("AB", "AC", "AD", "AE", "AF")) for ref in s2_cells)
 
     all_text = "\n".join(shared)
@@ -430,7 +431,8 @@ def test_sheet4_coalesced_span_reconciliation_stage_c_and_visible_fallback(tmp_p
             archetype_title=title, repeat_count=1, ascend_kernel=kern, logical_role=oid,
             dur_us=dur, exposed_dur_us=e, is_overlapped=is_ov, l_star_lean_us=dur * 0.5,
             gap_us=max(0.0, dur * 0.5), semantic_atoms=(atom,), formula_eval=fe,
-            needs_new_kernel=needs_new, absorbed_source_ops=absorbed, binding_state=binding,
+            needs_new_kernel=needs_new, is_shipping_abi=(not needs_new),
+            absorbed_source_ops=absorbed, binding_state=binding,
             predecessors=(),
         )
 
@@ -468,16 +470,15 @@ def test_sheet4_coalesced_span_reconciliation_stage_c_and_visible_fallback(tmp_p
         analysis_mode=MODE_MODELING, has_unbound_formula_ops=True,
     )
     aligned = align_before_after_operators(b_bun, a_bun)
-    plan = enrich_comparison_plan_stage_receipts(
-        build_comparison_plan(b_bun, a_bun, aligned), b_bun, a_bun, aligned,
-    )
+    plan = build_comparison_plan(b_bun, a_bun, aligned)
+    assert plan.waterfall.reconciliation_error_ns == 0
     res_acc = next(a for a in plan.group_accounting if a.bucket == "residual")
     assert res_acc.after_pre_edit_ms == pytest.approx(1.0, abs=1e-9)
     assert res_acc.config_share_ms == pytest.approx(0.2, abs=1e-9)
     assert res_acc.kernel_share_ms == pytest.approx(0.01, abs=1e-9)
 
     out_direct = tmp_path / "direct_spans.xlsx"
-    export_comparison_xlsx(b_bun, out_direct, compare_source=a_bun)
+    export_comparison_xlsx(b_bun, out_direct, after_bundle=a_bun)
     _, roots, shared = _inspect_xlsx(out_direct)
     all_sheets = {name: _sheet_cells(root, shared) for name, root in roots.items()}
     s4 = all_sheets[SHEET_PENDING_KERNELS]
@@ -508,7 +509,7 @@ def test_sheet4_coalesced_span_reconciliation_stage_c_and_visible_fallback(tmp_p
     fa_bun = replace(a_bun, operators=tuple(frag_a), step_span_us=fa_step, us_per_tok_die=fa_step / 2.0,
                      throughput_per_die_tokens_per_s=2e6 / fa_step, throughput_tokens_per_s=4e6 / fa_step)
     out_frag = tmp_path / "fragmented_fallback.xlsx"
-    export_comparison_xlsx(fb_bun, out_frag, compare_source=fa_bun)
+    export_comparison_xlsx(fb_bun, out_frag, after_bundle=fa_bun)
     f_meta, f_roots, f_shared = _inspect_xlsx(out_frag)
     for _, attrs in f_meta:
         assert "state" not in attrs
@@ -644,7 +645,7 @@ def test_sheet1_roofline_bottleneck_unconstrained_ttft_and_per_column_sla(tmp_pa
         step_tight_resources=("cube@r0.p0.d0", "hbm_read@r0.p0.d0"),
     )
     out_sla = tmp_path / "per_col_sla.xlsx"
-    export_comparison_xlsx(bun_bef, out_sla, compare_source=bun_aft)
+    export_comparison_xlsx(bun_bef, out_sla, after_bundle=bun_aft)
     _, roots_s, shared_s = _inspect_xlsx(out_sla)
     s1_s = _sheet_cells(roots_s[SHEET_SUMMARY], shared_s)
     assert s1_s["B16"][0] == "FAIL" and s1_s["C16"][0] == "PASS"
@@ -795,7 +796,7 @@ def test_sheet2_attnres_depth_slices_recoverssm_b69_codesign_cards_and_after_tra
     assert rec_aligned.effective_before_repeat == 69 and rec_aligned.effective_after_repeat == 69
 
     out_ar = tmp_path / "attnres_recoverssm_codesign.xlsx"
-    export_comparison_xlsx(bun_b, out_ar, compare_source=bun_a)
+    export_comparison_xlsx(bun_b, out_ar, after_bundle=bun_a)
     _, roots_ar, shared_ar = _inspect_xlsx(out_ar)
     s2 = _sheet_cells(roots_ar[SHEET_BREAKDOWN], shared_ar)
     rec_rows_s2 = [int(k[1:]) for k, (v, _) in s2.items() if k.startswith("G") and v and "RecoverSSMStateCommit" in v]
@@ -816,11 +817,11 @@ def test_sheet2_attnres_depth_slices_recoverssm_b69_codesign_cards_and_after_tra
     # 3. Post-synthesis per_layer_timings reflects After timings (never overwritten by Before timings).
     raw_bef, req_s = compose_export_case(
         "qwen3-32b", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
-        dp=1, tp=2, ep=1, prompt_tokens=512, output_tokens=32, concurrency=2, feature_track="merged",
+        dp=1, tp=2, ep=1, prompt_tokens=512, output_tokens=32, concurrency=2, feature_track="shipping",
     )
     raw_aft, _ = compose_export_case(
         "qwen3-32b", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
-        dp=1, tp=2, ep=1, prompt_tokens=512, output_tokens=32, concurrency=2, feature_track="expected_ideal",
+        dp=1, tp=2, ep=1, prompt_tokens=512, output_tokens=32, concurrency=2, feature_track="target",
     )
     b_pre = build_export_bundle(raw_bef, request=req_s, apply_target_envelope=False)
     b_post = build_export_bundle(raw_aft, request=req_s, apply_target_envelope=True)

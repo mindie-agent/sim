@@ -1,8 +1,9 @@
 """Sheet 2 (``Layer_Operator_Breakdown``) & conditional ``Measured_msprof_Calibration`` writers.
 
-[Role] Render topological Before-vs-After operator breakdown strictly inside
-  visible columns ``A..AA`` (``CMP_COLS = 27``, zero ``AB..AF`` accounting
-  columns), standalone breakdown (``A..P``), and conditional 1-to-N
+[Role] Render topological Before-vs-After and standalone operator breakdown strictly
+  inside visible columns ``A..AA`` (``CMP_COLS = 27``, zero ``AB..AF`` accounting
+  columns) with an explicit visible ``Idle / Host Wait / Bubble (idle_or_wait)``
+  row for exact 0-ns conservation, plus conditional 1-to-N
   ``Measured_msprof_Calibration`` worksheet (``A..N``).
 [Invariants] Every independent ``N->1`` fusion renders as ONE contiguous merged
   After cell with zero ``[↑ 已并入`` split rows; Sheet 2 populated column index
@@ -15,20 +16,24 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-import re
 
 from .action_plan import GroupAccounting
-from .comparison import format_public_track_label
 from .models import (
-    BACKEND_TILELANG,
+    BINDING_STATE_BOUND,
     MIN_DENOM_EPS,
+    NS_PER_MS,
+    NS_PER_US,
     OVERLAP_EXPOSED_EPS_US,
     US_PER_MS,
     AlignedComparisonRow,
     ExportBundle,
     OperatorExportRow,
+    bundle_step_int_ns,
     format_binding_badge,
+    op_exposed_int_ns,
+    op_lstar_int_ns,
 )
+from .public_view import format_track_label
 from .ooxml import (
     STYLE_FLOAT2,
     STYLE_FLOAT3,
@@ -106,20 +111,20 @@ CMP_CLUSTER_MERGE_COLS = (
 )
 CMP_SUBTOTAL_LABEL_END_COL = 9
 
-#: Sheet 2 Standalone mode column indices (16 columns A..P).
-STD_COLS = 16
-STD_DATA_START_ROW = 3
-STD_COL_ARCH = 1
-STD_COL_REP = 2
-STD_COL_SUB = 3
-STD_COL_ROLE = 4
-STD_COL_EXP_MS = 11
-STD_COL_LSTAR_US = 12
-STD_COL_LSTAR_MS = 13
-STD_COL_GAP_MS = 14
-STD_COL_BOUND = 15
-STD_COL_SOURCE_REF = 16
-STD_SUBTOTAL_LABEL_END_COL = 10
+#: Sheet 2 Standalone mode shares the canonical 27-column A..AA schema.
+STD_COLS = CMP_COLS
+STD_DATA_START_ROW = CMP_DATA_START_ROW
+STD_COL_ARCH = CMP_COL_ARCH
+STD_COL_REP = CMP_COL_REP
+STD_COL_SUB = CMP_COL_SUB
+STD_COL_ROLE = CMP_COL_ROLE
+STD_COL_EXP_MS = CMP_COL_AFT_EXP_MS
+STD_COL_LSTAR_US = CMP_COL_AFT_RAW_US
+STD_COL_LSTAR_MS = CMP_COL_LSTAR_MS
+STD_COL_GAP_MS = CMP_COL_GAP_MS
+STD_COL_BOUND = CMP_COL_AFT_BOUND
+STD_COL_SOURCE_REF = CMP_COL_SOURCE_REF
+STD_SUBTOTAL_LABEL_END_COL = CMP_SUBTOTAL_LABEL_END_COL
 
 #: Conditional Measured_msprof_Calibration sheet layout constants (14 columns A..N).
 MEAS_COLS = 14
@@ -138,14 +143,9 @@ CMP_COL_WIDTHS = (
     26.0, 28.0, 13.0, 13.0, 14.0, 13.0, 10.0, 20.0, 13.0, 12.0, 38.0, 30.0,
     15.0, 15.0, 15.0, 26.0,
 )
-STD_COL_WIDTHS = (
-    30.0, 9.0, 22.0, 28.0, 34.0, 32.0, 26.0, 28.0, 13.0, 13.0,
-    14.0, 13.0, 13.0, 12.0, 20.0, 30.0,
-)
 MEAS_COL_WIDTHS = (
     28.0, 22.0, 24.0, 24.0, 24.0, 28.0, 12.0, 14.0, 14.0, 28.0, 14.0, 14.0, 12.0, 20.0,
 )
-_LEGACY_BACKEND_RE = re.compile(r"legacy[-_]?dsl", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +155,17 @@ class BreakdownSheetReceipt:
     row_spans: dict[int, tuple[int, int]]
     last_detail_row: int
     grand_total_row: int
+    idle_row: int = 0
+    idle_before_ns: int = 0
+    idle_after_ns: int = 0
+
+
+def _op_exposed_int_ns(op: OperatorExportRow, rep: int) -> int:
+    return op_exposed_int_ns(op, rep)
+
+
+def _op_lstar_int_ns(op: OperatorExportRow, rep: int) -> int:
+    return op_lstar_int_ns(op, rep)
 
 
 def _stream_masking_badge(op: OperatorExportRow) -> tuple[str, int]:
@@ -179,7 +190,7 @@ def _stream_masking_badge(op: OperatorExportRow) -> tuple[str, int]:
 
 
 def _sanitize_backend_text(text: str) -> str:
-    return _LEGACY_BACKEND_RE.sub(BACKEND_TILELANG, str(text or ""))
+    return str(text or "")
 
 
 def _kernel_with_backend(op: OperatorExportRow) -> str:
@@ -191,11 +202,11 @@ def _kernel_with_backend(op: OperatorExportRow) -> str:
 def _write_cmp_before_sides(
     ws: Worksheet, r_start: int, row_count: int, item: AlignedComparisonRow,
     rep: int, b_ntok: float, *, b_rep: int | None = None,
-) -> tuple[float, float]:
-    """Populate Before columns (B, D..K, W, X) across ``row_count`` rows."""
+) -> tuple[int, float]:
+    """Populate Before columns (B, D..K, W, X) across ``row_count`` rows with exact int-ns sum."""
     eff_b_rep = int(b_rep) if b_rep is not None else rep
     same_rep = eff_b_rep == rep
-    before_ms_sum = 0.0
+    before_ns_sum = 0
     before_upt_sum = 0.0
     a_primary = item.after_ops[0] if item.after_ops else None
     for offset in range(row_count):
@@ -206,10 +217,11 @@ def _write_cmp_before_sides(
         upt_formula = f"=IF({SUM_BEF_NTOK_REF}>0,J{r}*1000/{SUM_BEF_NTOK_REF},0)"
         if offset < len(item.before_ops):
             b_op = item.before_ops[offset]
-            b_exp_us = 0.0 if b_op.is_overlapped else b_op.exposed_dur_us
-            b_ms = b_exp_us * eff_b_rep / US_PER_MS
-            b_upt = b_ms * US_PER_MS / b_ntok
-            before_ms_sum += b_ms
+            b_ns = _op_exposed_int_ns(b_op, eff_b_rep)
+            b_exp_us = float(b_ns) / (NS_PER_US * float(max(1, eff_b_rep))) if b_ns > 0 else 0.0
+            b_ms = float(b_ns) / float(NS_PER_MS)
+            b_upt = float(b_ns) / (NS_PER_US * b_ntok)
+            before_ns_sum += b_ns
             before_upt_sum += b_upt
             mask_ref = a_primary if (a_primary is not None and len(item.before_ops) == 1 and len(item.after_ops) == 1) else b_op
             stream_txt, stream_style = _stream_masking_badge(mask_ref)
@@ -242,28 +254,31 @@ def _write_cmp_before_sides(
             ), start_col=CMP_COL_ROLE)
             ws.set_cell(r, CMP_COL_SOURCE_REF, ref_a.source_ref or "", style=STYLE_MUTED_TEXT)
             ws.set_cell(r, CMP_COL_BEF_UPT, 0.0, formula=upt_formula, style=STYLE_FLOAT2)
-    return before_ms_sum, before_upt_sum
+    return before_ns_sum, before_upt_sum
 
 
 def _write_cmp_after_cluster(
     ws: Worksheet, r_start: int, r_end: int, item: AlignedComparisonRow,
-    rep: int, before_ms_sum: float, before_upt_sum: float, a_ntok: float,
+    rep: int, before_ns_sum: int, before_upt_sum: float, a_ntok: float,
     *, a_rep: int | None = None,
-) -> tuple[float, float, float]:
+) -> tuple[int, int, float]:
     """Populate After columns for M->N (len(after_ops) >= 2) re-association clusters."""
     eff_a_rep = int(a_rep) if a_rep is not None else rep
     same_rep = eff_a_rep == rep
-    aft_ms_sum = lstar_ms_sum = aft_upt_sum = 0.0
+    aft_ns_sum = lstar_ns_sum = 0
+    aft_upt_sum = 0.0
     for offset in range(r_end - r_start + 1):
         r = r_start + offset
         if offset < len(item.after_ops):
             a_op = item.after_ops[offset]
-            a_exp_us = 0.0 if a_op.is_overlapped else a_op.exposed_dur_us
-            a_ms = a_exp_us * eff_a_rep / US_PER_MS
-            l_ms = 0.0 if a_op.is_overlapped else (a_op.l_star_lean_us * eff_a_rep / US_PER_MS)
-            a_upt = a_ms * US_PER_MS / a_ntok
-            aft_ms_sum += a_ms
-            lstar_ms_sum += l_ms
+            a_ns = _op_exposed_int_ns(a_op, eff_a_rep)
+            l_ns = _op_lstar_int_ns(a_op, eff_a_rep)
+            a_exp_us = float(a_ns) / (NS_PER_US * float(max(1, eff_a_rep))) if a_ns > 0 else 0.0
+            a_ms = float(a_ns) / float(NS_PER_MS)
+            l_ms = float(l_ns) / float(NS_PER_MS)
+            a_upt = float(a_ns) / (NS_PER_US * a_ntok)
+            aft_ns_sum += a_ns
+            lstar_ns_sum += l_ns
             aft_upt_sum += a_upt
             st_style = (
                 STYLE_NEW_KERNEL if a_op.needs_new_kernel
@@ -275,9 +290,9 @@ def _write_cmp_after_cluster(
             ws.set_cell(r, CMP_COL_AFT_EXP_US, a_exp_us, style=STYLE_FLOAT3)
             ws.set_cell(r, CMP_COL_AFT_EXP_MS, a_ms, formula=f"=O{r}*B{r}/1000" if same_rep else f"=O{r}*{eff_a_rep}/1000", style=STYLE_FLOAT3)
             ws.set_cell(r, CMP_COL_AFT_BOUND, a_op.bound_display, style=STYLE_OVERLAP if a_op.is_overlapped else STYLE_TEXT)
-            ws.set_cell(r, CMP_COL_LSTAR_MS, l_ms, style=STYLE_FLOAT3)
+            ws.set_cell(r, CMP_COL_LSTAR_MS, l_ms, formula="=0" if a_op.is_overlapped else None, style=STYLE_FLOAT3)
             ws.set_cell(r, CMP_COL_AFT_UPT, a_upt, formula=f"=IF({SUM_AFT_NTOK_REF}>0,P{r}*1000/{SUM_AFT_NTOK_REF},0)", style=STYLE_FLOAT2)
-            ws.set_cell(r, CMP_COL_BINDING, format_binding_badge(a_op.binding_state), style=STYLE_TEXT_WRAP)
+            ws.set_cell(r, CMP_COL_BINDING, format_binding_badge(a_op.binding_state or BINDING_STATE_BOUND), style=STYLE_TEXT_WRAP)
         else:
             ws.set_cell(r, CMP_COL_AFT_KERN, "(Cluster Pad)", style=STYLE_TEXT)
             ws.set_cell(r, CMP_COL_STATUS, "-", style=STYLE_TEXT)
@@ -288,8 +303,11 @@ def _write_cmp_after_cluster(
             ws.set_cell(r, CMP_COL_LSTAR_MS, 0.0, style=STYLE_FLOAT3)
             ws.set_cell(r, CMP_COL_AFT_UPT, 0.0, formula="=0", style=STYLE_FLOAT2)
             ws.set_cell(r, CMP_COL_BINDING, "-", style=STYLE_TEXT)
-    spd = (before_ms_sum / aft_ms_sum) if aft_ms_sum > 0.0 else 0.0
-    ws.set_cell(r_start, CMP_COL_SAVED_MS, before_ms_sum - aft_ms_sum, formula=f"=SUM(J{r_start}:J{r_end})-SUM(P{r_start}:P{r_end})", style=STYLE_FLOAT3)
+    before_ms_sum = float(before_ns_sum) / float(NS_PER_MS)
+    aft_ms_sum = float(aft_ns_sum) / float(NS_PER_MS)
+    lstar_ms_sum = float(lstar_ns_sum) / float(NS_PER_MS)
+    spd = (before_ms_sum / aft_ms_sum) if aft_ns_sum > 0 else 0.0
+    ws.set_cell(r_start, CMP_COL_SAVED_MS, float(before_ns_sum - aft_ns_sum) / float(NS_PER_MS), formula=f"=SUM(J{r_start}:J{r_end})-SUM(P{r_start}:P{r_end})", style=STYLE_FLOAT3)
     ws.set_cell(r_start, CMP_COL_SPEEDUP, spd, formula=f"=IF(SUM(P{r_start}:P{r_end})>0,SUM(J{r_start}:J{r_end})/SUM(P{r_start}:P{r_end}),0)", style=STYLE_RATIO)
     ws.set_cell(r_start, CMP_COL_GAP_MS, max(0.0, aft_ms_sum - lstar_ms_sum), formula=f"=MAX(0,SUM(P{r_start}:P{r_end})-SUM(T{r_start}:T{r_end}))", style=STYLE_FLOAT3)
     ws.set_cell(r_start, CMP_COL_ACTION, _sanitize_backend_text(item.action_note), style=STYLE_TEXT_WRAP)
@@ -297,7 +315,7 @@ def _write_cmp_after_cluster(
     if r_end > r_start:
         for col in CMP_CLUSTER_MERGE_COLS:
             ws.merge_range(r_start, col, r_end, col)
-    return aft_ms_sum, lstar_ms_sum, aft_upt_sum
+    return aft_ns_sum, lstar_ns_sum, aft_upt_sum
 
 
 def _write_comparison_group(
@@ -308,30 +326,33 @@ def _write_comparison_group(
     acc: GroupAccounting | None,
     b_ntok: float,
     a_ntok: float,
-) -> tuple[float, float, float, float, float]:
+) -> tuple[int, int, int, float, float]:
     b_rep = item.effective_before_repeat
     a_rep = item.effective_after_repeat
     rep = a_rep or b_rep or max(1, int(item.repeat_count))
     row_count = r_end - r_start + 1
-    before_ms_sum, before_upt_sum = _write_cmp_before_sides(
+    before_ns_sum, before_upt_sum = _write_cmp_before_sides(
         ws, r_start, row_count, item, rep, b_ntok, b_rep=b_rep,
     )
 
     if len(item.after_ops) >= 2:
-        aft_ms, lstar_ms, aft_upt = _write_cmp_after_cluster(
-            ws, r_start, r_end, item, rep, before_ms_sum, before_upt_sum, a_ntok, a_rep=a_rep,
+        aft_ns, lstar_ns, aft_upt = _write_cmp_after_cluster(
+            ws, r_start, r_end, item, rep, before_ns_sum, before_upt_sum, a_ntok, a_rep=a_rep,
         )
-        return before_ms_sum, aft_ms, lstar_ms, before_upt_sum, aft_upt
+        return before_ns_sum, aft_ns, lstar_ns, before_upt_sum, aft_upt
 
     a_primary = item.after_ops[0] if item.after_ops else None
+    before_ms_sum = float(before_ns_sum) / float(NS_PER_MS)
     if a_primary is not None:
-        a_exp_us = 0.0 if a_primary.is_overlapped else a_primary.exposed_dur_us
-        aft_ms = a_exp_us * a_rep / US_PER_MS
-        lstar_ms = 0.0 if a_primary.is_overlapped else (a_primary.l_star_lean_us * a_rep / US_PER_MS)
-        aft_upt = aft_ms * US_PER_MS / a_ntok
-        saved_ms = before_ms_sum - aft_ms
-        speedup = (before_ms_sum / aft_ms) if aft_ms > 0.0 else 0.0
-        gap_ms = max(0.0, aft_ms - lstar_ms)
+        aft_ns = _op_exposed_int_ns(a_primary, a_rep)
+        lstar_ns = _op_lstar_int_ns(a_primary, a_rep)
+        a_exp_us = float(aft_ns) / (NS_PER_US * float(max(1, a_rep))) if aft_ns > 0 else 0.0
+        aft_ms = float(aft_ns) / float(NS_PER_MS)
+        lstar_ms = float(lstar_ns) / float(NS_PER_MS)
+        aft_upt = float(aft_ns) / (NS_PER_US * a_ntok)
+        saved_ms = float(before_ns_sum - aft_ns) / float(NS_PER_MS)
+        speedup = (before_ms_sum / aft_ms) if aft_ns > 0 else 0.0
+        gap_ms = max(0.0, float(aft_ns - lstar_ns) / float(NS_PER_MS))
         status_txt = acc.category if (acc is not None and acc.bucket in {"new", "tune"}) else (
             a_primary.kernel_status if a_primary.kernel_status else (acc.category if acc is not None else "")
         )
@@ -349,15 +370,16 @@ def _write_comparison_group(
             (saved_ms, f"=SUM(J{r_start}:J{r_end})-P{r_start}", STYLE_FLOAT3),
             (speedup, f"=IF(P{r_start}>0,SUM(J{r_start}:J{r_end})/P{r_start},0)", STYLE_RATIO),
             (a_primary.bound_display, None, STYLE_OVERLAP if a_primary.is_overlapped else STYLE_TEXT),
-            (lstar_ms, None, STYLE_FLOAT3),
+            (lstar_ms, "=0" if a_primary.is_overlapped else None, STYLE_FLOAT3),
             (gap_ms, f"=MAX(0,P{r_start}-T{r_start})", STYLE_FLOAT3),
             (_sanitize_backend_text(item.action_note), None, STYLE_TEXT_WRAP),
         ), start_col=CMP_COL_AFT_KERN)
         ws.set_cell(r_start, CMP_COL_AFT_UPT, aft_upt, formula=f"=IF({SUM_AFT_NTOK_REF}>0,P{r_start}*1000/{SUM_AFT_NTOK_REF},0)", style=STYLE_FLOAT2)
         ws.set_cell(r_start, CMP_COL_SAVED_UPT, before_upt_sum - aft_upt, formula=f"=SUM(X{r_start}:X{r_end})-Y{r_start}", style=STYLE_FLOAT2)
-        ws.set_cell(r_start, CMP_COL_BINDING, format_binding_badge(a_primary.binding_state), style=STYLE_TEXT_WRAP)
+        ws.set_cell(r_start, CMP_COL_BINDING, format_binding_badge(a_primary.binding_state or BINDING_STATE_BOUND), style=STYLE_TEXT_WRAP)
     else:
-        aft_ms = lstar_ms = aft_upt = 0.0
+        aft_ns = lstar_ns = 0
+        aft_upt = 0.0
         write_row(ws, r_start, (
             ("— [优化后移除, 0.000 ms]", None, STYLE_OVERLAP), ("已移除", None, STYLE_OVERLAP),
             (0.0, None, STYLE_FLOAT3), (0.0, None, STYLE_FLOAT3),
@@ -373,7 +395,7 @@ def _write_comparison_group(
     if r_end > r_start:
         for col in CMP_AFTER_MERGE_COLS:
             ws.merge_range(r_start, col, r_end, col)
-    return before_ms_sum, aft_ms, lstar_ms, before_upt_sum, aft_upt
+    return before_ns_sum, aft_ns, lstar_ns, before_upt_sum, aft_upt
 
 
 def _write_comparison_subtotal_row(
@@ -430,6 +452,57 @@ def _write_comparison_grand_total(
     ws.set_cell(tot_row, CMP_COL_BINDING, "= 10^6 / Single-Die TPS", style=STYLE_TOTAL_TEXT)
 
 
+def _write_idle_wall_row(
+    ws: Worksheet,
+    r_idle: int,
+    *,
+    bef_idle_ns: int,
+    aft_idle_ns: int,
+    b_ntok: float,
+    a_ntok: float,
+    binding_state: str,
+) -> tuple[float, float]:
+    """Write explicit visible idle/wait wall-time row so Sheet 2 sums to step_span_ns (0 ns residual)."""
+    ws.set_row_height(r_idle, WRAP_ROW_HEIGHT_PT)
+    b_us = float(bef_idle_ns) / NS_PER_US
+    a_us = float(aft_idle_ns) / NS_PER_US
+    b_ms = float(bef_idle_ns) / float(NS_PER_MS)
+    a_ms = float(aft_idle_ns) / float(NS_PER_MS)
+    b_upt = float(bef_idle_ns) / (NS_PER_US * b_ntok)
+    a_upt = float(aft_idle_ns) / (NS_PER_US * a_ntok)
+    spd = (b_ms / a_ms) if aft_idle_ns > 0 else 0.0
+    write_row(ws, r_idle, (
+        ("Idle / Host Wait / Bubble (idle_or_wait)", None, STYLE_MERGED),
+        (1, None, STYLE_INT),
+        ("Idle / Host Wait / Bubble", None, STYLE_TEXT_WRAP),
+        ("Unoverlapped Host Wait / Sync Bubble (idle_or_wait)", None, STYLE_TEXT_WRAP),
+        ("主机/同步等待 [暴露 100%]", None, STYLE_TEXT),
+        ("-", None, STYLE_TEXT),
+        ("Idle / Wait [Host]", None, STYLE_TEXT),
+        (b_us, None, STYLE_FLOAT3),
+        (b_us, None, STYLE_FLOAT3),
+        (b_ms, f"=I{r_idle}*B{r_idle}/1000", STYLE_FLOAT3),
+        ("Host / Sync Bubble Wait", None, STYLE_TEXT),
+        ("Idle / Wait [Host]", None, STYLE_TEXT),
+        ("主机等待 / 流水气泡", None, STYLE_TEXT),
+        (a_us, None, STYLE_FLOAT3),
+        (a_us, None, STYLE_FLOAT3),
+        (a_ms, f"=O{r_idle}*B{r_idle}/1000", STYLE_FLOAT3),
+        (float(bef_idle_ns - aft_idle_ns) / float(NS_PER_MS), f"=J{r_idle}-P{r_idle}", STYLE_FLOAT3),
+        (spd, f"=IF(P{r_idle}>0,J{r_idle}/P{r_idle},0)", STYLE_RATIO),
+        ("Host / Sync Bubble Wait", None, STYLE_TEXT),
+        (0.0, None, STYLE_FLOAT3),
+        (a_ms, f"=MAX(0,P{r_idle}-T{r_idle})", STYLE_FLOAT3),
+        ("显式空闲/同步等待行（0 ns 端到端守恒）", None, STYLE_TEXT_WRAP),
+        ("", None, STYLE_MUTED_TEXT),
+        (b_upt, f"=IF({SUM_BEF_NTOK_REF}>0,J{r_idle}*1000/{SUM_BEF_NTOK_REF},0)", STYLE_FLOAT2),
+        (a_upt, f"=IF({SUM_AFT_NTOK_REF}>0,P{r_idle}*1000/{SUM_AFT_NTOK_REF},0)", STYLE_FLOAT2),
+        (b_upt - a_upt, f"=X{r_idle}-Y{r_idle}", STYLE_FLOAT2),
+        (format_binding_badge(binding_state or BINDING_STATE_BOUND), None, STYLE_TEXT_WRAP),
+    ))
+    return b_upt, a_upt
+
+
 def populate_comparison_breakdown_sheet(
     ws: Worksheet,
     before_bundle: ExportBundle,
@@ -437,204 +510,154 @@ def populate_comparison_breakdown_sheet(
     aligned_rows: Sequence[AlignedComparisonRow],
     group_accounting: Sequence[GroupAccounting] = (),
 ) -> BreakdownSheetReceipt:
-    """Populate Sheet 2 in comparison mode strictly within visible columns ``A:AA``."""
+    """Populate canonical 27-column A:AA Sheet 2 with exact int-ns accumulation + visible idle row."""
     apply_col_widths(ws, CMP_COL_WIDTHS)
     ws.freeze_panes(CMP_FREEZE_ROWS, CMP_FREEZE_COLS)
-    b_track_lbl = format_public_track_label(before_bundle, role="before")
-    a_track_lbl = format_public_track_label(after_bundle, role="after")
+    b_track_lbl = format_track_label(before_bundle.feature_track) if before_bundle.feature_track else "基线配置"
+    a_track_lbl = format_track_label(after_bundle.feature_track) if after_bundle.feature_track else "优化方案"
     write_banner(
         ws, 1, CMP_COLS,
-        (
-            f"Before ({b_track_lbl}) vs After ({a_track_lbl}) "
-            f"Topological Operator Breakdown | {before_bundle.model_name} @ {before_bundle.hardware_sku} ({before_bundle.phase.upper()})"
-        ),
+        f"全网逐层算子拆解与优化对比 (Layer Operator Breakdown) | {before_bundle.model_name} @ {after_bundle.hardware_sku} | Before [{b_track_lbl}] vs After [{a_track_lbl}]",
         STYLE_TITLE,
     )
     headers = (
-        "Archetype (Scope & Layer Range)", "Repeats (×N)", "Submodule",
-        "Logical Role (带作用域标注)", "并发流与掩盖关系 (Stream & Masking)",
-        "Rank-Local Shapes & Dtype",
-        "Before Ascend Kernel [Backend]", "Before 流内单次 (us)", "Before 单次暴露 (us)",
-        "Before 全网暴露 (ms)", "Before Bound",
-        "After Ascend Kernel [Backend]", "分类 / 算子状态 (Category / Status)",
-        "After 流内单次 (us)", "After 单次暴露 (us)", "After 全网暴露 (ms)",
-        "暴露净省 Δ (ms)", "Speedup", "After Bound",
-        "物理下界 L* (ms)", "Gap vs L* (ms)",
-        "物理收据与变化说明 (Receipt Summary)", "源码出处 / Source Ref",
-        "Before 摊薄耗时 (us/tok·die)", "After 摊薄耗时 (us/tok·die)",
-        "摊薄净省 Δ (us/tok·die)", "绑定状态 (Binding State)",
+        "Layer Archetype", "Repeat", "Submodule", "Logical Role", "Stream & Masking",
+        "Rank-Local Shapes & Dtype", f"Before Kernel [{b_track_lbl}]",
+        "Before Raw (us)", "Before Exp (us)", "Before Model (ms)", "Before Bound",
+        f"After Kernel [{a_track_lbl}]", "Kernel Status",
+        "After Raw (us)", "After Exp (us)", "After Model (ms)",
+        "Saved Δ (ms)", "Speedup", "After Bound", "L* Floor (ms)", "Gap vs L* (ms)",
+        "Optimization / Fusion Action", "Source Ref",
+        "Before (us/tok·die)", "After (us/tok·die)", "Saved Δ (us/tok·die)", "Binding State",
     )
     write_headers(ws, 2, headers)
 
     b_ntok = max(float(before_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
     a_ntok = max(float(after_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
     acc_by_idx = {a.row_index: a for a in group_accounting}
-    by_arch: list[tuple[str, str, int, list[tuple[int, AlignedComparisonRow]]]] = []
-    for row_idx, item in enumerate(aligned_rows):
-        if not by_arch or by_arch[-1][0] != item.archetype_id:
-            by_arch.append((item.archetype_id, item.archetype_title, item.repeat_count, []))
-        by_arch[-1][3].append((row_idx, item))
-
-    row_cursor = CMP_DATA_START_ROW
     row_spans: dict[int, tuple[int, int]] = {}
     subtotal_rows: list[int] = []
-    last_detail_row = CMP_DATA_START_ROW - 1
-    tot_bef_ms = tot_aft_ms = tot_lstar_ms = 0.0
+    tot_bef_ns = tot_aft_ns = tot_lstar_ns = 0
     tot_bef_upt = tot_aft_upt = 0.0
-    for _, arch_title, _, arch_items in by_arch:
+    row_cursor = CMP_DATA_START_ROW
+    last_detail_row = CMP_DATA_START_ROW - 1
+
+    # Group contiguous aligned rows by archetype_id for exact subtotals.
+    idx = 0
+    n_items = len(aligned_rows)
+    while idx < n_items:
+        arch_id = aligned_rows[idx].archetype_id
+        arch_title = aligned_rows[idx].archetype_title or arch_id
         arch_start = row_cursor
-        sub_spans: list[tuple[str, int, int]] = []
-        arch_bef_ms = arch_aft_ms = arch_lstar_ms = 0.0
+        arch_bef_ns = arch_aft_ns = arch_lstar_ns = 0
         arch_bef_upt = arch_aft_upt = 0.0
-        for row_idx, item in arch_items:
+        sub_span: list[int] | None = None
+        sub_label = ""
+        while idx < n_items and aligned_rows[idx].archetype_id == arch_id:
+            item = aligned_rows[idx]
             row_count = max(1, len(item.before_ops), len(item.after_ops))
             r_start = row_cursor
             r_end = row_cursor + row_count - 1
-            b_ms, a_ms, l_ms, b_u, a_u = _write_comparison_group(
-                ws, r_start, r_end, item, acc_by_idx.get(row_idx), b_ntok, a_ntok,
+            b_ns, a_ns, l_ns, b_upt, a_upt = _write_comparison_group(
+                ws, r_start, r_end, item, acc_by_idx.get(idx), b_ntok, a_ntok,
             )
-            row_spans[row_idx] = (r_start, r_end)
-            last_detail_row = max(last_detail_row, r_end)
-            arch_bef_ms += b_ms
-            arch_aft_ms += a_ms
-            arch_lstar_ms += l_ms
-            arch_bef_upt += b_u
-            arch_aft_upt += a_u
-            extend_span(sub_spans, item.submodule, r_start, r_end)
+            row_spans[idx] = (r_start, r_end)
+            arch_bef_ns += b_ns
+            arch_aft_ns += a_ns
+            arch_lstar_ns += l_ns
+            arch_bef_upt += b_upt
+            arch_aft_upt += a_upt
+            if sub_span is None or item.submodule != sub_label:
+                if sub_span is not None and sub_span[1] > sub_span[0]:
+                    ws.merge_range(sub_span[0], CMP_COL_SUB, sub_span[1], CMP_COL_SUB)
+                sub_label = item.submodule
+                sub_span = [r_start, r_end]
+                ws.set_cell(r_start, CMP_COL_SUB, sub_label, style=STYLE_TEXT_WRAP)
+            else:
+                sub_span[1] = r_end
+            last_detail_row = r_end
             row_cursor = r_end + 1
+            idx += 1
+
+        if sub_span is not None and sub_span[1] > sub_span[0]:
+            ws.merge_range(sub_span[0], CMP_COL_SUB, sub_span[1], CMP_COL_SUB)
         arch_end = row_cursor - 1
         ws.set_cell(arch_start, CMP_COL_ARCH, arch_title, style=STYLE_MERGED)
-        ws.merge_range(arch_start, CMP_COL_ARCH, arch_end, CMP_COL_ARCH)
-        for sub_label, s1, s2 in sub_spans:
-            ws.set_cell(s1, CMP_COL_SUB, sub_label, style=STYLE_MERGED)
-            ws.merge_range(s1, CMP_COL_SUB, s2, CMP_COL_SUB)
+        if arch_end > arch_start:
+            ws.merge_range(arch_start, CMP_COL_ARCH, arch_end, CMP_COL_ARCH)
+
         r_sub = row_cursor
         _write_comparison_subtotal_row(
             ws, r_sub, arch_title, arch_start, arch_end,
-            arch_bef_ms, arch_aft_ms, arch_lstar_ms, arch_bef_upt, arch_aft_upt,
+            float(arch_bef_ns) / float(NS_PER_MS),
+            float(arch_aft_ns) / float(NS_PER_MS),
+            float(arch_lstar_ns) / float(NS_PER_MS),
+            arch_bef_upt, arch_aft_upt,
         )
         subtotal_rows.append(r_sub)
-        tot_bef_ms += arch_bef_ms
-        tot_aft_ms += arch_aft_ms
-        tot_lstar_ms += arch_lstar_ms
+        tot_bef_ns += arch_bef_ns
+        tot_aft_ns += arch_aft_ns
+        tot_lstar_ns += arch_lstar_ns
         tot_bef_upt += arch_bef_upt
         tot_aft_upt += arch_aft_upt
         row_cursor += 1
+
+    b_step_ns = bundle_step_int_ns(before_bundle)
+    a_step_ns = bundle_step_int_ns(after_bundle)
+    idle_bef_ns = max(0, b_step_ns - tot_bef_ns)
+    idle_aft_ns = max(0, a_step_ns - tot_aft_ns)
+    idle_row = 0
+    if idle_bef_ns > 0 or idle_aft_ns > 0:
+        idle_row = row_cursor
+        ib_upt, ia_upt = _write_idle_wall_row(
+            ws, idle_row, bef_idle_ns=idle_bef_ns, aft_idle_ns=idle_aft_ns,
+            b_ntok=b_ntok, a_ntok=a_ntok, binding_state=after_bundle.binding_state,
+        )
+        subtotal_rows.append(idle_row)
+        tot_bef_ns += idle_bef_ns
+        tot_aft_ns += idle_aft_ns
+        tot_bef_upt += ib_upt
+        tot_aft_upt += ia_upt
+        last_detail_row = idle_row
+        row_cursor += 1
+
+    tot_row = row_cursor
     _write_comparison_grand_total(
-        ws, row_cursor, subtotal_rows, tot_bef_ms, tot_aft_ms, tot_lstar_ms, tot_bef_upt, tot_aft_upt,
+        ws, tot_row, subtotal_rows,
+        float(tot_bef_ns) / float(NS_PER_MS),
+        float(tot_aft_ns) / float(NS_PER_MS),
+        float(tot_lstar_ns) / float(NS_PER_MS),
+        tot_bef_upt, tot_aft_upt,
     )
     ws.validate_max_column(CMP_COLS)
     return BreakdownSheetReceipt(
         row_spans=row_spans,
         last_detail_row=last_detail_row,
-        grand_total_row=row_cursor,
+        grand_total_row=tot_row,
+        idle_row=idle_row,
+        idle_before_ns=idle_bef_ns,
+        idle_after_ns=idle_aft_ns,
     )
 
 
 def populate_standalone_breakdown_sheet(
     ws: Worksheet, bundle: ExportBundle,
 ) -> BreakdownSheetReceipt:
-    """Populate Sheet 2 in standalone (single-bundle) mode."""
-    apply_col_widths(ws, STD_COL_WIDTHS)
-    ws.freeze_panes(CMP_FREEZE_ROWS, CMP_FREEZE_COLS)
-    write_banner(
-        ws, 1, STD_COLS,
-        f"Layer-Archetype -> Submodule -> Ascend Kernel Breakdown | {bundle.model_name} @ {bundle.hardware_sku} ({bundle.phase.upper()})",
-        STYLE_TITLE,
+    """Populate canonical 27-column A:AA Sheet 2 for standalone single-bundle workbooks."""
+    identity_rows = tuple(
+        AlignedComparisonRow(
+            archetype_id=op.archetype_id or op.layer_label,
+            archetype_title=op.archetype_title or op.layer_label,
+            repeat_count=op.repeat_count,
+            submodule=op.submodule,
+            before_ops=(op,),
+            after_ops=(op,),
+            relation="1->1",
+            action_note="",
+        )
+        for op in bundle.operators
     )
-    headers = (
-        "Archetype (Scope & Layer Range)", "Repeats (×N)", "Submodule",
-        "Logical Role (带作用域标注)", "并发流与掩盖关系 (Stream & Masking)",
-        "Rank-Local Shapes & Dtype", "Ascend Kernel [Backend]",
-        "Kernel Status (算子状态)",
-        "流内单次 (us)", "单次暴露 (us)", "全网暴露 (ms)",
-        "物理下界 L* 单次 (us)", "物理下界 L* 全网 (ms)", "Gap vs L* (ms)",
-        "Bottleneck Bound", "源码出处 / Source Ref",
-    )
-    write_headers(ws, 2, headers)
-
-    by_arch: list[tuple[str, str, list[tuple[int, OperatorExportRow]]]] = []
-    for op_idx, op in enumerate(bundle.operators):
-        aid = op.archetype_id or op.layer_label
-        if not by_arch or by_arch[-1][0] != aid:
-            by_arch.append((aid, op.archetype_title or op.layer_label, []))
-        by_arch[-1][2].append((op_idx, op))
-
-    row_cursor = STD_DATA_START_ROW
-    row_spans: dict[int, tuple[int, int]] = {}
-    subtotal_rows: list[int] = []
-    last_detail_row = STD_DATA_START_ROW - 1
-    tot_ms = tot_lstar_ms = 0.0
-    for _, arch_title, ops in by_arch:
-        arch_start = row_cursor
-        sub_spans: list[tuple[str, int, int]] = []
-        arch_ms = arch_lstar_ms = 0.0
-        for op_idx, op in ops:
-            r = row_cursor
-            row_spans[op_idx] = (r, r)
-            last_detail_row = max(last_detail_row, r)
-            ws.set_row_height(r, WRAP_ROW_HEIGHT_PT)
-            rep = max(1, int(op.repeat_count))
-            stream_txt, stream_style = _stream_masking_badge(op)
-            exp_us = 0.0 if op.is_overlapped else op.exposed_dur_us
-            exp_ms = exp_us * rep / US_PER_MS
-            l_ms = 0.0 if op.is_overlapped else (op.l_star_lean_us * rep / US_PER_MS)
-            arch_ms += exp_ms
-            arch_lstar_ms += l_ms
-            ws.set_cell(r, STD_COL_REP, rep, style=STYLE_INT)
-            write_row(ws, r, (
-                (op.logical_role or op.op_id, None, STYLE_TEXT_WRAP),
-                (stream_txt, None, stream_style),
-                (op.tensor_contract, None, STYLE_TEXT_WRAP),
-                (_kernel_with_backend(op), None, STYLE_TEXT_WRAP),
-                (op.kernel_status, None, STYLE_NEW_KERNEL if op.needs_new_kernel else STYLE_TEXT_WRAP),
-                (op.dur_us, None, STYLE_FLOAT3),
-                (exp_us, None, STYLE_FLOAT3),
-                (exp_ms, f"=J{r}*B{r}/1000", STYLE_FLOAT3),
-                (op.l_star_lean_us, None, STYLE_FLOAT3),
-                (l_ms, "=0" if op.is_overlapped else f"=L{r}*B{r}/1000", STYLE_FLOAT3),
-                (max(0.0, exp_ms - l_ms), f"=MAX(0,K{r}-M{r})", STYLE_FLOAT3),
-                (op.bound_display, None, STYLE_OVERLAP if op.is_overlapped else STYLE_TEXT),
-                (op.source_ref or "", None, STYLE_MUTED_TEXT),
-            ), start_col=STD_COL_ROLE)
-            extend_span(sub_spans, op.submodule, r, r)
-            row_cursor += 1
-        arch_end = row_cursor - 1
-        ws.set_cell(arch_start, STD_COL_ARCH, arch_title, style=STYLE_MERGED)
-        ws.merge_range(arch_start, STD_COL_ARCH, arch_end, STD_COL_ARCH)
-        for sub_label, s1, s2 in sub_spans:
-            ws.set_cell(s1, STD_COL_SUB, sub_label, style=STYLE_MERGED)
-            ws.merge_range(s1, STD_COL_SUB, s2, STD_COL_SUB)
-        r_sub = row_cursor
-        ws.set_cell(r_sub, 1, f"Subtotal — {arch_title}", style=STYLE_SUBTOTAL_TEXT)
-        ws.merge_range(r_sub, 1, r_sub, STD_SUBTOTAL_LABEL_END_COL)
-        ws.set_cell(r_sub, STD_COL_EXP_MS, arch_ms, formula=f"=SUM(K{arch_start}:K{arch_end})", style=STYLE_SUBTOTAL_NUM)
-        ws.set_cell(r_sub, STD_COL_LSTAR_US, "", style=STYLE_SUBTOTAL_TEXT)
-        ws.set_cell(r_sub, STD_COL_LSTAR_MS, arch_lstar_ms, formula=f"=SUM(M{arch_start}:M{arch_end})", style=STYLE_SUBTOTAL_NUM)
-        ws.set_cell(r_sub, STD_COL_GAP_MS, max(0.0, arch_ms - arch_lstar_ms), formula=f"=MAX(0,K{r_sub}-M{r_sub})", style=STYLE_SUBTOTAL_NUM)
-        ws.set_cell(r_sub, STD_COL_BOUND, "", style=STYLE_SUBTOTAL_TEXT)
-        ws.merge_range(r_sub, STD_COL_BOUND, r_sub, STD_COL_SOURCE_REF)
-        subtotal_rows.append(r_sub)
-        tot_ms += arch_ms
-        tot_lstar_ms += arch_lstar_ms
-        row_cursor += 1
-
-    ws.set_cell(row_cursor, 1, "WHOLE-MODEL TOTAL (实际暴露耗时合计)", style=STYLE_TOTAL_TEXT)
-    ws.merge_range(row_cursor, 1, row_cursor, STD_SUBTOTAL_LABEL_END_COL)
-    sum_k = "=" + "+".join(f"K{r}" for r in subtotal_rows) if subtotal_rows else "=0"
-    sum_m = "=" + "+".join(f"M{r}" for r in subtotal_rows) if subtotal_rows else "=0"
-    ws.set_cell(row_cursor, STD_COL_EXP_MS, tot_ms, formula=sum_k, style=STYLE_TOTAL_FLOAT3)
-    ws.set_cell(row_cursor, STD_COL_LSTAR_US, "", style=STYLE_TOTAL_TEXT)
-    ws.set_cell(row_cursor, STD_COL_LSTAR_MS, tot_lstar_ms, formula=sum_m, style=STYLE_TOTAL_FLOAT3)
-    ws.set_cell(row_cursor, STD_COL_GAP_MS, max(0.0, tot_ms - tot_lstar_ms), formula=f"=MAX(0,K{row_cursor}-M{row_cursor})", style=STYLE_TOTAL_FLOAT3)
-    ws.set_cell(row_cursor, STD_COL_BOUND, f"{len(bundle.operators)} archetype ops", style=STYLE_TOTAL_TEXT)
-    ws.merge_range(row_cursor, STD_COL_BOUND, row_cursor, STD_COL_SOURCE_REF)
-    ws.validate_max_column(STD_COLS)
-    return BreakdownSheetReceipt(
-        row_spans=row_spans,
-        last_detail_row=last_detail_row,
-        grand_total_row=row_cursor,
-    )
+    return populate_comparison_breakdown_sheet(ws, bundle, bundle, identity_rows, ())
 
 
 def populate_measured_calibration_sheet(ws: Worksheet, bundle: ExportBundle) -> None:

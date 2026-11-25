@@ -31,24 +31,24 @@ import math
 import re
 from typing import Any, Literal
 
-from mindie_sim.schema.scenario import canonical_comparison_stages
+from mindie_sim.schema.common import ModelingError
 
 from .models import (
-    BINDING_STATE_BOUND, BINDING_STATE_MEASURED, BINDING_STATE_UNBOUND_FORMULA,
-    DEFAULT_TOP_OPTIMIZE_KERNELS, KIB_BYTES, MIN_DENOM_EPS, MODE_MODELING,
-    OVERLAP_EXPOSED_EPS_US,
+    BINDING_STATE_MEASURED, BINDING_STATE_UNBOUND_FORMULA,
+    DEFAULT_TOP_OPTIMIZE_KERNELS, KIB_BYTES, MIN_DENOM_EPS,
+    NS_PER_MS, NS_PER_US, OVERLAP_EXPOSED_EPS_US,
     PENDING_KIND_AT_FLOOR, PENDING_KIND_TO_IMPLEMENT, PENDING_KIND_TO_OPTIMIZE,
     TRACK_CONFIG_ENV, TRACK_FRAMEWORK, TRACK_KERNEL, US_PER_MS,
     ActionRoadmapRow, AlignedComparisonRow, ExportBundle, NewKernelBacklogItem,
-    OperatorExportRow, PendingKernelItem,
+    OperatorExportRow, PendingKernelItem, bundle_step_int_ns, op_exposed_int_ns,
 )
 from .public_view import (
     PUBLIC_PIPE_NAMES,
     THREE_TRACK_LABELS,
     diff_public_scenario_configs,
     is_same_public_config,
-    normalize_public_backend,
     project_public_effective_config,
+    project_public_scenario_config,
     sanitize_public_text,
     sanitize_source_ref,
 )
@@ -71,10 +71,22 @@ STRUCTURAL_EDIT_OPCODES = frozenset({
     "FuseRegion", "CollectiveTransform", "HoistOrDeduplicate", "StreamSchedule", "StreamCoreBudget",
 })
 
+#: Canonical 3-stage + residual waterfall stage identifiers shared across Sheet 1 & Sheet 4.
+WF_STAGE_CONFIG = "config"
+WF_STAGE_FRAMEWORK = "framework"
+WF_STAGE_KERNEL = "kernel"
+WF_STAGE_RESIDUAL = "residual"
+_MIN_RECEIPT_STAGES_FOR_FWK = 3
+_RECEIPT_FOUR_STAGES = 4
+_FRAMEWORK_REASONS = frozenset({
+    "stream_masking_change",
+    "shipping_fusion_enablement",
+    "subgraph_reassociation",
+    "shipping_route_switch",
+    "framework_graph_edit",
+})
+
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
-_ARCH_FAMILY_A5_TOKENS = ("950", "a5", "3510")
-_ARCH_FAMILY_A3_TOKENS = ("910_93", "910c", "a3", "9392", "9382", "9372", "9362", "9391", "9381")
-_ARCH_FAMILY_A2_TOKENS = ("910b", "a2", "310p", "300i")
 
 
 @dataclass(frozen=True, slots=True)
@@ -122,6 +134,11 @@ class WaterfallSummary:
     sheet2_after_total_ms: float
     before_endpoint_error_ms: float
     after_endpoint_error_ms: float
+    before_step_ns: int = 0
+    after_step_ns: int = 0
+    idle_before_ns: int = 0
+    idle_after_ns: int = 0
+    reconciliation_error_ns: int = 0
 
     def to_brief_dict(self) -> dict[str, float]:
         return {
@@ -154,15 +171,19 @@ def format_signed_gain_text(saved_ms: float) -> str:
     return f"{saved_ms * US_PER_MS:.2f} us" if 0.0 < abs(saved_ms) < SUB_MS_DISPLAY_THRESHOLD else f"{saved_ms:.3f} ms"
 
 
-def _arch_tag_from_sku(hardware_sku: str) -> str:
-    low = str(hardware_sku or "").strip().lower()
-    if any(tok in low for tok in _ARCH_FAMILY_A5_TOKENS):
-        return "arch35"
-    if any(tok in low for tok in _ARCH_FAMILY_A3_TOKENS):
-        return "arch22"
-    if any(tok in low for tok in _ARCH_FAMILY_A2_TOKENS):
-        return "arch20"
-    return _SLUG_RE.sub("_", low).strip("_") or "generic"
+def _arch_tag_from_bundle(bundle: ExportBundle) -> str:
+    """Read structured architecture family from ExportBundle metadata or canonical HW normalizer."""
+    from mindie_sim.catalog.npu_checkpoints import normalize_hw_family
+
+    eff = bundle.effective_config if isinstance(bundle.effective_config, Mapping) else {}
+    raw = str(eff.get("arch_family") or "").strip().lower()
+    if not raw and isinstance(bundle.hardware_die_summary, Mapping):
+        raw = str(bundle.hardware_die_summary.get("arch_family") or "").strip().lower()
+    if not raw and bundle.hardware_sku:
+        raw = str(normalize_hw_family(bundle.hardware_sku) or "").strip().lower()
+    if not raw:
+        raise ModelingError(f"missing_structured_arch_family_on_bundle:{bundle.hardware_sku!r}")
+    return _SLUG_RE.sub("_", raw).strip("_")
 
 
 def _short_arch_name(title: str) -> str:
@@ -173,11 +194,34 @@ def _public_effective_config(bundle: ExportBundle) -> dict[str, Any]:
     return project_public_effective_config(bundle)
 
 
+_RUNTIME_FEATURE_SWITCH_KEYS = frozenset({
+    "graph_mode", "enable_fused_mc2", "multistream_overlap_shared_expert",
+})
+
+
 def _is_same_deployment_config(before: ExportBundle, after: ExportBundle) -> bool:
     return (
         is_same_public_config(before, after)
         and abs(float(before.n_tok_per_die or 1.0) - float(after.n_tok_per_die or 1.0)) <= MIN_DENOM_EPS
     )
+
+
+def _is_same_deployment_geometry(before: ExportBundle, after: ExportBundle) -> bool:
+    """True when hardware, workload, batch, parallelism, and quantization match."""
+    if abs(float(before.n_tok_per_die or 1.0) - float(after.n_tok_per_die or 1.0)) > MIN_DENOM_EPS:
+        return False
+    bc = project_public_scenario_config(before)
+    ac = project_public_scenario_config(after)
+    for key, b_val in bc.items():
+        if key in _RUNTIME_FEATURE_SWITCH_KEYS:
+            continue
+        a_val = ac.get(key)
+        if isinstance(b_val, float) or isinstance(a_val, float):
+            if abs(float(b_val or 0.0) - float(a_val or 0.0)) > MIN_DENOM_EPS:
+                return False
+        elif b_val != a_val:
+            return False
+    return True
 
 
 def _extract_deployment_diffs(before: ExportBundle, after: ExportBundle) -> list[tuple[str, str, str]]:
@@ -190,111 +234,38 @@ def build_parallelism_codesign_note(before_bundle: ExportBundle, after_bundle: E
     return " | ".join(f"{f}: {bv} -> {av}" for f, bv, av in _extract_deployment_diffs(before_bundle, after_bundle))
 
 
-def anchor_stage_waterfall(
-    before_bundle: ExportBundle,
-    after_bundle: ExportBundle,
-    *,
-    config_bridge_span_us: float | None = None,
-    config_saved_us: float | None = None,
-    config_stage_saved_us: float | None = None,
-    framework_stage_saved_us: float | None = None,
-) -> tuple[dict[str, Any], ...]:
-    """Anchor 4-stage Engine waterfall onto ``before_bundle.step_span_us -> after_bundle.step_span_us``.
+def _op_exposed_ns(op: OperatorExportRow, repeat_count: int) -> int:
+    return op_exposed_int_ns(op, repeat_count)
 
-    Bridges cross-track pairs (e.g. ``merged`` -> ``expected_ideal``) so Stage 0
-    is always ``before_bundle.step_span_us``, Stage 1 is the config/parallel bridge
-    (or ``before`` when deployment config is identical), Stage 2 is ``after_bundle``'s
-    pre-synthesis / framework-rewrite span, and Stage 3 is ``after_bundle.step_span_us``
-    with zero telescoping gap. When Sheet 4's exact classified stage savings
-    ``(config_stage_saved_us, framework_stage_saved_us)`` are provided, Stages 1 & 2
-    match Sheet 4 ``D4`` and ``D5`` identically.
-    """
-    before_us = max(0.0, float(before_bundle.step_span_us))
-    after_us = max(0.0, float(after_bundle.step_span_us))
-    raw_wf = tuple(dict(item) for item in (after_bundle.stage_waterfall or ()) if isinstance(item, Mapping))
-    raw_by_stage = {str(item.get("stage") or ""): item for item in raw_wf}
-    raw_before_us = float(raw_by_stage["before"]["step_span_us"]) if "before" in raw_by_stage else None
-    raw_cfg_us = float(raw_by_stage["config_only"]["step_span_us"]) if "config_only" in raw_by_stage else None
-    raw_fwk_us = float(raw_by_stage["framework_rewrite"]["step_span_us"]) if "framework_rewrite" in raw_by_stage else None
 
-    has_fwk_delta = (
-        framework_stage_saved_us is not None
-        and abs(float(framework_stage_saved_us)) > OVERLAP_EXPOSED_EPS_US
-    )
-    is_modeling = (
-        "framework_rewrite" in raw_by_stage
-        or after_bundle.analysis_mode == MODE_MODELING
-        or bool(after_bundle.target_envelope_applied)
-        or has_fwk_delta
-    )
-    stage_specs = canonical_comparison_stages("modeling" if is_modeling else "simulation")
-    same_cfg = _is_same_deployment_config(before_bundle, after_bundle)
-    fwk_raw = (
-        raw_fwk_us if raw_fwk_us is not None
-        else (raw_before_us if raw_before_us is not None else after_us)
-    )
+def _bundle_step_and_idle_ns(bundle: ExportBundle) -> tuple[int, int]:
+    step_ns = bundle_step_int_ns(bundle)
+    op_sum_ns = sum(_op_exposed_ns(op, op.repeat_count) for op in bundle.operators)
+    if step_ns < op_sum_ns:
+        step_ns = op_sum_ns
+    return step_ns, max(0, step_ns - op_sum_ns)
 
-    if config_stage_saved_us is not None and framework_stage_saved_us is not None:
-        s1 = max(0.0, before_us - float(config_stage_saved_us))
-        s2 = max(0.0, s1 - float(framework_stage_saved_us))
-    elif before_us >= after_us:
-        s2 = min(before_us, max(after_us, fwk_raw))
-        if same_cfg:
-            s1 = before_us
-        elif config_bridge_span_us is not None:
-            s1 = min(before_us, max(s2, float(config_bridge_span_us)))
-        elif config_saved_us is not None:
-            s1 = min(before_us, max(s2, before_us - float(config_saved_us)))
-        elif (
-            raw_cfg_us is not None
-            and raw_before_us is not None
-            and abs(raw_before_us - before_us) <= OVERLAP_EXPOSED_EPS_US
-        ):
-            s1 = min(before_us, max(s2, raw_cfg_us))
-        else:
-            s1 = before_us
-    else:
-        s2 = fwk_raw if (raw_fwk_us is not None or raw_before_us is not None) else after_us
-        if same_cfg:
-            s1 = before_us
-        elif config_bridge_span_us is not None:
-            s1 = max(0.0, float(config_bridge_span_us))
-        elif config_saved_us is not None:
-            s1 = max(0.0, before_us - float(config_saved_us))
-        else:
-            s1 = before_us
 
-    span_by_stage = {
-        "before": before_us,
-        "config_only": s1,
-        "framework_rewrite": s2,
-        "after": after_us,
-    }
-    rows: list[dict[str, Any]] = []
-    prev_us = before_us
-    for idx, st in enumerate(stage_specs):
-        cur_us = float(span_by_stage[st.stage])
-        existing = raw_by_stage.get(st.stage, {})
-        rows.append({
-            "stage": st.stage,
-            "owner": str(existing.get("owner") or st.owner),
-            "step_span_us": cur_us,
-            "delta_from_prev_us": 0.0 if idx == 0 else (cur_us - prev_us),
-            "cumulative_saved_us": before_us - cur_us,
-            "allowed_readiness": tuple(existing.get("allowed_readiness") or sorted(st.allowed_readiness)),
-            "allowed_rewrite_tracks": tuple(existing.get("allowed_rewrite_tracks") or st.allowed_rewrite_tracks),
-            "engine_uid": str(existing.get("engine_uid") or "unified_die_engine"),
-        })
-        prev_us = cur_us
-    return tuple(rows)
+def _row_exposed_metrics_ns(
+    row: AlignedComparisonRow, before_ntok: float, after_ntok: float,
+) -> tuple[int, int, int, float, float, float, float, float, float]:
+    b_rep, a_rep = row.effective_before_repeat, row.effective_after_repeat
+    b_ns = sum(_op_exposed_ns(b, b_rep) for b in row.before_ops)
+    a_ns = sum(_op_exposed_ns(a, a_rep) for a in row.after_ops)
+    saved_ns = b_ns - a_ns
+    b_ms = float(b_ns) / float(NS_PER_MS)
+    a_ms = float(a_ns) / float(NS_PER_MS)
+    saved_ms = float(saved_ns) / float(NS_PER_MS)
+    b_upt = float(b_ns) / (NS_PER_US * before_ntok)
+    a_upt = float(a_ns) / (NS_PER_US * after_ntok)
+    return b_ns, a_ns, saved_ns, b_ms, a_ms, saved_ms, b_upt, a_upt, b_upt - a_upt
 
 
 def _row_exposed_metrics(row: AlignedComparisonRow, before_ntok: float, after_ntok: float) -> tuple[float, float, float, float, float, float]:
-    b_rep, a_rep = row.effective_before_repeat, row.effective_after_repeat
-    b_ms = sum(0.0 if b.is_overlapped else (b.exposed_dur_us * b_rep / US_PER_MS) for b in row.before_ops)
-    a_ms = sum(0.0 if a.is_overlapped else (a.exposed_dur_us * a_rep / US_PER_MS) for a in row.after_ops)
-    b_upt, a_upt = b_ms * US_PER_MS / before_ntok, a_ms * US_PER_MS / after_ntok
-    return b_ms, a_ms, b_ms - a_ms, b_upt, a_upt, b_upt - a_upt
+    _b_ns, _a_ns, _s_ns, b_ms, a_ms, saved_ms, b_upt, a_upt, saved_upt = _row_exposed_metrics_ns(
+        row, before_ntok, after_ntok,
+    )
+    return b_ms, a_ms, saved_ms, b_upt, a_upt, saved_upt
 
 
 def _extract_clean_equations(raw_eqs: Any) -> list[str]:
@@ -382,24 +353,62 @@ def _assign_deterministic_card_ids(groups: Sequence[Mapping[str, Any]]) -> dict[
 
 
 def _applied_fuse_outputs(after_bundle: ExportBundle) -> set[str]:
-    return {
-        str(x) for rec in (after_bundle.applied_edit_receipts or ())
-        if isinstance(rec, Mapping) and str(rec.get("status", "applied")).lower() == "applied" and str(rec.get("opcode") or "").strip() == "FuseRegion"
-        for x in (rec.get("output_occurrences") or ()) if x
-    }
+    out: set[str] = set()
+    for rec in (after_bundle.applied_edit_receipts or ()):
+        if not isinstance(rec, Mapping):
+            continue
+        if str(rec.get("opcode") or "").strip() != "FuseRegion":
+            continue
+        if str(rec.get("status", "applied")).lower() != "applied":
+            continue
+        if rec.get("verified") is False:
+            continue
+        for key in ("output_occurrences", "members"):
+            for item in (rec.get(key) or ()):
+                if item:
+                    out.add(str(item))
+    return out
 
 
-def _is_verified_new_fusion(row: AlignedComparisonRow, *, is_comparison: bool, saved_ms: float, fuse_outputs: set[str]) -> bool:
-    if len(row.after_ops) != 1 or not bool(row.after_ops[0].needs_new_kernel):
+def _is_verified_new_fusion(
+    row: AlignedComparisonRow,
+    *,
+    is_comparison: bool,
+    saved_ms: float,
+    fuse_outputs: set[str],
+    rewrite_verified: bool = False,
+) -> bool:
+    """Require real verified FuseRegion receipt, SRAM-verified KernelSynthesisSpec, or N->1 ABI extension."""
+    if len(row.after_ops) != 1:
         return False
     a_op = row.after_ops[0]
-    if is_comparison:
-        if len(row.before_ops) < MIN_FUSION_MEMBERS:
-            return False
-        return saved_ms > CONSERVATION_EPS_MS or a_op.kernel_synthesis_spec is not None or a_op.op_id in fuse_outputs
+    if not a_op.needs_new_kernel and a_op.is_shipping_abi:
+        return False
     kspec = a_op.kernel_synthesis_spec
-    constituents = getattr(kspec, "constituent_op_ids", ()) if kspec is not None else ()
-    return len(a_op.absorbed_source_ops) >= MIN_FUSION_MEMBERS or len(constituents) >= MIN_FUSION_MEMBERS
+    if kspec is not None and bool(getattr(kspec, "sram_verified", False)):
+        members = getattr(kspec, "constituent_op_ids", ()) or ()
+        if len(members) >= MIN_FUSION_MEMBERS:
+            return True
+    if (
+        is_comparison
+        and a_op.needs_new_kernel
+        and not a_op.is_shipping_abi
+        and len(row.before_ops) >= MIN_FUSION_MEMBERS
+        and saved_ms > CONSERVATION_EPS_MS
+        and "abi_variant_extension" in (a_op.new_kernel_spec or "")
+    ):
+        return True
+    if not rewrite_verified or not fuse_outputs:
+        return False
+    if a_op.op_id in fuse_outputs:
+        return True
+    if is_comparison and len(row.before_ops) >= MIN_FUSION_MEMBERS:
+        if any(b.op_id in fuse_outputs for b in row.before_ops):
+            return True
+    if len(a_op.absorbed_source_ops) >= MIN_FUSION_MEMBERS:
+        if any(src in fuse_outputs for src in a_op.absorbed_source_ops):
+            return True
+    return False
 
 
 def _is_masking_only_change(row: AlignedComparisonRow) -> bool:
@@ -413,20 +422,39 @@ def _is_masking_only_change(row: AlignedComparisonRow) -> bool:
     )
 
 
-def _has_tuning_evidence(b_op: OperatorExportRow, a_op: OperatorExportRow, *, same_config: bool) -> bool:
+def _has_tuning_evidence(
+    b_op: OperatorExportRow,
+    a_op: OperatorExportRow,
+    *,
+    same_config: bool,
+    same_geometry: bool = False,
+) -> bool:
+    same_kernel_speedup = (
+        (same_config or (
+            same_geometry
+            and b_op.shape == a_op.shape
+            and b_op.dtype == a_op.dtype
+            and b_op.ascend_kernel == a_op.ascend_kernel
+        ))
+        and (b_op.dur_us - a_op.dur_us) > OVERLAP_EXPOSED_EPS_US
+    )
     return (
         a_op.formula_eval is not None or a_op.measured_sum_us is not None
         or a_op.binding_state in {BINDING_STATE_UNBOUND_FORMULA, BINDING_STATE_MEASURED}
         or a_op.opt_pillar in {"pillar2_roofline", "pillar2_tiler_extension", "pillar1_fusion"}
-        or (same_config and (b_op.dur_us - a_op.dur_us) > OVERLAP_EXPOSED_EPS_US)
+        or same_kernel_speedup
     )
 
 
 def _prelim_classify_row(
-    row: AlignedComparisonRow, *, is_comparison: bool, same_config: bool,
+    row: AlignedComparisonRow, *, is_comparison: bool, same_config: bool, same_geometry: bool = False,
     saved_ms: float, saved_upt: float, after_pre_edit_ms: float | None, fuse_outputs: set[str],
+    rewrite_verified: bool = False,
 ) -> tuple[str, OperatorExportRow | None, str]:
-    if _is_verified_new_fusion(row, is_comparison=is_comparison, saved_ms=saved_ms, fuse_outputs=fuse_outputs):
+    if _is_verified_new_fusion(
+        row, is_comparison=is_comparison, saved_ms=saved_ms,
+        fuse_outputs=fuse_outputs, rewrite_verified=rewrite_verified,
+    ):
         return "new", row.after_ops[0], "verified_new_fusion"
     if not is_comparison:
         if len(row.after_ops) == 1:
@@ -441,6 +469,12 @@ def _prelim_classify_row(
     if len(row.before_ops) >= MIN_FUSION_MEMBERS and len(row.after_ops) == 1:
         return ("residual", row.after_ops[0], "zero_gain_unreceipted_fusion") if row.after_ops[0].needs_new_kernel else ("config", row.after_ops[0], "shipping_fusion_enablement")
     if len(row.before_ops) != 1 or len(row.after_ops) != 1:
+        has_stage3_rewrite = rewrite_verified and any(
+            a.op_id.startswith("rewrite:") or a.op_id in fuse_outputs
+            for a in row.after_ops
+        )
+        if has_stage3_rewrite:
+            return "residual", None, "stage3_multi_fusion_group"
         return "config", None, "subgraph_reassociation"
     b_op, a_op = row.before_ops[0], row.after_ops[0]
     if _is_masking_only_change(row):
@@ -449,7 +483,9 @@ def _prelim_classify_row(
         return "residual", a_op, "fully_masked_both_sides"
     if abs(saved_ms) <= CONSERVATION_EPS_MS and abs(saved_upt) <= CONSERVATION_EPS_MS:
         return "residual", a_op, "zero_delta"
-    if a_op.is_shipping_abi and not a_op.needs_new_kernel and _has_tuning_evidence(b_op, a_op, same_config=same_config):
+    if a_op.is_shipping_abi and not a_op.needs_new_kernel and _has_tuning_evidence(
+        b_op, a_op, same_config=same_config, same_geometry=same_geometry,
+    ):
         if not same_config and after_pre_edit_ms is None and saved_ms <= 0.0:
             return "config", a_op, "batch_or_parallel_delta"
         return "tune", a_op, "shipping_kernel_tuning_candidate"
@@ -497,7 +533,7 @@ def _add_row_to_group(
         entry = {
             "kernel_key": key, "stem": stem, "category": category,
             "target_kernel": sanitize_public_text(raw_target),
-            "backend": normalize_public_backend(a_op.kernel_backend or "CANN aclnn/AscendC"),
+            "backend": sanitize_public_text(a_op.kernel_backend),
             "status": sanitize_public_text(a_op.kernel_status),
             "submodule": sanitize_public_text(a_op.submodule),
             "logical_role": sanitize_public_text(a_op.logical_role or a_op.op_id),
@@ -513,7 +549,7 @@ def _add_row_to_group(
             "core_budget": sanitize_public_text(a_op.stream_core_budget),
             "opt_pillar": a_op.opt_pillar or ("pillar1_fusion" if category == PENDING_KIND_TO_IMPLEMENT else "pillar2_roofline"),
             "synthesis_spec": kspec, "math_formula": math_formula, "sram_residency_summary": sram_sum,
-            "formula_summary": _format_formula_eval_receipt(fe), "binding_state": a_op.binding_state or BINDING_STATE_BOUND,
+            "formula_summary": _format_formula_eval_receipt(fe), "binding_state": a_op.binding_state,
             "source_row_indices": [], "best_member_rank": (gain_ms, gain_upt), "best_member_occ": occ_tie,
         }
         groups[key] = entry
@@ -614,7 +650,7 @@ def _materialize_card(prio: int, entry: Mapping[str, Any], card_id: str, fw_by_c
         after_us_per_tok_die=float(entry["after_upt"]), saved_us_per_tok_die=gain_upt,
         synthesis_spec=entry["synthesis_spec"], math_formula=str(entry["math_formula"] or ""),
         sram_residency_summary=str(entry["sram_residency_summary"] or ""),
-        binding_state=str(entry.get("binding_state") or BINDING_STATE_BOUND),
+        binding_state=str(entry.get("binding_state") or ""),
         source_row_indices=tuple(sorted(int(i) for i in entry.get("source_row_indices", ()))),
         core_budget=str(entry.get("core_budget") or ""),
         attributable_gain_ms=(float(entry["attr_gain_ms"]) if entry.get("has_split") else None),
@@ -774,34 +810,294 @@ def _qualify_action_groups(
     return qualified, qualified_keys
 
 
+def _committed_receipt_spans(receipt: Any) -> tuple[int, ...]:
+    stages = tuple(getattr(receipt, "stages", ()) or ())
+    if not stages:
+        return ()
+    out: list[int] = []
+    prev_ns: int | None = None
+    for idx, st in enumerate(stages):
+        raw_ns = int(st.span_ns)
+        eff_ns = raw_ns if (idx == 0 or st.status == "committed" or prev_ns is None) else prev_ns
+        out.append(eff_ns)
+        prev_ns = eff_ns
+    return tuple(out)
+
+
+def _receipt_zero_framework_transition(
+    before_bundle: ExportBundle,
+    after_bundle: ExportBundle,
+) -> bool:
+    """True when ``after_bundle.engine_step_receipt`` starts at ``before_bundle`` with 0 ns Stage 2 gain."""
+    receipt = getattr(after_bundle, "engine_step_receipt", None)
+    if receipt is None:
+        return False
+    spans = _committed_receipt_spans(receipt)
+    if len(spans) < _MIN_RECEIPT_STAGES_FOR_FWK:
+        return False
+    b_step_ns, _ = _bundle_step_and_idle_ns(before_bundle)
+    return b_step_ns == spans[0] and spans[1] == spans[2]
+
+
+def classify_waterfall_stage(
+    acc: GroupAccounting,
+    before_bundle: ExportBundle,
+    after_bundle: ExportBundle,
+) -> tuple[str, str | None]:
+    """Classify one ``GroupAccounting`` row into canonical waterfall stage(s) via public config."""
+    same_cfg = is_same_public_config(before_bundle, after_bundle)
+    zero_fwk_receipt = _receipt_zero_framework_transition(before_bundle, after_bundle)
+    if acc.bucket == "config":
+        if same_cfg or acc.reason in _FRAMEWORK_REASONS:
+            return (WF_STAGE_RESIDUAL, None) if zero_fwk_receipt else (WF_STAGE_FRAMEWORK, None)
+        return WF_STAGE_CONFIG, None
+    has_cfg_split = (
+        not same_cfg
+        and acc.after_pre_edit_ms is not None
+        and abs(float(acc.config_share_ms)) > CONSERVATION_EPS_MS
+    )
+    if acc.bucket in {"new", "tune"}:
+        return (WF_STAGE_CONFIG, WF_STAGE_KERNEL) if has_cfg_split else (WF_STAGE_KERNEL, None)
+    if has_cfg_split:
+        return WF_STAGE_CONFIG, WF_STAGE_RESIDUAL
+    return WF_STAGE_RESIDUAL, None
+
+
+def _classified_stage_ns(
+    accounting: Sequence[GroupAccounting],
+    waterfall: WaterfallSummary,
+    before_bundle: ExportBundle,
+    after: ExportBundle,
+) -> tuple[int, int]:
+    """Compute exact int-ns Sheet 4 ``[1] Config`` and ``[2] Framework`` deltas."""
+    cfg_ns = 0
+    fwk_ns = 0
+    for acc in accounting:
+        st_primary, st_secondary = classify_waterfall_stage(acc, before_bundle, after)
+        if st_secondary is not None and acc.after_pre_edit_ms is not None:
+            pre_ns = int(round(float(acc.config_share_ms) * float(NS_PER_MS)))
+            if st_primary == WF_STAGE_CONFIG:
+                cfg_ns += pre_ns
+            elif st_primary == WF_STAGE_FRAMEWORK:
+                fwk_ns += pre_ns
+        else:
+            saved_ns = int(round(float(acc.saved_ms) * float(NS_PER_MS)))
+            if st_primary == WF_STAGE_CONFIG:
+                cfg_ns += saved_ns
+            elif st_primary == WF_STAGE_FRAMEWORK:
+                fwk_ns += saved_ns
+    same_pub_cfg = is_same_public_config(before_bundle, after)
+    if not same_pub_cfg and (waterfall.idle_before_ns > 0 or waterfall.idle_after_ns > 0):
+        cfg_ns += int(waterfall.idle_before_ns) - int(waterfall.idle_after_ns)
+    return cfg_ns, fwk_ns
+
+
+def _project_canonical_stage_waterfall(
+    before_bundle: ExportBundle,
+    after: ExportBundle,
+    *,
+    b_step_ns: int,
+    a_step_ns: int,
+    same_config: bool,
+    accounting: Sequence[GroupAccounting] = (),
+    waterfall: WaterfallSummary | None = None,
+) -> tuple[dict[str, Any], ...]:
+    """Project exact int-ns 4-stage waterfall aligned identically with Sheet 4 ``D3:D9``."""
+    cfg_ns, fwk_ns = (
+        _classified_stage_ns(accounting, waterfall, before_bundle, after)
+        if waterfall is not None
+        else (0, 0)
+    )
+    s1_ns = b_step_ns - cfg_ns
+    s2_ns = s1_ns - fwk_ns
+    receipt = getattr(after, "engine_step_receipt", None)
+    if receipt is not None and getattr(receipt, "stages", None):
+        stages = tuple(receipt.stages)
+        committed = _committed_receipt_spans(receipt)
+        if len(committed) >= _RECEIPT_FOUR_STAGES and b_step_ns == committed[0]:
+            spans_by_idx = (b_step_ns, committed[1], committed[2], a_step_ns)
+        else:
+            spans_by_idx = (b_step_ns, s1_ns, s2_ns, a_step_ns)
+        out: list[dict[str, Any]] = []
+        prev_ns = b_step_ns
+        for idx, st in enumerate(stages):
+            st_ns = spans_by_idx[idx] if idx < len(spans_by_idx) else a_step_ns
+            delta_ns = 0 if idx == 0 else int(prev_ns - st_ns)
+            prev_ns = st_ns
+            out.append({
+                "stage_id": st.stage_id,
+                "stack_track": st.stack_track,
+                "status": st.status,
+                "span_ns": st_ns,
+                "delta_ns": delta_ns,
+                "span_ms": float(st_ns) / float(NS_PER_MS),
+                "delta_ms": float(delta_ns) / float(NS_PER_MS),
+                "l_star_ns": int(st.l_star_ns),
+                "l_star_valid": bool(st.l_star_valid),
+                "idle_or_wait_ns": int(st.idle_or_wait_ns),
+                "config_bridge_ns": (b_step_ns - spans_by_idx[1]) if idx == 1 else 0,
+            })
+        return tuple(out)
+
+    a_track = str(after.feature_track or "shipping").strip().lower()
+    b_track = str(before_bundle.feature_track or "shipping").strip().lower()
+    spans = (
+        ("before_merged", b_track, b_step_ns, 0),
+        ("stage1_ops_config", a_track if s1_ns != b_step_ns else b_track, s1_ns, b_step_ns - s1_ns),
+        ("stage2_unmerged_pr", a_track if s2_ns != s1_ns else b_track, s2_ns, s1_ns - s2_ns),
+        ("stage3_target_after", a_track, a_step_ns, s2_ns - a_step_ns),
+    )
+    return tuple(
+        {
+            "stage_id": sid,
+            "stack_track": trk,
+            "status": "committed",
+            "span_ns": int(sp),
+            "delta_ns": int(dl),
+            "span_ms": float(sp) / float(NS_PER_MS),
+            "delta_ms": float(dl) / float(NS_PER_MS),
+        }
+        for sid, trk, sp, dl in spans
+    )
+
+
+def _assemble_waterfall_and_accounting(
+    prelim_rows: Sequence[Mapping[str, Any]],
+    *,
+    before_bundle: ExportBundle,
+    after: ExportBundle,
+    same_config: bool,
+    b_ntok: float,
+    a_ntok: float,
+    qualified_new_keys: set[str],
+    qualified_tune_keys: set[str],
+    card_id_by_key: Mapping[str, str],
+    displayed_keys: set[str],
+) -> tuple[list[GroupAccounting], WaterfallSummary, int, int]:
+    accounting: list[GroupAccounting] = []
+    totals_ns = {k: 0 for k in ("cfg", "new", "tune", "res", "s2_b", "s2_a")}
+    totals_upt = {k: 0.0 for k in ("cfg", "new", "tune", "res")}
+    for rec in prelim_rows:
+        bucket: Literal["config", "new", "tune", "residual"] = rec["cand_bucket"]
+        gkey = rec["group_key"]
+        if bucket == "new" and gkey not in qualified_new_keys:
+            bucket, reason, cid, cat = "residual", "below_materiality_threshold", "", PENDING_KIND_AT_FLOOR
+            if rec["pre_edit_ms"] is not None:
+                cfg_ns, cfg_ms, cfg_upt = rec["cfg_ns"], rec["cfg_ms"], rec["cfg_upt"]
+                kern_ns, kern_ms, kern_upt = rec["kern_ns"], rec["kern_ms"], rec["kern_upt"]
+            else:
+                cfg_ns, cfg_ms, cfg_upt, kern_ns, kern_ms, kern_upt = 0, 0.0, 0.0, rec["saved_ns"], rec["saved_ms"], rec["saved_upt"]
+        elif bucket == "tune" and gkey not in qualified_tune_keys:
+            bucket, reason, cid, cat = "residual", "below_tuning_threshold", "", PENDING_KIND_AT_FLOOR
+            if rec["pre_edit_ms"] is not None:
+                cfg_ns, cfg_ms, cfg_upt = rec["cfg_ns"], rec["cfg_ms"], rec["cfg_upt"]
+                kern_ns, kern_ms, kern_upt = rec["kern_ns"], rec["kern_ms"], rec["kern_upt"]
+            else:
+                cfg_ns, cfg_ms, cfg_upt, kern_ns, kern_ms, kern_upt = 0, 0.0, 0.0, rec["saved_ns"], rec["saved_ms"], rec["saved_upt"]
+        else:
+            cfg_ns, kern_ns = rec["cfg_ns"], rec["kern_ns"]
+            cfg_ms, cfg_upt, kern_ms, kern_upt, reason = rec["cfg_ms"], rec["cfg_upt"], rec["kern_ms"], rec["kern_upt"], rec["reason"]
+            cid = card_id_by_key.get(gkey, "") if gkey in displayed_keys else ""
+            cat = PENDING_KIND_TO_IMPLEMENT if bucket == "new" else (PENDING_KIND_TO_OPTIMIZE if bucket == "tune" else PENDING_KIND_AT_FLOOR)
+        accounting.append(GroupAccounting(
+            row_index=rec["row_index"], bucket=bucket, card_id=cid, category=cat, before_ms=rec["b_ms"], after_ms=rec["a_ms"],
+            saved_ms=rec["saved_ms"], before_upt=rec["b_upt"], after_upt=rec["a_upt"], saved_upt=rec["saved_upt"],
+            after_pre_edit_ms=rec["pre_edit_ms"] if (bucket in {"new", "tune"} or cfg_ns != 0) else None,
+            config_share_ms=cfg_ms, config_share_upt=cfg_upt, kernel_share_ms=kern_ms, kernel_share_upt=kern_upt, reason=reason,
+        ))
+        totals_ns["s2_b"] += int(rec["b_ns"])
+        totals_ns["s2_a"] += int(rec["a_ns"])
+        totals_ns["cfg"] += int(cfg_ns)
+        totals_upt["cfg"] += cfg_upt
+        if bucket in {"new", "tune", "residual"}:
+            pfx = "res" if bucket == "residual" else bucket
+            totals_ns[pfx] += int(kern_ns)
+            totals_upt[pfx] += kern_upt
+
+    b_step_ns, b_idle_ns = _bundle_step_and_idle_ns(before_bundle)
+    a_step_ns, a_idle_ns = _bundle_step_and_idle_ns(after)
+    idle_b_ns = max(0, b_step_ns - totals_ns["s2_b"]) if b_step_ns >= totals_ns["s2_b"] else b_idle_ns
+    idle_a_ns = max(0, a_step_ns - totals_ns["s2_a"]) if a_step_ns >= totals_ns["s2_a"] else a_idle_ns
+    totals_ns["s2_b"] += idle_b_ns
+    totals_ns["s2_a"] += idle_a_ns
+    idle_saved_ns = idle_b_ns - idle_a_ns
+    idle_saved_upt = (float(idle_b_ns) / (NS_PER_US * b_ntok)) - (float(idle_a_ns) / (NS_PER_US * a_ntok))
+    if not same_config:
+        totals_ns["cfg"] += idle_saved_ns
+        totals_upt["cfg"] += idle_saved_upt
+    else:
+        totals_ns["res"] += idle_saved_ns
+        totals_upt["res"] += idle_saved_upt
+
+    tot_saved_ns = totals_ns["cfg"] + totals_ns["new"] + totals_ns["tune"] + totals_ns["res"]
+    recon_after_ns = b_step_ns - tot_saved_ns
+    recon_err_ns = recon_after_ns - a_step_ns
+    bef_step_ms, aft_step_ms = float(b_step_ns) / float(NS_PER_MS), float(a_step_ns) / float(NS_PER_MS)
+    bef_step_upt, aft_step_upt = float(b_step_ns) / (NS_PER_US * b_ntok), float(a_step_ns) / (NS_PER_US * a_ntok)
+    tot_saved_upt = totals_upt["cfg"] + totals_upt["new"] + totals_upt["tune"] + totals_upt["res"]
+    waterfall = WaterfallSummary(
+        before_step_ms=bef_step_ms, after_step_ms=aft_step_ms, before_upt=bef_step_upt, after_upt=aft_step_upt,
+        config_saved_ms=float(totals_ns["cfg"]) / float(NS_PER_MS), config_saved_upt=totals_upt["cfg"],
+        new_kernel_saved_ms=float(totals_ns["new"]) / float(NS_PER_MS), new_kernel_saved_upt=totals_upt["new"],
+        tune_kernel_saved_ms=float(totals_ns["tune"]) / float(NS_PER_MS), tune_kernel_saved_upt=totals_upt["tune"],
+        residual_saved_ms=float(totals_ns["res"]) / float(NS_PER_MS), residual_saved_upt=totals_upt["res"],
+        reconstructed_after_ms=float(recon_after_ns) / float(NS_PER_MS),
+        reconciliation_error_ms=float(recon_err_ns) / float(NS_PER_MS),
+        reconciliation_error_upt=tot_saved_upt - (bef_step_upt - aft_step_upt),
+        sheet2_before_total_ms=float(totals_ns["s2_b"]) / float(NS_PER_MS),
+        sheet2_after_total_ms=float(totals_ns["s2_a"]) / float(NS_PER_MS),
+        before_endpoint_error_ms=float(totals_ns["s2_b"] - b_step_ns) / float(NS_PER_MS),
+        after_endpoint_error_ms=float(totals_ns["s2_a"] - a_step_ns) / float(NS_PER_MS),
+        before_step_ns=b_step_ns, after_step_ns=a_step_ns,
+        idle_before_ns=idle_b_ns, idle_after_ns=idle_a_ns,
+        reconciliation_error_ns=recon_err_ns,
+    )
+    return accounting, waterfall, b_step_ns, a_step_ns
+
+
 def build_comparison_plan(
     before_bundle: ExportBundle, after_bundle: ExportBundle | None, aligned_rows: Sequence[AlignedComparisonRow],
     *, top_k_optimize: int = MAX_DISPLAY_CARDS, include_to_optimize: bool = True, script_audit: Any = None,
+    comparison_request: Any = None,
 ) -> ComparisonPlan:
     """Build single source-of-truth Waterfall, classified cards, and 3-track roadmap."""
     is_comparison = after_bundle is not None
+    if is_comparison:
+        from .comparison import assert_comparison_polarity, build_default_comparison_request
+
+        eff_cmp_req = (
+            comparison_request
+            if comparison_request is not None
+            else build_default_comparison_request(before_bundle, after_bundle)
+        )
+        assert_comparison_polarity(before_bundle, after_bundle, eff_cmp_req)
     after = after_bundle or before_bundle
     b_ntok, a_ntok = max(float(before_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS), max(float(after.n_tok_per_die or 1.0), MIN_DENOM_EPS)
     same_config = (not is_comparison) or _is_same_deployment_config(before_bundle, after)
-    arch_tag, fuse_outputs = _arch_tag_from_sku(after.hardware_sku), _applied_fuse_outputs(after)
+    same_geometry = same_config or _is_same_deployment_geometry(before_bundle, after)
+    arch_tag, fuse_outputs = _arch_tag_from_bundle(after), _applied_fuse_outputs(after)
+    rewrite_verified = bool(getattr(after, "rewrite_verification_passed", False))
 
     prelim_rows: list[dict[str, Any]] = []
     new_groups: dict[str, dict[str, Any]] = {}
     tune_groups: dict[str, dict[str, Any]] = {}
     for r_idx, row in enumerate(aligned_rows):
-        b_ms, a_ms, saved_ms, b_upt, a_upt, saved_upt = _row_exposed_metrics(row, b_ntok, a_ntok)
+        b_ns, a_ns, saved_ns, b_ms, a_ms, saved_ms, b_upt, a_upt, saved_upt = _row_exposed_metrics_ns(row, b_ntok, a_ntok)
         pre_edit_ms = _after_pre_edit_exposed_ms(row) if (is_comparison and not same_config) else None
         cand_bucket, a_op, reason = _prelim_classify_row(
-            row, is_comparison=is_comparison, same_config=same_config,
-            saved_ms=saved_ms, saved_upt=saved_upt, after_pre_edit_ms=pre_edit_ms, fuse_outputs=fuse_outputs,
+            row, is_comparison=is_comparison, same_config=same_config, same_geometry=same_geometry,
+            saved_ms=saved_ms, saved_upt=saved_upt, after_pre_edit_ms=pre_edit_ms,
+            fuse_outputs=fuse_outputs, rewrite_verified=rewrite_verified,
         )
         if pre_edit_ms is not None and cand_bucket in {"new", "tune"}:
-            cfg_ms, cfg_upt = b_ms - pre_edit_ms, b_upt - (pre_edit_ms * US_PER_MS / a_ntok)
-            kern_ms, kern_upt, has_split = saved_ms - cfg_ms, saved_upt - cfg_upt, True
+            pre_edit_ns = max(0, int(round(pre_edit_ms * NS_PER_MS)))
+            cfg_ns, kern_ns = b_ns - pre_edit_ns, saved_ns - (b_ns - pre_edit_ns)
+            cfg_ms, cfg_upt = float(cfg_ns) / float(NS_PER_MS), b_upt - (float(pre_edit_ns) / (NS_PER_US * a_ntok))
+            kern_ms, kern_upt, has_split = float(kern_ns) / float(NS_PER_MS), saved_upt - cfg_upt, True
         elif cand_bucket == "config":
-            cfg_ms, cfg_upt, kern_ms, kern_upt, has_split = saved_ms, saved_upt, 0.0, 0.0, False
+            cfg_ns, kern_ns, cfg_ms, cfg_upt, kern_ms, kern_upt, has_split = saved_ns, 0, saved_ms, saved_upt, 0.0, 0.0, False
         else:
-            cfg_ms, cfg_upt, kern_ms, kern_upt, has_split = 0.0, 0.0, saved_ms, saved_upt, False
+            cfg_ns, kern_ns, cfg_ms, cfg_upt, kern_ms, kern_upt, has_split = 0, saved_ns, 0.0, 0.0, saved_ms, saved_upt, False
 
         group_key = ""
         if cand_bucket == "new" and a_op is not None:
@@ -821,20 +1117,19 @@ def build_comparison_plan(
         elif cand_bucket == "tune" and not include_to_optimize:
             cand_bucket, reason = "residual", "tuning_excluded"
         prelim_rows.append({
-            "row_index": r_idx, "cand_bucket": cand_bucket, "group_key": group_key, "b_ms": b_ms, "a_ms": a_ms,
-            "saved_ms": saved_ms, "b_upt": b_upt, "a_upt": a_upt, "saved_upt": saved_upt, "pre_edit_ms": pre_edit_ms,
+            "row_index": r_idx, "cand_bucket": cand_bucket, "group_key": group_key,
+            "b_ns": b_ns, "a_ns": a_ns, "saved_ns": saved_ns, "cfg_ns": cfg_ns, "kern_ns": kern_ns,
+            "b_ms": b_ms, "a_ms": a_ms, "saved_ms": saved_ms, "b_upt": b_upt, "a_upt": a_upt,
+            "saved_upt": saved_upt, "pre_edit_ms": pre_edit_ms,
             "cfg_ms": cfg_ms, "cfg_upt": cfg_upt, "kern_ms": kern_ms, "kern_upt": kern_upt, "reason": reason,
         })
 
     qualified_new, qualified_new_keys = _qualify_action_groups(
-        new_groups, is_comparison=is_comparison, check_gap_when_single=False,
-        min_saved_ms=NEW_KERNEL_MIN_SAVED_MS,
+        new_groups, is_comparison=is_comparison, check_gap_when_single=False, min_saved_ms=NEW_KERNEL_MIN_SAVED_MS,
     )
     qualified_tune, qualified_tune_keys = _qualify_action_groups(
-        tune_groups, is_comparison=is_comparison, check_gap_when_single=True,
-        min_saved_ms=TUNE_MIN_SAVED_MS,
+        tune_groups, is_comparison=is_comparison, check_gap_when_single=True, min_saved_ms=TUNE_MIN_SAVED_MS,
     )
-
     card_id_by_key = _assign_deterministic_card_ids([*qualified_new, *qualified_tune])
     ordered_new = sorted(qualified_new, key=lambda e: (-float(e["gain_upt"]), -float(e["gain_ms"]), card_id_by_key[e["kernel_key"]]))
     ordered_tune = sorted(
@@ -844,52 +1139,10 @@ def build_comparison_plan(
     cap = max(0, min(MAX_DISPLAY_CARDS, int(top_k_optimize))) if not is_comparison else MAX_DISPLAY_CARDS
     displayed_entries = [*ordered_new, *ordered_tune][:cap]
     displayed_keys = {e["kernel_key"] for e in displayed_entries}
-
-    accounting: list[GroupAccounting] = []
-    totals = {k: 0.0 for k in ("cfg_ms", "cfg_upt", "new_ms", "new_upt", "tune_ms", "tune_upt", "res_ms", "res_upt", "s2_b", "s2_a")}
-    for rec in prelim_rows:
-        bucket: Literal["config", "new", "tune", "residual"] = rec["cand_bucket"]
-        gkey = rec["group_key"]
-        if bucket == "new" and gkey not in qualified_new_keys:
-            bucket, cfg_ms, cfg_upt, kern_ms, kern_upt = "residual", 0.0, 0.0, rec["saved_ms"], rec["saved_upt"]
-            reason, cid, cat = "below_materiality_threshold", "", PENDING_KIND_AT_FLOOR
-        elif bucket == "tune" and gkey not in qualified_tune_keys:
-            bucket, cfg_ms, cfg_upt, kern_ms, kern_upt = "residual", 0.0, 0.0, rec["saved_ms"], rec["saved_upt"]
-            reason, cid, cat = "below_tuning_threshold", "", PENDING_KIND_AT_FLOOR
-        else:
-            cfg_ms, cfg_upt, kern_ms, kern_upt, reason = rec["cfg_ms"], rec["cfg_upt"], rec["kern_ms"], rec["kern_upt"], rec["reason"]
-            cid = card_id_by_key.get(gkey, "") if gkey in displayed_keys else ""
-            cat = PENDING_KIND_TO_IMPLEMENT if bucket == "new" else (PENDING_KIND_TO_OPTIMIZE if bucket == "tune" else PENDING_KIND_AT_FLOOR)
-        accounting.append(GroupAccounting(
-            row_index=rec["row_index"], bucket=bucket, card_id=cid, category=cat, before_ms=rec["b_ms"], after_ms=rec["a_ms"],
-            saved_ms=rec["saved_ms"], before_upt=rec["b_upt"], after_upt=rec["a_upt"], saved_upt=rec["saved_upt"],
-            after_pre_edit_ms=rec["pre_edit_ms"] if bucket in {"new", "tune"} else None,
-            config_share_ms=cfg_ms, config_share_upt=cfg_upt, kernel_share_ms=kern_ms, kernel_share_upt=kern_upt, reason=reason,
-        ))
-        totals["s2_b"] += rec["b_ms"]
-        totals["s2_a"] += rec["a_ms"]
-        totals["cfg_ms"] += cfg_ms
-        totals["cfg_upt"] += cfg_upt
-        if bucket in {"new", "tune", "residual"}:
-            pfx = "res" if bucket == "residual" else bucket
-            totals[f"{pfx}_ms"] += kern_ms
-            totals[f"{pfx}_upt"] += kern_upt
-
-    bef_step_ms, aft_step_ms = before_bundle.step_span_us / US_PER_MS, after.step_span_us / US_PER_MS
-    bef_step_upt, aft_step_upt = before_bundle.step_span_us / b_ntok, after.step_span_us / a_ntok
-    tot_saved_ms = totals["cfg_ms"] + totals["new_ms"] + totals["tune_ms"] + totals["res_ms"]
-    tot_saved_upt = totals["cfg_upt"] + totals["new_upt"] + totals["tune_upt"] + totals["res_upt"]
-    recon_after_ms = bef_step_ms - tot_saved_ms
-    waterfall = WaterfallSummary(
-        before_step_ms=bef_step_ms, after_step_ms=aft_step_ms, before_upt=bef_step_upt, after_upt=aft_step_upt,
-        config_saved_ms=totals["cfg_ms"], config_saved_upt=totals["cfg_upt"],
-        new_kernel_saved_ms=totals["new_ms"], new_kernel_saved_upt=totals["new_upt"],
-        tune_kernel_saved_ms=totals["tune_ms"], tune_kernel_saved_upt=totals["tune_upt"],
-        residual_saved_ms=totals["res_ms"], residual_saved_upt=totals["res_upt"],
-        reconstructed_after_ms=recon_after_ms, reconciliation_error_ms=recon_after_ms - aft_step_ms,
-        reconciliation_error_upt=tot_saved_upt - (bef_step_upt - aft_step_upt),
-        sheet2_before_total_ms=totals["s2_b"], sheet2_after_total_ms=totals["s2_a"],
-        before_endpoint_error_ms=totals["s2_b"] - bef_step_ms, after_endpoint_error_ms=totals["s2_a"] - aft_step_ms,
+    accounting, waterfall, b_step_ns, a_step_ns = _assemble_waterfall_and_accounting(
+        prelim_rows, before_bundle=before_bundle, after=after, same_config=same_config,
+        b_ntok=b_ntok, a_ntok=a_ntok, qualified_new_keys=qualified_new_keys,
+        qualified_tune_keys=qualified_tune_keys, card_id_by_key=card_id_by_key, displayed_keys=displayed_keys,
     )
 
     prelim_cards = tuple(_materialize_card(p, e, card_id_by_key[e["kernel_key"]], {}) for p, e in enumerate(displayed_entries, 1))
@@ -905,7 +1158,10 @@ def build_comparison_plan(
         for item in final_cards[:MAX_ROADMAP_KERNEL_ITEMS]
     ]
     anchored_stage_wf = (
-        anchor_stage_waterfall(before_bundle, after, config_saved_us=totals["cfg_ms"] * US_PER_MS)
+        _project_canonical_stage_waterfall(
+            before_bundle, after, b_step_ns=b_step_ns, a_step_ns=a_step_ns, same_config=same_config,
+            accounting=accounting, waterfall=waterfall,
+        )
         if is_comparison
         else tuple(dict(item) for item in (before_bundle.stage_waterfall or ()) if isinstance(item, Mapping))
     )
@@ -967,7 +1223,9 @@ def build_actionable_roadmap(
 
 __all__ = [
     "CONSERVATION_EPS_MS", "MAX_DISPLAY_CARDS", "NEW_KERNEL_MIN_SAVED_MS", "TUNE_MIN_SAVED_MS",
+    "WF_STAGE_CONFIG", "WF_STAGE_FRAMEWORK", "WF_STAGE_KERNEL", "WF_STAGE_RESIDUAL",
     "ComparisonPlan", "GroupAccounting", "WaterfallSummary",
-    "anchor_stage_waterfall", "build_actionable_roadmap", "build_comparison_plan", "build_new_kernel_backlog",
-    "build_parallelism_codesign_note", "build_pending_kernel_details", "format_signed_gain_text",
+    "build_actionable_roadmap", "build_comparison_plan", "build_new_kernel_backlog",
+    "build_parallelism_codesign_note", "build_pending_kernel_details",
+    "classify_waterfall_stage", "format_signed_gain_text",
 ]

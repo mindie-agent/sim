@@ -29,6 +29,9 @@ from mindie_sim.prediction.offload.policy import missing_scenario_error
 from mindie_sim.prediction.program.primitives import PrimitiveKey, PrimitiveStore
 from mindie_sim.prediction.results import ReplayOptions, StepRequest, json_payload
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.schema.common import ModelingError
+
+_CANONICAL_STACK_TRACKS = frozenset({"eager", "shipping", "proposed", "target"})
 
 MIB_BYTES = 1024 * 1024
 MAX_CLI_JSON_BYTES = 50 * MIB_BYTES
@@ -573,6 +576,12 @@ def _dispatch_solve(args: argparse.Namespace) -> object:
     from mindie_sim.solve import solve_deployment
     plan_path = getattr(args, "rewrite_plan", None)
     rewrite_plan = read_json(plan_path, bounded=True) if plan_path else None
+    compare_track = str(getattr(args, "compare_track", None) or "shipping").strip()
+    target_track = str(getattr(args, "target_track", None) or "target").strip()
+    if compare_track not in _CANONICAL_STACK_TRACKS:
+        raise ModelingError(f"invalid_stack_track:{compare_track!r}")
+    if target_track not in _CANONICAL_STACK_TRACKS:
+        raise ModelingError(f"invalid_stack_track:{target_track!r}")
     return solve_deployment(
         args.model,
         args.hardware,
@@ -603,8 +612,8 @@ def _dispatch_solve(args: argparse.Namespace) -> object:
         runtime_stack=getattr(args, "stack", None),
         xlsx_path=getattr(args, "xlsx", None),
         trace_path=getattr(args, "trace", None),
-        compare_track=str(getattr(args, "compare_track", None) or "unmerged_pr"),
-        target_track=str(getattr(args, "target_track", None) or "expected_ideal"),
+        compare_track=compare_track,
+        target_track=target_track,
         mode=str(getattr(args, "mode", None) or "modeling"),
         rewrite_plan=rewrite_plan,
     )

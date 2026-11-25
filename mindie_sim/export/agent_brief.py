@@ -52,7 +52,6 @@ from .models import (
 from .public_view import (
     THREE_TRACK_LABELS,
     format_track_label,
-    normalize_public_backend,
     project_agent_brief_mapping,
     project_artifacts,
     project_codesign_opportunities,
@@ -102,8 +101,8 @@ def _bundle_track_label(bundle: ExportBundle) -> str:
         if isinstance(bundle.effective_config, Mapping) else ""
     )
     if not raw and bundle.target_envelope_applied:
-        raw = "expected_ideal"
-    return format_track_label(raw or "merged")
+        raw = "target"
+    return format_track_label(raw or "shipping")
 
 
 def _bundle_kpi_dict(bundle: ExportBundle) -> dict[str, Any]:
@@ -343,7 +342,7 @@ def _build_brief_action_items(
             "prio": f"P{item.priority}",
             "cat": "new" if item.category == PENDING_KIND_TO_IMPLEMENT else "tune",
             "kernel": _trim_text(item.target_kernel, BRIEF_KERNEL_LIMIT),
-            "backend": normalize_public_backend(item.suggested_backend),
+            "backend": sanitize_public_text(item.suggested_backend),
             "submodule": _trim_text(item.submodule, BRIEF_KERNEL_LIMIT),
             "saved_ms": round(item.expected_gain_ms, 3),
             "saved_us_per_tok_die": round(item.saved_us_per_tok_die, 2),
@@ -400,13 +399,6 @@ def _build_brief_scenario_block(after: ExportBundle, par_short: str, par_detail:
     pd_pool = project_pd_pool(after.pd_pool_summary)
     if pd_pool is not None:
         scen_block["pd_pool"] = pd_pool
-    if isinstance(after.calibration_basis, Mapping) and after.calibration_basis:
-        scen_block["calibration_basis"] = {
-            "mode": sanitize_public_text(after.calibration_basis.get("mode") or ""),
-            "calibrated": bool(after.calibration_basis.get("calibrated")),
-            "pt_sku": sanitize_public_text(after.calibration_basis.get("primitive_table_sku") or ""),
-            "cann": sanitize_public_text(after.calibration_basis.get("cann_version") or ""),
-        }
     return scen_block
 
 
@@ -417,14 +409,24 @@ def build_agent_brief(
     generated_files: Mapping[str, str] | None = None,
     script_audit: Mapping[str, Any] | None = None,
     comparison_plan: ComparisonPlan | None = None,
+    comparison_request: Any = None,
 ) -> dict[str, Any]:
     """Build compact (< 8 KB) allowlist-only deterministic JSON brief for Agent workflows."""
     from .comparison import (
         align_before_after_operators,
+        assert_comparison_polarity,
+        build_default_comparison_request,
         build_macro_module_breakdown,
         format_parallelism_codomain_summary,
     )
 
+    if after_bundle is not None:
+        eff_req = (
+            comparison_request
+            if comparison_request is not None
+            else build_default_comparison_request(before_bundle, after_bundle)
+        )
+        assert_comparison_polarity(before_bundle, after_bundle, eff_req)
     after = after_bundle or before_bundle
     macro_rows = build_macro_module_breakdown(before_bundle, after_bundle)
     if comparison_plan is None:
@@ -440,7 +442,8 @@ def build_agent_brief(
             )
         )
         plan = build_comparison_plan(
-            before_bundle, after_bundle, aligned, script_audit=script_audit,
+            before_bundle, after_bundle, aligned,
+            script_audit=script_audit, comparison_request=comparison_request,
         )
     else:
         plan = comparison_plan
@@ -491,6 +494,8 @@ def build_agent_brief(
         "kpis_before_vs_after": {
             "before": b_kpi, "after": a_kpi,
             "saved_step_ms": float(b_kpi["step_ms"] - a_kpi["step_ms"]),
+            "saved_step_ns": int(plan.waterfall.before_step_ns - plan.waterfall.after_step_ns),
+            "reconciliation_error_ns": int(plan.waterfall.reconciliation_error_ns),
             "saved_us_per_tok_die": float(b_kpi["us_per_tok_die"] - a_kpi["us_per_tok_die"]),
             "speedup": speedup,
             "sheet4_cards_total_gain_ms": float(sum(x.expected_gain_ms for x in pending)),
@@ -530,6 +535,7 @@ def export_agent_brief(
     generated_files: Mapping[str, str] | None = None,
     script_audit: Mapping[str, Any] | None = None,
     comparison_plan: ComparisonPlan | None = None,
+    comparison_request: Any = None,
 ) -> Path | dict[str, Any]:
     """Atomically persist compact (< 8 KB) allowlist-projected ``agent_brief.json``."""
     return_dict = False
@@ -542,6 +548,7 @@ def export_agent_brief(
             generated_files=generated_files,
             script_audit=script_audit,
             comparison_plan=comparison_plan,
+            comparison_request=comparison_request,
         )
         target = Path(third)
         return_dict = True
@@ -615,8 +622,8 @@ def format_executive_digest_markdown(brief: Mapping[str, Any]) -> str:
     aft = kp.get("after") or {}
     plan = clean_brief.get("action_plan_3_tracks") or {}
     is_modeling = str(aft.get("analysis_mode") or "") == MODE_MODELING or bool(aft.get("has_unbound_formula_ops"))
-    bef_track = format_track_label(bef.get("track_label") or "merged")
-    aft_track = format_track_label(aft.get("track_label") or ("expected_ideal" if is_modeling else "merged"))
+    bef_track = format_track_label(bef.get("track_label") or "shipping")
+    aft_track = format_track_label(aft.get("track_label") or ("target" if is_modeling else "shipping"))
     aft_col = f"After [{aft_track} · 卡SLA目标建模终态]" if is_modeling else f"After [{aft_track}]"
     bind_badge = format_binding_badge(str(aft.get("binding_state") or BINDING_STATE_BOUND))
     sla_target = aft.get("sla_target_ms")

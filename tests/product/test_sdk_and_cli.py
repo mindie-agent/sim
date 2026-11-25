@@ -710,7 +710,7 @@ def test_public_graph_mapping_cli_geometry_and_report_parity(tmp_path, capsys):
     direct_s = export_structure(raw, phase="prefill", tokens=64, context=0, sequences=1, media_tokens_per_sequence=0)
     assert direct_s["execution"]["media_tokens_per_sequence"] == 0
 
-    # 3. CLI report uses geometric speculative accept length & honors explicit --weight-quant bf16 --cache-dtype bf16.
+    # 3. CLI report avoids fabricating magic 0.70 accept rate without --accept-len, and honors explicit --accept-len + bf16.
     out_dir = tmp_path / "rep_bf16"
     rec_path = tmp_path / "rep_bf16_rec.json"
     rc_r = cli_main([
@@ -729,7 +729,24 @@ def test_public_graph_mapping_cli_geometry_and_report_parity(tmp_path, capsys):
     scen = rec_r["agent_brief"]["scenario_and_parallelism"]
     assert scen["weight_quant"].upper().startswith("BF16")
     assert scen["cache_dtype"].upper() == "BF16"
-    assert scen["avg_accepted_tokens"] == pytest.approx(compute_speculative_accept_step(0.70, 3), rel=1e-6)
+    assert scen["avg_accepted_tokens"] == pytest.approx(1.0, rel=1e-6)
+    expected_acc = compute_speculative_accept_step(0.70, 3)
+    rec_exp_path = tmp_path / "rep_bf16_accept_rec.json"
+    rc_acc = cli_main([
+        "report", "--model", "deepseek-v3.2", "--hardware", "a5",
+        "--deployment-mode", "colocated",
+        "--dp", "1", "--tp", "8", "--ep", "8", "--concurrency", "1",
+        "--prompt-tokens", "256", "--output-tokens", "32",
+        "--weight-quant", "bf16", "--cache-dtype", "bf16",
+        "--spec-tokens", "3", "--accept-len", f"{expected_acc:.6f}", "--mode", "simulation",
+        "--no-trace", "--no-xlsx", "--out-dir", str(tmp_path / "rep_bf16_acc"),
+        "--json", "--receipt", str(rec_exp_path),
+    ])
+    assert rc_acc == 0, capsys.readouterr().err
+    rec_acc = json.loads(rec_exp_path.read_text(encoding="utf-8"))
+    assert rec_acc["agent_brief"]["scenario_and_parallelism"]["avg_accepted_tokens"] == pytest.approx(
+        expected_acc, rel=1e-5,
+    )
 
 
 def test_formula_sdk_hardware_resolution_rank_guard_and_aclnn_replica():
@@ -783,13 +800,18 @@ def test_report_preserves_solved_pd_columns_pooling_phase_and_strict_tracks(tmp_
     from mindie_sim.solve import _bundle_inputs_for_solution
     from mindie_sim.sweep import pd as pd_mod
 
-    # 1. Strict simulation mode normalizes --compare-track expected_ideal -> merged.
+    # 1. Strict simulation mode normalizes --compare-track target -> shipping and rejects legacy aliases.
     assert report_mod._report_tracks(
-        "simulation", compare_track="expected_ideal", target_track="expected_ideal", enforce_eager=False,
-    ) == ("merged", "merged")
+        "simulation", compare_track="target", target_track="target", enforce_eager=False,
+    ) == ("shipping", "shipping")
     assert report_mod._report_tracks(
-        "simulation", compare_track="merged", target_track="unmerged_pr", enforce_eager=False,
-    ) == ("merged", "unmerged_pr")
+        "simulation", compare_track="shipping", target_track="proposed", enforce_eager=False,
+    ) == ("shipping", "proposed")
+    for retired_track in ("expected_ideal", "merged"):
+        with pytest.raises(ModelingError, match="invalid_stack_track"):
+            report_mod._report_tracks(
+                "simulation", compare_track=retired_track, target_track="target", enforce_eager=False,
+            )
 
     # 2. _auto_solve_report_layout threads pd_pooled/pd_unpooled pooling mode and preserves full solved dict.
     seen_modes: list[str | None] = []
@@ -815,7 +837,7 @@ def test_report_preserves_solved_pd_columns_pooling_phase_and_strict_tracks(tmp_
                 "decode_parallel": {"dp": 1, "tp": 4, "ep": 4, "pp": 1, "pcp": 1, "cp": 1},
                 "b_feasible": 4,
                 "b_vram_max": 8,
-                "mtp_proposal_tokens": 2 if kw.get("feature_track") == "expected_ideal" else 0,
+                "mtp_proposal_tokens": 2 if kw.get("feature_track") == "target" else 0,
                 "handoff_tpot_ms": 3.5,
                 "used_dies": 8,
                 "e2e_total_tps": 1200.0,
@@ -858,13 +880,13 @@ def test_report_preserves_solved_pd_columns_pooling_phase_and_strict_tracks(tmp_
 
         raw_p, step_p, meta_p = _bundle_inputs_for_solution(
             lay_pool["solved"], model="deepseek-v3.2", hardware="a3", runtime_stack="vllm-ascend",
-            base_kw={}, feature_track="merged", prompt_tokens=128, output_tokens=32,
+            base_kw={}, feature_track="shipping", prompt_tokens=128, output_tokens=32,
             scope="model", phase="prefill",
         )
         assert step_p.phase == "prefill" and step_p.tokens == 128 and meta_p["handoff_tpot_ms"] == 0.0
         assert raw_p["runtime"]["metadata"].get("draft_proposal_tokens", 0) == 0
 
-        # End-to-end report with catalog preset w8a8_dynamic + simulation expected_ideal normalization + PD pool summary.
+        # End-to-end report with catalog preset w8a8_dynamic + simulation target->shipping normalization + PD pool summary.
         out_dir = tmp_path / "rep_pd"
         rec_path = tmp_path / "rep_pd_rec.json"
         rc = cli_main([
@@ -872,7 +894,7 @@ def test_report_preserves_solved_pd_columns_pooling_phase_and_strict_tracks(tmp_
             "--prompt-tokens", "128", "--output-tokens", "32",
             "--weight-quant", "w8a8_dynamic",
             "--deployment-mode", "pd_disaggregated", "--kv-pooling", "pooled_dram_ssd",
-            "--mode", "simulation", "--compare-track", "expected_ideal",
+            "--mode", "simulation", "--compare-track", "target",
             "--no-trace", "--no-xlsx", "--out-dir", str(out_dir), "--json", "--receipt", str(rec_path),
         ])
         assert rc == 0 and rec_path.is_file()
@@ -890,20 +912,37 @@ def test_report_shipping_defaults_partial_pins_and_script_free_purity(tmp_path, 
     from mindie_sim.export import export_comparison_xlsx as real_export_xlsx
     from mindie_sim.sweep import pd as pd_mod
 
-    # 1. Default --compare-track is merged; auto-device estimation works; retired --kernel-designs-json exits 2.
+    # 1. Default --compare-track is shipping; auto-device estimation works; retired --kernel-designs-json exits 2;
+    #    SLA_VIOLATED never reports feasible=True.
     from mindie_sim.cli import report as report_mod
+    from types import SimpleNamespace
     rep_args = build_parser().parse_args(["report", "--model", "qwen3-32b", "--hardware", "a3"])
-    assert rep_args.compare_track == "merged"
+    assert rep_args.compare_track == "shipping"
+    assert rep_args.target_track == "target"
+    violated_bundle = SimpleNamespace(
+        phase="decode", step_span_ns=80_000_000, step_span_us=80_000.0, avg_accepted_tokens=1.0,
+        handoff_tpot_ms=0.0, tpot_slo_ms=50.0, ttft_slo_ms=None, sla_regime="SLA_VIOLATED",
+        memory_ledger=SimpleNamespace(fits_hbm=True), model_name="qwen3-32b", hardware_sku="Ascend910_9392",
+    )
+    violated_rec = report_mod._assemble_report_receipt(
+        args=SimpleNamespace(concurrency=1, emit_json=True), after_bundle=violated_bundle,
+        summary={}, brief_dict={}, digest_md="", mode="simulation",
+        resolved_stack_id="vllm-ascend", dep_mode="colocated",
+    )
+    assert violated_rec["feasible"] is False and violated_rec["all_slas_met"] is False
+    assert violated_rec["status"] == "infeasible" and violated_rec["sla_regime"] == "SLA_VIOLATED"
     pol = report_mod.resolve_auto_va_policy("qwen3-32b", "a3")
     assert report_mod._estimate_auto_num_devices(pol["model_spec"], pol["sku"], pol["weight_quant"]) >= 1
     bad_designs = tmp_path / "designs.json"
     bad_designs.write_text("{}", encoding="utf-8")
-    assert cli_main([
-        "report", "--model", "qwen3-32b", "--hardware", "a3",
-        "--deployment-mode", "colocated",
-        "--dp", "1", "--tp", "2", "--ep", "1", "--concurrency", "1",
-        "--kernel-designs-json", str(bad_designs), "--out-dir", str(tmp_path / "bad_out"),
-    ]) == 2
+    with pytest.raises(SystemExit) as exc_bad:
+        cli_main([
+            "report", "--model", "qwen3-32b", "--hardware", "a3",
+            "--deployment-mode", "colocated",
+            "--dp", "1", "--tp", "2", "--ep", "1", "--concurrency", "1",
+            "--kernel-designs-json", str(bad_designs), "--out-dir", str(tmp_path / "bad_out"),
+        ])
+    assert exc_bad.value.code == 2
 
     # 2. Partial parallel pin (--tp 2 --num-devices 4) forwards pinned_parallel to solver instead of bypassing search.
     seen_pins: list[dict[str, int] | None] = []

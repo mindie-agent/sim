@@ -29,14 +29,16 @@ from .agent_brief import build_agent_brief, export_agent_brief
 from .bundle import build_export_bundle, compose_export_case
 from .comparison import (
     align_before_after_operators,
+    assert_comparison_polarity,
+    build_default_comparison_request,
     build_macro_module_breakdown,
-    enrich_comparison_plan_stage_receipts,
 )
 from .models import (
     DEFAULT_SCENARIO_OUTPUT_TOKENS,
     DEFAULT_SCENARIO_PROMPT_TOKENS,
     PENDING_KIND_TO_IMPLEMENT,
     AlignedComparisonRow,
+    ComparisonRequest,
     ExportBundle,
 )
 from .ooxml import NS_MAIN as NS_MAIN, Workbook
@@ -54,7 +56,6 @@ from .xlsx_summary import (
     SHEET_BREAKDOWN,
     SHEET_MEASURED,
     SHEET_MEMORY,
-    SHEET_NEW_KERNELS,
     SHEET_PENDING_KERNELS,
     SHEET_SUMMARY,
     SUMMARY_COLS,
@@ -110,8 +111,9 @@ class XlsxExportSummary:
 
 
 def _resolve_xlsx_bundles(
-    source: ExportBundle | CaseInput | None,
-    compare_source: ExportBundle | CaseInput | None,
+    before_bundle: ExportBundle | CaseInput | None,
+    after_bundle: ExportBundle | CaseInput | None,
+    comparison_request: ComparisonRequest | None = None,
     *,
     request: StepRequest | None, step_eval: StepEvaluation | None, replay: ReplayOptions,
     observations_path: str | Path | None, weight_quant: str | None,
@@ -121,69 +123,78 @@ def _resolve_xlsx_bundles(
     dp: int, tp: int, dcp: int, ep: int, pp: int, pcp: int,
     prompt_tokens: int, output_tokens: int, concurrency: int,
     mtp_proposal_tokens: int, mtp_acceptance_length: float,
-    compare_track: str | None, target_track: str | None,
+    before_track: str | None, after_track: str | None,
 ) -> tuple[ExportBundle, ExportBundle | None]:
-    compose_before = source is None
-    compose_after = compose_before and compare_source is None and bool(target_track)
-    if source is None:
+    """Resolve explicit Before/After bundles and enforce 3-arg comparison polarity lock."""
+    build_kw: dict[str, Any] = {
+        "replay": replay,
+        "weight_quant": weight_quant,
+        "cache_dtype": cache_dtype,
+        "engram_host_offload": engram_host_offload,
+        "include_vision_tower": include_vision_tower,
+        "apply_preset_to_ignored": apply_preset_to_ignored,
+    }
+    if before_bundle is None:
         if not model or not hardware:
-            raise ValueError("export_comparison_xlsx_requires_source_or_model_and_hardware")
-        base_track = compare_track or "merged"
-        raw_bef, auto_req = compose_export_case(
+            raise ModelingError("export_comparison_xlsx_requires_before_bundle_or_model_hardware")
+        b_track = str(before_track or "shipping").strip().lower()
+        raw_bef, req_bef = compose_export_case(
             model, hardware, topology_preset=topology_preset,
             dp=dp, tp=tp, dcp=dcp, ep=ep, pp=pp, pcp=pcp,
-            prompt_tokens=prompt_tokens, output_tokens=output_tokens,
-            concurrency=concurrency, mtp_proposal_tokens=mtp_proposal_tokens,
-            mtp_acceptance_length=mtp_acceptance_length, feature_track=base_track,
+            prompt_tokens=prompt_tokens, output_tokens=output_tokens, concurrency=concurrency,
+            mtp_proposal_tokens=mtp_proposal_tokens, mtp_acceptance_length=mtp_acceptance_length,
+            feature_track=b_track,
             quant=weight_quant, kv_cache_dtype=cache_dtype,
             engram_cpu_offload=engram_host_offload,
         )
-        eff_req = request or auto_req
-        source = raw_bef
-        if compare_source is None and target_track:
-            raw_aft, _ = compose_export_case(
+        eff_req = request if request is not None else req_bef
+        composed_build_kw = {**build_kw, "weight_quant": None}
+        resolved_before = build_export_bundle(
+            raw_bef, request=eff_req, step_eval=step_eval,
+            observations_path=observations_path, **composed_build_kw,
+        )
+        resolved_after: ExportBundle | None = None
+        if after_bundle is not None:
+            resolved_after = (
+                after_bundle if isinstance(after_bundle, ExportBundle)
+                else build_export_bundle(after_bundle, request=eff_req, **build_kw)
+            )
+        elif after_track is not None:
+            raw_aft, req_aft = compose_export_case(
                 model, hardware, topology_preset=topology_preset,
                 dp=dp, tp=tp, dcp=dcp, ep=ep, pp=pp, pcp=pcp,
-                prompt_tokens=prompt_tokens, output_tokens=output_tokens,
-                concurrency=concurrency, mtp_proposal_tokens=mtp_proposal_tokens,
-                mtp_acceptance_length=mtp_acceptance_length, feature_track=target_track,
+                prompt_tokens=prompt_tokens, output_tokens=output_tokens, concurrency=concurrency,
+                mtp_proposal_tokens=mtp_proposal_tokens, mtp_acceptance_length=mtp_acceptance_length,
+                feature_track=str(after_track).strip().lower(),
                 quant=weight_quant, kv_cache_dtype=cache_dtype,
                 engram_cpu_offload=engram_host_offload,
             )
-            compare_source = raw_aft
+            resolved_after = build_export_bundle(
+                raw_aft, request=(request if request is not None else req_aft), **composed_build_kw,
+            )
     else:
-        eff_req = request
-
-    bundle = (
-        source if isinstance(source, ExportBundle)
-        else build_export_bundle(
-            source, request=eff_req, step_eval=step_eval, replay=replay,
-            observations_path=observations_path,
-            weight_quant=None if compose_before else weight_quant,
-            cache_dtype=cache_dtype, engram_host_offload=engram_host_offload,
-            include_vision_tower=include_vision_tower,
-            apply_preset_to_ignored=apply_preset_to_ignored,
-        )
-    )
-    compare_bundle: ExportBundle | None = None
-    if compare_source is not None:
-        compare_bundle = (
-            compare_source if isinstance(compare_source, ExportBundle)
+        resolved_before = (
+            before_bundle if isinstance(before_bundle, ExportBundle)
             else build_export_bundle(
-                compare_source,
-                request=eff_req or StepRequest(
-                    phase=bundle.phase,  # type: ignore[arg-type]
-                    tokens=bundle.tokens_per_seq, context=bundle.context_tokens,
-                    sequences=bundle.sequences, scope=bundle.scope,  # type: ignore[arg-type]
-                ),
-                replay=replay, weight_quant=None if compose_after else weight_quant,
-                cache_dtype=cache_dtype, engram_host_offload=engram_host_offload,
-                include_vision_tower=include_vision_tower,
-                apply_preset_to_ignored=apply_preset_to_ignored,
-                compare_source=bundle,
+                before_bundle, request=request, step_eval=step_eval,
+                observations_path=observations_path, **build_kw,
             )
         )
-    return bundle, compare_bundle
+        resolved_after = None
+        if after_bundle is not None:
+            resolved_after = (
+                after_bundle if isinstance(after_bundle, ExportBundle)
+                else build_export_bundle(after_bundle, request=request, **build_kw)
+            )
+
+    if resolved_after is not None:
+        eff_cmp_req = (
+            comparison_request
+            if comparison_request is not None
+            else build_default_comparison_request(resolved_before, resolved_after)
+        )
+        assert_comparison_polarity(resolved_before, resolved_after, eff_cmp_req)
+    return resolved_before, resolved_after
 
 
 def _populate_workbook_sheets(
@@ -212,7 +223,7 @@ def _populate_workbook_sheets(
         ws_breakdown.validate_max_column(CMP_COLS)
     else:
         s2_receipt = populate_standalone_breakdown_sheet(ws_breakdown, bundle)
-        ws_breakdown.validate_max_column(STD_COLS)
+        ws_breakdown.validate_max_column(CMP_COLS)
     populate_memory_sheet(ws_memory, compare_bundle or bundle)
     ws_memory.validate_max_column(MEMORY_COLS)
     sheet_names = [SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY]
@@ -222,20 +233,19 @@ def _populate_workbook_sheets(
         SHEET_MEMORY: len(ws_memory.merged_ranges),
     }
     target_bundle = compare_bundle or bundle
-    if compare_bundle is not None or plan.pending_items or target_bundle.co_design_opportunities:
-        ws_pending = wb.create_sheet(SHEET_PENDING_KERNELS)
-        populate_pending_kernel_details_sheet(
-            ws_pending, plan.pending_items, target_bundle,
-            is_comparison=(compare_bundle is not None),
-            waterfall=(plan.waterfall if compare_bundle is not None else None),
-            breakdown_receipt=s2_receipt,
-            before_bundle=bundle,
-            group_accounting=plan.group_accounting,
-            co_design_opportunities=target_bundle.co_design_opportunities,
-        )
-        ws_pending.validate_max_column(PENDING_COLS)
-        sheet_names.append(SHEET_PENDING_KERNELS)
-        merge_counts[SHEET_PENDING_KERNELS] = len(ws_pending.merged_ranges)
+    ws_pending = wb.create_sheet(SHEET_PENDING_KERNELS)
+    populate_pending_kernel_details_sheet(
+        ws_pending, plan.pending_items, target_bundle,
+        is_comparison=(compare_bundle is not None),
+        waterfall=(plan.waterfall if compare_bundle is not None else None),
+        breakdown_receipt=s2_receipt,
+        before_bundle=bundle,
+        group_accounting=plan.group_accounting,
+        co_design_opportunities=target_bundle.co_design_opportunities,
+    )
+    ws_pending.validate_max_column(PENDING_COLS)
+    sheet_names.append(SHEET_PENDING_KERNELS)
+    merge_counts[SHEET_PENDING_KERNELS] = len(ws_pending.merged_ranges)
     if bundle.reconciliation is not None:
         ws_meas = wb.create_sheet(SHEET_MEASURED)
         populate_measured_calibration_sheet(ws_meas, bundle)
@@ -246,10 +256,11 @@ def _populate_workbook_sheets(
 
 
 def export_comparison_xlsx(
-    source: ExportBundle | CaseInput | None = None,
+    before_bundle: ExportBundle | CaseInput | None = None,
     output_path: str | Path = "",
     *,
-    compare_source: ExportBundle | CaseInput | None = None,
+    after_bundle: ExportBundle | CaseInput | None = None,
+    comparison_request: Any = None,
     request: StepRequest | None = None,
     step_eval: StepEvaluation | None = None,
     replay: ReplayOptions = ReplayOptions(),
@@ -259,7 +270,6 @@ def export_comparison_xlsx(
     engram_host_offload: bool | None = None,
     include_vision_tower: bool | None = None,
     apply_preset_to_ignored: bool = False,
-    agent_kernel_designs: Mapping[str, Any] | None = None,
     agent_brief_path: str | Path | None = None,
     script_audit: Any = None,
     comparison_plan: ComparisonPlan | None = None,
@@ -277,17 +287,15 @@ def export_comparison_xlsx(
     concurrency: int = 1,
     mtp_proposal_tokens: int = 0,
     mtp_acceptance_length: float = 1.0,
-    compare_track: str | None = None,
-    target_track: str | None = None,
+    before_track: str | None = None,
+    after_track: str | None = None,
 ) -> XlsxExportSummary:
-    """Build and atomically save the receipt-driven Ascend comparison ``.xlsx`` workbook."""
+    """Build and atomically save the receipt-driven Ascend 4-sheet comparison ``.xlsx`` workbook."""
     if not str(output_path):
         raise ValueError("export_comparison_xlsx_requires_output_path")
-    if agent_kernel_designs:
-        raise ModelingError("kernel_designs_prose_override_retired:use_rewrite_plan_for_verified_receipts")
 
     bundle, compare_bundle = _resolve_xlsx_bundles(
-        source, compare_source,
+        before_bundle, after_bundle, comparison_request,
         request=request, step_eval=step_eval, replay=replay,
         observations_path=observations_path,
         weight_quant=weight_quant, cache_dtype=cache_dtype,
@@ -299,7 +307,7 @@ def export_comparison_xlsx(
         prompt_tokens=prompt_tokens, output_tokens=output_tokens,
         concurrency=concurrency, mtp_proposal_tokens=mtp_proposal_tokens,
         mtp_acceptance_length=mtp_acceptance_length,
-        compare_track=compare_track, target_track=target_track,
+        before_track=before_track, after_track=after_track,
     )
 
     macro_rows = build_macro_module_breakdown(bundle, compare_bundle)
@@ -317,14 +325,9 @@ def export_comparison_xlsx(
                 for op in bundle.operators
             )
         plan = build_comparison_plan(
-            bundle, compare_bundle, aligned_rows, script_audit=script_audit,
+            bundle, compare_bundle, aligned_rows,
+            script_audit=script_audit, comparison_request=comparison_request,
         )
-    if compare_bundle is not None:
-        plan = enrich_comparison_plan_stage_receipts(
-            plan, bundle, compare_bundle, plan.aligned_rows,
-        )
-        if plan.stage_waterfall:
-            compare_bundle = replace(compare_bundle, stage_waterfall=plan.stage_waterfall)
 
     pending_items = plan.pending_items
     wb = Workbook()
@@ -344,11 +347,12 @@ def export_comparison_xlsx(
         brief = build_agent_brief(
             bundle, compare_bundle,
             generated_files={
-                "comparison_xlsx": str(out.resolve()),
-                "agent_brief_json": str(Path(agent_brief_path).resolve()),
+                "comparison_xlsx": out.name,
+                "agent_brief_json": Path(agent_brief_path).name,
             },
             script_audit=audit_dict,
             comparison_plan=plan,
+            comparison_request=comparison_request,
         )
         export_agent_brief(brief, agent_brief_path)
         brief_path_str = str(Path(agent_brief_path))
@@ -376,14 +380,15 @@ def export_comparison_xlsx(
 
 
 __all__ = [
+    "ComparisonRequest",
     "NS_MAIN",
     "SHEET_BREAKDOWN",
     "SHEET_MEASURED",
     "SHEET_MEMORY",
-    "SHEET_NEW_KERNELS",
     "SHEET_PENDING_KERNELS",
     "SHEET_SUMMARY",
     "XLSX_EXPORT_RECEIPT_SCHEMA",
     "XlsxExportSummary",
+    "assert_comparison_polarity",
     "export_comparison_xlsx",
 ]

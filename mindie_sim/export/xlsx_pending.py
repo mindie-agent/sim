@@ -24,7 +24,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-import re
 from typing import Any
 
 from .action_plan import GroupAccounting, WaterfallSummary, format_signed_gain_text
@@ -39,14 +38,19 @@ from .models import (
     BACKEND_ASCENDC,
     BACKEND_CATLASS,
     BACKEND_TILELANG,
+    BINDING_STATE_BOUND,
     GIB_BYTES,
     KIB_BYTES,
     MIB_BYTES,
+    MIN_DENOM_EPS,
+    NS_PER_MS,
+    NS_PER_US,
     PENDING_KIND_TO_IMPLEMENT,
     ExportBundle,
     PendingKernelItem,
     format_binding_badge,
 )
+from .public_view import is_same_public_config
 from .ooxml import (
     BACKLOG_ROW_HEIGHT_PT,
     CARD_ACCEPT_ROW_HEIGHT_PT,
@@ -114,9 +118,6 @@ WF_ROW_RESIDUAL = 7
 WF_ROW_RECON = 8
 WF_ROW_AFTER = 9
 WF_ROW_ERROR = 10
-#: Backward-compatible aliases preserving exact row indices 5 & 6.
-WF_ROW_NEW = WF_ROW_FRAMEWORK
-WF_ROW_TUNE = WF_ROW_KERNEL
 WF_NOTE_START_COL = 6
 
 CMP_INDEX_BANNER_ROW = 12
@@ -159,7 +160,6 @@ STD_NEXT_SECTION_NUM = 2
 
 WF_RECON_TOL_MS = 1e-4
 PRIMARY_KERNEL_BACKENDS = f"{BACKEND_TILELANG} / {BACKEND_ASCENDC} / {BACKEND_CATLASS}"
-_LEGACY_BACKEND_RE = re.compile(r"legacy[-_]?dsl", re.IGNORECASE)
 _STAGES_ORDERED = (WF_STAGE_CONFIG, WF_STAGE_FRAMEWORK, WF_STAGE_KERNEL, WF_STAGE_RESIDUAL)
 _STAGE_META: dict[str, tuple[int, str, str]] = {
     WF_STAGE_CONFIG: (
@@ -234,8 +234,7 @@ class _StagePlan:
 
 
 def _sanitize_backend_text(text: str) -> str:
-    cleaned = _LEGACY_BACKEND_RE.sub(BACKEND_TILELANG, str(text or ""))
-    return cleaned
+    return str(text or "")
 
 
 def _coalesce_spans(spans: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -319,87 +318,116 @@ def _compile_stage_plan(
     before_bundle: ExportBundle | None,
     target_bundle: ExportBundle,
 ) -> _StagePlan:
-    """Build exact 4-stage attribution, direct span formulas, and fallback-limit audit."""
-    stage_ms = {st: 0.0 for st in _STAGES_ORDERED}
-    stage_upt = {st: 0.0 for st in _STAGES_ORDERED}
+    """Compile exact int-ns 4-stage Sheet 4 Waterfall formulas and visible A:N fallback table."""
+    del wf
+    ref_before = before_bundle if before_bundle is not None else target_bundle
+    same_cfg = is_same_public_config(ref_before, target_bundle)
+    b_ntok = max(float(ref_before.n_tok_per_die or 1.0), MIN_DENOM_EPS)
+    a_ntok = max(float(target_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
+
+    stage_ns: dict[str, int] = {st: 0 for st in _STAGES_ORDERED}
+    stage_upt: dict[str, float] = {st: 0.0 for st in _STAGES_ORDERED}
     unsplit_spans: dict[str, list[tuple[int, int]]] = {st: [] for st in _STAGES_ORDERED}
     pre_spans: dict[str, list[tuple[int, int]]] = {st: [] for st in _STAGES_ORDERED}
+    pre_c_sum: dict[str, float] = {st: 0.0 for st in _STAGES_ORDERED}
     post_spans: dict[str, list[tuple[int, int]]] = {st: [] for st in _STAGES_ORDERED}
-    pre_c: dict[str, float] = {st: 0.0 for st in _STAGES_ORDERED}
-    post_c: dict[str, float] = {st: 0.0 for st in _STAGES_ORDERED}
+    post_c_sum: dict[str, float] = {st: 0.0 for st in _STAGES_ORDERED}
     attr_rows: list[_AttrRowRecord] = []
-    bef_ref = before_bundle or target_bundle
 
-    if group_accounting and receipt.row_spans:
-        for acc in group_accounting:
-            span = receipt.row_spans.get(acc.row_index)
-            if span is None:
-                continue
-            r1, r2 = span
-            primary_st, pre_st = classify_waterfall_stage(acc, bef_ref, target_bundle)
-            if pre_st is None:
-                unsplit_spans[primary_st].append(span)
-                stage_ms[primary_st] += acc.saved_ms
-                stage_upt[primary_st] += acc.saved_upt
-                is_pre_bucket = primary_st in {WF_STAGE_CONFIG, WF_STAGE_FRAMEWORK}
-                pre_ms = acc.saved_ms if is_pre_bucket else 0.0
-                post_ms = 0.0 if is_pre_bucket else acc.saved_ms
-                pre_u = acc.saved_upt if is_pre_bucket else 0.0
-                post_u = 0.0 if is_pre_bucket else acc.saved_upt
-            else:
-                c_val = float(acc.after_pre_edit_ms or 0.0)
-                pre_spans[pre_st].append(span)
-                pre_c[pre_st] += c_val
-                stage_ms[pre_st] += acc.config_share_ms
-                stage_upt[pre_st] += acc.config_share_upt
-                post_spans[primary_st].append(span)
-                post_c[primary_st] += c_val
-                stage_ms[primary_st] += acc.kernel_share_ms
-                stage_upt[primary_st] += acc.kernel_share_upt
-                pre_ms, post_ms = acc.config_share_ms, acc.kernel_share_ms
-                pre_u, post_u = acc.config_share_upt, acc.kernel_share_upt
+    for acc in group_accounting:
+        span = receipt.row_spans.get(acc.row_index)
+        if span is None:
+            continue
+        r1, r2 = span
+        st_primary, st_secondary = classify_waterfall_stage(acc, ref_before, target_bundle)
+        if st_secondary is not None and acc.after_pre_edit_ms is not None:
+            pre_st, post_st = st_primary, st_secondary
+            pre_ns = int(round(float(acc.config_share_ms) * float(NS_PER_MS)))
+            post_ns = int(round(float(acc.kernel_share_ms) * float(NS_PER_MS)))
+            stage_ns[pre_st] += pre_ns
+            stage_ns[post_st] += post_ns
+            stage_upt[pre_st] += float(acc.config_share_upt)
+            stage_upt[post_st] += float(acc.kernel_share_upt)
+            pre_spans[pre_st].append((r1, r2))
+            pre_c_sum[pre_st] += float(acc.after_pre_edit_ms)
+            post_spans[post_st].append((r1, r2))
+            post_c_sum[post_st] += float(acc.after_pre_edit_ms)
             attr_rows.append(_AttrRowRecord(
-                row_index=acc.row_index, r1=r1, r2=r2, primary_stage=primary_st,
-                pre_stage=pre_st or "", card_id=acc.card_id,
+                row_index=acc.row_index, r1=r1, r2=r2,
+                primary_stage=post_st, pre_stage=pre_st, card_id=acc.card_id,
                 before_ms=acc.before_ms, after_ms=acc.after_ms, saved_ms=acc.saved_ms,
-                pre_edit_ms=acc.after_pre_edit_ms, pre_share_ms=pre_ms, post_share_ms=post_ms,
-                saved_upt=acc.saved_upt, pre_share_upt=pre_u, post_share_upt=post_u,
+                pre_edit_ms=acc.after_pre_edit_ms,
+                pre_share_ms=acc.config_share_ms, post_share_ms=acc.kernel_share_ms,
+                saved_upt=acc.saved_upt, pre_share_upt=acc.config_share_upt, post_share_upt=acc.kernel_share_upt,
             ))
-    else:
-        stage_ms[WF_STAGE_CONFIG] = wf.config_saved_ms
-        stage_ms[WF_STAGE_KERNEL] = wf.new_kernel_saved_ms + wf.tune_kernel_saved_ms
-        stage_ms[WF_STAGE_RESIDUAL] = wf.residual_saved_ms
-        stage_upt[WF_STAGE_CONFIG] = wf.config_saved_upt
-        stage_upt[WF_STAGE_KERNEL] = wf.new_kernel_saved_upt + wf.tune_kernel_saved_upt
-        stage_upt[WF_STAGE_RESIDUAL] = wf.residual_saved_upt
+        else:
+            saved_ns = int(round(float(acc.saved_ms) * float(NS_PER_MS)))
+            stage_ns[st_primary] += saved_ns
+            stage_upt[st_primary] += float(acc.saved_upt)
+            unsplit_spans[st_primary].append((r1, r2))
+            is_pre = st_primary in {WF_STAGE_CONFIG, WF_STAGE_FRAMEWORK}
+            attr_rows.append(_AttrRowRecord(
+                row_index=acc.row_index, r1=r1, r2=r2,
+                primary_stage=st_primary, pre_stage="", card_id=acc.card_id,
+                before_ms=acc.before_ms, after_ms=acc.after_ms, saved_ms=acc.saved_ms,
+                pre_edit_ms=None,
+                pre_share_ms=acc.saved_ms if is_pre else 0.0,
+                post_share_ms=0.0 if is_pre else acc.saved_ms,
+                saved_upt=acc.saved_upt,
+                pre_share_upt=acc.saved_upt if is_pre else 0.0,
+                post_share_upt=0.0 if is_pre else acc.saved_upt,
+            ))
 
+    if receipt.idle_row > 0 and (receipt.idle_before_ns > 0 or receipt.idle_after_ns > 0):
+        idle_st = WF_STAGE_CONFIG if not same_cfg else WF_STAGE_RESIDUAL
+        idle_saved_ns = int(receipt.idle_before_ns) - int(receipt.idle_after_ns)
+        idle_b_ms = float(receipt.idle_before_ns) / float(NS_PER_MS)
+        idle_a_ms = float(receipt.idle_after_ns) / float(NS_PER_MS)
+        idle_s_ms = float(idle_saved_ns) / float(NS_PER_MS)
+        idle_s_upt = (float(receipt.idle_before_ns) / (NS_PER_US * b_ntok)) - (float(receipt.idle_after_ns) / (NS_PER_US * a_ntok))
+        stage_ns[idle_st] += idle_saved_ns
+        stage_upt[idle_st] += idle_s_upt
+        unsplit_spans[idle_st].append((receipt.idle_row, receipt.idle_row))
+        is_pre_idle = idle_st == WF_STAGE_CONFIG
+        attr_rows.append(_AttrRowRecord(
+            row_index=-1, r1=receipt.idle_row, r2=receipt.idle_row,
+            primary_stage=idle_st, pre_stage="", card_id="",
+            before_ms=idle_b_ms, after_ms=idle_a_ms, saved_ms=idle_s_ms,
+            pre_edit_ms=None,
+            pre_share_ms=idle_s_ms if is_pre_idle else 0.0,
+            post_share_ms=0.0 if is_pre_idle else idle_s_ms,
+            saved_upt=idle_s_upt,
+            pre_share_upt=idle_s_upt if is_pre_idle else 0.0,
+            post_share_upt=0.0 if is_pre_idle else idle_s_upt,
+        ))
+
+    q_let = column_letter(CMP_COL_SAVED_MS)
     j_let = column_letter(CMP_COL_BEF_EXP_MS)
     p_let = column_letter(CMP_COL_AFT_EXP_MS)
-    q_let = column_letter(CMP_COL_SAVED_MS)
+    z_let = column_letter(CMP_COL_SAVED_UPT)
     x_let = column_letter(CMP_COL_BEF_UPT)
     y_let = column_letter(CMP_COL_AFT_UPT)
-    z_let = column_letter(CMP_COL_SAVED_UPT)
 
     direct_wf_ms: dict[str, str] = {}
     direct_wf_upt: dict[str, str] = {}
     needs_fallback = False
     for st in _STAGES_ORDERED:
-        if attr_rows:
-            f_ms, ex_ms = _build_stage_formula(
-                unsplit_spans=unsplit_spans[st], pre_spans=pre_spans[st], pre_c_sum=pre_c[st],
-                post_spans=post_spans[st], post_c_sum=post_c[st],
-                unsplit_col=q_let, before_col=j_let, after_col=p_let, is_upt=False,
-            )
-            f_upt, ex_upt = _build_stage_formula(
-                unsplit_spans=unsplit_spans[st], pre_spans=pre_spans[st], pre_c_sum=pre_c[st],
-                post_spans=post_spans[st], post_c_sum=post_c[st],
-                unsplit_col=z_let, before_col=x_let, after_col=y_let, is_upt=True,
-            )
-            needs_fallback = needs_fallback or ex_ms or ex_upt
-        else:
-            f_ms, f_upt = f"={stage_ms[st]!r}", f"={stage_upt[st]!r}"
-        direct_wf_ms[st] = f_ms
-        direct_wf_upt[st] = f_upt
+        ms_f, ms_over = _build_stage_formula(
+            unsplit_spans=unsplit_spans[st],
+            pre_spans=pre_spans[st], pre_c_sum=pre_c_sum[st],
+            post_spans=post_spans[st], post_c_sum=post_c_sum[st],
+            unsplit_col=q_let, before_col=j_let, after_col=p_let, is_upt=False,
+        )
+        upt_f, upt_over = _build_stage_formula(
+            unsplit_spans=unsplit_spans[st],
+            pre_spans=pre_spans[st], pre_c_sum=pre_c_sum[st],
+            post_spans=post_spans[st], post_c_sum=post_c_sum[st],
+            unsplit_col=z_let, before_col=x_let, after_col=y_let, is_upt=True,
+        )
+        direct_wf_ms[st] = ms_f
+        direct_wf_upt[st] = upt_f
+        if ms_over or upt_over:
+            needs_fallback = True
 
     direct_card_m: dict[str, str] = {}
     direct_card_n: dict[str, str] = {}
@@ -409,45 +437,40 @@ def _compile_stage_plan(
         n_expr, n_args = _build_sum_expr(p_let, item_spans)
         m_f = f"={m_expr}" if m_expr else "=0"
         n_f = f"={n_expr}" if n_expr else "=0"
-        if (
-            max(m_args, n_args) > EXCEL_MAX_FORMULA_ARGS
-            or max(len(m_f), len(n_f)) > EXCEL_MAX_FORMULA_CHARS
-        ):
-            needs_fallback = True
         direct_card_m[item.card_id] = m_f
         direct_card_n[item.card_id] = n_f
+        if (
+            m_args > EXCEL_MAX_FORMULA_ARGS
+            or n_args > EXCEL_MAX_FORMULA_ARGS
+            or len(m_f) > EXCEL_MAX_FORMULA_CHARS
+            or len(n_f) > EXCEL_MAX_FORMULA_CHARS
+        ):
+            needs_fallback = True
 
+    stage_ms = {st: float(stage_ns[st]) / float(NS_PER_MS) for st in _STAGES_ORDERED}
     return _StagePlan(
-        stage_ms=stage_ms, stage_upt=stage_upt,
-        direct_wf_ms=direct_wf_ms, direct_wf_upt=direct_wf_upt,
-        direct_card_m=direct_card_m, direct_card_n=direct_card_n,
+        stage_ms=stage_ms,
+        stage_upt=stage_upt,
+        direct_wf_ms=direct_wf_ms,
+        direct_wf_upt=direct_wf_upt,
+        direct_card_m=direct_card_m,
+        direct_card_n=direct_card_n,
         attr_rows=tuple(attr_rows),
-        needs_fallback_table=(needs_fallback and bool(attr_rows)),
+        needs_fallback_table=needs_fallback and bool(attr_rows),
     )
 
 
-def _fallback_waterfall_formulas(
-    t1: int, t2: int,
-) -> tuple[dict[str, str], dict[str, str]]:
-    """Build compact SUMIF Waterfall formulas over the visible Sheet 4 ``A:N`` attribution table."""
-    c_rng = f"$C${t1}:$C${t2}"
-    d_rng = f"$D${t1}:$D${t2}"
-    j_rng = f"$J${t1}:$J${t2}"
-    k_rng = f"$K${t1}:$K${t2}"
-    m_rng = f"$M${t1}:$M${t2}"
-    n_rng = f"$N${t1}:$N${t2}"
-    wf_ms = {
-        WF_STAGE_CONFIG: f'=SUMIF({c_rng},"config",{j_rng})+SUMIF({d_rng},"config",{j_rng})',
-        WF_STAGE_FRAMEWORK: f'=SUMIF({c_rng},"framework",{j_rng})+SUMIF({d_rng},"framework",{j_rng})',
-        WF_STAGE_KERNEL: f'=SUMIF({c_rng},"kernel",{k_rng})',
-        WF_STAGE_RESIDUAL: f'=SUMIF({c_rng},"residual",{k_rng})',
-    }
-    wf_upt = {
-        WF_STAGE_CONFIG: f'=SUMIF({c_rng},"config",{m_rng})+SUMIF({d_rng},"config",{m_rng})',
-        WF_STAGE_FRAMEWORK: f'=SUMIF({c_rng},"framework",{m_rng})+SUMIF({d_rng},"framework",{m_rng})',
-        WF_STAGE_KERNEL: f'=SUMIF({c_rng},"kernel",{n_rng})',
-        WF_STAGE_RESIDUAL: f'=SUMIF({c_rng},"residual",{n_rng})',
-    }
+def _fallback_waterfall_formulas(t1: int, t2: int) -> tuple[dict[str, str], dict[str, str]]:
+    """Build bounded SUMIF Waterfall formulas over the visible A:N Group Attribution Table."""
+    wf_ms: dict[str, str] = {}
+    wf_upt: dict[str, str] = {}
+    for st in _STAGES_ORDERED:
+        if st in {WF_STAGE_CONFIG, WF_STAGE_FRAMEWORK}:
+            wf_ms[st] = f'=SUMIF($C${t1}:$C${t2},"{st}",$J${t1}:$J${t2})+SUMIF($D${t1}:$D${t2},"{st}",$J${t1}:$J${t2})'
+            wf_upt[st] = f'=SUMIF($C${t1}:$C${t2},"{st}",$M${t1}:$M${t2})+SUMIF($D${t1}:$D${t2},"{st}",$M${t1}:$M${t2})'
+        else:
+            wf_ms[st] = f'=SUMIF($C${t1}:$C${t2},"{st}",$K${t1}:$K${t2})'
+            wf_upt[st] = f'=SUMIF($C${t1}:$C${t2},"{st}",$N${t1}:$N${t2})'
     return wf_ms, wf_upt
 
 
@@ -599,7 +622,7 @@ def _write_pending_kernel_card(
     """Render one structured 8-row physical-receipt kernel card (strictly inside A:N)."""
     is_new = item.category == PENDING_KIND_TO_IMPLEMENT
     cat_style = STYLE_NEW_KERNEL if is_new else STYLE_OPT_BADGE
-    bind_badge = format_binding_badge(item.binding_state)
+    bind_badge = format_binding_badge(item.binding_state or target_bundle.binding_state or BINDING_STATE_BOUND)
     gain_hdr = format_signed_gain_text(item.expected_gain_ms)
     clean_target = _sanitize_backend_text(item.target_kernel)
     clean_backend = _sanitize_backend_text(item.suggested_backend) or PRIMARY_KERNEL_BACKENDS
@@ -895,7 +918,7 @@ def _write_pending_index_totals(
         formula=f"=SUM(K{idx_data_start}:K{r_end})",
         style=STYLE_TOTAL_NUM,
     )
-    ws.set_cell(r_tot, PENDING_COL_BINDING, format_binding_badge(target_bundle.binding_state), style=STYLE_TOTAL_TEXT)
+    ws.set_cell(r_tot, PENDING_COL_BINDING, format_binding_badge(target_bundle.binding_state or BINDING_STATE_BOUND), style=STYLE_TOTAL_TEXT)
     ws.set_cell(
         r_tot, PENDING_COL_BEF_MS,
         sum(x.before_model_ms if is_comparison else x.after_model_ms for x in pending_items),
@@ -970,7 +993,7 @@ def _write_pending_index_and_cards(
             (f"{item.before_bound} -> {item.after_bound}", None, STYLE_TEXT_WRAP),
             (f"Card #{item.priority} [{item.card_id}] (Row {card_row})", None, STYLE_MERGED),
             (item.saved_us_per_tok_die, gain_upt_f, STYLE_FLOAT2),
-            (format_binding_badge(item.binding_state), None, STYLE_TEXT_WRAP),
+            (format_binding_badge(item.binding_state or target_bundle.binding_state or BINDING_STATE_BOUND), None, STYLE_TEXT_WRAP),
             (m_val, m_formula, STYLE_FLOAT3),
             (n_val, n_formula, STYLE_FLOAT3),
         ))
@@ -1078,7 +1101,7 @@ def populate_pending_kernel_details_sheet(
         )
 
     if has_wf and waterfall is not None and stage_plan is not None:
-        if stage_plan.needs_fallback_table:
+        if stage_plan.needs_fallback_table and fallback_t1 > 0 and fallback_t2 >= fallback_t1:
             wf_ms_f, wf_upt_f = _fallback_waterfall_formulas(fallback_t1, fallback_t2)
         else:
             wf_ms_f, wf_upt_f = stage_plan.direct_wf_ms, stage_plan.direct_wf_upt
@@ -1119,9 +1142,7 @@ __all__ = [
     "WF_ROW_ERROR",
     "WF_ROW_FRAMEWORK",
     "WF_ROW_KERNEL",
-    "WF_ROW_NEW",
     "WF_ROW_RECON",
     "WF_ROW_RESIDUAL",
-    "WF_ROW_TUNE",
     "populate_pending_kernel_details_sheet",
 ]

@@ -8,22 +8,25 @@
 """
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from graphlib import CycleError, TopologicalSorter
 from heapq import heappop, heappush
-from math import isfinite, prod
+from math import inf, isfinite, prod
 from types import SimpleNamespace
 from typing import Any, Literal
 
+from mindie_sim.prediction.body_defaults import consume_target_declaration
 from mindie_sim.prediction.fusion.control_rewrite import (
-    apply_incoming_controls, ordering_prerequisites, rewritten_control_metadata,
+    apply_incoming_controls, rewritten_control_metadata,
 )
 from mindie_sim.prediction.fusion.ports import (
-    CONTROL_METADATA_KEYS, control_dependency_names, control_value_names, declared_control_order,
-    full_operand_ports, input_port_entries, replace_input_ports,
+    CONTROL_METADATA_KEYS, INPUT_PORTS_KEY, control_dependency_names, control_value_names,
+    declared_control_order, full_operand_ports, input_port_entries, metadata_pairs,
+    replace_input_ports,
 )
+from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.runtime import tile_solver
 from mindie_sim.prediction.runtime.tile_solver import TilePipelineSpec
@@ -140,6 +143,37 @@ class AppliedPlan:
     region_tiers: tuple[tuple[str, FusionTier], ...] = ()
     in_place_aliases: tuple[tuple[str, str], ...] = ()
     credit_edges: tuple[tuple[str, str, int], ...] = ()
+def _lower_prepared_step_for_rewrite(
+    spine: PredictionSpine,
+    case: Case,
+    request: LoweringRequest,
+) -> PreparedStep:
+    """Lower a ``PreparedStep`` for rewrite analysis without building unused structure payloads."""
+    if type(spine) is not PredictionSpine:
+        return spine.lower(case, request)
+    base = spine.stacks.resolve_base(case, request)
+    rewritten = spine.rewrite.apply(base)
+    effective_case = (
+        consume_target_declaration(base.case, rewritten.target_graphs)
+        if rewritten.target_graphs is not None else base.case
+    )
+    active_replicas = frozenset(entry.replica for entry in rewritten.executable)
+    bound_owners = spine._bind_stream_plans(effective_case, rewritten.streams, active_replicas)
+    book = RecipeBook.from_mapping(effective_case.runtime.kernels, family_registry=spine.families)
+    resolved_ops = spine._resolve_governed_operators(effective_case, rewritten, book, bound_owners)
+    graph_id = _json_digest(
+        (effective_case.model.name, request.tier, request.stack, rewritten.executable, rewritten.streams),
+        default=_digest_default,
+    )
+    return PreparedStep(
+        graph=rewritten,
+        case=effective_case,
+        operators=resolved_ops,
+        graph_id=graph_id,
+        structure_payload=None,
+    )
+
+
 def resolve_scenario(case, request: StepRequest, *, spine=None,
                      stack_id: str = DEFAULT_STACK_ID, primitives=None,
                      primitive_table=None) -> ResolvedScenario:
@@ -147,10 +181,12 @@ def resolve_scenario(case, request: StepRequest, *, spine=None,
     case = Case.from_mapping(case)
     spine = PredictionSpine() if spine is None else spine
     stack = DEFAULT_STACK_NAME if stack_id == DEFAULT_STACK_ID else stack_id
-    atomic = spine.lower(case, LoweringRequest(step=request, tier="unmerge",
-                                               apply_body_defaults=False, stack=stack))
-    mainline = spine.lower(case, LoweringRequest(step=request, tier="mainline",
-                                                 apply_body_defaults=True, stack=stack))
+    atomic = _lower_prepared_step_for_rewrite(
+        spine, case, LoweringRequest(step=request, tier="unmerge", apply_body_defaults=False, stack=stack),
+    )
+    mainline = _lower_prepared_step_for_rewrite(
+        spine, case, LoweringRequest(step=request, tier="mainline", apply_body_defaults=True, stack=stack),
+    )
     graph = atomic.graph
     base = _json_digest(graph.executable, default=_digest_default)
     framing = _json_digest(
@@ -223,42 +259,133 @@ def _named_inputs(op):
     return {key: dep for key, dep in op.metadata if key.endswith("_producer") and isinstance(dep, str)}
 
 
-def _dependencies(ops, stream=None):
-    deps = ordering_prerequisites(ops)
-    for op in ops:
-        deps[op.op_id].update(port["producer"] for _, port in _typed_inputs(op)
-                              if port.get("producer") in deps and port["producer"] != op.op_id)
-        deps[op.op_id].update(dep for dep in _named_inputs(op).values()
-                              if dep in deps and dep != op.op_id)
+_GRAPH_INDEX_CACHE_MAX = 16
+_PORT_PAIR_LEN = 2
+_MIDPOINT_FACTOR = 0.5
+_GRAPH_INDEX_CACHE: OrderedDict[tuple[int, int], tuple[Any, ...]] = OrderedDict()
+
+
+def _op_candidate_refs(op: OpSpec) -> set[str]:
+    """Single-pass extraction of all dependency, port, control, and named producer IDs."""
+    names = {str(dep) for dep in op.deps}
+    named: dict[str, str] = {}
+    for key, value in metadata_pairs(op.metadata):
+        if key == INPUT_PORTS_KEY and isinstance(value, (tuple, list)):
+            for item in value:
+                if isinstance(item, (tuple, list)) and len(item) == _PORT_PAIR_LEN:
+                    dep, port = str(item[0]), str(item[1])
+                    if dep and port:
+                        names.add(dep)
+        if key in CONTROL_METADATA_KEYS:
+            for name in control_value_names(value):
+                if name:
+                    names.add(name)
+        if key in {"typed_inputs", "input_ports"}:
+            for port in value:
+                if isinstance(port, Mapping):
+                    prod = port.get("producer")
+                    if prod is not None:
+                        names.add(prod)
+        if isinstance(key, str) and key.endswith("_producer") and isinstance(value, str):
+            named[key] = value
+    if named:
+        names.update(named.values())
+    return names
+
+
+def _compute_topo_pos(deps_map: Mapping[str, Any]) -> dict[str, int] | None:
+    try:
+        return {node: idx for idx, node in enumerate(TopologicalSorter(deps_map).static_order())}
+    except CycleError:
+        return None
+
+
+def _build_graph_index(
+    ops: Sequence[OpSpec], stream=None,
+) -> tuple[dict[str, frozenset[str]], dict[str, tuple[str, ...]], dict[str, int] | None]:
+    known = {op.op_id for op in ops}
+    deps: dict[str, set[str]] = {
+        op.op_id: {name for name in _op_candidate_refs(op) if name in known and name != op.op_id}
+        for op in ops
+    }
     if stream is not None:
         for event in stream.events:
             for target in event.wait_before:
                 if target in deps and event.record_after in deps:
                     deps[target].add(event.record_after)
-    return deps
+    users_lists: dict[str, list[str]] = {op.op_id: [] for op in ops}
+    for key, predecessors in deps.items():
+        for dep in predecessors:
+            users_lists[dep].append(key)
+    deps_frozen = {key: frozenset(predecessors) for key, predecessors in deps.items()}
+    users_tuple = {key: tuple(children) for key, children in users_lists.items()}
+    return deps_frozen, users_tuple, _compute_topo_pos(deps_frozen)
+
+
+def _graph_index(
+    ops: Sequence[OpSpec], stream=None,
+) -> tuple[dict[str, frozenset[str]], dict[str, tuple[str, ...]], dict[str, int] | None]:
+    if not isinstance(ops, tuple):
+        return _build_graph_index(ops, stream)
+    cache_key = (id(ops), id(stream))
+    cached = _GRAPH_INDEX_CACHE.get(cache_key)
+    if cached is not None and cached[0] is ops and cached[1] is stream:
+        _GRAPH_INDEX_CACHE.move_to_end(cache_key)
+        return cached[2], cached[3], cached[4]
+    deps_frozen, users_tuple, topo_pos = _build_graph_index(ops, stream)
+    _GRAPH_INDEX_CACHE[cache_key] = (ops, stream, deps_frozen, users_tuple, topo_pos)
+    while len(_GRAPH_INDEX_CACHE) > _GRAPH_INDEX_CACHE_MAX:
+        _GRAPH_INDEX_CACHE.popitem(last=False)
+    return deps_frozen, users_tuple, topo_pos
+
+
+def _dependencies(ops, stream=None):
+    deps_frozen, _, _ = _graph_index(ops, stream)
+    return {key: set(predecessors) for key, predecessors in deps_frozen.items()}
 
 
 def _successors(ops, stream=None):
-    users = {op.op_id: [] for op in ops}
-    for key, predecessors in _dependencies(tuple(ops), stream).items():
-        for dep in predecessors:
-            users[dep].append(key)
-    return users
-def _convex(ops, members: set[str], stream=None) -> bool:
-    users = _successors(ops, stream)
-    pending = [user for member in members for user in users[member] if user not in members]
-    visited = set()
+    _, users_tuple, _ = _graph_index(ops, stream)
+    return {key: list(children) for key, children in users_tuple.items()}
+
+
+def _convex_from_index(
+    users: Mapping[str, Any],
+    members: set[str],
+    topo_pos: Mapping[str, float | int] | None = None,
+) -> bool:
+    if not members:
+        return True
+    max_pos = max(topo_pos[m] for m in members) if topo_pos is not None else None
+    pending: list[str] = []
+    for member in members:
+        for user in users[member]:
+            if user not in members and (max_pos is None or topo_pos[user] < max_pos):
+                pending.append(user)
+    visited: set[str] = set()
     while pending:
         node = pending.pop()
         if node in members:
             return False
         if node not in visited:
             visited.add(node)
-            pending.extend(users[node])
+            for nxt in users[node]:
+                if nxt in members:
+                    return False
+                if max_pos is None or topo_pos[nxt] < max_pos:
+                    pending.append(nxt)
     return True
-def _topological(ops):
+
+
+def _convex(ops, members: set[str], stream=None) -> bool:
+    _, users, topo_pos = _graph_index(ops, stream)
+    return _convex_from_index(users, members, topo_pos)
+
+
+def _topological(ops, *, dependencies=None):
     positions = {key: i for i, key in enumerate(ops)}
-    dependencies = _dependencies(tuple(ops.values()))
+    if dependencies is None:
+        dependencies, _, _ = _graph_index(tuple(ops.values()))
     if any(key in op.deps for key, op in ops.items()):
         raise ModelingError("rewrite_execution_dag_cycle")
     if all(positions[dep] < positions[key] for key, deps in dependencies.items() for dep in deps):
@@ -546,12 +673,14 @@ def _unabsorbed_splitv_cost(
     for cand in all_ops.values():
         if cand.op_id in sib_ids:
             continue
+        matched = [dep for dep in cand.deps if dep in consumers_by_sib]
+        if not matched:
+            continue
         meta = dict(cand.metadata) if cand.metadata else {}
         if bool(meta.get("accepts_strided_view")) or bool(meta.get("packed_view_compatible")):
             continue
-        for dep in cand.deps:
-            if dep in consumers_by_sib:
-                consumers_by_sib[dep].add(cand.op_id)
+        for dep in matched:
+            consumers_by_sib[dep].add(cand.op_id)
     total_slice_bytes = 0.0
     unabsorbed_slices = 0
     for op in siblings:
@@ -853,6 +982,129 @@ class _RankDraft:
         self.collectives: list[CollectiveRewriteRecord] = []
         self.hoisted: list[str] = []
         self.elided: list[str] = []
+        self._cand_refs: dict[str, set[str]] = {}
+        self._base_deps: dict[str, set[str]] = {}
+        self._base_users: dict[str, set[str]] = {k: set() for k in self.ops}
+        self._consumers: dict[str, set[str]] = {}
+        for oid, op in self.ops.items():
+            refs = _op_candidate_refs(op)
+            self._cand_refs[oid] = refs
+            deps = {r for r in refs if r in self.ops and r != oid}
+            self._base_deps[oid] = deps
+            for dep in deps:
+                self._base_users[dep].add(oid)
+            for ref in refs:
+                self._consumers.setdefault(ref, set()).add(oid)
+        self._topo_pos: dict[str, float] | None = None
+
+    def _reindex_op_inputs(self, oid: str) -> None:
+        for ref in self._cand_refs.get(oid, ()):
+            cons = self._consumers.get(ref)
+            if cons is not None:
+                cons.discard(oid)
+                if not cons:
+                    del self._consumers[ref]
+        for dep in self._base_deps.get(oid, ()):
+            users = self._base_users.get(dep)
+            if users is not None:
+                users.discard(oid)
+        op = self.ops[oid]
+        refs = _op_candidate_refs(op)
+        self._cand_refs[oid] = refs
+        deps = {r for r in refs if r in self.ops and r != oid}
+        self._base_deps[oid] = deps
+        self._base_users.setdefault(oid, set())
+        for dep in deps:
+            self._base_users.setdefault(dep, set()).add(oid)
+        for ref in refs:
+            self._consumers.setdefault(ref, set()).add(oid)
+
+    def _remove_op_index(self, oid: str) -> None:
+        for ref in self._cand_refs.pop(oid, ()):
+            cons = self._consumers.get(ref)
+            if cons is not None:
+                cons.discard(oid)
+                if not cons:
+                    del self._consumers[ref]
+        for dep in self._base_deps.pop(oid, ()):
+            users = self._base_users.get(dep)
+            if users is not None:
+                users.discard(oid)
+        for user in self._base_users.pop(oid, ()):
+            user_deps = self._base_deps.get(user)
+            if user_deps is not None:
+                user_deps.discard(oid)
+
+    def _consumer_ids(self, keys: set[str]) -> set[str]:
+        found: set[str] = set()
+        for key in keys:
+            cons = self._consumers.get(key)
+            if cons:
+                found.update(cons)
+        found.difference_update(keys)
+        return found
+
+    def _effective_deps_for(self, keys: set[str]) -> dict[str, set[str]]:
+        deps = {k: set(self._base_deps[k]) for k in keys}
+        if self.stream is not None:
+            for event in self.stream.events:
+                if event.record_after in self.ops:
+                    for target in event.wait_before:
+                        if target in deps:
+                            deps[target].add(event.record_after)
+        return deps
+
+    def _is_convex(self, keys: set[str]) -> bool:
+        if self.stream is None or not self.stream.events:
+            if self._topo_pos is None:
+                raw = _compute_topo_pos(self._base_deps)
+                self._topo_pos = None if raw is None else {k: float(v) for k, v in raw.items()}
+            return _convex_from_index(self._base_users, keys, self._topo_pos)
+        deps = {k: set(v) for k, v in self._base_deps.items()}
+        users = {k: set(v) for k, v in self._base_users.items()}
+        for event in self.stream.events:
+            if event.record_after in deps:
+                for target in event.wait_before:
+                    if target in deps:
+                        deps[target].add(event.record_after)
+                        users[event.record_after].add(target)
+        return _convex_from_index(users, keys, _compute_topo_pos(deps))
+
+    def _update_topo_after_replace(self, removed: set[str], replacement: str | None) -> None:
+        if self._topo_pos is None:
+            return
+        if self.stream is not None and self.stream.events:
+            self._topo_pos = None
+            return
+        for key in removed:
+            self._topo_pos.pop(key, None)
+        if replacement is None or replacement not in self.ops:
+            return
+        preds = self._base_deps.get(replacement, ())
+        succs = self._base_users.get(replacement, ())
+        if replacement in self._topo_pos:
+            pos = self._topo_pos[replacement]
+            if any(self._topo_pos.get(p, inf) >= pos for p in preds) or any(
+                self._topo_pos.get(s, -inf) <= pos for s in succs
+            ):
+                self._topo_pos = None
+            return
+        p_max = max((self._topo_pos[p] for p in preds), default=None)
+        s_min = min((self._topo_pos[s] for s in succs), default=None)
+        if p_max is None and s_min is None:
+            self._topo_pos[replacement] = 0.0
+        elif p_max is None:
+            self._topo_pos[replacement] = s_min - 1.0
+        elif s_min is None:
+            self._topo_pos[replacement] = p_max + 1.0
+        elif p_max < s_min:
+            mid = p_max + (s_min - p_max) * _MIDPOINT_FACTOR
+            if p_max < mid < s_min:
+                self._topo_pos[replacement] = mid
+            else:
+                self._topo_pos = None
+        else:
+            self._topo_pos = None
 
     def resolve(self, ref: OpRef) -> OpSpec:
         ids = (ref.id,) if ref.kind == "atom" else self.handles.get(ref.id, ())
@@ -872,13 +1124,13 @@ class _RankDraft:
     def replace_nodes(self, removed, replacement, outputs=None):
         removed = removed - {replacement}
         redirects = dict.fromkeys(removed, replacement)
-        for key, op in self.ops.items():
-            if key in removed:
-                continue
+        affected = [key for key in self._consumer_ids(removed) if key in self.ops]
+        for key in affected:
+            op = self.ops[key]
             ports = input_port_entries(op.metadata)
             typed = {port.get("producer") for _, port in _typed_inputs(op)}
             controls = declared_control_order(op.metadata)
-            named = _named_inputs(op)
+            named = {k: v for k, v in _named_inputs(op).items() if v in self.ops or v in removed}
             inputs = (*op.deps, *controls, *(dep for dep, _ in ports), *sorted(typed - {None}), *named.values())
             if removed.intersection(inputs):
                 metadata = rewritten_control_metadata(op.metadata, redirects) if replacement else tuple(
@@ -919,6 +1171,11 @@ class _RankDraft:
                 self.ops[key] = replace(op, deps=deps, metadata=metadata)
         for key in removed:
             del self.ops[key]
+            self._remove_op_index(key)
+        if replacement is not None and replacement in self.ops:
+            self._reindex_op_inputs(replacement)
+        for key in affected:
+            self._reindex_op_inputs(key)
         if self.stream is not None:
             assign = dict(self.stream.assignments)
             if replacement is not None:
@@ -943,10 +1200,11 @@ class _RankDraft:
             self.stream = replace(self.stream, assignments=tuple(
                 (key, value) for key, value in assign.items() if key not in removed
             ), events=tuple(events))
+        self._update_topo_after_replace(removed, replacement)
 
     def _assemble_fused_op(
         self, *, fused_id, spec, ordered, keys, kernel_for, dependencies,
-        boundary, typed, named, cut, live, declared, read, write,
+        boundary, typed, named, cut, live, declared, read, write, consumer_ops=None,
     ):
         tail = ordered[-1]
         matrix = Counter()
@@ -989,7 +1247,9 @@ class _RankDraft:
                 sum(int(op.local_shape[1]) for op in ordered),
                 int(ordered[0].local_shape[2]),
             )
-            splitv_hbm, splitv_launches = _unabsorbed_splitv_cost(ordered, self.ops)
+            splitv_hbm, splitv_launches = _unabsorbed_splitv_cost(
+                ordered, self.ops if consumer_ops is None else consumer_ops,
+            )
         splitv_half = 0.5 * splitv_hbm
         fused_mte2 = sum(op.mte2_bytes for op in ordered) - read + splitv_half
         fused_mte3 = sum(op.mte3_bytes for op in ordered) - write + splitv_half
@@ -1074,10 +1334,10 @@ class _RankDraft:
         if len({(op.stage, op.phase, assignments.get(op.op_id, op.stream or MAIN_STREAM))
                 for op in members}) != 1:
             raise ModelingError("rewrite_fusion_cross_execution_domain")
-        if not _convex(tuple(self.ops.values()), keys, self.stream):
+        if not self._is_convex(keys):
             raise ModelingError(f"NON_CONVEX_REGION:{edit.edit_id}")
-        ordered = tuple(op for op in _topological(self.ops) if op.op_id in keys)
-        dependencies = _dependencies(tuple(self.ops.values()), self.stream)
+        ordered = tuple(op for op in _topological(self.ops, dependencies=self._base_deps) if op.op_id in keys)
+        dependencies = self._effective_deps_for(keys)
         if any(kernel_for[dep] > kernel_for[op.op_id]
                for op in ordered for dep in dependencies[op.op_id] if dep in keys):
             raise ModelingError("rewrite_kernel_boundary_dependency_order")
@@ -1088,7 +1348,7 @@ class _RankDraft:
                       if port.get("producer") not in keys)
         named = {key: dep for op in ordered for key, dep in _named_inputs(op).items() if dep not in keys}
         cut = {dep for op in ordered for dep in (*op.deps, *dependencies[op.op_id]) if dep not in keys}
-        users = tuple(op for op in self.ops.values() if op.op_id not in keys)
+        users = tuple(self.ops[cid] for cid in self._consumer_ids(keys) if cid in self.ops)
         declared = {(port["producer"], *_port_key(port)) for op in users
                     for _, port in _typed_inputs(op) if port.get("producer") in keys}
         consumed = {(dep, _positional_name(dep, port), 0) for op in users
@@ -1115,11 +1375,12 @@ class _RankDraft:
             fused_id=fused_id, spec=spec, ordered=ordered, keys=keys,
             kernel_for=kernel_for, dependencies=dependencies, boundary=boundary,
             typed=typed, named=named, cut=cut, live=live, declared=declared,
-            read=read, write=write,
+            read=read, write=write, consumer_ops={op.op_id: op for op in users},
         )
         insertion = next(key for key in self.ops if key in keys)
         self.ops = {key: item for previous, op in self.ops.items() for key, item in (
             ((fused_id, fused), (previous, op)) if previous == insertion else ((previous, op),))}
+        self._reindex_op_inputs(fused_id)
         self.replace_nodes(keys, fused_id, outputs)
         self.absorbed[fused_id] = tuple(atom for op in ordered
                                         for atom in self.absorbed.pop(op.op_id, (op.op_id,)))
@@ -1157,7 +1418,7 @@ class _RankDraft:
             raise ModelingError("rewrite_hoist_effectful")
         if spec.scope == "load_time":
             initialized = set(self.hoisted)
-            for op in _topological(self.ops):
+            for op in _topological(self.ops, dependencies=self._base_deps):
                 if _immutable(op) and set(op.deps) <= initialized:
                     initialized.add(op.op_id)
             if set(ids) - initialized:
@@ -1185,7 +1446,7 @@ def _prefetch(draft, edit, scenario):
     target, anchor = draft.port(spec.target_port), draft.port(spec.window_anchor)
     if target.stage != anchor.stage or target.op_id == anchor.op_id:
         raise ModelingError("rewrite_prefetch_window_invalid")
-    ordered = {op.op_id: i for i, op in enumerate(_topological(draft.ops))}
+    ordered = {op.op_id: i for i, op in enumerate(_topological(draft.ops, dependencies=draft._base_deps))}
     if ordered[anchor.op_id] >= ordered[target.op_id]:
         raise ModelingError("rewrite_prefetch_anchor_not_ready")
     meta = dict(target.metadata)
@@ -1257,8 +1518,9 @@ def _schedule(draft, spec, scenario, all_ids):
     plan = StreamPlan(draft.replica, spec.lanes, assignments, tuple(events))
     for stage in {op.stage for op in draft.ops.values()}:
         bind_stream_owners(plan, _path(scenario, draft.replica, stage))
-    _check_stream(_topological(draft.ops), plan)
+    _check_stream(_topological(draft.ops, dependencies=draft._base_deps), plan)
     draft.stream = plan
+    draft._topo_pos = None
     return tuple(key for key, _ in assignments), ()
 def _target_edit(draft, edit, scenario):
     spec = edit.operation
@@ -1329,9 +1591,13 @@ def apply_plan(plan: RewritePlan, scenario: ResolvedScenario) -> AppliedPlan:
     receipts, handles, quantized = [], [], []
     for edit in _ordered_edits(plan.edits, handles=True):
         refs = tuple(_references(edit.operation))
-        all_ids = {key for draft in drafts for key in draft.ops}
-        if any(ref.kind == "atom" and ref.id not in all_ids for ref in refs):
+        if any(ref.kind == "atom" and not any(ref.id in d.ops for d in drafts) for ref in refs):
             raise ModelingError(f"rewrite_unresolved_atom:{edit.edit_id}")
+        all_ids = (
+            {key for draft in drafts for key in draft.ops}
+            if isinstance(edit.operation, StreamSchedule)
+            else None
+        )
         affected, results = {}, {}
         eligible = 0
         for draft in drafts:
@@ -1358,7 +1624,7 @@ def apply_plan(plan: RewritePlan, scenario: ResolvedScenario) -> AppliedPlan:
 
     executable = []
     for draft in drafts:
-        ordered = _topological(draft.ops) if plan.edits else tuple(draft.ops.values())
+        ordered = _topological(draft.ops, dependencies=draft._base_deps) if plan.edits else tuple(draft.ops.values())
         if draft.stream is not None:
             ordered = _check_stream(ordered, draft.stream)
         executable.append(RankOps(draft.replica, ordered))

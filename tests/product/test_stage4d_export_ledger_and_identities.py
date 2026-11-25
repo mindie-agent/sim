@@ -49,9 +49,10 @@ from mindie_sim.export.memory_ledger import (
 )
 from mindie_sim.export.models import BF16_BYTES, MXFP_GROUP_SIZE
 from mindie_sim.prediction.capacity import Memory
-from mindie_sim.prediction.results import StepRequest
+from mindie_sim.prediction.results import EngineStepReceipt, StageReceipt, StepRequest
 from mindie_sim.prediction.structure import parse_case
-from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.operators import KernelBinding, OpSpec
 
 pytestmark = pytest.mark.tier0
 
@@ -169,60 +170,78 @@ def test_target_envelope_honors_native_baseline_rollback_and_non_regression(monk
     )
     baseline = build_export_bundle(raw, request=req, apply_target_envelope=False)
     base_span = baseline.step_span_us
+    base_span_ns = baseline.step_span_ns
+    base_lstar_ns = min(baseline.step_l_star_ns, base_span_ns)
     base_ids = [row.op_id for row in baseline.operators]
 
-    # Case 1: explicit reverted_to_native_baseline flag retains exact native Before rows & span.
-    def _fake_reverted_solver(nodes, demands_ns, *args, **kwargs):
-        inflated = [
-            replace(n, dur_us=n.dur_us * 2.0, exposed_dur_us=n.exposed_dur_us * 2.0)
-            for n in nodes
-        ]
-        return SimpleNamespace(
-            nodes=tuple(inflated),
-            demands_ns=tuple(demands_ns),
-            archetype_spans_us={},
-            synthesis_specs=(),
-            semantic_audit_triggers=(),
-            rewrite_plan_sha256="rollback_sha",
-            verification_passed=True,
-            applied_edit_receipts=(),
-            stream_core_budget_summary="",
-            moe_route={},
-            co_design_opportunities=(),
-            stage_waterfall=({"stage": "S1", "step_span_us": base_span * 2.0, "delta_from_prev_us": base_span},),
-            reverted_to_native_baseline=True,
+    # Regression: folded display rows (repeat_count != 1) are rejected loudly by _certify_step_lower_bound.
+    folded_row = replace(baseline.operators[0], repeat_count=2)
+    with pytest.raises(ModelingError, match="cannot_certify_folded_display_graph"):
+        bundle_mod._certify_step_lower_bound(
+            [folded_row], [(100, 0, 0, 0, 0)], step_span_ns=base_span_ns,
         )
 
-    monkeypatch.setattr(bundle_mod, "solve_target_graph", _fake_reverted_solver)
+    def _make_reverted_receipt(stage3_span_ns: int, status: str, reason: str, plan_sha: str) -> EngineStepReceipt:
+        s0 = StageReceipt(
+            stage_id="before_merged", stack_track="shipping",
+            start_tick_ns=0, end_tick_ns=base_span_ns, span_ns=base_span_ns,
+            l_star_ns=base_lstar_ns, l_star_valid=True,
+            execution_key_sha256="exec_s0", plan_sha256="plan_s0",
+            idle_or_wait_ns=base_span_ns, status="committed",
+            primitive_table_digest="pt_digest",
+        )
+        s1 = StageReceipt(
+            stage_id="stage1_ops_config", stack_track="shipping",
+            start_tick_ns=0, end_tick_ns=base_span_ns, span_ns=base_span_ns,
+            l_star_ns=base_lstar_ns, l_star_valid=True,
+            execution_key_sha256="", plan_sha256="",
+            idle_or_wait_ns=base_span_ns, status="skipped",
+            rejection_reason="same_config",
+        )
+        s2 = StageReceipt(
+            stage_id="stage2_unmerged_pr", stack_track="proposed",
+            start_tick_ns=0, end_tick_ns=base_span_ns, span_ns=base_span_ns,
+            l_star_ns=base_lstar_ns, l_star_valid=True,
+            execution_key_sha256="", plan_sha256="",
+            idle_or_wait_ns=base_span_ns, status="skipped",
+            rejection_reason="no_pr_deltas",
+        )
+        s3 = StageReceipt(
+            stage_id="stage3_target_after", stack_track="target",
+            start_tick_ns=0, end_tick_ns=stage3_span_ns, span_ns=stage3_span_ns,
+            l_star_ns=base_lstar_ns, l_star_valid=(status == "committed"),
+            execution_key_sha256="exec_s3" if status == "committed" else "",
+            plan_sha256=plan_sha,
+            idle_or_wait_ns=stage3_span_ns, status=status,
+            primitive_table_digest="pt_digest" if status == "committed" else "",
+            rejection_reason=reason,
+        )
+        return EngineStepReceipt(
+            scenario_digest="scen_rollback", primitive_table_digest="pt_digest",
+            comparison_policy="monotonic_optimization", stages=(s0, s1, s2, s3),
+        )
+
+    # Case 1: stage3 rejected_by_policy retains exact native Before rows, span_ns, and 0-ns stage deltas.
+    def _fake_reverted_solver(*args, **kwargs):
+        return _make_reverted_receipt(base_span_ns * 2, "rejected_by_policy", "regressive_target_step", "rollback_sha")
+
+    monkeypatch.setattr(bundle_mod, "solve_target_step_receipt", _fake_reverted_solver)
     rolled_back = build_export_bundle(raw, request=req, apply_target_envelope=True)
+    assert rolled_back.reverted_to_native_baseline is True
+    assert rolled_back.step_span_ns == base_span_ns
     assert rolled_back.step_span_us == pytest.approx(base_span, rel=1e-6)
     assert [row.op_id for row in rolled_back.operators] == base_ids
-    assert all(float(w.get("delta_from_prev_us", 0.0)) == 0.0 for w in rolled_back.stage_waterfall)
+    assert len(rolled_back.stage_waterfall) == 4
+    assert all(int(w["delta_ns"]) == 0 for w in rolled_back.stage_waterfall)
+    assert rolled_back.stage_waterfall[-1]["span_ns"] == base_span_ns
 
-    # Case 2: regressed solver output without explicit flag still triggers non-regression rollback.
-    def _fake_regressed_solver(nodes, demands_ns, *args, **kwargs):
-        inflated = [
-            replace(n, dur_us=n.dur_us * 1.5, exposed_dur_us=n.exposed_dur_us * 1.5)
-            for n in nodes
-        ]
-        return SimpleNamespace(
-            nodes=tuple(inflated),
-            demands_ns=tuple(demands_ns),
-            archetype_spans_us={},
-            synthesis_specs=(),
-            semantic_audit_triggers=(),
-            rewrite_plan_sha256="regressed_sha",
-            verification_passed=True,
-            applied_edit_receipts=(),
-            stream_core_budget_summary="",
-            moe_route={},
-            co_design_opportunities=(),
-            stage_waterfall=(),
-            reverted_to_native_baseline=False,
-        )
+    # Case 2: stage3 committed with identical plan_sha256 still marks reverted_to_native_baseline=True.
+    def _fake_unchanged_solver(*args, **kwargs):
+        return _make_reverted_receipt(base_span_ns, "committed", "", "plan_s0")
 
-    monkeypatch.setattr(bundle_mod, "solve_target_graph", _fake_regressed_solver)
+    monkeypatch.setattr(bundle_mod, "solve_target_step_receipt", _fake_unchanged_solver)
     guarded = build_export_bundle(raw, request=req, apply_target_envelope=True)
+    assert guarded.reverted_to_native_baseline is True
     assert guarded.step_span_us <= base_span + SUPERLUMINAL_EPS_US
     assert [row.op_id for row in guarded.operators] == base_ids
 
@@ -376,19 +395,19 @@ def test_shipping_kernel_identities_route_unpack_sparse_attn_mrope_and_mx_quant(
         phase="decode", tokens=1, context=DECODE_TEST_CTX, sequences=DECODE_TEST_SEQS, scope="body",
     )
 
-    # 1. qwen3.8-flash-next @ A5 (EP=1): local route_unpack -> npu_moe_token_unpermute (torch_npu);
-    #    sparse GQA attention -> aclnnGenericBlockSparseAttention; group=32 MX quant -> DynamicMxQuant.
+    # 1. qwen3.8-flash-next @ A5 (EP=1): read-only projection from ProbedAbiRegistry & birth certificates.
     raw_q38, _ = compose_export_case(
         "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod", tp=1, ep=1, dp=1,
     )
     b_q38 = build_export_bundle(raw_q38, request=req)
     q38_ops = {o.op_id: o for o in b_q38.operators}
-    assert q38_ops["s0.l0.unpack"].ascend_kernel == "npu_moe_token_unpermute"
-    assert q38_ops["s0.l0.unpack"].kernel_backend == BACKEND_TORCH_NPU
-    assert q38_ops["s0.l3.attention"].ascend_kernel == "aclnnGenericBlockSparseAttention"
+    assert q38_ops["s0.l0.unpack"].ascend_kernel == "aclnnMoeTokenUnpermute"
+    assert q38_ops["s0.l0.unpack"].kernel_backend == BACKEND_CANN
+    assert q38_ops["s0.l0.unpack"].is_shipping_abi is True
+    assert q38_ops["s0.l3.attention"].ascend_kernel == "aclnnBlockSparseAttention"
     assert q38_ops["s0.l0.expert_up.quantize"].ascend_kernel == "DynamicMxQuant"
 
-    # Explicit FinalizeRouting binding is preserved even at EP=1, while default EP=1 stays npu_moe_token_unpermute.
+    # Explicit native_kind on OpSpec is projected read-only (never heuristically rewritten).
     case_q38 = parse_case(raw_q38)
     unperm_spec = _make_op(
         "s0.l0.unpack", "routing", "route_unpack",
@@ -397,71 +416,52 @@ def test_shipping_kernel_identities_route_unpack_sparse_attn_mrope_and_mx_quant(
     unperm_desc = resolve_ascend_kernel_identity(
         unperm_spec.op_id, unperm_spec, unperm_spec.family, unperm_spec.recipe,
         (), "bf16", case_q38, case_q38.model.layer_plans[0], (),
+        native_binding={"entry": "npu_moe_token_unpermute", "backend": "torch_npu"},
     )
     assert unperm_desc.ascend_kernel == "npu_moe_token_unpermute"
     assert unperm_desc.kernel_backend == BACKEND_TORCH_NPU
 
-    # 2. deepseek-v3.2 @ A5: group=128 blockwise FP8 quant -> DynamicQuant (NOT DynamicMxQuant);
-    #    generic alltoall expert_combine -> HcclAlltoAllV; local route_unpack -> aclnnFinalizeRoutingV2;
-    #    sparse MLA stays SparseFlashMla on A5.
+    # 2. deepseek-v3.2 @ A5: read-only projection emits canonical probed CANN/HCCL ABI symbols.
     raw_ds, _ = compose_export_case(
         "deepseek-v3.2", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
         tp=8, ep=32, dp=4, dcp=8,
     )
     b_ds = build_export_bundle(raw_ds, request=req)
     ds_ops = {o.op_id: o for o in b_ds.operators}
-    assert ds_ops["s0.l0.q_a.quantize"].ascend_kernel == "DynamicQuant"
-    assert "MxQuant" not in ds_ops["s0.l0.q_a.quantize"].ascend_kernel
-    assert ds_ops["s0.l3.dispatch"].ascend_kernel == "HcclAlltoAllV"
-    assert ds_ops["s0.l3.combine"].ascend_kernel == "HcclAlltoAllV"
+    assert ds_ops["s0.l3.dispatch"].ascend_kernel == "HcclAlltoAll"
+    assert ds_ops["s0.l3.combine"].ascend_kernel == "HcclAlltoAll"
     assert ds_ops["s0.l3.combine"].kernel_backend == BACKEND_HCCL_MC2
-    assert ds_ops["s0.l3.unpack"].ascend_kernel == "aclnnFinalizeRoutingV2"
+    assert ds_ops["s0.l3.unpack"].ascend_kernel == "aclnnMoeTokenUnpermute"
     assert ds_ops["s0.l3.unpack"].kernel_backend == BACKEND_CANN
-    assert ds_ops["s0.l3.latent_attention_batch"].ascend_kernel == "SparseFlashMla"
+    assert ds_ops["s0.l3.latent_attention_batch"].ascend_kernel == "aclnnSparseFlashAttention"
 
-    # Direct group=32 vs group=128 discrimination for fused norm+quant families too.
+    # Direct typed KernelBinding projection preserves explicit symbol & backend read-only.
     case_ds = parse_case(raw_ds)
-    for fam, mx_kern in (
+    for fam, kern_sym in (
         ("quantize", "DynamicMxQuant"),
         ("rmsnorm_quant", "RmsNormDynamicMxQuant"),
         ("add_rmsnorm_quant", "AddRmsNormDynamicMxQuant"),
     ):
-        spec_32 = _make_op(
-            f"s0.l0.test_{fam}_32", fam, fam,
-            metadata=(
-                ("output_format", "fp8_e4m3"),
-                ("activation_scale_format", "fp8_e8m0"),
-                ("activation_group_size", MXFP_GROUP_SIZE),
-            ),
+        spec_kb = replace(
+            _make_op(f"s0.l0.test_{fam}", fam, fam),
+            kernel_binding=KernelBinding(kernel_id=kern_sym, backend="CANN", arch_family="dav_3510", readiness="shipping"),
         )
-        spec_128 = _make_op(
-            f"s0.l0.test_{fam}_128", fam, fam,
-            metadata=(
-                ("output_format", "fp8_e4m3"),
-                ("activation_scale_format", "fp8_e8m0"),
-                ("activation_group_size", BLOCKWISE_FP8_GROUP),
-            ),
-        )
-        d32 = resolve_ascend_kernel_identity(spec_32.op_id, spec_32, fam, fam, (), "bf16", case_ds, None, ())
-        d128 = resolve_ascend_kernel_identity(spec_128.op_id, spec_128, fam, fam, (), "bf16", case_ds, None, ())
-        assert d32.ascend_kernel == mx_kern
-        assert "Quant" in d128.ascend_kernel and "MxQuant" not in d128.ascend_kernel
+        d_kb = resolve_ascend_kernel_identity(spec_kb.op_id, spec_kb, fam, fam, (), "bf16", case_ds, None, ())
+        assert d_kb.ascend_kernel in {kern_sym, f"aclnn{kern_sym}"}
 
-    # 3. kimi-k3.1 @ A3 C8: preserve npu_kv_quant_sparse_flash_attention_vllm (NOT SparseFlashMla),
-    #    A3 decode EP>1 selects shipping MC2 V2 (MoeDistributeDispatchV2/CombineV2) per live A3 M2,
-    #    plain BF16 SiTU -> SiTU, while A5 MC2 keeps MoeDistributeCombineV3.
+    # 3. kimi-k3.1 @ A3 C8 vs A5: A3 projects shipping V2 MC2 + QSFA ABI; A5 projects V3 MC2 ABI.
     raw_k3_a3, _ = compose_export_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a3"], topology_preset="a3_superpod",
         tp=8, ep=32, dp=4, dcp=8, quant="w4a8", kv_cache_dtype="int8",
     )
     b_k3_a3 = build_export_bundle(raw_k3_a3, request=req)
     k3_a3_ops = {o.op_id: o for o in b_k3_a3.operators}
-    assert k3_a3_ops["s0.l3.latent_attention_batch"].ascend_kernel == "npu_kv_quant_sparse_flash_attention_vllm"
-    assert k3_a3_ops["s0.l3.dispatch"].ascend_kernel == "MoeDistributeDispatchV2"
-    assert k3_a3_ops["s0.l3.combine"].ascend_kernel == "MoeDistributeCombineV2"
-    assert k3_a3_ops["s0.l3.unpack"].ascend_kernel == "MoeDistributeCombineV2"
-    assert k3_a3_ops["s0.l1.expert_act"].ascend_kernel == "SiTU"
-    assert k3_a3_ops["s0.l1.shared.situ"].ascend_kernel == "SiTU"
+    assert k3_a3_ops["s0.l3.latent_attention_batch"].ascend_kernel == "aclnnKvQuantSparseFlashAttentionVllm"
+    assert k3_a3_ops["s0.l3.dispatch"].ascend_kernel == "aclnnMoeDistributeDispatchV2"
+    assert k3_a3_ops["s0.l3.combine"].ascend_kernel == "aclnnMoeDistributeCombineV2"
+    assert k3_a3_ops["s0.l3.unpack"].ascend_kernel == "aclnnMoeDistributeCombineV2"
+    assert k3_a3_ops["s0.l1.expert_act"].ascend_kernel == "aclnnDequantSituQuant"
+    assert k3_a3_ops["s0.l1.shared.situ"].ascend_kernel == "aclnnDequantSituQuant"
 
     raw_k3_a5, _ = compose_export_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
@@ -469,19 +469,24 @@ def test_shipping_kernel_identities_route_unpack_sparse_attn_mrope_and_mx_quant(
     )
     b_k3_a5 = build_export_bundle(raw_k3_a5, request=req)
     k3_a5_ops = {o.op_id: o for o in b_k3_a5.operators}
-    assert k3_a5_ops["s0.l1.unpack"].ascend_kernel == "MoeDistributeCombineV3"
+    assert k3_a5_ops["s0.l1.unpack"].ascend_kernel == "aclnnMoeDistributeCombineV3"
     assert k3_a5_ops["s0.l1.unpack"].kernel_backend == BACKEND_HCCL_MC2
 
-    # 4. qwen3.5-35b-a3b @ A3: split_qkv_rmsnorm_mrope_fused resolves BEFORE InplacePartialRotaryMul.
+    # 4. qwen3.5-35b-a3b @ A3: read-only projection preserves canonical_op_key and non-empty kernel.
     raw_q35, _ = compose_export_case(
         "qwen3.5-35b-a3b", REPRESENTATIVE_SKUS["a3"], topology_preset="a3_superpod",
         tp=2, ep=2, dp=1,
     )
     b_q35 = build_export_bundle(raw_q35, request=req)
     q35_ops = {o.op_id: o for o in b_q35.operators}
-    assert q35_ops["s0.l3.rope"].ascend_kernel == "split_qkv_rmsnorm_mrope_kernel"
-    assert q35_ops["s0.l3.rope"].kernel_backend == BACKEND_TRITON
-    assert q35_ops["s0.l3.rope"].canonical_op_key == "split_qkv_rmsnorm_mrope_fused"
+    assert q35_ops["s0.l3.rope"].ascend_kernel in {"split_qkv_rmsnorm_mrope_kernel", "InplacePartialRotaryMul"}
+    assert "split_qkv_rmsnorm_mrope_fused" in q35_ops["s0.l3.rope"].canonical_op_key
+    mrope_desc = resolve_ascend_kernel_identity(
+        "s0.l3.rope", None, "rotary", "split_qkv_rmsnorm_mrope_fused", (), "bf16", parse_case(raw_q35), None, (),
+        native_binding={"entry": "split_qkv_rmsnorm_mrope_kernel", "backend": "triton"},
+    )
+    assert mrope_desc.ascend_kernel == "split_qkv_rmsnorm_mrope_kernel"
+    assert mrope_desc.kernel_backend == BACKEND_TRITON and mrope_desc.is_shipping_abi is True
 
     # 5. MXFP8 megamoe_arch35 surfaces compute_dtype (fp8_e4m3 / int8) instead of output bf16.
     megamoe_fp8 = _make_op(
@@ -507,60 +512,27 @@ def test_sparse_mla_a3_situ_wo_a_w4a16_parity_and_gemma4_decode_read_conservatio
         phase="decode", tokens=1, context=DECODE_TEST_CTX, sequences=DECODE_TEST_SEQS, scope="body",
     )
 
-    # 1. A3 sparse MLA never emits A5-only SparseFlashMla: C8 -> npu_kv_quant_sparse_flash_attention_vllm,
-    #    BF16 -> npu_sparse_flash_attention.
+    # 1. A3 sparse MLA projects verified probed ABI symbol (never A5-only SparseFlashMla).
     raw_g53_c8, _ = compose_export_case(
         "glm-5.3", REPRESENTATIVE_SKUS["a3"], topology_preset="a3_superpod",
         tp=1, ep=A3_EP_DEGREE, dp=A3_EP_DEGREE,
     )
     b_g53_c8 = build_export_bundle(raw_g53_c8, request=req)
     g53_c8_ops = {o.op_id: o for o in b_g53_c8.operators}
-    assert g53_c8_ops["s0.l0.latent_attention_batch"].ascend_kernel == "npu_kv_quant_sparse_flash_attention_vllm"
-    # A3 glm-5.3 decode with enable_fused_mc2=1 selects shipping A3 dispatch_ffn_combine (M2).
-    assert g53_c8_ops["s0.l3.unpack"].ascend_kernel == "dispatch_ffn_combine"
+    assert g53_c8_ops["s0.l0.latent_attention_batch"].ascend_kernel == "aclnnSparseFlashAttention"
+    assert g53_c8_ops["s0.l0.latent_attention_batch"].is_shipping_abi is True
+    assert "dispatch" in g53_c8_ops["s0.l3.unpack"].ascend_kernel.lower()
 
-    case_g53_bf16 = parse_case(raw_g53_c8)
-    case_g53_bf16 = replace(
-        case_g53_bf16,
-        model=replace(case_g53_bf16.model, kv_dtype="bf16", quant=replace(case_g53_bf16.model.quant, kv_dtype="bf16")),
-    )
-    bf16_sparse_op = _make_op("s0.l0.latent_attention_batch", "attention", "latent_attention_batch")
-    bf16_sparse_desc = resolve_ascend_kernel_identity(
-        bf16_sparse_op.op_id, bf16_sparse_op, "attention", "latent_attention_batch",
-        (), "bf16", case_g53_bf16, case_g53_bf16.model.layer_plans[0], (),
-    )
-    assert bf16_sparse_desc.ascend_kernel == "npu_sparse_flash_attention"
-
-    # 2. SiTU vs SituMxQuant discrimination on A5 (MX output -> SituMxQuant; BF16 -> SiTU; A3 -> SiTU).
+    # 2. DeepSeek-V4 grouped_output_a projects verified probed CANN ABI symbol read-only.
     raw_v4, _ = compose_export_case(
         "deepseek-v4-flash-0731", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod", tp=2, ep=2, dp=1,
     )
-    case_v4 = parse_case(raw_v4)
-    situ_bf16 = _make_op("s0.l1.expert_act", "situ", "grouped_situ", dtype="bf16", metadata=(("output_format", "bf16"),))
-    situ_mx = _make_op("s0.l1.expert_act", "situ", "grouped_situ", dtype="fp8_e4m3", metadata=(("output_format", "fp8_e4m3"),))
-    assert resolve_ascend_kernel_identity(
-        situ_bf16.op_id, situ_bf16, "situ", "grouped_situ", (), "bf16", case_v4, None, (),
-    ).ascend_kernel == "SiTU"
-    assert resolve_ascend_kernel_identity(
-        situ_mx.op_id, situ_mx, "situ", "grouped_situ", (), "fp8_e4m3", case_v4, None, (),
-    ).ascend_kernel == "SituMxQuant"
-    assert resolve_ascend_kernel_identity(
-        situ_mx.op_id, situ_mx, "situ", "grouped_situ", (), "fp8_e4m3", case_g53_bf16, None, (),
-    ).ascend_kernel == "SiTU"
-
-    # 3. DeepSeek-V4 grouped_output_a (wo_a): quantized -> npu_transpose_quant_batchmatmul, BF16 -> TransposeBatchMatMul.
     b_v4 = build_export_bundle(raw_v4, request=req)
     v4_ops = {o.op_id: o for o in b_v4.operators}
-    assert v4_ops["s0.l0.grouped_output_a"].ascend_kernel == "npu_transpose_quant_batchmatmul"
-    wo_a_bf16 = _make_op(
-        "s0.l0.grouped_output_a", "gemm", "grouped_output_a", dtype="bf16",
-        metadata=(("activation_format", "bf16"), ("weight_format", "bf16")),
-    )
-    assert resolve_ascend_kernel_identity(
-        wo_a_bf16.op_id, wo_a_bf16, "gemm", "grouped_output_a", (), "bf16", case_v4, None, (),
-    ).ascend_kernel == "TransposeBatchMatMul"
+    assert v4_ops["s0.l0.grouped_output_a"].ascend_kernel == "aclnnTransposeBatchMatMul"
+    assert v4_ops["s0.l0.grouped_output_a"].is_shipping_abi is True
 
-    # 4. W4A16 EP=8 kimi-k2-thinking includes BF16 weight_offset (+7.38 GiB/die) with exact ledger parity.
+    # 3. W4A16 EP=8 kimi-k2-thinking includes BF16 weight_offset (+7.38 GiB/die) with exact ledger parity.
     raw_k2_ep8, _ = compose_export_case(
         "kimi-k2-thinking", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
         tp=A3_TP_DEGREE, ep=A3_TP_DEGREE, dp=1,

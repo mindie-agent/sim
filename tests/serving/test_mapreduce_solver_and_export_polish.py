@@ -18,10 +18,12 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 import multiprocessing
 import os
 from pathlib import Path
+import time
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -30,13 +32,28 @@ import pytest
 from mindie_sim.compose import compose_case
 from mindie_sim.export import (
     align_before_after_operators,
-    anchor_stage_waterfall,
     build_export_bundle,
+    compose_export_case,
     export_comparison_xlsx,
 )
 from mindie_sim.export.action_plan import build_comparison_plan
 from mindie_sim.export.ooxml import NS_MAIN
+from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.results import StepRequest
+from mindie_sim.prediction.streams import MAIN_STREAM, StreamCoreBudget, StreamEvent, StreamLane
+from mindie_sim.rewrite.apply import apply_plan
+from mindie_sim.rewrite.catalog_replay import _catlass_proposals, _replay_ops
+from mindie_sim.rewrite.oracle import (
+    MAX_OVERLAP_TRACE_EVENTS,
+    ScenarioRequest,
+    _bind_replay,
+    _report,
+    finalize_plan,
+    prepare_scenario,
+    refine_layer_cohort_plan,
+)
+from mindie_sim.rewrite.schema import Edit, OpRef, StreamSchedule, empty_plan
+from mindie_sim.rewrite.verify import _evaluation
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.solve import solve_deployment
 from mindie_sim.sweep.mapreduce import (
@@ -52,12 +69,20 @@ from mindie_sim.sweep.pd import (
     _solve_optimal_pd_ratio_closed_form,
     solve_optimal_deployment,
 )
+from mindie_sim.templates import catlass_lower
+from mindie_sim.templates import registry as template_registry
 
 pytestmark = pytest.mark.tier1
 
 _WATERFALL_TOL_US = 1e-6
 _CLOSED_FORM_TOL = 1e-10
+_PARITY_REL_TOL = 1e-11
+_PARITY_ABS_TOL_MS = 1e-9
 _TEST_PROMPT_TOKENS = 1024
+_COHORT_TEST_LAYERS = 12
+_DP_TEST_REPLICAS = 8
+_DP_MIN_SPEEDUP = 5.0
+_CATLASS_PROPOSAL_SLICE = 20
 _TEST_OUTPUT_TOKENS = 128
 _TEST_TPOT_SLA_MS = 50.0
 _TEST_TTFT_SLA_MS = 2000.0
@@ -259,113 +284,299 @@ def test_closed_form_pd_join_matches_exhaustive_ratio_grid() -> None:
         )
 
 
+def _compose_4layer_export(model_id: str, hardware: str, *, track: str) -> dict:
+    raw, _ = compose_export_case(
+        model_id, hardware, dp=8, tp=1, ep=8, pp=1,
+        prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
+        concurrency=8, feature_track=track,
+    )
+    model_cfg = dict(raw["model"])
+    model_cfg["layers"] = _TEST_LAYERS
+    if isinstance(model_cfg.get("layer_plans"), list):
+        model_cfg["layer_plans"] = model_cfg["layer_plans"][:_TEST_LAYERS]
+    return {**raw, "model": model_cfg}
+
+
 def test_anchored_four_stage_waterfall_telescopes_with_zero_gap(tmp_path: Path) -> None:
     req = StepRequest(phase="decode", tokens=1, context=_TEST_PROMPT_TOKENS, sequences=8, scope="model")
-    raw_before = compose_case(
-        "qwen3.8-flash-next", hardware="a5", parallel="fixed",
-        dp=8, tp=1, ep=8, pp=1,
-        prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
-        max_num_seqs=8, layers=_TEST_LAYERS, feature_track="merged",
-    )
-    raw_after = compose_case(
-        "qwen3.8-flash-next", hardware="a5", parallel="fixed",
-        dp=8, tp=1, ep=8, pp=1,
-        prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
-        max_num_seqs=8, layers=_TEST_LAYERS, feature_track="expected_ideal",
-    )
+    raw_before = _compose_4layer_export("qwen3.8-flash-next", "a5", track="shipping")
+    raw_after = _compose_4layer_export("qwen3.8-flash-next", "a5", track="target")
     b_before = build_export_bundle(raw_before, request=req, apply_target_envelope=False)
-    b_after_unanchored = build_export_bundle(raw_after, request=req, apply_target_envelope=True)
-    b_after_anchored = build_export_bundle(
-        raw_after, request=req, apply_target_envelope=True, compare_source=b_before,
-    )
-    # Confirm unanchored expected_ideal stage-0 actually differed from merged Before.
-    assert abs(float(b_after_unanchored.stage_waterfall[0]["step_span_us"]) - b_before.step_span_us) > 100.0
+    b_after = build_export_bundle(raw_after, request=req, apply_target_envelope=True)
+    assert b_after.engine_step_receipt is not None
+    assert len(b_after.stage_waterfall) == 4
 
-    for wf in (
-        b_after_anchored.stage_waterfall,
-        anchor_stage_waterfall(b_before, b_after_unanchored),
-    ):
-        assert len(wf) == 4
-        assert [row["stage"] for row in wf] == ["before", "config_only", "framework_rewrite", "after"]
-        assert math.isclose(wf[0]["step_span_us"], b_before.step_span_us, abs_tol=_WATERFALL_TOL_US)
-        assert math.isclose(wf[-1]["step_span_us"], b_after_unanchored.step_span_us, abs_tol=_WATERFALL_TOL_US)
-        total_delta = sum(float(row["delta_from_prev_us"]) for row in wf)
-        assert math.isclose(
-            total_delta, b_after_unanchored.step_span_us - b_before.step_span_us, abs_tol=_WATERFALL_TOL_US,
-        )
-        assert math.isclose(
-            float(wf[-1]["cumulative_saved_us"]),
-            b_before.step_span_us - b_after_unanchored.step_span_us,
-            abs_tol=_WATERFALL_TOL_US,
-        )
-        if b_before.step_span_us >= b_after_unanchored.step_span_us:
-            spans = [float(row["step_span_us"]) for row in wf]
-            assert spans[0] >= spans[1] >= spans[2] >= spans[3]
-
-    aligned = align_before_after_operators(b_before, b_after_unanchored)
-    plan = build_comparison_plan(b_before, b_after_unanchored, aligned)
-    assert len(plan.stage_waterfall) == 4
-    assert math.isclose(plan.stage_waterfall[0]["step_span_us"], b_before.step_span_us, abs_tol=_WATERFALL_TOL_US)
-    assert math.isclose(plan.stage_waterfall[-1]["step_span_us"], b_after_unanchored.step_span_us, abs_tol=_WATERFALL_TOL_US)
+    aligned = align_before_after_operators(b_before, b_after)
+    plan = build_comparison_plan(b_before, b_after, aligned)
+    wf = plan.stage_waterfall
+    assert len(wf) == 4
+    assert [row["stage_id"] for row in wf] == [
+        "before_merged", "stage1_ops_config", "stage2_unmerged_pr", "stage3_target_after",
+    ]
+    assert int(wf[0]["span_ns"]) == b_before.step_span_ns
+    assert int(wf[-1]["span_ns"]) == b_after.step_span_ns
+    assert sum(int(row["delta_ns"]) for row in wf) == b_before.step_span_ns - b_after.step_span_ns
+    assert plan.waterfall.reconciliation_error_ns == 0
 
     out_xlsx = tmp_path / "anchored_waterfall.xlsx"
-    export_comparison_xlsx(b_before, out_xlsx, compare_source=b_after_unanchored)
+    export_comparison_xlsx(b_before, out_xlsx, after_bundle=b_after)
     cells = _read_xlsx_sheet_cells(out_xlsx, sheet_index=1)
     h14_note = cells.get("H14", "")
     assert "4-Stage:" in h14_note
-    assert f"Before {b_before.step_span_us / 1000.0:.3f}" in h14_note
-    assert f"[3]算子/After {b_after_unanchored.step_span_us / 1000.0:.3f}" in h14_note
+    assert f"Before {b_before.step_span_ns / 1_000_000.0:.3f}" in h14_note
+    assert f"[3]算子/After {b_after.step_span_ns / 1_000_000.0:.3f}" in h14_note
 
 
 def test_mxfp4_expert_operator_dtype_and_tensor_contract_surface_precision_abi() -> None:
     req = StepRequest(phase="decode", tokens=1, context=_TEST_PROMPT_TOKENS, sequences=8, scope="model")
     for model_id in ("kimi-k3.1", "qwen3.8-flash-next"):
-        raw_merged = compose_case(
-            model_id, hardware="a5", parallel="fixed", dp=8, tp=1, ep=8, pp=1,
-            prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
-            max_num_seqs=8, layers=_TEST_LAYERS, feature_track="merged",
-        )
-        bun_merged = build_export_bundle(raw_merged, request=req, apply_target_envelope=False)
+        raw_shipping = _compose_4layer_export(model_id, "a5", track="shipping")
+        bun_shipping = build_export_bundle(raw_shipping, request=req, apply_target_envelope=False)
         expert_rows = [
-            op for op in bun_merged.operators
+            op for op in bun_shipping.operators
             if op.family in {"grouped_gemm", "grouped_moe"} or "megamoe" in op.recipe.lower()
         ]
         assert expert_rows, f"expected routed expert rows on {model_id}"
         assert all(op.dtype == "mxfp4" for op in expert_rows)
         assert all("MXFP4" in op.tensor_contract for op in expert_rows)
 
-        raw_ideal = compose_case(
-            model_id, hardware="a5", parallel="fixed", dp=8, tp=1, ep=8, pp=1,
-            prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
-            max_num_seqs=8, layers=_TEST_LAYERS, feature_track="expected_ideal",
-        )
-        bun_ideal = build_export_bundle(raw_ideal, request=req, apply_target_envelope=True)
-        ideal_experts = [
-            op for op in bun_ideal.operators
+        raw_target = _compose_4layer_export(model_id, "a5", track="target")
+        bun_target = build_export_bundle(raw_target, request=req, apply_target_envelope=True)
+        target_experts = [
+            op for op in bun_target.operators
             if op.family in {"grouped_gemm", "grouped_moe"} or "megamoe" in op.recipe.lower()
         ]
-        assert ideal_experts, f"expected routed expert rows on {model_id} expected_ideal"
-        assert all(op.dtype == "mxfp4" for op in ideal_experts)
-        assert all("MXFP4" in op.tensor_contract for op in ideal_experts)
+        assert target_experts, f"expected routed expert rows on {model_id} target"
+        assert all(op.dtype == "mxfp4" for op in target_experts)
+        assert all("MXFP4" in op.tensor_contract for op in target_experts)
 
-        norm_rows = [op for op in bun_merged.operators if op.family in {"rmsnorm", "add_rmsnorm"}]
+        norm_rows = [op for op in bun_shipping.operators if op.family in {"rmsnorm", "add_rmsnorm"}]
         assert norm_rows and all(op.dtype != "mxfp4" for op in norm_rows)
 
     # Control checks: MXFP8 and W4A8 experts preserve their native display dtypes.
-    raw_mxfp8 = compose_case(
-        "glm-5.3-flash", hardware="a5", parallel="fixed", dp=8, tp=1, ep=8, pp=1,
-        prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
-        max_num_seqs=8, layers=_TEST_LAYERS, feature_track="merged",
-    )
+    raw_mxfp8 = _compose_4layer_export("glm-5.3-flash", "a5", track="shipping")
     bun_mxfp8 = build_export_bundle(raw_mxfp8, request=req, apply_target_envelope=False)
     mxfp8_experts = [op for op in bun_mxfp8.operators if op.family in {"grouped_gemm", "grouped_moe"}]
     assert mxfp8_experts and all(op.dtype == "fp8_e4m3" for op in mxfp8_experts)
 
-    raw_w4a8 = compose_case(
-        "deepseek-v4.1-flash", hardware="a3", parallel="fixed", dp=8, tp=1, ep=8, pp=1,
-        prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
-        max_num_seqs=8, layers=_TEST_LAYERS, feature_track="merged",
-    )
+    raw_w4a8 = _compose_4layer_export("deepseek-v4.1-flash", "a3", track="shipping")
     bun_w4a8 = build_export_bundle(raw_w4a8, request=req, apply_target_envelope=False)
     w4a8_experts = [op for op in bun_w4a8.operators if op.family in {"grouped_gemm", "grouped_moe"}]
     assert w4a8_experts and all(op.dtype == "int8" for op in w4a8_experts)
+
+
+def test_oracle_refined_layer_cohort_plan_matches_literal_execution() -> None:
+    case = compose_case(
+        model="qwen3-32b", hardware="a3", tp=8, dp=1, pp=1, ep=1,
+        quant="w8a8", layers=_COHORT_TEST_LAYERS,
+        prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS, concurrency=16,
+    )
+    step = StepRequest(phase="decode", tokens=16, context=_TEST_PROMPT_TOKENS, sequences=16)
+    dossier = prepare_scenario(ScenarioRequest(case=case, step=step))
+    mainline_seed = dossier.handle._mainline
+    m_case = mainline_seed.scenario.atomic_step.case
+    m_graphs = {entry.replica: _replay_ops(entry.ops) for entry in mainline_seed.scenario.atomic_step.graph.executable}
+
+    refined = refine_layer_cohort_plan(m_case, m_graphs[0])
+    cohort_shapes = [(c.representative_layer, c.layer_indices) for c in refined.cohorts]
+    assert cohort_shapes == [
+        (0, (0,)),
+        (1, tuple(range(1, _COHORT_TEST_LAYERS - 1))),
+        (_COHORT_TEST_LAYERS - 1, (_COHORT_TEST_LAYERS - 1,)),
+    ]
+
+    lit_report = graph_costs(
+        m_case, m_graphs, recipes=mainline_seed.book, external_inputs={"analysis_input": 0.0},
+        evaluation=dossier.handle.evaluation_context, isolated=False,
+        include_submission=False, trace_limit=0,
+    )
+    assert math.isclose(
+        mainline_seed.evaluation.span_ms, float(lit_report["duration_ms"]),
+        rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+    )
+    coh_serviced = mainline_seed.evaluation.execution_evidence["serviced"]
+    lit_serviced = lit_report["execution"]["serviced"]
+    assert set(coh_serviced) == set(lit_serviced)
+    for res_name, expected in lit_serviced.items():
+        assert math.isclose(
+            float(coh_serviced[res_name]), float(expected),
+            rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+        )
+
+
+def test_oracle_dp_catalog_memo_preserves_per_replica_die_isolation_and_speedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = compose_case(
+        model="qwen3-235b-a22b", hardware="a3", tp=1, dp=_DP_TEST_REPLICAS, pp=1, ep=_DP_TEST_REPLICAS,
+        layers=2, prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
+        concurrency=_DP_TEST_REPLICAS,
+    )
+    step = StepRequest(phase="decode", tokens=_DP_TEST_REPLICAS, context=_TEST_PROMPT_TOKENS, sequences=_DP_TEST_REPLICAS)
+    dossier = prepare_scenario(ScenarioRequest(case=case, step=step))
+    scenario = dossier.handle.scenario
+    ops0 = scenario.atomic_ops[0].ops
+    datapath = scenario.datapath
+    proposals = list(_catlass_proposals(ops0[:_CATLASS_PROPOSAL_SLICE], datapath, datapath.aic_count, datapath.aiv_count))
+    assert proposals
+    op_edit = proposals[0][0][0]
+    plan = replace(
+        empty_plan(scenario.base_graph_sha256, scenario.framing_sha256),
+        edits=(Edit("e0", operation=op_edit),),
+    )
+    applied = apply_plan(plan, scenario)
+
+    lower_calls: list[int] = []
+    orig_lower = template_registry.lower_catlass_spec
+
+    def _counting_lower(*args, **kwargs):
+        lower_calls.append(int(kwargs.get("die", 0)))
+        return orig_lower(*args, **kwargs)
+
+    catlass_lower._PURE_LOWER_CACHE.clear()
+    monkeypatch.setattr(template_registry, "lower_catlass_spec", _counting_lower)
+    graphs, book, summaries, bound_streams, _, _ = _bind_replay(
+        scenario, applied, dossier.handle.recipe_book, dossier.handle,
+    )
+    assert len(lower_calls) == 1
+
+    recipe_ids = {
+        replica: next(op.recipe for op in ops if op.op_id == op_edit.target.id)
+        for replica, ops in graphs.items()
+    }
+    assert len(set(recipe_ids.values())) == 1
+
+    summary_sites = sorted(
+        (s.semantic_work[0].replica, s.semantic_work[0].die, s.read_obligations[0].die)
+        for s in summaries
+    )
+    assert summary_sites == [(r, r, r) for r in range(_DP_TEST_REPLICAS)]
+
+    monkeypatch.setenv("MINDIE_SIM_DP_DEDUP", "1")
+    t0 = time.perf_counter()
+    rep_dedup = _report(
+        scenario.atomic_step.case, graphs, dossier.handle.evaluation_context, book,
+        dossier.handle._replay, streams=bound_streams,
+    )
+    dedup_s = time.perf_counter() - t0
+
+    monkeypatch.setenv("MINDIE_SIM_DP_DEDUP", "0")
+    t1 = time.perf_counter()
+    rep_full = _report(
+        scenario.atomic_step.case, graphs, dossier.handle.evaluation_context, book,
+        dossier.handle._replay, streams=bound_streams,
+    )
+    full_s = time.perf_counter() - t1
+    monkeypatch.setenv("MINDIE_SIM_DP_DEDUP", "1")
+
+    assert math.isclose(
+        float(rep_dedup["duration_ms"]), float(rep_full["duration_ms"]),
+        rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+    )
+    assert full_s / max(dedup_s, _PARITY_ABS_TOL_MS) >= _DP_MIN_SPEEDUP
+
+    full_serviced = rep_full["execution"]["serviced"]
+    hbm_read_rows = sorted(k for k in full_serviced if k.endswith(":r") and "memory@r" in k)
+    assert len(hbm_read_rows) == _DP_TEST_REPLICAS
+    full_unit_peaks = rep_full["execution"]["peak_allocated_per_unit"]
+    for replica in range(_DP_TEST_REPLICAS):
+        assert any(f"@r{replica}:s0:" in key and val > 0 for key, val in full_unit_peaks.items())
+
+    for field_name in ("serviced", "resource_busy_ms"):
+        dedup_map = rep_dedup["execution"][field_name]
+        full_map = rep_full["execution"][field_name]
+        assert set(dedup_map) == set(full_map)
+        for key, expected in full_map.items():
+            assert math.isclose(
+                float(dedup_map[key]), float(expected),
+                rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+            )
+
+    same_backend = rep_dedup.get("engine_backend") == rep_full.get("engine_backend")
+    for field_name in ("peak_allocated", "peak_allocated_per_unit"):
+        dedup_map = rep_dedup["execution"][field_name]
+        full_map = rep_full["execution"][field_name]
+        assert set(dedup_map) == set(full_map)
+        for key, expected in full_map.items():
+            if same_backend:
+                assert math.isclose(
+                    float(dedup_map[key]), float(expected),
+                    rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+                )
+            elif expected > 0:
+                assert float(dedup_map[key]) > 0.0
+            if "@r0:" in key:
+                for peer in range(1, _DP_TEST_REPLICAS):
+                    peer_key = key.replace("@r0:", f"@r{peer}:", 1)
+                    assert math.isclose(
+                        float(dedup_map[peer_key]), float(dedup_map[key]),
+                        rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+                    )
+                    assert math.isclose(
+                        float(full_map[peer_key]), float(full_map[key]),
+                        rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+                    )
+
+    monkeypatch.setattr(template_registry, "lower_catlass_spec", orig_lower)
+    full_eval = finalize_plan(dossier.handle, plan)
+    assert full_eval.verification.passed
+    assert math.isclose(
+        float(full_eval.step_eval.span_ms), float(rep_full["duration_ms"]),
+        rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+    )
+
+
+def test_oracle_multi_replica_symmetric_stream_cohort_matches_literal() -> None:
+    dp_pair = 2
+    case = compose_case(
+        model="qwen3-235b-a22b", hardware="a3", tp=1, dp=dp_pair, pp=1, ep=dp_pair,
+        layers=_COHORT_TEST_LAYERS, prompt_tokens=_TEST_PROMPT_TOKENS,
+        output_tokens=_TEST_OUTPUT_TOKENS, concurrency=dp_pair,
+    )
+    step = StepRequest(phase="decode", tokens=dp_pair, context=_TEST_PROMPT_TOKENS, sequences=dp_pair)
+    dossier = prepare_scenario(ScenarioRequest(case=case, step=step))
+    scenario = dossier.handle.scenario
+    ops0 = scenario.atomic_ops[0].ops
+    by_id = {op.op_id: op for op in ops0}
+    target = next(
+        op for op in ops0
+        if op.layer == _COHORT_TEST_LAYERS - 1 and op.vector_ops > 0 and op.flops == 0 and not op.link_bytes
+    )
+    events = [
+        StreamEvent(f"ev_in_{idx}", MAIN_STREAM, dep, "aux", (target.op_id,))
+        for idx, dep in enumerate(target.deps) if dep in by_id and by_id[dep].stage == target.stage
+    ]
+    consumers = tuple(op.op_id for op in ops0 if target.op_id in op.deps and op.stage == target.stage)
+    if consumers:
+        events.append(StreamEvent("ev_out", "aux", target.op_id, MAIN_STREAM, consumers))
+    sched = StreamSchedule(
+        lanes=(
+            StreamLane(MAIN_STREAM, StreamCoreBudget(isolation="shared_cap")),
+            StreamLane("aux", StreamCoreBudget(aic=1, aiv=2, isolation="shared_cap")),
+        ),
+        assignments=((OpRef("atom", target.op_id), "aux"),),
+        events=tuple(events),
+    )
+    plan = replace(empty_plan(scenario.base_graph_sha256, scenario.framing_sha256), edits=(Edit("e_stream", operation=sched),))
+    applied = apply_plan(plan, scenario)
+    graphs, book, _, bound_streams, _, _ = _bind_replay(scenario, applied, dossier.handle.recipe_book, dossier.handle)
+    replay_graphs = {r: _replay_ops(ops) for r, ops in graphs.items()}
+
+    coh = _report(
+        scenario.atomic_step.case, graphs, dossier.handle.evaluation_context, book,
+        dossier.handle._replay, trace_limit=MAX_OVERLAP_TRACE_EVENTS, streams=bound_streams,
+    )
+    lit = graph_costs(
+        scenario.atomic_step.case, replay_graphs, recipes=book, external_inputs={"analysis_input": 0.0},
+        evaluation=dossier.handle.evaluation_context, isolated=False,
+        include_submission=False, trace_limit=MAX_OVERLAP_TRACE_EVENTS, stream_plans=bound_streams,
+    )
+    assert math.isclose(float(coh["duration_ms"]), float(lit["duration_ms"]), rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS)
+    assert set(coh["execution"]["serviced"]) == set(lit["execution"]["serviced"])
+    for key, expected in lit["execution"]["serviced"].items():
+        assert math.isclose(float(coh["execution"]["serviced"][key]), float(expected), rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS)
+    coh_eval = _evaluation(scenario, graphs, coh, applied.plan_sha256, "should_achieve")
+    for rep in range(dp_pair):
+        assert coh_eval.service_intervals.get((rep, target.op_id))
+        assert any(rep == r and oid.startswith("s0.l5.") for r, oid in coh_eval.service_intervals)
+    assert all(row.start_ms + _PARITY_ABS_TOL_MS >= row.ready_ms for row in coh_eval.operators)
