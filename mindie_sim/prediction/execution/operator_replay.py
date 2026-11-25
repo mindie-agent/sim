@@ -25,6 +25,140 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.body_defaults import consume_target_declaration
 
 
+_WARM_DURATION_EPS_MS = 1e-12
+
+
+def _make_warm_entry_view(src):
+    """Clone ``src`` into a first-touch-warm ``AdmissionMemoryView`` for lower bounds."""
+    from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView, _ResidentL2Entry
+    from mindie_sim.prediction.runtime.memory_physics import (
+        SectorCoverage, _subtract_byte_intervals,
+    )
+
+    class _WarmEntryAdmissionView(AdmissionMemoryView):
+        def _unseen_coverage(self, pattern, key, coverage, working_set, eff):
+            if pattern.direction != "read" or eff <= 0 or coverage.empty:
+                return SectorCoverage()
+            if not self._hit_fraction(working_set, eff, die=pattern.die):
+                return SectorCoverage()
+            seen = self._seen_by_key.get((key, pattern.version))
+            if seen is None:
+                return coverage
+            if not coverage.periodic and not seen.periodic:
+                u_ivs = (
+                    _subtract_byte_intervals(coverage.intervals, seen.intervals)
+                    if seen.intervals else coverage.intervals
+                )
+                u_scale = (
+                    _subtract_byte_intervals(coverage.scale_intervals, seen.scale_intervals)
+                    if seen.scale_intervals else coverage.scale_intervals
+                )
+                return SectorCoverage(intervals=u_ivs, scale_intervals=u_scale, _canonical=True)
+            return SectorCoverage() if seen == coverage else coverage
+
+        def resident_coverage_for(self, pattern, aligned_bytes=None):
+            base = super().resident_coverage_for(pattern, aligned_bytes)
+            eff_aligned = pattern.runs.aligned_copy_bytes() if aligned_bytes is None else aligned_bytes
+            key = self._key(pattern, eff_aligned)
+            if key is not None and pattern.direction == "read":
+                eff = self._preview_effective_l2(key)
+                coverage, working_set = self._geometry(pattern, eff_aligned)
+                unseen = self._unseen_coverage(pattern, key, coverage, working_set, eff)
+                if not unseen.empty:
+                    return unseen if base.empty else base.union(unseen)
+            return base
+
+        def _classify_access_with_overlap(
+            self, pattern, aligned_bytes, eff, coverage, working_set, entry,
+        ):
+            if pattern.direction == "read" and eff > 0:
+                key = self._key(pattern, aligned_bytes)
+                if key is not None:
+                    unseen = self._unseen_coverage(pattern, key, coverage, working_set, eff)
+                    if not unseen.empty:
+                        if entry is None and unseen == coverage:
+                            frac = self._hit_fraction(working_set, eff, die=pattern.die)
+                            hit = aligned_bytes if frac == 1.0 else round(aligned_bytes * frac)
+                            return hit, aligned_bytes - hit, None
+                        merged = unseen if entry is None else entry.coverage_snapshot().union(unseen)
+                        synth = _ResidentL2Entry(
+                            key=key, working_set_bytes=working_set, version=pattern.version,
+                            dirty=False, private_workspace=False,
+                            resident_coverage=merged, resident_bytes=merged.measure_bytes(),
+                            cache_policy=pattern.cache_policy,
+                            resident_scale_intervals=merged.scale_intervals,
+                        )
+                        return super()._classify_access_with_overlap(
+                            pattern, aligned_bytes, eff, coverage, working_set, synth,
+                        )
+            return super()._classify_access_with_overlap(
+                pattern, aligned_bytes, eff, coverage, working_set, entry,
+            )
+
+        def _admit_access_with_prior(self, pattern, aligned_bytes):
+            key = self._key(pattern, aligned_bytes)
+            coverage = SectorCoverage()
+            if key is not None and pattern.direction == "read":
+                coverage, working_set = self._geometry(pattern, aligned_bytes)
+                eff = self.effective_l2_bytes(key.die)
+                existing = self._existing(pattern, key, eff, preview=False)
+                unseen = self._unseen_coverage(pattern, key, coverage, working_set, eff)
+                if existing is not None and not unseen.empty:
+                    merged = existing.coverage_snapshot().union(unseen)
+                    existing.resident_intervals_mut = None
+                    existing.resident_coverage = merged
+                    existing.resident_bytes = merged.measure_bytes()
+                    existing.resident_scale_intervals = merged.scale_intervals
+                    existing.working_set_bytes = max(existing.working_set_bytes, working_set)
+                    self._evict_over_capacity(key.die, protect_key=key)
+            res = super()._admit_access_with_prior(pattern, aligned_bytes)
+            if key is not None and not coverage.empty:
+                prev = self._seen_by_key.get((key, pattern.version))
+                self._seen_by_key[(key, pattern.version)] = (
+                    coverage if prev is None else prev.union(coverage)
+                )
+            return res
+
+    view = _WarmEntryAdmissionView(
+        dict(src._l2_capacity),
+        memory_access=src._memory_access_default,
+        memory_access_by_die=dict(src._memory_access_by_die),
+        granule_bytes=src.granule_bytes,
+        arch_id=src.arch_id,
+    )
+    view._knee_curves_by_die = dict(src._knee_curves_by_die)
+    view._granule_by_die = dict(src._granule_by_die)
+    view._knee_curve = src._knee_curve
+    view._seen_by_key = {}
+    return view
+
+
+def _probe_warm_entry_duration(execution, program, input_ready_ms: float) -> float:
+    """Measure first-touch-warm lower-bound duration on a fresh silent probe Engine."""
+    cold_view = execution.engine.admission_memory_view
+    warm_engine = execution._new_engine()
+    warm_view = _make_warm_entry_view(cold_view)
+    warm_engine.attach_admission_memory_view(warm_view)
+    orig_submit_bound = warm_engine.submit_bound_access
+
+    def _silent_warm_bound_access(
+        name, bound, *, after=(), release=None, owner="", priority=0,
+        memory_state=None, pattern=None, on_delivery=None,
+    ):
+        del on_delivery
+        target_state = warm_view if memory_state is cold_view else memory_state
+        return orig_submit_bound(
+            name, bound, after=after, release=release, owner=owner, priority=priority,
+            memory_state=target_state, pattern=pattern, on_delivery=None,
+        )
+
+    warm_engine.submit_bound_access = _silent_warm_bound_access
+    warm_ready = warm_engine.submit("operator_warm:input_ready", release=input_ready_ms)
+    warm_complete = program.start(warm_engine, "operator_warm", warm_ready)
+    warm_engine.advance(until=(warm_complete,))
+    return float(warm_complete.time) - float(input_ready_ms)
+
+
 def physical_signature(op):
     """Deterministic serialization of the canonical physical key."""
     from mindie_sim.prediction.program.physical_key import physical_signature as _signature
@@ -111,8 +245,8 @@ def _remap_replica_refs(value, source: int, target: int):
 
 
 _REPLICA_SCOPED_FIELDS = (
-    "serviced", "service_before_input", "peak_buffers", "remaining_buffers",
-    "peak_buffers_per_unit",
+    "declared_service", "serviced", "service_before_input", "service_delta",
+    "peak_buffers", "remaining_buffers", "peak_buffers_per_unit",
 )
 
 
@@ -243,7 +377,11 @@ def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_m
     if stream_plans:
         from mindie_sim.prediction.streams import validate_stream_plan_ranks
         stream_plans = validate_stream_plan_ranks(stream_plans, {int(r) for r in graphs})
-    group_for = {rank: group for group in cohorts(case.runtime.parallel) for rank in group}
+    group_for = {
+        rank: group
+        for group in cohorts(case.runtime.parallel, case.machine)
+        for rank in group
+    }
     expanded = {rank: tuple(recipes.expand(items)) for rank, items in graphs.items()}
     expanded = bind_cohort_traffic(case, expanded)
     scopes, joins, joint_nodes, isolation = {}, {}, set(), []
@@ -338,7 +476,7 @@ def _replay_scope(ops, declared):
 
 def _evaluate_isolated_group(
     execution, op, *, replica: int, replay_scope: str, input_ready_ms: float,
-    identity: str, count: int,
+    identity: str, count: int, compute_warm: bool = False,
 ):
     from mindie_sim.prediction.program import NativeProgram
 
@@ -347,6 +485,9 @@ def _evaluate_isolated_group(
         raise ValueError("operator_collective_requires_complete_cohort:use_graph_costs")
     context = execution._context(op, replica, replay_scope, recipe=recipe)
     engine = execution.engine
+    l2_view = getattr(engine, "admission_memory_view", None)
+    l2_fp_fn = getattr(l2_view, "residency_fingerprint", None)
+    l2_before = str(l2_fp_fn()) if callable(l2_fp_fn) else ""
     ready = engine.submit("input_ready", release=input_ready_ms)
     program = execution.lower_program(context, recipe)
     cp_binding = getattr(context, "collective_plan", None)
@@ -373,6 +514,7 @@ def _evaluate_isolated_group(
     engine.advance(until=(complete,))
     duration = complete.time - input_ready_ms
     hw_serviced = {k: v for k, v in engine.serviced.items() if "stream_quota@" not in k}
+    l2_after = str(l2_fp_fn()) if callable(l2_fp_fn) else ""
     comm_accounting = (
         execution.topology.accounting(
             op, replica, volume=context.native_work["link"],
@@ -387,7 +529,7 @@ def _evaluate_isolated_group(
             and context.joint_native_service is None)
         else context
     )
-    return {
+    row = {
         **_cost_row(
             execution, op, recipe, row_context, identity=identity,
             count=count, duration=duration,
@@ -396,10 +538,18 @@ def _evaluate_isolated_group(
         **({"communication": _communication_description(comm_accounting, recipe)}
            if comm_accounting is not None else {}),
     }
+    if compute_warm and l2_after != l2_before and not isinstance(program, NativeProgram):
+        from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView
+        if isinstance(l2_view, AdmissionMemoryView):
+            warm_duration = _probe_warm_entry_duration(execution, program, input_ready_ms)
+            if warm_duration + _WARM_DURATION_EPS_MS < duration:
+                row["warm_duration_ms"] = warm_duration
+    return row
 
 
 def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=None,
-                    input_ready_ms=0, replica=0, evaluation=None, stream_plans=None):
+                    input_ready_ms=0, replica=0, evaluation=None, stream_plans=None,
+                    _compute_warm: bool = False):
     """Price local operators or complete replica->operators cohort mappings."""
     from mindie_sim.prediction.program import RecipeBook
     if input_ready_ms < 0 or not math.isfinite(input_ready_ms):
@@ -461,8 +611,14 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
         identity = physical_id(op)
         profile_key = ctx.bindings.profile_key(replica, op.stage)
         op_owners = stream_owners_lookup.get((int(replica), int(op.stage), op.stream or "main"))
+        link_scope = (
+            (int(replica),)
+            if (float(getattr(op, "link_bytes", 0.0) or 0.0) > 0.0
+                or dict(op.metadata).get("group_axis"))
+            else ()
+        )
         cache_key = (profile_key, int(op.stage), signature, replay_scope,
-                     float(input_ready_ms), op_owners)
+                     float(input_ready_ms), op_owners, link_scope, bool(_compute_warm))
         if isolated_cache is not None:
             cached = isolated_cache.get(cache_key)
             if cached is not None:
@@ -483,6 +639,7 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
         row = _evaluate_isolated_group(
             execution, op, replica=replica, replay_scope=replay_scope,
             input_ready_ms=input_ready_ms, identity=identity, count=group["count"],
+            compute_warm=bool(_compute_warm),
         )
         rows.append(row)
         if isolated_cache is not None:

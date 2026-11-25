@@ -21,7 +21,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 import re
 from typing import Any, Mapping, Sequence
 
@@ -114,33 +114,83 @@ def _common_prefix(tokens: Sequence[str]) -> str:
     return pfx
 
 
+def _freeze_attr(value: Any) -> Any:
+    """Return a deterministic hashable representation of a typed OpSpec field."""
+    if value is None or type(value) in _REBIND_ATOMIC or type(value) is str:
+        return value
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        pass
+    if is_dataclass(value) and not isinstance(value, type):
+        return (
+            type(value).__qualname__,
+            tuple((f.name, _freeze_attr(getattr(value, f.name))) for f in fields(value)),
+        )
+    if isinstance(value, Mapping):
+        return tuple(sorted(((str(k), _freeze_attr(v)) for k, v in value.items()), key=lambda pair: pair[0]))
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_attr(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return tuple(sorted((_freeze_attr(item) for item in value), key=repr))
+    return repr(value)
+
+
+def _request_slot_map(graph: Sequence[Any]) -> tuple[dict[str, str], re.Pattern | None, str]:
+    """Map one graph's distinct request IDs to canonical first-appearance slots."""
+    req_ids = _request_ids(graph)
+    if not req_ids:
+        return {}, None, ""
+    slots = {req: f"@req{idx}" for idx, req in enumerate(req_ids)}
+    return slots, _compile_token_pattern(req_ids), _common_prefix(req_ids)
+
+
 def _normalized(
     value: Any,
     request_pattern: re.Pattern | None = None,
-    request_set: frozenset[str] = frozenset(),
+    request_slots: Mapping[str, str] = (),  # type: ignore[assignment]
     request_prefix: str = "",
+    local_rank_slots: Mapping[int, str] | None = None,
 ) -> Any:
     t = type(value)
     if t in _REBIND_ATOMIC:
         return value
     if t is str:
-        if request_set and value in request_set:
-            return "@request"
-        text = RANK_TOKEN.sub("@r*", value) if "@r" in value else value
+        if request_slots and value in request_slots:
+            return request_slots[value]
+        if "@r" in value:
+            if local_rank_slots is not None:
+                text = RANK_TOKEN.sub(
+                    lambda match: (
+                        f"@r_local_{local_rank_slots[int(match.group(RANK_GROUP))]}"
+                        if int(match.group(RANK_GROUP)) in local_rank_slots
+                        else match.group(0)
+                    ),
+                    value,
+                )
+            else:
+                text = RANK_TOKEN.sub("@r*", value)
+        else:
+            text = value
         if request_pattern is not None and (not request_prefix or request_prefix in text):
-            text = request_pattern.sub("@request", text)
+            text = request_pattern.sub(lambda match: request_slots[match.group()], text)
         return text
     if isinstance(value, Mapping):
         return tuple(sorted(
-            ((str(key), _normalized(item, request_pattern, request_set, request_prefix))
+            ((str(key), _normalized(item, request_pattern, request_slots, request_prefix, local_rank_slots))
              for key, item in value.items()
              if str(key) not in _SKIP_NORM_META_KEYS),
             key=lambda pair: pair[0]))
     if isinstance(value, (tuple, list)):
-        return tuple(_normalized(item, request_pattern, request_set, request_prefix) for item in value)
+        return tuple(
+            _normalized(item, request_pattern, request_slots, request_prefix, local_rank_slots)
+            for item in value
+        )
     if isinstance(value, (set, frozenset)):
         return tuple(sorted(
-            (_normalized(item, request_pattern, request_set, request_prefix) for item in value),
+            (_normalized(item, request_pattern, request_slots, request_prefix, local_rank_slots)
+             for item in value),
             key=repr))
     return value
 
@@ -148,10 +198,12 @@ def _normalized(
 def _op_signature(
     op: Any,
     request_pattern: re.Pattern | None = None,
-    request_set: frozenset[str] = frozenset(),
+    request_slots: Mapping[str, str] = (),  # type: ignore[assignment]
     request_prefix: str = "",
+    local_rank_slots: Mapping[int, str] | None = None,
 ) -> tuple:
     metadata = dict(getattr(op, "metadata", ()) or {})
+    op_requests = tuple(getattr(op, "requests", ()) or ())
     return (
         str(getattr(op, "family", "")), str(getattr(op, "recipe", "")),
         str(getattr(op, "phase", "")), int(getattr(op, "stage", 0)),
@@ -166,37 +218,57 @@ def _op_signature(
         float(getattr(op, "mte3_bytes", 0) or 0),
         float(getattr(op, "vector_ops", 0) or 0),
         float(getattr(op, "link_bytes", 0) or 0),
+        str(getattr(op, "link_scope", "") or ""),
         str(getattr(op, "source_boundary", "")),
+        tuple(getattr(op, "returns", ()) or ()),
         str(getattr(op, "stream", "") or ""),
-        _normalized(tuple(getattr(op, "deps", ()) or ()), request_pattern, request_set, request_prefix),
-        _normalized(tuple(getattr(op, "matrix_flops", ()) or ()), request_pattern, request_set, request_prefix),
-        _normalized(metadata.get("matrix_flops"), request_pattern, request_set, request_prefix),
-        len(tuple(getattr(op, "requests", ()) or ())),
-        _normalized(metadata, request_pattern, request_set, request_prefix),
+        _freeze_attr(getattr(op, "precision_abi", None)),
+        _freeze_attr(getattr(op, "kernel_binding", None)),
+        _freeze_attr(getattr(op, "owner_schedule", None)),
+        tuple(getattr(op, "logical_precision_reqs", ()) or ()),
+        str(getattr(op, "coverage", "") or ""),
+        _normalized(
+            tuple(getattr(op, "deps", ()) or ()),
+            request_pattern, request_slots, request_prefix, local_rank_slots,
+        ),
+        _normalized(
+            tuple(getattr(op, "matrix_flops", ()) or ()),
+            request_pattern, request_slots, request_prefix, local_rank_slots,
+        ),
+        _normalized(
+            metadata.get("matrix_flops"),
+            request_pattern, request_slots, request_prefix, local_rank_slots,
+        ),
+        tuple(request_slots.get(str(r), str(r)) for r in op_requests) if request_slots else op_requests,
+        _normalized(metadata, request_pattern, request_slots, request_prefix, local_rank_slots),
     )
 
 
 def _values_isomorphic(
     v0: Any,
     vr: Any,
-    request_pattern: re.Pattern | None,
-    request_set: frozenset[str],
-    request_prefix: str,
+    pat0: re.Pattern | None,
+    slots0: Mapping[str, str],
+    pfx0: str,
+    pat_r: re.Pattern | None,
+    slots_r: Mapping[str, str],
+    pfx_r: str,
 ) -> bool:
-    """Short-circuit structural equality matching ``_normalized(v0) == _normalized(vr)``."""
-    if v0 == vr:
-        return True
+    """Short-circuit structural equality matching per-graph slot-normalized values."""
     t0 = type(v0)
     tr = type(vr)
+    if t0 in _REBIND_ATOMIC and tr in _REBIND_ATOMIC:
+        return v0 == vr
     if t0 is str and tr is str:
-        return _normalized(v0, request_pattern, request_set, request_prefix) == _normalized(
-            vr, request_pattern, request_set, request_prefix
-        )
+        return _normalized(v0, pat0, slots0, pfx0) == _normalized(vr, pat_r, slots_r, pfx_r)
     if (t0 is tuple or t0 is list) and (tr is tuple or tr is list):
         if len(v0) != len(vr):
             return False
         for a, b in zip(v0, vr):
-            if a != b and not _values_isomorphic(a, b, request_pattern, request_set, request_prefix):
+            if type(a) in _REBIND_ATOMIC and type(b) in _REBIND_ATOMIC:
+                if a != b:
+                    return False
+            elif not _values_isomorphic(a, b, pat0, slots0, pfx0, pat_r, slots_r, pfx_r):
                 return False
         return True
     if t0 is dict and tr is dict:
@@ -206,24 +278,33 @@ def _values_isomorphic(
             return False
         for k in keys0:
             a, b = v0[k], vr[k]
-            if a != b and not _values_isomorphic(a, b, request_pattern, request_set, request_prefix):
+            if type(a) in _REBIND_ATOMIC and type(b) in _REBIND_ATOMIC:
+                if a != b:
+                    return False
+            elif not _values_isomorphic(a, b, pat0, slots0, pfx0, pat_r, slots_r, pfx_r):
                 return False
         return True
-    return _normalized(v0, request_pattern, request_set, request_prefix) == _normalized(
-        vr, request_pattern, request_set, request_prefix
-    )
+    return _normalized(v0, pat0, slots0, pfx0) == _normalized(vr, pat_r, slots_r, pfx_r)
 
 
 def _ops_isomorphic(
     op0: Any,
     op_r: Any,
-    request_pattern: re.Pattern | None,
-    request_set: frozenset[str],
-    request_prefix: str,
+    pat0: re.Pattern | None,
+    slots0: Mapping[str, str],
+    pfx0: str,
+    pat_r: re.Pattern | None,
+    slots_r: Mapping[str, str],
+    pfx_r: str,
+    *,
+    req_slots_r: Mapping[str, str] | None = None,
 ) -> bool:
-    """Zero-allocation structural isomorphism check matching ``_op_signature`` exactly."""
-    if op0 == op_r:
+    """Structural isomorphism check enforcing request bijection and typed ABI equality."""
+    eff_req_r = slots_r if req_slots_r is None else req_slots_r
+    if op0 == op_r and slots0 == eff_req_r:
         return True
+    req0 = tuple(getattr(op0, "requests", ()) or ())
+    req_r = tuple(getattr(op_r, "requests", ()) or ())
     if (
         str(getattr(op0, "family", "")) != str(getattr(op_r, "family", ""))
         or str(getattr(op0, "recipe", "")) != str(getattr(op_r, "recipe", ""))
@@ -241,41 +322,151 @@ def _ops_isomorphic(
         or float(getattr(op0, "mte3_bytes", 0) or 0) != float(getattr(op_r, "mte3_bytes", 0) or 0)
         or float(getattr(op0, "vector_ops", 0) or 0) != float(getattr(op_r, "vector_ops", 0) or 0)
         or float(getattr(op0, "link_bytes", 0) or 0) != float(getattr(op_r, "link_bytes", 0) or 0)
+        or str(getattr(op0, "link_scope", "") or "") != str(getattr(op_r, "link_scope", "") or "")
         or str(getattr(op0, "source_boundary", "")) != str(getattr(op_r, "source_boundary", ""))
+        or tuple(getattr(op0, "returns", ()) or ()) != tuple(getattr(op_r, "returns", ()) or ())
         or str(getattr(op0, "stream", "") or "") != str(getattr(op_r, "stream", "") or "")
-        or len(tuple(getattr(op0, "requests", ()) or ())) != len(tuple(getattr(op_r, "requests", ()) or ()))
+        or getattr(op0, "precision_abi", None) != getattr(op_r, "precision_abi", None)
+        or getattr(op0, "kernel_binding", None) != getattr(op_r, "kernel_binding", None)
+        or getattr(op0, "owner_schedule", None) != getattr(op_r, "owner_schedule", None)
+        or tuple(getattr(op0, "logical_precision_reqs", ()) or ()) != tuple(getattr(op_r, "logical_precision_reqs", ()) or ())
+        or str(getattr(op0, "coverage", "") or "") != str(getattr(op_r, "coverage", "") or "")
+        or len(req0) != len(req_r)
     ):
+        return False
+    if req0 and tuple(slots0.get(str(r), str(r)) for r in req0) != tuple(eff_req_r.get(str(r), str(r)) for r in req_r):
         return False
     deps0 = tuple(getattr(op0, "deps", ()) or ())
     deps_r = tuple(getattr(op_r, "deps", ()) or ())
-    if deps0 != deps_r and not _values_isomorphic(deps0, deps_r, request_pattern, request_set, request_prefix):
+    if (deps0 != deps_r or slots0 != slots_r) and not _values_isomorphic(
+        deps0, deps_r, pat0, slots0, pfx0, pat_r, slots_r, pfx_r,
+    ):
         return False
     mf0 = tuple(getattr(op0, "matrix_flops", ()) or ())
     mf_r = tuple(getattr(op_r, "matrix_flops", ()) or ())
-    if mf0 != mf_r and not _values_isomorphic(mf0, mf_r, request_pattern, request_set, request_prefix):
+    if (mf0 != mf_r or slots0 != slots_r) and not _values_isomorphic(
+        mf0, mf_r, pat0, slots0, pfx0, pat_r, slots_r, pfx_r,
+    ):
         return False
     raw_m0 = getattr(op0, "metadata", ()) or ()
     raw_mr = getattr(op_r, "metadata", ()) or ()
-    if raw_m0 == raw_mr:
+    if raw_m0 == raw_mr and (not raw_m0 or slots0 == slots_r):
         return True
-    d0 = dict(raw_m0)
-    dr = dict(raw_mr)
-    return _values_isomorphic(d0, dr, request_pattern, request_set, request_prefix)
+    return _values_isomorphic(dict(raw_m0), dict(raw_mr), pat0, slots0, pfx0, pat_r, slots_r, pfx_r)
 
 
 def _graph_signature(
     ops: Sequence[Any],
     request_pattern: re.Pattern | None = None,
-    request_set: frozenset[str] = frozenset(),
+    request_slots: Mapping[str, str] = (),  # type: ignore[assignment]
     request_prefix: str = "",
+    local_rank_slots: Mapping[int, str] | None = None,
 ) -> tuple:
-    return tuple(_op_signature(op, request_pattern, request_set, request_prefix) for op in ops)
+    return tuple(
+        _op_signature(op, request_pattern, request_slots, request_prefix, local_rank_slots)
+        for op in ops
+    )
 
 
-def _request_tokens(graphs: Sequence[Sequence[Any]]) -> tuple[str, ...]:
-    tokens = {str(request) for graph in graphs for op in graph
-              for request in (getattr(op, "requests", ()) or ())}
-    return tuple(sorted(tokens, key=lambda item: (-len(item), item)))
+def _replica_hardware_signature(case: Any, replica: int, placement: Any) -> tuple:
+    """Physical die, datapath capability, and incident link signature for quotient verification."""
+    from mindie_sim.schema.datapath import _arch_capability_key, datapath_for_devices
+
+    parallel = case.runtime.parallel
+    pp = max(1, int(parallel.pp))
+    links = getattr(case.machine, "links", ()) or ()
+    transfer_channels = getattr(case.machine, "transfer_channels", ()) or ()
+    stage_sigs = []
+    rank_to_pos: dict[int, int] = {}
+    for stage in range(pp):
+        ranks = placement.stage_ranks(int(replica), stage)
+        for rk in ranks:
+            if int(rk) not in rank_to_pos:
+                rank_to_pos[int(rk)] = len(rank_to_pos)
+        dies = tuple(placement.die_for_rank(rank) for rank in ranks)
+        stage_rank_set = frozenset(int(d.rank) for d in dies)
+        compute_arch, datapath = datapath_for_devices(
+            dies, links=links, transfer_channels=transfer_channels,
+        )
+        ub_edges = getattr(datapath, "ub_peer_edges", ()) or ()
+        in_stage_ub = sum(1 for src, dst in ub_edges if src in stage_rank_set and dst in stage_rank_set)
+        out_stage_ub = sum(1 for src, dst in ub_edges if src in stage_rank_set and dst not in stage_rank_set)
+        dp_sig = datapath._signature((in_stage_ub, out_stage_ub))
+        arch_sig = (
+            _arch_capability_key(compute_arch),
+            tuple(
+                (rt.name, rt.provides, _freeze_attr(rt.conditions))
+                for rt in compute_arch.runtimes
+            ),
+        )
+        die_sig = tuple(
+            (
+                str(d.sku), d.rates, d.buffers, d.compute_peaks, d.compute_peak_aliases,
+                d.service_modes, d.store_queues, d.work_units, d.resource_units,
+                d.buffer_units, float(d.launch_us), _freeze_attr(d.kernel_invocations),
+                d.memory_access, d.hbm_read_bytes_per_s, d.hbm_write_bytes_per_s,
+                d.hbm_rw_alpha, int(d.simt_ub_carveout_bytes),
+                _freeze_attr(d.subtile_wave), _freeze_attr(d.dispatch_sync),
+                getattr(d.physical_mechanisms, "signature", None),
+            )
+            for d in dies
+        )
+        stage_sigs.append((die_sig, dp_sig, arch_sig))
+    replica_ranks = frozenset(rank_to_pos)
+    link_sigs = []
+    for link in links:
+        members = tuple(int(m) for m in link.members)
+        if not any(m in replica_ranks for m in members):
+            continue
+        is_intra = all(m in replica_ranks for m in members)
+        local_pos = tuple(sorted(rank_to_pos[m] for m in members if m in rank_to_pos))
+        local_eps = tuple(sorted(
+            (rank_to_pos[int(rk)], float(rate))
+            for rk, rate in link.endpoint_rates
+            if int(rk) in rank_to_pos
+        ))
+        link_sigs.append((
+            is_intra,
+            local_pos,
+            len(members),
+            str(link.channel),
+            str(link.protocol),
+            str(link.semantics),
+            str(link.scope),
+            float(link.capacity_bytes_per_ms),
+            link.peak_capacity_bytes_per_ms,
+            float(link.bw_utilization),
+            float(link.latency_us),
+            int(link.switch_hops),
+            float(link.switch_hop_latency_us),
+            link.switch_capacity_bytes_per_ms,
+            link.transaction_bytes,
+            int(link.alignment_bytes),
+            int(link.protocol_overhead_bytes),
+            link.protocol_bands,
+            local_eps,
+        ))
+    link_sigs.sort(key=repr)
+    return (tuple(stage_sigs), tuple(link_sigs))
+
+
+def _cohort_hardware_homogeneous(case: Any, ordered_keys: Sequence[int]) -> bool:
+    """Verify all participating cohort replicas share identical physical service supply."""
+    if len(ordered_keys) <= 1:
+        return True
+    machine = getattr(case, "machine", None)
+    runtime = getattr(case, "runtime", None)
+    if machine is None or runtime is None or not hasattr(machine, "validate_placement"):
+        return True
+    try:
+        placement = machine.validate_placement(runtime.parallel)
+        base_sig = _replica_hardware_signature(case, int(ordered_keys[0]), placement)
+        return all(
+            _replica_hardware_signature(case, int(rep), placement) == base_sig
+            for rep in ordered_keys[1:]
+        )
+    except (ModelingError, IndexError, KeyError):
+        return bool(getattr(machine, "homogeneous", False))
 
 
 def prove_homogeneous_cohort(
@@ -292,13 +483,28 @@ def prove_homogeneous_cohort(
     if any(len(graph) != len(ordered[0]) for graph in ordered[1:]):
         reasons.append("asymmetric_replica_graph")
     elif len(ordered) > 1:
-        request_tokens = _request_tokens(ordered)
-        req_set = frozenset(tok for tok in request_tokens if tok)
-        req_pat = _compile_token_pattern(request_tokens)
-        req_pfx = _common_prefix(request_tokens)
         base_ops = ordered[0]
+        slots0, pat0, pfx0 = _request_slot_map(base_ops)
         for graph in ordered[1:]:
-            if not all(_ops_isomorphic(o0, o_r, req_pat, req_set, req_pfx) for o0, o_r in zip(base_ops, graph)):
+            slots_r, pat_r, pfx_r = _request_slot_map(graph)
+            if len(slots0) != len(slots_r):
+                reasons.append("asymmetric_replica_graph")
+                break
+            meta_slots_r = {**slots0, **slots_r} if slots0 else slots_r
+            if meta_slots_r != slots_r:
+                meta_tokens_r = tuple(meta_slots_r)
+                meta_pat_r = _compile_token_pattern(meta_tokens_r)
+                meta_pfx_r = _common_prefix(meta_tokens_r)
+            else:
+                meta_pat_r, meta_pfx_r = pat_r, pfx_r
+            if not all(
+                _ops_isomorphic(
+                    o0, o_r, pat0, slots0, pfx0,
+                    meta_pat_r, meta_slots_r, meta_pfx_r,
+                    req_slots_r=slots_r,
+                )
+                for o0, o_r in zip(base_ops, graph)
+            ):
                 reasons.append("asymmetric_replica_graph")
                 break
     if selected_implementations is not None:
@@ -313,6 +519,9 @@ def prove_homogeneous_cohort(
     if not template_reused:
         return CohortReuseProof(False, tuple(reasons), replicas=replicas)
     quotient = True
+    if not _cohort_hardware_homogeneous(case, ordered_keys):
+        quotient = False
+        reasons.append("heterogeneous_replica_hardware")
     for op in ordered[0]:
         if getattr(op, "source_boundary", ""):
             quotient = False
@@ -436,15 +645,17 @@ def _rebind_nested_requests(
     return value
 
 
-def _rank_map(case: Any, replica: int, *, topology: Any = None) -> dict[int, int]:
+def _rank_map(
+    case: Any, replica: int, *, template_replica: int = 0, topology: Any = None,
+) -> dict[int, int]:
     from mindie_sim.prediction.topology import Topology
 
     parallel = case.runtime.parallel
     topo = topology if topology is not None else Topology(case.machine, parallel)
     mapping: dict[int, int] = {}
     for stage in range(max(1, int(parallel.pp))):
-        base = topo.ranks(0, stage)
-        target = topo.ranks(replica, stage)
+        base = topo.ranks(int(template_replica), stage)
+        target = topo.ranks(int(replica), stage)
         mapping.update({int(left): int(right)
                         for left, right in zip(base, target)})
     return mapping
@@ -501,12 +712,25 @@ def rebind_replica_graph(
     request_prefix = _common_prefix(tuple(requests)) if requests else ""
     states = dict(state_bindings or {})
     groups_cache = {} if local_groups_cache is None else local_groups_cache
+    def _rebind_ident(text: str) -> str:
+        out = text
+        if "@r" in out:
+            if rank_map:
+                out = RANK_TOKEN.sub(
+                    lambda match: (
+                        f"@r{rank_map.get(int(match.group(RANK_GROUP)), int(match.group(RANK_GROUP)))}"
+                    ),
+                    out,
+                )
+            else:
+                out = RANK_TOKEN.sub(lambda _match: f"@r{fallback}", out)
+        if request_pattern is not None:
+            out = _rebind_nested_requests(out, request_pattern, requests, request_prefix)
+        return out
+
     rebound = []
     for op in template:
-        op_id = str(getattr(op, "op_id", ""))
-        if "@r" in op_id:
-            op_id = RANK_TOKEN.sub(
-                lambda match: f"@r{rank_map.get(int(match.group(RANK_GROUP)), fallback)}", op_id)
+        op_id = _rebind_ident(str(getattr(op, "op_id", "")))
         raw_meta = getattr(op, "metadata", ()) or ()
         meta_may_have_req = (
             request_pattern is not None
@@ -543,9 +767,7 @@ def rebind_replica_graph(
                 metadata = dict(rebound_meta)
                 meta_changed = True
         deps = tuple(
-            RANK_TOKEN.sub(
-                lambda match: f"@r{rank_map.get(int(match.group(RANK_GROUP)), fallback)}",
-                str(dep)) if "@r" in str(dep) else str(dep)
+            _rebind_ident(str(dep))
             for dep in (getattr(op, "deps", ()) or ()))
         new_meta = (
             tuple(sorted(metadata.items(), key=lambda pair: pair[0]))
@@ -595,41 +817,50 @@ def prepare_cohort_graphs(
     template_rep = min(graphs)
     request_ids = {replica: _request_ids(graph)
                    for replica, graph in graphs.items()}
-    rank_maps = {replica: _rank_map(case, replica, topology=shared_topology)
-                 for replica in graphs}
+    rank_maps = {
+        replica: _rank_map(
+            case, replica, template_replica=template_rep, topology=shared_topology,
+        )
+        for replica in graphs
+    }
     ranks_by_replica = {
         replica: (min(mapping.values()) if mapping else int(replica))
         for replica, mapping in rank_maps.items()
     }
     cache_stats = {}
     if graph_cache is not None:
-        all_tokens = _request_tokens(tuple(graphs.values()))
-        req_set = frozenset(tok for tok in all_tokens if tok)
-        req_pat = _compile_token_pattern(all_tokens)
+        tpl_slots, tpl_pat, tpl_pfx = _request_slot_map(graphs[template_rep])
+        tpl_rank_slots = {
+            int(rk): str(idx)
+            for idx, rk in enumerate(sorted(rank_maps[template_rep]))
+        }
         key = semantic_graph_key(
             case, None, scope="cohort",
             selection_signature=(proof.reasons, tuple(sorted(graphs)),
                                  _graph_signature(
-                                     graphs[template_rep], req_pat, req_set)))
+                                     graphs[template_rep], tpl_pat, tpl_slots, tpl_pfx,
+                                     local_rank_slots=tpl_rank_slots)))
         template = graph_cache.get_or_build(key, lambda: graphs[template_rep])
         cache_stats = graph_cache.stats()
     else:
         template = graphs[template_rep]
-    rebound = {template_rep: tuple(template)}
-    template_req_pfx = _common_prefix(request_ids[template_rep])
+    template_req_ids = _request_ids(template)
+    template_req_pfx = _common_prefix(template_req_ids)
     meta_prefix_cache: dict[int, bool] | None = None
     if template_req_pfx:
         meta_prefix_cache = {}
         for op in template:
             raw_meta = getattr(op, "metadata", ()) or ()
             _scan_meta_prefix(raw_meta, template_req_pfx, meta_prefix_cache)
+    rebound: dict[int, tuple[Any, ...]] = {}
     for replica in sorted(graphs):
-        if replica == template_rep:
-            continue
         replica_requests = request_ids[replica]
+        if replica == template_rep and replica_requests == template_req_ids:
+            rebound[replica] = tuple(template)
+            continue
         request_binding = (
-            dict(zip(request_ids[template_rep], replica_requests))
-            if len(request_ids[template_rep]) == len(replica_requests)
+            dict(zip(template_req_ids, replica_requests))
+            if len(template_req_ids) == len(replica_requests)
             else {})
         rebound[replica] = rebind_replica_graph(
             template, replica=replica, placement=rank_maps[replica],

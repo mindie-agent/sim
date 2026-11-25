@@ -608,48 +608,127 @@ def build_submission_summary(execution) -> dict[str, Any]:
     }
 
 
+def _bind_eager_ag_ready(engine, barrier_entry, ready_futures, local_ranks) -> None:
+    targets = tuple(ready_futures[rk] for rk in local_ranks if rk in ready_futures)
+    if not targets:
+        return
+
+    def _resolve_local(_ev, _targets=targets) -> None:
+        for fut in _targets:
+            if fut.time is None:
+                engine.resolve(fut)
+
+    engine.on_complete(barrier_entry, _resolve_local, native_hook=True)
+
+
 def _submit_eager_counts_allgather(
-    execution, op, replica: int, stage_dies, *, ep_size: int, dtype_bytes: int,
+    execution, op, replica: int, stage_dies, *, num_experts: int, dtype_bytes: int,
     name: str, barrier_entry, ids: dict, owner: str,
 ) -> tuple[dict[int, Any], str]:
-    """Resolve current-dispatch counts AllGather op or lower it on the EP group."""
+    """Resolve current-dispatch counts AllGather op or lower it once per EP group."""
     layer_prefix = op.op_id.rsplit(".", 1)[0] if "." in str(op.op_id) else ""
     expected_hist = f"{layer_prefix}.moe_histogram_gather" if layer_prefix else ""
     if expected_hist and expected_hist in ids:
         ev = ids[expected_hist]
         return {int(d.rank): ev for d in stage_dies}, "op"
     from ..collectives.protocol import lower_collective, submit_lowered_collective
+
     topo = execution.topology
-    stage_ranks = tuple(int(d.rank) for d in stage_dies)
-    ep_groups = topo.groups("ep", replica, op.stage, metadata=_metadata_dict(op))
-    ep_ranks = next(
-        (grp for grp in ep_groups if set(stage_ranks).intersection(grp)),
-        stage_ranks,
-    )
-    if len(ep_ranks) <= 1:
-        return {}, "none"
-    try:
-        lowered = lower_collective(
-            "allgather", ep_ranks, topo, float(ep_size * dtype_bytes),
-            communicator_id=f"{name}:counts_ag",
-        )
-    except ModelingError:
-        return {}, "fallback"
     engine = execution.engine
-    missing_res = [
-        res for res in topo.resources()
-        if res.name not in engine.resources and any(
-            res.name in tr.resources
-            for ph in lowered.phases for tr in ph.transfers
-        )
-    ]
-    if missing_res:
-        engine.extend(missing_res)
-    ready_map = {rank: barrier_entry for rank in ep_ranks}
-    done_map = submit_lowered_collective(
-        engine, f"{name}:eager_split:counts_ag", lowered, ready_map, owner=owner
+    stage_ranks = tuple(int(d.rank) for d in stage_dies)
+    stage_rank_set = set(stage_ranks)
+    ep_groups = topo.groups("ep", replica, op.stage, metadata=_metadata_dict(op))
+    intersecting = tuple(
+        tuple(int(r) for r in grp)
+        for grp in ep_groups
+        if stage_rank_set.intersection(grp)
     )
-    return {int(d.rank): done_map[int(d.rank)] for d in stage_dies if int(d.rank) in done_map}, "lowered_collective"
+    if not intersecting:
+        intersecting = (stage_ranks,)
+    payload_bytes = float(int(num_experts) * int(dtype_bytes))
+    ag_table = getattr(execution, "_eager_split_counts_ag", None)
+    if ag_table is None:
+        ag_table = {}
+        execution._eager_split_counts_ag = ag_table
+    occ_table = getattr(execution, "_eager_split_counts_occ", None)
+    if occ_table is None:
+        occ_table = {}
+        execution._eager_split_counts_occ = occ_table
+    ag_by_rank: dict[int, Any] = {}
+    saw_lowered = False
+    saw_fallback = False
+    for ep_ranks in intersecting:
+        if len(ep_ranks) <= 1:
+            continue
+        local_ranks = tuple(rk for rk in stage_ranks if rk in ep_ranks)
+        occ_key = (int(replica), ep_ranks, str(op.op_id), int(op.stage))
+        occ = occ_table.get(occ_key, 0)
+        occ_table[occ_key] = occ + 1
+        shared_key = (ep_ranks, str(op.op_id), int(op.stage), occ)
+        entry = ag_table.get(shared_key)
+        if entry is None:
+            try:
+                lowered = lower_collective(
+                    "allgather", ep_ranks, topo, payload_bytes,
+                    communicator_id=f"{name}:counts_ag:g{ep_ranks[0]}",
+                )
+            except ModelingError:
+                saw_fallback = True
+                continue
+            missing_res = [
+                res for res in topo.resources()
+                if res.name not in engine.resources and any(
+                    res.name in tr.resources
+                    for ph in lowered.phases for tr in ph.transfers
+                )
+            ]
+            if missing_res:
+                engine.extend(missing_res)
+            cross_replica = not set(ep_ranks).issubset(stage_rank_set)
+            dedup_reps = getattr(execution, "_symmetric_dedup_replicas", ())
+            if cross_replica and execution._collectives is not None and not dedup_reps:
+                ready_futures = {
+                    rk: engine.future(f"{name}:eager_split:counts_ag_ready:d{rk}")
+                    for rk in ep_ranks
+                }
+                done_map = submit_lowered_collective(
+                    engine, f"{name}:eager_split:counts_ag:g{ep_ranks[0]}",
+                    lowered, ready_futures, owner=owner,
+                )
+                _bind_eager_ag_ready(engine, barrier_entry, ready_futures, local_ranks)
+                entry = (ready_futures, done_map)
+            else:
+                ready_map = {rk: barrier_entry for rk in ep_ranks}
+                done_map = submit_lowered_collective(
+                    engine, f"{name}:eager_split:counts_ag:g{ep_ranks[0]}",
+                    lowered, ready_map, owner=owner,
+                )
+                entry = (None, done_map)
+            ag_table[shared_key] = entry
+            target_ranks = ep_ranks if dedup_reps else local_ranks
+            for rk in target_ranks:
+                if rk in done_map:
+                    ag_by_rank[rk] = done_map[rk]
+        else:
+            ready_futures, done_map = entry
+            if ready_futures is not None:
+                _bind_eager_ag_ready(engine, barrier_entry, ready_futures, local_ranks)
+                for rk in local_ranks:
+                    if rk in done_map:
+                        ag_by_rank[rk] = done_map[rk]
+            else:
+                for rk in local_ranks:
+                    if rk in done_map:
+                        ag_by_rank[rk] = engine.submit(
+                            f"{name}:eager_split:counts_ag_join:d{rk}",
+                            after=(barrier_entry, done_map[rk]), owner=owner,
+                        )
+        saw_lowered = True
+    if saw_lowered:
+        return ag_by_rank, "lowered_collective"
+    if saw_fallback:
+        return {}, "fallback"
+    return {}, "none"
 
 
 def schedule_eager_moe_split_barrier(
@@ -695,7 +774,7 @@ def schedule_eager_moe_split_barrier(
     )
     ag_by_rank, ag_mode = _submit_eager_counts_allgather(
         execution, op, replica, stage_dies,
-        ep_size=ep_size, dtype_bytes=dtype_bytes,
+        num_experts=num_experts, dtype_bytes=dtype_bytes,
         name=name, barrier_entry=hist_entry, ids=ids, owner=owner,
     )
     indep_events = (
@@ -703,45 +782,54 @@ def schedule_eager_moe_split_barrier(
         if spec.requires_explicit_device_sync
         else ()
     )
-    results = []
-    all_d2h_resources: list[str] = []
-    for die in stage_dies:
-        die_rank = int(die.rank)
-        res = EagerSplitBarrier.submit(
-            engine,
-            machine,
-            die,
-            spec,
-            barrier_entry,
-            name=f"{name}:eager_split:d{die_rank}",
-            namespace=execution.namespace,
-            allgather_event=ag_by_rank.get(die_rank),
-            independent_device_events=indep_events,
-            owner=owner,
-        )
-        results.append(res)
-        deps.append(res.dispatch_ready)
-        for rname in res.d2h_resources:
-            if rname not in all_d2h_resources:
-                all_d2h_resources.append(rname)
-    total_in = sum(r.input_splits_bytes for r in results)
-    total_out = sum(r.output_splits_bytes for r in results)
-    execution.eager_split_barriers.append({
-        "op_id": op.op_id,
-        "replica": replica,
-        "stage": op.stage,
-        "ep_size": ep_size,
-        "num_local_experts": num_local_experts,
-        "participating_ranks": [int(d.rank) for d in stage_dies],
-        "input_splits_bytes": results[0].input_splits_bytes,
-        "output_splits_bytes": results[0].output_splits_bytes,
-        "total_input_splits_bytes": total_in,
-        "total_output_splits_bytes": total_out,
-        "total_d2h_bytes": total_in + total_out,
-        "counts_allgather_mode": ag_mode,
-        "explicit_device_sync": any(r.explicit_device_sync is not None for r in results),
-        "d2h_resources": all_d2h_resources,
-    })
+    dedup_reps = getattr(execution, "_symmetric_dedup_replicas", ())
+    target_replicas = dedup_reps if (dedup_reps and replica in dedup_reps) else (replica,)
+    for rep_i in target_replicas:
+        rep_dies = stage_dies if rep_i == replica else execution.stage_dies.get((rep_i, op.stage), ())
+        if not rep_dies:
+            continue
+        rep_owner = owner if rep_i == replica else f"replica:{rep_i}"
+        rep_name = name if rep_i == replica else name.replace(f"r{replica}:", f"r{rep_i}:", 1)
+        results = []
+        all_d2h_resources: list[str] = []
+        for die in rep_dies:
+            die_rank = int(die.rank)
+            res = EagerSplitBarrier.submit(
+                engine,
+                machine,
+                die,
+                spec,
+                barrier_entry,
+                name=f"{rep_name}:eager_split:d{die_rank}",
+                namespace=execution.namespace,
+                allgather_event=ag_by_rank.get(die_rank),
+                independent_device_events=indep_events if rep_i == replica else (),
+                owner=rep_owner,
+            )
+            results.append(res)
+            if rep_i == replica:
+                deps.append(res.dispatch_ready)
+            for rname in res.d2h_resources:
+                if rname not in all_d2h_resources:
+                    all_d2h_resources.append(rname)
+        total_in = sum(r.input_splits_bytes for r in results)
+        total_out = sum(r.output_splits_bytes for r in results)
+        execution.eager_split_barriers.append({
+            "op_id": op.op_id,
+            "replica": rep_i,
+            "stage": op.stage,
+            "ep_size": ep_size,
+            "num_local_experts": num_local_experts,
+            "participating_ranks": [int(d.rank) for d in rep_dies],
+            "input_splits_bytes": results[0].input_splits_bytes,
+            "output_splits_bytes": results[0].output_splits_bytes,
+            "total_input_splits_bytes": total_in,
+            "total_output_splits_bytes": total_out,
+            "total_d2h_bytes": total_in + total_out,
+            "counts_allgather_mode": ag_mode,
+            "explicit_device_sync": any(r.explicit_device_sync is not None for r in results),
+            "d2h_resources": all_d2h_resources,
+        })
     return barrier_entry
 
 
@@ -918,6 +1006,11 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         self.streams: dict[tuple[int, int, str], Event] = {}
         self.hosts: dict[tuple[int, int], Event] = {}
         self.submission_counts = {"eager_invocations": 0, "graph_replays": 0}
+        self._stage_graph_replays: dict[tuple[int, int], int] = {}
+        self._eager_split_counts_ag: dict[tuple, tuple[dict[int, Any] | None, dict[int, Any]]] = {}
+        self._eager_split_counts_occ: dict[tuple, int] = {}
+        self._symmetric_dedup_replicas: tuple[int, ...] = ()
+        self._op_accounting: dict[tuple[int, str], tuple[str, float, float, float, float]] = {}
         self.prepared = {}
         self.schedules = {}
 
@@ -1110,6 +1203,12 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         self.ledger, self.cost = ledger, cost
         self._offload_memory = None
         self.recipes_used = {}
+        self.work = dict.fromkeys(("flops", "vector_ops", "hbm_bytes", "link_bytes"), 0.0)
+        self._stage_graph_replays.clear()
+        self._eager_split_counts_ag.clear()
+        self._eager_split_counts_occ.clear()
+        self._symmetric_dedup_replicas = ()
+        self._op_accounting.clear()
         for cache in (self.streams, self.hosts, self.prepared, self.schedules,
                       self._prepare_cache, self._program_cache, self._lazy_op_cache,
                       self._lazy_stage_id_caches, self.fragment_conductors):
@@ -1348,6 +1447,17 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
             entry["ready"] = boundary
         return complete
 
+    def _add_symmetric_group(self, works, release_ms, *, external_inputs=None,
+                             requires_peer_collectives=False):
+        self._symmetric_dedup_replicas = tuple(sorted(int(r) for r in works))
+        try:
+            return super()._add_symmetric_group(
+                works, release_ms, external_inputs=external_inputs,
+                requires_peer_collectives=requires_peer_collectives,
+            )
+        finally:
+            self._symmetric_dedup_replicas = ()
+
     def add(self, work: IterationWork, replica: int, release_ms: float, *,
             external_inputs=None, emitted_tokens=None,
             memory_bindings=None, state_accesses=None) -> ScheduledIteration:
@@ -1446,6 +1556,13 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
             ready = kernel_groups.phase_ready(op, ready, name)
             recipe_name = op.recipe or type(recipe).__name__
             self.recipes_used[recipe_name] = self.recipes_used.get(recipe_name, 0) + 1
+            self._op_accounting[(int(replica), str(op.op_id))] = (
+                recipe_name,
+                float(op.flops),
+                float(op.vector_ops),
+                float(op.hbm_bytes),
+                float(op.link_bytes),
+            )
             cross_dp = collective_requires_cohort(op, self.topology)
             if cross_dp and getattr(recipe, "algorithm", None) and self._collectives is None:
                 raise ModelingError("joint_collective_requires_complete_cohort")
@@ -1544,12 +1661,14 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
             if captured and scope == "piecewise" and self.submission.piecewise_sync_ms > 0.0:
                 if deps:
                     host_deps = tuple(deps) + host_deps
-                if self.submission_counts["graph_replays"] > 0:
+                if self._stage_graph_replays.get(stage_key, 0) > 0:
                     duration += float(self.submission.piecewise_sync_ms)
             host_launch = engine.submit(name + ":submit", {names["host"]: duration},
                                         after=host_deps, owner=owner)
             self.hosts[stage_key] = host_launch
             self.submission_counts["graph_replays" if captured else "eager_invocations"] += 1
+            if captured:
+                self._stage_graph_replays[stage_key] = self._stage_graph_replays.get(stage_key, 0) + 1
             start = engine.start_boundary(host_launch, name + ":host_submit")
             if captured:
                 graph_launch[capture_key] = (host_launch, start)
