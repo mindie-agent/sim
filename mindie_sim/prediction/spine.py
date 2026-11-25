@@ -22,7 +22,9 @@ from functools import lru_cache
 from typing import Any
 
 from mindie_sim.feature_mechanisms import (
+    RuntimeStackProfile,
     SoftwareStackRegistry,
+    SoftwareStackSpec,
     default_stack_registry,
 )
 from mindie_sim.schema.case import Case
@@ -78,6 +80,26 @@ MS_PER_SECOND = 1000.0
 NS_PER_MS = 1_000_000.0
 DEFAULT_PD_TOTAL_DIES = 16
 DEFAULT_OPTIMIZE_TRIALS = 16
+_KDA_DECODE_MAX_QUERY_TOKENS = 8
+_GDN_A5_MAX_QUERY_TOKENS = 8
+_GDN_SPECULATIVE_MIN_QUERY_TOKENS = 2
+_DECODE_ONLY_KDA_RECIPES = frozenset({
+    "vllm_ascend_recurrent_kda_arch35",
+    "vllm_ascend_recurrent_kda_arch22",
+    "vllm_ascend_fla_kda_recurrent",
+})
+_DECODE_ONLY_GDN_RECIPES = frozenset({
+    "vllm_ascend_gdn_decode",
+})
+_STACK_OWNED_RECURRENT_SELECTORS = frozenset({
+    "kda",
+    "kda_input_projection",
+    "gdn_decode",
+    "gdn_prefill",
+})
+_PLAN_METADATA_OPTION_KEYS: Mapping[str, frozenset[str]] = {
+    "mla_prolog": frozenset({"preprocess_mode"}),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,6 +198,92 @@ def _map_executable_lowering_passes(
     return tuple(out)
 
 
+def _leaf_binding(recipe_id: str, opts: Mapping[str, Any]) -> str | dict[str, Any]:
+    return {"implementation": recipe_id, "options": dict(opts)} if opts else recipe_id
+
+
+def _merge_leaf_binding(
+    leaf: Any,
+    recipe_id: str,
+    valid_opts: Mapping[str, Any],
+) -> Any:
+    if leaf == recipe_id:
+        return _leaf_binding(recipe_id, valid_opts)
+    if isinstance(leaf, Mapping) and leaf.get("implementation") == recipe_id:
+        merged_opts = dict(leaf.get("options") or {})
+        merged_opts.update(valid_opts)
+        return _leaf_binding(recipe_id, merged_opts)
+    return leaf
+
+
+def _merge_binding_into_policy(
+    existing: Mapping[str, Any],
+    recipe_id: str,
+    valid_opts: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Preserve existing phase-policy ``cases`` and ``otherwise`` while merging stack-plan options."""
+    policy = deepcopy(dict(existing))
+    raw_cases = policy.get("cases")
+    if isinstance(raw_cases, list):
+        updated_cases = []
+        for entry in raw_cases:
+            if not isinstance(entry, Mapping):
+                updated_cases.append(entry)
+                continue
+            item = dict(entry)
+            item["binding"] = _merge_leaf_binding(item.get("binding"), recipe_id, valid_opts)
+            updated_cases.append(item)
+        policy["cases"] = updated_cases
+    if "otherwise" in policy:
+        policy["otherwise"] = _merge_leaf_binding(policy["otherwise"], recipe_id, valid_opts)
+    return policy
+
+
+def _default_phase_policy_binding(
+    recipe_id: str,
+    valid_opts: Mapping[str, Any],
+) -> str | dict[str, Any]:
+    """Preserve decode-only phase policies when injecting onto a clean ``Case``."""
+    leaf = _leaf_binding(recipe_id, valid_opts)
+    if recipe_id in _DECODE_ONLY_KDA_RECIPES:
+        return {
+            "cases": [{
+                "domain": {
+                    "phases": ["decode"],
+                    "max_query_tokens": {"max": _KDA_DECODE_MAX_QUERY_TOKENS},
+                },
+                "binding": leaf,
+            }],
+            "otherwise": "analytical",
+        }
+    if recipe_id in _DECODE_ONLY_GDN_RECIPES:
+        is_arch35 = valid_opts.get("recurrent_implementation") == "arch35_fp32"
+        spec_domain: dict[str, Any] = {
+            "phases": ["decode"],
+            "min_query_tokens": {"min": _GDN_SPECULATIVE_MIN_QUERY_TOKENS},
+        }
+        if is_arch35:
+            spec_domain["max_query_tokens"] = {"max": _GDN_A5_MAX_QUERY_TOKENS}
+        return {
+            "cases": [
+                {
+                    "domain": {
+                        "phases": ["decode"],
+                        "min_query_tokens": {"min": 1},
+                        "max_query_tokens": {"max": 1},
+                    },
+                    "binding": leaf,
+                },
+                {
+                    "domain": spec_domain,
+                    "binding": leaf,
+                },
+            ],
+            "otherwise": "analytical",
+        }
+    return leaf
+
+
 def _build_injected_base(
     case: Case,
     request: LoweringRequest,
@@ -211,31 +319,61 @@ def _build_injected_base(
             continue
         if selector in impl.blocks or selector in impl.operators:
             canon_selector = selector
-        elif impl.blocks:
-            canon_selector = impl.blocks[0]
-        elif impl.operators:
-            canon_selector = impl.operators[0]
         else:
-            continue
+            raise ModelingError(
+                f"spine_lowering_selector_mismatch:{selector}:{recipe_id}:"
+                f"allowed={sorted((*impl.blocks, *impl.operators))}"
+            )
         selector_remap[selector] = canon_selector
-        filtered_opts = {k: v for k, v in opts_dict.items() if k in impl.options}
+        plan_meta_keys = _PLAN_METADATA_OPTION_KEYS.get(canon_selector, frozenset())
+        allowed_opt_keys = frozenset(impl.options)
+        unknown_opts = sorted(
+            k for k in opts_dict if k not in allowed_opt_keys and k not in plan_meta_keys
+        )
+        if unknown_opts:
+            raise ModelingError(
+                f"spine_lowering_option_unknown:{canon_selector}:{recipe_id}:{unknown_opts}"
+            )
+        valid_opts = {k: v for k, v in opts_dict.items() if k in allowed_opt_keys}
         existing = lowerings.get(canon_selector)
         if isinstance(existing, Mapping) and "cases" in existing:
-            continue
-        if isinstance(existing, Mapping) and existing.get("implementation") == recipe_id:
+            lowerings[canon_selector] = _merge_binding_into_policy(
+                existing, recipe_id, valid_opts,
+            )
+        elif isinstance(existing, Mapping) and existing.get("implementation") == recipe_id:
             merged_opts = dict(existing.get("options") or {})
-            merged_opts.update(filtered_opts)
-            lowerings[canon_selector] = (
-                {"implementation": recipe_id, "options": merged_opts}
-                if merged_opts else recipe_id
+            merged_opts.update(valid_opts)
+            lowerings[canon_selector] = _default_phase_policy_binding(
+                recipe_id, merged_opts,
             )
         else:
-            lowerings[canon_selector] = (
-                {"implementation": recipe_id, "options": filtered_opts}
-                if filtered_opts else recipe_id
+            lowerings[canon_selector] = _default_phase_policy_binding(
+                recipe_id, valid_opts,
             )
+    bound_selectors = set(selector_remap.values())
+    existing_origins = meta.get(RECIPE_BINDING_ORIGINS_KEY)
+    low_origins = (
+        existing_origins.get("lowerings")
+        if isinstance(existing_origins, Mapping)
+        and isinstance(existing_origins.get("lowerings"), Mapping)
+        else {}
+    )
+    for rec_sel in _STACK_OWNED_RECURRENT_SELECTORS:
+        if rec_sel not in bound_selectors and low_origins.get(rec_sel) != "caller":
+            lowerings.pop(rec_sel, None)
+    if (
+        "kda" not in bound_selectors
+        and low_origins.get("kda") != "caller"
+        and any(str(p.attention).lower() == "kda" for p in case.model.layer_plans)
+    ):
+        analytical = list(meta.get("analytical_implementations") or ())
+        if "kda" not in analytical:
+            analytical.append("kda")
+        meta["analytical_implementations"] = tuple(analytical)
     if lowerings:
         kernels["lowerings"] = lowerings
+    elif "lowerings" in kernels:
+        kernels["lowerings"] = {}
     for scope_key, role_key, layout_name in stack_lowering_plan.tensor_layouts:
         layouts[f"{scope_key}.{role_key}" if scope_key else role_key] = layout_name
 
@@ -303,6 +441,41 @@ def _build_injected_base(
         runtime_quant_plan=runtime_quant_plan,
         stack_lowering_plan=stack_lowering_plan,
     )
+
+
+def _bound_stack_id_for_case(
+    case: Case,
+    *,
+    scenario_contract: ScenarioContract | None = None,
+    runtime_quant_plan: RuntimeQuantPlan | None = None,
+    stack_lowering_plan: StackLoweringPlan | None = None,
+) -> str | None:
+    """Read already-bound stack identity without importing ``mindie_sim.stacks`` (AG010-clean)."""
+    for source in (
+        scenario_contract,
+        stack_lowering_plan,
+        runtime_quant_plan,
+        getattr(case, "scenario", None),
+        getattr(case, "scenario_contract", None),
+        getattr(case, "stack_lowering_plan", None),
+        getattr(case, "runtime_quant_plan", None),
+    ):
+        sid = str(getattr(source, "stack_id", "") or "").strip() if source is not None else ""
+        if sid:
+            return sid
+    meta = dict(case.runtime.metadata)
+    single_spine = meta.get("single_spine")
+    feature_track = meta.get("feature_track_report")
+    for raw in (
+        meta.get("stack_id"),
+        meta.get("runtime_stack"),
+        single_spine.get("stack_id") if isinstance(single_spine, Mapping) else None,
+        feature_track.get("stack") if isinstance(feature_track, Mapping) else None,
+    ):
+        sid = str(raw or "").strip()
+        if sid:
+            return sid
+    return None
 
 
 def _step_seam_metadata(
@@ -802,6 +975,31 @@ class PredictionSpine:
             **seam_meta,
         )
 
+    def _ladder_spine_for_stack(self, stack_id: str) -> PredictionSpine:
+        """Return a call-scoped spine supporting neutral ``ideal-target`` without mutating ``self.stacks``."""
+        key = stack_id.strip().lower()
+        if key in self.stacks.list_stacks() or key != "ideal-target":
+            return self
+        specs = [self.stacks.get(name) for name in self.stacks.list_stacks()]
+        specs.append(SoftwareStackSpec(
+            name="ideal-target",
+            repository="ideal-target",
+            description="Hardware-neutral ideal-target stack profile (zero vendor shipping bindings)",
+            profile=RuntimeStackProfile(
+                name="ideal-target",
+                repository="ideal-target",
+                description="Hardware-neutral ideal-target stack profile (zero vendor shipping bindings)",
+                bindings=(),
+            ),
+            default_track="target",
+            decode_capture_mode="none",
+        ))
+        return PredictionSpine(
+            stacks=SoftwareStackRegistry(specs),
+            rewrite=self.rewrite,
+            families=self.families,
+        )
+
     def optimize_ladder(
         self,
         case: Case,
@@ -811,21 +1009,52 @@ class PredictionSpine:
         replay: ReplayOptions = ReplayOptions(),
         primitives: Any = None,
         primitive_table: Any = None,
-        stack_id: str = "cann93_va_main",
+        stack_id: str | None = None,
+        scenario_contract: ScenarioContract | None = None,
+        runtime_quant_plan: RuntimeQuantPlan | None = None,
+        stack_lowering_plan: StackLoweringPlan | None = None,
         max_trials: int = DEFAULT_OPTIMIZE_TRIALS,
         allow_unbound_formula: bool = False,
     ) -> Any:
         """Run the certified 5-level primal-dual optimization ladder on ``runtime.Engine``."""
         from mindie_sim.optimization.ladder import solve_five_level_ladder
 
+        eff_stack_id = (
+            str(stack_id).strip()
+            if stack_id is not None and str(stack_id).strip()
+            else _bound_stack_id_for_case(
+                case,
+                scenario_contract=scenario_contract,
+                runtime_quant_plan=runtime_quant_plan,
+                stack_lowering_plan=stack_lowering_plan,
+            )
+        )
+        if not eff_stack_id:
+            raise ModelingError("spine_optimize_ladder_stack_id_required")
+
+        eff_case = case
+        eff_lowering = stack_lowering_plan or (
+            scenario_contract.lowering_plan if scenario_contract is not None else None
+        )
+        if eff_lowering is not None:
+            eff_case = _build_injected_base(
+                case,
+                LoweringRequest(step=request),
+                scenario_contract=scenario_contract,
+                runtime_quant_plan=runtime_quant_plan or (
+                    scenario_contract.quant_plan if scenario_contract is not None else None
+                ),
+                stack_lowering_plan=eff_lowering,
+            ).case
+
         return solve_five_level_ladder(
-            case,
+            eff_case,
             request,
-            spine=self,
+            spine=self._ladder_spine_for_stack(eff_stack_id),
             replay=replay,
             primitives=primitives,
             primitive_table=primitive_table,
-            stack_id=stack_id,
+            stack_id=eff_stack_id,
             max_trials=max_trials,
             allow_unbound_formula=allow_unbound_formula,
         )
@@ -839,6 +1068,7 @@ class PredictionSpine:
         replay: ReplayOptions = ReplayOptions(),
         primitives: Any = None,
         primitive_table: Any = None,
+        stack_id: str | None = None,
     ) -> ThreeTierEvaluation:
         """Evaluate ``unmerge``, ``mainline``, and constructive ``should_achieve`` via primal-dual ladder."""
         report = self.optimize_ladder(
@@ -847,6 +1077,7 @@ class PredictionSpine:
             replay=replay,
             primitives=primitives,
             primitive_table=primitive_table,
+            stack_id=stack_id,
         )
         unmerge_eval = report.unmerge_eval
         mainline_eval = report.mainline_eval

@@ -6,9 +6,13 @@
 [Timeouts & Locks] No blocking operations or locks.
 [Side-Effect Policy] Build descriptors without mutating operators or metadata.
 """
+from collections.abc import Mapping
+from dataclasses import replace
 import math
+from typing import Any
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.operators import OpSpec, TensorPrecisionABI
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
 
 from mindie_sim.prediction.program.implementation_audit import _audit_outputs
@@ -79,7 +83,6 @@ def typed_value(*, producer, dtype, shape, output, role, source, quant="",
     logical_bytes = None
     storage_bytes = None
     try:
-        from mindie_sim.schema.common import dtype_bytes
         logical_bytes = float(math.prod(logical) * dtype_bytes(dtype))
         storage_bytes = float(math.prod(physical) * dtype_bytes(dtype))
     except (KeyError, ValueError):
@@ -133,6 +136,12 @@ def typed_roles(source):
         if record not in bucket:
             bucket.append(record)
 
+    primary_produced = produced_values(source) if hasattr(source, "op_id") else ()
+    primary_shape = (
+        primary_produced[0]["logical_shape"]
+        if primary_produced else getattr(source, "local_shape", None)
+    )
+
     for key, value in metadata.items():
         if not isinstance(value, str) or not value or key == "dtype":
             continue
@@ -161,33 +170,46 @@ def typed_roles(source):
         if key == "activation_scale_format":
             shape = metadata.get("activation_scale_shape")
         elif key in {"output_format", "dtype"} and hasattr(source, "local_shape"):
-            if hasattr(source, "op_id"):
-                produced = produced_values(source)
-                if produced:
-                    value = produced[0]["dtype"]
-                    shape = produced[0]["logical_shape"]
-                else:
-                    shape = getattr(source, "local_shape", None)
+            if primary_produced:
+                value = primary_produced[0]["dtype"]
+                shape = primary_shape
             else:
                 shape = getattr(source, "local_shape", None)
         add(role, key, value, shape)
-    if hasattr(source, "dtype") and source.dtype:
-        add("output", "output_format", metadata.get("output_format") or source.dtype,
-            getattr(source, "local_shape", None))
+    abi = getattr(source, "precision_abi", None)
+    abi_fields = (
+        ("input", "precision_abi.input_dtype", abi.input_dtype, None),
+        ("weight", "precision_abi.weight_dtype", abi.weight_dtype, None),
+        ("output", "precision_abi.output_dtype", abi.output_dtype, primary_shape),
+        ("accumulator", "precision_abi.compute_dtype", abi.compute_dtype, None),
+        ("accumulator", "precision_abi.accum_dtype", abi.accum_dtype, None),
+        ("scale", "precision_abi.weight_scale_dtype", abi.weight_scale_dtype, None),
+        ("scale", "precision_abi.act_scale_dtype", abi.act_scale_dtype, None),
+        ("parameter", "precision_abi.weight_offset_dtype", abi.weight_offset_dtype, None),
+    ) if isinstance(abi, TensorPrecisionABI) else ()
+    for role, field, value, shape in abi_fields:
+        add(role, field, value, shape)
+    abi_output = abi.output_dtype if isinstance(abi, TensorPrecisionABI) else ""
+    abi_scale = abi.act_scale_dtype if isinstance(abi, TensorPrecisionABI) else ""
+    if hasattr(source, "dtype") and (abi_output or source.dtype):
+        add("output", "output_format",
+            abi_output or metadata.get("output_format") or source.dtype,
+            primary_shape)
     for name in getattr(source, "returns", ()) or ():
         if name == "activation_scales":
             add("scale", "returns.activation_scales",
-                metadata.get("activation_scale_format") or "fp32",
+                metadata.get("activation_scale_format") or abi_scale or "fp32",
                 metadata.get("activation_scale_shape") or
                 ((source.local_shape[0], 1) if getattr(source, "local_shape", ()) else None))
         elif name == "rstd":
             add("auxiliary", "returns.rstd", "fp32")
         elif name:
-            produced = next((value for value in produced_values(source)
+            produced = next((value for value in primary_produced
                              if value.get("output") == name), None)
             add("output", f"returns.{name}",
-                (produced or {}).get("dtype") or metadata.get(f"{name}_dtype") or
-                (metadata.get("output_format") or getattr(source, "dtype", "")),
+                (produced or {}).get("dtype") or metadata.get(f"{name}_dtype")
+                or metadata.get(f"{name}_format")
+                or (abi_output or metadata.get("output_format") or getattr(source, "dtype", "")),
                 (produced or {}).get("logical_shape"))
     return {role: tuple(records) for role, records in roles.items()}
 
@@ -339,6 +361,65 @@ def _normalize_output(value, op, materialized, *, native=False):
     )
 
 
+def _verified_precision_abi(op: OpSpec, metadata: Mapping[str, Any]) -> TensorPrecisionABI | None:
+    abi = getattr(op, "precision_abi", None)
+    if not isinstance(abi, TensorPrecisionABI):
+        return None
+    declared_sig = metadata.get("precision_abi_signature")
+    if isinstance(declared_sig, str) and declared_sig and declared_sig != abi.abi_signature:
+        raise ModelingError(f"typed_output_precision_abi_signature_drift:{op.op_id}")
+    return abi
+
+
+def _resolve_primary_dtype(
+    op: OpSpec, metadata: Mapping[str, Any], abi: TensorPrecisionABI | None,
+) -> str:
+    meta_out = str(metadata.get("output_format") or metadata.get("output_dtype") or "").strip()
+    abi_out = str(abi.output_dtype).strip() if abi is not None and abi.output_dtype else ""
+    if abi_out and meta_out and abi_out.lower() != meta_out.lower():
+        raise ModelingError(
+            f"typed_output_precision_abi_mismatch:{op.op_id}:abi={abi_out}:meta={meta_out}"
+        )
+    dtype = abi_out or meta_out or str(op.dtype or "").strip()
+    if not dtype:
+        raise ModelingError(f"typed_output_primary_dtype_unresolved:{op.op_id}")
+    return dtype
+
+
+def _check_explicit_precision_alignment(
+    op: OpSpec,
+    metadata: Mapping[str, Any],
+    abi: TensorPrecisionABI | None,
+    normalized: tuple[dict[str, Any], ...],
+) -> None:
+    if abi is None or not normalized:
+        return
+    abi_out = str(abi.output_dtype or "").strip().lower()
+    if abi_out:
+        primary_name = _primary_output_name(op, metadata)
+        primary = next(
+            (v for v in normalized if v.get("output") == primary_name),
+            normalized[0] if len(normalized) == 1 else None,
+        )
+        if primary is not None:
+            exp_dtype = str(primary.get("dtype") or "").strip().lower()
+            if exp_dtype and exp_dtype != abi_out:
+                raise ModelingError(
+                    f"typed_output_precision_abi_mismatch:{op.op_id}:abi={abi_out}:explicit={exp_dtype}"
+                )
+    abi_scale = str(abi.act_scale_dtype or "").strip().lower()
+    if abi_scale:
+        scale_val = next(
+            (v for v in normalized if v.get("output") == "activation_scales"), None,
+        )
+        if scale_val is not None:
+            exp_scale = str(scale_val.get("dtype") or "").strip().lower()
+            if exp_scale and exp_scale != abi_scale:
+                raise ModelingError(
+                    f"typed_output_scale_abi_mismatch:{op.op_id}:abi={abi_scale}:explicit={exp_scale}"
+                )
+
+
 def produced_values(op, *, materialized=None):
     """All actual values written by ``op``, with logical and storage shapes.
 
@@ -347,21 +428,21 @@ def produced_values(op, *, materialized=None):
     quantized values carry the declared payload format, not the consumer's
     activation format; scales are separate values.
     """
+    metadata = dict(op.metadata)
+    abi = _verified_precision_abi(op, metadata)
     explicit = _audit_outputs(op)
     if explicit:
-        return tuple(_normalize_output(value, op, materialized, native=native)
-                     for value, native in explicit)
-    metadata = dict(op.metadata)
+        normalized = tuple(_normalize_output(value, op, materialized, native=native)
+                           for value, native in explicit)
+        _check_explicit_precision_alignment(op, metadata, abi, normalized)
+        return normalized
     declared_shape, declared_layout, declared_layout_name = _declared_output_geometry(
         op, metadata)
     geometry = declared_shape or _row_geometry(op, metadata)
     if not geometry:
         return ()
     logical, storage = _row_shape(metadata, geometry)
-    dtype = str(metadata.get("output_format") or metadata.get("output_dtype")
-                or op.dtype)
-    if not dtype:
-        raise ModelingError(f"typed_output_primary_dtype_unresolved:{op.op_id}")
+    dtype = _resolve_primary_dtype(op, metadata, abi)
     name = _primary_output_name(op, metadata)
     quant = str(metadata.get("output_quant") or metadata.get("quantization") or "")
     layout_kind = str(metadata.get("output_layout_kind") or
@@ -405,17 +486,27 @@ def produced_values(op, *, materialized=None):
             or metadata.get("target_layout") or metadata.get("output_layout")):
         primary["layout_gap"] = "missing_source_layout"
     outputs = [primary]
+    secondary_materialized = True if materialized is None else materialized
+    abi_scale = str(abi.act_scale_dtype).strip() if abi is not None and abi.act_scale_dtype else ""
+    abi_input = str(abi.input_dtype).strip() if abi is not None and abi.input_dtype else ""
     for returned in op.returns:
+        if returned == name:
+            continue
         if returned == "activation_scales":
-            dtype = str(metadata.get("activation_scale_format") or "fp32")
+            meta_scale = str(metadata.get("activation_scale_format") or "").strip()
+            if abi_scale and meta_scale and abi_scale.lower() != meta_scale.lower():
+                raise ModelingError(
+                    f"typed_output_scale_abi_mismatch:{op.op_id}:abi={abi_scale}:meta={meta_scale}"
+                )
+            scale_dtype = abi_scale or meta_scale or "fp32"
             shape = tuple(metadata.get("activation_scale_shape") or
                           ((logical[0], 1) if logical else ()))
             logical_scale, storage_scale = _row_shape(metadata, shape)
             outputs.append(typed_value(
-                producer=op.op_id, dtype=dtype, shape=logical_scale,
+                producer=op.op_id, dtype=scale_dtype, shape=logical_scale,
                 storage_shape=storage_scale, output=returned, role="scale",
                 source=f"{op.op_id}:returns.{returned}",
-                materialized=(True if materialized is None else materialized),
+                materialized=secondary_materialized,
                 write_bytes=metadata.get("activation_scale_bytes"),
                 contract="declared_scale_value"))
         elif returned == "rstd":
@@ -425,25 +516,148 @@ def produced_values(op, *, materialized=None):
                 storage_shape=(storage[0],) if storage else (rows,),
                 output=returned, role="auxiliary",
                 source=f"{op.op_id}:returns.{returned}",
-                materialized=True, contract="declared_auxiliary_value"))
+                materialized=secondary_materialized,
+                contract="declared_auxiliary_value"))
         else:
-            declared_shape = metadata.get(f"{returned}_shape")
-            shape = tuple(declared_shape) if declared_shape else logical
+            declared_ret_shape = metadata.get(f"{returned}_shape")
+            shape = tuple(declared_ret_shape) if declared_ret_shape else logical
+            ret_logical, ret_storage = _row_shape(metadata, shape)
             if returned == "residual":
-                dtype = str(metadata.get("residual_dtype")
-                            or metadata.get("input_format")
-                            or metadata.get("activation_format") or op.dtype)
+                ret_dtype = str(
+                    metadata.get("residual_dtype")
+                    or metadata.get("residual_format")
+                    or metadata.get("input_format")
+                    or metadata.get("activation_format")
+                    or abi_input
+                    or op.dtype
+                )
             else:
-                dtype = str(metadata.get(f"{returned}_dtype")
-                            or metadata.get("output_format") or op.dtype)
+                ret_dtype = str(
+                    metadata.get(f"{returned}_dtype")
+                    or metadata.get(f"{returned}_format")
+                    or dtype
+                )
+            ret_write_bytes = metadata.get(f"{returned}_write_bytes")
+            if ret_write_bytes is None:
+                ret_write_bytes = metadata.get(f"{returned}_bytes")
             outputs.append(typed_value(
-                producer=op.op_id, dtype=dtype, shape=shape, storage_shape=shape,
-                output=returned, role="declared_output",
+                producer=op.op_id, dtype=ret_dtype, shape=ret_logical,
+                storage_shape=ret_storage, output=returned,
+                role=str(metadata.get(f"{returned}_role") or "declared_output"),
                 source=f"{op.op_id}:returns.{returned}",
-                materialized=True,
-                write_bytes=None,
+                materialized=secondary_materialized,
+                write_bytes=ret_write_bytes,
                 contract="declared_return_value"))
     return tuple(outputs)
+
+
+def _prepend_source_value_contract(
+    meta: dict[str, Any],
+    op: OpSpec,
+    typed_outputs_contract: tuple[dict[str, Any], ...],
+) -> None:
+    """Install replacement ``source_value_contract`` ahead of older audit records."""
+    origins = [
+        record for record in meta.get("fused_origin_scopes", ())
+        if not (record.get("kind") == "source_value_contract" and record.get("op_id") == op.op_id)
+    ]
+    replacement = {
+        "op_id": op.op_id,
+        "kind": "source_value_contract",
+        "layer": op.layer,
+        "stage": op.stage,
+        "block": None,
+        "role": None,
+        "boundary": {"typed_outputs": tuple(typed_outputs_contract)},
+    }
+    meta["fused_origin_scopes"] = (replacement, *origins)
+
+
+def rebind_op_precision(
+    op: OpSpec,
+    precision_abi: TensorPrecisionABI,
+    *,
+    op_dtype: str | None = None,
+    returns: tuple[str, ...] | None = None,
+    primary_output: str | None = None,
+    typed_outputs_contract: tuple[dict[str, Any], ...] | None = None,
+    metadata: Mapping[str, Any] | None = None,
+) -> OpSpec:
+    """Atomically rebind ``op.precision_abi``, ``matrix_flops``, precision metadata, and value contract.
+
+    Prevents split-brain drift between ``op.precision_abi``, ``op.dtype``,
+    ``op.matrix_flops``, ``op.metadata`` precision/scale fields, and
+    ``produced_values(op)`` when an operator lowering or rewrite changes
+    operand/output precision.
+    """
+    if not isinstance(precision_abi, TensorPrecisionABI):
+        raise ModelingError(f"rebind_op_precision_abi_required:{op.op_id}")
+    meta = dict(op.metadata)
+    if not precision_abi.weight_scale_dtype:
+        for stale_key in [k for k in meta if str(k).startswith("weight_scale_")]:
+            meta.pop(stale_key, None)
+    if not precision_abi.act_scale_dtype:
+        for stale_key in [
+            k for k in meta
+            if str(k).startswith(("activation_scale_", "act_scale_"))
+        ]:
+            meta.pop(stale_key, None)
+    if not precision_abi.weight_offset_dtype:
+        for stale_key in [k for k in meta if str(k).startswith("weight_offset_")]:
+            meta.pop(stale_key, None)
+    if metadata is not None:
+        meta.update(metadata)
+    meta["precision_abi_signature"] = precision_abi.abi_signature
+    meta["input_format"] = precision_abi.input_dtype
+    if precision_abi.weight_dtype:
+        meta["weight_format"] = precision_abi.weight_dtype
+    if precision_abi.output_dtype:
+        meta["output_format"] = precision_abi.output_dtype
+        if "output_dtype" in meta:
+            meta["output_dtype"] = precision_abi.output_dtype
+    if precision_abi.compute_dtype and "compute_dtype" in meta:
+        meta["compute_dtype"] = precision_abi.compute_dtype
+    if precision_abi.accum_dtype and "accum_dtype" in meta:
+        meta["accum_dtype"] = precision_abi.accum_dtype
+    if precision_abi.weight_scale_dtype:
+        meta["weight_scale_format"] = precision_abi.weight_scale_dtype
+    if precision_abi.act_scale_dtype:
+        meta["activation_scale_format"] = precision_abi.act_scale_dtype
+    if precision_abi.weight_offset_dtype:
+        meta["weight_offset_format"] = precision_abi.weight_offset_dtype
+    if primary_output:
+        meta["primary_output"] = str(primary_output)
+    if typed_outputs_contract is not None:
+        _prepend_source_value_contract(meta, op, typed_outputs_contract)
+    is_matrix = bool(op.matrix_flops) or meta.get("program_kind") == "matmul"
+    if op_dtype is not None:
+        next_dtype = op_dtype
+    elif is_matrix:
+        next_dtype = (
+            precision_abi.compute_dtype
+            or precision_abi.input_dtype
+            or precision_abi.output_dtype
+            or op.dtype
+        )
+    else:
+        next_dtype = precision_abi.output_dtype or precision_abi.compute_dtype or op.dtype
+    next_matrix_flops = op.matrix_flops
+    if op.matrix_flops:
+        compute_dt = str(precision_abi.compute_dtype or (op_dtype or "") or "").strip()
+        if compute_dt:
+            total_flops = float(sum(float(v) for _, v in op.matrix_flops))
+            next_matrix_flops = ((compute_dt, total_flops),)
+    next_returns = tuple(returns) if returns is not None else op.returns
+    updated = replace(
+        op,
+        dtype=next_dtype,
+        matrix_flops=next_matrix_flops,
+        returns=next_returns,
+        precision_abi=precision_abi,
+        metadata=tuple(meta.items()),
+    )
+    produced_values(updated)
+    return updated
 
 
 def typed_outputs(op, *, materialized=True):

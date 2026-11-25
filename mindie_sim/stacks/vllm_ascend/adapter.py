@@ -26,6 +26,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import math
 from typing import Any
 
 from mindie_sim.backends.abi_registry import default_abi_registry
@@ -118,8 +119,21 @@ MIN_STREAM_CORES = 1
 NS_PER_US = 1000.0
 _QLI_NATIVE_HEAD_DIM = 128
 _QLI_NATIVE_HEADS = 64
+_QLI_ARCH35_HEAD_COUNTS = frozenset({32, 64})
 _QLI_NATIVE_TOPK_MAX = 2048
 _QLI_NATIVE_COMPRESS_MAX = 128
+_KDA_NATIVE_KEY_WIDTH = 128
+_KDA_NATIVE_VALUE_WIDTHS = frozenset({128, 256})
+_KDA_NATIVE_MAX_VALUE_HEADS = 256
+_KDA_NATIVE_STATE_DTYPES = frozenset({"bf16", "fp32"})
+_GDN_ARCH35_PREFILL_HEAD_DIM = 128
+_KDA_BFG_PORT_ROLES = (
+    "kda.b_proj", "kda.f_a_proj", "kda.f_b_proj", "kda.f_proj", "kda.g_proj",
+    "b_proj", "f_a_proj", "f_b_proj", "f_proj", "g_proj",
+)
+_KDA_QKV_PORT_ROLES = (
+    "kda.q_proj", "kda.k_proj", "kda.v_proj", "q_proj", "k_proj", "v_proj",
+)
 
 _ALL_FRAMEWORK_REWRITES: tuple[FrameworkRewriteKind, ...] = (
     "merge_sibling_projections",
@@ -668,6 +682,77 @@ def _bf16_lightning_indexer_fits_ub(
     return True
 
 
+def _mla_prolog_v3_options(
+    model: ModelSpec,
+    *,
+    hw: str,
+    parallel: ParallelSpec,
+    is_int8_kv: bool,
+    mla_mode: str,
+) -> tuple[tuple[str, Any], ...] | None:
+    """Validate ``vllm_ascend_mla_prolog_v3`` domain and emit canonical binding options."""
+    mla_layers = [p for p in model.layer_plans if str(p.attention).lower() == "mla"]
+    if not mla_layers or parallel.cp < 1 or parallel.pcp < 1:
+        return None
+    if str(model.activation_dtype or "").strip().lower() != "bf16":
+        return None
+    quant = getattr(model, "quant", None)
+    if quant is None:
+        return (("preprocess_mode", mla_mode),)
+    from mindie_sim.catalog.ops import compute_dtype_for
+    from mindie_sim.catalog.quant import projection_quant
+    from mindie_sim.prediction.operators.mla_prolog.family_mla_prolog import (
+        BF16_CACHE_DTYPES,
+        CACHE_GROUP_SIZE,
+        DRAFT_SCOPES,
+        MLA_PROLOG_QUERY_LORA_RANKS,
+        _indexer_q_category,
+        _prolog_port_formats,
+    )
+    from mindie_sim.prediction.operators.mla_prolog.mla_prolog_packed import (
+        LAYOUT as PACKED_MLA_LAYOUT,
+        SUPPORTED_QUERY_FORMATS,
+        view as packed_mla_view,
+    )
+
+    packed = hw in {"a3", "a5"} and is_int8_kv and str(quant.kv_dtype).strip().lower() == "int8"
+    for plan in mla_layers:
+        pquant = projection_quant(quant, plan)
+        w_ports, act_ports = _prolog_port_formats(pquant)
+        proj_w, proj_act = w_ports[0], act_ports[0]
+        layer_kv_dtype = str(pquant.kv_dtype or "").strip().lower()
+        layer_is_draft = getattr(plan, "scope", "body") in DRAFT_SCOPES
+        layer_packed = packed and not (layer_is_draft and layer_kv_dtype in BF16_CACHE_DTYPES)
+        if (
+            len(set(w_ports)) != 1
+            or len(set(act_ports)) != 1
+            or proj_w not in {"bf16", "int8", "fp8_e4m3"}
+            or (layer_packed and layer_kv_dtype != "int8")
+            or (not layer_packed and layer_kv_dtype not in BF16_CACHE_DTYPES)
+            or plan.mla_variant != "latent_mla"
+            or plan.cache_kind != "dense"
+            or int(plan.qk_rope_head_dim or 0) <= 0
+            or (plan.q_lora_rank and plan.q_lora_rank not in MLA_PROLOG_QUERY_LORA_RANKS)
+        ):
+            return None
+        if layer_packed:
+            if proj_w not in SUPPORTED_QUERY_FORMATS or proj_act != proj_w:
+                return None
+            try:
+                packed_mla_view(plan.kv_lora_rank, plan.qk_rope_head_dim, CACHE_GROUP_SIZE)
+            except ModelingError:
+                return None
+        if proj_act != model.activation_dtype:
+            if (
+                (plan.indexer or plan.owns_topk or plan.index_query_per_layer)
+                and compute_dtype_for(pquant, _indexer_q_category(pquant))[1] != proj_act
+            ):
+                return None
+    if packed:
+        return (("cache_layout", PACKED_MLA_LAYOUT), ("preprocess_mode", mla_mode))
+    return (("preprocess_mode", mla_mode),)
+
+
 def _select_mla_prolog_binding(
     model: ModelSpec,
     *,
@@ -723,31 +808,223 @@ def _select_mla_prolog_binding(
         registry=registry,
     )
     if mla_mode in {"prolog_v3", "prolog_v3_learned_rope_tail"}:
-        return ("mla_prolog", "vllm_ascend_mla_prolog_v3", (("arch", hw), ("preprocess_mode", mla_mode)))
+        v3_opts = _mla_prolog_v3_options(
+            model, hw=hw, parallel=parallel, is_int8_kv=is_int8_kv, mla_mode=mla_mode,
+        )
+        if v3_opts is None:
+            return None
+        return ("mla_prolog", "vllm_ascend_mla_prolog_v3", v3_opts)
     if mla_mode == "mlapo":
-        return ("mla_prolog", "vllm_ascend_mlapo_decode", (("arch", hw), ("preprocess_mode", mla_mode)))
+        return ("mla_prolog", "vllm_ascend_mlapo_decode", (("preprocess_mode", mla_mode),))
     return None
+
+
+def _kda_recurrent_domain_ok(
+    kda_layers: Sequence[Any], model: ModelSpec, parallel: ParallelSpec,
+) -> bool:
+    """Match ``family_kda_recurrent.validate`` & ``kda_recurrent.Params`` operand domains."""
+    if str(model.activation_dtype or "").strip().lower() != "bf16":
+        return False
+    tp = max(1, int(parallel.tp or 1))
+    for plan in kda_layers:
+        total_v = int(plan.linear_value_heads or plan.linear_heads or 0)
+        total_k = int(plan.linear_key_heads or plan.linear_heads or 0)
+        dk = int(plan.linear_key_head_dim or plan.linear_head_dim or 0)
+        dv = int(plan.linear_head_dim or 0)
+        local_v = math.ceil(total_v / tp) if total_v > 0 else 0
+        local_k = math.ceil(total_k / tp) if total_k > 0 else 0
+        state_dtype = str(getattr(plan, "recurrent_state_dtype", "") or "").strip().lower()
+        if (
+            dk != _KDA_NATIVE_KEY_WIDTH
+            or dv not in _KDA_NATIVE_VALUE_WIDTHS
+            or not (1 <= local_k <= local_v <= _KDA_NATIVE_MAX_VALUE_HEADS)
+            or local_v % local_k != 0
+            or state_dtype not in _KDA_NATIVE_STATE_DTYPES
+        ):
+            return False
+    return True
+
+
+def _select_kda_bindings(
+    model: ModelSpec,
+    *,
+    hw: str,
+    parallel: ParallelSpec,
+    quant_plan: RuntimeQuantPlan,
+) -> tuple[tuple[str, str, tuple[tuple[str, Any], ...]], ...]:
+    """Resolve KDA recurrent and mixed-projection bindings strictly within declared domains."""
+    kda_layers = [p for p in model.layer_plans if str(p.attention).lower() == "kda"]
+    if not kda_layers:
+        return ()
+    from mindie_sim.catalog.paired_sfa import execution as paired_sfa_execution
+
+    bindings: list[tuple[str, str, tuple[tuple[str, Any], ...]]] = []
+    if (
+        parallel.pcp >= 1
+        and (
+            parallel.cp == 1
+            or paired_sfa_execution(model).get("recurrent_context_sharded") is False
+        )
+        and _kda_recurrent_domain_ok(kda_layers, model, parallel)
+    ):
+        rec_id = (
+            "vllm_ascend_recurrent_kda_arch35"
+            if hw == "a5" else "vllm_ascend_recurrent_kda_arch22"
+        )
+        kda_opts: tuple[tuple[str, Any], ...] = ()
+        if hw == "a5":
+            from mindie_sim.prediction.operators.kda.kda_source import (
+                options as kda_source_options,
+            )
+            opt_dicts = [
+                kda_source_options(p, activation_dtype=model.activation_dtype)
+                for p in kda_layers
+            ]
+            if opt_dicts and opt_dicts[0] is not None and all(d == opt_dicts[0] for d in opt_dicts):
+                kda_opts = tuple(sorted(opt_dicts[0].items()))
+        bindings.append(("kda", rec_id, kda_opts))
+
+    quant = getattr(model, "quant", None)
+    if quant is not None and str(model.activation_dtype or "").strip().lower() == "bf16":
+        from mindie_sim.catalog.ops import compute_dtype_for
+        from mindie_sim.catalog.quant import projection_quant
+        from mindie_sim.prediction.operators.kda.family_kda_projection import _resolve_kda_f_quant
+        from mindie_sim.prediction.projections import _representation
+
+        tp = max(1, int(parallel.tp or 1))
+        port_map = {
+            (lid, role): abi
+            for (sc, lid, role), abi in quant_plan.port_abis
+            if sc == "target"
+        }
+        mixed_ok = True
+        for plan in kda_layers:
+            heads = plan.linear_value_heads or plan.linear_heads
+            keys = plan.linear_key_heads or plan.linear_heads
+            dk = plan.linear_key_head_dim or plan.linear_head_dim
+            if (
+                heads != keys
+                or heads % tp != 0
+                or plan.gate_rank
+                or dk != plan.linear_head_dim
+            ):
+                mixed_ok = False
+                break
+            pquant = _resolve_kda_f_quant(projection_quant(quant, plan))
+            qkv_reps = {_representation(pquant, f"kda.{role}") for role in ("q", "k", "v")}
+            bfg_reps = {_representation(pquant, f"kda.{role}") for role in ("b", "f", "g")}
+            if (
+                len(qkv_reps) != 1
+                or compute_dtype_for(pquant, "kda.q")[1] == model.activation_dtype
+                or len(bfg_reps) != 1
+                or any(
+                    pquant.for_category(f"kda.{role}").format_for(f"kda.{role}") != "bf16"
+                    for role in ("b", "f_a", "f_b", "f", "g")
+                )
+            ):
+                mixed_ok = False
+                break
+            nid = plan.native_layer_id if plan.native_layer_id >= 0 else plan.index
+            kda_qkv_abis = [
+                port_map[(nid, role)]
+                for role in _KDA_QKV_PORT_ROLES
+                if (nid, role) in port_map
+            ]
+            if kda_qkv_abis and any(
+                abi.linear_method == "dense"
+                or str(abi.input_dtype or "").strip().lower() in {"", "bf16", "fp16", "fp32"}
+                for abi in kda_qkv_abis
+            ):
+                mixed_ok = False
+                break
+            kda_bfg_abis = [
+                port_map[(nid, role)]
+                for role in _KDA_BFG_PORT_ROLES
+                if (nid, role) in port_map
+            ]
+            if any(
+                abi.linear_method != "dense"
+                or str(abi.weight_dtype or "").strip().lower() not in {"", "bf16"}
+                or str(abi.input_dtype or "").strip().lower() not in {"", "bf16"}
+                for abi in kda_bfg_abis
+            ):
+                mixed_ok = False
+                break
+        if mixed_ok:
+            bindings.append(("kda_input_projection", "vllm_ascend_kda_mixed_projection", ()))
+    return tuple(bindings)
+
+
+def _select_gdn_bindings(
+    model: ModelSpec,
+    *,
+    hw: str,
+    parallel: ParallelSpec,
+) -> tuple[tuple[str, str, tuple[tuple[str, Any], ...]], ...]:
+    """Resolve GDN decode and A5 prefill bindings strictly within declared kernel domains."""
+    gdn_layers = [p for p in model.layer_plans if str(p.attention).lower() == "gdn"]
+    if not gdn_layers or parallel.pcp < 1:
+        return ()
+    act_dtype = str(model.activation_dtype or "").strip().lower()
+    if act_dtype != "bf16":
+        return ()
+    from mindie_sim.prediction.operators.linear_attention.gdn_decode import (
+        _resolve_local_gdn_heads,
+    )
+
+    tp = max(1, int(parallel.tp or 1))
+    decode_ok = True
+    prefill_ok = hw == "a5"
+    for plan in gdn_layers:
+        state_dtype = str(getattr(plan, "recurrent_state_dtype", "") or "").strip().lower()
+        conv_dtype = str(getattr(plan, "conv_state_dtype", "") or "").strip().lower()
+        if state_dtype != "fp32" or conv_dtype != act_dtype:
+            decode_ok = False
+            prefill_ok = False
+            break
+        try:
+            _keys, _heads, dk, dv, _rep = _resolve_local_gdn_heads(plan, tp)
+        except ModelingError:
+            decode_ok = False
+            prefill_ok = False
+            break
+        if dk != _GDN_ARCH35_PREFILL_HEAD_DIM or dv != _GDN_ARCH35_PREFILL_HEAD_DIM:
+            prefill_ok = False
+    bindings: list[tuple[str, str, tuple[tuple[str, Any], ...]]] = []
+    if decode_ok:
+        gdn_opts: tuple[tuple[str, Any], ...] = (
+            (("recurrent_implementation", "arch35_fp32"),) if hw == "a5" else ()
+        )
+        bindings.append(("gdn_decode", "vllm_ascend_gdn_decode", gdn_opts))
+    if prefill_ok:
+        bindings.append(("gdn_prefill", "gdn_prefill_arch35", ()))
+    return tuple(bindings)
 
 
 def _select_indexer_binding(
     model: ModelSpec,
     *,
+    hw: str,
     hardware: Hardware,
     parallel: ParallelSpec,
     quant_plan: RuntimeQuantPlan,
     eff_opts: Mapping[str, Any],
 ) -> tuple[str, str, tuple[tuple[str, Any], ...]] | None:
-    """Resolve INT8/BF16 LightningIndexerV2 binding strictly within declared operator domains."""
+    """Resolve INT8/FP8/BF16 LightningIndexerV2 binding strictly within declared operator domains."""
     idx_plans = [p for p in model.layer_plans if p.indexer and int(p.index_kpool or 1) == 1]
     if not idx_plans:
         return None
     abi_idx_dtype, abi_idx_scale = _index_cache_dtypes(quant_plan)
     q_idx = getattr(model, "quant", None)
-    idx_dtype = abi_idx_dtype or str(getattr(q_idx, "index_dtype", "") or "bf16").strip().lower()
-    idx_scale = abi_idx_scale or str(getattr(q_idx, "index_scale_dtype", "") or "").strip().lower()
+    model_idx_dtype = str(getattr(q_idx, "index_dtype", "") or "").strip().lower()
+    model_idx_scale = str(getattr(q_idx, "index_scale_dtype", "") or "").strip().lower()
+    idx_dtype = abi_idx_dtype or model_idx_dtype or "bf16"
+    idx_scale = abi_idx_scale or model_idx_scale
     if (
         idx_dtype == "int8"
         and idx_scale == "fp16"
+        and (not model_idx_dtype or model_idx_dtype == "int8")
+        and (not model_idx_scale or model_idx_scale == "fp16")
         and int(parallel.cp or 1) == 1
         and all(
             not p.candidate_filter
@@ -755,6 +1032,25 @@ def _select_indexer_binding(
             and int(p.index_heads or 0) == _QLI_NATIVE_HEADS
             and 1 <= int(p.index_topk or 0) <= _QLI_NATIVE_TOPK_MAX
             and 1 <= int(p.compress_ratio or 0) <= _QLI_NATIVE_COMPRESS_MAX
+            and (int(p.compress_ratio or 0) & (int(p.compress_ratio or 0) - 1)) == 0
+            for p in idx_plans
+        )
+    ):
+        return ("quant_lightning_indexer", "cann_quant_lightning_indexer_v2_complete", ())
+    if (
+        hw == "a5"
+        and idx_dtype == "fp8_e4m3"
+        and idx_scale == "fp32"
+        and (not model_idx_dtype or model_idx_dtype == "fp8_e4m3")
+        and (not model_idx_scale or model_idx_scale == "fp32")
+        and int(parallel.cp or 1) == 1
+        and int(parallel.pcp or 1) >= 1
+        and all(
+            not p.candidate_filter
+            and int(p.index_dim or 0) == _QLI_NATIVE_HEAD_DIM
+            and int(p.index_heads or 0) in _QLI_ARCH35_HEAD_COUNTS
+            and 1 <= int(p.index_topk or 0) <= _QLI_NATIVE_TOPK_MAX
+            and 0 <= int(p.compress_ratio or 0) <= _QLI_NATIVE_COMPRESS_MAX
             and (int(p.compress_ratio or 0) & (int(p.compress_ratio or 0) - 1)) == 0
             for p in idx_plans
         )
@@ -826,29 +1122,21 @@ def _select_recipe_bindings(
             origins.append((mla_binding[0], "stack_profile"))
 
     if "kda" in attns and track != "eager":
-        rec_id = "vllm_ascend_recurrent_kda_arch35" if hw == "a5" else "vllm_ascend_recurrent_kda_arch22"
-        bindings.append(("kda", rec_id, ()))
-        origins.append(("kda", "stack_profile"))
-        kda_qkv_quantized = any(
-            role in {"q_proj", "k_proj", "v_proj"}
-            and abi.linear_method != "dense"
-            and str(abi.input_dtype or "").lower() not in {"", "bf16", "fp16", "fp32"}
-            for (_sc, _lid, role), abi in quant_plan.port_abis
-        )
-        if kda_qkv_quantized:
-            bindings.append(("kda_input_projection", "vllm_ascend_kda_mixed_projection", ()))
-            origins.append(("kda_input_projection", "stack_profile"))
+        for kda_binding in _select_kda_bindings(
+            model, hw=hw, parallel=parallel, quant_plan=quant_plan,
+        ):
+            bindings.append(kda_binding)
+            origins.append((kda_binding[0], "stack_profile"))
 
     if "gdn" in attns and track != "eager":
-        bindings.append(("gdn_decode", "vllm_ascend_gdn_decode", ()))
-        origins.append(("gdn_decode", "stack_profile"))
-        if hw == "a5":
-            bindings.append(("gdn_prefill", "gdn_prefill_arch35", ()))
-            origins.append(("gdn_prefill", "stack_profile"))
+        for gdn_binding in _select_gdn_bindings(model, hw=hw, parallel=parallel):
+            bindings.append(gdn_binding)
+            origins.append((gdn_binding[0], "stack_profile"))
 
     if has_idx and track != "eager":
         idx_binding = _select_indexer_binding(
-            model, hardware=hardware, parallel=parallel, quant_plan=quant_plan, eff_opts=eff_opts,
+            model, hw=hw, hardware=hardware, parallel=parallel,
+            quant_plan=quant_plan, eff_opts=eff_opts,
         )
         if idx_binding is not None:
             bindings.append(idx_binding)
