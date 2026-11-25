@@ -21,6 +21,7 @@ import math
 
 from .common import ModelingError
 from .compute_arch_presets import CAPABILITY_PRESETS
+from .device_input import HBM_CACHELINE_SERVICE
 
 
 REPRESENTATION_ROLES = frozenset({"storage", "transfer", "operand", "accumulator"})
@@ -53,7 +54,7 @@ def _positive_int(value, reason):
     return value
 
 
-def _format(value):
+def canonical_format(value):
     name = _text(value, "representation_format_invalid")
     return _FORMAT_ALIASES.get(name, name)
 
@@ -69,6 +70,10 @@ class InstructionService:
     resource: str | None = None
     clock_hz: float | None = None
     cycles_per_unit: float | None = None
+
+    @property
+    def has_linked_supply(self) -> bool:
+        return bool(self.scale_with or self.clock_hz is not None or self.name == HBM_CACHELINE_SERVICE)
 
     def to_dict(self):
         supply = ({"clock_hz": self.clock_hz, "cycles_per_unit": self.cycles_per_unit}
@@ -119,11 +124,11 @@ class NativeComputeMode:
     provenance: object = field(default_factory=dict)
 
     def accepts(self, operand: str, accumulator: str | None = None) -> bool:
-        if _format(operand) not in self.operands and operand not in self.operands:
+        if canonical_format(operand) not in self.operands and operand not in self.operands:
             return False
         if accumulator is None:
             return True
-        return _format(accumulator) in self.accumulators
+        return canonical_format(accumulator) in self.accumulators
 
     def to_dict(self):
         return {"kind": self.kind, "operands": list(self.operands),
@@ -180,9 +185,9 @@ class DataPath:
 
     def supports(self, representation: str,
                  registry: dict[str, RepresentationCapability]) -> bool:
-        name = _format(representation)
-        if self.representations:
-            return name in self.representations
+        name = canonical_format(representation)
+        if self.representations and name not in self.representations:
+            return False
         declared = registry.get(name) or registry.get(representation)
         if declared is None:
             return False
@@ -233,6 +238,10 @@ class ComputeArchSpec:
     clock_hz: float | None = None
 
     # ---- capability queries ------------------------------------------------
+    @property
+    def declared(self) -> bool:
+        return bool(self.preset or self.clock_hz or self.instruction_services or self.has_capabilities())
+
     def has_capabilities(self) -> bool:
         return bool(self.representations or self.native_modes or self.casts
                     or self.paths or self.runtimes)
@@ -241,7 +250,7 @@ class ComputeArchSpec:
         return bool(self.native_modes)
 
     def representation(self, name: str) -> RepresentationCapability:
-        wanted = _format(name)
+        wanted = canonical_format(name)
         for item in self.representations:
             if item.name == wanted:
                 return item
@@ -315,14 +324,14 @@ class ComputeArchSpec:
             + ":" + runtime.name)
 
     def cast_rule(self, source: str, target: str) -> CastCapability | None:
-        wanted = (_format(source), _format(target))
+        wanted = (canonical_format(source), canonical_format(target))
         for item in self.casts:
             if (item.source, item.target) == wanted:
                 return item
         return None
 
     def can_cast(self, source: str, target: str) -> bool:
-        if _format(source) == _format(target):
+        if canonical_format(source) == canonical_format(target):
             try:
                 self.representation(source)
                 return True
@@ -460,6 +469,8 @@ class ComputeArchSpec:
                 if name not in registry:
                     raise ModelingError(
                         f"data_path_representation_missing:{item.name}:{name}")
+                if not item.supports(name, registry):
+                    raise ModelingError(f"data_path_representation_role_mismatch:{item.name}:{name}")
         for item in self.casts:
             if item.source not in registry or item.target not in registry:
                 raise ModelingError(
@@ -536,7 +547,7 @@ class ComputeArchSpec:
 def _validate_peak_formats(peaks, modes) -> None:
     matrix = tuple(mode for mode in modes if mode.kind == "matrix")
     for dtype in peaks:
-        aliases = {dtype, _format(dtype)}
+        aliases = {dtype, canonical_format(dtype)}
         covered = any(alias in mode.operands for mode in matrix for alias in aliases)
         if not covered:
             raise ModelingError(f"compute_peak_without_native_compute_mode:{dtype}")
@@ -590,7 +601,7 @@ def _parse_representations(raw):
         if not roles or not set(roles) <= REPRESENTATION_ROLES:
             raise ModelingError(f"representation_roles_invalid:{name}")
         result.append(RepresentationCapability(
-            _format(name),
+            canonical_format(name),
             _positive_int(item.get("bits"), f"representation_bits_invalid:{name}"),
             roles,
             _positive_int(item.get("alignment_bytes", 1),
@@ -608,9 +619,9 @@ def _parse_native_modes(raw):
         if not isinstance(item, Mapping):
             raise ModelingError(f"native_compute_mapping_required:{name}")
         kind = _text(item.get("kind"), f"native_compute_kind_invalid:{name}")
-        operands = tuple(sorted({_format(value)
+        operands = tuple(sorted({canonical_format(value)
                                  for value in item.get("operands", ())}))
-        accumulators = tuple(sorted({_format(value)
+        accumulators = tuple(sorted({canonical_format(value)
                                      for value in item.get("accumulators", ())}))
         if not operands:
             raise ModelingError(f"native_compute_operands_required:{name}")
@@ -631,8 +642,8 @@ def _parse_casts(raw):
     for name, item in raw.items():
         if not isinstance(item, Mapping):
             raise ModelingError(f"cast_mapping_required:{name}")
-        source = _format(item.get("source", ""))
-        target = _format(item.get("target", ""))
+        source = canonical_format(item.get("source", ""))
+        target = canonical_format(item.get("target", ""))
         if not source or not target or source == target:
             raise ModelingError(f"cast_requires_distinct_representations:{name}")
         result.append(CastCapability(
@@ -667,7 +678,7 @@ def _parse_paths(raw):
             str(item.get("sync", "pipe")),
             _positive_int(item.get("alignment_bytes", 1),
                           f"path_alignment_invalid:{name}"),
-            tuple(sorted({_format(value)
+            tuple(sorted({canonical_format(value)
                           for value in item.get("representations", ())})),
             deepcopy(item.get("provenance", {})),
         ))

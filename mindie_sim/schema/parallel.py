@@ -134,6 +134,8 @@ def _normalise_cp_plan(value: Any, cp: int, pcp: int, tp: int) -> str:
         raise ModelingError(f"pcp_requires_pcp_plan:{plan}")
     if int(pcp) <= 1 and plan in {"pcp", CP_PLAN_PCP_DCP}:
         raise ModelingError("pcp_plan_requires_pcp")
+    if int(cp) > 1 and plan not in {"dcp", CP_PLAN_PCP_DCP}:
+        raise ModelingError(f"cp_requires_dcp_plan:{plan}")
     if plan == "dcp" and int(cp) <= 1:
         raise ModelingError("dcp_plan_requires_cp")
     if plan == CP_PLAN_PCP_DCP and int(cp) <= 1:
@@ -141,29 +143,20 @@ def _normalise_cp_plan(value: Any, cp: int, pcp: int, tp: int) -> str:
     return plan
 
 
-def _phase_plans(plan: str) -> tuple[str, str]:
-    """Resolved (prefill, decode) strategy for one declared plan."""
-    return {
-        "pcp": ("pcp", "none"),
-        "dcp": ("none", "dcp"),
-        CP_PLAN_PCP_DCP: ("pcp", "dcp"),
-        # DSA-CP is a prefill query-token plan; decode stays ordinary.
-        "dsa_cp": ("dsa_cp", "none"),
-        "none": ("none", "none"),
-    }[plan]
+_CP_PHASES = {
+    "pcp": ("pcp", "none"),
+    "dcp": ("none", "dcp"),
+    CP_PLAN_PCP_DCP: ("pcp", "dcp"),
+    "dsa_cp": ("dsa_cp", "none"),
+    "none": ("none", "none"),
+}
 
 
 def _plan_from_phases(prefill: str, decode: str) -> str:
-    """Derive the single plan name from independently declared phase plans."""
-    pair = (prefill, decode)
-    if pair == ("pcp", "dcp"):
-        return CP_PLAN_PCP_DCP
-    if pair == ("pcp", "none") or pair == ("pcp", ""):
-        return "pcp"
-    if pair == ("none", "dcp") or pair == ("", "dcp"):
-        return "dcp"
-    if pair in {("none", "none"), ("", "")}:
-        return "none"
+    pair = (prefill or "none", decode or "none")
+    for plan, phases in _CP_PHASES.items():
+        if phases == pair:
+            return plan
     raise ModelingError(f"cp_phase_plans_unsupported:{prefill}+{decode}")
 
 
@@ -325,12 +318,12 @@ class ParallelSpec:
     @property
     def prefill_cp_plan(self) -> str:
         """Resolved prefill strategy (``pcp``/``dsa_cp``/``none``)."""
-        return _phase_plans(self.cp_plan)[0]
+        return _CP_PHASES[self.cp_plan][0]
 
     @property
     def decode_cp_plan(self) -> str:
         """Resolved decode strategy (``dcp``/``none``)."""
-        return _phase_plans(self.cp_plan)[1]
+        return _CP_PHASES[self.cp_plan][1]
 
     @classmethod
     def from_mapping(cls, value: Any, prefix: str = "parallel") -> "ParallelSpec":
@@ -364,10 +357,7 @@ class ParallelSpec:
         dp = 1 if dp is None else dp
         pp = 1 if pp is None else pp
         external_dp = 1 if external_dp is None else external_dp
-        pcp = _int(
-            raw.get("pcp", raw.get("prefill_context_parallel_size", 1)),
-            f"{prefix}.pcp_invalid", minimum=1,
-        )
+        pcp = _axis_int(raw, "pcp", "prefill_context_parallel_size", prefix) or 1
         ep = _axis_int(raw, "ep", "expert_parallel_size", prefix)
         enable_ep = raw.get("enable_expert_parallel")
         if enable_ep is not None and not isinstance(enable_ep, bool):
@@ -399,17 +389,14 @@ class ParallelSpec:
             raise ModelingError(f"{prefix}.cp_dcp_conflict:{cp}!={dcp}")
         cp = cp if cp is not None else (dcp if dcp is not None else 1)
         plan_raw = raw.get("cp_plan", raw.get("context_parallel_plan", "auto"))
+        if "cp_plan" in raw and "context_parallel_plan" in raw:
+            if (_normalise_cp_plan(raw["cp_plan"], cp, pcp, tp)
+                    != _normalise_cp_plan(raw["context_parallel_plan"], cp, pcp, tp)):
+                raise ModelingError(f"{prefix}.cp_plan_conflict")
         declared_prefill = _normalise_phase_plan(
             raw.get("prefill_cp_plan", ""), "prefill_cp_plan")
         declared_decode = _normalise_phase_plan(
             raw.get("decode_cp_plan", ""), "decode_cp_plan")
-        # ``to_dict`` exports the resolved phase properties.  A round-tripped
-        # default spec therefore carries ``("none", "none")`` even when a
-        # caller subsequently declares ``pcp``/``cp``; those two values are
-        # the serialized default, not a phase declaration, so let the explicit
-        # plan and degree axes remain authoritative.
-        if (declared_prefill, declared_decode) == ("none", "none"):
-            declared_prefill = declared_decode = ""
         if declared_prefill or declared_decode:
             expected = _plan_from_phases(declared_prefill, declared_decode)
             raw_plan = str(plan_raw if plan_raw is not None else "auto").strip().lower()
@@ -566,6 +553,43 @@ class ParallelSpec:
             return self.tp // self.ep
         return 1
 
+    def validate_expert_placement(self) -> None:
+        """Check that EP groups and tensor shards factor the declared rank plane."""
+        if self.rank_table is not None:
+            flat = tuple(rank for group in self.rank_table for rank in group)
+            groups = {len(group) for group in self.rank_table}
+            if max(groups, default=0) > self.world_size:
+                raise ModelingError("rank_table_group_exceeds_world")
+            if len(flat) > self.world_size:
+                raise ModelingError(
+                    f"rank_table_ranks_exceed_world:{len(flat)}>{self.world_size}"
+                )
+            if groups != {self.ep}:
+                raise ModelingError(f"rank_table_ep_membership_mismatch:{sorted(groups)}!={self.ep}")
+        plane = self.ep_domain
+        expert_tp = self.etp
+        expert_dp = self.expert_dp if self.expert_dp is not None else plane // (self.ep * expert_tp)
+        if self.ep > plane:
+            raise ModelingError(f"ep_exceeds_lane_plane:{self.ep}>{plane}")
+        if expert_tp < 1 or expert_dp < 1 or self.ep * expert_tp * expert_dp != plane:
+            raise ModelingError(
+                f"ep_expert_factorization_invalid:"
+                f"ep={self.ep},expert_tp={expert_tp},expert_dp={expert_dp},plane={plane}")
+        if self.tp % expert_tp != 0:
+            raise ModelingError(f"expert_tp_not_divisor_of_tp:{expert_tp}!|{self.tp}")
+        ep_tp_width = max(1, self.tp // self.etp)
+        if not self.ep_spans_pcp:
+            if self.ep > 1 and self.ep <= ep_tp_width and ep_tp_width % self.ep != 0:
+                raise ModelingError(f"ep_not_divisor_of_tp:{self.ep}%{ep_tp_width}")
+            if self.rank_table is None and self.ep > ep_tp_width and self.ep % ep_tp_width != 0:
+                raise ModelingError(f"ep_not_multiple_of_tp:{self.ep}%{ep_tp_width}")
+        else:
+            local_domain = ep_tp_width * self.pcp
+            if self.ep <= local_domain and local_domain % self.ep != 0:
+                raise ModelingError(f"ep_not_divisor_of_tp_pcp:{local_domain}%{self.ep}")
+            if self.ep > local_domain and self.ep % local_domain != 0:
+                raise ModelingError(f"ep_not_multiple_of_tp_pcp:{self.ep}%{local_domain}")
+
     def validate(
         self, model: "ModelSpec", *,
         layer_partition: Sequence[int] | None = None,
@@ -578,31 +602,7 @@ class ParallelSpec:
         legal while a broken one is refused.  Callers without a plan keep the
         even ``layers % pp`` requirement unchanged.
         """
-        if self.rank_table is None:
-            plane = self.ep_domain
-            expert_tp = self.etp
-            expert_dp = self.expert_dp if self.expert_dp is not None else (
-                plane // (self.ep * expert_tp) if expert_tp > 0
-                and plane % (self.ep * expert_tp) == 0 else 0)
-            if self.ep > plane:
-                raise ModelingError(f"ep_exceeds_lane_plane:{self.ep}>{plane}")
-            if expert_tp < 1 or expert_dp < 1 or self.ep * expert_tp * expert_dp != plane:
-                raise ModelingError(
-                    f"ep_expert_factorization_invalid:"
-                    f"ep={self.ep},expert_tp={expert_tp},expert_dp={expert_dp},plane={plane}")
-            if self.tp % expert_tp != 0:
-                raise ModelingError(f"expert_tp_not_divisor_of_tp:{expert_tp}!|{self.tp}")
-        else:
-            flat = tuple(rank for group in self.rank_table for rank in group)
-            groups = {len(group) for group in self.rank_table}
-            if max(groups, default=0) > self.world_size:
-                raise ModelingError("rank_table_group_exceeds_world")
-            if len(flat) > self.world_size:
-                raise ModelingError(
-                    f"rank_table_ranks_exceed_world:{len(flat)}>{self.world_size}"
-                )
-            if not groups <= {self.ep} and self.ep > 1:
-                raise ModelingError(f"rank_table_ep_membership_mismatch:{sorted(groups)}!={self.ep}")
+        self.validate_expert_placement()
         if self.cp > 1:
             max_domain = self.dp * self.tp * self.pcp
             if self.cp > max_domain:
@@ -642,18 +642,6 @@ class ParallelSpec:
                 raise ModelingError(f"pp_partition_empty_stage:{list(counts)}")
         if model.num_heads % self.tp != 0:
             raise ModelingError(f"heads_not_divisible_by_tp:{model.num_heads}%{self.tp}")
-        ep_tp_width = max(1, self.tp // self.etp)
-        if not self.ep_spans_pcp:
-            if self.ep > 1 and self.ep <= ep_tp_width and ep_tp_width % self.ep != 0:
-                raise ModelingError(f"ep_not_divisor_of_tp:{self.ep}%{ep_tp_width}")
-            if self.rank_table is None and self.ep > ep_tp_width and self.ep % ep_tp_width != 0:
-                raise ModelingError(f"ep_not_multiple_of_tp:{self.ep}%{ep_tp_width}")
-        else:
-            local_domain = ep_tp_width * self.pcp
-            if self.ep <= local_domain and local_domain % self.ep != 0:
-                raise ModelingError(f"ep_not_divisor_of_tp_pcp:{local_domain}%{self.ep}")
-            if self.ep > local_domain and self.ep % local_domain != 0:
-                raise ModelingError(f"ep_not_multiple_of_tp_pcp:{self.ep}%{local_domain}")
         if self.cp > 1 or self.pcp > 1 or self.cp_plan == "dsa_cp":
             # DCP reuses TP devices (``tp % cp == 0``); PCP is a separate rank
             # axis with its own prefill schedule; DSA-CP is query-token SP over

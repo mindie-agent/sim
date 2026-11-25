@@ -24,7 +24,7 @@ _DTYPE_BYTES = {
     "float16": 2.0, "fp8": 1.0, "fp8_e4m3": 1.0, "fp8_e5m2": 1.0,
     "int8": 1.0, "uint8": 1.0, "w8a8": 1.0, "int4": 0.5, "w4a8": 0.5, "fp4": 0.5,
     "fp4_e2m1": 0.5, "int32": 4.0, "int64": 8.0,
-    "bool": 1.0, "fp8_e8m0": 1.0, "e8m0": 1.0,
+    "hifloat8": 1.0, "hif8": 1.0, "bool": 1.0, "fp8_e8m0": 1.0, "e8m0": 1.0,
     # MXFP8 transports 32 E4M3 elements plus one E8M0 block scale byte:
     # 32 payload bytes + 1 scale byte per 32 elements = 33/32 B per element.
     "mxfp8": 33.0 / 32.0, "mx_fp8": 33.0 / 32.0, "mxfp8_e4m3": 33.0 / 32.0,

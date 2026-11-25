@@ -219,7 +219,7 @@ class MatrixPolicySpec:
             for dtype in sorted(self.micro_tiles_by_dtype):
                 if not compute_arch.supports_native("matrix", dtype):
                     raise ModelingError(f"matrix_policy_dtype_not_native:{dtype}")
-        if compute_arch is not None and bool(compute_arch.paths):
+        if compute_arch is not None:
             for path in self.supported_output_paths:
                 route = OUTPUT_PATH_ROUTES.get(path)
                 if route is None:
@@ -331,7 +331,7 @@ def default_physical_mechanisms(*, l2_capacity_bytes: int = 0, compute_arch=None
         }
         if not micros:
             raise ModelingError("matrix_policy_no_native_matrix_dtypes")
-    if compute_arch is not None and bool(compute_arch.paths):
+    if compute_arch is not None:
         supported = []
         for path in paths:
             if path in LOCAL_ACCUMULATION_OUTPUT_PATHS:

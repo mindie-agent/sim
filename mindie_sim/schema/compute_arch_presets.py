@@ -121,7 +121,7 @@ def _native_machine_modes(architecture, source, *, fp8, int4_operand):
     return modes
 
 
-def _casts(architecture, source_ref):
+def _casts(architecture, source_ref, extra=()):
     return {
         f"{source_format}->{target}": {
             "source": source_format, "target": target,
@@ -134,7 +134,7 @@ def _casts(architecture, source_ref):
             ("bf16", "fp32", True), ("fp32", "bf16", False),
             ("fp16", "fp32", True), ("fp32", "fp16", False),
             ("bf16", "fp16", False), ("fp16", "bf16", False),
-            ("hf32", "fp32", True), ("fp32", "hf32", False),
+            ("hf32", "fp32", True), ("fp32", "hf32", False), *extra,
         )
     }
 
@@ -280,7 +280,11 @@ CAPABILITY_PRESETS: dict[str, dict] = {
             int4_operand=False),
         "native_compute": _native_machine_modes(
             "npu_arch_3510", _3510_SOURCE, fp8=True, int4_operand=False),
-        "casts": _casts("npu_arch_3510", _3510_SOURCE),
+        "casts": _casts("npu_arch_3510", _3510_SOURCE, extra=(
+            ("bf16", "hifloat8", False), ("hifloat8", "bf16", True),
+            ("bf16", "fp8_e4m3", False), ("fp8_e4m3", "bf16", True),
+            ("bf16", "fp8_e5m2", False), ("fp8_e5m2", "bf16", True),
+        )),
         "paths": _paths_3510(),
         "local_copy_paths": _local_copy_paths(
             "npu_arch_3510", _3510_SOURCE, ub_rate=_DAV_3510_UB_COPY_BYTES_PER_CYCLE),

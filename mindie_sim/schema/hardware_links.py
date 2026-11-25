@@ -253,6 +253,7 @@ class Link:
     root_complex_id: str = ""
     endpoint_ids: tuple[tuple[int, str], ...] = ()
     protocol_bands: tuple[CollectiveBandSpec, ...] = ()
+    protocol: str = ""
 
     def __post_init__(self):
         for field_name, minimum in (("transaction_bytes", 1), ("alignment_bytes", 1),
@@ -278,11 +279,15 @@ class Link:
             raise ModelingError(f"link_bw_utilization_invalid:{self.name}")
         if float(utilization) > 1.0:
             raise ModelingError("link_bw_utilization_exceeds_unity")
+        if not math.isfinite(self.capacity_bytes_per_ms) or self.capacity_bytes_per_ms <= 0:
+            raise ModelingError(f"link_rate_invalid:{self.name}")
         if self.peak_capacity_bytes_per_ms is not None:
             peak = self.peak_capacity_bytes_per_ms
             if (not isinstance(peak, (int, float)) or isinstance(peak, bool)
                     or not math.isfinite(float(peak)) or float(peak) <= 0):
                 raise ModelingError(f"link_peak_capacity_invalid:{self.name}")
+            if self.capacity_bytes_per_ms > peak:
+                raise ModelingError(f"link_effective_capacity_exceeds_peak:{self.name}")
         if self.scope is not None:
             object.__setattr__(self, "scope", normalize_link_scope(self.scope, self.name))
         if isinstance(self.rail_id, bool):
@@ -367,6 +372,8 @@ class Link:
             result["root_complex_id"] = self.root_complex_id
         if self.endpoint_ids:
             result["endpoint_ids"] = {str(rank): ep for rank, ep in self.endpoint_ids}
+        if self.protocol:
+            result["protocol"] = self.protocol
         if self.protocol_bands:
             result["protocol_bands"] = [band.to_dict() for band in self.protocol_bands]
         return result
@@ -388,40 +395,13 @@ class Link:
             "effective_uni_bw_gbps", "effective_bi_bw_gbps",
             "pageable_uni_bw_gbps", "node_peak_bw_gbps", "solo_effective_uni_bw_gbps",
             "endpoint_rates", "scope", "rail_id", "switch_id", "root_complex_id",
-            "endpoint_ids", "protocol_bands",
+            "endpoint_ids", "protocol_bands", "solo_uni_bw_gbps", "fabric",
         }
         _unknown(value, allowed, "link")
         name = value.get("name", "link")
         if not isinstance(name, str) or not name:
             raise ModelingError(f"link_name_invalid:{name}")
-        utilization = 1.0
-        for alias in ("bw_utilization", "bw_ratio", "utilization"):
-            if alias not in value:
-                continue
-            candidate = _positive_float(value[alias], "link_bw_utilization_invalid",
-                                        allow_zero=False)
-            if candidate > 1.0:
-                raise ModelingError("link_bw_utilization_exceeds_unity")
-            utilization = candidate
-            break
-        peak = value.get("peak_capacity_bytes_per_ms")
-        if peak is not None:
-            peak = _positive_float(peak, f"link_peak_capacity_invalid:{name}")
-        if "capacity_bytes_per_ms" in value:
-            capacity = _positive_float(value["capacity_bytes_per_ms"],
-                                       f"link_rate_invalid:{name}")
-            if peak is None and not math.isclose(utilization, 1.0):
-                peak = capacity / utilization
-        elif "capacity_gbps" in value or "gbps" in value:
-            rate = value.get("capacity_gbps", value.get("gbps"))
-            declared_peak = _positive_float(
-                rate, f"link_rate_invalid:{name}") * GBPS_TO_BYTES_PER_MS
-            peak = declared_peak if peak is None else peak
-            capacity = declared_peak * utilization
-        elif peak is not None:
-            capacity = peak * utilization
-        else:
-            raise ModelingError(f"link_rate_invalid:{name}")
+        peak, capacity, utilization = _link_bandwidth(value, name)
         endpoint_raw = value.get("endpoint_rates", ())
         if isinstance(endpoint_raw, Mapping):
             endpoint_items = endpoint_raw.items()
@@ -445,13 +425,13 @@ class Link:
             ep_ids = tuple(sorted((int(rk), str(ep)) for rk, ep in ep_ids_raw))
         else:
             raise ModelingError(f"link_endpoint_ids_invalid:{name}")
-        semantics = value.get("semantics", value.get("transport_semantics", "shared"))
+        semantics = value.get("semantics", value.get("channel_semantics", value.get("transport_semantics", "shared")))
         semantics = {"switched": "per_port"}.get(semantics, semantics)
         bands = parse_collective_bands(value.get("protocol_bands"))
         return cls(
             name=name, capacity_bytes_per_ms=capacity,
             members=tuple(value.get("members", default_members)),
-            latency_us=float(value.get("latency_us", 0)),
+            latency_us=float(value.get("latency_us", value.get("alpha_us", 0))),
             channel=value.get("channel", "fabric"), semantics=semantics,
             transaction_bytes=value.get("transaction_bytes"),
             alignment_bytes=value.get("alignment_bytes", 1),
@@ -467,7 +447,7 @@ class Link:
             switch_id=str(value.get("switch_id") or ""),
             root_complex_id=str(value.get("root_complex_id") or ""),
             endpoint_ids=ep_ids,
-            protocol_bands=bands,
+            protocol_bands=bands, protocol=str(value.get("protocol") or ""),
         )
 
 
@@ -527,87 +507,57 @@ def apply_network_overrides(links, raw: Mapping, *,
     return tuple(result)
 
 
-def _transfer_channel(channel: Mapping, name: str = "transfer") -> Link:
-    """Build one link from a transfer-channel declaration."""
-    if not isinstance(channel, Mapping):
-        raise ModelingError(f"transfer_channel_record_invalid:{name}")
-    if "scope" in channel and channel["scope"] is not None:
-        normalize_link_scope(channel["scope"])
-    allowed = {
-        "channel", "channel_name", "gbps", "capacity_bytes_per_ms",
-        "capacity_gbps", "members", "latency_us", "channel_semantics",
-        "semantics", "transport_semantics", "transaction_bytes",
-        "alignment_bytes", "protocol_overhead_bytes", "switch_hops",
-        "switch_hop_latency_us", "switch_capacity_bytes_per_ms",
-        "bw_utilization", "bw_ratio", "utilization",
-        "peak_capacity_bytes_per_ms", "effective_uni_bw_gbps",
-        "uni_peak_bw_gbps", "bi_peak_bw_gbps", "calibrated_uni_bw_gbps",
-        "calibrated_bi_bw_gbps", "derived_uni_bw_gbps", "derived_bi_bw_gbps",
-        "effective_bi_bw_gbps", "pageable_uni_bw_gbps", "node_peak_bw_gbps",
-        "solo_uni_bw_gbps", "solo_effective_uni_bw_gbps", "fabric",
-        "alpha_us", "protocol", "transport_mode",
-        "notes", "bandwidth_provenance", "scope", "rail_id", "switch_id",
-        "root_complex_id", "endpoint_ids", "protocol_bands",
-    }
-    _unknown(channel, allowed, f"transfer_channel.{name}")
-    utilization = 1.0
-    for alias in ("bw_utilization", "bw_ratio", "utilization"):
-        if alias in channel:
-            utilization = _positive_float(channel[alias],
-                                          "transfer_channel_bw_utilization_invalid",
-                                          allow_zero=False)
-            if utilization > 1.0:
-                raise ModelingError("transfer_channel_bw_utilization_invalid")
+_CHANNEL_BANDWIDTH_TIERS = (
+    "effective_uni_bw_gbps", "calibrated_uni_bw_gbps", "derived_uni_bw_gbps", "uni_peak_bw_gbps",
+)
+
+
+def _channel_rate_gbps(record):
+    """Effective/calibrated/derived service is already derated; only a peak needs utilization."""
+    if "effective_uni_bw_gbps" in record:
+        return record["effective_uni_bw_gbps"]
+    for key in _CHANNEL_BANDWIDTH_TIERS[1:-1]:
+        if record.get(key) is not None:
+            return record[key]
+    return None
+
+
+def _link_bandwidth(record, name):
+    util = next((record[key] for key in ("bw_utilization", "bw_ratio", "utilization")
+                 if key in record), None)
+    utilization = 1.0 if util is None else _positive_float(util, "link_bw_utilization_invalid")
+    if utilization > 1:
+        raise ModelingError("link_bw_utilization_exceeds_unity")
+    peak = record.get("peak_capacity_bytes_per_ms")
+    if peak is not None:
+        peak = _positive_float(peak, f"link_peak_capacity_invalid:{name}")
+    for key in ("capacity_gbps", "gbps", "uni_peak_bw_gbps"):
+        if record.get(key) is not None:
+            declared = _positive_float(record[key], f"link_peak_capacity_invalid:{name}") * GBPS_TO_BYTES_PER_MS
+            if peak is not None and not math.isclose(peak, declared):
+                raise ModelingError(f"link_bandwidth_declarations_conflict:{name}")
+            peak = declared
             break
-    if channel.get("gbps") is not None:
-        peak = (_positive_float(channel.get("gbps"),
-                                "transfer_channel_requires_positive_gbps")
-                * GBPS_TO_BYTES_PER_MS)
-    elif channel.get("peak_capacity_bytes_per_ms") is not None:
-        peak = _positive_float(channel["peak_capacity_bytes_per_ms"],
-                               "transfer_channel_requires_positive_gbps")
-    elif channel.get("capacity_bytes_per_ms") is not None:
-        peak = (_positive_float(channel["capacity_bytes_per_ms"],
-                                "transfer_channel_requires_positive_gbps")
-                / utilization)
-    elif channel.get("capacity_gbps") is not None:
-        peak = (_positive_float(channel["capacity_gbps"],
-                                "transfer_channel_requires_positive_gbps")
-                * GBPS_TO_BYTES_PER_MS / utilization)
-    elif channel.get("effective_uni_bw_gbps") is not None:
-        peak = (_positive_float(channel["effective_uni_bw_gbps"],
-                                "transfer_channel_requires_positive_gbps")
-                * GBPS_TO_BYTES_PER_MS / utilization)
-    elif channel.get("uni_peak_bw_gbps") is not None:
-        peak = (_positive_float(channel["uni_peak_bw_gbps"],
-                                "transfer_channel_requires_positive_gbps")
-                * GBPS_TO_BYTES_PER_MS)
+    capacity = record.get("capacity_bytes_per_ms")
+    if capacity is not None:
+        capacity = _positive_float(capacity, f"link_rate_invalid:{name}")
+    effective = _channel_rate_gbps(record)
+    if capacity is None and effective is not None:
+        capacity = _positive_float(effective, f"link_rate_invalid:{name}") * GBPS_TO_BYTES_PER_MS
+    if capacity is None:
+        if peak is None or ("effective_uni_bw_gbps" in record and effective is None):
+            raise ModelingError(f"link_rate_invalid:{name}")
+        capacity = peak * utilization
+    elif peak is None:
+        if util is not None or effective is not None:
+            peak = capacity / utilization
     else:
-        raise ModelingError("transfer_channel_requires_positive_gbps")
-    effective = peak * utilization
-    channel_name = channel.get("channel", channel.get("channel_name", name))
-    semantics = channel.get("semantics", channel.get("channel_semantics",
-                                                      channel.get("transport_semantics", "shared")))
-    semantics = {"switched": "per_port"}.get(semantics, semantics)
-    return Link(
-        name=str(channel_name), capacity_bytes_per_ms=effective,
-        members=tuple(channel.get("members", ())),
-        latency_us=float(channel.get("latency_us", channel.get("alpha_us", 0))),
-        channel=str(channel_name), semantics=semantics,
-        transaction_bytes=channel.get("transaction_bytes"),
-        alignment_bytes=channel.get("alignment_bytes", 1),
-        protocol_overhead_bytes=channel.get("protocol_overhead_bytes", 0),
-        switch_hops=channel.get("switch_hops", 0),
-        switch_hop_latency_us=channel.get("switch_hop_latency_us", 0),
-        switch_capacity_bytes_per_ms=channel.get("switch_capacity_bytes_per_ms"),
-        bw_utilization=utilization,
-        peak_capacity_bytes_per_ms=peak,
-        scope=channel.get("scope"),
-        rail_id=0 if channel.get("rail_id") is None else channel["rail_id"],
-        switch_id=str(channel.get("switch_id") or ""),
-        root_complex_id=str(channel.get("root_complex_id") or ""),
-        protocol_bands=parse_collective_bands(channel.get("protocol_bands")),
-    )
+        if capacity > peak:
+            raise ModelingError(f"link_effective_capacity_exceeds_peak:{name}")
+        if util is not None and not math.isclose(capacity, peak * utilization):
+            raise ModelingError(f"link_bandwidth_declarations_conflict:{name}")
+        utilization = capacity / peak
+    return peak, capacity, utilization
 
 
 def _collective_protocols(value) -> tuple[tuple[str, str], ...]:
@@ -628,26 +578,57 @@ def _collective_protocols(value) -> tuple[tuple[str, str], ...]:
     return tuple(sorted(result.items()))
 
 
-def _neutral_transfer_channel_links(raw: Mapping) -> list[dict]:
-    declaration = raw.get("transfer_channels")
-    if not isinstance(declaration, Mapping):
-        return []
+def _neutral_transfer_channel_links(raw, placements):
+    """Generate only physical D2D links, respecting package/node membership."""
+    from .device_input import placement_node_groups, placement_package_groups
+
+    channels = raw.get("transfer_channels") or {}
+    nodes = placement_node_groups(placements)
+    groups = {
+        "d2d_intra_package": placement_package_groups(placements),
+        "d2d_intra_node": nodes,
+        "d2d_inter_node": [(0, [rank for rank, _, _ in placements])] if len(nodes) > 1 else [],
+    }
     links = []
-    for name, channel in declaration.items():
+    for name, domains in groups.items():
+        if name not in channels:
+            continue
+        channel = channels[name]
         if not isinstance(channel, Mapping):
+            raise ModelingError(f"transfer_channel_record_invalid:{name}")
+        if ("effective_uni_bw_gbps" in channel and channel["effective_uni_bw_gbps"] is None
+                or any(key in channel for key in _CHANNEL_BANDWIDTH_TIERS)
+                and all(channel.get(key) is None for key in _CHANNEL_BANDWIDTH_TIERS)):
             continue
-        try:
-            link = _transfer_channel(channel, str(name))
-        except ModelingError as exc:
-            if str(exc).startswith("link_scope_unknown"):
-                raise
-            continue
-        record = link.to_dict()
-        record["name"] = str(name)
-        if not link.members:
-            record.pop("members", None)
-        links.append(record)
-    return links
+        kind = name.removeprefix("d2d_")
+        record = dict(channel)
+        if not {"latency_us", "alpha_us"} & record.keys() and raw.get(f"{kind}_latency_us") is not None:
+            record["latency_us"] = raw[f"{kind}_latency_us"]
+        if not {*_CHANNEL_BANDWIDTH_TIERS, "gbps", "capacity_gbps",
+                "capacity_bytes_per_ms", "peak_capacity_bytes_per_ms"} & record.keys():
+            if raw.get(f"{kind}_bw_bytes_per_s") is not None:
+                record["peak_capacity_bytes_per_ms"] = raw[f"{kind}_bw_bytes_per_s"] * BYTES_PER_S_TO_BYTES_PER_MS
+            elif raw.get(f"{kind}_bw_gbps") is not None:
+                record["capacity_gbps"] = raw[f"{kind}_bw_gbps"]
+        if (not {"bw_utilization", "bw_ratio", "utilization"} & record.keys()
+                and _channel_rate_gbps(record) is None and raw.get(f"{kind}_bw_util") is not None):
+            record["bw_utilization"] = raw[f"{kind}_bw_util"]
+        channel_name = record.pop("channel_name", name)
+        record.setdefault("channel", channel_name)
+        ranks = tuple(rank for rank, _, _ in placements)
+        link = Link.from_mapping({**record, "name": name}, default_members=ranks)
+        if not set(link.members).issubset(ranks):
+            raise ModelingError(f"link_member_unknown:{name}")
+        for index, domain in domains:
+            local = set(domain)
+            members = tuple(rank for rank in link.members if rank in local)
+            if len(members) < 2:
+                continue
+            label = name if len(domains) == 1 else f"{name}:{index}"
+            links.append(replace(link, name=label, members=members,
+                                 endpoint_ids=tuple(x for x in link.endpoint_ids if x[0] in local),
+                                 endpoint_rates=tuple(x for x in link.endpoint_rates if x[0] in local)))
+    return tuple(links)
 
 
 def calibration_warnings(calibration: Mapping | None, existing=()) -> list[str]:
@@ -687,7 +668,6 @@ __all__ = [
     "_collective_protocols",
     "_network_override_keys",
     "_neutral_transfer_channel_links",
-    "_transfer_channel",
     "apply_network_overrides",
     "calibration_warnings",
     "combine_calibrations",

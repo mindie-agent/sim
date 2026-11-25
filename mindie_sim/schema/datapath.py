@@ -20,7 +20,8 @@ from dataclasses import dataclass
 from typing import Any, NewType
 
 from .common import ModelingError
-from .compute_arch import ComputeArchSpec, DataPath
+from .compute_arch import ComputeArchSpec, DataPath, canonical_format
+from .compute_peak_aliases import matrix_peak
 from .compute_arch_presets import preset_datapath_parts
 from .device_input import (
     DeviceInput,
@@ -125,25 +126,8 @@ class DatapathCapabilitySpec:
 
     def cube_peak(self, dtype: str) -> float:
         """Return the declared matrix peak (FLOP/s) for ``dtype`` without profile guessing."""
-        from .compute_peak_aliases import resolve_compute_peak_name
-
-        peaks = dict(self.compute_peaks)
-        supply = dict(self.compute_peak_aliases)
-        dtype_aliases = {
-            "bfloat16": "bf16", "float16": "fp16", "float32": "fp32",
-            "fp8_e4m3": "fp8", "fp8_e5m2": "fp8",
-        }
-        canonical = dtype_aliases.get(dtype, dtype)
-        arch = self.compute_arch.declared
-        if arch is None or not (
-            arch.supports_native("matrix", dtype) or arch.supports_native("matrix", canonical)
-        ):
-            raise ModelingError(f"fuse_region_matrix_precision_unsupported:{dtype}")
-        native = resolve_compute_peak_name(dtype, peaks, supply) if supply else dtype
-        name = native if native in peaks else dtype_aliases.get(native, canonical)
-        if name in peaks and peaks[name] > 0.0:
-            return float(peaks[name])
-        raise ModelingError(f"fuse_region_compute_precision_requires_context:{dtype}")
+        return matrix_peak(dtype, self.compute_peaks, self.compute_peak_aliases,
+                           self.compute_arch.declared, require_native=True)
 
     @property
     def supported_output_paths(self) -> tuple[str, ...]:
@@ -211,8 +195,28 @@ class DatapathCapabilitySpec:
             f"owner {owner_group!r} cannot reach {src}->{dst} on {self.arch_id}",
         )
 
+    def validate_fixpipe_accumulator(self, tile, representation: str, *, producer_mode: str | None = None) -> None:
+        """Validate an M×N accumulator plane. An optional third extent describes the reduction."""
+        if len(tile) not in (PAIR_ARITY, TILE_3D_ARITY):
+            raise self._route_err("datapath_route_tile_invalid:l0c",
+                                  "an accumulator tile requires M, N and optionally K")
+        arch = self.compute_arch.declared
+        if arch is None or not arch.representation_supports(representation, "accumulator"):
+            raise self._route_err(f"datapath_accumulator_unsupported:{representation}",
+                                  "Fixpipe requires an accumulator representation")
+        if producer_mode is not None:
+            operand = canonical_format(producer_mode)
+            arch.native_mode("matrix", operand, representation)
+            wave = next((w for w in self.subtile_wave if w.native_mode == operand), None)
+            if wave is None:
+                raise self._route_err(f"datapath_subtile_wave_undeclared:{operand}",
+                                      f"no issue geometry for {operand}")
+            if wave.issued_shape(tile[0], tile[1], wave.tile_k)[:PAIR_ARITY] != tuple(tile[:PAIR_ARITY]):
+                raise self._route_err("datapath_route_tile_invalid:l0c",
+                                      "accumulator shape violates the producing wave geometry")
+
     def _validate_route_tile(
-        self, path: DataPath, src: str, dst: str, rep: str, elem_bits: int, tile: Any
+        self, path: DataPath, src: str, dst: str, rep: str, elem_bits: int, tile: Any, producer_mode: str | None
     ) -> None:
         align = max(1, int(path.alignment_bytes or 1))
         if isinstance(tile, int) and not isinstance(tile, bool):
@@ -229,18 +233,8 @@ class DatapathCapabilitySpec:
                     f"tile dimensions {tile!r} must be positive integers",
                 )
             if src == "l0c" or dst == "l0c":
-                wave = next((w for w in self.subtile_wave if w.native_mode == rep), None)
-                if wave is None:
-                    raise self._route_err(f"datapath_subtile_wave_undeclared:{rep}",
-                                          f"arch {self.arch_id} has no native wave for {rep!r}")
-                if (len(tile) < PAIR_ARITY
-                        or tile[0] % wave.independently_issuable_m != 0
-                        or tile[1] % wave.tile_n != 0
-                        or (len(tile) >= TILE_3D_ARITY and tile[PAIR_ARITY] % wave.tile_k != 0)):
-                    raise self._route_err(
-                        f"datapath_route_tile_invalid:{src}->{dst}:{tuple(tile)}",
-                        f"tile {tuple(tile)} violates subtile alignment ({wave.independently_issuable_m},{wave.tile_n})",
-                    )
+                self.validate_fixpipe_accumulator(tile, rep, producer_mode=producer_mode)
+                tile = tile[:PAIR_ARITY]
             elems = 1
             for dim in tile:
                 elems *= dim
@@ -263,7 +257,7 @@ class DatapathCapabilitySpec:
 
     def route(
         self, src: str, dst: str, representation: str = "",
-        owner_group: Any = None, tile: Any = None,
+        owner_group: Any = None, tile: Any = None, *, producer_mode: str | None = None,
     ) -> RoutePlan:
         """Resolve a physical directed path or raise ``UnmodeledCapabilityError``."""
         rep = str(representation or "").strip().lower()
@@ -283,18 +277,25 @@ class DatapathCapabilitySpec:
             if rep in registry:
                 elem_bits = int(registry[rep].bits)
         candidates = [p for p in self.usable_paths if p.source == src and p.target == dst]
+        failure = None
         for path in candidates:
             if rep and ((registry and not path.supports(rep, registry))
                         or (not registry and path.representations and rep not in path.representations)):
                 continue
-            if owner_group is not None:
-                self._validate_route_owner(path, src, dst, owner_group)
-            if tile is not None:
-                self._validate_route_tile(path, src, dst, rep, elem_bits, tile)
+            try:
+                if owner_group is not None:
+                    self._validate_route_owner(path, src, dst, owner_group)
+                if tile is not None:
+                    self._validate_route_tile(path, src, dst, rep, elem_bits, tile, producer_mode)
+            except ModelingError as exc:
+                failure = exc
+                continue
             return RoutePlan(
                 source=src, destination=dst, path=path,
                 representation=rep, owner_group=owner_group, tile=tile,
             )
+        if failure is not None:
+            raise failure
         raise self._route_err(
             f"datapath_route_unsupported:{src}->{dst}",
             f"arch {self.arch_id} does not declare directed route {src}->{dst} (representation={rep or 'any'})",
@@ -334,15 +335,19 @@ class DatapathCapabilitySpec:
     @property
     def signature(self) -> tuple:
         """Hashable structural capability identity for cache keys."""
+        return self._signature(self.ub_peer_edges)
+
+    def _signature(self, peer_connectivity: tuple) -> tuple:
         return (
             self.compute_arch.arch_id,
+            self.clock_hz,
             self.aic_count,
             self.aiv_count,
             self.aic_aiv_pairs,
-            tuple((p.name, p.source, p.target, p.unit, p.executor, p.sync, p.alignment_bytes)
-                  for p in self.usable_paths),
+            tuple((p.name, p.source, p.target, p.unit, p.executor, p.sync, p.alignment_bytes,
+                   p.roles, p.representations, p.reach, p.buffer) for p in self.usable_paths),
             tuple(sorted(self.matrix_output_paths)),
-            self.ub_peer_edges,
+            peer_connectivity,
             (None if self.stars is None else (
                 self.stars.resource, self.stars.slots_per_die,
                 self.stars.descriptor_path.name)),
@@ -355,12 +360,12 @@ class DatapathCapabilitySpec:
             self.memory_access,
             self.buffers,
             self.compute_peaks,
+            self.compute_peak_aliases,
         )
 
 
 def _arch_identity(spec: ComputeArchSpec) -> ComputeArchIdentity:
-    declared = spec if (spec.preset or spec.has_capabilities()
-                        or spec.instruction_services) else None
+    declared = spec if spec.declared else None
     arch_id = ArchId(spec.preset) if spec.preset else GENERIC_ARCH_ID
     return ComputeArchIdentity(arch_id=arch_id, declared=declared)
 
@@ -386,8 +391,6 @@ def _aic_aiv_pairs(aic_count: int, aiv_count: int) -> tuple[tuple[int, tuple[int
 
 def _matrix_output_paths(die: Device, usable_paths: tuple[DataPath, ...]) -> frozenset[str]:
     declared = frozenset(die.physical_mechanisms.matrix.supported_output_paths)
-    if not usable_paths:
-        return declared
     has_l0c_ub = any(p.source == "l0c" and p.target == "ub" for p in usable_paths)
     if L0C_TO_UB_OUTPUT_PATH in declared and not has_l0c_ub:
         return declared - {L0C_TO_UB_OUTPUT_PATH}
@@ -480,27 +483,6 @@ def device_input_for_die(
     )
 
 
-def _ub_channel_names(
-    transfer_channels: Mapping[str, object] | Sequence[tuple[str, object]] = (),
-) -> tuple[frozenset[str], bool]:
-    if not transfer_channels:
-        return frozenset(), False
-    entries = (
-        transfer_channels.items()
-        if isinstance(transfer_channels, Mapping)
-        else transfer_channels
-    )
-    ub: set[str] = set()
-    has_entries = False
-    for channel, spec in entries:
-        has_entries = True
-        mapping = dict(spec) if isinstance(spec, (Mapping, tuple, list)) else {}
-        protocol = str(mapping.get("protocol") or "").strip().upper()
-        if protocol == "UB" or protocol.startswith("UB_"):
-            ub.add(str(channel))
-    return frozenset(ub), has_entries
-
-
 def ub_peer_edges_for_rank(
     rank: int,
     links: Sequence[Link] = (),
@@ -510,20 +492,19 @@ def ub_peer_edges_for_rank(
     if not links:
         return ()
     target = int(rank)
-    ub_channels, _has_channels = _ub_channel_names(transfer_channels)
+    channels = dict(transfer_channels)
     edges: set[tuple[int, int]] = set()
     for link in links:
         if target not in link.members:
             continue
         chan_low = str(link.channel).lower()
-        name_low = str(link.name).lower()
-        is_ub = (
-            link.channel in ub_channels
-            or chan_low == "ub"
-            or chan_low.startswith("ub_")
-            or name_low.startswith("ub_")
-        )
-        if not is_ub:
+        record = dict(channels.get(link.channel, ()))
+        protocol = str(link.protocol or record.get("protocol") or "").strip().upper()
+        if link.scope in {"cross_node", "host"} or record.get("scope") in {"cross_node", "host"}:
+            continue
+        direct = (protocol == "UB" or protocol.startswith("UB_DIRECT")) if protocol else (
+            chan_low in {"ub", "ub_mesh"} or chan_low.startswith("ub_direct"))
+        if not direct:
             continue
         for member in link.members:
             peer = int(member)
@@ -534,7 +515,7 @@ def ub_peer_edges_for_rank(
 
 def _arch_capability_key(spec: ComputeArchSpec) -> tuple:
     return (
-        spec.preset,
+        spec.preset, spec.clock_hz,
         tuple(
             (s.name, s.unit, s.owner_axis, s.per_owner_rate, s.scale_with,
              s.resource, s.clock_hz, s.cycles_per_unit)
@@ -565,26 +546,8 @@ def _homogeneity_key(
     rank: int,
     stage_ranks: frozenset[int],
 ) -> tuple:
-    return (
-        spec.compute_arch.arch_id,
-        spec.aic_count,
-        spec.aiv_count,
-        spec.aic_aiv_pairs,
-        tuple((p.name, p.source, p.target, p.unit, p.executor, p.sync, p.alignment_bytes)
-              for p in spec.usable_paths),
-        tuple(sorted(spec.matrix_output_paths)),
-        _ub_relative_connectivity(rank, spec.ub_peer_edges, stage_ranks),
-        (None if spec.stars is None else (
-            spec.stars.resource, spec.stars.slots_per_die,
-            spec.stars.descriptor_path.name)),
-        spec.simt_ub_carveout_bytes,
-        spec.subtile_wave,
-        spec.dispatch_sync,
-        spec.hbm_rw_alpha,
-        spec.hbm_read_bytes_per_s,
-        spec.hbm_write_bytes_per_s,
-        spec.memory_access,
-    )
+    connectivity = _ub_relative_connectivity(rank, spec.ub_peer_edges, stage_ranks)
+    return spec._signature(connectivity)
 
 
 def datapath_for_devices(

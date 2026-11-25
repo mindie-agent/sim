@@ -20,9 +20,11 @@ from dataclasses import dataclass
 import math
 from typing import Any
 
-from .common import ModelingError, _positive_float
+from .common import ModelingError, _positive_float, align_up
 
 
+HBM_CACHELINE_SERVICE = "gm_hbm_cacheline_128b"
+HBM_CACHELINE_BYTES = 128
 BYTES_PER_GIB = 1024 * 1024 * 1024
 ASCEND_SECTOR_BYTES = 32
 DEFAULT_L2_LINE_BYTES = 512
@@ -120,6 +122,13 @@ class SubtileWaveSpec:
             cube_k = _req_pos_int(self.cube_k, "subtile_wave.cube_k")
             if self.tile_k % cube_k:
                 raise ModelingError("subtile_wave_cube_k_must_divide_tile_k")
+
+    def issued_shape(self, m: int, n: int, k: int) -> tuple[int, int, int]:
+        """Round one independently issued tile to its physical wave extents."""
+        if min(m, n, k) < 0:
+            raise ModelingError("subtile_wave_negative_extent")
+        return (align_up(m, self.independently_issuable_m),
+                align_up(n, self.tile_n), align_up(k, self.tile_k))
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> SubtileWaveSpec:
@@ -399,7 +408,7 @@ def machine_device_defaults(raw):
     fields = {
         *_MAP_FIELDS, *_ARCH_FIELDS, "service_modes", "compute_arch",
         "physical_mechanisms", *_RATE_FIELDS, *_DATAPATH_DEVICE_FIELDS,
-        "memory_bytes", "hbm_gib", "hbm_bytes", "cube_flops_per_s",
+        "memory_bytes", "hbm_gib", "hbm_bytes", "cube_flops_per_s", "compute_peak_aliases",
         "compute_units", "aic_count", "aiv_count", "launch_us",
         *(pool + "_bytes" for pool in _POOLS),
     }
@@ -453,6 +462,26 @@ def _normalize(raw):
     if buffers:
         data["buffers"] = {**buffers, **data.get("buffers", {})}
     return data
+
+
+def _normalize_l2(data, inherited_buffers):
+    buffers = data.get("buffers", {})
+    mechanisms = data.get("physical_mechanisms") or {}
+    if not isinstance(mechanisms, Mapping):
+        raise ModelingError("device_physical_mechanisms_requires_mapping")
+    hierarchy = mechanisms.get("memory_hierarchy", {})
+    if not isinstance(hierarchy, Mapping):
+        raise ModelingError("device_physical_mechanisms_sections_require_mapping")
+    if "l2" not in buffers and "l2_capacity_bytes" not in hierarchy:
+        return
+    capacity = hierarchy.get("l2_capacity_bytes", buffers.get("l2"))
+    if "l2" in buffers and buffers["l2"] != capacity:
+        raise ModelingError("device_l2_capacity_conflict")
+    if capacity or "l2" in buffers or "l2" in inherited_buffers:
+        data["buffers"] = {**buffers, "l2": capacity}
+    data["physical_mechanisms"] = {
+        **mechanisms, "memory_hierarchy": {**hierarchy, "l2_capacity_bytes": capacity},
+    }
 
 
 def _deep_merge(base, patch):
@@ -512,11 +541,33 @@ def _merge_service_modes(base, declared, ratios):
     return merged
 
 
+def _update_cacheline_supply(device, patch):
+    """Redistribute the inherited HBM line service when its bus or owner count changes."""
+    if not ("hbm" in patch.get("rates", {}) or "resource_units" in patch or "compute_units" in patch):
+        return
+    if HBM_CACHELINE_SERVICE in patch.get("compute_arch", {}).get("instruction_services", {}):
+        return
+    arch = device.get("compute_arch", {})
+    services = arch.get("instruction_services", {})
+    service = services.get(HBM_CACHELINE_SERVICE)
+    if service is None or "per_owner_rate" not in service:
+        return
+    owners = device.get("resource_units", {}).get(service["owner_axis"], device.get("compute_units", 1))
+    if owners < 1:
+        raise ModelingError("resource_units_must_be_positive")
+    rate = device["rates"]["hbm"] / (HBM_CACHELINE_BYTES * owners)
+    device["compute_arch"] = {**arch, "instruction_services": {
+        **services, HBM_CACHELINE_SERVICE: {**service, "per_owner_rate": rate},
+    }}
+
+
 def merge_device_inputs(*declarations):
     """Canonicalize each layer before later aliases override earlier defaults."""
     result = {}
     for raw in declarations:
         data = _normalize(raw)
+        _normalize_l2(data, result.get("buffers", {}))
+        patch = data.copy()
         changed_preset = False
         if "compute_arch" in data:
             previous_arch = result.get("compute_arch", {})
@@ -567,6 +618,7 @@ def merge_device_inputs(*declarations):
             data["physical_mechanisms"] = _merge_physical_mechanisms(
                 result.get("physical_mechanisms"), data["physical_mechanisms"])
         result.update(data)
+        _update_cacheline_supply(result, patch)
     return result
 
 
@@ -576,20 +628,31 @@ def resolve_device_placements(records, count, ranks_per_node, dies_per_package):
     width = max(1, int(ranks_per_node))
     per_package = max(1, int(dies_per_package))
     packages_per_node = max(1, math.ceil(width / per_package))
-    bases, offsets, placements = {}, {}, []
+    next_package, occupancy, slots = {}, {}, []
     for index in range(int(count)):
         record = (records[index] if index < len(records)
                   and isinstance(records[index], Mapping) else {})
         rank = int(record.get("rank", index))
         node = int(record.get("node", index // width))
-        if node not in bases:
-            bases[node] = len(bases) * packages_per_node
-            offsets[node] = 0
+        next_package.setdefault(node, len(next_package) * packages_per_node)
         package = record.get("package")
+        if package is not None:
+            package = int(package)
+            key = (node, package)
+            occupancy[key] = occupancy.get(key, 0) + 1
+            if occupancy[key] > per_package:
+                raise ModelingError(f"package_die_limit_exceeded:{node}:{package}")
+        slots.append((rank, node, package))
+    placements = []
+    for rank, node, package in slots:
         if package is None:
-            package = bases[node] + offsets[node] // per_package
-            offsets[node] += 1
-        placements.append((rank, node, int(package)))
+            package = next_package[node]
+            while occupancy.get((node, package), 0) == per_package:
+                package += 1
+            next_package[node] = package
+            key = (node, package)
+            occupancy[key] = occupancy.get(key, 0) + 1
+        placements.append((rank, node, package))
     return tuple(placements)
 
 

@@ -26,7 +26,8 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
-from mindie_sim.schema.common import ModelingError
+from .common import ModelingError
+from .compute_arch import canonical_format
 
 
 def _items(value: Any, reason: str) -> tuple[tuple[str, Any], ...]:
@@ -49,7 +50,13 @@ def _peak_map(peaks: Any) -> dict[str, float]:
         values = dict(_items(peaks, "compute_peaks_invalid"))
     except (TypeError, ValueError) as exc:
         raise ModelingError("compute_peaks_invalid") from exc
-    return {str(name): float(value) for name, value in values.items()}
+    result = {}
+    for name, value in values.items():
+        key = canonical_format(name)
+        if key in result and result[key] != value:
+            raise ModelingError(f"compute_peak_spelling_conflict:{key}")
+        result[key] = float(value)
+    return result
 
 
 def _alias_map(aliases: Any) -> dict[str, str]:
@@ -60,6 +67,7 @@ def _alias_map(aliases: Any) -> dict[str, str]:
             raise ModelingError(f"compute_peak_alias_invalid:{name!r}")
         if not isinstance(target, str) or not target:
             raise ModelingError(f"compute_peak_alias_invalid:{name}")
+        name, target = canonical_format(name), canonical_format(target)
         if name in result and result[name] != target:
             raise ModelingError(f"compute_peak_alias_conflict:{name}")
         result[name] = target
@@ -70,7 +78,7 @@ def resolve_compute_peak_name(
     dtype: str, peaks: Any, aliases: Any,
 ) -> str:
     """Return the native peak name for ``dtype`` (one validated hop chain)."""
-    name = str(dtype)
+    name = canonical_format(dtype)
     mapping = _alias_map(aliases)
     seen: set[str] = set()
     while name in mapping:
@@ -79,6 +87,21 @@ def resolve_compute_peak_name(
         seen.add(name)
         name = mapping[name]
     return name
+
+
+def matrix_peak(dtype, peaks, aliases, arch, *, require_native=False) -> float:
+    """Resolve a reporting alias and check the exact executing matrix format."""
+    name = resolve_compute_peak_name(dtype, peaks, aliases)
+    if arch is not None and arch.has_native_modes():
+        arch.native_mode("matrix", name)
+    elif require_native:
+        raise ModelingError(f"fuse_region_matrix_precision_unsupported:{dtype}")
+    rates = _peak_map(peaks)
+    if name not in rates and name in {"fp8_e4m3", "fp8_e5m2"}:
+        name = "fp8"
+    if name not in rates:
+        raise ModelingError(f"compute_precision_rate_required:{dtype}")
+    return rates[name]
 
 
 def native_compute_peak_items(
