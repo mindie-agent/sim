@@ -147,10 +147,17 @@ def test_kimi_k31_a5_mxfp_and_a3_w4a8_quant_packing_cache_and_recoverssm() -> No
         ),
     )
 
-    opts = adapter.resolve_options(
+    opts_no_optin = adapter.resolve_options(
         model, a5_hw, par_tp4, role="pd_decode", track="shipping",
         requested_options={"num_speculative_tokens": 5, "spec_method": "dspark"},
         field_origins={"num_speculative_tokens": "cli_flag"},
+    )
+    assert dict(opts_no_optin.effective_mechanisms)["recoverssm_enabled"] is False
+
+    opts = adapter.resolve_options(
+        model, a5_hw, par_tp4, role="pd_decode", track="shipping",
+        requested_options={"num_speculative_tokens": 5, "spec_method": "dspark", "use_replayssm": True},
+        field_origins={"num_speculative_tokens": "cli_flag", "use_replayssm": "cli_flag"},
     )
     qplan = adapter.resolve_quant_instantiation(
         model, ckpt_a5, a5_hw, par_tp4, opts, role="pd_decode", phase="decode",
@@ -187,9 +194,11 @@ def test_kimi_k31_a5_mxfp_and_a3_w4a8_quant_packing_cache_and_recoverssm() -> No
     assert len(prep_f.layer_indices) == 69
     assert prep_f.retains_source_tensors is True and prep_f.lifetime == "persistent"
 
-    # Exact CacheStateABI counts & byte widths: 69 KDA + 24 MLA (656 B) + 24 DSA Indexer K (no phantom weights row).
+    # Exact CacheStateABI counts & byte widths: 69 KDA + 29 MLA (24 target + 5 DSpark draft, 656 B) + 24 DSA Indexer K.
     assert len(qplan.recurrent_state_abi) == 69
-    assert len(qplan.kv_cache_abi) == 24
+    assert len(qplan.kv_cache_abi) == 29
+    assert sum(1 for a in qplan.kv_cache_abi if a.scope == "target") == 24
+    assert sum(1 for a in qplan.kv_cache_abi if a.scope == "draft") == 5
     assert len(qplan.index_cache_abi) == 24
     assert qplan.kv_cache_abi[0].total_plane_bytes() == 656
     assert {p.plane_id for p in qplan.index_cache_abi[0].planes} == {"index_k", "index_k_scale"}
@@ -292,7 +301,7 @@ def test_qwen38_flash_next_mxfp_keeps_linear_ple_hc_and_mtp_bf16() -> None:
     assert ports[("draft", 0, "mlp.experts.w13")].linear_method == "dense"
     assert ports[("draft", 0, "mlp.experts.w2")].linear_method == "dense"
 
-    # Exact CacheStateABI counts: 36 GDN + 1 PLE conv (layer 1) + 12 GQA + 12 KPool (factor=4, tail=3).
+    # Exact CacheStateABI counts: 36 GDN + 1 PLE conv (layer 1) + 12 GQA + 12 KPool (factor=4, tail=8).
     gdn_abis = [a for a in qplan.recurrent_state_abi if a.component_role == "recurrent_state"]
     ple_abis = [a for a in qplan.recurrent_state_abi if a.component_role == "ple_conv_state"]
     assert len(gdn_abis) == 36
@@ -300,7 +309,7 @@ def test_qwen38_flash_next_mxfp_keeps_linear_ple_hc_and_mtp_bf16() -> None:
     assert len(qplan.kv_cache_abi) == 12
     assert len(qplan.index_cache_abi) == 12
     assert qplan.index_cache_abi[0].pooling_ratio == 4
-    assert qplan.index_cache_abi[0].tail_slots == 3
+    assert qplan.index_cache_abi[0].tail_slots == 8
     assert qplan.index_cache_abi[0].compressed_append_units(5, 4) == 1
 
 

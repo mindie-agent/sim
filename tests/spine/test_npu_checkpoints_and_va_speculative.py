@@ -450,8 +450,12 @@ def test_fia_ceiling_and_aclgraph_capture_multiples() -> None:
     )
     assert sizes == (5, 10, 15, 20)
     assert validate_aclgraph_capture_sizes(sizes, num_speculative_tokens=4) == ()
-    bad_warns = validate_aclgraph_capture_sizes([1, 4, 8], num_speculative_tokens=4)
-    assert len(bad_warns) == 1 and "not_multiples_of_5" in bad_warns[0]
+    # MRV2 (default) rounds capture sizes up to stride (K + 1 = 5); [1, 4, 8] captures 5 <= 8.
+    assert validate_aclgraph_capture_sizes([1, 4, 8], num_speculative_tokens=4) == ()
+    mrv2_bad = validate_aclgraph_capture_sizes([1, 4], num_speculative_tokens=4)
+    assert len(mrv2_bad) == 1 and "not_multiples_of_5" in mrv2_bad[0]
+    mrv1_bad = validate_aclgraph_capture_sizes([1, 4, 8], num_speculative_tokens=4, use_v2_model_runner=False)
+    assert len(mrv1_bad) == 1 and "not_multiples_of_5" in mrv1_bad[0]
 
     from mindie_sim.stacks.vllm_ascend.speculative import normalize_capture_mode
     with pytest.raises(ModelingError, match="unsupported_cudagraph_mode"):
@@ -497,7 +501,8 @@ def test_pd_disaggregation_rules_and_serving_cli_guards() -> None:
     assert pure_pd.decode_speculative_config["num_speculative_tokens"] == 5
     assert pure_pd.effective_kv_cache_dtype == "int8"
     assert "--kv-cache-dtype int8" in pure_pd.cli_flags
-    assert pure_pd.additional_config["enable_weight_nz_layout"] is True
+    assert pure_pd.additional_config["weight_nz_mode"] == 1
+    assert "enable_weight_nz_layout" not in pure_pd.additional_config
     assert "HCCS" in pure_pd.collective_guidance and "SIO" in pure_pd.collective_guidance
 
     # A2 cross-node RoCE guidance + strict FIA ceiling (K=20 fails fast, K=15 admits).
@@ -514,7 +519,7 @@ def test_pd_disaggregation_rules_and_serving_cli_guards() -> None:
     assert "RoCE" in a2_rules.collective_guidance
     assert "--no-enable-prefix-caching" in a2_rules.cli_flags
     assert a2_rules.enable_ep_weight_filter is False
-    assert a2_rules.additional_config["enable_weight_nz_layout"] is True
+    assert a2_rules.additional_config["weight_nz_mode"] == 1
 
 
 def test_draft_kv_clamps_to_draft_spec_and_guards_mla_prolog() -> None:
