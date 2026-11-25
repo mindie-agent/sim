@@ -11,12 +11,29 @@
 [Side-Effect Policy] Returns operators without measurements or device activity.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.implementations import preserve_graph
 from mindie_sim.prediction.mechanism import PlannedRecipe
 from mindie_sim.prediction.operators.grouped_moe import grouped_gemm
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="175ef4d49c2072f9233619636f0309f4f88b4e2c",
+        relative_path="vllm_ascend/ops/fused_moe/moe_mlp.py",
+        source_sha256="6b5f4f6d3259cb14e0613a6f7b1c2592331f143a14cf7240dd9d49a0a57dd53b",
+    ),
+    SourceRef(
+        repository="Ascend/op-plugin",
+        revision="48189acf95882e23fae56ea96ceeb89358cb42da",
+        relative_path="op_plugin/ops/opapi/GroupedMatmulKernelNpuOpApi.cpp",
+        source_sha256="a58dd51addfa3511735fcf1f46355a4597f62920cc5d24edc335b59610128fdc",
+    ),
+)
 
 _BASES = {"declared_integer_counts", "forced_balanced_integer_counts",
           "explicit_token_routing_integer"}
@@ -217,6 +234,34 @@ def _local_bank(realization, rows, n, k):
     return local_rows, local_ids, physical_ids, global_rows
 
 
+def _strided_local_bank(realization, rows, n, k):
+    """Validate a packed local weight bank whose logical IDs are strided across EP."""
+    local_rows = _validated_rows(realization.get("local_expert_rows"), "local_expert_rows")
+    physical_ids = _validated_rows(
+        realization.get("representative_expert_ids"), "representative_expert_ids")
+    local_ids = tuple(realization.get("local_weight_expert_ids", range(len(local_rows))))
+    global_rows = _validated_rows(realization.get("global_expert_rows"), "global_expert_rows")
+    rank = realization.get("representative_rank")
+    bank = len(local_rows)
+    if len(local_ids) != bank or local_ids != tuple(range(bank)):
+        raise ModelingError("grouped_gemm_local_weight_ids_must_be_contiguous_bank_slots")
+    if len(physical_ids) != bank or len(set(physical_ids)) != bank:
+        raise ModelingError("grouped_gemm_representative_expert_ids_must_match_local_bank")
+    if type(rank) is not int or rank < 0:
+        raise ModelingError("grouped_gemm_contiguous_bank_requires_valid_representative_rank")
+    if any(expert >= len(global_rows) for expert in physical_ids):
+        raise ModelingError("grouped_gemm_representative_expert_ids_out_of_global_range")
+    global_slice = tuple(global_rows[expert] for expert in physical_ids)
+    if global_slice != local_rows:
+        raise ModelingError("grouped_gemm_local_rows_must_be_selected_global_bank_slice")
+    parent_rows = realization.get("expert_rows")
+    if parent_rows is not None and tuple(parent_rows) != global_rows:
+        raise ModelingError("grouped_gemm_global_ledger_fields_must_not_disagree")
+    if sum(local_rows) != rows or n < 1 or k < 1:
+        raise ModelingError("grouped_gemm_local_bank_must_conserve_semantic_rows")
+    return local_rows, local_ids, physical_ids, global_rows, global_slice
+
+
 def lower_op(op):
     metadata = dict(op.metadata)
     realization = metadata.get("routing_realization")
@@ -245,6 +290,12 @@ def lower_op(op):
             raise ModelingError("grouped_gemm_local_bank_has_no_valid_rows")
         rank = realization.get("representative_rank")
         global_slice = tuple(global_rows[rank * len(counts):(rank + 1) * len(counts)])
+        provenance = "contiguous_local_bank"
+    elif placement == "strided_ep":
+        counts, group_ids, physical_ids, global_rows, global_slice = _strided_local_bank(
+            realization, rows, n, k)
+        if not counts or sum(counts) == 0:
+            raise ModelingError("grouped_gemm_local_bank_has_no_valid_rows")
         provenance = "contiguous_local_bank"
     elif placement is None:
         counts = _validated_rows(realization.get("expert_rows"), "expert_rows")
