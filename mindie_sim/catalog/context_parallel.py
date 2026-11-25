@@ -411,27 +411,36 @@ def _sparse_sequence_moments(
     return (caps, pinned, sem_means, variances, residual_caps, weight * sel)
 
 
-def _waterfill_other_ranks(
-    remaining: float, caps: Sequence[float], exclude: int,
+def _waterfill_with_floors(
+    remaining: float,
+    floors: Sequence[float],
+    caps: Sequence[float],
+    *,
+    exclude: int = -1,
 ) -> list[float]:
-    """Distribute ``remaining`` across ``r != exclude`` bounded by ``[0, caps[r]]``."""
+    """Waterfill ``remaining`` movable rows to minimize peak ``floor[r] + add[r] <= cap[r]``."""
     cp = len(caps)
-    alloc = [0.0] * cp
+    alloc = [0.0 if r == exclude else float(floors[r]) for r in range(cp)]
     rem = max(0.0, float(remaining))
-    active = [r for r in range(cp) if r != exclude and caps[r] > 1e-12]
-    while rem > 1e-12 and active:
-        share = rem / float(len(active))
-        saturated = [r for r in active if alloc[r] + share >= caps[r] - 1e-12]
-        if saturated:
-            for r in saturated:
-                rem = max(0.0, rem - (caps[r] - alloc[r]))
-                alloc[r] = float(caps[r])
-            sat_set = set(saturated)
-            active = [r for r in active if r not in sat_set]
-        else:
-            for r in active:
-                alloc[r] += share
+    movable = [r for r in range(cp) if r != exclude and alloc[r] < float(caps[r]) - 1e-12]
+    while rem > 1e-12 and movable:
+        min_lvl = min(alloc[r] for r in movable)
+        lowest = [r for r in movable if alloc[r] <= min_lvl + 1e-12]
+        upper_cands = [float(caps[r]) for r in lowest] + [
+            alloc[r] for r in movable if alloc[r] > min_lvl + 1e-12
+        ]
+        next_lvl = min(upper_cands)
+        step = (next_lvl - min_lvl) * float(len(lowest))
+        if rem <= step + 1e-12:
+            share = rem / float(len(lowest))
+            for r in lowest:
+                alloc[r] = min(float(caps[r]), alloc[r] + share)
             rem = 0.0
+            break
+        for r in lowest:
+            alloc[r] = next_lvl
+        rem = max(0.0, rem - step)
+        movable = [r for r in movable if alloc[r] < float(caps[r]) - 1e-12]
     return alloc
 
 
@@ -441,15 +450,19 @@ def _apply_sparse_imbalance_override(
     alpha: float,
     total: float,
 ) -> tuple[tuple[float, ...], tuple[tuple[float, ...], ...]]:
-    """Place ``min(cap[r*], alpha * total / cp)`` on highest-capacity rank ``r*``."""
-    eff_caps = [sum(min(m[0][r], m[5]) for m in moments) for r in range(cp)]
+    """Place ``min(hi[r*], alpha * total / cp)`` on highest-capacity rank ``r*`` respecting pinned rows."""
+    eff_caps = [
+        sum(m[1][r] + min(m[4][r], max(0.0, m[5] - sum(m[1]))) for m in moments)
+        for r in range(cp)
+    ]
     raw_caps = [sum(m[0][r] for m in moments) for r in range(cp)]
     r_star = max(range(cp), key=lambda r: (eff_caps[r], raw_caps[r]))
     bounds: list[tuple[float, float]] = []
-    for caps_i, _, _, _, _, tot_i in moments:
-        other_cap = sum(caps_i[r] for r in range(cp) if r != r_star)
-        lo_i = max(0.0, tot_i - other_cap)
-        hi_i = min(caps_i[r_star], tot_i)
+    for _caps_i, pinned_i, _, _, res_caps_i, tot_i in moments:
+        rem_tot_i = max(0.0, tot_i - sum(pinned_i))
+        other_res = sum(res_caps_i[r] for r in range(cp) if r != r_star)
+        lo_i = pinned_i[r_star] + max(0.0, rem_tot_i - other_res)
+        hi_i = pinned_i[r_star] + min(res_caps_i[r_star], rem_tot_i)
         bounds.append((lo_i, hi_i))
     sum_lo = sum(lo for lo, _ in bounds)
     sum_hi = sum(hi for _, hi in bounds)
@@ -457,9 +470,11 @@ def _apply_sparse_imbalance_override(
     span = sum_hi - sum_lo
     frac = (k_star_batch - sum_lo) / span if span > 1e-12 else 0.0
     per_seq: list[tuple[float, ...]] = []
-    for (caps_i, _, _, _, _, tot_i), (lo_i, hi_i) in zip(moments, bounds):
+    for (caps_i, pinned_i, _, _, _res_caps_i, tot_i), (lo_i, hi_i) in zip(moments, bounds):
         k_star_i = lo_i + (hi_i - lo_i) * frac
-        alloc_i = _waterfill_other_ranks(max(0.0, tot_i - k_star_i), caps_i, exclude=r_star)
+        other_pinned = sum(pinned_i[r] for r in range(cp) if r != r_star)
+        rem_other = max(0.0, tot_i - k_star_i - other_pinned)
+        alloc_i = _waterfill_with_floors(rem_other, pinned_i, caps_i, exclude=r_star)
         alloc_i[r_star] = k_star_i
         per_seq.append(tuple(alloc_i))
     batch_per_rank = tuple(sum(row[r] for row in per_seq) for r in range(cp))

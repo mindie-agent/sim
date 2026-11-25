@@ -17,19 +17,37 @@ from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 
-from mindie_sim.catalog.cache import layer_cache_components
-from mindie_sim.catalog.context_parallel import cp_interleave, layer_dcp_degree
+from mindie_sim.catalog.cache import gbsa_cache_layout, layer_cache_components
+from mindie_sim.catalog.cache_format import (
+    _resolve_index_cache_format,
+    cache_format,
+    gqa_kv_formats,
+)
+from mindie_sim.catalog.context_parallel import (
+    cp_interleave,
+    dcp_indexer_sharded,
+    layer_dcp_degree,
+    layer_dcp_factors,
+)
 from mindie_sim.catalog.draft import optional_draft_spec
 from mindie_sim.catalog.draft_geometry import draft_layer_plans
 from mindie_sim.schema.common import ModelingError
 
 from ..pd_connector import PDHandoff, PDTransfer
-from ..disaggregated.ranges import address, exact_int_bytes, owned_runs, transfers_for_runs
+from ..disaggregated.ranges import (
+    address,
+    canonical_physical_rank,
+    exact_int_bytes,
+    interleaved_token_runs,
+    owned_runs,
+    transfers_for_runs,
+)
 
 _NON_NEURAL_SPEC_METHODS = frozenset({"none", "ngram", "ngram_gpu"})
 
 HEAD_COMPONENTS = frozenset({"gqa_kv", "window"})
 ROW_COMPONENTS = frozenset({"mla_kv", "window", "compressed_kv", "index_k"})
+_TOKEN_ADDITIVE_COMPONENTS = HEAD_COMPONENTS | ROW_COMPONENTS | frozenset({"gqa_k", "gqa_v"})
 SHARDED_STATE_COMPONENTS = frozenset({"recurrent_state", "conv_state"})
 TRANSIENT_STATE_COMPONENTS = frozenset({"replay_records", "state_transient"})
 VALID_PD_CONNECTORS = frozenset({
@@ -339,8 +357,11 @@ def _resolve_active_draft_handoff(
     )
 
 
-def _handoff_rank_views(case, layer, parallel, ranks, ledger, owners,
-                        head_spans, has_head_axis, tokens):
+def _handoff_rank_views(
+    case, layer, parallel, ranks, ledger, owners,
+    head_spans, has_head_axis, tokens,
+    *, stage: int = 0, replica: int = 0, phase: str = "prefill",
+):
     eff_cp = layer_dcp_degree(layer, parallel)
     if owners is not None:
         spans = tuple(_token_span(ledger, index, tokens) for index in range(len(ranks)))
@@ -353,24 +374,40 @@ def _handoff_rank_views(case, layer, parallel, ranks, ledger, owners,
             )
             for index in range(len(ranks))
         )
-        # Preserve exact DCP interleaved ownership in layer_cache_components for row/MLA caches
-        # when caller did not provide explicit T05 owner spans.
-        component_owners = spans if (has_head_axis or eff_cp <= 1) else None
+        # Preserve exact DCP interleaved ownership in layer_cache_components
+        # whenever caller did not supply explicit T05 owner spans.
+        component_owners = None
     interleave = cp_interleave(case.runtime)
+    dsa_non_dcp_idx = (
+        owners is None
+        and eff_cp > 1
+        and getattr(parallel, "cp_plan", "") == "dsa_cp"
+        and getattr(layer, "owns_index_k", False)
+        and not dcp_indexer_sharded(case.model, case.runtime)
+        and layer_dcp_factors(layer, parallel)[2] <= 1
+    )
     result = []
     for index, rank in enumerate(ranks):
+        if owners is not None:
+            cache_rank = index
+        elif dsa_non_dcp_idx:
+            cache_rank = index % eff_cp
+        else:
+            cache_rank = canonical_physical_rank(
+                index, parallel, stage=stage, replica=replica, cohort_size=len(ranks),
+            )
         raw_components = layer_cache_components(
             case.model, layer, parallel, tokens, capacity_padded=False,
             interleave=interleave,
-            rank=index, owner_spans=component_owners,
-            runtime=case.runtime, query_tokens=1, phase="prefill",
+            rank=cache_rank, owner_spans=component_owners,
+            runtime=case.runtime, query_tokens=1, phase=phase,
         )
         components = {
             name: exact_int_bytes(val, f"pd_component_bytes:{name}")
             for name, val in raw_components.items()
             if name not in TRANSIENT_STATE_COMPONENTS
         }
-        result.append((index, rank, components, spans[index]))
+        result.append((index, rank, components, spans[index], cache_rank))
     return result
 
 
@@ -401,7 +438,7 @@ def compute_expected_pd_handoff_demand(
     pp = max(1, int(d_par.pp))
     if n_tokens <= 0:
         return PdExpectedDemand(0, 0, 0, 0, 0, tuple(0.0 for _ in range(pp)), None)
-    d_topo = _CohortStageTopology(d_par, rank_offset=0)
+    d_topo = _CohortStageTopology(d_par, machine=decode_case.machine, rank_offset=0)
     offload, offload_layers, hot_tokens = _sparse_offload_params(decode_memory, n_tokens)
     target_owners = getattr(decode_memory, "rank_token_owners", None)
     stage_hbm_total = [0] * pp
@@ -418,17 +455,18 @@ def compute_expected_pd_handoff_demand(
         dst_views = _handoff_rank_views(
             decode_case, layer, d_par, dst_ranks, decode_memory,
             target_owners, target_spans, has_head_axis, n_tokens,
+            stage=st, replica=0, phase="decode",
         )
         window = int(getattr(layer, "window", 0) or 0)
         host_counted = False
-        for index, _rank, values, span in dst_views:
+        for _index, _rank, values, span, cache_rank in dst_views:
             for comp, comp_bytes in values.items():
                 if comp_bytes <= 0:
                     continue
                 if offload and comp == "mla_kv" and layer.index in offload_layers:
                     win_start = max(0, n_tokens - window) if window > 0 else 0
                     runs = owned_runs(
-                        comp, layer, decode_case.model, d_par, index, span,
+                        comp, layer, decode_case.model, d_par, cache_rank, span,
                         n_tokens, win_start, runtime=decode_case.runtime,
                         explicit_span=(target_owners is not None),
                     )
@@ -464,8 +502,9 @@ def compute_expected_pd_handoff_demand(
                 dst_views = _handoff_rank_views(
                     decode_case, d_layer, d_par, dst_ranks, decode_memory,
                     target_owners, target_spans, has_head_axis, active_draft.eff_tokens,
+                    stage=draft_st, replica=0, phase="decode",
                 )
-                for _index, _rank, values, _span in dst_views:
+                for _index, _rank, values, _span, _cache_rank in dst_views:
                     for comp, comp_bytes in values.items():
                         if comp_bytes <= 0:
                             continue
@@ -476,18 +515,13 @@ def compute_expected_pd_handoff_demand(
                             draft_kv_total += comp_bytes
         else:
             d_cp = int(d_par.cp) if active_draft.d_sharded else 1
-            draft_num_heads = int(getattr(active_draft.d_draft_spec, "num_kv_heads", 0) or 0)
-            draft_gqa = (
-                str(getattr(active_draft.d_draft_spec, "attention_kind", "")) != "mla"
-                and draft_num_heads > 0
-            )
-            draft_head_spans = _local_head_spans(draft_num_heads, d_par.tp) if draft_gqa else ()
             for index in range(len(dst_ranks)):
-                lo, hi = _head_token_span(
-                    index, active_draft.eff_tokens, draft_head_spans, d_cp,
-                    total_ranks=len(dst_ranks), parallel=d_par,
+                runs = _draft_token_runs(
+                    decode_case, d_par, decode_memory, index, active_draft.eff_tokens,
+                    d_cp, stage=draft_st, replica=0, cohort_size=len(dst_ranks),
                 )
-                layer_bytes = (hi - lo) * active_draft.d_row_bytes
+                owned_rows = sum(hi - lo for lo, hi in runs)
+                layer_bytes = owned_rows * active_draft.d_row_bytes
                 total_rank_draft = layer_bytes * int(active_draft.d_draft_spec.layers)
                 stage_hbm_total[draft_st] += total_rank_draft
                 draft_kv_total += total_rank_draft
@@ -589,15 +623,15 @@ def _emit_state_transfers(
     is_sharded = raw_component in SHARDED_STATE_COMPONENTS
     attn = str(getattr(layer, "attention", "") or "").strip().lower()
     if not is_sharded:
-        for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
+        for dest_index, dest_rank, dest_values, dest_tokens, _ in dst_views:
             need = dest_values.get(raw_component, 0)
             if need <= 0:
                 continue
-            src_index, src_rank, src_values, src_tokens = src_views[dest_index % len(src_views)]
+            src_index, src_rank, src_values, src_tokens, _ = src_views[dest_index % len(src_views)]
             avail = src_values.get(raw_component, 0)
-            if avail < need:
+            if avail != need:
                 raise ModelingError(
-                    f"pd_handoff_component_range_uncovered:{request}:{logical_layer}:{emitted_component}"
+                    f"pd_handoff_cache_abi_mismatch:{request}:{logical_layer}:{emitted_component}:src={avail}:dst={need}"
                 )
             emit(
                 src_rank, dest_rank, emitted_component, need,
@@ -629,13 +663,13 @@ def _emit_state_transfers(
         return tp_i, dp_i * pcp_n + pcp_i
 
     src_by_shard: dict[int, list[tuple[int, int, int, tuple[int, int]]]] = defaultdict(list)
-    for src_index, src_rank, src_values, src_tokens in src_views:
+    for src_index, src_rank, src_values, src_tokens, _ in src_views:
         avail = src_values.get(raw_component, 0)
         if avail > 0:
             j_p, p_plane = _shard_and_plane(src_index, prefill_p)
             src_by_shard[j_p].append((p_plane, src_rank, avail, src_tokens))
 
-    for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
+    for dest_index, dest_rank, dest_values, dest_tokens, _ in dst_views:
         need = dest_values.get(raw_component, 0)
         if need <= 0:
             continue
@@ -651,6 +685,10 @@ def _emit_state_transfers(
                     f"pd_handoff_component_range_uncovered:{request}:{logical_layer}:{emitted_component}"
                 )
             _, src_rank, avail, src_tokens = cands[d_plane % len(cands)]
+            if avail != need * tp_ratio:
+                raise ModelingError(
+                    f"pd_handoff_cache_abi_mismatch:{request}:{logical_layer}:{emitted_component}:src={avail}:dst={need}"
+                )
             src_storage = f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}"
             if tp_ratio == 1:
                 emit(
@@ -692,6 +730,10 @@ def _emit_state_transfers(
                         f"pd_handoff_component_range_uncovered:{request}:{logical_layer}:{emitted_component}"
                     )
                 _, src_rank, avail, src_tokens = cands[d_plane % len(cands)]
+                if need != avail * tp_ratio:
+                    raise ModelingError(
+                        f"pd_handoff_cache_abi_mismatch:{request}:{logical_layer}:{emitted_component}:src={avail}:dst={need}"
+                    )
                 src_storage = f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}"
                 if raw_component == "conv_state":
                     _emit_conv_displaced_slices(
@@ -715,28 +757,146 @@ def _emit_state_transfers(
                     )
 
 
-def _gqa_kv_plane_weights(model: Any, layer: Any) -> tuple[int, int]:
+def _gqa_kv_plane_weights(model: Any, layer: Any, *, phase: str = "decode") -> tuple[int, int]:
     """Return exact positive integer ``(k_bytes, v_bytes)`` weights per head-token."""
     if model is None:
         return 1, 1
-    from mindie_sim.catalog.cache_format import gqa_kv_formats
-
-    k_fmt, v_fmt, is_shared = gqa_kv_formats(model, plan=layer)
-    if is_shared:
+    k_fmt, v_fmt, is_shared = gqa_kv_formats(model, plan=layer, phase=phase)
+    k_dim = max(1, int(getattr(layer, "head_dim", 0) or getattr(model, "head_dim", 1) or 1))
+    v_dim = max(1, int(getattr(layer, "v_head_dim", 0) or k_dim))
+    if is_shared and k_dim == v_dim:
         return 1, 1
-    head_dim = max(1, int(getattr(layer, "head_dim", 0) or getattr(model, "head_dim", 1) or 1))
-    k_b = max(1, int(k_fmt.row_bytes(head_dim)))
-    v_b = max(1, int(v_fmt.row_bytes(head_dim)))
+    k_b = max(1, int(k_fmt.row_bytes(k_dim)))
+    v_b = max(1, int(v_fmt.row_bytes(v_dim)))
     return k_b, v_b
+
+
+def _assert_matching_cache_abi(
+    prefill_case: Any, decode_case: Any, layer: Any, raw_component: str,
+    request: str, logical_layer: int,
+) -> None:
+    """Fail closed when prefill and decode declare incompatible cache wire formats."""
+    if raw_component in {"gqa_kv", "index_k"}:
+        if gbsa_cache_layout(prefill_case.runtime) != gbsa_cache_layout(decode_case.runtime):
+            raise ModelingError(
+                f"pd_handoff_cache_abi_mismatch:{request}:{logical_layer}:{raw_component}"
+            )
+    if raw_component == "gqa_kv":
+        p_fmt = gqa_kv_formats(prefill_case.model, plan=layer, phase="prefill")
+        d_fmt = gqa_kv_formats(decode_case.model, plan=layer, phase="decode")
+        if p_fmt != d_fmt:
+            raise ModelingError(
+                f"pd_handoff_cache_abi_mismatch:{request}:{logical_layer}:{raw_component}"
+            )
+        return
+    if raw_component == "index_k":
+        p_fmt = _resolve_index_cache_format(prefill_case.model, layer, phase="prefill")
+        d_fmt = _resolve_index_cache_format(decode_case.model, layer, phase="decode")
+        if p_fmt != d_fmt:
+            raise ModelingError(
+                f"pd_handoff_cache_abi_mismatch:{request}:{logical_layer}:{raw_component}"
+            )
+        return
+    if raw_component in ROW_COMPONENTS:
+        p_fmt = cache_format(prefill_case.model, raw_component, plan=layer, phase="prefill")
+        d_fmt = cache_format(decode_case.model, raw_component, plan=layer, phase="decode")
+        if p_fmt != d_fmt:
+            raise ModelingError(
+                f"pd_handoff_cache_abi_mismatch:{request}:{logical_layer}:{raw_component}"
+            )
+
+
+def _consecutive_int_runs(values) -> list[list[int]]:
+    ordered = sorted(int(v) for v in values)
+    if not ordered:
+        return []
+    runs: list[list[int]] = [[ordered[0]]]
+    for val in ordered[1:]:
+        if val == runs[-1][-1] + 1:
+            runs[-1].append(val)
+        else:
+            runs.append([val])
+    return runs
+
+
+def _packed_run_offsets(runs: tuple[tuple[int, int], ...]) -> tuple[int, ...]:
+    prefix = 0
+    offsets: list[int] = []
+    for lo, hi in runs:
+        offsets.append(prefix)
+        prefix += hi - lo
+    return tuple(offsets)
+
+
+def _intersect_head_runs(
+    src_runs: tuple[tuple[int, int], ...],
+    src_offsets: tuple[int, ...],
+    dst_runs: tuple[tuple[int, int], ...],
+    dst_offsets: tuple[int, ...],
+):
+    for (d_lo, d_hi), d_prefix in zip(dst_runs, dst_offsets):
+        for (s_lo, s_hi), s_prefix in zip(src_runs, src_offsets):
+            lo, hi = max(s_lo, d_lo), min(s_hi, d_hi)
+            if hi > lo:
+                yield s_lo, s_prefix, d_lo, d_prefix, lo, hi
+
+
+def _emit_head_piece_groups(
+    emit, request, emitted_component, logical_layer, source_stage, destination_stage,
+    src_rank, dest_rank, src_storage, dst_storage, sspan, dspan,
+    src_runs, dst_runs, src_rows, dst_rows, src_comp_bytes, need, per_head_token,
+    s_lo, s_prefix, d_lo, d_prefix, grouped, split_kv, model, layer,
+) -> None:
+    del src_runs, dst_runs, src_rows, dst_rows
+    if split_kv:
+        k_w, v_w = _gqa_kv_plane_weights(model, layer, phase="decode")
+        tot_w = k_w + v_w
+        plane_specs = (("gqa_k", k_w), ("gqa_v", v_w))
+        for total_val in (per_head_token, src_comp_bytes, need):
+            if (total_val * k_w) % tot_w != 0 or (total_val * v_w) % tot_w != 0:
+                raise ModelingError(f"pd_transfer_split_kv_non_integer:{request}:{logical_layer}")
+    else:
+        tot_w = 1
+        plane_specs = ((emitted_component, 1),)
+    src_heads = sspan[1] - sspan[0]
+    dst_heads = dspan[1] - dspan[0]
+    for (piece_lo, piece_hi), heads in grouped.items():
+        for group in _consecutive_int_runs(heads):
+            head_slice = (group[0], group[-1] + 1)
+            full_row = len(group) == src_heads == dst_heads
+            token_chunks = (
+                ((piece_lo, piece_hi),)
+                if full_row
+                else tuple((tok, tok + 1) for tok in range(piece_lo, piece_hi))
+            )
+            for t_lo, t_hi in token_chunks:
+                src_off = (s_prefix + (t_lo - s_lo)) * src_heads + (group[0] - sspan[0])
+                dst_off = (d_prefix + (t_lo - d_lo)) * dst_heads + (group[0] - dspan[0])
+                for plane, plane_w in plane_specs:
+                    unit = (per_head_token * plane_w) // tot_w
+                    src_plane_size = (src_comp_bytes * plane_w) // tot_w
+                    dst_plane_size = (need * plane_w) // tot_w
+                    payload = unit * (t_hi - t_lo) * len(group)
+                    emit(
+                        src_rank, dest_rank, plane, payload,
+                        source_stage=source_stage, destination_stage=destination_stage,
+                        layer=logical_layer, source_span=head_slice, destination_span=head_slice,
+                        source_tokens=(t_lo, t_hi), destination_tokens=(t_lo, t_hi),
+                        source_storage=src_storage, destination_storage=dst_storage,
+                        source_size=src_plane_size, source_displacement=unit * src_off,
+                        destination_size=dst_plane_size, destination_displacement=unit * dst_off,
+                    )
 
 
 def _emit_head_transfers(
     emit, request, emitted_component, raw_component, layer, logical_layer,
     source_stage, destination_stage, prefill_rep, decode_rep,
-    src_views, dst_views, source_spans, target_spans, prefill_p, decode_p,
-    windowed, window_start, tokens, split_kv, *, model: Any = None,
+    src_views, dst_views, source_spans, target_spans,
+    prefill_case, decode_case, prefill_p, decode_p,
+    window_start, tokens, split_kv, *, source_owners=None, target_owners=None,
 ):
-    """Upstream ``push_worker.py:482-505`` contiguous GQA head transfer with replica balance."""
+    """Upstream ``push_worker.py:482-505`` GQA head transfer with exact interleaved DCP runs."""
+    _assert_matching_cache_abi(prefill_case, decode_case, layer, raw_component, request, logical_layer)
     tp_p = max(1, int(prefill_p.tp))
     pcp_p = max(1, int(prefill_p.pcp))
     tp_d = max(1, int(decode_p.tp))
@@ -746,15 +906,25 @@ def _emit_head_transfers(
     p_dcp = layer_dcp_degree(layer, prefill_p)
     d_dcp = layer_dcp_degree(layer, decode_p)
 
-    for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
+    def _build_manifest(case, parallel, views, *, explicit_span: bool):
+        out = []
+        for idx, rank, values, span, cache_rank in views:
+            runs = owned_runs(
+                raw_component, layer, case.model, parallel, cache_rank, span,
+                tokens, window_start, runtime=case.runtime, explicit_span=explicit_span,
+            )
+            out.append((idx, rank, values, runs, _packed_run_offsets(runs), sum(hi - lo for lo, hi in runs)))
+        return out
+
+    src_manifest = _build_manifest(prefill_case, prefill_p, src_views, explicit_span=(source_owners is not None))
+    dst_manifest = _build_manifest(decode_case, decode_p, dst_views, explicit_span=(target_owners is not None))
+
+    for dest_index, dest_rank, dest_values, dst_runs, dst_offsets, dst_rows in dst_manifest:
         need = dest_values.get(raw_component, 0)
         dspan = target_spans[dest_index % max(1, len(target_spans))]
-        d_lo, d_hi = dest_tokens
-        if windowed:
-            d_lo, d_hi = max(window_start, d_lo), min(tokens, d_hi)
-        if need <= 0 or dspan[1] <= dspan[0] or d_hi <= d_lo:
+        if need <= 0 or dspan[1] <= dspan[0] or dst_rows <= 0:
             continue
-        denom = (dspan[1] - dspan[0]) * (d_hi - d_lo)
+        denom = (dspan[1] - dspan[0]) * dst_rows
         if need % denom != 0:
             raise ModelingError(
                 f"pd_transfer_non_integer_head_bytes:{request}:{logical_layer}:{need}:{denom}"
@@ -764,68 +934,49 @@ def _emit_head_transfers(
         d_pcp = (dest_index // tp_d) % pcp_d
         if p_dcp == 1 and d_dcp == 1:
             ordered_sources = [
-                entry for entry in src_views
+                entry for entry in src_manifest
                 if ((entry[0] // tp_p) % pcp_p) == (d_pcp % pcp_p)
                 and (entry[0] % tp_p) % replicas_p == (d_tp % replicas_p)
             ]
         else:
-            shift = dest_index % max(1, len(src_views))
-            ordered_sources = list(src_views[shift:]) + list(src_views[:shift])
+            shift = dest_index % max(1, len(src_manifest))
+            ordered_sources = list(src_manifest[shift:]) + list(src_manifest[:shift])
 
         covered: dict[int, list[tuple[int, int]]] = {}
-        for src_index, src_rank, src_values, src_tokens in ordered_sources:
+        dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{dest_rank}"
+        for src_index, src_rank, src_values, src_runs, src_offsets, src_rows in ordered_sources:
             sspan = source_spans[src_index % max(1, len(source_spans))]
             common = [h for h in range(dspan[0], dspan[1]) if sspan[0] <= h < sspan[1]]
-            if not common:
-                continue
-            s_lo, s_hi = src_tokens
-            if windowed:
-                s_lo, s_hi = max(window_start, s_lo), min(tokens, s_hi)
-            lo, hi = max(s_lo, d_lo), min(s_hi, d_hi)
-            if hi <= lo:
-                continue
-            src_storage = f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}"
-            dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{dest_rank}"
-            grouped: dict[tuple[int, int], list[int]] = {}
-            for head in common:
-                for piece_lo, piece_hi in _uncovered_intervals(covered.get(head, ()), lo, hi):
-                    grouped.setdefault((piece_lo, piece_hi), []).append(head)
-                    covered.setdefault(head, []).append((piece_lo, piece_hi))
             src_comp_bytes = src_values.get(raw_component, 0)
-            for (piece_lo, piece_hi), heads in grouped.items():
-                spans_all_rows = (piece_lo, piece_hi) == (s_lo, s_hi) == (d_lo, d_hi)
-                consecutive = heads[-1] - heads[0] + 1 == len(heads)
-                groups = [heads] if (spans_all_rows and consecutive) else [[h] for h in heads]
-                if split_kv:
-                    k_w, v_w = _gqa_kv_plane_weights(model, layer)
-                    tot_w = k_w + v_w
-                    plane_specs = (("gqa_k", k_w), ("gqa_v", v_w))
-                    for total_val in (per_head_token, src_comp_bytes, need):
-                        if (total_val * k_w) % tot_w != 0 or (total_val * v_w) % tot_w != 0:
-                            raise ModelingError(f"pd_transfer_split_kv_non_integer:{request}:{logical_layer}")
-                else:
-                    tot_w = 1
-                    plane_specs = ((emitted_component, 1),)
-                for group in groups:
-                    src_off = (group[0] - sspan[0]) * (s_hi - s_lo) + (piece_lo - s_lo)
-                    dst_off = (group[0] - dspan[0]) * (d_hi - d_lo) + (piece_lo - d_lo)
-                    for plane, plane_w in plane_specs:
-                        unit = (per_head_token * plane_w) // tot_w
-                        src_plane_size = (src_comp_bytes * plane_w) // tot_w
-                        dst_plane_size = (need * plane_w) // tot_w
-                        payload = unit * (piece_hi - piece_lo) * len(group)
-                        emit(
-                            src_rank, dest_rank, plane, payload,
-                            source_stage=source_stage, destination_stage=destination_stage,
-                            layer=logical_layer, source_span=sspan, destination_span=dspan,
-                            source_tokens=(piece_lo, piece_hi), destination_tokens=(piece_lo, piece_hi),
-                            source_storage=src_storage, destination_storage=dst_storage,
-                            source_size=src_plane_size, source_displacement=unit * src_off,
-                            destination_size=dst_plane_size, destination_displacement=unit * dst_off,
-                        )
+            if not common or src_comp_bytes <= 0 or src_rows <= 0:
+                continue
+            src_denom = (sspan[1] - sspan[0]) * src_rows
+            if src_comp_bytes % src_denom != 0 or (src_comp_bytes // src_denom) != per_head_token:
+                raise ModelingError(
+                    f"pd_handoff_cache_abi_mismatch:{request}:{logical_layer}:{raw_component}"
+                )
+            src_storage = f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}"
+            for s_lo, s_prefix, d_lo, d_prefix, lo, hi in _intersect_head_runs(
+                src_runs, src_offsets, dst_runs, dst_offsets,
+            ):
+                grouped: dict[tuple[int, int], list[int]] = {}
+                for head in common:
+                    for piece_lo, piece_hi in _uncovered_intervals(covered.get(head, ()), lo, hi):
+                        grouped.setdefault((piece_lo, piece_hi), []).append(head)
+                        covered.setdefault(head, []).append((piece_lo, piece_hi))
+                if grouped:
+                    _emit_head_piece_groups(
+                        emit, request, emitted_component, logical_layer,
+                        source_stage, destination_stage, src_rank, dest_rank,
+                        src_storage, dst_storage, sspan, dspan,
+                        src_runs, dst_runs, src_rows, dst_rows,
+                        src_comp_bytes, need, per_head_token,
+                        s_lo, s_prefix, d_lo, d_prefix, grouped,
+                        split_kv, decode_case.model, layer,
+                    )
         missing = [
             h for h in range(dspan[0], dspan[1])
-            if sum(p_hi - p_lo for p_lo, p_hi in covered.get(h, ())) < d_hi - d_lo
+            if sum(p_hi - p_lo for p_lo, p_hi in covered.get(h, ())) < dst_rows
         ]
         if missing:
             raise ModelingError(
@@ -841,19 +992,21 @@ def _emit_row_transfers(
     destination, *, source_owners=None, target_owners=None,
 ):
     """Upstream ``push_worker.py:470-481`` DCP-group-filtered MLA/index row transfer."""
+    _assert_matching_cache_abi(prefill_case, decode_case, layer, raw_component, request, logical_layer)
+
     def manifest(case, parallel, entries, *, explicit_span: bool):
         return [
             (
                 index,
                 rank,
                 owned_runs(
-                    raw_component, layer, case.model, parallel, index, span,
+                    raw_component, layer, case.model, parallel, cache_rank, span,
                     tokens, window_start, runtime=case.runtime,
                     explicit_span=explicit_span,
                 ),
                 values.get(raw_component, 0),
             )
-            for index, rank, values, span in entries
+            for index, rank, values, span, cache_rank in entries
         ]
 
     src_manifest = manifest(prefill_case, prefill_p, src_views, explicit_span=(source_owners is not None))
@@ -888,16 +1041,28 @@ def _emit_row_transfers(
             grouped_sources[j_p // eff_p_dcp].append((rank, runs, size))
 
     sparse_layer = offload and raw_component == "mla_kv" and logical_layer in offload_layers
-    receivers: list[tuple[int, int, tuple[tuple[int, int], ...], str, str]] = []
+    receivers: list[tuple[int, int, tuple[tuple[int, int], ...], str, str, int | None]] = []
+    dst_row_unit: int | None = None
+    for _dst_idx, _rank, runs, need in dst_manifest:
+        n_rows = sum(hi - lo for lo, hi in runs)
+        if need > 0 and n_rows > 0:
+            if need % n_rows != 0:
+                raise ModelingError(
+                    f"pd_transfer_non_integer_row_bytes:need={need},rows={n_rows}"
+                )
+            dst_row_unit = need // n_rows
+            break
     if sparse_layer:
         host_slot = logical_layer % len(destination)
         receivers.append((
             host_slot, destination[host_slot], ((window_start, tokens),),
-            "host", f"pd:host:{request}:decode:r{decode_rep}",
+            "host", f"pd:host:{request}:decode:r{decode_rep}", dst_row_unit,
         ))
     for dst_idx, rank, runs, need in dst_manifest:
         if need <= 0:
             continue
+        full_rows = sum(hi - lo for lo, hi in runs)
+        rank_unit = (need // full_rows) if full_rows > 0 else dst_row_unit
         if sparse_layer:
             runs = tuple(
                 (max(lo, tokens - hot_tokens), hi)
@@ -906,7 +1071,7 @@ def _emit_row_transfers(
             if not runs:
                 continue
         storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{rank}"
-        receivers.append((dst_idx, rank, runs, "hbm", storage))
+        receivers.append((dst_idx, rank, runs, "hbm", storage, rank_unit))
 
     ratio = (
         max(1, int(layer.compress_ratio or 1), int(layer.index_kpool or 1))
@@ -915,7 +1080,7 @@ def _emit_row_transfers(
         if raw_component == "compressed_kv"
         else 1
     )
-    for dst_idx, dst_rank, runs, tier, storage in receivers:
+    for dst_idx, dst_rank, runs, tier, storage, expected_unit in receivers:
         if use_groups:
             j_d = _upstream_rank_coord(dst_idx, decode_p) if tier == "hbm" else dst_idx
             cand_sources = grouped_sources.get(j_d % replicas) or all_sources
@@ -924,6 +1089,10 @@ def _emit_row_transfers(
         target_rows = sum(hi - lo for lo, hi in runs)
         received = 0
         for src_rank, lo, hi, size, offset, unit in transfers_for_runs(cand_sources, runs):
+            if expected_unit is not None and unit != expected_unit:
+                raise ModelingError(
+                    f"pd_handoff_cache_abi_mismatch:{request}:{logical_layer}:{raw_component}:src={unit}:dst={expected_unit}"
+                )
             token_span = (lo * ratio, hi * ratio)
             emit(
                 src_rank, dst_rank, emitted_component, (hi - lo) * unit,
@@ -937,14 +1106,76 @@ def _emit_row_transfers(
             received += hi - lo
 
 
+def _cohort_stage_ranks(exec_obj: Any, parallel: Any, replica: int, stage: int) -> tuple[int, ...]:
+    """Return full DCP-DP cohort stage ranks for both ``_CohortStageTopology`` and live ``Topology``."""
+    topo = exec_obj.topology
+    if isinstance(topo, _CohortStageTopology):
+        return tuple(topo.ranks(replica, stage))
+    dcp_dp = max(1, int(getattr(parallel, "dcp_dp_width", 1) or 1))
+    if dcp_dp <= 1:
+        return tuple(topo.ranks(replica, stage))
+    first_rep = (int(replica) // dcp_dp) * dcp_dp
+    out: list[int] = []
+    for dp_off in range(dcp_dp):
+        out.extend(topo.ranks(first_rep + dp_off, stage))
+    return tuple(out)
+
+
+def _draft_token_runs(
+    case: Any,
+    parallel: Any,
+    memory: Any,
+    index: int,
+    eff_tokens: int,
+    cp: int,
+    *,
+    stage: int,
+    replica: int,
+    cohort_size: int,
+) -> tuple[tuple[int, int], ...]:
+    """Exact half-open interleaved token runs owned by one rank for non-inherited draft KV."""
+    toks = max(0, int(eff_tokens))
+    if toks <= 0:
+        return ()
+    cp_n = max(1, int(cp))
+    if cp_n <= 1:
+        return ((0, toks),)
+    if getattr(memory, "rank_token_owners", None) is not None:
+        lo, hi = _token_span(memory, index, toks)
+        return ((lo, hi),) if hi > lo else ()
+    block = max(1, int(cp_interleave(case.runtime)))
+    cache_rank = canonical_physical_rank(
+        index, parallel, stage=stage, replica=replica, cohort_size=cohort_size,
+    )
+    return interleaved_token_runs(toks, cp_n, block, cache_rank % cp_n)
+
+
+def pd_destination_rank_offset(prefill_case: Any, decode_case: Any) -> int:
+    """Canonical pool-level connector rank shift (0 when P and D declare disjoint die ranks)."""
+    p_dies = tuple(getattr(getattr(prefill_case, "machine", None), "dies", ()) or ())
+    d_dies = tuple(getattr(getattr(decode_case, "machine", None), "dies", ()) or ())
+    p_ranks = (
+        {int(d.rank) for d in p_dies}
+        if p_dies else set(range(max(1, int(prefill_case.runtime.parallel.world_size))))
+    )
+    d_ranks = (
+        {int(d.rank) for d in d_dies}
+        if d_dies else set(range(max(1, int(decode_case.runtime.parallel.world_size))))
+    )
+    if not (p_ranks and d_ranks and (p_ranks & d_ranks)):
+        return 0
+    offset = max(p_ranks) + 1 - min(d_ranks)
+    return offset if offset > 0 else max(p_ranks) + 1
+
+
 def _bind_layer_handoff(
     layer, logical_layer, source_stage, destination_stage, request, tokens,
     published, emit, prefill_exec, decode_exec, prefill_rep, decode_rep,
     prefill_case, decode_case, prefill_p, decode_p, prefill_mem, decode_mem,
     offload, offload_layers, hot_tokens, *, component_prefix: str = "",
 ):
-    source = tuple(prefill_exec.topology.ranks(prefill_rep, source_stage))
-    destination = tuple(decode_exec.topology.ranks(decode_rep, destination_stage))
+    source = _cohort_stage_ranks(prefill_exec, prefill_p, prefill_rep, source_stage)
+    destination = _cohort_stage_ranks(decode_exec, decode_p, decode_rep, destination_stage)
     if not source or not destination:
         raise ModelingError("pd_handoff_missing_stage_ranks:" + request)
     num_heads = int(getattr(layer, "num_kv_heads", 0) or 0)
@@ -957,13 +1188,15 @@ def _bind_layer_handoff(
     src_views = _handoff_rank_views(
         prefill_case, layer, prefill_p, source, prefill_mem,
         source_owners, source_spans, has_head_axis, tokens,
+        stage=source_stage, replica=prefill_rep, phase="prefill",
     )
     dst_views = _handoff_rank_views(
         decode_case, layer, decode_p, destination, decode_mem,
         target_owners, target_spans, has_head_axis, tokens,
+        stage=destination_stage, replica=decode_rep, phase="decode",
     )
-    components = {name for _, _, values, _ in src_views for name in values}
-    components |= {name for _, _, values, _ in dst_views for name in values}
+    components = {name for _, _, values, _, _ in src_views for name in values}
+    components |= {name for _, _, values, _, _ in dst_views for name in values}
     gqa_components = {name for name in HEAD_COMPONENTS if has_head_axis and num_heads > 0}
     split_kv = (
         not component_prefix
@@ -982,8 +1215,10 @@ def _bind_layer_handoff(
             _emit_head_transfers(
                 emit, request, emitted_component, raw_component, layer, logical_layer,
                 source_stage, destination_stage, prefill_rep, decode_rep,
-                src_views, dst_views, source_spans, target_spans, prefill_p, decode_p,
-                windowed, window_start, tokens, split_kv, model=decode_case.model,
+                src_views, dst_views, source_spans, target_spans,
+                prefill_case, decode_case, prefill_p, decode_p,
+                window_start, tokens, split_kv,
+                source_owners=source_owners, target_owners=target_owners,
             )
             continue
         if raw_component in ROW_COMPONENTS:
@@ -1014,6 +1249,10 @@ def _emit_non_inherited_gqa_draft_handoff(
     destination: tuple[int, ...],
     prefill_rep: int,
     decode_rep: int,
+    prefill_case: Any,
+    decode_case: Any,
+    prefill_mem: Any,
+    decode_mem: Any,
     prefill_p: Any,
     decode_p: Any,
     num_heads: int,
@@ -1044,36 +1283,32 @@ def _emit_non_inherited_gqa_draft_handoff(
     tp_p, pcp_p = max(1, int(prefill_p.tp)), max(1, int(prefill_p.pcp))
     tp_d, pcp_d = max(1, int(decode_p.tp)), max(1, int(decode_p.pcp))
     replicas_p = max(1, tp_p // max(1, len(set(src_head_spans))))
-    src_entries = [
-        (
-            s_idx,
-            s_rank,
-            src_head_spans[s_idx % len(src_head_spans)],
-            _head_token_span(
-                s_idx, toks, src_head_spans, p_cp,
-                total_ranks=len(source), parallel=prefill_p,
-            ),
+    src_entries = []
+    for s_idx, s_rank in enumerate(source):
+        s_runs = _draft_token_runs(
+            prefill_case, prefill_p, prefill_mem, s_idx, toks, p_cp,
+            stage=source_stage, replica=prefill_rep, cohort_size=len(source),
         )
-        for s_idx, s_rank in enumerate(source)
-    ]
-    dst_entries = [
-        (
-            d_idx,
-            d_rank,
-            dst_head_spans[d_idx % len(dst_head_spans)],
-            _head_token_span(
-                d_idx, toks, dst_head_spans, d_cp,
-                total_ranks=len(destination), parallel=decode_p,
-            ),
+        src_entries.append((
+            s_idx, s_rank, src_head_spans[s_idx % len(src_head_spans)],
+            s_runs, _packed_run_offsets(s_runs), sum(hi - lo for lo, hi in s_runs),
+        ))
+    dst_entries = []
+    for d_idx, d_rank in enumerate(destination):
+        d_runs = _draft_token_runs(
+            decode_case, decode_p, decode_mem, d_idx, toks, d_cp,
+            stage=destination_stage, replica=decode_rep, cohort_size=len(destination),
         )
-        for d_idx, d_rank in enumerate(destination)
-    ]
+        dst_entries.append((
+            d_idx, d_rank, dst_head_spans[d_idx % len(dst_head_spans)],
+            d_runs, _packed_run_offsets(d_runs), sum(hi - lo for lo, hi in d_runs),
+        ))
     for layer_offset in range(int(draft_info.d_draft_spec.layers)):
         logical_layer = body_layers + layer_offset
-        for d_idx, d_rank, dspan, (d_lo, d_hi) in dst_entries:
-            if d_hi <= d_lo or dspan[1] <= dspan[0]:
+        for d_idx, d_rank, dspan, d_runs, d_offsets, dst_rows in dst_entries:
+            if dst_rows <= 0 or dspan[1] <= dspan[0]:
                 continue
-            dst_size = (d_hi - d_lo) * draft_info.d_row_bytes
+            dst_size = dst_rows * draft_info.d_row_bytes
             dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{d_rank}"
             if p_cp == 1 and d_cp == 1:
                 d_tp, d_pcp = d_idx % tp_d, (d_idx // tp_d) % pcp_d
@@ -1086,38 +1321,33 @@ def _emit_non_inherited_gqa_draft_handoff(
                 shift = d_idx % max(1, len(src_entries))
                 ordered = src_entries[shift:] + src_entries[:shift]
             covered: dict[int, list[tuple[int, int]]] = {}
-            for _s_idx, s_rank, sspan, (s_lo, s_hi) in ordered:
+            for _s_idx, s_rank, sspan, s_runs, s_offsets, src_rows in ordered:
                 common = [h for h in range(dspan[0], dspan[1]) if sspan[0] <= h < sspan[1]]
-                lo, hi = max(s_lo, d_lo), min(s_hi, d_hi)
-                if not common or hi <= lo:
+                if not common or src_rows <= 0:
                     continue
-                src_size = (s_hi - s_lo) * draft_info.p_row_bytes
+                src_size = src_rows * draft_info.p_row_bytes
                 src_storage = f"pd:kv:{request}:prefill:r{prefill_rep}:rank{s_rank}"
-                grouped: dict[tuple[int, int], list[int]] = {}
-                for head in common:
-                    for piece_lo, piece_hi in _uncovered_intervals(covered.get(head, ()), lo, hi):
-                        grouped.setdefault((piece_lo, piece_hi), []).append(head)
-                        covered.setdefault(head, []).append((piece_lo, piece_hi))
-                for (piece_lo, piece_hi), heads in grouped.items():
-                    all_rows = (piece_lo, piece_hi) == (s_lo, s_hi) == (d_lo, d_hi)
-                    consecutive = heads[-1] - heads[0] + 1 == len(heads)
-                    groups = [heads] if (all_rows and consecutive) else [[h] for h in heads]
-                    for group in groups:
-                        src_off = (group[0] - sspan[0]) * (s_hi - s_lo) + (piece_lo - s_lo)
-                        dst_off = (group[0] - dspan[0]) * (d_hi - d_lo) + (piece_lo - d_lo)
-                        payload = per_head_token * (piece_hi - piece_lo) * len(group)
-                        emit(
-                            s_rank, d_rank, comp, payload,
-                            source_stage=source_stage, destination_stage=destination_stage,
-                            layer=logical_layer, source_span=sspan, destination_span=dspan,
-                            source_tokens=(piece_lo, piece_hi), destination_tokens=(piece_lo, piece_hi),
-                            tier="hbm", source_storage=src_storage, destination_storage=dst_storage,
-                            source_size=src_size, source_displacement=per_head_token * src_off,
-                            destination_size=dst_size, destination_displacement=per_head_token * dst_off,
+                for s_lo, s_prefix, d_lo, d_prefix, lo, hi in _intersect_head_runs(
+                    s_runs, s_offsets, d_runs, d_offsets,
+                ):
+                    grouped: dict[tuple[int, int], list[int]] = {}
+                    for head in common:
+                        for piece_lo, piece_hi in _uncovered_intervals(covered.get(head, ()), lo, hi):
+                            grouped.setdefault((piece_lo, piece_hi), []).append(head)
+                            covered.setdefault(head, []).append((piece_lo, piece_hi))
+                    if grouped:
+                        _emit_head_piece_groups(
+                            emit, request, comp, logical_layer,
+                            source_stage, destination_stage, s_rank, d_rank,
+                            src_storage, dst_storage, sspan, dspan,
+                            s_runs, d_runs, src_rows, dst_rows,
+                            src_size, dst_size, per_head_token,
+                            s_lo, s_prefix, d_lo, d_prefix, grouped,
+                            False, None, None,
                         )
             missing = [
                 h for h in range(dspan[0], dspan[1])
-                if sum(p_hi - p_lo for p_lo, p_hi in covered.get(h, ())) < d_hi - d_lo
+                if sum(p_hi - p_lo for p_lo, p_hi in covered.get(h, ())) < dst_rows
             ]
             if missing:
                 raise ModelingError(
@@ -1128,13 +1358,14 @@ def _emit_non_inherited_gqa_draft_handoff(
 def _bind_non_inherited_draft_handoff(
     draft_info: _ActiveDraftHandoff, body_layers: int, request: str, emit,
     prefill_exec, decode_exec, prefill_rep: int, decode_rep: int,
+    prefill_case: Any, decode_case: Any, prefill_mem: Any, decode_mem: Any,
     prefill_p: Any, decode_p: Any,
 ) -> None:
     """Emit explicit integer ``PDTransfer`` records for paired-SFA / non-inherited draft caches."""
     source_stage = max(0, int(prefill_p.pp) - 1)
     destination_stage = max(0, int(decode_p.pp) - 1)
-    source = tuple(prefill_exec.topology.ranks(prefill_rep, source_stage))
-    destination = tuple(decode_exec.topology.ranks(decode_rep, destination_stage))
+    source = _cohort_stage_ranks(prefill_exec, prefill_p, prefill_rep, source_stage)
+    destination = _cohort_stage_ranks(decode_exec, decode_p, decode_rep, destination_stage)
     if not source or not destination:
         raise ModelingError("pd_handoff_missing_stage_ranks:" + request)
     p_cp = int(prefill_p.cp) if draft_info.p_sharded else 1
@@ -1147,6 +1378,8 @@ def _bind_non_inherited_draft_handoff(
             source_stage=source_stage, destination_stage=destination_stage,
             source=source, destination=destination,
             prefill_rep=prefill_rep, decode_rep=decode_rep,
+            prefill_case=prefill_case, decode_case=decode_case,
+            prefill_mem=prefill_mem, decode_mem=decode_mem,
             prefill_p=prefill_p, decode_p=decode_p,
             num_heads=num_heads, p_cp=p_cp, d_cp=d_cp, comp=comp,
         )
@@ -1154,10 +1387,11 @@ def _bind_non_inherited_draft_handoff(
     toks = draft_info.eff_tokens
     src_runs_all = []
     for s_idx, s_rank in enumerate(source):
-        s_lo, s_hi = _head_token_span(
-            s_idx, toks, (), p_cp, total_ranks=len(source), parallel=prefill_p,
+        s_runs = _draft_token_runs(
+            prefill_case, prefill_p, prefill_mem, s_idx, toks, p_cp,
+            stage=source_stage, replica=prefill_rep, cohort_size=len(source),
         )
-        src_runs_all.append((s_idx, s_rank, ((s_lo, s_hi),), (s_hi - s_lo) * draft_info.p_row_bytes))
+        src_runs_all.append((s_idx, s_rank, s_runs, sum(hi - lo for lo, hi in s_runs) * draft_info.p_row_bytes))
 
     replicas = len(source) // max(1, p_cp) if len(source) % max(1, p_cp) == 0 else 1
     grouped: dict[int, list[tuple[int, tuple[tuple[int, int], ...], int]]] = defaultdict(list)
@@ -1170,17 +1404,18 @@ def _bind_non_inherited_draft_handoff(
     for layer_offset in range(int(draft_info.d_draft_spec.layers)):
         logical_layer = body_layers + layer_offset
         for d_idx, d_rank in enumerate(destination):
-            d_lo, d_hi = _head_token_span(
-                d_idx, toks, (), d_cp, total_ranks=len(destination), parallel=decode_p,
+            d_runs = _draft_token_runs(
+                decode_case, decode_p, decode_mem, d_idx, toks, d_cp,
+                stage=destination_stage, replica=decode_rep, cohort_size=len(destination),
             )
-            if d_hi <= d_lo:
+            target_rows = sum(hi - lo for lo, hi in d_runs)
+            if target_rows <= 0:
                 continue
             j_d = _upstream_rank_coord(d_idx, decode_p)
             cand_sources = grouped.get(j_d % replicas) or flat_sources if replicas > 1 else flat_sources
-            target_rows = d_hi - d_lo
             received = 0
             dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{d_rank}"
-            for s_rank, lo, hi, size, offset, unit in transfers_for_runs(cand_sources, ((d_lo, d_hi),)):
+            for s_rank, lo, hi, size, offset, unit in transfers_for_runs(cand_sources, d_runs):
                 emit(
                     s_rank, d_rank, comp, (hi - lo) * unit,
                     source_stage=source_stage, destination_stage=destination_stage,
@@ -1339,7 +1574,8 @@ def _make_pd_transfer_emitter(
 def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
                         decode_local, volume, demands, shared_buffer_prefix=None,
                         shared_buffer_capacity=None, published=None, *,
-                        active_draft: _ActiveDraftHandoff | None = None):
+                        active_draft: _ActiveDraftHandoff | None = None,
+                        source_plane_bases_out: dict[Any, int] | None = None):
     """Bind actual source/destination layer, component, head and token integer ranges."""
     del decode_local
     prefill_exec = execution["prefill"]
@@ -1399,8 +1635,12 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
         else:
             _bind_non_inherited_draft_handoff(
                 active_draft, body_len, request, emit, prefill_exec, decode_exec,
-                prefill_rep, decode_rep, prefill_p, decode_p,
+                prefill_rep, decode_rep, prefill_case, decode_case,
+                prefill_mem, decode_mem, prefill_p, decode_p,
             )
+
+    if source_plane_bases_out is not None:
+        source_plane_bases_out.update(plane_bases)
 
     _verify_disjoint_integer_partition(
         request, transfers, source_extents, destination_offsets, expected_volume,
@@ -1471,13 +1711,30 @@ def _register_consumer_release(engine, request, releases, device_complete,
 class _CohortStageTopology:
     """Minimal disjoint stage-rank topology over one request's P or D shard cohort."""
 
-    def __init__(self, parallel, *, rank_offset: int = 0) -> None:
+    def __init__(self, parallel, *, machine=None, rank_offset: int = 0) -> None:
         self._pp = max(1, int(parallel.pp))
-        dcp_dp = max(1, int(getattr(parallel, "dcp_dp_width", 1) or 1))
-        self._width = max(1, int(parallel.tp) * int(parallel.pcp) * dcp_dp)
+        self._tp = max(1, int(parallel.tp))
+        self._pcp = max(1, int(parallel.pcp))
+        self._dcp_dp = max(1, int(getattr(parallel, "dcp_dp_width", 1) or 1))
+        self._local_width = max(1, self._tp * self._pcp)
+        self._width = max(1, self._local_width * self._dcp_dp)
+        self._dies = tuple(getattr(machine, "dies", ()) or ()) if machine is not None else ()
         self._offset = int(rank_offset)
 
     def ranks(self, replica: int, stage: int) -> tuple[int, ...]:
+        first_rep = (int(replica) // self._dcp_dp) * self._dcp_dp
+        if self._dies:
+            out: list[int] = []
+            for dp_off in range(self._dcp_dp):
+                rep_i = first_rep + dp_off
+                start = (rep_i * self._pp + int(stage)) * self._local_width
+                chunk = self._dies[start:start + self._local_width]
+                if len(chunk) != self._local_width:
+                    out = []
+                    break
+                out.extend(int(dev.rank) + self._offset for dev in chunk)
+            if out:
+                return tuple(out)
         base = self._offset + (int(replica) * self._pp + int(stage)) * self._width
         return tuple(range(base, base + self._width))
 
@@ -1500,16 +1757,32 @@ def _union_interval_length(intervals) -> int:
     return total + (cur_hi - cur_lo)
 
 
-def _summarize_unique_logical_handoff_bytes(handoff: PDHandoff, p_case, p_topo) -> int:
-    """Compute replica-deduplicated logical KV/state bytes across emitted transfers."""
+def _summarize_unique_logical_handoff_bytes(
+    handoff: PDHandoff, p_case, p_topo, plane_bases: Mapping[Any, int] | None = None,
+) -> tuple[int, int]:
+    """Compute replica-deduplicated logical ``(total_bytes, non_token_state_bytes)``."""
     logical_row_units: dict[tuple[Any, ...], tuple[int, int]] = {}
     logical_row_spans: dict[tuple[Any, ...], list[tuple[int, int]]] = defaultdict(list)
     logical_plane_spans: dict[tuple[Any, ...], list[tuple[int, int]]] = defaultdict(list)
+    logical_state_spans: dict[tuple[Any, ...], list[tuple[int, int]]] = defaultdict(list)
     p_par = p_case.runtime.parallel
     p_rank_to_idx: dict[tuple[int, int], int] = {}
     for st in range(p_topo._pp):
         for idx, rk in enumerate(p_topo.ranks(0, st)):
             p_rank_to_idx[(st, rk)] = idx
+
+    def _plane_relative_range(item: PDTransfer, layer_id: int) -> tuple[int, int]:
+        lo, hi = int(item.source_byte_range[0]), int(item.source_byte_range[1])
+        if plane_bases:
+            b_key = (
+                (int(item.source_rank), str(item.source_storage), int(item.source_version)),
+                (int(layer_id), str(item.component)),
+            )
+            base = plane_bases.get(b_key)
+            if base is not None:
+                return (lo - int(base), hi - int(base))
+        return (0, hi - lo)
+
     for item in handoff.transfers:
         layer_id = item.source_layers[0] if item.source_layers else 0
         raw_comp = item.component.removeprefix("draft.")
@@ -1532,7 +1805,7 @@ def _summarize_unique_logical_handoff_bytes(handoff: PDHandoff, p_case, p_topo) 
                     continue
             key = (layer_id, item.component, item.source_heads, item.source_token_span)
             if item.source_byte_range:
-                logical_plane_spans[key].append(item.source_byte_range)
+                logical_plane_spans[key].append(_plane_relative_range(item, layer_id))
         elif raw_comp in SHARDED_STATE_COMPONENTS:
             s_idx = p_rank_to_idx.get((item.source_stage, item.source_rank), 0)
             layer_obj = (
@@ -1545,11 +1818,11 @@ def _summarize_unique_logical_handoff_bytes(handoff: PDHandoff, p_case, p_topo) 
             shard_id = ((s_idx % tp_n) * pcp_n + (s_idx // tp_n) % pcp_n) if attn == "kda" else (s_idx % tp_n)
             key = (layer_id, item.component, shard_id)
             if item.source_byte_range:
-                logical_plane_spans[key].append(item.source_byte_range)
+                logical_state_spans[key].append(_plane_relative_range(item, layer_id))
         else:
             key = (layer_id, item.component, "rep")
             if item.source_byte_range:
-                logical_plane_spans[key].append(item.source_byte_range)
+                logical_state_spans[key].append(_plane_relative_range(item, layer_id))
     unique_total = 0
     for key, spans in logical_row_spans.items():
         union_toks = _union_interval_length(spans)
@@ -1557,7 +1830,8 @@ def _summarize_unique_logical_handoff_bytes(handoff: PDHandoff, p_case, p_topo) 
         unique_total += (union_toks * pay_ref) // span_ref
     for spans in logical_plane_spans.values():
         unique_total += _union_interval_length(spans)
-    return int(unique_total)
+    unique_state = sum(_union_interval_length(spans) for spans in logical_state_spans.values())
+    return int(unique_total + unique_state), int(unique_state)
 
 
 def compute_pd_handoff_plan(
@@ -1593,6 +1867,7 @@ def compute_pd_handoff_plan(
             "hybrid_connector_reason": conn_reason,
             "total_transfer_bytes": 0,
             "unique_kv_bytes": 0,
+            "unique_state_bytes": 0,
             "draft_kv_bytes": 0,
             "draft_state_bytes": 0,
             "hbm_transfer_bytes": 0,
@@ -1604,6 +1879,8 @@ def compute_pd_handoff_plan(
             "destination_hbm_rank_bytes": {},
             "destination_host_rank_bytes": {},
             "unique_source_rank_bytes": {},
+            "unique_source_rank_state_bytes": {},
+            "destination_rank_offset": 0,
             "source_ranks": (),
             "destination_ranks": (),
             "transfer_count": 0,
@@ -1611,21 +1888,23 @@ def compute_pd_handoff_plan(
         }
 
     demand = compute_expected_pd_handoff_demand(p_case, d_case, p_mem, d_mem, n_tokens)
-    p_topo = _CohortStageTopology(p_case.runtime.parallel, rank_offset=0)
-    p_span = p_topo._pp * p_topo._width
-    d_topo = _CohortStageTopology(d_case.runtime.parallel, rank_offset=p_span)
+    p_topo = _CohortStageTopology(p_case.runtime.parallel, machine=p_case.machine, rank_offset=0)
+    d_offset = pd_destination_rank_offset(p_case, d_case)
+    d_topo = _CohortStageTopology(d_case.runtime.parallel, machine=d_case.machine, rank_offset=d_offset)
     execution = {
         "prefill": SimpleNamespace(topology=p_topo),
         "decode": SimpleNamespace(topology=d_topo),
     }
     req_id = "__pd_handoff__"
     placement = {("prefill", req_id): 0, ("decode", req_id): 0}
+    src_plane_bases: dict[Any, int] = {}
     handoff, src_ranks, dst_ranks = _pd_handoff_binding(
         req_id, n_tokens, placement,
         {"prefill": p_case, "decode": d_case},
         {"prefill": p_mem, "decode": d_mem},
         execution, demand.decode_local_stage_bytes, demand.total_volume_bytes, {},
         active_draft=demand.active_draft,
+        source_plane_bases_out=src_plane_bases,
     )
 
     src_bytes: dict[int, int] = defaultdict(int)
@@ -1634,6 +1913,7 @@ def compute_pd_handoff_plan(
     dst_host_bytes: dict[int, int] = defaultdict(int)
     per_layer: dict[int, int] = defaultdict(int)
     unique_ranges: dict[tuple[int, str], list[tuple[int, int]]] = defaultdict(list)
+    unique_state_ranges: dict[tuple[int, str], list[tuple[int, int]]] = defaultdict(list)
     hbm_total = 0
     host_total = 0
     body_layers = len(p_case.model.layer_plans)
@@ -1655,7 +1935,11 @@ def compute_pd_handoff_plan(
             for layer_idx in layers_tup:
                 per_layer[layer_idx] += share
         if item.source_byte_range:
-            unique_ranges[(item.source_rank, item.source_storage)].append(item.source_byte_range)
+            key_r = (item.source_rank, item.source_storage)
+            unique_ranges[key_r].append(item.source_byte_range)
+            raw_comp = item.component.removeprefix("draft.")
+            if raw_comp not in _TOKEN_ADDITIVE_COMPONENTS:
+                unique_state_ranges[key_r].append(item.source_byte_range)
 
     unique_by_src = {
         s_rank: sum(
@@ -1665,7 +1949,17 @@ def compute_pd_handoff_plan(
         )
         for s_rank in sorted({rk for rk, _ in unique_ranges})
     }
-    unique_total = _summarize_unique_logical_handoff_bytes(handoff, p_case, p_topo)
+    unique_state_by_src = {
+        s_rank: sum(
+            _union_interval_length(spans)
+            for (rank_k, _stor), spans in unique_state_ranges.items()
+            if rank_k == s_rank
+        )
+        for s_rank in sorted({rk for rk, _ in unique_state_ranges})
+    }
+    unique_total, unique_state_total = _summarize_unique_logical_handoff_bytes(
+        handoff, p_case, p_topo, src_plane_bases,
+    )
     total_bytes = hbm_total + host_total
     if unique_total <= 0:
         unique_total = total_bytes
@@ -1679,6 +1973,7 @@ def compute_pd_handoff_plan(
         "hybrid_connector_reason": conn_reason,
         "total_transfer_bytes": int(total_bytes),
         "unique_kv_bytes": int(unique_total),
+        "unique_state_bytes": int(unique_state_total),
         "draft_kv_bytes": int(demand.draft_kv_bytes),
         "draft_state_bytes": int(demand.draft_state_bytes),
         "hbm_transfer_bytes": int(hbm_total),
@@ -1690,6 +1985,8 @@ def compute_pd_handoff_plan(
         "destination_hbm_rank_bytes": {int(k): int(v) for k, v in sorted(dst_hbm_bytes.items())},
         "destination_host_rank_bytes": {int(k): int(v) for k, v in sorted(dst_host_bytes.items())},
         "unique_source_rank_bytes": {int(k): int(v) for k, v in sorted(unique_by_src.items())},
+        "unique_source_rank_state_bytes": {int(k): int(v) for k, v in sorted(unique_state_by_src.items())},
+        "destination_rank_offset": int(d_offset),
         "source_ranks": tuple(int(r) for r in src_ranks),
         "destination_ranks": tuple(int(r) for r in dst_ranks),
         "transfer_count": len(handoff.transfers),

@@ -385,13 +385,14 @@ def _gqa_layer_row_bytes(
     model: Any, plan: Any, tp: int, *, int8_fa3: bool, phase: str,
 ) -> int:
     heads = local_kv_heads(plan.num_kv_heads, tp)
+    k_dim = int(plan.head_dim)
+    v_dim = int(getattr(plan, "v_head_dim", 0) or k_dim)
     if int8_fa3:
-        return 2 * heads * (int(plan.head_dim) + C8_SCALE_RESERVED_BYTES)
+        return heads * (k_dim + v_dim + 2 * C8_SCALE_RESERVED_BYTES)
     key_fmt, val_fmt, is_shared = gqa_kv_formats(model, plan=plan, phase=phase)
-    if is_shared:
-        return int(key_fmt.row_bytes(2 * heads * int(plan.head_dim)))
-    side_width = heads * int(plan.head_dim)
-    return int(key_fmt.row_bytes(side_width) + val_fmt.row_bytes(side_width))
+    if is_shared and k_dim == v_dim:
+        return int(key_fmt.row_bytes(2 * heads * k_dim))
+    return int(key_fmt.row_bytes(heads * k_dim) + val_fmt.row_bytes(heads * v_dim))
 
 
 def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,

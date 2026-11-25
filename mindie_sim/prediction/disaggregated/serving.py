@@ -33,6 +33,7 @@ from .handoff import (
     _pending_release_targets,
     _register_consumer_release,
     compute_expected_pd_handoff_demand,
+    pd_destination_rank_offset,
 )
 
 #: Bounded default diagnostic trace sizes for the direct PD entry.
@@ -197,13 +198,16 @@ def _run_pd_loop(cases, engine, connector, memory, execution, lowerers,
     handoff_records = []
     handoff_bytes, handoffs, iterations = 0, 0, 0
 
-    def source_release_callback(source_rank, source_released, prefill_replica):
-        def release_source(rank=source_rank, done=source_released,
-                           replica=prefill_replica):
-            if done[0]:
+    def source_release_callback(request_id, source_rank, source_state, prefill_replica):
+        def release_source(rank=source_rank, state=source_state,
+                           replica=prefill_replica, req=request_id):
+            if state["released"]:
                 return
-            done[0] = True
-            memory["prefill"].release(replica, request)
+            state["remaining"].discard(rank)
+            if state["remaining"]:
+                return
+            state["released"] = True
+            memory["prefill"].release(replica, req)
         return release_source
 
     while not all(state.done for state in states):
@@ -222,7 +226,7 @@ def _run_pd_loop(cases, engine, connector, memory, execution, lowerers,
                 handoff_bytes += volume
                 handoffs += 1
         for name, case in cases.items():
-            for group in cohorts(case.runtime.parallel):
+            for group in cohorts(case.runtime.parallel, case.machine):
                 if any((name, replica) in flights for replica in group):
                     continue
                 pending_release = any(state.location in {"waiting_transfer", "transferring"}
@@ -337,11 +341,16 @@ def _admit_pd_handoff(
     demands = {}
     for pool in ("prefill", "decode"):
         replica = placement[pool, request]
+        par = cases[pool].runtime.parallel
+        dcp_dp = max(1, int(getattr(par, "dcp_dp_width", 1) or 1))
+        first_rep = (int(replica) // dcp_dp) * dcp_dp
         local = (decode_local if pool == "decode"
                  else memory[pool].cache_bytes(state.computed, padded=False))
-        for stage, stage_bytes in enumerate(local):
-            roles = execution[pool].stage_names[replica, stage]
-            demands[roles["hbm"]] = stage_bytes
+        for dp_off in range(dcp_dp):
+            rep_i = first_rep + dp_off
+            for stage, stage_bytes in enumerate(local):
+                roles = execution[pool].stage_names[rep_i, stage]
+                demands[roles["hbm"]] = stage_bytes
     handoff, source_ranks, destination_ranks = _pd_handoff_binding(
         request, state.computed, placement, cases, memory, execution,
         decode_local, volume, demands,
@@ -369,7 +378,8 @@ def _admit_pd_handoff(
         return None
     storage_holds = {}
     handoff, destination_ranks = _offset_colliding_decode_ranks(
-        handoff, source_ranks, destination_ranks,
+        handoff, destination_ranks,
+        offset=pd_destination_rank_offset(cases["prefill"], cases["decode"]),
     )
     transfers[request] = _submit_rank_handoff(
         engine, connector, handoff, request, source_ranks, destination_ranks,
@@ -419,13 +429,10 @@ def _admit_pd_handoff(
     return volume
 
 
-def _offset_colliding_decode_ranks(handoff, source_ranks, destination_ranks):
-    """Namespace pool-local decode ranks onto disjoint connector ranks when a self-flow exists."""
-    if not any(item.source_rank == item.destination_rank for item in handoff.transfers):
-        return handoff, destination_ranks
-    offset = max(source_ranks) + 1 - min(destination_ranks)
+def _offset_colliding_decode_ranks(handoff, destination_ranks, *, offset: int = 0):
+    """Apply pool-level connector rank namespace shift consistently across all requests."""
     if offset <= 0:
-        offset = max(source_ranks) + 1
+        return handoff, destination_ranks
     shifted_dst = tuple(rank + offset for rank in destination_ranks)
     shifted_transfers = tuple(
         replace(item, destination_rank=item.destination_rank + offset)
@@ -507,13 +514,13 @@ def _submit_rank_handoff(
         # identity; never re-derived from a display name later.
         consumer_callbacks[request, rank] = release_hold
         release_callbacks[rank] = release_hold
-    source_released = [False]
-    source_release_state[request] = source_released
+    source_state = {"remaining": set(source_ranks), "released": False}
+    source_release_state[request] = source_state
     source_callbacks = {}
     prefill_replica = placement["prefill", request]
     for source_rank in source_ranks:
         source_callbacks[source_rank] = source_release_callback(
-            source_rank, source_released, prefill_replica)
+            request, source_rank, source_state, prefill_replica)
     return connector.submit_handoff(
         engine, handoff,
         source_ready_by_rank={rank: source_event
@@ -567,8 +574,9 @@ def _schedule_pd_final_releases(
                 engine.resolve(target)
             if cancel is not None:
                 cancel()
-            if source_state is not None and not source_state[0]:
-                source_state[0] = True
+            if source_state is not None and not source_state["released"]:
+                source_state["remaining"].clear()
+                source_state["released"] = True
                 memory["prefill"].release(
                     placement["prefill", request], request)
         final_releases.append(engine.submit(
