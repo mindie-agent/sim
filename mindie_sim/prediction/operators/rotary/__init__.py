@@ -11,6 +11,8 @@
 """
 from __future__ import annotations
 
+from typing import Literal
+
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from ..contracts import (
@@ -18,7 +20,7 @@ from ..contracts import (
     OperatorPlanningContext,
     ResolvedOperator,
 )
-from .common import IMPLEMENTATION, SOURCES, SUPPORTED_ABIS, build, describe
+from .common import IMPLEMENTATION, SOURCES, SUPPORTED_ABIS, TARGET_BACKEND, build, describe
 
 
 def resolve_operator_plan(
@@ -69,6 +71,8 @@ def register_family() -> OperatorFamilySpec:
 
 
 __all__ = [
+    "SOURCES",
+    "TARGET_BACKEND",
     "register_family",
     "resolve_operator_plan",
 ]

@@ -10,9 +10,10 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict, replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
-from mindie_sim.schema.datapath import ArchId, ComputeArchIdentity, DatapathCapabilitySpec, GENERIC_ARCH_ID
+from mindie_sim.schema.datapath import ArchId, ComputeArchIdentity, DatapathCapabilitySpec, GENERIC_ARCH_ID, SourceRef
 from mindie_sim.schema.operators import OpSpec
 from ...collectives import PairwiseCollective
 from ...mechanism import Geometry, OperatorPlan, PlannedRecipe, Work
@@ -25,48 +26,61 @@ from ._cp_tiling import (
     with_collectives,
 )
 from .common import (
-    ARCH22, ARCH35, BF16_BYTES, C8_ABI, C8_LATENT_DIM, C8_V1_ABI, FIA_ABI, FIA_TILE,
-    GBSA_ABI, MINDIE_ABIS, MINDIE_V3_ABI, NOPE_ABI, QUANT_MODE_BF16, QUANT_MODE_FP8_C8, QUANT_MODE_INT8_C8,
-    QUANT_MODE_MINDIE_FP8, QUANT_MODE_MXFP4_CX, QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP8, QUANT_MODE_TQ4,
-    SFA_V1_ABI, SOFTMAX_OPS, SUPPORTED_QUANT_MODES, TQ4_ROW_BYTES, AttentionContract, ContextParallelPlan,
-    FiaPanelPlan, bsh_kv_access_plan, c8_gather_accounting, describe, lower_cp_collectives,
+    ARCH22, ARCH35, BF16_BYTES, C8_ABI, C8_LATENT_DIM, C8_ROPE_DIM, C8_V1_ABI, C8_VLLM_ABI, C8_VLLM_ROW_BYTES,
+    FIA_ABI, FIA_TILE, GBSA_ABI, MINDIE_ABIS, MINDIE_V3_ABI, NOPE_ABI, QUANT_MODE_BF16, QUANT_MODE_FP8_C8,
+    QUANT_MODE_INT8_C8, QUANT_MODE_MINDIE_FP8, QUANT_MODE_MXFP4_CX, QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP8,
+    QUANT_MODE_TQ4, SFA_V1_ABI, SOFTMAX_OPS, SUPPORTED_QUANT_MODES, TQ4_ROW_BYTES, AttentionContract,
+    ContextParallelPlan, FiaPanelPlan, bsh_kv_access_plan, c8_gather_accounting, describe, lower_cp_collectives,
     shipping_fia_panel_plan, solve_wide_head_tiling, unmodeled, with_sequence_context,
 )
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = arch35.SOURCES
 FIA_RECIPE = "fused_infer_attention_score"
 GBSA_RECIPE = "generic_block_sparse_attention_arch35"
 KV_QUANT_SFA_C8_RECIPE = "kv_quant_sfa_c8_arch35"
 SPARSE_FLASH_MLA_NOPE_RECIPE = "sparse_flash_mla_nope_arch35"
 RECIPE_BY_ABI = {
     FIA_ABI: FIA_RECIPE, GBSA_ABI: GBSA_RECIPE, C8_ABI: KV_QUANT_SFA_C8_RECIPE,
-    C8_V1_ABI: C8_V1_ABI, SFA_V1_ABI: SFA_V1_ABI,
+    C8_V1_ABI: C8_V1_ABI, C8_VLLM_ABI: C8_VLLM_ABI, SFA_V1_ABI: SFA_V1_ABI,
     NOPE_ABI: SPARSE_FLASH_MLA_NOPE_RECIPE, **{abi: abi for abi in MINDIE_ABIS},
 }
 ABI_BY_RECIPE = {recipe: abi for abi, recipe in RECIPE_BY_ABI.items()}
 STRATEGIES = {ARCH22: arch22.STRATEGY, ARCH35: arch35.STRATEGY}
 DEFAULT_GBSA_BLOCK_SIZE = 8
+DEFAULT_GBSA_KV_LAYOUT = "PA_BLK_BSND"
 DEFAULT_SFA_SELECTED_TOKENS = 2048
 FP8_ELEMENT_BYTES = 1.0
+INT8_ELEMENT_BYTES = 1.0
 MXFP4_ELEMENT_BYTES = 0.5
 C8_SCALE_BYTES_PER_ROW = 16
+
+
+def _is_gbsa_fp8_quant(contract: AttentionContract) -> bool:
+    return contract.abi == GBSA_ABI and contract.quant_mode in {QUANT_MODE_FP8_C8, QUANT_MODE_MXFP8}
 
 
 def _minimum_contract_io(contract: AttentionContract, dtype: str) -> tuple[float, float, float, float]:
     """Conservative physical lower bound on (hbm, mte2, mte3, vector_ops) for L* soundness."""
     out_elem = float(dtype_bytes(dtype))
     if contract.abi == MINDIE_V3_ABI and contract.quant_mode in {QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP4_CX}:
-        q_elem = MXFP4_ELEMENT_BYTES
-    elif contract.quant_mode == QUANT_MODE_MXFP8 or (
+        q_elem = kv_elem = MXFP4_ELEMENT_BYTES
+    elif contract.quant_mode == QUANT_MODE_MXFP8 or _is_gbsa_fp8_quant(contract) or (
         contract.abi in MINDIE_ABIS and contract.quant_mode == QUANT_MODE_MINDIE_FP8
     ):
-        q_elem = FP8_ELEMENT_BYTES
-    else:
+        q_elem = kv_elem = FP8_ELEMENT_BYTES
+    elif contract.abi == GBSA_ABI and contract.quant_mode == QUANT_MODE_INT8_C8:
         q_elem = out_elem
+        kv_elem = INT8_ELEMENT_BYTES
+    else:
+        q_elem = kv_elem = out_elem
     q_bytes = float(contract.query_tokens * contract.num_heads * contract.head_dim) * q_elem
     o_bytes = float(contract.query_tokens * contract.num_heads * contract.v_head_dim) * out_elem
     row_counts = tuple(contract.row_counts())
     vector_ops = float(SOFTMAX_OPS * contract.num_heads * sum(row_counts))
-    if contract.sequences:
+    if contract.selection_lists:
+        unique_rows = len({addr for rows in contract.selection_lists for addr in rows})
+    elif contract.sequences:
         seq_vis = [
             min(kv, kv if contract.selected_tokens is None else contract.selected_tokens,
                 (contract.window_size + max(0, q - 1)) if contract.window_size else kv)
@@ -79,15 +93,15 @@ def _minimum_contract_io(contract: AttentionContract, dtype: str) -> tuple[float
         unique_rows = max(row_counts)
     else:
         unique_rows = 0
-    if contract.quant_mode == QUANT_MODE_TQ4:
+    if contract.abi in {C8_ABI, C8_V1_ABI} and contract.quant_mode == QUANT_MODE_TQ4:
         kv_row_b = float(TQ4_ROW_BYTES)
-    elif contract.abi in {C8_ABI, C8_V1_ABI}:
+    elif contract.abi in {C8_ABI, C8_V1_ABI, C8_VLLM_ABI}:
         rope_dim = max(0, contract.head_dim - contract.v_head_dim)
         kv_row_b = float(contract.v_head_dim + C8_SCALE_BYTES_PER_ROW + rope_dim * BF16_BYTES)
     elif contract.abi in {NOPE_ABI, SFA_V1_ABI} and contract.num_kv_heads == 1:
-        kv_row_b = float(contract.head_dim) * q_elem
+        kv_row_b = float(contract.head_dim) * kv_elem
     else:
-        kv_row_b = float(contract.num_kv_heads * (contract.head_dim + contract.v_head_dim)) * q_elem
+        kv_row_b = float(contract.num_kv_heads * (contract.head_dim + contract.v_head_dim)) * kv_elem
     kv_read = float(unique_rows) * kv_row_b
     # Warm external L2 backing (kv_tensor_id) may absorb KV HBM reads; Q/O remain live.
     kv_hbm = 0.0 if contract.kv_tensor_id else kv_read
@@ -273,9 +287,9 @@ def make_attention_op(
     return_lse = contract.return_lse
     contract = history_decode_contract(contract)
     shape = (contract.query_tokens, contract.num_heads, contract.v_head_dim)
-    family = "mla" if contract.abi in {C8_ABI, NOPE_ABI} else "attention"
+    family = "mla" if contract.abi in {C8_ABI, C8_V1_ABI, C8_VLLM_ABI, NOPE_ABI} else "attention"
     matrix_dtype = dtype
-    if contract.quant_mode == QUANT_MODE_MXFP8 or (
+    if contract.quant_mode == QUANT_MODE_MXFP8 or _is_gbsa_fp8_quant(contract) or (
         contract.abi in MINDIE_ABIS and contract.quant_mode == QUANT_MODE_MINDIE_FP8
     ):
         matrix_dtype = "fp8_e4m3"
@@ -300,6 +314,7 @@ def make_gbsa_op(
     requests: tuple[str, ...] = (), phase: str = "decode", query_tokens: int, num_heads: int,
     num_kv_heads: int, head_dim: int, v_head_dim: int | None = None, selected_tokens: int,
     context_tokens: int | None = None, block_size: int = DEFAULT_GBSA_BLOCK_SIZE,
+    kv_layout: str = DEFAULT_GBSA_KV_LAYOUT,
     quant_mode: int = QUANT_MODE_BF16, ssmax: bool = False, metadata_reuse: bool = False,
     batch_size: int | None = None, shared_prefix: bool = False,
 ) -> OpSpec:
@@ -313,8 +328,8 @@ def make_gbsa_op(
                           for rank in range(groups))
     contract = AttentionContract(
         query_tokens, num_heads, num_kv_heads, head_dim, head_dim if v_head_dim is None else v_head_dim,
-        selected_tokens=selected_tokens, phase=phase, abi=GBSA_ABI, block_size=block_size,
-        quant_mode=quant_mode, ssmax=ssmax, metadata_reuse=metadata_reuse,
+        selected_tokens=selected_tokens, phase=phase, abi=GBSA_ABI, kv_layout=kv_layout,
+        block_size=block_size, quant_mode=quant_mode, ssmax=ssmax, metadata_reuse=metadata_reuse,
         batch_size=batch, shared_prefix=shared_prefix, sequences=sequences,
     )
     return make_attention_op(contract, op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests)
@@ -323,15 +338,18 @@ def make_gbsa_op(
 def make_kv_quant_sfa_c8_op(
     *, op_id: str, deps: tuple[str, ...] = (), stage: int = 0, layer: int = 0,
     requests: tuple[str, ...] = (), phase: str = "decode", query_tokens: int, num_heads: int,
-    kv_lora_rank: int = C8_LATENT_DIM, rope_dim: int = 0, selected_tokens: int = DEFAULT_SFA_SELECTED_TOKENS,
+    kv_lora_rank: int = C8_LATENT_DIM, rope_dim: int | None = None,
+    selected_tokens: int = DEFAULT_SFA_SELECTED_TOKENS,
     precompute_scale_addr: bool = True, nope_bf16: bool = False, batch_size: int | None = None,
     shared_prefix: bool = False, quant_mode: int = QUANT_MODE_FP8_C8,
     selection_lists: tuple[tuple[int, ...], ...] = (), kv_tensor_id: str = "", kv_version: int = 0,
 ) -> OpSpec:
     """Bind the legacy C8 or NoPE parameters to their distinct kernel ABI."""
+    eff_rope = (0 if nope_bf16 else C8_ROPE_DIM) if rope_dim is None else rope_dim
+    abi = NOPE_ABI if nope_bf16 else (C8_VLLM_ABI if eff_rope == 0 else C8_ABI)
     contract = AttentionContract(
-        query_tokens, num_heads, 1, kv_lora_rank + rope_dim, kv_lora_rank, selected_tokens=selected_tokens,
-        phase=phase, abi=NOPE_ABI if nope_bf16 else C8_ABI, kv_layout="PA_BLK_BSND",
+        query_tokens, num_heads, 1, kv_lora_rank + eff_rope, kv_lora_rank, selected_tokens=selected_tokens,
+        phase=phase, abi=abi, kv_layout="PA_BLK_BSND",
         quant_mode=QUANT_MODE_BF16 if nope_bf16 else quant_mode, precompute_scale_addr=precompute_scale_addr,
         batch_size=(len(requests) or query_tokens) if batch_size is None else batch_size,
         shared_prefix=shared_prefix, selection_lists=selection_lists, kv_tensor_id=kv_tensor_id, kv_version=kv_version,
@@ -345,6 +363,7 @@ from ..vector.ring_update import (
 )
 
 __all__ = [
+    "SOURCES", "TARGET_BACKEND", "C8_VLLM_ABI",
     "build", "resolve_operator_plan", "register_family", "AttentionContract", "ContextParallelPlan",
     "c8_gather_accounting", "bsh_kv_access_plan", "solve_wide_head_tiling", "shipping_fia_panel_plan",
     "lower_cp_collectives", "make_gbsa_op", "make_kv_quant_sfa_c8_op", "make_attention_op",

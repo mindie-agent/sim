@@ -15,6 +15,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from itertools import islice
 from math import ceil, isfinite
+from typing import Literal
 
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError
@@ -35,17 +36,36 @@ from ._cp_tiling import (
     lower_cp_collectives,
 )
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+OPS_TRANSFORMER_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=OPS_TRANSFORMER_REVISION,
+        relative_path="attention/fused_infer_attention_score/op_host/fused_infer_attention_score_tiling.cpp",
+        source_sha256="bac8846fe180d6b95311a7a80b333e0e37a4a587c81c9cfd798e910c14197be0",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=OPS_TRANSFORMER_REVISION,
+        relative_path="attention/kv_quant_sparse_flash_attention/op_host/kv_quant_sparse_flash_attention_tiling.cpp",
+        source_sha256="2c75acce70974165d5b087416d724bcd0d09909b2e8dd693370b5860de9dbc6e",
+    ),
+)
 FIA_ABI = "aclnnFusedInferAttentionScore"
 GBSA_ABI = "aclnnGenericBlockSparseAttention"
 C8_ABI = "aclnnKvQuantSparseFlashAttentionV2"
 C8_V1_ABI = "aclnnKvQuantSparseFlashAttention"
+C8_VLLM_ABI = "aclnnKvQuantSparseFlashAttentionVllm"
 SFA_V1_ABI = "aclnnSparseFlashAttention"
 NOPE_ABI = "aclnnSparseFlashMla"
 MINDIE_V1_ABI = "mindie_sd.block_sparse_attention_v1"
 MINDIE_V2_ABI = "mindie_sd.block_sparse_attention_v2"
 MINDIE_V3_ABI = "mindie_sd.block_sparse_attention_v3"
 MINDIE_ABIS = frozenset({MINDIE_V1_ABI, MINDIE_V2_ABI, MINDIE_V3_ABI})
-SUPPORTED_ABIS = frozenset({FIA_ABI, GBSA_ABI, C8_ABI, C8_V1_ABI, SFA_V1_ABI, NOPE_ABI}) | MINDIE_ABIS
+SUPPORTED_ABIS = frozenset({
+    FIA_ABI, GBSA_ABI, C8_ABI, C8_V1_ABI, C8_VLLM_ABI, SFA_V1_ABI, NOPE_ABI,
+}) | MINDIE_ABIS
 ARCH22 = "npu_arch_2201"
 ARCH35 = "npu_arch_3510"
 QUANT_MODE_BF16 = 0
@@ -61,12 +81,15 @@ SUPPORTED_QUANT_MODES = frozenset({
     QUANT_MODE_FP8_C8, QUANT_MODE_MXFP8,
 })
 C8_MODES = frozenset({QUANT_MODE_INT8_C8, QUANT_MODE_TQ4, QUANT_MODE_FP8_C8})
+C8_VLLM_MODES = frozenset({QUANT_MODE_INT8_C8, QUANT_MODE_FP8_C8})
 MINDIE_V3_MODES = frozenset({
     QUANT_MODE_BF16, QUANT_MODE_MINDIE_FP8, QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP4_CX,
 })
+SFA_V1_MODES = frozenset({QUANT_MODE_BF16})
 TOKEN_MAJOR_LAYOUTS = frozenset({"BSH", "BSND", "PA_BLK_BSND", "TND"})
 PAGED_LAYOUTS = frozenset({"PA_BLK_BSND", "PA_BLK_BHSD"})
 KV_LAYOUTS = TOKEN_MAJOR_LAYOUTS | {"BNSD", "PA_BLK_BHSD"}
+GBSA_LAYOUTS = KV_LAYOUTS - {"BSH"}
 RECTANGULAR_SEQUENCE_LAYOUTS = frozenset({"BSND", "BNSD", "BSH", "PA_BLK_BSND"})
 FIA_TILE = 128
 FIA_PROBABILITY_SLOTS = 3
@@ -173,6 +196,7 @@ C8_LATENT_DIM = 512
 C8_ROPE_DIM = 64
 C8_SCALE_COUNT = 4
 C8_ROW_BYTES = C8_LATENT_DIM + C8_ROPE_DIM * BF16_BYTES + C8_SCALE_COUNT * FP32_BYTES
+C8_VLLM_ROW_BYTES = C8_LATENT_DIM + C8_SCALE_COUNT * FP32_BYTES
 TQ4_ROW_BYTES = C8_LATENT_DIM // 2 + C8_ROPE_DIM * BF16_BYTES + BF16_BYTES
 SECTOR_BYTES = 32
 
@@ -241,7 +265,14 @@ class AttentionContract:
         if (self.phase not in {"prefill", "decode"} or self.kv_layout not in KV_LAYOUTS
                 or self.window_size < 0 or self.panel_mode not in {"shipping", "tile_solver_candidate"}):
             raise ModelingError("attention_phase_layout_window_or_panel_mode_invalid")
-        modes = MINDIE_V3_MODES if self.abi == MINDIE_V3_ABI else SUPPORTED_QUANT_MODES
+        if self.abi == MINDIE_V3_ABI:
+            modes = MINDIE_V3_MODES
+        elif self.abi == SFA_V1_ABI:
+            modes = SFA_V1_MODES
+        elif self.abi == C8_VLLM_ABI:
+            modes = C8_VLLM_MODES
+        else:
+            modes = SUPPORTED_QUANT_MODES
         if self.abi not in SUPPORTED_ABIS or type(self.quant_mode) is not int or self.quant_mode not in modes:
             raise unmodeled("attention_abi_or_quant_mode", f"Bind attention ABI {self.abi} and quantization {self.quant_mode}")
         if (type(self.kv_version) is not int or self.kv_version < 0 or not isinstance(self.kv_tensor_id, str)
@@ -573,11 +604,17 @@ class _AttentionProgramBuilder:
             placement = _placement(context, pair, self.aic_count, self.aiv_count)
             stages = []
             for phase in phases:
+                deps = tuple(dep for dep in phase.after if dep in phase_names)
+                if callable(phase.memory):
+                    mem_stage = phase.memory(context, index, count, core, self.aic_count, deps)
+                    if mem_stage is not None:
+                        stages.append(mem_stage)
+                        continue
                 share = Work(
                     {role: _owner_share(amount, index, count) for role, amount in phase.work.matrix.items()},
                     {role: _owner_share(amount, index, count) for role, amount in phase.work.resources.items()},
                 )
-                bound = replace(phase, work=share, after=tuple(dep for dep in phase.after if dep in phase_names))
+                bound = replace(phase, work=share, after=deps)
                 stages.append(_stage(context, bound, placement))
             programs.append(KernelProgram(tuple(stages)))
         return ParallelProgram(tuple(programs))
@@ -703,6 +740,7 @@ def workspace_write_work(ctx: OperatorPlanningContext, pipe: str, bytes_: int, *
 def output_phases(
     ctx: OperatorPlanningContext, contract: AttentionContract, dtype_bytes: int,
     previous: tuple[str, ...], partials: int, *, queries: int | None = None,
+    lse_slots: int = 1,
 ) -> tuple[AttentionPhase, ...]:
     """Publish completed rows and explicitly reduce split-KV partials."""
     rows = (contract.query_tokens if queries is None else queries) * contract.num_heads
@@ -717,6 +755,8 @@ def output_phases(
             }), ("split_read",)),
         ))
         previous = ("split_merge",)
-    result = rows * (contract.v_head_dim * dtype_bytes + (FP32_BYTES if contract.return_lse else 0))
+    result = rows * (
+        contract.v_head_dim * dtype_bytes + (lse_slots * FP32_BYTES if contract.return_lse else 0)
+    )
     phases.append(AttentionPhase("output", Work(resources={"mte3": result, "hbm": result}), previous))
     return tuple(phases)

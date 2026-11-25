@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import math
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
@@ -31,11 +32,16 @@ from ...results import (
 )
 from mindie_sim.prediction.operators.vector.vector_pipeline import AIVTiledVectorAndGatherRecipe
 from ..contracts import OperatorPlanningContext
+from .family_v41_rotary import issued_mte2_bytes as partial_rotary_mte2_bytes
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 IMPLEMENTATION = "rotary_position_embedding"
 UPSTREAM_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
 KERNEL_SOURCE_SHA256 = (
     "5160d08c053ba32694df0c699d31ddc9b67a26d3ae4545f4fb9d6122efc3400e"
+)
+TILING_SOURCE_SHA256 = (
+    "851736864e5038ea3c69a204d2b79303d79c818672780fc0554533be74b56e57"
 )
 SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
@@ -47,10 +53,20 @@ SOURCES: tuple[SourceRef, ...] = (
         ),
         source_sha256=KERNEL_SOURCE_SHA256,
     ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=UPSTREAM_REVISION,
+        relative_path=(
+            "posembedding/rotary_position_embedding/op_host/"
+            "rope_regbase_tiling_base.cpp"
+        ),
+        source_sha256=TILING_SOURCE_SHA256,
+    ),
 )
 SUPPORTED_ABIS: frozenset[str] = frozenset({
     "aclnnRotaryPositionEmbedding",
 })
+SUPPORTED_ROTARY_DTYPES: frozenset[str] = frozenset({"fp16", "bf16", "fp32"})
 
 # Rotate-half per element (ops-transformer rotate_half.h:124 & rotate_half_base.h:294-296):
 # Muls(sin, -1, halfD) = 0.5 + Mul(x, cos) = 1.0 + Mul(xNew, sin) = 1.0 + Add(xNew, x) = 1.0.
@@ -155,10 +171,34 @@ def _pipeline_spec(work: Work, dtype: str) -> FusedPipelineSpec:
     )
 
 
+def _validate_rotary_contract(op: OpSpec, ctx: OperatorPlanningContext) -> None:
+    """Validate CANN aclnnRotaryPositionEmbedding dtype and rotate-half even head dim."""
+    del ctx
+    dtype = str(op.dtype or "bf16").strip().lower()
+    if dtype not in SUPPORTED_ROTARY_DTYPES:
+        raise ModelingError(f"rotary_dtype_unsupported:{op.op_id}:{dtype}")
+    shape = tuple(int(dim) for dim in (op.local_shape or op.semantic_shape or ()))
+    if any(dim < 0 for dim in shape):
+        raise ModelingError(f"rotary_invalid_shape:{op.op_id}:{shape}")
+    if shape and shape[-1] > 0 and shape[-1] % 2 != 0:
+        raise ModelingError(f"rotary_head_dim_must_be_even:{op.op_id}:{shape[-1]}")
+    meta = dict(op.metadata or ())
+    rotary_dim = int(meta.get("rotary_dim", 0) or 0)
+    if rotary_dim > 0 and rotary_dim % 2 != 0:
+        raise ModelingError(f"rotary_head_dim_must_be_even:{op.op_id}:{rotary_dim}")
+
+
 def build(op: OpSpec, ctx: OperatorPlanningContext, /) -> OperatorPlan:
     """Build the conserved AIV rotary ``OperatorPlan`` with attached ``FusedPipelineSpec``."""
+    _validate_rotary_contract(op, ctx)
     declared = work_from_op(op)
     work = declared if _has_declared_work(declared) else _derive_rotary_work(op)
+    if dict(op.metadata or ()).get("partial_rotary_work"):
+        domain = max(1, int(dict(ctx.geometry.resource_units).get("vector", ctx.effective_aiv_cores)))
+        issued = float(partial_rotary_mte2_bytes(op, domain=domain))
+        resources = dict(work.resources)
+        resources["mte2"] = issued
+        work = Work(work.matrix, resources)
     dtype = str(op.dtype or "bf16")
     spec = _pipeline_spec(work, dtype)
     return OperatorPlan(
@@ -201,6 +241,8 @@ __all__ = [
     "IMPLEMENTATION",
     "SOURCES",
     "SUPPORTED_ABIS",
+    "SUPPORTED_ROTARY_DTYPES",
+    "TARGET_BACKEND",
     "build",
     "describe",
 ]
