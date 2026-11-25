@@ -388,13 +388,21 @@ def _recurrent_gdn(inputs, outputs):
             or key != query or outputs[0] != value
             or not _tensor(state, RECURRENT_GDN_STATE_RANK, {"bf16", "fp32"})
             or outputs[1] != state
-            or not _tensor(lengths, 1, {"int32"}) or lengths[0][0] < 2):
+            or not _tensor(lengths, 1, {"int32"})):
         return None, _issue(kind, "inconsistent_recurrent_gdn_tensors",
                             "Recurrent GDN requires equal BF16 Q/K, BF16 value/output, "
-                            "the same state input/output, and cumulative sequence descriptors.")
+                            "the same state input/output, and an INT32 sequence descriptor.")
     tokens, key_heads, dk = query[0]
     value_tokens, heads, dv = value[0]
-    sequences = lengths[0][0] - 1
+    sequences = lengths[0][0]
+    if len(inputs) == 9:
+        # Compact captures omit gk. Accepted counts disambiguate the
+        # wrapper's leading length entry from the native B-element vector.
+        if accepted == _EMPTY:
+            return None, _issue(kind, "unresolved_sequence_count",
+                                "Compact lengths alone do not identify the sequence convention.")
+        if accepted[0] == (sequences - 1,) and sequences > 1:
+            sequences -= 1
     if (value_tokens != tokens or heads % key_heads or state[0][1:] != (heads, dv, dk)
             or beta != ((tokens, heads), "bf16", "ND")
             or indices != ((tokens,), "int32", "ND")

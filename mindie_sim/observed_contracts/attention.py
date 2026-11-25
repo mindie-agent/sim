@@ -50,14 +50,12 @@ MQSMLA_ORIGINAL_ROW_BYTES = 544
 MQSMLA_COMPRESSED_ROW_BYTES = 320
 MQSMLA_FP8_ROW_BYTES = 608
 MQSMLA_MXFP8_ROW_BYTES = 584
-MQSMLA_ORIGINAL_ROW_WIDTHS = frozenset({
-    MQSMLA_ORIGINAL_ROW_BYTES, MQSMLA_FP8_ROW_BYTES, MQSMLA_MXFP8_ROW_BYTES,
-})
-MQSMLA_ROW_WIDTH_PAIRS = frozenset({
-    (MQSMLA_ORIGINAL_ROW_BYTES, MQSMLA_COMPRESSED_ROW_BYTES),
-    (MQSMLA_FP8_ROW_BYTES, MQSMLA_FP8_ROW_BYTES),
-    (MQSMLA_MXFP8_ROW_BYTES, MQSMLA_MXFP8_ROW_BYTES),
-})
+MQSMLA_NATIVE_INPUT_COUNT = 18
+MQSMLA_NATIVE_RECORDS = {
+    ("fp8_e4m3", MQSMLA_FP8_ROW_BYTES), ("fp8_e4m3", MQSMLA_MXFP8_ROW_BYTES),
+    ("uint8", MQSMLA_FP8_ROW_BYTES), ("uint8", MQSMLA_MXFP8_ROW_BYTES),
+    ("int8", MQSMLA_FP8_ROW_BYTES),
+}
 MQSMLA_COMPRESSED_INPUT_COUNT = 10
 LEGACY_MQSMLA_CANONICAL_KIND = "MqsmlaKernel___call__"
 LEGACY_MQSMLA_KINDS = frozenset({LEGACY_MQSMLA_CANONICAL_KIND, "MqsmlaKernel"})
@@ -96,24 +94,9 @@ _ARITIES = {
 }
 # Mixed-quant sparse MLA profile slots: original-only 7/8 inputs,
 # compressed cache 10/11/12 inputs, one or two outputs.
-_ARITIES.update({kind: (MQSMLA_INPUT_COUNTS, MQSMLA_OUTPUT_COUNTS) for kind in MQSMLA_KINDS})
+_ARITIES.update({kind: (MQSMLA_INPUT_COUNTS, MQSMLA_OUTPUT_COUNTS) for kind in LEGACY_MQSMLA_KINDS})
+_ARITIES.update({kind: ({MQSMLA_NATIVE_INPUT_COUNT}, {2}) for kind in ACLNN_MQSMLA_KINDS})
 ATTENTION_CACHE_TYPES = frozenset(_ARITIES) | {"PaMlaAttention"}
-
-
-def _native(row):
-    contract = native_tensor_contract(row)
-    if contract is None or row.kind not in _ARITIES:
-        return None
-    if any(not shape and str(fmt).strip().upper() == "N/A"
-           for shapes, formats in ((row.input_shapes, row.input_formats),
-                                   (row.output_shapes, row.output_formats))
-           for shape, fmt in zip(shapes, formats)):
-        return None
-    inputs, outputs = contract[2:]
-    expected_inputs, expected_outputs = _ARITIES[row.kind]
-    if len(inputs) not in expected_inputs or len(outputs) not in expected_outputs:
-        return None
-    return contract
 
 
 def _dense_fia(inputs, outputs):
@@ -299,58 +282,75 @@ def _sparse_attention(kind, inputs, outputs):
 
 
 def _mqsmla_attention(kind, inputs, outputs):
-    if len(inputs) not in MQSMLA_INPUT_COUNTS or len(outputs) not in MQSMLA_OUTPUT_COUNTS:
-        return None
-    query, original, output = inputs[0], inputs[2], outputs[0]
+    query, output = inputs[0], outputs[0]
+    empty = ((), None, None)
     if (not _nd_tensor(query, MQSMLA_QUERY_RANK, {"bf16"})
-            or query[0][-1] != MQSMLA_QUERY_WIDTH or output != query
-            or not _nd_tensor(original, MQSMLA_CACHE_RANK, {"uint8"})
-            or original[0][2] != 1
-            or original[0][3] not in MQSMLA_ORIGINAL_ROW_WIDTHS
-            or (kind in LEGACY_MQSMLA_KINDS
-                and original[0][3] != MQSMLA_ORIGINAL_ROW_BYTES)
-            or not _nd_tensor(inputs[3], 2, {"int32"})):
+            or query[0][-1] != MQSMLA_QUERY_WIDTH or output != query):
         return None
-    compressed_head = ((), None, None)
-    if len(inputs) >= MQSMLA_COMPRESSED_INPUT_COUNT:
-        compressed = inputs[7]
-        if (not _nd_tensor(compressed, MQSMLA_CACHE_RANK, {"uint8"})
-                or compressed[0][2] != 1
-                or (original[0][3], compressed[0][3]) not in MQSMLA_ROW_WIDTH_PAIRS
-                or not _nd_tensor(inputs[8], 2, {"int32"})):
+    if kind in ACLNN_MQSMLA_KINDS:
+        canonical_kind = ACLNN_MQSMLA_CANONICAL_KIND
+        original, compressed = inputs[1:3]
+        table, compressed_table = inputs[5:7]
+        if (not _nd_tensor(original, MQSMLA_CACHE_RANK, {"uint8", "fp8_e4m3", "int8"})
+                or (original[1], original[0][-1]) not in MQSMLA_NATIVE_RECORDS):
             return None
-        compressed_head = (compressed[0][2:], "uint8", "ND")
-    canonical_kind = (
-        ACLNN_MQSMLA_CANONICAL_KIND if kind in ACLNN_MQSMLA_KINDS
-        else LEGACY_MQSMLA_CANONICAL_KIND
-    )
-    return (
-        "sparse_attention_active", canonical_kind,
-        (query,),
-        ((original[0][2:], "uint8", "ND"), compressed_head),
-        output,
-    )
+        compressed_width = original[0][-1]
+    else:
+        canonical_kind = LEGACY_MQSMLA_CANONICAL_KIND
+        original, table = inputs[2:4]
+        compressed, compressed_table = (inputs[7:9] if len(inputs) >= MQSMLA_COMPRESSED_INPUT_COUNT
+                                        else (empty, empty))
+        if (not _nd_tensor(original, MQSMLA_CACHE_RANK, {"uint8"})
+                or original[0][-1] != MQSMLA_ORIGINAL_ROW_BYTES):
+            return None
+        compressed_width = MQSMLA_COMPRESSED_ROW_BYTES
+    if original[0][-2] != 1 or not _nd_tensor(table, 2, {"int32"}):
+        return None
+    compressed_head = empty
+    if (compressed != empty or compressed_table != empty
+            or (kind in LEGACY_MQSMLA_KINDS and len(inputs) >= MQSMLA_COMPRESSED_INPUT_COUNT)):
+        if (not _nd_tensor(compressed, MQSMLA_CACHE_RANK, {original[1]})
+                or compressed[0][-2:] != (1, compressed_width)
+                or not _nd_tensor(compressed_table, 2, {"int32"})):
+            return None
+        compressed_head = (compressed[0][2:], *compressed[1:])
+    return ("sparse_attention_active", canonical_kind, (query,),
+            ((original[0][2:], *original[1:]), compressed_head), output)
+
+
+def _attention_projection(row):
+    native = native_tensor_contract(row)
+    if native is None:
+        return None, native_tensor_diagnostic(row)
+    inputs, outputs = native[2:]
+    arity = _ARITIES.get(row.kind)
+    if arity is None or len(inputs) not in arity[0] or len(outputs) not in arity[1]:
+        return None, {"category": "contract_support_gap", "reason": "unsupported_native_tensor_slots",
+                      "detail": "This attention/cache ABI arity has no source-backed contract.",
+                      "operator_type": row.kind}
+    if row.kind in SUBGRAPH_TYPES:
+        return subgraph_contract(native)
+    if row.kind in MQSMLA_KINDS:
+        contract = _mqsmla_attention(row.kind, inputs, outputs)
+        if contract is None:
+            return None, {"category": "contract_support_gap", "reason": "unsupported_mqsmla_geometry",
+                          "detail": "The query, cache records and tables must match the ordered ABI.",
+                          "operator_type": row.kind}
+        return contract, None
+    if row.kind == "FusedInferAttentionScore":
+        return (_dense_fia(inputs, outputs) or _paged_fia(inputs, outputs)
+                or _paged_mla_fia(inputs, outputs) or native), None
+    if row.kind == "ReshapeAndCacheNdKernel":
+        return _reshape_cache(inputs, outputs) or native, None
+    if row.kind == "ScatterPaKvCache":
+        return _scatter_cache(inputs, outputs) or native, None
+    if row.kind in {"SparseFlashAttention", "SparseAttnSharedkv"}:
+        return _sparse_attention(row.kind, inputs, outputs) or native, None
+    return native, None
 
 
 def observed_attention_contract(row):
-    native = _native(row)
-    if native is None:
-        return None
-    if row.kind in SUBGRAPH_TYPES:
-        return subgraph_contract(native)[0]
-    inputs, outputs = native[2:]
-    if row.kind in MQSMLA_KINDS:
-        return _mqsmla_attention(row.kind, inputs, outputs)
-    if row.kind == "FusedInferAttentionScore":
-        return (_dense_fia(inputs, outputs) or _paged_fia(inputs, outputs)
-                or _paged_mla_fia(inputs, outputs) or native)
-    if row.kind == "ReshapeAndCacheNdKernel":
-        return _reshape_cache(inputs, outputs) or native
-    if row.kind == "ScatterPaKvCache":
-        return _scatter_cache(inputs, outputs) or native
-    if row.kind in {"SparseFlashAttention", "SparseAttnSharedkv"}:
-        return _sparse_attention(row.kind, inputs, outputs) or native
-    return native
+    return _attention_projection(row)[0]
 
 
 def attention_contract_scope(row):
@@ -444,18 +444,9 @@ def attention_contract_scope(row):
 
 
 def attention_contract_diagnostic(row):
-    if native_tensor_contract(row) is None:
-        return native_tensor_diagnostic(row)
-    if _native(row) is None:
-        return {
-            "category": "contract_support_gap", "reason": "unsupported_native_tensor_slots",
-            "detail": "This attention/cache ABI arity has no source-backed contract.",
-            "operator_type": row.kind,
-        }
-    if row.kind in SUBGRAPH_TYPES:
-        _, issue = subgraph_contract(_native(row))
-        if issue is not None:
-            return issue
+    _, issue = _attention_projection(row)
+    if issue is not None:
+        return issue
     return {
         "category": "tensor_contract_available", "reason": "observed_tensor_contract_available",
         "detail": "The compared descriptor scope is explicit; occurrence evidence remains independent.",

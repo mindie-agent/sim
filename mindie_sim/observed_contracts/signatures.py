@@ -306,9 +306,13 @@ def native_call_signature_match(binding: Mapping[str, Any], event: Event) -> boo
         if not in_formats or not out_formats:
             return None
         if layout in {"contiguous", "nd"}:
-            if any(fmt in _NON_CONTIGUOUS_FORMATS for fmt in (*in_formats, *out_formats)):
+            if any(fmt in _NON_CONTIGUOUS_FORMATS or fmt.startswith("FRACTAL_NZ_")
+                   for fmt in (*in_formats, *out_formats)):
                 return False
-        elif "fractal_nz" in layout and "FRACTAL_NZ" not in in_formats:
+        elif layout.startswith("fractal_nz_") and layout.upper() not in in_formats:
+            return False
+        elif "fractal_nz" in layout and not any(
+                fmt == "FRACTAL_NZ" or fmt.startswith("FRACTAL_NZ_") for fmt in in_formats):
             return False
     return None if unresolved_order else True
 
@@ -593,6 +597,8 @@ MX_SCALE_BLOCK_ROUNDING_OFFSET = 63
 MOE_INIT_SCALE_GROUP = 32
 MOE_INIT_INPUT_SLOTS = 2
 MOE_INIT_OUTPUT_SLOTS = 4
+CAUSAL_CONV_KERNEL_WIDTHS = {2, 3, 4}
+CAUSAL_CONV_SPECULATIVE_WIDTH = 4
 
 
 def _mx_quant_contract(row):
@@ -661,6 +667,56 @@ def _moe_init_routing_contract(row):
     )
 
 
+def _native_causal_conv(row):
+    native = native_tensor_contract(row)
+    if native is None or len(native[2]) != 8:
+        return None
+    x, weight, state, bias, starts, indices, initial, accepted = native[2]
+    empty = ((), None, None)
+    if (len(x[0]) not in {2, 3} or min(x[0]) <= 0 or x[1] not in {"bf16", "fp16"}
+            or x[2] != "ND" or len(weight[0]) != 2 or weight[0][-1] != x[0][-1]
+            or weight[0][0] not in CAUSAL_CONV_KERNEL_WIDTHS
+            or weight[1:] != x[1:] or len(state[0]) != 3 or state[0][-1] != x[0][-1]
+            or state[1:] != x[1:] or native[3] != (state, x)
+            or bias not in {empty, ((x[0][-1],), *x[1:])}):
+        return None
+    if len(x[0]) == 2:
+        if len(starts[0]) != 1 or starts[1:] != ("int32", "ND"):
+            return None
+        batch = starts[0][0] - 1
+    else:
+        if starts != empty:
+            return None
+        batch = x[0][0]
+    history = weight[0][0] - 1
+    if accepted != empty:
+        if weight[0][0] != CAUSAL_CONV_SPECULATIVE_WIDTH:
+            return None
+        if len(x[0]) == 3:
+            history += x[0][1] - 1
+    if (batch <= 0 or state[0][0] < batch or state[0][1] < history
+            or any(slot not in {empty, ((batch,), "int32", "ND")}
+                   for slot in (indices, initial, accepted))):
+        return None
+    return native
+
+
+def _gdn_gating_contract(row):
+    native = native_tensor_contract(row)
+    if native is None or len(native[2]) not in {3, 4} or len(native[3]) != 2:
+        return None
+    log_decay, a, b = native[2][:3]
+    if (len(a[0]) != 2 or min(a[0]) <= 0 or b[0] != a[0]
+            or log_decay[0] != (a[0][-1],) or any(slot[0] != log_decay[0] for slot in native[2][3:])
+            or any(slot[1] not in {"bf16", "fp16", "fp32"} or slot[2] != "ND"
+                   for slot in native[2])):
+        return None
+    shape = (1, *a[0])
+    if native[3] != ((shape, "fp32", "ND"), (shape, b[1], "ND")):
+        return None
+    return ("gdn_gating", a[0], native[2], native[3])
+
+
 def observed_contract(row):
     if row.kind in MOE_INIT_NATIVE_TYPES:
         return _moe_init_routing_contract(row)
@@ -691,7 +747,9 @@ def observed_contract(row):
         return (row.kind, inputs, outputs, tuple(DTYPES.get(d, d) for d in row.input_dtypes),
                 tuple(DTYPES.get(d, d) for d in row.output_dtypes))
     if row.kind == "CausalConv1d":
-        if len(inputs) < 7 or len(inputs[0]) != 2 or len(inputs[1]) != 2:
+        if len(outputs) == 2:
+            return _native_causal_conv(row)
+        if len(outputs) != 1 or len(inputs) < 7 or len(inputs[0]) != 2 or len(inputs[1]) != 2:
             return None
         if inputs[3] and len(inputs[3]) != 3:
             return None
@@ -720,8 +778,8 @@ def observed_contract(row):
             return ("matrix_bias", (m, n, k), *dtypes, inputs[2], bias_dtype)
         scale = (), ""
         return ("matrix", (m, n, k), *dtypes, *scale)
-    if row.kind == "fused_gdn_gating_kernel" and len(inputs) >= 3:
-        return ("gdn_gating", inputs[1])
+    if row.kind == "fused_gdn_gating_kernel":
+        return _gdn_gating_contract(row)
     if (row.kind == "Slice" and len(inputs[0]) in {2, 3}
             and len(outputs) == 1 and len(outputs[0]) == len(inputs[0])):
         # Captured geometry does not include index tensor values or source offsets.

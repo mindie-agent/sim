@@ -83,6 +83,7 @@ FIELDS = {
                     "bias_shape", "bias_dtype"),
     "grouped_matrix": ("family", "geometry", "input_dtype", "weight_dtype", "output_dtype",
                        "scale_shape", "scale_dtype"),
+    "gdn_gating": ("family", "shape", "input_slots", "output_slots"),
     "slice_copy": ("family", "input_shape", "output_shape", "input_dtype", "output_dtype"),
     "rmsnorm": ("family", "shape", "dtype", "has_weight"),
     "add_rmsnorm": ("family", "shape", "dtype", "has_weight"),
@@ -148,7 +149,7 @@ FIELDS = {
         "output_dtype"),
     "router_selection_active": (
         "family", "native_operator", "selection_mode", "logits_slot", "weights_slot",
-        "indices_slot"),
+        "indices_slot", "text_bias_slot", "vision_bias_slot"),
 }
 
 NATIVE_FAMILIES = {
@@ -291,27 +292,6 @@ _UNDEFINED_DTYPES = frozenset({"", "N/A", "NULL", "NONE", "UNDEFINED", "DT_UNDEF
 _ATTENTION_AUX_DTYPES = frozenset(
     {"int8", "uint8", "int16", "uint16", "int32", "uint32", "int64", "uint64", "bool"}
 )
-_DTYPE_TOKENS = {
-    **dict.fromkeys(("BF16", "BFP16", "BFLOAT16", "DT_BF16", "DT_BFLOAT16"), "bf16"),
-    **dict.fromkeys(("FP16", "HALF", "FLOAT16", "DT_FLOAT16", "DT_HALF"), "fp16"),
-    **dict.fromkeys(("FP32", "FLOAT", "FLOAT32", "DT_FLOAT", "DT_FLOAT32"), "fp32"),
-    **dict.fromkeys(("FP64", "DOUBLE", "FLOAT64", "DT_DOUBLE", "DT_FLOAT64"), "fp64"),
-    **dict.fromkeys(("INT4", "DT_INT4"), "int4"),
-    **dict.fromkeys(("INT8", "DT_INT8"), "int8"),
-    **dict.fromkeys(("INT16", "DT_INT16"), "int16"),
-    **dict.fromkeys(("INT32", "DT_INT32"), "int32"),
-    **dict.fromkeys(("INT64", "DT_INT64"), "int64"),
-    **dict.fromkeys(("UINT8", "DT_UINT8"), "uint8"),
-    **dict.fromkeys(("UINT16", "DT_UINT16"), "uint16"),
-    **dict.fromkeys(("UINT32", "DT_UINT32"), "uint32"),
-    **dict.fromkeys(("UINT64", "DT_UINT64"), "uint64"),
-    **dict.fromkeys(("BOOL", "DT_BOOL"), "bool"),
-    **dict.fromkeys(("HIF8", "HIFLOAT8", "DT_HIFLOAT8"), "hif8"),
-    **dict.fromkeys(("FP8_E4M3", "FP8_E4M3FN", "FLOAT8_E4M3FN", "DT_FLOAT8_E4M3FN"), "fp8_e4m3"),
-    **dict.fromkeys(("FP8_E5M2", "FLOAT8_E5M2", "DT_FLOAT8_E5M2"), "fp8_e5m2"),
-    **dict.fromkeys(("FP8_E8M0", "FLOAT8_E8M0", "DT_FLOAT8_E8M0"), "fp8_e8m0"),
-    **dict.fromkeys(("MXFP4", "FLOAT4_E2M1", "DT_FLOAT4_E2M1"), "mxfp4"),
-}
 _NON_CONTIGUOUS_FORMATS = frozenset(
     {"FRACTAL_NZ", "FRACTAL_Z", "FRACTAL_Z_3D", "NC1HWC0", "NDC1HWC0", "C1HWNCOC0"}
 )
@@ -443,14 +423,6 @@ _DECLARED_INPUT_DTYPE_ROLES: tuple[tuple[str, frozenset[str]], ...] = (
 )
 
 
-def _norm_dtype(raw: Any) -> str | None:
-    text = str(raw or "").strip().strip('"')
-    upper = text.upper()
-    if upper in _UNDEFINED_DTYPES:
-        return None
-    return _DTYPE_TOKENS.get(upper, text.lower().removeprefix("dt_"))
-
-
 import hashlib
 import json
 from collections.abc import Mapping, Sequence
@@ -465,7 +437,10 @@ DTYPES = {
     "DT_INT4": "int4", "INT4": "int4", "DT_UINT4": "uint4", "UINT4": "uint4",
     "UINT64": "uint64", "DT_UINT64": "uint64", "UINT32": "uint32",
     "DT_UINT32": "uint32", "UINT8": "uint8", "DT_UINT8": "uint8",
-    "BF16": "bf16", "FP16": "fp16", "DT_FLOAT": "fp32",
+    "BF16": "bf16", "BFP16": "bf16", "FP16": "fp16", "DT_FLOAT": "fp32",
+    "HALF": "fp16", "DT_HALF": "fp16", "DOUBLE": "fp64", "DT_DOUBLE": "fp64",
+    "INT16": "int16", "DT_INT16": "int16", "UINT16": "uint16", "DT_UINT16": "uint16",
+    "DT_BOOL": "bool", "FP8_E4M3FN": "fp8_e4m3",
     "bf16": "bf16", "fp16": "fp16", "fp32": "fp32", "fp64": "fp64",
     "int8": "int8", "int4": "int4", "int64": "int64", "int32": "int32",
     "uint64": "uint64", "uint32": "uint32", "uint4": "uint4", "bool": "bool",
@@ -488,6 +463,10 @@ DTYPES = {
 _MISSING = {"", "N/A", "NULL", "UNDEFINED", "DT_UNDEFINED"}
 _EMPTY_DTYPES = {"UNDEFINED", "DT_UNDEFINED"}
 _EMPTY_FORMATS = {"NULL", "UNDEFINED"}
+
+
+def _missing_layout(value):
+    return not isinstance(value, str) or value.strip().upper() in _MISSING
 
 
 def _undefined_dtype(value):
@@ -539,8 +518,11 @@ def native_contract_issue(row):
                 }
             if not shape and _undefined_dtype(dtype) and _undefined_layout(layout):
                 continue
-            missing = [field for field, value in (("dtype", dtype), ("format", layout))
-                       if value in _MISSING or not str(value or "").strip()]
+            missing = []
+            if _norm_dtype(dtype) is None:
+                missing.append("dtype")
+            if _missing_layout(layout):
+                missing.append("format")
             if missing:
                 return {
                     "category": "capture_metadata_missing", "reason": "missing_tensor_metadata",
@@ -564,7 +546,7 @@ def native_tensor_contract(row, *, kind=None):
         ):
             empty = (not shape and _undefined_dtype(dtype)
                      and _undefined_layout(layout))
-            slots.append((tuple(shape), None if empty else DTYPES.get(dtype, dtype),
+            slots.append((tuple(shape), None if empty else _norm_dtype(dtype),
                           None if empty else layout))
         sides.append(tuple(slots))
     return ("native_tensor_abi", kind or row.kind, *sides)
@@ -582,19 +564,14 @@ def _canonical(value):
     return json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False)
 
 
-def _normalize_dtype(value):
-    """Return (normalized known alias or literal unknown, present)."""
+def _norm_dtype(value):
+    """Canonical native dtype for a descriptor or signature; preserve unknown literals."""
     if not isinstance(value, str):
-        return None, False
-    text = value.strip()
-    if not text or text in _MISSING:
-        return None, False
-    if text in DTYPES:
-        return DTYPES[text], True
-    low = text.lower().replace("-", "_")
-    if low in DTYPES:
-        return DTYPES[low], True
-    return text, True
+        return None
+    text = value.strip().strip('"')
+    if text.upper() in _UNDEFINED_DTYPES:
+        return None
+    return DTYPES.get(text.upper(), DTYPES.get(text.lower().replace("-", "_"), text))
 
 
 def _slot_inputs(slots, direction):
@@ -618,11 +595,11 @@ def _slot_inputs(slots, direction):
                 continue
             shape_present = "shape" in slot
             shape = slot.get("shape")
-            dtype_raw = slot.get("dtype")
+            dtype_raw = slot.get("dtype_raw", slot.get("dtype"))
             dtype_present = (bool(slot.get("dtype_present"))
                              if "dtype_present" in slot else "dtype" in slot)
             if "layout" in slot:
-                layout_raw = slot.get("layout")
+                layout_raw = slot.get("layout_raw", slot.get("layout"))
                 layout_present = (bool(slot.get("layout_present"))
                                   if "layout_present" in slot else True)
             elif "format" in slot:
@@ -658,7 +635,7 @@ def _slot_inputs(slots, direction):
             shape = list(shape) if isinstance(shape, (list, tuple)) else None
         else:
             shape = [int(value) for value in shape]
-        dtype, dtype_known = _normalize_dtype(dtype_raw)
+        dtype = _norm_dtype(dtype_raw)
         if not dtype_present:
             slot_issues.append({"reason": "missing_dtype"})
         if not layout_present:
@@ -670,7 +647,7 @@ def _slot_inputs(slots, direction):
             if empty and undefined_dtype and undefined_layout:
                 quality = "undefined"
             elif empty:
-                if dtype is None or not isinstance(layout_raw, str) or not layout_raw.strip():
+                if dtype is None or _missing_layout(layout_raw):
                     slot_issues.append({"reason": "missing_dtype_or_layout"})
                     quality = "missing"
                 else:
@@ -678,7 +655,7 @@ def _slot_inputs(slots, direction):
             else:
                 if dtype is None:
                     slot_issues.append({"reason": "missing_dtype"})
-                if not isinstance(layout_raw, str) or not layout_raw.strip() or layout_raw in _MISSING:
+                if _missing_layout(layout_raw):
                     slot_issues.append({"reason": "missing_layout"})
                 quality = "tensor" if not slot_issues else "missing"
         else:
@@ -1147,23 +1124,23 @@ def _project(row):
         if (len(x[0]) != 2 or not all(dim > 0 for dim in x[0])
                 or x[1] not in _FLOAT or x[2] != "ND"
                 or gamma[0] != (x[0][-1],) or gamma != beta
-                or gamma[1] not in _FLOAT or gamma[2] != "ND" or outputs[0] != x
-                or any(slot[0] != (x[0][0], 1) or slot[1:] != ("fp32", "ND")
+                or gamma[1] not in {x[1], "fp32"} or gamma[2] != "ND" or outputs[0] != x
+                or any(slot[0] != (x[0][0], 1) or slot[1:] != gamma[1:]
                        for slot in outputs[1:])):
             return None, _issue(kind, "unsupported_layernorm_geometry",
                                 "Verified LayerNorm has ND rows, matching affine channels, "
-                                "a primary result and one FP32 mean/rstd per row.")
+                                "a primary result and mean/rstd in the affine dtype per row.")
         return ("layernorm_active", kind, x, gamma, beta, outputs[0]), None
     if len(inputs) != 2 or len(outputs) != 1:
         return None, _issue(kind, "unsupported_native_tensor_slots",
                             "The retained TransposeBatchMatMul boundary has two inputs and one output.")
     x, weight = inputs
     y = outputs[0]
-    if (any(len(slot[0]) != 3 or not all(dim > 0 for dim in slot[0])
-            or slot[1] not in _FLOAT or slot[2] != "ND"
+    if (x[1] not in _FLOAT or any(
+            len(slot[0]) != 3 or min(slot[0]) <= 0 or slot[1:] != (x[1], "ND")
             for slot in (x, weight, y))):
         return None, _issue(kind, "unsupported_batch_matrix_geometry",
-                            "The supported projection needs complete rank-three floating ND operands.")
+                            "The supported projection needs rank-three ND inputs and output of the same floating dtype.")
     batch, k, n = weight[0]
     rows = y[0][0]
     if y[0] != (rows, batch, n) or x[0] not in {

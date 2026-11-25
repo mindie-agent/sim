@@ -230,24 +230,30 @@ def _dequant_swiglu(kind, inputs, outputs):
 
 
 def _rmsnorm_mxquant(kind, inputs, outputs):
-    if len(inputs) != 2 or len(outputs) != 3:
+    if len(inputs) not in {2, 3} or len(outputs) != 3:
         return None, _issue(kind, "unsupported_native_tensor_slots",
-                            "The retained RMS/MX quantization ABI has two inputs and three outputs.")
+                            "RMS/MX quantization requires x, gamma, optional beta and three outputs.")
     missing = _missing(kind, inputs, outputs, range(2), range(2))
     if missing:
         return None, missing
-    x, gamma = inputs
+    x, gamma = inputs[:2]
     result, scale, auxiliary = outputs
-    if (not _tensor(x, 2, {"bf16", "fp16"})
-            or gamma != ((x[0][-1],), x[1], "ND")
-            or result != (x[0], "fp8_e4m3", "ND")
-            or x[0][-1] % MX_MICROSCALE_BLOCK
-            or scale != ((x[0][0], x[0][1] // MX_MICROSCALE_BLOCK, 2), "fp8_e8m0", "NCL")
-            or auxiliary[0]):
-        return None, _issue(
-            kind, "unsupported_rmsnorm_mxquant_geometry",
-            "The retained path exposes one FP8 output and E8M0 paired scales, "
-            "with matching RMS weight and no materialized auxiliary output.")
+    if not _tensor(x, 2, _FLOAT):
+        return None, _issue(kind, "unsupported_rmsnorm_mxquant_geometry",
+                            "Expected a floating ND matrix.")
+    rows, width = x[0]
+    pairs = (width + MX_MICROSCALE_BLOCK - 1) // MX_MICROSCALE_BLOCK
+    full = len(inputs) == 3
+    beta = inputs[2] if full else _EMPTY
+    disabled_rstd = ((0,) if full else (), "fp32", "ND")
+    if (gamma[0] != (width,) or gamma[1] not in {x[1], "fp32"} or gamma[2] != "ND"
+            or beta not in {_EMPTY, gamma} or result != (x[0], "fp8_e4m3", "ND")
+            or scale != ((rows, pairs, 2), "fp8_e8m0", "ND" if full else "NCL")
+            or auxiliary not in {_EMPTY, disabled_rstd, ((rows, 1), "fp32", "ND")}):
+        return None, _issue(kind, "unsupported_rmsnorm_mxquant_geometry",
+                            "RMS weights, paired E8M0 scales and rstd must match the recorded ABI.")
+    if beta != _EMPTY or auxiliary == ((rows, 1), "fp32", "ND"):
+        return ("native_tensor_abi", kind, inputs, outputs), None
     return ("rmsnorm_mxquant_active", kind, x, gamma, result, scale), None
 
 
@@ -310,8 +316,9 @@ def moe_fusion_scope(kind):
     if kind == "RmsNormDynamicMxQuant":
         return {
             **common, "kind": "rmsnorm_mxquant_tensor_descriptors",
-            "compared": ["native_operator_type", "input_weight_output_and_scale_slots"],
-            "not_compared": ["epsilon", "rounding_mode", "scale_values", "auxiliary_output"],
+            "compared": ["native_operator_type", "input_weight_output_and_scale_slots",
+                         "materialized_beta_and_rstd_descriptors_when_present"],
+            "not_compared": ["epsilon", "rounding_mode", "scale_values"],
         }
     return {
         **common, "kind": "native_implementation_boundary_only", "compared": [],

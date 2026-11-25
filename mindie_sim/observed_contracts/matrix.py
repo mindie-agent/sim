@@ -31,11 +31,7 @@ def _project_router(row):
                 else HASH_ROUTER_INPUT_SLOT_ARITIES)
     if kind not in ROUTER_TYPES or len(inputs) not in expected or len(outputs) != 3:
         return None, _issue(row, "unsupported_router_native_slots",
-                            "TopK requires 2/3 slots; Hash supports the verified 4/3 "
-                            "interface and the retained 5/3 form with an undefined extra input.")
-    if len(inputs) == 5 and inputs[4] != _EMPTY:
-        return None, _issue(row, "unverified_router_extra_input",
-                            "A materialized fifth Hash input has no verified source interpretation.")
+                            "TopK requires 2/3 slots; Hash requires four or five inputs and three outputs.")
     logits, bias = inputs[:2]
     weights, indices, auxiliary = outputs
     if not logits[0] or not weights[0] or not indices[0]:
@@ -53,20 +49,31 @@ def _project_router(row):
                             "The verified interface preserves token rows and score dtype, "
                             "with INT32 selected IDs, optional per-expert bias and FP32 auxiliary scores.")
     mode = "score_topk"
+    bias_slots = ()
     if kind == "MoeGatingTopKHash":
         token_ids, table = inputs[2:4]
-        if token_ids == table == _EMPTY:
-            pass
-        elif (token_ids[0] == (logits[0][0],) and token_ids[1] in {"int32", "int64"}
-              and token_ids[2] == "ND" and len(table[0]) == 2 and table[0][0] > 0
-              and table[0][1] == weights[0][1] and table[1] in {"int32", "int64"}
-              and table[2] == "ND" and bias == _EMPTY):
-            mode = "hash_table"
-        else:
+        vision_bias = inputs[4] if len(inputs) == 5 else _EMPTY
+        expert_bias = ((logits[0][1],), logits[1], "ND")
+        if vision_bias not in {_EMPTY, expert_bias}:
+            return None, _issue(row, "unsupported_router_active_geometry",
+                                "Vision bias must match the expert width and logits dtype.")
+        if token_ids != _EMPTY and (token_ids[0] != (logits[0][0],)
+                                    or token_ids[1] not in {"int32", "int64"} or token_ids[2] != "ND"):
             return None, _issue(row, "unsupported_router_hash_inputs",
-                                "Hash token IDs and the token-to-expert table must occur together "
-                                "with the same selected-expert width and no correction bias.")
-    return ("router_selection_active", kind, mode, logits, weights, indices), None
+                                "Token IDs require one integer per logits row.")
+        if token_ids == _EMPTY and (table != _EMPTY or vision_bias != _EMPTY):
+            return None, _issue(row, "unsupported_router_hash_inputs",
+                                "A hash table or vision bias requires token IDs.")
+        if table != _EMPTY:
+            if (len(table[0]) != 2 or table[0][0] <= 0 or table[0][1] != weights[0][1]
+                    or table[1] not in {"int32", "int64"} or table[2] != "ND"):
+                return None, _issue(row, "unsupported_router_hash_inputs",
+                                    "The integer hash table must match the selected-expert width.")
+            mode = "hash_table"
+        if bias != _EMPTY or vision_bias != _EMPTY:
+            # Keep both positions, including an undefined text or vision bias.
+            bias_slots = (bias, vision_bias)
+    return ("router_selection_active", kind, mode, logits, weights, indices, *bias_slots), None
 
 
 def observed_router_contract(row):
@@ -83,21 +90,20 @@ def router_contract_diagnostic(row):
 
 
 def router_contract_scope(row):
+    hash_router = row.kind == "MoeGatingTopKHash"
     return {
         "kind": "router_active_selection_descriptors",
         "compared": ["native_operator_type", "hash_table_presence", "logits_shape_dtype_layout",
-                     "selected_weight_shape_dtype_layout", "selected_id_shape_dtype_layout"],
+                     "selected_weight_shape_dtype_layout", "selected_id_shape_dtype_layout",
+                     *(["text_and_vision_bias_presence"] if hash_router else [])],
         "not_compared": ["score_function", "renorm", "group_count", "k_group", "bias_values",
-                         "bias_presence", "routed_scaling_factor", "eps", "out_flag",
+                         *([] if hash_router else ["bias_presence"]), "routed_scaling_factor", "eps", "out_flag",
                          "token_ids", "hash_table_capacity_dtype_and_values"],
         "normalization_scope": (
             "Hash source call uses renorm=0; any declared top-k renormalization is external"
             if row.kind == "MoeGatingTopKHash" else
             "TopK supports internal renormalization; the scalar mode is not captured"),
         "excluded_semantic_work": ["router_logits_matrix_multiplication"],
-        "capture_abi_limit": (
-            "The retained fifth input is undefined and excluded; no materialized extension is accepted"
-            if row.kind == "MoeGatingTopKHash" else None),
         "occurrence_identity": False,
     }
 
