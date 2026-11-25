@@ -29,21 +29,77 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.ownership import read_role
 from mindie_sim.prediction.program import KernelProgram, Stage
+from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, check_live_buffers
 from .w4a8_matrix import matrix_program, matrix_work
 FP32_BYTES = 4
 from .w4a8_schedule import (
     MSD_FLOPS_PER_K_STEP, MSD_WORKSPACE_BYTES_PER_OUTPUT, NZ_N_ALIGNMENT,
     POST_DEQUANT_OPS_PER_OUTPUT, PRE_OPS_PER_INPUT, QUANT_OPS_PER_OUTPUT,
-    SWIGLU_OPS_PER_OUTPUT, gate_schedule, total_work,
+    SWIGLU_OPS_PER_OUTPUT, align_up, gate_schedule, total_work,
+)
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="vllm_ascend/quantization/methods/w4a8/w4a8.py",
+        source_sha256="51682287230ab8b4e618a8dd7763a22250d8f416730c12a1d7f1f79aa2c7f89e",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="csrc/gmm/grouped_matmul_swiglu_quant_v2/op_host/op_api/gmm_dsq_base.h",
+        source_sha256="08e07b078ca73626df3a135bff230c9b7b61108b235e0f98f22420f4c94f9733",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="csrc/gmm/grouped_matmul_swiglu_quant_v2/op_host/grouped_matmul_swiglu_quant_v2_base_tiling.cpp",
+        source_sha256="8e2d570efd12ddda8360fcd515c81fd50444571d47e2ed3200c10f72f7aaef97",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="csrc/gmm/grouped_matmul_swiglu_quant_v2/op_kernel/grouped_matmul_swiglu_quant_v2_a8w4_msd_pre.h",
+        source_sha256="b87eda2542700e1800412f9775360552b5c6ae6e38e2afcbd77da677d60f8332",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="csrc/gmm/grouped_matmul_swiglu_quant_v2/op_kernel/grouped_matmul_swiglu_quant_v2_a8w4_msd_mid.h",
+        source_sha256="1881d03e65258e846fe9bbfb736f4cbbcd770b84a6730319dd0c9d00abdc4087",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="csrc/gmm/grouped_matmul_swiglu_quant_v2/op_kernel/grouped_matmul_swiglu_quant_v2_a8w4_msd_post.h",
+        source_sha256="8cf63fb3e34955a2ed28d4f9f56c2030e74744cbe5a63aaeb5d130eb0940758f",
+    ),
 )
 
 GATE_NZ_K_ALIGNMENT = 16
+GATE_MAX_N = 10_240
+GATE_K_EXCLUSIVE_LIMIT = 20_000
+UB_ALIGN_BYTES = 32
+PRE_UB_MASK_BYTES = 256
+PRE_UB_FP16_BYTES_PER_K = 2
+PRE_UB_FP32_BYTES_PER_K = 4
+POST_UB_MM_OUT_BYTES_PER_ELEM = 8
+POST_UB_ASSIST_BYTES_PER_COL = 4
+POST_UB_REDUCE_BYTES_PER_COL = 2
+POST_UB_REDUCE_BLOCK_BYTES = 64
+POST_UB_ROW_SCALE_ALIGN = 8
+POST_UB_ROW_WEIGHT_HALF_BYTES = 17
+POST_UB_STATIC_COL_BYTES = POST_UB_ASSIST_BYTES_PER_COL + POST_UB_REDUCE_BYTES_PER_COL
 
 
 RECIPE = "ascend_w4a8_msd"
@@ -124,6 +180,64 @@ def _require_int(value, name, minimum=0):
     return value
 
 
+def _validate_gate_dimensions(n: int, k: int) -> None:
+    """Enforce pinned Key2 A8W4 host alignment and N/K ceilings (gmm_dsq_base.h:481)."""
+    if n % 2:
+        raise ModelingError("w4a8_msd_swiglu_width_must_be_even")
+    if n % NZ_N_ALIGNMENT or k % GATE_NZ_K_ALIGNMENT:
+        raise ModelingError("w4a8_msd_nz_requires_n_multiple64_k_multiple16")
+    if n > GATE_MAX_N:
+        raise ModelingError(f"w4a8_msd_n_exceeds_host_limit:{n}>{GATE_MAX_N}")
+    if k >= GATE_K_EXCLUSIVE_LIMIT:
+        raise ModelingError(f"w4a8_msd_k_reaches_host_limit:{k}>={GATE_K_EXCLUSIVE_LIMIT}")
+
+
+def _gate_post_ub_for_rows(n: int, rows: int) -> int:
+    """Simultaneous post-phase InitBuffer UB bytes for ``rows`` rows (post.h:303-313)."""
+    return (
+        POST_UB_MM_OUT_BYTES_PER_ELEM * rows * n
+        + (rows * n) // 2
+        + align_up(rows, POST_UB_ROW_SCALE_ALIGN) * FP32_BYTES
+        + POST_UB_ASSIST_BYTES_PER_COL * n
+        + POST_UB_REDUCE_BYTES_PER_COL * n
+        + POST_UB_REDUCE_BLOCK_BYTES
+    )
+
+
+def _gate_host_max_rows(n: int, ub_capacity: int) -> int:
+    """Host ``CalMaxRowInUbA8W4`` row selection (base_tiling.cpp:56-91)."""
+    avail = ub_capacity - POST_UB_REDUCE_BLOCK_BYTES - POST_UB_STATIC_COL_BYTES * n
+    if avail <= 0:
+        return 0
+    est = (2 * avail) // (POST_UB_ROW_WEIGHT_HALF_BYTES * n)
+    while est > 0 and _gate_post_ub_for_rows(n, est) > ub_capacity:
+        est -= 1
+    return est
+
+
+def gate_phase_ub_bytes(config: Config, *, ub_capacity: int | None = None) -> tuple[int, int]:
+    """Per-AIV simultaneous aligned InitBuffer UB bytes for pre and host-tiled post."""
+    pre_ub = (
+        align_up(config.k, UB_ALIGN_BYTES)
+        + 2 * align_up(config.k // 2, UB_ALIGN_BYTES)
+        + align_up(PRE_UB_FP16_BYTES_PER_K * config.k, UB_ALIGN_BYTES)
+        + align_up(PRE_UB_FP32_BYTES_PER_K * config.k, UB_ALIGN_BYTES)
+        + PRE_UB_MASK_BYTES
+    )
+    host_rows = _gate_host_max_rows(config.n, ub_capacity) if ub_capacity is not None else 1
+    post_ub = _gate_post_ub_for_rows(config.n, max(1, host_rows))
+    return pre_ub, post_ub
+
+
+def _geometry_int4_subtile(geometry):
+    datapath = getattr(geometry, "datapath", None)
+    waves = getattr(datapath, "subtile_wave", ()) if datapath is not None else ()
+    for wave in waves:
+        if getattr(wave, "native_mode", "") == "int4":
+            return wave
+    return None
+
+
 def config_from_op(op):
     """Validate and return the only supported source domain."""
     raw = dict(op.metadata).get("w4a8_msd")
@@ -143,10 +257,7 @@ def config_from_op(op):
     basis = raw.get("routing_basis")
     if basis not in SUPPORTED_EXPERT_ROW_BASES:
         raise ModelingError("w4a8_msd_rejects_probability_moment_routing")
-    if n % 2:
-        raise ModelingError("w4a8_msd_swiglu_width_must_be_even")
-    if n % NZ_N_ALIGNMENT or k % GATE_NZ_K_ALIGNMENT:
-        raise ModelingError("w4a8_msd_nz_requires_n_multiple64_k_multiple16")
+    _validate_gate_dimensions(n, k)
     for key, expected in (("weight_format", "int4"),
                           ("activation_format", "int8"),
                           ("output_format", "int8")):
@@ -199,8 +310,7 @@ def config_from_group(declaration, members):
     if m != sum(rows):
         raise ModelingError("w4a8_msd_group_rows_do_not_match_explicit_histogram")
     config = Config(m, n, k, tuple(rows), realization["basis"])
-    if n % NZ_N_ALIGNMENT or k % GATE_NZ_K_ALIGNMENT:
-        raise ModelingError("w4a8_msd_nz_requires_n_multiple64_k_multiple16")
+    _validate_gate_dimensions(n, k)
     if (metadata.get("activation_scale_format") != "fp32"
             or metadata.get("activation_scale_bytes") != FP32_BYTES * m
             or metadata.get("activation_group_size", 0) < k):
@@ -262,7 +372,8 @@ def work_from_config(config, *, fixpipe=False, resource_roles=None, geometry=Non
         aic, aiv = _geometry_owners(geometry)
         schedule = gate_schedule(
             config.m, config.n, config.k, config.expert_rows,
-            aic_owners=aic, aiv_owners=aiv, fixpipe=fixpipe)
+            aic_owners=aic, aiv_owners=aiv, fixpipe=fixpipe,
+            subtile_wave=_geometry_int4_subtile(geometry))
         phases = _schedule_phases(schedule, resource_roles)
     total = Work()
     for work in phases.values():
@@ -282,7 +393,8 @@ def ledger(config):
                 "vector_ops": PRE_OPS_PER_INPUT * m * k,
                 "expression": "high cast+mul+cast (3MK) + halfword-and (MK/2) "
                               "+ cast+add+cast (3MK)"},
-        "matrix": {"flops_int4": MSD_FLOPS_PER_K_STEP * m * n * k,
+        "matrix": {"flops_int4": reference["matrix"].matrix["int4"],
+                   "logical_flops_int4": MSD_FLOPS_PER_K_STEP * m * n * k,
                    "read_bytes": reference["matrix"].resources["mte2"],
                    "write_bytes": MSD_WORKSPACE_BYTES_PER_OUTPUT * m * n,
                    "publication_role": "fixpipe; additional service only when declared",
@@ -320,7 +432,7 @@ def _base_program(config, *, fixpipe=False, resource_roles=None):
     return program
 
 
-def _owner_program(schedule):
+def _owner_program(schedule, *, pre_ub_bytes: int = 0, post_ub_bytes: int = 0):
     order = (("pre", schedule.pre, schedule.aiv_owners, ()),
              ("matrix", schedule.matrix, schedule.aic_owners, "pre"),
              ("post_dequant", schedule.post_dequant, schedule.aiv_owners, "matrix"),
@@ -329,6 +441,8 @@ def _owner_program(schedule):
 
     def program(context):
         stages, barrier = [], {}
+        has_ub = "ub" in context.pool_names
+        post_allocs = {}
         for name, group, owners_count, after in order:
             predecessors = barrier.get(after, ()) if after else ()
             if name == "matrix":
@@ -337,7 +451,9 @@ def _owner_program(schedule):
                 barrier[name] = ("matrix",)
                 continue
             names = []
+            seen_owners = set()
             for record in group:
+                seen_owners.add(record.owner)
                 work = _role_work(record.work, name, context.resource_units)
                 bound = context.for_phase(
                     work, kernel=f"grouped_matmul_swiglu_quant_v2_a8w4_msd_{name}",
@@ -347,11 +463,38 @@ def _owner_program(schedule):
                 roles = set(work.resources) - {"hbm"}
                 if work.matrix:
                     roles.add("cube")
+                acq, rel = (), ()
+                if has_ub and name == "pre" and pre_ub_bytes > 0:
+                    alloc = context.allocate(f"pre_ub:{record.owner}", "ub", pre_ub_bytes, (record.owner,))
+                    acq, rel = (alloc,), (alloc,)
+                elif has_ub and name == "post_dequant" and post_ub_bytes > 0:
+                    alloc = context.allocate(f"post_ub:{record.owner}", "ub", post_ub_bytes, (record.owner,))
+                    post_allocs[record.owner] = alloc
+                    acq = (alloc,)
+                elif has_ub and name == "quantize" and record.owner in post_allocs:
+                    rel = (post_allocs[record.owner],)
                 stage_name = f"{name}:{record.owner}"
                 stages.append(Stage(
                     stage_name, work=bound.work, after=predecessors,
+                    acquire=acq, free=rel,
                     placement=context.owned(record.owner, owners_count, roles)))
                 names.append(stage_name)
+            if has_ub and name == "pre" and pre_ub_bytes > 0:
+                for idle_owner in range(schedule.aiv_owners):
+                    if idle_owner in seen_owners:
+                        continue
+                    alloc = context.allocate(f"pre_ub:{idle_owner}", "ub", pre_ub_bytes, (idle_owner,))
+                    idle_name = f"pre_ub_init:{idle_owner}"
+                    stages.append(Stage(idle_name, after=predecessors, acquire=(alloc,), free=(alloc,)))
+                    names.append(idle_name)
+            elif has_ub and name == "post_dequant" and post_ub_bytes > 0:
+                for idle_owner in range(schedule.aiv_owners):
+                    if idle_owner in seen_owners:
+                        continue
+                    alloc = context.allocate(f"post_ub:{idle_owner}", "ub", post_ub_bytes, (idle_owner,))
+                    idle_name = f"post_ub_init:{idle_owner}"
+                    stages.append(Stage(idle_name, after=predecessors, acquire=(alloc,), free=(alloc,)))
+                    names.append(idle_name)
             barrier[name] = tuple(names)
         return KernelProgram(tuple(stages))
 
@@ -362,16 +505,39 @@ def build(op, geometry=None):
     config = config_from_op(op)
     if geometry is None:
         return OperatorPlan(work_from_config(config), _base_program(config))
+    ub_cap = int(geometry.buffers["ub"]) if "ub" in geometry.buffers else None
+    pre_ub_bytes, post_ub_bytes = gate_phase_ub_bytes(config, ub_capacity=ub_cap)
+    if "ub" in geometry.buffers:
+        check_live_buffers(
+            (
+                LiveBufferSpec(
+                    "w4a8_gate_pre_ub", "ub", pre_ub_bytes, 0, 1,
+                    owner_kind="aiv", alignment_bytes=UB_ALIGN_BYTES,
+                ),
+                LiveBufferSpec(
+                    "w4a8_gate_post_ub", "ub", post_ub_bytes, 1, 2,
+                    owner_kind="aiv", alignment_bytes=UB_ALIGN_BYTES,
+                ),
+            ),
+            geometry,
+            family=RECIPE,
+            kernel_abi="aclnnGroupedMatmulSwigluQuantV2",
+            source_guard="w4a8_msd_ub_capacity",
+        )
     fixpipe = "fixpipe" in geometry.resource_units
     aic, aiv = _geometry_owners(geometry)
     schedule = gate_schedule(
         config.m, config.n, config.k, config.expert_rows,
-        aic_owners=aic, aiv_owners=aiv, fixpipe=fixpipe)
+        aic_owners=aic, aiv_owners=aiv, fixpipe=fixpipe,
+        subtile_wave=_geometry_int4_subtile(geometry))
     total = Work()
     for name, work in _schedule_phases(schedule, geometry.resource_units).items():
         total += (_role_work(matrix_work(schedule, geometry.resource_units), name,
                              geometry.resource_units) if name == "matrix" else work)
-    return OperatorPlan(total, _owner_program(schedule))
+    return OperatorPlan(
+        total,
+        _owner_program(schedule, pre_ub_bytes=pre_ub_bytes, post_ub_bytes=post_ub_bytes),
+    )
 
 
 def describe(config):

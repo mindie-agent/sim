@@ -714,10 +714,14 @@ def routed_expert_work(op, *, n, k, weights, weight_kind, local_rows,
                    metadata=tuple(metadata.items()) + routing_metadata)
 
 
-_MX_QUANT_DTYPES = frozenset({"fp8_e4m3fn", "fp4_e2m1"})
+_MX_QUANT_DTYPES = frozenset({"fp8_e4m3fn", "fp8_e5m2", "fp4_e2m1", "fp4_e1m2"})
+_MX_FP4_DTYPES = frozenset({"fp4_e2m1", "fp4_e1m2"})
 _MX_SCALE_DTYPES = frozenset({"fp8_e8m0", "e8m0", "uint8"})
 _SWIGLU_INT8_INPUT_DTYPES = frozenset({"bf16", "fp16"})
 _SITU_INT8_INPUT_DTYPES = frozenset({"int8", "int32"})
+_GMM_GATE_UP_RECIPES = frozenset({"grouped_gate_up", "grouped_expert_gemm", "balanced_grouped_gate_up"})
+_FUSED_ACT_QUANT_RECIPES = frozenset({"swiglu_quantize", "situ_quantize"})
+_FUSED_ACT_QUANT_KERNELS = frozenset({"npu_swiglu_mx_quant", "aclnnSwiGluQuant", "aclnnDequantSituQuant"})
 
 
 def _resolve_activation_quant_abi(
@@ -733,13 +737,37 @@ def _resolve_activation_quant_abi(
     group_size = int(q_meta.get("activation_group_size") or 0)
     if act.family == "swiglu":
         if (out_fmt in _MX_QUANT_DTYPES
+                and in_fmt in _SWIGLU_INT8_INPUT_DTYPES
                 and group_size == SWIGLU_MX_GROUP
                 and scale_fmt in _MX_SCALE_DTYPES):
+            if len(act.local_shape) < 2 or tuple(act.local_shape) != tuple(quant.local_shape):
+                return None
+            leading = tuple(int(d) for d in quant.local_shape[:-1])
+            rows = math.prod(leading)
+            width = int(quant.local_shape[-1])
+            if rows <= 0 or width <= 0:
+                return None
+            expected_scale_tail = (math.ceil(width / MX32_SCALE_PAIR), 2)
+            expected_scale_bytes = rows * expected_scale_tail[0] * 2
+            scale_shape = q_meta.get("activation_scale_shape")
+            if scale_shape is not None and tuple(int(d) for d in scale_shape) != (*leading, *expected_scale_tail):
+                return None
+            scale_bytes = q_meta.get("activation_scale_bytes")
+            if scale_bytes is not None and int(scale_bytes) != expected_scale_bytes:
+                return None
+            payload_row = math.ceil(width / 2) if out_fmt in _MX_FP4_DTYPES else width
+            if float(quant.mte3_bytes) > 0.0 and float(quant.mte3_bytes) < rows * payload_row + expected_scale_bytes:
+                return None
+            if (float(act.mte2_bytes) > 0.0
+                    and float(act.mte2_bytes) < rows * 2 * width * dtype_bytes(in_fmt)):
+                return None
             return (
                 "npu_swiglu_mx_quant",
                 {"aiv_units": SWIGLU_MX_AIV_UNITS,
                  "group_size": SWIGLU_MX_GROUP,
-                 "stages": SWIGLU_MX_STAGES},
+                 "stages": SWIGLU_MX_STAGES,
+                 "swiglu_input_width": 2 * width,
+                 "swiglu_output_width": width},
             )
         if out_fmt == "int8" and in_fmt in _SWIGLU_INT8_INPUT_DTYPES and scale_fmt in {"fp32", ""}:
             return ("aclnnSwiGluQuant", None)
@@ -831,13 +859,29 @@ def gmm_swiglu_quant_fusion(ops, source_dtype):
     by_id, users = {op.op_id: op for op in ops}, users_map(ops)
     replacements: dict = {}
     for tail in ops:
-        if (tail.plan_required or not str(tail.recipe).endswith("_quantize")
+        if (tail.plan_required or tail.recipe not in _FUSED_ACT_QUANT_RECIPES
                 or tail.family != "quantize" or len(tail.deps) != 1):
+            continue
+        tail_meta = dict(tail.metadata)
+        prev_fused = tuple(tail_meta.get("fused_from") or ())
+        has_act_provenance = (
+            tail_meta.get("fused_kernel") in _FUSED_ACT_QUANT_KERNELS
+            or bool({"swiglu", "situ"} & set(prev_fused))
+        )
+        if not has_act_provenance:
             continue
         gate = by_id.get(tail.deps[0])
         if (gate is None or gate.plan_required or gate.family != "grouped_gemm"
+                or gate.recipe not in _GMM_GATE_UP_RECIPES
                 or gate.stage != tail.stage or gate.stream != tail.stream):
             continue
+        if len(gate.local_shape) >= 2 and len(tail.local_shape) >= 2:
+            gate_m = int(gate.local_shape[-3]) if len(gate.local_shape) >= 3 else int(gate.local_shape[0])
+            gate_n = int(gate.local_shape[-2]) if len(gate.local_shape) >= 3 else int(gate.local_shape[1])
+            tail_m = math.prod(int(d) for d in tail.local_shape[:-1])
+            tail_n = int(tail.local_shape[-1])
+            if gate_m != tail_m or gate_n != 2 * tail_n:
+                continue
         if users[gate.op_id] != [tail.op_id]:
             continue
         if gate.op_id in replacements or tail.op_id in replacements:
@@ -845,9 +889,9 @@ def gmm_swiglu_quant_fusion(ops, source_dtype):
         gate_meta = dict(gate.metadata)
         act_dtype = str(gate_meta.get("output_format") or tail.dtype or gate.dtype)
         if len(gate.local_shape) >= 2:
-            intermediate_bytes = float(
-                gate.local_shape[0] * gate.local_shape[1] * dtype_bytes(act_dtype)
-            )
+            gate_rows = int(gate.local_shape[-3]) if len(gate.local_shape) >= 3 else int(gate.local_shape[0])
+            gate_cols = int(gate.local_shape[-2]) if len(gate.local_shape) >= 3 else int(gate.local_shape[1])
+            intermediate_bytes = float(gate_rows * gate_cols * dtype_bytes(act_dtype))
         else:
             intermediate_bytes = min(float(gate.mte3_bytes), float(tail.mte2_bytes))
         eliminated_write = min(float(gate.mte3_bytes), intermediate_bytes)
@@ -880,7 +924,7 @@ def gmm_swiglu_quant_fusion(ops, source_dtype):
             metadata=merge_meta(tail, extra=(
                 ("onchip_handoff_from", gate.op_id),
                 ("eliminated_activation_read_bytes", eliminated_read),
-                ("fused_from", ("grouped_gemm", tail.recipe)),
+                ("fused_from", ("grouped_gemm", *(prev_fused or (tail.recipe,)))),
             )),
         )
     if not replacements:

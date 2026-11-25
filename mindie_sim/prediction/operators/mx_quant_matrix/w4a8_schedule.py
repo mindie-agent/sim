@@ -32,9 +32,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
+from mindie_sim.schema.compute_arch_presets import CAPABILITY_PRESETS
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import Work
 FP32_BYTES = 4
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="csrc/gmm/grouped_matmul_swiglu_quant_v2/op_kernel/grouped_matmul_swiglu_quant_v2_a8w4_msd_mid.h",
+        source_sha256="1881d03e65258e846fe9bbfb736f4cbbcd770b84a6730319dd0c9d00abdc4087",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul/op_kernel/grouped_matmul_antiquant_a8w4_msd.h",
+        source_sha256="b092d276255c441542a5d205dbec5718d2ba5ae0ab7f5e637a2dba5fb20ee619",
+    ),
+)
 
 NZ_N_ALIGNMENT = 64
 COLUMN_SCALE_BYTES = 8
@@ -65,6 +84,28 @@ DOWN_BASE_N_TALL = 256
 
 def ceil_div(value: int, divisor: int) -> int:
     return (value + divisor - 1) // divisor
+
+
+def align_up(value: int, granule: int) -> int:
+    return ceil_div(value, granule) * granule
+
+
+def resolve_int4_subtile(subtile_wave=None) -> tuple[int, int, int]:
+    """Return registered A2/A3 INT4 Cube subtile ``(tile_m, tile_n, tile_k)``."""
+    if subtile_wave is not None:
+        return (
+            int(subtile_wave.independently_issuable_m),
+            int(subtile_wave.tile_n),
+            int(subtile_wave.tile_k),
+        )
+    wave = next(
+        w for w in CAPABILITY_PRESETS["npu_arch_2201"]["subtile_waves"]
+        if w.native_mode == "int4"
+    )
+    return int(wave.independently_issuable_m), int(wave.tile_n), int(wave.tile_k)
+
+
+DEFAULT_INT4_SUBTILE_M, DEFAULT_INT4_SUBTILE_N, DEFAULT_INT4_SUBTILE_K = resolve_int4_subtile()
 
 
 @dataclass(frozen=True)
@@ -109,6 +150,9 @@ class GateSchedule:
     tile_count: int
     expert_scan_count: int
     zero_bank_offsets: tuple[int, ...]
+    subtile_m: int = DEFAULT_INT4_SUBTILE_M
+    subtile_n: int = DEFAULT_INT4_SUBTILE_N
+    subtile_k: int = DEFAULT_INT4_SUBTILE_K
 
     @property
     def active_experts(self) -> int:
@@ -133,6 +177,9 @@ class DownSchedule:
     tile_count: int
     expert_scan_count: int
     zero_bank_offsets: tuple[int, ...]
+    subtile_m: int = DEFAULT_INT4_SUBTILE_M
+    subtile_n: int = DEFAULT_INT4_SUBTILE_N
+    subtile_k: int = DEFAULT_INT4_SUBTILE_K
 
     @property
     def active_experts(self) -> int:
@@ -251,8 +298,12 @@ def _scans(rows, n, k, base_m, base_n):
     return tuple(experts), offset
 
 
-def _matrix_tiles(rows, n, k, base_m, base_n, aic_owners, fixpipe):
+def _matrix_tiles(rows, n, k, base_m, base_n, aic_owners, fixpipe, *, subtile_dims=None):
     """Aggregate the rolling global tile grid without retaining tile records."""
+    sub_m, sub_n, sub_k = subtile_dims or (
+        DEFAULT_INT4_SUBTILE_M, DEFAULT_INT4_SUBTILE_N, DEFAULT_INT4_SUBTILE_K,
+    )
+    issued_k = align_up(k, sub_k)
     owners_acc = {}
     owner_tiles, owner_m, owner_n = {}, {}, {}
     start = 0
@@ -275,7 +326,9 @@ def _matrix_tiles(rows, n, k, base_m, base_n, aic_owners, fixpipe):
                          "mte2": activation + weight + scale}
             if fixpipe:
                 resources["fixpipe"] = 2 * m_tile * n_tile
-            _add(add, Work({"int4": 2 * m_tile * n_tile * k}, resources),
+            issued_m = align_up(m_tile, sub_m)
+            issued_n = align_up(n_tile, sub_n)
+            _add(add, Work({"int4": 2 * issued_m * issued_n * issued_k}, resources),
                  Work(resources={"vector": m_tile * n_tile}))
             owner_tiles[owner] = owner_tiles.get(owner, 0) + 1
             owner_m[owner] = owner_m.get(owner, 0) + m_tile
@@ -328,14 +381,16 @@ def _gate_post(rows, n, k, aiv_owners):
     )
 
 
-def gate_schedule(m, n, k, expert_rows, *, aic_owners, aiv_owners, fixpipe=False):
+def gate_schedule(m, n, k, expert_rows, *, aic_owners, aiv_owners, fixpipe=False, subtile_wave=None):
     """Bounded source-derived owner work for the gate kernel."""
     if min(m, n, k, aic_owners, aiv_owners) < 1 or sum(expert_rows) != m:
         raise ValueError("gate_schedule_requires_conserving_positive_geometry")
     aiv_group(0, aic_owners, aiv_owners)
+    sub_m, sub_n, sub_k = resolve_int4_subtile(subtile_wave)
     experts, tile_count = _scans(expert_rows, n, k, GATE_BASE_M, GATE_BASE_N)
     acc, tiles, _, _, _ = _matrix_tiles(
-        expert_rows, n, k, GATE_BASE_M, GATE_BASE_N, aic_owners, fixpipe)
+        expert_rows, n, k, GATE_BASE_M, GATE_BASE_N, aic_owners, fixpipe,
+        subtile_dims=(sub_m, sub_n, sub_k))
     matrix = _owner_records(acc, {}, tiles=tiles)
     pre = _gate_pre(expert_rows, k, aiv_owners)
     post, swiglu, quant = _gate_post(expert_rows, n, k, aiv_owners)
@@ -346,6 +401,7 @@ def gate_schedule(m, n, k, expert_rows, *, aic_owners, aiv_owners, fixpipe=False
         pre=pre, matrix=matrix, post_dequant=post, swiglu=swiglu, quantize=quant,
         tile_count=tile_count, expert_scan_count=len(experts),
         zero_bank_offsets=zeros,
+        subtile_m=sub_m, subtile_n=sub_n, subtile_k=sub_k,
     )
 
 
@@ -377,17 +433,19 @@ def down_task_ratio(m, n, k, expert_count):
                  and k <= CV11_MAX_K and n <= CV11_MAX_N) else 2
 
 
-def down_schedule(m, n, k, expert_rows, *, aic_owners, aiv_owners, fixpipe=False):
+def down_schedule(m, n, k, expert_rows, *, aic_owners, aiv_owners, fixpipe=False, subtile_wave=None):
     """Bounded source-derived owner work for the ordinary grouped-down kernel."""
     if min(m, n, k, aic_owners, aiv_owners) < 1 or sum(expert_rows) != m:
         raise ValueError("down_schedule_requires_conserving_positive_geometry")
     aiv_group(0, aic_owners, aiv_owners)
+    sub_m, sub_n, sub_k = resolve_int4_subtile(subtile_wave)
     short = (m // len(expert_rows)) < DOWN_SHORT_M
     base_m = DOWN_BASE_M if short else DOWN_BASE_M_TALL
     base_n = DOWN_BASE_N if short else DOWN_BASE_N_TALL
     experts, tile_count = _scans(expert_rows, n, k, base_m, base_n)
     matrix_acc, tiles, _, _, _ = _matrix_tiles(
-        expert_rows, n, k, base_m, base_n, aic_owners, fixpipe)
+        expert_rows, n, k, base_m, base_n, aic_owners, fixpipe,
+        subtile_dims=(sub_m, sub_n, sub_k))
     matrix = _owner_records(matrix_acc, {}, tiles=tiles)
     task_ratio = down_task_ratio(m, n, k, len(expert_rows))
     pre = _down_pre(expert_rows, k, aic_owners, task_ratio)
@@ -443,6 +501,7 @@ def down_schedule(m, n, k, expert_rows, *, aic_owners, aiv_owners, fixpipe=False
         experts=experts, pre=pre, matrix=matrix, post_dequant=post_records,
         output=output_records, tile_count=tile_count,
         expert_scan_count=len(experts), zero_bank_offsets=zeros,
+        subtile_m=sub_m, subtile_n=sub_n, subtile_k=sub_k,
     )
 
 
