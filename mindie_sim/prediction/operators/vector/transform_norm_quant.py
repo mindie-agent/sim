@@ -82,17 +82,64 @@ def _same_representation(op, values):
 def _parameter_read_bytes(op):
     metadata = dict(op.metadata)
     declared = metadata.get("parameter_read_bytes") or metadata.get("parameter_reads") or {}
-    if isinstance(declared, dict):
+    if isinstance(declared, Mapping):
         total = sum(float(value) for value in declared.values())
+        has_gamma_key = any(
+            "gamma" in str(key).lower() or "weight" in str(key).lower() for key in declared
+        )
     elif isinstance(declared, (int, float)) and not isinstance(declared, bool):
         total = float(declared)
+        has_gamma_key = False
     else:
         total = 0.0
-    for key in ("norm_gamma_runtime_bytes", "norm_gamma_bytes", "gamma_read_bytes", "parameter_bytes"):
+        has_gamma_key = False
+    gamma_bytes = 0.0
+    for key in ("norm_gamma_runtime_bytes", "norm_gamma_bytes", "gamma_read_bytes"):
         value = metadata.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
-            total = max(total, float(value))
+            gamma_bytes = max(gamma_bytes, float(value))
+    if gamma_bytes > 0.0:
+        if isinstance(declared, Mapping) and declared and not has_gamma_key:
+            total += gamma_bytes
+        else:
+            total = max(total, gamma_bytes)
+    param_bytes = metadata.get("parameter_bytes")
+    if isinstance(param_bytes, (int, float)) and not isinstance(param_bytes, bool):
+        total = max(total, float(param_bytes))
     return total
+
+
+def _eliminated_norm_read_bytes(norm, op, norm_values, quant_inputs):
+    primary = norm_values[0] if norm_values else None
+    if primary is None:
+        return float(norm.mte3_bytes)
+    logical_read = _access_read(
+        quant_inputs,
+        float(primary.get("write_bytes") or primary.get("bytes") or norm.mte3_bytes),
+    )
+    storage = primary.get("storage_bytes")
+    op_act_read = float(op.mte2_bytes) - _parameter_read_bytes(op)
+    if (storage is not None and float(storage) > logical_read
+            and float(norm.mte3_bytes) >= float(storage)
+            and op_act_read >= float(storage)):
+        return float(storage)
+    return logical_read
+
+
+def _resolve_residual_norm_dep(norm, raw_norm_meta, by_id, users, rebindable_native_norm):
+    if len(norm.deps) == 1:
+        return norm.deps[0], None
+    if rebindable_native_norm and len(norm.deps) == _BINARY_RESIDUAL_INPUTS:
+        gamma_id = norm.op_id + ".gamma_shift"
+        gamma_op = by_id.get(gamma_id)
+        caller_shift = raw_norm_meta.get("norm_caller_weight_offset")
+        if (gamma_id in norm.deps and gamma_op is not None
+                and gamma_op.family == "elementwise" and not gamma_op.deps
+                and caller_shift and dict(gamma_op.metadata).get("weight_offset") == caller_shift
+                and users[gamma_id] == [norm.op_id]):
+            other = next(dep for dep in norm.deps if dep != gamma_id)
+            return other, gamma_id
+    return None, None
 
 
 def _access_read(values, fallback):
@@ -213,8 +260,20 @@ def norm_quant(ops, _, *, consumers=None, external_output="eliminate", capture_s
             outputs.append({**nv, "producer": op.op_id, "output": port,
                             "role": "external_intermediate", "materialized": True})
         outputs = tuple(outputs)
-        read = (norm.mte2_bytes if _same_representation(norm, norm_inputs)
-                else (_access_read(norm_inputs, norm.mte2_bytes) + _parameter_read_bytes(norm)))
+        norm_read = (
+            norm.mte2_bytes if _same_representation(norm, norm_inputs)
+            else (_access_read(norm_inputs, norm.mte2_bytes) + _parameter_read_bytes(norm))
+        )
+        quant_inputs = producer_input_values(op, values_by_id)
+        if _same_representation(op, quant_inputs):
+            quant_extra_read = max(
+                0.0,
+                float(op.mte2_bytes)
+                - _eliminated_norm_read_bytes(norm, op, norm_values, quant_inputs),
+            )
+        else:
+            quant_extra_read = _parameter_read_bytes(op)
+        read = norm_read + quant_extra_read
         exposed = tuple(
             "norm" if v.get("output") == norm_primary else v.get("output")
             for v in norm_values
@@ -252,8 +311,12 @@ def norm_quant(ops, _, *, consumers=None, external_output="eliminate", capture_s
         }
         meta = fold_region_metadata_dict((norm, op), primary_anchor_id=op.op_id, extra=(
             ("fused_from", ("rmsnorm", "quantize")),
-            ("primary_output", "payload"), ("norm_output_materialized", bool(external)),
+            ("primary_output", "payload"), ("norm_output_materialized", bool(external_primary)),
         ))
+        norm_params = dict(norm.metadata).get("parameter_read_bytes")
+        op_params = dict(op.metadata).get("parameter_read_bytes")
+        if isinstance(norm_params, Mapping) and isinstance(op_params, Mapping):
+            meta["parameter_read_bytes"] = {**norm_params, **op_params}
         audit = {
             **boundary, "transform_members": member_contracts((norm, op)),
             "typed_outputs": outputs, "typed_roles": merge_typed_roles(norm, op),
@@ -292,14 +355,20 @@ def residual_norm(ops, _, *, capture_state=None):
         norm_binding = raw_norm_meta.get("implementation_binding")
         rebindable_native_norm = (
             norm.family == "rmsnorm_quant"
-            and isinstance(norm_binding, Mapping)
-            and norm_binding.get("implementation") == "vllm_ascend_native_norm"
+            and (
+                (isinstance(norm_binding, Mapping)
+                 and norm_binding.get("implementation") == "vllm_ascend_native_norm")
+                or (norm_binding is None
+                    and raw_norm_meta.get("native_norm_kind") == "RmsNormDynamicMxQuant")
+            )
         )
         if (norm.plan_required
                 or (norm_binding is not None and not rebindable_native_norm)
-                or norm.family not in {"rmsnorm", "rmsnorm_quant"} or len(norm.deps) != 1):
+                or norm.family not in {"rmsnorm", "rmsnorm_quant"}):
             continue
-        residual = by_id.get(norm.deps[0])
+        residual_dep, gamma_dep = _resolve_residual_norm_dep(
+            norm, raw_norm_meta, by_id, users, rebindable_native_norm)
+        residual = by_id.get(residual_dep) if residual_dep is not None else None
         if (residual is None or residual.plan_required or residual.recipe != "residual_add"
                 or len(residual.deps) != _BINARY_RESIDUAL_INPUTS
                 or residual.op_id in removed or norm.stage != residual.stage
@@ -308,8 +377,21 @@ def residual_norm(ops, _, *, capture_state=None):
                 or any(positions[u] < positions[norm.op_id] for u in users[residual.op_id])
                 or _capture_state(norm, capture_state) != _capture_state(residual, capture_state)):
             continue
+        norm_vector_ops = norm.vector_ops
+        if rebindable_native_norm:
+            prior_norm = raw_norm_meta.get("native_norm_vector_ops")
+            prior_quant = raw_norm_meta.get("native_norm_quant_vector_ops")
+            prior_component = raw_norm_meta.get("native_norm_quant_component_ops")
+            prior_extra = raw_norm_meta.get("native_norm_extra_vector_ops") or 0
+            if (prior_norm is not None and prior_quant is not None
+                    and prior_component is not None
+                    and norm.vector_ops == float(prior_norm) + float(prior_quant) + float(prior_extra)):
+                norm_vector_ops = norm.vector_ops - float(prior_quant) + float(prior_component)
         res_in = producer_input_values(residual, values_by_id)
-        norm_in = producer_input_values(norm, values_by_id)
+        norm_in = producer_input_values(
+            replace(norm, deps=(residual.op_id,)) if gamma_dep is not None else norm,
+            values_by_id,
+        )
         if _same_representation(residual, res_in) and _same_representation(norm, norm_in):
             read = residual.mte2_bytes + norm.mte2_bytes - residual.mte3_bytes
         else:
@@ -344,7 +426,7 @@ def residual_norm(ops, _, *, capture_state=None):
             "kind": "residual_norm", "replaces_work": True, "replaces_allocation": True,
             "replaced_occurrences": replaced_occurrences(residual, norm), "replacement_occurrence": norm.op_id,
             "work": {"mte2_bytes": read, "mte3_bytes": write, "hbm_bytes": read + write,
-                     "vector_ops": residual.vector_ops + norm.vector_ops, "flops": norm.flops},
+                     "vector_ops": residual.vector_ops + norm_vector_ops, "flops": norm.flops},
             "allocations": {"replaced": replaced_occurrences(residual, norm),
                             "materialized": tuple(v["output"] for v in outputs),
                             "eliminated": ("residual.intermediate_write", *nested.get("allocations", {}).get("eliminated", ()))},
@@ -362,7 +444,14 @@ def residual_norm(ops, _, *, capture_state=None):
             ("residual_output_materialized", True),
         ))
         if rebindable_native_norm:
-            for stale in ("implementation_binding", "native_kind", "native_implementation"):
+            caller_shift = raw_norm_meta.get("norm_caller_weight_offset")
+            if gamma_dep is not None and caller_shift:
+                meta["norm_weight_offset"] = caller_shift
+            for stale in (
+                "implementation_binding", "native_kind", "native_implementation", "native_source",
+                "norm_auxiliary_output_bytes", "norm_auxiliary_scope",
+                "norm_parameter_basis", "norm_caller_weight_offset",
+            ):
                 meta.pop(stale, None)
             for stale in [k for k in meta if str(k).startswith("native_norm_")]:
                 meta.pop(stale, None)
@@ -380,11 +469,13 @@ def residual_norm(ops, _, *, capture_state=None):
             norm, deps=residual.deps,
             family="add_rmsnorm_quant" if quantized else "add_rmsnorm",
             recipe="add_rmsnorm_quantize" if quantized else "add_rmsnorm",
-            vector_ops=residual.vector_ops + norm.vector_ops,
+            vector_ops=residual.vector_ops + norm_vector_ops,
             mte2_bytes=read, mte3_bytes=write, hbm_bytes=read + write,
             metadata=tuple(meta.items()), returns=returned,
         )
         removed.add(residual.op_id)
+        if gamma_dep is not None:
+            removed.add(gamma_dep)
         residual_map[residual.op_id] = norm.op_id
         ports[residual.op_id] = "residual"
     if not replacements:

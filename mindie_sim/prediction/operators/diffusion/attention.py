@@ -46,6 +46,8 @@ SOURCES: tuple[SourceRef, ...] = (
 )
 
 _BSND_RANK = 4
+_ROPE_RANK = 2
+_ROPE_OPS_PER_ELEMENT = 3
 _HEAD_DIM_AXIS = 3
 _LAYER_NORM = 1
 _AFFINE_LAYER_NORM = 2
@@ -67,6 +69,72 @@ def _check_norm_rope_bhd(
         raise ModelingError("mindie_sd_norm_rope_requires_BSND_shapes")
     if shape[0] != b or shape[2] != h or shape[_HEAD_DIM_AXIS] != d:
         raise ModelingError(f"{error_code}:{role_name}:{shape}:expected_bhd={(b, h, d)}")
+
+
+def _append_norm_rope_rotary(
+    meta, reads, compute, *,
+    b: int, h: int, d: int, dtype: str,
+    sq: int, sk: int, sv: int, seq: int, sek: int, sev: int,
+    concat_order: int, q_src: str, k_src: str, enc_q_src: str | None, enc_k_src: str | None,
+) -> tuple[str, str, str | None, str | None]:
+    if d % 2 != 0:
+        raise ModelingError(f"mindie_sd_norm_rope_head_dim_must_be_even:{d}")
+    max_seq = max(sq + seq, sk + sek, sv + sev)
+    raw_rope_shape = meta.get("rope_sin_shape")
+    raw_rope_len = meta.get("rope_len")
+    if raw_rope_shape is not None:
+        rope_shape = _as_shape(raw_rope_shape, "rope_sin")
+        if len(rope_shape) != _ROPE_RANK:
+            raise ModelingError("mindie_sd_norm_rope_sin_shape_invalid")
+        if rope_shape[1] != d:
+            raise ModelingError(f"mindie_sd_norm_rope_sin_dim_mismatch:{rope_shape[1]}:{d}")
+        rope_len = int(raw_rope_len) if raw_rope_len is not None else rope_shape[0]
+        if rope_shape[0] != rope_len:
+            raise ModelingError(f"mindie_sd_norm_rope_len_mismatch:{rope_len}:{rope_shape[0]}")
+    else:
+        rope_len = int(raw_rope_len) if raw_rope_len is not None else max_seq
+        if rope_len < 0:
+            raise ModelingError("mindie_sd_norm_rope_len_invalid")
+        rope_shape = (rope_len, d)
+    if rope_len > max_seq:
+        raise ModelingError(f"mindie_sd_norm_rope_len_exceeds_max_seq:{rope_len}:{max_seq}")
+    raw_cos_shape = meta.get("rope_cos_shape")
+    if raw_cos_shape is not None:
+        cos_shape = _as_shape(raw_cos_shape, "rope_cos")
+        if cos_shape != rope_shape:
+            raise ModelingError(f"mindie_sd_norm_rope_cos_shape_mismatch:{cos_shape}:{rope_shape}")
+    rope_dtype = str(meta.get("rope_dtype", dtype)).strip().lower()
+    if rope_dtype != str(dtype).strip().lower():
+        raise ModelingError(f"mindie_sd_norm_rope_dtype_mismatch:{rope_dtype}:{dtype}")
+    q_off, enc_q_off = (seq, 0) if concat_order == 1 else (0, sq)
+    k_off, enc_k_off = (sek, 0) if concat_order == 1 else (0, sk)
+    q_rot = max(0, min(q_off + sq, rope_len) - q_off)
+    k_rot = max(0, min(k_off + sk, rope_len) - k_off)
+    enc_q_rot = max(0, min(enc_q_off + seq, rope_len) - enc_q_off) if enc_q_src is not None else 0
+    enc_k_rot = max(0, min(enc_k_off + sek, rope_len) - enc_k_off) if enc_k_src is not None else 0
+    # NormRopeConcat runs ProcessOne independently for Q, encoder Q, K, encoder K,
+    # loading one (d,) row from rope_sin and rope_cos per active rotated position.
+    table_bytes = float((q_rot + k_rot + enc_q_rot + enc_k_rot) * d * dtype_bytes(rope_dtype))
+    reads.append({**_read("rope_sin", rope_shape, rope_dtype), "bytes": table_bytes})
+    reads.append({**_read("rope_cos", rope_shape, rope_dtype), "bytes": table_bytes})
+    rot_specs = (
+        ("query", q_src, q_rot),
+        ("key", k_src, k_rot),
+        ("encoder_query", enc_q_src, enc_q_rot),
+        ("encoder_key", enc_k_src, enc_k_rot),
+    )
+    updated = {"query": q_src, "key": k_src, "encoder_query": enc_q_src, "encoder_key": enc_k_src}
+    for role, source, rot_len in rot_specs:
+        if source is None or rot_len <= 0:
+            continue
+        compute.append({
+            "name": f"{role}_rope", "kind": "vector",
+            "inputs": (source, "rope_sin", "rope_cos"),
+            "outputs": (f"{role}_roped",),
+            "vector_ops": float(b * h * rot_len * d * _ROPE_OPS_PER_ELEMENT),
+        })
+        updated[role] = f"{role}_roped"
+    return updated["query"], updated["key"], updated["encoder_query"], updated["encoder_key"]
 
 
 def _norm_rope_contract(op, meta, dtype, returns):
@@ -179,20 +247,13 @@ def _norm_rope_contract(op, meta, dtype, returns):
         enc_k_src = "encoder_key_normed"
         stats_sources["norm_added_key"] = "encoder_key_norm"
     if rope_type:
-        rope_len = int(meta.get("rope_len", max(sq, sk)))
-        rope_shape = _as_shape(meta.get("rope_sin_shape", (rope_len, d // 2)),
-                               "rope_sin")
-        rope_dtype = str(meta.get("rope_dtype", "fp32"))
-        reads.append(_read("rope_sin", rope_shape, rope_dtype))
-        reads.append(_read("rope_cos", rope_shape, rope_dtype))
-        for role, source, seq_len in (("query", q_src, sq), ("key", k_src, sk)):
-            compute.append({
-                "name": f"{role}_rope", "kind": "vector",
-                "inputs": (source, "rope_sin", "rope_cos"),
-                "outputs": (f"{role}_roped",),
-                "vector_ops": float(b * h * min(rope_len, seq_len) * d * 2),
-            })
-        q_src, k_src = "query_roped", "key_roped"
+        q_src, k_src, enc_q_src, enc_k_src = _append_norm_rope_rotary(
+            meta, reads, compute,
+            b=b, h=h, d=d, dtype=dtype,
+            sq=sq, sk=sk, sv=sv, seq=seq, sek=sek, sev=sev,
+            concat_order=concat_order, q_src=q_src, k_src=k_src,
+            enc_q_src=enc_q_src, enc_k_src=enc_k_src,
+        )
     q_out = (b, h, sq + seq, d)
     k_out = (b, h, sk + sek, d)
     v_out = (b, h, sv + sev, d)
@@ -266,56 +327,86 @@ def _sparse_shape(meta, op, name, default):
     raise ModelingError(f"mindie_sd_sparse_{name}_requires_BNSD_or_TND")
 
 
+def _is_mask_flag(value) -> bool:
+    return isinstance(value, (int, bool))
+
+
+def _parse_head_mask(
+    head, qb: int, kb: int, max_qb: int, max_kb: int,
+) -> tuple[tuple[int, ...], bool]:
+    if not isinstance(head, (tuple, list)):
+        raise ModelingError("mindie_sd_sparse_block_mask_shape_mismatch")
+    if all(_is_mask_flag(value) for value in head):
+        if len(head) == qb * kb:
+            return tuple(1 if value else 0 for value in head), False
+        if len(head) == max_qb * max_kb:
+            return tuple(
+                1 if head[qi * max_kb + ki] else 0
+                for qi in range(qb) for ki in range(kb)
+            ), True
+        raise ModelingError("mindie_sd_sparse_block_mask_shape_mismatch")
+    if (len(head) == qb
+            and all(isinstance(item, (tuple, list)) and len(item) == kb
+                    and all(_is_mask_flag(value) for value in item)
+                    for item in head)):
+        return tuple(
+            1 if head[qi][ki] else 0
+            for qi in range(qb) for ki in range(kb)
+        ), (qb == max_qb and kb == max_kb)
+    if (len(head) == max_qb
+            and all(isinstance(item, (tuple, list)) and len(item) == max_kb
+                    and all(_is_mask_flag(value) for value in item)
+                    for item in head)):
+        return tuple(
+            1 if head[qi][ki] else 0
+            for qi in range(qb) for ki in range(kb)
+        ), True
+    raise ModelingError("mindie_sd_sparse_block_mask_shape_mismatch")
+
+
 def _sparse_mask_flags(mask_values, total_pairs, per_batch_pairs, b, hq):
-    flat = None
-    head_flags = None
-    if mask_values is not None:
-        if (isinstance(mask_values, (str, bytes))
-                or not isinstance(mask_values, (tuple, list))):
-            raise ModelingError("mindie_sd_sparse_block_mask_invalid")
-        if (len(mask_values) == total_pairs
-                and all(isinstance(value, (int, bool)) for value in mask_values)):
-            flat = tuple(1 if value else 0 for value in mask_values)
-        elif (all(isinstance(value, (int, bool)) for value in mask_values)
-              and per_batch_pairs
-              and all(qb * kb == len(mask_values) for _, qb, kb in per_batch_pairs)):
-            flat = tuple(1 if value else 0 for value in mask_values) * b
-        else:
-            head_rows = []
-            for batch_index, qb, kb in per_batch_pairs:
-                if batch_index >= len(mask_values):
-                    raise ModelingError("mindie_sd_sparse_block_mask_batch_missing")
-                row = mask_values[batch_index]
-                if isinstance(row, (str, bytes)):
-                    raise ModelingError("mindie_sd_sparse_block_mask_shape_mismatch")
-                if len(row) == hq:
-                    heads = []
-                    for head in row:
-                        if isinstance(head, (str, bytes)):
-                            raise ModelingError(
-                                "mindie_sd_sparse_block_mask_shape_mismatch")
-                        if len(head) == qb * kb:
-                            heads.append(tuple(1 if value else 0 for value in head))
-                        elif (len(head) == qb
-                              and all(not isinstance(item, (str, bytes))
-                                      and len(item) == kb for item in head)):
-                            heads.append(tuple(
-                                1 if head[qi][ki] else 0
-                                for qi in range(qb) for ki in range(kb)))
-                        else:
-                            raise ModelingError(
-                                "mindie_sd_sparse_block_mask_shape_mismatch")
-                    head_rows.append(tuple(heads))
-                elif len(row) == qb * kb:
-                    flags = tuple(1 if value else 0 for value in row)
-                    head_rows.append(tuple(flags for _ in range(hq)))
-                else:
-                    raise ModelingError("mindie_sd_sparse_block_mask_shape_mismatch")
-            head_flags = tuple(head_rows)
-            total_head_pairs = sum(len(row[0]) for row in head_flags) * hq
-            if total_head_pairs != sum(qb * kb for _, qb, kb in per_batch_pairs) * hq:
+    if mask_values is None:
+        return None, None, False
+    if not isinstance(mask_values, (tuple, list)):
+        raise ModelingError("mindie_sd_sparse_block_mask_invalid")
+    if all(_is_mask_flag(value) for value in mask_values):
+        if len(mask_values) == total_pairs:
+            return tuple(1 if value else 0 for value in mask_values), None, False
+        if (per_batch_pairs
+                and all(qb * kb == len(mask_values) for _, qb, kb in per_batch_pairs)):
+            return tuple(1 if value else 0 for value in mask_values) * b, None, False
+        raise ModelingError("mindie_sd_sparse_block_mask_shape_mismatch")
+    if len(mask_values) < b:
+        raise ModelingError("mindie_sd_sparse_block_mask_batch_missing")
+    if len(mask_values) != b:
+        raise ModelingError("mindie_sd_sparse_block_mask_shape_mismatch")
+    max_qb = max((qb for _, qb, _ in per_batch_pairs), default=0)
+    max_kb = max((kb for _, _, kb in per_batch_pairs), default=0)
+    head_rows = []
+    rectangular = False
+    for batch_index, qb, kb in per_batch_pairs:
+        row = mask_values[batch_index]
+        if not isinstance(row, (tuple, list)):
+            raise ModelingError("mindie_sd_sparse_block_mask_shape_mismatch")
+        if all(_is_mask_flag(value) for value in row):
+            if len(row) == qb * kb:
+                flags = tuple(1 if value else 0 for value in row)
+            elif len(row) == max_qb * max_kb:
+                flags = tuple(
+                    1 if row[qi * max_kb + ki] else 0
+                    for qi in range(qb) for ki in range(kb)
+                )
+                rectangular = True
+            else:
                 raise ModelingError("mindie_sd_sparse_block_mask_shape_mismatch")
-    return flat, head_flags
+            head_rows.append(tuple(flags for _ in range(hq)))
+        elif len(row) == hq:
+            parsed = tuple(_parse_head_mask(head, qb, kb, max_qb, max_kb) for head in row)
+            rectangular = rectangular or any(is_rect for _, is_rect in parsed)
+            head_rows.append(tuple(flags for flags, _ in parsed))
+        else:
+            raise ModelingError("mindie_sd_sparse_block_mask_shape_mismatch")
+    return None, tuple(head_rows), rectangular
 
 
 _SPARSE_MAC_FACTOR = 2
@@ -355,10 +446,10 @@ def _sparse_legacy_contract(op, dtype, ratio, block, meta, options):
 
 
 def _sparse_active_totals(
-    per_batch_pairs, q_lengths, k_lengths, block, ratio, flat, head_flags, hq, dq, dv,
+    per_batch_pairs, q_lengths, k_lengths, block, ratio, flat, head_flags, hq, hkv, dq, dv,
 ):
     qk_flops = pv_flops = 0.0
-    active_rows = active_pairs = 0
+    active_score_elements = active_pairs = 0
     kv_blocks = set()
     if head_flags is None:
         cursor = 0
@@ -377,27 +468,32 @@ def _sparse_active_totals(
                         cursor += 1
             for qi, ki in selected:
                 qrows, rows = min(block, ql - qi * block), min(block, kl - ki * block)
+                score_elements = qrows * rows * hq
                 active_pairs += 1
-                active_rows += qrows * rows
-                qk_flops += _SPARSE_MAC_FACTOR * qrows * rows * hq * dq
-                pv_flops += _SPARSE_MAC_FACTOR * qrows * rows * hq * dv
-                kv_blocks.add((batch_index, ki))
-        return qk_flops, pv_flops, active_rows, active_pairs, kv_blocks
+                active_score_elements += score_elements
+                qk_flops += _SPARSE_MAC_FACTOR * score_elements * dq
+                pv_flops += _SPARSE_MAC_FACTOR * score_elements * dv
+                for kv_head in range(hkv):
+                    kv_blocks.add((batch_index, kv_head, ki))
+        return qk_flops, pv_flops, active_score_elements, active_pairs, kv_blocks
+    group_size = hq // hkv
     for batch_index, qb, kb in per_batch_pairs:
         ql, kl = q_lengths[batch_index], k_lengths[batch_index]
         for head in range(hq):
             flags = head_flags[batch_index][head]
+            kv_head = head // group_size
             for qi in range(qb):
                 for ki in range(kb):
                     if not flags[qi * kb + ki]:
                         continue
                     qrows, rows = min(block, ql - qi * block), min(block, kl - ki * block)
+                    score_elements = qrows * rows
                     active_pairs += 1
-                    active_rows += qrows * rows
-                    qk_flops += _SPARSE_MAC_FACTOR * qrows * rows * dq
-                    pv_flops += _SPARSE_MAC_FACTOR * qrows * rows * dv
-                    kv_blocks.add((batch_index, ki))
-    return qk_flops, pv_flops, active_rows, active_pairs, kv_blocks
+                    active_score_elements += score_elements
+                    qk_flops += _SPARSE_MAC_FACTOR * score_elements * dq
+                    pv_flops += _SPARSE_MAC_FACTOR * score_elements * dv
+                    kv_blocks.add((batch_index, kv_head, ki))
+    return qk_flops, pv_flops, active_score_elements, active_pairs, kv_blocks
 
 
 def _sparse_contract(op, meta, dtype, returns, resolved, options):
@@ -451,22 +547,31 @@ def _sparse_contract(op, meta, dtype, returns, resolved, options):
                                 (kl + block - 1) // block))
     total_pairs = sum(qb * kb for _, qb, kb in per_batch_pairs)
     mask_values = meta.get("block_mask")
-    flat, head_flags = _sparse_mask_flags(mask_values, total_pairs, per_batch_pairs, b, hq)
-    qk_flops, pv_flops, active_rows, active_pairs, kv_blocks = _sparse_active_totals(
-        per_batch_pairs, q_lengths, k_lengths, block, ratio, flat, head_flags, hq, dq, dv)
+    flat, head_flags, mask_is_rect = _sparse_mask_flags(
+        mask_values, total_pairs, per_batch_pairs, b, hq)
+    qk_flops, pv_flops, active_score_elements, active_pairs, kv_blocks = _sparse_active_totals(
+        per_batch_pairs, q_lengths, k_lengths, block, ratio, flat, head_flags, hq, hkv, dq, dv)
     k_elem_bytes = dtype_bytes(k_dtype)
     v_elem_bytes = dtype_bytes(v_dtype)
     kv_load_bytes = 0.0
-    for batch_index, ki in kv_blocks:
+    for batch_index, _kv_head, ki in kv_blocks:
         rows = min(block, k_lengths[batch_index] - ki * block)
-        kv_load_bytes += rows * hkv * (dk * k_elem_bytes + dv * v_elem_bytes)
+        kv_load_bytes += rows * (dk * k_elem_bytes + dv * v_elem_bytes)
     if head_flags is not None:
-        mask_bytes = float(meta.get(
-            "mask_bytes",
-            sum(qb * kb for _, qb, kb in per_batch_pairs) * hq
-            * dtype_bytes(str(meta.get("mask_dtype", "int8")))))
+        max_qb = max((qb for _, qb, _ in per_batch_pairs), default=0)
+        max_kb = max((kb for _, _, kb in per_batch_pairs), default=0)
+        mask_dtype = str(meta.get("mask_dtype", "int8"))
+        uniform_grid = all(qb == max_qb and kb == max_kb for _, qb, kb in per_batch_pairs)
+        mask_shape = (
+            (b, hq, max_qb, max_kb)
+            if (mask_is_rect or uniform_grid)
+            else (sum(qb * kb for _, qb, kb in per_batch_pairs) * hq,)
+        )
+        mask_bytes = float(meta.get("mask_bytes", prod(mask_shape) * dtype_bytes(mask_dtype)))
     else:
-        mask_bytes = float(meta.get("mask_bytes", total_pairs * int(dtype_bytes("int32"))))
+        mask_dtype = str(meta.get("mask_dtype", "int32"))
+        mask_shape = (total_pairs,)
+        mask_bytes = float(meta.get("mask_bytes", total_pairs * dtype_bytes(mask_dtype)))
     reads = [_read("query", q_shape, q_dtype),
              {"name": "key", "shape": k_shape, "dtype": k_dtype,
               "bytes": 0.0, "materialized": True, "alias": None,
@@ -477,7 +582,7 @@ def _sparse_contract(op, meta, dtype, returns, resolved, options):
              {"name": "kv_load", "shape": (active_pairs,), "dtype": k_dtype,
               "bytes": kv_load_bytes, "materialized": True, "alias": None,
               "kind": "block_load", "producer": None},
-             {"name": "block_mask", "shape": (total_pairs,), "dtype": "int32",
+             {"name": "block_mask", "shape": mask_shape, "dtype": mask_dtype,
               "bytes": mask_bytes, "materialized": True, "alias": None,
               "kind": "mask", "producer": None}]
     for name, shape_key, dt_key in (
@@ -523,7 +628,7 @@ def _sparse_contract(op, meta, dtype, returns, resolved, options):
          "inputs": ("query", "kv_load", "block_mask") + scale_inputs,
          "outputs": ("qk_scores",)},
         {"name": "softmax", "kind": "vector",
-         "vector_ops": float(active_rows * hq * 2),
+         "vector_ops": float(active_score_elements * 2),
          "inputs": ("qk_scores", "block_mask"),
          "outputs": ("probs", "softmax_lse")},
         {"name": "pv", "kind": "matrix",
@@ -534,7 +639,7 @@ def _sparse_contract(op, meta, dtype, returns, resolved, options):
     return _contract(reads, writes, compute, attributes={
         "sparsity_ratio": ratio, "block_size": block,
         "active_block_pairs": active_pairs, "block_pairs": total_pairs,
-        "active_rows": active_rows, "layout": q_layout, "batch": b,
+        "active_rows": active_score_elements, "layout": q_layout, "batch": b,
         "q_lengths": q_lengths, "k_lengths": k_lengths, "v_lengths": v_lengths,
         "kv_dtype": k_dtype, "q_dtype": q_dtype, "k_dtype": k_dtype,
         "v_dtype": v_dtype, "output_dtype": out_dtype,

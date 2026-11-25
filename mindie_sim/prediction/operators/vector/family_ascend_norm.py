@@ -369,6 +369,9 @@ def lower_op(op, *, has_bias=None, external_gamma_shift=False):
         raise ModelingError("ascend_native_norm_bias_cannot_remove_declared_affine")
     qmeta = _quant_contract(meta, op.family, rows, width, dtype=op.dtype, bias=bias) \
         if op.family in {"rmsnorm_quant", "add_rmsnorm_quant"} else None
+    if qmeta is not None and ("norm" in op.returns or bool(meta.get("norm_output_materialized"))):
+        raise ModelingError(
+            f"ascend_native_norm_quant_materialized_norm_output_unsupported:{op.family}")
     declared_api = meta.get("norm_native_api")
     if op.family == "add_rmsnorm":
         if declared_api is None:
