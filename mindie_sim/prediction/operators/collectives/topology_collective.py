@@ -14,15 +14,33 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Literal
 
 from mindie_sim.prediction.physical_recipe_base import (IO_HBM_CATEGORY, Phase, build_plan,
                                    io_weight, phased_program)
 from mindie_sim.prediction.program import KernelProgram, Stage
+from mindie_sim.schema.datapath import SourceRef
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/all_reduce/algorithm/template/aicpu/ins_temp_all_reduce_mesh_1D_two_shot.cc",
+        source_sha256="00a81cd91df30b50132b5eb22328d7c468a16a185432d8649c76ad8e14434784",
+    ),
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/reduce_scatter/algorithm/template/aicpu/ins_temp_reduce_scatter_mesh_1D.cc",
+        source_sha256="1bb66446b852ee0b121d01521302e4d0719af821e49866fc14d98d581fbdb69e",
+    ),
+)
 
 HALF_SHARE = 0.5
-REDUCE_VECTOR_SHARE = 0.50
 MESH_ALGORITHM = "direct_mesh"
-ALLREDUCE_FAMILIES = frozenset({"allreduce", "tp_allreduce"})
+ALLREDUCE_FAMILIES = frozenset({"allreduce", "all_reduce", "tp_allreduce", "tp_all_reduce"})
+REDUCE_SCATTER_FAMILIES = frozenset({"reduce_scatter", "tp_reduce_scatter"})
 
 
 def _pack_phase(read_share):
@@ -36,15 +54,18 @@ def _unpack_phase(write_share, after):
     }, after=after)
 
 
-def _mesh_phases(context, phases, family):
+def _mesh_phases(context, phases):
     """Physical phase weights around the plan-owned peer transports."""
     read_share = io_weight(context, "hbm_read")
     write_share = io_weight(context, "hbm_write")
     result = [_pack_phase(read_share)]
-    reduce = (REDUCE_VECTOR_SHARE if family in ALLREDUCE_FAMILIES
-              else 1.0)
+    reduce_phase = (
+        "reduce_scatter" if "reduce_scatter" in phases
+        else (phases[-1] if phases else None)
+    )
     for name in phases:
-        result.append(Phase(name, {"vector": reduce}, after=(result[(-1)].name,)))
+        weights = {"vector": 1.0} if name == reduce_phase else {}
+        result.append(Phase(name, weights, after=(result[(-1)].name,)))
     result.append(_unpack_phase(write_share, after=(result[(-1)].name,)))
     return tuple(result)
 
@@ -72,13 +93,23 @@ class TopologyCollectiveRecipe:
         if family in ALLREDUCE_FAMILIES:
             phases = (
                 _pack_phase(read_share),
-                Phase("reduce_scatter", {"link": HALF_SHARE,
-                                         "vector": REDUCE_VECTOR_SHARE},
+                Phase("reduce_scatter_net", {"link": HALF_SHARE},
                       after=("pack",)),
-                Phase("all_gather", {"link": HALF_SHARE,
-                                     "vector": REDUCE_VECTOR_SHARE},
+                Phase("reduce_scatter", {"vector": 1.0},
+                      after=("reduce_scatter_net",)),
+                Phase("all_gather", {"link": HALF_SHARE},
                       after=("reduce_scatter",)),
                 _unpack_phase(write_share, after=("all_gather",)),
+            )
+            base = _with_setup(context, phases)
+        elif family in REDUCE_SCATTER_FAMILIES:
+            phases = (
+                _pack_phase(read_share),
+                Phase("reduce_scatter", {"link": 1.0},
+                      after=("pack",)),
+                Phase("reduce", {"vector": 1.0},
+                      after=("reduce_scatter",)),
+                _unpack_phase(write_share, after=("reduce",)),
             )
             base = _with_setup(context, phases)
         else:
@@ -98,23 +129,35 @@ class TopologyCollectiveRecipe:
 def _lower_mesh(context, plan):
     """Submit the selected plan's dependent phases; never re-split ring demand."""
     plan.validate_path_model("direct")
-    family = str(getattr(context.op, "family", ""))
     # The plan owns all link work.  Keep only local packaging/reduction work in
     # the stages that wrap the physical peer programs, so no byte is counted
     # twice.
     link_names = frozenset(plan.wire_by_resource())
     work = {name: value for name, value in dict(context.work).items()
             if name not in link_names}
-    phases = _mesh_phases(context, tuple(plan.phase_names), family)
+    phases = _mesh_phases(context, tuple(plan.phase_names))
     base = phased_program(replace(context, work=work), phases)
     stages = []
     for stage in base.stages:
         if stage.name in plan.phase_names:
             # A dependent phase is a real program boundary: its startup and
-            # every directed peer message come from the topology plan.
-            stage = replace(stage, program=plan.phase_program(stage.name),
-                            keep_empty=True)
-        stages.append(stage)
+            # every directed peer message come from the topology plan, and
+            # local reduction work runs strictly after peer transfer arrival.
+            if stage.work:
+                net_name = f"{stage.name}:network"
+                stages.append(Stage(
+                    net_name, after=stage.after,
+                    program=plan.phase_program(stage.name),
+                    keep_empty=True,
+                ))
+                stages.append(replace(stage, after=(net_name,), keep_empty=True))
+            else:
+                stages.append(replace(
+                    stage, program=plan.phase_program(stage.name),
+                    keep_empty=True,
+                ))
+        else:
+            stages.append(stage)
     return KernelProgram(tuple(stages), minimum_ms=context.minimum_ms)
 
 

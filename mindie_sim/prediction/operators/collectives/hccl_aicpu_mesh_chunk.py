@@ -11,9 +11,28 @@
 """
 from __future__ import annotations
 
-from .hccl_contracts import HcclPlan, ModelingError
+from typing import Literal
+
+from mindie_sim.schema.datapath import SourceRef
+from .hccl_contracts import HCCL_64BIT_ELEMENT_BYTES, HcclPlan, ModelingError
 from .hccl_source_shapes import (
     copy_phase, exchange_phase, slice_sizes, step_matrix, subchunks, sync_phase,
+)
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/all_reduce/algorithm/template/aicpu/ins_temp_all_reduce_mesh_1D_two_shot_mesh_chunk.cc",
+        source_sha256="e161c54154da16a624be065580072b21131de830b2950c5055f5f17408ad2bfa",
+    ),
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/op_common/op_common.cc",
+        source_sha256="09adbab9512711e0e7882b098b60b6f3c6a1c3be30da835868427248bc8e354a",
+    ),
 )
 
 TEMPLATE = "mesh_chunk_twoshot"
@@ -29,6 +48,8 @@ def contract(selection, rank=0):
         raise ModelingError("hccl_mesh_chunk_requires_separate_buffers")
     if s.segments or s.level1_weights:
         raise ModelingError("hccl_mesh_chunk_does_not_accept_segments_or_weights")
+    if s.dtype_bytes == HCCL_64BIT_ELEMENT_BYTES:
+        raise ModelingError("hccl_aicpu_64bit_reduce_cpu_path_not_implemented")
     r, n, dtype = s.ranks, s.payload_bytes, s.dtype_bytes
     if r < 2 or n < dtype or n % dtype:
         raise ModelingError("hccl_mesh_chunk_requires_positive_element_geometry")

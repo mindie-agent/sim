@@ -27,9 +27,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import math
-from typing import ClassVar
+from typing import ClassVar, Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.engine import Allocation
 from mindie_sim.prediction.collectives import (PairwiseCollective, PairwiseGroup,
                            _joint_complete, _ready_by_rank,
@@ -37,6 +38,17 @@ from mindie_sim.prediction.collectives import (PairwiseCollective, PairwiseGroup
 from mindie_sim.prediction.communication import CommunicationWork, MessageFlow
 from mindie_sim.prediction.topology import (
     DEFAULT_MAX_PHYSICAL_CHUNKS, TransportOptions, chunk_count, chunk_size_at, chunk_sizes,
+)
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+US_PER_MS = 1000.0
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/all_reduce/algorithm/template/aicpu/ins_temp_all_reduce_mesh_1D_two_shot.cc",
+        source_sha256="00a81cd91df30b50132b5eb22328d7c468a16a185432d8649c76ad8e14434784",
+    ),
 )
 
 
@@ -198,10 +210,8 @@ class DirectPeerGroup(PairwiseGroup):
             raise ModelingError(
                 "direct_peer_chunk_exceeds_receive_capacity:"
                 f"{largest}>{capacity}")
-        first_chunk = self.topology.route_message(MessageFlow(
-            source, destination, largest)).hops
         if capacity is None:
-            chunk_window = max(1, len(first_chunk))
+            chunk_window = None
         else:
             chunk_window = max(
                 1, int(float(capacity) // largest + 1e-9))
@@ -209,6 +219,7 @@ class DirectPeerGroup(PairwiseGroup):
         remaining = [total]
         arrived_chunks = [0]
         issued_chunks = [0]
+        hop0_done = [0]
         # Local indices only index the peer matrix.  The consumption
         # binder, pool identity and release lookup all use physical ranks.
         pair = (source, destination)
@@ -237,14 +248,21 @@ class DirectPeerGroup(PairwiseGroup):
                 engine.extend(pools={
                     pool: float(self.receive_capacity_bytes_per_peer)})
 
-        def arrived(_event, chunk_index, prefix, allocation):
+        def arrived(_event, chunk_index, prefix, allocation, hop_count):
             remaining[0] -= 1
             arrived_chunks[0] += 1
+            if hop_count == 0:
+                hop0_done[0] += 1
             release_chunk(prefix, pair, allocation, _event)
             pump()
             if remaining[0]:
                 return
             finish_message(index, destination_index)
+
+        def on_hop0_done(_event, chunk_index):
+            hop0_done[0] += 1
+            if chunk_index + 1 < total:
+                pump()
 
         def schedule_chunk(chunk_index):
             useful = chunk_size_at(
@@ -269,15 +287,35 @@ class DirectPeerGroup(PairwiseGroup):
                     f"{prefix}:chunk{chunk_index}:gate",
                     after=tuple(dependencies), owner=owner)
             previous = gate
+            startup_ms = float(self.hop_startup_us) / US_PER_MS
+            has_tx = False
+            has_rx = False
+            if chunk_index == 0 and startup_ms:
+                route_resources = {
+                    res for hop in chunk
+                    for res in (hop.resource, *hop.additional_resources)
+                }
+                has_tx = any(
+                    res.endswith(f":tx:port{source}") for res in route_resources)
+                has_rx = any(
+                    res.endswith(f":rx:port{destination}") for res in route_resources)
             for hop_index, hop in enumerate(chunk):
                 dependencies = [previous]
                 if previous_services is not None:
                     dependencies.append(previous_services[hop_index])
-                if chunk_index == 0 and self.hop_startup_us:
+                if chunk_index == 0 and startup_ms:
+                    if has_tx and hop_index == 0:
+                        inject = engine.submit(
+                            f"{prefix}:inject:startup",
+                            after=tuple(dependencies),
+                            latency=startup_ms,
+                            owner=owner,
+                            metadata={"startup_boundary": "source_injection_once"})
+                        dependencies = [inject]
                     startup = engine.submit(
                         f"{prefix}:hop{hop_index}:startup",
                         after=tuple(dependencies),
-                        latency=float(self.hop_startup_us) / 1000.0,
+                        latency=startup_ms,
                         owner=owner,
                         metadata={"startup_boundary": "per_hop_protocol_once"})
                     dependencies = [startup]
@@ -286,8 +324,8 @@ class DirectPeerGroup(PairwiseGroup):
                     hop.demand, after=tuple(dependencies), owner=owner,
                     coupled=True,
                     on_complete=(
-                        (lambda _event: pump())
-                        if hop_index == 0 and chunk_index + 1 < total
+                        (lambda event, ci=chunk_index: on_hop0_done(event, ci))
+                        if hop_index == 0
                         else None))
                 arrival = engine.submit(
                     f"{prefix}:chunk{chunk_index}:hop{hop_index}:arrival",
@@ -295,15 +333,22 @@ class DirectPeerGroup(PairwiseGroup):
                 services.setdefault(
                     chunk_index, [None] * len(chunk))[hop_index] = service
                 previous = arrival
+            if chunk_index == 0 and startup_ms and has_rx:
+                previous = engine.submit(
+                    f"{prefix}:receive:startup", after=(previous,),
+                    latency=startup_ms, owner=owner,
+                    metadata={"startup_boundary": "destination_receipt_once"})
             received_event = engine.submit(
                 f"{prefix}:chunk{chunk_index}:received", after=(previous,),
                 owner=owner,
                 on_complete=lambda event, ci=chunk_index, p=prefix,
-                a=allocation: arrived(event, ci, p, a))
+                a=allocation, hc=len(chunk): arrived(event, ci, p, a, hc))
 
         def pump():
-            limit = min(
-                total, arrived_chunks[0] + chunk_window + 1)
+            if chunk_window is None:
+                limit = min(total, hop0_done[0] + 1)
+            else:
+                limit = min(total, arrived_chunks[0] + chunk_window + 1)
             while issued_chunks[0] < limit:
                 index_to_issue = issued_chunks[0]
                 issued_chunks[0] += 1
@@ -604,20 +649,29 @@ class DirectMeshPlan:
                     for hop in route.hops:
                         routed_useful += hop.useful_bytes
                         physical_wire += hop.wire_bytes
-                        useful[hop.resource] = (
-                            useful.get(hop.resource, 0.0) + hop.useful_bytes)
-                        wire[hop.resource] = (
-                            wire.get(hop.resource, 0.0) + hop.wire_bytes)
-                        transactions[hop.resource] = (
-                            None if hop.transactions is None
-                            else transactions.get(hop.resource, 0)
-                            + hop.transactions)
-                        if hop.transaction_frame is not None:
-                            frames[hop.resource] = hop.transaction_frame
+                        for resource in hop.demand:
+                            useful[resource] = (
+                                useful.get(resource, 0.0) + hop.useful_bytes)
+                            wire[resource] = (
+                                wire.get(resource, 0.0) + hop.wire_bytes)
+                            previous_tx = transactions.get(resource, 0)
+                            if hop.transactions is None or previous_tx is None:
+                                transactions[resource] = None
+                            else:
+                                transactions[resource] = (
+                                    previous_tx + hop.transactions)
+                            if resource not in frames:
+                                frames[resource] = hop.transaction_frame
+                            elif frames[resource] != hop.transaction_frame:
+                                frames[resource] = None
                         path_latency += hop.latency_ms
                     max_path_latency = max(max_path_latency, path_latency)
+        uniform_frames = {
+            resource: frame for resource, frame in frames.items()
+            if frame is not None
+        }
         return CommunicationWork(
-            useful_by_rank, useful, wire, transactions, frames, messages,
+            useful_by_rank, useful, wire, transactions, uniform_frames, messages,
             0.0, routed_useful, physical_wire, max_path_latency)
 
     def wire_by_resource(self):

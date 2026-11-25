@@ -10,12 +10,36 @@
 from bisect import bisect_right
 from dataclasses import asdict, dataclass
 from math import ceil
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from .hccl_aiv import GROUP_BUFFER, UB_BATCH, UB_RESIDENCY
 from .hccl_contracts import HcclPhase, HcclPlan, HcclSelection, SOURCE, SOURCE_REVISION
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/all_gather/algorithm/template/aiv/kernel/aiv_all_gather_mesh_1d.h",
+        source_sha256="3ca3049ddf8bacaa688e030f71641044593d5657b2644ea8167f31a966a5bb25",
+    ),
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/all_gather/algorithm/template/aiv/aiv_temp_all_gather_mesh_1D.cc",
+        source_sha256="abe686271bb67ab44c7a830d6d7fa00bae56a8afe1ca92d83fc4819ba7c1c61a",
+    ),
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/op_common/algorithm/template/aiv/aiv_communication_base_v2.h",
+        source_sha256="09fa4eabd485d8f7f24cc3a1225a91cf6373734f7bf38f3fa35db4cd5d156fa2",
+    ),
+)
 
 RECIPE = 'hccl_aiv_gather_source_phase'
 DATA_LIMIT = 512 * 1024
@@ -103,11 +127,91 @@ def jobs(s, available, rank=0):
     }
 
 
+def _mesh(ranks, wire):
+    if not wire:
+        return ()
+    return tuple(tuple(0 if i == j else wire for j in range(ranks)) for i in range(ranks))
+
+
+def _producer_fragment_bytes(selection, count):
+    r, n, width = selection.ranks, selection.payload_bytes, selection.dtype_bytes
+    usable = count // r * r
+    cut = (usable - r) // r
+    sizes = tuple(_partition(part, cut) for part in _partition(n // width, r))
+    return tuple(size * width for group in sizes for size in group if size)
+
+
+def _phase_specs(owner_jobs, selection, count, details):
+    """Emit causally ordered flag and payload phases without coalescing transfers."""
+    r, n = selection.ranks, selection.payload_bytes
+    specs = [('precopy', (), owner_jobs['precopy'], (), 'send')]
+    if details['branch'] == 'producer_consumer':
+        # Producer-consumer (aiv_all_gather_mesh_1d.h:104-145): consumers poll
+        # each peer's fragment flag via WaitFlag(targetRank) and pull each
+        # positive fragment via GetGmIn(targetRank) — both are remote reads.
+        flag_names = []
+        copy_names = []
+        for idx, frag_bytes in enumerate(_producer_fragment_bytes(selection, count)):
+            flag_name = f'gather_ready_{idx}'
+            copy_name = f'gather_copy_{idx}'
+            specs.append((flag_name, ('precopy',), {}, _mesh(r, FLAG_BYTES), 'read'))
+            specs.append((copy_name, (flag_name,), {}, _mesh(r, frag_bytes), 'read'))
+            flag_names.append(flag_name)
+            copy_names.append(copy_name)
+        gather_after = tuple(flag_names) if flag_names else ('precopy',)
+        specs.append(('gather', gather_after, owner_jobs['gather'], (), 'send'))
+        tail = ('gather', *copy_names)
+    else:
+        # RunCtrlCore (aiv_all_gather_mesh_1d.h:168-184): readiness write,
+        # remote payload read, ack write, and post-arrival ack wait are
+        # causally separated phases per directed peer.
+        peer_splits = _partition(r, details['copy_owner_count'])
+        ready_owners = {
+            owner: (Action('record', FLAG_BYTES),) * peers
+            for owner, peers in enumerate(peer_splits)
+        }
+        copy_owners = {
+            owner: tuple(
+                action for _ in range(peers)
+                for action in (Action('wait', FLAG_BYTES), Action('copy', n))
+            )
+            for owner, peers in enumerate(peer_splits)
+        }
+        ack_record_owners = {
+            owner: (Action('record', FLAG_BYTES),) * peers
+            for owner, peers in enumerate(peer_splits)
+        }
+        ack_wait_owners = {
+            owner: (Action('wait', FLAG_BYTES),) * peers
+            for owner, peers in enumerate(peer_splits)
+        }
+        specs.append(('gather_ready', ('precopy',), ready_owners, _mesh(r, FLAG_BYTES), 'send'))
+        specs.append(('gather', ('gather_ready',), copy_owners, _mesh(r, n), 'read'))
+        specs.append(('gather_ack', ('gather',), ack_record_owners, _mesh(r, FLAG_BYTES), 'send'))
+        specs.append(('gather_ack_wait', ('gather_ack',), ack_wait_owners, (), 'send'))
+        tail = ('gather_ack_wait',)
+    if 'post_barrier' in owner_jobs:
+        # BarrierAll records peer flags remotely before waiting on incoming
+        # peer flags and clearing/resetting local barrier state.
+        barrier_send = {}
+        barrier_wait = {}
+        for owner, peers in enumerate(_partition(r, count)):
+            if peers:
+                barrier_send[owner] = (Action('record', FLAG_BYTES),) * peers
+                barrier_wait[owner] = tuple(
+                    action for _ in range(peers)
+                    for action in (Action('wait', FLAG_BYTES), Action('record', FLAG_BYTES))
+                )
+        specs.append(('post_barrier', tail, barrier_send, _mesh(r, FLAG_BYTES), 'send'))
+        specs.append(('post_barrier_wait', ('post_barrier',), barrier_wait, (), 'send'))
+    return tuple(specs)
+
+
 def contract(selection, available, rank=0):
     owner_jobs, count, details = jobs(selection,available,rank)
-    r,n = selection.ranks,selection.payload_bytes
-    phases, previous, all_counts = [], (), {}
-    for name, owners in owner_jobs.items():
+    n = selection.payload_bytes
+    phases, all_counts = [], {}
+    for name, after, owners, exchange, direction in _phase_specs(owner_jobs, selection, count, details):
         demand, counts = {}, {}
         for actions in owners.values():
             for action in actions:
@@ -116,16 +220,10 @@ def contract(selection, available, rank=0):
                 for role, value in action.work().items():
                     demand[role] = demand.get(role,0)+value
                 counts[action.kind] = counts.get(action.kind,0)+1
-        # Direction is symmetric for equal contributions. Successful flag
-        # payload is physical remote GM traffic, separate from useful payload.
-        wire = (n + FLAG_BYTES*(details['positive_input_fragments']
-                if details['branch']=='producer_consumer' else 2)) if name=='gather' else (
-                    FLAG_BYTES if name=='post_barrier' else 0)
-        exchange = tuple(tuple(0 if i==j else wire for j in range(r)) for i in range(r)) if wire else ()
-        phases.append(HcclPhase(name,previous,tuple(demand.items()),exchange=exchange,
+        phases.append(HcclPhase(name,after,tuple(demand.items()),exchange=exchange,
             owner_domain=tuple(owner for owner,actions in owners.items() if actions),
-            control_counts=tuple(sorted(counts.items()))))
-        previous = (name,)
+            control_counts=tuple(sorted(counts.items())),
+            native_direction=direction))
         for key,value in counts.items(): all_counts[key] = all_counts.get(key,0)+value
     all_counts['sync_all_block_calls'] = count*details['sync_all_calls_per_launched_block']
     return HcclPlan(selection,rank,tuple(phases),count,n,tuple(sorted(all_counts.items())),(
@@ -144,9 +242,13 @@ def build(op, geometry):
     selection = HcclSelection(**raw['selection'])
     units = geometry.resource_units.get('vector',geometry.compute_units)
     owner_jobs,count,details = jobs(selection,units,raw.get('rank',0))
+    phase_owners = {
+        name: owners
+        for name, _, owners, _, _ in _phase_specs(owner_jobs, selection, count, details)
+    }
     plan = contract(selection,units,raw.get('rank',0))
     phase = next(p for p in plan.phases if p.name == raw['phase'])
-    selected = owner_jobs[phase.name]
+    selected = phase_owners[phase.name]
     if geometry.buffers.get('ub',0) < UB_RESIDENCY:
         raise ModelingError('hccl_aiv_gather_requires_copy_queue_and_flags_UB')
     work = Work(resources=dict(phase.work))

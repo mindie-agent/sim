@@ -10,9 +10,30 @@
 """
 from __future__ import annotations
 
-from .hccl_contracts import HcclPlan, ModelingError, exact_positive_int
+from typing import Literal
+
+from mindie_sim.schema.datapath import SourceRef
+from .hccl_contracts import (
+    HCCL_64BIT_ELEMENT_BYTES, HcclPlan, ModelingError, exact_positive_int,
+)
 from .hccl_source_shapes import (
     copy_phase, exchange_phase, rs_chunks, rs_step_matrix, sync_phase,
+)
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/reduce_scatter/algorithm/template/aicpu/ins_temp_reduce_scatter_mesh_1D_meshchunk.cc",
+        source_sha256="4835863a85633a2c020e7bd5d257c128302e4879f6940dacc5c159c2d3ec5a14",
+    ),
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/op_common/op_common.cc",
+        source_sha256="09adbab9512711e0e7882b098b60b6f3c6a1c3be30da835868427248bc8e354a",
+    ),
 )
 
 TEMPLATE = "rs_mesh_chunk"
@@ -28,6 +49,8 @@ def contract(selection, rank=0):
         raise ModelingError("hccl_rs_mesh_chunk_requires_separate_buffers")
     if s.level1_weights:
         raise ModelingError("hccl_rs_mesh_chunk_does_not_accept_level1_weights")
+    if s.dtype_bytes == HCCL_64BIT_ELEMENT_BYTES:
+        raise ModelingError("hccl_aicpu_64bit_reduce_cpu_path_not_implemented")
     r, n, dtype = s.ranks, s.payload_bytes, s.dtype_bytes
     if r < 2 or n < r * dtype or n % (r * dtype):
         raise ModelingError("hccl_rs_mesh_chunk_requires_equal_integer_output_shards")
