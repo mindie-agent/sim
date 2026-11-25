@@ -146,7 +146,7 @@ class NativeBackend:
     __slots__ = (
         "library", "arena", "status_dict", "backend",
         "reason", "abi", "native_calls", "native_steps",
-        "native_boundaries", "fallbacks", "mode", "enabled",
+        "native_epochs_executed", "native_boundaries", "fallbacks", "mode", "enabled",
         "res_names", "pending", "deliver", "drops",
         "external", "callback_marks", "max_tasks", "live", "seeded",
         "disabled_reason", "error", "made_progress", "engine_slots",
@@ -173,6 +173,7 @@ class NativeBackend:
         self.abi = ABI_VERSION
         self.native_calls = 0
         self.native_steps = 0
+        self.native_epochs_executed = 0
         self.native_boundaries = 0
         self.fallbacks = 0
         self.mode = mode
@@ -295,7 +296,7 @@ class NativeBackend:
             self.res_names = tuple(engine.resources)
             self.res_index = {name: i for i, name in enumerate(self.res_names)}
             self.res_version = engine._resource_version
-            self.has_fair_res = any(p == 0 for p in policy)
+            self.has_fair_res = bool(policy)
         self.touched_res_ids.clear()
         self.fair_prio = None
         self.enabled = True
@@ -435,7 +436,7 @@ class NativeBackend:
         """Collect all active tasks plus all compatible unstarted tasks into one persistent arena."""
         tasks = engine._tasks
         allow_cb = self.mode == "auto"
-        has_fair = any(res.policy != "fifo" for res in engine.resources.values())
+        has_fair = bool(engine.resources)
         active_tasks = []
         fair_prio = None
         has_non_hook_cb = False
@@ -994,6 +995,8 @@ class NativeBackend:
         now, _boundary, steps, ncomp, nstart = prefix
         self.native_calls += 1
         self.native_steps += steps
+        if steps > 0:
+            self.native_epochs_executed += 1
         self._sync_counters(engine, full=True)
         engine.now = now
         engine.advance_steps += steps
@@ -1063,7 +1066,7 @@ class NativeBackend:
         if not all(math.isfinite(rate) and rate > 0 and 1 <= unit <= MAX_U
                    for rate, unit in zip(rates, units)):
             return False
-        has_fair = 0 in policy
+        has_fair = bool(policy)
         priorities = {task.priority for _, task, _ in self.pending} if has_fair else set()
         if len(priorities) > 1:
             return False
@@ -1255,6 +1258,8 @@ class NativeBackend:
             self._translate_fault(error)
         self.native_calls += 1
         self.native_steps += steps
+        if steps > 0:
+            self.native_epochs_executed += 1
         engine.now, engine.advance_steps = now, engine.advance_steps + steps
         if steps > 0:
             self._sync_counters(engine)
@@ -1399,6 +1404,7 @@ class NativeBackend:
             "accel_backend": backend, "backend_reason": reason,
             "abi": self.abi, "native_calls": self.native_calls,
             "native_steps": self.native_steps,
+            "native_epochs_executed": self.native_epochs_executed,
             "native_boundaries": self.native_boundaries,
             "fallbacks": self.fallbacks,
             "fallback_reason": reason, "mirrored_live": self.live,
@@ -1421,8 +1427,8 @@ class NativeBackend:
         self.enabled = False
 #: Counter keys every backend reports, so ``Engine.accel_status()`` has one
 #: stable shape whether or not a kernel is attached.
-_IDLE_COUNTERS = {"native_calls": 0, "native_steps": 0, "native_boundaries": 0,
-                  "fallbacks": 0, "mirrored_live": 0}
+_IDLE_COUNTERS = {"native_calls": 0, "native_steps": 0, "native_epochs_executed": 0,
+                  "native_boundaries": 0, "fallbacks": 0, "mirrored_live": 0}
 
 def make_backend(requested: str | None = None, *, eager_attach: bool = False):
     """Return ``(backend_or_none, telemetry)`` for one Engine."""

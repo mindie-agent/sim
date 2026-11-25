@@ -24,7 +24,6 @@
 /* Omit when embedded in the sanitizer harness under renamed symbols. */
 #ifndef msim_abi_version
 
-#define MSIM_FC_MIN_RATE 1e-12
 #define MSIM_FC_HALF_STEP 0.5
 #define MSIM_FC_CAP_ULPS 8.0
 #define MSIM_FC_SAT_ULPS 16.0
@@ -110,6 +109,7 @@ static double msim_fsum(const double *vals, int32_t n)
 
 typedef struct {
     int32_t flow;
+    int32_t span;
     double w;
 } msim_fc_term;
 
@@ -129,6 +129,7 @@ typedef struct {
     double bind_thresh;
     int32_t start;
     int32_t count;
+    uint8_t force_bind;
 } msim_fc_unit;
 
 typedef struct {
@@ -136,22 +137,29 @@ typedef struct {
     double sat_tol;
     int32_t start;
     int32_t count;
+    uint8_t force_bind;
 } msim_fc_bind;
 
 typedef struct {
     int32_t flow;
+    int32_t span;
     double w;
     int32_t next;
 } msim_fc_node;
 
 typedef struct {
     int32_t link_idx;
+    int32_t flow;
+    int32_t rem_u;
+    uint8_t unplaced;
     double demand;
+    double w;
+    double base_alpha;
 } msim_fc_span;
 
 static bool msim_fc_push_node(msim_fc_node **arr, int32_t *n, int32_t *cap,
                               int32_t *head, int32_t *tail,
-                              int32_t flow, double w)
+                              int32_t flow, int32_t span, double w)
 {
     int32_t idx;
     if (*n >= *cap) {
@@ -163,6 +171,7 @@ static bool msim_fc_push_node(msim_fc_node **arr, int32_t *n, int32_t *cap,
     }
     idx = (*n)++;
     (*arr)[idx].flow = flow;
+    (*arr)[idx].span = span;
     (*arr)[idx].w = w;
     (*arr)[idx].next = -1;
     if (*head < 0) {
@@ -176,7 +185,7 @@ static bool msim_fc_push_node(msim_fc_node **arr, int32_t *n, int32_t *cap,
 }
 
 static bool msim_fc_push_term(msim_fc_term **arr, int32_t *n, int32_t *cap,
-                              int32_t flow, double w)
+                              int32_t flow, int32_t span, double w)
 {
     if (*n >= *cap) {
         int32_t ncap = *cap > 0 ? (*cap * 2) : 64;
@@ -186,6 +195,7 @@ static bool msim_fc_push_term(msim_fc_term **arr, int32_t *n, int32_t *cap,
         *cap = ncap;
     }
     (*arr)[*n].flow = flow;
+    (*arr)[*n].span = span;
     (*arr)[*n].w = w;
     (*n)++;
     return true;
@@ -198,12 +208,21 @@ static void msim_fc_sort_terms(msim_fc_term *t, int32_t n)
         msim_fc_term key = t[i];
         j = i - 1;
         while (j >= 0 && (t[j].flow > key.flow
-                          || (t[j].flow == key.flow && t[j].w > key.w))) {
+                          || (t[j].flow == key.flow
+                              && (t[j].w > key.w
+                                  || (t[j].w == key.w && t[j].span > key.span))))) {
             t[j + 1] = t[j];
             j--;
         }
         t[j + 1] = key;
     }
+}
+
+static double msim_fc_term_val(const msim_fc_span *sp, double alpha_next, double base_c)
+{
+    return sp->base_alpha != 0.0
+        ? (base_c + (alpha_next - sp->base_alpha) * sp->w)
+        : (alpha_next * sp->w);
 }
 
 static uint64_t msim_fc_hash_unit(double cap, const msim_fc_term *terms, int32_t cnt)
@@ -256,9 +275,7 @@ static double msim_fc_sat_tol_exact(double cap, double res_v, double base_tol)
     if (res_v >= 0.0 && res_v <= cap) return base_tol;
     m = fabs(cap);
     if (fabs(res_v) > m) m = fabs(res_v);
-    if (1.0 > m) m = 1.0;
-    m = MSIM_FC_SAT_ULPS * msim_ulp(m);
-    return m > MSIM_FC_MIN_RATE ? m : MSIM_FC_MIN_RATE;
+    return MSIM_FC_SAT_ULPS * msim_ulp(m);
 }
 
 /* Native C11 implementation of ``fast_single_tier_coupled``.
@@ -293,6 +310,7 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
     double *r_ucap = NULL, *r_sattol = NULL, *r_bthresh = NULL;
     int32_t *r_cnt = NULL, *r_uoff = NULL;
     int32_t *r_fhead = NULL, *r_ftail = NULL, *r_fcnt = NULL;
+    uint8_t *r_has_unp = NULL;
     int32_t *u_head = NULL, *u_tail = NULL, *u_cnt = NULL, *r_umap_n = NULL;
     msim_fc_node *nodes = NULL;
     int32_t n_nodes = 0, cap_nodes = 0;
@@ -312,7 +330,7 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
 
     msim_fc_bind *binding = NULL;
     int32_t n_binding = 0;
-    int32_t *htab = NULL;
+    int32_t *htab = NULL, *shared_to_bind = NULL, *bind_to_rem = NULL;
 
     int32_t *deg = NULL;
     uint8_t *act_flag = NULL;
@@ -322,12 +340,13 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
     int32_t *act_idx = NULL, *next_act = NULL;
     int32_t *open_sh = NULL, *still_open = NULL, *next_open = NULL;
     int32_t *comm_off = NULL;
-    double *committed = NULL, *totals = NULL, *cand_tot = NULL;
+    double *base_comm = NULL, *committed = NULL, *totals = NULL, *cand_tot = NULL;
+    uint8_t *blocking = NULL, *failed_u = NULL, *span_redist = NULL;
     double *fsum_buf = NULL;
     int32_t fsum_cap = 0;
 
     int32_t *span_l = NULL, *span_nu = NULL;
-    uint8_t *span_full = NULL;
+    uint8_t *span_full = NULL, *span_unp = NULL;
 
     if (out_fault != NULL) { out_fault[0] = 0; out_fault[1] = 0; out_fault[2] = 0; }
     if (n_links > 0 && out_rate != NULL) {
@@ -351,22 +370,22 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
     r_fhead = (int32_t *)malloc((size_t)n_res * sizeof(int32_t));
     r_ftail = (int32_t *)malloc((size_t)n_res * sizeof(int32_t));
     r_fcnt = (int32_t *)calloc((size_t)n_res, sizeof(int32_t));
+    r_has_unp = (uint8_t *)calloc((size_t)n_res, sizeof(uint8_t));
     r_umap_n = (int32_t *)calloc((size_t)n_res, sizeof(int32_t));
     if (!r_ucap || !r_sattol || !r_bthresh || !r_cnt || !r_uoff
-            || !r_fhead || !r_ftail || !r_fcnt || !r_umap_n) {
+            || !r_fhead || !r_ftail || !r_fcnt || !r_has_unp || !r_umap_n) {
         out_fault[0] = 3; rc = -1; goto cleanup;
     }
 
     for (r = 0; r < n_res; r++) {
         int32_t cnt = res_units[r] > 1 ? res_units[r] : 1;
         double u_cap = res_rate[r] / (double)cnt;
-        double cap_scale = u_cap < 1.0 ? 1.0 : u_cap;
-        double u16 = MSIM_FC_SAT_ULPS * msim_ulp(cap_scale);
-        double u32 = MSIM_FC_SAT_ULPS * 2.0 * msim_ulp(cap_scale);
+        double u16 = MSIM_FC_SAT_ULPS * msim_ulp(u_cap);
+        double u32 = MSIM_FC_SAT_ULPS * 2.0 * msim_ulp(u_cap);
         r_cnt[r] = cnt;
         r_ucap[r] = u_cap;
-        r_sattol[r] = u16 > MSIM_FC_MIN_RATE ? u16 : MSIM_FC_MIN_RATE;
-        r_bthresh[r] = u_cap - (u32 > MSIM_FC_MIN_RATE ? u32 : MSIM_FC_MIN_RATE);
+        r_sattol[r] = u16;
+        r_bthresh[r] = u_cap - u32;
         r_fhead[r] = -1;
         r_ftail[r] = -1;
         r_uoff[r] = total_res_units;
@@ -388,8 +407,9 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
     span_l = (int32_t *)malloc((size_t)n_links * sizeof(int32_t));
     span_nu = (int32_t *)malloc((size_t)n_links * sizeof(int32_t));
     span_full = (uint8_t *)malloc((size_t)n_links * sizeof(uint8_t));
+    span_unp = (uint8_t *)malloc((size_t)n_links * sizeof(uint8_t));
     if (!flow_limits || !flow_span_off || !flow_spans
-            || !span_l || !span_nu || !span_full) {
+            || !span_l || !span_nu || !span_full || !span_unp) {
         out_fault[0] = 3; rc = -1; goto cleanup;
     }
     flow_span_off[0] = 0;
@@ -409,16 +429,17 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                 double amt = link_rem[l];
                 int32_t ri, cnt, n_u = 0;
                 double u_cap, denom;
-                uint8_t is_full = 0;
+                uint8_t is_full = 0, is_unp = 0;
                 if (amt <= 0.0) continue;
                 ri = link_res[l];
                 if (ri < 0 || ri >= n_res) { out_fault[0] = 3; rc = -1; goto cleanup; }
                 u_cap = r_ucap[ri];
                 cnt = r_cnt[ri];
-                if (u_cap <= MSIM_FC_MIN_RATE) { blocked = true; break; }
+                if (u_cap <= 0.0) { blocked = true; break; }
                 if (link_unplaced[l]) {
                     n_u = cnt;
                     is_full = 1;
+                    is_unp = cnt > 1 ? 1 : 0;
                 } else {
                     int32_t p0 = link_place_off[l], p1 = link_place_off[l + 1], p;
                     bool seq_ok = true;
@@ -443,6 +464,7 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                 span_l[ns] = l;
                 span_nu[ns] = n_u;
                 span_full[ns] = is_full;
+                span_unp[ns] = is_unp;
                 ns++;
             }
             if (blocked || ns == 0) continue;
@@ -464,14 +486,20 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                 int32_t li = span_l[i];
                 int32_t ri = link_res[li];
                 int32_t cnt = r_cnt[ri];
+                int32_t s_id = n_spans_tot++;
                 double demand = link_rem[li] / scale;
                 double weight = demand / (double)span_nu[i];
-                flow_spans[n_spans_tot].link_idx = li;
-                flow_spans[n_spans_tot].demand = demand;
-                n_spans_tot++;
+                flow_spans[s_id].link_idx = li;
+                flow_spans[s_id].flow = f_idx;
+                flow_spans[s_id].rem_u = span_nu[i];
+                flow_spans[s_id].unplaced = span_unp[i];
+                flow_spans[s_id].demand = demand;
+                flow_spans[s_id].w = weight;
+                flow_spans[s_id].base_alpha = 0.0;
+                if (span_unp[i]) r_has_unp[ri] = 1;
                 if (span_full[i]) {
                     if (!msim_fc_push_node(&nodes, &n_nodes, &cap_nodes,
-                                           &r_fhead[ri], &r_ftail[ri], f_idx, weight)) {
+                                           &r_fhead[ri], &r_ftail[ri], f_idx, s_id, weight)) {
                         out_fault[0] = 3; rc = -1; goto cleanup;
                     }
                     r_fcnt[ri]++;
@@ -484,7 +512,7 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                         if (u_cnt[base + pu] == 0) r_umap_n[ri]++;
                         if (!msim_fc_push_node(&nodes, &n_nodes, &cap_nodes,
                                                &u_head[base + pu], &u_tail[base + pu],
-                                               f_idx, weight)) {
+                                               f_idx, s_id, weight)) {
                             out_fault[0] = 3; rc = -1; goto cleanup;
                         }
                         u_cnt[base + pu]++;
@@ -495,17 +523,18 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
         } else {
             for (l = l0; l < l1; l++) {
                 double amt = link_rem[l], u_cap, demand, cap, limit;
-                int32_t ri, cnt, n_u = 0, f_idx;
-                uint8_t is_full = 0;
+                int32_t ri, cnt, n_u = 0, f_idx, s_id;
+                uint8_t is_full = 0, is_unp = 0;
                 if (amt <= 0.0) continue;
                 ri = link_res[l];
                 if (ri < 0 || ri >= n_res) { out_fault[0] = 3; rc = -1; goto cleanup; }
                 u_cap = r_ucap[ri];
                 cnt = r_cnt[ri];
-                if (u_cap <= MSIM_FC_MIN_RATE) continue;
+                if (u_cap <= 0.0) continue;
                 if (link_unplaced[l]) {
                     n_u = cnt;
                     is_full = 1;
+                    is_unp = cnt > 1 ? 1 : 0;
                 } else {
                     int32_t p0 = link_place_off[l], p1 = link_place_off[l + 1], p;
                     bool seq_ok = true;
@@ -530,15 +559,21 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                 if (limit <= 0.0) continue;
                 f_idx = n_flows++;
                 flow_limits[f_idx] = limit;
-                flow_spans[n_spans_tot].link_idx = l;
-                flow_spans[n_spans_tot].demand = demand;
-                n_spans_tot++;
-                flow_span_off[n_flows] = n_spans_tot;
+                s_id = n_spans_tot++;
                 {
                     double weight = demand / (double)n_u;
+                    flow_spans[s_id].link_idx = l;
+                    flow_spans[s_id].flow = f_idx;
+                    flow_spans[s_id].rem_u = n_u;
+                    flow_spans[s_id].unplaced = is_unp;
+                    flow_spans[s_id].demand = demand;
+                    flow_spans[s_id].w = weight;
+                    flow_spans[s_id].base_alpha = 0.0;
+                    flow_span_off[n_flows] = n_spans_tot;
+                    if (is_unp) r_has_unp[ri] = 1;
                     if (is_full) {
                         if (!msim_fc_push_node(&nodes, &n_nodes, &cap_nodes,
-                                               &r_fhead[ri], &r_ftail[ri], f_idx, weight)) {
+                                               &r_fhead[ri], &r_ftail[ri], f_idx, s_id, weight)) {
                             out_fault[0] = 3; rc = -1; goto cleanup;
                         }
                         r_fcnt[ri]++;
@@ -551,7 +586,7 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                             if (u_cnt[base + pu] == 0) r_umap_n[ri]++;
                             if (!msim_fc_push_node(&nodes, &n_nodes, &cap_nodes,
                                                    &u_head[base + pu], &u_tail[base + pu],
-                                                   f_idx, weight)) {
+                                                   f_idx, s_id, weight)) {
                                 out_fault[0] = 3; rc = -1; goto cleanup;
                             }
                             u_cnt[base + pu]++;
@@ -592,7 +627,8 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
             } else if (fcnt > 1) {
                 int32_t start = n_terms, nd;
                 for (nd = r_fhead[r]; nd >= 0; nd = nodes[nd].next) {
-                    if (!msim_fc_push_term(&terms, &n_terms, &cap_terms, nodes[nd].flow, nodes[nd].w)) {
+                    if (!msim_fc_push_term(&terms, &n_terms, &cap_terms,
+                                           nodes[nd].flow, nodes[nd].span, nodes[nd].w)) {
                         out_fault[0] = 3; rc = -1; goto cleanup;
                     }
                 }
@@ -605,6 +641,7 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                 shared[n_shared].res = r; shared[n_shared].unit = 0; shared[n_shared].cap = u_cap;
                 shared[n_shared].sat_tol = sat_tol; shared[n_shared].bind_thresh = bthresh;
                 shared[n_shared].start = start; shared[n_shared].count = n_terms - start;
+                shared[n_shared].force_bind = 0;
                 n_shared++;
             }
             continue;
@@ -634,7 +671,8 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                 } else {
                     int32_t start = n_terms, nd;
                     for (nd = u_head[base + u]; nd >= 0; nd = nodes[nd].next) {
-                        if (!msim_fc_push_term(&terms, &n_terms, &cap_terms, nodes[nd].flow, nodes[nd].w)) {
+                        if (!msim_fc_push_term(&terms, &n_terms, &cap_terms,
+                                               nodes[nd].flow, nodes[nd].span, nodes[nd].w)) {
                             out_fault[0] = 3; rc = -1; goto cleanup;
                         }
                     }
@@ -647,12 +685,45 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                     shared[n_shared].res = r; shared[n_shared].unit = u; shared[n_shared].cap = u_cap;
                     shared[n_shared].sat_tol = sat_tol; shared[n_shared].bind_thresh = bthresh;
                     shared[n_shared].start = start; shared[n_shared].count = n_terms - start;
+                    shared[n_shared].force_bind = 0;
                     n_shared++;
                 }
             }
             continue;
         }
-        /* Both full-placement flows and explicit partial-unit flows present. */
+        /* Flexible unplaced + partial explicit mix: emit every physical unit. */
+        if (r_has_unp[r] && cnt > 1) {
+            for (u = 0; u < cnt; u++) {
+                int32_t start = n_terms, nd, tcnt;
+                for (nd = r_fhead[r]; nd >= 0; nd = nodes[nd].next) {
+                    if (!msim_fc_push_term(&terms, &n_terms, &cap_terms,
+                                           nodes[nd].flow, nodes[nd].span, nodes[nd].w)) {
+                        out_fault[0] = 3; rc = -1; goto cleanup;
+                    }
+                }
+                for (nd = u_head[base + u]; nd >= 0; nd = nodes[nd].next) {
+                    if (!msim_fc_push_term(&terms, &n_terms, &cap_terms,
+                                           nodes[nd].flow, nodes[nd].span, nodes[nd].w)) {
+                        out_fault[0] = 3; rc = -1; goto cleanup;
+                    }
+                }
+                tcnt = n_terms - start;
+                if (u_cnt[base + u] > 0) msim_fc_sort_terms(terms + start, tcnt);
+                if (n_shared >= cap_shared) {
+                    int32_t ncap = cap_shared > 0 ? (cap_shared * 2) : 64;
+                    msim_fc_unit *next = (msim_fc_unit *)realloc(shared, (size_t)ncap * sizeof(msim_fc_unit));
+                    if (!next) { out_fault[0] = 3; rc = -1; goto cleanup; }
+                    shared = next; cap_shared = ncap;
+                }
+                shared[n_shared].res = r; shared[n_shared].unit = u; shared[n_shared].cap = u_cap;
+                shared[n_shared].sat_tol = sat_tol; shared[n_shared].bind_thresh = bthresh;
+                shared[n_shared].start = start; shared[n_shared].count = tcnt;
+                shared[n_shared].force_bind = 1;
+                n_shared++;
+            }
+            continue;
+        }
+        /* Both explicit full-unit flows and partial-unit flows present. */
         if (umap_n < cnt) {
             int32_t u_rep = 0;
             for (u = 0; u < cnt; u++) {
@@ -679,7 +750,8 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
             } else {
                 int32_t start = n_terms, nd;
                 for (nd = r_fhead[r]; nd >= 0; nd = nodes[nd].next) {
-                    if (!msim_fc_push_term(&terms, &n_terms, &cap_terms, nodes[nd].flow, nodes[nd].w)) {
+                    if (!msim_fc_push_term(&terms, &n_terms, &cap_terms,
+                                           nodes[nd].flow, nodes[nd].span, nodes[nd].w)) {
                         out_fault[0] = 3; rc = -1; goto cleanup;
                     }
                 }
@@ -692,6 +764,7 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                 shared[n_shared].res = r; shared[n_shared].unit = u_rep; shared[n_shared].cap = u_cap;
                 shared[n_shared].sat_tol = sat_tol; shared[n_shared].bind_thresh = bthresh;
                 shared[n_shared].start = start; shared[n_shared].count = n_terms - start;
+                shared[n_shared].force_bind = 0;
                 n_shared++;
             }
         }
@@ -700,12 +773,14 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
             if (u_cnt[base + u] == 0) continue;
             start = n_terms;
             for (nd = r_fhead[r]; nd >= 0; nd = nodes[nd].next) {
-                if (!msim_fc_push_term(&terms, &n_terms, &cap_terms, nodes[nd].flow, nodes[nd].w)) {
+                if (!msim_fc_push_term(&terms, &n_terms, &cap_terms,
+                                       nodes[nd].flow, nodes[nd].span, nodes[nd].w)) {
                     out_fault[0] = 3; rc = -1; goto cleanup;
                 }
             }
             for (nd = u_head[base + u]; nd >= 0; nd = nodes[nd].next) {
-                if (!msim_fc_push_term(&terms, &n_terms, &cap_terms, nodes[nd].flow, nodes[nd].w)) {
+                if (!msim_fc_push_term(&terms, &n_terms, &cap_terms,
+                                       nodes[nd].flow, nodes[nd].span, nodes[nd].w)) {
                     out_fault[0] = 3; rc = -1; goto cleanup;
                 }
             }
@@ -720,6 +795,7 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
             shared[n_shared].res = r; shared[n_shared].unit = u; shared[n_shared].cap = u_cap;
             shared[n_shared].sat_tol = sat_tol; shared[n_shared].bind_thresh = bthresh;
             shared[n_shared].start = start; shared[n_shared].count = tcnt;
+            shared[n_shared].force_bind = 0;
             n_shared++;
         }
     }
@@ -742,34 +818,52 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
         while (hcap < n_shared * 2) hcap *= 2;
         htab = (int32_t *)malloc((size_t)hcap * sizeof(int32_t));
         binding = (msim_fc_bind *)malloc((size_t)n_shared * sizeof(msim_fc_bind));
-        if (!htab || !binding) { out_fault[0] = 3; rc = -1; goto cleanup; }
+        shared_to_bind = (int32_t *)malloc((size_t)n_shared * sizeof(int32_t));
+        if (!htab || !binding || !shared_to_bind) { out_fault[0] = 3; rc = -1; goto cleanup; }
         for (i = 0; i < hcap; i++) htab[i] = -1;
+        for (i = 0; i < n_shared; i++) shared_to_bind[i] = -1;
 
         for (i = 0; i < n_shared; i++) {
             const msim_fc_unit *su = &shared[i];
             const msim_fc_term *ut = terms + su->start;
-            double max_tot = msim_fc_unit_sum(ut, su->count, flow_limits, fsum_buf);
-            if (max_tot > su->bind_thresh) {
-                uint64_t h = msim_fc_hash_unit(su->cap, ut, su->count);
-                uint32_t mask = (uint32_t)(hcap - 1);
-                uint32_t pos = (uint32_t)h & mask;
-                bool dup = false;
-                while (htab[pos] >= 0) {
-                    const msim_fc_bind *b = &binding[htab[pos]];
-                    if (msim_fc_same_unit(su->cap, ut, su->count,
-                                          b->cap, terms + b->start, b->count)) {
-                        dup = true;
-                        break;
+            if (su->force_bind) {
+                shared_to_bind[i] = n_binding;
+                binding[n_binding].cap = su->cap;
+                binding[n_binding].sat_tol = su->sat_tol;
+                binding[n_binding].start = su->start;
+                binding[n_binding].count = su->count;
+                binding[n_binding].force_bind = 1;
+                n_binding++;
+                continue;
+            }
+            {
+                double max_tot = msim_fc_unit_sum(ut, su->count, flow_limits, fsum_buf);
+                if (max_tot > su->bind_thresh) {
+                    uint64_t h = msim_fc_hash_unit(su->cap, ut, su->count);
+                    uint32_t mask = (uint32_t)(hcap - 1);
+                    uint32_t pos = (uint32_t)h & mask;
+                    int32_t hit = -1;
+                    while (htab[pos] >= 0) {
+                        const msim_fc_bind *b = &binding[htab[pos]];
+                        if (!b->force_bind && msim_fc_same_unit(
+                                su->cap, ut, su->count,
+                                b->cap, terms + b->start, b->count)) {
+                            hit = htab[pos];
+                            break;
+                        }
+                        pos = (pos + 1u) & mask;
                     }
-                    pos = (pos + 1u) & mask;
-                }
-                if (!dup) {
-                    htab[pos] = n_binding;
-                    binding[n_binding].cap = su->cap;
-                    binding[n_binding].sat_tol = su->sat_tol;
-                    binding[n_binding].start = su->start;
-                    binding[n_binding].count = su->count;
-                    n_binding++;
+                    if (hit < 0) {
+                        hit = n_binding;
+                        htab[pos] = hit;
+                        binding[n_binding].cap = su->cap;
+                        binding[n_binding].sat_tol = su->sat_tol;
+                        binding[n_binding].start = su->start;
+                        binding[n_binding].count = su->count;
+                        binding[n_binding].force_bind = 0;
+                        n_binding++;
+                    }
+                    shared_to_bind[i] = hit;
                 }
             }
         }
@@ -779,11 +873,15 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
             deg = (int32_t *)calloc((size_t)n_flows, sizeof(int32_t));
             act_flag = (uint8_t *)calloc((size_t)n_flows, sizeof(uint8_t));
             rem_units = (msim_fc_bind *)malloc((size_t)n_binding * sizeof(msim_fc_bind));
-            if (!deg || !act_flag || !rem_units) { out_fault[0] = 3; rc = -1; goto cleanup; }
+            bind_to_rem = (int32_t *)malloc((size_t)n_binding * sizeof(int32_t));
+            if (!deg || !act_flag || !rem_units || !bind_to_rem) {
+                out_fault[0] = 3; rc = -1; goto cleanup;
+            }
             for (i = 0; i < n_flows; i++) alphas[i] = 0.0;
             for (i = 0; i < n_binding; i++) {
                 int32_t k;
                 const msim_fc_term *ut = terms + binding[i].start;
+                bind_to_rem[i] = -1;
                 for (k = 0; k < binding[i].count; k++) deg[ut[k].flow]++;
             }
             for (i = 0; i < n_flows; i++) {
@@ -795,10 +893,12 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                 const msim_fc_bind *bu = &binding[i];
                 const msim_fc_term *ut = terms + bu->start;
                 int32_t n_t = bu->count, k;
-                bool iso = true;
-                for (k = 0; k < n_t; k++) {
+                bool iso = !bu->force_bind;
+                for (k = 0; k < n_t && iso; k++) {
                     int32_t f = ut[k].flow;
-                    if (deg[f] != 1 || !act_flag[f]) { iso = false; break; }
+                    if (deg[f] != 1 || !act_flag[f] || flow_spans[ut[k].span].unplaced) {
+                        iso = false;
+                    }
                 }
                 if (iso) {
                     double slope, denom, b_val;
@@ -840,6 +940,7 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                         if (solved) continue;
                     }
                 }
+                bind_to_rem[i] = n_rem;
                 rem_units[n_rem++] = *bu;
             }
 
@@ -853,8 +954,12 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                 comm_off = (int32_t *)malloc((size_t)(n_rem + 1) * sizeof(int32_t));
                 totals = (double *)calloc((size_t)n_rem, sizeof(double));
                 cand_tot = (double *)malloc((size_t)n_rem * sizeof(double));
+                blocking = (uint8_t *)calloc((size_t)n_rem, sizeof(uint8_t));
+                failed_u = (uint8_t *)calloc((size_t)n_rem, sizeof(uint8_t));
+                span_redist = (uint8_t *)calloc((size_t)(n_spans_tot > 0 ? n_spans_tot : 1), sizeof(uint8_t));
                 if (!act_idx || !next_act || !open_sh || !still_open || !next_open
-                        || !comm_off || !totals || !cand_tot) {
+                        || !comm_off || !totals || !cand_tot
+                        || !blocking || !failed_u || !span_redist) {
                     out_fault[0] = 3; rc = -1; goto cleanup;
                 }
                 for (i = 0; i < n_flows; i++) if (act_flag[i]) act_idx[n_act++] = i;
@@ -864,51 +969,32 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                     tot_comm += rem_units[i].count;
                 }
                 comm_off[n_rem] = tot_comm;
+                base_comm = (double *)calloc((size_t)(tot_comm > 0 ? tot_comm : 1), sizeof(double));
                 committed = (double *)calloc((size_t)(tot_comm > 0 ? tot_comm : 1), sizeof(double));
-                if (!committed) { out_fault[0] = 3; rc = -1; goto cleanup; }
+                if (!base_comm || !committed) { out_fault[0] = 3; rc = -1; goto cleanup; }
 
                 while (n_act > 0 && n_open > 0) {
-                    double bound_limit = INFINITY, headroom = INFINITY, delta;
+                    double bound_limit = INFINITY, headroom = INFINITY, raw_delta, delta;
                     int32_t n_still = 0, s_pos, attempt, n_cand = 0;
-                    bool advanced = false, froze_any = false;
+                    bool advanced = false, froze_any = false, any_redist = false;
                     int32_t n_next_open = 0, n_next_act = 0;
 
                     for (s_pos = 0; s_pos < n_open; s_pos++) {
                         int32_t s_idx = open_sh[s_pos];
                         const msim_fc_bind *ru = &rem_units[s_idx];
                         const msim_fc_term *ut = terms + ru->start;
-                        if (ru->count == 2) {
-                            int32_t f0 = ut[0].flow, f1 = ut[1].flow;
-                            double w0 = ut[0].w, w1 = ut[1].w;
-                            uint8_t a0 = act_flag[f0], a1 = act_flag[f1];
-                            double slope, denom;
-                            if (!a0 && !a1) continue;
+                        int32_t cnt_w = 0, k;
+                        for (k = 0; k < ru->count; k++) {
+                            if (act_flag[ut[k].flow]) fsum_buf[cnt_w++] = flow_spans[ut[k].span].w;
+                        }
+                        if (cnt_w > 0) {
+                            double slope = (cnt_w == 1) ? fsum_buf[0]
+                                : (cnt_w == 2 ? (fsum_buf[0] + fsum_buf[1]) : msim_fsum(fsum_buf, cnt_w));
                             still_open[n_still++] = s_idx;
-                            if (a0 && a1) {
-                                slope = w0 + w1;
-                                denom = slope > 0.0 ? nextafter(slope, INFINITY) : 0.0;
-                            } else {
-                                slope = a0 ? w0 : w1;
-                                denom = slope;
-                            }
-                            if (denom > 0.0) {
+                            if (slope > 0.0) {
+                                double denom = (cnt_w == 1) ? slope : nextafter(slope, INFINITY);
                                 double b = (ru->cap - totals[s_idx]) / denom;
                                 if (b < bound_limit) bound_limit = b;
-                            }
-                        } else {
-                            int32_t cnt_w = 0, k;
-                            for (k = 0; k < ru->count; k++) {
-                                if (act_flag[ut[k].flow]) fsum_buf[cnt_w++] = ut[k].w;
-                            }
-                            if (cnt_w > 0) {
-                                double slope;
-                                still_open[n_still++] = s_idx;
-                                slope = (cnt_w == 1) ? fsum_buf[0] : msim_fsum(fsum_buf, cnt_w);
-                                if (slope > 0.0) {
-                                    double denom = (cnt_w == 1) ? slope : nextafter(slope, INFINITY);
-                                    double b = (ru->cap - totals[s_idx]) / denom;
-                                    if (b < bound_limit) bound_limit = b;
-                                }
                             }
                         }
                     }
@@ -923,42 +1009,53 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                         double hr = flow_limits[fi] - alphas[fi];
                         if (hr < headroom) headroom = hr;
                     }
-                    delta = bound_limit < headroom ? bound_limit : headroom;
-                    if (!isfinite(delta) || delta < 0.0) break;
+                    raw_delta = bound_limit < headroom ? bound_limit : headroom;
+                    delta = raw_delta;
+                    if (!isfinite(raw_delta) || raw_delta < 0.0) break;
 
+                    for (s_pos = 0; s_pos < n_open; s_pos++) blocking[open_sh[s_pos]] = 0;
                     for (attempt = 0; attempt < MSIM_FC_MAX_ATTEMPTS; attempt++) {
-                        bool unsafe = false;
+                        bool cap_fail = false, any_u_fail = false;
                         if (delta <= 0.0) { n_cand = 0; break; }
                         for (i = 0; i < n_act; i++) {
                             int32_t fi = act_idx[i];
-                            if (alphas[fi] + delta > flow_limits[fi]) { unsafe = true; break; }
+                            if (alphas[fi] + delta > flow_limits[fi]) { cap_fail = true; break; }
                         }
                         n_cand = 0;
-                        if (!unsafe) {
+                        if (!cap_fail) {
                             for (s_pos = 0; s_pos < n_open; s_pos++) {
                                 int32_t s_idx = open_sh[s_pos];
                                 const msim_fc_bind *ru = &rem_units[s_idx];
                                 const msim_fc_term *ut = terms + ru->start;
                                 const double *cs = committed + comm_off[s_idx];
+                                const double *bc = base_comm + comm_off[s_idx];
                                 double tot;
-                                if (ru->count == 2) {
-                                    int32_t f0 = ut[0].flow, f1 = ut[1].flow;
-                                    double v0 = act_flag[f0] ? ((alphas[f0] + delta) * ut[0].w) : cs[0];
-                                    double v1 = act_flag[f1] ? ((alphas[f1] + delta) * ut[1].w) : cs[1];
-                                    tot = v0 + v1;
-                                } else {
-                                    int32_t k;
-                                    for (k = 0; k < ru->count; k++) {
-                                        int32_t fk = ut[k].flow;
-                                        fsum_buf[k] = act_flag[fk] ? ((alphas[fk] + delta) * ut[k].w) : cs[k];
-                                    }
-                                    tot = (ru->count == 1) ? fsum_buf[0] : msim_fsum(fsum_buf, ru->count);
+                                int32_t k;
+                                failed_u[s_idx] = 0;
+                                for (k = 0; k < ru->count; k++) {
+                                    int32_t fk = ut[k].flow;
+                                    fsum_buf[k] = act_flag[fk]
+                                        ? msim_fc_term_val(&flow_spans[ut[k].span], alphas[fk] + delta, bc[k])
+                                        : cs[k];
                                 }
-                                if (tot > ru->cap) { unsafe = true; break; }
-                                cand_tot[n_cand++] = tot;
+                                tot = (ru->count == 1) ? fsum_buf[0]
+                                    : (ru->count == 2 ? (fsum_buf[0] + fsum_buf[1]) : msim_fsum(fsum_buf, ru->count));
+                                if (tot > ru->cap) {
+                                    failed_u[s_idx] = 1;
+                                    any_u_fail = true;
+                                } else {
+                                    cand_tot[s_pos] = tot;
+                                }
+                            }
+                            if (!any_u_fail) n_cand = n_open;
+                        }
+                        if (!cap_fail && !any_u_fail) break;
+                        if (any_u_fail) {
+                            for (s_pos = 0; s_pos < n_open; s_pos++) {
+                                int32_t s_idx = open_sh[s_pos];
+                                blocking[s_idx] = failed_u[s_idx];
                             }
                         }
-                        if (!unsafe) break;
                         delta = (attempt < MSIM_FC_NEXTAFTER_STEPS)
                             ? nextafter(delta, 0.0) : (delta * MSIM_FC_HALF_STEP);
                         if (attempt + 1 == MSIM_FC_MAX_ATTEMPTS) {
@@ -981,10 +1078,13 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                             const msim_fc_bind *ru = &rem_units[s_idx];
                             const msim_fc_term *ut = terms + ru->start;
                             double *cs = committed + comm_off[s_idx];
+                            const double *bc = base_comm + comm_off[s_idx];
                             int32_t k;
                             for (k = 0; k < ru->count; k++) {
                                 int32_t fk = ut[k].flow;
-                                if (act_flag[fk]) cs[k] = alphas[fk] * ut[k].w;
+                                if (act_flag[fk]) {
+                                    cs[k] = msim_fc_term_val(&flow_spans[ut[k].span], alphas[fk], bc[k]);
+                                }
                             }
                             if (s_pos < n_cand) totals[s_idx] = cand_tot[s_pos];
                         }
@@ -993,19 +1093,65 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                     for (s_pos = 0; s_pos < n_open; s_pos++) {
                         int32_t s_idx = open_sh[s_pos];
                         const msim_fc_bind *ru = &rem_units[s_idx];
+                        const msim_fc_term *ut = terms + ru->start;
                         double res_v = ru->cap - totals[s_idx];
                         double tol = msim_fc_sat_tol_exact(ru->cap, res_v, ru->sat_tol);
-                        if (res_v <= tol) {
-                            const msim_fc_term *ut = terms + ru->start;
-                            int32_t k;
-                            for (k = 0; k < ru->count; k++) {
-                                if (act_flag[ut[k].flow]) {
-                                    act_flag[ut[k].flow] = 0;
-                                    froze_any = true;
+                        bool has_uncapped = false, unit_bound;
+                        int32_t k;
+                        for (k = 0; k < ru->count; k++) {
+                            int32_t fk = ut[k].flow;
+                            if (act_flag[fk]) {
+                                double lim = flow_limits[fk], al = alphas[fk];
+                                double m = fabs(lim) >= fabs(al) ? fabs(lim) : fabs(al);
+                                if (al < lim - MSIM_FC_CAP_ULPS * msim_ulp(m)) {
+                                    has_uncapped = true;
+                                    break;
                                 }
                             }
-                        } else {
+                        }
+                        unit_bound = (res_v <= 0.0)
+                            || ((blocking[s_idx] || has_uncapped) && res_v <= tol);
+                        if (!unit_bound) {
                             next_open[n_next_open++] = s_idx;
+                            continue;
+                        }
+                        for (k = 0; k < ru->count; k++) {
+                            int32_t fk = ut[k].flow;
+                            int32_t sid = ut[k].span;
+                            if (!act_flag[fk]) continue;
+                            froze_any = true;
+                            if (!flow_spans[sid].unplaced) {
+                                act_flag[fk] = 0;
+                            } else {
+                                flow_spans[sid].rem_u -= 1;
+                                if (flow_spans[sid].rem_u <= 0) {
+                                    act_flag[fk] = 0;
+                                } else {
+                                    span_redist[sid] = 1;
+                                    any_redist = true;
+                                }
+                            }
+                        }
+                    }
+                    if (any_redist) {
+                        for (s_pos = 0; s_pos < n_next_open; s_pos++) {
+                            int32_t os_idx = next_open[s_pos];
+                            const msim_fc_bind *ru = &rem_units[os_idx];
+                            const msim_fc_term *ut = terms + ru->start;
+                            const double *cs = committed + comm_off[os_idx];
+                            double *bc = base_comm + comm_off[os_idx];
+                            int32_t k;
+                            for (k = 0; k < ru->count; k++) {
+                                if (span_redist[ut[k].span]) bc[k] = cs[k];
+                            }
+                        }
+                        for (i = 0; i < n_spans_tot; i++) {
+                            if (!span_redist[i]) continue;
+                            span_redist[i] = 0;
+                            if (act_flag[flow_spans[i].flow]) {
+                                flow_spans[i].base_alpha = alphas[flow_spans[i].flow];
+                                flow_spans[i].w = flow_spans[i].demand / (double)flow_spans[i].rem_u;
+                            }
                         }
                     }
                     memcpy(open_sh, next_open, (size_t)n_next_open * sizeof(int32_t));
@@ -1046,7 +1192,16 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
     }
     for (i = 0; i < n_shared; i++) {
         const msim_fc_unit *su = &shared[i];
-        double tot_u = msim_fc_unit_sum(terms + su->start, su->count, alphas, fsum_buf);
+        int32_t b_idx = shared_to_bind != NULL ? shared_to_bind[i] : -1;
+        int32_t r_idx = (b_idx >= 0 && bind_to_rem != NULL) ? bind_to_rem[b_idx] : -1;
+        double tot_u;
+        if (r_idx >= 0) {
+            const double *cs = committed + comm_off[r_idx];
+            int32_t cnt_c = rem_units[r_idx].count;
+            tot_u = (cnt_c == 1) ? cs[0] : (cnt_c == 2 ? (cs[0] + cs[1]) : msim_fsum(cs, cnt_c));
+        } else {
+            tot_u = msim_fc_unit_sum(terms + su->start, su->count, alphas, fsum_buf);
+        }
         if (tot_u > su->cap) {
             out_fault[0] = 2;
             out_fault[1] = su->res;
@@ -1069,19 +1224,20 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
     }
 
 cleanup:
-    free(span_full); free(span_nu); free(span_l);
+    free(span_unp); free(span_full); free(span_nu); free(span_l);
     free(fsum_buf);
-    free(cand_tot); free(totals); free(committed); free(comm_off);
+    free(span_redist); free(failed_u); free(blocking);
+    free(cand_tot); free(totals); free(committed); free(base_comm); free(comm_off);
     free(next_open); free(still_open); free(open_sh);
     free(next_act); free(act_idx);
     free(rem_units); free(act_flag); free(deg);
-    free(htab); free(binding);
+    free(bind_to_rem); free(shared_to_bind); free(htab); free(binding);
     free(alphas);
     free(terms); free(shared); free(privs);
     free(flow_spans); free(flow_span_off); free(flow_limits);
     free(nodes);
     free(u_cnt); free(u_tail); free(u_head);
-    free(r_umap_n); free(r_fcnt); free(r_ftail); free(r_fhead);
+    free(r_umap_n); free(r_has_unp); free(r_fcnt); free(r_ftail); free(r_fhead);
     free(r_uoff); free(r_cnt); free(r_bthresh); free(r_sattol); free(r_ucap);
     return rc;
 }

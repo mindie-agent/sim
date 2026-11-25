@@ -15,18 +15,25 @@ from typing import Mapping
 
 from ..ownership import unit_rates
 from .arbiter_tiered import (
-    _lockstep_coupled, _max_min_rates, _priority_tiers, _progressive_unit_fill,
-    _residual_unit_rates, _tier_flows, _tiered_coupled, _tiered_simple,
-    _unit_span, fair_rates,
+    _lockstep_coupled, _max_min_rates, _member_placements, _priority_tiers,
+    _progressive_unit_fill, _residual_unit_rates, _tier_flows, _tiered_coupled,
+    _tiered_simple, _unit_span, fair_rates,
 )
 
 
-def fifo_winner(caps: Mapping[int, float], tasks) -> int:
-    """Non-preemptive owner: actual start, then priority, then preserved FIFO order."""
+def fifo_winner(caps: Mapping[int, float], tasks, resource_name: str | None = None) -> int:
+    """Non-preemptive owner: active FIFO holder, then priority, then arrival/FIFO order."""
+    if resource_name is None:
+        return min(caps, key=lambda key: (
+            tasks[key].start is None,
+            tasks[key].start if tasks[key].start is not None else math.inf,
+            tasks[key].priority,
+            tasks[key].fifo_order if getattr(tasks[key], "fifo_order", None) is not None else (key, 0)))
     return min(caps, key=lambda key: (
+        tasks[key].service.get(resource_name, 0.0) <= 0.0,
+        tasks[key].priority,
         tasks[key].start is None,
         tasks[key].start if tasks[key].start is not None else math.inf,
-        tasks[key].priority,
         tasks[key].fifo_order if getattr(tasks[key], "fifo_order", None) is not None else (key, 0)))
 
 
@@ -37,10 +44,10 @@ def _fast_eligible_task(resources, task) -> bool:
     rem = task.remaining
     if not rem:
         return True
+    if getattr(task, "cohort_size", 1) > 1:
+        return False
     pl = task.placement
     if task.coupled:
-        if getattr(task, "cohort_size", 1) > 1:
-            return False
         first_u = first_tot = 0
         for rname in rem:
             res = resources[rname]
@@ -70,6 +77,7 @@ def _needs_unit_tier_solver(resources, tasks, active) -> bool:
     multi_prio = False
     any_coupled = False
     any_fair = False
+    any_uncoupled_cohort = False
     for key in active:
         task = tasks[key]
         rem = task.remaining
@@ -95,6 +103,8 @@ def _needs_unit_tier_solver(resources, tasks, active) -> bool:
                         first_u, first_tot = u_len, res.units
                     elif u_len * first_tot != first_u * res.units:
                         return True
+        elif getattr(task, "cohort_size", 1) > 1:
+            any_uncoupled_cohort = True
         for rname, amt in rem.items():
             if amt <= 0.0:
                 continue
@@ -105,6 +115,8 @@ def _needs_unit_tier_solver(resources, tasks, active) -> bool:
                 units = pl.get(rname)
                 if units is not None and len(units) < res.units:
                     return True
+    if any_coupled and any_uncoupled_cohort:
+        return True
     return multi_prio and (any_coupled or any_fair)
 
 
@@ -162,6 +174,28 @@ def _partition_coupled_components(resources, tasks, active):
     return coupled_keys, uncoupled_keys
 
 
+def _expand_cohort_contenders(tasks, caps: Mapping[int, float], name: str):
+    """Expand uncoupled ``cohort_size > 1`` tasks into literal member contenders."""
+    exp_caps: dict[tuple[int, int], float] = {}
+    exp_pinned: dict[tuple[int, int], tuple[int, ...]] = {}
+    for key, cap in caps.items():
+        task = tasks[key]
+        cohort = max(1, int(getattr(task, "cohort_size", 1) or 1))
+        if cohort == 1:
+            exp_caps[(key, 0)] = cap
+            pl = task.placement
+            if pl and name in pl:
+                exp_pinned[(key, 0)] = pl[name]
+            continue
+        member_cap = cap / cohort
+        for idx, m_units in enumerate(_member_placements(task, name, cohort)):
+            m_key = (key, idx)
+            exp_caps[m_key] = member_cap
+            if m_units is not None:
+                exp_pinned[m_key] = m_units
+    return exp_caps, exp_pinned
+
+
 def _independent_component_rates(resources, tasks, active, placed_active):
     contenders: dict[str, dict[int, float]] = {}
     for key in sorted(active):
@@ -179,7 +213,7 @@ def _independent_component_rates(resources, tasks, active, placed_active):
     for name, caps in contenders.items():
         resource = resources[name]
         if resource.policy == "fifo":
-            winner = fifo_winner(caps, tasks)
+            winner = fifo_winner(caps, tasks, name)
             result[name] = {winner: min(resource.rate, caps[winner])}
             continue
         n_c = len(caps)
@@ -198,6 +232,18 @@ def _independent_component_rates(resources, tasks, active, placed_active):
                     continue
             r_rate = resource.rate
             result[name] = {key: cap if cap < r_rate else r_rate}
+            continue
+        if any(getattr(tasks[key], "cohort_size", 1) > 1 for key in caps):
+            exp_caps, exp_pinned = _expand_cohort_contenders(tasks, caps, name)
+            exp_rates = (
+                unit_rates(resource.rate, resource.units, exp_caps, exp_pinned)
+                if (exp_pinned and resource.units > 1)
+                else _max_min_rates(resource.rate, exp_caps)
+            )
+            agg: dict[int, float] = {}
+            for (orig_key, _idx), rate in exp_rates.items():
+                agg[orig_key] = agg.get(orig_key, 0.0) + rate
+            result[name] = agg
             continue
         if not probe_placed or resource.units == 1:
             result[name] = _max_min_rates(resource.rate, caps)
