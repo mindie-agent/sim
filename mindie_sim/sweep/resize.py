@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
+from dataclasses import replace
 import math
 from typing import Any
 
@@ -354,21 +355,44 @@ def enumerate_parallel_candidates(
     return candidates
 
 
-def resolve_ranks_per_node(parsed: CaseSpec, num_devices: int) -> int:
-    original = int(parsed.machine.ranks_per_node)
-    if original >= 1:
-        return min(num_devices, original)
+def _sku_native_ranks_per_node(parsed: CaseSpec) -> int:
     from mindie_sim.backends.ascend import ASCEND_TOPOLOGY_PRESETS
     topology = dict(getattr(parsed.machine, "topology_options", ()))
+    phys = topology.get("physical_ranks_per_node")
+    if phys is not None and int(phys) >= 1:
+        return int(phys)
     preset = topology.get("topology_preset")
     preset_ranks = int(ASCEND_TOPOLOGY_PRESETS.get(
         str(preset), {}).get("ranks_per_node", 0) or 0)
     if preset_ranks >= 1:
-        return min(num_devices, preset_ranks)
-    fallback = (A3_RANKS_PER_NODE if (
+        return preset_ranks
+    return (A3_RANKS_PER_NODE if (
         parsed.machine.arch_family == "A3"
         or parsed.machine.dies_per_package >= 2) else DEFAULT_RANKS_PER_NODE)
-    return min(num_devices, fallback)
+
+
+def resolve_ranks_per_node(
+    parsed: CaseSpec, num_devices: int,
+    raw_case: CaseSpec | Mapping[str, Any] | None = None,
+) -> int:
+    native = _sku_native_ranks_per_node(parsed)
+    if isinstance(raw_case, Mapping) and isinstance(
+            raw_case.get("machine"), Mapping):
+        raw_rpn = raw_case["machine"].get("ranks_per_node")
+        if raw_rpn is not None:
+            return min(num_devices, max(1, int(raw_rpn)))
+        return min(num_devices, native)
+    topology = dict(getattr(parsed.machine, "topology_options", ()))
+    explicit = topology.get("ranks_per_node_explicit")
+    original = int(parsed.machine.ranks_per_node)
+    if explicit is True:
+        return min(num_devices, original) if original >= 1 else min(num_devices, native)
+    if explicit is False:
+        return min(num_devices, native)
+    if original >= 1 and not (
+            original == len(parsed.machine.dies) and original < native):
+        return min(num_devices, original)
+    return min(num_devices, native)
 
 
 def project_transfer_channel_input(
@@ -450,10 +474,25 @@ def materialize_machine_for_devices(
     original_count = len(parsed.machine.dies)
     if original_count == num_devices:
         return parsed.machine
+    if not parsed.machine.homogeneous:
+        if num_devices > original_count:
+            raise ModelingError(
+                f"resize_heterogeneous_expansion_undeclared:{original_count}->{num_devices}")
+        selected_dies = tuple(parsed.machine.dies[:num_devices])
+        selected_ranks = {int(die.rank) for die in selected_dies}
+        induced_links = tuple(
+            link for link in parsed.machine.links
+            if link.members and all(int(m) in selected_ranks for m in link.members)
+        )
+        ranks_per_node = min(
+            num_devices, resolve_ranks_per_node(parsed, num_devices, raw_case=raw_case))
+        return replace(
+            parsed.machine, dies=selected_dies, links=induced_links,
+            ranks_per_node=ranks_per_node)
     base_device = deepcopy(parsed.machine.dies[0].to_dict())
     for key in ("rank", "node", "package"):
         base_device.pop(key, None)
-    ranks_per_node = resolve_ranks_per_node(parsed, num_devices)
+    ranks_per_node = resolve_ranks_per_node(parsed, num_devices, raw_case=raw_case)
     sku = parsed.machine.sku
     assumptions = dict(getattr(parsed.machine, "assumptions", ()) or ())
     profiles = ascend_profiles()
@@ -473,6 +512,10 @@ def materialize_machine_for_devices(
     }
     raw_machine.update({key: deepcopy(value) for key, value in
                         getattr(parsed.machine, "topology_options", ())})
+    if (isinstance(raw_case, Mapping)
+            and isinstance(raw_case.get("machine"), Mapping)
+            and raw_case["machine"].get("ranks_per_node") is None):
+        raw_machine.pop("ranks_per_node_explicit", None)
     links = _first_link_by_channel(parsed.machine)
     channels: dict[str, dict[str, Any]] = {}
     for name, value in getattr(parsed.machine, "transfer_channels", ()):
