@@ -31,10 +31,10 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from dataclasses import dataclass, replace
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, Work
-from mindie_sim.prediction.ownership import read_role
+from mindie_sim.prediction.ownership import read_role, unit_group
 from mindie_sim.prediction.program import (
     KernelProgram,
     ParallelProgram,
@@ -42,14 +42,69 @@ from mindie_sim.prediction.program import (
     RecipeContext,
     Stage,
 )
+from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, check_live_buffers
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
-from mindie_sim.prediction.operators.vector.mixed_core import placement, require_pair, phase_stages
+from mindie_sim.prediction.operators.kda.kda_source import parse_gate_lower_bound
+from mindie_sim.prediction.operators.vector.mixed_core import (
+    phase_stages,
+    placement,
+    require_pair,
+    resident,
+)
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_PREPARE_REPO = "vllm-ascend-v41-private"
+_VLLM_ASCEND_PREPARE_REV = "ae923905948f360f4b7ab06df52d0789a0c9316e"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        _VLLM_ASCEND_PREPARE_REPO,
+        _VLLM_ASCEND_PREPARE_REV,
+        "csrc/attention/chunk_kda_fwd/op_kernel/chunk_kda_fwd.cpp",
+        "0ea787730736f4ed92a35e3bafa6e54417c84716fc6aed381a339259abfa74d0",
+    ),
+    SourceRef(
+        _VLLM_ASCEND_PREPARE_REPO,
+        _VLLM_ASCEND_PREPARE_REV,
+        "csrc/attention/chunk_kda_fwd/op_kernel/chunk_kda_fwd_common.h",
+        "e98c17e528d673a9b6c2f0bbbfce83746bcccf0afaeb413ea0ac41a2809e74f8",
+    ),
+    SourceRef(
+        _VLLM_ASCEND_PREPARE_REPO,
+        _VLLM_ASCEND_PREPARE_REV,
+        "csrc/attention/kda_gate_cumsum/op_kernel/kda_gate_cumsum_kernel.h",
+        "8abaec8e5cec1344e2fe8047271816115b20cbcf41463dc69195ae859f96162e",
+    ),
+    SourceRef(
+        _VLLM_ASCEND_PREPARE_REPO,
+        _VLLM_ASCEND_PREPARE_REV,
+        "csrc/attention/chunk_kda_fwd/op_kernel/arch35/chunk_kda_fwd_prepare.h",
+        "b808a1a1c6e21c0a3098433764675a1f507b04bc8f77d22eaffedd2c4de866c7",
+    ),
+    SourceRef(
+        _VLLM_ASCEND_PREPARE_REPO,
+        _VLLM_ASCEND_PREPARE_REV,
+        "csrc/attention/chunk_kda_fwd/op_host/chunk_kda_fwd_tiling.cpp",
+        "72148ca10b26ba4f34919c11e973c3bbcd696cfbc9a938c3cc3bf724e41f813c",
+    ),
+    SourceRef(
+        _VLLM_ASCEND_PREPARE_REPO,
+        _VLLM_ASCEND_PREPARE_REV,
+        "csrc/attention/chunk_kda_fwd/op_host/arch35/chunk_kda_fwd_tiling_impl.h",
+        "e7542eff7113d97ce069b7ec4f57b01809f4894f1e3b5e801add5f557991fe59",
+    ),
+)
 
 SCORE_BLOCK_COUNT = 3
 SOLVE_DIAG_BLOCK_TOKENS = 16
 SOLVE_MERGE_BLOCK_TOKENS = 32
 SOLVE_DIAG_MERGES = 4
+SOLVE_MCH_ITERS = 3
+SOLVE_MCH_DIAG_GEMMS_PER_BLOCK = 1 + SOLVE_MCH_ITERS + (SOLVE_MCH_ITERS - 1)
+SOLVE_MCH_DIAG_GEMMS = SOLVE_DIAG_MERGES * SOLVE_MCH_DIAG_GEMMS_PER_BLOCK
+SOLVE_MCH_TILES = (SOLVE_DIAG_BLOCK_TOKENS,) * SOLVE_MCH_DIAG_GEMMS
+SOLVE_MCH_FP32_FLOPS = SOLVE_MCH_DIAG_GEMMS * 2 * SOLVE_DIAG_BLOCK_TOKENS ** 3
 SOLVE_GEMM_TILES = (SOLVE_DIAG_BLOCK_TOKENS,) * SOLVE_DIAG_MERGES + (SOLVE_MERGE_BLOCK_TOKENS,) * 2
 SOLVE_DIAG_FP32_FLOPS = SOLVE_DIAG_MERGES * 2 * SOLVE_DIAG_BLOCK_TOKENS ** 3
 SOLVE_MERGE_FP32_FLOPS = 2 * 2 * SOLVE_MERGE_BLOCK_TOKENS ** 3
@@ -58,11 +113,21 @@ SOLVE_MASKED_LANES = (119, 119, SOLVE_ROW_BARRIERS)
 SOLVE_WORKSPACE_MATRICES = 5
 WORKSPACE_HEADS_PER_CORE = 4
 GATE_ROW_OPS_PER_ELEMENT = 10
+SOFTPLUS_GATE_ROW_OPS_PER_ELEMENT = 11
 GATE_A_LOG_BYTES = 4
 GATE_DT_BIAS_BYTES = 128 * 4
 GATE_SEQUENCE_INDEX_BYTES = 8
 GATE_AUX_READ_BYTES = GATE_A_LOG_BYTES + GATE_DT_BIAS_BYTES + 2 * GATE_SEQUENCE_INDEX_BYTES
 SCORE_MASK_OPS_PER_PAIR = 4
+GATE_UB_ROW_ELEMENTS = 256
+GATE_UB_PIPELINE_DEPTH = 2
+GATE_UB_ROW_FP32_BUFFERS = 7
+GATE_UB_SCALAR_BUFFERS_BYTES = 64
+PREPARE_UB_EXP2_ELEMENTS = 256
+PREPARE_UB_VEC_ARENA_ELEMENTS = 32_768
+PREPARE_UB_GATE_TILE_ROWS = 16
+PREPARE_UB_SAFE_GATE_BUFFER_DEPTH = 2
+PREPARE_UB_SOFTPLUS_BUFFER_DEPTH = 3
 
 RECIPE = "vllm_ascend_kda_gate_prepare"
 IMPLEMENTATION = "vllm_ascend_kda_chunk_prepare_state"
@@ -72,6 +137,35 @@ _V_DIM = 128
 _CHUNK = 64
 _BF16 = 2
 _FP32 = 4
+GATE_UB_BYTES_PER_AIV = (
+    GATE_UB_ROW_FP32_BUFFERS * GATE_UB_ROW_ELEMENTS * _FP32
+    + GATE_UB_PIPELINE_DEPTH * GATE_UB_ROW_ELEMENTS * _BF16
+    + 2 * _CHUNK * _K_DIM * _FP32
+    + GATE_UB_SCALAR_BUFFERS_BYTES
+)
+PREPARE_UB_FIXED_BYTES = (
+    PREPARE_UB_VEC_ARENA_ELEMENTS * _FP32
+    + PREPARE_UB_EXP2_ELEMENTS * (_FP32 + _BF16)
+)
+PREPARE_UB_SAFE_GATE_WRITEBACK_BYTES = (
+    PREPARE_UB_SAFE_GATE_BUFFER_DEPTH
+    * (
+        PREPARE_UB_GATE_TILE_ROWS * _K_DIM * (3 * _BF16 + _FP32)
+        + PREPARE_UB_GATE_TILE_ROWS * _FP32
+        + PREPARE_UB_GATE_TILE_ROWS * _K_DIM * _BF16
+    )
+)
+PREPARE_UB_SOFTPLUS_WRITEBACK_BYTES = (
+    PREPARE_UB_SOFTPLUS_BUFFER_DEPTH
+    * (
+        PREPARE_UB_GATE_TILE_ROWS * _K_DIM * (2 * _BF16 + _FP32)
+        + PREPARE_UB_GATE_TILE_ROWS * _K_DIM * _BF16
+    )
+)
+PREPARE_UB_BYTES_PER_AIV = PREPARE_UB_FIXED_BYTES + PREPARE_UB_SAFE_GATE_WRITEBACK_BYTES
+PREPARE_UB_SOFTPLUS_BYTES_PER_AIV = PREPARE_UB_FIXED_BYTES + PREPARE_UB_SOFTPLUS_WRITEBACK_BYTES
+_MCH_READ_HEAD = SOLVE_MCH_DIAG_GEMMS * 2 * SOLVE_DIAG_BLOCK_TOKENS ** 2 * _FP32
+_MCH_WRITE_HEAD = SOLVE_MCH_DIAG_GEMMS * SOLVE_DIAG_BLOCK_TOKENS ** 2 * _FP32
 _SCORE_BF16_HEAD = 2 * 2 * 32 * (32 + 64) * 128      # 1,572,864
 _SOLVE_FP32_HEAD = SOLVE_DIAG_FP32_FLOPS + SOLVE_MERGE_FP32_FLOPS
 _DIAG_BLOCKS = 4
@@ -94,13 +188,22 @@ _FINAL_AKK_READ_HEAD = 16_384
 _FINAL_AKK_WRITE_HEAD = 8_192
 _GATE_ROW_ELEMENTS = 128
 _SOURCE = "chunk_kda_fwd/arch35/GATE_PREPARE/safe_gate/bf16_raw_g/varlen"
+_SOURCE_SOFTPLUS = "chunk_kda_fwd/arch35/GATE_PREPARE/softplus_gate/bf16_raw_g/varlen"
 
 _PARAM_KEYS = frozenset({
     "lengths", "heads", "key_heads", "dk", "dv", "chunk", "dtype",
     "gate_dtype", "raw_g_dtype", "beta_dtype", "compute_gate_in_prepare",
-    "fuse_post_wu", "use_dense_fwd_h", "safe_gate",
+    "fuse_post_wu", "use_dense_fwd_h", "safe_gate", "kda_gate_lower_bound",
     "compact",
 })
+
+
+def _prepare_ub_bytes(safe_gate: bool) -> int:
+    return (
+        PREPARE_UB_BYTES_PER_AIV
+        if safe_gate
+        else PREPARE_UB_SOFTPLUS_BYTES_PER_AIV
+    )
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -138,6 +241,7 @@ class Params:
     dv: int
     chunk: int
     compact: bool = True
+    safe_gate: bool = True
 
     @property
     def total_tokens(self) -> int:
@@ -203,7 +307,7 @@ class Params:
             "raw_g_dtype": "bf16",
             "gate_dtype": "fp32",
             "beta_dtype": "fp32",
-            "safe_gate": True,
+            "safe_gate": self.safe_gate,
             "compute_gate_in_prepare": False,
             "fuse_post_wu": False,
             "use_dense_fwd_h": False,
@@ -212,7 +316,7 @@ class Params:
             "prepare_gate_products": "inside_native_gate_prepare_score",
             "source_phase": "GATE_PREPARE",
             "native_kind": "ChunkKdaFwd/GATE_PREPARE",
-            "implementation": _SOURCE,
+            "implementation": _SOURCE if self.safe_gate else _SOURCE_SOFTPLUS,
             "total_tokens": self.total_tokens,
             "total_chunks": self.total_chunks,
             "chunks_per_sequence": self.chunks_per_sequence,
@@ -223,8 +327,16 @@ class Params:
             "score_block_bf16_flops_per_head": (
                 _SCORE_BF16_HEAD // SCORE_BLOCK_COUNT, 2 * _SCORE_BF16_HEAD // SCORE_BLOCK_COUNT),
             "solve_bf16_flops_absent": True,
-            "solve_fp32_flops_per_head": (SOLVE_DIAG_FP32_FLOPS, SOLVE_MERGE_FP32_FLOPS),
-            "small_fp32_gemms_per_head": len(SOLVE_GEMM_TILES),
+            "solve_fp32_flops_per_head": (
+                (SOLVE_DIAG_FP32_FLOPS, SOLVE_MERGE_FP32_FLOPS)
+                if self.safe_gate
+                else (SOLVE_MCH_FP32_FLOPS + SOLVE_DIAG_FP32_FLOPS, SOLVE_MERGE_FP32_FLOPS)
+            ),
+            "small_fp32_gemms_per_head": (
+                len(SOLVE_GEMM_TILES)
+                if self.safe_gate
+                else len(SOLVE_MCH_TILES) + len(SOLVE_GEMM_TILES)
+            ),
             "diag_vector_ops_per_head": _DIAG_VECTOR_HEAD,
             "diag_row_barriers_per_16block": SOLVE_ROW_BARRIERS,
             "diag_masked_lane_ops_per_16block": SOLVE_MASKED_LANES,
@@ -240,7 +352,10 @@ class Params:
             "final_akk_bf16_write_bytes_per_head": _FINAL_AKK_WRITE_HEAD,
             "gate_row_read_bytes": _GATE_ROW_ELEMENTS * _BF16,
             "gate_row_write_bytes": _GATE_ROW_ELEMENTS * _FP32,
-            "gate_row_vector_ops": GATE_ROW_OPS_PER_ELEMENT * _GATE_ROW_ELEMENTS,
+            "gate_row_vector_ops": (
+                GATE_ROW_OPS_PER_ELEMENT if self.safe_gate
+                else SOFTPLUS_GATE_ROW_OPS_PER_ELEMENT
+            ) * _GATE_ROW_ELEMENTS,
             "gate_row_special_lanes": 2 * _GATE_ROW_ELEMENTS,
             "gate_aux_read_bytes_per_task": GATE_AUX_READ_BYTES,
             "gate_chunk_reset_vector_ops": _GATE_ROW_ELEMENTS,
@@ -296,15 +411,27 @@ def parse_params(params: Mapping[str, Any]) -> Params:
     _dtype(params.get("beta_dtype", "fp32"), {"fp32": "fp32", "float32": "fp32"},
            "kda_prepare_requires_fp32_beta")
     for name, required in (("compute_gate_in_prepare", False),
-                           ("fuse_post_wu", False), ("use_dense_fwd_h", False),
-                           ("safe_gate", True)):
+                           ("fuse_post_wu", False), ("use_dense_fwd_h", False)):
         if _flag(params, name, required) != required:
             raise ModelingError(f"kda_prepare_requires_flag:{name}={required}")
+    if "kda_gate_lower_bound" in params:
+        bound, valid = parse_gate_lower_bound(params.get("kda_gate_lower_bound"))
+        if not valid:
+            raise ModelingError("kda_prepare_gate_lower_bound_unsupported")
+        if "safe_gate" in params:
+            safe_gate = _flag(params, "safe_gate", bound is not None)
+            if bound is not None and not safe_gate:
+                raise ModelingError("kda_prepare_safe_gate_conflict")
+        else:
+            safe_gate = bound is not None
+    else:
+        safe_gate = _flag(params, "safe_gate", True)
     for length in lengths:
         if length % chunk:
             raise ModelingError("kda_prepare_rejects_partial_chunk_tail")
     return Params(lengths, heads, key_heads, dk, dv, chunk,
-                  compact=_flag(params, "compact", True))
+                  compact=_flag(params, "compact", True),
+                  safe_gate=safe_gate)
 
 
 def _work(*, bf16: float = 0.0, fp32: float = 0.0, read: float = 0.0,
@@ -341,10 +468,15 @@ def gate_row_work(*, first_row: bool, split_read: bool = False) -> Work:
     return Work({}, resources)
 
 
-def gate_accumulate_work(*, first_row: bool, split_read: bool = False) -> Work:
-    """Safe-gate row: bias, expA, exp, div, lower-bound, cumsum and store."""
+def gate_accumulate_work(*, first_row: bool, split_read: bool = False,
+                         safe_gate: bool = True) -> Work:
+    """Gate row: bias, safe-gate or softplus activation, cumsum and store."""
     write = _GATE_ROW_ELEMENTS * _FP32
-    vector = GATE_ROW_OPS_PER_ELEMENT * _GATE_ROW_ELEMENTS + (_GATE_ROW_ELEMENTS if first_row else 0)
+    ops_per_elem = (
+        GATE_ROW_OPS_PER_ELEMENT if safe_gate
+        else SOFTPLUS_GATE_ROW_OPS_PER_ELEMENT
+    )
+    vector = ops_per_elem * _GATE_ROW_ELEMENTS + (_GATE_ROW_ELEMENTS if first_row else 0)
     resources = {
         "hbm": write, "mte3": write, "vector": vector,
         "reg_special_lanes": 2 * _GATE_ROW_ELEMENTS,
@@ -354,13 +486,17 @@ def gate_accumulate_work(*, first_row: bool, split_read: bool = False) -> Work:
 
 def gate_work(params: Params) -> Work:
     """Aggregate source gate work over every (sequence, head) task."""
+    ops_per_elem = (
+        GATE_ROW_OPS_PER_ELEMENT if params.safe_gate
+        else SOFTPLUS_GATE_ROW_OPS_PER_ELEMENT
+    )
     total = Work()
     for length in params.lengths:
         chunks = length // params.chunk
         rows = length * params.heads
         read = rows * _GATE_ROW_ELEMENTS * _BF16
         write = rows * _GATE_ROW_ELEMENTS * _FP32
-        vector = rows * GATE_ROW_OPS_PER_ELEMENT * _GATE_ROW_ELEMENTS + chunks * params.heads * _GATE_ROW_ELEMENTS
+        vector = rows * ops_per_elem * _GATE_ROW_ELEMENTS + chunks * params.heads * _GATE_ROW_ELEMENTS
         total += Work({}, {"hbm": read + write, "mte2": read,
                            "mte3": write, "vector": vector,
                            "reg_special_lanes": rows * 2 * _GATE_ROW_ELEMENTS})
@@ -372,34 +508,37 @@ def gate_work(params: Params) -> Work:
     return Work(total.matrix, resources)
 
 
-def headchunk_work() -> Work:
-    """One full head-chunk: direct-UB score/factor, seed, diag, six-GEMM merge."""
-    aic_read = _SCORE_READ_HEAD + _MERGE_READ_HEAD
+def headchunk_work(*, safe_gate: bool = True) -> Work:
+    """One full head-chunk: direct-UB score/factor, seed, diag, solve GEMMs."""
+    mch_flops = 0 if safe_gate else SOLVE_MCH_FP32_FLOPS
+    mch_read = 0 if safe_gate else _MCH_READ_HEAD
+    mch_write = 0 if safe_gate else _MCH_WRITE_HEAD
+    aic_read = _SCORE_READ_HEAD + _MERGE_READ_HEAD + mch_read
     aiv_read = _SCORE_FACTOR_READ_HEAD + _FINAL_AKK_READ_HEAD
     hbm = (aic_read + aiv_read + _SCORE_FACTOR_WRITE_HEAD + _SEED_WRITE_HEAD
-           + _FINAL_AKK_WRITE_HEAD + _MERGE_WRITE_HEAD)
+           + _FINAL_AKK_WRITE_HEAD + _MERGE_WRITE_HEAD + mch_write)
     return Work(
-        {"bf16": _SCORE_BF16_HEAD, "fp32": _SOLVE_FP32_HEAD},
+        {"bf16": _SCORE_BF16_HEAD, "fp32": _SOLVE_FP32_HEAD + mch_flops},
         {"hbm": hbm, "mte2_aic": aic_read, "mte2_aiv": aiv_read,
-         "mte1": _SCORE_READ_HEAD + _MERGE_READ_HEAD,
+         "mte1": _SCORE_READ_HEAD + _MERGE_READ_HEAD + mch_read,
          "mte3": (_SCORE_FACTOR_WRITE_HEAD + _SEED_WRITE_HEAD
                   + _FINAL_AKK_WRITE_HEAD),
-         "fixpipe": _SCORE_FIXPIPE_HEAD + _MERGE_WRITE_HEAD,
+         "fixpipe": _SCORE_FIXPIPE_HEAD + _MERGE_WRITE_HEAD + mch_write,
          "vector": (_FACTOR_VECTOR_HEAD + _DIAG_VECTOR_HEAD
                     + _DIRECT_SOLVE_VECTOR_HEAD + _FINAL_VECTOR_HEAD),
          "reg_special_lanes": _FACTOR_SPECIAL_HEAD},
     )
 
 
-def paired_work() -> Work:
-    return headchunk_work().scaled(2)
+def paired_work(*, safe_gate: bool = True) -> Work:
+    return headchunk_work(safe_gate=safe_gate).scaled(2)
 
 
 def source_work(params: Params, cores: int | None = None) -> Work:
     """Conserved aggregate for the whole stage, independent of core count."""
     if cores is not None:
         _positive_int(cores, "kda_prepare_requires_positive_compute_units")
-    prepare = paired_work().scaled(params.paired_tasks)
+    prepare = paired_work(safe_gate=params.safe_gate).scaled(params.paired_tasks)
     gate = gate_work(params)
     total = gate + prepare
     resources = dict(total.resources)
@@ -466,7 +605,7 @@ def _gate_pipeline(aiv: int, params: Params, context: RecipeContext,
                                       ("mte2_aiv" if split else "mte2"):
                                           load.resources.get(
                                               "mte2_aiv" if split else "mte2", 0) + aux})
-        compute = gate_accumulate_work(first_row=first)
+        compute = gate_accumulate_work(first_row=first, safe_gate=params.safe_gate)
         if local_row == 0:
             compute += Work({}, {"vector": 2, "reg_special_lanes": 1})
         return (
@@ -525,8 +664,13 @@ def _paired_tile(core: int, params: Params, context: RecipeContext):
                 f"seed{lane}", _work(write=_SEED_WRITE_HEAD, vector=2 * _CHUNK ** 2),
                 context, core, aiv=lane, after=(f"diag{lane}",)))
         previous = ("seed0", "seed1")
+        gemm_tiles = (
+            SOLVE_GEMM_TILES
+            if params.safe_gate
+            else SOLVE_MCH_TILES + SOLVE_GEMM_TILES
+        )
         for lane in (0, 1):
-            for gemm, size in enumerate(SOLVE_GEMM_TILES):
+            for gemm, size in enumerate(gemm_tiles):
                 name = f"merge{lane}_{gemm}"
                 work = _work(fp32=2 * size * size * size, read=2 * size * size * _FP32,
                              mte1=2 * size * size * _FP32, fixpipe=size * size * _FP32)
@@ -545,25 +689,58 @@ def _paired_tile(core: int, params: Params, context: RecipeContext):
     return PipelineProgram(count, 1, tile)
 
 
-def program(params: Params, context: RecipeContext, cores: int) -> KernelProgram:
-    if context.resource_units.get("vector", cores) != 2 * cores:
-        raise ModelingError("kda_prepare_requires_two_vector_subblocks_per_matrix_core")
-    if int(context.core_count) != cores:
-        raise ModelingError("kda_prepare_geometry_changed_after_build")
-    if params.compact:
-        from .kda_prepare_compact import program as compact_program
-        return compact_program(params, context, cores)
+def _wrap_aiv_ub(context: RecipeContext, aiv: int, aiv_count: int, size: int,
+                 body) -> KernelProgram:
+    if "ub" not in context.pool_names:
+        return body
+    alloc = (context.allocate(
+        "kda_gate_ub", "ub", size,
+        unit_group(aiv, aiv_count, context.pool_units.get("ub", aiv_count))),)
+    return KernelProgram((
+        Stage("reserve", acquire=alloc),
+        Stage("body", after=("reserve",), program=body),
+        Stage("release", after=("body",), free=alloc),
+    ))
+
+
+def _literal_program(params: Params, context: RecipeContext, cores: int) -> KernelProgram:
     aiv_count = 2 * cores
-    gate = tuple(_gate_pipeline(aiv, params, context, aiv_count)
-                 for aiv in range(aiv_count)
-                 if aiv < params.gate_tasks)
-    prepare = tuple(_paired_tile(core, params, context)
-                    for core, count in task_ownership(params, cores) if count)
+    prepare_ub = _prepare_ub_bytes(params.safe_gate)
+    gate = tuple(
+        _wrap_aiv_ub(
+            context, aiv, aiv_count, GATE_UB_BYTES_PER_AIV,
+            _gate_pipeline(aiv, params, context, aiv_count),
+        )
+        for aiv in range(aiv_count)
+        if aiv < params.gate_tasks
+    )
+    prepare = tuple(
+        resident(
+            context, core, {"ub": prepare_ub},
+            _paired_tile(core, params, context),
+        ) if "ub" in context.pool_names else _paired_tile(core, params, context)
+        for core, count in task_ownership(params, cores) if count
+    )
     return KernelProgram((
         Stage("gate", program=ParallelProgram(gate)),
         Stage("syncall", after=("gate",)),
         Stage("prepare", after=("syncall",), program=ParallelProgram(prepare)),
     ))
+
+
+def program(params: Params, context: RecipeContext, cores: int):
+    if context.resource_units.get("vector", cores) != 2 * cores:
+        raise ModelingError("kda_prepare_requires_two_vector_subblocks_per_matrix_core")
+    if int(context.core_count) != cores:
+        raise ModelingError("kda_prepare_geometry_changed_after_build")
+    if params.compact:
+        from .kda_prepare_compact import can_compact, guarded_program
+        if can_compact(context):
+            return guarded_program(
+                params, context, cores,
+                lambda: _literal_program(params, context, cores),
+            )
+    return _literal_program(params, context, cores)
 
 
 def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
@@ -574,6 +751,21 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     cores = int(geometry.compute_units)
     if cores < 1:
         raise ModelingError("kda_prepare_requires_positive_compute_units")
+    if "ub" in geometry.buffers:
+        check_live_buffers(
+            (
+                LiveBufferSpec(
+                    "kda_gate_cumsum_ub", "ub", GATE_UB_BYTES_PER_AIV,
+                    live_start=0, live_end=0, owner_kind="aiv",
+                ),
+                LiveBufferSpec(
+                    "kda_prepare_ub", "ub", _prepare_ub_bytes(params.safe_gate),
+                    live_start=1, live_end=1, owner_kind="aiv",
+                ),
+            ),
+            geometry,
+            family=RECIPE,
+        )
     total = source_work(params, cores)
     if read_role(geometry.resource_units) == "mte2":
         resources = dict(total.resources)
@@ -625,7 +817,8 @@ def make_op(params: Mapping[str, Any], *, op_id: str = "kda_gate_prepare",
 def bind_gate_prepare(ops, *, gate, local_ops, lengths, heads, key_heads, dk, dv,
                       chunk, dtype, raw_g_dtype="bf16", gate_dtype="fp32",
                       beta_dtype="fp32", requests=(), pcp=1,
-                      speculative=False):
+                      speculative=False, safe_gate=None,
+                      kda_gate_lower_bound=None):
     """Replace generic prefill gate and local chunk math with one source call.
 
     ``pcp >= 1`` is accepted. Inter-chunk state transfer is a caller collective.
@@ -634,13 +827,24 @@ def bind_gate_prepare(ops, *, gate, local_ops, lengths, heads, key_heads, dk, dv
         raise ModelingError("kda_prepare_requires_pcp")
     if speculative:
         raise ModelingError("kda_prepare_speculative_prefill_not_supported")
+    bound, valid = parse_gate_lower_bound(kda_gate_lower_bound)
+    if not valid:
+        raise ModelingError("kda_prepare_gate_lower_bound_unsupported")
+    if bound is not None:
+        if safe_gate is False:
+            raise ModelingError("kda_prepare_safe_gate_conflict")
+        resolved_safe_gate = True
+    elif safe_gate is not None:
+        resolved_safe_gate = bool(safe_gate)
+    else:
+        resolved_safe_gate = False
     local_ids = {op.op_id for op in local_ops}
     ids = {gate.op_id, *local_ids}
     params = {
         "lengths": tuple(lengths), "heads": heads, "key_heads": key_heads,
         "dk": dk, "dv": dv, "chunk": chunk, "dtype": dtype,
         "raw_g_dtype": raw_g_dtype, "gate_dtype": gate_dtype,
-        "beta_dtype": beta_dtype,
+        "beta_dtype": beta_dtype, "safe_gate": resolved_safe_gate,
     }
     replaced = {gate.op_id, *local_ids}
     deps = tuple(dict.fromkeys(
@@ -663,8 +867,9 @@ def bind_gate_prepare(ops, *, gate, local_ops, lengths, heads, key_heads, dk, dv
 
 
 __all__ = [
-    "IMPLEMENTATION", "Params", "RECIPE", "bind_gate_prepare", "build",
-    "gate_accumulate_work", "gate_row_work", "gate_work", "headchunk_work",
-    "make_op", "paired_work", "parse_params", "sequence_chunk", "source_work",
-    "task_ownership",
+    "GATE_UB_BYTES_PER_AIV", "IMPLEMENTATION", "PREPARE_UB_BYTES_PER_AIV",
+    "Params", "RECIPE", "SOURCES", "TARGET_BACKEND", "bind_gate_prepare",
+    "build", "gate_accumulate_work", "gate_row_work", "gate_work",
+    "headchunk_work", "make_op", "paired_work", "parse_params",
+    "sequence_chunk", "source_work", "task_ownership",
 ]

@@ -6,12 +6,36 @@
 [Timeouts & Locks] Pure metadata operations; no I/O or locks.
 [Side-Effect Policy] Immutable operators and recipe mappings only.
 """
+from typing import Literal
+
 from mindie_sim.prediction.operators.kda import family_kda_recurrent
 from mindie_sim.prediction.mechanism import PlannedRecipe
 from mindie_sim.prediction.operators.kda import kda_recurrent_membase
+from mindie_sim.schema.datapath import SourceRef
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 IMPLEMENTATION = kda_recurrent_membase.IMPLEMENTATION
 SOURCE = kda_recurrent_membase.SOURCE
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        SOURCE["repository"],
+        SOURCE["revision"],
+        SOURCE["kernel"]["path"],
+        SOURCE["kernel"]["sha256"],
+    ),
+    SourceRef(
+        SOURCE["repository"],
+        SOURCE["revision"],
+        SOURCE["host"]["path"],
+        SOURCE["host"]["sha256"],
+    ),
+    SourceRef(
+        SOURCE["repository"],
+        SOURCE["revision"],
+        SOURCE["caller"]["path"],
+        SOURCE["caller"]["sha256"],
+    ),
+)
 CAPABILITIES = family_kda_recurrent.CAPABILITIES
 validate = family_kda_recurrent.validate
 

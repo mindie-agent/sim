@@ -9,18 +9,25 @@
 from collections.abc import Mapping
 from dataclasses import replace
 import math
+from typing import Literal
 
 from mindie_sim.prediction.operators.recurrent.recover_ssm_work import record_head_bytes
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import ProgramFragment, StateEffect
 from mindie_sim.schema.subgraphs import PortSet
-from mindie_sim.schema.tensors import TensorValue
+from mindie_sim.schema.tensors import TensorLayout, TensorValue
 from .kda_state_selection import (
-    bind_state_value, binding_record, binding_value, decision_ports,
-    state_ports, state_records,
+    SOURCES as _SELECTION_SOURCES,
+    _narrow_value, bind_state_value, binding_record, binding_value,
+    decision_ports, state_ports, state_records,
 )
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = _SELECTION_SOURCES
+
 STATE_POOL_DIMS = 4
+_STATE_TAIL_DIMS = 3
 _DEFAULT_HEAD_DIM = 128
 _STATE_DTYPE_BYTES = {"fp32": 4, "bf16": 2}
 
@@ -41,10 +48,53 @@ def _slot_storage(storage, slot):
     return base if slot is None else f"{base}{marker}{slot}"
 
 
+def _write_slot_value(state_values, source, value, slot):
+    if slot is None:
+        return value
+    if (isinstance(state_values, TensorValue)
+            and len(state_values.layout.shape) == STATE_POOL_DIMS
+            and tuple(state_values.layout.shape[1:]) == tuple(value.layout.shape[-_STATE_TAIL_DIMS:])):
+        return _narrow_value(state_values, 0, slot, 1)
+    read_slot = source.get("slot")
+    if (read_slot is not None and slot != read_slot
+            and len(value.layout.shape) == STATE_POOL_DIMS
+            and value.layout.shape[0] == 1):
+        slot_stride = value.layout.strides[0]
+        base_offset = value.layout.offset - int(read_slot) * slot_stride
+        if base_offset < 0:
+            raise ModelingError("kda_state_value_window_outside_layout")
+        return replace(
+            value,
+            layout=replace(value.layout, offset=base_offset + int(slot) * slot_stride),
+        )
+    return value
+
+
+def _recover_ssm_record_value(*, producer, source, value, version, token_index, record_dtype):
+    shape = tuple(value.layout.shape)
+    heads = shape[1] if len(shape) == STATE_POOL_DIMS and shape[0] == 1 else shape[0]
+    dv, dk = int(shape[-2]), int(shape[-1])
+    rec_head = record_head_bytes(dk, dv, str(record_dtype))
+    elem_bytes = int(dtype_bytes(str(record_dtype)))
+    rec_elems = rec_head // elem_bytes
+    layout = TensorLayout(
+        shape=(heads, rec_elems),
+        strides=(rec_elems, 1),
+        offset=token_index * heads * rec_elems,
+    )
+    storage = f"{_slot_storage(source['storage'], None)}:recover_ssm_record"
+    return TensorValue(
+        producer=str(producer), dtype=str(record_dtype), layout=layout,
+        output=f"recover_ssm_record:{version}", storage=storage,
+        binding="static", binding_name="", state_version=version,
+    ), ((0, heads), (0, rec_elems))
+
+
 def state_contract(*, lengths, targets=(), requests=(), selection=None,
                    contexts=None, acceptance=None, bindings=None,
-                   owner="self", state_dtype=None, decisions=(),
-                   ready=(), grants=(), op_id=None):
+                   owner="self", state_dtype=None, record_dtype="bf16",
+                   decisions=(), ready=(), grants=(), op_id=None,
+                   recover_ssm=False, state_values=None):
     """Bind per-query versions to explicit state write/commit records.
 
     ``bindings`` are the caller's actual ``TensorValue`` records.  The contract
@@ -59,13 +109,19 @@ def state_contract(*, lengths, targets=(), requests=(), selection=None,
         raise ModelingError("kda_state_contract_requires_value_bindings")
     targets = tuple(targets)
     bindings = tuple(bindings)
-    if len(bindings) != len(tuple(lengths)) or any(
+    lengths_tuple = tuple(lengths)
+    if len(bindings) != len(lengths_tuple) or any(
             binding["target"] != target
             for binding, target in zip(bindings, targets)):
         raise ModelingError("kda_state_contract_bindings_must_match_targets")
     checkpoint_slots = None if selection is None else selection.get("checkpoint_slots")
+    if checkpoint_slots is None and bindings and all(
+        binding.get("slot") is not None and int(q) == 1
+        for binding, q in zip(bindings, lengths_tuple)
+    ):
+        checkpoint_slots = tuple((binding["slot"],) for binding in bindings)
     records = state_records(
-        targets=targets, lengths=lengths, contexts=contexts,
+        targets=targets, lengths=lengths_tuple, contexts=contexts,
         acceptance=acceptance, checkpoint_slots=checkpoint_slots)
     effects = []
     for binding in bindings:
@@ -73,29 +129,63 @@ def state_contract(*, lengths, targets=(), requests=(), selection=None,
             binding["target"], "read", binding["state_version"]))
     write_bindings = []
     by_target = {binding["target"]: binding for binding in bindings}
+    committed_pairs = set(records["commit_records"])
+    query_by_target = dict(zip(targets, records["queries"]))
+    token_pos_by_target: dict[str, int] = {}
     for target, version, slot in records["write_records"]:
         source = by_target[target]
         value = binding_value(source)
-        layout = value.layout
-        # A candidate overwrites this sequence's slot with a new generation;
-        # the leading capacity axis is already narrowed for a pool tensor.
-        write_value = replace(
-            value, producer=str(op_id or target),
-            output=f"checkpoint:{version}", storage=_slot_storage(
-                source["storage"], slot),
-            state_version=version, binding="static", binding_name="")
-        binding = bind_state_value(
-            write_value, target=target, owner=source.get("owner", owner),
-            slot=slot, version=version,
-            ready=source.get("ready"), grant=source.get("grant"),
-            generation=version, decision=("token_commit" if version in
-                                          records["commit_versions"] else None),
-            last_use=("next_decode_read" if version in
-                      records["commit_versions"] else "last_reader"),
-            representation=source.get("representation"),
-            required=True, span=((0, layout.shape[-2]), (0, layout.shape[-1])))
+        q_len = int(query_by_target[target])
+        is_spec = bool(recover_ssm and q_len > 1)
+        token_index = token_pos_by_target.get(target, 0)
+        token_pos_by_target[target] = token_index + 1
+        if is_spec:
+            write_value, span = _recover_ssm_record_value(
+                producer=str(op_id or target), source=source, value=value,
+                version=version, token_index=token_index,
+                record_dtype=record_dtype,
+            )
+            binding = bind_state_value(
+                write_value, target=target, owner=source.get("owner", owner),
+                slot=None, version=version,
+                ready=source.get("ready"), grant=source.get("grant"),
+                generation=version, decision="recover_ssm_record",
+                last_use="recover_ssm_commit",
+                representation="recover_ssm_record",
+                window=(0, q_len), required=True, span=span,
+            )
+        else:
+            write_base = _write_slot_value(state_values, source, value, slot)
+            layout = write_base.layout
+            is_commit = (target, version) in committed_pairs
+            # A candidate overwrites this sequence's slot with a new generation;
+            # the leading capacity axis is sliced by the target write slot.
+            write_value = replace(
+                write_base, producer=str(op_id or target),
+                output=f"checkpoint:{version}", storage=_slot_storage(
+                    source["storage"], slot),
+                state_version=version, binding="static", binding_name="")
+            binding = bind_state_value(
+                write_value, target=target, owner=source.get("owner", owner),
+                slot=slot, version=version,
+                ready=source.get("ready"), grant=source.get("grant"),
+                generation=version, decision=("token_commit" if is_commit else None),
+                last_use=("next_decode_read" if is_commit else "last_reader"),
+                representation=source.get("representation"),
+                window=(0, q_len),
+                required=True, span=((0, layout.shape[-2]), (0, layout.shape[-1])))
         write_bindings.append(binding)
         effects.append(_state_effect(target, "write", version))
+    overwritten_records = tuple(
+        (target, version)
+        for target, q_len, versions in zip(
+            targets, records["queries"], records["overwritten_versions"]
+        )
+        if not (recover_ssm and int(q_len) > 1)
+        for version in versions
+    )
+    for target, version in overwritten_records:
+        effects.append(_state_effect(target, "rollback", version, "slot_overwrite"))
     for target, version in records["commit_records"]:
         effects.append(_state_effect(target, "commit", version,
                                      "acceptance_trace"))
@@ -124,6 +214,7 @@ def state_contract(*, lengths, targets=(), requests=(), selection=None,
     contract = {
         **records, "initial_slots": None if selection is None else selection.get("initial_slots"),
         "checkpoint_slots": checkpoint_slots,
+        "overwritten_records": overwritten_records,
         "address_basis": None if selection is None else selection.get("address_basis"),
         "state_dtype": state_dtype, "state_layout": "V,K", "request_ids": tuple(requests),
         "owner": owner, "read_bindings": tuple(binding_record(b) for b in bindings),
@@ -181,10 +272,15 @@ def state_fragments(op):
                     direction="in", readiness="previous_iteration",
                     optional=False))
     read = replace(read, attrs=_binding_attrs(read_bindings))
+    write_effects = [
+        _effect(binding["target"], "write", binding["state_version"])
+        for binding in write_bindings
+    ]
+    for target, version in contract.get("overwritten_records", ()):
+        write_effects.append(_effect(target, "rollback", version, "slot_overwrite"))
     write = _fragment(
         f"{op.op_id}:state_write",
-        (_effect(binding["target"], "write", binding["state_version"])
-         for binding in write_bindings),
+        write_effects,
         state_ports(bindings=write_bindings, owner=f"kda.layer[{op.layer}]",
                     direction="out", readiness="producer_complete",
                     optional=False))
@@ -229,6 +325,14 @@ def _binding_span(binding, *, head=None):
     return tuple((0, size) for size in shape)
 
 
+def _window_width(window, fallback: int) -> int:
+    if isinstance(window, (tuple, list)) and len(window) == 2:
+        return int(window[1]) - int(window[0])
+    if isinstance(window, int) and not isinstance(window, bool):
+        return window
+    return int(fallback)
+
+
 def state_accesses(op):
     """Project KDA decode state reads/writes into SERVICE access records.
 
@@ -270,20 +374,36 @@ def state_accesses(op):
             "tier": binding.get("tier", "hbm"), "source_ready": binding.get("ready"),
             "grant_ready": binding.get("grant"), "last_use_event": "next_decode_read",
         })
-    committed = set(contract.get("commit_versions", ()))
     targets = tuple(contract.get("targets", ()))
+    queries = tuple(contract.get("queries", ()))
+    if "commit_records" in contract:
+        committed = {(t, v) for t, v in contract["commit_records"]}
+    else:
+        committed = {
+            (t, v) for t, v in zip(targets, contract.get("commit_versions", ()))
+            if v is not None
+        }
     for write_index, binding in enumerate(tuple(contract.get("write_bindings", ()))) :
         target = binding["target"]
         sequence = targets.index(target) if target in targets else 0
         request = request_ids[sequence] if sequence < len(request_ids) else str(sequence)
         version, shape = binding["state_version"], tuple(binding["layout"]["shape"])
         heads = shape[1] if len(shape) == STATE_POOL_DIMS and shape[0] == 1 else shape[0]
-        slot, commit = binding.get("slot"), version in committed
+        slot, commit = binding.get("slot"), (target, version) in committed
         decision_event = _decision_name(contract, target, version)
         base_span = _binding_span(binding)
-        is_spec = use_recover and int(binding.get("window") or 1) > 1
+        fallback_q = queries[sequence] if sequence < len(queries) else 1
+        is_spec = use_recover and _window_width(binding.get("window"), fallback_q) > 1
         out_bytes = float(rec_head if is_spec else dk * dv * state_byte)
         out_repr = "recover_ssm_record" if is_spec else binding.get("representation", "state")
+        out_decision = (
+            "recover_ssm_record" if is_spec
+            else ("token_commit" if commit else "candidate_hold")
+        )
+        out_last_use = (
+            "recover_ssm_commit" if is_spec
+            else ("next_decode_read" if commit else "last_reader")
+        )
         result.append({
             "occurrence": f"{op.op_id}:write:{write_index}",
             "producer": binding["producer"], "request": request,
@@ -293,15 +413,15 @@ def state_accesses(op):
             "representation": out_repr, "persistent": True, "temporary": False,
             "state_version": version, "span": base_span, "bytes": float(heads * out_bytes),
             "source": binding["producer"], "reader": "", "grant": binding.get("grant") or "",
-            "decision": "token_commit" if commit else "candidate_hold",
-            "last_use": "next_decode_read" if commit else "last_reader",
+            "decision": out_decision,
+            "last_use": out_last_use,
             "rank": None, "scope": "target", "generation": version, "slot": slot,
             "window": binding.get("window"), "offset": binding.get("offset"),
             "physical_key": binding["storage"], "request_slot": slot,
             "rows": 1, "row_stride": dk * dv, "tier": binding.get("tier", "hbm"),
             "source_ready": binding.get("ready"), "grant_ready": binding.get("grant"),
             "decision_event": decision_event,
-            "last_use_event": "next_decode_read" if commit else "last_reader",
+            "last_use_event": out_last_use,
         })
     return tuple(result)
 

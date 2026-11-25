@@ -8,12 +8,17 @@
 [Timeouts & Locks] Pure metadata validation; no I/O or locks.
 [Side-Effect Policy] No device work, source reads or global mutation.
 """
+from typing import Literal
+
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import PlannedRecipe
 from mindie_sim.prediction.operators.kda import kda_state
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 IMPLEMENTATION = kda_state.IMPLEMENTATION
 CAPABILITIES = frozenset({"prefill_fwd_h"})
+SOURCES: tuple[SourceRef, ...] = kda_state.SOURCES
 SOURCE = {
     "repository": "vllm-ascend",
     "revision": "ae923905948f360f4b7ab06df52d0789a0c9316e",
@@ -86,7 +91,7 @@ def validate(*, key_heads, value_heads, key_width, value_width, model):
 
 def bind_prefill_scans(scans, *, lengths, heads, key_heads, dk, dv, chunk,
                        dtype, state_dtype, requests, pcp=1, speculative=False,
-                       state_contexts=None, state_targets=None,
+                       views=None, state_contexts=None, state_targets=None,
                        state_values=None, layout_values=None,
                        state_ready=(), state_grants=()):
     """Replace the prefill scan members with one actual varlen FWD_H op.
@@ -100,8 +105,15 @@ def bind_prefill_scans(scans, *, lengths, heads, key_heads, dk, dv, chunk,
         raise ModelingError("kda_state_requires_pcp")
     if speculative:
         raise ModelingError("kda_state_speculative_prefill_not_supported")
+    lengths = tuple(lengths)
+    if state_contexts is None and views is not None:
+        prefill_views = tuple(
+            view for view in views if getattr(view, "phase", "prefill") == "prefill")
+        if len(prefill_views) == len(lengths):
+            state_contexts = tuple(
+                int(getattr(view, "context", 0)) for view in prefill_views)
     params = {
-        "lengths": tuple(lengths), "heads": heads, "key_heads": key_heads,
+        "lengths": lengths, "heads": heads, "key_heads": key_heads,
         "dk": dk, "dv": dv, "chunk": chunk, "dtype": dtype,
         "gate_dtype": "fp32", "state_dtype": state_dtype,
         "use_initial_state": True, "output_final_state": True,
@@ -120,6 +132,6 @@ def bind_prefill_scans(scans, *, lengths, heads, key_heads, dk, dv, chunk,
 
 
 __all__ = [
-    "CAPABILITIES", "IMPLEMENTATION", "SOURCE", "bind_prefill_scans",
-    "recipes", "validate",
+    "CAPABILITIES", "IMPLEMENTATION", "SOURCE", "SOURCES", "TARGET_BACKEND",
+    "bind_prefill_scans", "recipes", "validate",
 ]

@@ -7,20 +7,26 @@
 [Side-Effect Policy] Pure contract, fragment and access records.
 """
 from dataclasses import replace
-from typing import Mapping
+from typing import Literal, Mapping
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import ProgramFragment, SemanticAttr, StateEffect
-from mindie_sim.schema.subgraphs import EventPortSpec, PortSet
+from mindie_sim.schema.subgraphs import EventPortSpec, PortSet, TensorPortSpec
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
 from .kda_state_selection import (
+    SOURCES as _SELECTION_SOURCES,
     bind_state_value, binding_record, prefill_records, state_ports, state_value,
 )
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = _SELECTION_SOURCES
 
 _K_DIM = 128
 _V_DIM = 128
 _CHUNK = 64
 _SLOTTED_STATE_TRANSPOSE = (0, 1, 3, 2)
+_INITIAL_SNAPSHOT_DTYPE = "bf16"
 
 
 def _effect(target, action, version, arbiter=""):
@@ -166,23 +172,24 @@ def prefill_state_contract(*, lengths, requests=(), chunk=_CHUNK, contexts=None,
                        else "producer_complete")))
         for head in range(heads):
             head_value = _head_view(public, head, heads=heads)
+            head_layout = TensorLayout.contiguous(head_value.layout.shape)
             internal = records["internal_targets"][sequence][head]
-            initial = replace(
-                head_value, producer=f"{op_id}:initialize",
+            initial = TensorValue(
+                f"{op_id}:initialize", _INITIAL_SNAPSHOT_DTYPE, head_layout,
                 output=f"{sequence}:{head}",
-                storage=f"state:{sequence}:head:{head}", binding="static",
+                storage=f"h_snapshot:{sequence}:head:{head}", binding="static",
                 binding_name="", state_version=context)
             initialize_bindings.append(bind_state_value(
                 initial, target=internal, owner=f"{owner}.head[{head}]",
                 version=context, generation=context, required=True,
-                representation=state_dtype, span=((0, dk), (0, dv))))
-            previous = initial
+                representation=_INITIAL_SNAPSHOT_DTYPE, span=((0, dk), (0, dv))))
             for chunk_index, version in enumerate(
                     records["checkpoint_versions"][sequence]):
-                chunk_value = replace(
-                    previous, producer=f"{op_id}:state_chunk:"
-                                      f"{sequence}:{head}:{chunk_index}",
-                    output=chunk_index, binding="static", binding_name="",
+                chunk_value = TensorValue(
+                    f"{op_id}:state_chunk:{sequence}:{head}:{chunk_index}",
+                    state_dtype, head_layout, output=chunk_index,
+                    storage=f"state:{sequence}:head:{head}",
+                    binding="static", binding_name="",
                     state_version=version)
                 internal_bindings[(sequence, head, chunk_index)] = (
                     bind_state_value(
@@ -191,7 +198,6 @@ def prefill_state_contract(*, lengths, requests=(), chunk=_CHUNK, contexts=None,
                         generation=version, required=True,
                         representation=state_dtype,
                         span=((0, dk), (0, dv))))
-                previous = chunk_value
     publication_bindings = _build_publication_bindings(
         targets, records, layouts, shape, state_dtype, owner, heads, dv, dk)
     publication_effects = []
@@ -224,7 +230,6 @@ def prefill_state_contract(*, lengths, requests=(), chunk=_CHUNK, contexts=None,
         "internal_commit_records": tuple(records["internal_commit_records"]),
         "publication_write_records": tuple(records["publication_write_records"]),
         "publication_records": tuple(records["publication_records"]),
-        "publication_write_records": tuple(records["publication_write_records"]),
         "read_bindings": tuple(binding_record(b) for b in read_bindings),
         "initialize_bindings": tuple(
             binding_record(b) for b in initialize_bindings),
@@ -326,23 +331,53 @@ def state_fragments(op):
               record for record in contract.get("internal_write_records", ())}
     commits = {(record["sequence"], record["head"], record["chunk"]):
                record for record in contract.get("internal_commit_records", ())}
+    init_by_sh = {
+        (record["sequence"], record["head"]): init_binding
+        for record, init_binding in zip(
+            contract.get("initialize_write_records", ()), initialize_bindings)
+    }
     for key, binding in by_key.items():
+        sequence, head, chunk = key
         read_record = reads[key]
         write_record = writes[key]
         commit_record = commits[key]
+        prev_binding = (
+            init_by_sh[(sequence, head)] if chunk == 0
+            else by_key[(sequence, head, chunk - 1)]
+        )
         effects = (
             _effect(read_record["target"], "read", read_record["version"]),
             _effect(write_record["target"], "write", write_record["version"]),
             _effect(commit_record["target"], "commit", commit_record["version"]),
         )
+        if chunk == 0:
+            chunk_ports = PortSet(
+                tensor_in=(TensorPortSpec(
+                    name=f"{prev_binding['target']}:snapshot",
+                    direction="in",
+                    representation=prev_binding.get("representation") or prev_binding["dtype"],
+                    dtype=prev_binding["dtype"],
+                    layout_kind=prev_binding.get("layout_kind", "contiguous"),
+                    scope="layer",
+                    owner=prev_binding.get("owner", owner),
+                    readiness="producer_complete",
+                    optional=False,
+                ),),
+                tensor_out=_binding_ports(
+                    (binding,), direction="out",
+                    owner=binding.get("owner", owner),
+                    readiness="producer_complete", optional=False).tensor_out,
+            )
+        else:
+            chunk_ports = _binding_ports(
+                (binding,), direction="inout",
+                owner=binding.get("owner", owner),
+                readiness="producer_complete", optional=False)
         internal[key] = ProgramFragment(
             f"{op.op_id}:state_chunk:{key[0]}:{key[1]}:{key[2]}",
             state_effects=effects,
-            ports=_binding_ports(
-                (binding,), direction="inout",
-                owner=binding.get("owner", owner),
-                readiness="producer_complete", optional=False),
-            attrs=_binding_attr((binding,)))
+            ports=chunk_ports,
+            attrs=_binding_attr((prev_binding, binding)))
     publication = []
     publication_bindings = tuple(contract.get("publication_bindings", ()))
     for sequence, binding in enumerate(publication_bindings):
@@ -450,8 +485,10 @@ def state_accesses(op):
             grant=binding.get("grant") or "", decision=None,
             last_use="before_head_initialize", generation=record["version"],
             physical_key=f"{binding['storage']}:head:{head}", sequence=sequence, rows=1))
+    init_by_sh = {}
     for record, binding in zip(contract["initialize_write_records"], initialize_bindings):
         sequence, head = record["sequence"], record["head"]
+        init_by_sh[(sequence, head)] = binding
         request = request_ids[sequence] if sequence < len(request_ids) else str(sequence)
         result.append(_kda_access_row(
             op, contract, occurrence=f"{op.op_id}:initialize:{sequence}:{head}",
@@ -459,28 +496,38 @@ def state_accesses(op):
             record=record, binding=binding, owner=f"{owner}.head[{head}]",
             source=record["producer"], grant="", decision="initial_materialization",
             last_use="next_head_chunk_read", generation=record["version"],
-            physical_key=f"{binding['storage']}:head:{head}", sequence=sequence, rows=1))
+            physical_key=binding["storage"], sequence=sequence, rows=1))
     internal_reads = {(r["sequence"], r["head"], r["chunk"]): r for r in contract["internal_read_records"]}
     internal_writes = {(r["sequence"], r["head"], r["chunk"]): r for r in contract["internal_write_records"]}
+    internal_by_key = dict(contract.get("internal_bindings", ()))
     for key, binding in contract.get("internal_bindings", ()):
         sequence, head, chunk = key
         request = request_ids[sequence] if sequence < len(request_ids) else str(sequence)
         read_record, write_record = internal_reads[key], internal_writes[key]
-        head_owner, phys_key = f"{owner}.head[{head}]", f"{binding['storage']}:head:{head}"
+        head_owner = f"{owner}.head[{head}]"
+        read_binding = (
+            init_by_sh[(sequence, head)]
+            if chunk == 0 and (sequence, head) in init_by_sh
+            else internal_by_key.get((sequence, head, chunk - 1), binding)
+        )
+        read_producer = read_record.get("producer") or (
+            f"{op.op_id}:initialize" if chunk == 0
+            else f"{op.op_id}:state_chunk:{sequence}:{head}:{chunk - 1}"
+        )
         result.append(_kda_access_row(
             op, contract, occurrence=f"{op.op_id}:chunk_read:{sequence}:{head}:{chunk}",
-            producer=binding["producer"], request=request, direction="read", position="state",
-            record=read_record, binding=binding, owner=head_owner,
-            source=binding["producer"], grant="", decision=None,
+            producer=read_producer, request=request, direction="read", position="state",
+            record=read_record, binding=read_binding, owner=head_owner,
+            source=read_producer, grant="", decision=None,
             last_use="before_chunk_store", generation=read_record["version"],
-            physical_key=phys_key, sequence=sequence, rows=1))
+            physical_key=read_binding["storage"], sequence=sequence, rows=1))
         result.append(_kda_access_row(
             op, contract, occurrence=f"{op.op_id}:write:{sequence}:{head}:{chunk}",
             producer=write_record["producer"], request=request, direction="write", position="state",
             record=write_record, binding=binding, owner=head_owner,
             source=write_record["producer"], grant="", decision="internal_chunk_commit",
             last_use="next_head_chunk_read", generation=write_record["generation"],
-            physical_key=phys_key, sequence=sequence, rows=1))
+            physical_key=binding["storage"], sequence=sequence, rows=1))
     for sequence, binding in enumerate(publication_bindings):
         record = contract["publication_write_records"][sequence]
         request = request_ids[sequence] if sequence < len(request_ids) else str(sequence)

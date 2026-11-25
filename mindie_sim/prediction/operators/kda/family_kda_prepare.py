@@ -11,13 +11,18 @@
 [Timeouts & Locks] Pure metadata validation; no I/O or locks.
 [Side-Effect Policy] No device work, source reads or global mutation.
 """
+from typing import Literal
+
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import PlannedRecipe
 from mindie_sim.prediction.operators.kda import family_kda_state
 from mindie_sim.prediction.operators.kda import kda_prepare, kda_state
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 IMPLEMENTATION = kda_prepare.IMPLEMENTATION
 CAPABILITIES = frozenset({"prefill_gate_prepare", "prefill_fwd_h", "in_kernel_gates"})
+SOURCES: tuple[SourceRef, ...] = kda_prepare.SOURCES
 SOURCE = {
     "repository": "vllm-ascend",
     "revision": "ae923905948f360f4b7ab06df52d0789a0c9316e",
@@ -86,30 +91,32 @@ def validate(*, key_heads, value_heads, key_width, value_width, model):
 def bind_gate_prepare(ops, *, gate, local_ops, lengths, heads, key_heads, dk, dv,
                       chunk, dtype, raw_g_dtype="bf16", gate_dtype="fp32",
                       beta_dtype="fp32", requests=(), pcp=1,
-                      speculative=False):
+                      speculative=False, safe_gate=None,
+                      kda_gate_lower_bound=None):
     return kda_prepare.bind_gate_prepare(
         ops, gate=gate, local_ops=local_ops, lengths=lengths, heads=heads,
         key_heads=key_heads, dk=dk, dv=dv, chunk=chunk, dtype=dtype,
         raw_g_dtype=raw_g_dtype, gate_dtype=gate_dtype,
         beta_dtype=beta_dtype, requests=requests, pcp=pcp,
-        speculative=speculative)
+        speculative=speculative, safe_gate=safe_gate,
+        kda_gate_lower_bound=kda_gate_lower_bound)
 
 
 def bind_prefill_scans(scans, *, lengths, heads, key_heads, dk, dv, chunk,
                        dtype, state_dtype, requests, pcp=1, speculative=False,
-                       state_contexts=None, state_targets=None,
+                       views=None, state_contexts=None, state_targets=None,
                        state_values=None, layout_values=None,
                        state_ready=(), state_grants=()):
     return family_kda_state.bind_prefill_scans(
         scans, lengths=lengths, heads=heads, key_heads=key_heads, dk=dk,
         dv=dv, chunk=chunk, dtype=dtype, state_dtype=state_dtype,
-        requests=requests, pcp=pcp, speculative=speculative,
+        requests=requests, pcp=pcp, speculative=speculative, views=views,
         state_contexts=state_contexts, state_targets=state_targets,
         state_values=state_values, layout_values=layout_values,
         state_ready=state_ready, state_grants=state_grants)
 
 
 __all__ = [
-    "CAPABILITIES", "IMPLEMENTATION", "SOURCE", "bind_gate_prepare",
-    "bind_prefill_scans", "recipes", "validate",
+    "CAPABILITIES", "IMPLEMENTATION", "SOURCE", "SOURCES", "TARGET_BACKEND",
+    "bind_gate_prepare", "bind_prefill_scans", "recipes", "validate",
 ]

@@ -6,13 +6,18 @@
 [Timeouts & Locks] Pure metadata operations, no I/O or locks.
 [Side-Effect Policy] Returns immutable operators and local recipe mappings.
 """
+from typing import Literal
+
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from .kda_source import view_state_declaration
 from mindie_sim.prediction.mechanism import PlannedRecipe
 from mindie_sim.prediction.operators.kda import kda_recurrent
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 IMPLEMENTATION = kda_recurrent.IMPLEMENTATION
 SOURCE = kda_recurrent.SOURCE
+SOURCES: tuple[SourceRef, ...] = kda_recurrent.SOURCES
 CAPABILITIES = frozenset({"decode", "in_kernel_gates", "decode_recurrent_source"})
 _SOURCE_KEY_WIDTH = 128
 _SOURCE_VALUE_WIDTHS = (128, 256)
@@ -41,8 +46,10 @@ def bind_decode_scans(scans, *, lengths, heads, key_heads, dk, dv, dtype,
         raise ModelingError("recurrent_kda_decode_scans_missing")
     if views is not None:
         contexts, acceptance = view_state_declaration(views)
-        flags.setdefault("state_contexts", contexts)
-        flags.setdefault("state_acceptance", acceptance)
+        if flags.get("state_contexts") is None:
+            flags["state_contexts"] = contexts
+        if flags.get("state_acceptance") is None:
+            flags["state_acceptance"] = acceptance
     first = scans[0]
     return kda_recurrent.make_op({
         "lengths": tuple(lengths), "heads": heads, "key_heads": key_heads,
