@@ -62,18 +62,19 @@ N_MAX_SWIGLU_QUANT = 8192
 HIDDEN_DIV_INDEXER_QUANT = 32
 HIDDEN_MAX_INDEXER_QUANT = 8192
 HIDDEN_MIN_MEGAMOE_A23 = 1024
-HIDDEN_MIN_MEGAMOE_A5 = 512
+HIDDEN_MIN_MEGAMOE_A5 = 1024
 HIDDEN_MAX_MEGAMOE = 8192
 HIDDEN_DIV_MEGAMOE_A23 = 512
-HIDDEN_DIV_MEGAMOE_A5 = 256
+HIDDEN_DIV_MEGAMOE_A5 = 64
 INTER_MIN_MEGAMOE_A23 = 512
-INTER_MIN_MEGAMOE_A5 = 128
+INTER_MIN_MEGAMOE_A5 = 256
 INTER_DIV_MEGAMOE_A23 = 256
 INTER_DIV_MEGAMOE_A5 = 128
 TOPK_MAX_MEGAMOE_A23 = 16
 TOPK_MAX_MEGAMOE_A5 = 32
 MAX_SHARED_MEGAMOE_A5 = 4
 MAX_EXPERTS_MEGAMOE_A23 = 1024
+MAX_EXPERTS_MEGAMOE_A5 = 2048
 MAX_EXPERTS_GROUPED_MATMUL = 1024
 MAX_EXPERTS_MOE_GATING = 2048
 MQSMLA_HEAD_DIMS = frozenset({512})
@@ -89,6 +90,8 @@ WS_HCCL_ALL = frozenset({2, 4, 8, 16, 32, 64, 128, 256})
 WS_EP_A23 = frozenset({2, 4, 8, 16, 32, 64})
 WS_EP_MEGAMOE_A23 = frozenset({2, 4, 8, 16, 32, 48, 64, 96, 128})
 WS_EP_A5 = frozenset({2, 4, 8, 16, 32, 64, 128, 256})
+MAX_EP_MEGAMOE_A5 = 1024
+WS_EP_MEGAMOE_A5 = frozenset(range(2, MAX_EP_MEGAMOE_A5 + 1))
 
 PLACEMENTS_LOCAL = frozenset({"local"})
 PLACEMENTS_A2 = frozenset({"hccs_single_node", "a2_switched_multinode"})
@@ -329,6 +332,44 @@ def _mk(
         probe_signature_sha256=sig,
         probe_domain_note=full_note,
     )
+
+
+def _a5_megamoe_dtype_tuples() -> tuple[tuple[str, ...], ...]:
+    """Enumerate exact CANN 9.3 Arch35 OpDef ``aclnnMegaMoe`` input port tuples."""
+    bf16_weight_pairs = (
+        ("weight1:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0", "weight2:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0"),
+        ("weight1:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0", "weight2:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0"),
+        ("weight1:fp8_e5m2:ND:mx_fp8:32:fp8_e8m0", "weight2:fp8_e5m2:ND:mx_fp8:32:fp8_e8m0"),
+        ("weight1:fp4_e2m1:FRACTAL_NZ_C0_32:mx_fp4:32:fp8_e8m0", "weight2:fp4_e2m1:FRACTAL_NZ_C0_32:mx_fp4:32:fp8_e8m0"),
+        ("weight1:fp4_e2m1:FRACTAL_NZ:mx_fp4:32:fp8_e8m0", "weight2:fp4_e2m1:FRACTAL_NZ_C0_32:mx_fp4:32:fp8_e8m0"),
+        ("weight1:bf16:ND:dense::none", "weight2:bf16:ND:dense::none"),
+        ("weight1:bf16:FRACTAL_NZ:dense::none", "weight2:bf16:FRACTAL_NZ:dense::none"),
+    )
+    prequant_triples = (
+        ("x:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0", "weight1:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0", "weight2:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0"),
+        ("x:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0", "weight1:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0", "weight2:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0"),
+        ("x:fp8_e5m2:ND:mx_fp8:32:fp8_e8m0", "weight1:fp8_e5m2:ND:mx_fp8:32:fp8_e8m0", "weight2:fp8_e5m2:ND:mx_fp8:32:fp8_e8m0"),
+        ("x:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0", "weight1:fp4_e2m1:FRACTAL_NZ_C0_32:mx_fp4:32:fp8_e8m0", "weight2:fp4_e2m1:FRACTAL_NZ_C0_32:mx_fp4:32:fp8_e8m0"),
+        ("x:fp4_e2m1:ND:mx_fp4:32:fp8_e8m0", "weight1:fp4_e2m1:FRACTAL_NZ:mx_fp4:32:fp8_e8m0", "weight2:fp4_e2m1:FRACTAL_NZ_C0_32:mx_fp4:32:fp8_e8m0"),
+    )
+    rows: list[tuple[str, ...]] = []
+    for tkw_dt in ("fp32", "bf16"):
+        tkw_tok = f"topk_weights:{tkw_dt}:ND:dense::none"
+        for w1_tok, w2_tok in bf16_weight_pairs:
+            rows.append((
+                "context:int32:ND:none::none", "x:bf16:ND:dense::none",
+                "topk_ids:int32:ND:none::none", tkw_tok, w1_tok, w2_tok,
+            ))
+        for x_tok, w1_tok, w2_tok in prequant_triples:
+            rows.append((
+                "context:int32:ND:none::none", x_tok,
+                "topk_ids:int32:ND:none::none", tkw_tok, w1_tok, w2_tok,
+            ))
+            rows.append((
+                "context:int32:ND:none::none", x_tok, "scales:fp8_e8m0:ND:none::none",
+                "topk_ids:int32:ND:none::none", tkw_tok, w1_tok, w2_tok,
+            ))
+    return tuple(rows)
 
 
 def _mc2_entries(
@@ -577,26 +618,7 @@ def _mc2_entries(
             available=True, backend="hccl_mc2", symbol="cann_ops_transformer.ops.mega_moe",
             arch=arch, role="moe_fused_frame", graph_motif="moe_mc2_frame",
             dtype_tuple=(
-                (
-                    (
-                        "context:int32:ND:none::none", "x:bf16:ND:dense::none",
-                        "topk_ids:int32:ND:none::none", "topk_weights:fp32:ND:dense::none",
-                        "weight1:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-                        "weight2:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-                    ),
-                    (
-                        "context:int32:ND:none::none", "x:bf16:ND:dense::none",
-                        "topk_ids:int32:ND:none::none", "topk_weights:fp32:ND:dense::none",
-                        "weight1:fp4_e2m1:FRACTAL_NZ:mx_fp4:32:fp8_e8m0",
-                        "weight2:fp4_e2m1:FRACTAL_NZ:mx_fp4:32:fp8_e8m0",
-                    ),
-                    (
-                        "context:int32:ND:none::none", "x:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0",
-                        "topk_ids:int32:ND:none::none", "topk_weights:fp32:ND:dense::none",
-                        "weight1:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-                        "weight2:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-                    ),
-                ) if is_a5 else (
+                _a5_megamoe_dtype_tuples() if is_a5 else (
                     (
                         "context:int32:ND:none::none", "x:bf16:ND:dense::none",
                         "topk_ids:int32:ND:none::none", "topk_weights:fp32:ND:dense::none",
@@ -616,9 +638,12 @@ def _mc2_entries(
                 )
             ),
             outputs=(
-                ("y:bf16:ND", "expert_token_nums:int32:ND"),
-                ("y:bf16:ND", "expert_token_nums:int32:ND"),
-                ("y:bf16:ND", "expert_token_nums:int32:ND"),
+                (("y:bf16:ND", "expert_token_nums:int32:ND"),) * len(_a5_megamoe_dtype_tuples())
+                if is_a5 else (
+                    ("y:bf16:ND", "expert_token_nums:int32:ND"),
+                    ("y:bf16:ND", "expert_token_nums:int32:ND"),
+                    ("y:bf16:ND", "expert_token_nums:int32:ND"),
+                )
             ),
             shape=AbiShapeConstraints(
                 hidden_range=(HIDDEN_MIN_MEGAMOE_A5 if is_a5 else HIDDEN_MIN_MEGAMOE_A23, HIDDEN_MAX_MEGAMOE),
@@ -627,10 +652,10 @@ def _mc2_entries(
                 inter_divisibility=INTER_DIV_MEGAMOE_A5 if is_a5 else INTER_DIV_MEGAMOE_A23,
                 topk_range=(1, TOPK_MAX_MEGAMOE_A5 if is_a5 else TOPK_MAX_MEGAMOE_A23),
                 max_shared_experts_per_rank=MAX_SHARED_MEGAMOE_A5 if is_a5 else 0,
-                max_experts=0 if is_a5 else MAX_EXPERTS_MEGAMOE_A23,
+                max_experts=MAX_EXPERTS_MEGAMOE_A5 if is_a5 else MAX_EXPERTS_MEGAMOE_A23,
             ),
             placements=PLACEMENTS_A5_MEGAMOE if is_a5 else mc2_place,
-            world_sizes=ep_ws if is_a5 else WS_EP_MEGAMOE_A23,
+            world_sizes=WS_EP_MEGAMOE_A5 if is_a5 else WS_EP_MEGAMOE_A23,
             activations=(
                 frozenset({"swiglu", "swiglustep", "swigluoai", "situglu", "gelu"})
                 if is_a5 else frozenset({"swiglu", "situglu", "swiglustep", "swigluoai"})
@@ -649,7 +674,11 @@ def _mc2_entries(
                 "ops-transformer/mc2/mega_moe/op_host/op_tiling/arch22/mega_moe_tiling_arch22.cpp:105"
             ),
             kernels=("MegaMoe",),
-            note="A5 MXFP8/MXFP4 (mode 4 BF16 in or mode 0 topoType=0); A2/A3 BF16/INT8/INT4 NZ (no FP8)",
+            note=(
+                "A5 A8W8/A8W4(FRACTAL_NZ_C0_32)/A4W4(NZ+NZ_C0_32)/A16W16 (mode 4 BF16 MXFP or mode 0 BF16/prequant topoType=0); has_active_mask=False"
+                if is_a5 else
+                "A5 MXFP8/MXFP4 (mode 4 BF16 in or mode 0 topoType=0); A2/A3 BF16/INT8/INT4 NZ (no FP8)"
+            ),
             observed_kernels=observed,
         ),
     ]
@@ -3416,6 +3445,74 @@ def _self_test_catalogs(snapshots: dict[str, AbiCatalogSnapshot]) -> None:
     assert reg.verify(_q("A5", "aclnnMixedQuantSparseFlashMla", "mixed_quant_sparse_flash_mla", mqs_csa_in, mqs_out)).status == "admitted_shipping"
     assert reg.verify(_q("A5", "aclnnMixedQuantSparseFlashMla", "mixed_quant_sparse_flash_mla", mqs_csa_in[:2], mqs_out)).status == "rejected_abi"
     assert reg.verify(_q("A3", "aclnnMixedQuantSparseFlashMla", "mixed_quant_sparse_flash_mla", mqs_csa_in, mqs_out)).status == "rejected_abi"
+    _self_test_megamoe_catalog(reg)
+
+
+def _self_test_megamoe_catalog(reg: Any) -> None:
+    """Verify A5/A3 MegaMoe coupled layout, mask, mode, scale geometry, rank, and divisibility rules."""
+    from mindie_sim.schema.abi import AbiQueryKey, OperandPortSig
+
+    def _mp(
+        role: str, dt: str, shape: tuple[int, ...], layout: str = "ND",
+        qm: str = "dense", gs: tuple[int, ...] = (1,), sd: str = "none",
+        ss: tuple[int, ...] = (),
+    ) -> OperandPortSig:
+        return OperandPortSig(
+            role=role, dtype=dt, layout=layout, transposed=False, shape=shape,
+            quant_mode=qm, group_shape=gs, scale_dtype=sd, scale_shape=ss,
+        )
+
+    def _mq(
+        w1_layout: str, w2_layout: str, *, dqm: int = 4, mask: bool = False,
+        experts: int = 512, ep: int = 4, w1_shape: tuple[int, ...] = (128, 1280, 2560),
+        w2_shape: tuple[int, ...] = (128, 2560, 640),
+        w1_ss: tuple[int, ...] = (128, 1280, 40, 2), w2_ss: tuple[int, ...] = (128, 2560, 10, 2),
+        tkw_dt: str = "fp32", act: str = "swiglu", act_params: tuple[tuple[str, float], ...] = (),
+    ) -> AbiQueryKey:
+        per_rank = max(1, experts // max(1, ep))
+        return AbiQueryKey(
+            soc_arch="A5", sku_id=SOC_SKU_IDS["A5"].lower(), abi_id="aclnnMegaMoe",
+            graph_motif="moe_mc2_frame", model_scope="target", draft_quant_mode="none",
+            pr_track="shipping",
+            operands=(
+                _mp("context", "int32", (64,), qm="none"),
+                _mp("x", "bf16", (1, 2560)),
+                _mp("topk_ids", "int32", (1, 10), qm="none"),
+                _mp("topk_weights", tkw_dt, (1, 10)),
+                _mp("weight1", "fp4_e2m1", w1_shape, layout=w1_layout, qm="mx_fp4", gs=(32,), sd="fp8_e8m0", ss=w1_ss),
+                _mp("weight2", "fp4_e2m1", w2_shape, layout=w2_layout, qm="mx_fp4", gs=(32,), sd="fp8_e8m0", ss=w2_ss),
+            ),
+            outputs=(_mp("y", "bf16", (1, 2560)), _mp("expert_token_nums", "int32", (per_rank,), qm="none")),
+            rank_placement="ub_ccu_intramachine", world_size=ep, comm_group_id="ep",
+            comm_domain_width=ep, comm_dtype="bf16", reduction_kind="permute",
+            activation_kind=act, activation_params=act_params, has_bias=False,
+            has_active_mask=mask, dispatch_quant_mode=dqm, shared_experts_per_rank=0,
+            top_k=10, moe_expert_num=experts, qk_rope_head_dim=0, mla_variant="none",
+            sfa_dcp_active=False, pcp_size=1, kv_cache_dtype="none",
+            has_kpool_indexer=False, dcp_size=1, is_act_and_mul=True,
+            enabled_stack_passes=frozenset(),
+        )
+
+    assert reg.verify(_mq("FRACTAL_NZ_C0_32", "FRACTAL_NZ_C0_32")).status == "admitted_shipping"
+    assert reg.verify(_mq("FRACTAL_NZ", "FRACTAL_NZ_C0_32")).status == "admitted_shipping"
+    assert reg.verify(_mq("FRACTAL_NZ_C0_32", "FRACTAL_NZ_C0_32", tkw_dt="bf16")).status == "admitted_shipping"
+    assert reg.verify(_mq("FRACTAL_NZ_C0_32", "FRACTAL_NZ_C0_32", w1_shape=(1280, 2560), w2_shape=(2560, 640), w1_ss=(1280, 40, 2), w2_ss=(2560, 10, 2))).status == "admitted_shipping"
+    assert reg.verify(_mq("FRACTAL_NZ_C0_32", "FRACTAL_NZ_C0_32", act="situglu", act_params=(("beta", 1.5),))).status == "admitted_shipping"
+    assert reg.verify(_mq("FRACTAL_NZ_C0_32", "FRACTAL_NZ_C0_32", act="situglu", act_params=())).status == "rejected_abi"
+    assert reg.verify(_mq("FRACTAL_NZ", "FRACTAL_NZ")).status == "rejected_abi"
+    assert reg.verify(_mq("FRACTAL_NZ_C0_32", "FRACTAL_NZ_C0_32", mask=True)).status == "rejected_abi"
+    assert reg.verify(_mq("FRACTAL_NZ_C0_32", "FRACTAL_NZ_C0_32", dqm=0)).status == "rejected_abi"
+    assert reg.verify(_mq("FRACTAL_NZ_C0_32", "FRACTAL_NZ_C0_32", experts=130)).status == "rejected_abi"
+    assert reg.verify(_mq("FRACTAL_NZ_C0_32", "FRACTAL_NZ_C0_32", w1_shape=(2560, 640))).status == "rejected_abi"
+    assert reg.verify(_mq("FRACTAL_NZ_C0_32", "FRACTAL_NZ_C0_32", w1_ss=(1, 1))).status == "rejected_abi"
+    # Pre-quantized x requires scales=(bs, ceil(H/32)) either on x.scale_shape or explicit scales operand.
+    pq_base = _mq("FRACTAL_NZ_C0_32", "FRACTAL_NZ_C0_32", dqm=0)
+    pq_x_ok = _mp("x", "fp8_e4m3fn", (1, 2560), qm="mx_fp8", gs=(32,), sd="fp8_e8m0", ss=(1, 80))
+    pq_x_bad = _mp("x", "fp8_e4m3fn", (1, 2560), qm="mx_fp8", gs=(32,), sd="fp8_e8m0", ss=())
+    from dataclasses import replace
+    assert reg.verify(replace(pq_base, operands=(pq_base.operands[0], pq_x_ok, *pq_base.operands[2:]))).status == "admitted_shipping"
+    assert reg.verify(replace(pq_base, operands=(pq_base.operands[0], pq_x_bad, *pq_base.operands[2:]))).status == "rejected_abi"
+    assert reg.verify(replace(pq_base, operands=(pq_base.operands[0], pq_x_bad, _mp("scales", "fp8_e8m0", (1, 80), qm="none"), *pq_base.operands[2:]))).status == "admitted_shipping"
 
 
 def verify_sealed_dir(abi_dir: Path) -> dict[str, dict[str, Any]]:

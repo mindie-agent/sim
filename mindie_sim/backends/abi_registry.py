@@ -22,6 +22,7 @@ from functools import lru_cache
 import importlib.metadata
 import importlib.resources
 import json
+import math
 from pathlib import Path
 import site
 import sys
@@ -457,6 +458,30 @@ _HEAD_DIM_PORT_ROLES = ("q", "query", "x")
 _KV_HEAD_PORT_ROLES = ("ori_kv", "k_cache", "kv_cache", "key", "k", "kv", "window")
 _MOE_GATING_TOPK_IDS = frozenset({"torch_npu.npu_moe_gating_top_k", "aclnnMoeGatingTopK"})
 _MLA_PROLOG_WEIGHT_UK_IDS = frozenset({"aclnnMlaPrologV3WeightNz", "aclnnMlaPrologV4WeightNz"})
+_MEGAMOE_DISPATCH_MODE_PASSTHROUGH = 0
+_MEGAMOE_DISPATCH_MODE_INT8 = 2
+_MEGAMOE_DISPATCH_MODE_MXFP = 4
+_MEGAMOE_MAX_EXPERTS_A5 = 2048
+_MEGAMOE_MAX_EXPERT_PER_RANK_A5 = 1024
+_MEGAMOE_MAX_EXPERTS_A23 = 1024
+_MEGAMOE_MAX_EXPERT_PER_RANK_A23 = 128
+_MEGAMOE_A5_HIDDEN_DIM_MIN = 512
+_MEGAMOE_A5_HIDDEN_DIM_MAX = 8192
+_MEGAMOE_A5_HIDDEN_DIM_ALIGN = 256
+_MEGAMOE_A5_URMA_PLACEMENTS = frozenset({"urma_cross_supernode", "layered_ub_roce"})
+_MEGAMOE_A5_URMA_ALLOWED_ACTIVATIONS = frozenset({"swiglu", "situglu", "gelu"})
+_MEGAMOE_A5_PREQUANT_DTYPES = frozenset({"fp8_e4m3fn", "fp8_e5m2", "fp4_e2m1"})
+_MEGAMOE_A5_MXFP_WEIGHT_DTYPES = frozenset({"fp8_e4m3fn", "fp8_e5m2", "fp4_e2m1"})
+_MEGAMOE_A23_INT_WEIGHT_DTYPES = frozenset({"int8", "int4"})
+_MEGAMOE_FLOAT_WEIGHT_DTYPES = frozenset({"bf16", "fp16"})
+_MEGAMOE_PORT_IDX_X = 1
+_MEGAMOE_PORT_IDX_TOPK_IDS = 2
+_MEGAMOE_PORT_IDX_TOPK_WEIGHTS = 3
+_MEGAMOE_PORT_IDX_WEIGHT1 = 4
+_MEGAMOE_PORT_IDX_WEIGHT2 = 5
+_MEGAMOE_MX_SCALE_ALIGN = 64
+_MEGAMOE_MX_SCALE_TRAILING = 2
+_MEGAMOE_A5_MAX_EP = 1024
 
 
 def _resolve_port_by_roles(
@@ -491,7 +516,11 @@ def _extract_mkn(query: AbiQueryKey) -> tuple[int, int, int]:
         elif len(act_shape) == 1:
             k_dim = act_shape[0]
     if wt_port is not None and len(wt_port.shape) >= _RANK_2D:
-        if wt_port.layout.startswith("FRACTAL_NZ") and len(wt_port.shape) == _RANK_5D:
+        if query.abi_id == "aclnnMegaMoe":
+            raw_hidden = wt_port.shape[-2] if query.soc_arch == "A5" else wt_port.shape[-1]
+            act_div = 1 if query.activation_kind == "gelu" else _EVEN_DIVISOR
+            n_dim = raw_hidden // act_div if raw_hidden > 0 else 0
+        elif wt_port.layout.startswith("FRACTAL_NZ") and len(wt_port.shape) == _RANK_5D:
             n_dim = wt_port.shape[1] * wt_port.shape[_RANK_4D]
         elif wt_port.layout.startswith("FRACTAL_NZ") and len(wt_port.shape) == _RANK_4D:
             n_dim = wt_port.shape[0] * wt_port.shape[_RANK_3D]
@@ -718,8 +747,197 @@ def _check_comm_bytes_cap(entry: ProbedAbiEntry, query: AbiQueryKey, m_dim: int,
     return None
 
 
+def _check_megamoe_mode_and_params(
+    entry: ProbedAbiEntry, query: AbiQueryKey, x_p: OperandPortSig, w1_p: OperandPortSig,
+) -> str | None:
+    """Validate CANN ``aclnnMegaMoe`` dispatch mode, active mask, bias, placement, and activation params."""
+    x_dt = _norm_dtype(x_p.dtype)
+    w1_dt = _norm_dtype(w1_p.dtype)
+    if entry.device_arch == "A5":
+        if query.has_active_mask:
+            return "rejected_shape_or_align:megamoe_a5_forbids_active_mask"
+        if query.world_size > _MEGAMOE_A5_MAX_EP:
+            return f"rejected_rank_domain:megamoe_a5_ep_exceeds_max:ep={query.world_size}"
+        if x_dt in _MEGAMOE_A5_PREQUANT_DTYPES:
+            if query.dispatch_quant_mode != _MEGAMOE_DISPATCH_MODE_PASSTHROUGH:
+                return f"rejected_shape_or_align:megamoe_a5_prequant_requires_mode_0:got={query.dispatch_quant_mode}"
+            if query.rank_placement != "ub_ccu_intramachine":
+                return f"rejected_rank_domain:megamoe_a5_prequant_requires_mte:placement={query.rank_placement}"
+        elif x_dt == "bf16" and w1_dt in _MEGAMOE_A5_MXFP_WEIGHT_DTYPES:
+            if query.dispatch_quant_mode != _MEGAMOE_DISPATCH_MODE_MXFP:
+                return f"rejected_shape_or_align:megamoe_a5_mxfp_requires_mode_4:got={query.dispatch_quant_mode}"
+        elif x_dt == "bf16" and w1_dt == "bf16":
+            if query.dispatch_quant_mode != _MEGAMOE_DISPATCH_MODE_PASSTHROUGH:
+                return f"rejected_shape_or_align:megamoe_a5_bf16_requires_mode_0:got={query.dispatch_quant_mode}"
+        else:
+            return f"rejected_dtype:megamoe_a5_unsupported_xw_pair:x={x_dt},w1={w1_dt}"
+        if (query.rank_placement in _MEGAMOE_A5_URMA_PLACEMENTS
+                and query.activation_kind not in _MEGAMOE_A5_URMA_ALLOWED_ACTIVATIONS):
+            return f"rejected_dtype:megamoe_a5_urma_forbids_activation:{query.activation_kind}"
+        params = dict(query.activation_params)
+        if query.activation_kind == "situglu":
+            beta = params.get("beta")
+            if beta is None or not math.isfinite(beta) or beta <= 0.0:
+                return f"rejected_shape_or_align:megamoe_a5_situglu_beta_invalid:{beta}"
+            if "linear_beta" in params:
+                lb = params["linear_beta"]
+                if not math.isfinite(lb) or lb <= 0.0:
+                    return f"rejected_shape_or_align:megamoe_a5_situglu_linear_beta_invalid:{lb}"
+        elif query.activation_kind in {"swiglu", "swiglustep"} and "clamp" in params:
+            cl = params["clamp"]
+            if not math.isfinite(cl) or cl < 0.0:
+                return f"rejected_shape_or_align:megamoe_a5_swiglu_clamp_invalid:{cl}"
+        return None
+
+    expected_dqm = (
+        _MEGAMOE_DISPATCH_MODE_INT8 if w1_dt in _MEGAMOE_A23_INT_WEIGHT_DTYPES
+        else (_MEGAMOE_DISPATCH_MODE_PASSTHROUGH if w1_dt in _MEGAMOE_FLOAT_WEIGHT_DTYPES else -1)
+    )
+    if expected_dqm < 0 or query.dispatch_quant_mode != expected_dqm:
+        return (
+            f"rejected_shape_or_align:megamoe_a23_dispatch_quant_mode_mismatch:"
+            f"got={query.dispatch_quant_mode},expected={expected_dqm}"
+        )
+    if w1_dt == "int4" and not query.has_bias:
+        return "rejected_dtype:megamoe_a23_int4_requires_bias"
+    if w1_dt != "int4" and query.has_bias:
+        return f"rejected_dtype:megamoe_a23_bias_forbidden_for_{w1_dt}"
+    return None
+
+
+def _check_megamoe_a5_scales(
+    query: AbiQueryKey,
+    x_p: OperandPortSig,
+    w1_p: OperandPortSig,
+    w2_p: OperandPortSig,
+    per_rank: int,
+    h_dim: int,
+    w1_hidden: int,
+    w2_inter: int,
+) -> str | None:
+    """Validate A5 pre-quantized ``x`` E8M0 scale shape and MX weight scale trailing-2 geometry."""
+    x_dt = _norm_dtype(x_p.dtype)
+    if x_dt in _MEGAMOE_A5_PREQUANT_DTYPES:
+        exp_x_scale = (x_p.shape[0], (h_dim + _MX_BLOCK_SIZE - 1) // _MX_BLOCK_SIZE)
+        scales_p = _resolve_port_by_roles(query.operands, ("scales",), -1)
+        actual_x_scale = scales_p.shape if scales_p is not None else x_p.scale_shape
+        if actual_x_scale != exp_x_scale:
+            return f"rejected_shape_or_align:megamoe_a5_x_scale_shape_mismatch:{actual_x_scale}!={exp_x_scale}"
+    if _norm_dtype(w1_p.dtype) in _MEGAMOE_A5_MXFP_WEIGHT_DTYPES:
+        prefix = (per_rank,) if len(w1_p.shape) == _RANK_3D else ()
+        exp_w1_s = (
+            *prefix, w1_hidden,
+            (h_dim + _MEGAMOE_MX_SCALE_ALIGN - 1) // _MEGAMOE_MX_SCALE_ALIGN,
+            _MEGAMOE_MX_SCALE_TRAILING,
+        )
+        exp_w2_s = (
+            *prefix, h_dim,
+            (w2_inter + _MEGAMOE_MX_SCALE_ALIGN - 1) // _MEGAMOE_MX_SCALE_ALIGN,
+            _MEGAMOE_MX_SCALE_TRAILING,
+        )
+        if w1_p.scale_shape != exp_w1_s:
+            return f"rejected_shape_or_align:megamoe_a5_w1_scale_shape_mismatch:{w1_p.scale_shape}!={exp_w1_s}"
+        if w2_p.scale_shape != exp_w2_s:
+            return f"rejected_shape_or_align:megamoe_a5_w2_scale_shape_mismatch:{w2_p.scale_shape}!={exp_w2_s}"
+    return None
+
+
+def _check_megamoe_constraints(entry: ProbedAbiEntry, query: AbiQueryKey) -> str | None:
+    """Enforce CANN 9.3 ``aclnnMegaMoe`` coupled dispatch/mask/placement/expert/weight invariants."""
+    ws = max(1, int(query.world_size))
+    is_a5 = entry.device_arch == "A5"
+    max_e = _MEGAMOE_MAX_EXPERTS_A5 if is_a5 else _MEGAMOE_MAX_EXPERTS_A23
+    max_per_rank = _MEGAMOE_MAX_EXPERT_PER_RANK_A5 if is_a5 else _MEGAMOE_MAX_EXPERT_PER_RANK_A23
+    if query.moe_expert_num <= 0:
+        return "rejected_shape_or_align:megamoe_expert_num_missing"
+    if query.moe_expert_num < ws or query.moe_expert_num > max_e or (query.moe_expert_num % ws) != 0:
+        return f"rejected_shape_or_align:megamoe_experts_indivisible:E={query.moe_expert_num},ep={ws}"
+    per_rank = query.moe_expert_num // ws
+    if per_rank < 1 or per_rank > max_per_rank:
+        return f"rejected_shape_or_align:megamoe_experts_per_rank_out_of_range:per_rank={per_rank},max={max_per_rank}"
+
+    x_p = _resolve_port_by_roles(query.operands, ("x",), _MEGAMOE_PORT_IDX_X)
+    tk_ids_p = _resolve_port_by_roles(query.operands, ("topk_ids",), _MEGAMOE_PORT_IDX_TOPK_IDS)
+    tk_wt_p = _resolve_port_by_roles(query.operands, ("topk_weights",), _MEGAMOE_PORT_IDX_TOPK_WEIGHTS)
+    w1_p = _resolve_port_by_roles(query.operands, ("weight1",), _MEGAMOE_PORT_IDX_WEIGHT1)
+    w2_p = _resolve_port_by_roles(query.operands, ("weight2",), _MEGAMOE_PORT_IDX_WEIGHT2)
+    if x_p is None or w1_p is None or w2_p is None:
+        return "rejected_shape_or_align:megamoe_required_ports_missing"
+    mode_err = _check_megamoe_mode_and_params(entry, query, x_p, w1_p)
+    if mode_err is not None:
+        return mode_err
+
+    if len(x_p.shape) != _RANK_2D or x_p.shape[0] <= 0 or x_p.shape[1] <= 0:
+        return f"rejected_shape_or_align:megamoe_x_must_be_2d:got={x_p.shape}"
+    h_dim = x_p.shape[1]
+    act_div = 1 if query.activation_kind == "gelu" else _EVEN_DIVISOR
+    if is_a5:
+        if len(w1_p.shape) not in {_RANK_2D, _RANK_3D} or len(w1_p.shape) != len(w2_p.shape):
+            return f"rejected_shape_or_align:megamoe_a5_weight_rank_invalid:w1={w1_p.shape},w2={w2_p.shape}"
+        if len(w1_p.shape) == _RANK_3D and (w1_p.shape[0] != per_rank or w2_p.shape[0] != per_rank):
+            return (
+                f"rejected_shape_or_align:megamoe_weight_local_experts_mismatch:"
+                f"w1={w1_p.shape[0]},w2={w2_p.shape[0]},expected={per_rank}"
+            )
+        w1_hidden, w1_h = w1_p.shape[-2], w1_p.shape[-1]
+        w2_h, w2_inter = w2_p.shape[-2], w2_p.shape[-1]
+        if w1_h != h_dim or w2_h != h_dim:
+            return f"rejected_shape_or_align:megamoe_a5_hidden_mismatch:x_h={h_dim},w1={w1_p.shape},w2={w2_p.shape}"
+        if (w1_hidden < _MEGAMOE_A5_HIDDEN_DIM_MIN
+                or w1_hidden > _MEGAMOE_A5_HIDDEN_DIM_MAX
+                or (w1_hidden % _MEGAMOE_A5_HIDDEN_DIM_ALIGN) != 0):
+            return f"rejected_shape_or_align:megamoe_a5_hidden_dim_invalid:hidden_dim={w1_hidden}"
+        if (w1_hidden % act_div) != 0 or w2_inter != w1_hidden // act_div:
+            return f"rejected_shape_or_align:megamoe_a5_inter_mismatch:w1={w1_p.shape},w2={w2_p.shape},act={query.activation_kind}"
+        scale_err = _check_megamoe_a5_scales(query, x_p, w1_p, w2_p, per_rank, h_dim, w1_hidden, w2_inter)
+        if scale_err is not None:
+            return scale_err
+    else:
+        if len(w1_p.shape) != _RANK_2D or len(w2_p.shape) != _RANK_2D:
+            return f"rejected_shape_or_align:megamoe_a23_weights_must_be_2d:w1={w1_p.shape},w2={w2_p.shape}"
+        w1_h, w1_hidden = w1_p.shape[0], w1_p.shape[1]
+        w2_inter, w2_h = w2_p.shape[0], w2_p.shape[1]
+        if w1_h != h_dim or w2_h != h_dim:
+            return f"rejected_shape_or_align:megamoe_a23_hidden_mismatch:x_h={h_dim},w1={w1_p.shape},w2={w2_p.shape}"
+        if (w1_hidden % act_div) != 0 or w2_inter != w1_hidden // act_div:
+            return f"rejected_shape_or_align:megamoe_a23_inter_mismatch:w1={w1_p.shape},w2={w2_p.shape},act={query.activation_kind}"
+    if query.top_k > 0 and tk_ids_p is not None and tk_ids_p.shape != (x_p.shape[0], query.top_k):
+        return f"rejected_shape_or_align:megamoe_topk_ids_shape_mismatch:{tk_ids_p.shape}!={(x_p.shape[0], query.top_k)}"
+    if tk_ids_p is not None and tk_wt_p is not None and tk_wt_p.shape != tk_ids_p.shape:
+        return f"rejected_shape_or_align:megamoe_topk_weights_shape_mismatch:{tk_wt_p.shape}!={tk_ids_p.shape}"
+    if query.outputs:
+        if query.outputs[0].shape != x_p.shape:
+            return f"rejected_shape_or_align:megamoe_y_shape_mismatch:{query.outputs[0].shape}!={x_p.shape}"
+        if len(query.outputs) >= _RANK_2D and query.outputs[1].shape != (per_rank,):
+            return f"rejected_shape_or_align:megamoe_expert_token_nums_shape_mismatch:{query.outputs[1].shape}!={(per_rank,)}"
+    return None
+
+
+def _check_dispatch_v2_shapes(query: AbiQueryKey) -> str | None:
+    """Enforce ``aclnnMoeDistributeDispatchV2`` worst-case receive capacity conservation."""
+    if not query.operands or not query.outputs:
+        return None
+    x_s = query.operands[0].shape
+    out_s = query.outputs[0].shape
+    if len(x_s) != _RANK_2D or len(out_s) != _RANK_2D or x_s[0] <= 0 or x_s[1] <= 0:
+        return f"rejected_shape_or_align:dispatch_v2_rank_invalid:x={x_s},expand_x={out_s}"
+    if out_s[1] != x_s[1]:
+        return f"rejected_shape_or_align:dispatch_v2_hidden_mismatch:x={x_s},expand_x={out_s}"
+    ws = max(1, int(query.world_size))
+    if ws > 1 and query.moe_expert_num > 0 and query.top_k > 0:
+        local_experts = (query.moe_expert_num + ws - 1) // ws
+        min_capacity = x_s[0] * ws * min(local_experts, query.top_k)
+        if out_s[0] < min_capacity:
+            return f"rejected_shape_or_align:dispatch_v2_expand_x_capacity_underflow:{out_s[0]}<{min_capacity}"
+    return None
+
+
 def _check_op_specific_shapes(entry: ProbedAbiEntry, query: AbiQueryKey) -> str | None:
     """Enforce operator-specific rank/shape invariants grounded in C++ CheckParams."""
+    if entry.abi_id == "aclnnMegaMoe":
+        return _check_megamoe_constraints(entry, query)
+    if entry.abi_id == "aclnnMoeDistributeDispatchV2":
+        return _check_dispatch_v2_shapes(query)
     if entry.abi_id in _MOE_GATING_TOPK_IDS and query.operands:
         x_shape = query.operands[0].shape
         if len(x_shape) != _RANK_2D:
