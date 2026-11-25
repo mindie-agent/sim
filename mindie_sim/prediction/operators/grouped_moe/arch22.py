@@ -346,10 +346,16 @@ def _gated_stages(contract, ctx, name, after, metadata):
 
 
 def _routed_stages(ctx, contract, name, after, metadata, transport_builder):
+    # Arch22 mega_moe_tiling_arch22.cpp:60 does not consume topk_weights_type.
+    contract = replace(contract, topk_weights_type=0) if contract.topk_weights_type else contract
     dispatch, combine = name + "dispatch", name + "combine"
-    stages = routing_stages(dispatch, after, contract, metadata, transport_builder)
+    stages = routing_stages(
+        dispatch, after, contract, metadata, transport_builder, allow_pre_weighted=False,
+    )
     if not contract.m:
-        return stages + routing_stages(combine, (dispatch,), contract, metadata, transport_builder)
+        return stages + routing_stages(
+            combine, (dispatch,), contract, metadata, transport_builder, allow_pre_weighted=False,
+        )
     cohort = tuple((key, value) for key, value in metadata if key in {"cohort_id", "slot"})
     gated, _, _ = _gated_stages(contract, ctx, name, (dispatch,), cohort)
     stages.extend(gated)
@@ -359,7 +365,9 @@ def _routed_stages(ctx, contract, name, after, metadata, transport_builder):
         contract.output_dtype, input_dtype=contract.quant_dtype,
         input_scaled=contract.quant_dtype == "int8", metadata=cohort,
     ))
-    stages.extend(routing_stages(combine, (name + "gmm2",), contract, metadata, transport_builder))
+    stages.extend(routing_stages(
+        combine, (name + "gmm2",), contract, metadata, transport_builder, allow_pre_weighted=False,
+    ))
     return stages
 
 

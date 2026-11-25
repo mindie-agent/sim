@@ -295,19 +295,26 @@ def declare_router_selection(*, ops, key, plan, tokens, weight_dtype, contract_k
                              cann_kind, fused, members, entries, anchor,
                              selection_mode, noaux_tc):
     """Declare the router selection subgraph on its anchor operator."""
+    is_norm_type_2 = (
+        selection_mode == HASH_SELECTION_MODE
+        or str(plan.router_mode or "").strip().lower() == "sqrtsoftplus"
+        or str(cann_kind or "") == "aclnnMoeGatingTopKHash"
+    )
     view = {
         "tokens": tokens, "experts": plan.num_experts, "topk": plan.top_k,
         "dtype": weight_dtype, "native_kind": contract_kind,
         "cann_native_kind": cann_kind, "fused": fused,
         "selection_mode": selection_mode,
         "score_function": plan.router_mode,
-        # The hash call has no in-kernel renormalization: its declared top-k
-        # normalization stays an external consumer.  Every score-based call
-        # (softmax / sigmoid / sqrtsoftplus) owns `renorm=1`.
+        # ``norm_type=2`` (hash / sqrtsoftplus) owns sum-normalization without
+        # setting ``renorm=True``; fused kernels absorb ``route_normalize``
+        # in-kernel, leaving external renormalization whenever unfused.
         "renorm": bool(plan.router_norm_topk
-                       and selection_mode == SCORE_SELECTION_MODE),
+                       and selection_mode == SCORE_SELECTION_MODE
+                       and not is_norm_type_2),
         "external_renorm": bool(plan.router_norm_topk
-                                and selection_mode == HASH_SELECTION_MODE),
+                                and (selection_mode == HASH_SELECTION_MODE or is_norm_type_2)
+                                and not fused),
         "noaux_tc": noaux_tc,
         "routed_scaling_factor": float(plan.routed_scaling_factor),
         "groups": plan.router_groups, "group_topk": plan.router_group_topk,

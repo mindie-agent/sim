@@ -279,6 +279,10 @@ _SITU_UNFUSED_PLAIN_KERNELS: tuple[str, ...] = (
     "Cast", "Slice", "RealDiv", "Tanh", "Mul", "Slice", "Sigmoid", "Mul",
     "Slice", "Mul", "Cast",
 )
+_SITU_GATE_SLICE_RECIPES: frozenset[str] = frozenset({
+    "situ_gate_slice", "situ_sig_slice", "situ_up_slice",
+})
+_SITU_FP32_DTYPES: frozenset[str] = frozenset({"fp32", "float32"})
 
 
 def _is_unquantized_linear(layer_quant, category: str) -> bool:
@@ -412,7 +416,9 @@ def _verify_dequant_situ_quant_abi(
 
 
 def _activation_abi_lowering(
-    plan, runtime, layer_quant, category: str,
+    plan, runtime, layer_quant, category: str, *,
+    activation_dtype: str | None = None,
+    output_dtype: str | None = None,
 ) -> tuple[bool, bool, tuple[tuple[str, object], ...]]:
     """Resolve shipping CANN vs unfused activation lowering strictly via ``ProbedAbiRegistry``.
 
@@ -456,6 +462,12 @@ def _activation_abi_lowering(
                 if has_linear_beta
                 else _SITU_UNFUSED_PLAIN_KERNELS
             )
+            in_dtype = str(activation_dtype or act_fmt or "").strip().lower()
+            out_dtype = str(output_dtype or activation_dtype or act_fmt or "").strip().lower()
+            if in_dtype in _SITU_FP32_DTYPES and kernels and kernels[0] == "Cast":
+                kernels = kernels[1:]
+            if out_dtype in _SITU_FP32_DTYPES and kernels and kernels[-1] == "Cast":
+                kernels = kernels[:-1]
             extra += (("native_kinds", kernels),)
         return bool(is_unquantized), False, extra
     has_clip = (
@@ -513,7 +525,11 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
         metadata=(("ffn_role", "gate_up"), ("ffn_category", category)),
     )
     act_id = prefix + (".situ" if plan.ffn_activation == "situ" else ".swiglu")
-    unfuse_situ, unfuse_clipped, abi_act_meta = _activation_abi_lowering(plan, runtime, layer_quant, category)
+    gate_in_dtype = str(dict(gate.metadata).get("output_format") or gate.dtype or model.activation_dtype)
+    unfuse_situ, unfuse_clipped, abi_act_meta = _activation_abi_lowering(
+        plan, runtime, layer_quant, category,
+        activation_dtype=gate_in_dtype, output_dtype=model.activation_dtype,
+    )
     act_extra_meta = (
         ("ffn_role", "activation"),
         ("ffn_category", category),
@@ -524,7 +540,7 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
         act_ops = list(situ_eager_chain(
             plan=plan, rows=tokens, width=width, op_id=act_id,
             deps=(gate.op_id,), stage=stage, requests=requests,
-            dtype=model.activation_dtype, phase=mode,
+            dtype=gate_in_dtype, output_dtype=model.activation_dtype, phase=mode,
         ))
         # situ_eager_chain already emits every individual kernel op; strip collapsed native_kinds
         # so the final Cast op is not expanded a second time into 14 additional launches.
@@ -1008,8 +1024,11 @@ def _dispatch_routed_inputs(
     absorbed_routing_meta = None
     if pack_quant is not None:
         absorbed_pack, retired = (
-            absorb_init_routing(pack=packing, quantizer=pack_quant, ep=parallel.ep,
-                dispatch_owns_quant=dispatch_quantizes_internally(runtime))
+            absorb_init_routing(
+                pack=packing, quantizer=pack_quant, ep=parallel.ep,
+                dispatch_owns_quant=dispatch_quantizes_internally(runtime),
+                runtime=runtime,
+            )
             if cann_native_active(runtime) else (packing, None))
         if retired is not None:
             pack_idx = next(
@@ -1126,13 +1145,21 @@ def _emit_routed_activation(
     caller, local_rows,
 ):
     """Build routed MoE activation op chain with ABI lowering and segment metadata."""
-    unfuse_situ, unfuse_clipped, abi_act_meta = _activation_abi_lowering(plan, runtime, layer_quant, "routed_expert")
+    gate_in_dtype = (
+        str(dict(gate_segments[0].metadata).get("output_format") or gate_segments[0].dtype or model.activation_dtype)
+        if gate_segments else str(model.activation_dtype)
+    )
+    unfuse_situ, unfuse_clipped, abi_act_meta = _activation_abi_lowering(
+        plan, runtime, layer_quant, "routed_expert",
+        activation_dtype=gate_in_dtype, output_dtype=model.activation_dtype,
+    )
     is_eager_situ = plan.ffn_activation == "situ" and (_is_raw_eager(runtime) or unfuse_situ)
     if is_eager_situ:
         act_ops = list(situ_eager_chain(
             plan=plan, rows=activation_rows, width=expert_width,
             op_id=prefix + ".expert_act", deps=act_deps, stage=stage,
-            requests=requests, dtype=model.activation_dtype, phase=mode,
+            requests=requests, dtype=gate_in_dtype, output_dtype=model.activation_dtype,
+            phase=mode,
         ))
     elif unfuse_clipped:
         act_ops = list(_clipped_swiglu_eager_chain(
@@ -1156,32 +1183,40 @@ def _emit_routed_activation(
     if act_params_meta:
         act_ops[-1] = replace(act_ops[-1], metadata=act_ops[-1].metadata + act_params_meta)
     if gate_segments:
-        gate_consumer = act_ops[0]
-        gate_consumer = replace(gate_consumer, metadata=gate_consumer.metadata + (
-            ("memory_accesses", tuple({
-                "producer": op.op_id,
-                "output": dict(op.metadata).get("primary_output") or "output",
-                "direction": "read", "position": "local",
-                "storage": f"moe.act:{op.op_id}",
-                "bytes": float(int(op.local_shape[0]) * int(op.local_shape[1])
-                               * dtype_bytes(dict(op.metadata).get("output_format") or model.activation_dtype)),
-                "span": ((0, int(op.local_shape[0])),),
-                "last_use": prefix + ".expert_down",
-                "purpose": "gate_output_rows",
-            } for op in gate_segments)),))
+        elided_situ_cast = is_eager_situ and act_ops[0].recipe == "situ_gate_slice"
+        consumer_indices = (
+            tuple(idx for idx, op in enumerate(act_ops) if op.recipe in _SITU_GATE_SLICE_RECIPES)
+            if elided_situ_cast else (0,)
+        )
+        width_divisor = 2 if elided_situ_cast else 1
+        gate_accesses = tuple({
+            "producer": op.op_id,
+            "output": dict(op.metadata).get("primary_output") or "output",
+            "direction": "read", "position": "local",
+            "storage": f"moe.act:{op.op_id}",
+            "bytes": float(
+                int(op.local_shape[0]) * (int(op.local_shape[1]) // width_divisor)
+                * dtype_bytes(dict(op.metadata).get("output_format") or model.activation_dtype)
+            ),
+            "span": ((0, int(op.local_shape[0])),),
+            "last_use": prefix + ".expert_down",
+            "purpose": "gate_output_rows",
+        } for op in gate_segments)
         segment_meta = tuple(
             (op.op_id, dict(op.metadata).get("deepep_physical_row_start"),
              dict(op.metadata).get("deepep_physical_row_stop"),
-             int(op.local_shape[0]), int(op.local_shape[1]))
+             int(op.local_shape[0]), int(op.local_shape[1]) // width_divisor)
             for op in gate_segments)
-        gate_consumer = replace(gate_consumer, metadata=gate_consumer.metadata + (
-            ("activation_input_segments", segment_meta),
-            ("activation_input_bytes", sum(
-                int(op.local_shape[0]) * int(op.local_shape[1])
-                * dtype_bytes(dict(op.metadata).get("output_format") or model.activation_dtype)
-                for op in gate_segments)),
-        ))
-        act_ops[0] = gate_consumer
+        segment_bytes = sum(
+            int(op.local_shape[0]) * (int(op.local_shape[1]) // width_divisor)
+            * dtype_bytes(dict(op.metadata).get("output_format") or model.activation_dtype)
+            for op in gate_segments)
+        for idx in consumer_indices:
+            act_ops[idx] = replace(act_ops[idx], metadata=act_ops[idx].metadata + (
+                ("memory_accesses", gate_accesses),
+                ("activation_input_segments", segment_meta),
+                ("activation_input_bytes", segment_bytes),
+            ))
     activation = act_ops[-1]
     if token_partition is not None and token_partition.activation_owners:
         activation = replace(activation, metadata=activation.metadata + (

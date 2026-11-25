@@ -43,6 +43,7 @@ ROUTING_INDEX_BYTES = 4
 ROUTING_WEIGHT_BYTES = 4
 GROUP_COUNT_BYTES = 8
 PER_TOKEN_SCALE_BYTES = 4
+MEGA_MOE_META_INFO_BYTES = 32
 MX_SCALE_GROUP_SIZE = 32
 MX_SCALE_PAIR_BYTES = 2
 MX_SCALE_PAIR_WIDTH = MX_SCALE_GROUP_SIZE * MX_SCALE_PAIR_BYTES
@@ -327,21 +328,34 @@ class DualBatchMoEPipeline:
         return stages
 
 
-def _routing_local(name, after, contract, metadata, *, dispatch, publish_output, read_counts):
+def _routing_local(
+    name, after, contract, metadata, *, dispatch, publish_output, read_counts,
+    allow_pre_weighted: bool = True,
+):
     payload_dtype = contract.dtype_a if dispatch else contract.output_dtype
     payload = tensor_bytes(contract.m, contract.k, payload_dtype, scaled=payload_dtype == "int8")
-    index_bytes = ROUTING_INDEX_BYTES if dispatch else ROUTING_WEIGHT_BYTES
+    pre_weighted = allow_pre_weighted and int(getattr(contract, "topk_weights_type", 0) or 0) == 1
+    # Arch35 MegaMoeLayered::LoadTopkWeightsToUb (mega_moe_layered_dispatch.h:455)
+    # fetches source FP32 routing weights during dispatch when pre-weighted,
+    # shifting the weight read out of combine and emitting 32 B/row metadata.
+    index_bytes = (
+        (ROUTING_INDEX_BYTES + (ROUTING_WEIGHT_BYTES if pre_weighted else 0))
+        if dispatch
+        else (0 if pre_weighted else ROUTING_WEIGHT_BYTES)
+    )
     count = contract.tokens if dispatch or publish_output else 0
     token_bytes = count * element_bytes(contract.k, contract.output_dtype)
-    read, write = (token_bytes, payload) if dispatch else (
+    meta_write = contract.m * MEGA_MOE_META_INFO_BYTES if (dispatch and pre_weighted) else 0
+    read, write = (token_bytes, payload + meta_write) if dispatch else (
         payload + token_bytes * bool(contract.shared_intermediate), token_bytes
     )
     read += count * contract.top_k * index_bytes
     if read_counts and (count or contract.m):
         read += len(contract.group_rows) * GROUP_COUNT_BYTES
+    combine_ops = (contract.top_k if pre_weighted else 2 * contract.top_k) + bool(contract.shared_intermediate)
     vector = count * contract.k * (
         QUANT_OPS_PER_ELEMENT if dispatch and payload_dtype not in {"bf16", "fp16"} else
-        (1 if dispatch else 2 * contract.top_k + bool(contract.shared_intermediate))
+        (1 if dispatch else combine_ops)
     )
     counts = (("source_tokens", count),) if dispatch else (("output_tokens", count),)
     return StageDemand(name + ":local", after, Work(resources={
@@ -350,11 +364,12 @@ def _routing_local(name, after, contract, metadata, *, dispatch, publish_output,
 
 
 def routing_stages(name, after, contract, metadata, builder: TransportBuilder | None, *,
-                   publish_output=True, read_counts=True):
+                   publish_output=True, read_counts=True, allow_pre_weighted: bool = True):
     """Bind directed peer stages; the endpoint owns token pack and publication."""
     dispatch = name.endswith("dispatch")
     local = _routing_local(name, after, contract, metadata, dispatch=dispatch,
-                           publish_output=publish_output, read_counts=read_counts)
+                           publish_output=publish_output, read_counts=read_counts,
+                           allow_pre_weighted=allow_pre_weighted)
     expected = contract.transport_bytes[0 if dispatch else 1]
     amount = expected or 0
     remote = name + ":transport"

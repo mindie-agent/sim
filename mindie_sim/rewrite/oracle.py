@@ -1175,6 +1175,11 @@ def _report(case, graphs, context, book, replay, *, deadline=None, fast=False, t
                     report = _expand_symmetric_peer_timeline(report, replay_graphs, sym[0], sym[1])
                 if eff_trace > 0:
                     report = _expand_cohort_service_spans(report, replay_graphs, op_rep_map, context=context)
+                if not fast:
+                    # Full cohort replay in ``layer_runs._rebuild_full_cohort_counters``
+                    # already scales ``execution["serviced"]`` and ``resource_busy_ms``
+                    # to exact full depth; only fast-span reports need expansion here.
+                    return report
                 expanded = _expand_cohort_serviced(
                     case, replay_graphs, report, op_rep_map, context, book, replay,
                 )
