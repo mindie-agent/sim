@@ -95,6 +95,7 @@ MAX_BOTTLENECK_OPS = 16
 MAX_SCREEN_CACHE_ENTRIES = 256
 GROUPED_MATRIX_RANK = 3
 _RECIPE_DIGEST_LEN = 16
+_DIFF_OP_OVERLAP_EPS_MS = 1e-9
 _CTX_SITE_RE = re.compile(r"@r(\d+):s(\d+)(?:$|:)")
 @dataclass(frozen=True, slots=True)
 class ScenarioRequest:
@@ -150,6 +151,7 @@ class ScenarioHandle:
     _replay: ReplayOptions = field(repr=False)
     _layer_cache: OrderedDict = field(default_factory=OrderedDict, repr=False, compare=False)
     _candidates: OrderedDict = field(default_factory=OrderedDict, repr=False, compare=False)
+    _finalized: OrderedDict = field(default_factory=OrderedDict, repr=False, compare=False)
     _certificate: dict = field(default_factory=dict, repr=False, compare=False)
     _catalog_memo: dict = field(default_factory=dict, repr=False, compare=False)
     _hardware_cache: list = field(default_factory=list, repr=False, compare=False)
@@ -323,16 +325,18 @@ def _check_budget(budget, deadline):
     if budget.cancelled is not None and budget.cancelled():
         raise TimeoutError("rewrite_oracle_cancelled")
 def _stream_touched_layers(ops: Sequence[OpSpec], stream_plan: Any) -> set[int]:
-    """Return layer indices referenced by any lane assignment or stream event."""
+    """Return target body layer indices touched by lane assignments, stream events, or non-main streams."""
     if stream_plan is None:
         return set()
     touched_ids: set[str] = {oid for oid, _lane in getattr(stream_plan, "assignments", ())}
     for event in getattr(stream_plan, "events", ()):
         touched_ids.add(event.record_after)
         touched_ids.update(event.wait_before)
-    if not touched_ids:
-        return set()
-    return {int(op.layer) for op in ops if op.op_id in touched_ids and _is_target_body_op(op)}
+    return {
+        int(op.layer) for op in ops
+        if _is_target_body_op(op)
+        and (op.op_id in touched_ids or (op.stream or MAIN_STREAM) != MAIN_STREAM)
+    }
 
 
 def refine_layer_cohort_plan(
@@ -530,61 +534,266 @@ def prewarm_cohort_diff_ops(
                     serv_cache[_serv_key(item)] = serv_val
 
 
+def _parse_span_task(task_name: str, known_ids: set[str]) -> tuple[int, str] | None:
+    rep_tok, _, tail = str(task_name).partition(":")
+    if not rep_tok.startswith("r") or not rep_tok[1:].isdigit():
+        return None
+    _, _, tail = tail.partition(":")
+    keys = tail.split(":")
+    for count in range(len(keys), 0, -1):
+        oid = ":".join(keys[:count])
+        if oid in known_ids:
+            return int(rep_tok[1:]), oid
+    return None
+
+
+def _compute_kept_op_shifts(
+    r0_rows: Sequence[Mapping[str, Any]],
+    ops0: Sequence[OpSpec],
+    op_rep_map: Mapping[str, str],
+    context: EvaluationContext | None,
+) -> dict[str, float]:
+    """Reconstruct exact cumulative timeline shift applied to each kept op by cohort expansion."""
+    ops0_by_id = {op.op_id: op for op in ops0}
+    row_by_op = {str(row.get("op_id", "")): row for row in r0_rows}
+    rep_keys: set[tuple[str, int]] = set()
+    skipped_pairs: dict[tuple[str, int], list[tuple[OpSpec, OpSpec]]] = defaultdict(list)
+    skipped_rep_key: dict[tuple[str, int], tuple[str, int]] = {}
+    for oid, rep_oid in op_rep_map.items():
+        op_l = ops0_by_id.get(oid)
+        op_r = ops0_by_id.get(rep_oid)
+        if op_l is None or op_r is None:
+            continue
+        l_key = _body_layer_key(op_l)
+        r_key = _body_layer_key(op_r)
+        if l_key is not None and r_key is not None:
+            rep_keys.add(r_key)
+            skipped_rep_key[l_key] = r_key
+            skipped_pairs[l_key].append((op_l, op_r))
+    rep_rows_by_layer: dict[tuple[str, int], list[Mapping[str, Any]]] = defaultdict(list)
+    for row in r0_rows:
+        op0 = ops0_by_id.get(str(row.get("op_id", "")))
+        bkey = _body_layer_key(op0) if op0 is not None else None
+        if bkey in rep_keys:
+            rep_rows_by_layer[bkey].append(row)
+    rep_span_by_layer: dict[tuple[str, int], float] = {
+        r_key: max(float(r["complete_ms"]) for r in rows) - min(float(r["ready_ms"]) for r in rows)
+        for r_key, rows in rep_rows_by_layer.items()
+        if rows
+    }
+    dur_cache = getattr(context, "_cohort_pkey_dur_cache", None) or {}
+    skipped_span_by_layer: dict[tuple[str, int], float] = {}
+    for l_key, pairs in skipped_pairs.items():
+        span_l = rep_span_by_layer.get(skipped_rep_key[l_key], 0.0)
+        for op_l, op_r in pairs:
+            pkey_l = (int(op_l.stage), physical_key(op_l))
+            pkey_r = (int(op_r.stage), physical_key(op_r))
+            if pkey_l == pkey_r:
+                continue
+            if pkey_l in dur_cache and pkey_r in dur_cache:
+                span_l += float(dur_cache[pkey_l]) - float(dur_cache[pkey_r])
+            elif op_l.op_id in row_by_op and op_r.op_id in row_by_op:
+                span_l += float(row_by_op[op_l.op_id]["elapsed_ms"]) - float(row_by_op[op_r.op_id]["elapsed_ms"])
+        skipped_span_by_layer[l_key] = span_l
+    cum_shift = 0.0
+    seen_skipped: set[tuple[str, int]] = set()
+    kept_shift: dict[str, float] = {}
+    for row in r0_rows:
+        oid = str(row.get("op_id", ""))
+        if oid in op_rep_map:
+            op_l = ops0_by_id.get(oid)
+            l_key = _body_layer_key(op_l) if op_l is not None else None
+            if l_key is not None and l_key not in seen_skipped:
+                seen_skipped.add(l_key)
+                cum_shift += skipped_span_by_layer.get(l_key, 0.0)
+        else:
+            kept_shift[oid] = cum_shift
+    return kept_shift
+
+
 def _expand_cohort_service_spans(
     report: dict[str, Any],
     replay_graphs: Mapping[int, Sequence[OpSpec]],
     op_rep_map: Mapping[str, str],
+    context: EvaluationContext | None = None,
 ) -> dict[str, Any]:
-    """Expand traced service spans from representative layers onto skipped cohort layers."""
+    """Shift kept-op spans to expanded coordinates and expand service spans across all replicas."""
     if not op_rep_map or 0 not in replay_graphs:
         return report
     events = report.get("events") or ()
     evicted = dict(report.get("evicted_service_spans") or {})
     if not events and not evicted:
         return report
-    ready_by_op: dict[tuple[int, str], float] = {}
+    timeline = report.get("timeline") or ()
+    r0_rows = [row for row in timeline if int(row.get("replica", 0)) == 0]
+    kept_shift = _compute_kept_op_shifts(r0_rows, replay_graphs[0], op_rep_map, context)
+    timing_by_op: dict[tuple[int, str], tuple[float, float, float]] = {
+        (int(row.get("replica", 0)), str(row.get("op_id", ""))): (
+            float(row.get("ready_ms", 0.0) or 0.0),
+            float(row.get("complete_ms", 0.0) or 0.0),
+            float(row.get("elapsed_ms", 0.0) or 0.0),
+        )
+        for row in timeline
+    }
     stage_by_op: dict[str, int] = {op.op_id: int(op.stage) for op in replay_graphs[0]}
-    for row in report.get("timeline") or ():
-        ready_by_op[(int(row.get("replica", 0)), str(row.get("op_id", "")))] = float(row.get("ready_ms", 0.0) or 0.0)
-    known_ids = {op.op_id for op in replay_graphs[0]}
+    known_ids = set(stage_by_op)
     rep_spans: dict[tuple[int, str], list[tuple[float, float]]] = defaultdict(list)
-    for ev_name, spans in evicted.items():
-        rep_tok, _, tail = str(ev_name).partition(":")
-        if not rep_tok.startswith("r") or not rep_tok[1:].isdigit():
-            continue
-        _, _, tail = tail.partition(":")
-        keys = tail.split(":")
-        for count in range(len(keys), 0, -1):
-            oid = ":".join(keys[:count])
-            if oid in known_ids:
-                rep_spans[(int(rep_tok[1:]), oid)].extend((float(s), float(e)) for s, e in spans)
-                break
-    for ev in events:
-        if not ev.get("serviced"):
-            continue
-        rep_tok, _, tail = str(ev.get("task", "")).partition(":")
-        if not rep_tok.startswith("r") or not rep_tok[1:].isdigit():
-            continue
-        _, _, tail = tail.partition(":")
-        keys = tail.split(":")
-        for count in range(len(keys), 0, -1):
-            oid = ":".join(keys[:count])
-            if oid in known_ids:
-                rep_spans[(int(rep_tok[1:]), oid)].append((float(ev["start_ms"]), float(ev["end_ms"])))
-                break
     changed = False
+    for ev_name, spans in list(evicted.items()):
+        parsed = _parse_span_task(ev_name, known_ids)
+        if parsed is None:
+            continue
+        rep, oid = parsed
+        sh = kept_shift.get(oid, 0.0)
+        shifted = [(float(s) + sh, float(e) + sh) for s, e in spans]
+        if sh:
+            evicted[ev_name] = shifted
+            changed = True
+        rep_spans[(rep, oid)].extend(shifted)
+    new_events: list[Any] = []
+    events_changed = False
+    for ev in events:
+        parsed = _parse_span_task(str(ev.get("task", "")), known_ids)
+        if parsed is not None and "start_ms" in ev and "end_ms" in ev:
+            rep, oid = parsed
+            sh = kept_shift.get(oid, 0.0)
+            s_ms = float(ev["start_ms"]) + sh
+            e_ms = float(ev["end_ms"]) + sh
+            if sh:
+                new_events.append({**ev, "start_ms": s_ms, "end_ms": e_ms})
+                events_changed = True
+            else:
+                new_events.append(ev)
+            if ev.get("serviced"):
+                rep_spans[(rep, oid)].append((s_ms, e_ms))
+        else:
+            new_events.append(ev)
+    replicas = tuple(sorted(replay_graphs))
     for oid, rep_oid in op_rep_map.items():
         if oid == rep_oid:
             continue
-        src_spans = rep_spans.get((0, rep_oid))
-        if not src_spans:
+        stage = stage_by_op.get(oid, 0)
+        for rep in replicas:
+            src_spans = rep_spans.get((rep, rep_oid)) or rep_spans.get((0, rep_oid))
+            dst_t = timing_by_op.get((rep, oid))
+            rep_t = timing_by_op.get((rep, rep_oid))
+            if not src_spans or dst_t is None or rep_t is None:
+                continue
+            ready_oid, complete_oid, elapsed_oid = dst_t
+            ready_rep, _complete_rep, elapsed_rep = rep_t
+            if not isclose(elapsed_oid, elapsed_rep, rel_tol=1e-9, abs_tol=1e-9):
+                dst_spans = [(ready_oid, max(ready_oid, complete_oid))]
+            else:
+                delta = ready_oid - ready_rep
+                dst_spans = [(s + delta, e + delta) for s, e in src_spans]
+            evicted[f"r{rep}:s{stage}:{oid}"] = dst_spans
+            changed = True
+    if not changed and not events_changed:
+        return report
+    out = {**report, "evicted_service_spans": evicted}
+    if events_changed:
+        out["events"] = new_events
+    return out
+
+
+def _diff_op_isolated_in_timeline(op_id: str, timeline: Sequence[Mapping[str, Any]]) -> bool:
+    """Return True iff ``op_id`` on replica 0 does not overlap any other op in ``timeline``."""
+    target = next(
+        (r for r in timeline if int(r.get("replica", 0)) == 0 and str(r.get("op_id", "")) == op_id),
+        None,
+    )
+    if target is None:
+        return False
+    t_lo = float(target.get("ready_ms", 0.0) or 0.0)
+    t_hi = float(target.get("complete_ms", t_lo) or t_lo)
+    for row in timeline:
+        if int(row.get("replica", 0)) != 0 or str(row.get("op_id", "")) == op_id:
             continue
-        if (0, oid) not in ready_by_op or (0, rep_oid) not in ready_by_op:
-            continue
-        delta = ready_by_op[(0, oid)] - ready_by_op[(0, rep_oid)]
-        evicted[f"r0:s{stage_by_op.get(oid, 0)}:{oid}"] = [(s + delta, e + delta) for s, e in src_spans]
-        changed = True
-    return {**report, "evicted_service_spans": evicted} if changed else report
+        r_lo = float(row.get("ready_ms", 0.0) or 0.0)
+        r_hi = float(row.get("complete_ms", r_lo) or r_lo)
+        if r_lo + _DIFF_OP_OVERLAP_EPS_MS < t_hi and r_hi > t_lo + _DIFF_OP_OVERLAP_EPS_MS:
+            return False
+    return True
+
+
+def _accumulate_diff_cohort_metrics(
+    case: Any,
+    diff_pairs: Sequence[tuple[OpSpec, OpSpec]],
+    rep_timelines: Mapping[tuple[str, int], Sequence[Mapping[str, Any]]],
+    replicas: Sequence[int],
+    context: EvaluationContext,
+    book: RecipeBook,
+    extra_serviced: Counter[str],
+    extra_busy: Counter[str],
+) -> bool:
+    """Accumulate exact serviced & busy deltas for strictly isolated depth-varying diff ops."""
+    for op_r, op_l in diff_pairs:
+        r_key = _body_layer_key(op_r)
+        if (
+            r_key is None
+            or not _is_diff_op_safe_to_price_isolated(op_r)
+            or not _is_diff_op_safe_to_price_isolated(op_l)
+            or float(op_r.link_bytes or 0.0) > 0.0
+            or float(op_l.link_bytes or 0.0) > 0.0
+            or not _diff_op_isolated_in_timeline(op_r.op_id, rep_timelines.get(r_key, ()))
+        ):
+            return False
+    metrics_cache = getattr(context, "_cohort_diff_metrics_cache", None)
+    if metrics_cache is None:
+        metrics_cache = {}
+        try:
+            setattr(context, "_cohort_diff_metrics_cache", metrics_cache)
+        except (AttributeError, TypeError):
+            metrics_cache = None
+
+    def _diff_cache_key(item: OpSpec) -> tuple[Any, ...]:
+        rec_obj = book.recipes.get(item.recipe) if item.recipe else None
+        rec_tag = type(rec_obj).__qualname__ if rec_obj is not None else ""
+        return (int(item.stage), physical_id(item), item.recipe, rec_tag)
+
+    diff_metrics: dict[tuple[int, str], tuple[dict[str, float], dict[str, float]]] = {}
+    for op_r, op_l in diff_pairs:
+        for item in (op_r, op_l):
+            skey = (int(item.stage), physical_id(item))
+            if skey in diff_metrics:
+                continue
+            ckey = _diff_cache_key(item)
+            if metrics_cache is not None and ckey in metrics_cache:
+                diff_metrics[skey] = metrics_cache[ckey]
+                continue
+            ext = {dep: 0.0 for dep in _external_dependencies((item,))}
+            rep_one = graph_costs(
+                case, {0: (item,)}, recipes=book, external_inputs=ext,
+                evaluation=context, isolated=False, include_submission=False,
+                trace_limit=0, fast_span_only=False, timeline_replicas=(0,),
+            )
+            ex_one = rep_one.get("execution") or {}
+            entry = (dict(ex_one.get("serviced") or {}), dict(ex_one.get("resource_busy_ms") or {}))
+            diff_metrics[skey] = entry
+            if metrics_cache is not None:
+                metrics_cache[ckey] = entry
+
+    def _add_mirrored(target: Counter[str], src_map: Mapping[str, float], sign: float) -> None:
+        for res_name, amt in src_map.items():
+            if not amt or "scheduler@" in res_name:
+                continue
+            delta = sign * float(amt)
+            target[res_name] += delta
+            if "@r0:" in res_name:
+                for peer in peers:
+                    target[res_name.replace("@r0:", f"@r{peer}:", 1)] += delta
+
+    peers = replicas[1:]
+    for op_r, op_l in diff_pairs:
+        key_r = (int(op_r.stage), physical_id(op_r))
+        key_l = (int(op_l.stage), physical_id(op_l))
+        serv_l, busy_l = diff_metrics.get(key_l, ({}, {}))
+        serv_r, busy_r = diff_metrics.get(key_r, ({}, {}))
+        _add_mirrored(extra_serviced, serv_l, 1.0)
+        _add_mirrored(extra_busy, busy_l, 1.0)
+        _add_mirrored(extra_serviced, serv_r, -1.0)
+        _add_mirrored(extra_busy, busy_r, -1.0)
+    return True
 
 
 def _expand_cohort_serviced(
@@ -595,8 +804,8 @@ def _expand_cohort_serviced(
     context: EvaluationContext,
     book: RecipeBook,
     replay: ReplayOptions,
-) -> dict[str, Any]:
-    """Reconstruct exact full-graph executed service counters after cohort reduction."""
+) -> dict[str, Any] | None:
+    """Reconstruct exact full-graph executed clocks, busy intervals, and service counters."""
     if not op_rep_map or 0 not in replay_graphs:
         return report
     exec_info = report.get("execution")
@@ -626,6 +835,8 @@ def _expand_cohort_serviced(
         if (int(op_l.stage), physical_key(op_l)) != (int(op_r.stage), physical_key(op_r)):
             diff_pairs.append((op_r, op_l))
     extra: Counter[str] = Counter()
+    extra_busy: Counter[str] = Counter()
+    rep_timelines: dict[tuple[str, int], tuple[Mapping[str, Any], ...]] = {}
     replicas = tuple(sorted(replay_graphs))
     for rep_key, skipped_keys in skipped_layers_by_rep.items():
         if not skipped_keys:
@@ -638,74 +849,40 @@ def _expand_cohort_serviced(
             case, rep_cut, recipes=book, external_inputs=cut_ext,
             evaluation=context, isolated=False,
             include_submission=replay.include_submission,
-            trace_limit=0, fast_span_only=True,
+            trace_limit=0, fast_span_only=False,
+            timeline_replicas=(0,),
         )
         if len(rep_cut) > 1:
             rep_report = _mirror_dedup_directional_evidence(case, context, rep_cut, rep_report)
+        rep_timelines[rep_key] = tuple(rep_report.get("timeline") or ())
         mult = len(skipped_keys)
-        for res_name, amount in (rep_report.get("execution", {}).get("serviced") or {}).items():
+        rep_exec = rep_report.get("execution") or {}
+        for res_name, amount in (rep_exec.get("serviced") or {}).items():
             if amount and "scheduler@" not in res_name:
                 extra[res_name] += float(amount) * mult
-    if diff_pairs:
-        serv_cache = getattr(context, "_cohort_diff_serviced_cache", None)
-        if serv_cache is None:
-            serv_cache = {}
-            try:
-                setattr(context, "_cohort_diff_serviced_cache", serv_cache)
-            except (AttributeError, TypeError):
-                serv_cache = None
-
-        def _diff_cache_key(item: OpSpec) -> tuple[Any, ...]:
-            rec_obj = book.recipes.get(item.recipe) if item.recipe else None
-            rec_tag = type(rec_obj).__qualname__ if rec_obj is not None else ""
-            return (int(item.stage), physical_id(item), item.recipe, rec_tag)
-
-        unique_ops: dict[tuple[int, str], OpSpec] = {}
-        diff_serviced: dict[tuple[int, str], dict[str, float]] = {}
-        for op_r, op_l in diff_pairs:
-            for item in (op_r, op_l):
-                skey = (int(item.stage), physical_id(item))
-                if skey in diff_serviced or skey in unique_ops:
-                    continue
-                ckey = _diff_cache_key(item)
-                if serv_cache is not None and ckey in serv_cache:
-                    diff_serviced[skey] = serv_cache[ckey]
-                else:
-                    unique_ops[skey] = item
-        if unique_ops:
-            oc = operator_costs(
-                case, tuple(unique_ops.values()),
-                recipes=book, evaluation=context, replica=0,
-            )
-            for row in oc.get("operators", ()):
-                skey = (int(dict(row.get("operator") or {}).get("stage", 0) or 0), str(row["physical_id"]))
-                sval = dict(row.get("serviced") or {})
-                diff_serviced[skey] = sval
-                if serv_cache is not None and skey in unique_ops:
-                    serv_cache[_diff_cache_key(unique_ops[skey])] = sval
-        peers = replicas[1:]
-        for op_r, op_l in diff_pairs:
-            key_r = (int(op_r.stage), physical_id(op_r))
-            key_l = (int(op_l.stage), physical_id(op_l))
-            for res_name, amt in diff_serviced.get(key_l, {}).items():
-                if amt and "scheduler@" not in res_name:
-                    extra[res_name] += float(amt)
-                    if "@r0:" in res_name:
-                        for peer in peers:
-                            extra[res_name.replace("@r0:", f"@r{peer}:", 1)] += float(amt)
-            for res_name, amt in diff_serviced.get(key_r, {}).items():
-                if amt and "scheduler@" not in res_name:
-                    extra[res_name] -= float(amt)
-                    if "@r0:" in res_name:
-                        for peer in peers:
-                            extra[res_name.replace("@r0:", f"@r{peer}:", 1)] -= float(amt)
-    if not extra:
-        return report
+        for res_name, busy_amt in (rep_exec.get("resource_busy_ms") or {}).items():
+            if busy_amt and "scheduler@" not in res_name:
+                extra_busy[res_name] += float(busy_amt) * mult
+    if diff_pairs and not _accumulate_diff_cohort_metrics(
+        case, diff_pairs, rep_timelines, replicas, context, book, extra, extra_busy,
+    ):
+        return None
     serviced = dict(exec_info["serviced"])
     for res_name, delta in extra.items():
         if delta:
             serviced[res_name] = max(0.0, float(serviced.get(res_name, 0.0)) + delta)
-    return {**report, "execution": {**exec_info, "serviced": serviced}}
+    busy_ms = dict(exec_info.get("resource_busy_ms") or {})
+    for res_name, delta in extra_busy.items():
+        if delta:
+            busy_ms[res_name] = max(0.0, float(busy_ms.get(res_name, 0.0)) + delta)
+    full_time_ms = float(report.get("complete_ms", report.get("duration_ms", exec_info.get("time_ms", 0.0))))
+    new_exec = {
+        **exec_info,
+        "time_ms": full_time_ms,
+        "serviced": serviced,
+        "resource_busy_ms": busy_ms,
+    }
+    return {**report, "execution": new_exec}
 
 
 def _replicas_hardware_symmetric(case: Any, context: EvaluationContext, replicas: Sequence[int]) -> bool:
@@ -854,6 +1031,67 @@ def _mirror_dedup_directional_evidence(
     return {**report, "execution": new_exec}
 
 
+def _stream_plan_full_main_budget(
+    context: EvaluationContext,
+    stream_plan: Any,
+    ops: Sequence[OpSpec],
+) -> bool:
+    """True when ``MAIN_STREAM`` owns an uncapped ``shared_cap`` core budget on every stage."""
+    if stream_plan is None:
+        return True
+    stages = {int(op.stage) for op in ops} or {0}
+    replica = int(stream_plan.rank)
+    for stage in stages:
+        path = context.bindings.datapath_for_stage(replica, stage)
+        owners = bind_stream_owners(stream_plan, path).get(MAIN_STREAM)
+        if (
+            owners is None
+            or owners.isolation != "shared_cap"
+            or owners.aic_limit < path.aic_count
+            or owners.aiv_limit < path.aiv_count
+        ):
+            return False
+    return True
+
+
+def _resolve_cohort_streams(
+    replay_graphs: Mapping[int, Sequence[OpSpec]],
+    context: EvaluationContext,
+    streams: Sequence[Any],
+    book: Any,
+    eff_trace: int,
+) -> tuple[bool, Any]:
+    """Return ``(eligible, stream0)`` for exact cohort reduction with optional symmetric streams."""
+    if eff_trace > 0 and any(
+        isinstance(rec, _DboGrouped) for rec in (getattr(book, "recipes", None) or {}).values()
+    ):
+        return False, None
+    if not streams:
+        return eff_trace == 0, None
+    by_rank = {int(plan.rank): plan for plan in streams}
+    if len(by_rank) != len(streams) or set(by_rank) != set(replay_graphs) or 0 not in by_rank:
+        return False, None
+    stream0 = by_rank[0]
+    if len(replay_graphs) > 1:
+        sig0 = (stream0.lanes, stream0.assignments, stream0.events)
+        if any((plan.lanes, plan.assignments, plan.events) != sig0 for plan in streams):
+            return False, None
+    if not _stream_plan_full_main_budget(context, stream0, replay_graphs[0]):
+        return False, None
+    touched_ids: set[str] = {oid for oid, _lane in getattr(stream0, "assignments", ())}
+    for event in getattr(stream0, "events", ()):
+        touched_ids.add(event.record_after)
+        touched_ids.update(event.wait_before)
+    if any(
+        (bkey := _body_layer_key(op)) is not None
+        and bkey[0] != "target"
+        and (op.op_id in touched_ids or (op.stream or MAIN_STREAM) != MAIN_STREAM)
+        for op in replay_graphs[0]
+    ):
+        return False, None
+    return True, stream0
+
+
 def _report(case, graphs, context, book, replay, *, deadline=None, fast=False, trace_limit=0, streams=(), cut=False):
     external = {dep: 0.0 for ops in graphs.values()
                 for dep in _external_dependencies(ops) if cut or dep == "analysis_input"}
@@ -861,19 +1099,16 @@ def _report(case, graphs, context, book, replay, *, deadline=None, fast=False, t
     eff_trace = max(trace_limit, replay.event_limit) if not fast else 0
     token = ACTIVE_DEADLINE_MONO.set(deadline)
     try:
-        can_cohort = (
-            not cut and not replay.isolated and 0 in replay_graphs
-            and (
-                (not streams and eff_trace == 0)
-                or (len(replay_graphs) == 1 and len(streams) == 1 and int(streams[0].rank) == 0)
-            )
+        can_cohort, stream0 = (
+            _resolve_cohort_streams(replay_graphs, context, streams, book, eff_trace)
+            if (not cut and not replay.isolated and 0 in replay_graphs)
+            else (False, None)
         )
         sym = _graphs_symmetric_for_dedup(replay_graphs) if (can_cohort and len(replay_graphs) > 1) else None
         if can_cohort and (
             len(replay_graphs) == 1
             or (sym is not None and _replicas_hardware_symmetric(case, context, tuple(sorted(replay_graphs))))
         ):
-            stream0 = streams[0] if (len(replay_graphs) == 1 and streams) else None
             refined = refine_layer_cohort_plan(case, replay_graphs[0], stream_plan=stream0)
             prewarm_cohort_diff_ops(case, replay_graphs[0], refined, context, book)
             report, reduced_map, op_rep_map = execute_native_cohort_graph(
@@ -889,11 +1124,14 @@ def _report(case, graphs, context, book, replay, *, deadline=None, fast=False, t
                 if sym is not None:
                     report = _expand_symmetric_peer_timeline(report, replay_graphs, sym[0], sym[1])
                 if eff_trace > 0:
-                    report = _expand_cohort_service_spans(report, replay_graphs, op_rep_map)
-                report = _expand_cohort_serviced(
+                    report = _expand_cohort_service_spans(report, replay_graphs, op_rep_map, context=context)
+                expanded = _expand_cohort_serviced(
                     case, replay_graphs, report, op_rep_map, context, book, replay,
                 )
-            return report
+                if expanded is not None:
+                    return expanded
+            else:
+                return report
         report = graph_costs(
             case, replay_graphs,
             recipes=book, external_inputs=external, evaluation=context,
@@ -1007,13 +1245,20 @@ def prepare_scenario(
     book_m = (book if mainline.case.runtime.kernels == atomic.case.runtime.kernels
               else RecipeBook.from_mapping(mainline.case.runtime.kernels))
 
+    seed_cut_cache: dict[str, int] = {}
+    seed_full_cache: dict[str, dict[str, Any]] = {}
+
     def prepare_seed(resolved, recipes, tier):
         prepared = resolved.atomic_step
         _check_budget(budget, deadline)
         graphs = {entry.replica: entry.ops for entry in prepared.graph.executable}
-        report = _report(prepared.case, graphs, context, recipes, request.replay, deadline=deadline,
-                         streams=prepared.graph.streams,
-                         trace_limit=MAX_OVERLAP_TRACE_EVENTS if prepared.graph.streams else 0)
+        full_key = _cut_layer_key(graphs, recipes, prepared.graph.streams, False)
+        report = seed_full_cache.get(full_key)
+        if report is None:
+            report = _report(prepared.case, graphs, context, recipes, request.replay, deadline=deadline,
+                             streams=prepared.graph.streams,
+                             trace_limit=MAX_OVERLAP_TRACE_EVENTS if prepared.graph.streams else 0)
+            seed_full_cache[full_key] = report
         seed_plan_sha = plan_sha256(empty_plan(resolved.base_graph_sha256, resolved.framing_sha256))
         evaluation = _evaluation(
             resolved, graphs, report, prepared.graph_id, tier, prepared,
@@ -1034,9 +1279,14 @@ def prepare_scenario(
             _check_budget(budget, deadline)
             cut = layers[item.representative_layer]
             streams = _cut_plans(cut, resolved.stream_plans)
-            report = _report(prepared.case, cut, context, recipes, request.replay, deadline=deadline,
-                             fast=True, cut=True, streams=streams)
-            reference.update(dict.fromkeys(item.layer_indices, round(report["duration_ms"] * NS_PER_MS)))
+            cut_key = _cut_layer_key(cut, recipes, streams, False)
+            span_ns = seed_cut_cache.get(cut_key)
+            if span_ns is None:
+                cut_report = _report(prepared.case, cut, context, recipes, request.replay, deadline=deadline,
+                                     fast=True, cut=True, streams=streams)
+                span_ns = round(cut_report["duration_ms"] * NS_PER_MS)
+                seed_cut_cache[cut_key] = span_ns
+            reference.update(dict.fromkeys(item.layer_indices, span_ns))
         return _Seed(resolved, recipes, evaluation, archetypes, layers, dict(sites),
                      {rank: _work_totals(ops) for rank, ops in graphs.items()},
                      {layer: {rank: _work_totals(ops) for rank, ops in cut.items()} for layer, cut in layers.items()},
@@ -1797,6 +2047,22 @@ def evaluate_rewrites(
         results.append(result)
     return BatchEvaluation(scenario.scenario_digest, "archetype", tuple(results), (monotonic() - started) * 1000)
 
+def _pipeline_implementation_for_op(op: OpSpec, edit: Any) -> str:
+    """Carry verified physical boundary symbol (or explicit unbound formula tag) onto pipeline receipt."""
+    recipe = str(op.recipe or "").strip()
+    if recipe.startswith("rewrite_formula:"):
+        return recipe
+    operation = getattr(edit, "operation", None) if edit is not None else None
+    if isinstance(operation, FuseRegion) and len(operation.kernel_boundaries) == 1:
+        abi_id = str(operation.kernel_boundaries[0].abi_id or "").strip()
+        if abi_id:
+            return abi_id
+    kb = getattr(op, "kernel_binding", None)
+    if kb is not None and getattr(kb, "kernel_id", ""):
+        return str(kb.kernel_id)
+    return recipe or op.family
+
+
 def finalize_plan(
     scenario: ScenarioHandle,
     plan: RewritePlan,
@@ -1813,6 +2079,19 @@ def finalize_plan(
     deadline = _deadline(budget, scenario._replay)
     _check_budget(budget, deadline)
     use_formula = scenario.allow_unbound_formula if allow_unbound_formula is None else bool(allow_unbound_formula)
+    can_memo = dual_certificate is None and dual_program is None and event_dag is None
+    fin_key = (
+        (plan_sha256(plan), use_formula, str(rate_mode), primitive_table_digest_token(primitive_table))
+        if can_memo else None
+    )
+    if fin_key is not None:
+        with scenario._cache_lock:
+            cached_eval = scenario._finalized.get(fin_key)
+            if cached_eval is not None:
+                scenario._finalized.move_to_end(fin_key)
+        if cached_eval is not None:
+            _check_budget(budget, deadline)
+            return cached_eval
     seed = _baseline(scenario, plan)
     resolved, baseline = seed.scenario, seed.evaluation
     applied = apply_plan(plan, resolved)
@@ -1821,32 +2100,49 @@ def finalize_plan(
     )
     overlap = any(len(stream.lanes) > 1 for stream in bound_streams) or any(
         tile.cohort_split == "dbo_2cohort" for tile in applied.tile_bindings)
-    report = _report(resolved.atomic_step.case, graphs, scenario.evaluation_context, book, scenario._replay,
-                     deadline=deadline, streams=bound_streams,
-                     trace_limit=MAX_OVERLAP_TRACE_EVENTS if overlap else 0)
-    absorbed_map = dict(applied.absorbed_atoms)
-    fused_pipelines = tuple(
-        FusedPipelineDescriptor(
-            owner=OpOccurrence(replica, op.stage, _die(resolved, replica, op.stage).rank, op.op_id),
-            family=op.family,
-            implementation=op.recipe or op.family,
-            member_op_ids=(op.op_id,),
-            absorbed_source_op_ids=tuple(absorbed_map[op.op_id]),
-            phases=(),
-            sources=(),
+    can_reuse_baseline = (
+        not plan.edits
+        and not summaries
+        and not applied.absorbed_atoms
+        and not applied.tile_bindings
+        and not applied.prefetch_leases
+        and bound_streams == resolved.stream_plans
+        and (not bound_streams or overlap)
+    )
+    if can_reuse_baseline:
+        step = replace(baseline, graph_id=applied.plan_sha256, plan_sha256=applied.plan_sha256)
+    else:
+        report = _report(resolved.atomic_step.case, graphs, scenario.evaluation_context, book, scenario._replay,
+                         deadline=deadline, streams=bound_streams,
+                         trace_limit=MAX_OVERLAP_TRACE_EVENTS if overlap else 0)
+        absorbed_map = dict(applied.absorbed_atoms)
+        edit_by_op_id = {f"rewrite:{edit.edit_id}": edit for edit in applied.plan.edits}
+        fused_pipelines = tuple(
+            FusedPipelineDescriptor(
+                owner=OpOccurrence(replica, op.stage, _die(resolved, replica, op.stage).rank, op.op_id),
+                family=op.family,
+                implementation=_pipeline_implementation_for_op(op, edit_by_op_id.get(op.op_id)),
+                member_op_ids=(op.op_id,),
+                absorbed_source_op_ids=tuple(absorbed_map[op.op_id]),
+                phases=(),
+                sources=(
+                    (op.kernel_binding.source_ref,)
+                    if getattr(op, "kernel_binding", None) is not None and op.kernel_binding.source_ref is not None
+                    else ()
+                ),
+            )
+            for replica, ops in graphs.items()
+            for op in ops
+            if absorbed_map.get(op.op_id)
         )
-        for replica, ops in graphs.items()
-        for op in ops
-        if absorbed_map.get(op.op_id)
-    )
-    step = _evaluation(
-        resolved, graphs, report, applied.plan_sha256,
-        baseline.tier if not plan.edits else "should_achieve",
-        resolved.atomic_step if not plan.edits else None,
-        scenario_sha256=resolved.scenario_sha256,
-        plan_sha256=applied.plan_sha256,
-        extra_pipelines=fused_pipelines,
-    )
+        step = _evaluation(
+            resolved, graphs, report, applied.plan_sha256,
+            baseline.tier if not plan.edits else "should_achieve",
+            resolved.atomic_step if not plan.edits else None,
+            scenario_sha256=resolved.scenario_sha256,
+            plan_sha256=applied.plan_sha256,
+            extra_pipelines=fused_pipelines,
+        )
     wall = round(step.span_ms * NS_PER_MS)
     if dual_certificate is None and dual_program is None and event_dag is None:
         cacheable = (
@@ -1884,13 +2180,17 @@ def finalize_plan(
                                baseline_work=seed.work, region_summaries=summaries, primitive_table=primitive_table, rate_mode=rate_mode,
                                service_replay=(graphs, book, seed.book, scenario.evaluation_context, deadline),
                                catalog_memo=scenario._catalog_memo)
-    return FullPlanEvaluation(
+    result = FullPlanEvaluation(
         scenario.scenario_digest, applied.plan_sha256, "full", step, wall,
         verification, applied, (monotonic() - started) * 1000, summaries,
         has_unbound_formula_ops=bool(unbound_ops),
         unbound_formula_ops=unbound_ops,
         binding_states=b_states,
     )
+    if fin_key is not None:
+        with scenario._cache_lock:
+            _memo_put(scenario._finalized, fin_key, result)
+    return result
 
 __all__ = [
     "ScenarioRequest", "EvalBudget", "StepArchetype", "ScenarioHandle", "ScenarioDossier",

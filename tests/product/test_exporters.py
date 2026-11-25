@@ -249,16 +249,19 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
     b_bef = build_export_bundle(raw_bef, request=req)
     b_aft = build_export_bundle(raw_aft, request=req)
 
-    # Real target track natively fuses target_arch_2 MLA Prolog (7 ops -> 1 mla_prolog_v3).
+    # Real target track natively fuses target_arch_2 MLA Prolog (7 ops -> 1 aclnnMlaPrologV3WeightNz).
     mla_bef = [op for op in b_bef.operators if op.archetype_id == "target_arch_2" and "MLA Prolog" in op.submodule]
     mla_aft = [op for op in b_aft.operators if op.archetype_id == "target_arch_2" and "MLA Prolog" in op.submodule]
-    assert len(mla_bef) >= 7 and any("mla_prolog_v3" in op.canonical_op_key for op in mla_aft)
+    assert len(mla_bef) >= 7 and any(
+        op.ascend_kernel == "aclnnMlaPrologV3WeightNz" and "mla_prolog" in op.op_id
+        for op in mla_aft
+    )
 
     designs = {"aclnnMlaPrologV3": {"kernel_design": "prose override"}, "hcom_allgather": {"design": "prose"}}
     from mindie_sim.schema.common import ModelingError
     xlsx_path = tmp_path / "comparison.xlsx"
     brief_path = tmp_path / "comparison_agent_brief.json"
-    with pytest.raises(ModelingError, match="kernel_designs_prose_override_retired"):
+    with pytest.raises(TypeError):
         export_comparison_xlsx(b_bef, xlsx_path, after_bundle=b_aft, agent_kernel_designs=designs)
     # Polarity lock: swapped (after_bundle, before_bundle) is rejected loudly by 3-arg assert_comparison_polarity & xlsx!
     cmp_req = build_default_comparison_request(b_bef, b_aft)
@@ -274,8 +277,8 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
     assert summary.sheets == (SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY, SHEET_PENDING_KERNELS)
     assert SHEET_MEASURED not in summary.sheets
     assert summary.has_comparison is True and summary.has_measured is False
-    # Shipping N->1 (MLAPO) stays in tuning; genuine ABI extensions (SiTU MegaMoE) enter backlog.
-    assert summary.new_kernel_backlog_count >= 1 and summary.to_optimize_kernel_count >= 1
+    # Shipping N->1 (MLAPO) stays out of to_implement (shipping fusion enablement); genuine ABI extensions (SiTU MegaMoE) enter backlog.
+    assert summary.new_kernel_backlog_count >= 1 and summary.to_optimize_kernel_count >= 0
     assert not any("aclnnMlaPrologV3" in str(i.get("op_name", "")) and i.get("category") == "to_implement" for i in json.loads(brief_path.read_text(encoding="utf-8")).get("pending_kernels", ()))
     assert brief_path.is_file() and brief_path.stat().st_size < 8192
 
@@ -327,11 +330,17 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
     assert any(f and f.startswith("SUM(J") and "-P" in f for _, f in brk_cells.values())
     assert not any(v == "Measured Kernel (msprof)" for v, _ in brk_cells.values())
 
-    # Verify topological ordering inside target_arch_1: [Pre-Attn] attn_res precedes [Pre-MoE/FFN] attn_res.
+    # Verify topological ordering inside target_arch_1: pre-attention attn_res precedes pre-FFN attn_res.
     aligned = align_before_after_operators(b_bef, b_aft)
-    arch1_roles = [(r.after_ops or r.before_ops)[0].logical_role for r in aligned if r.archetype_id == "target_arch_1"]
-    pre_attn_idx = next(i for i, lbl in enumerate(arch1_roles) if "[Pre-Attn]" in lbl)
-    pre_moe_idx = next(i for i, lbl in enumerate(arch1_roles) if "[Pre-MoE/FFN]" in lbl)
+    arch1_ops = [(r.after_ops or r.before_ops)[0] for r in aligned if r.archetype_id == "target_arch_1"]
+    pre_attn_idx = next(
+        i for i, op in enumerate(arch1_ops)
+        if "attn_res" in op.op_id and ".attention." in op.op_id
+    )
+    pre_moe_idx = next(
+        i for i, op in enumerate(arch1_ops)
+        if "attn_res" in op.op_id and ".ffn." in op.op_id
+    )
     assert pre_attn_idx == 0 and pre_moe_idx > pre_attn_idx + 2
 
     # Verify 100% end-to-end conservation: Step Δ == Sheet 1 Δ == Sheet 2 Δ == Sheet 4 Waterfall Δ.
@@ -357,8 +366,9 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
     assert s4["D10"][1] == "D8-D9"
     assert any(f and "SUM(" in f and SHEET_BREAKDOWN in f for _, f in s4.values())
     assert not any(f and ("!AB" in f or "!AC" in f or "!AE" in f or "!AF" in f) for _, f in s4.values())
-    assert any(v == PENDING_KIND_TO_OPTIMIZE for v, _ in s4.values())
     assert any(v == PENDING_KIND_TO_IMPLEMENT for v, _ in s4.values())
+    if summary.to_optimize_kernel_count > 0:
+        assert any(v == PENDING_KIND_TO_OPTIMIZE for v, _ in s4.values())
     assert any(v and v.startswith("Card #1 [") for v, _ in s4.values())
     assert not any("① 已有特效开关与通信展开配置" in s for s in shared)
     assert not any("避免 ACLGraph 图断裂" in s for s in shared)

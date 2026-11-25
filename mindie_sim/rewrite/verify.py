@@ -78,19 +78,10 @@ _CATLASS_SPEC_META_KEYS = (
 )
 
 
-def _norm_self_prefix(value: Any, self_prefix: str) -> Any:
-    if isinstance(value, str):
-        return value.replace(self_prefix, "__self__:") if self_prefix and self_prefix in value else value
-    if isinstance(value, tuple):
-        return tuple(_norm_self_prefix(item, self_prefix) for item in value)
-    return value
-
-
-def _norm_catalog_op(item: Any, replica: int) -> tuple[Any, ...]:
-    self_prefix = f"analysis{replica}:"
+def _norm_catalog_op(item: Any) -> tuple[Any, ...]:
     meta = tuple(
         sorted(
-            (k, _norm_self_prefix(_canon_digest_value(v), self_prefix))
+            (k, _canon_digest_value(v))
             for k, v in item.metadata
             if k not in _RANK_LABEL_METADATA_KEYS
         )
@@ -319,8 +310,8 @@ def _memoized_catalog_lowering(
         problem = None
         memo_key = (
             tier, tpl_id, _canon_digest_value(params),
-            _norm_catalog_op(op, atomic_entry.replica),
-            tuple(_norm_catalog_op(member, atomic_entry.replica) for member in members),
+            _norm_catalog_op(op),
+            tuple(_norm_catalog_op(member) for member in members),
             _canon_digest_value(_norm_catalog_datapath(path)), limits,
         )
     cached = catalog_memo.get(memo_key)

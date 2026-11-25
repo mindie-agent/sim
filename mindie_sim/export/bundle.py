@@ -17,7 +17,7 @@
 """
 from __future__ import annotations
 
-from collections import OrderedDict, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields as dataclass_fields, replace
 from fractions import Fraction
@@ -48,6 +48,7 @@ from mindie_sim.prediction.efficiency import extract_hardware_peaks
 from mindie_sim.prediction.efficiency.capacity_window import _resolve_speculative_tokens
 from mindie_sim.prediction.evaluation import EvaluationContext
 from mindie_sim.prediction.execution.layer_runs import (
+    _is_target_body_op,
     discover_layer_cohorts,
     execute_native_cohort_graph,
 )
@@ -70,7 +71,7 @@ from mindie_sim.prediction.runtime.exposed_observer import (
     attribute_stream0_intervals,
 )
 from mindie_sim.prediction.results import LoweringRequest
-from mindie_sim.prediction.spine import default_spine
+from mindie_sim.prediction.spine import PredictionSpine, default_spine
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.primitives.loader import _table_band_p50
 from mindie_sim.rewrite.oracle import prewarm_cohort_diff_ops, refine_layer_cohort_plan
@@ -202,6 +203,20 @@ def _normalize_pre_w2a_case_track(raw_track: str) -> str:
     if raw_track == aliases.get("ideal"):
         return "target"
     return raw_track
+
+
+def _resolve_case_stack_track(parsed: Case) -> str:
+    """Project the resolved runtime stack track (including ``raw_eager=True``) onto canonical StackTrack."""
+    meta = dict(parsed.runtime.metadata) if parsed.runtime.metadata else {}
+    ep = meta.get("execution_policy") if isinstance(meta.get("execution_policy"), Mapping) else {}
+    sp = meta.get("single_spine") if isinstance(meta.get("single_spine"), Mapping) else {}
+    raw = str(
+        (meta.get("feature_track_report") or {}).get("feature_track")
+        or meta.get("feature_track")
+        or sp.get("stack_track")
+        or ("eager" if (bool(meta.get("raw_eager")) or bool(ep.get("raw_eager"))) else "")
+    ).strip()
+    return _normalize_pre_w2a_case_track(raw)
 
 
 def _compose_case_track_kwarg(canonical_track: str) -> dict[str, Any]:
@@ -708,7 +723,7 @@ def _assign_op_archetype(
             return archetypes_by_id.get("draft_context_kv") or next(iter(archetypes_by_id.values()))
         if ".s" in oid and layer_idx is not None:
             return archetypes_by_id.get("draft_arch_0") or next(iter(archetypes_by_id.values()))
-        if any(tok in oid for tok in ("final_norm", "logits", "markov")):
+        if any(tok in oid for tok in ("final_norm", "logits", "markov", "select_hidden", ".final.")):
             return archetypes_by_id.get("draft_tail") or next(iter(archetypes_by_id.values()))
         return archetypes_by_id.get("draft_pre") or next(iter(archetypes_by_id.values()))
     if oid.startswith("final.") or oid in {"sp_output_gather", "final_norm", "logits", "logits_gather", "accept"}:
@@ -858,11 +873,21 @@ def _collapse_micro_split_ops(
     return out_rows, out_demands
 
 
-def _fast_graph_id(ops: Sequence[OpSpec], model_name: str, phase: str) -> str:
+def _fast_graph_id(
+    graphs_or_ops: Mapping[int, Sequence[OpSpec]] | Sequence[OpSpec],
+    model_name: str,
+    phase: str,
+) -> str:
     h = hashlib.sha256()
     h.update(f"{model_name}:{phase}:".encode("utf-8"))
-    for op in ops:
-        h.update(f"{op.op_id}|{op.family}|{op.recipe}|{op.local_shape}|".encode("utf-8"))
+    if isinstance(graphs_or_ops, Mapping):
+        for rep, ops in sorted(graphs_or_ops.items()):
+            h.update(f"r{int(rep)}:".encode("utf-8"))
+            for op in ops:
+                h.update(f"{op.op_id}|{op.family}|{op.recipe}|{op.local_shape}|{op.dtype}|".encode("utf-8"))
+    else:
+        for op in graphs_or_ops:
+            h.update(f"{op.op_id}|{op.family}|{op.recipe}|{op.local_shape}|{op.dtype}|".encode("utf-8"))
     return f"sha256:{h.hexdigest()[:GRAPH_DIGEST_HEX_LEN]}"
 
 
@@ -1094,7 +1119,7 @@ def _evaluate_representative_step(
 ) -> tuple[
     Case, list[dict[str, Any]], dict[tuple[int, str], OpSpec],
     dict[str, Sequence[Any]], dict[str, dict[str, Any]], dict[str, dict[str, Any]], str,
-    dict[str, dict[str, float]], Any,
+    dict[str, dict[str, float]], Any, float,
 ]:
     base = spine.stacks.resolve_base(rep_case, LoweringRequest(step=step_req))
     rewritten = spine.rewrite.apply(base, streams=tuple(streams))
@@ -1160,11 +1185,12 @@ def _evaluate_representative_step(
         struct_by_op, subgraph_by_op = _extract_structure_registry_view(
             eff_case, graphs, step_req, semantic_graphs=rewritten.target_graphs,
         )
-    graph_id = _fast_graph_id(graphs.get(0, ()), str(eff_case.model.name), step_req.phase)
+    graph_id = _fast_graph_id(graphs, str(eff_case.model.name), step_req.phase)
     timeline = list(report.get("timeline") or report.get("operators") or ())
+    report_span_ms = float(report.get("duration_ms", 0.0) or 0.0)
     return (
         eff_case, timeline, op_spec_by_key, {}, struct_by_op, subgraph_by_op,
-        graph_id, prepared_work_by_op, rebound_primitive_table,
+        graph_id, prepared_work_by_op, rebound_primitive_table, report_span_ms,
     )
 
 
@@ -1343,19 +1369,66 @@ def format_attnres_depth_note(
     return ""
 
 
+_DRAFT_STEP_PREFIX_RE = re.compile(r"^draft(\d+)\.")
+_REWRITE_FORMULA_MIN_PARTS = 3
+
+
+def _collect_draft_proposal_steps(rows: Sequence[OperatorExportRow]) -> tuple[int, ...]:
+    steps: set[int] = set()
+    for row in rows:
+        if row.model_scope == "draft":
+            m_step = _DRAFT_STEP_PREFIX_RE.match(row.op_id)
+            if m_step is not None:
+                steps.add(int(m_step.group(1)))
+    return tuple(sorted(steps))
+
+
+def _per_layer_timing_key(
+    row: OperatorExportRow,
+    multi_draft_step: bool,
+) -> tuple[str, int] | None:
+    if row.archetype_id in {"target_embed", "target_tail"}:
+        return (row.archetype_id, -1)
+    if row.model_scope == "draft":
+        m_step = _DRAFT_STEP_PREFIX_RE.match(row.op_id)
+        step_suffix = f"_step{m_step.group(1)}" if (multi_draft_step and m_step is not None) else ""
+        if row.archetype_id == "draft_context_kv" and row.layer is not None and row.layer >= 0:
+            return (f"draft_context_kv{step_suffix}", int(row.layer))
+        if row.archetype_id == "draft_arch_0" and row.layer is not None and row.layer >= 0:
+            return (f"draft{step_suffix}", int(row.layer))
+        if row.archetype_id in {"draft_pre", "draft_tail"}:
+            return (f"{row.archetype_id}{step_suffix}", -1)
+        return None
+    if row.layer is not None and row.layer >= 0:
+        return (row.model_scope, int(row.layer))
+    return None
+
+
+def _micro_collapsed_site(row: OperatorExportRow) -> str:
+    match = _RECURRENT_MICRO_PATTERN.match(row.op_id)
+    if match is None and row.archetype_id == "target_tail":
+        match = _RECOVER_SSM_MICRO_PATTERN.match(row.op_id)
+    if match is None:
+        return ""
+    collapsed_id = f"{match.group(1)}.{match.group(2)}" if match.group(1) else str(match.group(2))
+    return strip_op_prefix(collapsed_id)
+
+
 def _extract_per_layer_timings(
     rows: Sequence[OperatorExportRow],
     layer_plans: Sequence[Any] = (),
 ) -> dict[tuple[str, int], dict[str, Any]]:
-    """Capture exact native per-layer physical timings for trace replay & slice reaggregation."""
+    """Capture exact native per-layer and per-proposal physical timings for trace replay."""
     block_by_layer = {
         int(lp.index): int(getattr(lp, "residual_block_size", 0) or 0)
         for lp in layer_plans
     }
+    multi_draft_step = len(_collect_draft_proposal_steps(rows)) > 1
     by_layer: dict[tuple[str, int], list[OperatorExportRow]] = defaultdict(list)
     for row in rows:
-        if row.layer is not None and row.layer >= 0 and row.archetype_id != "target_tail":
-            by_layer[(row.model_scope, int(row.layer))].append(row)
+        key = _per_layer_timing_key(row, multi_draft_step)
+        if key is not None:
+            by_layer[key].append(row)
     out: dict[tuple[str, int], dict[str, Any]] = {}
     for key, l_rows in by_layer.items():
         min_s = min(r.start_us for r in l_rows)
@@ -1366,25 +1439,44 @@ def _extract_per_layer_timings(
         op_dur_ns_map: dict[str, int] = {}
         op_exp_ns_map: dict[str, int] = {}
         op_lstar_ns_map: dict[str, int] = {}
+        micro_groups: dict[str, list[OperatorExportRow]] = defaultdict(list)
         for r in l_rows:
-            site = strip_op_prefix(r.op_id)
-            if site not in op_map:
-                dur_u = max(0.0, r.dur_us)
-                exp_u = 0.0 if r.is_overlapped else max(0.0, r.exposed_dur_us)
-                ls_u = 0.0 if r.is_overlapped else max(0.0, r.l_star_lean_us)
-                op_map[site] = (max(0.0, r.start_us - min_s), dur_u)
-                op_exp_map[site] = exp_u
-                op_lstar_map[site] = ls_u
-                op_dur_ns_map[site] = int(r.dur_ns) if int(r.dur_ns) > 0 else max(0, int(round(dur_u * NS_PER_US)))
-                op_exp_ns_map[site] = (
-                    0 if r.is_overlapped
-                    else (int(r.exposed_ns) if int(r.exposed_ns) > 0 else max(0, int(round(exp_u * NS_PER_US))))
+            sites = [strip_op_prefix(r.op_id)]
+            if r.op_id.startswith("rewrite:") and r.absorbed_source_ops:
+                sites.append(
+                    "rewrite_fused:" + "+".join(strip_op_prefix(src) for src in r.absorbed_source_ops)
                 )
-                op_lstar_ns_map[site] = (
-                    0 if r.is_overlapped
-                    else (int(r.l_star_ns) if int(r.l_star_ns) > 0 else max(0, int(round(ls_u * NS_PER_US))))
-                )
+            micro_site = _micro_collapsed_site(r)
+            if micro_site:
+                micro_groups[micro_site].append(r)
+            dur_u = max(0.0, r.dur_us)
+            exp_u = 0.0 if r.is_overlapped else max(0.0, r.exposed_dur_us)
+            ls_u = 0.0 if r.is_overlapped else max(0.0, r.l_star_lean_us)
+            dur_ns_v = int(r.dur_ns) if int(r.dur_ns) > 0 else max(0, int(round(dur_u * NS_PER_US)))
+            exp_ns_v = (
+                0 if r.is_overlapped
+                else (int(r.exposed_ns) if int(r.exposed_ns) > 0 else max(0, int(round(exp_u * NS_PER_US))))
+            )
+            ls_ns_v = (
+                0 if r.is_overlapped
+                else (int(r.l_star_ns) if int(r.l_star_ns) > 0 else max(0, int(round(ls_u * NS_PER_US))))
+            )
+            for site in sites:
+                if site not in op_map:
+                    op_map[site] = (max(0.0, r.start_us - min_s), dur_u)
+                    op_exp_map[site] = exp_u
+                    op_lstar_map[site] = ls_u
+                    op_dur_ns_map[site] = dur_ns_v
+                    op_exp_ns_map[site] = exp_ns_v
+                    op_lstar_ns_map[site] = ls_ns_v
+        for micro_site, m_rows in micro_groups.items():
+            if micro_site not in op_map and m_rows:
+                m_start = min(mr.start_us for mr in m_rows)
+                m_avg_dur = sum(max(0.0, mr.dur_us) for mr in m_rows) / float(len(m_rows))
+                op_map[micro_site] = (max(0.0, m_start - min_s), m_avg_dur)
         out[key] = {
+            "start_us": min_s,
+            "end_us": max_e,
             "span_us": max(0.0, max_e - min_s),
             "ops": op_map,
             "ops_exposed": op_exp_map,
@@ -1490,13 +1582,45 @@ def _reconcile_draft_schedule_repeats(
     archetypes: Sequence[LayerArchetypeSpec],
     full_schedule: Sequence[TraceScheduleEntry],
     rows: Sequence[OperatorExportRow],
+    *,
+    draft_steps: Sequence[int] = (),
 ) -> tuple[tuple[LayerArchetypeSpec, ...], tuple[TraceScheduleEntry, ...]]:
-    """Align multi-step MTP draft archetype repeat counts & schedule entries with folded rows."""
+    """Align multi-step MTP draft archetype repeat counts & per-proposal execution order."""
+    if len(draft_steps) > 1:
+        active_draft_aids = {r.archetype_id for r in rows if r.model_scope == "draft"}
+        non_draft_prefix: list[TraceScheduleEntry] = []
+        draft_template: list[TraceScheduleEntry] = []
+        non_draft_suffix: list[TraceScheduleEntry] = []
+        seen_draft = False
+        for entry in full_schedule:
+            if entry.scope == "draft":
+                seen_draft = True
+                if entry.archetype_id in active_draft_aids:
+                    draft_template.append(entry)
+            elif seen_draft:
+                non_draft_suffix.append(entry)
+            else:
+                non_draft_prefix.append(entry)
+        expanded_draft = [
+            TraceScheduleEntry(e.archetype_id, e.scope, f"{e.label} [Step {step_i}]", e.full_layer_index)
+            for step_i in draft_steps
+            for e in draft_template
+        ]
+        sched_counts = Counter(e.archetype_id for e in expanded_draft)
+        updated_archs: list[LayerArchetypeSpec] = []
+        for arch in archetypes:
+            cnt = sched_counts.get(arch.archetype_id, 0)
+            if arch.scope == "draft" and cnt > arch.repeat_count:
+                new_title = re.sub(r"\(×\d+\)", f"(×{cnt})", arch.title)
+                arch = replace(arch, repeat_count=cnt, title=new_title)
+            updated_archs.append(arch)
+        return tuple(updated_archs), tuple([*non_draft_prefix, *expanded_draft, *non_draft_suffix])
+
     max_rep_by_arch: dict[str, int] = {}
     for row in rows:
         aid = row.archetype_id
         max_rep_by_arch[aid] = max(max_rep_by_arch.get(aid, 0), max(1, int(row.repeat_count)))
-    updated_archs: list[LayerArchetypeSpec] = []
+    updated_archs = []
     expanded_targets: dict[str, int] = {}
     for arch in archetypes:
         if arch.scope == "draft" and arch.archetype_id in {"draft_arch_0", "draft_context_kv"}:
@@ -1743,6 +1867,34 @@ def _resolve_row_work_metrics(
     return flops, matrix_flops, vec_ops, link_bytes, hbm_r, hbm_w, hbm_tot, mte2, mte3, fixpipe, l2_hit
 
 
+def _native_binding_from_pipeline(pipe: FusedPipelineDescriptor | None) -> dict[str, Any] | None:
+    """Extract verified native kernel boundary metadata from a finalized ``FusedPipelineDescriptor``."""
+    if pipe is None:
+        return None
+    impl = str(pipe.implementation or "").strip()
+    if not impl or impl.startswith((_REWRITE_FORMULA_PREFIX, "rewrite_")):
+        return None
+    src = pipe.sources[0] if getattr(pipe, "sources", None) else None
+    low = impl.lower()
+    if low.startswith("aclnn"):
+        return {
+            "symbol": impl, "backend": "cann_aclnn", "readiness": "shipping",
+            "source": src, "preserve_symbol": True,
+        }
+    if low.startswith("hccl"):
+        return {
+            "symbol": impl, "backend": "hccl_mc2", "readiness": "shipping",
+            "source": src, "preserve_symbol": True,
+        }
+    if low.startswith("catlass."):
+        return {"symbol": impl, "backend": "catlass", "source": src, "preserve_symbol": True}
+    if low.startswith("dsl."):
+        return {"symbol": impl, "backend": "tilelang", "source": src, "preserve_symbol": True}
+    if ":" not in impl:
+        return {"symbol": impl, "source": src, "preserve_symbol": True}
+    return None
+
+
 def _resolve_row_fusion_binding(
     rec: Mapping[str, Any],
     desc: Any,
@@ -1756,8 +1908,13 @@ def _resolve_row_fusion_binding(
         pipe_impl.startswith(_REWRITE_FORMULA_PREFIX)
         or (bool(meta.get("target_rewrite_fused")) and not desc.is_shipping_abi)
     )
+    is_unbound_ext = bool(
+        meta.get("abi_variant_extension")
+        and desc.needs_new_kernel
+        and not desc.is_shipping_abi
+    )
     op_binding = str(meta.get("binding_state") or "").strip() or (
-        BINDING_STATE_UNBOUND_FORMULA if is_unbound_fused else BINDING_STATE_BOUND
+        BINDING_STATE_UNBOUND_FORMULA if (is_unbound_fused or is_unbound_ext) else BINDING_STATE_BOUND
     )
     ascend_kernel = desc.ascend_kernel
     kernel_status = desc.kernel_status
@@ -1766,7 +1923,11 @@ def _resolve_row_fusion_binding(
     is_shipping_abi = bool(desc.is_shipping_abi)
     opt_pillar = ""
     if is_unbound_fused:
-        if ":" in pipe_impl:
+        if pipe_impl.startswith(_REWRITE_FORMULA_PREFIX):
+            parts = pipe_impl.split(":")
+            cand = parts[1] if len(parts) >= _REWRITE_FORMULA_MIN_PARTS else parts[-1]
+            ascend_kernel = cand or ascend_kernel
+        elif ":" in pipe_impl:
             ascend_kernel = pipe_impl.rsplit(":", 1)[-1] or ascend_kernel
         kernel_status = KERNEL_STATUS_NEW_OP
         needs_new_kernel = True
@@ -1851,6 +2012,7 @@ def _build_prelim_operator_rows(
             rec["op_id"], spec, rec["family"], rec["recipe"], rec["shape"], rec["dtype"],
             eff_case, lp, sources_by_op.get(rec["op_id"], ()),
             struct_node=s_node, subgraph_info=sg_info,
+            native_binding=_native_binding_from_pipeline(pipe) if spec is None else None,
         )
         sem_atoms = extract_semantic_atoms(
             rec["op_id"], rec["family"], rec["recipe"], absorbed, metadata=meta,
@@ -2119,6 +2281,81 @@ def _apply_stage_exposed_ns(
     return out_rows, updated_archs, step_span_ns, idle_or_wait_ns
 
 
+def _select_final_receipt_stage(receipt: EngineStepReceipt) -> tuple[Any, Any, bool]:
+    """Select the last committed waterfall stage and whether Stage 3 reverted to baseline."""
+    stage0 = receipt.stage_for("before_merged")
+    stage1 = receipt.stage_for("stage1_ops_config")
+    stage2 = receipt.stage_for("stage2_unmerged_pr")
+    stage3 = receipt.stage_for("stage3_target_after")
+    if stage3 is not None and stage3.status == "committed":
+        final_stage = stage3
+    elif stage2 is not None and stage2.status == "committed":
+        final_stage = stage2
+    elif stage1 is not None and stage1.status == "committed":
+        final_stage = stage1
+    elif stage0 is not None:
+        final_stage = stage0
+    else:
+        final_stage = receipt.stages[-1]
+    reverted = bool(
+        stage3 is None
+        or stage3.status != "committed"
+        or (stage0 is not None and stage3.plan_sha256 == stage0.plan_sha256)
+    )
+    return stage0, final_stage, reverted
+
+
+def _project_stage_step_eval_rows(
+    eff_spine: Any,
+    parsed: Case,
+    step_req: StepRequest,
+    final_stage: Any,
+    *,
+    archetypes: Sequence[LayerArchetypeSpec],
+    rep_lp_by_idx: Mapping[int, Any],
+    rebound_primitive_table: Any,
+    streams: tuple[Any, ...],
+) -> tuple[
+    list[OperatorExportRow],
+    list[tuple[int, int, int, int, int]],
+    tuple[LayerArchetypeSpec, ...],
+    int,
+    int,
+    dict[tuple[int, str], OpSpec],
+    Case,
+    dict[int, dict[str, Any]],
+    str,
+    tuple[FusedPipelineDescriptor, ...],
+    Any,
+]:
+    (
+        st_case, st_raw_records, st_spec_map, st_sources,
+        st_struct, st_subgraph, st_gid, st_pipes, st_pt,
+    ) = _resolve_bundle_step_eval(
+        eff_spine, parsed, step_req, final_stage.step_eval,
+        primitive_table=rebound_primitive_table, streams=streams,
+    )
+    st_filtered, st_tail = _prepare_bundle_records(
+        st_raw_records, archetypes=archetypes, use_archetype_dedup=False,
+    )
+    st_rows, st_demands, st_peaks = _build_prelim_operator_rows(
+        st_filtered, eff_case=st_case, archetypes=archetypes, rep_lp_by_idx=rep_lp_by_idx,
+        use_archetype_dedup=False, sources_by_op=st_sources,
+        struct_by_op=st_struct, subgraph_by_op=st_subgraph,
+        prepared_work_by_op=None, tail_closure=st_tail,
+        pipeline_by_op=_pipeline_map_from_eval(final_stage.step_eval),
+        op_spec_by_key=st_spec_map,
+    )
+    st_rows, st_archs, _, _ = _attribute_full_bundle_stream0(st_rows, archetypes)
+    out_rows, out_archs, out_span_ns, out_idle_ns = _apply_stage_exposed_ns(
+        st_rows, st_archs, final_stage,
+    )
+    return (
+        out_rows, st_demands, out_archs, out_span_ns, out_idle_ns,
+        st_spec_map, st_case, st_peaks, st_gid, st_pipes, st_pt,
+    )
+
+
 def _apply_target_envelope_to_rows(
     prelim_rows: list[OperatorExportRow],
     demands_ns: list[tuple[int, int, int, int, int]],
@@ -2140,32 +2377,7 @@ def _apply_target_envelope_to_rows(
     target_max_trials: int = DEFAULT_EXPORT_TARGET_TRIALS,
     deferred_prelim: bool = False,
     use_archetype_dedup: bool = False,
-) -> tuple[
-    list[OperatorExportRow],
-    list[tuple[int, int, int, int, int]],
-    tuple[LayerArchetypeSpec, ...],
-    tuple[Any, ...],
-    tuple[Any, ...],
-    str,
-    bool,
-    tuple[dict[str, Any], ...],
-    str,
-    Mapping[str, Any],
-    tuple[Any, ...],
-    tuple[dict[str, Any], ...],
-    EngineStepReceipt,
-    bool,
-    int,
-    int,
-    int,
-    bool,
-    dict[tuple[int, str], OpSpec],
-    Case,
-    dict[int, dict[str, Any]],
-    str,
-    tuple[FusedPipelineDescriptor, ...],
-    Any,
-]:
+) -> tuple[Any, ...]:
     """Consume canonical 4-stage ``EngineStepReceipt`` from ``W3a`` ladder."""
     del cluster_conc
     eff_spine = spine if spine is not None else default_spine()
@@ -2182,33 +2394,14 @@ def _apply_target_envelope_to_rows(
         max_trials=max(1, int(target_max_trials)),
         allow_unbound_formula=bool(allow_unbound_formula),
     )
-    stage0 = receipt.stage_for("before_merged")
-    stage1 = receipt.stage_for("stage1_ops_config")
-    stage2 = receipt.stage_for("stage2_unmerged_pr")
-    stage3 = receipt.stage_for("stage3_target_after")
-    if stage3 is not None and stage3.status == "committed":
-        final_stage = stage3
-    elif stage2 is not None and stage2.status == "committed":
-        final_stage = stage2
-    elif stage1 is not None and stage1.status == "committed":
-        final_stage = stage1
-    elif stage0 is not None:
-        final_stage = stage0
-    else:
-        final_stage = receipt.stages[-1]
-
-    reverted_to_native_baseline = bool(
-        stage3 is None
-        or stage3.status != "committed"
-        or (stage0 is not None and stage3.plan_sha256 == stage0.plan_sha256)
-    )
+    stage0, final_stage, reverted_to_native_baseline = _select_final_receipt_stage(receipt)
     stage_waterfall = _build_stage_waterfall_entries(receipt)
     plan_digest = str(final_stage.plan_sha256 or "")
     plan_verified = bool(final_stage.status == "committed" and final_stage.l_star_valid)
     stage_pipelines = tuple(getattr(final_stage.step_eval, "pipelines", ()) or ()) if final_stage.step_eval is not None else ()
     applied_receipts = _extract_applied_edit_receipts(
-        ext_plan,
-        verified=plan_verified and not reverted_to_native_baseline,
+        None if reverted_to_native_baseline else ext_plan,
+        verified=plan_verified,
         pipelines=stage_pipelines,
     )
 
@@ -2232,29 +2425,13 @@ def _apply_target_envelope_to_rows(
     )
     if (has_improved_eval or deferred_prelim) and final_stage.step_eval is not None:
         (
-            st_case, st_raw_records, st_spec_map, st_sources,
-            st_struct, st_subgraph, st_gid, st_pipes, st_pt,
-        ) = _resolve_bundle_step_eval(
-            eff_spine, parsed, step_req, final_stage.step_eval,
-            primitive_table=rebound_primitive_table, streams=streams,
+            out_rows, out_demands, out_archs, out_span_ns, out_idle_ns,
+            out_spec_map, st_case, st_peaks, st_gid, st_pipes, st_pt,
+        ) = _project_stage_step_eval_rows(
+            eff_spine, parsed, step_req, final_stage,
+            archetypes=archetypes, rep_lp_by_idx=rep_lp_by_idx,
+            rebound_primitive_table=rebound_primitive_table, streams=streams,
         )
-        st_filtered, st_tail = _prepare_bundle_records(
-            st_raw_records, archetypes=archetypes, use_archetype_dedup=False,
-        )
-        st_rows, st_demands, st_peaks = _build_prelim_operator_rows(
-            st_filtered, eff_case=st_case, archetypes=archetypes, rep_lp_by_idx=rep_lp_by_idx,
-            use_archetype_dedup=False, sources_by_op=st_sources,
-            struct_by_op=st_struct, subgraph_by_op=st_subgraph,
-            prepared_work_by_op=None, tail_closure=st_tail,
-            pipeline_by_op=_pipeline_map_from_eval(final_stage.step_eval),
-            op_spec_by_key=st_spec_map,
-        )
-        st_rows, st_archs, _, _ = _attribute_full_bundle_stream0(st_rows, archetypes)
-        out_rows, out_archs, out_span_ns, out_idle_ns = _apply_stage_exposed_ns(
-            st_rows, st_archs, final_stage,
-        )
-        out_demands = st_demands
-        out_spec_map = st_spec_map
         if deferred_prelim:
             out_case, out_peaks, out_gid, out_pipes, out_pt = (
                 st_case, st_peaks, st_gid, st_pipes, st_pt,
@@ -2282,31 +2459,72 @@ def _apply_target_envelope_to_rows(
         primitive_table=(None if out_pt is False else out_pt),
     )
     return (
-        out_rows,
-        out_demands,
-        out_archs,
-        (),
-        (),
-        plan_digest,
-        plan_verified,
-        applied_receipts,
-        "",
-        {},
-        co_opps,
-        stage_waterfall,
-        receipt,
-        reverted_to_native_baseline,
-        out_span_ns,
-        out_idle_ns,
-        out_l_star_ns,
-        out_l_star_valid,
-        out_spec_map,
-        out_case,
-        out_peaks,
-        out_gid,
-        out_pipes,
-        out_pt,
+        out_rows, out_demands, out_archs, (), (), plan_digest, plan_verified,
+        applied_receipts, "", {}, co_opps, stage_waterfall, receipt,
+        reverted_to_native_baseline, out_span_ns, out_idle_ns,
+        out_l_star_ns, out_l_star_valid, out_spec_map, out_case,
+        out_peaks, out_gid, out_pipes, out_pt,
     )
+
+
+def _extract_cohort_structure_view(
+    eff_case: Case,
+    exec_graphs: Mapping[int, Sequence[OpSpec]],
+    step_req: StepRequest,
+    *,
+    semantic_graphs: Mapping[int, Sequence[OpSpec]] | None = None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
+    """Extract structure provenance over representative cohort layers and expand to peers."""
+    if 0 not in exec_graphs:
+        return {}, {}
+    ops0 = tuple(exec_graphs[0])
+    refined = refine_layer_cohort_plan(eff_case, ops0)
+    by_layer: dict[int, list[OpSpec]] = defaultdict(list)
+    for op in ops0:
+        if _is_target_body_op(op):
+            by_layer[int(op.layer)].append(op)
+    op_rep_map: dict[str, str] = {}
+    skipped_ids: set[str] = set()
+    kept_layers: set[int] = set()
+    for cohort in refined.cohorts:
+        rep_lyr = int(cohort.representative_layer)
+        kept_layers.add(rep_lyr)
+        rep_ops = by_layer.get(rep_lyr, ())
+        rep_skel = tuple((op.family, op.recipe, op.stream) for op in rep_ops)
+        for lyr in cohort.layer_indices:
+            lyr_i = int(lyr)
+            if lyr_i == rep_lyr:
+                continue
+            l_ops = by_layer.get(lyr_i, ())
+            if tuple((op.family, op.recipe, op.stream) for op in l_ops) == rep_skel:
+                for op_r, op_l in zip(rep_ops, l_ops):
+                    op_rep_map[op_l.op_id] = op_r.op_id
+                    skipped_ids.add(op_l.op_id)
+            else:
+                kept_layers.add(lyr_i)
+    if not skipped_ids:
+        return _extract_structure_registry_view(
+            eff_case, exec_graphs, step_req, semantic_graphs=semantic_graphs,
+        )
+    r0_filtered = tuple(op for op in ops0 if op.op_id not in skipped_ids)
+    sem_filtered: Mapping[int, Sequence[OpSpec]] | None = None
+    if semantic_graphs is not None and 0 in semantic_graphs:
+        sem_filtered = {
+            0: tuple(
+                op for op in semantic_graphs[0]
+                if int(op.layer) < 0 or int(op.layer) in kept_layers
+                or op.op_id.startswith(("draft", "final."))
+            )
+        }
+    struct_by_op, subgraph_by_op = _extract_structure_registry_view(
+        eff_case, {0: r0_filtered}, step_req, semantic_graphs=sem_filtered,
+    )
+    for oid, rep_oid in op_rep_map.items():
+        if rep_oid in struct_by_op and oid not in struct_by_op:
+            struct_by_op[oid] = struct_by_op[rep_oid]
+        if rep_oid in subgraph_by_op and oid not in subgraph_by_op:
+            subgraph_by_op[oid] = subgraph_by_op[rep_oid]
+    return struct_by_op, subgraph_by_op
 
 
 def _resolve_bundle_step_eval(
@@ -2324,10 +2542,34 @@ def _resolve_bundle_step_eval(
 ]:
     eff_streams = tuple(streams) if streams else tuple(getattr(step_eval, "streams", None) or ())
     eff_pt_arg = primitive_table if primitive_table is not None else getattr(step_eval, "primitive_table", None)
-    prepared = spine.lower(eval_case, LoweringRequest(step=step_req), streams=eff_streams)
-    eff_case = prepared.case
-    book = ReplayRecipeBook.from_mapping(eff_case.runtime.kernels, family_registry=spine.families)
-    book.graph = prepared.graph
+    if type(spine) is PredictionSpine:
+        base = spine.stacks.resolve_base(eval_case, LoweringRequest(step=step_req))
+        rewritten = spine.rewrite.apply(base, streams=eff_streams)
+        eff_case = (
+            consume_target_declaration(base.case, rewritten.target_graphs)
+            if rewritten.target_graphs is not None else base.case
+        )
+        book = ReplayRecipeBook.from_mapping(eff_case.runtime.kernels, family_registry=spine.families)
+        book.graph = rewritten
+        r0_entries = tuple(entry for entry in rewritten.executable if int(entry.replica) == 0)
+        if r0_entries:
+            r0_streams = tuple(plan for plan in rewritten.streams if int(plan.rank) == 0)
+            r0_owners = spine._bind_stream_plans(eff_case, r0_streams, frozenset({0}))
+            r0_resolved = spine._resolve_governed_operators(
+                eff_case, replace(rewritten, executable=r0_entries), book, r0_owners,
+            )
+            sources_by_op: dict[str, Sequence[Any]] = {r.occurrence.op_id: r.sources for r in r0_resolved}
+        else:
+            sources_by_op = {}
+    else:
+        prepared = spine.lower(eval_case, LoweringRequest(step=step_req), streams=eff_streams)
+        rewritten = prepared.graph
+        eff_case = prepared.case
+        book = ReplayRecipeBook.from_mapping(eff_case.runtime.kernels, family_registry=spine.families)
+        book.graph = rewritten
+        sources_by_op = {
+            r.occurrence.op_id: r.sources for r in prepared.operators if r.occurrence.replica == 0
+        }
     eval_ctx = EvaluationContext.create(
         eff_case, book, None,
         primitive_table=(False if eff_pt_arg is False else eff_pt_arg),
@@ -2339,22 +2581,19 @@ def _resolve_bundle_step_eval(
     else:
         rebound_pt = eval_ctx.bindings.primitive_table
     op_spec_by_key = _resolve_prepared_op_specs(
-        prepared.graph.executable, eval_ctx,
+        rewritten.executable, eval_ctx,
         case=eff_case, book=book,
-        request_views=getattr(prepared.graph, "request_views", ()),
+        request_views=getattr(rewritten, "request_views", ()),
         padded_tokens=step_req.padded_tokens,
         sequence_layout=step_req.layout,
     )
-    exec_graphs = {e.replica: e.ops for e in prepared.graph.executable}
-    struct_by_op, subgraph_by_op = _extract_structure_registry_view(
-        eff_case, exec_graphs, step_req, semantic_graphs=prepared.graph.target_graphs,
+    exec_graphs = {e.replica: e.ops for e in rewritten.executable}
+    struct_by_op, subgraph_by_op = _extract_cohort_structure_view(
+        eff_case, exec_graphs, step_req, semantic_graphs=rewritten.target_graphs,
     )
     raw_records = _timeline_to_raw_records(
         step_eval.operators, is_step_eval=True, case=eff_case, op_spec_by_key=op_spec_by_key,
     )
-    sources_by_op: dict[str, Sequence[Any]] = {
-        r.occurrence.op_id: r.sources for r in prepared.operators if r.occurrence.replica == 0
-    }
     return (
         eff_case, raw_records, op_spec_by_key, sources_by_op,
         struct_by_op, subgraph_by_op, step_eval.graph_id, step_eval.pipelines, rebound_pt,
@@ -2414,11 +2653,7 @@ def _resolve_bundle_step_context(
     parsed = case if isinstance(case, Case) else parse_case(dict(case))
     meta = dict(parsed.runtime.metadata)
     spec_tokens = int(meta.get("draft_proposal_tokens", 0) or 0)
-    track_name = _normalize_pre_w2a_case_track(str(
-        (meta.get("feature_track_report") or {}).get("feature_track")
-        or meta.get("feature_track")
-        or ""
-    ).strip())
+    track_name = _resolve_case_stack_track(parsed)
     step_req = request if request is not None else (step_eval.request if step_eval is not None else None)
     if step_req is None:
         raise ModelingError(
@@ -2469,6 +2704,7 @@ def _evaluate_bundle_prelim_rows(
     int,
 ]:
     prepared_work_by_op: dict[str, dict[str, float]] = {}
+    report_span_ms = 0.0
     if step_eval is not None:
         (
             eff_case, raw_records, op_spec_by_key, sources_by_op,
@@ -2481,7 +2717,7 @@ def _evaluate_bundle_prelim_rows(
         (
             eff_case, timeline, op_spec_by_key, sources_by_op,
             struct_by_op, subgraph_by_op, graph_id, prepared_work_by_op,
-            rebound_primitive_table,
+            rebound_primitive_table, report_span_ms,
         ) = _evaluate_representative_step(
             spine, eval_case, step_req, replay,
             primitive_table=primitive_table, streams=streams,
@@ -2504,8 +2740,9 @@ def _evaluate_bundle_prelim_rows(
     prelim_rows, archetypes, unfolded_span_ns, unfolded_idle_ns = _attribute_full_bundle_stream0(
         prelim_rows, archetypes,
     )
-    if step_eval is not None:
-        eval_span_ns = max(0, int(round(float(step_eval.span_ms) * NS_PER_MS)))
+    full_span_ms = float(step_eval.span_ms) if step_eval is not None else float(report_span_ms)
+    if full_span_ms > 0.0:
+        eval_span_ns = max(0, int(round(full_span_ms * NS_PER_MS)))
         if eval_span_ns > unfolded_span_ns:
             unfolded_idle_ns += eval_span_ns - unfolded_span_ns
             unfolded_span_ns = eval_span_ns
@@ -2626,6 +2863,7 @@ def build_export_bundle(
             step_l_star_ns = unfolded_l_star_check
 
     # Capture per-layer timings strictly on unfolded rows BEFORE read-only display folding.
+    draft_steps = _collect_draft_proposal_steps(prelim_rows)
     per_layer_timings = _extract_per_layer_timings(prelim_rows, parsed.model.layer_plans)
     if use_archetype_dedup:
         prelim_rows, demands_ns, archetypes = _aggregate_bundle_cohort_rows(
@@ -2640,7 +2878,9 @@ def build_export_bundle(
         rep_lp_by_idx=rep_lp_by_idx, op_spec_by_key=op_spec_by_key,
     )
     prelim_rows, demands_ns = _collapse_micro_split_ops(prelim_rows, demands_ns)
-    archetypes, full_schedule = _reconcile_draft_schedule_repeats(archetypes, full_schedule, prelim_rows)
+    archetypes, full_schedule = _reconcile_draft_schedule_repeats(
+        archetypes, full_schedule, prelim_rows, draft_steps=draft_steps,
+    )
     prelim_rows, demands_ns = _reorder_rows_by_archetype(prelim_rows, demands_ns, archetypes)
     final_rows, rank_order, reconcile_summary = _finalize_ranked_rows(prelim_rows, observations_path)
 
@@ -2913,6 +3153,41 @@ def _resolve_calibrated_launch_us(parsed: Case, primitive_table: Any) -> tuple[f
     return host_launch_us, graph_launch_us, h2d_startup_us
 
 
+def _canonical_step_request_digest_fields(step_req: StepRequest) -> dict[str, Any]:
+    raw_seqs = step_req.sequences
+    if isinstance(raw_seqs, Mapping):
+        norm_seqs: Any = sorted((int(k), int(v)) for k, v in raw_seqs.items())
+    elif isinstance(raw_seqs, (tuple, list)):
+        norm_seqs = [int(v) for v in raw_seqs]
+    else:
+        norm_seqs = int(raw_seqs)
+    norm_reqs = [
+        [
+            str(r.request_id), int(r.q_len), int(r.context), bool(r.samples), str(r.phase),
+            int(r.prefix_tokens), int(r.priority), bool(r.padding), str(r.semantic_phase),
+            str(r.execution_mode), bool(r.media_encoded), bool(r.draft_verify),
+            bool(r.draft_prepare), int(r.draft_proposal_tokens),
+            int(r.draft_accepted_tokens), int(r.draft_advanced_tokens), int(r.prompt_tokens),
+        ]
+        for r in (step_req.requests or ())
+    ]
+    return {
+        "phase": str(step_req.phase),
+        "scope": str(step_req.scope),
+        "tokens": int(step_req.tokens),
+        "context": int(step_req.context),
+        "sequences": norm_seqs,
+        "media_tokens_per_sequence": (
+            int(step_req.media_tokens_per_sequence)
+            if step_req.media_tokens_per_sequence is not None else None
+        ),
+        "draft_prepare": bool(step_req.draft_prepare),
+        "requests": norm_reqs,
+        "padded_tokens": int(step_req.padded_tokens),
+        "layout": str(step_req.layout),
+    }
+
+
 def _compute_bundle_case_digest(
     parsed: Case,
     *,
@@ -2928,10 +3203,7 @@ def _compute_bundle_case_digest(
     payload = {
         "model": str(parsed.model.name),
         "sku": str(parsed.machine.sku or parsed.machine.name),
-        "phase": str(step_req.phase),
-        "scope": str(step_req.scope),
-        "tokens": int(step_req.tokens),
-        "context": int(step_req.context),
+        **_canonical_step_request_digest_fields(step_req),
         "graph_id": str(graph_id),
         "track": str(track_name),
         "parallel": [int(p.dp), int(p.tp), int(p.ep), int(p.pp), int(p.cp), int(p.pcp)],
@@ -3113,11 +3385,7 @@ def _assemble_export_bundle(
     )
     meta_dict = dict(parsed.runtime.metadata)
     ckpt_summary, va_summary = _build_checkpoint_and_va_summary(parsed, mem_ledger, scen, seq_count)
-    track_name = _normalize_pre_w2a_case_track(str(
-        (meta_dict.get("feature_track_report") or {}).get("feature_track")
-        or meta_dict.get("feature_track")
-        or ""
-    ).strip())
+    track_name = _resolve_case_stack_track(parsed)
     active_ids = {r.archetype_id for r in final_rows}
     filtered_schedule = tuple(e for e in full_schedule if e.archetype_id in active_ids) if use_archetype_dedup else ()
     has_unbound = any(r.binding_state == BINDING_STATE_UNBOUND_FORMULA for r in final_rows)

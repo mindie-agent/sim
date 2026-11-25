@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
+import re
 from dataclasses import dataclass, replace
 import json
 import os
@@ -588,10 +589,13 @@ def _emit_op_and_pipes(
     pipeline_info: tuple[int, tuple[str, ...]] | None,
     op_placement: Mapping[Any, tuple[int, int, float, str]],
 ) -> tuple[list[dict[str, Any]], tuple[int, int, float, str], int]:
+    from .kernel_catalog import strip_op_prefix
+
     pid, tid = _op_pid_tid(op, base_pid)
     cat = "Communication" if op.task_type == "HCCL" else "Kernel"
     k_name = op.ascend_kernel or op.logical_role or op.canonical_op_key
-    event_name = f"{k_name} [{op.canonical_op_key}]" if (op.canonical_op_key and op.canonical_op_key != k_name) else k_name
+    op_tag = strip_op_prefix(op.op_id) or op.canonical_op_key
+    event_name = f"{k_name} [{op_tag}]" if (op_tag and op_tag != k_name) else k_name
     pipe_info = _compute_physical_pipe_times(op, bundle.hardware_peaks)
     ts_end = ts_start + op.dur_us
     events: list[dict[str, Any]] = [{
@@ -750,14 +754,91 @@ def _resolve_host_launch_spec(
     return f"aclrtLaunchKernel({kern})", max(0.0, dur)
 
 
+_ENTRY_STEP_RE = re.compile(r"\[Step\s+(\d+)\]")
+
+
+def _resolve_entry_layer_rec(
+    entry: Any, per_layer: Mapping[tuple[str, int], Mapping[str, Any]],
+) -> Mapping[str, Any] | None:
+    m_step = _ENTRY_STEP_RE.search(str(getattr(entry, "label", "") or ""))
+    step_suffix = f"_step{m_step.group(1)}" if m_step is not None else ""
+    aid = str(getattr(entry, "archetype_id", "") or "")
+    if aid in {"target_embed", "target_tail", "draft_pre", "draft_tail"}:
+        if step_suffix:
+            rec = per_layer.get((f"{aid}{step_suffix}", -1))
+            if isinstance(rec, Mapping):
+                return rec
+        rec = per_layer.get((aid, -1))
+        return rec if isinstance(rec, Mapping) else None
+    if entry.full_layer_index is None:
+        return None
+    lyr = int(entry.full_layer_index)
+    if aid == "draft_context_kv":
+        if step_suffix:
+            rec = per_layer.get((f"draft_context_kv{step_suffix}", lyr))
+            if isinstance(rec, Mapping):
+                return rec
+        rec = per_layer.get(("draft_context_kv", lyr))
+        if isinstance(rec, Mapping):
+            return rec
+    if entry.scope == "draft" and step_suffix:
+        rec = per_layer.get((f"draft{step_suffix}", lyr))
+        if isinstance(rec, Mapping):
+            return rec
+    rec = per_layer.get((entry.scope, lyr))
+    return rec if isinstance(rec, Mapping) else None
+
+
 def _entry_layer_span(
     entry: Any, tpl: Any, per_layer: Mapping[tuple[str, int], Mapping[str, Any]],
 ) -> float:
-    if entry.full_layer_index is not None:
-        rec = per_layer.get((entry.scope, int(entry.full_layer_index)))
-        if isinstance(rec, Mapping) and float(rec.get("span_us", 0.0) or 0.0) > 0.0:
-            return float(rec["span_us"])
+    rec = _resolve_entry_layer_rec(entry, per_layer)
+    if isinstance(rec, Mapping) and float(rec.get("span_us", 0.0) or 0.0) > 0.0:
+        return float(rec["span_us"])
     return float(tpl.span_us)
+
+
+def _compute_scheduled_entry_windows(
+    effective_schedule: Sequence[TraceScheduleEntry],
+    templates: Mapping[str, _ArchetypeTemplate],
+    per_layer: Mapping[tuple[str, int], Mapping[str, Any]],
+    bundle: ExportBundle,
+) -> tuple[list[tuple[TraceScheduleEntry, _ArchetypeTemplate, float, float, Mapping[str, Any] | None]], float]:
+    windows: list[tuple[TraceScheduleEntry, _ArchetypeTemplate, float, float, Mapping[str, Any] | None]] = []
+    ts_cursor = 0.0
+    all_have_start = True
+    for entry in effective_schedule:
+        tpl = templates.get(entry.archetype_id)
+        if tpl is None or not tpl.ops:
+            continue
+        rec = _resolve_entry_layer_rec(entry, per_layer)
+        if isinstance(rec, Mapping) and "start_us" in rec:
+            l_start = float(rec["start_us"])
+            layer_span = float(rec.get("span_us", 0.0) or 0.0)
+            ts_cursor = max(ts_cursor, l_start + layer_span)
+        else:
+            all_have_start = False
+            l_start = ts_cursor
+            layer_span = _entry_layer_span(entry, tpl, per_layer)
+            ts_cursor = l_start + layer_span
+        windows.append((entry, tpl, l_start, layer_span, rec))
+    max_end = max((s + d for _, _, s, d, _ in windows), default=0.0)
+    total_span_us = max(max_end, float(bundle.step_span_us or 0.0)) if (windows and all_have_start) else max_end
+    return windows, total_span_us
+
+
+def _lookup_entry_op_timing(
+    op: OperatorExportRow,
+    layer_ops_map: Mapping[str, tuple[float, float]],
+    strip_fn: Any,
+) -> tuple[float, float] | None:
+    hit = layer_ops_map.get(strip_fn(op.op_id))
+    if hit is not None:
+        return hit
+    if op.op_id.startswith("rewrite:") and op.absorbed_source_ops:
+        fused_key = "rewrite_fused:" + "+".join(strip_fn(src) for src in op.absorbed_source_ops)
+        return layer_ops_map.get(fused_key)
+    return None
 
 
 def _emit_entry_op_repeats(
@@ -812,9 +893,8 @@ def _iter_scheduled_full_model_trace(
     effective_schedule, sched_counts = _expand_effective_trace_schedule(bundle)
     templates = _build_archetype_templates(bundle, sched_counts)
     per_layer = dict(getattr(bundle, "per_layer_timings", None) or {})
-    total_span_us = sum(
-        _entry_layer_span(e, templates[e.archetype_id], per_layer)
-        for e in effective_schedule if e.archetype_id in templates
+    entry_windows, total_span_us = _compute_scheduled_entry_windows(
+        effective_schedule, templates, per_layer, bundle,
     )
     track_display = format_track_label(bundle.feature_track, lang="en")
     yield {
@@ -833,28 +913,19 @@ def _iter_scheduled_full_model_trace(
     comm_by_die: dict[int, list[tuple[float, float]]] = defaultdict(list)
     samples_by_die: dict[int, list[tuple[float, float, float, float, float]]] = defaultdict(list)
 
-    ts_cursor = 0.0
     task_id = 1
     flow_id = 1
     launched_scopes: set[str] = set()
     scope_bounds: dict[str, list[float]] = {}
 
-    for entry in effective_schedule:
-        tpl = templates.get(entry.archetype_id)
-        if tpl is None or not tpl.ops:
-            continue
-        layer_rec = (
-            per_layer.get((entry.scope, int(entry.full_layer_index)))
-            if entry.full_layer_index is not None else None
-        )
+    for entry, tpl, l_start, layer_span, layer_rec in entry_windows:
         layer_ops_map = layer_rec.get("ops", {}) if isinstance(layer_rec, Mapping) else {}
-        layer_span = _entry_layer_span(entry, tpl, per_layer)
-        l_start = ts_cursor
-        l_end = ts_cursor + layer_span
+        l_end = l_start + layer_span
         if entry.scope not in scope_bounds:
             scope_bounds[entry.scope] = [l_start, l_end]
         else:
-            scope_bounds[entry.scope][1] = l_end
+            scope_bounds[entry.scope][0] = min(scope_bounds[entry.scope][0], l_start)
+            scope_bounds[entry.scope][1] = max(scope_bounds[entry.scope][1], l_end)
 
         yield {
             "name": entry.label, "cat": "MSTX_Layer", "ph": "X",
@@ -880,7 +951,9 @@ def _iter_scheduled_full_model_trace(
             coord = (op.occurrence.replica, op.occurrence.stage, int(op.occurrence.rank or 0))
             d_idx = die_map.get(coord, 0)
             base = _pid_base(d_idx)
-            exact_timing = layer_ops_map.get(strip_op_prefix(op.op_id)) if layer_ops_map else None
+            exact_timing = _lookup_entry_op_timing(op, layer_ops_map, strip_op_prefix) if layer_ops_map else None
+            if layer_ops_map and exact_timing is None:
+                continue
             if exact_timing is not None:
                 op_ts = l_start + float(exact_timing[0])
                 op_eff = replace(op, dur_us=float(exact_timing[1]), end_us=op.start_us + float(exact_timing[1]))
@@ -921,7 +994,6 @@ def _iter_scheduled_full_model_trace(
             comm_by_die[d0].append((l_start + r_lo * scale_span, l_start + r_hi * scale_span))
         if include_counters and layer_span > 0.0:
             samples_by_die[d0].append(_layer_metric_sample(tpl.ops, l_start + layer_span * MIDPOINT_FRACTION, layer_span, bundle.hardware_peaks))
-        ts_cursor = l_end
 
     for sc_key, (s_lo, s_hi) in scope_bounds.items():
         if s_hi > s_lo:
@@ -937,7 +1009,7 @@ def _iter_scheduled_full_model_trace(
             }
 
     if include_overlap:
-        yield from _iter_overlap_from_intervals(comp_by_die, comm_by_die, sorted(set(die_map.values())), ts_cursor)
+        yield from _iter_overlap_from_intervals(comp_by_die, comm_by_die, sorted(set(die_map.values())), total_span_us)
     if include_counters:
         yield from _iter_counter_events_from_samples(bundle, samples_by_die)
 

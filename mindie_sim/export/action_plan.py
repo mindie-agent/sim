@@ -48,6 +48,7 @@ from .public_view import (
     diff_public_scenario_configs,
     is_same_public_config,
     project_public_effective_config,
+    project_public_scenario_config,
     sanitize_public_text,
     sanitize_source_ref,
 )
@@ -75,6 +76,8 @@ WF_STAGE_CONFIG = "config"
 WF_STAGE_FRAMEWORK = "framework"
 WF_STAGE_KERNEL = "kernel"
 WF_STAGE_RESIDUAL = "residual"
+_MIN_RECEIPT_STAGES_FOR_FWK = 3
+_RECEIPT_FOUR_STAGES = 4
 _FRAMEWORK_REASONS = frozenset({
     "stream_masking_change",
     "shipping_fusion_enablement",
@@ -191,11 +194,34 @@ def _public_effective_config(bundle: ExportBundle) -> dict[str, Any]:
     return project_public_effective_config(bundle)
 
 
+_RUNTIME_FEATURE_SWITCH_KEYS = frozenset({
+    "graph_mode", "enable_fused_mc2", "multistream_overlap_shared_expert",
+})
+
+
 def _is_same_deployment_config(before: ExportBundle, after: ExportBundle) -> bool:
     return (
         is_same_public_config(before, after)
         and abs(float(before.n_tok_per_die or 1.0) - float(after.n_tok_per_die or 1.0)) <= MIN_DENOM_EPS
     )
+
+
+def _is_same_deployment_geometry(before: ExportBundle, after: ExportBundle) -> bool:
+    """True when hardware, workload, batch, parallelism, and quantization match."""
+    if abs(float(before.n_tok_per_die or 1.0) - float(after.n_tok_per_die or 1.0)) > MIN_DENOM_EPS:
+        return False
+    bc = project_public_scenario_config(before)
+    ac = project_public_scenario_config(after)
+    for key, b_val in bc.items():
+        if key in _RUNTIME_FEATURE_SWITCH_KEYS:
+            continue
+        a_val = ac.get(key)
+        if isinstance(b_val, float) or isinstance(a_val, float):
+            if abs(float(b_val or 0.0) - float(a_val or 0.0)) > MIN_DENOM_EPS:
+                return False
+        elif b_val != a_val:
+            return False
+    return True
 
 
 def _extract_deployment_diffs(before: ExportBundle, after: ExportBundle) -> list[tuple[str, str, str]]:
@@ -352,8 +378,7 @@ def _is_verified_new_fusion(
     fuse_outputs: set[str],
     rewrite_verified: bool = False,
 ) -> bool:
-    """Require real verified FuseRegion receipt or SRAM-verified KernelSynthesisSpec."""
-    del saved_ms
+    """Require real verified FuseRegion receipt, SRAM-verified KernelSynthesisSpec, or N->1 ABI extension."""
     if len(row.after_ops) != 1:
         return False
     a_op = row.after_ops[0]
@@ -364,6 +389,15 @@ def _is_verified_new_fusion(
         members = getattr(kspec, "constituent_op_ids", ()) or ()
         if len(members) >= MIN_FUSION_MEMBERS:
             return True
+    if (
+        is_comparison
+        and a_op.needs_new_kernel
+        and not a_op.is_shipping_abi
+        and len(row.before_ops) >= MIN_FUSION_MEMBERS
+        and saved_ms > CONSERVATION_EPS_MS
+        and "abi_variant_extension" in (a_op.new_kernel_spec or "")
+    ):
+        return True
     if not rewrite_verified or not fuse_outputs:
         return False
     if a_op.op_id in fuse_outputs:
@@ -388,17 +422,32 @@ def _is_masking_only_change(row: AlignedComparisonRow) -> bool:
     )
 
 
-def _has_tuning_evidence(b_op: OperatorExportRow, a_op: OperatorExportRow, *, same_config: bool) -> bool:
+def _has_tuning_evidence(
+    b_op: OperatorExportRow,
+    a_op: OperatorExportRow,
+    *,
+    same_config: bool,
+    same_geometry: bool = False,
+) -> bool:
+    same_kernel_speedup = (
+        (same_config or (
+            same_geometry
+            and b_op.shape == a_op.shape
+            and b_op.dtype == a_op.dtype
+            and b_op.ascend_kernel == a_op.ascend_kernel
+        ))
+        and (b_op.dur_us - a_op.dur_us) > OVERLAP_EXPOSED_EPS_US
+    )
     return (
         a_op.formula_eval is not None or a_op.measured_sum_us is not None
         or a_op.binding_state in {BINDING_STATE_UNBOUND_FORMULA, BINDING_STATE_MEASURED}
         or a_op.opt_pillar in {"pillar2_roofline", "pillar2_tiler_extension", "pillar1_fusion"}
-        or (same_config and (b_op.dur_us - a_op.dur_us) > OVERLAP_EXPOSED_EPS_US)
+        or same_kernel_speedup
     )
 
 
 def _prelim_classify_row(
-    row: AlignedComparisonRow, *, is_comparison: bool, same_config: bool,
+    row: AlignedComparisonRow, *, is_comparison: bool, same_config: bool, same_geometry: bool = False,
     saved_ms: float, saved_upt: float, after_pre_edit_ms: float | None, fuse_outputs: set[str],
     rewrite_verified: bool = False,
 ) -> tuple[str, OperatorExportRow | None, str]:
@@ -420,6 +469,12 @@ def _prelim_classify_row(
     if len(row.before_ops) >= MIN_FUSION_MEMBERS and len(row.after_ops) == 1:
         return ("residual", row.after_ops[0], "zero_gain_unreceipted_fusion") if row.after_ops[0].needs_new_kernel else ("config", row.after_ops[0], "shipping_fusion_enablement")
     if len(row.before_ops) != 1 or len(row.after_ops) != 1:
+        has_stage3_rewrite = rewrite_verified and any(
+            a.op_id.startswith("rewrite:") or a.op_id in fuse_outputs
+            for a in row.after_ops
+        )
+        if has_stage3_rewrite:
+            return "residual", None, "stage3_multi_fusion_group"
         return "config", None, "subgraph_reassociation"
     b_op, a_op = row.before_ops[0], row.after_ops[0]
     if _is_masking_only_change(row):
@@ -428,7 +483,9 @@ def _prelim_classify_row(
         return "residual", a_op, "fully_masked_both_sides"
     if abs(saved_ms) <= CONSERVATION_EPS_MS and abs(saved_upt) <= CONSERVATION_EPS_MS:
         return "residual", a_op, "zero_delta"
-    if a_op.is_shipping_abi and not a_op.needs_new_kernel and _has_tuning_evidence(b_op, a_op, same_config=same_config):
+    if a_op.is_shipping_abi and not a_op.needs_new_kernel and _has_tuning_evidence(
+        b_op, a_op, same_config=same_config, same_geometry=same_geometry,
+    ):
         if not same_config and after_pre_edit_ms is None and saved_ms <= 0.0:
             return "config", a_op, "batch_or_parallel_delta"
         return "tune", a_op, "shipping_kernel_tuning_candidate"
@@ -753,6 +810,35 @@ def _qualify_action_groups(
     return qualified, qualified_keys
 
 
+def _committed_receipt_spans(receipt: Any) -> tuple[int, ...]:
+    stages = tuple(getattr(receipt, "stages", ()) or ())
+    if not stages:
+        return ()
+    out: list[int] = []
+    prev_ns: int | None = None
+    for idx, st in enumerate(stages):
+        raw_ns = int(st.span_ns)
+        eff_ns = raw_ns if (idx == 0 or st.status == "committed" or prev_ns is None) else prev_ns
+        out.append(eff_ns)
+        prev_ns = eff_ns
+    return tuple(out)
+
+
+def _receipt_zero_framework_transition(
+    before_bundle: ExportBundle,
+    after_bundle: ExportBundle,
+) -> bool:
+    """True when ``after_bundle.engine_step_receipt`` starts at ``before_bundle`` with 0 ns Stage 2 gain."""
+    receipt = getattr(after_bundle, "engine_step_receipt", None)
+    if receipt is None:
+        return False
+    spans = _committed_receipt_spans(receipt)
+    if len(spans) < _MIN_RECEIPT_STAGES_FOR_FWK:
+        return False
+    b_step_ns, _ = _bundle_step_and_idle_ns(before_bundle)
+    return b_step_ns == spans[0] and spans[1] == spans[2]
+
+
 def classify_waterfall_stage(
     acc: GroupAccounting,
     before_bundle: ExportBundle,
@@ -760,9 +846,10 @@ def classify_waterfall_stage(
 ) -> tuple[str, str | None]:
     """Classify one ``GroupAccounting`` row into canonical waterfall stage(s) via public config."""
     same_cfg = is_same_public_config(before_bundle, after_bundle)
+    zero_fwk_receipt = _receipt_zero_framework_transition(before_bundle, after_bundle)
     if acc.bucket == "config":
         if same_cfg or acc.reason in _FRAMEWORK_REASONS:
-            return WF_STAGE_FRAMEWORK, None
+            return (WF_STAGE_RESIDUAL, None) if zero_fwk_receipt else (WF_STAGE_FRAMEWORK, None)
         return WF_STAGE_CONFIG, None
     has_cfg_split = (
         not same_cfg
@@ -826,7 +913,11 @@ def _project_canonical_stage_waterfall(
     receipt = getattr(after, "engine_step_receipt", None)
     if receipt is not None and getattr(receipt, "stages", None):
         stages = tuple(receipt.stages)
-        spans_by_idx = (b_step_ns, s1_ns, s2_ns, a_step_ns)
+        committed = _committed_receipt_spans(receipt)
+        if len(committed) >= _RECEIPT_FOUR_STAGES and b_step_ns == committed[0]:
+            spans_by_idx = (b_step_ns, committed[1], committed[2], a_step_ns)
+        else:
+            spans_by_idx = (b_step_ns, s1_ns, s2_ns, a_step_ns)
         out: list[dict[str, Any]] = []
         prev_ns = b_step_ns
         for idx, st in enumerate(stages):
@@ -844,7 +935,7 @@ def _project_canonical_stage_waterfall(
                 "l_star_ns": int(st.l_star_ns),
                 "l_star_valid": bool(st.l_star_valid),
                 "idle_or_wait_ns": int(st.idle_or_wait_ns),
-                "config_bridge_ns": cfg_ns if idx == 1 else 0,
+                "config_bridge_ns": (b_step_ns - spans_by_idx[1]) if idx == 1 else 0,
             })
         return tuple(out)
 
@@ -967,12 +1058,23 @@ def _assemble_waterfall_and_accounting(
 def build_comparison_plan(
     before_bundle: ExportBundle, after_bundle: ExportBundle | None, aligned_rows: Sequence[AlignedComparisonRow],
     *, top_k_optimize: int = MAX_DISPLAY_CARDS, include_to_optimize: bool = True, script_audit: Any = None,
+    comparison_request: Any = None,
 ) -> ComparisonPlan:
     """Build single source-of-truth Waterfall, classified cards, and 3-track roadmap."""
     is_comparison = after_bundle is not None
+    if is_comparison:
+        from .comparison import assert_comparison_polarity, build_default_comparison_request
+
+        eff_cmp_req = (
+            comparison_request
+            if comparison_request is not None
+            else build_default_comparison_request(before_bundle, after_bundle)
+        )
+        assert_comparison_polarity(before_bundle, after_bundle, eff_cmp_req)
     after = after_bundle or before_bundle
     b_ntok, a_ntok = max(float(before_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS), max(float(after.n_tok_per_die or 1.0), MIN_DENOM_EPS)
     same_config = (not is_comparison) or _is_same_deployment_config(before_bundle, after)
+    same_geometry = same_config or _is_same_deployment_geometry(before_bundle, after)
     arch_tag, fuse_outputs = _arch_tag_from_bundle(after), _applied_fuse_outputs(after)
     rewrite_verified = bool(getattr(after, "rewrite_verification_passed", False))
 
@@ -983,7 +1085,7 @@ def build_comparison_plan(
         b_ns, a_ns, saved_ns, b_ms, a_ms, saved_ms, b_upt, a_upt, saved_upt = _row_exposed_metrics_ns(row, b_ntok, a_ntok)
         pre_edit_ms = _after_pre_edit_exposed_ms(row) if (is_comparison and not same_config) else None
         cand_bucket, a_op, reason = _prelim_classify_row(
-            row, is_comparison=is_comparison, same_config=same_config,
+            row, is_comparison=is_comparison, same_config=same_config, same_geometry=same_geometry,
             saved_ms=saved_ms, saved_upt=saved_upt, after_pre_edit_ms=pre_edit_ms,
             fuse_outputs=fuse_outputs, rewrite_verified=rewrite_verified,
         )

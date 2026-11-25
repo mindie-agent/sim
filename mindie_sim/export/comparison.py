@@ -950,6 +950,9 @@ _VALID_COMPARISON_POLICIES = frozenset({"monotonic_optimization", "signed_compar
 def _bundle_canonical_track(bundle: ExportBundle) -> str:
     raw = str(getattr(bundle, "feature_track", "") or "").strip().lower()
     if not raw:
+        eff_cfg = getattr(bundle, "effective_config", None)
+        if isinstance(eff_cfg, Mapping) and bool(eff_cfg.get("raw_eager")):
+            return "eager"
         return "target" if bool(getattr(bundle, "target_envelope_applied", False)) else "shipping"
     if raw not in _CANONICAL_TRACK_RANK:
         raise ModelingError(f"invalid_comparison_track:{bundle.feature_track!r}")

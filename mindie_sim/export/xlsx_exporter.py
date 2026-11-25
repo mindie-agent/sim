@@ -325,7 +325,8 @@ def export_comparison_xlsx(
                 for op in bundle.operators
             )
         plan = build_comparison_plan(
-            bundle, compare_bundle, aligned_rows, script_audit=script_audit,
+            bundle, compare_bundle, aligned_rows,
+            script_audit=script_audit, comparison_request=comparison_request,
         )
 
     pending_items = plan.pending_items
@@ -351,6 +352,7 @@ def export_comparison_xlsx(
             },
             script_audit=audit_dict,
             comparison_plan=plan,
+            comparison_request=comparison_request,
         )
         export_agent_brief(brief, agent_brief_path)
         brief_path_str = str(Path(agent_brief_path))

@@ -409,14 +409,24 @@ def build_agent_brief(
     generated_files: Mapping[str, str] | None = None,
     script_audit: Mapping[str, Any] | None = None,
     comparison_plan: ComparisonPlan | None = None,
+    comparison_request: Any = None,
 ) -> dict[str, Any]:
     """Build compact (< 8 KB) allowlist-only deterministic JSON brief for Agent workflows."""
     from .comparison import (
         align_before_after_operators,
+        assert_comparison_polarity,
+        build_default_comparison_request,
         build_macro_module_breakdown,
         format_parallelism_codomain_summary,
     )
 
+    if after_bundle is not None:
+        eff_req = (
+            comparison_request
+            if comparison_request is not None
+            else build_default_comparison_request(before_bundle, after_bundle)
+        )
+        assert_comparison_polarity(before_bundle, after_bundle, eff_req)
     after = after_bundle or before_bundle
     macro_rows = build_macro_module_breakdown(before_bundle, after_bundle)
     if comparison_plan is None:
@@ -432,7 +442,8 @@ def build_agent_brief(
             )
         )
         plan = build_comparison_plan(
-            before_bundle, after_bundle, aligned, script_audit=script_audit,
+            before_bundle, after_bundle, aligned,
+            script_audit=script_audit, comparison_request=comparison_request,
         )
     else:
         plan = comparison_plan
@@ -524,6 +535,7 @@ def export_agent_brief(
     generated_files: Mapping[str, str] | None = None,
     script_audit: Mapping[str, Any] | None = None,
     comparison_plan: ComparisonPlan | None = None,
+    comparison_request: Any = None,
 ) -> Path | dict[str, Any]:
     """Atomically persist compact (< 8 KB) allowlist-projected ``agent_brief.json``."""
     return_dict = False
@@ -536,6 +548,7 @@ def export_agent_brief(
             generated_files=generated_files,
             script_audit=script_audit,
             comparison_plan=comparison_plan,
+            comparison_request=comparison_request,
         )
         target = Path(third)
         return_dict = True

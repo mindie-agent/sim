@@ -317,11 +317,11 @@ def test_trace_view_sanitizes_feature_track_and_conserves_mtp_and_recoverssm_spa
     b_bef = build_export_bundle(raw_bef, request=req_q, apply_target_envelope=False)
     b_aft = build_export_bundle(raw_aft, request=req_q, apply_target_envelope=True)
 
-    # 1. Shipping Qwen hc_gate_mix resolves to Triton-Ascend qwen4_exp_ascend_hc_gate_mix.
+    # 1. Shipping Qwen hc_gate_mix resolves to Triton-Ascend _hc_gate_mix_kernel.
     gate_ops = [op for op in b_bef.operators if op.op_id.endswith("hc_gate_mix")]
     assert gate_ops
     for op in gate_ops:
-        assert op.ascend_kernel == "qwen4_exp_ascend_hc_gate_mix"
+        assert op.ascend_kernel == "_hc_gate_mix_kernel"
         assert op.kernel_backend == BACKEND_TRITON
         assert op.needs_new_kernel is False
 
@@ -334,7 +334,7 @@ def test_trace_view_sanitizes_feature_track_and_conserves_mtp_and_recoverssm_spa
     assert (
         draft_gmm[0].binding_state == BINDING_STATE_UNBOUND_FORMULA
         if draft_gmm[0].needs_new_kernel
-        else draft_gmm[0].ascend_kernel == "GroupedMatmul"
+        else draft_gmm[0].ascend_kernel == "aclnnGroupedMatmulV4"
     )
     for spec in b_aft.kernel_synthesis_specs:
         src_joined = " ".join(str(s) for s in (getattr(spec, "constituent_op_ids", ()) or ()))

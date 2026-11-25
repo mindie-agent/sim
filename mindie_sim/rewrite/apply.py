@@ -17,6 +17,7 @@ from math import inf, isfinite, prod
 from types import SimpleNamespace
 from typing import Any, Literal
 
+from mindie_sim.prediction.body_defaults import consume_target_declaration
 from mindie_sim.prediction.fusion.control_rewrite import (
     apply_incoming_controls, rewritten_control_metadata,
 )
@@ -25,6 +26,7 @@ from mindie_sim.prediction.fusion.ports import (
     declared_control_order, full_operand_ports, input_port_entries, metadata_pairs,
     replace_input_ports,
 )
+from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.runtime import tile_solver
 from mindie_sim.prediction.runtime.tile_solver import TilePipelineSpec
@@ -141,6 +143,37 @@ class AppliedPlan:
     region_tiers: tuple[tuple[str, FusionTier], ...] = ()
     in_place_aliases: tuple[tuple[str, str], ...] = ()
     credit_edges: tuple[tuple[str, str, int], ...] = ()
+def _lower_prepared_step_for_rewrite(
+    spine: PredictionSpine,
+    case: Case,
+    request: LoweringRequest,
+) -> PreparedStep:
+    """Lower a ``PreparedStep`` for rewrite analysis without building unused structure payloads."""
+    if type(spine) is not PredictionSpine:
+        return spine.lower(case, request)
+    base = spine.stacks.resolve_base(case, request)
+    rewritten = spine.rewrite.apply(base)
+    effective_case = (
+        consume_target_declaration(base.case, rewritten.target_graphs)
+        if rewritten.target_graphs is not None else base.case
+    )
+    active_replicas = frozenset(entry.replica for entry in rewritten.executable)
+    bound_owners = spine._bind_stream_plans(effective_case, rewritten.streams, active_replicas)
+    book = RecipeBook.from_mapping(effective_case.runtime.kernels, family_registry=spine.families)
+    resolved_ops = spine._resolve_governed_operators(effective_case, rewritten, book, bound_owners)
+    graph_id = _json_digest(
+        (effective_case.model.name, request.tier, request.stack, rewritten.executable, rewritten.streams),
+        default=_digest_default,
+    )
+    return PreparedStep(
+        graph=rewritten,
+        case=effective_case,
+        operators=resolved_ops,
+        graph_id=graph_id,
+        structure_payload=None,
+    )
+
+
 def resolve_scenario(case, request: StepRequest, *, spine=None,
                      stack_id: str = DEFAULT_STACK_ID, primitives=None,
                      primitive_table=None) -> ResolvedScenario:
@@ -148,10 +181,12 @@ def resolve_scenario(case, request: StepRequest, *, spine=None,
     case = Case.from_mapping(case)
     spine = PredictionSpine() if spine is None else spine
     stack = DEFAULT_STACK_NAME if stack_id == DEFAULT_STACK_ID else stack_id
-    atomic = spine.lower(case, LoweringRequest(step=request, tier="unmerge",
-                                               apply_body_defaults=False, stack=stack))
-    mainline = spine.lower(case, LoweringRequest(step=request, tier="mainline",
-                                                 apply_body_defaults=True, stack=stack))
+    atomic = _lower_prepared_step_for_rewrite(
+        spine, case, LoweringRequest(step=request, tier="unmerge", apply_body_defaults=False, stack=stack),
+    )
+    mainline = _lower_prepared_step_for_rewrite(
+        spine, case, LoweringRequest(step=request, tier="mainline", apply_body_defaults=True, stack=stack),
+    )
     graph = atomic.graph
     base = _json_digest(graph.executable, default=_digest_default)
     framing = _json_digest(

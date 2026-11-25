@@ -40,9 +40,11 @@ from mindie_sim.export.action_plan import build_comparison_plan
 from mindie_sim.export.ooxml import NS_MAIN
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.results import StepRequest
+from mindie_sim.prediction.streams import MAIN_STREAM, StreamCoreBudget, StreamEvent, StreamLane
 from mindie_sim.rewrite.apply import apply_plan
 from mindie_sim.rewrite.catalog_replay import _catlass_proposals, _replay_ops
 from mindie_sim.rewrite.oracle import (
+    MAX_OVERLAP_TRACE_EVENTS,
     ScenarioRequest,
     _bind_replay,
     _report,
@@ -50,7 +52,8 @@ from mindie_sim.rewrite.oracle import (
     prepare_scenario,
     refine_layer_cohort_plan,
 )
-from mindie_sim.rewrite.schema import Edit, empty_plan
+from mindie_sim.rewrite.schema import Edit, OpRef, StreamSchedule, empty_plan
+from mindie_sim.rewrite.verify import _evaluation
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.solve import solve_deployment
 from mindie_sim.sweep.mapreduce import (
@@ -521,3 +524,59 @@ def test_oracle_dp_catalog_memo_preserves_per_replica_die_isolation_and_speedup(
         float(full_eval.step_eval.span_ms), float(rep_full["duration_ms"]),
         rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
     )
+
+
+def test_oracle_multi_replica_symmetric_stream_cohort_matches_literal() -> None:
+    dp_pair = 2
+    case = compose_case(
+        model="qwen3-235b-a22b", hardware="a3", tp=1, dp=dp_pair, pp=1, ep=dp_pair,
+        layers=_COHORT_TEST_LAYERS, prompt_tokens=_TEST_PROMPT_TOKENS,
+        output_tokens=_TEST_OUTPUT_TOKENS, concurrency=dp_pair,
+    )
+    step = StepRequest(phase="decode", tokens=dp_pair, context=_TEST_PROMPT_TOKENS, sequences=dp_pair)
+    dossier = prepare_scenario(ScenarioRequest(case=case, step=step))
+    scenario = dossier.handle.scenario
+    ops0 = scenario.atomic_ops[0].ops
+    by_id = {op.op_id: op for op in ops0}
+    target = next(
+        op for op in ops0
+        if op.layer == _COHORT_TEST_LAYERS - 1 and op.vector_ops > 0 and op.flops == 0 and not op.link_bytes
+    )
+    events = [
+        StreamEvent(f"ev_in_{idx}", MAIN_STREAM, dep, "aux", (target.op_id,))
+        for idx, dep in enumerate(target.deps) if dep in by_id and by_id[dep].stage == target.stage
+    ]
+    consumers = tuple(op.op_id for op in ops0 if target.op_id in op.deps and op.stage == target.stage)
+    if consumers:
+        events.append(StreamEvent("ev_out", "aux", target.op_id, MAIN_STREAM, consumers))
+    sched = StreamSchedule(
+        lanes=(
+            StreamLane(MAIN_STREAM, StreamCoreBudget(isolation="shared_cap")),
+            StreamLane("aux", StreamCoreBudget(aic=1, aiv=2, isolation="shared_cap")),
+        ),
+        assignments=((OpRef("atom", target.op_id), "aux"),),
+        events=tuple(events),
+    )
+    plan = replace(empty_plan(scenario.base_graph_sha256, scenario.framing_sha256), edits=(Edit("e_stream", operation=sched),))
+    applied = apply_plan(plan, scenario)
+    graphs, book, _, bound_streams, _, _ = _bind_replay(scenario, applied, dossier.handle.recipe_book, dossier.handle)
+    replay_graphs = {r: _replay_ops(ops) for r, ops in graphs.items()}
+
+    coh = _report(
+        scenario.atomic_step.case, graphs, dossier.handle.evaluation_context, book,
+        dossier.handle._replay, trace_limit=MAX_OVERLAP_TRACE_EVENTS, streams=bound_streams,
+    )
+    lit = graph_costs(
+        scenario.atomic_step.case, replay_graphs, recipes=book, external_inputs={"analysis_input": 0.0},
+        evaluation=dossier.handle.evaluation_context, isolated=False,
+        include_submission=False, trace_limit=MAX_OVERLAP_TRACE_EVENTS, stream_plans=bound_streams,
+    )
+    assert math.isclose(float(coh["duration_ms"]), float(lit["duration_ms"]), rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS)
+    assert set(coh["execution"]["serviced"]) == set(lit["execution"]["serviced"])
+    for key, expected in lit["execution"]["serviced"].items():
+        assert math.isclose(float(coh["execution"]["serviced"][key]), float(expected), rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS)
+    coh_eval = _evaluation(scenario, graphs, coh, applied.plan_sha256, "should_achieve")
+    for rep in range(dp_pair):
+        assert coh_eval.service_intervals.get((rep, target.op_id))
+        assert any(rep == r and oid.startswith("s0.l5.") for r, oid in coh_eval.service_intervals)
+    assert all(row.start_ms + _PARITY_ABS_TOL_MS >= row.ready_ms for row in coh_eval.operators)

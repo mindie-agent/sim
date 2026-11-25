@@ -304,7 +304,7 @@ class _TrialSearch:
 
     def compare(self, plans, limit):
         from mindie_sim.rewrite.oracle import evaluate_rewrites
-        from mindie_sim.rewrite.schema import plan_sha256
+        from mindie_sim.rewrite.schema import StreamSchedule, plan_sha256
 
         def unique():
             for plan in plans:
@@ -340,7 +340,17 @@ class _TrialSearch:
                     self.rejection_reasons["missing_wall_estimate"] += 1
                     continue
                 ranked.append((estimated_wall, plan_sha256(plan), plan))
-            for _, _, plan in sorted(ranked):
+            for estimated_wall, _, plan in sorted(ranked):
+                base_entry = self.frontier.get(plan.base_graph_sha256)
+                base_wall = _wall(base_entry[1]) if base_entry is not None else _wall(self.best_eval)
+                if (
+                    plan.edits
+                    and isinstance(plan.edits[-1].operation, StreamSchedule)
+                    and estimated_wall >= base_wall
+                ):
+                    self.rejected += 1
+                    self.rejection_reasons["stream_screen_non_improving"] += 1
+                    continue
                 self.replayed += 1
                 finalized_plan = self._bind_verified_plan(plan)
                 result = self.try_finalize(finalized_plan)
