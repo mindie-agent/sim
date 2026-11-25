@@ -147,13 +147,15 @@ def _lower_gdn_projections(b, tensors, *, deps, tokens, hidden, conv_width, valu
 
 
 def _lower_kda_projections(b, tensors, *, projection_source, conv_source, deps, tokens,
-                           hidden, key_width, value_width, heads, dk):
+                           hidden, key_width, value_width, heads, dk,
+                           beta_preprocessed: bool = True):
     plan, model = b.plan, b.model
     projection_group = None
     if projection_source:
         projection_group = projection_source.module.lower(
             b, tensors, plan=plan, tokens=tokens, hidden=hidden, key_width=key_width,
-            value_width=value_width, heads=heads, dk=dk, deps=deps)
+            value_width=value_width, heads=heads, dk=dk, deps=deps,
+            beta_preprocessed=beta_preprocessed)
         sources, output_gate, beta, decay, raw_beta = (projection_group[key] for key in
             ("sources", "output_gate", "beta", "decay", "raw_beta"))
     else:
@@ -658,7 +660,11 @@ def _bind_kda_decode(b, *, decode_source, views, parallel, projection_group, bet
         # This caller provides raw Q/K and decay. The selected kernel owns
         # normalization and gate evaluation, so their old nodes are removed.
         internal_beta = options.get("use_beta_sigmoid", False)
-        if projection_group and internal_beta:
+        if projection_group and projection_group.get("beta_preprocessed", True) is False:
+            # RecoverSSM verify consumes raw BF16 beta directly via in-kernel sigmoid.
+            internal_beta = True
+            options = {**options, "use_beta_sigmoid": True, "beta_dtype": model.activation_dtype}
+        elif projection_group and internal_beta:
             # The mixed input-projection caller materializes the FP32 beta
             # activation itself; the recurrent kernel consumes that producer
             # instead of applying a second in-kernel sigmoid.
@@ -1413,10 +1419,15 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             key_replication=key_replication)
         sources = [conv_input.producer]
     else:
+        has_decode_binder = bool(
+            decode_source and getattr(decode_source.module, "bind_decode_scans", None) is not None)
+        beta_preprocessed = not (
+            has_decode_binder and use_recover_ssm and bool(views)
+            and all(view.phase == "decode" and view.q_len > 1 for view in views))
         sources, output_gate, beta, decay, raw_beta, projection_group = _lower_kda_projections(
             b, tensors, projection_source=projection_source, conv_source=conv_source,
             deps=deps, tokens=tokens, hidden=hidden, key_width=key_width, value_width=value_width,
-            heads=heads, dk=dk)
+            heads=heads, dk=dk, beta_preprocessed=beta_preprocessed)
     conv = _lower_convolution(
         b, tensors, conv_source=conv_source, projection_group=projection_group,
         conv_input=conv_input, sources=sources, views=views, tokens=tokens, heads=heads,
