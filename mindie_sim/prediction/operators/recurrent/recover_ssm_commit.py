@@ -1128,7 +1128,7 @@ def _materialize_shared_kda_group(
     )
     out_ops: list[OpSpec] = [plan_op, conv_op]
     commit_deps = tuple(dict.fromkeys((plan_op.op_id, conv_op.op_id, *verify_deps)))
-    _, _, first_in_v, first_pub_v, first_base_n, first_het, first_trans, first_eff_seq = layer_pub_records[0]
+    _, _, first_in_v, first_pub_v, first_base_n, first_het, first_trans, _ = layer_pub_records[0]
     ver_meta = {
         "base_version": first_base_n,
         "input_state_version": first_in_v,
@@ -1140,10 +1140,12 @@ def _materialize_shared_kda_group(
     physical_ids: list[str] = []
     # Upstream kda/recoverssm.py:1544-1569 launches ALIGN_MODE=False then ALIGN_MODE=True in align mode.
     if align_mode or ord_sel or not bnd_sel:
+        # The ordinary launch spans the batch, with zero replay for ineligible rows.
+        ordinary_counts = dict(ord_sel)
         ord_op = _build_shared_kda_physical_commit(
             op_id=f"s{stage}.recover_ssm_commit{group_suffix}", commit_kind="ordinary",
             stage=stage, phase=phase, requests=reqs, deps=commit_deps,
-            selected_subset=ord_sel if ord_sel else list(first_eff_seq), active=active,
+            selected_subset=tuple((r, ordinary_counts.get(r, 0)) for r in reqs), active=active,
             work_per_layer=ord_work, num_layers=num_layers, covered_layers=covered_layers,
             heads=heads, dk=dk, dv=dv, state_dtype=state_dtype, kg_dtype=kg_dtype,
             v_tile_width=bv_ord, v_tiles=vt_ord, head_groups=hg_ord,
@@ -1152,7 +1154,7 @@ def _materialize_shared_kda_group(
         )
         out_ops.append(ord_op)
         physical_ids.append(ord_op.op_id)
-    if align_mode and bnd_sel:
+    if bnd_sel:
         bnd_op = _build_shared_kda_physical_commit(
             op_id=f"s{stage}.recover_ssm_commit_boundary{group_suffix}", commit_kind="boundary",
             stage=stage, phase=phase, requests=tuple(r for r, _ in bnd_sel),
