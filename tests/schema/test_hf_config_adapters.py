@@ -331,7 +331,7 @@ def test_quant_aliases_preserve_real_packed_bytes_and_checkpoint_exclusions() ->
     assert fp8 == quant_preset("w8a8_mxfp8")
     assert fp8.matrix_bytes(3, 33, "dense_mlp") == 3 * 33 + 3 * 2
     assert fp8.matrix_bytes(3, 33, "gdn") == 3 * 33 * 2
-    assert dict(fp8.source)["checkpoint"] == "Eco-Tech/Qwen3.8-27B-w8a8-mxfp8"
+    assert dict(fp8.source)["quant_method"] == "mxfp8" and "checkpoint" not in dict(fp8.source)
 
 def test_quant_alias_and_canonical_execute_identical_public_programs() -> None:
     raw = _deployment_case("qwen3.8", "fp8", SKUS[1])

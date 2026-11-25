@@ -19,7 +19,11 @@ from typing import Any
 
 from mindie_sim.catalog.npu_checkpoints import normalize_hw_family
 
-from .memory_ledger import KV_DTYPE_SENSITIVE_COMPONENTS, _PREPARED_WEIGHT_GROUP
+from .memory_ledger import (
+    KV_DTYPE_SENSITIVE_COMPONENTS,
+    _PREPARED_WEIGHT_GROUP,
+    _weight_format_storage_spec,
+)
 from .models import (
     BF16_BYTES,
     GIB_BYTES,
@@ -214,7 +218,7 @@ def _populate_memory_control_panel(
     )
     for idx, fmt in enumerate(lookup_order):
         r = MEMORY_LOOKUP_FIRST_ROW + idx
-        spec = WEIGHT_QUANT_FORMATS[fmt]
+        spec = _weight_format_storage_spec(fmt)
         write_row(ws, r, (
             (fmt, None, STYLE_TEXT),
             (float(spec["bytes"]), None, STYLE_FLOAT2),
@@ -424,9 +428,37 @@ def _stage_weight_formulas(
 def _stage_cache_formula(
     mem: MemoryCalculatorLedger, stage_idx: int, cache_tot_row: int,
 ) -> str:
-    """Build exact per-PP-stage cache formula without concurrency-scaling fixed C8 scales."""
+    """Build live per-PP-stage cache formula referencing Sheet 3 cache rows (honors $T$4/$T$18/$T$21)."""
     if mem.pp == 1 and cache_tot_row > 0:
         return f"=F{cache_tot_row}"
+    if cache_tot_row > len(mem.cache_rows) and mem.cache_rows:
+        c_start = cache_tot_row - len(mem.cache_rows)
+        terms: list[str] = []
+        for idx, crow in enumerate(mem.cache_rows):
+            r = c_start + idx
+            is_fixed = crow.component in _FIXED_PER_DIE_COMPONENTS
+            st_val = float(crow.per_stage_bytes[stage_idx]) if stage_idx < len(crow.per_stage_bytes) else 0.0
+            if st_val <= MIN_DENOM_EPS:
+                continue
+            max_val = float(crow.batch_total_bytes) if is_fixed else float(crow.per_request_bytes)
+            if max_val > MIN_DENOM_EPS:
+                share = st_val / max_val
+                if abs(share - 1.0) <= MIN_DENOM_EPS:
+                    terms.append(f"F{r}")
+                else:
+                    terms.append(f"F{r}*{share!r}")
+            elif is_fixed:
+                terms.append(f"{st_val / float(GIB_BYTES)!r}")
+            elif crow.scales_with_tokens and mem.local_cache_tokens > 0:
+                terms.append(
+                    f"({st_val / float(GIB_BYTES)!r}*{MEM_CTL_CONC_REF}"
+                    f"*{MEM_CTL_LOCAL_TOK_REF}/{mem.local_cache_tokens})"
+                )
+            else:
+                terms.append(f"({st_val / float(GIB_BYTES)!r}*{MEM_CTL_CONC_REF})")
+        if terms:
+            return f"={'+'.join(terms)}"
+        return "=0"
     per_req_bytes = 0.0
     fixed_die_bytes = 0.0
     for crow in mem.cache_rows:

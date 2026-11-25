@@ -144,6 +144,7 @@ _STANDARD_MXFP4_EXCLUSIONS: tuple[str, ...] = (
     "mtp", "norm", "router", "lm_head", "embedding", "mhc", "attn_res_proj",
     "compressor", "vision", "projector", "conv_weight_f32", "conv_weight_bf16",
 )
+_STANDARD_MXFP8_EXCLUSIONS: tuple[str, ...] = ("gdn", *_STANDARD_MXFP4_EXCLUSIONS)
 _MXFP4_ROUTED_ACTIVATION = {
     "activation_format": "fp8_e4m3",
     "activation_group_size": MX_EXPERT_BLOCK,
@@ -272,7 +273,7 @@ def _quant_mxfp8() -> QuantSpec:
         kv_dtype="bf16",
         index_dtype="bf16",
         index_scale_dtype="none",
-        exclusions=_STANDARD_MXFP4_EXCLUSIONS,
+        exclusions=_STANDARD_MXFP8_EXCLUSIONS,
         source=merge_source({
             "quant_method": "mxfp8",
             "weight_block_size": "1x32",

@@ -66,6 +66,7 @@ MX_GROUP = 32
 INT8_SCALE_BYTES = 4
 MXFP8_SCALE_BYTES = 1
 PLE_HBM_SECTOR_BYTES = 128
+PLE_OWNER_CAPACITY_DEFAULT = 64
 PLE_UVA_RECIPE = "ple_host_uva_lookup"
 PLE_QUANTIZED_FORMATS = frozenset({"int8", "mxfp8"})
 PLE_FLOAT_FORMATS = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"})
@@ -297,8 +298,9 @@ def _ple_lookup_owner_schedule(
     *,
     aiv_capacity: int = 0,
 ) -> OwnerScheduleSpec:
+    cap = aiv_capacity if aiv_capacity > 0 else PLE_OWNER_CAPACITY_DEFAULT
     tiles = max(1, int(hits_local))
-    owners = min(aiv_capacity, tiles) if aiv_capacity > 0 else tiles
+    owners = max(1, min(cap, tiles))
     max_tiles = _ceil_div(tiles, owners)
     per_owner_read = read_bytes / float(owners)
     per_owner_write = write_bytes / float(owners)
@@ -316,7 +318,7 @@ def _ple_lookup_owner_schedule(
         work_tiles=tiles,
         launched_owners=owners,
         active_owners=owners,
-        total_owners=aiv_capacity,
+        total_owners=cap,
         max_tiles_per_owner=max_tiles,
         residency=OwnerMemoryResidency(
             ub_live_bytes=max(
@@ -345,8 +347,9 @@ def _ple_gate_owner_schedule(
     *,
     aiv_capacity: int = 0,
 ) -> OwnerScheduleSpec:
+    cap = aiv_capacity if aiv_capacity > 0 else PLE_OWNER_CAPACITY_DEFAULT
     rows = max(1, int(padded_tokens))
-    owners = min(aiv_capacity, rows) if aiv_capacity > 0 else rows
+    owners = max(1, min(cap, rows))
     max_tiles = _ceil_div(rows, owners)
     per_owner_read = read_bytes / float(owners)
     per_owner_write = write_bytes / float(owners)
@@ -358,7 +361,7 @@ def _ple_gate_owner_schedule(
         work_tiles=rows,
         launched_owners=owners,
         active_owners=owners,
-        total_owners=aiv_capacity,
+        total_owners=cap,
         max_tiles_per_owner=max_tiles,
         residency=OwnerMemoryResidency(
             ub_live_bytes=max(PLE_HBM_SECTOR_BYTES, int(hc_mult * hidden * act_bytes)),

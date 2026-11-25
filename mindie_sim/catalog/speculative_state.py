@@ -133,11 +133,15 @@ def record_head_bytes(dk: int, dv: int, kg_dtype: str = DEFAULT_RECORD_KG_DTYPE)
 
 def _conv_slice_width(layer: Any, total_shards: int, local_conv: int, kernel: int) -> int:
     """Exact per-token convolution channel width on this shard."""
-    del local_conv, kernel
     conv_width = int(getattr(layer, "conv_width", 0) or 0)
     if conv_width > 0:
         return _ceil_div(conv_width, total_shards)
-    raise ModelingError("linear_attention_conv_width_missing")
+    if local_conv <= 0:
+        return 0
+    history_slots = max(1, kernel - 1)
+    if kernel > 1 and local_conv % history_slots != 0 and local_conv % kernel == 0:
+        return local_conv // kernel
+    return _ceil_div(local_conv, history_slots)
 
 
 def speculative_state_plan(

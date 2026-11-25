@@ -360,8 +360,9 @@ def test_mxfp8_gqa_static_c8_w4a16_and_qwen4_exp_stride_reserve():
     assert projected[0]["page_group_reserve"] >= int(round(TEST_CONCURRENCY * stride_reserves[0]))
 
     led_q38 = compute_memory_quant_ledger(case_q38, seq_len=VLM_TEST_SEQ_LEN, concurrency=TEST_CONCURRENCY)
-    pgr_row = next(r for r in led_q38.cache_rows if r.component == "page_group_reserve")
-    assert pgr_row.per_request_bytes >= stride_reserves[0] - PARITY_ABS_TOL_BYTES
+    pgr_rows = [r for r in led_q38.cache_rows if r.component in {"page_group_reserve", "page_group_reserve_seq"}]
+    assert any(r.component == "page_group_reserve" for r in pgr_rows)
+    assert sum(r.per_request_bytes for r in pgr_rows) >= stride_reserves[0] - PARITY_ABS_TOL_BYTES
     rec_q38 = mem_q38.resident_memory_receipt(
         phase="decode", sequence_tokens=VLM_TEST_SEQ_LEN, batch_per_dp=TEST_CONCURRENCY,
     )
@@ -583,3 +584,97 @@ def test_sparse_mla_a3_situ_wo_a_w4a16_parity_and_gemma4_decode_read_conservatio
     )
     bundle_read_gib = sum(o.hbm_read_bytes * o.repeat_count for o in b_g4.operators) / GIB_DIVISOR
     assert bundle_read_gib >= receipt_w_gib
+
+
+def test_memory_ledger_exact_integer_bijection_against_resident_receipt():
+    from mindie_sim.export.ooxml import Worksheet
+    from mindie_sim.export.xlsx_memory import populate_memory_sheet
+
+    raw, _ = compose_export_case(
+        "glm-5.3-flash", REPRESENTATIVE_SKUS["a3"],
+        dp=1, tp=A3_TP_DEGREE, ep=A3_TP_DEGREE, quant="w4a8_dynamic", kv_cache_dtype="int8",
+    )
+    case = parse_case(raw)
+    led = compute_memory_quant_ledger(case, seq_len=GQA_TEST_SEQ_LEN, concurrency=TEST_CONCURRENCY)
+    ws_tok = _resolve_ledger_workspace_tokens(case, phase="decode", resolved_seq=GQA_TEST_SEQ_LEN, resolved_conc=TEST_CONCURRENCY)
+    die = Memory(case, workspace_tokens=ws_tok).resident_memory_receipt(
+        phase="decode", sequence_tokens=GQA_TEST_SEQ_LEN, batch_per_dp=TEST_CONCURRENCY,
+    ).die_receipt(0, 0, 0)
+    sb = led.stage_budgets[0]
+    assert int(sb.weight_payload_bytes + sb.weight_scale_aux_bytes + sb.engram_ple_hbm_bytes) == (
+        die.checkpoint_weight_bytes + die.prepared_weight_bytes + die.vision_weight_bytes
+    )
+    assert int(sb.cache_bytes) == (
+        die.kv_cache_allocated_bytes + die.index_cache_allocated_bytes + die.recurrent_state_bytes + die.draft_cache_bytes
+    )
+    assert (int(sb.workspace_peak_bytes), int(sb.reserve_bytes), int(sb.total_hbm_bytes), int(sb.usable_hbm_budget_bytes)) == (
+        die.workspace_bytes, die.reserve_bytes, die.simultaneous_live_hbm_bytes, die.usable_hbm_bytes
+    )
+    ws = Worksheet("Memory_Quant_Calculator")
+    populate_memory_sheet(ws, SimpleNamespace(memory_ledger=led))  # type: ignore[arg-type]
+    assert any(dv.sqref == "T4" and dv.formula1 == '"BF16,C8"' for dv in ws._validations)
+    assert float(ws._cells[(24, 20)].value) * GIB_DIVISOR == pytest.approx(die.usable_hbm_bytes, abs=1.0)
+    assert not any("uncalibrated" in str(c.value).lower() for c in ws._cells.values() if c.value is not None)
+    # Caller-supplied ResidentMemoryReceipt with custom rank_token_owners & PreparedWeightSpec
+    # preserves cache row conservation, peak weight stage, bottleneck replica/peak headroom, live grants,
+    # PP non-peak stage formulas, Sheet 3 seq-len scaling, canonical W4A8 parity, and FAQuant C8 alias.
+    from mindie_sim.catalog.quant import quant_preset
+    from mindie_sim.compose import compose_case
+    from mindie_sim.export.xlsx_memory import (
+        _populate_cache_block, _populate_stage_budget_block, _stage_cache_formula,
+    )
+    from mindie_sim.prediction.capacity import MemoryPolicy, ResidentGrantEntry
+    from mindie_sim.schema.stack import PreparedWeightSpec
+
+    case_q32 = parse_case(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a3"], dp=1, tp=2, pp=2, layers=4, quant="bf16", prompt_tokens=255, output_tokens=1))
+    mem_q32 = Memory(case_q32, policy=MemoryPolicy(rank_token_owners=((0, 128), (128, 256))))
+    mem_q32.register_prepared_weights((PreparedWeightSpec("q-t", ("q_proj",), "transpose", "target", (0,), (5120, 1024), "bf16", "ND"),))
+    rec_q32 = mem_q32.resident_memory_receipt(sequence_tokens=256, batch_per_dp=1)
+    led_q32 = compute_memory_quant_ledger(case_q32, seq_len=256, concurrency=1, memory_receipt=rec_q32)
+    assert int(sum(x.batch_total_bytes for x in led_q32.cache_rows)) == int(max(x.cache_bytes for x in led_q32.stage_budgets)) == 524_288
+    assert led_q32.peak_weight_stage == 0 and int(led_q32.weight_footprint_per_die_bytes) == int(led_q32.sim_memory_weight_bytes_by_stage[0])
+    assert "F" in _stage_cache_formula(led_q32, 0, 100)
+
+    case_g = parse_case(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a3"], dp=2, tp=2, layers=2, quant="bf16", prompt_tokens=2047, output_tokens=1))
+    for owner, rel in ((1, False), (0, True)):
+        mg = Memory(case_g)
+        assert mg.grant_batch(owner, (("scratch", mg.resident_memory_receipt(sequence_tokens=2048, batch_per_dp=1).min_free_hbm_headroom_bytes),))
+        if rel:
+            assert mg.release_grant(owner, "scratch")
+        rg = mg.resident_memory_receipt(sequence_tokens=2048, batch_per_dp=1)
+        lg = compute_memory_quant_ledger(case_g, seq_len=2048, concurrency=1, memory_receipt=rg)
+        assert int(lg.stage_budgets[0].headroom_bytes) == rg.min_free_hbm_headroom_bytes
+
+    case_g1 = parse_case(compose_case("qwen3-32b", hardware=REPRESENTATIVE_SKUS["a3"], dp=1, tp=2, layers=2, quant="bf16", prompt_tokens=2047, output_tokens=1))
+    mg1 = Memory(case_g1)
+    grant_fill = ResidentGrantEntry("scratch", "workspace", "scratch", allocated_bytes=mg1.resident_memory_receipt(sequence_tokens=2048, batch_per_dp=1).min_free_hbm_headroom_bytes)
+    r_g1 = mg1.resident_memory_receipt(sequence_tokens=2048, batch_per_dp=1, extra_grants=(grant_fill,))
+    r_g2 = mg1.resident_memory_receipt(sequence_tokens=2048, batch_per_dp=2, extra_grants=(grant_fill,))
+    l_g1 = compute_memory_quant_ledger(case_g1, seq_len=2048, concurrency=1, memory_receipt=r_g1)
+    l_g2 = compute_memory_quant_ledger(case_g1, seq_len=2048, concurrency=2, memory_receipt=r_g2)
+    ws_g = Worksheet("S3")
+    _populate_stage_budget_block(ws_g, 10, l_g2)
+    used_g = sum(ws_g._cells[12, j].value for j in (3, 4, 5, 7, 8, 9))
+    assert l_g1.max_hbm_concurrency_per_dp == 1
+    assert int(round((ws_g._cells[12, 11].value - used_g) * GIB_DIVISOR)) == r_g2.min_free_hbm_headroom_bytes
+
+    l_pp = compute_memory_quant_ledger(parse_case(compose_case("qwen3-next-80b-a3b", hardware=REPRESENTATIVE_SKUS["a3"], layers=4, tp=4, pp=2, pp_layer_partition=(3, 1), quant="bf16", mtp_proposal_tokens=0, prompt_tokens=256, output_tokens=1)), seq_len=256, concurrency=1)
+    f_pp = _stage_cache_formula(l_pp, 1, 100)
+    assert "$T$18" in f_pp and "F" not in f_pp
+
+    for m_name in ("deepseek-v4.1-flash", "gemma-4-31b"):
+        c_s = parse_case(compose_case(m_name, hardware=REPRESENTATIVE_SKUS["a3"], tp=A3_TP_DEGREE, layers=6, quant="bf16", mtp_proposal_tokens=0, prompt_tokens=8192, output_tokens=8))
+        l_s = compute_memory_quant_ledger(c_s, seq_len=4096, concurrency=1)
+        ws_s = Worksheet("S3")
+        _populate_cache_block(ws_s, 10, l_s, ("BF16", "C8"))
+        est_2x = sum(r.batch_total_bytes * (2 if "$T$21" in (ws_s._cells[12 + i, 5].formula or "") else 1) for i, r in enumerate(l_s.cache_rows))
+        assert int(est_2x) == int(Memory(c_s).cache_bytes(8192)[0])
+
+    l_w4 = compute_memory_quant_ledger(parse_case(compose_case("qwen3-30b-a3b", hardware=REPRESENTATIVE_SKUS["a3"], tp=2, ep=2, num_devices=2, layers=2, quant="bf16", prompt_tokens=128, output_tokens=1)), weight_quant="W4A8", seq_len=128, concurrency=1)
+    r_exp = next(row for row in l_w4.weight_rows if row.name == "expert_gate")
+    assert int(quant_preset("w4a8_dynamic").matrix_bytes(r_exp.local_rows, r_exp.local_cols, r_exp.category) * r_exp.peak_stage_repeats) == (
+        evaluate_weight_storage_bytes(r_exp.local_rows, r_exp.local_cols, "W4A8", repeats=r_exp.peak_stage_repeats)[-1]
+    ) == int(r_exp.per_die_bytes)
+    l_faq = compute_memory_quant_ledger(case_g1, seq_len=4096, concurrency=1, cache_dtype="FAQuant")
+    l_c8 = compute_memory_quant_ledger(case_g1, seq_len=4096, concurrency=1, cache_dtype="C8")
+    assert (l_faq.cache_dtype, int(l_faq.stage_budgets[0].cache_bytes)) == ("C8", int(l_c8.stage_budgets[0].cache_bytes))

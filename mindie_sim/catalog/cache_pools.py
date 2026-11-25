@@ -594,7 +594,7 @@ def _resolve_kpool_mamba_contract(
     cohosted_mtp = 0
     foreign_draft_page = 0
     subsumed_draft = False
-    if draft is not None and proposals > 0:
+    if draft is not None:
         if (
             str(getattr(draft, "kind", "")) == "mtp"
             and str(getattr(draft, "attention_kind", "")) == "mla"
@@ -831,7 +831,7 @@ def _resolve_aliased_window_contract(
     tp = max(1, int(getattr(parallel, "tp", 1) or 1))
     plans = tuple(model.layer_plans)
     draft = _resolve_draft_spec(model, draft_kind)
-    draft_active = draft is not None and (proposals > 0 or getattr(runtime, "dspark", None) is not None)
+    draft_active = draft is not None
     draft_layers = int(draft.layers) if draft_active else 0
     draft_swa_page = (
         raw_block * _draft_row_bytes_int(model, draft, tp=tp) if draft_active else 0
@@ -981,11 +981,12 @@ def resolve_pool_allocator_contract(
             local_slot_counts=(0,) * pp,
         )
     stage_map = layer_stage_map(model, parallel, runtime)
-    proposals = (
-        max(0, int(query_tokens) - 1)
-        if query_tokens is not None
-        else resolve_speculative_proposals(runtime, phase=phase)
-    )
+    if str(phase or "decode").strip().lower() == "prefill":
+        proposals = 0
+    elif query_tokens is not None:
+        proposals = max(0, int(query_tokens) - 1)
+    else:
+        proposals = resolve_speculative_proposals(runtime, phase=phase)
     eff_draft = (
         str(draft_kind).strip().lower()
         if draft_kind is not None

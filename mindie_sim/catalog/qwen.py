@@ -388,18 +388,28 @@ def _aux_dspark(c: Mapping[str, Any]) -> AuxiliarySpec:
 
 
 def _has_modern_standard_gqa_schema(c: Mapping[str, Any]) -> bool:
-    """True for configs declaring modern explicit attention_bias / QK-norm schema."""
-    return ("attention_bias" in c) or ("use_qk_norm" in c) or ("qk_norm" in c)
+    """True for configs declaring modern explicit attention_bias / QK-norm / decoupled head_dim / no-shared MoE schema."""
+    if ("attention_bias" in c) or ("use_qk_norm" in c) or ("qk_norm" in c):
+        return True
+    if "qkv_bias" in c or c.get("shared_expert_intermediate_size") is not None:
+        return False
+    hidden = _int(c, "hidden_size")
+    heads = _int(c, "num_attention_heads")
+    raw_hd = c.get("head_dim")
+    if raw_hd is not None and heads > 0 and hidden > 0 and int(raw_hd) * heads != hidden:
+        return True
+    return _int(c, "num_experts") > 0 and _int(c, "moe_intermediate_size") > 0
 
 
 def _standard_qwen_head_dim(
     c: Mapping[str, Any], *, legacy_shared_moe: bool, hidden: int, heads: int,
 ) -> int:
-    """Resolve explicit head_dim or derive hidden/heads for legacy shared-expert MoE."""
+    """Resolve explicit head_dim whenever declared, else derive hidden/heads."""
+    del legacy_shared_moe
     if heads <= 0:
         raise ModelingError(f"model_config_qwen_heads_invalid:{heads}")
     raw = c.get("head_dim")
-    if legacy_shared_moe or raw is None:
+    if raw is None:
         if hidden % heads:
             raise ModelingError(
                 f"model_config_qwen_head_dim_not_integral:{hidden}%{heads}")

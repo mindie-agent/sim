@@ -55,6 +55,7 @@ from mindie_sim.export.ooxml import NS_MAIN
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.scenario import CoDesignOpportunity, MegaFusionBound
 
 pytestmark = pytest.mark.tier0
@@ -410,10 +411,9 @@ def test_a3_deepseek_megamoe_contract_and_sheet3_isa_plus_exact_c8_parity(tmp_pa
         for ref, (val, _) in s3.items()
     )
     dv_xml = ET.tostring(roots[SHEET_MEMORY], encoding="unicode")
-    assert '"BF16,C8"' in dv_xml
+    assert '"BF16"' in dv_xml and '"BF16,C8"' not in dv_xml
 
-    # Exact Sheet 3 T4="C8" parity vs simulator ResidentMemoryReceipt on DeepSeek-V4.1-Flash A3 & Kimi-K3.1 A3.
-    ds_c8_calc_bytes = _eval_sheet3_cache_total_for_dtype(s3, "C8")
+    # A3 DeepSeek-V4.1-Flash hard-rejects INT8/C8 KV (aliased_window_compressed_rejects_int8_kv).
     raw_ds_c8, _ = compose_export_case(
         "deepseek-v4.1-flash", REPRESENTATIVE_SKUS["a3"],
         dp=1, tp=DEEPSEEK_TP, ep=DEEPSEEK_EP,
@@ -421,40 +421,46 @@ def test_a3_deepseek_megamoe_contract_and_sheet3_isa_plus_exact_c8_parity(tmp_pa
         concurrency=DEEPSEEK_CONC, feature_track="expected_ideal", quant="w4a8_dynamic", kv_cache_dtype="int8",
     )
     ds_seq = b_ds_aft.memory_ledger.seq_len
-    ds_receipt = Memory(parse_case(raw_ds_c8)).resident_memory_receipt(
-        phase="decode", sequence_tokens=ds_seq, batch_per_dp=DEEPSEEK_CONC,
-    )
-    ds_sim_cache_bytes = _receipt_total_cache_bytes(ds_receipt)
-    assert abs(ds_c8_calc_bytes - ds_sim_cache_bytes) / max(ds_sim_cache_bytes, 1.0) <= C8_PARITY_REL_TOL
+    with pytest.raises(ModelingError, match="aliased_window_compressed_rejects_int8_kv"):
+        Memory(parse_case(raw_ds_c8)).resident_memory_receipt(
+            phase="decode", sequence_tokens=ds_seq, batch_per_dp=DEEPSEEK_CONC,
+        )
 
-    # Kimi-K3.1 A3 MLA C8 exact parity (656 B/tok vs 1152 B/tok BF16 + paired_sfa reserve).
-    raw_km_c8, req_km = compose_export_case(
-        "kimi-k3.1", REPRESENTATIVE_SKUS["a3"],
-        dp=1, tp=DEEPSEEK_TP, ep=DEEPSEEK_EP,
-        prompt_tokens=PROMPT_TOKENS, output_tokens=OUTPUT_TOKENS,
-        concurrency=DEEPSEEK_CONC, feature_track="merged", quant="w4a8_dynamic", kv_cache_dtype="int8",
-    )
-    raw_km_bf16, _ = compose_export_case(
-        "kimi-k3.1", REPRESENTATIVE_SKUS["a3"],
-        dp=1, tp=DEEPSEEK_TP, ep=DEEPSEEK_EP,
-        prompt_tokens=PROMPT_TOKENS, output_tokens=OUTPUT_TOKENS,
-        concurrency=DEEPSEEK_CONC, feature_track="merged", quant="w4a8_dynamic", kv_cache_dtype="bf16",
-    )
-    raw_km_bf16 = {
-        **raw_km_bf16,
-        "runtime": {**raw_km_bf16["runtime"], "kv_block_size": raw_km_c8["runtime"]["kv_block_size"]},
-    }
-    b_km_bf16 = build_export_bundle(raw_km_bf16, request=req_km, apply_target_envelope=False)
-    km_xlsx = tmp_path / "kimi_a3_c8.xlsx"
-    export_comparison_xlsx(b_km_bf16, km_xlsx)
-    km_sheets, _ = _read_workbook_sheets(km_xlsx)
-    km_s3 = km_sheets[SHEET_MEMORY]
-    km_c8_calc_bytes = _eval_sheet3_cache_total_for_dtype(km_s3, "C8")
-    km_receipt = Memory(parse_case(raw_km_c8)).resident_memory_receipt(
-        phase="decode", sequence_tokens=b_km_bf16.memory_ledger.seq_len, batch_per_dp=DEEPSEEK_CONC,
-    )
-    km_sim_cache_bytes = _receipt_total_cache_bytes(km_receipt)
-    assert abs(km_c8_calc_bytes - km_sim_cache_bytes) / max(km_sim_cache_bytes, 1.0) <= C8_PARITY_REL_TOL
+    # Kimi-K3.1 & GLM-5.3 A3 MLA C8 exact parity + Sheet 3 exact cache/total bijection.
+    for model_key, stem in (("kimi-k3.1", "kimi_a3_c8.xlsx"), ("glm-5.3", "glm53_a3_c8.xlsx")):
+        raw_c8, req_m = compose_export_case(
+            model_key, REPRESENTATIVE_SKUS["a3"],
+            dp=1, tp=DEEPSEEK_TP, ep=DEEPSEEK_EP,
+            prompt_tokens=PROMPT_TOKENS, output_tokens=OUTPUT_TOKENS,
+            concurrency=DEEPSEEK_CONC, feature_track="merged", quant="w4a8_dynamic", kv_cache_dtype="int8",
+        )
+        raw_bf16, _ = compose_export_case(
+            model_key, REPRESENTATIVE_SKUS["a3"],
+            dp=1, tp=DEEPSEEK_TP, ep=DEEPSEEK_EP,
+            prompt_tokens=PROMPT_TOKENS, output_tokens=OUTPUT_TOKENS,
+            concurrency=DEEPSEEK_CONC, feature_track="merged", quant="w4a8_dynamic", kv_cache_dtype="bf16",
+        )
+        raw_bf16 = {
+            **raw_bf16,
+            "runtime": {**raw_bf16["runtime"], "kv_block_size": raw_c8["runtime"]["kv_block_size"]},
+        }
+        b_bf16 = build_export_bundle(raw_bf16, request=req_m, apply_target_envelope=False)
+        out_m = tmp_path / stem
+        export_comparison_xlsx(b_bf16, out_m)
+        m_sheets, m_roots = _read_workbook_sheets(out_m)
+        assert '"BF16,C8"' in ET.tostring(m_roots[SHEET_MEMORY], encoding="unicode")
+        m_s3 = m_sheets[SHEET_MEMORY]
+        c8_calc_bytes = _eval_sheet3_cache_total_for_dtype(m_s3, "C8")
+        c8_receipt = Memory(parse_case(raw_c8)).resident_memory_receipt(
+            phase="decode", sequence_tokens=b_bf16.memory_ledger.seq_len, batch_per_dp=DEEPSEEK_CONC,
+        )
+        sim_cache_bytes = _receipt_total_cache_bytes(c8_receipt)
+        assert abs(c8_calc_bytes - sim_cache_bytes) / max(sim_cache_bytes, 1.0) <= C8_PARITY_REL_TOL
+        # Sheet 3 Cache Total (Max Stage) cached value matches ledger stage_budgets[0].cache_bytes (0 B drift).
+        tot_r = next(int(k[1:]) for k, (v, _) in m_s3.items() if k.startswith("A") and v == "Cache Total (Max Stage)")
+        assert float(m_s3[f"F{tot_r}"][0] or "0") * GIB_DIVISOR == pytest.approx(
+            b_bf16.memory_ledger.stage_budgets[0].cache_bytes, abs=1.0,
+        )
 
 
 def test_sheet4_surfaces_a5_tilelang_dual_tier_and_ub_wall_warning(tmp_path: Path) -> None:

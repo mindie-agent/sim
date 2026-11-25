@@ -498,6 +498,212 @@ def _union_elementary_spans(spans: Sequence[tuple[int, int, float]]) -> float:
     return total
 
 
+def _stage_shareable_prefix_range(
+    contract: Any,
+    stage: int,
+    *,
+    length: int,
+    declared_prefix: int,
+    eff_block: int,
+) -> range:
+    """Shareable physical block range on one stage (respects SWA window expiry)."""
+    from mindie_sim.catalog.cache_pools import REGIME_ALIASED_WINDOW_COMPRESSED
+
+    if declared_prefix <= 0 or length <= 0 or eff_block <= 0:
+        return range(0)
+    if (
+        contract.pool_regime == REGIME_ALIASED_WINDOW_COMPRESSED
+        and stage < len(contract.alias_backing_pitches_by_stage)
+        and not contract.alias_backing_pitches_by_stage[stage]
+    ):
+        win = int(contract.swa_max_window or 0)
+        win_start = max(0, length - win) if win > 0 else 0
+        shared_hi = min(declared_prefix, length)
+        if shared_hi <= win_start:
+            return range(0)
+        return range(_ceil_div(win_start, eff_block), shared_hi // eff_block)
+    max_shareable = min(declared_prefix // eff_block, _ceil_div(length, eff_block))
+    return range(max(0, max_shareable))
+
+
+def _record_hybrid_prefix_blocks(
+    req_hybrid: Any,
+    *,
+    stages: int,
+    shared_mode: bool,
+    length: int,
+    declared_prefix: int,
+    key: str,
+    generation: int,
+    private_pool_bytes: list[int],
+    shared_block_units: dict[tuple[str, int, int, int], int],
+) -> bool:
+    """Accumulate order-invariant private & shared-prefix pool block bytes for one request."""
+    contract = req_hybrid.contract
+    eff_block = contract.normalized_block_size
+    any_shared = False
+    for st in range(stages):
+        unit_b = int(req_hybrid.pool_unit_bytes_by_stage[st])
+        blk_range = (
+            _stage_shareable_prefix_range(
+                contract, st, length=length, declared_prefix=declared_prefix, eff_block=eff_block,
+            )
+            if (shared_mode and declared_prefix >= eff_block)
+            else range(0)
+        )
+        if blk_range:
+            any_shared = True
+            for blk_id in blk_range:
+                bkey = (key, generation, st, int(blk_id))
+                if unit_b > shared_block_units.get(bkey, 0):
+                    shared_block_units[bkey] = unit_b
+        private_pool_bytes[st] += max(
+            0, int(req_hybrid.total_pool_bytes_by_stage[st]) - len(blk_range) * unit_b,
+        )
+    return any_shared
+
+
+def _hybrid_batch_footprint(
+    case: Any,
+    *,
+    requests: Sequence[Any],
+    phase: str,
+    layer_stages: Mapping[int, int],
+    stages: int,
+    shared_mode: bool,
+    block_size: int,
+    interleave: int,
+    draft_kind: str,
+) -> BatchCacheFootprint:
+    """Physical batch footprint for G3 hybrid block-pool regimes with 0 B Memory parity."""
+    from mindie_sim.catalog.cache_pools import evaluate_hybrid_pool_receipt
+
+    model, parallel, runtime = case.model, case.runtime.parallel, case.runtime
+    is_prefill = str(phase or "decode").strip().lower() == "prefill"
+    shared: dict[tuple[int, str, str, int, int], list[tuple[int, int, float]]] = {}
+    shared_subsumed: dict[tuple[int, str, str, int, int], list[tuple[int, int, float]]] = {}
+    private = [0.0] * stages
+    state = [0.0] * stages
+    draft = [0.0] * stages
+    boundary = [0.0] * stages
+    subsumed_priv = [0.0] * stages
+    private_pool_bytes = [0] * stages
+    shared_block_units: dict[tuple[str, int, int, int], int] = {}
+    has_shared_blocks = False
+    per_req_shapes: list[tuple[int, int]] = []
+    cp_deg = int(getattr(parallel, "cp", 1) or 1)
+
+    for view in requests:
+        length = max(0, int(getattr(view, "kv_len", 0) or 0))
+        q_tok = 1 if is_prefill else max(1, int(getattr(view, "q_len", 1) or 1))
+        declared_prefix = max(0, min(int(getattr(view, "prefix_tokens", 0) or 0), length))
+        req_hybrid = evaluate_hybrid_pool_receipt(
+            model, parallel, length, num_requests=1, block_size=block_size,
+            runtime=runtime, draft_kind=draft_kind, query_tokens=q_tok, phase=phase,
+        )
+        contract = req_hybrid.contract
+        eff_block = contract.normalized_block_size
+        eff_interleave = eff_block if cp_deg <= 1 else interleave
+        sub_layers = set(contract.subsumed_layers)
+        sub_comps = set(contract.subsumed_components)
+        generation = _view_generation(view)
+        if shared_mode:
+            from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
+            key = canonical_prefix_cache_key("shared", getattr(view, "prefix_cache_key", ""))
+        else:
+            key = f"private:{getattr(view, 'request_id', '')}"
+        if _record_hybrid_prefix_blocks(
+            req_hybrid,
+            stages=stages, shared_mode=shared_mode, length=length,
+            declared_prefix=declared_prefix, key=key, generation=generation,
+            private_pool_bytes=private_pool_bytes, shared_block_units=shared_block_units,
+        ):
+            has_shared_blocks = True
+        per_req_shapes.append((length, q_tok))
+
+        for layer in model.layer_plans:
+            ranges = cache_component_ranges(
+                model, layer, parallel, sequence_tokens=length,
+                prefix_tokens=declared_prefix, interleave=eff_interleave,
+                block_size=eff_block, rank=None, capacity_padded=True,
+                runtime=runtime, query_tokens=q_tok, generation=generation,
+                phase=phase,
+            )
+            stage = layer_stages[int(layer.index)]
+            for item in _prefixed(ranges, key, generation):
+                is_sub = int(item.layer) in sub_layers and str(item.component) in sub_comps
+                if item.sharing == SHARING_SHARED and item.valid_bytes > 0.0:
+                    span_len = max(1, item.end_token - item.start_token)
+                    rate = float(item.valid_bytes) / float(span_len)
+                    grp_key = (int(item.layer), item.component, key, generation, stage)
+                    shared.setdefault(grp_key, []).append((int(item.start_token), int(item.end_token), rate))
+                    if is_sub:
+                        shared_subsumed.setdefault(grp_key, []).append((int(item.start_token), int(item.end_token), rate))
+                    continue
+                alloc_val = float(item.allocated_bytes)
+                valid_val = float(item.valid_bytes)
+                private[stage] += valid_val
+                boundary[stage] += max(0.0, alloc_val - valid_val)
+                if item.component in STATE_COMPONENTS:
+                    state[stage] += valid_val
+                if is_sub:
+                    subsumed_priv[stage] += alloc_val
+        if draft_kind:
+            values = draft_cache_components(
+                model, parallel, draft_kind=draft_kind, sequence_tokens=length,
+                runtime=runtime, capacity_padded=True, query_tokens=q_tok, phase=phase,
+            )
+            d_kv = float(values.get("draft_kv", 0.0))
+            d_st = float(values.get("draft_state", 0.0))
+            draft[-1] += d_kv
+            state[-1] += d_st
+            private[-1] += d_st
+            if contract.subsumed_draft_kv:
+                subsumed_priv[-1] += d_kv
+
+    shared_once = [0.0] * stages
+    for (_lyr, _comp, _key, _gen, stage), spans in shared.items():
+        shared_once[stage] += _union_elementary_spans(spans)
+    shared_sub_once = [0.0] * stages
+    for (_lyr, _comp, _key, _gen, stage), spans in shared_subsumed.items():
+        shared_sub_once[stage] += _union_elementary_spans(spans)
+
+    uniform_non_shared = (
+        bool(per_req_shapes)
+        and not has_shared_blocks
+        and len(set(per_req_shapes)) == 1
+    )
+    if uniform_non_shared:
+        ln0, qt0 = per_req_shapes[0]
+        batch_hybrid = evaluate_hybrid_pool_receipt(
+            model, parallel, ln0, num_requests=len(requests), block_size=block_size,
+            runtime=runtime, draft_kind=draft_kind, query_tokens=qt0, phase=phase,
+        )
+        for st in range(stages):
+            boundary[st] += float(batch_hybrid.stride_reserve_by_stage[st])
+    else:
+        shared_pool_bytes = [0] * stages
+        for (_k, _g, st, _blk), unit_b in shared_block_units.items():
+            shared_pool_bytes[st] += unit_b
+        for st in range(stages):
+            pool_target = float(private_pool_bytes[st] + shared_pool_bytes[st])
+            boundary[st] += max(0.0, pool_target - (shared_sub_once[st] + subsumed_priv[st]))
+
+    total = [
+        shared_once[st] + private[st] + draft[st] + boundary[st]
+        for st in range(stages)
+    ]
+    return BatchCacheFootprint(
+        tuple(float(value) for value in shared_once),
+        tuple(float(value) for value in private),
+        tuple(float(value) for value in state),
+        tuple(float(value) for value in draft),
+        tuple(float(value) for value in boundary),
+        tuple(float(value) for value in total),
+        requests=len(requests), stages=stages,
+    )
+
+
 def batch_cache_footprint(
     case: Any, *, requests: Sequence[Any], replica: int, phase: str,
     padded: bool,
@@ -514,17 +720,34 @@ def batch_cache_footprint(
             case, requests=requests, phase=phase, padded=padded,
             layer_stages=layer_stages, stages=stages, shared_mode=shared_mode,
         )
+    block_size = max(1, int(getattr(runtime, "kv_block_size", DEFAULT_INTERLEAVE) or DEFAULT_INTERLEAVE))
+    interleave = cp_interleave(runtime)
+    draft_kind = _active_draft_kind(model, runtime)
+    if padded and requests:
+        from mindie_sim.catalog.cache_pools import (
+            REGIME_UNIFORM_INDEPENDENT,
+            resolve_pool_allocator_contract,
+        )
+        eff_draft = draft_kind if str(phase) == "decode" else ""
+        contract = resolve_pool_allocator_contract(
+            model, parallel, block_size=block_size, runtime=runtime,
+            draft_kind=eff_draft, phase=phase,
+        )
+        if contract.pool_regime != REGIME_UNIFORM_INDEPENDENT:
+            return _hybrid_batch_footprint(
+                case, requests=requests, phase=phase, layer_stages=layer_stages,
+                stages=stages, shared_mode=shared_mode, block_size=block_size,
+                interleave=interleave, draft_kind=eff_draft,
+            )
     shared: dict[tuple[int, str, str, int, int], list[tuple[int, int, float]]] = {}
     private = [0.0] * stages
     state = [0.0] * stages
     draft = [0.0] * stages
     boundary = [0.0] * stages
-    block_size = max(1, int(getattr(runtime, "kv_block_size", DEFAULT_INTERLEAVE) or DEFAULT_INTERLEAVE))
-    interleave = cp_interleave(runtime)
-    draft_kind = _active_draft_kind(model, runtime)
+    is_prefill = str(phase or "decode").strip().lower() == "prefill"
     for view in requests:
         length = int(getattr(view, "kv_len", 0) or 0)
-        q_tok = max(1, int(getattr(view, "q_len", 1) or 1))
+        q_tok = 1 if is_prefill else max(1, int(getattr(view, "q_len", 1) or 1))
         declared_prefix = max(0, min(int(getattr(view, "prefix_tokens", 0) or 0), length))
         if shared_mode:
             from mindie_sim.schema.runtime_features import canonical_prefix_cache_key

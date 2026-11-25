@@ -58,6 +58,9 @@ _COMPONENT_POOL_MAP = {
     **{name: "recurrent_state_bytes" for name in _RECURRENT_POOL_COMPONENTS},
     "draft_kv": "draft_kv_bytes",
     "draft_state": "draft_state_bytes",
+    "dcp_dp_cohort_kv": "target_kv_bytes",
+    "dcp_dp_cohort_index": "indexer_k_bytes",
+    "dcp_dp_cohort_draft": "draft_kv_bytes",
 }
 
 
@@ -98,22 +101,25 @@ class _MemoryCacheMixin:
             return None
         return receipt
 
-    def _dp_cohort_extra_by_stage(
+    def _dp_cohort_extra_parts_by_stage(
         self,
         tokens: int,
         *,
         padded: bool = True,
         rank: int | None = None,
         query_tokens: int | None = None,
-    ) -> list[float]:
-        """Extra per-DP-sequence KV bytes hosted on one die from ``dcp_dp_width > 1``."""
+        phase: str = "decode",
+        peer_count_override: int | None = None,
+    ) -> list[dict[str, float]]:
+        """Per-stage DP-cohort extra bytes split into ``(kv, index, draft)``."""
         p = self.case.runtime.parallel
-        extra = [0.0] * p.pp
+        parts = [{"kv": 0.0, "index": 0.0, "draft": 0.0} for _ in range(p.pp)]
         dp_width = int(getattr(p, "dcp_dp_width", 1) or 1)
         if dp_width <= 1 or not self.case.model.layer_plans:
-            return extra
+            return parts
         case, model = self.case, self.case.model
-        q_tok = self._effective_cache_query_tokens(query_tokens)
+        is_prefill = str(phase or "decode").strip().lower() == "prefill"
+        q_tok = 1 if is_prefill else self._effective_cache_query_tokens(query_tokens)
         interleave = cp_interleave(case.runtime)
         sharded_idx = dcp_indexer_sharded(model, case.runtime)
         owner_spans = self.rank_token_owners if rank is not None else None
@@ -124,23 +130,68 @@ class _MemoryCacheMixin:
             components = layer_cache_components(
                 model, layer, p, tokens, capacity_padded=padded,
                 interleave=interleave, rank=rank, owner_spans=owner_spans,
-                runtime=case.runtime, query_tokens=q_tok,
+                runtime=case.runtime, query_tokens=q_tok, phase=phase,
             )
             covered = self.pages.covered.get(layer.index, ()) if padded else ()
             stage = self.layer_stage[layer.index]
+            scale = float(peer_count_override if peer_count_override is not None else (layer_dp - 1))
             for name, value in components.items():
                 if name in covered:
                     continue
-                if name in _DCP_KV_SHARDED_COMPONENTS or (name == "index_k" and sharded_idx):
-                    extra[stage] += float(value) * float(layer_dp - 1)
+                if name in _DCP_KV_SHARDED_COMPONENTS:
+                    parts[stage]["kv"] += float(value) * scale
+                elif name == "index_k" and sharded_idx:
+                    parts[stage]["index"] += float(value) * scale
         if self.draft_kind and model.auxiliary is not None and not self.paired_sfa:
-            if not self._uses_inherited_draft_cache(model):
+            if self._uses_inherited_draft_cache(model):
+                from mindie_sim.catalog.draft import optional_draft_spec
+                from mindie_sim.catalog.draft_geometry import draft_layer_plans
+
+                draft = optional_draft_spec(model, self.draft_kind)
+                draft_cap = self._draft_context_cap(draft)
+                eff_tokens = min(int(tokens), draft_cap) if draft_cap > 0 else int(tokens)
+                for d_plan in draft_layer_plans(model, self.draft_kind):
+                    _, _, d_layer_dp = layer_dcp_factors(d_plan, p)
+                    if d_layer_dp <= 1:
+                        continue
+                    d_comps = layer_cache_components(
+                        model, d_plan, p, eff_tokens, capacity_padded=padded,
+                        interleave=interleave, rank=rank, owner_spans=owner_spans,
+                        runtime=case.runtime, query_tokens=q_tok, phase=phase,
+                    )
+                    d_scale = float(
+                        peer_count_override if peer_count_override is not None else (d_layer_dp - 1)
+                    )
+                    for name, value in d_comps.items():
+                        if name in _DCP_KV_SHARDED_COMPONENTS or (name == "index_k" and sharded_idx):
+                            parts[-1]["draft"] += float(value) * d_scale
+            else:
                 draft_kv, draft_sharded = self._non_inherited_draft_cache_bytes(
                     model, tokens, padded=padded, rank=rank,
                 )
                 if draft_sharded and draft_kv > 0.0:
-                    extra[-1] += draft_kv * float(dp_width - 1)
-        return extra
+                    d_scale = float(
+                        peer_count_override if peer_count_override is not None else (dp_width - 1)
+                    )
+                    parts[-1]["draft"] += draft_kv * d_scale
+        return parts
+
+    def _dp_cohort_extra_by_stage(
+        self,
+        tokens: int,
+        *,
+        padded: bool = True,
+        rank: int | None = None,
+        query_tokens: int | None = None,
+        phase: str = "decode",
+        peer_count_override: int | None = None,
+    ) -> list[float]:
+        """Extra per-DP-sequence KV bytes hosted on one die from ``dcp_dp_width > 1``."""
+        parts = self._dp_cohort_extra_parts_by_stage(
+            tokens, padded=padded, rank=rank, query_tokens=query_tokens,
+            phase=phase, peer_count_override=peer_count_override,
+        )
+        return [float(st["kv"] + st["index"] + st["draft"]) for st in parts]
 
     def _rank_dp_cohort_cache_bytes(
         self,
@@ -149,6 +200,7 @@ class _MemoryCacheMixin:
         padded: bool = True,
         rank: int | None = None,
         query_tokens: int | None = None,
+        phase: str = "decode",
     ) -> list[float]:
         """Unified physical-die cache bytes including DP-cohort KV and hybrid pools."""
         base = (
@@ -157,7 +209,7 @@ class _MemoryCacheMixin:
             else self._rank_cache_bytes(tokens, padded=padded, rank=int(rank), query_tokens=query_tokens)
         )
         extra = self._dp_cohort_extra_by_stage(
-            tokens, padded=padded, rank=rank, query_tokens=query_tokens,
+            tokens, padded=padded, rank=rank, query_tokens=query_tokens, phase=phase,
         )
         return [float(b) + float(e) for b, e in zip(base, extra)]
 
@@ -326,7 +378,7 @@ class _MemoryCacheMixin:
 
     def _inherited_draft_cache_parts(
         self, model, tokens: int, *, padded: bool, rank: int | None = None,
-        query_tokens: int | None = None,
+        query_tokens: int | None = None, phase: str = "decode",
     ) -> tuple[float, float]:
         """Draft KV and recurrent state from inherited plans, honoring context cap."""
         from mindie_sim.catalog.cache_ownership import draft_cache_components
@@ -335,12 +387,14 @@ class _MemoryCacheMixin:
         draft = optional_draft_spec(model, self.draft_kind)
         draft_cap = self._draft_context_cap(draft)
         eff_tokens = min(tokens, draft_cap) if draft_cap > 0 else tokens
+        is_prefill = str(phase or "decode").strip().lower() == "prefill"
+        q_tok = 1 if is_prefill else self._effective_cache_query_tokens(query_tokens)
         values = draft_cache_components(
             model, self.case.runtime.parallel, draft_kind=self.draft_kind,
             sequence_tokens=eff_tokens, capacity_padded=padded,
             runtime=self.case.runtime, rank=rank,
             owner_spans=self.rank_token_owners if rank is not None else None,
-            query_tokens=self._effective_cache_query_tokens(query_tokens),
+            query_tokens=q_tok, phase=phase,
         )
         return float(values.get("draft_kv", 0.0)), float(values.get("draft_state", 0.0))
 
@@ -567,11 +621,12 @@ class _MemoryCacheMixin:
     def _cache_component_breakdown(
         self, tokens: int, *, padded: bool, skip_covered: bool,
         rank: int | None = None, query_tokens: int | None = None,
-        block_size_override: int | None = None,
+        block_size_override: int | None = None, phase: str = "decode",
     ) -> list[dict]:
         """Per-stage component payload/scale split for one liveness view."""
         case, model, p = self.case, self.case.model, self.case.runtime.parallel
-        q_tok = self._effective_cache_query_tokens(query_tokens)
+        is_prefill = str(phase or "decode").strip().lower() == "prefill"
+        q_tok = 1 if is_prefill else self._effective_cache_query_tokens(query_tokens)
         interleave = (
             int(block_size_override)
             if block_size_override is not None and int(block_size_override) > 0
@@ -586,7 +641,7 @@ class _MemoryCacheMixin:
                 model, layer, p, tokens, capacity_padded=padded,
                 interleave=interleave, block_size=block_size_override,
                 rank=rank, owner_spans=self.rank_token_owners,
-                runtime=case.runtime, query_tokens=q_tok,
+                runtime=case.runtime, query_tokens=q_tok, phase=phase,
             )
             covered = self.pages.covered.get(layer.index, ()) if skip_covered else ()
             stage = stages[self.layer_stage[layer.index]]
@@ -608,7 +663,9 @@ class _MemoryCacheMixin:
             draft_state = 0.0
             if self._uses_inherited_draft_cache(model):
                 value, draft_state = self._inherited_draft_cache_parts(
-                    model, tokens, padded=padded, rank=rank, query_tokens=q_tok)
+                    model, tokens, padded=padded, rank=rank,
+                    query_tokens=q_tok, phase=phase,
+                )
             else:
                 value, _ = self._non_inherited_draft_cache_bytes(
                     model, tokens, padded=padded, rank=rank)
@@ -649,7 +706,7 @@ class _MemoryCacheMixin:
     def _rank_max_layer_cache_bytes(
         self, tokens: int, rank: int, *, query_tokens: int | None = None,
     ) -> tuple[float, ...]:
-        if self.rank_token_owners is None:
+        if self.rank_token_owners is None and int(self.case.runtime.parallel.cp) <= 1:
             return self._max_layer_cache_bytes(tokens, query_tokens=query_tokens)
         model, p = self.case.model, self.case.runtime.parallel
         q_tok = self._effective_cache_query_tokens(query_tokens)
@@ -670,7 +727,7 @@ class _MemoryCacheMixin:
     ) -> tuple[list[list[float]], list[list[float]]]:
         """(HBM-resident, staging) per stage and physical rank."""
         p = self.case.runtime.parallel
-        if self.rank_token_owners is None:
+        if self.rank_token_owners is None and int(getattr(p, "cp", 1) or 1) <= 1:
             _gross, resident, staging = self._kv_residency(
                 tokens, query_tokens=query_tokens,
             )
@@ -696,6 +753,48 @@ class _MemoryCacheMixin:
                     staging[stage][rank] = (
                         float(layer_max[stage]) * (1.0 - self.kvc_hbm_ratio))
         return resident, staging
+
+    def _kv_residency_cohort(
+        self, replica: int, tokens: int, *, query_tokens: int | None = None,
+    ) -> tuple[list[list[list[float]]], list[list[list[float]]], dict[int, tuple[tuple[float, ...], ...]], dict[int, tuple[tuple[float, ...], ...]]]:
+        """Single-request physical (HBM-resident, staging) across its cross-DP DCP cohort."""
+        p = self.case.runtime.parallel
+        dp_width = max(1, int(getattr(p, "dcp_dp_width", 1) or 1))
+        cohort_start = (int(replica) // dp_width) * dp_width
+        cohort_end = min(int(p.dp), cohort_start + dp_width)
+        res_all = [[[0.0] * self.width for _ in range(p.pp)] for _ in range(p.dp)]
+        stg_all = [[[0.0] * self.width for _ in range(p.pp)] for _ in range(p.dp)]
+        res_map: dict[int, tuple[tuple[float, ...], ...]] = {}
+        stg_map: dict[int, tuple[tuple[float, ...], ...]] = {}
+        for peer_rep in range(cohort_start, cohort_end):
+            peer_res = [[0.0] * self.width for _ in range(p.pp)]
+            peer_stg = [[0.0] * self.width for _ in range(p.pp)]
+            for rank in range(self.width):
+                cohort_rk = (peer_rep - cohort_start) * self.width + rank
+                if peer_rep == int(replica):
+                    gross = self._rank_cache_bytes(
+                        tokens, padded=True, rank=cohort_rk, query_tokens=query_tokens,
+                    )
+                else:
+                    gross = self._dp_cohort_extra_by_stage(
+                        tokens, padded=True, rank=cohort_rk,
+                        query_tokens=query_tokens, peer_count_override=1,
+                    )
+                layer_max = (
+                    self._rank_max_layer_cache_bytes(tokens, cohort_rk, query_tokens=query_tokens)
+                    if self.kvc_hbm_ratio < 1.0 else (0.0,) * p.pp
+                )
+                for stage in range(p.pp):
+                    if self.kvc_hbm_ratio == 1.0:
+                        peer_res[stage][rank] = float(gross[stage])
+                    else:
+                        peer_res[stage][rank] = float(gross[stage]) * self.kvc_hbm_ratio
+                        peer_stg[stage][rank] = float(layer_max[stage]) * (1.0 - self.kvc_hbm_ratio)
+            res_all[peer_rep] = peer_res
+            stg_all[peer_rep] = peer_stg
+            res_map[peer_rep] = tuple(tuple(row) for row in peer_res)
+            stg_map[peer_rep] = tuple(tuple(row) for row in peer_stg)
+        return res_all, stg_all, res_map, stg_map
 
     def _allocation_view(
         self, tokens: int, *, rank: int | None = None,

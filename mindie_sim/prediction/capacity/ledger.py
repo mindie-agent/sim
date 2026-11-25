@@ -720,15 +720,43 @@ class _MemoryLedgerMixin:
             ))
         return tuple(refs)
 
+    def _is_cross_dp_dcp_cohort_active(self) -> bool:
+        p = self.case.runtime.parallel
+        return (
+            bool(getattr(p, "cp_spans_dp", False))
+            and int(getattr(p, "dcp_dp_width", 1) or 1) > 1
+            and self.rank_token_owners is None
+        )
+
+    def _accumulate_owner_map(
+        self,
+        target: list[list[list[float]]],
+        owners: Mapping[tuple[int, str], tuple[tuple[float, ...], ...]],
+        cohort_owners: Mapping[tuple[int, str], Mapping[int, tuple[tuple[float, ...], ...]]],
+        *,
+        exclude_request: tuple[int, str] | None = None,
+    ) -> None:
+        for key, rows in owners.items():
+            if key == exclude_request:
+                continue
+            cohort_map = cohort_owners.get(key)
+            if cohort_map is not None:
+                for peer_rep, peer_rows in cohort_map.items():
+                    for stage, row in enumerate(peer_rows):
+                        for rank, value in enumerate(row):
+                            target[peer_rep][stage][rank] += float(value)
+                continue
+            replica = key[0]
+            for stage, row in enumerate(rows):
+                for rank, value in enumerate(row):
+                    target[replica][stage][rank] += float(value)
+
     def _request_usage_ranks(self) -> list[list[list[float]]]:
         result = [
             [[0.0] * self.width for _ in range(self.case.runtime.parallel.pp)]
             for _ in range(self.case.runtime.parallel.dp)
         ]
-        for (replica, _request), rows in self.owner_ranks.items():
-            for stage, row in enumerate(rows):
-                for rank, value in enumerate(row):
-                    result[replica][stage][rank] += float(value)
+        self._accumulate_owner_map(result, self.owner_ranks, self._cohort_owner_ranks)
         return result
 
     def _staging_usage_ranks(self) -> list[list[list[float]]]:
@@ -736,11 +764,113 @@ class _MemoryLedgerMixin:
             [[0.0] * self.width for _ in range(self.case.runtime.parallel.pp)]
             for _ in range(self.case.runtime.parallel.dp)
         ]
-        for (replica, _request), rows in self.staging_owner_ranks.items():
-            for stage, row in enumerate(rows):
-                for rank, value in enumerate(row):
-                    result[replica][stage][rank] += float(value)
+        self._accumulate_owner_map(result, self.staging_owner_ranks, self._cohort_staging_ranks)
         return result
+
+    def _resident_admission(
+        self, replica: int, request: str, tokens: int,
+        *, query_tokens: int | None = None, proposal_tokens: int | None = None,
+    ) -> dict:
+        if not self._is_cross_dp_dcp_cohort_active():
+            return super()._resident_admission(
+                replica, request, tokens,
+                query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+            )
+        key = (replica, request)
+        eff_q = self._resolve_request_query_tokens(
+            key, query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+        )
+        res_all, stg_all, res_map, stg_map = self._kv_residency_cohort(
+            replica, tokens, query_tokens=eff_q,
+        )
+        own_res = res_map[int(replica)]
+        own_stg = stg_map[int(replica)]
+        demand = tuple(max(row) for row in own_res)
+        demand_staging = tuple(max(row) for row in own_stg)
+        host_demand = self.host_dram_cache_bytes(tokens) if self.sparse_offload else 0.0
+        (physical, host_physical, physical_staging,
+         physical_ranks, physical_staging_ranks) = self._physical_union(
+            key, demand, host_demand, demand_staging,
+            demand_ranks=own_res, staging_ranks=own_stg,
+        )
+        res_map[int(replica)] = physical_ranks
+        stg_map[int(replica)] = physical_staging_ranks
+        res_all[int(replica)] = [list(row) for row in physical_ranks]
+        stg_all[int(replica)] = [list(row) for row in physical_staging_ranks]
+        p = self.case.runtime.parallel
+        host_request = [0.0] * p.dp
+        host_request[replica] = float(host_physical)
+        hbm, host = self._state_usage(
+            exclude_request=key, request_usage=res_all,
+            staging_usage=stg_all, host_request=host_request,
+        )
+        resolved_q = self._effective_cache_query_tokens(eff_q)
+        return {
+            "demand": demand, "physical": physical,
+            "physical_ranks": physical_ranks,
+            "demand_ranks": own_res,
+            "demand_staging": demand_staging,
+            "demand_staging_ranks": own_stg,
+            "physical_staging": physical_staging,
+            "physical_staging_ranks": physical_staging_ranks,
+            "cohort_owner_ranks": res_map,
+            "cohort_staging_ranks": stg_map,
+            "host_demand": float(host_demand),
+            "host_physical": float(host_physical),
+            "query_tokens": int(resolved_q),
+            "candidate_hbm": hbm, "candidate_host": host,
+            "ok": self._usage_budget_ok(hbm, host),
+        }
+
+    def resize(
+        self, replica: int, request: str, tokens: int,
+        *, query_tokens: int | None = None, proposal_tokens: int | None = None,
+    ) -> bool:
+        if not self._is_cross_dp_dcp_cohort_active():
+            return super().resize(
+                replica, request, tokens,
+                query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+            )
+        key = (replica, request)
+        candidate = self._resident_admission(
+            replica, request, tokens,
+            query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+        )
+        if not candidate["ok"]:
+            return False
+        changed = (
+            self.owners.get(key) != candidate["physical"]
+            or self.owner_ranks.get(key) != candidate["physical_ranks"]
+            or self._cohort_owner_ranks.get(key) != candidate["cohort_owner_ranks"]
+            or self.logical_owners.get(key) != candidate["demand"]
+            or self.host_dram_owners.get(key) != candidate["host_physical"]
+            or self.staging_owners.get(key) != candidate["physical_staging"]
+            or self.request_query_tokens.get(key) != candidate["query_tokens"]
+        )
+        self._cohort_owner_ranks[key] = candidate["cohort_owner_ranks"]
+        self._cohort_staging_ranks[key] = candidate["cohort_staging_ranks"]
+        self._set_physical(
+            replica, key, candidate["physical"], candidate["host_physical"],
+            candidate["physical_staging"],
+            physical_ranks=candidate["physical_ranks"],
+            staging_ranks=candidate["physical_staging_ranks"],
+        )
+        self.logical_owners[key] = candidate["demand"]
+        self.logical_owner_ranks[key] = candidate["demand_ranks"]
+        self.logical_host_owners[key] = candidate["host_demand"]
+        self.logical_staging_owners[key] = candidate["demand_staging"]
+        self.logical_staging_rank[key] = candidate["demand_staging_ranks"]
+        self.request_query_tokens[key] = int(candidate["query_tokens"])
+        self.request_versions[key] = self.request_versions.get(key, 0) + 1
+        if changed:
+            self.budget_version += 1
+        return True
+
+    def _free_request(self, replica: int, request: str) -> None:
+        key = (replica, request)
+        self._cohort_owner_ranks.pop(key, None)
+        self._cohort_staging_ranks.pop(key, None)
+        super()._free_request(replica, request)
 
     def _state_usage(
         self, *, extra_holders=(), drop_holders=(), exclude_request=None,
@@ -784,18 +914,12 @@ class _MemoryLedgerMixin:
         for (replica, rank, stage, _storage, _tier, _key, _generation), ranges in \
                 backing_ranges.items():
             hbm[replica][stage][rank] += _union_bytes(ranges)
-        for (replica, _request), rows in self.owner_ranks.items():
-            if (replica, _request) == exclude_request:
-                continue
-            for stage, row in enumerate(rows):
-                for rank, value in enumerate(row):
-                    hbm[replica][stage][rank] += float(value)
-        for (replica, _request), rows in self.staging_owner_ranks.items():
-            if (replica, _request) == exclude_request:
-                continue
-            for stage, row in enumerate(rows):
-                for rank, value in enumerate(row):
-                    hbm[replica][stage][rank] += float(value)
+        self._accumulate_owner_map(
+            hbm, self.owner_ranks, self._cohort_owner_ranks, exclude_request=exclude_request,
+        )
+        self._accumulate_owner_map(
+            hbm, self.staging_owner_ranks, self._cohort_staging_ranks, exclude_request=exclude_request,
+        )
         if request_usage is not None:
             for replica, stages in enumerate(request_usage):
                 for stage, row in enumerate(stages):
@@ -1186,7 +1310,8 @@ class _MemoryLedgerMixin:
         p = self.case.runtime.parallel
         seq = int(sequence_tokens)
         b_int = int(batch_per_dp)
-        q_tok = self._effective_cache_query_tokens(query_tokens)
+        is_prefill = str(phase or "decode").strip().lower() == "prefill"
+        q_tok = 1 if is_prefill else self._effective_cache_query_tokens(query_tokens)
         hybrid_b = self._hybrid_pool_receipt(seq, num_requests=b_int, query_tokens=q_tok, phase=phase)
         hybrid_1 = (
             self._hybrid_pool_receipt(seq, num_requests=1, query_tokens=q_tok, phase=phase)
@@ -1195,11 +1320,11 @@ class _MemoryLedgerMixin:
         eff_block = hybrid_b.contract.normalized_block_size if hybrid_b is not None else None
         alloc_stages = self._cache_component_breakdown(
             seq, padded=True, skip_covered=True, rank=rank, query_tokens=q_tok,
-            block_size_override=eff_block,
+            block_size_override=eff_block, phase=phase,
         )
         valid_stages = self._cache_component_breakdown(
             seq, padded=False, skip_covered=True, rank=rank, query_tokens=q_tok,
-            block_size_override=eff_block,
+            block_size_override=eff_block, phase=phase,
         )
         group_parts = (
             self._group_cache_parts(seq, rank=rank, query_tokens=q_tok)
@@ -1213,13 +1338,31 @@ class _MemoryLedgerMixin:
             self.pages.metadata_stage_bytes(seq, self.case.runtime.max_model_len, p.pp)
             if self.pages.groups else None
         )
-        cohort_alloc = self._dp_cohort_extra_by_stage(seq, padded=True, rank=rank, query_tokens=q_tok)
-        cohort_valid = self._dp_cohort_extra_by_stage(seq, padded=False, rank=rank, query_tokens=q_tok)
+        cohort_alloc_parts = self._dp_cohort_extra_parts_by_stage(
+            seq, padded=True, rank=rank, query_tokens=q_tok, phase=phase,
+        )
+        cohort_valid_parts = self._dp_cohort_extra_parts_by_stage(
+            seq, padded=False, rank=rank, query_tokens=q_tok, phase=phase,
+        )
         rank_base_per_req = (
             None if hybrid_b is not None
-            else self._rank_dp_cohort_cache_bytes(seq, padded=True, rank=rank, query_tokens=q_tok)
+            else self._rank_dp_cohort_cache_bytes(
+                seq, padded=True, rank=rank, query_tokens=q_tok, phase=phase,
+            )
         )
         c8_static_stages = tuple(getattr(self, "c8_static_channel_scale_by_stage", (0,) * p.pp))
+        hbm_ratio = float(self.kvc_hbm_ratio)
+        if hbm_ratio < 1.0:
+            layer_max = (
+                self._rank_max_layer_cache_bytes(seq, int(rank), query_tokens=q_tok)
+                if rank is not None else self._max_layer_cache_bytes(seq, query_tokens=q_tok)
+            )
+            proj_staging_stages = tuple(
+                int(round(float(layer_max[st]) * (1.0 - hbm_ratio) * b_int))
+                for st in range(p.pp)
+            )
+        else:
+            proj_staging_stages = (0,) * p.pp
 
         per_stage: list[dict[str, Any]] = []
         for stage in range(p.pp):
@@ -1231,12 +1374,14 @@ class _MemoryLedgerMixin:
                 group_part=group_parts[stage] if group_parts is not None else None,
                 group_payload_b=float(group_payload[stage]) if group_payload is not None else 0.0,
                 group_meta_b=float(group_metadata[stage]) if group_metadata is not None else 0.0,
-                cohort_alloc_b=float(cohort_alloc[stage]),
-                cohort_valid_b=float(cohort_valid[stage]),
+                cohort_alloc=cohort_alloc_parts[stage],
+                cohort_valid=cohort_valid_parts[stage],
                 hybrid_b=hybrid_b,
                 hybrid_1=hybrid_1,
                 rank_base_per_req_b=float(rank_base_per_req[stage]) if rank_base_per_req is not None else 0.0,
                 c8_static_b=int(c8_static_stages[stage]) if stage < len(c8_static_stages) else 0,
+                hbm_ratio=hbm_ratio,
+                proj_staging_b=int(proj_staging_stages[stage]),
                 pool_map=_COMPONENT_POOL_MAP,
             )
             per_stage.append(entry)
@@ -1252,12 +1397,14 @@ class _MemoryLedgerMixin:
         group_part: dict[str, Any] | None,
         group_payload_b: float,
         group_meta_b: float,
-        cohort_alloc_b: float,
-        cohort_valid_b: float,
+        cohort_alloc: dict[str, float],
+        cohort_valid: dict[str, float],
         hybrid_b: Any,
         hybrid_1: Any,
         rank_base_per_req_b: float,
         c8_static_b: int,
+        hbm_ratio: float,
+        proj_staging_b: int,
         pool_map: dict[str, str],
     ) -> dict[str, Any]:
         """Conserve exact integer per-stage cache pools and component breakdowns."""
@@ -1307,20 +1454,32 @@ class _MemoryLedgerMixin:
                     comp_per_req.get("page_metadata", 0.0) + group_meta_b
                 )
 
-        if cohort_alloc_b > 0.0:
-            comp_per_req["dcp_dp_cohort_kv"] = (
-                comp_per_req.get("dcp_dp_cohort_kv", 0.0) + cohort_alloc_b
-            )
-            alloc_pools["target_kv_bytes"] += cohort_alloc_b
-        if cohort_valid_b > 0.0:
-            valid_pools["target_kv_bytes"] += cohort_valid_b
+        cohort_alloc_kv = float(cohort_alloc.get("kv", 0.0))
+        cohort_alloc_idx = float(cohort_alloc.get("index", 0.0))
+        cohort_alloc_drf = float(cohort_alloc.get("draft", 0.0))
+        if cohort_alloc_kv > 0.0:
+            comp_per_req["dcp_dp_cohort_kv"] = comp_per_req.get("dcp_dp_cohort_kv", 0.0) + cohort_alloc_kv
+            alloc_pools["target_kv_bytes"] += cohort_alloc_kv
+        if cohort_alloc_idx > 0.0:
+            comp_per_req["dcp_dp_cohort_index"] = comp_per_req.get("dcp_dp_cohort_index", 0.0) + cohort_alloc_idx
+            alloc_pools["indexer_k_bytes"] += cohort_alloc_idx
+        if cohort_alloc_drf > 0.0:
+            comp_per_req["dcp_dp_cohort_draft"] = comp_per_req.get("dcp_dp_cohort_draft", 0.0) + cohort_alloc_drf
+            alloc_pools["draft_kv_bytes"] += cohort_alloc_drf
+        valid_pools["target_kv_bytes"] += float(cohort_valid.get("kv", 0.0))
+        valid_pools["indexer_k_bytes"] += float(cohort_valid.get("index", 0.0))
 
-        for name, val in comp_per_req.items():
-            comp_batch[name] = int(round(b_int * val))
+        for name, val in list(comp_per_req.items()):
+            scaled = val * hbm_ratio
+            comp_per_req[name] = scaled
+            comp_batch[name] = int(round(b_int * scaled))
 
         if hybrid_b is not None:
-            stride_res_b = int(hybrid_b.stride_reserve_by_stage[stage])
-            stride_res_1 = float(hybrid_1.stride_reserve_by_stage[stage]) if hybrid_1 is not None else 0.0
+            stride_res_b = int(round(int(hybrid_b.stride_reserve_by_stage[stage]) * hbm_ratio))
+            stride_res_1 = (
+                float(hybrid_1.stride_reserve_by_stage[stage]) * hbm_ratio
+                if hybrid_1 is not None else 0.0
+            )
             if stride_res_b > 0:
                 comp_batch["page_group_reserve"] = comp_batch.get("page_group_reserve", 0) + stride_res_b
             if stride_res_1 > 0.0:
@@ -1330,14 +1489,15 @@ class _MemoryLedgerMixin:
                 + int(hybrid_b.outside_replay_bytes_by_stage[stage])
             )
             sub_draft_kv = bool(hybrid_b.contract.subsumed_draft_kv)
+            expected_non_c8 = int(round(outside_subsumed * hbm_ratio))
             if not sub_draft_kv:
-                outside_subsumed += comp_batch.get("draft_kv", 0)
-            outside_subsumed += comp_batch.get("draft_state", 0)
-            expected_total = outside_subsumed + c8_static_b
+                expected_non_c8 += comp_batch.get("draft_kv", 0)
+            expected_non_c8 += comp_batch.get("draft_state", 0)
+            expected_total = expected_non_c8 + c8_static_b
             page_reserve_total = stride_res_b
         else:
-            page_reserve_total = int(round(b_int * group_reserve_per_req))
-            expected_total = int(round(b_int * rank_base_per_req_b)) + c8_static_b
+            page_reserve_total = int(round(b_int * group_reserve_per_req * hbm_ratio))
+            expected_total = int(round(b_int * rank_base_per_req_b * hbm_ratio)) + c8_static_b
 
         if c8_static_b > 0:
             comp_batch["c8_static_channel_scale"] = c8_static_b
@@ -1345,10 +1505,9 @@ class _MemoryLedgerMixin:
 
         idx_a = sum(comp_batch.get(c, 0) for c, k in pool_map.items() if k == "indexer_k_bytes")
         rec_a = sum(comp_batch.get(c, 0) for c, k in pool_map.items() if k == "recurrent_state_bytes")
-        drf_a = comp_batch.get("draft_kv", 0) + comp_batch.get("draft_state", 0)
+        drf_a = comp_batch.get("draft_kv", 0) + comp_batch.get("draft_state", 0) + comp_batch.get("dcp_dp_cohort_draft", 0)
         non_kv = idx_a + rec_a + drf_a
-        comp_sum = sum(comp_batch.values())
-        residual = expected_total - comp_sum
+        residual = expected_total - sum(comp_batch.values())
         if residual != 0:
             if hybrid_b is not None or group_part is not None:
                 comp_batch["page_group_reserve"] = max(0, comp_batch.get("page_group_reserve", 0) + residual)
@@ -1358,16 +1517,17 @@ class _MemoryLedgerMixin:
         kv_a = (
             expected_total - non_kv
             if expected_total >= non_kv
-            else int(round(b_int * alloc_pools["target_kv_bytes"])) + c8_static_b
+            else int(round(b_int * alloc_pools["target_kv_bytes"] * hbm_ratio)) + c8_static_b
         )
         return {
             "kv_alloc": kv_a,
-            "kv_valid": int(round(b_int * valid_pools["target_kv_bytes"])) + c8_static_b,
+            "kv_valid": int(round(b_int * valid_pools["target_kv_bytes"] * hbm_ratio)) + c8_static_b,
             "idx_alloc": idx_a,
-            "idx_valid": int(round(b_int * valid_pools["indexer_k_bytes"])),
+            "idx_valid": int(round(b_int * valid_pools["indexer_k_bytes"] * hbm_ratio)),
             "rec": rec_a,
             "draft": drf_a,
             "page_group_reserve": page_reserve_total,
+            "proj_staging": int(proj_staging_b),
             "components_batch": {k: v for k, v in comp_batch.items() if v > 0},
             "components_per_req": {
                 k: v for k, v in comp_per_req.items() if v > 0.0 or k == "c8_static_channel_scale"
@@ -1473,8 +1633,10 @@ class _MemoryLedgerMixin:
         prep_total = term_prep_b + prep_persist_b
         fixed_total = ckpt_b + vision_b + prep_total + ws_b + res_b
         if projected is not None:
-            live_dyn = kv_a + idx_a + rec_b + drf_b + dyn_grant_only + stg_b + extra_only_billed
+            eff_stg_b = int(projected.get("proj_staging", 0)) if self.kvc_hbm_ratio < 1.0 else stg_b
+            live_dyn = kv_a + idx_a + rec_b + drf_b + dyn_grant_only + eff_stg_b + extra_only_billed
         else:
+            eff_stg_b = stg_b
             live_dyn = dyn_live_b + c8_static_b + extra_only_billed
         peak_dyn = max(live_dyn, dyn_peak_b + c8_static_b + extra_only_billed)
         sim_live = fixed_total + live_dyn
@@ -1497,7 +1659,7 @@ class _MemoryLedgerMixin:
             draft_cache_bytes=drf_b,
             workspace_bytes=ws_b,
             reserve_bytes=res_b,
-            staging_bytes=stg_b,
+            staging_bytes=eff_stg_b,
             dynamic_grant_bytes=dyn_grant_only + extra_only_billed,
             simultaneous_live_hbm_bytes=sim_live,
             simultaneous_peak_hbm_bytes=sim_peak,
@@ -1540,18 +1702,21 @@ class _MemoryLedgerMixin:
             ck, tp_b = self._stage_checkpoint_vs_prepared_split(st)
             ckpt_by_stage.append(max(0, ck + vision_delta[st] - vision_stage[st]))
             term_prep_by_stage.append(tp_b)
+        dp_width = max(1, int(getattr(p, "dcp_dp_width", 1) or 1))
+        spans_dp = bool(getattr(p, "cp_spans_dp", False)) and dp_width > 1 and self.rank_token_owners is None
         projected_by_rank: list[list[dict[str, Any]]] | None = None
         if sequence_tokens is not None and int(batch_per_dp) > 0:
             rank_divergent = (
                 self.rank_token_owners is not None or int(getattr(p, "cp", 1) or 1) > 1
             )
             if rank_divergent:
+                cohort_ranks = dp_width * self.width if spans_dp else self.width
                 projected_by_rank = [
                     self._projected_die_cache_pools(
                         int(sequence_tokens), int(batch_per_dp), query_tokens,
                         rank=rk, phase=str(phase),
                     )[0]
-                    for rk in range(self.width)
+                    for rk in range(cohort_ranks)
                 ]
             else:
                 uniform_stages, _ = self._projected_die_cache_pools(
@@ -1565,8 +1730,9 @@ class _MemoryLedgerMixin:
                 stage_dies = self._stage_dies(replica, stage)
                 host_b = int(round(host_live[replica] + self.engram_host_dram_bytes[stage]))
                 for rank in range(self.width):
+                    proj_rk = (replica % dp_width) * self.width + rank if spans_dp else rank
                     projected = (
-                        projected_by_rank[rank][stage]
+                        projected_by_rank[proj_rk][stage]
                         if projected_by_rank is not None else None
                     )
                     dyn_live_b = int(round(hbm_live[replica][stage][rank]))
@@ -1644,6 +1810,8 @@ class _MemoryLedgerMixin:
         kinds.setdefault("page_group_reserve", "Hybrid Pool / Page-Group Reserve")
         kinds.setdefault("page_metadata", "Page Table Metadata")
         kinds.setdefault("dcp_dp_cohort_kv", "DCP DP-Cohort Shared KV")
+        kinds.setdefault("dcp_dp_cohort_index", "DCP DP-Cohort Shared Indexer K")
+        kinds.setdefault("dcp_dp_cohort_draft", "DCP DP-Cohort Shared Draft KV")
         return {k: tuple(v) for k, v in counts.items()}, kinds
 
     def cache_ledger_projection(

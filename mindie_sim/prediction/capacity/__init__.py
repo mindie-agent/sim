@@ -394,7 +394,7 @@ class Memory(
         self.fixed_per_rank = fixed_per_rank
         self.rank_capacity = [
             [
-                [math.floor(die.hbm_bytes * case.runtime.gpu_memory_utilization)
+                [die.hbm_bytes * case.runtime.gpu_memory_utilization
                  - fixed_per_rank[stage] for die in self._stage_dies(replica, stage)]
                 for stage in range(p.pp)
             ]
@@ -450,6 +450,10 @@ class Memory(
         self.staging_owners: dict[tuple[int, str], tuple[float, ...]] = {}
         self.staging_owner_ranks: dict[
             tuple[int, str], tuple[tuple[float, ...], ...]] = {}
+        self._cohort_owner_ranks: dict[
+            tuple[int, str], dict[int, tuple[tuple[float, ...], ...]]] = {}
+        self._cohort_staging_ranks: dict[
+            tuple[int, str], dict[int, tuple[tuple[float, ...], ...]]] = {}
         self.staging_live = [0.0] * p.dp
         self.async_consumer_holds: dict[
             tuple[int, str], dict[str, _HoldSnapshot]] = {}
