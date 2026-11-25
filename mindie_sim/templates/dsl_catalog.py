@@ -94,12 +94,18 @@ KDA_MAX_CHUNK_GROUP = 512
 KDA_SHORT_TRAIN_GROUP = 13
 KDA_SHORT_TRAIN_MIN_LENGTH = 8192
 KDA_BETA_TILE = 16
+KDA_CONV_TAPS = 4
+KDA_CONV_STREAMS = 3
+KDA_CONV_HISTORY_KEEP = KDA_CONV_TAPS - 2
+MEGA_MODEL_HEADS = 96
+MEGA_HIDDEN_SIZE = 7168
 MEGA_TP_DEGREES = (4, 8, 16)
 MEGA_SEQUENCE_LENGTHS = (4, 8)
 KDA_REPLAY_CAPACITY = max(MEGA_SEQUENCE_LENGTHS)
 MEGA_MODEL_BATCH_LIMIT = 32
 MEGA_AIC_QUOTAS = (8, 16, 24, 28, 32)
 COMMIT_CORE_QUOTAS = (8, 24, 28, 32)
+ATTN_RES_HIDDEN_SIZE = 7168
 ATTN_RES_VL = 64
 ROUTE_COST_SCALE = 64
 PARTS_PER_MILLION = 1_000_000
@@ -129,6 +135,17 @@ _ARCH35_BASE_SKU_TAGS = frozenset({"ascend950pr", "ascend950pr_9579", "arch35_ba
 _ARCH35_HIGH_BW_SKU_TAGS = frozenset({"ascend950dt", "ascend950dt_9582", "ascend950dt_9589", "arch35_high_bw"})
 MLA_COLUMN_TILE = 96
 MLA_K_TILE = 128
+MLA_QB_GROUP_HEADS = 4
+MLA_DIM_MIN = 1024
+MLA_DIM_MAX = 8192
+MLA_DIM_ALIGN = 256
+MLA_Q_LORA_WIDTHS = frozenset({640, 1024, 1536, 2048})
+MLA_MAX_HEADS = 128
+MLA_KV_LORA_DIM = 512
+MLA_NOPE_ROPE_PAIRS = frozenset({(128, 64), (192, 64), (256, 0)})
+MLA_PAGE_SIZE_MIN = 16
+MLA_PAGE_SIZE_MAX = 1024
+MLA_PAGE_SIZE_ALIGN = 16
 MLA_TOKEN_PROFILES = ((1, 1, 1), (8, 2, 8), (16, 9, 16), (32, 17, 32), (64, 33, 64), (128, 65, 128))
 MLA_SMALL_PARTIAL_MAX_ROWS = 8
 MLA_GLOBAL_FRONT_MAX_ROWS = 64
@@ -144,10 +161,26 @@ MLA_SCRATCH_ALIGNMENT = 32
 MLA_QA_PARTIALS = 4
 MLA_NZ_PARTIAL_Q_LORA = 1536
 MLA_AMAX_LANES = 64
+MLA_FRONT_SMALL_NZ_WIDTH = 32
+MLA_FRONT_PARTIAL_1536_WIDTH = 48
+MLA_FRONT_MEDIUM_NZ_WIDTH = 64
+MLA_GLOBAL_FRONT_1536_WIDTH = 192
+MLA_SMALL_NZ_Q_LORA_WIDTHS = frozenset({640, 1024})
+MLA_QB_GROUP_Q_LORA_WIDTHS = frozenset({1536, 2048})
+MLA_QB_GROUP_MIN_HEADS = 96
+MLA_QB_GROUP_BM16_HEADS = 2
+MLA_QB_GROUP_MAX_BM = 16
+MLA_QB_WIDE_WIDTHS = (256, 192)
+MLA_QB_NZ_WIDTHS = (128, 96, 64)
+MLA_WKB_STREAM_MIN_HEADS = 64
+MLA_WKB_N_CHUNKS = 4
 QSLI_TILE_M = 32
 QSLI_TILE_N = 512
 QSLI_PACKED_D = 64
 QSLI_SCALE_ROW_BYTES = 4
+QSLI_CANDIDATE_BLOCK_SIZE = 8
+QSLI_CANDIDATE_CAPACITY = 2048
+QSLI_MAX_TOPK = 8192
 QSLI_TRUNK = 16384
 QSLI_HISTOGRAM_BINS = 256
 QSLI_MERGE_ALIGN = 128
@@ -155,6 +188,7 @@ QSLI_STAGING_DEPTH = 4
 QSLI_MAX_CUBE_WORKERS = 36
 QSLI_METADATA_BYTES = 1024 * 8
 MQSMLA_HEADS = 64
+MQSMLA_SMALL_HEAD_BUCKET = 32
 MQSMLA_KV_HEADS = 1
 MQSMLA_NOPE_DIM = 448
 MQSMLA_ROPE_DIM = 64
@@ -163,9 +197,21 @@ MQSMLA_KV_TILE = 128
 KV_ROW_BYTES_ORI = 544
 KV_ROW_BYTES_CMP = 320
 MQSMLA_L1_KV_BYTES = 384 * 1024
-MQSMLA_L1_Q_BYTES = 112 * 1024
-MQSMLA_L1_P_BYTES = 16 * 1024
+MQSMLA_Q_L1_WIDTH = 896
+MQSMLA_L1_Q_BYTES = MQSMLA_HEADS * MQSMLA_Q_L1_WIDTH * BF16_BYTES
+MQSMLA_L1_P_BYTES = MQSMLA_HEADS * MQSMLA_KV_TILE * BF16_BYTES
 MQSMLA_KV_DEPTH = 3
+MQSMLA_L0_SLOTS = 4
+MQSMLA_PV_ACC_SLOTS = 8
+MQSMLA_RESULT_CHANNELS = 2
+MQSMLA_RESULT_HALF_D = MQSMLA_HEAD_DIM // 2
+MQSMLA_RESULT_ROW_FACTOR = 2
+MQSMLA_RAW_GATHER_ROWS = 32
+MQSMLA_V0_OUT_FRACTALS = MQSMLA_HEAD_DIM // 16
+MQSMLA_V0_OUT_PAD_ROWS = 17
+MQSMLA_V0_OUT_LANE = 16
+MQSMLA_V0_OUT_DEPTH = 2
+MQSMLA_SOFTMAX_STATE_VECTORS = 8
 MQSMLA_FD_SLOT_BYTES = (MQSMLA_HEADS * MQSMLA_HEAD_DIM + 2 * MQSMLA_HEADS) * FP32_BYTES
 MQSMLA_FD_BYTES_PER_CORE = 2 * MQSMLA_FD_SLOT_BYTES
 
@@ -221,6 +267,8 @@ class MegaRecurrentKdaProblem:
     k_stride0: int | None = None
     decay_stride0: int | None = None
     checkpoint_stride0: int | None = None
+    conv_state_stride0: int | None = None
+    conv_accepted: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -285,6 +333,19 @@ class QsliProblem:
     topk: int
     split_parts: int = 1
     metadata_ms: float = 0
+    candidate_block_indices: tuple[int, ...] | tuple[tuple[int, ...], ...] = ()
+    block_table: tuple[int, ...] | tuple[tuple[int, ...], ...] = ()
+    pa_block_size: int = QSLI_CANDIDATE_BLOCK_SIZE
+
+    def block_ids(self, query):
+        if self.candidate_block_indices and isinstance(self.candidate_block_indices[0], (tuple, list)):
+            return self.candidate_block_indices[query]
+        return self.candidate_block_indices
+
+    def page_table(self, query):
+        if self.block_table and isinstance(self.block_table[0], (tuple, list)):
+            return self.block_table[query]
+        return self.block_table
 
 
 @dataclass(frozen=True, slots=True)
@@ -407,7 +468,7 @@ def resolve_flash_kda_route(
         raise ModelingError("flash_kda_workspace_or_layout_invalid")
     if query_heads is None:
         query_heads = value_heads
-    if query_heads < 1:
+    if query_heads < 1 or query_heads > value_heads or value_heads % query_heads != 0:
         raise ModelingError("flash_kda_workspace_or_layout_invalid")
     if max_chunk_group is None:
         short_training = (
@@ -559,6 +620,62 @@ def mla_workspaces(p, aic):
     return specs, sum(_aligned(size, MLA_SCRATCH_ALIGNMENT) for size in groups), scratch_rows, recompute
 
 
+def mla_projection_widths(p: MlaPrologProblem, aic: int, rows: int | None = None) -> tuple[int, int, int, bool, bool, int]:
+    """Resolve native MLA prolog projection tile widths and WKB grouping by format and token profile."""
+    mode = p.quant_mode
+    nz_active = p.weight_format == "nz"
+    bf16_cache = mode == QkvQuantMode.A16C16
+    profile = next((size for size, lo, hi in MLA_TOKEN_PROFILES if lo <= p.tokens <= hi), 0)
+    bm = MLA_K_TILE if profile == 0 else profile
+    head_dim = p.q_nope + p.rope
+    qp = p.heads * head_dim
+    global_front = (
+        nz_active and bf16_cache and MLA_SMALL_PARTIAL_MAX_ROWS < p.tokens <= MLA_GLOBAL_FRONT_MAX_ROWS
+        and p.q_lora == MLA_NZ_PARTIAL_Q_LORA
+    )
+    if global_front:
+        wqa_w = MLA_GLOBAL_FRONT_1536_WIDTH
+    elif nz_active:
+        if 0 < profile <= MLA_SMALL_PARTIAL_MAX_ROWS:
+            if p.q_lora == MLA_NZ_PARTIAL_Q_LORA:
+                wqa_w = MLA_FRONT_PARTIAL_1536_WIDTH
+            elif p.q_lora in MLA_SMALL_NZ_Q_LORA_WIDTHS:
+                wqa_w = MLA_FRONT_SMALL_NZ_WIDTH
+            else:
+                wqa_w = MLA_FRONT_MEDIUM_NZ_WIDTH
+        else:
+            wqa_w = MLA_K_TILE if profile == 0 else MLA_FRONT_MEDIUM_NZ_WIDTH
+    else:
+        wqa_w = MLA_COLUMN_TILE
+    if nz_active and (bm <= MLA_SMALL_PARTIAL_MAX_ROWS
+                      or (MLA_SMALL_PARTIAL_MAX_ROWS < bm <= MLA_GLOBAL_FRONT_MAX_ROWS and bf16_cache)):
+        wkva_w = MLA_FRONT_SMALL_NZ_WIDTH
+    else:
+        wkva_w = MLA_FRONT_MEDIUM_NZ_WIDTH
+    qb_grouped = (
+        nz_active and bm <= MLA_QB_GROUP_MAX_BM and bf16_cache
+        and p.q_lora in MLA_QB_GROUP_Q_LORA_WIDTHS and p.heads >= MLA_QB_GROUP_MIN_HEADS
+    )
+    if not nz_active:
+        wqb_w = MLA_COLUMN_TILE
+    elif qb_grouped:
+        wqb_w = (MLA_QB_GROUP_BM16_HEADS if bm == MLA_QB_GROUP_MAX_BM else MLA_QB_GROUP_HEADS) * head_dim
+    else:
+        candidates = MLA_QB_WIDE_WIDTHS + MLA_QB_NZ_WIDTHS if (bf16_cache and p.heads >= MLA_WKB_STREAM_MIN_HEADS) else MLA_QB_NZ_WIDTHS
+        wqb_w = next((w for w in candidates if qp % w == 0), MLA_COLUMN_TILE)
+        if bf16_cache and 0 < profile <= MLA_SMALL_PARTIAL_MAX_ROWS and wqb_w > MLA_K_TILE and qp % MLA_K_TILE == 0 and qp // wqb_w < aic:
+            wqb_w = MLA_K_TILE
+    allow_grouped = nz_active and mode != QkvQuantMode.FP8_TENSOR
+    m_tiles = ceil_div(p.tokens if rows is None else rows, bm)
+    if MLA_SMALL_PARTIAL_MAX_ROWS < bm <= MLA_GLOBAL_FRONT_MAX_ROWS and allow_grouped:
+        wkb_grouped = p.heads >= MLA_WKB_STREAM_MIN_HEADS
+    elif bm <= MLA_SMALL_PARTIAL_MAX_ROWS and allow_grouped:
+        wkb_grouped = m_tiles * p.heads >= 2 * aic
+    else:
+        wkb_grouped = False
+    return wqa_w, wkva_w, wqb_w, qb_grouped, wkb_grouped, bm
+
+
 def _buf(name, pool, size, slots=1, *, start=0, end=1, scale=0):
     return LiveBufferSpec(name, pool, size, start, end, owner_kind="aiv" if pool == "ub" else "aic",
                           scale_bytes=scale, slots=slots)
@@ -602,7 +719,7 @@ def _mega(p, aic, aiv, datapath, variant):
     if (
         p.tp not in MEGA_TP_DEGREES or p.sequence not in MEGA_SEQUENCE_LENGTHS
         or not 1 <= p.batch <= MEGA_MODEL_BATCH_LIMIT
-        or p.num_heads < 1 or p.num_heads % p.tp != 0 or p.hidden_size < 1
+        or p.num_heads != MEGA_MODEL_HEADS or p.hidden_size != MEGA_HIDDEN_SIZE
         or aic not in MEGA_AIC_QUOTAS or aiv < 2 * aic
     ):
         raise ModelingError("mega_kda_schedule_unsupported")
@@ -654,6 +771,25 @@ def _commit(p, aic, aiv, datapath, variant):
     return (f"quota{aic}", (rows, KDA_HEAD_DIM, 1), buffers, 0, (), (), sum(map(len, scheduling)))
 
 
+def mega_conv_stride_elems(p: MegaRecurrentKdaProblem) -> int:
+    """Resolve physical per-slot element stride for Mega KDA causal_conv state."""
+    if p.num_heads < 1 or p.num_heads % p.tp != 0:
+        raise ModelingError("mega_kda_geometry_invalid")
+    heads = p.num_heads // p.tp
+    batch = p.batch * p.tp
+    conv_width = KDA_CONV_STREAMS * heads * KDA_HEAD_DIM
+    if p.conv_accepted and (len(p.conv_accepted) != batch or any(type(a) is not int or a < 0 for a in p.conv_accepted)):
+        raise ModelingError("recurrent_kda_paged_state_geometry_invalid")
+    max_hist_off = max((max(a - 1, 0) for a in p.conv_accepted), default=0)
+    min_rows = max(KDA_CONV_HISTORY_KEEP + p.sequence, max_hist_off + KDA_CONV_TAPS - 1)
+    min_stride = min_rows * conv_width
+    if p.conv_state_stride0 is not None:
+        if type(p.conv_state_stride0) is not int or p.conv_state_stride0 < min_stride:
+            raise ModelingError("recurrent_kda_pool_stride_invalid")
+        return p.conv_state_stride0
+    return min_stride
+
+
 def _validate_kda_slots(p, batch, required):
     slots = p.state_indices
     capacity = replay_pool_capacity(p.replay_capacity, required)
@@ -664,8 +800,7 @@ def _validate_kda_slots(p, batch, required):
     if isinstance(p, CommitRecurrentKdaProblem):
         heads = p.heads
     else:
-        if p.num_heads < 1 or p.num_heads % p.tp != 0:
-            raise ModelingError("mega_kda_geometry_invalid")
+        mega_conv_stride_elems(p)
         heads = p.num_heads // p.tp
     replay_pool_strides(p, heads, capacity)
 
@@ -686,8 +821,18 @@ def replay_pool_capacity(requested, required):
 
 
 def _mla(p, aic, aiv, datapath, variant):
-    if (min(p.tokens, p.dim, p.q_lora, p.heads, p.q_nope, p.cache_page_size) < 1 or not 0 <= p.rope < p.kvr
-            or p.weight_format not in {"nd", "nz"} or p.cache_layout not in {"PA_BSND", "PA_NZ"}):
+    if (
+        p.tokens < 0
+        or not (MLA_DIM_MIN <= p.dim <= MLA_DIM_MAX and p.dim % MLA_DIM_ALIGN == 0)
+        or p.q_lora not in MLA_Q_LORA_WIDTHS
+        or not 1 <= p.heads <= MLA_MAX_HEADS
+        or p.kvr - p.rope != MLA_KV_LORA_DIM
+        or (p.q_nope, p.rope) not in MLA_NOPE_ROPE_PAIRS
+        or not (MLA_PAGE_SIZE_MIN <= p.cache_page_size <= MLA_PAGE_SIZE_MAX
+                and p.cache_page_size % MLA_PAGE_SIZE_ALIGN == 0)
+        or p.weight_format not in {"nd", "nz"}
+        or p.cache_layout not in {"PA_BSND", "PA_NZ"}
+    ):
         raise ModelingError("mla_prolog_problem_invalid")
     if p.cache_index is not None and (
         not isinstance(p.cache_index, (tuple, list)) or len(p.cache_index) != p.tokens
@@ -699,6 +844,9 @@ def _mla(p, aic, aiv, datapath, variant):
         raise ModelingError("mla_prolog_group_fp8_requires_pa_bsnd")
     if p.cache_layout == "PA_NZ" and p.cache_row_bytes % MLA_CACHE_NZ_LANE_BYTES:
         raise ModelingError("mla_prolog_pa_nz_cache_row_unaligned")
+    variant_name = QkvQuantMode.PA_BSND.value if p.mode == QkvQuantMode.PA_BSND else mode.value
+    if p.tokens == 0:
+        return variant_name, (1, MLA_COLUMN_TILE, MLA_K_TILE), (), 0, (), (), 0
     _, workspace, scratch_rows, _ = mla_workspaces(p, aic)
     m = min(scratch_rows, MLA_K_TILE)
     tile = (m, MLA_COLUMN_TILE, MLA_K_TILE)
@@ -710,11 +858,11 @@ def _mla(p, aic, aiv, datapath, variant):
         _buf("projection_out", "l0c", m * MLA_COLUMN_TILE * FP32_BYTES),
         _buf("norm_rope_quant", "ub", min(m, KDA_STATE_HALF) * MLA_COLUMN_TILE * FP32_BYTES, 2),
     )
-    return QkvQuantMode.PA_BSND.value if p.mode == QkvQuantMode.PA_BSND else mode.value, tile, buffers, workspace, (), (), p.tokens
+    return variant_name, tile, buffers, workspace, (), (), p.tokens
 
 
 def _attn_res(p, aic, aiv, datapath, variant):
-    if p.hidden_size < 1 or p.hidden_size % ATTN_RES_BF16_ALIGN != 0 or dtype_name(p.dtype) != "bf16":
+    if p.hidden_size != ATTN_RES_HIDDEN_SIZE or dtype_name(p.dtype) != "bf16":
         raise ModelingError("attn_res_requires_fixed_bf16_width")
     if p.tokens < 0:
         raise ModelingError("attn_res_token_count_negative")
@@ -745,10 +893,38 @@ def _qsli(p, aic, aiv, datapath, variant):
     arch = datapath.compute_arch.declared
     if arch is None or not arch.supports_native("matrix", QSLI_MATRIX_DTYPE, "fp32"):
         raise unmodeled(QSLI, "qsli_requires_native_mxfp4")
-    if (p.topk < 1 or p.candidates < 0 or p.query_rows < 1
-            or not 1 <= p.split_parts <= min(max(1, p.candidates), aic)
-            or aic > QSLI_MAX_CUBE_WORKERS):
+    num_tiles = max(1, ceil_div(p.candidates, QSLI_TILE_N))
+    if (not 1 <= p.topk <= QSLI_MAX_TOPK or p.candidates < 0 or p.query_rows < 1
+            or not 1 <= p.split_parts <= min(num_tiles, aic)
+            or aic > QSLI_MAX_CUBE_WORKERS
+            or type(p.pa_block_size) is not int or p.pa_block_size < QSLI_CANDIDATE_BLOCK_SIZE
+            or p.pa_block_size % QSLI_CANDIDATE_BLOCK_SIZE != 0):
         raise ModelingError("qsli_problem_invalid")
+    num_blocks = ceil_div(p.candidates, QSLI_CANDIDATE_BLOCK_SIZE)
+    blocks_per_page = p.pa_block_size // QSLI_CANDIDATE_BLOCK_SIZE
+    if p.candidate_block_indices:
+        if not num_blocks:
+            raise ModelingError("qsli_candidate_indices_invalid")
+        batched = isinstance(p.candidate_block_indices[0], (tuple, list))
+        if batched and len(p.candidate_block_indices) != p.query_rows:
+            raise ModelingError("qsli_candidate_indices_invalid")
+        for row in p.candidate_block_indices if batched else (p.candidate_block_indices,):
+            if (not isinstance(row, (tuple, list)) or len(row) != num_blocks
+                    or any(type(i) is not int or i < 0 for i in row)):
+                raise ModelingError("qsli_candidate_indices_invalid")
+    if p.block_table:
+        batched_bt = isinstance(p.block_table[0], (tuple, list))
+        if batched_bt and len(p.block_table) != p.query_rows:
+            raise ModelingError("qsli_block_table_invalid")
+        for q_idx in range(p.query_rows):
+            table = p.page_table(q_idx)
+            if not isinstance(table, (tuple, list)) or any(type(pg) is not int or pg < 0 for pg in table):
+                raise ModelingError("qsli_block_table_invalid")
+            if num_blocks:
+                ids = p.block_ids(q_idx)
+                max_blk = max(ids) if ids else num_blocks - 1
+                if max_blk // blocks_per_page >= len(table):
+                    raise ModelingError("qsli_block_table_invalid")
     if not p.candidates:
         return "histogram_topk", (1, 1, 1), (), 0, (), (), p.query_rows
     buffers = (
@@ -766,14 +942,55 @@ def _qsli(p, aic, aiv, datapath, variant):
             sum(qsli_workspace_sizes(p, aic).values()), (("score", "l0c", "ub"),), (), p.query_rows)
 
 
+def mqsmla_tile_m(heads: int) -> int:
+    return MQSMLA_SMALL_HEAD_BUCKET if heads <= MQSMLA_SMALL_HEAD_BUCKET else MQSMLA_HEADS
+
+
+def mqsmla_tile_partitions(p: MixedQuantSparseMlaProblem) -> tuple[tuple[tuple[str, int, int], ...], ...]:
+    """Build independent ORI/CMP S2 tiles and partition strictly on tile boundaries."""
+    tiles = (
+        *(("ori", pos, min(MQSMLA_KV_TILE, p.n_ori - pos)) for pos in range(0, p.n_ori, MQSMLA_KV_TILE)),
+        *(("cmp", pos, min(MQSMLA_KV_TILE, p.n_cmp - pos)) for pos in range(0, p.n_cmp, MQSMLA_KV_TILE)),
+    )
+    if p.split_parts > max(1, len(tiles)):
+        raise ModelingError("mqsmla_split_geometry_invalid")
+    if p.part_lengths:
+        if (min(p.part_lengths) < 1 or len(p.part_lengths) != p.split_parts
+                or sum(p.part_lengths) != p.n_ori + p.n_cmp):
+            raise ModelingError("mqsmla_split_geometry_invalid")
+        parts = []
+        cursor = 0
+        for target in p.part_lengths:
+            part_tiles = []
+            acc = 0
+            while cursor < len(tiles) and acc < target:
+                part_tiles.append(tiles[cursor])
+                acc += tiles[cursor][2]
+                cursor += 1
+            if acc != target or not part_tiles:
+                raise ModelingError("mqsmla_split_geometry_invalid")
+            parts.append(tuple(part_tiles))
+        if cursor != len(tiles):
+            raise ModelingError("mqsmla_split_geometry_invalid")
+        return tuple(parts)
+    if not tiles:
+        return ((),)
+    return tuple(
+        tiles[len(tiles) * part // p.split_parts:len(tiles) * (part + 1) // p.split_parts]
+        for part in range(p.split_parts)
+    )
+
+
 def _mqsmla(p, aic, aiv, datapath, variant):
-    if (p.heads, p.kv_heads, p.head_dim) != (MQSMLA_HEADS, MQSMLA_KV_HEADS, MQSMLA_HEAD_DIM):
+    if (not 1 <= p.heads <= MQSMLA_HEADS
+            or (p.kv_heads, p.head_dim) != (MQSMLA_KV_HEADS, MQSMLA_HEAD_DIM)):
         raise ModelingError("mqsmla_fixed_head_geometry_required")
     if min(p.n_ori, p.n_cmp) < 0 or p.queries < 1 or not 1 <= p.split_parts <= aic:
         raise ModelingError("mqsmla_problem_invalid")
     tables = p.block_tables
+    valid_sink = (p.sink_size in (0, p.heads)) if p.has_sink else (p.sink_size == 0)
     if (sum(map(bool, (p.ori_block_table, p.page_table, p.block_table))) > 1 or p.page_size < 1
-            or not p.has_sink or p.sink_size not in (0, p.heads)
+            or not valid_sink
             or any(type(page) is not int or page < 0 for table in tables for page in table)):
         raise ModelingError("mqsmla_paged_operand_invalid")
     total = p.n_ori + p.n_cmp
@@ -791,21 +1008,27 @@ def _mqsmla(p, aic, aiv, datapath, variant):
         raise ModelingError("mqsmla_paged_operand_invalid")
     if p.split_parts > 1 and p.queries * p.split_parts > 2 * aic:
         raise ModelingError("mqsmla_fd_partial_slots_exhausted")
-    if p.split_parts > max(1, p.n_ori + p.n_cmp) or (
-        p.part_lengths and (min(p.part_lengths) < 1 or len(p.part_lengths) != p.split_parts
-                            or sum(p.part_lengths) != p.n_ori + p.n_cmp)
-    ):
-        raise ModelingError("mqsmla_split_geometry_invalid")
+    mqsmla_tile_partitions(p)
+    tile_m = mqsmla_tile_m(p.heads)
+    tile_vec_m = tile_m // 2
     buffers = (
         _buf("kv_l1", "l1", MQSMLA_L1_KV_BYTES // MQSMLA_KV_DEPTH, MQSMLA_KV_DEPTH),
-        _buf("q_l1", "l1", MQSMLA_L1_Q_BYTES), _buf("p_l1", "l1", MQSMLA_L1_P_BYTES),
-        _buf("qk_l0c", "l0c", MQSMLA_HEADS * MQSMLA_KV_TILE * FP32_BYTES, 2),
-        _buf("q_l0a", "l0a", MQSMLA_HEADS * KDA_CHUNK * BF16_BYTES, 2),
-        _buf("kv_l0b", "l0b", MQSMLA_KV_TILE * KDA_CHUNK * BF16_BYTES, 2),
-        _buf("kv_packed", "ub", MQSMLA_KV_TILE // 2 * KV_ROW_BYTES_ORI, 2),
-        _buf("online_softmax", "ub", MQSMLA_FD_SLOT_BYTES // 2),
+        _buf("q_l1", "l1", tile_m * MQSMLA_Q_L1_WIDTH * BF16_BYTES),
+        _buf("p_l1", "l1", tile_m * MQSMLA_KV_TILE * BF16_BYTES),
+        _buf("qk_l0c", "l0c", tile_m * MQSMLA_KV_TILE * FP32_BYTES),
+        _buf("pv_l0c", "l0c", tile_m * KDA_CHUNK * FP32_BYTES, MQSMLA_PV_ACC_SLOTS),
+        _buf("q_l0a", "l0a", tile_m * MQSMLA_KV_TILE * BF16_BYTES, MQSMLA_L0_SLOTS),
+        _buf("kv_l0b", "l0b", MQSMLA_KV_TILE * KDA_CHUNK * BF16_BYTES, MQSMLA_L0_SLOTS),
+        _buf("result_channels", "ub", MQSMLA_RESULT_ROW_FACTOR * tile_vec_m * MQSMLA_RESULT_HALF_D * FP32_BYTES,
+             MQSMLA_RESULT_CHANNELS),
+        _buf("qk_ub", "ub", tile_vec_m * MQSMLA_KV_TILE * FP32_BYTES),
+        _buf("p_out", "ub", (tile_vec_m + 1) * MQSMLA_KV_TILE * BF16_BYTES),
+        _buf("ch_batch_bytes", "ub", MQSMLA_RAW_GATHER_ROWS * KV_ROW_BYTES_ORI, MQSMLA_KV_DEPTH),
+        _buf("v0_out", "ub", MQSMLA_V0_OUT_FRACTALS * MQSMLA_V0_OUT_PAD_ROWS * MQSMLA_V0_OUT_LANE * BF16_BYTES,
+             MQSMLA_V0_OUT_DEPTH),
+        _buf("softmax_state", "ub", MQSMLA_SOFTMAX_STATE_VECTORS * tile_vec_m * FP32_BYTES),
     )
-    return ("dual_bank", (MQSMLA_HEADS, MQSMLA_KV_TILE, p.head_dim), buffers,
+    return ("dual_bank", (tile_m, MQSMLA_KV_TILE, p.head_dim), buffers,
             aic * MQSMLA_FD_BYTES_PER_CORE, (("scores", "l0c", "ub"), ("p", "ub", "l1")), (), p.queries)
 
 
@@ -840,8 +1063,10 @@ def describe_dsl_kernel(kernel_id, problem, datapath, *, aic_budget=None, aiv_bu
         active = min(aic, max(1, items * p.split_parts if name in {QSLI, MQSMLA} else items))
         if not set(range(active)) <= {c for c, _ in pairs}:
             raise unmodeled(name, "dsl_cross_core_pairing_unavailable")
-        if name == QSLI and any(sum(c == core for c, _ in pairs) < 2 for core in range(active)):
-            raise unmodeled(name, "qsli_requires_two_paired_subblocks")
+        if name in {QSLI, FLASH_KDA, MQSMLA} and any(sum(c == core for c, _ in pairs) < 2 for core in range(active)):
+            raise unmodeled(
+                name, "qsli_requires_two_paired_subblocks" if name == QSLI else "dsl_requires_two_paired_subblocks",
+            )
         for cube, vector in pairs:
             datapath.route(src, dst, "fp32" if src == "l0c" else "bf16",
                            (cube, vector) if src == "l0c" else (vector, cube))
