@@ -9,15 +9,51 @@
 """
 import math
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.catalog.cache import index_row_bytes
 from mindie_sim.catalog.index_pool import PoolSelection, pool_selection
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 
 from .indexer_representation import index_representation
 from mindie_sim.prediction.operators.mla.mla_native import index_layer_norm
 from mindie_sim.prediction.structure_groups import declare_group
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_REV = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/attention/indexer_kpool.py",
+        source_sha256="c7268fa24836f3ef33f9fb626ece9430c6c752a596e3bc07d230de5e9fb99e9b",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/models/glm5next/attention.py",
+        source_sha256="799a1085d10606dae031c85e87d24bb25f6624e7e0fe75bae9f469ea829dad39",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/models/glm5next/sparse_attn_indexer_kpool.py",
+        source_sha256="e4849b6ec8231fe8e388fbe9a74cbfd819f2067ff5fa59c7fe2f05c6f23bb64f",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/ops/triton/glm5_next_kpool_tail_compress.py",
+        source_sha256="22f417ca59e9bc04749b0a05f3837468b26945b944dcc7df0d6141f61f0cffd9",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/ops/triton/glm5_next_lightning_indexer.py",
+        source_sha256="9b74018bcf5f41bc78f0b0099569d799540c6df424fd860a051f94876011bb81",
+    ),
+)
 
 FP32_ELEMENT_BYTES = 4
 POOL_ROW_PAIR_BYTES = 8

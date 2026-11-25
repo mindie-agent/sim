@@ -8,16 +8,28 @@
 [Side-Effect Policy] Creates immutable metadata and caller-owned graph nodes.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.catalog.ops import compute_dtype_for
 from mindie_sim.catalog.quant import projection_quant
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.invocation import Occurrence
 from mindie_sim.schema.operators import (
     FieldDisposition, ProgramFragment, SemanticAttr, SemanticRef, WorkItem, WorkSet,
 )
 from mindie_sim.schema.subgraphs import EventPortSpec, PortSet, TensorPortSpec
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_REV = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/attention/mla_v1.py",
+        source_sha256="f7f672e001651a748d2e88ef0f36797ef78db63321ac657f1c7a944c0f561c22",
+    ),
+)
 
 FIA_ABSORBED_LATENT_DIM = 512
 FIA_ABSORBED_ROPE_DIM = 64

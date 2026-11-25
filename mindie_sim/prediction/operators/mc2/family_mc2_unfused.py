@@ -9,10 +9,36 @@
 [Side-Effect Policy] Immutable operator transforms; no I/O, devices or timings.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from .lowering import FP32_SCALE_BYTES
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_REV = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
+_OPS_TRANSFORMER_REV = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_TRANSFORMER_REV,
+        relative_path="mc2/moe_distribute_dispatch_v3/op_host/moe_distribute_dispatch_v3_infershape.cpp",
+        source_sha256="32725689b52ccceab8ecdeb73503fc599185db0ac86db53990b03f42e3c27221",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py",
+        source_sha256="47444be0a5017d012401685d89134200f39c5e706f7941797fa7ecfccf1bba0d",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/ops/fused_moe/moe_mlp.py",
+        source_sha256="7882f9d0847e0303c78f2b216cfc50da9d3d062d6bd6f0cd22c94d1c7e78af0e",
+    ),
+)
 
 SELECTOR = "grouped_int8_caller"
 IMPLEMENTATION = "vllm_ascend_mc2_unfused_w8a8"
@@ -352,4 +378,4 @@ def lower(ops, bindings):
 
 
 __all__ = ["CAPABILITIES", "IMPLEMENTATION", "METADATA", "SELECTOR", "SOURCE",
-           "capabilities", "lower", "recipes"]
+           "SOURCES", "TARGET_BACKEND", "capabilities", "lower", "recipes"]
