@@ -41,7 +41,7 @@ from mindie_sim.primitives.loader import (
     load_primitives,
 )
 from mindie_sim.schema.checkpoint import CheckpointQuantMap
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.operators import KernelReadiness
@@ -96,7 +96,7 @@ from .profiles import (
     shipping_collective_policy,
     simulation_config,
 )
-from .quant_policy import DEFAULT_KV_BLOCK_SIZE, instantiate_runtime_quant_plan
+from .quant_policy import DEFAULT_KV_BLOCK_SIZE, MXFP_GROUP_SIZE, instantiate_runtime_quant_plan
 from .speculative import (
     ASCEND_V2_REJECTED_SPECULATIVE_METHODS,
     DEFAULT_MAX_NUM_SEQS,
@@ -556,12 +556,109 @@ def _build_stars_submit_policies(
     return tuple(policies)
 
 
+def _pd_local_tokens_for_abi(abi: Any, transfer_tokens: int) -> int:
+    tokens = max(1, int(transfer_tokens))
+    eff_tokens = min(tokens, int(abi.window)) if abi.window else tokens
+    place = abi.placement
+    if place.token_ownership_axis in {"dcp_head", "cp_striped"} and len(place.rank_ids) > 1:
+        cp_shard = len(place.rank_ids)
+        interleave = max(1, int(abi.cp_interleave_size or abi.kv_block_size or DEFAULT_KV_BLOCK_SIZE))
+        full_cycles, rem = divmod(eff_tokens, cp_shard * interleave)
+        return full_cycles * interleave + min(rem, interleave)
+    return eff_tokens
+
+
+def _pd_transfer_bytes_for_abi(abi: Any, transfer_tokens: int) -> int:
+    """Compute exact per-rank valid transfer bytes for one ``CacheStateABI`` over ``transfer_tokens``."""
+    local_tokens = _pd_local_tokens_for_abi(abi, transfer_tokens)
+    block = max(1, int(abi.kv_block_size or 1))
+    total = 0
+    for idx_pl, plane in enumerate(abi.planes):
+        if plane.allocation_frequency in {"checkpoint", "layer"} or plane.plane_id == "replay_records":
+            continue
+        unit_bytes = plane.exact_bytes()
+        if plane.allocation_frequency == "request_slot":
+            if plane.plane_id == "index_tail" or abi.component_role == "compressor_state":
+                cap_rows = max(1, int(plane.logical_shape[0])) if plane.logical_shape else 1
+                live_rows = min(local_tokens, cap_rows)
+                total += (unit_bytes * live_rows) // cap_rows
+            elif abi.component_role == "recurrent_state" and abi.rollback_slots > 0:
+                if idx_pl == 0 or plane.plane_id == "recurrent_state":
+                    total += unit_bytes // (1 + int(abi.rollback_slots))
+                elif abi.history_slots > 0:
+                    total += (unit_bytes * int(abi.history_slots)) // (int(abi.history_slots) + int(abi.rollback_slots))
+                else:
+                    total += unit_bytes
+            else:
+                total += unit_bytes
+        elif plane.allocation_frequency in {"token", "token_group"}:
+            rows = (
+                abi.compressed_append_units(0, local_tokens)
+                if (abi.compression_ratio > 1 or abi.pooling_ratio > 1)
+                else local_tokens
+            )
+            total += rows * unit_bytes
+        else:
+            full_pages, rem_tok = divmod(local_tokens, block)
+            plane_bytes = full_pages * unit_bytes
+            if rem_tok > 0:
+                if "block_group" in plane.logical_axes:
+                    g_ext = int(plane.group_extents[0]) if plane.group_extents else MXFP_GROUP_SIZE
+                    groups = (rem_tok + max(1, g_ext) - 1) // max(1, g_ext)
+                    other = math.prod(d for ax, d in zip(plane.logical_axes, plane.logical_shape) if ax != "block_group")
+                    tail_b = int(round(other * groups * dtype_bytes(plane.dtype) / max(1, plane.packed_elements)))
+                elif "token" in plane.logical_axes:
+                    other = math.prod(d for ax, d in zip(plane.logical_axes, plane.logical_shape) if ax != "token")
+                    tail_b = int(round(other * rem_tok * dtype_bytes(plane.dtype) / max(1, plane.packed_elements)))
+                else:
+                    tail_b = (unit_bytes * rem_tok + block - 1) // block
+                plane_bytes += min(unit_bytes, tail_b)
+            total += plane_bytes
+    return total
+
+
+def _partial_page_requires_repack(abi: Any, local_tokens: int) -> bool:
+    block = max(1, int(abi.kv_block_size or 1))
+    if local_tokens % block == 0:
+        return False
+    for plane in abi.planes:
+        if plane.allocation_frequency != "page" or "token" not in plane.logical_axes:
+            continue
+        tok_pos = plane.logical_axes.index("token")
+        if any(int(dim) > 1 for dim in plane.physical_shape[:tok_pos]):
+            return True
+    return False
+
+
+def _parse_c8_downgraded_layers(dispositions: Sequence[tuple[str, str, str]]) -> tuple[bool, set[tuple[str, int]]]:
+    all_layers = False
+    layers: set[tuple[str, int]] = set()
+    for name, status, detail in dispositions:
+        if name != "kv_cache_c8_producer" or status != "downgraded":
+            continue
+        if "layer=" not in detail:
+            all_layers = True
+            continue
+        scope = "target"
+        layer_id: int | None = None
+        for part in detail.split(":"):
+            if part.startswith("scope="):
+                scope = part.split("=", 1)[1].strip()
+            elif part.startswith("layer="):
+                layer_id = int(part.split("=", 1)[1].strip())
+        if layer_id is not None:
+            layers.add((scope, layer_id))
+    return all_layers, layers
+
+
 def _build_pd_kv_transfer_spec(
     quant_plan: RuntimeQuantPlan,
     *,
     hw: str,
     mode_str: str,
     transport_str: str,
+    role_norm: str = "colocated",
+    transfer_tokens: int = 1,
 ) -> PdKvTransferSpec:
     """Validate PdTransferMode and PdTransportKind strictly with zero coercion."""
     if mode_str not in PD_TRANSFER_MODES:
@@ -570,11 +667,32 @@ def _build_pd_kv_transfer_spec(
         raise ModelingError(f"pd_transfer_transport_invalid:{transport_str!r}")
     mode: PdTransferMode = mode_str  # type: ignore[assignment]
     transport: PdTransportKind = transport_str  # type: ignore[assignment]
+    c8_all_layers, c8_layers = _parse_c8_downgraded_layers(quant_plan.dispositions)
+    conv_recipe = ""
+    any_conversion = False
     edges: list[PdLayerTransferEdge] = []
     for abi in (*quant_plan.kv_cache_abi, *quant_plan.index_cache_abi, *quant_plan.recurrent_state_abi):
-        if abi.scope != "target" or abi.component_role == "engram_table":
+        if abi.scope not in {"target", "draft"} or abi.component_role == "engram_table":
             continue
-        n_bytes = abi.total_plane_bytes(include_padding=True)
+        local_tokens = _pd_local_tokens_for_abi(abi, transfer_tokens)
+        n_bytes = _pd_transfer_bytes_for_abi(abi, transfer_tokens)
+        is_c8_mismatch = (
+            abi.component_role == "kv_combined"
+            and (
+                abi.recipe_abi_id in {"gqa_int8", "gqa_faquant"}
+                or (role_norm == "pd_prefill" and (c8_all_layers or (abi.scope, abi.native_layer) in c8_layers))
+            )
+        )
+        edge_repack = is_c8_mismatch
+        edge_recipe = ""
+        if is_c8_mismatch:
+            src_dt = abi.planes[0].dtype if (role_norm == "pd_prefill" and abi.planes[0].dtype in {"bf16", "fp16"}) else "bf16"
+            edge_recipe = f"kv_c8_{src_dt}_to_int8_quantize"
+            any_conversion = True
+            conv_recipe = conv_recipe or edge_recipe
+        elif _partial_page_requires_repack(abi, local_tokens):
+            edge_repack = True
+            edge_recipe = "kv_partial_page_gather_pack"
         edges.append(PdLayerTransferEdge(
             native_layer=abi.native_layer,
             source_ready_event=f"ev.prefill_ready.{abi.producer_key}",
@@ -582,7 +700,8 @@ def _build_pd_kv_transfer_spec(
             source_abi_key=abi.producer_key,
             dest_abi_key=abi.producer_key,
             byte_range=(0, n_bytes),
-            requires_repack=False,
+            requires_repack=edge_repack,
+            repack_recipe_id=edge_recipe,
         ))
     route = "ub_direct" if hw == "a5" else ("hccs_sw" if hw == "a3" else "roce")
     return PdKvTransferSpec(
@@ -593,6 +712,8 @@ def _build_pd_kv_transfer_spec(
         layer_edges=tuple(edges),
         route=route,
         receive_credits=DEFAULT_PD_RECEIVE_CREDITS,
+        conversion_required=any_conversion,
+        conversion_recipe_id=conv_recipe if any_conversion else "",
         last_reader_event="ev.decode_kv_consume_done",
     )
 
@@ -772,12 +893,24 @@ def _select_mla_prolog_binding(
     act_dtype, weight_quant, is_w4a8, is_int8_kv, has_kv_scale = _mla_quant_facts(
         model, quant_plan, mla_nid,
     )
+    has_faquant = any(
+        w.allocation_id.startswith("faquant.") for w in quant_plan.prepared_weights
+    )
     eff_seqs = max(1, int(eff_opts.get("max_num_seqs") or 1))
     eff_spec_k = max(0, int(eff_opts.get("speculative_k") or 0))
     est_tokens = eff_seqs * (1 + eff_spec_k)
     max_batched = int(eff_opts.get("max_num_batched_tokens") or 0)
     if max_batched > 0:
         est_tokens = min(est_tokens, max_batched)
+    is_sparse_sfa = bool(mla_plan.indexer)
+    eff_has_kv_scale = has_kv_scale if is_sparse_sfa else (is_int8_kv and has_faquant)
+    req_strided = eff_opts.get("is_strided_kv_cache")
+    is_strided = (
+        bool(req_strided)
+        if req_strided is not None
+        else bool(mla_plan.cache_kind == "dense" and not (is_int8_kv and eff_has_kv_scale))
+    )
+    is_kv_consumer = str(eff_opts.get("role") or "").strip().lower() == "pd_decode"
     mla_mode = resolve_mla_preprocess_mode(
         arch=hw_upper,
         phase=phase,
@@ -786,7 +919,8 @@ def _select_mla_prolog_binding(
         kv_lora_rank=int(mla_plan.kv_lora_rank or 0),
         qk_rope_head_dim=int(mla_plan.qk_rope_head_dim or 0),
         has_rope=(not bool(mla_plan.mla_use_nope)) and int(mla_plan.qk_rope_head_dim or 0) > 0,
-        is_sparse_sfa=bool(mla_plan.indexer),
+        is_sparse_sfa=is_sparse_sfa,
+        is_kv_consumer=is_kv_consumer,
         dcp_size=int(parallel.cp or 1),
         pcp_size=int(parallel.pcp or 1),
         enable_mlapo=bool(eff_opts.get("mlapo", False)),
@@ -794,15 +928,16 @@ def _select_mla_prolog_binding(
         qkv_a_gate_fused=bool(mla_plan.mla_qkv_a_gate_fused or mla_plan.mla_output_gate),
         is_w4a8=is_w4a8,
         is_int8_kv=is_int8_kv,
-        has_kv_scale=has_kv_scale,
+        has_kv_scale=eff_has_kv_scale,
         has_learned_rope_tail=bool(
             str(mla_plan.mla_variant or "").lower() == "latent_mqa"
             and int(mla_plan.qk_rope_head_dim or 0) > 0
         ),
+        is_strided_kv_cache=is_strided,
         act_dtype=act_dtype,
         weight_quant=weight_quant,
         input_size=int(model.hidden_size),
-        num_kv_heads=1,
+        num_kv_heads=int(mla_plan.num_kv_heads or 1),
         num_q_heads=int(mla_plan.num_heads or model.num_heads),
         qk_nope_head_dim=int(mla_plan.qk_nope_head_dim or 0),
         registry=registry,
@@ -1348,8 +1483,15 @@ class VllmAscendStackAdapter:
             ("kv_block_size", int(requested_options.get("kv_block_size") or profile_cfg.get("kv_block_size") or DEFAULT_KV_BLOCK_SIZE)),
             ("max_num_seqs", int(requested_options.get("max_num_seqs") or DEFAULT_MAX_NUM_SEQS)),
             ("max_num_batched_tokens", int(requested_options.get("max_num_batched_tokens") or 0)),
+            ("prompt_tokens", int(requested_options.get("prompt_tokens") or 0)),
+            ("pp_layer_partition", tuple(int(x) for x in requested_options["pp_layer_partition"]) if requested_options.get("pp_layer_partition") else ()),
+            ("draft_max_model_len", int(requested_options.get("draft_max_model_len") or 0)),
             ("sp", sp_enabled),
             ("mlapo", bool(requested_options.get("mlapo", profile_cfg.get("mlapo", False)))),
+            ("is_strided_kv_cache", (
+                bool(requested_options["is_strided_kv_cache"])
+                if requested_options.get("is_strided_kv_cache") is not None else None
+            )),
             ("enable_fused_mc2", eff_mc2),
             ("multistream_overlap_shared_expert", eff_mso),
             ("engram_cpu_offload", bool(requested_options.get("engram_cpu_offload", profile_cfg.get("engram_cpu_offload", False)))),
@@ -1487,6 +1629,8 @@ class VllmAscendStackAdapter:
                 hw=hw,
                 mode_str=str(eff.get("pd_kv_transfer_mode") or "blocking"),
                 transport_str=str(eff.get("pd_kv_transport") or "direct_d2d"),
+                role_norm=role_norm,
+                transfer_tokens=max(1, int(eff.get("prompt_tokens") or 1)),
             )
 
         scheduling = SchedulingContract(
@@ -1559,12 +1703,16 @@ class VllmAscendStackAdapter:
         )
         verify_stride = spec_k + 1
         token_budget = state.max_num_batched_tokens
-        if state.max_num_input_tokens is not None:
-            token_budget = min(token_budget, state.max_num_input_tokens)
+        input_budget = (
+            min(token_budget, state.max_num_input_tokens)
+            if state.max_num_input_tokens is not None
+            else token_budget
+        )
 
         views: list[RequestView] = []
         statuses: list[tuple[str, str]] = []
         used_tokens = 0
+        used_input_tokens = 0
         for _, rid in ordered:
             if len(views) >= state.max_num_seqs or used_tokens >= token_budget:
                 statuses.append((rid, "queued"))
@@ -1572,10 +1720,11 @@ class VllmAscendStackAdapter:
             ctx, rem_prompt = prog_map.get(rid, (0, 0))
             remaining_budget = token_budget - used_tokens
             if rem_prompt > 0:
-                if not state.chunked_prefill and rem_prompt > remaining_budget:
+                prefill_budget = min(remaining_budget, input_budget - used_input_tokens)
+                if prefill_budget <= 0 or (not state.chunked_prefill and rem_prompt > prefill_budget):
                     statuses.append((rid, "deferred_budget"))
                     continue
-                q_len = min(rem_prompt, remaining_budget) if state.chunked_prefill else rem_prompt
+                q_len = min(rem_prompt, prefill_budget) if state.chunked_prefill else rem_prompt
                 views.append(RequestView(
                     request_id=rid,
                     q_len=q_len,
@@ -1590,6 +1739,7 @@ class VllmAscendStackAdapter:
                     global_q_len=q_len,
                 ))
                 used_tokens += q_len
+                used_input_tokens += q_len
                 statuses.append((rid, "running_prefill"))
             else:
                 if verify_stride > remaining_budget:

@@ -384,6 +384,7 @@ def materialize(raw):
     data.update(
         ranks_per_node=per_node,
         physical_ranks_per_node=phys_rpn,
+        ranks_per_node_explicit=bool(raw.get("ranks_per_node_explicit", "ranks_per_node" in raw)),
         dies_per_package=per_package,
     )
     if "collective_protocols" not in raw:
