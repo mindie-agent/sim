@@ -168,13 +168,15 @@ def conv_spec_terms(lengths, padding_slots, width, dim, bias, speculative):
     reads = sum(amount for amount, _ in traffic) * dim * 2
     writes = sum(amount for _, amount in traffic) * dim * 2
     # Externally observed envelope of `causal_conv1d_update` on the paired
-    # `#62` SKUs: `q` current tokens plus `kernel_width - 1` history rows are
-    # streamed in, and the same two windows are written back. The `width`
-    # weight taps stay L2-resident across the per-sequence repetitions, and the
-    # speculative reload window re-reads the retained positions and the current
-    # inputs from UB, so neither adds an off-chip descriptor.
-    external = sum(2 * (q + width - 1) * dim * 2
-                   for q, own in zip(lengths, has_state) if q > 0 and own)
+    # `#62` SKUs: `q` current tokens plus `width - 1` prior history rows are
+    # read cold, and `q` outputs plus `state_write` (`2 + q` speculative via
+    # `WriteBackStateSpec`, `width - 1` non-speculative) dirty rows are written
+    # back. The `width` weight taps stay L2-resident across per-sequence
+    # repetitions, and speculative reload re-reads already-fetched rows.
+    external = sum(
+        ((q + width - 1) + (q + (2 + q if speculative else width - 1))) * dim * BF16_BYTES
+        for q, own in zip(lengths, has_state) if q > 0 and own
+    )
     vector = sum((width + 1 + q * conv_token_ops(width, bias)) * dim
                  for q, own in zip(lengths, has_state) if q > 0 and own)
     return external, reads, writes, vector
@@ -291,9 +293,9 @@ def conv_plan(op, geometry, *, compact=True):
             # shared HBM bus as one address stream, double-buffered against the
             # token convolution rather than extending the token-critical path.
             if owns_state:
-                stream_rows = 2 * (q + width - 1)
+                stream_rows = (q + history) + (q + state_write)
                 stages.append(Stage("external_stream", context.bind(Work(
-                    resources={"hbm": stream_rows * n * 2}).scaled(repeat)),
+                    resources={"hbm": stream_rows * n * BF16_BYTES}).scaled(repeat)),
                     after=("weights_cast",), placement=owned))
             # The retained-history reload is a prefetch for the speculative
             # restore; it may double-buffer against the token convolution.

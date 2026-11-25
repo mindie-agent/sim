@@ -98,15 +98,43 @@ def _sum_valid_powers(tokens: int, chunk: int, power: int) -> int:
     return int(full) * int(chunk) ** int(power) + int(remainder) ** int(power)
 
 
-def _lower_gdn_projections(b, tensors, *, deps, tokens, hidden, conv_width, value_width, heads):
+def _lower_gdn_projections(b, tensors, *, deps, tokens, hidden, conv_width, value_width, heads,
+                           key_heads=None, dk=None, key_replication=1):
     # Checkpoints can retain gate/output projections in native precision
     # while quantizing QKV. Role overrides inherit the existing gdn parent.
     from mindie_sim.prediction.projections import gdn_input_projections
 
+    proj_conv_width = (
+        (QK_INPUT_COUNT * key_heads * dk) // key_replication + value_width
+        if key_replication > 1 else conv_width
+    )
+    proj_meta = (
+        (("gdn_key_head_replication", key_replication),
+         ("checkpoint_qkvz_width", proj_conv_width + value_width))
+        if key_replication > 1 else ()
+    )
     conv_view, output_gate_view, (beta_view, alpha_view) = gdn_input_projections(
         b, tensors, deps=deps, tokens=tokens, hidden=hidden,
-        conv_width=conv_width, value_width=value_width, heads=heads,
+        conv_width=proj_conv_width, value_width=value_width, heads=heads,
+        metadata=proj_meta,
     )
+    if key_replication > 1:
+        elem_bytes = dtype_bytes(b.model.activation_dtype)
+        rep_bytes = (
+            tokens * QK_INPUT_COUNT * key_heads * dk * elem_bytes
+            * (key_replication - 1) / key_replication
+        )
+        rep_id = b.communicate(
+            "gdn_key_head_replicate", (conv_view.producer,), rep_bytes, "allgather",
+            "local_tp",
+            shape=(tokens, conv_width),
+            comm_group_size=key_replication,
+            local_tp_width=key_replication,
+            local_tp_stride=1,
+            steps=key_replication - 1,
+            gdn_key_head_replication=key_replication,
+        )
+        conv_view = tensors.result(rep_id, (tokens, conv_width))
     conv_input = tensors.require(
         conv_view, "short_convolution", "input",
         name="convolution_input_contiguous")
@@ -316,18 +344,23 @@ def _lower_chunk_prepare(b, *, index, q, chunk, chunks, span, heads, dk, dv,
 
 def _emit_gdn_pcp_prefix_scan(b, *, index, view, dep, heads, dk, dv, pcp, chunk):
     """Exact ``ops/triton/fla/chunk.py`` GDN PCP: fwd_hupdate + 2 FP32 AGs + prefix scan."""
+    from mindie_sim.prediction.operators.linear_attention.gdn_prefill import pcp_gdn_prefix_work
+
     q_local = max(1, int(view.q_len))
-    scan_chunk = max(1, int(chunk))
+    scan_chunk = DEFAULT_RECURRENT_CHUNK_TOKENS
     chunks = max(1, math.ceil(q_local / scan_chunk))
     scan_heads = max(1, int(heads))
-    phi_bytes = float(scan_heads * dk * dk * FP32_BYTES)
-    state_bytes = float(scan_heads * dk * dv * FP32_BYTES)
+    pw = pcp_gdn_prefix_work(
+        n_pf=1, tokens=q_local, chunks=chunks, chunk=scan_chunk,
+        heads=scan_heads, dk=dk, dv=dv, pcp=pcp, act_dtype=b.model.activation_dtype,
+    )
     hupdate = b.work(
         f"pcp_gdn_hupdate{index}", (dep,), (1, scan_heads, dk, dk),
-        flops=float(2 * q_local * scan_heads * dk * dk),
-        vector=float(chunks * scan_heads * dk * dk),
-        read=phi_bytes + float(q_local * scan_heads * dk * 2),
-        write=phi_bytes, family="recurrent_scan", dtype="fp32",
+        flops=pw["hupdate_flops"],
+        matrix_flops=pw["hupdate_matrix_flops"],
+        vector=pw["hupdate_vector"],
+        read=pw["hupdate_read"],
+        write=pw["hupdate_write"], family="recurrent_scan", dtype="fp32",
         metadata=(
             ("pcp", int(pcp)), ("chunks", chunks), ("chunk", scan_chunk),
             ("tokens", q_local), ("heads", scan_heads),
@@ -336,18 +369,18 @@ def _emit_gdn_pcp_prefix_scan(b, *, index, view, dep, heads, dk, dv, pcp, chunk)
     )
     ag_state = b.communicate(
         f"pcp_gdn_state_gather{index}", (dep,),
-        state_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
+        pw["st_bytes"] * (pcp - 1), "allgather", "pcp", dtype="fp32",
     )
     ag_phi = b.communicate(
         f"pcp_gdn_hupdate_gather{index}", (hupdate,),
-        phi_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
+        pw["phi_bytes"] * (pcp - 1), "allgather", "pcp", dtype="fp32",
     )
-    steps = max(1, int(pcp) - 1)
+    steps = int(pw["prefix_steps"])
     prefix = b.work(
         f"pcp_gdn_prefix_scan{index}", (ag_state, ag_phi), (steps, scan_heads, dk, dv),
-        flops=float(2 * steps * scan_heads * dk * dk * dv),
-        vector=float(steps * scan_heads * dk * dv),
-        read=(state_bytes + phi_bytes) * pcp, write=state_bytes,
+        flops=pw["prefix_flops"],
+        vector=pw["prefix_vector"],
+        read=pw["prefix_read"], write=pw["prefix_write"],
         family="recurrent_scan", dtype="fp32",
         metadata=(
             ("pcp", int(pcp)), ("chunks", steps), ("chunk", 1),
@@ -359,7 +392,7 @@ def _emit_gdn_pcp_prefix_scan(b, *, index, view, dep, heads, dk, dv, pcp, chunk)
         f"pcp_gdn_fwd_h_rerun{index}", (prefix,), (q_local, scan_heads, dk, dv),
         flops=float(PREFILL_SCAN_FLOPS_PER_STATE_ELEMENT * q_local * scan_heads * dk * dv),
         vector=float(chunks * 2 * scan_heads * dk * dv),
-        read=chunks * state_bytes, write=chunks * state_bytes,
+        read=chunks * pw["st_bytes"], write=chunks * pw["st_bytes"],
         family="recurrent_scan", dtype="fp32",
         metadata=(
             ("pcp", int(pcp)), ("chunks", chunks), ("chunk", scan_chunk),
@@ -689,6 +722,7 @@ def _bind_kda_prefill(b, *, kda_source, kda_caps, prefill_source, prefill_scan_i
             pcp=parallel.pcp,
             speculative=any(view.draft_proposal_tokens
                             for view in views if view.phase == "prefill"),
+            kda_gate_lower_bound=plan.kda_gate_lower_bound,
         )
         gated = gated_op.op_id
     if prefill_source and prefill_scan_ids:
@@ -1333,9 +1367,16 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         deps, views, tokens, kda_common_peer, kda_gathered = _apply_kda_pcp_entry(
             b, deps=deps, views=views, tokens=local_tokens, hidden=hidden,
             parallel=parallel, model=model, runtime=runtime)
-    key_heads = math.ceil((plan.linear_key_heads or plan.linear_heads) / head_shards)
-    heads = math.ceil((plan.linear_value_heads or plan.linear_heads) / head_shards)
-    dk, dv = plan.linear_key_head_dim or plan.linear_head_dim, plan.linear_head_dim
+    key_replication = 1
+    if plan.attention == "gdn":
+        from mindie_sim.prediction.operators.linear_attention.gdn_decode import (
+            _resolve_local_gdn_heads,
+        )
+        key_heads, heads, dk, dv, key_replication = _resolve_local_gdn_heads(plan, head_shards)
+    else:
+        key_heads = math.ceil((plan.linear_key_heads or plan.linear_heads) / head_shards)
+        heads = math.ceil((plan.linear_value_heads or plan.linear_heads) / head_shards)
+        dk, dv = plan.linear_key_head_dim or plan.linear_head_dim, plan.linear_head_dim
     key_width, value_width = key_heads * dk, heads * dv
     use_recover_ssm = recover_ssm_enabled(runtime)
     from .recover_ssm_work import gdn_record_head_bytes
@@ -1368,7 +1409,8 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     if plan.attention == "gdn":
         conv_input, gate_inputs, output_gate_view = _lower_gdn_projections(
             b, tensors, deps=deps, tokens=tokens, hidden=hidden, conv_width=conv_width,
-            value_width=value_width, heads=heads)
+            value_width=value_width, heads=heads, key_heads=key_heads, dk=dk,
+            key_replication=key_replication)
         sources = [conv_input.producer]
     else:
         sources, output_gate, beta, decay, raw_beta, projection_group = _lower_kda_projections(

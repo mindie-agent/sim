@@ -22,6 +22,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 
+from mindie_sim.schema.common import dtype_bytes
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
 from mindie_sim.prediction.operators.causal_conv import native_causal_conv_prefill
 from mindie_sim.prediction.operators.linear_attention import gdn_recurrent
@@ -110,9 +111,9 @@ def _initial_conv_transfer(b, conv_input, *, view, plan, width, pcp, first_start
     return remote_initial
 
 
-def _segment_remote_ports(*, plan, width, version, remote_initial, exchange, previous_seg):
-    remote_port = (
-        gdn_recurrent.tensor_port(
+def _segment_remote_ports(*, plan, width, version, remote_initial, exchange, local_producer):
+    if remote_initial is not None:
+        return (gdn_recurrent.tensor_port(
             TensorValue(
                 str(remote_initial), plan.conv_state_dtype or "bf16",
                 TensorLayout.contiguous((1, plan.conv_kernel - 1, width)),
@@ -120,35 +121,41 @@ def _segment_remote_ports(*, plan, width, version, remote_initial, exchange, pre
             ),
             ready=str(remote_initial), role="remote_input",
             owner="external_rank",
-        )
-        if remote_initial is not None else None
-    )
-    remote_ports = (
-        (remote_port,) if remote_port else (
-            (gdn_recurrent.tensor_port(
-                TensorValue(
-                    str(exchange), plan.conv_state_dtype or "bf16",
-                    TensorLayout.contiguous((1, plan.conv_kernel - 1, width)),
-                    state_version=version,
-                ),
-                ready=str(exchange), role="remote_input",
-                owner="external_rank",
-            ),)
-            if previous_seg is not None else ()
-        )
-    )
-    return remote_ports
+        ),)
+    if exchange is not None:
+        return (gdn_recurrent.tensor_port(
+            TensorValue(
+                str(exchange), plan.conv_state_dtype or "bf16",
+                TensorLayout.contiguous((1, plan.conv_kernel - 1, width)),
+                state_version=version,
+            ),
+            ready=str(exchange), role="remote_input",
+            owner="external_rank",
+        ),)
+    if local_producer is not None:
+        return (gdn_recurrent.tensor_port(
+            TensorValue(
+                str(local_producer), plan.conv_state_dtype or "bf16",
+                TensorLayout.contiguous((1, plan.conv_kernel - 1, width)),
+                state_version=version,
+            ),
+            ready=str(local_producer), role="state_input",
+            owner=str(local_producer),
+        ),)
+    return ()
 
 
 def _lower_segmented_conv(b, tensors, *, prefix, plan, parallel, prefill, conv_input,
                           conv_params, conv_meta, cache_indices, state_rows, index_source,
-                          chunk, heads, width, actual):
+                          chunk, heads, width, actual, tail_gather=None, tail_preload=None):
     parts, offset = [], 0
     segment_index = 0
+    tail_ready = tail_preload or tail_gather
     for view_index, view in enumerate(prefill):
         previous_seg = None
         ranges = tuple(view.query_ranges)
         first_start = int(ranges[0][0]) if ranges else 0
+        previous_end = first_start
         global_end = view.context + (view.global_q_len or view.q_len)
         version = view.context + first_start
         remote_initial = _initial_conv_transfer(
@@ -158,33 +165,35 @@ def _lower_segmented_conv(b, tensors, *, prefix, plan, parallel, prefill, conv_i
             length = int(end) - int(start)
             if length <= 0:
                 continue
+            gap = int(start) - previous_end
             seg_input = conv_input.narrow(0, offset, length)
+            segment_context = view.context + int(start)
             seg_params = {
                 **conv_params,
                 "lengths": (length,),
                 "cache_indices": (
                     cache_indices[view_index] if cache_indices is not None else None,
                 ),
-                "has_initial_state": (version > 0 and not view.padding,),
+                "has_initial_state": (segment_context > 0 and not view.padding,),
             }
             seg_op = native_causal_conv_prefill.make_op(seg_params)
             deps = [seg_input.producer]
-            if range_index == 0 and remote_initial is not None:
-                deps.append(remote_initial)
             exchange = None
-            if previous_seg is not None:
-                exchange = b.communicate(
-                    f"pcp_conv_tail_gather{segment_index}", (conv_input.producer,),
-                    max(0, plan.conv_kernel - 1) * width * 2 * (parallel.pcp - 1),
-                    "allgather", "pcp",
-                    state_scope="conv_history",
-                    request=view.request_id,
-                    from_version=version,
-                    to_version=view.context + int(start),
-                    source="vllm_ascend.ops.gdn",
-                )
-                deps.append(exchange)
-            segment_context = view.context + int(start)
+            local_producer = None
+            seg_remote_initial = None
+            if previous_seg is not None and gap == 0:
+                # Adjacent local ranges (e.g. [4,8) then [8,12)) consume local
+                # tokens from the preceding segment rather than the PCP gather.
+                deps.append(previous_seg)
+                local_producer = previous_seg
+            else:
+                if tail_ready is not None:
+                    deps.append(tail_ready)
+                if range_index == 0 and remote_initial is not None:
+                    deps.append(remote_initial)
+                    seg_remote_initial = remote_initial
+                elif previous_seg is not None and gap > 0:
+                    exchange = tail_ready
             segment_view = SimpleNamespace(
                 request_id=f"{view.request_id}#convseg{segment_index}",
                 q_len=length, context=segment_context, global_q_len=length,
@@ -196,7 +205,7 @@ def _lower_segmented_conv(b, tensors, *, prefix, plan, parallel, prefill, conv_i
                 state_dtype=plan.recurrent_state_dtype,
                 conv_state_dtype=plan.conv_state_dtype,
                 conv_kernel=plan.conv_kernel, target_prefix=prefix,
-                chunk=chunk, initial_state=(version > 0,),
+                chunk=chunk, initial_state=(segment_context > 0,),
                 direction="conv", target_kind="conv",
                 global_lengths=(length,),
                 slot_indices=((cache_indices[view_index]
@@ -217,8 +226,9 @@ def _lower_segmented_conv(b, tensors, *, prefix, plan, parallel, prefill, conv_i
             seg_index_value = (None if cache_indices is None
                                else cache_indices[view_index])
             remote_ports = _segment_remote_ports(
-                plan=plan, width=width, version=version, remote_initial=remote_initial,
-                exchange=exchange, previous_seg=previous_seg)
+                plan=plan, width=width, version=segment_context,
+                remote_initial=seg_remote_initial, exchange=exchange,
+                local_producer=local_producer)
             meta.update({
                 "state_segment_index": segment_index,
                 "state_segment_range": (int(start), int(end)),
@@ -261,11 +271,27 @@ def _lower_segmented_conv(b, tensors, *, prefix, plan, parallel, prefill, conv_i
                 tensors.result(seg, (length, width)), (length * width,),
                 name=f"conv_seg_flat{segment_index}"))
             previous_seg = seg
-            version += length
+            previous_end = int(end)
+            version = segment_context + length
             offset += length
             segment_index += 1
     combined = tensors.concatenate_flat(parts, "pcp_conv_concatenate")
     return tensors.reshape(combined, (actual, width), name="pcp_conv_output").producer
+
+
+def _needs_pcp_conv_preload(prefill: tuple[Any, ...], pcp_rank: int | None) -> bool:
+    if pcp_rank is not None:
+        return int(pcp_rank) > 0
+    for view in prefill:
+        if view.padding:
+            continue
+        ranges = tuple(view.query_ranges)
+        if ranges and int(ranges[0][0]) > 0:
+            return True
+        for prev, nxt in zip(ranges, ranges[1:]):
+            if int(nxt[0]) > int(prev[1]):
+                return True
+    return False
 
 
 def lower_conv_stage(
@@ -291,9 +317,39 @@ def lower_conv_stage(
     heads: int,
     width: int,
     actual: int,
+    pcp_rank: int | None = None,
 ) -> str:
     """Lower PCP-segmented or mixed (decode+prefill) causal convolution."""
     b = builder
+    # Upstream vllm_ascend/ops/gdn.py:572-610 gathers the pre-convolution
+    # [n_prefill, conv_kernel - 1, width] input tail once across all PCP peers
+    # before short_convolution, preloads rank-1's tail on pcp_rank>0, and
+    # publishes rank[-1]'s tail into conv cache after convolution.
+    tail_gather = None
+    tail_preload = None
+    n_prefill = sum(1 for view in prefill if not view.padding)
+    state_len = max(0, plan.conv_kernel - 1)
+    conv_state_dtype = plan.conv_state_dtype or b.model.activation_dtype
+    tail_copy_bytes = n_prefill * state_len * width * dtype_bytes(conv_state_dtype)
+    if parallel.pcp > 1 and n_prefill > 0:
+        tail_bytes = (parallel.pcp - 1) * tail_copy_bytes
+        tail_gather = b.communicate(
+            "pcp_conv_tail_gather", (conv_input.producer,), tail_bytes,
+            "allgather", "pcp",
+            dtype=conv_state_dtype,
+            state_scope="conv_history",
+            source="vllm_ascend.ops.gdn",
+        )
+        if state_len > 0 and _needs_pcp_conv_preload(prefill, pcp_rank):
+            tail_preload = b.work(
+                "pcp_conv_tail_preload", (tail_gather,), (n_prefill, state_len, width),
+                vector=0, read=tail_copy_bytes, write=tail_copy_bytes,
+                family="tensor_copy", dtype=conv_state_dtype,
+                metadata=(
+                    ("state_scope", "conv_history"),
+                    ("source", "vllm_ascend/ops/gdn.py:590"),
+                ),
+            )
     pcp_ranges = (
         parallel.pcp > 1
         and not decode
@@ -301,15 +357,31 @@ def lower_conv_stage(
         and any(len(view.query_ranges) > 1 for view in prefill)
     )
     if pcp_ranges:
-        return _lower_segmented_conv(
+        conv = _lower_segmented_conv(
             b, tensors, prefix=prefix, plan=plan, parallel=parallel, prefill=prefill,
             conv_input=conv_input, conv_params=conv_params, conv_meta=conv_meta,
             cache_indices=cache_indices, state_rows=state_rows, index_source=index_source,
-            chunk=chunk, heads=heads, width=width, actual=actual)
-
+            chunk=chunk, heads=heads, width=width, actual=actual,
+            tail_gather=tail_gather, tail_preload=tail_preload)
+        if tail_gather is not None and state_len > 0:
+            b.work(
+                "pcp_conv_tail_publish", (conv, tail_gather), (n_prefill, state_len, width),
+                vector=0, read=tail_copy_bytes, write=tail_copy_bytes,
+                family="tensor_copy", dtype=conv_state_dtype,
+                metadata=(
+                    ("state_scope", "conv_history"),
+                    ("effect_role", "conv_tail_publish"),
+                    ("source", "vllm_ascend/ops/gdn.py:608"),
+                ),
+            )
+        return conv
 
     remote_inputs = [None] * len(ordered)
     conv_deps = [conv_input.producer]
+    if tail_preload is not None:
+        conv_deps.append(tail_preload)
+    elif tail_gather is not None:
+        conv_deps.append(tail_gather)
     for index, view in enumerate(ordered):
         if view.phase != "prefill":
             continue
@@ -381,10 +453,15 @@ def lower_conv_stage(
         "gdn_state_contract": mixed_contract,
         "gdn_state_effects": mixed_conv,
     }.items())))
-    if parallel.pcp > 1:
-        conv = b.communicate(
-            "pcp_conv_state_step", (conv,),
-            len(prefill) * max(0, plan.conv_kernel - 1) * width * 2
-            * (2 * parallel.pcp - 1) / parallel.pcp,
-            "allgather", "pcp")
+    if tail_gather is not None and state_len > 0:
+        b.work(
+            "pcp_conv_tail_publish", (conv, tail_gather), (n_prefill, state_len, width),
+            vector=0, read=tail_copy_bytes, write=tail_copy_bytes,
+            family="tensor_copy", dtype=conv_state_dtype,
+            metadata=(
+                ("state_scope", "conv_history"),
+                ("effect_role", "conv_tail_publish"),
+                ("source", "vllm_ascend/ops/gdn.py:608"),
+            ),
+        )
     return conv

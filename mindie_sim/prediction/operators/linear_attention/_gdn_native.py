@@ -18,11 +18,13 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Literal
 
+from mindie_sim.schema.common import ModelingError, align_up
 from mindie_sim.schema.datapath import SourceRef
 
 from ...mechanism import OperatorPlan, Work
 from ...program import (
     KernelProgram,
+    ParallelProgram,
     PipelineProgram,
     RecipeContext,
     Stage,
@@ -35,6 +37,7 @@ from .common import (
     GDN_CHUNK64_TOKENS,
     LinearAttentionContract,
     Phase,
+    _ARCH22_ID,
     analyze_state_residency,
     bind_phase,
     ceil_div,
@@ -44,6 +47,14 @@ from .common import (
     owner_units,
     transfer,
     verify_native_gdn_abi,
+)
+from .gdn_recurrent import (
+    QK_CAST_SCALE_OPS_PER_LANE,
+    VECTOR_LANE_ALIGNMENT,
+    head_ownership,
+    head_runs,
+    kernel_work_terms,
+    state_value_step,
 )
 
 TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
@@ -90,14 +101,28 @@ ARCH35_GDN_AIV_MTE2_QKV_PANELS = 3
 
 # recurrent_gated_delta_rule_arch{22,35}.h exact per-state-element op counts:
 #   Both Arch22 (Muls + MatVecMul + MulAddDst) and Arch35 (VecMulMatVF*2 + OuterAddVF) perform
-#   3 pre-ALU passes + 1 P09_reduce(k) + 1 q-ALU + 1 P09_reduce(q), plus BF16<->FP32 casts at P09_cast.
-RGDR_PRE_ALU_PASSES = 3
-RGDR_ARCH35_VSTEP_ELEMS = 8192  # recurrent_gated_delta_rule_arch35.h:149: vStep_ = 8192 / alignDK_
+#   decay + k-mul (2*ak), P09_reduce(k) (ak-1), delta + OuterAdd (2*ak+2), state copy/cast (ak),
+#   q-mul + attn_cast (ak+1), and P09_reduce(q) (ak-1) per dv row, plus gamma/Q/K/V casts.
+RGDR_UPD_CORE_PASSES = 2
+RGDR_GAMMA_KEY_OPS_PER_LANE = 1 + 2 + QK_CAST_SCALE_OPS_PER_LANE
 RGDR_PIPE_V_PER_VSTEP_TOKEN = 10  # recurrent_gated_delta_rule_arch{22,35}.h: 10 PipeBarrier<PIPE_V> per tile-token
 RGDR_QUEUE_SYNCS_PER_HEAD = 10  # CopyInGamaK/QK/V/State + CopyOutState/Attn EnQue/DeQue handshakes
 RGDR_MS_PER_S = 1000.0
 GDN_REF_HEAD_DIM = 128
 GDN_REF_DIM_SUM = float(GDN_REF_HEAD_DIM * 2)
+# recurrent_gated_delta_rule_tiling.cpp:630-661 Arch22 CalUbSize constants
+ARCH22_MAX_MTP = 8
+ARCH22_RESERVED_UB_BYTES = 128
+ARCH22_FP32_BLOCK_ELEMS = 8
+ARCH22_QKV_QUEUE_K_BYTES = 4
+ARCH22_QKV_QUEUE_V_BYTES = 2
+ARCH22_GAMA_QUEUE_BYTES = 4
+ARCH22_BETA_QUEUE_BYTES = 2
+ARCH22_QKV_UB_K_BYTES = 8
+ARCH22_QKV_UB_V_BYTES = 4
+ARCH22_QKV_UB_BETA_BYTES = 4
+ARCH22_STATE_UB_K_COEFF = 8
+ARCH22_STATE_UB_FIXED_COEFF = 12
 
 
 def _rgdr_reduce_ratio(rc: RecipeContext) -> float:
@@ -119,20 +144,90 @@ def _rgdr_reduce_ratio(rc: RecipeContext) -> float:
     raise ModelingError("rgdr_missing_calibrated_vector_reduce_rate")
 
 
-def _rgdr_cast_ms_per_aiv(rc: RecipeContext, cast_bytes_per_head: float) -> float:
-    """Return calibrated P09_cast latency in ms for one head's BF16<->FP32 cast on one AIV."""
-    if cast_bytes_per_head <= 0.0:
-        return 0.0
+def _rgdr_cast_ratio(rc: RecipeContext) -> float:
+    """Ratio of calibrated P07 vector ALU rate to P09 FP32-equivalent cast element rate."""
     table = getattr(rc, "primitive_table", None)
     if table is not None and hasattr(table, "cell"):
+        alu = table.cell("P07_vec_alu").band("vec_alu_ops_per_s_per_aiv").p50
         cast_bps = table.cell("P09_vec_reduce_cast").band("cast_bytes_per_s_per_aiv").p50
-        if cast_bps is None or float(cast_bps) <= 0.0:
+        if alu is None or cast_bps is None or float(cast_bps) <= 0.0:
             raise ModelingError("rgdr_missing_calibrated_cast_primitive_band")
-        return (cast_bytes_per_head / float(cast_bps)) * RGDR_MS_PER_S
+        return max(1.0, float(alu) / (float(cast_bps) / float(FP32_BYTES)))
+    vec_key = rc.resource_names.get("vector", "vector")
+    vec_rate = float(rc.rates.get(vec_key, rc.rates.get("vector", 0.0)) or 0.0) * RGDR_MS_PER_S
     cast_rate = rc.service_rate("cast") or rc.service_rate("vector_cast")
-    if cast_rate and float(cast_rate) > 0.0:
-        return (cast_bytes_per_head / float(cast_rate)) * RGDR_MS_PER_S
+    if vec_rate > 0.0 and cast_rate and float(cast_rate) > 0.0:
+        return max(1.0, vec_rate / (float(cast_rate) / float(FP32_BYTES)))
     raise ModelingError("rgdr_missing_calibrated_cast_rate")
+
+
+def _arch22_head_ownership(
+    lengths: tuple[int, ...], heads: int, blocks: int,
+) -> tuple[tuple[tuple[int, int], ...], ...]:
+    """Arch22 IsCurrentBlock (arch22.h:148,384): avgload = ceil(total_tokens * Hv / blocks)."""
+    target = ceil_div(sum(lengths) * heads, blocks)
+    owners: list[list[tuple[int, int]]] = [[] for _ in range(blocks)]
+    owner, load = 0, 0
+    for seq, q in enumerate(lengths):
+        if q <= 0:
+            continue
+        remaining = heads
+        while remaining:
+            count = min(remaining, ceil_div(target - load, q))
+            owners[owner].append((seq, count))
+            remaining -= count
+            load += count * q
+            if load >= target:
+                owner += 1
+                load = 0
+    return tuple(tuple(segments) for segments in owners if segments)
+
+
+def _arch22_v_step(
+    ctx: OperatorPlanningContext, dk: int, dv: int, nv: int, state_elem: int,
+) -> int:
+    """Host-selected Arch22 vStep (recurrent_gated_delta_rule_tiling.cpp:630-661)."""
+    ub_raw = dict(getattr(ctx.geometry, "buffers", ())).get("ub")
+    if ub_raw is None or int(ub_raw) <= 0:
+        raise missing("linear_attention_arch22_ub_missing", "Arch22 recurrent GDN requires declared UB capacity")
+    ub_size = int(ub_raw)
+    a_nv = align_up(nv, VECTOR_LANE_ALIGNMENT)
+    a_dv = align_up(dv, VECTOR_LANE_ALIGNMENT)
+    a_dk = align_up(dk, VECTOR_LANE_ALIGNMENT)
+    used = (
+        ARCH22_MAX_MTP * (ARCH22_QKV_QUEUE_K_BYTES * a_dk + ARCH22_QKV_QUEUE_V_BYTES * a_dv)
+        + ARCH22_RESERVED_UB_BYTES
+        + ARCH22_MAX_MTP * (ARCH22_GAMA_QUEUE_BYTES + ARCH22_BETA_QUEUE_BYTES) * a_nv
+        + ARCH22_MAX_MTP * (ARCH22_QKV_UB_K_BYTES * a_dk + ARCH22_QKV_UB_V_BYTES * a_dv + ARCH22_QKV_UB_BETA_BYTES * a_nv)
+    )
+    coeff = (2 * state_elem + ARCH22_STATE_UB_K_COEFF) * a_dk + ARCH22_STATE_UB_FIXED_COEFF
+    raw_step = ((ub_size - used) // coeff // ARCH22_FP32_BLOCK_ELEMS) * ARCH22_FP32_BLOCK_ELEMS
+    if raw_step < ARCH22_FP32_BLOCK_ELEMS:
+        raise missing("linear_attention_gdn_state_tile_overflow", "Arch22 recurrent GDN state tile exceeds UB")
+    rptime = ceil_div(dv, raw_step)
+    return align_up(ceil_div(dv, rptime), ARCH22_FP32_BLOCK_ELEMS)
+
+
+def _owner_compacted_runs(
+    lengths: tuple[int, ...], segments: tuple[tuple[int, int], ...],
+) -> tuple[tuple[int, int, int], ...]:
+    """Compact consecutive equal-q segments while counting distinct participating sequences."""
+    runs: list[tuple[int, int, int]] = []
+    cur_q: int | None = None
+    cur_heads = 0
+    cur_seqs = 0
+    for seq, head_count in segments:
+        q = lengths[seq]
+        if q == cur_q:
+            cur_heads += head_count
+            cur_seqs += 1
+        else:
+            if cur_heads:
+                runs.append((int(cur_q), cur_heads, cur_seqs))
+            cur_q, cur_heads, cur_seqs = q, head_count, 1
+    if cur_heads:
+        runs.append((int(cur_q), cur_heads, cur_seqs))
+    return tuple(runs)
 
 
 def _cap_vec_stage(st: Stage, rc: RecipeContext, ratio: float) -> Stage:
@@ -190,6 +285,130 @@ def compact_lane_pipeline(
     return PipelineProgram(count, slots, tile_fn)
 
 
+def _build_rgdr_run_stages(
+    rc: RecipeContext,
+    ctx: OperatorPlanningContext,
+    *,
+    c: LinearAttentionContract,
+    q: int,
+    head_count: int,
+    seq_count: int,
+    aiv_id: int,
+    is_arch22: bool,
+    elem: int,
+    gate_elem: int,
+    beta_elem: int,
+    slot_bytes: int,
+    v_tiles: int,
+    init_vec_head: int,
+    prek_vec_tok: int,
+    redk_vec_tok: int,
+    upd_core_vec_tok: int,
+    state_copy_vec_tok: int,
+    qalu_vec_tok: int,
+    redq_vec_tok: int,
+    red_ratio: float,
+    cast_ratio: float,
+    pipe_v_ms: float,
+    flag_ms: float,
+) -> tuple[Stage, ...]:
+    """Emit per-owner ordered MTE2/Vector/MTE3 stages for Arch22 or Arch35 RGDR."""
+    owner = (aiv_id,)
+    gb_mte2 = seq_count * q * c.hv * (gate_elem + beta_elem) if is_arch22 else 0
+    run_mte2 = head_count * (slot_bytes + q * (2 * c.dk + c.dv) * elem) + gb_mte2
+    run_scalar = 0 if is_arch22 else head_count * q * (gate_elem + beta_elem * v_tiles)
+    run_state_mte3 = head_count * slot_bytes
+    run_attn_mte3 = head_count * c.dv * elem
+    read_work = transfer(ctx, read=run_mte2) + (Work(resources={"hbm": run_scalar}) if run_scalar else Work())
+    init_stage = bind_phase(
+        Phase("rgdr_init", Work(resources={"vector": head_count * init_vec_head}), ("rgdr_read",)),
+        rc, ctx, (), owner,
+    )
+    if cast_ratio > 1.0:
+        init_stage = _cap_vec_stage(init_stage, rc, cast_ratio)
+    stages: list[Stage] = [
+        bind_phase(Phase("rgdr_read", read_work), rc, ctx, (), owner),
+        init_stage,
+    ]
+    prev_vec = "rgdr_init"
+    prev_mte3: str | None = None
+    for t in range(q):
+        pk_name, rk_name = f"rgdr_prek_{t}", f"rgdr_redk_{t}"
+        up_name, sp_name = f"rgdr_upd_{t}", f"rgdr_stprep_{t}"
+        qa_name, rq_name = f"rgdr_qalu_{t}", f"rgdr_redq_{t}"
+        sw_name, ow_name = f"rgdr_state_write_{t}", f"rgdr_out_write_{t}"
+        stages.append(bind_phase(
+            Phase(pk_name, Work(resources={"vector": head_count * prek_vec_tok}), (prev_vec,)),
+            rc, ctx, (), owner,
+        ))
+        stages.append(_cap_vec_stage(
+            bind_phase(Phase(rk_name, Work(resources={"vector": head_count * redk_vec_tok}), (pk_name,)),
+                       rc, ctx, (), owner),
+            rc, red_ratio,
+        ))
+        stages.append(bind_phase(
+            Phase(up_name, Work(resources={"vector": head_count * upd_core_vec_tok}), (rk_name,)),
+            rc, ctx, (), owner,
+        ))
+        if is_arch22:
+            # arch22.h:295-308,374-376: query dot + reduce finish before state cast/copy and MTE3 stores.
+            stages.append(bind_phase(
+                Phase(qa_name, Work(resources={"vector": head_count * qalu_vec_tok}), (up_name,)),
+                rc, ctx, (), owner,
+            ))
+            stages.append(_cap_vec_stage(
+                bind_phase(Phase(rq_name, Work(resources={"vector": head_count * redq_vec_tok}), (qa_name,)),
+                           rc, ctx, (), owner),
+                rc, red_ratio,
+            ))
+            stprep_stage = bind_phase(
+                Phase(sp_name, Work(resources={"vector": head_count * state_copy_vec_tok}), (rq_name,)),
+                rc, ctx, (), owner,
+            )
+            if cast_ratio > 1.0:
+                stprep_stage = _cap_vec_stage(stprep_stage, rc, cast_ratio)
+            stages.append(stprep_stage)
+            ow_after = (rq_name, prev_mte3) if prev_mte3 is not None else (rq_name,)
+            stages.append(bind_phase(Phase(ow_name, transfer(ctx, write=run_attn_mte3), ow_after), rc, ctx, (), owner))
+            stages.append(bind_phase(Phase(sw_name, transfer(ctx, write=run_state_mte3), (sp_name, ow_name)), rc, ctx, (), owner))
+            prev_vec = sp_name
+            prev_mte3 = sw_name
+        else:
+            # arch35.h:438-445: CopyOutState overlaps query dot + reduce; CopyAttentionOut strictly follows reduce.
+            stprep_stage = bind_phase(
+                Phase(sp_name, Work(resources={"vector": head_count * state_copy_vec_tok}), (up_name,)),
+                rc, ctx, (), owner,
+            )
+            if cast_ratio > 1.0:
+                stprep_stage = _cap_vec_stage(stprep_stage, rc, cast_ratio)
+            stages.append(stprep_stage)
+            sw_after = (sp_name, prev_mte3) if prev_mte3 is not None else (sp_name,)
+            stages.append(bind_phase(Phase(sw_name, transfer(ctx, write=run_state_mte3), sw_after), rc, ctx, (), owner))
+            stages.append(bind_phase(
+                Phase(qa_name, Work(resources={"vector": head_count * qalu_vec_tok}), (sp_name,)),
+                rc, ctx, (), owner,
+            ))
+            stages.append(_cap_vec_stage(
+                bind_phase(Phase(rq_name, Work(resources={"vector": head_count * redq_vec_tok}), (qa_name,)),
+                           rc, ctx, (), owner),
+                rc, red_ratio,
+            ))
+            stages.append(bind_phase(
+                Phase(ow_name, transfer(ctx, write=run_attn_mte3), (rq_name, sw_name)),
+                rc, ctx, (), owner,
+            ))
+            prev_vec = rq_name
+            prev_mte3 = ow_name
+    barrier_ms = head_count * (
+        q * v_tiles * RGDR_PIPE_V_PER_VSTEP_TOKEN * pipe_v_ms
+        + RGDR_QUEUE_SYNCS_PER_HEAD * flag_ms
+    )
+    if barrier_ms > 0.0:
+        tail_after = (prev_vec, prev_mte3) if prev_mte3 is not None else (prev_vec,)
+        stages.append(Stage("rgdr_sync", after=tail_after, latency=barrier_ms, keep_empty=True))
+    return tuple(stages)
+
+
 def build_native_recurrent_gdn(
     c: LinearAttentionContract, ctx: OperatorPlanningContext,
 ) -> OperatorPlan:
@@ -199,134 +418,120 @@ def build_native_recurrent_gdn(
     if not aivs:
         raise missing("linear_attention_no_physical_owner", "Recurrent GDN requires AIV owners")
 
+    is_arch22 = ctx.compute_arch.arch_id == _ARCH22_ID
     elem = element_bytes(c.dtype)
     state_elem = element_bytes(c.state_dtype)
     gate_elem = element_bytes(c.gate_dtype)
     beta_elem = element_bytes(c.beta_dtype)
-    n_seqs = len(c.lengths)
     total_tokens = sum(c.lengths)
-    max_q = max(c.lengths)
-    total_heads = n_seqs * c.hv
-    active_aivs = min(len(aivs), total_heads)
-    waves = ceil_div(total_heads, active_aivs)
-    v_step = max(1, min(c.dv, RGDR_ARCH35_VSTEP_ELEMS // max(1, c.dk)))
+    total_heads = sum(length > 0 for length in c.lengths) * c.hv
+    if total_heads == 0:
+        return make_plan(
+            ctx, RECURRENT_GDN_ABI, (), sources=RECURRENT_GDN_SOURCES,
+            owners=0, program=lambda _rc: KernelProgram(()),
+            metadata={"template": "native_recurrent_gdn", "empty_active_sequences": True,
+                      "active_aivs": 0, "waves": 0, "state_contraction_ops": 0},
+        )
+    blocks = min(len(aivs), total_heads)
+    ownership = (
+        _arch22_head_ownership(c.lengths, c.hv, blocks)
+        if is_arch22
+        else head_ownership(c.lengths, c.hv, blocks)
+    )
+    active_aivs = len(ownership)
+    owner_heads = tuple(sum(count for _, count in segments) for segments in ownership)
+    waves = max(owner_heads)
+    ak = align_up(c.dk, VECTOR_LANE_ALIGNMENT)
+    av = align_up(c.dv, VECTOR_LANE_ALIGNMENT)
+    v_step = (
+        _arch22_v_step(ctx, c.dk, c.dv, c.hv, state_elem)
+        if is_arch22
+        else state_value_step(ak)
+    )
+    if not v_step:
+        raise missing("linear_attention_gdn_state_tile_overflow", "Recurrent GDN state tile exceeds UB")
     v_tiles = ceil_div(c.dv, v_step)
 
     slot_bytes = c.dk * c.dv * state_elem
-    # recurrent_gated_delta_rule_arch35.h:438,465: CopyInState/CopyOutState execute unconditionally on in-place state.
-    state_read = total_heads * slot_bytes
-    state_write = total_tokens * c.hv * slot_bytes
-    qkv_read = total_tokens * (2 * c.hk * c.dk * elem + c.hv * (c.dv * elem + gate_elem + beta_elem))
-    out_write = total_tokens * c.hv * c.dv * elem
-    mte2_total = state_read + qkv_read
-    mte3_total = state_write + out_write
+    # recurrent_gated_delta_rule_arch{22,35}.h: every value-head owner copies Q, K, V and
+    # unconditionally reads/writes in-place state, sharing gdn_recurrent.kernel_work_terms.
+    mte2_base, _, mte3_total, vec_ops = kernel_work_terms(
+        c.lengths, c.hv, c.dk, c.dv, input_bytes=elem, state_bytes=state_elem,
+    )
+    if is_arch22:
+        # arch22.h:165-170,333-354: one whole-sequence gamma/beta MTE2 copy per participating (owner, seq).
+        gb_mte2_total = sum(
+            c.lengths[seq] * c.hv * (gate_elem + beta_elem)
+            for segments in ownership for seq, _ in segments
+        )
+        mte2_total = mte2_base + gb_mte2_total
+        scalar_total = 0
+    else:
+        mte2_total = mte2_base
+        scalar_total = total_tokens * c.hv * (gate_elem + beta_elem * v_tiles)
 
-    needs_state_cast = 1 if state_elem < FP32_BYTES else 0
-    state_elems = c.dk * c.dv
-    cast_bytes_per_head = float(state_elems * FP32_BYTES) if needs_state_cast else 0.0
-    pre_alu_ops = total_tokens * c.hv * RGDR_PRE_ALU_PASSES * state_elems
-    red_k_ops = total_tokens * c.hv * state_elems
-    q_alu_ops = total_tokens * c.hv * state_elems
-    red_q_ops = total_tokens * c.hv * state_elems
-    vec_ops = pre_alu_ops + red_k_ops + q_alu_ops + red_q_ops
+    needs_state_cast = state_elem < FP32_BYTES
+    init_vec_head = ak * c.dv
+    prek_vec_tok = RGDR_GAMMA_KEY_OPS_PER_LANE * ak + av + 2 * ak * c.dv
+    redk_vec_tok = (ak - 1) * c.dv
+    upd_core_vec_tok = (RGDR_UPD_CORE_PASSES * ak + 2) * c.dv
+    state_copy_vec_tok = ak * c.dv
+    qalu_vec_tok = (ak + 1) * c.dv
+    redq_vec_tok = (ak - 1) * c.dv
 
-    read_phase = Phase("rgdr_read", transfer(ctx, read=mte2_total))
+    read_work = transfer(ctx, read=mte2_total) + (Work(resources={"hbm": scalar_total}) if scalar_total else Work())
+    read_phase = Phase("rgdr_read", read_work)
     vec_phase = Phase("rgdr_compute", Work(resources={"vector": vec_ops}), ("rgdr_read",))
     write_phase = Phase("rgdr_write", transfer(ctx, write=mte3_total), ("rgdr_compute",))
     totals = (read_phase, vec_phase, write_phase)
     report = analyze_state_residency(c, ctx, persistent=True)
-    full_waves, rem_heads = divmod(total_heads, active_aivs)
 
-    def lower(rc: RecipeContext) -> KernelProgram:
+    def lower(rc: RecipeContext) -> KernelProgram | ParallelProgram:
         red_ratio = _rgdr_reduce_ratio(rc)
-        cast_ms = _rgdr_cast_ms_per_aiv(rc, cast_bytes_per_head)
-        barrier_ms = (
-            v_tiles * RGDR_PIPE_V_PER_VSTEP_TOKEN * p12_pipe_v_ms(rc)
-            + RGDR_QUEUE_SYNCS_PER_HEAD * p12_flag_ms(rc)
-        )
+        cast_ratio = _rgdr_cast_ratio(rc) if needs_state_cast else 1.0
+        pipe_v_ms = p12_pipe_v_ms(rc)
+        flag_ms = p12_flag_ms(rc)
 
-        def _wave_stages(k_heads: int) -> tuple[Stage, ...]:
-            share = k_heads / float(total_heads)
-            wave_aivs = aivs[:k_heads]
-            w_mte2 = mte2_total * share
-            w_mte3_tok = (mte3_total * share) / float(max_q)
-            w_pre_tok = (pre_alu_ops * share) / float(max_q)
-            w_rk_tok = (red_k_ops * share) / float(max_q)
-            w_qa_tok = (q_alu_ops * share) / float(max_q)
-            w_rq_tok = (red_q_ops * share) / float(max_q)
+        def _owner_program(aiv_id: int, segments: tuple[tuple[int, int], ...]) -> KernelProgram | PipelineProgram:
+            runs = _owner_compacted_runs(c.lengths, segments)
+            run_kwargs = dict(
+                c=c, aiv_id=aiv_id, is_arch22=is_arch22, elem=elem, gate_elem=gate_elem,
+                beta_elem=beta_elem, slot_bytes=slot_bytes, v_tiles=v_tiles,
+                init_vec_head=init_vec_head, prek_vec_tok=prek_vec_tok,
+                redk_vec_tok=redk_vec_tok, upd_core_vec_tok=upd_core_vec_tok,
+                state_copy_vec_tok=state_copy_vec_tok, qalu_vec_tok=qalu_vec_tok,
+                redq_vec_tok=redq_vec_tok, red_ratio=red_ratio, cast_ratio=cast_ratio,
+                pipe_v_ms=pipe_v_ms, flag_ms=flag_ms,
+            )
+            if len(runs) == 1:
+                q_i, h_i, s_i = runs[0]
+                return KernelProgram(_build_rgdr_run_stages(rc, ctx, q=q_i, head_count=h_i, seq_count=s_i, **run_kwargs))
+            return PipelineProgram(
+                len(runs), 1,
+                lambda idx, r=runs, kw=run_kwargs: (Stage(
+                    "run",
+                    program=KernelProgram(_build_rgdr_run_stages(
+                        rc, ctx, q=r[idx][0], head_count=r[idx][1], seq_count=r[idx][2], **kw,
+                    )),
+                ),),
+            )
 
-            # CopyInState + CopyInQK/V execute synchronously before the Q token loop (arch{22,35}.h:361,465).
-            stages: list[Stage] = [
-                bind_phase(Phase("rgdr_read", transfer(ctx, read=w_mte2)), rc, ctx, (), wave_aivs),
-            ]
-            prev_vec = "rgdr_read"
-            if cast_ms > 0.0:
-                stages.append(Stage("rgdr_cast_in", after=(prev_vec,), latency=cast_ms, keep_empty=True))
-                prev_vec = "rgdr_cast_in"
-            prev_mte3: str | None = None
-            for t in range(max_q):
-                pre_name = f"rgdr_pre_{t}"
-                rk_name = f"rgdr_redk_{t}"
-                co_name = f"rgdr_castout_{t}"
-                wr_name = f"rgdr_write_{t}"
-                qa_name = f"rgdr_qalu_{t}"
-                rq_name = f"rgdr_redq_{t}"
-                stages.append(bind_phase(
-                    Phase(pre_name, Work(resources={"vector": w_pre_tok}), (prev_vec,)),
-                    rc, ctx, (), wave_aivs,
-                ))
-                stages.append(_cap_vec_stage(
-                    bind_phase(Phase(rk_name, Work(resources={"vector": w_rk_tok}), (pre_name,)),
-                               rc, ctx, (), wave_aivs),
-                    rc, red_ratio,
-                ))
-                after_pre = rk_name
-                if cast_ms > 0.0:
-                    stages.append(Stage(co_name, after=(rk_name,), latency=cast_ms, keep_empty=True))
-                    after_pre = co_name
-                # CopyOutState (SINGLE_BUFFER MTE3) overlaps with query VecMulMat + ReduceSum (arch35.h:438-445).
-                wr_after = (after_pre, prev_mte3) if prev_mte3 is not None else (after_pre,)
-                stages.append(bind_phase(
-                    Phase(wr_name, transfer(ctx, write=w_mte3_tok), wr_after),
-                    rc, ctx, (), wave_aivs,
-                ))
-                stages.append(bind_phase(
-                    Phase(qa_name, Work(resources={"vector": w_qa_tok}), (after_pre,)),
-                    rc, ctx, (), wave_aivs,
-                ))
-                stages.append(_cap_vec_stage(
-                    bind_phase(Phase(rq_name, Work(resources={"vector": w_rq_tok}), (qa_name,)),
-                               rc, ctx, (), wave_aivs),
-                    rc, red_ratio,
-                ))
-                prev_vec = rq_name
-                prev_mte3 = wr_name
-            if barrier_ms > 0.0:
-                tail_after = (prev_vec, prev_mte3) if prev_mte3 is not None else (prev_vec,)
-                stages.append(Stage("rgdr_sync", after=tail_after, latency=barrier_ms, keep_empty=True))
-            return tuple(stages)
-
-        if full_waves == 1 and rem_heads == 0:
-            return KernelProgram(_wave_stages(active_aivs))
-        full_prog = (
-            KernelProgram(_wave_stages(active_aivs))
-            if full_waves == 1
-            else PipelineProgram(full_waves, 1, lambda _i: _wave_stages(active_aivs))
-        )
-        if rem_heads == 0:
-            return KernelProgram((Stage("rgdr_waves", program=full_prog),))
-        return KernelProgram((
-            Stage("rgdr_waves", program=full_prog),
-            Stage("rgdr_tail_wave", after=("rgdr_waves",), program=KernelProgram(_wave_stages(rem_heads))),
-        ))
+        owner_progs = tuple(_owner_program(aivs[idx], segs) for idx, segs in enumerate(ownership))
+        return owner_progs[0] if len(owner_progs) == 1 else ParallelProgram(owner_progs)
 
     return make_plan(
         ctx, RECURRENT_GDN_ABI, totals, sources=RECURRENT_GDN_SOURCES,
         owners=active_aivs, program=lower,
         metadata={
             "template": "native_recurrent_gdn", "active_aivs": active_aivs, "waves": waves,
+            "v_step": v_step, "v_tiles": v_tiles,
             "state_tile_bytes": report.state_tile_bytes, "owner_ub_bytes": report.owner_ub_bytes,
             "state_contraction_ops": 2 * total_tokens * c.hv * c.dk * c.dv,
             "persistent_ub_resident": True,
+            "recurrent_head_schedule": {
+                "logical_heads": total_heads,
+                "active_aivs": active_aivs,
+                "owner_heads": owner_heads,
+            },
         },
     )
