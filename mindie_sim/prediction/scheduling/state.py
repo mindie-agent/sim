@@ -63,6 +63,7 @@ class StateLedger:
         # never the authority.
         self._pending: dict[tuple[str, float], dict[int, tuple[str, int]]] = {}
         self._commit_base: dict[tuple[str, float], int | None] = {}
+        self._empty_arbiters: set[tuple[str, float]] = set()
         for target, version in dict(initial or {}).items():
             if not isinstance(target, str) or not target:
                 raise FragmentContractError("state_target_invalid")
@@ -98,6 +99,7 @@ class StateLedger:
         return tuple(sorted(self._live.get(target, ())))
 
     def check_read(self, target: str, version: int | None, *, at: float) -> int:
+        self._prune(at)
         current = self._committed.get(target)
         if version is None:
             if current is None:
@@ -119,14 +121,18 @@ class StateLedger:
             target = effect.target
             live = self._live.setdefault(target, set())
             if action == "write":
+                key = target, at
+                base = (self._commit_base[key]
+                        if key in self._commit_base
+                        else self._committed.get(target))
                 current = self._committed.get(target)
                 version = effect.version
                 if version is None:
                     version = 1 if current is None else current + 1
                 version = _version(version, target)
-                if current is not None and version < current:
+                if base is not None and version < base:
                     raise FragmentContractError(
-                        f"state_write_behind_committed:{target}:{version}:{current}")
+                        f"state_write_behind_committed:{target}:{version}:{base}")
                 live.add(version)
                 if len(live) > self.version_limit:
                     raise FragmentContractError(
@@ -159,30 +165,43 @@ class StateLedger:
             raise FragmentContractError(
                 f"state_commit_behind_committed:{target}:{version}:{previous}")
         records = self._pending.setdefault(key, {})
-        records.setdefault(version, (arbiter, sequence))
+        competing = len(records) > 1 or (
+            len(records) == 1 and version not in records)
+        if competing and (not arbiter or key in self._empty_arbiters):
+            raise FragmentContractError(
+                f"state_effect_conflict_requires_arbiter:{target}")
+        if not arbiter:
+            self._empty_arbiters.add(key)
+        candidate = (arbiter, sequence)
+        existing = records.get(version)
+        if existing is None or candidate > existing:
+            records[version] = candidate
         if len(records) == 1:
             self._committed[target] = version
             self._retain(target, version, previous)
             return
-        if any(not item[0] for item in records.values()):
-            raise FragmentContractError(
-                f"state_effect_conflict_requires_arbiter:{target}")
         winner = max(records.items(),
-                     key=lambda item: (item[1][0], item[1][1]))
+                     key=lambda item: (item[1][0], item[1][1], item[0]))
         self._committed[target] = winner[0]
         self._retain(target, winner[0], previous)
 
-    def _retain(self, target: str, version: int, previous: int | None) -> None:
+    def _retain(self, target: str, version: int, previous: int | None,
+                *, closing: bool = False) -> None:
         live = self._live.setdefault(target, set())
-        # Keep every version at or ahead of the pre-commit base until a later
-        # timestamp. A same-time competing commit may still arrive after this
-        # one, and dropping its candidate first would turn a declared arbiter
-        # conflict into a spurious "not live" error.
-        floor = previous if previous is not None else version
         keep = {version}
         if previous is not None:
             keep.add(previous)
-        keep.update(item for item in live if item >= floor)
+        if closing:
+            keep.update(item for item in live if item >= version)
+        elif previous is not None:
+            # Keep every version at or ahead of the pre-commit base until a
+            # later timestamp so same-time competing commits stay live.
+            keep.update(item for item in live if item >= previous)
+        else:
+            # Uninitialized target: defer pruning lower candidates until this
+            # timestamp closes so a same-time higher-arbiter commit to a lower
+            # version cannot hit a spurious "not live" error.
+            keep.update(live)
         if len(keep) > self.version_limit:
             raise FragmentContractError(
                 f"state_live_versions_exceeded:{target}:"
@@ -193,6 +212,13 @@ class StateLedger:
         stale = [key for key in self._pending if key[1] < at]
         for key in stale:
             del self._pending[key]
-        stale = [key for key in self._commit_base if key[1] < at]
-        for key in stale:
-            del self._commit_base[key]
+        stale_empty = [key for key in self._empty_arbiters if key[1] < at]
+        for key in stale_empty:
+            self._empty_arbiters.discard(key)
+        stale_base = [key for key in self._commit_base if key[1] < at]
+        for key in stale_base:
+            target, _ = key
+            previous = self._commit_base.pop(key)
+            committed = self._committed.get(target)
+            if committed is not None:
+                self._retain(target, committed, previous, closing=True)
