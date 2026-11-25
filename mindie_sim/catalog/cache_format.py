@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from mindie_sim.catalog.cache_pools import (
@@ -21,8 +21,17 @@ from mindie_sim.catalog.cache_pools import (
     _ceil_div,
     exact_element_bytes,
 )
+from mindie_sim.schema.checkpoint import (
+    CacheQuantRule,
+    CheckpointProvenance,
+    CheckpointQuantMap,
+)
 from mindie_sim.schema.common import ModelingError, dtype_bytes
-from mindie_sim.schema.stack import CachePlacementRule, CachePlaneABI, CacheStateABI
+from mindie_sim.schema.stack import (
+    CachePlaneABI,
+    CacheStateABI,
+    resolve_checkpoint_cache_abis,
+)
 
 
 #: NoPE C8 block-quantized MLA cache: one FP8 row split into 128-element
@@ -693,293 +702,278 @@ def _row_planes_from_format(
                 offset_in_page=cursor,
                 alignment=fmt.alignment,
                 page_pitch=pitch,
-                allocation_frequency="page" if block_size > 1 else "token",
-                write_trigger="page_assign",
+                allocation_frequency="token",
+                write_trigger="append",
                 bytes_per_unit=pad_b,
             )
         )
     return tuple(planes)
 
 
-def _index_consumer_keys(model: Any, owner_layer: int, scope: str) -> tuple[str, ...]:
-    consumers: list[str] = []
-    for candidate in getattr(model, "layer_plans", ()):
-        if int(getattr(candidate, "index_k_owner_layer_id", -1)) == int(owner_layer):
-            consumers.append(f"{scope}:layer{candidate.index}:indexer")
-    return tuple(consumers)
+_SCHEMA_CACHE_TAGS = frozenset({
+    "FLOAT", "BF16", "BFLOAT16", "FP16", "FLOAT16",
+    "C8", "INT8", "INT8_SYM", "INT8_DYNAMIC", "FAQUANT", "FAKQUANT",
+    "FP8", "FP8_DYNAMIC", "FP8_E4M3", "FP8_E5M2",
+    "MXFP8", "MXFP8_DYNAMIC", MXFP_KV_TAG,
+})
 
 
-def _linear_cache_abis(
-    plan: Any,
-    parallel: Any,
-    *,
-    scope: str,
-    native_layer: int,
-    phase: str,
-    deployment_role: str,
-    runtime: Any,
-    stage: int,
-    checkpoint_digest: str,
-) -> list[CacheStateABI]:
-    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
-    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
-    kda_axis = str(dict(getattr(runtime, "metadata", ()) or ()).get("kda_parallel_axis", "")).lower()
-    shards = tp * (1 if (plan.attention != "kda" or kda_axis == "tp") else pcp)
-    rec_elems = _ceil_div(int(plan.recurrent_state_elements), shards)
-    rec_bytes = exact_element_bytes(rec_elems, str(plan.recurrent_state_dtype))
-    conv_elems = _ceil_div(int(plan.conv_state_elements), shards)
-    conv_bytes = exact_element_bytes(conv_elems, str(plan.conv_state_dtype))
-    rec_place = CachePlacementRule(
-        pp_stage=int(stage),
-        memory_tier="hbm",
-        token_ownership_axis="none",
-        state_shard_axis="tp_x_pcp" if (plan.attention == "kda" and shards > tp) else "tp",
+def _materialize_plane_bytes(planes: tuple[CachePlaneABI, ...]) -> tuple[CachePlaneABI, ...]:
+    return tuple(
+        plane if plane.bytes_per_unit > 0 else replace(plane, bytes_per_unit=plane.exact_bytes())
+        for plane in planes
     )
-    out: list[CacheStateABI] = []
-    if rec_bytes > 0:
-        out.append(
-            CacheStateABI(
-                scope=scope,
-                native_layer=native_layer,
-                component_role="recurrent_state",
-                producer_key=f"{scope}:layer{native_layer}:recurrent_state",
-                planes=(CachePlaneABI(
-                    plane_id=f"l{native_layer}.recurrent_state",
-                    plane_kind="payload",
-                    logical_axes=("elements",),
-                    logical_shape=(rec_elems,),
-                    physical_shape=(rec_elems,),
-                    dtype=str(plan.recurrent_state_dtype),
-                    allocation_frequency="request_slot",
-                    write_trigger="accepted_commit",
-                    bytes_per_unit=rec_bytes,
-                ),),
-                phase=phase,
-                deployment_role=deployment_role,
-                checkpoint_digest=checkpoint_digest,
-                placement=rec_place,
+
+
+def _mqsmla_packed_planes(
+    model: Any,
+    plan: Any,
+    region: str,
+    *,
+    phase: str,
+    block_size: int,
+) -> tuple[CachePlaneABI, ...] | None:
+    """Emit canonical MQSMLA packed planes matching ``mqsmla_layout.packed_row_parts``."""
+    del block_size
+    from mindie_sim.catalog.mqsmla_layout import (
+        HEAD_WIDTH,
+        NATIVE_GROUP,
+        ROPE_WIDTH,
+        packed_row_parts,
+    )
+
+    parts = packed_row_parts(model, region, int(plan.cache_row_elements), plan=plan, phase=phase)
+    if parts is None:
+        return None
+    data_b, scale_b, pad_b = parts
+    fmt = cache_format(model, region, plan=plan, phase=phase)
+    nope = HEAD_WIDTH - ROPE_WIDTH
+    rope_b = data_b - nope
+    scale_groups = nope // NATIVE_GROUP
+    pitch = data_b + scale_b + pad_b
+    planes: list[CachePlaneABI] = [
+        CachePlaneABI(
+            plane_id="mla_latent",
+            plane_kind="payload",
+            logical_axes=("tokens", "dim"),
+            logical_shape=(1, nope),
+            physical_shape=(1, nope),
+            dtype=fmt.dtype,
+            layout="packed_row",
+            group_axes=(1,),
+            group_extents=(NATIVE_GROUP,),
+            scale_dtype=fmt.scale_dtype,
+            suffix_shape=(ROPE_WIDTH,),
+            suffix_dtype=C8_MLA_ROTARY_DTYPE,
+            offset_in_page=0,
+            alignment=1,
+            page_pitch=pitch,
+            allocation_frequency="token",
+            write_trigger="append",
+            bytes_per_unit=nope,
+        ),
+        CachePlaneABI(
+            plane_id="mla_rotary",
+            plane_kind="suffix",
+            logical_axes=("tokens", "dim"),
+            logical_shape=(1, ROPE_WIDTH),
+            physical_shape=(1, ROPE_WIDTH),
+            dtype=C8_MLA_ROTARY_DTYPE,
+            layout="ND",
+            offset_in_page=nope,
+            alignment=1,
+            page_pitch=pitch,
+            allocation_frequency="token",
+            write_trigger="append",
+            bytes_per_unit=rope_b,
+        ),
+        CachePlaneABI(
+            plane_id="mla_latent_scale",
+            plane_kind="scale",
+            logical_axes=("tokens", "scale_groups"),
+            logical_shape=(1, scale_groups),
+            physical_shape=(1, scale_groups),
+            dtype=fmt.scale_dtype,
+            layout="ND",
+            group_axes=(1,),
+            group_extents=(NATIVE_GROUP,),
+            offset_in_page=data_b,
+            alignment=1,
+            page_pitch=pitch,
+            allocation_frequency="token",
+            write_trigger="append",
+            bytes_per_unit=scale_b,
+        ),
+    ]
+    if pad_b > 0:
+        planes.append(
+            CachePlaneABI(
+                plane_id="mla_padding",
+                plane_kind="padding",
+                logical_axes=("padding_bytes",),
+                logical_shape=(pad_b,),
+                physical_shape=(pad_b,),
+                dtype="uint8",
+                layout="ND",
+                offset_in_page=data_b + scale_b,
+                alignment=1,
+                page_pitch=pitch,
+                allocation_frequency="token",
+                write_trigger="append",
+                bytes_per_unit=pad_b,
             )
         )
-    if conv_bytes > 0:
-        kernel = max(1, int(getattr(plan, "conv_kernel", 1) or 1))
+    return tuple(planes)
+
+
+def _layer_checkpoint_for_cache(
+    model: Any,
+    plan: Any,
+    *,
+    phase: str,
+) -> tuple[CheckpointQuantMap, str, bool]:
+    metadata = dict(getattr(model, "metadata", ()) or ())
+    quant = getattr(model, "quant", None)
+    orig_native = str((getattr(quant, "native_format", "") if quant is not None else "") or "bf16").strip().lower()
+    native_dtype = orig_native
+    raw_kv = _declared_kv_tag(model).upper().replace("-", "_")
+    kv_scale = str(
+        metadata.get("kv_scale_dtype")
+        or (getattr(quant, "kv_scale_dtype", "") if quant is not None else "")
+        or ""
+    ).strip().lower()
+    if raw_kv in {"", "AUTO", "NONE"}:
+        kv_tag = "FLOAT"
+    elif raw_kv in {"FP32", "FLOAT32"}:
+        kv_tag = "FLOAT"
+        native_dtype = "fp32"
+    elif plan.attention == "mla" and raw_kv in {"INT8", "C8"}:
+        kv_tag = "INT8_DYNAMIC"
+        kv_scale = kv_scale or C8_MLA_SCALE_DTYPE
+    elif plan.attention == "mla" and raw_kv in {"FP8", "FP8_E4M3", "FP8_E5M2", "FP8_DYNAMIC"}:
+        kv_tag = raw_kv
+        kv_scale = kv_scale or NOPE_BLOCK_SCALE_DTYPE
+    elif raw_kv in _SCHEMA_CACHE_TAGS:
+        kv_tag = raw_kv
+    else:
+        kv_tag = "FLOAT"
+
+    idx_fmt = _resolve_index_cache_format(model, plan, phase=phase)
+    idx_raw = idx_fmt.dtype.upper().replace("-", "_")
+    custom_index = (
+        _lookup_region_decl(metadata, "index_k", plan=plan, phase=phase) is not None
+        or idx_raw not in _SCHEMA_CACHE_TAGS
+        or (idx_raw in {"FP32", "FLOAT32"} and native_dtype != "fp32")
+    )
+    if custom_index:
+        idx_tag = "FLOAT"
+    elif idx_raw in {"", "AUTO", "NONE"}:
+        idx_tag = orig_native.upper() if orig_native in {"bf16", "fp16"} else "FLOAT"
+    else:
+        idx_tag = idx_raw
+    idx_scale = "" if idx_fmt.scale_dtype == "none" else idx_fmt.scale_dtype
+    ckpt = CheckpointQuantMap(
+        provenance=CheckpointProvenance(
+            checkpoint_id=str(getattr(model, "name", "catalog") or "catalog"),
+            origin="explicit_synthetic_preset",
+            source_format="explicit_synthetic_preset",
+        ),
+        native_float_dtype=native_dtype,
+        cache_rule=CacheQuantRule(
+            kv_tag=kv_tag,
+            index_tag=idx_tag,
+            kv_scale_dtype=kv_scale,
+            index_scale_dtype=idx_scale,
+            provenance="native",
+        ),
+    )
+    return ckpt, native_dtype, custom_index
+
+
+def _split_recurrent_abi(
+    abi: CacheStateABI,
+    plan: Any,
+    *,
+    checkpoint_digest: str,
+    original_attention: str,
+) -> list[CacheStateABI]:
+    out: list[CacheStateABI] = []
+    rec_elems = int(getattr(plan, "recurrent_state_elements", 0) or 0)
+    conv_elems = int(getattr(plan, "conv_state_elements", 0) or 0)
+    for plane in _materialize_plane_bytes(abi.planes):
+        if plane.bytes_per_unit <= 0:
+            continue
+        role = "conv_history" if plane.plane_id == "conv_history" else "recurrent_state"
+        if role == "conv_history" and conv_elems <= 0:
+            continue
+        if role == "recurrent_state" and rec_elems <= 0:
+            continue
         out.append(
-            CacheStateABI(
-                scope=scope,
-                native_layer=native_layer,
-                component_role="conv_history",
-                producer_key=f"{scope}:layer{native_layer}:conv_history",
-                planes=(CachePlaneABI(
-                    plane_id=f"l{native_layer}.conv_history",
-                    plane_kind="payload",
-                    logical_axes=("elements",),
-                    logical_shape=(conv_elems,),
-                    physical_shape=(conv_elems,),
-                    dtype=str(plan.conv_state_dtype),
-                    allocation_frequency="request_slot",
-                    write_trigger="append",
-                    bytes_per_unit=conv_bytes,
-                ),),
-                phase=phase,
-                deployment_role=deployment_role,
-                checkpoint_digest=checkpoint_digest,
-                history_slots=max(1, kernel - 1),
-                placement=rec_place,
+            replace(
+                abi,
+                component_role=role,
+                producer_key=f"{abi.scope}.l{abi.native_layer}.{role}",
+                planes=(plane,),
+                checkpoint_digest=checkpoint_digest or abi.checkpoint_digest,
+                recipe_abi_id=f"{original_attention}_recurrent_state",
+                history_slots=abi.history_slots if role == "conv_history" else 0,
             )
         )
     return out
 
 
-def _gqa_cache_abis(
+def _overlay_explicit_kv_planes(
     model: Any,
     plan: Any,
+    abi: CacheStateABI,
     *,
-    scope: str,
-    native_layer: int,
+    parallel: Any,
     phase: str,
-    deployment_role: str,
-    tp: int,
     block: int,
-    interleave: int,
-    placement: CachePlacementRule,
-    checkpoint_digest: str,
+    metadata: Mapping[str, Any],
 ) -> list[CacheStateABI]:
+    if plan.attention == "mla":
+        if abi.component_role == "window_kv":
+            abi = replace(abi, compression_ratio=1)
+        region = (
+            "mla_kv" if abi.component_role == "mla_latent"
+            else ("window" if abi.component_role == "window_kv" else "compressed_kv")
+        )
+        mqsmla_planes = _mqsmla_packed_planes(model, plan, region, phase=phase, block_size=block)
+        if mqsmla_planes is not None:
+            return [replace(abi, planes=mqsmla_planes)]
+        if _lookup_region_decl(metadata, region, plan=plan, phase=phase) is not None:
+            fmt = cache_format(model, region, plan=plan, phase=phase)
+            return [replace(abi, planes=_row_planes_from_format(
+                fmt, int(plan.cache_row_elements), prefix=f"l{abi.native_layer}.{region}", block_size=block,
+            ))]
+        return [abi]
+    upper_tag = _declared_kv_tag(model).upper().replace("-", "_")
+    has_gqa_override = (
+        upper_tag not in {MXFP_KV_TAG, C8_KV_TAG, FAQUANT_KV_TAG}
+        and any(
+            _lookup_region_decl(metadata, reg, plan=plan, phase=phase) is not None
+            for reg in ("gqa_kv_key", "gqa_kv_value", "gqa_kv")
+        )
+    )
+    if not has_gqa_override:
+        return [abi]
     from mindie_sim.schema.parallel import local_kv_heads
 
-    if 0 <= plan.kv_owner_layer_id < plan.index:
-        return []
-    local_heads = local_kv_heads(plan.num_kv_heads, tp)
-    upper_tag = _declared_kv_tag(model).upper().replace("-", "_")
-    if upper_tag == MXFP_KV_TAG:
-        planes = mxfp8_kv_packet_planes(
-            local_heads, block, plan.head_dim, plan.head_dim,
-            plane_prefix=f"l{native_layer}.gqa",
-        )
-        return [
-            CacheStateABI(
-                scope=scope,
-                native_layer=native_layer,
-                component_role="kv_combined",
-                producer_key=f"{scope}:layer{native_layer}:gqa_kv",
-                planes=planes,
-                phase=phase,
-                deployment_role=deployment_role,
-                checkpoint_digest=checkpoint_digest,
-                kv_block_size=block,
-                kernel_block_size=block,
-                cp_interleave_size=interleave,
-                window=plan.window or None,
-                placement=placement,
-            )
-        ]
-    if upper_tag in {C8_KV_TAG, FAQUANT_KV_TAG}:
-        q_heads = max(local_heads, int(getattr(plan, "num_q_heads", 0) or local_heads) // max(1, tp))
-        planes = dense_c8_kv_planes(
-            local_heads, block, plan.head_dim,
-            faquant=(upper_tag == FAQUANT_KV_TAG),
-            num_q_heads=q_heads,
-            plane_prefix=f"l{native_layer}.gqa",
-        )
-        return [
-            CacheStateABI(
-                scope=scope,
-                native_layer=native_layer,
-                component_role="kv_combined",
-                producer_key=f"{scope}:layer{native_layer}:gqa_kv",
-                planes=planes,
-                phase=phase,
-                deployment_role=deployment_role,
-                checkpoint_digest=checkpoint_digest,
-                kv_block_size=block,
-                kernel_block_size=block,
-                cp_interleave_size=interleave,
-                window=plan.window or None,
-                placement=placement,
-            )
-        ]
+    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+    local_heads = local_kv_heads(plan.num_kv_heads or plan.num_heads or 1, tp)
     key_fmt, val_fmt, _shared = gqa_kv_formats(model, plan=plan, phase=phase)
-    side_width = local_heads * plan.head_dim
-    out: list[CacheStateABI] = []
-    for role, suffix, fmt in (("kv_k", "k", key_fmt), ("kv_v", "v", val_fmt)):
-        out.append(
-            CacheStateABI(
-                scope=scope,
-                native_layer=native_layer,
-                component_role=role,
-                producer_key=f"{scope}:layer{native_layer}:{role}",
-                planes=_row_planes_from_format(
-                    fmt, side_width, prefix=f"l{native_layer}.{suffix}", block_size=block,
-                ),
-                phase=phase,
-                deployment_role=deployment_role,
-                checkpoint_digest=checkpoint_digest,
-                kv_block_size=block,
-                kernel_block_size=block,
-                cp_interleave_size=interleave,
-                window=plan.window or None,
-                placement=placement,
-            )
-        )
-    return out
-
-
-def _mla_cache_abis(
-    model: Any,
-    plan: Any,
-    *,
-    scope: str,
-    native_layer: int,
-    phase: str,
-    deployment_role: str,
-    block: int,
-    interleave: int,
-    placement: CachePlacementRule,
-    checkpoint_digest: str,
-) -> list[CacheStateABI]:
-    region = "mla_kv" if plan.cache_kind == "dense" else "window"
-    role = "mla_latent" if plan.cache_kind == "dense" else "window_kv"
-    fmt = cache_format(model, region, plan=plan, phase=phase)
-    out = [
-        CacheStateABI(
-            scope=scope,
-            native_layer=native_layer,
+    kd = int(plan.head_dim)
+    vd = int(getattr(plan, "v_head_dim", 0) or kd)
+    return [
+        replace(
+            abi,
             component_role=role,
-            producer_key=f"{scope}:layer{native_layer}:{region}",
-            planes=_row_planes_from_format(
-                fmt, int(plan.cache_row_elements), prefix=f"l{native_layer}.{region}",
-                block_size=block,
-            ),
-            phase=phase,
-            deployment_role=deployment_role,
-            checkpoint_digest=checkpoint_digest,
-            kv_block_size=block,
-            kernel_block_size=block,
-            cp_interleave_size=interleave,
-            window=plan.window or None,
-            compression_ratio=max(1, int(plan.compress_ratio or 1)),
-            placement=placement,
+            producer_key=f"{abi.scope}.l{abi.native_layer}.{role}",
+            planes=_row_planes_from_format(fmt, local_heads * width, prefix=f"l{abi.native_layer}.{suffix}", block_size=block),
         )
+        for role, suffix, fmt, width in (("kv_k", "k", key_fmt, kd), ("kv_v", "v", val_fmt, vd))
     ]
-    if plan.owns_long_kv and plan.cache_kind != "dense":
-        comp_fmt = cache_format(model, "compressed_kv", plan=plan, phase=phase)
-        out.append(
-            CacheStateABI(
-                scope=scope,
-                native_layer=native_layer,
-                component_role="compressed_kv",
-                producer_key=f"{scope}:layer{native_layer}:compressed_kv",
-                planes=_row_planes_from_format(
-                    comp_fmt, int(plan.cache_row_elements),
-                    prefix=f"l{native_layer}.compressed_kv", block_size=block,
-                ),
-                phase=phase,
-                deployment_role=deployment_role,
-                checkpoint_digest=checkpoint_digest,
-                kv_block_size=block,
-                kernel_block_size=block,
-                cp_interleave_size=interleave,
-                compression_ratio=max(1, int(plan.compress_ratio or 1)),
-                placement=placement,
-            )
-        )
-    return out
-
-
-def _index_cache_abi(
-    model: Any,
-    plan: Any,
-    *,
-    scope: str,
-    native_layer: int,
-    phase: str,
-    deployment_role: str,
-    block: int,
-    interleave: int,
-    placement: CachePlacementRule,
-    checkpoint_digest: str,
-) -> CacheStateABI:
-    idx_fmt = _resolve_index_cache_format(model, plan, phase=phase)
-    consumers = _index_consumer_keys(model, plan.index, scope)
-    return CacheStateABI(
-        scope=scope,
-        native_layer=native_layer,
-        component_role="index_k",
-        producer_key=f"{scope}:layer{native_layer}:index_k",
-        consumer_keys=consumers,
-        planes=_row_planes_from_format(
-            idx_fmt, int(plan.index_dim), prefix=f"l{native_layer}.index_k",
-            block_size=block,
-        ),
-        phase=phase,
-        deployment_role=deployment_role,
-        checkpoint_digest=checkpoint_digest,
-        kv_block_size=block,
-        kernel_block_size=block,
-        cp_interleave_size=interleave,
-        compression_ratio=max(1, int(plan.compress_ratio or 1)),
-        pooling_ratio=max(1, int(plan.index_kpool or 1)),
-        tail_slots=(2 * int(plan.index_kpool) if int(plan.index_kpool or 0) > 1 else 0),
-        placement=placement,
-    )
 
 
 def resolve_layer_cache_abis(
@@ -994,49 +988,91 @@ def resolve_layer_cache_abis(
     stage: int = 0,
     checkpoint_digest: str = "",
 ) -> tuple[CacheStateABI, ...]:
-    """Build typed L0 ``CacheStateABI`` entries for one native layer owner."""
-    from mindie_sim.catalog.context_parallel import cp_interleave, layer_dcp_degree
+    """Build typed L0 ``CacheStateABI`` entries for one native layer owner.
+
+    Delegates core cache-ABI construction to the sole native L0 builder
+    :func:`mindie_sim.schema.stack.resolve_checkpoint_cache_abis`.
+    """
+    from mindie_sim.catalog.context_parallel import cp_interleave
 
     native_layer = int(getattr(plan, "native_layer_id", -1))
     if native_layer < 0:
         native_layer = int(plan.index)
     block = int(getattr(runtime, "kv_block_size", 0) or DEFAULT_CACHE_PAGE_BLOCK)
     interleave = int(cp_interleave(runtime)) if runtime is not None else block
-    cp_deg = layer_dcp_degree(plan, parallel)
-    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
-    placement = CachePlacementRule(
-        pp_stage=int(stage),
-        memory_tier="hbm",
-        token_ownership_axis="cp_striped" if cp_deg > 1 else "replicated",
-        replication_factor=max(1, tp // max(1, int(getattr(plan, "num_kv_heads", 1) or 1)))
-        if plan.attention in {"gqa", "projection_only"} else 1,
+    kda_axis_raw = str(dict(getattr(runtime, "metadata", ()) or ()).get("kda_parallel_axis", "")).lower()
+    kda_axis = "tp" if kda_axis_raw == "tp" else "tp_x_pcp"
+    target_scope = "draft" if scope in {"draft", "mtp", "dspark", "standalone_draft"} else "target"
+    scoped_plan = plan if getattr(plan, "scope", "target") == target_scope else replace(plan, scope=target_scope)
+    orig_attention = str(scoped_plan.attention or "").lower()
+    delegated_plan = (
+        replace(scoped_plan, attention="gdn")
+        if orig_attention in LINEAR_ATTENTION_KINDS and orig_attention not in {"kda", "gdn"}
+        else scoped_plan
     )
+
+    owner_ids = {int(plan.index), native_layer}
+    relevant: list[Any] = [delegated_plan]
+    for cand in getattr(model, "layer_plans", ()):
+        cand_native = int(getattr(cand, "native_layer_id", -1))
+        if cand_native < 0:
+            cand_native = int(cand.index)
+        if cand_native == native_layer or int(cand.index) == int(plan.index):
+            continue
+        if (
+            int(getattr(cand, "kv_owner_layer_id", -1)) in owner_ids
+            or int(getattr(cand, "index_k_owner_layer_id", -1)) in owner_ids
+        ):
+            cand_scope = "draft" if getattr(cand, "scope", "target") in {"draft", "mtp", "dspark", "standalone_draft"} else "target"
+            if cand_scope == target_scope:
+                relevant.append(cand)
+
+    ckpt, native_dtype, custom_index = _layer_checkpoint_for_cache(model, scoped_plan, phase=phase)
+    kv_abis, idx_abis, rec_abis = resolve_checkpoint_cache_abis(
+        tuple(relevant),
+        ckpt,
+        parallel,
+        native_dtype,
+        role=deployment_role,
+        phase=phase,
+        kv_block_size=block,
+        cp_interleave_size=interleave,
+        kda_parallel_axis=kda_axis,
+        stage=int(stage),
+    )
+
+    metadata = dict(getattr(model, "metadata", ()) or ())
     out: list[CacheStateABI] = []
-    if plan.attention in LINEAR_ATTENTION_KINDS:
-        out.extend(_linear_cache_abis(
-            plan, parallel, scope=scope, native_layer=native_layer, phase=phase,
-            deployment_role=deployment_role, runtime=runtime, stage=stage,
-            checkpoint_digest=checkpoint_digest,
+    for abi in rec_abis:
+        if abi.native_layer == native_layer and abi.scope == target_scope:
+            out.extend(_split_recurrent_abi(
+                abi, scoped_plan, checkpoint_digest=checkpoint_digest, original_attention=orig_attention,
+            ))
+    for abi in kv_abis:
+        if abi.native_layer != native_layer or abi.scope != target_scope:
+            continue
+        stamped = replace(
+            abi,
+            planes=_materialize_plane_bytes(abi.planes),
+            checkpoint_digest=checkpoint_digest or abi.checkpoint_digest,
+        )
+        out.extend(_overlay_explicit_kv_planes(
+            model, scoped_plan, stamped, parallel=parallel, phase=phase, block=block, metadata=metadata,
         ))
-    elif plan.attention in {"gqa", "projection_only"}:
-        out.extend(_gqa_cache_abis(
-            model, plan, scope=scope, native_layer=native_layer, phase=phase,
-            deployment_role=deployment_role, tp=tp, block=block,
-            interleave=interleave, placement=placement,
-            checkpoint_digest=checkpoint_digest,
-        ))
-    elif plan.attention == "mla":
-        out.extend(_mla_cache_abis(
-            model, plan, scope=scope, native_layer=native_layer, phase=phase,
-            deployment_role=deployment_role, block=block, interleave=interleave,
-            placement=placement, checkpoint_digest=checkpoint_digest,
-        ))
-    if getattr(plan, "owns_index_k", False):
-        out.append(_index_cache_abi(
-            model, plan, scope=scope, native_layer=native_layer, phase=phase,
-            deployment_role=deployment_role, block=block, interleave=interleave,
-            placement=placement, checkpoint_digest=checkpoint_digest,
-        ))
+    for abi in idx_abis:
+        if abi.native_layer != native_layer or abi.scope != target_scope:
+            continue
+        planes = (
+            _row_planes_from_format(
+                _resolve_index_cache_format(model, scoped_plan, phase=phase),
+                int(scoped_plan.index_dim),
+                prefix=f"l{native_layer}.index_k",
+                block_size=block,
+            )
+            if custom_index
+            else _materialize_plane_bytes(abi.planes)
+        )
+        out.append(replace(abi, planes=planes, checkpoint_digest=checkpoint_digest or abi.checkpoint_digest))
     return tuple(out)
 
 

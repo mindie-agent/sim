@@ -46,6 +46,17 @@ def _safe_bytes(dtype: str) -> float:
     return float(dtype_bytes(dtype))
 
 
+_FLOAT_DTYPE_CANON = {
+    "bf16": "bf16", "bfloat16": "bf16",
+    "fp16": "fp16", "float16": "fp16",
+    "fp32": "fp32", "float32": "fp32",
+}
+
+
+def _canonical_float_dtype(dtype: str) -> str:
+    return _FLOAT_DTYPE_CANON.get(str(dtype or "").strip().lower(), "bf16")
+
+
 def compute_dtype_for(quant: QuantSpec, category: str) -> tuple[str, str]:
     """Return (compute dtype, declared activation dtype) for a category."""
     quant = quant.for_category(category)
@@ -56,25 +67,32 @@ def compute_dtype_for(quant: QuantSpec, category: str) -> tuple[str, str]:
         return "bf16", "bf16"
     if fmt in {"fp16", "float16"}:
         return "fp16", "fp16"
-    if fmt in {"int8", "w8a8"}:
+    act = str(quant.activation_format).strip().lower()
+    if fmt == "w8a8":
         return "int8", "int8"
+    if fmt == "int8":
+        if act == "int8":
+            return "int8", "int8"
+        canon_act = _canonical_float_dtype(act)
+        return canon_act, canon_act
     if fmt in {"int4", "w4a8"}:
         # Packed weights do not imply quantized activations or INT8 compute.
-        if quant.activation_format == "int8":
+        if act == "int8":
             return "int8", "int8"
         return quant.activation_format, quant.activation_format
     if fmt in FP4_FORMATS:
-        act = str(quant.activation_format).strip().lower()
         if act in FP4_FORMATS:
             return "mxfp4", quant.activation_format
         if act in FP8_FORMATS:
             return ("fp8_e5m2" if act == "fp8_e5m2" else "fp8_e4m3"), quant.activation_format
-        return "bf16", quant.activation_format
+        return _canonical_float_dtype(act), quant.activation_format
     if fmt in FP8_FORMATS:
-        act = str(quant.activation_format).strip().lower()
         if act in FP8_FORMATS:
-            return "fp8_e4m3", "fp8_e4m3"
-        return "bf16", "bf16"
+            act_dt = "fp8_e5m2" if act == "fp8_e5m2" else "fp8_e4m3"
+            comp_dt = "fp8_e5m2" if (act_dt == "fp8_e5m2" or fmt == "fp8_e5m2") else "fp8_e4m3"
+            return comp_dt, act_dt
+        canon_act = _canonical_float_dtype(act)
+        return canon_act, canon_act
     raise ModelingError(f"compute_format_undeclared:{category}:{fmt}")
 
 
@@ -220,6 +238,8 @@ def precision_abi_for_gemm(
         raw_method = resolved.linear_method(category)
         if fmt in {"int4", "w4a8"}:
             raw_method = "w4a8" if act == "int8" else "w4a16"
+        elif fmt == "int8":
+            raw_method = "w8a8" if act == "int8" else "w8a16"
         method = raw_method  # type: ignore[assignment]
         if fmt in {"mxfp4", "fp4", "fp4_e2m1", "int4", "w4a8"}:
             weight_block = (1, max(1, int(resolved.expert_block)))
@@ -456,20 +476,51 @@ def vector_op(
     )
     default_read = float(elements) * bytes_per
     default_write = float(elements) * bytes_per
-    read_bytes = (
-        float(read_bytes_override)
-        if read_bytes_override is not None else default_read
-    )
-    write_bytes = (
-        float(write_bytes_override)
-        if write_bytes_override is not None else default_write
-    )
-    if hbm_bytes_override is not None:
-        hbm = float(hbm_bytes_override)
-    elif read_bytes_override is not None or write_bytes_override is not None:
-        hbm = read_bytes + write_bytes
+    rw = max(0.0, float(read_write))
+    if read_bytes_override is not None and write_bytes_override is not None:
+        read_bytes = float(read_bytes_override)
+        write_bytes = float(write_bytes_override)
+        hbm = float(hbm_bytes_override) if hbm_bytes_override is not None else read_bytes + write_bytes
+        if hbm_bytes_override is not None:
+            total_rw = read_bytes + write_bytes
+            if total_rw > 0.0 and total_rw != hbm:
+                scale = hbm / total_rw
+                read_bytes *= scale
+                write_bytes = hbm - read_bytes
+            elif total_rw == 0.0 and hbm > 0.0:
+                read_bytes, write_bytes = hbm, 0.0
+    elif read_bytes_override is not None:
+        read_bytes = float(read_bytes_override)
+        if hbm_bytes_override is not None:
+            hbm = max(read_bytes, float(hbm_bytes_override))
+            write_bytes = hbm - read_bytes
+        else:
+            write_bytes = default_write
+            hbm = read_bytes + write_bytes
+    elif write_bytes_override is not None:
+        write_bytes = float(write_bytes_override)
+        if hbm_bytes_override is not None:
+            hbm = max(write_bytes, float(hbm_bytes_override))
+            read_bytes = hbm - write_bytes
+        else:
+            read_bytes = default_read
+            hbm = read_bytes + write_bytes
     else:
-        hbm = float(elements) * float(read_write) * bytes_per
+        hbm = (
+            float(hbm_bytes_override)
+            if hbm_bytes_override is not None
+            else float(elements) * rw * bytes_per
+        )
+        if hbm <= 0.0:
+            read_bytes, write_bytes = 0.0, 0.0
+        elif rw <= 1.0:
+            read_bytes, write_bytes = hbm, 0.0
+        elif rw < 2.0:
+            read_bytes = hbm / rw
+            write_bytes = hbm - read_bytes
+        else:
+            write_bytes = hbm / rw
+            read_bytes = hbm - write_bytes
     shape = shape or (elements,)
     meta_map = dict(metadata)
     input_format = str(meta_map.get("input_format", dtype))
