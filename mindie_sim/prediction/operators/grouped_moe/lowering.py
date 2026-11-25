@@ -11,9 +11,10 @@ from collections import defaultdict
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 from functools import partial
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from ...mechanism import Work
 from ...ownership import unit_group
 from ...program import KernelProgram, Program, RecipeContext, Stage, scope_allocations
@@ -21,6 +22,22 @@ from ...runtime.ring_buffer import RingBuffer
 
 if TYPE_CHECKING:
     from .common import MoECohortSplit
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-ascend",
+        revision="7a7ed073c481d5e3a2fc2194c5b879efb2d373c0",
+        relative_path="vllm_ascend/ops/fused_moe/fused_moe.py",
+        source_sha256="0647bf1676132121f738cf0d7c569502b5c67a745558d6107e0a39e9bbd9d6c4",
+    ),
+    SourceRef(
+        repository="vllm-ascend",
+        revision="7a7ed073c481d5e3a2fc2194c5b879efb2d373c0",
+        relative_path="vllm_ascend/ops/fused_moe/prepare_finalize.py",
+        source_sha256="f42c57c2835494e886bf6deef054362ac1be9faaea7b1220a257210c7e996611",
+    ),
+)
 
 ROUTING_INDEX_BYTES = 4
 ROUTING_WEIGHT_BYTES = 4
@@ -56,8 +73,16 @@ def mx_scale_bytes(width: int, *, padded: bool = True) -> int:
     return ceil_div(width, MX_SCALE_GROUP_SIZE)
 
 
-def tensor_bytes(rows: int, width: int, dtype: str, *, scaled: bool = False) -> int:
-    scale = mx_scale_bytes(width) if dtype in MX_DTYPES else (PER_TOKEN_SCALE_BYTES if scaled else 0)
+def tensor_bytes(
+    rows: int, width: int, dtype: str, *, scaled: bool = False,
+    mx_scaled: bool = False, mx_padded: bool = True,
+) -> int:
+    if mx_scaled or dtype in MX_DTYPES:
+        scale = mx_scale_bytes(width, padded=mx_padded)
+    elif scaled:
+        scale = PER_TOKEN_SCALE_BYTES
+    else:
+        scale = 0
     return rows * (element_bytes(width, dtype) + scale)
 
 
@@ -134,6 +159,16 @@ class BoundedMoEProgram:
 
     stages: tuple[Stage, ...]
 
+    def bind_stream_owners(self, owners, datapath, **kwargs):
+        from mindie_sim.prediction.streams import bind_stage_to_stream
+        bound = tuple(
+            bind_stage_to_stream(stage, owners, datapath, **kwargs)
+            for stage in self.stages
+        )
+        if all(new is old for new, old in zip(bound, self.stages)):
+            return self
+        return replace(self, stages=bound)
+
     def start(self, engine, name, ready, *, owner=""):
         complete = engine.future(name + ":complete")
         successors = defaultdict(list)
@@ -157,14 +192,38 @@ class BoundedMoEProgram:
                 pending[stage.name] -= 1
                 if pending[stage.name] == 0:
                     del pending[stage.name]
+                    scoped_acq = scope_allocations(name, stage.acquire)
+                    scoped_free = scope_allocations(name, stage.free)
+                    extra = {}
+                    if stage.cohort_widened:
+                        extra["cohort_widened"] = stage.cohort_widened
+                    if stage.cohort_members:
+                        extra["cohort_members"] = stage.cohort_members
+                    if stage.program is not None:
+                        entry = engine.submit(
+                            f"{name}:{stage.name}", stage.work, latency=stage.latency,
+                            caps=stage.caps, acquire=scoped_acq, metadata=stage.metadata,
+                            placement=stage.placement, coupled=stage.coupled,
+                            priority=stage.priority, owner=owner, **extra,
+                        )
+                        nested_done = stage.program.start(
+                            engine, f"{name}:{stage.name}:program", entry, owner=owner,
+                        )
+                        engine.submit(
+                            f"{name}:{stage.name}:done", after=(nested_done,),
+                            free=scoped_free, owner=owner,
+                            native_hook=True, on_complete=partial(publish, stage.name),
+                        )
+                        continue
                     event = engine.submit(
-                        f"{name}:{stage.name}", stage.work,
-                        acquire=scope_allocations(name, stage.acquire),
-                        free=scope_allocations(name, stage.free), metadata=stage.metadata,
-                        placement=stage.placement, coupled=stage.coupled, owner=owner,
+                        f"{name}:{stage.name}", stage.work, latency=stage.latency,
+                        caps=stage.caps, acquire=scoped_acq, free=scoped_free,
+                        metadata=stage.metadata, placement=stage.placement,
+                        coupled=stage.coupled, priority=stage.priority, owner=owner,
                         native_hook=True, on_complete=partial(publish, stage.name),
+                        **extra,
                     )
-                    if stage.acquire or stage.free:
+                    if (stage.acquire or stage.free) and not stage.work and stage.latency <= 0.0:
                         _settle_storage_boundary(engine, event)
                     elif stage.work and event.sequence not in engine._native_seqs:
                         # A numeric row the kernel cannot mirror belongs to

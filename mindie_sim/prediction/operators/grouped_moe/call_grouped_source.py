@@ -10,8 +10,10 @@
 """
 from dataclasses import replace
 import math
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.call_builders import CallDefinition
 from .call_grouped import FP32_BYTES, INT32_ACCUMULATOR_BYTES, build_quantized_grouped_call
 from mindie_sim.prediction.operators.matrix.matrix import HierarchicalMatmul
@@ -23,8 +25,24 @@ from .quant_grouped_schedule import (
     IMPLEMENTATION_ID, QuantGroupedTiling, plan_quant_grouped,
 )
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+        relative_path="gmm/grouped_matmul/op_kernel/grouped_matmul_apt.cpp",
+        source_sha256="320af4dac634a8c9398494cd484150801b67d3280861fda0dd945db1edef0175",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+        relative_path="gmm/grouped_matmul/op_kernel/arch35/quant_adaptive_sliding_window_templates/quant_block_sch.h",
+        source_sha256="55196716e988e3d0b502e21795e0e82d6095a63a7d7d4a8a082ac442cc3f695e",
+    ),
+)
 
 OUTPUT = PartitionedMatrixOutput("fixpipe", 2, 2, 8)
+_ARCH35_PRESET = "npu_arch_3510"
 _SOURCE_COMPUTE_TILE_LIMIT = 128
 _SOURCE_GROUP_SCANS_PER_OWNER = 3
 
@@ -59,6 +77,12 @@ def build_quantized_grouped_source_call(arguments):
             publish += math.ceil(tile.m / 2) * 2 * tile.n * INT32_ACCUMULATOR_BYTES
 
     def plan(op, geometry):
+        arch = getattr(geometry, "compute_arch", None)
+        datapath = getattr(geometry, "datapath", None)
+        has_l0c_to_ub = bool(datapath.has_l0c_to_ub) if datapath is not None else False
+        if arch is None or arch.preset != _ARCH35_PRESET or not has_l0c_to_ub:
+            preset = arch.preset if arch is not None else "unknown"
+            raise ModelingError(f"source_grouped_requires_arch35_l0c_to_ub:{preset}")
         if tiling.used_cores > geometry.compute_units:
             raise ModelingError("source_grouped_tiling_exceeds_physical_owners")
         operand_role = read_role(geometry.resource_units)

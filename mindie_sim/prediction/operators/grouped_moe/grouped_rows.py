@@ -10,9 +10,134 @@
 from collections import Counter
 from dataclasses import dataclass, replace
 import math
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
-from .expected_grouped import FRACTAL
+from mindie_sim.schema.datapath import SourceRef
+from .expected_grouped import FRACTAL, SOURCES as _EXPECTED_SOURCES
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = _EXPECTED_SOURCES
+
+
+def _parent_hbm_decomposition(context) -> tuple[float, float]:
+    """Return ``(effective_read_credit, extra_non_io_hbm)`` for parent HBM conservation."""
+    op = context.op
+    meta = dict(op.metadata)
+    parent_hit = max(0.0, float(meta.get("admitted_l2_read_hit_bytes", 0.0) or 0.0))
+    parent_hbm = float(context.native_work.get("hbm", op.hbm_bytes))
+    cold_io = float(op.mte2_bytes) + float(op.mte3_bytes)
+    extra = parent_hbm - cold_io + parent_hit
+    if extra < 0.0:
+        return parent_hit - extra, 0.0
+    return parent_hit, extra
+
+
+def _emitted_stage_read_hbm(stage, hbm_name: str, mte3_name: str | None) -> float:
+    total = 0.0
+    if hbm_name in stage.work and (mte3_name is None or mte3_name not in stage.work):
+        total += float(stage.work[hbm_name])
+    if stage.program is not None:
+        total += _emitted_program_read_hbm(stage.program, hbm_name, mte3_name)
+    return total
+
+
+def _emitted_program_read_hbm(program, hbm_name: str, mte3_name: str | None) -> float:
+    """Sum emitted read-side HBM bytes (including operand rereads) in a lowered program."""
+    from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
+    from mindie_sim.prediction.program.pipeline import PipelineProgram, PipelineTemplateProgram
+    from mindie_sim.prediction.program.stages import KernelProgram, ParallelProgram
+
+    if isinstance(program, KernelProgram):
+        return math.fsum(_emitted_stage_read_hbm(s, hbm_name, mte3_name) for s in program.stages)
+    if isinstance(program, ParallelProgram):
+        return math.fsum(_emitted_program_read_hbm(p, hbm_name, mte3_name) for p in program.programs)
+    if isinstance(program, PipelineProgram):
+        return math.fsum(
+            _emitted_stage_read_hbm(s, hbm_name, mte3_name)
+            for idx in range(program.count) for s in program.tile(idx)
+        )
+    if isinstance(program, RefillPipeline):
+        total = 0.0
+        for idx in range(program.count):
+            load, steps, _ = program.panel(idx)
+            total += _emitted_stage_read_hbm(load, hbm_name, mte3_name)
+            for pair, _ in steps:
+                total += math.fsum(_emitted_stage_read_hbm(s, hbm_name, mte3_name) for s in pair)
+        return total
+    if isinstance(program, PipelineTemplateProgram):
+        tmpl = program.template
+        total = math.fsum(_emitted_stage_read_hbm(s, hbm_name, mte3_name) for s in tmpl.setup)
+        total += math.fsum(_emitted_stage_read_hbm(s, hbm_name, mte3_name) for s in tmpl.drain)
+        for ph in tmpl.phases:
+            phase_sum = math.fsum(_emitted_stage_read_hbm(s, hbm_name, mte3_name) for s in ph.stages)
+            total += float(ph.repeat) * phase_sum
+        return total
+    return 0.0
+
+
+def _scale_stage_read_hbm(stage, hbm_name: str, mte3_name: str | None, factor: float):
+    work = stage.work
+    if hbm_name in work and (mte3_name is None or mte3_name not in work):
+        work = {**work, hbm_name: float(work[hbm_name]) * factor}
+    nested = (
+        _scale_program_read_hbm(stage.program, hbm_name, mte3_name, factor)
+        if stage.program is not None else None
+    )
+    if work is stage.work and nested is stage.program:
+        return stage
+    return replace(stage, work=work, program=nested)
+
+
+def _scale_program_read_hbm(program, hbm_name: str, mte3_name: str | None, factor: float):
+    """Apply partitioned L2 read-hit credit to wrapped non-SteadyMatmul read stages."""
+    from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
+    from mindie_sim.prediction.program.pipeline import PipelineProgram, PipelineTemplateProgram
+    from mindie_sim.prediction.program.stages import KernelProgram, ParallelProgram
+
+    if isinstance(program, KernelProgram):
+        return replace(
+            program,
+            stages=tuple(_scale_stage_read_hbm(s, hbm_name, mte3_name, factor) for s in program.stages),
+        )
+    if isinstance(program, ParallelProgram):
+        return replace(
+            program,
+            programs=tuple(_scale_program_read_hbm(p, hbm_name, mte3_name, factor) for p in program.programs),
+        )
+    if isinstance(program, PipelineProgram):
+        orig_tile = program.tile
+        return replace(
+            program,
+            tile=lambda idx, _orig=orig_tile, _f=factor: tuple(
+                _scale_stage_read_hbm(s, hbm_name, mte3_name, _f) for s in _orig(idx)
+            ),
+        )
+    if isinstance(program, RefillPipeline):
+        orig_panel = program.panel
+        def _scaled_panel(idx, _orig=orig_panel, _f=factor):
+            load, steps, release = _orig(idx)
+            scaled_load = _scale_stage_read_hbm(load, hbm_name, mte3_name, _f)
+            scaled_steps = (
+                (tuple(_scale_stage_read_hbm(s, hbm_name, mte3_name, _f) for s in pair), is_last)
+                for pair, is_last in steps
+            )
+            return scaled_load, scaled_steps, release
+        return replace(program, panel=_scaled_panel)
+    if isinstance(program, PipelineTemplateProgram):
+        tmpl = program.template
+        scaled_phases = tuple(
+            replace(ph, stages=tuple(_scale_stage_read_hbm(s, hbm_name, mte3_name, factor) for s in ph.stages))
+            for ph in tmpl.phases
+        )
+        scaled_tmpl = replace(
+            tmpl,
+            setup=tuple(_scale_stage_read_hbm(s, hbm_name, mte3_name, factor) for s in tmpl.setup),
+            drain=tuple(_scale_stage_read_hbm(s, hbm_name, mte3_name, factor) for s in tmpl.drain),
+            phases=scaled_phases,
+        )
+        return replace(program, template=scaled_tmpl)
+    return program
 
 
 def row_classes(op):
@@ -39,8 +164,13 @@ def split_context(context, rows_per_expert, experts):
     sub_weight = weight * bank_fraction
     read = (op.mte2_bytes - weight) * row_fraction + sub_weight
     write = op.mte3_bytes * row_fraction
+    read_fraction = (read / float(op.mte2_bytes)) if op.mte2_bytes > 0 else row_fraction
+    effective_hit, parent_extra = _parent_hbm_decomposition(context)
+    child_hit = effective_hit * read_fraction
     metadata.update(matrix_groups=experts, matrix_group_rows=(rows_per_expert,) * experts,
                     matrix_mapping_domain="equal_expert_groups", packed_weight_bytes=sub_weight)
+    if effective_hit > 0.0 or "admitted_l2_read_hit_bytes" in metadata:
+        metadata["admitted_l2_read_hit_bytes"] = child_hit
     if "weight_bytes" in metadata:
         metadata["weight_bytes"] *= bank_fraction
     if "activation_scale_bytes" in metadata:
@@ -55,10 +185,9 @@ def split_context(context, rows_per_expert, experts):
               (op.matrix_flops or ((op.dtype, op.flops),))}
     resources = {role: amount * row_fraction for role, amount in context.native_work.items()
                  if role != "cube"}
-    for role, base, part in (("hbm", op.hbm_bytes, read + write),
-                             ("mte2", op.mte2_bytes, read),
-                             ("mte3", op.mte3_bytes, write)):
-        resources[role] = part + (context.native_work.get(role, base) - base) * row_fraction
+    resources["mte2"] = read + (context.native_work.get("mte2", op.mte2_bytes) - op.mte2_bytes) * row_fraction
+    resources["mte3"] = write + (context.native_work.get("mte3", op.mte3_bytes) - op.mte3_bytes) * row_fraction
+    resources["hbm"] = max(0.0, read + write - child_hit) + parent_extra * row_fraction
     phase = context.for_phase(Work(matrix, resources), kernel="integer_expert_row_class")
     # Work.apply canonicalizes extended resource roles. Keep its scaled values,
     # rather than reintroducing the parent invocation's unscaled metadata.
@@ -80,13 +209,28 @@ class IntegerGroupedMatmul:
     matrix: object
 
     def lower(self, context):
+        from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
         from mindie_sim.prediction.program import KernelProgram, Stage
+
         classes = row_classes(context.op)
-        stages = [Stage("setup", latency=context.setup_ms)]
+        _, parent_extra = _parent_hbm_decomposition(context)
+        hbm_name = context.resource_names.get("hbm")
+        mte3_name = context.resource_names.get("mte3")
+        setup_work = {hbm_name: parent_extra} if (parent_extra > 0.0 and hbm_name) else {}
+        stages = [Stage("setup", setup_work, latency=context.setup_ms)]
+        needs_read_credit_scale = not isinstance(self.matrix, SteadyMatmul) and bool(hbm_name)
         for rows, experts in classes:
             phase = split_context(context, rows, experts)
+            child_program = self.matrix.lower(phase)
+            if needs_read_credit_scale:
+                child_hit = max(0.0, float(dict(phase.op.metadata).get("admitted_l2_read_hit_bytes", 0.0) or 0.0))
+                if child_hit > 0.0:
+                    emitted_reads = _emitted_program_read_hbm(child_program, hbm_name, mte3_name)
+                    if emitted_reads > 0.0:
+                        factor = max(0.0, 1.0 - min(child_hit, emitted_reads) / emitted_reads)
+                        child_program = _scale_program_read_hbm(child_program, hbm_name, mte3_name, factor)
             stages.append(Stage(
-                f"rows{rows}", after=(stages[-1].name,), program=self.matrix.lower(phase)))
+                f"rows{rows}", after=(stages[-1].name,), program=child_program))
         if context.record_mapping is not None:
             context.record_mapping({
                 "execution_abstraction": "integer_expert_row_classes",

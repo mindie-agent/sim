@@ -7,8 +7,10 @@
 """
 from __future__ import annotations
 
+from typing import Literal
+
 from mindie_sim.schema.datapath import (
-    GENERIC_ARCH_ID, ArchId, ComputeArchIdentity, DatapathCapabilitySpec,
+    GENERIC_ARCH_ID, ArchId, ComputeArchIdentity, DatapathCapabilitySpec, SourceRef,
 )
 from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Geometry, OperatorPlan
@@ -32,10 +34,49 @@ from .common import (
 
 from .lowering import DualBatchMoEPipeline
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = _ARCH22.sources + _ARCH35.sources
+
+_PEAK_DTYPE_ALIASES = {
+    "fp8": "fp8_e4m3",
+    "fp8_e4m3fn": "fp8_e4m3",
+    "fp4": "fp4_e2m1",
+    "hif8": "hifloat8",
+    "bfloat16": "bf16",
+    "float16": "fp16",
+    "float32": "fp32",
+}
+
 _STRATEGIES: dict[ArchId, ArchStrategy] = {
     _ARCH22.arch_id: _ARCH22,
     _ARCH35.arch_id: _ARCH35,
 }
+
+
+def _validate_megamoe_composite_target(op: OpSpec, ctx: OperatorPlanningContext, metadata: dict) -> None:
+    if ctx.compute_arch.arch_id != _ARCH35.arch_id or not ctx.datapath.has_l0c_to_ub:
+        raise capability_gap(op, ctx, "megamoe_arch35_requires_arch35_l0c_to_ub")
+    geom = dict(metadata.get("megamoe_geometry") or ())
+    spec = ctx.geometry.compute_arch
+    if spec is None or not spec.native_modes:
+        return
+    native_matrix = {
+        operand
+        for mode in spec.native_modes
+        if mode.kind == "matrix"
+        for operand in mode.operands
+    }
+    dtypes = [geom.get("compute_dtype") or op.dtype or "bf16"]
+    if geom.get("shared_intermediate") or geom.get("shared_inter"):
+        shared_dt = geom.get("shared_compute_dtype") or dtypes[0]
+        dtypes.append(shared_dt)
+        if geom.get("shared_weight_dtype"):
+            dtypes.append(geom["shared_weight_dtype"])
+    for raw_dtype in dtypes:
+        key = str(raw_dtype).lower()
+        canonical = _PEAK_DTYPE_ALIASES.get(key, key)
+        if canonical not in native_matrix:
+            raise capability_gap(op, ctx, f"megamoe_arch35_unsupported_compute_dtype:{raw_dtype}")
 
 
 def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext, /) -> ResolvedOperator:
@@ -44,6 +85,7 @@ def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext, /) -> Resolv
     if op.recipe == "megamoe_arch35" and "megamoe_geometry" in metadata and not {
         "matrix_group_rows", "group_rows", "expert_rows", "group_list",
     }.intersection(metadata):
+        _validate_megamoe_composite_target(op, ctx, metadata)
         from ..mc2.megamoe import NATIVE_KIND, build as build_megamoe_composite
 
         plan = build_megamoe_composite(op, ctx.geometry)

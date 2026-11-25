@@ -7,16 +7,20 @@
 [Timeouts & Locks] O(groups + output tiles); compact K loops use bounded state.
 [Side-Effect Policy] Pure plans submitted to the existing Engine only.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import ceil
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.operators.matrix.matrix_cycle import matrix_cycle
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.operators.matrix.refill import RefillPipeline
-from .common import HALF_PRECISION_FRACTAL_K
+from .common import HALF_PRECISION_FRACTAL_K, fractal_issues
 from .lowering import GROUP_COUNT_BYTES
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
 
 _SOURCE_TILE_N = 256
 _SOURCE_MAX_TILE_M = 256
@@ -24,6 +28,43 @@ _SOURCE_L1_B_BYTES = 256 * 1024
 _SOURCE_M_WINDOW_TILES = 4
 _BF16_BYTES = int(dtype_bytes("bf16"))
 _ACCUMULATOR_BYTES = int(dtype_bytes("fp32"))
+_DOUBLE_BUFFER_SLOTS = 2
+_REFILL_L1_DEPTH = 2
+_REFILL_L0_DEPTH = 2
+_FLOPS_PER_MAC = 2
+
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+        relative_path="gmm/grouped_matmul/op_host/op_tiling/arch35/grouped_no_quant_matmul_tiling.cpp",
+        source_sha256="ff47cab5a7fe02b90ee488efcebcc561d1870fcd73ed3600c3db650b624e3940",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+        relative_path="gmm/grouped_matmul/op_kernel/arch35/non_quant/grouped_matmul_kernel.h",
+        source_sha256="75cb656bebf4d441edf04c8ab0813a0b8260eddbe949413fde07154f8be6d298",
+    ),
+    SourceRef(
+        repository="cann/ops-tensor",
+        revision="5074e676c509af531df1f83554b6e9394cb45859",
+        relative_path="include/blaze/gemm/block/block_scheduler_grouped_matmul.h",
+        source_sha256="23e6cca3c273e4d261f88a6ec7c0764279edccfc3cce346e4cedfde01784c48b",
+    ),
+    SourceRef(
+        repository="cann/ops-tensor",
+        revision="5074e676c509af531df1f83554b6e9394cb45859",
+        relative_path="include/blaze/gemm/block/block_mmad_matmul_basic.h",
+        source_sha256="ff3a9a10cad8b1587bc687a22da6fabe8cf188e0282425e59df76811e3c0a1b6",
+    ),
+    SourceRef(
+        repository="cann/ops-tensor",
+        revision="5074e676c509af531df1f83554b6e9394cb45859",
+        relative_path="include/blaze/gemm/kernel/kernel_grouped_matmul.h",
+        source_sha256="e9906b5892817354bada66c29a4ee22803a3c72781b8207d2032ebd34bfdc175",
+    ),
+)
 
 SOURCE = {
     "repository": "https://gitcode.com/cann/ops-transformer",
@@ -110,14 +151,35 @@ def owner_tiles(rows, n, tile, cores):
     return tuple(tuple(value) for value in owners)
 
 
+@dataclass(frozen=True)
+class _StreamRefillPipeline(RefillPipeline):
+    """RefillPipeline that binds lazily constructed panel stages to stream owners."""
+
+    def bind_stream_owners(self, owners, datapath, **kwargs):
+        from mindie_sim.prediction.streams import bind_stage_to_stream
+        orig_panel = self.panel
+
+        def _bound_panel(idx, _orig=orig_panel, _o=owners, _d=datapath, _kw=kwargs):
+            load, steps, release = _orig(idx)
+            bound_load = bind_stage_to_stream(load, _o, _d, **_kw)
+            bound_steps = (
+                (tuple(bind_stage_to_stream(s, _o, _d, **_kw) for s in pair), is_last)
+                for pair, is_last in steps
+            )
+            return bound_load, bound_steps, release
+
+        return replace(self, panel=_bound_panel)
+
+
 def tile_work(m, n, k):
-    reads = 2 * (m + n) * k
-    return Work({"bf16": 2 * m * n * k}, {
-        "hbm": reads + 2 * m * n, "mte2_aic": reads,
-        "mte1": reads, "fixpipe": 2 * m * n})
+    reads = _BF16_BYTES * (m + n) * k
+    _, issued_flops = fractal_issues(m, n, k, "bf16")
+    return Work({"bf16": issued_flops}, {
+        "hbm": reads + _BF16_BYTES * m * n, "mte2_aic": reads,
+        "mte1": reads, "fixpipe": _BF16_BYTES * m * n})
 
 
-def build(op, geometry, *, compact=True):
+def build(op, geometry, *, compact=False):
     md = dict(op.metadata)
     rows = tuple(md.get("matrix_group_rows", ()))
     total, n, k = op.local_shape[-3:]
@@ -138,6 +200,10 @@ def build(op, geometry, *, compact=True):
         if geometry.buffer_units.get(pool) != cores:
             raise ModelingError("bf16_grouped_requires_aic_buffer_ownership:" + pool)
     owners = owner_tiles(rows, n, tile, cores)
+    active_owners = sum(1 for tiles in owners if tiles)
+    # Multi-AIC shared HBM arbitration invalidates isolated-rate fluid compaction;
+    # retain literal K-panel refill pipelines whenever multiple AICs compete on HBM.
+    use_compact = bool(compact) and active_owners <= 1
     # Every launched AIC reads every group-list element, including zero banks.
     scalar = Work(resources={"hbm": len(rows) * GROUP_COUNT_BYTES})
     total_work = scalar.scaled(cores)
@@ -162,23 +228,25 @@ def build(op, geometry, *, compact=True):
                 count, tail = divmod(k, tile.l1_k)
 
                 def parts(kd):
-                    load = stage("load", Work(resources={"hbm": 2 * (m + width) * kd,
-                                                       "mte2_aic": 2 * (m + width) * kd}))
+                    load = stage("load", Work(resources={"hbm": _BF16_BYTES * (m + width) * kd,
+                                                       "mte2_aic": _BF16_BYTES * (m + width) * kd}))
                     steps = []
                     for kk in range(0, kd, tile.k):
                         step = min(tile.k, kd - kk)
-                        operand = stage("operand", Work(resources={"mte1": 2 * (m + width) * step}))
-                        cube = stage("matrix", Work({"bf16": 2 * m * width * step}), after=("operand",))
+                        operand = stage("operand", Work(resources={"mte1": _BF16_BYTES * (m + width) * step}))
+                        _, issued_step = fractal_issues(m, width, step, "bf16")
+                        cube = stage("matrix", Work({"bf16": issued_step}), after=("operand",))
                         steps.append((operand, cube))
                     return load, tuple(steps)
 
-                write = stage("store", Work(resources={"hbm": 2 * m * width,
-                                                       "fixpipe": 2 * m * width}))
-                if not compact:
+                write = stage("store", Work(resources={"hbm": _BF16_BYTES * m * width,
+                                                       "fixpipe": _BF16_BYTES * m * width}))
+                if not use_compact:
                     def panel(index):
                         load, steps = parts(tail if tail and index == count else tile.l1_k)
                         return load, iter((s, i + 1 == len(steps)) for i, s in enumerate(steps)), ()
-                    stages = (Stage("K", program=RefillPipeline(count + bool(tail), 2, 2, panel)),
+                    stages = (Stage("K", program=_StreamRefillPipeline(
+                                  count + bool(tail), _REFILL_L1_DEPTH, _REFILL_L0_DEPTH, panel)),
                               Stage("store", write.work, after=("K",), placement=write.placement))
                 else:
                     full = parts(tile.l1_k) if count else None
@@ -186,7 +254,8 @@ def build(op, geometry, *, compact=True):
                     first, last = (full or end)[0], (end or full)[1][-1][1]
                     cycle = matrix_cycle(
                         duration(full[0]) if full else 0,
-                        tuple((duration(a), duration(b)) for a, b in (full or end)[1]), count, 2, 2,
+                        tuple((duration(a), duration(b)) for a, b in (full or end)[1]),
+                        count, _REFILL_L1_DEPTH, _REFILL_L0_DEPTH,
                         tail_load_ms=duration(end[0]) if end else None,
                         tail_micro_steps=tuple((duration(a), duration(b)) for a, b in end[1]) if end else None)
                     work, placement = {}, {}
@@ -220,17 +289,23 @@ def build(op, geometry, *, compact=True):
 
     return OperatorPlan(total_work, program, {
         "execution_class": "cube", "source_program": SOURCE,
+        "useful_flops": _FLOPS_PER_MAC * total * n * k,
         "source_mapping": {"base_m": tile.m, "base_n": tile.n,
                            "base_k": tile.k, "l1_k": tile.l1_k,
                            "output_tiles_by_owner": tuple(len(v) for v in owners),
                            "group_rows": rows, "buffers_per_owner": tile.buffers},
-        "execution_abstraction": "finite_source_K_pipeline_compact" if compact else "finite_source_K_pipeline_detailed",
-        "approximation": "source_output_tiles_serial;compact_external_contention_fluid",
+        "execution_abstraction": (
+            "finite_source_K_pipeline_compact" if use_compact else "finite_source_K_pipeline_detailed"
+        ),
+        "approximation": (
+            "source_output_tiles_serial;compact_external_contention_fluid"
+            if use_compact else "source_output_tiles_serial"
+        ),
         "unmodeled_source_features": ["scalar_descriptor_and_flag_instruction_latency",
-                                      "ND_to_NZ_transaction_efficiency", "physical_small_M_mmad_issue_cycles",
+                                      "ND_to_NZ_transaction_efficiency",
                                       "cross_output_tile_prefetch", "capture_binary_tiling_identity"],
     })
 
 
-def recipe(*, compact=True):
+def recipe(*, compact=False):
     return PlannedRecipe(lambda op, geometry: build(op, geometry, compact=compact))

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from functools import partial
+from typing import Literal
 
 from mindie_sim.schema.datapath import ArchId, SourceRef
 from mindie_sim.schema.operators import OpSpec
@@ -21,10 +22,12 @@ from .common import (
     ROUTED_MODES, SHIPPING_MEGAMOE_ACTIVATIONS, SHIPPING_SWIGLU_QUANT_ACTIVATIONS,
     activation_stages, capability_gap,
     PER_TOKEN_SCALE_BYTES, StageDemand, contract_fields, element_bytes, make_plan, matrix_schedule,
-    matrix_stages, validate_contract,
+    matrix_stages, validate_contract, vector_stages,
 )
 
 from .lowering import DualBatchMoEPipeline, routing_stages
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
 
 SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
@@ -73,9 +76,47 @@ SOURCES: tuple[SourceRef, ...] = (
 
 ARCH_ID = ArchId("npu_arch_2201")
 MATRIX_DTYPES = frozenset({"fp32", "bf16", "fp16", "int8", "w4a8", "int4"})
-ROUTED_DTYPES = frozenset({"bf16", "fp16", "int8", "w4a8"})
+ROUTED_DTYPES = frozenset({"bf16", "int8", "w4a8"})
+ARCH22_MEGAMOE_EP_WORLD_SIZES = frozenset({2, 4, 8, 16, 32, 48, 64, 96, 128})
 AIV_INPUT_DTYPES = frozenset({"int32", "fp16", "bf16", "fp32"})
 XLLM_GATED_ABI = "aclnnMoeGroupedMatmulSwigluQuant"
+_GATED_ACTIVATION_DIVISOR = 2
+_MSD_ROW_MULTIPLIER = 2
+_MSD_SPLIT_OPS_PER_ELEMENT = 2
+_DEQUANT_GROUP_KEYS = frozenset({"group_rows", "matrix_group_rows", "expert_rows", "group_list"})
+_DEQUANT_UB_RESERVE_BYTES = 1024
+_DEQUANT_BLOCK_BYTES = 32
+_DEQUANT_FIXED_BLOCK_COUNT = 3
+_DEQUANT_SCALAR_RESERVE_BYTES = 4
+_DEQUANT_BASE_BYTES_PER_COL = 37
+_DEQUANT_BIAS_BYTES_PER_COL = 8
+_DEQUANT_STATIC_OFFSET_BYTES_PER_COL = 4
+_DEQUANT_SWIGLU_V2_BYTES_PER_COL = 5
+
+
+def _dequant_max_input_width(ub_bytes: int, fields: dict) -> int:
+    fixed = (
+        _DEQUANT_UB_RESERVE_BYTES
+        + _DEQUANT_FIXED_BLOCK_COUNT * _DEQUANT_BLOCK_BYTES
+        + _DEQUANT_SCALAR_RESERVE_BYTES
+    )
+    per_col = _DEQUANT_BASE_BYTES_PER_COL
+    if fields.get("has_bias"):
+        per_col += _DEQUANT_BIAS_BYTES_PER_COL
+    if fields.get("quant_mode", 1) == 0:
+        per_col += _DEQUANT_STATIC_OFFSET_BYTES_PER_COL
+    if fields.get("swiglu_mode", 0):
+        per_col += _DEQUANT_SWIGLU_V2_BYTES_PER_COL
+    max_out = max(0, (ub_bytes - fixed) // per_col) // _DEQUANT_BLOCK_BYTES * _DEQUANT_BLOCK_BYTES
+    return _GATED_ACTIVATION_DIVISOR * max_out
+
+
+def _is_a8w4_msd(contract) -> bool:
+    return (
+        contract.mode == "gmm_swiglu_quant"
+        and contract.dtype_a == "int8"
+        and contract.matrix_weight_dtype == "int4"
+    )
 
 
 def _excludes_packed_weight(fields, ctx):
@@ -102,7 +143,8 @@ def _validate(op, ctx, contract):
         raise capability_gap(op, ctx, "aiv_owners")
     if contract.mode != "dequant_swiglu_quant" and contract.compute_dtype not in MATRIX_DTYPES:
         raise capability_gap(op, ctx, f"arch22_compute_dtype:{contract.compute_dtype}")
-    if {contract.dtype_a, contract.dtype_b, contract.quant_dtype} & MX_DTYPES:
+    if ({contract.dtype_a, contract.dtype_b, contract.quant_dtype} & MX_DTYPES
+            or contract.act_mx_scaled or contract.weight_mx_scaled):
         raise capability_gap(op, ctx, "arch22_mx_operands")
     requested = contract.abi
     if requested == "aclnnGroupedMatmulSwigluMxQuant":
@@ -114,6 +156,8 @@ def _validate(op, ctx, contract):
     fields = contract_fields(op)
     allow_abi_ext = bool(fields.get("abi_variant_extension", False))
     if contract.mode in ROUTED_MODES:
+        if contract.ep not in ARCH22_MEGAMOE_EP_WORLD_SIZES:
+            raise capability_gap(op, ctx, f"arch22_mega_moe_ep_world_size:{contract.ep}")
         if not allow_abi_ext and contract.activation not in SHIPPING_MEGAMOE_ACTIVATIONS:
             raise capability_gap(op, ctx, f"arch22_mega_moe_activation:{contract.activation}")
         if contract.dtype_b == "int32" and _excludes_packed_weight(fields, ctx):
@@ -129,8 +173,10 @@ def _validate(op, ctx, contract):
     if contract.mode == "gmm_swiglu_quant":
         if not allow_abi_ext and contract.activation not in SHIPPING_SWIGLU_QUANT_ACTIVATIONS:
             raise capability_gap(op, ctx, f"arch22_swiglu_quant_activation:{contract.activation}")
-        if contract.compute_dtype not in {"int8", "w4a8"} or contract.activation_divisor != 2:
+        if contract.compute_dtype not in {"int8", "w4a8"} or contract.activation_divisor != _GATED_ACTIVATION_DIVISOR:
             raise capability_gap(op, ctx, "arch22_gated_int32_accumulator")
+        if contract.matrix_weight_dtype == "int8" and not contract.padded_weight:
+            raise capability_gap(op, ctx, "arch22_a8w8_swiglu_quant_requires_nz_weight")
     if contract.mode in ROUTED_MODES | {"gmm_swiglu_quant"}:
         if fields.get("mask_routing") or fields.get("mask_blocked_output"):
             raise capability_gap(op, ctx, "arch22_mask_routing")
@@ -139,16 +185,58 @@ def _validate(op, ctx, contract):
     if contract.mode == "dequant_swiglu_quant":
         if not allow_abi_ext and contract.activation not in SHIPPING_SWIGLU_QUANT_ACTIVATIONS:
             raise capability_gap(op, ctx, f"arch22_dequant_swiglu_activation:{contract.activation}")
+        if contract.activation_divisor != _GATED_ACTIVATION_DIVISOR:
+            raise capability_gap(op, ctx, f"arch22_dequant_swiglu_gated_activation:{contract.activation}")
         if contract.handoff_dtype not in AIV_INPUT_DTYPES:
             raise capability_gap(op, ctx, f"arch22_dequant_input:{contract.handoff_dtype}")
+        # CANN IsPerformanceAndGroupIndexBrach enforces the whole-row UB ceiling
+        # only on grouped invocations or INT32 swiglu_mode==1; ungrouped mode-0
+        # BF16/FP16 splits along the column dimension instead.
+        requires_whole_row_ub = (
+            bool(_DEQUANT_GROUP_KEYS.intersection(fields))
+            or len(contract.group_rows) > 1
+            or (contract.handoff_dtype == "int32" and int(fields.get("swiglu_mode", 0) or 0) == 1)
+        )
+        ub_bytes = ctx.datapath.usable_bytes("ub")
+        if requires_whole_row_ub and ub_bytes > 0:
+            max_width = _dequant_max_input_width(ub_bytes, fields)
+            if contract.n > max_width:
+                raise capability_gap(op, ctx, f"arch22_dequant_ub_width_exceeds_limit:{contract.n}:{max_width}")
 
 
 def _gated_stages(contract, ctx, name, after, metadata):
-    schedule = matrix_schedule(contract, ctx, contract.group_rows, contract.n, contract.k)
-    stages = matrix_stages(
-        name + "gmm1", after, contract, schedule, contract.k, contract.handoff_dtype,
-        input_scaled=contract.mode in ROUTED_MODES and contract.dtype_a == "int8", metadata=metadata,
-    )
+    if _is_a8w4_msd(contract):
+        # Arch22 A8W4 MSD runs an AIV preprocessor that reads INT8 activations,
+        # writes the split low/high INT4 planes (2xM rows), then runs 2xM INT4
+        # MMAD and recombines to M logical INT32 output rows.
+        pre_name = name + "msd_preprocess"
+        pre_stages = vector_stages(
+            pre_name, after, ctx, contract.group_rows,
+            read=element_bytes(contract.k, "int8"),
+            compute=_MSD_SPLIT_OPS_PER_ELEMENT * contract.k,
+            write=_MSD_ROW_MULTIPLIER * element_bytes(contract.k, "int4"),
+            metadata=metadata,
+        )
+        msd_contract = replace(contract, compute_dtype="int4")
+        msd_rows = tuple(_MSD_ROW_MULTIPLIER * count for count in contract.group_rows)
+        schedule = matrix_schedule(msd_contract, ctx, msd_rows, contract.n, contract.k)
+        useful_flops = schedule.useful_flops // _MSD_ROW_MULTIPLIER
+        stages = [
+            *pre_stages,
+            *matrix_stages(
+                name + "gmm1", (pre_name,), msd_contract, schedule, contract.k, contract.handoff_dtype,
+                input_dtype="int4", input_scaled=False,
+                output_row_divisor=_MSD_ROW_MULTIPLIER, useful_flops_override=useful_flops,
+                metadata=metadata,
+            ),
+        ]
+    else:
+        schedule = matrix_schedule(contract, ctx, contract.group_rows, contract.n, contract.k)
+        useful_flops = schedule.useful_flops
+        stages = matrix_stages(
+            name + "gmm1", after, contract, schedule, contract.k, contract.handoff_dtype,
+            input_scaled=contract.mode in ROUTED_MODES and contract.dtype_a == "int8", metadata=metadata,
+        )
     ready = (name + "gmm1",)
     if contract.abi == XLLM_GATED_ABI and contract.m:
         # The xLLM ABI has one FP32 weight-scale vector per active group.
@@ -161,7 +249,7 @@ def _gated_stages(contract, ctx, name, after, metadata):
     stages.extend(activation_stages(
         name + "swiglu_quant", ready, ctx, contract, contract.group_rows, metadata
     ))
-    return stages, schedule
+    return stages, schedule, useful_flops
 
 
 def _routed_stages(ctx, contract, name, after, metadata, transport_builder):
@@ -170,7 +258,7 @@ def _routed_stages(ctx, contract, name, after, metadata, transport_builder):
     if not contract.m:
         return stages + routing_stages(combine, (dispatch,), contract, metadata, transport_builder)
     cohort = tuple((key, value) for key, value in metadata if key in {"cohort_id", "slot"})
-    gated, _ = _gated_stages(contract, ctx, name, (dispatch,), cohort)
+    gated, _, _ = _gated_stages(contract, ctx, name, (dispatch,), cohort)
     stages.extend(gated)
     schedule2 = matrix_schedule(contract, ctx, contract.group_rows, contract.k, contract.intermediate)
     stages.extend(matrix_stages(
@@ -212,9 +300,9 @@ class _Arch22Strategy:
             implementation = self.abi
         elif mode == "gmm_swiglu_quant":
             contract = replace(contract, handoff_dtype="int32")
-            stages, schedule = _gated_stages(contract, ctx, "", (), ())
-            metadata.update(useful_flops=schedule.useful_flops, issued_fractals=schedule.issued_fractals,
-                            gm_handoff_bytes=2 * contract.m * contract.n * INT32_HANDOFF_BYTES_PER_ELEM)
+            stages, schedule, useful_flops = _gated_stages(contract, ctx, "", (), ())
+            metadata.update(useful_flops=useful_flops, issued_fractals=schedule.issued_fractals,
+                            gm_handoff_bytes=_GATED_ACTIVATION_DIVISOR * contract.m * contract.n * INT32_HANDOFF_BYTES_PER_ELEM)
             implementation = contract.abi or "aclnnGroupedMatmulSwigluQuant"
         elif mode == "dequant_swiglu_quant":
             stages = activation_stages(
