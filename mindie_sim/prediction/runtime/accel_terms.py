@@ -3,9 +3,8 @@
 [Role] Expose typed ``ctypes`` bindings for ``_engine_accel_terms.h``
   (``msim_hbm_bus``, ``msim_access``, ``msim_term``, ``msim_delivery``,
   ``msim_progress``, ``msim_capacity_row``, ``msim_obs``, ``msim_slot_gen``,
-  ``msim_dep``), a ``PreparedTermsRunner`` for direct Python==C11 epoch parity,
-  and the zero-overhead ``ObsBridge`` connecting native C11 runs to
-  ``WaveRecorder`` plus asymmetric-cohort hand-back detection.
+  ``msim_dep``) and the zero-overhead ``ObsBridge`` connecting native C11 runs
+  to ``WaveRecorder`` plus asymmetric-cohort hand-back detection.
 [Invariants] Struct layouts match ``_engine_accel_terms.h`` and
   ``_engine_accel_core.h`` exactly. Caller-owned ``msim_obs`` arrays are never
   retained past detach, and ``has_asymmetric_cohort`` only triggers hand-back
@@ -22,30 +21,15 @@ from typing import Any
 import weakref
 
 from mindie_sim.schema.common import ModelingError
-from .memory_physics import HBM_DIR_READ, HBM_DIR_WRITE, HbmBusSpec
-from .prepared_terms import (
-    PreparedCapacityRow,
-    PreparedDelivery,
-    PreparedProgress,
-    PreparedTerm,
-)
 
 DEFAULT_OBS_BUFFER_CAP = 4096
 NS_PER_MS = 1_000_000.0
-MAX_WIDENED_LINK_BITS = 64
 TERMS_ABI_VERSION = 4
 TERMS_ABI_PROBE_CELLS = 16
 _PAD_BYTES_CAPACITY_ROW = 2
-_INT64_MIN = -(1 << 63)
-_INT64_MAX = (1 << 63) - 1
-_UINT64_MAX = (1 << 64) - 1
 _OBS_BUFFERS: weakref.WeakKeyDictionary[Any, tuple[Any, Any, int]] = (
     weakref.WeakKeyDictionary()
 )
-
-
-class MsimSlice(ctypes.Structure):
-    _fields_ = [("offset", ctypes.c_uint32), ("count", ctypes.c_uint32)]
 
 
 class MsimHbmBus(ctypes.Structure):
@@ -391,23 +375,6 @@ def stop_slots_for_epoch(engine: Any, until: Sequence[Any]) -> list[int]:
     return out
 
 
-def widened_mask_for_task(task: Any) -> int | None:
-    """Encode ``task.cohort_widened`` as a 64-bit link mask, or ``None`` if >64 links."""
-    widened = getattr(task, "cohort_widened", ())
-    if not widened:
-        return 0
-    if task.cohort_size <= 1:
-        return None
-    wset = set(widened)
-    mask = 0
-    for idx, name in enumerate(task.remaining):
-        if name in wset:
-            if idx >= MAX_WIDENED_LINK_BITS:
-                return None
-            mask |= 1 << idx
-    return mask
-
-
 def prepare_obs_bridge(backend: Any, engine: Any) -> None:
     """Attach or detach the C11 ``msim_obs`` buffer to match ``engine._wave_recorder``."""
     arena = backend.arena
@@ -591,212 +558,3 @@ def record_native_starts(backend: Any, engine: Any, nstart: int, ncomp: int = 0)
                 r_ms = task.ready_at if task.ready_at is not None else moment
                 blockers = ((p_pipe, task.blocker_event, r_ms, task.blocker_reason or "publish"),)
         rec.on_admit(seq, moment, owners=owners, generation=gen, blockers=blockers)
-
-
-class PreparedTermsRunner:
-    """Direct C11 wrapper for ``msim_hbm_terms`` and prepared-row epoch solving."""
-
-    def __init__(self, library: Any = None) -> None:
-        if library is None:
-            from . import accel_build, accel_loader
-            status = accel_build.build_accel()
-            if not status.get("ok"):
-                raise ModelingError(f"accel_build_unavailable:{status.get('reason')}")
-            library = accel_loader.load_library(status)
-        self.library = bind_terms_abi(library)
-        self.ctx = self.library.msim_ctx_create()
-        if not self.ctx:
-            raise ModelingError("msim_ctx_create_failed")
-        self._nprogs = 0
-        self._ncounters = 0
-
-    def close(self) -> None:
-        if getattr(self, "ctx", None):
-            self.library.msim_ctx_free(self.ctx)
-            self.ctx = None
-
-    def __enter__(self) -> PreparedTermsRunner:
-        return self
-
-    def __exit__(self, *_exc) -> None:
-        self.close()
-
-    def hbm_terms(self, bus: HbmBusSpec, direction: str, dram_bytes: float) -> tuple[float, float]:
-        """Call C11 ``msim_hbm_terms`` and return ``(ms_r, ms_w)``."""
-        c_bus = MsimHbmBus(
-            die=int(bus.die), row_r=0, row_w=1, ctr_r=0, ctr_w=1,
-            bw_r_bytes_per_ms=float(bus.read_bytes_per_ms),
-            bw_w_bytes_per_ms=float(bus.write_bytes_per_ms),
-            alpha_rw=float(bus.alpha_rw),
-        )
-        dir_code = HBM_DIR_READ if direction == "read" else HBM_DIR_WRITE
-        out_r = ctypes.c_double(0.0)
-        out_w = ctypes.c_double(0.0)
-        rc = int(self.library.msim_hbm_terms(
-            ctypes.byref(c_bus), dir_code, float(dram_bytes),
-            ctypes.byref(out_r), ctypes.byref(out_w),
-        ))
-        if rc != 0:
-            raise ModelingError(f"msim_hbm_terms_failed:{rc}")
-        return float(out_r.value), float(out_w.value)
-
-    def validate_access(self, acc: MsimAccess) -> int:
-        """Call C11 ``msim_validate_access``."""
-        return int(self.library.msim_validate_access(ctypes.byref(acc)))
-
-    def config_rows(self, rows: Sequence[PreparedCapacityRow]) -> None:
-        """Upload normalized capacity rows into the C11 context."""
-        n = len(rows)
-        arr = (MsimCapacityRow * max(1, n))()
-        for i, row in enumerate(rows):
-            arr[i].row_id = int(row.row_id)
-            arr[i].scope = int(row.scope)
-            arr[i].unit = int(row.unit)
-            arr[i].policy = int(row.policy)
-            if row.fifo_owner_seq is None:
-                arr[i].has_fifo_owner = 0
-                arr[i].fifo_owner_seq = 0
-            else:
-                owner_seq = int(row.fifo_owner_seq)
-                if owner_seq < 0 or owner_seq > _UINT64_MAX:
-                    raise ModelingError(f"prepared_fifo_owner_out_of_range:{owner_seq}")
-                arr[i].has_fifo_owner = 1
-                arr[i].fifo_owner_seq = owner_seq
-            arr[i].capacity = float(row.capacity)
-        rc = int(self.library.msim_config_rows(self.ctx, arr if n else None, n))
-        if rc != 0:
-            raise ModelingError(f"msim_config_rows_failed:{rc}")
-        self._nprogs = 0
-        self._ncounters = 0
-
-    def terms_abi_probe(self) -> tuple[int, ...]:
-        """Return the C11 16-cell struct size/offset probe vector."""
-        return verify_terms_abi(self.library)
-
-    def roundtrip_ring(self, ring: Any) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
-        """Pack, validate via C11 ``msim_validate_ring``, and decode ring records."""
-        from .ring_buffer import DepRecord, SlotGenRecord
-        slot_recs, dep_recs = ring.to_c_records()
-        ns, nd = len(slot_recs), len(dep_recs)
-        s_arr = (MsimSlotGen * max(1, ns))()
-        for i, s in enumerate(slot_recs):
-            s_arr[i] = MsimSlotGen(
-                occurrence=int(s.occurrence), generation=int(s.generation),
-                allocation_id=int(s.allocation_id), die=int(s.die),
-                owner=int(s.owner), pool_id=int(s.pool_id), slot_id=int(s.slot_id),
-                producer_node=int(s.producer_node), publish_node=int(s.publish_node),
-                last_use_node=int(s.last_use_node), consumer_count=int(s.consumer_count),
-            )
-        d_arr = (MsimDep * max(1, nd))()
-        for i, d in enumerate(dep_recs):
-            d_arr[i] = MsimDep(
-                src_node=int(d.src_node), dst_node=int(d.dst_node),
-                kind=int(d.kind), flags=int(d.flags), pad=0,
-            )
-        nnodes = len(ring._nodes)
-        rc = int(self.library.msim_validate_ring(
-            s_arr if ns else None, ns, d_arr if nd else None, nd, nnodes,
-        ))
-        if rc != 0:
-            raise ModelingError(f"msim_validate_ring_failed:{rc}")
-        dec_slots = tuple(
-            SlotGenRecord(
-                occurrence=int(s_arr[i].occurrence), generation=int(s_arr[i].generation),
-                allocation_id=int(s_arr[i].allocation_id), die=int(s_arr[i].die),
-                owner=int(s_arr[i].owner), pool_id=int(s_arr[i].pool_id),
-                slot_id=int(s_arr[i].slot_id), producer_node=int(s_arr[i].producer_node),
-                publish_node=int(s_arr[i].publish_node),
-                last_use_node=int(s_arr[i].last_use_node),
-                consumer_count=int(s_arr[i].consumer_count),
-            )
-            for i in range(ns)
-        )
-        dec_deps = tuple(
-            DepRecord(
-                src_node=int(d_arr[i].src_node), dst_node=int(d_arr[i].dst_node),
-                kind=int(d_arr[i].kind), flags=int(d_arr[i].flags),
-            )
-            for i in range(nd)
-        )
-        return dec_slots, dec_deps
-
-    def prepare_terms(
-        self,
-        progs: Sequence[PreparedProgress],
-        terms: Sequence[PreparedTerm],
-        deliveries: Sequence[PreparedDelivery],
-        ncounters: int,
-    ) -> None:
-        """Upload flows, coalesced row terms, and counter deliveries into C11."""
-        np, nt, nd = len(progs), len(terms), len(deliveries)
-        p_arr = (MsimProgress * max(1, np))()
-        for i, p in enumerate(progs):
-            seq = int(p.sequence)
-            prio = int(p.priority)
-            if seq < 0 or seq > _UINT64_MAX:
-                raise ModelingError(f"prepared_sequence_out_of_range:{seq}")
-            if prio < _INT64_MIN or prio > _INT64_MAX:
-                raise ModelingError(f"prepared_priority_out_of_range:{prio}")
-            p_arr[i] = MsimProgress(
-                sequence=seq, priority=prio, task=int(p.task),
-                placement_id=int(p.placement_id), member_map=int(p.member_map),
-                pad=0, z_left=float(p.z_left),
-                weight=float(p.weight), max_dz_ms=float(p.max_dz_ms),
-            )
-        t_arr = (MsimTerm * max(1, nt))()
-        for i, t in enumerate(terms):
-            t_arr[i] = MsimTerm(row=int(t.row), flow=int(t.flow), ms_per_z=float(t.ms_per_z))
-        d_arr = (MsimDelivery * max(1, nd))()
-        for i, d in enumerate(deliveries):
-            d_arr[i] = MsimDelivery(
-                counter=int(d.counter), flow=int(d.flow), work_per_z=float(d.work_per_z)
-            )
-        rc = int(self.library.msim_prepare_terms(
-            self.ctx,
-            p_arr if np else None, np,
-            t_arr if nt else None, nt,
-            d_arr if nd else None, nd,
-            int(ncounters),
-        ))
-        if rc != 0:
-            raise ModelingError(f"msim_prepare_terms_failed:{rc}")
-        self._nprogs = np
-        self._ncounters = int(ncounters)
-
-    def allocate_epoch(self) -> list[float]:
-        """Run C11 ``msim_allocate_epoch`` and return per-flow ``dz/dt`` rates."""
-        out = (ctypes.c_double * max(1, self._nprogs))()
-        rc = int(self.library.msim_allocate_epoch(
-            self.ctx, out if self._nprogs else None, self._nprogs
-        ))
-        if rc != 0:
-            raise ModelingError(f"msim_allocate_epoch_failed:{rc}")
-        return [float(out[i]) for i in range(self._nprogs)]
-
-    def integrate_epoch(self, dz_per_ms: Sequence[float], dt_ms: float) -> list[float]:
-        """Run C11 ``msim_integrate_epoch`` and return per-flow consumed ``dz``."""
-        in_arr = (ctypes.c_double * max(1, self._nprogs))(*[float(v) for v in dz_per_ms])
-        out_arr = (ctypes.c_double * max(1, self._nprogs))()
-        rc = int(self.library.msim_integrate_epoch(
-            self.ctx, in_arr if self._nprogs else None, self._nprogs,
-            float(dt_ms), out_arr if self._nprogs else None,
-        ))
-        if rc != 0:
-            raise ModelingError(f"msim_integrate_epoch_failed:{rc}")
-        return [float(out_arr[i]) for i in range(self._nprogs)]
-
-    def read_state(self) -> tuple[list[float], list[float]]:
-        """Read back ``(z_left, counters)`` from the C11 context."""
-        z_arr = (ctypes.c_double * max(1, self._nprogs))()
-        c_arr = (ctypes.c_double * max(1, self._ncounters))()
-        rc = int(self.library.msim_read_term_state(
-            self.ctx,
-            z_arr if self._nprogs else None, self._nprogs,
-            c_arr if self._ncounters else None, self._ncounters,
-        ))
-        if rc != 0:
-            raise ModelingError(f"msim_read_term_state_failed:{rc}")
-        return (
-            [float(z_arr[i]) for i in range(self._nprogs)],
-            [float(c_arr[i]) for i in range(self._ncounters)],
-        )

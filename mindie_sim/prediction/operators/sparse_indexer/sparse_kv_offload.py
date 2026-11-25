@@ -30,10 +30,11 @@ from __future__ import annotations
 from dataclasses import replace
 from functools import partial
 import math
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from mindie_sim.catalog.cache import index_row_bytes, packed_region_row_bytes
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.prediction.engine import Allocation
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, PlannedRecipe, Work
@@ -64,8 +65,33 @@ US_TO_MS = 1e-3
 BYTES_PER_S_TO_GBPS = 1e-9
 GBPS_TO_BYTES_PER_MS = 1e6
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+
+_VLLM_ASCEND_REPO = "vllm-project/vllm-ascend"
+_VLLM_ASCEND_REV = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
+
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository=_VLLM_ASCEND_REPO,
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/attention/sfa_kv_offload.py",
+        source_sha256="6347548c772f199c873e6b5c7079c1e85ab3e41f3b4360473706d913dba6f55f",
+    ),
+    SourceRef(
+        repository=_VLLM_ASCEND_REPO,
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/attention/sfa_hisparse.py",
+        source_sha256="76b5ebb6d373ebe508c56ba1c0855b5f6c5fb86f53b80ce03108dc5beac32685",
+    ),
+    SourceRef(
+        repository=_VLLM_ASCEND_REPO,
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/distributed/kv_transfer/utils/memfabric_transfer_engine.py",
+        source_sha256="acbfddf9e0f27b07ce7de5d0e8e8ce4e964c05ae6809148241390f8e35ce52aa",
+    ),
+)
+
 IMPLEMENTATION = "vllm_ascend_sparse_kv_offload"
-HISPARSE_ALIAS = "hisparse_kv_offload"
 
 MEMFABRIC_SOURCE = {
     "repository": "https://gitcode.com/Ascend/memfabric_hybrid",
@@ -1249,7 +1275,7 @@ def lower_op(op: OpSpec, **options: Any) -> OpSpec:
 
 
 __all__ = [
-    "HISPARSE_ALIAS", "IMPLEMENTATION", "MEMFABRIC_SOURCE",
+    "IMPLEMENTATION", "MEMFABRIC_SOURCE", "SOURCES", "TARGET_BACKEND",
     "copy_sfa_pool_capacity", "lower_decode_offload", "lower_op", "lower_prefill_offload",
     "prepare_case", "recipes", "sparse_kv_offload_memory_budget", "strip_case",
 ]

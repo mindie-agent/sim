@@ -34,12 +34,13 @@ from mindie_sim.prediction.program import (
 )
 from mindie_sim.prediction.runtime.accel_tables import pure_task
 from mindie_sim.prediction.runtime.accel_terms import (
-    TERMS_ABI_VERSION, MsimAccess, PreparedTermsRunner, expected_terms_abi_probe,
+    TERMS_ABI_VERSION, MsimAccess, expected_terms_abi_probe,
 )
 from mindie_sim.prediction.runtime.arbiter_fast_coupled import fast_single_tier_coupled
-from mindie_sim.prediction.runtime.prepared_terms import (
+from _support.prepared_terms_parity import (
     POLICY_FAIR, POLICY_FIFO, PreparedCapacityRow, PreparedDelivery,
-    PreparedProgress, PreparedTerm, allocate_prepared_epoch, integrate_prepared_epoch,
+    PreparedProgress, PreparedTerm, PreparedTermsRunner,
+    allocate_prepared_epoch, integrate_prepared_epoch,
 )
 from mindie_sim.prediction.runtime.exposed_observer import ServiceGrantObserver
 from mindie_sim.prediction.runtime.ring_buffer import RingBuffer, lower_generation

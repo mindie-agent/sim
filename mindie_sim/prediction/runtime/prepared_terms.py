@@ -1,23 +1,18 @@
-"""Vector sub-pipe lowering and prepared-row max-min epoch solver.
+"""Vector sub-pipe lowering and Engine residual snapping constant.
 
 [Role] Lower typed AIV vector instruction groups onto ``vec_issue`` plus
   declared ``vec_{alu,sfu,reduce}`` sub-pipes without a competing aggregate
-  ``vector`` row, and provide the canonical Python prepared-row weighted
-  max-min epoch allocator/integrator mirrored bit-for-bit in C11.
+  ``vector`` row, and expose ``RESIDUAL_SNAP_ULPS`` for Engine solo-step
+  residual snapping.
 [Invariants] ``target_eff`` scales issue and sub-pipe throughput while leaving
-  hardware result latency cycles invariant. Prepared-row conservation holds:
-  every flow consumes at most ``z_left`` and delivers ``sum(dz) * work_per_z``
-  to declared counters with residual snapping within ``RESIDUAL_SNAP_ULPS``.
-[Timeouts & Locks] Bounded progressive-filling loops with ``guard <= n + 1``;
-  no I/O, threads or locks.
-[Side-Effect Policy] Pure value builders except explicit in-place ``z_left``
-  and ``counters`` integration inside ``integrate_prepared_epoch``.
+  hardware result latency cycles invariant.
+[Timeouts & Locks] Linear O(groups) DAG lowering; no I/O, threads or locks.
+[Side-Effect Policy] Pure immutable value builders with zero shared mutation.
 """
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-import math
 from typing import TYPE_CHECKING, Any, Literal
 
 from mindie_sim.schema.common import ModelingError
@@ -26,8 +21,6 @@ if TYPE_CHECKING:
     from ..program.stages import Stage
 
 RESIDUAL_SNAP_ULPS = 4.0
-POLICY_FAIR = 0
-POLICY_FIFO = 1
 MS_PER_SECOND = 1000.0
 VALID_VECTOR_PIPES = frozenset({"vec_alu", "vec_sfu", "vec_reduce"})
 
@@ -258,207 +251,10 @@ def bind_vector_groups(
     )
 
 
-@dataclass(slots=True)
-class PreparedCapacityRow:
-    """One normalized capacity row matching C11 ``msim_capacity_row``."""
-
-    row_id: int
-    scope: int = 0
-    unit: int = 0
-    policy: int = POLICY_FAIR
-    capacity: float = 1.0
-    fifo_owner_seq: int | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedTerm:
-    """One nonnegative ``ms_per_z`` coefficient linking a flow to a capacity row."""
-
-    row: int
-    flow: int
-    ms_per_z: float
-
-
-@dataclass(frozen=True, slots=True)
-class PreparedDelivery:
-    """One counter delivery coefficient ``work_per_z`` for a flow."""
-
-    counter: int
-    flow: int
-    work_per_z: float
-
-
-@dataclass(slots=True)
-class PreparedProgress:
-    """Mutable progress cursor for one flow matching C11 ``msim_progress``."""
-
-    sequence: int
-    task: int
-    priority: int
-    placement_id: int
-    member_map: int
-    z_left: float
-    weight: float
-    max_dz_ms: float = math.inf
-
-
-def allocate_prepared_epoch(
-    rows: Sequence[PreparedCapacityRow],
-    progs: Sequence[PreparedProgress],
-    terms: Sequence[PreparedTerm],
-) -> list[float]:
-    """Reference prepared-row weighted max-min matching C11 ``msim_allocate_epoch``."""
-    n_rows = len(rows)
-    n_progs = len(progs)
-    dz = [0.0] * n_progs
-    if n_rows == 0 or n_progs == 0:
-        return dz
-
-    coalesced: dict[tuple[int, int], float] = {}
-    for term in terms:
-        if term.ms_per_z > 0.0:
-            key = (term.flow, term.row)
-            coalesced[key] = coalesced.get(key, 0.0) + float(term.ms_per_z)
-
-    order = sorted(
-        range(n_progs),
-        key=lambda f: (progs[f].priority, progs[f].sequence, progs[f].placement_id, progs[f].member_map, f),
-    )
-    flow_terms: list[list[tuple[int, float]]] = [[] for _ in range(n_progs)]
-    for (flow, row), coeff in sorted(coalesced.items(), key=lambda kv: (kv[0][0], kv[0][1])):
-        flow_terms[flow].append((row, coeff))
-
-    fifo_winner: dict[int, int] = {}
-    for row_idx, row_obj in enumerate(rows):
-        if row_obj.policy != POLICY_FIFO or row_obj.fifo_owner_seq is None:
-            continue
-        incumbent_seq = row_obj.fifo_owner_seq
-        for f in order:
-            if progs[f].sequence == incumbent_seq and progs[f].z_left > 0.0 and any(
-                r == row_idx and coeff > 0.0 for r, coeff in flow_terms[f]
-            ):
-                fifo_winner[row_idx] = f
-                break
-        if row_idx not in fifo_winner:
-            row_obj.fifo_owner_seq = None
-
-    rem_cap = [float(r.capacity) for r in rows]
-    by_prio: dict[int, list[int]] = {}
-    for f in order:
-        by_prio.setdefault(progs[f].priority, []).append(f)
-
-    for prio in sorted(by_prio):
-        free: list[int] = []
-        for f in by_prio[prio]:
-            p = progs[f]
-            if p.z_left <= 0.0 or p.weight <= 0.0 or p.max_dz_ms <= 0.0:
-                continue
-            blocked = False
-            for row, coeff in flow_terms[f]:
-                if coeff > 0.0:
-                    if rows[row].policy == POLICY_FIFO and row in fifo_winner and fifo_winner[row] != f:
-                        blocked = True
-                        break
-                    if rem_cap[row] <= 0.0:
-                        blocked = True
-                        break
-            if not blocked:
-                for row, coeff in flow_terms[f]:
-                    if coeff > 0.0 and rows[row].policy == POLICY_FIFO and row not in fifo_winner:
-                        fifo_winner[row] = f
-                free.append(f)
-        guard = 0
-        while free and guard <= n_progs + 1:
-            guard += 1
-            slope = [0.0] * n_rows
-            for f in free:
-                w_f = progs[f].weight
-                for row, coeff in flow_terms[f]:
-                    slope[row] += coeff * w_f
-            delta = math.inf
-            bounds = [math.inf] * n_rows
-            for j in range(n_rows):
-                if slope[j] > 0.0:
-                    b = rem_cap[j] / slope[j]
-                    bounds[j] = b
-                    if b < delta:
-                        delta = b
-            for f in free:
-                rem_v = (progs[f].max_dz_ms - dz[f]) / progs[f].weight
-                if rem_v < delta:
-                    delta = rem_v
-            if not math.isfinite(delta) or delta < 0.0:
-                break
-            for f in free:
-                dz[f] += delta * progs[f].weight
-            saturated: set[int] = set()
-            for j in range(n_rows):
-                if slope[j] > 0.0:
-                    nv = rem_cap[j] - delta * slope[j]
-                    rem_cap[j] = nv if nv > 0.0 else 0.0
-                    if bounds[j] <= delta or rem_cap[j] <= 0.0:
-                        saturated.add(j)
-            next_free: list[int] = []
-            for f in free:
-                if dz[f] >= progs[f].max_dz_ms:
-                    continue
-                if any(row in saturated for row, _coeff in flow_terms[f]):
-                    continue
-                next_free.append(f)
-            free = next_free
-    for row_idx, winner_f in fifo_winner.items():
-        if rows[row_idx].fifo_owner_seq is None and dz[winner_f] > 0.0:
-            rows[row_idx].fifo_owner_seq = progs[winner_f].sequence
-    return dz
-
-
-def integrate_prepared_epoch(
-    progs: Sequence[PreparedProgress],
-    deliveries: Sequence[PreparedDelivery],
-    dz_per_ms: Sequence[float],
-    dt_ms: float,
-    counters: list[float],
-) -> list[float]:
-    """Integrate one epoch ``dt_ms`` matching C11 ``msim_integrate_epoch``."""
-    if not math.isfinite(dt_ms) or dt_ms < 0.0:
-        raise ModelingError(f"prepared_epoch_dt_invalid:{dt_ms!r}")
-    dz_steps = [0.0] * len(progs)
-    for f, p in enumerate(progs):
-        rate = float(dz_per_ms[f])
-        if p.z_left <= 0.0 or rate <= 0.0:
-            continue
-        step = dt_ms * rate
-        if step >= p.z_left:
-            used = p.z_left
-            p.z_left = 0.0
-        else:
-            residual = p.z_left - step
-            if residual <= RESIDUAL_SNAP_ULPS * math.ulp(p.z_left):
-                used = p.z_left
-                p.z_left = 0.0
-            else:
-                used = step
-                p.z_left = residual
-        dz_steps[f] = used
-    for d in deliveries:
-        step = dz_steps[d.flow]
-        if step > 0.0:
-            counters[d.counter] += step * d.work_per_z
-    return dz_steps
-
-
 __all__ = [
     "BoundVectorOp",
-    "POLICY_FAIR",
-    "POLICY_FIFO",
-    "PreparedCapacityRow",
-    "PreparedDelivery",
-    "PreparedProgress",
-    "PreparedTerm",
     "RESIDUAL_SNAP_ULPS",
     "VALID_VECTOR_PIPES",
     "VectorInstructionGroup",
-    "allocate_prepared_epoch",
     "bind_vector_groups",
-    "integrate_prepared_epoch",
 ]
