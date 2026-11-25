@@ -30,6 +30,7 @@ from copy import deepcopy
 from dataclasses import replace
 import hashlib
 import importlib
+import math
 from pathlib import Path
 import re
 import threading
@@ -46,14 +47,16 @@ from mindie_sim.primitives.schema import PrimitiveTable
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.parallel import local_kv_heads as compute_local_kv_heads
+from mindie_sim.schema.workload import RequestView
 
 from .contracts import (
     DEFAULT_CLOCK_OPERATOR, DEFAULT_HELDOUT_APE_THRESHOLD_PCT, DEFAULT_PHYSICAL_ATOL_NS,
     DISPLAY_ROUND_DIGITS, FORBIDDEN_CALLER_PREDICTION_KEYS, NS_PER_MS, PERCENT_SCALE,
     SHORT_DIGEST_LEN, STANDARD_LEVEL_BOUNDARY_KINDS, VALID_CLOCK_OPERATORS,
-    assert_sanitized_payload, exceeds_physical_tolerance, program_dag_sha256,
-    sanitize_public_alias, sanitize_public_capture_uri, sanitize_public_run_id,
-    validate_parallel_topology, validate_strict_atol_ns, validate_strict_threshold_pct,
+    assert_sanitized_payload, exceeds_physical_tolerance, load_frozen_fit_manifest,
+    parse_lineage_edges, program_dag_sha256, sanitize_public_alias, sanitize_public_capture_uri,
+    sanitize_public_run_id, validate_parallel_topology, validate_strict_atol_ns,
+    validate_strict_threshold_pct, verify_capture_file_identity,
 )
 
 _ascend_mod = importlib.import_module("mindie_sim.backends.ascend")
@@ -70,7 +73,6 @@ _TRACE_PER_SEQ_FACTOR = 128
 _TRACE_KV_PAGE_SIZE = 128
 _TRACE_PER_KV_PAGE_FACTOR = 6
 _MAX_WORKLOAD_TRACE_LIMIT = 1_048_576
-_DEFAULT_AIV_PER_AIC_RATIO = 2
 _PERIODIC_BOUNDARY_REPS = 2
 _OBSERVER_COMPACT_THRESHOLD = 4096
 _MAX_DIAG_OP_IDS = 64
@@ -80,6 +82,7 @@ _MIN_DCP_PARTIALS = 2
 _P90_QUANTILE = 0.90
 _TOPO_TOKEN_RE = re.compile(r"(tp|pp|dp|ep|pcp|dcp)(\d+)")
 _GEMM_FAMILIES = frozenset({"gemm", "grouped_gemm", "gate_up_projection", "down_projection"})
+_ACTUAL_SEQ_SHAPE_KEYS = frozenset({"q_len", "query_tokens", "seq_len", "kv_len", "context_len"})
 _MLA_RECIPES = frozenset({
     "ascend_paged_mla_decode_arch22", "ascend_paged_mla_decode_arch35",
     "latent_attention0", "latent_attention_batch", "paired_mla_attention_analytic",
@@ -179,7 +182,7 @@ def union_interval_span_ms(intervals: Sequence[tuple[float, float]]) -> float:
 
 
 class _BusyUnionObserver:
-    """Zero-truncation streaming ``Engine`` observer for exact ``busy_union`` and per-row work."""
+    """Zero-truncation streaming ``EngineObserver`` for exact ``busy_union`` and per-row work."""
 
     def __init__(self) -> None:
         self._intervals: list[tuple[float, float]] = []
@@ -188,14 +191,24 @@ class _BusyUnionObserver:
         self._task_op: dict[int, tuple[int, str]] = {}
         self._periodic_extra_ms = 0.0
         self._periodic_by_row: dict[str, float] = {}
-        self._slot_gen: dict[tuple[str, int], int] = {}
+        self._periodic_by_op: dict[tuple[int, str], float] = {}
+        self._slot_gen: dict[tuple[str, int, str], int] = {}
 
     def register_pipe(self, name: str) -> int:
         return 0 * len(name)
 
-    def on_submit(self, task_id: int = 0, *_a: Any, occurrence: Any = None, **_kw: Any) -> None:
-        if occurrence is not None and (oid := str(getattr(occurrence, "op_id", "") or "").strip()):
-            self._task_op[int(task_id)] = (int(getattr(occurrence, "replica", 0) or 0), oid)
+    def on_submit(
+        self, task_id: int = 0, name: str = "", *_a: Any,
+        aliases: tuple[str, ...] = (), predecessors: tuple[int, ...] = (),
+        occurrence: Any = None, op_occ: Any = None, parent_task_id: int | None = None,
+        **_kw: Any,
+    ) -> None:
+        del name, aliases, predecessors
+        src = op_occ if op_occ is not None else occurrence
+        if src is not None and (oid := str(getattr(src, "op_id", "") or "").strip()):
+            self._task_op[int(task_id)] = (int(getattr(src, "replica", 0) or 0), oid)
+        elif parent_task_id is not None and int(parent_task_id) in self._task_op:
+            self._task_op[int(task_id)] = self._task_op[int(parent_task_id)]
 
     def on_admit(self, *_a: Any, **_kw: Any) -> None:
         return
@@ -203,20 +216,20 @@ class _BusyUnionObserver:
     def on_allocation(self, *_a: Any, **_kw: Any) -> None:
         return
 
-    def allocate_slot_generation(self, pool: str, owner: int, *_a: Any, **_kw: Any) -> tuple[int, int]:
-        key = (str(pool), int(owner))
+    def allocate_slot_generation(self, pool: str, unit: int, name: str = "") -> tuple[int, int]:
+        key = (str(pool), int(unit), str(name))
         self._slot_gen[key] = self._slot_gen.get(key, 0) + 1
         return 0, self._slot_gen[key]
 
-    def release_slot_generation(self, pool: str, owner: int, *_a: Any, **_kw: Any) -> tuple[int, int]:
-        return 0, self._slot_gen.get((str(pool), int(owner)), 0)
+    def release_slot_generation(self, pool: str, unit: int, name: str = "") -> tuple[int, int]:
+        return 0, self._slot_gen.get((str(pool), int(unit), str(name)), 0)
 
     def _append_compact(self, bucket: list[tuple[float, float]], span: tuple[float, float]) -> list[tuple[float, float]]:
         bucket.append(span)
         return _coalesce_intervals(bucket) if len(bucket) >= _OBSERVER_COMPACT_THRESHOLD else bucket
 
-    def on_service(self, task_id: int, physical_row: str, _owner: int, t0_ms: float, t1_ms: float, delivered: float, *, scope_id: int | None = None) -> None:
-        del scope_id
+    def on_service(self, task_id: int, physical_row: str, owner: int, t0_ms: float, t1_ms: float, delivered: float, *, scope_id: int | None = None) -> None:
+        del owner, scope_id
         if delivered <= 0.0 or t1_ms <= t0_ms:
             return
         span = (float(t0_ms), float(t1_ms))
@@ -226,39 +239,92 @@ class _BusyUnionObserver:
         if (ok := self._task_op.get(int(task_id))) is not None:
             self._by_op[ok] = self._append_compact(self._by_op.setdefault(ok, []), span)
 
-    def extract_cycle_pattern(self, start_ms: float, end_ms: float, *_a: Any, **_kw: Any) -> tuple[tuple[tuple[str, float, float], ...], tuple[Any, ...]]:
+    def extract_cycle_pattern(
+        self, start_ms: float, end_ms: float, *_a: Any, **_kw: Any,
+    ) -> tuple[tuple[tuple[str, float, float], ...], tuple[tuple[tuple[int, str], float, float], ...]]:
         s0, s1 = float(start_ms), float(end_ms)
         if s1 <= s0:
             return (), ()
-        self._intervals = _coalesce_intervals(self._intervals)
-        return tuple(("active", max(lo, s0) - s0, min(hi, s1) - s0) for lo, hi in self._intervals if hi > s0 and lo < s1 and min(hi, s1) > max(lo, s0)), ()
+        row_pat: list[tuple[str, float, float]] = []
+        for rk in sorted(self._by_row):
+            ivs = _coalesce_intervals(self._by_row[rk])
+            self._by_row[rk] = ivs
+            for lo, hi in ivs:
+                if hi > s0 and lo < s1 and (c_hi := min(hi, s1)) > (c_lo := max(lo, s0)):
+                    row_pat.append((rk, c_lo - s0, c_hi - s0))
+        op_pat: list[tuple[tuple[int, str], float, float]] = []
+        for op_key in sorted(self._by_op):
+            ivs = _coalesce_intervals(self._by_op[op_key])
+            self._by_op[op_key] = ivs
+            for lo, hi in ivs:
+                if hi > s0 and lo < s1 and (c_hi := min(hi, s1)) > (c_lo := max(lo, s0)):
+                    op_pat.append((op_key, c_lo - s0, c_hi - s0))
+        return tuple(row_pat), tuple(op_pat)
 
-    def on_period(self, anchor_ms: float, period_ms: float, repeats: int, service_pattern: Sequence[tuple[str, float, float]], *_a: Any, **_kw: Any) -> None:
-        if repeats <= 0 or period_ms <= 0.0 or not service_pattern:
-            return
-        rel = _coalesce_intervals([(float(lo), float(hi)) for _, lo, hi in service_pattern])
+    @staticmethod
+    def _integrate_periodic(
+        bucket: list[tuple[float, float]], raw_spans: Sequence[tuple[float, float]],
+        a_ms: float, p_ms: float, repeats: int,
+    ) -> float:
+        rel = _coalesce_intervals(raw_spans)
         if not rel:
-            return
-        a_ms, p_ms = float(anchor_ms), float(period_ms)
-        self._intervals.extend((a_ms + lo, a_ms + hi) for lo, hi in rel)
+            return 0.0
+        bucket.extend((a_ms + lo, a_ms + hi) for lo, hi in rel)
         if repeats >= _PERIODIC_BOUNDARY_REPS:
             last_base = a_ms + float(repeats - 1) * p_ms
-            self._intervals.extend((last_base + lo, last_base + hi) for lo, hi in rel)
-        if (interior := repeats - _PERIODIC_BOUNDARY_REPS) > 0:
-            extra = float(interior) * sum(hi - lo for lo, hi in rel)
-            self._periodic_extra_ms += extra
-            self._periodic_by_row["periodic"] = self._periodic_by_row.get("periodic", 0.0) + extra
+            bucket.extend((last_base + lo, last_base + hi) for lo, hi in rel)
+        interior = repeats - _PERIODIC_BOUNDARY_REPS
+        return float(interior) * sum(hi - lo for lo, hi in rel) if interior > 0 else 0.0
+
+    def on_period(
+        self, anchor_ms: float, period_ms: float, repeats: int,
+        service_pattern: Sequence[tuple[str, float, float]] = (),
+        *, template_id: str = "", state_digest: str = "",
+        handoff_pattern: Sequence[Any] = (), **_kw: Any,
+    ) -> None:
+        del template_id, state_digest
+        if repeats <= 0 or period_ms <= 0.0 or (not service_pattern and not handoff_pattern):
+            return
+        a_ms, p_ms = float(anchor_ms), float(period_ms)
+        by_row_raw: dict[str, list[tuple[float, float]]] = {}
+        all_raw: list[tuple[float, float]] = []
+        for entry in service_pattern:
+            rk, lo, hi = str(entry[0] or "device"), float(entry[1]), float(entry[2])
+            if hi > lo:
+                by_row_raw.setdefault(rk, []).append((lo, hi))
+                all_raw.append((lo, hi))
+        if all_raw:
+            self._periodic_extra_ms += self._integrate_periodic(self._intervals, all_raw, a_ms, p_ms, repeats)
+        for rk, spans in by_row_raw.items():
+            extra = self._integrate_periodic(self._by_row.setdefault(rk, []), spans, a_ms, p_ms, repeats)
+            if extra > 0.0:
+                self._periodic_by_row[rk] = self._periodic_by_row.get(rk, 0.0) + extra
+        by_op_raw: dict[tuple[int, str], list[tuple[float, float]]] = {}
+        for entry in handoff_pattern:
+            if isinstance(entry, tuple) and len(entry) == 3 and isinstance(entry[0], tuple) and len(entry[0]) == 2:
+                op_key = (int(entry[0][0]), str(entry[0][1]))
+                lo, hi = float(entry[1]), float(entry[2])
+                if hi > lo:
+                    by_op_raw.setdefault(op_key, []).append((lo, hi))
+        for op_key, spans in by_op_raw.items():
+            extra = self._integrate_periodic(self._by_op.setdefault(op_key, []), spans, a_ms, p_ms, repeats)
+            if extra > 0.0:
+                self._periodic_by_op[op_key] = self._periodic_by_op.get(op_key, 0.0) + extra
 
     def total_busy_ms(self) -> float:
         return union_interval_span_ms(self._intervals) + self._periodic_extra_ms
 
     def row_busy_ns(self, *, cap_ns: int) -> tuple[int, ...]:
-        spans = [ns for k in sorted(self._by_row) if (ns := min(cap_ns, int(round((union_interval_span_ms(self._by_row[k]) + self._periodic_by_row.get(k, 0.0)) * NS_PER_MS)))) > 0]
+        row_keys = sorted(set(self._by_row) | set(self._periodic_by_row))
+        spans = [
+            ns for k in row_keys
+            if (ns := min(cap_ns, int(math.floor((union_interval_span_ms(self._by_row.get(k, ())) + self._periodic_by_row.get(k, 0.0)) * NS_PER_MS)))) > 0
+        ]
         return tuple(spans) if spans else ((cap_ns,) if cap_ns > 0 else ())
 
     def op_busy_ns(self, op_key: tuple[int, str], *, cap_ns: int) -> int:
-        ivs = self._by_op.get(op_key)
-        return min(cap_ns, int(round(union_interval_span_ms(ivs) * NS_PER_MS))) if ivs else 0
+        total_ms = union_interval_span_ms(self._by_op.get(op_key, ())) + self._periodic_by_op.get(op_key, 0.0)
+        return min(cap_ns, int(math.floor(total_ms * NS_PER_MS))) if total_ms > 0.0 else 0
 
 
 def _build_executed_witness_program_dag(graphs: Mapping[int, tuple[Any, ...]], observer: _BusyUnionObserver, *, target_ns: int) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -273,62 +339,20 @@ def _build_executed_witness_program_dag(graphs: Mapping[int, tuple[Any, ...]], o
                 continue
             node_idx[key] = len(ordered)
             ordered.append((int(rep), op))
-            q = observer.op_busy_ns(key, cap_ns=target_ns)
-            quanta.append(q if q > 0 else (1 if target_ns > 0 else 0))
+            quanta.append(observer.op_busy_ns(key, cap_ns=target_ns))
     edges = [
         {"src": node_idx[(rep, str(d))], "dst": dst, "wire_ns": 0}
         for dst, (rep, op) in enumerate(ordered)
         for d in (getattr(op, "deps", ()) or ())
         if (rep, str(d)) in node_idx and node_idx[(rep, str(d))] != dst
     ]
-    return {"num_resources": len(row_ns), "global_work": list(row_ns), "site_modes": []}, {"node_quantum_ns": quanta or [max(row_ns)], "edges": edges}
-
-
-def _apply_calibrated_primitive_rates(case: Any, table: PrimitiveTable) -> Any:
-    if table.sku != case.machine.sku:
-        raise ModelingError(f"primitive_table_sku_mismatch:table={table.sku}:case={case.machine.sku}")
-    p01, p04, p06 = table.primitives.get("P01_datacopy"), table.primitives.get("P04_mte3_store"), table.primitives.get("P06_mmad")
-    p07, p09 = table.primitives.get("P07_vec_alu"), table.primitives.get("P09_vec_reduce_cast")
-    updated = []
-    for die in case.machine.dies:
-        rates, peaks = dict(die.rates), dict(die.compute_peaks)
-        aic = max(1, int(die.compute_units))
-        aiv = max(1, int(dict(die.resource_units).get("vector", aic * _DEFAULT_AIV_PER_AIC_RATIO)))
-        if p01 is not None:
-            hr, hw = p01.metrics.get("hbm_read_bytes_per_s"), p01.metrics.get("hbm_write_bytes_per_s")
-            if hr and hr.p50 and hw and hw.p50:
-                rates["hbm"] = float(min(hr.p50, hw.p50))
-            elif hr and hr.p50:
-                rates["hbm"] = float(hr.p50)
-            for mk, rkey, mult in (("mte2_aiv_hit_bytes_per_s_per_core", "mte2_aiv", aiv), ("mte2_aic_hit_bytes_per_s_per_core", "mte2_aic", aic)):
-                m = p01.metrics.get(mk)
-                if m and m.p50:
-                    rates[rkey] = float(m.p50) * mult
-        if p04 is not None:
-            m3 = p04.metrics.get("mte3_store_bytes_per_s_per_aiv") or p04.metrics.get("mte3_bytes_per_s_per_aiv")
-            if m3 and m3.p50:
-                rates["mte3"] = float(m3.p50) * aiv
-        if p06 is not None:
-            for mode_name, mm in p06.modes.items():
-                b = mm.get("cube_only_rate") or mm.get("cube_ops_per_s_per_aic")
-                if b and b.p50:
-                    peaks[mode_name] = float(b.p50) * aic
-        vecs = [
-            float(m.p50) * aiv
-            for p, keys in ((p07, ("vec_alu_ops_per_s_per_aiv",)), (p09, ("vec_reduce_ops_per_s_per_aiv", "reduce_ops_per_s_per_aiv")))
-            if p is not None
-            for m in (next((p.metrics.get(k) for k in keys if p.metrics.get(k)), None),)
-            if m and m.p50
-        ]
-        if vecs:
-            rates["vector"] = float(min(vecs))
-        updated.append(replace(die, rates=tuple(sorted(rates.items())), compute_peaks=tuple(sorted(peaks.items()))))
-    return replace(case, machine=replace(case.machine, dies=tuple(updated)))
+    return {"num_resources": len(row_ns), "global_work": list(row_ns), "site_modes": []}, {"node_quantum_ns": quanta or [max(row_ns) if row_ns else 0], "edges": edges}
 
 
 def _run_graphs_on_real_engine(
     sim_case: Any, graphs: Mapping[int, tuple[Any, ...]], *, start_event_name: str, end_event_name: str,
     external_inputs: Mapping[str, float] | None, family_registry: Any = None, sequences: int = 1, context: int = 0,
+    primitive_table: PrimitiveTable | None = None,
 ) -> tuple[Any, Any, Any, float, float, _BusyUnionObserver]:
     from mindie_sim.prediction.execution.cohort_traffic import bind_cohort_traffic
     from mindie_sim.prediction.efficiency.cost import CostLedger
@@ -341,8 +365,10 @@ def _run_graphs_on_real_engine(
     from mindie_sim.schema.operators import IterationWork
     from mindie_sim.schema.workload import IterationPlan
 
+    if primitive_table is not None and primitive_table.sku != sim_case.machine.sku:
+        raise ModelingError(f"primitive_table_sku_mismatch:table={primitive_table.sku}:case={sim_case.machine.sku}")
     book = RecipeBook.from_mapping(sim_case.runtime.kernels, family_registry=family_registry)
-    ctx = EvaluationContext.create(sim_case, book)
+    ctx = EvaluationContext.create(sim_case, book, primitive_table=primitive_table)
     expanded = bind_cohort_traffic(sim_case, {r: tuple(book.expand(items)) for r, items in graphs.items()})
     external = dict(external_inputs or {})
     op_count = sum(len(g) for g in expanded.values())
@@ -423,7 +449,12 @@ def _verify_attention_binding(op: Any, sim_case: Any, nb: Mapping[str, Any], act
         _assert_bind_eq(cid, "block_table_sequences", bt_seqs, step_seqs)
     if step_tokens > 0:
         _assert_bind_eq(cid, "q_len", _opt_pos_int(actual.get("q_len"), actual.get("query_tokens"), nb.get("q_len"), nb.get("query_tokens")), step_tokens)
-    _assert_bind_eq(cid, "kv_len", _opt_pos_int(actual.get("seq_len"), actual.get("kv_len"), nb.get("kv_len")), _opt_pos_int(pgeo["kv_lengths"][0] if pgeo.get("kv_lengths") else None))
+    loc = tuple(getattr(op, "local_shape", ()) or ())
+    low_kv_len = _opt_pos_int(
+        pgeo["kv_lengths"][0] if pgeo.get("kv_lengths") else None,
+        loc[1] if len(loc) >= 2 else None,
+    )
+    _assert_bind_eq(cid, "kv_len", _opt_pos_int(actual.get("seq_len"), actual.get("kv_len"), nb.get("kv_len")), low_kv_len)
     low_pages = _opt_pos_int(pgeo["page_counts"][0] if pgeo.get("page_counts") else None)
     for mp in (_opt_pos_int(actual.get("page_count")), bt_pages, _opt_pos_int(nb.get("page_count"))):
         _assert_bind_eq(cid, "page_count", mp, low_pages)
@@ -536,8 +567,27 @@ def _select_level_ops(all_ops: tuple[Any, ...], *, level: str, payload: Mapping[
     raise ModelingError(f"whitebox_level_unsupported:{level}")
 
 
-def _resolve_step_dims(payload: Mapping[str, Any], *, local_kv: int, cid: str) -> tuple[int, int, int, int]:
-    ctx, batch, axis = int(payload.get("context_len") or payload.get("context") or 0), max(1, int(payload.get("batch_size") or payload.get("sequences") or 1)), str(payload.get("axis") or "").strip()
+def _distribute_total_tokens(
+    total_tokens: int, seqs: int, *, ctx: int, phase: str, cid: str,
+) -> tuple[int, int, tuple[RequestView, ...]]:
+    if total_tokens < seqs:
+        raise ModelingError(f"whitebox_tokens_below_sequences:{cid}:tokens={total_tokens}:seqs={seqs}")
+    base, rem = divmod(total_tokens, seqs)
+    if rem == 0:
+        return base, total_tokens, ()
+    reqs = tuple(
+        RequestView(f"req-{i}", base + (1 if i < rem else 0), ctx, True, phase)
+        for i in range(seqs)
+    )
+    return base, total_tokens, reqs
+
+
+def _resolve_step_dims(
+    payload: Mapping[str, Any], *, local_kv: int, cid: str, phase: str = "decode",
+) -> tuple[int, int, int, int, int, tuple[RequestView, ...]]:
+    ctx = max(0, int(payload.get("context_len") or payload.get("context") or 0))
+    batch = max(1, int(payload.get("batch_size") or payload.get("sequences") or 1))
+    axis = str(payload.get("axis") or "").strip()
     bxkv_raw = payload.get("batch_x_kv_heads") if payload.get("batch_x_kv_heads") is not None else (payload.get("value") if axis == "batch_x_kv_heads" else None)
     kv_per = max(1, int(local_kv))
     if bxkv_raw is not None and not isinstance(bxkv_raw, bool):
@@ -548,8 +598,30 @@ def _resolve_step_dims(payload: Mapping[str, Any], *, local_kv: int, cid: str) -
     else:
         seqs, bxkv = batch, batch * kv_per
     q_raw, tok_raw = payload.get("query_tokens"), payload.get("tokens")
-    tokens = int(q_raw) if (q_raw is not None and int(q_raw) > 1) else (int(tok_raw) if (tok_raw is not None and int(tok_raw) > 0 and (axis == "tokens" or seqs == 1)) else max(1, int(q_raw or 1)))
-    return tokens, max(0, ctx), max(1, seqs), bxkv
+    q_val = int(q_raw) if (q_raw is not None and not isinstance(q_raw, bool)) else None
+    tok_val = int(tok_raw) if (tok_raw is not None and not isinstance(tok_raw, bool)) else None
+    if axis == "tokens":
+        total = tok_val if (tok_val is not None and tok_val > 0) else max(1, int(payload.get("value") or 1))
+        per_seq, total_tok, reqs = _distribute_total_tokens(total, seqs, ctx=ctx, phase=phase, cid=cid)
+        return per_seq, ctx, seqs, bxkv, total_tok, reqs
+    act = payload.get("actual_shape") if isinstance(payload.get("actual_shape"), Mapping) else {}
+    mb = payload.get("measured_binding") if isinstance(payload.get("measured_binding"), Mapping) else {}
+    eff_fam = str(mb.get("family") or payload.get("target_family") or "").strip()
+    act_m = _opt_pos_int(act.get("m"))
+    synth_q1 = (
+        q_val == 1 and tok_val is not None and tok_val > 1
+        and eff_fam in _GEMM_FAMILIES and act_m is not None and act_m >= tok_val and act_m % tok_val == 0
+        and _ACTUAL_SEQ_SHAPE_KEYS.isdisjoint(act) and "tokens" not in act
+        and "q_len" not in mb and "query_tokens" not in mb
+    )
+    if q_val is not None and not synth_q1:
+        if q_val < 1:
+            raise ModelingError(f"whitebox_query_tokens_invalid:{cid}:{q_val}")
+        return q_val, ctx, seqs, bxkv, q_val * seqs, ()
+    if tok_val is not None and tok_val > 0:
+        per_seq, total_tok, reqs = _distribute_total_tokens(tok_val, seqs, ctx=ctx, phase=phase, cid=cid)
+        return per_seq, ctx, seqs, bxkv, total_tok, reqs
+    return 1, ctx, seqs, bxkv, seqs, ()
 
 
 def eligible_replay_cases(cases: Sequence[GateCase]) -> list[GateCase]:
@@ -615,8 +687,14 @@ class WhiteboxSpineRunner:
                 raise ModelingError(f"whitebox_case_invalid_type:{case.case_id}")
         if str(sim_case.machine.sku).strip() != str(case.cohort.sku).strip():
             raise ModelingError(f"whitebox_materialized_sku_mismatch:{case.case_id}:expected={case.cohort.sku}:got={sim_case.machine.sku}")
-        if self.primitive_table is not None:
-            sim_case = _apply_calibrated_primitive_rates(sim_case, self.primitive_table)
+        for axis_name, expected_val in topo_req.items():
+            actual_val = int(getattr(sim_case.runtime.parallel, axis_name, 1) or 1)
+            if actual_val != expected_val:
+                raise ModelingError(
+                    f"whitebox_materialized_parallel_mismatch:{case.case_id}:{axis_name}:expected={expected_val}:got={actual_val}"
+                )
+        if self.primitive_table is not None and self.primitive_table.sku != sim_case.machine.sku:
+            raise ModelingError(f"primitive_table_sku_mismatch:table={self.primitive_table.sku}:case={sim_case.machine.sku}")
         return sim_case
 
     def _run_level(self, case: GateCase, *, expected_level: str) -> EngineInterval:
@@ -626,38 +704,42 @@ class WhiteboxSpineRunner:
         payload = dict(case.payload)
         sim_case = self._materialize_case(case, payload)
         local_kv = int(compute_local_kv_heads(int(getattr(sim_case.model, "num_kv_heads", 1) or 1), max(1, int(getattr(sim_case.runtime.parallel, "tp", 1) or 1))))
-        tokens, context, seqs, bxkv = _resolve_step_dims(payload, local_kv=local_kv, cid=case.case_id)
-        step_req = StepRequest(phase=str(payload.get("phase") or case.cohort.phase or "decode"), tokens=tokens, context=context, sequences=seqs, scope="body")  # type: ignore[arg-type]
+        phase = str(payload.get("phase") or case.cohort.phase or "decode")
+        tokens, context, seqs, bxkv, total_tokens, step_reqs = _resolve_step_dims(payload, local_kv=local_kv, cid=case.case_id, phase=phase)
+        step_req = StepRequest(phase=phase, tokens=tokens, context=context, sequences=seqs, requests=step_reqs, scope="body")  # type: ignore[arg-type]
         spine = default_spine()
         prepared = spine.lower(sim_case, LoweringRequest(step=step_req, tier="mainline"))
         graphs: dict[int, tuple[Any, ...]] = {}
         for entry in prepared.graph.executable:
             chosen = _select_level_ops(entry.ops, level=expected_level, payload=payload, cid=case.case_id)
-            _verify_measured_binding(chosen, prepared.case, payload, local_kv=local_kv, expected_level=expected_level, cid=case.case_id, step_tokens=tokens, step_seqs=seqs)
+            _verify_measured_binding(chosen, prepared.case, payload, local_kv=local_kv, expected_level=expected_level, cid=case.case_id, step_tokens=(0 if step_reqs else tokens), step_seqs=seqs)
             graphs[entry.replica] = chosen
         ext_in = {"analysis_input": 0.0} if any("analysis_input" in op.deps for ops in graphs.values() for op in ops) else None
         engine, start_ev, end_ev, elapsed_ms, busy_ms, obs = _run_graphs_on_real_engine(
             prepared.case, graphs, start_event_name=case.boundary.start_event, end_event_name=case.boundary.end_event,
             external_inputs=ext_in, family_registry=spine.families, sequences=seqs, context=context,
+            primitive_table=self.primitive_table,
         )
-        elapsed_ns = int(round(elapsed_ms * NS_PER_MS))
-        busy_ns = min(elapsed_ns, int(round(busy_ms * NS_PER_MS)))
-        clock_op = str(payload.get("clock_operator") or self.clock_operator)
+        base_interval = bind_engine_interval(case, engine, start_ev, end_ev, source_level=expected_level)
+        elapsed_ns = int(base_interval.elapsed_span_ns if base_interval.elapsed_span_ns is not None else round(elapsed_ms * NS_PER_MS))
+        busy_ns = int(base_interval.busy_union_ns if base_interval.busy_union_ns is not None else min(elapsed_ns, int(round(busy_ms * NS_PER_MS))))
+        bound_clock = str(base_interval.clock_operator)
+        witness_clock = "busy_union" if (bound_clock == "busy_union" or str(payload.get("clock_operator") or "") == "busy_union") else bound_clock
         if elapsed_ns <= 0:
             raise ModelingError(f"whitebox_prediction_nonpositive:{case.case_id}")
-        target_ns = busy_ns if clock_op == "busy_union" else elapsed_ns
+        target_ns = busy_ns if witness_clock == "busy_union" else elapsed_ns
         if target_ns <= 0:
-            raise ModelingError(f"whitebox_selected_clock_nonpositive:{case.case_id}:{clock_op}")
+            raise ModelingError(f"whitebox_selected_clock_nonpositive:{case.case_id}:{witness_clock}")
         lp, ld = _build_executed_witness_program_dag(graphs, obs, target_ns=target_ns)
         diag = (
-            ("clock_operator", clock_op), ("busy_union_ns", busy_ns), ("elapsed_span_ns", elapsed_ns),
+            ("clock_operator", bound_clock), ("busy_union_ns", busy_ns), ("elapsed_span_ns", elapsed_ns),
             ("replay_level", expected_level), ("engine_uid", str(engine.uid)),
             ("program_dag_sha256", program_dag_sha256(lp, ld)), ("lean_program", lp), ("lean_dag", ld),
             ("executed_op_families", sorted({str(op.family) for ops in graphs.values() for op in ops})),
             ("executed_op_ids", [str(op.op_id) for ops in graphs.values() for op in ops][:_MAX_DIAG_OP_IDS]),
-            ("lowered_dimensions", {"materialized_sku": str(sim_case.machine.sku), "tokens": tokens * seqs, "context": context, "sequences": seqs, "batch_x_kv_heads": bxkv}),
+            ("lowered_dimensions", {"materialized_sku": str(sim_case.machine.sku), "tokens": total_tokens, "context": context, "sequences": seqs, "batch_x_kv_heads": bxkv}),
         )
-        return bind_engine_interval(case, engine, start_ev, end_ev, source_level=expected_level, diagnostics=diag)
+        return replace(base_interval, diagnostics=diag)
 
     def run_l1(self, case: GateCase) -> EngineInterval:
         return self._run_level(case, expected_level="L1")
@@ -690,28 +772,102 @@ def validate_disjoint_lineage(
     return {"train_roots": sorted(train_roots), "heldout_roots": sorted(held_roots), "heldout_roots_by_level": {k: sorted(v) for k, v in sorted(by_level.items())}}
 
 
-def _row_to_gate_case(row: Mapping[str, Any], *, sku: str, idx: int, plan_pt: Mapping[str, Any] | None = None) -> GateCase:
+def _resolve_row_clock_operator(
+    row: Mapping[str, Any], plan_pt: Mapping[str, Any] | None, *, cid: str, default_clock_operator: str,
+) -> str:
+    b_raw = row.get("boundary")
+    p_raw = row.get("payload")
+    b_clock = str(b_raw.get("clock_operator") or "").strip() if isinstance(b_raw, Mapping) else ""
+    r_clock = str(row.get("clock_operator") or "").strip()
+    p_clock = str(p_raw.get("clock_operator") or "").strip() if isinstance(p_raw, Mapping) else ""
+    plan_clock = str((plan_pt or {}).get("clock_operator") or "").strip()
+    declared = [c for c in (b_clock, r_clock, p_clock) if c]
+    if len(set(declared)) > 1:
+        raise ModelingError(f"clock_operator_conflict:{cid}:declared={sorted(set(declared))}")
+    clock_op = (declared[0] if declared else "") or plan_clock or default_clock_operator
+    if clock_op not in VALID_CLOCK_OPERATORS:
+        raise ModelingError(f"clock_operator_invalid:{cid}:{clock_op}")
+    if plan_clock and plan_clock != clock_op:
+        raise ModelingError(f"clock_operator_plan_mismatch:{cid}:plan={plan_clock}:got={clock_op}")
+    return clock_op
+
+
+def _validate_row_against_plan_point(
+    row: Mapping[str, Any], plan_pt: Mapping[str, Any] | None, *, cid: str,
+) -> None:
+    if not plan_pt:
+        return
+    pl = row.get("payload") if isinstance(row.get("payload"), Mapping) else {}
+    coh = row.get("cohort") if isinstance(row.get("cohort"), Mapping) else {}
+    plan_topo = str(plan_pt.get("parallel_topology") or "").strip().lower()
+    row_topo = str(row.get("parallel_topology") or pl.get("parallel_topology") or coh.get("parallel_topology") or "").strip().lower()
+    if plan_topo and row_topo and row_topo != plan_topo:
+        raise ModelingError(f"observation_plan_geometry_mismatch:{cid}:parallel_topology:expected={plan_topo}:got={row_topo}")
+    axis = str(plan_pt.get("axis") or "").strip()
+    if axis and plan_pt.get("value") is not None:
+        exp_val = int(plan_pt["value"])
+        if axis == "context_len":
+            got_val = _opt_pos_int(row.get("context_len"), row.get("context"), pl.get("context_len"), pl.get("context"))
+        else:
+            got_val = _opt_pos_int(row.get(axis), pl.get(axis))
+        if got_val != exp_val:
+            raise ModelingError(f"observation_plan_geometry_mismatch:{cid}:{axis}:expected={exp_val}:got={got_val}")
+    if plan_pt.get("batch_size") is not None and axis != "batch_x_kv_heads":
+        exp_b = int(plan_pt["batch_size"])
+        got_b = _opt_pos_int(row.get("batch_size"), row.get("sequences"), pl.get("batch_size"), pl.get("sequences"))
+        if (got_b is not None and got_b != exp_b) or (got_b is None and exp_b > 1):
+            raise ModelingError(f"observation_plan_geometry_mismatch:{cid}:batch_size:expected={exp_b}:got={got_b}")
+    if plan_pt.get("query_tokens") is not None and axis != "tokens":
+        got_q = _opt_pos_int(row.get("query_tokens"), pl.get("query_tokens"))
+        if got_q is not None and got_q != int(plan_pt["query_tokens"]):
+            raise ModelingError(f"observation_plan_geometry_mismatch:{cid}:query_tokens:expected={int(plan_pt['query_tokens'])}:got={got_q}")
+    if plan_pt.get("topk") is not None:
+        got_tk = _opt_pos_int(row.get("topk"), pl.get("topk"))
+        if got_tk is not None and got_tk != int(plan_pt["topk"]):
+            raise ModelingError(f"observation_plan_geometry_mismatch:{cid}:topk:expected={int(plan_pt['topk'])}:got={got_tk}")
+
+
+def _row_to_gate_case(
+    row: Mapping[str, Any], *, sku: str, idx: int, plan_pt: Mapping[str, Any] | None = None,
+    default_clock_operator: str = DEFAULT_CLOCK_OPERATOR,
+) -> GateCase:
     cid = str(row.get("case_id") or row.get("point_id") or f"obs-{idx}")
     for fk in FORBIDDEN_CALLER_PREDICTION_KEYS:
         if row.get(fk) is not None:
             raise ModelingError(f"caller_prediction_forbidden:{cid}:{fk}")
     check_no_service_regimes(row, path=cid)
-    clock_op = str(row.get("clock_operator") or (plan_pt or {}).get("clock_operator") or DEFAULT_CLOCK_OPERATOR).strip()
-    if clock_op not in VALID_CLOCK_OPERATORS:
-        raise ModelingError(f"clock_operator_invalid:{cid}:{clock_op}")
-    if plan_pt and plan_pt.get("clock_operator") and str(plan_pt["clock_operator"]) != clock_op:
-        raise ModelingError(f"clock_operator_plan_mismatch:{cid}:plan={plan_pt['clock_operator']}:got={clock_op}")
+    clock_op = _resolve_row_clock_operator(row, plan_pt, cid=cid, default_clock_operator=default_clock_operator)
+    _validate_row_against_plan_point(row, plan_pt, cid=cid)
+    plan_topo = str((plan_pt or {}).get("parallel_topology") or "").strip().lower()
     if isinstance(row.get("boundary"), Mapping) and isinstance(row.get("cohort"), Mapping):
         raw_copy = dict(row)
+        raw_copy["boundary"] = {**dict(row["boundary"]), "clock_operator": clock_op}
+        coh_copy = dict(row["cohort"])
+        if plan_topo and not str(coh_copy.get("parallel_topology") or "").strip():
+            coh_copy["parallel_topology"] = plan_topo
+        raw_copy["cohort"] = coh_copy
         pl = {**dict(raw_copy.get("payload") or {}), "clock_operator": clock_op}
-        for k in ("sim_case", "target_op_id", "target_family", "target_op_ids", "measured_binding", "actual_shape", "timed_nodes", "context_len", "tokens", "batch_size", "query_tokens", "batch_x_kv_heads", "parallel_topology", "topk"):
+        for k in ("sim_case", "target_op_id", "target_family", "target_op_ids", "measured_binding", "actual_shape", "timed_nodes", "context_len", "context", "tokens", "batch_size", "sequences", "query_tokens", "batch_x_kv_heads", "parallel_topology", "topk"):
             if row.get(k) is not None and k not in pl:
                 pl[k] = row[k]
+        if plan_topo:
+            pl.setdefault("parallel_topology", plan_topo)
+        if plan_pt:
+            pl.setdefault("axis", str(plan_pt.get("axis") or ""))
+            if plan_pt.get("value") is not None:
+                pl.setdefault("value", int(plan_pt["value"]))
         raw_copy["payload"] = pl
         gc = parse_gate_case(raw_copy)
         if gc.cohort.sku != sku:
             raise ModelingError(f"observation_sku_mismatch:{cid}:expected={sku}:got={gc.cohort.sku}")
+        if plan_topo:
+            req_r = validate_parallel_topology(plan_topo)
+            if len(set(gc.boundary.device_ranks)) != req_r:
+                raise ModelingError(f"observation_participating_ranks_mismatch:{cid}:expected={req_r}:got={len(set(gc.boundary.device_ranks))}")
         return gc
+    row_sku = str(row.get("sku") or "").strip()
+    if row_sku and row_sku != sku:
+        raise ModelingError(f"observation_sku_mismatch:{cid}:expected={sku}:got={row_sku}")
     level = str(row.get("level") or "L1").strip().upper()
     if level not in STANDARD_LEVEL_BOUNDARY_KINDS:
         raise ModelingError(f"observation_level_invalid:{cid}:{level}")
@@ -721,36 +877,46 @@ def _row_to_gate_case(row: Mapping[str, Any], *, sku: str, idx: int, plan_pt: Ma
     raw_sha = str(row.get("raw_sha256") or "").strip()
     if not acq or not run_uid or not raw_sha:
         raise ModelingError(f"observation_provenance_missing:{cid}")
+    bkind = str(row.get("boundary_kind") or STANDARD_LEVEL_BOUNDARY_KINDS[level]).strip()
+    is_delta = bkind == "paired_rung_delta"
     meas_ns = int(round(float(row["measured_ns"]))) if row.get("measured_ns") is not None else int(round(float(row.get("busy_union_ns" if clock_op == "busy_union" else "elapsed_span_ns") or 0)))
-    if meas_ns <= 0:
+    if not is_delta and meas_ns <= 0:
         raise ModelingError(f"observation_measured_ns_nonpositive:{cid}")
     ranks = tuple(int(r) for r in (row.get("device_ranks") or (0,)))
     ev_ids = tuple(str(e) for e in (row.get("event_ids") or (f"{cid}-s", f"{cid}-e")))
-    if plan_pt and plan_pt.get("parallel_topology"):
-        req_r = validate_parallel_topology(str(plan_pt["parallel_topology"]))
+    eff_topo = str(row.get("parallel_topology") or plan_topo or "tp1").strip().lower()
+    if plan_topo:
+        req_r = validate_parallel_topology(plan_topo)
         if len(set(ranks)) != req_r:
             raise ModelingError(f"observation_participating_ranks_mismatch:{cid}:expected={req_r}:got={len(set(ranks))}")
-    payload = {k: row[k] for k in ("sim_case", "target_op_id", "target_family", "target_layer", "target_op_ids", "measured_binding", "actual_shape", "timed_nodes", "context_len", "tokens", "batch_size", "query_tokens", "batch_x_kv_heads", "parallel_topology", "topk", "phase") if row.get(k) is not None}
+    payload = {k: row[k] for k in ("sim_case", "target_op_id", "target_family", "target_layer", "target_op_ids", "measured_binding", "actual_shape", "timed_nodes", "context_len", "context", "tokens", "batch_size", "sequences", "query_tokens", "batch_x_kv_heads", "parallel_topology", "topk", "phase") if row.get(k) is not None}
     payload["clock_operator"] = clock_op
+    payload.setdefault("parallel_topology", eff_topo)
     if plan_pt:
         payload.setdefault("axis", str(plan_pt.get("axis") or ""))
         payload.setdefault("value", int(plan_pt["value"]))
-    return parse_gate_case({
+    compact_doc: dict[str, Any] = {
         "case_id": cid, "level": level, "split": split,
+        "debug_cross_level": bool(row.get("debug_cross_level", False)),
         "boundary": {
             "raw_sha256": raw_sha, "acquisition_uid": acq, "run_uid": sanitize_public_run_id(run_uid),
             "parent_digests": list(row.get("parent_digests") or ()), "event_ids": list(ev_ids),
             "device_ranks": list(ranks), "clock_domain": str(row.get("clock_domain") or "device_ns"),
             "start_event": str(row.get("start_event") or "start"), "end_event": str(row.get("end_event") or "end"),
-            "boundary_kind": STANDARD_LEVEL_BOUNDARY_KINDS[level], "unit": "ns",
+            "boundary_kind": bkind, "unit": "ns",
             "capture_uri": sanitize_public_capture_uri(str(row.get("capture_uri") or ""), raw_sha256=raw_sha),
+            "clock_operator": clock_op,
         },
         "input_digest": str(row.get("input_digest") or raw_sha),
         "stack_digest": str(row.get("stack_digest") or hashlib.sha256(b"mindie-sim-whitebox").hexdigest()),
         "implementation": str(row.get("implementation") or "whitebox_spine"),
-        "cohort": {"level": level, "cohort_name": str(row.get("cohort_name") or "onboarding_cliff"), "sku": sku, "phase": str(row.get("phase") or "decode"), "mode": str(row.get("mode") or "eager"), "shape_regime": str(row.get("regime_tag") or "cliff"), "parallel_topology": str(row.get("parallel_topology") or "tp1")},
+        "cohort": {"level": level, "cohort_name": str(row.get("cohort_name") or "onboarding_cliff"), "sku": sku, "phase": str(row.get("phase") or "decode"), "mode": str(row.get("mode") or "eager"), "shape_regime": str(row.get("regime_tag") or "cliff"), "parallel_topology": eff_topo},
         "measured_ns": meas_ns, "payload": payload,
-    })
+    }
+    for opt_k in ("is_counterfactual", "has_matched_capture", "block_capture_present", "rung_arm_a_measured_ns", "rung_arm_b_measured_ns"):
+        if opt_k in row:
+            compact_doc[opt_k] = row[opt_k]
+    return parse_gate_case(compact_doc)
 
 
 def _verify_optional_capture_files(cases: Sequence[GateCase], capture_root: Path | None, require_capture_files: bool) -> bool:
@@ -766,8 +932,15 @@ def _verify_optional_capture_files(cases: Sequence[GateCase], capture_root: Path
         cand = root / f"{sha}.json"
         if not cand.is_file():
             raise ModelingError(f"capture_file_missing:{c.case_id}:{sha[:SHORT_DIGEST_LEN]}")
-        if hashlib.sha256(cand.read_bytes()).hexdigest().lower() != sha:
+        raw_bytes = cand.read_bytes()
+        if hashlib.sha256(raw_bytes).hexdigest().lower() != sha:
             raise ModelingError(f"capture_file_sha256_mismatch:{c.case_id}")
+        id_err = verify_capture_file_identity(
+            raw_bytes, cid=c.case_id, sku=c.cohort.sku, split=c.split, level=c.level,
+            measured_ns=c.measured_ns, measured_p99_ns=None, clock_operator=c.boundary.clock_operator,
+        )
+        if id_err:
+            raise ModelingError(id_err)
     return True
 
 
@@ -776,6 +949,8 @@ def score_sealed_gate_cases(
     threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT, atol_ns: int = DEFAULT_PHYSICAL_ATOL_NS,
     clock_operator: str = DEFAULT_CLOCK_OPERATOR, primitive_table: PrimitiveTable | None = None,
     profile_override: Mapping[str, Any] | None = None, external_train_roots: Sequence[str] = (),
+    manifest_lineage_edges: Sequence[Any] = (),
+    fits_manifest: FrozenFitManifest | Mapping[str, Any] | str | Path | None = None,
     expected_points: Sequence[Mapping[str, Any]] = (), expected_train_points: Sequence[Mapping[str, Any]] = (),
     expected_point_ids: Sequence[str] = (), expected_levels: Mapping[str, str] | None = None,
     expected_family: str = "", require_disjoint_level_roots: bool = True,
@@ -785,15 +960,18 @@ def score_sealed_gate_cases(
     cap_pct = validate_strict_threshold_pct(threshold_pct)
     eff_atol = validate_strict_atol_ns(atol_ns)
     plan_by_id = {str(p["point_id"]): p for p in (*expected_train_points, *expected_points) if isinstance(p, Mapping) and p.get("point_id")}
-    cases = [_row_to_gate_case(r, sku=sku, idx=i, plan_pt=plan_by_id.get(str(r.get("case_id") or r.get("point_id") or ""))) for i, r in enumerate(rows)]
+    cases = [_row_to_gate_case(r, sku=sku, idx=i, plan_pt=plan_by_id.get(str(r.get("case_id") or r.get("point_id") or "")), default_clock_operator=clock_operator) for i, r in enumerate(rows)]
     if not cases:
-        return {"ok": False, "status": "insufficient_evidence", "threshold_pct": cap_pct, "atol_ns": eff_atol, "capture_files_verified": False, "lineage": {}, "missing_plan_points": sorted(set(expected_point_ids) | {str(p["point_id"]) for p in expected_points}), "missing_train_points": sorted(str(p["point_id"]) for p in expected_train_points), "over_budget_points": [], "failing_cases": [], "heldout_summary": None, "train_summary": None, "residuals": []}
+        return {"ok": False, "status": "insufficient_evidence", "sku": sku, "threshold_pct": cap_pct, "atol_ns": eff_atol, "capture_files_verified": False, "fits_sha256": "", "lineage": {}, "missing_plan_points": sorted(set(expected_point_ids) | {str(p["point_id"]) for p in expected_points}), "missing_train_points": sorted(str(p["point_id"]) for p in expected_train_points), "over_budget_points": [], "failing_cases": [], "heldout_summary": None, "train_summary": None, "residuals": []}
     for c in cases:
         if expected_levels and c.case_id in expected_levels and c.level != expected_levels[c.case_id]:
             raise ModelingError(f"observation_plan_level_mismatch:{c.case_id}:expected={expected_levels[c.case_id]}:got={c.level}")
     lineage_summary = validate_disjoint_lineage(cases, external_train_roots=external_train_roots, require_disjoint_level_roots=require_disjoint_level_roots)
-    manifest = Manifest(f"onboarding-{sanitize_public_alias(sku, 'sku')}", "mindie-multilevel-manifest/1", tuple(cases), strict_three_level_blind=require_disjoint_level_roots)
-    fits = FrozenFitManifest(f"onboarding-fits-{sanitize_public_alias(sku, 'sku')}", "mindie-frozen-fits/1", ())
+    m_edges = parse_lineage_edges(manifest_lineage_edges)
+    if m_edges:
+        lineage_summary["lineage_edges"] = [[p, c] for p, c in m_edges]
+    manifest = Manifest(f"onboarding-{sanitize_public_alias(sku, 'sku')}", "mindie-multilevel-manifest/1", tuple(cases), lineage_edges=m_edges, strict_three_level_blind=require_disjoint_level_roots)
+    fits, fits_sha = load_frozen_fit_manifest(fits_manifest, default_fit_id=f"onboarding-fits-{sanitize_public_alias(sku, 'sku')}")
     validate_lineage(manifest, fits)
     cap_verified = _verify_optional_capture_files(cases, Path(capture_root) if capture_root is not None else None, require_capture_files)
     active_runner = runner if runner is not None else WhiteboxSpineRunner(clock_operator=clock_operator, primitive_table=primitive_table, profile_override=profile_override)
@@ -821,42 +999,53 @@ def score_sealed_gate_cases(
 
     eval_rows = list(evaluate_multilevel(manifest, fits, _TapRunner(), target_split="all"))
     residuals, failing, over_budget, held_apes, train_apes = [], [], [], [], []
+    covered_heldout_ids: set[str] = set()
+    covered_train_ids: set[str] = set()
     for rec in eval_rows:
         src, d, gc = raw_by_id.get(rec.case_id, {}), diag_by_id.get(rec.case_id, {}), case_by_id[rec.case_id]
-        eff_clock = str(d.get("clock_operator") or clock_operator)
+        eff_clock = str(rec.clock_operator)
         if eff_clock not in VALID_CLOCK_OPERATORS:
             raise ModelingError(f"clock_operator_invalid:{rec.case_id}:{eff_clock}")
-        if src.get("clock_operator") and eff_clock != str(src["clock_operator"]):
-            raise ModelingError(f"whitebox_clock_operator_mismatch:{rec.case_id}:expected={src['clock_operator']}:got={eff_clock}")
-        clock_key = "busy_union_ns" if eff_clock == "busy_union" else "elapsed_span_ns"
-        raw_pred_ns = d.get(clock_key)
-        if type(raw_pred_ns) is not int or raw_pred_ns <= 0:
-            raise ModelingError(f"whitebox_selected_clock_missing:{rec.case_id}:{clock_key}")
-        pred_ns = raw_pred_ns
+        if d.get("clock_operator") and str(d["clock_operator"]) != eff_clock:
+            raise ModelingError(f"whitebox_clock_operator_mismatch:{rec.case_id}:expected={eff_clock}:got={d['clock_operator']}")
+        is_delta = gc.boundary.boundary_kind == "paired_rung_delta"
+        pred_ns = int(rec.predicted_ns)
+        if not is_delta and rec.status in {"ok", "debug_only", "near_zero_delta"} and pred_ns <= 0:
+            raise ModelingError(f"whitebox_selected_clock_missing:{rec.case_id}:{eff_clock}")
         meas_ns = int(rec.measured_ns)
-        ape = round(abs(pred_ns - meas_ns) / float(meas_ns) * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if meas_ns > 0 else PERCENT_SCALE
-        over = exceeds_physical_tolerance(pred_ns, meas_ns, threshold_pct=cap_pct, atol_ns=eff_atol)
+        if is_delta:
+            ape = round(abs(pred_ns - meas_ns) / float(abs(meas_ns)) * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if meas_ns != 0 else (0.0 if pred_ns == 0 else PERCENT_SCALE)
+        else:
+            ape = round(abs(pred_ns - meas_ns) / float(meas_ns) * PERCENT_SCALE, DISPLAY_ROUND_DIGITS) if (meas_ns > 0 and pred_ns > 0) else PERCENT_SCALE
+        over = exceeds_physical_tolerance(pred_ns, meas_ns, threshold_pct=cap_pct, atol_ns=eff_atol, allow_signed=is_delta) if rec.status == "ok" else False
         residuals.append({
             "case_id": rec.case_id, "level": rec.level, "split": gc.split, "sku": sku,
+            "boundary_kind": gc.boundary.boundary_kind,
+            "status": rec.status, "excluded_reason": rec.excluded_reason,
             "measured_ns": meas_ns, "measured_p99_ns": int(src["measured_p99_ns"]) if src.get("measured_p99_ns") else None,
             "predicted_ns": pred_ns, "ape_pct": ape, "over_budget": over, "clock_operator": eff_clock,
             "engine_receipt": str(rec.engine_receipt or ""),
             "program_dag_sha256": str(d.get("program_dag_sha256") or ""),
             "executed_op_families": list(d.get("executed_op_families") or ()), "executed_op_ids": list(d.get("executed_op_ids") or ()),
-            "raw_sha256": gc.boundary.raw_sha256,
+            "raw_sha256": gc.boundary.raw_sha256, "acquisition_root": gc.boundary.acquisition_uid,
+            "run_uid": gc.boundary.run_uid, "parent_digests": list(gc.boundary.parent_digests),
             "capture_uri": sanitize_public_capture_uri(str(src.get("capture_uri") or gc.boundary.capture_uri), raw_sha256=gc.boundary.raw_sha256),
             "implementation": str(src.get("implementation") or "whitebox_spine"), "target_family": str(src.get("target_family") or expected_family),
             "operator_id": str(src.get("operator_id") or ""), "upstream_abi": str(src.get("upstream_abi") or ""),
         })
+        if rec.status != "ok":
+            continue
         if gc.split == "heldout":
+            covered_heldout_ids.add(rec.case_id)
             held_apes.append(ape)
             if over:
                 over_budget.append(rec.case_id)
                 failing.append(rec.case_id)
         else:
+            covered_train_ids.add(rec.case_id)
             train_apes.append(ape)
-    miss_ho = sorted((set(expected_point_ids) | {str(p["point_id"]) for p in expected_points}) - {c.case_id for c in cases if c.split == "heldout"})
-    miss_tr = sorted({str(p["point_id"]) for p in expected_train_points} - {c.case_id for c in cases if c.split == "train"})
+    miss_ho = sorted((set(expected_point_ids) | {str(p["point_id"]) for p in expected_points}) - covered_heldout_ids)
+    miss_tr = sorted({str(p["point_id"]) for p in expected_train_points} - covered_train_ids)
 
     def _summ(apes: list[float]) -> dict[str, Any] | None:
         if not apes:
@@ -866,7 +1055,8 @@ def score_sealed_gate_cases(
     ok = not miss_ho and not miss_tr and not failing and bool(held_apes)
     out = {
         "ok": ok, "status": "insufficient_evidence" if (miss_ho or miss_tr or not held_apes) else ("pass" if ok else "fail"),
-        "threshold_pct": cap_pct, "atol_ns": eff_atol, "capture_files_verified": cap_verified, "lineage": lineage_summary,
+        "sku": sku, "threshold_pct": cap_pct, "atol_ns": eff_atol, "capture_files_verified": cap_verified,
+        "fits_sha256": fits_sha, "lineage": lineage_summary,
         "missing_plan_points": miss_ho, "missing_train_points": miss_tr, "over_budget_points": sorted(over_budget),
         "failing_cases": sorted(failing), "heldout_summary": _summ(held_apes), "train_summary": _summ(train_apes), "residuals": residuals,
     }

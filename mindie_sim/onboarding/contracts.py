@@ -33,7 +33,10 @@ import sys
 import tempfile
 from typing import Any, Literal
 
-from mindie_sim.observations.multilevel import SHA256_HEX_LENGTH, sanitize_capture_uri, validate_provenance_text
+from mindie_sim.observations.multilevel import (
+    SHA256_HEX_LENGTH, FrozenFitManifest, FrozenFitParameter, normalize_lineage_token,
+    sanitize_capture_uri, validate_provenance_text,
+)
 from mindie_sim.optimization.dual_bound import (
     DagEdge, EventDagSpec, FarkasCertificate, OptimalityCertificate, ResourceChoiceProgram, check_optimality_certificate,
 )
@@ -104,11 +107,13 @@ _OPAQUE_CAMPAIGN_RE = re.compile(r"^camp-[0-9a-f]{12}$")
 _OPAQUE_RUN_RE = re.compile(r"^run-[0-9a-f]{12}$")
 _OPAQUE_LEASE_RE = re.compile(r"^lease-[0-9a-f]{16}$")
 _SAFE_HEX_CAPTURE_NAME_RE = re.compile(r"^[0-9a-f]{64}(?:\.jsonl?)?$")
+_HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
 _DIAGNOSE_ESCALATED_EXIT = 1
 _PREVIEW_LINES = 8
 _PREVIEW_CHAR_LIMIT = 320
 _TIMING_TRIPLE_LEN = 3
 _TIMING_QUAD_LEN = 4
+_LINEAGE_EDGE_PAIR_LEN = 2
 _MAX_MISSING_CASES_IN_MSG = 8
 _SUBPROCESS_NO_WINDOW = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
@@ -786,14 +791,182 @@ def validate_strict_atol_ns(atol_ns: int) -> int:
 
 def exceeds_physical_tolerance(
     predicted_ns: int, measured_ns: int, *, threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT, atol_ns: int = DEFAULT_PHYSICAL_ATOL_NS,
+    allow_signed: bool = False,
 ) -> bool:
-    if measured_ns <= 0 or predicted_ns <= 0:
+    if not allow_signed and (measured_ns <= 0 or predicted_ns <= 0):
         return True
-    return float(abs(int(predicted_ns) - int(measured_ns))) > max((float(threshold_pct) / PERCENT_SCALE) * float(measured_ns), float(atol_ns))
+    return float(abs(int(predicted_ns) - int(measured_ns))) > max((float(threshold_pct) / PERCENT_SCALE) * float(abs(measured_ns)), float(atol_ns))
 
 
 def program_dag_sha256(program: Mapping[str, Any], dag: Mapping[str, Any]) -> str:
     return sha256_bytes(canonical_json_bytes({"program": dict(program), "dag": dict(dag)}))
+
+
+def parse_lineage_edges(raw_edges: Any) -> tuple[tuple[str, str], ...]:
+    """Parse ``(parent, child)`` lineage edge declarations from JSON/mapping sources."""
+    edges: list[tuple[str, str]] = []
+    for edge in raw_edges or ():
+        if isinstance(edge, Mapping):
+            parent, child = str(edge.get("parent") or "").strip(), str(edge.get("child") or "").strip()
+        elif isinstance(edge, Sequence) and not isinstance(edge, (str, bytes)) and len(edge) == _LINEAGE_EDGE_PAIR_LEN:
+            parent, child = str(edge[0]).strip(), str(edge[1]).strip()
+        else:
+            raise ModelingError("frozen_fit_lineage_edge_invalid")
+        if not parent or not child:
+            raise ModelingError("frozen_fit_lineage_edge_invalid")
+        edges.append((parent, child))
+    return tuple(edges)
+
+
+def load_frozen_fit_manifest(
+    fits_source: str | Path | Mapping[str, Any] | FrozenFitManifest | None,
+    *, default_fit_id: str = "onboarding-fits",
+) -> tuple[FrozenFitManifest, str]:
+    """Load and canonically digest a ``FrozenFitManifest`` from a path, mapping, or instance."""
+    if fits_source is None:
+        return FrozenFitManifest(default_fit_id, "mindie-frozen-fits/1", ()), ""
+    if isinstance(fits_source, FrozenFitManifest):
+        return fits_source, sha256_bytes(canonical_json_bytes(asdict(fits_source)))
+    raw = read_bounded_json(fits_source) if isinstance(fits_source, (str, Path)) else fits_source
+    if not isinstance(raw, Mapping):
+        raise ModelingError("frozen_fit_manifest_not_mapping")
+    fit_id = str(raw.get("fit_id") or default_fit_id).strip()
+    schema_ver = str(raw.get("schema_version") or "mindie-frozen-fits/1").strip()
+    params: list[FrozenFitParameter] = []
+    for item in raw.get("parameters") or ():
+        if not isinstance(item, Mapping):
+            raise ModelingError("frozen_fit_parameter_invalid")
+        pid = str(item.get("parameter_id") or "").strip()
+        if not pid:
+            raise ModelingError("frozen_fit_parameter_id_missing")
+        digests = tuple(str(d).strip() for d in (item.get("training_digests") or ()) if str(d).strip())
+        params.append(FrozenFitParameter(pid, digests, str(item.get("source_uri") or "").strip()))
+    edges = parse_lineage_edges(raw.get("lineage_edges") or ())
+    manifest = FrozenFitManifest(fit_id, schema_ver, tuple(params), edges)
+    return manifest, sha256_bytes(canonical_json_bytes(asdict(manifest)))
+
+
+def verify_fits_disjoint_from_residuals(fits: FrozenFitManifest, score_doc: Mapping[str, Any]) -> None:
+    """Reject any frozen-fit parameter whose lineage overlaps heldout residual digests or roots."""
+    if not fits.parameters:
+        return
+    heldout_tokens: set[str] = set()
+    for row in score_doc.get("residuals") or ():
+        if isinstance(row, Mapping) and str(row.get("split") or "") == "heldout":
+            for key in ("raw_sha256", "acquisition_root", "run_uid"):
+                if (val := str(row.get(key) or "").strip()):
+                    heldout_tokens.add(normalize_lineage_token(val))
+            for tok in row.get("parent_digests") or ():
+                if (val := str(tok or "").strip()):
+                    heldout_tokens.add(normalize_lineage_token(val))
+    lineage = score_doc.get("lineage")
+    extra_edges: tuple[tuple[str, str], ...] = ()
+    if isinstance(lineage, Mapping):
+        for tok in lineage.get("heldout_roots") or ():
+            if (val := str(tok or "").strip()):
+                heldout_tokens.add(normalize_lineage_token(val))
+        if lineage.get("lineage_edges"):
+            extra_edges = parse_lineage_edges(lineage.get("lineage_edges"))
+    if not heldout_tokens:
+        return
+    adj: dict[str, set[str]] = {}
+    for parent, child in (*fits.lineage_edges, *extra_edges):
+        np_tok, nc_tok = normalize_lineage_token(parent), normalize_lineage_token(child)
+        adj.setdefault(np_tok, set()).add(nc_tok)
+        adj.setdefault(nc_tok, set()).add(np_tok)
+    closure, queue = set(heldout_tokens), list(heldout_tokens)
+    while queue:
+        cur = queue.pop()
+        for nxt in adj.get(cur, ()):
+            if nxt not in closure:
+                closure.add(nxt)
+                queue.append(nxt)
+    for param in fits.parameters:
+        param_tokens = {normalize_lineage_token(d) for d in param.training_digests if d and d.strip()}
+        overlap = sorted(param_tokens & closure)
+        if overlap:
+            raise ModelingError(f"lineage_fit_heldout_leakage:parameter={param.parameter_id}:roots={','.join(overlap)}")
+
+
+def verify_capture_file_identity(
+    raw_bytes: bytes, *, cid: str, sku: str = "", split: str = "", level: str = "",
+    measured_ns: int | None = None, measured_p99_ns: int | None = None, clock_operator: str = "",
+) -> str:
+    """Verify capture file JSON content matches the residual's case identity and measurements."""
+    try:
+        doc = json.loads(raw_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return f"capture_file_json_invalid:{cid}"
+    if not isinstance(doc, Mapping):
+        return f"capture_file_json_invalid:{cid}"
+    cap_cid = str(doc.get("case_id") or "").strip()
+    if not cap_cid or cap_cid != cid:
+        return f"capture_file_identity_mismatch:{cid}:case_id={cap_cid or 'missing'}"
+    if sku and (cap_sku := str(doc.get("sku") or "").strip()) and cap_sku != sku:
+        return f"capture_file_identity_mismatch:{cid}:sku={cap_sku}"
+    if split and (cap_split := str(doc.get("split") or "").strip().lower()) and cap_split != split.lower():
+        return f"capture_file_identity_mismatch:{cid}:split={cap_split}"
+    if level and (cap_lvl := str(doc.get("level") or "").strip().upper()) and cap_lvl != level.upper():
+        return f"capture_file_identity_mismatch:{cid}:level={cap_lvl}"
+    if measured_ns is not None and doc.get("measured_ns") is not None and int(round(float(doc["measured_ns"]))) != int(measured_ns):
+        return f"capture_file_identity_mismatch:{cid}:measured_ns"
+    if measured_p99_ns is not None and doc.get("measured_p99_ns") is not None and int(round(float(doc["measured_p99_ns"]))) != int(measured_p99_ns):
+        return f"capture_file_identity_mismatch:{cid}:measured_p99_ns"
+    if clock_operator and (cap_clk := str(doc.get("clock_operator") or "").strip()) and cap_clk != clock_operator:
+        return f"capture_file_identity_mismatch:{cid}:clock_operator={cap_clk}"
+    return ""
+
+
+def _verify_residual_capture_files(
+    residuals: Sequence[Mapping[str, Any]], capture_root: str | Path | None, require_capture_files: bool,
+) -> tuple[bool, int, str, str]:
+    if capture_root is None:
+        return (False, 0, "capture_file_missing:capture_root_not_provided", "") if require_capture_files else (True, 0, "optional_not_requested", "")
+    root = Path(capture_root)
+    if not root.is_dir():
+        return False, 0, f"capture_file_missing:{root.name}", ""
+    if not residuals:
+        return False, 0, "capture_file_missing:no_residuals", ""
+    verified_pairs: list[tuple[str, str]] = []
+    violations: list[str] = []
+    for row in residuals:
+        cid = str(row.get("case_id") or "")
+        raw_sha = str(row.get("raw_sha256") or "").strip().lower()
+        if not _HEX_64_RE.fullmatch(raw_sha):
+            violations.append(f"capture_raw_sha256_invalid:{cid}")
+            continue
+        cand = root / f"{raw_sha}.json"
+        if not cand.is_file():
+            violations.append(f"capture_file_missing:{cid}:{raw_sha[:SHORT_DIGEST_LEN]}")
+            continue
+        try:
+            if cand.stat().st_size > MAX_READ_JSON_BYTES:
+                violations.append(f"capture_file_exceeds_50_mib:{cid}")
+                continue
+            raw_bytes = cand.read_bytes()
+        except TimeoutError:
+            raise
+        except OSError:
+            violations.append(f"capture_file_read_failed:{cid}")
+            continue
+        if sha256_bytes(raw_bytes).lower() != raw_sha:
+            violations.append(f"capture_file_sha256_mismatch:{cid}")
+            continue
+        id_err = verify_capture_file_identity(
+            raw_bytes, cid=cid, sku=str(row.get("sku") or "").strip(),
+            split=str(row.get("split") or "").strip(), level=str(row.get("level") or "").strip(),
+            measured_ns=int(row["measured_ns"]) if row.get("measured_ns") is not None else None,
+            measured_p99_ns=int(row["measured_p99_ns"]) if row.get("measured_p99_ns") is not None else None,
+            clock_operator=str(row.get("clock_operator") or "").strip(),
+        )
+        if id_err:
+            violations.append(id_err)
+            continue
+        verified_pairs.append((cid, raw_sha))
+    if violations:
+        return False, len(verified_pairs), "; ".join(violations[:_PREVIEW_LINES]), ""
+    bundle_sha = sha256_bytes(canonical_json_bytes(sorted(verified_pairs)))
+    return True, len(verified_pairs), f"{len(verified_pairs)}/{len(residuals)} capture files verified", bundle_sha
 
 
 def _strict_int(val: Any, name: str) -> int:
@@ -835,6 +1008,7 @@ def check_lean_non_inversion(
     checked, violations, seen_ids = [], [], set()
     for idx, row in enumerate(rows):
         cid = str(row.get("case_id") or f"case-{idx}")
+        dup_case = cid in seen_ids
         seen_ids.add(cid)
         raw_vals = (row.get("l_star_lean_ns"), row.get("t_sim_ns"), row.get("t_silicon_p99_ns"))
         if any(v is None or isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(float(v)) for v in raw_vals):
@@ -843,6 +1017,9 @@ def check_lean_non_inversion(
             continue
         l_star, t_sim, t_p99 = (int(round(float(v))) for v in raw_vals)
         cert_checked, cert_valid, witness_sha = False, l_star > 0 and t_sim > 0 and t_p99 > 0, ""
+        if dup_case:
+            cert_valid = False
+            violations.append(f"lean_witness_duplicate_case:{cid}")
         try:
             witness = _parse_certificate_witness(row)
         except (ModelingError, KeyError, TypeError, ValueError) as exc:
@@ -856,17 +1033,24 @@ def check_lean_non_inversion(
         elif verify_certificates:
             cert_valid = False
             violations.append(f"lean_certificate_missing:{cid}")
-        if expected_case_timings is not None and cid in expected_case_timings:
+        if expected_case_timings is not None and cid not in expected_case_timings:
+            cert_valid = False
+            violations.append(f"lean_witness_unexpected_case:{cid}")
+        elif expected_case_timings is not None:
             entry = expected_case_timings[cid]
             exp_sim, exp_meas = int(entry[0]), int(entry[1])
             exp_p99 = int(entry[2]) if len(entry) >= _TIMING_TRIPLE_LEN and entry[2] is not None else None
             exp_sha = str(entry[3] or "").strip().lower() if len(entry) >= _TIMING_QUAD_LEN else ""
+            exp_sha_ok = bool(_HEX_64_RE.fullmatch(exp_sha))
+            wit_sha_ok = bool(_HEX_64_RE.fullmatch(witness_sha))
             checks = (
                 (t_sim != exp_sim, f"lean_witness_t_sim_mismatch:{cid}:witness={t_sim}:scored={exp_sim}"),
                 (require_captured_p99 and (exp_p99 is None or exp_p99 <= 0), f"lean_captured_p99_missing:{cid}"),
                 (exp_p99 is not None and t_p99 != exp_p99, f"lean_witness_p99_mismatch:{cid}:witness={t_p99}:captured={exp_p99}"),
                 (t_p99 < exp_meas, f"lean_witness_p99_below_measured:{cid}"),
-                (bool(require_program_dag_join and exp_sha and witness_sha != exp_sha), f"lean_witness_program_dag_mismatch:{cid}"),
+                (bool(require_program_dag_join and not exp_sha_ok), f"lean_scored_program_dag_sha256_missing:{cid}"),
+                (bool(require_program_dag_join and not wit_sha_ok), f"lean_witness_program_dag_sha256_missing:{cid}"),
+                (bool(require_program_dag_join and exp_sha_ok and wit_sha_ok and witness_sha != exp_sha), f"lean_witness_program_dag_mismatch:{cid}"),
             )
             for failed, msg in checks:
                 if failed:
@@ -1015,18 +1199,46 @@ def finalize_stage4_certification(
     score_doc: Mapping[str, Any], lean_bounds_json: str | Path | Sequence[Mapping[str, Any]] | None,
     cap_pct: float, eff_atol: int, pre_gates: Sequence[GateCheckOutcome] = (),
     ape_gate_name: str, artifacts: Mapping[str, str], extra_warning_records: Sequence[Mapping[str, Any] | None] = (),
+    capture_root: str | Path | None = None, require_capture_files: bool = False,
     repo_root: str | Path | None = None, run_repo_gates: bool = True, orthogonality_base: str | None = None,
     out_receipt: str | Path | None = None, diagnosis_out: str | Path | None = None,
 ) -> tuple[bool, str, dict[str, Any], dict[str, Any] | None]:
-    """Shared Stage-4 gate verification (APE tolerance, certified lower-bound non-inversion, repo gates, tail diagnosis, SHA-256 receipt)."""
+    """Shared Stage-4 gate verification (SKU/capture provenance, APE tolerance, certified lower-bound non-inversion, repo gates, tail diagnosis, SHA-256 receipt)."""
     residuals = list(score_doc.get("residuals") or ())
-    heldout = [r for r in residuals if r.get("split") == "heldout"]
-    failing = [r for r in heldout if exceeds_physical_tolerance(int(r.get("predicted_ns") or 0), int(r.get("measured_ns") or 0), threshold_pct=cap_pct, atol_ns=eff_atol)]
-    ape_ok = bool(score_doc.get("ok")) and bool(heldout) and not failing
+    score_sku = str(score_doc.get("sku") or "").strip()
+    plan_obj = score_doc.get("plan") if isinstance(score_doc.get("plan"), Mapping) else None
+    plan_sku = str(plan_obj.get("sku") or "").strip() if plan_obj is not None else ""
+    foreign_rows = [str(r.get("case_id") or "") for r in residuals if str(r.get("sku") or "").strip() != sku]
+    sku_ok = (score_sku == sku) and (not plan_sku or plan_sku == sku) and not foreign_rows
+    sku_detail = (
+        f"sku={sku}"
+        if sku_ok
+        else f"target_sku_mismatch:expected={sku}:score_sku={score_sku or 'missing'}:foreign_rows={len(foreign_rows)}"
+    )
+    heldout = [
+        r for r in residuals
+        if r.get("split") == "heldout" and str(r.get("status") or "ok") == "ok" and str(r.get("sku") or "").strip() == sku
+    ]
+    failing = [
+        r for r in heldout
+        if exceeds_physical_tolerance(
+            int(r.get("predicted_ns") or 0), int(r.get("measured_ns") or 0),
+            threshold_pct=cap_pct, atol_ns=eff_atol,
+            allow_signed=(str(r.get("boundary_kind") or "") == "paired_rung_delta"),
+        )
+    ]
+    ape_ok = sku_ok and bool(score_doc.get("ok")) and bool(heldout) and not failing
     gates: list[GateCheckOutcome] = [
         *pre_gates,
+        GateCheckOutcome("target_sku_provenance", sku_ok, "pass" if sku_ok else "fail", sku_detail, (("expected_sku", sku), ("score_sku", score_sku), ("foreign_row_count", len(foreign_rows)))),
         GateCheckOutcome(ape_gate_name, ape_ok, "pass" if ape_ok else "fail", f"{len(heldout) - len(failing)}/{len(heldout)} heldout within max({cap_pct}%, {eff_atol}ns)", (("heldout_count", len(heldout)), ("failing_count", len(failing)))),
     ]
+    eff_artifacts = dict(artifacts)
+    if require_capture_files or capture_root is not None:
+        cap_ok, cap_cnt, cap_detail, cap_bundle_sha = _verify_residual_capture_files(residuals, capture_root, require_capture_files)
+        gates.append(GateCheckOutcome("capture_files_sha256", cap_ok, "pass" if cap_ok else "fail", cap_detail, (("verified_count", cap_cnt), ("required", bool(require_capture_files)))))
+        if cap_bundle_sha:
+            eff_artifacts["verified_captures_sha256"] = cap_bundle_sha
     lean_rows = list(read_bounded_json(lean_bounds_json) if isinstance(lean_bounds_json, (str, Path)) else (lean_bounds_json or ()))
     exp_timings = {str(r["case_id"]): (int(r["predicted_ns"]), int(r["measured_ns"]), r.get("measured_p99_ns"), r.get("program_dag_sha256")) for r in heldout}
     lean_ok, lean_checked, lean_viols = check_lean_non_inversion(lean_rows, expected_case_timings=exp_timings)
@@ -1041,7 +1253,7 @@ def finalize_stage4_certification(
     rec_u, rec_w = collect_receipt_warnings(score_doc, *extra_warning_records)
     receipt = seal_onboarding_receipt(
         schema=schema, target_kind=target_kind, target_id=target_id, sku=sku, status=status, ok=all_ok,
-        gates=gates, artifacts=artifacts,
+        gates=gates, artifacts=eff_artifacts,
         summary={"heldout_count": len(heldout), "failing_count": len(failing), "threshold_pct": cap_pct, "atol_ns": eff_atol, "acquisition_mode": acq_mode},
         receipt_unconfirmed=rec_u, receipt_warning=rec_w,
     ).to_dict()

@@ -40,6 +40,7 @@ import tempfile
 from typing import Any
 
 from mindie_sim.backends import ascend_profiles
+from mindie_sim.observations.multilevel import FrozenFitManifest
 from mindie_sim.primitives import sealer as _canonical_sealer
 from mindie_sim.primitives.loader import default_primitives_dir
 from mindie_sim.primitives.schema import PrimitiveTable, parse_primitive_table
@@ -55,10 +56,11 @@ from .contracts import (
     GIB_BYTES, MIB_BYTES, SHORT_DIGEST_LEN, SKU_ONBOARDING_RECEIPT_SCHEMA,
     TRAIN_OBSERVATION_MANIFEST_SCHEMA, SiliconProfileConflict, SocProbeRecord, TimeoutBudget,
     assert_sanitized_payload, build_capture_uri, collect_receipt_warnings, evaluate_abi_rejections,
-    finalize_stage4_certification, read_bounded_json, resolve_repo_root, run_python_script,
-    sanitize_lease_for_receipt, sanitize_public_alias, sanitize_public_campaign_id, sha256_bytes,
-    subprocess_window_kwargs, synthesize_sku_512_400k_plan, validate_strict_atol_ns,
-    validate_strict_threshold_pct, write_atomic_json,
+    finalize_stage4_certification, load_frozen_fit_manifest, parse_lineage_edges, read_bounded_json, resolve_repo_root,
+    run_python_script, sanitize_lease_for_receipt, sanitize_public_alias,
+    sanitize_public_campaign_id, sha256_bytes, subprocess_window_kwargs,
+    synthesize_sku_512_400k_plan, validate_strict_atol_ns, validate_strict_threshold_pct,
+    verify_fits_disjoint_from_residuals, write_atomic_json,
 )
 from .profiler_normalizer import (
     acquire_coordinator_host_queue_lease, acquire_stage3_observations, assign_plan_point_level,
@@ -234,6 +236,12 @@ def _scaffold_sku_profile(probe: SocProbeRecord, all_profiles: Mapping[str, Any]
     for pool, val in (("l2", probe.l2_bytes), ("ub", probe.ub_bytes), ("l1", probe.l1_bytes), ("l0a", probe.l0a_bytes), ("l0b", probe.l0b_bytes), ("l0c", probe.l0c_bytes)):
         if val > 0:
             dev["buffers"][pool] = val
+    if probe.l2_bytes > 0 and isinstance(dev.get("physical_mechanisms"), dict):
+        mem_h = dev["physical_mechanisms"].get("memory_hierarchy")
+        if isinstance(mem_h, dict):
+            mem_h["l2_capacity_bytes"] = probe.l2_bytes
+            if isinstance(mem_h.get("provenance"), dict):
+                mem_h["provenance"]["l2_capacity_bytes"] = probe.l2_bytes
     dev["buffer_units"]["l2"] = 1
     base["architecture"], base["dies_per_package"] = probe.architecture, probe.dies_per_package
     for cname, bw in probe.fabric_channels:
@@ -363,8 +371,8 @@ def _run_live_l0_bench(sku: str, endpoint_alias: str, campaign_id: str, cann_ver
         return dict(cap["payload"])
 
 
-def _manifest_cann_by_digest(repo_root: str | Path | None, manifest_path: str | Path | None) -> dict[str, str]:
-    mapping: dict[str, str] = {}
+def _manifest_cann_by_digest(repo_root: str | Path | None, manifest_path: str | Path | None) -> dict[str, set[str]]:
+    mapping: dict[str, set[str]] = {}
     for p in (*( [Path(manifest_path)] if manifest_path else [] ), resolve_repo_root(repo_root) / "data/primitives/manifest.json", default_primitives_dir() / "manifest.json"):
         if not p.is_file():
             continue
@@ -380,9 +388,9 @@ def _manifest_cann_by_digest(repo_root: str | Path | None, manifest_path: str | 
                 if cann.lower() in _ABSENT_CANN_TOKENS:
                     continue
                 if entry.get("capture_uri") and "/" in str(entry["capture_uri"]):
-                    mapping[str(entry["capture_uri"]).rsplit("/", 1)[-1].lower()] = cann
+                    mapping.setdefault(str(entry["capture_uri"]).rsplit("/", 1)[-1].lower(), set()).add(cann)
                 if entry.get("envelope_sha256"):
-                    mapping[str(entry["envelope_sha256"]).lower()] = cann
+                    mapping.setdefault(str(entry["envelope_sha256"]).lower(), set()).add(cann)
     return mapping
 
 
@@ -450,9 +458,17 @@ def calibrate_l0_and_fabric(
             else:
                 merged[k] = v
 
-    # Cross-check CANN provenance against capture & manifest
+    # Cross-check CANN provenance across L0 capture, fabric capture, manifest, and request
     cann_map = _manifest_cann_by_digest(repo_root, manifest_path)
-    ev_canns = {c for c in (str((raw_l0 or {}).get("cann_version") or "").strip(), str((raw_fab or {}).get("cann_version") or "").strip(), *(cann_map.get(d, "") for d in cap_digests)) if c.lower() not in _ABSENT_CANN_TOKENS}
+    ev_canns = {
+        c for c in (
+            *(str((src or {}).get(k) or "").strip() for src in (raw_l0, raw_fab) for k in ("cann_version", "runtime_cann_version")),
+            *(c for d in cap_digests for c in cann_map.get(d, ())),
+        )
+        if c.lower() not in _ABSENT_CANN_TOKENS
+    }
+    if len(ev_canns) > 1:
+        raise ModelingError(f"cann_version_provenance_conflict:observed={sorted(ev_canns)}")
     req_cann = str(cann_version or "").strip()
     if req_cann.lower() not in _ABSENT_CANN_TOKENS and ev_canns and req_cann not in ev_canns:
         raise ModelingError(f"cann_version_provenance_conflict:requested={req_cann}:observed={sorted(ev_canns)}")
@@ -492,6 +508,8 @@ def validate_512_400k(
     *, sku: str, observations_json: str | Path | Sequence[Mapping[str, Any]] | None = None,
     train_manifest_json: str | Path | Mapping[str, Any] | None = None,
     primitives_json: str | Path | Mapping[str, Any] | None = None,
+    fits_json: str | Path | Mapping[str, Any] | FrozenFitManifest | None = None,
+    lineage_edges: Sequence[Any] = (),
     plan_out: str | Path | None = None, report_out: str | Path | None = None,
     threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT, atol_ns: int = DEFAULT_PHYSICAL_ATOL_NS,
     campaign_id: str = "camp-onboard-512-400k", live_profiler: bool = False,
@@ -528,8 +546,9 @@ def validate_512_400k(
     scored = score_sealed_gate_cases(
         rows, sku=sku, runner=runner, threshold_pct=cap_pct, atol_ns=eff_atol,
         primitive_table=prim_tbl, profile_override=profile_override, external_train_roots=ext_train,
-        expected_points=plan_doc["heldout_points"], expected_train_points=plan_doc["train_points"],
-        expected_levels=exp_levels, capture_root=capture_root, require_capture_files=require_capture_files,
+        manifest_lineage_edges=lineage_edges, fits_manifest=fits_json, expected_points=plan_doc["heldout_points"],
+        expected_train_points=plan_doc["train_points"], expected_levels=exp_levels,
+        capture_root=capture_root, require_capture_files=require_capture_files,
     )
     abi_chk = evaluate_abi_rejections(plan_doc.get("abi_rejection_points") or (), abi_obs)
     ok = bool(scored["ok"]) and bool(abi_chk["ok"])
@@ -540,6 +559,7 @@ def validate_512_400k(
         "required_ranks": req_npus, "acquisition_mode": "live_silicon" if live_profiler else "offline_reverify",
         "capture_files_verified": bool(scored["capture_files_verified"]), "lease": lease_pub,
         "primitives_envelope_sha256": prim_tbl.envelope_sha256 if prim_tbl else "",
+        "fits_sha256": str(scored.get("fits_sha256") or ""),
         "missing_heldout_points": scored["missing_plan_points"], "missing_train_points": scored["missing_train_points"],
         "over_budget_points": scored["over_budget_points"], "failing_cases": scored["failing_cases"],
         "abi_rejection_check": abi_chk, "lineage": scored["lineage"],
@@ -557,7 +577,8 @@ def validate_512_400k(
 def verify_sku_gates(
     *, sku: str, validation_report_json: str | Path | Mapping[str, Any] | None = None,
     multilevel_manifest_json: str | Path | Mapping[str, Any] | None = None,
-    fits_json: str | Path | None = None, lean_bounds_json: str | Path | Sequence[Mapping[str, Any]] | None = None,
+    fits_json: str | Path | Mapping[str, Any] | FrozenFitManifest | None = None,
+    lean_bounds_json: str | Path | Sequence[Mapping[str, Any]] | None = None,
     primitives_json: str | Path | Mapping[str, Any] | None = None, expected_cann_version: str = "",
     capture_root: str | Path | None = None, require_capture_files: bool = False,
     repo_root: str | Path | None = None, threshold_pct: float = DEFAULT_HELDOUT_APE_THRESHOLD_PCT,
@@ -567,29 +588,49 @@ def verify_sku_gates(
     stage2_lease: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Stage 4: Enforce multilevel <10% / max(10%, 2us), certified lower-bound non-inversion, governance & orthogonality gates."""
-    del fits_json
     cap_pct, eff_atol = validate_strict_threshold_pct(threshold_pct), validate_strict_atol_ns(atol_ns)
     if validation_report_json is None and multilevel_manifest_json is None:
         raise ModelingError("verify_sku_gates_requires_validation_report_or_manifest")
     prim_tbl: PrimitiveTable | None = None
     if primitives_json is not None:
         prim_tbl = parse_primitive_table(read_bounded_json(primitives_json) if isinstance(primitives_json, (str, Path)) else primitives_json)
+        if prim_tbl.sku != sku:
+            raise ModelingError(f"primitives_sku_mismatch:expected={sku}:got={prim_tbl.sku}")
         if expected_cann_version.strip() and str(prim_tbl.cann_version or "").strip() != expected_cann_version.strip():
             raise ModelingError(f"primitives_cann_version_mismatch:expected={expected_cann_version}:got={prim_tbl.cann_version}")
 
+    fits_obj, fits_sha = (
+        load_frozen_fit_manifest(fits_json, default_fit_id=f"onboarding-fits-{sanitize_public_alias(sku, 'sku')}")
+        if fits_json is not None
+        else (None, "")
+    )
     if validation_report_json is not None:
         val_doc = dict(read_bounded_json(validation_report_json) if isinstance(validation_report_json, (str, Path)) else validation_report_json)
+        report_fits_sha = str(val_doc.get("fits_sha256") or "").strip().lower()
+        if fits_obj is not None:
+            if report_fits_sha and report_fits_sha != fits_sha.lower():
+                raise ModelingError(f"fits_manifest_digest_mismatch:report={report_fits_sha}:supplied={fits_sha}")
+            verify_fits_disjoint_from_residuals(fits_obj, val_doc)
     else:
         mf = read_bounded_json(multilevel_manifest_json) if isinstance(multilevel_manifest_json, (str, Path)) else multilevel_manifest_json
         assert isinstance(mf, Mapping)
-        val_doc = validate_512_400k(sku=sku, observations_json=list(mf.get("cases") or ()), abi_rejection_results=list(mf.get("abi_rejection_results") or ()), primitives_json=primitives_json, capture_root=capture_root, require_capture_files=require_capture_files, profile_override=profile_override, runner=runner, threshold_pct=cap_pct, atol_ns=eff_atol)
+        mf_edges = parse_lineage_edges(mf.get("lineage_edges") or ())
+        val_doc = validate_512_400k(sku=sku, observations_json=list(mf.get("cases") or ()), abi_rejection_results=list(mf.get("abi_rejection_results") or ()), primitives_json=primitives_json, fits_json=fits_obj, lineage_edges=mf_edges, capture_root=capture_root, require_capture_files=require_capture_files, profile_override=profile_override, runner=runner, threshold_pct=cap_pct, atol_ns=eff_atol)
 
+    artifacts = {
+        "primitives_envelope_sha256": prim_tbl.envelope_sha256 if prim_tbl else str(val_doc.get("primitives_envelope_sha256") or ""),
+        "plan_sha256": str(val_doc.get("plan_sha256") or ""),
+    }
+    eff_fits_sha = fits_sha or str(val_doc.get("fits_sha256") or "")
+    if eff_fits_sha:
+        artifacts["fits_sha256"] = eff_fits_sha
     all_ok, status, receipt, diagnosis = finalize_stage4_certification(
         schema=SKU_ONBOARDING_RECEIPT_SCHEMA, target_kind="sku", target_id=f"sku:{sku}", sku=sku,
         score_doc=val_doc, lean_bounds_json=lean_bounds_json, cap_pct=cap_pct, eff_atol=eff_atol,
         ape_gate_name="multilevel_512_400k",
-        artifacts={"primitives_envelope_sha256": prim_tbl.envelope_sha256 if prim_tbl else str(val_doc.get("primitives_envelope_sha256") or ""), "plan_sha256": str(val_doc.get("plan_sha256") or "")},
+        artifacts=artifacts,
         extra_warning_records=(sanitize_lease_for_receipt(stage2_lease),),
+        capture_root=capture_root, require_capture_files=require_capture_files,
         repo_root=repo_root, run_repo_gates=run_repo_gates, orthogonality_base=orthogonality_base,
         out_receipt=out_receipt, diagnosis_out=diagnosis_out,
     )
