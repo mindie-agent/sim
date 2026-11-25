@@ -361,6 +361,8 @@ class GroupedMoeContract:
     weight_mx_scaled: bool = False
     act_mx_padded: bool = True
     weight_mx_padded: bool = True
+    weight_scale_dtype: str = "fp32"
+    topk_weights_type: int = 0
 
     @property
     def intermediate(self) -> int:
@@ -394,22 +396,29 @@ class GroupedMoeContract:
 
 def _contract_rows(fields, mode, m, expected_total):
     rows = fields.get("matrix_group_rows", fields.get("group_rows", fields.get("expert_rows")))
-    if rows is None and "group_list" in fields:
+    list_rows = None
+    if "group_list" in fields:
         kind = fields.get("group_list_type", 0)
         if kind == SPARSE_GROUP_LIST_TYPE:
-            raise ModelingError("grouped_moe_sparse_group_list_requires_dense_histogram")
-        if kind not in {0, 1}:
+            if rows is None:
+                raise ModelingError("grouped_moe_sparse_group_list_requires_dense_histogram")
+        elif kind not in {0, 1}:
             raise ModelingError(f"grouped_moe_unsupported_group_list_type:{kind}")
-        rows = tuple(count for _, count in normalize_group_rows(
-            fields["group_list"], cumulative=fields.get("cumulative", kind == 0),
-            expected_total=expected_total,
-        ))
+        else:
+            list_rows = tuple(count for _, count in normalize_group_rows(
+                fields["group_list"], cumulative=fields.get("cumulative", kind == 0),
+                expected_total=expected_total,
+            ))
+            if rows is None:
+                rows = list_rows
     if rows is None:
         if mode in {"dense_gemm", "dequant_swiglu_quant"}:
             rows = (m,)
         else:
             raise ModelingError("grouped_moe_missing_expert_histogram")
     result = tuple(count for _, count in normalize_group_rows(rows, expected_total=expected_total))
+    if list_rows is not None and result != list_rows:
+        raise ModelingError("grouped_moe_group_list_histogram_mismatch")
     if not result or (mode == "dense_gemm" and len(result) != 1):
         raise ModelingError("grouped_moe_invalid_expert_count")
     return result
@@ -497,7 +506,15 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
     if mode not in GEMM_MODES and n % divisor:
         raise ModelingError("grouped_moe_gated_width_alignment")
     m = _integer(m, "m")
-    valid = fields.get("valid_rows", fields.get("routed_rows", None if routed else m))
+    cumulative_group_list = (
+        "group_list" in fields
+        and fields.get("group_list_type", 0) == 0
+        and fields.get("cumulative", True) is True
+    )
+    valid = fields.get(
+        "valid_rows",
+        fields.get("routed_rows", None if (routed or cumulative_group_list) else m),
+    )
     rows = _contract_rows(fields, mode, m, valid)
     allocated = _integer(fields.get("allocated_rows", sum(rows) if routed else m), "allocated_rows")
     if allocated < sum(rows):
@@ -537,6 +554,12 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
     layout_b = str(fields.get("layout_b", fields.get("weight_layout", default_layout_b))).upper()
     if layout_a not in {"ND", "CONTIGUOUS"} or layout_b not in VALID_LAYOUTS_B:
         raise ModelingError(f"grouped_moe_unsupported_layout:{layout_a}:{layout_b}")
+    pabi_wt_scale = str(getattr(pabi, "weight_scale_dtype", "") or "").strip() if pabi is not None else ""
+    raw_wt_scale = fields.get("weight_scale_dtype", pabi_wt_scale or "fp32")
+    weight_scale_dtype = _dtype(str(raw_wt_scale)) if raw_wt_scale else "fp32"
+    topk_weights_type = _integer(fields.get("topk_weights_type", 0), "topk_weights_type")
+    if topk_weights_type not in {0, 1}:
+        raise ModelingError(f"grouped_moe_invalid_topk_weights_type:{topk_weights_type}")
     top_k = _integer(fields.get("top_k", 1), "top_k", 1)
     ep = _integer(fields.get("ep", 1), "ep", 1)
     tokens = _integer(fields.get("tokens", m), "tokens")
@@ -581,6 +604,7 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
         top_k, ep, enable_dbo, split, mc2, shared, shared_compute, shared_weight,
         _integer(fields.get("wave_rows", 0), "wave_rows"), transfer, cohort_transfer,
         act_mx_scaled, weight_mx_scaled, act_mx_padded, weight_mx_padded,
+        weight_scale_dtype, topk_weights_type,
     )
 
 
@@ -744,12 +768,20 @@ def vector_stages(name, after, ctx, rows, *, read, compute, write, group_read=0,
     return stages
 
 
-def activation_stages(name, after, ctx, contract, rows, metadata=(), *, has_activation_scale=True):
+def activation_stages(
+    name, after, ctx, contract, rows, metadata=(), *,
+    has_activation_scale=True, weight_scale_dtype: str | None = None,
+):
     width = contract.intermediate
     quantized = contract.quant_dtype not in {"bf16", "fp16"}
     int32_input = contract.handoff_dtype == "int32"
     scale_read = PER_TOKEN_SCALE_BYTES if int32_input and has_activation_scale else 0
-    group_read = element_bytes(contract.n, "fp32") if int32_input and contract.mode == "dequant_swiglu_quant" else 0
+    if weight_scale_dtype is not None and int32_input:
+        group_read = element_bytes(contract.n, weight_scale_dtype)
+    elif int32_input and contract.mode == "dequant_swiglu_quant":
+        group_read = element_bytes(contract.n, "fp32")
+    else:
+        group_read = 0
     return vector_stages(
         name, after, ctx, rows, read=element_bytes(contract.n, contract.handoff_dtype) + scale_read,
         compute=width * (ACTIVATION_OPS[contract.activation] + (QUANT_OPS_PER_ELEMENT if quantized else 0)),

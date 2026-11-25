@@ -273,13 +273,13 @@ class QuantGroupedSchedule:
                             else:
                                 n_tile -= 1
                         if m_tile * n_tile > 1:
-                            if start != 0:
+                            if total_cnt < end + 1:
                                 # UpdateBasicIndex<true> computes
-                                # blockIdx/(mTailTile*nTailTile) and then
-                                # subtracts startBlockIdx_.  For a rotated
-                                # start, some small groups repeat rectangles
-                                # after unsigned wrap.  Keep this source domain
-                                # unmodeled instead of correcting its ordering.
+                                # blockIdx/(mTailTile*nTailTile) and subtracts
+                                # startBlockIdx_. When a single partial round
+                                # starts at start > 0 without wrapping
+                                # (total_cnt <= end), owners in [start, end]
+                                # underflow the unsigned tile index.
                                 raise ValueError(
                                     "unsupported_last_group_split_with_rotated_start:"
                                     f"group={group!r},start={start!r}"
@@ -343,7 +343,7 @@ class QuantGroupedSchedule:
             index += used - group.start
         else:
             index -= group.start
-        if index >= group.total_cnt:
+        if index < 0 or index >= group.total_cnt:
             raise ValueError(
                 "source_schedule_index_out_of_range:"
                 f"group={group.group!r},owner={owner!r},round={round_idx!r}"
