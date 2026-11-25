@@ -346,12 +346,16 @@ def _local_cache_rows(
         pcp_f, tp_g, dp_w = layer_dcp_factors(plan, parallel)
         tp_dim = max(1, int(parallel.tp))
         pcp_dim = max(1, int(parallel.pcp))
+        pp_dim = max(1, int(parallel.pp))
         dp_dim = max(1, int(parallel.dp))
         r_int = int(rank)
         tp_i = r_int % tp_dim
         pcp_i = (r_int // tp_dim) % pcp_dim
-        dp_i = (r_int // (tp_dim * pcp_dim)) % dp_dim
-        cp_rank = ((dp_i % dp_w) * (pcp_f * tp_g) + (pcp_i % pcp_f) * tp_g + (tp_i % tp_g)) % cp
+        dp_i = (r_int // (tp_dim * pcp_dim * pp_dim)) % dp_dim
+        if dp_w > 1:
+            cp_rank = ((dp_i % dp_w) * (pcp_f * tp_g) + (pcp_i % pcp_f) * tp_g + (tp_i % tp_g)) % cp
+        else:
+            cp_rank = ((tp_i % tp_g) * pcp_f + (pcp_i % pcp_f)) % cp
         exact = owned_positions(start, start + rows - 1, cp, stride, cp_rank)
         return float(block_round(exact, page_blk) if capacity_padded else exact)
     if capacity_padded:
@@ -516,8 +520,12 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
                 rows = capacity if capacity_padded else min(seq, capacity)
                 result["index_pool_tail"] = rows * 2 * plan.index_dim * FP32_ELEMENT_BYTES
         if plan.index_input == "hidden" and plan.compress_ratio and seq:
+            idx_state_rows = (
+                plan.compressor_state_rows if capacity_padded
+                else min(seq, plan.compressor_state_rows)
+            )
             result["index_compressor_state"] = (
-                min(seq, plan.compressor_state_rows)
+                idx_state_rows
                 * 2 * plan.compressor_width * plan.index_dim * FP32_ELEMENT_BYTES
             )
     return result
@@ -573,11 +581,18 @@ def stage_cache_components(
         ).items():
             stages[stage][key] = stages[stage].get(key, 0.0) + value
     if draft_kind and getattr(model, "auxiliary", None) is not None:
+        from mindie_sim.catalog.draft import optional_draft_spec
+        from mindie_sim.catalog.draft_spec import effective_draft_context_cap
+        draft = optional_draft_spec(model, draft_kind)
+        draft_seq = max(0, int(sequence_tokens))
+        draft_cap = effective_draft_context_cap(draft, runtime)
+        if draft_cap > 0:
+            draft_seq = min(draft_seq, draft_cap)
         if uses_inherited_draft_cache(model, draft_kind):
             from mindie_sim.catalog.cache_ownership import draft_cache_components
             draft_values = draft_cache_components(
                 model, parallel, draft_kind=draft_kind,
-                sequence_tokens=sequence_tokens, capacity_padded=capacity_padded,
+                sequence_tokens=draft_seq, capacity_padded=capacity_padded,
                 runtime=runtime, query_tokens=query_tokens, phase=phase,
             )
             stages[-1]["draft_kv"] = stages[-1].get("draft_kv", 0.0) + float(
@@ -586,10 +601,7 @@ def stage_cache_components(
                 stages[-1]["draft_state"] = stages[-1].get(
                     "draft_state", 0.0) + float(draft_values["draft_state"])
         else:
-            from mindie_sim.catalog.draft import optional_draft_spec
-            draft = optional_draft_spec(model, draft_kind)
             row_bytes = _draft_row_bytes_int(model, draft, tp=parallel.tp)
-            seq = max(0, int(sequence_tokens))
             block = max(1, int(block_size if block_size is not None else (
                 getattr(runtime, "kv_block_size", 0) or interleave
             )))
@@ -600,8 +612,8 @@ def stage_cache_components(
             )
             draft_cp = int(parallel.cp) if draft_sharded else 1
             seq_rows = (
-                _context_shard_blocks(seq, block, draft_cp) if capacity_padded
-                else seq / draft_cp
+                _context_shard_blocks(draft_seq, block, draft_cp) if capacity_padded
+                else draft_seq / draft_cp
             )
             stages[-1]["draft_kv"] = stages[-1].get("draft_kv", 0.0) + float(
                 seq_rows * row_bytes * draft.layers

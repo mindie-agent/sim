@@ -25,18 +25,49 @@ class _MemoryReportingMixin:
         rank: int | None = None,
     ) -> tuple[Allocation, ...]:
         if rank is None:
-            selected = self.selected_reserved[replica][stage]
-            shared = self.shared_reserved[replica][stage]
-            granted = self.granted[replica][stage]
-            readers = max(self.reader_rank[replica][stage])
+            best_rk = max(
+                range(self.width),
+                key=lambda rk: (
+                    self.selected_rank[replica][stage][rk]
+                    + self.shared_rank[replica][stage][rk]
+                    + self.granted_rank[replica][stage][rk]
+                    + self.reader_rank[replica][stage][rk]
+                ),
+            )
+            selected = self.selected_rank[replica][stage][best_rk]
+            shared = self.shared_rank[replica][stage][best_rk]
+            granted = self.granted_rank[replica][stage][best_rk]
+            readers = self.reader_rank[replica][stage][best_rk]
         else:
             selected = self.selected_rank[replica][stage][int(rank)]
             shared = self.shared_rank[replica][stage][int(rank)]
             granted = self.granted_rank[replica][stage][int(rank)]
             readers = self.reader_rank[replica][stage][int(rank)]
+        prep_persist = float(
+            self._prepared_persistent_by_stage[stage]
+            if stage < len(getattr(self, "_prepared_persistent_by_stage", ()))
+            else 0.0
+        )
+        c8_static = float(
+            self.c8_static_channel_scale_by_stage[stage]
+            if stage < len(getattr(self, "c8_static_channel_scale_by_stage", ()))
+            else 0.0
+        )
         allocations = [
             Allocation("weights", self.weights[stage], "weights",
                        note="persistent resident weight bytes"),
+        ]
+        if prep_persist > 0.0:
+            allocations.append(Allocation(
+                "prepared_weights", prep_persist, "prepared_weights",
+                note="registered persistent prepared weight copies",
+            ))
+        if c8_static > 0.0:
+            allocations.append(Allocation(
+                "c8_static_channel_scale", c8_static, "cache",
+                note="fixed per-die GQA C8 static channel scales",
+            ))
+        allocations.extend([
             Allocation("activation_workspace", self.workspace[stage], "workspace",
                        note="simultaneous implementation workspace"),
             Allocation("temporary_dequant", self.temporary_dequant[stage], "temporary",
@@ -54,7 +85,7 @@ class _MemoryReportingMixin:
             Allocation("reserve.communication", self.policy.communication_buffer_bytes,
                        "reserve"),
             Allocation("reserve.runtime", self.policy.runtime_bytes, "reserve"),
-        ]
+        ])
         if include_cache:
             span = self.case.runtime.max_model_len if tokens is None else tokens
             if rank is None:
@@ -130,28 +161,72 @@ class _MemoryReportingMixin:
             raise ValueError("memory_allocation_tokens_requires_nonnegative")
         cache = self.cache_allocation(tokens)
         gross_kv, resident_kv, staging_kv = self._kv_residency(tokens)
+        hbm_live, _host_live = self._state_usage()
         width = p.tp * p.pcp
         mounted = [
             [
                 min(d.hbm_bytes * case.runtime.gpu_memory_utilization
-                    for d in case.machine.dies[
-                        (replica * p.pp + stage) * width:
-                        (replica * p.pp + stage + 1) * width])
+                    for d in self._stage_dies(replica, stage))
                 for stage in range(p.pp)
             ]
             for replica in range(p.dp)
         ]
-        persistent = [
-            [
-                self.weights[stage] + self.policy.reserved + self.workspace[stage]
-                + self.temporary_dequant[stage] + resident_kv[stage]
-                + staging_kv[stage] + self.selected_reserved[replica][stage]
-                + self.shared_reserved[replica][stage] + self.granted[replica][stage]
-                + max(self.reader_rank[replica][stage])
-                for stage in range(p.pp)
-            ]
-            for replica in range(p.dp)
-        ]
+        dp_width = max(1, int(getattr(p, "dcp_dp_width", 1) or 1))
+        spans_dp = bool(getattr(p, "cp_spans_dp", False)) and dp_width > 1 and self.rank_token_owners is None
+        rank_divergent = self.rank_token_owners is not None or int(getattr(p, "cp", 1) or 1) > 1
+        persistent: list[list[float]] = []
+        headroom: list[list[float]] = []
+        for replica in range(p.dp):
+            rep_pers: list[float] = []
+            rep_head: list[float] = []
+            for stage in range(p.pp):
+                stage_dies = self._stage_dies(replica, stage)
+                prep_persist = float(
+                    self._prepared_persistent_by_stage[stage]
+                    if stage < len(getattr(self, "_prepared_persistent_by_stage", ()))
+                    else 0.0
+                )
+                c8_static = float(
+                    self.c8_static_channel_scale_by_stage[stage]
+                    if stage < len(getattr(self, "c8_static_channel_scale_by_stage", ()))
+                    else 0.0
+                )
+                fixed_stage = (
+                    self.weights[stage] + prep_persist + c8_static + self.policy.reserved
+                    + self.workspace[stage] + self.temporary_dequant[stage]
+                )
+                die_residents: list[float] = []
+                die_headrooms: list[float] = []
+                for rk in range(self.width):
+                    non_req = max(
+                        0.0,
+                        float(hbm_live[replica][stage][rk])
+                        - float(self.live_rank[replica][stage][rk])
+                        - float(self.staging_rank[replica][stage][rk]),
+                    )
+                    if rank_divergent:
+                        phys_rk = ((replica % dp_width) * p.pp) * self.width + rk if spans_dp else rk
+                        rk_gross = self._rank_cache_bytes(tokens, padded=True, rank=phys_rk)
+                        rk_lmax = self._rank_max_layer_cache_bytes(tokens, phys_rk)
+                        rk_res = (
+                            float(rk_gross[stage]) if self.kvc_hbm_ratio == 1.0
+                            else float(rk_gross[stage]) * self.kvc_hbm_ratio
+                        )
+                        rk_stg = (
+                            0.0 if self.kvc_hbm_ratio == 1.0
+                            else float(rk_lmax[stage]) * (1.0 - self.kvc_hbm_ratio)
+                        )
+                    else:
+                        rk_res = float(resident_kv[stage])
+                        rk_stg = float(staging_kv[stage])
+                    used_rk = fixed_stage + rk_res + rk_stg + non_req
+                    cap_rk = stage_dies[rk].hbm_bytes * case.runtime.gpu_memory_utilization
+                    die_residents.append(used_rk)
+                    die_headrooms.append(cap_rk - used_rk)
+                rep_pers.append(max(die_residents, default=0.0))
+                rep_head.append(min(die_headrooms, default=0.0))
+            persistent.append(rep_pers)
+            headroom.append(rep_head)
         plans = [
             [self.rank_capacity_plan(replica, stage, tokens=tokens).to_dict()
              for stage in range(p.pp)]
@@ -215,10 +290,7 @@ class _MemoryReportingMixin:
             },
             "mounted_capacity_bytes_per_replica_stage": mounted,
             "peak_resident_bytes_per_replica_stage": persistent,
-            "headroom_bytes_per_replica_stage": [
-                [cap - used for cap, used in zip(cap_row, used_row)]
-                for cap_row, used_row in zip(mounted, persistent)
-            ],
+            "headroom_bytes_per_replica_stage": headroom,
             "rank_plans": plans,
             "physical_rank_plans": physical_plans,
             "physical_rank_live_bytes_per_replica_stage": self.live_rank,
@@ -229,15 +301,9 @@ class _MemoryReportingMixin:
             "physical_rank_reader_bytes_per_replica_stage": self.reader_rank,
             "physical_rank_headroom_bytes_per_replica_stage": [
                 [
-                    [cap - used for cap, used in zip(
+                    [cap - float(used) for cap, used in zip(
                         self.rank_capacity[replica][stage],
-                        [a + b + c + d + e + f for a, b, c, d, e, f in zip(
-                            self.live_rank[replica][stage],
-                            self.staging_rank[replica][stage],
-                            self.selected_rank[replica][stage],
-                            self.shared_rank[replica][stage],
-                            self.granted_rank[replica][stage],
-                            self.reader_rank[replica][stage])])]
+                        hbm_live[replica][stage])]
                     for stage in range(p.pp)
                 ]
                 for replica in range(p.dp)
@@ -278,10 +344,17 @@ class _MemoryReportingMixin:
                 "cache_valid_bytes_per_stage_rank":
                     cache_allocation["valid"]["total_bytes_per_stage_rank"],
                 "resident_bytes_per_stage_rank": [
-                    weight + self.policy.reserved + workspace + temporary + resident + staging
-                    for weight, workspace, temporary, resident, staging in zip(
+                    weight
+                    + (float(self._prepared_persistent_by_stage[idx])
+                       if idx < len(getattr(self, "_prepared_persistent_by_stage", ()))
+                       else 0.0)
+                    + (float(self.c8_static_channel_scale_by_stage[idx])
+                       if idx < len(getattr(self, "c8_static_channel_scale_by_stage", ()))
+                       else 0.0)
+                    + self.policy.reserved + workspace + temporary + resident + staging
+                    for idx, (weight, workspace, temporary, resident, staging) in enumerate(zip(
                         self.weights, self.workspace, self.temporary_dequant,
-                        resident_kv, staging_kv)
+                        resident_kv, staging_kv))
                 ],
             },
         }
@@ -299,12 +372,46 @@ class _MemoryReportingMixin:
                 "expert_hbm_saved_bytes_per_stage_rank": self.expert_hbm_saved,
             }
         if self.sparse_offload:
+            p = self.case.runtime.parallel
             block_size = int(self.sparse_offload["block_size"])
-            idx_row_bytes = int(self.sparse_offload["index_row_bytes"])
-            full_idx_layers = len(self.sparse_offload["full_indexer_layers"])
-            npu_per_block = max(1, block_size * idx_row_bytes * max(1, full_idx_layers))
-            min_stage_cap = max(0.0, min(val for row in self.capacity for val in row))
-            npu_limit_blocks = int(min_stage_cap // npu_per_block)
+            options = self.sparse_offload.get("options") or {}
+            keep_device_kv = bool(options.get("keep_device_kv_cache", False))
+            if keep_device_kv or self.pages.groups:
+                _gross_blk, res_blk, _stg_blk = self._kv_residency(block_size)
+                stage_per_block_list = [float(v) for v in res_blk]
+            else:
+                idx_row_bytes = int(self.sparse_offload["index_row_bytes"])
+                kv_row_bytes = int(self.sparse_offload.get("kv_row_bytes", 0))
+                row_by_layer = self.sparse_offload.get("kv_row_bytes_by_layer") or {}
+                offload_seq = tuple(int(lid) for lid in self.sparse_offload.get("offload_layers", ()))
+                layerwise = bool(options.get("layerwise_kv_offload", False))
+                num_shared = max(0, int(options.get("num_shared_layers", 0) or 0))
+                zero_layers = set(offload_seq[num_shared:] if layerwise else offload_seq)
+                stage_per_block_list = [0.0] * p.pp
+                for lid in self.sparse_offload["full_indexer_layers"]:
+                    st = (
+                        self.layer_stage[int(lid)]
+                        if 0 <= int(lid) < len(self.layer_stage) else p.pp - 1
+                    )
+                    stage_per_block_list[st] += float(block_size * idx_row_bytes)
+                if kv_row_bytes > 0 or row_by_layer:
+                    for plan in self.case.model.layer_plans:
+                        if int(plan.index) in zero_layers:
+                            continue
+                        if plan.attention == "mla" and plan.cache_kind == "dense":
+                            st = (
+                                self.layer_stage[int(plan.index)]
+                                if 0 <= int(plan.index) < len(self.layer_stage) else p.pp - 1
+                            )
+                            row_b = int(row_by_layer.get(int(plan.index), row_by_layer.get(str(plan.index), kv_row_bytes)))
+                            stage_per_block_list[st] += float(block_size * row_b)
+                stage_per_block_list = [v * self.kvc_hbm_ratio for v in stage_per_block_list]
+            npu_limits = [
+                int(max(0.0, min(self.capacity[rep][st] for rep in range(p.dp))) // per_blk)
+                for st, per_blk in enumerate(stage_per_block_list)
+                if per_blk > 0.0
+            ]
+            npu_limit_blocks = min(npu_limits) if npu_limits else 0
             dram_limit_blocks = int(self.sparse_offload["dram_limit_blocks"])
             workload_limit_blocks = int(self.sparse_offload["workload_limit_blocks"])
             limits = {
@@ -327,6 +434,7 @@ class _MemoryReportingMixin:
         return section
 
     def to_dict(self) -> dict:
+        hbm_live, _host_live = self._state_usage()
         result = {
             "status": ("feasible" if all(value >= 0 for row in self.capacity for value in row)
                        else "oom"),
@@ -384,15 +492,9 @@ class _MemoryReportingMixin:
             "physical_rank_reader_bytes_per_replica_stage": self.reader_rank,
             "physical_rank_headroom_bytes_per_replica_stage": [
                 [
-                    [cap - used for cap, used in zip(
+                    [cap - float(used) for cap, used in zip(
                         self.rank_capacity[replica][stage],
-                        [a + b + c + d + e + f for a, b, c, d, e, f in zip(
-                            self.live_rank[replica][stage],
-                            self.staging_rank[replica][stage],
-                            self.selected_rank[replica][stage],
-                            self.shared_rank[replica][stage],
-                            self.granted_rank[replica][stage],
-                            self.reader_rank[replica][stage])])]
+                        hbm_live[replica][stage])]
                     for stage in range(self.case.runtime.parallel.pp)
                 ]
                 for replica in range(self.case.runtime.parallel.dp)
@@ -403,11 +505,21 @@ class _MemoryReportingMixin:
             "selected_plan_bytes_per_replica_stage": self.selected_reserved,
             "shared_page_bytes_per_replica_stage": self.shared_reserved,
             "shared_page_owners": [
-                {"replica": rep, "owner": owner, **record}
-                for (rep, owner), record in sorted(self.shared_pages.items())
+                {"replica": key[0], "owner": key[1], **record}
+                for key, record in sorted(
+                    self.shared_pages.items(),
+                    key=lambda item: (item[0][0], item[0][1], len(item[0]), item[0]),
+                )
             ],
             "peak_resident_bytes_per_replica_stage": [
-                [weight + self.policy.reserved + workspace + temporary
+                [weight
+                 + (float(self._prepared_persistent_by_stage[index])
+                    if index < len(getattr(self, "_prepared_persistent_by_stage", ()))
+                    else 0.0)
+                 + (float(self.c8_static_channel_scale_by_stage[index])
+                    if index < len(getattr(self, "c8_static_channel_scale_by_stage", ()))
+                    else 0.0)
+                 + self.policy.reserved + workspace + temporary
                  + self.peak_combined[replica][index]
                  for index, (weight, workspace, temporary) in enumerate(zip(
                      self.weights, self.workspace, self.temporary_dequant))]
