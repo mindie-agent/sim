@@ -1,9 +1,11 @@
 """Physical connector service for P/D handoffs.
 
-[Role] Submit transfers and account for wire, memory and receiver residency.
-[Invariants] Both transport branches preserve dependencies and physical work.
+[Role] Submit causal transfers and account for wire, memory and receiver residency.
+[Invariants] Source HBM reads, wire transmission, and post-propagation destination HBM
+  writes stream causally per chunk; receive buffers share one physical Engine pool per
+  buffer id; simultaneous live reservations and arrivals/consumptions conserve bytes.
 [Timeouts & Locks] Chunk issuance is bounded. All waits are virtual Engine events.
-[Side-Effect Policy] Submits Engine tasks and updates connector counters.
+[Side-Effect Policy] Submits Engine tasks and updates connector counters only after preflight.
 """
 import math
 from collections import defaultdict
@@ -12,12 +14,119 @@ from dataclasses import replace
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware, Link
 
+from ..collectives.ports import PortKey
+from ..collectives.transport import chunk_size_at
 from ..communication import MessageFlow
 from ..topology import Topology, TransportOptions
 from .handoff import PDHandoff, _non_negative_number, _normalize_releases
-from .transport import _alias_plan
+from .transport import _AliasedTopology, _alias_plan
 
 _MAX_PHYSICAL_CHUNKS = 4096
+_MS_PER_S = 1000.0
+_FLOAT_ABS_TOL = 1e-9
+_FLOAT_REL_TOL = 1e-12
+_SOURCE_PREFIXES = ("prefill:", "prefill_", "src:", "src_", "source:", "source_")
+_DEST_PREFIXES = (
+    "decode:", "decode_", "dst:", "dst_", "dest:", "dest_", "destination:", "destination_",
+)
+
+
+def _classify_memory_resource(name: str) -> tuple[str, int | None]:
+    """Classify a memory resource name into source/destination/shared and stage."""
+    text = str(name)
+    low = text.lower()
+    stage = None
+    if ":s" in text:
+        suffix = text.rsplit(":s", 1)[-1]
+        if suffix.isdigit():
+            stage = int(suffix)
+    if low in {"src", "source", "prefill"} or low.startswith(_SOURCE_PREFIXES):
+        return "source", stage
+    if low in {"dst", "dest", "destination", "decode"} or low.startswith(_DEST_PREFIXES):
+        return "destination", stage
+    return "shared", stage
+
+
+def _partition_memory_work(memory_work) -> tuple[list, list, list]:
+    """Split memory work mapping/items into source, destination, and shared entries."""
+    items = memory_work.items() if hasattr(memory_work, "items") else memory_work
+    src_items, dst_items, shared_items = [], [], []
+    for key, raw_value in items:
+        amount = float(raw_value)
+        if amount <= 0.0:
+            continue
+        role, stage = _classify_memory_resource(str(key))
+        if role == "source":
+            src_items.append((str(key), amount, stage))
+        elif role == "destination":
+            dst_items.append((str(key), amount, stage))
+        else:
+            shared_items.append((str(key), amount))
+    return src_items, dst_items, shared_items
+
+
+def _plan_wire_and_transactions(plan, *, track_transactions: bool):
+    wire = sum(
+        hop.wire_bytes for path in plan.flows
+        for chunk in path.chunks for hop in chunk.hops
+    )
+    transactions = (
+        sum(
+            hop.transactions or 0 for path in plan.flows
+            for chunk in path.chunks for hop in chunk.hops
+        )
+        if track_transactions
+        else None
+    )
+    chunks = sum(len(path.chunks) for path in plan.flows)
+    return wire, transactions, chunks
+
+
+def _validate_plan_chunks(plan) -> tuple[int, ...]:
+    """Force bounded-chunk validation before creating pools or submitting tasks."""
+    return tuple(len(path.chunks) for path in plan.flows)
+
+
+def _build_flow_memory_weights(plan, memory_work, transfers=None) -> list[dict[str, float]]:
+    """Allocate declared memory work proportionally across matching flows (0-byte drift)."""
+    n_flows = len(plan.flows)
+    per_flow: list[dict[str, float]] = [{} for _ in range(n_flows)]
+    if not n_flows:
+        return per_flow
+    src_items, dst_items, shared_items = _partition_memory_work(memory_work)
+    payloads = [float(path.flow.payload_bytes) for path in plan.flows]
+    all_indices = list(range(n_flows))
+
+    def _assign(res_name: str, amount: float, matching: list[int]) -> None:
+        targets = matching if matching else all_indices
+        total = sum(payloads[i] for i in targets)
+        if total <= 0.0:
+            share = amount / len(targets)
+            for idx in targets:
+                per_flow[idx][res_name] = per_flow[idx].get(res_name, 0.0) + share
+            return
+        for idx in targets:
+            per_flow[idx][res_name] = (
+                per_flow[idx].get(res_name, 0.0) + amount * (payloads[idx] / total)
+            )
+
+    for res_name, amount, stage in src_items:
+        matching = (
+            [i for i, t in enumerate(transfers) if t.source_stage == stage]
+            if transfers is not None and stage is not None
+            else all_indices
+        )
+        _assign(res_name, amount, matching)
+    for res_name, amount, stage in dst_items:
+        matching = (
+            [i for i, t in enumerate(transfers) if t.destination_stage == stage]
+            if transfers is not None and stage is not None
+            else all_indices
+        )
+        _assign(res_name, amount, matching)
+    for res_name, amount in shared_items:
+        _assign(res_name, amount, all_indices)
+    return per_flow
 
 
 class PDConnector:
@@ -25,12 +134,10 @@ class PDConnector:
         explicit = "link" in raw
         declaration = dict(raw["link"] if explicit else raw)
         if not explicit:
-            declaration["capacity_bytes_per_ms"] = declaration.pop("bytes_per_s") / 1000
+            declaration["capacity_bytes_per_ms"] = declaration.pop("bytes_per_s") / _MS_PER_S
         declaration.setdefault("name", "connector")
         declaration.setdefault("members", (0, 1))
         declaration["members"] = tuple(declaration["members"])
-        # Optional transport declaration lives beside the link record.  It is
-        # not part of Link and never changes the declared connector identity.
         self.chunk_bytes = raw.get("chunk_bytes")
         if self.chunk_bytes is not None:
             self.chunk_bytes = _non_negative_number(
@@ -61,50 +168,160 @@ class PDConnector:
                 "shared", "direct", "per_pair", "per_port", "fully_connected", "mesh"}:
             raise ModelingError(f"link_semantics_unknown:{self.link.semantics}")
         self.topology = Topology(Hardware("pd_connector", (), (self.link,)), None, "pd:")
-        # Existing flat connector inputs keep their public resource identity.
         self.alias = ({f"pd:link:{self.link.name}": "pd_link"}
                       if not explicit else {})
         self.wire_bytes = 0.0
         self.transactions = 0 if self.link.transaction_bytes is not None else None
-        # Aggregate bounded counters; a request's TransportRun is released as
-        # soon as its completion folds these values, so request count cannot
-        # grow live memory.
         self._transport = {
             "chunks": 0, "credit_waits": 0,
             "reservation_waits": 0, "reservation_wait_ms": 0.0,
-            "resident": {}, "peak_resident": {}, "peak_reserved": {},
+            "resident": {}, "peak_resident": {},
+            "reserved": {}, "peak_reserved": {},
             "unknowns": set(),
         }
         self._tracked_residency = False
         self._engine = None
         self._handoff_count = 0
         self._handoff_flows = 0
-        self._buffer_rank = {}
+        self._buffer_ranks: dict[str, set[int]] = defaultdict(set)
         self._handoff_ranks = set()
         self._last_receive_capacity = {}
         self._last_receive_buffers = {}
 
+    @staticmethod
+    def _receive_pool_name(buffer_id: str) -> str:
+        return f"transport:rx:{buffer_id}"
+
+    def _role_adjusted_resources(self, topology):
+        """Apply connector aliases and pool-role TX/RX endpoint rates."""
+        src_rate = self.link.endpoint_capacity_bytes_per_ms(0)
+        dst_rate = self.link.endpoint_capacity_bytes_per_ms(1)
+        tx_marker = f"link:{self.link.name}:tx:port"
+        rx_marker = f"link:{self.link.name}:rx:port"
+        has_endpoint_rates = bool(self.link.endpoint_rates)
+        adjusted = []
+        for resource in topology.resources():
+            rate = resource.rate
+            if has_endpoint_rates:
+                if tx_marker in resource.name:
+                    rate = (
+                        float(src_rate) if src_rate is not None
+                        else float(self.link.capacity_bytes_per_ms)
+                    )
+                elif rx_marker in resource.name:
+                    rate = (
+                        float(dst_rate) if dst_rate is not None
+                        else float(self.link.capacity_bytes_per_ms)
+                    )
+            adjusted.append(
+                replace(
+                    resource,
+                    name=self.alias.get(resource.name, resource.name),
+                    rate=rate,
+                )
+            )
+        return tuple(adjusted)
+
     def resources(self):
-        return tuple(replace(resource, name=self.alias.get(resource.name, resource.name))
-                     for resource in self.topology.resources())
+        return self._role_adjusted_resources(self.topology)
 
     def _alias_plan(self, plan):
         """Keep the public resource identity while using the shared planner."""
-        return _alias_plan(self, plan)
+        aliased = _alias_plan(self, plan)
+        if self.alias and plan.topology is not self.topology:
+            aliased = replace(
+                aliased, topology=_AliasedTopology(plan.topology, self.alias))
+        return aliased
 
-    def _topology_for_ranks(self, ranks):
-        wanted = set(ranks)
-        if wanted <= set(self.link.members):
+    def _topology_for_handoff(self, handoff):
+        """Bind declared pool-endpoint rates/ids onto actual physical ranks."""
+        src_ranks = {int(item.source_rank) for item in handoff.transfers}
+        dst_ranks = {int(item.destination_rank) for item in handoff.transfers}
+        if src_ranks <= {0} and dst_ranks <= {1}:
             return self.topology
-        link = replace(self.link, members=tuple(sorted(
-            set(self.link.members) | wanted)))
+        all_ranks = tuple(sorted(src_ranks | dst_ranks))
+        src_rate = self.link.endpoint_capacity_bytes_per_ms(0)
+        dst_rate = self.link.endpoint_capacity_bytes_per_ms(1)
+        mapped_rates = []
+        for rank in all_ranks:
+            if rank in src_ranks and rank in dst_ranks:
+                both = [r for r in (src_rate, dst_rate) if r is not None]
+                if both:
+                    mapped_rates.append((rank, float(min(both))))
+            elif rank in src_ranks and src_rate is not None:
+                mapped_rates.append((rank, float(src_rate)))
+            elif rank in dst_ranks and dst_rate is not None:
+                mapped_rates.append((rank, float(dst_rate)))
+        ep_ids = dict(self.link.endpoint_ids)
+        src_ep = ep_ids.get(0)
+        dst_ep = ep_ids.get(1)
+        mapped_ids = []
+        for rank in all_ranks:
+            if rank in src_ranks and rank in dst_ranks:
+                if src_ep is not None and (dst_ep is None or src_ep == dst_ep):
+                    mapped_ids.append((rank, src_ep))
+                elif dst_ep is not None and src_ep is None:
+                    mapped_ids.append((rank, dst_ep))
+            elif rank in src_ranks and src_ep is not None:
+                mapped_ids.append((rank, src_ep))
+            elif rank in dst_ranks and dst_ep is not None:
+                mapped_ids.append((rank, dst_ep))
+        link = replace(
+            self.link,
+            members=all_ranks,
+            endpoint_rates=tuple(mapped_rates),
+            endpoint_ids=tuple(mapped_ids),
+        )
         return Topology(Hardware("pd_connector", (), (link,)), None, "pd:")
 
     def _ensure_engine_resources(self, engine, topology):
-        missing = [resource for resource in topology.resources()
+        missing = [resource for resource in self._role_adjusted_resources(topology)
                    if resource.name not in engine.resources]
         if missing:
             engine.extend(resources=missing)
+
+    def _check_pool_capacity(self, engine, pool: str, capacity: float, label):
+        if pool in engine.pools and not math.isclose(
+                engine.pools[pool], capacity,
+                rel_tol=0.0, abs_tol=_FLOAT_ABS_TOL):
+            raise ModelingError(
+                f"pd_receive_pool_capacity_conflict:{label}:{engine.pools[pool]}!={capacity}")
+
+    def _preflight_handoff_pools(self, engine, handoff):
+        """Atomically validate per-rank and shared-pool footprints before submission."""
+        per_rank, by_buffer = handoff.resolved_receive_pools()
+        for destination, (_buf_id, footprint, pool_cap) in sorted(per_rank.items()):
+            if pool_cap < footprint:
+                raise ModelingError(
+                    "pd_whole_message_footprint_exceeds_pool:"
+                    f"{destination}:{footprint}>{pool_cap}")
+        for buffer_id, (total_footprint, pool_cap, ranks) in sorted(by_buffer.items()):
+            for rank in ranks:
+                rank_cap = per_rank[rank][2]
+                if rank_cap != pool_cap:
+                    raise ModelingError(
+                        "pd_receive_pool_capacity_conflict:"
+                        f"{rank}:{pool_cap}!={rank_cap}")
+            pool = self._receive_pool_name(buffer_id)
+            if (self.receive_capacity_bytes is not None
+                    and buffer_id == self.receive_buffer_id):
+                conn_cap = float(self.receive_capacity_bytes)
+                if float(total_footprint) > conn_cap + _FLOAT_ABS_TOL:
+                    raise ModelingError(
+                        "pd_whole_message_footprint_exceeds_pool:"
+                        f"{pool}:{total_footprint}>{conn_cap}")
+                if not math.isclose(
+                        float(pool_cap), conn_cap,
+                        rel_tol=0.0, abs_tol=_FLOAT_ABS_TOL):
+                    raise ModelingError(
+                        "pd_receive_pool_capacity_conflict:"
+                        f"{buffer_id}:{conn_cap}!={pool_cap}")
+            self._check_pool_capacity(engine, pool, float(pool_cap), ranks[0])
+            if pool_cap < total_footprint:
+                raise ModelingError(
+                    "pd_whole_message_footprint_exceeds_pool:"
+                    f"{pool}:{total_footprint}>{pool_cap}")
+        return per_rank
 
     def _expand_handoff_releases(self, handoff, release_events):
         normalized = _normalize_releases(release_events) or {}
@@ -112,7 +329,7 @@ class PDConnector:
         counts = defaultdict(int)
         for transfer in handoff.transfers:
             count = (1 if chunk is None else max(1, math.ceil(
-                float(transfer.payload_bytes) / float(chunk) - 1e-12)))
+                float(transfer.payload_bytes) / float(chunk) - _FLOAT_REL_TOL)))
             counts[transfer.destination_rank] += count
         result = {}
         for rank, count in counts.items():
@@ -128,32 +345,199 @@ class PDConnector:
             result[rank] = events
         return result
 
+    def _declared_port_demand(self, engine, topo, src: int, dst: int,
+                              wire_bytes: float) -> dict[str, float]:
+        """Charge externally registered physical PortKey resources matching endpoint_ids."""
+        ep_ids = dict(self.link.endpoint_ids)
+        src_ep, dst_ep = ep_ids.get(0), ep_ids.get(1)
+        if src_ep is None and dst_ep is None:
+            return {}
+        rail = getattr(self.link, "rail_id", 0)
+        ns = getattr(topo, "namespace", "pd:")
+        extra: dict[str, float] = {}
+        if src_ep is not None:
+            tx_name = PortKey(int(topo._node_of(src)), str(src_ep), rail, "tx").resource_name(ns)
+            if tx_name in engine.resources:
+                extra[tx_name] = wire_bytes
+        if dst_ep is not None:
+            rx_name = PortKey(int(topo._node_of(dst)), str(dst_ep), rail, "rx").resource_name(ns)
+            if rx_name in engine.resources:
+                extra[rx_name] = wire_bytes
+        return extra
+
+    def _chunk_coupled_demand(self, engine, plan, flow_index: int, chunk,
+                              flow_mem: dict[str, float]) -> tuple[dict[str, float], float]:
+        """Build coupled wire + declared physical endpoint port + memory demand for one chunk."""
+        path = plan.flows[flow_index]
+        demand: dict[str, float] = {}
+        prop_ms = 0.0
+        for hop in chunk.hops:
+            prop_ms += float(hop.latency_ms)
+            for res_name, amt in hop.demand.items():
+                demand[res_name] = demand.get(res_name, 0.0) + float(amt)
+        if chunk.hops:
+            extra_ports = self._declared_port_demand(
+                engine, plan.topology, path.flow.source, path.flow.destination,
+                float(chunk.hops[0].wire_bytes))
+            for port_name, amt in extra_ports.items():
+                demand.setdefault(port_name, amt)
+        if flow_mem:
+            total_payload = float(path.flow.payload_bytes)
+            frac = (float(chunk.flow.useful_bytes) / total_payload) if total_payload > 0.0 else 1.0
+            for res_name, total_amt in flow_mem.items():
+                share = float(total_amt) * frac
+                if share > 0.0:
+                    demand[res_name] = demand.get(res_name, 0.0) + share
+        return demand, prop_ms
+
+    def _execute_plan(
+        self, engine, name, plan, ready_by_rank, *,
+        memory_work=(), transfers=None, owner="",
+        per_chunk_pool: tuple[str, float] | None = None,
+        per_chunk_releases=None,
+        on_chunk_arrived=None,
+    ):
+        """Execute framed flows with coupled src/wire/dst streaming and causal credits."""
+        from ..engine import Allocation
+
+        expected = _validate_plan_chunks(plan)
+        n_flows = len(plan.flows)
+        flow_mems = _build_flow_memory_weights(plan, memory_work, transfers=transfers)
+        completions = [engine.future(f"{name}:flow{i}:complete") for i in range(n_flows)]
+        arrived_count = [0] * n_flows
+        issued = [0] * n_flows
+        prev_grant: list = [None] * n_flows
+        prev_service: list = [None] * n_flows
+        completed = [False] * n_flows
+        pool_name = per_chunk_pool[0] if per_chunk_pool is not None else None
+        pool_cap = float(per_chunk_pool[1]) if per_chunk_pool is not None else None
+        if pool_name is not None and pool_name not in engine.pools:
+            engine.extend(pools={pool_name: pool_cap})
+        releases_map = per_chunk_releases or {}
+        release_cursor = defaultdict(int)
+        windows: list[int | None] = []
+        for idx, path in enumerate(plan.flows):
+            if not expected[idx]:
+                windows.append(0)
+            elif pool_cap is None:
+                windows.append(None)
+            else:
+                largest = chunk_size_at(path.flow.payload_bytes, plan.chunk_bytes, 0)
+                windows.append(max(1, int(pool_cap // largest + _FLOAT_ABS_TOL)))
+
+        def complete_flow(fi: int):
+            if not completed[fi]:
+                completed[fi] = True
+                if not completions[fi].done:
+                    engine.resolve(completions[fi])
+
+        def schedule_per_chunk_release(prefix, dest, useful, done_ev, alloc):
+            events = tuple(releases_map.get(dest, ()))
+            explicit = dest in releases_map
+            cursor = release_cursor[dest]
+            while cursor < len(events) and events[cursor].done:
+                cursor += 1
+            release_cursor[dest] = cursor
+            if explicit and cursor >= len(events):
+                return
+            after = (done_ev, events[cursor]) if cursor < len(events) else (done_ev,)
+            def on_rel(_ev, d=dest, u=useful, a=alloc):
+                self._track_consumption(d, u)
+                if a is not None:
+                    self._track_reserved_release(d, a.size)
+            free_kw = {"free": (alloc,)} if alloc is not None else {}
+            engine.submit(
+                prefix + ":release", after=after, **free_kw,
+                owner=owner, on_complete=on_rel)
+
+        def on_chunk_done(fi: int, dest: int, useful: float, prefix: str, alloc, done_ev):
+            arrived_count[fi] += 1
+            if on_chunk_arrived is not None:
+                on_chunk_arrived(fi, dest, useful, done_ev)
+            elif pool_name is not None:
+                self._track_arrival(dest, useful)
+                schedule_per_chunk_release(prefix, dest, useful, done_ev, alloc)
+            pump(fi)
+            if arrived_count[fi] == expected[fi]:
+                complete_flow(fi)
+
+        def issue_chunk(fi: int, ci: int):
+            path = plan.flows[fi]
+            chunk = path.chunks[ci]
+            dest = int(path.flow.destination)
+            src = int(path.flow.source)
+            useful = float(chunk.flow.useful_bytes)
+            prefix = f"{name}:flow{fi}:chunk{ci}"
+            alloc = None
+            if pool_name is not None:
+                grant_deps = [ready_by_rank[src], ready_by_rank[dest]]
+                if prev_grant[fi] is not None:
+                    grant_deps.append(prev_grant[fi])
+                alloc = Allocation(prefix + ":credit", pool_name, useful, (0,))
+                s_ev, d_ev = ready_by_rank[src], ready_by_rank[dest]
+                def on_grant(_ev, d=dest, u=useful, se=s_ev, de=d_ev):
+                    self._track_reserved_acquire(d, u)
+                    ready_at = max(se.time or 0.0, de.time or 0.0)
+                    if float(engine.now) - ready_at > _FLOAT_REL_TOL:
+                        self._transport["credit_waits"] += 1
+                grant_ev = engine.submit(
+                    prefix + ":grant", after=tuple(grant_deps), acquire=(alloc,),
+                    owner=owner, on_complete=on_grant)
+                prev_grant[fi] = grant_ev
+            else:
+                gate_deps = [ready_by_rank[src], ready_by_rank[dest]]
+                if prev_service[fi] is not None:
+                    gate_deps.append(prev_service[fi])
+                grant_ev = engine.submit(prefix + ":gate", after=tuple(gate_deps), owner=owner)
+            demand, prop_ms = self._chunk_coupled_demand(engine, plan, fi, chunk, flow_mems[fi])
+            startup_ms = (
+                plan._port_stages(path) * float(plan.hop_startup_us) / _MS_PER_S
+                if ci == 0 and plan.hop_startup_us else 0.0
+            )
+            delay_ms = (prop_ms if (pool_name is not None or ci == 0) else 0.0) + startup_ms
+            if delay_ms > 0.0:
+                gate_ev = engine.submit(
+                    prefix + ":prop", after=(grant_ev,), latency=delay_ms, owner=owner)
+            else:
+                gate_ev = grant_ev
+            svc_deps = (gate_ev, prev_service[fi]) if prev_service[fi] is not None else (gate_ev,)
+            svc = engine.submit(
+                prefix + ":service", demand, after=svc_deps, owner=owner, coupled=True,
+                on_complete=lambda ev, f=fi, d=dest, u=useful, p=prefix, a=alloc:
+                    on_chunk_done(f, d, u, p, a, ev))
+            prev_service[fi] = svc
+
+        def pump(fi: int):
+            if expected[fi] == 0:
+                return
+            win = windows[fi]
+            limit = (
+                min(expected[fi], arrived_count[fi] + 1)
+                if win is None
+                else min(expected[fi], arrived_count[fi] + win + 1)
+            )
+            while issued[fi] < limit:
+                ci = issued[fi]
+                issued[fi] += 1
+                issue_chunk(fi, ci)
+
+        for fi, path in enumerate(plan.flows):
+            if not expected[fi]:
+                engine.submit(
+                    f"{name}:flow{fi}:empty",
+                    after=(ready_by_rank[path.flow.source], ready_by_rank[path.flow.destination]),
+                    owner=owner, on_complete=lambda _ev, f=fi: complete_flow(f))
+            else:
+                pump(fi)
+        return tuple(completions)
+
     def submit_handoff(self, engine, handoff, *, source_ready_by_rank,
                        destination_ready_by_rank, release_events=None,
                        source_last_use_by_rank=None,
                        source_release_callbacks=None,
                        release_callbacks_by_rank=None,
                        name=None):
-        """Submit an actual request/rank/stage handoff binding.
-
-        Every source and destination rank in ``handoff`` must have its own real
-        readiness event.  The T09 transport plan receives the actual directed
-        flows and per-destination physical receive buffer ids; T08 owns the
-        storage/generation/range facts already carried by each transfer.  The
-        receive footprint F is reserved once for the complete handoff in the
-        declared pool budget C.  A whole-message policy is refused *before any
-        submission* when F cannot fit C, so it cannot issue partial grants or
-        wire work.
-
-        ``source_last_use_by_rank`` are optional real local-reader events for a
-        source rank; the source handle is returned exactly at the last of those
-        events and that source's final transport read (never at a fabricated
-        time).  ``release_events`` are real destination consumer events; the
-        receive handle is returned only when their actual coverage equals the
-        full footprint.  ``source_release_callbacks`` and
-        ``release_callbacks_by_rank`` are fixed at call time with their
-        pool/rank identity and invoked once at the real boundary.
-        """
+        """Submit an actual request/rank/stage handoff binding."""
         if not isinstance(handoff, PDHandoff):
             raise ModelingError("pd_submit_handoff_requires_PDHandoff")
         name = name or f"pd:{handoff.request_id}"
@@ -178,77 +562,64 @@ class PDConnector:
             raise ModelingError(
                 "pd_handoff_missing_rank_ready:"
                 f"source={missing_sources}:destination={missing_destinations}")
-        capacity_by_rank = dict(handoff.receive_capacity_bytes)
-        pool_capacity_by_rank = dict(handoff.receive_pool_capacity_bytes)
-        buffer_by_rank = dict(handoff.receive_buffer_ids)
-        # C and F are distinct declarations.  A whole-message receiver needs
-        # the complete footprint in one allocation; if C < F it can never be
-        # authorized, so refuse with zero Engine submissions.
-        for destination, capacity in sorted(capacity_by_rank.items()):
-            pool_capacity = pool_capacity_by_rank.get(destination, capacity)
-            if float(pool_capacity) + 1e-9 < float(capacity):
-                raise ModelingError(
-                    "pd_whole_message_footprint_exceeds_pool:"
-                    f"{destination}:{capacity}>{pool_capacity}")
-        source_last_use = {}
-        for rank, value in dict(source_last_use_by_rank or {}).items():
-            source_last_use[int(rank)] = (
-                tuple(value) if isinstance(value, (tuple, list)) else (value,))
-        source_callbacks = {int(rank): callback for rank, callback
-                            in dict(source_release_callbacks or {}).items()}
-        release_callbacks = {int(rank): callback for rank, callback
-                            in dict(release_callbacks_by_rank or {}).items()}
-
-        topology = self._topology_for_ranks(handoff.ranks)
-        self._ensure_engine_resources(engine, topology)
-        # The receive footprint is reserved once for the complete handoff.
-        # T09 still owns route/chunk/framing; its per-chunk credit is not used
-        # here because the consumer is a whole-message consumer.
+        per_rank_pools = self._preflight_handoff_pools(engine, handoff)
+        topology = self._topology_for_handoff(handoff)
         transport = TransportOptions(
             chunk_bytes=self.chunk_bytes,
             hop_startup_us=self.hop_startup_us or 0.0,
             receive_buffer_ids=handoff.receive_buffer_ids,
             max_physical_chunks=_MAX_PHYSICAL_CHUNKS)
-        plan = topology.transport_plan(handoff.flows(), transport=transport)
-        plan = self._alias_plan(plan)
+        plan = self._alias_plan(topology.transport_plan(handoff.flows(), transport=transport))
+        _validate_plan_chunks(plan)
+        self._ensure_engine_resources(engine, topology)
+
+        source_last_use = {
+            int(rank): (tuple(val) if isinstance(val, (tuple, list)) else (val,))
+            for rank, val in dict(source_last_use_by_rank or {}).items()
+        }
+        source_callbacks = {int(rank): cb for rank, cb
+                            in dict(source_release_callbacks or {}).items()}
+        release_callbacks = {int(rank): cb for rank, cb
+                             in dict(release_callbacks_by_rank or {}).items()}
 
         rank_ready, reservations = self._reserve_handoff_receivers(
-            engine, handoff, name, sources, destinations,
-            capacity_by_rank, pool_capacity_by_rank, buffer_by_rank)
-        boundary = engine.submit(
-            name + ":ready", after=tuple(rank_ready.values()),
-            owner=f"request:{handoff.request_id}",
-            metadata={"boundary": "pd_handoff_all_rank_ready",
-                      "request_id": handoff.request_id,
-                      "rank_count": len(rank_ready)})
-        memory = engine.submit(
-            name + ":memory", dict(handoff.memory_work), after=(boundary,),
-            owner=f"request:{handoff.request_id}")
-        run = plan.start(engine, name + ":transport", rank_ready,
-                         owner=f"request:{handoff.request_id}")
+            engine, handoff, name, sources, destinations, per_rank_pools)
         release_map = _normalize_releases(release_events) or {}
         flow_index_by_destination = defaultdict(list)
-        source_flow_events = defaultdict(list)
-        for index, (event, path) in enumerate(zip(run.completions,
-                                                  run.plan.flows)):
-            transfer = handoff.transfers[index]
-            source_flow_events[transfer.source_rank].append(event)
+        hbm_flow_indices = set()
+        for index, transfer in enumerate(handoff.transfers):
             if transfer.destination_tier == "hbm":
-                flow_index_by_destination[path.flow.destination].append(index)
-        release_events_by_rank = {}
+                flow_index_by_destination[transfer.destination_rank].append(index)
+                hbm_flow_indices.add(index)
+        chunk_handlers: dict[int, object] = {}
+
+        def dispatch_chunk(fi: int, dest: int, useful: float, ev):
+            if fi in hbm_flow_indices:
+                handler = chunk_handlers.get(dest)
+                if handler is not None:
+                    handler(useful, float(ev.time if ev.time is not None else engine.now))
+
+        completions = self._execute_plan(
+            engine, name + ":transport", plan, rank_ready,
+            memory_work=handoff.memory_work, transfers=handoff.transfers,
+            owner=f"request:{handoff.request_id}",
+            on_chunk_arrived=dispatch_chunk)
+        source_flow_events = defaultdict(list)
+        for index, event in enumerate(completions):
+            source_flow_events[handoff.transfers[index].source_rank].append(event)
         for destination, allocation in reservations.items():
-            indices = flow_index_by_destination.get(destination, ())
-            flow_events = tuple(run.completions[index] for index in indices)
+            indices = tuple(flow_index_by_destination.get(destination, ()))
+            flow_events = tuple(completions[index] for index in indices)
             consumer_events = tuple(release_map.get(destination, ()))
             amount = sum(float(handoff.transfers[index].payload_bytes)
                          for index in indices)
-            release_event = self._schedule_residency(
+            _, on_chunk = self._schedule_residency(
                 engine, f"{name}:r{destination}", destination, amount,
                 flow_events, consumer_events, allocation=allocation,
                 release_name=f"{name}:receive_release:r{destination}",
                 explicit_consumer=True,
                 release_callback=release_callbacks.get(destination))
-            release_events_by_rank[destination] = release_event
+            chunk_handlers[destination] = on_chunk
         source_release_events = {}
         for rank in sorted(source_flow_events):
             explicit = source_last_use.get(rank, ())
@@ -266,11 +637,10 @@ class PDConnector:
                     if rank in source_callbacks else None))
             source_release_events[rank] = release
         return self._finish_handoff(
-            engine, name, handoff, memory, run, source_release_events)
+            engine, name, handoff, plan, completions, source_release_events)
 
     def _reserve_handoff_receivers(
-        self, engine, handoff, name, sources, destinations,
-        capacity_by_rank, pool_capacity_by_rank, buffer_by_rank,
+        self, engine, handoff, name, sources, destinations, per_rank_pools,
     ):
         pair_ready = defaultdict(list)
         for transfer in handoff.transfers:
@@ -284,46 +654,46 @@ class PDConnector:
         from ..engine import Allocation
         reservations = {}
         allocations = []
-        for destination, capacity in sorted(capacity_by_rank.items()):
-            buffer_id = buffer_by_rank.get(
-                destination, f"{handoff.request_id}:rank{destination}")
-            pool = f"transport:rx:{buffer_id}"
-            pool_capacity = pool_capacity_by_rank.get(destination, capacity)
-            if pool in engine.pools:
-                if not math.isclose(engine.pools[pool], pool_capacity,
-                                    rel_tol=1e-12, abs_tol=1e-9):
-                    raise ModelingError(
-                        "pd_receive_pool_capacity_conflict:"
-                        f"{destination}:{engine.pools[pool]}!={pool_capacity}")
-            else:
-                engine.extend(pools={pool: pool_capacity})
+        for destination, (buffer_id, footprint, pool_cap) in sorted(per_rank_pools.items()):
+            pool = self._receive_pool_name(buffer_id)
+            if pool not in engine.pools:
+                engine.extend(pools={pool: float(pool_cap)})
+            self._buffer_ranks[buffer_id].add(int(destination))
             allocation = Allocation(
-                f"{name}:rx:r{destination}", pool, float(capacity), (0,))
+                f"{name}:rx:r{destination}", pool, float(footprint), (0,))
             reservations[destination] = allocation
             allocations.append(allocation)
         if allocations:
             reserve_ready = engine.submit(
                 f"{name}:receive_ready",
-                after=tuple(event for destination in sorted(capacity_by_rank)
+                after=tuple(event for destination in sorted(per_rank_pools)
                             for event in pair_ready[destination]),
                 owner=f"request:{handoff.request_id}")
+            reserved_pairs = tuple(
+                (destination, allocation.size)
+                for destination, allocation in sorted(reservations.items())
+            )
+            def on_grant(_event):
+                self._track_reservation(reserve_ready)
+                for dest, amt in reserved_pairs:
+                    self._track_reserved_acquire(dest, amt)
             grant = engine.submit(
                 f"{name}:receive_grant", after=(reserve_ready,),
                 acquire=tuple(allocations),
                 owner=f"request:{handoff.request_id}",
-                on_complete=lambda _event: self._track_reservation(reserve_ready),
+                on_complete=on_grant,
                 metadata={"boundary": "pd_whole_message_receive_grant",
                           "request_id": handoff.request_id,
-                          "destination_ranks": sorted(capacity_by_rank),
+                          "destination_ranks": sorted(per_rank_pools),
                           "receive_buffer_ids": {
-                              str(rank): buffer_by_rank.get(rank)
-                              for rank in sorted(capacity_by_rank)},
+                              str(rank): per_rank_pools[rank][0]
+                              for rank in sorted(per_rank_pools)},
                           "footprint_bytes": {
-                              str(rank): capacity
-                              for rank, capacity in capacity_by_rank.items()},
+                              str(rank): per_rank_pools[rank][1]
+                              for rank in sorted(per_rank_pools)},
                           "pool_capacity_bytes": {
-                              str(rank): pool_capacity_by_rank.get(rank, capacity)
-                              for rank in sorted(capacity_by_rank)}})
+                              str(rank): per_rank_pools[rank][2]
+                              for rank in sorted(per_rank_pools)}})
             for rank in pair_ready:
                 pair_ready[rank].append(grant)
         rank_ready = {
@@ -333,28 +703,24 @@ class PDConnector:
             for rank in sorted(pair_ready)}
         return rank_ready, reservations
 
-    def _finish_handoff(self, engine, name, handoff, memory, run, source_release_events):
+    def _finish_handoff(self, engine, name, handoff, plan, completions, source_release_events):
         self._engine = engine
-        wire = sum(hop.wire_bytes for path in run.plan.flows
-                   for chunk in path.chunks for hop in chunk.hops)
-        transactions = (sum(hop.transactions or 0 for path in run.plan.flows
-                            for chunk in path.chunks for hop in chunk.hops)
-                        if self.transactions is not None else None)
+        wire, transactions, chunks = _plan_wire_and_transactions(
+            plan, track_transactions=self.transactions is not None)
         self.wire_bytes += wire
         if self.transactions is not None:
             self.transactions += transactions
-        chunks = sum(len(path.chunks) for path in run.plan.flows)
         self._transport["chunks"] += chunks
-        self._transport["unknowns"].update(key for key, _ in run.plan.unknowns)
+        self._transport["unknowns"].update(key for key, _ in plan.unknowns)
         self._handoff_count += 1
         self._handoff_flows += len(handoff.transfers)
         self._handoff_ranks.update(handoff.ranks)
         self._last_receive_capacity = dict(handoff.receive_capacity_bytes)
         self._last_receive_buffers = dict(handoff.receive_buffer_ids)
-        for rank, buffer_id in run.plan.receive_buffer_ids:
-            self._buffer_rank[buffer_id] = int(rank)
+        for rank, buffer_id in plan.receive_buffer_ids:
+            self._buffer_ranks[buffer_id].add(int(rank))
         return engine.submit(
-            name, after=(memory, *run.completions),
+            name, after=completions,
             owner=f"request:{handoff.request_id}",
             metadata={
                 "boundary": "pd_pool_connector_handoff",
@@ -372,173 +738,184 @@ class PDConnector:
                 "receive_buffer_ids": dict(handoff.receive_buffer_ids),
                 "source_release_ranks": sorted(source_release_events),
                 "transport": "common_topology_transport_plan",
-            }, on_complete=lambda _event: self._fold_transport(run))
+            })
 
     def submit(self, engine, name, volume, memory_work, *,
                ready=None, destination_ready=None, release_events=None):
-        """Submit one handoff under one common source/destination boundary.
-
-        ``ready`` is the source KV availability event; ``destination_ready`` is
-        the actual decode admission/grant event.  Both branches receive one
-        boundary event that is the join of those two events.  A legacy
-        whole-message transfer always pays its propagation stage after that
-        boundary; specifying an equivalent zero-time ready cannot delete work.
-        ``release_events`` are consumer events, not an additional call duration.
-        """
+        """Submit one handoff under one common source/destination boundary."""
         releases = _normalize_releases(release_events)
         declared_consumer = release_events is not None
+        pool = self._receive_pool_name(self.receive_buffer_id)
+        effective_rx_cap = self.receive_capacity_bytes
+        if effective_rx_cap is not None:
+            self._check_pool_capacity(engine, pool, float(effective_rx_cap), self.receive_buffer_id)
+        elif pool in engine.pools:
+            effective_rx_cap = float(engine.pools[pool])
+        if (declared_consumer and effective_rx_cap is not None
+                and float(effective_rx_cap) + _FLOAT_ABS_TOL < float(volume)):
+            raise ModelingError(
+                "pd_finite_receive_credit_requires_per_chunk_consumer:"
+                f"capacity={effective_rx_cap}:volume={volume}")
+        single_chunk = self.chunk_bytes is None or float(self.chunk_bytes) >= float(volume)
+        if (not declared_consumer and effective_rx_cap is not None):
+            largest = float(volume) if single_chunk else float(self.chunk_bytes)
+            if float(effective_rx_cap) + _FLOAT_ABS_TOL < largest:
+                raise ModelingError(
+                    "pd_whole_message_footprint_exceeds_pool:"
+                    f"{pool}:{largest}>{effective_rx_cap}")
+        use_transport = self.transport_declared or effective_rx_cap is not None
+        if not use_transport:
+            self._engine = engine
+            boundary = self._submit_common_boundary(engine, name, ready, destination_ready)
+            return self._submit_legacy(
+                engine, name, volume, memory_work, boundary=boundary, releases=releases)
+
+        use_reserved = (
+            effective_rx_cap is not None
+            and float(effective_rx_cap) + _FLOAT_ABS_TOL >= float(volume)
+            and (declared_consumer or single_chunk)
+        )
+        transport = TransportOptions(
+            chunk_bytes=self.chunk_bytes,
+            hop_startup_us=self.hop_startup_us or 0.0,
+            receive_capacity_bytes=(
+                ((1, float(effective_rx_cap)),)
+                if (not use_reserved and effective_rx_cap is not None) else ()
+            ),
+            receive_buffer_ids=((1, self.receive_buffer_id),),
+            max_physical_chunks=_MAX_PHYSICAL_CHUNKS)
+        plan = self._alias_plan(self.topology.transport_plan(
+            [MessageFlow(0, 1, volume)], transport=transport))
+        _validate_plan_chunks(plan)
+
         self._engine = engine
-        source_ready = ready if ready is not None else engine.submit(
-            name + ":source_ready")
-        receiver_ready = (destination_ready if destination_ready is not None
-                          else source_ready)
-        boundary = engine.submit(
+        boundary = self._submit_common_boundary(engine, name, ready, destination_ready)
+        if use_reserved:
+            return self._submit_reserved_single(
+                engine, name, volume, memory_work, plan=plan,
+                pool_capacity=float(effective_rx_cap), boundary=boundary,
+                releases=releases, declared_consumer=declared_consumer)
+
+        per_chunk_pool = (
+            (pool, float(effective_rx_cap)) if effective_rx_cap is not None else None
+        )
+        if per_chunk_pool is not None:
+            self._buffer_ranks[self.receive_buffer_id].add(1)
+        completions = self._execute_plan(
+            engine, name + ":transport", plan, {0: boundary, 1: boundary},
+            memory_work=memory_work, per_chunk_pool=per_chunk_pool,
+            per_chunk_releases=releases)
+        wire, transactions, chunks = _plan_wire_and_transactions(
+            plan, track_transactions=self.transactions is not None)
+        self.wire_bytes += wire
+        if self.transactions is not None:
+            self.transactions += transactions
+        self._transport["chunks"] += chunks
+        self._transport["unknowns"].update(key for key, _ in plan.unknowns)
+        for rank, buffer_id in plan.receive_buffer_ids:
+            self._buffer_ranks[buffer_id].add(int(rank))
+        return engine.submit(
+            name, after=completions, metadata={
+                "boundary": "pd_pool_connector",
+                "useful_bytes": volume,
+                "wire_bytes": wire,
+                "chunks": chunks,
+                "transactions": transactions,
+                "transport": "common_topology_transport_plan",
+            })
+
+    @staticmethod
+    def _submit_common_boundary(engine, name, ready, destination_ready):
+        source_ready = ready if ready is not None else engine.submit(name + ":source_ready")
+        receiver_ready = destination_ready if destination_ready is not None else source_ready
+        return engine.submit(
             name + ":ready", after=(source_ready, receiver_ready),
             metadata={"boundary": "pd_common_source_destination_ready",
                       "source_ready": source_ready.name,
                       "destination_ready": receiver_ready.name})
-        if not self.transport_declared:
-            return self._submit_legacy(
-                engine, name, volume, memory_work, boundary=boundary,
-                releases=releases)
-        if (declared_consumer and self.receive_capacity_bytes is not None
-                and float(self.receive_capacity_bytes) >= float(volume)):
-            return self._submit_reserved_single(
-                engine, name, volume, memory_work, boundary=boundary,
-                releases=releases, declared_consumer=True)
-        if (declared_consumer and self.receive_capacity_bytes is not None
-                and float(self.receive_capacity_bytes) < float(volume)):
-            # A single consumer release after the complete handoff cannot
-            # safely free a smaller per-chunk receive pool: the next chunk's
-            # grant would wait for a consumer that waits for the complete
-            # handoff.  Refuse to fabricate a deadlock; a chunked consumer
-            # protocol is a separate explicit capability.
-            raise ModelingError(
-                "pd_finite_receive_credit_requires_per_chunk_consumer:"
-                f"capacity={self.receive_capacity_bytes}:volume={volume}")
-        plan = self.topology.transport_plan(
-            [MessageFlow(0, 1, volume)],
-            chunk_bytes=self.chunk_bytes,
-            receive_capacity_bytes=self.receive_capacity_bytes,
-            hop_startup_us=self.hop_startup_us or 0.0)
-        plan = self._alias_plan(plan)
-        run = plan.start(engine, name + ":transport",
-                         {0: boundary, 1: boundary},
-                         release_events=releases)
-        memory = engine.submit(name + ":memory", memory_work, after=(boundary,))
-        self.wire_bytes += sum(
-            hop.wire_bytes for path in run.plan.flows
-            for chunk in path.chunks for hop in chunk.hops)
-        if self.transactions is not None:
-            self.transactions += sum(
-                hop.transactions or 0 for path in run.plan.flows
-                for chunk in path.chunks for hop in chunk.hops)
-        self._transport["chunks"] += sum(len(path.chunks) for path in run.plan.flows)
-        self._transport["unknowns"].update(key for key, _ in run.plan.unknowns)
-        for rank, buffer_id in run.plan.receive_buffer_ids:
-            self._buffer_rank[buffer_id] = int(rank)
-        return engine.submit(
-            name, after=(memory, *run.completions), metadata={
-                "boundary": "pd_pool_connector",
-                "useful_bytes": volume,
-                "wire_bytes": sum(hop.wire_bytes for path in run.plan.flows
-                                  for chunk in path.chunks for hop in chunk.hops),
-                "chunks": sum(len(path.chunks) for path in run.plan.flows),
-                "transactions": (sum(
-                    hop.transactions or 0 for path in run.plan.flows
-                    for chunk in path.chunks for hop in chunk.hops)
-                    if self.transactions is not None else None),
-                "transport": "common_topology_transport_plan",
-            }, on_complete=lambda _event: self._fold_transport(run))
 
     def _submit_reserved_single(self, engine, name, volume, memory_work, *,
-                                boundary, releases, declared_consumer=False):
-        """Hold one complete receive footprint for a whole-message consumer."""
+                                plan, pool_capacity, boundary, releases,
+                                declared_consumer=False):
+        """Hold one complete receive footprint on the shared physical receive pool."""
         from ..engine import Allocation
-        capacity = float(self.receive_capacity_bytes)
-        pool = f"transport:rx:{self.receive_buffer_id}"
-        if pool in engine.pools:
-            if not math.isclose(engine.pools[pool], capacity,
-                                rel_tol=1e-12, abs_tol=1e-9):
-                raise ModelingError(
-                    "pd_receive_pool_capacity_conflict:"
-                    f"{self.receive_buffer_id}:{engine.pools[pool]}!={capacity}")
-        else:
-            engine.extend(pools={pool: capacity})
+        pool = self._receive_pool_name(self.receive_buffer_id)
+        if pool not in engine.pools:
+            engine.extend(pools={pool: pool_capacity})
+        self._buffer_ranks[self.receive_buffer_id].add(1)
         allocation = Allocation(f"{name}:rx", pool, float(volume), (0,))
+        def on_grant(_event):
+            self._track_reservation(boundary)
+            self._track_reserved_acquire(1, allocation.size)
         grant = engine.submit(
             name + ":receive_grant", after=(boundary,), acquire=(allocation,),
             metadata={"boundary": "pd_whole_message_receive_grant",
                       "receive_buffer_id": self.receive_buffer_id,
-                      "pool_capacity_bytes": capacity,
+                      "pool_capacity_bytes": pool_capacity,
                       "footprint_bytes": volume},
-            on_complete=lambda _event: self._track_reservation(boundary))
-        transport = TransportOptions(
-            chunk_bytes=self.chunk_bytes,
-            hop_startup_us=self.hop_startup_us or 0.0,
-            receive_buffer_ids=((1, self.receive_buffer_id),),
-            max_physical_chunks=_MAX_PHYSICAL_CHUNKS)
-        plan = self.topology.transport_plan(
-            [MessageFlow(0, 1, volume)], transport=transport)
-        plan = self._alias_plan(plan)
-        run = plan.start(engine, name + ":transport", {0: grant, 1: grant})
-        memory = engine.submit(name + ":memory", memory_work, after=(grant,))
+            on_complete=on_grant)
+        chunk_cb = [None]
+        def dispatch_chunk(_fi, _dest, useful, ev):
+            if chunk_cb[0] is not None:
+                chunk_cb[0](useful, float(ev.time if ev.time is not None else engine.now))
+        completions = self._execute_plan(
+            engine, name + ":transport", plan, {0: grant, 1: grant},
+            memory_work=memory_work, on_chunk_arrived=dispatch_chunk)
         consumer_events = tuple((releases or {}).get(1, ()))
-        self._schedule_residency(
-            engine, name, 1, float(volume), run.completions, consumer_events,
+        _, on_chunk = self._schedule_residency(
+            engine, name, 1, float(volume), completions, consumer_events,
             allocation=allocation,
             release_name=f"{name}:receive_release:r1",
             explicit_consumer=declared_consumer)
-        self._engine = engine
-        wire = sum(hop.wire_bytes for path in run.plan.flows
-                   for chunk in path.chunks for hop in chunk.hops)
-        transactions = (sum(hop.transactions or 0 for path in run.plan.flows
-                            for chunk in path.chunks for hop in chunk.hops)
-                        if self.transactions is not None else None)
+        chunk_cb[0] = on_chunk
+        wire, transactions, chunks = _plan_wire_and_transactions(
+            plan, track_transactions=self.transactions is not None)
         self.wire_bytes += wire
         if self.transactions is not None:
             self.transactions += transactions
-        chunks = sum(len(path.chunks) for path in run.plan.flows)
         self._transport["chunks"] += chunks
-        self._transport["unknowns"].update(key for key, _ in run.plan.unknowns)
+        self._transport["unknowns"].update(key for key, _ in plan.unknowns)
         self._handoff_count += 1
         self._handoff_flows += 1
         self._handoff_ranks.update((0, 1))
-        self._last_receive_capacity = {1: capacity}
+        self._last_receive_capacity = {1: pool_capacity}
         self._last_receive_buffers = {1: self.receive_buffer_id}
-        for rank, buffer_id in run.plan.receive_buffer_ids:
-            self._buffer_rank[buffer_id] = int(rank)
+        for rank, buffer_id in plan.receive_buffer_ids:
+            self._buffer_ranks[buffer_id].add(int(rank))
         return engine.submit(
-            name, after=(memory, *run.completions), metadata={
+            name, after=completions, metadata={
                 "boundary": "pd_pool_connector_reserved",
                 "useful_bytes": volume, "wire_bytes": wire,
                 "transactions": transactions, "chunks": chunks,
                 "receive_buffer_id": self.receive_buffer_id,
                 "transport": "whole_message_receive_reservation",
-            }, on_complete=lambda _event: self._fold_transport(run))
+            })
 
     def _submit_legacy(self, engine, name, volume, memory_work, *,
                        boundary, releases=None):
         hop, = self.topology.route_message(MessageFlow(0, 1, volume)).hops
-        # Propagation is a physical stage after the common boundary, never a
-        # branch-local shortcut that disappears when an explicit ready is given.
         propagation = engine.submit(
             name + ":latency", after=(boundary,), latency=hop.latency_ms,
             metadata={"boundary": "pd_link_propagation_once"})
-        demand = {self.alias.get(key, key): value for key, value in hop.demand.items()}
+        demand = {self.alias.get(key, key): float(value) for key, value in hop.demand.items()}
+        for port_name, amt in self._declared_port_demand(
+                engine, self.topology, 0, 1, float(hop.wire_bytes)).items():
+            demand.setdefault(port_name, amt)
+        src_items, dst_items, shared_items = _partition_memory_work(memory_work)
+        for key, amount, _ in (*src_items, *dst_items):
+            demand[key] = demand.get(key, 0.0) + amount
+        for key, amount in shared_items:
+            demand[key] = demand.get(key, 0.0) + amount
         self.wire_bytes += hop.wire_bytes
         if self.transactions is not None:
             self.transactions += hop.transactions
-        memory = engine.submit(name + ":memory", memory_work, after=(propagation,))
         wire = engine.submit(name + ":wire", demand, after=(propagation,), coupled=True)
-        complete = engine.submit(name, after=(memory, wire), metadata={
+        complete = engine.submit(name, after=(wire,), metadata={
             "boundary": "pd_pool_connector", "useful_bytes": volume,
             "wire_bytes": hop.wire_bytes, "transactions": hop.transactions,
         })
         destination_releases = (releases or {}).get(1, ())
         if destination_releases:
-            # Consumer release is a separate zero-work boundary.  It never
-            # extends the handoff completion, but it is not silently dropped.
             engine.submit(name + ":consume", after=(wire, *destination_releases),
                           metadata={"boundary": "pd_consumer_release",
                                     "consumer_events": len(destination_releases)})
@@ -565,21 +942,26 @@ class PDConnector:
                 sorted(self._last_receive_buffers.items())},
         }
         if self._transport["chunks"] or self._transport["credit_waits"]:
-            shared_peak = {}
+            reserved = {
+                str(rank): value for rank, value in
+                self._transport["peak_reserved"].items()
+            }
+            shared_pool_seen = False
             if self._engine is not None:
                 for pool, value in self._engine.peak_allocated.items():
                     if str(pool).startswith("transport:rx:"):
+                        shared_pool_seen = True
                         buffer_id = str(pool)[len("transport:rx:"):]
-                        rank = self._buffer_rank.get(buffer_id, buffer_id)
-                        shared_peak[str(rank)] = value
-            reserved = (shared_peak if shared_peak else
-                        {str(rank): value for rank, value in
-                         self._transport["peak_reserved"].items()})
+                        ranks = self._buffer_ranks.get(buffer_id)
+                        if ranks and len(ranks) == 1:
+                            rank_key = str(next(iter(ranks)))
+                            if value > reserved.get(rank_key, 0.0):
+                                reserved[rank_key] = value
             result["transport"] = {
                 "boundary": "common_topology_transport_plan",
                 "capacity_scope": ("engine_pool_transport:rx:<destination>; "
                                    "shared by plans on the same Engine"),
-                "reserved_peak_basis": ("engine_pool_peak_granted" if shared_peak
+                "reserved_peak_basis": ("engine_pool_peak_granted" if shared_pool_seen
                                         else "max_single_handoff_granted"),
                 "residency_peak_basis": (
                     "pd_receive_arrival_minus_consumer"
@@ -612,104 +994,53 @@ class PDConnector:
         self._transport["resident"][key] = max(
             0.0, self._transport["resident"].get(key, 0.0) - float(amount))
 
+    def _track_reserved_acquire(self, destination, amount):
+        key = int(destination)
+        value = self._transport["reserved"].get(key, 0.0) + float(amount)
+        self._transport["reserved"][key] = value
+        if value > self._transport["peak_reserved"].get(key, 0.0):
+            self._transport["peak_reserved"][key] = value
+
+    def _track_reserved_release(self, destination, amount):
+        key = int(destination)
+        self._transport["reserved"][key] = max(
+            0.0, self._transport["reserved"].get(key, 0.0) - float(amount))
+
     def _schedule_residency(self, engine, name, destination, amount,
                             arrivals, consumer_events, allocation=None,
                             release_name=None, explicit_consumer=False,
                             release_callback=None):
-        """Bind arrival, real consumer times and the actual release decision.
-
-        Consumer events are not a count multiplier.  Each consumer's coverage
-        is decided from that consumer's *original* event time, never from the
-        synthetic callback time: a consumer before full arrival may drain at
-        most one physical chunk share, while a consumer at/after full arrival
-        may drain the remaining tail.  If the declared sequence does not cover
-        the whole footprint, the allocation stays live, so a successor cannot
-        be admitted by an exhausted event list.  An explicitly empty sequence
-        is a hold, not arrival-time consumption.
-        """
+        """Drive chunk arrival, bounded early/full consumption, and pool release."""
         self._tracked_residency = True
         events = tuple(consumer_events)
+        total = float(amount)
+        early_cap = float(self.chunk_bytes) if self.chunk_bytes is not None else total
+        state = {"arrived": 0.0, "consumed": 0.0, "released": False}
+        completed_consumers: list[dict] = []
 
-        def track_arrival(_event):
-            self._track_arrival(destination, amount)
+        def sync_arrived(new_arrived):
+            clamped = min(total, max(state["arrived"], float(new_arrived)))
+            delta = clamped - state["arrived"]
+            if delta > 0.0:
+                state["arrived"] = clamped
+                self._track_arrival(destination, delta)
 
-        arrival_event = engine.submit(
-            f"{name}:arrival", after=tuple(arrivals),
-            metadata={"boundary": "pd_receive_arrival",
-                      "destination_rank": destination,
-                      "bytes": amount},
-            on_complete=track_arrival)
-        if explicit_consumer and not events:
-            return None
-        consumed = [0.0]
-        count = (1 if self.chunk_bytes is None else max(
-            1, math.ceil(float(amount) / float(self.chunk_bytes) - 1e-12)))
-        shares = []
-        if not events:
-            shares = []
-        elif len(events) == 1:
-            shares = [float(amount)]
-        elif len(events) >= count:
-            share = float(self.chunk_bytes or amount)
-            shares = [share] * count
-            shares[-1] = float(amount) - share * (count - 1)
-            shares.extend([0.0] * (len(events) - count))
-        else:
-            shares = [float(self.chunk_bytes or (amount / len(events)))] * len(events)
+        def apply_consume(delta):
+            available = max(0.0, state["arrived"] - state["consumed"])
+            step = min(max(0.0, float(delta)), available)
+            if step > 0.0:
+                state["consumed"] += step
+                self._track_consumption(destination, step)
+            return step
 
-        def apply(index, value):
-            value = min(max(0.0, float(value)),
-                        max(0.0, float(amount) - consumed[0]))
-            consumed[0] += value
-            self._track_consumption(destination, value)
-
-        def consume(_task, index):
-            original = events[index]
-            base = shares[index] if index < len(shares) else 0.0
-            if not arrival_event.done:
-                # The consumer ran before the complete message arrived.  Its
-                # real declaration still covers its bounded share; account it
-                # at the real full-arrival boundary instead of inventing an
-                # earlier arrival.
-                engine.submit(
-                    f"{name}:consume{index}:deferred", after=(arrival_event,),
-                    metadata={"boundary": "pd_receive_consumer_share",
-                              "destination_rank": destination,
-                              "consumer_index": index,
-                              "bytes": float(base)},
-                    on_complete=lambda _event, i=index:
-                        apply(i, shares[i] if i < len(shares) else 0.0))
+        def maybe_release():
+            if state["released"] or allocation is None:
                 return
-            original_time = (original.time if original.time is not None
-                             else float(arrival_event.time or 0.0))
-            if original_time >= float(arrival_event.time or 0.0):
-                value = max(0.0, float(amount) - consumed[0])
-            else:
-                value = float(base)
-            apply(index, value)
-
-        for index, event in enumerate(events):
-            engine.submit(
-                f"{name}:consume{index}", after=(event,),
-                metadata={"boundary": "pd_receive_consumer_share",
-                          "destination_rank": destination,
-                          "consumer_index": index,
-                          "bytes": shares[index] if index < len(shares) else 0.0},
-                on_complete=lambda _event, i=index: consume(_event, i))
-        if allocation is None:
-            return None
-
-        def decide_release(_event):
-            if consumed[0] + 1e-9 < float(amount) and events:
-                last = events[-1]
-                if (last.time is not None and arrival_event.time is not None
-                        and last.time >= arrival_event.time):
-                    # The last original consumer is a whole-message tail; its
-                    # callback may have been deferred behind the same arrival.
-                    consumed[0] = float(amount)
-            if consumed[0] + 1e-9 < float(amount):
+            if state["consumed"] + _FLOAT_ABS_TOL < total:
                 return
-            def released(_event):
+            state["released"] = True
+            def on_released(_event):
+                self._track_reserved_release(destination, allocation.size)
                 if release_callback is not None:
                     release_callback()
             engine.submit(
@@ -717,33 +1048,71 @@ class PDConnector:
                 metadata={"boundary": "pd_whole_message_receive_release",
                           "destination_rank": destination,
                           "bytes": amount},
-                on_complete=released)
+                on_complete=on_released)
 
-        return engine.submit(
+        def on_chunk_arrived(chunk_bytes: float, at_ms: float):
+            sync_arrived(state["arrived"] + float(chunk_bytes))
+            for record in completed_consumers:
+                ev_time = record["event"].time
+                if ev_time is None or ev_time < at_ms - _FLOAT_REL_TOL:
+                    continue
+                rem_quota = max(0.0, early_cap - record["used"])
+                if rem_quota > 0.0:
+                    record["used"] += apply_consume(rem_quota)
+            maybe_release()
+
+        def on_arrival(_event):
+            sync_arrived(total)
+            arrival_t = float(arrival_event.time or 0.0)
+            if not explicit_consumer and not events:
+                apply_consume(total - state["consumed"])
+            elif any(rec["event"].time is not None and rec["event"].time >= arrival_t - _FLOAT_REL_TOL
+                     for rec in completed_consumers):
+                apply_consume(total - state["consumed"])
+            maybe_release()
+
+        arrival_event = engine.submit(
+            f"{name}:arrival", after=tuple(arrivals),
+            metadata={"boundary": "pd_receive_arrival",
+                      "destination_rank": destination,
+                      "bytes": amount},
+            on_complete=on_arrival)
+        if explicit_consumer and not events:
+            return None, on_chunk_arrived
+        if not events:
+            return arrival_event, on_chunk_arrived
+
+        def on_consumer(_task, index):
+            original = events[index]
+            record = {"event": original, "used": 0.0}
+            completed_consumers.append(record)
+            if arrival_event.done:
+                sync_arrived(total)
+                record["used"] += apply_consume(total - state["consumed"])
+            else:
+                record["used"] += apply_consume(early_cap)
+            maybe_release()
+
+        for index, event in enumerate(events):
+            engine.submit(
+                f"{name}:consume{index}", after=(event,),
+                metadata={"boundary": "pd_receive_consumer_share",
+                          "destination_rank": destination,
+                          "consumer_index": index},
+                on_complete=lambda _event, i=index: on_consumer(_event, i))
+        if allocation is None:
+            return None, on_chunk_arrived
+        decision = engine.submit(
             f"{name}:release_decision", after=(arrival_event, *events),
             metadata={"boundary": "pd_receive_consumer_coverage",
                       "destination_rank": destination,
                       "bytes": amount},
-            on_complete=decide_release)
+            on_complete=lambda _event: maybe_release())
+        return decision, on_chunk_arrived
 
     def _track_reservation(self, ready_event):
         ready_ms = ready_event.time or 0.0
         wait = max(0.0, float(self._engine.now) - float(ready_ms))
-        if wait > 1e-12:
+        if wait > _FLOAT_REL_TOL:
             self._transport["reservation_waits"] += 1
             self._transport["reservation_wait_ms"] += wait
-
-    def _fold_transport(self, run):
-        report = run.report()
-        self._transport["credit_waits"] += report["credit_waits"]
-        if self._tracked_residency:
-            return
-        for key, value in report["receiver_resident_peak_bytes"].items():
-            rank = str(key)
-            if value > self._transport["peak_resident"].get(rank, 0.0):
-                self._transport["peak_resident"][rank] = value
-        for key, value in report["receiver_reserved_peak_bytes"].items():
-            rank = str(key)
-            if value > self._transport["peak_reserved"].get(rank, 0.0):
-                self._transport["peak_reserved"][rank] = value
-        self._transport["unknowns"].update(report.get("unknowns", {}))
