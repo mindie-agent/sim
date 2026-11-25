@@ -367,7 +367,7 @@ def test_bf16_lightning_indexer_binds_non_quant_native_kernel() -> None:
 
 
 def test_deepseek_v4_head_norm_inverse_rope_collapse_and_mla_prolog_ranks() -> None:
-    assert {1024, 1280} <= MLA_PROLOG_QUERY_LORA_RANKS
+    assert MLA_PROLOG_QUERY_LORA_RANKS == frozenset({1536, 2048})
     q_wq = QuantSpec(name="test", exclusions=("indexer.wq",))
     assert _indexer_q_category(q_wq) == "indexer.wq"
     q_fp8 = QuantSpec(name="test", exclusions=("indexer_fp8",))

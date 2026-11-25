@@ -134,7 +134,7 @@ def test_governed_masked_assignments_keep_pack_work_and_zero_peer_payload(abi, k
                   if dispatch else ceil(2 * width / DATA)) * FRAME
         assert plan.work.resources.get("link", 0) == plan.metadata["peer_payload_bytes"] == kept * packet
         assert phases["cohort0_pack"].get("mte2_aiv", 0) == (kept + padding) * (width * 2 + (4 if dispatch else 12))
-        assert phases["cohort0_pack"].get("vector", 0) == (kept + padding) * (7 * width if dispatch else 1)
+        assert phases["cohort0_pack"].get("vector", 0) == (padding + kept * 7 * width if dispatch else kept + padding)
 
 def case(tp=1, dp=2, *, width=HIDDEN, mode="none", native=True, source=False, experts=None):
     raw = hardware_case()
@@ -494,8 +494,15 @@ def test_separate_quantized_transport_conserves_records_and_transposes_return_ro
         assert gather.op_id in pack.deps and quant.deps == (pack.op_id,)
         assert scale.deps == (quant.op_id, gather.op_id)
         assert send.deps == (quant.op_id, scale.op_id, gather.op_id)
-        assert set(gate.deps) == {quant.op_id, scale.op_id, send.op_id}
-        assert back.deps == (down.op_id,)
+        if 8 > ep:
+            reorder, unorder = ops["moe_receive_reorder"], ops["moe_combine_unorder"]
+            assert set(reorder.deps) == {send.op_id, scale.op_id}
+            assert gate.deps == (reorder.op_id,)
+            assert set(unorder.deps) == {down.op_id, reorder.op_id}
+            assert back.deps == (unorder.op_id,)
+        else:
+            assert set(gate.deps) == {quant.op_id, scale.op_id, send.op_id}
+            assert back.deps == (down.op_id,)
         assert "expert_up.quantize" not in ops and down.deps == (ops["expert_down.quantize"].op_id,)
     costs(raw, declared)
 

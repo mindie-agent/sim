@@ -215,11 +215,17 @@ def test_xllm_and_on_chip_abi_guards(geometry, fields, reason):
 ])
 def test_mega_moe_materializes_supported_operands_before_quant(geometry, dtype, weight, gap):
     op = make_op((4, 0), 64, 32, mode="mega_moe", dtype=dtype, dtype_b=weight,
-                 requested_abi=MEGA_ABI, output_dtype="bf16", soc_tier="a2")
+                 requested_abi=MEGA_ABI, output_dtype="bf16", soc_tier="a2",
+                 ep=2, dispatch_link_bytes=0, combine_link_bytes=0)
     if gap:
         with pytest.raises(UnmodeledCapabilityError, match=gap):
             resolve(op, geometry)
         return
+    if dtype == "bf16":
+        ep1 = make_op((4, 0), 64, 32, mode="mega_moe", dtype=dtype, dtype_b=weight,
+                      requested_abi=MEGA_ABI, output_dtype="bf16", soc_tier="a2", ep=1)
+        with pytest.raises(UnmodeledCapabilityError, match="arch22_mega_moe_ep_world_size:1"):
+            resolve(ep1, geometry)
     resolved = resolve(op, geometry)
     plan = resolved.recipe
     stages = {stage.name: stage for stage in check_ledger(resolved, bind(op, geometry, plan.work))}
@@ -232,22 +238,28 @@ def test_mega_moe_materializes_supported_operands_before_quant(geometry, dtype, 
 
 @pytest.mark.parametrize("arch", ARCH_IDS[1:])
 @pytest.mark.parametrize("activation,weight,specialization", [
-    ("int8", "int8", "MegaMoeA8W8Wave"), ("mxfp8", "mxfp4", "MegaMoeA8W4Wave"),
+    ("fp8_e4m3", "fp8_e4m3", "MegaMoeA8W8Wave"), ("mxfp8", "mxfp4", "MegaMoeA8W4Wave"),
     ("mxfp4", "mxfp4", "MegaMoeA4W4Wave"), ("bf16", "bf16", "MegaMoeA16W16Wave"),
 ])
 @pytest.mark.parametrize("shared", [0, 32])
 def test_mega_moe_wave_partitions_and_shared_expert(geometry, activation, weight, specialization, shared):
     counts, width, k = (3, 0, 6), 64, 32
-    shared_compute, shared_weight = ("bf16", "bf16") if activation == "int8" else (activation, weight)
+    shared_compute, shared_weight = ("bf16", "bf16") if activation == "fp8_e4m3" else (activation, weight)
+    layout_b = "NZ" if (activation, weight) == ("mxfp8", "mxfp4") else "ND"
     op = make_op(counts, 2 * width, k, mode="mega_moe", requested_abi=MEGA_ABI,
-                 dtype=activation, dtype_b=weight, output_dtype="bf16",
+                 dtype=activation, dtype_b=weight, layout_b=layout_b, output_dtype="bf16",
+                 ep=2, dispatch_link_bytes=0, combine_link_bytes=0,
                  wave_rows=4, enable_fused_mc2=3 if shared else 2, shared_intermediate=shared,
                  shared_compute_dtype=shared_compute, shared_weight_dtype=shared_weight)
     resolved = resolve(op, geometry)
     plan = resolved.recipe
     stages = {stage.name: stage for stage in check_ledger(resolved, bind(op, geometry, plan.work))}
     assert plan.metadata["wave_specialization"] == specialization
-    assert plan.metadata["gm_handoff_eliminated_bytes"] == 16 * sum(counts) * width
+    if specialization == "MegaMoeA8W4Wave":
+        assert plan.metadata["gm_handoff_eliminated_bytes"] == 0
+        assert plan.metadata["gm_handoff_bytes"] == 8 * sum(counts) * width
+    else:
+        assert plan.metadata["gm_handoff_eliminated_bytes"] == 16 * sum(counts) * width
     assert "wave3_gmm1" not in stages
     for wave, rows in enumerate((4, 4, 1)):
         prefix = f"wave{wave}_"
@@ -270,7 +282,12 @@ def test_mega_moe_wave_partitions_and_shared_expert(geometry, activation, weight
 @pytest.mark.parametrize("arch", ARCH_IDS)
 def test_architecture_bounds_fused_datapath(geometry):
     op = make_op((3,), 64, 32, mode="mega_moe", requested_abi=MEGA_ABI,
-                 enable_fused_mc2=3, shared_intermediate=32)
+                 enable_fused_mc2=3, shared_intermediate=32,
+                 ep=2, dispatch_link_bytes=0, combine_link_bytes=0)
+    ep1 = make_op((3,), 64, 32, mode="mega_moe", requested_abi=MEGA_ABI,
+                  enable_fused_mc2=3, shared_intermediate=32, ep=1)
+    with pytest.raises(UnmodeledCapabilityError, match="mega_moe_ep_world_size:1"):
+        resolve(ep1, geometry)
     if not geometry.datapath.has_l0c_to_ub:
         with pytest.raises(UnmodeledCapabilityError, match="shared_mc2"):
             resolve(op, geometry)
@@ -291,6 +308,7 @@ def test_descriptor_roundtrip_and_causal_replay_match_native(geometry, shared_hb
     on_chip = geometry.datapath.has_l0c_to_ub
     dtype = "mxfp8" if on_chip else "int8"
     op = make_op((3, 0, 1), 64, 32, mode="gmm_swiglu_quant", dtype=dtype,
+                 layout_b="ND" if on_chip else "NZ",
                  absorbed_source_op_ids=("activation",), output_dtype="fp8_e4m3" if on_chip else "bf16")
     resolved = resolve(op, geometry)
     plan, descriptor = resolved.recipe, resolved.descriptor
@@ -398,7 +416,8 @@ def test_packed_int32_weights_follow_the_declared_soc_contract(hardware_sku, dec
         "transport_abi": "a2_hccl_client" if legacy else "a3_sio_hccs",
         "soc_variant": hardware_sku,
     }
-    operands = dict(mode="mega_moe", dtype="int8", output_dtype="bf16", requested_abi=MEGA_ABI)
+    operands = dict(mode="mega_moe", dtype="int8", output_dtype="bf16", requested_abi=MEGA_ABI,
+                    ep=2, dispatch_link_bytes=0, combine_link_bytes=0)
     fields = {declaration: identity[declaration]} if declaration else {}
     op = make_op((4, 0), 64, 32, dtype_b="int32", **operands, **fields)
     if legacy:
@@ -421,7 +440,12 @@ def test_mega_moe_wave_readiness_releases_each_matrix_before_the_last_dispatch(g
         row_bytes = BF16_COMBINE_ROW_BYTES if dict(metadata)["transport_direction"] == "combine" else INT8_DISPATCH_ROW_BYTES
         return (StageDemand(name, after, Work(resources={"link": row_bytes})),)
 
-    op = make_op(rows, 64, 32, mode="mega_moe", dtype="int8",
+    int8_op = make_op(rows, 64, 32, mode="mega_moe", dtype="int8",
+                      requested_abi=MEGA_ABI, output_dtype="bf16", wave_rows=1, ep=2,
+                      dispatch_link_bytes=dispatch, combine_link_bytes=combine, cohort_transport_builder=transport)
+    with pytest.raises(UnmodeledCapabilityError, match="arch35_mega_moe_operand_pair:int8:int8"):
+        resolve(int8_op, geometry)
+    op = make_op(rows, 64, 32, mode="mega_moe", dtype="fp8_e4m3",
                  requested_abi=MEGA_ABI, output_dtype="bf16", wave_rows=1, ep=2,
                  dispatch_link_bytes=dispatch, combine_link_bytes=combine, cohort_transport_builder=transport)
     resolved = resolve(op, geometry)
@@ -443,7 +467,9 @@ def test_mega_moe_wave_readiness_releases_each_matrix_before_the_last_dispatch(g
     ("bf16", "bf16"), ("fp32", "fp32"), ("fp16", "fp16"), ("fp8_e5m2", "fp4_e2m1"),
 ])
 def test_shared_expert_uses_its_own_precision_for_both_matmuls(geometry, shared_dtype, shared_weight):
-    op = make_op((8,), 128, 32, mode="mega_moe", dtype="int8", output_dtype="bf16",
+    common = dict(mode="mega_moe", dtype="fp8_e4m3", output_dtype="bf16",
+                  ep=2, dispatch_link_bytes=0, combine_link_bytes=0)
+    op = make_op((8,), 128, 32, **common,
                  enable_fused_mc2=3, shared_intermediate=32,
                  shared_compute_dtype=shared_dtype, shared_weight_dtype=shared_weight)
     if shared_dtype != "bf16":
@@ -451,13 +477,13 @@ def test_shared_expert_uses_its_own_precision_for_both_matmuls(geometry, shared_
             resolve(op, geometry)
         return
     resolved = resolve(op, geometry)
-    routed = resolve(make_op((8,), 128, 32, mode="mega_moe", dtype="int8", output_dtype="bf16"), geometry)
+    routed = resolve(make_op((8,), 128, 32, **common), geometry)
     phases = resolved.descriptor.phases
     shared_mmad = [item for phase in phases if phase.phase_id.startswith("shared_")
                    for item in phase.work if item.resource == "cube"]
     assert len(shared_mmad) == 2 and all(item.dtype == shared_dtype for item in shared_mmad)
     assert resolved.recipe.work.matrix == {
-        "int8": routed.recipe.work.matrix["int8"], shared_dtype: 2 * 16 * 32 * (64 + 32),
+        "fp8_e4m3": routed.recipe.work.matrix["fp8_e4m3"], shared_dtype: 2 * 16 * 32 * (64 + 32),
     }
     down_reads = [item.amount for phase in phases if phase.phase_id.startswith("shared_gmm2:")
                   for item in phase.work if item.resource == "mte2_aic"]
@@ -515,14 +541,23 @@ def test_grouped_mla_projection_override_stays_local(phase):
         assert changed[role].hbm_bytes == baseline[role].hbm_bytes
 
 
-@pytest.mark.parametrize("m,n,k", [(1, 16, 8), (528, 288, 4096), (240, 384, 7168)])
-def test_router_split_k_preserves_matrix_and_workspace_service(m, n, k):
+@pytest.mark.parametrize("m,n,k,admitted", [
+    (1, 16, 8, False), (1, 16, 4096, True), (528, 288, 4096, True), (240, 384, 7168, True),
+])
+def test_router_split_k_preserves_matrix_and_workspace_service(m, n, k, admitted):
+    from mindie_sim.prediction.operators.matrix.matrix_steady import SteadyMatmul
+
     layer = SimpleNamespace(router_dtype="", router_output_dtype="fp32",
                             num_experts=n, router_input_size=k, index=0)
     model = SimpleNamespace(quant=QuantSpec("mx", weight_format="mxfp8"), activation_dtype="bf16")
     _, op, _, _ = router_gemm(prefix="route", plan=layer, deps=(), stage=0, requests=(),
                               tokens=m, model=model, hidden=k, mode="decode")
-    _, plan = RecipeBook().prepare(op, hardware(REPRESENTATIVE_SKUS["a5"]))
+    prepared_op, plan = RecipeBook().prepare(op, hardware(REPRESENTATIVE_SKUS["a5"]))
+    if not admitted:
+        # Below DAV_3510 Stream-K K-axis threshold, router stays on SteadyMatmul with no workspace.
+        assert isinstance(plan, SteadyMatmul)
+        assert prepared_op.flops == 2 * m * n * k
+        return
     tiles = ceil(m / ROUTER_TILE_M) * ceil(n / ROUTER_TILE_N)
     partial = m * n * 4 * plan.metadata["split_k"]
     assert plan.metadata["output_tiles"] == tiles
@@ -733,5 +768,5 @@ def test_splitk_workspace_charges_fixpipe_and_routes_warm_vs_spill_reads():
     )
     ctx_l2 = replace(ctx_l2, work=ctx_l2.bind(plan_l2.work))
     prog_l2 = plan_l2.program(ctx_l2)
-    assert [s.name for s in prog_l2.stages] == ["setup", "splits", "merge"]
+    assert [s.name for s in prog_l2.stages] == ["setup", "splits", "split_sync", "merge"]
     assert eng_l2.serviced["cube"] == pytest.approx(ctx_l2.bind(plan_l2.work)["cube"])
