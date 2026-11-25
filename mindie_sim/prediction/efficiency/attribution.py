@@ -21,11 +21,13 @@ from mindie_sim.schema.model import RequestSpec
 
 from ..body_defaults import TargetGraphSet, consume_target_declaration
 from ..graph_analysis import graph_costs
-from ..operator_analysis import operator_costs, target_graphs
+from ..operator_analysis import operator_costs, physical_id, target_graphs
 from ..efficiency.resource_attribution import attribute_stage_dag
 from ..scheduler import DraftPolicy
 from ..structure import parse_case
 from .analysis import (
+    _build_occurrence_index,
+    _match_timeline_item,
     analyze_network_efficiency,
     executed_occurrence_work_graph,
     occurrence_work_graph,
@@ -58,20 +60,74 @@ def _pkg_attr(name: str, default: Any) -> Any:
     return getattr(pkg, name, default) if pkg is not None else default
 
 
+def _replica_link_signature(case: CaseSpec, replica: int) -> tuple[Any, ...]:
+    from ..collectives.topology import Topology
+
+    topology = Topology(case.machine, case.runtime.parallel)
+    ranks = [
+        int(rank)
+        for st in range(case.runtime.parallel.pp)
+        for rank in topology.ranks(replica, st)
+    ]
+    local_idx = {rank: idx for idx, rank in enumerate(ranks)}
+    rank_set = set(ranks)
+    sig: list[tuple[Any, ...]] = []
+    for lnk in case.machine.links:
+        if not (rank_set & set(lnk.members)):
+            continue
+        ep_sig = tuple(sorted(
+            (local_idx[int(r)], float(rate))
+            for r, rate in lnk.endpoint_rates
+            if int(r) in local_idx
+        ))
+        sig.append((
+            lnk.channel, lnk.semantics, float(lnk.capacity_bytes_per_ms),
+            lnk.switch_capacity_bytes_per_ms, len(lnk.members), ep_sig,
+        ))
+    sig.sort()
+    return tuple(sig)
+
+
+def _can_reuse_lead_replica(
+    eff_case: CaseSpec,
+    graphs: Any,
+    lead: int,
+    has_kg: bool,
+) -> bool:
+    from ..sharding.local_tp import rank_zero_graph_reuse
+
+    if not eff_case.machine.homogeneous:
+        return False
+    if not rank_zero_graph_reuse(eff_case.runtime.parallel, len(graphs), has_kg):
+        return False
+    if not isinstance(graphs, Mapping) or len(graphs) <= 1:
+        return True
+    lead_work = tuple(physical_id(op) for op in graphs[lead])
+    lead_links = _replica_link_signature(eff_case, lead)
+    for rep, rep_ops in graphs.items():
+        if rep == lead:
+            continue
+        if tuple(physical_id(op) for op in rep_ops) != lead_work:
+            return False
+        if _replica_link_signature(eff_case, int(rep)) != lead_links:
+            return False
+    return True
+
+
 def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, lowered_graphs: Any | None = None, include_submission: bool = False, overlap_async_scheduler: bool = False, evaluation_context: Any | None = None, fast_span_only: bool = False, timeline_replicas: Any = None) -> tuple[Any, CaseSpec, dict[str, Any] | None]:
     graphs = lowered_graphs if lowered_graphs is not None else _pkg_attr("target_graphs", target_graphs)(case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope)
-    eff_case, has_kg = consume_target_declaration(case, graphs), any("device_kernel_group" in dict(op.metadata) for op in graphs[0])
+    lead = min(graphs)
+    eff_case, has_kg = consume_target_declaration(case, graphs), any("device_kernel_group" in dict(op.metadata) for op in graphs[lead])
     if not run_graph:
         # An explicit run_graph=False is a caller control: a selected MC2 or
         # Local-TP kernel group must not turn it into a full cohort DES run.
         return graphs, eff_case, None
     ext_in = {"analysis_input": 0} if scope == "body" else None
-    from ..sharding.local_tp import rank_zero_graph_reuse
-    sg = (TargetGraphSet({0: graphs[0]}, kernels=graphs.effective_kernels,
+    reuse_lead = _can_reuse_lead_replica(eff_case, graphs, lead, has_kg)
+    sg = (TargetGraphSet({lead: graphs[lead]}, kernels=graphs.effective_kernels,
                          selection=graphs.default_selection)
-          if isinstance(graphs, TargetGraphSet) else {0: graphs[0]}) \
-        if rank_zero_graph_reuse(eff_case.runtime.parallel, len(graphs), has_kg) \
-        else graphs
+          if isinstance(graphs, TargetGraphSet) else {lead: graphs[lead]}) \
+        if reuse_lead else graphs
     # Submission work is represented by the declared scheduler resource on the
     # ordinary submission path; no duration max() is synthesized here.
     if not include_submission:
@@ -100,7 +156,7 @@ def _fast_operator_and_graph_reports(case: CaseSpec, *, phase: str, tokens: int,
     ``isolated_results`` are reused; no execution result crosses a call.
     """
     from ..evaluation import EvaluationContext
-    from ..sharding.local_tp import local_tp_spans_dp, rank_zero_graph_reuse
+    from ..sharding.local_tp import local_tp_spans_dp
     if precomputed_graph is None:
         ctx = evaluation_context or EvaluationContext.create(case)
         graphs, eff_case, graph_rep = _pkg_attr("_lower_and_run_graph", _lower_and_run_graph)(
@@ -110,25 +166,40 @@ def _fast_operator_and_graph_reports(case: CaseSpec, *, phase: str, tokens: int,
     else:
         graphs, eff_case, graph_rep = precomputed_graph
         ctx = evaluation_context or EvaluationContext.create(eff_case)
-    r0_ops = graphs[0]
+    lead = min(graphs)
+    lead_ops = graphs[lead]
     parallel = eff_case.runtime.parallel
     needs_cohort = bool(
         parallel.ep_spans_dp or local_tp_spans_dp(parallel) or parallel.cp_spans_dp
     )
-    has_kg = any("device_kernel_group" in dict(op.metadata) for op in r0_ops)
-    if needs_cohort and not rank_zero_graph_reuse(parallel, len(graphs), has_kg):
-        selection = graphs if isinstance(graphs, Mapping) else {0: graphs}
+    has_kg = any("device_kernel_group" in dict(op.metadata) for op in lead_ops)
+    reuse_lead = _can_reuse_lead_replica(eff_case, graphs, lead, has_kg)
+    if (needs_cohort or len(graphs) > 1) and not reuse_lead:
+        selection = graphs if isinstance(graphs, Mapping) else {lead: graphs}
         if isinstance(graphs, TargetGraphSet):
             selection = TargetGraphSet(selection, kernels=graphs.effective_kernels,
                                        selection=graphs.default_selection)
         cohort_rep = operator_costs(eff_case, selection, evaluation=ctx)
-        r0_rows = [row for row in cohort_rep["operators"] if row.get("replica", 0) == 0]
+        lead_rows = [row for row in cohort_rep["operators"] if row.get("replica", lead) == lead]
         op_rep = {**cohort_rep,
-                  "operator_occurrences": sum(r["occurrences"] for r in r0_rows),
-                  "operator_sum_ms": sum(r["total_ms"] for r in r0_rows),
-                  "operators": r0_rows}
+                  "operator_occurrences": sum(r["occurrences"] for r in lead_rows),
+                  "operator_sum_ms": sum(r["total_ms"] for r in lead_rows),
+                  "operators": lead_rows,
+                  "_all_replica_operators": cohort_rep["operators"]}
     else:
-        op_rep = operator_costs(eff_case, r0_ops, replica=0, evaluation=ctx)
+        op_rep = operator_costs(eff_case, lead_ops, replica=lead, evaluation=ctx)
+        if lead != 0:
+            op_rep = {
+                **op_rep,
+                "operators": [{"replica": lead, **row} for row in op_rep["operators"]],
+            }
+    if isinstance(graphs, Mapping):
+        op_physical_ids = {
+            (int(rep), op.op_id): physical_id(op)
+            for rep, rep_ops in graphs.items()
+            for op in rep_ops
+        }
+        op_rep = {**op_rep, "_op_physical_ids": op_physical_ids}
     return op_rep, graph_rep
 
 
@@ -161,20 +232,17 @@ def _interval_union_ms(intervals: Sequence[tuple[float, float]]) -> tuple[float,
     return sum(end - start for start, end in merged), merged
 
 
-def _critical_path_work(graph_report: Mapping[str, Any], operator_rows: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any] | None:
+def _critical_path_work(
+    graph_report: Mapping[str, Any],
+    operator_rows: Sequence[Mapping[str, Any]] | None = None,
+    *,
+    op_physical_ids: Mapping[tuple[int, str], str] | None = None,
+) -> dict[str, Any] | None:
     """Longest dependency path over per-operator service work, never over total duration shares."""
     timeline = graph_report.get("timeline", ()) or ()
     if not timeline:
         return None
-    service = {}
-    for row in operator_rows or ():
-        op = row.get("operator") if isinstance(row.get("operator"), Mapping) else row
-        op_id = str(op.get("op_id") or row.get("op_id") or "")
-        count = max(1, int(row.get("occurrences", 1) or 1))
-        raw_total = float(row.get("total_ms", 0.0) or 0.0)
-        duration = float(row.get("duration_ms", raw_total / count if raw_total else 0.0) or 0.0)
-        if op_id:
-            service[op_id] = duration
+    index = _build_occurrence_index(operator_rows, graph_report, prefer_executed=False)
     nodes = {str(row["id"]): row for row in timeline}
     # Resolve the declared dependency edges once: every later stage consumes the
     # same reduced predecessor tuple instead of re-deriving it per node.
@@ -198,12 +266,15 @@ def _critical_path_work(graph_report: Mapping[str, Any], operator_rows: Sequence
         best = (max(preds, key=ends.__getitem__) if preds else None)
         parent[key] = best
         raw_isolated = row.get("isolated_ms")
-        op_id = str(row.get("op_id", ""))
+        matched = (
+            _match_timeline_item(row, index, op_physical_ids=op_physical_ids)
+            if raw_isolated is None else None
+        )
         if raw_isolated is not None:
             cost, isolated_basis = max(0.0, float(raw_isolated)), True
             service_matches += 1
-        elif op_id in service:
-            cost, service_matches = max(0.0, service[op_id]), service_matches + 1
+        elif matched is not None:
+            cost, service_matches = max(0.0, float(matched["duration_ms"])), service_matches + 1
         else:
             cost, elapsed_fallback = max(0.0, float(row.get("elapsed_ms", 0.0) or 0.0)), elapsed_fallback + 1
         ends[key] = (ends[best] if best is not None else 0.0) + cost
@@ -233,7 +304,14 @@ def _critical_path_work(graph_report: Mapping[str, Any], operator_rows: Sequence
             "interpretation": "dependency_path_over_work_not_a_wall_clock_saving"}
 
 
-def attribute_program(graph_report: Mapping[str, Any] | None, operator_rows: Sequence[Mapping[str, Any]] | None = None, *, occurrence_graph: Any | None = None) -> dict[str, Any]:
+def attribute_program(
+    graph_report: Mapping[str, Any] | None,
+    operator_rows: Sequence[Mapping[str, Any]] | None = None,
+    *,
+    occurrence_graph: Any | None = None,
+    graph_operator_rows: Sequence[Mapping[str, Any]] | None = None,
+    op_physical_ids: Mapping[tuple[int, str], str] | None = None,
+) -> dict[str, Any]:
     """Separate isolated work, active presence, per-resource busy, span and work path.
 
     Ready-to-complete intervals prove an operator is in flight; they do not prove
@@ -294,10 +372,16 @@ def attribute_program(graph_report: Mapping[str, Any] | None, operator_rows: Seq
             group["max_busy_share_of_span"] = max(group["max_busy_share_of_span"], busy / span)
     resources.sort(key=lambda row: row["capacity_bound_ms"], reverse=True)
     utilization = {role: row["max_busy_share_of_span"] for role, row in sorted(by_role.items())}
+    dag_rows = graph_operator_rows if graph_operator_rows is not None else source_rows
     if occurrence_graph is None:
-        occurrence_graph = occurrence_work_graph(graph_report, operator_rows)
+        occurrence_graph = occurrence_work_graph(
+            graph_report, dag_rows, op_physical_ids=op_physical_ids)
     stage_clock = None
-    stage_dag_graph = executed_occurrence_work_graph(graph_report, operator_rows or ()) or occurrence_graph
+    stage_dag_graph = (
+        executed_occurrence_work_graph(
+            graph_report, dag_rows, op_physical_ids=op_physical_ids)
+        or occurrence_graph
+    )
     if stage_dag_graph is not None:
         stage_clock = dict(attribute_stage_dag(
             stage_dag_graph,
@@ -342,7 +426,8 @@ def attribute_program(graph_report: Mapping[str, Any] | None, operator_rows: Seq
         "resource_service": resources,
         "service_utilization_by_role": utilization,
         "by_role": by_role,
-        "critical_path": _critical_path_work(graph_report, operator_rows),
+        "critical_path": _critical_path_work(
+            graph_report, dag_rows, op_physical_ids=op_physical_ids),
         "stage_clock_attribution": stage_clock,
         "exposed_hbm_fixed_plan_ms": (
             stage_clock.get("exposed_hbm_estimate_ms")

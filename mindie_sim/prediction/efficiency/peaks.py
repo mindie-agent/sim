@@ -12,11 +12,15 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
+from types import SimpleNamespace
 from typing import Any
 
 from mindie_sim.schema.case import Case as CaseSpec
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Device
 
+from ..collectives.topology import Topology
+from ..native_binding import bind_native_call
 from ..structure import parse_case
 
 
@@ -27,6 +31,9 @@ DEFAULT_OUTPUT_BUDGET = 1024
 DEFAULT_STAGE = 0
 DEFAULT_REPLICA = 0
 
+_MS_PER_S = 1000.0
+_GBPS_TO_BYTES_PER_MS = 1_000_000.0
+_CACHELINE_128B_BYTES = 128.0
 _VECTOR_FP16_FMA_FLOPS_PER_ISSUE = 4.0
 _LAUNCH_DIAGNOSTIC_MIN_THRESHOLD_MS = 0.002
 _LAUNCH_DIAGNOSTIC_SHORT_DURATION_MS = 0.006
@@ -36,7 +43,20 @@ _LAUNCH_DIAGNOSTIC_MAX_WORK_SHARE = 0.25
 _HBM_ROLES = frozenset({"hbm", "memory", "gm_hbm_cacheline_128b"})
 _CUBE_ROLES = frozenset({"cube", "aic"})
 _VEC_ROLES = frozenset({"vector", "vbitsort32", "scalar_store_issue", "ub_copy", "aiv", "reg_issue_slots", "reg_alu_lanes", "reg_special_lanes", "reg_reduce_lanes", "reg_shuffle_lanes", "reg_data_writes", "reg_ub_accesses", "reg_ub_stores"})
-_DTYPE_ALIASES = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32", "fp8_e4m3": "fp8", "fp8_e5m2": "fp8"}
+_DTYPE_ALIASES = {
+    "bfloat16": "bf16",
+    "float16": "fp16",
+    "float32": "fp32",
+    "float8_e4m3": "fp8_e4m3",
+    "float8_e5m2": "fp8_e5m2",
+    "hif8": "hifloat8",
+}
+_FP8_VARIANTS = frozenset({"fp8_e4m3", "fp8_e5m2"})
+_LINK_RESOURCE_PREFIXES = ("link:", "port:", "switch:", "sdma_flow:")
+_NON_OTHER_SERVICED_PREFIXES = (
+    "memory@", "gm_hbm", "matrix@", "vector@", "scheduler@",
+    "native_call_service", "ub_inj:",
+)
 _BOUNDS = ("memory_bound", "cube_bound", "vector_bound", "link_bound", "launch_bound")
 _KINDS = ("cube", "vector", "cv_fused", "communication", "memory_only")
 _SCALE_KEYS = ("hbm_bw_scale", "cube_flops_scale", "vector_ops_scale", "link_bw_scale", "hbm_capacity_scale")
@@ -109,16 +129,36 @@ def _role_scale_factor(role: str, *, hbm_bw_scale: float, cube_flops_scale: floa
     return link_bw_scale if (r == "link" or r.startswith("link")) else 1.0
 
 
-def _resolve_cube_peak(hw: Mapping[str, Any], dtype: str, default_dtype: str = "bf16") -> float:
-    target = str(dtype or default_dtype or hw.get("default_dtype") or "bf16").strip().lower()
-    canonical, peaks = _DTYPE_ALIASES.get(target, target), hw.get("compute_peaks", {})
-    try:
-        return float(peaks[canonical])
-    except KeyError:
+def _die_cube_peak(die: Device, dtype: str, default_dtype: str = "bf16") -> float:
+    raw = str(dtype or default_dtype or "bf16").strip()
+    lower = raw.lower()
+    canonical = _DTYPE_ALIASES.get(lower, lower)
+    if raw and raw != canonical:
         try:
-            return float(peaks[target])
+            return float(die.peak(raw))
+        except ModelingError:
+            pass
+    return float(die.peak(canonical))
+
+
+def _resolve_cube_peak(hw: Mapping[str, Any], dtype: str, default_dtype: str = "bf16") -> float:
+    raw = str(dtype or default_dtype or hw.get("default_dtype") or "bf16").strip()
+    lower = raw.lower()
+    canonical = _DTYPE_ALIASES.get(lower, lower)
+    dies = hw.get("dies") or ((hw["die"],) if hw.get("die") is not None else ())
+    if dies:
+        return min(_die_cube_peak(d, raw, default_dtype) for d in dies)
+    peaks = hw.get("compute_peaks", {})
+    for key in (raw, canonical, lower):
+        if not key:
+            continue
+        try:
+            return float(peaks[key])
         except KeyError:
-            return min(float(d.peak(target)) for d in (hw.get("dies") or (hw["die"],)))
+            continue
+    if canonical in _FP8_VARIANTS:
+        return float(peaks["fp8"])
+    raise KeyError(raw)
 
 
 def _link_effective_bps(lnk: Any, active_width: int) -> float:
@@ -163,7 +203,7 @@ def extract_hardware_peaks(case: CaseSpec | Mapping[str, Any], *, stage: int = D
     mte1_peak, fixpipe_peak = min(float(r.get("mte1", 0.0)) for r in rates_list), min(float(r.get("fixpipe", 0.0)) for r in rates_list)
     mte2_peak, mte3_peak = min(float(r.get("mte2_aic", r.get("mte2", r["hbm"]))) for r in rates_list), min(float(r.get("mte3", r["hbm"])) for r in rates_list)
     links = parsed.machine.links
-    active_width = max(p.tp, p.ep if p.ep > 1 else 1)
+    active_width = max(p.tp, p.ep, p.pcp, p.cp, p.dcp, p.etp, *p.local_tp_widths, 1)
     intra_links = [lnk for lnk in links
                    if "intra_package" in lnk.channel
                    or "intra_node" in lnk.channel
@@ -251,50 +291,170 @@ def legacy_service_regime_diagnostics(case: CaseSpec | Mapping[str, Any]) -> dic
             "rules": deepcopy(rules)}
 
 
-def _resolve_operator_link_peak(parsed, op, hw) -> float:
-    """Physical per-rank link peak for this operator's declared group axis."""
-    metadata = dict(op.get("metadata") or ())
+def _operator_comm_groups(
+    topology: Topology,
+    op: Mapping[str, Any],
+    replica: int,
+) -> tuple[tuple[int, ...], ...]:
+    raw_meta = op.get("metadata") or ()
+    metadata = dict(raw_meta) if isinstance(raw_meta, Mapping) else {k: v for k, v in raw_meta}
     axis = str(metadata.get("group_axis") or "tp")
-    parallel = parsed.runtime.parallel
-    width = max(1, int(getattr(parallel, axis, 1) or 1))
-    links = parsed.machine.links
-    candidates = [lnk for lnk in links
-                  if lnk.members and min(len(lnk.members), width) >= width]
-    if not candidates:
-        candidates = list(links)
-    if not candidates:
-        return float(hw.get("link_peak_bytes_per_s", 0.0) or 0.0)
-    within_node = width <= max(1, parsed.machine.ranks_per_node)
-    selected = [lnk for lnk in candidates
-                if ("intra_node" in lnk.channel or "intra_package" in lnk.channel)
-                == within_node] or candidates
-    link = min(selected, key=lambda item: item.capacity_bytes_per_ms)
-    # A link that explicitly declares a usable fraction is bounded by that
-    # configured capacity; a profile that only publishes a nameplate peak keeps
-    # the peak service boundary used by its silicon anchors.
+    family = str(metadata.get("collective") or op.get("family") or "").strip().lower()
+    stage = int(metadata.get("source_stage", op.get("stage", 0)) or 0)
+    if family == "pp_p2p" or axis == "pp":
+        dest = int(metadata.get("destination_stage", stage + 1))
+        if 0 <= stage < topology.parallel.pp and 0 <= dest < topology.parallel.pp and dest != stage:
+            return tuple(
+                (src, dst)
+                for src, dst in zip(topology.ranks(replica, stage), topology.ranks(replica, dest))
+                if src != dst
+            )
+        return ()
+    try:
+        groups = tuple(topology.groups(axis, replica, stage, metadata=metadata))
+    except ModelingError:
+        return ()
+    return tuple(group for group in groups if len(group) > 1)
+
+
+def _link_peak_for_group(
+    link: Any,
+    group: tuple[int, ...],
+    width: int,
+    *,
+    active_senders: int | None = None,
+) -> float:
     if getattr(link, "bw_utilization", None) is not None:
-        peak = float(link.capacity_bytes_per_ms
-                     or link.peak_capacity_bytes_per_ms) * 1000.0
+        raw_bps = float(link.capacity_bytes_per_ms or link.peak_capacity_bytes_per_ms) * _MS_PER_S
     else:
-        peak = float(link.peak_capacity_bytes_per_ms
-                     or link.capacity_bytes_per_ms) * 1000.0
+        raw_bps = float(link.peak_capacity_bytes_per_ms or link.capacity_bytes_per_ms) * _MS_PER_S
+    group_set = set(group)
+    ep_rates = [
+        float(rate) * _MS_PER_S
+        for rank, rate in (getattr(link, "endpoint_rates", ()) or ())
+        if float(rate) > 0.0 and (not group_set or int(rank) in group_set)
+    ]
     if link.semantics == "per_pair":
-        peak *= max(1, width - 1)
+        peak = raw_bps * max(1, width - 1)
+        if ep_rates:
+            peak = min(peak, min(ep_rates))
     elif link.semantics == "shared":
-        peak /= max(1, width)
+        senders = max(1, width if active_senders is None else int(active_senders))
+        peak = raw_bps / senders
+    else:
+        peak = min(ep_rates) if ep_rates else raw_bps
+    sw_cap = getattr(link, "switch_capacity_bytes_per_ms", None)
+    if sw_cap is not None and float(sw_cap) > 0.0:
+        peak = min(peak, float(sw_cap) * _MS_PER_S)
     return peak
 
 
-def physical_link_service(comm_info: Mapping[str, Any]) -> tuple[float, float] | None:
-    """Exact per-physical-link byte service from the communication ledger.
+def _routed_group_links(
+    topology: Topology,
+    group: tuple[int, ...],
+    group_scope: str,
+    *,
+    is_pp: bool,
+) -> list[Any]:
+    pairs = ((group[0], group[1]),) if is_pp else tuple(
+        (src, dst) for idx, src in enumerate(group) for dst in group[idx + 1:]
+    )
+    scoped_routed: list[Any] = []
+    all_routed: list[Any] = []
+    seen_scoped: set[str] = set()
+    seen_all: set[str] = set()
+    for src, dst in pairs:
+        try:
+            hops = topology.route(src, dst)
+        except ValueError:
+            continue
+        pair_scope = topology.scope_for_group((src, dst))
+        for link_name, _, _ in hops:
+            lnk = topology.links.get(link_name)
+            if lnk is None:
+                continue
+            if link_name not in seen_all:
+                seen_all.add(link_name)
+                all_routed.append(lnk)
+            if (pair_scope == group_scope and topology.link_scope(link_name) == group_scope
+                    and link_name not in seen_scoped):
+                seen_scoped.add(link_name)
+                scoped_routed.append(lnk)
+    return scoped_routed or all_routed
 
-    Returns ``(max(wire_bytes / peak_bytes_per_ms), sum(wire_bytes))`` only
-    when every published resource carries its own matching capacity.  The
-    numerator and denominator then cover the same rank boundary, so utilization
-    is never repaired by clipping or by averaging uneven traffic away.
-    """
+
+def _resolve_operator_link_peak(
+    parsed,
+    op,
+    hw,
+    *,
+    replica: int = DEFAULT_REPLICA,
+) -> float:
+    """Physical per-rank link peak for this operator's declared group axis."""
+    links = parsed.machine.links
+    if not links:
+        return float(hw.get("link_peak_bytes_per_s", 0.0) or 0.0)
+    raw_meta = op.get("metadata") or ()
+    metadata = dict(raw_meta) if isinstance(raw_meta, Mapping) else {k: v for k, v in raw_meta}
+    axis = str(metadata.get("group_axis") or "tp")
+    family = str(metadata.get("collective") or op.get("family") or "").strip().lower()
+    is_pp = family == "pp_p2p" or axis == "pp"
+    topology = Topology(parsed.machine, parsed.runtime.parallel)
+    groups = _operator_comm_groups(topology, op, replica)
+    if groups:
+        group_peaks: list[float] = []
+        for group in groups:
+            width = len(group)
+            group_scope = topology.scope_for_group(group)
+            selected = _routed_group_links(topology, group, group_scope, is_pp=is_pp)
+            if not selected:
+                group_set = set(group)
+                selected = [
+                    lnk for lnk in links
+                    if group_set <= set(lnk.members) and topology.link_scope(lnk.name) == group_scope
+                ] or list(links)
+            if is_pp:
+                peaks_for_group = [
+                    _link_peak_for_group(
+                        lnk, group, width,
+                        active_senders=max(1, len({src for src, _ in groups if src in lnk.members})),
+                    )
+                    for lnk in selected
+                ]
+            else:
+                peaks_for_group = [_link_peak_for_group(lnk, group, width) for lnk in selected]
+            group_peaks.append(min(peaks_for_group))
+        return min(group_peaks)
+    width = max(1, int(getattr(parsed.runtime.parallel, axis, 1) or 1))
+    candidates = [lnk for lnk in links if lnk.members and len(lnk.members) >= width] or list(links)
+    within_node = width <= max(1, parsed.machine.ranks_per_node)
+    selected = [
+        lnk for lnk in candidates
+        if (topology.link_scope(lnk.name) in {"package", "node"}) == within_node
+    ] or candidates
+    return max(_link_peak_for_group(lnk, (), width) for lnk in selected)
+
+
+def _split_link_namespace(name: str) -> tuple[str, str] | None:
+    text = str(name or "")
+    for prefix in _LINK_RESOURCE_PREFIXES:
+        if text.startswith(prefix):
+            return "", text
+        marker = f":{prefix}"
+        pos = text.find(marker)
+        if pos > 0:
+            return text[:pos + 1], text[pos + 1:]
+    if text.endswith(":switch_plane"):
+        return "", text
+    return None
+
+
+def _physical_link_service_with_owner(
+    comm_info: Mapping[str, Any],
+) -> tuple[float, float, str, dict[str, float]] | None:
     resources = dict(comm_info.get("resources") or {})
-    wire, capacity = {}, {}
+    wire: dict[str, float] = {}
+    capacity: dict[str, float] = {}
     for name, item in resources.items():
         if not isinstance(item, Mapping):
             continue
@@ -306,11 +466,229 @@ def physical_link_service(comm_info: Mapping[str, Any]) -> tuple[float, float] |
             capacity[str(name)] = peak
     if not wire or not set(wire) <= set(capacity):
         return None
-    return (max(wire[name] / capacity[name] for name in wire),
-            math.fsum(wire.values()))
+    best_name = ""
+    best_ms = -1.0
+    service_by_res: dict[str, float] = {}
+    for name in sorted(wire):
+        service_ms = wire[name] / capacity[name]
+        service_by_res[name] = service_ms
+        if service_ms > best_ms:
+            best_ms = service_ms
+            best_name = name
+    return best_ms, math.fsum(wire.values()), best_name, service_by_res
 
 
-def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, Any], *, peaks: Mapping[str, Any] | None = None, observed_duration_ms: float | None = None, pmu: Mapping[str, float] | None = None) -> dict[str, Any]:
+def physical_link_service(comm_info: Mapping[str, Any]) -> tuple[float, float] | None:
+    """Exact per-physical-link byte service from the communication ledger.
+
+    Returns ``(max(wire_bytes / peak_bytes_per_ms), sum(wire_bytes))`` only
+    when every published resource carries its own matching capacity.  The
+    numerator and denominator then cover the same rank boundary, so utilization
+    is never repaired by clipping or by averaging uneven traffic away.
+    """
+    resolved = _physical_link_service_with_owner(comm_info)
+    return None if resolved is None else (resolved[0], resolved[1])
+
+
+def _serviced_link_service(
+    serviced: Mapping[str, Any],
+    comm_info: Mapping[str, Any],
+    parsed: CaseSpec,
+    *,
+    resource_rates: Mapping[str, float] | None = None,
+) -> tuple[float, float, str, dict[str, float]] | None:
+    """Exact physical link service from executed Engine ``serviced`` entries."""
+    entries: list[tuple[str, float, str, str, bool]] = []
+    for raw_name, raw_val in serviced.items():
+        amount = float(raw_val or 0.0)
+        if amount <= 0.0:
+            continue
+        name = str(raw_name)
+        split = _split_link_namespace(name)
+        if split is not None:
+            entries.append((name, amount, split[0], split[1], False))
+        elif name.startswith("ub_inj:") or ":ub_inj:" in name:
+            entries.append((name, amount, "", name, True))
+    if not entries:
+        return None
+    comm_res = dict(comm_info.get("resources") or {})
+    pair_rates: dict[str, float] = {}
+    for res_name, item in comm_res.items():
+        if not isinstance(item, Mapping):
+            continue
+        peak = float(item.get("peak_bytes_per_ms", 0.0) or 0.0)
+        if peak > 0.0 and ":pair" in str(res_name):
+            pair_rates.setdefault(str(res_name).split(":pair", 1)[0], peak)
+    topo_rates_by_ns: dict[str, dict[str, float]] = {}
+    best_ms, best_name, wire_total = -1.0, "", 0.0
+    service_by_res: dict[str, float] = {}
+    for name, amount, ns, bare, is_ub_inj in sorted(entries, key=lambda item: item[0]):
+        if bare.startswith("sdma_flow:"):
+            service_ms = amount
+        else:
+            cap = float((resource_rates or {}).get(name, 0.0) or 0.0)
+            if cap <= 0.0:
+                item = comm_res.get(name)
+                cap = float(item.get("peak_bytes_per_ms", 0.0) or 0.0) if isinstance(item, Mapping) else 0.0
+            if cap <= 0.0 and not is_ub_inj and ":pair" in name:
+                cap = pair_rates.get(name.split(":pair", 1)[0], 0.0)
+            if cap <= 0.0 and not is_ub_inj:
+                rates = topo_rates_by_ns.get(ns)
+                if rates is None:
+                    topo = Topology(parsed.machine, parsed.runtime.parallel, namespace=ns)
+                    rates = {res.name: float(res.rate) for res in topo.resources()}
+                    topo_rates_by_ns[ns] = rates
+                cap = rates.get(name, 0.0)
+            if cap <= 0.0:
+                if is_ub_inj:
+                    continue
+                return None
+            service_ms = amount / cap
+            if not is_ub_inj:
+                wire_total += amount
+        service_by_res[name] = service_ms
+        if service_ms > best_ms:
+            best_ms = service_ms
+            best_name = name
+    if not service_by_res:
+        return None
+    return best_ms, wire_total, best_name, service_by_res
+
+
+def _serviced_other_non_hbm_ms(
+    serviced: Mapping[str, Any],
+    dies: Sequence[Device],
+    parsed: CaseSpec,
+    *,
+    resource_rates: Mapping[str, float] | None = None,
+) -> float:
+    """Max executed service (ms) over non-HBM, non-cube, non-vector, non-link device resources."""
+    rates_list = [dict(d.rates) for d in dies]
+    best = 0.0
+    for raw_name, raw_val in serviced.items():
+        amount = float(raw_val or 0.0)
+        if amount <= 0.0:
+            continue
+        name = str(raw_name)
+        if name.startswith(_NON_OTHER_SERVICED_PREFIXES) or _split_link_namespace(name) is not None:
+            continue
+        if name.startswith("ub_inj:") or ":ub_inj:" in name:
+            continue
+        rate_per_ms = float((resource_rates or {}).get(name, 0.0) or 0.0)
+        if rate_per_ms <= 0.0:
+            if name.startswith("host@") or ":host@" in name:
+                rate_per_ms = 1.0
+            elif name.startswith("host_solo:") and hasattr(parsed.machine, "host_solo_bw_gbps"):
+                parts = name.split(":")
+                if len(parts) >= 2:
+                    gbps = parsed.machine.host_solo_bw_gbps(parts[1])
+                    if gbps is not None and float(gbps) > 0.0:
+                        rate_per_ms = float(gbps) * _GBPS_TO_BYTES_PER_MS
+            elif name.startswith("host_rc:") and hasattr(parsed.machine, "host_root_complex_ceiling_gbps"):
+                parts = name.split(":")
+                if parts:
+                    gbps = parsed.machine.host_root_complex_ceiling_gbps(parts[-1])
+                    if gbps is not None and float(gbps) > 0.0:
+                        rate_per_ms = float(gbps) * _GBPS_TO_BYTES_PER_MS
+            elif "@" in name:
+                role = name.split("@", 1)[0]
+                matching = [float(r[role]) for r in rates_list if role in r and float(r[role]) > 0.0]
+                if matching:
+                    rate_per_ms = min(matching) / _MS_PER_S
+        if rate_per_ms > 0.0:
+            best = max(best, amount / rate_per_ms)
+    return best
+
+
+def _serviced_hbm_exec_ms(
+    serviced: Mapping[str, Any],
+    dies: Sequence[Device],
+    hbm_peak_bytes_per_s: float,
+    *,
+    resource_rates: Mapping[str, float] | None = None,
+) -> float:
+    rates_list = [dict(d.rates) for d in dies]
+    best = 0.0
+    for raw_name, raw_val in serviced.items():
+        amount = float(raw_val or 0.0)
+        if amount <= 0.0:
+            continue
+        name = str(raw_name)
+        if not name.startswith(("memory@", "gm_hbm")):
+            continue
+        rate_per_ms = float((resource_rates or {}).get(name, 0.0) or 0.0)
+        if rate_per_ms <= 0.0:
+            role = name.split("@", 1)[0] if "@" in name else name
+            if role == "gm_hbm_cacheline_128b":
+                matching = [float(r[role]) for r in rates_list if role in r and float(r[role]) > 0.0]
+                if matching:
+                    rate_per_ms = min(matching) / _MS_PER_S
+                elif hbm_peak_bytes_per_s > 0.0:
+                    rate_per_ms = (hbm_peak_bytes_per_s / _CACHELINE_128B_BYTES) / _MS_PER_S
+            elif hbm_peak_bytes_per_s > 0.0:
+                rate_per_ms = hbm_peak_bytes_per_s / _MS_PER_S
+        if rate_per_ms > 0.0:
+            best = max(best, amount / rate_per_ms)
+    return best
+
+
+def _op_native_call_id(op: Mapping[str, Any]) -> str:
+    raw_meta = op.get("metadata") or ()
+    metadata = tuple(raw_meta.items()) if isinstance(raw_meta, Mapping) else tuple(raw_meta)
+    raw_mf = op.get("matrix_flops") or ()
+    mf_items = raw_mf.items() if isinstance(raw_mf, Mapping) else raw_mf
+    matrix_flops = tuple(sorted((str(k), float(v)) for k, v in mf_items if v))
+    ns = SimpleNamespace(
+        op_id=str(op.get("op_id") or ""),
+        family=str(op.get("family") or ""),
+        recipe=str(op.get("recipe") or ""),
+        source_boundary=str(op.get("source_boundary") or ""),
+        dtype=str(op.get("dtype") or ""),
+        layout=str(op.get("layout") or "contiguous"),
+        local_shape=tuple(op.get("local_shape") or ()),
+        padded_shape=tuple(op.get("padded_shape") or ()),
+        launch_shape=tuple(op.get("launch_shape") or ()),
+        metadata=metadata,
+        matrix_flops=matrix_flops,
+    )
+    binding = bind_native_call(ns)
+    return str(binding.call_id) if binding is not None else ""
+
+
+def _is_cohort_priced_collective(
+    row: Mapping[str, Any],
+    comm_info: Mapping[str, Any],
+    parsed: CaseSpec,
+) -> bool:
+    """True when this operator row's link service already pools >= 2 replicas' traffic."""
+    p = parsed.runtime.parallel
+    if p.dp <= 1:
+        return False
+    if row.get("isolation_boundary") == "complete_collective_cohort":
+        return True
+    useful_ranks = comm_info.get("useful_bytes_by_rank") or {}
+    if not isinstance(useful_ranks, Mapping) or len(useful_ranks) <= 1:
+        return False
+    topology = Topology(parsed.machine, p)
+    rank_to_replica = {
+        int(rank): rep
+        for rep in range(p.dp)
+        for st in range(p.pp)
+        for rank in topology.ranks(rep, st)
+    }
+    reps = {rank_to_replica[int(rank)] for rank in useful_ranks if int(rank) in rank_to_replica}
+    return len(reps) > 1
+
+
+def analyze_operator_row(
+    row: Mapping[str, Any],
+    case: CaseSpec | Mapping[str, Any],
+    *,
+    peaks: Mapping[str, Any] | None = None,
+    observed_duration_ms: float | None = None,
+    pmu: Mapping[str, float] | None = None,
+    resource_rates: Mapping[str, float] | None = None,
+) -> dict[str, Any]:
     """Compute 4D efficiency (Cube_MFU, Vec_MFU, MBU, Link_Util) & CV-overlap for one operator."""
     parsed, op, count = parse_case(case), row["operator"], int(row.get("occurrences", 1))
     if isinstance(row.get("occurrences", 1), bool) or count < 1:
@@ -330,7 +708,7 @@ def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, A
     comm_info = dict(row.get("communication") or {})
     comm_wire = comm_info.get("wire_by_resource") or {}
     comm_res = dict(comm_info.get("resources") or {})
-    _non_lnk = ("memory@", "vector@", "matrix@", "mte", "fixpipe@", "l2@", "ub", "reg_", "sreg_", "vreg_", "scalar_", "vbitsort", "host", "scheduler@", "native_call_service")
+    _non_lnk = ("memory@", "vector@", "matrix@", "mte", "fixpipe@", "l2@", "ub", "reg_", "sreg_", "vreg_", "scalar_", "vbitsort", "host", "scheduler@", "native_call_service", "sdma_flow:")
     if has_jn:
         serv_link = 0.0
     elif comm_wire:
@@ -344,33 +722,62 @@ def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, A
         rank_div = (max(1, len(comm_info.get("useful_bytes_by_rank") or ()) or len(dies)) if is_per_port else 1)
         serv_link = float(comm_info["wire_bytes"]) / rank_div
     else:
-        lnk_items = {k: float(v) for k, v in serviced.items() if not any(k.startswith(p) for p in _non_lnk) and not k.endswith(":switch_plane")}
+        lnk_items = {
+            k: float(v) for k, v in serviced.items()
+            if not any(k.startswith(p) for p in _non_lnk)
+            and not k.endswith(":switch_plane")
+            and ":sdma_flow:" not in k
+        }
         tx_items = [v for k, v in lnk_items.items() if ":tx:port" in k]
         serv_link = (sum(tx_items) / max(1, len(dies))) if tx_items else sum(lnk_items.values())
 
     m_raw = op.get("matrix_flops") or ()
     matrix_flops = {str(k): float(v) for k, v in (m_raw.items() if isinstance(m_raw, Mapping) else m_raw) if v}
     flops, dtype = max(float(op.get("flops", 0.0) or 0.0) + float(res_work.get("cube", 0.0) or 0.0), sum(matrix_flops.values()), float(ref_work.get("cube", 0.0) or 0.0)), str(op.get("dtype") or hw["default_dtype"] or "bf16")
-    t_cube_ideal_ms = sum((fl / _resolve_cube_peak(hw, dt, dtype)) * 1000.0 for dt, fl in matrix_flops.items()) if matrix_flops else ((flops / _resolve_cube_peak(hw, dtype, hw["default_dtype"])) * 1000.0 if flops > 0 else 0.0)
+    if matrix_flops:
+        if dies:
+            t_cube_ideal_ms = max(
+                sum((fl / _die_cube_peak(d, dt, dtype)) * _MS_PER_S for dt, fl in matrix_flops.items())
+                for d in dies
+            )
+        else:
+            t_cube_ideal_ms = sum((fl / _resolve_cube_peak(hw, dt, dtype)) * _MS_PER_S for dt, fl in matrix_flops.items())
+    else:
+        t_cube_ideal_ms = (flops / _resolve_cube_peak(hw, dtype, hw["default_dtype"])) * _MS_PER_S if flops > 0 else 0.0
     vector_ops = max(float(op.get("vector_ops", 0.0) or 0.0) + float(res_work.get("vector", 0.0) or 0.0), serv_vec, float(ref_work.get("vector", 0.0) or 0.0))
-    t_vec_ideal_ms = (vector_ops / hw["vector_peak_ops_per_s"]) * 1000.0 if vector_ops > 0 else 0.0
+    t_vec_ideal_ms = (vector_ops / hw["vector_peak_ops_per_s"]) * _MS_PER_S if vector_ops > 0 else 0.0
     hbm_bytes = max(float(op.get("hbm_bytes", 0.0) or 0.0) + float(res_work.get("hbm", 0.0) or 0.0), serv_hbm, float(ref_work.get("hbm", 0.0) or 0.0))
     mte1_bytes = max(float(metadata.get("mte1_bytes", 0.0) or 0.0) + float(res_work.get("mte1", 0.0) or 0.0), serv_mte1, float(ref_work.get("mte1", 0.0) or 0.0))
     mte2_bytes = max(float(op.get("mte2_bytes", 0.0) or 0.0) + float(res_work.get("mte2", 0.0) or 0.0), serv_mte2, float(ref_work.get("mte2", 0.0) or 0.0))
     mte3_bytes = max(float(op.get("mte3_bytes", 0.0) or 0.0) + float(res_work.get("mte3", 0.0) or 0.0), serv_mte3, float(ref_work.get("mte3", 0.0) or 0.0))
-    t_hbm_ideal_ms = (hbm_bytes / hw["hbm_peak_bytes_per_s"]) * 1000.0 if hbm_bytes > 0 else 0.0
+    t_hbm_ideal_ms = (hbm_bytes / hw["hbm_peak_bytes_per_s"]) * _MS_PER_S if hbm_bytes > 0 else 0.0
     logical_link_bytes = max(float(op.get("link_bytes", 0.0) or 0.0) + float(res_work.get("link", 0.0) or 0.0), float(ref_work.get("link", 0.0) or 0.0))
-    physical_link = physical_link_service(comm_info)
+    serviced_link = _serviced_link_service(serviced, comm_info, parsed, resource_rates=resource_rates) if not has_jn else None
+    physical_link = _physical_link_service_with_owner(comm_info)
     link_bytes = max(logical_link_bytes, serv_link)
-    if physical_link is not None:
-        # The physical wire ledger drives the service bound; the reported
-        # logical link volume stays the declared per-rank payload.
-        t_link_ideal_ms, _physical_link_bytes = physical_link
+    dominant_link_resource: str | None = None
+    link_service_by_resource: dict[str, float] = {}
+    if serviced_link is not None:
+        t_link_ideal_ms, _physical_link_bytes, dominant_link_resource, link_service_by_resource = serviced_link
+    elif physical_link is not None:
+        t_link_ideal_ms, _physical_link_bytes, dominant_link_resource, link_service_by_resource = physical_link
     else:
-        op_link_peak = _resolve_operator_link_peak(parsed, op, hw)
-        t_link_ideal_ms = ((link_bytes / op_link_peak) * 1000.0
+        op_link_peak = _resolve_operator_link_peak(parsed, op, hw, replica=replica)
+        t_link_ideal_ms = ((link_bytes / op_link_peak) * _MS_PER_S
                            if (link_bytes > 0.0 and op_link_peak > 0.0)
                            else 0.0)
+
+    has_device_serviced = bool(serviced) and not has_jn
+    t_other_non_hbm_ms = _serviced_other_non_hbm_ms(serviced, dies, parsed, resource_rates=resource_rates) if has_device_serviced else 0.0
+    t_hbm_exec_ms = (
+        _serviced_hbm_exec_ms(serviced, dies, hw["hbm_peak_bytes_per_s"], resource_rates=resource_rates)
+        if has_device_serviced else None
+    )
+    matrix_vals = [float(v) for k, v in serviced.items() if k.startswith("matrix@") and float(v) > 0.0] if has_device_serviced else []
+    t_cube_exec_ms = max(matrix_vals) if matrix_vals else None
+    vec_vals = [float(v) for k, v in serviced.items() if k.startswith("vector@") and float(v) > 0.0] if has_device_serviced else []
+    t_vec_exec_ms = (max(vec_vals) / (hw["vector_peak_ops_per_s"] / _MS_PER_S)) if (vec_vals and hw["vector_peak_ops_per_s"] > 0.0) else None
+    t_link_exec_ms = serviced_link[0] if serviced_link is not None else None
 
     total_ms, safe_t = duration_ms * count, max(duration_ms, 1e-12)
     operator_kind = "cv_fused" if (flops > 0 and vector_ops > 0) else "cube" if flops > 0 else "vector" if vector_ops > 0 else "communication" if link_bytes > 0 else "memory_only"
@@ -385,13 +792,17 @@ def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, A
         cv_compute_share_ratio = (t_vec_ideal_ms / denom_comp) if denom_comp > 0 else 0.5
         pmu_data = pmu or row.get("pmu")
         if isinstance(pmu_data, Mapping) and ("aic_mac_time_us" in pmu_data or "aiv_vec_time_us" in pmu_data or "compute_span_us" in pmu_data):
-            t_c, t_v = float(pmu_data.get("aic_mac_time_us", t_cube_ideal_ms * 1000.0)) / 1000.0, float(pmu_data.get("aiv_vec_time_us", t_vec_ideal_ms * 1000.0)) / 1000.0
-            t_span = float(pmu_data["compute_span_us"]) / 1000.0 if "compute_span_us" in pmu_data else (max(t_c + float(pmu_data.get("aic_wait_time_us", 0.0)) / 1000.0, t_v + float(pmu_data.get("aiv_wait_time_us", 0.0)) / 1000.0) if ("aic_wait_time_us" in pmu_data or "aiv_wait_time_us" in pmu_data) else max(duration_ms - fixed_ms, max(t_c, t_v)))
+            t_c, t_v = float(pmu_data.get("aic_mac_time_us", t_cube_ideal_ms * _MS_PER_S)) / _MS_PER_S, float(pmu_data.get("aiv_vec_time_us", t_vec_ideal_ms * _MS_PER_S)) / _MS_PER_S
+            t_span = float(pmu_data["compute_span_us"]) / _MS_PER_S if "compute_span_us" in pmu_data else (max(t_c + float(pmu_data.get("aic_wait_time_us", 0.0)) / _MS_PER_S, t_v + float(pmu_data.get("aiv_wait_time_us", 0.0)) / _MS_PER_S) if ("aic_wait_time_us" in pmu_data or "aiv_wait_time_us" in pmu_data) else max(duration_ms - fixed_ms, max(t_c, t_v)))
             cv_overlap_ratio = _clamp((t_c + t_v - t_span) / min(t_c, t_v), 0.0, 1.0) if min(t_c, t_v) > 0 else 0.0
         elif denom_comp > max(duration_ms - fixed_ms, 0.0) and min(t_cube_ideal_ms, t_vec_ideal_ms) > 0:
             cv_overlap_ratio = _clamp((denom_comp - max(duration_ms - fixed_ms, max(t_cube_ideal_ms, t_vec_ideal_ms))) / min(t_cube_ideal_ms, t_vec_ideal_ms), 0.0, 1.0)
     return {
         "physical_id": row.get("physical_id", ""), "op_id": op.get("op_id", ""), "family": op.get("family", ""), "recipe": op.get("recipe", ""),
+        "replica": replica, "native_call_id": _op_native_call_id(op),
+        "dominant_link_resource": dominant_link_resource,
+        "link_service_by_resource": link_service_by_resource,
+        "is_cross_replica_collective": _is_cohort_priced_collective(row, comm_info, parsed),
         "structure_block": str(dict(op.get("metadata") or ()).get("structure_block", "")),
         "program": row.get("program", ""), "phase": op.get("phase", ""), "stage": stage, "layer": int(op.get("layer", 0)), "dtype": dtype,
         "local_shape": tuple(op.get("local_shape") or ()), "occurrences": count, "duration_ms": duration_ms, "total_ms": total_ms,
@@ -399,6 +810,7 @@ def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, A
         "analytical_reference_work": ref_work, "flops": flops, "matrix_flops": matrix_flops, "vector_ops": vector_ops, "hbm_bytes": hbm_bytes,
         "mte1_bytes": mte1_bytes, "mte2_bytes": mte2_bytes, "mte3_bytes": mte3_bytes, "link_bytes": link_bytes, "logical_link_bytes": logical_link_bytes,
         "t_cube_ideal_ms": t_cube_ideal_ms, "t_vec_ideal_ms": t_vec_ideal_ms, "t_hbm_ideal_ms": t_hbm_ideal_ms, "t_link_ideal_ms": t_link_ideal_ms,
+        "t_other_non_hbm_ms": t_other_non_hbm_ms, "t_cube_exec_ms": t_cube_exec_ms, "t_vec_exec_ms": t_vec_exec_ms, "t_hbm_exec_ms": t_hbm_exec_ms, "t_link_exec_ms": t_link_exec_ms,
         "roofline_ideal_ms": roofline_ideal_ms, "cube_mfu": (t_cube_ideal_ms / safe_t) if flops > 0 else None, "vec_mfu": (t_vec_ideal_ms / safe_t) if vector_ops > 0 else None,
         "mbu": (t_hbm_ideal_ms / safe_t) if hbm_bytes > 0 else None, "link_util": (t_link_ideal_ms / safe_t) if link_bytes > 0 else None,
         "roofline_efficiency": roofline_efficiency, "operator_kind": operator_kind, "dominant_bound": dominant_bound,

@@ -47,6 +47,12 @@ OCCURRENCE_KEYS: tuple[str, ...] = ("occurrences", "occurrence_count", "count")
 FIXED_KEYS: tuple[str, ...] = ("fixed_ms", "fixed_launch_ms")
 LAUNCH_KEYS: tuple[str, ...] = ("launch_ms",)
 RESOURCE_ID_SUFFIXES: tuple[str, ...] = ("_resource", "_physical_id", "_device")
+_SITE_RESOURCE_PREFIX: Mapping[str, str] = {
+    "cube": "matrix",
+    "vector": "vector",
+    "hbm": "memory",
+    "link": "link",
+}
 
 
 @dataclass(frozen=True)
@@ -93,6 +99,7 @@ class PhysicalWorkNode:
     predecessors: tuple[str, ...] = ()
     occurrences: int = 1
     resource_ids: tuple[tuple[str, str], ...] = ()
+    link_services: tuple[tuple[str, float], ...] = ()
 
     def __post_init__(self):
         raw_ids = self.resource_ids
@@ -106,10 +113,32 @@ class PhysicalWorkNode:
         else:
             normalized = ()
         object.__setattr__(self, "resource_ids", normalized)
+        raw_links = self.link_services
+        if isinstance(raw_links, Mapping):
+            norm_links = tuple(sorted(
+                (str(name), float(value))
+                for name, value in raw_links.items()))
+        elif raw_links:
+            norm_links = tuple(
+                (str(name), float(value)) for name, value in raw_links)
+        else:
+            norm_links = ()
+        object.__setattr__(self, "link_services", norm_links)
         if any(not math.isfinite(value) or value < 0.0
                for value in (self.cube_ms, self.vector_ms, self.hbm_ms,
                              self.link_ms, self.launch_ms, self.fixed_ms)):
             raise ModelingError("physical_work_node_duration_must_be_nonnegative")
+        seen_links: set[str] = set()
+        for identity, value in self.link_services:
+            if not identity:
+                raise ModelingError(
+                    "physical_work_node_resource_identity_must_be_nonempty")
+            if not math.isfinite(value) or value < 0.0:
+                raise ModelingError("physical_work_node_duration_must_be_nonnegative")
+            if identity in seen_links:
+                raise ModelingError(
+                    f"physical_work_node_resource_duplicate:{identity}")
+            seen_links.add(identity)
         if (isinstance(self.occurrences, bool)
                 or not isinstance(self.occurrences, int)
                 or self.occurrences < 1):
@@ -294,11 +323,23 @@ def _resource_totals(
         nodes: Iterable[PhysicalWorkNode]) -> tuple[dict[str, str], dict[str, float]]:
     """Per-physical-resource service totals, keyed by physical identity."""
     nodes = tuple(nodes)
-    explicit = any(node.resource_ids for node in nodes)
+    explicit = any(node.resource_ids or node.link_services for node in nodes)
     logical_by_key: dict[str, str] = {}
     values_by_key: dict[str, list[float]] = {}
     for node in nodes:
         for resource in RESOURCES:
+            if resource == "link" and node.link_services:
+                for key, raw_service in node.link_services:
+                    service = float(node.occurrences) * float(raw_service)
+                    if service <= 0.0:
+                        continue
+                    previous = logical_by_key.get(key)
+                    if previous is not None and previous != "link":
+                        raise ModelingError(
+                            f"physical_resource_identity_conflict:{key}")
+                    logical_by_key[key] = "link"
+                    values_by_key.setdefault(key, []).append(service)
+                continue
             service = node.service_ms(resource)
             if service <= 0.0:
                 continue
@@ -393,7 +434,7 @@ def link_utilization(wire_by_resource: Mapping[str, float],
         nominal_peak_utilization=maximum,
         configured_capacity_utilization=maximum,
         useful_payload_throughput=(total_wire / span if span > 0.0 else 0.0),
-        bus_wire_throughput=(total_capacity / span if span > 0.0 else 0.0),
+        bus_wire_throughput=total_capacity,
     )
 
 
@@ -423,22 +464,63 @@ def _row_ids(value: object) -> tuple[str, ...]:
     return tuple(str(item) for item in value)
 
 
-def _row_resource_ids(row: Mapping[str, object]) -> tuple[tuple[str, str], ...]:
-    raw = row.get("resource_ids")
+def _row_resource_ids(
+    row: Mapping[str, object],
+    supplied: Mapping[str, object] | None = None,
+) -> tuple[tuple[str, str], ...]:
     pairs: list[tuple[str, str]] = []
-    if isinstance(raw, Mapping):
-        pairs.extend((str(name), str(identity))
-                     for name, identity in raw.items())
-    elif raw:
-        pairs.extend((str(name), str(identity))
-                     for name, identity in raw)
-    for resource in RESOURCES:
-        for suffix in RESOURCE_ID_SUFFIXES:
-            identity = row.get(f"{resource}{suffix}")
-            if identity:
-                pairs.append((resource, str(identity)))
-                break
+    seen: set[str] = set()
+    for source in (row, supplied):
+        if source is None:
+            continue
+        raw = source.get("resource_ids")
+        if isinstance(raw, Mapping):
+            for name, identity in raw.items():
+                key = str(name)
+                if key not in seen:
+                    pairs.append((key, str(identity)))
+                    seen.add(key)
+        elif raw:
+            for name, identity in raw:
+                key = str(name)
+                if source is row or key not in seen:
+                    pairs.append((key, str(identity)))
+                    seen.add(key)
+        for resource in RESOURCES:
+            if resource in seen:
+                continue
+            for suffix in RESOURCE_ID_SUFFIXES:
+                identity = source.get(f"{resource}{suffix}")
+                if identity:
+                    pairs.append((resource, str(identity)))
+                    seen.add(resource)
+                    break
+    if row.get("replica") is not None or row.get("stage") is not None:
+        replica = int(row.get("replica", 0) or 0)
+        stage = int(row.get("stage", 0) or 0)
+        for resource in RESOURCES:
+            if resource not in seen:
+                pairs.append(
+                    (resource, f"{_SITE_RESOURCE_PREFIX[resource]}@r{replica}:s{stage}")
+                )
     return tuple(pairs)
+
+
+def _row_link_services(
+    row: Mapping[str, object],
+    supplied: Mapping[str, object] | None,
+    node_id: str,
+) -> tuple[tuple[str, float], ...]:
+    raw = row.get("link_services")
+    if raw is None and supplied is not None:
+        raw = supplied.get("link_services")
+    if not raw:
+        return ()
+    items = raw.items() if isinstance(raw, Mapping) else raw
+    return tuple(
+        (str(key), _nonnegative_float(val, f"{node_id}:link:{key}"))
+        for key, val in items
+    )
 
 
 def _occurrence_node_id(row: Mapping[str, object], index: int,
@@ -510,8 +592,12 @@ def graph_from_occurrences(
             resource: _row_value(row, SERVICE_ROW_KEYS[resource], 0.0)
             for resource in RESOURCES
         }
-        if service_by_id is not None and node_id in service_by_id:
-            supplied = service_by_id[node_id]
+        supplied = (
+            service_by_id[node_id]
+            if service_by_id is not None and node_id in service_by_id
+            else None
+        )
+        if supplied is not None:
             for resource in RESOURCES:
                 value = _row_value(supplied, SERVICE_ROW_KEYS[resource], None)
                 if value is not None:
@@ -535,7 +621,8 @@ def graph_from_occurrences(
                 predecessor for predecessor in raw_predecessors
                 if predecessor in known),
             occurrences=count,
-            resource_ids=_row_resource_ids(row),
+            resource_ids=_row_resource_ids(row, supplied),
+            link_services=_row_link_services(row, supplied, node_id),
         ))
     return PhysicalWorkGraph(tuple(nodes), edge_list)
 
