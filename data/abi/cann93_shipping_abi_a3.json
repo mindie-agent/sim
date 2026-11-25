@@ -3,7 +3,7 @@
   "device_arch": "A3",
   "sku_id": "ascend910_9362",
   "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
-  "payload_sha256": "d97770f65cf0a01bf244f37f5c23be767d3f546cb4cd2912de0e1cdb8bb0826c",
+  "payload_sha256": "6fff8c4ef9c77f25eeb55e75164cabb5ccf095cec278e01a78fd7a5dab786378",
   "entries": [
     {
       "entry_id": "a3_hccl_agmm_v2_dense",
@@ -104,7 +104,7 @@
       ],
       "allow_bias": false,
       "require_no_bias": true,
-      "probe_signature_sha256": "e545d513b78305c14b1932ffd08113b2bbac5f9700db4dfdc90716d682f739a0",
+      "probe_signature_sha256": "a395a38eba5d023e5240c80c7c50cd1be5ee2cb2233c6758d873e983701d30bd",
       "probe_domain_note": "Direct native AGMM callsite; rejects roce_flat_cross_node"
     },
     {
@@ -199,7 +199,7 @@
       ],
       "allow_bias": false,
       "require_no_bias": true,
-      "probe_signature_sha256": "c120a3c703120f80bff72b78da3f49f92ecf765bff25ba7dcb05232b374d3959",
+      "probe_signature_sha256": "464573b3bfd722f0d7c9e9a358d171ac91622e9b00804b14224cbb3122b8f937",
       "probe_domain_note": "Quantized AGMM compiler pass requires proposed/target PR track"
     },
     {
@@ -301,7 +301,7 @@
       ],
       "allow_bias": false,
       "require_no_bias": true,
-      "probe_signature_sha256": "773672cecbd8c0a0a16ebe63b96052e3d1c7af5da6343a6d14934e562a05496b",
+      "probe_signature_sha256": "4a021b14e662b2ee7d2fabb238b53ab866ff5c96466c6077f18cf99270357b55",
       "probe_domain_note": "Merged MMRS graph-fusion pass: dense BF16/FP16 bias-free ws in {2,4,8}"
     },
     {
@@ -389,7 +389,7 @@
       ],
       "allow_bias": false,
       "require_no_bias": true,
-      "probe_signature_sha256": "fef8579c4c377119c9fe7af05e3a51a5378f94b018e632487fc97f377ce74cf2",
+      "probe_signature_sha256": "edeb76004e3e30131d7f84e6f09f907fddbb3d5456327ebc894a3bb38dcdec2e",
       "probe_domain_note": "Quantized MMRS rejects int4 on A2/A3; requires proposed/target track"
     },
     {
@@ -411,7 +411,11 @@
           "expert_ids:int32:ND:none::none"
         ],
         [
-          "x:int8:ND:per_token_int8::fp32",
+          "x:bf16:ND:dense::none",
+          "expert_ids:int32:ND:none::none"
+        ],
+        [
+          "x:fp16:ND:dense::none",
           "expert_ids:int32:ND:none::none"
         ]
       ],
@@ -457,13 +461,40 @@
       ],
       "allowed_output_tuples": [
         [
-          "expand_x:bf16:ND"
+          "expand_x:bf16:ND",
+          "dynamic_scales:fp32:ND",
+          "assist_info_for_combine:int32:ND",
+          "expert_token_nums:int64:ND",
+          "ep_recv_counts:int32:ND",
+          "tp_recv_counts:int32:ND",
+          "expand_scales:fp32:ND"
         ],
         [
-          "expand_x:fp16:ND"
+          "expand_x:fp16:ND",
+          "dynamic_scales:fp32:ND",
+          "assist_info_for_combine:int32:ND",
+          "expert_token_nums:int64:ND",
+          "ep_recv_counts:int32:ND",
+          "tp_recv_counts:int32:ND",
+          "expand_scales:fp32:ND"
         ],
         [
-          "expand_x:int8:ND"
+          "expand_x:int8:ND",
+          "dynamic_scales:fp32:ND",
+          "assist_info_for_combine:int32:ND",
+          "expert_token_nums:int64:ND",
+          "ep_recv_counts:int32:ND",
+          "tp_recv_counts:int32:ND",
+          "expand_scales:fp32:ND"
+        ],
+        [
+          "expand_x:int8:ND",
+          "dynamic_scales:fp32:ND",
+          "assist_info_for_combine:int32:ND",
+          "expert_token_nums:int64:ND",
+          "ep_recv_counts:int32:ND",
+          "tp_recv_counts:int32:ND",
+          "expand_scales:fp32:ND"
         ]
       ],
       "allowed_rank_placements": [
@@ -487,7 +518,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "96382738963fcd1d06d7c2bc50150a6c3a8ef8576963f579269523d204faed50",
+      "probe_signature_sha256": "ef482449e0bd097189726bfbc6f17bdfb5d435d47cf6d8c82d913ae05d1d39a4",
       "probe_domain_note": "Standard decode MoE MC2 dispatch (V3 on A5 via op-plugin probe, V2 on A2/A3; compatible with MSO=True); live_silicon_observed=MoeDistributeDispatchV2"
     },
     {
@@ -584,7 +615,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "b929f899603e74820432a6ac54606d12cefeee8df6acc82886bb051732f874e0",
+      "probe_signature_sha256": "ae787fabc99894cac9c896d9b5709c769bacfd95523b7060feed97d951db9765",
       "probe_domain_note": "Standard decode MoE MC2 combine (V3 on A5 via op-plugin V6/V4/V3 probe, V2 on A2/A3; 5 required inputs); live_silicon_observed=MoeDistributeCombineV2"
     },
     {
@@ -598,15 +629,15 @@
       "role": "moe_fused_frame",
       "dtype_tuple": [
         [
-          "context:int8:ND:none::none",
+          "context:int32:ND:none::none",
           "x:bf16:ND:dense::none",
           "topk_ids:int32:ND:none::none",
           "topk_weights:fp32:ND:dense::none",
-          "weight1:bf16:FRACTAL_NZ:dense::none",
-          "weight2:bf16:FRACTAL_NZ:dense::none"
+          "weight1:bf16:ND:dense::none",
+          "weight2:bf16:ND:dense::none"
         ],
         [
-          "context:int8:ND:none::none",
+          "context:int32:ND:none::none",
           "x:bf16:ND:dense::none",
           "topk_ids:int32:ND:none::none",
           "topk_weights:fp32:ND:dense::none",
@@ -614,7 +645,7 @@
           "weight2:int8:FRACTAL_NZ:per_channel_int8::fp32"
         ],
         [
-          "context:int8:ND:none::none",
+          "context:int32:ND:none::none",
           "x:bf16:ND:dense::none",
           "topk_ids:int32:ND:none::none",
           "topk_weights:fp32:ND:dense::none",
@@ -644,7 +675,8 @@
           1,
           16
         ],
-        "max_shared_experts_per_rank": 0
+        "max_shared_experts_per_rank": 0,
+        "max_experts": 1024
       },
       "source_ref": {
         "repository": "cann/ops-transformer",
@@ -665,15 +697,15 @@
       "allowed_output_tuples": [
         [
           "y:bf16:ND",
-          "expert_token_nums:int64:ND"
+          "expert_token_nums:int32:ND"
         ],
         [
           "y:bf16:ND",
-          "expert_token_nums:int64:ND"
+          "expert_token_nums:int32:ND"
         ],
         [
           "y:bf16:ND",
-          "expert_token_nums:int64:ND"
+          "expert_token_nums:int32:ND"
         ]
       ],
       "allowed_rank_placements": [
@@ -686,12 +718,16 @@
         8,
         16,
         32,
-        64
+        48,
+        64,
+        96,
+        128
       ],
       "allowed_activations": [
-        "gelu",
         "situglu",
-        "swiglu"
+        "swiglu",
+        "swigluoai",
+        "swiglustep"
       ],
       "allowed_model_scopes": [
         "draft",
@@ -699,7 +735,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "4aeb3c371d6c70db9cbb5fb65ee0696a2b0dd4b21c17d96c9b9ad271ad078900",
+      "probe_signature_sha256": "ec52bfe25b4e833c8d6d0dfa14a00fa9fcb7dbdacd49de35c808b0faf4a883f1",
       "probe_domain_note": "A5 MXFP8/MXFP4 (mode 4 BF16 in or mode 0 topoType=0); A2/A3 BF16/INT8/INT4 NZ (no FP8)"
     },
     {
@@ -810,7 +846,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "a97d389f89824d87d56df4166794b8e5fa520b267f4898fbeaf414c920bbd863",
+      "probe_signature_sha256": "baff15616e2a285c5b042231b5b68ec2c668955a4cfefe550308c0dae8334e6f",
       "probe_domain_note": "HCCL collective; supports intra-node HCCS/UB and inter-node RoCE; live_silicon_observed=hcom_allReduce_"
     },
     {
@@ -921,7 +957,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "635b038f8bed7619df0d7f360841765bcb346105c03ad4fddc2a62ad5aab7d90",
+      "probe_signature_sha256": "40d57004c779ec0c83675d47b8ab200133882e07b9f3317b047e7d07f3d233e7",
       "probe_domain_note": "HCCL collective; supports intra-node HCCS/UB and inter-node RoCE; live_silicon_observed=hcom_allGather_"
     },
     {
@@ -1032,7 +1068,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "95537709aadf6f9c06a78ae0e57419e12d2f5b659151e38feec7313ecc1188b9",
+      "probe_signature_sha256": "5aaec6c324efbddf7108f14f7d8ecc7ccb9d06249b981eb7d258a2739269f562",
       "probe_domain_note": "HCCL collective; supports intra-node HCCS/UB and inter-node RoCE; live_silicon_observed=hcom_reduceScatter_"
     },
     {
@@ -1143,7 +1179,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "7917b44a952f93241ce916de233ecb8cbc3f63c2c5f690006c439898f3434835",
+      "probe_signature_sha256": "829a9225febbe675830955bad0690271ce23c4a7831c9c8a265015f68f6b4865",
       "probe_domain_note": "HCCL collective; supports intra-node HCCS/UB and inter-node RoCE"
     },
     {
@@ -1254,7 +1290,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "7db97a262190950efd1989249a11672566c89bf03640cc9ca617976a375e714e",
+      "probe_signature_sha256": "fbcc509f565dcb18e629401f6fbb2970e47f539459a2d62ba3ed6c0d86444e55",
       "probe_domain_note": "HCCL collective; supports intra-node HCCS/UB and inter-node RoCE; live_silicon_observed=hcom_alltoallv_"
     },
     {
@@ -1353,7 +1389,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "1646e618854a234904484ee9d0dba7a0f5e8b608d386bbabce604589686e6f5f",
+      "probe_signature_sha256": "28e4a302d3b137e91f50c3fb9ec31e12fc2098f0990a81d55339981a285170cf",
       "probe_domain_note": "Cube FRACTAL_M=16 per-expert alignment; live_silicon_observed=GroupedMatmul"
     },
     {
@@ -1370,13 +1406,6 @@
           "x:int8:ND:per_token_int8::fp32",
           "weight:int8:FRACTAL_NZ:per_channel_int8::fp32",
           "weight_scale:fp32:ND:dense::none",
-          "x_scale:fp32:ND:dense::none",
-          "group_list:int64:ND:none::none"
-        ],
-        [
-          "x:int8:ND:per_token_int8::fp32",
-          "weight:int4:FRACTAL_NZ:w4a8_int::fp32",
-          "weight_scale:uint64:ND:none::none",
           "x_scale:fp32:ND:dense::none",
           "group_list:int64:ND:none::none"
         ]
@@ -1425,6 +1454,96 @@
         [
           "y:int8:ND",
           "y_scale:fp32:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "swiglu"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "52507c11a448b90db1ab1aff25597ee7dc4c001ceede895a1d9974c114d7064a",
+      "probe_domain_note": "A2/A3 shipping W8A8 GMM+SwiGLU+Quant V1 (K<65536, even N<=10240); A5 uses V2/WeightNzV2; live_silicon_observed=GroupedMatmulSwigluQuant"
+    },
+    {
+      "entry_id": "a3_cann_gmm_swiglu_quant_v1_a8w4",
+      "abi_id": "aclnnGroupedMatmulSwigluQuant",
+      "available_on_device": true,
+      "backend_kind": "cann_aclnn",
+      "symbol_or_kernel": "aclnnGroupedMatmulSwigluQuant",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "moe_act_quant",
+      "dtype_tuple": [
+        [
+          "x:int8:ND:per_token_int8::fp32",
+          "weight:int4:FRACTAL_NZ:w4a8_int::fp32",
+          "bias:fp32:ND:dense::none",
+          "weight_scale:uint64:ND:none::none",
+          "x_scale:fp32:ND:dense::none",
+          "group_list:int64:ND:none::none"
+        ],
+        [
+          "x:int8:ND:per_token_int8::fp32",
+          "weight:int4:FRACTAL_NZ:w4a8_int::fp32",
+          "weight_scale:uint64:ND:none::none",
+          "x_scale:fp32:ND:dense::none",
+          "group_list:int64:ND:none::none"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 20000,
+        "n_max_inclusive": 10240,
+        "require_even_n": true,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
+        ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1
+      },
+      "source_ref": {
+        "repository": "cann/ops-transformer",
+        "revision": "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "relative_path": "gmm/grouped_matmul_swiglu_quant/op_host/grouped_matmul_swiglu_quant_def.cpp",
+        "source_sha256": "82c43e011225a3b66ebde85fd2bf1fcf6a924bf05e61bb3d58f35ffecf6959cc"
+      },
+      "graph_motif": "gmm_swiglu_quant",
+      "vllm_ascend_track": "merged",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "",
+      "vllm_ascend_ref": "vllm_ascend/quantization/methods/w4a8/w4a8.py:488",
+      "op_plugin_ref": "op_plugin/ops/opapi/GroupedMatmulSwigluQuantNpuOpapi.cpp",
+      "cann_check_params_ref": "ops-transformer/gmm/grouped_matmul_swiglu_quant/op_api/aclnn_grouped_matmul_swiglu_quant.cpp:178",
+      "device_kernel_expansion": [
+        "GroupedMatmulSwigluQuant"
+      ],
+      "allowed_output_tuples": [
+        [
+          "y:int8:ND",
+          "y_scale:fp32:ND"
         ],
         [
           "y:int8:ND",
@@ -1446,8 +1565,9 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "c278fdba223eb1fa738fc5e8280cc1192317bff9d5f5208a805a860fbbddd3ec",
-      "probe_domain_note": "A2/A3 shipping W8A8/W4A8 GMM+SwiGLU+Quant V1 (5 required inputs -> y, y_scale); A5 uses V2/WeightNzV2; live_silicon_observed=GroupedMatmulSwigluQuant"
+      "probe_signature_sha256": "8f7b5e458e7e1b71d87697d87bfe9b69a9e0ea63c4efed0ab458d36b995b158c",
+      "probe_domain_note": "A2/A3 shipping W4A8 GMM+SwiGLU+Quant V1 (A8W4 requires K<20000, even N<=10240, non-null bias); live_silicon_observed=GroupedMatmulSwigluQuant",
+      "require_bias": true
     },
     {
       "entry_id": "a3_cann_gmm_swiglu_quant_v2",
@@ -1533,7 +1653,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "5f508833a0d150288367974065c946afe207e5b761aff9bc41e36760ded4c997",
+      "probe_signature_sha256": "61bccffbfccb468dcb94fd4450dd02e6a8f0fb5285ce762b234cacefcbfd9358",
       "probe_domain_note": "Rejects BF16/FP16; A2/A3 A8W4 enforces K<20000 and even N<=10240; live_silicon_observed=GroupedMatmulSwigluQuantV2"
     },
     {
@@ -1625,7 +1745,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "7acaff6d8080d7562a2171605bcc8606eaa44ceb3deda4e4502143c85b3e78d6",
+      "probe_signature_sha256": "c71c214b4df37c1619920665654e65fc5ced8b6986d470232d47177cdc5558d4",
       "probe_domain_note": "Shipping CANN DequantSwigluQuant across A2/A3/A5 (AddConfig ascend910b/93/DAV_3510); live_silicon_observed=DequantSwigluQuant"
     },
     {
@@ -1682,7 +1802,8 @@
           0,
           0
         ],
-        "max_shared_experts_per_rank": -1
+        "max_shared_experts_per_rank": -1,
+        "max_experts": 2048
       },
       "source_ref": {
         "repository": "cann/ops-transformer",
@@ -1747,7 +1868,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "bc22545b293b6ec612a1dfdc77de2c8b72bd65888d3895a5d796c3c16d1139b3",
+      "probe_signature_sha256": "58fe8e1e4a52109db71e62a0dd85facc5379bbee54695d6ee1ec69a1c67a885a",
       "probe_domain_note": "Shipping CANN aclnnMoeGatingTopK across A2/A3/A5 (AddConfig ascend910b/93/950; optional 1D bias); live_silicon_observed=MoeGatingTopK"
     },
     {
@@ -1842,7 +1963,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "f62b93923caaf81a75bd7d8cd626b9163431487d690b0c337422c1e7c486b0cb",
+      "probe_signature_sha256": "97213be571a484d182ad04343b73852a97039add403d6c65acc7ba6a1e8e204d",
       "probe_domain_note": "Shipping CANN aclnnMoeGatingTopKSoftmaxV2 across A2/A3/A5 (AddConfig ascend910b/93/950)"
     },
     {
@@ -1942,7 +2063,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "85a5f50ab25339df3c063a06e9b9efb83a0be6a8aa01324513c846b09fad6752",
+      "probe_signature_sha256": "af68c835049ce5abc0508f1218974baf7c583a008310d9b85d6fd19a9e8cf7b0",
       "probe_domain_note": "Shipping CANN on A2/A3 (AddConfig ascend910b/93 ONLY); A5 BF16 SiTU unfused (12-14 kernels); live_silicon_observed=DequantSituQuant"
     },
     {
@@ -2050,7 +2171,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "1629418fef71a5f1213e4f7afbb719e0bdeace2cb871ea41212053aa7039e1b8",
+      "probe_signature_sha256": "14a46f248c12b601900ff75affd3dc828bdce224b131f31bb32455c6a7150502",
       "probe_domain_note": "Post-GMM SwiGLU+Quant ONLY (NEVER absorbs GMM); N even and <= 8192"
     },
     {
@@ -2134,7 +2255,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "f50b7fa1ce101590268f612dac56328ffcdb3d0a4dc082eff6efb20765bdaf40",
+      "probe_signature_sha256": "29d65f1e7f3f83c5f5b95468f53ccfbcad95100c682d1e01dc3996cc4319acde",
       "probe_domain_note": "Shipping CANN ClippedSwiglu on A2/A3 (device_op.py:535); live_silicon_observed=ClippedSwiglu"
     },
     {
@@ -2201,13 +2322,17 @@
       "allowed_output_tuples": [
         [
           "y1:int8:ND",
-          "y2:bf16:ND",
-          "scale:fp32:ND"
+          "y2:int8:ND",
+          "x:bf16:ND",
+          "scale1:fp32:ND",
+          "scale2:fp32:ND"
         ],
         [
           "y1:int8:ND",
-          "y2:fp16:ND",
-          "scale:fp32:ND"
+          "y2:int8:ND",
+          "x:fp16:ND",
+          "scale1:fp32:ND",
+          "scale2:fp32:ND"
         ]
       ],
       "allowed_rank_placements": [
@@ -2225,7 +2350,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "efbef74c4fdd52a01c0712ae801c959554f30d3fd5a520795e1289bc64fcd352",
+      "probe_signature_sha256": "6ba6fca8dca04aec94565a0328e26e8f16eb5a94e43a59ec720e14802e4946ff",
       "probe_domain_note": "Merged norm_quant_fusion pass (INT8 dynamic quant; skips W4A4)"
     },
     {
@@ -2399,7 +2524,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "c53df284ed340db48acbaa19f8332420081c6bfa151253a310b7666afff2b536",
+      "probe_signature_sha256": "9843f9dc7892736dc25dc4897bc9a451fcf277a0221c8bf054e182067ec96cf8",
       "probe_domain_note": "Quantized linear layers execute QuantBatchMatmulV3 on NPU; live_silicon_observed=QuantBatchMatmulV3"
     },
     {
@@ -2491,7 +2616,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "44eadf8c73ce1c8e939b43a2ae2938a08677dab6f5c1f2db9259be375e1ddcb3",
+      "probe_signature_sha256": "0ff3b2c2c3985aac9817fbe26bd2d9208acc784ed1482669bfa7f231f0ceaf0e",
       "probe_domain_note": "Dense BF16/FP16 matrix multiplication; live_silicon_observed=MatMulV2"
     },
     {
@@ -2509,9 +2634,6 @@
         ],
         [
           "x:fp16:ND:dense::none"
-        ],
-        [
-          "x:bool:ND:none::none"
         ]
       ],
       "shape_constraints": {
@@ -2561,7 +2683,85 @@
         ],
         [
           "y:fp16:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "none"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "1523d0677076d05c584483ac4cf9cf81e19d36664bfb606074e36d517a4e115a",
+      "probe_domain_note": "BF16/FP16 sp_pad > 0 expands to MemSet + PadV3; sp_pad == 0 is 0 PadV3; live_silicon_observed=MemSet,PadV3"
+    },
+    {
+      "entry_id": "a3_cann_constant_pad_nd_bool",
+      "abi_id": "aclnnConstantPadNd",
+      "available_on_device": true,
+      "backend_kind": "cann_aclnn",
+      "symbol_or_kernel": "aclnnConstantPadNd",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "sp_pad",
+      "dtype_tuple": [
+        [
+          "x:bool:ND:none::none"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 0,
+        "n_max_inclusive": 0,
+        "require_even_n": false,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
         ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1
+      },
+      "source_ref": {
+        "repository": "cann/ops-math",
+        "revision": "28dd9a64a56dcd5e27bfe0c6e9c935bd3e5e3dd1",
+        "relative_path": "conversion/pad_v3/op_api/aclnn_constant_pad_nd.cpp",
+        "source_sha256": "1168a8db9bd1fcacbf56a9ed17356a82c3b9e5bc1cc11bf4f7e1a40f65055b7d"
+      },
+      "graph_motif": "sp_pad_constant_bool",
+      "vllm_ascend_track": "merged",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "",
+      "vllm_ascend_ref": "vllm_ascend/ops/linear_op.py:218",
+      "op_plugin_ref": "op_plugin/ops/opapi/ConstantPadNdKernelNpuOpApi.cpp:91",
+      "cann_check_params_ref": "ops-math/conversion/pad_v3/op_api/aclnn_constant_pad_nd.cpp:339",
+      "device_kernel_expansion": [
+        "Cast",
+        "Cast",
+        "MemSet",
+        "PadV3",
+        "Cast"
+      ],
+      "allowed_output_tuples": [
         [
           "y:bool:ND"
         ]
@@ -2581,8 +2781,8 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "27ae87721822e987a5cfc7df467e70a3c34d9de468b2cd99f4bac3577d25ef9a",
-      "probe_domain_note": "sp_pad > 0 expands to MemSet + PadV3 (plus 3xCast for bool mc2_mask); sp_pad == 0 is 0 PadV3; live_silicon_observed=MemSet,PadV3"
+      "probe_signature_sha256": "f99c3a6be722e6eb6931cc1f7bf8e59cfa2b0dbe6ec21c2a2b778456272d2ac9",
+      "probe_domain_note": "A2/A3 non-RegBase bool ConstantPadNd wraps PadV3 with 3x Cast (self->int8, value->int8, out->bool); live_silicon_observed=Cast,Cast,Cast,MemSet,PadV3"
     },
     {
       "entry_id": "a3_cann_inplace_zero",
@@ -2670,7 +2870,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "1bf6263101245e890b899bfbd6c92fb917cbd26dcd7c1457fd2d232979ddbbb4",
+      "probe_signature_sha256": "3ab80036a5acce7dde21d6ec5fd2c9bdafc27c042617051322b039927677cf1e",
       "probe_domain_note": "In-place zero fill launching ZerosLike (live A3 & A5 verified); live_silicon_observed=ZerosLike"
     },
     {
@@ -2755,7 +2955,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "2b1a7031f00718ec2cca8af04b0b53f0f429c7a30849e4ae8e098814a08f68d8",
+      "probe_signature_sha256": "47b9056f065ec8948536b013b2eaf58c020be275a01141bdc5f3877bc4a71dd9",
       "probe_domain_note": "Tensor concatenation launching ConcatD (paired separately with aclnnInplaceZero -> ZerosLike); live_silicon_observed=ConcatD"
     },
     {
@@ -2841,7 +3041,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "8f8fca3c8cbe06b43a2b823226315c21f2f8bb715b84a79b8df1743d80878118",
+      "probe_signature_sha256": "e1322f1031442d83fc1a31de2a1fa70e178e6e52839346f299af3fb708dd9add",
       "probe_domain_note": "Multi-kernel aten::index expansion: IndexCheck + Index; live_silicon_observed=Index,IndexCheck"
     },
     {
@@ -2858,7 +3058,7 @@
           "token_x:bf16:ND:dense::none",
           "weight_dq:bf16:FRACTAL_NZ:dense::none",
           "weight_uq_qr:bf16:FRACTAL_NZ:dense::none",
-          "weight_uk:bf16:FRACTAL_NZ:dense::none",
+          "weight_uk:bf16:ND:dense::none",
           "weight_dkv_kr:bf16:FRACTAL_NZ:dense::none",
           "rmsnorm_gamma_cq:bf16:ND:dense::none",
           "rmsnorm_gamma_ckv:bf16:ND:dense::none",
@@ -2871,7 +3071,7 @@
           "token_x:int8:ND:per_token_int8::fp32",
           "weight_dq:int8:FRACTAL_NZ:per_channel_int8::fp32",
           "weight_uq_qr:int8:FRACTAL_NZ:per_channel_int8::fp32",
-          "weight_uk:int8:FRACTAL_NZ:per_channel_int8::fp32",
+          "weight_uk:bf16:ND:dense::none",
           "weight_dkv_kr:int8:FRACTAL_NZ:per_channel_int8::fp32",
           "rmsnorm_gamma_cq:bf16:ND:dense::none",
           "rmsnorm_gamma_ckv:bf16:ND:dense::none",
@@ -2960,7 +3160,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "e9756e8282516c629916c73a4f8e5686fe3c65d2ff3e2934c5ecc48747941800",
+      "probe_signature_sha256": "01937ce2af5371e6695140a7b4c9afbfd0b6237130a3e7b4c85c2ff87eac450f",
       "probe_domain_note": "Exact 11-input/4-output signature (aclnn_mla_prolog_v3_weight_nz.cpp:195); A5 BF16/MXFP8/INT8 (rejects FP16); A2/A3 INT8 NZ"
     },
     {
@@ -2977,7 +3177,7 @@
           "token_x:bf16:ND:dense::none",
           "weight_dq:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
           "weight_uq_qr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-          "weight_uk:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
+          "weight_uk:bf16:ND:dense::none",
           "weight_dkv_kr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
           "rmsnorm_gamma_cq:bf16:ND:dense::none",
           "rmsnorm_gamma_ckv:bf16:ND:dense::none",
@@ -2990,7 +3190,7 @@
           "token_x:bf16:ND:dense::none",
           "weight_dq:bf16:FRACTAL_NZ:dense::none",
           "weight_uq_qr:bf16:FRACTAL_NZ:dense::none",
-          "weight_uk:bf16:FRACTAL_NZ:dense::none",
+          "weight_uk:bf16:ND:dense::none",
           "weight_dkv_kr:bf16:FRACTAL_NZ:dense::none",
           "rmsnorm_gamma_cq:bf16:ND:dense::none",
           "rmsnorm_gamma_ckv:bf16:ND:dense::none",
@@ -3003,7 +3203,7 @@
           "token_x:bf16:ND:dense::none",
           "weight_dq:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
           "weight_uq_qr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-          "weight_uk:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
+          "weight_uk:bf16:ND:dense::none",
           "weight_dkv_kr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
           "rmsnorm_gamma_cq:bf16:ND:dense::none",
           "rmsnorm_gamma_ckv:bf16:ND:dense::none",
@@ -3014,7 +3214,7 @@
           "token_x:bf16:ND:dense::none",
           "weight_dq:bf16:FRACTAL_NZ:dense::none",
           "weight_uq_qr:bf16:FRACTAL_NZ:dense::none",
-          "weight_uk:bf16:FRACTAL_NZ:dense::none",
+          "weight_uk:bf16:ND:dense::none",
           "weight_dkv_kr:bf16:FRACTAL_NZ:dense::none",
           "rmsnorm_gamma_cq:bf16:ND:dense::none",
           "rmsnorm_gamma_ckv:bf16:ND:dense::none",
@@ -3206,7 +3406,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "ec8b4d408feda73b8ae9b5cdee177c6b472a52b6e2fbb092c72c59f50f9173e5",
+      "probe_signature_sha256": "69d547cbb0bca49870d0a89dd5e313ef84551bb0a3801958091f77b1dfc51787",
       "probe_domain_note": "Standard CANN FIA attention across A2/A3/A5; live_silicon_observed=FusedInferAttentionScore"
     },
     {
@@ -3221,11 +3421,25 @@
       "dtype_tuple": [
         [
           "q:bf16:ND:dense::none",
-          "k_cache:bf16:ND:dense::none"
+          "k_cache:bf16:ND:dense::none",
+          "block_table:int32:ND:none::none"
         ],
         [
-          "q:fp8_e4m3fn:ND:per_tensor_fp8::fp32",
-          "k_cache:fp8_e4m3fn:ND:per_tensor_fp8::fp32"
+          "q:fp16:ND:dense::none",
+          "k_cache:fp16:ND:dense::none",
+          "block_table:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "k_cache:bf16:ND:dense::none",
+          "block_table:int32:ND:none::none",
+          "cache_seqlens:int32:ND:none::none"
+        ],
+        [
+          "q:fp16:ND:dense::none",
+          "k_cache:fp16:ND:dense::none",
+          "block_table:int32:ND:none::none",
+          "cache_seqlens:int32:ND:none::none"
         ]
       ],
       "shape_constraints": {
@@ -3264,14 +3478,20 @@
       "required_mechanism_id": "",
       "vllm_ascend_ref": "vllm_ascend/attention/flashmla.py:160",
       "op_plugin_ref": "ops-transformer/attention/flash_mla/torch_extension/csrc/flash_mla.cpp:1",
-      "cann_check_params_ref": "ops-transformer/attention/flash_mla/op_host/flash_mla_def.cpp:107",
+      "cann_check_params_ref": "ops-transformer/attention/flash_mla/op_host/flash_mla_tiling_info_parser.cpp:357",
       "device_kernel_expansion": [],
       "allowed_output_tuples": [
         [
           "attn_out:bf16:ND"
         ],
         [
+          "attn_out:fp16:ND"
+        ],
+        [
           "attn_out:bf16:ND"
+        ],
+        [
+          "attn_out:fp16:ND"
         ]
       ],
       "allowed_rank_placements": [
@@ -3290,7 +3510,7 @@
       "allow_bias": true,
       "require_no_bias": false,
       "probe_signature_sha256": "",
-      "probe_domain_note": "A5 ONLY (AddConfig ascend950); unavailable on A2/A3"
+      "probe_domain_note": "A5 ONLY (AddConfig ascend950; BF16/FP16 only + required paged block_table per flash_mla_tiling_info_parser.cpp:357); unavailable on A2/A3"
     },
     {
       "entry_id": "a3_cann_sparse_flash_attention",
@@ -3382,7 +3602,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "c896288b483157abe8f1c54ae4d19d4b377d404255550c770702588e64f21f25",
+      "probe_signature_sha256": "2d30998976e5116cba286c5f3aabc00f7ab53fdf0237f1da086ce41e4be667d3",
       "probe_domain_note": "BF16/FP16 sparse flash attention (4 required inputs -> 3 outputs); live_silicon_observed=SparseFlashAttention"
     },
     {
@@ -3469,7 +3689,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "aef8a3c6ec03446f2739f7be5a90613c07e4063ac9d217223a7325a8504324a5",
+      "probe_signature_sha256": "91826a621d20c71dbcaaf7090365f5a30738179902a5618e410e32521413cdf7",
       "probe_domain_note": "Paired with GenericBlockSparseAttentionMetadata AI_CPU builder; live_silicon_observed=GenericBlockSparseAttention"
     },
     {
@@ -3558,7 +3778,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "be393431141e7082b3bcdac19ed50f2ae5eb0490b2b31b0cf20e93a803d8b342",
+      "probe_signature_sha256": "7b9627f7264b603911e7327a2d12b8918ed97c57d7e3880150ce311fc9086bb2",
       "probe_domain_note": "BF16/FP16 dense-weight LightningIndexer across A2/A3/A5 (3 required inputs -> 2 outputs); live_silicon_observed=LightningIndexer"
     },
     {
@@ -3574,16 +3794,9 @@
         [
           "query:int8:ND:per_token_int8::fp16",
           "key:int8:ND:per_token_int8::fp16",
-          "weights:bf16:ND:dense::none",
+          "weights:fp16:ND:dense::none",
           "query_dequant_scale:fp16:ND:dense::none",
           "key_dequant_scale:fp16:ND:dense::none"
-        ],
-        [
-          "query:int8:ND:per_token_int8::fp32",
-          "key:int8:ND:per_token_int8::fp32",
-          "weights:bf16:ND:dense::none",
-          "query_dequant_scale:fp32:ND:dense::none",
-          "key_dequant_scale:fp32:ND:dense::none"
         ]
       ],
       "shape_constraints": {
@@ -3629,9 +3842,6 @@
       "allowed_output_tuples": [
         [
           "sparse_indices:int32:ND"
-        ],
-        [
-          "sparse_indices:int32:ND"
         ]
       ],
       "allowed_rank_placements": [
@@ -3649,8 +3859,8 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "75f33c0e1bb3ac786c0a79758039fa176a69fd6c870105c32fa7556af34775d1",
-      "probe_domain_note": "Usable on live A5 (FP8_E4M3/HiFloat8/INT8 joint tuples per DAV_3510 tiling.cpp:438-475) and A3 INT8 (5 required inputs); live_silicon_observed=QuantLightningIndexer"
+      "probe_signature_sha256": "01296ffdedc7bc13ab5e4f249645d23acec7ec6e8a6b6cedc5581e4b6c00b8d7",
+      "probe_domain_note": "Usable on live A5 (FP8_E4M3/HiFloat8/INT8 joint tuples per DAV_3510) and A2/A3 INT8+FP16 weights/scales (5 required inputs); live_silicon_observed=QuantLightningIndexer"
     },
     {
       "entry_id": "a3_cann_quant_lightning_indexer_v2",
@@ -3665,16 +3875,9 @@
         [
           "q:int8:ND:per_token_int8::fp16",
           "k:int8:ND:per_token_int8::fp16",
-          "w:bf16:ND:dense::none",
+          "w:fp16:ND:dense::none",
           "q_descale:fp16:ND:dense::none",
           "k_descale:fp16:ND:dense::none"
-        ],
-        [
-          "q:int8:ND:per_token_int8::fp32",
-          "k:int8:ND:per_token_int8::fp32",
-          "w:bf16:ND:dense::none",
-          "q_descale:fp32:ND:dense::none",
-          "k_descale:fp32:ND:dense::none"
         ]
       ],
       "shape_constraints": {
@@ -3713,18 +3916,14 @@
       "required_mechanism_id": "",
       "vllm_ascend_ref": "vllm_ascend/device/device_op.py:772",
       "op_plugin_ref": "",
-      "cann_check_params_ref": "ops-transformer/attention/quant_lightning_indexer_v2/op_api/aclnn_quant_lightning_indexer_v2.cpp:60",
+      "cann_check_params_ref": "ops-transformer/attention/quant_lightning_indexer_v2/op_host/quant_lightning_indexer_v2_def.cpp:85",
       "device_kernel_expansion": [
         "QuantLightningIndexerV2"
       ],
       "allowed_output_tuples": [
         [
           "sparse_indices:int32:ND",
-          "sparse_values:fp32:ND"
-        ],
-        [
-          "sparse_indices:int32:ND",
-          "sparse_values:fp32:ND"
+          "sparse_values:bf16:ND"
         ]
       ],
       "allowed_rank_placements": [
@@ -3742,8 +3941,8 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "d75be4a32cd64e01f37aa9406143368c275aaa9556f7f1e056ca242550985952",
-      "probe_domain_note": "Standard CANN QLI V2 (5 required inputs -> sparse_indices, sparse_values)"
+      "probe_signature_sha256": "160757f61264f5a0b0c7712567ef52a95a1776aec569dbfe4cb12227ce71f425",
+      "probe_domain_note": "Standard CANN QLI V2 (5 required inputs -> sparse_indices:int32, sparse_values:bf16; A5 FP32/FP16 weights, A2/A3 INT8+FP16)"
     },
     {
       "entry_id": "a3_cann_indexer_quant_cache",
@@ -3958,7 +4157,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "3fbcf96cf32ce8bdd6da1604f44b8b9a74d2c2b54cb5ffab73ef7e6288856663",
+      "probe_signature_sha256": "c3e6961a9a54e394e2cf6c3f9b62d9c1220659c3727d130e960e074bd279dd3c",
       "probe_domain_note": "CANN RingAttentionUpdate across A2/A3/A5 (6 required inputs -> 3 outputs)"
     },
     {
@@ -3976,16 +4175,8 @@
           "key:bf16:ND:dense::none",
           "value:bf16:ND:dense::none",
           "beta:bf16:ND:dense::none",
-          "initial_state:fp32:ND:dense::none",
-          "actual_seq_lengths:int64:ND:none::none"
-        ],
-        [
-          "query:fp16:ND:dense::none",
-          "key:fp16:ND:dense::none",
-          "value:fp16:ND:dense::none",
-          "beta:fp16:ND:dense::none",
-          "initial_state:fp32:ND:dense::none",
-          "actual_seq_lengths:int64:ND:none::none"
+          "initial_state:bf16:ND:dense::none",
+          "actual_seq_lengths:int32:ND:none::none"
         ]
       ],
       "shape_constraints": {
@@ -4024,20 +4215,14 @@
       "required_mechanism_id": "",
       "vllm_ascend_ref": "vllm_ascend/ops/gdn.py",
       "op_plugin_ref": "",
-      "cann_check_params_ref": "ops-transformer/attention/chunk_gated_delta_rule/op_host/op_api/aclnn_chunk_gated_delta_rule.h:51",
+      "cann_check_params_ref": "ops-transformer/attention/chunk_gated_delta_rule/op_host/chunk_gated_delta_rule_tiling.cpp:369",
       "device_kernel_expansion": [
-        "ChunkGatedDeltaRuleFwdPrepare",
-        "ChunkFwdH",
-        "ChunkFwdO"
+        "ChunkGatedDeltaRule"
       ],
       "allowed_output_tuples": [
         [
           "out:bf16:ND",
-          "final_state:fp32:ND"
-        ],
-        [
-          "out:fp16:ND",
-          "final_state:fp32:ND"
+          "final_state:bf16:ND"
         ]
       ],
       "allowed_rank_placements": [
@@ -4055,8 +4240,8 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "a8f9737a6000aba6861701feb4f0cebe02d7b03cdf01009cc08cb8abfad8f8f9",
-      "probe_domain_note": "Canonical CANN symbol backing Arch22/Arch35 chunk GDN strategies (6 required inputs -> 2 outputs); live_silicon_observed=ChunkFwdH,ChunkFwdO,ChunkGatedDeltaRuleFwdPrepare"
+      "probe_signature_sha256": "0ae7804791ea0e8c42a19eb9007e7a33a8d9ef2b0e35fa4ea150c27641ab2346",
+      "probe_domain_note": "Canonical CANN aclnnChunkGatedDeltaRule (BF16-only Q/K/V/beta/out, int32 actual_seq_lengths; FP32 state A5-only per tiling.cpp:369)"
     },
     {
       "entry_id": "a3_cann_recurrent_gdn",
@@ -4078,11 +4263,11 @@
           "ssm_state_indices:int32:ND:none::none"
         ],
         [
-          "query:fp16:ND:dense::none",
-          "key:fp16:ND:dense::none",
-          "value:fp16:ND:dense::none",
-          "beta:fp16:ND:dense::none",
-          "state:fp32:ND:dense::none",
+          "query:bf16:ND:dense::none",
+          "key:bf16:ND:dense::none",
+          "value:bf16:ND:dense::none",
+          "beta:bf16:ND:dense::none",
+          "state:bf16:ND:dense::none",
           "actual_seq_lengths:int32:ND:none::none",
           "ssm_state_indices:int32:ND:none::none"
         ]
@@ -4123,7 +4308,7 @@
       "required_mechanism_id": "",
       "vllm_ascend_ref": "vllm_ascend/ops/gdn.py",
       "op_plugin_ref": "",
-      "cann_check_params_ref": "ops-transformer/attention/recurrent_gated_delta_rule/op_host/recurrent_gated_delta_rule_tiling.cpp:1",
+      "cann_check_params_ref": "ops-transformer/attention/recurrent_gated_delta_rule/op_host/recurrent_gated_delta_rule_def.cpp:22",
       "device_kernel_expansion": [
         "RecurrentGatedDeltaRule"
       ],
@@ -4133,8 +4318,8 @@
           "state:fp32:ND"
         ],
         [
-          "out:fp16:ND",
-          "state:fp32:ND"
+          "out:bf16:ND",
+          "state:bf16:ND"
         ]
       ],
       "allowed_rank_placements": [
@@ -4152,8 +4337,8 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "3a850f5322e7f868f8a5f3c768decf0cce48cb28defb3fc2c367f2d59a3da15d",
-      "probe_domain_note": "Decode GDN CANN kernel (7 required inputs -> 2 outputs; live A3 & A5 verified); live_silicon_observed=RecurrentGatedDeltaRule"
+      "probe_signature_sha256": "62e5fcdf6061ed41090bd3e674928b3f015ad2668b737713dd576f61dccac613",
+      "probe_domain_note": "Decode GDN CANN kernel (BF16-only Q/K/V/beta/out, FP32/BF16 state; 7 required inputs -> 2 outputs); live_silicon_observed=RecurrentGatedDeltaRule"
     },
     {
       "entry_id": "a3_cann_text_gated_residual",
@@ -4320,7 +4505,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "7df01a88840f1bee3d7c3b6e96213d046198e0bce251733255ecf00bf510f4c2",
+      "probe_signature_sha256": "78006ab033edab058d571f8a7186c6a5d0662e607a624f233b9b88e50f44def1",
       "probe_domain_note": "Shipping CANN SwiGlu across A2/A3/A5 (live A3 & A5 verified); live_silicon_observed=SwiGlu"
     },
     {
@@ -4405,7 +4590,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "f219380b17ed3408b2c25922de7d3c18b11c9550da67999d9e749b7905c62205",
+      "probe_signature_sha256": "a5b7ae4ce80dc473bc9cf2ba2f70fc0677d7b08b030cee0543267e46432b25ae",
       "probe_domain_note": "Shipping CANN block-wise dynamic quant (live A3 & A5 verified); live_silicon_observed=DynamicBlockQuant"
     },
     {
@@ -4500,7 +4685,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "de12da1f493ed00a4be2fa3c9d781e0a048861b335c5d6fc001d1657f7dfb0b3",
+      "probe_signature_sha256": "044b3e609326cda00dfbead37694c00a523a548681c2b4ecd6a2749232ce7e8b",
       "probe_domain_note": "Shipping CANN unit-offset GemmaRmsNorm (2 required inputs -> y, rstd; live A3 & A5 verified); live_silicon_observed=GemmaRmsNorm"
     },
     {
@@ -4601,7 +4786,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "237e4961357cc950e306e31ef20eefb1adf370cb391c94dbf68bc74b204e28c6",
+      "probe_signature_sha256": "966dd5216722c3746e3a614cde1e60ef277a610e2f20c07adda1cc52dfdd0f5e",
       "probe_domain_note": "Fused MLA KV RMSNorm + RoPE + paged cache write (7 required inputs -> 4 required outputs); live_silicon_observed=KvRmsNormRopeCache"
     },
     {
@@ -4690,7 +4875,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "c46b3a3b2b2f2bc4e2b8575849124b8932061b91da9b5c23b046a74ca2eba659",
+      "probe_signature_sha256": "c36a97905992bbd79fd474d175504f8ed7bad72eaea4a3f4f15eaf711b7b01b3",
       "probe_domain_note": "Dense BF16/FP16 LightningIndexerV2 (3 required inputs -> 2 outputs; live A3 & A5 verified); live_silicon_observed=LightningIndexerV2"
     },
     {
@@ -4777,7 +4962,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "dff969a49fbbe9099451a23bd6027ca9d9b0ee3ce608b4e91bf56ce0a96205f2",
+      "probe_signature_sha256": "7f8ee1ba3439e7b6c87693a3cb1d12a74a63cae70d18c0638e554734a433d783",
       "probe_domain_note": "Shipping CANN CausalConv1d for GDN/KDA/Mamba (3 required inputs -> y; live A5 verified); live_silicon_observed=CausalConv1d"
     },
     {
@@ -4835,16 +5020,18 @@
       "required_mechanism_id": "",
       "vllm_ascend_ref": "",
       "op_plugin_ref": "op_plugin/ops/opapi/MoeTokenPermuteKernelNpuOpApi.cpp:1",
-      "cann_check_params_ref": "op_plugin/ops/opapi/MoeTokenPermuteKernelNpuOpApi.cpp:1",
+      "cann_check_params_ref": "ops-transformer/moe/moe_token_permute/op_host/moe_token_permute_def.cpp:37",
       "device_kernel_expansion": [
         "MoeTokenPermute"
       ],
       "allowed_output_tuples": [
         [
-          "y:bf16:ND"
+          "permute_tokens:bf16:ND",
+          "sorted_indices:int32:ND"
         ],
         [
-          "y:fp16:ND"
+          "permute_tokens:fp16:ND",
+          "sorted_indices:int32:ND"
         ]
       ],
       "allowed_rank_placements": [
@@ -4862,8 +5049,8 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "ae3d05dd7bf10c98a5a68fc8f81e4fbcd16ee8885bb4493ce2c8006a1773d3bc",
-      "probe_domain_note": "MoE token permute (live A3 verified); live_silicon_observed=MoeTokenPermute"
+      "probe_signature_sha256": "db93f9a1ed919abdc0497843eab6481ae1416f813620a446f9c9126a522ff78f",
+      "probe_domain_note": "MoE token permute (2 required outputs: permute_tokens, sorted_indices; live A3 verified); live_silicon_observed=MoeTokenPermute"
     },
     {
       "entry_id": "a3_cann_moe_token_unpermute",
@@ -4947,7 +5134,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "73f755078e13de637ac84ac2dc74cabdb4fde5fa0bbcd36acd4b6b98c2b40696",
+      "probe_signature_sha256": "74ff8790772fb6bba92bdf3931aee41454c90651a9233a71ad4d62adfa12d0b8",
       "probe_domain_note": "MoE token unpermute (live A3 verified); live_silicon_observed=MoeTokenUnpermute"
     },
     {
@@ -4966,15 +5153,7 @@
           "value:bf16:ND:dense::none",
           "beta:bf16:ND:dense::none",
           "initial_state:fp32:ND:dense::none",
-          "actual_seq_lengths:int64:ND:none::none"
-        ],
-        [
-          "query:fp16:ND:dense::none",
-          "key:fp16:ND:dense::none",
-          "value:fp16:ND:dense::none",
-          "beta:fp16:ND:dense::none",
-          "initial_state:fp32:ND:dense::none",
-          "actual_seq_lengths:int64:ND:none::none"
+          "actual_seq_lengths:int32:ND:none::none"
         ]
       ],
       "shape_constraints": {
@@ -5013,7 +5192,7 @@
       "required_mechanism_id": "",
       "vllm_ascend_ref": "",
       "op_plugin_ref": "op_plugin/ops/opapi/ChunkGatedDeltaRuleKernelNpuOpApi.cpp:1",
-      "cann_check_params_ref": "ops-transformer/experimental/attention/chunk_gated_delta_rule/op_host/chunk_gated_delta_rule_tiling.cpp:1",
+      "cann_check_params_ref": "ops-transformer/experimental/attention/chunk_gated_delta_rule/op_host/chunk_gated_delta_rule_def.cpp:22",
       "device_kernel_expansion": [
         "ChunkGatedDeltaRuleFwdPrepare",
         "ChunkFwdH",
@@ -5022,10 +5201,6 @@
       "allowed_output_tuples": [
         [
           "out:bf16:ND",
-          "final_state:fp32:ND"
-        ],
-        [
-          "out:fp16:ND",
           "final_state:fp32:ND"
         ]
       ],
@@ -5044,8 +5219,8 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "9e0d3e0d62e596213414842372e6d7a13276bee25bf659e42599fa8c7b581d89",
-      "probe_domain_note": "Arch-specialized chunk GDN strategy ABI binding (6 required inputs -> out, final_state); live_silicon_observed=ChunkFwdH,ChunkFwdO,ChunkGatedDeltaRuleFwdPrepare"
+      "probe_signature_sha256": "5468f43586ab50deb7888a4f8fdb12a4058ef4db19b7a1ee9a033f9547b0fd80",
+      "probe_domain_note": "Arch-specialized chunk GDN strategy ABI binding (BF16-only, int32 actual_seq_lengths; 6 required inputs -> out, final_state); live_silicon_observed=ChunkFwdH,ChunkFwdO,ChunkGatedDeltaRuleFwdPrepare"
     },
     {
       "entry_id": "a3_cann_chunk_gdn_fwd",
@@ -5063,15 +5238,7 @@
           "value:bf16:ND:dense::none",
           "beta:bf16:ND:dense::none",
           "initial_state:fp32:ND:dense::none",
-          "actual_seq_lengths:int64:ND:none::none"
-        ],
-        [
-          "query:fp16:ND:dense::none",
-          "key:fp16:ND:dense::none",
-          "value:fp16:ND:dense::none",
-          "beta:fp16:ND:dense::none",
-          "initial_state:fp32:ND:dense::none",
-          "actual_seq_lengths:int64:ND:none::none"
+          "actual_seq_lengths:int32:ND:none::none"
         ]
       ],
       "shape_constraints": {
@@ -5110,7 +5277,7 @@
       "required_mechanism_id": "",
       "vllm_ascend_ref": "",
       "op_plugin_ref": "op_plugin/ops/opapi/ChunkGatedDeltaRuleKernelNpuOpApi.cpp:1",
-      "cann_check_params_ref": "ops-transformer/experimental/attention/chunk_gated_delta_rule/op_host/chunk_gated_delta_rule_tiling.cpp:1",
+      "cann_check_params_ref": "ops-transformer/experimental/attention/chunk_gated_delta_rule/op_host/chunk_gated_delta_rule_def.cpp:22",
       "device_kernel_expansion": [
         "ChunkGatedDeltaRuleFwdPrepare",
         "ChunkFwdH",
@@ -5119,10 +5286,6 @@
       "allowed_output_tuples": [
         [
           "out:bf16:ND",
-          "final_state:fp32:ND"
-        ],
-        [
-          "out:fp16:ND",
           "final_state:fp32:ND"
         ]
       ],
@@ -5141,8 +5304,8 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "be38ae2547d1822008a9e1c59fd6cbf676fddd1f1483139a87c7bfecdbc4f2c1",
-      "probe_domain_note": "Ordered 3-kernel chunk GDN forward expansion (live A3 & A5); live_silicon_observed=ChunkFwdH,ChunkFwdO,ChunkGatedDeltaRuleFwdPrepare"
+      "probe_signature_sha256": "e233e8663be7f9e27b17cd3d32c69cba271ec56d3b0b11b4aca7b60fde64504d",
+      "probe_domain_note": "Ordered 3-kernel experimental chunk GDN forward expansion (BF16-only, int32 actual_seq_lengths; live A3 & A5); live_silicon_observed=ChunkFwdH,ChunkFwdO,ChunkGatedDeltaRuleFwdPrepare"
     },
     {
       "entry_id": "a3_cann_clamp",
@@ -5232,7 +5395,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "aa26a8566975036114f294b77d1824cd7594f739c1d7289ccbcdfbd753d6b632",
+      "probe_signature_sha256": "571fd2aa71e397a0ae0e217d293b6628e319801e5dc41151f3cbd677560ed523",
       "probe_domain_note": "Ordered 3-kernel non-contiguous slice clamp expansion (live A5 clipped_swiglu); live_silicon_observed=ClipByValueV2,Slice,ViewCopy"
     },
     {
@@ -5290,7 +5453,7 @@
       "required_mechanism_id": "",
       "vllm_ascend_ref": "",
       "op_plugin_ref": "op_plugin/ops/opapi/TransposeBatchMatMulKernelNpuOpApi.cpp:85",
-      "cann_check_params_ref": "op_plugin/ops/opapi/TransposeBatchMatMulKernelNpuOpApi.cpp:85",
+      "cann_check_params_ref": "ops-nn/matmul/transpose_batch_mat_mul/op_api/aclnn_transpose_batch_mat_mul.cpp:196",
       "device_kernel_expansion": [
         "Slice",
         "TransposeBatchMatMul"
@@ -5316,10 +5479,10 @@
         "draft",
         "target"
       ],
-      "allow_bias": true,
-      "require_no_bias": false,
-      "probe_signature_sha256": "30ab03e774a873140ab894dcaad85297703fdc4f387013c59dc166c26b414464",
-      "probe_domain_note": "Ordered 2-kernel non-contiguous Q-view TransposeBatchMatMul expansion (live A5); live_silicon_observed=Slice,TransposeBatchMatMul"
+      "allow_bias": false,
+      "require_no_bias": true,
+      "probe_signature_sha256": "c67ff55ed167c368d87621621ea7f7b22f1bb0dcf41cadf03e1b5c3382b4409c",
+      "probe_domain_note": "Ordered 2-kernel TransposeBatchMatMul expansion (bias & perm_y=[0,1,2] A5-only per aclnn_transpose_batch_mat_mul.cpp:215,364); live_silicon_observed=Slice,TransposeBatchMatMul"
     },
     {
       "entry_id": "a3_csrc_attn_res_fwd",
@@ -5402,7 +5565,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "2a27bbb275c3e92b3af87b676185e9f33ed6de6c56b55f848f1406726c091e01",
+      "probe_signature_sha256": "ddd361a4f0868d5aac4ad01427ce683918e3c855c1c2247c6e589c4e504c787a",
       "probe_domain_note": "AscendC AttnResFwd OpDef order across A2/A3/A5 (6 BF16 inputs -> 3 BF16 outputs); live_silicon_observed=AttnResFwd"
     },
     {
@@ -5521,7 +5684,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "2cec8c07134f1dc3f790aa6500f90932942c271657a133b3399a0e8bdf1b66cf",
+      "probe_signature_sha256": "3bd3020f4f818ae4916c15702c5788237433fa80bf964d79fdaef438d73f299d",
       "probe_domain_note": "Torch binding _C_ascend.attn_res_fwd callable order (optional addend & output_norm_weight); live_silicon_observed=AttnResFwd"
     },
     {
@@ -5603,7 +5766,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "94739c601f925ddb37da7ed0ba48b03ed61c28a94e82a7c834d0004b996bc441",
+      "probe_signature_sha256": "53dd3a699eb4a1b5e523587eaf1d4083a5bada62a34544eaf4c38da2ee99f94f",
       "probe_domain_note": "Fused mHC pre-mix (MIX_AIC) verified live on A3 and A5; 4 required inputs -> 3 required outputs; live_silicon_observed=HcPre"
     },
     {
@@ -5710,7 +5873,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "db8ce3317e91ec1a8d760136ea841b54aa523c54904db04d0f0762aa2c4ac3b8",
+      "probe_signature_sha256": "7b809425eac2e72c3ed06cb6875ecd9a0ccb8d8b31d46e38b027b2da08a65524",
       "probe_domain_note": "Fused mHC post-mix (AI_VECTOR_CORE); 4 required inputs (x, residual, post, comb) -> y; live_silicon_observed=HcPost"
     },
     {
@@ -5801,7 +5964,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "a749ddaefa7149dd04d7476f1354c398773b4ea8cd20fb1abc62fb9729529f19",
+      "probe_signature_sha256": "4b713202c63a5e84410cf2a670d1cbd16b8c78abdd9230855ed36f00ea14feda",
       "probe_domain_note": "Shipping vllm-ascend csrc AddRmsNormBias across A2/A3/A5 (3 required inputs -> 3 outputs); live_silicon_observed=AddRmsNormBias"
     },
     {
@@ -5880,7 +6043,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "6a4ff4b1eada84d3bac3ed133532a643fe607d55996bf54ad290230b425fcd92",
+      "probe_signature_sha256": "8a7fe5d59b42d0f2fb654e7b36f47f90c33ba54db511f5fe0f71942963b82c0a",
       "probe_domain_note": "Shipping vllm-ascend KvQuantSparseFlashAttentionVllm decode/prefill kernel; live_silicon_observed=KvQuantSparseFlashAttentionVllm"
     },
     {
@@ -5989,7 +6152,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "20de8772b9c9c2950638143af95f8c2d157735909436699d9fce0a5827414143",
+      "probe_signature_sha256": "9c935d6cb8d86af2112c1591d2edf625beb191a68fdf060a73097ea8f2aca2d2",
       "probe_domain_note": "Exact OpDef registration (sparse_flash_mla_def.cpp:24): DT_BF16 ONLY for q/ori_kv/cmp_kv/attn_out across A2/A3/A5; live_silicon_observed=SparseFlashMla"
     },
     {
@@ -6005,7 +6168,7 @@
         [
           "q:int8:ND:per_token_int8::fp16",
           "k:int8:ND:per_token_int8::fp16",
-          "w:bf16:ND:dense::none",
+          "w:fp16:ND:dense::none",
           "q_descale:fp16:ND:dense::none",
           "k_descale:fp16:ND:dense::none"
         ]
@@ -6071,7 +6234,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "066e0695deecb3150b88526092d659d3cf1ac7e584b2ad9d1944a5dad574337c",
+      "probe_signature_sha256": "3e973cf8603776c2df056b92db320584be7e766c11f662a7543a17ee9b0fd07b",
       "probe_domain_note": "Shipping A3 vllm-ascend csrc sharded QLI V2 (5 required inputs -> sparse_indices, sparse_values); live_silicon_observed=VllmAscendQuantLightningIndexerV2"
     },
     {
@@ -6176,7 +6339,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "98f4a530324fc4210bcd516e2de1adf39f36ebcb63d4b60369126817dfc3d11b",
+      "probe_signature_sha256": "6e6b4715b5c3646e23a32f25e5a1a711dd8a559c96fe3c13c8dc4b4f5396d2ab",
       "probe_domain_note": "A3 enable_fused_mc2=1 with active_mask (7 INT8 / 9 INT4 required inputs -> out, expert_token_nums); superseded by MegaMoE on A5"
     },
     {
@@ -6259,7 +6422,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "f63fbfdb2c58e3960e0607314d4435175cd52c59455b457dcc1a94143e104307",
+      "probe_signature_sha256": "cc2d04b14d2553dd4859a2284183db6aefb0c2b3305368d486efb6d2582c33f5",
       "probe_domain_note": "M10 HARD LEGALITY: KPool indexer requires DCP == 1 (indexer_kpool.py:789-792); live_silicon_observed=KeyPool"
     },
     {
@@ -6337,7 +6500,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "4dd9b3d33389c48a57ce7aca8e2b3fcdea57d75337d09e604c973f0a61ad9ba2",
+      "probe_signature_sha256": "a875da953960bc8b4e1246c6b8f4872374d41582c7bcf6ddee1a3497a81abcea",
       "probe_domain_note": "Block-max MSA indexer score verified live on A3 and A5; live_silicon_observed=MsaIndexScore"
     },
     {
@@ -6593,7 +6756,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "74b07eb526be9c1f5c37a05144b20baa9a280f4a8f80e87038cc2d4b89426c20",
+      "probe_signature_sha256": "43dd77436a1d285009dd05faf2a3e0de4e63a36dfe2d4b6a19e3f3cc8abf02ba",
       "probe_domain_note": "KDA decode recurrent kernel verified live on A3 and A5; live_silicon_observed=RecurrentKda"
     },
     {
@@ -6676,7 +6839,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "43195f8a96ac63369a005270694743cd359a42398614cd5a0ed916362b915dc4",
+      "probe_signature_sha256": "751c87262b4f37b159543fcea60005727ba7f58294ddbcb32f380c1f3622755d",
       "probe_domain_note": "Prefill KDA: 5 required inputs (q, k, v, g, beta) -> attn_out (ordered 3-kernel aclnnChunkKdaFwdV2 expansion); live_silicon_observed=ChunkFwdH,ChunkKdaFwdFinalize,ChunkKdaFwdPrepare"
     },
     {
@@ -6753,7 +6916,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "cab6f547d9a9089093e71dcc6301316aea66e2bda707d6a08b69d5932ebe0cf5",
+      "probe_signature_sha256": "4af2a24ca80d3ad86d100d26ac28ca8e55c143321887d3928bc8cbdd78013c26",
       "probe_domain_note": "AI_CPU metadata (~496 us on A3): returns 1024 int32 on A2/A3; live_silicon_observed=SparseFlashMlaMetadata"
     },
     {
@@ -6831,7 +6994,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "0395671ee8c398ccc1450a6f78e2652cf62cdd7dc6a595e0acc6fc8801a6cec6",
+      "probe_signature_sha256": "35208b9084e396babf93e824e317777adfbd090ccaf385b169c10f5e8a74bbda",
       "probe_domain_note": "AI_CPU metadata (~139-140 us A3; ~63 us dec / 710 us pre A5); live_silicon_observed=GenericBlockSparseAttentionMetadata"
     },
     {
@@ -6908,7 +7071,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "c390aee3f31fa4a5eca5a39f14b739c8ebaee23eb7d0d390285a6e11bcee5e5e",
+      "probe_signature_sha256": "3b39e0448b586e273f2801dfc669c90b80fb2d65d1dafdb7aa899410a3caab16",
       "probe_domain_note": "AI_CPU metadata (~105-162 us on A3); live_silicon_observed=VllmAscendQuantLightningIndexerV2Metadata"
     },
     {
@@ -6985,7 +7148,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "cba87d834831b0090a5af590237751fb5904dee73d8522abe0acb10747a95735",
+      "probe_signature_sha256": "dd9b77be371946937e38163592e5e5792e6869ad74b379ba2f53ca2313140379",
       "probe_domain_note": "AI_CPU metadata (~117 us on A3; live verified on A3 & A5); live_silicon_observed=LightningIndexerV2Metadata"
     },
     {
@@ -7044,7 +7207,13 @@
       "op_plugin_ref": "",
       "cann_check_params_ref": "",
       "device_kernel_expansion": [
-        "chunk_kda"
+        "chunk_local_cumsum_vector_kernel",
+        "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter",
+        "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra",
+        "merge_16x16_to_64x64_inverse_kernel_kda",
+        "recompute_w_u_fwd_kernel",
+        "chunk_gated_delta_rule_fwd_kernel_h_blockdim64_kda",
+        "chunk_gla_fwd_kernel_o"
       ],
       "allowed_output_tuples": [
         [
@@ -7067,8 +7236,8 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "3dabd4d598a2a4db8af6fc04ef04715af6acf9521111b4a4e64e7576af2f974f",
-      "probe_domain_note": "Triton KDA chunk kernel"
+      "probe_signature_sha256": "6cd4c87121b02bd97d4c4a3de75f4877eb47b41c2cebcd3a5b0c41deaccb68a7",
+      "probe_domain_note": "Triton KDA chunk 7-kernel ordered launch chain"
     },
     {
       "entry_id": "a3_triton_kda_recoverssm_verify",
@@ -7149,7 +7318,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "49408708f2cec1010f612a5504992704a0db666a1d7aa586e1be542dab7f4ba9",
+      "probe_signature_sha256": "7bdbb050e9cd939cdc2cfb127f8f24d6b5bd0dabcdf19b99da42cf1cec674d31",
       "probe_domain_note": "KDA RecoverSSM verify/commit kernel (live A5 verified)"
     },
     {
@@ -7230,7 +7399,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "8f33b216387048f1fe91de21c8ad4eaf1aa22ccb7aa1ac9564acdefec79b9df0",
+      "probe_signature_sha256": "b375702316516ee74243fcadf4a9fb199d0eb2fcd29ea74d48d748b7383fd5b8",
       "probe_domain_note": "RecoverSSM commit plan preparation kernel"
     },
     {
@@ -7309,7 +7478,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "214acaef927aefe28f4c64d340930d99dbc7701c0e56d49218d2c61535b084cf",
+      "probe_signature_sha256": "a2a6dbc5f511b7cb7103600dcb7fd190578507d90668b75f9aa2f01f9ef43bdf",
       "probe_domain_note": "GDN RecoverSSM state commit kernel"
     },
     {
@@ -7391,7 +7560,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "9709a4cd073f0672956ab58ab8e75f708e2064290ce2fd6414168200411e15c2",
+      "probe_signature_sha256": "30c61512ba950498741863b6ad225ffb4d0f853a9d16ae9ece3690fd83f543b2",
       "probe_domain_note": "GDN RecoverSSM verify kernel"
     },
     {
@@ -7474,7 +7643,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "803b81df2985ad55191f01dcd9b16cb426a97d2bf779096b84b00ae7e6480279",
+      "probe_signature_sha256": "444849306d730d55276916e9843412ab67debdcdac381b53117736bad847052a",
       "probe_domain_note": "Fused QK-norm + RoPE + cache store Triton kernel (live A3 & A5); live_silicon_observed=_minimax_qknorm_rope_cache_kernel"
     },
     {
@@ -7718,7 +7887,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "5b6597874cc22b558b161a2543417177df611776ba076060de6c2f9328c79750",
+      "probe_signature_sha256": "2fbb9c3604aa17553885660f150dcac3b4bb20f17d683c9972262fecf205eb62",
       "probe_domain_note": "Shipping Triton low-rank HC combine+norm kernel (live A3 & A5); live_silicon_observed=_hc_combine_norm_kernel"
     },
     {
@@ -7803,7 +7972,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "eba8aacda8c03660d5f06cadb7c423b60636a8e3d3c892edfc5f8039aa5ff40b",
+      "probe_signature_sha256": "89371d215c893f6b1a93c96142fd760ada2da0ffff5569bd7230cd4aa50df4b6",
       "probe_domain_note": "Shipping Triton low-rank HC gate-mix kernel (live A3 & A5); live_silicon_observed=_hc_gate_mix_kernel"
     },
     {
@@ -7882,7 +8051,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "5416a65d8e92bc95d3ce34ec22fe4c24c1d91cc41badaa49646d8d425bb6aa39",
+      "probe_signature_sha256": "f7e2c78aee061d0eb680c35c38dba080a7d247e2416ecb068fd222a4f6b2d011",
       "probe_domain_note": "Sharded DCP sort input prep Triton kernel (sharded_indexer.py:439 allocates FP32 values); live_silicon_observed=_prepare_local_sort_inputs"
     },
     {
@@ -7962,7 +8131,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "3e2b0c671a1e6e7533bccdcb4c31378f5decf7ea8241ff4dbdb626246222b953",
+      "probe_signature_sha256": "90c25177f0a933c08de9ad7b11ade32cf83c67d2ba4d6fae2b71e9fb68964e20",
       "probe_domain_note": "Shipping Triton sharded indexer candidate normalizer kernel (live A3 & A5); live_silicon_observed=_normalize_dcp_candidates"
     },
     {
@@ -8040,7 +8209,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "9d44f006cdcb0fab05c8110ac1d93949db35065d19a2e396c6a8929358172363",
+      "probe_signature_sha256": "602e0dde4f3ec51e382f438c61e21cec7c19b9e0d385da0e760dc0726fedb2ff",
       "probe_domain_note": "Shipping Triton sharded indexer pre-AllGather pack kernel (live A3 & A5); live_silicon_observed=_pack_candidates"
     },
     {
@@ -8117,7 +8286,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "e0e536127a33abc9d291d60e02e0635723cf3df9e07dc351627594dd53890c79",
+      "probe_signature_sha256": "6cd660e432f293632c6d30f2e1faaffb738a432ee3324d98be6708f1e1177a46",
       "probe_domain_note": "Replicated DCP index remap kernel (live A3 & A5); live_silicon_observed=_remap_sort"
     },
     {
@@ -8202,7 +8371,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "7c3fb11c31093a336f408b444002d0a3ca370314d9c076b5a1283ae6360a1b85",
+      "probe_signature_sha256": "1dd8fdb30066d3b1d7ae44645afc6701883d98e465e62586869dc6395dc980ee",
       "probe_domain_note": "DCP Q gather head-major pack kernel (live A3 & A5); live_silicon_observed=_q_gather_prep_head_major_kernel"
     },
     {
@@ -8287,7 +8456,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "0b23037878bce7ad0f29702e71cf219dfb0be5530b8a3e7e5a792ac4b4ecd8b2",
+      "probe_signature_sha256": "f284e39b21e807b6fcc6ff95cecf9b88105693e0940ab0c097380b8477f3f0c5",
       "probe_domain_note": "Generic DCP output+LSE pack kernel (live A3 & A5); live_silicon_observed=_pack_dcp_output_lse_kernel"
     },
     {
@@ -8374,7 +8543,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "a46f77a1d169aee028f669ad81af3432fc121b92239ecea0731a7f33072b657b",
+      "probe_signature_sha256": "58bd527b6f6bfcfab3fcd1157e9b35bdd609bb202f6b16184ce01493a1d69dc3",
       "probe_domain_note": "Generic DCP LSE combine kernel (live A3 & A5); live_silicon_observed=_fused_dcp_lse_combine_kernel"
     },
     {
@@ -8388,7 +8557,7 @@
       "role": "dcp_exchange",
       "dtype_tuple": [
         [
-          "output_words:bf16:ND:dense::none",
+          "output_words:int32:ND:none::none",
           "lse:fp32:ND:dense::none"
         ]
       ],
@@ -8434,7 +8603,7 @@
       ],
       "allowed_output_tuples": [
         [
-          "send:bf16:ND"
+          "send:int32:ND"
         ]
       ],
       "allowed_rank_placements": [
@@ -8452,8 +8621,8 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "c39aa6e57ee7a066d8e9281e62c716c9b8d47c4d756bad7dd73f7a2fa2d56b01",
-      "probe_domain_note": "Fast pow2-head BF16 SFA DCP pack kernel (live A3 & A5); live_silicon_observed=_pack_token_peer"
+      "probe_signature_sha256": "43fce7ce2f318b05e5027e1326f3fd84938fca4a5356c337b9e5071a30551ac3",
+      "probe_domain_note": "Fast pow2-head SFA DCP pack kernel (int32 word-viewed output_words & send per sfa_dcp_exchange.py:197); live_silicon_observed=_pack_token_peer"
     },
     {
       "entry_id": "a3_triton_flash_attention_gate",
@@ -8537,7 +8706,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "0eecc667fae0ae42b58ed5bdc44bd6910a1339d76a6808d4f201ce95ce17cf9a",
+      "probe_signature_sha256": "b95d582038e3644bf1b36ea5c1313ca8def7c85e510a80b4a4aab51a780c0161",
       "probe_domain_note": "MLA output gate Triton kernel (live A3 & A5); live_silicon_observed=_flash_attention_gate_kernel"
     },
     {
@@ -8630,7 +8799,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "9a8d71f0935dd0adfe388c9a107c67c8a31705d888962b3cc8b8e018cf5013d8",
+      "probe_signature_sha256": "6c8f352eb4f5ccb43b84e6b0d772946a36686abeec9a4f3f1e540d53144bce46",
       "probe_domain_note": "C2 Triton KV compressor pooling kernel (live A3 & A5 verified; compressor_triton.py:218-255); live_silicon_observed=_pool_kernel"
     },
     {
@@ -8710,7 +8879,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "e2123be71bb47a1a1bf4e15e5f433ea2e85fcb1fe7045a8c0833260f38ea0a27",
+      "probe_signature_sha256": "465a0a51efb6d13f3e7af68b40569cfcfc4b480462ac7ea62fdd1a65d4fcd08a",
       "probe_domain_note": "C2 Triton KV compressor ring-cache tail update kernel (live A3 & A5 verified); live_silicon_observed=_cache_update_kernel"
     },
     {
@@ -8791,7 +8960,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "19d8183ad86dfc7f6853dbc3488899d75e3ea9e6bc26ce0d7f77a9faf7a76f0f",
+      "probe_signature_sha256": "a907200b009249907c6a942baed580a5ec65e984a9114f1269a26d0c192a1538",
       "probe_domain_note": "GDN delta gating Triton kernel (live A3 & A5); live_silicon_observed=fused_gdn_gating_kernel"
     },
     {
@@ -8880,7 +9049,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "80e8703e9dfdc10cb6abc2ef2aa9844d51a3dd737ff228395c959d93c6c97320",
+      "probe_signature_sha256": "67462d89898aa9be44ce1417d2625b5576a0559f6be9d24ec7e093e1c4102197",
       "probe_domain_note": "Recurrent Q/K L2Norm Triton kernel (live A3 & A5); live_silicon_observed=l2norm_fwd_kernel2"
     },
     {
@@ -8967,7 +9136,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "4247afcc4fd82f5d27614af735eb5828103f55bc22708230e615d41e18cec9e5",
+      "probe_signature_sha256": "5e77e4c9aee7a9780acc34b3b6c468f81d123cfd82c70daf2301ac1251c768aa",
       "probe_domain_note": "Gated RMSNorm Triton kernel for KDA/GDN (live A3 & A5); live_silicon_observed=layer_norm_gated_fwd_kernel"
     },
     {
@@ -9054,7 +9223,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "65977eae5b9ec1be4385b0ff643d64e1497ef6cb82728203707196e841924337",
+      "probe_signature_sha256": "4f79b01dce037d7c93c32e989232431738671fae586984a37fdcdf5e6775e8ba",
       "probe_domain_note": "Shipping Triton RoPE kernels (live A3 & A5); live_silicon_observed=_triton_rope_siso"
     },
     {
@@ -9141,7 +9310,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "fc849f9e925de43f249809d8b844032558ff8070f362e9ecae3c08893cc29006",
+      "probe_signature_sha256": "9a2871c54344a0e4ace9a93168834d51d3cf185e52010070d2e42aea62c7679c",
       "probe_domain_note": "Mamba2 Triton initial-state gather kernel (live A3 & A5); live_silicon_observed=_gather_initial_states_kernel"
     },
     {
@@ -9228,7 +9397,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "622c381a9b470cca1df598e903a2c2391ec8d5f3f356c6ce32ce29ec481d8346",
+      "probe_signature_sha256": "3b8673207415d311b2457d65822819679a44ce99bbf583de8978ea5616696f6b",
       "probe_domain_note": "QSA fused RMSNorm + MRoPE Triton kernel (live A3 & A5); live_silicon_observed=_qsa_rmsnorm_mrope_kernel"
     },
     {
@@ -9308,7 +9477,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "9d69dc3c2d7f90ed6257f8e931ee302c7ad22c96af708d79eda8c27fe091cb36",
+      "probe_signature_sha256": "303c076624dd67c257412e9d1092fbda385b81f950f4e41d7661e6b5656aca45",
       "probe_domain_note": "QSA group compression Triton kernel (live A3 & A5); live_silicon_observed=_compress_qsa_groups_kernel"
     },
     {
@@ -9386,7 +9555,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "b98a56e77488eb24a2c85534b6e6784d806a2cf54ed2c77efb5676dd63558e02",
+      "probe_signature_sha256": "9c91ae826373db6c16aa29d98a74e060e3d20090ee4540008eddc3f41e445bce",
       "probe_domain_note": "QSA compressed row scatter Triton kernel (live A3 & A5); live_silicon_observed=_store_qsa_rows_kernel"
     },
     {
@@ -9464,7 +9633,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "0dad1fd268b5d27220009af271ebcffbba98f3cd91f5014cf16e2acc1be4997d",
+      "probe_signature_sha256": "ec4221fe73f0d0ebbde566ed3638944b17b978927981d0f2897a1410d34549ce",
       "probe_domain_note": "QSA group index packing Triton kernel (live A3 & A5); live_silicon_observed=_pack_qsa_group_indices_kernel"
     },
     {
@@ -9546,7 +9715,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "82c1b18d0d94edb09c9df9fe2599ef930b7dcfc591a5ca8e936f2005d9cfafcb",
+      "probe_signature_sha256": "d73fd3b5b6a22f926d792cf6ed3619f4fceb680a80432a598641b0a9314ae656",
       "probe_domain_note": "KPool metadata prep Triton kernel (live A3 & A5; DCP==1); live_silicon_observed=_build_keypool_metadata_kernel"
     },
     {
@@ -9624,7 +9793,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "66d23993861102f446612a17239166f48d184b98e9c525ec2b056866269cf4a4",
+      "probe_signature_sha256": "b477b7ac5959bf1f968df347fcebe799ad64b231c2f70f067c0e8ed9da467c0d",
       "probe_domain_note": "KPool cache write Triton kernel (live A3 & A5; DCP==1); live_silicon_observed=_write_keypool_caches_kernel"
     },
     {
@@ -9702,7 +9871,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "91008b38076b35a031c230870aa38999cf8e3cdf856c12e2e03a7074b0a1ca75",
+      "probe_signature_sha256": "ce8fb3cadc6908121a32a255782b319f6cf523a053a9187c8f977bbc95bcc3df",
       "probe_domain_note": "KPool nonempty-input compaction Triton kernel (live A3 & A5; DCP==1); live_silicon_observed=_prepare_nonempty_keypool_inputs_kernel"
     },
     {
@@ -9782,7 +9951,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "76624c62001d5b9951dc6fbf97acd1d9d2778aadaa44195331f0d210f2c1f8af",
+      "probe_signature_sha256": "a163048a32b8220c3fb2e11439b7fe630c059a4df1937de092781bbbc05afc6a",
       "probe_domain_note": "Per-Layer Embedding causal conv Triton kernel (live A3 & A5)"
     },
     {
@@ -9862,7 +10031,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "971a3ff680590bb55831a2141e1576ce74e8b63cc2080ff7d89ff4e8231a32f6",
+      "probe_signature_sha256": "5bf2840a96b83187dd36388de1e06a971013c1bc47e4d249c47ab8146558bbf3",
       "probe_domain_note": "Per-Layer Embedding conv state writeback Triton kernel (live A3 & A5)"
     },
     {
@@ -9944,7 +10113,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "36133d54f51f3b8beab869207f09198486af0aa7f1ff429363250b8133c87cf2",
+      "probe_signature_sha256": "7f7969a0206af0837f89ad75c2498537aff5515cbeba114d68dad32996844954",
       "probe_domain_note": "Split QKV + RMSNorm + MRoPE Triton kernel (live A3); live_silicon_observed=split_qkv_rmsnorm_mrope_kernel"
     },
     {
@@ -10029,7 +10198,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "84dbe5b80aa445c25f0ad32acbd01e411a23e7aaa14958070157bc0c044178a0",
+      "probe_signature_sha256": "90478952ce68173fc6730264771b0bd89863dd3bbf63af6a75bd38effd3a81a6",
       "probe_domain_note": "Batched DCP output+LSE pack Triton kernel (live A3); live_silicon_observed=_pack_dcp_output_lse_batched_kernel"
     },
     {
@@ -10108,7 +10277,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "0698fbbf87329c6bd4295a68424b26a81b961f3b4902086772009254be8b8eb9",
+      "probe_signature_sha256": "452aa93342ea73517df8800499428acb5e043edf7d944580e46e7f5878e0a93b",
       "probe_domain_note": "Engram INT8 gather+dequant Triton kernel (live A3); live_silicon_observed=_engram_int8_gather_dequant_kernel"
     },
     {
@@ -10187,7 +10356,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "933e513d1804cc3749c4ad11bb37dfa0548661a43f4c247bd44a554a370e621c",
+      "probe_signature_sha256": "deb27047eff86b5b9998de42c9ed47e4d241b852f94cb1d6941316a3f859e001",
       "probe_domain_note": "PCP KV cache copy Triton kernel (live A5)"
     },
     {
@@ -10274,7 +10443,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "09d02df61a9d124b09072cb6451ca5a55c1a68103eeeb227499f8783383cce39",
+      "probe_signature_sha256": "151f430e639b32bd67367c4160d812f7a8a3cd875d2567d3c5df8c8c17bf77ae",
       "probe_domain_note": "PyTorch torch_npu op-plugin dispatch (exact upstream signature); live_silicon_observed=RmsNorm"
     },
     {
@@ -10365,7 +10534,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "0417081d6e7d2ed82d7f6f270cd1de6a6ead4c2a0613ea44c1008ee53c024bdf",
+      "probe_signature_sha256": "ddf36cf5939a56f81c6e637e689df6a96abb3b1017e8bbeef7826a1375df426a",
       "probe_domain_note": "PyTorch torch_npu op-plugin dispatch (exact upstream signature); live_silicon_observed=AddRmsNorm"
     },
     {
@@ -10452,7 +10621,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "2d6e2349527318fec4e621cacb5869ba28b86560e1269e8494f7c8dedc42b793",
+      "probe_signature_sha256": "fe6174731b34ac68c17f84f85de508952f588ffe36031b9143584076b59b8dd9",
       "probe_domain_note": "PyTorch torch_npu op-plugin dispatch (exact upstream signature)"
     },
     {
@@ -10537,7 +10706,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "f340d19d978e03de3a87a515c62d481b7aa5233afd2ccfa8ba3b01fac41970d5",
+      "probe_signature_sha256": "f2811709deed3278eb9db3ddfeb3b24ef2586fef86b4144a64d9a88f35a3a1de",
       "probe_domain_note": "PyTorch torch_npu op-plugin dispatch (exact upstream signature)"
     },
     {
@@ -10620,9 +10789,9 @@
         "draft",
         "target"
       ],
-      "allow_bias": true,
-      "require_no_bias": false,
-      "probe_signature_sha256": "40e2b89e6b61b232c1d7337371764de65c4c84066d8dc84a3fb4879041a7ea50",
+      "allow_bias": false,
+      "require_no_bias": true,
+      "probe_signature_sha256": "7bbe6080f82a946e0881f57efed2121bc318deff751da4fab3c7d6ab0d66729b",
       "probe_domain_note": "PyTorch torch_npu op-plugin dispatch (exact upstream signature); live_silicon_observed=TransposeBatchMatMul"
     },
     {
@@ -10679,7 +10848,8 @@
           0,
           0
         ],
-        "max_shared_experts_per_rank": -1
+        "max_shared_experts_per_rank": -1,
+        "max_experts": 2048
       },
       "source_ref": {
         "repository": "Ascend/op-plugin",
@@ -10744,7 +10914,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "7e521e40ab30e0b23f4ab47a64e38571f8f3d54ad963a42af6fffa4de841fb57",
+      "probe_signature_sha256": "269a60e0226e4aaab4b5b3529c38b054055c57e40e0c166ceed230752fcba5cf",
       "probe_domain_note": "PyTorch torch_npu op-plugin dispatch (exact upstream signature); live_silicon_observed=MoeGatingTopK"
     },
     {
@@ -10835,7 +11005,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "404fb87167dd2be9f1d37da586885082181d97334ea1366da365bb5c209161cd",
+      "probe_signature_sha256": "e7370f6c9fdec14524068f8088e1ddbaf969a0f52f304e4e61eced2860b9e4a2",
       "probe_domain_note": "PyTorch torch_npu op-plugin dispatch (exact upstream signature); live_silicon_observed=MoeInitRoutingV3"
     },
     {
@@ -10940,8 +11110,122 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "6f4a26e59c70df73c4627621ec25de8b1491f8c644ae0fc3a2ba2236459fb1be",
+      "probe_signature_sha256": "08e5aeaca04d094a899fcb735ece26473cbfd6599c74a8c261ae8dd4f4b4f065",
       "probe_domain_note": "PyTorch torch_npu op-plugin dispatch (exact upstream signature)"
+    },
+    {
+      "entry_id": "a3_torch_npu_npu_grouped_matmul",
+      "abi_id": "torch_npu.npu_grouped_matmul",
+      "available_on_device": true,
+      "backend_kind": "torch_npu",
+      "symbol_or_kernel": "torch_npu.npu_grouped_matmul",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "moe_grouped_matmul",
+      "dtype_tuple": [
+        [
+          "x:bf16:ND:dense::none",
+          "w:bf16:FRACTAL_NZ:dense::none"
+        ],
+        [
+          "x:fp16:ND:dense::none",
+          "w:fp16:FRACTAL_NZ:dense::none"
+        ],
+        [
+          "x:bf16:ND:dense::none",
+          "w:bf16:ND:dense::none"
+        ],
+        [
+          "x:fp16:ND:dense::none",
+          "w:fp16:ND:dense::none"
+        ],
+        [
+          "x:int8:ND:per_token_int8::fp32",
+          "w:int8:FRACTAL_NZ:per_channel_int8::fp32"
+        ],
+        [
+          "x:int8:ND:per_token_int8::fp32",
+          "w:int4:FRACTAL_NZ:w4a8_int::fp32"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 0,
+        "n_max_inclusive": 0,
+        "require_even_n": false,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
+        ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1,
+        "max_experts": 1024
+      },
+      "source_ref": {
+        "repository": "Ascend/op-plugin",
+        "revision": "48189acf95882e23fae56ea96ceeb89358cb42da",
+        "relative_path": "op_plugin/ops/opapi/GroupedMatmulKernelNpuOpApi.cpp",
+        "source_sha256": "a58dd51addfa3511735fcf1f46355a4597f62920cc5d24edc335b59610128fdc"
+      },
+      "graph_motif": "npu_grouped_matmul",
+      "vllm_ascend_track": "merged",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "",
+      "vllm_ascend_ref": "",
+      "op_plugin_ref": "op_plugin/ops/opapi/GroupedMatmulKernelNpuOpApi.cpp:1",
+      "cann_check_params_ref": "",
+      "device_kernel_expansion": [
+        "GroupedMatmul"
+      ],
+      "allowed_output_tuples": [
+        [
+          "y:bf16:ND"
+        ],
+        [
+          "y:fp16:ND"
+        ],
+        [
+          "y:bf16:ND"
+        ],
+        [
+          "y:fp16:ND"
+        ],
+        [
+          "y:bf16:ND"
+        ],
+        [
+          "y:bf16:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "none"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "0644fe017c7565e3271b8ced3560311e26b0e2d0f5efc753042051b9c88216e6",
+      "probe_domain_note": "PyTorch torch_npu op-plugin dispatch (exact upstream signature); live_silicon_observed=GroupedMatmul"
     },
     {
       "entry_id": "a3_catlass_grouped_gemm_bf16",
@@ -11018,7 +11302,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "4ab54c010abc0560bf69005ffde19a8dee032b8c96909ae386466bba40481012",
+      "probe_signature_sha256": "5fba330fe786beecb265c540d93833b3c4a12490d60aca19a5e33e2fde5259bc",
       "probe_domain_note": "CATLASS Ascend template (A2/A3 UB=192KiB, A5 UB=248KiB)"
     },
     {
@@ -11026,14 +11310,16 @@
       "abi_id": "catlass_epilogue_dual_level_quant_mx",
       "available_on_device": false,
       "backend_kind": "catlass",
-      "symbol_or_kernel": "catlass::epilogue::BlockEpilogueDualLevelQuantMx",
+      "symbol_or_kernel": "Catlass::Epilogue::Block::BlockQuantDualLevelMx",
       "device_arch": "A3",
       "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
-      "role": "catlass_template",
+      "role": "catlass_epilogue",
       "dtype_tuple": [
         [
-          "x1:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0",
-          "x2:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0"
+          "x:bf16:ND:dense::none"
+        ],
+        [
+          "x:fp16:ND:dense::none"
         ]
       ],
       "shape_constraints": {
@@ -11076,8 +11362,14 @@
       "device_kernel_expansion": [],
       "allowed_output_tuples": [
         [
-          "y:fp8_e4m3fn:ND",
-          "scale:fp8_e8m0:ND"
+          "y:fp4_e2m1:ND:mx_fp4:32:fp8_e8m0",
+          "scale1:fp32:ND",
+          "scale2:fp8_e8m0:ND"
+        ],
+        [
+          "y:fp4_e2m1:ND:mx_fp4:32:fp8_e8m0",
+          "scale1:fp32:ND",
+          "scale2:fp8_e8m0:ND"
         ]
       ],
       "allowed_rank_placements": [
@@ -11096,7 +11388,7 @@
       "allow_bias": true,
       "require_no_bias": false,
       "probe_signature_sha256": "",
-      "probe_domain_note": "A5 L0C->Fixpipe->UB MX epilogue template (arch35 only)"
+      "probe_domain_note": "A5 BlockQuantDualLevelMx dual-level MXFP4 epilogue (1 BF16/FP16 tile -> fp4_e2m1 + fp32 scale1 + fp8_e8m0 scale2)"
     },
     {
       "entry_id": "a3_wheel_fla_npu_chunk_kda",
@@ -11176,7 +11468,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "c14e05d5518e3b2f003fcae98c9e63c0e4644e688129922db6954d5e9b69184d",
+      "probe_signature_sha256": "ec4df52e394e1c690078ca7e712eba6c666b07507523532fd62d7d659de058ff",
       "probe_domain_note": "Third-party fla_npu_stable wheel verified live on A3 and A5; live_silicon_observed=ChunkFwdH,ChunkKdaFwdFinalize,ChunkKdaFwdPrepare"
     },
     {
@@ -11254,6 +11546,1756 @@
       "require_no_bias": false,
       "probe_signature_sha256": "",
       "probe_domain_note": "External Python wheel not installed in baseline container image (missing Python package)"
+    },
+    {
+      "entry_id": "a3_cann_mixed_quant_sparse_flash_mla",
+      "abi_id": "aclnnMixedQuantSparseFlashMla",
+      "available_on_device": true,
+      "backend_kind": "cann_aclnn",
+      "symbol_or_kernel": "aclnnMixedQuantSparseFlashMla",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "attention",
+      "dtype_tuple": [
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:int8:ND:int8_csa_608:64:bf16",
+          "cmp_kv:int8:ND:int8_csa_608:64:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "cu_seqlens_ori_kv:int32:ND:none::none",
+          "cu_seqlens_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:int8:ND:int8_csa_608:64:bf16",
+          "cmp_kv:int8:ND:int8_csa_608:64:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "cu_seqlens_ori_kv:int32:ND:none::none",
+          "cu_seqlens_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:bf16:PA_BBND:tq4_ori::none",
+          "cmp_kv:uint8:PA_BBND:tq4_cmp::none",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:bf16:PA_BBND:tq4_ori::none",
+          "cmp_kv:uint8:PA_BBND:tq4_cmp::none",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:fp16:ND:dense::none",
+          "ori_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:fp16:ND:dense::none",
+          "ori_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:fp16:ND:dense::none",
+          "ori_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:fp16:ND:dense::none",
+          "ori_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_kv:int8:PA_BBND:int8_csa_608:64:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:fp16:ND:dense::none",
+          "ori_kv:int8:ND:int8_csa_608:64:bf16",
+          "cmp_kv:int8:ND:int8_csa_608:64:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "cu_seqlens_ori_kv:int32:ND:none::none",
+          "cu_seqlens_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:fp16:ND:dense::none",
+          "ori_kv:int8:ND:int8_csa_608:64:bf16",
+          "cmp_kv:int8:ND:int8_csa_608:64:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "cu_seqlens_ori_kv:int32:ND:none::none",
+          "cu_seqlens_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:fp16:ND:dense::none",
+          "ori_kv:fp16:PA_BBND:tq4_ori::none",
+          "cmp_kv:uint8:PA_BBND:tq4_cmp::none",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:fp16:ND:dense::none",
+          "ori_kv:fp16:PA_BBND:tq4_ori::none",
+          "cmp_kv:uint8:PA_BBND:tq4_cmp::none",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 0,
+        "n_max_inclusive": 0,
+        "require_even_n": false,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
+        ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1,
+        "head_dim_allowed_set": [
+          512
+        ],
+        "rope_dim_allowed_set": [
+          64
+        ],
+        "kv_heads_allowed_set": [
+          1
+        ]
+      },
+      "source_ref": {
+        "repository": "cann/ops-transformer",
+        "revision": "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "relative_path": "attention/mixed_quant_sparse_flash_mla/op_host/mixed_quant_sparse_flash_mla_def.cpp",
+        "source_sha256": "01fed3ba65503363284a3a49579529a6dd21eaf42938a542008bccc536750c49"
+      },
+      "graph_motif": "mixed_quant_sparse_flash_mla",
+      "vllm_ascend_track": "merged",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "",
+      "vllm_ascend_ref": "",
+      "op_plugin_ref": "",
+      "cann_check_params_ref": "ops-transformer/attention/mixed_quant_sparse_flash_mla/op_host/checkers/mixed_quant_variant_checker.cpp:37",
+      "device_kernel_expansion": [
+        "MixedQuantSparseFlashMla"
+      ],
+      "allowed_output_tuples": [
+        [
+          "attn_out:bf16:ND"
+        ],
+        [
+          "attn_out:bf16:ND",
+          "softmax_lse:fp32:ND"
+        ],
+        [
+          "attn_out:bf16:ND"
+        ],
+        [
+          "attn_out:bf16:ND",
+          "softmax_lse:fp32:ND"
+        ],
+        [
+          "attn_out:bf16:ND"
+        ],
+        [
+          "attn_out:bf16:ND",
+          "softmax_lse:fp32:ND"
+        ],
+        [
+          "attn_out:bf16:ND"
+        ],
+        [
+          "attn_out:bf16:ND",
+          "softmax_lse:fp32:ND"
+        ],
+        [
+          "attn_out:fp16:ND"
+        ],
+        [
+          "attn_out:fp16:ND",
+          "softmax_lse:fp32:ND"
+        ],
+        [
+          "attn_out:fp16:ND"
+        ],
+        [
+          "attn_out:fp16:ND",
+          "softmax_lse:fp32:ND"
+        ],
+        [
+          "attn_out:fp16:ND"
+        ],
+        [
+          "attn_out:fp16:ND",
+          "softmax_lse:fp32:ND"
+        ],
+        [
+          "attn_out:fp16:ND"
+        ],
+        [
+          "attn_out:fp16:ND",
+          "softmax_lse:fp32:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "none"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "3be3afdc402f9809d2461ed3990b491e04cc62e2ccbd6b85f8526f01557d20a7",
+      "probe_domain_note": "A2/A3 DAV_2201 MQSMLA (INT8 CSA mode 1 [608B] & TurboQuant mode 3 [512/258B]; FP8 Mode 1/2 is A5-only)"
+    },
+    {
+      "entry_id": "a3_dsl_mixed_quant_sparse_flash_mla",
+      "abi_id": "tilelang_dsl.mixed_quant_sparse_flash_mla",
+      "available_on_device": false,
+      "backend_kind": "third_party_wheel",
+      "symbol_or_kernel": "tilelang_dsl.mixed_quant_sparse_flash_mla",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "third_party_kernel",
+      "dtype_tuple": [
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "cmp_kv:fp4_e2m1:PA_BBND:per_group_fp4:16:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "cmp_kv:fp4_e2m1:PA_BBND:per_group_fp4:16:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "cmp_kv:fp4_e2m1:PA_BBND:per_group_fp4:16:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "cmp_kv:fp4_e2m1:PA_BBND:per_group_fp4:16:bf16",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "ori_block_table:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "ori_block_table:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "ori_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "ori_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "cmp_kv:fp4_e2m1:PA_BBND:per_group_fp4:16:bf16",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "cmp_kv:fp4_e2m1:PA_BBND:per_group_fp4:16:bf16",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "cmp_kv:fp4_e2m1:PA_BBND:per_group_fp4:16:bf16",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "cmp_kv:fp4_e2m1:PA_BBND:per_group_fp4:16:bf16",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "cmp_kv:fp4_e2m1:PA_BBND:per_group_fp4:16:bf16",
+          "ori_sparse_indices:int32:ND:none::none",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "cmp_kv:fp4_e2m1:PA_BBND:per_group_fp4:16:bf16",
+          "ori_sparse_indices:int32:ND:none::none",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "cmp_kv:fp4_e2m1:PA_BBND:per_group_fp4:16:bf16",
+          "ori_sparse_indices:int32:ND:none::none",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ],
+        [
+          "q:bf16:ND:dense::none",
+          "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+          "cmp_kv:fp4_e2m1:PA_BBND:per_group_fp4:16:bf16",
+          "ori_sparse_indices:int32:ND:none::none",
+          "cmp_sparse_indices:int32:ND:none::none",
+          "ori_block_table:int32:ND:none::none",
+          "cmp_block_table:int32:ND:none::none",
+          "cu_seqlens_q:int32:ND:none::none",
+          "seqused_ori_kv:int32:ND:none::none",
+          "seqused_cmp_kv:int32:ND:none::none",
+          "sinks:fp32:ND:dense::none",
+          "metadata:int32:ND:none::none"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 0,
+        "n_max_inclusive": 0,
+        "require_even_n": false,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
+        ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1,
+        "head_dim_allowed_set": [
+          512
+        ],
+        "rope_dim_allowed_set": [
+          64
+        ],
+        "kv_heads_allowed_set": [
+          1
+        ]
+      },
+      "source_ref": {
+        "repository": "cann/ops-transformer",
+        "revision": "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "relative_path": "attention/mixed_quant_sparse_flash_mla/op_dsl/mixed_quant_sparse_flash_mla.py",
+        "source_sha256": "7202ee9ae83ac0ceb553b1d0aeeab1cb8bc7e4b05e9ef6e84356ea493e27d74c"
+      },
+      "graph_motif": "mixed_quant_sparse_flash_mla_dsl",
+      "vllm_ascend_track": "unmerged_pr",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "mqsmla_dsl_544_320",
+      "vllm_ascend_ref": "",
+      "op_plugin_ref": "",
+      "cann_check_params_ref": "ops-transformer/attention/mixed_quant_sparse_flash_mla/op_dsl/mixed_quant_sparse_flash_mla.py:4094",
+      "device_kernel_expansion": [],
+      "allowed_output_tuples": [
+        [
+          "attn_out:bf16:ND"
+        ],
+        [
+          "attn_out:bf16:ND",
+          "softmax_lse:fp32:ND"
+        ],
+        [
+          "attn_out:bf16:ND"
+        ],
+        [
+          "attn_out:bf16:ND",
+          "softmax_lse:fp32:ND"
+        ],
+        [
+          "attn_out:bf16:ND"
+        ],
+        [
+          "attn_out:bf16:ND",
+          "softmax_lse:fp32:ND"
+        ],
+        [
+          "attn_out:bf16:ND"
+        ],
+        [
+          "attn_out:bf16:ND",
+          "softmax_lse:fp32:ND"
+        ],
+        [
+          "attn_out:bf16:ND"
+        ],
+        [
+          "attn_out:bf16:ND",
+          "softmax_lse:fp32:ND"
+        ],
+        [
+          "attn_out:bf16:ND"
+        ],
+        [
+          "attn_out:bf16:ND",
+          "softmax_lse:fp32:ND"
+        ],
+        [
+          "attn_out:bf16:ND"
+        ],
+        [
+          "attn_out:bf16:ND",
+          "softmax_lse:fp32:ND"
+        ],
+        [
+          "attn_out:bf16:ND"
+        ],
+        [
+          "attn_out:bf16:ND",
+          "softmax_lse:fp32:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "none"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "",
+      "probe_domain_note": "A5 TileLang DSL MQSMLA (544B FP8 window + 320B FP4 compressed KV; unmerged_pr track requiring ManifestBinding)"
+    },
+    {
+      "entry_id": "a3_mindie_sd_rainfusion_bsa",
+      "abi_id": "RainFusionBlockSparseAttention",
+      "available_on_device": false,
+      "backend_kind": "third_party_wheel",
+      "symbol_or_kernel": "aclnnRainFusionAttention",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "diffusion_attention",
+      "dtype_tuple": [
+        [
+          "query:bf16:ND:dense::none",
+          "key:bf16:ND:dense::none",
+          "value:bf16:ND:dense::none",
+          "select_idx:int64:ND:none::none",
+          "select_num_idx:int64:ND:none::none",
+          "block_shape:int64:ND:none::none"
+        ],
+        [
+          "query:fp16:ND:dense::none",
+          "key:fp16:ND:dense::none",
+          "value:fp16:ND:dense::none",
+          "select_idx:int64:ND:none::none",
+          "select_num_idx:int64:ND:none::none",
+          "block_shape:int64:ND:none::none"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 0,
+        "n_max_inclusive": 0,
+        "require_even_n": false,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
+        ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1
+      },
+      "source_ref": {
+        "repository": "Ascend/MindIE-SD",
+        "revision": "9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        "relative_path": "csrc/plugin/rainfusionattention.cpp",
+        "source_sha256": "b93f7038895fc9090b347f6da793c7b744c48d4b55a8d3e6115fb5f5e8eaeaf1"
+      },
+      "graph_motif": "rainfusion_bsa",
+      "vllm_ascend_track": "merged",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "",
+      "vllm_ascend_ref": "",
+      "op_plugin_ref": "",
+      "cann_check_params_ref": "",
+      "device_kernel_expansion": [],
+      "allowed_output_tuples": [
+        [
+          "attention_out:bf16:ND"
+        ],
+        [
+          "attention_out:fp16:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "none"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "",
+      "probe_domain_note": "MindIE-SD plugin wrapper (aclnnRainFusionAttention, int64 indices per rain_fusion_attention_def.cpp:31); unprobed in baseline container"
+    },
+    {
+      "entry_id": "a3_mindie_sd_ada_bsa",
+      "abi_id": "AdaBlockSparseAttention",
+      "available_on_device": true,
+      "backend_kind": "third_party_wheel",
+      "symbol_or_kernel": "aclnnAdaBlockSparseAttention",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "diffusion_attention",
+      "dtype_tuple": [
+        [
+          "query:bf16:ND:dense::none",
+          "key:bf16:ND:dense::none",
+          "value:bf16:ND:dense::none"
+        ],
+        [
+          "query:fp16:ND:dense::none",
+          "key:fp16:ND:dense::none",
+          "value:fp16:ND:dense::none"
+        ],
+        [
+          "query:int8:ND:per_token_int8::fp32",
+          "key:int8:ND:per_token_int8::fp32",
+          "value:int8:ND:per_token_int8::fp32"
+        ],
+        [
+          "query:int8:ND:per_token_int8::fp32",
+          "key:int8:ND:per_token_int8::fp32",
+          "value:int8:ND:per_token_int8::fp32"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 0,
+        "n_max_inclusive": 0,
+        "require_even_n": false,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
+        ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1
+      },
+      "source_ref": {
+        "repository": "Ascend/MindIE-SD",
+        "revision": "9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        "relative_path": "csrc/ops/ada_block_sparse_attention/op_host/ada_block_sparse_attention_def.cpp",
+        "source_sha256": "105e0eea08d20f51d095c4d36a4d26e423bdf8189575118519b802c1c6adb49c"
+      },
+      "graph_motif": "ada_bsa",
+      "vllm_ascend_track": "merged",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "",
+      "vllm_ascend_ref": "",
+      "op_plugin_ref": "",
+      "cann_check_params_ref": "",
+      "device_kernel_expansion": [
+        "AdaBlockSparseAttention"
+      ],
+      "allowed_output_tuples": [
+        [
+          "attention_out:bf16:ND"
+        ],
+        [
+          "attention_out:fp16:ND"
+        ],
+        [
+          "attention_out:fp16:ND"
+        ],
+        [
+          "attention_out:int8:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "none"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "5f2a61c0a2be2b611186373a2522a2c3aa38cc9a3cc3224b6a68a8bfe39c8a8e",
+      "probe_domain_note": "MindIE-SD AdaBlockSparseAttention (AddConfig ascend910b/93 ONLY; all-INT8 QKV outputs fp16/int8 per def.cpp:121)"
+    },
+    {
+      "entry_id": "a3_mindie_sd_eagle_bsa",
+      "abi_id": "EagleBlockSparseAttention",
+      "available_on_device": true,
+      "backend_kind": "third_party_wheel",
+      "symbol_or_kernel": "aclnnEagleBlockSparseAttention",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "diffusion_attention",
+      "dtype_tuple": [
+        [
+          "query:bf16:ND:dense::none",
+          "key:bf16:ND:dense::none",
+          "value:bf16:ND:dense::none",
+          "blockSparseMask:int8:ND:none::none"
+        ],
+        [
+          "query:fp16:ND:dense::none",
+          "key:fp16:ND:dense::none",
+          "value:fp16:ND:dense::none",
+          "blockSparseMask:int8:ND:none::none"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 0,
+        "n_max_inclusive": 0,
+        "require_even_n": false,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
+        ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1
+      },
+      "source_ref": {
+        "repository": "Ascend/MindIE-SD",
+        "revision": "9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        "relative_path": "csrc/ops/eagle_block_sparse_attention/op_host/eagle_block_sparse_attention_def.cpp",
+        "source_sha256": "dbb1022ab1620c1fb1f0e34440e180085b23a53722f6ff9dfc88b58084d65551"
+      },
+      "graph_motif": "eagle_bsa",
+      "vllm_ascend_track": "merged",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "",
+      "vllm_ascend_ref": "",
+      "op_plugin_ref": "",
+      "cann_check_params_ref": "",
+      "device_kernel_expansion": [
+        "EagleBlockSparseAttention"
+      ],
+      "allowed_output_tuples": [
+        [
+          "attentionOut:bf16:ND"
+        ],
+        [
+          "attentionOut:fp16:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "none"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "a2b3250fd6bedc81b8fcf161e9052515d5d3810b2fd0a1672212c5f507d41cff",
+      "probe_domain_note": "MindIE-SD EagleBlockSparseAttention (AddConfig ascend910b/93 ONLY; requires blockSparseMask:int8 per tiling.cpp:710)"
+    },
+    {
+      "entry_id": "a3_mindie_sd_eagle_quant_bsa",
+      "abi_id": "EagleQuantBlockSparseAttention",
+      "available_on_device": false,
+      "backend_kind": "third_party_wheel",
+      "symbol_or_kernel": "aclnnEagleQuantBlockSparseAttention",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "diffusion_attention",
+      "dtype_tuple": [
+        [
+          "query:int8:ND:per_token_int8::fp32",
+          "key:int8:ND:per_token_int8::fp32",
+          "value:int8:ND:per_token_int8::fp32",
+          "blockSparseMask:int8:ND:none::none"
+        ],
+        [
+          "query:int8:ND:per_token_int8::fp32",
+          "key:int8:ND:per_token_int8::fp32",
+          "value:int8:ND:per_token_int8::fp32",
+          "blockSparseMask:int8:ND:none::none"
+        ],
+        [
+          "query:int8:ND:per_token_int8::fp32",
+          "key:int8:ND:per_token_int8::fp32",
+          "value:fp8_e4m3fn:ND:per_token_fp8::fp32",
+          "blockSparseMask:int8:ND:none::none"
+        ],
+        [
+          "query:int8:ND:per_token_int8::fp32",
+          "key:int8:ND:per_token_int8::fp32",
+          "value:fp8_e4m3fn:ND:per_token_fp8::fp32",
+          "blockSparseMask:int8:ND:none::none"
+        ],
+        [
+          "query:int8:ND:per_token_int8::fp32",
+          "key:int8:ND:per_token_int8::fp32",
+          "value:int8:ND:per_token_int8::fp32",
+          "blockSparseMask:int32:ND:none::none"
+        ],
+        [
+          "query:int8:ND:per_token_int8::fp32",
+          "key:int8:ND:per_token_int8::fp32",
+          "value:int8:ND:per_token_int8::fp32",
+          "blockSparseMask:int32:ND:none::none"
+        ],
+        [
+          "query:int8:ND:per_token_int8::fp32",
+          "key:int8:ND:per_token_int8::fp32",
+          "value:fp8_e4m3fn:ND:per_token_fp8::fp32",
+          "blockSparseMask:int32:ND:none::none"
+        ],
+        [
+          "query:int8:ND:per_token_int8::fp32",
+          "key:int8:ND:per_token_int8::fp32",
+          "value:fp8_e4m3fn:ND:per_token_fp8::fp32",
+          "blockSparseMask:int32:ND:none::none"
+        ],
+        [
+          "query:int8:ND:per_token_int8::fp32",
+          "key:int8:ND:per_token_int8::fp32",
+          "value:int8:ND:per_token_int8::fp32",
+          "blockSparseMask:bool:ND:none::none"
+        ],
+        [
+          "query:int8:ND:per_token_int8::fp32",
+          "key:int8:ND:per_token_int8::fp32",
+          "value:int8:ND:per_token_int8::fp32",
+          "blockSparseMask:bool:ND:none::none"
+        ],
+        [
+          "query:int8:ND:per_token_int8::fp32",
+          "key:int8:ND:per_token_int8::fp32",
+          "value:fp8_e4m3fn:ND:per_token_fp8::fp32",
+          "blockSparseMask:bool:ND:none::none"
+        ],
+        [
+          "query:int8:ND:per_token_int8::fp32",
+          "key:int8:ND:per_token_int8::fp32",
+          "value:fp8_e4m3fn:ND:per_token_fp8::fp32",
+          "blockSparseMask:bool:ND:none::none"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 0,
+        "n_max_inclusive": 0,
+        "require_even_n": false,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
+        ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1
+      },
+      "source_ref": {
+        "repository": "Ascend/MindIE-SD",
+        "revision": "9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        "relative_path": "csrc/ops/eagle_quant_block_sparse_attention/op_host/eagle_quant_block_sparse_attention_def.cpp",
+        "source_sha256": "db5020ae4ef6eb4dbcd7dbd4756354653c8a2372872e9bf8ac021b47d20cd385"
+      },
+      "graph_motif": "eagle_quant_bsa",
+      "vllm_ascend_track": "merged",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "",
+      "vllm_ascend_ref": "",
+      "op_plugin_ref": "",
+      "cann_check_params_ref": "",
+      "device_kernel_expansion": [],
+      "allowed_output_tuples": [
+        [
+          "attentionOut:bf16:ND"
+        ],
+        [
+          "attentionOut:fp16:ND"
+        ],
+        [
+          "attentionOut:bf16:ND"
+        ],
+        [
+          "attentionOut:fp16:ND"
+        ],
+        [
+          "attentionOut:bf16:ND"
+        ],
+        [
+          "attentionOut:fp16:ND"
+        ],
+        [
+          "attentionOut:bf16:ND"
+        ],
+        [
+          "attentionOut:fp16:ND"
+        ],
+        [
+          "attentionOut:bf16:ND"
+        ],
+        [
+          "attentionOut:fp16:ND"
+        ],
+        [
+          "attentionOut:bf16:ND"
+        ],
+        [
+          "attentionOut:fp16:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "none"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "",
+      "probe_domain_note": "MindIE-SD EagleQuantBlockSparseAttention (AddConfig ascend950 ONLY; requires INT8 Q/K + blockSparseMask per tiling.cpp:202,443)"
+    },
+    {
+      "entry_id": "a3_mindie_sd_adalayernorm_fused",
+      "abi_id": "AdaLayerNormFused",
+      "available_on_device": false,
+      "backend_kind": "third_party_wheel",
+      "symbol_or_kernel": "aclnnAdaLayerNormV2",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "diffusion_norm",
+      "dtype_tuple": [
+        [
+          "x:bf16:ND:dense::none",
+          "scale:bf16:ND:dense::none",
+          "shift:bf16:ND:dense::none"
+        ],
+        [
+          "x:fp16:ND:dense::none",
+          "scale:fp16:ND:dense::none",
+          "shift:fp16:ND:dense::none"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 0,
+        "n_max_inclusive": 0,
+        "require_even_n": false,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
+        ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1
+      },
+      "source_ref": {
+        "repository": "Ascend/MindIE-SD",
+        "revision": "9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        "relative_path": "csrc/plugin/adalayernorm.cpp",
+        "source_sha256": "d862775cf5193b94b411b0c1edc7ac9e85429407b7f7326a4dbd960d951ce68f"
+      },
+      "graph_motif": "adalayernorm_fused",
+      "vllm_ascend_track": "merged",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "",
+      "vllm_ascend_ref": "",
+      "op_plugin_ref": "",
+      "cann_check_params_ref": "",
+      "device_kernel_expansion": [],
+      "allowed_output_tuples": [
+        [
+          "y:bf16:ND",
+          "mean:bf16:ND",
+          "rstd:bf16:ND"
+        ],
+        [
+          "y:fp16:ND",
+          "mean:fp16:ND",
+          "rstd:fp16:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "none"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "",
+      "probe_domain_note": "MindIE-SD plugin wrapper (aclnnAdaLayerNorm/V2; mean/rstd match x dtype per adalayernorm.cpp:77); unprobed in baseline container"
+    },
+    {
+      "entry_id": "a3_mindie_sd_rms_norm_rope_concat",
+      "abi_id": "RmsNormRopeConcatFused",
+      "available_on_device": true,
+      "backend_kind": "third_party_wheel",
+      "symbol_or_kernel": "aclnnNormRopeConcat",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "diffusion_norm",
+      "dtype_tuple": [
+        [
+          "query:bf16:ND:dense::none",
+          "key:bf16:ND:dense::none",
+          "value:bf16:ND:dense::none"
+        ],
+        [
+          "query:fp16:ND:dense::none",
+          "key:fp16:ND:dense::none",
+          "value:fp16:ND:dense::none"
+        ],
+        [
+          "query:fp32:ND:dense::none",
+          "key:fp32:ND:dense::none",
+          "value:fp32:ND:dense::none"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 0,
+        "n_max_inclusive": 0,
+        "require_even_n": false,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
+        ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1
+      },
+      "source_ref": {
+        "repository": "Ascend/MindIE-SD",
+        "revision": "9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        "relative_path": "csrc/ops/norm_rope_concat/op_host/norm_rope_concat_def.cpp",
+        "source_sha256": "6c7fd0d1473073d593117176d7cd0d2b5c0deea8c73ae9c50e9e87fe14c57552"
+      },
+      "graph_motif": "norm_rope_concat",
+      "vllm_ascend_track": "merged",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "",
+      "vllm_ascend_ref": "",
+      "op_plugin_ref": "",
+      "cann_check_params_ref": "",
+      "device_kernel_expansion": [
+        "NormRopeConcat"
+      ],
+      "allowed_output_tuples": [
+        [
+          "query_output:bf16:ND",
+          "key_output:bf16:ND",
+          "value_output:bf16:ND"
+        ],
+        [
+          "query_output:fp16:ND",
+          "key_output:fp16:ND",
+          "value_output:fp16:ND"
+        ],
+        [
+          "query_output:fp32:ND",
+          "key_output:fp32:ND",
+          "value_output:fp32:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "none"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "6335d8da81dff063a440b3e763d515bef82d0083d940a8f4259fd5318b993e54",
+      "probe_domain_note": "MindIE-SD NormRopeConcat (AddConfig ascend910b/93/950; requires 4D [B,S,N,D] with num_q_heads == num_kv_heads)"
+    },
+    {
+      "entry_id": "a3_mindie_sd_laurel_residual",
+      "abi_id": "LaurelLowRankResidual",
+      "available_on_device": false,
+      "backend_kind": "third_party_wheel",
+      "symbol_or_kernel": "LaurelLowRankResidual",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "residual_mixer",
+      "dtype_tuple": [
+        [
+          "x:bf16:ND:dense::none",
+          "w_down:bf16:ND:dense::none",
+          "w_up:bf16:ND:dense::none"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 0,
+        "n_max_inclusive": 0,
+        "require_even_n": false,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
+        ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1
+      },
+      "source_ref": {
+        "repository": "Ascend/MindIE-SD",
+        "revision": "9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        "relative_path": "csrc/plugin/register_ops.cpp",
+        "source_sha256": "861fc97a28905b4e9c2ea39f8cd5641725b7b21f355ca8bb237446b5ae86c08a"
+      },
+      "graph_motif": "laurel_low_rank_residual",
+      "vllm_ascend_track": "merged",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "",
+      "vllm_ascend_ref": "",
+      "op_plugin_ref": "",
+      "cann_check_params_ref": "",
+      "device_kernel_expansion": [],
+      "allowed_output_tuples": [
+        [
+          "y:bf16:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "none"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "",
+      "probe_domain_note": "Composite residual; no native MindIE-SD wheel operator (lowered via matmul+add)"
+    },
+    {
+      "entry_id": "a3_mindie_sd_quant_four_over_six_a5",
+      "abi_id": "QuantFourOverSixA5",
+      "available_on_device": false,
+      "backend_kind": "third_party_wheel",
+      "symbol_or_kernel": "aclnnQuantFourOverSixA5V2",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "norm_quant",
+      "dtype_tuple": [
+        [
+          "x:bf16:ND:dense::none"
+        ],
+        [
+          "x:bf16:ND:dense::none"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 0,
+        "n_max_inclusive": 0,
+        "require_even_n": false,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
+        ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1,
+        "last_axis_divisibility": 32,
+        "rank_range": [
+          1,
+          7
+        ]
+      },
+      "source_ref": {
+        "repository": "Ascend/MindIE-SD",
+        "revision": "9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        "relative_path": "csrc/ops/quant_four_over_six_a5/op_host/quant_four_over_six_a5_def.cpp",
+        "source_sha256": "0266e56885835192fa88810cbf861a5ceb6bb1cf8d7a72ec07324e874c6cef68"
+      },
+      "graph_motif": "quant_four_over_six_a5",
+      "vllm_ascend_track": "merged",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "",
+      "vllm_ascend_ref": "",
+      "op_plugin_ref": "",
+      "cann_check_params_ref": "",
+      "device_kernel_expansion": [],
+      "allowed_output_tuples": [
+        [
+          "y:fp4_e2m1:ND:mx_fp4:32:fp8_e8m0",
+          "mxscale:fp8_e8m0:ND"
+        ],
+        [
+          "y:uint8:ND:mx_fp4:32:fp8_e8m0",
+          "mxscale:fp8_e8m0:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "none"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "",
+      "probe_domain_note": "MindIE-SD A5-only 4/6 adaptive MXFP4 quant (AddConfig ascend950; BF16 rank 1..7, last dim % 32 == 0 -> fp4_e2m1/uint8 + fp8_e8m0)"
+    },
+    {
+      "entry_id": "a3_mindie_sd_eagle_ffn",
+      "abi_id": "CatlassMatmulAddFfn",
+      "available_on_device": false,
+      "backend_kind": "third_party_wheel",
+      "symbol_or_kernel": "aclnnEagleFfnV2",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "fused_ffn",
+      "dtype_tuple": [
+        [
+          "x:bf16:ND:dense::none",
+          "weight1:bf16:ND:dense::none",
+          "weight2:bf16:ND:dense::none"
+        ],
+        [
+          "x:fp16:ND:dense::none",
+          "weight1:fp16:ND:dense::none",
+          "weight2:fp16:ND:dense::none"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 0,
+        "n_max_inclusive": 0,
+        "require_even_n": false,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
+        ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1
+      },
+      "source_ref": {
+        "repository": "Ascend/MindIE-SD",
+        "revision": "9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        "relative_path": "csrc/ops/eagle_ffn/op_host/eagle_ffn_def.cpp",
+        "source_sha256": "b742ae16a54ac6c84d1452fd29fc1dc8c3fe948c295b00c6389e5ae3e7529880"
+      },
+      "graph_motif": "eagle_ffn",
+      "vllm_ascend_track": "merged",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "",
+      "vllm_ascend_ref": "",
+      "op_plugin_ref": "",
+      "cann_check_params_ref": "",
+      "device_kernel_expansion": [],
+      "allowed_output_tuples": [
+        [
+          "y:bf16:ND"
+        ],
+        [
+          "y:fp16:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "gelu",
+        "silu",
+        "swiglu"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "",
+      "probe_domain_note": "MindIE-SD A5-only fused EagleFfn (AddConfig ascend950; decomposed linear->act->linear on A2/A3)"
+    },
+    {
+      "entry_id": "a3_cann_inplace_partial_rotary_mul",
+      "abi_id": "InplacePartialRotaryMul",
+      "available_on_device": true,
+      "backend_kind": "cann_aclnn",
+      "symbol_or_kernel": "aclnnInplacePartialRotaryMul",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "attention",
+      "dtype_tuple": [
+        [
+          "x:fp16:ND:dense::none",
+          "cos:fp16:ND:dense::none",
+          "sin:fp16:ND:dense::none"
+        ],
+        [
+          "x:fp32:ND:dense::none",
+          "cos:fp32:ND:dense::none",
+          "sin:fp32:ND:dense::none"
+        ],
+        [
+          "x:bf16:ND:dense::none",
+          "cos:bf16:ND:dense::none",
+          "sin:bf16:ND:dense::none"
+        ],
+        [
+          "x:fp16:ND:dense::none",
+          "cos:fp32:ND:dense::none",
+          "sin:fp32:ND:dense::none"
+        ],
+        [
+          "x:bf16:ND:dense::none",
+          "cos:fp32:ND:dense::none",
+          "sin:fp32:ND:dense::none"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 0,
+        "n_max_inclusive": 0,
+        "require_even_n": false,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
+        ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1
+      },
+      "source_ref": {
+        "repository": "cann/cann-recipes-infer",
+        "revision": "3c9266727c2a25bd17d503ad37d189a134ff364b",
+        "relative_path": "ops/ascendc/src/inplace_partial_rotary_mul/op_host/inplace_partial_rotary_mul_def.cpp",
+        "source_sha256": "613f628c97efca5fc61213154a8ba36cd7dc6ed7dce999272a7b93000895cf6f"
+      },
+      "graph_motif": "v41_partial_rotary",
+      "vllm_ascend_track": "merged",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "",
+      "vllm_ascend_ref": "",
+      "op_plugin_ref": "",
+      "cann_check_params_ref": "cann-recipes-infer/ops/ascendc/src/inplace_partial_rotary_mul/op_host/inplace_partial_rotary_mul_def.cpp:22",
+      "device_kernel_expansion": [
+        "InplacePartialRotaryMul"
+      ],
+      "allowed_output_tuples": [
+        [
+          "x:fp16:ND"
+        ],
+        [
+          "x:fp32:ND"
+        ],
+        [
+          "x:bf16:ND"
+        ],
+        [
+          "x:fp16:ND"
+        ],
+        [
+          "x:bf16:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "none"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "6789d6e2717d5213c262b84bf38c864650e05a481eef25a0fc0b778750487518",
+      "probe_domain_note": "Shipping CANN InplacePartialRotaryMul across A2/A3/A5 (AddConfig ascend910b/93/950; backs v41_partial_rotary); live_silicon_observed=InplacePartialRotaryMul"
+    },
+    {
+      "entry_id": "a3_cann_kv_compress_epilog",
+      "abi_id": "aclnnKvCompressEpilog",
+      "available_on_device": true,
+      "backend_kind": "cann_aclnn",
+      "symbol_or_kernel": "aclnnKvCompressEpilog",
+      "device_arch": "A3",
+      "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
+      "role": "compressor",
+      "dtype_tuple": [
+        [
+          "cache:uint8:ND:none::none",
+          "x:bf16:ND:dense::none",
+          "slot_mapping:int32:ND:none::none"
+        ],
+        [
+          "cache:uint8:ND:none::none",
+          "x:bf16:ND:dense::none",
+          "slot_mapping:int64:ND:none::none"
+        ]
+      ],
+      "shape_constraints": {
+        "k_min": 0,
+        "k_max_exclusive": 0,
+        "n_max_inclusive": 0,
+        "require_even_n": false,
+        "require_even_k_for_fp4": false,
+        "require_even_n_for_fp4_transb": false,
+        "require_m_divisible_by_ws": false,
+        "max_comm_bytes_formula": "none",
+        "hidden_allowed_set": [],
+        "hidden_range": [
+          0,
+          0
+        ],
+        "hidden_divisibility": 0,
+        "inter_min": 0,
+        "inter_max": 0,
+        "inter_divisibility": 0,
+        "topk_range": [
+          0,
+          0
+        ],
+        "max_shared_experts_per_rank": -1
+      },
+      "source_ref": {
+        "repository": "cann/ops-transformer",
+        "revision": "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "relative_path": "attention/kv_compress_epilog/op_host/kv_compress_epilog_def.cpp",
+        "source_sha256": "2ea38505c7917737045336af55cecf6cb90db37fa2c457e8ace58f9fc2b6f650"
+      },
+      "graph_motif": "kv_compress_epilog",
+      "vllm_ascend_track": "merged",
+      "required_stack_pass_id": "",
+      "required_mechanism_id": "",
+      "vllm_ascend_ref": "",
+      "op_plugin_ref": "",
+      "cann_check_params_ref": "ops-transformer/attention/kv_compress_epilog/op_host/kv_compress_epilog_def.cpp:24",
+      "device_kernel_expansion": [
+        "KvCompressEpilog"
+      ],
+      "allowed_output_tuples": [
+        [
+          "cache:uint8:ND"
+        ],
+        [
+          "cache:uint8:ND"
+        ]
+      ],
+      "allowed_rank_placements": [
+        "local"
+      ],
+      "allowed_world_sizes": [
+        1
+      ],
+      "allowed_activations": [
+        "none"
+      ],
+      "allowed_model_scopes": [
+        "draft",
+        "target"
+      ],
+      "allow_bias": true,
+      "require_no_bias": false,
+      "probe_signature_sha256": "e3461010c032e3cf4b412a39691d0ec18d63ea87fdc022d489c12387f580c548",
+      "probe_domain_note": "Shipping CANN KvCompressEpilog across A2/A3/A5 (AddConfig ascend910b/93/950; uint8 cache + bf16 x + int32/int64 slot_mapping)"
     }
   ]
 }

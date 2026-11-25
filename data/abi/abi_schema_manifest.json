@@ -33,8 +33,8 @@
   ],
   "arch_manifest_pattern": "cann93_shipping_abi_{arch}.json",
   "sealed_sha256": {
-    "A2": "63ba2a5886a5b9ac4a77ac28c4e9193a135cf2d748f7cd028a64524121343dff",
-    "A3": "d97770f65cf0a01bf244f37f5c23be767d3f546cb4cd2912de0e1cdb8bb0826c",
-    "A5": "fe8cbaf6673b0ab9b446601dd15f639fc9ecd081568d5e3c8f179e7827819932"
+    "A2": "50c978d3814a22174e62c70876499dfaa6405a4384cd548961bcf4001129cec1",
+    "A3": "6fff8c4ef9c77f25eeb55e75164cabb5ccf095cec278e01a78fd7a5dab786378",
+    "A5": "f9a1b9b65dc96d7909066c9f8b9ac813471672b8ae6320067575fc4f87749a9b"
   }
 }
