@@ -18,10 +18,12 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 import multiprocessing
 import os
 from pathlib import Path
+import time
 import xml.etree.ElementTree as ET
 import zipfile
 
@@ -36,7 +38,19 @@ from mindie_sim.export import (
 )
 from mindie_sim.export.action_plan import build_comparison_plan
 from mindie_sim.export.ooxml import NS_MAIN
+from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.results import StepRequest
+from mindie_sim.rewrite.apply import apply_plan
+from mindie_sim.rewrite.catalog_replay import _catlass_proposals, _replay_ops
+from mindie_sim.rewrite.oracle import (
+    ScenarioRequest,
+    _bind_replay,
+    _report,
+    finalize_plan,
+    prepare_scenario,
+    refine_layer_cohort_plan,
+)
+from mindie_sim.rewrite.schema import Edit, empty_plan
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.solve import solve_deployment
 from mindie_sim.sweep.mapreduce import (
@@ -52,12 +66,20 @@ from mindie_sim.sweep.pd import (
     _solve_optimal_pd_ratio_closed_form,
     solve_optimal_deployment,
 )
+from mindie_sim.templates import catlass_lower
+from mindie_sim.templates import registry as template_registry
 
 pytestmark = pytest.mark.tier1
 
 _WATERFALL_TOL_US = 1e-6
 _CLOSED_FORM_TOL = 1e-10
+_PARITY_REL_TOL = 1e-11
+_PARITY_ABS_TOL_MS = 1e-9
 _TEST_PROMPT_TOKENS = 1024
+_COHORT_TEST_LAYERS = 12
+_DP_TEST_REPLICAS = 8
+_DP_MIN_SPEEDUP = 5.0
+_CATLASS_PROPOSAL_SLICE = 20
 _TEST_OUTPUT_TOKENS = 128
 _TEST_TPOT_SLA_MS = 50.0
 _TEST_TTFT_SLA_MS = 2000.0
@@ -338,3 +360,164 @@ def test_mxfp4_expert_operator_dtype_and_tensor_contract_surface_precision_abi()
     bun_w4a8 = build_export_bundle(raw_w4a8, request=req, apply_target_envelope=False)
     w4a8_experts = [op for op in bun_w4a8.operators if op.family in {"grouped_gemm", "grouped_moe"}]
     assert w4a8_experts and all(op.dtype == "int8" for op in w4a8_experts)
+
+
+def test_oracle_refined_layer_cohort_plan_matches_literal_execution() -> None:
+    case = compose_case(
+        model="qwen3-32b", hardware="a3", tp=8, dp=1, pp=1, ep=1,
+        quant="w8a8", layers=_COHORT_TEST_LAYERS,
+        prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS, concurrency=16,
+    )
+    step = StepRequest(phase="decode", tokens=16, context=_TEST_PROMPT_TOKENS, sequences=16)
+    dossier = prepare_scenario(ScenarioRequest(case=case, step=step))
+    mainline_seed = dossier.handle._mainline
+    m_case = mainline_seed.scenario.atomic_step.case
+    m_graphs = {entry.replica: _replay_ops(entry.ops) for entry in mainline_seed.scenario.atomic_step.graph.executable}
+
+    refined = refine_layer_cohort_plan(m_case, m_graphs[0])
+    cohort_shapes = [(c.representative_layer, c.layer_indices) for c in refined.cohorts]
+    assert cohort_shapes == [
+        (0, (0,)),
+        (1, tuple(range(1, _COHORT_TEST_LAYERS - 1))),
+        (_COHORT_TEST_LAYERS - 1, (_COHORT_TEST_LAYERS - 1,)),
+    ]
+
+    lit_report = graph_costs(
+        m_case, m_graphs, recipes=mainline_seed.book, external_inputs={"analysis_input": 0.0},
+        evaluation=dossier.handle.evaluation_context, isolated=False,
+        include_submission=False, trace_limit=0,
+    )
+    assert math.isclose(
+        mainline_seed.evaluation.span_ms, float(lit_report["duration_ms"]),
+        rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+    )
+    coh_serviced = mainline_seed.evaluation.execution_evidence["serviced"]
+    lit_serviced = lit_report["execution"]["serviced"]
+    assert set(coh_serviced) == set(lit_serviced)
+    for res_name, expected in lit_serviced.items():
+        assert math.isclose(
+            float(coh_serviced[res_name]), float(expected),
+            rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+        )
+
+
+def test_oracle_dp_catalog_memo_preserves_per_replica_die_isolation_and_speedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    case = compose_case(
+        model="qwen3-235b-a22b", hardware="a3", tp=1, dp=_DP_TEST_REPLICAS, pp=1, ep=_DP_TEST_REPLICAS,
+        layers=2, prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
+        concurrency=_DP_TEST_REPLICAS,
+    )
+    step = StepRequest(phase="decode", tokens=_DP_TEST_REPLICAS, context=_TEST_PROMPT_TOKENS, sequences=_DP_TEST_REPLICAS)
+    dossier = prepare_scenario(ScenarioRequest(case=case, step=step))
+    scenario = dossier.handle.scenario
+    ops0 = scenario.atomic_ops[0].ops
+    datapath = scenario.datapath
+    proposals = list(_catlass_proposals(ops0[:_CATLASS_PROPOSAL_SLICE], datapath, datapath.aic_count, datapath.aiv_count))
+    assert proposals
+    op_edit = proposals[0][0][0]
+    plan = replace(
+        empty_plan(scenario.base_graph_sha256, scenario.framing_sha256),
+        edits=(Edit("e0", operation=op_edit),),
+    )
+    applied = apply_plan(plan, scenario)
+
+    lower_calls: list[int] = []
+    orig_lower = template_registry.lower_catlass_spec
+
+    def _counting_lower(*args, **kwargs):
+        lower_calls.append(int(kwargs.get("die", 0)))
+        return orig_lower(*args, **kwargs)
+
+    catlass_lower._PURE_LOWER_CACHE.clear()
+    monkeypatch.setattr(template_registry, "lower_catlass_spec", _counting_lower)
+    graphs, book, summaries, bound_streams, _, _ = _bind_replay(
+        scenario, applied, dossier.handle.recipe_book, dossier.handle,
+    )
+    assert len(lower_calls) == 1
+
+    recipe_ids = {
+        replica: next(op.recipe for op in ops if op.op_id == op_edit.target.id)
+        for replica, ops in graphs.items()
+    }
+    assert len(set(recipe_ids.values())) == 1
+
+    summary_sites = sorted(
+        (s.semantic_work[0].replica, s.semantic_work[0].die, s.read_obligations[0].die)
+        for s in summaries
+    )
+    assert summary_sites == [(r, r, r) for r in range(_DP_TEST_REPLICAS)]
+
+    monkeypatch.setenv("MINDIE_SIM_DP_DEDUP", "1")
+    t0 = time.perf_counter()
+    rep_dedup = _report(
+        scenario.atomic_step.case, graphs, dossier.handle.evaluation_context, book,
+        dossier.handle._replay, streams=bound_streams,
+    )
+    dedup_s = time.perf_counter() - t0
+
+    monkeypatch.setenv("MINDIE_SIM_DP_DEDUP", "0")
+    t1 = time.perf_counter()
+    rep_full = _report(
+        scenario.atomic_step.case, graphs, dossier.handle.evaluation_context, book,
+        dossier.handle._replay, streams=bound_streams,
+    )
+    full_s = time.perf_counter() - t1
+    monkeypatch.setenv("MINDIE_SIM_DP_DEDUP", "1")
+
+    assert math.isclose(
+        float(rep_dedup["duration_ms"]), float(rep_full["duration_ms"]),
+        rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+    )
+    assert full_s / max(dedup_s, _PARITY_ABS_TOL_MS) >= _DP_MIN_SPEEDUP
+
+    full_serviced = rep_full["execution"]["serviced"]
+    hbm_read_rows = sorted(k for k in full_serviced if k.endswith(":r") and "memory@r" in k)
+    assert len(hbm_read_rows) == _DP_TEST_REPLICAS
+    full_unit_peaks = rep_full["execution"]["peak_allocated_per_unit"]
+    for replica in range(_DP_TEST_REPLICAS):
+        assert any(f"@r{replica}:s0:" in key and val > 0 for key, val in full_unit_peaks.items())
+
+    for field_name in ("serviced", "resource_busy_ms"):
+        dedup_map = rep_dedup["execution"][field_name]
+        full_map = rep_full["execution"][field_name]
+        assert set(dedup_map) == set(full_map)
+        for key, expected in full_map.items():
+            assert math.isclose(
+                float(dedup_map[key]), float(expected),
+                rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+            )
+
+    same_backend = rep_dedup.get("engine_backend") == rep_full.get("engine_backend")
+    for field_name in ("peak_allocated", "peak_allocated_per_unit"):
+        dedup_map = rep_dedup["execution"][field_name]
+        full_map = rep_full["execution"][field_name]
+        assert set(dedup_map) == set(full_map)
+        for key, expected in full_map.items():
+            if same_backend:
+                assert math.isclose(
+                    float(dedup_map[key]), float(expected),
+                    rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+                )
+            elif expected > 0:
+                assert float(dedup_map[key]) > 0.0
+            if "@r0:" in key:
+                for peer in range(1, _DP_TEST_REPLICAS):
+                    peer_key = key.replace("@r0:", f"@r{peer}:", 1)
+                    assert math.isclose(
+                        float(dedup_map[peer_key]), float(dedup_map[key]),
+                        rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+                    )
+                    assert math.isclose(
+                        float(full_map[peer_key]), float(full_map[key]),
+                        rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+                    )
+
+    monkeypatch.setattr(template_registry, "lower_catlass_spec", orig_lower)
+    full_eval = finalize_plan(dossier.handle, plan)
+    assert full_eval.verification.passed
+    assert math.isclose(
+        float(full_eval.step_eval.span_ms), float(rep_full["duration_ms"]),
+        rel_tol=_PARITY_REL_TOL, abs_tol=_PARITY_ABS_TOL_MS,
+    )

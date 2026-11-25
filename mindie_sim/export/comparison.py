@@ -24,9 +24,12 @@ from typing import Any
 from mindie_sim.schema.common import ModelingError
 
 from .action_plan import (
-    CONSERVATION_EPS_MS, ComparisonPlan, GroupAccounting, WaterfallSummary,
+    CONSERVATION_EPS_MS,
+    WF_STAGE_CONFIG, WF_STAGE_FRAMEWORK, WF_STAGE_KERNEL, WF_STAGE_RESIDUAL,
+    ComparisonPlan, GroupAccounting, WaterfallSummary,
     build_actionable_roadmap, build_comparison_plan,
     build_new_kernel_backlog, build_parallelism_codesign_note, build_pending_kernel_details,
+    classify_waterfall_stage,
 )
 from .agent_brief import (
     AGENT_BRIEF_MAX_BYTES, _compact_agent_brief_to_budget, build_agent_brief,
@@ -42,7 +45,7 @@ from .models import (
     OperatorExportRow, bundle_step_int_ns, op_dur_int_ns, op_exposed_int_ns,
     op_lstar_int_ns,
 )
-from .public_view import format_track_label, is_same_public_config
+from .public_view import format_track_label
 
 SLICE_MAX_EXPLICIT_LAYERS = 4
 MIN_GROUP_SIZE = 2
@@ -53,18 +56,6 @@ _DEPTH_NOTE_STRIP_RE = re.compile(
     r"(?:\s*\|\s*)?(?:depth-varying\b[^|]*|L\d+\s*(?:->|→)\s*L\d+，随层深[^|]*)"
 )
 
-#: Canonical 3-stage + residual waterfall stage identifiers for Sheet 4.
-WF_STAGE_CONFIG = "config"
-WF_STAGE_FRAMEWORK = "framework"
-WF_STAGE_KERNEL = "kernel"
-WF_STAGE_RESIDUAL = "residual"
-_FRAMEWORK_REASONS = frozenset({
-    "stream_masking_change",
-    "shipping_fusion_enablement",
-    "subgraph_reassociation",
-    "shipping_route_switch",
-    "framework_graph_edit",
-})
 _UNBOUND_PROJECTION_BADGE = "[未绑定实现 · 硬件物理预演]"
 
 
@@ -1031,29 +1022,6 @@ def assert_comparison_polarity(
             raise ModelingError("export_comparison_reversed_before_after:target_envelope_inverted")
         if _CANONICAL_TRACK_RANK[b_track] > _CANONICAL_TRACK_RANK[a_track]:
             raise ModelingError(f"export_comparison_reversed_before_after:{b_track}>{a_track}")
-
-
-def classify_waterfall_stage(
-    acc: GroupAccounting,
-    before_bundle: ExportBundle,
-    after_bundle: ExportBundle,
-) -> tuple[str, str | None]:
-    """Classify one ``GroupAccounting`` row into canonical waterfall stage(s) via public config."""
-    same_cfg = is_same_public_config(before_bundle, after_bundle)
-    if acc.bucket == "config":
-        if same_cfg or acc.reason in _FRAMEWORK_REASONS:
-            return WF_STAGE_FRAMEWORK, None
-        return WF_STAGE_CONFIG, None
-    has_cfg_split = (
-        not same_cfg
-        and acc.after_pre_edit_ms is not None
-        and abs(float(acc.config_share_ms)) > CONSERVATION_EPS_MS
-    )
-    if acc.bucket in {"new", "tune"}:
-        return (WF_STAGE_CONFIG, WF_STAGE_KERNEL) if has_cfg_split else (WF_STAGE_KERNEL, None)
-    if has_cfg_split:
-        return WF_STAGE_CONFIG, WF_STAGE_RESIDUAL
-    return WF_STAGE_RESIDUAL, None
 
 
 __all__ = [

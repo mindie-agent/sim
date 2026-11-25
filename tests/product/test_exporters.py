@@ -586,16 +586,10 @@ def test_agent_brief_digest_and_static_launch_script_audit(tmp_path):
         "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
         dp=2, tp=2, ep=4, prompt_tokens=4096, output_tokens=64, concurrency=8,
         mtp_proposal_tokens=3, mtp_acceptance_length=2.4, tpot_slo_ms=15.0,
-        kv_cache_dtype="fp8_e4m3", engram_cpu_offload=True, feature_track="proposed",
+        kv_cache_dtype="fp8_e4m3", engram_cpu_offload=True, feature_track="shipping",
     )
-    raw_aft, _ = compose_export_case(
-        "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
-        dp=2, tp=2, ep=4, prompt_tokens=4096, output_tokens=64, concurrency=8,
-        mtp_proposal_tokens=3, mtp_acceptance_length=2.4, tpot_slo_ms=15.0,
-        kv_cache_dtype="fp8_e4m3", engram_cpu_offload=True, feature_track="target",
-    )
-    b_bef = build_export_bundle(raw_bef, request=req)
-    b_aft = build_export_bundle(raw_aft, request=req)
+    b_bef = build_export_bundle(raw_bef, request=req, apply_target_envelope=False)
+    b_aft = build_export_bundle(raw_bef, request=req, apply_target_envelope=True)
     assert b_aft.step_span_ns <= b_bef.step_span_ns
     assert not any("Qwen4Exp" in op.ascend_kernel for op in b_aft.operators)
 

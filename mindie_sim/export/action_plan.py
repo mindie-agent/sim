@@ -70,6 +70,19 @@ STRUCTURAL_EDIT_OPCODES = frozenset({
     "FuseRegion", "CollectiveTransform", "HoistOrDeduplicate", "StreamSchedule", "StreamCoreBudget",
 })
 
+#: Canonical 3-stage + residual waterfall stage identifiers shared across Sheet 1 & Sheet 4.
+WF_STAGE_CONFIG = "config"
+WF_STAGE_FRAMEWORK = "framework"
+WF_STAGE_KERNEL = "kernel"
+WF_STAGE_RESIDUAL = "residual"
+_FRAMEWORK_REASONS = frozenset({
+    "stream_masking_change",
+    "shipping_fusion_enablement",
+    "subgraph_reassociation",
+    "shipping_route_switch",
+    "framework_graph_edit",
+})
+
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -740,6 +753,58 @@ def _qualify_action_groups(
     return qualified, qualified_keys
 
 
+def classify_waterfall_stage(
+    acc: GroupAccounting,
+    before_bundle: ExportBundle,
+    after_bundle: ExportBundle,
+) -> tuple[str, str | None]:
+    """Classify one ``GroupAccounting`` row into canonical waterfall stage(s) via public config."""
+    same_cfg = is_same_public_config(before_bundle, after_bundle)
+    if acc.bucket == "config":
+        if same_cfg or acc.reason in _FRAMEWORK_REASONS:
+            return WF_STAGE_FRAMEWORK, None
+        return WF_STAGE_CONFIG, None
+    has_cfg_split = (
+        not same_cfg
+        and acc.after_pre_edit_ms is not None
+        and abs(float(acc.config_share_ms)) > CONSERVATION_EPS_MS
+    )
+    if acc.bucket in {"new", "tune"}:
+        return (WF_STAGE_CONFIG, WF_STAGE_KERNEL) if has_cfg_split else (WF_STAGE_KERNEL, None)
+    if has_cfg_split:
+        return WF_STAGE_CONFIG, WF_STAGE_RESIDUAL
+    return WF_STAGE_RESIDUAL, None
+
+
+def _classified_stage_ns(
+    accounting: Sequence[GroupAccounting],
+    waterfall: WaterfallSummary,
+    before_bundle: ExportBundle,
+    after: ExportBundle,
+) -> tuple[int, int]:
+    """Compute exact int-ns Sheet 4 ``[1] Config`` and ``[2] Framework`` deltas."""
+    cfg_ns = 0
+    fwk_ns = 0
+    for acc in accounting:
+        st_primary, st_secondary = classify_waterfall_stage(acc, before_bundle, after)
+        if st_secondary is not None and acc.after_pre_edit_ms is not None:
+            pre_ns = int(round(float(acc.config_share_ms) * float(NS_PER_MS)))
+            if st_primary == WF_STAGE_CONFIG:
+                cfg_ns += pre_ns
+            elif st_primary == WF_STAGE_FRAMEWORK:
+                fwk_ns += pre_ns
+        else:
+            saved_ns = int(round(float(acc.saved_ms) * float(NS_PER_MS)))
+            if st_primary == WF_STAGE_CONFIG:
+                cfg_ns += saved_ns
+            elif st_primary == WF_STAGE_FRAMEWORK:
+                fwk_ns += saved_ns
+    same_pub_cfg = is_same_public_config(before_bundle, after)
+    if not same_pub_cfg and (waterfall.idle_before_ns > 0 or waterfall.idle_after_ns > 0):
+        cfg_ns += int(waterfall.idle_before_ns) - int(waterfall.idle_after_ns)
+    return cfg_ns, fwk_ns
+
+
 def _project_canonical_stage_waterfall(
     before_bundle: ExportBundle,
     after: ExportBundle,
@@ -747,23 +812,25 @@ def _project_canonical_stage_waterfall(
     b_step_ns: int,
     a_step_ns: int,
     same_config: bool,
+    accounting: Sequence[GroupAccounting] = (),
+    waterfall: WaterfallSummary | None = None,
 ) -> tuple[dict[str, Any], ...]:
-    """Project exact int-ns 4-stage waterfall directly from ``EngineStepReceipt`` (zero clamping)."""
+    """Project exact int-ns 4-stage waterfall aligned identically with Sheet 4 ``D3:D9``."""
+    cfg_ns, fwk_ns = (
+        _classified_stage_ns(accounting, waterfall, before_bundle, after)
+        if waterfall is not None
+        else (0, 0)
+    )
+    s1_ns = b_step_ns - cfg_ns
+    s2_ns = s1_ns - fwk_ns
     receipt = getattr(after, "engine_step_receipt", None)
     if receipt is not None and getattr(receipt, "stages", None):
         stages = tuple(receipt.stages)
-        first_ns = int(stages[0].span_ns)
+        spans_by_idx = (b_step_ns, s1_ns, s2_ns, a_step_ns)
         out: list[dict[str, Any]] = []
         prev_ns = b_step_ns
         for idx, st in enumerate(stages):
-            if idx == 0:
-                st_ns = b_step_ns
-            elif st.status == "committed":
-                st_ns = int(st.span_ns)
-            elif idx == 1 and b_step_ns != first_ns:
-                st_ns = first_ns
-            else:
-                st_ns = prev_ns
+            st_ns = spans_by_idx[idx] if idx < len(spans_by_idx) else a_step_ns
             delta_ns = 0 if idx == 0 else int(prev_ns - st_ns)
             prev_ns = st_ns
             out.append({
@@ -777,20 +844,17 @@ def _project_canonical_stage_waterfall(
                 "l_star_ns": int(st.l_star_ns),
                 "l_star_valid": bool(st.l_star_valid),
                 "idle_or_wait_ns": int(st.idle_or_wait_ns),
-                "config_bridge_ns": (b_step_ns - first_ns) if idx == 1 else 0,
+                "config_bridge_ns": cfg_ns if idx == 1 else 0,
             })
         return tuple(out)
 
     a_track = str(after.feature_track or "shipping").strip().lower()
     b_track = str(before_bundle.feature_track or "shipping").strip().lower()
-    s1_ns = a_step_ns if (not same_config and a_track == b_track) else b_step_ns
-    s2_ns = a_step_ns if a_track == "proposed" else s1_ns
-    s3_ns = a_step_ns
     spans = (
         ("before_merged", b_track, b_step_ns, 0),
         ("stage1_ops_config", a_track if s1_ns != b_step_ns else b_track, s1_ns, b_step_ns - s1_ns),
         ("stage2_unmerged_pr", a_track if s2_ns != s1_ns else b_track, s2_ns, s1_ns - s2_ns),
-        ("stage3_target_after", a_track, s3_ns, s2_ns - s3_ns),
+        ("stage3_target_after", a_track, a_step_ns, s2_ns - a_step_ns),
     )
     return tuple(
         {
@@ -994,6 +1058,7 @@ def build_comparison_plan(
     anchored_stage_wf = (
         _project_canonical_stage_waterfall(
             before_bundle, after, b_step_ns=b_step_ns, a_step_ns=a_step_ns, same_config=same_config,
+            accounting=accounting, waterfall=waterfall,
         )
         if is_comparison
         else tuple(dict(item) for item in (before_bundle.stage_waterfall or ()) if isinstance(item, Mapping))
@@ -1056,7 +1121,9 @@ def build_actionable_roadmap(
 
 __all__ = [
     "CONSERVATION_EPS_MS", "MAX_DISPLAY_CARDS", "NEW_KERNEL_MIN_SAVED_MS", "TUNE_MIN_SAVED_MS",
+    "WF_STAGE_CONFIG", "WF_STAGE_FRAMEWORK", "WF_STAGE_KERNEL", "WF_STAGE_RESIDUAL",
     "ComparisonPlan", "GroupAccounting", "WaterfallSummary",
     "build_actionable_roadmap", "build_comparison_plan", "build_new_kernel_backlog",
-    "build_parallelism_codesign_note", "build_pending_kernel_details", "format_signed_gain_text",
+    "build_parallelism_codesign_note", "build_pending_kernel_details",
+    "classify_waterfall_stage", "format_signed_gain_text",
 ]

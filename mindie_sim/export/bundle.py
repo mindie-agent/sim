@@ -73,6 +73,7 @@ from mindie_sim.prediction.results import LoweringRequest
 from mindie_sim.prediction.spine import default_spine
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.primitives.loader import _table_band_p50
+from mindie_sim.rewrite.oracle import prewarm_cohort_diff_ops, refine_layer_cohort_plan
 from mindie_sim.rewrite.schema import load_rewrite_plan
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
@@ -1112,8 +1113,11 @@ def _evaluate_representative_step(
         else None
     )
     eff_streams = tuple(rewritten.streams or ()) or tuple(streams)
+    refined_cohort = refine_layer_cohort_plan(eff_case, graphs[0]) if 0 in graphs else None
+    if refined_cohort is not None and 0 in graphs:
+        prewarm_cohort_diff_ops(eff_case, graphs[0], refined_cohort, evaluation, book)
     report, reduced_graphs, op_rep_map = execute_native_cohort_graph(
-        eff_case, graphs, recipes=book, external_inputs=ext_inputs,
+        eff_case, graphs, cohort_plan=refined_cohort, recipes=book, external_inputs=ext_inputs,
         include_submission=replay.include_submission, isolated=replay.isolated,
         trace_limit=replay.event_limit, compact=False, evaluation=evaluation,
         stream_plans=eff_streams or None, request_views=rewritten.request_views,
@@ -2134,6 +2138,8 @@ def _apply_target_envelope_to_rows(
     rep_lp_by_idx: Mapping[int, Any] = (),
     streams: tuple[Any, ...] = (),
     target_max_trials: int = DEFAULT_EXPORT_TARGET_TRIALS,
+    deferred_prelim: bool = False,
+    use_archetype_dedup: bool = False,
 ) -> tuple[
     list[OperatorExportRow],
     list[tuple[int, int, int, int, int]],
@@ -2154,6 +2160,11 @@ def _apply_target_envelope_to_rows(
     int,
     bool,
     dict[tuple[int, str], OpSpec],
+    Case,
+    dict[int, dict[str, Any]],
+    str,
+    tuple[FusedPipelineDescriptor, ...],
+    Any,
 ]:
     """Consume canonical 4-stage ``EngineStepReceipt`` from ``W3a`` ladder."""
     del cluster_conc
@@ -2205,6 +2216,11 @@ def _apply_target_envelope_to_rows(
     out_demands = list(demands_ns)
     out_archs = tuple(archetypes)
     out_spec_map: dict[tuple[int, str], OpSpec] = dict(op_spec_by_key)
+    out_case = eff_case
+    out_peaks: dict[int, dict[str, Any]] = dict(peaks_by_stage)
+    out_gid = ""
+    out_pipes: tuple[FusedPipelineDescriptor, ...] = ()
+    out_pt = rebound_primitive_table
     out_span_ns = int(final_stage.span_ns)
     out_idle_ns = int(final_stage.idle_or_wait_ns)
     out_l_star_ns = int(final_stage.l_star_ns)
@@ -2214,10 +2230,10 @@ def _apply_target_envelope_to_rows(
         final_stage.step_eval is not None
         and (stage0 is None or final_stage.plan_sha256 != stage0.plan_sha256 or final_stage.span_ns < stage0.span_ns)
     )
-    if has_improved_eval and final_stage.step_eval is not None:
+    if (has_improved_eval or deferred_prelim) and final_stage.step_eval is not None:
         (
             st_case, st_raw_records, st_spec_map, st_sources,
-            st_struct, st_subgraph, _st_gid, _st_pipes, _st_pt,
+            st_struct, st_subgraph, st_gid, st_pipes, st_pt,
         ) = _resolve_bundle_step_eval(
             eff_spine, parsed, step_req, final_stage.step_eval,
             primitive_table=rebound_primitive_table, streams=streams,
@@ -2225,7 +2241,7 @@ def _apply_target_envelope_to_rows(
         st_filtered, st_tail = _prepare_bundle_records(
             st_raw_records, archetypes=archetypes, use_archetype_dedup=False,
         )
-        st_rows, st_demands, _st_peaks = _build_prelim_operator_rows(
+        st_rows, st_demands, st_peaks = _build_prelim_operator_rows(
             st_filtered, eff_case=st_case, archetypes=archetypes, rep_lp_by_idx=rep_lp_by_idx,
             use_archetype_dedup=False, sources_by_op=st_sources,
             struct_by_op=st_struct, subgraph_by_op=st_subgraph,
@@ -2239,16 +2255,31 @@ def _apply_target_envelope_to_rows(
         )
         out_demands = st_demands
         out_spec_map = st_spec_map
+        if deferred_prelim:
+            out_case, out_peaks, out_gid, out_pipes, out_pt = (
+                st_case, st_peaks, st_gid, st_pipes, st_pt,
+            )
     else:
+        if deferred_prelim and not out_rows:
+            (
+                out_case, out_rows, out_demands, out_peaks, out_archs_list,
+                out_spec_map, out_gid, out_pipes, out_pt, _, _,
+            ) = _evaluate_bundle_prelim_rows(
+                eff_spine, parsed, step_req, None, replay,
+                archetypes=list(archetypes), rep_lp_by_idx=rep_lp_by_idx,
+                use_archetype_dedup=use_archetype_dedup,
+                primitive_table=rebound_primitive_table, streams=streams,
+            )
+            out_archs = tuple(out_archs_list)
         out_rows, out_archs, out_span_ns, out_idle_ns = _apply_stage_exposed_ns(
             out_rows, out_archs, final_stage,
         )
 
     co_opps = collect_codesign_opportunities(
-        eff_case,
+        out_case,
         step_request=step_req,
         step_receipt=receipt,
-        primitive_table=pt_arg,
+        primitive_table=(None if out_pt is False else out_pt),
     )
     return (
         out_rows,
@@ -2270,6 +2301,11 @@ def _apply_target_envelope_to_rows(
         out_l_star_ns,
         out_l_star_valid,
         out_spec_map,
+        out_case,
+        out_peaks,
+        out_gid,
+        out_pipes,
+        out_pt,
     )
 
 
@@ -2519,23 +2555,38 @@ def build_export_bundle(
         and (len(rep_lp_by_idx) < len(parsed.model.layer_plans) or total_draft_layers > 1)
     )
     spine = default_spine()
-    (
-        eff_case, prelim_rows, demands_ns, peaks_by_stage, archetypes,
-        op_spec_by_key, graph_id, pipelines, rebound_primitive_table,
-        unfolded_span_ns, unfolded_idle_ns,
-    ) = _evaluate_bundle_prelim_rows(
-        spine, parsed, step_req, step_eval, replay,
-        archetypes=archetypes, rep_lp_by_idx=rep_lp_by_idx,
-        use_archetype_dedup=use_archetype_dedup,
-        primitive_table=primitive_table, streams=streams,
-    )
-    step_l_star_ns, step_cert_valid, step_tight_res = _certify_step_lower_bound(
-        prelim_rows, demands_ns, step_span_ns=unfolded_span_ns,
-    )
     should_synthesize = True if rewrite_plan is not None else (
         apply_target_envelope if apply_target_envelope is not None
         else (track_name == "target" and step_eval is None and observations_path is None)
     )
+    defer_prelim = should_synthesize and step_eval is None and observations_path is None and not streams
+    if defer_prelim:
+        eff_case = parsed
+        prelim_rows: list[OperatorExportRow] = []
+        demands_ns: list[tuple[int, int, int, int, int]] = []
+        peaks_by_stage: dict[int, dict[str, Any]] = {}
+        op_spec_by_key: dict[tuple[int, str], OpSpec] = {}
+        graph_id, pipelines = "", ()
+        rebound_primitive_table: Any = (
+            False if primitive_table is False
+            else EvaluationContext.create(parsed, None, None, primitive_table=primitive_table).bindings.primitive_table
+        )
+        unfolded_span_ns, unfolded_idle_ns = 0, 0
+        step_l_star_ns, step_cert_valid, step_tight_res = 0, True, ""
+    else:
+        (
+            eff_case, prelim_rows, demands_ns, peaks_by_stage, archetypes,
+            op_spec_by_key, graph_id, pipelines, rebound_primitive_table,
+            unfolded_span_ns, unfolded_idle_ns,
+        ) = _evaluate_bundle_prelim_rows(
+            spine, parsed, step_req, step_eval, replay,
+            archetypes=archetypes, rep_lp_by_idx=rep_lp_by_idx,
+            use_archetype_dedup=use_archetype_dedup,
+            primitive_table=primitive_table, streams=streams,
+        )
+        step_l_star_ns, step_cert_valid, step_tight_res = _certify_step_lower_bound(
+            prelim_rows, demands_ns, step_span_ns=unfolded_span_ns,
+        )
     synthesis_specs: tuple[Any, ...] = ()
     audit_triggers: tuple[Any, ...] = ()
     plan_digest, plan_verified = "", False
@@ -2554,6 +2605,7 @@ def build_export_bundle(
             engine_step_receipt, reverted_to_native_baseline,
             unfolded_span_ns, unfolded_idle_ns, step_l_star_ns, step_cert_valid,
             op_spec_by_key,
+            st_eff_case, st_peaks, st_gid, st_pipes, st_pt,
         ) = _apply_target_envelope_to_rows(
             prelim_rows, demands_ns, archetypes, parsed=parsed, eff_case=eff_case,
             step_req=step_req, cluster_conc=cluster_conc, op_spec_by_key=op_spec_by_key,
@@ -2561,7 +2613,12 @@ def build_export_bundle(
             rebound_primitive_table=rebound_primitive_table, allow_unbound_formula=allow_unbound_formula,
             spine=spine, replay=replay, rep_lp_by_idx=rep_lp_by_idx, streams=streams,
             target_max_trials=target_max_trials,
+            deferred_prelim=defer_prelim, use_archetype_dedup=use_archetype_dedup,
         )
+        if defer_prelim:
+            eff_case, peaks_by_stage, graph_id, pipelines, rebound_primitive_table = (
+                st_eff_case, st_peaks, st_gid, st_pipes, st_pt,
+            )
         unfolded_l_star_check, _, step_tight_res = _certify_step_lower_bound(
             prelim_rows, demands_ns, step_span_ns=unfolded_span_ns,
         )

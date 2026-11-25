@@ -9,12 +9,13 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from fractions import Fraction
 from graphlib import CycleError, TopologicalSorter
 from itertools import combinations
 from math import fsum, isclose, isfinite
-from typing import Literal
+from typing import Any, Literal
 
 from mindie_sim.backends.abi_registry import default_abi_registry
 from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO
@@ -30,15 +31,23 @@ from mindie_sim.prediction.streams import MAIN_STREAM, bind_stream_owners, propo
 from mindie_sim.prediction.execution.weight_prefetch import residency_peak
 from mindie_sim.schema.abi import validate_fusion_tier_verdict
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.templates.contracts import DslKernelSpec
 
 from .algebra import AlgebraicTrait, _resolve_soc_arch, classify_op_traits
 from .apply import (
     AppliedPlan, ResolvedScenario, _check_stream, _convex, _dependencies, _die, _path,
     _solve_tiles, _successors, _topological,
 )
-from .catalog_replay import _replay_ops
+from .catalog_replay import (
+    _canon_digest_value,
+    _catalog_lowerer,
+    _declared_regions,
+    _matrix_problem,
+    _replay_ops,
+    replay_catalog_binding,
+    summary_matches_canonical,
+)
 from .dual_cert import (
-    _check_region_summary_bindings,
     build_dual_inputs_from_scenario,
     check_optimality_certificate,
 )
@@ -58,6 +67,379 @@ _TRANSFER_SERVICE = {"mte2": ("mte2@", "mte2_aic@", "mte2_aiv@"), "hbm": ("memor
 _TEMPLATE_SERVICE = {**_TRANSFER_SERVICE, "cube": _MATRIX_SERVICE_PREFIXES,
                      "vector": ("vector@",), "mte3": ("mte3@",), "link": ("link:",)}
 _COHORT_PREFIX = "rewrite_cohort"
+_MAX_CATALOG_MEMO_ENTRIES = 128
+_RANK_LABEL_METADATA_KEYS = frozenset({
+    "ep_rank", "rank", "local_rank", "dp_rank", "tp_rank",
+    "pp_rank", "replica", "die_id", "die_rank", "owner_rank",
+})
+_CATLASS_SPEC_META_KEYS = (
+    "l1_tile_shape", "l0_tile_shape", "mutex_stages", "simt_thread_block_dim",
+    "swizzle_offsets", "evg_tree", "enable_unit_flag", "l1_resident_slot_match",
+)
+
+
+def _norm_self_prefix(value: Any, self_prefix: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(self_prefix, "__self__:") if self_prefix and self_prefix in value else value
+    if isinstance(value, tuple):
+        return tuple(_norm_self_prefix(item, self_prefix) for item in value)
+    return value
+
+
+def _norm_catalog_op(item: Any, replica: int) -> tuple[Any, ...]:
+    self_prefix = f"analysis{replica}:"
+    meta = tuple(
+        sorted(
+            (k, _norm_self_prefix(_canon_digest_value(v), self_prefix))
+            for k, v in item.metadata
+            if k not in _RANK_LABEL_METADATA_KEYS
+        )
+    )
+    return (
+        item.op_id, item.family, item.recipe, item.stage, item.layer,
+        item.dtype, item.local_shape, item.padded_shape, item.launch_shape,
+        item.layout, item.flops, item.matrix_flops, item.vector_ops,
+        item.hbm_bytes, item.mte2_bytes, item.mte3_bytes, item.link_bytes,
+        item.source_boundary, meta,
+    )
+
+
+def _norm_catalog_datapath(path: Any) -> Any:
+    return replace(path, ub_peer_edges=()) if hasattr(path, "ub_peer_edges") else path
+
+
+def _can_retag_problem_ids(problem: Any) -> bool:
+    raw = (problem.a_id, problem.b_id, problem.c_id, problem.indices_id)
+    distinct = tuple(x for x in raw if x)
+    if len(set(distinct)) != len(distinct):
+        return False
+    return not any(x != y and y.startswith(x + ":") for x in distinct for y in distinct)
+
+
+def _alloc_id_replacements(old_problem: Any, new_problem: Any) -> tuple[tuple[str, str], ...]:
+    if old_problem is None or new_problem is None:
+        return ()
+    pairs = (
+        (old_problem.a_id, new_problem.a_id),
+        (old_problem.b_id, new_problem.b_id),
+        (old_problem.c_id, new_problem.c_id),
+        (old_problem.indices_id, new_problem.indices_id),
+    )
+    return tuple((src, dst) for src, dst in pairs if src and dst and src != dst)
+
+
+def _remap_alloc_id(value: str, replacements: tuple[tuple[str, str], ...]) -> str:
+    for src, dst in replacements:
+        if value == src:
+            return dst
+        if value.startswith(src + ":"):
+            return dst + value[len(src):]
+    return value
+
+
+def _retag_access_record(rec: Any, target_die: int, replacements: tuple[tuple[str, str], ...]) -> Any:
+    if rec is None:
+        return None
+    pat = rec.pattern
+    new_tensor = _remap_alloc_id(pat.tensor_id, replacements) if replacements else pat.tensor_id
+    rkey = pat.reuse_key
+    if rkey is not None:
+        rk_backing = _remap_alloc_id(rkey.backing_allocation, replacements) if replacements else rkey.backing_allocation
+        rk_stream = (
+            _remap_alloc_id(rkey.reuse_stream, replacements)
+            if (replacements and rkey.reuse_stream)
+            else rkey.reuse_stream
+        )
+        rkey = replace(rkey, die=target_die, backing_allocation=rk_backing, reuse_stream=rk_stream)
+    return replace(rec, pattern=replace(pat, die=target_die, tensor_id=new_tensor, reuse_key=rkey))
+
+
+def _retag_summary_for_site(
+    raw_summary: Any,
+    op_ids: tuple[str, ...],
+    *,
+    die: int,
+    replica: int,
+    stage: int,
+    is_dsl: bool,
+    op_id: str,
+    alloc_replacements: tuple[tuple[str, str], ...] = (),
+) -> Any:
+    """Stamp exact per-site ``(die, replica, pp_stage, region_id, alloc_ids)`` on a pure summary."""
+    old_rid = raw_summary.region_id
+    old_prefix = f"{old_rid}:"
+    new_prefix = f"{op_id}:"
+
+    def _retag_work(item: Any) -> Any:
+        wid = item.work_id
+        if old_rid != op_id and wid.startswith(old_prefix):
+            wid = new_prefix + wid[len(old_prefix):]
+        return replace(item, work_id=wid, die=die, replica=replica, pp_stage=stage)
+
+    def _retag_obligations(items: tuple[Any, ...]) -> tuple[Any, ...]:
+        if is_dsl:
+            return tuple(
+                replace(item, die=die, allocation_id=f"{op_id}:{item.allocation_id}")
+                for item in items
+            )
+        if alloc_replacements:
+            return tuple(
+                replace(item, die=die, allocation_id=_remap_alloc_id(item.allocation_id, alloc_replacements))
+                for item in items
+            )
+        return tuple(replace(item, die=die) for item in items)
+
+    return replace(
+        raw_summary,
+        region_id=op_id,
+        op_ids=op_ids,
+        semantic_work=tuple(_retag_work(item) for item in raw_summary.semantic_work),
+        read_obligations=_retag_obligations(raw_summary.read_obligations),
+        write_obligations=_retag_obligations(raw_summary.write_obligations),
+    )
+
+
+def _retag_catalog_program_for_site(
+    program: Any,
+    target_die: int,
+    raw_summary_for_site: Any,
+    *,
+    new_problem: Any = None,
+    alloc_replacements: tuple[tuple[str, str], ...] = (),
+) -> Any:
+    """Clone a pure lowered ``with_context`` catalog program onto ``(target_die, new_problem)``."""
+    same_rid = getattr(getattr(program, "summary", None), "region_id", None) == raw_summary_for_site.region_id
+    if getattr(program, "die", None) == target_die and not alloc_replacements and same_rid:
+        return program
+    if (
+        getattr(program, "context", None) is not None
+        or getattr(program, "hbm_bus", None) is not None
+        or getattr(program, "initial_state", None) is not None
+        or getattr(program, "live_state", None) is not None
+    ):
+        return None
+    eff_problem = new_problem if new_problem is not None else getattr(program, "problem", None)
+    if hasattr(program, "waves"):
+        retagged_waves = tuple(
+            tuple(
+                replace(
+                    cohort,
+                    phases=tuple(
+                        replace(
+                            phase,
+                            panels=tuple(
+                                replace(
+                                    panel,
+                                    gm_a=_retag_access_record(panel.gm_a, target_die, alloc_replacements),
+                                    scale_a=_retag_access_record(panel.scale_a, target_die, alloc_replacements),
+                                    gm_b=_retag_access_record(panel.gm_b, target_die, alloc_replacements),
+                                    scale_b=_retag_access_record(panel.scale_b, target_die, alloc_replacements),
+                                )
+                                for panel in phase.panels
+                            ),
+                        )
+                        for phase in cohort.phases
+                    ),
+                    drain=_retag_access_record(cohort.drain, target_die, alloc_replacements),
+                )
+                for cohort in wave_cohorts
+            )
+            for wave_cohorts in program.waves
+        )
+        return replace(
+            program, die=target_die, problem=eff_problem,
+            waves=retagged_waves, summary=raw_summary_for_site,
+        )
+    if type(program).__name__ == "_StreamingCatlassProgram":
+        return replace(program, die=target_die, problem=eff_problem, summary=raw_summary_for_site)
+    return None
+
+
+def _resolve_catalog_request(op: Any, template: Any, applied: AppliedPlan, atomic_entry: Any):
+    if template and template.tier in {"K2", "K3"} and template.template_id.startswith(("catlass.", "dsl.")):
+        return template.tier, template.template_id, template.params, (op,), False
+    if op.family == "rewrite_fused" and dict(op.metadata).get("fusion_tier") == "K3_dsl_pipeline":
+        edit = next(edit for edit in applied.plan.edits if op.op_id == f"rewrite:{edit.edit_id}")
+        operation = edit.operation
+        if (
+            not isinstance(operation, FuseRegion)
+            or len(operation.kernel_boundaries) != 1
+            or any(ref.kind != "atom" for ref in operation.members)
+        ):
+            return None
+        ids = {ref.id for ref in operation.members}
+        members = tuple(member for member in atomic_entry.ops if member.op_id in ids)
+        boundary, = operation.kernel_boundaries
+        identifier = boundary.abi_id
+        if identifier.startswith("dsl."):
+            return "K3", identifier, boundary.params, members, False
+        if any(decl["region_id"] == identifier for _, _, decl in _declared_regions(atomic_entry.ops)):
+            return "K3", identifier, boundary.params, members, True
+    return None
+
+
+def _memoized_catalog_lowering(
+    scenario: ResolvedScenario,
+    atomic_entry: Any,
+    op: Any,
+    template: Any,
+    applied: AppliedPlan,
+    stream: Any,
+    catalog_memo: dict[Any, Any],
+    *,
+    need_program: bool,
+) -> tuple[Any, Any, Any, Any, tuple[int, int], int, Callable[..., Any], Any] | None:
+    """Resolve one K2/K3 site via cross-layer/cross-replica memo with exact per-site retagging."""
+    req = _resolve_catalog_request(op, template, applied, atomic_entry)
+    if req is None:
+        return None
+    tier, tpl_id, params, members, is_explicit_region = req
+    if is_explicit_region:
+        bound = replay_catalog_binding(scenario, atomic_entry, op, template, applied, stream)
+        if bound is None:
+            return None
+        recipe, summary = bound
+        return ("explicit", recipe, summary, None, (0, 0), 0, lambda *a, **kw: None, None)
+    path = _path(scenario, atomic_entry.replica, op.stage)
+    limits = (path.aic_count, path.aiv_count)
+    if stream is not None:
+        owners = bind_stream_owners(stream, path)[dict(stream.assignments).get(op.op_id, MAIN_STREAM)]
+        limits = (owners.aic_limit, owners.aiv_limit)
+    die = _die(scenario, atomic_entry.replica, op.stage).rank
+    problem = _matrix_problem(op, dict(op.metadata)) if (tier == "K2" and tpl_id.startswith("catlass.")) else None
+    if problem is not None and _can_retag_problem_ids(problem):
+        meta_dict = dict(op.metadata)
+        catlass_opts = tuple((k, _canon_digest_value(meta_dict[k])) for k in _CATLASS_SPEC_META_KEYS if k in meta_dict)
+        norm_problem = replace(problem, a_id="__a__", b_id="__b__", c_id="__c__", indices_id="__idx__")
+        memo_key: tuple[Any, ...] = (
+            "K2_norm", tpl_id, _canon_digest_value(params), _canon_digest_value(norm_problem),
+            catlass_opts, _canon_digest_value(_norm_catalog_datapath(path)), limits,
+        )
+    else:
+        problem = None
+        memo_key = (
+            tier, tpl_id, _canon_digest_value(params),
+            _norm_catalog_op(op, atomic_entry.replica),
+            tuple(_norm_catalog_op(member, atomic_entry.replica) for member in members),
+            _canon_digest_value(_norm_catalog_datapath(path)), limits,
+        )
+    cached = catalog_memo.get(memo_key)
+    if cached is None:
+        lower = _catalog_lowerer(op, members, atomic_entry.ops, path, tier, tpl_id, params, limits)
+        result = lower(path, die=die, region_id=op.op_id)
+        if len(catalog_memo) >= _MAX_CATALOG_MEMO_ENTRIES:
+            catalog_memo.pop(next(iter(catalog_memo)))
+        catalog_memo[memo_key] = (lower, result, problem, op.op_id, die)
+        src_problem, src_op_id, src_die = problem, op.op_id, die
+        site_prog = result.program if need_program else None
+    else:
+        lower, result, src_problem, src_op_id, src_die = cached
+        site_prog = None
+    alloc_repls = _alloc_id_replacements(src_problem, problem) if (src_problem is not None and problem is not None) else ()
+    is_dsl = isinstance(result.summary.spec, DslKernelSpec)
+    if need_program and site_prog is None:
+        if hasattr(result.program, "with_context"):
+            raw_for_site = _retag_summary_for_site(
+                result.summary, (op.op_id,) if not is_dsl else result.summary.op_ids,
+                die=die, replica=0, stage=0, is_dsl=False, op_id=op.op_id,
+                alloc_replacements=alloc_repls,
+            )
+            site_prog = _retag_catalog_program_for_site(
+                result.program, die, raw_for_site, new_problem=problem, alloc_replacements=alloc_repls,
+            )
+            if site_prog is None:
+                local_lower = (
+                    lower if not alloc_repls
+                    else _catalog_lowerer(op, members, atomic_entry.ops, path, tier, tpl_id, params, limits)
+                )
+                site_prog = local_lower(path, die=die, region_id=op.op_id).program
+        elif not alloc_repls and src_op_id == op.op_id and src_die == die:
+            site_prog = result.program
+        elif is_dsl:
+            site_prog = result.program
+        else:
+            # Programs without ``with_context`` are lowered lazily per executing site
+            # via ``site.lower(dp, context=context, die=site.die, region_id=site.op_id)``.
+            site_prog = None
+    op_ids = (
+        dict(applied.absorbed_atoms)[op.op_id]
+        if (template and op.family == "rewrite_fused")
+        else tuple(member.op_id for member in members)
+    )
+    summary = _retag_summary_for_site(
+        result.summary, op_ids, die=die, replica=atomic_entry.replica, stage=op.stage,
+        is_dsl=is_dsl, op_id=op.op_id, alloc_replacements=alloc_repls,
+    )
+    site_lower = (
+        lower if (not alloc_repls and src_op_id == op.op_id)
+        else _catalog_lowerer(op, members, atomic_entry.ops, path, tier, tpl_id, params, limits)
+    )
+    return ("memo", site_prog, summary, path, limits, die, site_lower, result)
+
+
+def _verify_region_summary_bindings(
+    scenario: ResolvedScenario,
+    applied: AppliedPlan,
+    summaries: tuple[Any, ...],
+    *,
+    require_catalog: bool = False,
+    catalog_memo: dict[Any, Any] | None = None,
+) -> None:
+    """Verify region summaries against canonical K2/K3 lowerings with cross-layer/replica memo."""
+    if not summaries:
+        return
+    fusions = {f"rewrite:{edit.edit_id}" for edit in applied.plan.edits if isinstance(edit.operation, FuseRegion)}
+    members = {region: atoms for region, atoms in applied.absorbed_atoms if region in fusions}
+    members.update(
+        (binding.target_op, (binding.target_op,))
+        for binding in applied.template_bindings
+        if binding.target_op not in members
+    )
+    bound: dict[tuple[str, tuple[str, ...]], set[tuple[int, int, int]]] = defaultdict(set)
+    for rank in applied.executable:
+        for op in rank.ops:
+            if op.op_id in members and (op.op_id not in fusions or op.family == "rewrite_fused"):
+                die = _die(scenario, rank.replica, op.stage).rank
+                bound[op.op_id, members[op.op_id]].add((rank.replica, op.stage, die))
+    memo = {} if catalog_memo is None else catalog_memo
+    templates = {binding.target_op: binding for binding in applied.template_bindings}
+    atomic = {entry.replica: entry for entry in scenario.atomic_ops}
+    streams = {stream.rank: stream for stream in applied.streams}
+    needed_ids = {s.region_id for s in summaries}
+    canonical: dict[tuple[int, int, str], Any] = {}
+    for entry in applied.executable:
+        rank_atomic = atomic.get(entry.replica)
+        if rank_atomic is None:
+            continue
+        stream = streams.get(entry.replica)
+        for op in entry.ops:
+            if op.op_id not in needed_ids:
+                continue
+            resolved = _memoized_catalog_lowering(
+                scenario, rank_atomic, op, templates.get(op.op_id), applied, stream, memo,
+                need_program=False,
+            )
+            if resolved is not None:
+                canonical[entry.replica, op.stage, op.op_id] = resolved[2]
+    for summary in summaries:
+        work_sites = {(item.replica, item.pp_stage, item.die) for item in summary.semantic_work}
+        dies = {item.die for group in (summary.read_obligations, summary.write_obligations) for item in group}
+        key = summary.region_id, tuple(summary.op_ids)
+        matches = sorted(
+            site for site in bound.get(key, ())
+            if (not work_sites or work_sites == {site}) and (not dies or dies == {site[-1]})
+        )
+        chosen = next((
+            site for site in matches
+            if (
+                (expected := canonical.get((site[0], site[1], summary.region_id))) is not None
+                and summary_matches_canonical(summary, expected)
+            )
+            or (expected is None and not require_catalog)
+        ), None)
+        if chosen is None:
+            raise ModelingError(f"LEDGER_RECONCILIATION_ERROR:unbound_region_summary:{summary.region_id}")
+        bound[key].remove(chosen)
 
 
 class SoundnessInversionError(ModelingError):
@@ -134,8 +516,8 @@ def compute_overlap_pct(intervals_x, intervals_y) -> float | None:
     return 100 * fsum(intersections) / denominator
 
 
-def _ancestor_masks(ops, stream=None) -> tuple[dict[str, int], dict[str, int]]:
-    """Compute transitive ancestor bitmasks over full canonical dependencies in O(V + E)."""
+def _ancestor_graph(ops, stream=None) -> tuple[tuple, dict[str, set[str]], dict[str, int], dict[str, int]]:
+    """Compute topological order, deps, and transitive ancestor bitmasks in O(V + E)."""
     by_id = {op.op_id: op for op in ops}
     ordered = _topological(by_id)
     deps_map = _dependencies(ordered, stream)
@@ -147,6 +529,12 @@ def _ancestor_masks(ops, stream=None) -> tuple[dict[str, int], dict[str, int]]:
             if dep in bit:
                 mask |= bit[dep] | anc.get(dep, 0)
         anc[op.op_id] = mask
+    return ordered, deps_map, bit, anc
+
+
+def _ancestor_masks(ops, stream=None) -> tuple[dict[str, int], dict[str, int]]:
+    """Compute transitive ancestor bitmasks over full canonical dependencies in O(V + E)."""
+    _, _, bit, anc = _ancestor_graph(ops, stream)
     return bit, anc
 
 
@@ -199,6 +587,50 @@ def _dep_meta(op) -> tuple:
     )
 
 
+def _propagate_curr_trait_masks(
+    orig_ordered, orig_deps, traits, replacements, curr_bit,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int], dict[str, int]]:
+    """Propagate surviving current-graph trait masks along original DAG edges in O(V + E)."""
+    own_r: dict[str, int] = {}
+    own_s: dict[str, int] = {}
+    own_c: dict[str, int] = {}
+    own_sum: dict[str, int] = {}
+    for op in orig_ordered:
+        oid = op.op_id
+        tr = traits[oid]
+        r_oid = replacements.get(oid, oid)
+        c_bit = curr_bit.get(r_oid, 0)
+        own_r[oid] = c_bit if (
+            tr.trait in {AlgebraicTrait.ROW_REDUCTION, AlgebraicTrait.ATTENTION_CORE} or tr.is_nonlinear
+        ) else 0
+        own_s[oid] = c_bit if (
+            tr.trait in {AlgebraicTrait.ROW_REDUCTION, AlgebraicTrait.ATTENTION_CORE} or tr.is_precision_sensitive
+        ) else 0
+        own_c[oid] = c_bit if tr.trait == AlgebraicTrait.BILINEAR_MATMUL else 0
+        own_sum[oid] = c_bit if (
+            tr.trait == AlgebraicTrait.ASSOCIATIVE_COLLECTIVE and tr.collective_op == "SUM"
+        ) else 0
+
+    anc_r: dict[str, int] = {}
+    anc_s: dict[str, int] = {}
+    anc_c: dict[str, int] = {}
+    anc_sum: dict[str, int] = {}
+    for op in orig_ordered:
+        oid = op.op_id
+        mr = ms = mc = msum = 0
+        for dep in orig_deps.get(oid, ()):
+            if dep in own_r:
+                mr |= own_r[dep] | anc_r.get(dep, 0)
+                ms |= own_s[dep] | anc_s.get(dep, 0)
+                mc |= own_c[dep] | anc_c.get(dep, 0)
+                msum |= own_sum[dep] | anc_sum.get(dep, 0)
+        anc_r[oid] = mr
+        anc_s[oid] = ms
+        anc_c[oid] = mc
+        anc_sum[oid] = msum
+    return anc_r, anc_s, anc_c, anc_sum
+
+
 def _check_algebraic_commutativity(
     originals, current_ops, regions, applied, *, orig_stream=None, curr_stream=None,
 ) -> None:
@@ -217,9 +649,12 @@ def _check_algebraic_commutativity(
         if region in by_id for atom in atoms
     }
     traits = {op.op_id: classify_op_traits(op) for op in originals}
-    orig_bit, orig_anc = _ancestor_masks(originals, orig_stream)
-    curr_bit, curr_anc = _ancestor_masks(current_ops, curr_stream)
+    orig_ordered, orig_deps, orig_bit, orig_anc = _ancestor_graph(originals, orig_stream)
+    _, _, curr_bit, curr_anc = _ancestor_graph(current_ops, curr_stream)
     boundary_pos = _boundary_order_by_region(applied)
+    anc_r, anc_s, anc_c, anc_sum = _propagate_curr_trait_masks(
+        orig_ordered, orig_deps, traits, replacements, curr_bit,
+    )
 
     sum_collectives = [
         op.op_id for op in originals
@@ -231,27 +666,50 @@ def _check_algebraic_commutativity(
         if traits[op.op_id].trait in {AlgebraicTrait.ROW_REDUCTION, AlgebraicTrait.ATTENTION_CORE}
         or traits[op.op_id].is_nonlinear
     ]
+    nonlinear_or_red_set = set(nonlinear_or_red)
 
     # Guard 1: Never fuse or push NONLINEAR_NORM / ROW_REDUCTION across ASSOCIATIVE_COLLECTIVE(SUM).
+    for n_id in nonlinear_or_red:
+        rn = replacements.get(n_id, n_id)
+        if rn not in curr_bit:
+            continue
+        rn_bit = curr_bit[rn]
+        if anc_sum[n_id] & rn_bit:
+            for c_id in sum_collectives:
+                if c_id != n_id and replacements.get(c_id, c_id) == rn and (orig_anc.get(n_id, 0) & orig_bit[c_id]):
+                    raise ModelingError(f"NON_COMMUTATIVE_REWRITE:collective_sum_fusion:{c_id}:{n_id}")
+        if (anc_sum[n_id] & ~rn_bit) & ~curr_anc[rn]:
+            for c_id in sum_collectives:
+                rc = replacements.get(c_id, c_id)
+                if (
+                    c_id != n_id and rc != rn and rc in curr_bit
+                    and (orig_anc.get(n_id, 0) & orig_bit[c_id])
+                    and not (curr_anc.get(rn, 0) & curr_bit[rc])
+                ):
+                    raise ModelingError(f"NON_COMMUTATIVE_REWRITE:collective_sum_reorder:{n_id}_before_{c_id}")
+
     for c_id in sum_collectives:
         rc = replacements.get(c_id, c_id)
-        for n_id in nonlinear_or_red:
-            if c_id == n_id:
-                continue
-            rn = replacements.get(n_id, n_id)
-            c_before_n = bool(orig_anc.get(n_id, 0) & orig_bit[c_id])
-            n_before_c = bool(orig_anc.get(c_id, 0) & orig_bit[n_id])
-            if c_before_n:
-                if rc == rn:
-                    raise ModelingError(f"NON_COMMUTATIVE_REWRITE:collective_sum_fusion:{c_id}:{n_id}")
-                if rc in curr_bit and rn in curr_bit and not (curr_anc.get(rn, 0) & curr_bit[rc]):
-                    raise ModelingError(f"NON_COMMUTATIVE_REWRITE:collective_sum_reorder:{n_id}_before_{c_id}")
-            elif n_before_c:
-                if rc == rn and rc in boundary_pos:
-                    pos = boundary_pos[rc]
-                    if c_id in pos and n_id in pos and pos[c_id] < pos[n_id]:
-                        raise ModelingError(f"NON_COMMUTATIVE_REWRITE:collective_sum_reorder:{c_id}_before_{n_id}")
-                if rc != rn and rc in curr_bit and rn in curr_bit and not (curr_anc.get(rc, 0) & curr_bit[rn]):
+        if rc not in curr_bit:
+            continue
+        rc_bit = curr_bit[rc]
+        if rc in boundary_pos and (anc_r[c_id] & rc_bit):
+            pos = boundary_pos[rc]
+            for n_id in regions.get(rc, ()):
+                if (
+                    n_id != c_id and n_id in nonlinear_or_red_set
+                    and (orig_anc.get(c_id, 0) & orig_bit[n_id])
+                    and c_id in pos and n_id in pos and pos[c_id] < pos[n_id]
+                ):
+                    raise ModelingError(f"NON_COMMUTATIVE_REWRITE:collective_sum_reorder:{c_id}_before_{n_id}")
+        if (anc_r[c_id] & ~rc_bit) & ~curr_anc[rc]:
+            for n_id in nonlinear_or_red:
+                rn = replacements.get(n_id, n_id)
+                if (
+                    c_id != n_id and rc != rn and rn in curr_bit
+                    and (orig_anc.get(c_id, 0) & orig_bit[n_id])
+                    and not (curr_anc.get(rc, 0) & curr_bit[rn])
+                ):
                     raise ModelingError(f"NON_COMMUTATIVE_REWRITE:collective_sum_reorder:{c_id}_before_{n_id}")
 
     # Guard 2: Never reverse causal order across non-commuting reductions or Cube boundaries.
@@ -265,20 +723,42 @@ def _check_algebraic_commutativity(
         or traits[op.op_id].is_nonlinear
         or traits[op.op_id].is_precision_sensitive
     ]
-    for a_id in guarded:
-        ra = replacements.get(a_id, a_id)
-        tr_a = traits[a_id]
-        for b_id in guarded:
-            if a_id == b_id or not (orig_anc.get(b_id, 0) & orig_bit[a_id]):
-                continue
-            if not _is_non_commuting_pair(tr_a, traits[b_id]):
-                continue
-            rb = replacements.get(b_id, b_id)
-            if ra != rb and ra in curr_bit and rb in curr_bit and not (curr_anc.get(rb, 0) & curr_bit[ra]):
-                raise ModelingError(f"NON_COMMUTATIVE_REWRITE:non_commuting_reorder:{b_id}_before_{a_id}")
-            if ra == rb and ra in boundary_pos:
-                pos = boundary_pos[ra]
-                if a_id in pos and b_id in pos and pos[b_id] < pos[a_id]:
+    guarded_set = set(guarded)
+    for b_id in guarded:
+        rb = replacements.get(b_id, b_id)
+        if rb not in curr_bit:
+            continue
+        tr_b = traits[b_id]
+        req = 0
+        if tr_b.trait in {AlgebraicTrait.ROW_REDUCTION, AlgebraicTrait.ATTENTION_CORE} or tr_b.is_nonlinear:
+            req |= anc_r[b_id]
+        if tr_b.trait in {AlgebraicTrait.ROW_REDUCTION, AlgebraicTrait.ATTENTION_CORE} or tr_b.is_precision_sensitive:
+            req |= anc_c[b_id]
+        if tr_b.trait == AlgebraicTrait.BILINEAR_MATMUL:
+            req |= anc_s[b_id] | anc_c[b_id]
+        if (req & ~curr_bit[rb]) & ~curr_anc[rb]:
+            for a_id in guarded:
+                ra = replacements.get(a_id, a_id)
+                if (
+                    a_id != b_id and ra != rb and ra in curr_bit
+                    and (orig_anc.get(b_id, 0) & orig_bit[a_id])
+                    and _is_non_commuting_pair(traits[a_id], tr_b)
+                    and not (curr_anc.get(rb, 0) & curr_bit[ra])
+                ):
+                    raise ModelingError(f"NON_COMMUTATIVE_REWRITE:non_commuting_reorder:{b_id}_before_{a_id}")
+
+    for rid, pos in boundary_pos.items():
+        if rid not in by_id:
+            continue
+        r_atoms = [aid for aid in regions.get(rid, ()) if aid in guarded_set and aid in pos]
+        for a_id in r_atoms:
+            tr_a = traits[a_id]
+            for b_id in r_atoms:
+                if (
+                    a_id != b_id and pos[b_id] < pos[a_id]
+                    and (orig_anc.get(b_id, 0) & orig_bit[a_id])
+                    and _is_non_commuting_pair(tr_a, traits[b_id])
+                ):
                     raise ModelingError(f"NON_COMMUTATIVE_REWRITE:non_commuting_boundary_swap:{b_id}_before_{a_id}")
 
 
@@ -1205,9 +1685,9 @@ def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, 
 
 
 def _conservation(scenario, applied, summaries, step_eval=None, baseline_eval=None, baseline_work=None,
-                  service_replay=None, *, scope="full"):
+                  service_replay=None, *, scope="full", catalog_memo=None):
     _verify_fuse_region_witnesses(scenario, applied, scope, step_eval=step_eval, baseline_eval=baseline_eval)
-    _check_region_summary_bindings(scenario, applied, summaries)
+    _verify_region_summary_bindings(scenario, applied, summaries, catalog_memo=catalog_memo)
     hoists = set(applied.hoisted_load_time)
     cse = {edit.edit_id for edit in applied.plan.edits
            if isinstance(edit.operation, HoistOrDeduplicate) and edit.operation.scope == "intra_step"}
@@ -1262,10 +1742,19 @@ def _capture(name, check, *args, **kwargs):
     return GateReceipt(name, True)
 
 
-def _bound(scenario, applied, summaries, primitive_table, rate_mode, certificate, program, dag, wall, u, m, framework, dsl):
+def _bound(scenario, applied, summaries, primitive_table, rate_mode, certificate, program, dag, wall, u, m, framework, dsl,
+           *, catalog_memo=None):
     if program is not None or dag is not None:
+        if summaries:
+            _verify_region_summary_bindings(
+                scenario, applied, summaries, require_catalog=True, catalog_memo=catalog_memo,
+            )
         canonical_program, canonical_dag, _ = build_dual_inputs_from_scenario(
-            scenario, applied=applied, region_summaries=summaries, primitive_table=primitive_table, rate_mode=rate_mode,
+            scenario,
+            applied=(None if summaries else applied),
+            region_summaries=summaries,
+            primitive_table=primitive_table,
+            rate_mode=rate_mode,
         )
         if (program is not None and program != canonical_program) or (dag is not None and dag != canonical_dag):
             raise ModelingError("LEAN_CERTIFICATE_INVALID:certificate_unbound_to_scenario")
@@ -1322,6 +1811,7 @@ def verify_plan(
     dual_certificate=None, dual_program=None, event_dag=None, baseline_u_ns=None,
     baseline_m_ns=None, framework_ns=None, dsl_ns=None, region_summaries=(), scope="full",
     baseline_eval=None, baseline_work=None, service_replay=None, primitive_table=None, rate_mode="engine_ceiling",
+    catalog_memo=None,
 ) -> VerificationReceipt:
     """Run structural and replay gates for the stated occurrence coverage."""
     if scope not in {"archetype", "full"}:
@@ -1350,9 +1840,10 @@ def verify_plan(
     except ModelingError as error:
         reason, _, detail = str(error).partition(":")
         gates.append(GateReceipt(name, False, reason, detail))
+    eff_memo = {} if catalog_memo is None else catalog_memo
     gates.append(_capture("work_conservation_and_ledgers", _conservation,
                           scenario, applied, region_summaries, step_eval, baseline_eval, baseline_work,
-                          service_replay, scope=scope))
+                          service_replay, scope=scope, catalog_memo=eff_memo))
     l_star = regression = None
     if scope == "full":
         name = "lean_bound_and_monotonicity"
@@ -1366,7 +1857,8 @@ def verify_plan(
                 raise ModelingError("LEAN_CERTIFICATE_INVALID:certificate_unbound_to_scenario")
             l_star = _bound(scenario, applied, region_summaries, primitive_table, rate_mode,
                             dual_certificate, dual_program, event_dag, wall_ns,
-                            baseline_u_ns, baseline_m_ns, framework_ns, dsl_ns)
+                            baseline_u_ns, baseline_m_ns, framework_ns, dsl_ns,
+                            catalog_memo=eff_memo)
             gates.append(GateReceipt(name, True))
         except SoundnessInversionError:
             raise
