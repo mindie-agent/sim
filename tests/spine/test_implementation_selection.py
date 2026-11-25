@@ -15,7 +15,6 @@ from _support.linear_cases import caller
 from _support.moe_hc_mc2_fixtures import raw_case
 from _support.operator_cases import declared_case as case
 from mindie_sim import compose_case, graph_costs, predict, study, target_graphs
-from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.compose import apply_va_recommended, va_recommended_config
 from mindie_sim.feature_mechanisms import MechanismContext, _apply_basic_norm_quant
 from mindie_sim.hardware_derivation import derive_hardware_sku
@@ -29,7 +28,6 @@ from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.implementation_selection import graph_selections
 from mindie_sim.prediction.operators.mc2.mc2_graph import lower, select_common
 from mindie_sim.prediction.operator_analysis import operator_costs, target_operators
-from mindie_sim.prediction.operators.attention import attention_online; from mindie_sim.prediction.operators.vector import cuda_norm
 from mindie_sim.prediction.program import HostStaging, RecipeBook
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
@@ -52,20 +50,14 @@ def recommended_kda(hardware, **request):
     return compose_case('kimi-k3', hardware=hardware, tp=8, ep=8, layers=4, va_recommended=True, **request)
 KDA_NATIVE_SKUS = [('a3', 'vllm_ascend_recurrent_kda_arch22'), ('a5', 'vllm_ascend_recurrent_kda_arch35')]
 GDN_SKUS = ('a3', 'a5')
-NORM = 'vllm_cuda_rms_norm'
-ATTENTION_BINDING = {'implementation': attention_online.IMPLEMENTATION_ID, 'options': {'compute_capability': [8, 9]}}
-NORM_BINDING = {'implementation': cuda_norm.IMPLEMENTATION, 'recipes': ['rmsnorm']}
-FUSIONS = ('activation_quantization', 'norm_quant', 'residual_norm')
+NORM = 'vllm_ascend_native_norm'
 hc_ops = partial(target_operators, phase='decode', tokens=1, context=2048, sequences=2, scope='body')
 WIDTH, TOKENS, TOPK, EP, RECEIVED = 256, 8, 4, 8, 16.0
 
-def declared_case(*, dtype='bf16', tp=1, output=2, passes=(), **lowerings):
+def declared_case(*, dtype='bf16', tp=1, output=2, passes=('residual_norm',), **lowerings):
     raw = case(tp=tp, output=output)
     raw['model'].update(layers=1, activation_dtype=dtype, weight_dtype=dtype, compute_dtype=dtype, kv_dtype=dtype)
-    device = raw['machine']['device']
-    roles = {**attention_online.SERVICE_ROLES, **cuda_norm.SERVICE_ROLES}
-    device['rates']['shared_memory'] = device['compute_peaks']['fp16'] = 1e9
-    device['service_modes'] = {role: {'resource': resource, 'rate': 1e9} for role, resource in roles.items()}
+    raw['machine']['device']['compute_peaks']['fp16'] = 1e9
     raw['runtime'].update({'lowering_passes': passes} if passes else {}, kernels={'lowerings': deepcopy(lowerings)})
     return raw
 def with_first_layer(case, **changes):
@@ -88,93 +80,65 @@ def test_unknown_binding_is_a_visible_modeling_failure_in_both_public_paths():
     with pytest.raises(ModelingError, match=error):
         predict(raw)
 def test_source_option_typo_cannot_be_ignored_or_abort_other_study_candidates():
-    raw = declared_case(rmsnorm=NORM_BINDING)
-    result = study([{'id': 'aligned', 'case': raw}, {'id': 'typo', 'case': raw, 'overrides': {'runtime': {'kernels': {'lowerings': {'rmsnorm': {'options': {'aligend': False}}}}}}}], [{'id': 'prefill', 'phase': 'prefill', 'tokens': 3}])
+    raw = declared_case(add_rmsnorm={'implementation': NORM})
+    result = study([{'id': 'native', 'case': raw}, {'id': 'typo', 'case': raw, 'overrides': {'runtime': {'kernels': {'lowerings': {'add_rmsnorm': {'options': {'has_bais': True}}}}}}}], [{'id': 'prefill', 'phase': 'prefill', 'tokens': 3}])
     assert result['status'] == 'partial'
     accepted, rejected = result['evaluations']
     assert accepted['status'] == 'modeled' and accepted['duration_ms'] > 0
-    assert rejected['error'] == 'implementation_options_unknown:rmsnorm:aligend'
+    assert rejected['error'] == 'implementation_options_unknown:add_rmsnorm:has_bais'
     assert 'duration_ms' not in rejected
-    assert [row['candidate'] for row in result['rankings'][0]['candidates']] == ['aligned']
-def test_source_attention_rates_change_time_without_rewriting_work():
-    raw = declared_case(gqa_attention=ATTENTION_BINDING)
-    parsed = parse_case(raw)
-    ops = [op for op in target_operators(parsed, phase='prefill', tokens=7) if op.family == 'attention']
-    fast = operator_costs(parsed, ops)['operators'][0]
-    raw['machine']['device']['service_modes']['fp32_exp']['rate'] = 1000.0
-    slow = operator_costs(parse_case(raw), ops)['operators'][0]
+    assert [row['candidate'] for row in result['rankings'][0]['candidates']] == ['native']
+def test_native_norm_rate_changes_time_without_rewriting_work():
+    raw = declared_case(add_rmsnorm=NORM)
+    ops = [op for op in target_operators(raw, phase='prefill', tokens=7) if op.family == 'add_rmsnorm']
+    fast = operator_costs(raw, ops)['operators'][0]
+    raw['machine']['device']['rates']['vector'] /= 1024
+    slow = operator_costs(raw, ops)['operators'][0]
     assert slow['duration_ms'] > fast['duration_ms']
-    assert slow['operator']['metadata']['resource_work'] == fast['operator']['metadata']['resource_work']
-    assert slow['operator']['flops'] == fast['operator']['flops']
-def test_attention_binding_uses_local_heads_and_declared_source_tile_dispatch():
-    raw = declared_case(tp=2, gqa_attention=ATTENTION_BINDING)
-    raw['model'].update(hidden_size=1024, head_dim=256)
-    first = next((op for op in target_operators(raw, phase='prefill', tokens=7) if op.family == 'attention'))
-    raw['runtime']['kernels']['lowerings']['gqa_attention']['options']['compute_capability'] = [10, 0]
-    second = next((op for op in target_operators(raw, phase='prefill', tokens=7) if op.family == 'attention'))
-    a, b = (dict(first.metadata), dict(second.metadata))
-    assert_fields(a['source_params'], heads=2, key_heads=1)
-    assert a['semantic_pairs'] == b['semantic_pairs'] == 2 * 7 * 8 // 2
-    assert (a['dispatch']['tile_size'], b['dispatch']['tile_size']) == (32, 128)
-    assert first.flops < second.flops
-def test_source_attention_domain_does_not_silently_erase_window_or_kv_quantization():
-    parsed = parse_case(declared_case(gqa_attention=ATTENTION_BINDING))
-    windowed = with_first_layer(parsed, window=2)
-    with pytest.raises(ModelingError, match='unwindowed_unquantized'):
-        work_for(windowed)
-    analytic = with_runtime(windowed, kernels={})
-    attention = next((op for op in work_for(analytic).ops if op.family == 'attention'))
-    assert attention.flops == 4 * 8 * 4 * (1 + 2 + 2 + 2)
-    quantized = replace(parsed, model=replace(parsed.model, quant=replace(parsed.model.quant, kv_dtype='int8')))
-    with pytest.raises(ModelingError, match='unwindowed_unquantized'):
-        work_for(quantized)
+    assert slow['operator']['vector_ops'] == fast['operator']['vector_ops'] > 0
+    assert slow['operator']['hbm_bytes'] == fast['operator']['hbm_bytes'] > 0
+
+
+def test_attention_work_uses_local_heads_and_window():
+    parsed = parse_case(declared_case(tp=2))
+    for case, pairs in ((parsed, 1 + 2 + 3 + 4), (with_first_layer(parsed, window=2), 1 + 2 + 2 + 2)):
+        attention = next(op for op in work_for(case).ops if op.family == 'attention')
+        assert attention.local_shape[-2:] == (2, 8)
+        assert attention.flops == 4 * 8 * 2 * pairs
+
+
 @pytest.mark.parametrize('dtype', ['bf16', 'fp16', 'fp32'])
 def test_model_norm_preserves_precision_and_source_traffic(dtype):
-    parsed = parse_case(declared_case(dtype=dtype, rmsnorm=NORM_BINDING))
+    parsed = parse_case(declared_case(dtype=dtype, add_rmsnorm=NORM))
     ops = target_operators(parsed, phase='prefill', tokens=3)
-    norm = next((op for op in ops if op.op_id == 's0.l0.norm1'))
-    assert norm.dtype == dtype
-    row = operator_costs(parsed, (norm,))['operators'][0]
+    fused = next(op for op in ops if op.family == 'add_rmsnorm')
+    rows, width = fused.local_shape
+    assert fused.dtype == dtype and len(fused.deps) == 2
+    assert dict(fused.metadata)['native_norm_kind'] == 'AddRmsNormBias'
+    assert set(fused.returns) == {'residual', 'rstd'}
     size = 4 if dtype == 'fp32' else 2
-    assert row['operator']['hbm_bytes'] == 3 * 32 * size * 4
-    assert row['operator']['metadata']['dispatch']['width'] == 32
-    assert row['program'] == 'OperatorPlan'
-def test_explicit_norm_binding_survives_generic_fusion_and_keeps_quantization_separate():
-    parsed = parse_case(declared_case(passes=FUSIONS, rmsnorm=NORM_BINDING))
-    parsed = replace(parsed, model=replace(parsed.model, quant=quant_preset('w8a8_int8')))
-    ops = target_operators(parsed, phase='prefill', tokens=3)
-    norm = next((op for op in ops if op.op_id == 's0.l0.norm1'))
-    quant = next((op for op in ops if op.family == 'quantize' and op.deps == (norm.op_id,)))
-    assert norm.plan_required and norm.dtype == 'bf16'
-    assert quant.mte3_bytes > 0 and (not quant.plan_required)
-    assert norm.returns == ()
-    assert dict(quant.metadata)['activation_scale_bytes'] > 0
-def test_fused_norm_binding_requires_actual_fusion_and_preserves_residual_consumers():
-    parsed = parse_case(declared_case(passes=['activation_quantization', 'residual_norm'], add_rmsnorm=cuda_norm.IMPLEMENTATION))
-    ops = target_operators(parsed, phase='prefill', tokens=3)
-    fused = next((op for op in ops if op.family == 'add_rmsnorm'))
-    assert fused.plan_required and fused.returns == ('residual',)
-    assert len(fused.deps) == 2
-    assert dict(fused.metadata)['dispatch']['kernel'] == 'fused_add_rms_norm'
-    assert any((fused.op_id in op.deps and op.recipe == 'residual_add' for op in ops))
+    assert fused.mte3_bytes == 2 * rows * width * size + rows * 4
     row = operator_costs(parsed, (fused,))['operators'][0]
-    assert row['operator']['hbm_bytes'] == 3 * 32 * 2 * 6
-def test_recipe_filter_leaves_distinct_qk_norm_contract_analytic():
-    parsed = parse_case(declared_case(rmsnorm=NORM_BINDING))
+    assert row['operator']['hbm_bytes'] == fused.mte2_bytes + fused.mte3_bytes
+    assert any(fused.op_id in op.deps and op.recipe == 'residual_add' for op in ops)
+
+
+@pytest.mark.parametrize('recipe, selected', [('add_rmsnorm', True), ('rmsnorm', False)])
+def test_recipe_filter_applies_only_to_matching_fused_norm(recipe, selected):
+    parsed = parse_case(declared_case(add_rmsnorm={'implementation': NORM, 'recipes': [recipe]}))
     parsed = with_first_layer(parsed, qk_norm=True)
     ops = target_operators(parsed, phase='prefill', tokens=3)
-    assert next((op for op in ops if op.recipe == 'qk_norm')).source_boundary == ''
-    assert next((op for op in ops if op.op_id == 's0.l0.norm1')).plan_required
-    all_norms = replace(parsed.runtime, kernels={'lowerings': {'rmsnorm': cuda_norm.IMPLEMENTATION}})
-    with pytest.raises(ModelingError, match='normalization_semantic_contract_required:qk_norm'):
-        target_operators(replace(parsed, runtime=all_norms), phase='prefill', tokens=3)
+    fused = next(op for op in ops if op.family == 'add_rmsnorm')
+    assert ('native_norm_kind' in dict(fused.metadata)) == selected
+    assert next(op for op in ops if op.recipe == 'qk_norm').source_boundary == ''
+
 def policy(binding, domain=None, *extra_cases, otherwise='error'):
     return {'cases': [{'domain': domain or {'phases': ['decode']}, 'binding': binding}, *extra_cases], 'otherwise': otherwise}
 def test_overlapping_geometry_does_not_silently_give_first_case_priority():
     raw = case()
     overlap = {'domain': {'valid_tokens': {'min': 1}}, 'binding': 'analytical'}
-    raw['runtime']['kernels'] = {'lowerings': {'rmsnorm': policy(NORM, None, overlap)}}
-    with pytest.raises(ModelingError, match='implementation_domains_overlap:rmsnorm'):
+    raw['runtime']['kernels'] = {'lowerings': {'add_rmsnorm': policy(NORM, None, overlap)}}
+    with pytest.raises(ModelingError, match='implementation_domains_overlap:add_rmsnorm'):
         target_graphs(raw, phase='decode', tokens=1)
 def test_prefill_kda_chooses_its_chunk_source_without_decode_source_in_mixed_batch():
     parsed, _ = caller((1,))

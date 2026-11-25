@@ -322,8 +322,7 @@ def test_coupling_retains_both_resources_and_ties_follow_submission_order():
         assert [row["task"] for row in list(engine.trace)[:3]] == ["first", "second", "join"]
         assert engine.serviced == {"a": 30, "b": 10} and done.time == 3
         assert engine.busy_ms == {"a": 3, "b": 3 if coupled else 1}
-EXTENSIONS = ("cuda_norm", "cuda_quant", "attention", "grouped_gemm", "moe_align", "moe_combine", "gdn_prepare", "gdn_state")
-_EXT_MOD = {"cuda_norm": "vector", "cuda_quant": "vector", "grouped_gemm": "grouped_moe", "moe_align": "moe_routing", "moe_combine": "moe_routing", "gdn_prepare": "linear_attention", "gdn_state": "linear_attention"}
+_EXT_MOD = {"grouped_gemm": "grouped_moe", "gdn_prepare": "linear_attention", "gdn_state": "linear_attention"}
 def _source_case(name):
     if name == "attention":
         return attention, replace(OPS[attention.register_family()], requests=("r",)), sku_case(REPRESENTATIVE_SKUS["a5"])
@@ -331,7 +330,7 @@ def _source_case(name):
     params = json.loads((FIXTURES / "operator_cases" / f"{name}.json").read_text())["cases"][0]["params"]
     op = replace(module.make_op(params), requests=("r",))
     return module, op, parse_case(control_case(units=4, service_roles=getattr(module, "SERVICE_ROLES", {})))
-@pytest.mark.parametrize("name", [name for name in EXTENSIONS if name != "attention"])
+@pytest.mark.parametrize("name", tuple(_EXT_MOD))
 def test_source_calls_require_explicit_binding_in_both_execution_paths(name):
     module, op, case = _source_case(name)
     bound, op = PlannedRecipe(module.build), replace(op, metadata=(*op.metadata, ("program_kind", "matmul")))
@@ -347,7 +346,7 @@ def test_resource_envelope_cannot_execute_even_when_bound_to_a_recipe():
     op = replace(simple_op("unmodeled", "envelope"), hbm_bytes=128)
     with pytest.raises(ModelingError, match="resource_envelope_banned"):
         operator_costs(hardware_case(), (op,), recipes=RecipeBook({op.recipe: ResourceEnvelope()}))
-@pytest.mark.parametrize("name", (*EXTENSIONS[:3], "moe_align"))
+@pytest.mark.parametrize("name", ("attention", "grouped_gemm"))
 def test_bound_source_work_matches_iteration_and_expansion_is_idempotent(name):
     from mindie_sim.prediction.evaluation import EvaluationContext
     module, op, case = _source_case(name)
@@ -373,14 +372,32 @@ def test_bound_source_work_matches_iteration_and_expansion_is_idempotent(name):
         children = book.expand((op,))
         assert len(children) == len(expand(op)) + 1 and book.expand(children) == children
         assert all(operator_costs(case, (child,), recipes=book)["operator_occurrences"] == 1 for child in expand(op))
+@pytest.mark.parametrize("control, implementation, recipe", [
+    ("grouped-gemm-control.json", "ascendc_grouped_nd_bf16", "grouped_expert_gemm"),
+    ("w4a8-down-msd-control.json", "ascend_w4a8_msd_grouped_down", "ascend_w4a8_msd_grouped_down"),
+])
+def test_grouped_controls_execute_their_declared_recipe(control, implementation, recipe):
+    raw = json.loads((ROOT / "examples/source-families" / control).read_text())
+    ops = target_operators(raw, phase="prefill", tokens=4)
+    bound = [op for op in ops if op.recipe == recipe]
+    assert bound and all(dict(op.metadata)["implementation_binding"]["implementation"]
+                         == implementation for op in bound)
+    rows = operator_costs(raw, bound)["operators"]
+    assert all(row["program"] == "OperatorPlan" and row["duration_ms"] > 0 for row in rows)
+
+
 def test_semantic_fusion_cannot_rewrite_source_owned_operands():
-    module, op, case = _source_case("cuda_norm")
-    book = RecipeBook({op.recipe: PlannedRecipe(module.build)})
-    payload = dict(stage=0, layer=0, requests=("r",), elements=5120, dtype="bf16", phase="prefill")
+    case = parse_case(hardware_case())
+    op = norm(name="norm", deps=("add",), stage=0, layer=0, requests=("r",),
+              tokens=1, width=8, model=case.model, mode="prefill")
+    source_norm = replace(op, source_boundary="kernel")
+    payload = dict(stage=0, layer=0, requests=("r",), elements=8, dtype="bf16", phase="prefill", shape=(1, 8))
     quant = vector_op(op_id="quant", deps=(op.op_id,), ops_per_element=4, family="quantize", recipe="dynamic_quantize", **payload)
-    add = vector_op(op_id="add", deps=(), ops_per_element=1, family="elementwise", recipe="residual_add", **payload)
-    for before, transform in (((op, quant), norm_quant), ((add, replace(op, deps=("add",))), residual_norm)):
-        assert operator_costs(case, transform(before, "bf16"), recipes=book) == operator_costs(case, before, recipes=book)
+    add = vector_op(op_id="add", deps=("x", "skip"), ops_per_element=1, family="elementwise", recipe="residual_add", **payload)
+    assert len(norm_quant((op, quant), "bf16")) == 1
+    assert len(residual_norm((add, op), "bf16")) == 1
+    assert norm_quant((source_norm, quant), "bf16") == [source_norm, quant]
+    assert residual_norm((add, source_norm), "bf16") == [add, source_norm]
     source = replace(_matrix("source", (), quant=quant_preset("w8a8_int8")), source_boundary="kernel")
     assert activation_quantization((source,), "bf16") == [source]
 def _historical():

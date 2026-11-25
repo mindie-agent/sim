@@ -36,7 +36,6 @@ from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.mechanism import Geometry, Work
 from mindie_sim.prediction.operators.hyper_connections.native_fusion import _groups, lower_native_fusions
 from mindie_sim.prediction.operator_analysis import target_operators
-from mindie_sim.prediction.operators.vector import cuda_quant
 from mindie_sim.prediction.program import KernelProgram, RecipeContext, Stage
 from mindie_sim.prediction.source_program_service import SourceProgramService
 from mindie_sim.prediction.structure import parse_case
@@ -457,63 +456,57 @@ def test_joint_copy_service_conserves_owners_and_call_time(direction):
                                                 local_shape=(16, 6, 3071)),)
                           )["operators"][0]["operator"]["metadata"]["program_execution"]
     assert not info["joint_pipe_busy_ns"] and info["payload_read_bytes"] == 16 * 6 * 3071 * 2
-def quant_case(*, source=True, dtype=None):
+def quant_case(*, dtype="bf16"):
     raw = declared_case(prompt=3, output=2)
-    raw["model"].update(layers=1, quant=asdict(quant_preset("w8a8_int8")))
-    if dtype:
-        raw["model"]["activation_dtype"] = dtype
-    device = raw["machine"]["device"]
-    device["compute_peaks"]["int8"] = 1e9
-    device["rates"]["shared_memory"] = 1e9
-    device["service_modes"] = {role: {"resource": resource, "rate": 1e9}
-                               for role, resource in cuda_quant.SERVICE_ROLES.items()}
-    if source:
-        raw["runtime"]["kernels"] = {"lowerings": {"quantize": cuda_quant.IMPLEMENTATION}}
+    raw["model"].update(layers=1, activation_dtype=dtype, quant=asdict(quant_preset("w8a8_int8")))
+    raw["machine"]["device"]["compute_peaks"]["int8"] = 1e9
+    raw["runtime"]["lowering_passes"] = ["activation_quantization"]
     return raw
-def test_quant_producers_scales_and_rejections():
-    analytic, source = quant_case(source=False), quant_case()
-    a_ops = {op.op_id: op for op in target_operators(analytic, phase="prefill", tokens=3)}
-    s_ops = {op.op_id: op for op in target_operators(source, phase="prefill", tokens=3)}
-    quantized = [op for op in s_ops.values() if op.family == "quantize"]
+
+
+def test_quant_producers_materialize_payload_and_scales():
+    raw = quant_case()
+    ops = target_operators(raw, phase="prefill", tokens=3)
+    quantized = [op for op in ops if op.family == "quantize"]
+    assert quantized
     for op in quantized:
-        original, (rows, width) = a_ops[op.op_id], op.local_shape
-        assert op.plan_required and op.returns == ("activation_scales",) and (
-            op.mte2_bytes == 2 * original.mte2_bytes)
-        assert op.mte3_bytes == original.mte3_bytes == rows * width + rows * 4
-        consumers = [consumer for consumer in s_ops.values() if op.op_id in consumer.deps]
+        rows, width = op.local_shape
+        assert op.returns == ("activation_scales",)
+        assert op.mte2_bytes == rows * width * 2
+        assert op.mte3_bytes == rows * width + rows * 4
+        consumers = [consumer for consumer in ops if op.op_id in consumer.deps]
         assert consumers and all(dict(consumer.metadata)["activation_scale_bytes"] == rows * 4
                                  for consumer in consumers)
-    assert predict(source)["parameters"]["calibration"] == "none"
-    raw = quant_case()
-    raw["runtime"]["lowering_passes"] = ["activation_quantization", "norm_quant", "residual_norm"]
+    assert predict(raw)["parameters"]["calibration"] == "none"
+    raw["runtime"].update(lowering_passes=["activation_quantization", "norm_quant", "residual_norm"],
+                          kernels={"lowerings": {"add_rmsnorm_quant": "vllm_ascend_native_norm"}})
     graphs = target_graphs(raw, phase="prefill", tokens=3)
-    quantized = [op for op in graphs[0] if op.family == "quantize"]
-    assert quantized and not any(op.family == "rmsnorm_quant" for op in graphs[0])
+    fused = next(op for op in graphs[0] if op.family == "add_rmsnorm_quant")
+    rows, width = fused.local_shape
+    assert dict(fused.metadata)["native_norm_kind"] == "AddRmsNormDynamicQuant"
+    assert set(fused.returns) == {"residual", "activation_scales"}
+    assert fused.mte3_bytes == rows * width * 3 + rows * 4
     report = graph_costs(raw, graphs, input_ready_ms=5)
     assert report["execution"]["live_tasks"] == report["execution"]["live_programs"] == 0
-    for dtype in ("fp16", "fp32"):
-        raw = quant_case(source=False, dtype=dtype)
-        ops = {op.op_id: op for op in target_operators(raw, phase="prefill", tokens=3)}
-        assert dict(ops["s0.l0.gate_up"].metadata)["output_format"] == "bf16" and ops["s0.l0.swiglu"].dtype == dtype
-        raw["runtime"]["kernels"] = {"lowerings": {"quantize": cuda_quant.IMPLEMENTATION}}
-        with pytest.raises(ModelingError, match="requires_bf16_producer_chain"):
-            target_operators(raw, phase="prefill", tokens=3)
+
+
+@pytest.mark.parametrize("dtype", ("fp16", "fp32"))
+def test_quant_producer_preserves_activation_dtype(dtype):
+    ops = {op.op_id: op for op in target_operators(quant_case(dtype=dtype), phase="prefill", tokens=3)}
+    assert dict(ops["s0.l0.gate_up"].metadata)["output_format"] == "bf16"
+    assert ops["s0.l0.swiglu"].dtype == dtype
+
+
+def test_native_norm_rejects_grouped_int8_scales():
     raw = quant_case()
     raw["model"]["quant"]["activation_group_size"] = 16
-    with pytest.raises(ModelingError, match="integer_per_row_int8_fp32_scale"):
+    ops = target_operators(raw, phase="prefill", tokens=3)
+    assert any(len(dict(op.metadata)["activation_scale_shape"]) == 2 for op in ops if op.family == "quantize")
+    raw["runtime"].update(lowering_passes=["activation_quantization", "norm_quant", "residual_norm"],
+                          kernels={"lowerings": {"add_rmsnorm_quant": "vllm_ascend_native_norm"}})
+    with pytest.raises(ModelingError, match="ascend_native_norm_int8_quant_requires_complete_row_fp32_scale"):
         target_operators(raw, phase="prefill", tokens=3)
-    del raw["runtime"]["kernels"]
-    assert any(len(dict(op.metadata)["activation_scale_shape"]) == 2
-               for op in target_operators(raw, phase="prefill", tokens=3)
-               if op.family == "quantize")
-    raw = quant_case()
-    raw["model"].update(ffn="moe", num_experts=4, top_k=2, moe_intermediate_size=32,
-                        expert_routing_histogram=[.8, .1, .05, .05])
-    raw["runtime"].update(tp=2, ep=2, parallel={"tp": 2, "dp": 1, "ep": 2, "rank_table": [[0, 1]]})
-    raw["machine"]["num_devices"] = 2
-    raw["machine"]["links"][0]["members"] = [0, 1]
-    with pytest.raises(ModelingError, match="integer_per_row_int8_fp32_scale"):
-        target_graphs(raw, phase="prefill", tokens=3)
+
 def sort_machine(sku="Ascend950DT_9581", clock=None, owners=4):
     arch = {"presets": ["ascend_sort32_spec"]}
     if clock is not None:

@@ -40,7 +40,6 @@ from mindie_sim.prediction.implementation_selection import graph_selections
 from mindie_sim.prediction.operators.mc2.moe_comm_selection import MoeCommConfig
 from mindie_sim.prediction.operators.moe_routing.moe_init_mxfp8 import RECIPE
 from mindie_sim.prediction.operator_analysis import operator_costs, target_operators
-from mindie_sim.prediction.operators.attention import attention_online; from mindie_sim.prediction.operators.vector import cuda_norm
 from mindie_sim.prediction.prefix_reads import CacheAccess, plan_prefix_reads
 from mindie_sim.prediction.rewrite import online_indexer_topk
 from mindie_sim.prediction.frontend.speculation import draft_program
@@ -63,34 +62,28 @@ def selection(report):
 def with_runtime(case, **changes):
     return replace(case, runtime=replace(case.runtime, **changes))
 ROOT = Path(__file__).resolve().parents[2]
-NORM = 'vllm_cuda_rms_norm'
-ATTENTION_BINDING = {'implementation': attention_online.IMPLEMENTATION_ID, 'options': {'compute_capability': [8, 9]}}
-NORM_BINDING = {'implementation': cuda_norm.IMPLEMENTATION, 'recipes': ['rmsnorm']}
+NORM = 'vllm_ascend_native_norm'
+# 512 FP8 latent elements, four FP16 scales, and a 64-element BF16 rotary suffix.
+FP8_MLA_ROW_BYTES = 512 + (512 // 128) * 2 + 64 * 2
 QUANT = QuantSpec('descriptor_conditioned_mxfp8', weight_format='fp8_e4m3', activation_format='fp8_e4m3', expert_weight_format='mxfp4', weight_block=(1, 32), expert_block=32, scale_format='fp8_e8m0', scale_bytes=1, activation_group_size=32, activation_scale_format='fp8_e8m0', activation_scale_pack=2)
 K, GATE_N, SITU_WIDTH, EXPERTS, GROUP = (3584, 6144, 3072, 28, 32)
 
 def declared_case(*, output=2, **lowerings):
     raw = case(output=output)
     raw['model'].update(layers=1, activation_dtype='bf16', weight_dtype='bf16', compute_dtype='bf16', kv_dtype='bf16')
-    device = raw['machine']['device']
-    roles = {**attention_online.SERVICE_ROLES, **cuda_norm.SERVICE_ROLES}
-    device['rates']['shared_memory'] = device['compute_peaks']['fp16'] = 1e9
-    device['service_modes'] = {role: {'resource': resource, 'rate': 1e9} for role, resource in roles.items()}
+    raw['runtime']['lowering_passes'] = ['residual_norm']
     raw['runtime']['kernels'] = {'lowerings': lowerings}
     return raw
 def work_for(parsed, views=None):
     return Frontend(attention_policy=AttentionPolicy(**parsed.runtime.attention_policy))(IterationPlan(views or (RequestView('r', 4, 0, True, 'prefill'),)), parsed.model, parsed.runtime, parsed.machine)
 def test_runtime_declaration_reaches_real_model_and_shared_execution():
-    parsed = parse_case(declared_case(rmsnorm=NORM_BINDING, gqa_attention=ATTENTION_BINDING))
+    parsed = parse_case(declared_case(add_rmsnorm=NORM))
     work = work_for(parsed)
-    source = [op for op in work.ops if op.plan_required]
-    attention = next((op for op in source if op.family == 'attention'))
-    metadata = dict(attention.metadata)
-    assert metadata['semantic_pairs'] == 4 * (1 + 2 + 3 + 4)
-    assert attention.flops > 4 * 8 * metadata['semantic_pairs']
-    assert metadata['source_params']['page_block_size'] == parsed.runtime.kv_block_size
+    fused = next(op for op in work.ops if op.family == 'add_rmsnorm')
+    assert dict(fused.metadata)['implementation_binding']['implementation'] == NORM
+    assert {'residual', 'rstd'} <= set(fused.returns)
+    attention = next(op for op in work.ops if op.family == 'attention')
     assert attention.deps == ('s0.l0.cache', 's0.l0.rope')
-    assert {op.family for op in source} == {'attention', 'rmsnorm'}
     isolated = operator_costs(parsed, work.ops, input_ready_ms=3)
     execution = Execution(parsed, CostModel(parsed))
     submission = execution.add(work, 0, 0)
@@ -105,26 +98,26 @@ def test_runtime_declaration_reaches_real_model_and_shared_execution():
     result = predict(parsed)
     assert result['requests'][0]['generated_tokens'] == 2
     assert result['parameters']['operator_occurrences']['measured_primitive'] == 0
-def test_source_attention_uses_declared_call_batching_without_fabricating_launches():
-    parsed = parse_case(declared_case(gqa_attention=ATTENTION_BINDING))
+def test_attention_batching_preserves_request_rows_and_work():
+    parsed = parse_case(declared_case())
     views = (RequestView('a', 3, 2, False, 'prefill'), RequestView('b', 5, 0, False, 'prefill'))
-    with pytest.raises(ModelingError, match='one_sequence_launch'):
-        work_for(parsed, views)
+    batched, = [op for op in work_for(parsed, views).ops if op.family == 'attention']
+    assert batched.requests == ('a', 'b')
     parsed = with_runtime(parsed, attention_policy={'fused_batch': False})
     work = work_for(parsed, views)
     calls = [op for op in work.ops if op.family == 'attention']
     assert len(calls) == 2
-    assert [dict(op.metadata)['source_params']['query'] for op in calls] == [3, 5]
+    assert [op.local_shape[0] for op in calls] == [3, 5]
     assert [op.requests for op in calls] == [('a',), ('b',)]
     assert work.ops[-1].deps
     report = operator_costs(parsed, calls)
     assert report['operator_occurrences'] == 2
-    assert all((row['program'] == 'OperatorPlan' for row in report['operators']))
+    assert sum(op.flops for op in calls) == batched.flops
 def policy(binding, domain=None, *, otherwise='error'):
     return {'cases': [{'domain': domain or {'phases': ['decode']}, 'binding': binding}], 'otherwise': otherwise}
 def test_serving_and_both_analysis_scopes_share_padding_aware_selection():
     domain = {'phases': ['decode'], 'valid_tokens': {'max': 1}, 'padded_tokens': {'min': 4, 'max': 4}}
-    raw = declared_case(output=3, rmsnorm=policy(NORM, domain, otherwise='analytical'))
+    raw = declared_case(output=3, add_rmsnorm=policy(NORM, domain, otherwise='analytical'))
     raw['runtime'].update(graph_mode='auto', graph_buckets=[4])
     original = deepcopy(raw)
     result = predict_quiet(raw)
@@ -134,27 +127,27 @@ def test_serving_and_both_analysis_scopes_share_padding_aware_selection():
     assert not result['execution']['live_tasks']
     for scope in ('body', 'model'):
         graph = target_graphs(raw, phase='decode', tokens=1, context=4, scope=scope)[0]
-        assert any((op.recipe.startswith('cuda_norm.') for op in graph))
+        assert any('native_norm_kind' in dict(op.metadata) for op in graph)
         choice, = graph_selections(graph)
         assert choice['case'] == 0
         assert_fields(choice['geometry'], valid_tokens=1, padded_tokens=4)
         prefill = target_graphs(raw, phase='prefill', tokens=4, scope=scope)[0]
-        assert not any((op.recipe.startswith('cuda_norm.') for op in prefill))
+        assert not any('native_norm_kind' in dict(op.metadata) for op in prefill)
         assert graph_selections(prefill)[0]['coverage'] == 'analytical_semantic_work'
     assert raw == original
 def test_mixed_batch_requires_its_whole_phase_domain_and_unmatched_is_visible():
     raw = case()
-    raw['runtime']['kernels'] = {'lowerings': {'rmsnorm': policy(NORM)}}
+    raw['runtime']['kernels'] = {'lowerings': {'add_rmsnorm': policy(NORM)}}
     parsed = parse_case(raw)
     views = (RequestView('decode', 1, 8, True, 'decode'), RequestView('prefill', 4, 0, True, 'prefill'))
-    with pytest.raises(ModelingError, match='implementation_domain_unmatched:rmsnorm'):
+    with pytest.raises(ModelingError, match='implementation_domain_unmatched:add_rmsnorm'):
         frontend(parsed, *views)
-    raw['runtime']['kernels']['lowerings']['rmsnorm']['cases'].append({'domain': {'phases': ['decode', 'prefill']}, 'binding': 'analytical'})
+    raw['runtime']['kernels']['lowerings']['add_rmsnorm']['cases'].append({'domain': {'phases': ['decode', 'prefill']}, 'binding': 'analytical'})
     parsed = parse_case(raw)
     work = frontend(parsed, *views)
     choice, = work.implementation_selections
     assert choice['case'] == 1 and choice['geometry']['valid_tokens'] == 5
-    assert not any((op.recipe.startswith('cuda_norm.') for op in work.ops))
+    assert not any('native_norm_kind' in dict(op.metadata) for op in work.ops)
     assert set(work.ops[-1].requests) == {'decode', 'prefill'}
 def test_sparse_decode_metadata_is_explicitly_excluded_from_prefill():
     raw = sparse_case()
@@ -193,7 +186,7 @@ def test_optional_prepared_weights_stay_resident_when_mixed_calls_select_analyti
 def test_draft_calls_select_their_own_phase_and_q1_geometry_before_target_verification():
     parsed = replace(draft_case(), machine=parse_case(declared_case()).machine)
     policy_cases = {'cases': [{'domain': {'model_scopes': ['target'], 'phases': ['prefill']}, 'binding': NORM}, {'domain': {'model_scopes': ['draft'], 'phases': ['decode'], 'max_query_tokens': {'max': 1}}, 'binding': NORM}], 'otherwise': 'analytical'}
-    parsed = with_runtime(parsed, kernels={'lowerings': {'rmsnorm': policy_cases}})
+    parsed = with_runtime(parsed, lowering_passes=('residual_norm',), kernels={'lowerings': {'add_rmsnorm': policy_cases}})
     view = RequestView('r', 1, 4, True, 'decode', draft_proposal_tokens=2)
     work = frontend(parsed, view)
     target, = [record for record in work.implementation_selections if record['model_scope'] == 'target']
@@ -204,7 +197,7 @@ def test_draft_calls_select_their_own_phase_and_q1_geometry_before_target_verifi
     assert len(drafts) == 2 and [record['case'] for record in drafts] == ['otherwise', 1]
     assert [record['geometry']['max_context_tokens'] for record in drafts] == [4, 7]
     assert [record['geometry']['max_query_tokens'] for record in drafts] == [3, 1]
-    selected = [op for op in work.ops if op.recipe.startswith('cuda_norm.')]
+    selected = [op for op in work.ops if 'native_norm_kind' in dict(op.metadata)]
     assert selected and all((op.phase == 'draft' for op in selected))
     result = predict_quiet(parsed)
     decisions = selection(result)
@@ -374,7 +367,7 @@ def test_native_sparse_configuration_and_independent_draft_formats():
     assert sparse[0].index == 3 and sparse[-1].index == 92
     assert all(((p.index_heads, p.index_dim, p.index_topk) == (32, 128, 2048) for p in sparse))
     assert all((p.owns_index_k and p.index_query_per_layer for p in sparse))
-    assert cache_format(c.model, 'mla_kv').row_bytes(576) == 656
+    assert cache_format(c.model, 'mla_kv').row_bytes(576) == FP8_MLA_ROW_BYTES
     assert cache_format(c.model, 'index_k').row_bytes(128) == 130
     draft = c.model.auxiliary.dspark
     assert draft_quant(c.model, draft).kv_dtype == 'bf16'
@@ -384,7 +377,7 @@ def test_native_sparse_configuration_and_independent_draft_formats():
 def test_shared_pool_quote_and_allocation_report_conserve_bytes(cp, proposals):
     c = sparse_alignment_case(cp, proposals)
     memory = Memory(c)
-    pool_unit = 1536 * (24 * 656 + 24 * 130 + (5 * 1152 if proposals else 0))
+    pool_unit = 1536 * (24 * FP8_MLA_ROW_BYTES + 24 * 130 + (5 * 1152 if proposals else 0))
     assert memory.pages.groups[0].bytes_per_group_page == pool_unit
     states = 3 * (2 + proposals)
     for tokens in (1, 1536 * cp, 1536 * cp + 1, 131588):
@@ -490,7 +483,7 @@ def test_indexer_precision_is_independent_of_main_kv_precision():
     metadata = dict(c.model.metadata)
     metadata['cache_representations'] = {key: value for key, value in metadata['cache_representations'].items() if key != 'index_k'}
     memory = Memory(replace(c, model=replace(c.model, quant=quant, metadata=tuple(metadata.items()))))
-    assert memory.pages.groups[0].bytes_per_group_page == 1536 * (24 * 656 + 24 * 128 * 2 + 5 * 1152)
+    assert memory.pages.groups[0].bytes_per_group_page == 1536 * (24 * FP8_MLA_ROW_BYTES + 24 * 128 * 2 + 5 * 1152)
 
 def test_index_key_window_counts_physical_compressed_rows():
     rows, refills = index_key_window(((4, 128),), compression=32)

@@ -24,7 +24,6 @@ from mindie_sim.prediction.implementations import (
 from mindie_sim.prediction.operators.hyper_connections.native_fusion import lower_native_fusions
 from mindie_sim.prediction.operators.hyper_connections.native_fusion_traffic import apply_traffic_profile
 from mindie_sim.prediction.operator_analysis import target_operators
-from mindie_sim.prediction.operators.vector import cuda_quant
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.transforms import (
     activation_quantization, lower_implementations, norm_quant, residual_norm,
@@ -132,13 +131,15 @@ def test_replacements_rewire_only_the_replaced_named_ports(unrelated_port):
 
 def test_source_binding_restores_semantic_scale_and_attributes():
     semantic = family(activate(graph(parsed("w8a8_int8"))[:3]), "quantize")
-    source = cuda_quant.make_op({"rows": 2, "width": 8, "dtype": "bf16"})
+    source = replace(vec("row_quant", shape=(2, 8), family="quantize",
+                         metadata={"output_format": "int8"}, write_bytes_override=2 * (8 + 4),
+                         returns=("activation_scales",)), source_boundary="kernel")
     preserved = preserve_graph(source, semantic)
     metadata = dict(preserved.metadata)
     fields(metadata, activation_scale_format="fp32", activation_scale_shape=(2,),
            input_format="bf16", output_format="int8")
-    fields(metadata["source_binding"], semantic_output_format="int8", implementation_recipe=cuda_quant.RECIPE)
-    fields(metadata["dispatch"], input_dtype="bf16", output_dtype="int8")
+    fields(metadata["source_binding"], semantic_output_format="int8", implementation_recipe="row_quant")
+    assert preserved.op_id == semantic.op_id and preserved.deps == semantic.deps
     assert preserved.source_boundary == "kernel"
     assert preserved.returns == ("activation_scales",)
 
@@ -573,16 +574,16 @@ def test_replay_partitions_inserted_quantizer_before_native_admission(resource_f
         assert family(ops, "quantize") and by_id(ops, matrix.op_id)
 
 @pytest.mark.parametrize("phase,context,selected,matches,kind", [
-    ("decode", 8, "vllm_cuda_rms_norm", [True, False], "declared_software_plan"),
+    ("decode", 8, "vllm_ascend_native_norm", [True, False], "declared_software_plan"),
     ("prefill", 0, "analytical", [False, True], "analytical_semantic_work"),
     ("mixed", 8, None, None, None),
 ])
 def test_selection_exposes_candidates_and_chosen_plan(phase, context, selected, matches, kind):
     policy = {"cases": [
         {"domain": {"phases": [p]}, "binding": b} for p, b in
-        (("decode", "vllm_cuda_rms_norm"), ("prefill", "analytical"))
+        (("decode", "vllm_ascend_native_norm"), ("prefill", "analytical"))
     ], "otherwise": "error"}
-    runtime = replace(parsed().runtime, kernels={"lowerings": {"rmsnorm": policy}})
+    runtime = replace(parsed().runtime, kernels={"lowerings": {"add_rmsnorm": policy}})
     view = SimpleNamespace(phase=phase, q_len=4, context=context)
     if selected is None:
         with pytest.raises(ModelingError, match="implementation_domain_unmatched"):
@@ -593,7 +594,7 @@ def test_selection_exposes_candidates_and_chosen_plan(phase, context, selected, 
     assert record["selected"]["case"] == matches.index(True)
     assert record["plan"]["kind"] == kind
     if phase == "decode":
-        assert record["plan"]["implementation"] == resolved.kernels["lowerings"]["rmsnorm"] == selected
+        assert record["plan"]["implementation"] == resolved.kernels["lowerings"]["add_rmsnorm"] == selected
         assert record["geometry"]["padded_tokens"] == 4
     else:
-        assert record["implementation"] == selected and "rmsnorm" not in resolved.kernels["lowerings"]
+        assert record["implementation"] == selected and "add_rmsnorm" not in resolved.kernels["lowerings"]

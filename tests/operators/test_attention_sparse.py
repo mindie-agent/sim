@@ -609,7 +609,6 @@ def test_c8_gather_l2_admission_uses_unique_sector_union_not_duplicate_copy_byte
 def test_sparse_mla_metadata_and_governed_attention_ops_declare_physical_io():
     from mindie_sim.prediction.lowering import Builder
     from mindie_sim.prediction.operators import paged_mla
-    from mindie_sim.prediction.operators.mla import mla_decode
     from mindie_sim.prediction.operators.paged_mla import family_paged_mla
     from mindie_sim.prediction.operators.sparse_indexer import sparse_mla_metadata
     from mindie_sim.prediction.structure import parse_case
@@ -653,17 +652,6 @@ def test_sparse_mla_metadata_and_governed_attention_ops_declare_physical_io():
     decl_op = family_paged_mla._declaration_op(decl, views=views, plan=case.model.layer_plans[0])
     assert decl_op.flops > 0 and decl_op.vector_ops > 0
     assert 0 < decl_op.hbm_bytes < decl_op.mte2_bytes + decl_op.mte3_bytes
-
-    dec_op = mla_decode.make_op({
-        "implementation": mla_decode.IMPLEMENTATION, "is_mla": True, "is_hip": False,
-        "dtype": "bf16", "cache_dtype": "bf16", "heads": 16, "key_heads": 1,
-        "latent_dim": 512, "rope_dim": 64, "page_size": 16, "num_kv_splits": 4,
-        "contexts": [256, 512],
-    })
-    s1_op, s2_op = mla_decode.kernels(dec_op)
-    assert dec_op.flops == pytest.approx(s1_op.flops + s2_op.flops) and dec_op.flops > 0
-    assert dec_op.hbm_bytes == pytest.approx(s1_op.hbm_bytes + s2_op.hbm_bytes) and dec_op.hbm_bytes > 0
-    assert s1_op.mte2_bytes > 0 and s2_op.mte2_bytes > 0 and s2_op.vector_ops > 0
 
 
 def test_sparse_chunked_prefill_guard_disjoint_history_and_minimax_gbsa_consumer():
