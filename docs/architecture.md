@@ -22,20 +22,491 @@ Core packages (L0–L3 plus generic solver, rewrite, and export frameworks) are
 100% runtime-agnostic and follow a strict acyclic unidirectional DAG enforced by
 `AG010` (layer ordering + package SCC checks):
 
-| Layer | Canonical Modules | Input -> Output | Responsibility |
+| Layer | Canonical Subsystems (`ag015:architecture-manifest`) | Input -> Output | Responsibility |
 | --- | --- | --- | --- |
-| **L0 Contracts** | `schema/{checkpoint,stack,scenario,operators,model,hardware,case}.py` | validated inputs -> frozen `ScenarioContract`, `CheckpointQuantMap`, `SLAContract`, `DeploymentMode`, `TensorPrecisionABI`, `OwnerScheduleSpec`, `CoDesignOpportunity` | Immutable domain types, explicit 4-mode deployment & role-SLA validation, deterministic digests; zero runtime-vendor imports |
-| **L1 Hardware & On-Disk Facts** | `backends/`, `primitives/`, `catalog/`, `catalog/checkpoint_reader.py`, `templates/` | native `config.json` / `> 50 MiB` streamed ModelSlim or HF quant metadata + 71 curated checkpoints (`curated_checkpoints.json`) -> `ModelSpec`, `CheckpointQuantMap`, `Hardware`, `PrimitiveTable` | Hardware resource & 4-tier interconnect profiles, read-only streaming quantization descriptors, zero silent BF16 degradation |
-| **L2 Unified Engine & Ledger** | `prediction/{runtime,execution,program,collectives,capacity}/`, `prediction/spine.py` | lowered `GraphIR` + injected lowering/quant plans -> `StepEvaluation`, `LayerRunProgram`, `StreamExposureResult`, `ResidentMemoryReceipt` | Single `Engine` + `PrimitiveTable`, exact native-layer cohort replay (`layer_runs.py`, `0 ns` drift on 93L/61L/48L), $O((N+G)\log(N+G))$ sweep-line observer (`exposed_observer.py`), simultaneous per-die HBM peak ledger (`capacity/ledger.py`) |
-| **L3 Operator Families & Sharding** | `prediction/operators/<family>/`, `prediction/sharding/` | `OpSpec` + geometry -> `KernelBinding`, `OwnerScheduleSpec`, `Program` | Governed single-rank physical kernels (`arch<NN>.py` leaves with AST-grounded `Upstream-ABI`) and distributed tensor placement / local-TP / collective monoids |
-| **L4 Pluggable Runtime Stacks** | `stacks/registry.py`, `stacks/{vllm_ascend,diffusion_native,ideal_target,raw_eager}/` | `(ModelSpec, CheckpointQuantMap, Hardware, ParallelSpec)` -> `ResolvedStackOptions`, `RuntimeQuantPlan` (`CacheStateABI` + `PreparedWeightSpec`), `StackLoweringPlan`, optional `LaunchConfigCodec` | Encapsulates all inference-engine specifics behind `RuntimeStackAdapter` (`mindie-sim.stack-adapter/1`), custom JSON manifests (`mindie-sim.stack-manifest/1`), and `mindie_sim.stacks` entry points; domain-aware default routing (`llm`/`vlm` -> `vllm-ascend`, `diffusion` -> `diffusion-native`; mismatched forced stacks raise `ModelingError`); never imports `compose/` or `export/` |
-| **L4 Composition, Solvers & Pure Export** | `compose/`, `sweep/`, `rewrite/`, `optimization/`, `export/`, `cli/`, `solve.py`, `api.py` | frozen `ScenarioContract` -> `DeploymentOutcome`, 4-stage causal waterfall, pure 4-sheet `.xlsx`, `trace_view.json`, `agent_brief.json` | Full-grid `(DP, TP, EP, PP, co-domain DCP, PCP)` admission & PD overlap solver, legal GraphIR rewrites + independent `L*` dual bound (`dual_bound.py`), strict `export/public_view.py` allowlist (4 visible sheets, 0 hidden sheets, Sheet 2 `A:AA` 27 cols, Sheet 3 `"As evaluated"`, Sheet 4 live span formulas + visible `A:N` fallback) |
-| **Observations & Profiler SSOT** | `observations/`, `observed_contracts/`, `structure*`, `subgraph_math.py`, `study.py` | captures / protocols / candidates -> calibrated parameters, independent heldout accuracy, `mindie-model-structure/1`, cohort comparisons | Provenance, train/heldout separation, and cross-repo SSOT contract with `mindie-profiler` |
+| **L0 Contracts & Pure Metadata** | `L0_SCHEMA`: `schema/**`, `observed_contracts/**`, `public/errors.py`, `coverage/**` | validated inputs -> frozen `ScenarioContract`, `CheckpointQuantMap`, `SLAContract`, `DeploymentMode`, `TensorPrecisionABI`, `CacheStateABI` (single native storage-geometry builder), `StateEffect`, `OwnerScheduleSpec`, `CoDesignOpportunity`, `AbiQueryKey`, `PhysicalRankMap`, `UnmodeledCapabilityError`, CANN 9.3 pure `observed_contracts` | Immutable domain types, explicit 4-mode deployment & role-SLA validation, deterministic digests, pure coverage/error/CANN-contract vocabulary; zero runtime-vendor imports |
+| **L1 Hardware, Primitives, Catalog & Templates** | `L1_HW_PRIM_ABI` (`backends/**`, `primitives/**`, `hardware_derivation.py`, `data/abi/*.json`, `data/primitives/**`), `L1_CATALOG` (`catalog/**`, `model_configs/*.json`, `model_catalog.py`), `L1_TEMPLATES` (`templates/**`) | native `config.json` / `> 50 MiB` streamed ModelSlim or HF quant metadata + curated checkpoints (`curated_checkpoints.json`) -> `ModelSpec`, `CheckpointQuantMap`, `Hardware`, `PrimitiveTable`, sealed `data/abi/cann93_shipping_abi_*.json`, `FormulaKernelSpec` | Ascend + hardware-neutral primitive/ABI facts (zero shipping NVIDIA/CUDA profiles or GPU kernels), read-only streaming quantization descriptors, CATLASS/DSL/fused template bounds, `CacheStateABI` delegation |
+| **L2 Unified Engine, Program, Collectives & Memory** | `L2_ENGINE_RUNTIME` (`prediction/{runtime,engine_periodic}/**`, `engine.py`, `graph.py`, L2 `efficiency/{exposed_*,metrics,resource_attribution,roofline_graph,step_metrics,unmodeled_gate}.py`), `L2_PROGRAM_SCHED` (`prediction/{program,scheduling,values}/**`, `fusion/ports.py`, core L2), `L2_COLLECTIVES` (`prediction/collectives/**`, `sharding/{local_tp,routing,sequence_parallel}.py`), `L2_CAPACITY_OFFLOAD` (`prediction/{capacity,cache_path,cache_execution,offload,service_regime_domains,response_functions}/**`) | lowered `GraphIR` + injected lowering/quant plans -> `StepEvaluation`, `LayerRunProgram`, `StreamExposureResult`, `ResidentMemoryReceipt` (`usable`, `current_live`, `reclaimable`, `historical_peak`) | Single hardware-neutral `Engine` (`Python == C11 ABI v4`) + `PrimitiveTable`, formal `EngineObserver` Protocol, addressed read-only `AdmissionMemoryView.preview_access` + completion-time L2 settlement, per-slot/gen `RefillPipeline`, unified physical directional host-DMA (`host_solo:{dir}:d{rank}`) & `RootComplexKey` |
+| **L3 Operator Families, Graph Execution & Sharding** | `L3_OPERATORS_SHARDING`: `prediction/{operators,execution,frontend,scheduler,disaggregated,pd_connector}/**`, `fusion/{__init__,bridge,control_rewrite,graph,pool}.py`, `sharding/{__init__,context_parallel,ffn_rules}.py`, `compose/operator_defaults.py`, `graph_analysis.py`, `rewrite.py`, `transforms.py`, L3 `efficiency/{__init__,analysis,attribution,capacity_window,cost,peaks,sla}.py`, core L3 builders | `OpSpec` + geometry -> `KernelBinding`, `OwnerScheduleSpec`, `Program`, `CohortReplay`, `ServingStep`, `PDHandoff`, Roofline/SLA analysis | Governed single-rank Ascend/hardware-neutral kernels (`TARGET_BACKEND` + pinned `SourceRef`; zero GPU/CUDA or dead `custom_framework/*` kernels), cohort/graph replay, causal serving scheduler & per-chunk `PDConnector`, distributed CP/FFN sharding |
+| **L4 Pluggable Runtime Stacks (Firewall)** | `L4_STACKS`: `stacks/**` | `(ModelSpec, CheckpointQuantMap, Hardware, ParallelSpec)` -> `ResolvedStackOptions`, `RuntimeQuantPlan`, `StackLoweringPlan`, optional `LaunchConfigCodec` | Encapsulates all inference-engine specifics behind `RuntimeStackAdapter` (`mindie-sim.stack-adapter/1`), custom JSON manifests, and `mindie_sim.stacks` entry points (`vllm-ascend`, `diffusion-native`, `ideal-target`, `raw-eager`); domain-aware default routing; never imports L5 (`compose/`, `rewrite/`, `export/`) |
+| **L5a Composition & Rewrite Algebra** | `L5A_COMPOSE_REWRITE`: `compose/{__init__,inputs,runtime}.py`, `rewrite/**`, `feature_mechanisms.py`, `runtime_advisor.py`, `sku_comparison.py`, `custom_hardware.py` | frozen `ScenarioContract` -> process-cache-safe `Case`, `(replica, op_id)`-scoped `RewritePlan` `/2`, `AppliedPlan`, `OptimalityCertificate` (`dual_cert.py`) | Case composition, neutral synthetic `custom_hardware.py` builder, canonical GraphIR rewrites, per-unit L1 prefetch/tile-binding liveness verification, and exact-witness Eq.7 verification (zero `rewrite -> optimization` SCC) |
+| **L5b Optimization, Solvers, Spine, Export, CLI & Profiler SSOT** | `L5B_OPT_SOLVE_EXPORT_CLI` (`optimization/**`, `sweep/**`, `solve.py`, `export/**`, `cli/**`, `public/**`, `onboarding/**`, `prediction/spine.py`, `api.py`, `__init__.py`, `__main__.py`), `L5_OBSERVATIONS_SSOT` (`observations/**`, `structure/**`, `structure_values/**`, `structure_*.py`, `subgraph_math.py`, `cohort_accuracy.py`, `study.py`) | frozen `ScenarioContract` & captures -> `DeploymentOutcome`, `CoDesignOpportunity`, 4-sheet `.xlsx` / `agent_brief.json` / `trace_view.json` / `digest.md`, Stage-4 onboarding receipts, packaged `mindie-sim obs {scoreboard,subgraph-parity}`, `mindie-model-structure/1` | Hardware-neutral `PredictionSpine` (zero hardcoded vendor `stack_id`, zero L3->L4 `stacks` import), full-grid SLA/PD Pareto solvers, independent `L*` dual bound, pure 4-sheet export with `OpOccurrence` reconciliation, CLI/SDK entrypoints, and cross-repo `mindie-profiler` SSOT |
+| **DEV Out-of-Band Tooling** | `DEV_TOOLS`: `tools/**` | CLI scripts / ABI probes / wheel verification | Dev-time `probe_shipping_abi.py`, thin `live_subgraph_parity_gate.py` delegate, and `verify_wheel.py`; mapped in `AG015-A` file ownership (`Rule #3`), strictly excluded from `AG015-B` library reachability roots |
 
 Model labels and source revisions are provenance. Physical work does not branch
 on them. Family adapters decode native configurations into structural records;
 they contain no latency correction tables. Hardware profiles are data, not
 alternate execution algorithms.
+
+## Machine-Checked Architecture Ownership Manifest (`AG015-A`)
+
+<!-- ag015:architecture-manifest:start -->
+```json
+{
+  "schema": "mindie-sim.ag015-architecture-manifest/1",
+  "bilingual_mirror_required": false,
+  "subsystems": [
+    {
+      "id": "L0_SCHEMA",
+      "layer": "L0",
+      "selectors": [
+        "mindie_sim/schema/**",
+        "mindie_sim/observed_contracts/**",
+        "mindie_sim/public/errors.py",
+        "mindie_sim/coverage/**"
+      ],
+      "allowed_edges": []
+    },
+    {
+      "id": "L1_HW_PRIM_ABI",
+      "layer": "L1",
+      "selectors": [
+        "mindie_sim/backends/**",
+        "mindie_sim/primitives/**",
+        "mindie_sim/hardware_derivation.py",
+        "data/abi/*.json",
+        "data/primitives/**"
+      ],
+      "allowed_edges": ["L0_SCHEMA"]
+    },
+    {
+      "id": "L1_CATALOG",
+      "layer": "L1",
+      "selectors": [
+        "mindie_sim/catalog/**",
+        "mindie_sim/model_configs/*.json",
+        "mindie_sim/model_catalog.py"
+      ],
+      "allowed_edges": ["L0_SCHEMA", "L1_HW_PRIM_ABI"]
+    },
+    {
+      "id": "L1_TEMPLATES",
+      "layer": "L1",
+      "selectors": ["mindie_sim/templates/**"],
+      "allowed_edges": ["L0_SCHEMA", "L1_HW_PRIM_ABI"]
+    },
+    {
+      "id": "L2_ENGINE_RUNTIME",
+      "layer": "L2",
+      "selectors": [
+        "mindie_sim/prediction/runtime/**",
+        "mindie_sim/prediction/engine_periodic/**",
+        "mindie_sim/prediction/engine.py",
+        "mindie_sim/prediction/graph.py",
+        "mindie_sim/prediction/efficiency/exposed_breakdown.py",
+        "mindie_sim/prediction/efficiency/exposed_program.py",
+        "mindie_sim/prediction/efficiency/metrics.py",
+        "mindie_sim/prediction/efficiency/resource_attribution.py",
+        "mindie_sim/prediction/efficiency/roofline_graph.py",
+        "mindie_sim/prediction/efficiency/step_metrics.py",
+        "mindie_sim/prediction/efficiency/unmodeled_gate.py"
+      ],
+      "allowed_edges": [
+        "L0_SCHEMA",
+        "L1_HW_PRIM_ABI",
+        "L1_CATALOG",
+        "L1_TEMPLATES",
+        "L2_PROGRAM_SCHED",
+        "L2_COLLECTIVES",
+        "L2_CAPACITY_OFFLOAD"
+      ]
+    },
+    {
+      "id": "L2_PROGRAM_SCHED",
+      "layer": "L2",
+      "selectors": [
+        "mindie_sim/prediction/program/**",
+        "mindie_sim/prediction/scheduling/**",
+        "mindie_sim/prediction/fusion/ports.py",
+        "mindie_sim/prediction/values/**",
+        "mindie_sim/prediction/mechanism.py",
+        "mindie_sim/prediction/native_binding.py",
+        "mindie_sim/prediction/physical_recipe_base.py",
+        "mindie_sim/prediction/results.py",
+        "mindie_sim/prediction/streams.py",
+        "mindie_sim/prediction/tensors.py",
+        "mindie_sim/prediction/source_program_service.py",
+        "mindie_sim/prediction/lowering.py",
+        "mindie_sim/prediction/structure_groups.py",
+        "mindie_sim/prediction/fusion_regions.py",
+        "mindie_sim/prediction/implementations.py",
+        "mindie_sim/prediction/instructions.py",
+        "mindie_sim/prediction/ownership.py",
+        "mindie_sim/prediction/projections.py",
+        "mindie_sim/prediction/rewrite_mhc_rules.py",
+        "mindie_sim/prediction/transactions.py"
+      ],
+      "allowed_edges": [
+        "L0_SCHEMA",
+        "L1_HW_PRIM_ABI",
+        "L1_CATALOG",
+        "L2_ENGINE_RUNTIME",
+        "L2_COLLECTIVES",
+        "L2_CAPACITY_OFFLOAD"
+      ]
+    },
+    {
+      "id": "L2_COLLECTIVES",
+      "layer": "L2",
+      "selectors": [
+        "mindie_sim/prediction/collectives/**",
+        "mindie_sim/prediction/communication.py",
+        "mindie_sim/prediction/topology.py",
+        "mindie_sim/prediction/sharding/local_tp.py",
+        "mindie_sim/prediction/sharding/routing.py",
+        "mindie_sim/prediction/sharding/sequence_parallel.py"
+      ],
+      "allowed_edges": [
+        "L0_SCHEMA",
+        "L1_HW_PRIM_ABI",
+        "L1_CATALOG",
+        "L2_ENGINE_RUNTIME",
+        "L2_PROGRAM_SCHED"
+      ]
+    },
+    {
+      "id": "L2_CAPACITY_OFFLOAD",
+      "layer": "L2",
+      "selectors": [
+        "mindie_sim/prediction/capacity/**",
+        "mindie_sim/prediction/cache_path/**",
+        "mindie_sim/prediction/cache_execution/**",
+        "mindie_sim/prediction/offload/**",
+        "mindie_sim/prediction/cache_representation.py",
+        "mindie_sim/prediction/memory_traffic.py",
+        "mindie_sim/prediction/prefix_reads.py",
+        "mindie_sim/prediction/service_regime_domains/**",
+        "mindie_sim/prediction/response_functions/**"
+      ],
+      "allowed_edges": [
+        "L0_SCHEMA",
+        "L1_HW_PRIM_ABI",
+        "L1_CATALOG",
+        "L2_ENGINE_RUNTIME",
+        "L2_PROGRAM_SCHED",
+        "L2_COLLECTIVES"
+      ]
+    },
+    {
+      "id": "L3_OPERATORS_SHARDING",
+      "layer": "L3",
+      "selectors": [
+        "mindie_sim/prediction/operators/**",
+        "mindie_sim/prediction/execution/**",
+        "mindie_sim/prediction/scheduler/**",
+        "mindie_sim/prediction/fusion/__init__.py",
+        "mindie_sim/prediction/fusion/bridge.py",
+        "mindie_sim/prediction/fusion/control_rewrite.py",
+        "mindie_sim/prediction/fusion/graph.py",
+        "mindie_sim/prediction/fusion/pool.py",
+        "mindie_sim/prediction/sharding/__init__.py",
+        "mindie_sim/prediction/sharding/context_parallel.py",
+        "mindie_sim/prediction/sharding/ffn_rules.py",
+        "mindie_sim/prediction/frontend/**",
+        "mindie_sim/prediction/disaggregated/**",
+        "mindie_sim/prediction/pd_connector/**",
+        "mindie_sim/prediction/__init__.py",
+        "mindie_sim/prediction/api.py",
+        "mindie_sim/prediction/body_defaults.py",
+        "mindie_sim/prediction/call_builders.py",
+        "mindie_sim/prediction/evaluation.py",
+        "mindie_sim/prediction/feedforward.py",
+        "mindie_sim/prediction/graph_analysis.py",
+        "mindie_sim/prediction/implementation_selection.py",
+        "mindie_sim/prediction/operator_analysis.py",
+        "mindie_sim/prediction/physical_recipe_registry.py",
+        "mindie_sim/prediction/rewrite.py",
+        "mindie_sim/prediction/structure.py",
+        "mindie_sim/prediction/transforms.py",
+        "mindie_sim/prediction/efficiency/__init__.py",
+        "mindie_sim/prediction/efficiency/analysis.py",
+        "mindie_sim/prediction/efficiency/attribution.py",
+        "mindie_sim/prediction/efficiency/capacity_window.py",
+        "mindie_sim/prediction/efficiency/cost.py",
+        "mindie_sim/prediction/efficiency/peaks.py",
+        "mindie_sim/prediction/efficiency/sla.py",
+        "mindie_sim/compose/operator_defaults.py"
+      ],
+      "allowed_edges": [
+        "L0_SCHEMA",
+        "L1_HW_PRIM_ABI",
+        "L1_CATALOG",
+        "L1_TEMPLATES",
+        "L2_ENGINE_RUNTIME",
+        "L2_PROGRAM_SCHED",
+        "L2_COLLECTIVES",
+        "L2_CAPACITY_OFFLOAD"
+      ]
+    },
+    {
+      "id": "L4_STACKS",
+      "layer": "L4",
+      "selectors": ["mindie_sim/stacks/**"],
+      "allowed_edges": [
+        "L0_SCHEMA",
+        "L1_HW_PRIM_ABI",
+        "L1_CATALOG",
+        "L2_PROGRAM_SCHED",
+        "L3_OPERATORS_SHARDING"
+      ]
+    },
+    {
+      "id": "L5A_COMPOSE_REWRITE",
+      "layer": "L5a",
+      "selectors": [
+        "mindie_sim/compose/__init__.py",
+        "mindie_sim/compose/inputs.py",
+        "mindie_sim/compose/runtime.py",
+        "mindie_sim/rewrite/**",
+        "mindie_sim/feature_mechanisms.py",
+        "mindie_sim/runtime_advisor.py",
+        "mindie_sim/sku_comparison.py",
+        "mindie_sim/custom_hardware.py"
+      ],
+      "allowed_edges": [
+        "L0_SCHEMA",
+        "L1_HW_PRIM_ABI",
+        "L1_CATALOG",
+        "L1_TEMPLATES",
+        "L2_ENGINE_RUNTIME",
+        "L2_PROGRAM_SCHED",
+        "L2_COLLECTIVES",
+        "L2_CAPACITY_OFFLOAD",
+        "L3_OPERATORS_SHARDING",
+        "L4_STACKS",
+        "L5B_OPT_SOLVE_EXPORT_CLI"
+      ]
+    },
+    {
+      "id": "L5B_OPT_SOLVE_EXPORT_CLI",
+      "layer": "L5b",
+      "selectors": [
+        "mindie_sim/optimization/**",
+        "mindie_sim/sweep/**",
+        "mindie_sim/solve.py",
+        "mindie_sim/export/**",
+        "mindie_sim/cli/**",
+        "mindie_sim/public/__init__.py",
+        "mindie_sim/public/api.py",
+        "mindie_sim/public/api_support.py",
+        "mindie_sim/public/cli.py",
+        "mindie_sim/public/contracts.py",
+        "mindie_sim/public/environment.py",
+        "mindie_sim/public/formula_sdk.py",
+        "mindie_sim/public/profiles.py",
+        "mindie_sim/public/services.py",
+        "mindie_sim/public/values.py",
+        "mindie_sim/onboarding/**",
+        "mindie_sim/prediction/spine.py",
+        "mindie_sim/api.py",
+        "mindie_sim/__init__.py",
+        "mindie_sim/__main__.py"
+      ],
+      "allowed_edges": [
+        "L0_SCHEMA",
+        "L1_HW_PRIM_ABI",
+        "L1_CATALOG",
+        "L1_TEMPLATES",
+        "L2_ENGINE_RUNTIME",
+        "L2_PROGRAM_SCHED",
+        "L2_COLLECTIVES",
+        "L2_CAPACITY_OFFLOAD",
+        "L3_OPERATORS_SHARDING",
+        "L4_STACKS",
+        "L5A_COMPOSE_REWRITE",
+        "L5_OBSERVATIONS_SSOT"
+      ]
+    },
+    {
+      "id": "L5_OBSERVATIONS_SSOT",
+      "layer": "L5b",
+      "selectors": [
+        "mindie_sim/observations/**",
+        "mindie_sim/structure/**",
+        "mindie_sim/structure_values/**",
+        "mindie_sim/structure_contracts.py",
+        "mindie_sim/structure_implementations.py",
+        "mindie_sim/structure_subgraphs.py",
+        "mindie_sim/subgraph_math.py",
+        "mindie_sim/cohort_accuracy.py",
+        "mindie_sim/study.py"
+      ],
+      "allowed_edges": [
+        "L0_SCHEMA",
+        "L1_HW_PRIM_ABI",
+        "L1_CATALOG",
+        "L1_TEMPLATES",
+        "L2_ENGINE_RUNTIME",
+        "L2_PROGRAM_SCHED",
+        "L2_COLLECTIVES",
+        "L2_CAPACITY_OFFLOAD",
+        "L3_OPERATORS_SHARDING",
+        "L4_STACKS",
+        "L5A_COMPOSE_REWRITE",
+        "L5B_OPT_SOLVE_EXPORT_CLI"
+      ]
+    },
+    {
+      "id": "DEV_TOOLS",
+      "layer": "DEV",
+      "selectors": ["tools/**"],
+      "allowed_edges": [
+        "L0_SCHEMA",
+        "L1_HW_PRIM_ABI",
+        "L1_CATALOG",
+        "L1_TEMPLATES",
+        "L2_ENGINE_RUNTIME",
+        "L2_PROGRAM_SCHED",
+        "L2_COLLECTIVES",
+        "L2_CAPACITY_OFFLOAD",
+        "L3_OPERATORS_SHARDING",
+        "L4_STACKS",
+        "L5A_COMPOSE_REWRITE",
+        "L5B_OPT_SOLVE_EXPORT_CLI",
+        "L5_OBSERVATIONS_SSOT"
+      ]
+    }
+  ]
+}
+```
+<!-- ag015:architecture-manifest:end -->
+
+### UML-1-AMEND
+
+```mermaid
+flowchart TD
+    L0_SCHEMA["L0_SCHEMA (L0)\nschema/**, observed_contracts/**, public/errors.py, coverage/**\nHardwareIngress, PhysicalRankMap, TensorPrecisionABI,\nCacheStateABI, StateEffect, ScenarioContract, CANN 9.3 Vocabulary"]
+
+    L1_HW_PRIM_ABI["L1_HW_PRIM_ABI (L1)\nbackends/**, primitives/**, hardware_derivation.py,\ndata/abi/*.json, data/primitives/**\nAscend + Neutral Primitives ONLY (0 NVIDIA/CUDA)"]
+    L1_CATALOG["L1_CATALOG (L1)\ncatalog/**, model_configs/*.json, model_catalog.py\nStreaming CheckpointQuantMap, curated_checkpoints.json, CacheStateABI Delegate"]
+    L1_TEMPLATES["L1_TEMPLATES (L1)\ntemplates/**\nFormulaKernelSpec, CATLASS/DSL Streaming/Periodic, 216K/248K UB"]
+
+    L2_ENGINE_RUNTIME["L2_ENGINE_RUNTIME (L2)\nprediction/{runtime,engine_periodic}/**, engine.py, graph.py + L2 metrics\nEngine (Python == C11 ABI v4), EngineObserver, Addressed L2, Exposed Metrics"]
+    L2_PROGRAM_SCHED["L2_PROGRAM_SCHED (L2)\nprediction/{program,scheduling,values}/**, fusion/ports.py + core L2\nStreamOwners, LiveBufferSpec, RefillPipeline, PipelineProgram, Mechanism"]
+    L2_COLLECTIVES["L2_COLLECTIVES (L2)\nprediction/collectives/**, sharding/{local_tp,routing,sequence_parallel}.py\nPhysical Directional Ports (host_solo:dir:dR), RootComplexKey, Uncapped Issuance"]
+    L2_CAPACITY_OFFLOAD["L2_CAPACITY_OFFLOAD (L2)\nprediction/{capacity,cache_path,cache_execution,offload,service_regime_domains,response_functions}/**\nResidentMemoryReceipt (current/reclaimable/peak), Full-Duplex H2D/D2H"]
+
+    L3_OPERATORS_SHARDING["L3_OPERATORS_SHARDING (L3)\nprediction/{operators,execution,frontend,scheduler,fusion,disaggregated,pd_connector}/**, graph_analysis, L3 efficiency\nAscend/Neutral Kernels (TARGET_BACKEND + SourceRef), Cohort Replay, Serving, PDConnector"]
+
+    L4_STACKS["L4_STACKS (L4 — Core Firewall)\nstacks/** (incl. W2a checkpoint_registry.py)\nRuntimeStackAdapter, vllm-ascend (Z-WIRE-4), diffusion-native, ideal-target, raw-eager"]
+
+    L5A_COMPOSE_REWRITE["L5A_COMPOSE_REWRITE (L5a)\ncompose/{__init__,inputs,runtime}.py, rewrite/**, feature_mechanisms.py, custom_hardware.py\nProcess-Cache-Safe Compose, (replica,op_id) Rewrite/Prefetch/TileBinding/DualCert"]
+    L5B_OPT_SOLVE_EXPORT_CLI["L5B_OPT_SOLVE_EXPORT_CLI (L5b)\noptimization/**, sweep/**, solve.py, export/**, cli/**, public/**, onboarding/**, spine.py\nNeutral Spine (spine.py:707), CoDesignOpportunity, Certified SLA/PD, 4-Sheet Export"]
+    L5_OBSERVATIONS_SSOT["L5_OBSERVATIONS_SSOT (L5b)\nobservations/**, structure/**, structure_values/**, structure_*.py, subgraph_math.py, study.py\nCANN 9.3 Profiler SSOT, Packaged mindie-sim obs {scoreboard,subgraph-parity}"]
+
+    DEV_TOOLS["DEV_TOOLS (DEV — Outside AG015-B Library Roots)\ntools/**\nprobe_shipping_abi.py (W1B-00), live_subgraph_parity_gate.py (thin CLI delegate), verify_wheel.py"]
+
+    subgraph RETIRED["WAVE-0 + STEP 5 RETIRED (Excluded from AG015-A Runtime Nodes)"]
+        W0_RET["Retired Code & Data (-43 Code/Data Files, -13,628 .py LOC + 16 GPU Fixtures/Tests)\nassembly, wave_*, engine_plan, legacy fusion/*, migration/*, _dual_obligations,\nkernel_synthesis, nvidia.{py,json}, data/measurements/gpu/*, 13 GPU + 7 custom_framework"]
+    end
+
+    L1_HW_PRIM_ABI --> L0_SCHEMA
+    L1_CATALOG --> L0_SCHEMA
+    L1_CATALOG --> L1_HW_PRIM_ABI
+    L1_TEMPLATES --> L0_SCHEMA
+    L1_TEMPLATES --> L1_HW_PRIM_ABI
+
+    L2_ENGINE_RUNTIME --> L0_SCHEMA
+    L2_ENGINE_RUNTIME --> L1_HW_PRIM_ABI
+    L2_ENGINE_RUNTIME --> L1_CATALOG
+    L2_ENGINE_RUNTIME --> L1_TEMPLATES
+    L2_ENGINE_RUNTIME --> L2_PROGRAM_SCHED
+    L2_ENGINE_RUNTIME --> L2_COLLECTIVES
+    L2_ENGINE_RUNTIME --> L2_CAPACITY_OFFLOAD
+
+    L2_PROGRAM_SCHED --> L0_SCHEMA
+    L2_PROGRAM_SCHED --> L1_HW_PRIM_ABI
+    L2_PROGRAM_SCHED --> L1_CATALOG
+    L2_PROGRAM_SCHED --> L2_ENGINE_RUNTIME
+    L2_PROGRAM_SCHED --> L2_COLLECTIVES
+    L2_PROGRAM_SCHED --> L2_CAPACITY_OFFLOAD
+
+    L2_COLLECTIVES --> L0_SCHEMA
+    L2_COLLECTIVES --> L1_HW_PRIM_ABI
+    L2_COLLECTIVES --> L1_CATALOG
+    L2_COLLECTIVES --> L2_ENGINE_RUNTIME
+    L2_COLLECTIVES --> L2_PROGRAM_SCHED
+
+    L2_CAPACITY_OFFLOAD --> L0_SCHEMA
+    L2_CAPACITY_OFFLOAD --> L1_HW_PRIM_ABI
+    L2_CAPACITY_OFFLOAD --> L1_CATALOG
+    L2_CAPACITY_OFFLOAD --> L2_ENGINE_RUNTIME
+    L2_CAPACITY_OFFLOAD --> L2_PROGRAM_SCHED
+    L2_CAPACITY_OFFLOAD --> L2_COLLECTIVES
+
+    L3_OPERATORS_SHARDING --> L0_SCHEMA
+    L3_OPERATORS_SHARDING --> L1_HW_PRIM_ABI
+    L3_OPERATORS_SHARDING --> L1_CATALOG
+    L3_OPERATORS_SHARDING --> L1_TEMPLATES
+    L3_OPERATORS_SHARDING --> L2_ENGINE_RUNTIME
+    L3_OPERATORS_SHARDING --> L2_PROGRAM_SCHED
+    L3_OPERATORS_SHARDING --> L2_COLLECTIVES
+    L3_OPERATORS_SHARDING --> L2_CAPACITY_OFFLOAD
+
+    L4_STACKS --> L0_SCHEMA
+    L4_STACKS --> L1_HW_PRIM_ABI
+    L4_STACKS --> L1_CATALOG
+    L4_STACKS --> L2_PROGRAM_SCHED
+    L4_STACKS --> L3_OPERATORS_SHARDING
+
+    L5A_COMPOSE_REWRITE --> L0_SCHEMA
+    L5A_COMPOSE_REWRITE --> L1_HW_PRIM_ABI
+    L5A_COMPOSE_REWRITE --> L1_CATALOG
+    L5A_COMPOSE_REWRITE --> L1_TEMPLATES
+    L5A_COMPOSE_REWRITE --> L2_ENGINE_RUNTIME
+    L5A_COMPOSE_REWRITE --> L2_PROGRAM_SCHED
+    L5A_COMPOSE_REWRITE --> L2_COLLECTIVES
+    L5A_COMPOSE_REWRITE --> L2_CAPACITY_OFFLOAD
+    L5A_COMPOSE_REWRITE --> L3_OPERATORS_SHARDING
+    L5A_COMPOSE_REWRITE --> L4_STACKS
+    L5A_COMPOSE_REWRITE --> L5B_OPT_SOLVE_EXPORT_CLI
+
+    L5B_OPT_SOLVE_EXPORT_CLI --> L0_SCHEMA
+    L5B_OPT_SOLVE_EXPORT_CLI --> L1_HW_PRIM_ABI
+    L5B_OPT_SOLVE_EXPORT_CLI --> L1_CATALOG
+    L5B_OPT_SOLVE_EXPORT_CLI --> L1_TEMPLATES
+    L5B_OPT_SOLVE_EXPORT_CLI --> L2_ENGINE_RUNTIME
+    L5B_OPT_SOLVE_EXPORT_CLI --> L2_PROGRAM_SCHED
+    L5B_OPT_SOLVE_EXPORT_CLI --> L2_COLLECTIVES
+    L5B_OPT_SOLVE_EXPORT_CLI --> L2_CAPACITY_OFFLOAD
+    L5B_OPT_SOLVE_EXPORT_CLI --> L3_OPERATORS_SHARDING
+    L5B_OPT_SOLVE_EXPORT_CLI --> L4_STACKS
+    L5B_OPT_SOLVE_EXPORT_CLI --> L5A_COMPOSE_REWRITE
+    L5B_OPT_SOLVE_EXPORT_CLI --> L5_OBSERVATIONS_SSOT
+
+    L5_OBSERVATIONS_SSOT --> L0_SCHEMA
+    L5_OBSERVATIONS_SSOT --> L1_HW_PRIM_ABI
+    L5_OBSERVATIONS_SSOT --> L1_CATALOG
+    L5_OBSERVATIONS_SSOT --> L1_TEMPLATES
+    L5_OBSERVATIONS_SSOT --> L2_ENGINE_RUNTIME
+    L5_OBSERVATIONS_SSOT --> L2_PROGRAM_SCHED
+    L5_OBSERVATIONS_SSOT --> L2_COLLECTIVES
+    L5_OBSERVATIONS_SSOT --> L2_CAPACITY_OFFLOAD
+    L5_OBSERVATIONS_SSOT --> L3_OPERATORS_SHARDING
+    L5_OBSERVATIONS_SSOT --> L4_STACKS
+    L5_OBSERVATIONS_SSOT --> L5A_COMPOSE_REWRITE
+    L5_OBSERVATIONS_SSOT --> L5B_OPT_SOLVE_EXPORT_CLI
+
+    DEV_TOOLS --> L0_SCHEMA
+    DEV_TOOLS --> L1_HW_PRIM_ABI
+    DEV_TOOLS --> L1_CATALOG
+    DEV_TOOLS --> L1_TEMPLATES
+    DEV_TOOLS --> L2_ENGINE_RUNTIME
+    DEV_TOOLS --> L2_PROGRAM_SCHED
+    DEV_TOOLS --> L2_COLLECTIVES
+    DEV_TOOLS --> L2_CAPACITY_OFFLOAD
+    DEV_TOOLS --> L3_OPERATORS_SHARDING
+    DEV_TOOLS --> L4_STACKS
+    DEV_TOOLS --> L5A_COMPOSE_REWRITE
+    DEV_TOOLS --> L5B_OPT_SOLVE_EXPORT_CLI
+    DEV_TOOLS --> L5_OBSERVATIONS_SSOT
+
+    W0_RET -. "git rm in W0B & Step 5 W3b" .-> L3_OPERATORS_SHARDING
+
+    style RETIRED fill:#fff0f0,stroke:#c00,stroke-dasharray: 5 5
+    style W0_RET fill:#ffe0e0,stroke:#c00,stroke-dasharray: 5 5
+    style DEV_TOOLS fill:#eef7ff,stroke:#06c,stroke-dasharray: 3 3
+```
 
 ## Explicit deployment modes, 4-stage waterfall & co-design
 
