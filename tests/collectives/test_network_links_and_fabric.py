@@ -25,16 +25,13 @@
 """
 from __future__ import annotations
 
-import json
 from dataclasses import replace
-from pathlib import Path
 
 import pytest
 
 from mindie_sim import compose_case, graph_costs, predict
 from mindie_sim.backends.ascend import materialize as ascend_materialize
-from mindie_sim.backends.nvidia import materialize as nvidia_materialize
-from mindie_sim.backends.nvidia import profiles as nvidia_profiles
+from mindie_sim.backends.ascend import profiles
 from mindie_sim.prediction.communication import MessageFlow
 from mindie_sim.prediction.operators.collectives.direct_peer import DirectPeerCollective
 from mindie_sim.prediction.engine import Engine
@@ -52,19 +49,15 @@ from mindie_sim.sweep.resize import (
     _first_link_by_channel, materialize_machine_for_devices, project_transfer_channel_input,
 )
 
-from _support.axes import GEN2_SKU, GEN3_SKU, GEN5_DT_SKU, GEN5_DT_SMALL_SKU, GEN5_PR_SKU
+from _support.axes import COMPOSE_HARDWARE, GEN2_SKU, GEN3_SKU, GEN5_DT_SKU, GEN5_DT_SMALL_SKU, GEN5_PR_SKU
 from _support.collective_cases import case as declared_case
 from _support.collective_cases import declared, exchange
 from _support.collective_cases import topology as build_topology
 
 pytestmark = pytest.mark.tier0
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
-
 TINY_MODEL = "qwen3.5-35b-a3b"
 GENERIC_MODEL = "deepseek-v3"
-
-GPU_SKUS = ("NVIDIA_H20", "NVIDIA_H800", "NVIDIA_H200", "NVIDIA_B300")
 
 #: ``(sku, preset, devices, ranks_per_node, tiers, routes)`` where each tier is
 #: ``(channel, member_count, service_bytes_per_ms, latency_us)``.
@@ -99,16 +92,6 @@ def _channel_link(machine: Hardware, channel: str, members=None) -> Link:
 
 def _materialized_link(raw: dict, channel: str) -> dict:
     return next(link for link in raw["links"] if link["channel"] == channel)
-
-def _gpu_materialized(channel: dict, **machine) -> dict:
-    return _materialized_link(nvidia_materialize({ "sku": "NVIDIA_H200", "num_devices": 16, "ranks_per_node": 8,
-        "transfer_channels": {"d2d_inter_node": channel}, **machine}),
-        "d2d_inter_node")
-
-def _gpu_machine(*, util: float | None = None) -> Hardware:
-    extra = {} if util is None else {"intra_node_bw_util": util}
-    return Hardware.from_mapping({"backend": "nvidia", "sku": "NVIDIA_H200",
-                                  "num_devices": 16, "ranks_per_node": 8, **extra})
 
 def _arrival_ms(machine: Hardware, source: int, destination: int, payload: float) -> float:
     topology = Topology(machine, ParallelSpec(tp=16))
@@ -275,13 +258,12 @@ def test_declared_utilization_moves_service_and_preserves_peak():
     assert _arrival_ms(half.machine, 0, 8, payload) - _arrival_ms( whole.machine, 0, 8, payload) == pytest.approx(
             payload / 50_000_000 - payload / 100_000_000)
 
-    gpu_base, gpu_half = _gpu_machine(), _gpu_machine(util=0.5)
-    gpu_base_link = _channel_link(gpu_base, "d2d_intra_node", range(8))
-    gpu_half_link = _channel_link(gpu_half, "d2d_intra_node", range(8))
-    assert gpu_base_link.effective_peak_capacity_bytes_per_ms == pytest.approx(450e6)
-    assert gpu_half_link.effective_peak_capacity_bytes_per_ms == pytest.approx(450e6)
-    assert gpu_half_link.capacity_bytes_per_ms == pytest.approx( gpu_base_link.capacity_bytes_per_ms / 2)
-    assert Hardware.from_mapping(gpu_half.to_dict()) == gpu_half
+    local_half = _machine(GEN3_SKU, intra_node_bw_util=0.5)
+    local_link = _channel_link(local_half, "d2d_intra_node", range(8))
+    local_peak = _channel_link(baseline, "d2d_intra_node", range(8)).capacity_bytes_per_ms
+    assert local_link.effective_peak_capacity_bytes_per_ms == pytest.approx(local_peak)
+    assert local_link.capacity_bytes_per_ms == pytest.approx(local_peak / 2)
+    assert Hardware.from_mapping(local_half.to_dict()) == local_half
 
 @pytest.mark.parametrize("sku,preset,devices,ranks_per_node,tiers,routes", TIER_LADDERS)
 def test_tiered_preset_emits_the_declared_link_ladder(sku, preset, devices, ranks_per_node, tiers, routes):
@@ -302,30 +284,18 @@ def test_tiered_preset_emits_the_declared_link_ladder(sku, preset, devices, rank
         assert [hop[0] for hop in topology.route(source, destination)] == [expected]
     assert Hardware.from_mapping(machine.to_dict()) == machine
 
-@pytest.mark.parametrize(("alias", "sku", "memory_gib"), ( ("h20", "NVIDIA_H20", 96), ("h800", "NVIDIA_H800", 80),
-    ("h200", "NVIDIA_H200", 141), ("b300", "NVIDIA_B300", 288)))
-def test_public_gpu_skus_compose_parse_and_predict(alias, sku, memory_gib):
-    profiles = nvidia_profiles()
-    assert set(profiles) == set(GPU_SKUS)
-    assert all(profiles[name]["ranks_per_node"] == 8 for name in GPU_SKUS)
-    assert all(profiles[name]["hbm_bw_gbps"] > 0 and profiles[name]["cube_fp16_tflops"] > 0 for name in GPU_SKUS)
-    data = json.loads((REPO_ROOT / "mindie_sim" / "backends" / "profiles" / "nvidia.json").read_text(encoding="utf-8"))
-    assert (data["NVIDIA_H20"]["intra_node_bw_gbps"], data["NVIDIA_H200"]["hbm_bw_gbps"],
-            data["NVIDIA_B300"]["intra_package_bw_gbps"]) == (450, 4800, 900)
-    case = compose_case(TINY_MODEL, hardware=alias, tp=8, dp=2, ep=8,
-                        layers=1, prompt_tokens=32, output_tokens=4, concurrency=1)
-    parsed = parse_case(case)
-    profile = profiles[sku]
-    assert parsed.machine.sku == sku
-    assert (len(parsed.machine.dies), parsed.machine.dies[0].memory_bytes) \
-        == (16, memory_gib * 1024**3)
-    node = _channel_link(parsed.machine, "d2d_intra_node", range(8))
-    inter = _channel_link(parsed.machine, "d2d_inter_node")
-    assert node.capacity_bytes_per_ms == pytest.approx( profile["intra_node_bw_gbps"] * 1e6)
-    assert inter.capacity_bytes_per_ms == pytest.approx( profile["inter_node_bw_gbps"] * 1e6)
-    if profile["dies_per_package"] > 1:
-        package = _channel_link(parsed.machine, "d2d_intra_package", range(2))
-        assert package.capacity_bytes_per_ms == pytest.approx( profile["intra_package_bw_gbps"] * 1e6)
+@pytest.mark.parametrize(("alias", "sku"), [(alias, sku) for alias, sku, _ in COMPOSE_HARDWARE])
+def test_public_skus_compose_parse_and_predict_across_nodes(alias, sku):
+    case = compose_case(TINY_MODEL, hardware=alias, tp=2, dp=2, ep=2, ranks_per_node=2,
+                        layers=1, prompt_tokens=4, output_tokens=2, concurrency=1)
+    machine = parse_case(case).machine
+    profile = profiles()[sku]
+    assert machine.sku == sku and len(machine.dies) == 4
+    assert machine.dies[0].memory_bytes == profile["device"]["memory_bytes"]
+    for channel, members in (("d2d_intra_node", range(2)), ("d2d_inter_node", range(4))):
+        link = _channel_link(machine, channel, members)
+        assert link.capacity_bytes_per_ms == pytest.approx(
+            profile["transfer_channels"][channel]["effective_uni_bw_gbps"] * 1e6)
     result = predict(case)
     assert result["status"] == "modeled"
     assert result["requests"][0]["status"] == "served"
@@ -340,17 +310,14 @@ def test_peak_and_calibration_overrides_survive_materialization():
     assert _materialized_link(asc, "d2d_inter_node")["capacity_bytes_per_ms"] \
         == pytest.approx(25000000.0)
 
-    nv = _gpu_materialized({"bw_utilization": 0.5, "latency_us": 3.5})
-    assert nv["semantics"] == "per_port"
-    assert nv["capacity_bytes_per_ms"] == pytest.approx(25000000.0)
-    assert nv["latency_us"] == pytest.approx(3.5)
-    assert _gpu_materialized({"bw_utilization": 0.5}, inter_node_bw_gbps=100.0)[
-        "capacity_bytes_per_ms"] == pytest.approx(50e6)
-    assert _gpu_materialized({"calibrated_uni_bw_gbps": 80.0, "bw_utilization": 0.5})["capacity_bytes_per_ms"] \
-        == pytest.approx(40e6)
+    calibrated = _machine(GEN3_SKU, transfer_channels={"d2d_inter_node": {
+        "calibrated_uni_bw_gbps": 80.0, "bw_utilization": 0.5, "alpha_us": 3.5}})
+    link = _channel_link(calibrated, "d2d_inter_node")
+    assert link.semantics == "per_port" and link.latency_us == 3.5
+    assert link.capacity_bytes_per_ms == pytest.approx(40e6)
 
     explicit = Hardware.from_mapping({
-        "backend": "nvidia", "sku": "NVIDIA_H200", "num_devices": 16, "ranks_per_node": 8,
+        "backend": "ascend", "sku": GEN3_SKU, "num_devices": 16, "ranks_per_node": 8,
         "inter_node_bw_util": 0.5,
         "links": [{"name": "inter:0", "members": list(range(16)), "capacity_bytes_per_ms": 100e6, "latency_us": 2.0,
                    "channel": "d2d_inter_node"}]})

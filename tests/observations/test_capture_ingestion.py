@@ -400,17 +400,16 @@ def test_historical_source_index_preserves_hashes_and_source_roles(tmp_path):
         rows = index.find_sources("profiler.csv")
         assert rows[0]["kind"] == "profiler" and len(rows[0]["sha256"]) == 64
         assert index.inventory()["profiler_catalogue"]["files"] == 1
-def test_rate_fit_predicts_independent_measurements():
-    root = REPO_ROOT / "data" / "measurements" / "gpu"
-    raw = json.loads(next(root.glob("*.stdout")).read_text())
-    # The fixture is the actual 4090 Driver API capture, not generated timings.
-    samples = raw["samples"]
-    fitted = fit_resource_rate(samples)
-    changed = [dict(sample, duration_ms=sample["duration_ms"] * 2)
-               if sample["split"] == "heldout" else sample for sample in samples]
-    assert fitted["bytes_per_ms"] == fit_resource_rate(changed)["bytes_per_ms"]
-    assert len(fitted["heldout"]) == 5
-    assert max(abs(row["relative_error"]) for row in fitted["heldout"]) < .08
+def test_rate_fit_excludes_heldout_duration():
+    train = [{"work_bytes": 1024, "duration_ms": 2, "split": "train"},
+             {"work_bytes": 3072, "duration_ms": 4, "split": "train"}]
+    for observed_ms in (3, 6):
+        heldout = {"work_bytes": 2048, "duration_ms": observed_ms, "split": "heldout"}
+        fitted = fit_resource_rate([*train, heldout])
+        assert (fitted["setup_ms"], fitted["bytes_per_ms"]) == (1, 1024)
+        row, = fitted["heldout"]
+        assert row["predicted_ms"] == 3
+        assert row["relative_error"] == pytest.approx(3 / observed_ms - 1)
 def test_real_matmul_rows_do_not_gain_negative_gaps_from_epoch_float_rounding():
     report = analyze_window(fixture_path("a5_microbench_20261030", "cube_matmul_m1_k4096_n4096.csv"), 4)
     stream = report["streams"][0]

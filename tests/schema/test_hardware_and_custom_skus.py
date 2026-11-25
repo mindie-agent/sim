@@ -171,10 +171,12 @@ def test_undeclared_host_has_no_launch_service_and_explicit_launch_is_additive(s
 
 
 def test_non_ascend_efficiency_peaks_preserve_declared_fp32_vector_rate():
+    machine = ch.build_custom_hardware_machine(
+        {**MOCK, "vector_fp32_tflops": 2}, num_devices=1, archetype="generic_accelerator")
     peaks = extract_hardware_peaks(Case.from_mapping({
-        "machine": {"backend": "nvidia", "sku": "NVIDIA_H200"},
+        "machine": machine,
         "model": MODEL, "workload": WORKLOAD, "runtime": {}}))
-    assert peaks["vector_peak_ops_per_s"] == peaks["vector_fp32_fma_flops_per_s"] == pytest.approx(67e12)
+    assert peaks["vector_peak_ops_per_s"] == peaks["vector_fp32_fma_flops_per_s"] == pytest.approx(2e12)
 
 
 # --- pipeline supply on the common Engine ----------------------------------------------

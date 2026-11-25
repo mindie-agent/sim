@@ -546,7 +546,6 @@ import json, sys, weakref
 from pathlib import Path
 import mindie_sim
 from mindie_sim.backends.ascend import profiles as ascend_profiles
-from mindie_sim.backends.nvidia import profiles as nvidia_profiles
 from mindie_sim.model_catalog import load_model
 from mindie_sim.primitives.loader import default_primitives_dir, load_manifest
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
@@ -556,7 +555,8 @@ extract, package = Path(sys.argv[1]).resolve(), Path(mindie_sim.__file__).resolv
 assert package.is_relative_to(extract), (package, extract)
 prim_dir, prim_manifest = default_primitives_dir().resolve(), load_manifest()
 assert prim_dir.is_relative_to(extract) and prim_manifest.get("tables"), (prim_dir, prim_manifest)
-assert len(ascend_profiles()) == 16 and len(nvidia_profiles()) == 4 and type(load_model("qwen3-32b")).__name__ == "ModelSpec"
+assert len(ascend_profiles()) == 16
+assert type(load_model("qwen3-32b")).__name__ == "ModelSpec"
 class F(float): pass
 class Tok: pass
 report = {"package": str(package), "primitives_dir": str(prim_dir), "primitive_tables": len(prim_manifest["tables"])}

@@ -11,7 +11,6 @@ from copy import deepcopy
 from dataclasses import replace
 import json
 from pathlib import Path
-from statistics import median
 
 import pytest
 from _support.captures import REPO_ROOT, captured_report, fixture_json, norm_case
@@ -26,7 +25,7 @@ from mindie_sim.observations.scoreboard import main, native_comparison_scoreboar
 from mindie_sim.observations.scoreboard import render_native_comparison_markdown
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.structure import export_structure
-from tools.accuracy_report import retained_copy_campaign
+from tools.accuracy_report import main as accuracy_report_main
 
 pytestmark = pytest.mark.tier0
 
@@ -384,22 +383,23 @@ def test_repeated_sampling_cannot_outweigh_independent_runs_and_training_is_excl
         accuracy_report({**campaign, "observations": samples + [{**samples[0], "split": "train"}]})
 
 
-def test_retained_gpu_batch_uses_raw_holdout_and_frozen_engine(tmp_path):
-    path = REPO_ROOT / "data/measurements/gpu/service-curve-validation-20261028.json"
-    retained = json.loads(path.read_text())
-    altered = tmp_path / "capture.json"
-    altered.write_text(json.dumps({**retained, "passed": True, "heldout_engine": [],
-                                   "scores_by_work": [{"median_relative_error": 0, "accepted": True}]}))
-    campaign = retained_copy_campaign(altered, root=REPO_ROOT, tolerances={"relative": 0.1})
-    result = accuracy_report(campaign)
-    point, = [row for row in result["points"] if row["status"] == "paired"]
-    raw = json.loads((REPO_ROOT / retained["source"]).read_text())
-    holdout = [row for row in raw["samples"] if row["split"] == "heldout"]
-    assert point["observed_ms"] == pytest.approx(median(row["duration_ms"] * row["repetitions"] for row in holdout))
-    assert point["heldout_samples"] == len(holdout) == 5
-    assert point["comparison"]["relative_error"] == pytest.approx(-.003238146446031376)
-    assert result["coverage"]["excluded_observations"] == {"split_train": 15}
-
+def test_accuracy_tool_scores_heldout_timings_with_requested_tolerance(tmp_path):
+    prediction = point("custom-memory", 2)
+    training = sample(prediction, 1, run="training", split="train")
+    heldout = sample(prediction, 4, run="validation")
+    campaign = tmp_path / "campaign.json"
+    campaign.write_text(json.dumps({
+        "predictions": [prediction], "observations": [training, heldout],
+        "tolerances": {"relative": 1}, "passed": True,
+    }))
+    output = tmp_path / "report.json"
+    accuracy_report_main([str(campaign), "--relative-tolerance", "0.25", "-o", str(output)])
+    report = json.loads(output.read_text())
+    paired, = report["points"]
+    assert paired["heldout_samples"] == 1 and paired["observed_ms"] == heldout["duration_ms"]
+    assert paired["comparison"]["relative_error"] == -0.5
+    assert report["tolerance_outcomes"]["outside"] == 1
+    assert report["coverage"]["excluded_observations"] == {"split_train": 1}
 
 
 def test_different_boundaries_and_incomplete_identities_remain_unpaired():
