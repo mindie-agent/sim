@@ -27,6 +27,12 @@ _LONGCAT_MODEL_TYPES = frozenset({"longcat_flash", "longcat_flash_ngram"})
 _LONGCAT_SUBLAYERS_PER_BLOCK = 2
 
 
+def _is_dual_sublayer_block_config(c: Mapping[str, Any]) -> bool:
+    return bool(c.get("dual_sublayers_per_block")) or (
+        str(c.get("model_type", "")).lower() in _LONGCAT_MODEL_TYPES
+    )
+
+
 def _longcat_plans(c: Mapping[str, Any]) -> tuple[list[LayerPlan], list[str]]:
     """Expand LongCat-Flash blocks into native dual-MLA + dual-dense-MLP + 1 MoE sublayers."""
     h = positive(c, "hidden_size")
@@ -286,7 +292,7 @@ def build_composable(key, config, family="generic"):
         from .kimi import _standard_kimi_plans, _standard_kimi_gaps, _aux_standard_kimi
         plans = _standard_kimi_plans(c)
         gaps, aux = list(_standard_kimi_gaps(c)), _aux_standard_kimi(c)
-    elif str(c.get("model_type", "")).lower() in _LONGCAT_MODEL_TYPES:
+    elif _is_dual_sublayer_block_config(c):
         plans, gaps = _longcat_plans(c)
     else:
         plans, gaps = generic_plans(c)
@@ -309,7 +315,7 @@ def build_composable(key, config, family="generic"):
         {"index_topk", "index_n_heads", "index_head_dim"}
         if family in {"standard_deepseek", "standard_glm"} else
         {"zero_expert_num", "ngram_embedding", "dual_sublayers_per_block", "routed_scaling_factor"}
-        if str(c.get("model_type", "")).lower() in _LONGCAT_MODEL_TYPES else ()
+        if _is_dual_sublayer_block_config(c) else ()
     )
     unknown = unrecognized_fields(config, consumed=consumed_extra)
     gaps.extend("unrecognized_config_field:" + field for field in unknown)

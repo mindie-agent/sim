@@ -182,11 +182,23 @@ def apply_model_overrides(model, raw):
         # catalog model (the W8A8-MXFP8 checkpoint served on A5) without
         # forking the architecture.  The structure, dimensions and layer
         # plan stay the catalog's; only the weight/activation plan moves.
-        from mindie_sim.catalog.quant import quant_preset, _quant_bf16
+        from mindie_sim.catalog.quant import QUANTIZATION_PRESETS, quant_preset, _quant_bf16
 
         try:
-            quant = (_quant_bf16({}, name="bf16") if str(declared).lower() in {"none", "bf16", "bf16_qwen"}
-                     else quant_preset(str(declared), model=model))
+            declared_key = str(declared).strip().lower()
+            is_bf16_profile_alias = (
+                declared_key not in QUANTIZATION_PRESETS
+                and declared_key.startswith("bf16_")
+                and not any(
+                    tok in declared_key
+                    for tok in ("int4", "int8", "fp8", "fp4", "mxfp", "w4", "w8", "quarot")
+                )
+            )
+            quant = (
+                _quant_bf16({}, name="bf16")
+                if declared_key in {"none", "bf16"} or is_bf16_profile_alias
+                else quant_preset(str(declared), model=model)
+            )
         except ValueError as exc:
             raise ModelingError(str(exc)) from exc
         # A weight preset does not erase the catalog model's declared

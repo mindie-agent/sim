@@ -1359,9 +1359,12 @@ def _activation(manifest, capture, path):
                 [value * count for value in row["burst_samples_ms"]])
 
 
+_GROUPED_PROBE_SCHEMA_RE = re.compile(r"^(?:[a-z0-9]+-)*grouped-graph-probe/1$")
+
+
 def _grouped(manifest, capture, path):
     header = _fields(path, {"schema", "device", "torch", "torch_npu", "cann", "timing"})
-    if header["schema"] != "a5-qwen35-grouped-graph-probe/1":
+    if not _GROUPED_PROBE_SCHEMA_RE.fullmatch(str(header.get("schema") or "")):
         raise ValueError("grouped_capture_schema_mismatch")
     for index, row in enumerate(json_items(path, "rows.item")):
         prefix = f"/rows/{index}"
@@ -1381,13 +1384,22 @@ def _grouped(manifest, capture, path):
         counts += [0] * (shape["experts"] - shape["groups"])
         if sum(counts) != shape["tokens"]:
             raise ValueError("grouped_producer_histogram_conflict")
+        contract = row["contract"]
+        def _contract_dtype(key: str, default: str) -> str:
+            raw_val = str(contract.get(key) or "").strip()
+            return raw_val.split()[0] if raw_val else default
         base = dict(
-            implementation={"api": row["contract"]["api"], "contract": row["contract"]},
+            implementation={"api": contract["api"], "contract": contract},
             phase="primitive",
             shape={"tokens": shape["tokens"], "k": shape["k"], "n": shape["n"],
                    "experts": shape["experts"], "expert_counts": counts},
-            dtype={"input": "int8", "weight": "int8", "scale": "float32",
-                   "per_token_scale": "float32", "output": "bfloat16"},
+            dtype={
+                "input": _contract_dtype("x", "int8"),
+                "weight": _contract_dtype("weight", "int8"),
+                "scale": _contract_dtype("scale", "float32"),
+                "per_token_scale": _contract_dtype("per_token_scale", "float32"),
+                "output": _contract_dtype("out_dtype", "bfloat16"),
+            },
             layout={"input": "ND", "weight": "FRACTAL_NZ", "output": "ND"},
         )
         for field, mode, invocations in (

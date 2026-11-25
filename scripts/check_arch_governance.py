@@ -1262,7 +1262,7 @@ def scan_ag014(
 def scan_repository(
     root: Path, /, *, revision: str | None = None,
     refs_root: Path | None = None, repo_map: Mapping[str, Path] | None = None,
-    include_ag014: bool = False,
+    include_ag014: bool = True,
 ) -> tuple[Violation, ...]:
     """Return the sorted static findings under ``mindie_sim/**/*.py``."""
     violations: list[Violation] = []
@@ -1303,11 +1303,11 @@ def scan_repository(
 
 
 def filter_allowlisted(violations: Sequence[Violation], /) -> tuple[Violation, ...]:
-    """Drop only tracked pre-Stage-3 legacy violations; never waive governed operators."""
+    """Drop only tracked pre-Stage-3 legacy violations; never waive governed operators or AG014."""
     kept: list[Violation] = []
     for item in violations:
         in_pkg, _family, _fname = _is_governed_family_path(item.path)
-        if in_pkg or item.rule not in LEGACY_ALLOWLIST.get(item.path.as_posix(), frozenset()):
+        if in_pkg or item.rule == "AG014" or item.rule not in LEGACY_ALLOWLIST.get(item.path.as_posix(), frozenset()):
             kept.append(item)
     return tuple(kept)
 
@@ -1322,7 +1322,7 @@ def new_violations(
     added: list[Violation] = []
     for item in current:
         in_pkg, _family, _fname = _is_governed_family_path(item.path)
-        if in_pkg:
+        if in_pkg or item.rule == "AG014":
             added.append(item)
             continue
         key = (item.rule, item.path.as_posix(), item.fingerprint)
@@ -1341,7 +1341,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--strict-ag014",
         action="store_true",
-        help="promote AG014 zero model-name branching checks from staged observation to hard failure",
+        help="compatibility no-op; AG014 zero model-name branching is enforced unconditionally by default",
     )
     parser.add_argument("--refs-root", default=None, help="local upstream repos root for SHA-256 check")
     parser.add_argument(
@@ -1359,30 +1359,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         all_current = scan_repository(
             root, refs_root=refs_root, repo_map=repo_map or None, include_ag014=True,
         )
-        current = tuple(v for v in all_current if v.rule != "AG014")
-        ag014_findings = tuple(v for v in all_current if v.rule == "AG014")
         if args.base is not None:
-            all_base = scan_repository(root, revision=args.base, include_ag014=args.strict_ag014)
-            base_non_ag014 = tuple(v for v in all_base if v.rule != "AG014")
-            active = new_violations(current, base_non_ag014)
-            if args.strict_ag014:
-                base_ag014 = tuple(v for v in all_base if v.rule == "AG014")
-                ag014_findings = new_violations(ag014_findings, base_ag014)
+            all_base = scan_repository(root, revision=args.base, include_ag014=True)
+            active = new_violations(all_current, all_base)
         elif args.strict:
-            active = current
+            active = all_current
         else:
-            active = filter_allowlisted(current)
+            active = filter_allowlisted(all_current)
         if args.strict:
             active += scan_runtime(root) + tuple(check_ag012(root))
-        if args.strict_ag014:
-            active += ag014_findings
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_USAGE
     for item in active:
         print(f"{item.path.as_posix()}:{item.line}: {item.rule} {item.message}")
-    if not args.strict_ag014 and ag014_findings:
-        print(f"arch governance AG014 staged warnings: {len(ag014_findings)}")
     print(f"arch governance violations: {len(active)}")
     return EXIT_VIOLATIONS if active else EXIT_OK
 

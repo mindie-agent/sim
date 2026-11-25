@@ -89,10 +89,22 @@ def _hc_grid_dims(op: OpSpec) -> tuple[int, int]:
     return hc_mult, hidden
 
 
+def _is_row_reduction_norm(op: OpSpec) -> bool:
+    """True for full-hidden per-stream norm reductions (incl. unit-offset RMSNorm)."""
+    meta = dict(op.metadata)
+    norm_style = str(meta.get("norm_style", "") or "").strip().lower()
+    return (
+        str(op.family or "").strip().lower() == "rmsnorm"
+        or norm_style == "unit_offset"
+        or bool(meta.get("norm_unit_offset", False))
+        or str(op.recipe or "").endswith("_rmsnorm")
+    )
+
+
 def _tile_weights(op: OpSpec, rows: int) -> tuple[int, ...]:
     """Per-program active element counts matching upstream masked Triton tiles."""
     hc_mult, hidden = _hc_grid_dims(op)
-    if op.recipe in {"grouped_gemma_rmsnorm", "hc_combine_rmsnorm"}:
+    if _is_row_reduction_norm(op):
         return (hidden,) * (rows * hc_mult)
     if op.recipe in {"hc_gate_mix", "hc_combine"}:
         hidden_tiles = _ceil_div(hidden, LOWRANK_HC_HIDDEN_TILE)
