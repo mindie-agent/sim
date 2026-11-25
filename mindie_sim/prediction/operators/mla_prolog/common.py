@@ -134,7 +134,7 @@ class PrologContract:
         latent, rope = self.kv_lora_rank, self.qk_rope_head_dim
         if self.kv_cache_quant_mode == KV_QUANT_NONE:
             return (latent + rope) * BF16_BYTES
-        if self.kv_cache_quant_mode == KV_QUANT_PER_TENSOR and self.query_quant_mode:
+        if self.kv_cache_quant_mode == KV_QUANT_PER_TENSOR:
             return latent + rope * BF16_BYTES
         return latent + rope * BF16_BYTES + ceil_div(latent, self.tile_size) * FP32_BYTES
 
@@ -189,9 +189,6 @@ def validate_contract(
            **dict(metadata.get("prolog_contract") or {})}
     weight = _integer(raw.get("weight_quant_mode", WEIGHT_QUANT_MXFP8), "weight_quant_mode")
     cache = _integer(raw.get("kv_cache_quant_mode", 1), "kv_cache_quant_mode")
-    query = _integer(raw.get("query_quant_mode", 0), "query_quant_mode")
-    if weight not in SUPPORTED_WEIGHT_MODES or cache not in SUPPORTED_KV_MODES or query not in {0, 1}:
-        raise ModelingError(f"mla_prolog_unsupported_quant_modes:{weight}:{cache}:{query}")
     declared = raw.get("abi") or raw.get("native_kind")
     requested = requested_abi or raw.get("requested_abi")
     if requested and declared and requested != declared:
@@ -199,6 +196,13 @@ def validate_contract(
     abi = requested or declared or (ABI_V4_NZ if weight == WEIGHT_QUANT_MXFP8 else ABI_V3_NZ)
     if abi not in SUPPORTED_ABIS:
         raise ModelingError(f"mla_prolog_abi_unsupported:{abi}")
+    raw_query = raw.get("query_quant_mode")
+    if raw_query is None:
+        query = 1 if (abi != ABI_DSL and cache == KV_QUANT_PER_TENSOR) else 0
+    else:
+        query = _integer(raw_query, "query_quant_mode")
+    if weight not in SUPPORTED_WEIGHT_MODES or cache not in SUPPORTED_KV_MODES or query not in {0, 1}:
+        raise ModelingError(f"mla_prolog_unsupported_quant_modes:{weight}:{cache}:{query}")
     tile_size = _integer(raw.get("tile_size", C8_BLOCK_SIZE), "tile_size", 1)
     if abi != ABI_DSL and tile_size != C8_BLOCK_SIZE:
         raise ModelingError(f"mla_prolog_invalid_tile_size:{tile_size}")
@@ -304,16 +308,14 @@ def aclnn_contract_supported(c: PrologContract) -> tuple[bool, str]:
             )
     else:
         return False, f"unsupported_qk_rope_head_dim:{c.qk_rope_head_dim}"
-    if c.weight_quant_mode == WEIGHT_QUANT_INT8:
-        expected_query = 1 if c.kv_cache_quant_mode == KV_QUANT_PER_TENSOR else 0
-        if c.query_quant_mode != expected_query:
-            return False, f"unsupported_int8_query_quant_mode:{c.kv_cache_quant_mode}:{c.query_quant_mode}"
-    elif c.weight_quant_mode == WEIGHT_QUANT_BF16 and c.query_quant_mode != 0:
-        return False, f"unsupported_bf16_query_quant_mode:{c.query_quant_mode}"
-    elif (c.weight_quant_mode == WEIGHT_QUANT_MXFP8
-          and c.kv_cache_quant_mode != KV_QUANT_PER_TENSOR
-          and c.query_quant_mode != 0):
-        return False, f"unsupported_mxfp8_query_quant_mode:{c.kv_cache_quant_mode}:{c.query_quant_mode}"
+    if c.weight_quant_mode == WEIGHT_QUANT_BF16 and c.kv_cache_quant_mode != KV_QUANT_NONE:
+        return False, f"unsupported_bf16_kv_cache_quant_mode:{c.kv_cache_quant_mode}"
+    expected_query = 1 if c.kv_cache_quant_mode == KV_QUANT_PER_TENSOR else 0
+    if c.query_quant_mode != expected_query:
+        return False, (
+            f"unsupported_query_quant_mode:{c.weight_quant_mode}:"
+            f"{c.kv_cache_quant_mode}:{c.query_quant_mode}"
+        )
     return True, ""
 
 
@@ -322,7 +324,7 @@ def _minimum_prolog_io(c: PrologContract) -> tuple[float, float, float, float]:
     if c.tokens == 0:
         return 0.0, 0.0, 0.0, 0.0
     w_elem = BF16_BYTES if c.weight_quant_mode == WEIGHT_QUANT_BF16 else 1
-    in_bytes = float(c.tokens * c.hidden_size * BF16_BYTES)
+    in_bytes = float(c.tokens * _activation(c.hidden_size, c.precision))
     weight_bytes = 0.0
     for name, n, k, groups, _ in _products(c):
         elem = BF16_BYTES if name == "mm4_w_uk" else w_elem
@@ -359,7 +361,7 @@ def make_op(
     q_lora_rank: int = DEFAULT_Q_LORA_RANK, kv_lora_rank: int = DEFAULT_KV_LORA_RANK,
     qk_nope_head_dim: int = DEFAULT_QK_NOPE_DIM, qk_rope_head_dim: int = DEFAULT_QK_ROPE_DIM,
     abi: str | None = None, weight_quant_mode: int = WEIGHT_QUANT_MXFP8,
-    kv_cache_quant_mode: int = 1, query_quant_mode: int = 0, cache_mode: str = "PA_BSND",
+    kv_cache_quant_mode: int = 1, query_quant_mode: int | None = None, cache_mode: str = "PA_BSND",
     do_rope: bool | None = None, batch_seq_fused: bool = False,
     actual_seq_len: tuple[int, ...] | None = None, tile_size: int = C8_BLOCK_SIZE,
     emit_query_norm_out: bool = True, dsl_d_width: int | None = None,
@@ -402,6 +404,38 @@ def unsupported(op: OpSpec, ctx: OperatorPlanningContext, reason: str) -> Unmode
     )
 
 
+def _dequant_opt_enabled(c: PrologContract) -> bool:
+    """CANN enableDequantOpt_ predicate (mla_prolog_tiling.cpp:585-592)."""
+    return (
+        c.weight_quant_mode == WEIGHT_QUANT_MXFP8
+        or (c.weight_quant_mode == WEIGHT_QUANT_INT8 and c.num_heads >= GROUP_COMPUTE_MIN_HEADS)
+    )
+
+
+def _aclnn_workspace_bytes(c: PrologContract, step_rows: int, *, split_m: bool) -> int:
+    """CANN CalcWorkSpace per-group slab size (mla_prolog_tiling.cpp:671-739)."""
+    rank, latent, heads = c.q_lora_rank, c.kv_lora_rank, c.num_heads
+    nope, rope = c.qk_nope_head_dim, c.qk_rope_head_dim
+    if c.weight_quant_mode != WEIGHT_QUANT_BF16:
+        per_row = (
+            rank * (INT32_BYTES + BF16_BYTES)
+            + (latent + rope) * INT32_BYTES
+            + (heads * latent * BF16_BYTES if c.kv_cache_quant_mode == KV_QUANT_PER_TENSOR else 0)
+        )
+    else:
+        per_row = 2 * rank * BF16_BYTES + (latent + rope) * BF16_BYTES
+    per_row += heads * (nope + rope) * INT32_BYTES + heads * nope * BF16_BYTES
+    if (split_m and c.weight_quant_mode == WEIGHT_QUANT_MXFP8
+            and c.kv_cache_quant_mode in {KV_QUANT_NONE, KV_QUANT_PER_TENSOR}):
+        per_row += heads * nope * BF16_BYTES
+    scale_bytes = 0
+    if _dequant_opt_enabled(c):
+        slot = (_align(rank // MX_GROUP_SIZE, CQ_SCALE_SLOT_BYTES)
+                if c.weight_quant_mode == WEIGHT_QUANT_MXFP8 else CQ_SCALE_SLOT_BYTES)
+        scale_bytes = step_rows * slot
+    return step_rows * per_row + scale_bytes
+
+
 @dataclass
 class _ChunkGraph:
     contract: PrologContract
@@ -413,35 +447,43 @@ class _ChunkGraph:
     phases: list[_Phase]
     cq_scale_slot_rows: int = 0
     token_runs: tuple[tuple[int, int], ...] = ()
+    split_m: bool = False
+    step_rows: int = 0
 
     def add(self, name: str, after: tuple[str, ...], demands) -> str:
         self.phases.append(_Phase(name, after, tuple(demands)))
         return name
+
+    def _slices(self, product) -> list[tuple[int, int, int]]:
+        name, n, _, groups, dtype = product
+        k0 = FRACTAL_K_BF16 if dtype == "bf16" else FRACTAL_K_BYTE
+        c = self.contract
+        if groups > 1 or name == "mm4_w_uk":
+            per, _ = w_uk_ownership(groups, len(self.aics))
+            return [(n, start, min(per, groups - start)) for start in range(0, groups, per)]
+        granule = k0
+        if name == "mm3_qc_qr" and _dequant_opt_enabled(c):
+            granule = c.qk_nope_head_dim + c.qk_rope_head_dim
+        width = _align(ceil_div(n, len(self.aics)), granule)
+        if name == "mm1_cq":
+            width = max(width, MATRIX_N_MIN)
+        if name == "mm2_ckv_kr" and len(self.aics) >= KV_FIXED_N_MIN_AIC:
+            width = max(width, MATRIX_N_MIN)
+        if len(self.aics) == 1:
+            width = n
+        return [(min(width, n - start), start, 1) for start in range(0, n, width)]
 
     def matrix(self, product, after=()):
         name, n, k, groups, dtype = product
         acc_bytes = MATMUL_OUTPUT_BYTES[dtype]
         k0 = FRACTAL_K_BF16 if dtype == "bf16" else FRACTAL_K_BYTE
         c, rows = self.contract, self.rows
-        if groups > 1 or name == "mm4_w_uk":
-            per, _ = w_uk_ownership(groups, len(self.aics))
-            slices = [(n, start, min(per, groups - start)) for start in range(0, groups, per)]
-        else:
-            granule = k0
-            if name == "mm3_qc_qr" and (dtype == "int8" and c.num_heads >= GROUP_COMPUTE_MIN_HEADS):
-                granule = c.qk_nope_head_dim + c.qk_rope_head_dim
-            width = _align(ceil_div(n, len(self.aics)), granule)
-            if name == "mm1_cq":
-                width = max(width, MATRIX_N_MIN)
-            if name == "mm2_ckv_kr" and len(self.aics) >= KV_FIXED_N_MIN_AIC:
-                width = max(width, MATRIX_N_MIN)
-            if len(self.aics) == 1:
-                width = n
-            slices = [(min(width, n - start), start, 1) for start in range(0, n, width)]
+        slices = self._slices(product)
 
         reads, operands, cubes, publish = [], [], [], []
         for owner, (cols, start, batches) in zip(self.aics, slices, strict=False):
-            width = _activation(k, dtype)
+            # CANN INT8 full-quant AIC loads pure INT8 operands; AIV consumes FP32 scales.
+            width = k if dtype == "int8" else _activation(k, dtype)
             activation = (_plane(rows, width),)
             if self.token_runs and name in {"mm1_cq", "mm2_ckv_kr"}:
                 activation = tuple(_plane(count, width, offset=offset * width) for offset, count in self.token_runs)
@@ -460,9 +502,9 @@ class _ChunkGraph:
                 weight_scales: tuple = ()
             else:
                 weight_payload = (weight[0],)
-                weight_scales = weight[1:]
+                weight_scales = () if dtype == "int8" else weight[1:]
             logical_weight = cols * k * (BF16_BYTES if dtype == "bf16" else 1)
-            logical_weight += sum(run.rows * run.row_bytes for run in weight[1:])
+            logical_weight += sum(run.rows * run.row_bytes for run in weight_scales)
             logical_input = sum(run.rows * run.row_bytes for run in activation)
             access = _transfer_operands(
                 owner, "aic", "mte2_aic", name, (
@@ -832,24 +874,39 @@ class _ChunkGraph:
         nope, rope = c.qk_nope_head_dim, c.qk_rope_head_dim
         quantized = c.weight_quant_mode != WEIGHT_QUANT_BF16
         int8 = c.weight_quant_mode == WEIGHT_QUANT_INT8
-        norm_row = _activation(rank, c.precision)
+        dequant_opt = _dequant_opt_enabled(c)
+        if c.weight_quant_mode == WEIGHT_QUANT_MXFP8:
+            mx_scales = ceil_div(rank, MX_GROUP_SIZE)
+            # CANN always writes workspace deQuantScaleCqGm_ and adds optional
+            # dequant_scale_q_norm_out when queryNormFlag == 1.
+            norm_row = (
+                rank + _align(mx_scales, CQ_SCALE_SLOT_BYTES)
+                + (mx_scales if c.emit_query_norm_out else 0)
+            )
+        elif int8:
+            norm_row = rank + (FP32_BYTES if c.emit_query_norm_out else 0)
+        else:
+            norm_row = rank * BF16_BYTES
         rope_ops = rope * ROPE_OPS_PER_ELEM if c.do_rope else 0
-        rope_tables = 2 * rope * FP32_BYTES if c.do_rope else 0
+        rope_tables = 2 * rope * BF16_BYTES if c.do_rope else 0
         mm1, mm2, mm3, *uk = _products(c)
+        mm3_blocks = len(self._slices(mm3))
         cq_bytes, ckv_bytes, qcqr_bytes = (MATMUL_OUTPUT_BYTES[p[-1]] for p in (mm1, mm2, mm3))
         cq = self.matrix(mm1)
         ckv = self.matrix(mm2)
         self.vector(
             "kv_cache", (ckv,), read_rows=mm2[1] * ckv_bytes
-            + rope_tables + (SLOT_INDEX_BYTES if c.cache_mode in PAGED_CACHE_MODES else 0),
-            params=latent * BF16_BYTES,
+            + (FP32_BYTES if int8 else 0)
+            + (rope_tables if dequant_opt else 0)
+            + (SLOT_INDEX_BYTES if c.cache_mode in PAGED_CACHE_MODES else 0),
+            params=latent * BF16_BYTES + ((latent + rope) * FP32_BYTES if int8 else 0),
             ops=latent * RMSNORM_OPS_PER_ELEM + rope_ops
             + (C8_QUANT_OPS_PER_ELEM * latent if c.kv_cache_quant_mode else 0),
             write_rows=c.kv_row_bytes,
         )
         cq_norm = self.vector(
-            "cq_norm", (cq,), read_rows=rank * cq_bytes,
-            params=rank * BF16_BYTES, ops=rank * (
+            "cq_norm", (cq,), read_rows=rank * cq_bytes + (FP32_BYTES if int8 else 0),
+            params=rank * BF16_BYTES + (rank * FP32_BYTES if int8 else 0), ops=rank * (
                 RMSNORM_OPS_PER_ELEM + (MX_QUANT_OPS_PER_ELEM if quantized else 0)
             ), write_rows=norm_row, publish_scale=bool(self.cq_scale_slot_rows),
         )
@@ -865,9 +922,14 @@ class _ChunkGraph:
         qc = query
         if quantized:
             qc = self.vector("qc_dequant", (query,), read_rows=heads * nope * qcqr_bytes,
+                             params=heads * nope * FP32_BYTES if int8 else 0,
                              ops=heads * nope, write_rows=heads * nope * BF16_BYTES)
         if rope:
-            self.vector("query_rope", (query,), read_rows=heads * rope * qcqr_bytes + rope_tables,
+            # Non-dequantOpt shares one CopyInSinCos load; dequantOpt replicates
+            # CopyInSinCos across mm3_blocks owner pairs alongside kv_cache's load.
+            q_rope_tables = rope_tables * (mm3_blocks if dequant_opt else 1)
+            self.vector("query_rope", (query,), read_rows=heads * rope * qcqr_bytes + q_rope_tables,
+                        params=heads * rope * FP32_BYTES if int8 else 0,
                         ops=heads * (rope_ops + (rope if int8 else 0)),
                         write_rows=heads * rope * BF16_BYTES)
         absorb = self.matrix(uk[0], (qc,))
@@ -875,14 +937,10 @@ class _ChunkGraph:
             self.vector("query_quant", (absorb,), read_rows=heads * latent * BF16_BYTES,
                         ops=heads * latent * C8_QUANT_OPS_PER_ELEM,
                         write_rows=heads * (latent + FP32_BYTES))
-        workspace = rank * cq_bytes + mm2[1] * ckv_bytes + mm3[1] * qcqr_bytes
-        if quantized and not c.emit_query_norm_out:
-            workspace += norm_row
-        if quantized:
-            workspace += heads * nope * BF16_BYTES
-        if c.query_quant_mode:
-            workspace += heads * latent * BF16_BYTES
-        return _Chunk(count, tuple(self.phases), self.rows * workspace + self.cq_scale_slot_rows * CQ_SCALE_SLOT_BYTES)
+        workspace_bytes = _aclnn_workspace_bytes(
+            c, self.step_rows or self.rows, split_m=self.split_m,
+        )
+        return _Chunk(count, tuple(self.phases), workspace_bytes)
 
 
 def _unsupported_for_ctx(ctx: OperatorPlanningContext, reason: str) -> UnmodeledCapabilityError:
@@ -941,12 +999,14 @@ def build_plan(
     spans = planning_sequence_spans(ctx, "TND" if c.batch_seq_fused else "BSH")
     token_start = 0
     for rows, aics, aivs in groups:
+        group_step = min(rows, chunk_size)
         full, tail = divmod(rows, chunk_size)
         chunks = (_token_chunks(spans, token_start, rows, chunk_size) if spans else
                   ((chunk_size, full, ()), (tail, int(bool(tail)), ())))
         programs.append(tuple(
             _ChunkGraph(c, size, aics, aivs, l2, fixpipe_alignment, [],
-                        cq_scale_slot_rows=chunk_size if cq_scale else 0, token_runs=addresses).lower(count)
+                        cq_scale_slot_rows=group_step if cq_scale else 0, token_runs=addresses,
+                        split_m=split_m, step_rows=group_step).lower(count)
             for size, count, addresses in chunks if count
         ))
         token_start += rows

@@ -25,7 +25,8 @@ from ._lowering import (
     _GenericTiling, _ResidentTiling, _align, ceil_div,
 )
 from .common import (
-    ABI_V3_NZ, FAMILY, KV_QUANT_PER_TENSOR, WEIGHT_QUANT_MXFP8, PrologContract, aclnn_contract_supported,
+    ABI_V3_NZ, FAMILY, GROUP_COMPUTE_MIN_HEADS, KV_QUANT_PER_TENSOR, WEIGHT_QUANT_INT8,
+    WEIGHT_QUANT_MXFP8, PrologContract, aclnn_contract_supported,
     build_plan, contract_for, unsupported, uses_split_m,
 )
 
@@ -472,7 +473,8 @@ class _Arch35Strategy:
                               resident=resident, generic=generic, fixpipe_alignment=alignment)
         if uses_split_m(c):
             return build_plan(c, ctx, sources=ACLNN_SOURCES, mode="split_m", pairs=_split_m_owners(ctx))
-        return build_plan(c, ctx, sources=ACLNN_SOURCES, mode="split_n")
+        cq_scale = c.weight_quant_mode == WEIGHT_QUANT_INT8 and c.num_heads >= GROUP_COMPUTE_MIN_HEADS
+        return build_plan(c, ctx, sources=ACLNN_SOURCES, mode="split_n", cq_scale=cq_scale)
 
 
 STRATEGY: ArchStrategy = _Arch35Strategy()
