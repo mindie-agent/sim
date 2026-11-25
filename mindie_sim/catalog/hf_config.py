@@ -195,6 +195,13 @@ def _classify_exclusion_pattern(pattern: str) -> str | None:
 _INDEXED_LAYER_ATTN_RE = re.compile(
     r"(?:^|\.)layers\.(\d+)\.(?:self_attn|linear_attn|attention)(?:\.|$)"
 )
+_INDEXED_LAYER_PATH_RE = re.compile(
+    r"^(?:(?:model|language_model|text_model)\.)*layers\.(\d+)\.(.+)$"
+)
+_INDEXED_SKIP_ROLES = frozenset({
+    "norm", "router", "lm_head", "embedding", "vision", "projector",
+})
+_FP32_SCALE_BYTES = 4
 
 
 def _is_indexed_layer_attention_exclusion(pattern: str) -> bool:
@@ -203,6 +210,111 @@ def _is_indexed_layer_attention_exclusion(pattern: str) -> bool:
     if not raw or "*" in raw or any(ch in raw for ch in _REGEX_META_CHARS):
         return False
     return _INDEXED_LAYER_ATTN_RE.search(raw) is not None
+
+
+def _indexed_subpath_categories(
+    raw_lower: str,
+    subpath: str,
+    *,
+    has_mla: bool,
+    has_kda: bool,
+) -> tuple[str, ...]:
+    if subpath in {"self_attn", "attention", "attn"}:
+        if has_mla:
+            return ("mla", "mla_absorb")
+        return ("kda",) if has_kda else ("attn",)
+    if subpath == "linear_attn":
+        return ("gdn",)
+    if subpath in {"mlp", "ffn"}:
+        return ("dense_mlp", "shared_expert", "routed_expert")
+    if subpath in {"mlp.experts", "moe.experts", "block_sparse_moe.experts", "experts"}:
+        return ("routed_expert",)
+    if subpath in {"mlp.shared_experts", "mlp.shared_expert", "share_expert", "shared_experts", "shared_expert"}:
+        return ("shared_expert",)
+    from .checkpoint_reader import classify_tensor_categories
+
+    return tuple(
+        cat for cat in classify_tensor_categories(raw_lower, has_mla=has_mla, has_kda=has_kda)
+        if cat not in _INDEXED_SKIP_ROLES
+    )
+
+
+_INDEXED_LAYER_EXPERT_RE = re.compile(r"\bexperts\.(\d+)\.")
+
+
+def resolve_indexed_layer_exclusions(
+    patterns: Sequence[str],
+    *,
+    native: str,
+    has_mla: bool = False,
+    has_kda: bool = False,
+    num_experts: int = 0,
+) -> tuple[dict[str, Any], tuple[str, ...]]:
+    """Map concrete per-layer module exclusions onto ``layer_quant_overrides.native_layers``."""
+    native_layers: dict[str, dict[str, Any]] = {}
+    partial_experts: dict[tuple[int, str], set[int]] = {}
+    remaining: list[str] = []
+    float_fields = {"weight_format": native, "activation_format": native}
+    for item in patterns or ():
+        pattern = str(item)
+        raw = pattern.strip()
+        lower = raw.lower()
+        if (
+            not lower
+            or lower.startswith("re:")
+            or "*" in lower
+            or "\\" in lower
+            or any(ch in lower for ch in _REGEX_META_CHARS)
+            or any(ch in lower for ch in "()|")
+        ):
+            remaining.append(pattern)
+            continue
+        match = _INDEXED_LAYER_PATH_RE.match(lower)
+        if match is None:
+            remaining.append(pattern)
+            continue
+        layer_idx = int(match.group(1))
+        subpath = match.group(2)
+        for suffix in (".weight", ".bias"):
+            if subpath.endswith(suffix):
+                subpath = subpath[:-len(suffix)]
+        if _classify_plain_exclusion(subpath) in _NON_LINEAR_EXCLUSION_ROLES:
+            remaining.append(pattern)
+            continue
+        cats = _indexed_subpath_categories(lower, subpath, has_mla=has_mla, has_kda=has_kda)
+        if not cats:
+            remaining.append(pattern)
+            continue
+        exp_match = _INDEXED_LAYER_EXPERT_RE.search(subpath)
+        if exp_match is not None:
+            eid = int(exp_match.group(1))
+            for cat in cats:
+                partial_experts.setdefault((layer_idx, cat), set()).add(eid)
+            continue
+        entry = native_layers.setdefault(str(layer_idx), {"category_overrides": {}})
+        for cat in cats:
+            entry["category_overrides"][cat] = dict(float_fields)
+    for (layer_idx, cat), eids in sorted(partial_experts.items()):
+        sorted_ids = sorted(eids)
+        count = max(int(num_experts or 0), sorted_ids[-1] + 1)
+        entry = native_layers.setdefault(str(layer_idx), {"category_overrides": {}})
+        cat_entry = dict(entry["category_overrides"].get(cat) or {})
+        cat_entry["expert_quant_count"] = count
+        cat_entry["expert_quant_overrides"] = [
+            {"expert_indices": sorted_ids, "fields": dict(float_fields)},
+        ]
+        entry["category_overrides"][cat] = cat_entry
+    layer_overrides = {"native_layers": native_layers} if native_layers else {}
+    return layer_overrides, tuple(remaining)
+
+
+def _config_arch_flags(c: Mapping[str, Any]) -> tuple[bool, bool]:
+    has_mla = bool(c.get("kv_lora_rank"))
+    sched = c.get("layer_attention_schedule", c.get("layer_types")) or ()
+    has_kda = str(c.get("attention_type", "")).lower() == "kda" or any(
+        "kda" in str(item).lower() for item in sched
+    )
+    return has_mla, has_kda
 
 
 def resolve_role_exclusions(
@@ -386,7 +498,11 @@ def _native_quant_gaps(c, quant):
             gaps.append("native_quant_kv_cache_scheme_unresolved:retained_plan_proxy")
     excluded = tuple(str(v) for v in (raw.get("modules_to_not_convert") or raw.get("ignore") or ()))
     if excluded:
-        resolved_roles, unresolved_patterns = resolve_role_exclusions(excluded)
+        has_mla, has_kda = _config_arch_flags(c)
+        _, global_excluded = resolve_indexed_layer_exclusions(
+            excluded, native=quant.native_format, has_mla=has_mla, has_kda=has_kda,
+        )
+        resolved_roles, unresolved_patterns = resolve_role_exclusions(global_excluded)
         truly_unresolved = tuple(
             p for p in unresolved_patterns if not _is_indexed_layer_attention_exclusion(p)
         )
@@ -635,9 +751,10 @@ def resolve_quant(c):
     weight = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}.get(weight, weight)
     if not raw and weight == native:
         return base, gaps
+    has_mla, has_kda = _config_arch_flags(c)
     if method == "compressed-tensors":
         from .compressed_int4 import resolve_compressed_int4
-        resolved = resolve_compressed_int4(raw, base)
+        resolved = resolve_compressed_int4(raw, base, has_mla=has_mla, has_kda=has_kda)
         if resolved is not None:
             return resolved, gaps
     if method == "fp8":
@@ -653,11 +770,10 @@ def resolve_quant(c):
                 gaps.append(f"quant_scale_format_unmodeled:{scale}:{native}_proxy")
                 return base, gaps
             excluded = tuple(str(v) for v in (raw.get("modules_to_not_convert") or raw.get("ignore") or ()))
-            per_layer_indexed = tuple(
-                pat for pat in excluded
-                if _is_indexed_layer_attention_exclusion(pat)
+            num_exp = int(c.get("n_routed_experts") or c.get("num_local_experts") or c.get("num_experts") or 0)
+            layer_overrides, global_excluded = resolve_indexed_layer_exclusions(
+                excluded, native=native, has_mla=has_mla, has_kda=has_kda, num_experts=num_exp,
             )
-            global_excluded = tuple(pat for pat in excluded if pat not in per_layer_indexed)
             resolved_roles, unresolved_patterns = resolve_role_exclusions(global_excluded)
             exclusions_unresolved = bool(global_excluded) and (
                 bool(unresolved_patterns)
@@ -666,19 +782,17 @@ def resolve_quant(c):
             if exclusions_unresolved:
                 gaps.append("quant_module_exclusions_unresolved")
             base_exclusions = ("norm", "router", "embedding", "lm_head")
-            merged_exclusions = tuple(dict.fromkeys((
-                *base_exclusions, *resolved_roles,
-                *(f"module:{pat}" for pat in per_layer_indexed),
-            )))
+            merged_exclusions = tuple(dict.fromkeys((*base_exclusions, *resolved_roles)))
             quant = QuantSpec(
                 name="hf_fp8_block", weight_format="fp8_e4m3",
                 expert_weight_format="fp8_e4m3", activation_format="fp8_e4m3",
                 weight_block=tuple(int(v) for v in block),
-                scale_format=scale, scale_bytes=4 if scale == "fp32" else 1,
+                scale_format=scale, scale_bytes=_FP32_SCALE_BYTES if scale == "fp32" else 1,
                 activation_group_size=int(block[1]), activation_scale_format=scale,
                 kv_dtype=base.kv_dtype, index_dtype=base.index_dtype,
                 index_scale_dtype="none", native_format=native,
                 exclusions=merged_exclusions,
+                layer_quant_overrides=layer_overrides,
             )
             if exclusions_unresolved:
                 # Preserve the model with an explicit whole-matrix native

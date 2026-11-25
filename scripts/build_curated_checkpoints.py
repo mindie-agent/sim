@@ -122,7 +122,13 @@ def build_curated_payload(
         if not isinstance(qcfg, dict) or not qcfg:
             continue
         dtype_hint = row.get("config_torch_dtype")
-        base_cfg = {"torch_dtype": dtype_hint} if isinstance(dtype_hint, str) and dtype_hint.strip() else None
+        expert_hint = row.get("expert_dtype") or row.get("config_expert_dtype")
+        base_cfg_dict: dict[str, Any] = {}
+        if isinstance(dtype_hint, str) and dtype_hint.strip():
+            base_cfg_dict["torch_dtype"] = dtype_hint.strip()
+        if isinstance(expert_hint, str) and expert_hint.strip():
+            base_cfg_dict["expert_dtype"] = expert_hint.strip()
+        base_cfg = base_cfg_dict or None
         qmap = read_hf_quantization_config(
             qcfg,
             checkpoint_id=repo_id,
