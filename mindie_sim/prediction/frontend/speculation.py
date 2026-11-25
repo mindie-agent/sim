@@ -287,8 +287,10 @@ def _resolve_draft_tp(runtime, draft) -> int:
     return target_tp
 
 
-def _dspark_layer_valid_rows(runtime, layer_idx: int, *, feature_rows: int, global_none: bool) -> int | None:
-    """Return valid slot write count for one DSpark layer, or None if layer mapping is absent."""
+def _dspark_layer_slot_spec(
+    runtime, layer_idx: int, *, feature_rows: int, global_none: bool,
+) -> int | tuple[bool, ...] | None:
+    """Preserve per-row slot validity masks when supplied, else return scalar valid count."""
     if global_none:
         return None
     meta = dict(getattr(runtime, "metadata", ()) or ())
@@ -299,14 +301,14 @@ def _dspark_layer_valid_rows(runtime, layer_idx: int, *, feature_rows: int, glob
             if entry is None:
                 return None
             if isinstance(entry, Sequence) and not isinstance(entry, (str, bytes)):
-                return sum(1 for s in entry if int(s) >= 0)
+                return tuple(int(s) >= 0 for s in entry[:feature_rows])
             return max(0, min(feature_rows, int(entry)))
     elif isinstance(per_layer, Sequence) and not isinstance(per_layer, (str, bytes)) and layer_idx < len(per_layer):
         entry = per_layer[layer_idx]
         if entry is None:
             return None
         if isinstance(entry, Sequence) and not isinstance(entry, (str, bytes)):
-            return sum(1 for s in entry if int(s) >= 0)
+            return tuple(int(s) >= 0 for s in entry[:feature_rows])
         return max(0, min(feature_rows, int(entry)))
     per_counts = meta.get("dspark_valid_slot_rows_by_layer")
     if isinstance(per_counts, Mapping) and (layer_idx in per_counts or str(layer_idx) in per_counts):
@@ -314,10 +316,20 @@ def _dspark_layer_valid_rows(runtime, layer_idx: int, *, feature_rows: int, glob
         return None if val is None else max(0, min(feature_rows, int(val)))
     slots = meta.get("dspark_slot_mapping")
     if isinstance(slots, Sequence) and not isinstance(slots, (str, bytes)):
-        return sum(1 for s in slots if int(s) >= 0)
+        return tuple(int(s) >= 0 for s in slots[:feature_rows])
     if meta.get("dspark_valid_slot_rows") is not None:
         return max(0, min(feature_rows, int(meta["dspark_valid_slot_rows"])))
     return feature_rows
+
+
+def _dspark_layer_valid_rows(runtime, layer_idx: int, *, feature_rows: int, global_none: bool) -> int | None:
+    """Return valid slot write count for one DSpark layer, or None if layer mapping is absent."""
+    spec = _dspark_layer_slot_spec(
+        runtime, layer_idx, feature_rows=feature_rows, global_none=global_none,
+    )
+    if spec is None or isinstance(spec, int):
+        return spec
+    return sum(1 for valid in spec if valid)
 
 
 def _dspark_physical_kv_row_bytes(model, draft, draft_model, layer_idx: int, runtime, *, kv_dtype: str) -> int:
@@ -578,6 +590,7 @@ def lower_dspark_context_kv(
     context_prolog_v3: bool,
     eager_draft: bool,
     slot_mapping_none: bool = False,
+    machine=None,
 ) -> tuple[list, str]:
     """Context-only DSpark KV preparation used on BOTH prompt init and decode verified rows.
 
@@ -617,17 +630,29 @@ def lower_dspark_context_kv(
     if slot_mapping_none:
         return ops, ctx_ready
     per_layer_valid = [
-        _dspark_layer_valid_rows(runtime, lyr, feature_rows=feature_rows, global_none=slot_mapping_none)
+        _dspark_layer_slot_spec(runtime, lyr, feature_rows=feature_rows, global_none=slot_mapping_none)
         for lyr in range(int(draft.layers))
     ]
     if all(v is None for v in per_layer_valid):
         return ops, ctx_ready
-    has_partial_slots = any(v is None or v < feature_rows for v in per_layer_valid)
-    from mindie_sim.prediction.operators.mla_prolog.draft_context import prepare
+    has_partial_slots = any(
+        v is None
+        or (isinstance(v, Sequence) and (len(v) < feature_rows or not all(v)))
+        or (isinstance(v, int) and v < feature_rows)
+        for v in per_layer_valid
+    )
+    from mindie_sim.catalog.context_parallel import cp_interleave
+    from mindie_sim.prediction.operators.mla_prolog.draft_context import (
+        draft_cache_requires_prolog_v3_scatter,
+        prepare,
+    )
     rows_by_view = [
         int(v.global_q_len or v.q_len) if prefill else max(int(v.q_len), int(v.draft_proposal_tokens) + 1)
         for v in proposal_views
     ]
+    requires_staging_scatter = draft_cache_requires_prolog_v3_scatter(
+        model, runtime=runtime, machine=machine, draft=draft, parallel=runtime.parallel,
+    )
     ctx_ready = prepare(
         ops, projection=main_norm, model=draft_model, draft=draft,
         rows=feature_rows, query_rows=query_rows, prefix=prefix,
@@ -635,9 +660,10 @@ def lower_dspark_context_kv(
         rows_by_view=rows_by_view,
         views=proposal_views,
         contexts=[view.context for view in proposal_views],
-        block=int(getattr(runtime, "kv_block_size", 1) or 1),
-        use_prolog_v3=context_prolog_v3 and not eager_draft and not prefill,
+        block=cp_interleave(runtime),
+        use_prolog_v3=context_prolog_v3,
         layer_slot_valid_rows=per_layer_valid if has_partial_slots else None,
+        requires_staging_scatter=requires_staging_scatter,
     )
     return ops, ctx_ready
 
@@ -1047,6 +1073,7 @@ def _lower_dspark_prefill_program(
         proposal_views=proposal_views, prefill=True,
         external_context=external_context, context_prolog_v3=context_prolog_v3,
         eager_draft=eager_draft, slot_mapping_none=slot_mapping_none,
+        machine=machine,
     )
     rows_by_request = {v.request_id: v.q_len for v in proposal_views}
     regions = [LoweringRegion(
@@ -1160,6 +1187,7 @@ def _lower_dspark_draft_program(
         proposal_views=active, prefill=False,
         external_context=external_context, context_prolog_v3=context_prolog_v3,
         eager_draft=eager_draft, slot_mapping_none=slot_mapping_none,
+        machine=machine,
     )
     global_tokens = sum(v.q_len for v in global_proposals)
     body, previous = frontend.body(
