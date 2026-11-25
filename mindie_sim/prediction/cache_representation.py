@@ -17,9 +17,12 @@ from math import ceil
 from collections import deque
 import json
 
-from mindie_sim.catalog.cache import cache_row_split, packed_region_row_bytes
-from mindie_sim.catalog.mqsmla_layout import packed_row_parts
-from mindie_sim.catalog.cache_format import cache_format
+from mindie_sim.catalog.cache import cache_row_parts
+from mindie_sim.catalog.cache_format import (
+    CacheFormat, _lookup_region_decl, cache_format,
+)
+from mindie_sim.catalog.cache_index import index_row_parts
+from mindie_sim.catalog.cache_pools import exact_element_bytes
 from mindie_sim.catalog.ops import cache_store_op
 from mindie_sim.prediction.cache_execution import (
     CacheAccessOperation, CacheAccessRequest, CacheExecution, CacheTypedView,
@@ -28,10 +31,11 @@ from mindie_sim.prediction.cache_path import (
     CacheAccessGeometry, CacheGeometry, CachePolicy, CacheState,
 )
 from mindie_sim.prediction.engine import Event
-from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 
 SOURCE_RESIDENCY = frozenset({"unresolved", "on_chip"})
+_GROUP_QUANT_OPS_PER_ELEMENT = 4
 
 
 def cache_identity(region, *, layer=None, request=None, block=None, rank=None,
@@ -139,11 +143,79 @@ def _access_metadata(result, resolution, fmt, row_bytes, geometry, region, *,
     return tuple(metadata)
 
 
-def _legacy_store(builder, name, deps, rows, width, region, fmt):
+def _builder_context(builder):
+    """Resolve ``(plan, phase)`` from a Builder or minimal cache producer."""
+    common = getattr(builder, "common", None) or {}
+    phase = getattr(builder, "phase", None) or common.get("phase")
+    plan = getattr(builder, "plan", None)
+    if plan is None and "layer" in common:
+        layer = common["layer"]
+        for candidate in getattr(builder.model, "layer_plans", ()):
+            if getattr(candidate, "index", None) == layer:
+                plan = candidate
+                break
+    return plan, phase
+
+
+def _region_format_and_parts(model, region, width, *, plan=None, phase=None):
+    """Resolve ``(CacheFormat, (payload, scale, padding))`` for one region."""
+    if region == "index_k":
+        metadata = dict(getattr(model, "metadata", ()) or ())
+        if _lookup_region_decl(metadata, "index_k", plan=plan, phase=phase) is not None:
+            fmt = cache_format(model, "index_k", plan=plan, phase=phase)
+            return fmt, fmt.row_parts(int(width))
+        quant = getattr(model, "quant", None)
+        idx_dtype = str(
+            (getattr(quant, "index_dtype", "") if quant is not None else "") or "bf16"
+        ).strip().lower()
+        idx_scale = str(
+            (getattr(quant, "index_scale_dtype", "") if quant is not None else "") or "none"
+        ).strip().lower()
+        has_scale = bool(idx_scale and idx_scale != "none")
+        if int(width) <= 0:
+            return CacheFormat(idx_dtype), (0, 0, 0)
+        fmt = (
+            CacheFormat(idx_dtype, int(width), idx_scale)
+            if has_scale else CacheFormat(idx_dtype)
+        )
+        return fmt, index_row_parts(model, int(width), plan=plan, phase=phase)
+    fmt = cache_format(model, region, plan=plan, phase=phase)
+    return fmt, cache_row_parts(model, region, int(width), plan=plan, phase=phase)
+
+
+def _grouped_conversion_ops(rows, width, fmt):
+    """Vector conversion ops for grouped quantization, excluding unquantized suffix."""
+    quantized = width - fmt.suffix_elements
+    if quantized < 0:
+        raise ModelingError("cache_suffix_exceeds_row_width")
+    groups = ceil(quantized / fmt.group_size) if (fmt.group_size and quantized > 0) else 0
+    return rows * (_GROUP_QUANT_OPS_PER_ELEMENT * quantized + groups)
+
+
+def _commit_access(state, identity, rows, row_bytes, *, write, policy,
+                   access_geometry=None):
+    """Run one synchronous cache access through the exact declared geometry."""
+    if access_geometry is None:
+        if rows > 0 and row_bytes > 0:
+            access_geometry = CacheAccessGeometry(
+                rows=rows, row_bytes=row_bytes, stride_bytes=row_bytes,
+            )
+        else:
+            access_geometry = CacheAccessGeometry(rows=0, row_bytes=0)
+    reservation = state.prepare_access(
+        identity, access_geometry, write=write, policy=policy,
+    )
+    reservation.mark_drained()
+    reservation.publish()
+    reservation.finish()
+    return reservation.result
+
+
+def _legacy_store(builder, name, deps, rows, width, region, fmt, row_bytes):
     """Preserve the pre-cache-level byte semantics of an undeclared call."""
     common = builder.common
-    row_bytes = packed_region_row_bytes(builder.model, region, width)
     stored = rows * row_bytes
+    source = rows * exact_element_bytes(width, builder.model.activation_dtype)
     legacy = (
         ("cache_resolution", "legacy_no_cache_declaration"),
         ("cache_legacy_semantics", True),
@@ -157,23 +229,29 @@ def _legacy_store(builder, name, deps, rows, width, region, fmt):
         }),
     )
     if not fmt.group_size:
-        # Exactly the former builder.store()/cache_store_op ABI.
+        # Preserve plain cache_store row ABI while charging activation-width
+        # source reads separately from narrower packed destination writes.
         op = cache_store_op(
             op_id=builder.prefix + "." + name, deps=tuple(deps),
             stage=common["stage"], layer=common["layer"], requests=common["requests"],
             phase=common["phase"], recipe="kv_store" if name == "cache" else name, rows=rows, row_bytes=row_bytes,
             dtype=fmt.dtype, kind=name, metadata=legacy,
         )
+        if source != stored:
+            op = replace(
+                op,
+                hbm_bytes=float(source + stored),
+                mte2_bytes=float(source),
+            )
         builder.add(op)
         return op.op_id
-    source = rows * width * dtype_bytes(builder.model.activation_dtype)
-    groups = ceil(width / fmt.group_size)
+    operations = _grouped_conversion_ops(rows, width, fmt)
     op = OpSpec(
         op_id=builder.prefix + "." + name, family="cache_store",
         phase=common["phase"], stage=common["stage"], layer=common["layer"],
         requests=common["requests"], semantic_shape=(rows, width),
         local_shape=(rows, width), padded_shape=(rows, width),
-        launch_shape=(rows, width), vector_ops=float(rows * (4 * width + groups)),
+        launch_shape=(rows, width), vector_ops=float(operations),
         hbm_bytes=float(source + stored), mte2_bytes=float(source),
         mte3_bytes=float(stored), deps=tuple(deps), recipe="kv_store" if name == "cache" else name,
         dtype=builder.model.activation_dtype,
@@ -192,18 +270,18 @@ def _legacy_store(builder, name, deps, rows, width, region, fmt):
     return op.op_id
 
 
-def _store_cache_aware(builder, name, deps, rows, width, region, fmt, *,
-                       state, geometry, identity, policy, source_residency):
+def _store_cache_aware(builder, name, deps, rows, width, region, fmt, row_bytes, *,
+                       state, geometry, identity, policy, source_residency,
+                       access_geometry=None):
     common = builder.common
-    row_bytes = packed_region_row_bytes(builder.model, region, width)
-    stored = rows * row_bytes
-    source = rows * width * dtype_bytes(builder.model.activation_dtype)
-    groups = ceil(width / fmt.group_size) if fmt.group_size else 0
+    source = rows * exact_element_bytes(width, builder.model.activation_dtype)
     resolved_state, resolution = _resolve_state(builder, state, geometry)
     access_identity, cold = _identity(identity, region)
     access_policy = replace(policy, cold=cold)
-    result = resolved_state.access(access_identity, stored, write=True,
-                                   policy=access_policy)
+    result = _commit_access(
+        resolved_state, access_identity, rows, row_bytes, write=True,
+        policy=access_policy, access_geometry=access_geometry,
+    )
     if result.cold_path and policy.write_policy == "write_back":
         effective_write_policy = "cold_materialize"
     else:
@@ -211,20 +289,20 @@ def _store_cache_aware(builder, name, deps, rows, width, region, fmt, *,
     if fmt.group_size:
         shape = (rows, width)
         padded_shape = shape
-        operations = rows * (4 * width + groups)
+        operations = _grouped_conversion_ops(rows, width, fmt)
         dtype = builder.model.activation_dtype
-        mte2_bytes = source
     else:
-        # Preserve the plain cache_store row ABI.
+        # Preserve the plain cache_store row ABI while keeping activation-width
+        # source reads separate from packed destination writes.
         shape = (max(1, rows), max(1, row_bytes))
         padded_rows = (max(1, rows) + 7) // 8 * 8
         padded_shape = (padded_rows, shape[1])
         operations = rows * max(1, row_bytes)
         dtype = fmt.dtype
-        mte2_bytes = rows * row_bytes
+    mte2_bytes = source
     # An unresolved source remains external traffic. A declared on-chip source
-    # removes only that read from HBM, never the cache output write.
-    hbm_bytes = result.hbm_write_bytes
+    # removes only that read from HBM, never the cache output write or RMW read.
+    hbm_bytes = result.hbm_bytes
     source_scope = "on_chip_not_HBM"
     if source_residency != "on_chip":
         hbm_bytes += source
@@ -259,15 +337,16 @@ def _store_cache_aware(builder, name, deps, rows, width, region, fmt, *,
     return op.op_id
 
 
-def _load_cache_aware(builder, name, deps, rows, width, region, fmt, *,
-                      state, geometry, identity, policy):
+def _load_cache_aware(builder, name, deps, rows, width, region, fmt, row_bytes, *,
+                      state, geometry, identity, policy,
+                      access_geometry=None):
     common = builder.common
-    row_bytes = packed_region_row_bytes(builder.model, region, width)
-    stored = rows * row_bytes
     resolved_state, resolution = _resolve_state(builder, state, geometry)
     access_identity, cold = _identity(identity, region)
-    result = resolved_state.access(access_identity, stored, write=False,
-                                   policy=replace(policy, cold=cold))
+    result = _commit_access(
+        resolved_state, access_identity, rows, row_bytes, write=False,
+        policy=replace(policy, cold=cold), access_geometry=access_geometry,
+    )
     metadata = _access_metadata(
         result, resolution, fmt, row_bytes, resolved_state.geometry, region,
         execution_gap=bool(result.staging_bytes or policy.ready_ms),
@@ -295,7 +374,7 @@ def _load_cache_aware(builder, name, deps, rows, width, region, fmt, *,
 
 def store(b, name, deps, rows, width, region, *, state=None, geometry=None,
           identity=None, write_policy="write_through", ready_ms=0.0, bypass=False,
-          source_residency="unresolved"):
+          source_residency="unresolved", access_geometry=None):
     """Write ``rows`` packed cache rows.
 
     Without a declared geometry/state this retains the former byte semantics.
@@ -317,7 +396,9 @@ def store(b, name, deps, rows, width, region, *, state=None, geometry=None,
     if (not isinstance(ready_ms, (int, float)) or isinstance(ready_ms, bool)
             or not ready_ms >= 0):
         raise ModelingError("cache_ready_ms_must_be_nonnegative")
-    fmt = cache_format(b.model, region)
+    plan, phase = _builder_context(b)
+    fmt, parts = _region_format_and_parts(b.model, region, width, plan=plan, phase=phase)
+    row_bytes = sum(parts)
     attached = getattr(b, "cache_state", None)
     if attached is not None and not isinstance(attached, CacheState):
         raise ModelingError("builder_cache_state_must_be_cache_state")
@@ -332,19 +413,19 @@ def store(b, name, deps, rows, width, region, *, state=None, geometry=None,
             raise ModelingError("cache_write_back_requires_persistent_state")
         if source_residency == "on_chip":
             raise ModelingError("cache_source_residency_requires_declared_geometry")
-        return _legacy_store(b, name, deps, rows, width, region, fmt)
+        return _legacy_store(b, name, deps, rows, width, region, fmt, row_bytes)
     if write_policy == "write_back" and resolved_state is None:
         raise ModelingError("cache_write_back_requires_persistent_state")
     policy = CachePolicy(bypass=bypass, write_policy=write_policy, ready_ms=ready_ms)
     return _store_cache_aware(
-        b, name, deps, rows, width, region, fmt, state=state,
+        b, name, deps, rows, width, region, fmt, row_bytes, state=state,
         geometry=effective_geometry, identity=identity, policy=policy,
-        source_residency=source_residency,
+        source_residency=source_residency, access_geometry=access_geometry,
     )
 
 
 def load(b, name, deps, rows, width, region, *, state=None, geometry=None,
-         identity=None, bypass=False, ready_ms=0.0):
+         identity=None, bypass=False, ready_ms=0.0, access_geometry=None):
     """Read ``rows`` packed cache rows against a declared cache level.
 
     A hit removes only the next-level line fill. GM copy service, staging
@@ -360,7 +441,9 @@ def load(b, name, deps, rows, width, region, *, state=None, geometry=None,
     if (not isinstance(ready_ms, (int, float)) or isinstance(ready_ms, bool)
             or not ready_ms >= 0):
         raise ModelingError("cache_ready_ms_must_be_nonnegative")
-    fmt = cache_format(b.model, region)
+    plan, phase = _builder_context(b)
+    fmt, parts = _region_format_and_parts(b.model, region, width, plan=plan, phase=phase)
+    row_bytes = sum(parts)
     attached = getattr(b, "cache_state", None)
     if attached is not None and not isinstance(attached, CacheState):
         raise ModelingError("builder_cache_state_must_be_cache_state")
@@ -371,13 +454,15 @@ def load(b, name, deps, rows, width, region, *, state=None, geometry=None,
     policy = CachePolicy(bypass=bypass, write_policy="write_through",
                          ready_ms=ready_ms)
     return _load_cache_aware(
-        b, name, deps, rows, width, region, fmt, state=state,
+        b, name, deps, rows, width, region, fmt, row_bytes, state=state,
         geometry=effective_geometry, identity=identity, policy=policy,
+        access_geometry=access_geometry,
     )
 
 
 
-def _typed_view(model, op, fmt, rows, width, row_bytes, region, identity, deps=()):
+def _typed_view(op, fmt, rows, width, parts, region, identity, deps=(),
+                *, access_geometry=None):
     """Actual producer/output/view of one declared cache row operation.
 
     OpSpec currently has no output namespace. The producer output name is kept
@@ -385,19 +470,24 @@ def _typed_view(model, op, fmt, rows, width, row_bytes, region, identity, deps=(
     registered as an actual dependency port unless the producer really exposes
     that output.
     """
-    parts = packed_row_parts(model, region, width)
-    if parts is None:
-        data, scales = cache_row_split(model, region, width)
-        parts = data, scales, 0
     payload_bytes, scale_bytes, padding_bytes = (
         int(round(rows * amount)) for amount in parts)
     packed = fmt.packed_elements != 1 or bool(fmt.group_size)
+    strided = (
+        access_geometry is not None
+        and access_geometry.rows > 1
+        and access_geometry.stride != access_geometry.row_bytes
+    )
+    if packed:
+        layout = "packed_strided" if strided else "packed_row"
+    else:
+        layout = "strided" if strided else "contiguous"
     outputs = tuple(getattr(op, "outputs", None) or ())
     registered = bool(outputs)
     output = str(outputs[0]) if registered else op.op_id + ".output"
     return CacheTypedView(
         producer=op.op_id, output=output, dtype=fmt.dtype,
-        layout="packed_row" if packed else "contiguous",
+        layout=layout,
         shape=(rows, width), storage=region, owner=identity,
         inputs=tuple(deps), payload_bytes=payload_bytes,
         scale_bytes=scale_bytes, padding_bytes=padding_bytes,
@@ -506,23 +596,27 @@ class CacheLowering:
               source_residency="unresolved", outstanding=0, response_ms=0.0,
               offset_bytes=0, stride_bytes=None, page_bytes=0, packing=1,
               partial_line="masked", source_port=""):
-        fmt = cache_format(self.builder.model, region)
-        row_bytes = packed_region_row_bytes(self.builder.model, region, width)
-        static = CacheState(self.state.geometry)
-        store(self.builder, name, deps, rows, width, region, state=static,
-              identity=identity, write_policy="write_through",
-              ready_ms=ready_ms, bypass=bypass,
-              source_residency=source_residency)
+        if not isinstance(rows, int) or isinstance(rows, bool) or rows < 0:
+            raise ModelingError("cache_rows_must_be_nonnegative_integer")
+        if not isinstance(width, int) or isinstance(width, bool) or width < 0:
+            raise ModelingError("cache_row_width_must_be_nonnegative_integer")
+        plan, phase = _builder_context(self.builder)
+        fmt, parts = _region_format_and_parts(
+            self.builder.model, region, width, plan=plan, phase=phase,
+        )
+        row_bytes = sum(parts)
         geometry = CacheAccessGeometry(
             offset_bytes=offset_bytes, rows=rows, row_bytes=row_bytes,
             stride_bytes=row_bytes if stride_bytes is None else stride_bytes,
             page_bytes=page_bytes, packing=packing, partial_line=partial_line)
+        static = CacheState(self.state.geometry)
+        store(self.builder, name, deps, rows, width, region, state=static,
+              identity=identity, write_policy="write_through",
+              ready_ms=ready_ms, bypass=bypass,
+              source_residency=source_residency, access_geometry=geometry)
         op = self.builder.ops[-1]
-        view = _typed_view(self.builder.model, op, fmt, rows, width, row_bytes,
-                           region, identity, deps=deps)
-        # The declared source view is activation-width bytes recorded by the
-        # cache-aware store. It is not the packed output row width, so a plain
-        # cache_store op's mte2 byte count cannot stand in for it.
+        view = _typed_view(op, fmt, rows, width, parts, region, identity,
+                           deps=deps, access_geometry=geometry)
         source_bytes = dict(op.metadata).get("cache_source_read_bytes")
         if source_bytes is None:
             source_bytes = int(op.mte2_bytes)
@@ -547,18 +641,26 @@ class CacheLowering:
              ready_ms=0.0, bypass=False, outstanding=0, response_ms=0.0,
              offset_bytes=0, stride_bytes=None, page_bytes=0, packing=1,
              partial_line="masked", source_port=""):
-        fmt = cache_format(self.builder.model, region)
-        row_bytes = packed_region_row_bytes(self.builder.model, region, width)
-        static = CacheState(self.state.geometry)
-        load(self.builder, name, deps, rows, width, region, state=static,
-             identity=identity, bypass=bypass, ready_ms=ready_ms)
+        if not isinstance(rows, int) or isinstance(rows, bool) or rows < 0:
+            raise ModelingError("cache_rows_must_be_nonnegative_integer")
+        if not isinstance(width, int) or isinstance(width, bool) or width < 0:
+            raise ModelingError("cache_row_width_must_be_nonnegative_integer")
+        plan, phase = _builder_context(self.builder)
+        fmt, parts = _region_format_and_parts(
+            self.builder.model, region, width, plan=plan, phase=phase,
+        )
+        row_bytes = sum(parts)
         geometry = CacheAccessGeometry(
             offset_bytes=offset_bytes, rows=rows, row_bytes=row_bytes,
             stride_bytes=row_bytes if stride_bytes is None else stride_bytes,
             page_bytes=page_bytes, packing=packing, partial_line=partial_line)
+        static = CacheState(self.state.geometry)
+        load(self.builder, name, deps, rows, width, region, state=static,
+             identity=identity, bypass=bypass, ready_ms=ready_ms,
+             access_geometry=geometry)
         op = self.builder.ops[-1]
-        view = _typed_view(self.builder.model, op, fmt, rows, width, row_bytes,
-                           region, identity, deps=deps)
+        view = _typed_view(op, fmt, rows, width, parts, region, identity,
+                           deps=deps, access_geometry=geometry)
         request = CacheAccessRequest(
             identity, geometry, write=False,
             policy=CachePolicy(bypass=bypass, ready_ms=ready_ms),

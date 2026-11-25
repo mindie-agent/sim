@@ -25,6 +25,8 @@ _PREFETCH_BANDWIDTH_SAFETY = 0.9
 _PREFETCH_ALIGNMENT_BYTES = 256
 _PREFETCH_MIN_WEIGHT_FRACTION = 0.1
 PREFETCH_TASK_PRIORITY = 10
+_EVENT_END = 0
+_EVENT_START = 1
 
 
 @dataclass(frozen=True)
@@ -287,15 +289,17 @@ def prefetch_weight_entries(graph: TypedGraph, op_id: str, *,
 
 
 def residency_peak(intervals: tuple[tuple[float, float, int], ...]) -> tuple[int, tuple]:
-    """Peak simultaneous resident bytes over ``(start, end, bytes)`` intervals."""
+    """Peak simultaneous resident bytes over half-open ``[start, end)`` intervals."""
     events: list[tuple[float, int, int, str]] = []
     for start, end, amount in intervals:
-        if amount <= 0:
+        start_t = float(start)
+        end_t = float(end)
+        if amount <= 0 or end_t <= start_t:
             continue
-        events.append((float(start), 0, amount, "start"))
-        events.append((float(max(start, end)), 1, amount, "end"))
+        events.append((start_t, _EVENT_START, amount, "start"))
+        events.append((end_t, _EVENT_END, amount, "end"))
     live = peak = 0
     for _time, kind, amount, _label in sorted(events):
-        live += amount if kind == 0 else -amount
+        live += amount if kind == _EVENT_START else -amount
         peak = max(peak, live)
-    return peak, tuple(sorted((float(t), int(a)) for t, k, a, _ in events))
+    return peak, tuple(sorted((float(t), int(a)) for t, _k, a, _ in events))
