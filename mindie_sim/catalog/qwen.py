@@ -33,12 +33,37 @@ QWEN_PP_CAPABILITY = (1, 2, 4, 8, 16)
 DEFAULT_MLA_DSPARK_BLOCK = 5
 
 
+def _has_linear_attention_config(c: Mapping[str, Any]) -> bool:
+    """True when the HF config declares GDN / linear-attention head geometry."""
+    return any(
+        key in c
+        for key in (
+            "linear_num_key_heads",
+            "linear_num_value_heads",
+            "linear_key_head_dim",
+            "linear_conv_kernel_dim",
+        )
+    )
+
+
+def _qwen_gdn_layout(c: Mapping[str, Any]) -> str:
+    """Resolve structural GDN projection layout (interleaved QKVZ/BA vs standard)."""
+    explicit = str(c.get("gdn_layout") or "").strip().lower()
+    if explicit:
+        return explicit
+    if c.get("linear_expand_v") is not None or bool(c.get("apply_layernorm_1p")):
+        return "interleaved"
+    return "standard"
+
+
 def _qwen_normalization(c: Mapping[str, Any]) -> dict[str, Any]:
-    """The model class declares Gemma's weight shift independently of hardware."""
-    if (
-        c.get("model_type") not in {"qwen3_5_text", "qwen3_5_moe_text", "qwen3_next"}
-        and not bool(c.get("apply_layernorm_1p"))
-    ):
+    """Structural unit-offset RMSNorm declaration derived strictly from config keys."""
+    uses_unit_offset = bool(c.get("apply_layernorm_1p")) or (
+        _has_linear_attention_config(c)
+        and _int(c, "hc_lowrank") <= 0
+        and not c.get("ple_layer_ids")
+    )
+    if not uses_unit_offset:
         return {}
     return {
         "norm_weight_offset": 1.0,
@@ -63,7 +88,7 @@ def _qwen_output_gate(c: Mapping[str, Any]) -> bool:
     gate_type = str(c.get("output_gate_type") or "").strip().lower()
     if gate_type:
         return gate_type not in {"none", "false", "0"}
-    return str(c.get("model_type") or "").strip().lower() == "qwen3_next"
+    return _has_linear_attention_config(c)
 
 
 def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
@@ -111,6 +136,10 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     router_norm_topk = bool(c.get("norm_topk_prob", True))
     partial = declared_partial_rotary(c)
     rope_dim, nope_dim = rotary_dimensions(head_dim, partial)
+    norm_unit_offset = bool(_qwen_normalization(c).get("norm_weight_offset", 0.0) == 1.0)
+    has_sandwich_norm = bool(c.get("has_sandwich_norm", False))
+    v_norm = bool(c.get("v_norm", False))
+    gdn_layout = _qwen_gdn_layout(c)
     plans: list[LayerPlan] = []
     for index, kind in enumerate(layer_types):
         if kind == "linear_attention":
@@ -138,10 +167,14 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                                   + conv_width * (conv_k - 1) * dtype_bytes("bf16")),
                 q_output_gate=gate,
                 hyper_connections=hc_count > 0, hc_mult=hc_count, hc_lowrank=hc_lowrank,
+                has_sandwich_norm=has_sandwich_norm,
+                norm_unit_offset=norm_unit_offset,
+                v_norm=v_norm,
+                gdn_layout=gdn_layout,
                 kv_owner_layer_id=index,
                 native_layer_id=index, scope="body",
             ))
-        elif kind in {"full_attention", "qwen_sparse_attention", "indexed_attention"}:
+        elif kind in {"full_attention", "indexed_attention"} or kind.endswith("_sparse_attention"):
             plans.append(LayerPlan(
                 index=index, attention="gqa", architecture="gated_gqa" if gate else "gqa",
                 ffn="moe" if moe else "dense",
@@ -154,12 +187,13 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 shared_expert_gate=bool(moe),
                 router_input_size=h, router_mode=router_mode,
                 router_norm_topk=router_norm_topk,
-                # Qwen3NextAttention normalizes Q and K per head before RoPE;
-                # Qwen3.5 reuses this attention class for its full-attention layers.
                 qk_norm=True,
                 qk_rope_head_dim=rope_dim, qk_nope_head_dim=nope_dim,
                 q_output_gate=gate,
                 hyper_connections=hc_count > 0, hc_mult=hc_count, hc_lowrank=hc_lowrank,
+                has_sandwich_norm=has_sandwich_norm,
+                norm_unit_offset=norm_unit_offset,
+                v_norm=v_norm,
                 indexer=indexer, indexer_type="full" if indexer else "none",
                 owns_index_k=indexer, index_k_owner_layer_id=index if indexer else -1,
                 owns_topk=indexer, topk_owner_layer_id=index if indexer else -1,
@@ -173,13 +207,8 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 native_layer_id=index, scope="body",
             ))
         else:
-            raise ModelingError(f"model_config_qwen_layer_type_unsupported:{kind}")
+            raise ModelingError(f"model_config_qwen_layer_type_unsupported:{index}:{kind}")
     return plans
-
-
-def _draft_compat_kwargs(**candidates: Any) -> dict[str, Any]:
-    declared = DraftSpec.__dataclass_fields__
-    return {key: value for key, value in candidates.items() if key in declared}
 
 
 def _aux_qwen(c: Mapping[str, Any]) -> AuxiliarySpec:
@@ -233,7 +262,7 @@ def _dspark_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
         q_lora = int(_require(c, "q_lora_rank"))
         nope = int(_require(c, "qk_nope_head_dim"))
         rope = int(_require(c, "qk_rope_head_dim"))
-        v_dim = int(c.get("v_head_dim", 128) or 128)
+        v_dim = int(_require(c, "v_head_dim"))
         head_dim = nope + rope
         kv_heads = int(c.get("num_key_value_heads", 1) or 1)
         causal = bool((c.get("dflash_config") or {}).get(
@@ -279,7 +308,7 @@ def _aux_dspark(c: Mapping[str, Any]) -> AuxiliarySpec:
     if kv_lora > 0:
         nope = int(_require(c, "qk_nope_head_dim"))
         rope = int(_require(c, "qk_rope_head_dim"))
-        v_dim = int(c.get("v_head_dim", 128) or 128)
+        v_dim = int(_require(c, "v_head_dim"))
         heads = int(_require(c, "num_attention_heads"))
         q_lora = int(_require(c, "q_lora_rank"))
         head_dim = nope + rope
@@ -314,10 +343,8 @@ def _aux_dspark(c: Mapping[str, Any]) -> AuxiliarySpec:
                 "context_projection_mode": "mla_prolog",
             }),
             notes=("DSpark MLA draft model is its own body; target features are model inputs",),
-            **_draft_compat_kwargs(
-                independent_context=True,
-                context_projection_mode="mla_prolog",
-            ),
+            independent_context=True,
+            context_projection_mode="mla_prolog",
         )
         return AuxiliarySpec(dspark=spec, standalone_draft=True)
     targets = tuple(int(v) for v in (c.get("dflash_config", {}) or {}).get("target_layer_ids", ()) or ())
@@ -350,35 +377,39 @@ def _aux_dspark(c: Mapping[str, Any]) -> AuxiliarySpec:
             "dcp_sharded": "false",
         }),
         notes=("DSpark draft model is its own body; target features are model inputs",),
-        **_draft_compat_kwargs(
-            independent_context=True,
-            context_projection_mode="fused_kv_bank",
-            dcp_sharded=False,
-        ),
+        independent_context=True,
+        context_projection_mode="fused_kv_bank",
+        dcp_sharded=False,
     )
     return AuxiliarySpec(dspark=spec, standalone_draft=True)
 
 
-# --- standard Qwen2/Qwen2.5/Qwen3 dense and MoE bodies ---------------------
-
-_STANDARD_QWEN_TYPES = frozenset({"qwen2", "qwen2_moe", "qwen3", "qwen3_moe"})
+# --- standard dense and MoE GQA bodies (pure structural predicates) --------
 
 
-def _standard_qwen_family(c: Mapping[str, Any]) -> str:
-    model_type = str(c.get("model_type", ""))
-    if model_type not in _STANDARD_QWEN_TYPES:
-        raise ModelingError(f"model_config_standard_qwen_unsupported:{model_type}")
-    return model_type
+def _has_modern_standard_gqa_schema(c: Mapping[str, Any]) -> bool:
+    """True for configs declaring modern explicit attention_bias / QK-norm / decoupled head_dim / no-shared MoE schema."""
+    if ("attention_bias" in c) or ("use_qk_norm" in c) or ("qk_norm" in c):
+        return True
+    if "qkv_bias" in c or c.get("shared_expert_intermediate_size") is not None:
+        return False
+    hidden = _int(c, "hidden_size")
+    heads = _int(c, "num_attention_heads")
+    raw_hd = c.get("head_dim")
+    if raw_hd is not None and heads > 0 and hidden > 0 and int(raw_hd) * heads != hidden:
+        return True
+    return _int(c, "num_experts") > 0 and _int(c, "moe_intermediate_size") > 0
 
 
 def _standard_qwen_head_dim(
-    c: Mapping[str, Any], family: str, hidden: int, heads: int,
+    c: Mapping[str, Any], *, legacy_shared_moe: bool, hidden: int, heads: int,
 ) -> int:
-    """Qwen2/3 honor an explicit head_dim; Qwen2-MoE derives hidden/heads."""
+    """Resolve explicit head_dim whenever declared, else derive hidden/heads."""
+    del legacy_shared_moe
     if heads <= 0:
         raise ModelingError(f"model_config_qwen_heads_invalid:{heads}")
     raw = c.get("head_dim")
-    if family == "qwen2_moe" or raw is None:
+    if raw is None:
         if hidden % heads:
             raise ModelingError(
                 f"model_config_qwen_head_dim_not_integral:{hidden}%{heads}")
@@ -400,9 +431,9 @@ def _standard_qwen_mlp_only(c: Mapping[str, Any]) -> tuple[set[int], tuple[str, 
 
 
 def _standard_qwen_ffn_config(
-    c: Mapping[str, Any], family: str,
+    c: Mapping[str, Any], *, legacy_shared_moe: bool,
 ) -> tuple[dict[str, Any], tuple[str, ...]]:
-    """Decode only the declared Qwen MoE fields; no hybrid/Kimi defaults."""
+    """Decode only declared standard GQA/MoE FFN fields via structural keys."""
     dense_i = _int(c, "intermediate_size")
     experts = _int(c, "num_experts")
     top_k = _int(c, "num_experts_per_tok")
@@ -414,14 +445,11 @@ def _standard_qwen_ffn_config(
     shared_count = 0
     shared_i = 0
     shared_gate = False
-    if experts > 0 and family == "qwen2_moe":
-        # Qwen2Moe always constructs one shared MLP plus its sigmoid gate.
+    if experts > 0 and legacy_shared_moe:
         shared_i = _int(c, "shared_expert_intermediate_size")
         shared_count = 1 if shared_i > 0 else 0
         shared_gate = shared_i > 0
-    elif experts > 0 and family == "qwen3_moe":
-        # Qwen3Moe has no shared branch in the reference source. An explicit
-        # extension is still honored instead of inheriting the Qwen2/hybrid one.
+    elif experts > 0:
         shared_count = _int(c, "num_shared_experts", _int(c, "n_shared_experts"))
         shared_i = _int(c, "shared_expert_intermediate_size")
         if shared_count > 0 and shared_i <= 0:
@@ -445,27 +473,15 @@ def _standard_qwen_ffn_config(
 
 
 def _standard_qwen_layer_moe(index: int, ffn: Mapping[str, Any]) -> bool:
-    """Native source schedule: one-based sparse step, dense-only overrides."""
     experts = int(ffn["experts"])
     if experts <= 0:
         return False
-    return (
-        index not in ffn["mlp_only"]
-        and (index + 1) % int(ffn["step"]) == 0
-    )
+    return index not in ffn["mlp_only"] and (index + 1) % int(ffn["step"]) == 0
 
 
 def _standard_qwen_window(
     c: Mapping[str, Any], layers: int,
 ) -> tuple[list[str], list[int], tuple[str, ...]]:
-    """Return explicit layer kinds and actual per-index window widths.
-
-    An explicit ordinary full/sliding ``layer_types`` schedule is authoritative.
-    Without one, v4.51.3 FlashAttn activation is reproduced exactly:
-    ``use_sliding_window and sliding_window is not None and
-    layer_idx >= max_window_layers``. Unknown custom kinds stay explicit as the
-    original kind instead of being coerced to full attention.
-    """
     issues: list[str] = []
     raw_types = c.get("layer_types")
     if raw_types is not None:
@@ -517,19 +533,30 @@ def _standard_qwen_window(
 
 
 def _standard_qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
-    """Plans for ordinary Qwen2/Qwen2.5 dense, Qwen2-MoE and Qwen3 dense/MoE."""
-    family = _standard_qwen_family(c)
+    """Plans for standard dense and MoE GQA bodies using structural HF predicates."""
     hidden = int(_require(c, "hidden_size"))
     layers = int(_require(c, "num_hidden_layers"))
     heads = _int(c, "num_attention_heads")
     kv_heads = _int(c, "num_key_value_heads", heads)
-    head_dim = _standard_qwen_head_dim(c, family, hidden, heads) if heads else 0
-    ffn, _ = _standard_qwen_ffn_config(c, family)
+    modern = _has_modern_standard_gqa_schema(c)
+    legacy_shared_moe = _int(c, "num_experts") > 0 and not modern
+    head_dim = _standard_qwen_head_dim(
+        c, legacy_shared_moe=legacy_shared_moe, hidden=hidden, heads=heads,
+    ) if heads else 0
+    ffn, _ = _standard_qwen_ffn_config(c, legacy_shared_moe=legacy_shared_moe)
     kinds, windows, _ = _standard_qwen_window(c, layers)
-    qk_norm = family in {"qwen3", "qwen3_moe"}
+    if "use_qk_norm" in c:
+        qk_norm = bool(c["use_qk_norm"])
+    elif "qk_norm" in c:
+        qk_norm = bool(c["qk_norm"])
+    else:
+        qk_norm = modern
     activation = str(c.get("hidden_act", "silu"))
     partial = declared_partial_rotary(c)
     rope_dim, nope_dim = rotary_dimensions(head_dim, partial)
+    has_sandwich_norm = bool(c.get("has_sandwich_norm", False))
+    norm_unit_offset = bool(c.get("apply_layernorm_1p", False))
+    v_norm = bool(c.get("v_norm", False))
     plans: list[LayerPlan] = []
     for index in range(layers):
         moe = _standard_qwen_layer_moe(index, ffn)
@@ -547,8 +574,6 @@ def _standard_qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 "shared_intermediate_size": int(ffn["shared_i"]),
                 "shared_expert_gate": bool(ffn["shared_gate"]),
                 "router_input_size": hidden, "router_mode": "softmax",
-                # The gate Linear keeps model precision. Only the subsequent
-                # softmax promotes scores to FP32 in the reference forward.
                 "router_dtype": "",
                 "router_norm_topk": bool(c.get("norm_topk_prob", False)),
             }
@@ -563,8 +588,10 @@ def _standard_qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 "shared_expert_gate": False, "router_input_size": 0,
                 "router_mode": "softmax", "router_norm_topk": False,
             }
-        known_core = (kinds[index] == "full_attention"
-                      or kinds[index] == "sliding_attention" and windows[index] > 0)
+        known_core = (
+            kinds[index] == "full_attention"
+            or (kinds[index] == "sliding_attention" and windows[index] > 0)
+        )
         if not known_core:
             projections_known = heads > 0 and kv_heads > 0 and head_dim > 0
             plans.append(LayerPlan(
@@ -576,6 +603,9 @@ def _standard_qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 head_dim=head_dim if projections_known else 0,
                 qk_norm=False, window=0, cache_kind="none",
                 qk_rope_head_dim=rope_dim, qk_nope_head_dim=nope_dim,
+                has_sandwich_norm=has_sandwich_norm,
+                norm_unit_offset=norm_unit_offset,
+                v_norm=v_norm,
                 ffn_activation=activation,
                 native_layer_id=index, scope="body", **ffn_fields,
             ))
@@ -588,6 +618,9 @@ def _standard_qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
             num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
             qk_rope_head_dim=rope_dim, qk_nope_head_dim=nope_dim,
             qk_norm=qk_norm, window=windows[index],
+            has_sandwich_norm=has_sandwich_norm,
+            norm_unit_offset=norm_unit_offset,
+            v_norm=v_norm,
             kv_cache_elements=2 * kv_heads * head_dim,
             kv_owner_layer_id=index, ffn_activation=activation,
             native_layer_id=index, scope="body", **ffn_fields,
@@ -597,41 +630,39 @@ def _standard_qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
 
 def _aux_standard_qwen(c: Mapping[str, Any]) -> AuxiliarySpec:
     """A layer count alone does not specify a standard-Qwen draft architecture."""
+    del c
     return AuxiliarySpec()
 
 
 def _standard_qwen_gaps(c: Mapping[str, Any]) -> tuple[str, ...]:
-    """Visible unmodeled standard-Qwen fields; never a timing correction."""
-    family = _standard_qwen_family(c)
+    """Visible unmodeled standard GQA fields derived strictly from structural config keys."""
     hidden = int(_require(c, "hidden_size"))
     heads = _int(c, "num_attention_heads")
     layers = int(_require(c, "num_hidden_layers"))
+    modern = _has_modern_standard_gqa_schema(c)
+    legacy_shared_moe = _int(c, "num_experts") > 0 and not modern
     issues = list(_standard_qwen_window(c, layers)[2])
-    issues.extend(_standard_qwen_ffn_config(c, family)[1])
-    if family == "qwen2":
-        issues.append("qkv_bias_unmodeled")
-    elif family == "qwen2_moe":
+    issues.extend(_standard_qwen_ffn_config(c, legacy_shared_moe=legacy_shared_moe)[1])
+    if not modern:
         if bool(c.get("qkv_bias", True)):
             issues.append("qkv_bias_unmodeled")
-        raw = c.get("head_dim")
-        if raw is not None:
+        if legacy_shared_moe and c.get("head_dim") is not None:
             try:
-                declared = int(raw)
+                declared = int(c["head_dim"])
             except (TypeError, ValueError):
                 issues.append("head_dim_invalid")
             else:
                 derived = hidden // heads if heads and hidden % heads == 0 else 0
                 if declared != derived:
                     issues.append(
-                        f"head_dim_ignored_by_qwen2_moe_source:{declared}!={derived}")
+                        f"head_dim_ignored_by_legacy_shared_moe_source:{declared}!={derived}")
     elif bool(c.get("attention_bias", False)):
-        # Qwen3 applies attention_bias to Q/K/V and the output projection.
         issues.append("attention_bias_unmodeled")
     activation = str(c.get("hidden_act", "silu"))
     if activation != "silu":
         issues.append(f"hidden_act_unsupported:{activation}")
     if bool(c.get("attn_output_gate", False)):
-        issues.append("q_output_gate_unsupported_for_standard_qwen")
+        issues.append("q_output_gate_unsupported_for_standard_gqa")
     if _int(c, "num_nextn_predict_layers") > 0 or _int(c, "mtp_num_hidden_layers") > 0:
         issues.append("optional_mtp_schema_not_modeled")
     return tuple(dict.fromkeys(issues))

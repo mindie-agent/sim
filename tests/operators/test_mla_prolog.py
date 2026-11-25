@@ -589,12 +589,12 @@ def test_projection_quantization_preserves_absorption_index_and_draft_formats():
     from mindie_sim.catalog.draft_weights import _draft_attention_terms
     from mindie_sim.catalog.ops import compute_dtype_for
     from mindie_sim.compose import compose_case
-    case = parse_case(compose_case("glm-5.3-flash", hardware=SPLIT_M_SKU, quant="w8a8_mxfp8",
+    case = parse_case(compose_case("glm-5.3-flash", hardware=SPLIT_M_SKU, quant=None,
                                   tp=1, layers=4, prompt_tokens=4096, output_tokens=16,
                                   concurrency=8, graph_capture_mode="none"))
     quant = case.model.quant
     assert {quant.format_for(k) for k in ("mla", "routed_expert", "shared_expert", "mtp")} == {"fp8_e4m3"}
-    assert {quant.format_for(k) for k in ("kda", "mla_absorb", "indexer", "indexer_fp8", "dspark_input")} == {"bf16"}
+    assert {quant.format_for(k) for k in ("kda.q", "kda.o", "mla_absorb", "indexer", "indexer_fp8", "dspark_input")} == {"bf16"}
     draft = case.model.auxiliary.mtp
     dq = draft_quant(case.model, draft)
     assert (dq.expert_weight_format, dq.format_for("mla_absorb")) == ("fp8_e4m3", "bf16")

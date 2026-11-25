@@ -310,9 +310,12 @@ def _build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
             raise ModelingError(f"model_config_engram_storage_mode_unsupported:{storage_mode}")
         quant = replace(quant, engram_table_mode=storage_mode)
         engram = replace(engram, storage_mode=storage_mode)
+    resolved_intermediate = intermediate or moe_i
+    if resolved_intermediate <= 0:
+        raise ModelingError("model_config_intermediate_size_missing")
     model = ModelSpec(
         name=key, layers=body_layers, hidden_size=h, num_heads=heads,
-        head_dim=head_dim, intermediate_size=intermediate or (moe_i or 1),
+        head_dim=head_dim, intermediate_size=resolved_intermediate,
         vocab_size=vocab, attention=attention, ffn=ffn, num_kv_heads=kv_heads,
         activation_dtype=str(quant.native_format or "bf16"),
         weight_dtype=(declared_weight

@@ -14,18 +14,24 @@ from typing import Any
 
 from mindie_sim.catalog.cache import (
     _context_shard_blocks,
+    _context_shard_rows,
     block_round,
     cache_component_split,
     cache_row_split,
     index_row_parts,
     layer_cache_components,
     local_kv_heads,
+    owned_block_rows,
     owned_token_rows,
 )
 from mindie_sim.catalog.cache_format import gqa_kv_formats
 from mindie_sim.catalog.cache_pools import (
+    REGIME_UNIFORM_INDEPENDENT,
+    HybridPoolReceipt,
+    _ceil_div,
     _draft_is_dcp_sharded,
     _draft_row_bytes_int,
+    evaluate_hybrid_pool_receipt,
 )
 from mindie_sim.catalog.context_parallel import (
     cp_interleave,
@@ -52,6 +58,9 @@ _COMPONENT_POOL_MAP = {
     **{name: "recurrent_state_bytes" for name in _RECURRENT_POOL_COMPONENTS},
     "draft_kv": "draft_kv_bytes",
     "draft_state": "draft_state_bytes",
+    "dcp_dp_cohort_kv": "target_kv_bytes",
+    "dcp_dp_cohort_index": "indexer_k_bytes",
+    "dcp_dp_cohort_draft": "draft_kv_bytes",
 }
 
 
@@ -60,131 +69,306 @@ class _MemoryCacheMixin:
         # ``self.query_tokens`` already carries the shared DSpark ``[K+1]`` verify width.
         return self.query_tokens if query_tokens is None else max(1, int(query_tokens))
 
-    def dp_cohort_cache_bytes(
-        self, tokens: int, *, padded: bool = True,
+    def _hybrid_pool_receipt(
+        self,
+        tokens: int,
+        *,
+        num_requests: int = 1,
         query_tokens: int | None = None,
-    ) -> tuple[float, ...]:
-        """Per-DP-sequence HBM bytes on one die conserving DP-cohort DCP capacity.
-
-        When ``dcp_dp_width > 1``, evaluating ``b`` sequences per DP replica
-        means ``b * dcp_dp_width`` cohort sequences share this die's KV pool,
-        so KV-sharded components scale by ``dcp_dp_width`` while per-replica
-        recurrent/conv/replicated-index state stays at ``1x``.
-        """
-        base = list(
-            self.cache_bytes(tokens, padded=padded)
-            if query_tokens is None or max(1, int(query_tokens)) == self.query_tokens
-            else self.cache_bytes(tokens, padded=padded, query_tokens=query_tokens)
+        phase: str = "decode",
+    ) -> HybridPoolReceipt | None:
+        """Resolve exact integer hybrid-pool allocation when a non-uniform regime applies."""
+        if (
+            self.paired_sfa
+            or self.pages.groups
+            or not self.case.model.layer_plans
+            or int(tokens) <= 0
+            or int(num_requests) <= 0
+        ):
+            return None
+        q_tok = self._effective_cache_query_tokens(query_tokens)
+        receipt = evaluate_hybrid_pool_receipt(
+            self.case.model,
+            self.case.runtime.parallel,
+            int(tokens),
+            num_requests=int(num_requests),
+            runtime=self.case.runtime,
+            draft_kind=self.draft_kind,
+            query_tokens=q_tok,
+            phase=phase,
         )
+        if receipt.contract.pool_regime == REGIME_UNIFORM_INDEPENDENT:
+            return None
+        return receipt
+
+    def _dp_cohort_extra_parts_by_stage(
+        self,
+        tokens: int,
+        *,
+        padded: bool = True,
+        rank: int | None = None,
+        query_tokens: int | None = None,
+        phase: str = "decode",
+        peer_count_override: int | None = None,
+    ) -> list[dict[str, float]]:
+        """Per-stage DP-cohort extra bytes split into ``(kv, index, draft)``."""
         p = self.case.runtime.parallel
+        parts = [{"kv": 0.0, "index": 0.0, "draft": 0.0} for _ in range(p.pp)]
         dp_width = int(getattr(p, "dcp_dp_width", 1) or 1)
         if dp_width <= 1 or not self.case.model.layer_plans:
-            return tuple(base)
+            return parts
         case, model = self.case, self.case.model
-        q_tok = self._effective_cache_query_tokens(query_tokens)
+        is_prefill = str(phase or "decode").strip().lower() == "prefill"
+        q_tok = 1 if is_prefill else self._effective_cache_query_tokens(query_tokens)
         interleave = cp_interleave(case.runtime)
         sharded_idx = dcp_indexer_sharded(model, case.runtime)
+        owner_spans = self.rank_token_owners if rank is not None else None
         for layer in model.layer_plans:
             _, _, layer_dp = layer_dcp_factors(layer, p)
             if layer_dp <= 1:
                 continue
             components = layer_cache_components(
                 model, layer, p, tokens, capacity_padded=padded,
-                interleave=interleave, runtime=case.runtime, query_tokens=q_tok,
+                interleave=interleave, rank=rank, owner_spans=owner_spans,
+                runtime=case.runtime, query_tokens=q_tok, phase=phase,
             )
             covered = self.pages.covered.get(layer.index, ()) if padded else ()
             stage = self.layer_stage[layer.index]
+            scale = float(peer_count_override if peer_count_override is not None else (layer_dp - 1))
             for name, value in components.items():
                 if name in covered:
                     continue
-                if name in _DCP_KV_SHARDED_COMPONENTS or (name == "index_k" and sharded_idx):
-                    base[stage] += float(value) * float(layer_dp - 1)
+                if name in _DCP_KV_SHARDED_COMPONENTS:
+                    parts[stage]["kv"] += float(value) * scale
+                elif name == "index_k" and sharded_idx:
+                    parts[stage]["index"] += float(value) * scale
         if self.draft_kind and model.auxiliary is not None and not self.paired_sfa:
-            if not self._uses_inherited_draft_cache(model):
-                draft_kv, draft_sharded = self._non_inherited_draft_cache_bytes(
-                    model, tokens, padded=padded)
-                if draft_sharded and draft_kv > 0.0:
-                    base[-1] += draft_kv * float(dp_width - 1)
-        return tuple(base)
+            if self._uses_inherited_draft_cache(model):
+                from mindie_sim.catalog.draft import optional_draft_spec
+                from mindie_sim.catalog.draft_geometry import draft_layer_plans
 
-    def cache_bytes(self, tokens: int, *, padded=True,
-                    query_tokens: int | None = None) -> tuple[float, ...]:
+                draft = optional_draft_spec(model, self.draft_kind)
+                draft_cap = self._draft_context_cap(draft)
+                eff_tokens = min(int(tokens), draft_cap) if draft_cap > 0 else int(tokens)
+                for d_plan in draft_layer_plans(model, self.draft_kind):
+                    _, _, d_layer_dp = layer_dcp_factors(d_plan, p)
+                    if d_layer_dp <= 1:
+                        continue
+                    d_comps = layer_cache_components(
+                        model, d_plan, p, eff_tokens, capacity_padded=padded,
+                        interleave=interleave, rank=rank, owner_spans=owner_spans,
+                        runtime=case.runtime, query_tokens=q_tok, phase=phase,
+                    )
+                    d_scale = float(
+                        peer_count_override if peer_count_override is not None else (d_layer_dp - 1)
+                    )
+                    for name, value in d_comps.items():
+                        if name in _DCP_KV_SHARDED_COMPONENTS or (name == "index_k" and sharded_idx):
+                            parts[-1]["draft"] += float(value) * d_scale
+            else:
+                draft_kv, draft_sharded = self._non_inherited_draft_cache_bytes(
+                    model, tokens, padded=padded, rank=rank,
+                )
+                if draft_sharded and draft_kv > 0.0:
+                    d_scale = float(
+                        peer_count_override if peer_count_override is not None else (dp_width - 1)
+                    )
+                    parts[-1]["draft"] += draft_kv * d_scale
+        return parts
+
+    def _dp_cohort_extra_by_stage(
+        self,
+        tokens: int,
+        *,
+        padded: bool = True,
+        rank: int | None = None,
+        query_tokens: int | None = None,
+        phase: str = "decode",
+        peer_count_override: int | None = None,
+    ) -> list[float]:
+        """Extra per-DP-sequence KV bytes hosted on one die from ``dcp_dp_width > 1``."""
+        parts = self._dp_cohort_extra_parts_by_stage(
+            tokens, padded=padded, rank=rank, query_tokens=query_tokens,
+            phase=phase, peer_count_override=peer_count_override,
+        )
+        return [float(st["kv"] + st["index"] + st["draft"]) for st in parts]
+
+    def _rank_dp_cohort_cache_bytes(
+        self,
+        tokens: int,
+        *,
+        padded: bool = True,
+        rank: int | None = None,
+        query_tokens: int | None = None,
+        phase: str = "decode",
+    ) -> list[float]:
+        """Unified physical-die cache bytes including DP-cohort KV and hybrid pools."""
+        base = (
+            list(self.cache_bytes(tokens, padded=padded, query_tokens=query_tokens))
+            if rank is None
+            else self._rank_cache_bytes(tokens, padded=padded, rank=int(rank), query_tokens=query_tokens)
+        )
+        extra = self._dp_cohort_extra_by_stage(
+            tokens, padded=padded, rank=rank, query_tokens=query_tokens, phase=phase,
+        )
+        return [float(b) + float(e) for b, e in zip(base, extra)]
+
+    def dp_cohort_cache_bytes(
+        self, tokens: int, *, padded: bool = True,
+        query_tokens: int | None = None,
+    ) -> tuple[float, ...]:
+        """Per-DP-sequence HBM bytes on one die conserving DP-cohort DCP capacity."""
+        return tuple(self._rank_dp_cohort_cache_bytes(
+            tokens, padded=padded, rank=None, query_tokens=query_tokens,
+        ))
+
+    def _sum_unsubsumed_stage_bytes(
+        self,
+        tokens: int,
+        *,
+        padded: bool,
+        rank: int | None,
+        query_tokens: int,
+        hybrid: HybridPoolReceipt | None,
+    ) -> list[float]:
+        """Evaluate stage cache bytes via hybrid pool (when active) plus outside allocations."""
         case, model, p = self.case, self.case.model, self.case.runtime.parallel
-        q_tok = self._effective_cache_query_tokens(query_tokens)
-        result = (self.pages.allocation_stage_bytes(tokens, case.runtime.max_model_len, p.pp)
-                  if padded else [0.0] * p.pp)
-        interleave = cp_interleave(case.runtime)
+        if hybrid is not None:
+            result = [float(v) for v in hybrid.total_pool_bytes_by_stage]
+            sub_layers = set(hybrid.contract.subsumed_layers)
+            sub_comps = set(hybrid.contract.subsumed_components)
+            sub_draft_kv = bool(hybrid.contract.subsumed_draft_kv)
+            interleave = int(hybrid.contract.normalized_block_size)
+            block_override: int | None = interleave
+        else:
+            result = (
+                self.pages.allocation_stage_bytes(tokens, case.runtime.max_model_len, p.pp)
+                if padded else [0.0] * p.pp
+            )
+            sub_layers = set()
+            sub_comps = set()
+            sub_draft_kv = False
+            interleave = cp_interleave(case.runtime)
+            block_override = None
+        owner_spans = self.rank_token_owners if rank is not None else None
         if model.layer_plans:
             for layer in model.layer_plans:
                 components = layer_cache_components(
                     model, layer, p, tokens, capacity_padded=padded,
-                    interleave=interleave,
-                    runtime=case.runtime, query_tokens=q_tok)
+                    interleave=interleave, block_size=block_override,
+                    rank=rank, owner_spans=owner_spans,
+                    runtime=case.runtime, query_tokens=query_tokens,
+                )
                 covered = self.pages.covered.get(layer.index, ()) if padded else ()
-                result[self.layer_stage[layer.index]] += sum(
-                    value for name, value in components.items() if name not in covered)
+                stage = self.layer_stage[layer.index]
+                for name, value in components.items():
+                    if name in covered:
+                        continue
+                    if hybrid is not None and int(layer.index) in sub_layers and name in sub_comps:
+                        continue
+                    result[stage] += float(value)
         mode = self.draft_kind
         if self.paired_sfa and mode and not padded:
-            result[-1] += self._paired_draft_bytes(tokens)
+            result[-1] += self._paired_draft_bytes(tokens, rank=rank, padded=False)
         elif mode and model.auxiliary is not None and not self.paired_sfa:
             if self._uses_inherited_draft_cache(model):
                 draft_kv, draft_state = self._inherited_draft_cache_parts(
-                    model, tokens, padded=padded, query_tokens=q_tok)
-                result[-1] += draft_kv + draft_state
-            else:
+                    model, tokens, padded=padded, rank=rank, query_tokens=query_tokens,
+                )
+                result[-1] += draft_state + (0.0 if sub_draft_kv else draft_kv)
+            elif not sub_draft_kv:
                 draft_kv, _ = self._non_inherited_draft_cache_bytes(
-                    model, tokens, padded=padded)
+                    model, tokens, padded=padded, rank=rank,
+                )
                 result[-1] += draft_kv
-        return tuple(result)
+        return result
+
+    def cache_bytes(self, tokens: int, *, padded=True,
+                    query_tokens: int | None = None) -> tuple[float, ...]:
+        q_tok = self._effective_cache_query_tokens(query_tokens)
+        hybrid = self._hybrid_pool_receipt(tokens, num_requests=1, query_tokens=q_tok) if padded else None
+        return tuple(self._sum_unsubsumed_stage_bytes(
+            tokens, padded=bool(padded), rank=None, query_tokens=q_tok, hybrid=hybrid,
+        ))
 
     def _draft_context_cap(self, draft) -> int:
-        try:
-            from mindie_sim.catalog.draft_spec import effective_draft_context_cap
-        except ImportError:
-            candidates: list[int] = []
-            spec_cap = int(getattr(draft, "max_position_embeddings", 0) or 0)
-            if spec_cap > 0:
-                candidates.append(spec_cap)
-            meta = dict(getattr(self.case.runtime, "metadata", ()) or ())
-            rt_cap = int(meta.get("draft_max_model_len") or 0)
-            if rt_cap > 0:
-                candidates.append(rt_cap)
-            spec_cfg = meta.get("speculative_config")
-            if isinstance(spec_cfg, Mapping):
-                for key in ("draft_max_model_len", "max_model_len", "max_position_embeddings"):
-                    cfg_cap = int(spec_cfg.get(key) or 0)
-                    if cfg_cap > 0:
-                        candidates.append(cfg_cap)
-            return min(candidates) if candidates else 0
+        from mindie_sim.catalog.draft_spec import effective_draft_context_cap
         return effective_draft_context_cap(draft, self.case.runtime)
+
+    def _resolve_draft_tp(self) -> int:
+        """Resolve draft tensor-parallel degree strictly from contract/runtime metadata."""
+        rt = self.case.runtime
+        meta = dict(getattr(rt, "metadata", ()) or ())
+        contract = getattr(rt, "speculative_contract", None) or meta.get("speculative_contract")
+        if contract is not None:
+            raw_tp = (
+                contract.get("draft_tp")
+                if isinstance(contract, Mapping)
+                else getattr(contract, "draft_tp", None)
+            )
+            if raw_tp is not None and not isinstance(raw_tp, bool) and int(raw_tp) > 0:
+                return int(raw_tp)
+        meta_tp = meta.get("draft_tp")
+        if meta_tp is not None and not isinstance(meta_tp, bool) and int(meta_tp) > 0:
+            return int(meta_tp)
+        spec_cfg = meta.get("speculative_config")
+        if isinstance(spec_cfg, Mapping):
+            cfg_tp = spec_cfg.get("draft_tensor_parallel_size") or spec_cfg.get("draft_tp")
+            if cfg_tp is not None and not isinstance(cfg_tp, bool) and int(cfg_tp) > 0:
+                return int(cfg_tp)
+        return max(1, int(rt.parallel.tp))
+
+    def _draft_owned_rows(
+        self,
+        eff_tokens: int,
+        block: int,
+        draft_cp: int,
+        *,
+        padded: bool,
+        rank: int | None,
+    ) -> int:
+        """Exact integer token rows owned by one rank for draft KV under CP/T05."""
+        tokens_int = max(0, int(eff_tokens))
+        blk = max(1, int(block))
+        cp = max(1, int(draft_cp))
+        if cp <= 1:
+            return int(block_round(tokens_int, blk) if padded else tokens_int)
+        if rank is not None and self.rank_token_owners is not None:
+            base_tokens = block_round(tokens_int, blk) if padded else tokens_int
+            owned = owned_token_rows(base_tokens, self.rank_token_owners, int(rank))
+            return int(owned) if owned is not None else 0
+        if rank is not None:
+            cp_rank = int(rank) % cp
+            if padded:
+                blocks = _ceil_div(tokens_int, blk) if tokens_int else 0
+                count = ((blocks - 1 - cp_rank) // cp + 1) if cp_rank < blocks else 0
+                return int(count * blk)
+            return int(owned_block_rows(tokens_int, blk, cp, cp_rank))
+        if padded:
+            return int(_context_shard_blocks(tokens_int, blk, cp))
+        return int(_context_shard_rows(tokens_int, cp))
 
     def _non_inherited_draft_cache_bytes(
         self, model, tokens: int, *, padded: bool, rank: int | None = None,
     ) -> tuple[float, bool]:
-        """Return ``(draft_kv_bytes, draft_is_dcp_sharded)`` honoring draft quant & cap."""
+        """Return ``(draft_kv_bytes, draft_is_dcp_sharded)`` honoring draft TP/quant/CP/cap."""
         from mindie_sim.catalog.draft import optional_draft_spec
 
         case, p = self.case, self.case.runtime.parallel
         draft = optional_draft_spec(model, self.draft_kind)
         draft_cap = self._draft_context_cap(draft)
-        eff_tokens = min(tokens, draft_cap) if draft_cap > 0 else tokens
+        eff_tokens = min(int(tokens), draft_cap) if draft_cap > 0 else int(tokens)
         block = max(1, int(cp_interleave(case.runtime)))
-        row_bytes = float(_draft_row_bytes_int(model, draft, tp=p.tp))
+        draft_tp = self._resolve_draft_tp()
+        row_bytes = _draft_row_bytes_int(model, draft, tp=draft_tp)
         draft_sharded = _draft_is_dcp_sharded(
             model, p, self.draft_kind,
             dcp=int(getattr(p, "cp", 1) or 1),
-            draft_page=block * int(row_bytes),
+            draft_page=block * row_bytes,
         )
-        if draft_sharded and rank is not None and self.rank_token_owners is not None:
-            base_tokens = block_round(eff_tokens, block) if padded else eff_tokens
-            rows = float(owned_token_rows(base_tokens, self.rank_token_owners, int(rank)))
-        else:
-            draft_cp = int(p.cp) if draft_sharded else 1
-            rows = (
-                float(_context_shard_blocks(eff_tokens, block, draft_cp))
-                if padded else float(eff_tokens) / float(draft_cp)
-            )
-        return rows * row_bytes * float(draft.layers), draft_sharded
+        draft_cp = int(p.cp) if draft_sharded else 1
+        rows = self._draft_owned_rows(eff_tokens, block, draft_cp, padded=padded, rank=rank)
+        return float(rows * row_bytes * int(draft.layers)), draft_sharded
 
     def _uses_inherited_draft_cache(self, model) -> bool:
         """True when draft KV/state follows the declared draft LayerPlans."""
@@ -194,7 +378,7 @@ class _MemoryCacheMixin:
 
     def _inherited_draft_cache_parts(
         self, model, tokens: int, *, padded: bool, rank: int | None = None,
-        query_tokens: int | None = None,
+        query_tokens: int | None = None, phase: str = "decode",
     ) -> tuple[float, float]:
         """Draft KV and recurrent state from inherited plans, honoring context cap."""
         from mindie_sim.catalog.cache_ownership import draft_cache_components
@@ -203,12 +387,14 @@ class _MemoryCacheMixin:
         draft = optional_draft_spec(model, self.draft_kind)
         draft_cap = self._draft_context_cap(draft)
         eff_tokens = min(tokens, draft_cap) if draft_cap > 0 else tokens
+        is_prefill = str(phase or "decode").strip().lower() == "prefill"
+        q_tok = 1 if is_prefill else self._effective_cache_query_tokens(query_tokens)
         values = draft_cache_components(
             model, self.case.runtime.parallel, draft_kind=self.draft_kind,
             sequence_tokens=eff_tokens, capacity_padded=padded,
             runtime=self.case.runtime, rank=rank,
             owner_spans=self.rank_token_owners if rank is not None else None,
-            query_tokens=self._effective_cache_query_tokens(query_tokens),
+            query_tokens=q_tok, phase=phase,
         )
         return float(values.get("draft_kv", 0.0)), float(values.get("draft_state", 0.0))
 
@@ -345,7 +531,7 @@ class _MemoryCacheMixin:
     def _paired_draft_bytes(
         self, tokens: int, *, rank: int | None = None, padded: bool = False,
     ) -> float:
-        """Draft KV bytes inside paired SFA honoring draft TP, draft DCP, and cap."""
+        """Draft KV bytes inside paired SFA honoring draft TP, exact integer CP, and cap."""
         from mindie_sim.catalog.draft import optional_draft_spec
         from mindie_sim.catalog.paired_sfa import draft_row
 
@@ -353,34 +539,19 @@ class _MemoryCacheMixin:
         draft = optional_draft_spec(self.case.model, self.draft_kind)
         draft_cap = self._draft_context_cap(draft)
         max_len = int(self.case.runtime.max_model_len or 0)
-        eff_tokens = min(tokens, max_len) if max_len > 0 else tokens
+        eff_tokens = min(int(tokens), max_len) if max_len > 0 else int(tokens)
         eff_tokens = min(eff_tokens, draft_cap) if draft_cap > 0 else eff_tokens
-        row_bytes = float(draft_row(self.case.model, draft, tp=p.tp))
+        draft_tp = self._resolve_draft_tp()
+        row_bytes = int(draft_row(self.case.model, draft, tp=draft_tp))
         block = max(1, int(self.case.runtime.kv_block_size or cp_interleave(self.case.runtime)))
         sharded = _draft_is_dcp_sharded(
             self.case.model, p, self.draft_kind,
             dcp=int(getattr(p, "cp", 1) or 1),
-            draft_page=block * int(row_bytes),
+            draft_page=block * row_bytes,
         )
         draft_cp = int(p.cp) if sharded else 1
-        if rank is not None and sharded:
-            if self.rank_token_owners is not None:
-                base_tokens = block_round(eff_tokens, block) if padded else eff_tokens
-                rows = float(owned_token_rows(base_tokens, self.rank_token_owners, int(rank)))
-            elif eff_tokens > 0:
-                from mindie_sim.catalog.context_parallel import owned_positions
-                exact = owned_positions(
-                    0, eff_tokens - 1, draft_cp,
-                    cp_interleave(self.case.runtime), int(rank) % draft_cp,
-                )
-                rows = float(block_round(exact, block) if padded else exact)
-            else:
-                rows = 0.0
-        elif padded:
-            rows = float(_context_shard_blocks(eff_tokens, block, draft_cp))
-        else:
-            rows = float(eff_tokens) / float(draft_cp)
-        return rows * row_bytes * float(draft.layers)
+        rows = self._draft_owned_rows(eff_tokens, block, draft_cp, padded=padded, rank=rank)
+        return float(rows * row_bytes * int(draft.layers))
 
     def _group_token_component(
         self, model, layer, parallel, group, name: str, valid_tokens: int,
@@ -435,7 +606,9 @@ class _MemoryCacheMixin:
         self, tokens: int, *, query_tokens: int | None = None,
     ) -> tuple[list[float], list[float], list[float]]:
         """(gross, HBM-resident, staging) KV bytes, same basis as resize."""
-        gross = list(self.cache_bytes(tokens, query_tokens=query_tokens))
+        gross = self._rank_dp_cohort_cache_bytes(
+            tokens, padded=True, rank=None, query_tokens=query_tokens,
+        )
         if self.kvc_hbm_ratio == 1.0:
             return gross, list(gross), [0.0] * len(gross)
         resident = [value * self.kvc_hbm_ratio for value in gross]
@@ -448,10 +621,17 @@ class _MemoryCacheMixin:
     def _cache_component_breakdown(
         self, tokens: int, *, padded: bool, skip_covered: bool,
         rank: int | None = None, query_tokens: int | None = None,
+        block_size_override: int | None = None, phase: str = "decode",
     ) -> list[dict]:
         """Per-stage component payload/scale split for one liveness view."""
         case, model, p = self.case, self.case.model, self.case.runtime.parallel
-        q_tok = self._effective_cache_query_tokens(query_tokens)
+        is_prefill = str(phase or "decode").strip().lower() == "prefill"
+        q_tok = 1 if is_prefill else self._effective_cache_query_tokens(query_tokens)
+        interleave = (
+            int(block_size_override)
+            if block_size_override is not None and int(block_size_override) > 0
+            else cp_interleave(case.runtime)
+        )
         stages = [
             {"payload": 0.0, "scale": 0.0, "total": 0.0, "components": {}}
             for _ in range(p.pp)
@@ -459,9 +639,9 @@ class _MemoryCacheMixin:
         for layer in model.layer_plans:
             components = layer_cache_components(
                 model, layer, p, tokens, capacity_padded=padded,
-                interleave=cp_interleave(case.runtime),
+                interleave=interleave, block_size=block_size_override,
                 rank=rank, owner_spans=self.rank_token_owners,
-                runtime=case.runtime, query_tokens=q_tok,
+                runtime=case.runtime, query_tokens=q_tok, phase=phase,
             )
             covered = self.pages.covered.get(layer.index, ()) if skip_covered else ()
             stage = stages[self.layer_stage[layer.index]]
@@ -483,7 +663,9 @@ class _MemoryCacheMixin:
             draft_state = 0.0
             if self._uses_inherited_draft_cache(model):
                 value, draft_state = self._inherited_draft_cache_parts(
-                    model, tokens, padded=padded, rank=rank, query_tokens=q_tok)
+                    model, tokens, padded=padded, rank=rank,
+                    query_tokens=q_tok, phase=phase,
+                )
             else:
                 value, _ = self._non_inherited_draft_cache_bytes(
                     model, tokens, padded=padded, rank=rank)
@@ -515,40 +697,16 @@ class _MemoryCacheMixin:
             return list(self.cache_bytes(tokens, padded=True, query_tokens=query_tokens))
         if not self.paired_sfa and (self.rank_token_owners is None and int(self.case.runtime.parallel.cp) <= 1):
             return list(self.cache_bytes(tokens, padded=padded, query_tokens=query_tokens))
-        case, model, p = self.case, self.case.model, self.case.runtime.parallel
         q_tok = self._effective_cache_query_tokens(query_tokens)
-        result = (
-            self.pages.allocation_stage_bytes(tokens, case.runtime.max_model_len, p.pp)
-            if padded else [0.0] * p.pp
+        hybrid = self._hybrid_pool_receipt(tokens, num_requests=1, query_tokens=q_tok) if padded else None
+        return self._sum_unsubsumed_stage_bytes(
+            tokens, padded=bool(padded), rank=int(rank), query_tokens=q_tok, hybrid=hybrid,
         )
-        for layer in model.layer_plans:
-            components = layer_cache_components(
-                model, layer, p, tokens, capacity_padded=padded,
-                interleave=cp_interleave(case.runtime),
-                rank=int(rank), owner_spans=self.rank_token_owners,
-                runtime=case.runtime, query_tokens=q_tok,
-            )
-            covered = self.pages.covered.get(layer.index, ()) if padded else ()
-            result[self.layer_stage[layer.index]] += sum(
-                value for name, value in components.items() if name not in covered)
-        mode = self.draft_kind
-        if self.paired_sfa and mode and not padded:
-            result[-1] += self._paired_draft_bytes(tokens, rank=int(rank), padded=False)
-        elif mode and model.auxiliary is not None and not self.paired_sfa:
-            if self._uses_inherited_draft_cache(model):
-                draft_kv, draft_state = self._inherited_draft_cache_parts(
-                    model, tokens, padded=padded, rank=int(rank), query_tokens=q_tok)
-                result[-1] += draft_kv + draft_state
-            else:
-                draft_kv, _ = self._non_inherited_draft_cache_bytes(
-                    model, tokens, padded=padded, rank=int(rank))
-                result[-1] += draft_kv
-        return result
 
     def _rank_max_layer_cache_bytes(
         self, tokens: int, rank: int, *, query_tokens: int | None = None,
     ) -> tuple[float, ...]:
-        if self.rank_token_owners is None:
+        if self.rank_token_owners is None and int(self.case.runtime.parallel.cp) <= 1:
             return self._max_layer_cache_bytes(tokens, query_tokens=query_tokens)
         model, p = self.case.model, self.case.runtime.parallel
         q_tok = self._effective_cache_query_tokens(query_tokens)
@@ -569,7 +727,7 @@ class _MemoryCacheMixin:
     ) -> tuple[list[list[float]], list[list[float]]]:
         """(HBM-resident, staging) per stage and physical rank."""
         p = self.case.runtime.parallel
-        if self.rank_token_owners is None:
+        if self.rank_token_owners is None and int(getattr(p, "cp", 1) or 1) <= 1:
             _gross, resident, staging = self._kv_residency(
                 tokens, query_tokens=query_tokens,
             )
@@ -580,7 +738,7 @@ class _MemoryCacheMixin:
         resident = [[0.0] * self.width for _ in range(p.pp)]
         staging = [[0.0] * self.width for _ in range(p.pp)]
         for rank in range(self.width):
-            gross = self._rank_cache_bytes(
+            gross = self._rank_dp_cohort_cache_bytes(
                 tokens, padded=True, rank=rank, query_tokens=query_tokens,
             )
             layer_max = self._rank_max_layer_cache_bytes(
@@ -596,16 +754,64 @@ class _MemoryCacheMixin:
                         float(layer_max[stage]) * (1.0 - self.kvc_hbm_ratio))
         return resident, staging
 
+    def _kv_residency_cohort(
+        self, replica: int, tokens: int, *, query_tokens: int | None = None,
+    ) -> tuple[list[list[list[float]]], list[list[list[float]]], dict[int, tuple[tuple[float, ...], ...]], dict[int, tuple[tuple[float, ...], ...]]]:
+        """Single-request physical (HBM-resident, staging) across its cross-DP DCP cohort."""
+        p = self.case.runtime.parallel
+        dp_width = max(1, int(getattr(p, "dcp_dp_width", 1) or 1))
+        cohort_start = (int(replica) // dp_width) * dp_width
+        cohort_end = min(int(p.dp), cohort_start + dp_width)
+        res_all = [[[0.0] * self.width for _ in range(p.pp)] for _ in range(p.dp)]
+        stg_all = [[[0.0] * self.width for _ in range(p.pp)] for _ in range(p.dp)]
+        res_map: dict[int, tuple[tuple[float, ...], ...]] = {}
+        stg_map: dict[int, tuple[tuple[float, ...], ...]] = {}
+        for peer_rep in range(cohort_start, cohort_end):
+            peer_res = [[0.0] * self.width for _ in range(p.pp)]
+            peer_stg = [[0.0] * self.width for _ in range(p.pp)]
+            for rank in range(self.width):
+                cohort_rk = (peer_rep - cohort_start) * self.width + rank
+                if peer_rep == int(replica):
+                    gross = self._rank_cache_bytes(
+                        tokens, padded=True, rank=cohort_rk, query_tokens=query_tokens,
+                    )
+                else:
+                    gross = self._dp_cohort_extra_by_stage(
+                        tokens, padded=True, rank=cohort_rk,
+                        query_tokens=query_tokens, peer_count_override=1,
+                    )
+                layer_max = (
+                    self._rank_max_layer_cache_bytes(tokens, cohort_rk, query_tokens=query_tokens)
+                    if self.kvc_hbm_ratio < 1.0 else (0.0,) * p.pp
+                )
+                for stage in range(p.pp):
+                    if self.kvc_hbm_ratio == 1.0:
+                        peer_res[stage][rank] = float(gross[stage])
+                    else:
+                        peer_res[stage][rank] = float(gross[stage]) * self.kvc_hbm_ratio
+                        peer_stg[stage][rank] = float(layer_max[stage]) * (1.0 - self.kvc_hbm_ratio)
+            res_all[peer_rep] = peer_res
+            stg_all[peer_rep] = peer_stg
+            res_map[peer_rep] = tuple(tuple(row) for row in peer_res)
+            stg_map[peer_rep] = tuple(tuple(row) for row in peer_stg)
+        return res_all, stg_all, res_map, stg_map
+
     def _allocation_view(
         self, tokens: int, *, rank: int | None = None,
         include_components: bool = True,
     ) -> dict:
         """One physical rank's (or the legacy stage's) cache allocation view."""
         case, p = self.case, self.case.runtime.parallel
+        hybrid = self._hybrid_pool_receipt(tokens, num_requests=1)
+        eff_block = hybrid.contract.normalized_block_size if hybrid is not None else None
         allocated = self._cache_component_breakdown(
-            tokens, padded=True, skip_covered=True, rank=rank)
+            tokens, padded=True, skip_covered=True, rank=rank,
+            block_size_override=eff_block,
+        )
         valid = self._cache_component_breakdown(
-            tokens, padded=False, skip_covered=True, rank=rank)
+            tokens, padded=False, skip_covered=True, rank=rank,
+            block_size_override=eff_block,
+        )
         group_parts = self._group_cache_parts(tokens, rank=rank)
         group_payload = self.pages.stage_bytes(
             tokens, case.runtime.max_model_len, p.pp)
@@ -613,6 +819,10 @@ class _MemoryCacheMixin:
             tokens, case.runtime.max_model_len, p.pp)
         group_access_metadata = self.pages.access_metadata_stage_bytes(
             tokens, case.runtime.max_model_len, p.pp)
+        hybrid_reserve = (
+            [float(v) for v in hybrid.stride_reserve_by_stage]
+            if hybrid is not None else [0.0] * p.pp
+        )
         result = {
             "sequence_tokens": int(tokens),
             "basis": "padded_cache_pages_separate_from_valid_access",
@@ -661,7 +871,10 @@ class _MemoryCacheMixin:
         for index in range(p.pp):
             known_payload = group_parts[index]["alloc_payload"]
             known_scale = group_parts[index]["alloc_scale"]
-            reserve = max(0.0, group_payload[index] - known_payload - known_scale)
+            reserve = (
+                max(0.0, group_payload[index] - known_payload - known_scale)
+                + hybrid_reserve[index]
+            )
             alloc_payload = allocated[index]["payload"] + known_payload
             alloc_scale = allocated[index]["scale"] + known_scale
             metadata = group_metadata[index]
@@ -747,8 +960,15 @@ class _MemoryCacheMixin:
         """Pool-structured cache breakdown conserving ``cache_bytes(tokens, padded=padded)``."""
         case, model, p = self.case, self.case.model, self.case.runtime.parallel
         q_tok = self._effective_cache_query_tokens(query_tokens)
+        hybrid = self._hybrid_pool_receipt(tokens, num_requests=1, query_tokens=q_tok) if padded else None
+        eff_block = hybrid.contract.normalized_block_size if hybrid is not None else None
         stages = self._cache_component_breakdown(
             tokens, padded=padded, skip_covered=padded, query_tokens=q_tok,
+            block_size_override=eff_block,
+        )
+        hybrid_reserve = (
+            [float(v) for v in hybrid.stride_reserve_by_stage]
+            if hybrid is not None else [0.0] * p.pp
         )
         group_parts = (
             self._group_cache_parts(tokens, query_tokens=q_tok)
@@ -788,7 +1008,7 @@ class _MemoryCacheMixin:
                     float(group_payload[index]) - float(gp["alloc_payload"]) - float(gp["alloc_scale"]),
                 )
             else:
-                reserve = float(group_payload[index]) if padded else 0.0
+                reserve = (float(group_payload[index]) if padded else 0.0) + hybrid_reserve[index]
             meta_bytes = float(group_metadata[index]) if padded else 0.0
             if self.paired_sfa and self.draft_kind and not padded:
                 draft_val = float(self._paired_draft_bytes(tokens))

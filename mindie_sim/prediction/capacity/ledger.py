@@ -176,6 +176,57 @@ class ResidentMemoryReceipt:
 
 
 @dataclass(frozen=True)
+class CacheLedgerProjection:
+    """Internal per-die / per-stage / per-component exact integer cache projection.
+
+    Pairs the frozen D0 Contract 3 ``ResidentMemoryReceipt`` with exact integer
+    component allocations per PP stage so ``export/memory_ledger.py`` projects
+    with 0 B multi-key bijection and zero shadow HBM recomputation.
+    """
+
+    receipt: ResidentMemoryReceipt
+    bottleneck_rank_by_stage: tuple[int, ...]
+    per_stage_component_batch_bytes: tuple[dict[str, int], ...]
+    per_stage_component_per_req_bytes: tuple[dict[str, float], ...]
+    active_layers_by_component: dict[str, tuple[int, ...]]
+    cache_kind_by_component: dict[str, str]
+    fixed_per_die_components: frozenset[str]
+    normalized_block_size: int
+    hybrid_pool_receipt: Any = None
+
+
+def _exact_int_bound(value: Any, name: str) -> int:
+    """Validate an exact integer byte bound without float floor/ceil smearing."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{name}_invalid")
+    if isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError(f"{name}_must_be_integer")
+        return int(value)
+    return int(value)
+
+
+def _exact_half_open_int_ranges(
+    raw_ranges: Any, amount: Any,
+) -> tuple[tuple[int, int], ...]:
+    """Build exact integer half-open ``[lo, hi)`` byte ranges directly."""
+    if raw_ranges:
+        out: list[tuple[int, int]] = []
+        for lo_raw, hi_raw in raw_ranges:
+            lo = _exact_int_bound(lo_raw, "memory_byte_range")
+            hi = _exact_int_bound(hi_raw, "memory_byte_range")
+            if lo < 0 or hi < lo:
+                raise ValueError("memory_byte_range_invalid")
+            if hi > lo:
+                out.append((lo, hi))
+        return tuple(out)
+    amt = _exact_int_bound(amount, "memory_byte_amount")
+    if amt < 0:
+        raise ValueError("memory_byte_amount_negative")
+    return ((0, amt),) if amt > 0 else ()
+
+
+@dataclass(frozen=True)
 class RecoverSsmRingBreakdown:
     """Exact HBM cost of storing ``K`` speculative SSM snapshots vs ``RecoverSSM``."""
 
@@ -370,68 +421,79 @@ class _MemoryLedgerMixin:
         return _LedgerBoundary(self._ledger_serial)
 
     def _typed_spec_bindings(self, replica: int, spec: dict):
-        """Translate one legacy grant spec onto canonical typed identities.
-
-        The declared ``rank`` is a storage-holder identity, not a new physical
-        die: a producer may name a KV owner rank that the placed envelope does
-        not enumerate (for example a TP1 case whose binding still names the
-        source rank).  Byte accounting already normalises that legacy value
-        through ``_account_rank``; the canonical pool/backing identity must use
-        the same accounting rank so a grant cannot fail with
-        ``memory_rank_out_of_range`` while the legacy ledger admits it.  The
-        raw declared rank stays in ``grant_records``/``grant_bindings``.
-        """
+        """Construct typed ``AllocationBinding`` records with exact integer half-open ranges."""
         if self.ledger_domain is None:
             return ()
         stage = int(spec.get("stage", 0))
-        rank = spec.get("rank")
-        rank = 0 if rank is None else int(rank)
+        rank_raw = spec.get("rank")
+        rank = 0 if rank_raw is None else int(rank_raw)
         account_rank = self._account_rank(rank)
         amount = float(spec.get("bytes", 0.0))
         generation = self._ledger_generation(spec.get("generation"))
         occurrence = self._ledger_occurrence(replica, stage, rank)
+        tier = str(spec.get("tier", "hbm"))
         backing = BackingKey(
-            physical_domain=self.ledger_domain.domain_id, rank=account_rank,
-            tier=str(spec.get("tier", "hbm")),
+            physical_domain=self.ledger_domain.domain_id,
+            rank=account_rank,
+            tier=tier,
             storage_id=str(spec.get("physical_key", "")),
-            generation=generation)
-        ranges = tuple(
-            (int(math.floor(lo)), int(math.ceil(hi)))
-            for lo, hi in (spec.get("_ranges") or ()))
-        if not ranges and amount > 0:
-            ranges = ((0, int(math.floor(amount))),)
+            generation=generation,
+        )
+        ranges = _exact_half_open_int_ranges(spec.get("_ranges"), spec.get("bytes", 0))
         key = AllocationKey(
-            occurrence=occurrence, scope_kind="invocation",
-            scope_ordinal=int(spec.get("stage", 0)), symbol=self._ledger_serial,
-            generation=generation)
+            occurrence=occurrence,
+            scope_kind="invocation",
+            scope_ordinal=stage,
+            symbol=self._ledger_serial,
+            generation=generation,
+        )
         result = [AllocationBinding(
-            key=key, pool=self.ledger_pool(
-                replica, stage, account_rank, tier=str(spec.get("tier", "hbm")),
-                domain=self.ledger_domain.domain_id),
-            amount=amount, backing=backing, byte_ranges=ranges,
+            key=key,
+            pool=self.ledger_pool(
+                replica, stage, account_rank, tier=tier,
+                domain=self.ledger_domain.domain_id,
+            ),
+            amount=amount,
+            backing=backing,
+            byte_ranges=ranges,
             owner=str(spec.get("owner", "")),
-            storage=str(spec.get("storage", "")), access="readwrite")]
-        host = float(spec.get("host_bytes", 0.0))
-        if host > 0:
+            storage=str(spec.get("storage", "")),
+            access="readwrite",
+        )]
+        host_raw = spec.get("host_bytes", 0)
+        host = float(host_raw)
+        if host > 0.0:
+            host_int = _exact_int_bound(host_raw, "memory_host_bytes")
             self._ledger_serial += 1
             host_key = AllocationKey(
                 occurrence=self._ledger_occurrence(replica, stage, -1),
-                scope_kind="external", scope_ordinal=self._ledger_serial,
-                symbol=self._ledger_serial, generation=generation)
+                scope_kind="external",
+                scope_ordinal=self._ledger_serial,
+                symbol=self._ledger_serial,
+                generation=generation,
+            )
             result.append(AllocationBinding(
                 key=host_key,
                 pool=PoolKey(
-                    physical_domain=self.ledger_domain.domain_id, rank=-1,
-                    tier="host", name="host", unit=int(replica)),
+                    physical_domain=self.ledger_domain.domain_id,
+                    rank=-1,
+                    tier="host",
+                    name="host",
+                    unit=int(replica),
+                ),
                 amount=host,
                 backing=BackingKey(
-                    physical_domain=self.ledger_domain.domain_id, rank=-1,
+                    physical_domain=self.ledger_domain.domain_id,
+                    rank=-1,
                     tier="host",
                     storage_id=str(spec.get("physical_key", "")) + "#host",
-                    generation=generation),
-                byte_ranges=((0, int(math.floor(host))),),
+                    generation=generation,
+                ),
+                byte_ranges=((0, host_int),),
                 owner=str(spec.get("owner", "")),
-                storage=str(spec.get("storage", "")), access="readwrite"))
+                storage=str(spec.get("storage", "")),
+                access="readwrite",
+            ))
         return tuple(result)
 
     def bind_runtime(self, state, *, domain_id: str = "memory") -> CapacityDomainState:
@@ -658,15 +720,43 @@ class _MemoryLedgerMixin:
             ))
         return tuple(refs)
 
+    def _is_cross_dp_dcp_cohort_active(self) -> bool:
+        p = self.case.runtime.parallel
+        return (
+            bool(getattr(p, "cp_spans_dp", False))
+            and int(getattr(p, "dcp_dp_width", 1) or 1) > 1
+            and self.rank_token_owners is None
+        )
+
+    def _accumulate_owner_map(
+        self,
+        target: list[list[list[float]]],
+        owners: Mapping[tuple[int, str], tuple[tuple[float, ...], ...]],
+        cohort_owners: Mapping[tuple[int, str], Mapping[int, tuple[tuple[float, ...], ...]]],
+        *,
+        exclude_request: tuple[int, str] | None = None,
+    ) -> None:
+        for key, rows in owners.items():
+            if key == exclude_request:
+                continue
+            cohort_map = cohort_owners.get(key)
+            if cohort_map is not None:
+                for peer_rep, peer_rows in cohort_map.items():
+                    for stage, row in enumerate(peer_rows):
+                        for rank, value in enumerate(row):
+                            target[peer_rep][stage][rank] += float(value)
+                continue
+            replica = key[0]
+            for stage, row in enumerate(rows):
+                for rank, value in enumerate(row):
+                    target[replica][stage][rank] += float(value)
+
     def _request_usage_ranks(self) -> list[list[list[float]]]:
         result = [
             [[0.0] * self.width for _ in range(self.case.runtime.parallel.pp)]
             for _ in range(self.case.runtime.parallel.dp)
         ]
-        for (replica, _request), rows in self.owner_ranks.items():
-            for stage, row in enumerate(rows):
-                for rank, value in enumerate(row):
-                    result[replica][stage][rank] += float(value)
+        self._accumulate_owner_map(result, self.owner_ranks, self._cohort_owner_ranks)
         return result
 
     def _staging_usage_ranks(self) -> list[list[list[float]]]:
@@ -674,11 +764,113 @@ class _MemoryLedgerMixin:
             [[0.0] * self.width for _ in range(self.case.runtime.parallel.pp)]
             for _ in range(self.case.runtime.parallel.dp)
         ]
-        for (replica, _request), rows in self.staging_owner_ranks.items():
-            for stage, row in enumerate(rows):
-                for rank, value in enumerate(row):
-                    result[replica][stage][rank] += float(value)
+        self._accumulate_owner_map(result, self.staging_owner_ranks, self._cohort_staging_ranks)
         return result
+
+    def _resident_admission(
+        self, replica: int, request: str, tokens: int,
+        *, query_tokens: int | None = None, proposal_tokens: int | None = None,
+    ) -> dict:
+        if not self._is_cross_dp_dcp_cohort_active():
+            return super()._resident_admission(
+                replica, request, tokens,
+                query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+            )
+        key = (replica, request)
+        eff_q = self._resolve_request_query_tokens(
+            key, query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+        )
+        res_all, stg_all, res_map, stg_map = self._kv_residency_cohort(
+            replica, tokens, query_tokens=eff_q,
+        )
+        own_res = res_map[int(replica)]
+        own_stg = stg_map[int(replica)]
+        demand = tuple(max(row) for row in own_res)
+        demand_staging = tuple(max(row) for row in own_stg)
+        host_demand = self.host_dram_cache_bytes(tokens) if self.sparse_offload else 0.0
+        (physical, host_physical, physical_staging,
+         physical_ranks, physical_staging_ranks) = self._physical_union(
+            key, demand, host_demand, demand_staging,
+            demand_ranks=own_res, staging_ranks=own_stg,
+        )
+        res_map[int(replica)] = physical_ranks
+        stg_map[int(replica)] = physical_staging_ranks
+        res_all[int(replica)] = [list(row) for row in physical_ranks]
+        stg_all[int(replica)] = [list(row) for row in physical_staging_ranks]
+        p = self.case.runtime.parallel
+        host_request = [0.0] * p.dp
+        host_request[replica] = float(host_physical)
+        hbm, host = self._state_usage(
+            exclude_request=key, request_usage=res_all,
+            staging_usage=stg_all, host_request=host_request,
+        )
+        resolved_q = self._effective_cache_query_tokens(eff_q)
+        return {
+            "demand": demand, "physical": physical,
+            "physical_ranks": physical_ranks,
+            "demand_ranks": own_res,
+            "demand_staging": demand_staging,
+            "demand_staging_ranks": own_stg,
+            "physical_staging": physical_staging,
+            "physical_staging_ranks": physical_staging_ranks,
+            "cohort_owner_ranks": res_map,
+            "cohort_staging_ranks": stg_map,
+            "host_demand": float(host_demand),
+            "host_physical": float(host_physical),
+            "query_tokens": int(resolved_q),
+            "candidate_hbm": hbm, "candidate_host": host,
+            "ok": self._usage_budget_ok(hbm, host),
+        }
+
+    def resize(
+        self, replica: int, request: str, tokens: int,
+        *, query_tokens: int | None = None, proposal_tokens: int | None = None,
+    ) -> bool:
+        if not self._is_cross_dp_dcp_cohort_active():
+            return super().resize(
+                replica, request, tokens,
+                query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+            )
+        key = (replica, request)
+        candidate = self._resident_admission(
+            replica, request, tokens,
+            query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+        )
+        if not candidate["ok"]:
+            return False
+        changed = (
+            self.owners.get(key) != candidate["physical"]
+            or self.owner_ranks.get(key) != candidate["physical_ranks"]
+            or self._cohort_owner_ranks.get(key) != candidate["cohort_owner_ranks"]
+            or self.logical_owners.get(key) != candidate["demand"]
+            or self.host_dram_owners.get(key) != candidate["host_physical"]
+            or self.staging_owners.get(key) != candidate["physical_staging"]
+            or self.request_query_tokens.get(key) != candidate["query_tokens"]
+        )
+        self._cohort_owner_ranks[key] = candidate["cohort_owner_ranks"]
+        self._cohort_staging_ranks[key] = candidate["cohort_staging_ranks"]
+        self._set_physical(
+            replica, key, candidate["physical"], candidate["host_physical"],
+            candidate["physical_staging"],
+            physical_ranks=candidate["physical_ranks"],
+            staging_ranks=candidate["physical_staging_ranks"],
+        )
+        self.logical_owners[key] = candidate["demand"]
+        self.logical_owner_ranks[key] = candidate["demand_ranks"]
+        self.logical_host_owners[key] = candidate["host_demand"]
+        self.logical_staging_owners[key] = candidate["demand_staging"]
+        self.logical_staging_rank[key] = candidate["demand_staging_ranks"]
+        self.request_query_tokens[key] = int(candidate["query_tokens"])
+        self.request_versions[key] = self.request_versions.get(key, 0) + 1
+        if changed:
+            self.budget_version += 1
+        return True
+
+    def _free_request(self, replica: int, request: str) -> None:
+        key = (replica, request)
+        self._cohort_owner_ranks.pop(key, None)
+        self._cohort_staging_ranks.pop(key, None)
+        super()._free_request(replica, request)
 
     def _state_usage(
         self, *, extra_holders=(), drop_holders=(), exclude_request=None,
@@ -722,18 +914,12 @@ class _MemoryLedgerMixin:
         for (replica, rank, stage, _storage, _tier, _key, _generation), ranges in \
                 backing_ranges.items():
             hbm[replica][stage][rank] += _union_bytes(ranges)
-        for (replica, _request), rows in self.owner_ranks.items():
-            if (replica, _request) == exclude_request:
-                continue
-            for stage, row in enumerate(rows):
-                for rank, value in enumerate(row):
-                    hbm[replica][stage][rank] += float(value)
-        for (replica, _request), rows in self.staging_owner_ranks.items():
-            if (replica, _request) == exclude_request:
-                continue
-            for stage, row in enumerate(rows):
-                for rank, value in enumerate(row):
-                    hbm[replica][stage][rank] += float(value)
+        self._accumulate_owner_map(
+            hbm, self.owner_ranks, self._cohort_owner_ranks, exclude_request=exclude_request,
+        )
+        self._accumulate_owner_map(
+            hbm, self.staging_owner_ranks, self._cohort_staging_ranks, exclude_request=exclude_request,
+        )
         if request_usage is not None:
             for replica, stages in enumerate(request_usage):
                 for stage, row in enumerate(stages):
@@ -1029,7 +1215,7 @@ class _MemoryLedgerMixin:
 
     def _resolve_vision_delta_by_stage(self, vision_accounting: str) -> tuple[list[int], list[int]]:
         """Return ``(vision_bytes_by_stage, weight_delta_by_stage)`` for vision scope."""
-        from mindie_sim.catalog.types import QuantSpec
+        from mindie_sim.catalog.draft_weights import require_model_quant
         from mindie_sim.catalog.weight_terms import term_bytes
         from mindie_sim.catalog.weights import vision_weight_terms
 
@@ -1038,7 +1224,7 @@ class _MemoryLedgerMixin:
         if vision_accounting not in VISION_ACCOUNTING_SCOPES:
             raise ValueError(f"vision_accounting_invalid:{vision_accounting!r}")
         model = self.case.model
-        quant = model.quant or QuantSpec("bf16")
+        quant = require_model_quant(model)
         vision_all = int(round(sum(
             term_bytes(term, quant, p, self.case.machine.ranks_per_node)
             for term in vision_weight_terms(model, include_vision=True)
@@ -1057,26 +1243,37 @@ class _MemoryLedgerMixin:
 
     def _stage_checkpoint_vs_prepared_split(self, stage: int) -> tuple[int, int]:
         """Split ``self.weights[stage]`` into source checkpoint vs runtime-only prepared bytes."""
-        from mindie_sim.catalog.types import QuantSpec
+        from mindie_sim.catalog.draft_weights import require_model_quant
         from mindie_sim.catalog.weight_terms import term_bytes
         from mindie_sim.catalog.weights import _expand_resident_terms, stage_weight_terms
 
         model = self.case.model
         p = self.case.runtime.parallel
-        quant = model.quant or QuantSpec("bf16")
+        quant = require_model_quant(model)
         include_vision = self.vision_accounting == "full_checkpoint"
         all_stage_terms = stage_weight_terms(
-            model, p, include_draft=bool(self.draft_kind),
+            model, p,
+            include_draft=bool(self.draft_kind),
             draft_kind=self.draft_kind or None,
             include_engram_tables=not self.case.runtime.engram_cpu_offload,
-            include_vision=include_vision, layer_partition=self.layers,
+            include_vision=include_vision,
+            layer_partition=self.layers,
             slot_plans=self.slot_plans,
         )
+        shared_dp = bool(getattr(self, "enable_shared_expert_dp", False))
+        pcp_o_proj = bool(getattr(self, "enable_pcp_o_proj_weight_sharding", False))
+        dcp_q_rep = bool(getattr(self, "dcp_q_replicate", False))
         runtime_only = 0.0
         for term in all_stage_terms[stage]:
             if term.source_owned:
                 continue
-            for t_sub, placed in _expand_resident_terms(term, p, False, model=model):
+            expanded = _expand_resident_terms(
+                term, p, shared_dp,
+                pcp_o_proj_weight_sharding=pcp_o_proj,
+                dcp_q_replicate=dcp_q_rep,
+                model=model,
+            )
+            for t_sub, placed in expanded:
                 runtime_only += term_bytes(t_sub, quant, placed, self.case.machine.ranks_per_node)
         prep_b = int(round(runtime_only))
         ckpt_b = max(0, int(round(self.weights[stage])) - prep_b)
@@ -1088,53 +1285,254 @@ class _MemoryLedgerMixin:
         *,
         query_tokens: int | None = None,
     ) -> list[float]:
-        """Per-stage per-request unified hybrid-pool stride alignment reserve."""
+        """Per-stage per-request unified hybrid-pool stride alignment reserve (all 4 regimes)."""
         p = self.case.runtime.parallel
-        zeros = [0.0] * p.pp
         seq = int(sequence_tokens)
         if seq <= 0:
-            return zeros
-        from mindie_sim.catalog.qwen4_exp import qwen4_exp_pool_breakdown
+            return [0.0] * p.pp
+        receipt = self._hybrid_pool_receipt(seq, num_requests=1, query_tokens=query_tokens)
+        if receipt is None:
+            return [0.0] * p.pp
+        return [float(v) for v in receipt.stride_reserve_by_stage]
 
-        q_tok = self._effective_cache_query_tokens(query_tokens)
-        cp = max(1, int(getattr(p, "cp", 1) or 1))
-        eff_seq = (seq + cp - 1) // cp if cp > 1 else seq
-        qwen4_pool = qwen4_exp_pool_breakdown(
-            self.case.model, p, eff_seq,
-            runtime=self.case.runtime, query_tokens=q_tok,
+    def _projected_die_cache_pools(
+        self,
+        sequence_tokens: int,
+        batch_per_dp: int,
+        query_tokens: int | None,
+        *,
+        rank: int | None = None,
+        phase: str = "decode",
+    ) -> tuple[list[dict[str, Any]], Any]:
+        """Exact per-stage integer cache pools and component breakdowns for one physical rank."""
+        from .cache import _COMPONENT_POOL_MAP
+
+        p = self.case.runtime.parallel
+        seq = int(sequence_tokens)
+        b_int = int(batch_per_dp)
+        is_prefill = str(phase or "decode").strip().lower() == "prefill"
+        q_tok = 1 if is_prefill else self._effective_cache_query_tokens(query_tokens)
+        hybrid_b = self._hybrid_pool_receipt(seq, num_requests=b_int, query_tokens=q_tok, phase=phase)
+        hybrid_1 = (
+            self._hybrid_pool_receipt(seq, num_requests=1, query_tokens=q_tok, phase=phase)
+            if hybrid_b is not None else None
         )
-        if not qwen4_pool:
-            return zeros
+        eff_block = hybrid_b.contract.normalized_block_size if hybrid_b is not None else None
         alloc_stages = self._cache_component_breakdown(
-            seq, padded=True, skip_covered=True, query_tokens=q_tok,
+            seq, padded=True, skip_covered=True, rank=rank, query_tokens=q_tok,
+            block_size_override=eff_block, phase=phase,
         )
-        target_base = 0.0
-        for st in range(p.pp):
-            for name, detail in alloc_stages[st]["components"].items():
-                if not name.startswith("draft_"):
-                    target_base += float(detail.get("total", 0.0) or 0.0)
-        if self.pages.groups:
-            group_payload = self.pages.stage_bytes(seq, self.case.runtime.max_model_len, p.pp)
-            group_parts = self._group_cache_parts(seq, query_tokens=q_tok)
-            for st in range(p.pp):
-                target_base += max(
-                    float(group_payload[st]),
-                    float(group_parts[st]["alloc_payload"]) + float(group_parts[st]["alloc_scale"]),
+        valid_stages = self._cache_component_breakdown(
+            seq, padded=False, skip_covered=True, rank=rank, query_tokens=q_tok,
+            block_size_override=eff_block, phase=phase,
+        )
+        group_parts = (
+            self._group_cache_parts(seq, rank=rank, query_tokens=q_tok)
+            if self.pages.groups else None
+        )
+        group_payload = (
+            self.pages.stage_bytes(seq, self.case.runtime.max_model_len, p.pp)
+            if self.pages.groups else None
+        )
+        group_metadata = (
+            self.pages.metadata_stage_bytes(seq, self.case.runtime.max_model_len, p.pp)
+            if self.pages.groups else None
+        )
+        cohort_alloc_parts = self._dp_cohort_extra_parts_by_stage(
+            seq, padded=True, rank=rank, query_tokens=q_tok, phase=phase,
+        )
+        cohort_valid_parts = self._dp_cohort_extra_parts_by_stage(
+            seq, padded=False, rank=rank, query_tokens=q_tok, phase=phase,
+        )
+        rank_base_per_req = (
+            None if hybrid_b is not None
+            else self._rank_dp_cohort_cache_bytes(
+                seq, padded=True, rank=rank, query_tokens=q_tok, phase=phase,
+            )
+        )
+        c8_static_stages = tuple(getattr(self, "c8_static_channel_scale_by_stage", (0,) * p.pp))
+        hbm_ratio = float(self.kvc_hbm_ratio)
+        if hbm_ratio < 1.0:
+            layer_max = (
+                self._rank_max_layer_cache_bytes(seq, int(rank), query_tokens=q_tok)
+                if rank is not None else self._max_layer_cache_bytes(seq, query_tokens=q_tok)
+            )
+            proj_staging_stages = tuple(
+                int(round(float(layer_max[st]) * (1.0 - hbm_ratio) * b_int))
+                for st in range(p.pp)
+            )
+        else:
+            proj_staging_stages = (0,) * p.pp
+
+        per_stage: list[dict[str, Any]] = []
+        for stage in range(p.pp):
+            entry = self._assemble_stage_die_cache_pool(
+                stage=stage,
+                b_int=b_int,
+                alloc_stage=alloc_stages[stage],
+                valid_stage=valid_stages[stage],
+                group_part=group_parts[stage] if group_parts is not None else None,
+                group_payload_b=float(group_payload[stage]) if group_payload is not None else 0.0,
+                group_meta_b=float(group_metadata[stage]) if group_metadata is not None else 0.0,
+                cohort_alloc=cohort_alloc_parts[stage],
+                cohort_valid=cohort_valid_parts[stage],
+                hybrid_b=hybrid_b,
+                hybrid_1=hybrid_1,
+                rank_base_per_req_b=float(rank_base_per_req[stage]) if rank_base_per_req is not None else 0.0,
+                c8_static_b=int(c8_static_stages[stage]) if stage < len(c8_static_stages) else 0,
+                hbm_ratio=hbm_ratio,
+                proj_staging_b=int(proj_staging_stages[stage]),
+                pool_map=_COMPONENT_POOL_MAP,
+            )
+            per_stage.append(entry)
+        return per_stage, hybrid_b
+
+    def _assemble_stage_die_cache_pool(
+        self,
+        *,
+        stage: int,
+        b_int: int,
+        alloc_stage: dict[str, Any],
+        valid_stage: dict[str, Any],
+        group_part: dict[str, Any] | None,
+        group_payload_b: float,
+        group_meta_b: float,
+        cohort_alloc: dict[str, float],
+        cohort_valid: dict[str, float],
+        hybrid_b: Any,
+        hybrid_1: Any,
+        rank_base_per_req_b: float,
+        c8_static_b: int,
+        hbm_ratio: float,
+        proj_staging_b: int,
+        pool_map: dict[str, str],
+    ) -> dict[str, Any]:
+        """Conserve exact integer per-stage cache pools and component breakdowns."""
+        alloc_pools = {
+            "target_kv_bytes": 0.0, "indexer_k_bytes": 0.0,
+            "recurrent_state_bytes": 0.0, "draft_kv_bytes": 0.0,
+            "draft_state_bytes": 0.0,
+        }
+        valid_pools = {"target_kv_bytes": 0.0, "indexer_k_bytes": 0.0}
+        comp_per_req: dict[str, float] = {}
+        comp_batch: dict[str, int] = {}
+
+        for name, detail in alloc_stage["components"].items():
+            val = float(detail["total"])
+            if val <= 0.0:
+                continue
+            comp_per_req[name] = comp_per_req.get(name, 0.0) + val
+            key = pool_map.get(name)
+            if key in alloc_pools:
+                alloc_pools[key] += val
+        for name, detail in valid_stage["components"].items():
+            key = pool_map.get(name)
+            if key in valid_pools:
+                valid_pools[key] += float(detail["total"])
+
+        group_reserve_per_req = 0.0
+        if group_part is not None:
+            known_group = 0.0
+            for name, detail in group_part["components"].items():
+                part_alloc = float(detail["alloc_payload"]) + float(detail["alloc_scale"])
+                part_valid = float(detail["valid_payload"]) + float(detail["valid_scale"])
+                if part_alloc > 0.0:
+                    comp_per_req[name] = comp_per_req.get(name, 0.0) + part_alloc
+                key = pool_map.get(name)
+                if key in alloc_pools:
+                    alloc_pools[key] += part_alloc
+                    known_group += part_alloc
+                if key in valid_pools:
+                    valid_pools[key] += part_valid
+            group_reserve_per_req = max(0.0, group_payload_b - known_group)
+            if group_reserve_per_req > 0.0:
+                comp_per_req["page_group_reserve"] = (
+                    comp_per_req.get("page_group_reserve", 0.0) + group_reserve_per_req
                 )
-        stride_reserve = max(0.0, float(qwen4_pool["total_pool_bytes"]) - target_base)
-        if stride_reserve <= 0.0:
-            return zeros
-        qsa_per_stage = [0] * p.pp
-        for lp in self.case.model.layer_plans:
-            if lp.attention == "gqa" and lp.indexer:
-                st = self.layer_stage[lp.index]
-                if 0 <= st < p.pp:
-                    qsa_per_stage[st] += 1
-        total_qsa = sum(qsa_per_stage)
-        if total_qsa <= 0:
-            zeros[0] = stride_reserve
-            return zeros
-        return [stride_reserve * (float(cnt) / float(total_qsa)) for cnt in qsa_per_stage]
+            if group_meta_b > 0.0:
+                comp_per_req["page_metadata"] = (
+                    comp_per_req.get("page_metadata", 0.0) + group_meta_b
+                )
+
+        cohort_alloc_kv = float(cohort_alloc.get("kv", 0.0))
+        cohort_alloc_idx = float(cohort_alloc.get("index", 0.0))
+        cohort_alloc_drf = float(cohort_alloc.get("draft", 0.0))
+        if cohort_alloc_kv > 0.0:
+            comp_per_req["dcp_dp_cohort_kv"] = comp_per_req.get("dcp_dp_cohort_kv", 0.0) + cohort_alloc_kv
+            alloc_pools["target_kv_bytes"] += cohort_alloc_kv
+        if cohort_alloc_idx > 0.0:
+            comp_per_req["dcp_dp_cohort_index"] = comp_per_req.get("dcp_dp_cohort_index", 0.0) + cohort_alloc_idx
+            alloc_pools["indexer_k_bytes"] += cohort_alloc_idx
+        if cohort_alloc_drf > 0.0:
+            comp_per_req["dcp_dp_cohort_draft"] = comp_per_req.get("dcp_dp_cohort_draft", 0.0) + cohort_alloc_drf
+            alloc_pools["draft_kv_bytes"] += cohort_alloc_drf
+        valid_pools["target_kv_bytes"] += float(cohort_valid.get("kv", 0.0))
+        valid_pools["indexer_k_bytes"] += float(cohort_valid.get("index", 0.0))
+
+        for name, val in list(comp_per_req.items()):
+            scaled = val * hbm_ratio
+            comp_per_req[name] = scaled
+            comp_batch[name] = int(round(b_int * scaled))
+
+        if hybrid_b is not None:
+            stride_res_b = int(round(int(hybrid_b.stride_reserve_by_stage[stage]) * hbm_ratio))
+            stride_res_1 = (
+                float(hybrid_1.stride_reserve_by_stage[stage]) * hbm_ratio
+                if hybrid_1 is not None else 0.0
+            )
+            if stride_res_b > 0:
+                comp_batch["page_group_reserve"] = comp_batch.get("page_group_reserve", 0) + stride_res_b
+            if stride_res_1 > 0.0:
+                comp_per_req["page_group_reserve"] = comp_per_req.get("page_group_reserve", 0.0) + stride_res_1
+            outside_subsumed = (
+                int(hybrid_b.total_pool_bytes_by_stage[stage])
+                + int(hybrid_b.outside_replay_bytes_by_stage[stage])
+            )
+            sub_draft_kv = bool(hybrid_b.contract.subsumed_draft_kv)
+            expected_non_c8 = int(round(outside_subsumed * hbm_ratio))
+            if not sub_draft_kv:
+                expected_non_c8 += comp_batch.get("draft_kv", 0)
+            expected_non_c8 += comp_batch.get("draft_state", 0)
+            expected_total = expected_non_c8 + c8_static_b
+            page_reserve_total = stride_res_b
+        else:
+            page_reserve_total = int(round(b_int * group_reserve_per_req * hbm_ratio))
+            expected_total = int(round(b_int * rank_base_per_req_b * hbm_ratio)) + c8_static_b
+
+        if c8_static_b > 0:
+            comp_batch["c8_static_channel_scale"] = c8_static_b
+            comp_per_req.setdefault("c8_static_channel_scale", 0.0)
+
+        idx_a = sum(comp_batch.get(c, 0) for c, k in pool_map.items() if k == "indexer_k_bytes")
+        rec_a = sum(comp_batch.get(c, 0) for c, k in pool_map.items() if k == "recurrent_state_bytes")
+        drf_a = comp_batch.get("draft_kv", 0) + comp_batch.get("draft_state", 0) + comp_batch.get("dcp_dp_cohort_draft", 0)
+        non_kv = idx_a + rec_a + drf_a
+        residual = expected_total - sum(comp_batch.values())
+        if residual != 0:
+            if hybrid_b is not None or group_part is not None:
+                comp_batch["page_group_reserve"] = max(0, comp_batch.get("page_group_reserve", 0) + residual)
+            else:
+                target_key = next((c for c in ("mla_kv", "gqa_kv", "window", "compressed_kv") if c in comp_batch), "page_group_reserve")
+                comp_batch[target_key] = max(0, comp_batch.get(target_key, 0) + residual)
+        kv_a = (
+            expected_total - non_kv
+            if expected_total >= non_kv
+            else int(round(b_int * alloc_pools["target_kv_bytes"] * hbm_ratio)) + c8_static_b
+        )
+        return {
+            "kv_alloc": kv_a,
+            "kv_valid": int(round(b_int * valid_pools["target_kv_bytes"] * hbm_ratio)) + c8_static_b,
+            "idx_alloc": idx_a,
+            "idx_valid": int(round(b_int * valid_pools["indexer_k_bytes"] * hbm_ratio)),
+            "rec": rec_a,
+            "draft": drf_a,
+            "page_group_reserve": page_reserve_total,
+            "proj_staging": int(proj_staging_b),
+            "components_batch": {k: v for k, v in comp_batch.items() if v > 0},
+            "components_per_req": {
+                k: v for k, v in comp_per_req.items() if v > 0.0 or k == "c8_static_channel_scale"
+            },
+        }
 
     def _projected_stage_cache_pools(
         self,
@@ -1145,84 +1543,21 @@ class _MemoryLedgerMixin:
         """Per-stage projected KV/Index/State/Draft bytes for ``batch_per_dp`` requests."""
         if sequence_tokens is None or int(batch_per_dp) <= 0:
             return None
-        from .cache import _COMPONENT_POOL_MAP
-
-        p = self.case.runtime.parallel
-        b_int = int(batch_per_dp)
-        alloc_stages = self._cache_component_breakdown(
-            int(sequence_tokens), padded=True, skip_covered=True, query_tokens=query_tokens,
+        stages, _ = self._projected_die_cache_pools(
+            int(sequence_tokens), int(batch_per_dp), query_tokens, rank=None,
         )
-        valid_stages = self._cache_component_breakdown(
-            int(sequence_tokens), padded=False, skip_covered=True, query_tokens=query_tokens,
-        )
-        group_parts = (
-            self._group_cache_parts(int(sequence_tokens), query_tokens=query_tokens)
-            if self.pages.groups else None
-        )
-        group_payload = (
-            self.pages.stage_bytes(int(sequence_tokens), self.case.runtime.max_model_len, p.pp)
-            if self.pages.groups else None
-        )
-        group_metadata = (
-            self.pages.metadata_stage_bytes(int(sequence_tokens), self.case.runtime.max_model_len, p.pp)
-            if self.pages.groups else None
-        )
-        stage_cache_bytes = self.cache_bytes(
-            int(sequence_tokens), padded=True, query_tokens=query_tokens,
-        )
-        stride_reserves = self._unified_pool_stride_reserve_by_stage(
-            int(sequence_tokens), query_tokens=query_tokens,
-        )
-        per_stage: list[dict[str, int]] = []
-        for stage in range(p.pp):
-            alloc_pools = {"target_kv_bytes": 0.0, "indexer_k_bytes": 0.0,
-                           "recurrent_state_bytes": 0.0, "draft_kv_bytes": 0.0,
-                           "draft_state_bytes": 0.0}
-            valid_pools = {"target_kv_bytes": 0.0, "indexer_k_bytes": 0.0}
-            for name, detail in alloc_stages[stage]["components"].items():
-                key = _COMPONENT_POOL_MAP.get(name)
-                if key in alloc_pools:
-                    alloc_pools[key] += float(detail["total"])
-            for name, detail in valid_stages[stage]["components"].items():
-                key = _COMPONENT_POOL_MAP.get(name)
-                if key in valid_pools:
-                    valid_pools[key] += float(detail["total"])
-            group_reserve = 0.0
-            if group_parts is not None and group_payload is not None and group_metadata is not None:
-                known_group = 0.0
-                for name, detail in group_parts[stage]["components"].items():
-                    key = _COMPONENT_POOL_MAP.get(name)
-                    part_alloc = float(detail["alloc_payload"]) + float(detail["alloc_scale"])
-                    if key in alloc_pools:
-                        alloc_pools[key] += part_alloc
-                        known_group += part_alloc
-                    if key in valid_pools:
-                        valid_pools[key] += float(detail["valid_payload"]) + float(detail["valid_scale"])
-                group_reserve = max(0.0, float(group_payload[stage]) - known_group)
-                alloc_pools["target_kv_bytes"] += group_reserve + float(group_metadata[stage])
-            stride_reserve = float(stride_reserves[stage]) if stage < len(stride_reserves) else 0.0
-            if stride_reserve > 0.0:
-                alloc_pools["target_kv_bytes"] += stride_reserve
-            idx_a = int(round(b_int * alloc_pools["indexer_k_bytes"]))
-            rec_a = int(round(b_int * alloc_pools["recurrent_state_bytes"]))
-            drf_a = int(round(b_int * (alloc_pools["draft_kv_bytes"] + alloc_pools["draft_state_bytes"])))
-            expected_total = int(round(b_int * (float(stage_cache_bytes[stage]) + stride_reserve)))
-            non_kv = idx_a + rec_a + drf_a
-            kv_a = (
-                expected_total - non_kv
-                if expected_total >= non_kv
-                else int(round(b_int * alloc_pools["target_kv_bytes"]))
-            )
-            per_stage.append({
-                "kv_alloc": kv_a,
-                "kv_valid": int(round(b_int * valid_pools["target_kv_bytes"])),
-                "idx_alloc": idx_a,
-                "idx_valid": int(round(b_int * valid_pools["indexer_k_bytes"])),
-                "rec": rec_a,
-                "draft": drf_a,
-                "page_group_reserve": int(round(b_int * (group_reserve + stride_reserve))),
-            })
-        return per_stage
+        return [
+            {
+                "kv_alloc": int(st["kv_alloc"]),
+                "kv_valid": int(st["kv_valid"]),
+                "idx_alloc": int(st["idx_alloc"]),
+                "idx_valid": int(st["idx_valid"]),
+                "rec": int(st["rec"]),
+                "draft": int(st["draft"]),
+                "page_group_reserve": int(st["page_group_reserve"]),
+            }
+            for st in stages
+        ]
 
     def _build_die_receipt(
         self,
@@ -1248,9 +1583,11 @@ class _MemoryLedgerMixin:
         usable = int(math.floor(die_obj.hbm_bytes * self.case.runtime.gpu_memory_utilization))
         ws_b = int(round(self.workspace[stage] + self.temporary_dequant[stage]))
         res_b = int(round(self.policy.reserved))
+        c8_stages = tuple(getattr(self, "c8_static_channel_scale_by_stage", ()))
+        c8_static_b = int(c8_stages[stage]) if stage < len(c8_stages) else 0
         dyn_grant_only = max(0, dyn_live_b - req_b - stg_b)
-        kv_a = projected["kv_alloc"] if projected is not None else req_b
-        kv_v = projected["kv_valid"] if projected is not None else req_b
+        kv_a = projected["kv_alloc"] if projected is not None else (req_b + c8_static_b)
+        kv_v = projected["kv_valid"] if projected is not None else (req_b + c8_static_b)
         idx_a = projected["idx_alloc"] if projected is not None else 0
         idx_v = projected["idx_valid"] if projected is not None else 0
         rec_b = projected["rec"] if projected is not None else 0
@@ -1259,6 +1596,7 @@ class _MemoryLedgerMixin:
         ckpt_gid = f"r{replica}:s{stage}:k{rank}:checkpoint_weights"
         vis_gid = f"r{replica}:s{stage}:k{rank}:vision_weights"
         term_gid = f"r{replica}:s{stage}:k{rank}:prepared_terms"
+        c8_gid = f"r{replica}:s{stage}:k{rank}:c8_static_channel_scale"
         raw_entries: list[ResidentGrantEntry] = [
             ResidentGrantEntry(
                 grant_id=ckpt_gid, category="checkpoint_weights",
@@ -1278,10 +1616,16 @@ class _MemoryLedgerMixin:
                 physical_backing_id=term_gid, checkpoint_bytes=0,
                 runtime_bytes=term_prep_b, allocated_bytes=term_prep_b, valid_bytes=term_prep_b,
             ))
+        if c8_static_b > 0:
+            raw_entries.append(ResidentGrantEntry(
+                grant_id=c8_gid, category="c8_static_channel_scale",
+                physical_backing_id=c8_gid, checkpoint_bytes=c8_static_b,
+                runtime_bytes=c8_static_b, allocated_bytes=c8_static_b, valid_bytes=c8_static_b,
+            ))
         raw_entries.extend(stage_prep_grants)
         raw_entries.extend(extra_grants)
         dedup_grants, _ = _deduplicate_grant_entries(raw_entries)
-        base_gids = {ckpt_gid, vis_gid, term_gid}
+        base_gids = {ckpt_gid, vis_gid, term_gid, c8_gid}
         extra_only_billed = sum(
             g.billed_once_bytes for g in dedup_grants
             if g.grant_id not in base_gids and not g.grant_id.startswith("prepared:")
@@ -1289,10 +1633,12 @@ class _MemoryLedgerMixin:
         prep_total = term_prep_b + prep_persist_b
         fixed_total = ckpt_b + vision_b + prep_total + ws_b + res_b
         if projected is not None:
-            live_dyn = kv_a + idx_a + rec_b + drf_b + dyn_grant_only + stg_b + extra_only_billed
+            eff_stg_b = int(projected.get("proj_staging", 0)) if self.kvc_hbm_ratio < 1.0 else stg_b
+            live_dyn = kv_a + idx_a + rec_b + drf_b + dyn_grant_only + eff_stg_b + extra_only_billed
         else:
-            live_dyn = dyn_live_b + extra_only_billed
-        peak_dyn = max(live_dyn, dyn_peak_b + extra_only_billed)
+            eff_stg_b = stg_b
+            live_dyn = dyn_live_b + c8_static_b + extra_only_billed
+        peak_dyn = max(live_dyn, dyn_peak_b + c8_static_b + extra_only_billed)
         sim_live = fixed_total + live_dyn
         sim_peak = fixed_total + peak_dyn
         return DieResidentReceipt(
@@ -1313,7 +1659,7 @@ class _MemoryLedgerMixin:
             draft_cache_bytes=drf_b,
             workspace_bytes=ws_b,
             reserve_bytes=res_b,
-            staging_bytes=stg_b,
+            staging_bytes=eff_stg_b,
             dynamic_grant_bytes=dyn_grant_only + extra_only_billed,
             simultaneous_live_hbm_bytes=sim_live,
             simultaneous_peak_hbm_bytes=sim_peak,
@@ -1356,16 +1702,39 @@ class _MemoryLedgerMixin:
             ck, tp_b = self._stage_checkpoint_vs_prepared_split(st)
             ckpt_by_stage.append(max(0, ck + vision_delta[st] - vision_stage[st]))
             term_prep_by_stage.append(tp_b)
-        projected_stages = self._projected_stage_cache_pools(
-            sequence_tokens, batch_per_dp, query_tokens,
-        )
+        dp_width = max(1, int(getattr(p, "dcp_dp_width", 1) or 1))
+        spans_dp = bool(getattr(p, "cp_spans_dp", False)) and dp_width > 1 and self.rank_token_owners is None
+        projected_by_rank: list[list[dict[str, Any]]] | None = None
+        if sequence_tokens is not None and int(batch_per_dp) > 0:
+            rank_divergent = (
+                self.rank_token_owners is not None or int(getattr(p, "cp", 1) or 1) > 1
+            )
+            if rank_divergent:
+                cohort_ranks = dp_width * self.width if spans_dp else self.width
+                projected_by_rank = [
+                    self._projected_die_cache_pools(
+                        int(sequence_tokens), int(batch_per_dp), query_tokens,
+                        rank=rk, phase=str(phase),
+                    )[0]
+                    for rk in range(cohort_ranks)
+                ]
+            else:
+                uniform_stages, _ = self._projected_die_cache_pools(
+                    int(sequence_tokens), int(batch_per_dp), query_tokens,
+                    rank=None, phase=str(phase),
+                )
+                projected_by_rank = [uniform_stages for _ in range(self.width)]
         dies: list[DieResidentReceipt] = []
         for replica in range(p.dp):
             for stage in range(p.pp):
                 stage_dies = self._stage_dies(replica, stage)
-                projected = projected_stages[stage] if projected_stages is not None else None
                 host_b = int(round(host_live[replica] + self.engram_host_dram_bytes[stage]))
                 for rank in range(self.width):
+                    proj_rk = (replica % dp_width) * self.width + rank if spans_dp else rank
+                    projected = (
+                        projected_by_rank[proj_rk][stage]
+                        if projected_by_rank is not None else None
+                    )
                     dyn_live_b = int(round(hbm_live[replica][stage][rank]))
                     dyn_peak_b = max(dyn_live_b, int(round(self.peak_rank[replica][stage][rank])))
                     dies.append(self._build_die_receipt(
@@ -1385,6 +1754,145 @@ class _MemoryLedgerMixin:
             occurrence=str(occurrence),
             vision_accounting=vis_scope,
             dies=tuple(dies),
+        )
+
+    def _component_layer_counts_and_kinds(self) -> tuple[dict[str, tuple[int, ...]], dict[str, str]]:
+        """Derive per-stage active layer counts and structural kind labels per component."""
+        model = self.case.model
+        p = self.case.runtime.parallel
+        pp = max(1, int(p.pp))
+        counts: dict[str, list[int]] = {}
+        kinds: dict[str, str] = {}
+
+        def _bump(comp: str, st: int, kind: str) -> None:
+            row = counts.setdefault(comp, [0] * pp)
+            row[st] += 1
+            kinds.setdefault(comp, kind)
+
+        for plan in model.layer_plans:
+            st = self.layer_stage[plan.index] if plan.index < len(self.layer_stage) else pp - 1
+            if plan.attention == "mla" and plan.cache_kind == "dense":
+                _bump("mla_kv", st, "MLA Latent KV")
+            elif plan.attention in {"gqa", "projection_only"} and not (0 <= plan.kv_owner_layer_id < plan.index):
+                _bump("gqa_kv", st, "GQA K/V")
+            if int(plan.window or 0) > 0 and plan.attention == "mla":
+                _bump("window", st, "Sliding-Window KV")
+            if plan.owns_long_kv and plan.cache_kind == "window_compressed":
+                _bump("compressed_kv", st, "Compressed Long KV")
+            if plan.owns_index_k:
+                _bump("index_k", st, "Sparse Indexer K")
+                if int(plan.index_kpool or 0) > 0:
+                    _bump("index_pool_tail", st, "KeyPool Ring Tail")
+            if int(plan.compressor_state_rows or 0) > 0:
+                _bump("compressor_state", st, "C2 Compressor Ring")
+            if plan.attention in {"linear", "kda", "gdn"}:
+                _bump("recurrent_state", st, "Linear Recurrent SSM")
+                _bump("conv_state", st, "Causal Conv1D State")
+                _bump("replay_records", st, "RecoverSSM Replay Records")
+                _bump("state_transient", st, "RecoverSSM Transient")
+        engram = getattr(model, "engram", None)
+        if engram is not None and getattr(engram, "layer_ids", ()):
+            for lid in engram.layer_ids:
+                if 0 <= int(lid) < len(self.layer_stage):
+                    _bump("ple_conv_state", self.layer_stage[int(lid)], "PLE Conv1D State")
+        if self.draft_kind and model.auxiliary is not None:
+            from mindie_sim.catalog.draft import optional_draft_spec
+            draft = optional_draft_spec(model, self.draft_kind)
+            for _ in range(max(1, int(draft.layers))):
+                _bump("draft_kv", pp - 1, f"Draft KV ({draft.attention_kind.upper()})")
+                _bump("draft_state", pp - 1, "Draft Recurrent State")
+        c8_stages = tuple(getattr(self, "c8_static_channel_scale_by_stage", (0,) * pp))
+        for st, val in enumerate(c8_stages):
+            if val > 0:
+                gqa_cnt = counts.get("gqa_kv", [0] * pp)[st]
+                counts.setdefault("c8_static_channel_scale", [0] * pp)[st] = gqa_cnt
+                kinds.setdefault("c8_static_channel_scale", "GQA Static C8 Channel Scales (Fixed/Die)")
+        kinds.setdefault("page_group_reserve", "Hybrid Pool / Page-Group Reserve")
+        kinds.setdefault("page_metadata", "Page Table Metadata")
+        kinds.setdefault("dcp_dp_cohort_kv", "DCP DP-Cohort Shared KV")
+        kinds.setdefault("dcp_dp_cohort_index", "DCP DP-Cohort Shared Indexer K")
+        kinds.setdefault("dcp_dp_cohort_draft", "DCP DP-Cohort Shared Draft KV")
+        return {k: tuple(v) for k, v in counts.items()}, kinds
+
+    def cache_ledger_projection(
+        self,
+        *,
+        scenario: str = "",
+        phase: str = "decode",
+        occurrence: str = "steady",
+        sequence_tokens: int,
+        batch_per_dp: int,
+        query_tokens: int | None = None,
+        vision_accounting: str | None = None,
+        prepared_weights: Sequence[PreparedWeightSpec] = (),
+        extra_grants: Sequence[ResidentGrantEntry] = (),
+    ) -> CacheLedgerProjection:
+        """Build authoritative ``ResidentMemoryReceipt`` paired with exact per-component integers."""
+        from mindie_sim.catalog.cache import DEFAULT_CACHE_BLOCK_SIZE
+
+        p = self.case.runtime.parallel
+        seq = max(0, int(sequence_tokens))
+        b_int = max(0, int(batch_per_dp))
+        receipt = self.resident_memory_receipt(
+            scenario=scenario,
+            phase=phase,
+            occurrence=occurrence,
+            sequence_tokens=seq if b_int > 0 else None,
+            batch_per_dp=b_int,
+            query_tokens=query_tokens,
+            vision_accounting=vision_accounting,
+            prepared_weights=prepared_weights,
+            extra_grants=extra_grants,
+        )
+        rank_divergent = self.rank_token_owners is not None or int(getattr(p, "cp", 1) or 1) > 1
+        bottleneck_ranks: list[int] = []
+        stage_comp_batch: list[dict[str, int]] = []
+        stage_comp_per_req: list[dict[str, float]] = []
+        hybrid_receipt: Any = None
+        cached_uniform: list[dict[str, Any]] | None = None
+        for st in range(p.pp):
+            best_rk = max(
+                range(self.width),
+                key=lambda rk: receipt.die_receipt(0, st, rk).simultaneous_live_hbm_bytes,
+            )
+            bottleneck_ranks.append(best_rk)
+            if seq <= 0 or b_int <= 0:
+                c8_b = int(self.c8_static_channel_scale_by_stage[st])
+                stage_comp_batch.append({"c8_static_channel_scale": c8_b} if c8_b > 0 else {})
+                stage_comp_per_req.append({"c8_static_channel_scale": 0.0} if c8_b > 0 else {})
+                continue
+            if rank_divergent:
+                rank_stages, h_rec = self._projected_die_cache_pools(
+                    seq, b_int, query_tokens, rank=best_rk, phase=str(phase),
+                )
+                entry = rank_stages[st]
+                if hybrid_receipt is None and h_rec is not None:
+                    hybrid_receipt = h_rec
+            else:
+                if cached_uniform is None:
+                    cached_uniform, hybrid_receipt = self._projected_die_cache_pools(
+                        seq, b_int, query_tokens, rank=None, phase=str(phase),
+                    )
+                entry = cached_uniform[st]
+            stage_comp_batch.append(dict(entry["components_batch"]))
+            stage_comp_per_req.append(dict(entry["components_per_req"]))
+
+        layer_counts, kinds = self._component_layer_counts_and_kinds()
+        raw_block = max(1, int(getattr(self.case.runtime, "kv_block_size", 0) or DEFAULT_CACHE_BLOCK_SIZE))
+        norm_block = (
+            int(hybrid_receipt.contract.normalized_block_size)
+            if hybrid_receipt is not None else raw_block
+        )
+        return CacheLedgerProjection(
+            receipt=receipt,
+            bottleneck_rank_by_stage=tuple(bottleneck_ranks),
+            per_stage_component_batch_bytes=tuple(stage_comp_batch),
+            per_stage_component_per_req_bytes=tuple(stage_comp_per_req),
+            active_layers_by_component=layer_counts,
+            cache_kind_by_component=kinds,
+            fixed_per_die_components=frozenset({"c8_static_channel_scale"}),
+            normalized_block_size=norm_block,
+            hybrid_pool_receipt=hybrid_receipt,
         )
 
     def evaluate_space_time_tradeoff(

@@ -1,12 +1,14 @@
-"""Sheet 3 (``Memory_Quant_Calculator``) OOXML worksheet writer.
+"""Sheet 3 (``Memory_Quant_Calculator``) pure ``DieResidentReceipt`` worksheet writer.
 
-[Role] Render the closed-form per-die Weight/Quant/Cache/Engram-PLE/PP HBM
-  calculator with live ``VLOOKUP``/``ROUNDUP``/``SUMIFS`` formulas and strict
-  hardware-generation format isolation (A5 MXFP/FP8 vs A2/A3 W8A8/W4A8/C8).
-[Invariants] Editable format dropdowns, lookup tables, formulas, and captions
-  emit only formats supported on the target device architecture (plus any
-  explicitly active format on the ledger so ``VLOOKUP`` never returns ``#N/A``);
-  zero cross-generation format or QuaRot advice leaks.
+[Role] Render the 24-column Sheet 3 per-die Weight/Quant/Cache/Engram-PLE/PP HBM
+  calculator directly from ``MemoryCalculatorLedger`` (projected with 0 B
+  bijection from ``DieResidentReceipt`` and ``HybridPoolReceipt``).
+[Invariants] Strictly hardware-scoped via canonical ``normalize_hw_family`` (zero
+  SKU substring sniffing). Every cache-dtype switch formula uses exact per-dtype
+  bytes projected by canonical ``Memory`` (zero scalar precision-ratio scaling).
+  Fixed per-die static C8 channel scale rows never scale with concurrency
+  (``$T$18``). Zero ``PresetLinearFP8`` or ``"FP8"`` formula branches on A2/A3;
+  zero ``Uncalibrated`` labels.
 [Timeouts & Locks] Single-pass O(Weights + Cache + Stages) OOXML assembly.
 [Side-Effect Policy] Mutates only the caller-provided ``Worksheet``.
 """
@@ -15,11 +17,12 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Any
 
+from mindie_sim.catalog.npu_checkpoints import normalize_hw_family
+
 from .memory_ledger import (
-    _PREPARED_WEIGHT_GROUP,
-    C8_CACHE_WIDTH_BYTES,
-    FP8_CACHE_WIDTH_BYTES,
     KV_DTYPE_SENSITIVE_COMPONENTS,
+    _PREPARED_WEIGHT_GROUP,
+    _weight_format_storage_spec,
 )
 from .models import (
     BF16_BYTES,
@@ -31,7 +34,6 @@ from .models import (
     QUANT_RULE_FIXED_FP32,
     QUANT_RULE_PRESET_LINEAR_FP8,
     QUANT_RULE_PRESET_LINEAR_W8A8,
-    SUPPORTED_CACHE_DTYPES,
     SUPPORTED_WEIGHT_QUANTS,
     WEIGHT_QUANT_FORMATS,
     ExportBundle,
@@ -70,9 +72,6 @@ from .xlsx_summary import (
 
 #: Default Sheet 3 quant mode preserving every row's evaluated format and scale bytes.
 QUANT_MODE_AS_EVALUATED = "As evaluated"
-#: Cache bytes/elem factors matching closed-form memory ledger formulas.
-C8_CACHE_FACTOR = C8_CACHE_WIDTH_BYTES
-FP8_CACHE_FACTOR = FP8_CACHE_WIDTH_BYTES
 
 #: Sheet 3 structural layout constants (24 columns A..X).
 MEMORY_COLS = 24
@@ -95,17 +94,13 @@ MEMORY_LOOKUP_FIRST_ROW = 4
 MEMORY_TABLE_HEADER_ROW = 3
 MEMORY_FREEZE_ROWS = 3
 
-#: Hardware-scoped format sets (D6 cross-gen isolation).
+#: Hardware-scoped weight format sets (derived from canonical ``normalize_hw_family``).
 A5_WEIGHT_QUANTS = ("BF16", "FP8", "MXFP8", "MXFP4")
-A5_CACHE_DTYPES = ("BF16", "FP8")
 A5_LOOKUP_ORDER = ("BF16", "FP32", "FP8", "MXFP8", "MXFP4")
 A23_WEIGHT_QUANTS = ("BF16", "W8A8", "W4A8")
-A23_CACHE_DTYPES = ("BF16", "C8")
 A23_LOOKUP_ORDER = ("BF16", "FP32", "W8A8", "W4A8")
 GENERIC_LOOKUP_ORDER = ("BF16", "FP32", "FP8", "W8A8", "W4A8", "MXFP8", "MXFP4")
-
-_A5_SKU_TOKENS = ("950", "a5", "3510")
-_A23_SKU_TOKENS = ("910_93", "910c", "a3", "9392", "9382", "9372", "9362", "9391", "9381", "910b", "a2")
+_FIXED_PER_DIE_COMPONENTS = frozenset({"c8_static_channel_scale"})
 
 #: Control Panel absolute cell references in column T (20).
 MEM_CTL_QUANT_REF = "$T$3"
@@ -126,34 +121,44 @@ MEMORY_COL_WIDTHS = (
 def _device_format_scope(
     mem: MemoryCalculatorLedger,
 ) -> tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
-    """Return ``(arch_kind, weight_dropdown, cache_dropdown, lookup_order)`` scoped to SKU."""
-    low = str(mem.hardware_sku or "").strip().lower()
-    if any(tok in low for tok in _A5_SKU_TOKENS):
+    """Return ``(arch_kind, weight_dropdown, cache_dropdown, lookup_order)`` via canonical HW family."""
+    hw_family = normalize_hw_family(str(mem.hardware_sku or ""))
+    if hw_family == "a5":
         arch = "a5"
         w_opts = list(A5_WEIGHT_QUANTS)
-        c_opts = list(A5_CACHE_DTYPES)
         lookup = list(A5_LOOKUP_ORDER)
-    elif any(tok in low for tok in _A23_SKU_TOKENS):
+    elif hw_family in {"a2", "a3"}:
         arch = "a23"
         w_opts = list(A23_WEIGHT_QUANTS)
-        c_opts = list(A23_CACHE_DTYPES)
         lookup = list(A23_LOOKUP_ORDER)
     else:
         arch = "generic"
         w_opts = list(SUPPORTED_WEIGHT_QUANTS)
-        c_opts = list(SUPPORTED_CACHE_DTYPES)
         lookup = list(GENERIC_LOOKUP_ORDER)
 
-    # Preserve VLOOKUP completeness if any active ledger row explicitly uses another registered format.
-    active_fmts = {mem.weight_quant, *(r.quant_format for r in mem.weight_rows)}
-    for fmt in sorted(active_fmts):
-        if fmt in WEIGHT_QUANT_FORMATS and fmt not in lookup:
-            lookup.append(fmt)
-    if mem.weight_quant in WEIGHT_QUANT_FORMATS and mem.weight_quant not in w_opts:
-        w_opts.append(mem.weight_quant)
-    if mem.cache_dtype and mem.cache_dtype not in c_opts:
-        c_opts.append(mem.cache_dtype)
-    return arch, tuple(w_opts), tuple(c_opts), tuple(lookup)
+    # Preserve VLOOKUP completeness for every active format already present on the ledger.
+    active_fmts = [mem.weight_quant, *(row.quant_format for row in mem.weight_rows)]
+    for fmt in active_fmts:
+        up = str(fmt or "").strip().upper()
+        if up in WEIGHT_QUANT_FORMATS and up not in lookup:
+            lookup.append(up)
+        if up in WEIGHT_QUANT_FORMATS and up != "FP32" and up not in w_opts:
+            w_opts.append(up)
+
+    # Derive legal cache dtypes strictly from the exact Memory-resolved dtype matrix on cache_rows.
+    observed_cache_dtypes: list[str] = []
+    for row in mem.cache_rows:
+        for dt, _val in row.per_request_bytes_by_dtype:
+            up = str(dt or "").strip().upper()
+            if up and up not in observed_cache_dtypes:
+                observed_cache_dtypes.append(up)
+    active_cd = str(mem.cache_dtype or "BF16").strip().upper()
+    if active_cd and active_cd not in observed_cache_dtypes:
+        observed_cache_dtypes.append(active_cd)
+    ordered_cd = (["BF16"] if "BF16" in observed_cache_dtypes else []) + [
+        dt for dt in observed_cache_dtypes if dt != "BF16"
+    ]
+    return arch, tuple(w_opts), tuple(ordered_cd or [active_cd]), tuple(lookup)
 
 
 def _populate_memory_control_panel(
@@ -163,14 +168,15 @@ def _populate_memory_control_panel(
     c_opts: Sequence[str],
     lookup_order: Sequence[str],
 ) -> int:
+    """Populate interactive control panel (S:T) and hardware-scoped lookup table (U:X)."""
     c_lbl, c_val = MEMORY_CONTROL_COL_LABEL, MEMORY_CONTROL_COL_VALUE
-    ws.set_cell(2, c_lbl, "Parallel & Quant Control Panel", style=STYLE_SECTION)
+    ws.set_cell(2, c_lbl, "Control Panel (Editable What-If)", style=STYLE_SECTION)
     ws.merge_range(2, c_lbl, 2, c_val)
-    controls: tuple[tuple[str, Any, str | None, int], ...] = (
+    controls = (
         ("Weight Quant Preset", QUANT_MODE_AS_EVALUATED, None, STYLE_INPUT_TEXT),
-        ("KV/Indexer/KeyPool Dtype", mem.cache_dtype, None, STYLE_INPUT_TEXT),
+        ("KV Cache Dtype", mem.cache_dtype, None, STYLE_INPUT_TEXT),
         ("Engram / PLE Host Offload", "ON" if mem.engram_host_offload else "OFF", None, STYLE_INPUT_TEXT),
-        ("Apply Preset To Ignored Attn/Linear", "ON" if mem.apply_preset_to_ignored else "OFF", None, STYLE_INPUT_TEXT),
+        ("Override Checkpoint Ignore", "ON" if mem.apply_preset_to_ignored else "OFF", None, STYLE_INPUT_TEXT),
         ("Include Vision Tower (ViT)", "ON" if mem.include_vision_tower else "OFF", None, STYLE_INPUT_TEXT),
         ("DP", mem.dp, None, STYLE_INPUT_NUM),
         ("TP", mem.tp, None, STYLE_INPUT_NUM),
@@ -205,13 +211,19 @@ def _populate_memory_control_panel(
 
     ws.set_cell(2, MEMORY_LOOKUP_START_COL, "Quant Format Storage Rules", style=STYLE_SECTION)
     ws.merge_range(2, MEMORY_LOOKUP_START_COL, 2, MEMORY_COLS)
-    write_headers(ws, MEMORY_LOOKUP_HEADER_ROW, ("Format", "B/Elem", "MX Group", "Aux B/Row"), start_col=MEMORY_LOOKUP_START_COL)
+    write_headers(
+        ws, MEMORY_LOOKUP_HEADER_ROW,
+        ("Format", "B/Elem", "MX Group", "Aux B/Row"),
+        start_col=MEMORY_LOOKUP_START_COL,
+    )
     for idx, fmt in enumerate(lookup_order):
         r = MEMORY_LOOKUP_FIRST_ROW + idx
-        spec = WEIGHT_QUANT_FORMATS[fmt]
+        spec = _weight_format_storage_spec(fmt)
         write_row(ws, r, (
-            (fmt, None, STYLE_TEXT), (float(spec["bytes"]), None, STYLE_FLOAT2),
-            (int(spec["group"]), None, STYLE_INT), (int(spec["aux"]), None, STYLE_INT),
+            (fmt, None, STYLE_TEXT),
+            (float(spec["bytes"]), None, STYLE_FLOAT2),
+            (int(spec["group"]), None, STYLE_INT),
+            (int(spec["aux"]), None, STYLE_INT),
         ), start_col=MEMORY_LOOKUP_START_COL)
     return MEMORY_LOOKUP_FIRST_ROW + len(lookup_order) - 1
 
@@ -225,7 +237,10 @@ def _quant_format_formula(quant_rule: str, eval_fmt: str, arch: str) -> str | No
     elif arch == "a23":
         linear_expr = f'IF({MEM_CTL_QUANT_REF}="W4A8","W8A8",{MEM_CTL_QUANT_REF})'
     else:
-        linear_expr = f'IF({MEM_CTL_QUANT_REF}="W4A8","W8A8",IF({MEM_CTL_QUANT_REF}="MXFP4","MXFP8",{MEM_CTL_QUANT_REF}))'
+        linear_expr = (
+            f'IF({MEM_CTL_QUANT_REF}="W4A8","W8A8",'
+            f'IF({MEM_CTL_QUANT_REF}="MXFP4","MXFP8",{MEM_CTL_QUANT_REF}))'
+        )
     if quant_rule in {QUANT_RULE_PRESET_LINEAR_FP8, QUANT_RULE_PRESET_LINEAR_W8A8}:
         what_if_expr = linear_expr
     elif quant_rule == QUANT_RULE_CHECKPOINT_IGNORE:
@@ -235,55 +250,32 @@ def _quant_format_formula(quant_rule: str, eval_fmt: str, arch: str) -> str | No
     return f'=IF({MEM_CTL_QUANT_REF}="{QUANT_MODE_AS_EVALUATED}","{eval_fmt}",{what_if_expr})'
 
 
-def _cache_width_factor(dtype_name: str) -> float:
-    upper = str(dtype_name or "BF16").strip().upper()
-    if upper == "BF16":
-        return float(BF16_BYTES)
-    if upper == "FP8":
-        return FP8_CACHE_FACTOR
-    return C8_CACHE_FACTOR
-
-
-def _cache_rate_formula(row: Any, mem_cache_dtype: str, c_opts: Sequence[str], arch: str) -> str:
-    """Build hardware-scoped exact bytes/tok/layer formula matching ``ResidentMemoryReceipt``."""
-    rates_map = dict(getattr(row, "bytes_per_token_by_dtype", ()) or ())
-    scoped_opts = [opt for opt in c_opts if opt in rates_map]
-    if scoped_opts:
-        ordered = (["BF16"] if "BF16" in scoped_opts else []) + [o for o in scoped_opts if o != "BF16"]
-        if len(ordered) == 1:
-            return f"={rates_map[ordered[0]]!r}"
-        expr = f"{rates_map[ordered[-1]]!r}"
-        for opt in reversed(ordered[:-1]):
-            expr = f'IF({MEM_CTL_CACHE_REF}="{opt}",{rates_map[opt]!r},{expr})'
-        return f"={expr}"
-    base_width = _cache_width_factor(mem_cache_dtype)
-    if arch == "a23":
-        live_width = f'IF({MEM_CTL_CACHE_REF}="BF16",{BF16_BYTES},{C8_CACHE_FACTOR!r})'
-    elif arch == "a5":
-        live_width = f'IF({MEM_CTL_CACHE_REF}="BF16",{BF16_BYTES},{FP8_CACHE_FACTOR!r})'
-    else:
-        live_width = (
-            f'IF({MEM_CTL_CACHE_REF}="BF16",{BF16_BYTES},'
-            f'IF({MEM_CTL_CACHE_REF}="FP8",{FP8_CACHE_FACTOR!r},{C8_CACHE_FACTOR!r}))'
-        )
-    return f"={row.bytes_per_token_per_layer!r}*{live_width}/{base_width!r}"
-
-
-def _cache_fixed_req_mib_formula(row: Any, c_opts: Sequence[str]) -> str | None:
-    """Build hardware-scoped per-request MiB formula for KV-dtype-dependent page-group reserves."""
-    reqs_map = dict(getattr(row, "per_request_bytes_by_dtype", ()) or ())
-    scoped_opts = [opt for opt in c_opts if opt in reqs_map]
-    if len(scoped_opts) < 2:
+def _exact_dtype_switch_formula(
+    values_by_dtype: Sequence[tuple[str, float]],
+    c_opts: Sequence[str],
+    *,
+    divisor: float = 1.0,
+) -> str | None:
+    """Build exact ``IF($T$4=..., ...)`` formula strictly from Memory-projected per-dtype values."""
+    val_map = {str(k).strip().upper(): float(v) / float(divisor) for k, v in values_by_dtype}
+    scoped = [opt for opt in c_opts if opt in val_map]
+    if not scoped:
         return None
-    ordered = (["BF16"] if "BF16" in scoped_opts else []) + [o for o in scoped_opts if o != "BF16"]
-    expr = f"{reqs_map[ordered[-1]] / float(MIB_BYTES)!r}"
+    ordered = (["BF16"] if "BF16" in scoped else []) + [o for o in scoped if o != "BF16"]
+    if len(ordered) == 1:
+        return f"={val_map[ordered[0]]!r}"
+    # If all legal options share the exact same value, no branch needed.
+    first_val = val_map[ordered[0]]
+    if all(abs(val_map[o] - first_val) <= MIN_DENOM_EPS for o in ordered[1:]):
+        return None
+    expr = f"{val_map[ordered[-1]]!r}"
     for opt in reversed(ordered[:-1]):
-        expr = f'IF({MEM_CTL_CACHE_REF}="{opt}",{reqs_map[opt] / float(MIB_BYTES)!r},{expr})'
+        expr = f'IF({MEM_CTL_CACHE_REF}="{opt}",{val_map[opt]!r},{expr})'
     return f"={expr}"
 
 
 def _populate_cache_block(
-    ws: Worksheet, start_row: int, mem: MemoryCalculatorLedger, c_opts: Sequence[str], arch: str,
+    ws: Worksheet, start_row: int, mem: MemoryCalculatorLedger, c_opts: Sequence[str],
 ) -> int:
     ws.set_cell(start_row, 1, "2. KV / Indexer / KeyPool / Recurrent State Cache Breakdown", style=STYLE_SECTION)
     ws.merge_range(start_row, 1, start_row, MEMORY_TABLE_END_COL)
@@ -299,27 +291,47 @@ def _populate_cache_block(
     opts_txt = "/".join(c_opts)
     for offset, row in enumerate(mem.cache_rows):
         r = c_start + offset
+        is_fixed_die = row.component in _FIXED_PER_DIE_COMPONENTS
         kv_scaled = row.component in KV_DTYPE_SENSITIVE_COMPONENTS
-        if row.scales_with_tokens and row.max_stage_layers > 0 and row.bytes_per_token_per_layer > 0.0:
-            if kv_scaled:
-                rate_formula: str | None = _cache_rate_formula(row, mem.cache_dtype, c_opts, arch)
-                basis = f"Scales with Local Cache Tokens & KV Dtype ({opts_txt}, active={mem.cache_dtype})"
-            else:
-                rate_formula = None
-                basis = f"Scales with Local Cache Tokens (independent dtype: {row.cache_kind})"
-            req_formula: str | None = f"=C{r}*D{r}*{MEM_CTL_LOCAL_TOK_REF}/{MIB_BYTES}"
+        if is_fixed_die:
+            rate_formula: str | None = None
+            req_formula: str | None = None
+            batch_formula: str | None = _exact_dtype_switch_formula(
+                row.per_request_bytes_by_dtype, c_opts, divisor=float(GIB_BYTES),
+            )
+            basis = f"Fixed per-die checkpoint scale buffer (independent of concurrency; {opts_txt})"
+        elif row.scales_with_tokens and row.max_stage_layers > 0 and (
+            row.bytes_per_token_per_layer > 0.0
+            or any(v > 0.0 for _, v in row.bytes_per_token_by_dtype)
+        ):
+            rate_formula = (
+                _exact_dtype_switch_formula(row.bytes_per_token_by_dtype, c_opts)
+                if kv_scaled else None
+            )
+            req_formula = f"=C{r}*D{r}*{MEM_CTL_LOCAL_TOK_REF}/{MIB_BYTES}"
+            batch_formula = f"=E{r}*{MEM_CTL_CONC_REF}/{MIB_PER_GIB}"
+            basis = (
+                f"Scales with Local Cache Tokens & KV Dtype ({opts_txt}, active={mem.cache_dtype})"
+                if kv_scaled
+                else f"Scales with Local Cache Tokens (independent dtype: {row.cache_kind})"
+            )
         else:
             rate_formula = None
-            req_formula = _cache_fixed_req_mib_formula(row, c_opts)
+            req_formula = _exact_dtype_switch_formula(
+                row.per_request_bytes_by_dtype, c_opts, divisor=float(MIB_BYTES),
+            )
+            batch_formula = f"=E{r}*{MEM_CTL_CONC_REF}/{MIB_PER_GIB}"
             basis = (
-                f"Page-group reserve scaled with KV Dtype ({opts_txt}, active={mem.cache_dtype})"
+                f"Exact Memory-projected hybrid pool / reserve ({opts_txt}, active={mem.cache_dtype})"
                 if req_formula else "Fixed per-request state buffer (non-token-scaled)"
             )
         write_row(ws, r, (
-            (row.component, None, STYLE_TEXT), (row.cache_kind, None, STYLE_TEXT),
-            (row.max_stage_layers, None, STYLE_INT), (row.bytes_per_token_per_layer, rate_formula, STYLE_FLOAT2),
+            (row.component, None, STYLE_TEXT),
+            (row.cache_kind, None, STYLE_TEXT),
+            (row.max_stage_layers, None, STYLE_INT),
+            (row.bytes_per_token_per_layer, rate_formula, STYLE_FLOAT2),
             (row.per_request_bytes / float(MIB_BYTES), req_formula, STYLE_FLOAT3),
-            (row.batch_total_bytes / float(GIB_BYTES), f"=E{r}*{MEM_CTL_CONC_REF}/{MIB_PER_GIB}", STYLE_FLOAT3),
+            (row.batch_total_bytes / float(GIB_BYTES), batch_formula, STYLE_FLOAT3),
             (basis, None, STYLE_TEXT),
         ))
         ws.merge_range(r, MEMORY_CACHE_BASIS_START_COL, r, MEMORY_TABLE_END_COL)
@@ -329,16 +341,21 @@ def _populate_cache_block(
     ws.set_cell(c_tot, 1, "Cache Total (Max Stage)", style=STYLE_TOTAL_TEXT)
     ws.merge_range(c_tot, 1, c_tot, MEMORY_CACHE_MERGE_END_COL)
     ws.set_cell(
-        c_tot, MEMORY_CACHE_REQ_COL, sum(x.per_request_bytes for x in mem.cache_rows) / float(MIB_BYTES),
-        formula=f"=SUM(E{c_start}:E{c_end})" if c_end >= c_start else "=0", style=STYLE_TOTAL_NUM,
+        c_tot, MEMORY_CACHE_REQ_COL,
+        sum(x.per_request_bytes for x in mem.cache_rows) / float(MIB_BYTES),
+        formula=f"=SUM(E{c_start}:E{c_end})" if c_end >= c_start else "=0",
+        style=STYLE_TOTAL_NUM,
     )
     ws.set_cell(
-        c_tot, MEMORY_CACHE_BATCH_COL, sum(x.batch_total_bytes for x in mem.cache_rows) / float(GIB_BYTES),
-        formula=f"=SUM(F{c_start}:F{c_end})" if c_end >= c_start else "=0", style=STYLE_TOTAL_NUM,
+        c_tot, MEMORY_CACHE_BATCH_COL,
+        sum(x.batch_total_bytes for x in mem.cache_rows) / float(GIB_BYTES),
+        formula=f"=SUM(F{c_start}:F{c_end})" if c_end >= c_start else "=0",
+        style=STYLE_TOTAL_NUM,
     )
     ws.set_cell(
         c_tot, MEMORY_CACHE_BASIS_START_COL,
-        f"Local tokens={mem.local_cache_tokens}, Concurrency={mem.concurrency}", style=STYLE_TOTAL_TEXT,
+        f"Local tokens={mem.local_cache_tokens}, Concurrency={mem.concurrency}",
+        style=STYLE_TOTAL_TEXT,
     )
     ws.merge_range(c_tot, MEMORY_CACHE_BASIS_START_COL, c_tot, MEMORY_TABLE_END_COL)
     return c_tot
@@ -408,6 +425,55 @@ def _stage_weight_formulas(
     return payload_f, scale_f
 
 
+def _stage_cache_formula(
+    mem: MemoryCalculatorLedger, stage_idx: int, cache_tot_row: int,
+) -> str:
+    """Build live per-PP-stage cache formula referencing Sheet 3 cache rows (honors $T$4/$T$18/$T$21)."""
+    if mem.pp == 1 and cache_tot_row > 0:
+        return f"=F{cache_tot_row}"
+    if cache_tot_row > len(mem.cache_rows) and mem.cache_rows:
+        c_start = cache_tot_row - len(mem.cache_rows)
+        terms: list[str] = []
+        for idx, crow in enumerate(mem.cache_rows):
+            r = c_start + idx
+            is_fixed = crow.component in _FIXED_PER_DIE_COMPONENTS
+            st_val = float(crow.per_stage_bytes[stage_idx]) if stage_idx < len(crow.per_stage_bytes) else 0.0
+            if st_val <= MIN_DENOM_EPS:
+                continue
+            max_val = float(crow.batch_total_bytes) if is_fixed else float(crow.per_request_bytes)
+            if max_val > MIN_DENOM_EPS:
+                share = st_val / max_val
+                if abs(share - 1.0) <= MIN_DENOM_EPS:
+                    terms.append(f"F{r}")
+                else:
+                    terms.append(f"F{r}*{share!r}")
+            elif is_fixed:
+                terms.append(f"{st_val / float(GIB_BYTES)!r}")
+            elif crow.scales_with_tokens and mem.local_cache_tokens > 0:
+                terms.append(
+                    f"({st_val / float(GIB_BYTES)!r}*{MEM_CTL_CONC_REF}"
+                    f"*{MEM_CTL_LOCAL_TOK_REF}/{mem.local_cache_tokens})"
+                )
+            else:
+                terms.append(f"({st_val / float(GIB_BYTES)!r}*{MEM_CTL_CONC_REF})")
+        if terms:
+            return f"={'+'.join(terms)}"
+        return "=0"
+    per_req_bytes = 0.0
+    fixed_die_bytes = 0.0
+    for crow in mem.cache_rows:
+        st_val = float(crow.per_stage_bytes[stage_idx]) if stage_idx < len(crow.per_stage_bytes) else 0.0
+        if crow.component in _FIXED_PER_DIE_COMPONENTS:
+            fixed_die_bytes += st_val
+        else:
+            per_req_bytes += st_val
+    req_gib = per_req_bytes / float(GIB_BYTES)
+    fixed_gib = fixed_die_bytes / float(GIB_BYTES)
+    if fixed_gib > 0.0:
+        return f"={req_gib!r}*{MEM_CTL_CONC_REF}+{fixed_gib!r}"
+    return f"={req_gib!r}*{MEM_CTL_CONC_REF}"
+
+
 def _populate_stage_budget_block(
     ws: Worksheet, start_row: int, mem: MemoryCalculatorLedger, *,
     cache_tot_row: int = 0, weight_start_row: int = 0, lookup_ref: str = "",
@@ -423,37 +489,15 @@ def _populate_stage_budget_block(
     )
     write_headers(ws, hdr_row, headers)
 
-    sum_per_req = sum(x.per_request_bytes for x in mem.cache_rows)
     s_start = hdr_row + 1
     for offset, st in enumerate(mem.stage_budgets):
         r = s_start + offset
         raw_engram_gib = (st.engram_ple_hbm_bytes + st.engram_ple_host_bytes) / float(GIB_BYTES)
-        st_per_req = (
-            float(st.per_request_cache_bytes)
-            if float(st.per_request_cache_bytes) > 0.0
-            else (float(st.cache_bytes) / float(max(1, mem.concurrency)))
-        )
-        if cache_tot_row > 0 and sum_per_req > 0.0:
-            first = cache_tot_row - len(mem.cache_rows)
-            terms: list[str] = []
-            for i, crow in enumerate(mem.cache_rows, first):
-                if crow.per_request_bytes <= 0.0:
-                    continue
-                stage_vals = crow.per_stage_bytes
-                share = (
-                    float(stage_vals[st.stage]) / float(crow.per_request_bytes)
-                    if st.stage < len(stage_vals) else 1.0
-                )
-                if abs(share - 1.0) <= MIN_DENOM_EPS:
-                    terms.append(f"E{i}")
-                elif share > 0.0:
-                    terms.append(f"E{i}*{share!r}")
-            cache_f = f"=({'+'.join(terms) or '0'})*{MEM_CTL_CONC_REF}/{MIB_PER_GIB}"
-        else:
-            cache_f = f"={st_per_req / float(GIB_BYTES)!r}*{MEM_CTL_CONC_REF}"
+        cache_f = _stage_cache_formula(mem, st.stage, cache_tot_row)
         w_payload_f, w_scale_f = _stage_weight_formulas(mem, st.stage, weight_start_row, lookup_ref)
         write_row(ws, r, (
-            (f"Stage {st.stage}", None, STYLE_MERGED), (st.owned_layers, None, STYLE_INT),
+            (f"Stage {st.stage}", None, STYLE_MERGED),
+            (st.owned_layers, None, STYLE_INT),
             (st.weight_payload_bytes / float(GIB_BYTES), w_payload_f, STYLE_FLOAT3),
             (st.weight_scale_aux_bytes / float(GIB_BYTES), w_scale_f, STYLE_FLOAT3),
             (st.engram_ple_hbm_bytes / float(GIB_BYTES), f'=IF({MEM_CTL_OFFLOAD_REF}="ON",0,N{r})', STYLE_FLOAT3),
@@ -493,39 +537,52 @@ def _populate_stage_budget_block(
         is_headroom = col == MEMORY_STAGE_HEADROOM_COL
         agg = "MIN" if is_headroom else "MAX"
         val = (min(vals) if is_headroom else max(vals)) if vals else 0.0
-        ws.set_cell(max_row, col, val, formula=f"={agg}({c_let}{s_start}:{c_let}{s_end})" if s_end >= s_start else "=0", style=STYLE_TOTAL_NUM)
-    ws.set_cell(max_row, MEMORY_STAGE_STATUS_COL, "PASS" if mem.fits_hbm else "OOM", formula=f'=IF(J{max_row}<=K{max_row},"PASS","OOM")', style=STYLE_ALERT_OK if mem.fits_hbm else STYLE_ALERT_HIGH)
+        ws.set_cell(
+            max_row, col, val,
+            formula=f"={agg}({c_let}{s_start}:{c_let}{s_end})" if s_end >= s_start else "=0",
+            style=STYLE_TOTAL_NUM,
+        )
+    ws.set_cell(
+        max_row, MEMORY_STAGE_STATUS_COL,
+        "PASS" if mem.fits_hbm else "OOM",
+        formula=f'=IF(J{max_row}<=K{max_row},"PASS","OOM")',
+        style=STYLE_ALERT_OK if mem.fits_hbm else STYLE_ALERT_HIGH,
+    )
     raw_engram_vals = [(s.engram_ple_hbm_bytes + s.engram_ple_host_bytes) / GIB_BYTES for s in mem.stage_budgets]
-    ws.set_cell(max_row, MEMORY_STAGE_RAW_ENGRAM_COL, max(raw_engram_vals, default=0.0), formula=f"=MAX(N{s_start}:N{s_end})" if s_end >= s_start else "=0", style=STYLE_TOTAL_NUM)
+    ws.set_cell(
+        max_row, MEMORY_STAGE_RAW_ENGRAM_COL,
+        max(raw_engram_vals, default=0.0),
+        formula=f"=MAX(N{s_start}:N{s_end})" if s_end >= s_start else "=0",
+        style=STYLE_TOTAL_NUM,
+    )
     return max_row
 
 
-def populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
-    """Populate Sheet 3 (``Memory_Quant_Calculator``) with arch-scoped formats."""
-    mem = bundle.memory_ledger
-    arch, w_opts, c_opts, lookup_order = _device_format_scope(mem)
-    apply_col_widths(ws, MEMORY_COL_WIDTHS)
-    ws.freeze_panes(MEMORY_FREEZE_ROWS, 2)
-    write_banner(
-        ws, 1, MEMORY_COLS,
-        f"Closed-Form Memory / Quant / Cache / Engram-PLE / PP HBM Calculator | {mem.model_name} @ {mem.hardware_sku} | {mem.weight_quant_display or mem.weight_quant}",
-        STYLE_TITLE,
+def _populate_weight_block(
+    ws: Worksheet,
+    mem: MemoryCalculatorLedger,
+    arch: str,
+    w_opts: Sequence[str],
+    lookup_ref: str,
+) -> tuple[int, int]:
+    """Render Section 1 per-die Weight + Quant Scale table; return ``(w_start, w_tot_vit)``."""
+    ws.set_cell(
+        2, 1,
+        f"1. Per-Die Weight + Quant Scale Closed-Form Table (Side-by-Side 原生 BF16 vs 量化后; Supported: {'/'.join(w_opts)})",
+        style=STYLE_SECTION,
     )
-    lookup_last = _populate_memory_control_panel(ws, mem, w_opts, c_opts, lookup_order)
-    ws.set_cell(2, 1, f"1. Per-Die Weight + Quant Scale Closed-Form Table (Side-by-Side 原生 BF16 vs 量化后; Supported: {'/'.join(w_opts)})", style=STYLE_SECTION)
     ws.merge_range(2, 1, 2, MEMORY_TABLE_END_COL)
     rep_col_hdr = f"Peak Stage Rep (S{mem.peak_weight_stage})" if mem.pp > 1 else "Stage Rep"
     w_headers = (
         "Group", "Tensor Name", "Global Rows", "Global Cols", "Shard Rule",
         "Local Rows", "Local Cols", rep_col_hdr, "Quant Rule", "Quant Format",
-        "Payload (B)", "MX Scale (B)", "Channel Aux (B)",
-        "原生 BF16 单卡 (GiB)", "当前量化后单卡 (GiB, 含 Scale)", "Residency & Quant Policy",
+        "Payload (B)", "MX Scale (B)", "Ch Aux (B)", "Native BF16 (GiB)",
+        "Quant Per-Die (GiB)", "Residency & Quant Note",
     )
     write_headers(ws, MEMORY_TABLE_HEADER_ROW, w_headers)
 
-    lookup_ref = f"$U${MEMORY_LOOKUP_FIRST_ROW}:$X${lookup_last}"
     w_start = MEMORY_TABLE_HEADER_ROW + 1
-    group_spans: list[tuple[str, int, int]] = []
+    group_spans: list[list[Any]] = []
     for idx, row in enumerate(mem.weight_rows):
         r = w_start + idx
         extend_span(group_spans, row.group, r, r)
@@ -538,11 +595,9 @@ def populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
         else:
             res_text = f"NPU HBM ({row.quant_note})" if row.quant_note else "NPU HBM"
             res_formula = None
-        q_formula = (
-            None if row.group == _PREPARED_WEIGHT_GROUP
-            else _quant_format_formula(row.quant_rule, row.quant_format, arch)
-        )
-        if row.group == _PREPARED_WEIGHT_GROUP:
+        is_prepared = row.group == _PREPARED_WEIGHT_GROUP
+        q_formula = None if is_prepared else _quant_format_formula(row.quant_rule, row.quant_format, arch)
+        if is_prepared:
             payload_formula: str | None = None
             scale_formula: str | None = None
             aux_formula: str | None = None
@@ -563,9 +618,12 @@ def populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
             else row.quant_rule
         )
         write_row(ws, r, (
-            (row.name, None, STYLE_TEXT), (row.global_rows, None, STYLE_INT),
-            (row.global_cols, None, STYLE_INT), (row.shard_rule, None, STYLE_TEXT),
-            (row.local_rows, None, STYLE_INT), (row.local_cols, None, STYLE_INT),
+            (row.name, None, STYLE_TEXT),
+            (row.global_rows, None, STYLE_INT),
+            (row.global_cols, None, STYLE_INT),
+            (row.shard_rule, None, STYLE_TEXT),
+            (row.local_rows, None, STYLE_INT),
+            (row.local_cols, None, STYLE_INT),
             (row.peak_stage_repeats, None, STYLE_INT),
             (display_rule, None, STYLE_TEXT),
             (row.quant_format, q_formula, STYLE_INPUT_TEXT if q_formula else STYLE_TEXT),
@@ -602,7 +660,10 @@ def populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
         for offset, tot_v in enumerate(vals):
             col = MEMORY_WEIGHT_SUM_START_COL + offset
             c_let = column_letter(col)
-            f_str = f'=SUMIFS({c_let}{w_start}:{c_let}{w_end},$P${w_start}:$P${w_end},"{crit}")' if w_end >= w_start else "=0"
+            f_str = (
+                f'=SUMIFS({c_let}{w_start}:{c_let}{w_end},$P${w_start}:$P${w_end},"{crit}")'
+                if w_end >= w_start else "=0"
+            )
             ws.set_cell(r_idx, col, tot_v, formula=f_str, style=n_st)
         ws.set_cell(r_idx, MEMORY_TABLE_END_COL, note_txt, style=t_st)
 
@@ -619,14 +680,47 @@ def populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
     _sumifs_row(
         w_tot_vit, "Excluded Vision Tower Total (GiB, 纯文本默认不加载 ViT)", "Excluded*",
         lambda x: x.is_vision and not mem.include_vision_tower,
-        "切 T7=ON 可计入多模态显存", STYLE_SUBTOTAL_TEXT, STYLE_SUBTOTAL_NUM,
+        "切换 T7=ON 即刻计入 NPU HBM", STYLE_SUBTOTAL_TEXT, STYLE_SUBTOTAL_NUM,
     )
+    return w_start, w_tot_vit
 
-    cache_end = _populate_cache_block(ws, w_tot_vit + 2, mem, c_opts, arch)
-    _populate_stage_budget_block(
-        ws, cache_end + 2, mem,
-        cache_tot_row=cache_end, weight_start_row=w_start, lookup_ref=lookup_ref,
+
+def populate_memory_sheet(ws: Worksheet, bundle: ExportBundle) -> None:
+    """Populate Sheet 3 (``Memory_Quant_Calculator``) directly from ``DieResidentReceipt`` ledger."""
+    mem = bundle.memory_ledger
+    arch, w_opts, c_opts, lookup_order = _device_format_scope(mem)
+    apply_col_widths(ws, MEMORY_COL_WIDTHS)
+    ws.freeze_panes(MEMORY_FREEZE_ROWS, 2)
+    write_banner(
+        ws, 1, MEMORY_COLS,
+        f"Closed-Form Memory / Quant / Cache / Engram-PLE / PP HBM Calculator | {mem.model_name} @ {mem.hardware_sku} | {mem.weight_quant_display or mem.weight_quant}",
+        STYLE_TITLE,
     )
+    lookup_last = _populate_memory_control_panel(ws, mem, w_opts, c_opts, lookup_order)
+    lookup_ref = f"$U${MEMORY_LOOKUP_FIRST_ROW}:$X${lookup_last}"
+    w_start, w_tot_vit = _populate_weight_block(ws, mem, arch, w_opts, lookup_ref)
+    c_tot = _populate_cache_block(ws, w_tot_vit + 2, mem, c_opts)
+    max_stage_row = _populate_stage_budget_block(
+        ws, c_tot + 2, mem,
+        cache_tot_row=c_tot, weight_start_row=w_start, lookup_ref=lookup_ref,
+    )
+    summary_row = max_stage_row + 2
+    ws.set_cell(summary_row, 1, "4. Bottleneck Concurrency & Receipt Bijection Summary", style=STYLE_SECTION)
+    ws.merge_range(summary_row, 1, summary_row, MEMORY_TABLE_END_COL)
+    write_row(ws, summary_row + 1, (
+        ("Max HBM Concurrency / DP", None, STYLE_SUBTOTAL_TEXT),
+        (mem.max_hbm_concurrency_per_dp, None, STYLE_INT),
+        ("Per-Request Cache Max Stage (MiB)", None, STYLE_SUBTOTAL_TEXT),
+        (mem.per_request_cache_bytes_max_stage / float(MIB_BYTES), None, STYLE_FLOAT3),
+        ("Max Stage HBM (GiB)", None, STYLE_SUBTOTAL_TEXT),
+        (mem.max_stage_hbm_bytes / float(GIB_BYTES), f"=J{max_stage_row}", STYLE_FLOAT3),
+        ("Min Headroom (GiB)", None, STYLE_SUBTOTAL_TEXT),
+        (
+            min((s.headroom_bytes for s in mem.stage_budgets), default=0.0) / float(GIB_BYTES),
+            f"=L{max_stage_row}",
+            STYLE_FLOAT3,
+        ),
+    ))
 
 
 __all__ = ["MEMORY_COLS", "QUANT_MODE_AS_EVALUATED", "populate_memory_sheet"]

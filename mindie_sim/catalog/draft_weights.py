@@ -19,6 +19,59 @@ MULTI_TARGET_CONCAT_MIN = 2
 #: ``WeightTerm.groups``/``units``/``unit_width`` for a term with no grouping.
 
 
+def require_model_quant(model: ModelSpec) -> QuantSpec:
+    """Return normalized ``model.quant`` or construct strictly from declared native dtypes."""
+    quant = getattr(model, "quant", None)
+    if quant is not None:
+        return quant
+    w_dt = str(getattr(model, "weight_dtype", "") or "").strip().lower()
+    a_dt = str(getattr(model, "activation_dtype", "") or "").strip().lower()
+    kv_dt = str(getattr(model, "kv_dtype", "") or a_dt or w_dt).strip().lower()
+    if not w_dt or not a_dt:
+        raise ModelingError("model_quant_missing")
+    return QuantSpec(
+        name=str(getattr(model, "quantization", "") or w_dt),
+        weight_format=w_dt,
+        activation_format=a_dt,
+        expert_weight_format=w_dt,
+        kv_dtype=kv_dt,
+        index_dtype=kv_dt,
+        native_format=a_dt,
+    )
+
+
+def lowrank_hc_draft_terms(draft: DraftSpec) -> list[WeightTerm]:
+    """Low-rank gated hyper-connection weight terms for one draft layer."""
+    if draft.mhc_mult <= ZERO or draft.mhc_lowrank <= ZERO:
+        return []
+    hc_dim = draft.mhc_mult * draft.hidden_size
+    terms: list[WeightTerm] = []
+    for part in ("attn", "ffn"):
+        terms.extend([
+            _t(f"draft_hc_{part}_norm", hc_dim, ONE, "norm"),
+            _t(
+                f"draft_hc_{part}_down_inject",
+                draft.mhc_lowrank + draft.mhc_mult,
+                hc_dim,
+                "linear_param_bf16",
+            ),
+            _t(f"draft_hc_{part}_up", hc_dim, draft.mhc_lowrank, "linear_param_bf16"),
+        ])
+    return terms
+
+
+def lowrank_hc_draft_head_terms(draft: DraftSpec) -> list[WeightTerm]:
+    """Low-rank gated hyper-connection collapse head terms for a draft model."""
+    if draft.mhc_mult <= ZERO or draft.mhc_lowrank <= ZERO:
+        return []
+    hc_dim = draft.mhc_mult * draft.hidden_size
+    return [
+        _t("draft_hc_head_norm", hc_dim, ONE, "norm"),
+        _t("draft_hc_head_down", draft.mhc_lowrank, hc_dim, "linear_param_bf16"),
+        _t("draft_hc_head_up", hc_dim, draft.mhc_lowrank, "linear_param_bf16"),
+    ]
+
+
 def _resolved_input_width(draft: DraftSpec) -> int:
     targets = tuple(getattr(draft, "target_layer_ids", ()) or ())
     if len(targets) >= MULTI_TARGET_CONCAT_MIN:
@@ -168,7 +221,6 @@ def _draft_ffn_terms(
             _t("draft_down", h, i, "dense_mlp", "dense_down"),
         ])
     if draft.mhc_lowrank > ZERO:
-        from mindie_sim.catalog.qwen4_exp import lowrank_hc_draft_terms
         terms.extend(lowrank_hc_draft_terms(draft))
     elif draft.mhc_mult:
         mix = (2 + draft.mhc_mult) * draft.mhc_mult
@@ -212,7 +264,10 @@ def draft_terms(
     ep: int = ONE,
 ) -> list[WeightTerm]:
     h = draft.hidden_size
-    dq = draft_quant(model, draft) if getattr(model, "quant", None) is not None else QuantSpec("bf16")
+    resolved_model = model if getattr(model, "quant", None) is not None else replace(
+        model, quant=require_model_quant(model),
+    )
+    dq = draft_quant(resolved_model, draft)
     terms: list[WeightTerm] = []
     if standalone_heads_only and draft.kind == "standalone_draft":
         # The standalone draft always consumes concatenated target features.
@@ -262,7 +317,7 @@ def draft_terms(
             terms.extend(_draft_attention_terms(draft, dq))
             terms.extend(_draft_ffn_terms(draft, model, ep=ep))
             if index < len(plans):
-                terms.extend(_draft_plan_terms(plans[index], draft, model, dq=dq))
+                terms.extend(_draft_plan_terms(plans[index], draft, resolved_model, dq=dq))
             if draft.output_head_owned:
                 terms.append(_t("draft_output_norm", h, ONE, "norm"))
                 if int(draft.output_head_count) > ZERO:
@@ -270,7 +325,6 @@ def draft_terms(
                         "draft_output_head", draft.vocab_size, h, "lm_head",
                         "out_tp", ONE, 0, 0, 0, False, True))
         if draft.mhc_lowrank > ZERO:
-            from mindie_sim.catalog.qwen4_exp import lowrank_hc_draft_head_terms
             terms.extend(lowrank_hc_draft_head_terms(draft))
     if draft.kind in {"mtp", "eagle3"} and draft.target_shared_lm_head:
         terms.append(WeightTerm(
@@ -297,7 +351,7 @@ def draft_weight_summary(
 ) -> tuple[float, float]:
     if model.auxiliary is None:
         return 0.0, 0.0
-    quant = model.quant or QuantSpec("bf16")
+    quant = require_model_quant(model)
     parallel = ParallelSpec()
     drafts: list[DraftSpec] = []
     aux = model.auxiliary

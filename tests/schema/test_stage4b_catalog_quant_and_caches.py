@@ -8,7 +8,16 @@ import pytest
 from mindie_sim.catalog.cache import layer_cache_components, request_cache_breakdown
 from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.cache_index import index_row_bytes
-from mindie_sim.catalog.cache_pools import _packed_mla_row_bytes
+from mindie_sim.catalog.cache_pools import (
+    DS_V41_FOLDED_GROUP_TOKENS,
+    DS_V41_FOLDED_ROW_BYTES,
+    REGIME_ALIASED_WINDOW_COMPRESSED,
+    REGIME_DUAL_PITCH_KPOOL_MAMBA,
+    REGIME_SHARED_SLAB_PRIVATE_AUX,
+    _packed_mla_row_bytes,
+    evaluate_hybrid_pool_receipt,
+    resolve_pool_allocator_contract,
+)
 from mindie_sim.catalog.draft_weights import draft_terms
 from mindie_sim.catalog.ops import compute_dtype_for
 from mindie_sim.catalog.quant import _quant_w4a8_dynamic
@@ -19,6 +28,7 @@ from mindie_sim.catalog.weights import _body_terms
 from mindie_sim.compose import compose_case
 from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.stacks.vllm_ascend.profiles import VA_RECOMMENDED_PROFILES
 
@@ -331,3 +341,158 @@ def test_w4a16_offset_residency_glm_mean_collapse_step5_qk_norm_and_dspark_causa
     assert k31.auxiliary.dspark.noncausal_query_block is False
     k3 = load_model("kimi-k3")
     assert k3.auxiliary.dspark.noncausal_query_block is True
+
+
+def test_hybrid_pool_kpool_mamba_shared_slab_ple_and_aliased_window_contracts():
+    """Verify exact integer hybrid block-pool contracts across KPool-Mamba, QSA+PLE, and aliased-window regimes."""
+    # 1. GLM-5.3-Flash 128K spec5 TP8: exact BF16 (B_eff=640, 1,871,708,160 B) & C8 (B_eff=1,152, 1,088,446,464 B).
+    for kv_dt, exp_beff, exp_bytes in (
+        ("bf16", 640, 1_871_708_160),
+        ("int8", 1152, 1_088_446_464),
+    ):
+        raw_g = compose_case(
+            "glm-5.3-flash", hardware="a3", tp=8, dp=1, ep=8, num_devices=8,
+            prompt_tokens=131072, output_tokens=16, kv_cache_dtype=kv_dt, mtp_proposal_tokens=5,
+        )
+        case_g = parse_case(raw_g)
+        rec_g = evaluate_hybrid_pool_receipt(
+            case_g.model, case_g.runtime.parallel, 131072,
+            num_requests=1, runtime=case_g.runtime, query_tokens=6,
+        )
+        assert rec_g.contract.pool_regime == REGIME_DUAL_PITCH_KPOOL_MAMBA
+        assert rec_g.contract.normalized_block_size == exp_beff
+        assert rec_g.total_pool_bytes_by_stage == (exp_bytes,)
+
+    # 2. Qwen3.8-Flash-Next shared slab + private PLE (286,720 B/block at spec5, +1 raw ring, DCP=1 guard).
+    raw_q = compose_case(
+        "qwen3.8-flash-next", hardware="a5", tp=4, dp=1, ep=4, num_devices=4,
+        prompt_tokens=4096, output_tokens=16, mtp_proposal_tokens=5,
+    )
+    case_q = parse_case(raw_q)
+    rec_q = evaluate_hybrid_pool_receipt(
+        case_q.model, case_q.runtime.parallel, 4096,
+        num_requests=1, runtime=case_q.runtime, query_tokens=6,
+    )
+    assert rec_q.contract.pool_regime == REGIME_SHARED_SLAB_PRIVATE_AUX
+    assert rec_q.contract.private_bytes_per_block == 286_720
+    assert rec_q.per_request_ple_page_bytes == 286_720
+    assert rec_q.contract.raw_ring_blocks_per_req == 1
+    assert rec_q.raw_blocks_per_request == 1
+    with pytest.raises(ModelingError, match="shared_slab_requires_dcp_1_pcp_1"):
+        resolve_pool_allocator_contract(
+            case_q.model, ParallelSpec(tp=4, dp=1, ep=4, pp=1, cp=2), runtime=case_q.runtime,
+        )
+
+    # 3. DeepSeek-V4.1-Flash A5 folded (544 B/8 tok = +8,704 B on L20) + A3 INT8 ban + DCP=1 enforcement.
+    raw_v41 = compose_case(
+        "deepseek-v4.1-flash", hardware="a5", tp=8, dp=1, ep=8, num_devices=8,
+        prompt_tokens=8192, output_tokens=16, kv_cache_dtype="fp8_e4m3",
+    )
+    case_v41 = parse_case(raw_v41)
+    rec_v41 = evaluate_hybrid_pool_receipt(
+        case_v41.model, case_v41.runtime.parallel, 8192,
+        num_requests=1, runtime=case_v41.runtime,
+    )
+    assert rec_v41.contract.pool_regime == REGIME_ALIASED_WINDOW_COMPRESSED
+    assert rec_v41.contract.alias_backing_pitches_by_stage == ((131_072, 131_072, 131_072, 69_632),)
+    # Isolate non-compressed owner L20 without SWA aliasing to verify exact +544 B/8 tok folded KV term.
+    l20 = replace(next(p for p in case_v41.model.layer_plans if p.owns_long_kv and int(p.compress_ratio or 1) == 1), index=0, window=0)
+    m_l20 = replace(case_v41.model, layers=1, layer_plans=(l20,), auxiliary=None)
+    rt_l20 = replace(case_v41.runtime, pp_layer_partition=())
+    c_l20 = resolve_pool_allocator_contract(m_l20, case_v41.runtime.parallel, block_size=128, runtime=rt_l20)
+    expected_l20 = 128 * 320 + 128 * 68 + (128 // DS_V41_FOLDED_GROUP_TOKENS) * DS_V41_FOLDED_ROW_BYTES
+    assert c_l20.alias_backing_pitches_by_stage == ((expected_l20,),)
+
+    with pytest.raises(ModelingError, match="aliased_window_compressed_requires_dcp_1"):
+        resolve_pool_allocator_contract(
+            case_v41.model, ParallelSpec(tp=8, dp=1, ep=8, pp=1, cp=2), runtime=case_v41.runtime,
+        )
+    raw_v41_a3_c8 = compose_case(
+        "deepseek-v4.1-flash", hardware="a3", tp=8, dp=1, ep=8, num_devices=8,
+        prompt_tokens=8192, output_tokens=16, quant="w4a8_dynamic", kv_cache_dtype="int8",
+    )
+    case_v41_a3_c8 = parse_case(raw_v41_a3_c8)
+    with pytest.raises(ModelingError, match="aliased_window_compressed_rejects_int8_kv"):
+        resolve_pool_allocator_contract(
+            case_v41_a3_c8.model, case_v41_a3_c8.runtime.parallel, runtime=case_v41_a3_c8.runtime,
+        )
+
+    # 4. Prefill chunk length never expands speculative state; expired prefix never frees private SWA pages;
+    #    explicit head_dim is honored even without attention_bias.
+    from _support.axes import REPRESENTATIVE_SKUS
+    from mindie_sim.catalog.cache_ownership import batch_cache_footprint
+    from mindie_sim.model_catalog import build_model_spec
+    from mindie_sim.prediction.capacity import Memory
+    from mindie_sim.schema.workload import RequestView
+
+    c_pref = parse_case(compose_case(
+        "glm-5.3-flash", tp=8, quant="bf16", mtp_proposal_tokens=0,
+        deployment_mode="colocated", prompt_tokens=4096, output_tokens=1,
+    ))
+    pf1 = batch_cache_footprint(
+        c_pref, requests=(RequestView("r", 1, 4095, False, "prefill"),), replica=0, phase="prefill", padded=True,
+    )
+    pf4k = batch_cache_footprint(
+        c_pref, requests=(RequestView("r", 4096, 0, False, "prefill"),), replica=0, phase="prefill", padded=True,
+    )
+    assert int(pf1.total_bytes[0]) == int(pf4k.total_bytes[0])
+    m_pref = Memory(c_pref)
+    rec_pf1 = m_pref.resident_memory_receipt(phase="prefill", sequence_tokens=4096, batch_per_dp=1, query_tokens=1).dies[0]
+    rec_pf4k = m_pref.resident_memory_receipt(phase="prefill", sequence_tokens=4096, batch_per_dp=1, query_tokens=4096).dies[0]
+    assert rec_pf1.recurrent_state_bytes == rec_pf4k.recurrent_state_bytes == 18_452_480
+
+    c_swa = parse_case(compose_case(
+        "deepseek-v4.1-flash", tp=8, pp=2, pp_layer_partition=(2, 38),
+        quant="bf16", mtp_proposal_tokens=0, deployment_mode="colocated",
+        prefix_cache_mode="shared", concurrency=2, prompt_tokens=4096, output_tokens=2,
+    ))
+    swa_0 = batch_cache_footprint(
+        c_swa,
+        requests=tuple(RequestView(str(i), 1, 4095, True, "decode", prefix_tokens=0, prefix_cache_key="p") for i in range(2)),
+        replica=0, phase="decode", padded=True,
+    )
+    swa_exp = batch_cache_footprint(
+        c_swa,
+        requests=tuple(RequestView(str(i), 1, 4095, True, "decode", prefix_tokens=2048, prefix_cache_key="p") for i in range(2)),
+        replica=0, phase="decode", padded=True,
+    )
+    assert int(swa_0.total_bytes[0]) == int(swa_exp.total_bytes[0]) == 1_048_576
+
+    # Shared-prefix footprint is strictly order-invariant across heterogeneous decode views.
+    c_ord = parse_case(compose_case(
+        "qwen3.8-flash-next", hardware=REPRESENTATIVE_SKUS["a3"], tp=4, quant="bf16",
+        mtp_proposal_tokens=5, concurrency=2, prefix_cache_mode="shared",
+        prompt_tokens=4096, output_tokens=16, deployment_mode="colocated",
+    ))
+    views_ord = tuple(
+        RequestView(str(q), q, 4096 - q, True, "decode", prefix_tokens=2560, prefix_cache_key="p", draft_proposal_tokens=q - 1)
+        for q in (1, 6)
+    )
+    assert int(batch_cache_footprint(c_ord, requests=views_ord, replica=0, phase="decode", padded=True).total) == (
+        int(batch_cache_footprint(c_ord, requests=views_ord[::-1], replica=0, phase="decode", padded=True).total)
+    )
+
+    # Explicit head_dim & qk_norm are honored identically with or without optional attention_bias=False.
+    cfg_hd = dict(
+        model_type="qwen3_moe", num_hidden_layers=2, hidden_size=2048,
+        num_attention_heads=32, num_key_value_heads=4, head_dim=128, intermediate_size=6144,
+        moe_intermediate_size=768, num_experts=128, num_experts_per_tok=8,
+        vocab_size=151936, torch_dtype="bfloat16",
+    )
+    m_nobias = build_model_spec("typed", cfg_hd)
+    m_bias = build_model_spec("typed", {**cfg_hd, "attention_bias": False})
+    assert (m_nobias.layer_plans[0].head_dim, m_nobias.layer_plans[0].qk_norm, m_nobias.parameter_count()) == (
+        128, True, m_bias.parameter_count(),
+    )
+
+    # Emitted PLE gate owner_schedule respects physical AIV core ceiling.
+    from mindie_sim.prediction.operator_analysis import target_graphs
+
+    c_ple_a5 = parse_case(compose_case(
+        "qwen3.8-flash-next", hardware=REPRESENTATIVE_SKUS["a5"], tp=4, ep=4,
+        engram_cpu_offload=False, prompt_tokens=4096, output_tokens=1,
+    ))
+    ple_ops = target_graphs(c_ple_a5, phase="prefill", tokens=4096, scope="model", layer_limit=4)[0]
+    ple_sched = next(op.owner_schedule for op in ple_ops if op.family == "engram_apply")
+    aiv_cores = c_ple_a5.machine.dies[0].units("vector")
+    assert ple_sched.active_owners <= aiv_cores and ple_sched.max_tiles_per_owner == (ple_sched.work_tiles + aiv_cores - 1) // aiv_cores

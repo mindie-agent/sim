@@ -9,9 +9,16 @@
 from dataclasses import dataclass, replace
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.parallel import ParallelSpec
 from .cache_format import cache_format
 from .cache_pools import _ceil_div, _draft_is_dcp_sharded, _draft_row_bytes_int, exact_element_bytes
 from .draft_spec import effective_draft_context_cap
+from .speculative_state import (
+    NON_NEURAL_SPEC_METHODS,
+    kda_total_state_shards,
+    resolve_speculative_proposals,
+    speculative_state_plan,
+)
 
 QUANT_GROUP = 128
 NOPE_FP8_DTYPES = frozenset({"fp8", "fp8_e4m3"})
@@ -100,8 +107,9 @@ def normalize_formats(model):
     if dtype_bytes(kv_dtype) == 1:
         for plan in mla_plans:
             rope = int(getattr(plan, "qk_rope_head_dim", 0) or 0)
+            is_nope = bool(getattr(plan, "mla_use_nope", False)) or rope == 0
             default_scale = (
-                "fp16" if (rope == 0 and kv_dtype in NOPE_FP8_DTYPES) else "fp32"
+                "fp16" if (is_nope and kv_dtype in NOPE_FP8_DTYPES) else "fp32"
             )
             decl = {
                 "dtype": kv_dtype,
@@ -152,25 +160,19 @@ def draft_row(model, draft, *, tp=1):
 
 
 def _kda_state_shards(parallel, metadata) -> int:
-    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
-    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
-    axis = str(metadata.get("kda_parallel_axis", "")).strip().lower()
-    return tp * (1 if axis == "tp" else pcp)
+    return kda_total_state_shards(None, parallel, metadata)
 
 
 def _kda_state_page_bytes(plan, shards: int, proposals: int) -> int:
-    rec_elems = _ceil_div(int(plan.recurrent_state_elements), shards)
-    rec_bytes = exact_element_bytes(rec_elems, str(plan.recurrent_state_dtype))
-    conv_width = int(getattr(plan, "conv_width", 0) or 0)
-    kernel = max(1, int(getattr(plan, "conv_kernel", 1) or 1))
-    if conv_width > 0:
-        conv_elems = _ceil_div(conv_width * (kernel - 1 + proposals), shards)
-    else:
-        base_conv = _ceil_div(int(plan.conv_state_elements), shards)
-        slice_w = _ceil_div(base_conv, max(1, kernel - 1)) if base_conv else 0
-        conv_elems = base_conv + proposals * slice_w
-    conv_bytes = exact_element_bytes(conv_elems, str(plan.conv_state_dtype))
-    return rec_bytes + conv_bytes
+    sp = speculative_state_plan(
+        None,
+        plan,
+        ParallelSpec(tp=max(1, int(shards))),
+        query_tokens=1 + max(0, int(proposals)),
+        recover_ssm=True,
+        capacity_padded=True,
+    )
+    return int(sp.recurrent_bytes + sp.conv_bytes)
 
 
 def _project_paired_sfa_stage(
@@ -334,14 +336,10 @@ def _paired_sfa_stage_entries(case, layer_stage, query_tokens):
     mode = metadata.get("mamba_cache_mode", "align")
     if mode not in {"align", "none"}:
         raise ModelingError("paired_sfa_state_cache_mode_not_supported")
-    fallback = max(0, int(query_tokens) - 1)
-    draft_len = getattr(runtime.dspark, "draft_len", None)
-    if draft_len is not None and "draft_proposal_tokens" not in metadata:
-        fallback = max(0, int(draft_len))
-    proposals = int(metadata.get(
-        "num_speculative_state_blocks",
-        metadata.get("draft_proposal_tokens", fallback),
-    ))
+    if "num_speculative_state_blocks" in metadata and metadata["num_speculative_state_blocks"] is not None:
+        proposals = int(metadata["num_speculative_state_blocks"])
+    else:
+        proposals = resolve_speculative_proposals(runtime)
     extra = int(metadata.get("num_prefill_checkpoint_blocks", 0))
     if min(proposals, extra) < 0:
         raise ModelingError("paired_sfa_negative_state_slots")
@@ -374,7 +372,12 @@ def _paired_sfa_stage_entries(case, layer_stage, query_tokens):
         if _kda_state_page_bytes(plan, kda_shards, proposals) > main_page:
             raise ModelingError("paired_sfa_block_too_small_for_recurrent_page")
 
-    draft_kind = metadata.get("draft_mode") or ("dspark" if runtime.dspark else "")
+    raw_draft_mode = str(metadata.get("draft_mode") or "").strip().lower()
+    raw_spec_method = str(metadata.get("spec_method") or "").strip().lower()
+    if raw_draft_mode in NON_NEURAL_SPEC_METHODS or raw_spec_method in NON_NEURAL_SPEC_METHODS:
+        draft_kind = ""
+    else:
+        draft_kind = raw_draft_mode or ("dspark" if runtime.dspark else "")
     draft = optional_draft_spec(model, draft_kind) if draft_kind else None
     draft_cap = effective_draft_context_cap(draft, runtime) if draft is not None else 0
 
@@ -442,8 +445,10 @@ def minimum_block_size(
     )
     if row_bytes <= 0:
         return 0
-    axis = str(kda_parallel_axis or "").strip().lower()
-    shards = max(1, int(tp)) * (1 if axis == "tp" else max(1, int(pcp)))
+    shards = _kda_state_shards(
+        ParallelSpec(tp=max(1, int(tp)), pcp=max(1, int(pcp))),
+        {"kda_parallel_axis": kda_parallel_axis},
+    )
     prop = max(0, int(proposals))
     required = 0
     for plan in recurrent:

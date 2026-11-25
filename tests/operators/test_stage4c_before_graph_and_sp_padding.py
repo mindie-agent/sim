@@ -315,22 +315,23 @@ def test_gdn_high_tp_replicates_key_heads_and_interleaved_emits_fused_split() ->
         prompt_tokens=128, output_tokens=16,
     )
     case_next = parse_case(raw_next)
-    interleaved_model = replace(
-        case_next.model,
-        layer_plans=tuple(
-            replace(p, gdn_layout="interleaved") if p.attention == "gdn" else p
-            for p in case_next.model.layer_plans
-        ),
-    )
+    assert all(p.gdn_layout == "interleaved" for p in case_next.model.layer_plans if p.attention == "gdn")
     next80_ops = target_graphs(
-        replace(case_next, model=interleaved_model),
-        phase="decode", tokens=1, context=128, sequences=4, scope="body",
+        case_next, phase="decode", tokens=1, context=128, sequences=4, scope="body",
     )[0]
     assert any(op.recipe == "fused_qkvzba_split_reshape_cat" for op in next80_ops)
     assert not any(op.op_id.endswith(".qkv_concatenate") for op in next80_ops)
     # Explicit gdn_layout="standard" must never emit fused_qkvzba_split_reshape_cat even on qwen3_next.
+    standard_model = replace(
+        case_next.model,
+        layer_plans=tuple(
+            replace(p, gdn_layout="standard") if p.attention == "gdn" else p
+            for p in case_next.model.layer_plans
+        ),
+    )
     std_ops = target_graphs(
-        case_next, phase="decode", tokens=1, context=128, sequences=4, scope="body",
+        replace(case_next, model=standard_model),
+        phase="decode", tokens=1, context=128, sequences=4, scope="body",
     )[0]
     assert not any(op.recipe == "fused_qkvzba_split_reshape_cat" for op in std_ops)
 

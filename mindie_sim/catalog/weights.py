@@ -28,7 +28,11 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Any, Mapping, Sequence
 
-from mindie_sim.catalog.draft_weights import draft_terms, draft_weight_summary
+from mindie_sim.catalog.draft_weights import (
+    draft_terms,
+    draft_weight_summary,
+    require_model_quant,
+)
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.weight_layer_terms import (
     _attention_terms,
@@ -58,9 +62,68 @@ from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.parallel import ParallelSpec
 
 MHC_HEAD_STREAMS = 4
+DEFAULT_PLE_CONV_KERNEL = 4
+PLE_STORAGE_KIND = "ple_ngram_conv"
 TARGET_ALIAS_CATEGORIES = frozenset({
     "target_alias_embedding", "target_alias_lm_head",
 })
+
+
+def _require_model_quant(model: ModelSpec) -> QuantSpec:
+    return require_model_quant(model)
+
+
+def is_ple_engram(engram: Any) -> bool:
+    """Structural predicate distinguishing per-layer n-gram conv PLE from shared Engram."""
+    if engram is None:
+        return False
+    src = dict(getattr(engram, "source", ()) or ())
+    return src.get("storage_kind") == PLE_STORAGE_KIND or "ple_conv_kernel_size" in src
+
+
+def lowrank_hc_head_terms(model: ModelSpec) -> list[WeightTerm]:
+    """Low-rank gated hyper-connection collapse head terms for body output."""
+    hc = max((p.hc_mult for p in model.layer_plans), default=0)
+    lr = max((p.hc_lowrank for p in model.layer_plans), default=0)
+    hc_dim = hc * model.hidden_size
+    return [
+        _t("hc_head_norm", hc_dim, 1, "norm"),
+        _t("hc_head_down", lr, hc_dim, "linear_param_bf16"),
+        _t("hc_head_up", hc_dim, lr, "linear_param_bf16"),
+    ]
+
+
+def ple_table_terms(model: ModelSpec) -> list[WeightTerm]:
+    """TP-sharded per-layer n-gram embedding table weight terms."""
+    engram = model.engram
+    if engram is None:
+        return []
+    return [
+        WeightTerm(f"ple_table_{table.table_id}", table.rows, table.width, "engram_table", "out_tp", 1)
+        for table in engram.tables
+    ]
+
+
+def ple_gate_terms_by_layer(model: ModelSpec) -> dict[int, list[WeightTerm]]:
+    """Per-layer PLE projection, norm, and depthwise conv weight terms."""
+    engram = model.engram
+    if engram is None:
+        return {}
+    hc = max((p.hc_mult for p in model.layer_plans), default=1)
+    h = model.hidden_size
+    hc_h = hc * h
+    embed = engram.columns_per_table * engram.width
+    conv_k = int(dict(engram.source).get("ple_conv_kernel_size", DEFAULT_PLE_CONV_KERNEL))
+    by_layer: dict[int, list[WeightTerm]] = {}
+    for table in engram.tables:
+        by_layer.setdefault(table.layer_id, []).extend([
+            _t("ple_kv_proj", hc_h + h, embed, "ple_proj", count=1),
+            _t("ple_norm_key", hc_h, 1, "norm", count=1),
+            _t("ple_norm_query", hc_h, 1, "norm", count=1),
+            _t("ple_norm_conv", hc_h, 1, "norm", count=1),
+            _t("ple_conv1d", hc_h, conv_k, "conv_weight_bf16", count=1),
+        ])
+    return by_layer
 
 
 def _resident_parallel(
@@ -195,7 +258,7 @@ def stage_weight_decomposition(
     dcp_q_replicate: bool = False,
 ) -> list[dict[str, float]]:
     """Per-PP-stage weight bytes split into payload and quant metadata."""
-    quant = model.quant or QuantSpec("bf16")
+    quant = _require_model_quant(model)
     stages: list[dict[str, float]] = []
     pair_memo: dict[Any, tuple[float, float]] = {}
     for terms in stage_weight_terms(
@@ -271,7 +334,7 @@ def vision_weight_terms(
     if vision.norm_type == "layernorm":
         terms.append(_t("vision_final_norm_bias", vision.hidden_size, 1, "norm"))
     aligner_in = vision.aligner_input_width
-    if vision.kind == "deepseek_v41":
+    if vision.aligner_hidden_size > 0 and vision.bias:
         terms.extend([
             _t("aligner_norm", aligner_in, 1, "norm"),
             _t("aligner_w1", vision.out_hidden_size, aligner_in, "projector"),
@@ -279,7 +342,7 @@ def vision_weight_terms(
             _t("aligner_w2", vision.out_hidden_size, vision.out_hidden_size, "projector"),
             _t("aligner_w2_bias", vision.out_hidden_size, 1, "vision"),
         ])
-    elif vision.kind == "kimi_k3":
+    elif vision.aligner_hidden_size > 0:
         terms.extend([
             _t("projector_w0", vision.aligner_hidden_size, aligner_in, "projector"),
             _t("projector_w2", vision.out_hidden_size, vision.aligner_hidden_size, "projector"),
@@ -300,7 +363,7 @@ def vision_weight_terms(
 
 
 def _output_res_quant(model: ModelSpec) -> QuantSpec:
-    base = model.quant or QuantSpec("bf16")
+    base = _require_model_quant(model)
     explicit = {key: dict(val) for key, val in base.category_overrides}
     if "attn_res_proj" in explicit:
         return base
@@ -348,7 +411,6 @@ def body_head_terms(model: ModelSpec) -> list[WeightTerm]:
             replace(_t("output_attn_res_proj", 1, h, "attn_res_proj"), quant=res_quant),
         ])
     if lowrank_hc:
-        from mindie_sim.catalog.qwen4_exp import lowrank_hc_head_terms
         terms.extend(lowrank_hc_head_terms(model))
     elif any(
         plan.hyper_connections
@@ -367,25 +429,26 @@ def engram_table_terms(model: ModelSpec) -> list[WeightTerm]:
     engram = model.engram
     if engram is None:
         return []
-    from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, ple_table_terms
-    if is_qwen4_exp_ple(engram):
+    if is_ple_engram(engram):
         return ple_table_terms(model)
-    return [WeightTerm(f"engram_table_{table.table_id}", table.rows, table.width, "engram_table", "node", 1)
-            for table in engram.tables]
+    return [
+        WeightTerm(f"engram_table_{table.table_id}", table.rows, table.width, "engram_table", "node", 1)
+        for table in engram.tables
+    ]
 
 
 def engram_gate_terms_by_layer(model: ModelSpec) -> dict[int, list[WeightTerm]]:
     engram = model.engram
     if engram is None:
         return {}
-    from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, ple_gate_terms_by_layer
-    if is_qwen4_exp_ple(engram):
+    if is_ple_engram(engram):
         raw_ple = ple_gate_terms_by_layer(model)
         plans_by_idx = {int(p.index): p for p in model.layer_plans}
+        base_quant = _require_model_quant(model)
         resolved_ple: dict[int, list[WeightTerm]] = {}
         for layer_id, layer_terms in raw_ple.items():
             plan = plans_by_idx.get(int(layer_id))
-            lquant = _layer_resolved_quant(model, plan) if plan is not None else (model.quant or QuantSpec("bf16"))
+            lquant = _layer_resolved_quant(model, plan) if plan is not None else base_quant
             resolved_ple[int(layer_id)] = [
                 replace(term, quant=term.quant or lquant) for term in layer_terms
             ]
@@ -523,7 +586,7 @@ def stage_weight_bytes(
     dcp_q_replicate: bool = False,
     slot_plans: Mapping[int, Any] | None = None, ep_rank: int | None = None,
 ) -> list[float]:
-    quant = model.quant or QuantSpec("bf16")
+    quant = _require_model_quant(model)
     result: list[float] = []
     byte_memo: dict[Any, float] = {}
     for terms in stage_weight_terms(
@@ -610,7 +673,7 @@ def weight_breakdown(
     layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,
 ) -> dict[str, float]:
-    quant = model.quant or QuantSpec("bf16")
+    quant = _require_model_quant(model)
     groups: dict[str, float] = {}
     byte_memo: dict[Any, float] = {}
     for terms in stage_weight_terms(

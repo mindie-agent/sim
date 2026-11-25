@@ -757,3 +757,114 @@ def test_ledger_cross_engine_isolation_pending_release_and_unknown_domain_ceilin
         Ledger.try_acquire(state, (AllocationBinding(key=_rt_key(2), pool=unknown_pool, amount=float(PAGE)),), holder="h1", at=ev_a_acq)
     over = Ledger.try_acquire(state, (AllocationBinding(key=_rt_key(3), pool=pool, amount=float(3 * PAGE)),), holder="h2", at=ev_a_acq)
     assert over.granted is False and over.reason == "capacity_exceeded" and pool in over.blocked_pools
+
+
+def test_dp_cohort_zero_drift_uneven_rank_receipt_and_ngram_zero_draft_cache():
+    from _support.axes import REPRESENTATIVE_SKUS
+    from mindie_sim.compose import compose_case
+    from mindie_sim.export import compute_memory_quant_ledger
+    from mindie_sim.prediction.capacity import MemoryPolicy
+
+    # 1. DP-cohort residency zero drift on deepseek-v3.2 TP2/DP2/DCP4/EP4.
+    raw_v32 = compose_case(
+        "deepseek-v3.2", hardware=REPRESENTATIVE_SKUS["a5"],
+        tp=2, dp=2, dcp=4, ep=4, num_devices=4, layers=4,
+        prompt_tokens=4096, output_tokens=16,
+    )
+    case_v32 = parse_case(raw_v32)
+    mem_v32 = Memory(case_v32)
+    rec_v32 = mem_v32.resident_memory_receipt(phase="decode", sequence_tokens=4096, batch_per_dp=2)
+    led_v32 = compute_memory_quant_ledger(case_v32, seq_len=4096, concurrency=2)
+    die0 = rec_v32.die_receipt(0, 0, 0)
+    receipt_cache = (
+        die0.kv_cache_allocated_bytes + die0.index_cache_allocated_bytes
+        + die0.recurrent_state_bytes + die0.draft_cache_bytes
+    )
+    assert int(led_v32.stage_budgets[0].cache_bytes) == receipt_cache
+    assert int(sum(r.batch_total_bytes for r in led_v32.cache_rows)) == receipt_cache
+    cohort_rows = [r for r in led_v32.cache_rows if r.component == "dcp_dp_cohort_kv"]
+    assert len(cohort_rows) == 1 and cohort_rows[0].batch_total_bytes > 0.0
+
+    # 2. Uneven-rank exact 48/24 B DieResidentReceipt (zero rank-0 broadcast).
+    raw_u = compose_case(
+        "qwen3-32b", hardware=REPRESENTATIVE_SKUS["a5"],
+        tp=2, dp=1, ep=1, num_devices=2, layers=1, prompt_tokens=3, output_tokens=1,
+    )
+    case_u = parse_case(raw_u)
+    lp0 = replace(case_u.model.layer_plans[0], num_kv_heads=2, head_dim=6, v_head_dim=6)
+    case_u = replace(
+        case_u,
+        model=replace(case_u.model, layers=1, layer_plans=(lp0,)),
+        runtime=replace(case_u.runtime, kv_block_size=1),
+    )
+    mem_u = Memory(case_u, policy=MemoryPolicy(rank_token_owners=((0, 2), (2, 3))))
+    rec_u = mem_u.resident_memory_receipt(phase="decode", sequence_tokens=3, batch_per_dp=1)
+    assert rec_u.die_receipt(0, 0, 0).kv_cache_allocated_bytes == 48
+    assert rec_u.die_receipt(0, 0, 1).kv_cache_allocated_bytes == 24
+
+    # 3. Non-neural ngram / ngram_gpu speculative methods never coerce draft_kind->"mtp" or bill draft cache.
+    for method in ("ngram", "ngram_gpu"):
+        raw_ng = compose_case(
+            "deepseek-v3.2", hardware=REPRESENTATIVE_SKUS["a5"],
+            tp=2, dp=1, ep=2, num_devices=2, layers=4,
+            prompt_tokens=512, output_tokens=16, mtp_proposal_tokens=3,
+        )
+        case_ng = parse_case(raw_ng)
+        rt_meta = tuple(sorted({**dict(case_ng.runtime.metadata), "spec_method": method}.items()))
+        mem_ng = Memory(replace(case_ng, runtime=replace(case_ng.runtime, metadata=rt_meta)))
+        rec_ng = mem_ng.resident_memory_receipt(phase="decode", sequence_tokens=512, batch_per_dp=2)
+        assert mem_ng.draft_kind == ""
+        assert rec_ng.die_receipt(0, 0, 0).draft_cache_bytes == 0
+
+    # 4. Cross-DP DCP preserves exact total valid KV, index, inherited MTP draft, and live admission bytes.
+    for seq_n in (128, 256):
+        totals = []
+        for dcp_v in (1, 2):
+            c_dcp = parse_case(compose_case(
+                "deepseek-v3.2", layers=3, hardware=REPRESENTATIVE_SKUS["a3"],
+                dp=2, tp=1, dcp=dcp_v, quant="bf16", deployment_mode="colocated",
+                concurrency=2, mtp_proposal_tokens=0, block_size=128,
+                prompt_tokens=seq_n - 1, output_tokens=1, enable_sfa_dcp_sharded_indexer=True,
+            ))
+            r_dcp = Memory(c_dcp).resident_memory_receipt(sequence_tokens=seq_n, batch_per_dp=1)
+            kv_v = sum(d.kv_cache_valid_bytes for d in r_dcp.dies)
+            idx_v = sum(d.index_cache_valid_bytes for d in r_dcp.dies)
+            totals.append((kv_v + idx_v, idx_v))
+        assert totals[0] == totals[1]
+
+    draft_totals = []
+    for dcp_v in (1, 2):
+        c_mtp = parse_case(compose_case(
+            "deepseek-v3.2", hardware=REPRESENTATIVE_SKUS["a3"], layers=4, tp=1, dp=2, dcp=dcp_v,
+            prompt_tokens=255, output_tokens=1, concurrency=2, mtp_proposal_tokens=1,
+            quant="bf16", deployment_mode="colocated", enable_sfa_dcp_sharded_indexer=True,
+        ))
+        dies_mtp = Memory(c_mtp).resident_memory_receipt(sequence_tokens=256, batch_per_dp=1).dies
+        draft_totals.append((sum(d.draft_cache_bytes for d in dies_mtp), sum(d.index_cache_allocated_bytes for d in dies_mtp)))
+    assert draft_totals[0] == draft_totals[1] == (656_384, 266_240)
+
+    c_live = parse_case(compose_case(
+        "deepseek-v3.2", hardware=REPRESENTATIVE_SKUS["a3"], layers=3, tp=1, dp=2, dcp=2,
+        quant="bf16", deployment_mode="colocated", concurrency=2, mtp_proposal_tokens=0,
+        block_size=128, prompt_tokens=127, output_tokens=1, enable_sfa_dcp_sharded_indexer=True,
+    ))
+    m_live = Memory(c_live)
+    proj_live = m_live.resident_memory_receipt(sequence_tokens=128, batch_per_dp=1)
+    for rep in (0, 1):
+        assert m_live.resize(rep, str(rep), 128)
+    assert [d.kv_cache_allocated_bytes + d.index_cache_allocated_bytes for d in m_live.resident_memory_receipt().dies] == (
+        [d.kv_cache_allocated_bytes + d.index_cache_allocated_bytes for d in proj_live.dies]
+    ) == [984_576, 0]
+
+    # 5. Projected HBM receipt honors kvc_ddr_ratio identically to live admission.
+    c_ddr = parse_case(compose_case(
+        "qwen3-32b", hardware=REPRESENTATIVE_SKUS["a3"], tp=2, layers=4,
+        quant="bf16", prompt_tokens=4095, output_tokens=1,
+    ))
+    m_ddr = Memory(c_ddr, policy=MemoryPolicy(kvc_ddr_ratio=0.5))
+    assert m_ddr.resize(0, "x", 4096)
+    d_live = m_ddr.resident_memory_receipt().dies[0]
+    d_proj = m_ddr.resident_memory_receipt(sequence_tokens=4096, batch_per_dp=1).dies[0]
+    assert (d_live.kv_cache_allocated_bytes, d_live.staging_bytes, d_live.simultaneous_live_hbm_bytes) == (
+        d_proj.kv_cache_allocated_bytes, d_proj.staging_bytes, d_proj.simultaneous_live_hbm_bytes,
+    ) == (16_777_216, 4_194_304, d_live.simultaneous_live_hbm_bytes)

@@ -77,18 +77,37 @@ class SpeculativeStatePlan:
 
 
 KDA_PARALLEL_AXIS = "tp_x_pcp"
+KDA_TP_ONLY_AXIS = "tp"
+NON_NEURAL_SPEC_METHODS = frozenset({"none", "ngram", "ngram_gpu"})
+
+
+def kda_state_shards(layer: Any, parallel: Any, runtime: Any = None) -> int:
+    """Canonical extra KDA state shard multiplier (PCP unless ``kda_parallel_axis == 'tp'``)."""
+    kind = str(getattr(layer, "attention", "kda") or "kda") if layer is not None else "kda"
+    if kind != "kda":
+        return ONE
+    meta = (
+        dict(runtime) if isinstance(runtime, Mapping)
+        else dict(getattr(runtime, "metadata", ()) or ())
+    )
+    axis = str(meta.get("kda_parallel_axis") or "").strip().lower()
+    pcp = max(ONE, int(getattr(parallel, "pcp", ONE) or ONE))
+    return ONE if axis == KDA_TP_ONLY_AXIS else pcp
+
+
+def kda_total_state_shards(layer: Any, parallel: Any, runtime: Any = None) -> int:
+    """Canonical total KDA state shards ``tp * kda_state_shards(...)``."""
+    tp = max(ONE, int(getattr(parallel, "tp", ONE) or ONE))
+    return tp * kda_state_shards(layer, parallel, runtime)
 
 
 def _kda_shards(layer: Any, parallel: Any, runtime: Any) -> int:
-    """The KDA TP x PCP history shard count, or one every other family uses."""
-    if str(getattr(layer, "attention", "")) != "kda":
-        return 1
-    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
-    if pcp <= 1:
-        return 1
-    metadata = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
-    axis = str(metadata.get("kda_parallel_axis", "")).strip().lower()
-    return 1 if axis == "tp" else pcp
+    return kda_state_shards(layer, parallel, runtime)
+
+
+def gdn_record_head_bytes(dk: int, dv: int) -> int:
+    """Per-token per-head GDN compact replay record: FP32 ``(k + v + beta) = (dk + dv + 1) * 4 B``."""
+    return (int(dk) + int(dv) + ONE) * CORRECTION_BYTES
 
 
 def _local_heads(layer: Any, parallel: Any, shards: int = 1) -> int:
@@ -113,13 +132,7 @@ def record_head_bytes(dk: int, dv: int, kg_dtype: str = DEFAULT_RECORD_KG_DTYPE)
 
 
 def _conv_slice_width(layer: Any, total_shards: int, local_conv: int, kernel: int) -> int:
-    """Exact per-token convolution channel width on this shard.
-
-    Catalog models store ``conv_width * (kernel - 1)`` history elements and
-    declare ``conv_width > 0`` explicitly. Legacy synthetic layers with
-    ``conv_width == 0`` fall back cleanly to ``kernel - 1`` (or ``kernel`` when
-    the declared buffer is an exact ``kernel``-multiple synthetic fixture).
-    """
+    """Exact per-token convolution channel width on this shard."""
     conv_width = int(getattr(layer, "conv_width", 0) or 0)
     if conv_width > 0:
         return _ceil_div(conv_width, total_shards)
@@ -129,15 +142,6 @@ def _conv_slice_width(layer: Any, total_shards: int, local_conv: int, kernel: in
     if kernel > 1 and local_conv % history_slots != 0 and local_conv % kernel == 0:
         return local_conv // kernel
     return _ceil_div(local_conv, history_slots)
-
-
-def _conv_geometry(layer: Any, parallel: Any, shards: int = 1) -> tuple[int, int, str]:
-    total_shards = max(1, int(parallel.tp)) * max(1, int(shards))
-    local_conv = _ceil_div(int(getattr(layer, "conv_state_elements", 0) or 0), total_shards)
-    kernel = max(1, int(getattr(layer, "conv_kernel", 0) or 1))
-    width = _conv_slice_width(layer, total_shards, local_conv, kernel)
-    dtype = str(getattr(layer, "conv_state_dtype", "") or "bf16")
-    return int(width), kernel, dtype
 
 
 def speculative_state_plan(
@@ -157,7 +161,9 @@ def speculative_state_plan(
     shards = _kda_shards(layer, parallel, runtime)
     heads = _local_heads(layer, parallel, shards)
     dk, dv = _head_geometry(layer)
-    state_dtype = str(getattr(layer, "recurrent_state_dtype", "") or "fp32")
+    state_dtype = str(getattr(layer, "recurrent_state_dtype", "") or "").strip()
+    if not state_dtype:
+        raise ModelingError("linear_attention_recurrent_state_dtype_missing")
     kg_dtype = str(contract.get("record_kg_dtype", DEFAULT_RECORD_KG_DTYPE))
     total_shards = max(1, int(parallel.tp)) * shards
     recurrent_elements = _ceil_div(
@@ -167,7 +173,9 @@ def speculative_state_plan(
     conv_raw = int(getattr(layer, "conv_state_elements", 0) or 0)
     local_conv = _ceil_div(conv_raw, total_shards)
     kernel = max(1, int(getattr(layer, "conv_kernel", 0) or 1))
-    conv_dtype = str(getattr(layer, "conv_state_dtype", "") or "bf16")
+    conv_dtype = str(getattr(layer, "conv_state_dtype", "") or "").strip()
+    if not conv_dtype:
+        raise ModelingError("linear_attention_conv_state_dtype_missing")
     slice_width = _conv_slice_width(layer, total_shards, local_conv, kernel)
     default_history = max(1, kernel - 1) if (
         int(getattr(layer, "conv_width", 0) or 0) > 0
@@ -193,10 +201,7 @@ def speculative_state_plan(
             q, slots, state_bytes * float(slots), conv_bytes, 0,
             transient, MODE_CHECKPOINT)
     if kind == "gdn":
-        # Qwen GDN keeps ``(Dk + Dv + 1)`` FP32 elements per head, distinct
-        # from the KDA correction+kg record.
-        from mindie_sim.prediction.operators.recurrent.recover_ssm_work import gdn_record_head_bytes
-        record = gdn_record_head_bytes(dk, dv) * float(heads)
+        record = float(gdn_record_head_bytes(dk, dv) * heads)
     else:
         record = record_head_bytes(dk, dv, kg_dtype) * float(heads)
     override = contract.get("record_bytes_per_token")
@@ -219,11 +224,64 @@ def runtime_recover_ssm(runtime: Any) -> bool:
     return metadata.get("recover_ssm") is True
 
 
+def _declared_speculative_policy(runtime: Any) -> tuple[str, int]:
+    """Extract canonical ``(spec_method, num_speculative_tokens)`` from runtime contracts."""
+    if runtime is None:
+        return "", 0
+    contract = getattr(runtime, "speculative_contract", None)
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    if contract is None:
+        raw_contract = meta.get("speculative_contract")
+        if raw_contract is not None:
+            contract = raw_contract
+    if contract is not None:
+        method = str(
+            getattr(contract, "spec_method", None)
+            or (contract.get("spec_method") if isinstance(contract, Mapping) else "")
+            or ""
+        ).strip().lower()
+        k_val = int(
+            getattr(contract, "num_speculative_tokens", None)
+            if not isinstance(contract, Mapping)
+            else contract.get("num_speculative_tokens", 0) or 0
+        )
+        return method, max(0, k_val)
+    spine = meta.get("single_spine")
+    if isinstance(spine, Mapping):
+        scen = spine.get("scenario_contract")
+        if isinstance(scen, Mapping):
+            pol = scen.get("speculative_policy")
+            if isinstance(pol, Mapping):
+                method = str(pol.get("spec_method") or "").strip().lower()
+                k_val = int(pol.get("num_speculative_tokens", 0) or 0)
+                if method or k_val > 0:
+                    return method, max(0, k_val)
+    method = str(meta.get("spec_method") or meta.get("draft_mode") or "").strip().lower()
+    raw_k = meta.get("num_speculative_tokens")
+    if raw_k is None:
+        raw_k = meta.get("draft_proposal_tokens")
+    k_val = int(raw_k or 0)
+    return method, max(0, k_val)
+
+
+def resolve_speculative_proposals(runtime: Any, *, phase: str = PHASE_DECODE) -> int:
+    """Resolve declared integer speculative proposal count ``K >= 0`` from runtime contracts."""
+    if phase != PHASE_DECODE or runtime is None:
+        return 0
+    dspark = getattr(runtime, "dspark", None)
+    if dspark is not None:
+        return max(0, int(dspark.step_spec().draft_len))
+    method, k_val = _declared_speculative_policy(runtime)
+    if method == "none":
+        return 0
+    return k_val
+
+
 def resolve_speculative_query_tokens(
     runtime: Any, *, view: Any = None, tokens_per_seq: int | None = None,
     phase: str = PHASE_DECODE,
 ) -> int:
-    """Resolve the actual verify width from the scheduled view/declaration."""
+    """Resolve the actual verify width from the scheduled view or declared contract."""
     if phase != PHASE_DECODE:
         return ONE
     if view is not None:
@@ -237,13 +295,4 @@ def resolve_speculative_query_tokens(
             raise ModelingError(
                 f"speculative_state_tokens_per_seq_invalid:{tokens_per_seq}")
         return width
-    dspark = getattr(runtime, "dspark", None)
-    if dspark is not None:
-        # DSpark verifies the confidence-truncated proposal prefix plus the bonus token.
-        return ONE + int(dspark.step_spec().draft_len)
-    metadata = dict(getattr(runtime, "metadata", ()) or ())
-    proposals = int(metadata.get("draft_proposal_tokens", ZERO) or ZERO)
-    if int(getattr(runtime, "mtp_acceptance_length", ONE) or ONE) <= ONE and proposals <= ZERO:
-        return ONE
-    # MTP and metadata-only DSpark both declare a proposal count: verify width is ``[K+1]``.
-    return max(ONE, proposals + ONE)
+    return ONE + resolve_speculative_proposals(runtime, phase=phase)

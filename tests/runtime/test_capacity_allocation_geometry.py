@@ -515,7 +515,7 @@ def test_grant_decision_names_waitable_release_and_permanent_deficit():
 
 
 @pytest.mark.parametrize("filename,tail,weight_scales", [
-    ("qwen38-a5.json", 0, True), ("glm53-a5.json", 3_063_808, False),
+    ("qwen38-a5.json", 0, True), ("glm53-a5.json", 148_228_096, False),
 ])
 def test_catalog_rank_plan_conserves_weight_and_cache_bytes(filename, tail, weight_scales):
     memory = Memory(parse_case(json.loads((EXAMPLE_CASES / filename).read_text(encoding="utf-8"))))
@@ -552,9 +552,10 @@ def test_catalog_compressed_cache_reports_physical_and_access_scales():
     allocated, access = allocation["allocated"], allocation["access"]
     assert allocated["scale_bytes_per_stage_rank"][0] > 0
     assert access["scale_bytes_per_stage_rank"][0] > 0
-    assert [payload + scale + metadata for payload, scale, metadata in zip(
+    assert allocated["reserve_bytes_per_stage_rank"][0] > 0
+    assert [payload + scale + reserve + metadata for payload, scale, reserve, metadata in zip(
         allocated["payload_bytes_per_stage_rank"], allocated["scale_bytes_per_stage_rank"],
-        allocated["metadata_bytes_per_stage_rank"],
+        allocated["reserve_bytes_per_stage_rank"], allocated["metadata_bytes_per_stage_rank"],
     )] == allocated["total_bytes_per_stage_rank"]
 
 

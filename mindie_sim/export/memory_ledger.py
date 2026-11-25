@@ -1,34 +1,29 @@
-"""Closed-form per-die Weight/Quant/Cache/Engram-PLE/PP HBM memory calculator.
+"""Pure per-die memory ledger projection from canonical ``DieResidentReceipt``.
 
-[Role] Compute deterministic, Excel-verifiable per-die memory ledgers honoring
-  ``QuantSpec.exclusions``, post-TP/EP/PP/DCP/PCP/Local-TP tensor sharding,
-  MXFP4/MXFP8 microscaling and W8A8/W4A8 per-channel aux overhead, KV/Indexer/
-  KeyPool/KDA recurrent cache sizing, Engram/PLE Host DRAM offload, and closed-form
-  per-DP Max HBM Concurrency.
-[Invariants] Strictly pure analytical computation over ``Case`` and ``Memory``;
-  zero device contexts, zero weight loading, and exact parity with Sheet 3's
-  live OOXML ``VLOOKUP``/``ROUNDUP`` formulas.
-[Timeouts & Locks] Single-pass O(Unique Weight Terms + Layers) arithmetic; no
-  locks or I/O.
+[Role] Project ``Memory.cache_ledger_projection`` (``DieResidentReceipt`` +
+  ``HybridPoolReceipt``) and canonical ``stage_weight_terms`` into the frozen
+  ``MemoryCalculatorLedger`` consumed by ``ExportBundle``, ``agent_brief``, and
+  Sheet 3 (``Memory_Quant_Calculator``).
+[Invariants] Strictly pure analytical projection over ``Case`` and ``Memory``:
+  every stage weight, cache, workspace, reserve, usable HBM, and total HBM
+  field satisfies exact 0 B multi-key bijection with the bottleneck die's
+  ``DieResidentReceipt``. Fixed per-die static C8 channel scales are never
+  divided by or multiplied by concurrency; hardware ISA legality is enforced
+  upfront via ``validate_quant_for_hardware``; zero shadow HBM calculators and
+  zero AG014 model-name branches.
+[Timeouts & Locks] Single-pass O(Unique Weight Terms + Legal Dtypes x Layers)
+  in-memory arithmetic; no locks or I/O.
 [Side-Effect Policy] Read-only over caller ``Case`` instances.
 """
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 import math
 from typing import Any
 
-from mindie_sim.catalog.cache import (
-    DEFAULT_CACHE_BLOCK_SIZE,
-    INDEX_INTERLEAVE_TOKENS,
-    layer_cache_components,
-    local_kv_heads,
-)
-from mindie_sim.catalog.cache_format import dense_c8_kv_planes
-from mindie_sim.catalog.cache_pools import exact_element_bytes
-from mindie_sim.catalog.context_parallel import dcp_q_replicate_enabled
+from mindie_sim.catalog.cache import DEFAULT_CACHE_BLOCK_SIZE, layer_cache_components
+from mindie_sim.catalog.draft_weights import require_model_quant
 from mindie_sim.catalog.npu_checkpoints import (
     NpuCheckpointSpec,
     classify_weight_tensor_quant,
@@ -36,6 +31,7 @@ from mindie_sim.catalog.npu_checkpoints import (
     resolve_default_checkpoint,
     validate_quant_for_hardware,
 )
+from mindie_sim.catalog.quant import quant_preset
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.weight_terms import (
     WeightTerm,
@@ -43,12 +39,9 @@ from mindie_sim.catalog.weight_terms import (
     term_bytes,
     term_payload_bytes,
 )
-from mindie_sim.catalog.weights import (
-    _expand_resident_terms,
-    engram_table_terms,
-    stage_weight_terms,
-)
+from mindie_sim.catalog.weights import _expand_resident_terms, stage_weight_terms
 from mindie_sim.prediction.capacity import Memory, prepared_weight_bytes
+from mindie_sim.prediction.capacity.ledger import CacheLedgerProjection
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.stack import PreparedWeightSpec
@@ -57,7 +50,6 @@ from .models import (
     BF16_BYTES,
     FP32_BYTES,
     KV_QUANT_GROUP_SIZE,
-    MAX_EXPLICIT_LAYER_LABELS,
     MIN_DENOM_EPS,
     MXFP_GROUP_SIZE,
     QUANT_RULE_CHECKPOINT_IGNORE,
@@ -66,7 +58,6 @@ from .models import (
     QUANT_RULE_FOLLOW_PRESET,
     QUANT_RULE_PRESET_LINEAR_FP8,
     QUANT_RULE_PRESET_LINEAR_W8A8,
-    SUPPORTED_CACHE_DTYPES,
     WEIGHT_QUANT_FORMATS,
     CacheLedgerRow,
     MemoryCalculatorLedger,
@@ -74,11 +65,40 @@ from .models import (
     WeightLedgerRow,
 )
 
+#: Canonical KV-cache effective element widths (bytes/element) for format queries.
+C8_CACHE_WIDTH_BYTES = 1.0 + float(FP32_BYTES) / float(KV_QUANT_GROUP_SIZE)
+GQA_STATIC_C8_CACHE_WIDTH_BYTES = 1.0
+FP8_CACHE_WIDTH_BYTES = 1.0 + float(BF16_BYTES) / float(KV_QUANT_GROUP_SIZE)
+MXFP8_CACHE_WIDTH_BYTES = 1.0 + 1.0 / float(MXFP_GROUP_SIZE)
+
+#: Cache components whose byte width responds to target KV cache dtype overrides.
+KV_DTYPE_SENSITIVE_COMPONENTS = frozenset({
+    "gqa_kv", "mla_kv", "window", "compressed_kv", "dcp_dp_cohort_kv",
+    "page_group_reserve_seq",
+})
+_GQA_CACHE_COMPONENTS = frozenset({"gqa_kv", "window"})
+_PREPARED_WEIGHT_GROUP = "Prepared Runtime Weights"
+_FIXED_PER_DIE_COMPONENTS = frozenset({"c8_static_channel_scale"})
+_NON_TOKEN_SCALED_COMPONENTS = frozenset({
+    "window", "recurrent_state", "conv_state", "ple_conv_state", "replay_records",
+    "state_transient", "compressor_state", "index_compressor_state",
+    "index_pool_tail", "draft_state", "page_group_reserve", "page_metadata",
+    "c8_static_channel_scale",
+})
+_COMPONENT_DISPLAY_ORDER = (
+    "gqa_kv", "mla_kv", "window", "compressed_kv",
+    "index_k", "index_pool_tail", "compressor_state", "index_compressor_state",
+    "recurrent_state", "conv_state", "ple_conv_state",
+    "replay_records", "state_transient",
+    "draft_kv", "draft_state",
+    "dcp_dp_cohort_kv", "dcp_dp_cohort_index", "dcp_dp_cohort_draft",
+    "page_group_reserve", "page_group_reserve_seq", "page_metadata",
+    "c8_static_channel_scale",
+)
 _ENGRAM_CATEGORIES = frozenset({"engram_table", "ple_table"})
 _VISION_CATEGORIES = frozenset({"vision", "projector", "vision_pos", "image_token"})
 _VISION_NAME_PREFIXES = ("vision_", "aligner_", "merger_", "projector_", "image_")
-_W4A8_EXPERT_ONLY_CATEGORIES = frozenset({"expert", "routed_expert", "moe.routed"})
-_MXFP4_EXPERT_CATEGORIES = frozenset({"expert", "routed_expert", "moe.routed"})
+_EXPERT_CATEGORIES = frozenset({"expert", "routed_expert", "moe.routed"})
 _FIXED_FP32_CATEGORIES = frozenset({
     "param_fp32", "conv_weight_f32", "a_log", "dt_bias", "norm_f32",
     "compressor_fp32_runtime", "mhc", "ape",
@@ -89,26 +109,8 @@ _FIXED_BF16_CATEGORIES = frozenset({
     "vision_pos", "image_token", "conv_weight_bf16", "linear_param_bf16",
     "compressor_bf16_runtime", "dspark_input",
 })
-#: Distinct KV-cache bytes/element factors:
-#: MLA C8 uses FP32/128 scales; GQA static C8 stores INT8 payload (1.0 B/elem)
-#: plus static per-channel checkpoint scales/offsets (no block-128 inflation);
-#: FP8 uses FP16/128 scales; MXFP8 uses E8M0/32 scales (33/32 B/elem).
-C8_CACHE_WIDTH_BYTES = 1.0 + float(FP32_BYTES) / float(KV_QUANT_GROUP_SIZE)
-GQA_STATIC_C8_CACHE_WIDTH_BYTES = 1.0
-FP8_CACHE_WIDTH_BYTES = 1.0 + float(BF16_BYTES) / float(KV_QUANT_GROUP_SIZE)
-MXFP8_CACHE_WIDTH_BYTES = 1.0 + 1.0 / float(MXFP_GROUP_SIZE)
 _FLOAT16_FORMATS = frozenset({"bf16", "fp16", "bfloat16", "float16"})
-_GQA_CACHE_COMPONENTS = frozenset({"gqa_kv", "window"})
-#: Cache components whose byte width scales with the target KV cache dtype override.
-KV_DTYPE_SENSITIVE_COMPONENTS = frozenset({
-    "gqa_kv", "mla_kv", "window", "compressed_kv", "dcp_dp_cohort_kv",
-})
-_PREPARED_WEIGHT_GROUP = "Prepared Runtime Weights"
-
-
-def _is_ple_category(cat: str) -> bool:
-    low = str(cat or "").lower()
-    return low == "ple" or low.endswith("_ple")
+_MXFP8_KV_TAG = "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL"
 _WEIGHT_QUANT_ALIASES: dict[str, str] = {
     "bf16": "BF16",
     "bfloat16": "BF16",
@@ -120,6 +122,8 @@ _WEIGHT_QUANT_ALIASES: dict[str, str] = {
     "fp8_e4m3": "FP8",
     "fp8_e5m2": "FP8",
     "w8a8": "W8A8",
+    "w8a8_dynamic": "W8A8",
+    "w8a8_mix": "W8A8",
     "int8": "INT8",
     "w4a16": "W4A16",
     "compressed_tensors_w4a16": "W4A16",
@@ -127,1384 +131,1255 @@ _WEIGHT_QUANT_ALIASES: dict[str, str] = {
     "w4a16_awq": "W4A16",
     "w4a16_gptq": "W4A16",
     "w4a8": "W4A8",
+    "w4a8_dynamic": "W4A8",
     "int4": "INT4",
     "mxfp8": "MXFP8",
     "w8a8_mxfp8": "MXFP8",
-    "w8a8-mxfp8": "MXFP8",
-    "mxfp8_mxfp4": "MXFP4",
-    "mxfp8+mxfp4": "MXFP4",
-    "quarot_mxfp8_mxfp4": "MXFP4",
     "mxfp4": "MXFP4",
-    "mxfp4_routed_only": "MXFP4",
-    "w4a8_mxfp": "MXFP4",
-    "w4a8-mxfp": "MXFP4",
     "w4a8_mxfp4": "MXFP4",
-    "w4a8-mxfp4": "MXFP4",
+    "w4a4_mxfp4": "MXFP4",
+    "fp4_e2m1": "MXFP4",
 }
 _CACHE_DTYPE_ALIASES: dict[str, str] = {
     "bf16": "BF16",
     "bfloat16": "BF16",
     "fp16": "BF16",
     "float16": "BF16",
-    "c8": "C8",
     "int8": "C8",
+    "c8": "C8",
+    "kv_c8": "C8",
+    "fa3_c8": "C8",
     "faquant": "C8",
+    "fa_quant": "C8",
     "fp8": "FP8",
     "fp8_e4m3": "FP8",
     "fp8_e5m2": "FP8",
     "mxfp8": "MXFP8",
-    "mx_fp8": "MXFP8",
     "qk_mxfp8_dynamic_v_mxfp8_per_channel": "MXFP8",
-    "qk-mxfp8-dynamic-v-mxfp8-per-channel": "MXFP8",
 }
-_QUANT_FORMAT_DISPLAY: dict[str, str] = {
-    "bf16": "BF16",
-    "bfloat16": "BF16",
-    "fp16": "BF16",
-    "float16": "BF16",
-    "fp32": "FP32",
-    "float32": "FP32",
-    "fp8": "FP8",
-    "fp8_e4m3": "FP8",
-    "fp8_e5m2": "FP8",
-    "int8": "W8A8",
-    "w8a8": "W8A8",
-    "w4a16": "W4A16",
-    "int4": "W4A8",
-    "w4a8": "W4A8",
-    "mxfp8": "MXFP8",
-    "mx_fp8": "MXFP8",
-    "mxfp4": "MXFP4",
-    "mx_fp4": "MXFP4",
-    "fp4": "MXFP4",
-    "fp4_e2m1": "MXFP4",
+_CANONICAL_CACHE_TO_KV_DTYPE: dict[str, str] = {
+    "BF16": "bf16",
+    "C8": "int8",
+    "FP8": "fp8_e4m3",
+    "MXFP8": "fp8_e4m3",
 }
+_W4A16_SCALE_BYTES = 2 * BF16_BYTES
+_HW_FAMILY_A5 = "a5"
+_HW_FAMILY_A23 = frozenset({"a2", "a3"})
+_DEFAULT_CONCURRENCY = 1
+
+
+def _is_ple_category(cat: str) -> bool:
+    low = str(cat or "").lower()
+    return low == "ple" or low.endswith("_ple")
+
+
+def _is_vision_term(term: WeightTerm) -> bool:
+    cat = str(term.category or "").lower()
+    name = str(term.name or "").lower()
+    return cat in _VISION_CATEGORIES or name.startswith(_VISION_NAME_PREFIXES)
+
+
+def _weight_format_storage_spec(fmt: str) -> dict[str, float | int]:
+    """Canonical per-format storage spec aligned with registered ``quant_preset``."""
+    spec = dict(WEIGHT_QUANT_FORMATS[fmt])
+    if fmt in {"W4A8", "INT4"}:
+        # Canonical W4A8_DYNAMIC routed experts store 1 per-channel FP32 scale per row.
+        spec["aux"] = int(FP32_BYTES)
+    return spec
 
 
 def evaluate_weight_storage_bytes(
-    local_rows: int, local_cols: int, quant_format: str,
+    local_rows: int,
+    local_cols: int,
+    quant_format: str,
+    *,
+    repeats: int = 1,
+    scale_bytes_per_group: int | None = None,
 ) -> tuple[int, int, int, int]:
-    """Closed-form ``(payload, scale, aux, total)`` bytes for one post-TP local matrix."""
-    key = str(quant_format or "BF16").strip().upper()
-    spec = WEIGHT_QUANT_FORMATS.get(key)
-    if spec is None:
-        raise ModelingError(f"unsupported_weight_quant_format:{quant_format}")
-    rows = int(local_rows)
-    cols = int(local_cols)
-    if rows < 1 or cols < 1:
-        raise ModelingError(f"invalid_local_weight_shape:({rows},{cols})")
-    payload = rows * math.ceil(cols * float(spec["bytes"]))
+    """Exact closed-form integer ``(payload, mx_scale, channel_aux, total)`` bytes."""
+    fmt = _canonicalize_weight_quant_override(quant_format)
+    if fmt not in WEIGHT_QUANT_FORMATS:
+        raise ModelingError(f"unsupported_weight_quant_format:{quant_format!r}")
+    spec = _weight_format_storage_spec(fmt)
+    rows = max(0, int(local_rows))
+    cols = max(0, int(local_cols))
+    rep = max(0, int(repeats))
+    if rows == 0 or cols == 0 or rep == 0:
+        return 0, 0, 0, 0
+    elem_bytes = float(spec["bytes"])
+    payload_row = int(math.ceil(cols * elem_bytes))
+    payload = rows * payload_row * rep
     group = int(spec["group"])
+    scale_unit = int(spec["scale"]) if scale_bytes_per_group is None else int(scale_bytes_per_group)
     scale = (
-        rows * ((cols + group - 1) // group) * int(spec["scale"])
-        if group > 0 else 0
+        rows * int(math.ceil(cols / float(group))) * scale_unit * rep
+        if group > 0 and scale_unit > 0 else 0
     )
-    aux = rows * int(spec["aux"]) if int(spec["aux"]) > 0 else 0
+    aux = rows * int(spec["aux"]) * rep
     return payload, scale, aux, payload + scale + aux
+
+
+def _canonicalize_weight_quant_override(raw: str) -> str:
+    low = str(raw or "BF16").strip().lower()
+    return _WEIGHT_QUANT_ALIASES.get(low, low.upper())
+
+
+def _canonicalize_cache_dtype_override(raw: str) -> str:
+    low = str(raw or "BF16").strip().lower()
+    if low in _CACHE_DTYPE_ALIASES:
+        return _CACHE_DTYPE_ALIASES[low]
+    if "mxfp8" in low:
+        return "MXFP8"
+    if "fp8" in low:
+        return "FP8"
+    if "int8" in low or "c8" in low or "faquant" in low or "fa_quant" in low:
+        return "C8"
+    return "BF16"
 
 
 def _normalize_quant_preset(quant: QuantSpec | None, fallback: str = "BF16") -> str:
     if quant is None:
         return fallback
-    name = str(getattr(quant, "name", "") or "").strip().lower()
-    exp_fmt = str(getattr(quant, "expert_weight_format", "") or "").strip().lower()
-    w_fmt = str(getattr(quant, "weight_format", "") or "").strip().lower()
-    act_fmt = str(getattr(quant, "activation_format", "") or "").strip().lower()
-    combined = f"{name} {exp_fmt} {w_fmt}"
-    if "mxfp4" in combined or "mx_fp4" in combined:
-        return "MXFP4"
-    if "mxfp8" in combined or "mx_fp8" in combined:
-        return "MXFP8"
-    if "w4a16" in combined or (
-        (exp_fmt == "int4" or w_fmt == "int4")
-        and act_fmt in _FLOAT16_FORMATS
-        and "w4a8" not in name
+    name = str(quant.name or "").strip().lower()
+    exp_fmt = str(quant.expert_weight_format or "").strip().lower()
+    w_fmt = str(quant.weight_format or "").strip().lower()
+    act_fmt = str(quant.activation_format or "").strip().lower()
+    scale_fmt = str(quant.scale_format or "").strip().lower()
+    block = tuple(quant.weight_block or ())
+    if "w4a16" in name or (exp_fmt == "int4" and act_fmt in _FLOAT16_FORMATS) or (
+        w_fmt == "int4" and act_fmt in _FLOAT16_FORMATS
     ):
         return "W4A16"
-    if "w4a8" in combined or "int4" in combined or "fp4" in combined:
+    if "mxfp4" in name or exp_fmt in {"fp4_e2m1", "mxfp4"} or w_fmt in {"fp4_e2m1", "mxfp4"}:
+        return "MXFP4"
+    if "mxfp8" in name or (scale_fmt == "fp8_e8m0" and block == (1, MXFP_GROUP_SIZE)):
+        return "MXFP8"
+    if "w4a8" in name or exp_fmt == "int4" or w_fmt == "int4":
         return "W4A8"
-    if "w8a8" in combined or "int8" in combined:
+    if "w8a8" in name or exp_fmt == "int8" or w_fmt == "int8":
         return "W8A8"
-    if "fp8" in combined:
+    if "fp8" in name or exp_fmt.startswith("fp8") or w_fmt.startswith("fp8"):
         return "FP8"
-    return "BF16"
-
-
-def _describe_quant_display(
-    quant: QuantSpec | None,
-    resolved_wq: str,
-    *,
-    explicit_override: bool,
-    apply_preset_to_ignored: bool = False,
-) -> tuple[str, tuple[str, ...]]:
-    exclusions = tuple(getattr(quant, "exclusions", ()) or ()) if quant is not None else ()
-    if apply_preset_to_ignored:
-        return f"{resolved_wq} (Full Quant / QuaRot Override)", exclusions
-    if quant is None or not exclusions:
-        return resolved_wq, ()
-    excl_set = set(exclusions)
-    routed_only = (
-        resolved_wq == "MXFP4"
-        and ({"attn", "mla", "kda"} & excl_set)
-        and "shared_expert" in excl_set
-    )
-    if routed_only:
-        overrides = dict(getattr(quant, "category_overrides", ()) or ())
-        if "latent_moe" in overrides or "attn_res_proj" in overrides:
-            return "MXFP4 (Routed+Latent+AttnRes, Attn/Shared BF16)", exclusions
-        return "MXFP4 (Routed-Only, Attn/Shared BF16)", exclusions
-    w_fmt = str(getattr(quant, "weight_format", "bf16") or "bf16").lower()
-    exp_fmt = str(getattr(quant, "expert_weight_format", "bf16") or "bf16").lower()
-    if not explicit_override and w_fmt != exp_fmt and "fp8" in w_fmt and "mxfp4" in exp_fmt:
-        q_name = str(getattr(quant, "name", "") or "").lower()
-        if "mxfp8" in q_name:
-            return "MXFP8 Linear + MXFP4 Routed/Latent (QuaRot / msmodelslim)", exclusions
-        return "FP8 Linear + MXFP4 Routed Experts (Router/Norm/Head BF16)", exclusions
-    if resolved_wq == "W4A16":
-        if ({"attn", "mla", "kda"} & excl_set) and "shared_expert" in excl_set:
-            return "W4A16 (INT4 Group-32 Routed Experts, Attn/Shared BF16)", exclusions
-        return "W4A16 (Compressed INT4 Group-32, BF16 Activations)", exclusions
-    if resolved_wq == "W4A8":
-        return "W4A8_DYNAMIC (INT8 Linear + INT4 Routed Experts, Norm/Router/Head BF16)", exclusions
-    if resolved_wq == "W8A8":
-        return "W8A8_DYNAMIC (INT8 Linear & Experts, Norm/Router/Head BF16)", exclusions
-    return f"{resolved_wq} (Excl: {','.join(exclusions[:MAX_EXPLICIT_LAYER_LABELS])})", exclusions
-
-
-def _canonicalize_weight_quant_override(raw: str) -> str:
-    token = str(raw).strip().lower()
-    return _WEIGHT_QUANT_ALIASES.get(token, str(raw).strip().upper())
-
-
-def _canonicalize_cache_dtype_override(raw: str) -> str:
-    token = str(raw).strip().lower()
-    return _CACHE_DTYPE_ALIASES.get(token, str(raw).strip().upper())
+    return _canonicalize_weight_quant_override(w_fmt or fallback)
 
 
 def _normalize_cache_dtype(model: Any) -> str:
     meta = dict(getattr(model, "metadata", ()) or ())
-    quant = getattr(model, "quant", None)
-    tokens = (
-        str(meta.get("kv_cache_tag") or "").strip().lower(),
-        str(meta.get("kv_cache_type") or "").strip().lower(),
-        str(getattr(quant, "kv_dtype", "") if quant is not None else "").strip().lower(),
-        str(getattr(model, "kv_dtype", "") or "").strip().lower(),
-    )
-    joined = " ".join(tok for tok in tokens if tok)
-    if "mxfp8" in joined or "mx_fp8" in joined:
+    tag = str(meta.get("kv_cache_tag") or "").strip().lower()
+    if "mxfp8" in tag:
         return "MXFP8"
-    if "int8" in joined or "faquant" in joined or any(tok == "c8" for tok in tokens):
-        return "C8"
-    if "fp8" in joined:
-        return "FP8"
-    return "BF16"
-
-
-def _resolve_shard_axis_and_rule(
-    term: WeightTerm,
-    placed_parallel: Any = None,
-    base_parallel: Any = None,
-) -> tuple[str, int]:
-    shard = str(term.shard or "replicated")
-    role = str(term.placement_role or "")
-    axis = 1 if (role == "attention_output" or shard in {"in_tp", "dense_down", "expert_down", "group_in"}) else 0
-    if shard in {"expert_gate_up", "expert_down"}:
-        return "EP", axis
-    if shard == "replicated":
-        return "Replicated", axis
-    if shard == "node":
-        return "Node", axis
-    if role == "attention_output":
-        return "Local-TP (o_proj)", axis
-    if role == "attention_query":
-        return "Local-TP (q_proj)", axis
-    if term.category == "shared_expert":
-        if (
-            placed_parallel is not None
-            and base_parallel is not None
-            and int(getattr(placed_parallel, "tp", 1) or 1) == 1
-            and int(getattr(base_parallel, "tp", 1) or 1) > 1
-        ):
-            return "Shared-DP (Replicated)", axis
-        return "Shared-TP", axis
-    return f"TP ({shard})", axis
-
-
-def stage_layer_counts(case: Case) -> tuple[int, ...]:
-    """Return decoder layer counts owned by each pipeline stage."""
-    p = case.runtime.parallel
-    if case.runtime.pp_layer_partition:
-        return tuple(int(x) for x in case.runtime.pp_layer_partition)
-    return tuple(
-        case.model.layers // p.pp + (1 if stage < case.model.layers % p.pp else 0)
-        for stage in range(p.pp)
-    )
+    quant = getattr(model, "quant", None)
+    raw = str(
+        (getattr(quant, "kv_dtype", "") if quant is not None else "")
+        or getattr(model, "kv_dtype", "")
+        or "bf16"
+    ).strip().lower()
+    return _canonicalize_cache_dtype_override(raw)
 
 
 def _model_has_mla(model: Any) -> bool:
-    return any(getattr(lp, "attention", "") == "mla" for lp in getattr(model, "layer_plans", ()) or ())
+    return any(
+        getattr(lp, "attention", "") == "mla"
+        for lp in getattr(model, "layer_plans", ())
+    )
 
 
 def _cache_dtype_width_bytes(dtype: str, *, is_gqa: bool) -> float:
-    if dtype == "MXFP8":
+    norm = _canonicalize_cache_dtype_override(dtype)
+    if norm == "BF16":
+        return float(BF16_BYTES)
+    if norm == "MXFP8":
         return MXFP8_CACHE_WIDTH_BYTES
-    if dtype == "C8":
-        return GQA_STATIC_C8_CACHE_WIDTH_BYTES if is_gqa else C8_CACHE_WIDTH_BYTES
-    if dtype == "FP8":
+    if norm == "FP8":
         return FP8_CACHE_WIDTH_BYTES
-    return float(BF16_BYTES)
+    return GQA_STATIC_C8_CACHE_WIDTH_BYTES if is_gqa else C8_CACHE_WIDTH_BYTES
 
 
-def _cache_dtype_override_ratio(model: Any, target_dtype: str, *, component: str = "") -> float:
-    base = _normalize_cache_dtype(model)
-    target = str(target_dtype or base).strip().upper()
-    if target == base:
-        return 1.0
+def _cache_dtype_override_ratio(
+    model: Any, target_dtype: str, *, component: str = "",
+) -> float:
+    base_dtype = _normalize_cache_dtype(model)
     is_gqa = (
         component in _GQA_CACHE_COMPONENTS
-        or (component == "" and not _model_has_mla(model))
+        if component else (not _model_has_mla(model))
     )
-    base_w = _cache_dtype_width_bytes(base, is_gqa=is_gqa)
-    target_w = _cache_dtype_width_bytes(target, is_gqa=is_gqa)
+    base_w = _cache_dtype_width_bytes(base_dtype, is_gqa=is_gqa)
+    target_w = _cache_dtype_width_bytes(target_dtype, is_gqa=is_gqa)
     return target_w / max(base_w, MIN_DENOM_EPS)
 
 
-def _gqa_c8_static_scale_bytes_by_stage(
-    case: Case,
-    stage_layers: Sequence[int],
-    block_size: int,
-) -> tuple[list[float], list[int]]:
-    """Per-stage static checkpoint C8 channel scale + offset bytes for GQA layers."""
-    n_stages = len(stage_layers)
-    by_stage = [0.0] * n_stages
-    layers_by_stage = [0] * n_stages
-    layer_stage = [s for s, count in enumerate(stage_layers) for _ in range(count)]
-    tp = max(1, int(case.runtime.parallel.tp))
-    blk = max(1, int(block_size))
-    for lp in getattr(case.model, "layer_plans", ()) or ():
-        if getattr(lp, "attention", "") != "gqa":
-            continue
-        k_dim = int(getattr(lp, "head_dim", 0) or getattr(case.model, "head_dim", 0) or 0)
-        v_dim = int(getattr(lp, "v_head_dim", 0) or k_dim)
-        n_kv = int(getattr(lp, "num_kv_heads", 0) or getattr(case.model, "kv_heads", 0) or 0)
-        if k_dim <= 0 or n_kv <= 0:
-            continue
-        local_kv = local_kv_heads(n_kv, tp)
-        k_planes = dense_c8_kv_planes(local_kv, blk, k_dim)
-        if v_dim == k_dim:
-            static_b = float(sum(
-                pl.bytes_per_unit for pl in k_planes if pl.allocation_frequency == "checkpoint"
-            ))
-        else:
-            v_planes = dense_c8_kv_planes(local_kv, blk, v_dim)
-            static_b = float(
-                sum(
-                    pl.bytes_per_unit for pl in k_planes
-                    if pl.allocation_frequency == "checkpoint" and pl.plane_id.startswith("k_")
-                )
-                + sum(
-                    pl.bytes_per_unit for pl in v_planes
-                    if pl.allocation_frequency == "checkpoint" and pl.plane_id.startswith("v_")
-                )
-            )
-        st = layer_stage[lp.index] if lp.index < len(layer_stage) else 0
-        if 0 <= st < n_stages:
-            by_stage[st] += static_b
-            layers_by_stage[st] += 1
-    return by_stage, layers_by_stage
-
-
-_FIXED_STATE_CACHE_COMPONENTS = frozenset({
-    "recurrent_state",
-    "conv_state",
-    "compressor_state",
-    "index_compressor_state",
-    "index_pool_tail",
-    "ple_conv_state",
-    "draft_state",
-    "replay_records",
-    "state_transient",
-    "page_group_reserve",
-    "page_metadata",
-    "c8_static_channel_scale",
-})
-
-
-def _add_fixed_cache_stage_values(
-    comp_name: str,
-    values: Sequence[float],
-    stage_layers: Sequence[int],
-    comp_stage_bytes: dict[str, list[float]],
-    comp_stage_layers: dict[str, list[int]],
-    comp_scalable: dict[str, bool],
-    comp_kv_scaled: dict[str, bool],
-    *,
-    layer_counts: Sequence[int] | None = None,
-) -> None:
-    for st_idx in range(min(len(stage_layers), len(values))):
-        val = float(values[st_idx] or 0.0)
-        if val <= 0.0:
-            continue
-        comp_scalable[comp_name] = False
-        comp_kv_scaled[comp_name] = False
-        comp_stage_bytes[comp_name][st_idx] += val
-        layers_val = (
-            int(layer_counts[st_idx])
-            if layer_counts is not None and st_idx < len(layer_counts)
-            else int(stage_layers[st_idx])
-        )
-        comp_stage_layers[comp_name][st_idx] = max(1, layers_val)
-
-
-_CACHE_DTYPE_TO_MODEL_KV: dict[str, str] = {
-    "BF16": "bf16",
-    "C8": "int8",
-    "FP8": "fp8_e4m3",
-    "MXFP8": "mxfp8",
-}
-_A23_HW_FAMILIES = frozenset({"a2", "a3"})
-_MXFP8_KV_TAG = "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL"
-
-
-def _case_with_cache_dtype(case: Case, target_dtype: str) -> Case:
-    """Clone ``case`` with canonical KV cache format set to ``target_dtype`` (read-only)."""
-    norm = str(target_dtype or "BF16").strip().upper()
-    kv_raw = _CACHE_DTYPE_TO_MODEL_KV.get(norm, norm.lower())
-    model = case.model
-    meta = dict(getattr(model, "metadata", ()) or ())
-    meta.pop("kv_cache_tag", None)
-    meta.pop("kv_cache_type", None)
-    raw_reps = meta.get("cache_representations")
-    if isinstance(raw_reps, Mapping):
-        filtered_reps = {k: v for k, v in raw_reps.items() if k not in KV_DTYPE_SENSITIVE_COMPONENTS}
-        if filtered_reps:
-            meta["cache_representations"] = filtered_reps
-        else:
-            meta.pop("cache_representations", None)
-    if norm == "MXFP8":
-        meta["kv_cache_tag"] = _MXFP8_KV_TAG
-    quant = getattr(model, "quant", None)
-    new_quant = replace(quant, kv_dtype=kv_raw) if quant is not None else None
-    new_model = replace(model, kv_dtype=kv_raw, quant=new_quant, metadata=tuple(sorted(meta.items())))
-    return replace(case, model=new_model)
-
-
-def _exact_kv_stage_bytes_for_dtype(
-    case: Case, target_dtype: str, stage_layers: Sequence[int], seq_len: int, spec_tokens: int = 0,
-) -> dict[str, list[float]]:
-    """Evaluate exact per-stage bytes for KV-sensitive components via ``Memory`` or layer cache math."""
-    n_stages = len(stage_layers)
-    alt_case = _case_with_cache_dtype(case, target_dtype)
-    out: dict[str, list[float]] = defaultdict(lambda: [0.0] * n_stages)
-    try:
-        alt_mem = Memory(alt_case)
-    except ModelingError:
-        # Paired-SFA recurrent page constraints may reject a narrower what-if dtype on small blocks;
-        # fall back to canonical layer_cache_components which uses the exact same CacheFormat math.
-        layer_stage = [s for s, count in enumerate(stage_layers) for _ in range(count)]
-        for lp in alt_case.model.layer_plans:
-            st_idx = layer_stage[lp.index] if lp.index < len(layer_stage) else 0
-            raw_comps = layer_cache_components(
-                alt_case.model, lp, alt_case.runtime.parallel, max(1, seq_len),
-                capacity_padded=True, interleave=INDEX_INTERLEAVE_TOKENS,
-                runtime=alt_case.runtime, query_tokens=max(1, 1 + spec_tokens),
-            )
-            for comp_name, val in raw_comps.items():
-                if comp_name in KV_DTYPE_SENSITIVE_COMPONENTS and val > 0.0 and 0 <= st_idx < n_stages:
-                    out[comp_name][st_idx] += float(val)
-        return dict(out)
-    alt_alloc = alt_mem.allocation_report(max(1, seq_len)).get("cache") or {}
-    alt_summary = alt_alloc.get("allocated") or {}
-    alt_reserves = alt_summary.get("reserve_bytes_per_stage_rank") or ()
-    alt_stride = alt_mem._unified_pool_stride_reserve_by_stage(max(1, seq_len))
-    for st_idx in range(n_stages):
-        r_val = (
-            (float(alt_reserves[st_idx] or 0.0) if st_idx < len(alt_reserves) else 0.0)
-            + (float(alt_stride[st_idx] or 0.0) if st_idx < len(alt_stride) else 0.0)
-        )
-        if r_val > 0.0:
-            out["page_group_reserve"][st_idx] += r_val
-    comp_entries = alt_alloc.get("components") or ()
-    for st_idx in range(n_stages):
-        entry = comp_entries[st_idx] if st_idx < len(comp_entries) else {}
-        for comp_name, detail in (entry.get("allocated") or {}).items():
-            if comp_name in KV_DTYPE_SENSITIVE_COMPONENTS:
-                val = float(detail.get("total", 0.0) or 0.0)
-                if val > 0.0:
-                    out[comp_name][st_idx] += val
-        for comp_name, detail in (entry.get("group_allocated") or {}).items():
-            if comp_name in KV_DTYPE_SENSITIVE_COMPONENTS:
-                val = float(detail.get("alloc_payload", 0.0) or 0.0) + float(detail.get("alloc_scale", 0.0) or 0.0)
-                if val > 0.0:
-                    out[comp_name][st_idx] += val
-    if int(getattr(alt_case.runtime.parallel, "dcp_dp_width", 1) or 1) > 1:
-        cohort_totals = alt_mem.dp_cohort_cache_bytes(max(1, seq_len), padded=True)
-        base_totals = alt_mem.cache_bytes(max(1, seq_len), padded=True)
-        for st_idx in range(min(n_stages, len(cohort_totals), len(base_totals))):
-            extra = float(cohort_totals[st_idx]) - float(base_totals[st_idx])
-            if extra > MIN_DENOM_EPS:
-                out["dcp_dp_cohort_kv"][st_idx] += extra
-    return dict(out)
-
-
-def _hw_cache_dtype_options(case: Case, active_dtype: str) -> tuple[str, ...]:
-    hw_fam = normalize_hw_family(str(case.machine.sku or case.machine.name or "a5"))
-    if hw_fam in _A23_HW_FAMILIES:
-        opts = ["BF16", "C8"]
-    elif hw_fam == "a5":
-        opts = ["BF16", "FP8"]
-    else:
-        opts = list(SUPPORTED_CACHE_DTYPES)
-    norm_active = str(active_dtype or "BF16").strip().upper()
-    if norm_active and norm_active not in opts:
-        opts.append(norm_active)
-    return tuple(opts)
-
-
-def _build_cache_ledger_row_list(
-    *,
-    model: Any,
-    comp_stage_bytes: Mapping[str, list[float]],
-    comp_stage_layers: Mapping[str, list[int]],
-    comp_scalable: Mapping[str, bool],
-    comp_kv_scaled: Mapping[str, bool],
-    per_dtype_stage_bytes: Mapping[str, Mapping[str, list[float]]],
-    n_stages: int,
-    local_tokens: int,
-    concurrency: int,
-    cache_dtype: str,
-) -> tuple[tuple[CacheLedgerRow, ...], list[float], list[float]]:
-    stage_per_req_totals = [0.0] * n_stages
-    stage_totals = [0.0] * n_stages
-    rows: list[CacheLedgerRow] = []
-    index_dtype_lbl = str(getattr(getattr(model, "quant", None), "index_dtype", "int8") or "int8").upper()
-    for comp_name in sorted(comp_stage_bytes):
-        per_stage = comp_stage_bytes[comp_name]
-        layers_per_stage = tuple(comp_stage_layers[comp_name])
-        max_layers = max(layers_per_stage, default=0)
-        max_req_bytes = max(per_stage, default=0.0)
-        scalable = comp_scalable.get(comp_name, True) and (max_layers > 0)
-        kv_scaled = comp_kv_scaled.get(comp_name, False) and scalable
-        denom = float(max(1, max_layers * local_tokens))
-        b_per_tok = (max_req_bytes / denom) if scalable else 0.0
-        rates_by_dt: tuple[tuple[str, float], ...] = ()
-        req_by_dt: tuple[tuple[str, float], ...] = ()
-        if kv_scaled and per_dtype_stage_bytes:
-            rates_by_dt = tuple(
-                (dt_opt, max(opt_map[comp_name], default=0.0) / denom)
-                for dt_opt, opt_map in per_dtype_stage_bytes.items()
-                if comp_name in opt_map
-            )
-        elif comp_name == "page_group_reserve" and per_dtype_stage_bytes:
-            cand_reqs = tuple(
-                (dt_opt, max(opt_map[comp_name], default=0.0))
-                for dt_opt, opt_map in per_dtype_stage_bytes.items()
-                if comp_name in opt_map
-            )
-            if len({round(v, 2) for _, v in cand_reqs}) > 1:
-                req_by_dt = cand_reqs
-        for st_idx, st_val in enumerate(per_stage):
-            if comp_name != "c8_static_channel_scale":
-                stage_per_req_totals[st_idx] += st_val
-            stage_totals[st_idx] += st_val * float(concurrency)
-        if not scalable:
-            c_kind = "State (Fixed)"
-        elif kv_scaled:
-            c_kind = cache_dtype
-        elif comp_name == "index_k":
-            c_kind = f"Index ({index_dtype_lbl})"
-        elif comp_name == "draft_kv":
-            c_kind = "Draft KV (Fixed)"
-        else:
-            c_kind = "Independent (Fixed)"
-        rows.append(CacheLedgerRow(
-            component=comp_name,
-            cache_kind=c_kind,
-            active_layers_per_stage=layers_per_stage,
-            max_stage_layers=max_layers,
-            bytes_per_token_per_layer=b_per_tok,
-            per_request_bytes=max_req_bytes,
-            batch_total_bytes=max_req_bytes * float(concurrency),
-            scales_with_tokens=scalable,
-            per_stage_bytes=tuple(float(v) for v in per_stage),
-            bytes_per_token_by_dtype=rates_by_dt,
-            per_request_bytes_by_dtype=req_by_dt,
-        ))
-    return tuple(rows), stage_totals, stage_per_req_totals
-
-
-def _accumulate_alloc_cache_components(
-    model: Any,
-    comp_entries: Sequence[Mapping[str, Any]],
-    *,
-    n_stages: int,
-    cache_dtype: str,
-    exact_override_stage_bytes: Mapping[str, list[float]],
-    comp_stage_bytes: dict[str, list[float]],
-    comp_scalable: dict[str, bool],
-    comp_kv_scaled: dict[str, bool],
-) -> None:
-    fixed_state_comps = _FIXED_STATE_CACHE_COMPONENTS
-    used_exact_override: set[str] = set()
-    for st_idx in range(n_stages):
-        entry = comp_entries[st_idx] if st_idx < len(comp_entries) else {}
-        for section, is_group in (("allocated", False), ("group_allocated", True)):
-            for comp_name, detail in (entry.get(section) or {}).items():
-                val = (
-                    float(detail.get("alloc_payload", 0.0) or 0.0) + float(detail.get("alloc_scale", 0.0) or 0.0)
-                    if is_group else float(detail.get("total", 0.0) or 0.0)
-                )
-                if val <= 0.0:
-                    continue
-                scalable = comp_name not in fixed_state_comps
-                kv_scaled = scalable and (comp_name in KV_DTYPE_SENSITIVE_COMPONENTS)
-                comp_scalable[comp_name] = scalable
-                comp_kv_scaled[comp_name] = kv_scaled
-                if kv_scaled and comp_name in exact_override_stage_bytes:
-                    used_exact_override.add(comp_name)
-                else:
-                    ratio = _cache_dtype_override_ratio(model, cache_dtype, component=comp_name) if kv_scaled else 1.0
-                    comp_stage_bytes[comp_name][st_idx] += val * ratio
-    for comp_name in used_exact_override:
-        comp_stage_bytes[comp_name] = list(exact_override_stage_bytes[comp_name])
-
-
-def _compute_cache_ledger_rows(
-    case: Case,
-    mem: Memory,
-    alloc_cache: Mapping[str, Any],
-    *,
-    stage_layers: Sequence[int],
-    cache_dtype: str,
-    seq_len: int,
-    concurrency: int,
-    block_size: int,
-    spec_tokens: int,
-) -> tuple[int, tuple[CacheLedgerRow, ...], list[float], list[float]]:
-    """Unify cache ledger rows directly onto ``Memory(case)`` (including Draft KV & page groups)."""
-    model = case.model
+def stage_layer_counts(case: Case) -> tuple[int, ...]:
     p = case.runtime.parallel
-    dcp = max(1, int(p.cp))
-    n_stages = len(stage_layers)
-    local_tokens = math.ceil(max(1, seq_len) / (max(1, block_size) * dcp)) * max(1, block_size)
-    layer_stage = [s for s, count in enumerate(stage_layers) for _ in range(count)]
-    comp_stage_bytes: dict[str, list[float]] = defaultdict(lambda: [0.0] * n_stages)
-    comp_stage_layers: dict[str, list[int]] = defaultdict(lambda: [0] * n_stages)
-    comp_scalable: dict[str, bool] = {}
-
-    for lp in model.layer_plans:
-        stage = layer_stage[lp.index] if lp.index < len(layer_stage) else 0
-        raw_comps = layer_cache_components(
-            model, lp, p, max(1, seq_len),
-            capacity_padded=True,
-            interleave=INDEX_INTERLEAVE_TOKENS,
-            runtime=case.runtime,
-            query_tokens=max(1, 1 + spec_tokens),
-        )
-        for comp_name, val in raw_comps.items():
-            if val > 0.0:
-                comp_stage_layers[comp_name][stage] += 1
-
-    base_cache_dtype = _normalize_cache_dtype(model)
-    exact_override_stage_bytes = (
-        _exact_kv_stage_bytes_for_dtype(case, cache_dtype, stage_layers, seq_len, spec_tokens)
-        if cache_dtype != base_cache_dtype else {}
-    )
-    alloc_summary = alloc_cache.get("allocated") or {}
-    reserves = alloc_summary.get("reserve_bytes_per_stage_rank") or ()
-    metadatas = alloc_summary.get("metadata_bytes_per_stage_rank") or ()
-    comp_kv_scaled: dict[str, bool] = {}
-    _accumulate_alloc_cache_components(
-        model, alloc_cache.get("components") or (), n_stages=n_stages, cache_dtype=cache_dtype,
-        exact_override_stage_bytes=exact_override_stage_bytes,
-        comp_stage_bytes=comp_stage_bytes, comp_scalable=comp_scalable, comp_kv_scaled=comp_kv_scaled,
-    )
-    _add_fixed_cache_stage_values(
-        "page_group_reserve", reserves, stage_layers,
-        comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
-    )
-    stride_reserves = mem._unified_pool_stride_reserve_by_stage(max(1, seq_len))
-    _add_fixed_cache_stage_values(
-        "page_group_reserve", stride_reserves, stage_layers,
-        comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
-    )
-    _add_fixed_cache_stage_values(
-        "page_metadata", metadatas, stage_layers,
-        comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
-    )
-    if cache_dtype == "C8" and (_GQA_CACHE_COMPONENTS & set(comp_stage_bytes)):
-        c8_static_b, c8_gqa_layers = _gqa_c8_static_scale_bytes_by_stage(case, stage_layers, block_size)
-        amortized_static = [v / float(max(1, concurrency)) for v in c8_static_b]
-        _add_fixed_cache_stage_values(
-            "c8_static_channel_scale", amortized_static, stage_layers,
-            comp_stage_bytes, comp_stage_layers, comp_scalable, comp_kv_scaled,
-            layer_counts=c8_gqa_layers,
-        )
-
-    if int(getattr(p, "dcp_dp_width", 1) or 1) > 1:
-        if "dcp_dp_cohort_kv" in exact_override_stage_bytes:
-            extras: Sequence[float] = exact_override_stage_bytes["dcp_dp_cohort_kv"]
-        else:
-            cohort_ratio = _cache_dtype_override_ratio(model, cache_dtype, component="dcp_dp_cohort_kv")
-            cohort_totals = mem.dp_cohort_cache_bytes(max(1, seq_len), padded=True)
-            base_totals = mem.cache_bytes(max(1, seq_len), padded=True)
-            extras = [
-                (float(cohort_totals[st]) - float(base_totals[st])) * cohort_ratio
-                for st in range(min(n_stages, len(cohort_totals), len(base_totals)))
-            ]
-        for st_idx, extra in enumerate(extras):
-            if extra > MIN_DENOM_EPS:
-                comp_scalable["dcp_dp_cohort_kv"] = True
-                comp_kv_scaled["dcp_dp_cohort_kv"] = True
-                comp_stage_bytes["dcp_dp_cohort_kv"][st_idx] += extra
-                comp_stage_layers["dcp_dp_cohort_kv"][st_idx] = max(1, int(stage_layers[st_idx]))
-
-    if "draft_kv" in comp_stage_bytes and sum(comp_stage_layers["draft_kv"]) == 0:
-        aux = getattr(model, "auxiliary", None)
-        draft_obj = getattr(aux, mem.draft_kind, None) if (aux is not None and mem.draft_kind) else None
-        draft_layers = max(1, int(getattr(draft_obj, "layers", 1) or 1))
-        comp_stage_layers["draft_kv"][-1] = draft_layers
-
-    kv_scaled_comps = {c for c, flag in comp_kv_scaled.items() if flag}
-    per_dtype_stage_bytes: dict[str, dict[str, list[float]]] = {}
-    if kv_scaled_comps:
-        tracked_comps = kv_scaled_comps | ({"page_group_reserve"} if "page_group_reserve" in comp_stage_bytes else set())
-        for dt_opt in _hw_cache_dtype_options(case, cache_dtype):
-            if dt_opt == cache_dtype:
-                per_dtype_stage_bytes[dt_opt] = {c: list(comp_stage_bytes[c]) for c in tracked_comps if c in comp_stage_bytes}
-            else:
-                per_dtype_stage_bytes[dt_opt] = _exact_kv_stage_bytes_for_dtype(case, dt_opt, stage_layers, seq_len, spec_tokens)
-
-    rows, stage_totals, stage_per_req_totals = _build_cache_ledger_row_list(
-        model=model, comp_stage_bytes=comp_stage_bytes, comp_stage_layers=comp_stage_layers,
-        comp_scalable=comp_scalable, comp_kv_scaled=comp_kv_scaled,
-        per_dtype_stage_bytes=per_dtype_stage_bytes, n_stages=n_stages,
-        local_tokens=local_tokens, concurrency=concurrency, cache_dtype=cache_dtype,
-    )
-    return local_tokens, rows, stage_totals, stage_per_req_totals
-
-
-def _is_vision_term(term: WeightTerm) -> bool:
-    cat = str(term.category or "").lower()
-    fam = cat.split(".", 1)[0]
-    if cat in _VISION_CATEGORIES or fam in _VISION_CATEGORIES:
-        return True
-    return str(term.name or "").lower().startswith(_VISION_NAME_PREFIXES)
-
-
-def _linear_format_for_preset(resolved_wq: str) -> str:
-    if resolved_wq == "W4A8":
-        return "W8A8"
-    if resolved_wq == "MXFP4":
-        return "MXFP8"
-    return resolved_wq
-
-
-def _resolve_term_quant_format(
-    term: WeightTerm,
-    model_quant: QuantSpec | None,
-    resolved_wq: str,
-    *,
-    explicit_override: bool,
-    apply_preset_to_ignored: bool = False,
-    checkpoint: NpuCheckpointSpec | None = None,
-    hw_family: str = "",
-) -> tuple[str, bool, str, str]:
-    cat = str(term.category or "")
-    fam = cat.split(".", 1)[0]
-    term_quant = term.runtime_quant or term.quant or model_quant
-    linear_rule = (
-        QUANT_RULE_PRESET_LINEAR_W8A8
-        if hw_family in _A23_HW_FAMILIES else QUANT_RULE_PRESET_LINEAR_FP8
-    )
-    if not explicit_override and not apply_preset_to_ignored and term.runtime_dtype:
-        rt_fmt = _QUANT_FORMAT_DISPLAY.get(str(term.runtime_dtype).strip().lower(), "BF16")
-        rt_rule = QUANT_RULE_FIXED_FP32 if rt_fmt == "FP32" else QUANT_RULE_FIXED_BF16
-        return rt_fmt, (rt_fmt in {"BF16", "FP32"}), f"Runtime {rt_fmt} param", rt_rule
-    if cat == "engram_table" and not explicit_override and not apply_preset_to_ignored and term_quant is not None:
-        e_mode = str(getattr(term_quant, "engram_table_mode", "device_bf16") or "device_bf16").lower()
-        if e_mode in {"host_fp8_e8m0", "source_fp8_e8m0"}:
-            return "MXFP8", False, f"Engram table ({e_mode})", QUANT_RULE_FIXED_BF16
-        if e_mode == "device_int8_fp32":
-            return "W8A8", False, f"Engram table ({e_mode})", QUANT_RULE_FIXED_BF16
-        return "BF16", True, f"Engram table ({e_mode})", QUANT_RULE_FIXED_BF16
-    if fam in _FIXED_FP32_CATEGORIES or cat in _FIXED_FP32_CATEGORIES:
-        return "FP32", True, "FP32 param", QUANT_RULE_FIXED_FP32
-    if fam in _FIXED_BF16_CATEGORIES or cat in _FIXED_BF16_CATEGORIES or _is_ple_category(cat) or _is_ple_category(fam):
-        note = "Vision ViT BF16" if _is_vision_term(term) else "Native BF16 structural/head param"
-        return "BF16", True, note, QUANT_RULE_FIXED_BF16
-
-    is_w4_expert = cat in _W4A8_EXPERT_ONLY_CATEGORIES or fam in _W4A8_EXPERT_ONLY_CATEGORIES
-    is_mxfp4_expert = cat in _MXFP4_EXPERT_CATEGORIES or fam in _MXFP4_EXPERT_CATEGORIES
-    if term_quant is not None:
-        exclusions = set(getattr(term_quant, "exclusions", ()) or ())
-        if cat in exclusions or fam in exclusions:
-            if apply_preset_to_ignored:
-                over_fmt = resolved_wq if is_mxfp4_expert else _linear_format_for_preset(resolved_wq)
-                return over_fmt, False, f"Override ignore -> {over_fmt}", QUANT_RULE_CHECKPOINT_IGNORE
-            native = _QUANT_FORMAT_DISPLAY.get(str(term_quant.native_format or "bf16").lower(), "BF16")
-            return native, True, "quantization_config.ignore -> BF16", QUANT_RULE_CHECKPOINT_IGNORE
-        if not explicit_override:
-            resolved_q = term_quant.for_category(cat)
-            eff_raw = str(resolved_q.format_for(cat) or "bf16").lower()
-            lin_method = str(resolved_q.linear_method(cat) or "").lower()
-            act_fmt = str(getattr(resolved_q, "activation_format", "") or "").lower()
-            w_blk = tuple(getattr(resolved_q, "weight_block", (0, 0)) or (0, 0))
-            if lin_method == "mx_fp8" or (
-                eff_raw in {"fp8", "fp8_e4m3", "fp8_e5m2"} and w_blk == (1, MXFP_GROUP_SIZE)
-            ):
-                mapped = "MXFP8"
-            elif lin_method == "mx_fp4":
-                mapped = "MXFP4"
-            elif lin_method == "w4a16" or (eff_raw == "int4" and act_fmt in _FLOAT16_FORMATS):
-                mapped = "W4A16"
-            else:
-                mapped = _QUANT_FORMAT_DISPLAY.get(eff_raw, resolved_wq)
-            if resolved_wq == "W4A8" and not is_w4_expert and mapped == "W4A8":
-                mapped = "W8A8"
-            note = (
-                "MXFP4 (group=32)" if mapped == "MXFP4"
-                else ("MXFP8 (group=32 E8M0)" if mapped == "MXFP8"
-                      else ("W4A16 (INT4 Group-32, BF16 Act)" if mapped == "W4A16"
-                            else ("W4A8_DYNAMIC (INT4 Packed Expert)" if mapped == "W4A8"
-                                  else ("W8A8_DYNAMIC (INT8 Linear)" if mapped == "W8A8" else mapped))))
-            )
-            rule = QUANT_RULE_FOLLOW_PRESET if (is_mxfp4_expert or is_w4_expert) else linear_rule
-            return mapped, (mapped == "BF16"), note, rule
-    elif checkpoint is not None and not explicit_override:
-        wt_q = classify_weight_tensor_quant(term.name, checkpoint)
-        if wt_q.ledger_format in WEIGHT_QUANT_FORMATS:
-            mapped = wt_q.ledger_format
-            rule = (
-                QUANT_RULE_CHECKPOINT_IGNORE
-                if not wt_q.is_quantized
-                else (QUANT_RULE_FOLLOW_PRESET if (is_mxfp4_expert or is_w4_expert) else linear_rule)
-            )
-            return mapped, (not wt_q.is_quantized), f"{checkpoint.repo_id} ({wt_q.raw_tag})", rule
-
-    if resolved_wq == "W4A8" and not is_w4_expert:
-        return "W8A8", False, "W8A8_DYNAMIC (INT8 Linear under W4A8)", linear_rule
-    if resolved_wq == "MXFP4" and not is_mxfp4_expert and explicit_override:
-        return "MXFP8", False, "MXFP8 Linear under MXFP4", linear_rule
-    note = (
-        "MXFP4 (group=32)" if resolved_wq == "MXFP4"
-        else ("MXFP8 (group=32 E8M0)" if resolved_wq == "MXFP8"
-              else ("W4A16 (INT4 Group-32, BF16 Act)" if resolved_wq == "W4A16"
-                    else ("W4A8_DYNAMIC (INT4 Packed Expert)" if resolved_wq == "W4A8"
-                          else ("W8A8_DYNAMIC (INT8)" if resolved_wq == "W8A8" else resolved_wq))))
-    )
-    rule = QUANT_RULE_FOLLOW_PRESET if (is_mxfp4_expert or is_w4_expert) else linear_rule
-    return resolved_wq, (resolved_wq == "BF16"), note, rule
-
-
-def _resolve_weight_placement_flags(case: Case) -> tuple[bool, bool, bool]:
-    """Match ``Memory._init_weights`` resident weight placement flags."""
-    meta = dict(case.runtime.metadata)
-    raw_extra = meta.get("additional_config")
-    extra = dict(raw_extra) if isinstance(raw_extra, Mapping) else {}
-    shared_expert_dp = bool(meta.get("enable_shared_expert_dp", False))
-    pcp_o_proj_shard = bool(
-        meta.get(
-            "enable_pcp_o_proj_weight_sharding",
-            extra.get("enable_pcp_o_proj_weight_sharding", False),
-        )
-    )
-    p = case.runtime.parallel
-    has_sparse_mla = any(
-        lp.indexer or lp.owns_topk or lp.topk_owner_layer_id >= 0 or lp.index_k_owner_layer_id >= 0
-        for lp in case.model.layer_plans
-    )
-    dcp_q_rep = (
-        int(p.cp) > 1
-        and dcp_q_replicate_enabled(
-            case.runtime,
-            pcp_factor=int(p.dcp_pcp_factor),
-            dp_width=int(p.dcp_dp_width),
-            sparse=has_sparse_mla,
-        )
-    )
-    return shared_expert_dp, pcp_o_proj_shard, dcp_q_rep
-
-
-def _price_evaluated_term(
-    term: WeightTerm,
-    quant_spec: QuantSpec,
-    placed_parallel: Any,
-    ranks_per_node: int,
-    quant_fmt: str,
-    local_cnt: int,
-) -> tuple[int, int, int, int]:
-    """Compute exact per-instance ``(payload, scale, aux, total)`` bytes from canonical term math."""
-    cnt = max(1, int(local_cnt))
-    total_all = term_bytes(term, quant_spec, placed_parallel, ranks_per_node)
-    payload_all = term_payload_bytes(term, quant_spec, placed_parallel, ranks_per_node)
-    total_1 = int(round(total_all / float(cnt)))
-    payload_1 = int(round(payload_all / float(cnt)))
-    meta_1 = max(0, total_1 - payload_1)
-    if quant_fmt in {"W8A8", "W4A8", "INT8", "INT4"} and term.category != "engram_table":
-        rep_q = (term.runtime_quant or term.quant or quant_spec).for_category(term.category)
-        if quant_fmt in {"W4A8", "INT4"} and int(getattr(rep_q, "expert_block", 1) or 1) > 1:
-            scale_1, aux_1 = meta_1, 0
-        else:
-            scale_1, aux_1 = 0, meta_1
-    else:
-        scale_1, aux_1 = meta_1, 0
-    return payload_1, scale_1, aux_1, total_1
-
-
-def _append_prepared_weight_entries(
-    grouped: dict[tuple[Any, ...], dict[str, Any]],
-    mem: Memory,
-    pp: int,
-    prepared_weights: Sequence[PreparedWeightSpec],
-) -> None:
-    """Include persistent non-aliased ``PreparedWeightSpec`` runtime HBM copies."""
-    for spec in prepared_weights:
-        if not isinstance(spec, PreparedWeightSpec):
-            continue
-        if spec.alias_of or spec.lifetime == "load_peak_only":
-            continue
-        total_1 = int(prepared_weight_bytes(spec))
-        if total_1 <= 0:
-            continue
-        shape = tuple(int(d) for d in spec.local_shape) if spec.local_shape else (1, 1)
-        local_r = shape[0]
-        local_c = math.prod(shape[1:]) if len(shape) > 1 else 1
-        payload_1 = int(exact_element_bytes(math.prod(shape), spec.dtype)) if spec.local_shape else 0
-        aux_1 = max(0, total_1 - payload_1)
-        dtype_low = str(spec.dtype or "bf16").strip().lower()
-        q_fmt = _QUANT_FORMAT_DISPLAY.get(dtype_low, "FP32" if "64" in dtype_low or "32" in dtype_low else "BF16")
-        q_rule = QUANT_RULE_FIXED_FP32 if q_fmt == "FP32" else QUANT_RULE_FIXED_BF16
-        stages: list[int] = []
-        if spec.layer_indices:
-            for layer_idx in spec.layer_indices:
-                st = mem.layer_stage[layer_idx] if 0 <= layer_idx < len(mem.layer_stage) else pp - 1
-                stages.append(st)
-        else:
-            stages.append(pp - 1 if spec.scope == "draft" else 0)
-        key = (
-            "prepared_weight", spec.allocation_id, local_r, local_c, local_r, local_c,
-            "Prepared", False, False, q_fmt, payload_1, 0, aux_1,
-        )
-        entry = grouped.get(key)
-        if entry is None:
-            entry = {
-                "category": "prepared_weight",
-                "name": spec.allocation_id,
-                "global_rows": local_r,
-                "global_cols": local_c,
-                "shard_rule": "Prepared",
-                "axis": 0,
-                "local_rows": local_r,
-                "local_cols": local_c,
-                "stage_repeats": [0] * pp,
-                "is_engram": False,
-                "is_vision": False,
-                "quant": q_fmt,
-                "is_excluded": True,
-                "quant_note": f"Prepared runtime copy ({spec.transform}, {spec.dtype})",
-                "quant_rule": q_rule,
-                "payload_1": payload_1,
-                "scale_1": 0,
-                "aux_1": aux_1,
-                "total_1": total_1,
-                "group_override": _PREPARED_WEIGHT_GROUP,
-            }
-            grouped[key] = entry
-        for st_idx in stages:
-            if 0 <= st_idx < pp:
-                entry["stage_repeats"][st_idx] += 1
-
-
-def _weight_group_label(category: str, name: str = "") -> str:
-    lower = category.lower()
-    n_low = name.lower()
-    if lower in _ENGRAM_CATEGORIES or "engram" in lower or "ple" in lower:
-        return "Engram / PLE"
-    if "vision" in lower or "projector" in lower or "image" in lower or n_low.startswith(_VISION_NAME_PREFIXES):
-        return "Vision"
-    if "expert" in lower or "router" in lower or "moe" in lower:
-        return "MoE"
-    if "mla" in lower or "indexer" in lower or ("attn" in lower and "attn_res" not in lower) or "compressor" in lower:
-        return "Attention / MLA"
-    if "kda" in lower or "gdn" in lower or "conv" in lower or "linear" in lower:
-        return "LinearAttn"
-    if "mlp" in lower or "ffn" in lower:
-        return "Dense FFN"
-    if lower in {"embedding", "lm_head"}:
-        return "Head / Embedding"
-    return "Norm / Residual"
-
-
-def _collect_weight_ledger_rows(
-    case: Case,
-    mem: Memory,
-    stage_layers: Sequence[int],
-    resolved_wq: str,
-    *,
-    explicit_override: bool,
-    include_vision_tower: bool = False,
-    apply_preset_to_ignored: bool = False,
-    engram_host_offload: bool = False,
-    prepared_weights: Sequence[PreparedWeightSpec] = (),
-) -> tuple[
-    tuple[WeightLedgerRow, ...],
-    list[float],
-    list[float],
-    list[float],
-    list[float],
-    list[float],
-    int,
-]:
-    p = case.runtime.parallel
-    shared_expert_dp, pcp_o_proj_shard, dcp_q_rep = _resolve_weight_placement_flags(case)
-    stage_terms = stage_weight_terms(
-        case.model, p,
-        include_draft=bool(mem.draft_kind),
-        include_engram=True,
-        include_engram_tables=True,
-        include_vision=(True if case.model.vision is not None else None),
-        layer_partition=stage_layers,
-        draft_kind=mem.draft_kind or None,
-        slot_plans=mem.slot_plans,
-    )
-    engram_names = {t.name for t in engram_table_terms(case.model)}
-    hw_fam = normalize_hw_family(str(case.machine.sku or case.machine.name or "a5"))
-    default_ckpt = resolve_default_checkpoint(str(case.model.name or ""), hw_family=hw_fam)
-    quant_spec = case.model.quant or QuantSpec("bf16")
-    use_canonical_bytes = (not explicit_override) and (not apply_preset_to_ignored)
-    grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
-    for stage_idx, terms in enumerate(stage_terms):
-        for term in terms:
-            if not term.runtime_owned:
-                continue
-            for t_sub, placed in _expand_resident_terms(
-                term, p, shared_expert_dp,
-                pcp_o_proj_weight_sharding=pcp_o_proj_shard,
-                dcp_q_replicate=dcp_q_rep,
-                model=case.model,
-            ):
-                local_r, local_c, local_cnt = _sharded_shape(t_sub, placed, case.machine.ranks_per_node)
-                shard_rule, axis = _resolve_shard_axis_and_rule(t_sub, placed, p)
-                is_engram = (
-                    t_sub.category in _ENGRAM_CATEGORIES
-                    or _is_ple_category(t_sub.category)
-                    or t_sub.name in engram_names
-                    or "engram_table" in t_sub.name.lower()
-                    or "ple_table" in t_sub.name.lower()
-                )
-                is_vis = _is_vision_term(t_sub)
-                quant_fmt, is_excl, q_note, q_rule = _resolve_term_quant_format(
-                    t_sub, case.model.quant, resolved_wq,
-                    explicit_override=explicit_override,
-                    apply_preset_to_ignored=apply_preset_to_ignored,
-                    checkpoint=default_ckpt,
-                    hw_family=hw_fam,
-                )
-                if use_canonical_bytes:
-                    payload_1, scale_1, aux_1, total_1 = _price_evaluated_term(
-                        t_sub, quant_spec, placed, case.machine.ranks_per_node, quant_fmt, local_cnt,
-                    )
-                else:
-                    payload_1, scale_1, aux_1, total_1 = evaluate_weight_storage_bytes(
-                        local_r, local_c, quant_fmt,
-                    )
-                key = (
-                    t_sub.category, t_sub.name, int(t_sub.rows), int(t_sub.cols),
-                    int(local_r), int(local_c), shard_rule, is_engram, is_vis,
-                    quant_fmt, payload_1, scale_1, aux_1,
-                )
-                entry = grouped.get(key)
-                if entry is None:
-                    entry = {
-                        "category": t_sub.category,
-                        "name": t_sub.name,
-                        "global_rows": int(t_sub.rows),
-                        "global_cols": int(t_sub.cols),
-                        "shard_rule": shard_rule,
-                        "axis": axis,
-                        "local_rows": int(local_r),
-                        "local_cols": int(local_c),
-                        "stage_repeats": [0] * p.pp,
-                        "is_engram": is_engram,
-                        "is_vision": is_vis,
-                        "quant": quant_fmt,
-                        "is_excluded": is_excl,
-                        "quant_note": q_note,
-                        "quant_rule": q_rule,
-                        "payload_1": payload_1,
-                        "scale_1": scale_1,
-                        "aux_1": aux_1,
-                        "total_1": total_1,
-                    }
-                    grouped[key] = entry
-                entry["stage_repeats"][stage_idx] += max(1, int(local_cnt))
-
-    if prepared_weights:
-        _append_prepared_weight_entries(grouped, mem, int(p.pp), prepared_weights)
-
-    return _finalize_weight_ledger_rows(
-        grouped, p.pp,
-        include_vision_tower=include_vision_tower,
-        engram_host_offload=engram_host_offload,
-    )
-
-
-def _finalize_weight_ledger_rows(
-    grouped: Mapping[tuple[Any, ...], dict[str, Any]],
-    pp: int,
-    *,
-    include_vision_tower: bool,
-    engram_host_offload: bool,
-) -> tuple[
-    tuple[WeightLedgerRow, ...],
-    list[float],
-    list[float],
-    list[float],
-    list[float],
-    list[float],
-    int,
-]:
-    stage_w_payload = [0.0] * pp
-    stage_w_scale = [0.0] * pp
-    stage_engram_total = [0.0] * pp
-    stage_native_bf16 = [0.0] * pp
-    stage_vision_total = [0.0] * pp
-    evaluated: list[tuple[dict[str, Any], int, int, int, int, int, tuple[int, ...], int]] = []
-    for entry in grouped.values():
-        payload_1 = int(entry["payload_1"])
-        scale_1 = int(entry["scale_1"])
-        aux_1 = int(entry["aux_1"])
-        total_1 = int(entry["total_1"])
-        native_bf16_1 = int(entry["local_rows"]) * int(entry["local_cols"]) * BF16_BYTES
-        repeats = tuple(entry["stage_repeats"])
-        max_rep = max(repeats, default=0)
-        for st_idx, rep in enumerate(repeats):
-            if rep <= 0:
-                continue
-            if entry["is_engram"]:
-                stage_engram_total[st_idx] += float(total_1 * rep)
-            elif entry["is_vision"]:
-                stage_vision_total[st_idx] += float(total_1 * rep)
-                if include_vision_tower:
-                    stage_w_payload[st_idx] += float(payload_1 * rep)
-                    stage_w_scale[st_idx] += float((scale_1 + aux_1) * rep)
-                    stage_native_bf16[st_idx] += float(native_bf16_1 * rep)
-            else:
-                stage_w_payload[st_idx] += float(payload_1 * rep)
-                stage_w_scale[st_idx] += float((scale_1 + aux_1) * rep)
-                stage_native_bf16[st_idx] += float(native_bf16_1 * rep)
-        evaluated.append((entry, payload_1, scale_1, aux_1, total_1, native_bf16_1, repeats, max_rep))
-
-    peak_stage = max(
-        range(pp),
-        key=lambda st: (
-            stage_w_payload[st]
-            + stage_w_scale[st]
-            + (0.0 if engram_host_offload else stage_engram_total[st])
-        ),
-        default=0,
-    )
-    weight_rows: list[WeightLedgerRow] = []
-    for entry, payload_1, scale_1, aux_1, total_1, native_bf16_1, repeats, max_rep in evaluated:
-        is_hbm_row = (
-            not (entry["is_engram"] and engram_host_offload)
-            and not (entry["is_vision"] and not include_vision_tower)
-        )
-        peak_rep = repeats[peak_stage] if peak_stage < len(repeats) else 0
-        row_rep = peak_rep if is_hbm_row else max_rep
-        grp_lbl = str(entry.get("group_override") or _weight_group_label(entry["category"], entry["name"]))
-        weight_rows.append(WeightLedgerRow(
-            group=grp_lbl,
-            name=entry["name"],
-            category=entry["category"],
-            global_rows=entry["global_rows"],
-            global_cols=entry["global_cols"],
-            shard_rule=entry["shard_rule"],
-            shard_axis=entry["axis"],
-            local_rows=entry["local_rows"],
-            local_cols=entry["local_cols"],
-            stage_repeats=repeats,
-            max_stage_repeats=max_rep,
-            quant_format=entry["quant"],
-            payload_bytes=payload_1 * row_rep,
-            scale_bytes=scale_1 * row_rep,
-            aux_bytes=aux_1 * row_rep,
-            per_die_bytes=total_1 * row_rep,
-            is_engram_or_ple=entry["is_engram"],
-            is_quant_excluded=entry["is_excluded"],
-            quant_note=entry["quant_note"],
-            native_bf16_bytes=native_bf16_1 * row_rep,
-            quant_rule=entry["quant_rule"],
-            is_vision=entry["is_vision"],
-            peak_stage_repeats=row_rep,
-        ))
-    weight_rows.sort(key=lambda r: (r.group, r.name))
-    return (
-        tuple(weight_rows),
-        stage_w_payload,
-        stage_w_scale,
-        stage_engram_total,
-        stage_native_bf16,
-        stage_vision_total,
-        peak_stage,
-    )
-
-
-def _compute_max_hbm_concurrency(
-    case: Case,
-    stage_budgets: Sequence[StageBudgetRow],
-    stage_per_req_cache: Sequence[float],
-    fallback_conc: int,
-    *,
-    phase: str,
-    resolved_seq: int,
-    stage_fixed_cache: Sequence[float] = (),
-) -> int:
-    """Binary-search exact per-DP HBM concurrency honoring per-batch workspace growth."""
-    static_fixed = [
-        st.weight_payload_bytes
-        + st.weight_scale_aux_bytes
-        + st.engram_ple_hbm_bytes
-        + st.reserve_bytes
-        + (float(stage_fixed_cache[st.stage]) if st.stage < len(stage_fixed_cache) else 0.0)
-        for st in stage_budgets
-    ]
-    ws_1_tok = _resolve_ledger_workspace_tokens(
-        case, phase=phase, resolved_seq=resolved_seq, resolved_conc=1,
-    )
-    mem_1 = Memory(case, workspace_tokens=ws_1_tok)
-    ws_1 = [
-        float(mem_1.workspace[st.stage] if st.stage < len(mem_1.workspace) else 0.0)
-        + float(mem_1.temporary_dequant[st.stage] if st.stage < len(mem_1.temporary_dequant) else 0.0)
-        for st in stage_budgets
-    ]
-    caps: list[int] = []
-    for st, base_fixed, ws_b, per_req in zip(stage_budgets, static_fixed, ws_1, stage_per_req_cache):
-        avail = st.usable_hbm_budget_bytes - (base_fixed + ws_b)
-        if avail <= 0.0:
-            return 0
-        if per_req > 0.0:
-            caps.append(int(avail // per_req))
-    if not caps:
-        return max(0, int(fallback_conc))
-    hi = min(caps)
-    if hi <= 1:
-        return max(0, hi)
-
-    def _fits(cand_b: int) -> bool:
-        cand_ws_tok = _resolve_ledger_workspace_tokens(
-            case, phase=phase, resolved_seq=resolved_seq, resolved_conc=cand_b,
-        )
-        if cand_ws_tok <= ws_1_tok:
-            cand_ws = ws_1
-        else:
-            cand_mem = Memory(case, workspace_tokens=cand_ws_tok)
-            cand_ws = [
-                float(cand_mem.workspace[st.stage] if st.stage < len(cand_mem.workspace) else 0.0)
-                + float(cand_mem.temporary_dequant[st.stage] if st.stage < len(cand_mem.temporary_dequant) else 0.0)
-                for st in stage_budgets
-            ]
-        return all(
-            base_fixed + ws_b + float(cand_b) * per_req <= st.usable_hbm_budget_bytes
-            for st, base_fixed, ws_b, per_req in zip(stage_budgets, static_fixed, cand_ws, stage_per_req_cache)
-        )
-
-    if _fits(hi):
-        return hi
-    lo = 0
-    while lo + 1 < hi:
-        mid = (lo + hi) // 2
-        if _fits(mid):
-            lo = mid
-        else:
-            hi = mid
-    return lo
-
-
-def _build_stage_budget_rows(
-    *,
-    pp: int,
-    stage_layers: list[int],
-    stage_w_payload: list[float],
-    stage_w_scale: list[float],
-    stage_engram_total: list[float],
-    stage_cache_bytes: list[float],
-    stage_per_req_cache: list[float],
-    ws_by_stage: list[float],
-    deq_by_stage: list[float],
-    reserve_bytes: float,
-    usable_hbm: float,
-    engram_host_offload: bool,
-) -> tuple[StageBudgetRow, ...]:
-    rows: list[StageBudgetRow] = []
-    for st in range(pp):
-        engram_hbm = 0.0 if engram_host_offload else stage_engram_total[st]
-        engram_host = stage_engram_total[st] if engram_host_offload else 0.0
-        ws_peak = (ws_by_stage[st] if st < len(ws_by_stage) else 0.0) + (
-            deq_by_stage[st] if st < len(deq_by_stage) else 0.0
-        )
-        total_hbm = (
-            stage_w_payload[st] + stage_w_scale[st] + engram_hbm
-            + stage_cache_bytes[st] + ws_peak + reserve_bytes
-        )
-        rows.append(StageBudgetRow(
-            stage=st,
-            owned_layers=stage_layers[st],
-            weight_payload_bytes=stage_w_payload[st],
-            weight_scale_aux_bytes=stage_w_scale[st],
-            engram_ple_hbm_bytes=engram_hbm,
-            engram_ple_host_bytes=engram_host,
-            cache_bytes=stage_cache_bytes[st],
-            workspace_peak_bytes=ws_peak,
-            reserve_bytes=reserve_bytes,
-            total_hbm_bytes=total_hbm,
-            usable_hbm_budget_bytes=usable_hbm,
-            headroom_bytes=usable_hbm - total_hbm,
-            fits_hbm=total_hbm <= usable_hbm,
-            per_request_cache_bytes=stage_per_req_cache[st] if st < len(stage_per_req_cache) else 0.0,
-        ))
-    return tuple(rows)
+    part = case.runtime.pp_layer_partition
+    if part:
+        return tuple(int(v) for v in part)
+    total = int(case.model.layers)
+    return tuple(total // p.pp + (1 if st < total % p.pp else 0) for st in range(p.pp))
 
 
 def _resolve_ledger_workspace_tokens(
     case: Case, *, phase: str, resolved_seq: int, resolved_conc: int,
 ) -> int:
-    rt_meta = dict(case.runtime.metadata)
-    spec_tokens = int(rt_meta.get("draft_proposal_tokens", 0) or 0)
-    role_norm = str(rt_meta.get("deployment_role") or rt_meta.get("role") or "").strip().lower()
-    prompts = [int(getattr(req, "prompt_tokens", 0) or 0) for req in (getattr(case.workload, "requests", ()) or ())]
-    raw_prompt = max(prompts) if prompts else resolved_seq
-    prefill_ws = (
-        min(raw_prompt, int(case.runtime.max_num_batched_tokens))
-        if case.runtime.enable_chunked_prefill and int(case.runtime.max_num_batched_tokens) > 0
-        else raw_prompt
+    rt = case.runtime
+    if str(phase) == "prefill":
+        return max(1, int(rt.max_num_batched_tokens or resolved_seq))
+    meta = dict(rt.metadata)
+    prop = int(meta.get("draft_proposal_tokens", 0) or 0)
+    if rt.dspark is not None:
+        prop = max(prop, int(rt.dspark.speculative_tokens))
+    return max(1, int(resolved_conc) * (1 + max(0, prop)))
+
+
+def _case_with_weight_quant(
+    case: Case,
+    resolved_wq: str,
+    *,
+    apply_preset_to_ignored: bool,
+) -> Case:
+    base_q = require_model_quant(case.model)
+    exclusions = () if apply_preset_to_ignored else tuple(base_q.exclusions)
+    preset_map = {
+        "BF16": "bf16",
+        "W8A8": "w8a8_dynamic",
+        "W4A8": "w4a8_dynamic",
+        "MXFP8": "w8a8_mxfp8",
+        "MXFP4": "w4a8_mxfp4",
+    }
+    if resolved_wq in preset_map:
+        preset = quant_preset(preset_map[resolved_wq])
+        eff_excl = () if resolved_wq == "BF16" else (exclusions or tuple(preset.exclusions))
+        if apply_preset_to_ignored:
+            eff_excl = ()
+        new_q = replace(
+            preset,
+            kv_dtype=base_q.kv_dtype,
+            index_dtype=base_q.index_dtype,
+            native_format=base_q.native_format,
+            exclusions=eff_excl,
+        )
+    elif resolved_wq == "W4A16":
+        new_q = QuantSpec(
+            "w4a16", weight_format="bf16", activation_format="bf16",
+            expert_weight_format="int4", kv_dtype=base_q.kv_dtype,
+            index_dtype=base_q.index_dtype, native_format=base_q.native_format,
+            weight_block=(1, MXFP_GROUP_SIZE), scale_format="bf16",
+            scale_bytes=float(_W4A16_SCALE_BYTES), exclusions=exclusions,
+        )
+    elif resolved_wq == "FP8":
+        new_q = QuantSpec(
+            "fp8", weight_format="fp8_e4m3", activation_format="fp8_e4m3",
+            expert_weight_format="fp8_e4m3", kv_dtype=base_q.kv_dtype,
+            index_dtype=base_q.index_dtype, native_format=base_q.native_format,
+            exclusions=exclusions,
+        )
+    else:
+        return case
+    return replace(case, model=replace(case.model, quant=new_q))
+
+
+def _case_with_cache_dtype(case: Case, target_dtype: str) -> Case:
+    """Re-resolve full model cache ABI metadata and ``QuantSpec.kv_dtype`` for ``target_dtype``."""
+    canon = _canonicalize_cache_dtype_override(target_dtype)
+    kv_dt = _CANONICAL_CACHE_TO_KV_DTYPE.get(canon, "bf16")
+    base_q = require_model_quant(case.model)
+    new_q = replace(base_q, kv_dtype=kv_dt)
+    meta = dict(case.model.metadata)
+    if canon == "MXFP8":
+        meta["kv_cache_tag"] = _MXFP8_KV_TAG
+    else:
+        meta.pop("kv_cache_tag", None)
+    if canon != _normalize_cache_dtype(case.model):
+        # Clear pinned static row-width overrides that belong only to the original dtype.
+        meta.pop("cache_representations", None)
+    new_model = replace(
+        case.model,
+        quant=new_q,
+        kv_dtype=kv_dt,
+        metadata=tuple(sorted(meta.items())),
     )
-    decode_ws = max(1, resolved_conc * max(1, 1 + spec_tokens))
-    if role_norm == "pd_prefill" or str(phase or "").strip().lower() == "prefill":
-        return max(1, prefill_ws)
-    if role_norm == "pd_decode":
-        return decode_ws
-    return max(1, prefill_ws, decode_ws)
+    return replace(case, model=new_model)
 
 
-def _resolve_ledger_parameters(
+def _hw_cache_dtype_candidates(case: Case, active_dtype: str) -> tuple[str, ...]:
+    hw_family = normalize_hw_family(str(getattr(case.machine, "sku", "") or getattr(case.machine, "arch_family", "")))
+    if hw_family in _HW_FAMILY_A23:
+        base = ["BF16", "C8"]
+    elif hw_family == _HW_FAMILY_A5:
+        base = ["BF16", "FP8"]
+    else:
+        base = ["BF16", "C8", "FP8"]
+    if active_dtype not in base:
+        base.append(active_dtype)
+    return tuple(base)
+
+
+def _resolve_shard_axis_and_rule(
+    term: WeightTerm,
+    placed_parallel: Any,
+    global_rows: int,
+    global_cols: int,
+    local_rows: int,
+    local_cols: int,
+) -> tuple[int, str]:
+    del placed_parallel
+    shard = str(term.shard or "replicated")
+    if local_rows < global_rows and local_cols == global_cols:
+        return 0, f"{shard} (row/{max(1, global_rows // max(1, local_rows))})"
+    if local_cols < global_cols and local_rows == global_rows:
+        return 1, f"{shard} (col/{max(1, global_cols // max(1, local_cols))})"
+    if local_rows < global_rows and local_cols < global_cols:
+        return 0, f"{shard} (2d)"
+    return -1, shard
+
+
+def _weight_group_label(category: str, name: str = "") -> str:
+    low_c = str(category or "").lower()
+    low_n = str(name or "").lower()
+    if low_c in _VISION_CATEGORIES or low_n.startswith(_VISION_NAME_PREFIXES):
+        return "Vision / Multimodal"
+    if low_c in _ENGRAM_CATEGORIES or _is_ple_category(low_c):
+        return "Engram / PLE Memory"
+    if low_c in {"embedding", "lm_head", "norm", "norm_f32", "mhc", "ape", "param_fp32"}:
+        return "Embedding / Norm / Head"
+    if low_c in _EXPERT_CATEGORIES:
+        return "MoE Routed Experts"
+    if low_c in {"shared_expert", "moe.shared"}:
+        return "MoE Shared Experts"
+    if low_c in {"router", "router_bias"}:
+        return "MoE Router"
+    if low_c in {"dense_mlp", "dense_ffn", "ffn"}:
+        return "Dense FFN"
+    if "draft" in low_c or "dspark" in low_c or "mtp" in low_c:
+        return "Speculative Draft"
+    if "linear" in low_c or "kda" in low_c or "gdn" in low_c or "conv" in low_c or "a_log" in low_c or "dt_bias" in low_c:
+        return "Linear Attention (KDA / GDN)"
+    if "mla" in low_c or "indexer" in low_c or ("attn" in low_c and "attn_res" not in low_c) or "compressor" in low_c:
+        return "Attention / MLA"
+    return "Embedding / Norm / Head"
+
+
+def _classify_term_format_and_rule(
+    term: WeightTerm,
+    quant: QuantSpec,
+    resolved_wq: str,
+    hw_family: str,
+    checkpoint: NpuCheckpointSpec | None,
+    apply_preset_to_ignored: bool,
+) -> tuple[str, str, bool, str]:
+    """Return ``(quant_format, quant_rule, is_excluded, note)`` for one term."""
+    cat = str(term.category or "").lower()
+    eff_quant = term.runtime_quant or term.quant or quant
+    linear_rule = (
+        QUANT_RULE_PRESET_LINEAR_W8A8
+        if hw_family in _HW_FAMILY_A23 else QUANT_RULE_PRESET_LINEAR_FP8
+    )
+    rt_dtype = str(term.runtime_dtype or "").strip().lower()
+    if cat in _FIXED_FP32_CATEGORIES or rt_dtype == "fp32":
+        return "FP32", QUANT_RULE_FIXED_FP32, False, "FP32 fixed"
+    if cat in _FIXED_BF16_CATEGORIES or _is_vision_term(term) or rt_dtype in _FLOAT16_FORMATS:
+        return "BF16", QUANT_RULE_FIXED_BF16, False, "BF16 fixed"
+
+    raw_fmt = str(eff_quant.format_for(term.category)).strip().lower()
+    is_excluded = (not apply_preset_to_ignored) and (
+        str(term.category) in eff_quant.exclusions or raw_fmt in _FLOAT16_FORMATS
+    )
+    if checkpoint is not None and not apply_preset_to_ignored:
+        ckpt_cls = classify_weight_tensor_quant(term.category, checkpoint)
+        if str(getattr(ckpt_cls, "weight_format", "") or "").lower() in _FLOAT16_FORMATS and raw_fmt in _FLOAT16_FORMATS:
+            is_excluded = True
+
+    if raw_fmt in _FLOAT16_FORMATS:
+        if resolved_wq != "BF16" and cat not in _FIXED_BF16_CATEGORIES:
+            return "BF16", QUANT_RULE_CHECKPOINT_IGNORE, True, "checkpoint ignore"
+        return "BF16", QUANT_RULE_FOLLOW_PRESET, False, ""
+
+    if raw_fmt == "fp4_e2m1":
+        return "MXFP4", QUANT_RULE_FOLLOW_PRESET, False, ""
+    if raw_fmt == "int4":
+        if str(eff_quant.activation_format or "").strip().lower() in _FLOAT16_FORMATS or resolved_wq == "W4A16":
+            return "W4A16", QUANT_RULE_FOLLOW_PRESET, False, ""
+        return "W4A8", QUANT_RULE_FOLLOW_PRESET, False, ""
+    if raw_fmt == "int8":
+        rule = QUANT_RULE_FOLLOW_PRESET if cat in _EXPERT_CATEGORIES else linear_rule
+        return "W8A8", rule, is_excluded, ""
+    if raw_fmt.startswith("fp8"):
+        is_mx = str(eff_quant.scale_format or "").lower() == "fp8_e8m0" and tuple(eff_quant.weight_block or ()) == (1, MXFP_GROUP_SIZE)
+        fmt = "MXFP8" if is_mx else "FP8"
+        rule = QUANT_RULE_FOLLOW_PRESET if cat in _EXPERT_CATEGORIES else linear_rule
+        return fmt, rule, is_excluded, ""
+    return _canonicalize_weight_quant_override(raw_fmt), QUANT_RULE_FOLLOW_PRESET, is_excluded, ""
+
+
+def _describe_quant_display(
+    resolved_wq: str,
+    weight_rows: Sequence[WeightLedgerRow],
+) -> str:
+    if resolved_wq == "BF16":
+        return "BF16 (Full Precision)"
+    routed_fmts = {r.quant_format for r in weight_rows if r.category in _EXPERT_CATEGORIES}
+    non_routed_linear = [
+        r for r in weight_rows
+        if r.category not in _EXPERT_CATEGORIES
+        and r.category not in _FIXED_BF16_CATEGORIES
+        and r.category not in _FIXED_FP32_CATEGORIES
+        and not r.is_vision
+        and not r.is_engram_or_ple
+        and r.group != _PREPARED_WEIGHT_GROUP
+    ]
+    all_non_routed_bf16 = bool(non_routed_linear) and all(r.quant_format == "BF16" for r in non_routed_linear)
+    if resolved_wq == "MXFP4" and all_non_routed_bf16 and "MXFP4" in routed_fmts:
+        return "MXFP4 (Routed-Only, Attn/Shared BF16)"
+    if resolved_wq == "W4A16":
+        return "W4A16 (Routed INT4 Group-32, Activations BF16)"
+    if resolved_wq == "W4A8":
+        return "W4A8 (Routed INT4, Linear W8A8)"
+    if resolved_wq == "MXFP8":
+        return "MXFP8 (FP8 E4M3 + E8M0/32)"
+    return resolved_wq
+
+
+def _append_prepared_weight_entries(
+    grouped: dict[tuple[Any, ...], dict[str, Any]],
+    order: list[tuple[Any, ...]],
+    mem: Memory,
+    prepared_weights: Sequence[PreparedWeightSpec],
+    pp: int,
+) -> None:
+    """Append deduplicated persistent ``PreparedWeightSpec`` entries into weight table."""
+    seen_backings: set[tuple[int, str]] = set()
+    for spec_p in prepared_weights:
+        if not isinstance(spec_p, PreparedWeightSpec):
+            continue
+        if spec_p.alias_of or spec_p.lifetime == "load_peak_only":
+            continue
+        raw_b = prepared_weight_bytes(spec_p)
+        target_stages = (
+            [mem.layer_stage[i] if 0 <= i < len(mem.layer_stage) else pp - 1 for i in spec_p.layer_indices]
+            if spec_p.layer_indices else [pp - 1 if spec_p.scope == "draft" else 0]
+        )
+        st_reps = [0] * pp
+        for idx, st in enumerate(target_stages):
+            backing = f"{spec_p.allocation_id}:s{st}:i{idx}"
+            if (st, backing) in seen_backings:
+                continue
+            seen_backings.add((st, backing))
+            st_reps[st] += 1
+        if sum(st_reps) <= 0:
+            continue
+        l_rows = int(spec_p.local_shape[0]) if spec_p.local_shape else 1
+        l_cols = int(math.prod(spec_p.local_shape[1:])) if len(spec_p.local_shape) > 1 else 1
+        fmt_p = _canonicalize_weight_quant_override(spec_p.dtype)
+        key_p = (_PREPARED_WEIGHT_GROUP, spec_p.allocation_id, "prepared_weight", l_rows, l_cols, fmt_p)
+        grouped[key_p] = {
+            "group": _PREPARED_WEIGHT_GROUP, "name": spec_p.allocation_id,
+            "category": "prepared_weight", "g_rows": l_rows, "g_cols": l_cols,
+            "rule": f"prepared({spec_p.layout})", "axis": -1, "l_rows": l_rows, "l_cols": l_cols,
+            "q_fmt": fmt_p, "q_rule": QUANT_RULE_FIXED_BF16,
+            "is_excl": False, "q_note": spec_p.transform,
+            "is_engram": False, "is_vis": False,
+            "unit_p": raw_b, "unit_s": 0, "unit_a": 0, "unit_bf16": raw_b,
+            "stage_reps": st_reps,
+        }
+        order.append(key_p)
+
+
+def _finalize_weight_ledger_rows(
+    grouped: Mapping[tuple[Any, ...], Mapping[str, Any]],
+    order: Sequence[tuple[Any, ...]],
+    mem: Memory,
+    pp: int,
+    *,
+    peak_stage_override: int | None = None,
+) -> tuple[tuple[WeightLedgerRow, ...], list[int], list[int], list[int], int]:
+    """Materialize ``WeightLedgerRow`` tuples and per-stage payload/scale/engram sums."""
+    peak_stage = (
+        int(peak_stage_override)
+        if peak_stage_override is not None and 0 <= int(peak_stage_override) < pp
+        else max(range(pp), key=lambda st: float(mem.weights[st]))
+    )
+    stage_payload = [0] * pp
+    stage_scale_aux = [0] * pp
+    stage_engram_raw = [0] * pp
+    rows_out: list[WeightLedgerRow] = []
+    include_vit = mem.vision_accounting == "full_checkpoint"
+
+    for key in order:
+        rec = grouped[key]
+        reps = tuple(int(v) for v in rec["stage_reps"])
+        pk_rep = reps[peak_stage]
+        p_b = int(rec["unit_p"]) * pk_rep
+        s_b = int(rec["unit_s"]) * pk_rep
+        a_b = int(rec["unit_a"]) * pk_rep
+        rows_out.append(WeightLedgerRow(
+            group=rec["group"], name=rec["name"], category=rec["category"],
+            global_rows=rec["g_rows"], global_cols=rec["g_cols"],
+            shard_rule=rec["rule"], shard_axis=rec["axis"],
+            local_rows=rec["l_rows"], local_cols=rec["l_cols"],
+            stage_repeats=reps, max_stage_repeats=max(reps, default=0),
+            quant_format=rec["q_fmt"],
+            payload_bytes=p_b, scale_bytes=s_b, aux_bytes=a_b,
+            per_die_bytes=p_b + s_b + a_b,
+            is_engram_or_ple=rec["is_engram"],
+            is_quant_excluded=rec["is_excl"],
+            quant_note=rec["q_note"],
+            native_bf16_bytes=int(rec["unit_bf16"]) * pk_rep,
+            quant_rule=rec["q_rule"],
+            is_vision=rec["is_vis"],
+            peak_stage_repeats=pk_rep,
+        ))
+        for st in range(pp):
+            st_r = reps[st]
+            if st_r <= 0 or (rec["is_vis"] and not include_vit):
+                continue
+            if rec["is_engram"]:
+                stage_engram_raw[st] += (int(rec["unit_p"]) + int(rec["unit_s"]) + int(rec["unit_a"])) * st_r
+                continue
+            stage_payload[st] += int(rec["unit_p"]) * st_r
+            stage_scale_aux[st] += (int(rec["unit_s"]) + int(rec["unit_a"])) * st_r
+
+    return tuple(rows_out), stage_payload, stage_scale_aux, stage_engram_raw, peak_stage
+
+
+def _collect_weight_ledger_entries(
+    case: Case,
+    mem: Memory,
+    *,
+    resolved_wq: str,
+    hw_family: str,
+    apply_preset_to_ignored: bool,
+    prepared_weights: Sequence[PreparedWeightSpec],
+) -> tuple[dict[tuple[Any, ...], dict[str, Any]], list[tuple[Any, ...]]]:
+    """Collect deduplicated canonical weight terms and persistent prepared entries."""
+    model = case.model
+    p = case.runtime.parallel
+    pp = max(1, int(p.pp))
+    quant = require_model_quant(model)
+    checkpoint = resolve_default_checkpoint(model.name, hw_family=hw_family)
+    all_stage_terms = stage_weight_terms(
+        model, p,
+        include_draft=bool(mem.draft_kind),
+        draft_kind=mem.draft_kind or None,
+        include_engram_tables=True,
+        include_vision=True,
+        layer_partition=mem.layers,
+        slot_plans=mem.slot_plans,
+    )
+    shared_dp = bool(getattr(mem, "enable_shared_expert_dp", False))
+    pcp_o_proj = bool(getattr(mem, "enable_pcp_o_proj_weight_sharding", False))
+    dcp_q_rep = bool(getattr(mem, "dcp_q_replicate", False))
+    node_ranks = int(case.machine.ranks_per_node)
+
+    grouped: dict[tuple[Any, ...], dict[str, Any]] = {}
+    order: list[tuple[Any, ...]] = []
+    for st in range(pp):
+        for term in all_stage_terms[st]:
+            if not term.runtime_owned:
+                continue
+            expanded = _expand_resident_terms(
+                term, p, shared_dp,
+                pcp_o_proj_weight_sharding=pcp_o_proj,
+                dcp_q_replicate=dcp_q_rep,
+                model=model,
+            )
+            for t_sub, placed in expanded:
+                if not t_sub.runtime_owned:
+                    continue
+                g_rows, g_cols = int(t_sub.rows), int(t_sub.cols)
+                l_rows, l_cols, l_count = _sharded_shape(t_sub, placed, node_ranks)
+                if l_count <= 0:
+                    continue
+                q_fmt, q_rule, is_excl, q_note = _classify_term_format_and_rule(
+                    t_sub, quant, resolved_wq, hw_family, checkpoint, apply_preset_to_ignored,
+                )
+                tot_b = int(round(term_bytes(t_sub, quant, placed, node_ranks)))
+                pay_b = int(round(term_payload_bytes(t_sub, quant, placed, node_ranks)))
+                unit_total = tot_b // l_count
+                unit_payload = pay_b // l_count
+                unit_meta = max(0, unit_total - unit_payload)
+                spec = WEIGHT_QUANT_FORMATS.get(q_fmt, WEIGHT_QUANT_FORMATS["BF16"])
+                unit_scale, unit_aux = (unit_meta, 0) if int(spec["group"]) > 0 else (0, unit_meta)
+                axis, rule_str = _resolve_shard_axis_and_rule(
+                    t_sub, placed, g_rows, g_cols, l_rows, l_cols,
+                )
+                is_engram = str(t_sub.category or "").lower() in _ENGRAM_CATEGORIES
+                is_vis = _is_vision_term(t_sub)
+                key = (
+                    _weight_group_label(t_sub.category, t_sub.name),
+                    str(t_sub.name), str(t_sub.category),
+                    g_rows, g_cols, rule_str, axis, l_rows, l_cols,
+                    q_fmt, q_rule, is_engram, is_vis, unit_payload, unit_scale, unit_aux,
+                )
+                rec = grouped.get(key)
+                if rec is None:
+                    rec = {
+                        "group": key[0], "name": key[1], "category": key[2],
+                        "g_rows": g_rows, "g_cols": g_cols, "rule": rule_str,
+                        "axis": axis, "l_rows": l_rows, "l_cols": l_cols,
+                        "q_fmt": q_fmt, "q_rule": q_rule,
+                        "is_excl": is_excl, "q_note": q_note,
+                        "is_engram": is_engram, "is_vis": is_vis,
+                        "unit_p": unit_payload, "unit_s": unit_scale, "unit_a": unit_aux,
+                        "unit_bf16": l_rows * l_cols * BF16_BYTES,
+                        "stage_reps": [0] * pp,
+                    }
+                    grouped[key] = rec
+                    order.append(key)
+                rec["stage_reps"][st] += int(l_count)
+
+    _append_prepared_weight_entries(grouped, order, mem, prepared_weights, pp)
+    return grouped, order
+
+
+def _project_cache_ledger_rows(
+    case: Case,
+    active_proj: CacheLedgerProjection,
+    alt_projections: Mapping[str, CacheLedgerProjection],
+    *,
+    active_dtype: str,
+    local_tokens: int,
+    concurrency: int,
+) -> tuple[CacheLedgerRow, ...]:
+    """Project exact per-component ``CacheLedgerRow`` rows directly from ``CacheLedgerProjection``."""
+    p = case.runtime.parallel
+    pp = max(1, int(p.pp))
+    conc = max(1, int(concurrency))
+    all_projs = {active_dtype: active_proj, **alt_projections}
+    legal_dtypes = tuple(all_projs.keys())
+
+    # Union of all components present across any legal dtype & stage.
+    comp_set: set[str] = set()
+    for proj in all_projs.values():
+        for st_map in proj.per_stage_component_batch_bytes:
+            comp_set.update(st_map.keys())
+
+    ordered_comps = [c for c in _COMPONENT_DISPLAY_ORDER if c in comp_set]
+    ordered_comps.extend(sorted(comp_set.difference(ordered_comps)))
+
+    # Select bottleneck cache stage on active projection.
+    stage_totals = [sum(st_map.values()) for st_map in active_proj.per_stage_component_batch_bytes]
+    peak_cache_stage = max(range(pp), key=lambda st: stage_totals[st]) if stage_totals else 0
+
+    rows: list[CacheLedgerRow] = []
+    for comp in ordered_comps:
+        is_fixed_die = comp in _FIXED_PER_DIE_COMPONENTS
+        scales_tok = comp not in _NON_TOKEN_SCALED_COMPONENTS
+        layer_counts = active_proj.active_layers_by_component.get(comp, (0,) * pp)
+        if not any(layer_counts):
+            for proj in all_projs.values():
+                cand = proj.active_layers_by_component.get(comp)
+                if cand and any(cand):
+                    layer_counts = cand
+                    break
+        max_layers = max(layer_counts, default=0)
+        kind_label = active_proj.cache_kind_by_component.get(comp, comp)
+        if kind_label == comp:
+            for proj in all_projs.values():
+                if comp in proj.cache_kind_by_component:
+                    kind_label = proj.cache_kind_by_component[comp]
+                    break
+
+        active_batch_by_st = tuple(
+            float(active_proj.per_stage_component_batch_bytes[st].get(comp, 0))
+            for st in range(pp)
+        )
+        active_per_req_by_st = tuple(
+            0.0 if is_fixed_die else float(active_proj.per_stage_component_per_req_bytes[st].get(comp, 0.0))
+            for st in range(pp)
+        )
+        batch_b = active_batch_by_st[peak_cache_stage]
+        per_req_b = 0.0 if is_fixed_die else active_per_req_by_st[peak_cache_stage]
+        denom = float(max_layers * max(1, local_tokens)) if (scales_tok and max_layers > 0) else 0.0
+        rate_b = (per_req_b / denom) if denom > 0.0 else 0.0
+
+        rate_by_dt: list[tuple[str, float]] = []
+        req_by_dt: list[tuple[str, float]] = []
+        for dt in legal_dtypes:
+            dt_proj = all_projs[dt]
+            dt_batch = float(dt_proj.per_stage_component_batch_bytes[peak_cache_stage].get(comp, 0))
+            if is_fixed_die:
+                # Fixed per-die bytes stored directly (never divided or scaled by concurrency).
+                req_by_dt.append((dt, dt_batch))
+                rate_by_dt.append((dt, 0.0))
+            else:
+                dt_req = float(dt_proj.per_stage_component_per_req_bytes[peak_cache_stage].get(comp, 0.0))
+                if dt_req == 0.0 and dt_batch > 0.0:
+                    dt_req = dt_batch / float(conc)
+                req_by_dt.append((dt, dt_req))
+                dt_rate = (dt_req / denom) if denom > 0.0 else 0.0
+                rate_by_dt.append((dt, dt_rate))
+
+        per_stage_out = active_batch_by_st if is_fixed_die else active_per_req_by_st
+        rows.append(CacheLedgerRow(
+            component=comp,
+            cache_kind=kind_label,
+            active_layers_per_stage=tuple(int(v) for v in layer_counts),
+            max_stage_layers=int(max_layers),
+            bytes_per_token_per_layer=float(rate_b),
+            per_request_bytes=float(per_req_b),
+            batch_total_bytes=float(batch_b),
+            scales_with_tokens=bool(scales_tok),
+            per_stage_bytes=per_stage_out,
+            bytes_per_token_by_dtype=tuple(rate_by_dt),
+            per_request_bytes_by_dtype=tuple(req_by_dt),
+        ))
+    return tuple(rows)
+
+
+def _bottleneck_die_for_stage(receipt: Any, stage: int, fallback_rank: int = 0) -> Any:
+    """Select bottleneck die across all replicas and ranks for ``stage`` by peak then live HBM."""
+    dies_list = tuple(getattr(receipt, "dies", ()) or ())
+    st_dies = [d for d in dies_list if int(getattr(d, "stage", -1)) == int(stage)]
+    if st_dies:
+        return max(
+            st_dies,
+            key=lambda d: (
+                int(getattr(d, "simultaneous_peak_hbm_bytes", 0) or 0),
+                int(getattr(d, "simultaneous_live_hbm_bytes", 0) or 0),
+            ),
+        )
+    return receipt.die_receipt(0, stage, fallback_rank)
+
+
+def _build_stage_budgets_from_receipt(
+    case: Case,
+    mem: Memory,
+    proj: CacheLedgerProjection,
+    *,
+    stage_payload: Sequence[int],
+    stage_scale_aux: Sequence[int],
+    stage_engram_raw: Sequence[int],
+) -> tuple[StageBudgetRow, ...]:
+    """Project exact per-PP-stage ``StageBudgetRow`` with 0 B multi-key bijection to ``DieResidentReceipt``."""
+    p = case.runtime.parallel
+    pp = max(1, int(p.pp))
+    layer_counts = stage_layer_counts(case)
+    offload_engram = bool(case.runtime.engram_cpu_offload)
+    budgets: list[StageBudgetRow] = []
+
+    for st in range(pp):
+        rk = proj.bottleneck_rank_by_stage[st]
+        die = _bottleneck_die_for_stage(proj.receipt, st, rk)
+        receipt_weight_hbm = int(
+            die.checkpoint_weight_bytes + die.prepared_weight_bytes + die.vision_weight_bytes
+        )
+        engram_raw = int(stage_engram_raw[st])
+        engram_hbm = 0 if offload_engram else engram_raw
+        engram_host = int(round(mem.engram_host_dram_bytes[st])) if offload_engram else 0
+        non_engram_hbm = max(0, receipt_weight_hbm - engram_hbm)
+        w_scale = min(int(stage_scale_aux[st]), non_engram_hbm)
+        w_payload = non_engram_hbm - w_scale
+        if int(stage_payload[st]) + int(stage_scale_aux[st]) == non_engram_hbm:
+            w_payload = int(stage_payload[st])
+            w_scale = int(stage_scale_aux[st])
+        cache_b = int(
+            die.kv_cache_allocated_bytes
+            + die.index_cache_allocated_bytes
+            + die.recurrent_state_bytes
+            + die.draft_cache_bytes
+        )
+        ws_b = int(die.workspace_bytes)
+        total_hbm = int(die.simultaneous_peak_hbm_bytes)
+        usable_b = int(die.usable_hbm_bytes)
+        headroom_b = int(die.free_hbm_headroom_bytes)
+        res_b = max(0, total_hbm - receipt_weight_hbm - cache_b - ws_b)
+        per_req_cache = float(sum(
+            v for k, v in proj.per_stage_component_per_req_bytes[st].items()
+            if k not in _FIXED_PER_DIE_COMPONENTS
+        ))
+        budgets.append(StageBudgetRow(
+            stage=st,
+            owned_layers=int(layer_counts[st]),
+            weight_payload_bytes=float(w_payload),
+            weight_scale_aux_bytes=float(w_scale),
+            engram_ple_hbm_bytes=float(engram_hbm),
+            engram_ple_host_bytes=float(engram_host),
+            cache_bytes=float(cache_b),
+            workspace_peak_bytes=float(ws_b),
+            reserve_bytes=float(res_b),
+            total_hbm_bytes=float(total_hbm),
+            usable_hbm_budget_bytes=float(usable_b),
+            headroom_bytes=float(headroom_b),
+            fits_hbm=bool(total_hbm <= usable_b),
+            per_request_cache_bytes=per_req_cache,
+        ))
+    return tuple(budgets)
+
+
+def _compute_max_hbm_concurrency(
+    stage_budgets: Sequence[StageBudgetRow],
+    proj: CacheLedgerProjection,
+) -> int:
+    """Closed-form max per-DP concurrency honoring fixed per-die overhead."""
+    limits: list[int] = []
+    for st in stage_budgets:
+        fixed_c8 = int(proj.per_stage_component_batch_bytes[st.stage].get("c8_static_channel_scale", 0))
+        fixed_hbm = (
+            st.weight_payload_bytes
+            + st.weight_scale_aux_bytes
+            + st.engram_ple_hbm_bytes
+            + st.workspace_peak_bytes
+            + st.reserve_bytes
+            + float(fixed_c8)
+        )
+        avail = st.usable_hbm_budget_bytes - fixed_hbm
+        if avail <= 0.0:
+            return 0
+        per_req = float(st.per_request_cache_bytes)
+        if per_req > MIN_DENOM_EPS:
+            limits.append(int(math.floor(avail / per_req)))
+    return min(limits) if limits else 0
+
+
+def _resolve_case_overrides(
     case: Case,
     *,
-    phase: str,
-    seq_len: int | None,
-    concurrency: int | None,
+    hw_family: str,
     weight_quant: str | None,
     cache_dtype: str | None,
     engram_host_offload: bool | None,
     include_vision_tower: bool | None,
     apply_preset_to_ignored: bool,
-    prepared_weights: Sequence[PreparedWeightSpec],
-) -> dict[str, Any]:
-    """Validate and resolve normalized quant, cache, vision, and workspace parameters."""
-    resolved_seq = max(1, int(seq_len if seq_len is not None else case.runtime.max_model_len))
-    resolved_conc = max(1, int(concurrency if concurrency is not None else max(1, len(case.workload.requests))))
-    explicit_override = weight_quant is not None
-    resolved_wq = (
-        _canonicalize_weight_quant_override(weight_quant)
-        if weight_quant is not None else _normalize_quant_preset(case.model.quant)
-    )
-    if resolved_wq not in WEIGHT_QUANT_FORMATS:
-        raise ModelingError(f"unsupported_weight_quant:{resolved_wq}")
-    wq_display, q_exclusions = _describe_quant_display(
-        case.model.quant, resolved_wq,
-        explicit_override=explicit_override,
-        apply_preset_to_ignored=bool(apply_preset_to_ignored),
-    )
-    resolved_cd = (
-        _canonicalize_cache_dtype_override(cache_dtype)
-        if cache_dtype is not None else _normalize_cache_dtype(case.model)
-    )
-    if resolved_cd not in SUPPORTED_CACHE_DTYPES:
-        raise ModelingError(f"unsupported_cache_dtype:{resolved_cd}")
-    hw_fam = normalize_hw_family(str(case.machine.sku or case.machine.name or "a5"))
-    if weight_quant is not None or cache_dtype is not None:
+) -> tuple[Case, str, str]:
+    """Apply explicit ledger overrides while enforcing hardware ISA legality."""
+    resolved = case
+    if weight_quant is not None:
+        canon_wq = _canonicalize_weight_quant_override(weight_quant)
+        validate_quant_for_hardware(canon_wq, hw_family, strict=True)
+        resolved = _case_with_weight_quant(
+            resolved, canon_wq, apply_preset_to_ignored=apply_preset_to_ignored,
+        )
+    elif apply_preset_to_ignored:
+        canon_wq = _normalize_quant_preset(resolved.model.quant)
+        resolved = _case_with_weight_quant(
+            resolved, canon_wq, apply_preset_to_ignored=True,
+        )
+    if cache_dtype is not None:
+        canon_cd = _canonicalize_cache_dtype_override(cache_dtype)
         validate_quant_for_hardware(
-            resolved_wq if weight_quant is not None else "BF16",
-            hw_fam,
-            kv_cache_dtype=(resolved_cd if cache_dtype is not None else "BF16"),
+            "bf16", hw_family,
+            kv_cache_dtype=_CANONICAL_CACHE_TO_KV_DTYPE.get(canon_cd, "bf16"),
             strict=True,
         )
-    resolved_offload = (
-        bool(case.runtime.engram_cpu_offload)
-        if engram_host_offload is None else bool(engram_host_offload)
+        resolved = _case_with_cache_dtype(resolved, canon_cd)
+    if engram_host_offload is not None:
+        resolved = replace(
+            resolved,
+            runtime=replace(resolved.runtime, engram_cpu_offload=bool(engram_host_offload)),
+        )
+    if include_vision_tower is not None:
+        vis_scope = "full_checkpoint" if bool(include_vision_tower) else "text_backbone"
+        rt_meta = {**dict(resolved.runtime.metadata), "vision_accounting": vis_scope}
+        resolved = replace(
+            resolved,
+            runtime=replace(resolved.runtime, metadata=tuple(sorted(rt_meta.items()))),
+        )
+    resolved_wq = _normalize_quant_preset(resolved.model.quant)
+    resolved_cd = _normalize_cache_dtype(resolved.model)
+    validate_quant_for_hardware(
+        resolved_wq, hw_family,
+        kv_cache_dtype=_CANONICAL_CACHE_TO_KV_DTYPE.get(resolved_cd, "bf16"),
+        strict=True,
     )
-    rt_meta = dict(case.runtime.metadata)
-    explicit_vit = None if include_vision_tower is None else bool(include_vision_tower)
-    block_size = int(
-        getattr(case.runtime, "kv_block_size", None)
-        or getattr(case.runtime, "block_size", None)
-        or DEFAULT_CACHE_BLOCK_SIZE
-    )
-    spec_tokens = int(rt_meta.get("draft_proposal_tokens", 0) or 0)
-    ws_tokens = _resolve_ledger_workspace_tokens(
-        case, phase=phase, resolved_seq=resolved_seq, resolved_conc=resolved_conc,
-    )
-    meta_prepared = [
-        item for item in (rt_meta.get("prepared_weights") or ())
-        if isinstance(item, PreparedWeightSpec)
+    return resolved, resolved_wq, resolved_cd
+
+
+def _split_saturated_swa_gqa(
+    case: Case,
+    mem: Memory,
+    proj: CacheLedgerProjection,
+    *,
+    phase: str,
+    resolved_seq: int,
+    resolved_conc: int,
+) -> CacheLedgerProjection:
+    """Split saturated sliding-window GQA layers out of ``gqa_kv`` into fixed ``window``."""
+    model = case.model
+    p = case.runtime.parallel
+    pp = max(1, int(p.pp))
+    sat_layers = [
+        lp for lp in model.layer_plans
+        if lp.attention == "gqa" and int(lp.window or 0) > 0 and resolved_seq >= int(lp.window or 0)
     ]
-    resolved_prepared = tuple(dict.fromkeys((*meta_prepared, *prepared_weights)))
-    return {
-        "rt_meta": rt_meta,
-        "resolved_seq": resolved_seq,
-        "resolved_conc": resolved_conc,
-        "explicit_override": explicit_override,
-        "resolved_wq": resolved_wq,
-        "wq_display": wq_display,
-        "q_exclusions": q_exclusions,
-        "resolved_cd": resolved_cd,
-        "resolved_offload": resolved_offload,
-        "explicit_vit": explicit_vit,
-        "block_size": block_size,
-        "spec_tokens": spec_tokens,
-        "ws_tokens": ws_tokens,
-        "resolved_prepared": resolved_prepared,
+    if not sat_layers:
+        return proj
+    block = int(proj.normalized_block_size)
+    full_counts = [0] * pp
+    swa_counts = [0] * pp
+    swa_req_by_st = [0.0] * pp
+    hbm_ratio = float(mem.kvc_hbm_ratio)
+    for lp in model.layer_plans:
+        if lp.attention != "gqa":
+            continue
+        st = mem.layer_stage[lp.index] if lp.index < len(mem.layer_stage) else pp - 1
+        if int(lp.window or 0) > 0 and resolved_seq >= int(lp.window or 0):
+            swa_counts[st] += 1
+            rk = proj.bottleneck_rank_by_stage[st] if (mem.rank_token_owners is not None or int(p.cp) > 1) else None
+            comps = layer_cache_components(
+                model, lp, p, resolved_seq, capacity_padded=True,
+                interleave=block, block_size=block, rank=rk,
+                owner_spans=mem.rank_token_owners if rk is not None else None,
+                runtime=case.runtime, query_tokens=mem.query_tokens, phase=phase,
+            )
+            swa_req_by_st[st] += float(comps.get("gqa_kv", 0.0)) * hbm_ratio
+        else:
+            full_counts[st] += 1
+
+    new_batch: list[dict[str, int]] = []
+    new_req: list[dict[str, float]] = []
+    for st in range(pp):
+        b_map = dict(proj.per_stage_component_batch_bytes[st])
+        r_map = dict(proj.per_stage_component_per_req_bytes[st])
+        gqa_b = int(b_map.get("gqa_kv", 0))
+        swa_b = min(gqa_b, int(round(swa_req_by_st[st] * resolved_conc)))
+        if swa_b > 0:
+            rem_b = gqa_b - swa_b
+            if rem_b > 0:
+                b_map["gqa_kv"] = rem_b
+            else:
+                b_map.pop("gqa_kv", None)
+            b_map["window"] = int(b_map.get("window", 0)) + swa_b
+            gqa_r = float(r_map.get("gqa_kv", 0.0))
+            swa_r = min(gqa_r, swa_req_by_st[st])
+            rem_r = gqa_r - swa_r
+            if rem_r > MIN_DENOM_EPS:
+                r_map["gqa_kv"] = rem_r
+            else:
+                r_map.pop("gqa_kv", None)
+            r_map["window"] = float(r_map.get("window", 0.0)) + swa_r
+        new_batch.append(b_map)
+        new_req.append(r_map)
+
+    layers_map = dict(proj.active_layers_by_component)
+    kinds_map = dict(proj.cache_kind_by_component)
+    layers_map["gqa_kv"] = tuple(full_counts)
+    layers_map["window"] = tuple(swa_counts)
+    kinds_map.setdefault("window", "Sliding Window KV")
+    return replace(
+        proj,
+        per_stage_component_batch_bytes=tuple(new_batch),
+        per_stage_component_per_req_bytes=tuple(new_req),
+        active_layers_by_component=layers_map,
+        cache_kind_by_component=kinds_map,
+    )
+
+
+def _split_hybrid_reserve_seq_vs_fixed(
+    case: Case,
+    mem: Memory,
+    proj: CacheLedgerProjection,
+    *,
+    phase: str,
+    resolved_seq: int,
+    resolved_conc: int,
+) -> CacheLedgerProjection:
+    """Split hybrid ``page_group_reserve`` into fixed + token-scaled ``page_group_reserve_seq``."""
+    if proj.hybrid_pool_receipt is None or resolved_seq <= 0:
+        return proj
+    p = case.runtime.parallel
+    pp = max(1, int(p.pp))
+    block = int(proj.normalized_block_size)
+    cp_deg = max(1, int(getattr(p, "cp", 1) or 1))
+    local_tok = int(math.ceil(resolved_seq / float(max(1, block * cp_deg)))) * block
+    if local_tok <= 0:
+        return proj
+    seq_2x = 2 * local_tok * cp_deg
+    use_rank = mem.rank_token_owners is not None or cp_deg > 1
+    rank_probe = proj.bottleneck_rank_by_stage[0] if use_rank else None
+    stages_2x, _ = mem._projected_die_cache_pools(
+        seq_2x, resolved_conc, None, rank=rank_probe, phase=str(phase),
+    )
+
+    new_batch: list[dict[str, int]] = []
+    new_req: list[dict[str, float]] = []
+    seq_layers = [0] * pp
+    for st in range(pp):
+        b_map = dict(proj.per_stage_component_batch_bytes[st])
+        r_map = dict(proj.per_stage_component_per_req_bytes[st])
+        res_1x = int(b_map.get("page_group_reserve", 0))
+        res_2x = int(stages_2x[st]["components_batch"].get("page_group_reserve", 0))
+        seq_b = min(res_1x, max(0, res_2x - res_1x))
+        fix_b = res_1x - seq_b
+        req_1x = float(r_map.get("page_group_reserve", 0.0))
+        req_2x = float(stages_2x[st]["components_per_req"].get("page_group_reserve", 0.0))
+        seq_r = min(req_1x, max(0.0, req_2x - req_1x))
+        fix_r = req_1x - seq_r
+        if seq_b > 0:
+            seq_layers[st] = 1
+            b_map["page_group_reserve_seq"] = seq_b
+            r_map["page_group_reserve_seq"] = seq_r
+            if fix_b > 0:
+                b_map["page_group_reserve"] = fix_b
+                r_map["page_group_reserve"] = fix_r
+            else:
+                b_map.pop("page_group_reserve", None)
+                r_map.pop("page_group_reserve", None)
+        new_batch.append(b_map)
+        new_req.append(r_map)
+
+    if not any(seq_layers):
+        return proj
+    layers_map = dict(proj.active_layers_by_component)
+    kinds_map = dict(proj.cache_kind_by_component)
+    layers_map["page_group_reserve_seq"] = tuple(seq_layers)
+    kinds_map["page_group_reserve_seq"] = "Hybrid Pool Stride Reserve (Seq-Scaled)"
+    return replace(
+        proj,
+        per_stage_component_batch_bytes=tuple(new_batch),
+        per_stage_component_per_req_bytes=tuple(new_req),
+        active_layers_by_component=layers_map,
+        cache_kind_by_component=kinds_map,
+    )
+
+
+def _refine_projection_for_ledger(
+    case: Case,
+    mem: Memory,
+    proj: CacheLedgerProjection,
+    *,
+    phase: str,
+    resolved_seq: int,
+    resolved_conc: int,
+) -> CacheLedgerProjection:
+    """Refine ``CacheLedgerProjection`` for Sheet 3 seq-length scaling conservation."""
+    refined = _split_saturated_swa_gqa(
+        case, mem, proj, phase=phase, resolved_seq=resolved_seq, resolved_conc=resolved_conc,
+    )
+    return _split_hybrid_reserve_seq_vs_fixed(
+        case, mem, refined, phase=phase, resolved_seq=resolved_seq, resolved_conc=resolved_conc,
+    )
+
+
+def _probe_legal_cache_projections(
+    resolved_case: Case,
+    *,
+    resolved_wq: str,
+    resolved_cd: str,
+    hw_family: str,
+    phase: str,
+    resolved_seq: int,
+    resolved_conc: int,
+    ws_tok: int,
+    prepared_weights: Sequence[PreparedWeightSpec],
+) -> dict[str, CacheLedgerProjection]:
+    """Project all hardware-legal alternate cache dtypes via canonical ``Memory``."""
+    alt_projections: dict[str, CacheLedgerProjection] = {}
+    for cand_dt in _hw_cache_dtype_candidates(resolved_case, resolved_cd):
+        if cand_dt == resolved_cd:
+            continue
+        try:
+            validate_quant_for_hardware(
+                resolved_wq, hw_family,
+                kv_cache_dtype=_CANONICAL_CACHE_TO_KV_DTYPE.get(cand_dt, "bf16"),
+                strict=True,
+            )
+            alt_case = _case_with_cache_dtype(resolved_case, cand_dt)
+            alt_mem = Memory(alt_case, workspace_tokens=ws_tok)
+            if prepared_weights:
+                alt_mem.register_prepared_weights(prepared_weights)
+            raw_alt = alt_mem.cache_ledger_projection(
+                scenario=str(alt_case.model.name),
+                phase=str(phase),
+                sequence_tokens=resolved_seq,
+                batch_per_dp=resolved_conc,
+                vision_accounting=alt_mem.vision_accounting,
+                prepared_weights=prepared_weights,
+            )
+            alt_projections[cand_dt] = _refine_projection_for_ledger(
+                alt_case, alt_mem, raw_alt,
+                phase=str(phase), resolved_seq=resolved_seq, resolved_conc=resolved_conc,
+            )
+        except ModelingError:
+            continue
+    return alt_projections
+
+
+def _component_receipt_pool(name: str) -> str:
+    from mindie_sim.prediction.capacity.cache import _COMPONENT_POOL_MAP
+
+    mapped = _COMPONENT_POOL_MAP.get(name, "")
+    if mapped == "indexer_k_bytes":
+        return "idx"
+    if mapped == "recurrent_state_bytes":
+        return "rec"
+    if mapped in {"draft_kv_bytes", "draft_state_bytes"}:
+        return "drf"
+    return "kv"
+
+
+def _reconcile_stage_components_to_die(
+    st_batch: Mapping[str, int],
+    st_req: Mapping[str, float],
+    die: Any,
+    *,
+    concurrency: int,
+    has_mla: bool,
+) -> tuple[dict[str, int], dict[str, float], dict[str, float]]:
+    """Scale per-stage cache components to match ``die`` pool totals to exact 0 B."""
+    conc = max(1, int(concurrency))
+    targets = {
+        "kv": int(die.kv_cache_allocated_bytes),
+        "idx": int(die.index_cache_allocated_bytes),
+        "rec": int(die.recurrent_state_bytes),
+        "drf": int(die.draft_cache_bytes),
     }
+    defaults = {
+        "kv": "mla_kv" if has_mla else "gqa_kv",
+        "idx": "index_k",
+        "rec": "recurrent_state",
+        "drf": "draft_kv",
+    }
+    new_b = {k: int(v) for k, v in st_batch.items() if int(v) > 0}
+    new_r = {k: float(v) for k, v in st_req.items() if float(v) > 0.0 or k in _FIXED_PER_DIE_COMPONENTS}
+    ratios: dict[str, float] = {}
+    for pool_k, target_b in targets.items():
+        members = [c for c in new_b if _component_receipt_pool(c) == pool_k]
+        fixed_b = sum(new_b[c] for c in members if c in _FIXED_PER_DIE_COMPONENTS)
+        var_members = [c for c in members if c not in _FIXED_PER_DIE_COMPONENTS]
+        cur_var = sum(new_b[c] for c in var_members)
+        var_target = max(0, target_b - fixed_b)
+        if cur_var == var_target:
+            ratios[pool_k] = 1.0
+            continue
+        if var_target <= 0:
+            for c in var_members:
+                new_b.pop(c, None)
+                new_r.pop(c, None)
+            ratios[pool_k] = 0.0
+            continue
+        if cur_var <= 0:
+            cname = defaults[pool_k]
+            new_b[cname] = var_target
+            new_r[cname] = float(var_target) / float(conc)
+            ratios[pool_k] = 1.0
+            continue
+        ratio = float(var_target) / float(cur_var)
+        ratios[pool_k] = ratio
+        running = 0
+        for c in var_members:
+            scaled = int(round(new_b[c] * ratio))
+            new_b[c] = scaled
+            new_r[c] = float(new_r.get(c, float(scaled) / float(conc))) * ratio
+            running += scaled
+        rem = var_target - running
+        if rem != 0:
+            lead = max(var_members, key=lambda c: new_b[c])
+            new_b[lead] = max(0, new_b[lead] + rem)
+            new_r[lead] = max(0.0, float(new_r.get(lead, 0.0)) + float(rem) / float(conc))
+        for c in list(var_members):
+            if new_b.get(c, 0) <= 0:
+                new_b.pop(c, None)
+                new_r.pop(c, None)
+    return new_b, new_r, ratios
 
 
-def _extract_receipt_weight_totals(
+def _scale_alt_projections_by_ratios(
+    alt_projections: Mapping[str, CacheLedgerProjection],
+    stage_ratios: Sequence[Mapping[str, float]],
+) -> dict[str, CacheLedgerProjection]:
+    """Scale alternate-dtype cache projections consistently with caller-receipt ownership."""
+    if all(all(abs(r - 1.0) <= MIN_DENOM_EPS for r in st_r.values()) for st_r in stage_ratios):
+        return dict(alt_projections)
+    scaled_out: dict[str, CacheLedgerProjection] = {}
+    for dt, alt_p in alt_projections.items():
+        b_list: list[dict[str, int]] = []
+        r_list: list[dict[str, float]] = []
+        for st, st_r in enumerate(stage_ratios):
+            b_map = dict(alt_p.per_stage_component_batch_bytes[st])
+            r_map = dict(alt_p.per_stage_component_per_req_bytes[st])
+            for c in list(b_map):
+                if c in _FIXED_PER_DIE_COMPONENTS:
+                    continue
+                ratio = float(st_r.get(_component_receipt_pool(c), 1.0))
+                b_map[c] = int(round(b_map[c] * ratio))
+                if c in r_map:
+                    r_map[c] = float(r_map[c]) * ratio
+            b_list.append({k: v for k, v in b_map.items() if v > 0})
+            r_list.append(r_map)
+        scaled_out[dt] = replace(
+            alt_p,
+            per_stage_component_batch_bytes=tuple(b_list),
+            per_stage_component_per_req_bytes=tuple(r_list),
+        )
+    return scaled_out
+
+
+def _anchor_projection_to_caller_receipt(
+    case: Case,
+    proj: CacheLedgerProjection,
+    alt_projections: Mapping[str, CacheLedgerProjection],
+    caller_receipt: Any,
     *,
     pp: int,
-    receipt: Any,
-    alloc_weights_by_stage: Sequence[float],
-    stage_budgets: Sequence[StageHbmBudgetRow],
-    stage_native_bf16: Sequence[float],
-    stage_engram_total: Sequence[float],
-    stage_vision_total: Sequence[float],
-    peak_weight_stage: int,
-    resolved_offload: bool,
-) -> tuple[tuple[float, ...], float, float, float, float]:
-    """Extract per-stage resident weight receipt totals and peak compression metrics."""
-    receipt_weights_by_stage: list[float] = []
+    concurrency: int,
+    grouped: dict[tuple[Any, ...], dict[str, Any]],
+    order: list[tuple[Any, ...]],
+    prepared_weights: Sequence[PreparedWeightSpec],
+) -> tuple[CacheLedgerProjection, dict[str, CacheLedgerProjection], int | None]:
+    """Anchor projection, cache components, and peak weight stage to ``caller_receipt``."""
+    dies_list = tuple(getattr(caller_receipt, "dies", ()) or ())
+    if not dies_list or not hasattr(caller_receipt, "die_receipt"):
+        return proj, dict(alt_projections), None
+    bottleneck_ranks: list[int] = []
+    stage_weight_totals: list[int] = []
+    new_batch: list[dict[str, int]] = []
+    new_req: list[dict[str, float]] = []
+    stage_ratios: list[dict[str, float]] = []
+    has_mla = _model_has_mla(case.model)
+
     for st in range(pp):
-        st_die = next(
-            (d for d in receipt.dies if d.replica == 0 and d.stage == st and d.rank == 0),
-            None,
+        st_dies = [d for d in dies_list if int(getattr(d, "stage", -1)) == st]
+        if not st_dies:
+            return proj, dict(alt_projections), None
+        best_die = _bottleneck_die_for_stage(caller_receipt, st)
+        bottleneck_ranks.append(int(best_die.rank))
+        stage_weight_totals.append(int(
+            best_die.checkpoint_weight_bytes
+            + best_die.prepared_weight_bytes
+            + best_die.vision_weight_bytes
+        ))
+        b_map, r_map, ratios = _reconcile_stage_components_to_die(
+            proj.per_stage_component_batch_bytes[st],
+            proj.per_stage_component_per_req_bytes[st],
+            best_die, concurrency=concurrency, has_mla=has_mla,
         )
-        if st_die is not None:
-            receipt_weights_by_stage.append(
-                float(st_die.checkpoint_weight_bytes + st_die.vision_weight_bytes + st_die.prepared_weight_bytes)
-            )
-        else:
-            receipt_weights_by_stage.append(float(alloc_weights_by_stage[st]))
-    peak_budget = stage_budgets[peak_weight_stage] if peak_weight_stage < len(stage_budgets) else None
-    weight_footprint = (
-        peak_budget.weight_payload_bytes + peak_budget.weight_scale_aux_bytes + peak_budget.engram_ple_hbm_bytes
-        if peak_budget is not None else 0.0
+        new_batch.append(b_map)
+        new_req.append(r_map)
+        stage_ratios.append(ratios)
+        if not prepared_weights:
+            for grant in getattr(best_die, "grants", ()) or ():
+                gid = str(getattr(grant, "grant_id", ""))
+                gbytes = int(getattr(grant, "billed_once_bytes", 0) or 0)
+                if gid.startswith("prepared:") and gbytes > 0 and getattr(grant, "lifetime", "") != "load_peak_only":
+                    name = gid.removeprefix("prepared:")
+                    cols = max(1, gbytes // BF16_BYTES)
+                    key_p = (_PREPARED_WEIGHT_GROUP, name, "prepared_weight", 1, cols, "BF16")
+                    rec = grouped.get(key_p)
+                    if rec is None:
+                        rec = {
+                            "group": _PREPARED_WEIGHT_GROUP, "name": name,
+                            "category": "prepared_weight", "g_rows": 1, "g_cols": cols,
+                            "rule": "prepared", "axis": -1, "l_rows": 1, "l_cols": cols,
+                            "q_fmt": "BF16", "q_rule": QUANT_RULE_FIXED_BF16,
+                            "is_excl": False, "q_note": "caller_receipt_prepared",
+                            "is_engram": False, "is_vis": False,
+                            "unit_p": gbytes, "unit_s": 0, "unit_a": 0, "unit_bf16": gbytes,
+                            "stage_reps": [0] * pp,
+                        }
+                        grouped[key_p] = rec
+                        order.append(key_p)
+                    rec["stage_reps"][st] += 1
+
+    anchored = replace(
+        proj,
+        receipt=caller_receipt,
+        bottleneck_rank_by_stage=tuple(bottleneck_ranks),
+        per_stage_component_batch_bytes=tuple(new_batch),
+        per_stage_component_per_req_bytes=tuple(new_req),
     )
-    native_bf16_footprint = (
-        stage_native_bf16[peak_weight_stage] + (0.0 if resolved_offload else stage_engram_total[peak_weight_stage])
-        if peak_weight_stage < len(stage_native_bf16) else 0.0
-    )
-    vision_bytes = max(stage_vision_total, default=0.0)
-    comp_ratio = (native_bf16_footprint / weight_footprint) if weight_footprint > 0.0 else 1.0
-    return tuple(receipt_weights_by_stage), weight_footprint, native_bf16_footprint, vision_bytes, comp_ratio
+    peak_w = max(range(pp), key=lambda st: stage_weight_totals[st]) if stage_weight_totals else None
+    scaled_alts = _scale_alt_projections_by_ratios(alt_projections, stage_ratios)
+    return anchored, scaled_alts, peak_w
 
 
 def compute_memory_quant_ledger(
@@ -1519,143 +1394,157 @@ def compute_memory_quant_ledger(
     include_vision_tower: bool | None = None,
     apply_preset_to_ignored: bool = False,
     prepared_weights: Sequence[PreparedWeightSpec] = (),
+    memory_receipt: Any = None,
 ) -> MemoryCalculatorLedger:
-    """Derive closed-form per-die Weight/Quant/Cache/Engram-PLE/PP HBM budget ledger."""
-    p = case.runtime.parallel
-    stage_layers = stage_layer_counts(case)
-    cfg = _resolve_ledger_parameters(
+    """Project canonical ``Memory`` / ``DieResidentReceipt`` into ``MemoryCalculatorLedger``."""
+    hw_sku = str(getattr(case.machine, "sku", "") or getattr(case.machine, "name", ""))
+    hw_family = normalize_hw_family(hw_sku or str(getattr(case.machine, "arch_family", "")))
+    has_case_override = any((
+        weight_quant is not None,
+        cache_dtype is not None,
+        engram_host_offload is not None,
+        include_vision_tower is not None,
+        bool(apply_preset_to_ignored),
+    ))
+    resolved_case, resolved_wq, resolved_cd = _resolve_case_overrides(
         case,
-        phase=phase,
-        seq_len=seq_len,
-        concurrency=concurrency,
+        hw_family=hw_family,
         weight_quant=weight_quant,
         cache_dtype=cache_dtype,
         engram_host_offload=engram_host_offload,
         include_vision_tower=include_vision_tower,
         apply_preset_to_ignored=apply_preset_to_ignored,
-        prepared_weights=prepared_weights,
     )
-    resolved_seq, resolved_conc = cfg["resolved_seq"], cfg["resolved_conc"]
-    resolved_wq, resolved_cd = cfg["resolved_wq"], cfg["resolved_cd"]
-    resolved_offload = cfg["resolved_offload"]
-    resolved_prepared = cfg["resolved_prepared"]
-
-    mem = Memory(case, workspace_tokens=cfg["ws_tokens"])
-    resolved_vit = (
-        bool(mem.vision_accounting == "full_checkpoint")
-        if cfg["explicit_vit"] is None else bool(cfg["explicit_vit"])
-    )
-    if resolved_prepared:
-        mem.register_prepared_weights(resolved_prepared)
-    alloc = mem.allocation_report(resolved_seq)
-    receipt = mem.resident_memory_receipt(
-        phase=phase,
-        sequence_tokens=resolved_seq,
-        batch_per_dp=resolved_conc,
-        vision_accounting=("full_checkpoint" if resolved_vit else "text_backbone"),
-        prepared_weights=resolved_prepared,
-    )
-    (
-        weight_rows, stage_w_payload, stage_w_scale, stage_engram_total,
-        stage_native_bf16, stage_vision_total, peak_weight_stage,
-    ) = _collect_weight_ledger_rows(
-        case, mem, stage_layers, resolved_wq,
-        explicit_override=cfg["explicit_override"],
-        include_vision_tower=resolved_vit,
-        apply_preset_to_ignored=bool(apply_preset_to_ignored),
-        engram_host_offload=resolved_offload,
-        prepared_weights=resolved_prepared,
-    )
-    local_tokens, cache_rows, stage_cache_bytes, stage_per_req_cache = _compute_cache_ledger_rows(
-        case, mem, alloc["cache"],
-        stage_layers=stage_layers,
-        cache_dtype=resolved_cd,
-        seq_len=resolved_seq,
-        concurrency=resolved_conc,
-        block_size=cfg["block_size"],
-        spec_tokens=cfg["spec_tokens"],
-    )
-    die_hbm = float(min(d.hbm_bytes for d in case.machine.dies))
-    util = float(case.runtime.gpu_memory_utilization)
-    usable_hbm = die_hbm * util
-    stage_budgets = _build_stage_budget_rows(
-        pp=int(p.pp),
-        stage_layers=stage_layers,
-        stage_w_payload=stage_w_payload,
-        stage_w_scale=stage_w_scale,
-        stage_engram_total=stage_engram_total,
-        stage_cache_bytes=stage_cache_bytes,
-        stage_per_req_cache=stage_per_req_cache,
-        ws_by_stage=[float(x) for x in alloc["workspace"]["total_bytes_per_stage_rank"]],
-        deq_by_stage=[float(x) for x in alloc["temporary_dequant"]["bytes_per_stage_rank"]],
-        reserve_bytes=float(alloc["reserve"]["total_bytes_per_rank"]),
-        usable_hbm=usable_hbm,
-        engram_host_offload=resolved_offload,
-    )
-
-    local_tp = max(
-        int(getattr(p, "effective_o_proj_tp", p.tp) or p.tp),
-        int(getattr(p, "q_proj_tp", 1) or 1),
-        int(getattr(p, "dcp_linear_tp", 1) or 1),
-    )
-    shared_tp = 1 if bool(cfg["rt_meta"].get("enable_shared_expert_dp", False)) else int(p.tp)
-    stride_reserves = mem._unified_pool_stride_reserve_by_stage(resolved_seq)
-    sim_cache_by_stage = tuple(
-        float(v) + (float(stride_reserves[idx]) if idx < len(stride_reserves) else 0.0)
-        for idx, v in enumerate(mem.dp_cohort_cache_bytes(resolved_seq, padded=True))
-    )
-    receipt_weights_by_stage, weight_footprint, native_bf16_footprint, vision_bytes, comp_ratio = (
-        _extract_receipt_weight_totals(
-            pp=int(p.pp),
-            receipt=receipt,
-            alloc_weights_by_stage=alloc["weights"]["total_bytes_per_stage_rank"],
-            stage_budgets=stage_budgets,
-            stage_native_bf16=stage_native_bf16,
-            stage_engram_total=stage_engram_total,
-            stage_vision_total=stage_vision_total,
-            peak_weight_stage=peak_weight_stage,
-            resolved_offload=resolved_offload,
+    rt = resolved_case.runtime
+    p = rt.parallel
+    resolved_seq = int(
+        seq_len if seq_len is not None else (
+            max((int(r.prompt_tokens) + int(r.output_tokens) for r in resolved_case.workload.requests), default=0)
+            or int(rt.max_model_len or DEFAULT_CACHE_BLOCK_SIZE)
         )
     )
-    stage_fixed_cache = [
-        max(0.0, float(stage_cache_bytes[st]) - float(resolved_conc) * float(stage_per_req_cache[st]))
-        for st in range(len(stage_budgets))
-    ]
-    max_conc = _compute_max_hbm_concurrency(
-        case, stage_budgets, stage_per_req_cache, resolved_conc,
-        phase=phase, resolved_seq=resolved_seq,
-        stage_fixed_cache=stage_fixed_cache,
+    resolved_conc = max(
+        _DEFAULT_CONCURRENCY,
+        int(concurrency if concurrency is not None else (len(resolved_case.workload.requests) or _DEFAULT_CONCURRENCY)),
     )
+    ws_tok = _resolve_ledger_workspace_tokens(
+        resolved_case, phase=phase, resolved_seq=resolved_seq, resolved_conc=resolved_conc,
+    )
+    mem = Memory(resolved_case, workspace_tokens=ws_tok)
+    if prepared_weights:
+        mem.register_prepared_weights(prepared_weights)
+    raw_proj = mem.cache_ledger_projection(
+        scenario=str(resolved_case.model.name),
+        phase=str(phase),
+        sequence_tokens=resolved_seq,
+        batch_per_dp=resolved_conc,
+        vision_accounting=mem.vision_accounting,
+        prepared_weights=prepared_weights,
+    )
+    proj = _refine_projection_for_ledger(
+        resolved_case, mem, raw_proj,
+        phase=str(phase), resolved_seq=resolved_seq, resolved_conc=resolved_conc,
+    )
+    alt_projections = _probe_legal_cache_projections(
+        resolved_case,
+        resolved_wq=resolved_wq, resolved_cd=resolved_cd, hw_family=hw_family,
+        phase=str(phase), resolved_seq=resolved_seq, resolved_conc=resolved_conc,
+        ws_tok=ws_tok, prepared_weights=prepared_weights,
+    )
+    grouped, order = _collect_weight_ledger_entries(
+        resolved_case, mem,
+        resolved_wq=resolved_wq, hw_family=hw_family,
+        apply_preset_to_ignored=apply_preset_to_ignored,
+        prepared_weights=prepared_weights,
+    )
+    peak_w_override: int | None = None
+    if memory_receipt is not None and not has_case_override:
+        proj, alt_projections, peak_w_override = _anchor_projection_to_caller_receipt(
+            resolved_case, proj, alt_projections, memory_receipt,
+            pp=int(p.pp), concurrency=resolved_conc,
+            grouped=grouped, order=order, prepared_weights=prepared_weights,
+        )
+    weight_rows, st_payload, st_scale, st_engram, peak_w_stage = _finalize_weight_ledger_rows(
+        grouped, order, mem, int(p.pp), peak_stage_override=peak_w_override,
+    )
+    block_size = int(proj.normalized_block_size)
+    cp_deg = max(1, int(getattr(p, "cp", 1) or 1))
+    local_tok = int(math.ceil(resolved_seq / float(max(1, block_size * cp_deg)))) * block_size if resolved_seq > 0 else 0
+    cache_rows = _project_cache_ledger_rows(
+        resolved_case, proj, alt_projections,
+        active_dtype=resolved_cd, local_tokens=local_tok, concurrency=resolved_conc,
+    )
+    stage_budgets = _build_stage_budgets_from_receipt(
+        resolved_case, mem, proj,
+        stage_payload=st_payload, stage_scale_aux=st_scale, stage_engram_raw=st_engram,
+    )
+    die0 = _bottleneck_die_for_stage(proj.receipt, 0, proj.bottleneck_rank_by_stage[0])
+    die_hbm = float(resolved_case.machine.dies[0].hbm_bytes)
+    include_vit = mem.vision_accounting == "full_checkpoint"
+    offload_engram = bool(rt.engram_cpu_offload)
+    hbm_w_rows = [
+        r for r in weight_rows
+        if not (r.is_engram_or_ple and offload_engram)
+        and not (r.is_vision and not include_vit)
+    ]
+    w_footprint = float(sum(r.per_die_bytes for r in hbm_w_rows))
+    native_bf16_w = float(sum(r.native_bf16_bytes for r in hbm_w_rows))
+    vis_w = float(sum(r.per_die_bytes for r in weight_rows if r.is_vision)) if include_vit else 0.0
+    pcp_deg = max(1, int(getattr(p, "pcp", 1) or 1))
     return MemoryCalculatorLedger(
-        model_name=str(case.model.name),
-        hardware_sku=str(case.machine.sku or case.machine.name),
-        phase=phase,
+        model_name=str(resolved_case.model.name),
+        hardware_sku=hw_sku,
+        phase=str(phase),
         weight_quant=resolved_wq,
         cache_dtype=resolved_cd,
-        engram_host_offload=resolved_offload,
+        engram_host_offload=offload_engram,
         dp=int(p.dp), tp=int(p.tp), ep=int(p.ep), pp=int(p.pp),
-        dcp=int(p.cp), pcp=int(p.pcp), local_tp=int(local_tp), shared_tp=int(shared_tp),
-        total_dies=len(case.machine.dies),
+        dcp=max(1, int(getattr(p, "dcp", p.cp) or 1)), pcp=pcp_deg,
+        local_tp=int(getattr(p, "o_proj_tp", 0) or getattr(p, "local_tp", 0) or p.tp),
+        shared_tp=1 if bool(getattr(mem, "enable_shared_expert_dp", False)) else int(p.tp),
+        total_dies=int(p.dp * p.tp * p.pp * pcp_deg),
         seq_len=resolved_seq, concurrency=resolved_conc,
-        block_size=cfg["block_size"], spec_tokens=cfg["spec_tokens"], local_cache_tokens=local_tokens,
-        die_hbm_capacity_bytes=die_hbm, gpu_memory_utilization=util, usable_hbm_bytes=usable_hbm,
+        block_size=block_size, spec_tokens=max(0, int(mem.query_tokens) - 1),
+        local_cache_tokens=local_tok,
+        die_hbm_capacity_bytes=die_hbm,
+        gpu_memory_utilization=float(rt.gpu_memory_utilization),
+        usable_hbm_bytes=float(die0.usable_hbm_bytes),
         weight_rows=weight_rows,
         cache_rows=cache_rows,
-        stage_budgets=tuple(stage_budgets),
-        max_stage_hbm_bytes=max((row.total_hbm_bytes for row in stage_budgets), default=0.0),
-        max_stage_host_offload_bytes=max((row.engram_ple_host_bytes for row in stage_budgets), default=0.0),
-        fits_hbm=all(row.fits_hbm for row in stage_budgets),
-        sim_memory_weight_bytes_by_stage=receipt_weights_by_stage,
-        sim_memory_cache_bytes_by_stage=sim_cache_by_stage,
-        weight_quant_display=cfg["wq_display"],
-        quant_exclusions=cfg["q_exclusions"],
-        weight_footprint_per_die_bytes=weight_footprint,
-        per_request_cache_bytes_max_stage=max(stage_per_req_cache, default=0.0),
-        max_hbm_concurrency_per_dp=max_conc,
-        include_vision_tower=resolved_vit,
+        stage_budgets=stage_budgets,
+        max_stage_hbm_bytes=max((sb.total_hbm_bytes for sb in stage_budgets), default=0.0),
+        max_stage_host_offload_bytes=max((sb.engram_ple_host_bytes for sb in stage_budgets), default=0.0),
+        fits_hbm=all(sb.fits_hbm for sb in stage_budgets),
+        sim_memory_weight_bytes_by_stage=tuple(
+            float(sb.weight_payload_bytes + sb.weight_scale_aux_bytes + sb.engram_ple_hbm_bytes)
+            for sb in stage_budgets
+        ),
+        sim_memory_cache_bytes_by_stage=tuple(float(sb.cache_bytes) for sb in stage_budgets),
+        weight_quant_display=_describe_quant_display(resolved_wq, weight_rows),
+        quant_exclusions=tuple(sorted(set(require_model_quant(resolved_case.model).exclusions))),
+        weight_footprint_per_die_bytes=w_footprint,
+        per_request_cache_bytes_max_stage=max((sb.per_request_cache_bytes for sb in stage_budgets), default=0.0),
+        max_hbm_concurrency_per_dp=_compute_max_hbm_concurrency(stage_budgets, proj),
+        include_vision_tower=include_vit,
         apply_preset_to_ignored=bool(apply_preset_to_ignored),
-        native_bf16_weight_footprint_per_die_bytes=native_bf16_footprint,
-        vision_weight_bytes_per_die=vision_bytes,
-        weight_compression_ratio=comp_ratio,
-        peak_weight_stage=peak_weight_stage,
+        native_bf16_weight_footprint_per_die_bytes=native_bf16_w,
+        vision_weight_bytes_per_die=vis_w,
+        weight_compression_ratio=(native_bf16_w / w_footprint) if w_footprint > MIN_DENOM_EPS else 1.0,
+        peak_weight_stage=peak_w_stage,
     )
+
+
+__all__ = [
+    "C8_CACHE_WIDTH_BYTES",
+    "FP8_CACHE_WIDTH_BYTES",
+    "GQA_STATIC_C8_CACHE_WIDTH_BYTES",
+    "KV_DTYPE_SENSITIVE_COMPONENTS",
+    "MXFP8_CACHE_WIDTH_BYTES",
+    "_PREPARED_WEIGHT_GROUP",
+    "_cache_dtype_override_ratio",
+    "_normalize_cache_dtype",
+    "_resolve_ledger_workspace_tokens",
+    "compute_memory_quant_ledger",
+    "evaluate_weight_storage_bytes",
+    "stage_layer_counts",
+]

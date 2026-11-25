@@ -49,10 +49,6 @@ GLM_MTP_SOURCE: dict[str, str] = {
 }
 
 
-def _draft_compat_kwargs(**candidates: Any) -> dict[str, Any]:
-    declared = DraftSpec.__dataclass_fields__
-    return {key: value for key, value in candidates.items() if key in declared}
-
 def _index_pool(c):
     size = int(c.get("index_kpool") or 1)
     compress = bool(c.get("index_kpool_compress", False))
@@ -91,7 +87,10 @@ def _glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     qk_nope = int(c.get("qk_nope_head_dim", 0) or 0)
     rope = int(c.get("qk_rope_head_dim", 0) or 0)
     v_dim = int(c.get("v_head_dim", 0) or 0)
-    if qk_head <= 0 or qk_nope <= 0 or rope <= 0 or v_dim <= 0:
+    mla_use_nope = bool(c.get("mla_use_nope", False))
+    if rope == 0 and not mla_use_nope:
+        raise ModelingError("model_config_glm_mla_rope_missing_without_nope")
+    if qk_head <= 0 or qk_nope <= 0 or rope < 0 or v_dim <= 0:
         raise ModelingError("model_config_glm_mla_dims_missing")
     if qk_nope + rope != qk_head:
         raise ModelingError(f"model_config_glm_qk_split_mismatch:{qk_nope}+{rope}!={qk_head}")
@@ -129,7 +128,8 @@ def _glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
             num_heads=heads, num_kv_heads=int(c.get("num_key_value_heads", heads) or heads),
             head_dim=qk_head, q_lora_rank=q_rank, kv_lora_rank=kv_rank,
             qk_nope_head_dim=qk_nope, qk_rope_head_dim=rope, v_head_dim=v_dim,
-            mla_variant="latent_mla", kv_cache_elements=kv_rank + rope,
+            mla_variant="latent_mla", mla_use_nope=mla_use_nope,
+            kv_cache_elements=kv_rank + rope,
             intermediate_size=dense_i if ffn == "dense" else 0,
             num_experts=experts if ffn == "moe" else 0,
             top_k=top_k if ffn == "moe" else 0,
@@ -203,7 +203,10 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     qk_nope = int(c.get("qk_nope_head_dim", 0) or 0)
     rope = int(c.get("qk_rope_head_dim", 0) or 0)
     v_dim = int(c.get("v_head_dim", 0) or 0)
-    if qk_head <= 0 or qk_nope <= 0 or v_dim <= 0:
+    mla_use_nope = bool(c.get("mla_use_nope", False))
+    if rope == 0 and not mla_use_nope:
+        raise ModelingError("model_config_glm_mla_rope_missing_without_nope")
+    if qk_head <= 0 or qk_nope <= 0 or rope < 0 or v_dim <= 0:
         raise ModelingError("model_config_glm_mla_dims_missing")
     if qk_nope + rope != qk_head:
         raise ModelingError(
@@ -274,7 +277,7 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
         )
         if kind in {"linear_attention", "kda"}:
             plans.append(_glm_kda_plan(index, kda_heads, kda_dim, conv_k, conv_width, ffn_fields))
-        elif kind in {"deepseek_sparse_attention", "full_attention", "mla"}:
+        elif kind in {"full_attention", "mla"} or kind.endswith("_sparse_attention"):
             plans.append(LayerPlan(
                 index=index,
                 attention="mla",
@@ -290,6 +293,7 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 qk_rope_head_dim=rope,
                 v_head_dim=v_dim,
                 mla_variant="latent_mla",
+                mla_use_nope=mla_use_nope or rope == 0,
                 mla_output_gate=False,
                 packed_input_projection=True,
                 kv_cache_elements=kv_rank + rope,
@@ -300,8 +304,6 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 owns_topk=True,
                 index_source_layer_id=index,
                 index_source_status="exact_native_full_schedule",
-                # MTP proposal steps share one TopK selection while each step
-                # still produces its own KPool cache row.
                 index_share_for_mtp_iteration=bool(
                     c.get("index_share_for_mtp_iteration", True)),
                 **_index_pool(c),
@@ -358,10 +360,8 @@ def _aux_glm(c: Mapping[str, Any]) -> AuxiliarySpec:
             },
         ),
         notes=("GLM body is 78 layers; MTP is one optional layer",),
-        **_draft_compat_kwargs(
-            independent_context=False,
-            dcp_sharded=True,
-        ),
+        independent_context=False,
+        dcp_sharded=True,
     )
     return AuxiliarySpec(mtp=mtp, notes=("body78_mtp1_distinct",))
 
@@ -385,10 +385,20 @@ def _glm_rope_split(c: Mapping[str, Any], head_dim: int) -> tuple[int, int]:
     return head_dim - rope, rope
 
 
+def _is_legacy_gqa_schema(c: Mapping[str, Any]) -> bool:
+    """Structural predicate for legacy ChatGLM-style config keys (zero model_type checks)."""
+    return any(
+        key in c
+        for key in (
+            "kv_channels", "ffn_hidden_size", "multi_query_group_num",
+            "rmsnorm", "post_layer_norm", "add_qkv_bias", "add_bias_linear",
+        )
+    )
+
+
 def _standard_glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
-    """Body plans for GLM-4 modern/legacy and GLM-4.5/Air GQA checkpoints."""
-    model_type = str(c.get("model_type", ""))
-    if model_type == "chatglm":
+    """Body plans for modern/legacy standard GQA and MoE-GQA checkpoints."""
+    if _is_legacy_gqa_schema(c):
         return _standard_legacy_chatglm_plans(c)
     layers = int(_require(c, "num_hidden_layers"))
     h = int(_require(c, "hidden_size"))
@@ -462,9 +472,8 @@ def _aux_standard_glm(c: Mapping[str, Any]) -> AuxiliarySpec | None:
 
 
 def _standard_glm_gaps(c: Mapping[str, Any]) -> tuple[str, ...]:
-    model_type = str(c.get("model_type", ""))
     gaps: list[str] = []
-    if model_type == "chatglm":
+    if _is_legacy_gqa_schema(c):
         head_dim = _glm_alias_int(c, "kv_channels", "head_dim")
         gaps.append(f"partial_rope_{head_dim // 2}_of_{head_dim}_not_in_attention_plan")
         if not bool(c.get("rmsnorm", False)):
@@ -482,10 +491,10 @@ def _standard_glm_gaps(c: Mapping[str, Any]) -> tuple[str, ...]:
         gaps.append(f"partial_rope_{rope}_of_{head_dim}_not_in_attention_plan")
     if bool(c.get("attention_bias", False)):
         gaps.append("attention_bias_qkv_not_in_layer_plan")
-    if model_type == "glm4":
-        gaps.append("additional_post_self_attn_and_post_mlp_norms_not_in_layer_schema")
-    if model_type == "glm4_moe" and c.get("n_routed_experts") is not None:
+    if c.get("n_routed_experts") is not None:
         gaps.append("router_sigmoid_correction_bias_and_routed_scaling_not_in_layer_plan")
         if _int(c, "num_nextn_predict_layers") > 0:
             gaps.append("optional_mtp_not_modeled")
+    else:
+        gaps.append("additional_post_self_attn_and_post_mlp_norms_not_in_layer_schema")
     return tuple(gaps)

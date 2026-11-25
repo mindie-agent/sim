@@ -49,6 +49,7 @@ from mindie_sim.export import trace_exporter as trace_mod
 from mindie_sim.export.xlsx_exporter import NS_MAIN
 from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.stacks.vllm_ascend.launch_codec import SCRIPT_AUDIT_SCHEMA, VllmAscendLaunchCodec
 
 pytestmark = pytest.mark.tier0
@@ -486,7 +487,7 @@ def test_submodule_and_kernel_hygiene_across_hybrid_architectures(tmp_path):
 def test_memory_quant_calculator_exclusions_offload_and_pp_budget(tmp_path):
     assert evaluate_weight_storage_bytes(6, 65, "MXFP4") == (198, 18, 0, 216)
     assert evaluate_weight_storage_bytes(16, 64, "W8A8") == (1024, 0, 128, 1152)
-    assert evaluate_weight_storage_bytes(16, 64, "W4A8") == (512, 0, 256, 768)
+    assert evaluate_weight_storage_bytes(16, 64, "W4A8") == (512, 0, 64, 576)
     assert evaluate_weight_storage_bytes(16, 64, "MXFP8") == (1024, 32, 0, 1056)
     assert evaluate_weight_storage_bytes(16, 64, "BF16") == (2048, 0, 0, 2048)
 
@@ -523,8 +524,10 @@ def test_memory_quant_calculator_exclusions_offload_and_pp_budget(tmp_path):
         case, seq_len=4096, concurrency=4, weight_quant="BF16", cache_dtype="BF16", engram_host_offload=False,
     )
     led_w4a8_offload = compute_memory_quant_ledger(
-        case, seq_len=4096, concurrency=4, weight_quant="W4A8", cache_dtype="C8", engram_host_offload=True,
+        case, seq_len=4096, concurrency=4, weight_quant="W4A8", cache_dtype="BF16", engram_host_offload=True,
     )
+    with pytest.raises(ModelingError, match="aliased_window_compressed_rejects_int8_kv"):
+        compute_memory_quant_ledger(case, seq_len=4096, concurrency=4, weight_quant="W4A8", cache_dtype="C8")
     engram_hbm_total = sum(s.engram_ple_hbm_bytes for s in led_bf16_hbm.stage_budgets)
     engram_host_total = sum(s.engram_ple_host_bytes for s in led_w4a8_offload.stage_budgets)
     assert engram_hbm_total > 0.0 and engram_host_total == pytest.approx(engram_hbm_total, rel=1e-9)
