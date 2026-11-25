@@ -10,7 +10,12 @@ from bisect import bisect_right
 import math
 
 from mindie_sim.catalog.cache import index_k_block_rows
-from mindie_sim.catalog.context_parallel import dcp_indexer_sharded
+from mindie_sim.catalog.context_parallel import (
+    cp_interleave,
+    dcp_indexer_sharded,
+    layer_dcp_degree,
+    layer_dcp_factors,
+)
 from mindie_sim.schema.common import ModelingError
 
 
@@ -59,21 +64,83 @@ def _compressed_store_on_completion_runs(
     return ((c_lo, c_hi),) if c_hi > c_lo else ()
 
 
+def dcp_cp_rank(layer, parallel, rank: int) -> int:
+    """Exact DCP shard index for physical rank ``rank`` matching ``catalog.cache._local_cache_rows``."""
+    cp = layer_dcp_degree(layer, parallel)
+    if cp <= 1:
+        return 0
+    pcp_f, tp_g, dp_w = layer_dcp_factors(layer, parallel)
+    tp_dim = max(1, int(getattr(parallel, "tp", 1) or 1))
+    pcp_dim = max(1, int(getattr(parallel, "pcp", 1) or 1))
+    dp_dim = max(1, int(getattr(parallel, "dp", 1) or 1))
+    r_int = int(rank)
+    tp_i = r_int % tp_dim
+    pcp_i = (r_int // tp_dim) % pcp_dim
+    dp_i = (r_int // (tp_dim * pcp_dim)) % dp_dim
+    return ((dp_i % dp_w) * (pcp_f * tp_g) + (pcp_i % pcp_f) * tp_g + (tp_i % tp_g)) % cp
+
+
+def interleaved_token_runs(
+    tokens: int, cp: int, interleave: int, cp_rank: int, *, window_start: int = 0,
+) -> tuple[tuple[int, int], ...]:
+    """Exact half-open interleaved token runs owned by DCP shard ``cp_rank`` in ``[window_start, tokens)``."""
+    win_lo = max(0, int(window_start))
+    hi_tok = max(0, int(tokens))
+    if hi_tok <= win_lo:
+        return ()
+    cp_n = max(1, int(cp))
+    if cp_n <= 1:
+        return ((win_lo, hi_tok),)
+    step = max(1, int(interleave))
+    stride = cp_n * step
+    start = (int(cp_rank) % cp_n) * step
+    if start + step <= win_lo:
+        skip = (win_lo - start) // stride
+        start += skip * stride
+        if start + step <= win_lo:
+            start += stride
+    runs: list[tuple[int, int]] = []
+    for pos in range(start, hi_tok, stride):
+        r_lo = max(win_lo, pos)
+        r_hi = min(hi_tok, pos + step)
+        if r_hi > r_lo:
+            runs.append((r_lo, r_hi))
+    return tuple(runs)
+
+
 def owned_runs(component, layer, model, parallel, rank, span, tokens, window_start,
-               *, runtime=None):
+               *, runtime=None, explicit_span: bool = False):
     """Exact integer half-open row intervals owned by ``rank`` for ``component``."""
     lo, hi = int(span[0]), int(span[1])
     toks = max(0, int(tokens))
     win_lo = max(0, int(window_start))
+    cp_deg = layer_dcp_degree(layer, parallel)
+    use_interleaved = (not explicit_span) and cp_deg > 1
     if component in {"mla_kv", "window"}:
+        if use_interleaved:
+            return interleaved_token_runs(
+                toks, cp_deg, cp_interleave(runtime), dcp_cp_rank(layer, parallel, int(rank)),
+                window_start=win_lo,
+            )
         start = max(lo, win_lo)
         return ((start, hi),) if hi > start else ()
     ratio = max(1, int(getattr(layer, "compress_ratio", 1) or 1))
     if component == "compressed_kv":
+        if use_interleaved:
+            total = toks // ratio
+            stride = max(1, int(cp_interleave(runtime)) // ratio)
+            return interleaved_token_runs(
+                total, cp_deg, stride, dcp_cp_rank(layer, parallel, int(rank)),
+            )
         return _compressed_store_on_completion_runs(lo, hi, toks, ratio)
     ratio = max(ratio, int(getattr(layer, "index_kpool", 1) or 1))
     total = toks // ratio
-    if dcp_indexer_sharded(model, runtime) and int(parallel.cp) > 1:
+    if dcp_indexer_sharded(model, runtime) and cp_deg > 1:
+        if use_interleaved:
+            stride = max(1, int(cp_interleave(runtime)) // ratio)
+            return interleaved_token_runs(
+                total, cp_deg, stride, dcp_cp_rank(layer, parallel, int(rank)),
+            )
         return _compressed_store_on_completion_runs(lo, hi, toks, ratio)
     if parallel.cp_plan != "dsa_cp" or int(parallel.cp) <= 1:
         return ((0, total),) if total > 0 else ()

@@ -32,6 +32,8 @@ _SYMMETRIC_LINK_SEMANTICS = frozenset({"per_pair", "per_port", "fully_connected"
 _PORT_SEMANTICS = frozenset({"per_port", "fully_connected", "mesh"})
 _MIN_DEDUP_REPLICAS = 2
 _CANONICAL_INDEX = 0
+_BYTE_RECIPROCITY_REL_TOL = 1e-9
+_BYTE_SIG_ROUND_DIGITS = 6
 _NATIVE_MC2_FAMILIES = frozenset({"mc2_protocol", "mc2_transport"})
 _RANK_LABEL_METADATA_KEYS = frozenset({"ep_rank", "dp_rank", "replica", "rank_id"})
 _PAIR_RE = re.compile(r"^(?P<pfx>.+):pair(?P<src>\d+)>(?P<dst>\d+)$")
@@ -550,22 +552,45 @@ def is_symmetric_native_program(
     if width % local_k != 0:
         return False
     route_matrix = getattr(inner, "route_matrix", None)
-    if not route_matrix:
+    route_bytes = getattr(inner, "route_matrix_bytes", None)
+    payload_bytes_fn = getattr(inner, "payload_bytes", None)
+    has_byte_matrix = bool(route_bytes) or callable(payload_bytes_fn)
+    if not route_matrix and not has_byte_matrix:
         return True
     frames_for = getattr(inner, "frames_for", None)
     basis_for = getattr(inner, "payload_basis_for", None)
     local_for = getattr(inner, "local_frames_for", None)
-    if not callable(frames_for):
+    if route_matrix and not callable(frames_for):
         return False
 
-    matrix = [_row_frame_map(frames_for(rk), width) for rk in range(width)]
-    # 1) Strict directed reciprocity M[u][v] == M[v][u] for every pair u != v.
+    matrix = (
+        [_row_frame_map(frames_for(rk), width) for rk in range(width)]
+        if route_matrix else [{} for _ in range(width)]
+    )
+    # 1) Strict directed reciprocity M[u][v] == M[v][u] (both frames and expected bytes).
+    byte_rows: list[dict[int, float]] = [{} for _ in range(width)]
+    if has_byte_matrix:
+        for u in range(width):
+            for v in range(width):
+                if u == v:
+                    continue
+                if callable(payload_bytes_fn):
+                    b_uv = float(payload_bytes_fn(u, v) or 0.0)
+                else:
+                    b_uv = float(route_bytes[u][v] or 0.0)
+                if b_uv > 0.0:
+                    byte_rows[u][v] = b_uv
     for u in range(width):
         for v in range(u + 1, width):
             if matrix[u].get(v, 0) != matrix[v].get(u, 0):
                 return False
+            if has_byte_matrix:
+                b_uv = byte_rows[u].get(v, 0.0)
+                b_vu = byte_rows[v].get(u, 0.0)
+                if abs(b_uv - b_vu) > _BYTE_RECIPROCITY_REL_TOL * max(1.0, abs(b_uv), abs(b_vu)):
+                    return False
 
-    # 2) Identical per-rank basis, local frames, and off-diagonal frame histogram.
+    # 2) Identical per-rank basis, local frames, and off-diagonal frame/byte histograms.
     def _rank_sig(rk: int) -> tuple[Any, ...]:
         rep_base = (rk // local_k) * local_k
         rep_end = rep_base + local_k
@@ -577,9 +602,17 @@ def is_symmetric_native_program(
             f for dst, f in matrix[rk].items()
             if dst != rk and not (rep_base <= dst < rep_end)
         ))
+        intra_b = tuple(sorted(
+            (dst - rep_base, round(b, _BYTE_SIG_ROUND_DIGITS)) for dst, b in byte_rows[rk].items()
+            if dst != rk and rep_base <= dst < rep_end
+        ))
+        cross_b = tuple(sorted(
+            round(b, _BYTE_SIG_ROUND_DIGITS) for dst, b in byte_rows[rk].items()
+            if dst != rk and not (rep_base <= dst < rep_end)
+        ))
         basis = str(basis_for(rk)) if callable(basis_for) else ""
         loc = int(local_for(rk)) if callable(local_for) else 0
-        return (basis, loc, intra, cross)
+        return (basis, loc, intra, cross, intra_b, cross_b)
 
     n_replicas = width // local_k
     for pos in range(local_k):

@@ -384,32 +384,46 @@ class _CohortMixin(_CohortNativeMixin):
             prog0, ep_width, local_rank_count=local_k,
         ):
             return False, 0, ()
-        # Part 3: Symmetric routed reverse path latency/capacity on cross-replica edges.
+        # Part 3: Symmetric routed reverse path + cross-replica wire/latency/rate isomorphism.
         route = transport.get("route")
         inner = prog0.program
         if callable(route) and hasattr(inner, "transport_cells"):
             from ..communication import MessageFlow
-            local_set = set(local_sources)
-            for _si, _di, src, dst, useful, _frames in inner.transport_cells(transport, count=False):
-                if useful <= 0 or src == dst or (src in local_set and dst in local_set):
-                    continue
-                fwd = route(MessageFlow(src, dst, float(useful)))
-                rev = route(MessageFlow(dst, src, float(useful)))
-                if len(fwd.hops) != len(rev.hops):
+
+            def _hop_sig(routed) -> tuple[tuple[float, float, tuple[float, ...]], ...]:
+                return tuple(
+                    (
+                        float(hop.wire_bytes),
+                        float(hop.latency_ms),
+                        tuple(sorted(
+                            float(self.engine.resources[r].rate)
+                            for r in hop.demand if r in self.engine.resources
+                        )),
+                    )
+                    for hop in routed.hops
+                )
+
+            ref_sigs: list[tuple[tuple[float, float, tuple[float, ...]], ...]] | None = None
+            for rep in peer_replicas:
+                rep_sources = tuple(sorted({int(rk) for rk in self.topology.ranks(rep, source_stage)}))
+                if len(rep_sources) != local_k:
                     return False, 0, ()
-                for hf, hr in zip(fwd.hops, rev.hops):
-                    if hf.latency_ms != hr.latency_ms:
+                rep_transport = {**transport, "sources": rep_sources}
+                rep_set = set(rep_sources)
+                rep_sigs: list[tuple[tuple[float, float, tuple[float, ...]], ...]] = []
+                for _si, _di, src, dst, useful, _frames in inner.transport_cells(rep_transport, count=False):
+                    if useful <= 0 or src == dst or (src in rep_set and dst in rep_set):
+                        continue
+                    fwd_sig = _hop_sig(route(MessageFlow(src, dst, float(useful))))
+                    rev_sig = _hop_sig(route(MessageFlow(dst, src, float(useful))))
+                    if fwd_sig != rev_sig:
                         return False, 0, ()
-                    f_rates = tuple(sorted(
-                        self.engine.resources[r].rate
-                        for r in hf.demand if r in self.engine.resources
-                    ))
-                    r_rates = tuple(sorted(
-                        self.engine.resources[r].rate
-                        for r in hr.demand if r in self.engine.resources
-                    ))
-                    if f_rates != r_rates:
-                        return False, 0, ()
+                    rep_sigs.append(fwd_sig)
+                rep_sigs.sort()
+                if ref_sigs is None:
+                    ref_sigs = rep_sigs
+                elif rep_sigs != ref_sigs:
+                    return False, 0, ()
         return True, ep_width, local_sources
 
     def _build_canonical_launch_view(

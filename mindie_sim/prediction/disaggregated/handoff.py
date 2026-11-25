@@ -298,8 +298,13 @@ def _resolve_active_draft_handoff(
             f"p=({p_spec.layers},{p_spec.attention_kind}),"
             f"d=({d_spec.layers},{d_spec.attention_kind})"
         )
+    p_cap = int(p_mem._draft_context_cap(p_spec) or 0)
     d_cap = int(d_mem._draft_context_cap(d_spec) or 0)
-    eff_tokens = min(int(tokens), d_cap) if d_cap > 0 else int(tokens)
+    eff_tokens = int(tokens)
+    if p_cap > 0:
+        eff_tokens = min(eff_tokens, p_cap)
+    if d_cap > 0:
+        eff_tokens = min(eff_tokens, d_cap)
     if eff_tokens <= 0:
         return None
     if d_mem._uses_inherited_draft_cache(d_case.model):
@@ -348,7 +353,9 @@ def _handoff_rank_views(case, layer, parallel, ranks, ledger, owners,
             )
             for index in range(len(ranks))
         )
-        component_owners = spans
+        # Preserve exact DCP interleaved ownership in layer_cache_components for row/MLA caches
+        # when caller did not provide explicit T05 owner spans.
+        component_owners = spans if (has_head_axis or eff_cp <= 1) else None
     interleave = cp_interleave(case.runtime)
     result = []
     for index, rank in enumerate(ranks):
@@ -423,6 +430,7 @@ def compute_expected_pd_handoff_demand(
                     runs = owned_runs(
                         comp, layer, decode_case.model, d_par, index, span,
                         n_tokens, win_start, runtime=decode_case.runtime,
+                        explicit_span=(target_owners is not None),
                     )
                     owned_rows = sum(hi - lo for lo, hi in runs)
                     if owned_rows > 0:
@@ -707,11 +715,26 @@ def _emit_state_transfers(
                     )
 
 
+def _gqa_kv_plane_weights(model: Any, layer: Any) -> tuple[int, int]:
+    """Return exact positive integer ``(k_bytes, v_bytes)`` weights per head-token."""
+    if model is None:
+        return 1, 1
+    from mindie_sim.catalog.cache_format import gqa_kv_formats
+
+    k_fmt, v_fmt, is_shared = gqa_kv_formats(model, plan=layer)
+    if is_shared:
+        return 1, 1
+    head_dim = max(1, int(getattr(layer, "head_dim", 0) or getattr(model, "head_dim", 1) or 1))
+    k_b = max(1, int(k_fmt.row_bytes(head_dim)))
+    v_b = max(1, int(v_fmt.row_bytes(head_dim)))
+    return k_b, v_b
+
+
 def _emit_head_transfers(
     emit, request, emitted_component, raw_component, layer, logical_layer,
     source_stage, destination_stage, prefill_rep, decode_rep,
     src_views, dst_views, source_spans, target_spans, prefill_p, decode_p,
-    windowed, window_start, tokens, split_kv,
+    windowed, window_start, tokens, split_kv, *, model: Any = None,
 ):
     """Upstream ``push_worker.py:482-505`` contiguous GQA head transfer with replica balance."""
     tp_p = max(1, int(prefill_p.tp))
@@ -773,18 +796,24 @@ def _emit_head_transfers(
                 spans_all_rows = (piece_lo, piece_hi) == (s_lo, s_hi) == (d_lo, d_hi)
                 consecutive = heads[-1] - heads[0] + 1 == len(heads)
                 groups = [heads] if (spans_all_rows and consecutive) else [[h] for h in heads]
-                planes = ("gqa_k", "gqa_v") if split_kv else (emitted_component,)
-                n_planes = len(planes)
-                if per_head_token % n_planes != 0 or src_comp_bytes % n_planes != 0 or need % n_planes != 0:
-                    raise ModelingError(f"pd_transfer_split_kv_non_integer:{request}:{logical_layer}")
-                unit = per_head_token // n_planes
-                src_plane_size = src_comp_bytes // n_planes
-                dst_plane_size = need // n_planes
+                if split_kv:
+                    k_w, v_w = _gqa_kv_plane_weights(model, layer)
+                    tot_w = k_w + v_w
+                    plane_specs = (("gqa_k", k_w), ("gqa_v", v_w))
+                    for total_val in (per_head_token, src_comp_bytes, need):
+                        if (total_val * k_w) % tot_w != 0 or (total_val * v_w) % tot_w != 0:
+                            raise ModelingError(f"pd_transfer_split_kv_non_integer:{request}:{logical_layer}")
+                else:
+                    tot_w = 1
+                    plane_specs = ((emitted_component, 1),)
                 for group in groups:
                     src_off = (group[0] - sspan[0]) * (s_hi - s_lo) + (piece_lo - s_lo)
                     dst_off = (group[0] - dspan[0]) * (d_hi - d_lo) + (piece_lo - d_lo)
-                    payload = unit * (piece_hi - piece_lo) * len(group)
-                    for plane in planes:
+                    for plane, plane_w in plane_specs:
+                        unit = (per_head_token * plane_w) // tot_w
+                        src_plane_size = (src_comp_bytes * plane_w) // tot_w
+                        dst_plane_size = (need * plane_w) // tot_w
+                        payload = unit * (piece_hi - piece_lo) * len(group)
                         emit(
                             src_rank, dest_rank, plane, payload,
                             source_stage=source_stage, destination_stage=destination_stage,
@@ -809,10 +838,10 @@ def _emit_row_transfers(
     source_stage, destination_stage, prefill_rep, decode_rep,
     src_views, dst_views, prefill_case, decode_case, prefill_p, decode_p,
     tokens, window_start, num_heads, offload, offload_layers, hot_tokens,
-    destination, *, source_owners=None,
+    destination, *, source_owners=None, target_owners=None,
 ):
     """Upstream ``push_worker.py:470-481`` DCP-group-filtered MLA/index row transfer."""
-    def manifest(case, parallel, entries):
+    def manifest(case, parallel, entries, *, explicit_span: bool):
         return [
             (
                 index,
@@ -820,14 +849,15 @@ def _emit_row_transfers(
                 owned_runs(
                     raw_component, layer, case.model, parallel, index, span,
                     tokens, window_start, runtime=case.runtime,
+                    explicit_span=explicit_span,
                 ),
                 values.get(raw_component, 0),
             )
             for index, rank, values, span in entries
         ]
 
-    src_manifest = manifest(prefill_case, prefill_p, src_views)
-    dst_manifest = manifest(decode_case, decode_p, dst_views)
+    src_manifest = manifest(prefill_case, prefill_p, src_views, explicit_span=(source_owners is not None))
+    dst_manifest = manifest(decode_case, decode_p, dst_views, explicit_span=(target_owners is not None))
     all_sources = [(rank, runs, size) for _idx, rank, runs, size in src_manifest]
 
     # Upstream push_worker.py:478-481 replica group partitioning (zero 8x rank-0 hotspot).
@@ -953,7 +983,7 @@ def _bind_layer_handoff(
                 emit, request, emitted_component, raw_component, layer, logical_layer,
                 source_stage, destination_stage, prefill_rep, decode_rep,
                 src_views, dst_views, source_spans, target_spans, prefill_p, decode_p,
-                windowed, window_start, tokens, split_kv,
+                windowed, window_start, tokens, split_kv, model=decode_case.model,
             )
             continue
         if raw_component in ROW_COMPONENTS:
@@ -962,7 +992,7 @@ def _bind_layer_handoff(
                 source_stage, destination_stage, prefill_rep, decode_rep,
                 src_views, dst_views, prefill_case, decode_case, prefill_p, decode_p,
                 tokens, window_start, num_heads, offload, offload_layers, hot_tokens,
-                destination, source_owners=source_owners,
+                destination, source_owners=source_owners, target_owners=target_owners,
             )
             continue
         _emit_state_transfers(
@@ -1472,9 +1502,9 @@ def _union_interval_length(intervals) -> int:
 
 def _summarize_unique_logical_handoff_bytes(handoff: PDHandoff, p_case, p_topo) -> int:
     """Compute replica-deduplicated logical KV/state bytes across emitted transfers."""
-    logical_row_units: dict[tuple[int, str], tuple[int, int]] = {}
-    logical_row_spans: dict[tuple[int, str], list[tuple[int, int]]] = defaultdict(list)
-    logical_plane_spans: dict[tuple[int, str, Any], list[tuple[int, int]]] = defaultdict(list)
+    logical_row_units: dict[tuple[Any, ...], tuple[int, int]] = {}
+    logical_row_spans: dict[tuple[Any, ...], list[tuple[int, int]]] = defaultdict(list)
+    logical_plane_spans: dict[tuple[Any, ...], list[tuple[int, int]]] = defaultdict(list)
     p_par = p_case.runtime.parallel
     p_rank_to_idx: dict[tuple[int, int], int] = {}
     for st in range(p_topo._pp):
@@ -1490,7 +1520,17 @@ def _summarize_unique_logical_handoff_bytes(handoff: PDHandoff, p_case, p_topo) 
                 logical_row_spans[key].append((t_lo, t_hi))
                 logical_row_units[key] = (item.payload_bytes, t_hi - t_lo)
         elif raw_comp in HEAD_COMPONENTS or raw_comp in {"gqa_k", "gqa_v"}:
-            key = (layer_id, item.component, item.source_heads)
+            if item.source_token_span and item.source_heads:
+                t_lo, t_hi = item.source_token_span
+                h_lo, h_hi = item.source_heads
+                if t_hi > t_lo and h_hi > h_lo:
+                    n_units = (h_hi - h_lo) * (t_hi - t_lo)
+                    for head_id in range(h_lo, h_hi):
+                        h_key = (layer_id, item.component, head_id)
+                        logical_row_spans[h_key].append((t_lo, t_hi))
+                        logical_row_units[h_key] = (item.payload_bytes, n_units)
+                    continue
+            key = (layer_id, item.component, item.source_heads, item.source_token_span)
             if item.source_byte_range:
                 logical_plane_spans[key].append(item.source_byte_range)
         elif raw_comp in SHARDED_STATE_COMPONENTS:

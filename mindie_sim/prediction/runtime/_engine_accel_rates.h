@@ -420,7 +420,7 @@ static int32_t rates_coupled(msim_ctx *c)
         }
         {
             int32_t nu = c->res[r].units, order[MSIM_MAX_U], norder = 0, ue = 0;
-            if (!msim_uent_reserve(c, nent + total_u)) return MSIM_E_ARITH;
+            if (!msim_uent_reserve(c, total_u)) return MSIM_E_ARITH;
             if (!msim_own_reserve(c, nent + total_u)) return MSIM_E_ARITH;
             entry = c->entry; onext = c->onext; oslot = c->oslot;
             for (i = 0; i < nu; i++) c->uhead[i] = -1;

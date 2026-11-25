@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from fractions import Fraction
 import heapq
 import re
 from typing import Any, Mapping, Sequence
@@ -278,21 +279,60 @@ def _attribute_live_slice(
             mask_overlap[iv.occurrence_id][witness.label] += dt
 
 
+def _allocate_exact_fraction_shares(
+    total_ns: int, exact_shares: Mapping[str, Fraction],
+) -> dict[str, int]:
+    """Project exact rational shares onto integer nanoseconds conserving ``total_ns``."""
+    if total_ns <= 0 or not exact_shares:
+        return {}
+    items = [(oid, val) for oid, val in exact_shares.items() if val > 0]
+    if not items:
+        return {}
+    total_frac = sum((val for _, val in items), Fraction(0))
+    if total_frac <= 0:
+        return {}
+    scale = Fraction(total_ns) / total_frac
+    floors: dict[str, int] = {}
+    remainders: list[tuple[Fraction, str]] = []
+    used = 0
+    for oid, val in items:
+        scaled = val * scale
+        fl = int(scaled)
+        floors[oid] = fl
+        used += fl
+        remainders.append((scaled - fl, oid))
+    leftover = total_ns - used
+    if leftover > 0:
+        remainders.sort(key=lambda item: (-item[0], item[1]))
+        for idx in range(min(leftover, len(remainders))):
+            floors[remainders[idx][1]] += 1
+    elif leftover < 0:
+        remainders.sort(key=lambda item: (item[0], item[1]))
+        for _, oid in remainders:
+            if leftover >= 0:
+                break
+            if floors[oid] > 0:
+                floors[oid] -= 1
+                leftover += 1
+    return floors
+
+
 def _attribute_live_slice_indexed(
     dt: int,
     live_ivs: Mapping[int, ObservedInterval],
     live_oid_counts: Counter,
-    live_grants_by_res: Mapping[str, Mapping[int, tuple[str, float]]],
+    live_grants_by_res: Mapping[str, Mapping[int, tuple[str, Fraction]]],
     live_res_by_oid: Mapping[str, Counter],
     witness_set: frozenset[str],
-    exposed: dict[str, int],
+    exposed_int: dict[str, int],
+    contested_exact: dict[str, Fraction],
     mask_overlap: Mapping[str, dict[str, int]],
 ) -> None:
-    """Incremental sweep-line attribution touching only witness-active resources."""
+    """Incremental sweep-line attribution with cut-invariant exact-Fraction contested shares."""
     live = tuple(live_ivs.values())
     witness = _pick_stream0_witness(live, witness_set)
     w_res_map = live_res_by_oid.get(witness.occurrence_id)
-    combined: dict[str, float] = defaultdict(float)
+    combined: dict[str, Fraction] = {}
     if w_res_map:
         for res, cnt in w_res_map.items():
             if cnt <= 0:
@@ -300,24 +340,26 @@ def _attribute_live_slice_indexed(
             entries = live_grants_by_res.get(res)
             if not entries or len(entries) < 2:
                 continue
-            claimants: dict[str, float] = defaultdict(float)
+            claimants: dict[str, Fraction] = {}
             for oid, rate in entries.values():
                 if live_oid_counts.get(oid, 0) > 0:
-                    claimants[oid] += rate * float(dt)
+                    claimants[oid] = claimants.get(oid, Fraction(0)) + rate
             if witness.occurrence_id in claimants and len(claimants) >= 2:
-                res_tot = sum(claimants.values())
-                if res_tot > 0.0:
+                res_tot = sum(claimants.values(), Fraction(0))
+                if res_tot > 0:
                     for oid, amt in claimants.items():
-                        combined[oid] += amt / res_tot
+                        combined[oid] = combined.get(oid, Fraction(0)) + (amt / res_tot)
     if combined:
-        shares = _allocate_integer_shares(dt, combined)
-        for oid, ns in shares.items():
-            exposed[oid] += ns
-        for iv in live:
-            if iv.occurrence_id not in shares and iv.stream_index != witness.stream_index:
-                mask_overlap[iv.occurrence_id][witness.label] += dt
-        return
-    exposed[witness.occurrence_id] += dt
+        tot_w = sum(combined.values(), Fraction(0))
+        if tot_w > 0:
+            dt_frac = Fraction(dt)
+            for oid, weight in combined.items():
+                contested_exact[oid] = contested_exact.get(oid, Fraction(0)) + (dt_frac * weight / tot_w)
+            for iv in live:
+                if iv.occurrence_id not in combined and iv.stream_index != witness.stream_index:
+                    mask_overlap[iv.occurrence_id][witness.label] += dt
+            return
+    exposed_int[witness.occurrence_id] += dt
     for iv in live:
         if iv.occurrence_id != witness.occurrence_id and iv.stream_index != witness.stream_index:
             mask_overlap[iv.occurrence_id][witness.label] += dt
@@ -333,8 +375,9 @@ def attribute_stream0_intervals(
 ) -> StreamExposureResult:
     """Assign every half-open ``[t0, t1)`` slice once via O((N+G) log(N+G)) sweep-line.
 
-    Clipped grants scale ``delivered`` proportionally to the overlap fraction
-    ``(hi - lo) / (orig_hi - orig_lo)`` so clipping never inflates grant rate.
+    Clipped grants scale ``delivered`` proportionally via exact ``Fraction(delivered) / orig_span``,
+    and contested slices accumulate exact rational exposure before one final Hamilton rounding
+    so attribution is strictly cut-invariant and exact-integer conserved (0 ns delta).
     """
     start_i = int(start_ns)
     term_i = max(start_i, int(terminal_ns))
@@ -365,7 +408,7 @@ def attribute_stream0_intervals(
     for iv in active_ivs:
         cuts_set.add(iv.start_ns)
         cuts_set.add(iv.end_ns)
-    clamped_grants: list[tuple[int, int, str, str, float]] = []
+    clamped_grants: list[tuple[int, int, str, str, Fraction]] = []
     for gr in grants:
         orig_lo = int(gr.start_ns)
         orig_hi = int(gr.end_ns)
@@ -375,7 +418,7 @@ def attribute_stream0_intervals(
         lo = max(start_i, min(term_i, orig_lo))
         hi = max(start_i, min(term_i, orig_hi))
         if hi > lo:
-            rate = float(gr.delivered) / float(orig_span)
+            rate = Fraction(float(gr.delivered)) / Fraction(orig_span)
             clamped_grants.append((lo, hi, gr.occurrence_id, gr.resource, rate))
             cuts_set.add(lo)
             cuts_set.add(hi)
@@ -383,13 +426,14 @@ def attribute_stream0_intervals(
 
     cuts = sorted(cuts_set)
     idle_wait_ns = 0
+    contested_exact: dict[str, Fraction] = {}
     iv_ptr = gr_ptr = 0
     n_ivs, n_grants = len(active_ivs), len(clamped_grants)
     iv_heap: list[tuple[int, int]] = []
     gr_heap: list[tuple[int, int]] = []
     live_ivs: dict[int, ObservedInterval] = {}
     live_oid_counts: Counter = Counter()
-    live_grants_by_res: dict[str, dict[int, tuple[str, float]]] = defaultdict(dict)
+    live_grants_by_res: dict[str, dict[int, tuple[str, Fraction]]] = defaultdict(dict)
     live_res_by_oid: dict[str, Counter] = defaultdict(Counter)
 
     for lo, hi in zip(cuts, cuts[1:]):
@@ -439,8 +483,13 @@ def attribute_stream0_intervals(
             continue
         _attribute_live_slice_indexed(
             dt, live_ivs, live_oid_counts, live_grants_by_res,
-            live_res_by_oid, witness_set, exposed, mask_overlap,
+            live_res_by_oid, witness_set, exposed, contested_exact, mask_overlap,
         )
+
+    if contested_exact:
+        contested_total = (term_i - start_i) - idle_wait_ns - sum(exposed.values())
+        for oid, ns in _allocate_exact_fraction_shares(contested_total, contested_exact).items():
+            exposed[oid] = exposed.get(oid, 0) + ns
 
     masked_by: dict[str, str] = {}
     for iv in clamped:
@@ -544,6 +593,8 @@ class _Scope:
     metadata: dict[Any, dict[str, Any]] = field(default_factory=dict)
     releases: dict[Any, tuple[ExposedClocks, ...]] = field(default_factory=dict)
     refcounts: Counter = field(default_factory=Counter)
+    evicted: set[Any] = field(default_factory=set)
+    evicted_overflow: bool = False
     service: ExposedClocks = field(default_factory=lambda: ExposedClocks(0.0, 0.0, 0.0, 0.0))
     control_ms: float = 0.0
     opaque_control_ms: float = 0.0
@@ -716,34 +767,57 @@ class ExposedObserver:
             raise ModelingError(f"exposed_observer_scope_unknown:{key}")
         return self._scopes[key]
 
-    def on_submit(self, event: Any, *, after: Any = (), release: Any = (),
-                 declaration: Any = None) -> None:
-        scope = self._scope()
-        predecessors = [scope.events[key] for key in _edge_keys(after)
-                        if key in scope.events]
-        for key in _edge_keys(release):
-            predecessors.extend(scope.releases.get(key, ()))
-        duration, control, opaque = _clock_for_declaration(declaration)
-        scope.events[event] = advance_clocks(predecessors, duration)
-        scope.control_ms = max(scope.control_ms, control)
-        scope.opaque_control_ms = max(scope.opaque_control_ms, opaque)
-        for key in _edge_keys(after):
+    def _check_not_evicted(self, scope: _Scope, keys: tuple[Any, ...]) -> None:
+        for key in keys:
             if key in scope.events:
-                scope.refcounts[key] += 1
-        if len(scope.events) > self.max_events:
+                continue
+            if key in scope.evicted or scope.evicted_overflow:
+                raise ModelingError(f"exposed_observer_evicted_predecessor:{key}")
+
+    def _evict_if_needed(self, scope: _Scope, *, protect: Any) -> None:
+        if len(scope.events) <= self.max_events:
+            return
+        for require_resolved in (True, False):
+            if len(scope.events) <= self.max_events:
+                return
             evictable = [
                 key for key in scope.events
-                if key != event
-                and key in scope.event_time
+                if key != protect
                 and scope.refcounts.get(key, 0) <= 0
                 and key not in scope.terminals
+                and (not require_resolved or key in scope.event_time)
             ]
             for old_key in evictable:
                 if len(scope.events) <= self.max_events:
-                    break
+                    return
                 scope.events.pop(old_key, None)
                 scope.event_time.pop(old_key, None)
                 scope.metadata.pop(old_key, None)
+                if len(scope.evicted) < MAX_EVENTS:
+                    scope.evicted.add(old_key)
+                else:
+                    scope.evicted_overflow = True
+
+    def on_submit(self, event: Any, *, after: Any = (), release: Any = (),
+                 declaration: Any = None) -> None:
+        scope = self._scope()
+        after_keys = _edge_keys(after)
+        self._check_not_evicted(scope, after_keys)
+        predecessors = [scope.events[key] for key in after_keys
+                        if key in scope.events]
+        for key in _edge_keys(release):
+            if key not in scope.releases:
+                self._check_not_evicted(scope, (key,))
+            predecessors.extend(scope.releases.get(key, ()))
+        duration, control, opaque = _clock_for_declaration(declaration)
+        scope.evicted.discard(event)
+        scope.events[event] = advance_clocks(predecessors, duration)
+        scope.control_ms = max(scope.control_ms, control)
+        scope.opaque_control_ms = max(scope.opaque_control_ms, opaque)
+        for key in after_keys:
+            if key in scope.events:
+                scope.refcounts[key] += 1
+        self._evict_if_needed(scope, protect=event)
 
     def on_service_interval(
         self, *, start_ms: float, end_ms: float, services: Mapping[str, float],
@@ -771,20 +845,25 @@ class ExposedObserver:
 
     def on_resolve(self, event: Any, *, after: Any = (), moment_ms: float) -> ExposedClocks:
         scope = self._scope()
-        predecessors = [scope.events[key] for key in _edge_keys(after)
+        after_keys = _edge_keys(after)
+        self._check_not_evicted(scope, (event, *after_keys))
+        predecessors = [scope.events[key] for key in after_keys
                         if key in scope.events]
         base = scope.events.get(event)
         clocks = join_clocks([*predecessors, *([base] if base else [])])
+        scope.evicted.discard(event)
         scope.events[event] = clocks
         scope.event_time[event] = float(moment_ms)
-        for key in _edge_keys(after):
+        for key in after_keys:
             scope.refcounts[key] -= 1
             if scope.refcounts[key] <= 0:
                 scope.refcounts.pop(key, None)
+        self._evict_if_needed(scope, protect=event)
         return clocks
 
     def release(self, event: Any) -> None:
         scope = self._scope()
+        self._check_not_evicted(scope, (event,))
         clock = scope.events.get(event)
         if clock is not None:
             scope.releases[event] = (clock,)
@@ -812,8 +891,10 @@ class ExposedObserver:
         scope.periodic_repeats = repeat
         pairs = correspondence.items() if isinstance(correspondence, Mapping) else correspondence
         for source, target in pairs:
+            self._check_not_evicted(scope, (source,))
             clock = scope.events.get(source)
             if clock is not None:
+                scope.evicted.discard(target)
                 scope.events[target] = ExposedClocks(
                     clock.all_ms + scaled.all_ms,
                     clock.without_communication_ms + scaled.without_communication_ms,
@@ -823,6 +904,7 @@ class ExposedObserver:
     def finish_scope(self, scope_id: Any, terminal: Any) -> dict[str, Any]:
         scope = self._scope(scope_id)
         terminals = _edge_keys(terminal)
+        self._check_not_evicted(scope, terminals)
         terminal_clocks = [scope.events[key] for key in terminals
                            if key in scope.events]
         if terminal_clocks:
