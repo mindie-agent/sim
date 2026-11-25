@@ -10,7 +10,8 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass(slots=True)
@@ -24,6 +25,7 @@ class HostCursor:
     active_launches: int = 0
     host_dependency_ports: tuple[str, ...] = ()
     retired: bool = False
+    tail_event: Any = None
 
     def can_submit(self) -> bool:
         if self.retired:
@@ -37,10 +39,12 @@ class HostCursor:
         self.active_launches += 1
         return self.submitted - 1
 
-    def note_host_done(self, sequence: int) -> int:
+    def note_host_done(self, sequence: int, event: Any = None) -> int:
         """Advance the host cursor at host completion, not device completion."""
         self.host_completed = max(self.host_completed, int(sequence) + 1)
         self.active_launches = max(0, self.active_launches - 1)
+        if self.active_launches == 0 and (event is None or self.tail_event is event):
+            self.tail_event = None
         return self.host_completed
 
     def retire(self) -> None:

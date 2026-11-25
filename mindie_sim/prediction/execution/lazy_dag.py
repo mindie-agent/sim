@@ -32,61 +32,86 @@ from .streams import _meta_patch
 def build_verified_dag(physical_ops, prev_dag):
     """Build or reuse verified DAG successor/predecessor indices."""
     n_ops = len(physical_ops)
-    dag_sig = tuple((op.op_id, op.deps, op.family == "token_commit")
-                    for op in physical_ops)
+    stream_sig = tuple((op.stage, op.stream or "main") for op in physical_ops)
+    dag_sig = tuple(
+        (op.op_id, op.deps, stream_sig[idx], op.family == "token_commit")
+        for idx, op in enumerate(physical_ops)
+    )
     if prev_dag is not None and prev_dag[0] == dag_sig:
         return prev_dag[1], prev_dag
     order = {op.op_id: index for index, op in enumerate(physical_ops)}
     succ_lists: list[list[int]] = [[] for _ in range(n_ops)]
     init_unmet = [0] * n_ops
     dep_specs_list: list[Any] = [None] * n_ops
+    last_on_stream: dict[tuple[int, str], int] = {}
     for idx, op in enumerate(physical_ops):
+        stream_key = stream_sig[idx]
+        stream_pred = last_on_stream.get(stream_key)
+        last_on_stream[stream_key] = idx
         raw_deps = op.deps
-        if not raw_deps:
+        if not raw_deps and stream_pred is None:
             dep_specs_list[idx] = ()
+            continue
+        if not raw_deps and stream_pred is not None:
+            init_unmet[idx] = 1
+            succ_lists[stream_pred].append(idx)
+            dep_specs_list[idx] = stream_pred
             continue
         if len(raw_deps) == 1:
             j0 = order.get(raw_deps[0])
-            if j0 is not None:
+            if j0 is not None and (stream_pred is None or stream_pred == j0):
                 init_unmet[idx] = 1
                 succ_lists[j0].append(idx)
                 dep_specs_list[idx] = j0
                 continue
-        int_d = []
+        int_d: list[int] = []
+        seen_int: set[int] = set()
         all_internal = True
         for dep in raw_deps:
             j = order.get(dep)
             if j is not None:
-                int_d.append(j)
-                succ_lists[j].append(idx)
+                if j not in seen_int:
+                    seen_int.add(j)
+                    int_d.append(j)
+                    succ_lists[j].append(idx)
             else:
                 all_internal = False
+        if stream_pred is not None and stream_pred not in seen_int:
+            seen_int.add(stream_pred)
+            int_d.append(stream_pred)
+            succ_lists[stream_pred].append(idx)
         init_unmet[idx] = len(int_d)
-        dep_specs_list[idx] = tuple(int_d) if all_internal else None
+        dep_specs_list[idx] = (
+            int_d[0] if all_internal and len(int_d) == 1
+            else (tuple(int_d) if all_internal else None)
+        )
     root_idx = tuple(i for i in range(n_ops) if not init_unmet[i])
     if n_ops and not root_idx:
         raise ModelingError("execution_dependency_cycle")
-    reachable = [False] * n_ops
+    rem_in = list(init_unmet)
     reach_count = 0
     stack = list(root_idx)
     while stack:
         cur = stack.pop()
-        if reachable[cur]:
-            continue
-        reachable[cur] = True
         reach_count += 1
-        stack.extend(succ_lists[cur])
+        for nxt in succ_lists[cur]:
+            rem_in[nxt] -= 1
+            if rem_in[nxt] == 0:
+                stack.append(nxt)
     if reach_count != n_ops:
         raise ModelingError("execution_dependency_cycle")
     sink_idx = tuple(i for i in range(n_ops) if not succ_lists[i])
+    stream_tail_indices = set(last_on_stream.values())
     fut_indices = tuple(
         i for i in range(n_ops)
-        if not succ_lists[i] or physical_ops[i].family == "token_commit"
+        if not succ_lists[i] or i in stream_tail_indices
+        or physical_ops[i].family == "token_commit"
     )
     packed = (
         order, tuple(tuple(s) for s in succ_lists),
         tuple(init_unmet), tuple(dep_specs_list),
-        root_idx, sink_idx, fut_indices,
+        root_idx, sink_idx, fut_indices, stream_sig,
+        tuple(last_on_stream.items()),
     )
     return packed, (dag_sig, packed)
 
@@ -127,6 +152,8 @@ def collect_begin_after(idx, op, launch, tail, dep_specs, op_events,
     if dspec.__class__ is int:
         d_ev = op_events[dspec]
         if d_ev is not None:
+            if tail is d_ev:
+                tail = None
             if launch is not None and tail is not None:
                 return (input_ready, d_ev, launch, tail)
             if launch is not None:
