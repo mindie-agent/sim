@@ -47,6 +47,12 @@ def _delegate(command: str, rest: tuple[str, ...], *, prog: str) -> int | None:
     if command == "compare-cohorts":
         from mindie_sim.cohort_accuracy import main as cohorts_main
         return cohorts_main(list(rest))
+    if command == "scoreboard":
+        from mindie_sim.observations.scoreboard import main as scoreboard_main
+        return scoreboard_main(list(rest), prog=f"{prog} obs scoreboard")
+    if command == "subgraph-parity":
+        from mindie_sim.observations.subgraph_parity import main as subgraph_parity_main
+        return subgraph_parity_main(list(rest), prog=f"{prog} obs subgraph-parity")
     return None
 
 

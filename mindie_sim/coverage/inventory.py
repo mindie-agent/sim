@@ -406,12 +406,14 @@ def inventory_coverage(summary, captures=None, *, ledger=None, records=None,
         result["a5_record_recovery"] = recovery
         result["sources"]["a5_records"] = recovery["source"]
         flags = recovery["flags"]
-        result["unrecovered"].update({
-            key: flags[flag].get(value, 0) for key, flag, value in (
-                ("runtime_state_not_restored_records", "per_step_runtime_state_restored", "false"),
-                ("context_unobserved_records", "context_explicitly_unobserved", "true"),
-                ("source_binding_ambiguous_records", "source_binding_ambiguous", "true"),
-                ("full_per_call_10pct_validated_true_records", "full_per_call_10pct_validated", "true"),
-            )
-        })
+        for key, flag, value in (
+            ("runtime_state_not_restored_records", "per_step_runtime_state_restored", "false"),
+            ("context_unobserved_records", "context_explicitly_unobserved", "true"),
+            ("source_binding_ambiguous_records", "source_binding_ambiguous", "true"),
+            ("full_per_call_10pct_validated_true_records", "full_per_call_10pct_validated", "true"),
+        ):
+            if "not_declared" not in flags[flag]:
+                result["unrecovered"][key] = flags[flag].get(value, 0)
+            else:
+                result["unrecovered"].setdefault(key, None)
     return result

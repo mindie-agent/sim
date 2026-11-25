@@ -63,37 +63,52 @@ def _edge_list(row, name):
     return edges
 
 
-def _declared_source_edges(value):
+def _parse_declared_source_edges(value):
     if value is None:
         return {}
     if isinstance(value, Mapping):
         value = value.get("source_edges", value)
     if isinstance(value, Mapping):
-        rows = [dict(edge, item_id=item_id)
+        rows = [("any", item_id, edge)
                 for item_id, edges in value.items()
                 for edge in (edges if isinstance(edges, list) else [edges])]
     elif isinstance(value, (list, tuple)):
-        rows = list(value)
+        rows = [(None, None, row) for row in value]
     else:
         raise ValueError("source_edges_requires_object_or_list")
-    by_item = {}
-    for row in rows:
+    by_ref = {}
+    for ref_kind, ref_id, row in rows:
         if not isinstance(row, Mapping):
             raise ValueError("source_edge_requires_object")
-        item_id = (row.get("item_id") or row.get("sample_id")
-                   or row.get("observation_id") or row.get("window_id"))
-        if not isinstance(item_id, str) or not item_id:
+        if ref_kind is None:
+            if row.get("item_id"):
+                ref_kind, ref_id = "item", row["item_id"]
+            elif row.get("sample_id") or row.get("observation_id"):
+                ref_kind = "observation"
+                ref_id = row.get("sample_id") or row.get("observation_id")
+            elif row.get("window_id"):
+                ref_kind, ref_id = "window", row["window_id"]
+            else:
+                ref_id = None
+        if not isinstance(ref_id, str) or not ref_id:
             raise ValueError("source_edge_requires_item_id")
         source_id = row.get("source_id")
         source_path = row.get("source_path")
         capture_id = row.get("capture_id")
         if not source_id and not source_path:
             raise ValueError("source_edge_requires_source_id_or_path")
-        by_item.setdefault(item_id, []).append({
+        by_ref.setdefault((ref_kind, ref_id), []).append({
             "source_id": source_id,
             "source_path": _path_key(source_path) if source_path else None,
             "capture_id": capture_id,
         })
+    return by_ref
+
+
+def _declared_source_edges(value):
+    by_item = {}
+    for (_ref_kind, ref_id), edges in _parse_declared_source_edges(value).items():
+        by_item.setdefault(ref_id, []).extend(edges)
     return by_item
 
 
@@ -276,27 +291,41 @@ def _resolve_source_reference(reference, path_to_sources, capture_by_path, sourc
 
 
 def _resolve_declared_edges(acceptance, source_edges):
-    raw_declared = _declared_source_edges(source_edges)
-    item_ids = {item.get("item_id") for item in acceptance.get("items", ())}
-    observation_to_item, window_to_item = {}, {}
+    raw_declared = _parse_declared_source_edges(source_edges)
+    item_ids = {item.get("item_id") for item in acceptance.get("items", ()) if item.get("item_id")}
+    observation_to_items: dict[str, set[str]] = {}
+    window_to_items: dict[str, set[str]] = {}
     for item in acceptance.get("items", ()):
+        item_id = item.get("item_id")
+        if not item_id:
+            continue
         for observation_id in item.get("observation_ids") or ():
-            observation_to_item[observation_id] = item.get("item_id")
+            observation_to_items.setdefault(observation_id, set()).add(item_id)
         for window_id in item.get("observation_window_ids") or ():
-            window_to_item[window_id] = item.get("item_id")
+            window_to_items.setdefault(window_id, set()).add(item_id)
         for sample in item.get("samples", ()):
             if sample.get("observation_id"):
-                observation_to_item[sample["observation_id"]] = item.get("item_id")
+                observation_to_items.setdefault(sample["observation_id"], set()).add(item_id)
             if sample.get("window_id"):
-                window_to_item[sample["window_id"]] = item.get("item_id")
-    declared_edges = {}
-    for key, edges in raw_declared.items():
-        target = key
-        if target not in item_ids:
-            target = observation_to_item.get(key) or window_to_item.get(key)
-        if target is None:
+                window_to_items.setdefault(sample["window_id"], set()).add(item_id)
+    declared_edges: dict[str, list[dict]] = {}
+    for (ref_kind, key), edges in raw_declared.items():
+        if ref_kind == "item":
+            targets = (key,) if key in item_ids else ()
+        elif ref_kind == "observation":
+            targets = tuple(sorted(observation_to_items.get(key) or ()))
+        elif ref_kind == "window":
+            targets = tuple(sorted(window_to_items.get(key) or ()))
+        elif key in item_ids:
+            targets = (key,)
+        else:
+            targets = tuple(sorted(
+                observation_to_items.get(key) or window_to_items.get(key) or ()
+            ))
+        if not targets:
             raise ValueError(f"source_edge_unknown_item_reference:{key}")
-        declared_edges.setdefault(target, []).extend(edges)
+        for target in targets:
+            declared_edges.setdefault(target, []).extend(edges)
 
     return declared_edges
 
