@@ -189,19 +189,25 @@ def _submit_fragment(
     writes = self._active_effects(fragment, conditions, _STATE_ACTIONS_WRITE)
     reads = self._active_effects(fragment, conditions, {"read"})
     prospective_sequence = self._sequence + 1
+    prospective_occurrence = self.engine.next_launch + 1
     plan = self._plan_allocations(
-        fragment, conditions, holds, prospective_sequence)
+        fragment, conditions, holds, prospective_occurrence)
     output_plan = self._plan_event_outputs(
         fragment, plan, conditions, event_bindings)
     work = self._work(fragment)
     batchable = self._batchable(fragment, holds)
-    if not batchable and fragment.repeats > self.repeat_limit:
+    if batchable:
+        batched_work = self._work(fragment, fragment.repeats)
+        self._work(fragment, fragment.repeats, kind="useful")
+    elif fragment.repeats > self.repeat_limit:
         raise UnsupportedFragmentSemantics(
             "fragment_repeats_exceed_expansion_bound:"
             f"{fragment.repeats}:{self.repeat_limit}")
     self._sequence = prospective_sequence
     sequence = prospective_sequence
-    name = f"{self.prefix}{fragment.name}#{sequence}"
+    occurrence_id = self.engine.new_occurrence(
+        replica=self.memory_replica, stage=self.memory_stage).launch
+    name = f"{self.prefix}{fragment.name}#{occurrence_id}"
     record = _LiveRecord(fragment, sequence)
     check_reads = partial(_check_fragment_reads, conductor=self, record=record, reads=reads)
 
@@ -211,7 +217,7 @@ def _submit_fragment(
     if batchable:
         finish = partial(_finish_batched_fragment, conductor=self, record=record, writes=writes)
         work_complete = self._submit_task(
-            name, self._work(fragment, fragment.repeats), base,
+            name, batched_work, base,
             (), (), priority, fragment.coupled, check_reads, finish, owner)
         batched = True
     else:

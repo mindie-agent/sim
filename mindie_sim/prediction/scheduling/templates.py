@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Mapping as _AbcMapping
 from dataclasses import replace
 from typing import Mapping, Sequence
@@ -20,6 +21,7 @@ def _scoped_allocations(
     label: str, items: Sequence[Allocation], *,
     root: str | None = None, bindings: Mapping[str, str] | None = None,
     persistent: frozenset[str] = frozenset(),
+    slot: int | None = None,
 ) -> tuple[Allocation, ...]:
     """Bind allocations by the template's invocation/output/panel scope.
 
@@ -38,6 +40,8 @@ def _scoped_allocations(
         elif scope == "output":
             digits = "".join(ch for ch in item.name if ch.isdigit())
             prefix = f"{scope_root}:output{digits or 0}"
+        elif scope == "slot" and slot is not None:
+            prefix = f"{scope_root}:slot{slot}"
         elif scope == "panel":
             prefix = label
         elif item.name in persistent:
@@ -109,6 +113,44 @@ def _drop_periodic_run(engine: Engine, run_id: int) -> None:
             engine._periodic_tasks.pop(sequence, None)
 
 
+def _reachable_phase_stage_groups(
+    phase, *, indexed: bool, cursor: int
+) -> tuple[tuple, ...]:
+    """Return every stage group actually reachable during ``phase``."""
+    residue = tuple(getattr(phase, "residue_stages", ()) or ())
+    if not residue:
+        return (tuple(getattr(phase, "stages", ())),)
+    if indexed:
+        return tuple(tuple(group) for group in residue)
+    count = int(getattr(phase, "count", 0))
+    period = len(residue)
+    selector = getattr(phase, "stages_for", None)
+    if callable(selector):
+        return tuple(
+            tuple(selector(cursor + offset))
+            for offset in range(min(count, period))
+        )
+    return tuple(
+        tuple(residue[(cursor + offset) % period])
+        for offset in range(min(count, period))
+    )
+
+
+def _uniform_template_stages(phases) -> tuple | None:
+    """Return the single stage tuple if every reachable tile across ``phases`` is identical."""
+    batch_stages = None
+    cursor = 0
+    for phase in phases:
+        count = int(getattr(phase, "count", 0))
+        for group in _reachable_phase_stage_groups(phase, indexed=False, cursor=cursor):
+            if batch_stages is None:
+                batch_stages = group
+            elif group != batch_stages:
+                return None
+        cursor += count
+    return batch_stages
+
+
 class _PipelineTemplateRun:
     """Retain the bounded live state shared by a template's Engine callbacks."""
 
@@ -122,21 +164,32 @@ class _PipelineTemplateRun:
         self.indexed = indexed
         self.index_of = index_of
         self.total = total
-        # Names acquired and freed at different phase boundaries are resident
-        # across tiles (accumulator/KV/workspace). Names acquired and freed inside
-        # the same phase are tile-local.
-        acquire_phase: dict[str, set[int]] = {}
-        free_phase: dict[str, set[int]] = {}
+        # Names acquired and freed at different phase or residue boundaries are
+        # resident across tiles (accumulator/KV/workspace). Names acquired and
+        # freed inside the same reachable stage group are tile-local.
+        acquire_group: dict[str, set[tuple[int, int]]] = {}
+        free_group: dict[str, set[tuple[int, int]]] = {}
+        has_previous_lags = False
+        max_lag = 1
+        cursor = 0
         for phase_index, phase in enumerate(phases):
-            for stage in tuple(getattr(phase, "stages", ())):
-                for allocation in tuple(getattr(stage, "acquire", ())):
-                    acquire_phase.setdefault(allocation.name, set()).add(phase_index)
-                for allocation in tuple(getattr(stage, "free", ())):
-                    free_phase.setdefault(allocation.name, set()).add(phase_index)
+            groups = _reachable_phase_stage_groups(
+                phase, indexed=indexed, cursor=cursor)
+            cursor += int(getattr(phase, "count", 0))
+            for group_index, group in enumerate(groups):
+                group_id = (phase_index, group_index)
+                for stage in group:
+                    for allocation in tuple(getattr(stage, "acquire", ())):
+                        acquire_group.setdefault(allocation.name, set()).add(group_id)
+                    for allocation in tuple(getattr(stage, "free", ())):
+                        free_group.setdefault(allocation.name, set()).add(group_id)
+                    for _, lag in getattr(stage, "previous_lags", ()):
+                        has_previous_lags = True
+                        if lag > max_lag:
+                            max_lag = lag
         persistent_names = frozenset(
-            name for name, acquired in acquire_phase.items()
-            if not free_phase.get(name)
-            or not free_phase[name].issubset(acquired))
+            name for name, acquired in acquire_group.items()
+            if free_group.get(name) != acquired)
         binding_rows = tuple(getattr(template, "allocation_bindings", ()) or ())
         allocation_bindings = {
             str(row.get("name")): str(row.get("scope"))
@@ -151,6 +204,11 @@ class _PipelineTemplateRun:
         prepared_cache: dict[tuple, object] = {}
         setup = tuple(getattr(template, "setup", ()))
         drain = tuple(getattr(template, "drain", ()))
+        for stage in drain:
+            for _, lag in getattr(stage, "previous_lags", ()):
+                has_previous_lags = True
+                if lag > max_lag:
+                    max_lag = lag
         # Setup/body/drain share the same invocation symbols. The producer's
         # allocation_bindings scans body phases; any allocation first visible in
         # setup/drain is invocation-scoped here rather than getting a new label.
@@ -171,23 +229,49 @@ class _PipelineTemplateRun:
         self.setup = setup
         self.drain = drain
         self.template_owner = template_owner
+        self.has_previous_lags = has_previous_lags
+        self.max_lag = max_lag
+        self._track_periodic = not has_previous_lags
+        self._tile_events: dict[int, dict[str, Event]] = {}
+        self._uses_slot_scope = (not indexed) and any(
+            scope == "slot" for scope in allocation_bindings.values())
+        self._free_slots: deque[int] = deque(range(slots))
+        self._retire_slot: dict[int, int] = {}
+        self._last_slot: int = 0
 
     def _prepared_for(self, stage):
-        engine, name = self.engine, self.name
+        engine = self.engine
         prepared_cache = self.prepared_cache
         if stage.acquire or stage.free or stage.program is not None:
             return None
+        cohort_members = getattr(stage, "cohort_members", ())
+        members_key = (
+            tuple(sorted((res, tuple(tuple(row) for row in rows))
+                         for res, rows in cohort_members.items()))
+            if isinstance(cohort_members, _AbcMapping)
+            else tuple(cohort_members)
+        )
         key = (
-            stage.name, tuple(sorted(stage.work.items())), stage.latency,
+            stage.name,
+            tuple(stage.work.items()),
+            stage.latency,
             tuple(sorted(stage.caps.items())),
-            tuple(sorted((name, tuple(units))
-                         for name, units in stage.placement.items())),
-            stage.coupled, stage.priority,
+            tuple(sorted((res, tuple(units))
+                         for res, units in stage.placement.items())),
+            stage.coupled,
+            stage.priority,
             tuple(sorted(stage.work_units.items())),
+            bool(getattr(stage, "latency_from_first_service", False)),
+            tuple(getattr(stage, "deliveries", ())),
+            int(getattr(stage, "cohort_size", 1)),
+            tuple(getattr(stage, "cohort_widened", ())),
+            members_key,
+            bool(getattr(stage, "keep_empty", False)),
+            tuple(sorted(getattr(stage, "metadata", {}).items())),
         )
         prepared = prepared_cache.get(key)
         if prepared is None:
-            prepared = stage.prepare(engine, f"{name}:prepare", lambda items: ())
+            prepared = stage.prepare(engine, stage.name, lambda items: ())
             prepared_cache[key] = prepared
         return prepared
 
@@ -199,9 +283,10 @@ class _PipelineTemplateRun:
                 items, launch_uid=name, owner=self.template_owner, index=index,
                 output=output, panel=panel, slot=slot,
                 bindings=self.indexed_binding_rows, persistent=persistent_names)
+        resolved_slot = slot if slot is not None else index % self.slots
         return lambda items: _scoped_allocations(
             label, items, root=name, bindings=self.allocation_bindings,
-            persistent=persistent_names)
+            persistent=persistent_names, slot=resolved_slot)
 
     def _indexed_mapping(self, index: int):
         mapped = self.index_of(index)
@@ -260,7 +345,8 @@ class _PipelineTemplateRun:
             "live_tiles": set(), "retire_tiles": {}, "stage_tail": {}, "retire": None,
             "indexed": indexed,
         }
-        engine._periodic_runs[run_id] = periodic_run
+        if self._track_periodic:
+            engine._periodic_runs[run_id] = periodic_run
         self.current = current
         self.complete = complete
         self.periodic_run = periodic_run
@@ -282,50 +368,71 @@ class _PipelineTemplateRun:
         phases, indexed, total = self.phases, self.indexed, self.total
         current, periodic_run, run_id = self.current, self.periodic_run, self.run_id
         allocation_bindings, persistent_names = self.allocation_bindings, self.persistent_names
-        if (quiescent and not indexed and phases
-                and all(tuple(phase.stages) == tuple(phases[0].stages)
-                        for phase in phases)):
-            # A fully quiescent, dependency-free, allocation-free homogeneous phase
-            # run can be integrated as one meta-cycle: every stage carries K times
-            # its real work, the barrier preserves the tile boundary, and the
-            # caller guarantees no external submit until completion. Anything with
-            # after/previous/alloc/latency/tail falls back to the detailed lazy
-            # path below.
-            batch_count = total
-            batch_stages = tuple(getattr(phases[0], "stages", ()))
-            batchable = (
-                batch_count > 1
-                and all(not stage.after and not stage.previous
-                        and not stage.acquire and not stage.free
-                        and stage.program is None and stage.latency == 0
-                        for stage in batch_stages))
-            if batchable:
-                barrier = []
-                for stage in batch_stages:
-                    work = {resource: amount * batch_count
-                            for resource, amount in stage.work.items()}
-                    batched = replace(stage, work=work)
-                    barrier.append(batched.submit(
-                        engine, f"{name}:batch:{stage.name}",
-                        (current,), lambda items: _scoped_allocations(
-                            name, items, root=name,
-                            bindings=allocation_bindings), owner,
-                        prepared=self._prepared_for(batched)))
-                periodic_run.update({
-                    "next": total, "finished": total, "phase_ordinal": 0,
-                    "phase_end": total, "stage_tail": {},
-                    "last_events": tuple(barrier) or (current,),
-                    "total": total, "persistent_names": persistent_names,
-                    "batch_mode": True,
-                })
-                batch_complete = engine.submit(
-                    name + ":batch_complete", after=tuple(barrier) or (current,),
-                    on_complete=self._drain_and_resolve, owner=owner)
-                engine._periodic_tasks[batch_complete.sequence] = (
-                    run_id, total, len(batch_stages), "batch")
-                periodic_run["slots"] = ()
-                return True
-        return False
+        if not (quiescent and not indexed and phases and total > 1):
+            return False
+        batch_stages = _uniform_template_stages(phases)
+        if not batch_stages or len(batch_stages) != 1:
+            return False
+        stage = batch_stages[0]
+        # A fully quiescent, dependency-free, allocation-free homogeneous
+        # single-stage run can be integrated as one meta-cycle only when all
+        # active resources progress together (single non-aliased resource or
+        # coupled multi-resource) so intermediate horizons and deliveries match
+        # tile-by-tile execution exactly.
+        batch_count = total
+        active = [res for res, amount in stage.work.items() if amount]
+        aliases = getattr(engine, "_hbm_bus_aliases", None) or {}
+        cohort_size = int(getattr(stage, "cohort_size", 1))
+        batchable = (
+            not stage.after
+            and not stage.previous
+            and not getattr(stage, "previous_lags", ())
+            and not stage.acquire
+            and not stage.free
+            and stage.program is None
+            and stage.latency == 0
+            and (len(active) <= 1 or stage.coupled)
+            and (stage.coupled or not any(res in aliases for res in active))
+            and (cohort_size == 1 or all(
+                engine.resources[res].policy == "fair"
+                for res in active if res in engine.resources))
+        )
+        if not batchable:
+            return False
+        barrier = []
+        for stage in batch_stages:
+            work = {resource: amount * batch_count
+                    for resource, amount in stage.work.items()}
+            raw_deliveries = getattr(stage, "deliveries", ())
+            if raw_deliveries:
+                deliveries = tuple(
+                    (counter, amount * batch_count)
+                    for counter, amount in raw_deliveries
+                )
+                batched = replace(stage, work=work, deliveries=deliveries)
+            else:
+                batched = replace(stage, work=work)
+            barrier.append(batched.submit(
+                engine, f"{name}:batch:{stage.name}",
+                (current,), lambda items: _scoped_allocations(
+                    name, items, root=name,
+                    bindings=allocation_bindings), owner,
+                prepared=self._prepared_for(batched)))
+        periodic_run.update({
+            "next": total, "finished": total, "phase_ordinal": 0,
+            "phase_end": total, "stage_tail": {},
+            "last_events": tuple(barrier) or (current,),
+            "total": total, "persistent_names": persistent_names,
+            "batch_mode": True,
+        })
+        batch_complete = engine.submit(
+            name + ":batch_complete", after=tuple(barrier) or (current,),
+            on_complete=self._drain_and_resolve, owner=owner)
+        if self._track_periodic:
+            engine._periodic_tasks[batch_complete.sequence] = (
+                run_id, total, len(batch_stages), "batch")
+        periodic_run["slots"] = ()
+        return True
 
     def _select_stages(self, index: int):
         indexed, phases, periodic_run = self.indexed, self.phases, self.periodic_run
@@ -344,22 +451,30 @@ class _PipelineTemplateRun:
             if not selected:
                 raise FragmentContractError(
                     "pipeline_indexed_phase_requires_stages")
-            return selected, (output, panel, slot)
+            return selected, (output, panel, slot), 1
         while (periodic_run["phase_ordinal"] + 1 < len(phases)
                and index >= periodic_run["phase_end"]):
             ordinal = periodic_run["phase_ordinal"] + 1
             periodic_run["phase_ordinal"] = ordinal
             periodic_run["phase_end"] += int(
                 getattr(phases[ordinal], "count", 0))
-        selected = tuple(getattr(phases[periodic_run["phase_ordinal"]],
-                                 "stages"))
+        phase = phases[periodic_run["phase_ordinal"]]
+        selector = getattr(phase, "stages_for", None)
+        stages = (selector(index) if callable(selector)
+                  else getattr(phase, "stages"))
+        selected = tuple(stages)
         if not selected:
             raise FragmentContractError("pipeline_template_phase_requires_stages")
-        return selected, None
+        residue = tuple(getattr(phase, "residue_stages", ()) or ())
+        period = len(residue) if residue else 1
+        return selected, None, period
 
     def _finish(self, _event: Event) -> None:
+        self._tile_events.clear()
+        self._retire_slot.clear()
         self.engine.resolve(self.complete)
-        _drop_periodic_run(self.engine, self.run_id)
+        if self._track_periodic:
+            _drop_periodic_run(self.engine, self.run_id)
 
     def _drain_and_resolve(self, _event=None) -> None:
         if not self.drain:
@@ -368,17 +483,25 @@ class _PipelineTemplateRun:
         engine, name, owner = self.engine, self.name, self.owner
         periodic_run = self.periodic_run
         drain_index, drain_output, drain_panel, drain_slot = self.drain_coordinates
+        if not self.indexed:
+            drain_slot = self._last_slot
         local: dict[str, Event] = {}
         for stage in self.drain:
             deps = [local[key] for key in stage.after]
             deps.extend(periodic_run["stage_tail"][key]
                         for key in stage.previous
                         if key in periodic_run["stage_tail"])
+            for dep_name, lag in getattr(stage, "previous_lags", ()):
+                target = self.total - lag
+                if target >= 0:
+                    prior_tile = self._tile_events.get(target)
+                    if prior_tile is not None and dep_name in prior_tile:
+                        deps.append(prior_tile[dep_name])
             scoped = self._scoped_at(name + ":drain:" + stage.name, drain_index,
                                drain_output, drain_panel, drain_slot)
             local[stage.name] = stage.submit(
                 engine, f"{name}:drain:{stage.name}",
-                tuple(deps) or periodic_run["last_events"], scoped, owner,
+                tuple(dict.fromkeys(deps)) or periodic_run["last_events"], scoped, owner,
                 prepared=self._prepared_for(stage))
         engine.submit(name + ":drain_complete", after=tuple(local.values()),
                       on_complete=self._finish, owner=owner)
@@ -390,6 +513,9 @@ class _PipelineTemplateRun:
         tile_index = periodic_run["retire_tiles"].pop(event.sequence, None)
         if tile_index is not None:
             periodic_run["live_tiles"].discard(tile_index)
+        freed_slot = self._retire_slot.pop(event.sequence, None)
+        if freed_slot is not None:
+            self._free_slots.append(freed_slot)
         periodic_run["slots"] = tuple(sorted(
             tile - finished for tile in periodic_run["live_tiles"]))
         if finished == self.total:
@@ -402,7 +528,7 @@ class _PipelineTemplateRun:
         index = periodic_run["next"]
         if index >= self.total:
             return
-        stages, coordinates = self._select_stages(index)
+        stages, coordinates, period = self._select_stages(index)
         engine, name, owner = self.engine, self.name, self.owner
         indexed, current, run_id = self.indexed, self.current, self.run_id
         periodic_run["next"] = index + 1
@@ -411,34 +537,60 @@ class _PipelineTemplateRun:
         # masquerades as the previous panel's stream tail.
         previous = dict(periodic_run["stage_tail"])
         label = f"{name}:tile{index}"
+        assigned_slot: int | None = None
         if indexed:
             output, panel, slot = coordinates
             scoped = self._scoped_at(label, index, output, panel, slot)
         else:
-            scoped = self._scoped_at(label, index, None, None, None)
+            assigned_slot = self._free_slots.popleft()
+            self._last_slot = assigned_slot
+            scoped = self._scoped_at(label, index, None, None, assigned_slot)
+        suffix = ""
+        if period > 1:
+            suffix += f":r{index % period}"
+        if self._uses_slot_scope:
+            suffix += f":s{assigned_slot}"
+        stage_kind = f"stage{suffix}"
+        retire_kind = f"retire{suffix}"
         for stage in stages:
             deps = [local[key] for key in stage.after]
             deps.extend(previous[key] for key in stage.previous
                         if key in previous)
+            for dep_name, lag in getattr(stage, "previous_lags", ()):
+                target = index - lag
+                if target >= 0:
+                    prior_tile = self._tile_events.get(target)
+                    if prior_tile is not None and dep_name in prior_tile:
+                        deps.append(prior_tile[dep_name])
             if stage.name in previous:
                 deps.append(previous[stage.name])
             event = stage.submit(
                 engine, f"{label}:{stage.name}",
-                tuple(deps) or (current,), scoped, owner,
+                tuple(dict.fromkeys(deps)) or (current,), scoped, owner,
                 prepared=self._prepared_for(stage))
             local[stage.name] = event
             periodic_run["stage_tail"][stage.name] = event
-            engine._periodic_tasks[event.sequence] = (
-                run_id, index, len(local) - 1, "stage")
+            if self._track_periodic:
+                engine._periodic_tasks[event.sequence] = (
+                    run_id, index, len(local) - 1, stage_kind)
         periodic_run["last_events"] = tuple(local.values())
         retire_event = engine.submit(f"{label}:retire",
                                      after=periodic_run["last_events"],
                                      on_complete=self._retire, owner=owner)
         periodic_run["retire"] = retire_event
-        engine._periodic_tasks[retire_event.sequence] = (
-            run_id, index, len(stages), "retire")
+        if assigned_slot is not None:
+            self._retire_slot[retire_event.sequence] = assigned_slot
+        if self._track_periodic:
+            engine._periodic_tasks[retire_event.sequence] = (
+                run_id, index, len(stages), retire_kind)
         periodic_run["retire_tiles"][retire_event.sequence] = index
         periodic_run["live_tiles"].add(index)
+        if self.has_previous_lags:
+            self._tile_events[index] = local
+            cutoff = index - max(self.slots, self.max_lag)
+            for old_idx in tuple(self._tile_events):
+                if old_idx < cutoff and old_idx not in periodic_run["live_tiles"]:
+                    del self._tile_events[old_idx]
         periodic_run["slots"] = tuple(sorted(
             tile - periodic_run["finished"]
             for tile in periodic_run["live_tiles"]))
@@ -501,7 +653,9 @@ def start_pipeline_template(
         if total < 0:
             raise FragmentContractError("pipeline_template_count_invalid")
     for phase in phases:
-        if not tuple(getattr(phase, "stages", ())):
+        residue = tuple(getattr(phase, "residue_stages", ()) or ())
+        if (not tuple(getattr(phase, "stages", ()))
+                or any(not tuple(group) for group in residue)):
             raise FragmentContractError("pipeline_template_phase_requires_stages")
         if int(getattr(phase, "count", 0)) < 1:
             raise FragmentContractError("pipeline_template_phase_requires_positive_count")

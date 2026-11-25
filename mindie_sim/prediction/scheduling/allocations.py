@@ -41,6 +41,156 @@ class _AllocationPlan:
     program: tuple[_PlannedAllocation, ...] = ()
 
 
+def _hashable_value(value: Any) -> Any:
+    try:
+        hash(value)
+    except TypeError:
+        return repr(value)
+    return value
+
+
+def _normalize_half_open_ranges(
+    raw_ranges: Any, size: float,
+) -> tuple[tuple[float, float], ...]:
+    """Normalize explicit half-open byte intervals using the Memory ledger convention."""
+    if raw_ranges is None:
+        return ((0.0, size),) if size > 0.0 else ()
+    if isinstance(raw_ranges, (int, float)) and not isinstance(raw_ranges, bool):
+        val = float(raw_ranges)
+        return ((0.0, val),) if val > 0.0 else ()
+    items = tuple(raw_ranges)
+    if not items:
+        return ((0.0, size),) if size > 0.0 else ()
+    if all(isinstance(item, (int, float)) and not isinstance(item, bool)
+           for item in items):
+        nums = [float(item) for item in items]
+        if len(nums) == 1:
+            return ((0.0, nums[0]),) if nums[0] > 0.0 else ()
+        if len(nums) % 2:
+            return tuple((0.0, n) for n in nums if n > 0.0)
+        return tuple(
+            (nums[i], nums[i + 1])
+            for i in range(0, len(nums), 2)
+            if nums[i + 1] > nums[i]
+        )
+    return tuple(
+        (float(lo), float(hi))
+        for lo, hi in items
+        if float(hi) > float(lo)
+    )
+
+
+def _union_interval_bytes(intervals: list[tuple[float, float]]) -> float:
+    ordered = sorted((lo, hi) for lo, hi in intervals if hi > lo)
+    merged: list[tuple[float, float]] = []
+    for lo, hi in ordered:
+        if merged and lo <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], hi))
+        else:
+            merged.append((lo, hi))
+    return float(sum(hi - lo for lo, hi in merged))
+
+
+def _memory_grant_spec(self, planned: _PlannedAllocation) -> dict[str, Any]:
+    allocation = planned.allocation
+    spec: dict[str, Any] = {
+        "name": allocation.name,
+        "bytes": float(allocation.size),
+    }
+    if planned.memory:
+        spec.update(planned.memory)
+    spec["stage"] = int(spec.get("stage", self.memory_stage))
+    spec.setdefault("replica", self.memory_replica)
+    return spec
+
+
+def _check_memory_backed_capacity(
+    self, memory_planned: list[_PlannedAllocation],
+) -> None:
+    """Validate concurrent memory-backed allocations by physical-range union."""
+    grants = [_memory_grant_spec(self, item) for item in memory_planned]
+    grant_decision = getattr(self.memory, "grant_decision", None)
+    if callable(grant_decision):
+        decision = grant_decision(
+            self.memory_replica, grants, stage=self.memory_stage)
+        if decision.get("ok"):
+            return
+        if decision.get("reason") == "invalid_or_duplicate":
+            raise FragmentContractError(
+                "fragment_allocation_memory_binding_invalid")
+        if decision.get("permanent"):
+            pool_name = memory_planned[0].allocation.pool
+            shortfall = decision.get("shortfall_bytes_per_stage_rank") or ()
+            raise FragmentContractError(
+                f"fragment_allocation_concurrent_exceeds_capacity:"
+                f"{pool_name}:memory:{shortfall}")
+    # Standalone physical-range union catches permanent overflows even when
+    # existing live holders alias one of the candidate's backings (or when a
+    # custom routing ledger does not expose grant_decision).
+    hbm_ranges: dict[tuple, list[tuple[float, float]]] = {}
+    host_ranges: dict[tuple, list[tuple[float, float]]] = {}
+    pool_by_stage_rank: dict[tuple[int, int], str] = {}
+    for planned, spec in zip(memory_planned, grants):
+        stage_idx = int(spec["stage"])
+        rank_raw = spec.get("rank")
+        rank_idx = 0 if rank_raw is None else int(rank_raw)
+        storage = str(spec.get("storage") or "")
+        tier = str(spec.get("tier") or "hbm").lower()
+        backing_key = str(
+            spec.get("alias_of")
+            or spec.get("physical_backing_id")
+            or spec.get("physical_key")
+            or spec["name"]
+        )
+        generation = _hashable_value(spec.get("generation"))
+        size = float(spec["bytes"])
+        ranges = _normalize_half_open_ranges(spec.get("ranges"), size)
+        host_bytes = float(spec.get("host_bytes", 0.0) or 0.0)
+        host_key = (stage_idx, rank_idx, storage, backing_key, generation)
+        if tier == "host":
+            host_iv = ranges or (((0.0, host_bytes),) if host_bytes > 0.0 else ())
+            if host_iv:
+                host_ranges.setdefault(host_key, []).extend(host_iv)
+            continue
+        if tier not in {"hbm", ""}:
+            continue
+        hbm_key = (stage_idx, rank_idx, storage, tier, backing_key, generation)
+        pool_by_stage_rank[(stage_idx, rank_idx)] = planned.allocation.pool
+        if ranges:
+            hbm_ranges.setdefault(hbm_key, []).extend(ranges)
+        if host_bytes > 0.0:
+            host_ranges.setdefault(host_key, []).append((0.0, host_bytes))
+
+    hbm_by_stage_rank: dict[tuple[int, int], float] = {}
+    for (stage_idx, rank_idx, *_), intervals in hbm_ranges.items():
+        sr = (stage_idx, rank_idx)
+        hbm_by_stage_rank[sr] = hbm_by_stage_rank.get(sr, 0.0) + _union_interval_bytes(intervals)
+
+    rank_caps = getattr(self.memory, "rank_capacity", None)
+    for (stage_idx, rank_idx), amount in hbm_by_stage_rank.items():
+        pool_name = pool_by_stage_rank[(stage_idx, rank_idx)]
+        if (rank_caps is not None
+                and 0 <= self.memory_replica < len(rank_caps)
+                and 0 <= stage_idx < len(rank_caps[self.memory_replica])
+                and 0 <= rank_idx < len(rank_caps[self.memory_replica][stage_idx])):
+            cap = float(rank_caps[self.memory_replica][stage_idx][rank_idx])
+        else:
+            cap = float(self.engine.pools[pool_name])
+        if math.isfinite(cap) and amount > cap + _CAPACITY_ROUNDING_ULPS * math.ulp(cap):
+            raise FragmentContractError(
+                f"fragment_allocation_concurrent_exceeds_capacity:"
+                f"{pool_name}:rank{rank_idx}:{amount}:{cap}")
+
+    host_caps = getattr(self.memory, "host_dram_capacity", None)
+    if host_ranges and host_caps is not None and 0 <= self.memory_replica < len(host_caps):
+        host_cap = float(host_caps[self.memory_replica])
+        host_total = sum(_union_interval_bytes(ivs) for ivs in host_ranges.values())
+        if math.isfinite(host_cap) and host_total > host_cap + _CAPACITY_ROUNDING_ULPS * math.ulp(host_cap):
+            raise FragmentContractError(
+                f"fragment_allocation_concurrent_exceeds_capacity:"
+                f"host:replica{self.memory_replica}:{host_total}:{host_cap}")
+
+
 def _plan_allocations(
     self, fragment: ProgramFragment, conditions: Mapping[str, bool],
     holds: Mapping[str, Any], sequence: int,
@@ -107,8 +257,12 @@ def _plan_allocations(
     # also holds its stage/slot allocations. If that concurrent set cannot
     # fit, the fragment can never be admitted; reject instead of stalling.
     concurrent: dict[tuple[str, int], float] = {}
+    memory_planned: list[_PlannedAllocation] = []
     for planned in tuple(program) + tuple(stage):
         allocation = planned.allocation
+        if self.memory is not None and allocation.pool in self.memory_pools:
+            memory_planned.append(planned)
+            continue
         for unit in allocation.units:
             key = allocation.pool, unit
             concurrent[key] = concurrent.get(key, 0.0) + allocation.size
@@ -118,4 +272,6 @@ def _plan_allocations(
             raise FragmentContractError(
                 f"fragment_allocation_concurrent_exceeds_capacity:"
                 f"{pool}:unit{unit}:{amount}:{self.engine.pools[pool]}")
+    if memory_planned:
+        _check_memory_backed_capacity(self, memory_planned)
     return _AllocationPlan(tuple(stage), tuple(program))

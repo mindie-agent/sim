@@ -321,10 +321,11 @@ class FragmentConductor:
             return value
         return fragment.priority
 
-    def _work(self, fragment: ProgramFragment, multiply: int = 1) -> dict[str, float]:
+    def _work(self, fragment: ProgramFragment, multiply: int = 1,
+              *, kind: str = "issued") -> dict[str, float]:
         result: dict[str, float] = {}
-        for item in fragment.work.issued():
-            if not item.amount:
+        for item in fragment.work.items:
+            if item.kind != kind or not item.amount:
                 continue
             name = self._resource(item.resource)
             factor = self._unit_factor(item.unit, name, item.resource)
@@ -657,6 +658,7 @@ class FragmentConductor:
         release_boundaries = len(handle.release_by_name) if handle is not None else 0
         grants = tuple(handle.grant_by_name) if handle is not None else ()
         service_work = self._work(fragment, fragment.repeats)
+        useful_work = self._work(fragment, fragment.repeats, kind="useful")
         start_ms = record.started_ms if record.started_ms is not None else event.started
         observation = {
             "name": fragment.name,
@@ -666,7 +668,7 @@ class FragmentConductor:
             "repeats": fragment.repeats,
             "batched": bool(handle and handle.batched),
             "service_work": dict(service_work),
-            "useful_work": fragment.work.by_resource("useful"),
+            "useful_work": dict(useful_work),
             "grant_events": len(grants),
             "release_events": release_boundaries,
             "state": self.state.snapshot(),
