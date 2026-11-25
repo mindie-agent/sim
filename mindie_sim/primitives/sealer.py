@@ -323,11 +323,13 @@ def _build_p06_mmad_modes(
         ("int8", _TILE_16, _TILE_16, _TILE_32, _TILE_16, spec["peaks"].get("int8", 0.0) / aic),
     ]
     if is_arch35:
-        fp8_cap = spec["peaks"].get("fp8_e4m3", spec["peaks"].get("int8", 0.0)) / aic
+        for mode in ("fp8_e4m3", "fp8_e5m2"):
+            cap = spec["peaks"].get(mode, 0.0) / aic
+            mode_defs.append((mode, _TILE_16, _TILE_16, _TILE_32, _TILE_16, cap))
+        mx_cap = spec["peaks"].get("fp8_e4m3", spec["peaks"].get("int8", 0.0)) / aic
         mode_defs.extend([
-            ("fp8_e4m3", _TILE_16, _TILE_16, _TILE_32, _TILE_16, fp8_cap),
-            ("mxfp8", _TILE_16, _TILE_16, _TILE_32, _TILE_16, fp8_cap),
-            ("mxfp4", _TILE_16, _TILE_16, _TILE_64, _TILE_16, fp8_cap * _DOUBLE_FACTOR),
+            ("mxfp8", _TILE_16, _TILE_16, _TILE_32, _TILE_16, mx_cap),
+            ("mxfp4", _TILE_16, _TILE_16, _TILE_64, _TILE_16, mx_cap * _DOUBLE_FACTOR),
         ])
     for m_name, tm, tn, tk, miss, cap in mode_defs:
         if cap <= 0.0:

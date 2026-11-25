@@ -256,6 +256,7 @@ _MMAD_MODE_DTYPES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("fp32", ("fp32", "float32")),
     ("int8", ("int8",)),
     ("fp8_e4m3", ("fp8_e4m3", "fp8")),
+    ("fp8_e5m2", ("fp8_e5m2",)),
     ("mxfp8", ("mxfp8",)),
     ("mxfp4", ("mxfp4",)),
 )

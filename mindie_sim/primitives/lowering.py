@@ -454,14 +454,15 @@ def _l2(b):
 
 def _mmad(b):
     requested = b.get("mode", b.get("dtype", "bf16"))
-    conversions = {"w4a8": "int8", "a8w4_mx": "mxfp8", "fp8_e5m2": "fp8_e4m3"}
-    mode = requested if requested in b.cell.modes else conversions.get(requested, requested)
+    conversions = {"w4a8": "int8", "a8w4_mx": "mxfp8"}
+    native_mode = conversions.get(requested, requested)
+    mode = requested if requested in b.cell.modes else native_mode
     b.warnings.extend(_simulation_warnings(b.cell, mode, b.role, b.allow))
     m, n, k = dims = tuple(b.integer(axis, minimum=1) for axis in ("m", "n", "k"))
     data = b.cell.modes[mode]
     wave = next((item for item in b.dp.subtile_wave if item.native_mode == mode), None) if b.dp is not None else None
     declared = b.dp.compute_arch.declared if b.dp is not None else None
-    native = b.get("native_mode", requested if requested == "fp8_e5m2" else conversions.get(requested, requested))
+    native = b.get("native_mode", native_mode)
     if declared is not None and not declared.supports_native("matrix", native):
         b.gap(f"native_matrix_mode_required:{native}")
     defaults = (
