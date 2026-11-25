@@ -19,7 +19,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import importlib
@@ -33,6 +33,7 @@ import sys
 import tempfile
 from typing import Any, Literal
 
+from mindie_sim.catalog.context_parallel import validate_cp_geometry
 from mindie_sim.observations.multilevel import (
     SHA256_HEX_LENGTH, FrozenFitManifest, FrozenFitParameter, normalize_lineage_token,
     sanitize_capture_uri, validate_provenance_text,
@@ -41,6 +42,7 @@ from mindie_sim.optimization.dual_bound import (
     DagEdge, EventDagSpec, FarkasCertificate, OptimalityCertificate, ResourceChoiceProgram, check_optimality_certificate,
 )
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.parallel import ParallelSpec
 
 SKU_ONBOARDING_RECEIPT_SCHEMA = "mindie-sim.sku-onboarding-receipt/1"
 OPERATOR_ONBOARDING_RECEIPT_SCHEMA = "mindie-sim.operator-onboarding-receipt/1"
@@ -91,6 +93,12 @@ _CROSS_MTP_PAIRS: tuple[tuple[int, int], ...] = ((2, 2049), (4, 24576), (8, 9830
 _CROSS_CHUNK_PAIRS: tuple[tuple[int, int], ...] = ((2048, 98304), (8192, 200000))
 _CROSS_PARALLEL_SPECS: tuple[tuple[str, int], ...] = (("tp2_pcp2_dcp2", 200000), ("tp2_pcp2_dcp4", 400000))
 _SPARSE_INDEXER_FAMILIES = frozenset({"sparse_indexer", "lightning_indexer", "indexer"})
+_LIGHTNING_V1_ABIS = frozenset({"aclnnlightningindexer", "npu_lightning_indexer", "lightning_indexer"})
+_BF16_INDEXER_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16"})
+_QUANT_INDEXER_DTYPES = frozenset({"int8", "fp8", "fp8_e4m3", "fp8_e4m3fn", "fp8_e5m2", "mxfp4"})
+_AIV_OPERATOR_FAMILIES = frozenset({"rmsnorm", "rms_norm", "add_rmsnorm", "rmsnorm_quant", "add_rmsnorm_quant", "layernorm", "layer_norm", "swiglu", "silu", "gelu", "rotary", "elementwise", "quantize", "dynamic_quant", "dynamic_mx_quant", "cast", "softmax", "topk", "attention_merge", "kv_compress_epilog", "dcp_query_pack", "dcp_output_pack", "routing", "moe_init_routing"})
+_ATTENTION_CLIFF_FAMILIES = frozenset({"attention", "paged_mla", "mla", "flash_attention"})
+_GQA_BACKEND_KINDS = frozenset({"gqa", "mha", "mqa"})
 _CORE_COORD_KEYS: tuple[str, ...] = ("context_len", "tokens", "batch_size", "query_tokens", "topk", "batch_x_kv_heads")
 _IPV4_QUAD_RE = re.compile(r"(?<!\d)\d{1,3}(?:[._-]\d{1,3}){3}(?!\d)")
 _SAFE_SOC_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,63}$")
@@ -390,6 +398,7 @@ class TilingAxes:
     batch_axis: tuple[int, ...] = DEFAULT_TILING_BATCH_AXIS
     query_tokens_axis: tuple[int, ...] = DEFAULT_TILING_QUERY_AXIS
     enforce_topk_le_context_archs: tuple[str, ...] = ()
+    core_axis_units: tuple[tuple[str, Literal["aic", "aiv"]], ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -397,37 +406,52 @@ class TilingAxes:
             "phase_thresholds": dict(self.phase_thresholds), "abi_divisibility": [r.to_dict() for r in self.abi_divisibility],
             "batch_axis": list(self.batch_axis), "query_tokens_axis": list(self.query_tokens_axis),
             "enforce_topk_le_context_archs": list(self.enforce_topk_le_context_archs),
+            "core_axis_units": dict(self.core_axis_units),
         }
+
+
+def _resolve_indexer_abi(clean: str, *, arch_preset: str, upstream_abi: str, query_dtype: str, cache_dtype: str) -> str:
+    if upstream_abi.strip():
+        return upstream_abi.strip()
+    dtypes = {str(dt or "").strip().lower() for dt in (query_dtype, cache_dtype) if str(dt or "").strip()}
+    if dtypes & _QUANT_INDEXER_DTYPES:
+        return "aclnnQuantLightningIndexerV2"
+    if (dtypes and dtypes <= _BF16_INDEXER_DTYPES) or clean in {"lightning_indexer", "indexer"}:
+        return "aclnnLightningIndexer"
+    return "aclnnQuantLightningIndexerV2" if (clean == "sparse_indexer" and arch_preset == ARCH_PRESET_35) else "aclnnLightningIndexer"
 
 
 def family_default_tiling_axes(
     family: str, *, tile_dim: int, arch_preset: str = "", topk_threshold: int | None = None,
+    upstream_abi: str = "", query_dtype: str = "", cache_dtype: str = "",
 ) -> TilingAxes:
     clean = str(family or "").strip()
     for mod_path in (f"mindie_sim.prediction.operators.{clean}.common", f"mindie_sim.prediction.operators.{clean}"):
         if not clean:
             break
         try:
-            mod = importlib.import_module(mod_path)
-            decl = getattr(mod, "TILING_AXES", None)
-            if callable(decl):
-                res = decl(arch_preset)
-                if isinstance(res, TilingAxes):
-                    return res
-            elif isinstance(decl, TilingAxes):
-                return decl
+            decl = getattr(importlib.import_module(mod_path), "TILING_AXES", None)
+            res = decl(arch_preset) if callable(decl) else decl
+            if isinstance(res, TilingAxes):
+                return res
         except Exception:
             continue
     if clean in _SPARSE_INDEXER_FAMILIES or topk_threshold is not None:
         tk = int(topk_threshold) if topk_threshold is not None else LIGHTNING_TOPK_ABOVE_THRESHOLD
-        bounds = default_topk_abi_rule(divisor=1, arch_presets=())
-        dav22 = default_topk_abi_rule(divisor=LIGHTNING_TOPK_DIVISOR, arch_presets=(ARCH_PRESET_22,))
+        abi = _resolve_indexer_abi(clean, arch_preset=arch_preset, upstream_abi=upstream_abi, query_dtype=query_dtype, cache_dtype=cache_dtype).lower()
+        rules: tuple[AbiDivisibilityRule, ...] = (
+            (default_topk_abi_rule(divisor=LIGHTNING_TOPK_DIVISOR, arch_presets=()),)
+            if abi in _LIGHTNING_V1_ABIS
+            else (default_topk_abi_rule(divisor=1, arch_presets=()), default_topk_abi_rule(divisor=LIGHTNING_TOPK_DIVISOR, arch_presets=(ARCH_PRESET_22,)))
+        )
         thr: tuple[tuple[str, int], ...] = (
             (("topk", tk), ("topk", QLI_SMALL_M_TOPK_THRESHOLD))
             if (clean in _SPARSE_INDEXER_FAMILIES and arch_preset == ARCH_PRESET_35 and tk != QLI_SMALL_M_TOPK_THRESHOLD)
             else (("topk", tk),)
         )
-        return TilingAxes(tile_dims=(int(tile_dim),), phase_thresholds=thr, abi_divisibility=(bounds, dav22))
+        return TilingAxes(tile_dims=(int(tile_dim),), phase_thresholds=thr, abi_divisibility=rules)
+    if clean in _ATTENTION_CLIFF_FAMILIES:
+        return TilingAxes(tile_dims=(int(tile_dim),), core_product_axes=("batch_x_kv_heads",))
     return TilingAxes(tile_dims=(int(tile_dim),))
 
 
@@ -485,6 +509,7 @@ class OperatorCliffParameters:
     context_min: int = CONTEXT_MIN_TOKENS
     context_max: int = CONTEXT_MAX_TOKENS
     tiling_axes: TilingAxes | None = None
+    vector_core_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -515,20 +540,31 @@ class CliffBenchPlan:
         }
 
 
-def validate_parallel_topology(topo: str) -> int:
+def validate_parallel_topology(topo: str, *, backend_kind: str = "") -> int:
     text = str(topo or "tp1").strip().lower()
     tokens = _TOPO_TOKEN_RE.findall(text)
     if not tokens or "_".join(f"{k}{v}" for k, v in tokens) != text:
         raise ModelingError(f"parallel_topology_invalid:{topo}")
     axes = {k: int(v) for k, v in tokens}
+    if len(axes) != len(tokens):
+        raise ModelingError(f"parallel_topology_duplicate_axis:{topo}")
     if any(v < 1 for v in axes.values()):
         raise ModelingError(f"parallel_topology_nonpositive:{topo}")
-    tp, pcp, dcp = axes.get("tp", 1), axes.get("pcp", 1), axes.get("dcp", 1)
+    tp, dp, pp, ep, pcp, dcp = (axes.get(k, 1) for k in ("tp", "dp", "pp", "ep", "pcp", "dcp"))
+    if dcp > 1 and pcp == 1 and (tp % dcp != 0):
+        raise ModelingError(f"dcp_tp_domain_invalid:dcp={dcp}:tp={tp}:{topo}")
     if dcp > 1 and pcp > 1 and (dcp % pcp != 0):
         raise ModelingError(f"dcp_pcp_domain_invalid:dcp={dcp}:pcp={pcp}:{topo}")
     if dcp > 1 and dcp > tp * pcp:
         raise ModelingError(f"parallel_topology_invalid:{topo}")
-    return max(1, tp * max(1, axes.get("dp", 1)) * max(1, axes.get("pp", 1)) * max(1, pcp))
+    spec = ParallelSpec(dp=dp, tp=tp, ep=ep, pp=pp, cp=dcp, dcp=dcp, pcp=pcp)
+    spec.validate_expert_placement()
+    validate_cp_geometry(spec)
+    if dcp > 1 and pcp > 1:
+        allowed = {pcp} if str(backend_kind or "").strip().lower() in _GQA_BACKEND_KINDS else {pcp, tp * pcp}
+        if dcp not in allowed:
+            raise ModelingError(f"dcp_pcp_backend_domain_invalid:dcp={dcp}:pcp={pcp}:tp={tp}:allowed={sorted(allowed)}:{topo}")
+    return spec.world_size
 
 
 def required_ranks_for_plan(plan_doc: Mapping[str, Any]) -> int:
@@ -568,6 +604,36 @@ def verify_cliff_plan_integrity(plan_doc: Mapping[str, Any]) -> str:
     return actual
 
 
+def _resolve_vector_core_count(sku: str, core_count: int, explicit_aiv: int | None, profile_override: Mapping[str, Any] | None) -> int:
+    if explicit_aiv is not None and int(explicit_aiv) > 0:
+        return int(explicit_aiv)
+    from .whitebox_runner import resolve_sku_profile
+
+    prof = resolve_sku_profile(sku, profile_override)
+    dev = prof.get("device") if isinstance(prof, Mapping) and isinstance(prof.get("device"), Mapping) else {}
+    ru = dev.get("resource_units") if isinstance(dev.get("resource_units"), Mapping) else {}
+    prof_aiv, prof_aic = int(ru.get("vector") or 0), int(dev.get("compute_units") or 0)
+    if prof_aiv > 0:
+        return max(1, int(round(int(core_count) * (prof_aiv / prof_aic)))) if (prof_aic > 0 and int(core_count) != prof_aic) else prof_aiv
+    return max(1, int(core_count))
+
+
+def _axis_core_unit(family: str, c_axis: str, axes: TilingAxes) -> Literal["aic", "aiv"]:
+    unit_map = dict(axes.core_axis_units)
+    if c_axis in unit_map:
+        return unit_map[c_axis]
+    return "aiv" if ((family == "sku_suite" and c_axis == "tokens") or family in _AIV_OPERATOR_FAMILIES) else "aic"
+
+
+def _next_admissible_divisible(axis: str, value: int, axes: TilingAxes, arch_preset: str) -> int | None:
+    divs = [r.divisor for r in axes.abi_divisibility if r.applies_to(arch_preset) and r.axis == axis and r.divisor > 1 and value > r.above_threshold]
+    if not divs:
+        return None
+    step = math.lcm(*divs)
+    cand = ((value + step - 1) // step) * step
+    return cand if (cand > value and validate_abi({"axis": axis, "value": cand}, axes, arch_preset=arch_preset)[0]) else None
+
+
 def synthesize_operator_cliff_plan(
     params: OperatorCliffParameters, *, sku: str, campaign_id: str = "onboard",
     arch_preset: str = "", profile_override: Mapping[str, Any] | None = None,
@@ -583,7 +649,7 @@ def synthesize_operator_cliff_plan(
     seen_ho: set[tuple[Any, ...]] = set()
     seen_rej: set[tuple[Any, ...]] = set()
 
-    def _add(pid: str, axis: str, val: int, tag: str, why: str, *, b: int = 1, q: int = 1, tk: int | None = None, topo: str = "tp1") -> None:
+    def _add(pid: str, axis: str, val: int, tag: str, why: str, *, b: int = 1, q: int = 1, tk: int | None = None, topo: str = "tp1") -> bool:
         validate_parallel_topology(topo)
         ok, err = validate_abi({"axis": axis, "value": val, "batch_size": b, "query_tokens": q, "topk": tk}, axes, arch_preset=resolved_arch)
         key = (axis, val, b, q, tk, topo)
@@ -593,6 +659,7 @@ def synthesize_operator_cliff_plan(
         elif ok and key not in seen_ho:
             seen_ho.add(key)
             held_pts.append(CliffPointSpec(pid, "heldout", axis, val, tag, why, b, q, tk, topo))
+        return ok
 
     def _in_ctx(ctx_val: int) -> bool:
         return params.context_min <= ctx_val <= params.context_max
@@ -611,26 +678,28 @@ def synthesize_operator_cliff_plan(
     for topo, c in _CROSS_PARALLEL_SPECS:
         if _in_ctx(c):
             _add(f"cross_{topo}_ctx_{c}", "context_len", c, "parallel_split_2d", "Multi-rank TP/PCP/DCP", topo=topo)
+    aic_cores = max(1, int(params.core_count))
+    aiv_cores = _resolve_vector_core_count(sku, aic_cores, params.vector_core_count, profile_override)
     for td in axes.tile_dims:
         for delta, suffix in ((-1, "minus1"), (0, "exact"), (1, "plus1")):
             if td + delta >= 1:
                 _add(f"tile_{td}_{suffix}_{td + delta}", "tokens", td + delta, "tile_boundary", f"Tile boundary {td}{delta:+d}")
-        prod = max(1, int(params.core_count)) * td
         for c_axis in axes.core_product_axes:
+            unit = _axis_core_unit(params.family, c_axis, axes)
+            prod = (aiv_cores if unit == "aiv" else aic_cores) * td
             for delta, suffix in ((-1, "minus1"), (1, "plus1")):
                 if prod + delta >= 1:
-                    _add(f"cores_wave_{c_axis}_{td}_{suffix}_{prod + delta}", c_axis, prod + delta, "core_wave_boundary", f"Core wave {prod}{delta:+d}")
+                    _add(f"cores_wave_{c_axis}_{td}_{suffix}_{prod + delta}", c_axis, prod + delta, "core_wave_boundary", f"Core wave ({unit.upper()}) {prod}{delta:+d}")
     for p_axis, thr in axes.phase_thresholds:
         for delta, suffix in ((-1, "minus1"), (1, "plus1")):
             if (v := thr + delta) >= 1:
-                if p_axis == "topk":
-                    _add(f"topk_attr_{v}", "context_len", max(v, CONTEXT_MIN_TOKENS), "topk_phase_cliff", f"Top-K {thr}{delta:+d}", tk=v)
-                else:
-                    _add(f"phase_{p_axis}_{suffix}_{v}", p_axis, v, "phase_threshold", f"Phase threshold {thr}{delta:+d}")
+                is_tk = p_axis == "topk"
+                accepted = _add(f"topk_attr_{v}" if is_tk else f"phase_{p_axis}_{suffix}_{v}", "context_len" if is_tk else p_axis, max(v, CONTEXT_MIN_TOKENS) if is_tk else v, "topk_phase_cliff" if is_tk else "phase_threshold", f"{'Top-K' if is_tk else 'Phase threshold'} {thr}{delta:+d}", tk=v if is_tk else None)
+                if not accepted and delta > 0 and (nv := _next_admissible_divisible(p_axis, v, axes, resolved_arch)) is not None:
+                    _add(f"topk_attr_{nv}" if is_tk else f"phase_{p_axis}_admissible_{nv}", "context_len" if is_tk else p_axis, max(nv, CONTEXT_MIN_TOKENS) if is_tk else nv, "topk_phase_cliff" if is_tk else "phase_threshold", f"{'Top-K' if is_tk else 'Phase'} next admissible ({nv})", tk=nv if is_tk else None)
     for rule in axes.abi_divisibility:
         if rule.applies_to(resolved_arch) and rule.max_value is not None:
-            over = rule.max_value + 1
-            is_tk = rule.axis == "topk"
+            over, is_tk = rule.max_value + 1, rule.axis == "topk"
             _add(f"{rule.axis}_over_max_{over}", "context_len" if is_tk else rule.axis, max(over, CONTEXT_MIN_TOKENS) if is_tk else over, "abi_max_boundary", f"ABI max+1 ({over})", tk=over if is_tk else None)
 
     draft = {
@@ -651,11 +720,13 @@ def synthesize_operator_cliff_plan(
 def synthesize_sku_512_400k_plan(
     *, sku: str, core_count: int, l2_bytes: int, tile_dim: int = DEFAULT_TILE_DIM,
     campaign_id: str = "sku-512-400k", arch_preset: str = "", profile_override: Mapping[str, Any] | None = None,
+    vector_core_count: int | None = None,
 ) -> CliffBenchPlan:
     resolved_arch = _resolve_plan_arch_preset(sku, arch_preset, profile_override)
-    axes = family_default_tiling_axes("sparse_indexer", tile_dim=tile_dim, arch_preset=resolved_arch, topk_threshold=DEFAULT_SPARSE_TOPK)
+    base_axes = family_default_tiling_axes("lightning_indexer", tile_dim=tile_dim, arch_preset=resolved_arch, topk_threshold=DEFAULT_SPARSE_TOPK, upstream_abi="aclnnLightningIndexer", query_dtype="bf16", cache_dtype="bf16")
+    axes = replace(base_axes, core_axis_units=(("tokens", "aiv"), ("batch_x_kv_heads", "aic")))
     return synthesize_operator_cliff_plan(
-        OperatorCliffParameters(f"sku:{sku}:512_400k", "sku_suite", tile_dim, core_count, l2_bytes, topk_threshold=DEFAULT_SPARSE_TOPK, tiling_axes=axes),
+        OperatorCliffParameters(f"sku:{sku}:512_400k", "sku_suite", tile_dim, core_count, l2_bytes, topk_threshold=DEFAULT_SPARSE_TOPK, tiling_axes=axes, vector_core_count=vector_core_count),
         sku=sku, campaign_id=campaign_id, arch_preset=resolved_arch, profile_override=profile_override,
     )
 

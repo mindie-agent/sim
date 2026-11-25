@@ -81,8 +81,27 @@ _ISA_TOKEN_TO_PRESET = {
     "npu_arch_2201": ARCH_PRESET_22, "arch22": ARCH_PRESET_22, "dav-c220": ARCH_PRESET_22,
     "npu_arch_3510": ARCH_PRESET_35, "arch35": ARCH_PRESET_35, "dav-c310": ARCH_PRESET_35,
 }
+_NPU_ARCH_CODE_TO_PRESET = {"2201": ARCH_PRESET_22, "3510": ARCH_PRESET_35}
+_PROBE_INT_FIELDS: tuple[str, ...] = ("aic_count", "aiv_count", "hbm_bytes", "l2_bytes", "ub_bytes", "dies_per_package", "ranks_per_node", "aicore_freq_mhz", "l1_bytes", "l0a_bytes", "l0b_bytes", "l0c_bytes")
+_LIVE_PREFERRED_FIELDS = frozenset({"aic_count", "hbm_bytes", "aicore_freq_mhz", "dies_per_package", "ranks_per_node"})
+_INI_ARCH_SPECS: tuple[tuple[str | None, str], ...] = (("version", "npuarch"), ("version", "arch_preset"), ("version", "ccec_aic_version"), ("version", "ccec_cube_version"), ("socinfo", "compute_arch"), (None, "npuarch"), (None, "arch_preset"), (None, "compute_arch"), (None, "isa_version"), (None, "cube_arch"), (None, "ai_core_arch"))
+_INI_INT_SPECS: Mapping[str, tuple[tuple[str | None, str], ...]] = {
+    "aic_count": (("socinfo", "ai_core_cnt"), ("socinfo", "cube_core_cnt"), (None, "ai_core_cnt"), (None, "aic_count"), (None, "cube_core_cnt")),
+    "aiv_count": (("socinfo", "vector_core_cnt"), ("socinfo", "ai_vector_core_cnt"), (None, "vector_core_cnt"), (None, "aiv_count"), (None, "ai_vector_core_cnt")),
+    "aicore_freq_mhz": (("aicorespec", "cube_freq"), ("socinfo", "aic_freq"), (None, "aic_freq"), (None, "aicore_freq"), (None, "cube_freq"), (None, "ai_core_freq")),
+}
+_INI_SIZE_SPECS: Mapping[str, tuple[tuple[str | None, str], ...]] = {
+    "l2_bytes": (("socinfo", "l2_size"), (None, "l2_size"), (None, "l2_cache_size")),
+    "ub_bytes": (("aicorespec", "ub_size"), ("vectorcorespec", "ub_size"), ("socinfo", "ub_size"), (None, "ub_size"), (None, "unified_buffer_size")),
+    "l1_bytes": (("aicorespec", "l1_size"), (None, "l1_size"), (None, "l1_buffer_size")),
+    "l0a_bytes": (("aicorespec", "l0_a_size"), ("aicorespec", "l0a_size"), (None, "l0_a_size"), (None, "l0a_size"), (None, "l0a_buffer_size")),
+    "l0b_bytes": (("aicorespec", "l0_b_size"), ("aicorespec", "l0b_size"), (None, "l0_b_size"), (None, "l0b_size"), (None, "l0b_buffer_size")),
+    "l0c_bytes": (("aicorespec", "l0_c_size"), ("aicorespec", "l0c_size"), (None, "l0_c_size"), (None, "l0c_size"), (None, "l0c_buffer_size")),
+    "hbm_bytes": (("socinfo", "memory_size"), ("socinfo", "hbm_size"), (None, "hbm_size"), (None, "memory_size")),
+}
 _SAFE_SLUG_RE = re.compile(r"[^a-z0-9]+")
 _SIZE_UNIT_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([kmg]?i?b)?\s*$", re.IGNORECASE)
+_TOPO_ROW_RE = re.compile(r"(?m)^\s*((?:NPU|Phy-ID)\d+)\s+(?:X|SYS|PHB|PIX|PXB|HCCS(?:_SW)?|SIO|NA)\b")
 _UNIT_MULTIPLIERS = {"": 1, "b": 1, "kb": 1024, "kib": 1024, "mb": MIB_BYTES, "mib": MIB_BYTES, "gb": GIB_BYTES, "gib": GIB_BYTES}
 _SAFE_CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -91,6 +110,13 @@ def load_canonical_l0_sealer(repo_root: str | Path | None = None) -> Any:
     """Return the single canonical installed L0 primitive sealer ``mindie_sim.primitives.sealer``."""
     del repo_root
     return _canonical_sealer
+
+
+def _resolve_arch_preset_token(raw: str) -> str:
+    low = str(raw or "").strip().lower()
+    if not low:
+        return ""
+    return _NPU_ARCH_CODE_TO_PRESET.get(low) or _ISA_TOKEN_TO_PRESET.get(low) or next((p for tok, p in _ISA_TOKEN_TO_PRESET.items() if tok in low), "")
 
 
 def _parse_size_bytes(raw: Any, *, default_unit: str = "b") -> int:
@@ -103,51 +129,52 @@ def _parse_size_bytes(raw: Any, *, default_unit: str = "b") -> int:
 
 
 def parse_platform_config_ini(ini_text: str) -> dict[str, Any]:
-    """Parse CANN ``platform_config/<SocName>.ini`` hardware facts."""
-    vals: dict[str, str] = {}
+    """Parse section-qualified CANN ``platform_config/<SocName>.ini`` hardware facts."""
+    sections: dict[str, dict[str, str]] = {}
+    flat: dict[str, str] = {}
+    cur_sec = ""
     for line in ini_text.splitlines():
         clean = line.split("#", 1)[0].split(";", 1)[0].strip()
-        if clean and not clean.startswith("[") and "=" in clean:
+        if not clean:
+            continue
+        if clean.startswith("[") and clean.endswith("]"):
+            cur_sec = clean[1:-1].strip().lower()
+            sections.setdefault(cur_sec, {})
+        elif "=" in clean:
             k, v = clean.split("=", 1)
-            vals[k.strip().lower()] = v.strip()
+            kl, vs = k.strip().lower(), v.strip()
+            sections.setdefault(cur_sec, {})[kl] = vs
+            flat.setdefault(kl, vs)
 
-    def _first(*keys: str) -> str:
-        return next((vals[k] for k in keys if vals.get(k)), "")
+    def _lookup(*specs: tuple[str | None, str]) -> str | None:
+        return next((src[k] for s, k in specs if (src := flat if s is None else sections.get(s, {})) and k in src and src[k] != ""), None)
 
-    def _int_of(*keys: str) -> int:
-        m = re.match(r"(\d+)", _first(*keys))
-        return int(m.group(1)) if m else 0
-
-    isa = _first("arch_preset", "compute_arch", "isa_version", "cube_arch", "ai_core_arch").lower()
-    preset = next((p for tok, p in _ISA_TOKEN_TO_PRESET.items() if tok in isa), "")
-    return {
-        "soc_version": _first("soc_version", "soc_name"), "arch_preset": preset,
-        "architecture": _first("architecture", "soc_family", "product_family"),
+    preset = next((res for spec in _INI_ARCH_SPECS if (raw := _lookup(spec)) is not None and (res := _resolve_arch_preset_token(raw))), "")
+    parsed: dict[str, Any] = {
+        "soc_version": _lookup(("version", "soc_version"), ("socinfo", "soc_version"), (None, "soc_version"), (None, "soc_name")) or "",
+        "arch_preset": preset,
+        "architecture": _lookup(("version", "architecture"), ("socinfo", "architecture"), (None, "architecture"), (None, "soc_family"), (None, "product_family")) or "",
         "ini_sha256": sha256_bytes(ini_text.encode("utf-8")) if ini_text.strip() else "",
-        "aic_count": _int_of("ai_core_cnt", "aic_count", "cube_core_cnt"),
-        "aiv_count": _int_of("vector_core_cnt", "aiv_count", "ai_vector_core_cnt"),
-        "aicore_freq_mhz": _int_of("aic_freq", "aicore_freq", "cube_freq", "ai_core_freq"),
-        "l2_bytes": _parse_size_bytes(_first("l2_size", "l2_cache_size")),
-        "ub_bytes": _parse_size_bytes(_first("ub_size", "unified_buffer_size")),
-        "l1_bytes": _parse_size_bytes(_first("l1_size", "l1_buffer_size")),
-        "l0a_bytes": _parse_size_bytes(_first("l0a_size", "l0a_buffer_size")),
-        "l0b_bytes": _parse_size_bytes(_first("l0b_size", "l0b_buffer_size")),
-        "l0c_bytes": _parse_size_bytes(_first("l0c_size", "l0c_buffer_size")),
-        "hbm_bytes": _parse_size_bytes(_first("hbm_size", "memory_size")),
+        **{k: (int(m.group(1)) if (raw := _lookup(*sp)) is not None and (m := re.match(r"(\d+)", raw)) else None) for k, sp in _INI_INT_SPECS.items()},
+        **{k: (_parse_size_bytes(raw) if (raw := _lookup(*sp)) is not None and _SIZE_UNIT_RE.match(raw) else None) for k, sp in _INI_SIZE_SPECS.items()},
     }
+    parsed["present_fields"] = sorted(k for k in ("arch_preset", "architecture", *_PROBE_INT_FIELDS) if parsed.get(k) not in (None, ""))
+    return parsed
 
 
 def parse_npu_smi_topology(common_text: str, topo_text: str = "") -> dict[str, Any]:
     """Extract AIC count, frequency, HBM bytes, and topology hints from ``npu-smi`` text."""
-    def _int_f(label: str) -> int:
-        m = re.search(rf"{re.escape(label)}\s*:\s*(\d+)", common_text)
-        return int(m.group(1)) if m else 0
-
-    hbm_mb = _int_f("HBM Capacity(MB)")
-    dies = max(1, len(set(re.findall(r"(?m)^\s*Chip ID\s*:\s*(\d+)", common_text))))
-    ranks = max(dies, len(re.findall(r"(?m)^\s*NPU\d+\b", topo_text)))
-    fab = {k: 1.0 for tok, k in (("SIO", "d2d_intra_package"), ("HCCS", "d2d_intra_node")) if tok in topo_text}
-    return {"aic_count": _int_f("Aicore Count"), "aicore_freq_mhz": _int_f("Aicore Freq(MHZ)"), "hbm_bytes": hbm_mb * MIB_BYTES if hbm_mb > 0 else 0, "dies_per_package": dies, "ranks_per_node": ranks, "fabric_hints": fab}
+    _opt_re = lambda pat: int(m.group(1)) if (m := re.search(rf"{pat}\s*:\s*(\d+)", common_text, re.IGNORECASE)) else None
+    hbm_mb = _opt_re(r"HBM[- ]Capacity\(MB\)")
+    chip_ids = set(re.findall(r"(?mi)^\s*Chip ID\s*:\s*(\d+)", common_text))
+    dies = len(chip_ids) if chip_ids else None
+    topo_rows = set(_TOPO_ROW_RE.findall(topo_text))
+    return {
+        "aic_count": _opt_re(r"Aicore Count"), "aicore_freq_mhz": _opt_re(r"Aicore Freq\(MHZ\)"),
+        "hbm_bytes": (hbm_mb * MIB_BYTES) if hbm_mb is not None else None,
+        "dies_per_package": dies, "ranks_per_node": max(dies or 1, len(topo_rows)) if topo_rows else None,
+        "fabric_hints": {k: 1.0 for tok, k in (("SIO", "d2d_intra_package"), ("HCCS", "d2d_intra_node")) if tok in topo_text},
+    }
 
 
 def verify_idle_die_telemetry(info_text: str, common_text: str, *, npu_id: int = 0) -> dict[str, Any]:
@@ -189,21 +216,27 @@ def _ssh_exec(endpoint_alias: str, remote_cmd: str, *, timeout_s: int, endpoints
         raise ModelingError(f"onboarding_ssh_failed:{exc}") from exc
 
 
-def _validate_profile_against_probe(probe: SocProbeRecord, entry: Mapping[str, Any]) -> tuple[list[SiliconProfileConflict], dict[str, Any]]:
-    hw = Hardware.from_mapping({"sku": probe.soc_name, "architecture": entry["architecture"], "dies_per_package": entry["dies_per_package"], "ranks_per_node": max(1, probe.ranks_per_node), "num_devices": 1, "device": deepcopy(entry["device"]), "transfer_channels": deepcopy(entry.get("transfer_channels", {}))})
+def _validate_profile_against_probe(
+    probe: SocProbeRecord, entry: Mapping[str, Any], *, observed_fields: frozenset[str] | None = None,
+) -> tuple[list[SiliconProfileConflict], dict[str, Any]]:
+    eff_rpn = int(entry.get("ranks_per_node") or max(1, probe.ranks_per_node))
+    hw = Hardware.from_mapping({"sku": probe.soc_name, "architecture": entry["architecture"], "dies_per_package": entry["dies_per_package"], "ranks_per_node": eff_rpn, "physical_ranks_per_node": eff_rpn, "num_devices": 1, "device": deepcopy(entry["device"]), "transfer_channels": deepcopy(entry.get("transfer_channels", {}))})
     die = hw.dies[0]
     dp = datapath_for_die(die)
     bufs = dict(die.buffers)
     conflicts: list[SiliconProfileConflict] = []
 
     def _cmp(field: str, obs: Any, decl: Any) -> None:
-        if obs and obs != decl:
+        is_obs = (field in observed_fields) if observed_fields is not None else bool(obs)
+        if is_obs and obs != decl:
             conflicts.append(SiliconProfileConflict(field, obs, decl, f"silicon_profile_conflict:{field}:observed={obs}:declared={decl}"))
 
     _cmp("arch_preset", probe.arch_preset, str(dp.arch_id))
     _cmp("aic_count", probe.aic_count, int(dp.aic_count))
     _cmp("aiv_count", probe.aiv_count, int(dp.aiv_count))
     _cmp("dies_per_package", probe.dies_per_package, int(entry["dies_per_package"]))
+    if entry.get("ranks_per_node") is not None:
+        _cmp("ranks_per_node", probe.ranks_per_node, int(entry["ranks_per_node"]))
     _cmp("hbm_bytes", probe.hbm_bytes, int(die.memory_bytes))
     for fname, val, bk in (("l2_bytes", probe.l2_bytes, "l2"), ("ub_bytes", probe.ub_bytes, "ub"), ("l1_bytes", probe.l1_bytes, "l1"), ("l0a_bytes", probe.l0a_bytes, "l0a"), ("l0b_bytes", probe.l0b_bytes, "l0b"), ("l0c_bytes", probe.l0c_bytes, "l0c")):
         _cmp(fname, val, int(bufs.get(bk, 0)))
@@ -244,11 +277,33 @@ def _scaffold_sku_profile(probe: SocProbeRecord, all_profiles: Mapping[str, Any]
                 mem_h["provenance"]["l2_capacity_bytes"] = probe.l2_bytes
     dev["buffer_units"]["l2"] = 1
     base["architecture"], base["dies_per_package"] = probe.architecture, probe.dies_per_package
+    base["ranks_per_node"] = base["physical_ranks_per_node"] = probe.ranks_per_node
     for cname, bw in probe.fabric_channels:
         if cname in base.get("transfer_channels", {}) and bw > 0.0:
             base["transfer_channels"][cname]["uni_peak_bw_gbps"] = float(bw)
     base["source"] = {"calibration": {"calibrated": False, "rate_provenance": "declared_nominal", "source_sku": probe.soc_name, "anchor_sku": base_template_sku, "capture_uri": probe.capture_uri}}
     return base
+
+
+def _collect_probe_evidence(raw_doc: Mapping[str, Any], ini_f: Mapping[str, Any], smi_f: Mapping[str, Any]) -> tuple[dict[str, Any], frozenset[str], list[SiliconProfileConflict]]:
+    decl_src: dict[str, Any] = {k: int(raw_doc[k]) for k in _PROBE_INT_FIELDS if raw_doc.get(k) is not None and not isinstance(raw_doc.get(k), bool)}
+    if (norm_ap := _resolve_arch_preset_token(str(raw_doc.get("arch_preset") or ""))):
+        decl_src["arch_preset"] = norm_ap
+    if (raw_arch := str(raw_doc.get("architecture") or "").strip()):
+        decl_src["architecture"] = raw_arch
+    smi_src = {k: int(smi_f[k]) for k in _LIVE_PREFERRED_FIELDS if smi_f.get(k) is not None}
+    ini_src: dict[str, Any] = {k: int(ini_f[k]) for k in _PROBE_INT_FIELDS if ini_f.get(k) is not None}
+    ini_src.update({sk: str(ini_f[sk]).strip() for sk in ("arch_preset", "architecture") if str(ini_f.get(sk) or "").strip()})
+    conflicts, resolved, observed = [], {}, set()
+    for field in ("arch_preset", "architecture", *_PROBE_INT_FIELDS):
+        ordered = (("npu_smi", smi_src), ("platform_config_ini", ini_src), ("declared", decl_src)) if field in _LIVE_PREFERRED_FIELDS else (("platform_config_ini", ini_src), ("npu_smi", smi_src), ("declared", decl_src))
+        if not (present := [(name, src[field]) for name, src in ordered if field in src]):
+            continue
+        observed.add(field)
+        p_name, p_val = present[0]
+        resolved[field] = p_val
+        conflicts.extend(SiliconProfileConflict(field, p_val, ov, f"silicon_profile_conflict:{field}:{p_name}={p_val}:{on}={ov}") for on, ov in present[1:] if ov != p_val)
+    return resolved, frozenset(observed), conflicts
 
 
 def probe_soc(
@@ -280,48 +335,42 @@ def probe_soc(
 
     ini_f = parse_platform_config_ini(str(raw_doc.get("platform_config_ini") or ""))
     smi_f = parse_npu_smi_topology(str(raw_doc.get("npu_smi_common") or ""), str(raw_doc.get("npu_smi_topo") or ""))
-    acl_soc, decl_soc = str(raw_doc.get("aclrt_soc_name") or "").strip(), str(raw_doc.get("soc_name") or "").strip()
-    soc_name = acl_soc or decl_soc or ini_f["soc_version"]
-    early_conflicts: list[SiliconProfileConflict] = []
-    if acl_soc and decl_soc and acl_soc != decl_soc:
-        early_conflicts.append(SiliconProfileConflict("soc_name", acl_soc, decl_soc, f"silicon_profile_conflict:soc_name:aclrt={acl_soc}:declared={decl_soc}"))
-    if acl_soc and ini_f["soc_version"] and acl_soc != ini_f["soc_version"]:
-        early_conflicts.append(SiliconProfileConflict("platform_config_ini.soc_version", ini_f["soc_version"], acl_soc, "silicon_profile_conflict:ini_soc_mismatch"))
-    if not soc_name:
+    acl_soc, decl_soc, ini_soc = str(raw_doc.get("aclrt_soc_name") or "").strip(), str(raw_doc.get("soc_name") or "").strip(), str(ini_f["soc_version"] or "").strip()
+    soc_pairs = [(n, v) for n, v in (("aclrt_soc_name", acl_soc), ("soc_name", decl_soc), ("platform_config_ini.soc_version", ini_soc)) if v]
+    if not soc_pairs:
         raise ModelingError("soc_probe_missing_soc_name")
+    soc_name = soc_pairs[0][1]
+    early_conflicts: list[SiliconProfileConflict] = [
+        SiliconProfileConflict(on, soc_name, ov, f"silicon_profile_conflict:soc_name:{soc_pairs[0][0]}={soc_name}:{on}={ov}")
+        for on, ov in soc_pairs[1:] if ov != soc_name
+    ]
     raw_fab = raw_doc.get("fabric_channels")
     fab_pairs = tuple(sorted((str(k), float(v)) for k, v in raw_fab.items())) if isinstance(raw_fab, Mapping) else ()
-    raw_preset = str(raw_doc.get("arch_preset") or ini_f["arch_preset"] or "").strip().lower()
-    preset = _ISA_TOKEN_TO_PRESET.get(raw_preset, "")
+    ev_vals, observed_fields, source_conflicts = _collect_probe_evidence(raw_doc, ini_f, smi_f)
+    early_conflicts.extend(source_conflicts)
     probe = SocProbeRecord(
-        soc_name=soc_name, arch_preset=preset, architecture=str(raw_doc.get("architecture") or ini_f["architecture"] or "").strip(),
-        aic_count=int(raw_doc.get("aic_count") or ini_f["aic_count"] or smi_f["aic_count"] or 0),
-        aiv_count=int(raw_doc.get("aiv_count") or ini_f["aiv_count"] or 0),
-        hbm_bytes=int(raw_doc.get("hbm_bytes") or smi_f["hbm_bytes"] or ini_f["hbm_bytes"] or 0),
-        l2_bytes=int(raw_doc.get("l2_bytes") or ini_f["l2_bytes"] or 0),
-        ub_bytes=int(raw_doc.get("ub_bytes") or ini_f["ub_bytes"] or 0),
-        dies_per_package=max(1, int(raw_doc.get("dies_per_package") or smi_f["dies_per_package"] or 1)),
-        ranks_per_node=max(1, int(raw_doc.get("ranks_per_node") or smi_f["ranks_per_node"] or 1)),
-        aicore_freq_mhz=int(raw_doc.get("aicore_freq_mhz") or smi_f["aicore_freq_mhz"] or ini_f["aicore_freq_mhz"] or 0),
-        l1_bytes=int(raw_doc.get("l1_bytes") or ini_f["l1_bytes"] or 0), l0a_bytes=int(raw_doc.get("l0a_bytes") or ini_f["l0a_bytes"] or 0),
-        l0b_bytes=int(raw_doc.get("l0b_bytes") or ini_f["l0b_bytes"] or 0), l0c_bytes=int(raw_doc.get("l0c_bytes") or ini_f["l0c_bytes"] or 0),
+        soc_name=soc_name, arch_preset=str(ev_vals.get("arch_preset") or ""), architecture=str(ev_vals.get("architecture") or ""),
+        aic_count=int(ev_vals.get("aic_count", 0)), aiv_count=int(ev_vals.get("aiv_count", 0)),
+        hbm_bytes=int(ev_vals.get("hbm_bytes", 0)), l2_bytes=int(ev_vals.get("l2_bytes", 0)), ub_bytes=int(ev_vals.get("ub_bytes", 0)),
+        dies_per_package=int(ev_vals.get("dies_per_package", 1)), ranks_per_node=int(ev_vals.get("ranks_per_node", 1)),
+        aicore_freq_mhz=int(ev_vals.get("aicore_freq_mhz", 0)), l1_bytes=int(ev_vals.get("l1_bytes", 0)),
+        l0a_bytes=int(ev_vals.get("l0a_bytes", 0)), l0b_bytes=int(ev_vals.get("l0b_bytes", 0)), l0c_bytes=int(ev_vals.get("l0c_bytes", 0)),
         endpoint_alias=sanitize_public_alias(endpoint_alias or str(raw_doc.get("endpoint_alias") or ""), "local"),
-        cann_version=str(raw_doc.get("cann_version") or "unmeasured").strip(),
-        platform_ini_sha256=ini_f["ini_sha256"],
+        cann_version=str(raw_doc.get("cann_version") or "unmeasured").strip(), platform_ini_sha256=ini_f["ini_sha256"],
         capture_uri=build_capture_uri(f"soc-probe/{sanitize_public_campaign_id(campaign_id)}", json.dumps(dict(raw_doc), sort_keys=True).encode("utf-8")),
         fabric_channels=fab_pairs,
     )
     all_profiles = read_bounded_json(profiles_path) if profiles_path is not None else ascend_profiles()
     action, scaffold_profile, datapath_summary, conflicts = "validated_existing", None, {}, list(early_conflicts)
     if soc_name in all_profiles:
-        c2, datapath_summary = _validate_profile_against_probe(probe, all_profiles[soc_name])
+        c2, datapath_summary = _validate_profile_against_probe(probe, all_profiles[soc_name], observed_fields=observed_fields)
         conflicts.extend(c2)
     elif allow_scaffold:
-        missing = [k for k, v in (("arch_preset", probe.arch_preset in _KNOWN_ARCH_PRESETS), ("architecture", bool(probe.architecture)), ("aic_count", probe.aic_count > 0), ("aiv_count", probe.aiv_count > 0), ("hbm_bytes", probe.hbm_bytes > 0), ("l2_bytes", probe.l2_bytes > 0), ("ub_bytes", probe.ub_bytes > 0), ("base_template_sku", bool(base_template_sku.strip()))) if not v]
+        missing = [k for k, v in (("arch_preset", probe.arch_preset in _KNOWN_ARCH_PRESETS), ("architecture", bool(probe.architecture)), ("aic_count", probe.aic_count > 0), ("aiv_count", probe.aiv_count > 0), ("hbm_bytes", probe.hbm_bytes > 0), ("l2_bytes", probe.l2_bytes > 0), ("ub_bytes", probe.ub_bytes > 0), ("dies_per_package", probe.dies_per_package > 0), ("ranks_per_node", "ranks_per_node" in observed_fields and probe.ranks_per_node > 0), ("base_template_sku", bool(base_template_sku.strip()))) if not v]
         if missing:
             raise ModelingError(f"soc_probe_scaffold_missing_fields:{','.join(missing)}")
         entry = _scaffold_sku_profile(probe, all_profiles, base_template_sku=base_template_sku)
-        c2, datapath_summary = _validate_profile_against_probe(probe, entry)
+        c2, datapath_summary = _validate_profile_against_probe(probe, entry, observed_fields=observed_fields)
         conflicts.extend(c2)
         action, scaffold_profile = "scaffolded_new", {soc_name: entry}
         if scaffold_out is not None and not conflicts:
@@ -335,14 +384,12 @@ def probe_soc(
     arch_tag = "arch35" if (probe.arch_preset or datapath_summary.get("arch_id")) == ARCH_PRESET_35 else "arch22"
     result: dict[str, Any] = {
         "stage": "probe-soc", "ok": not conflicts, "status": "pass" if not conflicts else "fail",
-        "action": action, "sku": soc_name, "probe": probe.to_dict(),
-        "datapath": datapath_summary, "conflicts": [c.to_dict() for c in conflicts],
+        "action": action, "sku": soc_name, "probe": probe.to_dict(), "datapath": datapath_summary,
+        "conflicts": [c.to_dict() for c in conflicts],
         "canonical_bindings": {"compose_sku": soc_name, "primitive_table_relpath": f"data/primitives/{arch_tag}_{slug}.json", "registered_stacks": sorted(default_stack_registry().list_stacks())},
+        **({"error": "silicon_profile_conflict"} if conflicts else {}),
+        **({"scaffold_profile": scaffold_profile} if scaffold_profile is not None else {}),
     }
-    if conflicts:
-        result["error"] = "silicon_profile_conflict"
-    if scaffold_profile is not None:
-        result["scaffold_profile"] = scaffold_profile
     assert_sanitized_payload(result, field_name="probe_soc_result")
     return result
 
@@ -524,7 +571,11 @@ def validate_512_400k(
     cap_pct, eff_atol = validate_strict_threshold_pct(threshold_pct), validate_strict_atol_ns(atol_ns)
     hw = materialize_sku_hardware(sku, profile_override=profile_override)
     die = hw.dies[0]
-    plan_doc = synthesize_sku_512_400k_plan(sku=sku, core_count=int(die.compute_units), l2_bytes=int(dict(die.buffers).get("l2", 0)), campaign_id=campaign_id, profile_override=profile_override).to_dict()
+    plan_doc = synthesize_sku_512_400k_plan(
+        sku=sku, core_count=int(die.compute_units), l2_bytes=int(dict(die.buffers).get("l2", 0)),
+        campaign_id=campaign_id, profile_override=profile_override,
+        vector_core_count=int(dict(die.resource_units).get("vector", 0)) or None,
+    ).to_dict()
     if plan_out is not None:
         write_atomic_json(plan_out, plan_doc)
     prim_tbl: PrimitiveTable | None = None

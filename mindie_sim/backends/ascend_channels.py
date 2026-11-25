@@ -241,7 +241,10 @@ def _merge_channels(raw, profile):
             channels[name]["effective_uni_bw_gbps"] = value
             channels[name]["bandwidth_provenance"] = provenance
     node_ranks = int(
-        raw.get("ranks_per_node")
+        raw.get("physical_ranks_per_node")
+        or raw.get("ranks_per_node")
+        or profile.get("physical_ranks_per_node")
+        or profile.get("ranks_per_node")
         or default_ranks_per_node(str(raw.get("sku", "")))
     )
     if node_ranks > DIRECT_MESH_RANKS:

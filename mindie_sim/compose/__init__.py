@@ -43,6 +43,7 @@ from mindie_sim.compose.inputs import (
     _apply_quant_override,
     _apply_structural_overrides,
     _arch_key,
+    _ensure_registered_profiles,
     _resolve_hardware,
     _resolve_max_position_embeddings,
     _resolve_model_spec,
@@ -160,7 +161,12 @@ def _materialize_machine(
     )
     if resolved_devices < required_devices:
         raise ModelingError(f"insufficient_num_devices:{resolved_devices}:required:{required_devices}")
-    base_rpn = default_ranks_per_node(sku) if backend == "ascend" else DEFAULT_RANKS_PER_NODE
+    prof_rpn = None
+    if backend == "ascend":
+        prof_entry = _ensure_registered_profiles().get(sku)
+        if isinstance(prof_entry, Mapping):
+            prof_rpn = prof_entry.get("physical_ranks_per_node") or prof_entry.get("ranks_per_node")
+    base_rpn = (int(prof_rpn) if prof_rpn else default_ranks_per_node(sku)) if backend == "ascend" else DEFAULT_RANKS_PER_NODE
     phys_rpn = int(preset_defaults.get("ranks_per_node", base_rpn))
     default_rpn = min(resolved_devices, base_rpn)
     if preset_defaults:
