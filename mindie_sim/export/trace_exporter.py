@@ -47,6 +47,7 @@ from .models import (
     DEFAULT_SCENARIO_PROMPT_TOKENS,
     GIB_BYTES,
     MIN_POSITIVE_SECONDS,
+    NS_PER_US,
     US_PER_SECOND,
     ExportBundle,
     OperatorExportRow,
@@ -273,12 +274,44 @@ def _iter_metadata_events(
 def _compute_physical_pipe_times(
     op: OperatorExportRow, peaks: Mapping[str, float],
 ) -> dict[str, float]:
-    """Unplugged socket: shadow peak-division pipe times deleted."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: _compute_physical_pipe_times shadow peak-division + HBM-rate fallback "
-        "+ synthetic minimum span clamping deleted; project true pipe service intervals directly "
-        "from canonical EngineStepReceipt."
-    )
+    """Project physical pipe service durations and ratios from declared work and explicit peaks."""
+    dur = max(0.0, float(op.dur_us))
+    cube_peak = float(op.cube_peak_flops_per_s or peaks.get("cube_peak_flops_per_s") or 0.0)
+    vec_peak = float(peaks.get("vector_peak_ops_per_s") or 0.0)
+    mte2_peak = float(peaks.get("mte2_peak_bytes_per_s") or 0.0)
+    mte3_peak = float(peaks.get("mte3_peak_bytes_per_s") or 0.0)
+    fp_peak = float(peaks.get("fixpipe_peak_bytes_per_s") or 0.0)
+    fp_bytes = max(0.0, float(op.fixpipe_bytes))
+
+    def _pipe_us(work: float, rate: float) -> float:
+        if work <= 0.0 or rate <= 0.0 or dur <= 0.0:
+            return 0.0
+        return min(dur, (float(work) / float(rate)) * US_PER_SECOND)
+
+    cube_us = _pipe_us(op.flops, cube_peak)
+    vec_us = _pipe_us(op.vector_ops, vec_peak)
+    mte2_us = _pipe_us(op.mte2_bytes, mte2_peak)
+    mte3_us = _pipe_us(op.mte3_bytes, mte3_peak)
+    fp_us = _pipe_us(fp_bytes, fp_peak)
+
+    def _ratio(span_us: float) -> float:
+        if dur <= 0.0 or span_us <= 0.0:
+            return 0.0
+        return round(min(1.0, span_us / dur), RATIO_DECIMALS)
+
+    return {
+        "cube_us": cube_us,
+        "vec_us": vec_us,
+        "mte2_us": mte2_us,
+        "mte3_us": mte3_us,
+        "fp_us": fp_us,
+        "fp_bytes": fp_bytes,
+        "aic_mac_ratio": _ratio(cube_us),
+        "aiv_vec_ratio": _ratio(vec_us),
+        "mte2_ratio": _ratio(mte2_us),
+        "mte3_ratio": _ratio(mte3_us),
+        "fixpipe_ratio": _ratio(fp_us),
+    }
 
 
 def _physical_pipe_spans(
@@ -437,21 +470,21 @@ def _subtract_intervals(
 
 
 def _op_in_entry_repeats(op: OperatorExportRow, sched_count: int) -> int:
-    """Unplugged socket: heuristic draft repeat multiplier deleted."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: heuristic _op_in_entry_repeats / _expand_effective_trace_schedule "
-        "draft repeat multiplier deleted; emit explicit schedule directly from EngineStepReceipt."
-    )
+    """Return exact integer in-entry repeat divisor (zero heuristic rounded multipliers)."""
+    cnt = max(1, int(sched_count))
+    rep = max(1, int(op.repeat_count))
+    if rep > cnt and rep % cnt == 0:
+        return rep // cnt
+    return 1
 
 
 def _expand_effective_trace_schedule(
     bundle: ExportBundle,
 ) -> tuple[tuple[TraceScheduleEntry, ...], dict[str, int]]:
-    """Unplugged socket: heuristic draft schedule expansion deleted."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: heuristic _expand_effective_trace_schedule deleted; "
-        "read explicit full schedule directly from EngineStepReceipt."
-    )
+    """Read explicit full-model trace schedule directly from ``ExportBundle``."""
+    entries = tuple(bundle.full_trace_schedule or ())
+    counts = dict(Counter(e.archetype_id for e in entries))
+    return entries, counts
 
 
 def _build_archetype_templates(
@@ -700,12 +733,19 @@ def _resolve_host_launch_spec(
     *,
     is_graph_mode: bool,
     is_h2d_op: bool,
+    bundle: ExportBundle | None = None,
 ) -> tuple[str, float]:
-    """Unplugged socket: hardcoded HOST_GRAPH_LAUNCH_US / HOST_KERNEL_LAUNCH_US deleted."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: magic HOST_GRAPH_LAUNCH_US=12.0 / HOST_KERNEL_LAUNCH_US=1.5 deleted; "
-        "read calibrated STARS/host launch durations from PrimitiveTable."
-    )
+    """Resolve host launch API name and calibrated STARS/DMA launch duration (us)."""
+    scope_lbl = str(getattr(entry, "scope", "") or op_eff.model_scope or "target")
+    if is_h2d_op:
+        dur = float(getattr(bundle, "h2d_startup_us", 0.0) or 0.0) if bundle is not None else 0.0
+        return "aclrtMemcpyAsync(H2D)", max(0.0, dur)
+    if is_graph_mode:
+        dur = float(getattr(bundle, "graph_launch_us", 0.0) or 0.0) if bundle is not None else 0.0
+        return f"aclGraphLaunch[{scope_lbl}]", max(0.0, dur)
+    dur = float(getattr(bundle, "host_launch_us", 0.0) or 0.0) if bundle is not None else 0.0
+    kern = op_eff.ascend_kernel or op_eff.implementation or op_eff.op_id
+    return f"aclrtLaunchKernel({kern})", max(0.0, dur)
 
 
 def _entry_layer_span(
@@ -849,7 +889,7 @@ def _iter_scheduled_full_model_trace(
             if first_op_for_scope or not is_graph_mode or is_h2d_op:
                 dev_pid, dev_tid = _op_pid_tid(op_eff, base)
                 launch_name, l_dur = _resolve_host_launch_spec(
-                    op_eff, entry, is_graph_mode=is_graph_mode, is_h2d_op=is_h2d_op,
+                    op_eff, entry, is_graph_mode=is_graph_mode, is_h2d_op=is_h2d_op, bundle=bundle,
                 )
                 l_events, flow_id = _emit_host_launch_with_flow(
                     name=launch_name, dev_ts=op_ts, dev_pid=dev_pid, dev_tid=dev_tid,
@@ -923,18 +963,26 @@ def _iter_direct_trace(
     layer_spans: list[tuple[str, float, float]] = []
     sub_spans: list[tuple[str, str, float, float]] = []
     flow_id = 1
+    is_graph_mode = bundle.graph_capture_mode.lower() not in {"eager", "none", "off"}
     launched = False
 
     for task_id, op in enumerate(bundle.operators, start=1):
         coord = (op.occurrence.replica, op.occurrence.stage, int(op.occurrence.rank or 0))
         d_idx = die_map.get(coord, 0)
         base = _pid_base(d_idx)
-        if not launched:
-            raise NotImplementedError(
-                "LEGACY_PURGED: flat-trace unconditional aclGraphLaunch (even in eager mode) with "
-                "magic HOST_GRAPH_LAUNCH_US=12.0 deleted (Astra P1); respect graph_capture_mode "
-                "and read launch duration from PrimitiveTable."
+        is_h2d_op = op.family == "engram_rh2d" or "host_uva" in op.op_id.lower()
+        if (not launched) or (not is_graph_mode) or is_h2d_op:
+            dev_pid, dev_tid = _op_pid_tid(op, base)
+            launch_name, l_dur = _resolve_host_launch_spec(
+                op, None, is_graph_mode=is_graph_mode, is_h2d_op=is_h2d_op, bundle=bundle,
             )
+            l_events, flow_id = _emit_host_launch_with_flow(
+                name=launch_name, dev_ts=op.start_us, dev_pid=dev_pid, dev_tid=dev_tid,
+                launch_dur_us=l_dur, flow_id=flow_id,
+                extra_args={"scope": op.model_scope, "transfer": "H2D" if is_h2d_op else "launch"},
+            )
+            yield from l_events
+            launched = True
         lbl = op.archetype_title or op.layer_label
         events, placement, flow_id = _emit_op_and_pipes(
             bundle, op, ts_start=op.start_us, task_id=task_id, layer_label=lbl,
@@ -990,6 +1038,31 @@ def iter_msprof_trace_events(
     coords = _die_coordinates(bundle)
     die_map = {coord: idx for idx, coord in enumerate(coords)}
     yield from _iter_metadata_events(coords)
+    step_ns = (
+        int(bundle.step_span_ns)
+        if int(getattr(bundle, "step_span_ns", 0) or 0) > 0
+        else max(0, int(round(float(bundle.step_span_us) * NS_PER_US)))
+    )
+    exposed_sum_ns = sum(
+        0 if op.is_overlapped else (
+            int(op.exposed_ns) if int(getattr(op, "exposed_ns", 0) or 0) > 0
+            else max(0, int(round(float(op.exposed_dur_us) * max(1, int(op.repeat_count)) * NS_PER_US)))
+        )
+        for op in bundle.operators
+    )
+    idle_ns = max(0, step_ns - exposed_sum_ns)
+    yield {
+        "ph": "M",
+        "name": "mindie_sim_step_receipt",
+        "pid": PID_FRAMEWORK,
+        "tid": TID_FW_ENGINE,
+        "args": {
+            "step_span_ns": step_ns,
+            "disjoint_exposed_sum_ns": exposed_sum_ns,
+            "idle_or_wait_ns": idle_ns,
+            "reconciliation_error_ns": step_ns - (exposed_sum_ns + idle_ns),
+        },
+    }
 
     pipeline_by_occ = {
         pipe.owner: (len(pipe.phases), pipe.member_op_ids)

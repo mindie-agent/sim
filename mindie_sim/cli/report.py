@@ -45,17 +45,18 @@ from mindie_sim.compose.inputs import (
 from mindie_sim.export import (
     AGENT_BRIEF_SCHEMA, DEFAULT_SCENARIO_OUTPUT_TOKENS,
     DEPLOYMENT_MODE_LABELS, MODE_MODELING, MODE_SIMULATION, US_PER_MS,
+    align_before_after_operators, build_default_comparison_request,
     build_export_bundle, compose_export_case, export_agent_brief,
     export_comparison_xlsx, export_msprof_trace, format_executive_digest_markdown,
     project_two_step_gain, sanitize_public_text,
 )
-from mindie_sim.prediction.frontend.speculation import compute_speculative_accept_step
+from mindie_sim.export.action_plan import build_comparison_plan
+from mindie_sim.export.models import NS_PER_MS
 from mindie_sim.prediction.results import ReplayOptions, StepRequest
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.scenario import validate_deployment_mode
-from mindie_sim.schema.stack import LaunchConfigIngress
+from mindie_sim.schema.stack import STACK_TRACKS, LaunchConfigIngress
 from mindie_sim.stacks.registry import resolve_stack_for_scenario
-from mindie_sim.sweep.pd import DEFAULT_SPECULATIVE_ACCEPT_RATE
 
 REPORT_COMMANDS = frozenset({"report", "quickstart"})
 REPORT_BOOLEAN_FLAGS = frozenset({"--json", "--no-trace", "--no-xlsx"})
@@ -422,7 +423,9 @@ def _solved_column_inputs(
         prompt_tokens=prompt_tokens, output_tokens=output_tokens, scope="model", phase=phase,
     )
     rt = dict(raw.get("runtime") or {})
-    rt_meta = {**dict(rt.get("metadata") or {}), "deployment_mode": deployment_mode}
+    rt_meta = {**dict(rt.get("metadata") or {}), "deployment_mode": deployment_mode, "feature_track": feature_track}
+    if isinstance(rt_meta.get("feature_track_report"), Mapping):
+        rt_meta["feature_track_report"] = {**dict(rt_meta["feature_track_report"]), "feature_track": feature_track}
     if spec_tokens is not None and int(spec_tokens) > 0:
         rt_meta.setdefault("draft_proposal_tokens", int(spec_tokens))
     if accept_len is not None and float(accept_len) > 0.0:
@@ -661,10 +664,18 @@ def _emit_report_artifacts(
             audit_dict, before_bundle=before_bundle, tuned_bundle=tuned_bundle, after_bundle=after_bundle,
         )
 
+    aligned = align_before_after_operators(before_bundle, after_bundle)
+    shared_plan = build_comparison_plan(
+        before_bundle, after_bundle, aligned, script_audit=audit_dict,
+    )
+    cmp_req = build_default_comparison_request(before_bundle, after_bundle)
+
     if not getattr(args, "no_xlsx", False):
         xlsx_path = out_dir / f"{prefix}_comparison.xlsx"
         summary["xlsx"] = export_comparison_xlsx(
             before_bundle, xlsx_path, after_bundle=after_bundle,
+            comparison_request=cmp_req,
+            comparison_plan=shared_plan,
             script_audit=audit_dict,
         ).to_dict()
         generated["comparison_xlsx"] = xlsx_path.name
@@ -680,25 +691,32 @@ def _emit_report_artifacts(
 
     brief_path = out_dir / f"{prefix}_agent_brief.json"
     generated["agent_brief_json"] = brief_path.name
-    brief = export_agent_brief(before_bundle, after_bundle, brief_path, generated_files=generated, script_audit=audit_dict)
+    brief = export_agent_brief(
+        before_bundle, after_bundle, brief_path,
+        generated_files=generated, script_audit=audit_dict,
+        comparison_plan=shared_plan,
+    )
     brief_dict = dict(brief) if isinstance(brief, Mapping) else {}
     return summary, brief_dict, format_executive_digest_markdown(brief_dict)
 
 
 def _report_tracks(mode: str, *, compare_track: str, target_track: str, enforce_eager: bool) -> tuple[str, str]:
-    before = "eager" if enforce_eager else compare_track
-    if mode == MODE_SIMULATION and before.strip().lower() == "target":
-        before = "shipping"
-    after = target_track
-    if mode == MODE_SIMULATION and after.strip().lower() == "target":
-        after = before
+    raw_before = "eager" if enforce_eager else str(compare_track or "").strip().lower()
+    raw_after = str(target_track or "").strip().lower()
+    if raw_before not in STACK_TRACKS:
+        raise ModelingError(f"invalid_stack_track:{raw_before!r}")
+    if raw_after not in STACK_TRACKS:
+        raise ModelingError(f"invalid_stack_track:{raw_after!r}")
+    before = "shipping" if (mode == MODE_SIMULATION and raw_before == "target") else raw_before
+    after = before if (mode == MODE_SIMULATION and raw_after == "target") else raw_after
     return before, after
 
 
 def _accept_len_for(spec_tokens: int, explicit_accept: float | None) -> float:
     if explicit_accept is not None:
-        return float(explicit_accept)
-    return float(compute_speculative_accept_step(DEFAULT_SPECULATIVE_ACCEPT_RATE, int(spec_tokens))) if int(spec_tokens) > 0 else 1.0
+        return max(1.0, float(explicit_accept))
+    del spec_tokens
+    return 1.0
 
 
 def _resolve_report_mode_and_phase(
@@ -742,10 +760,17 @@ def _solve_report_columns(
     layout_before = layout_tuned = layout_after = None
 
     if full_explicit:
-        raise NotImplementedError(
-            "LEGACY_PURGED: pinned-report full_explicit auto-feasible bypass deleted (Astra P1: "
-            "emitted SLA_VIOLATED with feasible=True); evaluate canonical SlaVerdict and HBM fit."
-        )
+        after_par = {axis: max(1, int(pinned_parallel.get(axis, 1))) for axis in _PARALLEL_AXES}
+        conc = max(1, int(args.concurrency))
+        after_spec = max(0, int(explicit_spec or 0))
+        if script_info:
+            before_par = {axis: max(1, int(script_info.get(axis, after_par[axis]) or 1)) for axis in _PARALLEL_AXES}
+            before_conc = max(1, int(script_info.get("concurrency") or conc))
+            before_spec = max(0, int(script_info["spec_tokens"] if script_info.get("spec_tokens") is not None else after_spec))
+            tuned_par, tuned_conc = dict(after_par), conc
+        else:
+            before_par, before_conc, before_spec = dict(after_par), conc, after_spec
+            tuned_par, tuned_conc = dict(after_par), conc
     else:
         n_dev = int(args.num_devices or (script_info.get("num_devices") if script_info else None) or _estimate_auto_num_devices(policy["model_spec"], policy["sku"], policy["weight_quant"]))
         common_solve = dict(
@@ -878,6 +903,65 @@ def _build_infeasible_report_result(
     return receipt
 
 
+def _assemble_report_receipt(
+    *,
+    args: argparse.Namespace,
+    after_bundle: Any,
+    summary: Mapping[str, Any],
+    brief_dict: dict[str, Any],
+    digest_md: str,
+    mode: str,
+    resolved_stack_id: str,
+    dep_mode: str,
+) -> dict[str, Any]:
+    """Compute canonical SLA/HBM feasibility and assemble the CLI report receipt."""
+    is_decode = after_bundle.phase == "decode"
+    after_step_ms = (
+        float(after_bundle.step_span_ns) / float(NS_PER_MS)
+        if int(getattr(after_bundle, "step_span_ns", 0) or 0) > 0
+        else after_bundle.step_span_us / US_PER_MS
+    )
+    eff_tpot_ms = (
+        (after_step_ms / max(1.0, float(after_bundle.avg_accepted_tokens)))
+        + float(getattr(after_bundle, "handoff_tpot_ms", 0.0) or 0.0)
+        if is_decode else after_step_ms
+    )
+    tpot_slo = after_bundle.tpot_slo_ms if is_decode else None
+    ttft_slo = after_bundle.ttft_slo_ms if not is_decode else None
+    tpot_met = (tpot_slo is None) or (eff_tpot_ms <= float(tpot_slo))
+    ttft_met = (ttft_slo is None) or (after_step_ms <= float(ttft_slo))
+    all_slas_met = bool(
+        tpot_met
+        and ttft_met
+        and str(after_bundle.sla_regime or "").upper() != "SLA_VIOLATED"
+    )
+    hbm_feasible = bool(after_bundle.memory_ledger.fits_hbm)
+    feasible = bool(all_slas_met and hbm_feasible)
+    receipt: dict[str, Any] = {
+        "ok": True,
+        "feasible": feasible,
+        "status": "feasible" if feasible else "infeasible",
+        "all_slas_met": all_slas_met,
+        "hbm_feasible": hbm_feasible,
+        "sla_regime": after_bundle.sla_regime,
+        "command": "report",
+        "mode": mode,
+        "stack_id": resolved_stack_id,
+        "deployment_mode": dep_mode,
+        "ttft_slo_ms": after_bundle.ttft_slo_ms,
+        "model_name": after_bundle.model_name,
+        "hardware_sku": after_bundle.hardware_sku,
+        "phase": after_bundle.phase,
+        "agent_brief": brief_dict,
+        **summary,
+    }
+    if args.concurrency is not None:
+        receipt["requested_concurrency"] = int(args.concurrency)
+    if not getattr(args, "emit_json", False):
+        receipt["_stdout_markdown"] = digest_md
+    return receipt
+
+
 def run_report_command(args: argparse.Namespace) -> dict[str, Any]:
     """Execute ``mindie-sim report`` with explicit deployment-mode, domain stack routing, and zero TTFT coercion."""
     stack_arg = getattr(args, "stack", None)
@@ -1003,9 +1087,9 @@ def run_report_command(args: argparse.Namespace) -> dict[str, Any]:
         before_bundle=before_bundle, after_bundle=after_bundle, tuned_bundle=tuned_bundle,
         args=args, script_info=script_info, dep_mode=dep_mode,
     )
-    raise NotImplementedError(
-        "LEGACY_PURGED: hardcoded receipt['feasible']=True contradiction (SLA_VIOLATED + feasible=True) "
-        "deleted; compute feasible strictly from canonical SlaVerdict (all_slas_met and hbm_feasible)."
+    return _assemble_report_receipt(
+        args=args, after_bundle=after_bundle, summary=summary, brief_dict=brief_dict,
+        digest_md=digest_md, mode=mode, resolved_stack_id=resolved_stack_id, dep_mode=dep_mode,
     )
 
 

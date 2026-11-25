@@ -23,16 +23,31 @@ from collections.abc import Mapping, Sequence
 import re
 from typing import Any
 
+from mindie_sim.backends.abi_registry import default_abi_registry
 from mindie_sim.catalog.quant import projection_quant
+from mindie_sim.schema.abi import AbiQueryKey, AbiSupportVerdict, ProbedAbiEntry
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.operators import KernelBinding, OpSpec
+from mindie_sim.structure_implementations import operator_birth_certificate
 
 from .models import (
     ATTN_4D_RANK,
     ATTN_5D_RANK,
+    BACKEND_ASCENDC,
+    BACKEND_CANN,
+    BACKEND_CATLASS,
+    BACKEND_HCCL_MC2,
+    BACKEND_TILELANG,
+    BACKEND_TORCH_NPU,
+    BACKEND_TRITON,
+    BANNED_IMPLEMENTATION_NAMES,
     COLLECTIVE_FAMILIES,
     GEMM_SHAPE_RANK,
+    KERNEL_STATUS_EXISTING,
+    KERNEL_STATUS_EXTEND_TILING,
+    KERNEL_STATUS_FRAMEWORK,
+    KERNEL_STATUS_NEW_OP,
     MACRO_MOD_COLLECTIVES,
     MACRO_MOD_DENSE_FFN,
     MACRO_MOD_DRAFT_LAYERS,
@@ -49,6 +64,8 @@ from .models import (
     MACRO_MOD_VERIFY_HEAD,
     MACRO_MOD_VISION,
     MATRIX_2D_RANK,
+    MAX_SOURCE_REF_SUMMARY_LEN,
+    STRUCTURE_READINESS_MAP,
     SUB_ATTN_RES,
     SUB_DENSE_FFN,
     SUB_DSA_LI,
@@ -731,6 +748,273 @@ def _resolve_arch_family(case: Case) -> str:
 
 
 
+_RETIRED_DSL_TOKEN = "cann" + "bot"
+_CANONICAL_BACKEND_MAP: dict[str, str] = {
+    "cann": BACKEND_CANN,
+    "aclnn": BACKEND_CANN,
+    "cann_aclnn": BACKEND_CANN,
+    "cann aclnn/ascendc": BACKEND_CANN,
+    "ascendc": BACKEND_ASCENDC,
+    "vllm_ascend_csrc": BACKEND_ASCENDC,
+    "tilelang": BACKEND_TILELANG,
+    "catlass": BACKEND_CATLASS,
+    "triton": BACKEND_TRITON,
+    "triton_ascend": BACKEND_TRITON,
+    "triton-ascend": BACKEND_TRITON,
+    "torch_npu": BACKEND_TORCH_NPU,
+    "torch": BACKEND_TORCH_NPU,
+    "pytorch-npu": BACKEND_TORCH_NPU,
+    "torch_npu custom op": BACKEND_TORCH_NPU,
+    "third_party_wheel": BACKEND_TORCH_NPU,
+    "host": BACKEND_TORCH_NPU,
+    "hccl": BACKEND_HCCL_MC2,
+    "mc2": BACKEND_HCCL_MC2,
+    "hccl/mc2": BACKEND_HCCL_MC2,
+    "hccl / mc2": BACKEND_HCCL_MC2,
+    "hccl_mc2": BACKEND_HCCL_MC2,
+    "custom-ops": BACKEND_ASCENDC,
+    "custom_ops": BACKEND_ASCENDC,
+    "view_reshape": BACKEND_CANN,
+    "logical": BACKEND_CANN,
+}
+_SOURCE_REPO_BACKEND_MAP: dict[str, str] = {
+    "ascend/tilelang-ascend": BACKEND_TILELANG,
+    "ascend/catlass": BACKEND_CATLASS,
+    "ascend/triton-ascend": BACKEND_TRITON,
+}
+_BIRTH_READINESS_MAP: dict[str, tuple[str, bool]] = {
+    "shipping": (KERNEL_STATUS_EXISTING, False),
+    "proposed_pr": (KERNEL_STATUS_FRAMEWORK, False),
+    "synthesized_target": (KERNEL_STATUS_NEW_OP, True),
+    "tiler_extension": (KERNEL_STATUS_EXTEND_TILING, True),
+}
+
+
+def _clean_native_symbol(raw: Any) -> str:
+    text = str(raw or "").strip()
+    if not text or text in BANNED_IMPLEMENTATION_NAMES:
+        return ""
+    if _RETIRED_DSL_TOKEN in text.lower():
+        raise ModelingError(f"banned_legacy_dsl_kernel_symbol:{text!r}")
+    return text
+
+
+def _map_canonical_backend(raw: Any, *, family: str = "") -> str:
+    tok = str(raw or "").strip().lower()
+    if tok:
+        if _RETIRED_DSL_TOKEN in tok:
+            raise ModelingError(f"banned_legacy_dsl_backend:{raw!r}")
+        mapped = _CANONICAL_BACKEND_MAP.get(tok)
+        if mapped:
+            return mapped
+    if str(family or "").strip().lower() in COLLECTIVE_FAMILIES:
+        return BACKEND_HCCL_MC2
+    return BACKEND_CANN
+
+
+def _format_source_entry(src: Any) -> str:
+    if src is None:
+        return ""
+    if isinstance(src, str):
+        return src.strip()
+    if isinstance(src, Mapping):
+        repo = str(src.get("repository") or "").strip()
+        rel = str(src.get("relative_path") or src.get("path") or "").strip()
+        sym = str(src.get("symbol") or "").strip()
+        if repo and rel:
+            return f"{repo}:{rel}" + (f"#{sym}" if sym else "")
+        return rel or repo
+    repo = str(getattr(src, "repository", "") or "").strip()
+    rel = str(getattr(src, "relative_path", "") or getattr(src, "path", "") or "").strip()
+    if repo and rel:
+        return f"{repo}:{rel}"
+    return rel or repo
+
+
+def _collect_source_ref(
+    resolved_sources: Sequence[Any],
+    *explicit_sources: Any,
+) -> str:
+    seen: list[str] = []
+    for item in (*explicit_sources, *(resolved_sources or ())):
+        txt = _format_source_entry(item)
+        if txt and txt not in seen:
+            seen.append(txt)
+    joined = "; ".join(seen)
+    ellipsis = "..."
+    if len(joined) > MAX_SOURCE_REF_SUMMARY_LEN:
+        return joined[: MAX_SOURCE_REF_SUMMARY_LEN - len(ellipsis)] + ellipsis
+    return joined
+
+
+def _extract_native_binding_fields(raw_binding: Any) -> tuple[str, str, str]:
+    """Read ``(symbol, backend_token, source_ref)`` strictly from a structured native call."""
+    if raw_binding is None:
+        return "", "", ""
+    if isinstance(raw_binding, Mapping):
+        api = raw_binding.get("api") if isinstance(raw_binding.get("api"), Mapping) else {}
+        sym = (
+            _clean_native_symbol(api.get("aclnn_symbol"))
+            or _clean_native_symbol(api.get("entry"))
+            or _clean_native_symbol(raw_binding.get("aclnn_symbol"))
+            or _clean_native_symbol(raw_binding.get("entry"))
+            or _clean_native_symbol(raw_binding.get("symbol"))
+            or _clean_native_symbol(raw_binding.get("kernel_id"))
+        )
+        if not sym:
+            for item in raw_binding.get("kernels") or ():
+                if isinstance(item, Mapping):
+                    sym = _clean_native_symbol(item.get("name") or item.get("symbol"))
+                    if sym:
+                        break
+        if not sym:
+            for cand in api.get("candidates") or ():
+                sym = _clean_native_symbol(cand)
+                if sym:
+                    break
+        backend = str(api.get("namespace") or raw_binding.get("backend") or "").strip()
+        source = _format_source_entry(raw_binding.get("source"))
+        return sym, backend, source
+    sym = (
+        _clean_native_symbol(getattr(raw_binding, "aclnn_symbol", ""))
+        or _clean_native_symbol(getattr(raw_binding, "entry", ""))
+        or _clean_native_symbol(getattr(raw_binding, "symbol", ""))
+        or _clean_native_symbol(getattr(raw_binding, "kernel_id", ""))
+    )
+    backend = str(getattr(raw_binding, "namespace", "") or getattr(raw_binding, "backend", "") or "").strip()
+    source = _format_source_entry(getattr(raw_binding, "source", None))
+    return sym, backend, source
+
+
+def _resolve_binding_origin(case: Case, op_id: str, family: str, recipe: str) -> str:
+    rt_meta = dict(case.runtime.metadata) if case.runtime.metadata else {}
+    raw_origins = rt_meta.get("recipe_binding_origins")
+    if isinstance(raw_origins, Mapping):
+        origins = {str(k): str(v) for k, v in raw_origins.items()}
+    elif isinstance(raw_origins, (list, tuple)):
+        origins = {
+            str(pair[0]): str(pair[1])
+            for pair in raw_origins
+            if isinstance(pair, (list, tuple)) and len(pair) == MATRIX_2D_RANK
+        }
+    else:
+        return ""
+    suffix = strip_op_prefix(op_id)
+    for key in (op_id, suffix, f"{family}:{recipe}", recipe, family, "stack"):
+        if key and key in origins:
+            return origins[key]
+    return ""
+
+
+def _lookup_probed_abi_entry(
+    symbol: str, arch_family: str, track: str,
+) -> ProbedAbiEntry | None:
+    if not symbol:
+        return None
+    registry = default_abi_registry()
+    candidates = list(registry.lookup(symbol, arch_family, available_only=False))
+    if not candidates and not symbol.startswith("aclnn"):
+        candidates = list(registry.lookup(f"aclnn{symbol}", arch_family, available_only=False))
+    if not candidates:
+        snap = registry.get_snapshot(arch_family)
+        candidates = [e for e in snap.entries if symbol in e.device_kernel_expansion]
+    if not candidates:
+        return None
+    allow_unmerged = track in {"proposed", "target"}
+    for entry in candidates:
+        if entry.available_on_device and entry.vllm_ascend_track == "merged":
+            return entry
+    if allow_unmerged:
+        for entry in candidates:
+            if entry.available_on_device:
+                return entry
+    return candidates[0]
+
+
+def _extract_struct_provenance(
+    op_id: str,
+    spec: OpSpec | None,
+    family: str,
+    recipe: str,
+    shape: Sequence[int],
+    struct_node: Mapping[str, Any] | None,
+) -> tuple[str, str, str, str, str]:
+    """Return ``(symbol, backend, readiness, source_ref, role)`` from structure metadata."""
+    if isinstance(struct_node, Mapping):
+        sym = ""
+        impl = struct_node.get("implementation")
+        if isinstance(impl, Mapping):
+            for kind in impl.get("native_kinds") or ():
+                sym = _clean_native_symbol(kind)
+                if sym:
+                    break
+        if not sym:
+            for cand in struct_node.get("native_candidates") or ():
+                if isinstance(cand, Mapping) and cand.get("selected"):
+                    sym = _clean_native_symbol(cand.get("native"))
+                    if sym:
+                        break
+        return (
+            sym,
+            str(struct_node.get("backend_stack") or "").strip(),
+            str(struct_node.get("readiness") or "").strip().lower(),
+            str(struct_node.get("source_ref") or "").strip(),
+            str(struct_node.get("submodule") or "").strip(),
+        )
+    if not shape:
+        return "", "", "", "", ""
+    op_dict = {
+        "op_id": op_id,
+        "family": family,
+        "recipe": recipe,
+        "local_shape": tuple(int(d) for d in shape),
+        "metadata": dict(spec.metadata) if (spec is not None and spec.metadata) else {},
+    }
+    cert = operator_birth_certificate(op_dict, strict=False)
+    if cert.readiness == "unmodeled":
+        return "", "", "", "", ""
+    sym = _clean_native_symbol(cert.native_kinds[0]) if cert.native_kinds else ""
+    return sym, str(cert.backend_stack or ""), str(cert.readiness or ""), str(cert.source_ref or ""), str(cert.submodule or "")
+
+
+def _project_from_abi_verdict(
+    verdict: AbiSupportVerdict,
+    *,
+    logical_role: str,
+    tensor_contract: str,
+    canonical_op_key: str,
+    binding_origin: str,
+    resolved_sources: Sequence[Any],
+    extra_sources: Sequence[Any],
+) -> AscendKernelDescriptor:
+    admitted = verdict.status in {"admitted_shipping", "admitted_proposed_pr"}
+    is_shipping = verdict.status == "admitted_shipping" and verdict.available_on_device
+    if is_shipping:
+        status, needs_new, new_spec = KERNEL_STATUS_EXISTING, False, ""
+    elif verdict.status == "admitted_proposed_pr":
+        status, needs_new, new_spec = KERNEL_STATUS_FRAMEWORK, False, verdict.proposed_pr_ref
+    else:
+        reason = verdict.rejection_reason or f"abi_rejected:{verdict.abi_id}"
+        status, needs_new, new_spec = f"{KERNEL_STATUS_NEW_OP} ({reason})", True, reason
+    kernel = _clean_native_symbol(verdict.symbol_or_kernel) if admitted else ""
+    backend = _map_canonical_backend(verdict.backend_kind)
+    src = _collect_source_ref(resolved_sources, verdict.vllm_ascend_ref, verdict.source_ref, *extra_sources)
+    return AscendKernelDescriptor(
+        logical_role=logical_role,
+        ascend_kernel=kernel,
+        kernel_backend=backend,
+        kernel_status=status,
+        source_ref=src,
+        tensor_contract=tensor_contract,
+        needs_new_kernel=needs_new,
+        new_kernel_spec=new_spec,
+        canonical_op_key=canonical_op_key,
+        is_shipping_abi=is_shipping,
+        abi_entry_id=verdict.matched_entry_id,
+        binding_origin=binding_origin,
+    )
+
+
 def resolve_ascend_kernel_identity(
     op_id: str,
     spec: OpSpec | None,
@@ -746,10 +1030,131 @@ def resolve_ascend_kernel_identity(
     *,
     native_binding: Mapping[str, Any] | Any | None = None,
 ) -> AscendKernelDescriptor:
-    """Unplugged socket for pure read-only Ascend kernel identity projection."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: heuristic string-sniffing kernel_catalog fabricator deleted; "
-        "project strictly read-only from OpOccurrence.native_binding / "
-        "OpSpec.metadata['native_call'] + ProbedAbiRegistry.verify() + "
-        "StackLoweringPlan.binding_origins (fail-fast on missing provenance)."
+    """Pure read-only projection from KernelBinding / NativeCall / ProbedAbiRegistry / binding_origins."""
+    arch_family = _resolve_arch_family(case)
+    meta = dict(spec.metadata) if (spec is not None and spec.metadata) else {}
+    fam = str(family or "").strip()
+    rec = str(recipe or "").strip()
+    suffix = strip_op_prefix(op_id)
+    rt_meta = dict(case.runtime.metadata) if case.runtime.metadata else {}
+    track = str(rt_meta.get("feature_track") or "shipping").strip().lower()
+    binding_origin = _resolve_binding_origin(case, op_id, fam, rec)
+    contract_txt = _format_tensor_contract(op_id, fam, rec, shape, dtype, meta, case, layer_plan)
+    canon_key = f"{fam or 'op'}:{rec or suffix}"
+
+    kb = getattr(spec, "kernel_binding", None) if spec is not None else None
+    has_birth = isinstance(kb, KernelBinding)
+    birth_sym = _clean_native_symbol(kb.kernel_id) if has_birth else ""
+    birth_backend = str(kb.backend or "").strip() if has_birth else ""
+    if has_birth and birth_backend.lower() in {"", "custom-ops", "custom_ops"} and kb.source_ref is not None:
+        repo_key = str(getattr(kb.source_ref, "repository", "") or "").strip().lower()
+        birth_backend = _SOURCE_REPO_BACKEND_MAP.get(repo_key, birth_backend)
+    birth_readiness = str(kb.readiness or "").strip().lower() if has_birth else ""
+    birth_source = _format_source_entry(kb.source_ref) if has_birth else ""
+    birth_role = str(kb.submodule or "").strip() if has_birth else ""
+
+    nb_obj = (
+        native_binding
+        or meta.get("native_call_binding")
+        or meta.get("native_call")
+        or (struct_node.get("native_call") if isinstance(struct_node, Mapping) else None)
+    )
+    nb_sym, nb_backend, nb_source = _extract_native_binding_fields(nb_obj)
+    meta_impl = meta.get("implementation_binding") if isinstance(meta.get("implementation_binding"), Mapping) else {}
+    meta_api = meta.get("native_api") if isinstance(meta.get("native_api"), Mapping) else {}
+    meta_sym = (
+        (_clean_native_symbol(meta.get("fused_kernel_name")) if bool(meta.get("target_rewrite_fused")) else "")
+        or _clean_native_symbol(meta.get("aclnn_symbol"))
+        or _clean_native_symbol(meta.get("hccl_entry"))
+        or _clean_native_symbol(meta_api.get("aclnn_symbol") or meta_api.get("entry"))
+        or _clean_native_symbol(meta_impl.get("implementation"))
+        or _clean_native_symbol(meta.get("native_kind"))
+    )
+    meta_source = _format_source_entry(meta_impl.get("source") or meta.get("source_reference"))
+    st_sym, st_backend, st_readiness, st_source, st_role = _extract_struct_provenance(
+        op_id, spec, fam, rec, shape, struct_node,
+    )
+    role = birth_role or st_role or (f"{fam}:{rec}" if rec else (fam or suffix))
+
+    verdict = meta.get("abi_verdict")
+    if not isinstance(verdict, AbiSupportVerdict) and isinstance(meta.get("abi_query"), AbiQueryKey):
+        verdict = default_abi_registry().verify(meta["abi_query"])
+    if isinstance(verdict, AbiSupportVerdict):
+        return _project_from_abi_verdict(
+            verdict,
+            logical_role=role,
+            tensor_contract=contract_txt,
+            canonical_op_key=canon_key,
+            binding_origin=binding_origin,
+            resolved_sources=resolved_sources,
+            extra_sources=(birth_source, nb_source, meta_source, st_source),
+        )
+
+    is_target_fused = bool(meta.get("target_rewrite_fused"))
+    declared_sym = birth_sym or nb_sym or meta_sym or st_sym
+    abi_entry = (
+        None
+        if (is_target_fused or (has_birth and birth_readiness in {"synthesized_target", "tiler_extension"}))
+        else _lookup_probed_abi_entry(declared_sym, arch_family, track)
+    )
+
+    is_shipping_abi = False
+    abi_entry_id = ""
+    abi_source = ""
+    new_spec = ""
+    status = KERNEL_STATUS_EXISTING
+    needs_new = False
+    kernel = declared_sym
+    backend_raw = birth_backend or nb_backend or str(meta_api.get("namespace") or "") or st_backend
+
+    if abi_entry is not None:
+        abi_entry_id = abi_entry.entry_id
+        abi_source = abi_entry.vllm_ascend_ref or _format_source_entry(abi_entry.source_ref)
+        if abi_entry.available_on_device:
+            kernel = _clean_native_symbol(abi_entry.symbol_or_kernel) or declared_sym
+            backend_raw = abi_entry.backend_kind
+            is_shipping_abi = abi_entry.vllm_ascend_track == "merged"
+            if not is_shipping_abi:
+                status = KERNEL_STATUS_FRAMEWORK
+        else:
+            kernel = ""
+            backend_raw = abi_entry.backend_kind
+            needs_new = True
+            new_spec = abi_entry.probe_domain_note or f"unavailable_on_{arch_family}:{abi_entry.abi_id}"
+            status = f"{KERNEL_STATUS_NEW_OP} ({new_spec})"
+    elif has_birth and birth_readiness in _BIRTH_READINESS_MAP:
+        status, needs_new = _BIRTH_READINESS_MAP[birth_readiness]
+    elif st_readiness in STRUCTURE_READINESS_MAP:
+        status, needs_new = STRUCTURE_READINESS_MAP[st_readiness]
+
+    if is_target_fused:
+        is_shipping_abi = False
+        needs_new = True
+        status = KERNEL_STATUS_NEW_OP
+        new_spec = new_spec or str(meta.get("fusion_reason") or meta.get("fused_kernel_name") or "").strip()
+
+    if isinstance(subgraph_info, Mapping):
+        f_status = str(subgraph_info.get("fusion_status") or "").strip().lower()
+        if f_status == "fused_new_kernel_required" and not needs_new:
+            reason = str(subgraph_info.get("reason") or "").strip()
+            needs_new = True
+            is_shipping_abi = False
+            new_spec = new_spec or reason
+            status = f"{KERNEL_STATUS_NEW_OP} {reason}".strip()
+        elif f_status == "fused_framework_enable" and status == KERNEL_STATUS_EXISTING:
+            status = KERNEL_STATUS_FRAMEWORK
+
+    return AscendKernelDescriptor(
+        logical_role=role,
+        ascend_kernel=kernel,
+        kernel_backend=_map_canonical_backend(backend_raw, family=fam),
+        kernel_status=status,
+        source_ref=_collect_source_ref(resolved_sources, birth_source, abi_source, nb_source, meta_source, st_source),
+        tensor_contract=contract_txt,
+        needs_new_kernel=needs_new,
+        new_kernel_spec=new_spec,
+        canonical_op_key=canon_key,
+        is_shipping_abi=is_shipping_abi,
+        abi_entry_id=abi_entry_id,
+        binding_origin=binding_origin,
     )

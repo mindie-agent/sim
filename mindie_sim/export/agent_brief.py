@@ -483,6 +483,8 @@ def build_agent_brief(
         "kpis_before_vs_after": {
             "before": b_kpi, "after": a_kpi,
             "saved_step_ms": float(b_kpi["step_ms"] - a_kpi["step_ms"]),
+            "saved_step_ns": int(plan.waterfall.before_step_ns - plan.waterfall.after_step_ns),
+            "reconciliation_error_ns": int(plan.waterfall.reconciliation_error_ns),
             "saved_us_per_tok_die": float(b_kpi["us_per_tok_die"] - a_kpi["us_per_tok_die"]),
             "speedup": speedup,
             "sheet4_cards_total_gain_ms": float(sum(x.expected_gain_ms for x in pending)),
@@ -610,7 +612,7 @@ def format_executive_digest_markdown(brief: Mapping[str, Any]) -> str:
     bef_track = format_track_label(bef.get("track_label") or "shipping")
     aft_track = format_track_label(aft.get("track_label") or ("target" if is_modeling else "shipping"))
     aft_col = f"After [{aft_track} · 卡SLA目标建模终态]" if is_modeling else f"After [{aft_track}]"
-    bind_badge = format_binding_badge(str(aft.get("binding_state") or ""))
+    bind_badge = format_binding_badge(str(aft.get("binding_state") or BINDING_STATE_BOUND))
     sla_target = aft.get("sla_target_ms")
     sla_cell = (
         f"SLA <= {sla_target} ms ({aft.get('sla_regime')})"

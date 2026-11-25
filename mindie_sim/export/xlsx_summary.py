@@ -22,7 +22,7 @@ from typing import Any
 from .comparison import format_parallelism_codomain_summary
 from .models import (
     BINDING_STATE_BOUND, GIB_BYTES, MACRO_L1_HIERARCHY, MIN_DENOM_EPS, MODE_MODELING,
-    OVERLAP_EXPOSED_EPS_US, TRACK_CONFIG_ENV, TRACK_FRAMEWORK, US_PER_MS,
+    NS_PER_MS, OVERLAP_EXPOSED_EPS_US, TRACK_CONFIG_ENV, TRACK_FRAMEWORK, US_PER_MS,
     ActionRoadmapRow, ExportBundle, MacroModuleRow, format_binding_badge,
 )
 from .public_view import format_track_label
@@ -246,7 +246,7 @@ def _populate_summary_deployment_block(
     rows = (
         (SUM_ROW_MODEL, "模型与总层数 (Model & Total Layers)", ref.model_name, None, STYLE_MERGED, layers_txt, "总卡数 (Total Dies)", mem.total_dies, None, STYLE_INT, dies_detail),
         (SUM_ROW_HW, "硬件 SKU & 拓扑 (Hardware / Topology)", ref.hardware_sku, None, STYLE_TEXT, f"{topo_txt} | {ref.hardware_die_summary}", "并行切分策略 (Full Parallelism)", par_short, None, STYLE_MERGED, par_detail),
-        (SUM_ROW_MODE, "部署形态 (Deployment Mode)", ref.deployment_mode or "Unspecified", None, STYLE_MERGED, f"Phase={ref.phase.upper()} | Capture={ref.graph_capture_mode} | {mode_tag} {format_binding_badge(ref.binding_state)} | {track_txt}", "单 DP 活跃并发 (Active Concurrency / DP)", mem.concurrency, None, STYLE_INPUT_NUM, f"Active requests per DP replica (DP={mem.dp})"),
+        (SUM_ROW_MODE, "部署形态 (Deployment Mode)", ref.deployment_mode or "Unspecified", None, STYLE_MERGED, f"Phase={ref.phase.upper()} | Capture={ref.graph_capture_mode} | {mode_tag} {format_binding_badge(ref.binding_state or BINDING_STATE_BOUND)} | {track_txt}", "单 DP 活跃并发 (Active Concurrency / DP)", mem.concurrency, None, STYLE_INPUT_NUM, f"Active requests per DP replica (DP={mem.dp})"),
         (SUM_ROW_LEN, "业务输入/输出长度 (Prompt / Output)", f"{ref.prompt_tokens} / {ref.output_tokens}", None, STYLE_TEXT, f"Context={ref.context_tokens} tok, Output={ref.output_tokens} tok, SeqLen={mem.seq_len}", "集群总并发 (Cluster Total Concurrency)", eff_cc, cc_formula, STYLE_KPI_HIGHLIGHT, f"= 单 DP 活跃并发 × DP ({mem.dp})"),
         (SUM_ROW_SLA, "SLA 约束 (SLA Target ms)", sla_val, None, sla_style, sla_detail, "单卡 HBM 权重占用 (NPU Weight / Die GiB)", weight_gib, None, STYLE_FLOAT2, weight_detail),
         (SUM_ROW_SPEC, "投机解码策略 (Avg Accepted tok/step)", ref.avg_accepted_tokens, None, STYLE_FLOAT2, spec_detail, "单卡最大可承载并发 (Max HBM Concurrency / DP)", mem.max_hbm_concurrency_per_dp, None, STYLE_INT, f"Usable HBM={mem.usable_hbm_bytes / float(GIB_BYTES):.1f} GiB | Fit={'PASS' if mem.fits_hbm else 'OOM'} | Cache={mem.cache_dtype}"),
@@ -285,22 +285,31 @@ def _pd_cluster_tps_cells(bundle: ExportBundle, col: str) -> tuple[float, str | 
 
 _STAGE_WF_SHORT_LABELS: dict[str, str] = {
     "before": "Before",
+    "before_merged": "Before",
     "config_only": "[1]配置",
+    "stage1_ops_config": "[1]配置",
     "framework_rewrite": "[2]框架",
+    "stage2_unmerged_pr": "[2]框架",
     "after": "[3]算子/After",
+    "stage3_target_after": "[3]算子/After",
 }
 
 
 def _format_stage_waterfall_note(stage_waterfall: Sequence[Mapping[str, Any]]) -> str:
-    """Format anchored 4-stage waterfall spans in ms without altering row layout."""
+    """Format canonical 4-stage integer-ns waterfall spans in ms without altering row layout."""
     parts: list[str] = []
     for item in stage_waterfall:
         if not isinstance(item, Mapping):
             continue
-        stage = str(item.get("stage") or "").strip()
+        stage = str(item.get("stage_id") or item.get("stage") or "").strip()
         if stage not in _STAGE_WF_SHORT_LABELS:
             continue
-        span_ms = float(item.get("step_span_us", 0.0) or 0.0) / US_PER_MS
+        if item.get("span_ns") is not None:
+            span_ms = float(int(item["span_ns"])) / float(NS_PER_MS)
+        elif item.get("span_ms") is not None:
+            span_ms = float(item["span_ms"])
+        else:
+            span_ms = float(item.get("step_span_us", 0.0) or 0.0) / US_PER_MS
         parts.append(f"{_STAGE_WF_SHORT_LABELS[stage]} {span_ms:.3f}")
     return f"4-Stage: {' -> '.join(parts)} ms" if len(parts) >= 2 else ""
 
@@ -330,7 +339,16 @@ def _populate_summary_kpi_block(
     ))
     ws.merge_range(SUM_B2_HDR_ROW, SUM_KPI_NOTE_START_COL, SUM_B2_HDR_ROW, SUMMARY_COLS)
 
-    b_step, a_step = bundle.step_span_us / US_PER_MS, after.step_span_us / US_PER_MS
+    b_step = (
+        float(bundle.step_span_ns) / float(NS_PER_MS)
+        if int(getattr(bundle, "step_span_ns", 0) or 0) > 0
+        else bundle.step_span_us / US_PER_MS
+    )
+    a_step = (
+        float(after.step_span_ns) / float(NS_PER_MS)
+        if int(getattr(after, "step_span_ns", 0) or 0) > 0
+        else after.step_span_us / US_PER_MS
+    )
     b_acc, acc = max(1.0, bundle.avg_accepted_tokens), max(1.0, after.avg_accepted_tokens)
     b_hf = float(getattr(bundle, "handoff_tpot_ms", 0.0) or 0.0) if is_decode else 0.0
     a_hf = float(getattr(after, "handoff_tpot_ms", 0.0) or 0.0) if is_decode else 0.0

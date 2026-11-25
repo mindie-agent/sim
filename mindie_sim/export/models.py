@@ -31,6 +31,8 @@ MAX_OBSERVATION_JSON_BYTES = 50 * MIB_BYTES
 #: Microseconds per millisecond, nanoseconds per microsecond, microseconds per second.
 US_PER_MS = 1000.0
 NS_PER_US = 1000.0
+NS_PER_US_INT = 1_000
+NS_PER_MS = 1_000_000
 US_PER_SECOND = 1_000_000.0
 #: Positive denominator floors.
 MIN_POSITIVE_SECONDS = 1e-12
@@ -270,6 +272,20 @@ DEPLOYMENT_MODE_LABELS: dict[str, str] = {
     "pd_pooled": "PD 分离 [池化]",
 }
 
+#: Internal pre-W5a merge bridge for untouched W5a memory_ledger/xlsx_memory; not exported in export/__init__.py.
+WEIGHT_QUANT_FORMATS: dict[str, dict[str, float | int]] = {
+    "BF16": {"bytes": 2.0, "group": 0, "scale": 0, "aux": 0},
+    "FP32": {"bytes": 4.0, "group": 0, "scale": 0, "aux": 0},
+    "FP8": {"bytes": 1.0, "group": 0, "scale": 0, "aux": 0},
+    "W8A8": {"bytes": 1.0, "group": 0, "scale": 0, "aux": INT8_CHANNEL_AUX_BYTES},
+    "W4A8": {"bytes": 0.5, "group": 0, "scale": 0, "aux": INT4_CHANNEL_AUX_BYTES},
+    "W4A16": {"bytes": 0.5, "group": MXFP_GROUP_SIZE, "scale": 2 * BF16_BYTES, "aux": 0},
+    "MXFP8": {"bytes": 1.0, "group": MXFP_GROUP_SIZE, "scale": 1, "aux": 0},
+    "MXFP4": {"bytes": 0.5, "group": MXFP_GROUP_SIZE, "scale": 1, "aux": 0},
+    "INT8": {"bytes": 1.0, "group": 0, "scale": 0, "aux": INT8_CHANNEL_AUX_BYTES},
+    "INT4": {"bytes": 0.5, "group": 0, "scale": 0, "aux": INT4_CHANNEL_AUX_BYTES},
+}
+
 SUPPORTED_WEIGHT_QUANTS = ("BF16", "W8A8", "W4A8", "MXFP8", "MXFP4")
 SUPPORTED_CACHE_DTYPES = ("BF16", "C8", "FP8", "MXFP8")
 
@@ -353,6 +369,9 @@ class AscendKernelDescriptor:
     needs_new_kernel: bool
     new_kernel_spec: str
     canonical_op_key: str
+    is_shipping_abi: bool = False
+    abi_entry_id: str = ""
+    binding_origin: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -427,6 +446,9 @@ class OperatorExportRow:
     is_shipping_abi: bool = False
     stream_core_budget: str = ""
     formula_eval: Any = None
+    dur_ns: int = 0
+    exposed_ns: int = 0
+    l_star_ns: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -779,3 +801,27 @@ class ExportBundle:
     per_layer_timings: Mapping[tuple[str, int], Mapping[str, Any]] = field(default_factory=dict)
     co_design_opportunities: tuple[Any, ...] = ()
     stage_waterfall: tuple[dict[str, Any], ...] = ()
+    step_span_ns: int = 0
+    idle_or_wait_ns: int = 0
+    step_l_star_ns: int = 0
+    case_digest: str = ""
+    execution_key_sha256: str = ""
+    engine_step_receipt: Any = None
+    reverted_to_native_baseline: bool = False
+    host_launch_us: float = 0.0
+    graph_launch_us: float = 0.0
+    h2d_startup_us: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class ComparisonRequest:
+    """Role-tagged comparison polarity contract locking Before vs After roles."""
+
+    before_case_digest: str
+    after_case_digest: str
+    before_execution_key: str = ""
+    after_execution_key: str = ""
+    before_plan_sha256: str = ""
+    after_plan_sha256: str = ""
+    comparison_policy: str = "monotonic_optimization"
+    require_model_scope: bool = True

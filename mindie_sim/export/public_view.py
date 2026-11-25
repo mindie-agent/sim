@@ -197,8 +197,11 @@ PUBLIC_BACKENDS = frozenset({
 })
 _KERNEL_BINDING_BACKEND_MAP: Mapping[str, str] = {
     "cann": BACKEND_CANN,
+    "aclnn": BACKEND_CANN,
+    "cann_aclnn": BACKEND_CANN,
     "cann aclnn/ascendc": BACKEND_CANN,
     "ascendc": BACKEND_ASCENDC,
+    "vllm_ascend_csrc": BACKEND_ASCENDC,
     "tilelang": BACKEND_TILELANG,
     "catlass": BACKEND_CATLASS,
     "triton": BACKEND_TRITON,
@@ -208,10 +211,13 @@ _KERNEL_BINDING_BACKEND_MAP: Mapping[str, str] = {
     "hccl / mc2": BACKEND_HCCL_MC2,
     "hccl": BACKEND_HCCL_MC2,
     "mc2": BACKEND_HCCL_MC2,
+    "hccl_mc2": BACKEND_HCCL_MC2,
     "pytorch-npu": BACKEND_TORCH_NPU,
     "torch_npu": BACKEND_TORCH_NPU,
     "torch_npu custom op": BACKEND_TORCH_NPU,
+    "third_party_wheel": BACKEND_TORCH_NPU,
     "host": BACKEND_TORCH_NPU,
+    "view_reshape": BACKEND_CANN,
     "logical": BACKEND_CANN,
 }
 PUBLIC_PIPE_NAMES = frozenset({
@@ -263,11 +269,17 @@ def format_track_label(raw_track: Any, *, lang: str = "zh") -> str:
 
 
 def normalize_public_backend(raw_backend: Any, *, is_gemm: bool = False) -> str:
-    """Unplugged socket: implicit backend coercion and DSL rewriting deleted."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: normalize_public_backend silent coercion and DSL forgery deleted; "
-        "require explicit canonical backend enum or raise ModelingError."
-    )
+    """Validate and map an explicit canonical backend enum token (fail-closed on unknown/legacy)."""
+    del is_gemm
+    if not isinstance(raw_backend, str) or not raw_backend.strip():
+        raise ModelingError(f"invalid_public_backend:{raw_backend!r}")
+    token = raw_backend.strip()
+    if token in PUBLIC_BACKENDS:
+        return token
+    low = token.lower()
+    if low in _KERNEL_BINDING_BACKEND_MAP:
+        return _KERNEL_BINDING_BACKEND_MAP[low]
+    raise ModelingError(f"unknown_public_backend:{raw_backend!r}")
 
 
 def sanitize_public_text(val: Any) -> str:
@@ -919,6 +931,10 @@ def _project_kpis_block(raw: Any) -> dict[str, Any]:
         fval = _coerce_finite_float(raw.get(key))
         if fval is not None:
             out[key] = fval
+    for int_key in ("saved_step_ns", "reconciliation_error_ns"):
+        ival = _coerce_strict_int(raw.get(int_key))
+        if ival is not None:
+            out[int_key] = ival
     if isinstance(raw.get("waterfall"), Mapping):
         wf_keys = (
             "config_saved_ms", "new_kernel_saved_ms", "tune_kernel_saved_ms",

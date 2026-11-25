@@ -29,6 +29,8 @@ from .agent_brief import build_agent_brief, export_agent_brief
 from .bundle import build_export_bundle, compose_export_case
 from .comparison import (
     align_before_after_operators,
+    assert_comparison_polarity,
+    build_default_comparison_request,
     build_macro_module_breakdown,
 )
 from .models import (
@@ -36,6 +38,7 @@ from .models import (
     DEFAULT_SCENARIO_PROMPT_TOKENS,
     PENDING_KIND_TO_IMPLEMENT,
     AlignedComparisonRow,
+    ComparisonRequest,
     ExportBundle,
 )
 from .ooxml import NS_MAIN as NS_MAIN, Workbook
@@ -110,7 +113,7 @@ class XlsxExportSummary:
 def _resolve_xlsx_bundles(
     before_bundle: ExportBundle | CaseInput | None,
     after_bundle: ExportBundle | CaseInput | None,
-    comparison_request: Any = None,
+    comparison_request: ComparisonRequest | None = None,
     *,
     request: StepRequest | None, step_eval: StepEvaluation | None, replay: ReplayOptions,
     observations_path: str | Path | None, weight_quant: str | None,
@@ -122,11 +125,71 @@ def _resolve_xlsx_bundles(
     mtp_proposal_tokens: int, mtp_acceptance_length: float,
     before_track: str | None, after_track: str | None,
 ) -> tuple[ExportBundle, ExportBundle | None]:
-    """Unplugged socket: explicit (before_bundle, after_bundle, comparison_request) polarity."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: compare_source polarity trap and auto-compose 'merged' fallback deleted; "
-        "wire explicit (before_bundle, after_bundle, comparison_request) + 3-arg assert_comparison_polarity."
-    )
+    """Resolve explicit Before/After bundles and enforce 3-arg comparison polarity lock."""
+    build_kw: dict[str, Any] = {
+        "replay": replay,
+        "weight_quant": weight_quant,
+        "cache_dtype": cache_dtype,
+        "engram_host_offload": engram_host_offload,
+        "include_vision_tower": include_vision_tower,
+        "apply_preset_to_ignored": apply_preset_to_ignored,
+    }
+    if before_bundle is None:
+        if not model or not hardware:
+            raise ModelingError("export_comparison_xlsx_requires_before_bundle_or_model_hardware")
+        b_track = str(before_track or "shipping").strip().lower()
+        raw_bef, req_bef = compose_export_case(
+            model, hardware, topology_preset=topology_preset,
+            dp=dp, tp=tp, dcp=dcp, ep=ep, pp=pp, pcp=pcp,
+            prompt_tokens=prompt_tokens, output_tokens=output_tokens, concurrency=concurrency,
+            mtp_proposal_tokens=mtp_proposal_tokens, mtp_acceptance_length=mtp_acceptance_length,
+            feature_track=b_track,
+        )
+        eff_req = request if request is not None else req_bef
+        resolved_before = build_export_bundle(
+            raw_bef, request=eff_req, step_eval=step_eval,
+            observations_path=observations_path, **build_kw,
+        )
+        resolved_after: ExportBundle | None = None
+        if after_bundle is not None:
+            resolved_after = (
+                after_bundle if isinstance(after_bundle, ExportBundle)
+                else build_export_bundle(after_bundle, request=eff_req, **build_kw)
+            )
+        elif after_track is not None:
+            raw_aft, req_aft = compose_export_case(
+                model, hardware, topology_preset=topology_preset,
+                dp=dp, tp=tp, dcp=dcp, ep=ep, pp=pp, pcp=pcp,
+                prompt_tokens=prompt_tokens, output_tokens=output_tokens, concurrency=concurrency,
+                mtp_proposal_tokens=mtp_proposal_tokens, mtp_acceptance_length=mtp_acceptance_length,
+                feature_track=str(after_track).strip().lower(),
+            )
+            resolved_after = build_export_bundle(
+                raw_aft, request=(request if request is not None else req_aft), **build_kw,
+            )
+    else:
+        resolved_before = (
+            before_bundle if isinstance(before_bundle, ExportBundle)
+            else build_export_bundle(
+                before_bundle, request=request, step_eval=step_eval,
+                observations_path=observations_path, **build_kw,
+            )
+        )
+        resolved_after = None
+        if after_bundle is not None:
+            resolved_after = (
+                after_bundle if isinstance(after_bundle, ExportBundle)
+                else build_export_bundle(after_bundle, request=request, **build_kw)
+            )
+
+    if resolved_after is not None:
+        eff_cmp_req = (
+            comparison_request
+            if comparison_request is not None
+            else build_default_comparison_request(resolved_before, resolved_after)
+        )
+        assert_comparison_polarity(resolved_before, resolved_after, eff_cmp_req)
+    return resolved_before, resolved_after
 
 
 def _populate_workbook_sheets(
@@ -155,7 +218,7 @@ def _populate_workbook_sheets(
         ws_breakdown.validate_max_column(CMP_COLS)
     else:
         s2_receipt = populate_standalone_breakdown_sheet(ws_breakdown, bundle)
-        ws_breakdown.validate_max_column(STD_COLS)
+        ws_breakdown.validate_max_column(CMP_COLS)
     populate_memory_sheet(ws_memory, compare_bundle or bundle)
     ws_memory.validate_max_column(MEMORY_COLS)
     sheet_names = [SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY]
@@ -310,6 +373,7 @@ def export_comparison_xlsx(
 
 
 __all__ = [
+    "ComparisonRequest",
     "NS_MAIN",
     "SHEET_BREAKDOWN",
     "SHEET_MEASURED",
@@ -318,5 +382,6 @@ __all__ = [
     "SHEET_SUMMARY",
     "XLSX_EXPORT_RECEIPT_SCHEMA",
     "XlsxExportSummary",
+    "assert_comparison_polarity",
     "export_comparison_xlsx",
 ]

@@ -22,6 +22,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, fields as dataclass_fields, replace
 from fractions import Fraction
 import hashlib
+import json
 from pathlib import Path
 import re
 from typing import Any
@@ -33,10 +34,15 @@ from mindie_sim.optimization.causal_tail import (
     resolve_arch_family_tag,
     resolve_barrier_predecessors,
 )
+from mindie_sim.optimization.codesign import (
+    collect_codesign_opportunities,
+    evaluate_macro_wall_trigger,
+)
 from mindie_sim.optimization.dual_bound import (
     NS_PER_SECOND,
     inward_floor_ns,
 )
+from mindie_sim.optimization.ladder import solve_target_step_receipt
 from mindie_sim.prediction.body_defaults import consume_target_declaration
 from mindie_sim.prediction.efficiency import extract_hardware_peaks
 from mindie_sim.prediction.efficiency.capacity_window import _resolve_speculative_tokens
@@ -50,9 +56,11 @@ from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operator_analysis import cohort_sequence_counts
 from mindie_sim.prediction.results import (
     CaseInput,
+    EngineStepReceipt,
     FusedPipelineDescriptor,
     OpOccurrence,
     ReplayOptions,
+    StageReceipt,
     StepEvaluation,
     StepRequest,
 )
@@ -64,10 +72,14 @@ from mindie_sim.prediction.runtime.exposed_observer import (
 from mindie_sim.prediction.results import LoweringRequest
 from mindie_sim.prediction.spine import default_spine
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.primitives.loader import _table_band_p50
+from mindie_sim.rewrite.schema import load_rewrite_plan
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import datapath_for_die
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.scenario import ReadyStateAssumption, validate_deployment_mode
+from mindie_sim.schema.stack import STACK_TRACKS
 
 from .kernel_catalog import (
     classify_stream_index,
@@ -107,6 +119,7 @@ from .models import (
     MIN_POSITIVE_SECONDS,
     MODE_MODELING,
     MODE_SIMULATION,
+    NS_PER_MS,
     NS_PER_US,
     OVERLAP_EXPOSED_EPS_US,
     TB_BYTES,
@@ -155,6 +168,30 @@ def resolve_hardware_alias(
     return sku, (topology_preset if topology_preset is not None else (alias_preset or None))
 
 
+_CERT_RESOURCE_NAMES: tuple[str, ...] = (
+    "cube", "vector", "hbm_read", "hbm_write", "link",
+)
+_VALID_EXPORT_PHASES = frozenset({"decode", "prefill"})
+
+
+def _compose_case_track_kwarg(canonical_track: str) -> dict[str, Any]:
+    """Pass canonical StackTrack to ``compose_case`` (bridging pre-W2a TRACK_ALIASES if needed)."""
+    from mindie_sim import feature_mechanisms as fm_mod
+
+    aliases = getattr(fm_mod, "TRACK_ALIASES", None)
+    if not isinstance(aliases, Mapping) or canonical_track in aliases:
+        return {"feature_track": canonical_track}
+    if canonical_track == "shipping":
+        return {}
+    if canonical_track == "target" and "ideal" in aliases:
+        return {"feature_track": "ideal"}
+    if canonical_track == "proposed":
+        for key, val in aliases.items():
+            if str(val).startswith("unmerged"):
+                return {"feature_track": key}
+    return {"feature_track": canonical_track}
+
+
 def compose_export_case(
     model: str,
     hardware: str,
@@ -180,13 +217,113 @@ def compose_export_case(
     engram_cpu_offload: bool | None = None,
     deployment_mode: str | None = None,
     runtime_stack: str | Path | Mapping[str, Any] | None = None,
+    phase: str | None = None,
+    ready_state_source: str = "pre_populated_hbm",
 ) -> tuple[dict[str, Any], StepRequest]:
-    """Unplugged socket for 4-mode validated scenario composition."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: compose_export_case silent 'auto'/decode StepRequest fabrication "
-        "and 50ms TPOT default deleted; validate all 4 deployment modes via "
-        "schema.scenario.validate_deployment_mode + ReadyStateAssumption and require explicit phase/request."
+    """Compose a 4-mode validated scenario returning ``(case_dict, StepRequest)``."""
+    from mindie_sim.compose import compose_case
+
+    canonical_track = str(feature_track or "").strip().lower()
+    if canonical_track not in STACK_TRACKS:
+        raise ModelingError(
+            f"invalid_stack_track:{feature_track!r}:expected one of {sorted(STACK_TRACKS)}"
+        )
+
+    validated_mode: str | None = None
+    if deployment_mode is not None:
+        validated_mode = validate_deployment_mode(deployment_mode)
+    req_phase = str(phase or "").strip().lower()
+    if req_phase and req_phase not in _VALID_EXPORT_PHASES:
+        raise ModelingError(f"invalid_export_phase:{phase!r}")
+
+    if validated_mode == "pd_decode":
+        if ttft_slo_ms is not None:
+            raise ModelingError("pd_decode_forbids_ttft_slo_ms")
+        if req_phase == "prefill":
+            raise ModelingError("pd_decode_forbids_prefill_phase")
+        eff_phase = "decode"
+    elif validated_mode == "pd_prefill":
+        if tpot_slo_ms is not None:
+            raise ModelingError("pd_prefill_forbids_tpot_slo_ms")
+        if req_phase == "decode":
+            raise ModelingError("pd_prefill_forbids_decode_phase")
+        eff_phase = "prefill"
+    else:
+        eff_phase = req_phase or "decode"
+
+    sku, resolved_preset = resolve_hardware_alias(hardware, topology_preset)
+    spec_toks = max(0, int(mtp_proposal_tokens))
+    conc = max(1, int(concurrency))
+    p_tok = max(1, int(prompt_tokens))
+    o_tok = max(1, int(output_tokens))
+    min_batched = max(
+        p_tok * conc if eff_phase == "prefill" else conc * (1 + spec_toks),
+        DEFAULT_MIN_BATCHED_TOKENS,
     )
+    model_len = max(p_tok + o_tok + DEFAULT_MODEL_LEN_HEADROOM, DEFAULT_MIN_MODEL_LEN)
+    compose_kw: dict[str, Any] = {
+        "tp": max(1, int(tp)),
+        "dp": max(1, int(dp)),
+        "ep": max(1, int(ep)),
+        "pp": max(1, int(pp)),
+        "dcp": max(1, int(dcp)),
+        "pcp": max(1, int(pcp)),
+        "prompt_tokens": p_tok,
+        "output_tokens": o_tok,
+        "concurrency": conc,
+        "max_num_seqs": max(conc, 1),
+        "max_num_batched_tokens": min_batched,
+        "max_model_len": model_len,
+        "mtp_proposal_tokens": spec_toks,
+        "mtp_acceptance_length": float(mtp_acceptance_length),
+        "_stack_phase": eff_phase,
+        **_compose_case_track_kwarg(canonical_track),
+    }
+    if tpot_slo_ms is not None:
+        compose_kw["tpot_slo_ms"] = float(tpot_slo_ms)
+    if ttft_slo_ms is not None:
+        compose_kw["ttft_slo_ms"] = float(ttft_slo_ms)
+    if resolved_preset:
+        compose_kw["topology_preset"] = resolved_preset
+    if runtime_stack is not None:
+        compose_kw["runtime_stack"] = runtime_stack
+    if quant is not None:
+        compose_kw["quant"] = quant
+    if kv_cache_dtype is not None:
+        compose_kw["kv_cache_dtype"] = kv_cache_dtype
+    if indexer_kv_dtype is not None:
+        compose_kw["indexer_kv_dtype"] = indexer_kv_dtype
+    if engram_cpu_offload is not None:
+        compose_kw["engram_cpu_offload"] = bool(engram_cpu_offload)
+    if validated_mode is not None:
+        compose_kw["deployment_mode"] = validated_mode
+
+    case_dict = compose_case(model=model, hardware=sku, **compose_kw)
+    rt_meta = case_dict.setdefault("runtime", {}).setdefault("metadata", {})
+    rt_meta["feature_track"] = canonical_track
+    if isinstance(rt_meta.get("feature_track_report"), dict):
+        rt_meta["feature_track_report"]["feature_track"] = canonical_track
+    if validated_mode is not None:
+        rt_meta["deployment_mode"] = validated_mode
+    if validated_mode == "pd_decode":
+        ready = ReadyStateAssumption(
+            source=ready_state_source,  # type: ignore[arg-type]
+            context_tokens=p_tok,
+            layout="paged_kv",
+        )
+        rt_meta["ready_state_assumption"] = {
+            "source": ready.source,
+            "context_tokens": ready.context_tokens,
+            "layout": ready.layout,
+        }
+
+    if eff_phase == "prefill":
+        step_req = StepRequest(phase="prefill", tokens=p_tok, context=0, sequences=conc, scope="model")
+    else:
+        step_req = StepRequest(
+            phase="decode", tokens=1 + spec_toks, context=p_tok, sequences=conc, scope="model",
+        )
+    return case_dict, step_req
 
 
 DEPTH_VARY_REL_THRESHOLD = 0.01
@@ -350,7 +487,6 @@ def _op_lean_resource_demands_ns(
 ) -> tuple[tuple[int, int, int, int, int], float]:
     default_dt = str(peaks.get("default_dtype") or "").strip()
     die = peaks["die"]
-    cube_rate = _die_cube_peak_rate(die, dtype, default_dt)
     vec_rate = float(peaks["vector_peak_ops_per_s"] or 0.0)
     hbm_r_rate = float(peaks["hbm_read_bytes_per_s"] or 0.0)
     hbm_w_rate = float(peaks["hbm_write_bytes_per_s"] or 0.0)
@@ -366,6 +502,7 @@ def _op_lean_resource_demands_ns(
     if valid_pairs:
         cube_frac = Fraction(0)
         total_mf = 0.0
+        cube_rate = 0.0
         for dt, mf in valid_pairs:
             rate = _die_cube_peak_rate(die, dt, default_dt)
             if rate > 0.0:
@@ -374,8 +511,14 @@ def _op_lean_resource_demands_ns(
         cube_ns = inward_floor_ns(cube_frac) if cube_frac > 0 else 0
         if total_mf > 0.0 and cube_frac > 0:
             cube_rate = float(Fraction(total_mf) * NS_PER_SECOND / cube_frac)
-    else:
+        elif default_dt:
+            cube_rate = _die_cube_peak_rate(die, default_dt, "")
+    elif flops > 0.0:
+        cube_rate = _die_cube_peak_rate(die, dtype, default_dt)
         cube_ns = _demand_ns(flops, cube_rate)
+    else:
+        cube_rate = _die_cube_peak_rate(die, default_dt, "") if default_dt else 0.0
+        cube_ns = 0
 
     return (
         cube_ns,
@@ -439,12 +582,70 @@ def _hbm_read_write_l2(spec: OpSpec | None) -> tuple[float, float, float, float,
 def _certify_step_lower_bound(
     op_rows: Sequence[OperatorExportRow],
     per_op_demands_ns: Sequence[tuple[int, int, int, int, int]],
-) -> tuple[float, bool, tuple[str, ...]]:
-    """Unplugged socket: certify ONLY the unfolded executable step graph."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: folded display-graph certificate construction deleted (Astra P0); "
-        "certify strictly on the unfolded executable step graph via canonical EngineStepReceipt."
-    )
+    *,
+    step_span_ns: int | None = None,
+) -> tuple[int, bool, tuple[str, ...]]:
+    """Certify exact integer-ns physical lower bound ``L*`` strictly on an unfolded DAG."""
+    if not op_rows or not per_op_demands_ns:
+        return 0, True, ()
+    if len(op_rows) != len(per_op_demands_ns):
+        raise ModelingError(
+            f"certify_row_demand_length_mismatch:{len(op_rows)}!={len(per_op_demands_ns)}"
+        )
+    if any(int(row.repeat_count) != 1 for row in op_rows):
+        raise ModelingError(
+            "cannot_certify_folded_display_graph: step lower bound must be certified on unfolded rows"
+        )
+    res_sums = [0] * CERT_RESOURCE_COUNT
+    op_min_by_occ: dict[OpOccurrence, int] = {}
+    preds_by_occ: dict[OpOccurrence, tuple[OpOccurrence, ...]] = {}
+    for row, dem in zip(op_rows, per_op_demands_ns):
+        for idx in range(CERT_RESOURCE_COUNT):
+            res_sums[idx] += int(dem[idx])
+        op_min_by_occ[row.occurrence] = max(0, int(max(dem)))
+        preds_by_occ[row.occurrence] = row.predecessors
+
+    cp_cache: dict[OpOccurrence, int] = {}
+    visiting: set[OpOccurrence] = set()
+    for occ in op_min_by_occ:
+        if occ in cp_cache:
+            continue
+        stack: list[tuple[OpOccurrence, bool]] = [(occ, False)]
+        while stack:
+            node, expanded = stack.pop()
+            if node in cp_cache:
+                continue
+            if expanded:
+                visiting.discard(node)
+                best_pred = max((cp_cache[p] for p in preds_by_occ.get(node, ()) if p in cp_cache), default=0)
+                cp_cache[node] = op_min_by_occ[node] + best_pred
+                continue
+            if node in visiting:
+                cp_cache[node] = op_min_by_occ[node]
+                continue
+            visiting.add(node)
+            stack.append((node, True))
+            for pred in preds_by_occ.get(node, ()):
+                if pred in op_min_by_occ and pred not in cp_cache:
+                    stack.append((pred, False))
+
+    dag_cp_ns = max(cp_cache.values(), default=0)
+    max_res_ns = max(res_sums, default=0)
+    l_star_ns = max(max_res_ns, dag_cp_ns)
+    tight: list[str] = []
+    if l_star_ns > 0:
+        for idx, total in enumerate(res_sums):
+            if total == l_star_ns:
+                tight.append(_CERT_RESOURCE_NAMES[idx])
+        if dag_cp_ns == l_star_ns:
+            tight.append("critical_path")
+    if step_span_ns is not None:
+        cert_valid = l_star_ns <= int(step_span_ns)
+    else:
+        min_s = min(int(round(r.start_us * NS_PER_US)) for r in op_rows)
+        max_e = max(int(round(r.end_us * NS_PER_US)) for r in op_rows)
+        cert_valid = l_star_ns <= max(0, max_e - min_s)
+    return int(l_star_ns), bool(cert_valid), tuple(tight)
 
 
 def _assign_op_archetype(
@@ -524,14 +725,18 @@ def _collapse_micro_split_ops(
         base = out_rows[prev_idx]
         b_dem = out_demands[prev_idx]
         merged_dem = tuple(b_dem[i] + dem[i] for i in range(CERT_RESOURCE_COUNT))
-        new_dur = base.dur_us + row.dur_us
-        new_exposed = base.exposed_dur_us + row.exposed_dur_us
-        new_l_star = float(max(merged_dem)) / NS_PER_US
+        new_dur_ns = int(base.dur_ns) + int(row.dur_ns)
+        new_exposed_ns = int(base.exposed_ns) + int(row.exposed_ns)
+        new_l_star_ns = int(max(merged_dem))
+        new_dur = float(new_dur_ns) / NS_PER_US if new_dur_ns > 0 else (base.dur_us + row.dur_us)
+        new_exposed = float(new_exposed_ns) / NS_PER_US if new_exposed_ns > 0 else (base.exposed_dur_us + row.exposed_dur_us)
+        new_l_star = float(new_l_star_ns) / NS_PER_US
         out_rows[prev_idx] = replace(
             base,
             start_us=min(base.start_us, row.start_us), end_us=max(base.end_us, row.end_us),
             dur_us=new_dur, exposed_dur_us=new_exposed,
-            is_overlapped=(new_exposed <= OVERLAP_EXPOSED_EPS_US and new_dur > 0.0),
+            dur_ns=new_dur_ns, exposed_ns=new_exposed_ns, l_star_ns=new_l_star_ns,
+            is_overlapped=(new_exposed_ns == 0 and new_dur_ns > 0),
             flops=base.flops + row.flops, vector_ops=base.vector_ops + row.vector_ops,
             hbm_read_bytes=base.hbm_read_bytes + row.hbm_read_bytes,
             hbm_write_bytes=base.hbm_write_bytes + row.hbm_write_bytes,
@@ -549,10 +754,10 @@ def _collapse_micro_split_ops(
             if group_is_recover.get(key, False):
                 inv = 1.0 / float(cnt)
                 per_call_dem = tuple(int(out_demands[pos][k]) // cnt for k in range(CERT_RESOURCE_COUNT))
-                per_call_dur = row_cur.dur_us * inv
-                per_call_exp = row_cur.exposed_dur_us * inv
-                per_call_lstar = float(max(per_call_dem)) / NS_PER_US
-                fully_hidden = per_call_exp <= OVERLAP_EXPOSED_EPS_US and per_call_dur > 0.0
+                per_call_dur = float(row_cur.dur_ns) / (float(cnt) * NS_PER_US) if row_cur.dur_ns > 0 else row_cur.dur_us * inv
+                per_call_exp = float(row_cur.exposed_ns) / (float(cnt) * NS_PER_US) if row_cur.exposed_ns > 0 else row_cur.exposed_dur_us * inv
+                per_call_lstar = float(row_cur.l_star_ns) / (float(cnt) * NS_PER_US) if row_cur.l_star_ns > 0 else float(max(per_call_dem)) / NS_PER_US
+                fully_hidden = int(row_cur.exposed_ns) == 0 and int(row_cur.dur_ns) > 0
                 eff = (
                     min(1.0, per_call_lstar / per_call_dur)
                     if (per_call_dur > 0.0 and per_call_lstar > 0.0) else None
@@ -975,10 +1180,10 @@ def _filter_barriers_and_rewire_preds(
 def _attribute_full_bundle_stream0(
     rows: Sequence[OperatorExportRow],
     archetypes: Sequence[LayerArchetypeSpec],
-) -> tuple[list[OperatorExportRow], tuple[LayerArchetypeSpec, ...]]:
+) -> tuple[list[OperatorExportRow], tuple[LayerArchetypeSpec, ...], int, int]:
     """Run conserved integer-ns ``ExposedObserver`` attribution over full-depth native rows."""
     if not rows:
-        return [], tuple(archetypes)
+        return [], tuple(archetypes), 0, 0
     occ_to_id = {r.occurrence: str(i) for i, r in enumerate(rows)}
     intervals: list[ObservedInterval] = []
     preds: dict[str, tuple[str, ...]] = {}
@@ -998,31 +1203,43 @@ def _attribute_full_bundle_stream0(
         ))
         preds[oid] = tuple(occ_to_id[p] for p in row.predecessors if p in occ_to_id)
     start_i = min_ns if min_ns is not None else 0
+    step_span_ns = max(0, max_ns - start_i)
     res = attribute_stream0_intervals(intervals, start_ns=start_i, terminal_ns=max_ns, causal_preds=preds)
-    spans: dict[str, float] = defaultdict(float)
+    spans_ns: dict[str, int] = defaultdict(int)
     out_rows: list[OperatorExportRow] = []
+    total_exposed_ns = 0
     for idx, row in enumerate(rows):
         oid = str(idx)
-        exp_us = min(row.dur_us, float(res.exposed_ns_by_op.get(oid, 0)) / NS_PER_US)
-        fully_hidden = row.dur_us > OVERLAP_EXPOSED_EPS_US and exp_us <= OVERLAP_EXPOSED_EPS_US
-        eff_exp = 0.0 if fully_hidden else exp_us
-        masker = res.masked_by.get(oid, "") if (row.dur_us - eff_exp > OVERLAP_EXPOSED_EPS_US) else ""
+        dur_ns = max(0, int(row.dur_ns) if int(row.dur_ns) > 0 else int(round(float(row.dur_us) * NS_PER_US)))
+        exp_ns = max(0, int(res.exposed_ns_by_op.get(oid, 0)))
+        if dur_ns > 0:
+            exp_ns = min(dur_ns, exp_ns)
+        total_exposed_ns += exp_ns
+        exp_us = float(exp_ns) / NS_PER_US
+        fully_hidden = dur_ns > 0 and exp_ns == 0
+        masker = res.masked_by.get(oid, "") if (dur_ns > exp_ns) else ""
         b_disp = f"Overlapped by {masker} (0 exposed)" if (fully_hidden and masker) else row.bound_display
         out_rows.append(replace(
             row,
-            exposed_dur_us=eff_exp,
+            dur_ns=dur_ns,
+            exposed_ns=exp_ns,
+            exposed_dur_us=exp_us,
             is_overlapped=fully_hidden,
             masked_by=masker,
             gap_us=0.0 if fully_hidden else max(0.0, row.dur_us - row.l_star_lean_us),
             gap_ratio=None if fully_hidden else ((row.dur_us / row.l_star_lean_us) if row.l_star_lean_us > 0.0 else None),
             bound_display=b_disp,
         ))
-        spans[row.archetype_id] += eff_exp
+        spans_ns[row.archetype_id] += exp_ns
+    idle_or_wait_ns = max(0, step_span_ns - total_exposed_ns)
     updated_archs = tuple(
-        replace(a, single_span_us=spans.get(a.archetype_id, 0.0) / float(max(1, a.repeat_count)))
+        replace(
+            a,
+            single_span_us=float(spans_ns.get(a.archetype_id, 0)) / (NS_PER_US * float(max(1, a.repeat_count))),
+        )
         for a in archetypes
     )
-    return out_rows, updated_archs
+    return out_rows, updated_archs, step_span_ns, idle_or_wait_ns
 
 
 def _is_attnres_op(op_id: str, family: str = "") -> bool:
@@ -1113,12 +1330,80 @@ def _aggregate_bundle_cohort_rows(
     layer_plans: Sequence[Any] = (),
     total_target_layers: int = 0,
 ) -> tuple[list[OperatorExportRow], list[tuple[int, int, int, int, int]], tuple[LayerArchetypeSpec, ...]]:
-    """Unplugged socket: project read-only folded views strictly from unfolded EngineStepReceipt."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: _rebuild_synthesized_per_layer_timings proportional ratio rescaling and "
-        "folded-graph demand-averaging/rewiring deleted; project read-only folded display views "
-        "from canonical unfolded EngineStepReceipt (preserving idle wall-time and exact demands)."
+    """Read-only display folding preserving exact integer-ns group totals (never re-certifies)."""
+    if not rows:
+        return [], [], tuple(archetypes)
+    block_by_layer = {
+        int(lp.index): int(getattr(lp, "residual_block_size", 0) or 0)
+        for lp in layer_plans
+    }
+    groups: OrderedDict[tuple[str, str], list[tuple[OperatorExportRow, tuple[int, int, int, int, int]]]] = OrderedDict()
+    for row, dem in zip(rows, demands_ns):
+        site = strip_op_prefix(row.op_id)
+        groups.setdefault((row.archetype_id, site), []).append((row, dem))
+
+    folded_rows: list[OperatorExportRow] = []
+    folded_demands: list[tuple[int, int, int, int, int]] = []
+    arch_exposed_ns: dict[str, int] = defaultdict(int)
+    for (arch_id, _site), members in groups.items():
+        rep = members[0][0]
+        cnt = sum(max(1, int(m[0].repeat_count)) for m in members)
+        tot_dur_ns = sum(int(m[0].dur_ns) for m in members)
+        tot_exp_ns = sum(int(m[0].exposed_ns) for m in members)
+        tot_lstar_ns = sum(int(m[0].l_star_ns) for m in members)
+        sum_dem = tuple(sum(int(m[1][k]) for m in members) for k in range(CERT_RESOURCE_COUNT))
+        inv = 1.0 / float(max(1, cnt))
+        avg_dur_us = float(tot_dur_ns) * inv / NS_PER_US
+        avg_exp_us = float(tot_exp_ns) * inv / NS_PER_US
+        avg_lstar_us = float(tot_lstar_ns) * inv / NS_PER_US
+        fully_hidden = tot_dur_ns > 0 and tot_exp_ns == 0
+        layer_idxs = [int(m[0].layer) for m in members if m[0].layer is not None]
+        durs_us = [float(m[0].dur_us) for m in members if m[0].layer is not None]
+        blk_sz = block_by_layer.get(layer_idxs[0], 0) if layer_idxs else 0
+        depth_note = format_attnres_depth_note(
+            rep.op_id, layer_idxs, durs_us, blk_sz,
+            total_target_layers=total_target_layers, family=rep.family,
+        )
+        role_txt = rep.logical_role
+        if depth_note and depth_note not in role_txt:
+            role_txt = f"{role_txt} [{depth_note}]" if role_txt else depth_note
+        eff = min(1.0, avg_lstar_us / avg_dur_us) if (avg_dur_us > 0.0 and avg_lstar_us > 0.0) else rep.roofline_efficiency
+        folded_rows.append(replace(
+            rep,
+            ordinal=len(folded_rows),
+            repeat_count=cnt,
+            dur_us=avg_dur_us,
+            exposed_dur_us=0.0 if fully_hidden else avg_exp_us,
+            dur_ns=tot_dur_ns,
+            exposed_ns=tot_exp_ns,
+            l_star_ns=tot_lstar_ns,
+            l_star_lean_us=avg_lstar_us,
+            gap_us=0.0 if fully_hidden else max(0.0, avg_dur_us - avg_lstar_us),
+            gap_ratio=None if fully_hidden else ((avg_dur_us / avg_lstar_us) if avg_lstar_us > 0.0 else None),
+            roofline_efficiency=eff,
+            is_overlapped=fully_hidden,
+            flops=sum(float(m[0].flops) for m in members) * inv,
+            vector_ops=sum(float(m[0].vector_ops) for m in members) * inv,
+            hbm_read_bytes=sum(float(m[0].hbm_read_bytes) for m in members) * inv,
+            hbm_write_bytes=sum(float(m[0].hbm_write_bytes) for m in members) * inv,
+            hbm_total_bytes=sum(float(m[0].hbm_total_bytes) for m in members) * inv,
+            mte2_bytes=sum(float(m[0].mte2_bytes) for m in members) * inv,
+            mte3_bytes=sum(float(m[0].mte3_bytes) for m in members) * inv,
+            fixpipe_bytes=sum(float(m[0].fixpipe_bytes) for m in members) * inv,
+            link_bytes=sum(float(m[0].link_bytes) for m in members) * inv,
+            logical_role=role_txt,
+        ))
+        folded_demands.append(sum_dem)  # type: ignore[arg-type]
+        arch_exposed_ns[arch_id] += tot_exp_ns
+
+    updated_archs = tuple(
+        replace(
+            a,
+            single_span_us=float(arch_exposed_ns.get(a.archetype_id, 0)) / (NS_PER_US * float(max(1, a.repeat_count))),
+        )
+        for a in archetypes
     )
+    return folded_rows, folded_demands, updated_archs
 
 
 def _reconcile_draft_schedule_repeats(
@@ -1362,11 +1647,22 @@ def _build_prelim_operator_rows(
             rec["op_id"], rec["family"], rec["recipe"], absorbed, metadata=meta,
         )
         comm_dom = resolve_comm_domain_tag(rec["op_id"], rec["family"], rec["recipe"], meta, eff_case)
-        op_binding = str(meta.get("binding_state") or "").strip()
+        op_binding = str(meta.get("binding_state") or "").strip() or (
+            BINDING_STATE_UNBOUND_FORMULA
+            if (bool(meta.get("target_rewrite_fused")) and not desc.is_shipping_abi)
+            else BINDING_STATE_BOUND
+        )
         demands_ns.append(op_demand)
+        row_dur_ns = max(0, int(round(dur_us * NS_PER_US)))
+        row_l_star_ns = max(0, int(max(op_demand)))
         row_extras = _filter_dataclass_kwargs(
             _OP_ROW_FIELDS,
-            {"is_shipping_abi": False},
+            {
+                "is_shipping_abi": bool(desc.is_shipping_abi),
+                "dur_ns": row_dur_ns,
+                "exposed_ns": row_dur_ns,
+                "l_star_ns": row_l_star_ns,
+            },
         )
         prelim_rows.append(OperatorExportRow(
             ordinal=len(prelim_rows), occurrence=occ, op_id=rec["op_id"],
@@ -1487,6 +1783,104 @@ def _normalize_bundle_sequences(
     return max(1, max(counts.values(), default=1)), max(1, sum(counts.values()))
 
 
+def _occurrence_stage_label(occ: OpOccurrence) -> str:
+    rank = -1 if occ.rank is None else int(occ.rank)
+    return f"r{int(occ.replica)}.p{int(occ.stage)}.d{rank}:{occ.op_id}"
+
+
+def _build_stage_waterfall_entries(receipt: EngineStepReceipt) -> tuple[dict[str, Any], ...]:
+    """Project canonical 4-stage ``EngineStepReceipt`` into exact int-ns waterfall entries."""
+    entries: list[dict[str, Any]] = []
+    prev_span_ns: int | None = None
+    for stage in receipt.stages:
+        span_ns = int(stage.span_ns)
+        delta_ns = 0 if prev_span_ns is None else int(prev_span_ns - span_ns)
+        prev_span_ns = span_ns
+        entries.append({
+            "stage_id": stage.stage_id,
+            "stack_track": stage.stack_track,
+            "status": stage.status,
+            "span_ns": span_ns,
+            "delta_ns": delta_ns,
+            "span_ms": float(span_ns) / float(NS_PER_MS),
+            "delta_ms": float(delta_ns) / float(NS_PER_MS),
+            "l_star_ns": int(stage.l_star_ns),
+            "l_star_valid": bool(stage.l_star_valid),
+            "idle_or_wait_ns": int(stage.idle_or_wait_ns),
+            "plan_sha256": stage.plan_sha256,
+            "execution_key_sha256": stage.execution_key_sha256,
+            "rejection_reason": stage.rejection_reason,
+        })
+    return tuple(entries)
+
+
+def _extract_applied_edit_receipts(ext_plan: Any, *, verified: bool) -> tuple[dict[str, Any], ...]:
+    """Serialize verified ``RewritePlan`` edits into structured receipt dicts."""
+    if not verified or ext_plan is None:
+        return ()
+    receipts: list[dict[str, Any]] = []
+    for edit in getattr(ext_plan, "edits", ()) or ():
+        body = getattr(edit, "body", None)
+        opcode = type(body).__name__ if body is not None else ""
+        rec: dict[str, Any] = {
+            "edit_id": str(getattr(edit, "edit_id", "") or ""),
+            "opcode": opcode,
+            "verified": True,
+        }
+        if hasattr(body, "members"):
+            rec["members"] = [str(getattr(m, "id", m)) for m in (getattr(body, "members", ()) or ())]
+        if hasattr(body, "fusion_tier"):
+            rec["fusion_tier"] = str(getattr(body, "fusion_tier", "") or "")
+        if hasattr(body, "kernel_boundaries"):
+            rec["abi_ids"] = [
+                str(getattr(kb, "abi_id", "") or "")
+                for kb in (getattr(body, "kernel_boundaries", ()) or ())
+                if getattr(kb, "abi_id", "")
+            ]
+        receipts.append(rec)
+    return tuple(receipts)
+
+
+def _apply_stage_exposed_ns(
+    rows: Sequence[OperatorExportRow],
+    archetypes: Sequence[LayerArchetypeSpec],
+    stage: StageReceipt,
+) -> tuple[list[OperatorExportRow], tuple[LayerArchetypeSpec, ...], int, int]:
+    """Apply exact integer-ns exposure from a canonical ``StageReceipt`` onto unfolded rows."""
+    occ_exp = {str(k): max(0, int(v)) for k, v in stage.exposed_ns_by_occ}
+    spans_ns: dict[str, int] = defaultdict(int)
+    out_rows: list[OperatorExportRow] = []
+    total_exp_ns = 0
+    for row in rows:
+        lbl = _occurrence_stage_label(row.occurrence)
+        dur_ns = max(0, int(row.dur_ns) if int(row.dur_ns) > 0 else int(round(float(row.dur_us) * NS_PER_US)))
+        exp_ns = occ_exp.get(lbl, int(row.exposed_ns))
+        if dur_ns > 0:
+            exp_ns = min(dur_ns, max(0, exp_ns))
+        total_exp_ns += exp_ns
+        fully_hidden = dur_ns > 0 and exp_ns == 0
+        out_rows.append(replace(
+            row,
+            dur_ns=dur_ns,
+            exposed_ns=exp_ns,
+            exposed_dur_us=float(exp_ns) / NS_PER_US,
+            is_overlapped=fully_hidden,
+            gap_us=0.0 if fully_hidden else max(0.0, row.dur_us - row.l_star_lean_us),
+            gap_ratio=None if fully_hidden else ((row.dur_us / row.l_star_lean_us) if row.l_star_lean_us > 0.0 else None),
+        ))
+        spans_ns[row.archetype_id] += exp_ns
+    step_span_ns = max(total_exp_ns, int(stage.span_ns))
+    idle_or_wait_ns = max(0, step_span_ns - total_exp_ns)
+    updated_archs = tuple(
+        replace(
+            a,
+            single_span_us=float(spans_ns.get(a.archetype_id, 0)) / (NS_PER_US * float(max(1, a.repeat_count))),
+        )
+        for a in archetypes
+    )
+    return out_rows, updated_archs, step_span_ns, idle_or_wait_ns
+
+
 def _apply_target_envelope_to_rows(
     prelim_rows: list[OperatorExportRow],
     demands_ns: list[tuple[int, int, int, int, int]],
@@ -1501,6 +1895,10 @@ def _apply_target_envelope_to_rows(
     ext_plan: Any,
     rebound_primitive_table: Any,
     allow_unbound_formula: bool,
+    spine: Any = None,
+    replay: ReplayOptions = ReplayOptions(),
+    rep_lp_by_idx: Mapping[int, Any] = (),
+    streams: tuple[Any, ...] = (),
 ) -> tuple[
     list[OperatorExportRow],
     list[tuple[int, int, int, int, int]],
@@ -1514,14 +1912,118 @@ def _apply_target_envelope_to_rows(
     Mapping[str, Any],
     tuple[Any, ...],
     tuple[dict[str, Any], ...],
+    EngineStepReceipt,
+    bool,
+    int,
+    int,
+    int,
+    bool,
+    dict[tuple[int, str], OpSpec],
 ]:
-    """Unplugged socket: consume canonical EngineStepReceipt from W3a ladder."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: optimization.kernel_synthesis.solve_target_graph, 6-alias "
-        "rollback_flags, _normalize_rollback_waterfall, _resolve_node_base_and_members, "
-        "and aclnnSwiGluQuant string patches deleted; wire canonical W3a "
-        "mindie_sim.optimization.ladder.solve_target_step_receipt -> EngineStepReceipt "
-        "(read single typed reverted_to_native_baseline: bool)."
+    """Consume canonical 4-stage ``EngineStepReceipt`` from ``W3a`` ladder."""
+    del cluster_conc
+    eff_spine = spine if spine is not None else default_spine()
+    pt_arg = None if rebound_primitive_table is False else rebound_primitive_table
+    receipt = solve_target_step_receipt(
+        eff_case,
+        step_req,
+        spine=eff_spine,
+        replay=replay,
+        primitive_table=pt_arg,
+        stack_track="target",
+        comparison_policy="monotonic_optimization",
+        rewrite_plan=ext_plan,
+        allow_unbound_formula=bool(allow_unbound_formula),
+    )
+    stage0 = receipt.stage_for("before_merged")
+    stage2 = receipt.stage_for("stage2_unmerged_pr")
+    stage3 = receipt.stage_for("stage3_target_after")
+    if stage3 is not None and stage3.status == "committed":
+        final_stage = stage3
+    elif stage2 is not None and stage2.status == "committed":
+        final_stage = stage2
+    elif stage0 is not None:
+        final_stage = stage0
+    else:
+        final_stage = receipt.stages[-1]
+
+    reverted_to_native_baseline = bool(
+        stage3 is None
+        or stage3.status != "committed"
+        or (stage0 is not None and stage3.plan_sha256 == stage0.plan_sha256)
+    )
+    stage_waterfall = _build_stage_waterfall_entries(receipt)
+    plan_digest = str(final_stage.plan_sha256 or "")
+    plan_verified = bool(final_stage.status == "committed" and final_stage.l_star_valid)
+    applied_receipts = _extract_applied_edit_receipts(ext_plan, verified=plan_verified and not reverted_to_native_baseline)
+
+    out_rows = list(prelim_rows)
+    out_demands = list(demands_ns)
+    out_archs = tuple(archetypes)
+    out_spec_map: dict[tuple[int, str], OpSpec] = dict(op_spec_by_key)
+    out_span_ns = int(final_stage.span_ns)
+    out_idle_ns = int(final_stage.idle_or_wait_ns)
+    out_l_star_ns = int(final_stage.l_star_ns)
+    out_l_star_valid = bool(final_stage.l_star_valid)
+
+    has_improved_eval = (
+        final_stage.step_eval is not None
+        and (stage0 is None or final_stage.plan_sha256 != stage0.plan_sha256 or final_stage.span_ns < stage0.span_ns)
+    )
+    if has_improved_eval and final_stage.step_eval is not None:
+        (
+            st_case, st_raw_records, st_spec_map, st_sources,
+            st_struct, st_subgraph, _st_gid, _st_pipes, _st_pt,
+        ) = _resolve_bundle_step_eval(
+            eff_spine, parsed, step_req, final_stage.step_eval,
+            primitive_table=rebound_primitive_table, streams=streams,
+        )
+        st_filtered, st_tail = _prepare_bundle_records(
+            st_raw_records, archetypes=archetypes, use_archetype_dedup=False,
+        )
+        st_rows, st_demands, _st_peaks = _build_prelim_operator_rows(
+            st_filtered, eff_case=st_case, archetypes=archetypes, rep_lp_by_idx=rep_lp_by_idx,
+            use_archetype_dedup=False, sources_by_op=st_sources,
+            struct_by_op=st_struct, subgraph_by_op=st_subgraph,
+            prepared_work_by_op=None, tail_closure=st_tail,
+        )
+        st_rows, st_archs, _, _ = _attribute_full_bundle_stream0(st_rows, archetypes)
+        out_rows, out_archs, out_span_ns, out_idle_ns = _apply_stage_exposed_ns(
+            st_rows, st_archs, final_stage,
+        )
+        out_demands = st_demands
+        out_spec_map = st_spec_map
+    else:
+        out_rows, out_archs, out_span_ns, out_idle_ns = _apply_stage_exposed_ns(
+            out_rows, out_archs, final_stage,
+        )
+
+    co_opps = collect_codesign_opportunities(
+        eff_case,
+        step_request=step_req,
+        step_receipt=receipt,
+        primitive_table=pt_arg,
+    )
+    return (
+        out_rows,
+        out_demands,
+        out_archs,
+        (),
+        (),
+        plan_digest,
+        plan_verified,
+        applied_receipts,
+        "",
+        {},
+        co_opps,
+        stage_waterfall,
+        receipt,
+        reverted_to_native_baseline,
+        out_span_ns,
+        out_idle_ns,
+        out_l_star_ns,
+        out_l_star_valid,
+        out_spec_map,
     )
 
 
@@ -1650,17 +2152,84 @@ def _resolve_bundle_step_context(
         seq_count, cluster_conc = _normalize_bundle_sequences(step_req.sequences, dp_width)
     if rewrite_plan is not None and apply_target_envelope is False:
         raise ModelingError("rewrite_plan_conflicts_with_apply_target_envelope_false")
-    if rewrite_plan is not None:
-        raise NotImplementedError(
-            "LEGACY_PURGED: wire mindie_sim.rewrite.schema.load_rewrite_plan (mindie-rewrite-plan/2)."
-        )
-    ext_plan = None
+    ext_plan = load_rewrite_plan(rewrite_plan) if rewrite_plan is not None else None
     has_explicit_edits = ext_plan is not None and bool(getattr(ext_plan, "edits", ()))
     include_draft = (
         step_req.scope == "model" and spec_tokens > 0 and step_req.tokens > 1
         and getattr(parsed.model, "auxiliary", None) is not None
     )
     return parsed, track_name, step_req, seq_count, cluster_conc, ext_plan, has_explicit_edits, include_draft
+
+
+def _evaluate_bundle_prelim_rows(
+    spine: Any,
+    eval_case: Case,
+    step_req: StepRequest,
+    step_eval: StepEvaluation | None,
+    replay: ReplayOptions,
+    *,
+    archetypes: list[LayerArchetypeSpec],
+    rep_lp_by_idx: Mapping[int, int],
+    use_archetype_dedup: bool,
+    primitive_table: Any,
+    streams: tuple[Any, ...],
+) -> tuple[
+    Case,
+    list[OperatorExportRow],
+    list[tuple[int, int, int, int, int]],
+    dict[int, dict[str, Any]],
+    list[LayerArchetypeSpec],
+    dict[str, Any],
+    str,
+    tuple[FusedPipelineDescriptor, ...],
+    Any,
+    int,
+    int,
+]:
+    prepared_work_by_op: dict[str, dict[str, float]] = {}
+    if step_eval is not None:
+        (
+            eff_case, raw_records, op_spec_by_key, sources_by_op,
+            struct_by_op, subgraph_by_op, graph_id, pipelines, rebound_primitive_table,
+        ) = _resolve_bundle_step_eval(
+            spine, eval_case, step_req, step_eval,
+            primitive_table=primitive_table, streams=streams,
+        )
+    else:
+        (
+            eff_case, timeline, op_spec_by_key, sources_by_op,
+            struct_by_op, subgraph_by_op, graph_id, prepared_work_by_op,
+            rebound_primitive_table,
+        ) = _evaluate_representative_step(
+            spine, eval_case, step_req, replay,
+            primitive_table=primitive_table, streams=streams,
+        )
+        raw_records = _timeline_to_raw_records(
+            timeline, is_step_eval=False, case=eff_case, op_spec_by_key=op_spec_by_key,
+        )
+        pipelines = ()
+    filtered_records, tail_closure = _prepare_bundle_records(
+        raw_records, archetypes=archetypes, use_archetype_dedup=use_archetype_dedup,
+    )
+    prelim_rows, demands_ns, peaks_by_stage = _build_prelim_operator_rows(
+        filtered_records, eff_case=eff_case, archetypes=archetypes, rep_lp_by_idx=rep_lp_by_idx,
+        use_archetype_dedup=use_archetype_dedup, sources_by_op=sources_by_op,
+        struct_by_op=struct_by_op, subgraph_by_op=subgraph_by_op,
+        prepared_work_by_op=prepared_work_by_op, tail_closure=tail_closure,
+    )
+    prelim_rows, archetypes, unfolded_span_ns, unfolded_idle_ns = _attribute_full_bundle_stream0(
+        prelim_rows, archetypes,
+    )
+    if step_eval is not None:
+        eval_span_ns = max(0, int(round(float(step_eval.span_ms) * NS_PER_MS)))
+        if eval_span_ns > unfolded_span_ns:
+            unfolded_idle_ns += eval_span_ns - unfolded_span_ns
+            unfolded_span_ns = eval_span_ns
+    return (
+        eff_case, prelim_rows, demands_ns, peaks_by_stage, archetypes,
+        op_spec_by_key, graph_id, pipelines, rebound_primitive_table,
+        unfolded_span_ns, unfolded_idle_ns,
+    )
 
 
 def build_export_bundle(
@@ -1700,47 +2269,20 @@ def build_export_bundle(
         step_eval is None and observations_path is None and not has_explicit_edits
         and (len(rep_lp_by_idx) < len(parsed.model.layer_plans) or total_draft_layers > 1)
     )
-    # Always evaluate the full native 0..L-1 + final model on Engine (zero layers=3 mutation).
-    eval_case = parsed
     spine = default_spine()
-    prepared_work_by_op: dict[str, dict[str, float]] = {}
-    if step_eval is not None:
-        (
-            eff_case, raw_records, op_spec_by_key, sources_by_op,
-            struct_by_op, subgraph_by_op, graph_id, pipelines, rebound_primitive_table,
-        ) = _resolve_bundle_step_eval(
-            spine, eval_case, step_req, step_eval,
-            primitive_table=primitive_table, streams=streams,
-        )
-    else:
-        (
-            eff_case, timeline, op_spec_by_key, sources_by_op,
-            struct_by_op, subgraph_by_op, graph_id, prepared_work_by_op,
-            rebound_primitive_table,
-        ) = _evaluate_representative_step(
-            spine, eval_case, step_req, replay,
-            primitive_table=primitive_table, streams=streams,
-        )
-        raw_records = _timeline_to_raw_records(timeline, is_step_eval=False, case=eff_case, op_spec_by_key=op_spec_by_key)
-        pipelines = ()
-
-    filtered_records, tail_closure = _prepare_bundle_records(
-        raw_records, archetypes=archetypes, use_archetype_dedup=use_archetype_dedup,
+    (
+        eff_case, prelim_rows, demands_ns, peaks_by_stage, archetypes,
+        op_spec_by_key, graph_id, pipelines, rebound_primitive_table,
+        unfolded_span_ns, unfolded_idle_ns,
+    ) = _evaluate_bundle_prelim_rows(
+        spine, parsed, step_req, step_eval, replay,
+        archetypes=archetypes, rep_lp_by_idx=rep_lp_by_idx,
+        use_archetype_dedup=use_archetype_dedup,
+        primitive_table=primitive_table, streams=streams,
     )
-    prelim_rows, demands_ns, peaks_by_stage = _build_prelim_operator_rows(
-        filtered_records, eff_case=eff_case, archetypes=archetypes, rep_lp_by_idx=rep_lp_by_idx,
-        use_archetype_dedup=use_archetype_dedup, sources_by_op=sources_by_op,
-        struct_by_op=struct_by_op, subgraph_by_op=subgraph_by_op,
-        prepared_work_by_op=prepared_work_by_op, tail_closure=tail_closure,
+    step_l_star_ns, step_cert_valid, step_tight_res = _certify_step_lower_bound(
+        prelim_rows, demands_ns, step_span_ns=unfolded_span_ns,
     )
-    prelim_rows, archetypes = _attribute_full_bundle_stream0(prelim_rows, archetypes)
-    per_layer_timings = _extract_per_layer_timings(prelim_rows, parsed.model.layer_plans)
-    if use_archetype_dedup:
-        prelim_rows, demands_ns, archetypes = _aggregate_bundle_cohort_rows(
-            prelim_rows, demands_ns, archetypes,
-            layer_plans=parsed.model.layer_plans,
-            total_target_layers=total_target_layers,
-        )
     should_synthesize = True if rewrite_plan is not None else (
         apply_target_envelope if apply_target_envelope is not None
         else (track_name == "target" and step_eval is None and observations_path is None)
@@ -1752,19 +2294,38 @@ def build_export_bundle(
     stream_core_budget_summary, moe_route_summary = "", {}
     co_design_opportunities: tuple[Any, ...] = ()
     stage_waterfall: tuple[dict[str, Any], ...] = ()
+    engine_step_receipt: EngineStepReceipt | None = None
+    reverted_to_native_baseline = False
     if should_synthesize:
         (
             prelim_rows, demands_ns, archetypes,
             synthesis_specs, audit_triggers, plan_digest, plan_verified,
             applied_edit_receipts, stream_core_budget_summary, moe_route_summary,
             co_design_opportunities, stage_waterfall,
+            engine_step_receipt, reverted_to_native_baseline,
+            unfolded_span_ns, unfolded_idle_ns, step_l_star_ns, step_cert_valid,
+            op_spec_by_key,
         ) = _apply_target_envelope_to_rows(
             prelim_rows, demands_ns, archetypes, parsed=parsed, eff_case=eff_case,
             step_req=step_req, cluster_conc=cluster_conc, op_spec_by_key=op_spec_by_key,
             peaks_by_stage=peaks_by_stage, ext_plan=ext_plan,
             rebound_primitive_table=rebound_primitive_table, allow_unbound_formula=allow_unbound_formula,
+            spine=spine, replay=replay, rep_lp_by_idx=rep_lp_by_idx, streams=streams,
         )
-        per_layer_timings = _extract_per_layer_timings(prelim_rows, parsed.model.layer_plans)
+        unfolded_l_star_check, _, step_tight_res = _certify_step_lower_bound(
+            prelim_rows, demands_ns, step_span_ns=unfolded_span_ns,
+        )
+        if step_l_star_ns <= 0 and unfolded_l_star_check > 0:
+            step_l_star_ns = unfolded_l_star_check
+
+    # Capture per-layer timings strictly on unfolded rows BEFORE read-only display folding.
+    per_layer_timings = _extract_per_layer_timings(prelim_rows, parsed.model.layer_plans)
+    if use_archetype_dedup:
+        prelim_rows, demands_ns, archetypes = _aggregate_bundle_cohort_rows(
+            prelim_rows, demands_ns, archetypes,
+            layer_plans=parsed.model.layer_plans,
+            total_target_layers=total_target_layers,
+        )
 
     # Display grouping and precision ABI display tags belong strictly after target synthesis.
     prelim_rows = _apply_display_dtypes(
@@ -1801,6 +2362,13 @@ def build_export_bundle(
         per_layer_timings=per_layer_timings,
         co_design_opportunities=co_design_opportunities,
         stage_waterfall=stage_waterfall,
+        unfolded_step_span_ns=unfolded_span_ns,
+        unfolded_idle_ns=unfolded_idle_ns,
+        unfolded_l_star_ns=step_l_star_ns,
+        unfolded_cert_valid=step_cert_valid,
+        unfolded_tight_res=step_tight_res,
+        engine_step_receipt=engine_step_receipt,
+        reverted_to_native_baseline=reverted_to_native_baseline,
     )
     return assembled
 
@@ -1889,11 +2457,26 @@ def _build_bundle_memory_and_sla(
     )
     raw_sla_target = scen["tpot_slo_ms"] if step_req.phase == "decode" else scen["ttft_slo_ms"]
     min_headroom = min((st.headroom_bytes for st in mem_ledger.stage_budgets), default=0.0)
-    del eff_tpot_ms, raw_sla_target, min_headroom
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire canonical W3a mindie_sim.optimization.codesign.evaluate_macro_wall_trigger "
-        "(do not pass synthetic tpot_slo_ms=max(eff_tpot_ms, 1.0) or import kernel_synthesis)."
+    if raw_sla_target is None or float(raw_sla_target) <= 0.0:
+        sla_regime = "HBM_CAPACITY_EXCEEDED" if not bool(mem_ledger.fits_hbm) else "UNCONSTRAINED"
+        return mem_ledger, eff_handoff, 0.0, sla_regime, None
+    macro_wall = evaluate_macro_wall_trigger(
+        tpot_ms=eff_tpot_ms,
+        tpot_slo_ms=float(raw_sla_target),
+        hbm_used_bytes=float(mem_ledger.max_stage_hbm_bytes),
+        hbm_usable_bytes=float(mem_ledger.usable_hbm_bytes),
+        hbm_headroom_bytes=float(min_headroom),
     )
+    sla_slack = float(macro_wall.sla_slack_ms)
+    if not bool(mem_ledger.fits_hbm):
+        sla_regime = "HBM_CAPACITY_EXCEEDED"
+    elif sla_slack < 0.0:
+        sla_regime = "SLA_VIOLATED"
+    elif macro_wall.wall_kind == "HBM_CAPACITY_WALL":
+        sla_regime = "HBM_CAPACITY_BOUND"
+    else:
+        sla_regime = "SLA_LATENCY_BOUND"
+    return mem_ledger, eff_handoff, sla_slack, sla_regime, macro_wall
 
 
 def _resolve_graph_capture_mode(parsed: Case) -> str:
@@ -1999,6 +2582,166 @@ def _build_hw_peaks_and_die_summary(
     return hw_peaks_summary, die_summary
 
 
+def _resolve_calibrated_launch_us(parsed: Case, primitive_table: Any) -> tuple[float, float, float]:
+    """Read calibrated STARS/host launch durations (us) from PrimitiveTable or runtime.submission."""
+    sub = getattr(parsed.runtime, "submission", None)
+    sub_kernel_us = max(0.0, float(getattr(sub, "kernel_launch_ms", 0.0) or 0.0) * US_PER_MS) if sub is not None else 0.0
+    sub_graph_us = max(0.0, float(getattr(sub, "graph_launch_ms", 0.0) or 0.0) * US_PER_MS) if sub is not None else 0.0
+    pt_host_us = 0.0
+    pt_issue_us = 0.0
+    pt_h2d_us = 0.0
+    if primitive_table is not None and primitive_table is not False and hasattr(primitive_table, "cell"):
+        host_ns = _table_band_p50(primitive_table, "P15_rts_stars", "host_submit_ns")
+        issue_ns = _table_band_p50(primitive_table, "P15_rts_stars", "issue_interval_ns")
+        h2d_ns = _table_band_p50(primitive_table, "P20_host_dma_sync", "pinned_dma_startup_ns")
+        if host_ns is not None and host_ns > 0.0:
+            pt_host_us = float(host_ns) / NS_PER_US
+        if issue_ns is not None and issue_ns > 0.0:
+            pt_issue_us = float(issue_ns) / NS_PER_US
+        if h2d_ns is not None and h2d_ns > 0.0:
+            pt_h2d_us = float(h2d_ns) / NS_PER_US
+    host_launch_us = sub_kernel_us if sub_kernel_us > 0.0 else (pt_host_us if pt_host_us > 0.0 else pt_issue_us)
+    graph_launch_us = sub_graph_us if sub_graph_us > 0.0 else (pt_issue_us if pt_issue_us > 0.0 else host_launch_us)
+    h2d_startup_us = pt_h2d_us if pt_h2d_us > 0.0 else host_launch_us
+    return host_launch_us, graph_launch_us, h2d_startup_us
+
+
+def _compute_bundle_case_digest(
+    parsed: Case,
+    *,
+    step_req: StepRequest,
+    graph_id: str,
+    track_name: str,
+    weight_quant: str,
+    cache_dtype: str,
+    target_envelope_applied: bool,
+    rewrite_plan_sha256: str,
+) -> str:
+    p = parsed.runtime.parallel
+    payload = {
+        "model": str(parsed.model.name),
+        "sku": str(parsed.machine.sku or parsed.machine.name),
+        "phase": str(step_req.phase),
+        "scope": str(step_req.scope),
+        "tokens": int(step_req.tokens),
+        "context": int(step_req.context),
+        "graph_id": str(graph_id),
+        "track": str(track_name),
+        "parallel": [int(p.dp), int(p.tp), int(p.ep), int(p.pp), int(p.cp), int(p.pcp)],
+        "weight_quant": str(weight_quant),
+        "cache_dtype": str(cache_dtype),
+        "target_envelope": bool(target_envelope_applied),
+        "plan_sha256": str(rewrite_plan_sha256),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _resolve_bundle_step_accounting(
+    final_rows: tuple[OperatorExportRow, ...],
+    *,
+    step_eval: StepEvaluation | None,
+    unfolded_step_span_ns: int,
+    unfolded_l_star_ns: int,
+    unfolded_cert_valid: bool,
+) -> tuple[int, int, float, float, int, float, bool]:
+    sum_row_exposed_ns = sum(max(0, int(r.exposed_ns)) for r in final_rows)
+    if unfolded_step_span_ns > 0:
+        step_span_ns = max(int(unfolded_step_span_ns), sum_row_exposed_ns)
+    elif step_eval is not None:
+        step_span_ns = max(int(round(float(step_eval.span_ms) * NS_PER_MS)), sum_row_exposed_ns)
+    else:
+        min_start = min((r.start_us for r in final_rows), default=0.0)
+        max_end = max((r.end_us for r in final_rows), default=0.0)
+        step_span_ns = max(int(round(max(0.0, max_end - min_start) * NS_PER_US)), sum_row_exposed_ns)
+    idle_or_wait_ns = max(0, step_span_ns - sum_row_exposed_ns)
+    step_span_us = float(step_span_ns) / NS_PER_US
+    op_sum_us = (
+        float(sum(int(r.dur_ns) for r in final_rows)) / NS_PER_US
+        if any(r.dur_ns > 0 for r in final_rows)
+        else sum(r.dur_us * r.repeat_count for r in final_rows)
+    )
+    step_l_star_ns = max(0, int(unfolded_l_star_ns))
+    step_l_star_us = float(step_l_star_ns) / NS_PER_US
+    cert_valid = bool(unfolded_cert_valid and step_l_star_ns <= step_span_ns)
+    return step_span_ns, idle_or_wait_ns, step_span_us, op_sum_us, step_l_star_ns, step_l_star_us, cert_valid
+
+
+def _resolve_bundle_identity_and_extras(
+    parsed: Case,
+    *,
+    step_req: StepRequest,
+    graph_id: str,
+    track_name: str,
+    mem_ledger: Any,
+    scen: Mapping[str, Any],
+    graph_mode: str,
+    stream_core_budget_summary: str,
+    moe_route_summary: Mapping[str, Any],
+    serve_script_supplied: bool,
+    rebound_primitive_table: Any,
+    target_envelope_applied: bool,
+    rewrite_plan_sha256: str,
+    applied_edit_receipts: tuple[dict[str, Any], ...],
+    per_layer_timings: Mapping[tuple[str, int], Mapping[str, Any]],
+    co_design_opportunities: tuple[Any, ...],
+    stage_waterfall: tuple[dict[str, Any], ...],
+    step_span_ns: int,
+    idle_or_wait_ns: int,
+    step_l_star_ns: int,
+    engine_step_receipt: EngineStepReceipt | None,
+    reverted_to_native_baseline: bool,
+) -> dict[str, Any]:
+    eff_cfg = _build_effective_config_dict(
+        parsed, mem_ledger, scen, graph_capture_mode=graph_mode, track_name=track_name,
+        stream_core_budget_summary=stream_core_budget_summary,
+        moe_route_summary=moe_route_summary if isinstance(moe_route_summary, Mapping) else {},
+        serve_script_supplied=serve_script_supplied,
+    )
+    host_launch_us, graph_launch_us, h2d_startup_us = _resolve_calibrated_launch_us(
+        parsed, rebound_primitive_table,
+    )
+    case_digest = _compute_bundle_case_digest(
+        parsed,
+        step_req=step_req,
+        graph_id=graph_id,
+        track_name=track_name,
+        weight_quant=str(getattr(mem_ledger, "weight_quant", "") or ""),
+        cache_dtype=str(getattr(mem_ledger, "cache_dtype", "") or ""),
+        target_envelope_applied=target_envelope_applied,
+        rewrite_plan_sha256=rewrite_plan_sha256,
+    )
+    exec_key = ""
+    if engine_step_receipt is not None:
+        for st in reversed(engine_step_receipt.stages):
+            if st.status == "committed" and st.execution_key_sha256:
+                exec_key = str(st.execution_key_sha256)
+                break
+    if not exec_key:
+        exec_key = hashlib.sha256(f"{case_digest}:{graph_id}:{step_span_ns}".encode("utf-8")).hexdigest()
+    return _filter_dataclass_kwargs(
+        _BUNDLE_FIELDS,
+        {
+            "applied_edit_receipts": applied_edit_receipts,
+            "effective_config": eff_cfg,
+            "serve_script_supplied": bool(serve_script_supplied),
+            "per_layer_timings": dict(per_layer_timings) if isinstance(per_layer_timings, Mapping) else {},
+            "co_design_opportunities": tuple(co_design_opportunities),
+            "stage_waterfall": tuple(stage_waterfall),
+            "step_span_ns": step_span_ns,
+            "idle_or_wait_ns": idle_or_wait_ns,
+            "step_l_star_ns": step_l_star_ns,
+            "case_digest": case_digest,
+            "execution_key_sha256": exec_key,
+            "engine_step_receipt": engine_step_receipt,
+            "reverted_to_native_baseline": bool(reverted_to_native_baseline),
+            "host_launch_us": host_launch_us,
+            "graph_launch_us": graph_launch_us,
+            "h2d_startup_us": h2d_startup_us,
+        },
+    )
+
+
 def _assemble_export_bundle(
     *, parsed: Case, eff_case: Case, step_req: StepRequest, step_eval: StepEvaluation | None,
     seq_count: int, cluster_conc: int, graph_id: str, pipelines: tuple[FusedPipelineDescriptor, ...],
@@ -2023,22 +2766,23 @@ def _assemble_export_bundle(
     per_layer_timings: Mapping[tuple[str, int], Mapping[str, Any]] = (),
     co_design_opportunities: tuple[Any, ...] = (),
     stage_waterfall: tuple[dict[str, Any], ...] = (),
+    unfolded_step_span_ns: int = 0,
+    unfolded_idle_ns: int = 0,
+    unfolded_l_star_ns: int = 0,
+    unfolded_cert_valid: bool = True,
+    unfolded_tight_res: tuple[str, ...] = (),
+    engine_step_receipt: EngineStepReceipt | None = None,
+    reverted_to_native_baseline: bool = False,
 ) -> ExportBundle:
-    if use_archetype_dedup or target_envelope_applied:
-        raise NotImplementedError(
-            "LEGACY_PURGED: folded sum(exposed_dur_us) step_span_us drops idle wall-time (Astra P1); "
-            "compute step_span_us strictly from canonical unfolded EngineStepReceipt.step_ns "
-            "(preserving sum(op_exposed) + idle_or_wait_ns == wall_ns)."
-        )
-    if step_eval is not None:
-        step_span_us = float(step_eval.span_ms) * US_PER_MS
-    else:
-        min_start = min((r.start_us for r in final_rows), default=0.0)
-        max_end = max((r.end_us for r in final_rows), default=0.0)
-        step_span_us = max(0.0, max_end - min_start)
-
-    op_sum_us = sum(r.dur_us * r.repeat_count for r in final_rows)
-    step_l_star_us, cert_valid, tight_res = _certify_step_lower_bound(final_rows, demands_ns)
+    del demands_ns, unfolded_idle_ns
+    (
+        step_span_ns, idle_or_wait_ns, step_span_us, op_sum_us,
+        step_l_star_ns, step_l_star_us, cert_valid,
+    ) = _resolve_bundle_step_accounting(
+        final_rows, step_eval=step_eval, unfolded_step_span_ns=unfolded_step_span_ns,
+        unfolded_l_star_ns=unfolded_l_star_ns, unfolded_cert_valid=unfolded_cert_valid,
+    )
+    tight_res = tuple(unfolded_tight_res)
     p0 = peaks_by_stage.get(0) or _die_peaks_for_stage(eff_case, 0, 0)
     cube_mfu, vec_mfu, hbm_mbu, link_util, net_roof, exposed_us, b_mix = _compute_network_efficiency_summary(
         final_rows, step_span_us, p0,
@@ -2072,10 +2816,9 @@ def _assemble_export_bundle(
     has_unbound = any(r.binding_state == BINDING_STATE_UNBOUND_FORMULA for r in final_rows)
     bundle_mode = MODE_MODELING if ((target_envelope_applied and allow_unbound_formula) or track_name == "target") else MODE_SIMULATION
     has_measured_match = reconcile_summary is not None and int(reconcile_summary.matched_sim_ops) > 0
-    all_bound = bool(final_rows) and all(r.binding_state in {BINDING_STATE_BOUND, BINDING_STATE_MEASURED} for r in final_rows)
     bundle_binding = (
         BINDING_STATE_UNBOUND_FORMULA if has_unbound
-        else (BINDING_STATE_MEASURED if has_measured_match else (BINDING_STATE_BOUND if all_bound else ""))
+        else (BINDING_STATE_MEASURED if has_measured_match else BINDING_STATE_BOUND)
     )
     raw_pd_pool = pd_pool_summary if pd_pool_summary is not None else meta_dict.get("pd_pool_summary")
     eff_pd_pool = dict(raw_pd_pool) if isinstance(raw_pd_pool, Mapping) else None
@@ -2085,24 +2828,22 @@ def _assemble_export_bundle(
     )
     eff_dep_dies = max(0, int(raw_dep_dies or 0))
     graph_mode = _resolve_graph_capture_mode(parsed)
-    eff_cfg = _build_effective_config_dict(
-        parsed, mem_ledger, scen, graph_capture_mode=graph_mode, track_name=track_name,
+    bundle_extras = _resolve_bundle_identity_and_extras(
+        parsed,
+        step_req=step_req, graph_id=graph_id, track_name=track_name,
+        mem_ledger=mem_ledger, scen=scen, graph_mode=graph_mode,
         stream_core_budget_summary=stream_core_budget_summary,
-        moe_route_summary=moe_route_summary if isinstance(moe_route_summary, Mapping) else {},
-        serve_script_supplied=serve_script_supplied,
-    )
-    del rebound_primitive_table
-    cal_basis = None
-    bundle_extras = _filter_dataclass_kwargs(
-        _BUNDLE_FIELDS,
-        {
-            "applied_edit_receipts": applied_edit_receipts,
-            "effective_config": eff_cfg,
-            "serve_script_supplied": bool(serve_script_supplied),
-            "per_layer_timings": dict(per_layer_timings) if isinstance(per_layer_timings, Mapping) else {},
-            "co_design_opportunities": tuple(co_design_opportunities),
-            "stage_waterfall": tuple(stage_waterfall),
-        },
+        moe_route_summary=moe_route_summary, serve_script_supplied=serve_script_supplied,
+        rebound_primitive_table=rebound_primitive_table,
+        target_envelope_applied=target_envelope_applied,
+        rewrite_plan_sha256=rewrite_plan_sha256,
+        applied_edit_receipts=applied_edit_receipts,
+        per_layer_timings=per_layer_timings,
+        co_design_opportunities=co_design_opportunities,
+        stage_waterfall=stage_waterfall,
+        step_span_ns=step_span_ns, idle_or_wait_ns=idle_or_wait_ns,
+        step_l_star_ns=step_l_star_ns, engine_step_receipt=engine_step_receipt,
+        reverted_to_native_baseline=reverted_to_native_baseline,
     )
     return ExportBundle(
         schema=EXPORT_BUNDLE_SCHEMA, model_name=str(parsed.model.name),
@@ -2133,7 +2874,7 @@ def _assemble_export_bundle(
         analysis_mode=bundle_mode, binding_state=bundle_binding,
         has_unbound_formula_ops=has_unbound, handoff_tpot_ms=eff_handoff,
         cluster_concurrency=eff_cluster_conc, deployment_total_dies=eff_dep_dies,
-        pd_pool_summary=eff_pd_pool, calibration_basis=cal_basis,
+        pd_pool_summary=eff_pd_pool, calibration_basis=None,
         **scen, **bundle_extras,
     )
 

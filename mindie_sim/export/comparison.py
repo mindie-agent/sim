@@ -25,7 +25,7 @@ from mindie_sim.schema.common import ModelingError
 
 from .action_plan import (
     CONSERVATION_EPS_MS, ComparisonPlan, GroupAccounting, WaterfallSummary,
-    anchor_stage_waterfall, build_actionable_roadmap, build_comparison_plan,
+    build_actionable_roadmap, build_comparison_plan,
     build_new_kernel_backlog, build_parallelism_codesign_note, build_pending_kernel_details,
 )
 from .agent_brief import (
@@ -38,7 +38,7 @@ from .models import (
     BINDING_STATE_UNBOUND_FORMULA, L1_MOD_RESIDUAL_MEM, MACRO_L1_HIERARCHY,
     MACRO_MOD_DRAFT_LAYERS, MACRO_MOD_MOE_SHARED, MACRO_MOD_VERIFY_HEAD,
     MIN_DENOM_EPS, OVERLAP_EXPOSED_EPS_US, US_PER_MS, AlignedComparisonRow,
-    ExportBundle, MacroModuleRow, OperatorExportRow,
+    ComparisonRequest, ExportBundle, MacroModuleRow, OperatorExportRow,
 )
 from .public_view import format_track_label, is_same_public_config
 
@@ -883,28 +883,124 @@ def build_macro_module_breakdown(
     return tuple(rows)
 
 
+_CANONICAL_TRACK_RANK: dict[str, int] = {
+    "eager": 0,
+    "shipping": 1,
+    "proposed": 2,
+    "target": 3,
+}
+_VALID_COMPARISON_POLICIES = frozenset({"monotonic_optimization", "signed_comparison"})
+
+
+def _bundle_canonical_track(bundle: ExportBundle) -> str:
+    raw = str(getattr(bundle, "feature_track", "") or "").strip().lower()
+    if not raw:
+        return "target" if bool(getattr(bundle, "target_envelope_applied", False)) else "shipping"
+    if raw not in _CANONICAL_TRACK_RANK:
+        raise ModelingError(f"invalid_comparison_track:{bundle.feature_track!r}")
+    return raw
+
+
+def build_default_comparison_request(
+    before_bundle: ExportBundle,
+    after_bundle: ExportBundle,
+    *,
+    comparison_policy: str = "monotonic_optimization",
+    require_model_scope: bool | None = None,
+) -> ComparisonRequest:
+    """Build a role-tagged ``ComparisonRequest`` binding Before and After bundle digests."""
+    eff_req_model = (
+        bool(require_model_scope)
+        if require_model_scope is not None
+        else (before_bundle.scope == "model" and after_bundle.scope == "model")
+    )
+    return ComparisonRequest(
+        before_case_digest=str(getattr(before_bundle, "case_digest", "") or ""),
+        after_case_digest=str(getattr(after_bundle, "case_digest", "") or ""),
+        before_execution_key=str(getattr(before_bundle, "execution_key_sha256", "") or ""),
+        after_execution_key=str(getattr(after_bundle, "execution_key_sha256", "") or ""),
+        before_plan_sha256=str(getattr(before_bundle, "rewrite_plan_sha256", "") or ""),
+        after_plan_sha256=str(getattr(after_bundle, "rewrite_plan_sha256", "") or ""),
+        comparison_policy=comparison_policy,
+        require_model_scope=eff_req_model,
+    )
+
+
+def assert_comparison_polarity(
+    before_bundle: ExportBundle,
+    after_bundle: ExportBundle,
+    comparison_request: ComparisonRequest,
+) -> None:
+    """Fail-loud 3-argument role-tagged polarity & scope guard for Before vs After comparisons."""
+    if not isinstance(comparison_request, ComparisonRequest):
+        raise ModelingError("comparison_request_invalid:expected ComparisonRequest")
+    if comparison_request.comparison_policy not in _VALID_COMPARISON_POLICIES:
+        raise ModelingError(f"comparison_policy_invalid:{comparison_request.comparison_policy!r}")
+    b_dig = str(getattr(before_bundle, "case_digest", "") or "")
+    a_dig = str(getattr(after_bundle, "case_digest", "") or "")
+    if comparison_request.before_case_digest and b_dig != comparison_request.before_case_digest:
+        raise ModelingError("export_comparison_reversed_before_after:bundle_case_digest_role_mismatch")
+    if comparison_request.after_case_digest and a_dig != comparison_request.after_case_digest:
+        raise ModelingError("export_comparison_reversed_before_after:bundle_case_digest_role_mismatch")
+    b_ek = str(getattr(before_bundle, "execution_key_sha256", "") or "")
+    a_ek = str(getattr(after_bundle, "execution_key_sha256", "") or "")
+    if comparison_request.before_execution_key and b_ek != comparison_request.before_execution_key:
+        raise ModelingError("export_comparison_reversed_before_after:bundle_execution_key_role_mismatch")
+    if comparison_request.after_execution_key and a_ek != comparison_request.after_execution_key:
+        raise ModelingError("export_comparison_reversed_before_after:bundle_execution_key_role_mismatch")
+    if comparison_request.before_plan_sha256 and before_bundle.rewrite_plan_sha256 != comparison_request.before_plan_sha256:
+        raise ModelingError("export_comparison_reversed_before_after:bundle_plan_sha256_role_mismatch")
+    if comparison_request.after_plan_sha256 and after_bundle.rewrite_plan_sha256 != comparison_request.after_plan_sha256:
+        raise ModelingError("export_comparison_reversed_before_after:bundle_plan_sha256_role_mismatch")
+    if comparison_request.require_model_scope and (before_bundle.scope != "model" or after_bundle.scope != "model"):
+        raise ModelingError(
+            f"export_comparison_requires_model_scope:before={before_bundle.scope},after={after_bundle.scope}"
+        )
+    if before_bundle.scope != after_bundle.scope:
+        raise ModelingError(
+            f"export_comparison_scope_mismatch:before={before_bundle.scope},after={after_bundle.scope}"
+        )
+    if comparison_request.comparison_policy == "monotonic_optimization":
+        b_track = _bundle_canonical_track(before_bundle)
+        a_track = _bundle_canonical_track(after_bundle)
+        if before_bundle.target_envelope_applied and not after_bundle.target_envelope_applied:
+            raise ModelingError("export_comparison_reversed_before_after:target_envelope_inverted")
+        if _CANONICAL_TRACK_RANK[b_track] > _CANONICAL_TRACK_RANK[a_track]:
+            raise ModelingError(f"export_comparison_reversed_before_after:{b_track}>{a_track}")
+
+
 def classify_waterfall_stage(
     acc: GroupAccounting,
     before_bundle: ExportBundle,
     after_bundle: ExportBundle,
 ) -> tuple[str, str | None]:
-    """Unplugged socket: delegate stage attribution strictly to canonical EngineStepReceipt."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: duplicate is_same_deployment_config, heuristic classify_waterfall_stage, "
-        "and third shadow waterfall enrich_comparison_plan_stage_receipts deleted; "
-        "use public_view.is_same_public_config + direct EngineStepReceipt.stages (int ns)."
-    )
+    """Classify one ``GroupAccounting`` row into canonical waterfall stage(s) via public config."""
+    same_cfg = is_same_public_config(before_bundle, after_bundle)
+    if acc.bucket == "config":
+        if acc.reason in _FRAMEWORK_REASONS and same_cfg:
+            return WF_STAGE_FRAMEWORK, None
+        return WF_STAGE_CONFIG, None
+    if acc.bucket in {"new", "tune"}:
+        has_cfg_split = (
+            not same_cfg
+            and acc.after_pre_edit_ms is not None
+            and abs(float(acc.config_share_ms)) > CONSERVATION_EPS_MS
+        )
+        if has_cfg_split:
+            return WF_STAGE_CONFIG, WF_STAGE_KERNEL
+        return WF_STAGE_KERNEL, None
+    return WF_STAGE_RESIDUAL, None
 
 
 __all__ = [
-    "AGENT_BRIEF_MAX_BYTES", "ComparisonPlan", "GroupAccounting", "WF_STAGE_CONFIG",
-    "WF_STAGE_FRAMEWORK", "WF_STAGE_KERNEL", "WF_STAGE_RESIDUAL", "WaterfallSummary",
-    "_compact_agent_brief_to_budget", "align_before_after_operators", "anchor_stage_waterfall",
-    "build_actionable_roadmap",
-    "build_agent_brief", "build_comparison_plan", "build_macro_module_breakdown",
-    "build_new_kernel_backlog", "build_parallelism_codesign_note",
-    "build_pending_kernel_details", "classify_waterfall_stage",
-    "export_agent_brief",
+    "AGENT_BRIEF_MAX_BYTES", "ComparisonPlan", "ComparisonRequest", "GroupAccounting",
+    "WF_STAGE_CONFIG", "WF_STAGE_FRAMEWORK", "WF_STAGE_KERNEL", "WF_STAGE_RESIDUAL",
+    "WaterfallSummary", "_compact_agent_brief_to_budget", "align_before_after_operators",
+    "assert_comparison_polarity", "build_actionable_roadmap",
+    "build_agent_brief", "build_comparison_plan", "build_default_comparison_request",
+    "build_macro_module_breakdown", "build_new_kernel_backlog",
+    "build_parallelism_codesign_note", "build_pending_kernel_details",
+    "classify_waterfall_stage", "export_agent_brief",
     "format_executive_digest_markdown", "format_parallelism_codomain_summary",
     "format_public_track_label",
 ]

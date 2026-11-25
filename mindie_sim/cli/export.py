@@ -256,9 +256,15 @@ def _run_oneshot_export(args: argparse.Namespace) -> dict[str, Any]:
         "phase": before_bundle.phase,
     }
     if args.xlsx_output:
+        from mindie_sim.export import build_default_comparison_request
+        cmp_req = (
+            build_default_comparison_request(before_bundle, after_bundle)
+            if after_bundle is not None else None
+        )
         xlsx_sum = export_comparison_xlsx(
             before_bundle, args.xlsx_output,
             after_bundle=after_bundle,
+            comparison_request=cmp_req,
         )
         result["xlsx"] = xlsx_sum.to_dict()
     if args.trace_output:
