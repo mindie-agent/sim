@@ -208,31 +208,42 @@ def plan_attention_traffic(access: AttentionAccessSpec,
     if access.unique_rows_known or access.unique_rows > 0:
         unique_rows = max(0, int(access.unique_rows))
     else:
-        unique_rows = sum(int(c) + int(q)
-                          for q, c in zip(access.q_lengths, access.context_lengths))
         if access.window > 0:
             if access.noncausal:
-                unique_rows = sum(min(int(c) + int(q), access.window + int(q))
-                                  for q, c in zip(access.q_lengths, access.context_lengths))
+                unique_rows = sum(
+                    0 if int(q) <= 0 else min(int(c) + int(q), access.window + int(q))
+                    for q, c in zip(access.q_lengths, access.context_lengths)
+                )
             else:
-                unique_rows = sum(min(int(c) + int(q), access.window)
-                                  for q, c in zip(access.q_lengths, access.context_lengths))
-    if access.refill_rows_known or access.refill_rows > 0:
+                unique_rows = sum(
+                    0 if int(q) <= 0 else min(int(c) + int(q), access.window + int(q) - 1)
+                    for q, c in zip(access.q_lengths, access.context_lengths)
+                )
+        else:
+            unique_rows = sum(
+                0 if int(q) <= 0 else int(c) + int(q)
+                for q, c in zip(access.q_lengths, access.context_lengths)
+            )
+        if access.selected_rows_known:
+            unique_rows = min(unique_rows, max(0, int(access.selected_rows)))
+    if access.selected_rows_known or access.selected_rows > 0:
+        logical_rows = float(max(0, access.selected_rows))
+    elif access.refill_rows_known or access.refill_rows > 0:
         logical_rows = float(max(0, access.refill_rows))
     else:
         logical_rows = pairs
-    if access.selected_rows > 0:
-        logical_rows = float(access.selected_rows)
     logical = logical_rows * row_bytes
     working_set = float(unique_rows) * row_bytes
     private_refill = logical
     effective_l2 = hierarchy.effective_l2_bytes
-    sparse_decode = (access.topk > 0 and access.phase in {"decode", "draft"}
-                     and not access.selected_rows_known)
-    if sparse_decode:
+    unknown_sparse = access.topk > 0 and not access.selected_rows_known
+    if unknown_sparse:
         hbm_kv = logical
         basis = "unknown_dynamic_topk_per_query_gather"
-    elif working_set <= effective_l2 and schedule.resident:
+    elif not schedule.resident:
+        hbm_kv = logical
+        basis = "nonresident_streaming_schedule"
+    elif working_set <= effective_l2:
         hbm_kv = working_set
         basis = "dense_unique_working_set_resident"
     else:
@@ -263,19 +274,22 @@ def plan_index_key_traffic(access: IndexAccessSpec,
     """Plan shared dense prefix keys once and private per-query keys once."""
     hierarchy = _hierarchy(hierarchy)
     private = float(sum(max(0, int(value)) for value in access.private_tokens))
-    logical_rows = (float(access.prefix_tokens) * max(1, access.query_rows)
-                    + private)
+    queries = float(access.query_rows)
+    prefix_active = float(access.prefix_tokens) if access.query_rows > 0 else 0.0
+    logical_rows = float(access.prefix_tokens) * queries + private
     logical = logical_rows * access.row_bytes
+    working_set = (prefix_active + private) * access.row_bytes
     if access.dynamic_selection:
         selected = float(access.selected_rows) if access.selected_rows > 0 else logical_rows
         hbm = selected * access.row_bytes
+        if access.selected_rows > 0:
+            working_set = min(working_set, hbm)
         basis = "unknown_dynamic_selection_per_query"
     elif schedule.batch_tile and schedule.shared_key_scan:
-        unique_rows = float(access.prefix_tokens) + private
-        hbm = unique_rows * access.row_bytes
-        if hbm > hierarchy.effective_l2_bytes:
-            spill = max(0.0, 1.0 - hierarchy.effective_l2_bytes / hbm)
-            hbm += (logical - hbm) * spill
+        hbm = working_set
+        if working_set > hierarchy.effective_l2_bytes and working_set > 0.0:
+            spill = max(0.0, 1.0 - hierarchy.effective_l2_bytes / working_set)
+            hbm += max(0.0, logical - working_set) * spill
         basis = "shared_prefix_batch_tile_scan"
     else:
         hbm = logical
@@ -289,7 +303,7 @@ def plan_index_key_traffic(access: IndexAccessSpec,
         private_refill_bytes=logical,
         index_bytes=float(access.index_bytes),
         scale_bytes=float(access.scale_bytes),
-        working_set_bytes=hbm,
+        working_set_bytes=working_set,
         residency_basis=basis,
     )
 
