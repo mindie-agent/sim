@@ -94,7 +94,7 @@ def source_dispatch(contexts, heads, cores):
         threshold, current, previous = load/vectors, 0, (0,0)
         for task,(_,_,splits,parts,_) in enumerate(fd):
             for part in range(parts):
-                if splits > (threshold-current)*2:
+                if current > 0 and len(fd_ends) + 1 < vectors and splits > (threshold-current)*2:
                     fd_ends.append(list(previous))
                     load -= current
                     threshold, current = load/(vectors-len(fd_ends)), 0

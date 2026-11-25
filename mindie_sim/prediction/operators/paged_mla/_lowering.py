@@ -12,7 +12,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
 from graphlib import TopologicalSorter
 from itertools import accumulate, chain, groupby
-from math import gcd, lcm
+from math import gcd, isqrt, lcm
+import sys
 from typing import Any, Literal
 
 from mindie_sim.schema.common import dtype_bytes
@@ -34,7 +35,7 @@ from ..sharedkv.l0_sync import (
 from ..sharedkv.split_core import p01_cold_mte2_aic_cap
 from .common import (
     ACLNN_MQS_DATA_BYTES, ACLNN_MQS_INLINE_ROW_BYTES, ACLNN_MQS_SCALE_BYTES, ACLNN_MQS_SEPARATE_SCALE_MODE,
-    DSL_MQS_ABI, FAMILY, FIA_ABI, FP32_BYTES, INDEX_BYTES,
+    DSL_FLASH_ABI, DSL_MQS_ABI, FAMILY, FIA_ABI, FLASH_ABI, FP32_BYTES, INDEX_BYTES,
     MQS_ABI, MQS_COMPRESSED_ROW_BYTES, MQS_ORIGINAL_ROW_BYTES,
     MQS_PAGED_LAYOUT, NZ_BLOCK_BYTES, PagedMlaContract, _query_row, align_bytes, capability_gap,
     ceil_div, latent_record_bytes, mla_step_crosscore_ms,
@@ -53,9 +54,27 @@ WEIGHTED_MERGE_OPS_PER_VALUE = 3
 FP8_DEQUANT_OPS_PER_VALUE = 6
 FP4_DEQUANT_OPS_PER_VALUE = 4
 SOFTMAX_STATE_SCALARS = 2
+# Upstream CANN FIA & FlashMLA broadcast 8 FP32 copies each of max and sum (64 B/head).
+FD_SOFTMAX_STATE_SCALARS = 16
+DENSE_CANN_ABIS = frozenset({FIA_ABI, FLASH_ABI})
 SINGLE_AIV_HEAD_LIMIT = 16
-NATIVE_FD_REDUCE_HEAD_TILE = 64
 FD_REDUCE_HEAD_GRAIN = 8
+# CANN split_core / split_core_v2 host tiling constants (split_core.cpp, split_core_v2.cpp).
+FIA_COST_M_WEIGHT = 6
+FIA_COST_M_GRAIN = 16
+FIA_COST_S2_WEIGHT = 10
+FIA_COST_S2_GRAIN = 64
+FIA_TOLERANCE_DIVISOR = 2
+FIA_MIN_CORE_OFFSET_NUM = 1
+FIA_MIN_CORE_OFFSET_DEN = 4
+FIA_MIN_CORE_ROUND_NUM = 1
+FIA_MIN_CORE_ROUND_DEN = 2
+FIA_ARCH22_M_TILE = 256
+FIA_ARCH22_M_TILE_MIN = 128
+FIA_ARCH22_S2_TILE = 512
+FIA_ARCH35_M_TILE = 64
+FIA_ARCH35_S2_TILE = 128
+FIA_ARCH35_FD_TOLERANCE_BLOCKS = 9
 MLA_COMPACT_THRESHOLD = 32
 MLA_COMPACT_MIN_KEY_TILE = 128
 MQS_REFILL_ROW_ALIGN = 16
@@ -323,6 +342,326 @@ def _split_tiles(tiles: int, splits: int, split: int) -> tuple[int, int]:
 def _merge_ops(c: PagedMlaContract, rows: int, joins: int) -> int:
     return rows * joins * (SOFTMAX_MERGE_SCALAR_OPS + WEIGHTED_MERGE_OPS_PER_VALUE * c.dv)
 
+
+def _live_rows_in_span(start: int, end: int, logical_heads: int, physical_heads: int) -> int:
+    def _prefix(n: int) -> int:
+        return (n // physical_heads) * logical_heads + min(n % physical_heads, logical_heads)
+
+    return _prefix(end) - _prefix(start)
+
+
+@dataclass(frozen=True, slots=True)
+class _FiaRowSpec:
+    seq: int
+    m_block: int
+    m_rows: int
+    tiles: int
+    normal_cost: int
+    tail_cost: int
+    total_cost: int
+
+
+@dataclass(frozen=True, slots=True)
+class _FiaHostPlan:
+    """Resolved CANN SplitCore / SplitCore_v2 host schedule for FIA MLA."""
+
+    m_tile: int
+    s2_tile: int
+    used_cores: int
+    fd_enabled: bool
+    max_splits: int
+    core_slices: tuple[tuple[tuple[int, int, int, int], ...], ...]
+    row_splits: dict[tuple[int, int], int]
+    fd_reducers: tuple[tuple[tuple[int, int, int, int, int], ...], ...]
+
+
+def _fia_block_cost(m_rows: int, s2_cols: int) -> int:
+    return (
+        FIA_COST_M_WEIGHT * ceil_div(m_rows, FIA_COST_M_GRAIN)
+        + FIA_COST_S2_WEIGHT * ceil_div(s2_cols, FIA_COST_S2_GRAIN)
+    )
+
+
+def _eval_fia_split_core(
+    rows: tuple[_FiaRowSpec, ...],
+    batch_ends: tuple[int, ...],
+    core_num: int,
+    *,
+    stream_k: bool,
+    cost_limit: int | None = None,
+) -> tuple[int, int, tuple[tuple[tuple[int, int, int, int], ...], ...], list[int]]:
+    """Replay CANN SplitCore / SplitCore_v2 (AssignByBatch -> Row -> Block -> Force)."""
+    n_rows = len(rows)
+    total_cost = sum(r.total_cost for r in rows)
+    if core_num <= 0 or total_cost <= 0 or n_rows == 0:
+        return 1, 0, ((),), [1] * n_rows
+    max_m_cost = max(r.total_cost for r in rows)
+    batch_of = [0] * n_rows
+    batch_costs = [0] * len(batch_ends)
+    batch_blocks = [0] * len(batch_ends)
+    batch_last = [0] * len(batch_ends)
+    prev_end = 0
+    for b_idx, b_end in enumerate(batch_ends):
+        for r_i in range(prev_end, b_end):
+            batch_of[r_i] = b_idx
+            batch_costs[b_idx] += rows[r_i].total_cost
+            batch_blocks[b_idx] += rows[r_i].tiles
+        batch_last[b_idx] = rows[b_end - 1].tail_cost
+        prev_end = b_end
+
+    r_idx = tile_idx = 0
+    b_idx = 0
+    b_rem_cost, b_rem_blocks = batch_costs[0], batch_blocks[0]
+    r_rem_cost, r_rem_tiles = rows[0].total_cost, rows[0].tiles
+    unassigned = total_cost
+    max_cost = 0
+    splits = [0] * n_rows
+    all_slices: list[tuple[tuple[int, int, int, int], ...]] = []
+
+    def _reload_row() -> None:
+        nonlocal b_idx, b_rem_cost, b_rem_blocks, r_rem_cost, r_rem_tiles
+        if r_idx >= n_rows:
+            return
+        new_b = batch_of[r_idx]
+        if new_b != b_idx:
+            b_idx = new_b
+            b_rem_cost, b_rem_blocks = batch_costs[b_idx], batch_blocks[b_idx]
+        r_rem_cost, r_rem_tiles = rows[r_idx].total_cost, rows[r_idx].tiles
+
+    for c_idx in range(core_num):
+        if cost_limit is not None and max_cost > cost_limit:
+            return len(all_slices), max_cost, tuple(all_slices), splits
+        if r_idx >= n_rows or unassigned <= 0:
+            break
+        avg = unassigned // (core_num - c_idx)
+        limit = avg if stream_k else max(avg, max_m_cost)
+        cur_cost = cur_blocks = 0
+        c_slices: list[tuple[int, int, int, int]] = []
+
+        # 1. AssignByBatch
+        while r_idx < n_rows and cur_cost + b_rem_cost <= limit + batch_last[b_idx] // FIA_TOLERANCE_DIVISOR:
+            b_end = batch_ends[b_idx]
+            for k in range(r_idx, b_end):
+                st = tile_idx if k == r_idx else 0
+                cnt = rows[k].tiles - st
+                if cnt > 0:
+                    c_slices.append((rows[k].seq, rows[k].m_block, st, cnt))
+                    splits[k] += 1
+            cur_cost += b_rem_cost
+            cur_blocks += b_rem_blocks
+            r_idx, tile_idx = b_end, 0
+            _reload_row()
+
+        # 2. AssignByRow
+        while r_idx < n_rows and cur_cost + r_rem_cost <= limit + rows[r_idx].tail_cost // FIA_TOLERANCE_DIVISOR:
+            r = rows[r_idx]
+            c_slices.append((r.seq, r.m_block, tile_idx, r_rem_tiles))
+            splits[r_idx] += 1
+            cur_cost += r_rem_cost
+            cur_blocks += r_rem_tiles
+            b_rem_cost -= r_rem_cost
+            b_rem_blocks -= r_rem_tiles
+            r_idx, tile_idx = r_idx + 1, 0
+            _reload_row()
+
+        # 3. AssignByBlock
+        if stream_k and r_idx < n_rows:
+            r = rows[r_idx]
+            st = tile_idx
+            while tile_idx < r.tiles:
+                t_cost = r.tail_cost if tile_idx == r.tiles - 1 else r.normal_cost
+                if cur_cost + t_cost <= limit + t_cost // FIA_TOLERANCE_DIVISOR:
+                    cur_cost += t_cost
+                    cur_blocks += 1
+                    tile_idx += 1
+                    r_rem_cost -= t_cost
+                    r_rem_tiles -= 1
+                    b_rem_cost -= t_cost
+                    b_rem_blocks -= 1
+                else:
+                    break
+            if tile_idx > st:
+                c_slices.append((r.seq, r.m_block, st, tile_idx - st))
+                splits[r_idx] += 1
+                if tile_idx == r.tiles:
+                    r_idx, tile_idx = r_idx + 1, 0
+                    _reload_row()
+
+        # 4. ForceAssign
+        if cur_blocks == 0 and r_idx < n_rows:
+            r = rows[r_idx]
+            if stream_k:
+                t_cost = r.tail_cost if tile_idx == r.tiles - 1 else r.normal_cost
+                c_slices.append((r.seq, r.m_block, tile_idx, 1))
+                splits[r_idx] += 1
+                cur_cost += t_cost
+                cur_blocks = 1
+                tile_idx += 1
+                r_rem_cost -= t_cost
+                r_rem_tiles -= 1
+                b_rem_cost -= t_cost
+                b_rem_blocks -= 1
+                if tile_idx == r.tiles:
+                    r_idx, tile_idx = r_idx + 1, 0
+                    _reload_row()
+            else:
+                c_slices.append((r.seq, r.m_block, tile_idx, r_rem_tiles))
+                splits[r_idx] += 1
+                cur_cost += r_rem_cost
+                cur_blocks += r_rem_tiles
+                b_rem_cost -= r_rem_cost
+                b_rem_blocks -= r_rem_tiles
+                r_idx, tile_idx = r_idx + 1, 0
+                _reload_row()
+
+        all_slices.append(tuple(c_slices))
+        max_cost = max(max_cost, cur_cost)
+        unassigned -= cur_cost
+
+    return max(1, len(all_slices)), max_cost, tuple(all_slices), splits
+
+
+def _assign_fia_fd_reducers(
+    fd_tasks: tuple[tuple[int, int, int, int], ...],
+    used_cores: int,
+    aiv_per_aic: int,
+    *,
+    is_arch35: bool,
+) -> tuple[tuple[tuple[int, int, int, int, int], ...], ...]:
+    """Replay CANN SplitFD AIV assignment (split_core.cpp:659, split_core_v2.cpp:625)."""
+    if not fd_tasks:
+        return ()
+    max_vectors = max(1, used_cores * max(1, aiv_per_aic))
+    if is_arch35:
+        total_load = sum(m_rows * sp for _, _, m_rows, sp in fd_tasks)
+        avg_load = max(1, ceil_div(total_load, max_vectors))
+        empty_vecs = max(0, max_vectors - len(fd_tasks))
+        groups: list[tuple[tuple[int, int, int, int, int], ...]] = []
+        for seq, m_block, m_rows, sp in fd_tasks:
+            if empty_vecs == 0:
+                groups.append(((seq, m_block, 0, m_rows, sp),))
+                continue
+            v_num = max(1, (sp * m_rows) // avg_load)
+            avg_m = ceil_div(m_rows, v_num)
+            v_num = min(ceil_div(m_rows, avg_m), empty_vecs + 1)
+            for vid in range(v_num):
+                h_off = vid * avg_m
+                ch_h = min(avg_m, m_rows - h_off)
+                groups.append(((seq, m_block, h_off, ch_h, sp),))
+            empty_vecs -= v_num - 1
+        return tuple(groups)
+
+    units: list[tuple[int, int, int, int, int]] = []
+    for seq, m_block, m_rows, sp in fd_tasks:
+        parts = ceil_div(m_rows, FD_REDUCE_HEAD_GRAIN)
+        for p in range(parts):
+            h_off = p * FD_REDUCE_HEAD_GRAIN
+            units.append((seq, m_block, h_off, min(FD_REDUCE_HEAD_GRAIN, m_rows - h_off), sp))
+    vectors = min(len(units), max_vectors)
+    load = sum(u[4] for u in units)
+    threshold = load / vectors
+    current = 0
+    a22_groups: list[tuple[tuple[int, int, int, int, int], ...]] = []
+    cur_group: list[tuple[int, int, int, int, int]] = []
+    for unit in units:
+        sp = unit[4]
+        if (current > 0 and len(a22_groups) + 1 < vectors
+                and sp > (threshold - current) * FIA_TOLERANCE_DIVISOR):
+            a22_groups.append(tuple(cur_group))
+            load -= current
+            threshold = load / (vectors - len(a22_groups))
+            current = 0
+            cur_group = []
+        cur_group.append(unit)
+        current += sp
+    if cur_group:
+        a22_groups.append(tuple(cur_group))
+    return tuple(a22_groups)
+
+
+def resolve_fia_host_plan(
+    *,
+    sequences: tuple[tuple[int, int], ...],
+    physical_heads: int,
+    aic_count: int,
+    aiv_per_aic: int = 2,
+    is_arch35: bool,
+    page_size: int = 0,
+    paged: bool = False,
+) -> _FiaHostPlan:
+    """Replay CANN Arch22/Arch35 FIA MLA tiling, SplitCore, and SplitFD reducer mapping."""
+    batch = len(sequences)
+    max_s1 = max((q for q, _ in sequences), default=1)
+    if is_arch35:
+        m_tile, s2_tile, tol = FIA_ARCH35_M_TILE, FIA_ARCH35_S2_TILE, FIA_ARCH35_FD_TOLERANCE_BLOCKS
+    else:
+        s2_tile = FIA_ARCH22_S2_TILE
+        # fia_tiling_nonquant_mla.cpp:277-282 rounds S2 down to a multiple of PA blockSize.
+        if paged and page_size > 0 and s2_tile > page_size and s2_tile % page_size != 0:
+            s2_tile = (s2_tile // page_size) * page_size
+        m_tile = FIA_ARCH22_M_TILE
+        same_kv = len({kv for _, kv in sequences}) == 1
+        s1_g = max_s1 * physical_heads
+        if batch > 0 and aic_count > 0 and batch % aic_count != 0 and same_kv:
+            lcm_val = (batch // gcd(batch, aic_count)) * aic_count
+            split_of_s1g = lcm_val // batch
+            if split_of_s1g > 0 and s1_g % split_of_s1g == 0:
+                cand = s1_g // split_of_s1g
+                if FIA_ARCH22_M_TILE_MIN <= cand <= m_tile:
+                    m_tile = cand
+        tol = 0
+
+    rows_list: list[_FiaRowSpec] = []
+    batch_ends: list[int] = []
+    for seq, (q_len, kv_len) in enumerate(sequences):
+        if q_len <= 0 or kv_len <= 0:
+            continue
+        total_m = q_len * physical_heads
+        m_blocks = ceil_div(total_m, m_tile)
+        tiles = ceil_div(kv_len, s2_tile)
+        tail_s2 = kv_len - (tiles - 1) * s2_tile
+        for m_idx in range(m_blocks):
+            m_rows = min(m_tile, total_m - m_idx * m_tile)
+            n_cost = _fia_block_cost(m_rows, s2_tile)
+            t_cost = _fia_block_cost(m_rows, tail_s2)
+            rows_list.append(_FiaRowSpec(seq, m_idx, m_rows, tiles, n_cost, t_cost, (tiles - 1) * n_cost + t_cost))
+        batch_ends.append(len(rows_list))
+    rows = tuple(rows_list)
+    b_ends = tuple(batch_ends)
+    total_blocks = sum(r.tiles for r in rows)
+    if total_blocks <= 0:
+        return _FiaHostPlan(m_tile, s2_tile, 1, False, 1, ((),), {}, ())
+
+    max_core = min(aic_count, total_blocks)
+    root = isqrt(total_blocks * FIA_MIN_CORE_OFFSET_DEN + FIA_MIN_CORE_OFFSET_NUM)
+    min_core = max(1, min((root + FIA_MIN_CORE_ROUND_NUM) // FIA_MIN_CORE_ROUND_DEN, max_core))
+    best_used, best_cost, best_slices, best_splits = 1, sys.maxsize, ((),), [1] * len(rows)
+    for cores in range(min_core, max_core + 1):
+        used, m_cost, slices, splits = _eval_fia_split_core(
+            rows, b_ends, cores, stream_k=True, cost_limit=best_cost,
+        )
+        if m_cost < best_cost:
+            best_used, best_cost, best_slices, best_splits = used, m_cost, slices, splits
+
+    fd_on = max(best_splits, default=1) > 1
+    if fd_on and tol > 0:
+        no_used, no_cost, no_slices, no_splits = _eval_fia_split_core(rows, b_ends, best_used, stream_k=False)
+        full_cost = _fia_block_cost(min(max_s1 * physical_heads, m_tile), s2_tile)
+        if not ((no_cost - tol * full_cost) > best_cost):
+            best_used, best_slices, best_splits, fd_on = no_used, no_slices, no_splits, False
+
+    row_splits = {(r.seq, r.m_block): sp for r, sp in zip(rows, best_splits, strict=True)}
+    fd_tasks = tuple(
+        (r.seq, r.m_block, r.m_rows, sp)
+        for r, sp in zip(rows, best_splits, strict=True) if sp > 1
+    )
+    fd_reducers = _assign_fia_fd_reducers(fd_tasks, best_used, aiv_per_aic, is_arch35=is_arch35)
+    return _FiaHostPlan(
+        m_tile, s2_tile, best_used, fd_on, max(best_splits, default=1),
+        best_slices, row_splits, fd_reducers,
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _PagedMlaProgramBuilder:
     contract: PagedMlaContract
@@ -335,6 +674,28 @@ class _PagedMlaProgramBuilder:
     kv_tensor_id: str = ""
     kv_version: int = 0
     query_offsets: tuple[int, ...] = ()
+    fia_host_plan: _FiaHostPlan | None = None
+
+    def _pack_m(self) -> bool:
+        return self.contract.abi in DENSE_CANN_ABIS
+
+    def _m_blocks_for_seq(self, seq: int) -> int:
+        q = self.contract.sequences[seq][0]
+        if not q:
+            return 0
+        if self._pack_m():
+            return ceil_div(q * self.contract.physical_heads, self.layout.head_tile)
+        return q * ceil_div(self.contract.physical_heads, self.layout.head_tile)
+
+    def _m_block_span(self, seq: int, m_block: int) -> tuple[int, int, int, int, int]:
+        c, layout = self.contract, self.layout
+        total_m = c.sequences[seq][0] * c.physical_heads
+        m_start = m_block * layout.head_tile
+        m_end = min(total_m, m_start + layout.head_tile)
+        heads = m_end - m_start
+        live = _live_rows_in_span(m_start, m_end, c.logical_heads, c.physical_heads)
+        query, head_start = divmod(m_start, c.physical_heads)
+        return m_start, heads, live, query, head_start
 
     def _demand(self, step: str, live: int, *, seq: int = 0, query: int = 0, heads: int = 0,
                 start: int = 0, keys: int = 0, first: bool = False, last: bool = False,
@@ -344,8 +705,15 @@ class _PagedMlaProgramBuilder:
         elem = int(dtype_bytes(self.dtype))
         qk_width, v_width = c.dqk * elem, c.dv * elem
         scores, probs, pv = heads * keys * FP32_BYTES, heads * keys * elem, heads * c.dv * FP32_BYTES
-        state_heads = heads if c.abi == DSL_MQS_ABI else live
-        state = state_heads * (c.dv + SOFTMAX_STATE_SCALARS) * FP32_BYTES
+        dense_cann = c.abi in DENSE_CANN_ABIS
+        state_heads = heads if (dense_cann or c.abi == DSL_MQS_ABI) else live
+        state_scalars = FD_SOFTMAX_STATE_SCALARS if dense_cann else SOFTMAX_STATE_SCALARS
+        state = state_heads * (c.dv + state_scalars) * FP32_BYTES
+        out_heads = heads if dense_cann else live
+        cube_keys = layout.key_tile if (c.abi == DSL_MQS_ABI and keys > 0) else keys
+        # Arch35 direct UB->L1 kernels (FIA/FlashMLA/MQS/DSL) publish full s2BaseSize columns.
+        prob_cols = layout.key_tile if (not layout.gm_workspace and keys > 0) else keys
+        prob_publish = heads * prob_cols * elem
         d = _Demand(kv_reads=[] if self.planning is not None and step in {"kv_load", "pv_load"} else None)
         kv_base = 0
         if self.sequence_spans:
@@ -377,20 +745,20 @@ class _PagedMlaProgramBuilder:
                 d.linear("kv_workspace", "mte3", keys * qk_width, l2_hit_fraction=ws_hit)
             else:
                 pipe, alignment = layout.probability_output
-                d.add(pipe, align_bytes(keys * qk_width, alignment))
+                d.add(pipe, align_bytes(cube_keys * qk_width, alignment))
         elif step == "kv_refill" and c.abi == MQS_ABI:
             # mixed_quant_sparse_flash_mla_csa_block_cube.h:203 aligns refill rows up to 16.
             refill_rows = align_bytes(keys, MQS_REFILL_ROW_ALIGN)
             d.linear("kv_workspace", "mte2_aic", refill_rows * qk_width, l2_hit_fraction=ws_hit)
         elif step == "qk_operands":
             q_mult = (ceil_div(keys, ARCH22_MLA_NL1_SPLIT) if keys > 0 else 0) if layout.gm_workspace else 1
-            d.add("mte1", heads * q_mult * qk_width + keys * qk_width * l0b_factor)
+            d.add("mte1", heads * q_mult * qk_width + cube_keys * qk_width * l0b_factor)
         elif step == "qk":
-            d.flops = 2 * heads * keys * c.dqk
+            d.flops = 2 * heads * cube_keys * c.dqk
         elif step in {"score_store", "probability", "partial"}:
             tensor, (pipe, alignment), amount = {
                 "score_store": ("mm1", layout.matrix_output, scores),
-                "probability": ("vec1", layout.probability_output, probs),
+                "probability": ("vec1", layout.probability_output, prob_publish),
                 "partial": ("mm2", layout.matrix_output, pv),
             }[step]
             if layout.gm_workspace:
@@ -399,8 +767,8 @@ class _PagedMlaProgramBuilder:
                 else:
                     d.linear(tensor, pipe, amount, mm2_offset if step == "partial" else 0, l2_hit_fraction=ws_hit)
             else:
-                if step == "score_store" and layout.pv_panel_width:
-                    amount = fixpipe_rectangle_bytes(heads, keys)
+                if step == "score_store":
+                    amount = fixpipe_rectangle_bytes(heads, cube_keys)
                 d.add(pipe, align_bytes(amount, alignment))
         elif step == "score_read" and layout.gm_workspace:
             d.linear("mm1", "mte2_aiv", scores, l2_hit_fraction=ws_hit)
@@ -415,10 +783,11 @@ class _PagedMlaProgramBuilder:
                          l2_hit_fraction=v_hit)
         elif step == "pv_operands":
             p_mult = (ceil_div(c.dv, ARCH22_MLA_NL1_SPLIT) if c.dv > 0 else 0) if layout.gm_workspace else 1
-            d.add("mte1", probs * p_mult + keys * v_width * l0b_factor)
+            pv_probs = heads * cube_keys * elem
+            d.add("mte1", pv_probs * p_mult + cube_keys * v_width * l0b_factor)
         elif step in {"pv", "pv0", "pv1"}:
             columns = layout.pv_panel_width if step != "pv" else c.dv
-            d.flops = 2 * heads * keys * columns
+            d.flops = 2 * heads * cube_keys * columns
         elif step in {"partial0", "partial1"}:
             pipe, alignment = layout.matrix_output
             d.add(pipe, align_bytes(fixpipe_rectangle_bytes(heads, layout.pv_panel_width), alignment))
@@ -440,16 +809,20 @@ class _PagedMlaProgramBuilder:
             plan = AddressRunPlan((AddressRun(0, partials, state, align_bytes(state)),))
             d.transfer("vec2_split_state", "mte2_aiv", partials * state, plan)
         elif step == "merge":
-            d.add("vector", _merge_ops(c, live, max(0, partials - 1)))
+            d.add("vector", _merge_ops(c, out_heads, max(0, partials - 1)))
         elif step == "normalize" and partials:
-            d.add("vector", live * (c.dv + (2 if c.return_lse else 0)))
+            d.add("vector", out_heads * (c.dv + (2 if c.return_lse else 0)))
         elif step == "store":
-            d.linear("output", "mte3", live * v_width, q_base * v_width)
+            d.linear("output", "mte3", out_heads * v_width, q_base * v_width)
             if c.return_lse:
-                d.linear("lse", "mte3", live * FP32_BYTES, q_base * FP32_BYTES)
+                d.linear("lse", "mte3", out_heads * FP32_BYTES, q_base * FP32_BYTES)
         return d
+
     def _counts(self, seq: int, query: int) -> tuple[int, int]:
         c, width = self.contract, self.layout.key_tile
+        if self.fia_host_plan is not None:
+            tiles = ceil_div(c.sequences[seq][1], width)
+            return tiles, self.fia_host_plan.row_splits.get((seq, query), 1 if tiles else 0)
         if c.abi == DSL_MQS_ABI:
             ori, cmp = c.bank_counts(seq, query)
             tiles = ceil_div(ori, width) + ceil_div(cmp, width)
@@ -508,12 +881,17 @@ class _PagedMlaProgramBuilder:
     def _distribution(self):
         c = self.contract
         head_groups = ceil_div(c.physical_heads, self.layout.head_tile)
-        prefix = tuple(accumulate((q * head_groups for q, _ in c.sequences), initial=0))
+        prefix = tuple(accumulate((self._m_blocks_for_seq(seq) for seq in range(len(c.sequences))), initial=0))
         most_splits = max((n for _, _, n in self._group_ranges(head_groups, prefix)), default=0)
         lanes = min(len(self.owners), max(1, most_splits))
         return head_groups, prefix, lanes, len(self.owners) // lanes
 
     def _group_ranges(self, head_groups, prefix):
+        if self._pack_m():
+            for seq in range(len(self.contract.sequences)):
+                if prefix[seq + 1] > prefix[seq]:
+                    yield prefix[seq], prefix[seq + 1], self._counts(seq, 0)[1]
+            return
         for seq in range(len(self.contract.sequences)):
             for query, repeat in self._query_runs(seq):
                 if repeat:
@@ -529,17 +907,17 @@ class _PagedMlaProgramBuilder:
                 slots.update(range(base, base + max(1, min(partials, lanes))))
         return tuple(self.owners[i] for i in sorted(slots))
 
-    def _query_residue_multipliers(self, step: str, repeat: int) -> tuple[tuple[int, int], ...]:
+    def _row_residue_multipliers(self, step: str, repeat: int, row_stride: int) -> tuple[tuple[int, int], ...]:
         if repeat <= 1 or step not in {"q_load", "store"}:
             return ((0, repeat),)
         c = self.contract
         elem = int(dtype_bytes(self.dtype))
         if step == "q_load":
-            period = NZ_BLOCK_BYTES // gcd(c.physical_heads * c.dqk * elem, NZ_BLOCK_BYTES)
+            period = NZ_BLOCK_BYTES // gcd(row_stride * c.dqk * elem, NZ_BLOCK_BYTES)
         else:
-            p_out = NZ_BLOCK_BYTES // gcd(c.physical_heads * c.dv * elem, NZ_BLOCK_BYTES)
+            p_out = NZ_BLOCK_BYTES // gcd(row_stride * c.dv * elem, NZ_BLOCK_BYTES)
             p_lse = (
-                NZ_BLOCK_BYTES // gcd(c.physical_heads * FP32_BYTES, NZ_BLOCK_BYTES)
+                NZ_BLOCK_BYTES // gcd(row_stride * FP32_BYTES, NZ_BLOCK_BYTES)
                 if c.return_lse else 1
             )
             period = lcm(p_out, p_lse)
@@ -563,20 +941,159 @@ class _PagedMlaProgramBuilder:
         kv_v_period = NZ_BLOCK_BYTES // gcd(layout.key_tile * c.dv * elem, NZ_BLOCK_BYTES)
         return lcm(pt_period, kv_k_period, kv_v_period)
 
+    def _split_samples(self, count: int, can_fold_mid: bool, mid_period: int) -> tuple[tuple[int, int], ...]:
+        if can_fold_mid and count > 2:
+            mid_count = count - 2
+            return (
+                (0, 1),
+                *(
+                    (1 + r, (mid_count - 1 - r) // mid_period + 1)
+                    for r in range(min(mid_count, mid_period))
+                ),
+                (count - 1, 1),
+            )
+        return tuple((i, 1) for i in range(count))
+
+    def _fia_explicit_fd_reducers(self) -> tuple[tuple[tuple[int, int, int, int, int], ...], ...]:
+        c = self.contract
+        if c.abi != FIA_ABI or self.fia_host_plan is not None:
+            return ()
+        fd_tasks: list[tuple[int, int, int, int]] = []
+        for seq in range(len(c.sequences)):
+            m_blocks = self._m_blocks_for_seq(seq)
+            if not m_blocks:
+                continue
+            _, partials = self._counts(seq, 0)
+            if partials <= 1:
+                continue
+            for m_block in range(m_blocks):
+                _, heads, _, _, _ = self._m_block_span(seq, m_block)
+                fd_tasks.append((seq, m_block, heads, partials))
+        if not fd_tasks:
+            return ()
+        aiv_per_aic = min(len(aivs) for _, aivs in self.owners)
+        return _assign_fia_fd_reducers(
+            tuple(fd_tasks), len(self.owners), aiv_per_aic,
+            is_arch35=not self.layout.gm_workspace,
+        )
+
+    def _accumulate_fd_reducers(
+        self, totals: dict[str, Work],
+        reducers: tuple[tuple[tuple[int, int, int, int, int], ...], ...],
+    ) -> None:
+        c, layout = self.contract, self.layout
+        for chunks in reducers:
+            for seq, m_block, head_off, ch_heads, partials in chunks:
+                m_start = m_block * layout.head_tile + head_off
+                q_r, h_r = divmod(m_start, c.physical_heads)
+                for step in self._finish_steps(partials):
+                    work = self._demand(
+                        step, ch_heads, seq=seq, query=q_r, heads=ch_heads,
+                        partials=partials, head_start=h_r,
+                    ).work(self.dtype)
+                    totals[step] = totals.get(step, Work()) + work
+
+    def _accumulate_block_totals(
+        self, totals: dict[str, Work], seq: int, m_start: int, heads: int, live: int,
+        repeat: int, row_stride: int, tiles: int, partials: int,
+        phases: tuple[str, ...], can_fold_mid: bool, mid_period: int, *,
+        skip_fd_finish: bool = False,
+    ) -> None:
+        c = self.contract
+        base_query, _ = divmod(m_start, c.physical_heads)
+        for split in range(partials):
+            offset, count = self._split_extent(seq, base_query, tiles, split)
+            for i, mult in self._split_samples(count, can_fold_mid, mid_period):
+                for step in phases:
+                    for r_off, r_mult in self._row_residue_multipliers(step, repeat, row_stride):
+                        q_r, h_r = divmod(m_start + r_off * row_stride, c.physical_heads)
+                        demand = self._tile_demand(
+                            step, seq, q_r, heads, live, i, offset, count, partials, head_start=h_r,
+                        )
+                        totals[step] = totals.get(step, Work()) + demand.work(self.dtype).scaled(r_mult * mult)
+        if skip_fd_finish and partials > 1:
+            return
+        for step in self._finish_steps(partials):
+            for r_off, r_mult in self._row_residue_multipliers(step, repeat, row_stride):
+                q_r, h_r = divmod(m_start + r_off * row_stride, c.physical_heads)
+                work = self._demand(
+                    step, live, seq=seq, query=q_r, heads=heads, partials=partials, head_start=h_r,
+                ).work(self.dtype)
+                totals[step] = totals.get(step, Work()) + work.scaled(r_mult)
+
+    def _host_plan_totals(
+        self, phases: tuple[str, ...], can_fold_mid: bool, mid_period: int,
+    ) -> dict[str, Work]:
+        c, host = self.contract, self.fia_host_plan
+        assert host is not None
+        totals: dict[str, Work] = {}
+        for slices in host.core_slices:
+            for seq, m_block, offset, count in slices:
+                _, heads, live, query, head_start = self._m_block_span(seq, m_block)
+                partials = host.row_splits.get((seq, m_block), 1)
+                for i, mult in self._split_samples(count, can_fold_mid, mid_period):
+                    for step in phases:
+                        demand = self._tile_demand(
+                            step, seq, query, heads, live, i, offset, count, partials, head_start=head_start,
+                        )
+                        totals[step] = totals.get(step, Work()) + demand.work(self.dtype).scaled(mult)
+                if partials == 1:
+                    for step in self._finish_steps(1):
+                        work = self._demand(
+                            step, live, seq=seq, query=query, heads=heads, partials=1, head_start=head_start,
+                        ).work(self.dtype)
+                        totals[step] = totals.get(step, Work()) + work
+        for seq, (q_len, kv_len) in enumerate(c.sequences):
+            if q_len > 0 and kv_len == 0:
+                for m_block in range(self._m_blocks_for_seq(seq)):
+                    _, heads, live, query, head_start = self._m_block_span(seq, m_block)
+                    for step in self._finish_steps(0):
+                        work = self._demand(
+                            step, live, seq=seq, query=query, heads=heads, partials=0, head_start=head_start,
+                        ).work(self.dtype)
+                        totals[step] = totals.get(step, Work()) + work
+        self._accumulate_fd_reducers(totals, host.fd_reducers)
+        return totals
+
     def totals(self) -> dict[str, Work]:
         c, layout = self.contract, self.layout
-        totals: dict[str, Work] = {}
-        head_groups, prefix, lanes, groups_per_wave = self._distribution()
-        if c.sinks:
-            sink_owners = self._sink_owners(head_groups, prefix, lanes, groups_per_wave)
-            totals["sink_load"] = self._demand("sink_load", 0).work(self.dtype).scaled(len(sink_owners))
         phases = layout.phases
         can_fold_mid = (
             not c.mixed_quant and c.abi != DSL_MQS_ABI and not c.block_table
             and (layout.key_tile % c.page_size == 0 or c.page_size % layout.key_tile == 0)
         )
         mid_period = self._interior_tile_period() if can_fold_mid else 1
+        if self.fia_host_plan is not None:
+            return self._host_plan_totals(phases, can_fold_mid, mid_period)
+        totals: dict[str, Work] = {}
+        head_groups, prefix, lanes, groups_per_wave = self._distribution()
+        if c.sinks:
+            sink_owners = self._sink_owners(head_groups, prefix, lanes, groups_per_wave)
+            totals["sink_load"] = self._demand("sink_load", 0).work(self.dtype).scaled(len(sink_owners))
+        explicit_fd = self._fia_explicit_fd_reducers()
         for seq in range(len(c.sequences)):
+            if self._pack_m():
+                q_len = c.sequences[seq][0]
+                if not q_len:
+                    continue
+                tiles, partials = self._counts(seq, 0)
+                total_m = q_len * c.physical_heads
+                full_blocks, tail_m = divmod(total_m, layout.head_tile)
+                if full_blocks:
+                    self._accumulate_block_totals(
+                        totals, seq, 0, layout.head_tile, layout.head_tile,
+                        full_blocks, layout.head_tile, tiles, partials,
+                        phases, can_fold_mid, mid_period, skip_fd_finish=bool(explicit_fd),
+                    )
+                if tail_m:
+                    tail_start = full_blocks * layout.head_tile
+                    tail_live = _live_rows_in_span(tail_start, total_m, c.logical_heads, c.physical_heads)
+                    self._accumulate_block_totals(
+                        totals, seq, tail_start, tail_m, tail_live,
+                        1, layout.head_tile, tiles, partials,
+                        phases, can_fold_mid, mid_period, skip_fd_finish=bool(explicit_fd),
+                    )
+                continue
             for query, repeat in self._query_runs(seq):
                 if not repeat:
                     continue
@@ -584,52 +1101,14 @@ class _PagedMlaProgramBuilder:
                 for head_start in range(0, c.physical_heads, layout.head_tile):
                     heads = min(layout.head_tile, c.physical_heads - head_start)
                     live = min(heads, max(0, c.logical_heads - head_start))
-                    for split in range(partials):
-                        offset, count = self._split_extent(seq, query, tiles, split)
-                        if can_fold_mid and count > 2:
-                            mid_count = count - 2
-                            samples = (
-                                (0, 1),
-                                *(
-                                    (1 + r, (mid_count - 1 - r) // mid_period + 1)
-                                    for r in range(min(mid_count, mid_period))
-                                ),
-                                (count - 1, 1),
-                            )
-                        else:
-                            samples = tuple((i, 1) for i in range(count))
-                        for i, mult in samples:
-                            for step in phases:
-                                for q_off, q_mult in self._query_residue_multipliers(step, repeat):
-                                    demand = self._tile_demand(
-                                        step, seq, query + q_off, heads, live, i, offset, count, partials,
-                                        head_start=head_start,
-                                    )
-                                    totals[step] = totals.get(step, Work()) + demand.work(self.dtype).scaled(q_mult * mult)
-                    finish_steps = self._finish_steps(partials)
-                    if (c.abi == FIA_ABI and partials > 1 and lanes > 1
-                            and layout.head_tile >= NATIVE_FD_REDUCE_HEAD_TILE and live > FD_REDUCE_HEAD_GRAIN):
-                        n_chunks = min(lanes, ceil_div(live, FD_REDUCE_HEAD_GRAIN))
-                        base_h, extra_h = divmod(live, n_chunks)
-                        ch_head_start = head_start
-                        for idx in range(n_chunks):
-                            ch_live = base_h + (1 if idx < extra_h else 0)
-                            for step in finish_steps:
-                                for q_off, q_mult in self._query_residue_multipliers(step, repeat):
-                                    work = self._demand(
-                                        step, ch_live, seq=seq, query=query + q_off, heads=ch_live,
-                                        partials=partials, head_start=ch_head_start,
-                                    ).work(self.dtype)
-                                    totals[step] = totals.get(step, Work()) + work.scaled(q_mult)
-                            ch_head_start += ch_live
-                    else:
-                        for step in finish_steps:
-                            for q_off, q_mult in self._query_residue_multipliers(step, repeat):
-                                work = self._demand(
-                                    step, live, seq=seq, query=query + q_off, heads=heads, partials=partials,
-                                    head_start=head_start,
-                                ).work(self.dtype)
-                                totals[step] = totals.get(step, Work()) + work.scaled(q_mult)
+                    m_start = query * c.physical_heads + head_start
+                    self._accumulate_block_totals(
+                        totals, seq, m_start, heads, live,
+                        repeat, c.physical_heads, tiles, partials,
+                        phases, can_fold_mid, mid_period,
+                    )
+        if explicit_fd:
+            self._accumulate_fd_reducers(totals, explicit_fd)
         return totals
 
     def _stage(self, context, demand, pair, name, *, after=(), previous=(), previous_lags=(), metadata=None, latency=0.0, cold_caps=None, stage_caps=None):
@@ -651,7 +1130,10 @@ class _PagedMlaProgramBuilder:
                     pattern, bound, 0, hbm, self.planning,
                 )),)))
                 resources[access.pipe] -= ledger.aligned_transfer_bytes
-                resources["hbm"] -= ledger.dram_bus_transaction_bytes
+                if ledger.l2_hit_bytes:
+                    resources["l2"] -= ledger.l2_hit_bytes
+                if ledger.dram_bus_transaction_bytes:
+                    resources["hbm"] -= ledger.dram_bus_transaction_bytes
             work = Work(work.matrix, {role: value for role, value in resources.items() if value})
         if "l2" in work.resources and "l2" not in context.resource_names:
             work = Work(work.matrix, {role: val for role, val in work.resources.items() if role != "l2"})
@@ -747,7 +1229,8 @@ class _PagedMlaProgramBuilder:
         layout = self.layout
         aivs = pair[1]
         aiv_owners = ",".join(map(str, aivs)) if layout.pv_panel_width else ""
-        pair = (pair[0], pair[1][:heads])
+        aiv_limit = 1 if (layout.gm_workspace and heads <= SINGLE_AIV_HEAD_LIMIT) else heads
+        pair = (pair[0], pair[1][:aiv_limit])
         mm2_slot = interval % FIA_WORKSPACE_DEPTH
         mm2_offset = mm2_slot * align_bytes(layout.head_tile * self.contract.dv * FP32_BYTES)
         phases = layout.phases
@@ -887,11 +1370,108 @@ class _PagedMlaProgramBuilder:
             )
         return PipelineProgram(count + slots - 1, slots, lambda clk: _build_cycle(clk, compact_names=False))
 
+    def _lower_fd_reducers(
+        self, context: RecipeContext,
+        reducers: tuple[tuple[tuple[int, int, int, int, int], ...], ...],
+        used_cores: int,
+    ) -> ParallelProgram:
+        c, layout = self.contract, self.layout
+        active_owners = self.owners[:max(1, min(len(self.owners), used_cores))]
+        all_aivs = tuple(aiv for _, aivs in active_owners for aiv in aivs)
+        base_aic = active_owners[0][0]
+        branches: list[KernelProgram] = []
+        for aiv_idx, chunks in enumerate(reducers):
+            phys_aiv = all_aivs[aiv_idx % len(all_aivs)]
+            aiv_pair = (base_aic, (phys_aiv,))
+            aiv_stages: list[Stage] = []
+            for ch_idx, (seq, m_block, head_off, ch_heads, partials) in enumerate(chunks):
+                m_start = m_block * layout.head_tile + head_off
+                q_r, h_r = divmod(m_start, c.physical_heads)
+                for step in self._finish_steps(partials):
+                    dep = (aiv_stages[-1].name,) if aiv_stages else ()
+                    st_name = step if len(chunks) == 1 else f"{step}_{ch_idx}"
+                    aiv_stages.append(self._stage(
+                        context, self._demand(step, ch_heads, seq=seq, query=q_r, heads=ch_heads,
+                                              partials=partials, head_start=h_r),
+                        aiv_pair, st_name, after=dep, metadata={"nonempty_splits": partials},
+                    ))
+            branches.append(KernelProgram(tuple(aiv_stages)))
+        return ParallelProgram(tuple(branches))
+
+    def _wrap_global_fd_barrier(
+        self, context: RecipeContext, producer: Program,
+        reducers: tuple[tuple[tuple[int, int, int, int, int], ...], ...],
+        used_cores: int,
+    ) -> KernelProgram:
+        stages = [Stage("flash_attention", program=producer)]
+        if (syncall_ms := p13_syncall_ms(context)) > 0.0:
+            stages.append(Stage("fd_syncall", after=(stages[-1].name,), latency=syncall_ms, keep_empty=True))
+        stages.append(Stage(
+            "fd_reduce", after=(stages[-1].name,),
+            program=self._lower_fd_reducers(context, reducers, used_cores),
+        ))
+        return KernelProgram(tuple(stages))
+
+    def _lower_fia_host_plan(self, context: RecipeContext) -> Program:
+        c, layout, host = self.contract, self.layout, self.fia_host_plan
+        assert host is not None
+        active_cores = min(len(self.owners), len(host.core_slices))
+        core_programs: list[KernelProgram] = []
+        for core_idx, slices in enumerate(host.core_slices):
+            pair = self.owners[core_idx % len(self.owners)]
+            c_stages: list[Stage] = []
+            for slice_idx, (seq, m_block, offset, count) in enumerate(slices):
+                _, heads, live, query, head_start = self._m_block_span(seq, m_block)
+                partials = host.row_splits.get((seq, m_block), 1)
+                dep = (c_stages[-1].name,) if c_stages else ()
+                prog = self._split_program(
+                    context, seq, query, heads, live, pair, offset, count, partials,
+                    slice_idx, head_start, active_owners=active_cores,
+                )
+                c_stages.append(Stage(f"slice{slice_idx}", after=dep, program=prog, metadata={"split": slice_idx}))
+                if partials == 1:
+                    f_pair = (pair[0], pair[1][:1]) if (layout.gm_workspace and heads <= SINGLE_AIV_HEAD_LIMIT) else pair
+                    for step in self._finish_steps(1):
+                        c_stages.append(self._stage(
+                            context, self._demand(step, live, seq=seq, query=query, heads=heads, partials=1,
+                                                  head_start=head_start),
+                            f_pair, f"{step}_{slice_idx}", after=(c_stages[-1].name,),
+                            metadata={"nonempty_splits": 1},
+                        ))
+            if c_stages:
+                core_programs.append(KernelProgram(tuple(c_stages)))
+        empty_stages: list[Stage] = []
+        for seq, (q_len, kv_len) in enumerate(c.sequences):
+            if q_len > 0 and kv_len == 0:
+                for m_block in range(self._m_blocks_for_seq(seq)):
+                    _, heads, live, query, head_start = self._m_block_span(seq, m_block)
+                    pair = self.owners[0]
+                    f_pair = (pair[0], pair[1][:1]) if (layout.gm_workspace and heads <= SINGLE_AIV_HEAD_LIMIT) else pair
+                    for step in self._finish_steps(0):
+                        dep = (empty_stages[-1].name,) if empty_stages else ()
+                        empty_stages.append(self._stage(
+                            context, self._demand(step, live, seq=seq, query=query, heads=heads, partials=0,
+                                                  head_start=head_start),
+                            f_pair, f"{step}_empty_{seq}_{m_block}", after=dep,
+                            metadata={"nonempty_splits": 0},
+                        ))
+        if empty_stages:
+            core_programs.append(KernelProgram(tuple(empty_stages)))
+        if not core_programs:
+            return KernelProgram(())
+        producer: Program = core_programs[0] if len(core_programs) == 1 else ParallelProgram(tuple(core_programs))
+        if host.fd_reducers:
+            return self._wrap_global_fd_barrier(context, producer, host.fd_reducers, host.used_cores)
+        return producer
+
     def __call__(self, context: RecipeContext) -> Program:
         c, layout = self.contract, self.layout
+        if self.fia_host_plan is not None:
+            return self._lower_fia_host_plan(context)
         head_groups, prefix, lanes, groups_per_wave = self._distribution()
         if not prefix[-1]:
             return KernelProgram(())
+        explicit_fd = self._fia_explicit_fd_reducers()
 
         intervals = []
         if layout.gm_workspace:
@@ -915,10 +1495,14 @@ class _PagedMlaProgramBuilder:
 
         def group(group_index, owner_start):
             seq = bisect_right(prefix, group_index) - 1
-            query, head_group = divmod(group_index - prefix[seq], head_groups)
-            head_start = head_group * layout.head_tile
-            heads = min(layout.head_tile, c.physical_heads - head_start)
-            live = min(heads, max(0, c.logical_heads - head_start))
+            local_block = group_index - prefix[seq]
+            if self._pack_m():
+                _, heads, live, query, head_start = self._m_block_span(seq, local_block)
+            else:
+                query, head_group = divmod(local_block, head_groups)
+                head_start = head_group * layout.head_tile
+                heads = min(layout.head_tile, c.physical_heads - head_start)
+                live = min(heads, max(0, c.logical_heads - head_start))
             tiles, partials = self._counts(seq, query)
 
             active_groups = min(groups_per_wave, prefix[-1])
@@ -935,46 +1519,37 @@ class _PagedMlaProgramBuilder:
                     yield Stage(f"split{local}", program=program, metadata={"split": split})
 
             stages = [Stage("splits", program=PipelineProgram(ceil_div(partials, lanes), 1, wave))]
-            if partials > 1 and (syncall_ms := p13_syncall_ms(context)) > 0.0:
-                stages.append(Stage("fd_syncall", after=(stages[-1].name,), latency=syncall_ms, keep_empty=True))
-            if (c.abi == FIA_ABI and partials > 1 and lanes > 1
-                    and layout.head_tile >= NATIVE_FD_REDUCE_HEAD_TILE and live > FD_REDUCE_HEAD_GRAIN):
-                n_chunks = min(lanes, ceil_div(live, FD_REDUCE_HEAD_GRAIN))
-                base_h, extra_h = divmod(live, n_chunks)
-                finish_steps = self._finish_steps(partials)
-                def _reduce_chunk(idx: int) -> KernelProgram:
-                    ch_live = base_h + (1 if idx < extra_h else 0)
-                    ch_head_start = head_start + idx * base_h + min(idx, extra_h)
-                    ch_pair = self.owners[owner_start + idx]
-                    ch_stages: list[Stage] = []
-                    for step in finish_steps:
-                        dep = (ch_stages[-1].name,) if ch_stages else ()
-                        ch_stages.append(self._stage(
-                            context, self._demand(step, ch_live, seq=seq, query=query, heads=ch_live,
-                                                  partials=partials, head_start=ch_head_start),
-                            ch_pair, step, after=dep, metadata={"nonempty_splits": partials},
-                        ))
-                    return KernelProgram(tuple(ch_stages))
+            if explicit_fd and partials > 1:
+                if prefix[-1] > 1:
+                    return KernelProgram(tuple(stages))
+                if (syncall_ms := p13_syncall_ms(context)) > 0.0:
+                    stages.append(Stage("fd_syncall", after=(stages[-1].name,), latency=syncall_ms, keep_empty=True))
                 stages.append(Stage(
                     "fd_reduce", after=(stages[-1].name,),
-                    program=PipelineProgram(1, 1, lambda _i: tuple(
-                        Stage(f"reduce{k}", program=_reduce_chunk(k)) for k in range(n_chunks)
-                    )),
+                    program=self._lower_fd_reducers(context, explicit_fd, len(self.owners)),
                 ))
-            else:
-                for step in self._finish_steps(partials):
-                    stages.append(self._stage(
-                        context, self._demand(step, live, seq=seq, query=query, heads=heads, partials=partials,
-                                              head_start=head_start), self.owners[owner_start],
-                        step, after=(stages[-1].name,), metadata={"nonempty_splits": partials},
-                    ))
+                return KernelProgram(tuple(stages))
+            if partials > 1 and (syncall_ms := p13_syncall_ms(context)) > 0.0:
+                stages.append(Stage("fd_syncall", after=(stages[-1].name,), latency=syncall_ms, keep_empty=True))
+            finish_pair = self.owners[owner_start]
+            if layout.gm_workspace and heads <= SINGLE_AIV_HEAD_LIMIT:
+                finish_pair = (finish_pair[0], finish_pair[1][:1])
+            for step in self._finish_steps(partials):
+                stages.append(self._stage(
+                    context, self._demand(step, live, seq=seq, query=query, heads=heads, partials=partials,
+                                          head_start=head_start), finish_pair,
+                    step, after=(stages[-1].name,), metadata={"nonempty_splits": partials},
+                ))
             return KernelProgram(tuple(stages))
+
         def launch(index):
             start = index * groups_per_wave
             return tuple(Stage(f"query{local}", program=group(start + local, local * lanes))
                          for local in range(min(groups_per_wave, prefix[-1] - start)))
 
         pipeline = PipelineProgram(ceil_div(prefix[-1], groups_per_wave), 1, launch)
+        if explicit_fd and prefix[-1] > 1:
+            return self._wrap_global_fd_barrier(context, pipeline, explicit_fd, len(self.owners))
         if not c.sinks:
             return pipeline
         loads = tuple(self._stage(context, self._demand("sink_load", 0), pair, f"sink_load{pair[0]}")
@@ -995,14 +1570,13 @@ def owner_pairs(ctx: OperatorPlanningContext, abi: str) -> tuple[tuple[int, tupl
 
 def make_plan(op: OpSpec, ctx: OperatorPlanningContext, c: PagedMlaContract,
               layout: PipelineLayout, sources: tuple[SourceRef, ...], *, pairs=None,
-              row_cuts: RowCuts | None = None, **metadata) -> OperatorPlan:
+              row_cuts: RowCuts | None = None, fia_host_plan: _FiaHostPlan | None = None,
+              **metadata) -> OperatorPlan:
     dtype = op.dtype or "bf16"
     if dtype not in {"bf16", "fp16"} or (c.mixed_quant and dtype != "bf16"):
         raise capability_gap("paged_mla_unsupported_dtype", c.abi, ctx.compute_arch.arch_id)
     if pairs is None:
         pairs = owner_pairs(ctx, c.abi)
-    if layout.gm_workspace and layout.head_tile <= SINGLE_AIV_HEAD_LIMIT:
-        pairs = tuple((aic, aivs[:1]) for aic, aivs in pairs)
     spans = planning_sequence_spans(ctx, c.kv_layout)
     raw = dict(op.metadata)
     tensor_id = raw.get("kv_tensor_id", "")
@@ -1011,6 +1585,7 @@ def make_plan(op: OpSpec, ctx: OperatorPlanningContext, c: PagedMlaContract,
     query_offsets = tuple(accumulate((q for q, _ in c.sequences), initial=0))
     builder = _PagedMlaProgramBuilder(
         c, layout, dtype, pairs, row_cuts or {}, spans, planning, tensor_id, version, query_offsets,
+        fia_host_plan,
     )
     phase_totals = builder.totals()
     if "l2" not in ctx.geometry.rates:
@@ -1032,7 +1607,7 @@ def make_plan(op: OpSpec, ctx: OperatorPlanningContext, c: PagedMlaContract,
             "implementation": c.abi, "arch_id": ctx.compute_arch.arch_id, "governed_family": FAMILY,
             "native_kind": public_name, "native_entry": native_entry, "native_namespace": native_ns,
             "s2_base_size": c.s2_base_size, "key_tile": layout.key_tile, "dqk": c.dqk, "dv": c.dv,
-            "useful_matrix_flops": c.useful_matrix_flops, "issued_matrix_flops": c.issued_matrix_flops,
+            "useful_matrix_flops": c.useful_matrix_flops, "issued_matrix_flops": int(sum(total.matrix.values())),
             "latent_record_bytes": 0 if c.mixed_quant else latent_record_bytes(c, dtype=dtype),
             "scale_encoding": c.scale_encoding if c.mixed_quant else "", **metadata,
             **sequence_layout_metadata(ctx, c.kv_layout), **({"sinks": c.sinks} if c.sinks else {}),
