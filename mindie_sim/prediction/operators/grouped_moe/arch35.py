@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from functools import partial
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import ArchId, SourceRef
@@ -23,10 +24,12 @@ from .common import (
     SHIPPING_MEGAMOE_ACTIVATIONS, SHIPPING_SWIGLU_QUANT_ACTIVATIONS, SPARSE_GROUP_LIST_TYPE,
     StageDemand, activation_stages, capability_gap, contract_fields,
     blaze_tasks, ceil_div, element_bytes, fractal_issues, fractal_k0, make_plan, matrix_schedule,
-    matrix_stages, tensor_bytes, validate_contract,
+    matrix_stages, tensor_bytes, validate_contract, vector_stages,
 )
 
 from .lowering import DualBatchMoEPipeline, mx_scale_bytes, routing_stages, validate_transport_work
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
 
 SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
@@ -102,7 +105,20 @@ GMM2_LAG_MIN_TOKEN_NUM = 4096
 MEGA_MOE_WAVE_TILE = 256
 GMM1_WAVE_N_TILES_PER_CORE = 4
 FP4_DTYPES = frozenset({"fp4", "fp4_e2m1", "mxfp4"})
-BYTE_DTYPES = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8", "int8", "hif8"})
+FP8_E4M3_COMPAT_DTYPES = frozenset({"fp8", "fp8_e4m3", "mxfp8", "hif8"})
+A8W4_NZ_LAYOUTS = frozenset({"FRACTAL_NZ_C0_32", "FRACTAL_NZ", "NZ"})
+ARCH35_MIN_EP_WORLD_SIZE = 2
+ARCH35_MAX_EP_WORLD_SIZE = 1024
+V2_GATED_ABI = "aclnnGroupedMatmulSwigluQuantV2"
+V2_PERTOKEN_DTYPE_TUPLES = frozenset({
+    ("int8", "int8", "int8"),
+    ("fp8_e4m3", "fp8_e4m3", "fp8_e4m3"),
+    ("fp8_e4m3", "fp8_e4m3", "int8"),
+    ("fp8_e5m2", "fp8_e5m2", "fp8_e5m2"),
+    ("fp8_e5m2", "fp8_e5m2", "int8"),
+    ("hif8", "hif8", "hif8"),
+})
+_GATED_ACTIVATION_DIVISOR = 2
 SHARED_DTYPE_ALIASES = {
     "fp8": "fp8_e4m3", "mxfp8": "fp8_e4m3", "fp4": "fp4_e2m1", "mxfp4": "fp4_e2m1",
 }
@@ -120,10 +136,33 @@ DEQUANT_GROUP_CUT_MAX_AVG_ROWS = 16
 DEQUANT_FULL_LOAD_MAX_WIDTH = 5120
 DEQUANT_UB_RESERVE_BYTES = 1024
 UB_BLOCK_BYTES = 32
+_NOT_FULL_Y_SPLIT_BASE = 1
+_NOT_FULL_INT32_X_SPLIT = 8
+_NOT_FULL_FP16_X_SPLIT = 4
+_NOT_FULL_WEIGHT_SCALE_SPLIT = 8
+_NOT_FULL_QUANT_SCALE_SPLIT = 4
+_NOT_FULL_QUANT_OFFSET_SPLIT = 4
+_NOT_FULL_BIAS_4B_SPLIT = 8
+_NOT_FULL_BIAS_2B_SPLIT = 4
+_NOT_FULL_DOUBLE_BUFFER = 2
+_NOT_FULL_TMP_BUFFER_SPLIT = 8
+_BIAS_4B_THRESHOLD = 4
+_HALF_DIVISOR = 2
+_QUANT_MODE_DYNAMIC = 1
 
 
 def _nz_tail_alignment(contract):
     return fractal_k0(contract.matrix_weight_dtype) if contract.padded_weight else 1
+
+
+def _is_arch35_v2_pertoken(contract, fields) -> bool:
+    if (contract.abi != V2_GATED_ABI or contract.activation_divisor != _GATED_ACTIVATION_DIVISOR
+            or fields.get("quant_mode") != 0 or fields.get("dequant_mode") != 0):
+        return False
+    a = "fp8_e4m3" if contract.dtype_a == "fp8" else contract.dtype_a
+    b = "fp8_e4m3" if contract.dtype_b == "fp8" else contract.dtype_b
+    out = "fp8_e4m3" if contract.output_dtype == "fp8" else contract.output_dtype
+    return (a, b, out) in V2_PERTOKEN_DTYPE_TUPLES
 
 
 def _specialization(op, ctx, contract):
@@ -132,9 +171,15 @@ def _specialization(op, ctx, contract):
         return "MegaMoeA16W16Wave"
     if a in FP4_DTYPES and b in FP4_DTYPES:
         return "MegaMoeA4W4Wave"
-    if a in BYTE_DTYPES and b in FP4_DTYPES:
+    if a in FP8_E4M3_COMPAT_DTYPES and b in FP4_DTYPES:
+        if contract.layout_b not in A8W4_NZ_LAYOUTS:
+            raise capability_gap(op, ctx, f"arch35_mega_moe_a8w4_requires_nz_layout:{contract.layout_b}")
         return "MegaMoeA8W4Wave"
-    if a in BYTE_DTYPES and b in BYTE_DTYPES:
+    if a == "fp8_e5m2" and b == "fp8_e5m2":
+        if contract.padded_weight:
+            raise capability_gap(op, ctx, "arch35_mega_moe_fp8_e5m2_requires_nd")
+        return "MegaMoeA8W8Wave"
+    if a in FP8_E4M3_COMPAT_DTYPES and b in FP8_E4M3_COMPAT_DTYPES:
         return "MegaMoeA8W8Wave"
     raise capability_gap(op, ctx, f"arch35_mega_moe_operand_pair:{a}:{b}")
 
@@ -155,6 +200,8 @@ def _validate(op, ctx, contract):
     fields = contract_fields(op)
     allow_abi_ext = bool(fields.get("abi_variant_extension", False))
     if mode in ROUTED_MODES:
+        if not (ARCH35_MIN_EP_WORLD_SIZE <= contract.ep <= ARCH35_MAX_EP_WORLD_SIZE):
+            raise capability_gap(op, ctx, f"arch35_mega_moe_ep_world_size:{contract.ep}")
         if not allow_abi_ext and contract.activation not in SHIPPING_MEGAMOE_ACTIVATIONS:
             raise capability_gap(op, ctx, f"arch35_mega_moe_activation:{contract.activation}")
         _specialization(op, ctx, contract)
@@ -168,12 +215,18 @@ def _validate(op, ctx, contract):
     if mode == "gmm_swiglu_quant":
         if not allow_abi_ext and contract.activation not in SHIPPING_SWIGLU_QUANT_ACTIVATIONS:
             raise capability_gap(op, ctx, f"arch35_swiglu_quant_activation:{contract.activation}")
-        if (contract.dtype_a not in MX_DTYPES or contract.dtype_b not in MX_DTYPES
-                or contract.activation_divisor != 2):
+        is_mx_pair = (
+            (contract.dtype_a in MX_DTYPES or contract.act_mx_scaled)
+            and (contract.dtype_b in MX_DTYPES or contract.weight_mx_scaled)
+            and contract.activation_divisor == _GATED_ACTIVATION_DIVISOR
+        )
+        if not (is_mx_pair or _is_arch35_v2_pertoken(contract, fields)):
             raise capability_gap(op, ctx, "arch35_paired_mx_operands")
     if mode == "dequant_swiglu_quant":
         if not allow_abi_ext and contract.activation not in SHIPPING_SWIGLU_QUANT_ACTIVATIONS:
             raise capability_gap(op, ctx, f"arch35_dequant_swiglu_activation:{contract.activation}")
+        if contract.activation_divisor != _GATED_ACTIVATION_DIVISOR:
+            raise capability_gap(op, ctx, f"arch35_dequant_swiglu_gated_activation:{contract.activation}")
         if contract.handoff_dtype not in AIV_INPUT_DTYPES:
             raise capability_gap(op, ctx, f"arch35_dequant_input:{contract.handoff_dtype}")
 
@@ -203,7 +256,10 @@ def fit_ub(contract, ctx):
     return replace(contract, base_m=rows, base_n=columns), ceil_div(rows, consumers) * columns * accum_bytes
 
 
-def _gated_stages(contract, ctx, name, after, metadata, *, start_core=0, owner_ready=None):
+def _gated_stages(
+    contract, ctx, name, after, metadata, *, start_core=0, owner_ready=None,
+    pertoken_v2: bool = False, weight_scale_dtype: str = "fp32",
+):
     """Lower paired MMADs with a UB credit and an AIV acknowledgement per tile."""
     tiled, slot_bytes = fit_ub(contract, ctx)
     n_alignment = MX_SCALE_GROUP_SIZE if contract.uses_mx_scales else 1
@@ -229,8 +285,11 @@ def _gated_stages(contract, ctx, name, after, metadata, *, start_core=0, owner_r
                 consumers = (paired[0] if paired else owner * ctx.effective_aiv_cores // ctx.effective_aic_cores,)
             key = f"e{group.expert}:t{task}"
             deps = (*after, *previous.get(owner, ()))
-            body, fixpipe, done = _paired_tile(contract, gmm, activation, key, deps, rows, columns, column,
-                                               owner, consumers, slot_bytes, metadata)
+            body, fixpipe, done = _paired_tile(
+                contract, gmm, activation, key, deps, rows, columns, column,
+                owner, consumers, slot_bytes, metadata,
+                pertoken_v2=pertoken_v2, weight_scale_dtype=weight_scale_dtype,
+            )
             stages.extend(body)
             gmm_ends.append(fixpipe)
             stores.extend(done)
@@ -240,6 +299,23 @@ def _gated_stages(contract, ctx, name, after, metadata, *, start_core=0, owner_r
         ("useful_flops", divisor * schedule.useful_flops), ("issued_fractals", divisor * schedule.issued_fractals),
         ("max_waves", schedule.max_waves), ("wave_tail_imbalance", schedule.wave_tail_imbalance),
     )))
+    if pertoken_v2 and contract.m:
+        # CANN kernel_gmm_swiglu_pertoken_quant.h:449 runs SyncAll across all
+        # tiles' FP32 SwiGLU workspace writes before pass-2 per-token quant.
+        sync_name = activation + ":sync_all"
+        stages.append(StageDemand(sync_name, (gmm, *stores), metadata=metadata))
+        pass2_name = activation + ":pertoken_quant"
+        ws_row_bytes = contract.intermediate * INT32_HANDOFF_BYTES_PER_ELEM
+        out_row_bytes = element_bytes(contract.intermediate, contract.quant_dtype) + PER_TOKEN_SCALE_BYTES
+        stages.extend(vector_stages(
+            pass2_name, (sync_name,), ctx, contract.group_rows,
+            read=ws_row_bytes,
+            compute=contract.intermediate * QUANT_OPS_PER_ELEMENT,
+            write=out_row_bytes,
+            metadata=metadata,
+        ))
+        stages.append(StageDemand(activation, (pass2_name,), metadata=metadata))
+        return stages, schedule
     if not contract.uses_mx_scales and contract.quant_dtype not in FLOAT_EPILOGUE_DTYPES and contract.m:
         scale_bytes = contract.m * PER_TOKEN_SCALE_BYTES
         scales = StageDemand(activation + ":scales", tuple(stores), Work(resources={
@@ -252,9 +328,10 @@ def _gated_stages(contract, ctx, name, after, metadata, *, start_core=0, owner_r
 
 
 def _paired_tile(contract, gmm, activation, key, after, rows, columns, column,
-                 owner, consumers, slot_bytes, metadata):
+                 owner, consumers, slot_bytes, metadata, *,
+                 pertoken_v2: bool = False, weight_scale_dtype: str = "fp32"):
     divisor = contract.activation_divisor
-    input_scaled = contract.dtype_a == "int8" and contract.mode in ROUTED_MODES
+    input_scaled = contract.dtype_a == "int8" and (contract.mode in ROUTED_MODES or pertoken_v2)
     weight_k, weight_n = contract.k, columns
     if contract.padded_weight:
         k0 = fractal_k0(contract.dtype_b)
@@ -262,21 +339,32 @@ def _paired_tile(contract, gmm, activation, key, after, rows, columns, column,
         weight_k = ceil_div(weight_k, k_align) * k_align
         weight_n = ceil_div(weight_n, n_align) * n_align
     operand_bytes = divisor * (
-        tensor_bytes(rows, contract.k, contract.dtype_a, scaled=input_scaled)
-        + tensor_bytes(weight_n, weight_k, contract.dtype_b)
+        tensor_bytes(
+            rows, contract.k, contract.dtype_a, scaled=input_scaled,
+            mx_scaled=contract.act_mx_scaled, mx_padded=contract.act_mx_padded,
+        )
+        + tensor_bytes(
+            weight_n, weight_k, contract.dtype_b,
+            mx_scaled=contract.weight_mx_scaled, mx_padded=contract.weight_mx_padded,
+        )
     )
     _, issued = fractal_issues(rows, columns, contract.k, contract.compute_dtype)
     fix_bytes = rows * element_bytes(columns * divisor, contract.handoff_dtype)
     quantized = contract.quant_dtype not in FLOAT_EPILOGUE_DTYPES
-    ops_per_row = columns * (
-        ACTIVATION_OPS[contract.activation] + (QUANT_OPS_PER_ELEMENT if quantized else 0)
-    )
-    output_per_row = element_bytes(columns, contract.quant_dtype)
-    if contract.uses_mx_scales:
-        end_column = column + columns
-        # Interior tiles write valid groups; only the last tile writes row padding.
-        output_per_row += mx_scale_bytes(end_column, padded=end_column == contract.intermediate)
-        output_per_row -= mx_scale_bytes(column, padded=False)
+    if pertoken_v2:
+        # Pass 1 dequantizes with channel scales + SwiGLU and writes FP32 GM workspace.
+        ops_per_row = columns * ACTIVATION_OPS[contract.activation]
+        output_per_row = columns * INT32_HANDOFF_BYTES_PER_ELEM
+    else:
+        ops_per_row = columns * (
+            ACTIVATION_OPS[contract.activation] + (QUANT_OPS_PER_ELEMENT if quantized else 0)
+        )
+        output_per_row = element_bytes(columns, contract.quant_dtype)
+        if contract.uses_mx_scales:
+            end_column = column + columns
+            # Interior tiles write valid groups; only the last tile writes row padding.
+            output_per_row += mx_scale_bytes(end_column, padded=end_column == contract.intermediate)
+            output_per_row -= mx_scale_bytes(column, padded=False)
     base = f"{gmm}:{key}"
     read, cube, flag = (f"{base}:{phase}" for phase in ("read", "cube", "fixpipe"))
     stages = [
@@ -288,6 +376,7 @@ def _paired_tile(contract, gmm, activation, key, after, rows, columns, column,
     ]
     credits, done, epilogue = [], [], []
     rows_per_aiv = ceil_div(rows, len(consumers))
+    tile_ch_scale_bytes = element_bytes(columns * divisor, weight_scale_dtype) if pertoken_v2 else 0
     for subblock, aiv in enumerate(consumers):
         prefix = f"{activation}:{key}:aiv{aiv}"
         credit, vector, store, sync = (f"{prefix}:{phase}" for phase in ("credit", "vector", "store", "sync"))
@@ -297,9 +386,16 @@ def _paired_tile(contract, gmm, activation, key, after, rows, columns, column,
         if active:
             stages.append(StageDemand(credit, after, kind="aiv", owner=aiv, metadata=tag, ub_acquire=slot))
             credits.append(credit)
+            vec_deps = (flag,)
+            if pertoken_v2 and tile_ch_scale_bytes:
+                scale_stage = f"{prefix}:weight_scale"
+                epilogue.append(StageDemand(scale_stage, (flag,), Work(resources={
+                    "hbm": tile_ch_scale_bytes, "l2": tile_ch_scale_bytes, "mte2_aiv": tile_ch_scale_bytes,
+                }), "aiv", aiv, tag))
+                vec_deps = (scale_stage,)
             output = active * output_per_row
             epilogue.extend((
-                StageDemand(vector, (flag,), Work(resources={"vector": active * ops_per_row}), "aiv", aiv, tag),
+                StageDemand(vector, vec_deps, Work(resources={"vector": active * ops_per_row}), "aiv", aiv, tag),
                 StageDemand(store, (vector,), Work(resources={
                     "hbm": output, "l2": output, "mte3": output,
                 }), "aiv", aiv, tag),
@@ -448,6 +544,10 @@ def _shared_stages(stages, ctx, contract, name, after, metadata):
         n=contract.activation_divisor * contract.shared_intermediate,
         compute_dtype=compute, dtype_a=input_dtype, dtype_b=contract.shared_weight_dtype,
         quant_dtype=input_dtype, handoff_dtype=handoff,
+        act_mx_scaled=input_dtype in MX_DTYPES,
+        weight_mx_scaled=contract.shared_weight_dtype in MX_DTYPES,
+        act_mx_padded=True,
+        weight_mx_padded=True,
     )
     prefix = name + "shared_"
     body, _ = _gated_stages(shared, ctx, prefix, after, metadata)
@@ -463,55 +563,152 @@ def _shared_stages(stages, ctx, contract, name, after, metadata):
     return end
 
 
-def _int32_dequant_stages(contract, ctx, fields):
+def _not_full_dequant_workspace_per_row(
+    ctx, width: int, is_int32: bool, has_bias: bool, bias_elem_bytes: int, fields: dict,
+) -> int:
+    quant_mode = fields.get("quant_mode", _QUANT_MODE_DYNAMIC)
+    ub_available = ctx.datapath.usable_bytes("ub") - DEQUANT_UB_RESERVE_BYTES - UB_BLOCK_BYTES
+    ub_split = (
+        _NOT_FULL_Y_SPLIT_BASE
+        + (_NOT_FULL_INT32_X_SPLIT if is_int32 else _NOT_FULL_FP16_X_SPLIT)
+        + (_NOT_FULL_WEIGHT_SCALE_SPLIT if is_int32 else 0)
+        + _NOT_FULL_QUANT_SCALE_SPLIT
+    )
+    if fields.get("has_quant_offset"):
+        ub_split += _NOT_FULL_QUANT_OFFSET_SPLIT
+    if has_bias:
+        ub_split += _NOT_FULL_BIAS_4B_SPLIT if bias_elem_bytes >= _BIAS_4B_THRESHOLD else _NOT_FULL_BIAS_2B_SPLIT
+    ub_split = ub_split * _NOT_FULL_DOUBLE_BUFFER + _NOT_FULL_TMP_BUFFER_SPLIT
+    ub_factor = (ub_available // ub_split) // UB_BLOCK_BYTES * UB_BLOCK_BYTES
+    if ub_factor < 1:
+        raise ModelingError("grouped_moe_dequant_not_full_does_not_fit")
+    loops = ceil_div(width, ub_factor)
+    if quant_mode != _QUANT_MODE_DYNAMIC or loops <= 1:
+        return 0
+    balanced = ceil_div(ceil_div(width, loops), UB_BLOCK_BYTES) * UB_BLOCK_BYTES
+    if 0 < balanced <= ub_factor and ceil_div(width, balanced) == loops:
+        ub_factor = balanced
+    return (loops - 1) * ub_factor * INT32_HANDOFF_BYTES_PER_ELEM
+
+
+def _dequant_group_slices(count: int, owners: int, *, special: bool, not_full: bool, group: int):
+    if special:
+        yield group % owners, 0, count
+        return
+    if not_full:
+        # Wide-row kernel distributes rows cyclically across all active AIVs.
+        base, rem = divmod(count, owners)
+        start = 0
+        for owner in range(min(owners, count)):
+            size = base + (1 if owner < rem else 0)
+            yield owner, start, size
+            start += size
+        return
+    step = ceil_div(count, owners)
+    for part, start in enumerate(range(0, count, step)):
+        yield part, start, min(step, count - start)
+
+
+def _dequant_stages(contract, ctx, fields):
     name = "dequant_swiglu_quant"
     if not contract.m:
         return [StageDemand(name)]
     rows, width = contract.group_rows, contract.intermediate
     allocated = contract.allocated_rows
-    channels = element_bytes(contract.n, "fp32")
+    is_int32 = contract.handoff_dtype == "int32"
+    channels = element_bytes(contract.n, "fp32") if is_int32 else 0
+    has_bias = is_int32 and bool(fields.get("has_bias", False))
+    bias_dtype = str(fields.get("bias_dtype", "fp32")).lower()
+    has_quant_scale = bool(fields.get("has_quant_scale", False))
+    quant_scale_dtype = str(fields.get("quant_scale_dtype", "fp32")).lower()
+    has_quant_offset = bool(fields.get("has_quant_offset", False))
+    quant_offset_dtype = str(fields.get("quant_offset_dtype", "fp32")).lower()
+    quant_mode = fields.get("quant_mode", _QUANT_MODE_DYNAMIC)
+    dynamic_quant = quant_mode == _QUANT_MODE_DYNAMIC
+    bias_bytes = element_bytes(contract.n, bias_dtype) if has_bias else 0
+    bias_elem_bytes = element_bytes(1, bias_dtype) if has_bias else 0
+    quant_scale_bytes = element_bytes(width, quant_scale_dtype) if has_quant_scale else 0
+    quant_offset_bytes = element_bytes(width, quant_offset_dtype) if has_quant_offset else 0
+    group_param_bytes = channels + bias_bytes + quant_scale_bytes + quant_offset_bytes
     max_owners = min(ctx.effective_aiv_cores, allocated)
     sparse = fields.get("group_list_type") == SPARSE_GROUP_LIST_TYPE
     min_groups = DEQUANT_SPARSE_CUT_MIN_BINS if sparse else DEQUANT_GROUP_CUT_MIN_BINS
     special = (width <= DEQUANT_FULL_LOAD_MAX_WIDTH and len(rows) >= min_groups
                and allocated // len(rows) <= DEQUANT_GROUP_CUT_MAX_AVG_ROWS
-               and (sparse or not (fields.get("has_bias") or fields.get("has_quant_scale"))))
+               and (sparse or not (has_bias or has_quant_scale or has_quant_offset)))
     owners = max_owners
-    if not special and width <= DEQUANT_FULL_LOAD_MAX_WIDTH:
+    not_full = width > DEQUANT_FULL_LOAD_MAX_WIDTH
+    ws_per_row = 0
+    if not_full:
+        ws_per_row = _not_full_dequant_workspace_per_row(ctx, width, is_int32, has_bias, bias_elem_bytes, fields)
+    elif not special:
         # Full-load CANN tiling uses two row slots for x, activation scales
-        # and y, plus the FP32 vector scratch and the weight-scale planes.
+        # and y, plus the FP32 vector scratch, weight-scale/quant-scale planes,
+        # and optional bias plane.
         aligned = ceil_div(element_bytes(width, "fp32"), UB_BLOCK_BYTES) * UB_BLOCK_BYTES
         y_aligned = ceil_div(width, UB_BLOCK_BYTES) * UB_BLOCK_BYTES
-        row_bytes = 2 * (2 * aligned + UB_BLOCK_BYTES + y_aligned) + UB_BLOCK_BYTES + aligned
-        remaining = ctx.datapath.usable_bytes("ub") - DEQUANT_UB_RESERVE_BYTES - 2 * aligned - aligned
+        row_bytes = (
+            _NOT_FULL_DOUBLE_BUFFER * (_GATED_ACTIVATION_DIVISOR * aligned + UB_BLOCK_BYTES + y_aligned)
+            + UB_BLOCK_BYTES + aligned
+        )
+        if has_bias:
+            row_bytes += aligned if bias_elem_bytes >= _BIAS_4B_THRESHOLD else (aligned // _HALF_DIVISOR)
+        remaining = ctx.datapath.usable_bytes("ub") - DEQUANT_UB_RESERVE_BYTES - _GATED_ACTIVATION_DIVISOR * aligned - aligned
         tile_rows = remaining // row_bytes
         if tile_rows < 1:
             raise ModelingError("grouped_moe_dequant_full_load_does_not_fit")
         owners = min(owners, ceil_div(allocated, tile_rows))
     stages, ends, offset = [], {}, 0
+    row_scale = PER_TOKEN_SCALE_BYTES if (is_int32 and fields.get("has_activation_scale", True)) else 0
+    row_x_bytes = element_bytes(contract.n, contract.handoff_dtype)
     for group, count in enumerate(rows):
         if not count:
             continue
-        step = count if special else ceil_div(count, owners)
-        for part, start in enumerate(range(0, count, step)):
-            owner = group % owners if special else part
-            size = min(step, count - start)
+        for owner, start, size in _dequant_group_slices(
+            count, owners, special=special, not_full=not_full, group=group,
+        ):
             base = f"{name}:group{group}:aiv{owner}"
             after = (ends[owner],) if owner in ends else ()
-            read, vector, store = (f"{base}:{phase}" for phase in ("read", "vector", "store"))
             tag = (("group", group), ("row_start", offset + start), ("rows", size),
                    ("weight_scale_bytes", channels), ("special_core_cut", special))
-            row_scale = PER_TOKEN_SCALE_BYTES if fields.get("has_activation_scale", True) else 0
-            inputs = size * (element_bytes(contract.n, "int32") + row_scale) + channels
-            output = tensor_bytes(size, width, contract.quant_dtype, scaled=True)
-            ops = size * width * (ACTIVATION_OPS[contract.activation] + QUANT_OPS_PER_ELEMENT)
-            stages.extend((
-                StageDemand(read, after, Work(resources={"hbm": inputs, "l2": inputs, "mte2_aiv": inputs}),
-                            "aiv", owner, tag),
-                StageDemand(vector, (read,), Work(resources={"vector": ops}), "aiv", owner, tag),
-                StageDemand(store, (vector,), Work(resources={"hbm": output, "l2": output, "mte3": output}),
-                            "aiv", owner, tag),
-            ))
+            param_reloads = size if not_full else 1
+            inputs = size * (row_x_bytes + row_scale) + param_reloads * group_param_bytes
+            output = tensor_bytes(size, width, contract.quant_dtype, scaled=dynamic_quant)
+            bias_ops = size * contract.n if has_bias else 0
+            smooth_ops = size * width if has_quant_scale else 0
+            offset_ops = size * width if has_quant_offset else 0
+            if ws_per_row > 0:
+                ws_bytes = size * ws_per_row
+                pass1_ops = size * width * ACTIVATION_OPS[contract.activation] + bias_ops
+                pass2_ops = size * width * QUANT_OPS_PER_ELEMENT + smooth_ops + offset_ops
+                read, vec1, ws_st, ws_rd, vec2, store = (
+                    f"{base}:{phase}" for phase in ("read", "vector_p1", "ws_store", "ws_read", "vector_p2", "store")
+                )
+                stages.extend((
+                    StageDemand(read, after, Work(resources={"hbm": inputs, "l2": inputs, "mte2_aiv": inputs}),
+                                "aiv", owner, tag),
+                    StageDemand(vec1, (read,), Work(resources={"vector": pass1_ops}), "aiv", owner, tag),
+                    StageDemand(ws_st, (vec1,), Work(resources={"hbm": ws_bytes, "l2": ws_bytes, "mte3": ws_bytes}),
+                                "aiv", owner, tag),
+                    StageDemand(ws_rd, (ws_st,), Work(resources={"hbm": ws_bytes, "l2": ws_bytes, "mte2_aiv": ws_bytes}),
+                                "aiv", owner, tag),
+                    StageDemand(vec2, (ws_rd,), Work(resources={"vector": pass2_ops}), "aiv", owner, tag),
+                    StageDemand(store, (vec2,), Work(resources={"hbm": output, "l2": output, "mte3": output}),
+                                "aiv", owner, tag),
+                ))
+            else:
+                read, vector, store = (f"{base}:{phase}" for phase in ("read", "vector", "store"))
+                ops = (
+                    size * width * (ACTIVATION_OPS[contract.activation] + QUANT_OPS_PER_ELEMENT)
+                    + bias_ops + smooth_ops + offset_ops
+                )
+                stages.extend((
+                    StageDemand(read, after, Work(resources={"hbm": inputs, "l2": inputs, "mte2_aiv": inputs}),
+                                "aiv", owner, tag),
+                    StageDemand(vector, (read,), Work(resources={"vector": ops}), "aiv", owner, tag),
+                    StageDemand(store, (vector,), Work(resources={"hbm": output, "l2": output, "mte3": output}),
+                                "aiv", owner, tag),
+                ))
             ends[owner] = store
         offset += count
     return [*stages, StageDemand(name, tuple(ends.values()))]
@@ -547,15 +744,37 @@ class _Arch35Strategy:
                             max_waves=schedule.max_waves, wave_tail_imbalance=schedule.wave_tail_imbalance)
             implementation = "aclnnGroupedMatmul"
         elif mode == "dequant_swiglu_quant":
-            stages = (_int32_dequant_stages(contract, ctx, contract_fields(op)) if contract.handoff_dtype == "int32"
-                      else activation_stages("dequant_swiglu_quant", (), ctx, contract, contract.group_rows))
+            fields = contract_fields(op)
+            use_dequant = contract.handoff_dtype == "int32" or contract.intermediate > DEQUANT_FULL_LOAD_MAX_WIDTH
+            stages = (
+                _dequant_stages(contract, ctx, fields) if use_dequant
+                else activation_stages(
+                    "dequant_swiglu_quant", (), ctx, contract, contract.group_rows,
+                    has_activation_scale=fields.get("has_activation_scale", True),
+                )
+            )
             implementation = "aclnnDequantSwigluQuant"
         elif mode == "gmm_swiglu_quant":
-            contract = replace(contract, handoff_dtype="fp32")
-            stages, schedule = _gated_stages(contract, ctx, "", (), ())
-            metadata.update(useful_flops=2 * schedule.useful_flops,
-                            issued_fractals=2 * schedule.issued_fractals,
-                            gm_handoff_eliminated_bytes=2 * contract.m * contract.n * INT32_HANDOFF_BYTES_PER_ELEM)
+            fields = contract_fields(op)
+            is_pertoken_v2 = _is_arch35_v2_pertoken(contract, fields)
+            handoff = "int32" if (is_pertoken_v2 and contract.dtype_a == "int8") else "fp32"
+            contract = replace(
+                contract,
+                handoff_dtype=handoff,
+                quant_dtype=contract.output_dtype if is_pertoken_v2 else contract.quant_dtype,
+            )
+            wt_scale_dtype = str(fields.get("weight_scale_dtype", "fp32")).lower()
+            stages, schedule = _gated_stages(
+                contract, ctx, "", (), (),
+                pertoken_v2=is_pertoken_v2, weight_scale_dtype=wt_scale_dtype,
+            )
+            metadata.update(
+                useful_flops=_GATED_ACTIVATION_DIVISOR * schedule.useful_flops,
+                issued_fractals=_GATED_ACTIVATION_DIVISOR * schedule.issued_fractals,
+                gm_handoff_eliminated_bytes=(
+                    _GATED_ACTIVATION_DIVISOR * contract.m * contract.n * INT32_HANDOFF_BYTES_PER_ELEM
+                ),
+            )
             implementation = contract.abi or MX_ABI
         else:
             specialization = _specialization(op, ctx, contract)

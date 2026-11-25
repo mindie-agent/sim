@@ -12,8 +12,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 
 from mindie_sim.prediction.operators.matrix.matrix_epilogue import MatrixEpilogue
@@ -22,6 +24,7 @@ from mindie_sim.prediction.mechanism import Work
 from mindie_sim.prediction.program import KernelProgram, RecipeBook, Stage
 
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
 API = "torch_npu.npu_grouped_matmul"
 PRODUCER_PATH = (
     "capture://calibration/qwen35-grouped/probe_grouped_graph.py"
@@ -32,6 +35,15 @@ NZ_DOC_PATH = (
     "grouped_matmul_swiglu_quant_v2/op_host/op_api/gmm_dsq_base.h"
 )
 NZ_DOC_SHA256 = "08e07b078ca73626df3a135bff230c9b7b61108b235e0f98f22420f4c94f9733"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-ascend",
+        revision="7a7ed073c481d5e3a2fc2194c5b879efb2d373c0",
+        relative_path="csrc/gmm/grouped_matmul_swiglu_quant_v2/op_host/op_api/gmm_dsq_base.h",
+        source_sha256=NZ_DOC_SHA256,
+    ),
+)
+MAX_INT8_NZ_EXPERTS = 1024
 NZ_TILE_K = 16
 NZ_TILE_N = 32
 NZ_LAYOUT = "FRACTAL_NZ"
@@ -83,6 +95,10 @@ class QuantizedGroupedSpec:
     def __post_init__(self):
         if not self.expert_rows:
             raise ModelingError("quantized_grouped_expert_rows_must_not_be_empty")
+        if len(self.expert_rows) > MAX_INT8_NZ_EXPERTS:
+            raise ModelingError(
+                f"quantized_grouped_expert_count_exceeds_limit:{len(self.expert_rows)}:{MAX_INT8_NZ_EXPERTS}"
+            )
         rows = tuple(_integer(value, "expert_row_count", minimum=0)
                      for value in self.expert_rows)
         positive = {value for value in rows if value}

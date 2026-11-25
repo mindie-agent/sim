@@ -11,13 +11,16 @@
 """
 from dataclasses import replace
 from math import ceil
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage
 from mindie_sim.prediction.transforms import _fusion_metadata
 from .lowering import GROUP_COUNT_BYTES
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
 SELECTOR = "grouped_int8_caller"
 IMPLEMENTATION = "ascend_grouped_int32_dequant_swiglu"
 RECIPE = "grouped_int32_dequant_swiglu"
@@ -27,6 +30,45 @@ _DEQUANT_OPS_PER_INPUT = 3  # Cast and two scale multiplies.
 _SWIGLU_OPS_PER_OUTPUT = 5
 _ROW_SCALE_DIVISION_OPS = 8
 _QUANT_CASTS_PER_OUTPUT = 3
+_HOST_BLOCK_BYTES = 32
+_HOST_BLOCK_FP32_ELEMS = _HOST_BLOCK_BYTES // _FP32_BYTES
+_HOST_SWIGLU_FACTOR = 2
+_HOST_INPUT_WIDTH_ALIGN = _HOST_BLOCK_BYTES * _HOST_SWIGLU_FACTOR
+_HOST_UB_RESERVE_BYTES = 1024
+_HOST_DOUBLE_BUFFER = 2
+_HOST_STATIC_FP32_PLANES = 5
+_HOST_DYNAMIC_FIXED_RESERVE_BYTES = (
+    _HOST_UB_RESERVE_BYTES
+    + _HOST_BLOCK_BYTES
+    + _HOST_DOUBLE_BUFFER * _HOST_BLOCK_BYTES
+    + _FP32_BYTES
+    + _HOST_BLOCK_FP32_ELEMS * _HOST_BLOCK_FP32_ELEMS * _FP32_BYTES
+)
+_HOST_DYNAMIC_BASE_BYTES_PER_COL = (
+    _HOST_STATIC_FP32_PLANES * _FP32_BYTES
+    + _HOST_DOUBLE_BUFFER * _HOST_SWIGLU_FACTOR * _FP32_BYTES
+    + 1
+)
+_HOST_PERFORMANCE_CORE_CAP = 36
+_HOST_PERFORMANCE_H_SMALL = 2048
+_HOST_PERFORMANCE_H_LARGE = 4096
+_HOST_PERFORMANCE_UB_FACTOR_NUM = _HOST_PERFORMANCE_H_LARGE * _FP32_BYTES
+_HOST_CUT_GROUP_MIN = 32
+_HOST_CUT_GROUP_MAX_AVG_ROWS = 16
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-ascend",
+        revision="175ef4d49c2072f9233619636f0309f4f88b4e2c",
+        relative_path="vllm_ascend/ops/fused_moe/moe_mlp.py",
+        source_sha256="6b5f4f6d3259cb14e0613a6f7b1c2592331f143a14cf7240dd9d49a0a57dd53b",
+    ),
+    SourceRef(
+        repository="vllm-ascend",
+        revision="175ef4d49c2072f9233619636f0309f4f88b4e2c",
+        relative_path="csrc/moe/dequant_swiglu_quant/op_kernel/dequant_swiglu_quant.h",
+        source_sha256="2e516dc7332449057ea8379eebd61a0b6f2a2917907b7f88d07b6025d3cf72b2",
+    ),
+)
 SOURCE = {
     "repository": "vllm-ascend", "revision": "175ef4d49c2072f9233619636f0309f4f88b4e2c",
     "caller": "vllm_ascend/ops/fused_moe/moe_mlp.py:326-361",
@@ -147,8 +189,21 @@ def _rewrite(ops, gate, options):
           "grouped_int32_caller": SOURCE}
     for key in ("matrix_epilogue", "activation_scale_bytes", "activation_scale_shape", "activation_scale_format"):
         gm.pop(key, None)
+    new_gate_abi = None
+    if gate.precision_abi is not None:
+        new_gate_abi = replace(
+            gate.precision_abi,
+            output_dtype="int32",
+            accum_dtype="int32",
+            weight_scale_dtype="",
+            weight_scale_bytes=0,
+            act_scale_dtype="",
+            act_scale_pack="",
+            act_group_size=0,
+        )
+        gm["precision_abi_signature"] = new_gate_abi.abi_signature
     new_gate = replace(gate, hbm_bytes=read + write, mte2_bytes=read, mte3_bytes=write,
-                       vector_ops=0, metadata=tuple(gm.items()))
+                       vector_ops=0, precision_abi=new_gate_abi, metadata=tuple(gm.items()))
     # Preserve both semantic memberships so fused graph reporting cannot lose
     # the quantizer when its resource producer becomes the activation kernel.
     am = dict(activation.metadata)
@@ -174,10 +229,20 @@ def _rewrite(ops, gate, options):
                "group_index_semantics": "rows_per_expert",
                "semantic_recipe": activation.recipe,
                "fused_origin_scopes": _fusion_metadata(activation, quant)["fused_origin_scopes"]})
+    new_act_abi = None
+    if activation.precision_abi is not None:
+        new_act_abi = replace(
+            activation.precision_abi,
+            input_dtype="int32",
+            output_dtype="int8",
+            act_scale_dtype="fp32",
+            activation_quant_mode="dynamic_per_token",
+        )
+        am["precision_abi_signature"] = new_act_abi.abi_signature
     consumer = Work().apply(replace(
         activation, deps=(gate.op_id, scale.op_id), recipe=RECIPE,
         family="dequant_swiglu_quant", dtype="int8", source_boundary="kernel",
-        returns=("activation_scales",), metadata=tuple(am.items())))
+        precision_abi=new_act_abi, returns=("activation_scales",), metadata=tuple(am.items())))
     new_down = replace(down, deps=(consumer.op_id,), metadata=tuple({
         **dm, "activation_payload_producer": consumer.op_id,
         "activation_scale_producer": consumer.op_id}.items()))
@@ -211,6 +276,55 @@ def vector_elements(rows, width):
     return rows * (dequant_and_gate + abs_and_max + scale_and_quantize)
 
 
+def _host_used_aiv_cores(groups, width: int, config: dict, geometry, available_units: int) -> tuple[int, bool]:
+    """Enforce vllm-ascend DequantSwigluQuant host tiling alignment, UB fit, and block count."""
+    in_dim_y = _HOST_SWIGLU_FACTOR * width
+    if in_dim_y % _HOST_INPUT_WIDTH_ALIGN:
+        raise ModelingError(f"grouped_dequant_input_width_must_be_multiple_of_64:{in_dim_y}")
+    ub_size = int(geometry.buffers.get("ub", 0) or 0)
+    total_rows = int(config.get("input_capacity_rows", sum(groups)))
+    if ub_size <= 0:
+        return min(available_units, max(1, total_rows)), False
+    has_bias = bool(config.get("bias", False))
+    swiglu_mode = int(config.get("swiglu_mode", 0) or 0)
+    is_dynamic = int(config.get("quant_mode", 1)) == 1
+    bias_col = _HOST_SWIGLU_FACTOR * _FP32_BYTES if has_bias else 0
+    swiglu_col = (1 + _INT32_BYTES) if swiglu_mode else 0
+    quant_offset_col = 0 if is_dynamic else _FP32_BYTES
+    denom_max = _HOST_DYNAMIC_BASE_BYTES_PER_COL + bias_col + swiglu_col + quant_offset_col
+    max_out = max(0, (ub_size - _HOST_DYNAMIC_FIXED_RESERVE_BYTES) // denom_max) // _HOST_BLOCK_BYTES * _HOST_BLOCK_BYTES
+    max_in = _HOST_SWIGLU_FACTOR * max_out
+    if in_dim_y > max_in:
+        raise ModelingError(f"grouped_dequant_width_exceeds_ub_limit:{in_dim_y}:{max_in}")
+    if total_rows <= 0:
+        return min(available_units, 1), False
+    bias_x = in_dim_y * _FP32_BYTES if has_bias else 0
+    swiglu_x = width * (1 + _INT32_BYTES) if swiglu_mode else 0
+    quant_off_x = 0 if is_dynamic else width * _FP32_BYTES
+    num_x = (
+        ub_size - _HOST_UB_RESERVE_BYTES - width * _FP32_BYTES
+        - _HOST_BLOCK_BYTES - in_dim_y * _FP32_BYTES - bias_x - quant_off_x
+    )
+    den_x = (
+        _HOST_DOUBLE_BUFFER * (in_dim_y + _HOST_BLOCK_FP32_ELEMS) * _FP32_BYTES
+        + width + _FP32_BYTES + in_dim_y * _FP32_BYTES + swiglu_x
+        + _HOST_BLOCK_FP32_ELEMS * _FP32_BYTES
+    )
+    ub_factor_x = min(max(1, num_x // den_x), total_rows)
+    if swiglu_mode == 0 and not has_bias and in_dim_y in {_HOST_PERFORMANCE_H_SMALL, _HOST_PERFORMANCE_H_LARGE}:
+        ub_factor_x = _HOST_PERFORMANCE_UB_FACTOR_NUM // in_dim_y
+    used_cores = min(available_units, _HOST_PERFORMANCE_CORE_CAP, ceil(total_rows / max(1, ub_factor_x)))
+    cut_group = (
+        len(groups) >= _HOST_CUT_GROUP_MIN
+        and total_rows // len(groups) <= _HOST_CUT_GROUP_MAX_AVG_ROWS
+        and not has_bias
+        and not config.get("smooth_scale", False)
+    )
+    if cut_group:
+        used_cores = min(available_units, total_rows)
+    return max(1, used_cores), cut_group
+
+
 def build(op, geometry):
     config = dict(op.metadata)["grouped_dequant"]
     if config.get("dequant_program") == "arch35_full_load":
@@ -219,30 +333,42 @@ def build(op, geometry):
     groups, width = tuple(config["expert_rows"]), config["width"]
     if sum(groups) != op.local_shape[0] or width != op.local_shape[1]:
         raise ModelingError("grouped_dequant_rows_disagree_with_output")
-    units = geometry.resource_units.get("vector", geometry.compute_units)
+    available_units = geometry.resource_units.get("vector", geometry.compute_units)
     if not {"mte2_aiv", "mte3", "vector"} <= geometry.resource_units.keys():
         raise ModelingError("grouped_dequant_requires_aiv_read_and_write_pipes")
-    # Source group traversal repartitions each positive group over available
-    # owners. Phase aggregation preserves per-owner work, not captured tiling,
-    # scalar metadata latency or within-owner overlap.
-    loads, computes, writes = [0] * units, [0] * units, [0] * units
-    for owner in range(units):
+    used_units, cut_group = _host_used_aiv_cores(groups, width, config, geometry, available_units)
+    # Source group traversal repartitions each positive group across the host
+    # tiler's launched AIV block count (maxPreCore_), or assigns whole groups
+    # cyclically by group index in cut-group mode.
+    loads, computes, writes = [0] * used_units, [0] * used_units, [0] * used_units
+    for owner in range(used_units):
         loads[owner] = len(groups) * GROUP_COUNT_BYTES
-        for n in groups:
+    if cut_group:
+        for group_idx, n in enumerate(groups):
             if not n:
                 continue
-            chunk = ceil(n / units)
-            count = max(0, min(chunk, n - owner * chunk))
-            if count:
-                loads[owner] += (count * (2 * width * _INT32_BYTES + _FP32_BYTES)
-                                 + 2 * width * _FP32_BYTES)
-                computes[owner] += vector_elements(count, width)
-                writes[owner] += count * (width + _FP32_BYTES)
+            owner = group_idx % used_units
+            loads[owner] += (n * (_HOST_SWIGLU_FACTOR * width * _INT32_BYTES + _FP32_BYTES)
+                             + _HOST_SWIGLU_FACTOR * width * _FP32_BYTES)
+            computes[owner] += vector_elements(n, width)
+            writes[owner] += n * (width + _FP32_BYTES)
+    else:
+        for owner in range(used_units):
+            for n in groups:
+                if not n:
+                    continue
+                chunk = ceil(n / used_units)
+                count = max(0, min(chunk, n - owner * chunk))
+                if count:
+                    loads[owner] += (count * (_HOST_SWIGLU_FACTOR * width * _INT32_BYTES + _FP32_BYTES)
+                                     + _HOST_SWIGLU_FACTOR * width * _FP32_BYTES)
+                    computes[owner] += vector_elements(count, width)
+                    writes[owner] += count * (width + _FP32_BYTES)
     work = Work(resources={"hbm": sum(loads) + sum(writes), "mte2_aiv": sum(loads),
                            "mte3": sum(writes), "vector": sum(computes)})
     def program(context):
         def owner_program(owner):
-            placement = context.owned(owner, units, ("mte2_aiv", "mte3", "vector"))
+            placement = context.owned(owner, available_units, ("mte2_aiv", "mte3", "vector"))
             return KernelProgram((
                 Stage("load", context.bind(Work(resources={"hbm": loads[owner], "mte2_aiv": loads[owner]})),
                       placement=placement),
@@ -250,9 +376,10 @@ def build(op, geometry):
                       after=("load",), placement=placement),
                 Stage("write", context.bind(Work(resources={"hbm": writes[owner], "mte3": writes[owner]})),
                       after=("dequant_swiglu_quant",), placement=placement)))
-        return ParallelProgram(tuple(owner_program(i) for i in range(units)))
+        return ParallelProgram(tuple(owner_program(i) for i in range(used_units)))
     return OperatorPlan(work, program, metadata={"grouped_dequant_schedule": {
-        "kind": "analytical_per_owner_group_phases", "physical_aiv": units,
+        "kind": "analytical_per_owner_group_phases", "physical_aiv": used_units,
+        "available_aiv": available_units,
         "group_count": len(groups), "active_experts": sum(n > 0 for n in groups),
-        "unmodeled": ("native_host_tiling", "scalar_group_descriptor_issue_latency",
+        "unmodeled": ("scalar_group_descriptor_issue_latency",
                        "finite_ub_tiling_and_pipeline_overlap", "compiler_instruction_expansion")}})

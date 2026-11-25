@@ -11,6 +11,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from numbers import Integral
+from typing import Literal
 
 from mindie_sim.observed_contracts.vocabulary import build_unmodeled_onboarding_hint
 from mindie_sim.public.errors import UnmodeledCapabilityError
@@ -24,6 +25,8 @@ from .lowering import (
     MX_DTYPES, MX_SCALE_GROUP_SIZE, PER_TOKEN_SCALE_BYTES, QUANT_OPS_PER_ELEMENT,
     GroupedMoeProgram, StageDemand, ceil_div, element_bytes, tensor_bytes,
 )
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
 
 VLLM_CALLER_SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
@@ -45,6 +48,7 @@ VLLM_CALLER_SOURCES: tuple[SourceRef, ...] = (
         source_sha256="cc0c5a6138c2f76e3d2d371e4a04c0d66e1ad2f9dac316b921e24d40f733689a",
     ),
 )
+SOURCES: tuple[SourceRef, ...] = VLLM_CALLER_SOURCES
 
 FRACTAL_M_DIM = 16
 FRACTAL_N_DIM = 16
@@ -74,8 +78,11 @@ ACTIVATION_OPS = {
     "silu": 4, "gelu": 6, "gelu_tanh": 8, "geglu": 7,
 }
 SHIPPING_MEGAMOE_ACTIVATIONS = frozenset({"swiglu", "silu", "gelu"})
-SHIPPING_SWIGLU_QUANT_ACTIVATIONS = frozenset({"swiglu", "silu"})
+SHIPPING_SWIGLU_QUANT_ACTIVATIONS = frozenset({"swiglu"})
 GATED_ACTIVATIONS = frozenset({"swiglu", "swigluoai", "situglu", "situ", "geglu"})
+NZ_LAYOUTS = frozenset({"NZ", "FRACTAL_NZ", "FRACTAL_NZ_C0_16", "FRACTAL_NZ_C0_32"})
+VALID_LAYOUTS_B = NZ_LAYOUTS | {"ND", "CONTIGUOUS"}
+MX_SCALE_DTYPES = frozenset({"fp8_e8m0", "e8m0"})
 ABI_MODES = {
     "aclnnGroupedMatmul": GEMM_MODES,
     "aclnnMoeGroupedMatmulSwigluQuant": frozenset({"gmm_swiglu_quant"}),
@@ -350,6 +357,10 @@ class GroupedMoeContract:
     wave_rows: int
     transport_bytes: tuple[int | None, int | None]
     cohort_transport_bytes: tuple[tuple[int | None, int | None], ...] = ()
+    act_mx_scaled: bool = False
+    weight_mx_scaled: bool = False
+    act_mx_padded: bool = True
+    weight_mx_padded: bool = True
 
     @property
     def intermediate(self) -> int:
@@ -361,16 +372,24 @@ class GroupedMoeContract:
 
     @property
     def uses_mx_scales(self) -> bool:
-        return self.quant_dtype in MX_DTYPES or (self.mode == "gmm_swiglu_quant" and self.dtype_a in MX_DTYPES)
+        return (
+            self.quant_dtype in MX_DTYPES
+            or (self.mode == "gmm_swiglu_quant" and (self.dtype_a in MX_DTYPES or self.act_mx_scaled))
+        )
 
     @property
     def padded_weight(self) -> bool:
-        return self.layout_b in {"NZ", "FRACTAL_NZ"}
+        return self.layout_b in NZ_LAYOUTS
 
     @property
     def matrix_weight_dtype(self) -> str:
-        # The routed INT32 tensor is an ABI container for packed INT4 weights.
-        return "int4" if self.mode in ROUTED_MODES and self.dtype_b == "int32" else self.dtype_b
+        # Routed and A2 A8W4 gated INT32 tensors are ABI containers for packed INT4 weights.
+        if self.dtype_b == "int32" and (
+            self.mode in ROUTED_MODES
+            or (self.mode == "gmm_swiglu_quant" and self.dtype_a == "int8")
+        ):
+            return "int4"
+        return self.dtype_b
 
 
 def _contract_rows(fields, mode, m, expected_total):
@@ -402,6 +421,46 @@ def contract_fields(op: OpSpec) -> dict:
         if name in fields:
             fields.update(_mapping(fields[name], name))
     return fields
+
+
+def _resolve_input_dtype(op: OpSpec, fields: Mapping, mode: str, operand_default: str) -> tuple[str, bool]:
+    pabi = getattr(op, "precision_abi", None)
+    explicit: dict[str, str] = {}
+    for key in ("dtype_a", "input_dtype", "input_format"):
+        val = fields.get(key)
+        if val is not None and str(val).strip():
+            explicit[key] = _dtype(str(val))
+    if pabi is not None and pabi.input_dtype:
+        explicit["precision_abi.input_dtype"] = _dtype(pabi.input_dtype)
+    if len(set(explicit.values())) > 1:
+        raise ModelingError(f"grouped_moe_conflicting_input_dtypes:{sorted(explicit.items())}")
+    if explicit:
+        return next(iter(explicit.values())), True
+    if mode == "dequant_swiglu_quant":
+        input_default = _dtype(op.dtype or "int32")
+        return _dtype(fields.get(
+            "handoff_dtype",
+            input_default if input_default in {"int32", "bf16", "fp16", "fp32"} else "int32",
+        )), False
+    return _dtype(operand_default), False
+
+
+def _resolve_mx_scale_flags(op: OpSpec, fields: Mapping, dtype_a: str, dtype_b: str) -> tuple[bool, bool, bool, bool]:
+    pabi = getattr(op, "precision_abi", None)
+    act_scale_fmt = _dtype(fields.get("act_scale_dtype") or (pabi.act_scale_dtype if pabi else "") or "")
+    wt_scale_fmt = _dtype(fields.get("weight_scale_dtype") or (pabi.weight_scale_dtype if pabi else "") or "")
+    act_mx_scaled = dtype_a in MX_DTYPES or act_scale_fmt in MX_SCALE_DTYPES
+    weight_mx_scaled = dtype_b in MX_DTYPES or wt_scale_fmt in MX_SCALE_DTYPES
+    act_pack = str(fields.get("act_scale_pack") or (pabi.act_scale_pack if pabi else "") or "").lower()
+    wt_pack = str(fields.get("weight_scale_pack") or (getattr(pabi, "weight_scale_pack", "") if pabi else "") or "").lower()
+    act_mx_padded = dtype_a in MX_DTYPES or act_pack == "pack2" or not act_mx_scaled
+    weight_mx_padded = (
+        dtype_b in MX_DTYPES
+        or wt_pack == "pack2"
+        or (not wt_pack and act_pack == "pack2")
+        or not weight_mx_scaled
+    )
+    return act_mx_scaled, weight_mx_scaled, act_mx_padded, weight_mx_padded
 
 
 def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeContract:
@@ -447,30 +506,36 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
         raise ModelingError("grouped_moe_unsupported_scale_group")
 
     operand_default = fields.get("compute_dtype", fields.get("compute_format", op.dtype or "bf16"))
-    dtype_a = _dtype(fields.get("dtype_a", fields.get("input_dtype", operand_default)))
-    if mode == "dequant_swiglu_quant" and "dtype_a" not in fields and "input_dtype" not in fields:
-        input_default = _dtype(op.dtype or "int32")
-        dtype_a = _dtype(fields.get("handoff_dtype",
-            input_default if input_default in {"int32", "bf16", "fp16", "fp32"} else "int32"))
+    dtype_a, explicit_input = _resolve_input_dtype(op, fields, mode, str(operand_default))
     dtype_b = _dtype(fields.get("dtype_b", fields.get("weight_dtype", "int4" if dtype_a == "w4a8" else dtype_a)))
     if dtype_a == "w4a8":
         dtype_a = "int8"
-    compute_default = "w4a8" if routed and dtype_a == "int8" and dtype_b == "int32" else dtype_a
+    a8w4_packed = (routed or mode == "gmm_swiglu_quant") and dtype_a == "int8" and dtype_b in {"int4", "int32"}
+    compute_default = "w4a8" if a8w4_packed else dtype_a
     compute_dtype = _dtype(fields.get("compute_dtype", fields.get("compute_format", compute_default)))
     if mode != "dequant_swiglu_quant":
         fractal_k0(compute_dtype)
     output_dtype = _dtype(fields.get("output_dtype", fields.get("output_format", op.dtype or "bf16")))
+    act_mx_scaled, weight_mx_scaled, act_mx_padded, weight_mx_padded = _resolve_mx_scale_flags(
+        op, fields, dtype_a, dtype_b,
+    )
     quant_default = dtype_a if dtype_a in MX_DTYPES or (routed and dtype_a in {"bf16", "fp16"}) else "int8"
-    if mode == "gmm_swiglu_quant" and dtype_a in MX_DTYPES:
+    if mode == "gmm_swiglu_quant" and (dtype_a in MX_DTYPES or act_mx_scaled):
         quant_default = fields.get("output_dtype", fields.get("output_format", quant_default))
     quant_dtype = _dtype(fields.get("quant_dtype", fields.get("quant_output_dtype", quant_default)))
     default_handoff = "int32" if compute_dtype in {"int8", "w4a8"} else output_dtype
+    if mode == "dequant_swiglu_quant" and explicit_input and "handoff_dtype" in fields:
+        if _dtype(fields["handoff_dtype"]) != dtype_a:
+            raise ModelingError("grouped_moe_conflicting_dequant_handoff_dtype")
     handoff_dtype = _dtype(fields.get("handoff_dtype", dtype_a if mode == "dequant_swiglu_quant" else default_handoff))
     for dtype in (dtype_a, dtype_b, output_dtype, quant_dtype, handoff_dtype):
         element_bytes(1, dtype)
     layout_a = str(fields.get("layout_a", "ND")).upper()
-    layout_b = str(fields.get("layout_b", fields.get("weight_layout", "ND"))).upper()
-    if layout_a not in {"ND", "CONTIGUOUS"} or layout_b not in {"ND", "NZ", "FRACTAL_NZ", "CONTIGUOUS"}:
+    pabi = getattr(op, "precision_abi", None)
+    pabi_layout = str(getattr(pabi, "weight_layout", "") or "").upper() if pabi is not None else ""
+    default_layout_b = pabi_layout if pabi_layout in VALID_LAYOUTS_B else "ND"
+    layout_b = str(fields.get("layout_b", fields.get("weight_layout", default_layout_b))).upper()
+    if layout_a not in {"ND", "CONTIGUOUS"} or layout_b not in VALID_LAYOUTS_B:
         raise ModelingError(f"grouped_moe_unsupported_layout:{layout_a}:{layout_b}")
     top_k = _integer(fields.get("top_k", 1), "top_k", 1)
     ep = _integer(fields.get("ep", 1), "ep", 1)
@@ -515,6 +580,7 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> GroupedMoeCon
         _integer(fields.get("n_tail_cnt", 1), "n_tail_cnt", 1),
         top_k, ep, enable_dbo, split, mc2, shared, shared_compute, shared_weight,
         _integer(fields.get("wave_rows", 0), "wave_rows"), transfer, cohort_transfer,
+        act_mx_scaled, weight_mx_scaled, act_mx_padded, weight_mx_padded,
     )
 
 
@@ -599,7 +665,8 @@ def matrix_schedule(contract, ctx, rows, n, k, *, start_core=0, n_tail_alignment
 
 
 def matrix_stages(
-    name, after, contract, schedule, k, output_dtype, *, input_dtype=None, input_scaled=False, metadata=(),
+    name, after, contract, schedule, k, output_dtype, *, input_dtype=None, input_scaled=False,
+    output_row_divisor: int = 1, useful_flops_override: int | None = None, metadata=(),
 ):
     dtype = input_dtype or contract.dtype_a
     stages, ends = [], []
@@ -608,11 +675,17 @@ def matrix_stages(
         contract.padded_weight
     ) else 1
     weight_k = ceil_div(k, k_alignment) * k_alignment
+    act_mx = contract.act_mx_scaled if input_dtype is None else dtype in MX_DTYPES
+    act_mx_pad = contract.act_mx_padded if input_dtype is None else True
     for owner in schedule.nonempty_owners:
         a_rows, b_cols = schedule.owner_input_rows[owner], schedule.owner_weight_columns[owner]
-        a = tensor_bytes(a_rows, k, dtype, scaled=input_scaled)
-        b = tensor_bytes(b_cols, weight_k, weight_dtype)
-        out = element_bytes(schedule.owner_output_elements[owner], output_dtype)
+        a = tensor_bytes(a_rows, k, dtype, scaled=input_scaled, mx_scaled=act_mx, mx_padded=act_mx_pad)
+        b = tensor_bytes(
+            b_cols, weight_k, weight_dtype,
+            mx_scaled=contract.weight_mx_scaled, mx_padded=contract.weight_mx_padded,
+        )
+        out_elems = schedule.owner_output_elements[owner] // output_row_divisor
+        out = element_bytes(out_elems, output_dtype)
         read, cube, fix = (f"{name}:{owner}:{step}" for step in ("read", "cube", "fixpipe"))
         stages.extend((
             StageDemand(read, after, Work(resources={"hbm": a+b, "l2": a+b, "mte2_aic": a+b}),
@@ -624,8 +697,9 @@ def matrix_stages(
             StageDemand(fix, (cube,), Work(resources={"hbm": out, "l2": out, "fixpipe": out}), "aic", owner, metadata),
         ))
         ends.append(fix)
+    useful = schedule.useful_flops if useful_flops_override is None else useful_flops_override
     stages.append(StageDemand(name, tuple(ends) or after, metadata=(*metadata,
-        ("useful_flops", schedule.useful_flops), ("issued_fractals", schedule.issued_fractals),
+        ("useful_flops", useful), ("issued_fractals", schedule.issued_fractals),
         ("max_waves", schedule.max_waves), ("wave_tail_imbalance", schedule.wave_tail_imbalance),
     )))
     return stages
