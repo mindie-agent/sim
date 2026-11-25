@@ -9,9 +9,10 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Any, Callable, Mapping, Protocol, TYPE_CHECKING
+from typing import Any, Callable, Mapping, Protocol, Sequence, TYPE_CHECKING, runtime_checkable
 if TYPE_CHECKING:
     from .engine import Event
+    from ..results import OpOccurrence
     from mindie_sim.schema.tensors import TensorValue
     from mindie_sim.schema.operators import StateEffect
 
@@ -26,6 +27,79 @@ class OccurrenceKey:
     replica: int = 0
     rank: int = 0
     stage: int = 0
+    op_id: str = ""
+
+
+@runtime_checkable
+class EngineObserver(Protocol):
+    """Exact live read-only observer protocol attached to ``Engine``."""
+
+    def register_pipe(self, name: str) -> int: ...
+
+    def on_submit(
+        self,
+        task_id: int,
+        name: str = "",
+        *,
+        aliases: tuple[str, ...] = (),
+        predecessors: tuple[int, ...] = (),
+        occurrence: OccurrenceKey | OpOccurrence | None = None,
+        op_occ: OpOccurrence | None = None,
+        parent_task_id: int | None = None,
+    ) -> None: ...
+
+    def on_admit(
+        self,
+        task_id: int,
+        now_ms: float,
+        *,
+        owners: tuple[int, ...] = (),
+        generation: int = 0,
+        blockers: tuple[Any, ...] = (),
+    ) -> None: ...
+
+    def allocate_slot_generation(self, pool: str, unit: int, name: str) -> tuple[int, int]: ...
+
+    def release_slot_generation(self, pool: str, unit: int, name: str) -> tuple[int, int]: ...
+
+    def on_allocation(
+        self,
+        pool: str,
+        unit: int,
+        slot_id: int,
+        generation: int,
+        size_bytes: int,
+        now_ms: float,
+        action: str,
+        *,
+        task_id: int | None = None,
+    ) -> None: ...
+
+    def on_service(
+        self,
+        task_id: int,
+        physical_row: str,
+        owner: int,
+        t0_ms: float,
+        t1_ms: float,
+        delivered: float,
+    ) -> None: ...
+
+    def extract_cycle_pattern(
+        self, start_ms: float, end_ms: float,
+    ) -> tuple[tuple[Any, ...], tuple[Any, ...]]: ...
+
+    def on_period(
+        self,
+        anchor_ms: float,
+        period_ms: float,
+        repeats: int,
+        *,
+        template_id: str = "",
+        state_digest: str = "",
+        service_pattern: Sequence[Any] = (),
+        handoff_pattern: Sequence[Any] = (),
+    ) -> None: ...
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class AllocationKey:
@@ -193,6 +267,8 @@ class StageSpec:
     output_ports: tuple[str, ...] = ()
     nested_catalog: ProgramCatalog | None = None
     condition: str | None = None
+    latency_from_first_service: bool = False
+    deliveries: tuple[tuple[str, Scalar], ...] = ()
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class StageClass:

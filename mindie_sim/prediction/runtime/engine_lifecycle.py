@@ -12,6 +12,10 @@ from __future__ import annotations
 import heapq
 
 from . import frontier
+from ._engine_hbm_bus import (
+    _split_uncoupled_hbm_bus_task,
+    _task_needs_hbm_bus_split,
+)
 from .contracts import OccurrenceKey
 from .engine_types import (
     Allocation, Event, ExecutionError, _Task, _binding_for, _memory_binding,
@@ -173,7 +177,11 @@ class _EngineLifecycleMixin:
         if task.deliveries:
             deliv = self.delivered
             acc = task.delivered_acc
-            for ctr_id, total_amt in task.deliveries:
+            totals: dict[str, float] = {}
+            for ctr_id, amt in task.deliveries:
+                if amt > 0.0:
+                    totals[ctr_id] = totals.get(ctr_id, 0.0) + amt
+            for ctr_id, total_amt in totals.items():
                 prev = acc.get(ctr_id, 0.0) if acc is not None else 0.0
                 rem_amt = total_amt - prev
                 if rem_amt > 0.0:
@@ -229,12 +237,18 @@ class _EngineLifecycleMixin:
                 if t_ml > 0 and len(tdq) == t_ml:
                     self.trace_dropped += 1
                     evicted = tdq[0]
-                    if evicted[5] and evicted[3] > evicted[2]:
-                        ev_name = str(evicted[0])
+                    if evicted.__class__ is dict:
+                        ev_svc = evicted.get("serviced")
+                        ev_s_raw, ev_e_raw = evicted.get("start_ms"), evicted.get("end_ms")
+                        ev_name_raw = evicted.get("task")
+                    else:
+                        ev_name_raw, _, ev_s_raw, ev_e_raw, _, ev_svc = evicted[:6]
+                    if ev_svc and ev_e_raw > ev_s_raw:
+                        ev_name = str(ev_name_raw)
                         parts = ev_name.split(":")
                         ev_key = ":".join(parts[:3]) if len(parts) >= 3 else ev_name
                         spans = self._evicted_service_spans.setdefault(ev_key, [])
-                        ev_s, ev_e = float(evicted[2]), float(evicted[3])
+                        ev_s, ev_e = float(ev_s_raw), float(ev_e_raw)
                         if spans and ev_s <= spans[-1][1]:
                             spans[-1] = (min(spans[-1][0], ev_s), max(spans[-1][1], ev_e))
                         else:
@@ -547,6 +561,11 @@ class _EngineLifecycleMixin:
             wave_rec.on_admit(
                 key, now, owners=owners, generation=admit_gen, blockers=blockers,
             )
+        if _task_needs_hbm_bus_split(task):
+            if self._accel is not None and self._accel.enabled and self._native_slots:
+                self._accel.disable(self, "hbm_bus_split")
+            _split_uncoupled_hbm_bus_task(self, task, admit_gen=admit_gen)
+            return
         if task.latency_from_first_service and not task.demand:
             task.first_service = now
         if self._accel is not None and key in self._native_seqs:

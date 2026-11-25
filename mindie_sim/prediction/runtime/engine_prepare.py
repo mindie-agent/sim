@@ -15,9 +15,11 @@ from typing import Callable, Mapping, Sequence
 import weakref
 
 from ._engine_hbm_bus import (
+    _classify_hbm_split,
     _discover_hbm_bus_aliases,
     _expand_hbm_bus_work,
     _hbm_bus_alias_terms,
+    _is_pure_coupled_hbm_work,
     _refresh_prepared_for_hbm_bus,
     _retrofit_hbm_bus_tasks,
 )
@@ -140,6 +142,8 @@ class _EnginePrepareMixin:
         hbm_accounting: tuple[tuple[str, float, float, float, float | None, str, float, str, float, str], ...] = ()
         if work and self._hbm_bus_aliases:
             work, caps, hbm_accounting = _expand_hbm_bus_work(self._hbm_bus_aliases, name, work, caps)
+            if not coupled and hbm_accounting and _is_pure_coupled_hbm_work(work, hbm_accounting):
+                coupled = True
         if (work is not None and work.__class__ is dict and not caps
                 and not acquire and not free and placement is None
                 and not coupled and latency == 0.0 and not priority
@@ -552,13 +556,22 @@ class _EnginePrepareMixin:
         free_sig = (tuple((a.pool, a.size, a.units) for a in stg_free)
                     if stg_free else ())
         lffs = bool(getattr(lookup_stage, "latency_from_first_service", False))
+        hbm_sig = ()
+        if lookup_stage.work and self._hbm_bus_aliases:
+            hbm_sig = tuple(
+                (base, _classify_hbm_split(base, lookup_stage.name, lookup_stage.work, float(amt))[0])
+                for base, bus in self._hbm_bus_aliases.items()
+                if (amt := lookup_stage.work.get(base))
+                and bus.row_r not in lookup_stage.work
+                and bus.row_w not in lookup_stage.work
+            )
         proto_cache = self._stage_proto_prepared
         proto_key = (id(lookup_stage.work), id(lookup_stage.caps),
                      id(lookup_stage.placement),
                      lookup_stage.latency,
                      lookup_stage.coupled, lookup_stage.priority,
                      cohort_size, cohort_widened, members_sig,
-                     acq_sig, free_sig, lffs)
+                     acq_sig, free_sig, lffs, hbm_sig)
         phit = proto_cache.get(proto_key)
         if (phit is not None and phit[0] is lookup_stage.work
                 and phit[1] is lookup_stage.caps
@@ -570,7 +583,7 @@ class _EnginePrepareMixin:
                    tuple((name, units)
                          for name, units in lookup_stage.placement.items()),
                    lookup_stage.coupled, lookup_stage.priority, cohort_size,
-                   cohort_widened, members_sig, acq_sig, free_sig, lffs)
+                   cohort_widened, members_sig, acq_sig, free_sig, lffs, hbm_sig)
             cache = self._stage_prepared
             static_base = cache.get(key)
             if static_base is None:
