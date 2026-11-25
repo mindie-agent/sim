@@ -113,16 +113,29 @@ def _validate_native_call_precision(
     if not isinstance(native, Mapping) or not devices:
         return
     typed = native.get("typed")
-    declared = (
+    typed_dtype = (
         str(typed.get("dtype") or "").strip().lower()
         if isinstance(typed, Mapping) else ""
-    ) or str(op.dtype or "").strip().lower()
-    if not declared:
-        return
-    if not op.flops and declared not in (NATIVE_LOW_PRECISION_FORMATS | PACKED_FP4_FORMATS):
-        return
-    if not _all_dies_support(devices, declared):
-        raise ModelingError(f"matrix_native_call_precision_unsupported:{declared}")
+    )
+    op_dtype = str(op.dtype or "").strip().lower()
+    explicit_matrix_dtypes = tuple(
+        str(dt).strip().lower()
+        for dt, amount in op.matrix_flops
+        if dt and float(amount or 0.0) > 0.0
+    )
+    if explicit_matrix_dtypes and (not typed_dtype or typed_dtype == op_dtype):
+        candidates = explicit_matrix_dtypes
+    elif typed_dtype:
+        candidates = (typed_dtype,)
+    else:
+        candidates = (op_dtype,)
+    for declared in candidates:
+        if not declared:
+            continue
+        if not op.flops and declared not in (NATIVE_LOW_PRECISION_FORMATS | PACKED_FP4_FORMATS):
+            continue
+        if not _all_dies_support(devices, declared):
+            raise ModelingError(f"matrix_native_call_precision_unsupported:{declared}")
 
 
 def _is_native_mxfp4_eligible(op: OpSpec, meta: Mapping[str, Any]) -> bool:
@@ -340,13 +353,17 @@ def execution_compute_peaks(
     metadata = dict(op.metadata)
     dtypes: list[str] = []
     resolved = str(metadata.get("execution_compute_format", ""))
+    explicit_matrix_dtypes = [
+        str(dtype) for dtype, amount in op.matrix_flops
+        if dtype and float(amount or 0.0) > 0.0
+    ]
     if op.dtype and (
         op.dtype in base_peaks
         or resolved == str(op.dtype)
-        or op.flops
+        or (op.flops and not explicit_matrix_dtypes)
     ):
         dtypes.append(str(op.dtype))
-    dtypes.extend(str(dtype) for dtype, _amount in op.matrix_flops)
+    dtypes.extend(str(dtype) for dtype, _amount in op.matrix_flops if dtype)
     seen: set[str] = set()
     additions: dict[str, float] = {}
     for dtype in dtypes:

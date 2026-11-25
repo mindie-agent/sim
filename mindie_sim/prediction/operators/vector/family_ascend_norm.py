@@ -372,6 +372,9 @@ def lower_op(op, *, has_bias=None, external_gamma_shift=False):
     if qmeta is not None and ("norm" in op.returns or bool(meta.get("norm_output_materialized"))):
         raise ModelingError(
             f"ascend_native_norm_quant_materialized_norm_output_unsupported:{op.family}")
+    if qmeta is not None and "rstd" in op.returns:
+        raise ModelingError(
+            f"ascend_native_norm_quant_materialized_rstd_output_unsupported:{op.family}")
     declared_api = meta.get("norm_native_api")
     if op.family == "add_rmsnorm":
         if declared_api is None:

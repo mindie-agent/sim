@@ -403,13 +403,19 @@ class _CohortMixin(_CohortNativeMixin):
                     for hop in routed.hops
                 )
 
+            group_rank_to_idx = {rk: idx for idx, rk in enumerate(group)}
             ref_sigs: list[tuple[tuple[float, float, tuple[float, ...]], ...]] | None = None
             for rep in peer_replicas:
-                rep_sources = tuple(sorted({int(rk) for rk in self.topology.ranks(rep, source_stage)}))
+                rep_ranks = tuple(sorted({int(rk) for rk in self.topology.ranks(rep, source_stage)}))
+                if len(rep_ranks) != local_k:
+                    return False, 0, ()
+                rep_sources = tuple(
+                    group_rank_to_idx[rk] for rk in rep_ranks if rk in group_rank_to_idx
+                )
                 if len(rep_sources) != local_k:
                     return False, 0, ()
                 rep_transport = {**transport, "sources": rep_sources}
-                rep_set = set(rep_sources)
+                rep_set = set(rep_ranks)
                 rep_sigs: list[tuple[tuple[float, float, tuple[float, ...]], ...]] = []
                 for _si, _di, src, dst, useful, _frames in inner.transport_cells(rep_transport, count=False):
                     if useful <= 0 or src == dst or (src in rep_set and dst in rep_set):
@@ -432,9 +438,10 @@ class _CohortMixin(_CohortNativeMixin):
         """Construct the canonical ``Mc2LaunchView`` and ``(p_frames, p_basis)``."""
         labels = tuple(i for i in range(ep_width) if i != rank0)
         node = int(getattr(self.case.machine, "ranks_per_node", 0))
+        has_route_matrix = getattr(bound.program, "route_matrix", None) is not None
         frames_for = getattr(bound.program, "frames_for", None)
         frames_raw = (
-            frames_for(rank0) if callable(frames_for)
+            frames_for(rank0) if (has_route_matrix and callable(frames_for))
             else getattr(source_view, "payload_frames", None)
         )
         if isinstance(frames_raw, _AbcMapping):
@@ -447,7 +454,7 @@ class _CohortMixin(_CohortNativeMixin):
         p_basis = str(basis_for(rank0) if callable(basis_for)
                       else getattr(source_view, "payload_basis", "unknown"))
         local_for = getattr(bound.program, "local_frames_for", None)
-        p_local = int((local_for(rank0) if callable(local_for)
+        p_local = int((local_for(rank0) if (has_route_matrix and callable(local_for))
                        else getattr(source_view, "payload_local_frames", 0)) or 0)
         view = replace(
             source_view,
@@ -574,15 +581,24 @@ class _CohortMixin(_CohortNativeMixin):
         name0 = f"group:{key}:r{item0.replica}"
         phase_names = tuple(p.name for p in getattr(bound.program, "phases", ()))
         group = tuple(int(rk) for rk in (transport.get("group") or ()))
-        rank_to_idx = {rk: idx for idx, rk in enumerate(group)}
-        local_idx_set = {rank_to_idx[rk] for rk in local_sources if rk in rank_to_idx}
+        local_idx_set = {idx for idx in local_sources if 0 <= idx < len(group)}
 
         def _launch(_event=None):
             placeholders = {}
             inner_prog = bound.program
-            if hasattr(inner_prog, "transport_cells"):
-                for pname in phase_names:
-                    is_count = pname == "count_status_exchange"
+            phases_set = set(phase_names)
+            has_route = callable(transport.get("route"))
+            handled_payload = False
+            if has_route and hasattr(inner_prog, "transport_cells"):
+                has_payload_policy = bool(getattr(inner_prog, "has_payload_policy", False))
+                for pname, is_count in (
+                    ("payload_exchange", False),
+                    ("count_status_exchange", True),
+                ):
+                    if pname not in phases_set or (not is_count and not has_payload_policy):
+                        continue
+                    if not is_count:
+                        handled_payload = True
                     for si, di, _src, _dst, useful, _frames in inner_prog.transport_cells(
                         transport, count=is_count,
                     ):
@@ -606,25 +622,24 @@ class _CohortMixin(_CohortNativeMixin):
                                     lambda _e, target=rx_fut: None if target.done else self.engine.resolve(target),
                                     native_hook=True,
                                 )
-            elif p_frames:
+            if not handled_payload and p_frames and "payload_exchange" in phases_set:
+                pname = "payload_exchange"
+                peer_set = set(view.peer_labels)
                 for peer_idx, frames in p_frames:
-                    if frames <= 0 or peer_idx == rank0:
+                    if frames <= 0 or peer_idx == rank0 or peer_idx not in peer_set:
                         continue
-                    for pname in phase_names:
-                        if pname != "payload_exchange":
-                            continue
-                        tx_fut = placeholders.setdefault(
-                            (rank0, peer_idx, pname),
-                            self.engine.future(f"{name0}:tx:{rank0}->{peer_idx}:{pname}"),
+                    tx_fut = placeholders.setdefault(
+                        (rank0, peer_idx, pname),
+                        self.engine.future(f"{name0}:tx:{rank0}->{peer_idx}:{pname}"),
+                    )
+                    if (peer_idx, rank0, pname) not in placeholders:
+                        rx_fut = self.engine.future(f"{name0}:rx:{peer_idx}->{rank0}:{pname}")
+                        placeholders[(peer_idx, rank0, pname)] = rx_fut
+                        self.engine.on_complete(
+                            tx_fut,
+                            lambda _e, target=rx_fut: None if target.done else self.engine.resolve(target),
+                            native_hook=True,
                         )
-                        if (peer_idx, rank0, pname) not in placeholders:
-                            rx_fut = self.engine.future(f"{name0}:rx:{peer_idx}->{rank0}:{pname}")
-                            placeholders[(peer_idx, rank0, pname)] = rx_fut
-                            self.engine.on_complete(
-                                tx_fut,
-                                lambda _e, target=rx_fut: None if target.done else self.engine.resolve(target),
-                                native_hook=True,
-                            )
             rank_eng = _RankEngine(self.engine, res_names)
             finish, _handles = bound.start_with_handles(
                 rank_eng, name0, item0.ready,

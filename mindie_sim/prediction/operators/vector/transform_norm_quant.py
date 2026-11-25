@@ -38,6 +38,7 @@ from mindie_sim.prediction.implementations import (
 
 _OWNED_FUSION_ROLES = ("mla_prolog", "compressor")
 _BINARY_RESIDUAL_INPUTS = 2
+_ASCEND_NATIVE_NORM_IMPL = "vllm_ascend_native_norm"
 _NORM_QUANT_SEMANTIC_KEYS = (
     "reduction_width", "norm_eps", "epsilon",
     "activation_group_size", "activation_scale_shape", "activation_scale_format",
@@ -160,12 +161,55 @@ def _declared_fusion_owns(op):
     return any(str(key).rsplit(".", 1)[-1] in _OWNED_FUSION_ROLES for key in memberships or ())
 
 
+def _binding_uses_ascend_native_norm(raw):
+    if isinstance(raw, str):
+        return raw == _ASCEND_NATIVE_NORM_IMPL
+    if not isinstance(raw, Mapping):
+        return False
+    if raw.get("implementation") == _ASCEND_NATIVE_NORM_IMPL:
+        return True
+    if "cases" in raw:
+        cases = raw.get("cases") or ()
+        if any(
+            isinstance(case, Mapping)
+            and _binding_uses_ascend_native_norm(case.get("binding"))
+            for case in cases
+        ):
+            return True
+        return _binding_uses_ascend_native_norm(raw.get("otherwise"))
+    return False
+
+
+def _ascend_native_norm_quant_scopes(kernels):
+    lowerings = kernels.get("lowerings")
+    if not isinstance(lowerings, Mapping):
+        return False, False
+    return (
+        _binding_uses_ascend_native_norm(lowerings.get("rmsnorm_quant")),
+        _binding_uses_ascend_native_norm(lowerings.get("add_rmsnorm_quant")),
+    )
+
+
+_NORM_QUANT_EXTERNAL_MODES = frozenset({
+    "eliminate",
+    "materialize",
+    "native_eliminate",
+    "native_add_eliminate",
+    "native_add_materialize",
+})
+
+
 def _norm_quant_domain(kernels):
     domains = kernels.get("fusion_domains", {})
     if not isinstance(domains, Mapping) or set(domains) - {"norm_quant"}:
         raise ModelingError("fusion_domains_require_declared_norm_quant_consumer_domain")
     raw = domains.get("norm_quant")
+    native_plain, native_add = _ascend_native_norm_quant_scopes(kernels)
     if raw is None:
+        if native_plain:
+            return None, "native_eliminate"
+        if native_add:
+            return None, "native_add_eliminate"
         return None, "eliminate"
     if not isinstance(raw, Mapping) or set(raw) - {"consumers", "external_outputs"} or "consumers" not in raw:
         raise ModelingError("norm_quant_domain_requires_consumers")
@@ -180,6 +224,13 @@ def _norm_quant_domain(kernels):
     external = raw.get("external_outputs", "eliminate")
     if external not in {"eliminate", "materialize"}:
         raise ModelingError("norm_quant_external_output_mode_unknown")
+    # CANN AddRmsNormDynamicQuant / RmsNormDynamicMxQuant / AddRmsNormDynamicMxQuant
+    # materialize neither unquantized "norm" nor "rstd" (only payload, scales, and residual).
+    # Scope the restriction strictly to ops whose bound selector uses native norm lowering.
+    if native_plain:
+        external = "native_eliminate"
+    elif native_add:
+        external = "native_add_materialize" if external == "materialize" else "native_add_eliminate"
     return tuple(dict(item) for item in selectors), external
 
 
@@ -206,7 +257,7 @@ def _capture_state(op, partition):
 
 
 def norm_quant(ops, _, *, consumers=None, external_output="eliminate", capture_state=None):
-    if external_output not in {"eliminate", "materialize"}:
+    if external_output not in _NORM_QUANT_EXTERNAL_MODES:
         raise ModelingError("norm_quant_external_output_mode_unknown")
     by_id, users = {op.op_id: op for op in ops}, _users(ops)
     positions = {op.op_id: idx for idx, op in enumerate(ops)}
@@ -238,7 +289,25 @@ def norm_quant(ops, _, *, consumers=None, external_output="eliminate", capture_s
                 external_norm_outputs.add(norm_primary)
                 external_records.append({"consumer": user, "source_op": norm.op_id, "output": norm_primary})
         external_primary = norm_primary in external_norm_outputs
-        if ((external_primary and external_output != "materialize")
+        has_residual_producer = any(
+            (prod := by_id.get(dep)) is not None
+            and not prod.plan_required
+            and prod.recipe == "residual_add"
+            and len(prod.deps) == _BINARY_RESIDUAL_INPUTS
+            for dep in norm.deps
+        )
+        native_norm_applies = (
+            external_output == "native_eliminate"
+            or (external_output in {"native_add_eliminate", "native_add_materialize"} and has_residual_producer)
+        )
+        can_materialize_primary = (
+            external_output in {"materialize", "native_add_materialize"} and not native_norm_applies
+        )
+        unsupported_native_external = native_norm_applies and (
+            external_primary or "rstd" in external_norm_outputs
+        )
+        if ((external_primary and not can_materialize_primary)
+                or unsupported_native_external
                 or [u for u in users[norm.op_id] if by_id[u].family == "quantize"] != [op.op_id]
                 or any(positions[u] < positions[op.op_id] for u in external)
                 or _capture_state(norm, capture_state) != _capture_state(op, capture_state)
