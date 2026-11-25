@@ -568,13 +568,22 @@ EMBEDDED_A5_MC2_CAMPAIGNS = {
         "stack": "rack06", "date": "2026-10-22", "dtype": "int8+fp8-e4m3",
         "observed_expansion_mode": "not_observed", "requested_expansion_mode": "unspecified",
         "source": "capture://mindie-sim-data/a5/2026-10-22/mc2-quant/results/a5-mc2-quant-chain-validation.json",
-        "all_to_allv_series": (
-            ("fp8-e4m3", 2, ((14680064, 0.697195), (29360128, 1.161461))),
-            ("fp8-e4m3", 4, ((11010048, 0.580367), (22020096, 0.680918), (44040192, 0.912123))),
-            ("fp8-e4m3", 8, ((6422528, 0.751798), (12845056, 0.816551), (25690112, 0.865811))),
-            ("int8", 2, ((7340032, 0.482216), (14680064, 0.767949))),
-            ("int8", 4, ((5505024, 0.518167), (11010048, 0.577394), (22020096, 0.718820))),
-            ("int8", 8, ((3211264, 0.892829), (6422528, 0.907955), (12845056, 0.953864))),
+        # MC2 dispatch/combine callbacks are distinct device operations, never
+        # standalone AllToAllV.  FP8-E4M3 compute rows ran comm_mode=0 (BF16 on
+        # the wire), while INT8 compute rows ran comm_mode=2 (INT8 on the wire).
+        "mc2_comm_series": (
+            ("mc2_dispatch", "dispatch", "bf16", "fp8-e4m3", 2, ((14680064, 0.684780), (29360128, 1.110744))),
+            ("mc2_combine", "combine", "bf16", "fp8-e4m3", 2, ((14680064, 0.713726), (29360128, 1.190699))),
+            ("mc2_dispatch", "dispatch", "bf16", "fp8-e4m3", 4, ((11010048, 0.568884), (22020096, 0.674048), (44040192, 0.891875))),
+            ("mc2_combine", "combine", "bf16", "fp8-e4m3", 4, ((11010048, 0.589415), (22020096, 0.686549), (44040192, 0.931105))),
+            ("mc2_dispatch", "dispatch", "bf16", "fp8-e4m3", 8, ((6422528, 0.744687), (12845056, 0.806239), (25690112, 0.857518))),
+            ("mc2_combine", "combine", "bf16", "fp8-e4m3", 8, ((6422528, 0.771099), (12845056, 0.820368), (25690112, 0.872679))),
+            ("mc2_dispatch", "dispatch", "int8", "int8", 2, ((7340032, 0.428812), (14680064, 0.689170))),
+            ("mc2_combine", "combine", "int8", "int8", 2, ((7340032, 0.540832), (14680064, 0.853862))),
+            ("mc2_dispatch", "dispatch", "int8", "int8", 4, ((5505024, 0.497169), (11010048, 0.556873), (22020096, 0.675421))),
+            ("mc2_combine", "combine", "int8", "int8", 4, ((5505024, 0.535476), (11010048, 0.609449), (22020096, 0.782358))),
+            ("mc2_dispatch", "dispatch", "int8", "int8", 8, ((3211264, 0.879037), (6422528, 0.893208), (12845056, 0.941807))),
+            ("mc2_combine", "combine", "int8", "int8", 8, ((3211264, 0.912869), (6422528, 0.936168), (12845056, 0.986475))),
         ),
         "chains": (
             ("fp8-e4m3", 2, 64, 512, 0.698115, 0.381094, 0.065935, 0.222893, 0.732333, 1.810276),
@@ -631,6 +640,7 @@ EMBEDDED_A5_MC2_CAMPAIGNS = {
 
 
 import json
+import re
 from typing import Mapping
 
 from mindie_sim.schema.common import ModelingError
@@ -640,6 +650,14 @@ NATIVE_WINDOW_WARMUP_CALLS = 3
 NATIVE_WINDOW_ADMITTED_REPEATS = 5
 
 _EXPANSION_MODES = frozenset({"aicpu", "aiv"})
+_CANONICAL_EXPANSION_MODES = frozenset({"aicpu", "aiv", "ccu_ms", "nhr"})
+_NON_A5_EXECUTORS = frozenset({
+    "cpu", "host", "gpu", "cuda", "rocm", "xpu", "mps", "tpu",
+})
+_UNSPECIFIED_MODES = frozenset({
+    "", "unspecified", "not_observed", "default", "auto", "none",
+})
+_MC2_CALLBACK_COLLECTIVES = frozenset({"mc2_dispatch", "mc2_combine"})
 _CANARY_OK = frozenset({
     "all_ranks_matched", "ok", "passed", "matched", "match", "completed",
 })
@@ -692,25 +710,29 @@ def _require_a5(hardware_key, arch_family=None):
 
 def _mode(value):
     text = str(value or "").strip().lower()
-    if text in {"", "unspecified", "not_observed", "default", "auto", "none"}:
+    if text in _UNSPECIFIED_MODES:
         return "unspecified"
-    if text in {"aicpu", "ai_cpu", "cpu"}:
+    if text in {"aicpu", "ai_cpu", "aicpu_ts", "cpu"}:
         return "aicpu"
     if text in {"aiv", "ai_vector_core", "vector", "aivector"}:
         return "aiv"
+    if text in {"ccu", "ccu_ms", "ccu_sched"}:
+        return "ccu_ms"
+    if text == "nhr":
+        return "nhr"
     return text
 
 
 def _observed_mode(value):
-    text = str(value or "").strip().lower()
-    return text if text in _EXPANSION_MODES else "not_observed"
+    mode = _mode(value)
+    return "not_observed" if mode == "unspecified" else mode
 
 
 def _profiler_modes(evidence):
     """Extract explicitly named expansion engines from profiler text."""
     modes, stack = set(), [evidence]
     while stack:
-        if modes >= _EXPANSION_MODES:
+        if modes >= _CANONICAL_EXPANSION_MODES:
             break
         item = stack.pop()
         if isinstance(item, Mapping):
@@ -723,10 +745,15 @@ def _profiler_modes(evidence):
         if item is None or item is True or item is False:
             continue
         text = _normalized_text(item)
+        tokens = set(re.findall(r"[a-z0-9]+", str(item).lower()))
         if "aicpu" in text:
             modes.add("aicpu")
         if "aiv" in text or "aivectorcore" in text:
             modes.add("aiv")
+        if "ccu" in tokens or "ccums" in text or "ccusched" in text:
+            modes.add("ccu_ms")
+        if "nhr" in tokens:
+            modes.add("nhr")
     return modes
 
 
@@ -735,17 +762,17 @@ def resolve_expansion_regime(requested_expansion_mode, observed_expansion_mode, 
     """Resolve one expansion regime without promoting an unconfirmed request."""
     raw_req = _mode(requested_expansion_mode)
     observed = _observed_mode(observed_expansion_mode)
-    requested = raw_req if raw_req in _EXPANSION_MODES else "unspecified"
+    requested = raw_req if raw_req in _CANONICAL_EXPANSION_MODES else "unspecified"
     evidence = _profiler_modes(profiler_evidence)
     regime, conflict = "unspecified", False
-    if observed in _EXPANSION_MODES:
+    if observed != "not_observed":
         regime = observed
         conflict = bool(evidence and evidence != {observed})
     elif len(evidence) == 1:
         regime = next(iter(evidence))
     elif evidence:
         conflict = True
-    confirmed = regime in _EXPANSION_MODES and not conflict
+    confirmed = regime != "unspecified" and not conflict
     result = {
         "requested_expansion_mode": requested,
         "observed_expansion_mode": observed,
@@ -754,16 +781,16 @@ def resolve_expansion_regime(requested_expansion_mode, observed_expansion_mode, 
         "profiler_confirmed": bool(evidence) and regime in evidence and not conflict,
         "profiler_modes": sorted(evidence),
         "profiler_evidence": profiler_evidence,
-        "confirmed_by": ("observed" if observed in _EXPANSION_MODES and not conflict
+        "confirmed_by": ("observed" if observed != "not_observed" and not conflict
                          else "profiler" if confirmed else None),
         "evidence_conflict": conflict,
-        "requested_mismatch": (observed in _EXPANSION_MODES
-                               and requested in _EXPANSION_MODES
+        "requested_mismatch": (observed != "not_observed"
+                               and requested != "unspecified"
                                and observed != requested),
     }
     result["unconfirmed_tag"] = (None if confirmed else
                                  f"requested_{requested}_unconfirmed"
-                                 if requested in _EXPANSION_MODES else None)
+                                 if requested != "unspecified" else None)
     return _Resolution(result)
 
 
@@ -772,9 +799,12 @@ def _collective(value):
     aliases = {
         "allreduce": "all_reduce", "all_reduce_only": "all_reduce",
         "allgather": "all_gather", "all_gather_only": "all_gather",
+        "reducescatter": "reduce_scatter", "reducescatterv": "reduce_scatter",
         "reduce_scatter_only": "reduce_scatter", "reduce_scatter_v": "reduce_scatter",
         "alltoall": "all_to_all", "all_to_all_only": "all_to_all",
         "alltoallv": "all_to_allv", "all_to_allv_only": "all_to_allv",
+        "all_to_all_v": "all_to_allv", "all_to_all_v_only": "all_to_allv",
+        "alltoall_v": "all_to_allv",
         "p2p": "p2p_send_recv", "p2p_only": "p2p_send_recv",
         "send_recv": "p2p_send_recv", "point_to_point": "p2p_send_recv",
     }
@@ -927,6 +957,10 @@ def _validate_row(document, label):
         issue = _canary_issue(document.get(key))
         if issue:
             raise ValueError(f"a5_campaign_canary_failed:{label}:{key}:{issue}")
+    for exec_key in ("executor", "execution_device", "device_type", "device"):
+        raw_exec = document.get(exec_key)
+        if isinstance(raw_exec, str) and raw_exec.strip().lower() in _NON_A5_EXECUTORS:
+            raise ModelingError("a5_calibration_rejects_non_a5_hardware")
     for target in (document, document.get("machine"), document.get("hardware"),
                    document.get("stack_binding")):
         if isinstance(target, Mapping) and any(
@@ -984,8 +1018,46 @@ def _canonical_semantic(value):
         return repr(value)
 
 
+def _mc2_callback_measurement(direction: str, algorithm_identified: bool = False):
+    """Describe one measured MC2 dispatch or combine callback, never AllToAllV."""
+    norm_dir = "dispatch" if str(direction).strip().lower() == "dispatch" else "combine"
+    return {
+        "kind": "mc2_callback",
+        "phase": f"mc2_{norm_dir}",
+        "resource": f"mc2_{norm_dir}",
+        "native_operation": (
+            "npu_moe_distribute_dispatch_v2"
+            if norm_dir == "dispatch"
+            else "npu_moe_distribute_combine_v2"
+        ),
+        "direction": norm_dir,
+        "callback_boundary": (
+            "mc2_dispatch_call"
+            if norm_dir == "dispatch"
+            else "mc2_combine_call_with_capacity_buffer_zero_and_copy"
+        ),
+        "work_coordinate": "link_bytes",
+        "duration_unit": "ms",
+        "source_kind": "campaign_mc2_comm_lane",
+        "service_semantics": f"mc2_{norm_dir}_callback_envelope",
+        "complete_collective_call": False,
+        "complete_directed_call": False,
+        "link_transit_identified": False,
+        "hop_scaling": "not_derived",
+        "algorithm_identified": bool(algorithm_identified),
+        "direction_observed": True,
+        "explicit": True,
+    }
+
+
 def _fallback_measurement(collective, boundary, algorithm_identified=False):
     """Explicit campaign fallback; never claims a native AI_CPU child."""
+    if collective in _MC2_CALLBACK_COLLECTIVES:
+        direction = "dispatch" if collective == "mc2_dispatch" else "combine"
+        return {
+            **_mc2_callback_measurement(direction, algorithm_identified),
+            "explicit": False,
+        }
     if boundary == "resource_phase":
         return {
             "kind": "resource_phase", "phase": "collective_phase",
@@ -1028,7 +1100,8 @@ def _validate_measurement_window(measurement, window):
     kind = window.get("kind")
     if phase == "aicpu_child" and kind != "native_single_target_call":
         raise ValueError("a5_measurement_transport_window_mismatch")
-    if phase in {"collective_call", "directed_p2p_call", "collective_phase"} \
+    if phase in {"collective_call", "directed_p2p_call", "collective_phase",
+                 "mc2_dispatch", "mc2_combine"} \
             and kind == "native_single_target_call":
         raise ValueError("a5_measurement_transport_window_mismatch")
 

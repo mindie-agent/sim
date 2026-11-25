@@ -641,7 +641,8 @@ def _dedupe_conditions(rows, keep_meta=False):
         eff_sp = sp or "train"
         base = (
             row["campaign"], row["run_id"], row["collective"], row["world_size"],
-            row["placement_scope"], row["dtype"], row["payload_bytes"],
+            row["placement_scope"], row["dtype"], row.get("compute_dtype"),
+            row.get("direction"), row["payload_bytes"],
             row["single"], row["pair"], row["regime"], row.get("unconfirmed_tag"),
             row.get("profiler_confirmed"), row.get("stack"), row.get("cann"),
             row.get("algorithm"), _protocol_key(row.get("protocol")),
@@ -735,12 +736,16 @@ from .schema import (
     EMBEDDED_A5_MC2_CAMPAIGNS,
 )
 from .schema import (
+    _MC2_CALLBACK_COLLECTIVES,
+    _NON_A5_EXECUTORS,
     _collective,
     _dtype,
     _explicit_pair,
     _explicit_scope,
     _fallback_measurement,
     _fallback_transport_window,
+    _is_a5,
+    _mc2_callback_measurement,
     _merge_obs,
     _observed_mode,
     _pair,
@@ -847,9 +852,21 @@ def _base_row(document, label, origin, collective, world, scope, pair, payload,
     window = (dict(declared_window) if isinstance(declared_window, Mapping)
               else _fallback_transport_window(measurement))
     _validate_measurement_window(measurement, window)
-    return {
+    declared_comm_dtype = row.get("comm_dtype")
+    if declared_comm_dtype is not None:
+        wire_dtype = _dtype(declared_comm_dtype)
+    elif collective in _MC2_CALLBACK_COLLECTIVES:
+        mc2_dir = str(
+            row.get("direction")
+            or ("dispatch" if collective == "mc2_dispatch" else "combine")
+        ).strip().lower()
+        comp_dt = _dtype(row.get("compute_dtype") or row.get("dtype") or dtype)
+        wire_dtype = _resolve_mc2_comm_dtype(row, document, comp_dt, mc2_dir)
+    else:
+        wire_dtype = _dtype(row.get("dtype") or dtype)
+    result = {
         "campaign": label, "collective": collective, "world_size": int(world),
-        "placement_scope": scope, "dtype": _dtype(row.get("dtype") or dtype),
+        "placement_scope": scope, "dtype": wire_dtype,
         "payload_bytes": int(payload), "per_op_ms": float(duration),
         "single": bool(single), "pair": pair,
         **{key: resolved[key] for key in (
@@ -866,14 +883,26 @@ def _base_row(document, label, origin, collective, world, scope, pair, payload,
             "algorithm_identified", algorithm_identified)),
         **{k: row[k] for k in ("_repeats", "_weights") if k in row},
     }
+    if declared_comm_dtype is not None or collective in _MC2_CALLBACK_COLLECTIVES:
+        result["comm_dtype"] = wire_dtype
+    if row.get("compute_dtype") is not None:
+        result["compute_dtype"] = _dtype(row["compute_dtype"])
+    if row.get("compute_dtypes"):
+        result["compute_dtypes"] = list(row["compute_dtypes"])
+    if row.get("direction") is not None:
+        result["direction"] = row["direction"]
+    return result
 
 
 def _rank_rows(document, origin, p2p_pair=None, default_run_id=None, default_repeat=0):
     protocol = (document.get("protocol")
                 if isinstance(document.get("protocol"), Mapping) else {})
     dtype = _dtype(document.get("dtype") or protocol.get("dtype"))
-    world = (document.get("world_size")
-             or len(str(document.get("visible_devices", "")).split(",")))
+    visible = [
+        tok for tok in str(document.get("visible_devices") or "").split(",")
+        if tok.strip()
+    ]
+    world = int(document.get("world_size") or document.get("ranks") or len(visible) or 1)
     placement = document.get("placement", "")
     default_scope = _explicit_scope(document.get("placement_scope"))
     observed = document.get(
@@ -891,7 +920,9 @@ def _rank_rows(document, origin, p2p_pair=None, default_run_id=None, default_rep
                  or _scope(case.get("placement") or placement, world))
         explicit = (_explicit_pair(case.get("p2p_pair"))
                     or _explicit_pair(case.get("pair"))
+                    or _explicit_pair(case.get("p2p_scope"))
                     or _explicit_pair(document.get("p2p_pair"))
+                    or _explicit_pair(protocol.get("p2p_scope"))
                     or _explicit_pair(p2p_pair))
         pair = explicit if collective == "p2p_send_recv" else None
         if collective == "p2p_send_recv":
@@ -999,18 +1030,29 @@ def _parent_document(path, document):
     if not rank_files and not reports:
         return [(document, origin)]
     protocol, placement = document.get("protocol") or {}, document.get("placement", "")
-    world = document.get("world_size") or 1
-    pair = _explicit_pair(document.get("p2p_pair")) or _pair(
-        protocol.get("p2p_scope"), "p2p_send_recv", _scope(placement, world), world)
+    visible = [
+        tok for tok in str(document.get("visible_devices") or "").split(",")
+        if tok.strip()
+    ]
+    declared_world = document.get("world_size") or document.get("ranks") or (len(visible) if visible else None)
+    pair = (
+        _explicit_pair(document.get("p2p_pair"))
+        or _explicit_pair(protocol.get("p2p_scope"))
+    )
     grouped = defaultdict(list)
     parent_run = str(document.get("run_id") or document.get("label") or stem)
     inherited_keys = (
-        "observed_expansion_mode", "observed_execution",
+        "world_size", "ranks", "visible_devices", "dtype", "comm_dtype",
+        "compute_dtype", "placement", "placement_scope", "p2p_pair",
+        "hardware_key", "sku", "arch_family", "measurement",
+        "transport_window", "observed_expansion_mode", "observed_execution",
         "requested_expansion_mode", "profiler_evidence", "stack", "cann",
         "algorithm", "protocol", "machine", "stack_binding", "split",
         "boundary", "single",
     )
     defaults = {key: document[key] for key in inherited_keys if key in document}
+    if declared_world is not None:
+        defaults.setdefault("world_size", int(declared_world))
     rank_sources = list(chain(
         ((_load_json(item), str(item)) for item in rank_files), reports
     ))
@@ -1023,14 +1065,20 @@ def _parent_document(path, document):
             default_repeat=document.get("repeat_index", 0))
         for row in _dedupe_conditions(rank_rows, keep_meta=True):
             grouped[(
-                row["collective"], row["payload_bytes"], bool(row["single"]),
-                row["split"], row["pair"], row["dtype"], row["placement_scope"],
-                row["regime"], row.get("boundary"), row["run_id"],
-                row["repeat_index"], row.get("stack"), row.get("cann"),
-                row.get("algorithm"), _protocol_key(row.get("protocol")),
+                row["collective"], row["world_size"], row["payload_bytes"],
+                bool(row["single"]), row["split"], row["pair"], row["dtype"],
+                row.get("compute_dtype"), row.get("direction"),
+                row["placement_scope"], row["regime"],
+                row.get("unconfirmed_tag"), row.get("profiler_confirmed"),
+                row.get("boundary"),
+                _canonical_semantic(row.get("measurement")),
+                _canonical_semantic(row.get("transport_window")),
+                row.get("direction_observed"), row.get("algorithm_identified"),
+                row["run_id"], row["repeat_index"], row.get("stack"),
+                row.get("cann"), row.get("algorithm"),
+                _protocol_key(row.get("protocol")),
             )].append((rank_id, row))
     rows = []
-    expected_ranks = max(1, int(world))
     for _key, tagged_group in sorted(grouped.items(), key=str):
         by_rank: dict[int, list[dict]] = defaultdict(list)
         anonymous_rows: list[dict] = []
@@ -1055,6 +1103,7 @@ def _parent_document(path, document):
             {"_weights": [(med, sum(w for _, w in group[0]["_weights"]))]}
             if len(group) > 1 and "_weights" in group[0] else {}
         )
+        expected_ranks = max(1, int(declared_world or group[0].get("world_size") or 1))
         expected_set = _expected_rank_membership(group[0], expected_ranks)
         complete_coverage = (not anonymous_rows) and (set(by_rank) == expected_set)
         canary_value = "all_ranks_matched" if complete_coverage else base.get("canary")
@@ -1073,19 +1122,96 @@ def _parent_document(path, document):
               "label": document.get("label") or stem}, origin)]
 
 
+_MC2_CHAIN_COMPUTE_LEGS = frozenset({
+    "gate_up", "gmm_gate_up", "down", "gmm_down", "grouped_matmul",
+})
+_CAMPAIGN_CONTAINER_KEYS = frozenset({
+    "conditions", "comm_conditions", "series", "chains", "families",
+    "rank_reports", "cases", "median_ms_by_case", "raw_points",
+    "mc2_comm_series", "all_to_allv_series", "single_anchors",
+    "chain_validation",
+})
+
+
+def _row_declares_non_a5(item: Mapping) -> bool:
+    for exec_key in ("executor", "execution_device", "device_type", "device"):
+        raw_exec = item.get(exec_key)
+        if isinstance(raw_exec, str) and raw_exec.strip().lower() in _NON_A5_EXECUTORS:
+            return True
+    for target in (item, item.get("machine"), item.get("hardware"), item.get("stack_binding")):
+        if isinstance(target, Mapping) and any(
+            key in target for key in ("hardware_key", "sku", "arch_family", "key", "architecture")
+        ):
+            hw = target.get("hardware_key") or target.get("sku") or target.get("key") or A5_HARDWARE_KEY
+            arch = target.get("arch_family") or target.get("architecture")
+            if not _is_a5(hw, arch):
+                return True
+    return False
+
+
+def _is_campaign_document(value) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    keys = set(value)
+    if _CAMPAIGN_CONTAINER_KEYS & keys:
+        return True
+    return (
+        "label" in keys
+        and "legs_ms" not in keys
+        and "payload_bytes" not in keys
+        and "size_bytes" not in keys
+    )
+
+
+def _is_chain_validation_artifact(path: Path, values) -> bool:
+    name = path.name.lower()
+    if "chain-validation" not in name and "chain_validation" not in name:
+        return False
+    if not ("a5" in name or "mc2" in name or "a5" in {part.lower() for part in path.parts}):
+        return False
+    if not values:
+        return False
+    for item in values:
+        if not isinstance(item, Mapping) or _row_declares_non_a5(item):
+            return False
+        legs = item.get("legs_ms")
+        if not (isinstance(legs, Mapping) and "dispatch" in legs and "combine" in legs
+                and (_MC2_CHAIN_COMPUTE_LEGS & set(legs))):
+            return False
+        if not any(key in item for key in ("chain_ms", "chain_p50_ms", "pipeline_ms")):
+            return False
+        if not (any(key in item for key in ("condition", "chain_id"))
+                and "dtype" in item
+                and any(key in item for key in ("ranks", "ep", "world_size"))):
+            return False
+    return True
+
+
 def _list_document(values, origin):
     if not values:
         return []
-    if all(isinstance(value, Mapping) for value in values):
-        if any({"label", "conditions", "series", "chains", "families"} & set(value)
-               for value in values):
-            return [(value, origin) for value in values]
+    if all(_is_campaign_document(value) for value in values):
+        return [(value, origin) for value in values]
     raise ValueError(f"a5_campaign_source_list_not_a_campaign:{origin}")
 
 
 def _expand_path(path):
     document = _load_json(path)
     if isinstance(document, list):
+        if _is_chain_validation_artifact(path, document):
+            label = (
+                path.parent.parent.name
+                if path.parent.name == "results" and path.parent.parent.name
+                else path.stem
+            )
+            return [({
+                "label": label,
+                "kind": "mc2_chain",
+                "status": "completed",
+                "hardware_key": A5_HARDWARE_KEY,
+                "arch_family": A5_ARCH_FAMILY,
+                "chains": document,
+            }, str(path))]
         return _list_document(document, str(path))
     if not isinstance(document, Mapping):
         raise ValueError(f"a5_campaign_source_requires_json_object:{path}")
@@ -1196,9 +1322,7 @@ def _source_documents(source):
             return _list_document([source], "memory")
         return [(source, "memory")]
     if isinstance(source, (list, tuple)):
-        if (source and all(isinstance(value, Mapping) for value in source)
-                and any({"label", "conditions", "series", "chains", "families",
-                         "rank_reports", "cases"} & set(value) for value in source)):
+        if source and all(_is_campaign_document(value) for value in source):
             return [doc for value in source for doc in _source_documents(value)]
         return _list_document(list(source), "memory")
     raise ValueError("a5_campaign_source_requires_path_or_mapping")
@@ -1273,6 +1397,155 @@ def _add_series(rows, document, label, origin, dtype, common, series, single=Fal
             duration, dtype, bool(single or document.get("single")), **common))
 
 
+_MC2_COMBINE_QUANT_MODE_DTYPES = {
+    0: None,
+    2: "int8",
+    3: "mxfp8-e5m2",
+    4: "mxfp8-e4m3",
+}
+_MC2_DISPATCH_QUANT_MODE_DTYPES = {
+    0: None,
+    1: "int8",
+    2: "int8",
+    3: "int8",
+    4: "mxfp8",
+    5: "mxfp8",
+}
+_MC2_DIRECTIONS = frozenset({"dispatch", "combine"})
+_MC2_UNQUANTIZED_MODE = 0
+
+
+def _resolve_mc2_comm_dtype(point: Mapping, document: Mapping,
+                            compute_dtype: str, direction: str | None) -> str:
+    explicit = point.get("comm_dtype") or document.get("comm_dtype")
+    if explicit:
+        return _dtype(explicit)
+    expand_x = point.get("expand_x_dtype") or document.get("expand_x_dtype")
+    y_dtype = point.get("y_dtype") or document.get("y_dtype")
+    mode_table = (
+        _MC2_COMBINE_QUANT_MODE_DTYPES
+        if direction == "combine"
+        else _MC2_DISPATCH_QUANT_MODE_DTYPES
+    )
+    for key in ("comm_quant_mode", "comm_mode", "quant_mode"):
+        raw_mode = point.get(key, document.get(key))
+        if raw_mode is not None and not isinstance(raw_mode, bool):
+            mode_val = int(raw_mode)
+            if mode_val == _MC2_UNQUANTIZED_MODE:
+                if expand_x:
+                    return _dtype(str(expand_x).removeprefix("torch."))
+                return "bf16"
+            mapped = mode_table.get(mode_val)
+            if mapped is not None:
+                if direction == "combine":
+                    # combine_v2 quantizes BF16 expand_x onto the wire per comm_quant_mode.
+                    return mapped
+                if y_dtype:
+                    return _dtype(str(y_dtype).removeprefix("torch."))
+                if expand_x and _dtype(str(expand_x).removeprefix("torch.")) != "bf16":
+                    return _dtype(str(expand_x).removeprefix("torch."))
+                return mapped
+    if expand_x:
+        return _dtype(str(expand_x).removeprefix("torch."))
+    if direction in _MC2_DIRECTIONS and compute_dtype == "fp8-e4m3":
+        # A5 MC2 dispatch/combine v2 has no per-token fp8-e4m3 wire mode;
+        # fp8-e4m3 compute rows ran comm_mode=0 (BF16 on the wire).
+        return "bf16"
+    return compute_dtype
+
+
+def _raw_point_scope(point: Mapping, document: Mapping, world: int) -> str:
+    raw_pt_scope = point.get("placement_scope")
+    if raw_pt_scope is not None:
+        resolved = _explicit_scope(raw_pt_scope)
+        if resolved is None:
+            raise ModelingError(f"a5_placement_scope_unknown:{raw_pt_scope}")
+        return resolved
+    declared = (
+        _explicit_scope(document.get("placement_scope"))
+        or _explicit_scope(point.get("placement"))
+        or _explicit_scope(document.get("placement"))
+    )
+    return declared or _scope("", world)
+
+
+def _ingest_raw_points(rows, document, label, origin, default_dtype, common,
+                       requested, observed, evidence):
+    raw_points = document.get("raw_points") or ()
+    if not raw_points:
+        return
+    lane = {}
+    for index, point in enumerate(raw_points):
+        _validate_row(point, f"{label}:raw_points[{index}]")
+        direction = str(point.get("direction") or "").strip().lower() or None
+        is_mc2 = direction in _MC2_DIRECTIONS
+        collective = (
+            f"mc2_{direction}" if is_mc2
+            else _collective(point.get("collective") or "all_to_allv")
+        )
+        compute_dtype = _dtype(point.get("compute_dtype") or point.get("dtype") or default_dtype)
+        comm_dtype = _resolve_mc2_comm_dtype(point, document, compute_dtype, direction)
+        ep_world = int(point.get("ep"))
+        point_scope = _raw_point_scope(point, document, ep_world)
+        observed_point = point.get(
+            "observed_expansion_mode", point.get("observed_execution"))
+        resolved_point = resolve_expansion_regime(
+            point.get("requested_expansion_mode", requested),
+            point.get("observed_expansion_mode",
+                      point.get("observed_execution", observed)),
+            profiler_evidence=point.get("profiler_evidence", evidence))
+        sel = _selectors(document, point)
+        key = (
+            collective, direction, comm_dtype, point_scope,
+            ep_world, int(point.get("link_bytes")),
+            bool(point.get("single", document.get("single", False))),
+            _split(point.get("split", document.get("split"))),
+            point.get("run_id"), point.get("repeat_index"),
+            observed_point, point.get("requested_expansion_mode"),
+            point.get("algorithm"),
+            point.get("boundary", document.get("boundary")),
+            resolved_point["regime"], resolved_point["unconfirmed_tag"],
+            resolved_point["profiler_confirmed"],
+            (sel["stack"], sel["cann"], sel["algorithm"],
+             _protocol_key(sel["protocol"])),
+        )
+        entry = lane.setdefault(key, (point, [], set()))
+        entry[1].append(float(point["ms"]))
+        if is_mc2:
+            entry[2].add(compute_dtype)
+    for key, (point, values, comp_dtypes) in sorted(lane.items(), key=str):
+        (collective, direction, comm_dtype, point_scope, series_world,
+         payload, single, split, run_id, repeat_index, observed_point,
+         requested_point, _, _, _, _, _, _) = key
+        row_payload = {**point, "dtype": comm_dtype, "comm_dtype": comm_dtype}
+        row_payload.pop("compute_dtype", None)
+        ordered_comp = sorted(comp_dtypes)
+        if len(ordered_comp) == 1:
+            row_payload["compute_dtype"] = ordered_comp[0]
+        elif len(ordered_comp) > 1:
+            row_payload["compute_dtypes"] = ordered_comp
+        if direction in _MC2_DIRECTIONS:
+            row_payload["direction"] = direction
+            if not isinstance(row_payload.get("measurement"), Mapping) and not isinstance(document.get("measurement"), Mapping):
+                row_payload["measurement"] = _mc2_callback_measurement(
+                    direction,
+                    algorithm_identified=(point.get("algorithm", document.get("algorithm")) is not None),
+                )
+        rows.append(_base_row(
+            document, label, origin, collective, series_world,
+            point_scope, None, payload, median(values),
+            comm_dtype, single, row_payload,
+            run_id=run_id or common["run_id"],
+            repeat_index=(repeat_index if repeat_index is not None
+                          else common["repeat_index"]),
+            split=split if split is not None else common["split"],
+            requested=(requested_point if requested_point is not None
+                       else common["requested"]),
+            observed=(observed_point if observed_point is not None
+                      else common["observed"]),
+            evidence=point.get("profiler_evidence", evidence)))
+
+
 def _campaign_conditions(document, label, origin):
     protocol = (document.get("protocol")
                 if isinstance(document.get("protocol"), Mapping) else {})
@@ -1297,51 +1570,24 @@ def _campaign_conditions(document, label, origin):
             observed, requested, evidence))
     for series in document.get("series") or ():
         _add_series(rows, document, label, origin, dtype, common, series)
-    raw_points = document.get("raw_points") or ()
-    if raw_points:
-        lane = {}
-        for index, point in enumerate(raw_points):
-            _validate_row(point, f"{label}:raw_points[{index}]")
-            observed_point = point.get(
-                "observed_expansion_mode", point.get("observed_execution"))
-            resolved_point = resolve_expansion_regime(
-                point.get("requested_expansion_mode", requested),
-                point.get("observed_expansion_mode",
-                          point.get("observed_execution", observed)),
-                profiler_evidence=point.get("profiler_evidence", evidence))
-            sel = _selectors(document, point)
-            key = (
-                _dtype(point.get("dtype")), int(point.get("ep")),
-                int(point.get("link_bytes")),
-                bool(point.get("single", document.get("single", False))),
-                _split(point.get("split", document.get("split"))),
-                point.get("run_id"), point.get("repeat_index"),
-                observed_point, point.get("requested_expansion_mode"),
-                point.get("algorithm"),
-                point.get("boundary", document.get("boundary")),
-                resolved_point["regime"], resolved_point["unconfirmed_tag"],
-                resolved_point["profiler_confirmed"],
-                (sel["stack"], sel["cann"], sel["algorithm"],
-                 _protocol_key(sel["protocol"])),
-            )
-            lane.setdefault(key, (point, []))[1].append(float(point["ms"]))
-        for key, (point, values) in sorted(lane.items(), key=str):
-            (lane_dtype, series_world, payload, single, split, run_id,
-             repeat_index, observed_point, requested_point,
-             _, _, _, _, _, _) = key
+    _ingest_raw_points(
+        rows, document, label, origin, dtype, common,
+        requested, observed, evidence)
+    for coll, direction, comm_dtype, compute_dtype, series_world, points in (
+        document.get("mc2_comm_series") or ()
+    ):
+        meas = _mc2_callback_measurement(
+            direction, algorithm_identified=(document.get("algorithm") is not None))
+        series_row = {
+            "dtype": comm_dtype, "comm_dtype": comm_dtype,
+            "compute_dtype": compute_dtype, "direction": direction,
+            "measurement": meas,
+        }
+        for payload, duration in points:
             rows.append(_base_row(
-                document, label, origin, "all_to_allv", series_world,
-                _scope("", series_world), None, payload, median(values),
-                lane_dtype, single, point,
-                run_id=run_id or common["run_id"],
-                repeat_index=(repeat_index if repeat_index is not None
-                              else common["repeat_index"]),
-                split=split if split is not None else common["split"],
-                requested=(requested_point if requested_point is not None
-                           else common["requested"]),
-                observed=(observed_point if observed_point is not None
-                          else common["observed"]),
-                evidence=point.get("profiler_evidence", evidence)))
+                document, label, origin, _collective(coll), series_world,
+                _scope("", series_world), None, payload, duration, comm_dtype,
+                bool(document.get("single")), series_row, **common))
     for lane_dtype, series_world, points in document.get("all_to_allv_series") or ():
         _add_series(
             rows, document, label, origin, lane_dtype, common,

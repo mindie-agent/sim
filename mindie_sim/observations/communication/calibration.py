@@ -22,12 +22,15 @@ from .schema import A5_ARCH_FAMILY, A5_HARDWARE_KEY, A5_SKU
 from .ingest import _coerce_ingested, ingest_a5_campaign_data
 from .schema import (
     INTRA_NODE_MAX_RANKS,
+    _CANONICAL_EXPANSION_MODES,
+    _MC2_CALLBACK_COLLECTIVES,
     _collective,
     _dtype,
     _explicit_pair,
     _explicit_scope,
     _fallback_measurement,
     _fallback_transport_window,
+    _mc2_callback_measurement,
     _mode,
     _protocol_key,
     _require_a5,
@@ -41,13 +44,13 @@ DEFAULT_HOLDOUT_PAYLOADS = (65536, 16_777_216)
 _EXPANSION_MODES = frozenset({"aicpu", "aiv"})
 _PAIR_ORDER = {"0->1": 0, "0->4": 1, "0->8": 2, "0->24": 3}
 _PAIR_FALLBACK_ORDER = 99
-_FAR_PAIR_WORLD_ALIAS = 24
 # Source direction of the data movement each collective performs.  AllGather
 # channels read peers; AllReduce/ReduceScatter steps and AllToAll exchanges
 # write/send.  This is the HCCL contract direction, not a measured link sample.
 _COLLECTIVE_DIRECTION = {
     "all_gather": "read", "all_reduce": "send", "reduce_scatter": "send",
     "all_to_all": "send", "all_to_allv": "send", "p2p_send_recv": "directed",
+    "mc2_dispatch": "dispatch", "mc2_combine": "combine",
 }
 _PRIMARY_STACKS = ("rack06", "rack06-07", "rack06-09")
 _AMBIGUOUS = "a5_incompatible_software_stacks_require_selector"
@@ -193,6 +196,9 @@ def _measurement_boundary(collective, boundary, native=False,
             "algorithm_identified": bool(algorithm_identified),
             "direction_observed": False,
         }
+    if collective in {"mc2_dispatch", "mc2_combine"}:
+        direction = "dispatch" if collective == "mc2_dispatch" else "combine"
+        return _mc2_callback_measurement(direction, algorithm_identified)
     if collective == "p2p_send_recv":
         return {
             "kind": "device_call", "phase": "directed_p2p_call",
@@ -253,8 +259,12 @@ def _fit_group(rows, holdout_payloads, key, evidence, extra_identity=None):
                 "split": split,
             })
         else:
+            distinct_comp = {r.get("compute_dtype") for r in grp if r.get("compute_dtype")}
+            split_by_comp = len(distinct_comp) > 1
             samples.extend({
-                "work": work, "duration_ms": r["per_op_ms"], "run_id": run_id,
+                "work": work, "duration_ms": r["per_op_ms"],
+                "run_id": (f"{run_id}:{r.get('compute_dtype')}"
+                           if split_by_comp and r.get("compute_dtype") else run_id),
                 "repeat_index": int(r.get("repeat_index") or 0),
                 "source": (r.get("source")
                            or f"{r['campaign']}:{collective}:W{world_size}:{work}"),
@@ -272,12 +282,26 @@ def _fit_group(rows, holdout_payloads, key, evidence, extra_identity=None):
     measurement = _measurement_from_rows(rows, collective, boundary)
     window = _transport_window(rows, collective, boundary)
     semantics = measurement["service_semantics"]
+    work_scope = measurement.get("work_coordinate", "captured_per_rank_payload")
+    compute_dtypes = sorted({
+        str(cd)
+        for row in rows
+        for cd in (row.get("compute_dtypes")
+                   or ((row.get("compute_dtype"),) if row.get("compute_dtype") else ()))
+        if cd
+    })
     identity.update({
         "direction": direction, "shared_domain": shared,
         "transport_window": window, "measurement_boundary": measurement,
         "service_semantics": semantics,
-        "work_scope": "captured_per_rank_payload",
+        "work_scope": work_scope,
     })
+    if compute_dtypes or collective in _MC2_CALLBACK_COLLECTIVES:
+        identity["comm_dtype"] = dtype
+    if len(compute_dtypes) == 1:
+        identity["compute_dtype"] = compute_dtypes[0]
+    elif len(compute_dtypes) > 1:
+        identity["compute_dtypes"] = compute_dtypes
     if extra_identity:
         identity.update(extra_identity)
     provenance = {
@@ -298,7 +322,7 @@ def _fit_group(rows, holdout_payloads, key, evidence, extra_identity=None):
         "direction": direction, "shared_domain": shared,
         "transport_window": window, "service_semantics": semantics,
         "measurement_boundary": measurement,
-        "work_scope": "captured_per_rank_payload",
+        "work_scope": work_scope,
         # A measured call/phase is a completion envelope, not a per-hop link
         # price.  Whether a link transit rate is identifiable is recorded
         # explicitly instead of deriving one by multiplying hops.
@@ -311,6 +335,12 @@ def _fit_group(rows, holdout_payloads, key, evidence, extra_identity=None):
         "shared_domain_basis": "declared_placement_scope_and_group",
         "transport_window_basis": "source_artifact_kind",
     }
+    if compute_dtypes or collective in _MC2_CALLBACK_COLLECTIVES:
+        provenance["comm_dtype"] = dtype
+    if len(compute_dtypes) == 1:
+        provenance["compute_dtype"] = compute_dtypes[0]
+    elif len(compute_dtypes) > 1:
+        provenance["compute_dtypes"] = compute_dtypes
     if extra_identity and extra_identity.get("derived_from"):
         provenance["derived_from"] = extra_identity["derived_from"]
     provenance["boundary"] = boundary
@@ -340,6 +370,11 @@ def _selector_match(curve, selectors):
         elif curve.identity.get(name) != wanted:
             return False
     return True
+
+
+def _curve_matches_world(curve, wanted_world: int) -> bool:
+    declared = curve.identity.get("world_size")
+    return declared is None or int(declared) == int(wanted_world)
 
 
 def _select_software(cell, options):
@@ -411,7 +446,7 @@ class A5CommCalibrationBundle:
                     f"a5_placement_scope_unknown:{placement_scope}")
         base = (name, int(world_size), scope, _dtype(dtype))
         mode = _mode(expansion_mode)
-        if mode in _EXPANSION_MODES:
+        if mode in _CANONICAL_EXPANSION_MODES:
             keys = [base + (mode,)]
             if allow_unspecified_fallback:
                 keys.append(base + ("unspecified",))
@@ -423,12 +458,16 @@ class A5CommCalibrationBundle:
     def _pick(self, candidates, selectors, mode):
         requested = any(value is not None for value in selectors.values())
         for candidate in candidates:
+            wanted_world = int(candidate[1])
             direct = {curve.model_id: curve for key, curve in self.curves.items()
-                      if key == candidate and _selector_match(curve, selectors)}
+                      if key == candidate
+                      and _curve_matches_world(curve, wanted_world)
+                      and _selector_match(curve, selectors)}
             if not requested and direct:
                 return next(iter(direct.values()))
             matches = {curve.model_id: curve for key, curve
                        in self.stack_curves.items() if key[:5] == candidate
+                       and _curve_matches_world(curve, wanted_world)
                        and _selector_match(curve, selectors)}
             matches.update(direct)
             if not matches:
@@ -443,7 +482,7 @@ class A5CommCalibrationBundle:
             if len(matches) > 1:
                 raise ModelingError(_AMBIGUOUS)
             return next(iter(matches.values()))
-        if mode in _EXPANSION_MODES:
+        if mode in _CANONICAL_EXPANSION_MODES:
             raise ModelingError(f"a5_expansion_regime_unconfirmed:{mode}")
         base = candidates[0]
         raise ModelingError(
@@ -470,8 +509,9 @@ class A5CommCalibrationBundle:
                 key = key[:5]
             if len(key) != 5:
                 raise ModelingError("a5_curve_key_requires_five_or_six_fields")
-            if key in self.curves and not any(value is not None
-                                              for value in selectors.values()):
+            if (key in self.curves
+                    and not any(value is not None for value in selectors.values())
+                    and _curve_matches_world(self.curves[key], key[1])):
                 return self.curves[key]
             candidates, mode = self._candidates(
                 key[0], key[1], placement_scope=key[2], dtype=key[3],
@@ -543,6 +583,23 @@ class A5CommCalibrationBundle:
             production=production, **lookup_kwargs)
 
 
+def _variant_targets(cell, boundary_variants):
+    targets = defaultdict(list)
+    for index, entry in enumerate(boundary_variants):
+        pair = entry[0]
+        if index == 0:
+            targets[cell].append(entry)
+        if pair:
+            if index > 0:
+                suffix = pair.replace("->", "_")
+                targets[(cell[0], cell[1], f"{cell[2]}_{suffix}", cell[3],
+                         cell[4])].append(entry)
+            if pair == "0->24" and cell[2] != "cross_node_urma_far":
+                targets[(cell[0], cell[1], "cross_node_urma_far",
+                         cell[3], cell[4])].append(entry)
+    return targets
+
+
 def fit_a5_service_curves(ingested=None, *,
                           holdout_payloads=DEFAULT_HOLDOUT_PAYLOADS):
     """Fit one ServiceCurve per strict communication software partition."""
@@ -552,33 +609,28 @@ def fit_a5_service_curves(ingested=None, *,
     holdout = frozenset(int(payload) for payload in holdout_payloads)
     groups = defaultdict(list)
     for row in data.get("conditions") or ():
-        if row["single"] or row["collective"] not in _SUPPORTED_COLLECTIVES:
+        coll = _collective(row["collective"])
+        if row["single"] or coll not in _SUPPORTED_COLLECTIVES:
             continue
-        key = (row["collective"], int(row["world_size"]), row["placement_scope"],
+        key = (coll, int(row["world_size"]), row["placement_scope"],
                row["dtype"], row["regime"],
-               row["pair"] if row["collective"] == "p2p_send_recv" else None,
+               row["pair"] if coll == "p2p_send_recv" else None,
                *_software_key(row), row.get("boundary") or "device_kernel")
         groups[key].append(row)
-    derived_keys = set()
-    for key, rows in list(groups.items()):
-        if key[0] != "all_to_all":
-            continue
-        target = ("all_to_allv",) + key[1:2] + key[2:]
-        if target not in groups:
-            groups[target] = rows
-            derived_keys.add(target)
     curves, fits, holdout_rows, unfitted = {}, [], [], []
     software_maps = defaultdict(lambda: defaultdict(list))
-    for key in sorted(groups, key=str):
-        rows = groups[key]
-        derived = key in derived_keys
+    fitted_keys = set()
+
+    def _fit_and_record(key, rows, *, derived: bool) -> bool:
         evidence = "derived_all_to_all_equivalent" if derived else "measured"
         extra = {"derived_from": "all_to_all"} if derived else None
         curve, fitted, error = _fit_group(rows, holdout, key, evidence, extra)
         if error:
-            unfitted.append({"key": key, "reason": error})
-            continue
+            if not derived:
+                unfitted.append({"key": key, "reason": error})
+            return False
         cell = key[:5]
+        fitted_keys.add(key)
         software_maps[key[6:10]][cell].append((key[5], curve, fitted, key))
         fits.append({
             **fitted, "cell": cell, **_cell_fields(cell),
@@ -590,6 +642,17 @@ def fit_a5_service_curves(ingested=None, *,
             **row, "cell": cell, **_cell_fields(cell),
             "p2p_pair": key[5], "split": "heldout",
         } for row in fitted["heldout"])
+        return True
+
+    for key in sorted(groups, key=str):
+        _fit_and_record(key, groups[key], derived=False)
+    for key in sorted(groups, key=str):
+        if key[0] != "all_to_all":
+            continue
+        target = ("all_to_allv",) + key[1:]
+        if target not in fitted_keys:
+            if _fit_and_record(target, groups[key], derived=True):
+                unfitted = [item for item in unfitted if item["key"] != target]
     stack_curves = {}
     target_options = defaultdict(lambda: defaultdict(list))
     for software in sorted(software_maps, key=str):
@@ -602,20 +665,7 @@ def fit_a5_service_curves(ingested=None, *,
                 boundary_variants.sort(key=lambda value: (
                     _PAIR_ORDER.get(value[0], _PAIR_FALLBACK_ORDER),
                     str(value[3])))
-                targets = defaultdict(list)
-                for index, entry in enumerate(boundary_variants):
-                    pair = entry[0]
-                    if index == 0:
-                        targets[cell].append(entry)
-                        continue
-                    suffix = pair.replace("->", "_")
-                    targets[(cell[0], cell[1], f"{cell[2]}_{suffix}", cell[3],
-                             cell[4])].append(entry)
-                    if pair == "0->24":
-                        targets[(cell[0], _FAR_PAIR_WORLD_ALIAS, cell[2],
-                                 cell[3], cell[4])].append(entry)
-                        targets[(cell[0], cell[1], "cross_node_urma_far",
-                                 cell[3], cell[4])].append(entry)
+                targets = _variant_targets(cell, boundary_variants)
                 for target, entries in targets.items():
                     curve = entries[0][1]
                     stack_curves.setdefault(target + (software[0],), curve)
@@ -655,7 +705,7 @@ from statistics import median
 
 from mindie_sim.schema.common import ModelingError
 from .schema import A5_ARCH_FAMILY, A5_HARDWARE_KEY
-from .schema import _EXPANSION_MODES, _dtype, _mode, resolve_expansion_regime
+from .schema import _CANONICAL_EXPANSION_MODES, _dtype, _mode, resolve_expansion_regime
 from .binding import DEFAULT_ACTIVE_AIV_BLOCKS
 
 DEFAULT_TOTAL_AIV_UNITS = 64
@@ -705,10 +755,42 @@ def _engine_pipe_slowdown(rate_per_ms: float, contending_util: float) -> float:
     return float(cont_ev.time / base_ev.time) if base_ev.time > 0.0 else 1.0
 
 
-def _engine_link_transfer(hw, topo, peer, payload_bytes: int, hbm_slowdown: float) -> tuple[float, float]:
-    """Price 1-hop DirectPeerCollective transfer and startup sync on canonical Engine + Topology."""
+def _run_transfer_engine(cap_per_ms: float, hbm_per_ms: float, mte_per_ms: float,
+                         vec_per_ms: float, *, payload_bytes: int, sync_ms: float,
+                         mode: str, hbm_load: float = 0.0, mte_load: float = 0.0,
+                         vec_load: float = 0.0) -> tuple[float, float]:
     from mindie_sim.prediction.runtime.engine import Engine, Resource
 
+    resources = [Resource("link", cap_per_ms), Resource("hbm", hbm_per_ms)]
+    demand = {"link": float(payload_bytes), "hbm": float(payload_bytes)}
+    if mte_per_ms > 0.0:
+        resources.append(Resource("mte", mte_per_ms))
+        demand["mte"] = float(payload_bytes)
+    vec_work = 0.0
+    if mode == "aiv" and vec_per_ms > 0.0:
+        resources.append(Resource("vector", vec_per_ms))
+        vec_work = float(payload_bytes) / _BF16_ELEMENT_BYTES
+        demand["vector"] = vec_work
+    engine = Engine(tuple(resources))
+    # Match DirectPeerCollective hop execution: serialization service runs first,
+    # followed sequentially by propagation/hop-startup arrival latency.
+    service = engine.submit("direct_peer_service", demand, coupled=True)
+    arrival = engine.submit("direct_peer_arrival", {}, after=(service,), latency=sync_ms)
+    if hbm_load > 0.0:
+        engine.submit("hbm_contender", {"hbm": hbm_load * float(payload_bytes)})
+    if mte_load > 0.0 and mte_per_ms > 0.0:
+        engine.submit("mte_contender", {"mte": mte_load * float(payload_bytes)})
+    if vec_load > 0.0 and vec_work > 0.0:
+        engine.submit("vector_contender", {"vector": vec_load * vec_work})
+    engine.advance()
+    return float(arrival.time), float(service.time)
+
+
+def _engine_link_transfer(hw, topo, peer, payload_bytes: int, *,
+                          mode: str = "unspecified", hbm_load: float = 0.0,
+                          mte_load: float = 0.0,
+                          vec_load: float = 0.0) -> tuple[float, float, float, float]:
+    """Price matched baseline and contended DirectPeerCollective transfers on Engine."""
     route = topo.route(0, 1)
     if not route:
         raise ModelingError("a5_contention_topology_route_missing")
@@ -718,22 +800,20 @@ def _engine_link_transfer(hw, topo, peer, payload_bytes: int, hbm_slowdown: floa
     extra_hop_ms = float(getattr(opts, "hop_startup_us", 0.0) or 0.0) / _US_PER_MS
     sync_ms = hop_startup_ms + extra_hop_ms
     cap_per_ms = float(link.capacity_bytes_per_ms)
-    die = hw.dies[0]
-    hbm_per_ms = float(dict(die.rates).get("hbm", 0.0)) / _MS_PER_SECOND
-    engine = Engine((
-        Resource("link", cap_per_ms),
-        Resource("hbm", hbm_per_ms),
-    ))
-    ev = engine.submit(
-        "direct_peer_transfer",
-        {"link": float(payload_bytes), "hbm": float(payload_bytes)},
-        latency=sync_ms,
+    rates = dict(hw.dies[0].rates)
+    hbm_per_ms = float(rates.get("hbm", 0.0)) / _MS_PER_SECOND
+    mte_per_ms = float(rates.get("mte2_aiv", rates.get("mte2", 0.0))) / _MS_PER_SECOND
+    vec_per_ms = float(rates.get("vector", 0.0)) / _MS_PER_SECOND
+    base_elapsed, _base_service = _run_transfer_engine(
+        cap_per_ms, hbm_per_ms, mte_per_ms, vec_per_ms,
+        payload_bytes=payload_bytes, sync_ms=sync_ms, mode=mode,
     )
-    if hbm_slowdown > 1.0:
-        engine.submit("hbm_contender", {"hbm": (hbm_slowdown - 1.0) * float(payload_bytes)})
-    engine.advance()
-    transfer_ms = max(0.0, float(ev.time) - sync_ms)
-    return transfer_ms, sync_ms
+    cont_elapsed, transfer_ms = _run_transfer_engine(
+        cap_per_ms, hbm_per_ms, mte_per_ms, vec_per_ms,
+        payload_bytes=payload_bytes, sync_ms=sync_ms, mode=mode,
+        hbm_load=hbm_load, mte_load=mte_load, vec_load=vec_load,
+    )
+    return base_elapsed, cont_elapsed, transfer_ms, sync_ms
 
 
 def compute_a5_contention_slowdown(expansion_mode, *, concurrent_cube_util=0.0,
@@ -744,7 +824,7 @@ def compute_a5_contention_slowdown(expansion_mode, *, concurrent_cube_util=0.0,
                                    total_aiv_units=DEFAULT_TOTAL_AIV_UNITS):
     """Discrete-event Engine + Topology + DirectPeerCollective contention evaluation."""
     mode = _mode(expansion_mode)
-    if mode not in _EXPANSION_MODES and mode != "unspecified":
+    if mode not in _CANONICAL_EXPANSION_MODES and mode != "unspecified":
         raise ModelingError(f"a5_expansion_mode_unknown:{expansion_mode}")
     util_checks = [
         ("concurrent_cube_util", concurrent_cube_util),
@@ -782,11 +862,13 @@ def compute_a5_contention_slowdown(expansion_mode, *, concurrent_cube_util=0.0,
     hbm_load = float(concurrent_hbm_util) if concurrent_hbm_util is not None else u_mte
     hbm_slowdown = _engine_pipe_slowdown(r_hbm, hbm_load)
     cube_slowdown = _engine_pipe_slowdown(r_cube, u_cube)
-    # Communication legs do not execute on AIC Cube units.
-    total = max(vector_slowdown, mte_slowdown, hbm_slowdown)
-    transfer_ms, sync_ms = _engine_link_transfer(
-        hw, topo, peer, _CONTENTION_PROBE_BYTES, hbm_slowdown,
+    base_elapsed, cont_elapsed, transfer_ms, sync_ms = _engine_link_transfer(
+        hw, topo, peer, _CONTENTION_PROBE_BYTES,
+        mode=mode, hbm_load=hbm_load, mte_load=u_mte, vec_load=vec_load,
     )
+    # Transfer slowdown is derived from matched baseline vs contended Engine
+    # elapsed times, never max() over isolated single-pipe probes.
+    total = max(1.0, cont_elapsed / base_elapsed) if base_elapsed > 0.0 else 1.0
     return {
         "expansion_mode": mode,
         "vector_slowdown": vector_slowdown,
@@ -797,6 +879,8 @@ def compute_a5_contention_slowdown(expansion_mode, *, concurrent_cube_util=0.0,
         "total_slowdown": total,
         "overall_slowdown": total,
         "vector_alu_slowdown": vector_slowdown,
+        "baseline_elapsed_ms": base_elapsed,
+        "contended_elapsed_ms": cont_elapsed,
         "transfer_latency_ms": transfer_ms,
         "sync_latency_ms": sync_ms,
         "transfer_ms": transfer_ms,
@@ -808,10 +892,26 @@ def compute_a5_contention_slowdown(expansion_mode, *, concurrent_cube_util=0.0,
     }
 
 
-def _chain_stage_durations_ms(chain: Mapping) -> tuple[float, float, float]:
-    """Return ``(quant_ms, gmm_ms, comm_ms)`` from canonical stage or raw leg maps."""
+def _interval_overlap_ms(a: tuple[float, float], b: tuple[float, float]) -> float:
+    return max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
+
+
+def _chain_leg_breakdown(chain: Mapping) -> tuple[float, float, float, float, float]:
+    """Return ``(dispatch_ms, gate_up_ms, quant_ms, down_ms, combine_ms)``."""
     stage_legs = chain.get("stage_legs_ms") or {}
     legs = chain.get("legs_ms") or {}
+    dispatch_ms = float(
+        stage_legs.get("all_to_allv_dispatch", 0.0)
+        or legs.get("all_to_allv_dispatch", 0.0)
+        or legs.get("dispatch", 0.0)
+        or 0.0
+    )
+    combine_ms = float(
+        stage_legs.get("all_to_allv_combine", 0.0)
+        or legs.get("all_to_allv_combine", 0.0)
+        or legs.get("combine", 0.0)
+        or 0.0
+    )
     quant_ms = float(
         stage_legs.get("quant", 0.0)
         or legs.get("quant", 0.0)
@@ -819,22 +919,92 @@ def _chain_stage_durations_ms(chain: Mapping) -> tuple[float, float, float]:
         or legs.get("swiglu", 0.0)
         or 0.0
     )
-    gmm_ms = float(
-        stage_legs.get("grouped_matmul", 0.0)
-        or legs.get("grouped_matmul", 0.0)
-        or (float(legs.get("gate_up", 0.0) or 0.0) + float(legs.get("down", 0.0) or 0.0))
-        or 0.0
+    gate_up_ms = float(legs.get("gate_up", 0.0) or 0.0)
+    down_ms = float(legs.get("down", 0.0) or 0.0)
+    if gate_up_ms == 0.0 and down_ms == 0.0:
+        gmm_total = float(
+            stage_legs.get("grouped_matmul", 0.0)
+            or legs.get("grouped_matmul", 0.0)
+            or 0.0
+        )
+        gate_up_ms = gmm_total / 2.0
+        down_ms = gmm_total / 2.0
+    return dispatch_ms, gate_up_ms, quant_ms, down_ms, combine_ms
+
+
+def _chain_stage_durations_ms(chain: Mapping) -> tuple[float, float, float]:
+    """Return ``(quant_ms, gmm_ms, comm_ms)`` from canonical stage or raw leg maps."""
+    dispatch_ms, gate_up_ms, quant_ms, down_ms, combine_ms = _chain_leg_breakdown(chain)
+    return quant_ms, gate_up_ms + down_ms, dispatch_ms + combine_ms
+
+
+def _chain_overlap_split(dispatch_ms: float, gate_up_ms: float, quant_ms: float,
+                         down_ms: float, combine_ms: float,
+                         observed_overlap_ms: float) -> tuple[float, float]:
+    comm_total = dispatch_ms + combine_ms
+    compute_total = gate_up_ms + quant_ms + down_ms
+    ov = min(max(0.0, observed_overlap_ms), comm_total, compute_total)
+    ov_c = min(
+        ov * (combine_ms / comm_total) if comm_total > 0.0 else 0.0,
+        down_ms,
+        combine_ms,
     )
-    comm_ms = float(
-        (float(stage_legs.get("all_to_allv_dispatch", 0.0) or 0.0)
-         + float(stage_legs.get("all_to_allv_combine", 0.0) or 0.0))
-        or (float(legs.get("all_to_allv_dispatch", 0.0) or 0.0)
-            + float(legs.get("all_to_allv_combine", 0.0) or 0.0))
-        or (float(legs.get("dispatch", 0.0) or 0.0)
-            + float(legs.get("combine", 0.0) or 0.0))
-        or 0.0
+    ov_d = min(max(0.0, ov - ov_c), dispatch_ms)
+    rem = max(0.0, ov - ov_d - ov_c)
+    if rem > 0.0:
+        ov_c = min(ov_c + rem, down_ms, combine_ms)
+    return ov_d, ov_c
+
+
+def _run_chain_dag_schedule(dispatch_ms: float, gate_up_ms: float, quant_ms: float,
+                            down_ms: float, combine_ms: float,
+                            *, overlap_dispatch_ms: float,
+                            overlap_combine_ms: float) -> tuple[float, float, float]:
+    """Run causal MC2 DAG on Engine; return ``(makespan, quant_comm_ov, gmm_comm_ov)``."""
+    from mindie_sim.prediction.runtime.engine import Engine, Resource
+
+    engine = Engine((
+        Resource("comm", 1.0),
+        Resource("cube", 1.0),
+        Resource("vector", 1.0),
+    ))
+    ov_d = min(max(0.0, overlap_dispatch_ms), dispatch_ms)
+    d_pre = max(0.0, dispatch_ms - ov_d)
+    ev_d_pre = engine.submit("dispatch_pre", {"comm": d_pre} if d_pre > 0.0 else {})
+    ev_d_tail = engine.submit(
+        "dispatch_tail", {"comm": ov_d} if ov_d > 0.0 else {}, after=(ev_d_pre,))
+    ev_gu = engine.submit(
+        "gate_up", {"cube": gate_up_ms} if gate_up_ms > 0.0 else {}, after=(ev_d_pre,))
+    ev_q = engine.submit(
+        "quant", {"vector": quant_ms} if quant_ms > 0.0 else {}, after=(ev_gu,))
+    ov_c = min(max(0.0, overlap_combine_ms), down_ms, combine_ms)
+    dn_pre = max(0.0, down_ms - ov_c)
+    ev_dn_pre = engine.submit(
+        "down_pre", {"cube": dn_pre} if dn_pre > 0.0 else {}, after=(ev_q,))
+    ev_dn_tail = engine.submit(
+        "down_tail", {"cube": ov_c} if ov_c > 0.0 else {}, after=(ev_dn_pre,))
+    ev_comb = engine.submit(
+        "combine", {"comm": combine_ms} if combine_ms > 0.0 else {},
+        after=(ev_d_tail, ev_dn_pre))
+    engine.advance()
+    dispatch_span = (0.0, float(ev_d_tail.time))
+    gate_up_span = (float(ev_d_pre.time), float(ev_gu.time))
+    quant_span = (float(ev_gu.time), float(ev_q.time))
+    down_span = (float(ev_q.time), float(ev_dn_tail.time))
+    combine_start = max(float(ev_d_tail.time), float(ev_dn_pre.time))
+    combine_span = (combine_start, float(ev_comb.time))
+    quant_comm_ov = (
+        _interval_overlap_ms(quant_span, dispatch_span)
+        + _interval_overlap_ms(quant_span, combine_span)
     )
-    return quant_ms, gmm_ms, comm_ms
+    gmm_comm_ov = (
+        _interval_overlap_ms(gate_up_span, dispatch_span)
+        + _interval_overlap_ms(gate_up_span, combine_span)
+        + _interval_overlap_ms(down_span, dispatch_span)
+        + _interval_overlap_ms(down_span, combine_span)
+    )
+    makespan = max(float(ev_comb.time), float(ev_dn_tail.time))
+    return makespan, quant_comm_ov, gmm_comm_ov
 
 
 _MIN_CHAIN_SPAN_MS = 1e-12
@@ -888,25 +1058,28 @@ def evaluate_a5_mc2_chains(ingested=None):
                 profiler_evidence=chain.get("profiler_evidence"))["regime"]
         else:
             mode = _mode(chain.get("regime"))
-        quant_ms, gmm_ms, comm_ms = _chain_stage_durations_ms(chain)
-        # Price contention strictly from verified paired overlap or explicit shared
-        # resource demand — never infer overlap/contention from unpaired medians.
+        dispatch_ms, gate_up_ms, quant_ms, down_ms, combine_ms = _chain_leg_breakdown(chain)
+        ov_d, ov_c = _chain_overlap_split(
+            dispatch_ms, gate_up_ms, quant_ms, down_ms, combine_ms, observed_overlap_ms)
+        base_dag, quant_comm_ov, gmm_comm_ov = _run_chain_dag_schedule(
+            dispatch_ms, gate_up_ms, quant_ms, down_ms, combine_ms,
+            overlap_dispatch_ms=ov_d, overlap_combine_ms=ov_c,
+        )
+        # Price contention strictly from causal DAG overlap intervals or explicit
+        # shared resource demand — never charge impossible non-overlapping stages.
         explicit_vec = chain.get("concurrent_vector_util", chain.get("shared_vector_util"))
         explicit_mte = chain.get("concurrent_mte_util", chain.get("shared_mte_util"))
         explicit_hbm = chain.get("concurrent_hbm_util", chain.get("shared_hbm_util"))
+        span_floor = max(chain_ms, _MIN_CHAIN_SPAN_MS)
         if explicit_vec is not None:
             vec_util = float(explicit_vec)
-        elif mode == "aiv" and quant_ms > 0.0 and comm_ms > 0.0 and observed_overlap_ms > 0.0:
-            vec_util = min(1.0, min(quant_ms, comm_ms, observed_overlap_ms) / max(chain_ms, _MIN_CHAIN_SPAN_MS))
+        elif mode == "aiv" and quant_comm_ov > 0.0:
+            vec_util = min(1.0, quant_comm_ov / span_floor)
         else:
             vec_util = 0.0
         mte_util = float(explicit_mte) if explicit_mte is not None else 0.0
         hbm_util = float(explicit_hbm) if explicit_hbm is not None else mte_util
-        cube_util = (
-            min(1.0, min(gmm_ms, comm_ms, observed_overlap_ms) / max(chain_ms, _MIN_CHAIN_SPAN_MS))
-            if gmm_ms > 0.0 and comm_ms > 0.0 and observed_overlap_ms > 0.0
-            else 0.0
-        )
+        cube_util = min(1.0, gmm_comm_ov / span_floor) if gmm_comm_ov > 0.0 else 0.0
         contention = compute_a5_contention_slowdown(
             mode,
             concurrent_cube_util=cube_util,
@@ -914,6 +1087,21 @@ def evaluate_a5_mc2_chains(ingested=None):
             concurrent_mte_util=mte_util,
             concurrent_hbm_util=hbm_util,
         )
+        comm_sd = contention["contention_slowdown"]
+        vec_sd = contention["vector_slowdown"]
+        if mode != "aiv" or vec_sd <= 1.0:
+            cont_quant_ms = quant_ms
+        elif explicit_vec is not None:
+            cont_quant_ms = quant_ms * vec_sd
+        else:
+            cont_quant_ms = (quant_ms - quant_comm_ov) + quant_comm_ov * vec_sd
+        cont_dag, _, _ = _run_chain_dag_schedule(
+            dispatch_ms * comm_sd, gate_up_ms, cont_quant_ms,
+            down_ms, combine_ms * comm_sd,
+            overlap_dispatch_ms=ov_d, overlap_combine_ms=ov_c,
+        )
+        contended_ms = chain_ms + max(0.0, cont_dag - base_dag)
+        chain_multiplier = (contended_ms / chain_ms) if chain_ms > 0.0 else 1.0
         has_shared_demand = (vec_util > 0.0 and mode == "aiv") or mte_util > 0.0 or hbm_util > 0.0
         rows.append({
             **chain,
@@ -929,11 +1117,12 @@ def evaluate_a5_mc2_chains(ingested=None):
             "contention_basis": (
                 "shared_resource_demand" if has_shared_demand else "observed_overlap_only"
             ),
-            "contention_degradation_multiplier": contention["contention_slowdown"],
+            "contention_degradation_multiplier": chain_multiplier,
+            "transfer_slowdown": contention["contention_slowdown"],
             "vector_slowdown": contention["vector_slowdown"],
             "mte_slowdown": contention["mte_slowdown"],
             "hbm_slowdown": contention["hbm_slowdown"],
-            "contended_chain_ms": chain_ms * contention["contention_slowdown"],
+            "contended_chain_ms": contended_ms,
         })
     by_dtype = {}
     for dtype in sorted({row["dtype"] for row in rows}):
