@@ -9,14 +9,44 @@
 [Side-Effect Policy] Pure plans; no device/source access or observation lookup.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from .hccl_contracts import (
     HCCL_64BIT_ELEMENT_BYTES, LOCAL_REDUCE_HBM_TRANSFERS,
     HcclPhase, HcclPlan, HcclSelection, SOURCE,
 )
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.program import KernelProgram, Stage
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/all_reduce/algorithm/template/aicpu/ins_temp_all_reduce_mesh_1D_one_shot.cc",
+        source_sha256="c0edd830bd93b8b83dc4213351be403614397d91a90ba73cc98da3f80a330fd9",
+    ),
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/all_reduce/algorithm/template/aicpu/ins_temp_all_reduce_mesh_1D_two_shot.cc",
+        source_sha256="00a81cd91df30b50132b5eb22328d7c468a16a185432d8649c76ad8e14434784",
+    ),
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/all_gather/algorithm/template/aicpu/ins_temp_all_gather_mesh_1D.cc",
+        source_sha256="2ebe700e13b8952cfa98b46f557550262c1ca6a253ce57777c355ba56ea0eb6b",
+    ),
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/reduce_scatter/algorithm/template/aicpu/ins_temp_reduce_scatter_mesh_1D.cc",
+        source_sha256="1bb66446b852ee0b121d01521302e4d0719af821e49866fc14d98d581fbdb69e",
+    ),
+)
 
 RECIPE = "hccl_aicpu_source_phase"
 _OPTIONAL = {"hccl_copy", "hccl_reduce", "hccl_control"}

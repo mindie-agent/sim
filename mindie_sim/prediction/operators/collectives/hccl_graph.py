@@ -10,16 +10,41 @@
 """
 from dataclasses import replace
 import math
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from .hccl_contracts import select
 from mindie_sim.prediction.operators.collectives import hccl_aicpu, hccl_aiv, hccl_aiv_gather, hccl_ccu, hccl_ccu_two_die, hccl_analytic_hierarchy
 from mindie_sim.prediction.collectives import PairwiseCollective
 from mindie_sim.prediction.mechanism import PlannedRecipe, Work
-from mindie_sim.prediction.topology import TransportOptions
+from mindie_sim.prediction.topology import DEFAULT_MAX_PHYSICAL_CHUNKS, TransportOptions
 from .hccl_signals import RemoteNotify, RECIPE as SIGNAL
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/op_common/selector/selector_engine.cc",
+        source_sha256="ce4cf99321229acfe759eebfd12c591d2ab87203e5c78ff6c7bfe8f73f2de2a9",
+    ),
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/op_common/op_common.cc",
+        source_sha256="09adbab9512711e0e7882b098b60b6f3c6a1c3be30da835868427248bc8e354a",
+    ),
+)
+
 NETWORK = 'hccl_source_peer_exchange'
+
+
+def _exact_dtype_bytes(dtype_name: str) -> int:
+    width = float(dtype_bytes(dtype_name))
+    if not width.is_integer() or width <= 0:
+        raise ModelingError(f'hccl_caller_requires_integer_dtype_bytes:{dtype_name}')
+    return int(width)
 
 
 class SourceMeshPeers(PairwiseCollective):
@@ -119,7 +144,16 @@ def lower(ops, runtime, source_dtype):
         if not math.isclose(n,round(n),rel_tol=0,abs_tol=1e-6):
             raise ModelingError('hccl_caller_requires_integer_input_payload')
         options = {k:v for k,v in raw.items() if k != 'axes'}
-        options.setdefault('dtype_bytes',int(dtype_bytes(source_dtype)))
+        op_dtype_width = _exact_dtype_bytes(original.dtype) if original.dtype else None
+        if 'dtype_bytes' in options:
+            if op_dtype_width is not None and options['dtype_bytes'] != op_dtype_width:
+                raise ModelingError(
+                    f'hccl_dtype_bytes_mismatch:{original.dtype}({op_dtype_width})!={options["dtype_bytes"]}'
+                )
+        else:
+            options['dtype_bytes'] = (
+                op_dtype_width if op_dtype_width is not None else _exact_dtype_bytes(source_dtype)
+            )
         selector = hccl_analytic_hierarchy.select if is_analytic else select
         selection = selector(options,collective=original.family,ranks=r,payload_bytes=round(n))
         modules = {'AIV': hccl_aiv, 'AICPU_TS': hccl_aicpu,
@@ -193,6 +227,12 @@ def lower(ops, runtime, source_dtype):
                     'collective':'alltoallv','collective_id':netids[phase.name],
                     'steps':r-1,'peer_volume_basis':'group_mean',
                     'peer_traffic':{'kind':'matrix','payload_bytes':phase.exchange}}
+                if (module is hccl_aiv_gather
+                        and (phase.name == 'gather' or phase.name.startswith('gather_copy_'))
+                        and network_meta.get('transport_chunk_bytes') is None):
+                    max_cell = max(max(row) for row in phase.exchange)
+                    if hccl_aiv.UB_BATCH < max_cell <= DEFAULT_MAX_PHYSICAL_CHUNKS * hccl_aiv.UB_BATCH:
+                        network_meta['transport_chunk_bytes'] = hccl_aiv.UB_BATCH
                 network_meta.pop('reverse_of_collective',None)
                 wire = Work(resources={'link':sum(map(sum, phase.exchange))/r})
                 result.append(wire.apply(replace(original,op_id=netids[phase.name],deps=deps,

@@ -11,9 +11,36 @@
 """
 from __future__ import annotations
 
-from .hccl_contracts import HcclPlan, ModelingError, exact_positive_int
+from typing import Literal
+
+from mindie_sim.schema.datapath import SourceRef
+from .hccl_contracts import (
+    HCCL_64BIT_ELEMENT_BYTES, HcclPlan, ModelingError, exact_positive_int,
+)
 from .hccl_source_shapes import (
     copy_phase, detour_split, exchange_phase, reduce_phase, sync_phase,
+)
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/all_gather/algorithm/template/aicpu/ins_temp_all_gather_mesh_1D_Z_axis_detour.cc",
+        source_sha256="50ff65df825f6e168f6ac1de5b6e46a4b216a4ad2c0b8020752ff3a3c357647b",
+    ),
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/reduce_scatter/algorithm/template/aicpu/ins_temp_reduce_scatter_mesh_1D_Z_axis_detour.cc",
+        source_sha256="3eb4e7218bbf3509dc19f257cbb65b4dd505b11328f9ea4c108da766ac24e849",
+    ),
+    SourceRef(
+        repository="hicann/hccl",
+        revision="c2d6790464654ccf58aca39448de4b65fdc7b184",
+        relative_path="src/ops/op_common/algorithm/template/template_utils.cc",
+        source_sha256="2841aca0eaae6848cc6809fba7a7386fba0d3b44574d7d8230bda69a2d078701",
+    ),
 )
 
 TEMPLATES = {
@@ -31,6 +58,8 @@ def contract(selection, rank=0):
         raise ModelingError("hccl_z_detour_requires_single_level_aicpu_ag_or_rs")
     if s.buffer_mode != "separate":
         raise ModelingError("hccl_z_detour_requires_separate_buffers")
+    if s.dtype_bytes == HCCL_64BIT_ELEMENT_BYTES and s.collective != "allgather":
+        raise ModelingError("hccl_aicpu_64bit_reduce_cpu_path_not_implemented")
     r, n, dtype = s.ranks, s.payload_bytes, s.dtype_bytes
     if r < 2 or n < dtype or n % dtype:
         raise ModelingError("hccl_z_detour_requires_positive_element_geometry")
