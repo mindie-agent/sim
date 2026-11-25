@@ -142,15 +142,19 @@ OperandLayout: TypeAlias = Literal[
     "ND",
     "FRACTAL_NZ",
     "FRACTAL_NZ_C0_32",
+    "FRACTAL_NZ_C0_16",
     "FRACTAL_NZ_C0_4",
     "FRACTAL_NZ_C0_2",
+    "PA_BBND",
 ]
 OPERAND_LAYOUTS: frozenset[str] = frozenset({
     "ND",
     "FRACTAL_NZ",
     "FRACTAL_NZ_C0_32",
+    "FRACTAL_NZ_C0_16",
     "FRACTAL_NZ_C0_4",
     "FRACTAL_NZ_C0_2",
+    "PA_BBND",
 })
 
 MlaVariantKind: TypeAlias = Literal["none", "latent_mla", "latent_mqa"]
@@ -281,8 +285,25 @@ class AbiShapeConstraints:
     inter_divisibility: int = 0
     topk_range: tuple[int, int] = (0, 0)
     max_shared_experts_per_rank: int = -1
+    head_dim_allowed_set: frozenset[int] = frozenset()
+    rope_dim_allowed_set: frozenset[int] = frozenset()
+    kv_heads_allowed_set: frozenset[int] = frozenset()
+    max_experts: int = 0
+    required_layout_b: str = ""
+    allow_ungated_activation: bool = True
+    last_axis_divisibility: int = 0
+    rank_range: tuple[int, int] = (0, 0)
 
     def __post_init__(self) -> None:
+        for flag_name in (
+            "require_even_n",
+            "require_even_k_for_fp4",
+            "require_even_n_for_fp4_transb",
+            "require_m_divisible_by_ws",
+            "allow_ungated_activation",
+        ):
+            if not isinstance(getattr(self, flag_name), bool):
+                raise ModelingError(f"abi_shape_{flag_name}_invalid")
         k_min = _int_val(self.k_min, "abi_shape_k_min_invalid", minimum=0)
         k_max = _int_val(self.k_max_exclusive, "abi_shape_k_max_invalid", minimum=0)
         if k_max > 0 and k_max <= k_min:
@@ -296,8 +317,25 @@ class AbiShapeConstraints:
             _int_val(v, "abi_shape_hidden_allowed_invalid", minimum=1)
             for v in self.hidden_allowed_set
         )
+        head_dim_allowed = frozenset(
+            _int_val(v, "abi_shape_head_dim_allowed_invalid", minimum=1)
+            for v in self.head_dim_allowed_set
+        )
+        rope_dim_allowed = frozenset(
+            _int_val(v, "abi_shape_rope_dim_allowed_invalid", minimum=1)
+            for v in self.rope_dim_allowed_set
+        )
+        kv_heads_allowed = frozenset(
+            _int_val(v, "abi_shape_kv_heads_allowed_invalid", minimum=1)
+            for v in self.kv_heads_allowed_set
+        )
         hidden_range = _validate_bounds_pair(self.hidden_range, "abi_shape_hidden_range_invalid")
         topk_range = _validate_bounds_pair(self.topk_range, "abi_shape_topk_range_invalid")
+        rank_range = _validate_bounds_pair(self.rank_range, "abi_shape_rank_range_invalid")
+        if not isinstance(self.required_layout_b, str) or (
+            self.required_layout_b and self.required_layout_b not in OPERAND_LAYOUTS
+        ):
+            raise ModelingError(f"abi_shape_required_layout_b_invalid:{self.required_layout_b!r}")
         object.__setattr__(self, "k_min", k_min)
         object.__setattr__(self, "k_max_exclusive", k_max)
         object.__setattr__(self, "n_max_inclusive", n_max)
@@ -315,16 +353,28 @@ class AbiShapeConstraints:
             self, "max_shared_experts_per_rank",
             _int_val(self.max_shared_experts_per_rank, "abi_shape_max_shared_invalid", minimum=-1),
         )
+        object.__setattr__(
+            self, "max_experts",
+            _int_val(self.max_experts, "abi_shape_max_experts_invalid", minimum=0),
+        )
+        object.__setattr__(
+            self, "last_axis_divisibility",
+            _int_val(self.last_axis_divisibility, "abi_shape_last_axis_div_invalid", minimum=0),
+        )
         object.__setattr__(self, "hidden_allowed_set", hidden_allowed)
+        object.__setattr__(self, "head_dim_allowed_set", head_dim_allowed)
+        object.__setattr__(self, "rope_dim_allowed_set", rope_dim_allowed)
+        object.__setattr__(self, "kv_heads_allowed_set", kv_heads_allowed)
         object.__setattr__(self, "hidden_range", hidden_range)
         object.__setattr__(self, "topk_range", topk_range)
+        object.__setattr__(self, "rank_range", rank_range)
         object.__setattr__(
             self, "max_comm_bytes_formula",
             _req_str(self.max_comm_bytes_formula, "abi_shape_comm_formula_required"),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "k_min": self.k_min,
             "k_max_exclusive": self.k_max_exclusive,
             "n_max_inclusive": self.n_max_inclusive,
@@ -342,6 +392,23 @@ class AbiShapeConstraints:
             "topk_range": list(self.topk_range),
             "max_shared_experts_per_rank": self.max_shared_experts_per_rank,
         }
+        if self.head_dim_allowed_set:
+            out["head_dim_allowed_set"] = sorted(self.head_dim_allowed_set)
+        if self.rope_dim_allowed_set:
+            out["rope_dim_allowed_set"] = sorted(self.rope_dim_allowed_set)
+        if self.kv_heads_allowed_set:
+            out["kv_heads_allowed_set"] = sorted(self.kv_heads_allowed_set)
+        if self.max_experts:
+            out["max_experts"] = self.max_experts
+        if self.required_layout_b:
+            out["required_layout_b"] = self.required_layout_b
+        if not self.allow_ungated_activation:
+            out["allow_ungated_activation"] = self.allow_ungated_activation
+        if self.last_axis_divisibility:
+            out["last_axis_divisibility"] = self.last_axis_divisibility
+        if self.rank_range != (0, 0):
+            out["rank_range"] = list(self.rank_range)
+        return out
 
 
 @dataclass(frozen=True, slots=True)
@@ -504,6 +571,7 @@ class ProbedAbiEntry:
     allowed_model_scopes: frozenset[ModelScope] = frozenset({"target", "draft"})
     allow_bias: bool = True
     require_no_bias: bool = False
+    require_bias: bool = False
     probe_signature_sha256: str = ""
     probe_domain_note: str = ""
 
@@ -531,7 +599,11 @@ class ProbedAbiEntry:
             raise ModelingError("abi_entry_source_ref_invalid")
         if self.vllm_ascend_track not in MANIFEST_ENTRY_TRACKS:
             raise ModelingError(f"abi_entry_track_invalid:{self.vllm_ascend_track!r}")
+        if not (isinstance(self.allow_bias, bool) and isinstance(self.require_no_bias, bool) and isinstance(self.require_bias, bool)):
+            raise ModelingError(f"abi_entry_bias_flag_invalid:{self.entry_id}")
         if self.allow_bias and self.require_no_bias:
+            raise ModelingError(f"abi_entry_bias_contradiction:{self.entry_id}")
+        if self.require_bias and (self.require_no_bias or not self.allow_bias):
             raise ModelingError(f"abi_entry_bias_contradiction:{self.entry_id}")
         dtypes = _str_tuples(self.dtype_tuple, f"abi_entry_dtype_tuple_invalid:{self.entry_id}")
         if not dtypes:
@@ -590,7 +662,7 @@ class ProbedAbiEntry:
         return self.backend_kind in NON_CANN_ABI_BACKENDS
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        out: dict[str, Any] = {
             "entry_id": self.entry_id,
             "abi_id": self.abi_id,
             "available_on_device": self.available_on_device,
@@ -620,6 +692,9 @@ class ProbedAbiEntry:
             "probe_signature_sha256": self.probe_signature_sha256,
             "probe_domain_note": self.probe_domain_note,
         }
+        if self.require_bias:
+            out["require_bias"] = self.require_bias
+        return out
 
 
 @dataclass(frozen=True, slots=True)

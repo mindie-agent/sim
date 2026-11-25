@@ -73,12 +73,21 @@ INTER_DIV_MEGAMOE_A5 = 128
 TOPK_MAX_MEGAMOE_A23 = 16
 TOPK_MAX_MEGAMOE_A5 = 32
 MAX_SHARED_MEGAMOE_A5 = 4
+MAX_EXPERTS_MEGAMOE_A23 = 1024
+MAX_EXPERTS_GROUPED_MATMUL = 1024
+MAX_EXPERTS_MOE_GATING = 2048
+MQSMLA_HEAD_DIMS = frozenset({512})
+MQSMLA_ROPE_DIMS = frozenset({64})
+MQSMLA_KV_HEADS = frozenset({1})
+QUANT_46_LAST_AXIS_DIV = 32
+QUANT_46_RANK_RANGE = (1, 7)
 MLA_PROLOG_HIDDEN_SET = frozenset({1024, 2048, 3072, 4096, 5120, 6144, 7168, 7680, 8192})
 WS_LOCAL = frozenset({1})
 WS_A23_MC2 = frozenset({2, 4, 8})
 WS_A5_MC2 = frozenset({2, 4, 8, 16, 32, 64})
 WS_HCCL_ALL = frozenset({2, 4, 8, 16, 32, 64, 128, 256})
 WS_EP_A23 = frozenset({2, 4, 8, 16, 32, 64})
+WS_EP_MEGAMOE_A23 = frozenset({2, 4, 8, 16, 32, 48, 64, 96, 128})
 WS_EP_A5 = frozenset({2, 4, 8, 16, 32, 64, 128, 256})
 
 PLACEMENTS_LOCAL = frozenset({"local"})
@@ -104,6 +113,8 @@ REPO_URLS = {
     "ops-math": "cann/ops-math",
     "ops-tensor": "cann/ops-tensor",
     "catlass": "Ascend/catlass",
+    "mindie-sd": "Ascend/MindIE-SD",
+    "cann-recipes-infer": "cann/cann-recipes-infer",
 }
 
 
@@ -265,6 +276,7 @@ def _mk(
     scopes: frozenset[str] = frozenset({"target", "draft"}),
     allow_bias: bool = True,
     require_no_bias: bool = False,
+    require_bias: bool = False,
     note: str = "",
     observed_kernels: set[str] | None = None,
 ) -> ProbedAbiEntry:
@@ -284,6 +296,7 @@ def _mk(
         "source_sha256": src.source_sha256,
         "dtype_tuple": [list(t) for t in dtype_tuple],
         "kernels": list(kernels),
+        "require_bias": require_bias,
     }) if available else ""
     return ProbedAbiEntry(
         entry_id=entry_id,
@@ -312,6 +325,7 @@ def _mk(
         allowed_model_scopes=scopes,  # type: ignore[arg-type]
         allow_bias=allow_bias,
         require_no_bias=require_no_bias,
+        require_bias=require_bias,
         probe_signature_sha256=sig,
         probe_domain_note=full_note,
     )
@@ -450,18 +464,56 @@ def _mc2_entries(
             dtype_tuple=(
                 ("x:bf16:ND:dense::none", "expert_ids:int32:ND:none::none"),
                 ("x:fp16:ND:dense::none", "expert_ids:int32:ND:none::none"),
-                ("x:int8:ND:per_token_int8::fp32", "expert_ids:int32:ND:none::none"),
+                ("x:bf16:ND:dense::none", "expert_ids:int32:ND:none::none"),
+                ("x:fp16:ND:dense::none", "expert_ids:int32:ND:none::none"),
                 *(
-                    (("x:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0", "expert_ids:int32:ND:none::none"),)
+                    (
+                        ("x:bf16:ND:dense::none", "expert_ids:int32:ND:none::none"),
+                        ("x:fp16:ND:dense::none", "expert_ids:int32:ND:none::none"),
+                        ("x:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0", "expert_ids:int32:ND:none::none", "scales:fp8_e8m0:ND:none::none"),
+                    )
                     if is_a5 else ()
                 ),
             ),
             outputs=(
-                ("expand_x:bf16:ND",),
-                ("expand_x:fp16:ND",),
-                ("expand_x:int8:ND",),
+                (
+                    "expand_x:bf16:ND", "dynamic_scales:fp32:ND", "assist_info_for_combine:int32:ND",
+                    "expert_token_nums:int64:ND", "ep_recv_counts:int32:ND", "tp_recv_counts:int32:ND",
+                    "expand_scales:fp32:ND",
+                ),
+                (
+                    "expand_x:fp16:ND", "dynamic_scales:fp32:ND", "assist_info_for_combine:int32:ND",
+                    "expert_token_nums:int64:ND", "ep_recv_counts:int32:ND", "tp_recv_counts:int32:ND",
+                    "expand_scales:fp32:ND",
+                ),
+                (
+                    "expand_x:int8:ND", "dynamic_scales:fp32:ND", "assist_info_for_combine:int32:ND",
+                    "expert_token_nums:int64:ND", "ep_recv_counts:int32:ND", "tp_recv_counts:int32:ND",
+                    "expand_scales:fp32:ND",
+                ),
+                (
+                    "expand_x:int8:ND", "dynamic_scales:fp32:ND", "assist_info_for_combine:int32:ND",
+                    "expert_token_nums:int64:ND", "ep_recv_counts:int32:ND", "tp_recv_counts:int32:ND",
+                    "expand_scales:fp32:ND",
+                ),
                 *(
-                    (("expand_x:fp8_e4m3fn:ND",),)
+                    (
+                        (
+                            "expand_x:fp8_e4m3fn:ND", "dynamic_scales:fp8_e8m0:ND", "assist_info_for_combine:int32:ND",
+                            "expert_token_nums:int64:ND", "ep_recv_counts:int32:ND", "tp_recv_counts:int32:ND",
+                            "expand_scales:fp32:ND",
+                        ),
+                        (
+                            "expand_x:fp8_e4m3fn:ND", "dynamic_scales:fp8_e8m0:ND", "assist_info_for_combine:int32:ND",
+                            "expert_token_nums:int64:ND", "ep_recv_counts:int32:ND", "tp_recv_counts:int32:ND",
+                            "expand_scales:fp32:ND",
+                        ),
+                        (
+                            "expand_x:fp8_e4m3fn:ND", "dynamic_scales:fp8_e8m0:ND", "assist_info_for_combine:int32:ND",
+                            "expert_token_nums:int64:ND", "ep_recv_counts:int32:ND", "tp_recv_counts:int32:ND",
+                            "expand_scales:fp32:ND",
+                        ),
+                    )
                     if is_a5 else ()
                 ),
             ),
@@ -527,46 +579,46 @@ def _mc2_entries(
             dtype_tuple=(
                 (
                     (
-                        "context:int8:ND:none::none", "x:bf16:ND:dense::none",
+                        "context:int32:ND:none::none", "x:bf16:ND:dense::none",
                         "topk_ids:int32:ND:none::none", "topk_weights:fp32:ND:dense::none",
                         "weight1:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
                         "weight2:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
                     ),
                     (
-                        "context:int8:ND:none::none", "x:bf16:ND:dense::none",
+                        "context:int32:ND:none::none", "x:bf16:ND:dense::none",
                         "topk_ids:int32:ND:none::none", "topk_weights:fp32:ND:dense::none",
                         "weight1:fp4_e2m1:FRACTAL_NZ:mx_fp4:32:fp8_e8m0",
                         "weight2:fp4_e2m1:FRACTAL_NZ:mx_fp4:32:fp8_e8m0",
                     ),
                     (
-                        "context:int8:ND:none::none", "x:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0",
+                        "context:int32:ND:none::none", "x:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0",
                         "topk_ids:int32:ND:none::none", "topk_weights:fp32:ND:dense::none",
                         "weight1:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
                         "weight2:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
                     ),
                 ) if is_a5 else (
                     (
-                        "context:int8:ND:none::none", "x:bf16:ND:dense::none",
+                        "context:int32:ND:none::none", "x:bf16:ND:dense::none",
                         "topk_ids:int32:ND:none::none", "topk_weights:fp32:ND:dense::none",
-                        "weight1:bf16:FRACTAL_NZ:dense::none", "weight2:bf16:FRACTAL_NZ:dense::none",
+                        "weight1:bf16:ND:dense::none", "weight2:bf16:ND:dense::none",
                     ),
                     (
-                        "context:int8:ND:none::none", "x:bf16:ND:dense::none",
+                        "context:int32:ND:none::none", "x:bf16:ND:dense::none",
                         "topk_ids:int32:ND:none::none", "topk_weights:fp32:ND:dense::none",
                         "weight1:int8:FRACTAL_NZ:per_channel_int8::fp32",
                         "weight2:int8:FRACTAL_NZ:per_channel_int8::fp32",
                     ),
                     (
-                        "context:int8:ND:none::none", "x:bf16:ND:dense::none",
+                        "context:int32:ND:none::none", "x:bf16:ND:dense::none",
                         "topk_ids:int32:ND:none::none", "topk_weights:fp32:ND:dense::none",
                         "weight1:int4:FRACTAL_NZ:w4a8_int::fp32", "weight2:int4:FRACTAL_NZ:w4a8_int::fp32",
                     ),
                 )
             ),
             outputs=(
-                ("y:bf16:ND", "expert_token_nums:int64:ND"),
-                ("y:bf16:ND", "expert_token_nums:int64:ND"),
-                ("y:bf16:ND", "expert_token_nums:int64:ND"),
+                ("y:bf16:ND", "expert_token_nums:int32:ND"),
+                ("y:bf16:ND", "expert_token_nums:int32:ND"),
+                ("y:bf16:ND", "expert_token_nums:int32:ND"),
             ),
             shape=AbiShapeConstraints(
                 hidden_range=(HIDDEN_MIN_MEGAMOE_A5 if is_a5 else HIDDEN_MIN_MEGAMOE_A23, HIDDEN_MAX_MEGAMOE),
@@ -575,12 +627,13 @@ def _mc2_entries(
                 inter_divisibility=INTER_DIV_MEGAMOE_A5 if is_a5 else INTER_DIV_MEGAMOE_A23,
                 topk_range=(1, TOPK_MAX_MEGAMOE_A5 if is_a5 else TOPK_MAX_MEGAMOE_A23),
                 max_shared_experts_per_rank=MAX_SHARED_MEGAMOE_A5 if is_a5 else 0,
+                max_experts=0 if is_a5 else MAX_EXPERTS_MEGAMOE_A23,
             ),
             placements=PLACEMENTS_A5_MEGAMOE if is_a5 else mc2_place,
-            world_sizes=ep_ws,
+            world_sizes=ep_ws if is_a5 else WS_EP_MEGAMOE_A23,
             activations=(
                 frozenset({"swiglu", "swiglustep", "swigluoai", "situglu", "gelu"})
-                if is_a5 else frozenset({"swiglu", "situglu", "gelu"})
+                if is_a5 else frozenset({"swiglu", "situglu", "swiglustep", "swigluoai"})
             ),
             repo_key="ops-transformer",
             rel_path=(
@@ -675,10 +728,37 @@ def _cann_moe_and_norm_entries(
             available=not is_a5, backend="cann_aclnn",
             symbol="aclnnGroupedMatmulSwigluQuant", arch=arch,
             role="moe_act_quant", graph_motif="gmm_swiglu_quant",
+            dtype_tuple=((
+                "x:int8:ND:per_token_int8::fp32", "weight:int8:FRACTAL_NZ:per_channel_int8::fp32",
+                "weight_scale:fp32:ND:dense::none", "x_scale:fp32:ND:dense::none",
+                "group_list:int64:ND:none::none",
+            ),),
+            outputs=(("y:int8:ND", "y_scale:fp32:ND"),),
+            shape=AbiShapeConstraints(
+                k_max_exclusive=K_MAX_GMM_A8W8_EXCL, n_max_inclusive=N_MAX_GMM_ARCH22,
+                require_even_n=True,
+            ),
+            activations=frozenset({"swiglu"}),
+            repo_key="ops-transformer",
+            rel_path="gmm/grouped_matmul_swiglu_quant/op_host/grouped_matmul_swiglu_quant_def.cpp",
+            va_ref="vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:282",
+            op_ref="op_plugin/ops/opapi/GroupedMatmulSwigluQuantNpuOpapi.cpp",
+            cann_ref="ops-transformer/gmm/grouped_matmul_swiglu_quant/op_host/grouped_matmul_swiglu_quant_def.cpp:24",
+            kernels=("GroupedMatmulSwigluQuant",) if not is_a5 else (),
+            note="A2/A3 shipping W8A8 GMM+SwiGLU+Quant V1 (K<65536, even N<=10240); A5 uses V2/WeightNzV2",
+            observed_kernels=observed,
+        ),
+        _mk(
+            repos, entry_id=f"{p_low}_cann_gmm_swiglu_quant_v1_a8w4",
+            abi_id="aclnnGroupedMatmulSwigluQuant",
+            available=not is_a5, backend="cann_aclnn",
+            symbol="aclnnGroupedMatmulSwigluQuant", arch=arch,
+            role="moe_act_quant", graph_motif="gmm_swiglu_quant",
             dtype_tuple=(
                 (
-                    "x:int8:ND:per_token_int8::fp32", "weight:int8:FRACTAL_NZ:per_channel_int8::fp32",
-                    "weight_scale:fp32:ND:dense::none", "x_scale:fp32:ND:dense::none",
+                    "x:int8:ND:per_token_int8::fp32", "weight:int4:FRACTAL_NZ:w4a8_int::fp32",
+                    "bias:fp32:ND:dense::none",
+                    "weight_scale:uint64:ND:none::none", "x_scale:fp32:ND:dense::none",
                     "group_list:int64:ND:none::none",
                 ),
                 (
@@ -692,17 +772,19 @@ def _cann_moe_and_norm_entries(
                 ("y:int8:ND", "y_scale:fp32:ND"),
             ),
             shape=AbiShapeConstraints(
-                k_max_exclusive=K_MAX_GMM_A8W8_EXCL, n_max_inclusive=N_MAX_GMM_ARCH22,
+                k_max_exclusive=K_MAX_GMM_A8W4_EXCL, n_max_inclusive=N_MAX_GMM_ARCH22,
                 require_even_n=True,
             ),
             activations=frozenset({"swiglu"}),
+            allow_bias=True,
+            require_bias=True,
             repo_key="ops-transformer",
             rel_path="gmm/grouped_matmul_swiglu_quant/op_host/grouped_matmul_swiglu_quant_def.cpp",
-            va_ref="vllm_ascend/quantization/methods/w8a8/w8a8_dynamic.py:282",
+            va_ref="vllm_ascend/quantization/methods/w4a8/w4a8.py:488",
             op_ref="op_plugin/ops/opapi/GroupedMatmulSwigluQuantNpuOpapi.cpp",
-            cann_ref="ops-transformer/gmm/grouped_matmul_swiglu_quant/op_host/grouped_matmul_swiglu_quant_def.cpp:24",
+            cann_ref="ops-transformer/gmm/grouped_matmul_swiglu_quant/op_api/aclnn_grouped_matmul_swiglu_quant.cpp:178",
             kernels=("GroupedMatmulSwigluQuant",) if not is_a5 else (),
-            note="A2/A3 shipping W8A8/W4A8 GMM+SwiGLU+Quant V1 (5 required inputs -> y, y_scale); A5 uses V2/WeightNzV2",
+            note="A2/A3 shipping W4A8 GMM+SwiGLU+Quant V1 (A8W4 requires K<20000, even N<=10240, non-null bias)",
             observed_kernels=observed,
         ),
         _mk(
@@ -798,6 +880,7 @@ def _cann_moe_and_norm_entries(
                 ("y:fp16:ND", "expert_idx:int32:ND", "out:fp32:ND"),
                 ("y:fp32:ND", "expert_idx:int32:ND", "out:fp32:ND"),
             ),
+            shape=AbiShapeConstraints(max_experts=MAX_EXPERTS_MOE_GATING),
             repo_key="ops-transformer",
             rel_path="moe/moe_gating_top_k/op_host/moe_gating_top_k_def.cpp",
             va_ref="vllm_ascend/ops/fused_moe/router/fused_topk_router.py:227",
@@ -921,7 +1004,10 @@ def _cann_moe_and_norm_entries(
                 ("x1:bf16:ND:dense::none", "x2:bf16:ND:dense::none", "gamma:bf16:ND:dense::none"),
                 ("x1:fp16:ND:dense::none", "x2:fp16:ND:dense::none", "gamma:fp16:ND:dense::none"),
             ),
-            outputs=(("y1:int8:ND", "y2:bf16:ND", "scale:fp32:ND"), ("y1:int8:ND", "y2:fp16:ND", "scale:fp32:ND")),
+            outputs=(
+                ("y1:int8:ND", "y2:int8:ND", "x:bf16:ND", "scale1:fp32:ND", "scale2:fp32:ND"),
+                ("y1:int8:ND", "y2:int8:ND", "x:fp16:ND", "scale1:fp32:ND", "scale2:fp32:ND"),
+            ),
             repo_key="ops-nn",
             rel_path="norm/add_rms_norm_dynamic_quant/op_host/op_api/aclnn_add_rms_norm_dynamic_quant_v2.cpp",
             va_ref="vllm_ascend/compilation/passes/norm_quant_fusion_pass.py:348",
@@ -1002,15 +1088,34 @@ def _cann_moe_and_norm_entries(
             repos, entry_id=f"{p_low}_cann_constant_pad_nd", abi_id="aclnnConstantPadNd",
             available=True, backend="cann_aclnn", symbol="aclnnConstantPadNd", arch=arch,
             role="sp_pad", graph_motif="sp_pad_constant",
-            dtype_tuple=(("x:bf16:ND:dense::none",), ("x:fp16:ND:dense::none",), ("x:bool:ND:none::none",)),
-            outputs=(("y:bf16:ND",), ("y:fp16:ND",), ("y:bool:ND",)),
+            dtype_tuple=(("x:bf16:ND:dense::none",), ("x:fp16:ND:dense::none",)),
+            outputs=(("y:bf16:ND",), ("y:fp16:ND",)),
             repo_key="ops-math",
             rel_path="conversion/pad_v3/op_api/aclnn_constant_pad_nd.cpp",
             va_ref="vllm_ascend/ops/linear_op.py:218",
             op_ref="op_plugin/ops/opapi/ConstantPadNdKernelNpuOpApi.cpp:91",
             cann_ref="ops-math/conversion/pad_v3/op_api/aclnn_constant_pad_nd.cpp:357",
             kernels=("MemSet", "PadV3"),
-            note="sp_pad > 0 expands to MemSet + PadV3 (plus 3xCast for bool mc2_mask); sp_pad == 0 is 0 PadV3",
+            note="BF16/FP16 sp_pad > 0 expands to MemSet + PadV3; sp_pad == 0 is 0 PadV3",
+            observed_kernels=observed,
+        ),
+        _mk(
+            repos, entry_id=f"{p_low}_cann_constant_pad_nd_bool", abi_id="aclnnConstantPadNd",
+            available=True, backend="cann_aclnn", symbol="aclnnConstantPadNd", arch=arch,
+            role="sp_pad", graph_motif="sp_pad_constant_bool",
+            dtype_tuple=(("x:bool:ND:none::none",),),
+            outputs=(("y:bool:ND",),),
+            repo_key="ops-math",
+            rel_path="conversion/pad_v3/op_api/aclnn_constant_pad_nd.cpp",
+            va_ref="vllm_ascend/ops/linear_op.py:218",
+            op_ref="op_plugin/ops/opapi/ConstantPadNdKernelNpuOpApi.cpp:91",
+            cann_ref="ops-math/conversion/pad_v3/op_api/aclnn_constant_pad_nd.cpp:339",
+            kernels=("MemSet", "PadV3") if is_a5 else ("Cast", "Cast", "MemSet", "PadV3", "Cast"),
+            note=(
+                "A5 IsRegBase() bool ConstantPadNd executes MemSet + PadV3 directly"
+                if is_a5 else
+                "A2/A3 non-RegBase bool ConstantPadNd wraps PadV3 with 3x Cast (self->int8, value->int8, out->bool)"
+            ),
             observed_kernels=observed,
         ),
         _mk(
@@ -1068,7 +1173,7 @@ def _mla_prolog_in_row(
         f"token_x:{tok_spec}",
         f"weight_dq:{w_spec}",
         f"weight_uq_qr:{w_spec}",
-        f"weight_uk:{w_spec}",
+        "weight_uk:bf16:ND:dense::none",
         f"weight_dkv_kr:{w_spec}",
         "rmsnorm_gamma_cq:bf16:ND:dense::none",
         "rmsnorm_gamma_ckv:bf16:ND:dense::none",
@@ -1176,17 +1281,19 @@ def _cann_attention_and_linear_entries(
             available=is_a5, backend="cann_aclnn", symbol="aclnnFlashMla", arch=arch,
             role="attention", graph_motif="paged_mla",
             dtype_tuple=(
-                ("q:bf16:ND:dense::none", "k_cache:bf16:ND:dense::none"),
-                ("q:fp8_e4m3fn:ND:per_tensor_fp8::fp32", "k_cache:fp8_e4m3fn:ND:per_tensor_fp8::fp32"),
+                ("q:bf16:ND:dense::none", "k_cache:bf16:ND:dense::none", "block_table:int32:ND:none::none"),
+                ("q:fp16:ND:dense::none", "k_cache:fp16:ND:dense::none", "block_table:int32:ND:none::none"),
+                ("q:bf16:ND:dense::none", "k_cache:bf16:ND:dense::none", "block_table:int32:ND:none::none", "cache_seqlens:int32:ND:none::none"),
+                ("q:fp16:ND:dense::none", "k_cache:fp16:ND:dense::none", "block_table:int32:ND:none::none", "cache_seqlens:int32:ND:none::none"),
             ),
-            outputs=(("attn_out:bf16:ND",), ("attn_out:bf16:ND",)),
+            outputs=(("attn_out:bf16:ND",), ("attn_out:fp16:ND",), ("attn_out:bf16:ND",), ("attn_out:fp16:ND",)),
             repo_key="ops-transformer",
             rel_path="attention/flash_mla/op_api/aclnn_flash_mla.cpp",
             va_ref="vllm_ascend/attention/flashmla.py:160",
             op_ref="ops-transformer/attention/flash_mla/torch_extension/csrc/flash_mla.cpp:1",
-            cann_ref="ops-transformer/attention/flash_mla/op_host/flash_mla_def.cpp:107",
+            cann_ref="ops-transformer/attention/flash_mla/op_host/flash_mla_tiling_info_parser.cpp:357",
             kernels=("FlashMla",) if is_a5 else (),
-            note="A5 ONLY (AddConfig ascend950); unavailable on A2/A3",
+            note="A5 ONLY (AddConfig ascend950; BF16/FP16 only + required paged block_table per flash_mla_tiling_info_parser.cpp:357); unavailable on A2/A3",
             observed_kernels=observed,
         ),
         _mk(
@@ -1260,19 +1367,19 @@ def _cann_attention_and_linear_entries(
                     ("query:hif8:ND:per_token_fp8::fp32", "key:hif8:ND:per_token_fp8::fp32", "weights:bf16:ND:dense::none", "query_dequant_scale:fp32:ND:dense::none", "key_dequant_scale:fp32:ND:dense::none"),
                     ("query:int8:ND:per_token_int8::fp16", "key:int8:ND:per_token_int8::fp16", "weights:fp16:ND:dense::none", "query_dequant_scale:fp16:ND:dense::none", "key_dequant_scale:fp16:ND:dense::none"),
                 ) if is_a5 else (
-                    ("query:int8:ND:per_token_int8::fp16", "key:int8:ND:per_token_int8::fp16", "weights:bf16:ND:dense::none", "query_dequant_scale:fp16:ND:dense::none", "key_dequant_scale:fp16:ND:dense::none"),
-                    ("query:int8:ND:per_token_int8::fp32", "key:int8:ND:per_token_int8::fp32", "weights:bf16:ND:dense::none", "query_dequant_scale:fp32:ND:dense::none", "key_dequant_scale:fp32:ND:dense::none"),
+                    # DAV_2201 exact single tuple from quant_lightning_indexer_tiling.cpp:480-499 (FP16 weights & scales only)
+                    ("query:int8:ND:per_token_int8::fp16", "key:int8:ND:per_token_int8::fp16", "weights:fp16:ND:dense::none", "query_dequant_scale:fp16:ND:dense::none", "key_dequant_scale:fp16:ND:dense::none"),
                 )
             ),
             outputs=(
-                (("sparse_indices:int32:ND",),) * 4 if is_a5 else (("sparse_indices:int32:ND",),) * 2
+                (("sparse_indices:int32:ND",),) * 4 if is_a5 else (("sparse_indices:int32:ND",),)
             ),
             repo_key="ops-transformer",
             rel_path="attention/quant_lightning_indexer/op_host/quant_lightning_indexer_tiling.cpp",
             va_ref="vllm_ascend/attention/indexer.py:934",
             cann_ref="ops-transformer/attention/quant_lightning_indexer/op_host/quant_lightning_indexer_tiling.cpp:438",
             kernels=("QuantLightningIndexer",),
-            note="Usable on live A5 (FP8_E4M3/HiFloat8/INT8 joint tuples per DAV_3510 tiling.cpp:438-475) and A3 INT8 (5 required inputs)",
+            note="Usable on live A5 (FP8_E4M3/HiFloat8/INT8 joint tuples per DAV_3510) and A2/A3 INT8+FP16 weights/scales (5 required inputs)",
             observed_kernels=observed,
         ),
         _mk(
@@ -1282,26 +1389,27 @@ def _cann_attention_and_linear_entries(
             role="sparse_indexer", graph_motif="quant_lightning_indexer_v2",
             dtype_tuple=(
                 (
-                    ("q:fp8_e4m3fn:ND:per_token_fp8::fp32", "k:fp8_e4m3fn:ND:per_token_fp8::fp32", "w:bf16:ND:dense::none", "q_descale:fp32:ND:dense::none", "k_descale:fp32:ND:dense::none"),
-                    ("q:fp8_e4m3fn:ND:per_token_fp8::fp16", "k:fp8_e4m3fn:ND:per_token_fp8::fp16", "w:fp16:ND:dense::none", "q_descale:fp16:ND:dense::none", "k_descale:fp16:ND:dense::none"),
-                    ("q:hif8:ND:per_token_fp8::fp32", "k:hif8:ND:per_token_fp8::fp32", "w:bf16:ND:dense::none", "q_descale:fp32:ND:dense::none", "k_descale:fp32:ND:dense::none"),
+                    # Exact 5 DAV_3510 tuples from quant_lightning_indexer_v2_def.cpp:116-140 & tiling.cpp:504-608
+                    ("q:fp8_e4m3fn:ND:per_token_fp8::fp32", "k:fp8_e4m3fn:ND:per_token_fp8::fp32", "w:fp32:ND:dense::none", "q_descale:fp32:ND:dense::none", "k_descale:fp32:ND:dense::none"),
+                    ("q:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0", "k:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0", "w:fp32:ND:dense::none", "q_descale:fp8_e8m0:ND:none::none", "k_descale:fp8_e8m0:ND:none::none"),
+                    ("q:hif8:ND:per_token_fp8::fp32", "k:hif8:ND:per_token_fp8::fp32", "w:fp32:ND:dense::none", "q_descale:fp32:ND:dense::none", "k_descale:fp32:ND:dense::none"),
+                    ("q:fp4_e2m1:ND:mx_fp4:32:fp8_e8m0", "k:fp4_e2m1:ND:mx_fp4:32:fp8_e8m0", "w:fp32:ND:dense::none", "q_descale:fp8_e8m0:ND:none::none", "k_descale:fp8_e8m0:ND:none::none"),
                     ("q:int8:ND:per_token_int8::fp16", "k:int8:ND:per_token_int8::fp16", "w:fp16:ND:dense::none", "q_descale:fp16:ND:dense::none", "k_descale:fp16:ND:dense::none"),
                 ) if is_a5 else (
-                    ("q:int8:ND:per_token_int8::fp16", "k:int8:ND:per_token_int8::fp16", "w:bf16:ND:dense::none", "q_descale:fp16:ND:dense::none", "k_descale:fp16:ND:dense::none"),
-                    ("q:int8:ND:per_token_int8::fp32", "k:int8:ND:per_token_int8::fp32", "w:bf16:ND:dense::none", "q_descale:fp32:ND:dense::none", "k_descale:fp32:ND:dense::none"),
+                    ("q:int8:ND:per_token_int8::fp16", "k:int8:ND:per_token_int8::fp16", "w:fp16:ND:dense::none", "q_descale:fp16:ND:dense::none", "k_descale:fp16:ND:dense::none"),
                 )
             ),
             outputs=(
-                (("sparse_indices:int32:ND", "sparse_values:fp32:ND"),) * 4
+                (("sparse_indices:int32:ND", "sparse_values:bf16:ND"),) * 5
                 if is_a5 else
-                (("sparse_indices:int32:ND", "sparse_values:fp32:ND"),) * 2
+                (("sparse_indices:int32:ND", "sparse_values:bf16:ND"),)
             ),
             repo_key="ops-transformer",
             rel_path="attention/quant_lightning_indexer_v2/op_api/aclnn_quant_lightning_indexer_v2.cpp",
             va_ref="vllm_ascend/device/device_op.py:772",
-            cann_ref="ops-transformer/attention/quant_lightning_indexer_v2/op_api/aclnn_quant_lightning_indexer_v2.cpp:60",
+            cann_ref="ops-transformer/attention/quant_lightning_indexer_v2/op_host/quant_lightning_indexer_v2_def.cpp:85",
             kernels=("QuantLightningIndexerV2",),
-            note="Standard CANN QLI V2 (5 required inputs -> sparse_indices, sparse_values)",
+            note="Standard CANN QLI V2 (5 required inputs -> sparse_indices:int32, sparse_values:bf16; A5 FP32/FP16 weights, A2/A3 INT8+FP16)",
             observed_kernels=observed,
         ),
         _mk(
@@ -1370,22 +1478,28 @@ def _cann_attention_and_linear_entries(
             dtype_tuple=(
                 (
                     "query:bf16:ND:dense::none", "key:bf16:ND:dense::none", "value:bf16:ND:dense::none",
-                    "beta:bf16:ND:dense::none", "initial_state:fp32:ND:dense::none",
-                    "actual_seq_lengths:int64:ND:none::none",
+                    "beta:bf16:ND:dense::none", "initial_state:bf16:ND:dense::none",
+                    "actual_seq_lengths:int32:ND:none::none",
                 ),
-                (
-                    "query:fp16:ND:dense::none", "key:fp16:ND:dense::none", "value:fp16:ND:dense::none",
-                    "beta:fp16:ND:dense::none", "initial_state:fp32:ND:dense::none",
-                    "actual_seq_lengths:int64:ND:none::none",
+                *(
+                    ((
+                        "query:bf16:ND:dense::none", "key:bf16:ND:dense::none", "value:bf16:ND:dense::none",
+                        "beta:bf16:ND:dense::none", "initial_state:fp32:ND:dense::none",
+                        "actual_seq_lengths:int32:ND:none::none",
+                    ),)
+                    if is_a5 else ()
                 ),
             ),
-            outputs=(("out:bf16:ND", "final_state:fp32:ND"), ("out:fp16:ND", "final_state:fp32:ND")),
+            outputs=(
+                ("out:bf16:ND", "final_state:bf16:ND"),
+                *((("out:bf16:ND", "final_state:fp32:ND"),) if is_a5 else ()),
+            ),
             repo_key="ops-transformer",
             rel_path="attention/chunk_gated_delta_rule/op_host/op_api/aclnn_chunk_gated_delta_rule.h",
             va_ref="vllm_ascend/ops/gdn.py",
-            cann_ref="ops-transformer/attention/chunk_gated_delta_rule/op_host/op_api/aclnn_chunk_gated_delta_rule.h:51",
-            kernels=("ChunkGatedDeltaRuleFwdPrepare", "ChunkFwdH", "ChunkFwdO"),
-            note="Canonical CANN symbol backing Arch22/Arch35 chunk GDN strategies (6 required inputs -> 2 outputs)",
+            cann_ref="ops-transformer/attention/chunk_gated_delta_rule/op_host/chunk_gated_delta_rule_tiling.cpp:369",
+            kernels=("ChunkGatedDeltaRule",),
+            note="Canonical CANN aclnnChunkGatedDeltaRule (BF16-only Q/K/V/beta/out, int32 actual_seq_lengths; FP32 state A5-only per tiling.cpp:369)",
             observed_kernels=observed,
         ),
         _mk(
@@ -1399,18 +1513,18 @@ def _cann_attention_and_linear_entries(
                     "actual_seq_lengths:int32:ND:none::none", "ssm_state_indices:int32:ND:none::none",
                 ),
                 (
-                    "query:fp16:ND:dense::none", "key:fp16:ND:dense::none", "value:fp16:ND:dense::none",
-                    "beta:fp16:ND:dense::none", "state:fp32:ND:dense::none",
+                    "query:bf16:ND:dense::none", "key:bf16:ND:dense::none", "value:bf16:ND:dense::none",
+                    "beta:bf16:ND:dense::none", "state:bf16:ND:dense::none",
                     "actual_seq_lengths:int32:ND:none::none", "ssm_state_indices:int32:ND:none::none",
                 ),
             ),
-            outputs=(("out:bf16:ND", "state:fp32:ND"), ("out:fp16:ND", "state:fp32:ND")),
+            outputs=(("out:bf16:ND", "state:fp32:ND"), ("out:bf16:ND", "state:bf16:ND")),
             repo_key="ops-transformer",
             rel_path="attention/recurrent_gated_delta_rule/op_host/recurrent_gated_delta_rule_def.cpp",
             va_ref="vllm_ascend/ops/gdn.py",
-            cann_ref="ops-transformer/attention/recurrent_gated_delta_rule/op_host/recurrent_gated_delta_rule_tiling.cpp:1",
+            cann_ref="ops-transformer/attention/recurrent_gated_delta_rule/op_host/recurrent_gated_delta_rule_def.cpp:22",
             kernels=("RecurrentGatedDeltaRule",),
-            note="Decode GDN CANN kernel (7 required inputs -> 2 outputs; live A3 & A5 verified)",
+            note="Decode GDN CANN kernel (BF16-only Q/K/V/beta/out, FP32/BF16 state; 7 required inputs -> 2 outputs)",
             observed_kernels=observed,
         ),
         _mk(
@@ -1622,7 +1736,7 @@ def _vllm_ascend_csrc_entries(
             role="sparse_indexer", graph_motif="sharded_qli_v2",
             dtype_tuple=((
                 "q:int8:ND:per_token_int8::fp16", "k:int8:ND:per_token_int8::fp16",
-                "w:bf16:ND:dense::none", "q_descale:fp16:ND:dense::none", "k_descale:fp16:ND:dense::none",
+                "w:fp16:ND:dense::none", "q_descale:fp16:ND:dense::none", "k_descale:fp16:ND:dense::none",
             ),),
             outputs=(("sparse_indices:int32:ND", "sparse_values:fp32:ND"),),
             repo_key="vllm-ascend",
@@ -1827,7 +1941,17 @@ def _triton_and_other_non_cann_entries(
         tuple[tuple[str, ...], ...], tuple[tuple[str, ...], ...],
     ]] = [
         ("kda_chunk_triton", "vllm_ascend.ops.triton.kda.kda.chunk_kda", "linear_attention",
-         "vllm_ascend/ops/triton/kda/kda.py", ("chunk_kda",), True, "Triton KDA chunk kernel",
+         "vllm_ascend/ops/triton/kda/kda.py",
+         (
+             "chunk_local_cumsum_vector_kernel",
+             "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter",
+             "chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra",
+             "merge_16x16_to_64x64_inverse_kernel_kda",
+             "recompute_w_u_fwd_kernel",
+             "chunk_gated_delta_rule_fwd_kernel_h_blockdim64_kda",
+             "chunk_gla_fwd_kernel_o",
+         ),
+         True, "Triton KDA chunk 7-kernel ordered launch chain",
          (("q:bf16:ND:dense::none", "k:bf16:ND:dense::none", "v:bf16:ND:dense::none", "g:fp32:ND:dense::none", "beta:bf16:ND:dense::none"),),
          (("out:bf16:ND", "final_state:fp32:ND"),)),
         ("kda_recoverssm_verify", "_kda_recoverssm_verify_kernel", "recoverssm",
@@ -1917,9 +2041,9 @@ def _triton_and_other_non_cann_entries(
          (("output:bf16:ND",), ("output:fp16:ND",))),
         ("sfa_dcp_fast_exchange", "_pack_token_peer", "dcp_exchange",
          "vllm_ascend/ops/triton/dcp/sfa_dcp_exchange.py", ("_pack_token_peer",), True,
-         "Fast pow2-head BF16 SFA DCP pack kernel (live A3 & A5)",
-         (("output_words:bf16:ND:dense::none", "lse:fp32:ND:dense::none"),),
-         (("send:bf16:ND",),)),
+         "Fast pow2-head SFA DCP pack kernel (int32 word-viewed output_words & send per sfa_dcp_exchange.py:197)",
+         (("output_words:int32:ND:none::none", "lse:fp32:ND:dense::none"),),
+         (("send:int32:ND",),)),
         ("flash_attention_gate", "_flash_attention_gate_kernel", "attention",
          "vllm_ascend/ops/triton/flash_attention_output.py", ("_flash_attention_gate_kernel",), True,
          "MLA output gate Triton kernel (live A3 & A5)",
@@ -2192,12 +2316,15 @@ def _cann_live_extra_entries(
             available=True, backend="cann_aclnn", symbol="aclnnMoeTokenPermute", arch=arch,
             role="moe_routing", graph_motif="moe_token_permute",
             dtype_tuple=(("x:bf16:ND:dense::none", "idx:int32:ND:none::none"), ("x:fp16:ND:dense::none", "idx:int32:ND:none::none")),
-            outputs=(("y:bf16:ND",), ("y:fp16:ND",)),
+            outputs=(
+                ("permute_tokens:bf16:ND", "sorted_indices:int32:ND"),
+                ("permute_tokens:fp16:ND", "sorted_indices:int32:ND"),
+            ),
             repo_key="op-plugin", rel_path="op_plugin/ops/opapi/MoeTokenPermuteKernelNpuOpApi.cpp",
             op_ref="op_plugin/ops/opapi/MoeTokenPermuteKernelNpuOpApi.cpp:1",
-            cann_ref="op_plugin/ops/opapi/MoeTokenPermuteKernelNpuOpApi.cpp:1",
+            cann_ref="ops-transformer/moe/moe_token_permute/op_host/moe_token_permute_def.cpp:37",
             kernels=("MoeTokenPermute",),
-            note="MoE token permute (live A3 verified)",
+            note="MoE token permute (2 required outputs: permute_tokens, sorted_indices; live A3 verified)",
             observed_kernels=observed,
         ),
         _mk(
@@ -2219,25 +2346,18 @@ def _cann_live_extra_entries(
             available=True, backend="cann_aclnn",
             symbol="aclnnChunkGatedDeltaRuleArch35" if is_a5 else "aclnnChunkGatedDeltaRuleArch22",
             arch=arch, role="linear_attention", graph_motif="chunk_gdn",
-            dtype_tuple=(
-                (
-                    "query:bf16:ND:dense::none", "key:bf16:ND:dense::none", "value:bf16:ND:dense::none",
-                    "beta:bf16:ND:dense::none", "initial_state:fp32:ND:dense::none",
-                    "actual_seq_lengths:int64:ND:none::none",
-                ),
-                (
-                    "query:fp16:ND:dense::none", "key:fp16:ND:dense::none", "value:fp16:ND:dense::none",
-                    "beta:fp16:ND:dense::none", "initial_state:fp32:ND:dense::none",
-                    "actual_seq_lengths:int64:ND:none::none",
-                ),
-            ),
-            outputs=(("out:bf16:ND", "final_state:fp32:ND"), ("out:fp16:ND", "final_state:fp32:ND")),
+            dtype_tuple=((
+                "query:bf16:ND:dense::none", "key:bf16:ND:dense::none", "value:bf16:ND:dense::none",
+                "beta:bf16:ND:dense::none", "initial_state:fp32:ND:dense::none",
+                "actual_seq_lengths:int32:ND:none::none",
+            ),),
+            outputs=(("out:bf16:ND", "final_state:fp32:ND"),),
             repo_key="ops-transformer",
             rel_path="experimental/attention/chunk_gated_delta_rule/op_host/chunk_gated_delta_rule_def.cpp",
             op_ref="op_plugin/ops/opapi/ChunkGatedDeltaRuleKernelNpuOpApi.cpp:1",
-            cann_ref="ops-transformer/experimental/attention/chunk_gated_delta_rule/op_host/chunk_gated_delta_rule_tiling.cpp:1",
+            cann_ref="ops-transformer/experimental/attention/chunk_gated_delta_rule/op_host/chunk_gated_delta_rule_def.cpp:22",
             kernels=("ChunkGatedDeltaRuleFwdPrepare", "ChunkFwdH", "ChunkFwdO"),
-            note="Arch-specialized chunk GDN strategy ABI binding (6 required inputs -> out, final_state)",
+            note="Arch-specialized chunk GDN strategy ABI binding (BF16-only, int32 actual_seq_lengths; 6 required inputs -> out, final_state)",
             observed_kernels=observed,
         ),
         _mk(
@@ -2246,25 +2366,18 @@ def _cann_live_extra_entries(
             available=True, backend="cann_aclnn",
             symbol="aclnnChunkGatedDeltaRuleFwd",
             arch=arch, role="linear_attention", graph_motif="chunk_gdn_fwd",
-            dtype_tuple=(
-                (
-                    "query:bf16:ND:dense::none", "key:bf16:ND:dense::none", "value:bf16:ND:dense::none",
-                    "beta:bf16:ND:dense::none", "initial_state:fp32:ND:dense::none",
-                    "actual_seq_lengths:int64:ND:none::none",
-                ),
-                (
-                    "query:fp16:ND:dense::none", "key:fp16:ND:dense::none", "value:fp16:ND:dense::none",
-                    "beta:fp16:ND:dense::none", "initial_state:fp32:ND:dense::none",
-                    "actual_seq_lengths:int64:ND:none::none",
-                ),
-            ),
-            outputs=(("out:bf16:ND", "final_state:fp32:ND"), ("out:fp16:ND", "final_state:fp32:ND")),
+            dtype_tuple=((
+                "query:bf16:ND:dense::none", "key:bf16:ND:dense::none", "value:bf16:ND:dense::none",
+                "beta:bf16:ND:dense::none", "initial_state:fp32:ND:dense::none",
+                "actual_seq_lengths:int32:ND:none::none",
+            ),),
+            outputs=(("out:bf16:ND", "final_state:fp32:ND"),),
             repo_key="ops-transformer",
             rel_path="experimental/attention/chunk_gated_delta_rule/op_host/chunk_gated_delta_rule_def.cpp",
             op_ref="op_plugin/ops/opapi/ChunkGatedDeltaRuleKernelNpuOpApi.cpp:1",
-            cann_ref="ops-transformer/experimental/attention/chunk_gated_delta_rule/op_host/chunk_gated_delta_rule_tiling.cpp:1",
+            cann_ref="ops-transformer/experimental/attention/chunk_gated_delta_rule/op_host/chunk_gated_delta_rule_def.cpp:22",
             kernels=("ChunkGatedDeltaRuleFwdPrepare", "ChunkFwdH", "ChunkFwdO"),
-            note="Ordered 3-kernel chunk GDN forward expansion (live A3 & A5)",
+            note="Ordered 3-kernel experimental chunk GDN forward expansion (BF16-only, int32 actual_seq_lengths; live A3 & A5)",
             observed_kernels=observed,
         ),
         _mk(
@@ -2294,12 +2407,14 @@ def _cann_live_extra_entries(
                 ("x1:fp16:ND:dense::none", "x2:fp16:ND:dense::none"),
             ),
             outputs=(("y:bf16:ND",), ("y:fp16:ND",)),
+            allow_bias=is_a5,
+            require_no_bias=not is_a5,
             repo_key="op-plugin",
             rel_path="op_plugin/ops/opapi/TransposeBatchMatMulKernelNpuOpApi.cpp",
             op_ref="op_plugin/ops/opapi/TransposeBatchMatMulKernelNpuOpApi.cpp:85",
-            cann_ref="op_plugin/ops/opapi/TransposeBatchMatMulKernelNpuOpApi.cpp:85",
+            cann_ref="ops-nn/matmul/transpose_batch_mat_mul/op_api/aclnn_transpose_batch_mat_mul.cpp:196",
             kernels=("Slice", "TransposeBatchMatMul"),
-            note="Ordered 2-kernel non-contiguous Q-view TransposeBatchMatMul expansion (live A5)",
+            note="Ordered 2-kernel TransposeBatchMatMul expansion (bias & perm_y=[0,1,2] A5-only per aclnn_transpose_batch_mat_mul.cpp:215,364)",
             observed_kernels=observed,
         ),
     ]
@@ -2441,14 +2556,45 @@ def _torch_npu_catlass_and_wheel_entries(
                 ("y:fp16:ND",),
             ),
         ),
+        (
+            "npu_grouped_matmul", "torch_npu.npu_grouped_matmul", "moe_grouped_matmul",
+            "op_plugin/ops/opapi/GroupedMatmulKernelNpuOpApi.cpp", ("GroupedMatmul",),
+            (
+                ("x:bf16:ND:dense::none", "w:bf16:FRACTAL_NZ:dense::none"),
+                ("x:fp16:ND:dense::none", "w:fp16:FRACTAL_NZ:dense::none"),
+                ("x:bf16:ND:dense::none", "w:bf16:ND:dense::none"),
+                ("x:fp16:ND:dense::none", "w:fp16:ND:dense::none"),
+                ("x:int8:ND:per_token_int8::fp32", "w:int8:FRACTAL_NZ:per_channel_int8::fp32"),
+                ("x:int8:ND:per_token_int8::fp32", "w:int4:FRACTAL_NZ:w4a8_int::fp32"),
+                *(
+                    (
+                        ("x:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0", "w:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0"),
+                        ("x:fp4_e2m1:ND:mx_fp4:32:fp8_e8m0", "w:fp4_e2m1:FRACTAL_NZ:mx_fp4:32:fp8_e8m0"),
+                    ) if is_a5 else ()
+                ),
+            ),
+            (
+                ("y:bf16:ND",), ("y:fp16:ND",), ("y:bf16:ND",), ("y:fp16:ND",),
+                ("y:bf16:ND",), ("y:bf16:ND",),
+                *((("y:bf16:ND",), ("y:bf16:ND",)) if is_a5 else ()),
+            ),
+        ),
     ]
     for suffix, sym, role, rel, kernels, in_tuples, out_tuples in torch_npu_specs:
+        spec_shape = (
+            AbiShapeConstraints(max_experts=MAX_EXPERTS_MOE_GATING)
+            if suffix == "npu_moe_gating_top_k"
+            else (AbiShapeConstraints(max_experts=MAX_EXPERTS_GROUPED_MATMUL) if suffix == "npu_grouped_matmul" else None)
+        )
         entries.append(_mk(
             repos, entry_id=f"{p_low}_torch_npu_{suffix}", abi_id=sym,
             available=True, backend="torch_npu", symbol=sym, arch=arch,
             role=role, graph_motif=suffix,
             dtype_tuple=in_tuples,
             outputs=out_tuples,
+            shape=spec_shape,
+            allow_bias=is_a5 if suffix == "npu_transpose_batchmatmul" else True,
+            require_no_bias=(not is_a5) if suffix == "npu_transpose_batchmatmul" else False,
             repo_key="op-plugin", rel_path=rel, op_ref=f"{rel}:1",
             kernels=kernels, note="PyTorch torch_npu op-plugin dispatch (exact upstream signature)",
             observed_kernels=observed,
@@ -2470,14 +2616,20 @@ def _torch_npu_catlass_and_wheel_entries(
     entries.append(_mk(
         repos, entry_id=f"{p_low}_catlass_dual_level_mx_epilogue",
         abi_id="catlass_epilogue_dual_level_quant_mx", available=is_a5, backend="catlass",
-        symbol="catlass::epilogue::BlockEpilogueDualLevelQuantMx", arch=arch,
-        role="catlass_template", graph_motif="catlass_mx_epilogue",
-        dtype_tuple=(("x1:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0", "x2:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0"),),
-        outputs=(("y:fp8_e4m3fn:ND", "scale:fp8_e8m0:ND"),),
+        symbol="Catlass::Epilogue::Block::BlockQuantDualLevelMx", arch=arch,
+        role="catlass_epilogue", graph_motif="catlass_mx_epilogue",
+        dtype_tuple=(
+            ("x:bf16:ND:dense::none",),
+            ("x:fp16:ND:dense::none",),
+        ),
+        outputs=(
+            ("y:fp4_e2m1:ND:mx_fp4:32:fp8_e8m0", "scale1:fp32:ND", "scale2:fp8_e8m0:ND"),
+            ("y:fp4_e2m1:ND:mx_fp4:32:fp8_e8m0", "scale1:fp32:ND", "scale2:fp8_e8m0:ND"),
+        ),
         repo_key="catlass",
         rel_path="include/catlass/epilogue/block/block_epilogue_dual_level_quant_mx.hpp",
         kernels=("CatlassDualLevelQuantMx",) if is_a5 else (),
-        note="A5 L0C->Fixpipe->UB MX epilogue template (arch35 only)",
+        note="A5 BlockQuantDualLevelMx dual-level MXFP4 epilogue (1 BF16/FP16 tile -> fp4_e2m1 + fp32 scale1 + fp8_e8m0 scale2)",
         observed_kernels=observed,
     ))
 
@@ -2511,6 +2663,389 @@ def _torch_npu_catlass_and_wheel_entries(
     return entries
 
 
+def _mqsmla_io_rows(
+    ori_kv_spec: str,
+    cmp_kv_spec: str,
+    *,
+    include_nd_contiguous: bool = False,
+) -> tuple[tuple[tuple[str, ...], ...], tuple[tuple[str, ...], ...]]:
+    """Build exact positional C++ active-tensor rows for ``aclnnMixedQuantSparseFlashMla`` / DSL."""
+    q = "q:bf16:ND:dense::none"
+    ori_idx = "ori_sparse_indices:int32:ND:none::none"
+    cmp_idx = "cmp_sparse_indices:int32:ND:none::none"
+    ori_bt = "ori_block_table:int32:ND:none::none"
+    cmp_bt = "cmp_block_table:int32:ND:none::none"
+    cu_q = "cu_seqlens_q:int32:ND:none::none"
+    cu_ori = "cu_seqlens_ori_kv:int32:ND:none::none"
+    cu_cmp = "cu_seqlens_cmp_kv:int32:ND:none::none"
+    seq_ori = "seqused_ori_kv:int32:ND:none::none"
+    seq_cmp = "seqused_cmp_kv:int32:ND:none::none"
+    sinks = "sinks:fp32:ND:dense::none"
+    meta = "metadata:int32:ND:none::none"
+    base_in: list[tuple[str, ...]] = [
+        # CSA (window + sparse compressed) PA_BBND: BSND & TND
+        (q, ori_kv_spec, cmp_kv_spec, cmp_idx, ori_bt, cmp_bt, seq_ori, seq_cmp, sinks, meta),
+        (q, ori_kv_spec, cmp_kv_spec, cmp_idx, ori_bt, cmp_bt, cu_q, seq_ori, seq_cmp, sinks, meta),
+        # SWA (window-only, cmp_kv omitted) PA_BBND: BSND & TND
+        (q, ori_kv_spec, ori_bt, seq_ori, sinks, meta),
+        (q, ori_kv_spec, ori_bt, cu_q, seq_ori, sinks, meta),
+        # HCA (window + dense compressed) PA_BBND: BSND & TND
+        (q, ori_kv_spec, cmp_kv_spec, ori_bt, cmp_bt, seq_ori, seq_cmp, sinks, meta),
+        (q, ori_kv_spec, cmp_kv_spec, ori_bt, cmp_bt, cu_q, seq_ori, seq_cmp, sinks, meta),
+        # ORI_CMP_SPARSE (both sparse index tensors) PA_BBND: BSND & TND
+        (q, ori_kv_spec, cmp_kv_spec, ori_idx, cmp_idx, ori_bt, cmp_bt, seq_ori, seq_cmp, sinks, meta),
+        (q, ori_kv_spec, cmp_kv_spec, ori_idx, cmp_idx, ori_bt, cmp_bt, cu_q, seq_ori, seq_cmp, sinks, meta),
+    ]
+    if include_nd_contiguous:
+        ori_nd = ori_kv_spec.replace(":PA_BBND:", ":ND:")
+        cmp_nd = cmp_kv_spec.replace(":PA_BBND:", ":ND:")
+        base_in.extend([
+            (q, ori_nd, cmp_nd, cmp_idx, cu_q, cu_ori, cu_cmp, sinks, meta),
+            (q, ori_nd, cu_q, cu_ori, sinks, meta),
+        ])
+    in_rows: list[tuple[str, ...]] = []
+    out_rows: list[tuple[str, ...]] = []
+    for row in base_in:
+        in_rows.append(row)
+        out_rows.append(("attn_out:bf16:ND",))
+        in_rows.append(row)
+        out_rows.append(("attn_out:bf16:ND", "softmax_lse:fp32:ND"))
+    return tuple(in_rows), tuple(out_rows)
+
+
+def _mqsmla_a23_io_rows() -> tuple[tuple[tuple[str, ...], ...], tuple[tuple[str, ...], ...]]:
+    """Build exact arch22 INT8 CSA (mode 1) and TurboQuant (mode 3) positional C++ rows."""
+    cmp_idx = "cmp_sparse_indices:int32:ND:none::none"
+    ori_bt = "ori_block_table:int32:ND:none::none"
+    cmp_bt = "cmp_block_table:int32:ND:none::none"
+    cu_q = "cu_seqlens_q:int32:ND:none::none"
+    cu_ori = "cu_seqlens_ori_kv:int32:ND:none::none"
+    cu_cmp = "cu_seqlens_cmp_kv:int32:ND:none::none"
+    seq_ori = "seqused_ori_kv:int32:ND:none::none"
+    seq_cmp = "seqused_cmp_kv:int32:ND:none::none"
+    sinks = "sinks:fp32:ND:dense::none"
+    meta = "metadata:int32:ND:none::none"
+    in_rows: list[tuple[str, ...]] = []
+    out_rows: list[tuple[str, ...]] = []
+    for q_dt in ("bf16", "fp16"):
+        q = f"q:{q_dt}:ND:dense::none"
+        ori_i8_pa = "ori_kv:int8:PA_BBND:int8_csa_608:64:bf16"
+        cmp_i8_pa = "cmp_kv:int8:PA_BBND:int8_csa_608:64:bf16"
+        ori_i8_nd = "ori_kv:int8:ND:int8_csa_608:64:bf16"
+        cmp_i8_nd = "cmp_kv:int8:ND:int8_csa_608:64:bf16"
+        ori_tq = f"ori_kv:{q_dt}:PA_BBND:tq4_ori::none"
+        cmp_tq = "cmp_kv:uint8:PA_BBND:tq4_cmp::none"
+        candidates = (
+            # INT8 CSA (quant_mode=1): requires ori_kv, cmp_kv, cmp_sparse_indices (no ori_sparse_indices)
+            (q, ori_i8_pa, cmp_i8_pa, cmp_idx, ori_bt, cmp_bt, seq_ori, seq_cmp, sinks, meta),
+            (q, ori_i8_pa, cmp_i8_pa, cmp_idx, ori_bt, cmp_bt, cu_q, seq_ori, seq_cmp, sinks, meta),
+            (q, ori_i8_nd, cmp_i8_nd, cmp_idx, cu_q, cu_ori, cu_cmp, sinks, meta),
+            # TurboQuant (quant_mode=3): requires TND/PA_BBND
+            (q, ori_tq, cmp_tq, cmp_idx, ori_bt, cmp_bt, cu_q, seq_ori, seq_cmp, sinks, meta),
+        )
+        for row in candidates:
+            in_rows.append(row)
+            out_rows.append((f"attn_out:{q_dt}:ND",))
+            in_rows.append(row)
+            out_rows.append((f"attn_out:{q_dt}:ND", "softmax_lse:fp32:ND"))
+    return tuple(in_rows), tuple(out_rows)
+
+
+def _mqsmla_entries(
+    arch: str, repos: dict[str, RepoHandle], observed: set[str],
+) -> list[ProbedAbiEntry]:
+    is_a5 = arch == "A5"
+    p_low = arch.lower()
+    if is_a5:
+        m1_in, m1_out = _mqsmla_io_rows(
+            "ori_kv:fp8_e4m3fn:PA_BBND:packed_kv_608:64:bf16",
+            "cmp_kv:fp8_e4m3fn:PA_BBND:packed_kv_608:64:bf16",
+            include_nd_contiguous=True,
+        )
+        m2_in, m2_out = _mqsmla_io_rows(
+            "ori_kv:fp8_e4m3fn:PA_BBND:packed_kv_584:64:fp8_e8m0",
+            "cmp_kv:fp8_e4m3fn:PA_BBND:packed_kv_584:64:fp8_e8m0",
+            include_nd_contiguous=False,
+        )
+        cann_in, cann_out = m1_in + m2_in, m1_out + m2_out
+    else:
+        cann_in, cann_out = _mqsmla_a23_io_rows()
+    dsl_in, dsl_out = _mqsmla_io_rows(
+        "ori_kv:fp8_e4m3fn:PA_BBND:per_group_fp8:32:bf16",
+        "cmp_kv:fp4_e2m1:PA_BBND:per_group_fp4:16:bf16",
+        include_nd_contiguous=False,
+    )
+    mqs_shape = AbiShapeConstraints(
+        head_dim_allowed_set=MQSMLA_HEAD_DIMS,
+        rope_dim_allowed_set=MQSMLA_ROPE_DIMS,
+        kv_heads_allowed_set=MQSMLA_KV_HEADS,
+    )
+    return [
+        _mk(
+            repos, entry_id=f"{p_low}_cann_mixed_quant_sparse_flash_mla",
+            abi_id="aclnnMixedQuantSparseFlashMla", available=True,
+            backend="cann_aclnn", symbol="aclnnMixedQuantSparseFlashMla", arch=arch,
+            role="attention", graph_motif="mixed_quant_sparse_flash_mla",
+            dtype_tuple=cann_in,
+            outputs=cann_out,
+            shape=mqs_shape,
+            repo_key="ops-transformer",
+            rel_path="attention/mixed_quant_sparse_flash_mla/op_host/mixed_quant_sparse_flash_mla_def.cpp",
+            cann_ref="ops-transformer/attention/mixed_quant_sparse_flash_mla/op_host/checkers/mixed_quant_variant_checker.cpp:37",
+            kernels=("MixedQuantSparseFlashMla",),
+            note=(
+                "A5 DAV_3510 FP8 MQSMLA (Mode-1 608B PA_BBND/ND & Mode-2 584B PA_BBND-only; "
+                "full C++ positional active ports incl. block_table, seqused, sinks, metadata; D=512, RoPE=64, kvN=1)"
+                if is_a5 else
+                "A2/A3 DAV_2201 MQSMLA (INT8 CSA mode 1 [608B] & TurboQuant mode 3 [512/258B]; FP8 Mode 1/2 is A5-only)"
+            ),
+            observed_kernels=observed,
+        ),
+        _mk(
+            repos, entry_id=f"{p_low}_dsl_mixed_quant_sparse_flash_mla",
+            abi_id="tilelang_dsl.mixed_quant_sparse_flash_mla", available=is_a5,
+            backend="third_party_wheel", symbol="tilelang_dsl.mixed_quant_sparse_flash_mla", arch=arch,
+            role="third_party_kernel", graph_motif="mixed_quant_sparse_flash_mla_dsl",
+            track="unmerged_pr", mech_id="mqsmla_dsl_544_320",
+            dtype_tuple=dsl_in,
+            outputs=dsl_out,
+            shape=mqs_shape,
+            repo_key="ops-transformer",
+            rel_path="attention/mixed_quant_sparse_flash_mla/op_dsl/mixed_quant_sparse_flash_mla.py",
+            cann_ref="ops-transformer/attention/mixed_quant_sparse_flash_mla/op_dsl/mixed_quant_sparse_flash_mla.py:4094",
+            kernels=("mixed_quant_sparse_flash_mla_dsl",) if is_a5 else (),
+            note="A5 TileLang DSL MQSMLA (544B FP8 window + 320B FP4 compressed KV; unmerged_pr track requiring ManifestBinding)",
+            observed_kernels=observed,
+        ),
+    ]
+
+
+def _mindie_sd_diffusion_entries(
+    arch: str, repos: dict[str, RepoHandle], observed: set[str],
+) -> list[ProbedAbiEntry]:
+    is_a5 = arch == "A5"
+    p_low = arch.lower()
+    bf16_qkv = ("query:bf16:ND:dense::none", "key:bf16:ND:dense::none", "value:bf16:ND:dense::none")
+    fp16_qkv = ("query:fp16:ND:dense::none", "key:fp16:ND:dense::none", "value:fp16:ND:dense::none")
+    eqbsa_in = tuple(
+        (
+            "query:int8:ND:per_token_int8::fp32",
+            "key:int8:ND:per_token_int8::fp32",
+            v_spec,
+            f"blockSparseMask:{m_dt}:ND:none::none",
+        )
+        for m_dt in ("int8", "int32", "bool")
+        for v_spec in ("value:int8:ND:per_token_int8::fp32", "value:fp8_e4m3fn:ND:per_token_fp8::fp32")
+        for _ in ("bf16", "fp16")
+    )
+    eqbsa_out = tuple(
+        (f"attentionOut:{o_dt}:ND",)
+        for _m in ("int8", "int32", "bool")
+        for _v in ("int8", "fp8_e4m3fn")
+        for o_dt in ("bf16", "fp16")
+    )
+    return [
+        _mk(
+            repos, entry_id=f"{p_low}_mindie_sd_rainfusion_bsa",
+            abi_id="RainFusionBlockSparseAttention", available=False,
+            backend="third_party_wheel", symbol="aclnnRainFusionAttention", arch=arch,
+            role="diffusion_attention", graph_motif="rainfusion_bsa",
+            dtype_tuple=(
+                (*bf16_qkv, "select_idx:int64:ND:none::none", "select_num_idx:int64:ND:none::none", "block_shape:int64:ND:none::none"),
+                (*fp16_qkv, "select_idx:int64:ND:none::none", "select_num_idx:int64:ND:none::none", "block_shape:int64:ND:none::none"),
+            ),
+            outputs=(("attention_out:bf16:ND",), ("attention_out:fp16:ND",)),
+            repo_key="mindie-sd", rel_path="csrc/plugin/rainfusionattention.cpp",
+            kernels=(),
+            note="MindIE-SD plugin wrapper (aclnnRainFusionAttention, int64 indices per rain_fusion_attention_def.cpp:31); unprobed in baseline container",
+            observed_kernels=observed,
+        ),
+        _mk(
+            repos, entry_id=f"{p_low}_mindie_sd_ada_bsa",
+            abi_id="AdaBlockSparseAttention", available=not is_a5,
+            backend="third_party_wheel", symbol="aclnnAdaBlockSparseAttention", arch=arch,
+            role="diffusion_attention", graph_motif="ada_bsa",
+            dtype_tuple=(
+                bf16_qkv, fp16_qkv,
+                ("query:int8:ND:per_token_int8::fp32", "key:int8:ND:per_token_int8::fp32", "value:int8:ND:per_token_int8::fp32"),
+                ("query:int8:ND:per_token_int8::fp32", "key:int8:ND:per_token_int8::fp32", "value:int8:ND:per_token_int8::fp32"),
+            ),
+            outputs=(("attention_out:bf16:ND",), ("attention_out:fp16:ND",), ("attention_out:fp16:ND",), ("attention_out:int8:ND",)),
+            repo_key="mindie-sd",
+            rel_path="csrc/ops/ada_block_sparse_attention/op_host/ada_block_sparse_attention_def.cpp",
+            kernels=("AdaBlockSparseAttention",) if not is_a5 else (),
+            note="MindIE-SD AdaBlockSparseAttention (AddConfig ascend910b/93 ONLY; all-INT8 QKV outputs fp16/int8 per def.cpp:121)",
+            observed_kernels=observed,
+        ),
+        _mk(
+            repos, entry_id=f"{p_low}_mindie_sd_eagle_bsa",
+            abi_id="EagleBlockSparseAttention", available=not is_a5,
+            backend="third_party_wheel", symbol="aclnnEagleBlockSparseAttention", arch=arch,
+            role="diffusion_attention", graph_motif="eagle_bsa",
+            dtype_tuple=(
+                (*bf16_qkv, "blockSparseMask:int8:ND:none::none"),
+                (*fp16_qkv, "blockSparseMask:int8:ND:none::none"),
+            ),
+            outputs=(("attentionOut:bf16:ND",), ("attentionOut:fp16:ND",)),
+            repo_key="mindie-sd",
+            rel_path="csrc/ops/eagle_block_sparse_attention/op_host/eagle_block_sparse_attention_def.cpp",
+            kernels=("EagleBlockSparseAttention",) if not is_a5 else (),
+            note="MindIE-SD EagleBlockSparseAttention (AddConfig ascend910b/93 ONLY; requires blockSparseMask:int8 per tiling.cpp:710)",
+            observed_kernels=observed,
+        ),
+        _mk(
+            repos, entry_id=f"{p_low}_mindie_sd_eagle_quant_bsa",
+            abi_id="EagleQuantBlockSparseAttention", available=is_a5,
+            backend="third_party_wheel", symbol="aclnnEagleQuantBlockSparseAttention", arch=arch,
+            role="diffusion_attention", graph_motif="eagle_quant_bsa",
+            dtype_tuple=eqbsa_in,
+            outputs=eqbsa_out,
+            repo_key="mindie-sd",
+            rel_path="csrc/ops/eagle_quant_block_sparse_attention/op_host/eagle_quant_block_sparse_attention_def.cpp",
+            kernels=("EagleQuantBlockSparseAttention",) if is_a5 else (),
+            note="MindIE-SD EagleQuantBlockSparseAttention (AddConfig ascend950 ONLY; requires INT8 Q/K + blockSparseMask per tiling.cpp:202,443)",
+            observed_kernels=observed,
+        ),
+        _mk(
+            repos, entry_id=f"{p_low}_mindie_sd_adalayernorm_fused",
+            abi_id="AdaLayerNormFused", available=False,
+            backend="third_party_wheel", symbol="aclnnAdaLayerNormV2", arch=arch,
+            role="diffusion_norm", graph_motif="adalayernorm_fused",
+            dtype_tuple=(
+                ("x:bf16:ND:dense::none", "scale:bf16:ND:dense::none", "shift:bf16:ND:dense::none"),
+                ("x:fp16:ND:dense::none", "scale:fp16:ND:dense::none", "shift:fp16:ND:dense::none"),
+            ),
+            outputs=(
+                ("y:bf16:ND", "mean:bf16:ND", "rstd:bf16:ND"),
+                ("y:fp16:ND", "mean:fp16:ND", "rstd:fp16:ND"),
+            ),
+            repo_key="mindie-sd", rel_path="csrc/plugin/adalayernorm.cpp",
+            kernels=(),
+            note="MindIE-SD plugin wrapper (aclnnAdaLayerNorm/V2; mean/rstd match x dtype per adalayernorm.cpp:77); unprobed in baseline container",
+            observed_kernels=observed,
+        ),
+        _mk(
+            repos, entry_id=f"{p_low}_mindie_sd_rms_norm_rope_concat",
+            abi_id="RmsNormRopeConcatFused", available=True,
+            backend="third_party_wheel", symbol="aclnnNormRopeConcat", arch=arch,
+            role="diffusion_norm", graph_motif="norm_rope_concat",
+            dtype_tuple=(
+                bf16_qkv, fp16_qkv,
+                ("query:fp32:ND:dense::none", "key:fp32:ND:dense::none", "value:fp32:ND:dense::none"),
+            ),
+            outputs=(
+                ("query_output:bf16:ND", "key_output:bf16:ND", "value_output:bf16:ND"),
+                ("query_output:fp16:ND", "key_output:fp16:ND", "value_output:fp16:ND"),
+                ("query_output:fp32:ND", "key_output:fp32:ND", "value_output:fp32:ND"),
+            ),
+            repo_key="mindie-sd",
+            rel_path="csrc/ops/norm_rope_concat/op_host/norm_rope_concat_def.cpp",
+            kernels=("NormRopeConcat",),
+            note="MindIE-SD NormRopeConcat (AddConfig ascend910b/93/950; requires 4D [B,S,N,D] with num_q_heads == num_kv_heads)",
+            observed_kernels=observed,
+        ),
+        _mk(
+            repos, entry_id=f"{p_low}_mindie_sd_laurel_residual",
+            abi_id="LaurelLowRankResidual", available=False,
+            backend="third_party_wheel", symbol="LaurelLowRankResidual", arch=arch,
+            role="residual_mixer", graph_motif="laurel_low_rank_residual",
+            dtype_tuple=(("x:bf16:ND:dense::none", "w_down:bf16:ND:dense::none", "w_up:bf16:ND:dense::none"),),
+            outputs=(("y:bf16:ND",),),
+            repo_key="mindie-sd", rel_path="csrc/plugin/register_ops.cpp",
+            kernels=(),
+            note="Composite residual; no native MindIE-SD wheel operator (lowered via matmul+add)",
+            observed_kernels=observed,
+        ),
+        _mk(
+            repos, entry_id=f"{p_low}_mindie_sd_quant_four_over_six_a5",
+            abi_id="QuantFourOverSixA5", available=is_a5,
+            backend="third_party_wheel", symbol="aclnnQuantFourOverSixA5V2", arch=arch,
+            role="norm_quant", graph_motif="quant_four_over_six_a5",
+            dtype_tuple=(
+                ("x:bf16:ND:dense::none",),
+                ("x:bf16:ND:dense::none",),
+            ),
+            outputs=(
+                ("y:fp4_e2m1:ND:mx_fp4:32:fp8_e8m0", "mxscale:fp8_e8m0:ND"),
+                ("y:uint8:ND:mx_fp4:32:fp8_e8m0", "mxscale:fp8_e8m0:ND"),
+            ),
+            shape=AbiShapeConstraints(
+                rank_range=QUANT_46_RANK_RANGE,
+                last_axis_divisibility=QUANT_46_LAST_AXIS_DIV,
+            ),
+            repo_key="mindie-sd",
+            rel_path="csrc/ops/quant_four_over_six_a5/op_host/quant_four_over_six_a5_def.cpp",
+            kernels=("QuantFourOverSixA5",) if is_a5 else (),
+            note="MindIE-SD A5-only 4/6 adaptive MXFP4 quant (AddConfig ascend950; BF16 rank 1..7, last dim % 32 == 0 -> fp4_e2m1/uint8 + fp8_e8m0)",
+            observed_kernels=observed,
+        ),
+        _mk(
+            repos, entry_id=f"{p_low}_mindie_sd_eagle_ffn",
+            abi_id="CatlassMatmulAddFfn", available=is_a5,
+            backend="third_party_wheel", symbol="aclnnEagleFfnV2", arch=arch,
+            role="fused_ffn", graph_motif="eagle_ffn",
+            dtype_tuple=(
+                ("x:bf16:ND:dense::none", "weight1:bf16:ND:dense::none", "weight2:bf16:ND:dense::none"),
+                ("x:fp16:ND:dense::none", "weight1:fp16:ND:dense::none", "weight2:fp16:ND:dense::none"),
+            ),
+            outputs=(("y:bf16:ND",), ("y:fp16:ND",)),
+            activations=frozenset({"gelu", "silu", "swiglu"}),
+            repo_key="mindie-sd",
+            rel_path="csrc/ops/eagle_ffn/op_host/eagle_ffn_def.cpp",
+            kernels=("EagleFfn",) if is_a5 else (),
+            note="MindIE-SD A5-only fused EagleFfn (AddConfig ascend950; decomposed linear->act->linear on A2/A3)",
+            observed_kernels=observed,
+        ),
+    ]
+
+
+def _z_wire_extra_entries(
+    arch: str, repos: dict[str, RepoHandle], observed: set[str],
+) -> list[ProbedAbiEntry]:
+    p_low = arch.lower()
+    return [
+        _mk(
+            repos, entry_id=f"{p_low}_cann_inplace_partial_rotary_mul",
+            abi_id="InplacePartialRotaryMul", available=True,
+            backend="cann_aclnn", symbol="aclnnInplacePartialRotaryMul", arch=arch,
+            role="attention", graph_motif="v41_partial_rotary",
+            dtype_tuple=(
+                ("x:fp16:ND:dense::none", "cos:fp16:ND:dense::none", "sin:fp16:ND:dense::none"),
+                ("x:fp32:ND:dense::none", "cos:fp32:ND:dense::none", "sin:fp32:ND:dense::none"),
+                ("x:bf16:ND:dense::none", "cos:bf16:ND:dense::none", "sin:bf16:ND:dense::none"),
+                ("x:fp16:ND:dense::none", "cos:fp32:ND:dense::none", "sin:fp32:ND:dense::none"),
+                ("x:bf16:ND:dense::none", "cos:fp32:ND:dense::none", "sin:fp32:ND:dense::none"),
+            ),
+            outputs=(
+                ("x:fp16:ND",), ("x:fp32:ND",), ("x:bf16:ND",), ("x:fp16:ND",), ("x:bf16:ND",),
+            ),
+            repo_key="cann-recipes-infer",
+            rel_path="ops/ascendc/src/inplace_partial_rotary_mul/op_host/inplace_partial_rotary_mul_def.cpp",
+            cann_ref="cann-recipes-infer/ops/ascendc/src/inplace_partial_rotary_mul/op_host/inplace_partial_rotary_mul_def.cpp:22",
+            kernels=("InplacePartialRotaryMul",),
+            note="Shipping CANN InplacePartialRotaryMul across A2/A3/A5 (AddConfig ascend910b/93/950; backs v41_partial_rotary)",
+            observed_kernels=observed,
+        ),
+        _mk(
+            repos, entry_id=f"{p_low}_cann_kv_compress_epilog",
+            abi_id="aclnnKvCompressEpilog", available=True,
+            backend="cann_aclnn", symbol="aclnnKvCompressEpilog", arch=arch,
+            role="compressor", graph_motif="kv_compress_epilog",
+            dtype_tuple=(
+                ("cache:uint8:ND:none::none", "x:bf16:ND:dense::none", "slot_mapping:int32:ND:none::none"),
+                ("cache:uint8:ND:none::none", "x:bf16:ND:dense::none", "slot_mapping:int64:ND:none::none"),
+            ),
+            outputs=(("cache:uint8:ND",), ("cache:uint8:ND",)),
+            repo_key="ops-transformer",
+            rel_path="attention/kv_compress_epilog/op_host/kv_compress_epilog_def.cpp",
+            cann_ref="ops-transformer/attention/kv_compress_epilog/op_host/kv_compress_epilog_def.cpp:24",
+            kernels=("KvCompressEpilog",),
+            note="Shipping CANN KvCompressEpilog across A2/A3/A5 (AddConfig ascend910b/93/950; uint8 cache + bf16 x + int32/int64 slot_mapping)",
+            observed_kernels=observed,
+        ),
+    ]
+
+
 def build_snapshot(
     arch: str, repos: dict[str, RepoHandle], observed: set[str],
 ) -> AbiCatalogSnapshot:
@@ -2522,6 +3057,9 @@ def build_snapshot(
         + _vllm_ascend_csrc_entries(arch, repos, observed)
         + _triton_and_other_non_cann_entries(arch, repos, observed)
         + _torch_npu_catlass_and_wheel_entries(arch, repos, observed)
+        + _mqsmla_entries(arch, repos, observed)
+        + _mindie_sd_diffusion_entries(arch, repos, observed)
+        + _z_wire_extra_entries(arch, repos, observed)
     )
     return AbiCatalogSnapshot(
         device_arch=arch,  # type: ignore[arg-type]
@@ -2819,22 +3357,27 @@ def _self_test_catalogs(snapshots: dict[str, AbiCatalogSnapshot]) -> None:
     # 6. aclnnTextGatedResidual: requires 3 inputs (x, w_down, w_up) -> mixed; rejects unary.
     assert reg.verify(_q("A5", "aclnnTextGatedResidual", "text_gated_residual", (p("x", "bf16", (2, 8, 64)), p("w_down", "bf16", (16, 64)), p("w_up", "bf16", (64, 16))), (p("mixed", "bf16", (2, 8, 16)),))).status == "admitted_shipping"
     assert reg.verify(_q("A5", "aclnnTextGatedResidual", "text_gated_residual", (p("x", "bf16"),), (p("y", "bf16"),))).status == "rejected_abi"
-    # 7. A5 MlaPrologV3 requires all 11 inputs and BF16 native weights (rejects 2-arg and FP16).
+    # 7. A5 MlaPrologV3 requires all 11 inputs, BF16 ND 3D weight_uk, 3D/4D kv_cache_ref, and (T,N,Hckv) query_out.
     prolog_bf16_in = (
         p("token_x", "bf16", (16, 7168)), p("weight_dq", "bf16", (7168, 1536), layout="FRACTAL_NZ"),
-        p("weight_uq_qr", "bf16", (1536, 1536), layout="FRACTAL_NZ"), p("weight_uk", "bf16", (128, 512), layout="FRACTAL_NZ"),
+        p("weight_uq_qr", "bf16", (1536, 1536), layout="FRACTAL_NZ"), p("weight_uk", "bf16", (128, 128, 512), layout="ND"),
         p("weight_dkv_kr", "bf16", (7168, 576), layout="FRACTAL_NZ"), p("rmsnorm_gamma_cq", "bf16", (1536,)),
         p("rmsnorm_gamma_ckv", "bf16", (512,)), p("rope_sin", "bf16", (16, 64)), p("rope_cos", "bf16", (16, 64)),
-        p("kv_cache_ref", "bf16", (64, 512)), p("kr_cache_ref", "bf16", (64, 64)),
+        p("kv_cache_ref", "bf16", (64, 64, 1, 512)), p("kr_cache_ref", "bf16", (64, 64, 1, 64)),
     )
-    prolog_bf16_out = (p("query_out", "bf16"), p("query_rope_out", "bf16"), p("query_norm_out", "bf16"), p("dequant_scale_q_norm_out", "fp32"))
+    prolog_bf16_out = (p("query_out", "bf16", (16, 128, 512)), p("query_rope_out", "bf16", (16, 128, 64)), p("query_norm_out", "bf16", (16, 1536)), p("dequant_scale_q_norm_out", "fp32", (16,)))
     assert reg.verify(_q("A5", "aclnnMlaPrologV3WeightNz", "mla_prolog", prolog_bf16_in, prolog_bf16_out)).status == "admitted_shipping"
     assert reg.verify(_q("A5", "aclnnMlaPrologV3WeightNz", "mla_prolog", (p("x", "bf16", (16, 7168)), p("w_dq", "bf16", (7168, 1536), layout="FRACTAL_NZ")), (p("q_nope", "bf16"), p("q_rope", "bf16")))).status == "rejected_abi"
-    # 8. torch_npu.npu_moe_gating_top_k: bias optional (1D expert_num when present); 2D bias rejected.
+    prolog_nz_uk = (*prolog_bf16_in[:3], p("weight_uk", "bf16", (128, 128, 512), layout="FRACTAL_NZ"), *prolog_bf16_in[4:])
+    assert reg.verify(_q("A5", "aclnnMlaPrologV3WeightNz", "mla_prolog", prolog_nz_uk, prolog_bf16_out)).status == "rejected_abi"
+    prolog_2d_kv = (*prolog_bf16_in[:9], p("kv_cache_ref", "bf16", (64, 512)), prolog_bf16_in[10])
+    assert reg.verify(_q("A5", "aclnnMlaPrologV3WeightNz", "mla_prolog", prolog_2d_kv, prolog_bf16_out)).status == "rejected_abi"
+    # 8. torch_npu.npu_moe_gating_top_k & aclnnMoeGatingTopK: bias optional (1D), max_experts=2048.
     gating_out = (p("y", "bf16"), p("expert_idx", "int32"), p("out", "fp32"))
     assert reg.verify(_q("A5", "torch_npu.npu_moe_gating_top_k", "moe_routing", (p("x", "bf16", (4, 128)),), gating_out)).status == "admitted_shipping"
     assert reg.verify(_q("A5", "torch_npu.npu_moe_gating_top_k", "moe_routing", (p("x", "bf16", (4, 128)), p("bias", "bf16", (128,))), gating_out)).status == "admitted_shipping"
     assert reg.verify(_q("A5", "torch_npu.npu_moe_gating_top_k", "moe_routing", (p("x", "bf16", (4, 128)), p("bias", "bf16", (4, 128))), gating_out)).status == "rejected_abi"
+    assert reg.verify(_q("A5", "aclnnMoeGatingTopK", "moe_gating_top_k", (p("x", "bf16", (8, 4096)),), gating_out)).status == "rejected_abi"
     # 9. SparseFlashMla: BF16 ONLY (rejects FP16).
     assert reg.verify(_q("A5", "SparseFlashMla", "sparse_flash_mla", (p("q", "bf16"), p("ori_kv", "bf16")), (p("attn_out", "bf16"),))).status == "admitted_shipping"
     assert reg.verify(_q("A5", "SparseFlashMla", "sparse_flash_mla", (p("q", "fp16"), p("ori_kv", "fp16")), (p("attn_out", "fp16"),))).status == "rejected_abi"
@@ -2845,6 +3388,34 @@ def _self_test_catalogs(snapshots: dict[str, AbiCatalogSnapshot]) -> None:
     irs_in = (p("query", "bf16"), p("weights", "bf16"), p("key_summary", "bf16"), p("actual_kv_lengths", "int32", qm="none"), p("block_table", "int32", qm="none"), p("cu_seq_lens", "int32", qm="none"))
     assert reg.verify(_q("A5", "IndexerRegionScore", "region_index_score", irs_in, (p("output", "fp32"), p("selected_region_ids", "int32")))).status == "admitted_shipping"
     assert reg.verify(_q("A5", "IndexerRegionScore", "region_index_score", (p("query", "bf16"), p("key_summary", "bf16")), (p("output", "fp32"),))).status == "rejected_abi"
+    # 12. TransposeBatchMatMul: both CANN and torch_npu reject 2D and admit rank-3 perm_y=(1,0,2).
+    for tbmm_id in ("aclnnTransposeBatchMatMul", "torch_npu.npu_transpose_batchmatmul"):
+        assert reg.verify(_q("A5", tbmm_id, "transpose_batchmatmul", (p("x1", "bf16", (32, 128)), p("x2", "bf16", (128, 64))), (p("y", "bf16", (32, 64)),))).status == "rejected_abi"
+        assert reg.verify(_q("A5", tbmm_id, "transpose_batchmatmul", (p("x1", "bf16", (8, 32, 128)), p("x2", "bf16", (8, 128, 64))), (p("y", "bf16", (32, 8, 64)),))).status == "admitted_shipping"
+    # 13. Standalone HCCL collective output-shape conservation (AllGather / ReduceScatter).
+    assert reg.verify(_q("A5", "hcom_allGather", "hcom_allGather", (p("x", "bf16", (16, 4096)),), (p("y", "bf16", (16, 4096)),), ws=8, placement="ub_ccu_intramachine")).status == "rejected_abi"
+    assert reg.verify(_q("A5", "hcom_allGather", "hcom_allGather", (p("x", "bf16", (16, 4096)),), (p("y", "bf16", (128, 4096)),), ws=8, placement="ub_ccu_intramachine")).status == "admitted_shipping"
+    # 14. A5 aclnnMixedQuantSparseFlashMla full positional PA_BBND CSA admitted; 2-arg draft rejected; A3 rejected.
+    mqs_p = lambda role, dt, shape, layout="ND", qm="none", gs=(1,), sd="none": OperandPortSig(
+        role=role, dtype=dt, layout=layout, transposed=False, shape=shape,
+        quant_mode=qm, group_shape=gs, scale_dtype=sd, scale_shape=(),
+    )
+    mqs_csa_in = (
+        mqs_p("q", "bf16", (2, 1, 64, 512), qm="dense"),
+        mqs_p("ori_kv", "fp8_e4m3fn", (32, 64, 1, 608), layout="PA_BBND", qm="packed_kv_608", gs=(64,), sd="bf16"),
+        mqs_p("cmp_kv", "fp8_e4m3fn", (16, 64, 1, 608), layout="PA_BBND", qm="packed_kv_608", gs=(64,), sd="bf16"),
+        mqs_p("cmp_sparse_indices", "int32", (2, 1, 1, 512)),
+        mqs_p("ori_block_table", "int32", (2, 16)),
+        mqs_p("cmp_block_table", "int32", (2, 8)),
+        mqs_p("seqused_ori_kv", "int32", (2,)),
+        mqs_p("seqused_cmp_kv", "int32", (2,)),
+        mqs_p("sinks", "fp32", (64,), qm="dense"),
+        mqs_p("metadata", "int32", (2048,)),
+    )
+    mqs_out = (mqs_p("attn_out", "bf16", (2, 1, 64, 512), qm="dense"),)
+    assert reg.verify(_q("A5", "aclnnMixedQuantSparseFlashMla", "mixed_quant_sparse_flash_mla", mqs_csa_in, mqs_out)).status == "admitted_shipping"
+    assert reg.verify(_q("A5", "aclnnMixedQuantSparseFlashMla", "mixed_quant_sparse_flash_mla", mqs_csa_in[:2], mqs_out)).status == "rejected_abi"
+    assert reg.verify(_q("A3", "aclnnMixedQuantSparseFlashMla", "mixed_quant_sparse_flash_mla", mqs_csa_in, mqs_out)).status == "rejected_abi"
 
 
 def verify_sealed_dir(abi_dir: Path) -> dict[str, dict[str, Any]]:

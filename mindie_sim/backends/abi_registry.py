@@ -73,6 +73,72 @@ _MOE_ACT_AND_MUL_ABIS = frozenset({
 })
 _PORT_SPEC_FIELDS_MAX = 6
 _EVEN_DIVISOR = 2
+_PAIR_LEN = 2
+_SHAPE_CONSTRAINT_KEYS = frozenset({
+    "k_min",
+    "k_max_exclusive",
+    "n_max_inclusive",
+    "require_even_n",
+    "require_even_k_for_fp4",
+    "require_even_n_for_fp4_transb",
+    "require_m_divisible_by_ws",
+    "max_comm_bytes_formula",
+    "hidden_allowed_set",
+    "hidden_range",
+    "hidden_divisibility",
+    "inter_min",
+    "inter_max",
+    "inter_divisibility",
+    "topk_range",
+    "max_shared_experts_per_rank",
+    "head_dim_allowed_set",
+    "rope_dim_allowed_set",
+    "kv_heads_allowed_set",
+    "max_experts",
+    "required_layout_b",
+    "allow_ungated_activation",
+    "last_axis_divisibility",
+    "rank_range",
+})
+_PERM_3D_TABLE: dict[int, tuple[int, int, int]] = {
+    12: (0, 1, 2),
+    21: (0, 2, 1),
+    102: (1, 0, 2),
+    120: (1, 2, 0),
+    201: (2, 0, 1),
+    210: (2, 1, 0),
+}
+_DEFAULT_PERM_X: tuple[int, int, int] = (0, 1, 2)
+_TRANSPOSED_PERM_X: tuple[int, int, int] = (0, 2, 1)
+_DEFAULT_PERM_Y: tuple[int, int, int] = (1, 0, 2)
+_VALID_TBMM_PERM_X1 = frozenset({(0, 1, 2), (1, 0, 2), (0, 2, 1)})
+_VALID_TBMM_PERM_X2 = frozenset({(0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0)})
+_VALID_TBMM_PERM_Y = frozenset({(1, 0, 2), (0, 1, 2)})
+_TBMM_BATCH_CENTERED_X2 = frozenset({(1, 0, 2), (1, 2, 0)})
+_RANK_4D = 4
+_RANK_5D = 5
+_UINT32_MAX = (1 << 32) - 1
+_MX_BLOCK_SIZE = 32
+_MX_SCALE_ALIGN = 2
+_KV_COMPRESS_MIN_ARCH22 = 608
+_KV_COMPRESS_MIN_ARCH35 = 584
+_MQSMLA_QUANT_RECORD_DIMS: dict[str, int] = {
+    "packed_kv_608": 608,
+    "packed_kv_584": 584,
+    "int8_csa_608": 608,
+    "tq4_ori": 512,
+    "tq4_cmp": 258,
+}
+_REJECTION_PREFIX_PRIORITY: tuple[tuple[str, int], ...] = (
+    ("rejected_unmerged_pr:", 6),
+    ("rejected_missing_pass:", 6),
+    ("rejected_shape_or_align:", 5),
+    ("rejected_rank_domain:", 4),
+    ("rejected_dtype:bias_", 3),
+    ("rejected_dtype:activation=", 3),
+    ("rejected_dtype:output_tuple_mismatch:", 2),
+    ("rejected_dtype:operand_tuple_mismatch:", 1),
+)
 
 
 def _norm_dtype(dtype: str) -> str:
@@ -156,26 +222,70 @@ def _parse_source_ref(raw: Mapping[str, Any]) -> SourceRef:
     )
 
 
+def _req_bool(raw: Mapping[str, Any], key: str, default: bool | None = None) -> bool:
+    if key not in raw:
+        if default is None:
+            raise ModelingError(f"abi_bool_field_missing:{key}")
+        return default
+    val = raw[key]
+    if not isinstance(val, bool):
+        raise ModelingError(f"abi_bool_field_invalid:{key}:{val!r}")
+    return val
+
+
+def _parse_int_set(raw: Mapping[str, Any], key: str) -> frozenset[int]:
+    val = raw.get(key, ())
+    if isinstance(val, (str, bytes)) or not isinstance(val, (Sequence, set, frozenset)):
+        raise ModelingError(f"abi_shape_{key}_invalid:{val!r}")
+    items: list[int] = []
+    for item in val:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ModelingError(f"abi_shape_{key}_invalid:{item!r}")
+        items.append(item)
+    return frozenset(items)
+
+
+def _parse_int_pair(raw: Mapping[str, Any], key: str) -> tuple[int, int]:
+    val = raw.get(key, (0, 0))
+    if isinstance(val, (str, bytes)) or not isinstance(val, Sequence) or len(val) != _PAIR_LEN:
+        raise ModelingError(f"abi_shape_{key}_invalid:{val!r}")
+    a, b = val[0], val[1]
+    if isinstance(a, bool) or not isinstance(a, int) or isinstance(b, bool) or not isinstance(b, int):
+        raise ModelingError(f"abi_shape_{key}_invalid:{val!r}")
+    return (a, b)
+
+
 def _parse_shape_constraints(raw: Mapping[str, Any]) -> AbiShapeConstraints:
-    hr = raw.get("hidden_range", (0, 0))
-    tr = raw.get("topk_range", (0, 0))
+    if not isinstance(raw, Mapping):
+        raise ModelingError("abi_shape_constraints_mapping_required")
+    extra = sorted(set(raw) - _SHAPE_CONSTRAINT_KEYS)
+    if extra:
+        raise ModelingError(f"abi_shape_unknown_keys:{extra}")
     return AbiShapeConstraints(
-        k_min=int(raw.get("k_min", 0)),
-        k_max_exclusive=int(raw.get("k_max_exclusive", 0)),
-        n_max_inclusive=int(raw.get("n_max_inclusive", 0)),
-        require_even_n=bool(raw.get("require_even_n", False)),
-        require_even_k_for_fp4=bool(raw.get("require_even_k_for_fp4", False)),
-        require_even_n_for_fp4_transb=bool(raw.get("require_even_n_for_fp4_transb", False)),
-        require_m_divisible_by_ws=bool(raw.get("require_m_divisible_by_ws", False)),
+        k_min=raw.get("k_min", 0),
+        k_max_exclusive=raw.get("k_max_exclusive", 0),
+        n_max_inclusive=raw.get("n_max_inclusive", 0),
+        require_even_n=_req_bool(raw, "require_even_n", False),
+        require_even_k_for_fp4=_req_bool(raw, "require_even_k_for_fp4", False),
+        require_even_n_for_fp4_transb=_req_bool(raw, "require_even_n_for_fp4_transb", False),
+        require_m_divisible_by_ws=_req_bool(raw, "require_m_divisible_by_ws", False),
         max_comm_bytes_formula=str(raw.get("max_comm_bytes_formula", "none")),
-        hidden_allowed_set=frozenset(int(v) for v in raw.get("hidden_allowed_set", ())),
-        hidden_range=(int(hr[0]), int(hr[1])),
-        hidden_divisibility=int(raw.get("hidden_divisibility", 0)),
-        inter_min=int(raw.get("inter_min", 0)),
-        inter_max=int(raw.get("inter_max", 0)),
-        inter_divisibility=int(raw.get("inter_divisibility", 0)),
-        topk_range=(int(tr[0]), int(tr[1])),
-        max_shared_experts_per_rank=int(raw.get("max_shared_experts_per_rank", -1)),
+        hidden_allowed_set=_parse_int_set(raw, "hidden_allowed_set"),
+        hidden_range=_parse_int_pair(raw, "hidden_range"),
+        hidden_divisibility=raw.get("hidden_divisibility", 0),
+        inter_min=raw.get("inter_min", 0),
+        inter_max=raw.get("inter_max", 0),
+        inter_divisibility=raw.get("inter_divisibility", 0),
+        topk_range=_parse_int_pair(raw, "topk_range"),
+        max_shared_experts_per_rank=raw.get("max_shared_experts_per_rank", -1),
+        head_dim_allowed_set=_parse_int_set(raw, "head_dim_allowed_set"),
+        rope_dim_allowed_set=_parse_int_set(raw, "rope_dim_allowed_set"),
+        kv_heads_allowed_set=_parse_int_set(raw, "kv_heads_allowed_set"),
+        max_experts=raw.get("max_experts", 0),
+        required_layout_b=str(raw.get("required_layout_b", "")),
+        allow_ungated_activation=_req_bool(raw, "allow_ungated_activation", True),
+        last_axis_divisibility=raw.get("last_axis_divisibility", 0),
+        rank_range=_parse_int_pair(raw, "rank_range"),
     )
 
 
@@ -183,7 +293,7 @@ def _parse_entry(raw: Mapping[str, Any]) -> ProbedAbiEntry:
     return ProbedAbiEntry(
         entry_id=str(raw["entry_id"]),
         abi_id=str(raw["abi_id"]),
-        available_on_device=bool(raw["available_on_device"]),
+        available_on_device=_req_bool(raw, "available_on_device"),
         backend_kind=raw["backend_kind"],
         symbol_or_kernel=str(raw["symbol_or_kernel"]),
         device_arch=raw["device_arch"],
@@ -207,8 +317,9 @@ def _parse_entry(raw: Mapping[str, Any]) -> ProbedAbiEntry:
         allowed_world_sizes=frozenset(int(w) for w in raw.get("allowed_world_sizes", (1,))),
         allowed_activations=frozenset(str(a) for a in raw.get("allowed_activations", ("none",))),
         allowed_model_scopes=frozenset(raw.get("allowed_model_scopes", ("target", "draft"))),
-        allow_bias=bool(raw.get("allow_bias", True)),
-        require_no_bias=bool(raw.get("require_no_bias", False)),
+        allow_bias=_req_bool(raw, "allow_bias", True),
+        require_no_bias=_req_bool(raw, "require_no_bias", False),
+        require_bias=_req_bool(raw, "require_bias", False),
         probe_signature_sha256=str(raw.get("probe_signature_sha256", "")),
         probe_domain_note=str(raw.get("probe_domain_note", "")),
     )
@@ -342,6 +453,10 @@ def _matches_plain_dtype_tuple(
 
 _ACTIVATION_PORT_ROLES = ("x", "x1", "hidden_states")
 _WEIGHT_PORT_ROLES = ("weight1", "w", "x2", "weight")
+_HEAD_DIM_PORT_ROLES = ("q", "query", "x")
+_KV_HEAD_PORT_ROLES = ("ori_kv", "k_cache", "kv_cache", "key", "k", "kv", "window")
+_MOE_GATING_TOPK_IDS = frozenset({"torch_npu.npu_moe_gating_top_k", "aclnnMoeGatingTopK"})
+_MLA_PROLOG_WEIGHT_UK_IDS = frozenset({"aclnnMlaPrologV3WeightNz", "aclnnMlaPrologV4WeightNz"})
 
 
 def _resolve_port_by_roles(
@@ -368,12 +483,20 @@ def _extract_mkn(query: AbiQueryKey) -> tuple[int, int, int]:
     wt_port = _resolve_port_by_roles(query.operands, _WEIGHT_PORT_ROLES, 1, exclude=act_port)
     if act_port is not None:
         act_shape = act_port.shape
-        if len(act_shape) >= 2:
-            m_dim, k_dim = act_shape[0], act_shape[-1]
+        if len(act_shape) >= _RANK_2D:
+            if act_port.transposed:
+                m_dim, k_dim = act_shape[-1], act_shape[-2]
+            else:
+                m_dim, k_dim = act_shape[-2], act_shape[-1]
         elif len(act_shape) == 1:
             k_dim = act_shape[0]
-    if wt_port is not None and len(wt_port.shape) >= 2:
-        n_dim = wt_port.shape[-2] if wt_port.transposed else wt_port.shape[-1]
+    if wt_port is not None and len(wt_port.shape) >= _RANK_2D:
+        if wt_port.layout.startswith("FRACTAL_NZ") and len(wt_port.shape) == _RANK_5D:
+            n_dim = wt_port.shape[1] * wt_port.shape[_RANK_4D]
+        elif wt_port.layout.startswith("FRACTAL_NZ") and len(wt_port.shape) == _RANK_4D:
+            n_dim = wt_port.shape[0] * wt_port.shape[_RANK_3D]
+        else:
+            n_dim = wt_port.shape[-2] if wt_port.transposed else wt_port.shape[-1]
     elif query.outputs and query.outputs[0].shape:
         n_dim = query.outputs[0].shape[-1]
     return m_dim, k_dim, n_dim
@@ -381,7 +504,7 @@ def _extract_mkn(query: AbiQueryKey) -> tuple[int, int, int]:
 
 _ALLGATHER_MM_IDS = frozenset({"aclnnAllGatherMatmulV2", "aclnnAllGatherMatmul"})
 _MMRS_IDS = frozenset({"aclnnMatmulReduceScatterV2", "aclnnMatmulReduceScatter"})
-_BATCH_3D_MM_IDS = frozenset({"torch_npu.npu_transpose_batchmatmul"})
+_BATCH_3D_MM_IDS = frozenset({"torch_npu.npu_transpose_batchmatmul", "aclnnTransposeBatchMatMul"})
 _STRICT_2D_MATMUL_ROLES = frozenset({"collective_gemm"})
 _NO_TRANSA_ROLES = frozenset({"collective_gemm", "moe_grouped_matmul", "catlass_template"})
 _RANK_2D = 2
@@ -419,18 +542,83 @@ def _allow_empty_matmul_mn(entry: ProbedAbiEntry, a_dtype: str, b_dtype: str) ->
     return False
 
 
+def _decode_perm_3d(
+    params: Mapping[str, float],
+    key: str,
+    default: tuple[int, int, int],
+) -> tuple[int, int, int] | None:
+    if key not in params:
+        return default
+    raw = params[key]
+    if raw != int(raw):
+        return None
+    return _PERM_3D_TABLE.get(int(raw))
+
+
+def _check_transpose_batch_matmul_equations(
+    entry: ProbedAbiEntry, query: AbiQueryKey,
+) -> str | None:
+    """Enforce rank-3 perm, arch, bias, batch_split_factor, and output equations for TransposeBatchMatMul."""
+    a_port, b_port = query.operands[0], query.operands[1]
+    if len(a_port.shape) != _RANK_3D:
+        return f"rejected_shape_or_align:x1_rank_invalid:{len(a_port.shape)}D_not_in_[{_RANK_3D}]"
+    if len(b_port.shape) != _RANK_3D:
+        return f"rejected_shape_or_align:x2_rank_invalid:{len(b_port.shape)}D_not_in_[{_RANK_3D}]"
+    params = dict(query.activation_params)
+    px1 = _decode_perm_3d(params, "perm_x1", _TRANSPOSED_PERM_X if a_port.transposed else _DEFAULT_PERM_X)
+    px2 = _decode_perm_3d(params, "perm_x2", _TRANSPOSED_PERM_X if b_port.transposed else _DEFAULT_PERM_X)
+    py = _decode_perm_3d(params, "perm_y", _DEFAULT_PERM_Y)
+    if px1 not in _VALID_TBMM_PERM_X1 or px2 not in _VALID_TBMM_PERM_X2 or py not in _VALID_TBMM_PERM_Y:
+        return f"rejected_shape_or_align:tbmm_perm_invalid:{entry.abi_id}:px1={px1},px2={px2},py={py}"
+    raw_split = params.get("batch_split_factor", 1.0)
+    if raw_split < 1 or raw_split != int(raw_split):
+        return f"rejected_shape_or_align:tbmm_split_invalid:{raw_split}"
+    split = int(raw_split)
+    is_batch_first_y = py == _DEFAULT_PERM_X
+    if is_batch_first_y and (entry.device_arch != "A5" or split > 1):
+        return f"rejected_shape_or_align:tbmm_bmn_requires_a5_no_split:{entry.device_arch}:split={split}"
+    if (px1 == _TRANSPOSED_PERM_X or px2 in _TBMM_BATCH_CENTERED_X2) and (entry.device_arch != "A5" or not is_batch_first_y):
+        return f"rejected_shape_or_align:tbmm_transa_or_bcentered_requires_a5_bmn:{entry.device_arch}"
+    if query.has_bias and (entry.device_arch != "A5" or split > 1):
+        return f"rejected_dtype:tbmm_bias_requires_a5_no_split:{entry.device_arch}:split={split}"
+    a_b, a_m, a_k = a_port.shape[px1[0]], a_port.shape[px1[1]], a_port.shape[px1[2]]
+    b_b, b_k, b_n = b_port.shape[px2[0]], b_port.shape[px2[1]], b_port.shape[px2[2]]
+    if a_b <= 0 or a_m <= 0 or a_k <= 0 or b_n <= 0:
+        return f"rejected_shape_or_align:empty_tensor_unsupported:{entry.abi_id}:b={a_b},m={a_m},k={a_k},n={b_n}"
+    if a_b != b_b:
+        return f"rejected_shape_or_align:tbmm_batch_mismatch:a_b={a_b}!=b_b={b_b}"
+    if a_k != b_k:
+        return f"rejected_shape_or_align:matmul_k_mismatch:a_k={a_k}!=b_k={b_k}"
+    if split > 1 and (a_b * b_n) % split != 0:
+        return f"rejected_shape_or_align:tbmm_split_indivisible:b*n={a_b * b_n}%split={split}"
+    if not query.outputs:
+        return None
+    out_shape = query.outputs[0].shape
+    if len(out_shape) != _RANK_3D:
+        return f"rejected_shape_or_align:out_rank_invalid:{len(out_shape)}D_not_in_[{_RANK_3D}]"
+    if split > 1:
+        expected_out = (split, a_m, (a_b * b_n) // split)
+    else:
+        logical_out = (a_b, a_m, b_n)
+        expected_out = (logical_out[py[0]], logical_out[py[1]], logical_out[py[2]])
+    if out_shape != expected_out:
+        return f"rejected_shape_or_align:tbmm_out_shape_mismatch:{out_shape}!={expected_out}"
+    return None
+
+
 def _check_matmul_shape_equations(entry: ProbedAbiEntry, query: AbiQueryKey) -> str | None:
     """Enforce rank, transpose, empty-tensor, INT32 bounds, K, and output (M, N) matmul equations."""
-    if entry.role not in _MATMUL_ROLES or len(query.operands) < 2:
+    if entry.role not in _MATMUL_ROLES or len(query.operands) < _RANK_2D:
         return None
+    if entry.abi_id in _BATCH_3D_MM_IDS:
+        return _check_transpose_batch_matmul_equations(entry, query)
     a_port, b_port = query.operands[0], query.operands[1]
     if entry.role in _NO_TRANSA_ROLES and a_port.transposed:
         return f"rejected_shape_or_align:transposed_x1_unsupported:{entry.abi_id}"
 
-    is_batch_3d = entry.abi_id in _BATCH_3D_MM_IDS
     strict_a_roles = _STRICT_2D_MATMUL_ROLES | {"moe_grouped_matmul", "catlass_template"}
-    allowed_a_ranks = {_RANK_3D} if is_batch_3d else ({_RANK_2D} if entry.role in strict_a_roles else {_RANK_2D, _RANK_3D})
-    allowed_b_ranks = {_RANK_3D} if is_batch_3d else ({_RANK_2D} if entry.role in _STRICT_2D_MATMUL_ROLES else {_RANK_2D, _RANK_3D})
+    allowed_a_ranks = {_RANK_2D} if entry.role in strict_a_roles else {_RANK_2D, _RANK_3D}
+    allowed_b_ranks = {_RANK_2D} if entry.role in _STRICT_2D_MATMUL_ROLES else {_RANK_2D, _RANK_3D}
     # Reject 0-D scalars (shape == ()) and any unsupported operand rank unconditionally.
     if len(a_port.shape) not in allowed_a_ranks:
         return f"rejected_shape_or_align:x1_rank_invalid:{len(a_port.shape)}D_not_in_{sorted(allowed_a_ranks)}"
@@ -453,7 +641,7 @@ def _check_matmul_shape_equations(entry: ProbedAbiEntry, query: AbiQueryKey) -> 
     if not query.outputs:
         return None
     out_shape = query.outputs[0].shape
-    allowed_out_ranks = {_RANK_3D} if is_batch_3d else ({_RANK_2D} if entry.role in strict_a_roles else {_RANK_2D, _RANK_3D})
+    allowed_out_ranks = {_RANK_2D} if entry.role in strict_a_roles else {_RANK_2D, _RANK_3D}
     if len(out_shape) not in allowed_out_ranks:
         return f"rejected_shape_or_align:out_rank_invalid:{len(out_shape)}D_not_in_{sorted(allowed_out_ranks)}"
     out_m, out_n = out_shape[-2], out_shape[-1]
@@ -464,7 +652,7 @@ def _check_matmul_shape_equations(entry: ProbedAbiEntry, query: AbiQueryKey) -> 
         expected_m = a_m * ws
         if out_m != expected_m or out_m > _INT32_MAX:
             return f"rejected_shape_or_align:agmm_out_m_mismatch:out_m={out_m}!=x1_m*ws={expected_m}"
-        if len(query.outputs) >= 2:
+        if len(query.outputs) >= _RANK_2D:
             g_shape = query.outputs[1].shape
             if len(g_shape) != _RANK_2D or g_shape != (expected_m, a_k):
                 return f"rejected_shape_or_align:agmm_gather_out_mismatch:{g_shape}!={(expected_m, a_k)}"
@@ -476,6 +664,32 @@ def _check_matmul_shape_equations(entry: ProbedAbiEntry, query: AbiQueryKey) -> 
             return f"rejected_shape_or_align:mmrs_out_m_mismatch:out_m={out_m}!=x1_m/ws={expected_m}"
     elif out_m != a_m:
         return f"rejected_shape_or_align:matmul_m_mismatch:out_m={out_m}!=a_m={a_m}"
+    return None
+
+
+def _check_collective_shape_equations(entry: ProbedAbiEntry, query: AbiQueryKey) -> str | None:
+    """Enforce standalone HCCL collective input/output world-size shape conservation."""
+    if entry.role != "collective" or not query.operands or not query.outputs:
+        return None
+    in_shape = query.operands[0].shape
+    out_shape = query.outputs[0].shape
+    if not in_shape or not out_shape:
+        return f"rejected_shape_or_align:collective_scalar_unsupported:{entry.abi_id}"
+    ws = max(1, int(query.world_size))
+    if entry.abi_id == "hcom_allGather":
+        valid_outs = {(in_shape[0] * ws, *in_shape[1:]), (ws, *in_shape)}
+        if out_shape not in valid_outs:
+            return f"rejected_shape_or_align:allgather_out_shape_mismatch:{out_shape}_not_in_{sorted(valid_outs)}"
+    elif entry.abi_id == "hcom_reduceScatter":
+        valid_ins = {(out_shape[0] * ws, *out_shape[1:]), (ws, *out_shape)}
+        if in_shape not in valid_ins:
+            return f"rejected_shape_or_align:reducescatter_shape_mismatch:{in_shape}_vs_{out_shape}_ws={ws}"
+    elif entry.abi_id in {"hcom_allReduce", "hcom_alltoall"}:
+        if out_shape != in_shape:
+            return f"rejected_shape_or_align:collective_shape_mismatch:{out_shape}!={in_shape}"
+    elif entry.abi_id == "hcom_alltoallv":
+        if len(out_shape) != len(in_shape) or out_shape[1:] != in_shape[1:]:
+            return f"rejected_shape_or_align:alltoallv_trailing_shape_mismatch:{out_shape}_vs_{in_shape}"
     return None
 
 
@@ -506,26 +720,197 @@ def _check_comm_bytes_cap(entry: ProbedAbiEntry, query: AbiQueryKey, m_dim: int,
 
 def _check_op_specific_shapes(entry: ProbedAbiEntry, query: AbiQueryKey) -> str | None:
     """Enforce operator-specific rank/shape invariants grounded in C++ CheckParams."""
-    if entry.abi_id == "torch_npu.npu_moe_gating_top_k" and query.operands:
+    if entry.abi_id in _MOE_GATING_TOPK_IDS and query.operands:
         x_shape = query.operands[0].shape
         if len(x_shape) != _RANK_2D:
             return f"rejected_shape_or_align:moe_gating_x_must_be_2d:got={len(x_shape)}D"
-        if len(query.operands) >= 2:
+        if x_shape[1] <= 0:
+            return f"rejected_shape_or_align:moe_gating_experts_nonpositive:got={x_shape[1]}"
+        if query.moe_expert_num > 0 and query.moe_expert_num != x_shape[1]:
+            return (
+                f"rejected_shape_or_align:moe_gating_expert_num_mismatch:"
+                f"moe_expert_num={query.moe_expert_num}!=x_cols={x_shape[1]}"
+            )
+        if query.top_k > x_shape[1]:
+            return f"rejected_shape_or_align:moe_gating_topk_exceeds_experts:k={query.top_k}>E={x_shape[1]}"
+        if query.outputs and query.outputs[0].shape and query.outputs[0].shape[-1] > x_shape[1]:
+            return f"rejected_shape_or_align:moe_gating_out_k_exceeds_experts:out_k={query.outputs[0].shape[-1]}>E={x_shape[1]}"
+        if len(query.operands) >= _RANK_2D:
             b_shape = query.operands[1].shape
-            if len(b_shape) != 1:
-                return f"rejected_shape_or_align:moe_gating_bias_must_be_1d:got={b_shape}"
-            if b_shape[0] != x_shape[1]:
-                return f"rejected_shape_or_align:moe_gating_bias_width_mismatch:{b_shape[0]}!={x_shape[1]}"
-    if entry.abi_id == "aclnnTextGatedResidual" and len(query.operands) >= 3:
+            if len(b_shape) != 1 or b_shape[0] != x_shape[1]:
+                return f"rejected_shape_or_align:moe_gating_bias_invalid:{b_shape}_vs_E={x_shape[1]}"
+    if entry.abi_id == "aclnnMoeTokenPermute" and len(query.operands) >= _RANK_2D and len(query.outputs) >= _RANK_2D:
+        tok_s, idx_s = query.operands[0].shape, query.operands[1].shape
+        out_tok_s, sorted_idx_s = query.outputs[0].shape, query.outputs[1].shape
+        if len(tok_s) != _RANK_2D or len(idx_s) not in {1, _RANK_2D} or idx_s[0] != tok_s[0]:
+            return f"rejected_shape_or_align:moe_token_permute_in_invalid:tokens={tok_s},indices={idx_s}"
+        total = tok_s[0] * (idx_s[1] if len(idx_s) == _RANK_2D else 1)
+        if len(sorted_idx_s) != 1 or sorted_idx_s[0] != total:
+            return f"rejected_shape_or_align:moe_token_permute_sorted_idx_mismatch:{sorted_idx_s}!=({total},)"
+        if len(out_tok_s) != _RANK_2D or out_tok_s[1] != tok_s[1] or (
+            "num_out_tokens" not in dict(query.activation_params) and out_tok_s[0] != total
+        ):
+            return f"rejected_shape_or_align:moe_token_permute_out_mismatch:{out_tok_s}_vs_total={total}"
+    if entry.abi_id == "aclnnTextGatedResidual" and len(query.operands) >= _RANK_3D:
         x_s, wd_s, wu_s = query.operands[0].shape, query.operands[1].shape, query.operands[2].shape
-        if len(x_s) != _RANK_3D:
-            return f"rejected_shape_or_align:text_gated_residual_x_must_be_3d:got={len(x_s)}D"
-        if len(wd_s) != _RANK_2D:
-            return f"rejected_shape_or_align:text_gated_residual_wdown_must_be_2d:got={len(wd_s)}D"
-        if len(wu_s) != _RANK_2D:
-            return f"rejected_shape_or_align:text_gated_residual_wup_must_be_2d:got={len(wu_s)}D"
-        if wd_s[1] != x_s[-1] or wu_s[0] != x_s[-1] or wd_s[0] != wu_s[1]:
+        if len(x_s) != _RANK_3D or len(wd_s) != _RANK_2D or len(wu_s) != _RANK_2D:
+            return f"rejected_shape_or_align:text_gated_residual_rank_invalid:x={x_s},wd={wd_s},wu={wu_s}"
+        b_dim, s_dim, d_dim = x_s[0], x_s[1], x_s[2]
+        r_dim = wd_s[0]
+        if d_dim <= 0 or r_dim <= 0 or wd_s[1] != d_dim or wu_s[0] != d_dim or wu_s[1] != r_dim:
             return f"rejected_shape_or_align:text_gated_residual_dim_mismatch:x={x_s},wd={wd_s},wu={wu_s}"
+        if (b_dim > _UINT32_MAX or s_dim > _UINT32_MAX or d_dim > _UINT32_MAX
+                or r_dim > _UINT32_MAX or b_dim * s_dim > _UINT32_MAX):
+            return f"rejected_shape_or_align:text_gated_residual_uint32_overflow:b={b_dim},s={s_dim},d={d_dim},r={r_dim}"
+        if query.outputs:
+            m_s = query.outputs[0].shape
+            if len(m_s) != _RANK_3D or m_s[0] != b_dim or m_s[1] != s_dim or m_s[2] <= 0:
+                return f"rejected_shape_or_align:text_gated_residual_mixed_shape_invalid:x={x_s},mixed={m_s}"
+            params = dict(query.activation_params)
+            if "channels" in params:
+                raw_ch = params["channels"]
+                if raw_ch <= 0 or raw_ch != int(raw_ch) or int(raw_ch) > _UINT32_MAX:
+                    return f"rejected_shape_or_align:text_gated_residual_channels_invalid:{raw_ch}"
+                channels = int(raw_ch)
+                if d_dim % channels != 0 or m_s[2] != d_dim // channels:
+                    return (
+                        f"rejected_shape_or_align:text_gated_residual_mixed_channels_mismatch:"
+                        f"d={d_dim},channels={channels},mixed={m_s}"
+                    )
+            elif d_dim % m_s[2] != 0:
+                return f"rejected_shape_or_align:text_gated_residual_mixed_not_divisor:d={d_dim},mixed={m_s}"
+    return _check_attention_and_fusion_shapes(entry, query)
+
+
+def _check_attention_and_fusion_shapes(entry: ProbedAbiEntry, query: AbiQueryKey) -> str | None:
+    """Enforce MLA, MQSMLA, MX quantizer, rotary, and MindIE-SD fusion shape equations."""
+    if entry.abi_id in _MLA_PROLOG_WEIGHT_UK_IDS:
+        w_uk = _resolve_port_by_roles(query.operands, ("weight_uk",), -1)
+        if w_uk is not None and (len(w_uk.shape) != _RANK_3D or any(dim <= 0 for dim in w_uk.shape)):
+            return f"rejected_shape_or_align:mla_prolog_weight_uk_must_be_3d_nd:got={w_uk.shape}"
+        kv_ref = _resolve_port_by_roles(query.operands, ("kv_cache_ref",), -1)
+        if kv_ref is not None and len(kv_ref.shape) not in {_RANK_3D, _RANK_4D}:
+            return f"rejected_shape_or_align:mla_prolog_kv_cache_must_be_3d_or_4d:got={len(kv_ref.shape)}D"
+        kr_ref = _resolve_port_by_roles(query.operands, ("kr_cache_ref",), -1)
+        if kr_ref is not None and len(kr_ref.shape) not in {1, _RANK_3D, _RANK_4D}:
+            return f"rejected_shape_or_align:mla_prolog_kr_cache_rank_invalid:got={len(kr_ref.shape)}D"
+        tok_x = _resolve_port_by_roles(query.operands, ("token_x",), 0)
+        if tok_x is not None and w_uk is not None and query.outputs and len(tok_x.shape) in {_RANK_2D, _RANK_3D}:
+            exp_q = (*tok_x.shape[:-1], w_uk.shape[0], w_uk.shape[_RANK_2D])
+            if query.outputs[0].shape != exp_q:
+                return f"rejected_shape_or_align:mla_prolog_query_out_mismatch:{query.outputs[0].shape}!={exp_q}"
+    if entry.abi_id == "aclnnMixedQuantSparseFlashMla":
+        q_p = _resolve_port_by_roles(query.operands, ("q",), 0)
+        if q_p is not None and query.outputs and query.outputs[0].shape != q_p.shape:
+            return f"rejected_shape_or_align:mqsmla_out_shape_mismatch:{query.outputs[0].shape}!={q_p.shape}"
+        for role_name in ("ori_kv", "cmp_kv"):
+            kv_p = _resolve_port_by_roles(query.operands, (role_name,), -1)
+            if kv_p is None:
+                continue
+            exp_dim = _MQSMLA_QUANT_RECORD_DIMS.get(kv_p.quant_mode.lower())
+            if exp_dim is not None and (not kv_p.shape or kv_p.shape[-1] != exp_dim):
+                return f"rejected_shape_or_align:mqsmla_{role_name}_width_mismatch:{kv_p.shape}_expected_last={exp_dim}"
+    if entry.abi_id == "QuantFourOverSixA5" and query.operands and len(query.outputs) >= _RANK_2D:
+        x_s = query.operands[0].shape
+        sc_s = query.outputs[1].shape
+        if x_s:
+            blocks = (x_s[-1] + _MX_BLOCK_SIZE - 1) // _MX_BLOCK_SIZE
+            aligned = (blocks + _MX_SCALE_ALIGN - 1) // _MX_SCALE_ALIGN
+            exp_sc = (*x_s[:-1], aligned, _MX_SCALE_ALIGN)
+            if sc_s != exp_sc:
+                return f"rejected_shape_or_align:quant_46_mxscale_shape_mismatch:{sc_s}!={exp_sc}"
+    if entry.abi_id == "catlass_epilogue_dual_level_quant_mx" and query.operands and len(query.outputs) >= _RANK_3D:
+        x_s, sc2_s = query.operands[0].shape, query.outputs[_RANK_2D].shape
+        if x_s and (x_s[-1] % _MX_BLOCK_SIZE != 0 or sc2_s != (*x_s[:-1], x_s[-1] // _MX_BLOCK_SIZE)):
+            return f"rejected_shape_or_align:catlass_mx_scale2_mismatch:{sc2_s}_for_x={x_s}"
+    if entry.abi_id == "aclnnKvCompressEpilog" and query.operands:
+        cache_s = query.operands[0].shape
+        min_w = _KV_COMPRESS_MIN_ARCH35 if entry.device_arch == "A5" else _KV_COMPRESS_MIN_ARCH22
+        if len(cache_s) != _RANK_4D or cache_s[_RANK_3D] < min_w:
+            return f"rejected_shape_or_align:kv_compress_cache_invalid:{cache_s}:min_width={min_w}"
+        if query.outputs and query.outputs[0].shape != cache_s:
+            return f"rejected_shape_or_align:kv_compress_out_mismatch:{query.outputs[0].shape}!={cache_s}"
+    if entry.abi_id == "InplacePartialRotaryMul" and query.operands and query.outputs:
+        if query.outputs[0].shape != query.operands[0].shape:
+            return f"rejected_shape_or_align:inplace_rotary_shape_mismatch:{query.outputs[0].shape}!={query.operands[0].shape}"
+    if entry.abi_id == "RmsNormRopeConcatFused" and len(query.operands) >= _RANK_3D:
+        q_s, k_s, v_s = query.operands[0].shape, query.operands[1].shape, query.operands[_RANK_2D].shape
+        if len(q_s) != _RANK_4D or len(k_s) != _RANK_4D or len(v_s) != _RANK_4D:
+            return f"rejected_shape_or_align:norm_rope_concat_must_be_4d:q={q_s},k={k_s},v={v_s}"
+        if not (q_s[_RANK_2D] == k_s[_RANK_2D] == v_s[_RANK_2D]):
+            return f"rejected_shape_or_align:norm_rope_concat_head_mismatch:q={q_s[_RANK_2D]},k={k_s[_RANK_2D]},v={v_s[_RANK_2D]}"
+    if entry.abi_id == "CatlassMatmulAddFfn" and len(query.operands) >= _RANK_3D:
+        x_s, w1_s, w2_s = query.operands[0].shape, query.operands[1].shape, query.operands[_RANK_2D].shape
+        if len(x_s) < _RANK_2D or len(w1_s) != _RANK_2D or len(w2_s) != _RANK_2D:
+            return f"rejected_shape_or_align:eagle_ffn_rank_invalid:x={x_s},w1={w1_s},w2={w2_s}"
+        is_swiglu = query.activation_kind == "swiglu"
+        canon_ok = (
+            x_s[-1] == w1_s[0]
+            and ((w1_s[1] % _EVEN_DIVISOR == 0 and w1_s[1] // _EVEN_DIVISOR == w2_s[0]) if is_swiglu else (w1_s[1] == w2_s[0]))
+            and (not query.outputs or query.outputs[0].shape == (*x_s[:-1], w2_s[1]))
+        )
+        linear_ok = (
+            x_s[-1] == w1_s[1]
+            and ((w1_s[0] % _EVEN_DIVISOR == 0 and w1_s[0] // _EVEN_DIVISOR == w2_s[1]) if is_swiglu else (w1_s[0] == w2_s[1]))
+            and (not query.outputs or query.outputs[0].shape == (*x_s[:-1], w2_s[0]))
+        )
+        if not (canon_ok or linear_ok):
+            return f"rejected_shape_or_align:eagle_ffn_dim_mismatch:x={x_s},w1={w1_s},w2={w2_s},act={query.activation_kind}"
+    return None
+
+
+def _check_extended_shape_constraints(
+    entry: ProbedAbiEntry,
+    query: AbiQueryKey,
+    act_port: OperandPortSig | None,
+    wt_port: OperandPortSig | None,
+) -> str | None:
+    """Enforce extended typed ``AbiShapeConstraints`` (head/rope/kv_heads/experts/layout/rank)."""
+    sc = entry.shape_constraints
+    if sc.head_dim_allowed_set:
+        q_port = _resolve_port_by_roles(query.operands, _HEAD_DIM_PORT_ROLES, 0)
+        if q_port is None or not q_port.shape or q_port.shape[-1] not in sc.head_dim_allowed_set:
+            got = q_port.shape[-1] if (q_port is not None and q_port.shape) else 0
+            return f"rejected_shape_or_align:head_dim={got}_not_in_{sorted(sc.head_dim_allowed_set)}"
+    if sc.rope_dim_allowed_set and query.qk_rope_head_dim not in sc.rope_dim_allowed_set:
+        return (
+            f"rejected_shape_or_align:rope_dim={query.qk_rope_head_dim}"
+            f"_not_in_{sorted(sc.rope_dim_allowed_set)}"
+        )
+    if sc.kv_heads_allowed_set:
+        kv_port = _resolve_port_by_roles(query.operands, _KV_HEAD_PORT_ROLES, -1)
+        if kv_port is not None:
+            if len(kv_port.shape) < _RANK_3D or kv_port.shape[-2] not in sc.kv_heads_allowed_set:
+                got = kv_port.shape[-2] if len(kv_port.shape) >= _RANK_3D else 0
+                return f"rejected_shape_or_align:kv_heads={got}_not_in_{sorted(sc.kv_heads_allowed_set)}"
+    if sc.max_experts > 0:
+        if query.moe_expert_num > sc.max_experts:
+            return f"rejected_shape_or_align:experts={query.moe_expert_num}>max_experts={sc.max_experts}"
+        if (entry.abi_id in _MOE_GATING_TOPK_IDS
+                and query.operands
+                and len(query.operands[0].shape) == _RANK_2D
+                and query.operands[0].shape[1] > sc.max_experts):
+            return f"rejected_shape_or_align:experts={query.operands[0].shape[1]}>max_experts={sc.max_experts}"
+        if (entry.role == "moe_grouped_matmul"
+                and wt_port is not None
+                and len(wt_port.shape) >= _RANK_3D
+                and wt_port.shape[0] > sc.max_experts):
+            return f"rejected_shape_or_align:experts={wt_port.shape[0]}>max_experts={sc.max_experts}"
+    if sc.required_layout_b and wt_port is not None and wt_port.layout != sc.required_layout_b:
+        return f"rejected_shape_or_align:layout_b={wt_port.layout}!=required={sc.required_layout_b}"
+    if not sc.allow_ungated_activation and not query.is_act_and_mul:
+        return f"rejected_dtype:ungated_activation_forbidden:{entry.entry_id}"
+    if sc.last_axis_divisibility > 0 and act_port is not None and act_port.shape:
+        if (act_port.shape[-1] % sc.last_axis_divisibility) != 0:
+            return (
+                f"rejected_shape_or_align:last_axis={act_port.shape[-1]}"
+                f"_not_div_by_{sc.last_axis_divisibility}"
+            )
+    if sc.rank_range != (0, 0) and act_port is not None:
+        lo, hi = sc.rank_range
+        rank = len(act_port.shape)
+        if rank < lo or (hi > 0 and rank > hi):
+            return f"rejected_shape_or_align:rank={rank}_outside_{sc.rank_range}"
     return None
 
 
@@ -535,6 +920,9 @@ def _check_shape_constraints(
     mm_err = _check_matmul_shape_equations(entry, query)
     if mm_err is not None:
         return mm_err
+    coll_err = _check_collective_shape_equations(entry, query)
+    if coll_err is not None:
+        return coll_err
     op_err = _check_op_specific_shapes(entry, query)
     if op_err is not None:
         return op_err
@@ -554,10 +942,8 @@ def _check_shape_constraints(
     has_fp4 = any(_norm_dtype(o.dtype) in _FP4_DTYPES for o in query.operands)
     if sc.require_even_k_for_fp4 and has_fp4 and k_dim > 0 and (k_dim % _EVEN_DIVISOR) != 0:
         return f"rejected_shape_or_align:fp4_odd_k={k_dim}"
-    wt_port = _resolve_port_by_roles(
-        query.operands, _WEIGHT_PORT_ROLES, 1,
-        exclude=_resolve_port_by_roles(query.operands, _ACTIVATION_PORT_ROLES, 0),
-    )
+    act_port = _resolve_port_by_roles(query.operands, _ACTIVATION_PORT_ROLES, 0)
+    wt_port = _resolve_port_by_roles(query.operands, _WEIGHT_PORT_ROLES, 1, exclude=act_port)
     if (sc.require_even_n_for_fp4_transb and has_fp4
             and wt_port is not None and wt_port.transposed
             and n_dim > 0 and (n_dim % _EVEN_DIVISOR) != 0):
@@ -587,7 +973,7 @@ def _check_shape_constraints(
             f"rejected_shape_or_align:shared_experts={query.shared_experts_per_rank}"
             f">max={sc.max_shared_experts_per_rank}"
         )
-    return None
+    return _check_extended_shape_constraints(entry, query, act_port, wt_port)
 
 
 def _check_m10_legality(query: AbiQueryKey) -> str | None:
@@ -729,10 +1115,16 @@ class ProbedAbiRegistry:
             return True
         return False
 
-    def device_kernel_expansion(self, symbol: str, device_arch: str) -> tuple[str, ...]:
+    def device_kernel_expansion(
+        self,
+        symbol: str,
+        device_arch: str,
+        *,
+        dtype_tuple: Sequence[str] | None = None,
+    ) -> tuple[str, ...]:
         """Return sealed 1-to-many device kernel expansion for host API ``symbol`` on ``device_arch``."""
         arch = _norm_arch(device_arch)
-        matches = self.lookup(symbol, arch, available_only=True)
+        matches = self.lookup(symbol, arch, dtype_tuple=dtype_tuple, available_only=True)
         for entry in matches:
             if entry.symbol_or_kernel == symbol or entry.abi_id == symbol:
                 return entry.device_kernel_expansion
@@ -800,6 +1192,8 @@ class ProbedAbiRegistry:
             return f"rejected_dtype:activation={query.activation_kind}", ""
         if query.has_bias and (entry.require_no_bias or not entry.allow_bias):
             return f"rejected_dtype:bias_forbidden:{entry.entry_id}", ""
+        if entry.require_bias and not query.has_bias:
+            return f"rejected_dtype:bias_required:{entry.entry_id}", ""
         if query.rank_placement not in entry.allowed_rank_placements:
             return f"rejected_rank_domain:placement={query.rank_placement}", ""
         if query.world_size not in entry.allowed_world_sizes:
@@ -886,8 +1280,14 @@ class ProbedAbiRegistry:
             ids = ",".join(sorted(item[0].entry_id for item in admitted))
             raise ModelingError(f"abi_registry_ambiguous_match:{query.soc_arch}:{query.abi_id}:{ids}")
         if not admitted:
-            first_entry, first_err = rejections[0]
-            return self._reject(query, snapshot, first_err, entry=first_entry)
+            best_entry, best_err = max(
+                rejections,
+                key=lambda item: next(
+                    (prio for prefix, prio in _REJECTION_PREFIX_PRIORITY if item[1].startswith(prefix)),
+                    0,
+                ),
+            )
+            return self._reject(query, snapshot, best_err, entry=best_entry)
 
         entry, pr_ref = admitted[0]
         if effective_track == "eager":
