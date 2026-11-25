@@ -1343,7 +1343,7 @@ class FusedPipelineRecipe:
                 for ph, amt, cp in zip(final_phases, final_amounts, tile_caps)
             ]
 
-        return PipelineProgram(count, tile, slots=eff_slots, minimum_ms=context.minimum_ms)
+        return PipelineProgram(count, eff_slots, tile, minimum_ms=context.minimum_ms)
 
     def lower(self, context: RecipeContext) -> KernelProgram | PipelineProgram:
         """Lower declared physical work into a finite multi-pipe tile pipeline."""

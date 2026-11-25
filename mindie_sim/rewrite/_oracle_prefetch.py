@@ -16,13 +16,80 @@ from dataclasses import replace
 from mindie_sim.prediction.fusion.bridge import (
     CanonicalPlan, add_prefetch, apply_prefetch_rewrite, settle_prefetch_rewrite,
 )
-from mindie_sim.prediction.fusion.pool import register_recipe
+from mindie_sim.prediction.fusion.pool import PrefetchPoolProgram, register_recipe, units_for_pool
+from mindie_sim.prediction.fusion.ports import replace_scalar_metadata
+from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
+from mindie_sim.prediction.operators.matrix.matrix_epilogue import MatrixEpilogue
 from mindie_sim.prediction.streams import MAIN_STREAM, StreamEvent
 from mindie_sim.prediction.execution.weight_prefetch import PrefetchDecision
 from mindie_sim.schema.common import ModelingError
 
 PREFETCH_PRIORITY = 10
 DISABLED_PRIMITIVE_TABLE_TOKEN = "__primitive_table_disabled__"
+
+
+def _static_weight_bytes(meta: dict, fallback: int) -> int:
+    for key in ("packed_weight_bytes", "weight_bytes", "local_weight_bytes", "weight_read_bytes"):
+        val = meta.get(key)
+        if type(val) in {int, float} and val > 0:
+            return int(val)
+    return int(fallback)
+
+
+def _displaced_weight_mte2(op, amount: int) -> tuple[float, int | float | None]:
+    """Compute MTE2 bytes moved to prefetch DMA and remaining ``packed_weight_bytes``."""
+    mte2 = float(op.mte2_bytes)
+    if mte2 <= 0.0 or amount <= 0:
+        return 0.0, None
+    meta = dict(op.metadata)
+    packed = meta.get("packed_weight_bytes")
+    if type(packed) in {int, float} and packed > 0:
+        ep = MatrixEpilogue.from_op(op)
+        headroom_w = max(0.0, float(packed) - float(ep.column_scale_bytes))
+        headroom_m = max(0.0, mte2 - float(ep.row_scale_bytes))
+        moved = min(float(amount), headroom_w, headroom_m)
+        rem = max(float(ep.column_scale_bytes), float(packed) - moved)
+        rem_val: int | float = int(round(rem)) if isinstance(packed, int) and rem.is_integer() else rem
+        return moved, rem_val
+    return min(mte2, float(amount)), None
+
+
+def _rewrite_prefetch_recipe(
+    decision: PrefetchDecision,
+    holder,
+    amount: int,
+    mte2_moved: float,
+    pool: str,
+    unit_ids: tuple[int, ...],
+    units: int,
+) -> PlannedRecipe:
+    """Emit HBM + MTE2 copy work bound to the lease's physical pool units."""
+    base_res = {"hbm": float(amount)}
+    if mte2_moved > 0.0:
+        base_res["mte2"] = float(mte2_moved)
+    work = Work(resources=base_res)
+
+    def program(context):
+        names = context.resource_names
+        copy_work = {names["hbm"]: float(amount)}
+        if mte2_moved > 0.0:
+            mte2_key = names.get("mte2_aic") or names.get("mte2")
+            if mte2_key:
+                copy_work[mte2_key] = float(mte2_moved)
+        eff_units = len(unit_ids) if unit_ids else (units if units > 0 else units_for_pool(context, pool))
+        return PrefetchPoolProgram(
+            holder, float(amount), eff_units,
+            caps={names["hbm"]: float(decision.spare_bytes_per_ms)},
+            priority=decision.priority, work_resource=copy_work,
+            pool_name=dict(context.pool_names).get(pool, pool),
+            unit_ids=unit_ids or None,
+        )
+
+    def build(op, geometry):
+        del op, geometry
+        return OperatorPlan(work, program, metadata={"optimizer_prefetch": True})
+
+    return PlannedRecipe(build)
 
 
 def bind_prefetch_ops(case, replica, ops, book, leases, hardware):
@@ -36,30 +103,57 @@ def bind_prefetch_ops(case, replica, ops, book, leases, hardware):
     for lease in scoped_leases:
         target = next((op for op in plan.ops if op.op_id == lease.target_op), None)
         if target is None:
-            continue
+            raise ModelingError(f"rewrite_prefetch_target_missing:{lease.target_op}")
+        if not any(op.op_id == lease.window_anchor_op for op in plan.ops):
+            raise ModelingError(f"rewrite_prefetch_anchor_missing:{lease.window_anchor_op}")
         if not getattr(plan.book.select(target), "traffic_rewrite_capable", False):
             raise ModelingError(f"rewrite_prefetch_recipe_unbound:{target.op_id}")
         amount = lease.max_bytes
-        weight = int(dict(target.metadata).get("weight_bytes", amount))
+        weight = _static_weight_bytes(dict(target.metadata), amount)
+        stage_hw = hardware(target.stage) if callable(hardware) else hardware
         decision = PrefetchDecision(
-            target.op_id, (lease.port_name,), weight, amount, amount, weight - amount,
-            amount, 0, hardware.hbm_bytes_per_ms, 0, True, "", (),
+            target.op_id, (lease.port_name,), weight, amount, amount, max(0, weight - amount),
+            amount, 0, stage_hw.hbm_bytes_per_ms, 0, True, "", (),
             priority=PREFETCH_PRIORITY,
         )
-        if (added := add_prefetch(plan, decision, hardware)) is None:
+        if (added := add_prefetch(plan, decision, stage_hw)) is None:
             raise ModelingError(f"rewrite_prefetch_duplicate_target:{target.op_id}")
         plan, prefetch_id = added
         if (settled := settle_prefetch_rewrite(plan, decision, prefetch_id, amount)) is None:
             raise ModelingError(f"rewrite_prefetch_settlement_failed:{target.op_id}")
         plan = apply_prefetch_rewrite(plan, settled, prefetch_id)
-        plan = replace(plan, ops=tuple(
-            replace(op, deps=(lease.window_anchor_op,), stream=target.stream)
-            if op.op_id == prefetch_id else (
-                replace(op, stream=target.stream)
-                if op.family == "release" and target.op_id in op.deps else op
+        consumer = next((op for op in plan.ops if op.op_id == target.op_id), None)
+        mte2_moved, rem_packed = _displaced_weight_mte2(consumer, amount) if consumer is not None else (0.0, None)
+        prefetch_op = next((op for op in plan.ops if op.op_id == prefetch_id), None)
+        holder = dict(plan.pool_holders).get(prefetch_id)
+        if prefetch_op is not None and holder is not None:
+            unit_ids = tuple(int(u) for u in (getattr(lease, "physical_unit_ids", ()) or ()))
+            units = int(getattr(lease, "physical_units", 0) or 0)
+            dma_recipe = _rewrite_prefetch_recipe(
+                decision, holder, amount, mte2_moved, lease.pool, unit_ids, units,
             )
-            for op in plan.ops
-        ))
+            plan = replace(plan, book=register_recipe(plan.book, prefetch_op.recipe, dma_recipe))
+        new_ops = []
+        for op in plan.ops:
+            if op.op_id == prefetch_id:
+                new_ops.append(replace(
+                    op, deps=(lease.window_anchor_op,), stream=target.stream,
+                    hbm_bytes=float(amount), mte2_bytes=mte2_moved,
+                ))
+            elif op.op_id == target.op_id and mte2_moved > 0.0:
+                meta_out = (
+                    replace_scalar_metadata(op.metadata, packed_weight_bytes=rem_packed)
+                    if rem_packed is not None else op.metadata
+                )
+                new_ops.append(replace(
+                    op, mte2_bytes=max(0.0, float(op.mte2_bytes) - mte2_moved),
+                    metadata=meta_out,
+                ))
+            elif op.family == "release" and target.op_id in op.deps:
+                new_ops.append(replace(op, stream=target.stream))
+            else:
+                new_ops.append(op)
+        plan = replace(plan, ops=tuple(new_ops))
     generated = {op.recipe for op in plan.ops if op.family in {"prefetch", "release"}}
     book = plan.book
     for name in generated:

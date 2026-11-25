@@ -22,6 +22,7 @@ from operator import mul
 from time import perf_counter
 from typing import TYPE_CHECKING, Protocol
 
+from mindie_sim.prediction.fusion.ports import input_port_entries
 from mindie_sim.prediction.operators.matrix.matrix_precision import (
     PACKED_FP4_FORMATS, resolve_matrix_precision,
 )
@@ -604,14 +605,100 @@ def _op_contract_key(op, metadata):
     return op.family, op.stage, op.layer, op.requests, op.local_shape, op.dtype, op.layout, repr(ports), repr(contract)
 
 
-def _semantic_ops(scenario) -> tuple[list[tuple[int, OpSpec, dict]], dict[tuple[int, str], tuple[int, str]]]:
+def _proven_hoisted_sites(scenario, applied: AppliedPlan | None) -> frozenset[tuple[int, str]]:
+    """Return proven replica-scoped ``(replica, op_id)`` sites hoisted to load time."""
+    if applied is None:
+        return frozenset()
+    scoped = getattr(applied, "hoisted_load_time_sites", ())
+    if scoped:
+        return frozenset((int(replica), str(op_id)) for replica, op_id in scoped)
+    if not applied.hoisted_load_time:
+        return frozenset()
+    replicas = {entry.replica for entry in getattr(scenario, "atomic_ops", ())} or {0}
+    return frozenset((int(replica), str(op_id)) for replica in replicas for op_id in applied.hoisted_load_time)
+
+
+def _resolved_op_deps(op, meta: Mapping[str, object], in_graph: set[str] | None = None) -> tuple[str, ...]:
+    """Collect declared data/control prerequisite op IDs from ``deps``, ports, and typed inputs."""
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _add(dep: object) -> None:
+        if isinstance(dep, str) and dep and dep != op.op_id and dep not in seen:
+            if in_graph is None or dep in in_graph:
+                seen.add(dep)
+                found.append(dep)
+
+    for dep in getattr(op, "deps", ()):
+        _add(dep)
+    for dep, _ in input_port_entries(getattr(op, "metadata", ())):
+        _add(dep)
+    for key in ("typed_inputs", "input_ports"):
+        ports = meta.get(key)
+        if isinstance(ports, (tuple, list)):
+            for port in ports:
+                if isinstance(port, Mapping):
+                    _add(port.get("producer"))
+    if in_graph is not None:
+        for val in meta.values():
+            if isinstance(val, str) and val in in_graph:
+                _add(val)
+    return tuple(found)
+
+
+def _hoisted_source_port(op, meta: Mapping[str, object], src_id: str) -> tuple[str, int]:
+    """Resolve the ``(port_name, version)`` consumed from a single hoisted source op."""
+    for key in ("typed_inputs", "input_ports"):
+        ports = meta.get(key)
+        if isinstance(ports, (tuple, list)):
+            for port in ports:
+                if isinstance(port, Mapping) and port.get("producer") == src_id:
+                    name = str(port.get("port") or port.get("output") or port.get("name") or "out")
+                    ver = port.get("version", 0)
+                    return name, (ver if type(ver) is int and ver >= 0 else 0)
+    for dep, port_ref in input_port_entries(getattr(op, "metadata", ())):
+        if dep == src_id:
+            suffix = port_ref.removeprefix(f"{src_id}:") if isinstance(port_ref, str) else "out"
+            return (suffix or "out"), 0
+    return "out", 0
+
+
+def _semantic_ops(
+    scenario,
+    *,
+    hoisted_sites: frozenset[tuple[int, str]] = frozenset(),
+) -> tuple[list[tuple[int, OpSpec, dict]], dict[tuple[int, str], tuple[int, str]]]:
     """Deduplicate pure identical-contract ops strictly within each replica."""
+    raw_ops = list(_atomic_ops(scenario))
+    by_replica: dict[int, list[tuple[OpSpec, dict]]] = defaultdict(list)
+    for replica, op in raw_ops:
+        by_replica[replica].append((op, dict(op.metadata)))
+    valid_hoisted: set[tuple[int, str]] = set()
+    for replica, items in by_replica.items():
+        in_graph = {op.op_id for op, _ in items}
+        candidates = [
+            (op, meta, set(_resolved_op_deps(op, meta, in_graph)))
+            for op, meta in items
+            if (meta.get("load_time") or (replica, op.op_id) in hoisted_sites)
+            and not getattr(op, "link_bytes", 0)
+            and not meta.get("state_effect")
+        ]
+        ready: set[str] = set()
+        progressed = True
+        while progressed:
+            progressed = False
+            for op, _, deps in candidates:
+                if op.op_id not in ready and deps <= ready:
+                    ready.add(op.op_id)
+                    progressed = True
+        for oid in ready:
+            valid_hoisted.add((replica, oid))
     seen: dict[tuple, tuple[int, str]] = {}
     aliases: dict[tuple[int, str], tuple[int, str]] = {}
     operations: list[tuple[int, OpSpec, dict]] = []
-    for replica, op in _atomic_ops(scenario):
+    for replica, op in raw_ops:
         metadata = dict(op.metadata)
-        if metadata.get("load_time"):
+        if (replica, op.op_id) in valid_hoisted:
             aliases[replica, op.op_id] = (replica, op.op_id)
             continue
         key = _op_contract_key(op, metadata)
@@ -656,7 +743,12 @@ def _cold_weight_read(op, meta: Mapping[str, object], die: int) -> TensorRangeOb
     decl_ver = raw_ver if type(raw_ver) is int and raw_ver >= 0 else 0
     ranges = meta.get("weight_ranges", meta.get("ranges"))
     if ranges is None:
-        size = meta.get("weight_payload_bytes") or meta.get("weight_bytes") or meta.get("local_weight_bytes")
+        size = (
+            meta.get("packed_weight_bytes")
+            or meta.get("weight_payload_bytes")
+            or meta.get("weight_bytes")
+            or meta.get("local_weight_bytes")
+        )
         if not isinstance(size, (int, float)):
             return None
         touched = min(size, mte2_bytes)
@@ -670,6 +762,7 @@ def _cold_weight_read(op, meta: Mapping[str, object], die: int) -> TensorRangeOb
 
 def _pure_copy_boundary(
     op, meta: Mapping[str, object], die: int, replica: int, stage: int, consumed: set[tuple[int, str]],
+    aliases: Mapping[tuple[int, str], tuple[int, str]] | None = None,
 ):
     """Return ``(read_hbm_ob, write_hbm_ob, mte2_copy_bytes, write_copy_bytes)`` independently."""
     hbm = int(getattr(op, "hbm_bytes", 0) or 0)
@@ -679,7 +772,24 @@ def _pure_copy_boundary(
     read_ob = write_ob = None
     mte2_copy = write_copy = 0
     read_claimed = 0
-    if not getattr(op, "deps", ()):
+    alias_map = aliases or {}
+    full_deps = _resolved_op_deps(op, meta)
+    runtime_deps = tuple(
+        dep for dep in full_deps
+        if (replica, dep) not in alias_map or alias_map[replica, dep] != (replica, dep)
+    )
+    hoisted_deps = tuple(
+        dep for dep in full_deps
+        if (replica, dep) in alias_map and alias_map[replica, dep] == (replica, dep)
+    )
+    if not runtime_deps:
+        if len(hoisted_deps) == 1:
+            src_port, src_ver = _hoisted_source_port(op, meta, hoisted_deps[0])
+            read_alloc_id = f"hoisted:r{replica}:{hoisted_deps[0]}:{src_port}"
+            read_ver = src_ver
+        else:
+            read_alloc_id = f"boundary_in:r{replica}.p{stage}:{op.op_id}"
+            read_ver = 0
         if mte2 > 0:
             mte2_copy = mte2
             if hbm > 0 and not warm:
@@ -687,13 +797,13 @@ def _pure_copy_boundary(
                 if read_sz > 0:
                     read_claimed = read_sz
                     read_ob = TensorRangeObligation(
-                        die, f"boundary_in:r{replica}.p{stage}:{op.op_id}", 0,
+                        die, read_alloc_id, read_ver,
                         ((0, read_sz),), "hbm_cold", "owner",
                     )
         elif mte3 == 0 and hbm > 0 and not warm:
             read_claimed = hbm
             read_ob = TensorRangeObligation(
-                die, f"boundary_in:r{replica}.p{stage}:{op.op_id}", 0,
+                die, read_alloc_id, read_ver,
                 ((0, hbm),), "hbm_cold", "owner",
             )
     if (replica, op.op_id) not in consumed:
@@ -812,13 +922,15 @@ def derive_default_obligations(scenario, demands, aliases, covered, rank_ops_fn)
         has_explicit_mem = "read_obligations" in meta or "write_obligations" in meta
         if "read_obligations" in meta:
             read_obs.extend(meta["read_obligations"])
-        elif (read := _cold_weight_read(op, meta, die)) is not None:
+        elif key not in covered and (read := _cold_weight_read(op, meta, die)) is not None:
             read_obs.append(read)
             has_explicit_mem = True
         write_obs.extend(meta.get("write_obligations", ()))
 
         if not (has_explicit_work or has_explicit_mem or has_matrix or has_vector or has_link) and key not in covered:
-            b_read, b_write, b_mte2, b_mte3 = _pure_copy_boundary(op, meta, die, replica, stage, consumed)
+            b_read, b_write, b_mte2, b_mte3 = _pure_copy_boundary(
+                op, meta, die, replica, stage, consumed, aliases,
+            )
             if b_read is not None:
                 read_obs.append(b_read)
             if b_write is not None:
@@ -1138,14 +1250,16 @@ def build_dual_inputs_from_scenario(
     primitive_table: PrimitiveTable | _UpperCapacityLike | None = None,
     rate_mode: str = "engine_ceiling",
     applied: AppliedPlan | None = None,
+    verify_summaries: bool = True,
 ) -> tuple[ResourceChoiceProgram, EventDagSpec, tuple[str, ...]]:
     """Build replica-preserving resource-choice and event-DAG dual lower-bound inputs."""
-    if applied is not None:
+    if applied is not None and verify_summaries:
         _check_region_summary_bindings(scenario, applied, region_summaries, require_catalog=True)
-    elif not region_summaries:
+    elif applied is None and not region_summaries:
         region_summaries = getattr(scenario, "region_summaries", ())
     demands = _Demands(scenario, primitive_table, rate_mode)
-    operations, aliases = _semantic_ops(scenario)
+    hoisted_sites = _proven_hoisted_sites(scenario, applied)
+    operations, aliases = _semantic_ops(scenario, hoisted_sites=hoisted_sites)
     summaries = tuple(summary for summary in region_summaries if not _summary_is_aliased(summary, aliases))
     contractions = getattr(scenario, "bilinear_contractions", ())
     placements = dict(getattr(scenario, "die_placements", ()))

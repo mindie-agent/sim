@@ -17,6 +17,7 @@ from math import inf, isfinite, prod
 from types import SimpleNamespace
 from typing import Any, Literal
 
+from mindie_sim.feature_mechanisms import RUNTIME_STACKS
 from mindie_sim.prediction.body_defaults import consume_target_declaration
 from mindie_sim.prediction.fusion.control_rewrite import (
     apply_incoming_controls, rewritten_control_metadata,
@@ -27,7 +28,7 @@ from mindie_sim.prediction.fusion.ports import (
     replace_input_ports,
 )
 from mindie_sim.prediction.program import RecipeBook
-from mindie_sim.prediction.results import StepRequest
+from mindie_sim.prediction.results import DEFAULT_STACK_NAME, LoweringRequest, RankOps, StepRequest
 from mindie_sim.prediction.runtime import tile_solver
 from mindie_sim.prediction.runtime.tile_solver import TilePipelineSpec
 from mindie_sim.prediction.spine import PredictionSpine, PreparedStep
@@ -36,7 +37,7 @@ from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_die, ub_peer_edges_for_rank
 from mindie_sim.schema.operators import OpSpec
-from mindie_sim.prediction.results import DEFAULT_STACK_NAME, LoweringRequest, RankOps
+from mindie_sim.stacks.registry import DIFFUSION_PHASES, normalize_hardware_backend, resolve_stack_for_scenario
 
 from ._oracle_prefetch import die_placements_for_case, primitive_table_digest_token
 from .schema import (
@@ -46,7 +47,11 @@ from .schema import (
     plan_sha256,
 )
 
-DEFAULT_STACK_ID = "cann93_va_main"
+DEFAULT_STACK_ID = ""
+_LEGACY_ASCEND_STACK_ALIAS = "cann93_va_main"
+_STATIC_WEIGHT_KEYS = ("packed_weight_bytes", "weight_bytes", "local_weight_bytes", "weight_read_bytes")
+_SIMT_BACKENDS = frozenset({"tilelang_simt", "tla_simt"})
+_SPLITV_COPY_HALF = 0.5
 _FP32_UPCAST_BYTES = 4
 _POINTWISE_TILE_ELEMS = 128
 _BLOCK_QUANT_TILE_ELEMS = 256
@@ -104,6 +109,8 @@ class PrefetchLease:
     pool: Literal["l1"]
     max_bytes: int
     replica: int = 0
+    physical_units: int = 0
+    physical_unit_ids: tuple[int, ...] = ()
 @dataclass(frozen=True, slots=True)
 class TemplateBinding:
     edit_id: str
@@ -111,18 +118,21 @@ class TemplateBinding:
     tier: TemplateTier
     template_id: str
     params: tuple[tuple[str, str | int | bool], ...]
+    replica: int = 0
 @dataclass(frozen=True, slots=True)
 class TileBinding:
     edit_id: str
     target_op: str
     cohort_split: Literal["none", "dbo_2cohort"]
     tile_spec: TilePipelineSpec | VariantRef | None
+    replica: int = 0
 @dataclass(frozen=True, slots=True)
 class CollectiveRewriteRecord:
     edit_id: str
     target_op: str
     mode: str
     topology_route: str
+    replica: int = 0
 @dataclass(frozen=True, slots=True)
 class AppliedPlan:
     plan: RewritePlan
@@ -143,6 +153,8 @@ class AppliedPlan:
     region_tiers: tuple[tuple[str, FusionTier], ...] = ()
     in_place_aliases: tuple[tuple[str, str], ...] = ()
     credit_edges: tuple[tuple[str, str, int], ...] = ()
+    hoisted_load_time_sites: tuple[tuple[int, str], ...] = ()
+    elided_d2h_sites: tuple[tuple[int, str], ...] = ()
 def _lower_prepared_step_for_rewrite(
     spine: PredictionSpine,
     case: Case,
@@ -174,13 +186,120 @@ def _lower_prepared_step_for_rewrite(
     )
 
 
+def _infer_workload_domain_and_hw(case: Case, request: StepRequest) -> tuple[str, str | None]:
+    model_meta = dict(getattr(case.model, "metadata", ()) or ())
+    raw_dom = str(
+        getattr(case.model, "workload_domain", "")
+        or model_meta.get("workload_domain")
+        or ""
+    ).strip().lower()
+    if raw_dom in {"llm", "vlm", "diffusion", "custom"}:
+        domain = raw_dom
+    elif str(request.phase or "").strip().lower() in DIFFUSION_PHASES or str(
+        model_meta.get("model_family") or ""
+    ).strip().lower() in {"dit", "diffusion"}:
+        domain = "diffusion"
+    elif getattr(case.model, "vision", None) is not None:
+        domain = "vlm"
+    else:
+        domain = "llm"
+    hw_family: str | None = None
+    machine = case.machine
+    dies = getattr(machine, "dies", ()) or ()
+    die0 = dies[0] if dies else None
+    hw_tokens = (
+        getattr(die0, "sku", None),
+        getattr(die0, "arch_family", None),
+        getattr(machine, "sku", None),
+        getattr(machine, "hardware_key", None),
+        getattr(machine, "arch_family", None),
+        getattr(machine, "name", None),
+    )
+    has_nonempty_hw = False
+    for tok in hw_tokens:
+        if tok is not None and str(tok).strip():
+            has_nonempty_hw = True
+            norm = normalize_hardware_backend(str(tok))
+            if norm in {"ascend", "nvidia"}:
+                hw_family = norm
+                break
+            if norm == "generic" and hw_family is None:
+                hw_family = "generic"
+    if hw_family is None and (
+        dict(getattr(machine, "assumptions", ()) or ()).get("custom_hardware")
+        or has_nonempty_hw
+    ):
+        hw_family = "generic"
+    return domain, hw_family
+
+
+def _lowering_stack_name(stack_id: str) -> str:
+    key = stack_id.lower()
+    return (
+        stack_id
+        if (key in RUNTIME_STACKS or key.replace("-", "_") in RUNTIME_STACKS)
+        else "raw_eager"
+    )
+
+
+def _resolve_rewrite_stack(
+    case: Case, request: StepRequest, stack_id: str | None,
+) -> tuple[str, str]:
+    """Resolve neutral domain/hardware stack identity and its lowering stack name."""
+    domain, hw_family = _infer_workload_domain_and_hw(case, request)
+    raw = str(stack_id or "").strip()
+    if raw == _LEGACY_ASCEND_STACK_ALIAS:
+        if domain == "diffusion" or hw_family == "generic":
+            raw = ""
+        else:
+            return DEFAULT_STACK_NAME, DEFAULT_STACK_NAME
+    if raw:
+        return raw, _lowering_stack_name(raw)
+    rt_meta = dict(getattr(case.runtime, "metadata", ()) or ())
+    explicit_rt = str(rt_meta.get("stack_id") or "").strip()
+    if explicit_rt and explicit_rt != _LEGACY_ASCEND_STACK_ALIAS:
+        if domain == "diffusion" or hw_family == "generic":
+            adapter = resolve_stack_for_scenario(
+                explicit_rt,
+                workload_domain=domain,  # type: ignore[arg-type]
+                hardware_family=hw_family,
+            )
+            resolved_id = adapter.capabilities().stack_id
+            return resolved_id, _lowering_stack_name(resolved_id)
+        return explicit_rt, _lowering_stack_name(explicit_rt)
+    report = rt_meta.get("feature_track_report")
+    report_stack = str(
+        report.get("stack") if isinstance(report, Mapping) else ""
+    ).strip()
+    if report_stack and report_stack != _LEGACY_ASCEND_STACK_ALIAS:
+        if domain != "diffusion" and hw_family != "generic":
+            return report_stack, _lowering_stack_name(report_stack)
+        try:
+            adapter = resolve_stack_for_scenario(
+                report_stack,
+                workload_domain=domain,  # type: ignore[arg-type]
+                hardware_family=hw_family,
+            )
+            resolved_id = adapter.capabilities().stack_id
+            return resolved_id, _lowering_stack_name(resolved_id)
+        except ModelingError:
+            pass
+    adapter = resolve_stack_for_scenario(
+        None,
+        workload_domain=domain,  # type: ignore[arg-type]
+        hardware_family=hw_family,
+    )
+    resolved_id = adapter.capabilities().stack_id
+    return resolved_id, _lowering_stack_name(resolved_id)
+
+
 def resolve_scenario(case, request: StepRequest, *, spine=None,
-                     stack_id: str = DEFAULT_STACK_ID, primitives=None,
+                     stack_id: str | None = DEFAULT_STACK_ID, primitives=None,
                      primitive_table=None) -> ResolvedScenario:
     """Lower atomic and shipping graphs against a shared declared scenario."""
     case = Case.from_mapping(case)
     spine = PredictionSpine() if spine is None else spine
-    stack = DEFAULT_STACK_NAME if stack_id == DEFAULT_STACK_ID else stack_id
+    resolved_stack_id, stack = _resolve_rewrite_stack(case, request, stack_id)
     atomic = _lower_prepared_step_for_rewrite(
         spine, case, LoweringRequest(step=request, tier="unmerge", apply_body_defaults=False, stack=stack),
     )
@@ -190,7 +309,7 @@ def resolve_scenario(case, request: StepRequest, *, spine=None,
     graph = atomic.graph
     base = _json_digest(graph.executable, default=_digest_default)
     framing = _json_digest(
-        (case.to_dict(), atomic.case.runtime.to_dict(), asdict(request), stack_id,
+        (case.to_dict(), atomic.case.runtime.to_dict(), asdict(request), resolved_stack_id,
          graph.base.sources, graph.streams, primitives),
         default=_digest_default,
     )
@@ -198,7 +317,7 @@ def resolve_scenario(case, request: StepRequest, *, spine=None,
                           default=_digest_default)
     datapath = _die_path(atomic.case.machine, atomic.case.machine.dies[0])
     return ResolvedScenario(
-        case, request, stack_id, base, framing, digest, atomic, mainline,
+        case, request, resolved_stack_id, base, framing, digest, atomic, mainline,
         graph.executable, datapath, graph.streams, die_placements_for_case(atomic.case), (), primitive_table,
     )
 def _annotate(op: OpSpec, **values) -> OpSpec:
@@ -413,10 +532,41 @@ def _check_stream(ops, plan):
             if message.startswith(prefix):
                 raise ModelingError(f"{code}:{message}") from error
         raise
+def _static_weight_value(meta: Mapping[str, Any]):
+    for key in _STATIC_WEIGHT_KEYS:
+        val = meta.get(key)
+        if val is not None:
+            return val
+    return 0
+
+
+def _materialize_control_deps(ops: Sequence[OpSpec]) -> tuple[OpSpec, ...]:
+    """Materialize in-graph control prerequisites into ``op.deps`` while keeping tensor ports separate."""
+    if not ops:
+        return ()
+    by_id = {op.op_id: op for op in ops}
+    out: list[OpSpec] = []
+    for op in ops:
+        ctrl = control_dependency_names(op, by_id) & (by_id.keys() - {op.op_id})
+        missing = [dep for dep in declared_control_order(op.metadata) if dep in ctrl and dep not in op.deps]
+        for dep in sorted(ctrl):
+            if dep not in op.deps and dep not in missing:
+                missing.append(dep)
+        if not missing:
+            out.append(op)
+            continue
+        meta = op.metadata
+        ports = full_operand_ports(op, by_id)
+        if ports:
+            meta = replace_input_ports(meta, ports)
+        out.append(replace(op, deps=(*op.deps, *missing), metadata=meta))
+    return tuple(out)
+
+
 def _ports(op):
     meta = dict(op.metadata)
     result = {(name, 0) for name in ("op", "output", *op.returns)}
-    if any(key in meta for key in ("weight_bytes", "local_weight_bytes", "weight_read_bytes")):
+    if any(key in meta for key in _STATIC_WEIGHT_KEYS):
         result.add(("weight", 0))
     if isinstance(meta.get("primary_output"), str):
         result.add((meta["primary_output"], 0))
@@ -455,22 +605,33 @@ def _tile_fits_resident_pool(
     dst_dtype = str(tmeta.get("output_format") or target.dtype or "").strip().lower()
     if not src_dtype or not dst_dtype:
         raise ModelingError(f"rewrite_tile_missing_dtype:{source.op_id}:{target.op_id}")
+    uses_simt = any(
+        bool(m.get("uses_simt") or m.get("tile_uses_simt") or m.get("template_param_uses_simt"))
+        or str(m.get("backend_target") or m.get("backend") or "").strip().lower() in _SIMT_BACKENDS
+        for m in (smeta, tmeta)
+    )
     carveout = int(path.simt_ub_carveout_bytes)
     candidates: list[tile_solver.TileCandidate] = []
     if pool == "ub":
         in_b = tile_elems * max(1, int(round(float(dtype_bytes(src_dtype)))))
         out_b = tile_elems * max(1, int(round(float(dtype_bytes(dst_dtype)))))
         fp32_b = tile_elems * _FP32_UPCAST_BYTES
+        native_fp32 = src_dtype in {"fp32", "float32"}
         for depth in (2, 1):
-            buffers = (
+            live_bufs = [
                 tile_solver.LiveBufferSpec("tile_in", "ub", in_b, 0, 1, owner_kind="aiv", slots=depth),
                 tile_solver.LiveBufferSpec("tile_fp32_a", "ub", fp32_b, 0, 2, owner_kind="aiv", slots=1),
-                tile_solver.LiveBufferSpec("tile_fp32_b", "ub", fp32_b, 1, 2, owner_kind="aiv", slots=1),
+            ]
+            if not native_fp32:
+                live_bufs.append(
+                    tile_solver.LiveBufferSpec("tile_fp32_b", "ub", fp32_b, 1, 2, owner_kind="aiv", slots=1),
+                )
+            live_bufs.append(
                 tile_solver.LiveBufferSpec("tile_out", "ub", out_b, 1, 2, owner_kind="aiv", slots=depth),
             )
             candidates.append(tile_solver.TileCandidate(
                 "resident_1pass", tile_solver.TileShape(1, tile_elems, 1),
-                depth, (1, 1), 1, 1, buffers, uses_simt=True, owner_axis="aiv",
+                depth, (1, 1), 1, 1, tuple(live_bufs), uses_simt=uses_simt, owner_axis="aiv",
             ))
     elif pool == "l1":
         tw = min(inner, _POINTWISE_TILE_ELEMS)
@@ -651,53 +812,95 @@ def _precision_abi_tuple(op: OpSpec) -> tuple[Any, ...]:
     )
 
 
-def _unabsorbed_splitv_cost(
+def _op_data_producers(op: OpSpec, all_ops: Mapping[str, OpSpec] | None) -> set[str]:
+    """Return non-control data producer op IDs referenced by ``op``."""
+    ctrl = control_dependency_names(op, all_ops)
+    producers = {dep for dep, _ in full_operand_ports(op, all_ops)}
+    producers.update(
+        port["producer"]
+        for _, port in _typed_inputs(op)
+        if isinstance(port.get("producer"), str) and port.get("producer")
+    )
+    producers.update(
+        dep for dep in _named_inputs(op).values()
+        if all_ops is None or dep in all_ops
+    )
+    producers.difference_update(ctrl)
+    producers.discard(op.op_id)
+    return producers
+
+
+def _op_output_dtype(op: OpSpec) -> str:
+    """Resolve an operator's logical output dtype from ``precision_abi``, ports, or metadata."""
+    p_abi = getattr(op, "precision_abi", None)
+    if p_abi is not None and getattr(p_abi, "output_dtype", ""):
+        return str(p_abi.output_dtype).strip()
+    meta = dict(op.metadata) if op.metadata else {}
+    for port in meta.get("typed_outputs", ()):
+        if isinstance(port, Mapping) and port.get("dtype"):
+            return str(port["dtype"]).strip()
+    return str(meta.get("output_format") or op.dtype or "").strip()
+
+
+def _unabsorbed_splitv_consumers(
     siblings: Sequence[OpSpec],
     all_ops: Mapping[str, OpSpec] | None,
-) -> tuple[float, int]:
-    """Price physical unabsorbed SplitV / DataCopyPad HBM R+W and launch count.
-
-    Single-row outputs (``M <= 1``) slice contiguously with zero copy.
-    Multi-row outputs (``M > 1``) require physical contiguous slice
-    materialization (``SplitV`` / ``DataCopyPad``) unless EVERY downstream
-    consumer explicitly declares ``accepts_strided_view=True`` or
-    ``packed_view_compatible=True``. Unknown output dtypes fail fast.
-    """
+) -> tuple[float, int, frozenset[str], tuple[int, ...], str]:
+    """Return ``(splitv_hbm, splitv_launches, consumer_ids, copy_shape, copy_dtype)``."""
     if not all_ops or len(siblings) < 2:
-        return 0.0, 0
+        return 0.0, 0, frozenset(), (), ""
     sib_ids = {op.op_id for op in siblings}
     m_dim = int(siblings[0].local_shape[0]) if len(siblings[0].local_shape) >= 2 else 0
     if m_dim <= 1:
-        return 0.0, 0
+        return 0.0, 0, frozenset(), (), ""
     consumers_by_sib: dict[str, set[str]] = {op.op_id: set() for op in siblings}
+    contiguous_consumers: set[str] = set()
     for cand in all_ops.values():
         if cand.op_id in sib_ids:
             continue
-        matched = [dep for dep in cand.deps if dep in consumers_by_sib]
+        matched = [dep for dep in _op_data_producers(cand, all_ops) if dep in consumers_by_sib]
         if not matched:
             continue
         meta = dict(cand.metadata) if cand.metadata else {}
         if bool(meta.get("accepts_strided_view")) or bool(meta.get("packed_view_compatible")):
             continue
+        contiguous_consumers.add(cand.op_id)
         for dep in matched:
             consumers_by_sib[dep].add(cand.op_id)
     total_slice_bytes = 0.0
+    materialized_cols = 0
+    slice_dtypes: set[str] = set()
     unabsorbed_slices = 0
     for op in siblings:
         if not consumers_by_sib[op.op_id]:
             continue
         n_dim = int(op.local_shape[1]) if len(op.local_shape) >= 2 else 0
-        meta = dict(op.metadata) if op.metadata else {}
-        out_dt = str(meta.get("output_format") or op.dtype or "").strip()
+        out_dt = _op_output_dtype(op)
         if not out_dt:
             raise ModelingError(f"rewrite_splitv_dtype_missing:{op.op_id}")
         elem = float(dtype_bytes(out_dt))
         total_slice_bytes += float(m_dim * n_dim) * elem
+        materialized_cols += n_dim
+        slice_dtypes.add(out_dt)
         unabsorbed_slices += 1
     if total_slice_bytes <= 0.0 or unabsorbed_slices == 0:
-        return 0.0, 0
-    # One physical SplitV launch reads the packed output and writes each contiguous slice.
-    return 2.0 * total_slice_bytes, 1
+        return 0.0, 0, frozenset(), (), ""
+    if len(slice_dtypes) == 1:
+        copy_dtype = next(iter(slice_dtypes))
+        copy_shape: tuple[int, ...] = (m_dim, materialized_cols)
+    else:
+        copy_dtype = "uint8"
+        copy_shape = (int(round(total_slice_bytes)),)
+    return 2.0 * total_slice_bytes, 1, frozenset(contiguous_consumers), copy_shape, copy_dtype
+
+
+def _unabsorbed_splitv_cost(
+    siblings: Sequence[OpSpec],
+    all_ops: Mapping[str, OpSpec] | None,
+) -> tuple[float, int]:
+    """Price physical unabsorbed SplitV / DataCopyPad HBM R+W and launch count."""
+    hbm, launches, _, _, _ = _unabsorbed_splitv_consumers(siblings, all_ops)
+    return hbm, launches
 
 
 def has_illegal_cross_precision_merge(ops: Sequence[OpSpec]) -> bool:
@@ -899,9 +1102,30 @@ def _law2_matrix_metadata(
     return out
 
 
-def _resident_savings(members, kernel_for, preserved, external_reads, path, all_ops=None):
-    """Elide on-chip intermediate HBM round-trips verified by datapath + TileSolver."""
-    saved_read = saved_write = 0.0
+def _is_data_consumer(source_id: str, consumer: OpSpec, scope_ops: Mapping[str, OpSpec]) -> bool:
+    """True iff ``source_id`` feeds a tensor data port of ``consumer`` (never pure control)."""
+    ctrl = control_dependency_names(consumer, scope_ops)
+    ports = full_operand_ports(consumer, scope_ops)
+    if any(dep == source_id for dep, _ in ports):
+        return True
+    if any(
+        isinstance(port, Mapping)
+        and port.get("producer") == source_id
+        and str(port.get("role") or "").strip().lower() not in {"control", "barrier", "event"}
+        for _, port in _typed_inputs(consumer)
+    ):
+        return True
+    if source_id in _named_inputs(consumer).values():
+        return True
+    return source_id in consumer.deps and source_id not in ctrl and not ports
+
+
+def _resident_savings_detail(
+    members, kernel_for, preserved, external_reads, path, all_ops=None,
+) -> tuple[float, float, float, float, float]:
+    """Return ``(saved_read, saved_write, saved_aic_read, saved_aiv_read, fixpipe_bytes)``."""
+    scope_ops = all_ops if all_ops is not None else {op.op_id: op for op in members}
+    saved_read = saved_write = saved_aic = saved_aiv = fixpipe_b = 0.0
     for source in members:
         if source.op_id in preserved or source.op_id in external_reads:
             continue
@@ -911,13 +1135,7 @@ def _resident_savings(members, kernel_for, preserved, external_reads, path, all_
         writes = float(raw_writes) if explicit_w else min(float(source.hbm_bytes), float(source.mte3_bytes))
         if not 0.0 < writes <= min(float(source.hbm_bytes), float(source.mte3_bytes)):
             continue
-        consumers = [
-            op for op in members
-            if source.op_id in op.deps or any(
-                isinstance(port, Mapping) and port.get("producer") == source.op_id
-                for port in dict(op.metadata).get("typed_inputs", ())
-            )
-        ]
+        consumers = [op for op in members if _is_data_consumer(source.op_id, op, scope_ops)]
         if len(consumers) != 1:
             continue
         target = consumers[0]
@@ -926,11 +1144,13 @@ def _resident_savings(members, kernel_for, preserved, external_reads, path, all_
         tm = dict(target.metadata)
         s_owner, t_owner = sm.get("owner_id"), tm.get("owner_id")
         owners_conflict = s_owner is not None and t_owner is not None and s_owner != t_owner
-        if source.flops and not target.flops:
+        src_is_mat = bool(source.flops or source.matrix_flops)
+        tgt_is_mat = bool(target.flops or target.matrix_flops)
+        if src_is_mat and not tgt_is_mat:
             route = bool(path.has_l0c_to_ub) and _tile_fits_resident_pool(source, target, "ub", path)
-        elif not source.flops and target.flops:
+        elif not src_is_mat and tgt_is_mat:
             route = bool(path.has_ub_to_l1) and _tile_fits_resident_pool(source, target, "l1", path)
-        elif not source.flops and not target.flops:
+        elif not src_is_mat and not tgt_is_mat:
             route = (not owners_conflict) and _tile_fits_resident_pool(source, target, "ub", path)
         else:
             route = (s_owner is not None and s_owner == t_owner
@@ -953,10 +1173,19 @@ def _resident_savings(members, kernel_for, preserved, external_reads, path, all_
         if route and 0.0 < handoff <= min(float(target.hbm_bytes), float(target.mte2_bytes)):
             saved_read += handoff
             saved_write += handoff
-    saved_read += _sibling_activation_dedup_bytes(members, kernel_for, all_ops=all_ops)
+            if tgt_is_mat:
+                saved_aic += handoff
+            else:
+                saved_aiv += handoff
+                if src_is_mat and path.has_l0c_to_ub:
+                    fixpipe_b += handoff
+    sib_saved = _sibling_activation_dedup_bytes(members, kernel_for, all_ops=all_ops)
+    saved_read += sib_saved
+    saved_aic += sib_saved
     max_m2 = sum(float(op.mte2_bytes) for op in members)
     max_m3 = sum(float(op.mte3_bytes) for op in members)
     max_hbm = sum(float(op.hbm_bytes) for op in members)
+    raw_saved_read = saved_read
     saved_read = min(saved_read, max_m2)
     saved_write = min(saved_write, max_m3)
     if saved_read + saved_write > max_hbm:
@@ -964,6 +1193,88 @@ def _resident_savings(members, kernel_for, preserved, external_reads, path, all_
         trim_r = min(saved_read, excess)
         saved_read -= trim_r
         saved_write = max(0.0, saved_write - (excess - trim_r))
+    if raw_saved_read > 0.0 and saved_read < raw_saved_read:
+        scale = saved_read / raw_saved_read
+        saved_aic *= scale
+        saved_aiv *= scale
+        fixpipe_b *= scale
+    return saved_read, saved_write, saved_aic, saved_aiv, fixpipe_b
+
+
+def _fused_owner_pipe_meta(
+    ordered: Sequence[OpSpec],
+    fused_mte2: float,
+    saved_aic: float,
+    saved_aiv: float,
+    fixpipe_bytes: float,
+) -> list[tuple[str, Any]]:
+    """Build per-owner MTE2 pipe split, FixPipe handoff, and SIMT metadata for a fused op."""
+    extra: list[tuple[str, Any]] = []
+    has_cube = any(op.flops > 0 or op.matrix_flops for op in ordered)
+    has_vec = any(not (op.flops > 0 or op.matrix_flops) and op.vector_ops > 0 for op in ordered)
+    if has_cube and has_vec and fused_mte2 > 0.0:
+        raw_aic = sum(float(op.mte2_bytes) for op in ordered if op.flops > 0 or op.matrix_flops)
+        raw_aiv = sum(float(op.mte2_bytes) for op in ordered if not (op.flops > 0 or op.matrix_flops))
+        res_aiv = max(0.0, raw_aiv - saved_aiv)
+        res_aic = max(0.0, raw_aic - saved_aic)
+        tot_res = res_aic + res_aiv
+        if tot_res > 0.0 and tot_res != fused_mte2:
+            ratio = fused_mte2 / tot_res
+            res_aic *= ratio
+            res_aiv *= ratio
+        if res_aic > 0.0 and res_aiv > 0.0:
+            extra.append(("fused_mte2_aic_bytes", res_aic))
+            extra.append(("fused_mte2_aiv_bytes", res_aiv))
+        elif res_aiv > 0.0 and res_aic <= 0.0:
+            extra.append(("read_pipe", "aiv"))
+        elif res_aic > 0.0 and res_aiv <= 0.0:
+            extra.append(("read_pipe", "aic"))
+    if fixpipe_bytes > 0.0:
+        extra.append(("fixpipe_bytes", fixpipe_bytes))
+    if any(
+        dict(op.metadata).get("uses_simt")
+        or dict(op.metadata).get("tile_uses_simt")
+        or dict(op.metadata).get("template_param_uses_simt")
+        or str(dict(op.metadata).get("backend_target") or dict(op.metadata).get("backend") or "").strip().lower() in _SIMT_BACKENDS
+        for op in ordered
+    ):
+        extra.append(("uses_simt", True))
+    return extra
+
+
+def _build_splitv_op(
+    fused_id: str,
+    fused: OpSpec,
+    tail: OpSpec,
+    copy_shape: tuple[int, ...],
+    copy_dtype: str,
+    splitv_hbm: float,
+    splitv_launches: int,
+) -> OpSpec:
+    """Lower contiguous slice materialization for a packed Law-2 GEMM to its own executable copy op."""
+    splitv_half = _SPLITV_COPY_HALF * splitv_hbm
+    return OpSpec(
+        op_id=f"{fused_id}:splitv", family="tensor_copy", phase=tail.phase,
+        stage=tail.stage, layer=tail.layer, requests=tail.requests,
+        semantic_shape=copy_shape, local_shape=copy_shape,
+        padded_shape=copy_shape, launch_shape=copy_shape,
+        deps=(fused_id,), dtype=copy_dtype or tail.dtype, layout="contiguous",
+        recipe="tensor_copy", stream=fused.stream,
+        hbm_bytes=splitv_hbm, mte2_bytes=splitv_half, mte3_bytes=splitv_half,
+        returns=fused.returns,
+        metadata=(
+            ("splitv_for", fused_id),
+            ("splitv_unabsorbed_hbm_bytes", splitv_hbm),
+            ("splitv_launch_count", splitv_launches),
+        ),
+    )
+
+
+def _resident_savings(members, kernel_for, preserved, external_reads, path, all_ops=None):
+    """Elide on-chip intermediate HBM round-trips verified by datapath + TileSolver."""
+    saved_read, saved_write, _, _, _ = _resident_savings_detail(
+        members, kernel_for, preserved, external_reads, path, all_ops=all_ops,
+    )
     return saved_read, saved_write
 
 class _RankDraft:
@@ -1070,10 +1381,12 @@ class _RankDraft:
                         users[event.record_after].add(target)
         return _convex_from_index(users, keys, _compute_topo_pos(deps))
 
-    def _update_topo_after_replace(self, removed: set[str], replacement: str | None) -> None:
+    def _update_topo_after_replace(
+        self, removed: set[str], replacement: str | None, *, extra_added: bool = False,
+    ) -> None:
         if self._topo_pos is None:
             return
-        if self.stream is not None and self.stream.events:
+        if extra_added or (self.stream is not None and self.stream.events):
             self._topo_pos = None
             return
         for key in removed:
@@ -1082,10 +1395,13 @@ class _RankDraft:
             return
         preds = self._base_deps.get(replacement, ())
         succs = self._base_users.get(replacement, ())
+        if any(p not in self._topo_pos for p in preds) or any(s not in self._topo_pos for s in succs):
+            self._topo_pos = None
+            return
         if replacement in self._topo_pos:
             pos = self._topo_pos[replacement]
-            if any(self._topo_pos.get(p, inf) >= pos for p in preds) or any(
-                self._topo_pos.get(s, -inf) <= pos for s in succs
+            if any(self._topo_pos[p] >= pos for p in preds) or any(
+                self._topo_pos[s] <= pos for s in succs
             ):
                 self._topo_pos = None
             return
@@ -1121,19 +1437,74 @@ class _RankDraft:
             raise ModelingError(f"rewrite_unknown_port:{op.op_id}:{ref.name}:{ref.version}")
         return op
 
-    def replace_nodes(self, removed, replacement, outputs=None):
+    def _rebind_leases_after_replace(self, removed: set[str], replacement: str | None) -> None:
+        if not self.leases:
+            return
+        updated: list[PrefetchLease] = []
+        seen_targets: set[str] = set()
+        rebound_any = False
+        for lease in self.leases:
+            target_hit = lease.target_op in removed
+            anchor_hit = lease.window_anchor_op in removed
+            if not target_hit and not anchor_hit:
+                if lease.target_op in seen_targets:
+                    raise ModelingError(f"rewrite_prefetch_duplicate_target:{lease.target_op}")
+                seen_targets.add(lease.target_op)
+                updated.append(lease)
+                continue
+            rebound_any = True
+            new_target = replacement if target_hit else lease.target_op
+            new_anchor = replacement if anchor_hit else lease.window_anchor_op
+            if (
+                new_target is None or new_anchor is None
+                or new_target not in self.ops or new_anchor not in self.ops
+                or new_target == new_anchor
+            ):
+                raise ModelingError(f"rewrite_prefetch_composition_invalid:{lease.edit_id}")
+            if new_target in seen_targets:
+                raise ModelingError(f"rewrite_prefetch_duplicate_target:{new_target}")
+            seen_targets.add(new_target)
+            target_op = self.ops[new_target]
+            if target_hit:
+                tmeta = dict(target_op.metadata)
+                weight = _static_weight_value(tmeta)
+                if (
+                    type(weight) not in {int, float} or not isfinite(weight)
+                    or weight < lease.max_bytes or target_op.hbm_bytes < lease.max_bytes
+                    or tmeta.get("weight_is_dynamic")
+                ):
+                    raise ModelingError(f"rewrite_prefetch_composition_invalid:{lease.edit_id}")
+                self.ops[new_target] = _annotate(
+                    target_op,
+                    weight_prefetch_pool=lease.pool,
+                    weight_prefetch_bytes=lease.max_bytes,
+                    weight_prefetch_foreground_bytes=target_op.hbm_bytes - lease.max_bytes,
+                )
+            updated.append(replace(lease, target_op=new_target, window_anchor_op=new_anchor))
+        if rebound_any:
+            topo = {
+                op.op_id: index
+                for index, op in enumerate(_topological(self.ops, dependencies=self._base_deps))
+            }
+            for lease in updated:
+                if topo[lease.window_anchor_op] >= topo[lease.target_op]:
+                    raise ModelingError(f"rewrite_prefetch_anchor_not_ready:{lease.edit_id}")
+        self.leases = updated
+
+    def replace_nodes(self, removed, replacement, outputs=None, *, consumer_redirects=None):
         removed = removed - {replacement}
-        redirects = dict.fromkeys(removed, replacement)
         affected = [key for key in self._consumer_ids(removed) if key in self.ops]
         for key in affected:
             op = self.ops[key]
+            target_rep = consumer_redirects.get(key, replacement) if consumer_redirects else replacement
+            redirects = dict.fromkeys(removed, target_rep)
             ports = input_port_entries(op.metadata)
             typed = {port.get("producer") for _, port in _typed_inputs(op)}
             controls = declared_control_order(op.metadata)
             named = {k: v for k, v in _named_inputs(op).items() if v in self.ops or v in removed}
             inputs = (*op.deps, *controls, *(dep for dep, _ in ports), *sorted(typed - {None}), *named.values())
             if removed.intersection(inputs):
-                metadata = rewritten_control_metadata(op.metadata, redirects) if replacement else tuple(
+                metadata = rewritten_control_metadata(op.metadata, redirects) if target_rep else tuple(
                     (k, {dep: item for dep, item in v.items() if dep not in removed}
                      if isinstance(v, Mapping) else tuple(dep for dep in control_value_names(v) if dep not in removed))
                     if k in CONTROL_METADATA_KEYS else (k, v) for k, v in op.metadata
@@ -1147,7 +1518,7 @@ class _RankDraft:
                                                port.removeprefix(dep + ":"))
                     if name == "output" and port == f"{dep}:out":
                         name = "out"
-                    return endpoint(dep), f"{replacement}:{name}" if dep in removed else port
+                    return endpoint(dep), f"{target_rep}:{name}" if dep in removed else port
 
                 def typed_port(port):
                     producer = port["producer"]
@@ -1164,7 +1535,7 @@ class _RankDraft:
                     typed_port(port)
                     if isinstance(port, Mapping) and port.get("producer") in removed else port
                     for port in v if not isinstance(port, Mapping)
-                    or port.get("producer") not in removed or replacement is not None
+                    or port.get("producer") not in removed or target_rep is not None
                 ) if k in {"typed_inputs", "input_ports"} else v) for k, v in metadata)
                 deps = tuple(dict.fromkeys(dep for src in inputs
                     if (dep := endpoint(src)) and dep != key))
@@ -1174,6 +1545,10 @@ class _RankDraft:
             self._remove_op_index(key)
         if replacement is not None and replacement in self.ops:
             self._reindex_op_inputs(replacement)
+        if consumer_redirects:
+            for extra_rep in set(consumer_redirects.values()):
+                if extra_rep and extra_rep in self.ops and extra_rep != replacement:
+                    self._reindex_op_inputs(extra_rep)
         for key in affected:
             self._reindex_op_inputs(key)
         if self.stream is not None:
@@ -1185,26 +1560,61 @@ class _RankDraft:
                 if len(lanes) > 1:
                     raise ModelingError("rewrite_cross_stream_contraction")
                 if lanes:
-                    assign[replacement] = lanes.pop()
+                    lane = lanes.pop()
+                    assign[replacement] = lane
+                    if consumer_redirects:
+                        for extra_rep in set(consumer_redirects.values()):
+                            if extra_rep and extra_rep in self.ops and extra_rep != replacement:
+                                assign[extra_rep] = lane
             def endpoint(key):
                 return replacement if key in removed else key
 
             events = []
+            used_ev_ids = {ev.event_id for ev in self.stream.events}
             for event in self.stream.events:
-                record = endpoint(event.record_after)
-                waits = tuple(dict.fromkeys(
-                    key for item in event.wait_before if (key := endpoint(item)) and key != record
-                ))
-                if record and waits:
-                    events.append(replace(event, record_after=record, wait_before=waits))
+                base_rec = endpoint(event.record_after)
+                if not base_rec:
+                    continue
+                by_rec: dict[str, list[str]] = {}
+                for item in event.wait_before:
+                    target = endpoint(item)
+                    if not target:
+                        continue
+                    rec = (
+                        consumer_redirects.get(item, base_rec)
+                        if consumer_redirects and event.record_after in removed
+                        else base_rec
+                    )
+                    if rec and target != rec:
+                        by_rec.setdefault(rec, []).append(target)
+                kept_primary = False
+                for rec, targets in by_rec.items():
+                    waits = tuple(dict.fromkeys(targets))
+                    if not waits:
+                        continue
+                    if not kept_primary and (rec == base_rec or base_rec not in by_rec):
+                        ev_id = event.event_id
+                        kept_primary = True
+                    else:
+                        ev_id = f"{event.event_id}:{rec}"
+                        while ev_id in used_ev_ids:
+                            ev_id = f"{ev_id}:split"
+                        used_ev_ids.add(ev_id)
+                    events.append(replace(event, event_id=ev_id, record_after=rec, wait_before=waits))
             self.stream = replace(self.stream, assignments=tuple(
                 (key, value) for key, value in assign.items() if key not in removed
             ), events=tuple(events))
-        self._update_topo_after_replace(removed, replacement)
+        has_extra = bool(
+            consumer_redirects
+            and any(extra and extra in self.ops and extra != replacement for extra in consumer_redirects.values())
+        )
+        self._update_topo_after_replace(removed, replacement, extra_added=has_extra)
+        self._rebind_leases_after_replace(removed, replacement)
 
     def _assemble_fused_op(
         self, *, fused_id, spec, ordered, keys, kernel_for, dependencies,
         boundary, typed, named, cut, live, declared, read, write, consumer_ops=None,
+        saved_aic=0.0, saved_aiv=0.0, fixpipe_bytes=0.0,
     ):
         tail = ordered[-1]
         matrix = Counter()
@@ -1241,19 +1651,21 @@ class _RankDraft:
         )
         splitv_hbm = 0.0
         splitv_launches = 0
+        splitv_consumers: frozenset[str] = frozenset()
+        splitv_shape: tuple[int, ...] = ()
+        splitv_dtype = ""
         if is_law2_sibling_gemm:
             fused_shape = (
                 int(ordered[0].local_shape[0]),
                 sum(int(op.local_shape[1]) for op in ordered),
                 int(ordered[0].local_shape[2]),
             )
-            splitv_hbm, splitv_launches = _unabsorbed_splitv_cost(
+            splitv_hbm, splitv_launches, splitv_consumers, splitv_shape, splitv_dtype = _unabsorbed_splitv_consumers(
                 ordered, self.ops if consumer_ops is None else consumer_ops,
             )
-        splitv_half = 0.5 * splitv_hbm
-        fused_mte2 = sum(op.mte2_bytes for op in ordered) - read + splitv_half
-        fused_mte3 = sum(op.mte3_bytes for op in ordered) - write + splitv_half
-        fused_hbm = sum(op.hbm_bytes for op in ordered) - read - write + splitv_hbm
+        fused_mte2 = sum(op.mte2_bytes for op in ordered) - read
+        fused_mte3 = sum(op.mte3_bytes for op in ordered) - write
+        fused_hbm = sum(op.hbm_bytes for op in ordered) - read - write
         extra_meta: list[tuple[str, Any]] = [
             ("fusion_tier", spec.fusion_tier),
             ("kernel_abi", abi),
@@ -1261,6 +1673,7 @@ class _RankDraft:
             ("gm_round_trip_eliminated_bytes", read + write),
             ("fusion_route", "resident" if read or write else "gm_spill"),
         ]
+        extra_meta.extend(_fused_owner_pipe_meta(ordered, fused_mte2, saved_aic, saved_aiv, fixpipe_bytes))
         if spec.backend_target is not None:
             extra_meta.append(("backend_target", spec.backend_target))
         if spec.abi_query_digest:
@@ -1311,7 +1724,12 @@ class _RankDraft:
         if typed_outputs:
             metadata += (("typed_outputs", typed_outputs),)
         fused = replace(fused, deps=tuple(dict.fromkeys((*fused.deps, *sorted(cut)))), metadata=metadata)
-        return fused, outputs
+        splitv_op = (
+            _build_splitv_op(fused_id, fused, tail, splitv_shape, splitv_dtype, splitv_hbm, splitv_launches)
+            if (splitv_hbm > 0.0 and splitv_launches > 0 and splitv_consumers and splitv_shape)
+            else None
+        )
+        return fused, outputs, splitv_op, splitv_consumers
 
     def fuse(self, edit, scenario):
         spec = edit.operation
@@ -1346,7 +1764,10 @@ class _RankDraft:
                          if port[0] not in keys))
         typed = tuple((key, port) for op in ordered for key, port in _typed_inputs(op)
                       if port.get("producer") not in keys)
-        named = {key: dep for op in ordered for key, dep in _named_inputs(op).items() if dep not in keys}
+        named = {
+            key: dep for op in ordered for key, dep in _named_inputs(op).items()
+            if dep not in keys and dep in self.ops
+        }
         cut = {dep for op in ordered for dep in (*op.deps, *dependencies[op.op_id]) if dep not in keys}
         users = tuple(self.ops[cid] for cid in self._consumer_ids(keys) if cid in self.ops)
         declared = {(port["producer"], *_port_key(port)) for op in users
@@ -1369,19 +1790,29 @@ class _RankDraft:
         if fused_id in self.ops:
             raise ModelingError(f"rewrite_duplicate_fused_id:{fused_id}")
         path = _path(scenario, self.replica, ordered[-1].stage)
-        read, write = _resident_savings(ordered, kernel_for, preserved, readers, path, all_ops=self.ops)
+        read, write, saved_aic, saved_aiv, fixpipe_b = _resident_savings_detail(
+            ordered, kernel_for, preserved, readers, path, all_ops=self.ops,
+        )
         live = consumed | declared | {key for key in retained if key[0] in keys}
-        fused, outputs = self._assemble_fused_op(
+        fused, outputs, splitv_op, splitv_consumers = self._assemble_fused_op(
             fused_id=fused_id, spec=spec, ordered=ordered, keys=keys,
             kernel_for=kernel_for, dependencies=dependencies, boundary=boundary,
             typed=typed, named=named, cut=cut, live=live, declared=declared,
             read=read, write=write, consumer_ops={op.op_id: op for op in users},
+            saved_aic=saved_aic, saved_aiv=saved_aiv, fixpipe_bytes=fixpipe_b,
         )
+        if splitv_op is not None and (splitv_op.op_id in self.ops or splitv_op.op_id == fused_id):
+            raise ModelingError(f"rewrite_duplicate_fused_id:{splitv_op.op_id}")
         insertion = next(key for key in self.ops if key in keys)
+        inserted = ((fused_id, fused), (splitv_op.op_id, splitv_op)) if splitv_op is not None else ((fused_id, fused),)
         self.ops = {key: item for previous, op in self.ops.items() for key, item in (
-            ((fused_id, fused), (previous, op)) if previous == insertion else ((previous, op),))}
+            (*inserted, (previous, op)) if previous == insertion else ((previous, op),))}
         self._reindex_op_inputs(fused_id)
-        self.replace_nodes(keys, fused_id, outputs)
+        consumer_redirects = None
+        if splitv_op is not None:
+            self._reindex_op_inputs(splitv_op.op_id)
+            consumer_redirects = dict.fromkeys(splitv_consumers, splitv_op.op_id)
+        self.replace_nodes(keys, fused_id, outputs, consumer_redirects=consumer_redirects)
         self.absorbed[fused_id] = tuple(atom for op in ordered
                                         for atom in self.absorbed.pop(op.op_id, (op.op_id,)))
         self.tiers[fused_id] = spec.fusion_tier
@@ -1419,7 +1850,7 @@ class _RankDraft:
         if spec.scope == "load_time":
             initialized = set(self.hoisted)
             for op in _topological(self.ops, dependencies=self._base_deps):
-                if _immutable(op) and set(op.deps) <= initialized:
+                if _immutable(op) and self._base_deps[op.op_id] <= initialized:
                     initialized.add(op.op_id)
             if set(ids) - initialized:
                 raise ModelingError("rewrite_load_time_dynamic_input")
@@ -1441,6 +1872,26 @@ def _immutable(op):
     meta = dict(op.metadata)
     return bool(meta.get("constant") or meta.get("immutable") or meta.get("load_time")
                 or op.family == "constant") and not (op.link_bytes or meta.get("state_effect"))
+def _lane_pool_unit_ids(lane_owners, pool: str, total_units: int) -> tuple[int, ...]:
+    """Resolve physical pool unit IDs owned by ``lane_owners`` for ``pool``."""
+    count = max(1, int(total_units))
+    if lane_owners is None:
+        return tuple(range(count))
+    if pool in {"l1", "l0a", "l0b", "l0c"}:
+        if lane_owners.isolation == "disjoint" and lane_owners.aic:
+            return tuple(int(u) for u in lane_owners.aic)
+        pool_ids = tuple(int(u) for u in lane_owners.pool_aic) if lane_owners.pool_aic else tuple(range(count))
+        lim = int(lane_owners.aic_limit) if lane_owners.aic_limit else len(pool_ids)
+        return pool_ids[:max(1, min(lim, len(pool_ids)))]
+    if pool == "ub":
+        if lane_owners.isolation == "disjoint" and lane_owners.aiv:
+            return tuple(int(u) for u in lane_owners.aiv)
+        pool_ids = tuple(int(u) for u in lane_owners.pool_aiv) if lane_owners.pool_aiv else tuple(range(count))
+        lim = int(lane_owners.aiv_limit) if lane_owners.aiv_limit else len(pool_ids)
+        return pool_ids[:max(1, min(lim, len(pool_ids)))]
+    return tuple(range(count))
+
+
 def _prefetch(draft, edit, scenario):
     spec = edit.operation
     target, anchor = draft.port(spec.target_port), draft.port(spec.window_anchor)
@@ -1450,7 +1901,7 @@ def _prefetch(draft, edit, scenario):
     if ordered[anchor.op_id] >= ordered[target.op_id]:
         raise ModelingError("rewrite_prefetch_anchor_not_ready")
     meta = dict(target.metadata)
-    weight = meta.get("weight_bytes", meta.get("local_weight_bytes", meta.get("weight_read_bytes", 0)))
+    weight = _static_weight_value(meta)
     if (type(weight) not in {int, float} or not isfinite(weight) or weight <= 0
             or meta.get("weight_is_dynamic") or spec.target_port.version != 0):
         raise ModelingError("rewrite_prefetch_static_weight_required")
@@ -1458,13 +1909,23 @@ def _prefetch(draft, edit, scenario):
         raise ModelingError("rewrite_prefetch_max_bytes_invalid")
     if any(lease.target_op == target.op_id for lease in draft.leases):
         raise ModelingError("rewrite_prefetch_duplicate_target")
-    cap = _path(scenario, draft.replica, target.stage).usable_bytes(spec.pool)
+    die = _die(scenario, draft.replica, target.stage)
+    path = _path(scenario, draft.replica, target.stage)
+    lane = (
+        dict(draft.stream.assignments).get(target.op_id, target.stream or MAIN_STREAM)
+        if draft.stream is not None else (target.stream or MAIN_STREAM)
+    )
+    lane_owners = bind_stream_owners(draft.stream, path).get(lane) if draft.stream is not None else None
+    unit_ids = _lane_pool_unit_ids(lane_owners, spec.pool, max(1, int(die.pool_units(spec.pool))))
+    units = len(unit_ids)
+    cap = path.usable_bytes(spec.pool) * units
     limit = cap if spec.max_bytes is None else min(cap, spec.max_bytes)
     amount = min(int(weight), int(target.hbm_bytes), limit)
     if amount:
         draft.leases.append(PrefetchLease(
             edit.edit_id, target.op_id, spec.target_port.name,
             anchor.op_id, spec.pool, amount, replica=draft.replica,
+            physical_units=units, physical_unit_ids=unit_ids,
         ))
         # The replay moves these bytes only when a physical DMA/lease is bound.
         draft.ops[target.op_id] = _annotate(target, weight_prefetch_pool=spec.pool,
@@ -1472,11 +1933,13 @@ def _prefetch(draft, edit, scenario):
                                              weight_prefetch_foreground_bytes=target.hbm_bytes - amount)
     return ((target.op_id,) if amount else ()), (target.op_id,)
 def _quantize(draft, spec, scenario):
-    if spec.group_size is not None and spec.group_size <= 0:
+    if spec.group_size is not None and spec.group_size < 0:
         raise ModelingError("rewrite_quant_group_invalid")
-    for dtype in (spec.w_dtype, spec.a_dtype, spec.kv_dtype, spec.scale_dtype):
+    for dtype in (spec.w_dtype, spec.a_dtype, spec.kv_dtype):
         if dtype is not None:
             dtype_bytes(dtype)
+    if spec.scale_dtype is not None and spec.scale_dtype != "":
+        dtype_bytes(spec.scale_dtype)
     contract = scenario.case.model.quant
     if contract is not None:
         declared = (contract.weight_format, contract.activation_format, contract.kv_dtype)
@@ -1535,7 +1998,9 @@ def _target_edit(draft, edit, scenario):
             raise ModelingError("rewrite_template_params_invalid")
         hints = {f"template_param_{k}": v for k, v in params.items()}
         draft.ops[key] = _annotate(target, template_tier=spec.tier, template_id=spec.template_id, **hints)
-        draft.templates.append(TemplateBinding(edit.edit_id, key, spec.tier, spec.template_id, spec.params))
+        draft.templates.append(TemplateBinding(
+            edit.edit_id, key, spec.tier, spec.template_id, spec.params, replica=draft.replica,
+        ))
     elif isinstance(spec, PipelineTiles):
         tile = spec.tile_spec
         if isinstance(tile, VariantRef):
@@ -1558,14 +2023,16 @@ def _target_edit(draft, edit, scenario):
             solution, candidate = _solve_tiles(scenario, draft.replica, target, tile, draft.stream)
             hints.update(tile_algorithm=solution.algorithm, tile_uses_simt=candidate.uses_simt)
         draft.ops[key] = _annotate(target, **hints)
-        draft.tiles.append(TileBinding(edit.edit_id, key, spec.cohort_split, tile))
+        draft.tiles.append(TileBinding(edit.edit_id, key, spec.cohort_split, tile, replica=draft.replica))
     elif isinstance(spec, CollectiveTransform):
         if not (target.link_bytes > 0 or target.family in _COLLECTIVE_FAMILIES):
             raise ModelingError(f"rewrite_collective_target_invalid:{key}")
         if not spec.mode or not any(link.name == spec.topology_route for link in scenario.case.machine.links):
             raise ModelingError(f"rewrite_collective_route_unknown:{spec.topology_route}")
         draft.ops[key] = _annotate(target, collective_mode=spec.mode, topology_route=spec.topology_route)
-        draft.collectives.append(CollectiveRewriteRecord(edit.edit_id, key, spec.mode, spec.topology_route))
+        draft.collectives.append(CollectiveRewriteRecord(
+            edit.edit_id, key, spec.mode, spec.topology_route, replica=draft.replica,
+        ))
     return (key,), (key,)
 def _execute(draft, edit, scenario, all_ids):
     spec = edit.operation
@@ -1625,6 +2092,7 @@ def apply_plan(plan: RewritePlan, scenario: ResolvedScenario) -> AppliedPlan:
     executable = []
     for draft in drafts:
         ordered = _topological(draft.ops, dependencies=draft._base_deps) if plan.edits else tuple(draft.ops.values())
+        ordered = _materialize_control_deps(ordered)
         if draft.stream is not None:
             ordered = _check_stream(ordered, draft.stream)
         executable.append(RankOps(draft.replica, ordered))
@@ -1635,6 +2103,12 @@ def apply_plan(plan: RewritePlan, scenario: ResolvedScenario) -> AppliedPlan:
             seen_vals.extend(v for v in getattr(draft, attribute) if v not in seen_vals)
         return tuple(seen_vals)
 
+    hoisted_sites = tuple(
+        dict.fromkeys((draft.replica, oid) for draft in drafts for oid in draft.hoisted)
+    )
+    elided_sites = tuple(
+        dict.fromkeys((draft.replica, oid) for draft in drafts for oid in draft.elided)
+    )
     return AppliedPlan(
         plan, plan_sha256(plan), scenario.scenario_sha256, tuple(executable),
         tuple(draft.stream for draft in drafts if draft.stream is not None),
@@ -1643,6 +2117,8 @@ def apply_plan(plan: RewritePlan, scenario: ResolvedScenario) -> AppliedPlan:
         collect("leases"), collect("templates"), collect("tiles"), collect("hoisted"),
         collect("elided"), tuple(quantized), collect("collectives"),
         tuple(dict.fromkeys(item for draft in drafts for item in draft.tiers.items())),
+        hoisted_load_time_sites=hoisted_sites,
+        elided_d2h_sites=elided_sites,
     )
 
 apply = apply_plan
