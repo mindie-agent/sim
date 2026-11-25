@@ -32,6 +32,8 @@ from __future__ import annotations
 import ast
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
+from dataclasses import dataclass
+from fractions import Fraction
 import hashlib
 import keyword
 import math
@@ -44,11 +46,13 @@ from typing import Any, Literal
 from mindie_sim.backends import ascend
 from mindie_sim.observations.multilevel import SHA256_HEX_LENGTH
 from mindie_sim.optimization.dual_bound import (
+    NS_PER_SECOND,
     DagEdge,
     EventDagSpec,
     ResourceChoiceProgram,
     certify_lower_bound,
     check_optimality_certificate,
+    inward_floor_ns,
 )
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
@@ -84,7 +88,6 @@ _ABI_GENERIC = frozenset({"v1", "v2", "v3", "v4", "legacy", "internal", "custom"
 _TEMPLATE_ID_NAMES = frozenset({"TEMPLATE_ID", "TEMPLATE_IDS", "CATLASS_TEMPLATE_IDS", "DSL_KERNEL_IDS"})
 _REQUIRED_FAMILY_FILES = ("__init__.py", "common.py", "arch22.py", "arch35.py")
 _GIT_CAT_TIMEOUT_S = 15
-_NS_PER_SECOND = 1_000_000_000.0
 _DEFAULT_PROBE_SKU = "Ascend910B2"
 _DEFAULT_PROBE_SKU_A5 = "Ascend950DT_9582"
 _DEFAULT_PROBE_SHAPE = (1, 128)
@@ -296,60 +299,132 @@ def _build_default_planning_context(op: OpSpec, *, sku: str = _DEFAULT_PROBE_SKU
     return OperatorPlanningContext(occurrence=OpOccurrence(0, 0, 0, op.op_id), geometry=geom, datapath=dp)
 
 
-def _collect_stages(obj: Any, depth: int = 0) -> list[Any]:
-    if obj is None or depth > _MAX_STAGE_DEPTH or isinstance(obj, (tuple, list, dict, str, bytes, int, float, bool)):
+_SHARED_STAGE_LIST_ATTRS = ("stages", "setup", "drain")
+_BRANCH_CONTAINER_ATTRS = ("branches", "phases", "programs")
+_SINGLE_WRAPPER_ATTRS = ("placed", "program", "inner", "body", "template")
+
+
+@dataclass(frozen=True)
+class _ScopedStage:
+    stage: Any
+    scope: tuple[str | int, ...] = ()
+    repeat: int = 1
+
+
+def _collect_stages(
+    obj: Any, depth: int = 0, scope: tuple[str | int, ...] = (), repeat: int = 1,
+) -> list[_ScopedStage]:
+    if obj is None or depth > _MAX_STAGE_DEPTH or repeat <= 0 or isinstance(obj, (tuple, list, dict, str, bytes, int, float, bool)):
         return []
-    found: list[Any] = []
+    found: list[_ScopedStage] = []
     if hasattr(obj, "work") and hasattr(obj, "name") and hasattr(obj, "after"):
-        found.append(obj)
+        found.append(_ScopedStage(obj, scope, repeat))
         if getattr(obj, "program", None) is not None:
-            found.extend(_collect_stages(obj.program, depth + 1))
+            found.extend(_collect_stages(obj.program, depth + 1, (*scope, "sub"), repeat))
         return found
-    for attr in ("stages", "branches", "phases", "programs"):
+    if hasattr(obj, "stages") and hasattr(obj, "count"):
+        cnt = int(getattr(obj, "count", 1) or 0)
+        if cnt > 0 and isinstance(obj.stages, (tuple, list)):
+            for c in obj.stages:
+                found.extend(_collect_stages(c, depth + 1, (*scope, "phase"), repeat * cnt))
+        res = getattr(obj, "residue_stages", None)
+        if isinstance(res, (tuple, list)):
+            for c in res:
+                found.extend(_collect_stages(c, depth + 1, (*scope, "residue"), repeat))
+        return found
+    for attr in _SHARED_STAGE_LIST_ATTRS:
         ch = getattr(obj, attr, None)
         if isinstance(ch, (tuple, list)):
             for c in ch:
-                found.extend(_collect_stages(c, depth + 1))
-    for attr in ("placed", "program", "inner", "body", "template"):
+                found.extend(_collect_stages(c, depth + 1, (*scope, attr), repeat))
+    for attr in _BRANCH_CONTAINER_ATTRS:
+        ch = getattr(obj, attr, None)
+        if isinstance(ch, (tuple, list)):
+            for idx, c in enumerate(ch):
+                found.extend(_collect_stages(c, depth + 1, (*scope, attr, idx), repeat))
+    for attr in _SINGLE_WRAPPER_ATTRS:
         sub = getattr(obj, attr, None)
         if sub is not None and sub is not obj:
-            found.extend(_collect_stages(sub, depth + 1))
+            found.extend(_collect_stages(sub, depth + 1, (*scope, attr), repeat))
     if not found and hasattr(obj, "work") and callable(getattr(obj, "start", None)):
-        found.append(obj)
+        found.append(_ScopedStage(obj, scope, repeat))
     return found
+
+
+_STAGE_RESOURCE_ALIASES: Mapping[str, str] = {
+    "hbm_bytes": "hbm", "mte2_bytes": "mte2_aiv", "mte2": "mte2_aiv",
+    "mte3_bytes": "mte3", "vector_ops": "vector",
+}
+
+
+def _resolve_stage_resource(
+    raw_name: str, rates: Mapping[str, Any], peaks: Mapping[str, Any],
+) -> tuple[str, float]:
+    rk = str(raw_name)
+    alias_rk = _STAGE_RESOURCE_ALIASES.get(rk, rk)
+    if rk in rates:
+        return rk, float(rates[rk] or 0.0)
+    if alias_rk in rates:
+        return alias_rk, float(rates[alias_rk] or 0.0)
+    if rk in peaks:
+        return "cube", float(peaks[rk] or 0.0)
+    if rk.startswith("cube"):
+        return "cube", float(peaks.get(rk.split(":", 1)[-1], peaks.get("bf16", 0.0)) or 0.0)
+    return alias_rk, 0.0
 
 
 def _certify_stages_dual_bound(stages: Sequence[Any], geom: Geometry) -> tuple[bool, int, str]:
     rates, peaks = dict(geom.rates), dict(geom.compute_peaks)
-    aliases = {"hbm_bytes": "hbm", "mte2_bytes": "mte2_aiv", "mte2": "mte2_aiv", "mte3_bytes": "mte3", "vector_ops": "vector"}
-    res_ns: dict[str, int] = {}
-    quanta, name_idx, edges = [], {}, []
-    for st in stages:
-        st_ns = int(round(float(getattr(st, "latency", 0.0) or 0.0) * NS_PER_MS))
+    res_exact_ns: dict[str, Fraction] = {}
+    quanta: list[int] = []
+    scope_name_idx: dict[tuple[tuple[str | int, ...], str], int] = {}
+    edges: list[DagEdge] = []
+    unresolved_deps: list[tuple[int, tuple[str | int, ...], str]] = []
+    has_executable_work = False
+    for item in stages:
+        st, scope, rep = (item.stage, item.scope, item.repeat) if isinstance(item, _ScopedStage) else (item, (), 1)
+        if rep <= 0:
+            continue
+        lat_ms = float(getattr(st, "latency", 0.0) or 0.0)
+        if not math.isfinite(lat_ms) or lat_ms < 0.0:
+            return False, 0, "resolved_stage_latency_invalid"
+        st_exact_ns = Fraction(lat_ms) * NS_PER_MS if lat_ms > 0.0 else Fraction(0)
+        if lat_ms > 0.0:
+            has_executable_work = True
         wmap = getattr(st, "work", None)
         if isinstance(wmap, Mapping):
             for rn, amt_raw in wmap.items():
                 amt = float(amt_raw)
                 if amt <= 0.0:
                     continue
-                rk = str(rn)
-                rate = float(rates.get(rk) or rates.get(aliases.get(rk, "")) or peaks.get(rk) or (peaks.get(rk.split(":", 1)[-1], peaks.get("bf16", 0.0)) if rk.startswith("cube") else 0.0) or 0.0)
+                if not math.isfinite(amt):
+                    return False, 0, f"resolved_stage_work_invalid:{rn}"
+                canon_rk, rate = _resolve_stage_resource(str(rn), rates, peaks)
                 if rate <= 0.0 or not math.isfinite(rate):
-                    return False, 0, f"resolved_stage_resource_rate_missing:{rk}"
-                dur = max(1, math.ceil(amt / rate * _NS_PER_SECOND))
-                res_ns[rk] = res_ns.get(rk, 0) + dur
-                st_ns = max(st_ns, dur)
-        if st_ns > 0:
-            idx = len(quanta)
-            name_idx[str(getattr(st, "name", f"s{idx}"))] = idx
-            quanta.append(st_ns)
-            edges.extend(DagEdge(name_idx[str(d)], idx, 0) for d in (getattr(st, "after", ()) or ()) if str(d) in name_idx)
-    if not quanta:
+                    return False, 0, f"resolved_stage_resource_rate_missing:{rn}"
+                has_executable_work = True
+                dur_ns = Fraction(amt) * NS_PER_SECOND / Fraction(rate)
+                res_exact_ns[canon_rk] = res_exact_ns.get(canon_rk, Fraction(0)) + dur_ns * rep
+                if dur_ns > st_exact_ns:
+                    st_exact_ns = dur_ns
+        idx = len(quanta)
+        quanta.append(inward_floor_ns(st_exact_ns))
+        for dep in (getattr(st, "after", ()) or ()):
+            dname = str(dep)
+            if (scope, dname) in scope_name_idx and scope_name_idx[(scope, dname)] != idx:
+                edges.append(DagEdge(scope_name_idx[(scope, dname)], idx, 0))
+            else:
+                unresolved_deps.append((idx, scope, dname))
+        scope_name_idx[(scope, str(getattr(st, "name", f"s{idx}")))] = idx
+    if not quanta or not has_executable_work:
         return False, 0, "resolved_operator_program_zero_executable_events"
-    gwork = tuple(sorted(res_ns.values())) if res_ns else (max(quanta),)
+    for dst, scope, dname in unresolved_deps:
+        if (scope, dname) in scope_name_idx and scope_name_idx[(scope, dname)] != dst:
+            edges.append(DagEdge(scope_name_idx[(scope, dname)], dst, 0))
+    gwork = tuple(sorted(inward_floor_ns(total_ns) for total_ns in res_exact_ns.values())) if res_exact_ns else (max(quanta),)
     prog, dag = ResourceChoiceProgram(len(gwork), gwork, ()), EventDagSpec(tuple(quanta), tuple(edges))
     cert, _ = certify_lower_bound(prog, dag)
-    if not check_optimality_certificate(prog, dag, cert) or cert.l_star_lean_ns <= 0:
+    if not check_optimality_certificate(prog, dag, cert) or cert.l_star_lean_ns < 0:
         return False, int(cert.l_star_lean_ns), "lean_optimality_certificate_rejected"
     return True, int(cert.l_star_lean_ns), "verified"
 
@@ -572,6 +647,9 @@ def bench_and_score_operator(
     cap_pct, eff_atol = validate_strict_threshold_pct(threshold_pct), validate_strict_atol_ns(atol_ns)
     plan_doc = dict(read_bounded_json(cliff_plan) if isinstance(cliff_plan, (str, Path)) else cliff_plan)
     plan_sha = verify_cliff_plan_integrity(plan_doc)
+    plan_sku = str(plan_doc.get("sku") or "").strip()
+    if plan_sku and plan_sku != sku:
+        raise ModelingError(f"cliff_plan_sku_mismatch:expected={sku}:plan={plan_sku}")
     plan_family = str(plan_doc.get("family") or "").strip()
     custom_run = (lambda p: bench_dispatcher(p, DEFAULT_GATE_SUBPROCESS_TIMEOUT_S)) if bench_dispatcher is not None else None
     rows, abi_obs, lease_pub, req_npus = acquire_stage3_observations(
@@ -620,16 +698,17 @@ def certify_operator(
     out_receipt: str | Path | None = None, diagnosis_out: str | Path | None = None,
 ) -> dict[str, Any]:
     """Stage 4: Certify operator contract, pointwise cliff APE, certified lower-bound non-inversion, and repo gates."""
-    del capture_root, require_capture_files
     cap_pct, eff_atol = validate_strict_threshold_pct(threshold_pct), validate_strict_atol_ns(atol_ns)
     c_doc = dict(read_bounded_json(contract_report) if isinstance(contract_report, (str, Path)) else contract_report)
     s_doc = dict(read_bounded_json(score_report) if isinstance(score_report, (str, Path)) else score_report)
-    id_ok = str(s_doc.get("target_id") or "") == operator_id and bool(c_doc.get("ok"))
+    c_sku = str(c_doc.get("sku") or "").strip()
+    id_ok = str(s_doc.get("target_id") or "") == operator_id and bool(c_doc.get("ok")) and (not c_sku or c_sku == sku)
     pre = (GateCheckOutcome("operator_contract", id_ok, "pass" if id_ok else "fail", "contract valid" if id_ok else f"contract_or_id_invalid:{operator_id}"),)
     all_ok, status, receipt, diagnosis = finalize_stage4_certification(
         schema=OPERATOR_ONBOARDING_RECEIPT_SCHEMA, target_kind="operator", target_id=operator_id, sku=sku,
         score_doc=s_doc, lean_bounds_json=lean_bounds_json, cap_pct=cap_pct, eff_atol=eff_atol,
         pre_gates=pre, ape_gate_name="cliff_heldout_ape", artifacts={"plan_sha256": str(s_doc.get("plan_sha256") or "")},
+        capture_root=capture_root, require_capture_files=require_capture_files,
         repo_root=repo_root, run_repo_gates=run_repo_gates, orthogonality_base=orthogonality_base,
         out_receipt=out_receipt, diagnosis_out=diagnosis_out,
     )

@@ -34,7 +34,6 @@ L1_CLIFF_REL_TOL = 0.15
 L1_CLIFF_ABS_FLOOR_NS = 3000.0
 P90_QUANTILE = 0.9
 NS_PER_US = 1000.0
-LSTAR_INV_EPS = 1e-6
 DCP_MAX_VERIFIED_KV = 32768
 DCP_MAX_ABS_ERR = 0.05
 FAIL_SENTINEL_APE = 999.0
@@ -44,7 +43,6 @@ ROUND_APE_DIGITS = 4
 DEFAULT_Q_LEN = 1
 MAX_DIFF_PREVIEW = 5
 MIN_POSITIVE = 0.0
-ONE_TOL = 1.0 + LSTAR_INV_EPS
 P99_ORDER_EPS = 1e-9
 ABORT_SUFFIXES: tuple[str, ...] = ("_ABORT", "_TIMEOUT")
 ABORT_ERR_PREFIXES: tuple[str, ...] = ("worker_abort_", "timeout_")
@@ -158,12 +156,14 @@ def score_verdict(
             "ape_pct": FAIL_SENTINEL_APE, "inv_sim": True, "inv_obs": True, "capture_uri": capture_uri,
         }
     meas_ns = meas_p50 * NS_PER_US
+    p99_ns = meas_p99 * NS_PER_US
     pred_ns = pred_us * NS_PER_US
+    lstar_ns = lstar_us * NS_PER_US
     err_ns = abs(pred_ns - meas_ns)
     tol_ns = max(REL_TOL * meas_ns, ABS_FLOOR_NS)
     cliff_tol_ns = max(L1_CLIFF_REL_TOL * meas_ns, L1_CLIFF_ABS_FLOOR_NS)
-    inv_sim = lstar_us > pred_us * ONE_TOL
-    inv_obs = (lstar_us > meas_p50 * ONE_TOL) or (lstar_us > meas_p99 * ONE_TOL)
+    inv_sim = lstar_ns > pred_ns
+    inv_obs = (lstar_ns > meas_ns) or (lstar_ns > p99_ns)
     passed = (err_ns <= tol_ns) and (not inv_sim) and (not inv_obs)
     cliff_passed = (err_ns <= cliff_tol_ns) and (not inv_sim) and (not inv_obs)
     ape_pct = (err_ns / meas_ns) * PCT_SCALE
