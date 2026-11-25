@@ -1858,10 +1858,12 @@ def _graph_operator_rows(records, duration, compact, isolated, durations, warm_d
                 isolated, durations, warm_durations, cold_roots,
                 stream_plans, physical_id)
             continue
+        phys_id = physical_id(op)
         row = {
             "id": record["id"], "replica": r, "op_id": op.op_id, "family": op.family,
             "recipe": op.recipe, "program": record["program"], "stage": op.stage,
             "layer": op.layer, "stream": op.stream or "main", "phase": op.phase,
+            "physical_id": phys_id,
             "source_boundary": op.source_boundary, "predecessors": list(record["predecessors"]),
             "ready_ms": ready_ms, "complete_ms": record["complete"].time,
             "elapsed_ms": record["complete"].time - ready_ms,
@@ -1890,7 +1892,7 @@ def _graph_operator_rows(records, duration, compact, isolated, durations, warm_d
                     isolation_boundary="complete_collective_cohort")
             else:
                 op_stream = (op.stream or "main") if stream_plans else ""
-                key = (r, op.stage, physical_id(op), op_stream)
+                key = (r, op.stage, phys_id, op_stream)
                 cold_ms = 0 if op.family == "barrier" else durations[key]
                 row["isolated_ms"] = cold_ms
                 if op.family != "barrier" and record["id"] not in cold_roots:

@@ -8,7 +8,10 @@
 from __future__ import annotations
 
 from mindie_sim.catalog.context_parallel import cp_interleave
+from mindie_sim.catalog.weight_terms import vocab_parallel_rows
 from mindie_sim.prediction import frontend as _frontend
+from mindie_sim.prediction.sharding.routing import _balanced_ep_owner
+from mindie_sim.schema.common import align_up
 from mindie_sim.schema.model import QuantSpec
 
 
@@ -468,6 +471,11 @@ class _FrontendBody:
                     width=model.hidden_size, dtype=model.activation_dtype)
                 ops.extend(_frontend._scope((gathered,), "ffn"))
                 hidden, ffn_tokens = gathered.op_id, sp.tokens_global
+            resolved_ep_owner = (
+                rank_ledger.owner if rank_ledger is not None else
+                _balanced_ep_owner(p, int(physical_rank), replica=replica, machine=machine)
+                if physical_rank is not None else None
+            )
             ffn_ops, previous = self.ffn[layer.ffn](
                 **{**common, "tokens": ffn_tokens},
                 deps=hidden, parallel=p, global_tokens=global_tokens,
@@ -475,9 +483,9 @@ class _FrontendBody:
                 moe_recipe=runtime.moe_recipe, mc2_chunks=runtime.mc2_chunks,
                 overlap_shared=bool(runtime.multistream_overlap_shared_expert),
                 runtime=runtime, sequence_plan=(sp if (sp_moe if layer.ffn == "moe" else sp_dense) else None),
-                ep_owner=(rank_ledger.owner if rank_ledger is not None else
-                          int(physical_rank) % p.ep if physical_rank is not None else None),
-                price_owner=(rank_ledger.owner if rank_ledger is not None else None),
+                ep_owner=resolved_ep_owner,
+                price_owner=(rank_ledger.owner if rank_ledger is not None else
+                             resolved_ep_owner if explicit_physical_rank else None),
             )
             if sp_dense and layer.ffn == "dense":
                 ffn_ops, previous = _frontend.sequence_parallel.close_output(
@@ -833,20 +841,21 @@ class _FrontendBody:
             ops.extend(finals)
         head_rows = max(rows, int(lmhead_pad_rows or 0))
         if vocab_padding_size > 0:
-            cols_per_rank = (
-                _frontend.math.ceil(model.vocab_size / (p.tp * vocab_padding_size))
-                * vocab_padding_size
-            )
+            alignment = _frontend.math.lcm(int(vocab_padding_size), p.tp)
+            cols_per_rank = int(align_up(model.vocab_size, alignment)) // p.tp
             eff_vocab = p.tp * cols_per_rank
         else:
-            cols_per_rank = _frontend.math.ceil(model.vocab_size / p.tp)
-            eff_vocab = model.vocab_size
+            cols_per_rank = vocab_parallel_rows(model.vocab_size, p.tp)
+            eff_vocab = p.tp * cols_per_rank
         logits = _frontend.gemm_op(
             op_id=prefix + "logits", deps=(last,), stage=stage, layer=-1, requests=requests,
             m=head_rows, n=cols_per_rank, k=model.hidden_size, quant=model.quant,
             category="lm_head", phase=mode, family="logits", recipe="vocab_logits",
             metadata=(
                 (("vocab_padded_size", eff_vocab), ("vocab_cols_per_rank", cols_per_rank))
+                if (vocab_padding_size > 0 or eff_vocab != model.vocab_size) else ()
+            ) + (
+                (("vocab_padding_size", int(vocab_padding_size)),)
                 if vocab_padding_size > 0 else ()
             ) + ((("lmhead_padded_rows", head_rows), ("lmhead_valid_rows", rows)) if head_rows > rows else ()),
         )

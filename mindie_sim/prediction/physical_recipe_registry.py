@@ -226,6 +226,7 @@ def physical_recipe_bindings() -> dict[str, object]:
     from mindie_sim.prediction.operators.mx_quant_matrix.mxfp8_grouped import ScopedSwigluRecipe, build_swiglu_mx_quant
     from .operators.attention import recipes as bsa_recipes
     from .operators.mla_prolog import recipes as prolog_v4_recipes
+    from .operators.mla_prolog.draft_context import recipes as draft_context_recipes
     from .operators.sparse_indexer import recipes as scorer_recipes
     bindings = {recipe: INDEXER for recipe in INDEXER_TOPK_RECIPES}
     bindings.update({
@@ -247,6 +248,7 @@ def physical_recipe_bindings() -> dict[str, object]:
         bsa_recipes(),
         scorer_recipes(),
         prolog_v4_recipes(),
+        draft_context_recipes(),
         lowrank_hc_recipes(),
     ):
         bindings.update(group)

@@ -13,7 +13,76 @@ from mindie_sim.catalog.attention_common import _floor_sum
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
 
-from ...cache_path import CacheGeometry, CacheState
+
+class _LineSegmentCache:
+    """Exact access-order LRU cache over disjoint line intervals per physical stream."""
+
+    __slots__ = ("capacity_lines", "line_bytes", "_segments", "_total_lines")
+
+    def __init__(self, capacity_bytes: int, line_bytes: int) -> None:
+        self.line_bytes = max(1, int(line_bytes))
+        self.capacity_lines = max(0, int(capacity_bytes)) // self.line_bytes
+        self._segments: list[tuple[object, int, int]] = []
+        self._total_lines = 0
+
+    def access_lines(
+        self, stream_key: object, start_line: int, end_line: int,
+    ) -> tuple[tuple[int, int], ...]:
+        """Look up ``[start_line, end_line)``, return missed line spans, and update LRU."""
+        if end_line <= start_line:
+            return ()
+        if self.capacity_lines <= 0:
+            return ((start_line, end_line),)
+        hits: list[tuple[int, int]] = []
+        updated: list[tuple[object, int, int]] = []
+        for seg_key, seg_start, seg_end in self._segments:
+            if seg_key != stream_key or seg_end <= start_line or seg_start >= end_line:
+                updated.append((seg_key, seg_start, seg_end))
+                continue
+            ov_start = max(seg_start, start_line)
+            ov_end = min(seg_end, end_line)
+            hits.append((ov_start, ov_end))
+            self._total_lines -= ov_end - ov_start
+            if seg_start < ov_start:
+                updated.append((seg_key, seg_start, ov_start))
+            if ov_end < seg_end:
+                updated.append((seg_key, ov_end, seg_end))
+        hits.sort()
+        misses: list[tuple[int, int]] = []
+        cursor = start_line
+        for h_start, h_end in hits:
+            if h_start > cursor:
+                misses.append((cursor, h_start))
+            if h_end > cursor:
+                cursor = h_end
+        if cursor < end_line:
+            misses.append((cursor, end_line))
+        req_lines = end_line - start_line
+        if req_lines >= self.capacity_lines:
+            keep_start = end_line - self.capacity_lines
+            self._segments = [(stream_key, keep_start, end_line)]
+            self._total_lines = self.capacity_lines
+            return tuple(misses)
+        updated.append((stream_key, start_line, end_line))
+        self._total_lines += req_lines
+        excess = self._total_lines - self.capacity_lines
+        if excess > 0:
+            trimmed: list[tuple[object, int, int]] = []
+            for seg_key, seg_start, seg_end in updated:
+                if excess <= 0:
+                    trimmed.append((seg_key, seg_start, seg_end))
+                    continue
+                seg_len = seg_end - seg_start
+                if seg_len <= excess:
+                    excess -= seg_len
+                    self._total_lines -= seg_len
+                else:
+                    trimmed.append((seg_key, seg_start + excess, seg_end))
+                    self._total_lines -= excess
+                    excess = 0
+            updated = trimmed
+        self._segments = updated
+        return tuple(misses)
 
 TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 SOURCES: tuple[SourceRef, ...] = (
@@ -88,7 +157,7 @@ def _key_access_plan(spans, *, compression, key_row_bytes, q_row_bytes,
                      q_tile_rows, topk, kv_heads, aiv_units, ub_capacity,
                      l1_capacity, l2_capacity, owner, identity_prefix,
                      gm_capacity=None, exchange_grant=None,
-                     score_row_limit=None):
+                     score_row_limit=None, span_keys=None):
     """Resolve one joint plan for Q/K, scores, lists, exchange and output.
 
     The plan owns Q tile residency, K panel residency and the causal panel
@@ -133,8 +202,17 @@ def _key_access_plan(spans, *, compression, key_row_bytes, q_row_bytes,
             q_tile_rows = max(1, ub_for_tiles // max(1, per_q_ub))
     q_allocation = q_tile_rows * q_row_bytes if l1_capacity > 0 else 0
     k_capacity = max(0, l1_capacity - q_allocation)
-    total_visible = sum(((c + q) // compression) * key_row_bytes
-                        for q, c in spans)
+    resolved_keys = (
+        tuple(span_keys)
+        if span_keys is not None and len(span_keys) == len(spans)
+        else tuple(range(len(spans)))
+    )
+    visible_by_key: dict[object, int] = {}
+    for key, (q, c) in zip(resolved_keys, spans):
+        span_bytes = ((c + q) // compression) * key_row_bytes
+        if span_bytes > visible_by_key.get(key, 0):
+            visible_by_key[key] = span_bytes
+    total_visible = sum(visible_by_key.values())
     retained = l1_capacity > 0 and total_visible <= k_capacity
     k_allocation = (total_visible if retained
                     else min(total_visible, k_capacity))
@@ -145,15 +223,15 @@ def _key_access_plan(spans, *, compression, key_row_bytes, q_row_bytes,
         panel_rows)
     l2_retained = (l2_capacity is not None and l2_capacity > 0
                    and total_visible <= l2_capacity)
-    l1_state = (CacheState(CacheGeometry(k_allocation, line, transfer, 1))
+    l1_state = (_LineSegmentCache(k_allocation, line)
                 if retained and k_allocation > 0 else None)
-    l2_state = (CacheState(CacheGeometry(l2_capacity, line, transfer, 1))
+    l2_state = (_LineSegmentCache(l2_capacity, line)
                 if l2_capacity is not None and l2_capacity > 0 else None)
     (tiles, score_bytes, key_gm, key_hbm, key_logical, q_bytes_total,
      pairs_total, panels_total) = _key_tiles(
         spans, identity_prefix, q_tile_rows, q_row_bytes, compression, panel_rows,
         key_row_bytes, retained, l1_state, l2_state, l2_retained, line,
-        aiv_units, topk, kv_heads)
+        aiv_units, topk, kv_heads, resolved_keys)
     exchange_total = sum(tile["exchange_bytes"] for tile in tiles)
     exchange_per_tile = max((tile["exchange_bytes"] for tile in tiles), default=0)
     receive_required = (topk * kv_heads * LOCAL_LIST_ELEMENT_BYTES if exchange_total else 0)
@@ -188,7 +266,8 @@ def _key_access_plan(spans, *, compression, key_row_bytes, q_row_bytes,
                             identity_prefix=identity_prefix,
                             gm_capacity=gm_capacity,
                             exchange_grant=exchange_grant,
-                            score_row_limit=spare_rows)
+                            score_row_limit=spare_rows,
+                            span_keys=span_keys)
                 raise ModelingError(
                     "bf16_lightning_indexer_exchange_receive_has_no_ub")
             receive_alias = "dedicated"
@@ -277,14 +356,20 @@ def _score_panel_layout(
 def _key_tiles(
     spans, identity_prefix, q_tile_rows, q_row_bytes, compression, panel_rows, key_row_bytes,
     retained, l1_state, l2_state, l2_retained, line, aiv_units, topk, kv_heads,
+    span_keys=None,
 ):
     tiles = []
     score_bytes = 0
     key_gm = key_hbm = key_logical = q_bytes_total = pairs_total = 0
     panels_total = 0
+    keys = (
+        tuple(span_keys)
+        if span_keys is not None and len(span_keys) == len(spans)
+        else tuple(range(len(spans)))
+    )
+    del identity_prefix, l2_retained
     for request, (q_len, context) in enumerate(spans):
-        identity = f"{identity_prefix}|request={request}"
-        filled = 0
+        span_key = keys[request]
         for q_start in range(0, q_len, q_tile_rows):
             q_end = min(q_len, q_start + q_tile_rows)
             q_bytes = (q_end - q_start) * q_row_bytes
@@ -302,24 +387,22 @@ def _key_tiles(
                 logical = rows * key_row_bytes
                 pairs = _panel_pairs(q_start, q_end, context, compression,
                                      key_start, key_end)
-                if retained:
-                    # The retained K prefix is queried as a whole; miss lines
-                    # are the newly visible rows for this tile.
-                    l1_result = l1_state.access(identity, visible * key_row_bytes)
-                    gm = l1_result.miss_lines * line
+                start_line = (key_start * key_row_bytes) // line
+                end_line = _ceil_div(key_end * key_row_bytes, line)
+                if retained and l1_state is not None:
+                    gm_miss_spans = l1_state.access_lines(span_key, start_line, end_line)
+                    gm = sum(e - s for s, e in gm_miss_spans) * line
                 else:
+                    gm_miss_spans = ((start_line, end_line),) if end_line > start_line else ()
                     gm = logical
-                if l2_state is not None and l2_retained:
-                    # L2 fill is a prefix across panels/tiles; only rows not
-                    # already filled cause HBM traffic.
-                    first = max(key_start, filled)
-                    new_rows = max(0, key_end - first)
-                    hbm = new_rows * key_row_bytes
-                    filled = max(filled, key_end)
-                elif retained:
-                    hbm = gm
+                if l2_state is not None:
+                    hbm_miss_lines = 0
+                    for m_start, m_end in gm_miss_spans:
+                        for h_start, h_end in l2_state.access_lines(span_key, m_start, m_end):
+                            hbm_miss_lines += h_end - h_start
+                    hbm = min(gm, hbm_miss_lines * line)
                 else:
-                    hbm = logical
+                    hbm = gm
                 panels.append({
                     "key_start": key_start, "key_end": key_end,
                     "rows": rows, "logical_bytes": logical,

@@ -11,10 +11,10 @@
 """
 from __future__ import annotations
 
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field, fields, replace
 from functools import partial
-from typing import Literal
+from typing import Any, Literal
 
 from mindie_sim.catalog.attention_common import _floor_sum
 from mindie_sim.public.errors import UnmodeledCapabilityError
@@ -221,6 +221,73 @@ def _first_ge(lo: int, hi: int, a: int, b: int, d: int, target: int) -> int:
     return hi if idx >= hi else idx
 
 
+def _span_scanned_rows(
+    kv_tokens: int, max_scanned_rows: int, compress_ratio: int, max_residual: int,
+) -> tuple[int, int]:
+    step = max(1, compress_ratio)
+    rows, rem = divmod(max(0, kv_tokens), step)
+    if rows < max_scanned_rows or (rows == max_scanned_rows and rem <= max_residual):
+        return rows, rem
+    return max_scanned_rows, max_residual
+
+
+def _region_request_pairs(q: int, kv_tokens: int, scanned_rows: int, compress_ratio: int) -> int:
+    if q <= 0 or scanned_rows <= 0:
+        return 0
+    step = max(1, compress_ratio)
+    history_base = max(0, kv_tokens - q)
+    total = idx = 0
+    while idx < q:
+        raw_regions = (history_base + idx) // step
+        regions = min(scanned_rows, raw_regions)
+        until = (
+            q if raw_regions >= scanned_rows
+            else min(q, (raw_regions + 1) * step - history_base)
+        )
+        total += (until - idx) * regions
+        idx = until
+    return total
+
+
+def _region_active_queries(q: int, kv_tokens: int, scanned_rows: int, compress_ratio: int) -> int:
+    if q <= 0 or scanned_rows <= 0:
+        return 0
+    step = max(1, compress_ratio)
+    history_base = max(0, kv_tokens - q)
+    if history_base >= step:
+        return q
+    return max(0, q - (step - history_base))
+
+
+def _spans_from_request_views(request_views: Sequence[Any]) -> tuple[tuple[int, int], ...]:
+    spans: list[tuple[int, int]] = []
+    for req in request_views:
+        if getattr(req, "padding", False):
+            continue
+        raw_ranges = tuple(
+            (int(start), int(end))
+            for start, end in (getattr(req, "query_ranges", ()) or ())
+            if int(end) > int(start)
+        )
+        if raw_ranges:
+            req_ctx = int(req.context)
+            for start, end in raw_ranges:
+                spans.append((end - start, req_ctx + end))
+            continue
+        q = int(getattr(req, "logical_q_len", getattr(req, "q_len", 0)))
+        kv = int(getattr(req, "kv_len", int(getattr(req, "context", 0)) + q))
+        spans.append((q, kv))
+    return tuple(spans)
+
+
+def _kv_lens_to_spans(query_tokens: int, batch_size: int, kv_lens: Sequence[int]) -> tuple[tuple[int, int], ...]:
+    q_base, q_rem = divmod(query_tokens, batch_size)
+    return tuple(
+        (q_base + (1 if i < q_rem else 0), int(kv))
+        for i, kv in enumerate(kv_lens)
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SparseIndexerContract:
     query_tokens: int
@@ -244,15 +311,36 @@ class SparseIndexerContract:
     compress_ratio: int = 1
     residual_tokens: int = 0
     native_split_core: bool = False
+    request_spans: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self) -> None:
         if self.abi in MSA_ABIS and self.return_choice is not None:
             object.__setattr__(self, "fused_topk", self.return_choice != 0)
+        if self.request_spans:
+            normalized = tuple(
+                tuple(span) if isinstance(span, (list, tuple)) else span
+                for span in self.request_spans
+            )
+            object.__setattr__(self, "request_spans", normalized)
+
+    def _span_pairs(self, q_i: int, kv_i: int) -> tuple[int, int, int]:
+        scanned_i, residual_i = _span_scanned_rows(
+            kv_i, self.scanned_rows, self.compress_ratio, self.residual_tokens,
+        )
+        if q_i <= 0 or scanned_i <= 0:
+            return 0, scanned_i, residual_i
+        if not self.causal:
+            return q_i * scanned_i, scanned_i, residual_i
+        if self.abi == REGION_ABI:
+            return _region_request_pairs(q_i, kv_i, self.scanned_rows, self.compress_ratio), scanned_i, residual_i
+        return _causal_request_pairs(q_i, scanned_i, self.compress_ratio, residual_i), scanned_i, residual_i
 
     @property
     def useful_pairs(self) -> int:
         if self.query_tokens <= 0 or self.scanned_rows <= 0:
             return 0
+        if self.request_spans:
+            return sum(self._span_pairs(q_i, kv_i)[0] for q_i, kv_i in self.request_spans)
         if not self.causal:
             return self.query_tokens * self.scanned_rows
         q_base, extra = divmod(self.query_tokens, self.batch_size)
@@ -347,6 +435,19 @@ def validate_contract(contract: SparseIndexerContract) -> None:
         raise ModelingError("sparse_indexer_msa_block16_disallows_fused_topk")
     if contract.abi == MSA_ABI and contract.fused_topk:
         raise ModelingError("sparse_indexer_msa_v1_returns_scores")
+    if contract.request_spans:
+        span_q = 0
+        for span in contract.request_spans:
+            if not isinstance(span, tuple) or len(span) != 2:
+                raise ModelingError(f"sparse_indexer_invalid_request_span:{span!r}")
+            q_i, kv_i = span
+            _integer("request_query_tokens", q_i, minimum=0)
+            _integer("request_kv_tokens", kv_i, minimum=0)
+            span_q += q_i
+        if span_q != contract.query_tokens:
+            raise ModelingError(
+                f"sparse_indexer_request_spans_query_mismatch:{span_q}!={contract.query_tokens}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -380,6 +481,16 @@ def indexer_contract(op: OpSpec, ctx: OperatorPlanningContext, default_abi: str)
     dtype = raw.get("cache_dtype", "bf16").lower()
     raw["cache_dtype"] = _CACHE_ALIASES.get(dtype, dtype)
     raw["abi"] = abi
+    if not raw.get("request_spans"):
+        if ctx.requests:
+            req_spans = _spans_from_request_views(ctx.requests)
+            if req_spans and sum(q for q, _ in req_spans) == int(raw["query_tokens"]):
+                raw["request_spans"] = req_spans
+        elif isinstance(metadata.get("kv_lens"), (list, tuple)):
+            batch = int(raw.get("batch_size", 1))
+            raw_kv = metadata["kv_lens"]
+            if len(raw_kv) == batch:
+                raw["request_spans"] = _kv_lens_to_spans(int(raw["query_tokens"]), batch, raw_kv)
     contract = SparseIndexerContract(**{f.name: raw[f.name] for f in fields(SparseIndexerContract)
                                        if f.name in raw})
     validate_contract(contract)
@@ -400,9 +511,42 @@ def _has_varying_causal_rows(contract: SparseIndexerContract, query_block_size: 
 
 
 def _request_contract_spans(contract: SparseIndexerContract, ctx: OperatorPlanningContext):
+    step = max(1, contract.compress_ratio)
+    if not ctx.requests:
+        if not contract.request_spans:
+            return
+        q_offset = kv_offset = 0
+        for q, kv in contract.request_spans:
+            if contract.abi == REGION_ABI:
+                history_base = max(0, kv - q)
+                idx = 0
+                while idx < q:
+                    raw_regions = (history_base + idx) // step
+                    regions = min(contract.scanned_rows, raw_regions)
+                    until = (
+                        q if raw_regions >= contract.scanned_rows
+                        else min(q, (raw_regions + 1) * step - history_base)
+                    )
+                    yield (
+                        replace(contract, query_tokens=until - idx, batch_size=1,
+                                scanned_rows=regions, causal=False, request_spans=()),
+                        (q_offset + idx, kv_offset),
+                    )
+                    idx = until
+            else:
+                scanned, residual = _span_scanned_rows(
+                    kv, contract.scanned_rows, step, contract.residual_tokens,
+                )
+                yield (
+                    replace(contract, query_tokens=q, batch_size=1,
+                            scanned_rows=scanned, residual_tokens=residual, request_spans=()),
+                    (q_offset, kv_offset),
+                )
+            q_offset += q
+            kv_offset += kv
+        return
     spans = planning_sequence_spans(ctx, "TND")
     reqs = tuple(ctx.requests) if ctx.requests and len(ctx.requests) == len(spans) else (None,) * len(spans)
-    step = max(1, contract.compress_ratio)
     for req, (q, kv, q_offset, kv_offset, padding) in zip(reqs, spans, strict=True):
         if padding:
             continue
@@ -428,20 +572,18 @@ def _request_contract_spans(contract: SparseIndexerContract, ctx: OperatorPlanni
                         )
                         yield (
                             replace(contract, query_tokens=until - idx, batch_size=1,
-                                    scanned_rows=regions, causal=False),
+                                    scanned_rows=regions, causal=False, request_spans=()),
                             (local_q_offset + idx, kv_offset),
                         )
                         idx = until
                 else:
                     chunk_kv = req_ctx + end
-                    rows, rem = divmod(chunk_kv, step)
-                    if rows <= contract.scanned_rows:
-                        scanned, residual = rows, rem
-                    else:
-                        scanned, residual = contract.scanned_rows, contract.residual_tokens
+                    scanned, residual = _span_scanned_rows(
+                        chunk_kv, contract.scanned_rows, step, contract.residual_tokens,
+                    )
                     yield (
                         replace(contract, query_tokens=chunk_q, batch_size=1,
-                                scanned_rows=scanned, residual_tokens=residual),
+                                scanned_rows=scanned, residual_tokens=residual, request_spans=()),
                         (local_q_offset, kv_offset),
                     )
                 local_q_offset += chunk_q
@@ -458,19 +600,17 @@ def _request_contract_spans(contract: SparseIndexerContract, ctx: OperatorPlanni
                 )
                 yield (
                     replace(contract, query_tokens=until - idx, batch_size=1,
-                            scanned_rows=regions, causal=False),
+                            scanned_rows=regions, causal=False, request_spans=()),
                     (q_offset + idx, kv_offset),
                 )
                 idx = until
         else:
-            rows, rem = divmod(kv, step)
-            if rows <= contract.scanned_rows:
-                scanned, residual = rows, rem
-            else:
-                scanned, residual = contract.scanned_rows, contract.residual_tokens
+            scanned, residual = _span_scanned_rows(
+                kv, contract.scanned_rows, step, contract.residual_tokens,
+            )
             yield (
                 replace(contract, query_tokens=q, batch_size=1,
-                        scanned_rows=scanned, residual_tokens=residual),
+                        scanned_rows=scanned, residual_tokens=residual, request_spans=()),
                 (q_offset, kv_offset),
             )
 
@@ -480,30 +620,72 @@ def request_contracts(contract: SparseIndexerContract, ctx: OperatorPlanningCont
         yield request
 
 
+def _spans_match_uniform_contract(contract: SparseIndexerContract) -> bool:
+    """Return True when ``request_spans`` carries no shape detail beyond the uniform contract."""
+    spans = contract.request_spans
+    if not spans or len(spans) != contract.batch_size:
+        return False
+    q_base, q_rem = divmod(contract.query_tokens, contract.batch_size)
+    for i, (q_i, kv_i) in enumerate(spans):
+        if q_i != q_base + (1 if i < q_rem else 0):
+            return False
+        scanned_i, residual_i = _span_scanned_rows(
+            kv_i, contract.scanned_rows, contract.compress_ratio, contract.residual_tokens,
+        )
+        if scanned_i != contract.scanned_rows or residual_i != contract.residual_tokens:
+            return False
+    return True
+
+
 def _minimum_indexer_io(contract: SparseIndexerContract) -> tuple[float, float, float, float]:
     """Conservative physical (hbm, mte2, mte3, vector_ops) lower bound for L* soundness."""
     pairs = contract.useful_pairs
-    if pairs and contract.causal:
-        q_base, extra = divmod(contract.query_tokens, contract.batch_size)
-        active_q = (
-            extra * _causal_active_queries(q_base + 1, contract.scanned_rows, contract.compress_ratio, contract.residual_tokens)
-            + (contract.batch_size - extra) * _causal_active_queries(q_base, contract.scanned_rows, contract.compress_ratio, contract.residual_tokens)
-        )
+    if contract.request_spans:
+        active_q = 0
+        max_scanned = 0
+        block_max_raw = 0
+        for q_i, kv_i in contract.request_spans:
+            span_pairs, scanned_i, residual_i = contract._span_pairs(q_i, kv_i)
+            if span_pairs <= 0:
+                continue
+            if contract.abi == REGION_ABI and contract.causal:
+                visible_i = (
+                    min(contract.scanned_rows, (kv_i - 1) // max(1, contract.compress_ratio))
+                    if kv_i > 0 else 0
+                )
+            else:
+                visible_i = scanned_i
+            max_scanned = max(max_scanned, visible_i)
+            if not contract.causal:
+                active_q += q_i
+            elif contract.abi == REGION_ABI:
+                active_q += _region_active_queries(q_i, kv_i, contract.scanned_rows, contract.compress_ratio)
+            else:
+                active_q += _causal_active_queries(q_i, scanned_i, contract.compress_ratio, residual_i)
+            if contract.block_size > 1:
+                block_max_raw += max(0, span_pairs - q_i * ceil_div(scanned_i, contract.block_size))
+        k_rows = max_scanned
     else:
-        active_q = contract.query_tokens if pairs else 0
+        if pairs and contract.causal:
+            q_base, extra = divmod(contract.query_tokens, contract.batch_size)
+            active_q = (
+                extra * _causal_active_queries(q_base + 1, contract.scanned_rows, contract.compress_ratio, contract.residual_tokens)
+                + (contract.batch_size - extra) * _causal_active_queries(q_base, contract.scanned_rows, contract.compress_ratio, contract.residual_tokens)
+            )
+        else:
+            active_q = contract.query_tokens if pairs else 0
+        k_rows = contract.scanned_rows if pairs else 0
+        block_max_raw = max(0, pairs - contract.query_tokens * contract.score_items) if (contract.block_size > 1 and pairs) else 0
     q_elem = float(cache_row_bytes(contract.cache_dtype, contract.index_dim))
     q_bytes = float(active_q * contract.index_heads) * q_elem
-    k_bytes = float(contract.scanned_rows) * float(contract.cache_row_bytes) if pairs else 0.0
+    k_bytes = float(k_rows) * float(contract.cache_row_bytes) if pairs else 0.0
     out_items = contract.topk_items if contract.fused_topk else contract.score_items
     out_heads = contract.msa_score_heads if contract.abi in MSA_ABIS else 1
     out_elem = float(INT32_BYTES if contract.fused_topk else FP32_BYTES)
     out_bytes = float(contract.query_tokens * out_heads * out_items) * out_elem
     if contract.abi in MSA_ABIS:
         head_max = (contract.index_heads - contract.msa_score_heads) * pairs
-        block_max = (
-            max(0, pairs - contract.query_tokens * contract.score_items) * contract.msa_score_heads
-            if (contract.block_size > 1 and pairs) else 0
-        )
+        block_max = block_max_raw * contract.msa_score_heads
         vec_ops = float(head_max + block_max)
     elif contract.abi in QUANT_ABIS and contract.cache_dtype == "int8":
         # Arch22 QLI V2 executes head reduction on FP16 Cube, leaving key descale on AIV.
@@ -518,16 +700,45 @@ def make_op(
     contract: SparseIndexerContract, *, op_id: str, deps: tuple[str, ...] = (),
     stage: int = 0, layer: int = 0, requests: tuple[str, ...] = (),
     phase: str = "decode", recipe: str | None = None, source: SourceRef | None = None,
+    request_views: Sequence[Any] | None = None, kv_lens: Sequence[int] | None = None,
+    query_lens: Sequence[int] | None = None,
 ) -> OpSpec:
     dtype = _CACHE_ALIASES.get(contract.cache_dtype, contract.cache_dtype)
     if dtype != contract.cache_dtype:
         contract = replace(contract, cache_dtype=dtype)
+    if not contract.request_spans:
+        if request_views is not None:
+            spans = _spans_from_request_views(request_views)
+            if spans:
+                contract = replace(contract, request_spans=spans)
+        elif kv_lens is not None:
+            if len(kv_lens) != contract.batch_size:
+                raise ModelingError(
+                    f"sparse_indexer_kv_lens_batch_mismatch:{len(kv_lens)}!={contract.batch_size}"
+                )
+            if query_lens is not None:
+                if len(query_lens) != contract.batch_size:
+                    raise ModelingError(
+                        f"sparse_indexer_query_lens_batch_mismatch:{len(query_lens)}!={contract.batch_size}"
+                    )
+                inferred = tuple((int(q_i), int(kv_i)) for q_i, kv_i in zip(query_lens, kv_lens))
+            else:
+                inferred = _kv_lens_to_spans(contract.query_tokens, contract.batch_size, kv_lens)
+                if contract.causal and any(q_i > kv_i > 0 for q_i, kv_i in inferred):
+                    raise ModelingError(
+                        "sparse_indexer_kv_lens_requires_query_lens"
+                    )
+            contract = replace(contract, request_spans=inferred)
     validate_contract(contract)
     items = contract.topk_items if contract.fused_topk else contract.score_items
     shape = (contract.query_tokens, items)
     padded_shape = shape
     returns = ()
     meta = {"indexer_contract": asdict(contract), "native_kind": contract.abi}
+    if contract.request_spans and len(contract.request_spans) == contract.batch_size:
+        q_base, q_rem = divmod(contract.query_tokens, contract.batch_size)
+        if all(q_i == q_base + (1 if i < q_rem else 0) for i, (q_i, _) in enumerate(contract.request_spans)):
+            meta["kv_lens"] = tuple(kv_i for _, kv_i in contract.request_spans)
     if contract.abi in MSA_ABIS:
         shape = (contract.msa_score_heads, *shape)
         padded_shape = shape if contract.fused_topk else (*shape[:-1], contract.msa_score_stride)
@@ -1359,7 +1570,7 @@ def build_plan(
     geometry = ctx.geometry
     hierarchy = getattr(geometry.physical_mechanisms, "memory_hierarchy", None)
     l2_capacity = getattr(hierarchy, "effective_l2_bytes", geometry.buffers.get("l2", 0))
-    if ctx.requests and ctx.admission_memory_view is not None and "l2" in geometry.resource_units:
+    if (ctx.requests or contract.request_spans) and ctx.admission_memory_view is not None and "l2" in geometry.resource_units:
         l2_capacity = ctx.admission_memory_view.effective_l2_bytes(geometry.rank or 0)
 
     batch_msa_stride = contract.msa_score_stride if contract.abi in MSA_ABIS else None
@@ -1375,17 +1586,25 @@ def build_plan(
             offsets, batch_msa_stride,
         )
 
-    if ctx.requests:
+    use_per_request = bool(
+        ctx.requests
+        or (contract.request_spans and not _spans_match_uniform_contract(contract))
+    )
+    if use_per_request:
+        req_spans = tuple(_request_contract_spans(contract, ctx))
         builders, waves = [], []
         start = wave_start = 0
-        for request, offsets in _request_contract_spans(contract, ctx):
-            lanes = min(len(owners), max(1, S2Partition(
-                request.scanned_rows, lowering.tile_size, request.s2_splits,
-            ).owners))
+        for request, offsets in req_spans:
+            if len(req_spans) == 1:
+                lanes = len(owners)
+            else:
+                lanes = min(len(owners), max(1, S2Partition(
+                    request.scanned_rows, lowering.tile_size, request.s2_splits,
+                ).owners))
             if start + lanes > len(owners):
                 waves.append((wave_start, len(builders)))
                 wave_start, start = len(builders), 0
-            builders.append(bind(request, owners[start:start + lanes], offsets))
+            builders.append(bind(request, owners[start:start + lanes], offsets if ctx.requests else None))
             start += lanes
         if wave_start < len(builders):
             waves.append((wave_start, len(builders)))
