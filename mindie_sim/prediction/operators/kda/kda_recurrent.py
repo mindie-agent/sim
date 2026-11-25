@@ -14,6 +14,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 import math
+from typing import Literal
 
 from mindie_sim.prediction.engine import Allocation
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, Work
@@ -21,9 +22,12 @@ from mindie_sim.prediction.ownership import read_role, unit_group
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.operators.recurrent.recover_ssm_work import record_head_bytes, record_slice_bytes
 from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec, ProgramFragment, StateEffect
 from mindie_sim.schema.subgraphs import PortSet
 from mindie_sim.schema.tensors import TensorValue
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 from .kda_source import KDA_MAX_QUERY_ROWS
 from .kda_recurrent_contracts import (
     STATE_POOL_DIMS, _DEFAULT_HEAD_DIM, _binding_attrs, _binding_span,
@@ -68,6 +72,26 @@ SOURCE = {
                "sha256": "ca2f56280746f45a347578e7191decda716557c93aca69b5c3baf7b22a578803"},
     "scope": "selected_source_kernel_not_capture_binary_identity",
 }
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        SOURCE["repository"],
+        SOURCE["revision"],
+        SOURCE["kernel"]["path"],
+        SOURCE["kernel"]["sha256"],
+    ),
+    SourceRef(
+        SOURCE["repository"],
+        SOURCE["revision"],
+        SOURCE["host"]["path"],
+        SOURCE["host"]["sha256"],
+    ),
+    SourceRef(
+        SOURCE["repository"],
+        SOURCE["revision"],
+        SOURCE["caller"]["path"],
+        SOURCE["caller"]["sha256"],
+    ),
+)
 _BYTES = {"bf16": 2, "fp16": 2, "fp32": 4}
 A5_AIC_UNITS = 32
 A5_AIV_UNITS = 64
@@ -405,7 +429,9 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
     profile = buffer_profile(p, geometry.buffers["ub"])
     read = read_role(geometry.resource_units, aiv=0)
     def runs(owner):
-        return scheduled_runs(p.lengths, p.heads, blocks, owner, compact=compact,
+        # Execute exact per-head cycles so shared-HBM contention and competing
+        # tasks match literal Engine replay without fluid stage-scaling drift.
+        return scheduled_runs(p.lengths, p.heads, blocks, owner, compact=False,
                               beta_per_head=execution.beta_per_head)
     work = summarize_work(p, geometry, execution=execution)
     cycles = []
@@ -423,7 +449,7 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
                 return _head_stages(p, q, count, profile, context, placement, read,
                                     beta_repetitions=beta_count,
                                     delta_broadcast=execution.delta_broadcast)
-            heads = PipelineProgram(cycles[owner], 1, head, interior_fold=compact)
+            heads = PipelineProgram(cycles[owner], 1, head, interior_fold=False)
             allocation = (Allocation("kda_buffers", context.pool_names["ub"],
                                      profile["ub_bytes_per_owner"],
                                      unit_group(owner, units, context.pool_units.get("ub", units))),)
@@ -478,7 +504,7 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
             "state_residency": ("one_initial_load_per_head;recover_ssm_compact_record_then_single_commit"
                                 if spec_recover else "one_initial_load_per_head;checkpoint_write_every_query"),
             "head_handoff": "conservative_serial_head_retirement",
-            "contention_approximation": "serial_cycle_fluid_rephasing" if compact else "none",
+            "contention_approximation": "none",
             "scalar_metadata_getvalue_bytes": scalar_bytes*metadata_values,
             "accepted_metadata_getvalue_bytes": scalar_bytes*accepted_loads,
             "unmodeled_services": ("scalar_GetValue_cache_and_issue", "queue_flag_and_vector_instruction_issue"),
@@ -491,7 +517,20 @@ def make_op(params, *, op_id="kda_recurrent", deps=(), requests=(), stage=0,
             state_targets=None, state_values=None, state_slots=None,
             state_ready=(), state_grants=(), state_decisions=(),
             state_generation=None):
-    p = Params.parse(params)
+    raw_params = dict(params)
+    if state_contexts is not None:
+        ctx_tuple = tuple(state_contexts)
+        if (raw_params.get("state_contexts") is not None
+                and tuple(raw_params["state_contexts"]) != ctx_tuple):
+            raise ModelingError("recurrent_kda_state_contexts_conflict")
+        raw_params["state_contexts"] = ctx_tuple
+    if state_targets is not None:
+        tgt_tuple = tuple(state_targets)
+        if (raw_params.get("state_targets") is not None
+                and tuple(raw_params["state_targets"]) != tgt_tuple):
+            raise ModelingError("recurrent_kda_state_targets_conflict")
+        raw_params["state_targets"] = tgt_tuple
+    p = Params.parse(raw_params)
     shape = (sum(p.lengths), p.heads, p.dk, p.dv)
     spec_recover = bool(p.recover_ssm and any(q > 1 for q in p.lengths))
     metadata = {
@@ -536,8 +575,9 @@ def make_op(params, *, op_id="kda_recurrent", deps=(), requests=(), stage=0,
         lengths=p.lengths, targets=targets, requests=requests,
         selection=selection, contexts=contexts,
         acceptance=p.state_acceptance, bindings=bindings, owner=owner,
-        state_dtype=p.state_dtype, decisions=state_decisions,
-        ready=state_ready, grants=state_grants, op_id=op_id)
+        state_dtype=p.state_dtype, record_dtype=p.dtype, decisions=state_decisions,
+        ready=state_ready, grants=state_grants, op_id=op_id,
+        recover_ssm=p.recover_ssm, state_values=state_values)
     metadata.update(
         kda_state_contract=contract, kda_state_effects=effects,
         state_targets=targets, state_bindings=tuple(

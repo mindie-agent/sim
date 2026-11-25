@@ -14,8 +14,31 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
+from typing import Literal
+
+from mindie_sim.schema.datapath import SourceRef
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_RECURRENT_REV = "8c30e4f491f73cba737a1dacc522894e437cdf3d"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        _VLLM_ASCEND_RECURRENT_REV,
+        "csrc/attention/recurrent_kda/op_host/recurrent_kda_tiling_processor.h",
+        "c9eac28bd528eb03bdeb456c4fdbed4951f716937570ee9d810e0fb5b3ef3fbd",
+    ),
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        _VLLM_ASCEND_RECURRENT_REV,
+        "vllm_ascend/ops/kda.py",
+        "ca2f56280746f45a347578e7191decda716557c93aca69b5c3baf7b22a578803",
+    ),
+)
 
 KDA_MAX_QUERY_ROWS = 8
+KDA_SAFE_GATE_LOWER_BOUND_MIN = -5.0
+KDA_SAFE_GATE_LOWER_BOUND_MAX = 0.0
 NATIVE_KDA_MECHANISM = "recurrent_decode_native_kernels"
 NATIVE_KDA_SELECTOR = "kda"
 
@@ -35,13 +58,23 @@ def explicit_generic(kernels):
                for name in names)
 
 
+def parse_gate_lower_bound(value):
+    """Validate optional KDA safe-gate lower bound against CANN ``[-5, 0)``."""
+    if value is None:
+        return None, True
+    if (isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(value)):
+        return None, False
+    bound = float(value)
+    if not (KDA_SAFE_GATE_LOWER_BOUND_MIN <= bound < KDA_SAFE_GATE_LOWER_BOUND_MAX):
+        return None, False
+    return bound, True
+
+
 def gate_bound(plan):
     """Exact optional bound carried from the source linear_attn_config."""
-    value = getattr(plan, "kda_gate_lower_bound", None)
-    if value is not None and (isinstance(value, bool)
-                              or not isinstance(value, (int, float))):
-        return None, False
-    return value, True
+    return parse_gate_lower_bound(getattr(plan, "kda_gate_lower_bound", None))
 
 
 def view_state_declaration(views):
@@ -67,7 +100,7 @@ def options(plan, *, activation_dtype, views=None):
     if not valid:
         return None
     result = {
-        # Null/absent is the caller's false; zero is a valid non-None bound.
+        # Null/absent selects softplus (safe_gate=False); valid [-5, 0) selects safe_gate=True.
         "safe_gate": bound is not None,
         # A5 arch35 fuses ``SIGMOID_BETA`` (``tl.sigmoid(raw_beta)``) into the
         # KDA kernel, including the RecoverSSM verify call, so no standalone

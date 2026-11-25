@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from dataclasses import dataclass, replace
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, Work
 from mindie_sim.prediction.ownership import read_role
@@ -24,7 +24,9 @@ from mindie_sim.prediction.program import (
     RecipeContext,
     Stage,
 )
+from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, check_live_buffers
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import (
     OpSpec, ProgramFragment, SemanticAttr, StateEffect,
 )
@@ -39,10 +41,86 @@ from .kda_state_contracts import (
 from .kda_state_selection import (
     bind_state_value, binding_record, prefill_records, state_ports, state_value,
 )
-from mindie_sim.prediction.operators.vector.mixed_core import placement, require_pair, split_reads
+from mindie_sim.prediction.operators.vector.mixed_core import (
+    placement,
+    require_pair,
+    resident,
+    split_reads,
+)
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_FWD_H_REPO = "vllm-ascend-v41-private"
+_VLLM_ASCEND_FWD_H_REV = "ae923905948f360f4b7ab06df52d0789a0c9316e"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        _VLLM_ASCEND_FWD_H_REPO,
+        _VLLM_ASCEND_FWD_H_REV,
+        "csrc/attention/chunk_kda_fwd/op_kernel/chunk_kda_fwd_common.h",
+        "e98c17e528d673a9b6c2f0bbbfce83746bcccf0afaeb413ea0ac41a2809e74f8",
+    ),
+    SourceRef(
+        _VLLM_ASCEND_FWD_H_REPO,
+        _VLLM_ASCEND_FWD_H_REV,
+        "csrc/attention/chunk_kda_fwd/op_kernel/chunk_kda_fwd.cpp",
+        "0ea787730736f4ed92a35e3bafa6e54417c84716fc6aed381a339259abfa74d0",
+    ),
+    SourceRef(
+        _VLLM_ASCEND_FWD_H_REPO,
+        _VLLM_ASCEND_FWD_H_REV,
+        "csrc/attention/chunk_kda_fwd/op_host/chunk_kda_fwd_tiling.cpp",
+        "72148ca10b26ba4f34919c11e973c3bbcd696cfbc9a938c3cc3bf724e41f813c",
+    ),
+    SourceRef(
+        _VLLM_ASCEND_FWD_H_REPO,
+        _VLLM_ASCEND_FWD_H_REV,
+        "csrc/moe/chunk_gated_delta_rule_fwd_h/op_kernel/arch35/gemm/kernel/gdn_fwd_h_kernel.hpp",
+        "aa9695e2d9eba0dc0963d248199a86ab5cbd321c0f5836a9dd8ee8901944cf13",
+    ),
+    SourceRef(
+        _VLLM_ASCEND_FWD_H_REPO,
+        _VLLM_ASCEND_FWD_H_REV,
+        "csrc/moe/chunk_gated_delta_rule_fwd_h/op_kernel/arch35/gemm/block/block_scheduler_gdn_fwd_h.hpp",
+        "3e7730a090795623af026efea6a8484238d1fd02e301e286936f1b4bcd8ba741",
+    ),
+    SourceRef(
+        _VLLM_ASCEND_FWD_H_REPO,
+        _VLLM_ASCEND_FWD_H_REV,
+        "csrc/moe/chunk_gated_delta_rule_fwd_h/op_kernel/arch35/epilogue/block/block_epilogue_gdn_fwdh_vnew.hpp",
+        "8ec011c4ff4adaa0398ba77e2b5cbc331335c3f6c44d00921e9cdbcaa953dd02",
+    ),
+    SourceRef(
+        _VLLM_ASCEND_FWD_H_REPO,
+        _VLLM_ASCEND_FWD_H_REV,
+        "csrc/moe/chunk_gated_delta_rule_fwd_h/op_kernel/arch35/epilogue/block/block_epilogue_gdn_fwdh_update.hpp",
+        "67dbb475b2ae630bb53fbdb9bfe44af774c0be8b9da7c16074b5d1ef6d88fedb",
+    ),
+    SourceRef(
+        _VLLM_ASCEND_FWD_H_REPO,
+        _VLLM_ASCEND_FWD_H_REV,
+        "csrc/moe/chunk_gated_delta_rule_fwd_h/op_kernel/arch35/epilogue/block/block_epilogue_gdn_fwdh_regbase.hpp",
+        "c2221dbb88f92fcf04adde0a0799264bd53c6e1f74033ed3bee634fb9daac4cc",
+    ),
+    SourceRef(
+        _VLLM_ASCEND_FWD_H_REPO,
+        _VLLM_ASCEND_FWD_H_REV,
+        "vllm_ascend/ops/kimi_kda.py",
+        "35365b3b353fc492b4dc5d75b88916431f6802c21bf51b61b4893d39d54f11f3",
+    ),
+)
 
 TAIL_L1_ZERO_FILL_BUFFERS = 4
 VALUE_DELTA_OPS_PER_ELEMENT = 4
+INIT_STATE_UB_KIB = 64
+INIT_SNAPSHOT_UB_KIB = 32
+SCAN_UB_PONG_G_SUB_OFFSET_KIB = 171
+SCAN_UB_G_SUB_TILE_ROWS = 16
+_BYTES_PER_KIB = 1024
+_FP32_BYTES_UB = 4
+INIT_UB_BYTES_PER_AIV = 2 * (INIT_STATE_UB_KIB + INIT_SNAPSHOT_UB_KIB) * _BYTES_PER_KIB
+SCAN_UB_BYTES_PER_AIV = (
+    SCAN_UB_PONG_G_SUB_OFFSET_KIB * _BYTES_PER_KIB
+    + SCAN_UB_G_SUB_TILE_ROWS * _FP32_BYTES_UB
+)
 
 RECIPE = "vllm_ascend_kda_fwd_h"
 IMPLEMENTATION = "vllm_ascend_kda_chunk_state"
@@ -565,16 +643,26 @@ def _program(params: Params, groups: tuple[CoreTasks, ...],
         work = _work(read=params.dk * params.dv * _FP32_BYTES,
                      write=params.dk * params.dv * _BF16_BYTES,
                      vector=params.dk * params.dv).scaled(len(group.streams))
-        init_programs.append(KernelProgram(_phases(
-            "init", work, context, group.core, aiv_pair=True)))
+        init_body = KernelProgram(_phases(
+            "init", work, context, group.core, aiv_pair=True))
+        init_programs.append(
+            resident(context, group.core, {"ub": INIT_UB_BYTES_PER_AIV}, init_body)
+            if "ub" in context.pool_names else init_body
+        )
     initialize = Stage("initialize", program=ParallelProgram(tuple(init_programs)))
     if read_fragment is not None:
         initialize = replace(initialize, fragment=read_fragment)
+    scan_programs = tuple(
+        resident(
+            context, group.core, {"ub": SCAN_UB_BYTES_PER_AIV},
+            _core_program(group, params, context, fragment_map),
+        ) if "ub" in context.pool_names
+        else _core_program(group, params, context, fragment_map)
+        for group in groups
+    )
     return KernelProgram((
         initialize,
-        Stage("scan", after=("initialize",), program=ParallelProgram(tuple(
-            _core_program(group, params, context, fragment_map)
-            for group in groups))),
+        Stage("scan", after=("initialize",), program=ParallelProgram(scan_programs)),
     ))
 
 
@@ -585,6 +673,21 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     core_count = int(geometry.compute_units)
     if core_count < 1:
         raise ModelingError("kda_state_requires_positive_compute_units")
+    if "ub" in geometry.buffers:
+        check_live_buffers(
+            (
+                LiveBufferSpec(
+                    "kda_fwd_h_init_ub", "ub", INIT_UB_BYTES_PER_AIV,
+                    live_start=0, live_end=0, owner_kind="aiv",
+                ),
+                LiveBufferSpec(
+                    "kda_fwd_h_scan_ub", "ub", SCAN_UB_BYTES_PER_AIV,
+                    live_start=1, live_end=1, owner_kind="aiv",
+                ),
+            ),
+            geometry,
+            family=RECIPE,
+        )
     groups = head_ownership(params.lengths, params.heads, core_count,
                             chunk=params.chunk)
 
@@ -711,8 +814,9 @@ def make_op(params: Mapping[str, Any], *, op_id: str = "kda_fwd_h",
 
 
 __all__ = [
-    "ChunkWork", "CoreTasks", "IMPLEMENTATION", "Params", "RECIPE", "StreamTask",
-    "build", "chunk_work", "h_snapshot_offset", "head_ownership", "make_op",
-    "slot_queues", "state_accesses", "state_fragments", "state_offset",
-    "stream_work",
+    "ChunkWork", "CoreTasks", "IMPLEMENTATION", "INIT_UB_BYTES_PER_AIV",
+    "Params", "RECIPE", "SCAN_UB_BYTES_PER_AIV", "SOURCES", "StreamTask",
+    "TARGET_BACKEND", "build", "chunk_work", "h_snapshot_offset",
+    "head_ownership", "make_op", "slot_queues", "state_accesses",
+    "state_fragments", "state_offset", "stream_work",
 ]

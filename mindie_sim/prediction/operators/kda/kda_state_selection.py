@@ -13,17 +13,37 @@
 [Side-Effect Policy] Pure contract validation and immutable tuple results.
 """
 from itertools import accumulate
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.subgraphs import (
     EventPortSpec, PortSet, TensorPortSpec,
 )
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_RECURRENT_REV = "8c30e4f491f73cba737a1dacc522894e437cdf3d"
+_VLLM_ASCEND_FWD_H_REV = "ae923905948f360f4b7ab06df52d0789a0c9316e"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        _VLLM_ASCEND_RECURRENT_REV,
+        "csrc/attention/recurrent_kda/op_kernel/arch35/recurrent_kda.h",
+        "f35dd2c5fb604d6d9711c11139c755414d49fb27fc6aea0f3a4bec3d3adb0199",
+    ),
+    SourceRef(
+        "vllm-ascend-v41-private",
+        _VLLM_ASCEND_FWD_H_REV,
+        "csrc/moe/chunk_gated_delta_rule_fwd_h/op_kernel/arch35/gemm/kernel/gdn_fwd_h_kernel.hpp",
+        "aa9695e2d9eba0dc0963d248199a86ab5cbd321c0f5836a9dd8ee8901944cf13",
+    ),
+)
+
 PREFILL_DEFAULT_CHUNK_TOKENS = 64
 PREFILL_DEFAULT_KEY_DIM = 128
 PREFILL_DEFAULT_VALUE_DIM = 128
+_PREFILL_SNAPSHOT_DTYPE = "bf16"
 
 
 def resolve(raw, lengths):
@@ -270,7 +290,7 @@ def state_records(*, targets, lengths, contexts=None, acceptance=None,
         write_records.extend(
             (target, versions[position],
              None if slots is None else slots[position])
-            for position in retained)
+            for position in range(q))
         if not pending:
             commit_records.append((target, versions[accepted]))
             for position in range(transition["advances"][index], q):
@@ -345,6 +365,8 @@ def prefill_records(*, targets, lengths, contexts=None, chunk=PREFILL_DEFAULT_CH
     internal_commit_versions = []
     publication_write_records, publication_records = [], []
     byte = dk * dv * state_byte
+    snapshot_dtype = _PREFILL_SNAPSHOT_DTYPE
+    snapshot_byte = dk * dv * int(dtype_bytes(snapshot_dtype))
     span = ((0, dk), (0, dv))
     producer = layout_producer or f"{op_id}:layout_publication"
     for sequence, (target, length, context) in enumerate(
@@ -359,6 +381,7 @@ def prefill_records(*, targets, lengths, contexts=None, chunk=PREFILL_DEFAULT_CH
         for head in range(heads):
             internal = internal_targets[sequence][head]
             storage = f"state:{sequence}:head:{head}"
+            snapshot_storage = f"h_snapshot:{sequence}:head:{head}"
             # The real initialize conversion reads this head's public view.
             read_records.append({
                 "target": target, "version": context, "sequence": sequence,
@@ -369,34 +392,43 @@ def prefill_records(*, targets, lengths, contexts=None, chunk=PREFILL_DEFAULT_CH
                 "public_subview": (head, 0, 0)})
             initialize_write_records.append({
                 "target": internal, "version": context, "sequence": sequence,
-                "head": head, "storage": storage, "dtype": state_dtype,
-                "layout": "K,V", "span": span, "bytes": byte,
+                "head": head, "storage": snapshot_storage, "dtype": snapshot_dtype,
+                "layout": "K,V", "span": span, "bytes": snapshot_byte,
                 "action": "write",
                 "producer": f"{op_id}:initialize",
                 "output": (sequence, head)})
             per_head_versions.append(versions)
             per_head_commits.append(versions)
             previous = context
+            previous_producer = f"{op_id}:initialize"
             for chunk_index, version in enumerate(versions):
+                chunk_producer = (
+                    f"{op_id}:state_chunk:{sequence}:{head}:{chunk_index}"
+                )
+                is_first_chunk = chunk_index == 0
                 read = {
                     "target": internal, "version": previous,
                     "sequence": sequence, "head": head,
-                    "chunk": chunk_index, "storage": storage,
-                    "dtype": state_dtype, "layout": "K,V", "span": span,
-                    "bytes": byte, "action": "read"}
+                    "chunk": chunk_index,
+                    "storage": snapshot_storage if is_first_chunk else storage,
+                    "dtype": snapshot_dtype if is_first_chunk else state_dtype,
+                    "layout": "K,V", "span": span,
+                    "bytes": snapshot_byte if is_first_chunk else byte,
+                    "action": "read",
+                    "producer": previous_producer}
                 record = {
                     "target": internal, "version": version,
                     "sequence": sequence, "head": head, "chunk": chunk_index,
                     "storage": storage, "dtype": state_dtype,
                     "layout": "K,V", "span": span, "bytes": byte,
                     "generation": version,
-                    "producer": f"{op_id}:state_chunk:"
-                                f"{sequence}:{head}:{chunk_index}",
+                    "producer": chunk_producer,
                     "output": chunk_index}
                 internal_read_records.append(read)
                 internal_write_records.append({**record, "action": "write"})
                 internal_commit_records.append({**record, "action": "commit"})
                 previous = version
+                previous_producer = chunk_producer
         internal_checkpoint_versions.append(tuple(per_head_versions))
         internal_commit_versions.append(tuple(per_head_commits))
         final = versions[-1]
@@ -619,13 +651,17 @@ def bind_sequence_values(*, targets, lengths, contexts, shape, dtype, owner,
         layout = tuple(values.layout.shape)
         if layout == shape and count == 1:
             produced = [values]
-        elif len(layout) >= 1 and layout[0] == count and layout[1:] == shape:
-            produced = [values.narrow(0, index, 1) for index in range(count)]
-        elif (len(layout) >= 1 and layout[1:] == shape
-              and all(slot is not None and slot < layout[0] for slot in slots)):
-            produced = [_narrow_value(values, 0, slot, 1)
-                        if values.layout.shape[0] > 1 else values
-                        for slot in slots]
+        elif len(layout) >= 1 and layout[1:] == shape:
+            if all(slot is not None for slot in slots):
+                produced = [_narrow_value(values, 0, slot, 1) for slot in slots]
+            elif layout[0] == count:
+                produced = [
+                    _narrow_value(values, 0, slot if slot is not None else index, 1)
+                    for index, slot in enumerate(slots)
+                ]
+            else:
+                raise ModelingError(
+                    f"kda_state_pool_shape_mismatch:{layout}:{shape}")
         else:
             raise ModelingError(
                 f"kda_state_pool_shape_mismatch:{layout}:{shape}")

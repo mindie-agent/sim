@@ -11,12 +11,40 @@
 from collections import OrderedDict
 from dataclasses import replace
 import math
+from typing import Literal
 
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage
-from mindie_sim.prediction.operators.vector.mixed_core import placement
+from mindie_sim.prediction.operators.kda import kda_prepare as _kda_prepare
+from mindie_sim.prediction.operators.vector.mixed_core import placement, resident
+from mindie_sim.schema.datapath import SourceRef
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = _kda_prepare.SOURCES
 
 _NOMINAL = OrderedDict()
+_DMA_ROLES = ("mte2", "mte2_aic", "mte2_aiv", "mte3", "fixpipe")
+
+
+def can_compact(context) -> bool:
+    """Allow fluid owner-run folding only when shared HBM cannot saturate."""
+    hbm_name = context.resource_names.get("hbm")
+    if not hbm_name:
+        return True
+    hbm_rate = float(context.rates.get(hbm_name, 0.0))
+    if hbm_rate <= 0.0:
+        return False
+    for mode_key, target in context.service_modes.items():
+        if mode_key in (hbm_name, "hbm"):
+            return False
+        if isinstance(target, (tuple, list)) and target and target[0] in (hbm_name, "hbm"):
+            return False
+    die_dma_rate = sum(
+        float(context.rates.get(context.resource_names[role], 0.0))
+        for role in _DMA_ROLES
+        if role in context.resource_names
+    )
+    return die_dma_rate <= hbm_rate
 
 
 def _signature(context):
@@ -97,6 +125,55 @@ def _run(name, work, owned, elapsed):
         if elapsed else {}),))
 
 
+def _has_competing_work(engine) -> bool:
+    if getattr(engine, "allocations", None):
+        return True
+    tasks = getattr(engine, "_tasks", None)
+    if not tasks:
+        return False
+    return any(
+        bool(task.remaining) or bool(task.acquire) or bool(task.free)
+        for task in tasks.values()
+    )
+
+
+class _GuardedCompactProgram:
+    """Use fluid owner-runs only when the Engine has no competing resource work."""
+
+    def __init__(self, compact_builder, literal_builder):
+        self._compact_builder = compact_builder
+        self._literal_builder = literal_builder
+
+    def start(self, engine, name, ready, *, owner=""):
+        complete = engine.future(f"{name}:compact_guard_complete")
+
+        def launch(_event):
+            chosen = (
+                self._literal_builder()
+                if _has_competing_work(engine)
+                else self._compact_builder()
+            )
+            end = chosen.start(engine, name, ready, owner=owner)
+            engine.on_complete(end, lambda _done: engine.resolve(complete))
+
+        engine.submit(
+            f"{name}:compact_guard",
+            after=(ready,),
+            on_complete=launch,
+            owner=owner,
+            native_hook=True,
+        )
+        return complete
+
+
+def guarded_program(params, context, cores, literal_builder):
+    """Select compact owner-runs only when isolated on the Engine."""
+    return _GuardedCompactProgram(
+        lambda: program(params, context, cores),
+        literal_builder,
+    )
+
+
 def program(params, context, cores):
     from mindie_sim.prediction.operators.kda import kda_prepare as source
 
@@ -106,7 +183,7 @@ def program(params, context, cores):
         lengths = tuple(params.lengths[task // params.heads]
                         for task in range(aiv, params.gate_tasks, 2 * cores))
         expanded = source._gate_pipeline(aiv, params, context, 2 * cores)
-        key = ("gate", lengths, signature,
+        key = ("gate", lengths, params.safe_gate, signature,
                _ownership(context, aiv // 2, (aiv % 2,)))
         nominal = _nominal(key, expanded, context)
         # Reuse only arithmetic; a one-head Params is an owner ledger, not
@@ -117,18 +194,26 @@ def program(params, context, cores):
             resources = dict(work.resources)
             resources["mte2_aiv"] = resources.pop("mte2")
             work = source.Work(work.matrix, resources)
-        gates.append(_run("owner", context.bind(work),
-                          source._aiv(context, aiv), nominal))
+        gate_run = _run("owner", context.bind(work),
+                        source._aiv(context, aiv), nominal)
+        gates.append(source._wrap_aiv_ub(
+            context, aiv, 2 * cores, source.GATE_UB_BYTES_PER_AIV, gate_run))
 
     prepares = []
+    prepare_ub = source._prepare_ub_bytes(params.safe_gate)
     for core, count in source.task_ownership(params, cores):
         expanded = source._paired_tile(core, params, context)
         template = KernelProgram(tuple(expanded.tile(0)))
-        key = ("paired", signature, _ownership(context, core, (None, 0, 1)))
+        key = ("paired", params.safe_gate, signature,
+               _ownership(context, core, (None, 0, 1)))
         nominal = _nominal(key, template, context)
         work, owned = _ledger(template)
-        prepares.append(_run("owner", {name: amount * count for name, amount in work.items()},
-                             owned, nominal * count))
+        prep_run = _run("owner", {name: amount * count for name, amount in work.items()},
+                        owned, nominal * count)
+        prepares.append(
+            resident(context, core, {"ub": prepare_ub}, prep_run)
+            if "ub" in context.pool_names else prep_run
+        )
 
     if context.record_mapping:
         context.record_mapping({
