@@ -63,12 +63,16 @@ class ServiceGrantObserver:
         self.current_node_idx: int | None = None
         self.task_to_node: dict[int, int] = {}
         self.admit_ms_by_node: dict[int, float] = {}
-        self._grant_acc: dict[tuple[float, float, str, int], float] = {}
+        self._grant_acc: dict[tuple[float, float, str, int, int], float] = {}
         self._slot_gen: dict[tuple[str, int, str], int] = {}
 
     @property
     def grants(self) -> list[tuple[float, float, str, int, float]]:
-        return [(t0, t1, rname, idx, deliv) for (t0, t1, rname, idx), deliv in self._grant_acc.items()]
+        agg: dict[tuple[float, float, str, int], float] = {}
+        for (t0, t1, rname, _owner, idx), deliv in self._grant_acc.items():
+            key = (t0, t1, rname, idx)
+            agg[key] = agg.get(key, 0.0) + deliv
+        return [(t0, t1, rname, idx, deliv) for (t0, t1, rname, idx), deliv in agg.items()]
 
     def to_observed_grants(
         self,
@@ -79,20 +83,25 @@ class ServiceGrantObserver:
         """Convert accumulated Engine grants to integer-ns ``ObservedServiceGrant`` records."""
         out: list[ObservedServiceGrant] = []
         n_nodes = len(node_ids)
-        for (t0_ms, t1_ms, rname, idx), deliv in self._grant_acc.items():
+        for (t0_ms, t1_ms, rname, owner, idx), deliv in self._grant_acc.items():
             if deliv <= 0.0 or t1_ms <= t0_ms or idx < 0 or idx >= n_nodes:
                 continue
             s_ns = max(0, int(round(t0_ms * float(NS_PER_MS))) - step_start_ns)
             e_ns = max(s_ns, int(round(t1_ms * float(NS_PER_MS))) - step_start_ns)
             if e_ns > s_ns:
-                out.append(ObservedServiceGrant(node_ids[idx], rname, s_ns, e_ns, float(deliv)))
+                out.append(ObservedServiceGrant(node_ids[idx], rname, s_ns, e_ns, float(deliv), owner=owner))
         return tuple(out)
 
     def register_pipe(self, _name: str) -> int:
         return 0
 
-    def on_submit(self, task_id: int, name: str = "", *_args: Any, **_kwargs: Any) -> None:
-        idx = self.current_node_idx
+    def on_submit(
+        self, task_id: int, name: str = "", *_args: Any,
+        parent_task_id: int | None = None, **_kwargs: Any,
+    ) -> None:
+        idx = self.task_to_node.get(int(parent_task_id)) if parent_task_id is not None else None
+        if idx is None:
+            idx = self.current_node_idx
         if idx is None and name:
             match = _COLLECTIVE_TASK_IDX_RE.match(str(name))
             if match is not None:
@@ -108,14 +117,14 @@ class ServiceGrantObserver:
                 self.admit_ms_by_node[idx] = float(now_ms)
 
     def on_service(
-        self, task_id: int, physical_row: str, _owner: int,
+        self, task_id: int, physical_row: str, owner: int,
         t0_ms: float, t1_ms: float, delivered: float, **_kwargs: Any,
     ) -> None:
         if delivered <= 0.0 or t1_ms <= t0_ms:
             return
         idx = self.task_to_node.get(int(task_id))
         if idx is not None:
-            key = (float(t0_ms), float(t1_ms), str(physical_row), idx)
+            key = (float(t0_ms), float(t1_ms), str(physical_row), int(owner), idx)
             self._grant_acc[key] = self._grant_acc.get(key, 0.0) + float(delivered)
 
     def allocate_slot_generation(self, pool: str, unit: int, name: str) -> tuple[int, int]:
@@ -160,6 +169,7 @@ class ObservedServiceGrant:
     start_ns: int
     end_ns: int
     delivered: float
+    owner: int | None = None
 
 
 @dataclass(frozen=True)
@@ -248,12 +258,12 @@ def _attribute_live_slice(
     """Attribute one concurrent slice ``dt`` ns across active intervals and grants."""
     witness = _pick_stream0_witness(live, witness_set)
     live_ids = {iv.occurrence_id for iv in live}
-    grants_by_res: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
+    grants_by_res: dict[tuple[str, int | None], dict[str, float]] = defaultdict(lambda: defaultdict(float))
     for gr in live_grants:
         if gr.occurrence_id in live_ids:
             span = float(gr.end_ns - gr.start_ns)
             if span > 0.0:
-                grants_by_res[gr.resource][gr.occurrence_id] += gr.delivered * (float(dt) / span)
+                grants_by_res[(gr.resource, gr.owner)][gr.occurrence_id] += gr.delivered * (float(dt) / span)
     contested = [
         res for res, claimants in grants_by_res.items()
         if witness.occurrence_id in claimants and len(claimants) >= 2
@@ -321,7 +331,7 @@ def _attribute_live_slice_indexed(
     dt: int,
     live_ivs: Mapping[int, ObservedInterval],
     live_oid_counts: Counter,
-    live_grants_by_res: Mapping[str, Mapping[int, tuple[str, Fraction]]],
+    live_grants_by_res: Mapping[tuple[str, int | None], Mapping[int, tuple[str, Fraction]]],
     live_res_by_oid: Mapping[str, Counter],
     witness_set: frozenset[str],
     exposed_int: dict[str, int],
@@ -408,7 +418,7 @@ def attribute_stream0_intervals(
     for iv in active_ivs:
         cuts_set.add(iv.start_ns)
         cuts_set.add(iv.end_ns)
-    clamped_grants: list[tuple[int, int, str, str, Fraction]] = []
+    clamped_grants: list[tuple[int, int, str, tuple[str, int | None], Fraction]] = []
     for gr in grants:
         orig_lo = int(gr.start_ns)
         orig_hi = int(gr.end_ns)
@@ -419,10 +429,12 @@ def attribute_stream0_intervals(
         hi = max(start_i, min(term_i, orig_hi))
         if hi > lo:
             rate = Fraction(float(gr.delivered)) / Fraction(orig_span)
-            clamped_grants.append((lo, hi, gr.occurrence_id, gr.resource, rate))
+            clamped_grants.append((lo, hi, gr.occurrence_id, (gr.resource, gr.owner), rate))
             cuts_set.add(lo)
             cuts_set.add(hi)
-    clamped_grants.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+    clamped_grants.sort(
+        key=lambda item: (item[0], item[1], item[2], item[3][0], -1 if item[3][1] is None else item[3][1])
+    )
 
     cuts = sorted(cuts_set)
     idle_wait_ns = 0
@@ -433,7 +445,7 @@ def attribute_stream0_intervals(
     gr_heap: list[tuple[int, int]] = []
     live_ivs: dict[int, ObservedInterval] = {}
     live_oid_counts: Counter = Counter()
-    live_grants_by_res: dict[str, dict[int, tuple[str, Fraction]]] = defaultdict(dict)
+    live_grants_by_res: dict[tuple[str, int | None], dict[int, tuple[str, Fraction]]] = defaultdict(dict)
     live_res_by_oid: dict[str, Counter] = defaultdict(Counter)
 
     for lo, hi in zip(cuts, cuts[1:]):

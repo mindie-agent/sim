@@ -749,9 +749,7 @@ class Topology(_TopologyPlansMixin):
         return self._link_scope[name]
 
     def _endpoint_rate(self, link, rank: int) -> float:
-        value = link.endpoint_capacity_bytes_per_ms(int(rank))
-        return (float(value) if value is not None
-                else float(link.capacity_bytes_per_ms))
+        return float(link.capacity_at(int(rank)))
 
     def _endpoint_resource(self, link, direction: str, rank: int):
         return Resource(
@@ -1001,36 +999,22 @@ class Topology(_TopologyPlansMixin):
                 members = set(sources)
                 return tuple(tuple(group) for group in p.rank_table
                              if members.intersection(group))
+            if not (p.ep_spans_dp or p.ep_spans_pcp):
+                return tuple(sources[i:i + p.ep] for i in range(0, len(sources), p.ep))
             ep_tp_w = max(1, p.tp // p.etp)
-            ep_spans_pcp = p.pcp > 1 and p.ep > p.dp * ep_tp_w
-            ep_intra_w = ep_tp_w * p.pcp if ep_spans_pcp else ep_tp_w
-            ep_spans_dp = p.ep > ep_intra_w
-            if ep_spans_dp or (ep_spans_pcp and p.etp > 1):
-                count = max(1, p.ep // ep_intra_w)
-                first = (replica // count) * count
-                if ep_spans_pcp:
-                    if p.etp <= 1:
-                        return (tuple(rank for r in range(first, first + count)
-                                      for rank in self.ranks(r, stage)),)
-                    return tuple(
-                        tuple(
-                            rank
-                            for r in range(first, first + count)
-                            for copy in range(p.pcp)
-                            for rank in self.ranks(r, stage)[copy * p.tp + off:copy * p.tp + off + ep_tp_w]
-                        )
-                        for off in range(0, p.tp, ep_tp_w)
-                    )
-                return tuple(
-                    tuple(
-                        rank
-                        for r in range(first, first + count)
-                        for rank in self.ranks(r, stage)[copy * p.tp + off:copy * p.tp + off + ep_tp_w]
-                    )
-                    for copy in range(p.pcp)
-                    for off in range(0, p.tp, ep_tp_w)
+            dp_w = max(1, p.ep_dp_width)
+            first = (replica // dp_w) * dp_w
+            copy_count = min(p.pcp, max(1, p.ep // ep_tp_w)) if p.ep_spans_pcp else 1
+            return tuple(
+                tuple(
+                    rank
+                    for r in range(first, first + dp_w)
+                    for copy in range(first_copy, first_copy + copy_count)
+                    for rank in self.ranks(r, stage)[copy * p.tp + off:copy * p.tp + off + ep_tp_w]
                 )
-            return tuple(sources[i:i + p.ep] for i in range(0, len(sources), p.ep))
+                for first_copy in range(0, p.pcp, copy_count)
+                for off in range(0, p.tp, ep_tp_w)
+            )
         if axis == "tp":
             return tuple(sources[i:i + p.tp] for i in range(0, len(sources), p.tp))
         raise ModelingError(f"communication_group_axis_unknown:{axis}")

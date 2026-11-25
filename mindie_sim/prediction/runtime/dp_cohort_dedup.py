@@ -236,15 +236,22 @@ def _external_input_signature(engine: Any, mapping: Mapping | None) -> tuple[Any
     for key in sorted(mapping):
         ev = mapping[key]
         if ev.time is not None:
-            out.append((key, True, float(ev.time), 0.0, False))
+            out.append((key, True, float(ev.time), 0.0))
         else:
             task = engine._tasks.get(ev.sequence)
             if task is None:
-                return (("unresolved_promise", key, ev.sequence),)
-            out.append((
-                key, False, float(task.release), float(task.latency),
-                bool(task.remaining or task.waiting),
-            ))
+                out.append((key, "unresolved_promise", ev.sequence))
+            elif (
+                task.remaining
+                or task.waiting
+                or task.acquire
+                or task.callback is not None
+                or task.start_callback is not None
+            ):
+                out.append((key, "unresolved_task", ev.sequence))
+            else:
+                eff_start = float(task.start) if task.start is not None else float(task.release)
+                out.append((key, False, eff_start, float(task.latency)))
     return tuple(out)
 
 

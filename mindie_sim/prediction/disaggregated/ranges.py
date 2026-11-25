@@ -64,20 +64,43 @@ def _compressed_store_on_completion_runs(
     return ((c_lo, c_hi),) if c_hi > c_lo else ()
 
 
+def canonical_physical_rank(
+    index: int, parallel, *, stage: int = 0, replica: int = 0, cohort_size: int | None = None,
+) -> int:
+    """Canonical global physical rank ``((dp_i * pp + pp_i) * pcp + pcp_i) * tp + tp_i``."""
+    tp_dim = max(1, int(getattr(parallel, "tp", 1) or 1))
+    pcp_dim = max(1, int(getattr(parallel, "pcp", 1) or 1))
+    pp_dim = max(1, int(getattr(parallel, "pp", 1) or 1))
+    dcp_dp = max(1, int(getattr(parallel, "dcp_dp_width", 1) or 1))
+    idx = int(index)
+    tp_i = idx % tp_dim
+    pcp_i = (idx // tp_dim) % pcp_dim
+    dp_local = idx // (tp_dim * pcp_dim)
+    local_stage_w = tp_dim * pcp_dim
+    if dcp_dp > 1 and cohort_size is not None and int(cohort_size) >= local_stage_w * dcp_dp:
+        dp_i = (int(replica) // dcp_dp) * dcp_dp + dp_local
+    else:
+        dp_i = int(replica) + dp_local
+    return ((dp_i * pp_dim + int(stage)) * pcp_dim + pcp_i) * tp_dim + tp_i
+
+
 def dcp_cp_rank(layer, parallel, rank: int) -> int:
-    """Exact DCP shard index for physical rank ``rank`` matching ``catalog.cache._local_cache_rows``."""
+    """Exact DCP shard index for canonical global rank ``rank`` matching ``catalog.cache``."""
     cp = layer_dcp_degree(layer, parallel)
     if cp <= 1:
         return 0
     pcp_f, tp_g, dp_w = layer_dcp_factors(layer, parallel)
     tp_dim = max(1, int(getattr(parallel, "tp", 1) or 1))
     pcp_dim = max(1, int(getattr(parallel, "pcp", 1) or 1))
+    pp_dim = max(1, int(getattr(parallel, "pp", 1) or 1))
     dp_dim = max(1, int(getattr(parallel, "dp", 1) or 1))
     r_int = int(rank)
     tp_i = r_int % tp_dim
     pcp_i = (r_int // tp_dim) % pcp_dim
-    dp_i = (r_int // (tp_dim * pcp_dim)) % dp_dim
-    return ((dp_i % dp_w) * (pcp_f * tp_g) + (pcp_i % pcp_f) * tp_g + (tp_i % tp_g)) % cp
+    dp_i = (r_int // (tp_dim * pcp_dim * pp_dim)) % dp_dim
+    if dp_w > 1:
+        return ((dp_i % dp_w) * (pcp_f * tp_g) + (pcp_i % pcp_f) * tp_g + (tp_i % tp_g)) % cp
+    return ((tp_i % tp_g) * pcp_f + (pcp_i % pcp_f)) % cp
 
 
 def interleaved_token_runs(
@@ -116,14 +139,15 @@ def owned_runs(component, layer, model, parallel, rank, span, tokens, window_sta
     win_lo = max(0, int(window_start))
     cp_deg = layer_dcp_degree(layer, parallel)
     use_interleaved = (not explicit_span) and cp_deg > 1
-    if component in {"mla_kv", "window"}:
+    if component in {"gqa_kv", "mla_kv", "window"}:
         if use_interleaved:
             return interleaved_token_runs(
                 toks, cp_deg, cp_interleave(runtime), dcp_cp_rank(layer, parallel, int(rank)),
                 window_start=win_lo,
             )
         start = max(lo, win_lo)
-        return ((start, hi),) if hi > start else ()
+        end = min(toks, hi)
+        return ((start, end),) if end > start else ()
     ratio = max(1, int(getattr(layer, "compress_ratio", 1) or 1))
     if component == "compressed_kv":
         if use_interleaved:
@@ -135,13 +159,13 @@ def owned_runs(component, layer, model, parallel, rank, span, tokens, window_sta
         return _compressed_store_on_completion_runs(lo, hi, toks, ratio)
     ratio = max(ratio, int(getattr(layer, "index_kpool", 1) or 1))
     total = toks // ratio
-    if dcp_indexer_sharded(model, runtime) and cp_deg > 1:
-        if use_interleaved:
-            stride = max(1, int(cp_interleave(runtime)) // ratio)
-            return interleaved_token_runs(
-                total, cp_deg, stride, dcp_cp_rank(layer, parallel, int(rank)),
-            )
+    if explicit_span and (dcp_indexer_sharded(model, runtime) or cp_deg <= 1):
         return _compressed_store_on_completion_runs(lo, hi, toks, ratio)
+    if dcp_indexer_sharded(model, runtime) and cp_deg > 1:
+        stride = max(1, int(cp_interleave(runtime)) // ratio)
+        return interleaved_token_runs(
+            total, cp_deg, stride, dcp_cp_rank(layer, parallel, int(rank)),
+        )
     if parallel.cp_plan != "dsa_cp" or int(parallel.cp) <= 1:
         return ((0, total),) if total > 0 else ()
     block = index_k_block_rows(ratio)
