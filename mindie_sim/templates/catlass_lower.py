@@ -22,9 +22,11 @@ from mindie_sim.prediction.runtime.tile_solver import (
 from mindie_sim.schema.common import ModelingError
 
 from .catlass_catalog import (
-    GATHER_SCATTER_AIV_MAX_K, GATHER_SCATTER_FULL_LOAD_A, GATHER_SCATTER_POLICIES, GATHER_SCATTER_SIMT_UB_BYTES,
-    MX_SCALE_GROUP, STREAMK_PARTIAL_SLOTS_PER_CORE, _workspace_bytes, dtype_name, grouped_start_cores,
-    matrix_problem, mx_scale_bytes, packed_bytes, should_elide_l1_reload,
+    A8W4_EXPANDED_B_DTYPE, A8W4_PROLOGUE_B, FINALIZE_ROUTING_POLICY, GATHER_SCATTER_AIV_MAX_K,
+    GATHER_SCATTER_FULL_LOAD_A, GATHER_SCATTER_POLICIES, GATHER_SCATTER_SIMT_UB_BYTES,
+    MX_BASEK_FACTOR, MX_SCALE_GROUP, STREAMK_PARTIAL_SLOTS_PER_CORE, _workspace_bytes,
+    dtype_name, finalize_routing_column_slices, grouped_start_cores, matrix_problem,
+    mx_scale_bytes, packed_bytes, resolve_catlass_cube_mode, should_elide_l1_reload,
     streamk_partition, swizzle_block_coord, validate_catlass_spec,
 )
 from ._catlass_streaming import STREAMING_PANEL_MICRO_THRESHOLD, lower_catlass_streaming
@@ -37,6 +39,11 @@ SIMT_WARP_SIZE = 32
 A8W4_PROLOGUE_SUBBLOCK_ALIGNMENT = 32
 A8W4_PROLOGUE_UB_SLOT_BYTES = 2 * 32 * 1024
 GATHER_SCATTER_FULL_LOAD_UB_BYTES = 216 * 1024
+_MX_SCALE_C0_ELEMS = 2
+_SUBBLOCK_SPLIT = 2
+_SWIGLU_SUB_BANKS = 2
+_SWIGLU_AUX_SCALE_BUFFERS = 2
+_FINALIZE_ONE_DATA_BLOCK_BYTES = 32
 _SFU_NODES = {"exp": 1, "sqrt": 1, "rsqrt_fast": 1, "silu": 1}
 _ALU_NODES = {"relu": 1, "leaky_relu": 2, "silu": 2, "cast": 1, "mul": 1, "muls": 1, "add": 1}
 
@@ -49,7 +56,7 @@ def _paired_aiv(spec, datapath, owner):
 
 
 def _is_simt_matrix(spec):
-    return spec.simt_thread_block_dim is not None and spec.dispatch_policy != "GroupedMxMatmulFinalizeRoutingTla"
+    return spec.simt_thread_block_dim is not None and spec.dispatch_policy != FINALIZE_ROUTING_POLICY
 
 
 def _mx_scale_group_span(k0: int, k_len: int) -> tuple[int, int]:
@@ -69,12 +76,43 @@ def _scale(spec, elements, *, l1=False):
     return ceil_div(elements, MX_SCALE_GROUP)
 
 
+def _mx_scale_runs(
+    outer_start: int, outer_count: int, outer_total: int,
+    g_lo: int, g_count: int, k_scales_total: int, *, k_contiguous: bool,
+) -> tuple[AddressRun, ...]:
+    """Build exact ``MakeMxScaleLayout`` (``ELE_NUM_PER_C0 = 2``) GM scale runs."""
+    if k_contiguous:
+        stride = ceil_div(k_scales_total, _MX_SCALE_C0_ELEMS) * _MX_SCALE_C0_ELEMS
+        return (AddressRun(outer_start * stride + g_lo, outer_count, g_count, stride),)
+    pair_stride = outer_total * _MX_SCALE_C0_ELEMS
+    g_hi = g_lo + g_count
+    runs: list[AddressRun] = []
+    if g_lo % _MX_SCALE_C0_ELEMS:
+        runs.append(AddressRun(
+            (g_lo // _MX_SCALE_C0_ELEMS) * pair_stride + outer_start * _MX_SCALE_C0_ELEMS + 1,
+            outer_count, 1, _MX_SCALE_C0_ELEMS,
+        ))
+    p_lo = ceil_div(g_lo, _MX_SCALE_C0_ELEMS)
+    p_hi = g_hi // _MX_SCALE_C0_ELEMS
+    if p_hi > p_lo:
+        runs.append(AddressRun(
+            p_lo * pair_stride + outer_start * _MX_SCALE_C0_ELEMS,
+            p_hi - p_lo, outer_count * _MX_SCALE_C0_ELEMS, pair_stride,
+        ))
+    if g_hi % _MX_SCALE_C0_ELEMS and (g_hi - 1) >= g_lo and (g_hi - 1) >= p_lo * _MX_SCALE_C0_ELEMS:
+        runs.append(AddressRun(
+            (g_hi // _MX_SCALE_C0_ELEMS) * pair_stride + outer_start * _MX_SCALE_C0_ELEMS,
+            outer_count, 1, _MX_SCALE_C0_ELEMS,
+        ))
+    return tuple(runs)
+
+
 def _compute_b(spec):
-    return dtype_name(spec.dtype_a) if spec.prologue_b == "DecompressFp4ToFp8" else dtype_name(spec.dtype_b)
+    return A8W4_EXPANDED_B_DTYPE if spec.prologue_b == A8W4_PROLOGUE_B else dtype_name(spec.dtype_b)
 
 
 def _cube_dtype(spec):
-    return dtype_name(spec.dtype_a)
+    return resolve_catlass_cube_mode(spec)
 
 
 def _visitor_buffers(spec, tm, tn):
@@ -125,9 +163,12 @@ def _total_issued_ops(spec, p, datapath) -> int:
             for dim, mult in _axis_tile_counts(rows, tm):
                 m_counts[dim] += mult
     n_counts: Counter[int] = Counter()
-    if spec.epilogue_kind == "grouped_swiglu_mx_quant":
-        for dim, mult in _axis_tile_counts(p.n // 2, tn):
-            n_counts[dim] += 2 * mult
+    if spec.epilogue_kind == "finalize_routing":
+        for _, _, col_w in finalize_routing_column_slices(p.n, tn, spec.aic_budget):
+            n_counts[col_w] += 1
+    elif spec.epilogue_kind == "grouped_swiglu_mx_quant":
+        for dim, mult in _axis_tile_counts(p.n // _SUBBLOCK_SPLIT, tn):
+            n_counts[dim] += _SUBBLOCK_SPLIT * mult
     else:
         for dim, mult in _axis_tile_counts(p.n, tn):
             n_counts[dim] += mult
@@ -166,23 +207,35 @@ def solve_catlass_tile(spec, problem, datapath, *, memory_view=None, die=0):
     ) if not simt else ()
     total_elements = tm * tn
     if spec.has_bias and not simt:
-        buffers += (LiveBufferSpec("bias", "l1", packed_bytes(tn, spec.dtype_acc), 0, 1, owner_kind="aic"),)
+        bias_dtype = "bf16" if spec.epilogue_kind == "finalize_routing" else spec.dtype_acc
+        buffers += (LiveBufferSpec("bias", "l1", packed_bytes(tn, bias_dtype), 0, 1, owner_kind="aic"),)
     if spec.evg_tree:
         buffers += _visitor_buffers(spec, tm, tn)
-    if spec.prologue_b == "DecompressFp4ToFp8":
+    if spec.prologue_b == A8W4_PROLOGUE_B:
         buffers += (LiveBufferSpec(
             "packed_and_decompressed_b", "ub", A8W4_PROLOGUE_UB_SLOT_BYTES, 0, 1,
             owner_kind="aiv", slots=slots[1],
         ),)
-        for aic in range(min(spec.aic_budget, g_m * g_n)):
-            lanes = tuple(v for v in dict(datapath.aic_aiv_pairs).get(aic, ()) if v < spec.aiv_budget)
-            if len(lanes) != 2:
-                raise ModelingError(f"catlass_a8w4_requires_two_subblocks:{aic}")
-            for lane in lanes:
-                datapath.route("ub", "l1", _compute_b(spec), (lane, aic))
     if spec.epilogue_kind == "grouped_swiglu_mx_quant":
-        peak = 2 * packed_bytes(total_elements, spec.dtype_acc) + packed_bytes(total_elements, spec.dtype_c)
-        buffers += (LiveBufferSpec("gate_up", "ub", peak, 0, 1, owner_kind="aiv", slots=2),)
+        elems = ceil_div(tm, _SUBBLOCK_SPLIT) * tn
+        scale_elems = ceil_div(elems, MX_SCALE_GROUP)
+        peak = (
+            _SWIGLU_SUB_BANKS * packed_bytes(elems, spec.dtype_acc)
+            + packed_bytes(elems, spec.dtype_c)
+            + scale_elems
+            + packed_bytes(elems, "bf16")
+            + _SWIGLU_AUX_SCALE_BUFFERS * packed_bytes(scale_elems, "fp16")
+            + tm * _NOMINAL_BUFFER_ALIGNMENT
+        )
+        buffers += (LiveBufferSpec("gate_up", "ub", peak, 0, 1, owner_kind="aiv"),)
+    if spec.epilogue_kind == "finalize_routing":
+        elem_c_bytes = packed_bytes(1, spec.dtype_c)
+        brcb_lanes = _FINALIZE_ONE_DATA_BLOCK_BYTES // elem_c_bytes
+        ub_gmm = tm * ceil_div(tn, _SUBBLOCK_SPLIT) * elem_c_bytes
+        ub_idx = tm * packed_bytes(1, "int64")
+        ub_logit = tm * elem_c_bytes
+        ub_bytes = ub_gmm + ub_idx + ub_logit + ub_logit * brcb_lanes
+        buffers += (LiveBufferSpec("finalize_routing_ub", "ub", ub_bytes, 0, 1, owner_kind="aiv"),)
     if simt:
         threads = prod(spec.simt_thread_block_dim)
         pinned = spec.dispatch_policy == "MatmulGatherScatterSimt"
@@ -196,7 +249,12 @@ def solve_catlass_tile(spec, problem, datapath, *, memory_view=None, die=0):
             datapath.route("l0c", "ub", spec.dtype_acc, (core, lane), (tm, tn))
             if p.k <= GATHER_SCATTER_AIV_MAX_K:
                 datapath.route("ub", "l1", spec.dtype_a, (lane, core))
-    eff_g_n = ceil_div(p.n // 2, tn) if spec.epilogue_kind == "grouped_swiglu_mx_quant" else g_n
+    if spec.epilogue_kind == "finalize_routing":
+        eff_g_n = len(finalize_routing_column_slices(p.n, tn, spec.aic_budget))
+    elif spec.epilogue_kind == "grouped_swiglu_mx_quant":
+        eff_g_n = ceil_div(p.n // _SUBBLOCK_SPLIT, tn)
+    else:
+        eff_g_n = g_n
     if spec.epilogue_kind in {"evg_ub", "grouped_swiglu_mx_quant"}:
         owners = min(spec.aic_budget, g_m * eff_g_n)
         for aic in range(owners):
@@ -321,7 +379,7 @@ class _MatrixLowerer:
             if aiv_gather:
                 read = self.plan.work(f"{name}:gather_to_l1", "mte3", tile.m * stride, after=(read,), owner=vector)
             return (read,)
-        if not a and s.prologue_b == "DecompressFp4ToFp8":
+        if not a and s.prologue_b == A8W4_PROLOGUE_B:
             deps = self._expand_b(name, tile, row, rows, allocation, deps, cache_bypass)
         else:
             deps = (self._rect(
@@ -329,15 +387,19 @@ class _MatrixLowerer:
                 name=f"{name}:gm_{operand}", allocation=allocation, owner=core, pipe="mte2_aic",
                 after=deps, bypass=cache_bypass,
             ),)
-        if s.mx_scale_group:
-            per_row = ceil_div(width, MX_SCALE_GROUP) if a else ceil_div(p.k, MX_SCALE_GROUP)
-            g_lo, sc = _mx_scale_group_span(col, cols) if a else _mx_scale_group_span(row, rows)
-            sr = rows if a else cols
-            off = row * per_row + g_lo if a else col * per_row + g_lo
+        if s.mx_scale_group and (k_start // self.tk) % s.l1_scale_factor_k == 0:
+            k_scale_len = min(self.tk * s.l1_scale_factor_k, p.k - k_start)
+            g_lo, sc = _mx_scale_group_span(k_start, k_scale_len)
+            k_scales_total = ceil_div(p.k, MX_SCALE_GROUP)
+            outer_start, outer_count, outer_total = (row, rows, p.m) if a else (col, cols, p.n)
+            k_contiguous = (s.layout_a == "RowMajor") if a else (s.layout_b == "ColumnMajor")
+            runs = _mx_scale_runs(
+                outer_start, outer_count, outer_total, g_lo, sc, k_scales_total,
+                k_contiguous=k_contiguous,
+            )
             deps = (self.plan.access(
-                f"{name}:scale_{operand}", f"{allocation}:scale", sr * sc, owner=core,
-                pipe="mte2_aic", after=deps, bypass=cache_bypass,
-                runs=(AddressRun(off, sr, sc, per_row),),
+                f"{name}:scale_{operand}", f"{allocation}:scale", outer_count * sc, owner=core,
+                pipe="mte2_aic", after=deps, bypass=cache_bypass, runs=runs,
             ),)
         return deps
 
@@ -397,10 +459,12 @@ class _MatrixLowerer:
             self.owner_generation[core] += 1
             if core in self.mma_tail:
                 previous += (self.mma_tail[core],)
-        if s.has_bias:
+        if s.has_bias and (not panels or panels[0] == 0):
+            bias_dtype = "bf16" if s.epilogue_kind == "finalize_routing" else s.dtype_acc
+            bias_off = (tile.group * p.n if p.groups else 0) + tile.col
             previous = (plan.access(
-                f"{name}:bias", p.c_id + ":bias", packed_bytes(tile.n, s.dtype_acc),
-                owner=core, pipe="mte2_aic", offset=packed_bytes(tile.col, s.dtype_acc), after=previous,
+                f"{name}:bias", p.c_id + ":bias", packed_bytes(tile.n, bias_dtype),
+                owner=core, pipe="mte2_aic", offset=packed_bytes(bias_off, bias_dtype), after=previous,
             ),)
         g = 0
         for outer, panel in enumerate(panels, panel_start):
@@ -494,18 +558,7 @@ class _MatrixLowerer:
             self._consume(name, out)
             return out
         if epilogue == "finalize_routing":
-            aiv = self._aiv(tile)
-            amount = packed_bytes(tile.m * tile.n, s.dtype_c)
-            tensor = p.c_id + ":routing"
-            write = plan.access(name + ":routing_write", tensor, amount, private=True, direction="write",
-                                pipe="fixpipe", owner=tile.owner, after=(ready,), working_set=s.workspace_bytes,
-                                offset=tile.owner * packed_bytes(self.tm * self.tn, s.dtype_c))
-            self._consume(name, write)
-            read = plan.access(name + ":routing_read", tensor, amount, private=True, owner=aiv, after=(write,),
-                               working_set=s.workspace_bytes,
-                               offset=tile.owner * packed_bytes(self.tm * self.tn, s.dtype_c))
-            route = plan.work(name + ":finalize_routing", "aiv_simt", tile.m * tile.n, owner=aiv, after=(read,))
-            return self._write_output(name + ":output", tile, (route,), pipe="mte3", owner=aiv)
+            return self._finish_finalize_routing(tile, name, ready)
         aiv = self._aiv(tile, epilogue == "evg_ub")
         size = packed_bytes(tile.m * tile.n, s.dtype_acc)
         if epilogue == "evg_ub":
@@ -738,7 +791,51 @@ class _MatrixLowerer:
                                 after=after, offset=tile.row * index_bytes,
                                 obligation=p.indices is not None or p.physical_m is not None)
 
-    def zero_destination(self, launch):
+    def _finish_finalize_routing(self, tile, name, ready):
+        s, p, plan = self.spec, self.p, self.plan
+        amount = packed_bytes(tile.m * tile.n, s.dtype_c)
+        ws_base = tile.owner * packed_bytes(self.tm * self.tn, s.dtype_c)
+        tensor = p.c_id + ":routing"
+        write = plan.access(
+            name + ":routing_write", tensor, amount, private=True, direction="write",
+            pipe="fixpipe", owner=tile.owner, after=(ready,), working_set=s.workspace_bytes,
+            offset=ws_base,
+        )
+        self._consume(name, write)
+        lanes = tuple(v for v in dict(plan.datapath.aic_aiv_pairs).get(tile.owner, ()) if v < s.aiv_budget)
+        half_n = ceil_div(tile.n, _SUBBLOCK_SPLIT)
+        row_stride = packed_bytes(tile.n, s.dtype_c)
+        done = []
+        for lane, n_off, cur_n in zip(lanes, (0, half_n), (half_n, tile.n - half_n)):
+            if cur_n <= 0:
+                continue
+            tag = f"{name}:aiv{lane}"
+            cur_bytes = packed_bytes(cur_n, s.dtype_c)
+            ws_run = AddressRun(ws_base + packed_bytes(n_off, s.dtype_c), tile.m, cur_bytes, row_stride)
+            read = plan.access(
+                tag + ":routing_read", tensor, tile.m * cur_bytes, private=True, owner=lane,
+                pipe="mte2_aiv", after=(write,), working_set=s.workspace_bytes, runs=(ws_run,),
+            )
+            logit = plan.access(
+                tag + ":logit", p.c_id + ":logit", packed_bytes(tile.m, s.dtype_c), owner=lane,
+                pipe="mte2_aiv", after=(write,), offset=packed_bytes(tile.row, s.dtype_c),
+            )
+            idx = plan.access(
+                tag + ":routing_indices", p.indices_id, packed_bytes(tile.m, "int64"), owner=lane,
+                pipe="mte2_aiv", after=(write,), offset=packed_bytes(tile.row, "int64"),
+            )
+            mul = plan.work(
+                tag + ":logit_mul", "vec_alu", tile.m * cur_n, owner=lane, after=(read, logit, idx),
+                metadata={"finalize_routing_op": "logit_scale_atomic_add"},
+            )
+            sub_tile = replace(tile, col=tile.col + n_off, n=cur_n)
+            done.append(self._write_output(
+                tag + ":atomic_add", sub_tile, (mul,), pipe="mte3", owner=lane,
+                physical_rows=self._physical_rows(tile),
+            ))
+        return plan.add(Stage(name + ":finalize_routing", after=tuple(done), metadata={"atomic_add": True}))
+
+    def zero_destination(self, launch, *, prefix="simt"):
         p, s, plan = self.p, self.spec, self.plan
         sector = plan.sector
         total = packed_bytes(p.output_rows * p.n, s.dtype_c)
@@ -749,13 +846,15 @@ class _MatrixLowerer:
             end = min(total, sectors * (lane + 1) // s.aiv_budget * sector)
             if start < end:
                 writes.append(plan.access(
-                    f"simt:zero_output:{lane}", p.c_id, end - start, direction="write",
+                    f"{prefix}:zero_output:{lane}", p.c_id, end - start, direction="write",
                     pipe="mte3", owner=lane, offset=start, after=(launch,),
                 ))
-        return plan.add(Stage("simt:zero_output:barrier", after=tuple(writes)))
+        return plan.add(Stage(f"{prefix}:zero_output:barrier", after=tuple(writes)))
 
 
 def _issued_ops(m, n, k, spec, datapath):
+    if spec.mx_scale_group:
+        k = ceil_div(k, MX_BASEK_FACTOR) * MX_BASEK_FACTOR
     native = next((wave for wave in datapath.subtile_wave if wave.native_mode == _cube_dtype(spec)), None)
     blocks = (native.independently_issuable_m, native.tile_n, native.tile_k) if native else (
         DEFAULT_INST_BLOCK_DIM, DEFAULT_INST_BLOCK_DIM, DEFAULT_INST_BLOCK_DIM
@@ -922,6 +1021,24 @@ def lower_catlass_spec(
                                live_admission=live_admission, region_id=region_id)
 
 
+def _lower_finalize_routing_groups(lowerer, launch) -> None:
+    p, spec = lowerer.p, lowerer.spec
+    col_slices = finalize_routing_column_slices(p.n, lowerer.tn, spec.aic_budget)
+    row_start, owner_done = 0, {}
+    for index, rows in enumerate(p.groups):
+        if not rows:
+            continue
+        for core, col_start, col_w in col_slices:
+            for m_idx in range(ceil_div(rows, lowerer.tm)):
+                row = m_idx * lowerer.tm
+                tile = _ProductTile(
+                    index, row_start + row, row, col_start,
+                    min(lowerer.tm, rows - row), col_w, core, rows,
+                )
+                owner_done[core] = lowerer.ordinary(tile, (owner_done.get(core, launch),))
+        row_start += rows
+
+
 def _lower_catlass_impl(
     spec, p, datapath, *, context=None, memory_view=None, die=0, live_admission=False, region_id=None,
 ):
@@ -930,7 +1047,7 @@ def _lower_catlass_impl(
                                 spec.splitk_factor, spec.dispatch_policy, spec.epilogue_kind)
     if spec.workspace_bytes != expected:
         raise ModelingError(f"catlass_workspace_mismatch:{spec.workspace_bytes}:{expected}")
-    if _estimated_panel_micros(spec, p) >= STREAMING_PANEL_MICRO_THRESHOLD:
+    if _estimated_panel_micros(spec, p) >= STREAMING_PANEL_MICRO_THRESHOLD and spec.epilogue_kind != "finalize_routing":
         return lower_catlass_streaming(
             spec, p, datapath, solution,
             context=context, memory_view=memory_view, die=die,
@@ -939,21 +1056,25 @@ def _lower_catlass_impl(
     plan = Lowering(datapath, context=context, memory_view=memory_view, die=die, live_admission=live_admission)
     lowerer = _MatrixLowerer(plan, spec, p)
     launch = plan.launch()
-    if spec.dispatch_policy in GATHER_SCATTER_POLICIES:
-        launch = lowerer.zero_destination(launch)
+    if spec.dispatch_policy in GATHER_SCATTER_POLICIES or spec.epilogue_kind == "finalize_routing":
+        prefix = "finalize" if spec.epilogue_kind == "finalize_routing" else "simt"
+        launch = lowerer.zero_destination(launch, prefix=prefix)
     blocks = ceil_div(p.m, lowerer.tm) * ceil_div(p.n, lowerer.tn)
     if spec.scheduler == "grouped_slice_m":
-        n_cols = p.n // 2 if spec.epilogue_kind == "grouped_swiglu_mx_quant" else p.n
-        row_start, owner_done = 0, {}
-        schedules = iter(grouped_start_cores(p.groups, n_cols, lowerer.tm, lowerer.tn, spec.aic_budget))
-        for rows in p.groups:
-            if not rows:
-                continue
-            index, start, loops = next(schedules)
-            for task in range(loops):
-                tile = lowerer.tile(task, group=index, group_start=row_start, rows=rows, start_core=start, n_cols=n_cols)
-                owner_done[tile.owner] = lowerer.ordinary(tile, (owner_done.get(tile.owner, launch),))
-            row_start += rows
+        if spec.epilogue_kind == "finalize_routing":
+            _lower_finalize_routing_groups(lowerer, launch)
+        else:
+            n_cols = p.n // _SUBBLOCK_SPLIT if spec.epilogue_kind == "grouped_swiglu_mx_quant" else p.n
+            row_start, owner_done = 0, {}
+            schedules = iter(grouped_start_cores(p.groups, n_cols, lowerer.tm, lowerer.tn, spec.aic_budget))
+            for rows in p.groups:
+                if not rows:
+                    continue
+                index, start, loops = next(schedules)
+                for task in range(loops):
+                    tile = lowerer.tile(task, group=index, group_start=row_start, rows=rows, start_core=start, n_cols=n_cols)
+                    owner_done[tile.owner] = lowerer.ordinary(tile, (owner_done.get(tile.owner, launch),))
+                row_start += rows
     elif spec.dispatch_policy == "MatmulGatherScatterSimt":
         lowerer.simt_gather_scatter((launch,))
     elif spec.scheduler in {"streamk", "multi_core_splitk"}:

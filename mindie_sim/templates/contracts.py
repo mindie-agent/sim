@@ -453,8 +453,19 @@ def full_load_a_eligible(problem, datapath) -> bool:
             and problem.k <= FULL_LOAD_A_MAX_K and problem.k % FP16_ELEMENTS_PER_BLOCK == 0)
 
 
+_GROUPED_MX_FP8_DTYPES = frozenset({
+    "mxfp8", "mx_fp8", "mxfp8_e4m3", "fp8_e4m3", "fp8_e4m3fn", "float8_e4m3", "fp8_e5m2", "float8_e5m2",
+})
+
+
 def eligible_matrix_engines(problem, datapath) -> tuple[str, ...]:
     if problem.indices is not None or problem.physical_m is not None:
+        if (problem.groups and datapath.arch_id in DIRECT_MATRIX_ARCH_IDS
+                and problem.indices is not None
+                and {problem.dtype_a.lower(), problem.dtype_b.lower()} <= _GROUPED_MX_FP8_DTYPES
+                and problem.dtype_acc.lower() in {"fp32", "float32"}
+                and problem.dtype_c.lower() in {"fp32", "float32"}):
+            return ("cube",)
         engines = ("cube",) if full_load_a_eligible(problem, datapath) else ()
         if (datapath.arch_id in DIRECT_MATRIX_ARCH_IDS and datapath.simt_ub_carveout_bytes > 0
                 and _indexed_fp16(problem)):

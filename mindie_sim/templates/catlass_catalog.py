@@ -93,7 +93,15 @@ _CATLASS_SYMBOLS = {
 CATLASS_TEMPLATE_IDS = tuple(_CATLASS_SYMBOLS)
 MAX_MUTEX_IDS = 28
 MX_SCALE_GROUP = 32
+MX_BASEK_FACTOR = 64
 A8W4_L1_SCALE_FACTOR_K = 16
+A8W4_PROLOGUE_B = "DecompressFp4ToFp8"
+A8W4_EXPANDED_B_DTYPE = "fp8_e4m3"
+A8W4_PROLOGUE_SLOT_BYTES = 32 * 1024
+MX_SCALE_LAYOUT = "E8M0_NZ_G32"
+SWIGLU_N_ALIGNMENT = 128
+SWIGLU_MAX_GROUPS = 1024
+FINALIZE_ROUTING_POLICY = "GroupedMxMatmulFinalizeRoutingTla"
 SIMT_TLA_MAX_THREADS = 2048
 SIMT_CATLASS_MAX_THREADS = 1024
 GATHER_SCATTER_SIMT_UB_BYTES = 64 * 1024
@@ -108,9 +116,59 @@ DEFAULT_SWIZZLE_OFFSETS = (1, 2, 3, 4, 6, 8, 12, 16)
 DEFAULT_SIMT_BLOCK = (128, 1, 1)
 _MATRIX_SHAPE_RANK = 3
 _RING_COUNT = 5
+_SUBBLOCK_COUNT = 2
+_NZ_FRACTAL_N = 16
+_MX_EVENT_LIMIT = 8
 _DEFAULT_STAGE_DEPTHS = (2, 2, 2, 2, 1)
 _MUTEX_STAGE_DEPTHS = (2, 2, 2, 2, 2)
-_DTYPE_ALIASES = {"float32": "fp32", "float16": "fp16", "bfloat16": "bf16"}
+_DTYPE_ALIASES = {
+    "float32": "fp32",
+    "float16": "fp16",
+    "bfloat16": "bf16",
+    "float8_e4m3": "fp8_e4m3",
+    "fp8_e4m3fn": "fp8_e4m3",
+    "float8_e5m2": "fp8_e5m2",
+    "fp4": "fp4_e2m1",
+    "hif8": "hifloat8",
+    "mx_fp8": "mxfp8",
+    "mxfp8_e4m3": "mxfp8",
+    "mx_fp4": "mxfp4",
+    "mxfp4_e2m1": "mxfp4",
+}
+_MX_FP8_DTYPES = frozenset({"mxfp8", "fp8_e4m3", "fp8_e5m2"})
+_MX_FP4_DTYPES = frozenset({"mxfp4", "fp4_e2m1"})
+_MX_MODES = frozenset({"mxfp8", "mxfp4", "a8w4_mx"})
+_ALLOWED_OUTPUT_BY_ACC = {
+    "fp32": frozenset({"fp32", "fp16", "bf16"}),
+    "int32": frozenset({"int32"}),
+}
+_LEGACY_OPERAND_ACC = {
+    ("fp16", "fp16"): "fp32",
+    ("bf16", "bf16"): "fp32",
+    ("fp32", "fp32"): "fp32",
+    ("int8", "int8"): "int32",
+    ("int4", "int4"): "int32",
+}
+_DIRECT_ONLY_OPERAND_ACC = {
+    ("fp8_e4m3", "fp8_e4m3"): "fp32",
+    ("fp8_e5m2", "fp8_e5m2"): "fp32",
+    ("fp8_e4m3", "fp8_e5m2"): "fp32",
+    ("fp8_e5m2", "fp8_e4m3"): "fp32",
+    ("fp4_e2m1", "fp4_e2m1"): "fp32",
+    ("hifloat8", "hifloat8"): "fp32",
+}
+_NO_BIAS_TEMPLATES = frozenset({
+    "catlass.multi_core_splitk",
+    "catlass.grouped_mx_swiglu_mx_quant",
+    "catlass.grouped_slice_m",
+    "catlass.full_load_a_gather_scatter",
+})
+_NO_BIAS_POLICIES = frozenset({
+    "MmadAtlasA2Streamk",
+    "MatmulGatherScatterSimt",
+    "tla_dsl",
+    GATHER_SCATTER_FULL_LOAD_A,
+})
 
 
 def dtype_name(dtype: str) -> str:
@@ -161,7 +219,9 @@ class CatlassProblem:
             raise ModelingError("catlass_operand_offset_invalid")
         if type(self.b_version) is not int or self.b_version < 0:
             raise ModelingError("catlass_operand_version_invalid")
-        if self.physical_m is not None and (type(self.physical_m) is not int or self.physical_m < self.m):
+        if self.physical_m is not None and (
+            type(self.physical_m) is not int or self.physical_m < (1 if self.groups else self.m)
+        ):
             raise ModelingError("catlass_physical_row_count_invalid")
         if self.indices is not None and (
             len(self.indices) != self.m or any(type(i) is not int or i < 0 for i in self.indices)
@@ -247,8 +307,184 @@ def grouped_start_cores(groups: Iterable[int], n: int, tm: int, tn: int, cores: 
             start = (start + loops) % cores
 
 
+def finalize_routing_column_slices(n: int, tn: int, cores: int) -> tuple[tuple[int, int, int], ...]:
+    """Return ``(core, col_start, col_width)`` slices matching ``ColumnBlockSwizzle``."""
+    if min(n, tn, cores) < 1:
+        raise ModelingError("catlass_grouped_geometry_invalid")
+    blocks_per_core, tail_col = divmod(n, cores * tn)
+    per_core_tail, remainder = divmod(tail_col, cores)
+    tail_base = blocks_per_core * cores * tn
+    slices: list[tuple[int, int, int]] = []
+    for core in range(cores):
+        for local in range(blocks_per_core):
+            slices.append((core, (blocks_per_core * core + local) * tn, tn))
+        tail_n = per_core_tail + (core < remainder)
+        if tail_n > 0:
+            tail_off = core * per_core_tail + min(core, remainder)
+            slices.append((core, tail_base + tail_off, tail_n))
+    return tuple(slices)
+
+
 def mx_scale_bytes(m: int, k: int, factor: int) -> int:
     return (m * k // MX_SCALE_GROUP) * factor
+
+
+def resolve_catlass_cube_mode(spec: CatlassKernelSpec) -> str:
+    """Validate CATLASS operand/accumulator specialization and return its Cube compute mode."""
+    a = dtype_name(spec.dtype_a)
+    b = dtype_name(spec.dtype_b)
+    acc = dtype_name(spec.dtype_acc)
+    modern = spec.arch_tag == "Ascend950"
+    if spec.mx_scale_group:
+        if not modern:
+            raise ModelingError("catlass_mx_requires_ascend950")
+        if acc != "fp32":
+            raise ModelingError(f"catlass_operand_accumulator_unsupported:{a}:{b}:{acc}")
+        if spec.prologue_b == A8W4_PROLOGUE_B:
+            if a not in _MX_FP8_DTYPES or b not in _MX_FP4_DTYPES:
+                raise ModelingError("catlass_a8w4_operand_representation_invalid")
+            return "mxfp8"
+        if a in _MX_FP8_DTYPES and b in _MX_FP8_DTYPES:
+            return "mxfp8"
+        if a in _MX_FP4_DTYPES and b in _MX_FP4_DTYPES:
+            return "mxfp4"
+        raise ModelingError(f"catlass_mx_operand_pair_unsupported:{a}:{b}")
+    if spec.prologue_b == A8W4_PROLOGUE_B:
+        raise ModelingError("catlass_a8w4_requires_mx_scale")
+    expected_acc = _LEGACY_OPERAND_ACC.get((a, b))
+    if expected_acc is None and modern:
+        expected_acc = _DIRECT_ONLY_OPERAND_ACC.get((a, b))
+    if expected_acc is None or acc != expected_acc:
+        raise ModelingError(f"catlass_operand_accumulator_unsupported:{a}:{b}:{acc}")
+    return a
+
+
+def _validate_policy_contract(
+    spec: CatlassKernelSpec, p: CatlassProblem, modern: bool,
+) -> None:
+    name = spec.template_id
+    pingpong = "MmadPingpong" if modern else ("MmadAtlasA2PingpongBias" if p.has_bias else "MmadAtlasA2Pingpong")
+    if name == "catlass.mutex_block_mmad":
+        if not modern:
+            raise unmodeled(name, "catlass_mutex_requires_ascend950")
+        if spec.dispatch_policy != "MmadPingpongMutex":
+            raise ModelingError("catlass_mutex_dispatch_policy_required")
+    if name == "catlass.a5_simt":
+        if spec.simt_thread_block_dim is None or spec.dispatch_policy not in {
+            "MatmulGatherScatterSimt", "tla_dsl", FINALIZE_ROUTING_POLICY,
+        }:
+            raise ModelingError("catlass_simt_dispatch_policy_required")
+    elif spec.simt_thread_block_dim is not None:
+        raise ModelingError("catlass_simt_thread_block_unexpected")
+    expected_policy = {
+        "catlass.basic_pingpong": pingpong,
+        "catlass.mutex_block_mmad": "MmadPingpongMutex",
+        "catlass.streamk": "StreamkMatmulTla" if modern else "MmadAtlasA2Streamk",
+        "catlass.multi_core_splitk": pingpong,
+        "catlass.swizzle": pingpong,
+        "catlass.evg": pingpong,
+        "catlass.grouped_slice_m": pingpong,
+        "catlass.grouped_mx_swiglu_mx_quant": "MmadMx",
+        "catlass.mx_matmul": "MmadA8W4Mx" if spec.prologue_b == A8W4_PROLOGUE_B else "MmadMx",
+        "catlass.full_load_a_gather_scatter": GATHER_SCATTER_FULL_LOAD_A,
+    }.get(name)
+    if expected_policy is not None and spec.dispatch_policy != expected_policy:
+        raise ModelingError(f"catlass_dispatch_policy_invalid:{name}:{spec.dispatch_policy}")
+    if spec.has_bias and (name in _NO_BIAS_TEMPLATES or spec.dispatch_policy in _NO_BIAS_POLICIES):
+        raise ModelingError("catlass_bias_unsupported_by_kernel")
+    expected_scheduler = (
+        "streamk" if name == "catlass.streamk"
+        else "multi_core_splitk" if name == "catlass.multi_core_splitk"
+        else "grouped_slice_m" if (name.startswith("catlass.grouped_") or spec.dispatch_policy == FINALIZE_ROUTING_POLICY)
+        else "dataparallel"
+    )
+    if spec.scheduler != expected_scheduler:
+        raise ModelingError(f"catlass_scheduler_invalid:{name}:{spec.scheduler}")
+    expected_epilogues = {
+        "catlass.evg": {"evg_gm", "evg_ub"},
+        "catlass.grouped_mx_swiglu_mx_quant": {"grouped_swiglu_mx_quant"},
+    }.get(name, {"finalize_routing"} if spec.dispatch_policy == FINALIZE_ROUTING_POLICY else {"none"})
+    if spec.epilogue_kind not in expected_epilogues:
+        raise ModelingError(f"catlass_epilogue_invalid:{name}:{spec.epilogue_kind}")
+    mx_required = name in {"catlass.mx_matmul", "catlass.grouped_mx_swiglu_mx_quant"} or (
+        spec.dispatch_policy == FINALIZE_ROUTING_POLICY
+    )
+    if bool(spec.mx_scale_group) != mx_required:
+        raise ModelingError("catlass_scale_specialization_required")
+    if spec.prologue_a is not None or (
+        spec.prologue_b is not None and not (name == "catlass.mx_matmul" and spec.prologue_b == A8W4_PROLOGUE_B)
+    ):
+        raise ModelingError("catlass_prologue_unsupported")
+    if spec.epilogue_kind == "grouped_swiglu_mx_quant":
+        if (not p.groups or len(p.groups) > SWIGLU_MAX_GROUPS
+                or p.n % SWIGLU_N_ALIGNMENT or spec.l1_tile_shape[1] % MX_SCALE_GROUP):
+            raise ModelingError("catlass_swiglu_gate_up_tiles_misaligned")
+        if (dtype_name(spec.dtype_a) not in _MX_FP8_DTYPES
+                or dtype_name(spec.dtype_b) not in _MX_FP8_DTYPES
+                or dtype_name(spec.dtype_c) not in _MX_FP8_DTYPES):
+            raise ModelingError("catlass_grouped_swiglu_requires_fp8_operands_and_output")
+    elif spec.dispatch_policy == FINALIZE_ROUTING_POLICY:
+        if not p.groups or p.indices is None:
+            raise ModelingError("catlass_finalize_routing_requires_grouped_indices")
+        if (dtype_name(spec.dtype_a) not in _MX_FP8_DTYPES
+                or dtype_name(spec.dtype_b) not in _MX_FP8_DTYPES
+                or dtype_name(spec.dtype_c) != "fp32"):
+            raise ModelingError("catlass_finalize_routing_requires_fp8_mx_and_fp32_output")
+    elif spec.dispatch_policy not in GATHER_SCATTER_POLICIES:
+        acc, out = dtype_name(spec.dtype_acc), dtype_name(spec.dtype_c)
+        if out not in _ALLOWED_OUTPUT_BY_ACC.get(acc, ()):
+            raise ModelingError(f"catlass_output_dtype_unsupported:{acc}:{out}")
+
+
+def _validate_a8w4_prologue(spec: CatlassKernelSpec, p: CatlassProblem, datapath: DatapathCapabilitySpec) -> None:
+    if not datapath.has_ub_to_l1:
+        raise unmodeled(spec.template_id, "catlass_a8w4_requires_ub_to_l1")
+    tm, tn, tk = spec.l1_tile_shape
+    k_sub = tk // _SUBBLOCK_COUNT
+    out_bytes = ceil_div(tn, _NZ_FRACTAL_N) * _NZ_FRACTAL_N * k_sub
+    in_bytes = packed_bytes(tn * k_sub, spec.dtype_b)
+    if out_bytes > A8W4_PROLOGUE_SLOT_BYTES or in_bytes > A8W4_PROLOGUE_SLOT_BYTES:
+        raise ModelingError("catlass_a8w4_prologue_slot_exceeded")
+    g_m = sum(ceil_div(rows, tm) for rows in p.groups) if p.groups else ceil_div(p.m, tm)
+    g_n = ceil_div(p.n, tn)
+    aiv_pairs = dict(datapath.aic_aiv_pairs)
+    for aic in range(min(spec.aic_budget, g_m * g_n)):
+        lanes = tuple(v for v in aiv_pairs.get(aic, ()) if v < spec.aiv_budget)
+        if len(lanes) != _SUBBLOCK_COUNT:
+            raise ModelingError(f"catlass_a8w4_requires_two_subblocks:{aic}")
+        for lane in lanes:
+            datapath.route("ub", "l1", A8W4_EXPANDED_B_DTYPE, (lane, aic))
+
+
+def _validate_mx_spec(spec: CatlassKernelSpec, p: CatlassProblem, datapath: DatapathCapabilitySpec) -> None:
+    name = spec.template_id
+    a8w4 = spec.prologue_b == A8W4_PROLOGUE_B
+    if spec.mx_scale_group != MX_SCALE_GROUP or spec.scale_layout != MX_SCALE_LAYOUT or spec.l1_scale_factor_k < 1:
+        raise ModelingError("catlass_mx_scale_geometry_invalid")
+    if spec.layout_c != "RowMajor":
+        raise ModelingError(f"catlass_mx_layout_c_unsupported:{spec.layout_c}")
+    if spec.l1_tile_shape[-1] % MX_BASEK_FACTOR or spec.l0_tile_shape[-1] % MX_BASEK_FACTOR:
+        raise ModelingError("catlass_mx_tile_k_alignment_invalid")
+    if (spec.stages[0] + spec.stages[1] + spec.has_bias > _MX_EVENT_LIMIT
+            or spec.stages[2] + spec.stages[3] + spec.has_bias > _MX_EVENT_LIMIT):
+        raise ModelingError("catlass_mx_event_ids_exhausted")
+    cube_mode = resolve_catlass_cube_mode(spec)
+    if p.mx_mode == "a8w4_mx" and not a8w4:
+        raise ModelingError("catlass_a8w4_prologue_required")
+    if p.mx_mode in {"mxfp8", "mxfp4"} and (a8w4 or p.mx_mode != cube_mode):
+        raise ModelingError("catlass_mx_mode_operand_mismatch")
+    arch = datapath.compute_arch.declared
+    if arch is None or not arch.supports_native("matrix", cube_mode, "fp32"):
+        raise unmodeled(name, f"catlass_native_mx_mode_unsupported:{cube_mode}")
+    if a8w4:
+        _validate_a8w4_prologue(spec, p, datapath)
+    if spec.dispatch_policy == FINALIZE_ROUTING_POLICY:
+        aiv_pairs = dict(datapath.aic_aiv_pairs)
+        active_aics = sorted({c for c, _, _ in finalize_routing_column_slices(p.n, spec.l1_tile_shape[1], spec.aic_budget)})
+        for aic in active_aics:
+            lanes = tuple(v for v in aiv_pairs.get(aic, ()) if v < spec.aiv_budget)
+            if len(lanes) != _SUBBLOCK_COUNT:
+                raise ModelingError(f"catlass_finalize_routing_requires_two_subblocks:{aic}")
 
 
 def validate_catlass_spec(spec: CatlassKernelSpec, p: CatlassProblem, datapath: DatapathCapabilitySpec) -> None:
@@ -266,14 +502,17 @@ def validate_catlass_spec(spec: CatlassKernelSpec, p: CatlassProblem, datapath: 
         raise ModelingError("catlass_tile_shape_invalid")
     if spec.l1_tile_shape[:2] != spec.l0_tile_shape[:2] or spec.l0_tile_shape[-1] > spec.l1_tile_shape[-1]:
         raise ModelingError("catlass_l1_l0_tile_mismatch")
-    if spec.template_id == "catlass.mutex_block_mmad" and spec.dispatch_policy != "MmadPingpongMutex":
-        raise ModelingError("catlass_mutex_dispatch_policy_required")
-    if spec.template_id == "catlass.a5_simt" and (spec.simt_thread_block_dim is None or spec.dispatch_policy not in {
-        "MatmulGatherScatterSimt", "tla_dsl", "GroupedMxMatmulFinalizeRoutingTla",
-    }):
-        raise ModelingError("catlass_simt_dispatch_policy_required")
+    if spec.simt_thread_block_dim is not None:
+        if not modern or datapath.simt_ub_carveout_bytes <= 0:
+            raise unmodeled(name, "catlass_simt_capability_missing")
+        dims = spec.simt_thread_block_dim
+        limit = SIMT_CATLASS_MAX_THREADS if spec.dispatch_policy == "MatmulGatherScatterSimt" else SIMT_TLA_MAX_THREADS
+        if len(dims) != _MATRIX_SHAPE_RANK or min(dims) < 1 or prod(dims) > limit or not spec.aiv_budget:
+            raise ModelingError("catlass_simt_thread_block_invalid")
+    _validate_policy_contract(spec, p, modern)
     indexed = spec.dispatch_policy in GATHER_SCATTER_POLICIES
-    if (p.indices is not None or p.physical_m is not None) and not indexed:
+    finalize_routing = spec.dispatch_policy == FINALIZE_ROUTING_POLICY
+    if (p.indices is not None or p.physical_m is not None) and not (indexed or finalize_routing):
         raise ModelingError("catlass_indexed_operands_require_gather_scatter")
     if indexed:
         if p.has_bias or spec.has_bias or p.groups:
@@ -296,10 +535,6 @@ def validate_catlass_spec(spec: CatlassKernelSpec, p: CatlassProblem, datapath: 
         or not full_load_a_eligible(p, datapath) or spec.l1_tile_shape[-1] != p.k or not spec.aiv_budget
     ):
         raise ModelingError("catlass_full_load_a_geometry_invalid")
-    if spec.dispatch_policy == "MatmulGatherScatterSimt" and name != "catlass.a5_simt":
-        raise ModelingError("catlass_simt_dispatch_policy_required")
-    if spec.template_id in {"catlass.mx_matmul", "catlass.grouped_mx_swiglu_mx_quant"} and not spec.mx_scale_group:
-        raise ModelingError("catlass_scale_specialization_required")
     if spec.enable_unit_flag and spec.stages[-1] != 1:
         raise ModelingError("catlass_unit_flag_requires_single_l0c_stage")
     if spec.dispatch_policy == "MmadPingpongMutex" and sum(spec.stages) + 2 * spec.has_bias > MAX_MUTEX_IDS:
@@ -321,30 +556,24 @@ def validate_catlass_spec(spec: CatlassKernelSpec, p: CatlassProblem, datapath: 
             raise ModelingError("catlass_epilogue_requires_aiv")
     if spec.epilogue_kind in {"evg_ub", "grouped_swiglu_mx_quant"} and not datapath.has_l0c_to_ub:
         raise unmodeled(name, "catlass_direct_epilogue_requires_l0c_to_ub")
-    if spec.epilogue_kind == "grouped_swiglu_mx_quant":
-        if p.n % 2 or (p.n // 2) % spec.l1_tile_shape[1]:
-            raise ModelingError("catlass_swiglu_gate_up_tiles_misaligned")
+    if p.mx_mode is not None:
+        if p.mx_mode not in _MX_MODES:
+            raise ModelingError(f"catlass_mx_mode_unknown:{p.mx_mode}")
         if not spec.mx_scale_group:
-            raise ModelingError("catlass_grouped_swiglu_requires_mx")
+            raise ModelingError("catlass_scale_specialization_required")
     if spec.mx_scale_group:
-        arch = datapath.compute_arch.declared
-        mode = p.mx_mode or dtype_name(spec.dtype_a)
-        if arch is None or not arch.supports_native("matrix", mode):
-            raise unmodeled(name, f"catlass_native_mx_mode_unsupported:{mode}")
-        a8w4 = spec.prologue_b == "DecompressFp4ToFp8"
-        if a8w4 and not datapath.has_ub_to_l1:
-            raise unmodeled(name, "catlass_a8w4_requires_ub_to_l1")
-        if a8w4 and (packed_bytes(2, spec.dtype_a) != 2 or packed_bytes(2, spec.dtype_b) != 1):
-            raise ModelingError("catlass_a8w4_operand_representation_invalid")
-        if spec.mx_scale_group != MX_SCALE_GROUP or spec.l1_scale_factor_k != (A8W4_L1_SCALE_FACTOR_K if a8w4 else 1):
+        _validate_mx_spec(spec, p, datapath)
+    else:
+        if spec.scale_layout is not None or spec.l1_scale_factor_k != 0:
             raise ModelingError("catlass_mx_scale_geometry_invalid")
-    if spec.simt_thread_block_dim is not None:
-        if not modern or datapath.simt_ub_carveout_bytes <= 0:
-            raise unmodeled(name, "catlass_simt_capability_missing")
-        dims = spec.simt_thread_block_dim
-        limit = SIMT_CATLASS_MAX_THREADS if spec.dispatch_policy == "MatmulGatherScatterSimt" else SIMT_TLA_MAX_THREADS
-        if len(dims) != _MATRIX_SHAPE_RANK or min(dims) < 1 or prod(dims) > limit or not spec.aiv_budget:
-            raise ModelingError("catlass_simt_thread_block_invalid")
+        resolve_catlass_cube_mode(spec)
+        if spec.simt_thread_block_dim is None:
+            arch = datapath.compute_arch.declared
+            a, b, acc = dtype_name(spec.dtype_a), dtype_name(spec.dtype_b), dtype_name(spec.dtype_acc)
+            if arch is not None and arch.has_native_modes() and not (
+                arch.supports_native("matrix", a, acc) and arch.supports_native("matrix", b, acc)
+            ):
+                raise unmodeled(name, f"catlass_native_matrix_mode_unsupported:{a}:{b}:{acc}")
 
 
 def _workspace_bytes(template_id, p, tile, aic, split, policy, epilogue):
@@ -371,7 +600,7 @@ def enumerate_catlass_specs(
     stage_options: Iterable[tuple[int, int, int, int, int]] | None = None,
     swizzle_offsets: Iterable[int] = DEFAULT_SWIZZLE_OFFSETS,
     evg_tree: tuple[EvgVisitorNode, ...] = (),
-    simt_variants: Iterable[str] = ("MatmulGatherScatterSimt", "tla_dsl", "GroupedMxMatmulFinalizeRoutingTla"),
+    simt_variants: Iterable[str] = ("MatmulGatherScatterSimt", "tla_dsl", FINALIZE_ROUTING_POLICY),
     simt_thread_blocks: Iterable[tuple[int, int, int]] = (DEFAULT_SIMT_BLOCK,),
     aic_budget: int | None = None, aiv_budget: int | None = None,
     enable_unit_flag: bool = False, enable_l1_resident: bool = False,
@@ -389,71 +618,82 @@ def enumerate_catlass_specs(
     simt_variants, simt_thread_blocks = tuple(simt_variants), tuple(simt_thread_blocks)
     l0_tiles = None if l0_tiles is None else tuple(l0_tiles)
     tiles = tuple(l1_tiles)
+    if any(len(tile) != _MATRIX_SHAPE_RANK or min(tile) < 1 for tile in tiles):
+        raise ModelingError("catlass_tile_shape_invalid")
     modern = datapath.arch_id in DIRECT_MATRIX_ARCH_IDS
+    dt_a, dt_b = dtype_name(p.dtype_a), dtype_name(p.dtype_b)
+    is_mx_problem = bool(p.mx_mode) or dt_a in {"mxfp8", "mxfp4"} or dt_b in {"mxfp8", "mxfp4"}
+    is_a8w4_problem = p.mx_mode == "a8w4_mx" or (
+        p.mx_mode is None and is_mx_problem and dt_a in _MX_FP8_DTYPES and dt_b in _MX_FP4_DTYPES
+    )
     output = {}
     for name in template_ids:
         if name not in _CATLASS_SYMBOLS:
             raise ModelingError(f"catlass_template_unknown:{name}")
-        grouped = name.startswith("catlass.grouped_")
-        mx = name in {"catlass.mx_matmul", "catlass.grouped_mx_swiglu_mx_quant"}
-        is_mx_problem = bool(p.mx_mode) or dtype_name(p.dtype_a).startswith(("mxfp", "mx_fp"))
-        if bool(p.groups) != grouped or (name == "catlass.evg" and not evg_tree) or (mx != is_mx_problem):
+        if name == "catlass.evg" and not evg_tree:
             continue
-        scheduler = name.removeprefix("catlass.") if name in {"catlass.streamk", "catlass.multi_core_splitk"} else (
-            "grouped_slice_m" if grouped else "dataparallel"
-        )
         swizzles = tuple(product(("Zn", "Nz"), swizzle_offsets)) if name == "catlass.swizzle" else (("Zn", 1),)
         simt = name == "catlass.a5_simt"
         policies = simt_variants if simt else ({
             "catlass.full_load_a_gather_scatter": GATHER_SCATTER_FULL_LOAD_A,
             "catlass.mutex_block_mmad": "MmadPingpongMutex",
             "catlass.streamk": "StreamkMatmulTla" if modern else "MmadAtlasA2Streamk",
-            "catlass.mx_matmul": "MmadA8W4Mx" if p.mx_mode == "a8w4_mx" else "MmadMx",
+            "catlass.mx_matmul": "MmadA8W4Mx" if is_a8w4_problem else "MmadMx",
             "catlass.grouped_mx_swiglu_mx_quant": "MmadMx",
-        }.get(name, "MmadPingpong" if modern else "MmadAtlasA2Pingpong"),)
+        }.get(name, "MmadPingpong" if modern else (
+            "MmadAtlasA2PingpongBias" if p.has_bias else "MmadAtlasA2Pingpong"
+        )),)
         default_stages = (_MUTEX_STAGE_DEPTHS if name == "catlass.mutex_block_mmad" and not enable_unit_flag
                           else _DEFAULT_STAGE_DEPTHS)
-        for l1, raw_stages, (direction, offset), policy in product(
-            tiles, (default_stages,) if stage_options is None else stage_options, swizzles, policies,
-        ):
-            tm, tn, tk = l1
-            if min(l1) < 1:
-                raise ModelingError("catlass_tile_shape_invalid")
-            if policy == GATHER_SCATTER_FULL_LOAD_A:
-                tk = p.k
-                l1 = (tm, tn, tk)
-            micro_tiles = l0_tiles if l0_tiles is not None else ((tm, tn, min(tk, DEFAULT_L0_PANEL_K)),)
-            splits = range(2, min(aic, ceil_div(p.k, tk)) + 1) if scheduler == "multi_core_splitk" else (1,)
+        for policy in policies:
+            grouped = name.startswith("catlass.grouped_") or policy == FINALIZE_ROUTING_POLICY
+            mx = name in {"catlass.mx_matmul", "catlass.grouped_mx_swiglu_mx_quant"} or policy == FINALIZE_ROUTING_POLICY
+            if bool(p.groups) != grouped or (mx != is_mx_problem):
+                continue
+            scheduler = name.removeprefix("catlass.") if name in {"catlass.streamk", "catlass.multi_core_splitk"} else (
+                "grouped_slice_m" if grouped else "dataparallel"
+            )
+            a8w4 = name == "catlass.mx_matmul" and policy == "MmadA8W4Mx"
             epilogues = {
                 "catlass.evg": ("evg_gm", "evg_ub") if datapath.has_l0c_to_ub else ("evg_gm",),
                 "catlass.grouped_mx_swiglu_mx_quant": ("grouped_swiglu_mx_quant",),
-            }.get(name, ("finalize_routing",) if policy == "GroupedMxMatmulFinalizeRoutingTla" else ("none",))
-            stages = raw_stages
-            if policy == GATHER_SCATTER_FULL_LOAD_A:
-                stages = (1, *raw_stages[1:])
-            if name == "catlass.basic_pingpong":
-                depth = min(raw_stages[:-1])
-                stages = (depth, depth, depth, depth, 1)
-            a8w4 = mx and p.mx_mode == "a8w4_mx"
-            for l0, split, epilogue, block in product(micro_tiles, splits, epilogues, simt_thread_blocks if simt else (None,)):
-                refs = tuple(ref for ref in CATLASS_SOURCE_REFS if ref.symbol in (*_CATLASS_SYMBOLS[name], "Ascend950"))
-                spec = CatlassKernelSpec(
-                    name, "Ascend950" if modern else "AtlasA2", policy,
-                    p.dtype_a, p.dtype_b, p.dtype_c, p.dtype_acc,
-                    "RowMajor", "ColumnMajor" if a8w4 else "RowMajor", "RowMajor",
-                    None, "DecompressFp4ToFp8" if a8w4 else None,
-                    MX_SCALE_GROUP if mx else 0, "E8M0_NZ_G32" if mx else None,
-                    (A8W4_L1_SCALE_FACTOR_K if a8w4 else 1) if mx else 0,
-                    l1, l0, stages, p.has_bias, enable_unit_flag, enable_l1_resident, scheduler,
-                    split, offset, direction,
-                    "disable" if grouped and all(rows <= tm for rows in p.groups) else "normal",
-                    epilogue, evg_tree if name == "catlass.evg" else (),
-                    _workspace_bytes(name, p, l1, aic, split, policy, epilogue),
-                    block, aic, aiv, refs,
-                )
-                try:
-                    solve_catlass_tile(spec, p, datapath)
-                except ModelingError:
-                    continue
-                output[spec] = None
+            }.get(name, ("finalize_routing",) if policy == FINALIZE_ROUTING_POLICY else ("none",))
+            for l1, raw_stages, (direction, offset) in product(
+                tiles, (default_stages,) if stage_options is None else stage_options, swizzles,
+            ):
+                tm, tn, tk = l1
+                if policy == GATHER_SCATTER_FULL_LOAD_A:
+                    tk = p.k
+                    l1 = (tm, tn, tk)
+                micro_tiles = l0_tiles if l0_tiles is not None else ((tm, tn, min(tk, DEFAULT_L0_PANEL_K)),)
+                splits = range(2, min(aic, ceil_div(p.k, tk)) + 1) if scheduler == "multi_core_splitk" else (1,)
+                stages = raw_stages
+                if policy == GATHER_SCATTER_FULL_LOAD_A:
+                    stages = (1, *raw_stages[1:])
+                if name == "catlass.basic_pingpong":
+                    depth = min(raw_stages[:-1])
+                    stages = (depth, depth, depth, depth, 1)
+                for l0, split, epilogue, block in product(
+                    micro_tiles, splits, epilogues, simt_thread_blocks if simt else (None,),
+                ):
+                    refs = tuple(ref for ref in CATLASS_SOURCE_REFS if ref.symbol in (*_CATLASS_SYMBOLS[name], "Ascend950"))
+                    spec = CatlassKernelSpec(
+                        name, "Ascend950" if modern else "AtlasA2", policy,
+                        p.dtype_a, p.dtype_b, p.dtype_c, p.dtype_acc,
+                        "RowMajor", "ColumnMajor" if a8w4 else "RowMajor", "RowMajor",
+                        None, A8W4_PROLOGUE_B if a8w4 else None,
+                        MX_SCALE_GROUP if mx else 0, MX_SCALE_LAYOUT if mx else None,
+                        (A8W4_L1_SCALE_FACTOR_K if a8w4 else 1) if mx else 0,
+                        l1, l0, stages, p.has_bias, enable_unit_flag, enable_l1_resident, scheduler,
+                        split, offset, direction,
+                        "disable" if grouped and all(rows <= tm for rows in p.groups) else "normal",
+                        epilogue, evg_tree if name == "catlass.evg" else (),
+                        _workspace_bytes(name, p, l1, aic, split, policy, epilogue),
+                        block, aic, aiv, refs,
+                    )
+                    try:
+                        solve_catlass_tile(spec, p, datapath)
+                    except ModelingError:
+                        continue
+                    output[spec] = None
     return tuple(output)
