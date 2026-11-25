@@ -139,7 +139,7 @@ owns = ["mindie_sim/prediction/engine_periodic"]
 [[module]]
 path = "runtime/test_engine_memory_and_pipeline.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/program", "mindie_sim/prediction/runtime/memory_physics.py", "mindie_sim/prediction/runtime/l2_residency.py", "mindie_sim/prediction/runtime/prepared_terms.py", "mindie_sim/prediction/runtime/ring_buffer.py", "mindie_sim/prediction/runtime/tile_solver.py", "mindie_sim/prediction/runtime/wave_recorder.py", "mindie_sim/prediction/runtime/accel_terms.py"]
+owns = ["mindie_sim/prediction/program", "mindie_sim/prediction/runtime/memory_physics.py", "mindie_sim/prediction/runtime/l2_residency.py", "mindie_sim/prediction/runtime/prepared_terms.py", "mindie_sim/prediction/runtime/ring_buffer.py", "mindie_sim/prediction/runtime/tile_solver.py", "mindie_sim/prediction/runtime/accel_terms.py"]
 [[module]]
 path = "runtime/test_indexed_pipeline_templates.py"
 tier = "tier0"
@@ -212,7 +212,6 @@ tier = "tier0"
 owns = [
   "mindie_sim/optimization/causal_tail.py",
   "mindie_sim/optimization/ladder.py",
-  "mindie_sim/optimization/_dual_obligations.py",
   "mindie_sim/prediction/operators/matrix/matrix_precision.py",
   "mindie_sim/prediction/execution/context.py",
 ]
@@ -236,7 +235,7 @@ owns = ["mindie_sim/prediction/execution/cohort_traffic.py", "mindie_sim/predict
 [[module]]
 path = "collectives/test_network_links_and_fabric.py"
 tier = "tier0"
-owns = ["mindie_sim/backends/ascend.py", "mindie_sim/backends/nvidia.py", "mindie_sim/prediction/communication.py", "mindie_sim/prediction/operators/collectives/direct_peer.py"]
+owns = ["mindie_sim/backends/ascend.py", "mindie_sim/prediction/communication.py", "mindie_sim/prediction/operators/collectives/direct_peer.py"]
 [[module]]
 path = "collectives/test_hccl_expansion_templates.py"
 tier = "tier0"
@@ -285,7 +284,7 @@ owns = ["mindie_sim/prediction/operators/sparse_indexer"]
 [[module]]
 path = "operators/test_grouped_moe_routing.py"
 tier = "tier0"
-owns = ["mindie_sim/prediction/operators/grouped_moe", "mindie_sim/prediction/operators/moe_routing/family_moe.py", "mindie_sim/prediction/operators/moe_transport/moe_callers.py", "mindie_sim/prediction/operators/moe_routing/moe_gating_fusion.py"]
+owns = ["mindie_sim/prediction/operators/grouped_moe", "mindie_sim/prediction/operators/moe_transport/moe_callers.py", "mindie_sim/prediction/operators/moe_routing/moe_gating_fusion.py"]
 [[module]]
 path = "operators/test_grouped_moe_gemm.py"
 tier = "tier0"
@@ -666,7 +665,7 @@ owns = ["mindie_sim/prediction/spine.py", "mindie_sim/prediction/program/impleme
 [[module]]
 path = "hygiene/test_spine_bounds_and_wiring_locks.py"
 tier = "tier0"
-owns = ["mindie_sim/primitives/loader.py", "mindie_sim/optimization/_dual_obligations.py", "mindie_sim/rewrite/_oracle_prefetch.py"]
+owns = ["mindie_sim/primitives/loader.py", "mindie_sim/rewrite/_oracle_prefetch.py"]
 
 [[module]]
 path = "product/test_catalog_subgraphs.py"
