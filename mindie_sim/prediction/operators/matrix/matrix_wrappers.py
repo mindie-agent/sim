@@ -1,19 +1,31 @@
 """Explicit dense-to-single-bank MXFP8 wrapper declarations.
 
-[Role] Preserve a source caller's one-group tensor view on an existing matrix.
+[Role] Preserve a source caller's one-group tensor view on an existing matrix,
+  its eager 1-element INT64 device group-list fill producer, and post-processed
+  paired E8M0 weight-scale storage.
 [Invariants] The wrapper does not turn routed experts into dense GEMMs, infer
-  graph dispatch or change arithmetic, traffic, dependencies or recipe selection.
-  A selected projection is bias-free, two-dimensional and explicitly eager.
+  graph dispatch or change arithmetic or recipe selection. A selected projection
+  is bias-free, two-dimensional and explicitly eager. Checkpoint weight-scale
+  extent remains in provenance separately from paired runtime scale storage.
 [Timeouts & Locks] One bounded graph traversal; no I/O or locks.
-[Side-Effect Policy] Returns immutable metadata replacements only.
+[Side-Effect Policy] Returns immutable operators and metadata replacements only.
 """
 from dataclasses import replace
 
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.operators import OpSpec
 
 MX_SCALE_GROUP = 32
-MX_SCALE_GROUP_PAIR = 2 * MX_SCALE_GROUP
+MX_SCALE_PAIR_LANES = 2
+MX_SCALE_GROUP_PAIR = MX_SCALE_PAIR_LANES * MX_SCALE_GROUP
 MX_SCALE_PAIR_ROUNDUP = MX_SCALE_GROUP_PAIR - 1
+MX_SCALE_BYTES = int(dtype_bytes("fp8_e8m0"))
+GROUP_LIST_DTYPE = "int64"
+GROUP_LIST_BYTES = float(dtype_bytes(GROUP_LIST_DTYPE))
+GROUP_LIST_FILL_RECIPE = "group_list_fill"
+_FILL_PASSTHROUGH_META = (
+    "graph_captured", "graph_segment", "structure_block", "structure_role",
+)
 
 
 IMPLEMENTATION = "vllm_ascend_mxfp8_single_group_eager"
@@ -55,7 +67,7 @@ def _domain_issue(op, meta):
     if (meta.get("activation_group_size") != MX_SCALE_GROUP
             or meta.get("activation_scale_format") != "fp8_e8m0"
             or tuple(meta.get("activation_scale_shape", ())) != (
-                rows, (width + MX_SCALE_PAIR_ROUNDUP) // MX_SCALE_GROUP_PAIR, 2)
+                rows, (width + MX_SCALE_PAIR_ROUNDUP) // MX_SCALE_GROUP_PAIR, MX_SCALE_PAIR_LANES)
             or meta.get("weight_representation") != "fp8_block1x32_fp8_e8m0"):
         return "requires_group32_e8m0_scales"
     if meta.get("expected_rows", rows) != rows:
@@ -63,6 +75,69 @@ def _domain_issue(op, meta):
     if meta.get("graph_captured"):
         return "requires_eager_dispatch"
     return None
+
+
+def _group_list_fill_op(op: OpSpec, rows: int) -> OpSpec:
+    """Emit the eager 1-element INT64 device ``torch.full`` group-list producer."""
+    passthrough = tuple(
+        (key, value) for key, value in op.metadata
+        if key in _FILL_PASSTHROUGH_META
+    )
+    return OpSpec(
+        op_id=f"{op.op_id}.group_list_fill",
+        family="tensor_fill",
+        phase=op.phase,
+        stage=op.stage,
+        layer=op.layer,
+        requests=op.requests,
+        deps=op.deps,
+        semantic_shape=(1,),
+        local_shape=(1,),
+        padded_shape=(1,),
+        launch_shape=(1,),
+        dtype=GROUP_LIST_DTYPE,
+        layout="flat",
+        recipe=GROUP_LIST_FILL_RECIPE,
+        hbm_bytes=GROUP_LIST_BYTES,
+        mte2_bytes=0.0,
+        mte3_bytes=GROUP_LIST_BYTES,
+        vector_ops=1.0,
+        stream=op.stream,
+        metadata=(
+            ("native_kind", "Fill"),
+            ("aclnn_symbol", "aclnnInplaceFillScalar"),
+            ("fill_value", int(rows)),
+            ("output_format", GROUP_LIST_DTYPE),
+            ("group_list_consumer", op.op_id),
+            ("source", SOURCE),
+            *passthrough,
+        ),
+    )
+
+
+def _paired_weight_scale_storage(op: OpSpec, meta: dict):
+    """Post-processed paired E8M0 weight-scale storage per ``w8a8_mxfp8.py:269-276``."""
+    _, cols, width = op.local_shape
+    scale_pairs = (width + MX_SCALE_PAIR_ROUNDUP) // MX_SCALE_GROUP_PAIR
+    unpadded_groups = (width + MX_SCALE_GROUP - 1) // MX_SCALE_GROUP
+    paired_shape = (1, scale_pairs, cols, MX_SCALE_PAIR_LANES)
+    checkpoint_shape = tuple(meta.get("weight_scale_shape") or (cols, unpadded_groups))
+    payload_bytes = float(meta.get("weight_payload_bytes", cols * width))
+    checkpoint_packed = float(meta.get("packed_weight_bytes", meta.get("weight_bytes", payload_bytes)))
+    checkpoint_scale_bytes = max(0.0, checkpoint_packed - payload_bytes)
+    paired_scale_bytes = float(cols * scale_pairs * MX_SCALE_PAIR_LANES * MX_SCALE_BYTES)
+    runtime_packed = payload_bytes + paired_scale_bytes
+    delta = runtime_packed - checkpoint_packed
+    return (
+        payload_bytes,
+        checkpoint_packed,
+        checkpoint_scale_bytes,
+        paired_scale_bytes,
+        runtime_packed,
+        delta,
+        paired_shape,
+        checkpoint_shape,
+    )
 
 
 def apply_matrix_wrapper(ops, selection, runtime, *, local_tokens=None):
@@ -103,19 +178,48 @@ def apply_matrix_wrapper(ops, selection, runtime, *, local_tokens=None):
         if issue:
             raise ModelingError(f"matrix_wrapper_domain_miss:{op.op_id}:{issue}")
         rows = op.local_shape[0]
+        fill_op = _group_list_fill_op(op, rows)
+        (
+            payload_bytes,
+            checkpoint_packed,
+            checkpoint_scale_bytes,
+            paired_scale_bytes,
+            runtime_packed,
+            delta,
+            paired_shape,
+            checkpoint_shape,
+        ) = _paired_weight_scale_storage(op, meta)
+        new_mte2 = float(op.mte2_bytes) + delta
+        new_hbm = float(op.hbm_bytes) + delta
+        if new_mte2 < 0.0 or new_hbm < 0.0:
+            raise ModelingError(f"matrix_wrapper_negative_weight_scale_traffic:{op.op_id}")
         meta.update({
             "matrix_mapping_domain": MAPPING_DOMAIN,
             "matrix_weight_bank_groups": 1,
+            "group_list_producer": fill_op.op_id,
+            "weight_payload_bytes": payload_bytes,
+            "packed_weight_bytes": runtime_packed,
+            "weight_bytes": runtime_packed,
+            "weight_scale_shape": paired_shape,
+            "runtime_weight_scale_bytes": paired_scale_bytes,
+            "checkpoint_weight_scale_shape": checkpoint_shape,
+            "checkpoint_weight_scale_bytes": checkpoint_scale_bytes,
+            "checkpoint_packed_weight_bytes": checkpoint_packed,
             "matrix_wrapper": {
                 "implementation": IMPLEMENTATION,
                 "native_kind": "GroupedMatmul",
                 "input_rank": 2,
                 "graph_mode": "eager",
                 "group_list_shape": (1,),
-                "group_list_dtype": "int64",
+                "group_list_dtype": GROUP_LIST_DTYPE,
                 "group_list_values": (rows,),
+                "group_list_producer": fill_op.op_id,
                 "group_type": 0,
                 "split_item": 2,
+                "weight_scale_shape": paired_shape,
+                "runtime_weight_scale_bytes": paired_scale_bytes,
+                "checkpoint_weight_scale_shape": checkpoint_shape,
+                "checkpoint_weight_scale_bytes": checkpoint_scale_bytes,
                 "source_selection": "explicit_matrix_wrapper",
                 "source_capability": "AscendW8A8MXFP8Dynamic",
                 "source_role": "single_group_dense_wrapper",
@@ -143,7 +247,14 @@ def apply_matrix_wrapper(ops, selection, runtime, *, local_tokens=None):
                 "prediction_boundary": "existing_matrix_program",
             },
         })
-        result.append(replace(op, metadata=tuple(meta.items())))
+        wrapped_op = replace(
+            op,
+            deps=tuple(dict.fromkeys((*op.deps, fill_op.op_id))),
+            mte2_bytes=new_mte2,
+            hbm_bytes=new_hbm,
+            metadata=tuple(meta.items()),
+        )
+        result.extend((fill_op, wrapped_op))
     missing = selected - seen
     # An idle DP participant still computes received experts, but its caller
     # has no local dense projections. Only the caller can establish this.
