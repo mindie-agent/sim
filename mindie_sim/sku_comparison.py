@@ -34,6 +34,7 @@ from .prediction.efficiency import (
     analyze_network_efficiency, apply_sla_baseline_gains, solve_sla_sizing,
 )
 from .prediction.structure import parse_case
+from .schema.common import ModelingError
 
 MIN_SKU_COUNT = 2
 MS_PER_SECOND = 1000.0
@@ -42,10 +43,54 @@ DEFAULT_PHASE = "decode"
 MICROSECONDS_PER_MS = 1000
 DEFAULT_QUERY_TOKENS = 1
 PER_WORKER_RAM_GIB = 1.5
+RATIO_PRECISION_DIGITS = 6
 FAMILY_KEYS = (
     "attention", "moe_routed", "moe_dispatch_combine", "dense_gemm",
     "collective", "norm_activation",
 )
+#: Canonical kwargs forwarded verbatim into ``compose_case``.
+_COMPOSE_FORWARD_KEYS = frozenset({
+    "tp", "dp", "ep", "pp", "pcp", "dcp", "sp", "parallel", "pp_layer_partition",
+    "q_proj_tp", "o_proj_tp", "linear_proj_tp", "dcp_linear_tp",
+    "mlp_tp", "shared_expert_tp", "lm_head_tp", "redundant_experts_per_rank",
+    "enable_pcp_o_proj_weight_sharding", "enable_sfa_dcp_sharded_indexer", "dcp_q_replicate",
+    "num_devices", "ranks_per_node", "topology_preset", "superpod_size",
+    "inter_node_bw_gbps", "intra_node_bw_gbps", "intra_package_bw_gbps",
+    "inter_node_bw_util", "intra_node_bw_util", "intra_package_bw_util",
+    "inter_node_latency_us", "intra_node_latency_us", "intra_package_latency_us",
+    "superpod_bw_gbps", "inter_pod_bw_gbps", "intra_bw_4p_gbps", "intra_bw_8p_gbps",
+    "layers", "n_routed_experts", "num_experts_per_tok", "promote_dense_to_moe",
+    "allow_synthetic_gqa_draft",
+    "max_num_seqs", "max_num_batched_tokens", "max_model_len", "block_size",
+    "enable_chunked_prefill", "graph_capture_mode", "async_scheduling",
+    "mtp_proposal_tokens", "mtp_acceptance_length", "spec_method",
+    "draft_max_model_len", "draft_enforce_eager",
+    "prompt_tokens", "output_tokens", "concurrency", "prefix_tokens", "arrival_gap_ms",
+    "ttft_slo_ms", "tpot_slo_ms",
+    "kv_cache_dtype", "indexer_kv_dtype", "va_recommended", "raw_eager",
+    "enable_torch_compile", "enable_npugraph_ex", "enable_static_kernel", "enable_super_kernel",
+    "multistream_overlap_shared_expert", "engram_cpu_offload", "enable_shared_expert_dp",
+    "enable_flashcomm1", "enable_fused_mc2", "enable_prefill_mc2", "enable_dbo",
+    "moe_comm_mode", "collective_startup_mode", "matrix_compute_policy",
+    "runtime_stack", "feature_track", "optimizations", "exclude_optimizations",
+    "recover_ssm", "prefix_cache_mode", "prefix_read_mode", "homogeneous_graph_reuse",
+    "prefix_cache_key", "deployment", "deployment_mode", "role", "require_scenario",
+    "hardware_derivation", "aic_count", "aiv_count", "memory_bytes",
+    "hbm_peak_bytes_per_s", "hbm_efficiency", "mte2_ceiling_bytes_per_s", "mte2_efficiency",
+})
+#: Parallel overrides applied onto ``case["runtime"]["parallel"]`` after ``compose_case``.
+_POST_PARALLEL_KEYS = frozenset({"cp_plan", "enable_dsa_cp", "expert_tp", "expert_dp"})
+_PARALLEL_ALIAS_KEYS = frozenset({"cp", "etp"})
+_ACCEPTED_COMPARE_KEYS = _COMPOSE_FORWARD_KEYS | _POST_PARALLEL_KEYS | _PARALLEL_ALIAS_KEYS
+#: Hardware-profile fields kept on inline hardware dicts rather than popped as compose kwargs.
+_INLINE_HARDWARE_ONLY_KEYS = frozenset({
+    "hardware_derivation", "aic_count", "aiv_count", "memory_bytes",
+    "hbm_peak_bytes_per_s", "hbm_efficiency", "mte2_ceiling_bytes_per_s", "mte2_efficiency",
+})
+#: Per-SKU mapping keys routed as compose/parallel overrides rather than raw hardware fields.
+_SKU_COMPOSE_OVERRIDE_KEYS = (_ACCEPTED_COMPARE_KEYS - _INLINE_HARDWARE_ONLY_KEYS) | frozenset({"quant"})
+#: Flat parallel axis keys that a nested ``parallel`` mapping or ``parallel="auto"`` supersedes.
+_FLAT_PARALLEL_AXIS_KEYS = frozenset({"tp", "dp", "ep", "pp", "pcp", "dcp"})
 
 
 def _resolve_sku_label(spec: str | Mapping[str, Any]) -> str:
@@ -54,15 +99,102 @@ def _resolve_sku_label(spec: str | Mapping[str, Any]) -> str:
     return str(spec.get("name") or spec.get("sku") or "custom_sku")
 
 
-def _compose_kwargs(model: str, options: Mapping[str, Any]) -> dict[str, Any]:
-    kwargs = {"model": model}
-    for key in ("tp", "dp", "ep", "pp", "pcp", "num_devices", "ranks_per_node",
-                "layers", "max_num_seqs", "max_num_batched_tokens",
-                "graph_capture_mode", "async_scheduling", "mtp_proposal_tokens",
-                "prompt_tokens", "output_tokens", "concurrency", "prefix_tokens"):
+def _unpack_parallel_mapping(
+    raw_parallel: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split a nested ``parallel`` dict into compose axes and post-parallel overrides."""
+    allowed = _FLAT_PARALLEL_AXIS_KEYS | _POST_PARALLEL_KEYS | _PARALLEL_ALIAS_KEYS
+    unknown = sorted(str(k) for k in raw_parallel if str(k) not in allowed)
+    if unknown:
+        raise ModelingError(f"unknown_parallel_axis:{','.join(unknown)}")
+    compose_axes: dict[str, Any] = {}
+    post_axes: dict[str, Any] = {}
+    dcp_val = raw_parallel.get("dcp")
+    cp_val = raw_parallel.get("cp")
+    if dcp_val is not None and cp_val is not None and int(dcp_val) != int(cp_val):
+        raise ModelingError(f"cp_dcp_conflict:{cp_val}!={dcp_val}")
+    if dcp_val is not None or cp_val is not None:
+        compose_axes["dcp"] = int(dcp_val if dcp_val is not None else cp_val)
+    etp_val = raw_parallel.get("etp")
+    expert_tp_val = raw_parallel.get("expert_tp")
+    if etp_val is not None and expert_tp_val is not None and int(etp_val) != int(expert_tp_val):
+        raise ModelingError(f"expert_tp_conflict:{etp_val}!={expert_tp_val}")
+    if expert_tp_val is not None or etp_val is not None:
+        post_axes["expert_tp"] = int(expert_tp_val if expert_tp_val is not None else etp_val)
+    for key in _FLAT_PARALLEL_AXIS_KEYS:
+        if key != "dcp" and raw_parallel.get(key) is not None:
+            compose_axes[key] = int(raw_parallel[key])
+    for key in _POST_PARALLEL_KEYS:
+        if key != "expert_tp" and raw_parallel.get(key) is not None:
+            post_axes[key] = raw_parallel[key]
+    return compose_axes, post_axes
+
+
+def _extract_compose_and_parallel(
+    options: Mapping[str, Any], *, strict: bool = True,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split canonical compose kwargs and post-compose ParallelSpec overrides."""
+    if strict:
+        unknown = sorted(key for key in options if key not in _ACCEPTED_COMPARE_KEYS)
+        if unknown:
+            raise ModelingError(f"sku_comparison_unknown_options:{','.join(unknown)}")
+    kwargs: dict[str, Any] = {}
+    post_parallel: dict[str, Any] = {}
+    raw_parallel = options.get("parallel")
+    if isinstance(raw_parallel, Mapping):
+        p_compose, p_post = _unpack_parallel_mapping(raw_parallel)
+        kwargs.update(p_compose)
+        post_parallel.update(p_post)
+    elif raw_parallel is not None:
+        kwargs["parallel"] = raw_parallel
+    dcp_val = options.get("dcp")
+    cp_val = options.get("cp")
+    if dcp_val is not None and cp_val is not None and int(dcp_val) != int(cp_val):
+        raise ModelingError(f"cp_dcp_conflict:{cp_val}!={dcp_val}")
+    resolved_dcp = dcp_val if dcp_val is not None else cp_val
+    if resolved_dcp is not None:
+        kwargs["dcp"] = int(resolved_dcp)
+    etp_val = options.get("etp")
+    expert_tp_val = options.get("expert_tp")
+    if etp_val is not None and expert_tp_val is not None and int(etp_val) != int(expert_tp_val):
+        raise ModelingError(f"expert_tp_conflict:{etp_val}!={expert_tp_val}")
+    resolved_etp = expert_tp_val if expert_tp_val is not None else etp_val
+    if resolved_etp is not None:
+        post_parallel["expert_tp"] = int(resolved_etp)
+    for key in _COMPOSE_FORWARD_KEYS:
+        if key in {"dcp", "parallel"}:
+            continue
         if options.get(key) is not None:
             kwargs[key] = options[key]
-    return kwargs
+    for key in _POST_PARALLEL_KEYS:
+        if key == "expert_tp":
+            continue
+        if options.get(key) is not None:
+            post_parallel[key] = options[key]
+    return kwargs, post_parallel
+
+
+def _compose_kwargs(model: str, options: Mapping[str, Any]) -> dict[str, Any]:
+    kwargs, _ = _extract_compose_and_parallel(options, strict=True)
+    return {"model": model, **kwargs}
+
+
+def _apply_post_parallel(
+    composed: dict[str, Any], post_parallel: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply canonical ParallelSpec-only overrides and revalidate the composed case."""
+    if not post_parallel:
+        return composed
+    runtime = dict(composed.get("runtime") or {})
+    parallel = dict(runtime.get("parallel") or {})
+    parallel.update(post_parallel)
+    if post_parallel.get("cp_plan") == "dsa_cp":
+        parallel["enable_dsa_cp"] = True
+    runtime["parallel"] = parallel
+    updated = {**composed, "runtime": runtime}
+    parsed = parse_case(updated)
+    updated["runtime"] = {**runtime, "parallel": parsed.runtime.parallel.to_dict()}
+    return updated
 
 
 def _workload_geometry(parsed, *, context: int | None,
@@ -135,6 +267,7 @@ def _evaluate_sku(payload: Mapping[str, Any]) -> dict[str, Any]:
     started = time.perf_counter()
     case_dict = payload["case"]
     parsed = parse_case(case_dict)
+    num_dies = max(1, len(parsed.machine.dies))
     geometry = payload["geometry"]
     from .prediction.evaluation import EvaluationContext
     eval_ctx = EvaluationContext.create(parsed)
@@ -156,6 +289,9 @@ def _evaluate_sku(payload: Mapping[str, Any]) -> dict[str, Any]:
     )
     return {
         "sku": payload["sku"],
+        "num_devices": num_dies,
+        "parallel": parsed.runtime.parallel.to_dict(),
+        "geometry": dict(geometry),
         "elapsed_ms": round((time.perf_counter() - started) * MS_PER_SECOND, 2),
         "metrics": _summary_metrics(effective),
         "runtime_profile": _runtime_profile(case_dict),
@@ -164,9 +300,12 @@ def _evaluate_sku(payload: Mapping[str, Any]) -> dict[str, Any]:
         "async_scheduling_memory": sla.get("async_scheduling_memory"),
         "solver": sla.get("solver"),
         "sla_header": {
-            key: sla.get(key) for key in
-            ("schema", "sla_ms", "context", "phase", "scope", "tokens_per_seq",
-             "emitted_tokens_per_seq", "dp", "max_sequences_per_dp")
+            **{
+                key: sla.get(key) for key in
+                ("schema", "sla_ms", "context", "phase", "scope", "tokens_per_seq",
+                 "emitted_tokens_per_seq", "dp", "max_sequences_per_dp")
+            },
+            "num_devices": num_dies,
         },
         "accel_status": effective.get("accel_status"),
         "engine_backend": effective.get("engine_backend"),
@@ -184,9 +323,12 @@ def _evaluate_scenario(payload: Mapping[str, Any]) -> dict[str, Any]:
         sensitivity=payload["sensitivity"], jobs=1,
         base_b_hint=payload["base_b_hint"],
     )
-    return {"sku": payload["sku"],
-            "sla_scenario": sla["scenarios"][0],
-            "accel_status": None, "engine_backend": None}
+    return {
+        "sku": payload["sku"],
+        "sku_index": int(payload["sku_index"]),
+        "sla_scenario": sla["scenarios"][0],
+        "accel_status": None, "engine_backend": None,
+    }
 
 
 def _run_tasks(tasks, workers: int) -> list[dict[str, Any]]:
@@ -196,6 +338,81 @@ def _run_tasks(tasks, workers: int) -> list[dict[str, Any]]:
     with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
         futures = [pool.submit(fn, payload) for fn, payload in tasks]
         return [future.result() for future in futures]
+
+
+def _compose_with_post_parallel(
+    model: str, hardware_target: Any,
+    sku_kwargs: Mapping[str, Any], sku_post: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compose a SKU case, deferring ``ep`` validation when ``expert_tp`` alters EP divisibility."""
+    call_kwargs = dict(sku_kwargs)
+    effective_post = dict(sku_post)
+    etp_val = effective_post.get("expert_tp")
+    ep_val = call_kwargs.get("ep")
+    if etp_val is not None and int(etp_val) > 1 and ep_val is not None and int(ep_val) > 1:
+        tp_v = max(1, int(call_kwargs.get("tp") or 1))
+        dp_v = max(1, int(call_kwargs.get("dp") or 1))
+        pcp_v = max(1, int(call_kwargs.get("pcp") or 1))
+        ep_v, etp_v = int(ep_val), int(etp_val)
+        if tp_v % ep_v != 0 and ep_v % tp_v != 0:
+            world_dp = dp_v * tp_v * pcp_v
+            ep_proxy = ep_v * etp_v if (world_dp % (ep_v * etp_v) == 0) else world_dp
+            call_kwargs["ep"] = ep_proxy
+            effective_post["ep"] = ep_v
+    composed = compose_case(model=model, hardware=hardware_target, **call_kwargs)
+    return _apply_post_parallel(composed, effective_post)
+
+
+def _resolve_sku_case(
+    model: str,
+    spec: str | Mapping[str, Any],
+    base_kwargs: Mapping[str, Any],
+    base_post_parallel: Mapping[str, Any],
+) -> tuple[str, dict[str, Any]]:
+    """Compose and validate one SKU entry, honoring per-SKU compose/parallel overrides."""
+    label = _resolve_sku_label(spec)
+    sku_kwargs = dict(base_kwargs)
+    sku_post = dict(base_post_parallel)
+    if isinstance(spec, str):
+        hardware_target: Any = spec
+    elif isinstance(spec, Mapping):
+        per_sku_raw = {k: v for k, v in spec.items() if k in _SKU_COMPOSE_OVERRIDE_KEYS}
+        hw_only = {k: v for k, v in spec.items() if k not in _SKU_COMPOSE_OVERRIDE_KEYS}
+        if "quant" in per_sku_raw and per_sku_raw["quant"] is not None:
+            sku_kwargs["quant"] = per_sku_raw.pop("quant")
+        per_compose, per_post = _extract_compose_and_parallel(per_sku_raw, strict=False)
+        if isinstance(per_compose.get("parallel"), str):
+            for axis in _FLAT_PARALLEL_AXIS_KEYS:
+                sku_kwargs.pop(axis, None)
+        elif any(axis in per_compose for axis in _FLAT_PARALLEL_AXIS_KEYS):
+            sku_kwargs.pop("parallel", None)
+        sku_kwargs.update(per_compose)
+        sku_post.update(per_post)
+        base_hw = hw_only.get("base_hardware")
+        has_inline_hw = (
+            ("device" in hw_only and "links" in hw_only)
+            or any(k in hw_only for k in (
+                "archetype", "hbm_gb", "hbm_bw_gbps", "cube_fp16_tflops",
+            ))
+        )
+        if base_hw:
+            extras = {
+                k: v for k, v in hw_only.items()
+                if k not in {"name", "base_hardware"}
+            }
+            if extras:
+                hardware_target = {**extras, "sku": str(hw_only.get("sku") or base_hw)}
+            else:
+                hardware_target = str(base_hw)
+        elif hw_only.get("sku") or has_inline_hw:
+            hardware_target = dict(hw_only)
+            if not hardware_target.get("sku"):
+                hardware_target["sku"] = str(hw_only.get("name") or "CUSTOM_INLINE_SKU")
+        else:
+            raise ModelingError(f"sku_comparison_hardware_spec_missing:{label}")
+    else:
+        raise ModelingError(f"sku_comparison_invalid_spec:{spec!r}")
+    return label, _compose_with_post_parallel(model, hardware_target, sku_kwargs, sku_post)
 
 
 def compare_skus(
@@ -221,47 +438,22 @@ def compare_skus(
     # Prebuild/warm the compiled kernel once in the parent: workers then map the
     # immutable library instead of compiling in a stampede.
     runtime_advisor.probe_host_environment(ensure_accel=True)
-    base_kwargs = _compose_kwargs(model, compose_options)
+    base_kwargs, base_post_parallel = _extract_compose_and_parallel(
+        compose_options, strict=True,
+    )
     if quant is not None:
         base_kwargs["quant"] = quant
-    from .schema.common import ModelingError
-
-    resolved: list[tuple[str, dict[str, Any]]] = []
+    resolved: list[tuple[str, dict[str, Any], dict[str, int]]] = []
     for spec in skus:
-        label = _resolve_sku_label(spec)
-        if isinstance(spec, str):
-            hardware_target: Any = spec
-        elif isinstance(spec, Mapping):
-            base_hw = spec.get("base_hardware")
-            has_inline_hw = (
-                ("device" in spec and "links" in spec)
-                or any(k in spec for k in (
-                    "archetype", "hbm_gb", "hbm_bw_gbps", "cube_fp16_tflops",
-                ))
-            )
-            if base_hw:
-                extras = {
-                    k: v for k, v in spec.items()
-                    if k not in {"name", "base_hardware"}
-                }
-                if extras:
-                    hardware_target = {**extras, "sku": str(spec.get("sku") or base_hw)}
-                else:
-                    hardware_target = str(base_hw)
-            elif spec.get("sku") or has_inline_hw:
-                hardware_target = dict(spec)
-                if not hardware_target.get("sku"):
-                    hardware_target["sku"] = str(spec.get("name") or "CUSTOM_INLINE_SKU")
-            else:
-                raise ModelingError(
-                    f"sku_comparison_hardware_spec_missing:{label}"
-                )
-        else:
-            raise ModelingError(f"sku_comparison_invalid_spec:{spec!r}")
-        composed = compose_case(hardware=hardware_target, **base_kwargs)
-        resolved.append((label, composed))
-    geometry = _workload_geometry(parse_case(resolved[0][1]), context=context,
-                                  query_tokens=query_tokens_per_sequence)
+        label, composed = _resolve_sku_case(
+            model, spec, base_kwargs, base_post_parallel,
+        )
+        sku_geometry = _workload_geometry(
+            parse_case(composed), context=context,
+            query_tokens=query_tokens_per_sequence,
+        )
+        resolved.append((label, composed, sku_geometry))
+    geometry = resolved[0][2]
     scenarios = ([DEFAULT_SLA_SCENARIOS[0]]
                  if str(sensitivity).strip().lower() == SLA_SENSITIVITY_BASELINE
                  else list(DEFAULT_SLA_SCENARIOS))
@@ -276,29 +468,29 @@ def compare_skus(
             "compare-skus", workers=workers, work_units=work_units)
     baseline_tasks = [
         (_evaluate_sku if has_sla else _efficiency_only,
-         {"sku": label, "case": case_dict, "geometry": geometry,
+         {"sku": label, "sku_index": idx, "case": case_dict, "geometry": sku_geom,
           "phase": phase, "scope": scope, "sla_ms": sla_ms or 0.0,
           "max_batch": max_batch, "scenario": scenarios[0],
           "sensitivity": sensitivity})
-        for label, case_dict in resolved
+        for idx, (label, case_dict, sku_geom) in enumerate(resolved)
     ]
     reports = _run_tasks(baseline_tasks, workers)
-    hints = {row["sku"]: int(row.get("base_b_hint") or 1) for row in reports}
+    hints = {idx: int(row.get("base_b_hint") or 1) for idx, row in enumerate(reports)}
     follow_tasks = []
     if has_sla:
-        for label, case_dict in resolved:
+        for idx, (label, case_dict, sku_geom) in enumerate(resolved):
             for scenario in scenarios[1:]:
                 follow_tasks.append((_evaluate_scenario, {
-                    "sku": label, "case": case_dict, "sla_ms": sla_ms,
-                    "context": geometry["context"],
-                    "query_tokens_per_sequence": geometry["query_tokens_per_sequence"],
+                    "sku": label, "sku_index": idx, "case": case_dict,
+                    "sla_ms": sla_ms,
+                    "context": sku_geom["context"],
+                    "query_tokens_per_sequence": sku_geom["query_tokens_per_sequence"],
                     "max_batch": max_batch, "phase": phase, "scope": scope,
                     "scenario": scenario, "sensitivity": sensitivity,
-                    "base_b_hint": hints.get(label, 1)}))
+                    "base_b_hint": hints.get(idx, 1)}))
     extra = _run_tasks(follow_tasks, workers) if follow_tasks else []
-    by_sku = {row["sku"]: row for row in reports}
     for row in extra:
-        target = by_sku[row["sku"]]
+        target = reports[int(row["sku_index"])]
         target.setdefault("sla_scenarios", []).append(row["sla_scenario"])
         if row.get("accel_status") is not None:
             target.setdefault("accel_statuses", []).append(row["accel_status"])
@@ -311,13 +503,17 @@ def compare_skus(
         ordered = [row.pop("sla_scenario"), *row.get("sla_scenarios", [])]
         row["sla_scenarios"] = ordered
         apply_sla_baseline_gains(ordered, ordered[0])
+        num_dies = max(1, int(row.get("num_devices") or 1))
+        for item in ordered:
+            item_tps = float(item.get("tps_feasible") or 0.0)
+            item["tps_per_die"] = item_tps / float(num_dies)
+        base_tps = float(ordered[0].get("tps_feasible") or 0.0)
+        row["tps_feasible"] = base_tps
+        row["tps_per_die"] = base_tps / float(num_dies)
     reference = reports[0]
-    comparisons = []
-    for candidate in reports[1:]:
-        comparisons.append(_compare_pair(reference, candidate))
+    comparisons = [_compare_pair(reference, candidate) for candidate in reports[1:]]
     wall_ms = round((time.perf_counter() - wall_start) * MS_PER_SECOND, 2)
-    statuses = [row.get("accel_status") for row in reports
-                if row.get("accel_status")]
+    statuses = [row.get("accel_status") for row in reports if row.get("accel_status")]
     coverage = _coverage(statuses)
     env, advisory = runtime_advisor.build_runtime_environment(
         workers_used=workers, estimated_work_units=work_units)
@@ -348,6 +544,7 @@ def _efficiency_only(payload: Mapping[str, Any]) -> dict[str, Any]:
     """Efficiency point only, for ``sla_ms=None`` comparisons."""
     started = time.perf_counter()
     parsed = parse_case(payload["case"])
+    num_dies = max(1, len(parsed.machine.dies))
     geometry = payload["geometry"]
     effective = analyze_network_efficiency(
         parsed, phase=payload["phase"],
@@ -356,6 +553,9 @@ def _efficiency_only(payload: Mapping[str, Any]) -> dict[str, Any]:
         sequences=geometry["sequences_per_dp"], scope=payload["scope"])
     return {
         "sku": payload["sku"],
+        "num_devices": num_dies,
+        "parallel": parsed.runtime.parallel.to_dict(),
+        "geometry": dict(geometry),
         "elapsed_ms": round((time.perf_counter() - started) * MS_PER_SECOND, 2),
         "metrics": _summary_metrics(effective),
         "runtime_profile": _runtime_profile(payload["case"]),
@@ -396,20 +596,24 @@ def _compare_pair(reference: Mapping[str, Any],
     ref_families = _family_totals(reference)
     cand_families = _family_totals(candidate)
     family_delta = {
-        key: round(cand_families.get(key, 0.0) - ref_families.get(key, 0.0), 6)
+        key: round(cand_families.get(key, 0.0) - ref_families.get(key, 0.0), RATIO_PRECISION_DIGITS)
         for key in sorted(set(ref_families) | set(cand_families))
     }
-    dp_ref = max(1, int(reference.get("sla_header", {}).get("dp") or 1))
-    dp_cand = max(1, int(candidate.get("sla_header", {}).get("dp") or 1))
+    dies_ref = max(1, int(reference.get("num_devices")
+                          or reference.get("sla_header", {}).get("num_devices")
+                          or reference.get("sla_header", {}).get("dp") or 1))
+    dies_cand = max(1, int(candidate.get("num_devices")
+                           or candidate.get("sla_header", {}).get("num_devices")
+                           or candidate.get("sla_header", {}).get("dp") or 1))
     return {
         "reference_sku": reference["sku"],
         "candidate_sku": candidate["sku"],
-        "step_ms_delta": round(cand_step - ref_step, 6),
-        "step_speedup_x": round(ref_step / cand_step, 6),
-        "tps_feasible_gain_x": (round(cand_tps / ref_tps, 6)
+        "step_ms_delta": round(cand_step - ref_step, RATIO_PRECISION_DIGITS),
+        "step_speedup_x": round(ref_step / cand_step, RATIO_PRECISION_DIGITS),
+        "tps_feasible_gain_x": (round(cand_tps / ref_tps, RATIO_PRECISION_DIGITS)
                                 if ref_tps > 0.0 else None),
         "tps_per_die_gain_x": (
-            round((cand_tps / dp_cand) / (ref_tps / dp_ref), 6)
+            round((cand_tps / float(dies_cand)) / (ref_tps / float(dies_ref)), RATIO_PRECISION_DIGITS)
             if ref_tps > 0.0 and cand_tps > 0.0 else None),
         "b_feasible_delta": (int(cand_base.get("b_feasible") or 0)
                             - int(ref_base.get("b_feasible") or 0)),
