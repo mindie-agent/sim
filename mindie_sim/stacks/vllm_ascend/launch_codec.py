@@ -25,9 +25,13 @@ from collections.abc import Mapping
 import json
 from pathlib import Path
 import re
-import shlex
 from typing import Any
 
+from mindie_sim.catalog.checkpoint_reader import (
+    lookup_curated_checkpoint,
+    read_checkpoint_quant_map,
+)
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.scenario import DEPLOYMENT_MODES
 from mindie_sim.schema.stack import LaunchConfigIngress
@@ -42,6 +46,8 @@ from .profiles import (
 )
 from .speculative import (
     FULL_GRAPH_CUDAGRAPH_MODES,
+    WEIGHT_NZ_MODE_DISABLED,
+    WEIGHT_NZ_MODE_QUANT,
     build_va_serving_rules,
     validate_aclgraph_capture_sizes,
 )
@@ -55,12 +61,14 @@ DEFAULT_HCCL_EP_BUFFSIZE_MIB = 2048
 DEFAULT_GPU_MEMORY_UTILIZATION = 0.9
 DEFAULT_AUDIT_MAX_MODEL_LEN = 32768
 DEFAULT_AUDIT_MAX_NUM_SEQS = 64
+DEFAULT_PD_KV_CONNECTOR = "MooncakeConnectorV2"
 GIB_BYTES = 1024 * 1024 * 1024
 US_PER_MS = 1000.0
 AUDIT_MS_DECIMALS = 3
 AUDIT_RATE_DECIMALS = 2
 
 _ENV_ASSIGN_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=(.*)$")
+_SHELL_VAR_RE = re.compile(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
 _KNOWN_ENV_KEYS = frozenset({
     "HCCL_OP_EXPANSION_MODE",
     "VLLM_ASCEND_ENABLE_MLAPO",
@@ -97,6 +105,27 @@ _UNQUANTIZED_FORMATS = frozenset({"", "AUTO", "BF16", "FP16", "FLOAT", "NONE"})
 _INTEGER_WEIGHT_TOKENS = ("W8A8", "W4A8", "W4A4", "INT8", "INT4")
 _A5_MXFP_TOKENS = ("MXFP", "FP8", "FP4")
 _FALSE_ENV_TOKENS = frozenset({"0", "false", "no", "off"})
+_DOUBLE_QUOTE_ESCAPES = frozenset({'"', "\\", "$", "`"})
+_DOTTED_CONFIG_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("--additional-config.", "additional_config"),
+    ("--compilation-config.", "compilation_config"),
+    ("--speculative-config.", "speculative_config"),
+    ("--kv-transfer-config.", "kv_transfer_config"),
+)
+_NON_PD_KV_CONNECTORS = frozenset({
+    "offloadingconnector",
+    "ascendoffloadingconnector",
+    "preemptoffloadconnector",
+    "preemptoffloadconnectorv1",
+    "ascendstoreconnector",
+    "mooncakeconnectorstorev1",
+    "ucmconnector",
+    "ucmconnectorv1",
+    "hisparseconnector",
+    "hisparse",
+    "lmcacheconnector",
+    "lmcacheconnectorv1",
+})
 
 _KV_ROLE_TO_DEPLOYMENT_MODE: dict[str, str] = {
     "kv_producer": "pd_prefill",
@@ -105,24 +134,170 @@ _KV_ROLE_TO_DEPLOYMENT_MODE: dict[str, str] = {
 }
 
 
-def _strip_comments_and_join_continuations(raw_text: str) -> list[str]:
-    logical_lines: list[str] = []
-    buf = ""
-    for line in raw_text.splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            if buf:
-                logical_lines.append(buf)
-                buf = ""
+def _split_shell_commands(raw_text: str) -> list[list[list[tuple[str, str]]]]:
+    """Tokenize static shell text into commands of ``(segment, quote_kind)`` pieces."""
+    commands: list[list[list[tuple[str, str]]]] = []
+    cmd: list[list[tuple[str, str]]] = []
+    tok: list[tuple[str, str]] = []
+    buf: list[str] = []
+    tok_started = False
+    in_single = False
+    in_double = False
+    idx = 0
+    length = len(raw_text)
+
+    def flush_seg(quote_kind: str) -> None:
+        if buf:
+            tok.append(("".join(buf), quote_kind))
+            buf.clear()
+
+    def flush_tok() -> None:
+        nonlocal tok_started
+        flush_seg("single" if in_single else ("double" if in_double else "none"))
+        if tok_started:
+            cmd.append(list(tok))
+            tok.clear()
+            tok_started = False
+
+    def flush_cmd() -> None:
+        flush_tok()
+        if cmd:
+            commands.append(list(cmd))
+            cmd.clear()
+
+    while idx < length:
+        ch = raw_text[idx]
+        if in_single:
+            if ch == "'":
+                flush_seg("single")
+                in_single = False
+            else:
+                buf.append(ch)
+            idx += 1
             continue
-        if stripped.endswith("\\"):
-            buf = (buf + " " + stripped[:-1].strip()).strip()
+        if in_double:
+            if ch == '"':
+                flush_seg("double")
+                in_double = False
+                idx += 1
+            elif ch == "\\" and idx + 1 < length:
+                nxt = raw_text[idx + 1]
+                if nxt == "\n":
+                    idx += 2
+                elif nxt in _DOUBLE_QUOTE_ESCAPES:
+                    buf.append(nxt)
+                    idx += 2
+                else:
+                    buf.append(ch)
+                    idx += 1
+            else:
+                buf.append(ch)
+                idx += 1
+            continue
+        if ch == "\\" and idx + 1 < length:
+            nxt = raw_text[idx + 1]
+            if nxt == "\n":
+                idx += 2
+                continue
+            if nxt == "\r" and idx + 2 < length and raw_text[idx + 2] == "\n":
+                idx += 3
+                continue
+            tok_started = True
+            buf.append(nxt)
+            idx += 2
+            continue
+        if ch == "#" and not tok_started:
+            while idx < length and raw_text[idx] != "\n":
+                idx += 1
+            continue
+        if ch == "'":
+            flush_seg("none")
+            in_single = True
+            tok_started = True
+            idx += 1
+            continue
+        if ch == '"':
+            flush_seg("none")
+            in_double = True
+            tok_started = True
+            idx += 1
+            continue
+        if ch in {"\n", ";"}:
+            flush_cmd()
+            idx += 1
+            continue
+        if ch in {" ", "\t", "\r"}:
+            flush_tok()
+            idx += 1
+            continue
+        if ch in {"&", "|"} and idx + 1 < length and raw_text[idx + 1] == ch:
+            flush_cmd()
+            idx += 2
+            continue
+        tok_started = True
+        buf.append(ch)
+        idx += 1
+
+    flush_cmd()
+    return commands
+
+
+def _expand_command_tokens(
+    raw_cmd: list[list[tuple[str, str]]],
+    shell_vars: Mapping[str, str],
+    unresolved_vars: list[str],
+) -> list[str]:
+    tokens: list[str] = []
+    for raw_tok in raw_cmd:
+        pieces: list[str] = []
+        all_unquoted = True
+        expanded_any = False
+        for seg, quote_kind in raw_tok:
+            if quote_kind != "none":
+                all_unquoted = False
+            if quote_kind == "single" or "$" not in seg:
+                pieces.append(seg)
+                continue
+
+            def _replace(match: re.Match[str]) -> str:
+                nonlocal expanded_any
+                name = match.group(1) or match.group(2) or ""
+                if name in shell_vars:
+                    expanded_any = True
+                    return shell_vars[name]
+                if name and name not in unresolved_vars:
+                    unresolved_vars.append(name)
+                return match.group(0)
+
+            pieces.append(_SHELL_VAR_RE.sub(_replace, seg))
+        joined = "".join(pieces)
+        if all_unquoted and expanded_any:
+            tokens.extend(joined.split())
         else:
-            logical_lines.append((buf + " " + stripped).strip())
-            buf = ""
-    if buf:
-        logical_lines.append(buf)
-    return logical_lines
+            tokens.append(joined)
+    return tokens
+
+
+def _parse_dotted_scalar(raw: str) -> Any:
+    text = str(raw).strip()
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def _set_nested_config(target: dict[str, Any], dotted_key: str, value: Any) -> None:
+    parts = [part for part in dotted_key.split(".") if part]
+    if not parts:
+        return
+    cursor = target
+    for key in parts[:-1]:
+        existing = cursor.get(key)
+        if not isinstance(existing, dict):
+            existing = {}
+            cursor[key] = existing
+        cursor = existing
+    cursor[parts[-1]] = value
 
 
 def _safe_json_dict(raw: str) -> dict[str, Any]:
@@ -147,15 +322,56 @@ def _safe_float(raw: Any, default: float = 0.0) -> float:
         return default
 
 
-def _infer_quant_hint(model_arg: str, quantization_flag: str) -> str:
+def _canonical_quant_from_qmap(qmap: Any) -> tuple[str, str]:
+    raw_type = str(getattr(qmap, "model_quant_type", "") or "").strip()
+    if not raw_type:
+        return "", ""
+    upper = raw_type.upper()
+    rule_tags = {str(r.raw_tag or "").upper() for r in getattr(qmap, "rules", ()) or ()}
+    if "MXFP4" in upper or any("MXFP4" in t for t in rule_tags):
+        if upper == "W4A4_MXFP4" or ("W4A4_MXFP4" in rule_tags and not any("MXFP8" in t or "FP8" in t for t in rule_tags)):
+            return "w4a4_mxfp4", raw_type
+        return "mxfp8_mxfp4", raw_type
+    if "W4A8_MXFP" in upper or any("W4A8_MXFP" in t for t in rule_tags):
+        return "mxfp8_mxfp4", raw_type
+    if "MXFP8" in upper or any("MXFP8" in t for t in rule_tags):
+        return "mxfp8", raw_type
+    if "FP8" in upper or any("FP8" in t for t in rule_tags):
+        return "fp8", raw_type
+    if "W4A8" in upper or any("W4A8" in t for t in rule_tags):
+        return "w4a8", raw_type
+    if upper == "W8A8_DYNAMIC":
+        return "w8a8_dynamic", raw_type
+    if "W8A8" in upper or any("W8A8" in t for t in rule_tags):
+        return "w8a8", raw_type
+    if upper in {"FLOAT", "BF16", "FP16"}:
+        return "bf16", raw_type
+    return raw_type.lower(), raw_type
+
+
+def _infer_quant_hint(model_arg: str, quantization_flag: str) -> tuple[str, str]:
+    if model_arg:
+        curated = lookup_curated_checkpoint(model_arg)
+        if curated is not None and curated.model_quant_type:
+            return _canonical_quant_from_qmap(curated)
+        local_path = Path(model_arg)
+        if local_path.exists():
+            try:
+                local_qmap = read_checkpoint_quant_map(local_path)
+            except TimeoutError:
+                raise
+            except (ModelingError, OSError):
+                local_qmap = None
+            if local_qmap is not None and local_qmap.model_quant_type:
+                return _canonical_quant_from_qmap(local_qmap)
     base_low = Path(model_arg.rstrip("/")).name.lower() if model_arg else ""
     for tok, preset in _QUANT_BASENAME_TOKENS:
         if tok in base_low:
-            return preset
+            return preset, ""
     q_low = str(quantization_flag or "").strip().lower()
-    if q_low in {"", "bf16", "none"}:
-        return "bf16"
-    return q_low
+    if q_low and q_low not in {"none", "auto"}:
+        return q_low, ""
+    return "", ""
 
 
 def _parse_vllm_tokens(tokens: list[str], state: dict[str, Any], origins: dict[str, str]) -> None:
@@ -172,26 +388,49 @@ def _parse_vllm_tokens(tokens: list[str], state: dict[str, Any], origins: dict[s
         else:
             flag, nxt, step = tok, (tokens[idx + 1] if idx + 1 < len(tokens) else ""), 2
 
+        dotted_handled = False
+        for prefix, cfg_key in _DOTTED_CONFIG_PREFIXES:
+            if flag.startswith(prefix):
+                sub_key = flag[len(prefix):]
+                _set_nested_config(state[cfg_key], sub_key, _parse_dotted_scalar(nxt))
+                origins[cfg_key] = "launch_script"
+                dotted_handled = True
+                break
+        if dotted_handled:
+            idx += step
+            continue
+
         if flag in {"--model", "-m"}:
             state["model_arg"] = nxt
             origins["model_ref"] = "launch_script"
         elif flag in {"-tp", "--tensor-parallel-size"}:
             state["tp"] = max(1, _safe_int(nxt, 1))
+            state["has_parallel_flags"] = True
             origins["parallel.tp"] = "launch_script"
         elif flag in {"-dp", "--data-parallel-size"}:
             state["dp"] = max(1, _safe_int(nxt, 1))
+            state["has_parallel_flags"] = True
             origins["parallel.dp"] = "launch_script"
         elif flag in {"-pp", "--pipeline-parallel-size"}:
             state["pp"] = max(1, _safe_int(nxt, 1))
+            state["has_parallel_flags"] = True
             origins["parallel.pp"] = "launch_script"
         elif flag in {"--dcp-size", "--cp-size", "--decode-context-parallel-size"}:
             state["dcp"] = max(1, _safe_int(nxt, 1))
+            state["has_parallel_flags"] = True
             origins["parallel.cp"] = "launch_script"
         elif flag in {"--pcp-size", "--prefill-context-parallel-size"}:
             state["pcp"] = max(1, _safe_int(nxt, 1))
+            state["has_parallel_flags"] = True
             origins["parallel.pcp"] = "launch_script"
+        elif flag == "--nnodes":
+            state["nnodes"] = max(1, _safe_int(nxt, 1))
+            origins["runtime_limits.nnodes"] = "launch_script"
+        elif flag == "--node-rank":
+            state["node_rank"] = max(0, _safe_int(nxt, 0))
         elif flag == "--enable-expert-parallel":
             state["ep_enabled"], step = True, 1
+            state["has_parallel_flags"] = True
             origins["parallel.ep"] = "launch_script"
         elif flag == "--enforce-eager":
             state["enforce_eager"], step = True, 1
@@ -232,16 +471,16 @@ def _parse_vllm_tokens(tokens: list[str], state: dict[str, Any], origins: dict[s
             state["explicit_deployment_mode"] = str(nxt).strip().lower()
             origins["deployment_mode"] = "launch_script"
         elif flag == "--compilation-config":
-            state["compilation_config"] = _safe_json_dict(nxt)
+            state["compilation_config"].update(_safe_json_dict(nxt))
             origins["compilation_config"] = "launch_script"
         elif flag == "--speculative-config":
-            state["speculative_config"] = _safe_json_dict(nxt)
+            state["speculative_config"].update(_safe_json_dict(nxt))
             origins["speculative_config"] = "launch_script"
         elif flag == "--additional-config":
-            state["additional_config"] = _safe_json_dict(nxt)
+            state["additional_config"].update(_safe_json_dict(nxt))
             origins["additional_config"] = "launch_script"
         elif flag == "--kv-transfer-config":
-            state["kv_transfer_config"] = _safe_json_dict(nxt)
+            state["kv_transfer_config"].update(_safe_json_dict(nxt))
             origins["kv_transfer_config"] = "launch_script"
         else:
             step = 1
@@ -250,14 +489,17 @@ def _parse_vllm_tokens(tokens: list[str], state: dict[str, Any], origins: dict[s
 
 def _detect_explicit_deployment_mode(state: Mapping[str, Any]) -> str | None:
     """Return deployment mode ONLY when explicitly declared (zero silent guessing)."""
-    kv_xfer = state.get("kv_transfer_config")
-    if isinstance(kv_xfer, Mapping) and kv_xfer:
-        kv_role = str(kv_xfer.get("kv_role") or "").strip().lower()
-        if kv_role in _KV_ROLE_TO_DEPLOYMENT_MODE:
-            return _KV_ROLE_TO_DEPLOYMENT_MODE[kv_role]
     explicit = str(state.get("explicit_deployment_mode") or "").strip().lower()
     if explicit in DEPLOYMENT_MODES:
         return explicit
+    kv_xfer = state.get("kv_transfer_config")
+    if isinstance(kv_xfer, Mapping) and kv_xfer:
+        connector = str(kv_xfer.get("kv_connector") or "").strip().lower()
+        if connector in _NON_PD_KV_CONNECTORS:
+            return None
+        kv_role = str(kv_xfer.get("kv_role") or "").strip().lower()
+        if kv_role in _KV_ROLE_TO_DEPLOYMENT_MODE:
+            return _KV_ROLE_TO_DEPLOYMENT_MODE[kv_role]
     return None
 
 
@@ -315,6 +557,8 @@ class VllmAscendLaunchCodec:
             src_label = "inline_command"
 
         env_vars: dict[str, str] = {}
+        shell_vars: dict[str, str] = {}
+        unresolved_vars: list[str] = []
         origins: dict[str, str] = {}
         state: dict[str, Any] = {
             "model_arg": "",
@@ -326,6 +570,9 @@ class VllmAscendLaunchCodec:
             "ep_enabled": False,
             "dcp": 1,
             "pcp": 1,
+            "nnodes": 1,
+            "node_rank": 0,
+            "has_parallel_flags": False,
             "max_model_len": 0,
             "max_num_seqs": 0,
             "max_num_batched_tokens": 0,
@@ -343,11 +590,8 @@ class VllmAscendLaunchCodec:
             "additional_config": {},
             "kv_transfer_config": {},
         }
-        for line in _strip_comments_and_join_continuations(raw_text):
-            try:
-                tokens = shlex.split(line)
-            except ValueError:
-                tokens = line.split()
+        for raw_cmd in _split_shell_commands(raw_text):
+            tokens = _expand_command_tokens(raw_cmd, shell_vars, unresolved_vars)
             if not tokens:
                 continue
             pos = 1 if tokens[0] == "export" else 0
@@ -356,6 +600,7 @@ class VllmAscendLaunchCodec:
                 if match is None:
                     break
                 key, val = match.group(1), match.group(2)
+                shell_vars[key] = val
                 if key in _KNOWN_ENV_KEYS or key.startswith(("HCCL_", "VLLM_", "ASCEND_", "OMP_", "PYTORCH_NPU")):
                     env_vars[key] = val
                     origins[f"env.{key}"] = "launch_script"
@@ -373,16 +618,29 @@ class VllmAscendLaunchCodec:
         ep_size = (dp * tp * pcp) if state["ep_enabled"] else 1
         parallel = ParallelSpec(dp=dp, tp=tp, pp=pp, ep=ep_size, cp=dcp, pcp=pcp)
         model_arg = str(state["model_arg"])
-        quant_hint = _infer_quant_hint(model_arg, str(state["quantization_flag"]))
+        quant_hint, ckpt_quant_type = _infer_quant_hint(model_arg, str(state["quantization_flag"]))
         deploy_hint = _detect_explicit_deployment_mode(state)
         if deploy_hint is not None:
             origins["deployment_mode_hint"] = "launch_script"
+        if unresolved_vars:
+            origins["unresolved_shell_vars"] = "launch_script"
 
         vis = env_vars.get("ASCEND_RT_VISIBLE_DEVICES", "")
-        inferred_devs = len([x for x in vis.split(",") if x.strip()]) if vis else (dp * tp * pp * pcp)
+        local_vis = len([x for x in vis.split(",") if x.strip()]) if vis else 0
+        nnodes = max(1, int(state["nnodes"]))
+        world_size = parallel.world_size
+        inferred_devs = (
+            world_size
+            if (state["has_parallel_flags"] or nnodes > 1 or local_vis <= 0)
+            else local_vis
+        )
         runtime_limits: list[tuple[str, Any]] = [
             ("inferred_num_devices", inferred_devs),
         ]
+        if local_vis > 0:
+            runtime_limits.append(("local_visible_devices", local_vis))
+        if nnodes > 1:
+            runtime_limits.append(("nnodes", nnodes))
         for limit_key in ("max_model_len", "max_num_seqs", "max_num_batched_tokens", "block_size"):
             if int(state[limit_key]) > 0:
                 runtime_limits.append((limit_key, int(state[limit_key])))
@@ -407,12 +665,16 @@ class VllmAscendLaunchCodec:
         ]
         if state["mm_processor_cache_gb"] is not None:
             raw_flags.append(("mm_processor_cache_gb", int(state["mm_processor_cache_gb"])))
+        if ckpt_quant_type:
+            raw_flags.append(("checkpoint_quant_type", ckpt_quant_type))
+        if unresolved_vars:
+            raw_flags.append(("unresolved_shell_vars", tuple(unresolved_vars)))
 
         return LaunchConfigIngress(
             stack_id=VLLM_ASCEND_STACK_ID,
             source_label=src_label,
             model_ref=model_arg,
-            checkpoint_hint=quant_hint,
+            checkpoint_hint=ckpt_quant_type or quant_hint,
             parallel=parallel,
             deployment_mode_hint=deploy_hint,
             runtime_limits=tuple(runtime_limits),
@@ -448,33 +710,41 @@ class VllmAscendLaunchCodec:
                     w_fmt or tuned_kv, "; ".join(isa_warns),
                 ))
 
-        spec_k = _safe_int(spec_cfg.get("num_speculative_tokens") or tuned_facts.get("spec_proposals"), 0)
+        orig_spec_k = _safe_int(spec_cfg.get("num_speculative_tokens"), 0)
         raw_cap = comp_cfg.get("cudagraph_capture_sizes")
         cg_mode = str(comp_cfg.get("cudagraph_mode") or "FULL_DECODE_ONLY").upper()
-        if isinstance(raw_cap, list) and spec_k > 0:
+        if isinstance(raw_cap, list) and orig_spec_k > 0:
             cap_warns = validate_aclgraph_capture_sizes(
                 [int(x) for x in raw_cap if isinstance(x, int)],
-                num_speculative_tokens=spec_k,
+                num_speculative_tokens=orig_spec_k,
                 cudagraph_mode=cg_mode,
             )
             if cap_warns:
                 issues.append(_make_issue(
                     "aclgraph_capture_size_not_k_plus_1", "HIGH",
-                    f"ACLGraph capture sizes are not multiples of (K+1)={spec_k + 1}",
-                    str(raw_cap), f"Use multiples of {spec_k + 1}", cap_warns[0],
+                    f"ACLGraph capture sizes are not multiples of (K+1)={orig_spec_k + 1}",
+                    str(raw_cap), f"Use multiples of {orig_spec_k + 1}", cap_warns[0],
                 ))
 
-        if hw_fam in {"a2", "a3", "a5"} and spec_cfg and spec_k > 0:
+        if hw_fam in {"a2", "a3", "a5"} and spec_cfg and orig_spec_k > 0:
+            orig_kv = str(flags.get("kv_cache_dtype") or "bf16").strip().lower()
+            if hw_fam in {"a2", "a3"} and orig_kv in {"fp8", "fp8_e4m3", "mxfp8"}:
+                orig_kv = "bf16"
+            orig_limits = {k: _unfreeze_nested(v) for k, v in ingress.runtime_limits}
+            orig_max_seqs = max(1, _safe_int(orig_limits.get("max_num_seqs"), DEFAULT_AUDIT_MAX_NUM_SEQS))
             va_rules = build_va_serving_rules(
                 model_name, hw_family=hw_fam,
-                tp=max(1, _safe_int(tuned_facts.get("tp"), ingress.parallel.tp)),
-                dp=max(1, _safe_int(tuned_facts.get("dp"), ingress.parallel.dp)),
-                ep=max(1, _safe_int(tuned_facts.get("ep"), ingress.parallel.ep)),
-                pp=max(1, _safe_int(tuned_facts.get("pp"), ingress.parallel.pp)),
-                target_kv_dtype=tuned_kv.lower(), enable_speculative=True,
+                tp=max(1, ingress.parallel.tp),
+                dp=max(1, ingress.parallel.dp),
+                ep=max(1, ingress.parallel.ep),
+                pp=max(1, ingress.parallel.pp),
+                dcp=max(1, ingress.parallel.cp),
+                pcp=max(1, ingress.parallel.pcp),
+                target_kv_dtype=orig_kv, enable_speculative=True,
                 spec_method=str(spec_cfg.get("method") or "") or None,
-                num_speculative_tokens=spec_k,
-                max_num_seqs=max(1, _safe_int(tuned_facts.get("concurrency"), DEFAULT_AUDIT_MAX_NUM_SEQS)),
+                num_speculative_tokens=orig_spec_k,
+                draft_model=str(spec_cfg.get("model") or "") or None,
+                max_num_seqs=orig_max_seqs,
             )
             if va_rules.resolved_speculative is not None:
                 req_dtp = va_rules.resolved_speculative.draft_tensor_parallel_size
@@ -486,6 +756,7 @@ class VllmAscendLaunchCodec:
                         f"draft_tensor_parallel_size={got_dtp}", f"draft_tensor_parallel_size={req_dtp}",
                         f"vLLM-Ascend requires draft_tp={req_dtp}",
                     ))
+        del tuned_facts
         return cg_mode
 
     def audit_launch_config(
@@ -551,14 +822,13 @@ class VllmAscendLaunchCodec:
                 "Enable FULL_DECODE_ONLY or FULL_AND_PIECEWISE to eliminate decode launch bubbles",
             ))
 
-        if bool(tuned_facts.get("has_mla")):
-            raw_mlapo = env_vars.get("VLLM_ASCEND_ENABLE_MLAPO")
-            if (raw_mlapo is not None and raw_mlapo.strip().lower() in _FALSE_ENV_TOKENS) or add_cfg.get("enable_mlapo") is False:
-                issues.append(_make_issue(
-                    "missing_mlapo", "MEDIUM", "MLAPO explicitly disabled on MLA model",
-                    f"VLLM_ASCEND_ENABLE_MLAPO={raw_mlapo}" if raw_mlapo is not None else "enable_mlapo=false",
-                    "export VLLM_ASCEND_ENABLE_MLAPO=1", "Restore default MLA Prolog fusion",
-                ))
+        if bool(tuned_facts.get("has_mla")) and add_cfg.get("enable_mlapo") is False:
+            issues.append(_make_issue(
+                "missing_mlapo", "MEDIUM", "MLAPO explicitly disabled on MLA model",
+                "enable_mlapo=false",
+                '--additional-config \'{"enable_mlapo": true}\'',
+                "Restore default MLA Prolog fusion",
+            ))
 
         self._audit_overlap_and_hw_isolation(
             issues=issues, env_vars=env_vars, add_cfg=add_cfg, hw_fam=hw_fam,
@@ -644,11 +914,16 @@ class VllmAscendLaunchCodec:
                     ", ".join(legacy), "Remove legacy PCIe/RoCE env vars",
                     "A5 uses native UB-Direct interconnect",
                 ))
-            if _is_mxfp_or_fp8(w_fmt) and add_cfg.get("enable_weight_nz_layout"):
+            nz_val = add_cfg.get("weight_nz_mode")
+            if _is_mxfp_or_fp8(w_fmt) and (
+                add_cfg.get("enable_weight_nz_layout")
+                or (nz_val is not None and nz_val != WEIGHT_NZ_MODE_DISABLED)
+            ):
                 issues.append(_make_issue(
                     "a5_mxfp_nz_layout_incompatible", "MEDIUM",
                     "A5 MXFP/FP8 weights should not force global NZ layout",
-                    "enable_weight_nz_layout=true", "Remove enable_weight_nz_layout",
+                    f"weight_nz_mode={nz_val}" if nz_val is not None else "enable_weight_nz_layout=true",
+                    "Remove weight_nz_mode override on A5",
                     "MXFP layouts are operator-ABI driven on A5",
                 ))
         elif hw_fam in {"a3", "a2"}:
@@ -659,13 +934,37 @@ class VllmAscendLaunchCodec:
                     hccl_mode or "unset", f'HCCL_OP_EXPANSION_MODE="{target_hccl}"',
                     "A2/A3 HCCS requires AIV expansion (never CCU)",
                 ))
-            if _is_integer_quant(w_fmt) and not add_cfg.get("enable_weight_nz_layout"):
+            if _is_integer_quant(w_fmt) and (
+                add_cfg.get("weight_nz_mode") == WEIGHT_NZ_MODE_DISABLED
+                or add_cfg.get("enable_weight_nz_layout") is False
+            ):
                 issues.append(_make_issue(
                     "missing_nz_layout_a23", "MEDIUM",
-                    f"{hw_fam.upper()} integer quantization missing FRACTAL_NZ layout",
-                    "enable_weight_nz_layout unset", '--additional-config \'{"enable_weight_nz_layout": true}\'',
+                    f"{hw_fam.upper()} integer quantization disables FRACTAL_NZ layout",
+                    "weight_nz_mode=0",
+                    f'--additional-config \'{{"weight_nz_mode": {WEIGHT_NZ_MODE_QUANT}}}\'',
                     "Enable FRACTAL_NZ weight layout for A2/A3 INT8/INT4 GEMMs",
                 ))
+
+    def _resolve_pd_transfer_config(
+        self, role: str, phase: str, tuned_facts: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        if role == "pd_prefill":
+            kv_role = "kv_producer"
+        elif role == "pd_decode":
+            kv_role = "kv_consumer"
+        elif role == "pd_disaggregated":
+            kv_role = "kv_producer" if phase == "prefill" else "kv_consumer"
+        else:
+            return None
+        raw_xfer = tuned_facts.get("kv_transfer_config")
+        kv_xfer: dict[str, Any] = dict(raw_xfer) if isinstance(raw_xfer, Mapping) else {}
+        connector = str(kv_xfer.get("kv_connector") or tuned_facts.get("kv_connector") or "").strip()
+        if not connector or connector == "AscendHcclConnector":
+            connector = DEFAULT_PD_KV_CONNECTOR
+        kv_xfer["kv_connector"] = connector
+        kv_xfer["kv_role"] = kv_role
+        return kv_xfer
 
     def render_launch_config(self, tuned_facts: Mapping[str, Any]) -> str:
         """Render a clean, hardware-isolated ``vllm serve`` bash script."""
@@ -684,46 +983,67 @@ class VllmAscendLaunchCodec:
         pcp = max(1, _safe_int(tuned_facts.get("pcp"), 1))
         max_len = max(1, _safe_int(tuned_facts.get("max_model_len") or tuned_facts.get("seq_len"), DEFAULT_AUDIT_MAX_MODEL_LEN))
         max_seqs = max(1, _safe_int(tuned_facts.get("max_num_seqs") or tuned_facts.get("concurrency"), DEFAULT_AUDIT_MAX_NUM_SEQS))
+        max_batched = _safe_int(tuned_facts.get("max_num_batched_tokens"), 0)
+        block_size = _safe_int(tuned_facts.get("block_size") or tuned_facts.get("kv_block_size"), 0)
+        enforce_eager = bool(tuned_facts.get("enforce_eager", False))
+        use_replayssm = bool(tuned_facts.get("use_replayssm", False))
         gpu_util = _safe_float(tuned_facts.get("gpu_memory_utilization"), DEFAULT_GPU_MEMORY_UTILIZATION)
         if gpu_util <= 0.0:
             gpu_util = DEFAULT_GPU_MEMORY_UTILIZATION
 
         w_fmt = str(tuned_facts.get("weight_format") or "")
         kv_raw = str(tuned_facts.get("kv_cache_dtype") or "auto").strip().lower()
-        if hw_fam == "a5":
-            kv_flag = "fp8_e4m3" if kv_raw in {"fp8", "fp8_e4m3", "mxfp8"} else "auto"
-        elif hw_fam in {"a2", "a3"}:
-            kv_flag = "int8" if kv_raw in {"c8", "int8"} else "auto"
-        else:
-            kv_flag = kv_raw or "auto"
-
         spec_k = _safe_int(tuned_facts.get("spec_proposals"), 0)
-        cg_mode = str(tuned_facts.get("cudagraph_mode") or "FULL_DECODE_ONLY").upper()
+        cg_mode = "NONE" if enforce_eager else str(tuned_facts.get("cudagraph_mode") or "FULL_DECODE_ONLY").upper()
+        is_pd = role in {"pd_prefill", "pd_decode", "pd_disaggregated"}
+        va_pd_role = ("prefill" if phase == "prefill" else "decode") if role == "pd_disaggregated" else role
+        explicit_nz_mode = tuned_facts.get("weight_nz_mode")
         va_rules = (
             build_va_serving_rules(
-                model_name, hw_family=hw_fam, tp=tp, dp=dp, ep=ep, pp=pp,
-                target_kv_dtype=kv_flag, enable_speculative=(spec_k > 0),
+                model_name, hw_family=hw_fam, tp=tp, dp=dp, ep=ep, pp=pp, dcp=dcp, pcp=pcp,
+                target_kv_dtype=kv_raw, enable_speculative=(spec_k > 0),
                 spec_method=str(tuned_facts.get("spec_method") or "") or None,
                 num_speculative_tokens=spec_k if spec_k > 0 else None,
+                draft_model=str(tuned_facts.get("draft_model") or "") or None,
                 cudagraph_mode=cg_mode, max_num_seqs=max_seqs,
-                pd_disaggregated=(role in {"pd_prefill", "pd_decode", "pd_disaggregated"}),
-                pd_role=role,
+                pd_disaggregated=is_pd, pd_role=va_pd_role,
+                weight_nz_mode=explicit_nz_mode,
+                enable_replayssm=use_replayssm,
             ) if hw_fam in {"a2", "a3", "a5"} else None
         )
 
+        eff_kv = va_rules.effective_kv_cache_dtype if va_rules is not None else kv_raw
+        if hw_fam == "a5":
+            if eff_kv == "mxfp8":
+                kv_flag = "mxfp8"
+            elif eff_kv in {"fp8", "fp8_e4m3"}:
+                kv_flag = "fp8_e4m3"
+            else:
+                kv_flag = "auto"
+        elif hw_fam in {"a2", "a3"}:
+            kv_flag = "int8" if eff_kv in {"c8", "int8"} else "auto"
+        else:
+            kv_flag = eff_kv or "auto"
+
         add_cfg: dict[str, Any] = dict(va_rules.additional_config) if va_rules is not None else {}
+        add_cfg.pop("enable_weight_nz_layout", None)
         mc2_level = _safe_int(tuned_facts.get("enable_fused_mc2"), 0)
         mso_on = bool(tuned_facts.get("multistream_overlap_shared_expert", False)) and mc2_level <= 0
         if mc2_level > 0:
             add_cfg["enable_fused_mc2"] = mc2_level
         elif mso_on:
             add_cfg["multistream_overlap_shared_expert"] = True
-        if hw_fam in {"a2", "a3"} and _is_integer_quant(w_fmt):
-            add_cfg["enable_weight_nz_layout"] = True
-        elif hw_fam == "a5":
-            add_cfg.pop("enable_weight_nz_layout", None)
+        if explicit_nz_mode is None:
+            if hw_fam in {"a2", "a3"} and _is_integer_quant(w_fmt):
+                add_cfg["weight_nz_mode"] = WEIGHT_NZ_MODE_QUANT
+            elif hw_fam == "a5":
+                add_cfg.pop("weight_nz_mode", None)
+        if bool(tuned_facts.get("has_mla")):
+            add_cfg["enable_mlapo"] = (role != "pd_prefill")
 
-        comp_cfg = dict(va_rules.compilation_config) if va_rules is not None else {"cudagraph_mode": cg_mode}
+        comp_cfg = {"cudagraph_mode": "NONE"} if enforce_eager else (
+            dict(va_rules.compilation_config) if va_rules is not None else {"cudagraph_mode": cg_mode}
+        )
         coll = shipping_collective_policy(hw_fam, canonical=model_name, role=role)
         hccl_mode = str(tuned_facts.get("hccl_op_expansion_mode") or (coll or {}).get("process_env_mode") or "")
         if hw_fam in {"a2", "a3"} and "CCU" in hccl_mode.upper():
@@ -741,12 +1061,6 @@ class VllmAscendLaunchCodec:
         lines.extend([
             f"export HCCL_BUFFSIZE={DEFAULT_HCCL_BUFFSIZE_MIB}",
             f"export HCCL_BUFFSIZE_EP={DEFAULT_HCCL_EP_BUFFSIZE_MIB}",
-        ])
-        if mc2_level > 0:
-            lines.append("export VLLM_ASCEND_ENABLE_FUSED_MC2=1")
-        if bool(tuned_facts.get("has_mla")) and role != "pd_prefill":
-            lines.append("export VLLM_ASCEND_ENABLE_MLAPO=1")
-        lines.extend([
             'export PYTORCH_NPU_ALLOC_CONF="expandable_segments:True"',
             "",
             f'vllm serve "{model_target}" \\',
@@ -761,21 +1075,36 @@ class VllmAscendLaunchCodec:
             lines.append(f"  --decode-context-parallel-size {dcp} \\")
         if pcp > 1:
             lines.append(f"  --prefill-context-parallel-size {pcp} \\")
-        if role == "pd_prefill":
-            kv_xfer = {"kv_connector": "AscendHcclConnector", "kv_role": "kv_producer"}
-            lines.append(f"  --kv-transfer-config '{json.dumps(kv_xfer, separators=(',', ':'))}' \\")
-        elif role == "pd_decode":
-            kv_xfer = {"kv_connector": "AscendHcclConnector", "kv_role": "kv_consumer"}
+        if role == "pd_disaggregated":
+            lines.append("  --deployment-mode pd_disaggregated \\")
+        kv_xfer = self._resolve_pd_transfer_config(role, phase, tuned_facts)
+        if kv_xfer is not None:
             lines.append(f"  --kv-transfer-config '{json.dumps(kv_xfer, separators=(',', ':'))}' \\")
         if va_rules is not None and va_rules.speculative_enabled and va_rules.speculative_config:
             lines.append(f"  --speculative-config '{json.dumps(va_rules.speculative_config, separators=(',', ':'))}' \\")
+        no_prefix = (
+            tuned_facts.get("enable_prefix_caching") is False
+            or (va_rules is not None and "--no-enable-prefix-caching" in va_rules.cli_flags)
+        )
+        if no_prefix:
+            lines.append("  --no-enable-prefix-caching \\")
+        if use_replayssm:
+            lines.append("  --use-replayssm \\")
+        if enforce_eager:
+            lines.append("  --enforce-eager \\")
         if w_fmt.upper() not in _UNQUANTIZED_FORMATS:
             lines.append("  --quantization ascend \\")
         lines.extend([
             f"  --kv-cache-dtype {kv_flag} \\",
             f"  --max-model-len {max_len} \\",
             f"  --max-num-seqs {max_seqs} \\",
-            f"  --gpu-memory-utilization {gpu_util:.2f} \\",
+        ])
+        if max_batched > 0:
+            lines.append(f"  --max-num-batched-tokens {max_batched} \\")
+        if block_size > 0:
+            lines.append(f"  --block-size {block_size} \\")
+        lines.extend([
+            f"  --gpu-memory-utilization {gpu_util:g} \\",
             f"  --compilation-config '{json.dumps(comp_cfg, separators=(',', ':'))}' \\",
             f"  --additional-config '{json.dumps(add_cfg, separators=(',', ':'))}'",
             "",
