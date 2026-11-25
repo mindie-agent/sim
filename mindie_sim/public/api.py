@@ -113,6 +113,8 @@ def simulate_operator(case: Any, ops: Any, *, extensions: Any = None,
             if selected_profile is not None else None
         )
         if active_env is not None:
+            if isinstance(built_ops, Mapping) and "replica" in merged:
+                raise ExtensionError("standalone_operator_replica_ambiguous_with_mapping")
             return _core(
                 "operator", "simulate_operator", lambda: active_env.operator_report(
                     _ops(built_ops), profile=selected_profile,
@@ -148,11 +150,14 @@ def simulate_operator(case: Any, ops: Any, *, extensions: Any = None,
     if active_env is not None:
         input_ready_ms = kwargs.pop("input_ready_ms", 0)
         recipes = kwargs.pop("recipes", None)
+        has_replica = "replica" in kwargs
         replica = kwargs.pop("replica", 0)
         if kwargs:
             raise ExtensionError(
                 "standalone_operator_unsupported_keywords:"
                 + ",".join(sorted(kwargs)))
+        if isinstance(ops, Mapping) and has_replica:
+            raise ExtensionError("standalone_operator_replica_ambiguous_with_mapping")
         return _core(
             "operator", "simulate_operator", lambda: active_env.operator_report(
                 _ops(ops), profile=selected_profile, service_id=service_id,
@@ -344,6 +349,8 @@ def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
             if selected_profile is not None else None
         )
         if active_env is not None:
+            if isinstance(built_ops, Mapping) and "replica" in merged:
+                raise ExtensionError("standalone_graph_replica_ambiguous_with_mapping")
             return _core(
                 "graph", "simulate_graph", lambda: active_env.graph_report(
                     _ops(built_ops), profile=selected_profile,
@@ -383,12 +390,15 @@ def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
         input_ready_ms = kwargs.pop("input_ready_ms", 0)
         external_inputs = kwargs.pop("external_inputs", None)
         execution = kwargs.pop("execution", None)
+        has_replica = "replica" in kwargs
         replica = kwargs.pop("replica", 0)
         recipes = kwargs.pop("recipes", None)
         if kwargs:
             raise ExtensionError(
                 "standalone_graph_unsupported_keywords:"
                 + ",".join(sorted(kwargs)))
+        if isinstance(ops, Mapping) and has_replica:
+            raise ExtensionError("standalone_graph_replica_ambiguous_with_mapping")
         return _core(
             "graph", "simulate_graph", lambda: active_env.graph_report(
                 _ops(ops), profile=selected_profile, service_id=service_id,

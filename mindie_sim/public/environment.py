@@ -29,7 +29,7 @@ from dataclasses import dataclass, field, replace
 import math
 from typing import Any
 
-from mindie_sim.prediction.efficiency.cost import CostModel
+from mindie_sim.prediction.efficiency.cost import CostLedger, CostModel
 from mindie_sim.prediction.engine import Event
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.program import RecipeBook
@@ -47,11 +47,6 @@ from mindie_sim.prediction.service_regime_domains.services import service_identi
 from .profiles import UserProfile
 from .services import ProfileServiceRecipe, conditions_context
 
-_STANDALONE_WORK_ROLES = (
-    ("hbm_bytes", "hbm"), ("mte2_bytes", "mte2"), ("mte3_bytes", "mte3"),
-    ("vector_ops", "vector"), ("flops", "cube"), ("link_bytes", "link"),
-)
-
 
 @dataclass(frozen=True)
 class _StandaloneCase:
@@ -64,18 +59,16 @@ class _StandaloneCase:
     slo: SloSpec = field(default_factory=SloSpec)
 
 
-def _work_roles(op: OpSpec) -> dict[str, float]:
-    roles: dict[str, float] = {}
-    for field_name, role in _STANDALONE_WORK_ROLES:
-        value = float(getattr(op, field_name, 0.0) or 0.0)
-        if value:
-            roles[role] = roles.get(role, 0.0) + value
-    metadata = dict(op.metadata)
-    for role, value in dict(metadata.get("resource_work", {}) or {}).items():
-        amount = float(value or 0.0)
-        if amount:
-            roles[str(role)] = roles.get(str(role), 0.0) + amount
-    return roles
+def _work_roles(
+    op: OpSpec, cost_model: Any, replay_scope: str = "none",
+) -> dict[str, float]:
+    """Resolve declared resource roles through the single canonical CostModel."""
+    model = getattr(cost_model, "model", cost_model)
+    try:
+        priced = model.price(op, replay_scope, ledger=CostLedger())
+    except ValueError as exc:
+        raise ModelingError(str(exc)) from exc
+    return dict(priced.work)
 
 
 def _selection_records(ops: Sequence[OpSpec]) -> list[dict[str, Any]]:
@@ -109,18 +102,21 @@ def _identity_dtype(op: OpSpec) -> OpSpec:
                               else "mixed:" + ",".join(dtypes)))
 
 
-def _service_op(op: OpSpec, service: NormalizedResourceService,
-                context) -> OpSpec:
+def _service_op(
+    op: OpSpec, service: NormalizedResourceService, context,
+    cost_model: CostModel, replay_scope: str,
+) -> OpSpec:
     """Map declared OpSpec work onto the exact physical role a service names."""
     role = service.resource
-    roles = _work_roles(op)
+    roles = _work_roles(op, cost_model, replay_scope)
     if set(roles) == {role}:
         return op
-    if (role in {"mte2_aiv", "mte2_aic"} and set(roles) == {"mte2"}
-            and op.mte2_bytes):
+    if role in {"mte2_aiv", "mte2_aic"} and set(roles) == {"mte2"}:
         metadata = dict(op.metadata)
         resource_work = dict(metadata.get("resource_work", {}) or {})
-        resource_work[role] = op.mte2_bytes
+        mte2_total = float(roles["mte2"])
+        resource_work.pop("mte2", None)
+        resource_work[role] = float(resource_work.get(role, 0.0)) + mte2_total
         metadata["resource_work"] = resource_work
         return replace(op, mte2_bytes=0.0,
                        metadata=tuple(sorted(metadata.items())))
@@ -128,6 +124,164 @@ def _service_op(op: OpSpec, service: NormalizedResourceService,
         "user_profile_service_requires_one_declared_resource_phase:"
         + op.op_id + ":" + ",".join(sorted(roles)) + "!=" + role
         + ":placement=" + ",".join(sorted(context.resource_names)))
+
+
+def _overlay_recipes(base: RecipeBook, extra: Mapping[str, Any]) -> RecipeBook:
+    """Overlay explicit recipe bindings onto ``base`` without mutating ``base``."""
+    if not extra:
+        return base
+    merged = RecipeBook(
+        recipes={},
+        families={},
+        programs={},
+        default=base.default,
+        family_registry=getattr(base, "_family_registry", None),
+    )
+    merged.recipes = {**base.recipes, **extra}
+    merged.families = dict(base.families)
+    merged.programs = dict(base.programs)
+    merged._explicit_recipes = (
+        frozenset(getattr(base, "_explicit_recipes", ())) | frozenset(extra)
+    )
+    merged._caller_recipes = (
+        frozenset(getattr(base, "_caller_recipes", ())) | frozenset(extra)
+    )
+    merged._explicit_families = frozenset(getattr(base, "_explicit_families", ()))
+    merged._caller_programs = frozenset(getattr(base, "_caller_programs", ()))
+    merged._family_kinds = dict(getattr(base, "_family_kinds", {}))
+    return merged
+
+
+def _collective_replica_group(
+    op: OpSpec, replica: int, topology: Any,
+) -> tuple[int, ...]:
+    """Return sorted DP replicas participating in ``op``'s collective group."""
+    metadata = dict(op.metadata)
+    parallel = topology.parallel
+    stage = int(metadata.get("source_stage", op.stage))
+    ext_dp = max(1, int(getattr(parallel, "external_dp", 1) or 1))
+    dp_count = max(1, ext_dp * int(parallel.dp))
+    owner = {
+        int(rank): rep
+        for rep in range(dp_count)
+        for rank in topology.ranks(rep, stage)
+    }
+    axis = str(metadata.get("group_axis", "tp"))
+    declared = metadata.get("group_ranks")
+    if declared:
+        groups: Sequence[Sequence[int]] = (tuple(declared),)
+    elif axis == "etp":
+        from mindie_sim.prediction.sharding.local_tp import expert_tp_groups
+        groups = expert_tp_groups(topology, replica=replica, stage=stage)
+    else:
+        groups = tuple(topology.groups(axis, replica, stage, metadata=metadata))
+    rep_ranks = {int(rk) for rk in topology.ranks(replica, stage)}
+    matched: set[int] = set()
+    for group in groups:
+        group_ints = {int(rk) for rk in group}
+        if declared or (group_ints & rep_ranks):
+            matched.update(owner[rk] for rk in group_ints if rk in owner)
+    if not matched:
+        for group in groups:
+            matched.update(owner[int(rk)] for rk in group if int(rk) in owner)
+    return tuple(sorted(matched))
+
+
+def _collective_key(op: OpSpec) -> str:
+    meta = dict(op.metadata)
+    grp_ranks = meta.get("group_ranks")
+    if grp_ranks and meta.get("group_axis") == "local_tp":
+        return f"{op.op_id}@{','.join(map(str, grp_ranks))}"
+    return op.op_id
+
+
+def _replica_submission_groups(
+    works: Mapping[int, IterationWork],
+    topology: Any,
+    parallel: ParallelSpec,
+    machine: Hardware,
+) -> list[tuple[int, ...]]:
+    """Partition active replicas into cohorts covering all cross-DP collectives."""
+    from mindie_sim.prediction.execution.dispatch import cohorts
+    from mindie_sim.prediction.sharding.local_tp import collective_requires_cohort
+
+    active = list(works)
+    parent = {rep: rep for rep in active}
+
+    def find(rep: int) -> int:
+        while parent[rep] != rep:
+            parent[rep] = parent[parent[rep]]
+            rep = parent[rep]
+        return rep
+
+    def union_all(members: Sequence[int]) -> None:
+        present = [rep for rep in members if rep in parent]
+        if len(present) <= 1:
+            return
+        root = find(present[0])
+        for rep in present[1:]:
+            parent[find(rep)] = root
+
+    for group in cohorts(parallel, machine):
+        union_all(group)
+    for rep, work in works.items():
+        for op in work.ops:
+            if collective_requires_cohort(op, topology):
+                union_all(_collective_replica_group(op, rep, topology))
+    grouped: dict[int, list[int]] = {}
+    for rep in active:
+        grouped.setdefault(find(rep), []).append(rep)
+    return [tuple(members) for members in grouped.values()]
+
+
+def _operator_report_row(
+    op: OpSpec,
+    rep: int,
+    *,
+    multi_mapped: bool,
+    physical: Sequence[Mapping[str, Any]],
+    start_ms: float,
+    complete_ms: float,
+    duration: float,
+    input_ready_ms: float,
+    serviced: Mapping[str, Any],
+    execution: Execution,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    events: list[dict[str, Any]] = []
+    for captured in physical:
+        operator = captured["operator"]
+        zero = operator.get("family") == "barrier"
+        events.append({
+            **captured,
+            "zero_work": zero,
+            "serviced": {} if zero else None,
+            "service_attribution": (
+                "zero_work_sync" if zero else "call_aggregate_only"),
+        })
+    charge_event = next(
+        (event for event in events if not event["zero_work"]), events[0])
+    row = {
+        "physical_id": op.op_id,
+        **({"replica": rep} if multi_mapped else {}),
+        "operator": op.to_dict(),
+        "occurrences": 1,
+        "program": (op.recipe or charge_event["program"]),
+        "duration_ms": duration,
+        "total_ms": duration,
+        "input_ready_ms": input_ready_ms,
+        "ready_ms": start_ms,
+        "complete_ms": complete_ms,
+        "serviced": serviced,
+        "charge": "call",
+        "service_attribution": "call_terminal_once",
+        "physical_members": [event["physical_id"] for event in events],
+        "physical_event_count": len(events),
+        "physical_events": events,
+        "basis": execution.cost.summary(),
+        "runtime_uid": execution.engine.uid,
+        "live_tasks": execution.engine.summary()["live_tasks"],
+    }
+    return row, events
 
 
 @dataclass(frozen=True)
@@ -234,13 +388,51 @@ class ExecutionEnvironment:
             execution.case, op, replay_scope, device=die)
         return conditions_context(context, identity), context, die, identity
 
-    def _profiled(self, ops: Sequence[OpSpec], profile: UserProfile | None,
-                  service_id: str | None, execution: Execution,
-                  *, replay_scope: str = "none", replica: int = 0
-                  ) -> tuple[tuple[OpSpec, ...], RecipeBook | None]:
+    def _replica_ops(
+        self,
+        ops: Sequence[OpSpec] | Mapping[int, Sequence[OpSpec] | OpSpec] | OpSpec,
+        *,
+        replica: int = 0,
+    ) -> tuple[dict[int, tuple[OpSpec, ...]], bool]:
+        dp = max(1, self.runtime.parallel.dp)
+        if isinstance(ops, Mapping):
+            mapped: dict[int, tuple[OpSpec, ...]] = {}
+            for rep, rep_ops in ops.items():
+                if isinstance(rep, bool) or not isinstance(rep, int) or rep < 0 or rep >= dp:
+                    raise ModelingError(
+                        "standalone_graph_replica_outside_declared_placement:" + str(rep))
+                if isinstance(rep_ops, OpSpec):
+                    mapped[rep] = (rep_ops,)
+                elif isinstance(rep_ops, (str, bytes, bytearray)):
+                    raise ModelingError("standalone_entry_requires_op_spec")
+                else:
+                    try:
+                        mapped[rep] = tuple(rep_ops)
+                    except TypeError as exc:
+                        raise ModelingError("standalone_entry_requires_op_spec") from exc
+            return mapped, True
+        if isinstance(replica, bool) or not isinstance(replica, int) or replica < 0 or replica >= dp:
+            raise ModelingError(
+                "standalone_graph_replica_outside_declared_placement:" + str(replica))
+        if isinstance(ops, OpSpec):
+            seq = (ops,)
+        elif isinstance(ops, (str, bytes, bytearray)):
+            raise ModelingError("standalone_entry_requires_op_spec")
+        else:
+            try:
+                seq = tuple(ops)
+            except TypeError as exc:
+                raise ModelingError("standalone_entry_requires_op_spec") from exc
+        return {replica: seq}, False
+
+    def _profiled_entries(
+        self, ops: Sequence[OpSpec], profile: UserProfile | None,
+        service_id: str | None, execution: Execution,
+        *, replay_scope: str = "none", replica: int = 0, iteration: int = 0,
+    ) -> tuple[tuple[OpSpec, ...], dict[str, Any]]:
         ops = tuple(_identity_dtype(op) for op in ops)
         if profile is None:
-            return tuple(ops), None
+            return tuple(ops), {}
         recipes: dict[str, Any] = {}
         normalized: list[OpSpec] = []
         for index, op in enumerate(ops):
@@ -250,7 +442,7 @@ class ExecutionEnvironment:
             metadata = dict(op.metadata)
             metadata.setdefault("kernel", op.recipe or op.family)
             op = replace(op, metadata=tuple(sorted(metadata.items())))
-            conditions, stage_context, die, identity = self._placement_conditions(
+            conditions, stage_context, _die, _identity = self._placement_conditions(
                 execution, op, replay_scope, replica)
             service = profile.service(
                 service_id, conditions_context=conditions)
@@ -262,9 +454,9 @@ class ExecutionEnvironment:
                 raise ModelingError(
                     "user_profile_service_requires_a_physical_kernel:"
                     + op.op_id)
-            op = _service_op(op, service, stage_context)
+            op = _service_op(op, service, stage_context, execution.cost, replay_scope)
             role = service.resource
-            roles = _work_roles(op)
+            roles = _work_roles(op, execution.cost, replay_scope)
             if set(roles) != {role}:
                 raise ModelingError(
                     "user_profile_service_requires_one_declared_resource_phase:"
@@ -288,27 +480,69 @@ class ExecutionEnvironment:
                     "user_profile_service_boundary_mismatch:"
                     + op.op_id + ":" + service.boundary
                     + "!=" + _declared_boundary(op))
-            key = f"user-profile:{service.service_id}:{op.op_id}:{index}"
+            key = f"user-profile:{service.service_id}:r{replica}:i{iteration}:{op.op_id}:{index}"
             recipes[key] = ProfileServiceRecipe(service)
             normalized.append(replace(op, recipe=key))
-        return tuple(normalized), RecipeBook(recipes=recipes)
+        return tuple(normalized), recipes
+
+    def _profiled(self, ops: Sequence[OpSpec], profile: UserProfile | None,
+                  service_id: str | None, execution: Execution,
+                  *, replay_scope: str = "none", replica: int = 0,
+                  iteration: int = 0
+                  ) -> tuple[tuple[OpSpec, ...], RecipeBook | None]:
+        normalized, recipes = self._profiled_entries(
+            ops, profile, service_id, execution,
+            replay_scope=replay_scope, replica=replica, iteration=iteration)
+        return normalized, (
+            _overlay_recipes(execution.recipes, recipes)
+            if profile is not None else None
+        )
 
     def _prepare(self, ops: Sequence[OpSpec], profile: UserProfile | None,
                  service_id: str | None, execution: Execution,
-                 *, replay_scope: str = "none", replica: int = 0
+                 *, replay_scope: str = "none", replica: int = 0,
+                 iteration: int = 0
                  ) -> tuple[tuple[OpSpec, ...], RecipeBook]:
         normalized, profile_book = self._profiled(
             ops, profile, service_id, execution, replay_scope=replay_scope,
-            replica=replica)
+            replica=replica, iteration=iteration)
         book = profile_book or execution.recipes
         return tuple(book.expand(normalized)), book
 
-    def _execute(self, execution: Execution, expanded: Sequence[OpSpec], *,
-                 input_ready_ms: float, replay_scope: str,
-                 captured: list[dict[str, Any]], replica: int = 0,
-                 external_inputs: Mapping[str, Any] | None = None,
-                 wait: bool = True
-                 ) -> dict[str, Any]:
+    def _prepare_replicas(
+        self,
+        replica_ops: Mapping[int, Sequence[OpSpec]],
+        profile: UserProfile | None,
+        service_id: str | None,
+        execution: Execution,
+        *,
+        replay_scope: str = "none",
+        iteration: int = 0,
+    ) -> tuple[dict[int, tuple[OpSpec, ...]], RecipeBook]:
+        merged_recipes: dict[str, Any] = {}
+        normalized_by_replica: dict[int, tuple[OpSpec, ...]] = {}
+        for rep, rep_ops in replica_ops.items():
+            normalized, rep_recipes = self._profiled_entries(
+                rep_ops, profile, service_id, execution,
+                replay_scope=replay_scope, replica=rep, iteration=iteration)
+            normalized_by_replica[rep] = normalized
+            merged_recipes.update(rep_recipes)
+        book = (
+            _overlay_recipes(execution.recipes, merged_recipes)
+            if profile is not None else execution.recipes
+        )
+        expanded = {
+            rep: tuple(book.expand(rep_ops))
+            for rep, rep_ops in normalized_by_replica.items()
+        }
+        return expanded, book
+
+    def _build_external_events(
+        self,
+        execution: Execution,
+        external_inputs: Mapping[str, Any] | None,
+        input_ready_ms: float,
+    ) -> dict[str, Event]:
         external: dict[str, Event] = {}
         for key, value in (external_inputs or {}).items():
             if isinstance(value, Event):
@@ -325,51 +559,179 @@ class ExecutionEnvironment:
                 raise ModelingError(
                     "standalone_external_input_requires_time_or_event:"
                     + str(key))
-        iteration = getattr(execution, "_t15_submit_index", 0)
-        try:
-            setattr(execution, "_t15_submit_index", iteration + 1)
-        except (AttributeError, TypeError):
-            iteration = 0
-        work = IterationWork(
-            tuple(expanded), IterationPlan((), iteration=iteration), 1, 0, 0,
-            None, "standalone", "standalone", replay_scope=replay_scope)
-        step = execution.add(
-            work, replica, input_ready_ms, external_inputs=external)
-        if not wait:
-            return {
-                "execution": execution, "step": step,
-                "complete_ms": None, "charge_ready_ms": None,
-                "duration_ms": None, "input_ready_ms": input_ready_ms,
-                "joins": [{
-                    "id": op.op_id, "stream": op.stream,
-                    "scope": replay_scope, "dependencies": list(op.deps),
-                } for op in expanded if _is_zero_work(op)],
+        return external
+
+    @staticmethod
+    def _check_cohort_completeness(
+        execution: Execution, selected: Mapping[int, IterationWork],
+    ) -> None:
+        from mindie_sim.prediction.sharding.local_tp import collective_requires_cohort
+
+        present = set(selected)
+        for rep, work in selected.items():
+            for op in work.ops:
+                if not collective_requires_cohort(op, execution.topology):
+                    continue
+                peers = _collective_replica_group(op, rep, execution.topology)
+                if not set(peers) <= present:
+                    recipe = execution.recipes.select(op)
+                    if getattr(recipe, "algorithm", None):
+                        raise ModelingError("joint_collective_requires_complete_cohort")
+
+    def _submit_replica_works(
+        self,
+        execution: Execution,
+        works: Mapping[int, IterationWork],
+        input_ready_ms: float,
+        replica_externals: Mapping[int, Mapping[str, Event]],
+    ) -> dict[int, Any]:
+        groups = _replica_submission_groups(
+            works, execution.topology, self.runtime.parallel, self.machine)
+        steps: dict[int, Any] = {}
+        for group in groups:
+            selected = {rep: works[rep] for rep in group}
+            self._check_cohort_completeness(execution, selected)
+            if len(selected) > 1:
+                steps.update(execution.add_group(
+                    selected, input_ready_ms,
+                    external_inputs=replica_externals))
+            else:
+                rep, work = next(iter(selected.items()))
+                steps[rep] = execution.add(
+                    work, rep, input_ready_ms,
+                    external_inputs=replica_externals[rep])
+        return steps
+
+    def _execute_replicas(
+        self,
+        execution: Execution,
+        expanded_by_replica: Mapping[int, Sequence[OpSpec]],
+        *,
+        input_ready_ms: float,
+        replay_scope: str,
+        captured: list[dict[str, Any]],
+        external_inputs: Mapping[str, Any] | None = None,
+        wait: bool = True,
+        iteration: int | None = None,
+    ) -> dict[str, Any]:
+        external = self._build_external_events(
+            execution, external_inputs, input_ready_ms)
+        if iteration is None:
+            iteration = getattr(execution, "_t15_submit_index", 0)
+            try:
+                setattr(execution, "_t15_submit_index", iteration + 1)
+            except (AttributeError, TypeError):
+                iteration = 0
+        pp = max(1, self.runtime.parallel.pp)
+        works = {
+            rep: IterationWork(
+                tuple(rep_ops), IterationPlan((), iteration=iteration),
+                pp, 0, 0, None, "standalone", "standalone",
+                replay_scope=replay_scope)
+            for rep, rep_ops in expanded_by_replica.items()
+        }
+        replica_externals = {
+            rep: {
+                key: event for key, event in external.items()
+                if any(key in op.deps for op in rep_ops)
             }
-        execution.engine.advance(until=(step.completion,))
+            for rep, rep_ops in expanded_by_replica.items()
+        }
+        steps = self._submit_replica_works(
+            execution, works, input_ready_ms, replica_externals)
+        multi_replica = len(expanded_by_replica) > 1
         joins = [{
             "id": op.op_id, "stream": op.stream, "scope": replay_scope,
             "dependencies": list(op.deps),
-        } for op in expanded if _is_zero_work(op)]
-        charge_ready = next(
-            (item["ready"].time for item in captured
-             if item["operator"].get("family") != "barrier"),
-            input_ready_ms)
-        complete_ms = step.device_complete.time
+            **({"replica": rep} if multi_replica else {}),
+        } for rep, rep_ops in expanded_by_replica.items()
+          for op in rep_ops if _is_zero_work(op)]
+        only_step = next(iter(steps.values())) if len(steps) == 1 else None
+        if not wait:
+            return {
+                "execution": execution, "step": only_step, "steps": steps,
+                "complete_ms": None, "charge_ready_ms": None,
+                "duration_ms": None, "input_ready_ms": input_ready_ms,
+                "joins": joins,
+            }
+        unique_completions = tuple(dict.fromkeys(
+            step.completion for step in steps.values()))
+        execution.engine.advance(until=unique_completions, first=False)
+        ready_times = [
+            item["ready"].time for item in captured
+            if item["operator"].get("family") != "barrier"
+        ]
+        charge_ready = min(ready_times) if ready_times else input_ready_ms
+        complete_ms = max(
+            (step.device_complete.time for step in steps.values()),
+            default=input_ready_ms,
+        )
         return {
-            "execution": execution, "step": step, "joins": joins,
+            "execution": execution, "step": only_step, "steps": steps,
+            "joins": joins,
             "complete_ms": complete_ms,
             "charge_ready_ms": charge_ready,
             "duration_ms": complete_ms - charge_ready,
             "input_ready_ms": input_ready_ms,
         }
 
-    def _run(self, ops: Sequence[OpSpec], profile: UserProfile | None,
-             service_id: str | None, *, input_ready_ms: float = 0,
-             replay_scope: str = "none", replica: int = 0,
-             external_inputs: Mapping[str, Any] | None = None,
-             execution: Execution | None = None,
-             recipes: RecipeBook | None = None, wait: bool = True
-             ) -> tuple[dict[str, Any], Execution, tuple[OpSpec, ...]]:
+    def _execute(self, execution: Execution, expanded: Sequence[OpSpec], *,
+                 input_ready_ms: float, replay_scope: str,
+                 captured: list[dict[str, Any]], replica: int = 0,
+                 external_inputs: Mapping[str, Any] | None = None,
+                 wait: bool = True
+                 ) -> dict[str, Any]:
+        return self._execute_replicas(
+            execution, {replica: expanded}, input_ready_ms=input_ready_ms,
+            replay_scope=replay_scope, captured=captured,
+            external_inputs=external_inputs, wait=wait)
+
+    @staticmethod
+    def _register_deferred_recipe_restore(
+        execution: Execution,
+        steps: Mapping[int, Any],
+        previous_recipes: RecipeBook,
+    ) -> None:
+        """Keep deferred profile/custom recipes live until lazy submission finishes."""
+        pending_events = tuple(dict.fromkeys(
+            step.completion for step in steps.values()
+            if not getattr(step.completion, "done", False)
+        ))
+        if not pending_events:
+            execution.recipes = previous_recipes
+            return
+        active_submits = int(getattr(execution, "_t15_pending_submits", 0))
+        if active_submits == 0:
+            execution._t15_saved_recipes = previous_recipes
+        execution._t15_pending_submits = active_submits + 1
+        remaining = [len(pending_events)]
+
+        def _on_step_done(_ev, ex=execution, rem=remaining):
+            rem[0] -= 1
+            if rem[0] > 0:
+                return
+            left = max(0, int(getattr(ex, "_t15_pending_submits", 1)) - 1)
+            ex._t15_pending_submits = left
+            if left == 0 and hasattr(ex, "_t15_saved_recipes"):
+                ex.recipes = ex._t15_saved_recipes
+                delattr(ex, "_t15_saved_recipes")
+
+        for ev in pending_events:
+            execution.engine.on_complete(ev, _on_step_done, native_hook=True)
+
+    def _run_replicas(
+        self,
+        replica_ops: Mapping[int, Sequence[OpSpec]],
+        profile: UserProfile | None,
+        service_id: str | None,
+        *,
+        input_ready_ms: float = 0,
+        replay_scope: str = "none",
+        external_inputs: Mapping[str, Any] | None = None,
+        execution: Execution | None = None,
+        recipes: RecipeBook | None = None,
+        wait: bool = True,
+    ) -> tuple[dict[str, Any], Execution, dict[int, tuple[OpSpec, ...]]]:
         if (not isinstance(input_ready_ms, (int, float))
                 or isinstance(input_ready_ms, bool)
                 or not math.isfinite(float(input_ready_ms))
@@ -381,11 +743,11 @@ class ExecutionEnvironment:
             raise ModelingError("standalone_replay_scope_invalid")
         captured: list[dict[str, Any]] = []
 
-        def observe(original, replica, program, ready, complete):
+        def observe(original, obs_replica, program, ready, complete):
             captured.append({
                 "physical_id": original.op_id,
                 "operator": original.to_dict(),
-                "replica": replica, "program": program,
+                "replica": obs_replica, "program": program,
                 "ready": ready, "complete": complete,
             })
 
@@ -397,27 +759,47 @@ class ExecutionEnvironment:
         else:
             previous_observer = execution.on_operator
             previous_recipes = execution.recipes
+            if wait:
+                def observe_existing(original, obs_replica, program, ready, complete):
+                    if previous_observer is not None:
+                        previous_observer(original, obs_replica, program, ready, complete)
+                    observe(original, obs_replica, program, ready, complete)
 
-            def observe_existing(original, replica, program, ready, complete):
-                if previous_observer is not None:
-                    previous_observer(original, replica, program, ready, complete)
-                observe(original, replica, program, ready, complete)
-
-            execution.on_operator = observe_existing
+                execution.on_operator = observe_existing
+        iteration = getattr(execution, "_t15_submit_index", 0)
+        try:
+            setattr(execution, "_t15_submit_index", iteration + 1)
+        except (AttributeError, TypeError):
+            iteration = 0
+        defer_restore = borrowed and not wait
+        succeeded = False
         try:
             if recipes is not None:
-                execution.recipes = recipes
-            expanded, book = self._prepare(
-                ops, profile, service_id, execution, replay_scope=replay_scope,
-                replica=replica)
+                if borrowed and getattr(execution, "_t15_pending_submits", 0) > 0:
+                    pending_profiles = {
+                        k: v for k, v in previous_recipes.recipes.items()
+                        if k.startswith("user-profile:")
+                    }
+                    execution.recipes = _overlay_recipes(recipes, pending_profiles)
+                else:
+                    execution.recipes = recipes
+            expanded, book = self._prepare_replicas(
+                replica_ops, profile, service_id, execution,
+                replay_scope=replay_scope, iteration=iteration)
             execution.recipes = book
-            result = self._execute(
+            result = self._execute_replicas(
                 execution, expanded, input_ready_ms=input_ready_ms,
-                replay_scope=replay_scope, captured=captured, replica=replica,
-                external_inputs=external_inputs, wait=wait)
+                replay_scope=replay_scope, captured=captured,
+                external_inputs=external_inputs, wait=wait,
+                iteration=iteration)
+            if defer_restore and (profile is not None or recipes is not None):
+                self._register_deferred_recipe_restore(
+                    execution, result["steps"], previous_recipes)
+            succeeded = True
         finally:
-            if borrowed:
+            if borrowed and (not defer_restore or not succeeded):
                 execution.recipes = previous_recipes
+            if borrowed and wait:
                 execution.on_operator = previous_observer
         rows = ([{
             "physical_id": item["physical_id"], "operator": item["operator"],
@@ -433,63 +815,126 @@ class ExecutionEnvironment:
         })
         return result, execution, expanded
 
-    def operator_report(self, ops: Sequence[OpSpec], *,
-                        profile: UserProfile | None = None,
-                        service_id: str | None = None,
-                        input_ready_ms: float = 0,
-                        recipes: RecipeBook | None = None,
-                        replica: int = 0) -> dict[str, Any]:
-        self._validate(ops, allow_external_inputs=True)
+    def _run(self, ops: Sequence[OpSpec], profile: UserProfile | None,
+             service_id: str | None, *, input_ready_ms: float = 0,
+             replay_scope: str = "none", replica: int = 0,
+             external_inputs: Mapping[str, Any] | None = None,
+             execution: Execution | None = None,
+             recipes: RecipeBook | None = None, wait: bool = True
+             ) -> tuple[dict[str, Any], Execution, tuple[OpSpec, ...]]:
+        result, actual, expanded = self._run_replicas(
+            {replica: ops}, profile, service_id,
+            input_ready_ms=input_ready_ms, replay_scope=replay_scope,
+            external_inputs=external_inputs, execution=execution,
+            recipes=recipes, wait=wait)
+        return result, actual, expanded[replica]
+
+    def _operator_cohort_plan(
+        self,
+        replica_ops: Mapping[int, Sequence[OpSpec]],
+        recipes: RecipeBook | None,
+    ) -> dict[tuple[int, int], tuple[Any, dict[int, OpSpec]]]:
+        """Group complete cross-DP collective occurrences across replicas for isolated pricing."""
+        if len(replica_ops) <= 1:
+            return {}
+        has_candidate = any(
+            op.link_bytes > 0 or "group_axis" in dict(op.metadata)
+            for rep_ops in replica_ops.values()
+            for op in rep_ops
+        )
+        if not has_candidate:
+            return {}
+        from mindie_sim.prediction.sharding.local_tp import collective_requires_cohort
+
+        probe = self.execution(recipes=recipes)
+        seen_occ: dict[tuple[int, int, str], int] = {}
+        buckets: dict[tuple[tuple[int, ...], int, str, int], dict[int, tuple[int, OpSpec]]] = {}
+        for rep, rep_ops in replica_ops.items():
+            for idx, op in enumerate(rep_ops):
+                if not collective_requires_cohort(op, probe.topology):
+                    continue
+                peers = _collective_replica_group(op, rep, probe.topology)
+                coll_key = _collective_key(op)
+                occ_key = (rep, op.stage, coll_key)
+                occ = seen_occ.get(occ_key, 0)
+                seen_occ[occ_key] = occ + 1
+                buckets.setdefault((peers, op.stage, coll_key, occ), {})[rep] = (idx, op)
+        member_to_cohort: dict[tuple[int, int], tuple[Any, dict[int, OpSpec]]] = {}
+        for cohort_key, members in buckets.items():
+            peers = cohort_key[0]
+            if not set(peers) <= set(members):
+                continue
+            cohort_ops = {p: members[p][1] for p in peers}
+            for p in peers:
+                member_to_cohort[(p, members[p][0])] = (cohort_key, cohort_ops)
+        return member_to_cohort
+
+    def operator_report(
+        self,
+        ops: Sequence[OpSpec] | Mapping[int, Sequence[OpSpec] | OpSpec],
+        *,
+        profile: UserProfile | None = None,
+        service_id: str | None = None,
+        input_ready_ms: float = 0,
+        recipes: RecipeBook | None = None,
+        replica: int = 0,
+    ) -> dict[str, Any]:
+        replica_ops, multi_mapped = self._replica_ops(ops, replica=replica)
+        for rep_ops in replica_ops.values():
+            self._validate(rep_ops, allow_external_inputs=True)
+        member_to_cohort = self._operator_cohort_plan(replica_ops, recipes)
+        cohort_results: dict[Any, tuple[dict[str, Any], Execution]] = {}
         rows = []
         timeline = []
         total = 0.0
-        for op in ops:
-            isolated = replace(op, deps=())
-            result, execution, _ = self._run(
-                (isolated,), profile, service_id,
-                input_ready_ms=input_ready_ms, recipes=recipes, replica=replica)
-            physical = result["rows"]
-            if not physical:
-                raise ModelingError(
-                    "standalone_operator_produced_no_event:" + op.op_id)
-            start_ms = result["charge_ready_ms"]
-            complete_ms = result["complete_ms"]
-            duration = result["duration_ms"]
-            total += duration
-            events = []
-            for captured in physical:
-                operator = captured["operator"]
-                zero = operator.get("family") == "barrier"
-                events.append({
-                    **captured,
-                    "zero_work": zero,
-                    "serviced": {} if zero else None,
-                    "service_attribution": (
-                        "zero_work_sync" if zero else "call_aggregate_only"),
-                })
-            timeline.extend(events)
-            charge_event = next(
-                (event for event in events if not event["zero_work"]), events[0])
-            rows.append({
-                "physical_id": op.op_id,
-                "operator": op.to_dict(),
-                "occurrences": 1,
-                "program": (op.recipe or charge_event["program"]),
-                "duration_ms": duration,
-                "total_ms": duration,
-                "input_ready_ms": input_ready_ms,
-                "ready_ms": start_ms,
-                "complete_ms": complete_ms,
-                "serviced": result["serviced"],
-                "charge": "call",
-                "service_attribution": "call_terminal_once",
-                "physical_members": [event["physical_id"] for event in events],
-                "physical_event_count": len(events),
-                "physical_events": events,
-                "basis": execution.cost.summary(),
-                "runtime_uid": execution.engine.uid,
-                "live_tasks": execution.engine.summary()["live_tasks"],
-            })
+        all_ops: list[OpSpec] = []
+        for rep, rep_ops in replica_ops.items():
+            all_ops.extend(rep_ops)
+            for idx, op in enumerate(rep_ops):
+                cohort_info = member_to_cohort.get((rep, idx))
+                if cohort_info is not None:
+                    cohort_key, cohort_ops = cohort_info
+                    if cohort_key not in cohort_results:
+                        isolated_cohort = {
+                            p: (replace(peer_op, deps=()),)
+                            for p, peer_op in cohort_ops.items()
+                        }
+                        cohort_results[cohort_key] = self._run_replicas(
+                            isolated_cohort, profile, service_id,
+                            input_ready_ms=input_ready_ms, recipes=recipes,
+                        )[:2]
+                    result, execution = cohort_results[cohort_key]
+                    physical = [row for row in result["rows"] if row["replica"] == rep]
+                    ready_times = [
+                        row["ready_ms"] for row in physical
+                        if row["operator"].get("family") != "barrier"
+                    ]
+                    start_ms = min(ready_times) if ready_times else float(input_ready_ms)
+                    complete_ms = max(
+                        (row["complete_ms"] for row in physical),
+                        default=float(input_ready_ms),
+                    )
+                    duration = complete_ms - start_ms
+                else:
+                    isolated = replace(op, deps=())
+                    result, execution, _ = self._run(
+                        (isolated,), profile, service_id,
+                        input_ready_ms=input_ready_ms, recipes=recipes, replica=rep)
+                    physical = result["rows"]
+                    start_ms = result["charge_ready_ms"]
+                    complete_ms = result["complete_ms"]
+                    duration = result["duration_ms"]
+                if not physical:
+                    raise ModelingError(
+                        "standalone_operator_produced_no_event:" + op.op_id)
+                total += duration
+                row, events = _operator_report_row(
+                    op, rep, multi_mapped=multi_mapped, physical=physical,
+                    start_ms=start_ms, complete_ms=complete_ms, duration=duration,
+                    input_ready_ms=input_ready_ms, serviced=result["serviced"],
+                    execution=execution)
+                timeline.extend(events)
+                rows.append(row)
         return {
             "schema": "mindie-sim.operators/1",
             "boundary": "standalone_declared_device_programs",
@@ -497,54 +942,71 @@ class ExecutionEnvironment:
             "operator_events": len(timeline),
             "operator_sum_ms": total,
             "timeline": timeline,
-            "implementation_selections": _selection_records(ops),
+            "implementation_selections": _selection_records(all_ops),
             "operators": rows,
         }
 
-    def submit_graph(self, ops: Sequence[OpSpec], *,
-                     profile: UserProfile | None = None,
-                     service_id: str | None = None,
-                     input_ready_ms: float = 0,
-                     external_inputs: Mapping[str, Any] | None = None,
-                     execution: Execution | None = None,
-                     replica: int = 0,
-                     recipes: RecipeBook | None = None):
+    def submit_graph(
+        self,
+        ops: Sequence[OpSpec] | Mapping[int, Sequence[OpSpec] | OpSpec],
+        *,
+        profile: UserProfile | None = None,
+        service_id: str | None = None,
+        input_ready_ms: float = 0,
+        external_inputs: Mapping[str, Any] | None = None,
+        execution: Execution | None = None,
+        replica: int = 0,
+        recipes: RecipeBook | None = None,
+    ):
         """Submit one declared graph and return its real ScheduledIteration.
 
         Callers that compose in an existing Engine use the returned step and
         Execution handles; ``graph_report`` is the waiting/projection view of
         the same path.
         """
-        declaration = tuple(ops)
-        if not declaration:
+        replica_ops, mapped = self._replica_ops(ops, replica=replica)
+        if not replica_ops or not any(replica_ops.values()):
             raise ModelingError("standalone_graph_requires_op_spec_sequence")
         external = dict(external_inputs or {})
-        self._validate(declaration, allow_external_inputs=bool(external),
-                       external_keys=tuple(external))
-        result, actual, normalized = self._run(
-            declaration, profile, service_id, input_ready_ms=input_ready_ms,
-            replica=replica, external_inputs=external, execution=execution,
+        for rep_ops in replica_ops.values():
+            self._validate(rep_ops, allow_external_inputs=bool(external),
+                           external_keys=tuple(external))
+        result, actual, normalized = self._run_replicas(
+            replica_ops, profile, service_id, input_ready_ms=input_ready_ms,
+            external_inputs=external, execution=execution,
             recipes=recipes, wait=False)
-        return result["step"], actual, result, normalized
+        return (
+            result["steps"] if mapped else result["step"],
+            actual,
+            result,
+            normalized if mapped else normalized[replica],
+        )
 
-    def graph_report(self, ops: Sequence[OpSpec], *,
-                     profile: UserProfile | None = None,
-                     service_id: str | None = None,
-                     input_ready_ms: float = 0,
-                     external_inputs: Mapping[str, Any] | None = None,
-                     execution: Execution | None = None,
-                     replica: int = 0,
-                     recipes: RecipeBook | None = None) -> dict[str, Any]:
-        declaration = tuple(ops)
-        if not declaration:
+    def graph_report(
+        self,
+        ops: Sequence[OpSpec] | Mapping[int, Sequence[OpSpec] | OpSpec],
+        *,
+        profile: UserProfile | None = None,
+        service_id: str | None = None,
+        input_ready_ms: float = 0,
+        external_inputs: Mapping[str, Any] | None = None,
+        execution: Execution | None = None,
+        replica: int = 0,
+        recipes: RecipeBook | None = None,
+    ) -> dict[str, Any]:
+        replica_ops, _ = self._replica_ops(ops, replica=replica)
+        if not replica_ops or not any(replica_ops.values()):
             raise ModelingError("standalone_graph_requires_op_spec_sequence")
         external = dict(external_inputs or {})
-        self._validate(declaration, allow_external_inputs=bool(external),
-                       external_keys=tuple(external))
-        result, actual, normalized = self._run(
-            declaration, profile, service_id, input_ready_ms=input_ready_ms,
-            replica=replica, external_inputs=external, execution=execution,
-            recipes=recipes)
+        for rep_ops in replica_ops.values():
+            self._validate(rep_ops, allow_external_inputs=bool(external),
+                           external_keys=tuple(external))
+        result, actual, normalized_by_replica = self._run_replicas(
+            replica_ops, profile, service_id, input_ready_ms=input_ready_ms,
+            external_inputs=external, execution=execution, recipes=recipes)
+        all_normalized = tuple(
+            op for rep_ops in normalized_by_replica.values() for op in rep_ops
+        )
         return {
             "schema": "mindie-sim.graph/1",
             "boundary": "standalone_declared_graph",
@@ -552,6 +1014,7 @@ class ExecutionEnvironment:
             "input_ready_ms": input_ready_ms,
             "charge_ready_ms": result["charge_ready_ms"],
             "complete_ms": result["complete_ms"],
+            "replicas": list(replica_ops),
             "operator_occurrences": sum(
                 1 for row in result["rows"]
                 if row["operator"].get("family") != "barrier"),
@@ -568,10 +1031,10 @@ class ExecutionEnvironment:
                 for row in result["rows"]
             ],
             "zero_work_joins": result["joins"],
-            "implementation_selections": _selection_records(normalized),
+            "implementation_selections": _selection_records(all_normalized),
             "runtime_uid": actual.engine.uid,
             "execution": actual.summary(),
-            "operators": [op.to_dict() for op in normalized],
+            "operators": [op.to_dict() for op in all_normalized],
         }
 
     def call_report(self, ops: Sequence[OpSpec], *, invocations: int = 1,
@@ -581,6 +1044,8 @@ class ExecutionEnvironment:
                     max_operators: int = 8192,
                     recipes: RecipeBook | None = None,
                     replica: int = 0) -> dict[str, Any]:
+        if isinstance(ops, Mapping):
+            raise ModelingError("standalone_native_call_requires_op_spec_sequence")
         if not isinstance(invocations, int) or isinstance(invocations, bool) \
                 or invocations < 1:
             raise ModelingError("standalone_call_requires_positive_invocations")
@@ -590,7 +1055,8 @@ class ExecutionEnvironment:
                 or max_operators < 1):
             raise ModelingError(
                 "standalone_call_requires_positive_operator_budget")
-        declaration = tuple(ops)
+        replica_ops, _ = self._replica_ops(ops, replica=replica)
+        declaration = replica_ops[replica]
         if not declaration:
             raise ModelingError("standalone_native_call_requires_op_spec_sequence")
         self._validate(declaration, allow_external_inputs=False)
