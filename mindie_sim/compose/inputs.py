@@ -6,7 +6,7 @@
   draft structures before runtime synthesis in ``compose_case``.
 
 [Invariants]
-  * Hardware SKUs resolve strictly against registered Ascend, NVIDIA, or custom
+  * Hardware SKUs resolve strictly against registered Ascend or custom
     profiles; unknown identifiers raise ``ModelingError("unknown_hardware_sku:...")``.
   * Local JSON metadata reads are capped at 50 MiB.
   * Direct ``prepare_speculation`` synthesis of a 1-layer EAGLE3/GQA draft
@@ -34,7 +34,6 @@ from mindie_sim.backends.ascend import (
     ASCEND_TOPOLOGY_PRESETS,
     profiles as ascend_profiles,
 )
-from mindie_sim.backends.nvidia import profiles as nvidia_profiles
 from mindie_sim.catalog.specs import build_model_spec
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec, merge_source
 from mindie_sim.model_catalog import (
@@ -76,8 +75,6 @@ HARDWARE_ALIASES: dict[str, str] = {
     "a5": "Ascend950DT_9582", "950": "Ascend950DT_9582",
     "a5-pod": "Ascend950DT_9581", "atlas-950-superpod": "Ascend950DT_9581",
     "950pr_958b": "Ascend950PR_958b", "ascend950pr_958b": "Ascend950PR_958b",
-    "h20": "NVIDIA_H20", "h800": "NVIDIA_H800", "h200": "NVIDIA_H200",
-    "b300": "NVIDIA_B300",
     "800i-a2": "Ascend910B4", "a2-8p": "Ascend910B4",
     "800i-a3": "Ascend910_9392",
     "800i-a3-8p": "Ascend910_9392", "a3-8p": "Ascend910_9392",
@@ -392,7 +389,7 @@ def _format_quant_suggestions(raw: str) -> str:
 
 def resolve_hardware_sku(hardware: str) -> str:
     """Resolve a hardware alias or exact SKU name against registered profiles."""
-    reg = {**_ensure_registered_profiles(), **DERIVED_ASCEND_SKUS, **nvidia_profiles()}
+    reg = {**_ensure_registered_profiles(), **DERIVED_ASCEND_SKUS}
     if not isinstance(hardware, str) or not hardware.strip():
         raise ModelingError(f"unknown_hardware_sku:{hardware} — {_format_sku_suggestions(str(hardware), reg)}")
     raw = hardware.strip()
@@ -414,8 +411,6 @@ def resolve_hardware_sku(hardware: str) -> str:
 
 
 def _hardware_backend(sku: str) -> str:
-    if sku in nvidia_profiles():
-        return "nvidia"
     if sku in _ensure_registered_profiles() or sku in DERIVED_ASCEND_SKUS:
         return "ascend"
     from mindie_sim.custom_hardware import resolve_custom_hardware_sku

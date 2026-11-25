@@ -6,7 +6,7 @@
   mappings alongside explicit parallelism, workload, runtime, and SLO inputs.
 
 [Invariants]
-  * Hardware SKUs resolve against registered public Ascend and NVIDIA profiles;
+  * Hardware SKUs resolve against registered Ascend and custom profiles;
     topology aliases only add an explicit multi-tier preset.
   * Parallelism dimensions, structural overrides, and orthogonal compilation
     flags (``graph_capture_mode`` vs ``enable_torch_compile``/``enable_npugraph_ex``)
@@ -33,15 +33,8 @@ from mindie_sim.backends.ascend import (
     default_ranks_per_node,
     materialize as materialize_ascend,
 )
-from mindie_sim.backends.nvidia import materialize as materialize_nvidia
 from mindie_sim.catalog.draft_spec import canonical_speculative_method
 from mindie_sim.prediction.operators.mla_prolog import resolve_mla_preprocess_mode
-from mindie_sim.compose.assembly import (
-    _assembly_emit_counts,
-    _assembly_metric_rows,
-    _assembly_request_specs,
-    assemble,
-)
 from mindie_sim.compose.inputs import (
     DEFAULT_CONTEXT_TOKENS_FOR_QUANT,
     DERIVED_ASCEND_SKUS,
@@ -234,8 +227,6 @@ def _materialize_machine(
         machine = build_custom_hardware_machine(
             merged_spec, num_devices=resolved_devices, **custom_overrides,
         )
-    elif backend == "nvidia":
-        machine = materialize_nvidia(machine_input)
     elif sku in DERIVED_ASCEND_SKUS:
         from mindie_sim.hardware_derivation import derive_hardware_sku
         spec = DERIVED_ASCEND_SKUS[sku]
@@ -2522,7 +2513,6 @@ __all__ = [
     "HARDWARE_TOPOLOGY_ALIASES",
     "VA_RECOMMENDED_PROFILES",
     "apply_va_recommended",
-    "assemble",
     "capture_keys",
     "compose_case",
     "prepare_speculation",

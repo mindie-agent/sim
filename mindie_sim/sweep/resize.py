@@ -24,10 +24,6 @@ from mindie_sim.backends.ascend import (
     materialize as ascend_materialize,
     profiles as ascend_profiles,
 )
-from mindie_sim.backends.nvidia import (
-    materialize as nvidia_materialize,
-    profiles as nvidia_profiles,
-)
 from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
@@ -460,100 +456,72 @@ def materialize_machine_for_devices(
     ranks_per_node = resolve_ranks_per_node(parsed, num_devices)
     sku = parsed.machine.sku
     assumptions = dict(getattr(parsed.machine, "assumptions", ()) or ())
-    derived = sku not in ascend_profiles() and sku not in nvidia_profiles()
-    base_sku = (str(assumptions.get("derivation.base") or "")
-                if derived else sku)
-    is_ascend = bool(base_sku and base_sku in ascend_profiles())
-    is_nvidia = bool(base_sku and base_sku in nvidia_profiles())
-    if derived and not (is_ascend or is_nvidia):
+    profiles = ascend_profiles()
+    derived = sku not in profiles
+    base_sku = str(assumptions.get("derivation.base") or "") if derived else sku
+    if base_sku not in profiles:
         raise ModelingError(f"resize_base_sku_unregistered:{sku}")
-    if is_ascend or is_nvidia:
-        raw_machine: dict[str, Any] = {
-            "backend": "ascend" if is_ascend else "nvidia",
-            "name": parsed.machine.name,
-            "hardware_key": parsed.machine.hardware_key,
-            "sku": base_sku,
-            "num_devices": num_devices,
-            "ranks_per_node": ranks_per_node,
-            "dies_per_package": parsed.machine.dies_per_package,
-            "device": base_device,
-        }
-        raw_machine.update({key: deepcopy(value) for key, value in
-                            getattr(parsed.machine, "topology_options", ())})
-        links = _first_link_by_channel(parsed.machine)
-        channels: dict[str, dict[str, Any]] = {}
-        for name, value in getattr(parsed.machine, "transfer_channels", ()):
-            if name in GENERATED_CHANNELS:
-                continue
-            projected = project_transfer_channel_input(
-                dict(value), links.get(name), materialized=True)
-            if projected is not None:
-                channels[name] = projected
-        for name, link in links.items():
-            if name in channels:
-                continue
-            projected = project_transfer_channel_input({}, link,
-                                                       materialized=True)
-            if projected is not None:
-                channels[name] = projected
-        if channels:
-            raw_machine["transfer_channels"] = channels
-        if getattr(parsed.machine, "collective_protocols", None):
-            raw_machine["collective_protocols"] = dict(
-                parsed.machine.collective_protocols)
-        if isinstance(raw_case, Mapping) and isinstance(
-                raw_case.get("machine"), Mapping):
-            source_machine = raw_case["machine"]
-            for key in PRESERVED_TOPOLOGY_OVERRIDE_KEYS:
+    raw_machine: dict[str, Any] = {
+        "backend": "ascend",
+        "name": parsed.machine.name,
+        "hardware_key": parsed.machine.hardware_key,
+        "sku": base_sku,
+        "num_devices": num_devices,
+        "ranks_per_node": ranks_per_node,
+        "dies_per_package": parsed.machine.dies_per_package,
+        "device": base_device,
+    }
+    raw_machine.update({key: deepcopy(value) for key, value in
+                        getattr(parsed.machine, "topology_options", ())})
+    links = _first_link_by_channel(parsed.machine)
+    channels: dict[str, dict[str, Any]] = {}
+    for name, value in getattr(parsed.machine, "transfer_channels", ()):
+        if name in GENERATED_CHANNELS:
+            continue
+        projected = project_transfer_channel_input(
+            dict(value), links.get(name), materialized=True)
+        if projected is not None:
+            channels[name] = projected
+    for name, link in links.items():
+        if name in channels:
+            continue
+        projected = project_transfer_channel_input({}, link,
+                                                   materialized=True)
+        if projected is not None:
+            channels[name] = projected
+    if channels:
+        raw_machine["transfer_channels"] = channels
+    if getattr(parsed.machine, "collective_protocols", None):
+        raw_machine["collective_protocols"] = dict(
+            parsed.machine.collective_protocols)
+    if isinstance(raw_case, Mapping) and isinstance(
+            raw_case.get("machine"), Mapping):
+        source_machine = raw_case["machine"]
+        for key in PRESERVED_TOPOLOGY_OVERRIDE_KEYS:
+            if key in source_machine and source_machine[key] is not None:
+                raw_machine[key] = deepcopy(source_machine[key])
+        if "links" not in source_machine:
+            for key in TRANSFER_OVERRIDE_KEYS:
                 if key in source_machine and source_machine[key] is not None:
                     raw_machine[key] = deepcopy(source_machine[key])
-            if "links" not in source_machine:
-                for key in TRANSFER_OVERRIDE_KEYS:
-                    if key in source_machine and source_machine[key] is not None:
-                        raw_machine[key] = deepcopy(source_machine[key])
-                source_channels = source_machine.get("transfer_channels")
-                if isinstance(source_channels, Mapping):
-                    for name, value in source_channels.items():
-                        if name in GENERATED_CHANNELS or not isinstance(
-                                value, Mapping):
-                            continue
-                        projected = project_transfer_channel_input(
-                            value, links.get(name), materialized=False)
-                        if projected is not None:
-                            channels[name] = projected
-                if channels:
-                    raw_machine["transfer_channels"] = channels
-        materializer = ascend_materialize if is_ascend else nvidia_materialize
-        materialized = dict(materializer(raw_machine))
-        if derived:
-            materialized.update({
-                "name": parsed.machine.name,
-                "sku": sku,
-                "hardware_key": parsed.machine.hardware_key,
-                "assumptions": assumptions,
-            })
-        return Hardware.from_mapping(materialized)
-
-    machine_dict = deepcopy(parsed.machine.to_dict())
-    machine_dict["num_devices"] = num_devices
-    machine_dict["ranks_per_node"] = ranks_per_node
-    machine_dict["devices"] = [
-        {**deepcopy(base_device), "rank": index}
-        for index in range(num_devices)
-    ]
-    new_links = []
-    for link in machine_dict.get("links", ()):
-        copied = deepcopy(link)
-        members = list(copied.get("members", ()))
-        copied["members"] = (list(range(num_devices))
-                             if len(members) == original_count
-                             else [item for item in members
-                                   if item < num_devices])
-        if len(copied["members"]) > 1 or num_devices == 1:
-            new_links.append(copied)
-    if not new_links and num_devices > 1 and machine_dict.get("links"):
-        fallback = deepcopy(machine_dict["links"][0])
-        fallback["members"] = list(range(num_devices))
-        new_links.append(fallback)
-    machine_dict["links"] = new_links
-    return Hardware.from_mapping(machine_dict)
+            source_channels = source_machine.get("transfer_channels")
+            if isinstance(source_channels, Mapping):
+                for name, value in source_channels.items():
+                    if name in GENERATED_CHANNELS or not isinstance(
+                            value, Mapping):
+                        continue
+                    projected = project_transfer_channel_input(
+                        value, links.get(name), materialized=False)
+                    if projected is not None:
+                        channels[name] = projected
+            if channels:
+                raw_machine["transfer_channels"] = channels
+    materialized = dict(ascend_materialize(raw_machine))
+    if derived:
+        materialized.update({
+            "name": parsed.machine.name,
+            "sku": sku,
+            "hardware_key": parsed.machine.hardware_key,
+            "assumptions": assumptions,
+        })
+    return Hardware.from_mapping(materialized)

@@ -513,7 +513,6 @@ def _dispatch_catalog(args: argparse.Namespace) -> object:
     out: dict[str, Any] = {"schema": "mindie-sim.catalog/1"}
     if want_hw:
         from mindie_sim.backends.ascend import profiles as ascend_profiles
-        from mindie_sim.backends.nvidia import profiles as nvidia_profiles
         from mindie_sim.compose.inputs import (
             BYTES_PER_GIB,
             DERIVED_ASCEND_SKUS,
@@ -531,8 +530,7 @@ def _dispatch_catalog(args: argparse.Namespace) -> object:
             if tag not in aliases_by_sku.setdefault(target, []):
                 aliases_by_sku[target].append(tag)
         skus: list[dict[str, Any]] = []
-        reg = {**ascend_profiles(), **nvidia_profiles()}
-        for sku_name, prof in sorted(reg.items()):
+        for sku_name, prof in sorted(ascend_profiles().items()):
             dev = prof.get("device") or {}
             mem_b = float(dev.get("memory_bytes") or 0.0)
             hbm_bps = float((dev.get("rates") or {}).get("memory") or 0.0)

@@ -265,13 +265,12 @@ def _load_rewrite_plan(path: str | Path | None) -> Any:
 
 def _estimate_auto_num_devices(model_spec: Any, sku: str, weight_quant: str | None) -> int:
     from mindie_sim.backends.ascend import profiles as ascend_profiles
-    from mindie_sim.backends.nvidia import profiles as nvidia_profiles
     from mindie_sim.catalog.quant import QUANTIZATION_PRESETS, quant_preset
     from mindie_sim.catalog.types import QuantSpec
     from mindie_sim.catalog.weights import sharded_weight_bytes
     from mindie_sim.schema.parallel import ParallelSpec
 
-    entry = {**ascend_profiles(), **DERIVED_ASCEND_SKUS, **nvidia_profiles()}.get(sku, {})
+    entry = {**ascend_profiles(), **DERIVED_ASCEND_SKUS}.get(sku, {})
     raw_mem = entry.get("memory_bytes") or (entry.get("device") or {}).get("memory_bytes")
     if not raw_mem or float(raw_mem) <= 0.0:
         raise ModelingError(f"missing_device_memory_bytes:{sku}")
