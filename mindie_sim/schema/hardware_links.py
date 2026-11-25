@@ -26,6 +26,8 @@ BYTES_PER_S_TO_BYTES_PER_MS = 1.0 / 1000.0
 
 VALID_LINK_SCOPES = frozenset({"package", "node", "cross_node", "host"})
 VALID_BAND_STARTUP_SCOPES = frozenset({"collective", "phase", "hop"})
+DEFAULT_SHORT_FINAL_FRAME_POLICY = "exact_plus_header"
+VALID_SHORT_FINAL_FRAME_POLICIES = frozenset({"exact_plus_header", "pad_full_frame"})
 
 _NETWORK_OVERRIDE_CHANNELS = {
     "inter_node": frozenset({"d2d_inter_node", "inter_node"}),
@@ -37,6 +39,7 @@ _PRESERVED_TOPOLOGY_KEYS = (
     "intra_bw_4p_gbps", "intra_bw_8p_gbps", "superpod_size", "max_dies",
     "superpod_bw_gbps", "inter_pod_bw_gbps", "superpod_latency_us",
     "inter_pod_latency_us", "topology_preset", "physical_ranks_per_node",
+    "ranks_per_node_explicit",
 )
 _BAND_WILDCARDS = frozenset({"*", "any", "all"})
 _BAND_STACK_WILDCARDS = frozenset({"*", "default"})
@@ -84,6 +87,7 @@ class CollectiveBandSpec:
     wire_bytes_per_frame: int
     credit_bytes: int
     evidence_id: str
+    short_final_frame_policy: str = DEFAULT_SHORT_FINAL_FRAME_POLICY
 
     def __post_init__(self) -> None:
         raw_coll = _band_str(self.collective, "collective").lower()
@@ -127,6 +131,10 @@ class CollectiveBandSpec:
         object.__setattr__(self, "wire_bytes_per_frame", wframe)
         object.__setattr__(self, "credit_bytes", _band_nonneg_int(self.credit_bytes, "credit_bytes"))
         object.__setattr__(self, "evidence_id", _band_str(self.evidence_id, "evidence_id"))
+        frame_policy = _band_str(self.short_final_frame_policy, "short_final_frame_policy").lower()
+        if frame_policy not in VALID_SHORT_FINAL_FRAME_POLICIES:
+            raise ModelingError(f"collective_band_short_final_frame_policy_invalid:{frame_policy}")
+        object.__setattr__(self, "short_final_frame_policy", frame_policy)
 
     @property
     def selector_key(self) -> tuple[str, str, str, int, int, str]:
@@ -144,10 +152,26 @@ class CollectiveBandSpec:
 
     def wire_bytes_for(self, payload_bytes: float) -> tuple[float, int]:
         """Frame ``payload_bytes`` into exact protocol frames and wire bytes."""
-        if payload_bytes <= 0.0:
+        if type(payload_bytes) is int:
+            if payload_bytes <= 0:
+                return 0.0, 0
+            frames = (payload_bytes + self.payload_bytes_per_frame - 1) // self.payload_bytes_per_frame
+            if self.short_final_frame_policy == "pad_full_frame":
+                return float(frames * self.wire_bytes_per_frame), frames
+            header_per_frame = self.wire_bytes_per_frame - self.payload_bytes_per_frame
+            return float(payload_bytes + frames * header_per_frame), frames
+        payload = float(payload_bytes)
+        if payload <= 0.0:
             return 0.0, 0
-        frames = max(1, math.ceil(float(payload_bytes) / float(self.payload_bytes_per_frame)))
-        return float(frames * self.wire_bytes_per_frame), frames
+        if payload.is_integer():
+            exact = int(payload)
+            frames = (exact + self.payload_bytes_per_frame - 1) // self.payload_bytes_per_frame
+        else:
+            frames = max(1, math.ceil(payload / float(self.payload_bytes_per_frame) - 1e-12))
+        if self.short_final_frame_policy == "pad_full_frame":
+            return float(frames * self.wire_bytes_per_frame), frames
+        header_per_frame = self.wire_bytes_per_frame - self.payload_bytes_per_frame
+        return float(payload + frames * header_per_frame), frames
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> CollectiveBandSpec:
@@ -170,10 +194,11 @@ class CollectiveBandSpec:
             wire_bytes_per_frame=raw.get("wire_bytes_per_frame", 1024),
             credit_bytes=raw.get("credit_bytes", 0),
             evidence_id=raw.get("evidence_id", "undeclared"),
+            short_final_frame_policy=raw.get("short_final_frame_policy", DEFAULT_SHORT_FINAL_FRAME_POLICY),
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "collective": self.collective,
             "stack_id": self.stack_id,
             "topology_scope": self.topology_scope,
@@ -191,6 +216,9 @@ class CollectiveBandSpec:
             "credit_bytes": self.credit_bytes,
             "evidence_id": self.evidence_id,
         }
+        if self.short_final_frame_policy != DEFAULT_SHORT_FINAL_FRAME_POLICY:
+            result["short_final_frame_policy"] = self.short_final_frame_policy
+        return result
 
 
 def validate_protocol_bands(bands: Sequence[CollectiveBandSpec]) -> tuple[CollectiveBandSpec, ...]:
@@ -650,11 +678,13 @@ __all__ = [
     "COLLECTIVE_PROTOCOL_KEYS",
     "COLLECTIVE_PROTOCOL_VALUES",
     "CollectiveBandSpec",
+    "DEFAULT_SHORT_FINAL_FRAME_POLICY",
     "GBPS_TO_BYTES_PER_MS",
     "Link",
     "UNCALIBRATED_SKU_WARNING",
     "VALID_BAND_STARTUP_SCOPES",
     "VALID_LINK_SCOPES",
+    "VALID_SHORT_FINAL_FRAME_POLICIES",
     "_PRESERVED_TOPOLOGY_KEYS",
     "_collective_protocols",
     "_network_override_keys",

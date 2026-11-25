@@ -35,6 +35,7 @@ _FAULT_UNIT_IDX = 2
 _INITIAL_SCRATCH_CAP = 64
 _SCRATCH_GROWTH_FACTOR = 2
 _MIN_UNIT_COUNT = 1
+_MAX_NATIVE_COHORT = 2_147_483_647
 
 _NATIVE_FN_CACHE: dict[str, object] = {}
 _NATIVE_FN_LOCK = threading.Lock()
@@ -224,6 +225,8 @@ def fast_single_tier_coupled_c(
         task = tasks[key]
         buf.task_coupled[ti] = _MIN_UNIT_COUNT if task.coupled else _FAULT_OK
         cohort = int(task.cohort_size or _MIN_UNIT_COUNT)
+        if cohort > _MAX_NATIVE_COHORT:
+            return fast_single_tier_coupled_py(resources, tasks, active)
         buf.task_cohort[ti] = cohort if cohort >= _MIN_UNIT_COUNT else _MIN_UNIT_COUNT
         buf.task_link_off[ti] = li
         pl = task.placement
@@ -497,7 +500,7 @@ def _fold_private_slot(pc_append, flow_limits, name: str, u: int, u_cap: float, 
             flow_limits[f_idx] = math.nextafter(flow_limits[f_idx], 0.0)
 
 
-def _partition_capacity_slots(res_info, flow_limits):
+def _partition_capacity_slots(res_info, flow_limits, s_unp):
     shared_units = []
     su_append = shared_units.append
     private_checks: list[tuple[str, int, float, int, float]] = []
@@ -506,8 +509,13 @@ def _partition_capacity_slots(res_info, flow_limits):
         fslot, umap, has_unplaced = sbox
         if umap is None:
             if type(fslot) is tuple:
+                s_unp[fslot[2]] = False
                 _fold_private_slot(pc_append, flow_limits, name, 0, u_cap, fslot)
             elif fslot is not None:
+                # All ``cnt`` units carry identical contenders and saturate
+                # simultaneously; collapsed spans cannot redistribute.
+                for _f_idx, _w, s_id in fslot:
+                    s_unp[s_id] = False
                 su_append((name, 0, u_cap, sat_tol, bind_thresh, fslot, False))
             continue
         if fslot is None:
@@ -839,7 +847,7 @@ def fast_single_tier_coupled_py(resources, tasks, active) -> dict[str, dict[int,
     if not flow_keys:
         return {}
 
-    private_checks, shared_units = _partition_capacity_slots(res_info, flow_limits)
+    private_checks, shared_units = _partition_capacity_slots(res_info, flow_limits, span_meta[3])
     binding_units, shared_to_bind = _binding_capacity_slots(shared_units, flow_limits)
     if binding_units:
         alphas, bind_to_rem, committed = _solve_binding_slots(binding_units, flow_limits, span_meta)
@@ -850,10 +858,10 @@ def fast_single_tier_coupled_py(resources, tasks, active) -> dict[str, dict[int,
     for name, u, cap, f_idx, w in private_checks:
         if alphas[f_idx] * w > cap:
             raise AssertionError(f"unit_service_overallocated:{name}:{u}")
-    for s_idx, (name, u, cap, _sat_tol, _bind_thresh, terms, _fb) in enumerate(shared_units):
+    for s_idx, (name, u, cap, _sat_tol, _bind_thresh, terms, fb) in enumerate(shared_units):
         b_idx = shared_to_bind[s_idx]
         r_idx = bind_to_rem[b_idx] if b_idx >= 0 else -1
-        if r_idx >= 0:
+        if fb and r_idx >= 0:
             vals = committed[r_idx]
             n_t = len(vals)
             tot_u = vals[0] if n_t == 1 else (vals[0] + vals[1] if n_t == 2 else fsum(vals))
@@ -873,9 +881,12 @@ def fast_single_tier_coupled_py(resources, tasks, active) -> dict[str, dict[int,
             continue
         key = flow_keys[f_idx]
         for name, demand in flow_rates[f_idx]:
+            rate = alpha * demand
+            if rate <= 0.0:
+                continue
             target = result.get(name)
             if target is None:
-                result[name] = {key: alpha * demand}
+                result[name] = {key: rate}
             else:
-                target[key] = target.get(key, 0.0) + alpha * demand
+                target[key] = target.get(key, 0.0) + rate
     return result

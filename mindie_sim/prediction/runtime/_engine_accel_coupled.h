@@ -610,6 +610,7 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                 msim_fc_node *nd = &nodes[r_fhead[r]];
                 int32_t f_idx = nd->flow;
                 double w = nd->w;
+                flow_spans[nd->span].unplaced = 0;
                 if (n_priv >= cap_priv) {
                     int32_t ncap = cap_priv > 0 ? (cap_priv * 2) : 64;
                     msim_fc_priv *next = (msim_fc_priv *)realloc(privs, (size_t)ncap * sizeof(msim_fc_priv));
@@ -626,7 +627,9 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
                 }
             } else if (fcnt > 1) {
                 int32_t start = n_terms, nd;
+                /* All cnt units share identical contenders and saturate together. */
                 for (nd = r_fhead[r]; nd >= 0; nd = nodes[nd].next) {
+                    flow_spans[nodes[nd].span].unplaced = 0;
                     if (!msim_fc_push_term(&terms, &n_terms, &cap_terms,
                                            nodes[nd].flow, nodes[nd].span, nodes[nd].w)) {
                         out_fault[0] = 3; rc = -1; goto cleanup;
@@ -1195,7 +1198,7 @@ MSIM_EXPORT int32_t msim_fast_single_tier_coupled(
         int32_t b_idx = shared_to_bind != NULL ? shared_to_bind[i] : -1;
         int32_t r_idx = (b_idx >= 0 && bind_to_rem != NULL) ? bind_to_rem[b_idx] : -1;
         double tot_u;
-        if (r_idx >= 0) {
+        if (su->force_bind && r_idx >= 0) {
             const double *cs = committed + comm_off[r_idx];
             int32_t cnt_c = rem_units[r_idx].count;
             tot_u = (cnt_c == 1) ? cs[0] : (cnt_c == 2 ? (cs[0] + cs[1]) : msim_fsum(cs, cnt_c));

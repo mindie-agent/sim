@@ -305,7 +305,14 @@ def _store_cache_aware(builder, name, deps, rows, width, region, fmt, row_bytes,
     hbm_bytes = result.hbm_bytes
     source_scope = "on_chip_not_HBM"
     if source_residency != "on_chip":
-        hbm_bytes += source
+        line_bytes = resolved_state.geometry.line_bytes
+        if source > 0:
+            rounded_source = (
+                ((source + line_bytes - 1) // line_bytes) * line_bytes
+                if type(source) is int
+                else ceil(source / line_bytes) * line_bytes
+            )
+            hbm_bytes += rounded_source
         source_scope = "unresolved_source_read_counted_in_HBM"
     metadata = _access_metadata(
         result, resolution, fmt, row_bytes, resolved_state.geometry, region,

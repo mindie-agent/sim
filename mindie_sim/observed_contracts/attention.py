@@ -57,13 +57,15 @@ MQSMLA_NATIVE_RECORDS = {
     ("int8", MQSMLA_FP8_ROW_BYTES),
 }
 MQSMLA_COMPRESSED_INPUT_COUNT = 10
-LEGACY_MQSMLA_CANONICAL_KIND = "MqsmlaKernel___call__"
-LEGACY_MQSMLA_KINDS = frozenset({LEGACY_MQSMLA_CANONICAL_KIND, "MqsmlaKernel"})
+DSL_MQSMLA_NATIVE_KIND = "tilelang_dsl.mixed_quant_sparse_flash_mla"
+DSL_MQSMLA_KINDS = frozenset({
+    DSL_MQSMLA_NATIVE_KIND, "MqsmlaKernel___call__", "MqsmlaKernel",
+})
 ACLNN_MQSMLA_CANONICAL_KIND = "aclnnMixedQuantSparseFlashMla"
 ACLNN_MQSMLA_KINDS = frozenset({
     ACLNN_MQSMLA_CANONICAL_KIND, "MixedQuantSparseFlashMla",
 })
-MQSMLA_KINDS = LEGACY_MQSMLA_KINDS | ACLNN_MQSMLA_KINDS
+MQSMLA_KINDS = DSL_MQSMLA_KINDS | ACLNN_MQSMLA_KINDS
 MLA_PROLOG_INPUT_ARITIES = frozenset({21})
 MLA_PROLOG_OUTPUT_ARITIES = frozenset({7})
 
@@ -94,7 +96,7 @@ _ARITIES = {
 }
 # Mixed-quant sparse MLA profile slots: original-only 7/8 inputs,
 # compressed cache 10/11/12 inputs, one or two outputs.
-_ARITIES.update({kind: (MQSMLA_INPUT_COUNTS, MQSMLA_OUTPUT_COUNTS) for kind in LEGACY_MQSMLA_KINDS})
+_ARITIES.update({kind: (MQSMLA_INPUT_COUNTS, MQSMLA_OUTPUT_COUNTS) for kind in DSL_MQSMLA_KINDS})
 _ARITIES.update({kind: ({MQSMLA_NATIVE_INPUT_COUNT}, {2}) for kind in ACLNN_MQSMLA_KINDS})
 ATTENTION_CACHE_TYPES = frozenset(_ARITIES) | {"PaMlaAttention"}
 
@@ -296,7 +298,7 @@ def _mqsmla_attention(kind, inputs, outputs):
             return None
         compressed_width = original[0][-1]
     else:
-        canonical_kind = LEGACY_MQSMLA_CANONICAL_KIND
+        canonical_kind = DSL_MQSMLA_NATIVE_KIND
         original, table = inputs[2:4]
         compressed, compressed_table = (inputs[7:9] if len(inputs) >= MQSMLA_COMPRESSED_INPUT_COUNT
                                         else (empty, empty))
@@ -308,7 +310,7 @@ def _mqsmla_attention(kind, inputs, outputs):
         return None
     compressed_head = empty
     if (compressed != empty or compressed_table != empty
-            or (kind in LEGACY_MQSMLA_KINDS and len(inputs) >= MQSMLA_COMPRESSED_INPUT_COUNT)):
+            or (kind in DSL_MQSMLA_KINDS and len(inputs) >= MQSMLA_COMPRESSED_INPUT_COUNT)):
         if (not _nd_tensor(compressed, MQSMLA_CACHE_RANK, {original[1]})
                 or compressed[0][-2:] != (1, compressed_width)
                 or not _nd_tensor(compressed_table, 2, {"int32"})):

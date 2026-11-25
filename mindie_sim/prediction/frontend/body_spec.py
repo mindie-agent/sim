@@ -255,7 +255,8 @@ class LowRankHyperConnection:
             dtype=model.activation_dtype, family="rmsnorm",
             recipe="grouped_gemma_rmsnorm", shape=(tokens, hc_dim),
             read_bytes_override=(tokens * hc_dim + hc_dim) * act_bytes,
-            write_bytes_override=tokens * hc_dim * act_bytes, **common)
+            write_bytes_override=tokens * hc_dim * act_bytes,
+            metadata=(("hc_mult", hc), ("hidden_size", h)), **common)
         hc_down_inject = gemm_op(
             op_id=c["prefix"] + ".hc_down_inject", deps=(hc_norm.op_id,),
             m=tokens, n=down_out, k=hc_dim, quant=model.quant, category="linear_param_bf16",
@@ -338,7 +339,8 @@ def lowrank_hyper_final_mixer(*, prefix, deps, stage, requests, tokens, model, m
         dtype=model.activation_dtype, family="rmsnorm",
         recipe="grouped_gemma_rmsnorm", shape=(tokens, hc_dim),
         read_bytes_override=(tokens * hc_dim + hc_dim) * act_bytes,
-        write_bytes_override=tokens * hc_dim * act_bytes, **common)
+        write_bytes_override=tokens * hc_dim * act_bytes,
+        metadata=(("hc_mult", hc), ("hidden_size", h)), **common)
     hc_head_down = gemm_op(
         op_id=prefix + ".hc_head_down", deps=(hc_head_norm.op_id,),
         m=tokens, n=lr, k=hc_dim, quant=model.quant, category="linear_param_bf16",

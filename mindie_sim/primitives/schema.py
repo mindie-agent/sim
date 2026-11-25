@@ -479,7 +479,10 @@ class _FramedCollectiveBand(CollectiveBandSpec):
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> _FramedCollectiveBand:
         base = CollectiveBandSpec.from_mapping(raw)
-        return cls(**base.to_dict(), short_final_frame_policy=raw.get("short_final_frame_policy", "exact_plus_header"))
+        return cls(**{
+            **base.to_dict(),
+            "short_final_frame_policy": raw.get("short_final_frame_policy", "exact_plus_header"),
+        })
 
     def wire_bytes_for(self, payload_bytes: float) -> tuple[int, int]:
         if isinstance(payload_bytes, float) and payload_bytes.is_integer():
