@@ -14,9 +14,12 @@ Upstream-ABI: aclnnRingAttentionUpdateV2
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from math import ceil
+from typing import Literal
 
+from mindie_sim.backends.abi_registry import default_abi_registry
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
@@ -37,6 +40,8 @@ from ...runtime.memory_physics import (
 from ..attention.common import ARCH35, BF16_BYTES, FP32_BYTES
 from ..contracts import OperatorPlanningContext
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+
 RING_UPDATE_ABI = "aclnnRingAttentionUpdateV2"
 RING_UPDATE_RECIPE = "ring_attention_update_v2"
 STATS_WIDTH = 8
@@ -45,6 +50,8 @@ INPUT_STATS_TENSORS = 4
 OUTPUT_STATS_TENSORS = 2
 ATTN_ELEM_OPS = 6  # 2 FP32 upcasts + 2 muls + 1 add + 1 BF16 downcast (ring_attention_update_tnd.h:298)
 STATS_LANE_OPS = 8  # max + 2*(sub+exp+mul) + add + 2*div (ring_attention_update_tnd.h:210)
+_RING_UPDATE_SUPPORTED_DTYPES = frozenset({"fp16", "bf16", "fp32"})
+_ARCH22_TND_HEAD_DIM_ALIGN = 64
 
 RING_UPDATE_SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
@@ -66,6 +73,7 @@ RING_UPDATE_SOURCES: tuple[SourceRef, ...] = (
         source_sha256="b01e22be9695fc97df35650abd7f061ad7580cdef275a33d37c7a340e477e943",
     ),
 )
+SOURCES: tuple[SourceRef, ...] = RING_UPDATE_SOURCES
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,11 +88,48 @@ class RingUpdateContract:
         for name, val in (("tokens", self.tokens), ("num_heads", self.num_heads), ("head_dim", self.head_dim)):
             if type(val) is not int or val < 0:
                 raise ModelingError(f"ring_update_invalid_{name}:{val!r}")
+        dtype_norm = str(self.dtype or "").strip().lower()
+        if dtype_norm not in _RING_UPDATE_SUPPORTED_DTYPES:
+            raise ModelingError(f"ring_update_unsupported_dtype:{self.dtype!r}")
+        object.__setattr__(self, "dtype", dtype_norm)
 
 
 def _l2_capacity_bytes(ctx: OperatorPlanningContext) -> int:
     hierarchy = getattr(ctx.geometry.physical_mechanisms, "memory_hierarchy", None)
     return int(getattr(hierarchy, "effective_l2_bytes", ctx.geometry.buffers.get("l2", 0)) or 0)
+
+
+def _apportion_bytes(total: int, counts: Sequence[int]) -> tuple[int, ...]:
+    """Distribute exact integer bytes across active AIVs without rounding drift."""
+    total_units = sum(counts)
+    if total <= 0 or total_units <= 0:
+        return (0,) * len(counts)
+    shares = [(total * count) // total_units for count in counts]
+    remainder = total - sum(shares)
+    for idx in range(remainder):
+        shares[idx] += 1
+    return tuple(shares)
+
+
+def _apportion_hbm_l2(
+    total_hbm: int, total_l2: int, counts: Sequence[int],
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Distribute HBM and L2 bytes conserving aggregate totals and per-AIV sums."""
+    aiv_total = _apportion_bytes(total_hbm + total_l2, counts)
+    aiv_l2 = list(_apportion_bytes(total_l2, counts))
+    overflow = 0
+    for idx, (tot, l2_val) in enumerate(zip(aiv_total, aiv_l2)):
+        if l2_val > tot:
+            overflow += l2_val - tot
+            aiv_l2[idx] = tot
+    for idx in range(len(aiv_l2)):
+        if overflow <= 0:
+            break
+        add = min(aiv_total[idx] - aiv_l2[idx], overflow)
+        aiv_l2[idx] += add
+        overflow -= add
+    aiv_hbm = tuple(tot - l2_val for tot, l2_val in zip(aiv_total, aiv_l2))
+    return aiv_hbm, tuple(aiv_l2)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,8 +139,8 @@ class _RingUpdateProgram:
     aiv_read: str
     per_unit_read: int
     per_unit_write: int
-    per_unit_hbm: int
-    per_unit_l2: int
+    aiv_hbm: tuple[int, ...]
+    aiv_l2: tuple[int, ...]
     per_unit_vec: int
 
     def __call__(self, ctx: RecipeContext) -> KernelProgram | ParallelProgram:
@@ -105,8 +150,8 @@ class _RingUpdateProgram:
                 continue
             r_b = units * self.per_unit_read
             w_b = units * self.per_unit_write
-            h_b = units * self.per_unit_hbm
-            l_b = units * self.per_unit_l2
+            h_b = self.aiv_hbm[aiv_id]
+            l_b = self.aiv_l2[aiv_id]
             v_ops = units * self.per_unit_vec
             w = Work(resources={
                 self.aiv_read: r_b,
@@ -138,6 +183,8 @@ def build_ring_update(op: OpSpec, geometry: Geometry | OperatorPlanningContext) 
         shape = op.local_shape or op.semantic_shape
         contract = RingUpdateContract(int(shape[0]), int(shape[1]), int(shape[2]), dtype=op.dtype or "bf16")
     is_arch35 = ctx.compute_arch.arch_id == ARCH35
+    if not is_arch35 and contract.head_dim % _ARCH22_TND_HEAD_DIM_ALIGN != 0:
+        raise ModelingError(f"ring_update_arch22_tnd_head_dim_unaligned:{contract.head_dim}")
     aiv_total = max(1, int(ctx.datapath.aiv_count))
     aiv_read = read_role(ctx.geometry.resource_units, aiv=0)
     elem_b = BF16_BYTES if contract.dtype in ("bf16", "fp16") else FP32_BYTES
@@ -185,8 +232,8 @@ def build_ring_update(op: OpSpec, geometry: Geometry | OperatorPlanningContext) 
         write_hbm = w_led.dram_sector_bytes
         l2_bytes += w_led.l2_hit_bytes
     l2_absorbed = l2_bytes > 0
-    hbm_per_th = int(round((read_hbm + write_hbm) / max(1, total_th)))
-    l2_per_th = int(round(l2_bytes / max(1, total_th))) if has_l2_rate else 0
+    total_hbm = int(read_hbm + write_hbm)
+    total_l2 = int(l2_bytes) if has_l2_rate else 0
     if is_arch35:
         total_units = total_th
         mult = 1
@@ -201,17 +248,24 @@ def build_ring_update(op: OpSpec, geometry: Geometry | OperatorPlanningContext) 
         take = min(rows_per_aiv, rem)
         counts.append(take)
         rem -= take
+    aiv_hbm, aiv_l2 = _apportion_hbm_l2(total_hbm, total_l2, counts)
     prog = _RingUpdateProgram(
         tuple(counts), aiv_total, aiv_read,
-        read_per_th * mult, write_per_th * mult, hbm_per_th * mult, l2_per_th * mult, vec_per_th * mult,
+        read_per_th * mult, write_per_th * mult, aiv_hbm, aiv_l2, vec_per_th * mult,
     )
     total_work = Work(resources={
         aiv_read: total_th * read_per_th,
         "mte3": total_th * write_per_th,
         "vector": total_th * vec_per_th,
-        **({"hbm": total_th * hbm_per_th} if total_th * hbm_per_th else {}),
-        **({"l2": total_th * l2_per_th} if total_th * l2_per_th else {}),
+        **({"hbm": total_hbm} if total_hbm else {}),
+        **({"l2": total_l2} if total_l2 else {}),
     })
+    soc_arch = "A5" if is_arch35 else "A3"
+    abi_available = default_abi_registry().is_shipping_available(
+        contract.abi,
+        soc_arch,
+        dtype_tuple=(contract.dtype, "fp32", "fp32", contract.dtype, "fp32", "fp32"),
+    )
     items = tuple(WorkItem(r, "op" if r == "vector" else "bytes", n) for r, n in total_work.resources.items() if n)
     return OperatorPlan(
         work=total_work,
@@ -219,10 +273,15 @@ def build_ring_update(op: OpSpec, geometry: Geometry | OperatorPlanningContext) 
         metadata={
             "implementation": RING_UPDATE_RECIPE,
             "abi": contract.abi,
+            "abi_soc_arch": soc_arch,
+            "abi_available_on_device": abi_available,
             "execution_class": "aiv_only",
             "arch_id": str(ctx.compute_arch.arch_id),
             "active_aivs": active,
             "l2_absorbed": l2_absorbed,
+            "hbm_bytes": total_hbm,
+            "l2_hit_bytes": int(l2_bytes),
+            "total_transfer_bytes": int(total_read + total_write),
         },
         pipeline_spec=FusedPipelineSpec("attention_merge", RING_UPDATE_RECIPE,
                                         (PipelinePhase("merge", (), items),), RING_UPDATE_SOURCES),

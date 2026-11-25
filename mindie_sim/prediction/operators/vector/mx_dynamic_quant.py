@@ -12,7 +12,36 @@
 """
 from __future__ import annotations
 
-from mindie_sim.schema.common import ModelingError
+from typing import Literal
+
+from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-nn",
+        revision="238f76a06d0cfc5ee90071e2c08310e2b517c3a6",
+        relative_path="quant/dynamic_mx_quant/op_host/dynamic_mx_quant_def.cpp",
+        source_sha256="d4784100784e6b02b9edbb1ffa65af937f995db9298b5a2b600980609ff153f1",
+    ),
+    SourceRef(
+        repository="cann/ops-nn",
+        revision="238f76a06d0cfc5ee90071e2c08310e2b517c3a6",
+        relative_path="quant/dynamic_mx_quant/op_host/arch35/dynamic_mx_quant_tiling_arch35.cpp",
+        source_sha256="2fb351da15d698b7baeaa0200e4247ebe775153e9b1614d94fd6014968837176",
+    ),
+)
+
+_INPUT_DTYPE_ALIASES = {
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "fp16": "fp16",
+    "float16": "fp16",
+    "fp32": "fp32",
+    "float32": "fp32",
+}
 
 SOURCE_R64 = {
     "repository": "cann",
@@ -196,7 +225,13 @@ def producer_contract(width: int, *, input_dtype: str = "bf16",
     width = int(width)
     if width < 1:
         raise ModelingError("mx_dynamic_quant_requires_positive_width")
-    dtype = str(input_dtype or "bf16").lower()
+    raw_dtype = str(input_dtype or "bf16").strip().lower()
+    norm_dtype = _INPUT_DTYPE_ALIASES.get(raw_dtype)
+    if norm_dtype is None:
+        raise ModelingError(f"mx_dynamic_quant_input_dtype_unsupported:{input_dtype}")
+    if norm_dtype == "fp32" and width < _GROUP:
+        raise ModelingError("mx_dynamic_quant_fp32_requires_width_at_least_32")
+    input_bytes = int(width * dtype_bytes(norm_dtype))
     alg = int(scale_alg)
     if payload_format != "fp8_e4m3":
         raise ModelingError("mx_dynamic_quant_requires_fp8_e4m3_payload")
@@ -206,15 +241,19 @@ def producer_contract(width: int, *, input_dtype: str = "bf16",
         raise ModelingError("mx_dynamic_quant_scale_alg_2_rejected_for_fp8")
     selected_revision = str(source_revision) if str(source_revision) in SOURCES else "unpinned"
     source = SOURCES[selected_revision]
-    work = group32_work(width, dtype) if alg == 0 else None
+    work = (
+        group32_work(width, norm_dtype)
+        if (alg == 0 and norm_dtype in {"bf16", "fp16"})
+        else None
+    )
     payload_bytes = width
     groups = (width + _GROUP - 1) // _GROUP
     padded = (groups + 1) // 2 * 2
     scale_bytes = padded
     key = _TAIL_FP8_TILING_KEYS[alg]
     return {
-        "input_format": "fp16" if dtype in {"fp16", "float16"} else "bf16",
-        "input_bytes": width * 2,
+        "input_format": norm_dtype,
+        "input_bytes": input_bytes,
         "output_format": payload_format,
         "payload_bytes": payload_bytes,
         "scale_format": "fp8_e8m0",

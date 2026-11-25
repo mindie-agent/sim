@@ -7,12 +7,20 @@
 [Timeouts & Locks] Lazy row/column steps; O(unit count) temporary geometry.
 [Side-Effect Policy] Submits only to the caller's virtual engine.
 """
-from dataclasses import dataclass
 from collections import Counter
+from dataclasses import dataclass
 import math
+from typing import Literal
 
+from mindie_sim.schema.datapath import SourceRef
+
+from ...ownership import read_role
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from ...transactions import QueuedStore
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "hardware_neutral"
+
+SOURCES: tuple[SourceRef, ...] = ()
 
 DEFAULT_POINTWISE_TILE_ROWS = 64
 DEFAULT_POINTWISE_TILE_COLS = 8
@@ -33,6 +41,11 @@ class TiledPointwise:
             raise ValueError("tiled_pointwise_empty_local_shape")
         rows, cols = math.prod(shape[:-1]), shape[-1]
         names, rates = context.resource_names, context.rates
+        read_pipe = (
+            read_role(names, aiv=0)
+            if not ("mte2_aiv" in names and "mte2_aic" not in names)
+            else "mte2_aiv"
+        )
         units = context.resource_units.get(self.unit_role, context.core_count)
         row_iterations = math.ceil(rows / (units * self.tile_rows))
         col_iterations = math.ceil(cols / self.tile_cols)
@@ -42,7 +55,7 @@ class TiledPointwise:
             work = {names["hbm"]: amount}
             if resource in names:
                 work[names[resource]] = amount / bytes_per_work
-            elif resource not in {"mte2", "mte3"}:
+            elif resource not in {read_pipe, "mte2", "mte3"}:
                 raise ValueError(f"physical_resource_rate_missing:{resource}")
             return work
 
@@ -74,7 +87,7 @@ class TiledPointwise:
             reads = (elements * self.input_bytes_per_element +
                      members * valid_cols * self.parameter_bytes_per_col)
             stages = [
-                Stage("load", memory_work(reads, "mte2"), caps=cap("mte2", members)),
+                Stage("load", memory_work(reads, read_pipe), caps=cap(read_pipe, members)),
                 Stage("compute", {names["vector"]: members * self.tile_rows * self.tile_cols *
                                   vector_per_element}, after=("load",), caps=cap("vector", members)),
             ]

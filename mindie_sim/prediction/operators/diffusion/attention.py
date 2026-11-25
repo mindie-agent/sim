@@ -7,8 +7,10 @@
 """
 
 from math import prod
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 
 from .contracts import (
     _as_shape,
@@ -20,6 +22,31 @@ from .contracts import (
     _shape,
 )
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="Ascend/MindIE-SD",
+        revision="9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        relative_path="csrc/ops/norm_rope_concat/op_host/norm_rope_concat_tiling.cpp",
+        source_sha256="c02f0f00530e8f5f763a349aab9baadb7717517b654805456146198af0c04efa",
+    ),
+    SourceRef(
+        repository="Ascend/MindIE-SD",
+        revision="9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        relative_path="csrc/ops/eagle_quant_block_sparse_attention/op_host/eagle_quant_block_sparse_attention_def.cpp",
+        source_sha256="db5020ae4ef6eb4dbcd7dbd4756354653c8a2372872e9bf8ac021b47d20cd385",
+    ),
+    SourceRef(
+        repository="Ascend/MindIE-SD",
+        revision="9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        relative_path="csrc/ops/eagle_quant_block_sparse_attention/op_host/eagle_quant_block_sparse_attention_tiling.cpp",
+        source_sha256="378a1ddd937d4f7ce40901c931883a46018dd31fa0fe5bf788d50e50fea4e9be",
+    ),
+)
+
+_BSND_RANK = 4
+_HEAD_DIM_AXIS = 3
 _LAYER_NORM = 1
 _AFFINE_LAYER_NORM = 2
 _RMS_NORM = 3
@@ -33,24 +60,46 @@ _NORM_OPS_PER_ELEMENT = {
 }
 
 
+def _check_norm_rope_bhd(
+    role_name: str, shape: tuple[int, ...], b: int, h: int, d: int, error_code: str,
+) -> None:
+    if len(shape) != _BSND_RANK:
+        raise ModelingError("mindie_sd_norm_rope_requires_BSND_shapes")
+    if shape[0] != b or shape[2] != h or shape[_HEAD_DIM_AXIS] != d:
+        raise ModelingError(f"{error_code}:{role_name}:{shape}:expected_bhd={(b, h, d)}")
+
+
 def _norm_rope_contract(op, meta, dtype, returns):
     q_shape = _as_shape(meta.get("query_shape", meta.get("q_shape", _shape(op))),
                         "query")
     k_shape = _as_shape(meta.get("key_shape", q_shape), "key")
     v_shape = _as_shape(meta.get("value_shape", q_shape), "value")
-    if any(len(shape) != 4 for shape in (q_shape, k_shape, v_shape)):
+    if any(len(shape) != _BSND_RANK for shape in (q_shape, k_shape, v_shape)):
         raise ModelingError("mindie_sd_norm_rope_requires_BSND_shapes")
     b, sq, h, d = q_shape
+    _check_norm_rope_bhd("key", k_shape, b, h, d, "mindie_sd_norm_rope_qkv_shape_mismatch")
+    _check_norm_rope_bhd("value", v_shape, b, h, d, "mindie_sd_norm_rope_qkv_shape_mismatch")
     sk, sv = k_shape[1], v_shape[1]
+    if sk != sv:
+        raise ModelingError(f"mindie_sd_norm_rope_kv_seq_mismatch:{sk}:{sv}")
     enc_q = meta.get("encoder_query_shape")
     enc_k = meta.get("encoder_key_shape")
     enc_v = meta.get("encoder_value_shape")
     enc_q = _as_shape(enc_q, "encoder_query") if enc_q is not None else None
     enc_k = _as_shape(enc_k, "encoder_key") if enc_k is not None else None
     enc_v = _as_shape(enc_v, "encoder_value") if enc_v is not None else None
+    for role_name, shape in (
+        ("encoder_query", enc_q), ("encoder_key", enc_k), ("encoder_value", enc_v),
+    ):
+        if shape is not None:
+            _check_norm_rope_bhd(
+                role_name, shape, b, h, d, "mindie_sd_norm_rope_encoder_shape_mismatch",
+            )
     seq = enc_q[1] if enc_q else 0
     sek = enc_k[1] if enc_k else 0
     sev = enc_v[1] if enc_v else 0
+    if sek != sev:
+        raise ModelingError(f"mindie_sd_norm_rope_encoder_kv_seq_mismatch:{sek}:{sev}")
     norm_type = int(meta.get("norm_type", 0))
     norm_added_type = int(meta.get("norm_added_type", 0))
     rope_type = int(meta.get("rope_type", 0))
@@ -270,6 +319,16 @@ def _sparse_mask_flags(mask_values, total_pairs, per_batch_pairs, b, hq):
 
 
 _SPARSE_MAC_FACTOR = 2
+_SPARSE_DTYPE_ALIASES = {
+    "fp8_e4m3fn": "fp8_e4m3",
+    "float8_e4m3fn": "fp8_e4m3",
+}
+_QBSA_KV_DTYPES = frozenset({"int8", "fp8_e4m3", "fp8_e5m2"})
+
+
+def _norm_sparse_dtype(raw: str) -> str:
+    clean = str(raw).strip().lower()
+    return _SPARSE_DTYPE_ALIASES.get(clean, clean)
 
 
 def _sparse_legacy_contract(op, dtype, ratio, block, meta, options):
@@ -369,10 +428,23 @@ def _sparse_contract(op, meta, dtype, returns, resolved, options):
         _, hv, dv = v_shape
     if hkv != hv or dq != dk or hq % hkv:
         raise ModelingError("mindie_sd_sparse_qkv_head_geometry_mismatch")
-    q_dtype = str(meta.get("q_dtype", meta.get("query_dtype", dtype)))
-    k_dtype = str(meta.get("k_dtype", meta.get("kv_dtype", dtype)))
-    v_dtype = str(meta.get("v_dtype", meta.get("kv_dtype", dtype)))
-    q_bytes = sum(q_lengths) * hq * dq * dtype_bytes(q_dtype)
+    opt_kv_dtype = options.get("kv_dtype")
+    meta_kv_dtype = meta.get("kv_dtype")
+    declared_kv = opt_kv_dtype if opt_kv_dtype is not None else meta_kv_dtype
+    q_dtype = _norm_sparse_dtype(meta.get("q_dtype", meta.get("query_dtype", dtype)))
+    raw_k = meta.get("k_dtype")
+    raw_v = meta.get("v_dtype")
+    k_resolved = raw_k if raw_k is not None else declared_kv
+    v_resolved = raw_v if raw_v is not None else declared_kv
+    if resolved == "eagle_qbsa" and (k_resolved is None or v_resolved is None):
+        raise ModelingError("mindie_sd_eagle_qbsa_requires_declared_cache_dtype")
+    k_dtype = _norm_sparse_dtype(k_resolved if k_resolved is not None else dtype)
+    v_dtype = _norm_sparse_dtype(v_resolved if v_resolved is not None else dtype)
+    if resolved == "eagle_qbsa" and (
+        k_dtype not in _QBSA_KV_DTYPES or v_dtype not in _QBSA_KV_DTYPES
+    ):
+        raise ModelingError(
+            f"mindie_sd_eagle_qbsa_cache_dtype_unsupported:k={k_dtype}:v={v_dtype}")
     per_batch_pairs = []
     for b_index, (ql, kl) in enumerate(zip(q_lengths, k_lengths)):
         per_batch_pairs.append((b_index, (ql + block - 1) // block,
@@ -382,10 +454,12 @@ def _sparse_contract(op, meta, dtype, returns, resolved, options):
     flat, head_flags = _sparse_mask_flags(mask_values, total_pairs, per_batch_pairs, b, hq)
     qk_flops, pv_flops, active_rows, active_pairs, kv_blocks = _sparse_active_totals(
         per_batch_pairs, q_lengths, k_lengths, block, ratio, flat, head_flags, hq, dq, dv)
+    k_elem_bytes = dtype_bytes(k_dtype)
+    v_elem_bytes = dtype_bytes(v_dtype)
     kv_load_bytes = 0.0
     for batch_index, ki in kv_blocks:
         rows = min(block, k_lengths[batch_index] - ki * block)
-        kv_load_bytes += rows * hkv * (dk + dv) * dtype_bytes(k_dtype)
+        kv_load_bytes += rows * hkv * (dk * k_elem_bytes + dv * v_elem_bytes)
     if head_flags is not None:
         mask_bytes = float(meta.get(
             "mask_bytes",
@@ -420,7 +494,13 @@ def _sparse_contract(op, meta, dtype, returns, resolved, options):
         out_shape = (sum(q_lengths), hq, dv)
     else:
         out_shape = (b, max(q_lengths), hq, dv)
-    out_dtype = str(meta.get("output_dtype", dtype))
+    default_out_dtype = (
+        "bf16"
+        if (resolved == "eagle_qbsa"
+            and (q_dtype == "int8" or meta.get("q_scale_shape") is not None))
+        else dtype
+    )
+    out_dtype = _norm_sparse_dtype(meta.get("output_dtype", default_out_dtype))
     writes = [{**_role("attention_out", out_shape, out_dtype), "source": "pv"}]
     lse_shape = meta.get("lse_shape")
     if lse_shape is None and bool(meta.get("return_softmax_lse", False)):
@@ -432,6 +512,11 @@ def _sparse_contract(op, meta, dtype, returns, resolved, options):
                        "source": "softmax"})
     scale_inputs = tuple(item["name"] for item in reads
                          if item["name"] in {"q_scale", "k_scale", "v_scale"})
+    pv_dtype = (
+        "fp8_e4m3"
+        if (resolved == "eagle_qbsa" and v_dtype == "int8")
+        else v_dtype
+    )
     compute = [
         {"name": "qk", "kind": "matrix",
          "matrix_flops": ((q_dtype, qk_flops),),
@@ -442,7 +527,7 @@ def _sparse_contract(op, meta, dtype, returns, resolved, options):
          "inputs": ("qk_scores", "block_mask"),
          "outputs": ("probs", "softmax_lse")},
         {"name": "pv", "kind": "matrix",
-         "matrix_flops": ((v_dtype, pv_flops),),
+         "matrix_flops": ((pv_dtype, pv_flops),),
          "inputs": ("probs", "kv_load") + scale_inputs,
          "outputs": ("attention_out",)},
     ]

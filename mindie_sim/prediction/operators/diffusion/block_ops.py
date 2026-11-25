@@ -6,20 +6,65 @@
 [Side-Effect Policy] Creates local records only. No I/O or device access.
 """
 
+from dataclasses import replace
 from math import prod
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
+from mindie_sim.schema.operators import OpSpec
+
+from mindie_sim.prediction.values.typed import _prepend_source_value_contract, typed_value
 
 from .contracts import _as_shape, _bytes, _contract, _positive_int, _read, _role, _shape
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="Ascend/MindIE-SD",
+        revision="9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        relative_path="csrc/ops/eagle_ffn/op_host/eagle_ffn_def.cpp",
+        source_sha256="b742ae16a54ac6c84d1452fd29fc1dc8c3fe948c295b00c6389e5ae3e7529880",
+    ),
+    SourceRef(
+        repository="Ascend/MindIE-SD",
+        revision="9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        relative_path="mindiesd/layers/eagle_ffn_linear.py",
+        source_sha256="9ac63b1ed1da06c35d079a132bdd52191061e8d9863d21656883f65a7adc1f84",
+    ),
+    SourceRef(
+        repository="Ascend/MindIE-SD",
+        revision="9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        relative_path="mindiesd/layers/adalayernorm.py",
+        source_sha256="14a5f04de31d179202461a8cff3d54817aafc682537b9d4c4728706a2d758c5a",
+    ),
+    SourceRef(
+        repository="Ascend/MindIE-SD",
+        revision="9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        relative_path="csrc/plugin/adalayernorm.cpp",
+        source_sha256="d862775cf5193b94b411b0c1edc7ac9e85429407b7f7326a4dbd960d951ce68f",
+    ),
+    SourceRef(
+        repository="Ascend/MindIE-SD",
+        revision="9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        relative_path="csrc/plugin/quant_four_over_six_a5.cpp",
+        source_sha256="2cbf50d99848a85a90a6302b92430b4eac52cc344f50c8aec609a694a980eb38",
+    ),
+)
 
 _SWIGLU_OPS_PER_ELEMENT = 6.0
 _DEFAULT_FFN_ACTIVATION_OPS_PER_ELEMENT = 5.0
 _ADA_NORM_OPS_PER_ELEMENT = 5
 _MXFP4_SCALE_GROUP_SIZE = 32
 _MXFP4_QUANT_OPS_PER_ELEMENT = 4
+_QUANT46_MIN_RANK = 1
+_QUANT46_MAX_RANK = 7
+_ADALN_TOKENWISE_RANK = 3
+_A5_SOC_FAMILY = "Ascend950"
 
 
-def _eagle_ffn_contract(op, meta, dtype, returns):
+def _parse_eagle_ffn_geometry(op, meta, dtype):
     x_shape = _as_shape(meta.get("x_shape", _shape(op)), "x")
     if len(x_shape) < 2:
         raise ModelingError("mindie_sd_eagle_ffn_requires_matrix_x")
@@ -28,24 +73,7 @@ def _eagle_ffn_contract(op, meta, dtype, returns):
     w1 = meta.get("weight1_shape")
     w2 = meta.get("weight2_shape")
     if w1 is None or w2 is None:
-        if op.flops > 0 and op.mte2_bytes > 0:
-            reads = [{"name": "declared_operands", "shape": tuple(),
-                      "dtype": dtype, "bytes": float(op.mte2_bytes),
-                      "materialized": True, "alias": None,
-                      "kind": "declared", "producer": None}]
-            writes = [{"name": "y", "shape": x_shape, "dtype": dtype,
-                       "bytes": float(op.mte3_bytes), "materialized": True,
-                       "alias": None, "kind": "declared",
-                       "source": "declared_ffn"}]
-            compute = [{"name": "declared_ffn", "kind": "matrix",
-                        "matrix_flops": ((dtype, float(op.flops)),),
-                        "vector_ops": float(op.vector_ops),
-                        "inputs": ("declared_operands",),
-                        "outputs": ("declared_ffn_out",)}]
-            return _contract(reads, writes, compute, attributes={},
-                             basis="declared_ffn_flops_legacy",
-                             limitations=("weight_shapes_not_declared",))
-        raise ModelingError("mindie_sd_eagle_ffn_requires_weight1_and_weight2_shapes")
+        return None
     w1 = _as_shape(w1, "weight1")
     w2 = _as_shape(w2, "weight2")
     if len(w1) != 2 or len(w2) != 2:
@@ -56,7 +84,7 @@ def _eagle_ffn_contract(op, meta, dtype, returns):
         h_total, w1_layout = w1[1], "canonical_KxH"
     else:
         raise ModelingError("mindie_sd_eagle_ffn_weight1_K_mismatch")
-    activation = str(meta.get("activation", "silu")).lower()
+    activation = str(meta.get("activation", "gelu")).lower()
     h_act = h_total
     if activation == "swiglu":
         if h_total % 2:
@@ -79,7 +107,130 @@ def _eagle_ffn_contract(op, meta, dtype, returns):
         bias2_shape = _as_shape(bias2_shape, "bias2")
         if prod(bias2_shape) != n:
             raise ModelingError("mindie_sd_eagle_ffn_bias2_width_mismatch")
-    out_shape = tuple(x_shape[:-1]) + (n,)
+    return {
+        "x_shape": x_shape, "m": m, "k": k, "h_total": h_total, "h_act": h_act, "n": n,
+        "w1": w1, "w2": w2, "w1_layout": w1_layout, "w2_layout": w2_layout,
+        "activation": activation, "bias_dtype": bias_dtype,
+        "bias1_shape": bias1_shape, "bias2_shape": bias2_shape,
+        "out_shape": tuple(x_shape[:-1]) + (n,),
+        "up_shape": tuple(x_shape[:-1]) + (h_total,),
+        "act_shape": tuple(x_shape[:-1]) + (h_act,),
+    }
+
+
+def _eagle_ffn_unfused_ops(op: OpSpec, meta: dict, dtype: str, soc_family: str) -> tuple[OpSpec, ...]:
+    """Lower A2/A3 EagleFFN into unfused linear -> activation -> linear ops."""
+    geom = _parse_eagle_ffn_geometry(op, meta, dtype)
+    if geom is None:
+        raise ModelingError(f"mindie_sd_custom_op_soc_unsupported:eagle_ffn:{soc_family}")
+    m, k, h_total, h_act, n = geom["m"], geom["k"], geom["h_total"], geom["h_act"], geom["n"]
+    activation = geom["activation"]
+    activation_ops = (_SWIGLU_OPS_PER_ELEMENT if activation == "swiglu"
+                      else _DEFAULT_FFN_ACTIVATION_OPS_PER_ELEMENT)
+    b1_bytes = _bytes(geom["bias1_shape"], geom["bias_dtype"]) if geom["bias1_shape"] is not None else 0.0
+    b2_bytes = _bytes(geom["bias2_shape"], geom["bias_dtype"]) if geom["bias2_shape"] is not None else 0.0
+    up_bytes = _bytes(geom["up_shape"], dtype)
+    act_bytes = _bytes(geom["act_shape"], dtype)
+    out_bytes = _bytes(geom["out_shape"], dtype)
+    l1_read = _bytes(geom["x_shape"], dtype) + _bytes(geom["w1"], dtype) + b1_bytes
+    l1_flops = float(2 * m * h_total * k)
+    l2_read = act_bytes + _bytes(geom["w2"], dtype) + b2_bytes
+    l2_flops = float(2 * m * n * h_act)
+    act_vec = float(m * h_act * activation_ops)
+    shared_meta = {
+        "mindie_sd_unfused_fallback": "eagle_ffn",
+        "mindie_sd_soc_family": soc_family,
+        "activation": activation,
+    }
+    l1_id = f"{op.op_id}.linear1"
+    act_id = f"{op.op_id}.activation"
+    l1_shape = (m, h_total, k)
+    l2_shape = (m, n, h_act)
+    l1_op = replace(
+        op,
+        op_id=l1_id, family="gemm", recipe="gemm",
+        dtype=dtype, flops=l1_flops, vector_ops=0.0,
+        mte2_bytes=l1_read, mte3_bytes=up_bytes, hbm_bytes=l1_read + up_bytes,
+        matrix_flops=((dtype, l1_flops),), returns=(),
+        semantic_shape=l1_shape, local_shape=l1_shape, padded_shape=l1_shape, launch_shape=l1_shape,
+        metadata=tuple({
+            **shared_meta, "program_kind": "matmul",
+            "output_shape": geom["up_shape"], "output_format": dtype,
+        }.items()),
+    )
+    act_family = activation if activation in {"silu", "swiglu"} else "activation"
+    act_op = replace(
+        op,
+        op_id=act_id, deps=(l1_id,), family=act_family, recipe=activation,
+        dtype=dtype, flops=0.0, vector_ops=act_vec,
+        mte2_bytes=up_bytes, mte3_bytes=act_bytes, hbm_bytes=up_bytes + act_bytes,
+        matrix_flops=(), returns=(),
+        semantic_shape=geom["act_shape"], local_shape=geom["act_shape"],
+        padded_shape=geom["act_shape"], launch_shape=geom["act_shape"],
+        metadata=tuple({**shared_meta, "output_format": dtype}.items()),
+    )
+    out_returns = tuple(op.returns) if op.returns else ("y",)
+    primary_out = out_returns[0]
+    l2_meta = {
+        **shared_meta, "program_kind": "matmul",
+        "output_shape": geom["out_shape"], "output_format": dtype,
+        "primary_output": primary_out,
+    }
+    _prepend_source_value_contract(
+        l2_meta,
+        op,
+        (typed_value(
+            producer=op.op_id,
+            dtype=dtype,
+            shape=geom["out_shape"],
+            output=primary_out,
+            role="activation",
+            source=f"{op.op_id}:linear2",
+            write_bytes=out_bytes,
+            contract="mindie_sd_unfused_fallback",
+        ),),
+    )
+    l2_op = replace(
+        op,
+        op_id=op.op_id, deps=(act_id,), family="gemm", recipe="gemm",
+        dtype=dtype, flops=l2_flops, vector_ops=0.0,
+        mte2_bytes=l2_read, mte3_bytes=out_bytes, hbm_bytes=l2_read + out_bytes,
+        matrix_flops=((dtype, l2_flops),), returns=out_returns,
+        semantic_shape=l2_shape, local_shape=l2_shape, padded_shape=l2_shape, launch_shape=l2_shape,
+        metadata=tuple(l2_meta.items()),
+    )
+    return (l1_op, act_op, l2_op)
+
+
+def _eagle_ffn_contract(op, meta, dtype, returns):
+    geom = _parse_eagle_ffn_geometry(op, meta, dtype)
+    if geom is None:
+        x_shape = _as_shape(meta.get("x_shape", _shape(op)), "x")
+        if op.flops > 0 and op.mte2_bytes > 0:
+            reads = [{"name": "declared_operands", "shape": tuple(),
+                      "dtype": dtype, "bytes": float(op.mte2_bytes),
+                      "materialized": True, "alias": None,
+                      "kind": "declared", "producer": None}]
+            writes = [{"name": "y", "shape": x_shape, "dtype": dtype,
+                       "bytes": float(op.mte3_bytes), "materialized": True,
+                       "alias": None, "kind": "declared",
+                       "source": "declared_ffn"}]
+            compute = [{"name": "declared_ffn", "kind": "matrix",
+                        "matrix_flops": ((dtype, float(op.flops)),),
+                        "vector_ops": float(op.vector_ops),
+                        "inputs": ("declared_operands",),
+                        "outputs": ("declared_ffn_out",)}]
+            return _contract(reads, writes, compute, attributes={},
+                             basis="declared_ffn_flops_legacy",
+                             limitations=("weight_shapes_not_declared",))
+        raise ModelingError("mindie_sd_eagle_ffn_requires_weight1_and_weight2_shapes")
+    x_shape, m, k = geom["x_shape"], geom["m"], geom["k"]
+    h_total, h_act, n = geom["h_total"], geom["h_act"], geom["n"]
+    w1, w2 = geom["w1"], geom["w2"]
+    w1_layout, w2_layout = geom["w1_layout"], geom["w2_layout"]
+    activation, bias_dtype = geom["activation"], geom["bias_dtype"]
+    bias1_shape, bias2_shape = geom["bias1_shape"], geom["bias2_shape"]
+    out_shape = geom["out_shape"]
     hidden_bytes = float(m * h_act * dtype_bytes(dtype))
     reads = [_read("x", x_shape, dtype), _read("weight1", w1, dtype),
              _read("weight2", w2, dtype)]
@@ -125,21 +276,36 @@ def _eagle_ffn_contract(op, meta, dtype, returns):
         limitations=("hidden_store_is_a_real_gm_value",))
 
 
-def _adalayernorm_contract(op, meta, dtype, returns):
+def _adalayernorm_modulation_ok(shape: tuple[int, ...], x_shape: tuple[int, ...]) -> bool:
+    batch, width = x_shape[0], x_shape[-1]
+    if shape == (width,) or shape == x_shape:
+        return True
+    if len(shape) == 2 and shape == (batch, width):
+        return True
+    if len(shape) == len(x_shape) and shape[0] == batch and shape[-1] == width:
+        return all(dim in {1, x_dim} for dim, x_dim in zip(shape[1:-1], x_shape[1:-1]))
+    return False
+
+
+def _adalayernorm_contract(op, meta, dtype, returns, *, soc_family: str | None = None):
     x_shape = _as_shape(meta.get("x_shape", _shape(op)), "x")
     if len(x_shape) < 2:
         raise ModelingError("mindie_sd_adalayernorm_requires_at_least_2d_x")
     rows, width = prod(x_shape[:-1]), x_shape[-1]
     scale_shape = _as_shape(meta.get("scale_shape", (width,)), "scale")
     shift_shape = _as_shape(meta.get("shift_shape", (width,)), "shift")
-    batch = x_shape[0] if len(x_shape) >= 2 else 1
-    def broadcast_ok(shape):
-        return (prod(shape) in {width, rows * width}
-                or (len(shape) == 2 and shape[0] == batch and shape[1] == width))
-    if not broadcast_ok(scale_shape) or not broadcast_ok(shift_shape):
+    if (not _adalayernorm_modulation_ok(scale_shape, x_shape)
+            or not _adalayernorm_modulation_ok(shift_shape, x_shape)):
         raise ModelingError("mindie_sd_adalayernorm_modulation_width_mismatch")
-    reads = [_read("x", x_shape, dtype), _read("scale", scale_shape, dtype),
-             _read("shift", shift_shape, dtype)]
+    tokenwise = (
+        len(x_shape) == _ADALN_TOKENWISE_RANK
+        and x_shape[1] > 1
+        and (scale_shape == x_shape or shift_shape == x_shape)
+    )
+    read_scale_shape = x_shape if tokenwise else scale_shape
+    read_shift_shape = x_shape if tokenwise else shift_shape
+    reads = [_read("x", x_shape, dtype), _read("scale", read_scale_shape, dtype),
+             _read("shift", read_shift_shape, dtype)]
     weight_shape = meta.get("weight_shape")
     bias_shape = meta.get("bias_shape")
     if weight_shape is not None:
@@ -151,13 +317,17 @@ def _adalayernorm_contract(op, meta, dtype, returns):
                 "vector_ops": float(rows * width * _ADA_NORM_OPS_PER_ELEMENT),
                 "inputs": tuple(item["name"] for item in reads),
                 "outputs": ("y_value",)}]
-    if bool(meta.get("return_stats", False)):
+    return_stats = bool(meta.get("return_stats", False))
+    is_a5_v2 = soc_family == _A5_SOC_FAMILY
+    if return_stats or is_a5_v2:
         mean_shape = tuple(x_shape[:-1]) + (1,)
+        stats_kind = "value" if return_stats else "auxiliary"
         for name in ("mean", "rstd"):
-            writes.append({**_role(name, mean_shape, dtype), "source": "norm"})
+            writes.append({**_role(name, mean_shape, dtype, kind=stats_kind), "source": "norm"})
     return _contract(reads, writes, compute, attributes={
         "x_shape": x_shape, "scale_shape": scale_shape, "shift_shape": shift_shape,
         "weight_shape": weight_shape, "bias_shape": bias_shape,
+        "adaln_v2_stats_materialized": bool(return_stats or is_a5_v2),
     }, basis="three_dimensional_adaln_modulation_and_optional_affine")
 
 
@@ -195,12 +365,15 @@ def _laurel_contract(op, meta, dtype, returns):
 
 def _quant_four_over_six_contract(op, meta, dtype, returns):
     x_shape = _as_shape(meta.get("x_shape", _shape(op)), "x")
-    if len(x_shape) < 2:
-        raise ModelingError("mindie_sd_quant_four_over_six_requires_matrix_x")
-    rows, width = prod(x_shape[:-1]), x_shape[-1]
-    groups = (width + _MXFP4_SCALE_GROUP_SIZE - 1) // _MXFP4_SCALE_GROUP_SIZE
+    if not (_QUANT46_MIN_RANK <= len(x_shape) <= _QUANT46_MAX_RANK):
+        raise ModelingError(f"mindie_sd_quant_four_over_six_rank_unsupported:{len(x_shape)}")
+    rows = prod(x_shape[:-1]) if len(x_shape) > 1 else 1
+    width = x_shape[-1]
+    if width % _MXFP4_SCALE_GROUP_SIZE != 0:
+        raise ModelingError(f"mindie_sd_quant_four_over_six_last_dim_unaligned:{width}")
+    groups = width // _MXFP4_SCALE_GROUP_SIZE
     padded_groups = (groups + 1) // 2 * 2
-    payload_width = (width + 1) // 2
+    payload_width = width // 2
     reads = [_read("x", x_shape, dtype)]
     if meta.get("scale_shape") is not None:
         reads.append(_read("scale", _as_shape(meta["scale_shape"], "scale"), "fp32"))

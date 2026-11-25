@@ -9,13 +9,152 @@
 from __future__ import annotations
 
 from math import prod
-from typing import Any
+from typing import Any, Literal
 
+from mindie_sim.backends.abi_registry import default_abi_registry
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
+from mindie_sim.schema.physical_mechanisms import DAV_2201_PRESET, DAV_3510_PRESET
 
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.program import KernelProgram, Stage
+
+from .registry import MINDIE_SD_CUSTOM_OPS
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="Ascend/MindIE-SD",
+        revision="9fe772dfb90696e21b5e5d4e92ca07dffab84cf4",
+        relative_path="csrc/plugin/register_ops.cpp",
+        source_sha256="861fc97a28905b4e9c2ea39f8cd5641725b7b21f355ca8bb237446b5ae86c08a",
+    ),
+)
+
+_ARCH_TO_SOC = {
+    "A2": "Ascend910B",
+    "A3": "Ascend910_93",
+    "A5": "Ascend950",
+}
+
+
+def _geometry_soc_arch(geometry, op: OpSpec | None = None) -> tuple[str | None, str | None]:
+    """Resolve physical Ascend (soc_arch, soc_family) from Geometry or Device."""
+    inner = getattr(geometry, "geometry", geometry)
+    compute_arch = getattr(geometry, "compute_arch", None) or getattr(inner, "compute_arch", None)
+    if compute_arch is None:
+        return None, None
+    arch_id = str(
+        getattr(compute_arch, "arch_id", "") or getattr(compute_arch, "preset", "") or ""
+    ).strip().lower()
+    if arch_id in {DAV_3510_PRESET, "arch35", "a5"} or "3510" in arch_id:
+        return "A5", _ARCH_TO_SOC["A5"]
+    if arch_id in {DAV_2201_PRESET, "arch22", "a2", "a3"} or "2201" in arch_id:
+        sku = str(getattr(compute_arch, "sku", "") or getattr(inner, "sku", "") or "").lower()
+        op_soc = str(
+            dict(dict(op.metadata).get("native_implementation") or {}).get("soc_family") or ""
+        ).lower() if op is not None else ""
+        if "910b" in sku or "910b" in op_soc or arch_id == "a2":
+            return "A2", _ARCH_TO_SOC["A2"]
+        return "A3", _ARCH_TO_SOC["A3"]
+    return None, None
+
+
+def _expand_unfused_eagle_ffn_contract(contract: dict[str, Any]) -> dict[str, Any]:
+    """Insert intermediate GM up-projection materialization for A2/A3 unfused EagleFFN."""
+    attrs = dict(contract.get("attributes") or {})
+    w1 = attrs.get("weight1_shape")
+    hidden_shape = attrs.get("hidden_shape")
+    hidden_dtype = attrs.get("hidden_dtype")
+    if not w1 or not hidden_shape or not hidden_dtype:
+        return contract
+    w1_layout = attrs.get("weight1_layout", "linear_HxK")
+    h_total = int(w1[0] if w1_layout == "linear_HxK" else w1[1])
+    up_shape = (int(hidden_shape[0]), h_total)
+    up_bytes = _bytes(up_shape, str(hidden_dtype))
+    reads = list(contract["reads"])
+    writes = list(contract["writes"])
+    compute = []
+    for item in contract["compute"]:
+        if item["name"] == "activation":
+            compute.append({**item, "inputs": ("up_read",)})
+        else:
+            compute.append(dict(item))
+    writes.insert(0, {
+        "name": "up_store", "shape": up_shape, "dtype": str(hidden_dtype),
+        "bytes": up_bytes, "materialized": True, "alias": None,
+        "kind": "workspace", "source": "linear1",
+    })
+    reads.append({
+        "name": "up_read", "shape": up_shape, "dtype": str(hidden_dtype),
+        "bytes": up_bytes, "materialized": True, "alias": None,
+        "kind": "workspace", "producer": "up_store",
+    })
+    return _contract(
+        reads, writes, compute,
+        attributes={**attrs, "mindie_sd_unfused_fallback": True},
+        basis="unfused_linear_activation_linear_chain",
+        limitations=contract.get("limitations", ()),
+    )
+
+
+def _adapt_contract_for_soc(
+    op_key: str, contract: dict[str, Any], soc_family: str | None, unfused_ffn: bool,
+) -> dict[str, Any]:
+    """Align SoC-agnostic contracts to the physical target SoC at prepare time."""
+    if not contract or soc_family is None:
+        return contract
+    if unfused_ffn and op_key == "eagle_ffn":
+        return _expand_unfused_eagle_ffn_contract(contract)
+    if op_key == "adalayernorm" and soc_family == _ARCH_TO_SOC["A5"]:
+        write_names = {item["name"] for item in contract.get("writes", ())}
+        if "mean" in write_names and "rstd" in write_names:
+            return contract
+        y_write = next((item for item in contract.get("writes", ()) if item["name"] == "y"), None)
+        if y_write is None or not y_write.get("shape"):
+            return contract
+        mean_shape = tuple(y_write["shape"][:-1]) + (1,)
+        writes = list(contract["writes"])
+        for stat_name in ("mean", "rstd"):
+            if stat_name not in write_names:
+                writes.append({**_role(stat_name, mean_shape, y_write["dtype"], kind="auxiliary"),
+                               "source": "norm"})
+        return _contract(
+            contract["reads"], writes, contract["compute"],
+            attributes={**dict(contract.get("attributes") or {}), "adaln_v2_stats_materialized": True},
+            basis=contract.get("basis", "three_dimensional_adaln_modulation_and_optional_affine"),
+            limitations=contract.get("limitations", ()),
+        )
+    return contract
+
+
+def _abi_metadata_for_geometry(op: OpSpec, geometry) -> tuple[dict[str, Any], str | None, bool]:
+    """Verify Device-derived SoC legality and record honest sealed ABI availability."""
+    soc_arch, soc_family = _geometry_soc_arch(geometry, op)
+    if soc_arch is None or soc_family is None:
+        return {}, None, False
+    op_key = str(op.recipe or "").removeprefix("mindie_sd_")
+    spec = MINDIE_SD_CUSTOM_OPS.get(op_key)
+    if spec is None:
+        return {}, soc_family, False
+    unfused_ffn = False
+    if soc_family not in spec["supported_socs"]:
+        declared_soc = dict(dict(op.metadata).get("native_implementation") or {}).get("soc_family")
+        if (op_key == "eagle_ffn" and declared_soc is None
+                and soc_family in spec.get("unfused_fallback_socs", ())):
+            unfused_ffn = True
+        else:
+            raise ModelingError(f"mindie_sd_custom_op_soc_unsupported:{op_key}:{soc_family}")
+    abi_id = spec["native_kind"]
+    available = False if unfused_ffn else default_abi_registry().is_shipping_available(abi_id, soc_arch)
+    return {
+        "abi_id": abi_id,
+        "abi_soc_arch": soc_arch,
+        "abi_available_on_device": available,
+        **({"mindie_sd_unfused_fallback": True} if unfused_ffn else {}),
+    }, soc_family, unfused_ffn
 
 
 def _shape(op: OpSpec) -> tuple[int, ...]:
@@ -137,8 +276,12 @@ def _contract_work(contract):
 
 
 def _build_contract_plan(op: OpSpec, geometry):
+    abi_meta, soc_family, unfused_ffn = _abi_metadata_for_geometry(op, geometry)
+    op_key = str(op.recipe or "").removeprefix("mindie_sd_")
     contract = dict(dict(op.metadata).get("mindie_sd_contract") or {})
-    if not contract:
+    if contract:
+        contract = _adapt_contract_for_soc(op_key, contract, soc_family, unfused_ffn)
+    else:
         contract = _contract(
             [{"name": "declared_read", "bytes": float(op.mte2_bytes),
               "shape": tuple(), "dtype": op.dtype, "materialized": True,
@@ -280,4 +423,5 @@ def _build_contract_plan(op: OpSpec, geometry):
         "workspace_allocation_pool": workspace_pool_name,
         "workspace_requires_memory_grant": bool(workspace_writes),
         "workspace_grant_reused": workspace_grant is not None,
+        **abi_meta,
     })
