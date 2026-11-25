@@ -651,10 +651,17 @@ drain_compl_snapshot:
                     if (t->state != 1) continue;
                     for (k = 0; k < (int32_t)t->nlink; k++) {
                         msim_link *l = &c->link[t->lstart + k];
-                        if (l->rate > 0.0 && l->rem > 0.0) need_obs++;
+                        if (l->rate > 0.0 && l->rem > 0.0) {
+                            uint32_t emit_n = l->plen > 0 ? (uint32_t)l->plen : 1u;
+                            if (emit_n > UINT32_MAX - need_obs) {
+                                rc = MSIM_E_RANGE;
+                                goto fail;
+                            }
+                            need_obs += emit_n;
+                        }
                     }
                 }
-                if (c->obs_count + need_obs > c->obs_cap) {
+                if (need_obs > c->obs_cap || c->obs_count > c->obs_cap - need_obs) {
                     if (need_obs > c->obs_cap) c->obs_overflow = need_obs;
                     boundary = MSIM_B_OUTPUT; goto done;
                 }
@@ -713,10 +720,30 @@ drain_compl_snapshot:
                     c->serv[l->res] += used;
                     l->rem = residual;
                     if (c->obs_buf != NULL && dt > 0.0) {
-                        uint32_t owner_u = l->plen > 0 ? c->units[l->pstart] : 0u;
-                        msim_emit_obs_service(
-                            c, now, next_time, c->task[l->task].seq,
-                            (uint32_t)l->res, owner_u, used);
+                        uint64_t seq = c->task[l->task].seq;
+                        uint32_t rid = (uint32_t)l->res;
+                        if (l->plen > 1) {
+                            double prev = 0.0;
+                            double denom = (double)l->plen;
+                            int32_t u;
+                            for (u = 0; u < l->plen; u++) {
+                                double cur = (u + 1 == l->plen)
+                                    ? used
+                                    : used * ((double)(u + 1) / denom);
+                                double share = cur - prev;
+                                prev = cur;
+                                msim_emit_obs_service(
+                                    c, now, next_time, seq, rid,
+                                    c->units[l->pstart + u], share);
+                            }
+                        } else if (l->plen == 1) {
+                            msim_emit_obs_service(
+                                c, now, next_time, seq, rid,
+                                c->units[l->pstart], used);
+                        } else {
+                            msim_emit_obs_service(
+                                c, now, next_time, seq, rid, 0u, used);
+                        }
                     }
                 }
             }

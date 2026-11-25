@@ -14,53 +14,12 @@ from typing import Mapping
 import json
 from collections import OrderedDict
 
-from mindie_sim.catalog.types import QuantSpec
-from mindie_sim.schema.model import LayerPlan, ModelSpec, SloSpec, WorkloadSpec
+from mindie_sim.model_catalog import normalize_model
+from mindie_sim.schema.model import ModelSpec, SloSpec, WorkloadSpec
 from mindie_sim.schema.common import ModelingError, _unknown
 from mindie_sim.schema.case import Case, Software
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema import runtime_features
-
-
-
-def normalize_model(model: ModelSpec) -> ModelSpec:
-    quant = model.quant or QuantSpec(
-        name=model.quantization, weight_format=model.weight_dtype,
-        expert_weight_format=model.weight_dtype, activation_format=model.activation_dtype,
-        kv_dtype=model.kv_dtype,
-    )
-    if model.layer_plans:
-        if len(model.layer_plans) != model.layers:
-            raise ModelingError("layer_plan_count_differs_from_layers")
-        from mindie_sim.catalog.paired_sfa import normalize_formats
-        return normalize_formats(replace(model, quant=quant))
-    dimensions = {
-        "num_heads": model.num_heads, "num_kv_heads": model.num_kv_heads or model.num_heads,
-        "head_dim": model.head_dim, "intermediate_size": model.intermediate_size,
-        "num_experts": model.num_experts, "top_k": model.top_k,
-        "moe_intermediate_size": model.moe_intermediate_size,
-        "num_shared_experts": model.num_shared_experts,
-    }
-    if model.mla:
-        dimensions.update({
-            name: getattr(model.mla, name) for name in
-            ("q_lora_rank", "kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim",
-             "o_lora_rank", "o_groups")
-        })
-        dimensions.update(mla_variant="latent_mla", index_heads=model.mla.index_n_heads,
-                          index_dim=model.mla.index_head_dim, index_topk=model.mla.index_topk,
-                          indexer=bool(model.mla.index_topk), owns_index_k=bool(model.mla.index_topk),
-                          index_query_per_layer=bool(model.mla.index_topk))
-        dimensions.update(compress_ratio=model.mla.compress_ratio, window=model.mla.sliding_window,
-                          cache_kind="window_compressed" if model.mla.compress_ratio else "dense",
-                          compressor_kind="weighted_pool" if model.mla.compress_ratio else "none",
-                          compressor_state_rows=model.mla.compress_ratio)
-    attention = {"mha": "gqa", "dsa": "mla", "csa": "mla"}.get(model.attention, model.attention)
-    plans = tuple(LayerPlan(
-        index=index, attention=attention, ffn=model.ffn, architecture=attention,
-        kv_owner_layer_id=index, index_k_owner_layer_id=index, owns_long_kv=True, **dimensions,
-    ) for index in range(model.layers))
-    return replace(model, quant=quant, layer_plans=plans)
 
 
 #: Bounded identity memo of already-parsed declarations.  ``Case`` is frozen and
