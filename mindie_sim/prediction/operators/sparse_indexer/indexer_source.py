@@ -16,12 +16,29 @@
 """
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping
 
+from mindie_sim.schema.datapath import SourceRef
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="3c1b834495af94efb2af1f1a91da2fc8bd18441e",
+        relative_path="vllm_ascend/models/qwen4_exp/lightning_indexer.py",
+        source_sha256="e311aca9e24df6779f549d695321052b292733cb08d36b7e5860a87ef686418b",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/lightning_indexer_v2/op_host/lightning_indexer_v2_tiling.cpp",
+        source_sha256="b8988f5bdc1ccf8900c2a7853c4edf012f8cb99f6e9b5af40af56167bcd9aade",
+    ),
+)
 SCHEMA = "mindie-sim/indexer-source/1"
 SOURCE_FAMILY = "A5DeviceAdaptor.indexer_select_post_process"
 BF16_SOURCE_FAMILY = "bf16_lightning_indexer_v2"
-BF16_WEIGHT_DTYPES = frozenset({"fp32", "bf16", "fp16"})
+BF16_WEIGHT_DTYPES = frozenset({"fp32"})
 _DTYPE_ALIASES = {"bfloat16": "bf16", "float32": "fp32", "float16": "fp16"}
 
 

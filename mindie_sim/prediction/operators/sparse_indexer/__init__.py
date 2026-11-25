@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 
 from ...mechanism import Geometry, OperatorPlan, PlannedRecipe
@@ -23,9 +25,12 @@ from . import bf16_lightning
 from .common import (
     DEFAULT_INDEX_DIM, FAMILY, LIGHTNING_INDEXER_QSA_RECIPE, MSA_ABI,
     MSA_INDEX_SCORE_RECIPE, MSA_INDEX_SCORE_V2_RECIPE, MSA_V2_ABI, QSA_ABI, QSA_OVERLAY_SOURCE,
-    REGION_ABI, SCORER_RECIPES, STEP5_REGION_SCORE_RECIPE,
+    REGION_ABI, REGION_INDEX_DIM, SCORER_RECIPES, STEP5_REGION_SCORE_RECIPE,
     SparseIndexerContract, ceil_div, describe, make_op, unsupported,
 )
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = _arch22.SOURCES + _arch35.SOURCES
 
 DEFAULT_MSA_HEADS = 4
 DEFAULT_MSA_BLOCK = 128
@@ -147,16 +152,21 @@ def make_step5_region_score_op(
     *, op_id: str, deps: tuple[str, ...] = (), stage: int = 0, layer: int = 0,
     requests: tuple[str, ...] = (), phase: str = "decode", query_tokens: int,
     context_tokens: int, index_heads: int = DEFAULT_REGION_HEADS,
-    index_dim: int = DEFAULT_INDEX_DIM, region_block_size: int = DEFAULT_REGION_BLOCK,
+    index_dim: int = REGION_INDEX_DIM, region_block_size: int = DEFAULT_REGION_BLOCK,
     topk_regions: int = DEFAULT_REGION_TOPK, batch_size: int | None = None,
     shared_prefix: bool = False,
 ) -> OpSpec:
     if type(region_block_size) is not int or region_block_size <= 0:
         raise ModelingError("sparse_indexer_invalid_region_block_size")
+    if type(context_tokens) is not int or context_tokens < 0:
+        raise ModelingError("sparse_indexer_invalid_context_tokens")
+    if type(index_dim) is not int or index_dim != REGION_INDEX_DIM:
+        raise ModelingError(f"sparse_indexer_region_requires_index_dim_{REGION_INDEX_DIM}:{index_dim}")
     contract = SparseIndexerContract(
-        query_tokens, ceil_div(context_tokens, region_block_size), index_heads, index_dim,
+        query_tokens, context_tokens // region_block_size, index_heads, index_dim,
         topk_items=topk_regions, cache_dtype="fp8_e4m3", has_mask3_sort=True,
         abi=REGION_ABI, batch_size=_batch(batch_size, requests, query_tokens), shared_prefix=shared_prefix,
+        compress_ratio=region_block_size,
     )
     return _scorer_op(
         contract, _arch35.REGION_SOURCE, "step5_region_score",

@@ -10,9 +10,11 @@
 """
 from dataclasses import replace
 import math
+from typing import Literal
 
 from mindie_sim.catalog.attention_common import _floor_sum
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.operators.vector.mixed_core import split_reads
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage
@@ -29,6 +31,7 @@ INDEX_ELEMENT_BYTES = 4
 QUANT_WEIGHT_OPS_PER_HEAD = 17
 
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 IMPLEMENTATION = "cann_quant_lightning_indexer_v2_complete"
 RECIPE = "quant_lightning_indexer_v2"
 #: CANN 9.2.1 arch35 FP8 `quant_mode=1` lowering of the same operator family.
@@ -66,6 +69,26 @@ SOURCE = {
     },
     "capture_binary_identity": "not_established",
 }
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=SOURCE["revision"],
+        relative_path=SOURCE["cube"]["path"],
+        source_sha256=SOURCE["cube"]["sha256"],
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=SOURCE["revision"],
+        relative_path=SOURCE["vector"]["path"],
+        source_sha256=SOURCE["vector"]["sha256"],
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/quant_lightning_indexer_v2/op_kernel/arch35/quant_lightning_indexer_v2_kernel_arch35.h",
+        source_sha256="37b78aab1ddb5eb0139e8a8c710610bbbccdc32359c4352ec302057153ed8945",
+    ),
+)
 
 
 def recipes():
@@ -234,24 +257,100 @@ def _selection_comparisons(pairs, topk, visible_rows):
 ARCH35_PRESET = "npu_arch_3510"
 
 
+def _rle_encode(values):
+    runs = []
+    for value in values:
+        if runs and runs[-1][1] == value:
+            runs[-1] = (runs[-1][0] + 1, value)
+        else:
+            runs.append((1, value))
+    return tuple(runs)
+
+
+def _wave_key_ranges_from_spans(request_spans, wave_rows):
+    """Derive per-wave distinct interval fragments for an explicit core count."""
+    wave_rows = max(1, int(wave_rows))
+    waves, batch, prefixes, private = [], 0, {}, {}
+
+    def flush():
+        waves.append(tuple((0, n) for n in prefixes.values()) + tuple(private.values()))
+        prefixes.clear()
+        private.clear()
+
+    for request, (runs, extent, key) in enumerate(request_spans):
+        for count, n in runs:
+            rem = int(count)
+            while rem > 0:
+                room = wave_rows - (batch % wave_rows)
+                take = min(rem, room)
+                p = min(n, extent)
+                if p:
+                    prefixes[key] = max(prefixes.get(key, 0), p)
+                if n > p:
+                    private[request] = (extent, max(n, private.get(request, (0, 0))[1]))
+                batch += take
+                rem -= take
+                if batch % wave_rows == 0:
+                    flush()
+    if batch % wave_rows:
+        flush()
+    return tuple(waves)
+
+
 def _build_arch35(op, geometry):
-    """arch35 FP8 (`quant_mode=1`) block pipeline over the 32 AIC owners."""
+    """arch35 FP8 (`quant_mode=1`) block pipeline over active AIC owners."""
     compute_arch = getattr(geometry, "compute_arch", None) or getattr(
         getattr(geometry, "datapath", None), "compute_arch", None
     )
     preset = str(getattr(compute_arch, "preset", "") or getattr(compute_arch, "arch_id", "") or "")
     if preset != ARCH35_PRESET:
         raise ModelingError("quant_lightning_indexer_v2_arch35_requires_arch35")
-    ledger = dict(dict(op.metadata)[QUANT_LEDGER])
-    plan = Arch35QuantIndexerRecipe().build(op, geometry)
+    raw_meta = dict(op.metadata)
+    ledger = dict(raw_meta[QUANT_LEDGER])
+    stream_owners = getattr(geometry, "stream_owners", None)
+    stream_aics = 0
+    if stream_owners is not None:
+        aic_limit = getattr(stream_owners, "aic_limit", None)
+        aic_ids = getattr(stream_owners, "aic", ()) or getattr(stream_owners, "pool_aic", ())
+        if aic_limit is not None and int(aic_limit) > 0:
+            stream_aics = int(aic_limit)
+        elif aic_ids:
+            stream_aics = len(aic_ids)
+    wave_rows = max(1, int(
+        stream_aics
+        or getattr(geometry, "compute_units", 0)
+        or ledger.get("wave_rows", INDEXER_WAVE_ROWS)
+        or INDEXER_WAVE_ROWS
+    ))
+    query_rows = int(ledger.get("query_rows", 0) or 0)
+    waves = (query_rows + wave_rows - 1) // wave_rows if query_rows > 0 else 0
+    if (wave_rows != int(ledger.get("wave_rows", INDEXER_WAVE_ROWS) or INDEXER_WAVE_ROWS)
+            or waves != int(ledger.get("waves", 0) or 0)):
+        ledger["wave_rows"] = wave_rows
+        ledger["waves"] = waves
+        if "request_key_spans" in ledger:
+            ledger["wave_key_ranges"] = _wave_key_ranges_from_spans(
+                ledger["request_key_spans"], wave_rows)
+        else:
+            ledger.pop("wave_key_ranges", None)
+        raw_meta[QUANT_LEDGER] = ledger
+        op = replace(op, metadata=tuple(raw_meta.items()))
+    bound_geometry = replace(geometry, compute_units=wave_rows) if stream_aics > 0 else geometry
+    plan = Arch35QuantIndexerRecipe().build(op, bound_geometry)
+
+    def _bound_lower(context):
+        return plan.program(replace(context, op=op))
+
     metadata = {
         "execution_abstraction": "owner_wave_block_pipeline",
         "native_dispatch_reconstructed": False,
         "cross_owner_topk_traffic": "per_token_rolling_merge_declared",
-        "waves": ledger["waves"],
+        "wave_rows": wave_rows,
+        "waves": waves,
         "key_blocks": ledger["blocks"],
+        "owner_schedule": plan.metadata.get("owner_schedule"),
     }
-    return OperatorPlan(plan.work, plan.program, metadata=metadata)
+    return OperatorPlan(plan.work, _bound_lower, metadata=metadata)
 
 
 def _check_arch35_domain(plan, quant, parallel, keys, tokens=1):
@@ -325,30 +424,20 @@ def _candidate_keys(views, ratio, maxima=None):
     return scan, payload
 
 
-def _wave_key_ranges(row_sets, views, ratio, shared):
+def _wave_key_ranges(row_sets, views, ratio, shared, wave_rows=INDEXER_WAVE_ROWS):
     """Distinct interval fragments in each wave, in logical key coordinates."""
-    waves, batch, prefixes, private = [], 0, {}, {}
+    request_spans = _request_key_spans(row_sets, views, ratio, shared)
+    return _wave_key_ranges_from_spans(request_spans, wave_rows)
 
-    def flush():
-        waves.append(tuple((0, n) for n in prefixes.values()) + tuple(private.values()))
-        prefixes.clear()
-        private.clear()
 
-    for request, (values, view) in enumerate(zip(row_sets, views)):
+def _request_key_spans(row_sets, views, ratio, shared):
+    """Compact per-request (rle_row_keys, prefix_extent, prefix_key) spans."""
+    spans = []
+    for values, view in zip(row_sets, views):
         key = view.prefix_cache_key if shared else ""
         extent = min(view.prefix_tokens, view.context) // max(1, ratio) if key else 0
-        for n in values:
-            p = min(n, extent)
-            if p:
-                prefixes[key] = max(prefixes.get(key, 0), p)
-            if n > p:
-                private[request] = (extent, max(n, private.get(request, (0, 0))[1]))
-            batch += 1
-            if batch % INDEXER_WAVE_ROWS == 0:
-                flush()
-    if batch % INDEXER_WAVE_ROWS:
-        flush()
-    return tuple(waves)
+        spans.append((_rle_encode(values), extent, key))
+    return tuple(spans)
 
 
 def declare_arch35(builder, *, deps, views, plan, quant, parallel,
@@ -369,7 +458,8 @@ def declare_arch35(builder, *, deps, views, plan, quant, parallel,
     shared = prefix_cache_mode == "shared"
     keys = max(view_max, default=0)
     payload_keys = _candidate_keys(views, ratio, view_max)[1] if shared else sum(view_max)
-    wave_ranges = _wave_key_ranges(row_sets, views, ratio, shared)
+    request_spans = _request_key_spans(row_sets, views, ratio, shared)
+    wave_ranges = _wave_key_ranges_from_spans(request_spans, INDEXER_WAVE_ROWS)
     tokens = len(row_completed)
     _check_arch35_domain(plan, quant, parallel, keys, tokens)
     heads, width = plan.index_heads, plan.index_dim
@@ -382,23 +472,28 @@ def declare_arch35(builder, *, deps, views, plan, quant, parallel,
     key_row_bytes = width + FP32_BYTES
     blocks = key_blocks(keys) if keys > 0 else 0
     keys_padded = blocks * 1024
-    runs = []
-    for value in row_completed:
-        if runs and runs[-1][1] == value:
-            runs[-1] = (runs[-1][0] + 1, value)
-        else:
-            runs.append((1, value))
+    runs = _rle_encode(row_completed)
     ledger = {
         "query_rows": int(tokens), "wave_rows": INDEXER_WAVE_ROWS,
         "waves": indexer_waves(tokens), "blocks": blocks,
         "heads": heads, "width": width, "keys": keys_padded,
         "keys_padded": keys_padded,
         "completed_keys": keys, "payload_keys": payload_keys,
-        "row_completed_keys": tuple(runs),
+        "row_completed_keys": runs,
         "key_row_bytes": key_row_bytes, "wave_key_ranges": wave_ranges,
+        "request_key_spans": request_spans,
         "output_bytes": float(tokens) * plan.index_topk * INT32_BYTES,
     }
-    work = arch35_indexer_work(ledger)
+    # Hardware-independent compulsory lower bound (single wave over all rows)
+    # guarantees OpSpec floor <= physical plan for every active AIC count.
+    floor_wave_rows = max(1, int(tokens))
+    floor_ledger = {
+        **ledger,
+        "wave_rows": floor_wave_rows,
+        "waves": 1 if tokens else 0,
+        "wave_key_ranges": _wave_key_ranges_from_spans(request_spans, floor_wave_rows),
+    }
+    work = arch35_indexer_work(floor_ledger)
     result = builder.work(ARCH35_RECIPE, deps, (tokens, heads, width),
         family="indexer", dtype=ARCH35_INDEX_DTYPE,
         metadata=((QUANT_LEDGER, ledger),

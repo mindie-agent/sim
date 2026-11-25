@@ -11,6 +11,7 @@ Upstream-ABI: aclnnLightningIndexer
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import ArchId, SourceRef
@@ -21,13 +22,15 @@ from ..contracts import OperatorPlanningContext
 from ..sharedkv.sparse_indexer_v1 import build_arch22_v1_lightning
 from ._lowering import S2Partition
 from .common import (
-    ARCH22_FLUSH_BLOCKS, ARCH22_SMALL_QUERY_MAX, ARCH22_TOPK_LIMIT, BF16_BYTES, DEFAULT_S2_TILE,
-    FP32_BYTES, LIGHTNING_V2_ABI, MERGE_FAN_IN, PAIR_BYTES, QSA_ABI, QSA_OVERLAY_SOURCE, SORT_GROUP,
+    ARCH22_FLUSH_BLOCKS, ARCH22_QLI_DIM, ARCH22_QLI_HEADS, ARCH22_SMALL_QUERY_MAX,
+    ARCH22_TOPK_LIMIT, BF16_BYTES, DEFAULT_S2_TILE,
+    FP32_BYTES, LIGHTNING_V2_ABI, MERGE_FAN_IN, PAIR_BYTES, QLI_V2_ABI, QSA_ABI, QSA_OVERLAY_SOURCE, SORT_GROUP,
     Lowering, PhaseWork, SparseIndexerContract,
     _integer, align, build_plan, ceil_div, indexer_contract, request_contracts,
     owner_pairs, pair_merge, sort_ops, unsupported, vector,
 )
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 ARCH_ID = ArchId("npu_arch_2201")
 UPSTREAM_ABI = "aclnnLightningIndexer"
 _SUPPORTED_ABIS = frozenset({UPSTREAM_ABI, LIGHTNING_V2_ABI, QSA_ABI})
@@ -60,8 +63,23 @@ SOURCES: tuple[SourceRef, ...] = (
         relative_path="vllm_ascend/models/qwen4_exp/lightning_indexer.py",
         source_sha256="1d265521c2a44a904342e24a0d917aec575240469fe0f1dbc5ea61133d0e5736",
     ),
+    SourceRef(
+        repository="cann/ops-transformer", revision="a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+        relative_path="attention/quant_lightning_indexer_v2/op_kernel/arch22/quant_lightning_indexer_v2_service_cube_arch22.h",
+        source_sha256="87a50714932a4e8e7bd65a230c7bb32476456ac4aaa029e63c1f660244b9c4a6",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer", revision="a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+        relative_path="attention/quant_lightning_indexer_v2/op_kernel/arch22/quant_lightning_indexer_v2_service_vector_arch22.h",
+        source_sha256="d2ba785ac291998012c3b33671d708ad184970bd5ff896f79aa74dc319ae2906",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend", revision="fd7574116d21e21361acc0de0d2aca777e0bc564",
+        relative_path="csrc/attention/quant_lightning_indexer_v2/op_host/quant_lightning_indexer_v2_tiling.cpp",
+        source_sha256="500ca594826c422885c61d10b70433bd079eed1df1538d1685364d788cd5044f",
+    ),
 )
-LIGHTNING_SOURCES, QSA_SOURCE = SOURCES[:-1], SOURCES[-1]
+LIGHTNING_SOURCES, QSA_SOURCE, QLI_V2_SOURCES = SOURCES[:4], SOURCES[4], SOURCES[5:]
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +253,13 @@ def _retained_merge(incoming: int, retained: int) -> tuple[PhaseWork, ...]:
 
 def _contract(op: OpSpec, ctx: OperatorPlanningContext) -> SparseIndexerContract:
     contract = indexer_contract(op, ctx, UPSTREAM_ABI)
+    if contract.abi == QLI_V2_ABI and contract.cache_dtype == "int8":
+        if contract.index_heads != ARCH22_QLI_HEADS or contract.index_dim != ARCH22_QLI_DIM:
+            raise unsupported(
+                "arch22_abi",
+                f"Arch22 {QLI_V2_ABI} requires index_heads={ARCH22_QLI_HEADS} and index_dim={ARCH22_QLI_DIM}",
+            )
+        return contract
     if contract.abi not in _SUPPORTED_ABIS or contract.cache_dtype != "bf16":
         raise unsupported("arch22_abi", f"Arch22 cannot lower {contract.abi} with {contract.cache_dtype}")
     return contract
@@ -268,13 +293,17 @@ class _Arch22Strategy:
         sources = LIGHTNING_SOURCES
         if qsa:
             sources = (QSA_SOURCE,) if contract.has_head_weights else (QSA_OVERLAY_SOURCE,)
+        elif contract.abi == QLI_V2_ABI:
+            sources = QLI_V2_SOURCES
         # Align score blocks so local maxima are disjoint across S2 owners.
         tile_size = align(contract.s2_tile_size, SORT_GROUP * contract.block_size)
         host = max(request_contracts(contract, ctx), key=lambda c: c.query_tokens, default=contract)
         lowering = Lowering(
             contract.abi, "membase_s2_tiles", tile_size, _SCORE_ROUTE,
             tile_selection=_select_tile, flush_period=_flush_period(host),
-            score_align=SORT_GROUP, head_weight_item_bytes=FP32_BYTES if qsa else BF16_BYTES,
+            score_align=SORT_GROUP,
+            head_weight_item_bytes=FP32_BYTES if contract.abi in {QSA_ABI, LIGHTNING_V2_ABI} else BF16_BYTES,
+            cube_head_reduce_fp16=contract.abi == QLI_V2_ABI,
         )
         return build_plan(op, ctx, contract, lowering, owners, sources)
 
