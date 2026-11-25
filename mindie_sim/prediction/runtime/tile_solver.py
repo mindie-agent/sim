@@ -232,6 +232,9 @@ class TileCandidate:
     source_guard: str = ""
     fused: bool = False
     kernel_abi: str = ""
+    problem_shape: TileShape | None = None
+    problem_groups: tuple[int, ...] = ()
+    problem_group_axis: str = "m"
 
     def __post_init__(self) -> None:
         if self.algorithm not in ALGORITHM_LADDER_RANK:
@@ -240,6 +243,10 @@ class TileCandidate:
             raise ModelingError(f"tile_candidate_counts_invalid:{self.algorithm}")
         if any(dim < 1 for dim in self.instruction_block):
             raise ModelingError("tile_candidate_instruction_block_invalid")
+        if any(int(rows) < 0 for rows in self.problem_groups):
+            raise ModelingError("tile_candidate_problem_groups_invalid")
+        if self.problem_group_axis not in {"m", "k"}:
+            raise ModelingError("tile_candidate_problem_group_axis_invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -624,9 +631,96 @@ def check_live_buffers(
     return tuple(peaks)
 
 
+_GROUP_TYPE_K = 2
+
+
+def _padded_axis_extent(extent: int, tile: int, block: int) -> int:
+    """Sum fractal-padded tile extents across full and tail tiles along one axis."""
+    if extent <= 0:
+        return 0
+    step = tile if tile > 0 else extent
+    full, rem = divmod(extent, step)
+    return full * _align_up(step, block) + (_align_up(rem, block) if rem > 0 else 0)
+
+
+def matrix_tail_issued_flops(
+    m: int,
+    n: int,
+    k: int,
+    tile_shape: TileShape,
+    block_shape: tuple[int, int, int],
+    *,
+    groups: Sequence[int] = (),
+    group_axis: str = "m",
+) -> int:
+    """Exact cube issued FLOPs across per-axis full and tail tiles rounded to fractal blocks."""
+    bm, bn, bk = block_shape
+    if m < 0 or n < 0 or k < 0:
+        raise ModelingError("tile_problem_negative_dimension")
+    if group_axis not in {"m", "k"}:
+        raise ModelingError(f"tile_problem_group_axis_invalid:{group_axis}")
+    if n == 0 or (group_axis == "m" and (k == 0 or (not groups and m == 0))) or (
+        group_axis == "k" and (m == 0 or (not groups and k == 0))
+    ):
+        return 0
+    if groups and group_axis == "k":
+        pad_m = _padded_axis_extent(m, tile_shape.m, bm)
+        pad_k = sum(_padded_axis_extent(int(g), tile_shape.k, bk) for g in groups if int(g) > 0)
+    elif groups:
+        pad_m = sum(_padded_axis_extent(int(g), tile_shape.m, bm) for g in groups if int(g) > 0)
+        pad_k = _padded_axis_extent(k, tile_shape.k, bk)
+    else:
+        pad_m = _padded_axis_extent(m, tile_shape.m, bm)
+        pad_k = _padded_axis_extent(k, tile_shape.k, bk)
+    pad_n = _padded_axis_extent(n, tile_shape.n, bn)
+    return 2 * pad_m * pad_n * pad_k
+
+
+def _op_problem_groups(op: Any, m: int, k: int) -> tuple[tuple[int, ...], str]:
+    meta = dict(getattr(op, "metadata", ()) or ())
+    axis = "k" if meta.get("group_type") == _GROUP_TYPE_K else "m"
+    axis_total = k if axis == "k" else m
+    for key in ("matrix_group_rows", "aclnn_group_list"):
+        raw = meta.get(key)
+        if isinstance(raw, (tuple, list)) and raw and sum(int(g) for g in raw) == axis_total:
+            return tuple(int(g) for g in raw), axis
+    if getattr(op, "family", "") != "grouped_gemm":
+        geom = meta.get("aclnn_geometry")
+        raw_bg = meta.get("matrix_groups") or (
+            geom.get("matrix_groups") if isinstance(geom, dict) else None
+        )
+        batch_groups = int(raw_bg) if raw_bg is not None else 1
+        if batch_groups > 1 and m > 0 and m % batch_groups == 0:
+            return (m // batch_groups,) * batch_groups, "m"
+    return (), "m"
+
+
+def _resolve_problem_geometry(
+    candidate: TileCandidate,
+    op: Any,
+) -> tuple[int, int, int, tuple[int, ...], str] | None:
+    if candidate.problem_shape is not None:
+        ps = candidate.problem_shape
+        return ps.m, ps.n, ps.k, candidate.problem_groups, candidate.problem_group_axis
+    local_shape = getattr(op, "local_shape", None) if op is not None else None
+    if local_shape is not None and len(local_shape) == 3:
+        m, n, k = (int(dim) for dim in local_shape)
+        expected_logical = 2 * m * n * k
+        op_flops = int(getattr(op, "flops", 0) or 0)
+        if m >= 0 and n >= 0 and k >= 0 and expected_logical > 0 and (
+            candidate.logical_flops == expected_logical
+            or (candidate.logical_flops == 0 and op_flops == expected_logical)
+        ):
+            groups, axis = _op_problem_groups(op, m, k)
+            return m, n, k, groups, axis
+    return None
+
+
 def _issued_flops_for(
     candidate: TileCandidate,
     subtile_spec: SubtileWaveSpec | None,
+    *,
+    op: Any = None,
 ) -> tuple[int, int, int]:
     """Return ``(issued_flops, independently_issuable_m, subtile_wave_count)``."""
     shape = candidate.tile_shape
@@ -649,10 +743,17 @@ def _issued_flops_for(
         return 0, issuable_m, 0
     if shape.m == 0 or shape.n == 0 or shape.k == 0:
         return int(candidate.logical_flops), issuable_m, subtile_waves
+    problem = _resolve_problem_geometry(candidate, op)
+    if problem is not None:
+        prob_m, prob_n, prob_k, prob_groups, prob_axis = problem
+        issued = matrix_tail_issued_flops(
+            prob_m, prob_n, prob_k, shape, (bm, bn, bk),
+            groups=prob_groups, group_axis=prob_axis,
+        )
+        return max(int(candidate.logical_flops), issued), issuable_m, subtile_waves
     pad_m = _align_up(shape.m, bm)
     pad_n = _align_up(shape.n, bn)
     pad_k = _align_up(shape.k, bk)
-    # 2 * pad_m * pad_n * pad_k per tile, scaled across work_items * max(1, tiles_per_owner)
     per_tile_logical = 2 * shape.m * shape.n * shape.k
     per_tile_issued = 2 * pad_m * pad_n * pad_k
     if candidate.logical_flops > 0 and per_tile_logical > 0:
@@ -665,7 +766,6 @@ def _issued_flops_for(
 
 def solve(spec: TilePipelineSpec, op: Any, hw: Any) -> TileSolution:
     """Select the first source-declared candidate fitting every on-chip and L2 pool."""
-    del op
     if not spec.candidates:
         raise TileInfeasibleError(spec.family, ())
 
@@ -743,7 +843,7 @@ def solve(spec: TilePipelineSpec, op: Any, hw: Any) -> TileSolution:
             continue
 
         sw = subtile_by_mode.get(candidate.native_mode) if candidate.native_mode else None
-        issued_flops, issuable_m, subtile_waves = _issued_flops_for(candidate, sw)
+        issued_flops, issuable_m, subtile_waves = _issued_flops_for(candidate, sw, op=op)
         return TileSolution(
             algorithm=candidate.algorithm,
             tile_shape=candidate.tile_shape,
@@ -785,6 +885,7 @@ __all__ = [
     "TileShape",
     "TileSolution",
     "check_live_buffers",
+    "matrix_tail_issued_flops",
     "pool_peak_bytes",
     "solve",
     "ub_working_bytes",

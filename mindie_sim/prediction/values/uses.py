@@ -170,6 +170,111 @@ def producer_input_values(op, outputs_by_id=None, source_dtype=None):
     return tuple(values)
 
 
+_GROUP_TYPE_K = 2
+
+
+def _group_list_input_value(
+    op, metadata, group_list_producer, produced_by_dep, repeats, explicit, selected, add,
+):
+    group_list_val = _select_named_value(
+        op, group_list_producer, "group_list", produced_by_dep,
+    )
+    if group_list_val is None:
+        group_list_val, _ = selected(group_list_producer)
+    if group_list_val is None:
+        wrapper_meta = (
+            metadata.get("matrix_wrapper")
+            if isinstance(metadata.get("matrix_wrapper"), dict)
+            else {}
+        )
+        gl_dtype = str(
+            metadata.get("group_list_dtype")
+            or wrapper_meta.get("group_list_dtype")
+            or "int64"
+        )
+        raw_gl_shape = (
+            metadata.get("group_list_shape")
+            or wrapper_meta.get("group_list_shape")
+            or (
+                (int(metadata["matrix_weight_bank_groups"]),)
+                if metadata.get("matrix_weight_bank_groups")
+                else (1,)
+            )
+        )
+        gl_shape = tuple(int(dim) for dim in raw_gl_shape)
+        group_list_val = typed_value(
+            producer=group_list_producer, dtype=gl_dtype, shape=gl_shape,
+            storage_shape=gl_shape, output="group_list", role="index",
+            source=f"{op.op_id}:group_list_producer", materialized=True,
+            contract="declared_group_list_operand",
+        )
+    return add(
+        group_list_val, role="index", field="group_list",
+        shape=tuple(group_list_val.get("logical_shape") or ()),
+        dependency=group_list_producer,
+        repeats_value=repeats.get("group_list", repeats.get(group_list_producer, 1)),
+        explicit_bytes=explicit.get("group_list", explicit.get(group_list_producer)),
+    )
+
+
+def _weight_input_value(op, metadata, weight_dtype, repeats, explicit, add):
+    weight_n, weight_k = op.local_shape[1], op.local_shape[2]
+    expected_weight_elements = None
+    storage_shape = (weight_n, weight_k)
+    offset = 0
+    if op.family == "grouped_gemm" and metadata.get("group_type") != _GROUP_TYPE_K:
+        seg_rows = metadata.get("deepep_segment_expert_bank_rows")
+        if isinstance(seg_rows, (tuple, list)):
+            active_groups: float | None = float(sum(1 for rows in seg_rows if int(rows) > 0))
+        else:
+            raw_groups = (
+                metadata["expected_active_experts"]
+                if "expected_active_experts" in metadata
+                else metadata.get("matrix_groups")
+            )
+            if raw_groups is not None:
+                active_groups = float(raw_groups)
+                if "deepep_weight_scale" in metadata:
+                    active_groups *= float(metadata["deepep_weight_scale"])
+            else:
+                active_groups = None
+        if active_groups is not None:
+            group_dim = int(math.ceil(active_groups)) if active_groups > 0 else 0
+            shape = (group_dim, weight_n, weight_k)
+            if active_groups != group_dim:
+                expected_weight_elements = active_groups * weight_n * weight_k
+            bank_groups = metadata.get("matrix_weight_bank_groups")
+            resident_banks = (
+                max(int(bank_groups), group_dim)
+                if bank_groups is not None and int(bank_groups) > 0
+                else group_dim
+            )
+            storage_shape = (resident_banks, weight_n, weight_k)
+            group_rows = seg_rows if isinstance(seg_rows, (tuple, list)) else metadata.get("matrix_group_rows")
+            if isinstance(group_rows, (tuple, list)) and group_dim > 0:
+                first_active = next(
+                    (idx for idx, rows in enumerate(group_rows) if int(rows) > 0), 0
+                )
+                offset = first_active * weight_n * weight_k
+        else:
+            shape = (weight_n, weight_k)
+    else:
+        shape = (weight_n, weight_k)
+    weight = typed_value(
+        producer="", dtype=str(weight_dtype), shape=shape,
+        storage_shape=storage_shape, offset=offset, output="weight", role="weight",
+        source=f"{op.op_id}:weight_format", materialized=True,
+        write_bytes=metadata.get("weight_bytes")
+        or metadata.get("packed_weight_bytes"),
+        contract="parameter_value")
+    return add(
+        weight, role="weight", field="weight", shape=shape,
+        dependency="", repeats_value=repeats.get("weight", 1),
+        explicit_bytes=explicit.get("weight"),
+        expected_elements=expected_weight_elements,
+    )
+
+
 def _matmul_input_values(
     op, metadata, source_dtype, produced_by_dep, ports_by_dep,
     repeats, explicit, selected, add,
@@ -177,7 +282,12 @@ def _matmul_input_values(
     m, _, k = op.local_shape
     expected_rows = float(metadata.get("expected_rows", m))
     shape_rows = int(math.ceil(expected_rows)) if expected_rows > 0 else 0
-    dependency = op.deps[0] if op.deps else ""
+    raw_gl_producer = metadata.get("group_list_producer")
+    group_list_producer = (
+        raw_gl_producer if isinstance(raw_gl_producer, str) and raw_gl_producer else ""
+    )
+    activation_deps = tuple(dep for dep in op.deps if dep != group_list_producer)
+    dependency = activation_deps[0] if activation_deps else ""
     primary, primary_output = selected(dependency) if dependency else (None, None)
     logical, storage = _row_shape(metadata, (shape_rows, k))
     expected_elements = (
@@ -239,19 +349,16 @@ def _matmul_input_values(
                           dependency=dependency,
                           repeats_value=repeats.get("activation_scales", 1),
                           explicit_bytes=explicit.get("activation_scales")))
+    if group_list_producer:
+        values.append(_group_list_input_value(
+            op, metadata, group_list_producer, produced_by_dep,
+            repeats, explicit, selected, add,
+        ))
     weight_dtype = metadata.get("weight_format") or metadata.get("weight_dtype")
     if weight_dtype:
-        shape = (op.local_shape[1], op.local_shape[2])
-        weight = typed_value(
-            producer="", dtype=str(weight_dtype), shape=shape,
-            storage_shape=shape, output="weight", role="weight",
-            source=f"{op.op_id}:weight_format", materialized=True,
-            write_bytes=metadata.get("weight_bytes")
-            or metadata.get("packed_weight_bytes"),
-            contract="parameter_value")
-        values.append(add(weight, role="weight", field="weight", shape=shape,
-                          dependency="", repeats_value=repeats.get("weight", 1),
-                          explicit_bytes=explicit.get("weight")))
+        values.append(_weight_input_value(
+            op, metadata, weight_dtype, repeats, explicit, add,
+        ))
     return tuple(values)
 
 
@@ -263,6 +370,7 @@ _PRODUCER_FIELDS = {
     "topk_ids_producer": "topk_ids",
     "topk_weights_producer": "topk_weights",
     "inverse_index_producer": "inverse_index",
+    "group_list_producer": "group_list",
 }
 
 

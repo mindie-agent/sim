@@ -457,7 +457,7 @@ def _activation_abi_lowering(
                 else _SITU_UNFUSED_PLAIN_KERNELS
             )
             extra += (("native_kinds", kernels),)
-        return False, False, extra
+        return bool(is_unquantized), False, extra
     has_clip = (
         act == "swigluoai"
         or (act == "silu" and float(getattr(plan, "swiglu_limit", 0) or 0) > 0.0)
@@ -705,19 +705,30 @@ def _pack_routed_inputs(
         prefix=prefix, plan=router_plan, deps=deps, stage=stage, requests=requests,
         tokens=tokens, model=model, hidden=hidden, mode=mode)
     routed_input, logits_input = deps, router.op_id
+    logits_dtype, logits_bytes = weight_dtype, weight_bytes
     partition_views = ()
     if token_partition:
         partition_views = token_partition.prepare(
             prefix=prefix, input_id=deps, logits_id=router.op_id, width=hidden,
             experts=router_plan.num_experts, stage=stage, layer=plan.index,
             requests=requests, phase=mode, dtype=model.activation_dtype,
-            logits_dtype=token_partition.logits_dtype or weight_dtype)
+            logits_dtype=weight_dtype)
         routed_input, logits_input = (op.op_id for op in partition_views[-2:])
         tokens = token_partition.local_rows
+        if partition_views[-1].dtype:
+            logits_dtype = partition_views[-1].dtype
+            logits_bytes = dtype_bytes(logits_dtype)
     selection = build_selection(
         prefix=prefix, plan=router_plan, logits_input=logits_input,
-        weight_dtype=weight_dtype, weight_bytes=weight_bytes, stage=stage,
+        weight_dtype=logits_dtype, weight_bytes=logits_bytes, stage=stage,
         requests=requests, tokens=tokens, mode=mode, runtime=runtime)
+    select_meta = dict(selection.select.metadata)
+    weight_dtype = str(
+        select_meta.get("router_weight_dtype")
+        or select_meta.get("output_format")
+        or logits_dtype
+    )
+    weight_bytes = dtype_bytes(weight_dtype)
     # An idle representative owns no local hidden-state row: its router and
     # selection calls are not scheduled, while the pack still names its
     # selection producer contract.
@@ -1684,7 +1695,8 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         ops = bind_expert_slots(
             ops, model=model, plan=plan, parallel=parallel, routing=routing,
             runtime_routing=runtime_routing, routing_realization=routing_realization,
-            group_tokens=group_tokens, expert_width=expert_width, latent=latent)
+            group_tokens=group_tokens, expert_width=expert_width, latent=latent,
+            barrier=(price_owner is None and routing_realization is None))
         ops = _rescale_deepep_slot_weights(ops)
     if overlap_shared:
         ops = reorder_overlapped_shared(ops)
@@ -1818,20 +1830,116 @@ def reorder_overlapped_shared(ops):
 DEFAULT_MC2_CHUNKS = 4
 
 
+def _partition_explicit_token_routing(realization, count: int) -> tuple:
+    """Split an ``ExplicitTokenRouting`` into ``count`` disjoint per-chunk slices.
+
+    Slices each source owner's tokens front-loaded (``n // count + (i < n % count)``)
+    so every rank's per-chunk ``valid_local_tokens`` aligns with ``chunked_mc2``'s
+    scheduled ``local = tokens // count + (i < tokens % count)`` rows while
+    conserving ``expert_rows``, ``rank_expert_rows``, and ``peer_assignments``.
+    """
+    by_owner: dict[int, list[int]] = {}
+    for tok_idx, owner in enumerate(realization.source_owners):
+        by_owner.setdefault(int(owner), []).append(tok_idx)
+    chunk_indices: list[list[int]] = [[] for _ in range(count)]
+    for owner in sorted(by_owner):
+        indices = by_owner[owner]
+        base, rem = divmod(len(indices), count)
+        pos = 0
+        for chunk_idx in range(count):
+            take = base + int(chunk_idx < rem)
+            if take:
+                chunk_indices[chunk_idx].extend(indices[pos:pos + take])
+                pos += take
+    ep = len(realization.peer_assignments)
+    num_experts = len(realization.expert_rows)
+    bank_widths = tuple(len(row) for row in realization.rank_expert_rows)
+    total_tokens = realization.tokens
+    has_req_ids = len(realization.request_ids) == total_tokens
+    has_qpos = len(realization.query_positions) == total_tokens
+    chunks_out = []
+    for raw_idxs in chunk_indices:
+        idxs = sorted(raw_idxs)
+        chunk_topk = tuple(realization.topk_ids[i] for i in idxs)
+        chunk_owners = tuple(realization.source_owners[i] for i in idxs)
+        expert_rows = [0] * num_experts
+        rank_expert_rows = [[0] * width for width in bank_widths]
+        peer_assignments = [[0] * ep for _ in range(ep)]
+        for src, experts in zip(chunk_owners, chunk_topk):
+            for expert in experts:
+                expert_rows[expert] += 1
+                dst, bank = realization.expert_placement[expert]
+                rank_expert_rows[dst][bank] += 1
+                peer_assignments[src][dst] += 1
+        chunks_out.append(replace(
+            realization,
+            tokens=len(idxs),
+            topk_ids=chunk_topk,
+            source_owners=chunk_owners,
+            expert_rows=tuple(expert_rows),
+            rank_expert_rows=tuple(tuple(row) for row in rank_expert_rows),
+            peer_assignments=tuple(tuple(row) for row in peer_assignments),
+            request_ids=(tuple(realization.request_ids[i] for i in idxs)
+                         if has_req_ids else realization.request_ids),
+            query_positions=(tuple(realization.query_positions[i] for i in idxs)
+                             if has_qpos else realization.query_positions),
+        ))
+    return tuple(chunks_out)
+
+
+def _partition_mc2_routing_realization(realization, count: int) -> tuple:
+    """Partition an explicit routing realization across ``count`` MC2 chunks."""
+    if realization is None or count <= 1:
+        return (realization,) * count
+    if getattr(realization, "basis", "") == "explicit_token_routing_integer":
+        return _partition_explicit_token_routing(realization, count)
+    topk_ids = getattr(realization, "topk_ids", None)
+    if topk_ids is not None and getattr(realization, "basis", "") == "declared_integer_counts":
+        num_experts = len(realization.expert_rows)
+        total = len(topk_ids)
+        chunks_out = []
+        offset = 0
+        for idx in range(count):
+            take = total // count + int(idx < total % count)
+            part_topk = tuple(topk_ids[offset:offset + take])
+            offset += take
+            counts = [0] * num_experts
+            for experts in part_topk:
+                for expert in experts:
+                    counts[expert] += 1
+            chunks_out.append(replace(
+                realization, tokens=len(part_topk),
+                expert_rows=tuple(counts), topk_ids=part_topk,
+            ))
+        return tuple(chunks_out)
+    raise ModelingError("mc2_chunking_requires_explicit_token_routing_realization")
+
+
 def chunked_mc2(*, prefix, tokens, global_tokens=None, chunks=DEFAULT_MC2_CHUNKS, **kwargs):
     """Finite dispatch/compute/combine chunks with separate ordered streams."""
     group = tokens if global_tokens is None else global_tokens
     count = min(chunks, max(1, group))
-    if global_tokens is not None and (tokens % count or group % count):
+    realization = kwargs.get("routing_realization")
+    has_explicit_source = (
+        getattr(realization, "basis", "") == "explicit_token_routing_integer"
+    )
+    if global_tokens is not None and not has_explicit_source and (tokens % count or group % count):
         # Dividing the cohort total and then dividing each source are not
         # interchangeable at chunk tails. No source partition was supplied.
         raise ModelingError("mc2_cross_dp_tails_require_per_source_chunk_partitions")
+    chunk_realizations = _partition_mc2_routing_realization(realization, count)
     ops, completions = [], []
     for index in range(count):
         local = tokens // count + int(index < tokens % count)
-        global_local = group // count + int(index < group % count)
+        chunk_realization = chunk_realizations[index]
+        global_local = (
+            chunk_realization.tokens
+            if has_explicit_source
+            else group // count + int(index < group % count)
+        )
+        chunk_kwargs = {**kwargs, "routing_realization": chunk_realization}
         part, last = alltoall(prefix=f"{prefix}.chunk{index}", tokens=local,
-                              global_tokens=global_local, **kwargs)
+                              global_tokens=global_local, **chunk_kwargs)
         phase = "prepare"
         for op in part:
             if op.recipe == "expert_dispatch":
