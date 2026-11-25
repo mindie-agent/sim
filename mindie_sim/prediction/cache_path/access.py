@@ -88,23 +88,42 @@ def _reserve_bypass(
     self, identity, existing, summary, policy, write,
     line, line_count, transfer_bytes, staging,
 ):
-    from .residency import CacheAccessReservation
+    from .residency import CacheAccessReservation, _Resident
 
+    request_ranges = summary.line_segments
     bypass_existing = None
     existing_recency = -1
     existing_reserved_lines = 0
+    remaining_resident = None
     if existing is not None:
-        if existing.dirty_lines:
+        if intersect_spans(existing.dirty_ranges, request_ranges):
             raise ModelingError("cache_bypass_conflicts_with_dirty_identity")
         if write:
-            # Keep the clean old row as a rollback reservation until
-            # this access is irreversibly published or cancelled.
-            bypass_existing = replace(existing)
-            existing_recency = self._recency.get(identity, 0)
-            existing_reserved_lines = existing.lines
+            overlapped = intersect_spans(existing.ranges, request_ranges)
+            if overlapped:
+                # Keep only overwritten clean lines as a rollback reservation
+                # until this access is irreversibly published or cancelled;
+                # disjoint resident lines remain untouched.
+                bypass_existing = replace(existing)
+                existing_recency = self._recency.get(identity, 0)
+                existing_reserved_lines = range_count(overlapped)
+                remaining_ranges = subtract_spans(existing.ranges, overlapped)
+                if remaining_ranges:
+                    dropped_bytes = _byte_spans_of_lines(overlapped, line)
+                    remaining_resident = _Resident(
+                        range_count(remaining_ranges),
+                        existing.dirty_lines,
+                        remaining_ranges,
+                        existing.dirty_ranges,
+                        subtract_spans(existing.valid_bytes, dropped_bytes),
+                        existing.dirty_bytes_ranges,
+                    )
     if bypass_existing is not None:
-        self._resident.pop(identity)
-        self._drop_recency(identity)
+        if remaining_resident is None:
+            self._resident.pop(identity)
+            self._drop_recency(identity)
+        else:
+            self._resident[identity] = remaining_resident
         self._resident_bytes -= existing_reserved_lines * line
         self._reserved_bytes += existing_reserved_lines * line
     hbm_read_lines = hbm_write_lines = direct_lines = 0
@@ -198,8 +217,10 @@ def _reserve_resident(
     dirty_bytes_new = dirty_bytes
     hbm_read_lines = hbm_write_lines = direct_lines = 0
     writeback_bytes = victim_writeback
+    preflushed_ranges = ()
     if write and policy.write_policy == "write_through":
         preflush_lines = subtract_spans(dirty_lines, request_lines)
+        preflushed_ranges = preflush_lines
         preflush = range_count(preflush_lines)
         hbm_write_lines = line_count + preflush
         direct_lines = line_count
@@ -294,4 +315,5 @@ def _reserve_resident(
         resident_ranges, dirty_lines, resident_valid, dirty_bytes,
         victims, result, False, holder, held,
         existing_recency=existing_recency,
-        drain_bytes=drain_bytes, drain_completed=not drain_bytes)
+        drain_bytes=drain_bytes, drain_completed=not drain_bytes,
+        preflushed_ranges=preflushed_ranges)

@@ -219,7 +219,8 @@ class CacheAccessOperation:
             vector_resource=self.vector_resource,
             source_bytes=self.request.source_bytes,
             source_residency=self.request.source_residency,
-            convert_ops=self.request.convert_ops)
+            convert_ops=self.request.convert_ops,
+            transaction_bytes=line)
         labels = {"ready"}
         for item in items:
             if item.label in labels:
@@ -288,13 +289,7 @@ class CacheAccessOperation:
                     label, work, after=after,
                     on_complete=publish_event, owner=owner)
             elif item.label == "drain":
-                if (self.request.outstanding
-                        or self.request.response_ms):
-                    drained = submit_hbm(item, after)
-                else:
-                    drained = engine.submit(
-                        label, {self.hbm_resource: float(item.amount)},
-                        after=after, owner=owner)
+                drained = submit_hbm(item, after)
                 event = engine.submit(
                     label + ":terminal", after=(drained,),
                     on_complete=lambda _event: reservation.mark_drained(),
