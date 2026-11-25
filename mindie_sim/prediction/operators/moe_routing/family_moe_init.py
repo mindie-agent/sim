@@ -13,6 +13,7 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.implementations import select
 from mindie_sim.prediction.mechanism import PlannedRecipe
+from .moe_init_instructions import INDEX_BYTES
 from .moe_init_mxfp8 import (
     MAX_COUNT_MODE_EXPERTS, MX_SCALE_GROUP_SIZE, MX_WIDTH_ALIGNMENT, RECIPE, SOURCE, build,
 )
@@ -174,6 +175,28 @@ def apply(ops, bindings, runtime):
             dep in absorbed for dep in matrix.deps) else matrix.deps
         replacements[matrix.op_id] = replace(
             matrix, deps=deps, metadata=tuple(meta.items()))
+        inverse_bytes = float(rows * INDEX_BYTES)
+        for unpack in ops:
+            if unpack.recipe != "route_unpack":
+                continue
+            um = dict(unpack.metadata)
+            if um.get("inverse_index_producer") != pack.op_id:
+                continue
+            if float(um.get("inverse_index_bytes") or 0.0) > 0.0:
+                continue
+            read_bytes = float(unpack.mte2_bytes) + inverse_bytes
+            hbm_bytes = float(unpack.hbm_bytes) + inverse_bytes
+            um.update({
+                "inverse_index_dtype": "int32",
+                "inverse_index_bytes": inverse_bytes,
+                "read_bytes": read_bytes,
+            })
+            replacements[unpack.op_id] = replace(
+                unpack,
+                mte2_bytes=read_bytes,
+                hbm_bytes=hbm_bytes,
+                metadata=tuple(um.items()),
+            )
     return tuple(op for op in (replacements.get(op.op_id, op) for op in ops)
                  if op.op_id not in absorbed)
 

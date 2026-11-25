@@ -62,6 +62,7 @@ _PUBLISHED_COUNT_BYTES = int(dtype_bytes("int64"))
 _UB_ALIGNMENT_BYTES = 32
 _SIMT_CACHE_BYTES = 64 * 1024
 _SORT_INPUT_ALIGNMENT_ROWS = 8
+_SORT_UB_LOAD_LANES = 64
 _SORT_UB_BYTES_PER_ROW = 32
 _SORT_MAX_BLOCKS = 255
 _SORT_LANE_OPS_PER_INPUT_ROW = 6
@@ -72,6 +73,9 @@ _QUANT_CONSTANT_REGISTERS = 11
 _CONSTANT_REGISTER_LANES = 128
 _QUANT_DATA_OPS_PER_ELEMENT = 5
 _QUANT_PACKED_TEMP_BUFFERS = 4
+_QUANT_BF16_UB_READ_PASSES = 2
+_QUANT_SCALE_INTERMEDIATE_BUFFERS = 2
+_QUANT_SCALE_INTERMEDIATE_BYTES = 2
 _GATHER_COPY_TOPK_THRESHOLD = 3
 
 SOURCE = {
@@ -129,7 +133,10 @@ def _sort_program(stage, init, assignment_ids_read, sort_services, sort_input_ro
         # boundary. Whole-sort services require size-specific provenance;
         # blocks are a normalization coordinate, not independent sorts.
         post = Work(resources={"vector": 2 * sort_input_rows})
-        pre = Work(resources={"vector": sort_vector.resources["vector"] - post.resources["vector"]})
+        pre = Work(resources={
+            **sort_vector.resources,
+            "vector": sort_vector.resources["vector"] - post.resources["vector"],
+        })
         sort_stages.append(stage("sort_pre_lane_work", pre, 0, after=("read_ids",)))
         prior = "sort_pre_lane_work"
         for name, work in sort_services.items():
@@ -254,14 +261,15 @@ def _resolve_stream_aiv(geometry) -> tuple[int, int, tuple[int, ...], str, tuple
 def _build_moe_init_program(
     context, *, die_units, units, aiv_pool, isolation, shared_pool, active, assignments,
     per_owner, topk, experts, use_gather_copy, memory, init, assignment_ids_read,
-    sort_services, sort_input_rows, sort_vector, sort_out, count_parts, count_services,
-    primitive_work, operation_work, count_reduce, inverse_parts, inverse_services,
-    idle_index, row_load, row_quant, row_write, ub_bytes,
+    sort_services, sort_input_rows, sort_vector, sort_ub_work, sort_out, count_parts,
+    count_services, primitive_work, operation_work, count_reduce, inverse_parts,
+    inverse_services, idle_index, row_load, row_quant, row_write, ub_bytes,
 ):
     def owned(owner):
         phys_owner = aiv_pool[owner] if owner < len(aiv_pool) else owner
         return context.owned(phys_owner, die_units, (
-            "vector", "mte2_aiv", "mte3", *primitive_work.resources, *operation_work.resources))
+            "vector", "mte2_aiv", "mte3", *sort_ub_work.resources,
+            *primitive_work.resources, *operation_work.resources))
 
     def stage(name, work, owner, **kwargs):
         return Stage(name, context.bind(work), placement=owned(owner), **kwargs)
@@ -274,20 +282,47 @@ def _build_moe_init_program(
         stage("atomic_count_payload", parts[2], owner, after=("SIMT_count_memory",)),
     )) for owner, parts in enumerate(count_parts)))
     reduction = _count_reduction_program(stage, primitive_work, experts, count_reduce)
-    inversion = ParallelProgram(tuple(KernelProgram((stage("SIMT_invert_memory", work + inverse_services[owner], owner),))
-                                       for owner, work in enumerate(inverse_parts)))
+    if use_gather_copy:
+        inversion = ParallelProgram(tuple(
+            KernelProgram((stage("SIMT_invert_memory", work + inverse_services[owner], owner),))
+            for owner, work in enumerate(inverse_parts)))
+        tail_stages = (
+            Stage("inverse_ids", after=("reduce_counts",), program=inversion),
+            Stage("idle_total_reads", context.bind(idle_index), after=("reduce_counts",)),
+            Stage("gather_quantize", after=("inverse_ids", "idle_total_reads"),
+                  program=ParallelProgram(tuple(
+                      _gather_quantize_owner(
+                          owner, stage, memory, assignments, per_owner, topk,
+                          use_gather_copy, row_load, row_quant, row_write,
+                      ) for owner in range(active)))),
+        )
+    else:
+        # ScatterCopyExpandedXandMXQuant (K <= 3) has no cross-core SyncAll after
+        # RowIdxGather: each AIV reads the INT32 total count immediately after its
+        # own inversion while idle AIVs issue their two count reads after reduction.
+        owner_scatter_read = context.bind(memory(direct=INDEX_BYTES))
+        scatter_owners = ParallelProgram(tuple(
+            KernelProgram((
+                stage("SIMT_invert_memory", inverse_parts[owner] + inverse_services[owner], owner),
+                Stage("scatter_total_count_read", owner_scatter_read, after=("SIMT_invert_memory",)),
+                Stage("gather_quantize", after=("scatter_total_count_read",),
+                      program=_gather_quantize_owner(
+                          owner, stage, memory, assignments, per_owner, topk,
+                          use_gather_copy, row_load, row_quant, row_write,
+                      )),
+            )) for owner in range(active)))
+        idle_scatter = memory(direct=INDEX_BYTES * (units - active))
+        tail_stages = (
+            Stage("inverse_and_scatter_quantize", after=("reduce_counts",), program=scatter_owners),
+            Stage("idle_total_reads", context.bind(idle_index), after=("reduce_counts",)),
+            *((Stage("idle_scatter_total_reads", context.bind(idle_scatter), after=("reduce_counts",)),)
+              if idle_scatter.resources else ()),
+        )
     phases = KernelProgram((
         Stage("sort", program=sorting),
         Stage("count", after=("sort",), program=counting),
         Stage("reduce_counts", after=("count",), program=reduction),
-        Stage("inverse_ids", after=("reduce_counts",), program=inversion),
-        Stage("idle_total_reads", context.bind(idle_index), after=("reduce_counts",)),
-        Stage("gather_quantize", after=("inverse_ids", "idle_total_reads"),
-              program=ParallelProgram(tuple(
-                  _gather_quantize_owner(
-                      owner, stage, memory, assignments, per_owner, topk,
-                      use_gather_copy, row_load, row_quant, row_write,
-                  ) for owner in range(active)))),
+        *tail_stages,
     ))
     if isolation == "disjoint":
         ub_alloc_bytes, ub_owners = ub_bytes, aiv_pool
@@ -304,6 +339,35 @@ def _build_moe_init_program(
     return KernelProgram((Stage("reserve", acquire=allocation),
                           Stage("source", after=("reserve",), program=phases),
                           Stage("release", after=("source",), free=allocation)))
+
+
+def _ub_traffic_contract(assignments, quantized_rows, width, scales, declared_roles):
+    """Bind aligned B32 sort UB accesses to UB ports and record BF16/UINT16 UB traffic."""
+    sort_b32_read = aligned(assignments, _SORT_UB_LOAD_LANES) * INDEX_BYTES
+    sort_b32_write = aligned(assignments, _SORT_INPUT_ALIGNMENT_ROWS) * INDEX_BYTES
+    sort_ub_counts = PrimitiveInventory({
+        "ub_read_bytes": sort_b32_read,
+        "ub_write_bytes": sort_b32_write,
+    })
+    sort_ub_work, _ = sort_ub_counts.partition(declared_roles)
+    quant_bf16_read = _QUANT_BF16_UB_READ_PASSES * _BF16_BYTES * width * quantized_rows
+    quant_output_write = (width + scales) * quantized_rows
+    quant_scale_intermediate = (
+        _QUANT_SCALE_INTERMEDIATE_BUFFERS * _QUANT_SCALE_INTERMEDIATE_BYTES * scales * quantized_rows
+    )
+    metadata = {
+        "sort_b32_read_bytes": sort_b32_read,
+        "sort_b32_write_bytes": sort_b32_write,
+        "quant_bf16_read_bytes": quant_bf16_read,
+        "quant_output_write_bytes": quant_output_write,
+        "quant_scale_intermediate_read_bytes": quant_scale_intermediate,
+        "quant_scale_intermediate_write_bytes": quant_scale_intermediate,
+        "total_ub_read_bytes": sort_b32_read + quant_bf16_read + quant_scale_intermediate,
+        "total_ub_write_bytes": sort_b32_write + quant_output_write + quant_scale_intermediate,
+        "b32_port_services": sort_ub_counts.to_dict(declared_roles),
+        "bf16_read_boundary": "amax_and_quant_two_pass_bf16_and_u16_scale_ub_unpriced_on_b32_port",
+    }
+    return sort_ub_work, metadata
 
 
 def build(op, geometry):
@@ -391,15 +455,21 @@ def build(op, geometry):
     # Source tiling sets useGatherCopy = ((expertEnd - expertStart) * k > expertNum * 3).
     # For full expert range (expertEnd - expertStart == expertNum), useGatherCopy is (topk > 3).
     # When topk <= 3, ScatterCopyExpandedXandMXQuant loads and quantizes each sorted
-    # assignment row individually without cross-topk input row deduplication.
+    # assignment row individually without cross-topk input row deduplication, and
+    # every launched AIV reads the INT32 total count prior to the active-core guard.
     use_gather_copy = topk > _GATHER_COPY_TOPK_THRESHOLD
+    scatter_count_read = Work() if use_gather_copy else memory(direct=INDEX_BYTES * units)
     quantized_rows = (
         sum(sum(1 for _ in row_runs(assignments, topk, units, owner)) for owner in range(active))
         if use_gather_copy else assignments
     )
+    sort_ub_work, ub_traffic = _ub_traffic_contract(
+        assignments, quantized_rows, width, scales, geometry.resource_units,
+    )
+    sort_vector = sort_vector + sort_ub_work
     row_load, row_quant = memory(read=width * _BF16_BYTES), Work(resources={"vector": quant_vector(width)})
     row_write = memory(write=width + scales)
-    total = init + assignment_ids_read + sort_vector + sort_out + idle_index
+    total = init + assignment_ids_read + sort_vector + sort_out + idle_index + scatter_count_read
     for parts in count_parts:
         for part in parts:
             total += part
@@ -418,13 +488,13 @@ def build(op, geometry):
             assignments=assignments, per_owner=per_owner, topk=topk, experts=experts,
             use_gather_copy=use_gather_copy, memory=memory, init=init,
             assignment_ids_read=assignment_ids_read, sort_services=sort_services,
-            sort_input_rows=sort_input_rows, sort_vector=sort_vector, sort_out=sort_out,
-            count_parts=count_parts, count_services=count_services,
-            primitive_work=primitive_work, operation_work=operation_work,
-            count_reduce=count_reduce, inverse_parts=inverse_parts,
-            inverse_services=inverse_services, idle_index=idle_index,
-            row_load=row_load, row_quant=row_quant, row_write=row_write,
-            ub_bytes=ub_bytes)
+            sort_input_rows=sort_input_rows, sort_vector=sort_vector,
+            sort_ub_work=sort_ub_work, sort_out=sort_out, count_parts=count_parts,
+            count_services=count_services, primitive_work=primitive_work,
+            operation_work=operation_work, count_reduce=count_reduce,
+            inverse_parts=inverse_parts, inverse_services=inverse_services,
+            idle_index=idle_index, row_load=row_load, row_quant=row_quant,
+            row_write=row_write, ub_bytes=ub_bytes)
     source_branch = (
         "onecore_sort_GATHER_count_mode_full_range_useGatherCopy"
         if use_gather_copy else "onecore_sort_GATHER_count_mode_full_range_scatterCopy"
@@ -435,6 +505,7 @@ def build(op, geometry):
         "output_data_bytes": assignments * width, "output_scale_bytes": assignments * scales,
         "source_branch": source_branch,
         "sort_blocks32": sort_rows // SORT_BLOCK_ROWS,
+        "ub_traffic": ub_traffic,
         "primitive_services":primitive_counts.to_dict(geometry.resource_units),
         "source_operation_services": diagnostics(sort_ops,count_ops,inverse_ops,
             experts=experts,declared_roles=geometry.resource_units),
@@ -445,6 +516,6 @@ def build(op, geometry):
             'pipe_barrier':{'source_PIPE_V_calls':1},
             'excluded':'unknown compiled loop/branch/address ISA and barrier flag expansion'},
         "unpriced": ("Sort_Concat_Extract_specialized_issue", "SIMT_scalar_address_control",
-                     "SyncAll_flag_latency", "atomic_count_cache_RMW", "UB_register_ports"),
+                     "SyncAll_flag_latency", "atomic_count_cache_RMW", "BF16_UB_register_ports"),
         "schedule_limitations": "two_whole_row_slots_conservative_vs_separate_input_output_queues",
     })
