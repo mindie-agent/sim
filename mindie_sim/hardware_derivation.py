@@ -260,38 +260,67 @@ def _scale_rates(rates: dict[str, Any], s_c: float, s_v: float) -> dict[str, Any
     return result
 
 
+def _base_die_hbm_peak(
+    device: Mapping[str, Any], base_assumptions: Mapping[str, str],
+) -> float:
+    current_hbm = float((device.get("rates") or {}).get("hbm", 1.0))
+    raw_peak = base_assumptions.get("derivation.hbm_peak_bytes_per_s")
+    raw_rate = base_assumptions.get("derivation.hbm_rate_bytes_per_s")
+    if raw_peak is not None and raw_rate is not None:
+        try:
+            peak_val = float(raw_peak)
+            rate_val = float(raw_rate)
+        except ValueError:
+            return current_hbm
+        if (math.isfinite(peak_val) and peak_val > 0.0
+                and math.isclose(current_hbm, rate_val)):
+            return peak_val
+    return current_hbm
+
+
 def _strip_derived_instruction_rates(
-    data: dict[str, Any], arch: Any, assumptions: dict[str, str],
+    data: dict[str, Any],
+    base_die: Any,
+    assumptions: dict[str, str],
+    *,
+    preserved_rates: frozenset[str] = frozenset(),
 ) -> None:
     """Let the schema recompute aggregate per-owner supplies exactly once."""
     rates = dict(data.get("rates", {}))
     units = dict(data.get("resource_units", {}))
-    services = {item.name: item for item in getattr(arch, "instruction_services", ())}
-    for name, service in services.items():
+    base_rates = dict(base_die.rates)
+    base_units = dict(base_die.resource_units)
+    linked_overrides = frozenset(base_die.linked_rate_overrides) | preserved_rates
+    unit_overrides = frozenset(base_die.instruction_unit_overrides)
+    for service in getattr(base_die.compute_arch, "instruction_services", ()):
+        name = service.name
+        if service.resource is not None:
+            continue
+        base_axis_owners = int(
+            base_units.get(service.owner_axis, base_die.compute_units) or DEFAULT_DEVICE_COUNT
+        )
+        if name in units and name not in unit_overrides and int(base_units.get(name, 0)) == base_axis_owners:
+            units.pop(name)
         if name not in rates:
             continue
-        count = int(units.get(service.owner_axis, data.get("compute_units", DEFAULT_DEVICE_COUNT)) or DEFAULT_DEVICE_COUNT)
-        canonical = float(service.per_owner_rate) * count
+        if name in linked_overrides:
+            assumptions[f"derivation.explicit_service_override.{name}"] = "preserved"
+            continue
+        base_canonical = float(service.per_owner_rate) * base_axis_owners
+        new_owners = int(
+            units.get(service.owner_axis, data.get("compute_units", DEFAULT_DEVICE_COUNT)) or DEFAULT_DEVICE_COUNT
+        )
+        new_canonical = float(service.per_owner_rate) * new_owners
+        base_current = float(base_rates.get(name, rates[name]))
         current = float(rates[name])
-        if service.clock_hz is not None or abs(current - canonical) <= TOLERANCE * max(1.0, abs(canonical)):
+        if (abs(base_current - base_canonical) <= TOLERANCE * max(1.0, abs(base_canonical))
+                or abs(current - new_canonical) <= TOLERANCE * max(1.0, abs(new_canonical))):
             rates.pop(name)
             assumptions[f"derivation.recomputed_service.{name}"] = "from_owner_supply"
         else:
             assumptions[f"derivation.explicit_service_override.{name}"] = "preserved"
+    data["resource_units"] = units
     data["rates"] = rates
-    modes = {name: dict(mode) for name, mode in data.get("service_modes", {}).items()}
-    for name, mode in list(modes.items()):
-        service = services.get(name)
-        if service is None or "rate" not in mode:
-            continue
-        count = int(units.get(service.owner_axis, data.get("compute_units", DEFAULT_DEVICE_COUNT)) or DEFAULT_DEVICE_COUNT)
-        canonical = float(service.per_owner_rate) * count
-        if service.clock_hz is not None or abs(float(mode["rate"]) - canonical) <= TOLERANCE * max(1.0, abs(canonical)):
-            mode.pop("rate")
-            assumptions[f"derivation.recomputed_mode.{name}"] = "from_owner_supply"
-        else:
-            assumptions[f"derivation.explicit_mode_override.{name}"] = "preserved"
-    data["service_modes"] = modes
 
 
 def _derive_single_device(
@@ -307,6 +336,8 @@ def _derive_single_device(
     s_v: float,
     memory_bytes: int | None,
     raw_peak: float | None,
+    die_hbm_peak: float,
+    record_hbm_assumptions: bool,
     hbm_efficiency: Any,
     hbm_eta: float,
     mte2_efficiency: Any,
@@ -346,33 +377,61 @@ def _derive_single_device(
     device["compute_peak_aliases"] = aliases
     device["compute_peaks"] = peaks
 
+    base_rates = dict(base_die.rates)
     rates = _scale_rates(dict(device.get("rates", {})), s_c, s_v)
     if memory_bytes is not None:
         device["memory_bytes"] = _positive_count(memory_bytes, "hardware_derivation_memory_invalid")
     if raw_peak is not None:
         rates["hbm"] = raw_peak * hbm_eta
-        assumptions["derivation.hbm_peak_bytes_per_s"] = repr(raw_peak)
-        assumptions["derivation.hbm_rate_bytes_per_s"] = repr(rates["hbm"])
+        if record_hbm_assumptions:
+            assumptions["derivation.hbm_peak_bytes_per_s"] = repr(raw_peak)
+            assumptions["derivation.hbm_rate_bytes_per_s"] = repr(rates["hbm"])
     elif hbm_efficiency is not None and "hbm" in rates:
         rates["hbm"] = float(rates["hbm"]) * hbm_eta
-        assumptions["derivation.hbm_rate_bytes_per_s"] = repr(rates["hbm"])
+        if record_hbm_assumptions:
+            assumptions["derivation.hbm_peak_bytes_per_s"] = repr(die_hbm_peak)
+            assumptions["derivation.hbm_rate_bytes_per_s"] = repr(rates["hbm"])
+    mte2_preserved: set[str] = set()
+    if mte2_efficiency is not None or ceiling is not None:
+        for name in ("mte2_aic", "mte2_aiv", "mte2"):
+            if name not in rates and name in base_rates:
+                scale = s_c if name in AIC_RATE_KEYS else (s_v if name in AIV_RATE_KEYS else 1.0)
+                rates[name] = float(base_rates[name]) * scale
+                mte2_preserved.add(name)
     if mte2_efficiency is not None:
-        for name in ("mte2_aic", "mte2_aiv"):
+        for name in ("mte2_aic", "mte2_aiv", "mte2"):
             if name in rates:
                 rates[name] = float(rates[name]) * mte2_eta
     if ceiling is not None:
         rates = apply_mte2_ceiling(rates, ceiling)
         assumptions["derivation.mte2_ceiling_bytes_per_s"] = repr(ceiling)
     if "mte2_aic" in rates and "mte2_aiv" in rates:
-        rates["mte2"] = min(float(rates["mte2_aic"]), float(rates["mte2_aiv"]))
+        split_min = min(float(rates["mte2_aic"]), float(rates["mte2_aiv"]))
+        if "mte2" not in base_rates:
+            rates["mte2"] = split_min
+        elif math.isclose(
+            float(base_rates["mte2"]),
+            min(float(base_rates.get("mte2_aic", float("inf"))),
+                float(base_rates.get("mte2_aiv", float("inf")))),
+        ):
+            rates["mte2"] = split_min
+        else:
+            rates["mte2"] = min(float(rates["mte2"]), split_min)
 
-    hbm_scale = float(rates["hbm"]) / float(dict(base_die.rates)["hbm"])
+    hbm_scale = float(rates["hbm"]) / float(base_rates["hbm"])
     for name, mode in device.get("service_modes", {}).items():
         resource = mode.get("resource")
         if mode.get("rate") is None:
             continue
-        if resource == "hbm" or name in DRAM_BOUND_MODES:
+        if resource == "hbm":
             mode["rate"] = float(mode["rate"]) * hbm_scale
+        elif name in DRAM_BOUND_MODES:
+            scaled = float(mode["rate"]) * hbm_scale
+            if resource in rates:
+                scaled = min(scaled, float(rates[resource]))
+            mode["rate"] = scaled
+        elif resource in ("mte2_aic", "mte2_aiv", "mte2") and resource in rates and resource in base_rates:
+            mode["rate"] = float(mode["rate"]) * (float(rates[resource]) / float(base_rates[resource]))
         elif resource in AIC_RATE_KEYS:
             mode["rate"] = float(mode["rate"]) * s_c
         elif resource in AIV_RATE_KEYS:
@@ -393,7 +452,10 @@ def _derive_single_device(
             cacheline_mode.pop("rate", None)
     device["resource_units"] = units
     device["rates"] = rates
-    _strip_derived_instruction_rates(device, base_die.compute_arch, assumptions)
+    _strip_derived_instruction_rates(
+        device, base_die, assumptions,
+        preserved_rates=frozenset(mte2_preserved),
+    )
     device["sku"] = sku
 
 
@@ -429,7 +491,8 @@ def derive_hardware_sku(
     else:
         new_aiv = _positive_count(aiv_count, "hardware_derivation_aiv_count_invalid")
     s_v = float(new_aiv) / float(base_aiv) if core_override else 1.0
-    assumptions: dict[str, str] = dict(data.get("assumptions", {}))
+    base_assumptions: dict[str, str] = dict(data.get("assumptions", {}))
+    assumptions: dict[str, str] = dict(base_assumptions)
     assumptions.update({
         "derivation.base": base_hardware.sku or base_hardware.name,
         "derivation.sku": sku,
@@ -443,26 +506,35 @@ def derive_hardware_sku(
         hbm_peak_bytes_per_s, "hardware_derivation_hbm_peak_invalid")
     ceiling = None if mte2_ceiling_bytes_per_s is None else _finite_positive(
         mte2_ceiling_bytes_per_s, "hardware_derivation_mte2_ceiling_invalid")
-    hbm_eta, hbm_provenance = _resolve_efficiency(
-        hbm_efficiency, axis_hint=AXIS_HBM_PEAK, aic_count=new_aic,
-        hbm_peak=(raw_peak if raw_peak is not None else float(devices[0].get("rates", {}).get("hbm", 1.0))))
-    assumptions.update(hbm_provenance)
-    if hbm_efficiency is not None:
-        assumptions["derivation.hbm_efficiency"] = repr(hbm_eta)
-    mte2_eta, mte2_provenance = _resolve_efficiency(
-        mte2_efficiency, axis_hint=AXIS_AIC_COUNT, aic_count=new_aic,
-        hbm_peak=(raw_peak if raw_peak is not None else 1.0))
-    assumptions.update({
-        key.replace("efficiency", "mte2_efficiency", 1): value
-        for key, value in mte2_provenance.items()
-    })
+    record_hbm_assumptions = raw_peak is not None or base_hardware.homogeneous
     for device_index, device in enumerate(devices):
+        die_hbm_peak = (
+            raw_peak if raw_peak is not None
+            else _base_die_hbm_peak(device, base_assumptions)
+        )
+        die_aic = new_aic if core_override else int(device.get("compute_units", 1) or 1)
+        hbm_eta, hbm_provenance = _resolve_efficiency(
+            hbm_efficiency, axis_hint=AXIS_HBM_PEAK, aic_count=die_aic,
+            hbm_peak=die_hbm_peak)
+        mte2_eta, mte2_provenance = _resolve_efficiency(
+            mte2_efficiency, axis_hint=AXIS_AIC_COUNT, aic_count=die_aic,
+            hbm_peak=die_hbm_peak)
+        if device_index == 0:
+            assumptions.update(hbm_provenance)
+            if hbm_efficiency is not None:
+                assumptions["derivation.hbm_efficiency"] = repr(hbm_eta)
+            assumptions.update({
+                key.replace("efficiency", "mte2_efficiency", 1): value
+                for key, value in mte2_provenance.items()
+            })
         _derive_single_device(
             device, base_hardware.dies[device_index],
             arch_family=base_hardware.arch_family, sku=sku,
             core_override=core_override, new_aic=new_aic, new_aiv=new_aiv,
             s_c=s_c, s_v=s_v, memory_bytes=memory_bytes,
-            raw_peak=raw_peak, hbm_efficiency=hbm_efficiency, hbm_eta=hbm_eta,
+            raw_peak=raw_peak, die_hbm_peak=die_hbm_peak,
+            record_hbm_assumptions=record_hbm_assumptions and device_index == 0,
+            hbm_efficiency=hbm_efficiency, hbm_eta=hbm_eta,
             mte2_efficiency=mte2_efficiency, mte2_eta=mte2_eta,
             ceiling=ceiling, assumptions=assumptions,
         )

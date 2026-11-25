@@ -27,34 +27,34 @@ from mindie_sim.schema.operators import OpSpec
 
 @dataclass(frozen=True)
 class HardwareProfile:
-    """Per-die HBM bandwidth and aggregate L1 capacity across prefetch units."""
+    """Per-die HBM bandwidth and L1 prefetch unit count."""
 
     hbm_bytes_per_ms: float
-    prefetch_capacity_bytes: int
     prefetch_units: int
 
     def __post_init__(self):
         if self.hbm_bytes_per_ms <= 0 or not math.isfinite(self.hbm_bytes_per_ms):
             raise ValueError("hardware_rate_invalid:hbm_bytes_per_ms")
-        if self.prefetch_capacity_bytes < 0 or self.prefetch_units < 1:
+        if self.prefetch_units < 1:
             raise ValueError("hardware_capacity_invalid")
 
     @classmethod
-    def from_die(cls, die: Device, **overrides) -> HardwareProfile:
+    def from_die(cls, die: Device) -> HardwareProfile:
         has_l1 = "l1" in dict(die.buffers)
-        fields = dict(hbm_bytes_per_ms=die.total_rate("hbm") / 1000,
-                      prefetch_capacity_bytes=die.total_buffer_bytes("l1") if has_l1 else 0,
-                      prefetch_units=die.pool_units("l1") if has_l1 else 1)
-        return cls(**(fields | overrides))
+        return cls(
+            hbm_bytes_per_ms=die.total_rate("hbm") / 1000,
+            prefetch_units=die.pool_units("l1") if has_l1 else 1,
+        )
 
 
-def _canonical_hardware(case, hardware: HardwareProfile | None,
-                        options: Mapping[str, Any]) -> HardwareProfile:
+def _canonical_hardware(case, hardware: HardwareProfile | None = None,
+                        options: Mapping[str, Any] | None = None) -> HardwareProfile:
+    del options
     if hardware is not None:
         return hardware
     if not case.machine.dies:
         raise ValueError("hardware_case_machine_missing")
-    return HardwareProfile.from_die(case.machine.dies[0], **options.get("hardware", {}))
+    return HardwareProfile.from_die(case.machine.dies[0])
 
 
 @dataclass(frozen=True)

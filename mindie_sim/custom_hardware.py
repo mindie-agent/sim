@@ -173,14 +173,27 @@ def _resolve_archetype(
     return str(chosen)
 
 
+def _canonicalize_aliases(mapping: dict[str, Any]) -> dict[str, Any]:
+    result = dict(mapping)
+    if "max_dies" in result:
+        max_dies = result.pop("max_dies")
+        if result.get("superpod_size") is None:
+            result["superpod_size"] = max_dies
+        elif max_dies is not None and result["superpod_size"] != max_dies:
+            raise ModelingError(
+                f"custom_hardware_superpod_size_conflict:{result['superpod_size']}:{max_dies}"
+            )
+    return result
+
+
 def _merge_inputs(
     spec: Mapping[str, Any], archetype: str | None, overrides: Mapping[str, Any],
     *, prefer_spec_archetype: bool = False,
 ) -> tuple[str, dict[str, Any], dict[str, Any]]:
     if not isinstance(spec, Mapping):
         raise ModelingError("custom_hardware_spec_must_be_mapping")
-    explicit = _plain_mapping(spec, "spec")
-    explicit.update(_plain_mapping(overrides, "overrides"))
+    explicit = _canonicalize_aliases(_plain_mapping(spec, "spec"))
+    explicit.update(_canonicalize_aliases(_plain_mapping(overrides, "overrides")))
     resolved = _resolve_archetype(
         spec, archetype, prefer_spec_archetype=prefer_spec_archetype,
     )
@@ -399,6 +412,17 @@ def _derived_device_fields(
     }
 
 
+_CHANNEL_SCOPES: dict[str, str] = {
+    "intra_package": "package",
+    "intra_4p": "node",
+    "intra_8p": "node",
+    "intra_node": "node",
+    "superpod": "cross_node",
+    "inter_pod": "cross_node",
+    "inter_node": "cross_node",
+}
+
+
 def _link(
     channel: str, members: Sequence[int], bw_gbps: float, utilization: float,
     latency_us: float, *, name_prefix: str | None = None,
@@ -415,6 +439,7 @@ def _link(
         "latency_us": float(latency_us),
         "channel": channel,
         "semantics": semantics,
+        "scope": _CHANNEL_SCOPES[channel],
     }
     if not math.isclose(util, 1.0):
         record["bw_utilization"] = util
@@ -437,6 +462,21 @@ def _append_group_links(
                                semantics=semantics))
 
 
+def _append_node_subgroup_links(
+    links: list[dict[str, Any]], *, channel: str, group_size: int,
+    ranks_per_node: int, bw_gbps: Any, utilization: float, latency_us: float,
+    num_devices: int,
+) -> None:
+    if group_size <= 1 or bw_gbps is None or float(bw_gbps) <= 0.0:
+        return
+    for node_start in range(0, num_devices, ranks_per_node):
+        node_end = min(node_start + ranks_per_node, num_devices)
+        for start in range(node_start, node_end, group_size):
+            members = tuple(range(start, min(start + group_size, node_end)))
+            if len(members) > 1:
+                links.append(_link(channel, members, float(bw_gbps), utilization, latency_us))
+
+
 def _materialize_links(
     merged: Mapping[str, Any], *, num_devices: int, dies_per_package: int,
     ranks_per_node: int,
@@ -455,14 +495,16 @@ def _materialize_links(
             num_devices=num_devices, semantics="direct",
         )
     if merged.get("intra_bw_4p_gbps") is not None and dies_per_package > 0:
-        _append_group_links(
+        _append_node_subgroup_links(
             links, channel="intra_4p", group_size=4 * dies_per_package,
+            ranks_per_node=ranks_per_node,
             bw_gbps=merged.get("intra_bw_4p_gbps"), utilization=intra_util,
             latency_us=intra_latency, num_devices=num_devices,
         )
     if merged.get("intra_bw_8p_gbps") is not None and dies_per_package > 0:
-        _append_group_links(
+        _append_node_subgroup_links(
             links, channel="intra_8p", group_size=8 * dies_per_package,
+            ranks_per_node=ranks_per_node,
             bw_gbps=merged.get("intra_bw_8p_gbps"), utilization=intra_util,
             latency_us=intra_latency, num_devices=num_devices,
         )
@@ -475,9 +517,10 @@ def _materialize_links(
     superpod = merged.get("superpod_size", merged.get("max_dies"))
     superpod_size = int(superpod) if superpod is not None else 0
     if superpod_size > 0:
+        superpod_bw = merged.get("superpod_bw_gbps")
         _append_group_links(
             links, channel="superpod", group_size=min(superpod_size, num_devices),
-            bw_gbps=merged.get("superpod_bw_gbps"), utilization=inter_util,
+            bw_gbps=superpod_bw, utilization=inter_util,
             latency_us=node_latency, num_devices=num_devices,
         )
         if num_devices > superpod_size:
@@ -488,9 +531,13 @@ def _materialize_links(
                 num_devices=num_devices,
             )
         else:
+            inter_bw = merged.get("inter_node_bw_gbps")
+            if (inter_bw is not None and superpod_bw is not None
+                    and float(superpod_bw) > 0.0):
+                inter_bw = min(float(inter_bw), float(superpod_bw))
             _append_group_links(
                 links, channel="inter_node", group_size=num_devices,
-                bw_gbps=merged.get("inter_node_bw_gbps"), utilization=inter_util,
+                bw_gbps=inter_bw, utilization=inter_util,
                 latency_us=node_latency, num_devices=num_devices,
                 name_prefix="z_fallback:inter_node",
             )
