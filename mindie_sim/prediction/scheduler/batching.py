@@ -20,6 +20,7 @@ from ..capacity import Memory
 from .progress import DraftPolicy, Progress, running_first
 
 _PREEMPTED = object()
+_RETRY = object()
 _COMMIT_HISTORY_LIMIT = 2048
 
 
@@ -82,8 +83,16 @@ class Scheduler:
             raise ModelingError("scheduler_batch_already_in_flight")
         while True:
             result = self._schedule(now, defer_capacity_failure=defer_capacity_failure)
-            if result is not _PREEMPTED:
+            if result not in (_PREEMPTED, _RETRY):
                 return result
+
+    def _resize_memory(self, request_id: str, tokens: int, *, query_tokens: int) -> bool:
+        """Reserve or update per-request KV/state demand with its active verify width."""
+        if isinstance(self.memory, Memory):
+            return self.memory.resize(
+                self.replica, request_id, tokens, query_tokens=query_tokens,
+            )
+        return self.memory.resize(self.replica, request_id, tokens)
 
     def _refresh_waiting_states(self) -> None:
         """Recompute the preemption hold flag from the same Memory state.
@@ -116,10 +125,28 @@ class Scheduler:
     def _minimum_request_fits(self, state: Progress) -> bool:
         """Whether reclaiming every live holder could ever fit this request.
 
-        This uses the same Memory geometry as admission.  A request whose
-        minimum KV span exceeds the mounted per-stage budget is permanently
-        infeasible; no release callback can change that.
+        Uses the same Memory admission geometry (offload, staging, host DRAM,
+        and per-rank budgets) at the smallest legal step (minimum token span
+        and ``query_tokens=1``, since batch clipping can legally reduce decode
+        verify width to 1).  A request whose minimum step exceeds the static
+        token budget or mounted HBM/host budget is permanently infeasible.
         """
+        runtime = self.case.runtime
+        budget = runtime.max_num_batched_tokens
+        input_budget = runtime.max_num_input_tokens or budget
+        decode = state.computed >= state.prompt_target
+        if budget <= 0 or (not decode and input_budget <= 0):
+            return False
+        if not decode and not runtime.enable_chunked_prefill:
+            if state.prompt_target - state.computed > min(budget, input_budget):
+                return False
+        if hasattr(self.memory, "admission_decision"):
+            decision = self.memory.admission_decision(
+                self.replica, state.request.request_id,
+                self._minimum_request_tokens(state),
+                query_tokens=1,
+            )
+            return not bool(decision.get("permanent", False))
         if not hasattr(self.memory, "cache_bytes") or not hasattr(self.memory, "capacity"):
             return True
         capacity_table = self.memory.capacity
@@ -133,15 +160,90 @@ class Scheduler:
 
     def _mark_permanent(self, state: Progress) -> None:
         state.reason = "insufficient_cache_or_token_budget"
+        state.pending_context = None
+        state.reserved_tokens = 0
+        self._state_slots.pop(state.request.request_id, None)
         self._live_ids.discard(state.request.request_id)
         self._infeasible_ids.add(state.request.request_id)
-        self.retire_state(state.request.request_id, force=True)
+        # Preserve live async DMA consumer holds until their real completion.
+        self.retire_state(state.request.request_id, force=False)
         successor = self.successors.get(state.request.request_id)
         while successor is not None:
             successor.reason = "closed_loop_predecessor_unserved"
             self._live_ids.discard(successor.request.request_id)
             self._infeasible_ids.add(successor.request.request_id)
             successor = self.successors.get(successor.request.request_id)
+
+    def _handle_unscheduled_arrived(
+        self, arrived: list[Progress], *, defer_capacity_failure: bool,
+    ):
+        """Resolve an empty scheduling pass via permanent retirement, preemption, or wait."""
+        permanent = [state for state in arrived
+                     if not self._minimum_request_fits(state)]
+        feasible = [state for state in arrived
+                    if state not in permanent]
+        if permanent:
+            for state in permanent:
+                self._mark_permanent(state)
+            if feasible:
+                return _RETRY
+            self.last_reason = "capacity_or_budget_exhausted"
+            return None
+        running = [state for state in arrived if state.started]
+        if len(running) > 1 and not defer_capacity_failure:
+            victim = running[-1]
+            # Preemption revokes this request's logical demand.  A
+            # still-running reader keeps its physical allocation until its
+            # real completion; only the confirmed cancel/finish branch may
+            # force-release the corresponding references.
+            self.retire_state(victim.request.request_id, force=False)
+            committed_context = (
+                victim.request.prompt_tokens + max(0, victim.generated - 1)
+            )
+            victim.recompute_to = max(
+                victim.recompute_to, victim.computed, committed_context,
+            )
+            victim.computed = min(victim.request.prefix_tokens,
+                                  max(0, victim.request.prompt_tokens - 1))
+            victim.started = False
+            victim.preemptions += 1
+            victim.state_version += 1
+            victim.state_generation += 1
+            victim.last_state_publication = ""
+            self._state_slots.pop(victim.request.request_id, None)
+            victim.pending_context = None
+            victim.reserved_tokens = 0
+            victim.waiting_for_release = bool(
+                self.memory.pending_async_consumers(
+                    self.replica, victim.request.request_id)
+                or self.memory.is_retired(
+                    self.replica, victim.request.request_id))
+            self.last_reason = "preempted"
+            return _PREEMPTED
+        # A PD transfer, async consumer, delayed release, selected/shared
+        # reservation or grant owns the same Memory until a real event.
+        # That event can release capacity without evicting or failing a
+        # waiting request.  A request whose minimum span already exceeds
+        # the mounted budget is permanently infeasible regardless of any
+        # currently reclaimable reference.
+        if feasible and (defer_capacity_failure
+                         or self.memory.has_delayed_releases(self.replica)
+                         or self._has_reclaimable_capacity(feasible)):
+            self.last_reason = "waiting_for_release"
+            return None
+        waiting = [state for state in feasible if not state.started]
+        if running and waiting:
+            # Running requests held slots/KV while failing their next chunk;
+            # retire only the blocked active set and retry waiting requests.
+            for state in running:
+                self._mark_permanent(state)
+            return _RETRY
+        for state in feasible:
+            self._mark_permanent(state)
+        # The loop has exhausted admission and preemption. This is a real
+        # capacity/budget inability, never an absence-of-measurements gate.
+        self.last_reason = "capacity_or_budget_exhausted"
+        return None
 
     def _schedule(self, now, *, defer_capacity_failure):
         runtime = self.case.runtime
@@ -181,6 +283,7 @@ class Scheduler:
             if q <= 0:
                 continue
             allocation = q + proposal
+            verify_width = 1 + proposal
             lookahead_steps = getattr(self.memory, "async_in_flight_lookahead_steps", 0)
             lookahead = (
                 min(max(0, remaining - allocation), lookahead_steps * allocation)
@@ -191,13 +294,15 @@ class Scheduler:
             # correctness requirement.  If the next-step headroom is missing,
             # execute the current batch with only the rows it really reserves;
             # do not turn a transient async reservation into an unserved request.
-            if not self.memory.resize(
-                    self.replica, state.request.request_id,
-                    state.computed + allocation + lookahead):
+            if not self._resize_memory(
+                    state.request.request_id,
+                    state.computed + allocation + lookahead,
+                    query_tokens=verify_width):
                 lookahead = 0
-                if not self.memory.resize(
-                        self.replica, state.request.request_id,
-                        state.computed + allocation):
+                if not self._resize_memory(
+                        state.request.request_id,
+                        state.computed + allocation,
+                        query_tokens=verify_width):
                     continue
             state.pending_context = state.computed + allocation
             state.reserved_tokens = allocation
@@ -212,57 +317,9 @@ class Scheduler:
             if not decode:
                 input_budget -= q
         if not views:
-            running = [state for state in arrived if state.started]
-            if len(running) > 1 and not defer_capacity_failure:
-                victim = running[-1]
-                # Preemption revokes this request's logical demand.  A
-                # still-running reader keeps its physical allocation until its
-                # real completion; only the confirmed cancel/finish branch may
-                # force-release the corresponding references.
-                self.retire_state(victim.request.request_id, force=False)
-                victim.recompute_to = victim.computed
-                victim.computed = min(victim.request.prefix_tokens,
-                                      max(0, victim.request.prompt_tokens - 1))
-                victim.started = False
-                victim.preemptions += 1
-                victim.state_version += 1
-                victim.state_generation += 1
-                victim.last_state_publication = ""
-                self._state_slots.pop(victim.request.request_id, None)
-                victim.pending_context = None
-                victim.reserved_tokens = 0
-                victim.waiting_for_release = bool(
-                    self.memory.pending_async_consumers(
-                        self.replica, victim.request.request_id)
-                    or self.memory.is_retired(
-                        self.replica, victim.request.request_id))
-                self.last_reason = "preempted"
-                return _PREEMPTED
-            # A PD transfer, async consumer, delayed release, selected/shared
-            # reservation or grant owns the same Memory until a real event.
-            # That event can release capacity without evicting or failing a
-            # waiting request.  A request whose minimum span already exceeds
-            # the mounted budget is permanently infeasible regardless of any
-            # currently reclaimable reference.
-            permanent = [state for state in arrived
-                         if not self._minimum_request_fits(state)]
-            feasible = [state for state in arrived
-                        if state not in permanent]
-            if permanent:
-                for state in permanent:
-                    self._mark_permanent(state)
-            if feasible and (defer_capacity_failure
-                             or self.memory.has_delayed_releases(self.replica)
-                             or self._has_reclaimable_capacity(feasible)):
-                self.last_reason = "waiting_for_release"
-                return None
-            if not permanent:
-                for state in feasible:
-                    self._mark_permanent(state)
-            # The loop has exhausted admission and preemption. This is a real
-            # capacity/budget inability, never an absence-of-measurements gate.
-            self.last_reason = "capacity_or_budget_exhausted"
-            return None
+            return self._handle_unscheduled_arrived(
+                arrived, defer_capacity_failure=defer_capacity_failure,
+            )
         self.in_flight = tuple(views)
         self.last_reason = "scheduled"
         result = IterationPlan(tuple(views), iteration=self.iteration,
@@ -342,7 +399,13 @@ class Scheduler:
                     successor.release_ms = max(successor.request.arrival_ms,
                                                state.finish_ms + successor.request.gap_ms)
             else:
-                if not self.memory.resize(self.replica, view.request_id, state.computed):
+                verify_width = (
+                    1 + int(view.draft_proposal_tokens)
+                    if view.phase == "decode" else 1
+                )
+                if not self._resize_memory(
+                        view.request_id, state.computed,
+                        query_tokens=verify_width):
                     raise ModelingError(
                         "committed_kv_state_exceeds_reserved_capacity:"
                         + view.request_id)
@@ -464,14 +527,71 @@ class Scheduler:
         execution.memory = self.memory
         execution._offload_memory = self.memory
 
+    def _affected_replicas(self) -> tuple[int, ...]:
+        """Replicas whose pools can constrain admission on ``self.replica``."""
+        p = self.case.runtime.parallel
+        dp_width = max(1, int(getattr(p, "dcp_dp_width", 1) or 1))
+        if (bool(getattr(p, "cp_spans_dp", False))
+                and dp_width > 1
+                and getattr(self.memory, "rank_token_owners", None) is None):
+            start = (self.replica // dp_width) * dp_width
+            end = min(int(p.dp), start + dp_width)
+            return tuple(range(start, end))
+        return (self.replica,)
+
+    def _replica_headroom_by_stage(
+        self, capacity: list[float], live: list[float],
+    ) -> tuple[list[float], list[float], list[float]]:
+        """Derive per-stage ``(immediate, post_reclaim, reclaimable)`` headroom bytes.
+
+        Consumes ``ResidentMemoryReceipt`` (immediate = ``usable - live``,
+        post-reclaim = ``usable - (live - reclaimable)``, never historical peak)
+        when backed by the unified Memory ledger.  Stage reclaimable capacity
+        is the exact difference between stage post-reclaim and immediate minima.
+        """
+        if hasattr(self.memory, "resident_memory_receipt"):
+            receipt = self.memory.resident_memory_receipt()
+            by_stage: dict[int, list[Any]] = {}
+            for die in receipt.dies:
+                if die.replica == self.replica:
+                    by_stage.setdefault(die.stage, []).append(die)
+            if by_stage:
+                stages = sorted(by_stage)
+                immediate = [
+                    float(min(d.immediate_free_hbm_headroom_bytes for d in by_stage[st]))
+                    for st in stages
+                ]
+                post_reclaim = [
+                    float(min(d.post_reclaim_free_hbm_headroom_bytes for d in by_stage[st]))
+                    for st in stages
+                ]
+                reclaimable = [
+                    float(max(0.0, post - imm))
+                    for imm, post in zip(immediate, post_reclaim)
+                ]
+                return immediate, post_reclaim, reclaimable
+        if hasattr(self.memory, "physical_usage"):
+            usage = self.memory.physical_usage(self.replica)
+            caps = usage.get("rank_capacity_bytes_per_stage_rank") or ()
+            occ = usage.get("hbm_bytes_per_stage_rank") or ()
+            if caps and occ:
+                immediate = [
+                    float(min(float(c) - float(u) for c, u in zip(c_row, u_row)))
+                    for c_row, u_row in zip(caps, occ)
+                    if c_row and u_row
+                ]
+                return immediate, list(immediate), [0.0] * len(immediate)
+        immediate = [float(cap - used) for cap, used in zip(capacity, live)] if capacity else []
+        return immediate, list(immediate), [0.0] * len(immediate)
+
     def _has_reclaimable_capacity(self, states=None) -> bool:
         """True when a real T08 release/hold event can make room.
 
-        This is a view of the same Memory instance, not a second capacity
-        estimate.  It only names already-accounted grants/selected/shared
-        reservations, delayed releases, and async consumer holds that can be
-        released by their actual completion or cancellation.  A request whose
-        own minimum span can never fit is not made feasible by any release.
+        Inspects the authoritative ``ResidentMemoryReceipt`` post-reclaim
+        margin, HBM and host-DRAM grants/reservations, grant readers, delayed
+        releases, async consumer holds, and peer DCP-cohort holders across all
+        affected replicas.  A request whose minimum span can never fit is not
+        made feasible by any release.
         """
         if states:
             states = [state for state in states
@@ -479,16 +599,51 @@ class Scheduler:
             if not states:
                 return False
         memory = self.memory
-        if hasattr(memory, "has_delayed_releases") and memory.has_delayed_releases(self.replica):
-            return True
+        replicas = set(self._affected_replicas())
+        if hasattr(memory, "resident_memory_receipt"):
+            receipt = memory.resident_memory_receipt()
+            if any(
+                die.post_reclaim_free_hbm_headroom_bytes > die.immediate_free_hbm_headroom_bytes
+                for die in receipt.dies
+                if die.replica in replicas
+            ):
+                return True
+        if states and hasattr(memory, "admission_decision"):
+            for state in states:
+                decision = memory.admission_decision(
+                    self.replica, state.request.request_id,
+                    self._minimum_request_tokens(state),
+                    query_tokens=1,
+                )
+                if decision.get("wake_events"):
+                    return True
+        if hasattr(memory, "has_delayed_releases"):
+            if any(memory.has_delayed_releases(rep) for rep in replicas):
+                return True
         for attr in ("granted", "selected_reserved", "shared_reserved"):
             rows = getattr(memory, attr, None)
-            if rows and any(float(value) > 0.0 for value in rows[self.replica]):
+            if rows and any(
+                float(value) > 0.0
+                for rep in replicas if rep < len(rows)
+                for value in rows[rep]
+            ):
                 return True
+        granted_host = getattr(memory, "granted_host", None)
+        if granted_host and any(
+            float(granted_host[rep]) > 0.0
+            for rep in replicas if rep < len(granted_host)
+        ):
+            return True
+        grant_readers = getattr(memory, "grant_readers", {}) or {}
+        if any(replica in replicas and bool(readers)
+               for (replica, _grant), readers in grant_readers.items()):
+            return True
         holders = getattr(memory, "owners", {}) or {}
         for replica, request in holders:
-            if replica != self.replica:
+            if replica not in replicas:
                 continue
+            if replica != self.replica:
+                return True
             if hasattr(memory, "pending_async_consumers"):
                 if memory.pending_async_consumers(replica, request):
                     return True
@@ -625,6 +780,9 @@ class Scheduler:
             })
         infeasible = sorted(state.request.request_id for state in selected_states
                             if state.reason is not None)
+        immediate_headroom, post_reclaim_headroom, reclaimable_by_stage = (
+            self._replica_headroom_by_stage(capacity, live)
+        )
         return {
             "schema": "mindie-sim.scheduler-feedback/1",
             "replica": self.replica,
@@ -645,9 +803,10 @@ class Scheduler:
             "capacity": {
                 "cache_bytes_by_stage": [float(value) for value in live],
                 "kv_capacity_bytes_by_stage": [float(value) for value in capacity],
-                "headroom_bytes_by_stage": [
-                    float(cap - used) for cap, used in zip(capacity, live)
-                ] if capacity else [],
+                "headroom_bytes_by_stage": immediate_headroom,
+                "immediate_free_hbm_headroom_bytes_by_stage": immediate_headroom,
+                "post_reclaim_free_hbm_headroom_bytes_by_stage": post_reclaim_headroom,
+                "reclaimable_bytes_by_stage": reclaimable_by_stage,
                 "granted_bytes_by_stage": [
                     float(value) for value in memory_granted[self.replica]
                 ] if memory_granted else [],

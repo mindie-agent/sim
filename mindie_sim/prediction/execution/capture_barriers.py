@@ -25,13 +25,29 @@ CAPTURE_FLAG_KEYS = (
 )
 CAPTURE_BLOCKER_KEYS = ("explicit_capture_blockers", "capture_blockers",
                         "capture_blocker")
-STATE_EFFECT_KEYS = ("state_effects",)
+STATE_EFFECT_KEYS = ("state_effects", "gdn_state_effects")
 _CACHE_BOUNDARY_KEYS = ("cache_store", "cache_mutation", "mutates_cache",
-                        "cache_write", "gdn_state_effects")
-_MUTATING_ACTIONS = frozenset({"write", "read_write", "write_candidate"})
+                        "cache_write")
+_MUTATING_ACTIONS = frozenset({"write", "read_write", "write_candidate",
+                               "commit", "rollback"})
+
+
+def _iter_state_effects(metadata: Mapping):
+    """Yield every declared state effect across all supported metadata keys."""
+    meta = dict(metadata)
+    for key in STATE_EFFECT_KEYS:
+        raw = meta.get(key)
+        if not raw:
+            continue
+        if isinstance(raw, (tuple, list)):
+            yield from raw
+        else:
+            yield raw
 
 
 def _effect_is_mutating(effect: Any) -> bool:
+    if hasattr(effect, "to_dict") and not isinstance(effect, Mapping):
+        effect = effect.to_dict()
     if not isinstance(effect, Mapping):
         return True
     return str(effect.get("action") or "write") in _MUTATING_ACTIONS
@@ -39,12 +55,8 @@ def _effect_is_mutating(effect: Any) -> bool:
 
 def has_mutating_state_effect(metadata: Mapping) -> bool:
     """True when a declared state effect writes, not merely reads."""
-    raw = dict(metadata).get("state_effects")
-    if not raw:
-        return False
-    if isinstance(raw, (tuple, list)):
-        return any(_effect_is_mutating(effect) for effect in raw)
-    return True
+    return any(_effect_is_mutating(effect)
+               for effect in _iter_state_effects(metadata))
 
 
 def pointer_unstable(metadata: Mapping) -> bool:
@@ -73,30 +85,27 @@ def normalized_capture_metadata(member_specs: tuple) -> dict:
     """Union capture-blocking facts of every contracted member."""
     found: dict[str, object] = {}
     blockers: list[str] = []
-    effects: list[dict] = []
+    effects: list[object] = []
     seen_effects: set[tuple] = set()
     for spec in member_specs:
         meta = dict(spec.metadata)
         for key in CAPTURE_FLAG_KEYS:
             if meta.get(key):
                 found[key] = meta[key]
-        for key in STATE_EFFECT_KEYS:
-            raw = meta.get(key)
-            if isinstance(raw, Mapping):
-                effects_here = (raw,)
-            elif isinstance(raw, (tuple, list)):
-                effects_here = raw
-            else:
-                continue
-            for effect in effects_here:
-                if not isinstance(effect, Mapping):
-                    continue
+        for effect in _iter_state_effects(meta):
+            if hasattr(effect, "to_dict") and not isinstance(effect, Mapping):
+                effect = effect.to_dict()
+            if isinstance(effect, Mapping):
                 record = dict(effect)
-                identity = tuple(sorted((str(k), repr(v))
-                                        for k, v in record.items()))
-                if identity not in seen_effects:
-                    seen_effects.add(identity)
-                    effects.append(record)
+                identity = ("mapping", tuple(sorted((str(k), repr(v))
+                                                    for k, v in record.items())))
+                normalized: object = record
+            else:
+                identity = ("opaque", repr(effect))
+                normalized = effect
+            if identity not in seen_effects:
+                seen_effects.add(identity)
+                effects.append(normalized)
         if pointer_unstable(meta):
             found["pointer_stable"] = False
         blockers.extend(declared_blockers(meta))
@@ -122,7 +131,7 @@ def standalone_capture_blockers(op, node=None) -> tuple[str, ...]:
     if getattr(op, "family", "") in {"allreduce", "allgather", "reduce_scatter"} \
             or (node is not None and node.collective):
         found.append(f"collective:{op_id}")
-    if node is not None and node.state_effect:
+    if node is not None and str(node.state_effect) in _MUTATING_ACTIONS:
         found.append(f"state_write:{op_id}")
     if any(meta.get(key) for key in _CACHE_BOUNDARY_KEYS):
         found.append(f"capture_boundary_state:{op_id}")
