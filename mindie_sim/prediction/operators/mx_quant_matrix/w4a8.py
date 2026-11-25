@@ -398,7 +398,6 @@ def ledger(config):
                    "read_bytes": reference["matrix"].resources["mte2"],
                    "write_bytes": MSD_WORKSPACE_BYTES_PER_OUTPUT * m * n,
                    "publication_role": "fixpipe; additional service only when declared",
-                   "column_scale_ops": 2 * m * n,
                    "expression": "double-M INT4 product 4MNK; every N tile reads "
                                  "its A slice; each M tile reads its weight panel"},
         "post_dequant": {"read_bytes": reference["post_dequant"].resources["mte2"],
@@ -546,7 +545,6 @@ def describe(config):
         "limitations": [
             "explicit_coarse_phase_order_does_not_claim_native_workspace_pipeline_overlap",
             "workspace_split_chunk_boundaries_not_reconstructed",
-            "column_scale_charged_once_as_declared_vector_equivalent",
             "matrix_publication_HBM_retained; Fixpipe_service_requires_declared_rate",
             "post_assist_loads_duplicate_across_owner_group_segments",
             "per_owner_phases_use_global_coarse_phase_barriers_not_chunk_overlap",

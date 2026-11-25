@@ -435,20 +435,35 @@ def select_band(
 
 def frame_wire_bytes(
     payload_bytes: int | float, band: CollectiveBandSpec
-) -> tuple[int, float]:
+) -> tuple[int, int | float]:
     """Compute ``(frame_count, wire_bytes)`` under ``band`` MTU + framing policy."""
-    payload = float(payload_bytes)
-    if payload <= 0.0:
-        return 0, 0.0
-    frames = max(1, math.ceil(payload / float(band.payload_bytes_per_frame) - 1e-12))
+    is_exact_int = type(payload_bytes) is int
+    if is_exact_int:
+        if payload_bytes <= 0:
+            return 0, 0
+        exact: int | None = payload_bytes
+        payload = float(payload_bytes)
+    else:
+        payload = float(payload_bytes)
+        if payload <= 0.0:
+            return 0, 0.0
+        exact = int(payload) if payload.is_integer() else None
+    pbf = int(band.payload_bytes_per_frame)
+    wbf = int(band.wire_bytes_per_frame)
+    if exact is not None:
+        frames = (exact + pbf - 1) // pbf
+    else:
+        frames = max(1, math.ceil(payload / float(pbf) - 1e-12))
     policy = getattr(band, "short_final_frame_policy", "exact_plus_header")
     if policy == "pad_full_frame":
-        return frames, float(frames * int(band.wire_bytes_per_frame))
+        total = frames * wbf
+        return frames, total if is_exact_int else float(total)
     if policy != "exact_plus_header":
         raise ModelingError(f"collective_band_short_final_frame_policy_invalid:{policy}")
-    header_per_frame = max(
-        0, int(band.wire_bytes_per_frame) - int(band.payload_bytes_per_frame)
-    )
+    header_per_frame = max(0, wbf - pbf)
+    if exact is not None:
+        total = exact + frames * header_per_frame
+        return frames, total if is_exact_int else float(total)
     return frames, float(payload + frames * header_per_frame)
 
 
@@ -514,7 +529,7 @@ def _validate_alltoallv_inputs(
 
 def _build_transfer(
     phase_name: str, round_index: int, source: int, destination: int,
-    payload_bytes: float, band: CollectiveBandSpec, topology,
+    payload_bytes: int | float, band: CollectiveBandSpec, topology,
     *, slice_index: int = 0,
 ) -> LoweredTransfer:
     frames, wire_bytes = frame_wire_bytes(payload_bytes, band)
@@ -556,7 +571,7 @@ def _build_transfer(
         phase_name=phase_name, round_index=round_index,
         source=int(source), destination=int(destination),
         payload_bytes=float(payload_bytes), frames=frames,
-        wire_bytes=wire_bytes, hops=tuple(hops),
+        wire_bytes=float(wire_bytes), hops=tuple(hops),
         slice_index=int(slice_index),
         flow_cap_bytes_per_ms=min(flow_caps) if flow_caps else None,
     )
@@ -1030,8 +1045,8 @@ def lower_collective(
             for d_idx, dst in enumerate(group):
                 if s_idx == d_idx or matrix[s_idx][d_idx] == 0:
                     continue
-                amount = float(matrix[s_idx][d_idx])
-                per_rank_payload[src] += amount
+                amount = matrix[s_idx][d_idx]
+                per_rank_payload[src] += float(amount)
                 transfers.append(_build_transfer("alltoallv", 0, src, dst, amount, band, topology))
         phases = (LoweredPhase("alltoallv", 1, tuple(transfers), phase_startup),) if transfers else ()
     elif api_bytes == 0.0 or count <= 1:

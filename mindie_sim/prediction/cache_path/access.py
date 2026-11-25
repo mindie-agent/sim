@@ -67,7 +67,7 @@ def _prepare_access(
             evicted_bytes=0, writeback_bytes=0, direct_write_bytes=0,
             hit_lines=0, miss_lines=0, resident_bytes=self._resident_bytes,
             bypassed=bypass, cold_path=policy.cold,
-            ready_ms=float(policy.ready_ms),
+            ready_ms=float(policy.ready_ms), line_bytes=line,
         )
         return CacheAccessReservation(
             self, identity, 0, 0, target_ranges=(), dirty_ranges=(),
@@ -147,7 +147,7 @@ def _reserve_bypass(
         hit_lines=0, miss_lines=line_count,
         resident_bytes=self._resident_bytes + self._reserved_bytes,
         bypassed=True, cold_path=policy.cold,
-        ready_ms=float(policy.ready_ms),
+        ready_ms=float(policy.ready_ms), line_bytes=line,
     )
     holder = self._new_holder()
     held = (identity,)
@@ -308,6 +308,7 @@ def _reserve_resident(
         miss_lines=range_count(miss_lines_ranges),
         resident_bytes=self._resident_bytes + self._reserved_bytes,
         bypassed=False, cold_path=False, ready_ms=float(policy.ready_ms),
+        line_bytes=line,
     )
     return CacheAccessReservation(
         self, identity, target_lines, range_count(dirty_lines_new),

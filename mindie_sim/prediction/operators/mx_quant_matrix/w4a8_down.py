@@ -113,7 +113,6 @@ SUPPORTED_EXPERT_ROW_BASES = {
 LIMITATIONS = (
     "explicit_coarse_phase_order_does_not_claim_native_workspace_pipeline_overlap",
     "source_chunk_boundaries_and_exact_tiles_not_reconstructed",
-    "column_scale_charged_once_as_declared_vector_equivalent",
     "matrix_publication_HBM_retained; Fixpipe_service_requires_declared_rate",
     "CV11_or_CV12_host_selection;UB_row_chunks_rotate_with_persistent_vecCount",
     "per_owner_phases_use_global_coarse_phase_barriers_not_chunk_overlap",
@@ -355,7 +354,6 @@ def ledger(config):
             "read_bytes": reference["matrix"].resources["mte2"],
             "write_bytes": MSD_WORKSPACE_BYTES_PER_OUTPUT * m * n,
             "publication_role": "fixpipe; additional service only when declared",
-            "column_scale_ops": 2 * m * n,
             "active_weight_banks": active,
             "weight_bytes": 0.5 * n * k * m_panels,
             "encoded_scale_bytes": COLUMN_SCALE_BYTES * n * m_panels,

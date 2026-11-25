@@ -26,7 +26,100 @@ from typing import Any
 
 from mindie_sim.schema.common import ModelingError
 from ..program import NativeProgram
+from .context import _admission_l2_cache_key
 from .streams import _meta_patch
+
+
+def live_stage_l2_state(execution, replica: int, stage: int):
+    """Return ``(view, l2_cache_key)`` for the live stage admission memory view."""
+    view = execution._live_admission_memory_view()
+    if view is None:
+        return None, None
+    stage_geom = execution.stage_geometry.get((replica, stage))
+    die_rank = getattr(stage_geom, "rank", None)
+    if die_rank is None:
+        dies = execution.stage_dies.get((replica, stage))
+        if dies:
+            die_rank = int(dies[0].rank)
+    die_id = 0 if die_rank is None else int(die_rank)
+    return view, _admission_l2_cache_key(view, die_id)
+
+
+def undo_invocation_record(execution, inv_record) -> None:
+    """Roll back one superseded invocation count by invocation record dict."""
+    if inv_record is not None:
+        inv_id = inv_record.get("id")
+        if inv_id is not None:
+            cost_invs = execution.cost.invocations
+            rec = cost_invs.get(inv_id)
+            if rec is not None and rec["invocations"] > 0:
+                if rec["invocations"] > 1:
+                    rec["invocations"] -= 1
+                else:
+                    rec["invocations"] = 0
+                    cost_invs.pop(inv_id, None)
+    if execution.cost.counts.get("analytic_work", 0) > 0:
+        execution.cost.counts["analytic_work"] -= 1
+
+
+def undo_superseded_invocation(execution, inv_cell) -> None:
+    """Roll back one speculative invocation count when L2 state supersedes a prep."""
+    if inv_cell is not None:
+        cost_invs = execution.cost.invocations
+        rec = inv_cell[3] if inv_cell[2] is cost_invs else cost_invs.get(inv_cell[0])
+        if rec is not None and rec["invocations"] > 0:
+            if rec["invocations"] > 1:
+                rec["invocations"] -= 1
+            else:
+                rec["invocations"] = 0
+                cost_invs.pop(inv_cell[0], None)
+                if inv_cell[2] is cost_invs:
+                    inv_cell[3] = None
+    if execution.cost.counts.get("analytic_work", 0) > 0:
+        execution.cost.counts["analytic_work"] -= 1
+
+
+def _wrap_live_startup_program(
+    program, *, execution, replica: int, scope: str, compact_exec: bool,
+    op, prev_res_op, inv_record, live_view, live_l2_key,
+    prepare_op_context=None,
+):
+    """Re-bind an InvocationProgram body after startup if live L2 state changed."""
+    if live_view is None:
+        return program
+    from ..program.invocation import InvocationProgram
+    if not isinstance(program, InvocationProgram):
+        return program
+    eff_startup = max(
+        (program.timing.startup_ms, *(c.startup_ms for c in program.constraints)),
+        default=program.timing.startup_ms,
+    )
+    if eff_startup <= 0.0:
+        return program
+
+    def resolve_body():
+        cur_view, cur_l2_key = live_stage_l2_state(execution, replica, op.stage)
+        if cur_view is live_view and cur_l2_key == live_l2_key:
+            return program.body
+        undo_invocation_record(execution, inv_record)
+        if prepare_op_context is not None:
+            cur_res_op, cur_recipe, cur_ctx = prepare_op_context(op)
+        else:
+            cur_res_op, cur_recipe = execution.prepare(op, replica)
+            cur_ctx = execution._context(cur_res_op, replica, scope, recipe=cur_recipe)
+        for key in execution.work:
+            delta = float(getattr(cur_res_op, key)) - float(getattr(prev_res_op, key))
+            if delta != 0.0:
+                execution.work[key] += delta
+        fresh = cur_recipe.lower(replace(cur_ctx, minimum_ms=0, invocation_timing=None))
+        fresh = execution._apply_resource_service_program(cur_ctx, fresh)
+        fresh = execution._apply_stream_owners_program(cur_ctx, fresh)
+        if compact_exec:
+            from ..program import coalesce_execution_program
+            fresh = coalesce_execution_program(fresh)
+        return fresh
+
+    return replace(program, body_resolver=resolve_body)
 
 
 def build_verified_dag(physical_ops, prev_dag):
@@ -192,10 +285,72 @@ def collect_begin_after(idx, op, launch, tail, dep_specs, op_events,
     return tuple(deps) or (schedule,)
 
 
+def _lower_and_start_uncached(
+    execution, engine, replica, owner, compact_exec,
+    cur_res_op, recipe, ctx, name, ready_ev, *,
+    orig_op=None, scope="none", live_view=None, live_l2_key=None,
+    inv_record=None, prepare_op_context=None,
+):
+    """Lower and start one op directly when cached L2 residency state is stale."""
+    execution.replay_counts["real"] += 1
+    program = execution.lower_program(ctx, recipe)
+    program = execution._apply_resource_service_program(ctx, program)
+    program = execution._apply_stream_owners_program(ctx, program)
+    if compact_exec:
+        from ..program import coalesce_execution_program
+        program = coalesce_execution_program(program)
+    is_native_prog = isinstance(program, NativeProgram)
+    has_handles = is_native_prog and hasattr(
+        program.program, "start_with_handles")
+    transport = (
+        execution.native_transport(cur_res_op, replica)
+        if getattr(recipe, "native", False) else None
+    )
+    if has_handles and cur_res_op.op_id not in execution.native_group_launches:
+        execution._record_single_native(
+            ctx, program, replica, name, transport=transport)
+    if is_native_prog:
+        if transport is None:
+            return program.program.start(engine, name, ready_ev)
+        return program.start(engine, name, ready_ev, transport=transport)
+    program = _wrap_live_startup_program(
+        program, execution=execution, replica=replica, scope=scope,
+        compact_exec=compact_exec,
+        op=cur_res_op if orig_op is None else orig_op,
+        prev_res_op=cur_res_op, inv_record=inv_record,
+        live_view=live_view, live_l2_key=live_l2_key,
+        prepare_op_context=prepare_op_context,
+    )
+    return program.start(engine, name, ready_ev, owner=owner)
+
+
 def run_cached_bundle(execution, engine, replica, owner, compact_exec,
                       op, name, ready_ev, fast_entry, res_op_tmpl,
-                      meta_diff, context_tmpl):
+                      meta_diff, context_tmpl, *, scope="none",
+                      prepare_op_context=None):
     """Execute one cached lazy-submit operator bundle, lowering on first miss."""
+    live_view, live_l2_key = live_stage_l2_state(execution, replica, op.stage)
+    if ((len(fast_entry) >= 3 and fast_entry[2] != live_l2_key)
+            or context_tmpl.admission_memory_view is not live_view):
+        undo_superseded_invocation(execution, fast_entry[0][7])
+        if prepare_op_context is not None:
+            cur_res_op, recipe, ctx = prepare_op_context(op)
+        else:
+            cur_res_op, recipe = execution.prepare(op, replica)
+            ctx = execution._context(cur_res_op, replica, scope, recipe=recipe)
+        for key in execution.work:
+            delta = float(getattr(cur_res_op, key)) - float(getattr(res_op_tmpl, key))
+            if delta != 0.0:
+                execution.work[key] += delta
+        return _lower_and_start_uncached(
+            execution, engine, replica, owner, compact_exec,
+            cur_res_op, recipe, ctx, name, ready_ev,
+            orig_op=op, scope=scope, live_view=live_view, live_l2_key=live_l2_key,
+            inv_record=execution._last_invocation_record,
+            prepare_op_context=prepare_op_context,
+        )
+    inv_cell = fast_entry[0][7]
+    inv_rec = inv_cell[1] if inv_cell is not None else None
     prog_bundle = fast_entry[1]
     if prog_bundle is not None:
         (program, mapped_entries, svc_calls,
@@ -235,7 +390,13 @@ def run_cached_bundle(execution, engine, replica, owner, compact_exec,
             if transport is None:
                 return program.program.start(engine, name, ready_ev)
             return program.start(engine, name, ready_ev, transport=transport)
-        return program.start(engine, name, ready_ev, owner=owner)
+        run_prog = _wrap_live_startup_program(
+            program, execution=execution, replica=replica, scope=scope,
+            compact_exec=compact_exec, op=op, prev_res_op=res_op_tmpl,
+            inv_record=inv_rec, live_view=live_view, live_l2_key=live_l2_key,
+            prepare_op_context=prepare_op_context,
+        )
+        return run_prog.start(engine, name, ready_ev, owner=owner)
 
     recipe = fast_entry[0][3]
     meta = op.metadata
@@ -249,7 +410,7 @@ def run_cached_bundle(execution, engine, replica, owner, compact_exec,
             deps=op.deps, requests=op.requests,
             stream=op.stream, notes=op.notes, metadata=meta)
     )
-    ctx = replace(context_tmpl, op=cur_res_op)
+    ctx = replace(context_tmpl, op=cur_res_op, admission_memory_view=live_view)
     mapped_list = []
     svc_list = []
     orig_rec = ctx.record_mapping
@@ -299,4 +460,10 @@ def run_cached_bundle(execution, engine, replica, owner, compact_exec,
             ctx, program, replica, name, transport=transport)
     if is_native_prog:
         return program.start(engine, name, ready_ev, transport=transport)
-    return program.start(engine, name, ready_ev, owner=owner)
+    run_prog = _wrap_live_startup_program(
+        program, execution=execution, replica=replica, scope=scope,
+        compact_exec=compact_exec, op=op, prev_res_op=cur_res_op,
+        inv_record=inv_rec, live_view=live_view, live_l2_key=live_l2_key,
+        prepare_op_context=prepare_op_context,
+    )
+    return run_prog.start(engine, name, ready_ev, owner=owner)

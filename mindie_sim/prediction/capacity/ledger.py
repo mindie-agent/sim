@@ -2274,7 +2274,9 @@ class _MemoryLedgerMixin:
         quant = require_model_quant(model)
         vision_all = int(round(sum(
             term_bytes(term, quant, p, self.case.machine.ranks_per_node)
-            for term in vision_weight_terms(model, include_vision=True, parallel=p)
+            for term in vision_weight_terms(
+                model, include_vision=True, parallel=p, runtime=self.case.runtime,
+            )
         )))
         currently_included = (self.vision_accounting == "full_checkpoint") and (vision_all > 0)
         want_included = (vision_accounting == "full_checkpoint") and (vision_all > 0)
@@ -2306,6 +2308,7 @@ class _MemoryLedgerMixin:
             include_vision=include_vision,
             layer_partition=self.layers,
             slot_plans=self.slot_plans,
+            runtime=self.case.runtime,
         )
         shared_dp = bool(getattr(self, "enable_shared_expert_dp", False))
         pcp_o_proj = bool(getattr(self, "enable_pcp_o_proj_weight_sharding", False))

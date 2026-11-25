@@ -381,7 +381,7 @@ def study(candidates, probes, *, level="operators", serving=False, primitives=No
             "id": name, "status": "modeled", "case_key": _fingerprint(case.to_dict()),
             **model_coverage(case.model),
             "parallel": case.runtime.parallel.to_dict(),
-            "independent_cohorts": len(cohorts(case.runtime.parallel)),
+            "independent_cohorts": len(cohorts(case.runtime.parallel, case.machine)),
         }
         for probe in probes:
             try:

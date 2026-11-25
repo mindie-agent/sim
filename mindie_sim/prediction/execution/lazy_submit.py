@@ -33,12 +33,16 @@ from ..engine import Event
 from ..execution.state import memory_bindings_for
 from ..program import KernelProgram
 from .lazy_dag import (
+    _lower_and_start_uncached,
     build_verified_dag,
     collect_begin_after,
+    live_stage_l2_state,
     run_cached_bundle,
     stage_memory_info,
+    undo_invocation_record,
+    undo_superseded_invocation,
 )
-from .streams import _meta_diff, _meta_patch
+from .streams import _freeze_key, _meta_diff, _meta_patch
 from .submission import ScheduledIteration
 
 COMPACT_SUBMIT_MIN_OPS = 32
@@ -408,6 +412,16 @@ class _LazyFrontier:
             self.pending_activations.extend(woken)
             self._drain_activations()
 
+    @staticmethod
+    def _entry_matches_live_l2(entry, live_view, live_l2_key) -> bool:
+        return (
+            entry is not None
+            and entry is not False
+            and len(entry) >= 3
+            and entry[2] == live_l2_key
+            and entry[0][4].admission_memory_view is live_view
+        )
+
     def _prepare_entry(self, idx: int, op):
         execution = self.execution
         replica, scope = self.replica, self.scope
@@ -423,31 +437,45 @@ class _LazyFrontier:
         lazy_key = None
         stg_id_cache = None
         same_step_op = False
+        live_view = None
+        live_l2_key = None
         if lazy_fast:
+            live_view, live_l2_key = live_stage_l2_state(execution, replica, op.stage)
             if (prev_l_ops is not None and prev_l_ops[idx] is op
-                    and (pe := prev_l_entries[idx]) is not None):
+                    and self._entry_matches_live_l2(
+                        (pe := prev_l_entries[idx]), live_view, live_l2_key)):
                 entry = pe
                 same_step_op = True
             else:
                 stg_id_cache = stage_id_caches[op.stage]
                 hit = stg_id_cache.get(id(op))
-                if hit is not None and hit[0] is op:
+                if (hit is not None and hit[0] is op
+                        and self._entry_matches_live_l2(hit[1], live_view, live_l2_key)):
                     entry = hit[1]
                 else:
                     live_rates = stage_rates_map[op.stage]
                     lazy_key = (
                         replica, scope, compact_exec, recipes_id, live_rates,
-                        self._step_active_sig,
+                        self._step_active_sig, live_l2_key,
+                        id(live_view) if live_view is not None else None,
                         op.stage, op.family, op.recipe, op.phase, op.dtype, op.layout,
+                        op.requests,
                         op.semantic_shape, op.local_shape, op.padded_shape, op.launch_shape,
                         op.flops, op.matrix_flops, op.mte2_bytes, op.mte3_bytes,
                         op.vector_ops, op.hbm_bytes, op.link_bytes, op.link_scope,
-                        op.source_boundary, op.returns, execution._op_key(op),
+                        op.source_boundary, op.returns,
+                        _freeze_key(op.precision_abi),
+                        _freeze_key(op.kernel_binding),
+                        _freeze_key(op.owner_schedule),
+                        _freeze_key(op.logical_precision_reqs),
+                        op.coverage,
+                        execution._op_key(op),
                         op.stream or "main",
                         execution.stream_owners.get((replica, op.stage, op.stream or "main")),
                     )
-                    entry = lazy_cache.get(lazy_key)
-                    if entry is not None and entry is not False:
+                    cand = lazy_cache.get(lazy_key)
+                    if self._entry_matches_live_l2(cand, live_view, live_l2_key):
+                        entry = cand
                         if len(stg_id_cache) >= STAGE_ID_CACHE_LIMIT:
                             stg_id_cache.clear()
                         stg_id_cache[id(op)] = (op, entry)
@@ -462,7 +490,8 @@ class _LazyFrontier:
                 if not same_step_op:
                     trans_opts[(scope_str, op.op_id, replica)] = transport_options
                 if inv_cell is not None:
-                    if inv_cell[2] is cost_invs and inv_cell[3] is not None:
+                    if (inv_cell[2] is cost_invs and inv_cell[3] is not None
+                            and inv_cell[3]["invocations"] > 0):
                         inv_cell[3]["invocations"] += 1
                     elif inv_cell[0] in cost_invs:
                         li = cost_invs[inv_cell[0]]
@@ -476,6 +505,8 @@ class _LazyFrontier:
                 name = prefix_colon + op.op_id
                 return (entry, op, name, submit, None)
 
+        if not lazy_fast:
+            live_view, live_l2_key = live_stage_l2_state(execution, replica, op.stage)
         res_op, recipe, context = self._prepare_op_context(op)
         name = prefix_colon + res_op.op_id
         submit = bool(context.work or getattr(recipe, "algorithm", None))
@@ -511,7 +542,7 @@ class _LazyFrontier:
                 res_op, meta_diff, raw_meta_mem, recipe, context,
                 submit, transport_options, inv_cell, recipe_name, obs_prog_name, work_deltas,
             )
-            fast_created = [prep_bundle, None]
+            fast_created = [prep_bundle, None, live_l2_key]
             if len(lazy_cache) >= LAZY_OP_CACHE_LIMIT:
                 lazy_cache.pop(next(iter(lazy_cache)))
             lazy_cache[lazy_key] = fast_created
@@ -523,7 +554,10 @@ class _LazyFrontier:
                 cur_l_entries[idx] = fast_created
         if fast_created is not None:
             return (fast_created, op, name, submit, None)
-        return (None, op, name, submit, (res_op, recipe, context))
+        return (
+            None, op, name, submit,
+            (res_op, recipe, context, live_view, live_l2_key, execution._last_invocation_record),
+        )
 
     def _materialize_non_pumped(self, idx: int, op):
         pack = self._prepare_entry(idx, op)
@@ -546,7 +580,8 @@ class _LazyFrontier:
             try:
                 return run_cached_bundle(
                     execution, engine, replica, owner, compact_exec, op, name, boundary,
-                    entry, op_template, meta_diff, context_template)
+                    entry, op_template, meta_diff, context_template, scope=self.scope,
+                    prepare_op_context=self._prepare_op_context)
             finally:
                 engine._memory_context = previous_context
                 engine._memory_context_fast = previous_fast_context
@@ -555,7 +590,8 @@ class _LazyFrontier:
                 pools=(hbm,), bindings=bindings):
             return run_cached_bundle(
                 execution, engine, replica, owner, compact_exec, op, name, boundary,
-                entry, op_template, meta_diff, context_template)
+                entry, op_template, meta_diff, context_template, scope=self.scope,
+                prepare_op_context=self._prepare_op_context)
 
     def _complete_async(self, _event, *, complete, idx):
         self.engine.resolve(complete)
@@ -565,6 +601,32 @@ class _LazyFrontier:
         self, boundary, *, stage, hbm, bindings, memory_context, fast_memory_context,
         complete, idx, op, name, entry, op_template, meta_diff, context_template,
     ):
+        live_view, live_l2_key = live_stage_l2_state(self.execution, self.replica, op.stage)
+        if not self._entry_matches_live_l2(entry, live_view, live_l2_key):
+            old_deltas = entry[0][10]
+            undo_superseded_invocation(self.execution, entry[0][7])
+            pack = self._prepare_entry(idx, op)
+            if pack[0] is not None:
+                entry = pack[0]
+                op_template, meta_diff, raw_meta_mem, _rec, context_template = entry[0][:5]
+                new_deltas = entry[0][10]
+                if new_deltas != old_deltas:
+                    for key, delta in old_deltas:
+                        self.exec_work[key] -= delta
+                    for key, delta in new_deltas:
+                        self.exec_work[key] += delta
+                if self.memory_bindings is None:
+                    bindings = (
+                        {mn: dict(mv) for mn, mv in raw_meta_mem.items()}
+                        if raw_meta_mem is not None else None
+                    )
+                else:
+                    meta = op.metadata
+                    if meta_diff is not None:
+                        patched = _meta_patch(dict(op.metadata), meta_diff)
+                        meta = tuple(sorted(patched.items()))
+                    op_for_mem = replace(op_template, op_id=op.op_id, metadata=meta)
+                    bindings = memory_bindings_for(op_for_mem, self.memory_bindings)
         finish = self._run_bundle_in_scope(
             op, name, boundary, entry, op_template, meta_diff, context_template,
             stage, hbm, bindings, memory_context, fast_memory_context)
@@ -624,7 +686,8 @@ class _LazyFrontier:
         if all_done and sync_ev is None and compact_exec and begin_after:
             sync_ev = engine._instant_done_event(
                 name + ":begin" if observer is None else name + ":ready")
-        elif not all_done and compact_exec and observer is None:
+        elif (not all_done and compact_exec and observer is None
+              and execution._live_admission_memory_view() is None):
             pending_evs = [
                 ev for ev in begin_after if ev.time is None or ev.time > now]
             pb = fast_entry[1]
@@ -688,6 +751,56 @@ class _LazyFrontier:
         for key, delta in work_deltas:
             exec_work[key] += delta
 
+    def _activate_slow_async(
+        self, idx: int, op, orig_op, name: str, begin_after, physical_hbm: str,
+        res_op, recipe, context, prep_view, prep_l2_key, prep_inv_rec,
+    ):
+        execution, engine, replica, owner = self.execution, self.engine, self.replica, self.owner
+        observer, memory_bindings, exec_work = self.observer, self.memory_bindings, self.exec_work
+        complete = engine.future(name + ":program_complete")
+        ready_marker = engine.submit(
+            name + (":begin" if observer is None else ":ready"),
+            after=begin_after, owner=owner, native_hook=True,
+        )
+
+        def _begin_slow(_event):
+            cur_res_op, cur_recipe, cur_ctx = res_op, recipe, context
+            cur_inv_rec = prep_inv_rec
+            cur_view, cur_l2_key = live_stage_l2_state(execution, replica, op.stage)
+            if cur_view is not prep_view or cur_l2_key != prep_l2_key:
+                undo_invocation_record(execution, prep_inv_rec)
+                cur_res_op, cur_recipe, cur_ctx = self._prepare_op_context(op)
+                cur_inv_rec = execution._last_invocation_record
+                for key in exec_work:
+                    delta = float(getattr(cur_res_op, key)) - float(getattr(res_op, key))
+                    if delta != 0.0:
+                        exec_work[key] += delta
+            if not type(execution).schedule_replay:
+                with engine.memory_scope(
+                    execution.memory, replica=replica, stage=int(cur_res_op.stage),
+                    pools=(physical_hbm,),
+                    bindings=memory_bindings_for(cur_res_op, memory_bindings),
+                ):
+                    finish = _lower_and_start_uncached(
+                        execution, engine, replica, owner, self.compact_exec,
+                        cur_res_op, cur_recipe, cur_ctx, name, ready_marker,
+                        orig_op=op, scope=self.scope, live_view=cur_view,
+                        live_l2_key=cur_l2_key, inv_record=cur_inv_rec,
+                        prepare_op_context=self._prepare_op_context,
+                    )
+            else:
+                finish = execution._start_program(
+                    cur_ctx, cur_recipe, name, ready_marker, owner=owner, replica=replica,
+                    memory_ledger=execution.memory, memory_pools=(physical_hbm,),
+                    memory_bindings=memory_bindings_for(cur_res_op, memory_bindings),
+                )
+            engine.on_complete(
+                finish, partial(self._complete_async, complete=complete, idx=idx), native_hook=True,
+            )
+
+        engine.on_complete(ready_marker, _begin_slow, native_hook=True)
+        return ready_marker, complete
+
     def _activate(self, idx: int):
         execution = self.execution
         engine, replica, owner = self.engine, self.replica, self.owner
@@ -713,15 +826,23 @@ class _LazyFrontier:
                 self._materialize_non_pumped(idx, op)
                 info = host_info[idx]
         fast_entry, orig_op, name, launch, _start, slow_pack = info
+        if fast_entry is not None and fast_entry[1] is not False:
+            live_view, live_l2_key = live_stage_l2_state(execution, replica, op.stage)
+            if not self._entry_matches_live_l2(fast_entry, live_view, live_l2_key):
+                undo_superseded_invocation(execution, fast_entry[0][7])
+                pack = self._prepare_entry(idx, op)
+                fast_entry, orig_op, name, slow_pack = pack[0], pack[1], pack[2], pack[4]
+                host_info[idx] = (fast_entry, orig_op, name, launch, _start, slow_pack)
         if fast_entry is not None and fast_entry[1] is False:
+            live_view, live_l2_key = live_stage_l2_state(execution, replica, op.stage)
             res_op, recipe, context = self._prepare_op_context(op)
-            slow_pack = (res_op, recipe, context)
+            slow_pack = (res_op, recipe, context, live_view, live_l2_key, execution._last_invocation_record)
             fast_entry = None
         if fast_entry is not None:
             self._activate_cached(idx, op, orig_op, name, launch, fast_entry)
             return
 
-        res_op, recipe, context = slow_pack
+        res_op, recipe, context, prep_view, prep_l2_key, prep_inv_rec = slow_pack
         stage_key = replica, res_op.stage
         stream_key = replica, res_op.stage, res_op.stream or "main"
         tail = streams.get(stream_key)
@@ -729,20 +850,31 @@ class _LazyFrontier:
             idx, op, launch, tail, dep_specs, op_events,
             order, ext_map, input_ready, schedule)
         physical_hbm = execution.stage_pools.get(stage_key, {}).get("hbm", "hbm")
-        if observer is None:
-            ready = None
-            complete = execution._start_program(
-                context, recipe, name, None, owner=owner, replica=replica,
-                memory_ledger=execution.memory, memory_pools=(physical_hbm,),
-                memory_bindings=memory_bindings_for(res_op, memory_bindings),
-                on_resolve=lambda _i=idx: self._completed(_i), begin_after=begin_after)
+        live_view, live_l2_key = live_stage_l2_state(execution, replica, op.stage)
+        has_pending = any(ev.time is None or ev.time > engine.now for ev in begin_after)
+        if live_view is not None and (has_pending or not type(execution).schedule_replay):
+            ready, complete = self._activate_slow_async(
+                idx, op, orig_op, name, begin_after, physical_hbm,
+                res_op, recipe, context, prep_view, prep_l2_key, prep_inv_rec,
+            )
         else:
-            ready = engine.submit(name + ":ready", after=begin_after, owner=owner)
-            complete = execution._start_program(
-                context, recipe, name, ready, owner=owner, replica=replica,
-                memory_ledger=execution.memory, memory_pools=(physical_hbm,),
-                memory_bindings=memory_bindings_for(res_op, memory_bindings),
-                on_resolve=lambda _i=idx: self._completed(_i))
+            if live_view is not None and (live_view is not prep_view or live_l2_key != prep_l2_key):
+                undo_invocation_record(execution, prep_inv_rec)
+                res_op, recipe, context = self._prepare_op_context(op)
+            if observer is None:
+                ready = None
+                complete = execution._start_program(
+                    context, recipe, name, None, owner=owner, replica=replica,
+                    memory_ledger=execution.memory, memory_pools=(physical_hbm,),
+                    memory_bindings=memory_bindings_for(res_op, memory_bindings),
+                    on_resolve=lambda _i=idx: self._completed(_i), begin_after=begin_after)
+            else:
+                ready = engine.submit(name + ":ready", after=begin_after, owner=owner)
+                complete = execution._start_program(
+                    context, recipe, name, ready, owner=owner, replica=replica,
+                    memory_ledger=execution.memory, memory_pools=(physical_hbm,),
+                    memory_bindings=memory_bindings_for(res_op, memory_bindings),
+                    on_resolve=lambda _i=idx: self._completed(_i))
         streams[stream_key] = complete
         op_events[idx] = complete
         recipe_name = res_op.recipe or type(recipe).__name__

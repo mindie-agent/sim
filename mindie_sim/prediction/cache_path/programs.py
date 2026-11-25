@@ -81,7 +81,7 @@ def _result_line_bytes(result: CacheAccessResult) -> int:
         return result.hbm_read_bytes // result.hbm_read_lines
     if result.hbm_write_lines:
         return result.hbm_write_bytes // result.hbm_write_lines
-    return A5_LINE_BYTES
+    return result.line_bytes
 
 
 def _round_hbm_bytes(amount: int | float, transaction_bytes: int) -> float:
