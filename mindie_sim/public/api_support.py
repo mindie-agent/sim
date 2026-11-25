@@ -74,34 +74,37 @@ def _profile(value: Any) -> UserProfile | None:
     return value
 
 
-def _profile_environment(case: Any, ops: Any) -> ExecutionEnvironment:
+def _profile_environment(case: Any, ops: Any = None) -> ExecutionEnvironment:
     """Bind a case onto the unified ``ExecutionEnvironment`` for profile pricing."""
-    if isinstance(ops, Mapping):
-        raise ExtensionError("user_profile_supports_sequence_ops_only")
+    del ops
     parsed = parse_case(case)
     return ExecutionEnvironment.from_hardware(
         parsed.machine, runtime=parsed.runtime,
     )
 
 
-def _ops(value: Any) -> tuple[OpSpec, ...]:
+def _op_sequence(value: Any) -> tuple[OpSpec, ...]:
     if isinstance(value, OpSpec):
         return (value,)
-    if isinstance(value, Mapping):
-        flattened: list[OpSpec] = []
-        for rank_ops in value.values():
-            if isinstance(rank_ops, OpSpec):
-                flattened.append(rank_ops)
-            else:
-                try:
-                    flattened.extend(rank_ops)
-                except TypeError as exc:
-                    raise ExtensionError("operator_requires_op_spec_or_sequence") from exc
-        return tuple(flattened)
+    if isinstance(value, (str, bytes, bytearray)):
+        raise ExtensionError("operator_requires_op_spec_or_sequence")
     try:
         return tuple(value)
     except TypeError as exc:
         raise ExtensionError("operator_requires_op_spec_or_sequence") from exc
+
+
+def _ops(value: Any) -> tuple[OpSpec, ...] | dict[int, tuple[OpSpec, ...]]:
+    if isinstance(value, OpSpec):
+        return (value,)
+    if isinstance(value, Mapping):
+        mapped: dict[int, tuple[OpSpec, ...]] = {}
+        for rank, rank_ops in value.items():
+            if isinstance(rank, bool) or not isinstance(rank, int) or rank < 0:
+                raise ExtensionError("operator_replica_key_invalid:" + str(rank))
+            mapped[rank] = _op_sequence(rank_ops)
+        return mapped
+    return _op_sequence(value)
 
 
 def _gap_kind(reason: str) -> str:
@@ -133,11 +136,11 @@ def _ops_replay(ops: Any) -> Any:
             return {
                 str(rank): [
                     item.to_dict() if hasattr(item, "to_dict") else {"type": type(item).__name__}
-                    for item in _ops(rank_ops)
+                    for item in _op_sequence(rank_ops)
                 ]
                 for rank, rank_ops in ops.items()
             }
-        values = _ops(ops)
+        values = _op_sequence(ops)
         return [
             value.to_dict() if hasattr(value, "to_dict") else {"type": type(value).__name__}
             for value in values
@@ -273,6 +276,12 @@ def _merge_builder(value: Any, kwargs: Mapping[str, Any]
                    ) -> tuple[Any, dict[str, Any]]:
     ops, builder = _build_value(value)
     merged = dict(kwargs)
+    if isinstance(value, Mapping) and "consumed_kwargs" in value:
+        consumed = value["consumed_kwargs"]
+        if (isinstance(consumed, (Sequence, set, frozenset))
+                and not isinstance(consumed, (str, bytes, bytearray))):
+            for key in consumed:
+                merged.pop(key, None)
     merged.update(builder)
     return ops, merged
 
