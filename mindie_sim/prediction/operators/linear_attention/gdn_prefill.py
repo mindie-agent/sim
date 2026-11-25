@@ -20,6 +20,7 @@ from mindie_sim.catalog.attention_common import AttentionResult
 from mindie_sim.schema.common import dtype_bytes
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
 from mindie_sim.prediction.operators.linear_attention import gdn_composite
+from .gdn_decode import _resolve_local_gdn_heads
 from .gdn_domain import GDN_CHUNK64_TOKENS
 from .gdn_prefill_phases import (
     lower_conv_stage,
@@ -44,6 +45,81 @@ DELTA_GATE_OPS_PER_HEAD = 12
 OUTPUT_NORM_GATE_OPS_PER_ELEMENT = 9
 STATE_INDEX_BYTES = 4
 FP32_BYTES = 4
+PCP_PREFIX_SCAN_VECTOR_PASSES = 2
+PCP_PREFIX_STEP_STATE_READS = 6
+PCP_PREFIX_STEP_STATE_WRITES = 4
+PCP_HUPDATE_DIAG_HALVES = 2
+STATE_BLOCK_ELEMENTS = 1024
+
+
+def pcp_gdn_prefix_work(
+    *, n_pf: int, tokens: int, chunks: int, chunk: int, heads: int,
+    dk: int, dv: int, pcp: int, act_dtype: str = "bf16",
+) -> dict[str, float | int | tuple[tuple[str, float], ...]]:
+    """Canonical PCP GDN ``hupdate`` + ``prefix_scan`` work (chunk_delta_hupdate.py & chunk.py)."""
+    n_seq = max(0, int(n_pf))
+    scan_tok = max(0, int(tokens))
+    scan_chunks = max(0, int(chunks))
+    scan_chunk = max(1, int(chunk))
+    scan_heads = max(1, int(heads))
+    elem_bytes = int(dtype_bytes(act_dtype))
+    per_chunk_phi = float(scan_heads * dk * dk * FP32_BYTES)
+    phi_bytes = float(n_seq) * per_chunk_phi
+    st_bytes = float(n_seq * scan_heads * dk * dv * FP32_BYTES)
+    pcp_steps = max(0, int(pcp) - 1)
+    prefix_steps = pcp_steps * n_seq
+    # chunk_delta_hupdate.py:118-143: 4 local [K/2,BT]@[BT,K/2] act_dtype GEMMs +
+    # 8 composition [K/2,K/2]@[K/2,K/2] FP32 GEMMs per chunk-head, plus 1 identity eye(K) write/seq.
+    hupdate_act_flops = float(2 * scan_chunks * scan_heads * dk * dk * scan_chunk)
+    hupdate_fp32_flops = float(2 * scan_chunks * scan_heads * dk * dk * dk)
+    hupdate_flops = hupdate_act_flops + hupdate_fp32_flops
+    if hupdate_flops <= 0.0:
+        hupdate_matrix_flops: tuple[tuple[str, float], ...] = ()
+    elif act_dtype == "fp32":
+        hupdate_matrix_flops = (("fp32", hupdate_flops),)
+    else:
+        hupdate_matrix_flops = ((act_dtype, hupdate_act_flops), ("fp32", hupdate_fp32_flops))
+    hupdate_vector = float(
+        scan_chunks * scan_heads * (
+            2 * dk * dk + (dk * dk) // PCP_HUPDATE_DIAG_HALVES + scan_chunk * dk + 2 * scan_chunk
+        )
+    )
+    hupdate_read = (
+        float(scan_chunks) * per_chunk_phi
+        + float(scan_tok * scan_heads * (2 * dk * elem_bytes + FP32_BYTES))
+        if scan_chunks > 0 else 0.0
+    )
+    hupdate_write = float(n_seq + scan_chunks) * per_chunk_phi
+    # chunk.py:189-196: initial slice copy + (pcp-1) steps of sub, matmul, add, slice copy.
+    prefix_flops = float(2 * prefix_steps * scan_heads * dk * dk * dv)
+    prefix_vector = float(PCP_PREFIX_SCAN_VECTOR_PASSES * prefix_steps * scan_heads * dk * dv)
+    prefix_read = (
+        (1 + pcp_steps * PCP_PREFIX_STEP_STATE_READS) * st_bytes + pcp_steps * phi_bytes
+        if (n_seq > 0 and pcp_steps > 0) else 0.0
+    )
+    prefix_write = (
+        (1 + pcp_steps * PCP_PREFIX_STEP_STATE_WRITES) * st_bytes
+        if (n_seq > 0 and pcp_steps > 0) else 0.0
+    )
+    return {
+        "n_pf": n_seq,
+        "scan_tok": scan_tok,
+        "scan_chunks": scan_chunks,
+        "scan_chunk": scan_chunk,
+        "scan_heads": scan_heads,
+        "phi_bytes": phi_bytes,
+        "st_bytes": st_bytes,
+        "hupdate_flops": hupdate_flops,
+        "hupdate_matrix_flops": hupdate_matrix_flops,
+        "hupdate_vector": hupdate_vector,
+        "hupdate_read": hupdate_read,
+        "hupdate_write": hupdate_write,
+        "prefix_steps": prefix_steps,
+        "prefix_flops": prefix_flops,
+        "prefix_vector": prefix_vector,
+        "prefix_read": prefix_read,
+        "prefix_write": prefix_write,
+    }
 
 
 def recipes():
@@ -187,6 +263,9 @@ def _lower_gdn_pcp_prefix_sync(
     b, *, composite, active, tokens, chunk, heads, dk, dv, pcp, pcp_rank,
 ):
     """Reorder post-state ops after PCP state/phi AllGathers, prefix scan, and rank>0 rerun."""
+    n_pf = len(active)
+    if n_pf == 0:
+        return tuple(composite.states)
     state_set = set(composite.states)
     deferred_ops = []
     deferred_ids: set[str] = set()
@@ -201,23 +280,22 @@ def _lower_gdn_pcp_prefix_sync(
         else:
             kept_ops.append(op)
     b.ops[:] = kept_ops
-    n_pf = max(1, len(active))
     scan_seq_lens = tuple(int(v.q_len) for v in active if int(v.q_len) > 0)
-    scan_tok = sum(scan_seq_lens) if scan_seq_lens else max(1, int(tokens))
-    scan_chunk = max(1, int(chunk))
-    scan_chunks = max(
-        1, sum((q_i + scan_chunk - 1) // scan_chunk for q_i in scan_seq_lens),
-    )
+    scan_tok = sum(scan_seq_lens)
+    scan_chunk = GDN_CHUNK64_TOKENS
+    scan_chunks = sum((q_i + scan_chunk - 1) // scan_chunk for q_i in scan_seq_lens)
     scan_seq_meta = (("sequence_tokens", scan_seq_lens),) if scan_seq_lens else ()
     scan_heads = max(1, int(heads))
-    prefix_steps = max(1, int(pcp) - 1) * n_pf
-    phi_bytes = float(n_pf * scan_heads * dk * dk * FP32_BYTES)
-    st_bytes = float(n_pf * scan_heads * dk * dv * FP32_BYTES)
+    pw = pcp_gdn_prefix_work(
+        n_pf=n_pf, tokens=scan_tok, chunks=scan_chunks, chunk=scan_chunk,
+        heads=scan_heads, dk=dk, dv=dv, pcp=pcp, act_dtype=b.model.activation_dtype,
+    )
     hupdate = b.work(
         "pcp_gdn_hupdate", tuple(composite.states), (n_pf, scan_heads, dk, dk),
-        flops=float(2 * scan_tok * scan_heads * dk * dk),
-        vector=float(scan_chunks * scan_heads * dk * dk),
-        read=phi_bytes + float(scan_tok * scan_heads * dk * 2), write=phi_bytes,
+        flops=pw["hupdate_flops"],
+        matrix_flops=pw["hupdate_matrix_flops"],
+        vector=pw["hupdate_vector"],
+        read=pw["hupdate_read"], write=pw["hupdate_write"],
         family="recurrent_scan", dtype="fp32",
         metadata=(
             ("pcp", int(pcp)), ("chunks", scan_chunks), ("chunk", scan_chunk),
@@ -227,17 +305,18 @@ def _lower_gdn_pcp_prefix_sync(
     )
     ag_state = b.communicate(
         "pcp_gdn_state_gather", tuple(composite.states),
-        st_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
+        pw["st_bytes"] * (pcp - 1), "allgather", "pcp", dtype="fp32",
     )
     ag_phi = b.communicate(
         "pcp_gdn_hupdate_gather", (hupdate,),
-        phi_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
+        pw["phi_bytes"] * (pcp - 1), "allgather", "pcp", dtype="fp32",
     )
+    prefix_steps = int(pw["prefix_steps"])
     prefix_scan = b.work(
         "pcp_gdn_prefix_scan", (ag_state, ag_phi), (pcp - 1, n_pf, scan_heads, dk, dv),
-        flops=float(2 * prefix_steps * scan_heads * dk * dk * dv),
-        vector=float(prefix_steps * scan_heads * dk * dv),
-        read=(st_bytes + phi_bytes) * pcp, write=st_bytes,
+        flops=pw["prefix_flops"],
+        vector=pw["prefix_vector"],
+        read=pw["prefix_read"], write=pw["prefix_write"],
         family="recurrent_scan", dtype="fp32",
         metadata=(
             ("pcp", int(pcp)), ("chunks", prefix_steps), ("chunk", 1),
@@ -251,7 +330,7 @@ def _lower_gdn_pcp_prefix_sync(
             "pcp_gdn_fwd_h_rerun", (prefix_scan,), (scan_tok, scan_heads, dk, dv),
             flops=float(2 * 2 * scan_tok * scan_heads * dk * dv),
             vector=float(scan_chunks * 2 * scan_heads * dk * dv),
-            read=st_bytes, write=st_bytes, family="recurrent_scan", dtype="fp32",
+            read=pw["st_bytes"], write=pw["st_bytes"], family="recurrent_scan", dtype="fp32",
             metadata=(
                 ("pcp", int(pcp)), ("chunks", scan_chunks), ("chunk", scan_chunk),
                 ("tokens", scan_tok), ("heads", scan_heads),
@@ -306,8 +385,17 @@ def _declare_gdn_chunk_group(
               "chunk": chunk, "pcp": int(pcp)},
         implementation={
             "native_kind": "ChunkGatedDeltaRuleFwd",
-            "native_kinds": ("ChunkGatedDeltaRuleFwdPrepare", "ChunkFwdH", "ChunkFwdO"),
-            "selection": "arch35_gdn_prefill_composite",
+            "native_kinds": (
+                ("ChunkGatedDeltaRuleFwdPrepare", "ChunkFwdH", "ChunkFwdO")
+                if int(pcp) == 1
+                else ("chunk_local_cumsum", "chunk_scaled_dot_kkt_fwd", "solve_tril",
+                      "recompute_w_u_fwd", "ChunkFwdH", "ChunkFwdO")
+            ),
+            "selection": (
+                "arch35_gdn_prefill_composite"
+                if int(pcp) == 1
+                else "arch35_gdn_pcp_triton_prepare_composite"
+            ),
             "conditions": {"pcp": int(pcp), "chunk": chunk,
                            "state_dtype": state_dtype},
         },
@@ -325,7 +413,8 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
     b = builder
     tokens = sum(view.q_len for view in views)
     dtype = b.model.activation_dtype
-    lengths = tuple(view.q_len for view in views)
+    effective_chunk = GDN_CHUNK64_TOKENS if int(pcp) > 1 else int(chunk)
+    lengths = tuple(view.q_len for view in views if view.q_len > 0)
     values = (qkv_values if qkv_values is not None else
               rearrange_qkv(tensors, conv, tokens, heads, key_heads, dk, dv))
     # gdn.py always gathers an initial tensor, including zero states at context0.
@@ -339,7 +428,7 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
     padding_slots = tuple(index for index, view in enumerate(views) if view.padding)
     prior = tuple(view.context > 0 for view in active)
     prior_elements = sum(prior) * heads * dk * dv
-    state_blocks = math.ceil(heads * dk * dv / 1024)
+    state_blocks = math.ceil(heads * dk * dv / STATE_BLOCK_ELEMENTS)
     gather_metadata = state_blocks * (len(views) + STATE_INDEX_BYTES * sum(prior))
     initial_flags = tuple(view.context > 0 and not view.padding for view in views)
     global_lengths = tuple(view.global_q_len or view.q_len for view in views)
@@ -348,7 +437,7 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
     gather_contract, gather_effects = gdn_recurrent.state_contract(
         views=views, phase="prefill", state_dtype=state_dtype,
         conv_state_dtype=b.model.activation_dtype, conv_kernel=b.plan.conv_kernel,
-        target_prefix=b.prefix, chunk=chunk, initial_state=initial_flags,
+        target_prefix=b.prefix, chunk=effective_chunk, initial_state=initial_flags,
         direction="gather", target_kind="recurrent",
         global_lengths=global_lengths, slot_indices=slot_indices,
         state_capacity=state_capacity, slot_source=slot_source)
@@ -380,21 +469,30 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
         "state_value_outputs": gather_outputs,
         "gdn_state_contract": gather_contract,
     }.items())))
+    initial_state_dep = gather
+    if int(pcp) > 1:
+        # Upstream vllm_ascend/ops/gdn.py:935 transposes cache V,K -> K,V for Triton/PCP path.
+        initial_state_dep = b.work(
+            "initial_state_kv_transpose", (gather,), (len(views), heads, dk, dv),
+            read=state_elements * state_byte, write=state_elements * state_byte,
+            family="tensor_copy", dtype=state_dtype,
+            metadata=(("state_layout", "K,V"), ("source", "vllm_ascend/ops/gdn.py:935")),
+        )
     gate, beta = gate_values or (
         tensors.result(gated, (1, tokens, heads), "fp32", output="decay"),
         tensors.result(gated, (1, tokens, heads), dtype, output="beta"))
     state_bytes = heads * dk * dv * dtype_bytes(state_dtype)
     state_segments = _prefill_state_segments(
-        b, views=views, pcp=pcp, state_dtype=state_dtype, state_bytes=state_bytes, chunk=chunk,
+        b, views=views, pcp=pcp, state_dtype=state_dtype, state_bytes=state_bytes, chunk=effective_chunk,
         slot_indices=slot_indices, state_capacity=state_capacity, slot_source=slot_source,
         initial_flags=initial_flags, global_lengths=global_lengths, lengths=lengths,
-        gather=gather, gather_outputs=gather_outputs, heads=heads, dk=dk, dv=dv)
+        gather=initial_state_dep, gather_outputs=gather_outputs, heads=heads, dk=dk, dv=dv)
     composite = gdn_composite.prefill(
         builder=b, tensors=tensors, q=values[0], k=values[1], v=values[2],
         gate=gate, beta=beta, lengths=lengths, heads=heads, key_heads=key_heads,
-        dk=dk, dv=dv, chunk=chunk, initial_state_dependency=gather,
+        dk=dk, dv=dv, chunk=effective_chunk, initial_state_dependency=initial_state_dep,
         native_requests=tuple(view.request_id for view in views),
-        state_segments=state_segments)
+        state_segments=state_segments, pcp=pcp)
     # A PCP rank publishes a global state commit only when it actually owns
     # the whole global sequence.  Covering the local head and tail of a
     # longer sequence (or a prefix/suffix) still leaves the final state to a
@@ -409,7 +507,7 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
     scatter_contract, scatter_effects = gdn_recurrent.state_contract(
         views=views, phase="prefill", state_dtype=state_dtype,
         conv_state_dtype=b.model.activation_dtype, conv_kernel=b.plan.conv_kernel,
-        target_prefix=b.prefix, chunk=chunk, initial_state=initial_flags,
+        target_prefix=b.prefix, chunk=effective_chunk, initial_state=initial_flags,
         direction="scatter", target_kind="recurrent",
         global_lengths=global_lengths, slot_indices=slot_indices,
         state_capacity=state_capacity, slot_source=slot_source,
@@ -419,11 +517,22 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
         # global final state for persistent cache scatter on ALL PCP ranks; the
         # rank>0 rerun discards its final-state return and feeds local gdn_output*.
         scatter_deps = _lower_gdn_pcp_prefix_sync(
-            b, composite=composite, active=active, tokens=tokens, chunk=chunk,
+            b, composite=composite, active=active, tokens=tokens, chunk=effective_chunk,
             heads=heads, dk=dk, dv=dv, pcp=pcp, pcp_rank=pcp_rank)
+        scatter_op_deps = scatter_deps
+        if active_elements > 0:
+            # Upstream vllm_ascend/ops/gdn.py:942 transposes final K,V -> V,K ahead of cache scatter.
+            vk_transpose = b.work(
+                "final_state_vk_transpose", scatter_deps, (len(views), heads, dv, dk),
+                read=active_elements * state_byte, write=active_elements * state_byte,
+                family="tensor_copy", dtype=state_dtype,
+                metadata=(("state_layout", "V,K"), ("source", "vllm_ascend/ops/gdn.py:942")),
+            )
+            scatter_op_deps = (*scatter_deps, vk_transpose)
     else:
         scatter_deps = tuple(composite.states)
-    scatter = b.work("scatter_recurrent_state", scatter_deps,
+        scatter_op_deps = scatter_deps
+    scatter = b.work("scatter_recurrent_state", scatter_op_deps,
            (len(views), heads, dv, dk),
            read=active_elements * state_byte + len(active) * state_blocks * STATE_INDEX_BYTES,
            write=active_elements * state_byte,
@@ -456,7 +565,7 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
     _declare_gdn_chunk_group(
         b, chunk_start_index=chunk_start_index, composite=composite, tokens=tokens,
         heads=heads, key_heads=key_heads, dk=dk, dv=dv, dtype=dtype,
-        state_dtype=state_dtype, lengths=lengths, chunk=chunk, pcp=pcp)
+        state_dtype=state_dtype, lengths=lengths, chunk=effective_chunk, pcp=pcp)
     return composite.output
 
 
@@ -543,18 +652,24 @@ def decode_core(b, tensors, values, gate_values, views, heads, keys, dk, dv, *,
 def _lower_prefill_convolution(b, tensors, *, parallel, ordered, prefill, decode, conv_input,
                                padding_slots, initial_flags, global_lengths, cache_indices,
                                state_rows, index_source, null_block_id, runtime, chunk,
-                               heads, width, actual):
+                               heads, width, actual, pcp_rank=None):
     prefix, plan, model = b.prefix, b.plan, b.model
     # Physical row positions and qsl stay intact.  FN resolves the cache index
     # per sequence and skips the null/pad *work* while preserving the request's
     # physical offset (the next request's qsl must still start at this row).
-    conv_lengths = tuple(view.q_len for view in ordered)
+    positive_idx = tuple(i for i, view in enumerate(ordered) if view.q_len > 0)
+    conv_ordered = tuple(ordered[i] for i in positive_idx)
+    conv_lengths = tuple(view.q_len for view in conv_ordered)
+    conv_initial = tuple(initial_flags[i] for i in positive_idx)
+    conv_cache = None if cache_indices is None else tuple(cache_indices[i] for i in positive_idx)
+    conv_global = tuple(global_lengths[i] for i in positive_idx)
+    conv_padding = tuple(i for i, view in enumerate(conv_ordered) if view.padding)
     conv_params = {
         "lengths": conv_lengths,
         "dim": width, "width": plan.conv_kernel, "dtype": model.activation_dtype,
         "activation": "silu", "bias": False, "metadata_placement": "device",
-        "has_initial_state": initial_flags,
-        "cache_indices": cache_indices,
+        "has_initial_state": conv_initial,
+        "cache_indices": conv_cache,
         "state_history_slots": plan.conv_kernel - 1 + int(
             dict(runtime.metadata).get("draft_proposal_tokens", 0)),
         "null_block_id": null_block_id,
@@ -564,7 +679,7 @@ def _lower_prefill_convolution(b, tensors, *, parallel, ordered, prefill, decode
     conv_op = native_causal_conv_prefill.make_op(conv_params)
     conv_parts = []
     conv_cursor = 0
-    for index, view in enumerate(ordered):
+    for index, view in enumerate(conv_ordered):
         part_direction = "token" if view.phase == "decode" else "conv"
         conv_view = conv_input.narrow(0, conv_cursor, view.q_len)
         conv_cursor += view.q_len
@@ -573,10 +688,10 @@ def _lower_prefill_convolution(b, tensors, *, parallel, ordered, prefill, decode
             state_dtype=plan.recurrent_state_dtype,
             conv_state_dtype=plan.conv_state_dtype,
             conv_kernel=plan.conv_kernel, target_prefix=prefix, chunk=chunk,
-            initial_state=(initial_flags[index],),
+            initial_state=(conv_initial[index],),
             direction=part_direction, target_kind="conv",
-            global_lengths=(global_lengths[index],),
-            slot_indices=(None if cache_indices is None else cache_indices[index],),
+            global_lengths=(conv_global[index],),
+            slot_indices=(None if conv_cache is None else conv_cache[index],),
             state_capacity=state_rows, slot_source=index_source,
             value_inputs=(conv_view,), heads=heads,
             remote_publish=(parallel.pcp > 1
@@ -586,73 +701,130 @@ def _lower_prefill_convolution(b, tensors, *, parallel, ordered, prefill, decode
         [part for part, _ in conv_parts], allow_mixed_directions=True)
     mixed_conv = tuple(effect for _, effects in conv_parts for effect in effects)
     conv_meta = {
-        "padding_slots": padding_slots,
+        "padding_slots": conv_padding,
         "state_dtype": plan.conv_state_dtype,
         "state_layout": "slots_history_channels",
         "state_mutation": "inplace_history_writeback",
-        "state_write_bytes": (len(ordered) - len(padding_slots))
+        "state_write_bytes": (len(conv_ordered) - len(conv_padding))
                              * (plan.conv_kernel - 1) * width * 2,
-        "state_slots": tuple(index for index in range(len(ordered))
-                             if index not in padding_slots),
+        "state_slots": tuple(index for index in range(len(conv_ordered))
+                             if index not in conv_padding),
         "state_copy_boundary": "caller_state_rows_to_conv_history_slots",
         "state_index_source": index_source,
         "state_capacity_source": ("caller_metadata" if state_rows is not None
                                   else "unbound"),
         "state_rows": state_rows,
         "state_rows_bound": state_rows is not None,
-        "cache_indices": cache_indices,
-        "cache_index_present": cache_indices is not None,
-        "cache_index_bound": (cache_indices is not None
-                              and all(value is not None for value in cache_indices)),
+        "cache_indices": conv_cache,
+        "cache_index_present": conv_cache is not None,
+        "cache_index_bound": (conv_cache is not None
+                              and all(value is not None for value in conv_cache)),
         "null_block_id": null_block_id,
     }
     conv = lower_conv_stage(
         builder=b, tensors=tensors, prefix=prefix, plan=plan,
-        parallel=parallel, ordered=ordered, prefill=prefill, decode=decode,
+        parallel=parallel, ordered=conv_ordered, prefill=prefill, decode=decode,
         conv_input=conv_input, conv_params=conv_params, conv_op=conv_op,
         conv_meta=conv_meta, mixed_contract=mixed_contract,
-        mixed_conv=mixed_conv, cache_indices=cache_indices,
+        mixed_conv=mixed_conv, cache_indices=conv_cache,
         state_rows=state_rows, index_source=index_source, chunk=chunk,
-        heads=heads, width=width, actual=actual,
+        heads=heads, width=width, actual=actual, pcp_rank=pcp_rank,
     )
     return conv
 
 
-def _lower_idle_pcp_peer(
-    b, tensors, *, projection, zero, prefill, model, plan, parallel,
-    tokens, tp, heads, dk, dv, width, value_width,
-):
-    """Idle PCP peer owns 0 local tokens of a live prefill: join PCP collectives."""
+def _lower_idle_prefill_pcp_collectives(
+    b, *, root_dep, prefill, model, plan, parallel, heads, dk, dv, width,
+    emit_conv_tail: bool,
+) -> str | None:
+    """Join PCP prefill collectives for live prefill slots that own 0 local tokens."""
     pcp = int(parallel.pcp)
-    n_pf = max(1, len(prefill))
-    phi_bytes = float(n_pf * heads * dk * dk * FP32_BYTES)
-    st_bytes = float(n_pf * heads * dk * dv * FP32_BYTES)
+    active = tuple(view for view in prefill if not view.padding)
+    n_pf = len(active)
+    if pcp <= 1 or n_pf == 0:
+        return None
+    dep = root_dep
+    if emit_conv_tail:
+        conv_state_dtype = plan.conv_state_dtype or model.activation_dtype
+        state_len = max(0, plan.conv_kernel - 1)
+        tail_copy_bytes = n_pf * state_len * width * dtype_bytes(conv_state_dtype)
+        tail_bytes = (pcp - 1) * tail_copy_bytes
+        conv_tail = b.communicate(
+            "pcp_conv_tail_gather", (dep,), tail_bytes,
+            "allgather", "pcp", dtype=conv_state_dtype,
+            state_scope="conv_history", source="vllm_ascend.ops.gdn",
+        )
+        if state_len > 0:
+            b.work(
+                "pcp_conv_tail_publish", (conv_tail,), (n_pf, state_len, width),
+                vector=0, read=tail_copy_bytes, write=tail_copy_bytes,
+                family="tensor_copy", dtype=conv_state_dtype,
+                metadata=(("state_scope", "conv_history"), ("effect_role", "conv_tail_publish"),
+                          ("source", "vllm_ascend/ops/gdn.py:608")),
+            )
+        dep = conv_tail
+    state_dtype = plan.recurrent_state_dtype or "fp32"
+    state_byte = dtype_bytes(state_dtype)
+    active_elements = n_pf * heads * dk * dv
+    prior_elements = sum(view.context > 0 for view in active) * heads * dk * dv
+    state_blocks = math.ceil(heads * dk * dv / STATE_BLOCK_ELEMENTS)
+    gather_meta = state_blocks * (n_pf + STATE_INDEX_BYTES * sum(view.context > 0 for view in active))
+    pw = pcp_gdn_prefix_work(
+        n_pf=n_pf, tokens=0, chunks=0, chunk=GDN_CHUNK64_TOKENS,
+        heads=heads, dk=dk, dv=dv, pcp=pcp, act_dtype=model.activation_dtype,
+    )
     idle_start = len(b.ops)
+    # Idle live prefill slots supply their initial state and identity eye(K) update to the gathers.
+    gather = b.work(
+        "gather_recurrent_state", (dep,), (n_pf, heads, dv, dk),
+        read=prior_elements * state_byte + gather_meta,
+        write=active_elements * state_byte,
+        family="state_gather", dtype=state_dtype,
+        metadata=(("state_layout", "V,K"), ("active_state_rows", n_pf), ("effect_role", "gather_read")),
+    )
+    kv_transpose = b.work(
+        "initial_state_kv_transpose", (gather,), (n_pf, heads, dk, dv),
+        read=active_elements * state_byte, write=active_elements * state_byte,
+        family="tensor_copy", dtype=state_dtype,
+        metadata=(("state_layout", "K,V"), ("source", "vllm_ascend/ops/gdn.py:935")),
+    )
+    hupdate = b.work(
+        "pcp_gdn_hupdate", (kv_transpose,), (n_pf, heads, dk, dk),
+        flops=pw["hupdate_flops"], matrix_flops=pw["hupdate_matrix_flops"],
+        vector=pw["hupdate_vector"], read=pw["hupdate_read"], write=pw["hupdate_write"],
+        family="recurrent_scan", dtype="fp32",
+        metadata=(("pcp", pcp), ("chunks", 0), ("chunk", GDN_CHUNK64_TOKENS),
+                  ("tokens", 0), ("heads", heads),
+                  ("source", "ops/triton/fla/chunk.py:fwd_hupdate")),
+    )
     ag_state = b.communicate(
-        "pcp_gdn_state_gather", (zero,),
-        st_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
+        "pcp_gdn_state_gather", (kv_transpose,),
+        pw["st_bytes"] * (pcp - 1), "allgather", "pcp", dtype="fp32",
     )
     ag_phi = b.communicate(
-        "pcp_gdn_hupdate_gather", (zero,),
-        phi_bytes * (pcp - 1), "allgather", "pcp", dtype="fp32",
+        "pcp_gdn_hupdate_gather", (hupdate,),
+        pw["phi_bytes"] * (pcp - 1), "allgather", "pcp", dtype="fp32",
     )
-    prefix_steps = max(1, pcp - 1) * n_pf
+    prefix_steps = int(pw["prefix_steps"])
     prefix_scan = b.work(
         "pcp_gdn_prefix_scan", (ag_state, ag_phi), (pcp - 1, n_pf, heads, dk, dv),
-        flops=float(2 * prefix_steps * heads * dk * dk * dv),
-        vector=float(prefix_steps * heads * dk * dv),
-        read=(st_bytes + phi_bytes) * pcp, write=st_bytes,
+        flops=pw["prefix_flops"], vector=pw["prefix_vector"],
+        read=pw["prefix_read"], write=pw["prefix_write"],
         family="recurrent_scan", dtype="fp32",
-        metadata=(
-            ("pcp", pcp), ("chunks", prefix_steps), ("chunk", 1),
-            ("tokens", prefix_steps), ("heads", heads),
-            ("source", "ops/triton/fla/chunk.py:prefix_scan"),
-        ),
+        metadata=(("pcp", pcp), ("chunks", prefix_steps), ("chunk", 1),
+                  ("tokens", prefix_steps), ("heads", heads),
+                  ("source", "ops/triton/fla/chunk.py:prefix_scan")),
+    )
+    vk_transpose = b.work(
+        "final_state_vk_transpose", (prefix_scan,), (n_pf, heads, dv, dk),
+        read=active_elements * state_byte, write=active_elements * state_byte,
+        family="tensor_copy", dtype=state_dtype,
+        metadata=(("state_layout", "V,K"), ("source", "vllm_ascend/ops/gdn.py:942")),
     )
     scatter = b.work(
-        "scatter_recurrent_state", (prefix_scan,), (len(prefill), heads, dv, dk),
-        read=st_bytes, write=st_bytes, family="state_scatter",
-        dtype=plan.recurrent_state_dtype,
+        "scatter_recurrent_state", (prefix_scan, vk_transpose), (n_pf, heads, dv, dk),
+        read=active_elements * state_byte + n_pf * state_blocks * STATE_INDEX_BYTES,
+        write=active_elements * state_byte, family="state_scatter", dtype=state_dtype,
         metadata=(("state_layout", "V,K"), ("effect_role", "scatter_publish"),
                   ("state_value_input", (prefix_scan,)),
                   ("state_value_output", "persistent_cache")),
@@ -663,12 +835,12 @@ def _lower_idle_pcp_peer(
         b.ops, key=b.prefix + ".gdn_chunk", role="gdn_chunk", family="gdn",
         members=tuple(op.op_id for op in idle_ops),
         entries=tuple(op.op_id for op in idle_ops
-                      if any(dep not in idle_ids for dep in op.deps) or not op.deps),
+                      if any(d not in idle_ids for d in op.deps) or not op.deps),
         anchor=scatter, block="attention",
         view={"tokens": 0, "heads": heads, "key_heads": heads,
               "key_width": dk, "value_width": dv,
               "dtype": model.activation_dtype, "state_dtype": plan.recurrent_state_dtype,
-              "sequence_tokens": (), "pcp": pcp},
+              "sequence_tokens": (), "chunk": GDN_CHUNK64_TOKENS, "pcp": pcp},
         implementation={"native_kind": "ChunkGatedDeltaRuleFwd",
                         "conditions": {"pcp": pcp, "idle_pcp_peer": True}},
         source=source_reference("vllm_ascend/ops/gdn.py",
@@ -677,11 +849,25 @@ def _lower_idle_pcp_peer(
         fusion_reason="arch35_gdn_idle_pcp_peer_sync",
         native_fusion_eligible=False,
     )
+    return prefix_scan
+
+
+def _lower_idle_pcp_peer(
+    b, tensors, *, projection, zero, prefill, model, plan, parallel,
+    tokens, tp, heads, dk, dv, width, value_width,
+):
+    """Idle PCP peer owns 0 local tokens of a batch: join live prefill collectives only."""
+    prefix_scan = _lower_idle_prefill_pcp_collectives(
+        b, root_dep=zero, prefill=prefill, model=model, plan=plan,
+        parallel=parallel, heads=heads, dk=dk, dv=dv, width=width,
+        emit_conv_tail=True,
+    )
     gate = tensors.reshape(projection, (tokens * heads, dv),
                            name="output_gate_reshape")
     gate = tensors.require(gate, "linear_output_norm_gate", "gate", name="output_gate_contiguous")
+    norm_deps = (zero, gate.producer, prefix_scan) if prefix_scan is not None else (zero, gate.producer)
     normalized = b.vector(
-        "linear_output_norm_gate", (zero, gate.producer, prefix_scan),
+        "linear_output_norm_gate", norm_deps,
         tokens * value_width, OUTPUT_NORM_GATE_OPS_PER_ELEMENT,
         shape=(tokens * heads, dv), read_bytes_override=(2 * tokens * value_width + dv) * 2,
         write_bytes_override=tokens * value_width * 2,
@@ -805,17 +991,40 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     actual = sum(view.q_len for view in ordered)
     decode_tokens = sum(view.q_len for view in decode)
     prefill_tokens = actual - decode_tokens
-    keys = math.ceil((plan.linear_key_heads or plan.linear_heads) / tp)
-    heads = math.ceil((plan.linear_value_heads or plan.linear_heads) / tp)
-    dk, dv = plan.linear_key_head_dim or plan.linear_head_dim, plan.linear_head_dim
+    keys, heads, dk, dv, key_replication = _resolve_local_gdn_heads(plan, tp)
     from mindie_sim.prediction.projections import gdn_input_projections
 
     width, value_width = 2 * keys * dk + heads * dv, heads * dv
+    proj_qk_width = (2 * keys * dk) // key_replication
+    proj_conv_width = proj_qk_width + value_width
     caller = (("caller_branch", "qkvz_ba_noninterleaved_non_spec"),)
+    proj_meta = (
+        (("gdn_key_head_replication", key_replication),
+         ("checkpoint_qkvz_width", proj_conv_width + value_width))
+        if key_replication > 1 else ()
+    )
     conv_view, z_view, (beta_view, alpha_view) = gdn_input_projections(
         b, tensors, deps=deps, tokens=tokens, hidden=model.hidden_size,
-        conv_width=width, value_width=value_width, heads=heads, metadata=caller,
+        conv_width=proj_conv_width, value_width=value_width, heads=heads,
+        metadata=caller + proj_meta,
     )
+    if key_replication > 1:
+        elem_bytes = dtype_bytes(model.activation_dtype)
+        rep_bytes = (
+            tokens * 2 * keys * dk * elem_bytes
+            * (key_replication - 1) / key_replication
+        )
+        rep_id = b.communicate(
+            "gdn_key_head_replicate", (conv_view.producer,), rep_bytes, "allgather",
+            "local_tp",
+            shape=(tokens, width),
+            comm_group_size=key_replication,
+            local_tp_width=key_replication,
+            local_tp_stride=1,
+            steps=key_replication - 1,
+            gdn_key_head_replication=key_replication,
+        )
+        conv_view = tensors.result(rep_id, (tokens, width))
     gate_inputs = [tensors.contiguous(view, name + "_contiguous", reason="gdn_split_ba.contiguous")
                    for view, name in ((beta_view, "beta"), (alpha_view, "alpha"))]
     zero = b.work("core_output_zero", (deps,), (tokens, heads, dv),
@@ -834,6 +1043,10 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     cache_indices, state_rows, index_source, null_block_id = _state_slot_inputs(
         runtime, ordered)
     chunk = policy.recurrent_chunk if policy else GDN_CHUNK64_TOKENS
+    pcp_rank = (
+        (int(physical_rank) % max(1, int(parallel.tp) * int(parallel.pcp))) // max(1, int(parallel.tp))
+        if physical_rank is not None and int(parallel.pcp) > 1 else None
+    )
     global_lengths = tuple(view.global_q_len or view.q_len for view in ordered)
     initial_flags = tuple(view.context > 0 and not view.padding for view in ordered)
     conv = _lower_prefill_convolution(
@@ -841,7 +1054,7 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
         conv_input=conv_input, padding_slots=padding_slots, initial_flags=initial_flags,
         global_lengths=global_lengths, cache_indices=cache_indices, state_rows=state_rows,
         index_source=index_source, null_block_id=null_block_id, runtime=runtime, chunk=chunk,
-        heads=heads, width=width, actual=actual)
+        heads=heads, width=width, actual=actual, pcp_rank=pcp_rank)
     gated = b.vector(
         "delta_gates", tuple(value.producer for value in gate_inputs), actual * heads, DELTA_GATE_OPS_PER_HEAD,
         family="gdn_gating", shape=(actual, heads),
@@ -860,22 +1073,26 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
             decode=decode, decode_tokens=decode_tokens, qkv=qkv, gate_values=gate_values,
             heads=heads, keys=keys, dk=dk, dv=dv, chunk=chunk, cache_indices=cache_indices,
             state_rows=state_rows, index_source=index_source, runtime=runtime))
-    prefill_slots = (None if cache_indices is None else
-                     tuple(cache_indices[len(decode) + index]
-                           for index in range(len(prefill))))
-    pcp_rank = (
-        (int(physical_rank) % max(1, int(parallel.tp) * int(parallel.pcp))) // max(1, int(parallel.tp))
-        if physical_rank is not None and int(parallel.pcp) > 1 else None
-    )
-    output = core(builder=b, tensors=tensors, conv=conv, gated=gated, views=prefill,
-                  heads=heads, key_heads=keys, dk=dk, dv=dv, chunk=chunk,
-                  state_slot_indices=prefill_slots, state_capacity=state_rows,
-                  state_slot_source=index_source,
-                  qkv_values=tuple(v.narrow(1, decode_tokens, prefill_tokens) for v in qkv),
-                  gate_values=tuple(v.narrow(1, decode_tokens, prefill_tokens) for v in gate_values),
-                  pcp=parallel.pcp, pcp_rank=pcp_rank)
-    outputs.append(tensors.result(output, (prefill_tokens, heads, dv)))
-    if decode:
+    idle_prefix_sync = None
+    if prefill_tokens == 0 and int(parallel.pcp) > 1:
+        idle_prefix_sync = _lower_idle_prefill_pcp_collectives(
+            b, root_dep=conv, prefill=prefill, model=model, plan=plan,
+            parallel=parallel, heads=heads, dk=dk, dv=dv, width=width,
+            emit_conv_tail=False,
+        )
+    else:
+        prefill_slots = (None if cache_indices is None else
+                         tuple(cache_indices[len(decode) + index]
+                               for index in range(len(prefill))))
+        output = core(builder=b, tensors=tensors, conv=conv, gated=gated, views=prefill,
+                      heads=heads, key_heads=keys, dk=dk, dv=dv, chunk=chunk,
+                      state_slot_indices=prefill_slots, state_capacity=state_rows,
+                      state_slot_source=index_source,
+                      qkv_values=tuple(v.narrow(1, decode_tokens, prefill_tokens) for v in qkv),
+                      gate_values=tuple(v.narrow(1, decode_tokens, prefill_tokens) for v in gate_values),
+                      pcp=parallel.pcp, pcp_rank=pcp_rank)
+        outputs.append(tensors.result(output, (prefill_tokens, heads, dv)))
+    if len(outputs) > 1:
         flat = [tensors.reshape(value, (value.layout.elements,), name="mixed_output_view")
                 for value in outputs]
         output_value = tensors.reshape(tensors.concatenate_flat(flat, "mixed_output_concatenate"),
@@ -888,8 +1105,12 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     gate = tensors.reshape(z_view, (tokens * heads, dv),
                            name="output_gate_reshape")
     gate = tensors.require(gate, "linear_output_norm_gate", "gate", name="output_gate_contiguous")
+    norm_deps = (
+        (copied.producer, gate.producer, idle_prefix_sync)
+        if idle_prefix_sync is not None else (copied.producer, gate.producer)
+    )
     normalized = b.vector(
-        "linear_output_norm_gate", (copied.producer, gate.producer), tokens * value_width, OUTPUT_NORM_GATE_OPS_PER_ELEMENT,
+        "linear_output_norm_gate", norm_deps, tokens * value_width, OUTPUT_NORM_GATE_OPS_PER_ELEMENT,
         shape=(tokens * heads, dv), read_bytes_override=(2 * tokens * value_width + dv) * 2,
         write_bytes_override=tokens * value_width * 2,
         metadata=(("norm_kind", "rmsnorm"), ("norm_has_weight", True),
