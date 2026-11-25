@@ -81,6 +81,7 @@ class Stage:
     metadata: Mapping[str, Any] = field(default_factory=dict)
     deliveries: tuple[tuple[str, float], ...] = ()
     latency_from_first_service: bool = False
+    previous_lags: tuple[tuple[str, int], ...] = ()
 
     def __post_init__(self):
         work = MappingProxyType(dict(self.work)) if self.work else _EMPTY_MAPPING
@@ -145,6 +146,19 @@ class Stage:
             object.__setattr__(self, "metadata", MappingProxyType(raw_meta))
         else:
             object.__setattr__(self, "metadata", _EMPTY_MAPPING)
+        if self.previous_lags:
+            lags = tuple(self.previous_lags)
+            normalized_lags = []
+            for entry in lags:
+                if not isinstance(entry, tuple) or len(entry) != 2:
+                    raise ModelingError(f"stage_previous_lags_invalid:{self.name}")
+                dep, delta = entry
+                if type(dep) is not str or not dep or type(delta) is not int or delta < 1:
+                    raise ModelingError(f"stage_previous_lags_invalid:{self.name}")
+                normalized_lags.append((dep, delta))
+            object.__setattr__(self, "previous_lags", tuple(normalized_lags))
+        elif self.previous_lags.__class__ is not tuple:
+            object.__setattr__(self, "previous_lags", ())
 
     def _with_buffers(self, acquire: tuple[Allocation, ...], free: tuple[Allocation, ...]) -> Stage:
         """Clone an already-validated Stage replacing only tuple acquire/free."""
@@ -153,7 +167,7 @@ class Stage:
             "name", "work", "after", "latency", "caps", "program", "placement",
             "previous", "coupled", "work_units", "priority", "fragment",
             "cohort_size", "keep_empty", "cohort_widened", "cohort_members",
-            "metadata", "deliveries", "latency_from_first_service",
+            "metadata", "deliveries", "latency_from_first_service", "previous_lags",
         ):
             object.__setattr__(clone, attr, getattr(self, attr))
         object.__setattr__(clone, "acquire", acquire)
@@ -194,7 +208,7 @@ class Stage:
             self.program is not None and not self.work and self.latency <= 0.0
             and not self.acquire and not self.free and not self.caps
             and not self.coupled and self.priority == 0
-            and not self.keep_empty and not self.metadata
+            and not self.keep_empty and not self.metadata and not self.deliveries
             and self.fragment is None and len(predecessors) == 1
         ):
             return self.program.start(
@@ -412,7 +426,7 @@ def _declares_no_work(stage) -> bool:
         and stage.latency <= 0.0 and not stage.acquire and not stage.free
         and not any(stage.caps.values()) and not stage.coupled
         and stage.priority == 0 and stage.fragment is None
-        and not stage.metadata
+        and not stage.metadata and not stage.deliveries
     )
 
 
@@ -423,7 +437,8 @@ def _is_pure_root_delay(stage, all_consumed: set[str], stages) -> bool:
         and not any(stage.work.values()) and stage.latency > 0.0
         and not stage.acquire and not stage.free and not any(stage.caps.values())
         and not stage.coupled and stage.priority == 0 and stage.program is None
-        and stage.fragment is None and not stage.previous and not stage.metadata
+        and stage.fragment is None and not stage.previous and not stage.previous_lags
+        and not stage.metadata and not stage.deliveries
         and all(st.after == (stage.name,) for st in stages if stage.name in st.after)
     )
 

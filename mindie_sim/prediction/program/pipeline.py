@@ -16,7 +16,7 @@ from dataclasses import dataclass, field, replace
 from typing import Callable, Mapping, Sequence
 
 from mindie_sim.schema.common import ModelingError
-from ..engine import Engine, Event
+from ..engine import Allocation, Engine, Event
 from .stages import Stage, _declares_no_work, scope_allocations
 
 #: Bounded tile window a symmetric cohort may materialize to prove identity.
@@ -29,21 +29,27 @@ _MIN_FOLD_ENTRIES = 3
 
 
 def _allocation_sig(items):
-    return tuple(sorted((item.name, item.pool, item.size, len(item.units)) for item in items))
+    return tuple(sorted((item.name, item.pool, item.size, tuple(item.units)) for item in items))
 
 
 def _fold_stage_key(stage):
     """Exact physical identity of one repeated stage, work included."""
     if stage.program is not None or stage.fragment is not None:
         return None
-    if stage.latency > 0.0 or stage.coupled:
+    if (
+        stage.latency > 0.0 or stage.coupled
+        or stage.latency_from_first_service or stage.previous_lags
+        or stage.deliveries or stage.keep_empty
+    ):
         return None
     return (
         stage.name, stage.after, stage.previous, stage.priority,
+        stage.cohort_size, stage.cohort_widened,
         tuple(sorted(stage.work.items())),
         tuple(sorted(stage.caps.items())),
         tuple((key, tuple(units)) for key, units in stage.placement.items()),
         tuple(sorted(stage.work_units.items())),
+        tuple(sorted(stage.metadata.items())),
         _allocation_sig(stage.acquire),
         _allocation_sig(stage.free),
     )
@@ -70,7 +76,7 @@ def _fold_scaled(stages, repeat: int):
 def interior_fold_plan(program: PipelineProgram):
     """Return ``[(representative index, repeat, stages)]`` or ``None``."""
     count, slots = program.count, program.slots
-    if program.homogeneous or count < _MIN_FOLD_TILES or slots < 1:
+    if program.homogeneous or count < _MIN_FOLD_TILES or slots != 1:
         return None
     if count > PIPELINE_FOLD_WINDOW:
         return None
@@ -244,32 +250,49 @@ class PipelineProgram:
             if self.minimum_ms else None
         )
         stage_tail: dict[str, Event] = {}
+        tile_events: dict[int, dict[str, Event]] = {}
+        live_tiles: set[int] = set()
+        max_lag = 1
         next_tile, finished = 0, 0
         serial_single_slot = self.slots == 1
 
-        def retire(_event=None) -> None:
+        def retire(_event=None, tile_idx: int | None = None) -> None:
             nonlocal finished
             finished += 1
+            if tile_idx is not None:
+                live_tiles.discard(tile_idx)
             if finished == self.count:
                 stage_tail.clear()
+                tile_events.clear()
+                live_tiles.clear()
                 engine.resolve(complete)
             else:
                 issue()
 
         def issue() -> None:
-            nonlocal next_tile, finished
+            nonlocal next_tile, finished, max_lag
             while next_tile < self.count:
                 index = next_tile
                 next_tile += 1
                 local: dict[str, Event] = {}
                 previous = dict(stage_tail)
                 stages = tuple(self.tile(index))
+                for st in stages:
+                    for _, lag in st.previous_lags:
+                        if lag > max_lag:
+                            max_lag = lag
                 consumed: set[str] = set()
                 for stage in stages:
                     if stage.after:
                         consumed.update(stage.after)
                     deps = [local[key] for key in stage.after]
                     deps.extend(previous[key] for key in stage.previous if key in previous)
+                    for dep_name, lag in stage.previous_lags:
+                        target = index - lag
+                        if target >= 0:
+                            prior_tile = tile_events.get(target)
+                            if prior_tile is not None and dep_name in prior_tile:
+                                deps.append(prior_tile[dep_name])
                     if stage.name in stage_tail:
                         deps.append(stage_tail[stage.name])
                     task_name = f"{name}:tile{index}:{stage.name}"
@@ -285,6 +308,13 @@ class PipelineProgram:
                         engine, task_name, tuple(deps) or (setup,), scoped, owner
                     )
                     local[stage.name] = stage_tail[stage.name] = event
+                if not serial_single_slot or max_lag > 1:
+                    tile_events[index] = local
+                    live_tiles.add(index)
+                    cutoff = index - max(self.slots, max_lag)
+                    for old_idx in tuple(tile_events):
+                        if old_idx < cutoff and old_idx not in live_tiles:
+                            del tile_events[old_idx]
                 sinks = tuple(dict.fromkeys(
                     local[stage.name] for stage in stages if stage.name not in consumed
                 )) or (setup,)
@@ -294,13 +324,15 @@ class PipelineProgram:
                         finished += 1
                         if finished == self.count:
                             stage_tail.clear()
+                            tile_events.clear()
                             engine.resolve(complete)
                             return
                         continue
                     engine.on_complete(sink, retire, native_hook=True)
                     return
                 engine.submit(
-                    f"{name}:tile{index}:retire", after=sinks, on_complete=retire,
+                    f"{name}:tile{index}:retire", after=sinks,
+                    on_complete=lambda ev, _idx=index: retire(ev, _idx),
                     owner=owner, native_hook=True,
                 )
                 return
@@ -583,6 +615,282 @@ def indexed_pipeline_consumer_available() -> bool:
     return type(version) is int and version == 1
 
 
+def _iter_template_stages(template: PipelineTemplate):
+    yield from template.setup
+    yield from template.drain
+    for phase in template.phases:
+        for group in (phase.residue_stages or (phase.stages,)):
+            yield from group
+
+
+def _template_has_prepared_collision(template: PipelineTemplate) -> bool:
+    """True when two allocation-free stages collide in scheduling._prepared_for."""
+    seen: dict[tuple, tuple] = {}
+    for stage in _iter_template_stages(template):
+        if stage.acquire or stage.free or stage.program is not None:
+            continue
+        cache_key = (
+            stage.name, tuple(sorted(stage.work.items())), stage.latency,
+            tuple(sorted(stage.caps.items())),
+            tuple(sorted((k, tuple(u)) for k, u in stage.placement.items())),
+            stage.coupled, stage.priority,
+            tuple(sorted(stage.work_units.items())),
+        )
+        full_sig = (
+            stage.latency_from_first_service, stage.deliveries,
+            stage.cohort_size, stage.cohort_widened,
+            tuple(sorted(stage.cohort_members.items())),
+            stage.keep_empty, tuple(sorted(stage.metadata.items())),
+        )
+        prev = seen.get(cache_key)
+        if prev is not None and prev != full_sig:
+            return True
+        seen[cache_key] = full_sig
+    return False
+
+
+def _template_needs_direct(template: PipelineTemplate) -> bool:
+    if any(stage.previous_lags for stage in _iter_template_stages(template)):
+        return True
+    if template.indexed_panels is None and any(phase.residue_stages for phase in template.phases):
+        return True
+    return _template_has_prepared_collision(template)
+
+
+def _resolve_template_tile(template: PipelineTemplate, index: int):
+    if template.indexed_panels is None:
+        return template.stage_for(index), None
+    if index < 0 or index >= template.indexed_panels:
+        raise IndexError("pipeline_stage_index_out_of_range")
+    try:
+        mapped = template.index_of(index)
+    except (IndexError, TypeError):
+        raise
+    except KeyError as exc:
+        raise ModelingError("pipeline_index_mapping_invalid") from exc
+    if not isinstance(mapped, tuple) or len(mapped) != _INDEX_COORD_ARITY:
+        raise ModelingError("pipeline_index_mapping_invalid")
+    phase_id, end, output, panel, slot = mapped
+    if (
+        isinstance(phase_id, bool) or not isinstance(phase_id, int)
+        or not 0 <= phase_id < len(template.phases)
+        or isinstance(end, bool) or not isinstance(end, int)
+        or not index < end <= template.indexed_panels
+        or isinstance(output, bool) or not isinstance(output, int) or output < 0
+        or isinstance(panel, bool) or not isinstance(panel, int) or panel < 0
+        or isinstance(slot, bool) or not isinstance(slot, int)
+        or not 0 <= slot < template.slots
+    ):
+        raise ModelingError("pipeline_index_mapping_invalid")
+    return template.phases[phase_id].stages_for(index), (output, panel, slot)
+
+
+def _build_template_scoper(template: PipelineTemplate, name: str):
+    acquire_phase: dict[str, set[int]] = {}
+    free_phase: dict[str, set[int]] = {}
+    for phase_index, phase in enumerate(template.phases):
+        for group in (phase.residue_stages or (phase.stages,)):
+            for stage in group:
+                for alloc in stage.acquire:
+                    acquire_phase.setdefault(alloc.name, set()).add(phase_index)
+                for alloc in stage.free:
+                    free_phase.setdefault(alloc.name, set()).add(phase_index)
+    persistent = frozenset(
+        aname for aname, acq in acquire_phase.items()
+        if not free_phase.get(aname) or not free_phase[aname].issubset(acq)
+    )
+    binding_rows = {
+        str(row["name"]): dict(row)
+        for row in template.bindings if isinstance(row, Mapping) and row.get("name")
+    }
+    for stage in (*template.setup, *template.drain):
+        for alloc in (*stage.acquire, *stage.free):
+            binding_rows.setdefault(
+                alloc.name, {"name": alloc.name, "scope": "invocation", "owner": template.owner},
+            )
+    indexed = template.indexed_panels is not None
+    explicit_keys = ("identity", "physical", "physical_name", "external")
+
+    def scoped_at(label: str, index: int, coords):
+        output, panel, slot = coords if coords is not None else (None, None, None)
+
+        def _scope(items):
+            out = []
+            for item in items:
+                row = binding_rows.get(item.name, {})
+                scope = row.get("scope")
+                if indexed:
+                    explicit = next(
+                        (row[k] for k in explicit_keys if isinstance(row.get(k), str) and row[k]),
+                        None,
+                    )
+                    if explicit is not None:
+                        scoped_name = explicit
+                    elif scope == "invocation":
+                        scoped_name = f"{name}:owner{template.owner}:invocation0:{item.name}"
+                    elif scope == "output":
+                        ord_val = output if output is not None else int(row.get("ordinal", 0))
+                        scoped_name = f"{name}:owner{template.owner}:output{ord_val}:{item.name}"
+                    elif scope == "slot":
+                        ord_val = slot if slot is not None else int(row.get("ordinal", 0))
+                        scoped_name = f"{name}:owner{template.owner}:slot{ord_val}:{item.name}"
+                    elif scope == "panel" or item.name not in persistent:
+                        scoped_name = f"{name}:owner{template.owner}:panel{index}:{item.name}"
+                    else:
+                        scoped_name = f"{name}:owner{template.owner}:invocation0:{item.name}"
+                else:
+                    if scope == "invocation":
+                        prefix = name
+                    elif scope == "output":
+                        digits = "".join(ch for ch in item.name if ch.isdigit())
+                        prefix = f"{name}:output{digits or 0}"
+                    elif scope == "slot":
+                        prefix = f"{name}:slot{index % template.slots}"
+                    elif scope == "panel":
+                        prefix = label
+                    elif item.name in persistent:
+                        prefix = name
+                    else:
+                        prefix = label
+                    scoped_name = f"{prefix}:{item.name}"
+                out.append(Allocation(scoped_name, item.pool, item.size, item.units))
+            return tuple(out)
+
+        return _scope
+
+    return scoped_at
+
+
+def _start_template_direct(
+    engine: Engine, template: PipelineTemplate, name: str, ready: Event, owner: str,
+) -> Event:
+    """Execute a PipelineTemplate losslessly with full binding scopes and lags."""
+    scoped_at = _build_template_scoper(template, name)
+    current = (
+        engine.submit(name + ":setup", after=(ready,), latency=template.setup_ms, owner=owner)
+        if template.setup_ms else ready
+    )
+    if template.setup:
+        local_setup: dict[str, Event] = {}
+        for stage in template.setup:
+            deps = tuple(local_setup[key] for key in stage.after)
+            local_setup[stage.name] = stage.submit(
+                engine, f"{name}:setup:{stage.name}", deps or (current,),
+                scoped_at(f"{name}:setup:{stage.name}", 0, (0, 0, 0)), owner,
+            )
+        current = engine.submit(
+            name + ":setup_complete", after=tuple(local_setup.values()) or (current,), owner=owner,
+        )
+    observation = (
+        engine.submit(name + ":span", after=(current,), latency=template.minimum_ms, owner=owner)
+        if template.minimum_ms else None
+    )
+    total = template.tiles
+    complete = engine.future(name + ":complete")
+    stage_tail: dict[str, Event] = {}
+    tile_events: dict[int, dict[str, Event]] = {}
+    live_tiles: set[int] = set()
+    next_tile, finished, max_lag = 0, 0, 1
+    last_events: tuple[Event, ...] = (current,)
+    drain_coords = (0, 0, 0)
+
+    def finalize() -> None:
+        stage_tail_snap = dict(stage_tail)
+        stage_tail.clear()
+        tile_events.clear()
+        live_tiles.clear()
+        if not template.drain:
+            engine.resolve(complete)
+            return
+        local_drain: dict[str, Event] = {}
+        drain_index = total - 1 if total else 0
+        for stage in template.drain:
+            deps = [local_drain[key] for key in stage.after]
+            deps.extend(stage_tail_snap[key] for key in stage.previous if key in stage_tail_snap)
+            local_drain[stage.name] = stage.submit(
+                engine, f"{name}:drain:{stage.name}",
+                tuple(dict.fromkeys(deps)) or last_events,
+                scoped_at(f"{name}:drain:{stage.name}", drain_index, drain_coords), owner,
+            )
+        engine.submit(
+            name + ":drain_complete", after=tuple(local_drain.values()) or last_events,
+            on_complete=lambda _ev: engine.resolve(complete), owner=owner,
+        )
+
+    def retire(_event=None, tile_idx: int | None = None) -> None:
+        nonlocal finished
+        finished += 1
+        if tile_idx is not None:
+            live_tiles.discard(tile_idx)
+        if finished == total:
+            finalize()
+        else:
+            issue()
+
+    def issue() -> None:
+        nonlocal next_tile, max_lag, last_events, drain_coords
+        if next_tile >= total:
+            return
+        index = next_tile
+        next_tile += 1
+        stages, coords = _resolve_template_tile(template, index)
+        if index == total - 1 and coords is not None:
+            drain_coords = coords
+        for st in stages:
+            for _, lag in st.previous_lags:
+                if lag > max_lag:
+                    max_lag = lag
+        local: dict[str, Event] = {}
+        previous = dict(stage_tail)
+        consumed: set[str] = set()
+        scoped = scoped_at(f"{name}:tile{index}", index, coords)
+        for stage in stages:
+            if stage.after:
+                consumed.update(stage.after)
+            deps = [local[key] for key in stage.after]
+            deps.extend(previous[key] for key in stage.previous if key in previous)
+            for dep_name, lag in stage.previous_lags:
+                target = index - lag
+                if target >= 0:
+                    prior_tile = tile_events.get(target)
+                    if prior_tile is not None and dep_name in prior_tile:
+                        deps.append(prior_tile[dep_name])
+            if stage.name in stage_tail:
+                deps.append(stage_tail[stage.name])
+            ev = stage.submit(
+                engine, f"{name}:tile{index}:{stage.name}",
+                tuple(dict.fromkeys(deps)) or (current,), scoped, owner,
+            )
+            local[stage.name] = stage_tail[stage.name] = ev
+        tile_events[index] = local
+        live_tiles.add(index)
+        cutoff = index - max(template.slots, max_lag)
+        for old_idx in tuple(tile_events):
+            if old_idx < cutoff and old_idx not in live_tiles:
+                del tile_events[old_idx]
+        sinks = tuple(dict.fromkeys(
+            local[stage.name] for stage in stages if stage.name not in consumed
+        )) or (current,)
+        last_events = sinks
+        engine.submit(
+            f"{name}:tile{index}:retire", after=sinks,
+            on_complete=lambda ev, _idx=index: retire(ev, _idx),
+            owner=owner, native_hook=True,
+        )
+
+    def begin(_: Event) -> None:
+        if not total:
+            finalize()
+            return
+        for _ in range(min(template.slots, total)):
+            issue()
+
+    engine.submit(name + ":begin", after=(current,), on_complete=begin, owner=owner, native_hook=True)
+    if observation is None:
+        return complete
+    return engine.submit(name + ":complete_outer", after=(complete, observation), owner=owner)
+
+
 @dataclass(frozen=True)
 class PipelineTemplateProgram:
     """Program adapter that submits a finite PipelineTemplate."""
@@ -590,11 +898,11 @@ class PipelineTemplateProgram:
     template: PipelineTemplate
 
     def start(self, engine: Engine, name: str, ready: Event, *, owner: str = "") -> Event:
-        stages = (
-            *self.template.setup,
-            *self.template.drain,
-            *(stage for phase in self.template.phases for stage in phase.stages),
-        )
+        stages = tuple(_iter_template_stages(self.template))
+        if self.template.indexed_panels is not None and not indexed_pipeline_consumer_available():
+            raise ModelingError("pipeline_indexed_consumer_unavailable")
+        if _template_needs_direct(self.template):
+            return _start_template_direct(engine, self.template, name, ready, owner)
         nested = any(stage.program is not None for stage in stages)
         allocated = any(stage.acquire or stage.free for stage in stages)
         from ..program.catalog import submit_template

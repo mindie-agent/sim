@@ -51,9 +51,10 @@ def _stage_signature(stage, *, widen_pipelines: bool = False):
     if stage.program is not None and program is None:
         return None
     return (
-        stage.name, stage.after, stage.previous, stage.latency, stage.coupled,
-        stage.priority, stage.cohort_size, stage.keep_empty, stage.cohort_widened,
-        stage.latency_from_first_service,
+        stage.name, stage.after, stage.previous, stage.previous_lags,
+        stage.latency, stage.coupled, stage.priority, stage.cohort_size,
+        stage.keep_empty, stage.cohort_widened, stage.latency_from_first_service,
+        stage.deliveries,
         tuple(sorted(stage.metadata.items())),
         tuple(sorted(stage.work_units.items())),
         tuple(sorted(stage.work.items())),
@@ -157,7 +158,8 @@ def _merge_stages(
     if len({
         (
             stage.latency, stage.name, stage.coupled, stage.priority,
-            stage.keep_empty, stage.after, stage.previous,
+            stage.keep_empty, stage.after, stage.previous, stage.previous_lags,
+            stage.latency_from_first_service,
             tuple(sorted(stage.work_units.items())),
             tuple(sorted(stage.metadata.items())),
         )
@@ -169,7 +171,7 @@ def _merge_stages(
             return None
         if any(
             stage.work or stage.caps or stage.acquire or stage.free
-            or stage.placement or stage.latency
+            or stage.placement or stage.latency or stage.deliveries
             for stage in stages
         ):
             return None
@@ -182,6 +184,7 @@ def _merge_stages(
             return None
         return Stage(
             first.name, after=first.after, previous=first.previous,
+            previous_lags=first.previous_lags,
             coupled=first.coupled, work_units=first.work_units,
             priority=first.priority, program=merged, keep_empty=first.keep_empty,
             metadata=first.metadata,
@@ -263,7 +266,8 @@ def _merge_stages(
     return Stage(
         first.name, work, after=first.after, latency=first.latency,
         caps=caps, acquire=acquire, free=free, placement=placement,
-        previous=first.previous, coupled=first.coupled, work_units=first.work_units,
+        previous=first.previous, previous_lags=first.previous_lags,
+        coupled=first.coupled, work_units=first.work_units,
         priority=first.priority, cohort_size=cohort_size, keep_empty=first.keep_empty,
         cohort_widened=tuple(widened_keys),
         cohort_members=cohort_members if widened_keys else {},
@@ -333,79 +337,194 @@ def _merge_kernels(programs, *, scale_coupled_cohort: bool = True, widen_pipelin
     return KernelProgram(tuple(stages), first.minimum_ms)
 
 
-def _merge_wrapper_stages(stages):
+def _merge_wrapper_stages(
+    stages, *, scale_coupled_cohort: bool = True, allow_disjoint_placement: bool = True,
+):
     """Merge single-static wrapper stages that own one nested program."""
     if any(stage.program is None for stage in stages):
-        return _merge_stages(stages, scale_coupled_cohort=False)
+        return _merge_stages(
+            stages,
+            scale_coupled_cohort=scale_coupled_cohort,
+            allow_disjoint_placement=allow_disjoint_placement,
+        )
     if any(
         stage.work or stage.caps or stage.acquire or stage.free
-        or stage.placement or stage.latency
+        or stage.placement or stage.latency or stage.deliveries
         for stage in stages
     ):
         return None
-    if len({(s.name, s.after, s.previous, s.coupled, s.priority) for s in stages}) != 1:
+    if len({
+        (
+            s.name, s.after, s.previous, s.previous_lags, s.coupled,
+            s.priority, s.keep_empty, tuple(sorted(s.metadata.items())),
+        )
+        for s in stages
+    }) != 1:
         return None
-    merged = merge_programs([stage.program for stage in stages], scale_coupled_cohort=False)
+    merged = merge_programs(
+        [stage.program for stage in stages], scale_coupled_cohort=scale_coupled_cohort,
+    )
     if merged is None:
         return None
     first = stages[0]
     return Stage(
-        first.name, after=first.after, previous=first.previous, program=merged,
+        first.name, after=first.after, previous=first.previous,
+        previous_lags=first.previous_lags, program=merged,
         coupled=first.coupled, work_units=first.work_units, priority=first.priority,
+        keep_empty=first.keep_empty, metadata=first.metadata,
     )
 
 
-def _merge_templates(programs):
+def _merge_templates(programs, *, scale_coupled_cohort: bool = True):
     first = programs[0].template
+    if any(
+        p.template.setup or p.template.drain or p.template.bindings
+        or p.template.setup_ms or p.template.minimum_ms
+        or p.template.indexed_panels is not None or p.template.motif_repeats != 1
+        for p in programs
+    ):
+        return None
     if (
         len({p.template.slots for p in programs}) != 1
         or len({len(p.template.phases) for p in programs}) != 1
     ):
         return None
+    total_tiles = sum(phase.count for phase in first.phases)
+    allow_disjoint = (
+        total_tiles <= 1
+        and len(first.phases) <= 1
+        and not any(s.acquire or s.free for phase in first.phases for s in phase.stages)
+    )
     phases = []
     for index, phase in enumerate(first.phases):
         rows = [program.template.phases[index] for program in programs]
-        if len({(row.kind, row.count, row.key) for row in rows}) != 1:
+        if (
+            len({(row.kind, row.count, row.key, len(row.stages)) for row in rows}) != 1
+            or any(row.residue_stages for row in rows)
+        ):
             return None
-        merged = _merge_wrapper_stages([row.stages[0] for row in rows])
-        if merged is None:
-            return None
-        phases.append(PipelinePhase(phase.kind, (merged,), phase.count, key=phase.key))
+        stage_disjoint = allow_disjoint and len(phase.stages) <= 1
+        merged_stages = []
+        for stage_index in range(len(phase.stages)):
+            merged = _merge_wrapper_stages(
+                [row.stages[stage_index] for row in rows],
+                scale_coupled_cohort=scale_coupled_cohort,
+                allow_disjoint_placement=stage_disjoint,
+            )
+            if merged is None:
+                return None
+            merged_stages.append(merged)
+        phases.append(PipelinePhase(phase.kind, tuple(merged_stages), phase.count, key=phase.key))
     return PipelineTemplateProgram(PipelineTemplate(
         first.owner, first.slots, tuple(phases),
         setup_ms=first.setup_ms, minimum_ms=first.minimum_ms,
         tile_factory_calls=first.tile_factory_calls,
-        phase_objects=len(phases), stage_objects=len(phases),
+        phase_objects=len(phases),
+        stage_objects=sum(len(phase.stages) for phase in phases),
         static_phase_classes=len(phases),
         dynamic_instances=sum(phase.count for phase in phases),
     ))
 
 
+def _collect_stage_footprint(stage, out: dict[tuple[str, str], set[int] | None]) -> bool:
+    for res, amt in stage.work.items():
+        if not amt:
+            continue
+        key = ("res", res)
+        if res not in stage.placement:
+            out[key] = None
+        elif out.get(key, set()) is not None:
+            out.setdefault(key, set()).update(stage.placement[res])
+    for alloc in (*stage.acquire, *stage.free):
+        key = ("pool", alloc.pool)
+        if out.get(key, set()) is not None:
+            out.setdefault(key, set()).update(alloc.units or (0,))
+    if stage.program is not None:
+        return _collect_program_footprint(stage.program, out)
+    return True
+
+
+def _collect_program_footprint(program, out: dict[tuple[str, str], set[int] | None]) -> bool:
+    if isinstance(program, KernelProgram):
+        return all(_collect_stage_footprint(stage, out) for stage in program.stages)
+    if isinstance(program, PipelineTemplateProgram):
+        tpl = program.template
+        if tpl.indexed_panels is not None:
+            return False
+        stages = [*tpl.setup, *tpl.drain]
+        for phase in tpl.phases:
+            for group in (phase.residue_stages or (phase.stages,)):
+                stages.extend(group)
+        return all(_collect_stage_footprint(stage, out) for stage in stages)
+    if isinstance(program, PipelineProgram):
+        if program.homogeneous or program.count < 0 or program.count > PIPELINE_COHORT_WINDOW:
+            return False
+        for idx in range(program.count):
+            for stage in tuple(program.tile(idx)):
+                if not _collect_stage_footprint(stage, out):
+                    return False
+        return True
+    return False
+
+
+def _program_footprint(program) -> dict[tuple[str, str], set[int] | None] | None:
+    out: dict[tuple[str, str], set[int] | None] = {}
+    return out if _collect_program_footprint(program, out) else None
+
+
+def _footprints_conflict(
+    left: dict[tuple[str, str], set[int] | None] | None,
+    right: dict[tuple[str, str], set[int] | None] | None,
+) -> bool:
+    if left is None or right is None:
+        return True
+    for res in left.keys() & right.keys():
+        lu, ru = left[res], right[res]
+        if lu is None or ru is None or not lu.isdisjoint(ru):
+            return True
+    return False
+
+
 def coalesce_programs(programs, *, widen_pipelines: bool = False):
     """Combine symmetric owners into cohort programs; keep the exact fallback."""
     programs = tuple(programs)
-    if len(programs) < 2:
+    n = len(programs)
+    if n < 2:
         return programs
-    groups: list[tuple[object, list]] = []
-    for program in programs:
-        signature = program_signature(program, widen_pipelines=widen_pipelines)
-        if signature is None:
-            groups.append((None, [program]))
-            continue
-        for entry in groups:
-            if entry[0] == signature:
-                entry[1].append(program)
-                break
-        else:
-            groups.append((signature, [program]))
+    sigs = [program_signature(p, widen_pipelines=widen_pipelines) for p in programs]
+    footprints: list[dict[str, set[int] | None] | None] | None = None
+    consumed = [False] * n
     result = []
-    for signature, group in groups:
-        if signature is not None and len(group) > 1:
-            merged = merge_programs(group, widen_pipelines=widen_pipelines)
+    for i in range(n):
+        if consumed[i]:
+            continue
+        sig_i = sigs[i]
+        if sig_i is None:
+            consumed[i] = True
+            result.append(programs[i])
+            continue
+        indices = [i]
+        for j in range(i + 1, n):
+            if consumed[j] or sigs[j] != sig_i:
+                continue
+            intervening = [k for k in range(i + 1, j) if not consumed[k] and k not in indices]
+            if intervening:
+                if footprints is None:
+                    footprints = [_program_footprint(p) for p in programs]
+                if any(_footprints_conflict(footprints[j], footprints[k]) for k in intervening):
+                    continue
+            indices.append(j)
+        if len(indices) > 1:
+            merged = merge_programs(
+                [programs[idx] for idx in indices], widen_pipelines=widen_pipelines,
+            )
             if merged is not None:
+                for idx in indices:
+                    consumed[idx] = True
                 result.append(merged)
                 continue
-        result.extend(group)
+        consumed[i] = True
+        result.append(programs[i])
     return tuple(result)
 
 
@@ -419,7 +538,7 @@ def merge_programs(programs, *, scale_coupled_cohort: bool = True, widen_pipelin
             programs, scale_coupled_cohort=scale_coupled_cohort, widen_pipelines=widen_pipelines
         )
     if isinstance(first, PipelineTemplateProgram):
-        return _merge_templates(programs)
+        return _merge_templates(programs, scale_coupled_cohort=scale_coupled_cohort)
     if widen_pipelines and isinstance(first, PipelineProgram):
         return _merge_pipelines(
             programs, scale_coupled_cohort=scale_coupled_cohort, widen_pipelines=True
@@ -453,11 +572,16 @@ def split_cohort_kernel(programs):
     for index, stage in enumerate(stages):
         after = tuple(dep for name in stage.after for dep in refs(name))
         previous = tuple(dep for name in stage.previous for dep in refs(name))
+        previous_lags = tuple(
+            (dep, lag) for name, lag in stage.previous_lags for dep in refs(name)
+        )
         if not split[index]:
             merged = _merge_stages([program.stages[index] for program in programs])
             if merged is None:
                 return None
-            rebuilt.append(replace(merged, after=after, previous=previous))
+            rebuilt.append(replace(
+                merged, after=after, previous=previous, previous_lags=previous_lags,
+            ))
             continue
         for owner in range(count):
             source = programs[owner].stages[index]
@@ -467,5 +591,8 @@ def split_cohort_kernel(programs):
                 source, name=f"{stage.name}#{owner}",
                 after=tuple(dep for name in stage.after for dep in refs(name, owner)),
                 previous=tuple(dep for name in stage.previous for dep in refs(name, owner)),
+                previous_lags=tuple(
+                    (dep, lag) for name, lag in stage.previous_lags for dep in refs(name, owner)
+                ),
             ))
     return KernelProgram(tuple(rebuilt), first.minimum_ms)
