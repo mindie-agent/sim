@@ -44,6 +44,8 @@ from .submission import ScheduledIteration
 COMPACT_SUBMIT_MIN_OPS = 32
 STAGE_ID_CACHE_LIMIT = 16384
 LAZY_OP_CACHE_LIMIT = 4096
+_PACKED_DAG_ARITY = 9
+_PACKED_DAG_STREAM_IDX = 7
 
 
 class _LazyFrontier:
@@ -57,13 +59,21 @@ class _LazyFrontier:
         if execution.offload_policy is not None:
             raise ModelingError("lazy_frontier_requires_no_offload_policy")
         n_ops = len(physical_ops)
-        if verified_dag is not None:
+        if (
+            verified_dag is not None
+            and len(verified_dag) == _PACKED_DAG_ARITY
+            and len(verified_dag[_PACKED_DAG_STREAM_IDX]) == n_ops
+            and all(
+                (op.stage, op.stream or "main") == sk
+                for op, sk in zip(physical_ops, verified_dag[_PACKED_DAG_STREAM_IDX])
+            )
+        ):
             packed = verified_dag
         else:
             packed, execution._prev_lazy_dag = build_verified_dag(
                 physical_ops, execution._prev_lazy_dag)
         (order, succ_idx, init_unmet_t, dep_specs,
-         root_idx, sink_idx, fut_indices) = packed
+         root_idx, sink_idx, fut_indices, _stream_sig, stream_tails) = packed
 
         self.unmet = list(init_unmet_t)
         op_events: list[Event | None] = [None] * n_ops
@@ -82,9 +92,16 @@ class _LazyFrontier:
                     declared_commits[request] = fut
 
         self.host_info: list[Any] = [None] * n_ops
-        self.host_cursor = 0
-        self.host_submits: list[tuple[int, int, Event]] = []
+        self._op_host_submit: list[tuple[int, int, Event] | None] = [None] * n_ops
         self.owner = f"replica:{replica}"
+        self._step_active_requests = tuple(getattr(execution, "_active_requests", ()) or ())
+        self._step_active_padded_tokens = int(getattr(execution, "_active_padded_tokens", 0) or 0)
+        self._step_active_layout = str(getattr(execution, "_active_layout", "") or "")
+        self._step_active_sig = (
+            self._step_active_requests,
+            self._step_active_padded_tokens,
+            self._step_active_layout,
+        )
         compact_exec = (
             not execution.legacy_diagnostics
             and (not engine.trace.maxlen or n_ops > engine.trace.maxlen)
@@ -133,7 +150,7 @@ class _LazyFrontier:
         self.stage_id_caches = (
             {
                 stg: execution._lazy_stage_id_caches.setdefault(
-                    (replica, scope, compact_exec, recipes_id, lrates), {}
+                    (replica, scope, compact_exec, recipes_id, lrates, self._step_active_sig), {}
                 )
                 for stg, lrates in stage_rates_map.items()
             }
@@ -141,7 +158,7 @@ class _LazyFrontier:
         )
         step_env = (
             (replica, scope, compact_exec, recipes_id,
-             tuple(sorted(stage_rates_map.items())))
+             tuple(sorted(stage_rates_map.items())), self._step_active_sig)
             if lazy_fast else None
         )
         prev_le = execution._prev_lazy_entries
@@ -158,7 +175,13 @@ class _LazyFrontier:
         self.cost_counts = execution.cost.counts
         self.cost_invs = execution.cost.invocations
         self.trans_opts = execution._transport_options
-        self.streams = execution.streams
+        self.streams: dict[tuple[int, int, str], Event] = {}
+        for (stg, stm), tail_idx in stream_tails:
+            skey = (replica, stg, stm)
+            prev_ev = execution.streams.get(skey)
+            if prev_ev is not None:
+                self.streams[skey] = prev_ev
+            execution.streams[skey] = op_futures[tail_idx]
         self.recipes_used = execution.recipes_used
         self.exec_work = execution.work
         self.seen_host_stages: set[tuple[int, int]] = set()
@@ -195,57 +218,202 @@ class _LazyFrontier:
         self.step = None
         self.activating = False
         self.pending_activations = deque()
+        self._init_host_queues()
+
+    def _init_host_queues(self):
+        self._stage_op_indices: dict[int, list[int]] = {}
+        self._stage_host_pos: dict[int, int] = {}
+        self._stage_host_last_pos: dict[int, int] = {}
+        self._stage_host_in_flight: dict[int, int] = {}
+        self._stage_host_tail: dict[int, Event | None] = {}
+        self._stage_host_before_last: dict[int, Event | None] = {}
+        self._stage_host_before_last_resolved: dict[int, bool] = {}
+        self._stage_host_fifo_base: dict[int, int] = {}
+        self._stage_compact_zero: set[int] = set()
+        self._prepared_pending_host: dict[int, tuple] = {}
+        self._awaiting_host: set[int] = set()
+        if not self.include_sub:
+            self._host_pumped_stages: frozenset[int] = frozenset()
+            return
+        for idx, op in enumerate(self.physical_ops):
+            self._stage_op_indices.setdefault(op.stage, []).append(idx)
+        base_seq = self.engine._sequence
+        for stg_id in self._stage_op_indices:
+            self._stage_host_tail[stg_id] = self.execution.hosts.get((self.replica, stg_id))
+            self._stage_host_fifo_base[stg_id] = base_seq
+            if self.compact_submit and self.stage_launch_ms.get(stg_id, 0.0) == 0.0:
+                self._stage_compact_zero.add(stg_id)
+                continue
+            self._stage_host_pos[stg_id] = 0
+            self._stage_host_last_pos[stg_id] = -1
+            self._stage_host_in_flight[stg_id] = 0
+            self._stage_host_before_last[stg_id] = None
+            self._stage_host_before_last_resolved[stg_id] = False
+        self._host_pumped_stages = frozenset(self._stage_host_pos)
+
+    def _current_host_submits(self) -> tuple[tuple[int, int, Event], ...]:
+        return tuple(item for item in self._op_host_submit if item is not None)
 
     def _update_host_submits(self):
         if self.step is not None:
-            self.step.host_submits = tuple(self.host_submits)
+            self.step.host_submits = self._current_host_submits()
 
-    def _submit_host_launch(self, stage_key, name):
-        engine, prepared, owner, replica = self.engine, self.prepared, self.owner, self.replica
-        stage_launch_ms = self.stage_launch_ms
-        compact_submit = self.compact_submit
-        shared_zero_submit = self.shared_zero_submit
-        stage_zero_host_prep, stage_host_prep = self.stage_zero_host_prep, self.stage_host_prep
-        seen_host_stages, host_submits = self.seen_host_stages, self.host_submits
+    def _prepare_op_context(self, op):
         execution = self.execution
-        stg_id = stage_key[1]
-        duration = stage_launch_ms[stg_id]
-        if compact_submit and duration == 0.0:
-            shared = shared_zero_submit.get(stage_key)
-            if shared is None:
-                prev_h = execution.hosts.get(stage_key)
-                host_deps = (prepared, prev_h) if prev_h is not None else prepared
-                launch, start = engine._submit_host_launch(
-                    stage_zero_host_prep[stg_id], name + ":submit",
-                    name + ":host_submit", host_deps, owner)
-                execution.hosts[stage_key] = launch
-                seen_host_stages.add(stage_key)
-                host_submits.append((replica, stg_id, start))
-                shared_zero_submit[stage_key] = (launch, start)
-            else:
-                launch, start = shared
-            execution.submission_counts["eager_invocations"] += 1
-            return launch, start
-        prev_h = execution.hosts.get(stage_key)
-        if stage_key in seen_host_stages:
-            host_deps = prev_h
-        else:
-            seen_host_stages.add(stage_key)
-            host_deps = (prepared, prev_h) if prev_h is not None else prepared
+        prev_req = execution._active_requests
+        prev_pad = execution._active_padded_tokens
+        prev_lay = execution._active_layout
+        execution._active_requests = self._step_active_requests
+        execution._active_padded_tokens = self._step_active_padded_tokens
+        execution._active_layout = self._step_active_layout
+        try:
+            res_op, recipe = execution.prepare(op, self.replica)
+            context = execution._context(res_op, self.replica, self.scope, recipe=recipe)
+        finally:
+            execution._active_requests = prev_req
+            execution._active_padded_tokens = prev_pad
+            execution._active_layout = prev_lay
+        return res_op, recipe, context
+
+    def _submit_stage_host_task(
+        self, stg_id: int, idx: int, pos: int, name: str, *,
+        host_deps, attach_pump: bool, publish_global: bool,
+    ) -> tuple[Event, Event]:
+        engine = self.engine
         launch, start = engine._submit_host_launch(
-            stage_host_prep[stg_id], name + ":submit",
-            name + ":host_submit", host_deps, owner)
-        execution.hosts[stage_key] = launch
-        execution.submission_counts["eager_invocations"] += 1
-        host_submits.append((replica, stg_id, start))
+            self.stage_host_prep[stg_id], name + ":submit",
+            name + ":host_submit", host_deps, self.owner)
+        task = engine._tasks.get(launch.sequence)
+        if task is not None:
+            task.fifo_order = (self._stage_host_fifo_base[stg_id], pos)
+        if attach_pump:
+            self._stage_host_tail[stg_id] = launch
+            self._stage_host_in_flight[stg_id] += 1
+            engine.on_complete(
+                launch, partial(self._on_host_launch_done, stg_id=stg_id),
+                native_hook=True)
+        if publish_global:
+            self.execution.hosts[(self.replica, stg_id)] = launch
+        self.execution.submission_counts["eager_invocations"] += 1
+        self._op_host_submit[idx] = (self.replica, stg_id, start)
         return launch, start
 
-    def _materialize_one(self, idx: int, op):
+    def _submit_compact_zero_launch(
+        self, stg_id: int, idx: int, name: str,
+    ) -> tuple[Event, Event]:
+        stage_key = (self.replica, stg_id)
+        shared = self.shared_zero_submit.get(stage_key)
+        if shared is None:
+            prev_h = self._stage_host_tail.get(stg_id)
+            host_deps = (self.prepared, prev_h) if prev_h is not None else self.prepared
+            launch, start = self.engine._submit_host_launch(
+                self.stage_zero_host_prep[stg_id], name + ":submit",
+                name + ":host_submit", host_deps, self.owner)
+            task = self.engine._tasks.get(launch.sequence)
+            if task is not None:
+                task.fifo_order = (self._stage_host_fifo_base[stg_id], 0)
+            self._stage_host_tail[stg_id] = launch
+            self.execution.hosts[stage_key] = launch
+            self.seen_host_stages.add(stage_key)
+            self._op_host_submit[idx] = (self.replica, stg_id, start)
+            shared = (launch, start)
+            self.shared_zero_submit[stage_key] = shared
+        self.execution.submission_counts["eager_invocations"] += 1
+        return shared
+
+    def _prime_host_queues(self):
+        for stg_id in self._stage_compact_zero:
+            for idx in self._stage_op_indices[stg_id]:
+                pack = self._prepare_entry(idx, self.physical_ops[idx])
+                if pack[3]:
+                    launch, start = self._submit_compact_zero_launch(stg_id, idx, pack[2])
+                    self.host_info[idx] = (pack[0], pack[1], pack[2], launch, start, pack[4])
+                    break
+                self.host_info[idx] = (pack[0], pack[1], pack[2], None, None, pack[4])
+        for stg_id in self._host_pumped_stages:
+            indices = self._stage_op_indices[stg_id]
+            last_pos = -1
+            last_idx = -1
+            last_pack = None
+            for cand_pos in range(len(indices) - 1, -1, -1):
+                cand_idx = indices[cand_pos]
+                pack = self._prepare_entry(cand_idx, self.physical_ops[cand_idx])
+                if pack[3]:
+                    last_pos, last_idx, last_pack = cand_pos, cand_idx, pack
+                    break
+                self.host_info[cand_idx] = (pack[0], pack[1], pack[2], None, None, pack[4])
+            if last_pos < 0:
+                self._stage_host_pos[stg_id] = len(indices)
+                self._stage_host_last_pos[stg_id] = -1
+                continue
+            self._stage_host_last_pos[stg_id] = last_pos
+            self._pump_stage_host(stg_id, resolve_before_last=False)
+            stage_key = (self.replica, stg_id)
+            if self._stage_host_in_flight[stg_id] > 0:
+                before_last = self.engine.future(f"{self.prefix}:s{stg_id}:host_before_last")
+                self._stage_host_before_last[stg_id] = before_last
+                host_deps = before_last
+            else:
+                prev_h = self._stage_host_tail[stg_id]
+                self.seen_host_stages.add(stage_key)
+                host_deps = (self.prepared, prev_h) if prev_h is not None else self.prepared
+            launch_last, start_last = self._submit_stage_host_task(
+                stg_id, last_idx, last_pos, last_pack[2],
+                host_deps=host_deps, attach_pump=False, publish_global=True)
+            self.host_info[last_idx] = (
+                last_pack[0], last_pack[1], last_pack[2], launch_last, start_last, last_pack[4])
+
+    def _on_host_launch_done(self, _event, *, stg_id: int):
+        self._stage_host_in_flight[stg_id] = max(0, self._stage_host_in_flight[stg_id] - 1)
+        self._pump_stage_host(stg_id)
+
+    def _pump_stage_host(self, stg_id: int, *, resolve_before_last: bool = True):
+        indices = self._stage_op_indices[stg_id]
+        last_pos = self._stage_host_last_pos[stg_id]
+        woken: list[int] = []
+        while self._stage_host_in_flight[stg_id] < 1 and self._stage_host_pos[stg_id] < last_pos:
+            pos = self._stage_host_pos[stg_id]
+            idx = indices[pos]
+            if self.host_info[idx] is None:
+                pack = self._prepared_pending_host.pop(idx, None)
+                if pack is None:
+                    pack = self._prepare_entry(idx, self.physical_ops[idx])
+                if pack[3]:
+                    stage_key = (self.replica, stg_id)
+                    prev_h = self._stage_host_tail[stg_id]
+                    if stage_key in self.seen_host_stages:
+                        host_deps = prev_h
+                    else:
+                        self.seen_host_stages.add(stage_key)
+                        host_deps = (self.prepared, prev_h) if prev_h is not None else self.prepared
+                    launch, start = self._submit_stage_host_task(
+                        stg_id, idx, pos, pack[2],
+                        host_deps=host_deps, attach_pump=True, publish_global=False)
+                else:
+                    launch = start = None
+                self.host_info[idx] = (pack[0], pack[1], pack[2], launch, start, pack[4])
+            self._stage_host_pos[stg_id] = pos + 1
+            if idx in self._awaiting_host:
+                self._awaiting_host.discard(idx)
+                woken.append(idx)
+        if resolve_before_last and self._stage_host_pos[stg_id] >= last_pos and self._stage_host_in_flight[stg_id] == 0:
+            before_last = self._stage_host_before_last[stg_id]
+            if before_last is not None and not self._stage_host_before_last_resolved[stg_id]:
+                self._stage_host_before_last_resolved[stg_id] = True
+                self._update_host_submits()
+                self.engine.resolve(before_last)
+            else:
+                self._update_host_submits()
+        if woken:
+            self.pending_activations.extend(woken)
+            self._drain_activations()
+
+    def _prepare_entry(self, idx: int, op):
         execution = self.execution
         replica, scope = self.replica, self.scope
         compact_exec, recipes_id = self.compact_exec, self.recipes_id
-        host_info, prefix_colon = self.host_info, self.prefix_colon
-        include_sub, lazy_fast = self.include_sub, self.lazy_fast
+        prefix_colon = self.prefix_colon
+        lazy_fast = self.lazy_fast
         prev_l_ops, prev_l_entries, cur_l_entries = self.prev_l_ops, self.prev_l_entries, self.cur_l_entries
         stage_id_caches, stage_rates_map = self.stage_id_caches, self.stage_rates_map
         lazy_cache = self.lazy_cache
@@ -269,6 +437,7 @@ class _LazyFrontier:
                     live_rates = stage_rates_map[op.stage]
                     lazy_key = (
                         replica, scope, compact_exec, recipes_id, live_rates,
+                        self._step_active_sig,
                         op.stage, op.family, op.recipe, op.phase, op.dtype, op.layout,
                         op.semantic_shape, op.local_shape, op.padded_shape, op.launch_shape,
                         op.flops, op.matrix_flops, op.mte2_bytes, op.mte3_bytes,
@@ -286,7 +455,7 @@ class _LazyFrontier:
                     and entry[1] is not False):
                 if cur_l_entries is not None:
                     cur_l_entries[idx] = entry
-                (res_op_tmpl, _mdiff, _rmem, _rec, _ctx_tmpl,
+                (_res_op_tmpl, _mdiff, _rmem, _rec, _ctx_tmpl,
                  submit, transport_options, inv_cell, _rname, _oname,
                  _wdeltas) = entry[0]
                 cost_counts["analytic_work"] += 1
@@ -305,22 +474,11 @@ class _LazyFrontier:
                         inv_cell[2] = cost_invs
                         inv_cell[3] = cost_invs.get(inv_cell[0])
                 name = prefix_colon + op.op_id
-                launch = start = None
-                if submit and include_sub:
-                    launch, start = self._submit_host_launch(
-                        (replica, res_op_tmpl.stage), name)
-                host_info[idx] = (entry, op, name, launch, start, None)
-                self.host_cursor += 1
-                return
+                return (entry, op, name, submit, None)
 
-        res_op, recipe = execution.prepare(op, replica)
-        stage_key = replica, res_op.stage
+        res_op, recipe, context = self._prepare_op_context(op)
         name = prefix_colon + res_op.op_id
-        context = execution._context(res_op, replica, scope, recipe=recipe)
         submit = bool(context.work or getattr(recipe, "algorithm", None))
-        launch = start = None
-        if submit and include_sub:
-            launch, start = self._submit_host_launch(stage_key, name)
         fast_created = None
         if lazy_fast and lazy_key is not None and entry is None:
             orig_meta = dict(op.metadata)
@@ -364,26 +522,15 @@ class _LazyFrontier:
             if cur_l_entries is not None:
                 cur_l_entries[idx] = fast_created
         if fast_created is not None:
-            host_info[idx] = (fast_created, op, name, launch, start, None)
-        else:
-            host_info[idx] = (None, op, name, launch, start, (res_op, recipe, context))
-        self.host_cursor += 1
+            return (fast_created, op, name, submit, None)
+        return (None, op, name, submit, (res_op, recipe, context))
 
-    def _materialize_through(self, limit_idx: int):
-        n_ops, host_submits = self.n_ops, self.host_submits
-        host_info, physical_ops = self.host_info, self.physical_ops
-        end = n_ops - 1 if limit_idx >= n_ops else limit_idx
-        if self.host_cursor > end:
-            return
-        prev_len = len(host_submits)
-        while self.host_cursor <= end:
-            cur = self.host_cursor
-            if host_info[cur] is None:
-                self._materialize_one(cur, physical_ops[cur])
-            else:
-                self.host_cursor = cur + 1
-        if self.step is not None and len(host_submits) != prev_len and self.host_cursor >= n_ops:
-            self._update_host_submits()
+    def _materialize_non_pumped(self, idx: int, op):
+        pack = self._prepare_entry(idx, op)
+        launch = start = None
+        if pack[3] and self.include_sub and op.stage in self._stage_compact_zero:
+            launch, start = self._submit_compact_zero_launch(op.stage, idx, pack[2])
+        self.host_info[idx] = (pack[0], pack[1], pack[2], launch, start, pack[4])
 
     def _run_bundle_in_scope(
         self, op, name, boundary, entry, op_template, meta_diff, context_template,
@@ -503,8 +650,6 @@ class _LazyFrontier:
                 observer(orig_op, replica, obs_prog_name, sync_ev, complete)
             for key, delta in work_deltas:
                 exec_work[key] += delta
-            if self.host_cursor < n_ops:
-                self._materialize_through(idx + host_lookahead)
             if complete.time is not None:
                 if op_futures[idx] is not None or succ_idx[idx]:
                     self._completed(idx)
@@ -542,26 +687,34 @@ class _LazyFrontier:
             observer(orig_op, replica, obs_prog_name, ready_marker, complete)
         for key, delta in work_deltas:
             exec_work[key] += delta
-        if self.host_cursor < n_ops:
-            self._materialize_through(idx + host_lookahead)
 
     def _activate(self, idx: int):
         execution = self.execution
-        engine, replica, scope, owner = self.engine, self.replica, self.scope, self.owner
+        engine, replica, owner = self.engine, self.replica, self.owner
         host_info, physical_ops, streams = self.host_info, self.physical_ops, self.streams
         dep_specs, op_events, order = self.dep_specs, self.op_events, self.order
         ext_map, input_ready, schedule = self.ext_map, self.input_ready, self.schedule
         observer, memory_bindings = self.observer, self.memory_bindings
-        recipes_used, exec_work, host_lookahead = self.recipes_used, self.exec_work, self.host_lookahead
+        recipes_used, exec_work = self.recipes_used, self.exec_work
+        op = physical_ops[idx]
         info = host_info[idx]
         if info is None:
-            self._materialize_through(idx)
-            info = host_info[idx]
+            if op.stage in self._host_pumped_stages:
+                pack = self._prepared_pending_host.get(idx)
+                if pack is None:
+                    pack = self._prepare_entry(idx, op)
+                if pack[3]:
+                    self._prepared_pending_host[idx] = pack
+                    self._awaiting_host.add(idx)
+                    return
+                info = (pack[0], pack[1], pack[2], None, None, pack[4])
+                host_info[idx] = info
+            else:
+                self._materialize_non_pumped(idx, op)
+                info = host_info[idx]
         fast_entry, orig_op, name, launch, _start, slow_pack = info
-        op = physical_ops[idx]
         if fast_entry is not None and fast_entry[1] is False:
-            res_op, recipe = execution.prepare(op, replica)
-            context = execution._context(res_op, replica, scope, recipe=recipe)
+            res_op, recipe, context = self._prepare_op_context(op)
             slow_pack = (res_op, recipe, context)
             fast_entry = None
         if fast_entry is not None:
@@ -602,7 +755,6 @@ class _LazyFrontier:
                 ready, complete)
         for key in exec_work:
             exec_work[key] += float(getattr(res_op, key))
-        self._materialize_through(idx + host_lookahead)
 
     def _drain_activations(self):
         if self.activating:
@@ -651,10 +803,9 @@ class _LazyFrontier:
         replica, scope = self.replica, self.scope
         input_ready, physical_ops = self.input_ready, self.physical_ops
         op_futures, sink_idx = self.op_futures, self.sink_idx
-        declared_commits, host_submits = self.declared_commits, self.host_submits
+        declared_commits = self.declared_commits
         execution = self.execution
-        self._materialize_through(
-            (self.root_idx[-1] + self.host_lookahead) if self.root_idx else self.host_lookahead)
+        self._prime_host_queues()
         if self.root_idx:
             self.pending_activations.extend(self.root_idx)
             self._drain_activations()
@@ -688,7 +839,7 @@ class _LazyFrontier:
             work.graph_bucket, scope, len(physical_ops), commits,
             device_complete, host_results, clients,
             work.implementation_selections,
-            tuple(host_submits),
+            self._current_host_submits(),
             dict(declared_commits), dict(fallback_commits),
             offload_release)
         self.step = step

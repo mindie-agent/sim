@@ -19,7 +19,6 @@ from .snapshots import (
     _TEMPLATE_REPR_LIMIT,
     _check_canonical_snapshot,
     _check_structural,
-    _clock_rel_tol,
     _freeze_snapshot,
     _is_int,
     _measure_retained,
@@ -541,7 +540,6 @@ def _engine_dynamic_close(
     # runs (1), allocations (2), pools (3) stay 100% bit-exact.
     if f_body[1] != s_body[1] or f_body[2] != s_body[2] or f_body[3] != s_body[3]:
         return False
-    rel_tol = _clock_rel_tol(clock_scale, span)
     # task_dynamic (0): ("tuple", (task_entry, ...))
     f_tasks, s_tasks = f_body[0], s_body[0]
     if f_tasks != s_tasks:
@@ -556,20 +554,10 @@ def _engine_dynamic_close(
                 or len(s_fields) != _ENGINE_TASK_DYNAMIC_ARITY
             ):
                 return False
-            # waiting (1) is exact integer
-            if f_fields[1] != s_fields[1]:
+            # remaining (0) and waiting (1) stay exact so a live progressing
+            # residual task is never certified as invariant during a skip.
+            if f_fields[0] != s_fields[0] or f_fields[1] != s_fields[1]:
                 return False
-            # remaining (0): ("tuple", (("tuple", (("str", key), (tag, amount))), ...))
-            f_rem, s_rem = f_fields[0][1], s_fields[0][1]
-            if len(f_rem) != len(s_rem):
-                return False
-            for fr, sr in zip(f_rem, s_rem):
-                if fr == sr:
-                    continue
-                if fr[1][0] != sr[1][0]:
-                    return False
-                if not _frozen_scalar_close(fr[1][1], sr[1][1], rel_tol=rel_tol):
-                    return False
             # release (2) and start (3) offsets are time deltas in ms
             if not _frozen_scalar_close(f_fields[2], s_fields[2], clock_scale=clock_scale):
                 return False
