@@ -20,6 +20,7 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
+from mindie_sim.prediction.results import OpOccurrence
 from mindie_sim.schema.common import ModelingError
 
 from .models import (
@@ -220,7 +221,7 @@ def _kernel_matches_tokens(kernel: KernelObservationRow, tokens: Sequence[str]) 
 def _build_reconciled_group(
     op: OperatorExportRow, matched: tuple[KernelObservationRow, ...],
 ) -> ReconciledKernelGroup:
-    meas_sum = sum(k.duration_us for k in matched)
+    meas_sum = math.fsum(k.duration_us for k in matched)
     if meas_sum <= 0.0:
         return ReconciledKernelGroup(op.op_id, matched, None, None, None)
     abs_err = abs(op.dur_us - meas_sum)
@@ -242,66 +243,98 @@ def _nearest_rank_percentile(sorted_vals: Sequence[float], frac: float) -> float
     return float(sorted_vals[idx])
 
 
+def _consume_explicit_kernels(
+    wanted: Sequence[str],
+    by_name: Mapping[str, Sequence[tuple[int, KernelObservationRow]]],
+    kernels: Sequence[KernelObservationRow],
+    consumed: set[int],
+) -> list[KernelObservationRow]:
+    matched: list[KernelObservationRow] = []
+    for pattern in wanted:
+        chosen = next(((pos, k) for pos, k in by_name.get(pattern, ()) if pos not in consumed), None)
+        if chosen is None:
+            pat_low = pattern.lower()
+            chosen = next(
+                ((pos, k) for pos, k in enumerate(kernels) if pos not in consumed and pat_low in k.name.lower()),
+                None,
+            )
+        if chosen is not None:
+            consumed.add(chosen[0])
+            matched.append(chosen[1])
+    return matched
+
+
 def reconcile_operators_with_kernels(
     operators: Sequence[OperatorExportRow],
     kernels: Sequence[KernelObservationRow],
     *,
-    explicit_map: Mapping[str, Sequence[str]] | None = None,
+    explicit_map: Mapping[OpOccurrence | str, Sequence[str]] | None = None,
     source_label: str = "kernel_details.csv",
-) -> tuple[dict[str, ReconciledKernelGroup], ReconciliationSummary]:
-    """Perform sample-conserving 1-to-N reconciliation of fused ``sim`` ops to kernels."""
+) -> tuple[dict[OpOccurrence, ReconciledKernelGroup], ReconciliationSummary]:
+    """Perform sample-conserving ``OpOccurrence``-keyed 1-to-N reconciliation."""
+    seen_occurrences: set[OpOccurrence] = set()
+    for op in operators:
+        if op.occurrence in seen_occurrences:
+            raise ModelingError(f"duplicate_operator_occurrence:{op.occurrence!r}")
+        seen_occurrences.add(op.occurrence)
+
     consumed: set[int] = set()
-    groups: dict[str, ReconciledKernelGroup] = {}
+    groups: dict[OpOccurrence, ReconciledKernelGroup] = {}
     explicit = dict(explicit_map or {})
-    by_name: dict[str, list[KernelObservationRow]] = defaultdict(list)
-    for row in kernels:
-        by_name[row.name].append(row)
+    by_name: dict[str, list[tuple[int, KernelObservationRow]]] = defaultdict(list)
+    for pos, row in enumerate(kernels):
+        by_name[row.name].append((pos, row))
 
     for op in operators:
+        wanted = explicit.get(op.occurrence)
+        if not wanted:
+            continue
+        matched = _consume_explicit_kernels(wanted, by_name, kernels, consumed)
+        if matched:
+            groups[op.occurrence] = _build_reconciled_group(op, tuple(matched))
+
+    for op in operators:
+        if op.occurrence in groups or op.occurrence in explicit:
+            continue
         wanted = explicit.get(op.op_id)
         if not wanted:
             continue
-        matched: list[KernelObservationRow] = []
-        for pattern in wanted:
-            chosen = next((k for k in by_name.get(pattern, ()) if k.index not in consumed), None)
-            if chosen is None:
-                chosen = next((k for k in kernels if k.index not in consumed and pattern.lower() in k.name.lower()), None)
-            if chosen is not None:
-                consumed.add(chosen.index)
-                matched.append(chosen)
+        matched = _consume_explicit_kernels(wanted, by_name, kernels, consumed)
         if matched:
-            groups[op.op_id] = _build_reconciled_group(op, tuple(matched))
+            groups[op.occurrence] = _build_reconciled_group(op, tuple(matched))
 
     cursor = 0
     for op in operators:
-        if op.op_id in groups:
+        if op.occurrence in groups:
             continue
         tokens = _operator_match_tokens(op)
         matched = []
         scan_idx = cursor
         max_group = max(1, len(op.absorbed_source_ops) + 1)
         while scan_idx < len(kernels) and len(matched) < max_group:
-            cand = kernels[scan_idx]
+            pos = scan_idx
+            cand = kernels[pos]
             scan_idx += 1
-            if cand.index in consumed:
+            if pos in consumed:
                 continue
             if _kernel_matches_tokens(cand, tokens):
-                consumed.add(cand.index)
+                consumed.add(pos)
                 matched.append(cand)
                 cursor = scan_idx
             elif matched:
                 break
         if matched:
-            groups[op.op_id] = _build_reconciled_group(op, tuple(matched))
+            groups[op.occurrence] = _build_reconciled_group(op, tuple(matched))
 
-    unmatched = tuple(k for k in kernels if k.index not in consumed)
+    unmatched = tuple(k for pos, k in enumerate(kernels) if pos not in consumed)
     apes = sorted(g.ape_pct for g in groups.values() if g.ape_pct is not None and math.isfinite(g.ape_pct))
     med_ape = float(median(apes)) if apes else None
     p90_ape = _nearest_rank_percentile(apes, P90_QUANTILE) if apes else None
     within_count = sum(1 for g in groups.values() if g.within_gate is True)
     within_pct = (100.0 * within_count / len(groups)) if groups else None
-    matched_sim_sum = sum(op.dur_us for op in operators if op.op_id in groups)
-    matched_meas_sum = sum(g.measured_sum_us for g in groups.values() if g.measured_sum_us is not None)
+    matched_sim_sum = math.fsum(op.dur_us for op in operators if op.occurrence in groups)
+    matched_meas_sum = math.fsum(k.duration_us for g in groups.values() for k in g.kernels)
+    unmatched_meas_sum = math.fsum(k.duration_us for k in unmatched)
     summary = ReconciliationSummary(
         source_label=source_label,
         total_sim_ops=len(operators),
@@ -311,7 +344,7 @@ def reconcile_operators_with_kernels(
         unmatched_kernels=unmatched,
         matched_sim_sum_us=matched_sim_sum,
         matched_measured_sum_us=matched_meas_sum,
-        unmatched_measured_us=sum(k.duration_us for k in unmatched),
+        unmatched_measured_us=unmatched_meas_sum,
         median_ape_pct=med_ape,
         p90_ape_pct=p90_ape,
         within_gate_count=within_count,

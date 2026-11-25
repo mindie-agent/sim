@@ -725,12 +725,13 @@ def _collapse_micro_split_ops(
         key = (row.archetype_id, collapsed_id)
         renamed[row.op_id] = collapsed_id
         prev_idx = group_pos.get(key)
+        row_rep = max(1, int(row.repeat_count))
+        work_scale = float(row_rep) if is_recover_ssm else 1.0
         if prev_idx is None:
             group_pos[key] = len(out_rows)
-            group_counts[key] = 1
+            group_counts[key] = row_rep
             group_is_recover[key] = is_recover_ssm
             group_preds[key] = list(row.predecessors)
-            row_rep = max(1, int(row.repeat_count))
             first_dur_ns = op_dur_int_ns(row, row_rep)
             first_exp_ns = op_exposed_int_ns(row, row_rep)
             first_ls_ns = int(max(dem)) if max(dem) > 0 else op_lstar_int_ns(row, row_rep)
@@ -742,15 +743,23 @@ def _collapse_micro_split_ops(
                 dur_ns=first_dur_ns,
                 exposed_ns=first_exp_ns,
                 l_star_ns=first_ls_ns,
+                flops=row.flops * work_scale,
+                vector_ops=row.vector_ops * work_scale,
+                hbm_read_bytes=row.hbm_read_bytes * work_scale,
+                hbm_write_bytes=row.hbm_write_bytes * work_scale,
+                hbm_total_bytes=row.hbm_total_bytes * work_scale,
+                mte2_bytes=row.mte2_bytes * work_scale,
+                mte3_bytes=row.mte3_bytes * work_scale,
+                fixpipe_bytes=row.fixpipe_bytes * work_scale,
+                link_bytes=row.link_bytes * work_scale,
             ))
             out_demands.append(dem)
             continue
-        group_counts[key] += 1
+        group_counts[key] += row_rep
         group_preds[key].extend(row.predecessors)
         base = out_rows[prev_idx]
         b_dem = out_demands[prev_idx]
         base_rep = max(1, int(base.repeat_count))
-        row_rep = max(1, int(row.repeat_count))
         merged_dem = tuple(b_dem[i] + dem[i] for i in range(CERT_RESOURCE_COUNT))
         new_dur_ns = int(base.dur_ns) + op_dur_int_ns(row, row_rep)
         new_exposed_ns = int(base.exposed_ns) + op_exposed_int_ns(row, row_rep)
@@ -765,12 +774,15 @@ def _collapse_micro_split_ops(
             dur_us=new_dur, exposed_dur_us=new_exposed,
             dur_ns=new_dur_ns, exposed_ns=new_exposed_ns, l_star_ns=new_l_star_ns,
             is_overlapped=(new_exposed_ns == 0 and new_dur_ns > 0),
-            flops=base.flops + row.flops, vector_ops=base.vector_ops + row.vector_ops,
-            hbm_read_bytes=base.hbm_read_bytes + row.hbm_read_bytes,
-            hbm_write_bytes=base.hbm_write_bytes + row.hbm_write_bytes,
-            hbm_total_bytes=base.hbm_total_bytes + row.hbm_total_bytes,
-            mte2_bytes=base.mte2_bytes + row.mte2_bytes, mte3_bytes=base.mte3_bytes + row.mte3_bytes,
-            fixpipe_bytes=base.fixpipe_bytes + row.fixpipe_bytes, link_bytes=base.link_bytes + row.link_bytes,
+            flops=base.flops + row.flops * work_scale,
+            vector_ops=base.vector_ops + row.vector_ops * work_scale,
+            hbm_read_bytes=base.hbm_read_bytes + row.hbm_read_bytes * work_scale,
+            hbm_write_bytes=base.hbm_write_bytes + row.hbm_write_bytes * work_scale,
+            hbm_total_bytes=base.hbm_total_bytes + row.hbm_total_bytes * work_scale,
+            mte2_bytes=base.mte2_bytes + row.mte2_bytes * work_scale,
+            mte3_bytes=base.mte3_bytes + row.mte3_bytes * work_scale,
+            fixpipe_bytes=base.fixpipe_bytes + row.fixpipe_bytes * work_scale,
+            link_bytes=base.link_bytes + row.link_bytes * work_scale,
             l_star_lean_us=new_l_star, gap_us=new_dur - new_l_star,
             gap_ratio=(new_dur / new_l_star) if new_l_star > 0.0 else None,
         )
@@ -1254,10 +1266,9 @@ def _attribute_full_bundle_stream0(
     total_exposed_ns = 0
     for idx, row in enumerate(rows):
         oid = str(idx)
-        dur_ns = max(0, int(row.dur_ns) if int(row.dur_ns) > 0 else int(round(float(row.dur_us) * NS_PER_US)))
+        iv = intervals[idx]
+        dur_ns = iv.end_ns - iv.start_ns
         exp_ns = max(0, int(res.exposed_ns_by_op.get(oid, 0)))
-        if dur_ns > 0:
-            exp_ns = min(dur_ns, exp_ns)
         total_exposed_ns += exp_ns
         exp_us = float(exp_ns) / NS_PER_US
         fully_hidden = dur_ns > 0 and exp_ns == 0
@@ -1378,50 +1389,67 @@ def _micro_collapsed_site(row: OperatorExportRow) -> str:
 def _extract_per_layer_timings(
     rows: Sequence[OperatorExportRow],
     layer_plans: Sequence[Any] = (),
+    *,
+    demands_ns: Sequence[tuple[int, int, int, int, int]] = (),
 ) -> dict[tuple[str, int], dict[str, Any]]:
     """Capture exact native per-layer and per-proposal physical timings for trace replay."""
     block_by_layer = {
         int(lp.index): int(getattr(lp, "residual_block_size", 0) or 0)
         for lp in layer_plans
     }
+    has_demands = len(demands_ns) == len(rows) and len(rows) > 0
     multi_draft_step = len(_collect_draft_proposal_steps(rows)) > 1
-    by_layer: dict[tuple[str, int], list[OperatorExportRow]] = defaultdict(list)
-    for row in rows:
+    by_layer: dict[tuple[str, int], list[tuple[OperatorExportRow, tuple[int, int, int, int, int] | None]]] = defaultdict(list)
+    for idx, row in enumerate(rows):
         key = _per_layer_timing_key(row, multi_draft_step)
         if key is not None:
-            by_layer[key].append(row)
+            by_layer[key].append((row, demands_ns[idx] if has_demands else None))
     out: dict[tuple[str, int], dict[str, Any]] = {}
-    for key, l_rows in by_layer.items():
-        min_s = min(r.start_us for r in l_rows)
-        max_e = max(r.end_us for r in l_rows)
+    for key, l_items in by_layer.items():
+        min_s = min(r.start_us for r, _ in l_items)
+        max_e = max(r.end_us for r, _ in l_items)
         op_map: dict[str, tuple[float, float]] = {}
         op_exp_map: dict[str, float] = {}
         op_lstar_map: dict[str, float] = {}
         op_dur_ns_map: dict[str, int] = {}
         op_exp_ns_map: dict[str, int] = {}
         op_lstar_ns_map: dict[str, int] = {}
-        micro_groups: dict[str, list[OperatorExportRow]] = defaultdict(list)
-        for r in l_rows:
+        micro_groups: dict[
+            str,
+            list[tuple[OperatorExportRow, int, int, int, tuple[int, int, int, int, int] | None]],
+        ] = defaultdict(list)
+        for r, r_dem in l_items:
             sites = [strip_op_prefix(r.op_id)]
             if r.op_id.startswith("rewrite:") and r.absorbed_source_ops:
                 sites.append(
                     "rewrite_fused:" + "+".join(strip_op_prefix(src) for src in r.absorbed_source_ops)
                 )
-            micro_site = _micro_collapsed_site(r)
-            if micro_site:
-                micro_groups[micro_site].append(r)
             dur_u = max(0.0, r.dur_us)
             exp_u = 0.0 if r.is_overlapped else max(0.0, r.exposed_dur_us)
             ls_u = 0.0 if r.is_overlapped else max(0.0, r.l_star_lean_us)
-            dur_ns_v = int(r.dur_ns) if int(r.dur_ns) > 0 else max(0, int(round(dur_u * NS_PER_US)))
-            exp_ns_v = (
-                0 if r.is_overlapped
-                else (int(r.exposed_ns) if int(r.exposed_ns) > 0 else max(0, int(round(exp_u * NS_PER_US))))
+            s_ns = max(0, int(round(float(r.start_us) * NS_PER_US)))
+            e_ns = max(s_ns, int(round(float(r.end_us) * NS_PER_US)))
+            has_endpoints = r.start_us > 0.0 or r.end_us > 0.0
+            dur_ns_v = (
+                int(r.dur_ns)
+                if int(r.dur_ns) > 0
+                else ((e_ns - s_ns) if has_endpoints else max(0, int(round(dur_u * NS_PER_US))))
             )
+            if r.is_overlapped:
+                exp_ns_v = 0
+            elif int(r.exposed_ns) > 0:
+                exp_ns_v = int(r.exposed_ns)
+            elif dur_ns_v == 0 and has_endpoints:
+                exp_ns_v = 0
+            else:
+                exp_ns_v = max(0, int(round(exp_u * NS_PER_US)))
             ls_ns_v = (
                 0 if r.is_overlapped
                 else (int(r.l_star_ns) if int(r.l_star_ns) > 0 else max(0, int(round(ls_u * NS_PER_US))))
             )
+            micro_site = _micro_collapsed_site(r)
+            if micro_site:
+                micro_groups[micro_site].append((r, dur_ns_v, exp_ns_v, ls_ns_v, r_dem))
             for site in sites:
                 if site not in op_map:
                     op_map[site] = (max(0.0, r.start_us - min_s), dur_u)
@@ -1430,11 +1458,40 @@ def _extract_per_layer_timings(
                     op_dur_ns_map[site] = dur_ns_v
                     op_exp_ns_map[site] = exp_ns_v
                     op_lstar_ns_map[site] = ls_ns_v
-        for micro_site, m_rows in micro_groups.items():
-            if micro_site not in op_map and m_rows:
-                m_start = min(mr.start_us for mr in m_rows)
-                m_avg_dur = sum(max(0.0, mr.dur_us) for mr in m_rows) / float(len(m_rows))
-                op_map[micro_site] = (max(0.0, m_start - min_s), m_avg_dur)
+        for micro_site, m_items in micro_groups.items():
+            if not m_items or (micro_site in op_map and len(m_items) <= 1):
+                continue
+            m_start = min(mr.start_us for mr, _, _, _, _ in m_items)
+            m_dur_ns = sum(d_ns for _, d_ns, _, _, _ in m_items)
+            m_exp_ns = sum(e_ns for _, _, e_ns, _, _ in m_items)
+            is_recover_tail = (
+                key == ("target_tail", -1)
+                and _RECOVER_SSM_MICRO_PATTERN.match(m_items[0][0].op_id) is not None
+            )
+            call_count = sum(max(1, int(mr.repeat_count)) for mr, _, _, _, _ in m_items)
+            denom_us = float(call_count) * NS_PER_US if is_recover_tail else NS_PER_US
+            op_map[micro_site] = (max(0.0, m_start - min_s), float(m_dur_ns) / denom_us)
+            op_exp_map[micro_site] = float(m_exp_ns) / denom_us
+            op_dur_ns_map[micro_site] = m_dur_ns
+            op_exp_ns_map[micro_site] = m_exp_ns
+            fully_hidden = m_dur_ns > 0 and m_exp_ns == 0
+            if fully_hidden:
+                m_ls_ns: int | None = 0
+            elif has_demands:
+                m_ls_ns = int(max(
+                    sum(int(m_dem[k]) for _, _, _, _, m_dem in m_items if m_dem is not None)
+                    for k in range(CERT_RESOURCE_COUNT)
+                ))
+            elif len(m_items) == 1:
+                m_ls_ns = m_items[0][3]
+            else:
+                m_ls_ns = None
+            if m_ls_ns is not None:
+                op_lstar_map[micro_site] = float(m_ls_ns) / denom_us
+                op_lstar_ns_map[micro_site] = m_ls_ns
+            else:
+                op_lstar_map.pop(micro_site, None)
+                op_lstar_ns_map.pop(micro_site, None)
         out[key] = {
             "start_us": min_s,
             "end_us": max_e,
@@ -1697,25 +1754,25 @@ def _finalize_ranked_rows(
         key=lambda i: (-(prelim_rows[i].gap_us * prelim_rows[i].repeat_count), -(prelim_rows[i].gap_ratio or 0.0), prelim_rows[i].ordinal),
     )
     rank_by_idx = {idx: pos + 1 for pos, idx in enumerate(rank_order)}
-    reconciled: dict[str, ReconciledKernelGroup] = {}
+    reconciled: dict[OpOccurrence, ReconciledKernelGroup] = {}
     reconcile_summary: ReconciliationSummary | None = None
     if observations_path is not None:
         obs_kernels, explicit_map = load_observation_bundle(observations_path)
         reconciled, reconcile_summary = reconcile_operators_with_kernels(
             prelim_rows, obs_kernels, explicit_map=explicit_map, source_label=Path(observations_path).name,
         )
-    final_rows = tuple(
-        replace(
+    final_rows: list[OperatorExportRow] = []
+    for idx, item in enumerate(prelim_rows):
+        group = reconciled.get(item.occurrence)
+        final_rows.append(replace(
             item,
             gap_radar_rank=rank_by_idx[idx],
-            measured_kernels=reconciled[item.op_id].kernels if item.op_id in reconciled else (),
-            measured_sum_us=reconciled[item.op_id].measured_sum_us if item.op_id in reconciled else None,
-            ape_pct=reconciled[item.op_id].ape_pct if item.op_id in reconciled else None,
-            binding_state=BINDING_STATE_MEASURED if item.op_id in reconciled else item.binding_state,
-        )
-        for idx, item in enumerate(prelim_rows)
-    )
-    return final_rows, rank_order, reconcile_summary
+            measured_kernels=group.kernels if group is not None else (),
+            measured_sum_us=group.measured_sum_us if group is not None else None,
+            ape_pct=group.ape_pct if group is not None else None,
+            binding_state=BINDING_STATE_MEASURED if group is not None else item.binding_state,
+        ))
+    return tuple(final_rows), rank_order, reconcile_summary
 
 
 def _resolve_op_submodule(
@@ -1983,7 +2040,9 @@ def _build_prelim_operator_rows(
             _resolve_row_fusion_binding(rec, desc, pipe, meta, absorbed)
         )
         demands_ns.append(op_demand)
-        row_dur_ns = max(0, int(round(dur_us * NS_PER_US)))
+        row_start_ns = max(0, int(round(float(rec["start_us"]) * NS_PER_US)))
+        row_end_ns = max(row_start_ns, int(round(float(rec["end_us"]) * NS_PER_US)))
+        row_dur_ns = row_end_ns - row_start_ns
         row_l_star_ns = max(0, int(max(op_demand)))
         row_extras = _filter_dataclass_kwargs(
             _OP_ROW_FIELDS,
@@ -2211,25 +2270,36 @@ def _apply_stage_exposed_ns(
 ) -> tuple[list[OperatorExportRow], tuple[LayerArchetypeSpec, ...], int, int]:
     """Apply exact integer-ns exposure from a canonical ``StageReceipt`` onto unfolded rows."""
     occ_exp = {str(k): max(0, int(v)) for k, v in stage.exposed_ns_by_occ}
+    has_receipt_occ = bool(occ_exp)
     spans_ns: dict[str, int] = defaultdict(int)
     out_rows: list[OperatorExportRow] = []
     total_exp_ns = 0
     for row in rows:
         lbl = _occurrence_stage_label(row.occurrence)
-        dur_ns = max(0, int(row.dur_ns) if int(row.dur_ns) > 0 else int(round(float(row.dur_us) * NS_PER_US)))
-        exp_ns = occ_exp.get(lbl, int(row.exposed_ns))
-        if dur_ns > 0:
-            exp_ns = min(dur_ns, max(0, exp_ns))
+        s_ns = max(0, int(round(float(row.start_us) * NS_PER_US)))
+        e_ns = max(s_ns, int(round(float(row.end_us) * NS_PER_US)))
+        base_dur_ns = int(row.dur_ns) if int(row.dur_ns) > 0 else (e_ns - s_ns)
+        exp_ns = max(0, int(occ_exp.get(lbl, 0 if has_receipt_occ else row.exposed_ns)))
+        if exp_ns > base_dur_ns:
+            dur_ns = exp_ns
+            dur_us = float(dur_ns) / NS_PER_US
+            end_us = float(s_ns + dur_ns) / NS_PER_US
+        else:
+            dur_ns = base_dur_ns
+            dur_us = row.dur_us
+            end_us = row.end_us
         total_exp_ns += exp_ns
         fully_hidden = dur_ns > 0 and exp_ns == 0
         out_rows.append(replace(
             row,
+            end_us=end_us,
+            dur_us=dur_us,
             dur_ns=dur_ns,
             exposed_ns=exp_ns,
             exposed_dur_us=float(exp_ns) / NS_PER_US,
             is_overlapped=fully_hidden,
-            gap_us=0.0 if fully_hidden else max(0.0, row.dur_us - row.l_star_lean_us),
-            gap_ratio=None if fully_hidden else ((row.dur_us / row.l_star_lean_us) if row.l_star_lean_us > 0.0 else None),
+            gap_us=0.0 if fully_hidden else max(0.0, dur_us - row.l_star_lean_us),
+            gap_ratio=None if fully_hidden else ((dur_us / row.l_star_lean_us) if row.l_star_lean_us > 0.0 else None),
         ))
         spans_ns[row.archetype_id] += exp_ns
     step_span_ns = max(total_exp_ns, int(stage.span_ns))
@@ -2827,7 +2897,7 @@ def build_export_bundle(
 
     # Capture per-layer timings strictly on unfolded rows BEFORE read-only display folding.
     draft_steps = _collect_draft_proposal_steps(prelim_rows)
-    per_layer_timings = _extract_per_layer_timings(prelim_rows, parsed.model.layer_plans)
+    per_layer_timings = _extract_per_layer_timings(prelim_rows, parsed.model.layer_plans, demands_ns=demands_ns)
     if use_archetype_dedup:
         prelim_rows, demands_ns, archetypes = _aggregate_bundle_cohort_rows(
             prelim_rows, demands_ns, archetypes,
