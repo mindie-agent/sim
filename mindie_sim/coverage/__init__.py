@@ -73,14 +73,17 @@ def comparison_coverage(inventory, acceptance, *, linkage=None):
     if not isinstance(ledger, Mapping) or not isinstance(counts, Mapping):
         raise ValueError("comparison_coverage_inputs_are_incomplete")
     total = ledger.get("total_records")
+    a5_event_captures = ledger.get("legacy_a5_unique_event_captures")
+    if a5_event_captures is None:
+        a5_event_captures = ledger.get("a5_unique_event_captures")
+    if a5_event_captures is None:
+        a5_event_captures = ledger.get("a5_capture_count")
     return {
         "schema": COMPARISON_COVERAGE_SCHEMA,
         "ledger_records": total,
         "ledger_a5_records": ledger.get("a5_scope_records"),
         "ledger_captures_total": ledger.get("captures_total"),
-        "ledger_a5_event_captures": (ledger.get("a5_unique_event_captures")
-                                     if ledger.get("a5_unique_event_captures") is not None
-                                     else ledger.get("a5_capture_count")),
+        "ledger_a5_event_captures": a5_event_captures,
         "comparison": {
             "paired_items": counts.get("paired_items"),
             "duration_denominator_items": counts.get("duration_denominator_items"),

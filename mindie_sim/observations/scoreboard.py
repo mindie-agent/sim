@@ -1441,10 +1441,10 @@ def _read_json(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def main(argv=None):
+def main(argv=None, *, prog="python -m mindie_sim.observations.scoreboard"):
     """Publish one independent native comparison slice as JSON and markdown."""
     parser = argparse.ArgumentParser(
-        prog="python -m mindie_sim.observations.scoreboard",
+        prog=prog,
         description=("Project a profiler native comparison (formal/diagnostic "
                      "tolerance plus source coverage) into the sim scoreboard."))
     parser.add_argument(
