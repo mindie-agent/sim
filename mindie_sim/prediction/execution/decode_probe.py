@@ -48,7 +48,7 @@ def probe_capacity(case, *, context, tokens, sequences=1, phase="decode",
     """
     case = parse_case(case)
     _check_geometry(phase, tokens, 1, context, "body")
-    participants = cohorts(case.runtime.parallel)[0]
+    participants = cohorts(case.runtime.parallel, case.machine)[0]
     counts = cohort_sequence_counts(sequences, participants)
     if not padded_idle:
         from mindie_sim.prediction.operator_analysis import graph_padded_idle
@@ -71,7 +71,27 @@ def probe_capacity(case, *, context, tokens, sequences=1, phase="decode",
     # Body queries, not the case's potentially 126K prefill request, determine
     # live activation workspace. KV grows with valid contexts, not padding.
     memory = Memory(case, workspace_tokens=max(padded.values(), default=0))
-    cache = memory.cache_bytes(context + tokens)
+    cache_query_tokens = 1 if phase == "prefill" else tokens
+    cache = memory.cache_bytes(context + tokens, query_tokens=cache_query_tokens)
+    receipt = memory.resident_memory_receipt(
+        phase=phase,
+        sequence_tokens=context + tokens,
+        batch_per_dp=tuple(counts.get(r, 0) for r in range(case.runtime.parallel.dp)),
+        query_tokens=tokens,
+    )
+    stage_cache: dict[tuple[int, int], float] = {}
+    for die in receipt.dies:
+        die_cache = float(
+            die.kv_cache_allocated_bytes
+            + die.index_cache_allocated_bytes
+            + die.recurrent_state_bytes
+            + die.draft_cache_bytes
+            + die.staging_bytes
+        )
+        key = (int(die.replica), int(die.stage))
+        prev = stage_cache.get(key)
+        if prev is None or die_cache > prev:
+            stage_cache[key] = die_cache
     violations, rows = [], []
     runtime = case.runtime
     if context + tokens > runtime.max_model_len:
@@ -85,7 +105,7 @@ def probe_capacity(case, *, context, tokens, sequences=1, phase="decode",
                 violations.append({"constraint": constraint, "replica": replica,
                                    "required": required, "available": available})
         for stage, per_request in enumerate(cache):
-            required = per_request * count
+            required = stage_cache.get((replica, stage), per_request * count)
             available = memory.capacity[replica][stage]
             resident = (memory.weights[stage] + memory.workspace[stage]
                         + memory.policy.reserved + required)

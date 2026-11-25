@@ -32,16 +32,27 @@ class RankLedger:
 
 def ep_groups(parallel, machine, replica, stage):
     """Return ``(rank_to_coords, ep_group_tuples)`` for one pipeline stage."""
+    ext_base = (int(replica) // parallel.dp) * parallel.dp
+    placement = None
     if machine is None:
         def rank_at(d, c, t):
             return ((d * parallel.pp + stage) * parallel.pcp + c) * parallel.tp + t
+    elif hasattr(machine, "validate_placement") and hasattr(parallel, "world_size"):
+        placement = machine.validate_placement(parallel)
+        stage_ranks = {
+            d: placement.stage_ranks(d, stage)
+            for d in range(ext_base, ext_base + parallel.dp)
+        }
+
+        def rank_at(d, c, t):
+            return stage_ranks[d][c * parallel.tp + t]
     else:
         def rank_at(d, c, t):
             idx = ((d * parallel.pp + stage) * parallel.pcp + c) * parallel.tp + t
             return machine.dies[idx].rank
     coords = {
         rank_at(d, c, t): (d, c, t)
-        for d in range(parallel.dp)
+        for d in range(ext_base, ext_base + parallel.dp)
         for c in range(parallel.pcp)
         for t in range(parallel.tp)
     }
@@ -50,16 +61,63 @@ def ep_groups(parallel, machine, replica, stage):
             tuple(group) for group in parallel.rank_table
             if all(r in coords for r in group)
         )
+    elif placement is not None:
+        groups = tuple(dict.fromkeys(
+            placement.ep_group_ranks(replica, stage, lane=lane)
+            for lane in range(parallel.pcp * parallel.tp)
+        ))
     elif machine is not None:
         groups = Topology(machine, parallel).groups("ep", replica, stage)
     else:
-        plane = [(d, t) for d in range(parallel.dp) for t in range(parallel.tp)]
-        groups = tuple(
-            tuple(rank_at(d, c, t) for d, t in plane[i : i + parallel.ep])
-            for c in range(parallel.pcp)
-            for i in range(0, len(plane), parallel.ep)
-        )
+        etp = max(1, int(getattr(parallel, "etp", 1) or 1))
+        ep_tp_w = max(1, parallel.tp // etp)
+        ep_spans_pcp = parallel.pcp > 1 and parallel.ep > parallel.dp * ep_tp_w
+        if ep_spans_pcp:
+            groups = tuple(
+                tuple(
+                    rank_at(d, c, t)
+                    for d in range(ext_base, ext_base + parallel.dp)
+                    for c in range(parallel.pcp)
+                    for t in range(off, off + ep_tp_w)
+                )[i : i + parallel.ep]
+                for off in range(0, parallel.tp, ep_tp_w)
+                for i in range(0, parallel.dp * parallel.pcp * ep_tp_w, parallel.ep)
+            )
+        else:
+            groups = tuple(
+                tuple(
+                    rank_at(d, c, t)
+                    for d in range(ext_base, ext_base + parallel.dp)
+                    for t in range(off, off + ep_tp_w)
+                )[i : i + parallel.ep]
+                for c in range(parallel.pcp)
+                for off in range(0, parallel.tp, ep_tp_w)
+                for i in range(0, parallel.dp * ep_tp_w, parallel.ep)
+            )
     return coords, groups
+
+
+def ep_replica_group(parallel, machine, participants, replica) -> tuple[int, ...]:
+    """Return the subset of ``participants`` sharing an EP collective with ``replica``."""
+    members = tuple(participants)
+    if len(members) <= 1:
+        return members
+    if parallel.rank_table is not None:
+        linked = {int(replica)}
+        for stage in range(parallel.pp):
+            coords, tables = ep_groups(parallel, machine, replica, stage)
+            changed = True
+            while changed:
+                changed = False
+                for table in tables:
+                    owners = {coords[r][0] for r in table if r in coords}
+                    if owners & linked and not owners <= linked:
+                        linked |= owners
+                        changed = True
+        return tuple(r for r in members if r in linked)
+    ep_w = max(1, int(getattr(parallel, "ep_dp_width", 1) or 1))
+    first = (int(replica) // ep_w) * ep_w
+    return tuple(r for r in members if first <= r < first + ep_w)
 
 
 def replica_cohorts(machine, parallel, groups):
@@ -100,8 +158,12 @@ def selected_lane(parallel, machine, replica, rank):
     """Return the PCP lane index of ``rank`` within ``replica``, or ``None``."""
     if parallel.pcp == 1 or rank is None or machine is None:
         return None
-    members = Topology(machine, parallel).ranks(replica, 0)
-    return members.index(rank) // parallel.tp if rank in members else None
+    topo = Topology(machine, parallel)
+    for stage in range(parallel.pp):
+        members = topo.ranks(replica, stage)
+        if rank in members:
+            return members.index(rank) // parallel.tp
+    return None
 
 
 def routing_union(views):
@@ -128,6 +190,24 @@ def routing_union(views):
     return tuple(result)
 
 
+def _resolve_stage_coords(parallel, machine, replica, rank):
+    """Locate the pipeline stage carrying ``rank`` and return ``(coords, groups, physical)``."""
+    coords, groups = ep_groups(parallel, machine, replica, 0)
+    if rank is not None and rank not in coords and parallel.pp > 1:
+        for stage in range(1, parallel.pp):
+            cand_coords, cand_groups = ep_groups(parallel, machine, replica, stage)
+            if rank in cand_coords:
+                coords, groups = cand_coords, cand_groups
+                break
+    physical = next(
+        (r for r, (d, c, t) in coords.items() if d == replica and c == 0 and t == 0),
+        None,
+    )
+    if rank is not None and rank in coords:
+        physical = rank
+    return coords, groups, physical
+
+
 def rank_ledger_for(
     frontend, model, runtime, views, tokens, peers, replica, machine, rank,
     routing_views=None,
@@ -135,13 +215,7 @@ def rank_ledger_for(
     """Compute the single-step rank row ledger for one EP group."""
     del model
     p = runtime.parallel
-    coords, groups = ep_groups(p, machine, replica, 0)
-    physical = next(
-        (r for r, (d, c, t) in coords.items() if d == replica and c == 0 and t == 0),
-        None,
-    )
-    if rank is not None and rank in coords:
-        physical = rank
+    coords, groups, physical = _resolve_stage_coords(p, machine, replica, rank)
     if physical is None:
         return None
     if peers is None:
@@ -167,11 +241,12 @@ def rank_ledger_for(
     own = expanded[replica]
     if any(v.phase == "prefill" and v.global_q_len for v in views):
         lanes = (coords[physical][1], *range(p.pcp))
+        view_prefill_ranges = tuple(v.query_ranges for v in views if v.phase == "prefill")
         lane = next(
             (
                 c for c in lanes
-                if tuple(v.query_ranges for v in lane_views(own, p.pcp, c))
-                == tuple(v.query_ranges for v in views)
+                if tuple(v.query_ranges for v in lane_views(own, p.pcp, c, decode=False))
+                == view_prefill_ranges
             ),
             coords[physical][1],
         )
@@ -193,22 +268,35 @@ def rank_ledger_for(
     capacity = 0
     routing = []
     unit = p.tp if runtime.kernels.get("sequence_parallel") else 1
+    etp = max(1, int(getattr(p, "etp", 1) or 1))
+    ep_tp_w = max(1, p.tp // etp)
+    sharded_tp = bool(unit > 1 or runtime.kernels.get("moe_token_partition"))
+    scoped_tp = p.tp if sharded_tp else min(ep_tp_w, p.ep)
     for (d, c), members in by_lane.items():
-        first_lane = min(other for owner, other in by_lane if owner == d)
-        use_decode = c == first_lane or p.pcp_lane_policy == "replica_lanes"
+        use_decode = c == 0 or p.pcp_lane_policy in {"replica_lanes", "shard_decode_requests"}
+        has_prefill = any(v.phase == "prefill" for v in expanded[d])
         part = lane_views(expanded[d], p.pcp, c, decode=use_decode)
         count_rows = sum(v.q_len for v in part)
         active_rows = sum(v.logical_q_len for v in part)
         parent = count_rows
-        if expanded[d]:
+        if expanded[d] and (use_decode or has_prefill):
             bucket, _ = frontend.graph.select(expanded[d], runtime)
             extra = max(0, int(bucket or 0) - sum(v.q_len for v in expanded[d]))
-            if p.pcp > 1 and any(v.phase == "prefill" for v in expanded[d]):
+            if p.pcp > 1 and has_prefill:
                 extra = sum(hi - lo for lo, hi in pcp_rank_chunk_ranges(extra, p.pcp, c))
             parent += extra
         represented = (d, c) == coords[physical][:2]
         if represented and tokens is not None:
-            parent = max(count_rows, tokens)
+            if use_decode:
+                parent = max(count_rows, tokens)
+            elif has_prefill:
+                unowned_decode = sum(
+                    v.q_len + (0 if v.global_q_len else v.draft_proposal_tokens)
+                    for v in views if v.phase != "prefill"
+                )
+                parent = max(parent, tokens - unowned_decode)
+            else:
+                parent = count_rows
         slot = parent + (-parent) % unit
         if (
             unit > 1
@@ -219,13 +307,14 @@ def rank_ledger_for(
         if represented:
             capacity = slot
         routing.extend(v for v in part if not v.padding)
-        scoped_tp = (
-            p.tp if unit > 1 or runtime.kernels.get("moe_token_partition")
-            else min(p.tp, p.ep)
-        )
-        for t, position in members:
-            lane_index = t % scoped_tp
-            if unit > 1 or runtime.kernels.get("moe_token_partition"):
+        ordered_members = sorted(members)
+        for member_idx, (t, position) in enumerate(ordered_members):
+            lane_index = (
+                member_idx
+                if (not sharded_tp and len(ordered_members) == scoped_tp)
+                else (t % scoped_tp)
+            )
+            if sharded_tp:
                 width = (slot + scoped_tp - 1) // scoped_tp
                 owned = max(0, min(width, active_rows - lane_index * width))
             else:
@@ -269,6 +358,7 @@ def rank_ledger_for(
 __all__ = [
     "RankLedger",
     "ep_groups",
+    "ep_replica_group",
     "lane_views",
     "rank_ledger_for",
     "replica_cohorts",
