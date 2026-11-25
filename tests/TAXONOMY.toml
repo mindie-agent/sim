@@ -375,14 +375,6 @@ path = "operators/test_custom_op_libraries.py"
 tier = "tier0"
 owns = ["mindie_sim/backends/ascend.py", "mindie_sim/catalog/ops.py", "mindie_sim/prediction/call_builders.py", "mindie_sim/prediction/operators/custom_framework"]
 [[module]]
-path = "operators/test_cuda_norm.py"
-tier = "tier0"
-owns = ["mindie_sim/prediction/operators/vector/cuda_norm.py"]
-[[module]]
-path = "operators/test_cuda_quant.py"
-tier = "tier0"
-owns = ["mindie_sim/prediction/operators/vector/cuda_quant.py"]
-[[module]]
 path = "operators/test_anti_armchair_ground_truth.py"
 tier = "tier1"
 owns = [
