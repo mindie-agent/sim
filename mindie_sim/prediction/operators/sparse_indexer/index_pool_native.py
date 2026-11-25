@@ -13,10 +13,12 @@
 """
 from dataclasses import replace
 import math
+from typing import Literal
 
 from mindie_sim.catalog.index_pool import pool_selection
 from mindie_sim.catalog.ops import comm_op, compute_dtype_for
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.operators.attention.batch_prefix_attention import annotate_sparse_prefix_unknown
 from .index_pool import (
     _row_shard_value, _selection_for, native_shard_sizes, row_shard_tp, row_slice,
@@ -30,6 +32,47 @@ from .sparse_indexer_pipeline import (
 )
 from mindie_sim.prediction.structure_groups import declare_group
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_REV = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
+_OPS_TRANSFORMER_REV = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/attention/indexer_kpool.py",
+        source_sha256="c7268fa24836f3ef33f9fb626ece9430c6c752a596e3bc07d230de5e9fb99e9b",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/ops/cann_keypool.py",
+        source_sha256="5deb787e94c4b31f5246747778b2bbe3a9c69447b2ca9701c90b500c0da94696",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/ops/triton/glm5_next_cann_keypool.py",
+        source_sha256="b02108fc0ac4e5ec77828abd2f69811511ee226ee90894500943d2175c2b4dd6",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/ops/triton/prepare_nonempty_keypool_inputs.py",
+        source_sha256="1864a2affc64dee1f033aeae7ce92d9159948ee3b6bb80b6fa81c739b9745184",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_TRANSFORMER_REV,
+        relative_path="attention/key_pool/op_kernel/arch35/key_pool_kernel.h",
+        source_sha256="79a8b71792b211408eaa37dead28debbce74ecc1ffe58533499819af645d29d0",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_TRANSFORMER_REV,
+        relative_path="attention/pool_key_indexer/op_kernel/arch35/pool_key_indexer_kernel_arch35.h",
+        source_sha256="cafeaaba33bf4a95a24ff368a1643a7a1cee8ca542e521a770f624d07c9b7daa",
+    ),
+)
 
 FP32_ELEMENT_BYTES = 4
 POSITION_AND_GATE_BYTES = 8

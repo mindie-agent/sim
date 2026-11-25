@@ -11,9 +11,41 @@
 [Side-Effect Policy] Returns immutable operators and metadata replacements only.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_REV = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
+_OP_PLUGIN_REV = "48189acf95882e23fae56ea96ceeb89358cb42da"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/quantization/methods/w8a8/w8a8_mxfp8.py",
+        source_sha256="f9d03f16ae93fb678da5ff0135848226b585960dc1abe45252719ce7eb29e65a",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/models/kimi_k3/kimi_k3.py",
+        source_sha256="aa666ec743d3c8cd10d58196be9e05d0606aa4ca89d14a94f327a75c9fd44613",
+    ),
+    SourceRef(
+        repository="Ascend/op-plugin",
+        revision=_OP_PLUGIN_REV,
+        relative_path="op_plugin/ops/opapi/GroupedMatmulKernelNpuOpApi.cpp",
+        source_sha256="a58dd51addfa3511735fcf1f46355a4597f62920cc5d24edc335b59610128fdc",
+    ),
+    SourceRef(
+        repository="Ascend/op-plugin",
+        revision=_OP_PLUGIN_REV,
+        relative_path="op_plugin/ops/opapi/FillKernelNpuOpApi.cpp",
+        source_sha256="a514f43d59b0394ced4dae6af31c7b80b50e2171da2792aa500e6ad5f15683ba",
+    ),
+)
 
 MX_SCALE_GROUP = 32
 MX_SCALE_PAIR_LANES = 2
@@ -189,6 +221,9 @@ def apply_matrix_wrapper(ops, selection, runtime, *, local_tokens=None):
             paired_shape,
             checkpoint_shape,
         ) = _paired_weight_scale_storage(op, meta)
+        # The 1-element INT64 group_list write is accounted on fill_op; do not fold
+        # its scalar 8 B read into matrix mte2_bytes, which matrix_mapping splits
+        # into tiled activation A bytes (L1->L0A MTE1).
         new_mte2 = float(op.mte2_bytes) + delta
         new_hbm = float(op.hbm_bytes) + delta
         if new_mte2 < 0.0 or new_hbm < 0.0:

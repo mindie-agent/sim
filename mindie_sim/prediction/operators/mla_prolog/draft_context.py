@@ -605,6 +605,7 @@ def prepare(ops, *, projection, model, draft, rows, query_rows,
             views=views,
             contexts=contexts,
             block=block,
+            layer_slot_valid_rows=layer_slot_valid_rows,
         )
     common = dict(stage=stage, layer=-1, requests=requests, phase="draft")
     norm = vector_op(

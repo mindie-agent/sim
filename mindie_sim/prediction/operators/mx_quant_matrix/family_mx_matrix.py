@@ -33,9 +33,15 @@ SOURCE_REFS: tuple[SourceRef, ...] = (
     ),
     SourceRef(
         repository="cann/ops-nn",
-        revision="238f76a0",
-        relative_path="samples/matmul/quant_matmul/quant_batch_matmul_mx.py",
-        source_sha256="37c9d7f034ae249d2d8fcfe5b310ec6197a6df711736e2ab04ae7e2cdb3ed74e",
+        revision="238f76a06d0cfc5ee90071e2c08310e2b517c3a6",
+        relative_path="matmul/quant_batch_matmul_v3/op_kernel/arch35/qbmm_mx_tensor_api_blaze.h",
+        source_sha256="310fff478163b1d24bf742de94ddaa56310dd8ad04670a2418ee3c1d07c233d5",
+    ),
+    SourceRef(
+        repository="cann/ops-nn",
+        revision="238f76a06d0cfc5ee90071e2c08310e2b517c3a6",
+        relative_path="matmul/quant_batch_matmul_v3/op_host/mx_scale_nz_shape.h",
+        source_sha256="5c76d054d77c49de33efb3a1dbe740f7ea01af4904e93388b963410f22c55f29",
     ),
 )
 

@@ -9,11 +9,24 @@
 [Side-Effect Policy] Returns prepared model metadata and appends local DAG ops.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.catalog.quant import projection_quant
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.projections import input_projections, _representation
 from mindie_sim.prediction.transforms import activation_quantization
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_REV = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/ops/kimi_kda.py",
+        source_sha256="af37687463f9b34ca4797bdcefb14c333d3b70b2956d6aa1f15217815d5fbc10",
+    ),
+)
 
 BETA_SIGMOID_OPS_PER_HEAD = 4
 

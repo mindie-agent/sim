@@ -14,10 +14,12 @@
 """
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Literal
 import math
 
 from mindie_sim.catalog.attention_common import AttentionResult
 from mindie_sim.schema.common import dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
 from mindie_sim.prediction.operators.linear_attention import gdn_composite
 from .gdn_decode import _resolve_local_gdn_heads
@@ -38,6 +40,42 @@ from mindie_sim.prediction.operators.recurrent.recover_ssm_work import (
     rewrite_gdn_analytical_scan,
 )
 from mindie_sim.prediction.tensors import TensorLowering
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_REV = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
+_OPS_TRANSFORMER_REV = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/ops/gdn.py",
+        source_sha256="b170b30626cf46bc4ec1e47080f9487c1e5443e51add42bb8c67bfd20a79fac4",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/ops/triton/fla/chunk.py",
+        source_sha256="d624a189029371ddbcbf7fa8a602734fc758f341f445ff9bb9677043f127b9f9",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/ops/triton/fla/chunk_delta_hupdate.py",
+        source_sha256="19a25d233a68f34cfe733e12c96ced18b7243ee913f66e4fe527553cec42b224",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/device/device_op.py",
+        source_sha256="d9b682e08f292ec71cdb7877f755b0adafb3eed50acd0db353df6729529dae24",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_TRANSFORMER_REV,
+        relative_path="mamba/causal_conv1d/op_kernel/arch35/causal_conv1d_fn.h",
+        source_sha256="a63d194254fab4c00db1f1265a52482517fd094a260f76e09165caf91b2119d3",
+    ),
+)
 
 DECODE_QK_L2NORM_OPS_PER_ELEMENT = 5
 DECODE_RECURRENCE_OPS_PER_STATE_ELEMENT = 7

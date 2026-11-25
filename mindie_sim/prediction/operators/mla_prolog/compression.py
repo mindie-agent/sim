@@ -14,11 +14,41 @@
 [Side-Effect Policy] Adds operators to the caller's builder only.
 """
 from collections.abc import Sequence
+from typing import Literal
 
 from mindie_sim.backends.abi_registry import default_abi_registry
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.structure_groups import declare_group, source_reference
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_REV = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/models/deepseek_v4/compressor.py",
+        source_sha256="757e21d9e95a1bdc19c42921939830d8ba8d210cea635b7e5a694ce351c7a5ca",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/models/deepseek_v41/compressor.py",
+        source_sha256="b5bda1c7a95952a6271effcd7b2af99110a6b75129d9c232df44f842ec1ab5e1",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/ops/triton/compressor/compressor_triton.py",
+        source_sha256="3a4dc00693c7350d0da1bf85125f62d5fd25ce440f403d72bce2e7a13d740474",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/attention/dsa_v41.py",
+        source_sha256="1da24c133d0fd473e367aea28419dabd7f42d5e90e4a9215c35e787c182cc195",
+    ),
+)
 
 COMPRESSION_RECIPE = "compressor_bf16_runtime"
 COMPRESSION_FP32_RECIPE = "compressor_fp32_runtime"
