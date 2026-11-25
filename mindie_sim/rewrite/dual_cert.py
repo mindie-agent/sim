@@ -1243,6 +1243,60 @@ def _summary_is_aliased(summary: FusedRegionSummary, aliases: Mapping[tuple[int,
     return any((rep, op_id) in aliases for rep in replicas for op_id in summary.op_ids)
 
 
+def _op_has_scenario_compute_or_comm(op, meta: Mapping[str, object]) -> bool:
+    """Return True iff scenario op already declares compute, communication, or semantic work."""
+    return bool(
+        meta.get("semantic_work")
+        or (getattr(op, "flops", 0) or 0) > 0
+        or any(fl > 0 for _, fl in (getattr(op, "matrix_flops", ()) or ()))
+        or int(getattr(op, "vector_ops", 0) or 0) > 0
+        or int(getattr(op, "link_bytes", 0) or 0) > 0
+    )
+
+
+def _op_has_scenario_hbm_proof(op, meta: Mapping[str, object]) -> bool:
+    """Return True iff scenario metadata grounds compulsory HBM obligations for ``op``."""
+    if any(
+        getattr(ob, "initial_residency", None) == "hbm_cold"
+        for ob in (meta.get("read_obligations") or ())
+    ):
+        return True
+    if any(
+        getattr(ob, "required_final_visibility", None) in {"device", "host"}
+        for ob in (meta.get("write_obligations") or ())
+    ):
+        return True
+    if _cold_weight_read(op, meta, 0) is not None:
+        return True
+    return (
+        not _op_has_scenario_compute_or_comm(op, meta)
+        and meta.get("initial_residency") != "l2_warm"
+        and int(getattr(op, "hbm_bytes", 0) or 0) > 0
+    )
+
+
+def _matched_summary_ops(
+    summary: FusedRegionSummary,
+    op_meta_by_site: Mapping[tuple[int, str], tuple[OpSpec, dict]],
+    op_meta_by_id: Mapping[str, list[tuple[OpSpec, dict]]],
+) -> list[tuple[OpSpec, dict]]:
+    """Resolve scenario atomic ``(op, meta)`` pairs referenced by ``summary.op_ids``."""
+    op_ids = tuple(getattr(summary, "op_ids", ()) or ())
+    if not op_ids:
+        return []
+    replicas = {item.replica for item in getattr(summary, "semantic_work", ())}
+    matched: list[tuple[OpSpec, dict]] = []
+    for op_id in op_ids:
+        if replicas:
+            for rep in replicas:
+                pair = op_meta_by_site.get((rep, op_id))
+                if pair is not None:
+                    matched.append(pair)
+        else:
+            matched.extend(op_meta_by_id.get(op_id, ()))
+    return matched
+
+
 def build_dual_inputs_from_scenario(
     scenario: ResolvedScenario,
     *,
@@ -1263,16 +1317,29 @@ def build_dual_inputs_from_scenario(
     summaries = tuple(summary for summary in region_summaries if not _summary_is_aliased(summary, aliases))
     contractions = getattr(scenario, "bilinear_contractions", ())
     placements = dict(getattr(scenario, "die_placements", ()))
+    op_meta_by_site = {(replica, op.op_id): (op, meta) for replica, op, meta in operations}
+    op_meta_by_id: dict[str, list[tuple[OpSpec, dict]]] = defaultdict(list)
+    for _replica, op, meta in operations:
+        op_meta_by_id[op.op_id].append((op, meta))
+    work_summaries: list[FusedRegionSummary] = []
+    grounded_mem: list[FusedRegionSummary] = []
+    for summary in summaries:
+        matched = _matched_summary_ops(summary, op_meta_by_site, op_meta_by_id)
+        if not matched or not any(_op_has_scenario_compute_or_comm(op, meta) for op, meta in matched):
+            work_summaries.append(summary)
+        if not matched or any(_op_has_scenario_hbm_proof(op, meta) for op, meta in matched):
+            grounded_mem.append(summary)
     covered = {
         (item.replica, item.pp_stage, op_id)
-        for summary in summaries
+        for summary in work_summaries
         for item in summary.semantic_work
         for op_id in summary.op_ids
     }
     defaults, derived_places = derive_default_obligations(
         scenario, demands, aliases, covered, _scenario_rank_ops,
     )
-    summaries += defaults
+    work_summaries.extend(defaults)
+    memory_summaries = (*grounded_mem, *defaults)
     for die, coord in derived_places.items():
         placements.setdefault(die, coord)
     seen: set[tuple[int, int, int, str]] = set()
@@ -1283,7 +1350,7 @@ def build_dual_inputs_from_scenario(
             seen.add(key)
             demands.add_site(_engine_modes(demands, item))
 
-    for summary in summaries:
+    for summary in work_summaries:
         for item in summary.semantic_work:
             add_work(item)
 
@@ -1297,8 +1364,10 @@ def build_dual_inputs_from_scenario(
     quanta: list[int] = []
     event_ids: dict[tuple[int, str], int] = {}
     for replica, op, meta in operations:
-        for item in meta.get("semantic_work", ()):
-            add_work(item)
+        op_stage = int(getattr(op, "stage", 0))
+        if (replica, op_stage, op.op_id) not in covered:
+            for item in meta.get("semantic_work", ()):
+                add_work(item)
         for link, byte_count in meta.get("mandatory_comm_wire_bytes_by_link", ()):
             link_spec = demands.links.get(link)
             if link_spec is not None and (link_spec.semantics == "per_pair" or link_spec.semantics in _PORT_LINK_SEMANTICS):
@@ -1362,6 +1431,6 @@ def build_dual_inputs_from_scenario(
             if source in event_ids and source != dst_key:
                 edges.append(DagEdge(event_ids[source], event_ids[dst_key], inward_floor_ns(Fraction(wire_ns))))
 
-    _memory_demands(demands, scenario, summaries, placements, contractions)
+    _memory_demands(demands, scenario, memory_summaries, placements, contractions)
     program, names = demands.program()
     return program, EventDagSpec(tuple(quanta) or (0,), tuple(edges)), names

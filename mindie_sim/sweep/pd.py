@@ -3198,6 +3198,7 @@ def _compute_step_work_floor_rays(
     stage_kv: dict[int, float] = {}
     stage_cube: dict[int, float] = {}
     stage_vec: dict[int, float] = {}
+    stage_vec_fixed: dict[int, float] = {}
     stage_link: dict[int, float] = {}
     dp_val: dict[str, float] = {}
     dp_ray: dict[str, tuple[float, float]] = {}
@@ -3206,20 +3207,38 @@ def _compute_step_work_floor_rays(
         str(getattr(eff_case.runtime, "prefix_cache_mode", "") or "").strip().lower() == "shared"
     )
     inv_b = 1.0 / float(b)
+    q_tokens = max(1, int(tokens))
+    graph_sp_padded_rows = max(
+        (int(dict(getattr(op, "metadata", ()) or ()).get("tokens_global") or 0)
+         for op in ops_0),
+        default=0,
+    )
     b_pad = int(b)
     if phase == "decode":
-        full_bs, pw_bs = _decode_batch_capture_boundaries(eff_case, max(1, int(tokens)))
+        full_bs, pw_bs = _decode_batch_capture_boundaries(eff_case, q_tokens)
         cap_bs = full_bs or pw_bs
         if cap_bs:
             b_pad = next((int(c) for c in cap_bs if int(c) >= b), int(b))
     pad_scale = (float(b) / float(b_pad)) if b_pad > b else 1.0
     for op in ops_0:
+        sem = getattr(op, "semantic_shape", ()) or ()
+        loc = getattr(op, "local_shape", ()) or ()
+        batch_invariant_vec = (
+            len(sem) <= 1 and len(loc) <= 1
+            and not getattr(op, "flops", 0)
+            and not getattr(op, "matrix_flops", ())
+            and not getattr(op, "link_bytes", 0)
+        )
         a_op, c_op, used_gg = _SLASizingRun._op_floor_contribution(
-            op, b=b, inv_b=inv_b, phase=phase, context=context,
+            op, b=b, inv_b=inv_b, q_tokens=q_tokens,
+            graph_sp_padded_rows=graph_sp_padded_rows,
+            phase=phase, context=context,
             runtime_shared_prefix=runtime_shared_prefix, caps=caps,
             attn_fams=_ATTN_FLOOR_FAMILIES, non_kernel_fams=_NON_KERNEL_FLOOR_FAMILIES,
             stage_wb=stage_wb, stage_gg=stage_gg, stage_kv=stage_kv,
-            stage_cube=stage_cube, stage_vec=stage_vec, stage_link=stage_link,
+            stage_cube=stage_cube,
+            stage_vec=stage_vec_fixed if batch_invariant_vec else stage_vec,
+            stage_link=stage_link,
         )
         if used_gg:
             dag_used_gg = True
@@ -3240,12 +3259,19 @@ def _compute_step_work_floor_rays(
             lin = (stage_kv.get(st, 0.0) / max_hbm_ms) * inv_b
             if fixed > 0.0 or lin > 0.0:
                 rays.append((fixed, lin))
-    for stage_map in (stage_cube, stage_vec, stage_link):
+    for stage_map in (stage_cube, stage_link):
         top = max(stage_map.values(), default=0.0)
         if top > 0.0:
             if b_pad > b:
                 rays.append((top, 0.0))
             rays.append((0.0, top * inv_b * pad_scale))
+    for st in set(stage_vec) | set(stage_vec_fixed):
+        v_fixed = stage_vec_fixed.get(st, 0.0)
+        v_lin = stage_vec.get(st, 0.0)
+        if v_fixed > 0.0 or v_lin > 0.0:
+            if b_pad > b and v_lin > 0.0:
+                rays.append((v_fixed + v_lin, 0.0))
+            rays.append((v_fixed, v_lin * inv_b * pad_scale))
     if dp_val:
         top_id = max(dp_val, key=dp_val.__getitem__)
         dag_a, dag_c = dp_ray[top_id]

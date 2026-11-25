@@ -345,6 +345,17 @@ class SparseIndexerContract:
             return self.query_tokens * self.scanned_rows
         q_base, extra = divmod(self.query_tokens, self.batch_size)
         total = 0
+        if self.abi == REGION_ABI:
+            kv_tokens = self.scanned_rows * max(1, self.compress_ratio) + self.residual_tokens
+            if extra:
+                total += extra * _region_request_pairs(
+                    q_base + 1, kv_tokens, self.scanned_rows, self.compress_ratio,
+                )
+            if q_base:
+                total += (self.batch_size - extra) * _region_request_pairs(
+                    q_base, kv_tokens, self.scanned_rows, self.compress_ratio,
+                )
+            return total
         if extra:
             total += extra * _causal_request_pairs(
                 q_base + 1, self.scanned_rows, self.compress_ratio, self.residual_tokens,
@@ -623,7 +634,7 @@ def request_contracts(contract: SparseIndexerContract, ctx: OperatorPlanningCont
 def _spans_match_uniform_contract(contract: SparseIndexerContract) -> bool:
     """Return True when ``request_spans`` carries no shape detail beyond the uniform contract."""
     spans = contract.request_spans
-    if not spans or len(spans) != contract.batch_size:
+    if not spans or contract.abi == REGION_ABI or len(spans) != contract.batch_size:
         return False
     q_base, q_rem = divmod(contract.query_tokens, contract.batch_size)
     for i, (q_i, kv_i) in enumerate(spans):
@@ -668,13 +679,25 @@ def _minimum_indexer_io(contract: SparseIndexerContract) -> tuple[float, float, 
     else:
         if pairs and contract.causal:
             q_base, extra = divmod(contract.query_tokens, contract.batch_size)
-            active_q = (
-                extra * _causal_active_queries(q_base + 1, contract.scanned_rows, contract.compress_ratio, contract.residual_tokens)
-                + (contract.batch_size - extra) * _causal_active_queries(q_base, contract.scanned_rows, contract.compress_ratio, contract.residual_tokens)
-            )
+            if contract.abi == REGION_ABI:
+                kv_tokens = contract.scanned_rows * max(1, contract.compress_ratio) + contract.residual_tokens
+                active_q = (
+                    extra * _region_active_queries(q_base + 1, kv_tokens, contract.scanned_rows, contract.compress_ratio)
+                    + (contract.batch_size - extra) * _region_active_queries(q_base, kv_tokens, contract.scanned_rows, contract.compress_ratio)
+                )
+                k_rows = (
+                    min(contract.scanned_rows, (kv_tokens - 1) // max(1, contract.compress_ratio))
+                    if kv_tokens > 0 else 0
+                )
+            else:
+                active_q = (
+                    extra * _causal_active_queries(q_base + 1, contract.scanned_rows, contract.compress_ratio, contract.residual_tokens)
+                    + (contract.batch_size - extra) * _causal_active_queries(q_base, contract.scanned_rows, contract.compress_ratio, contract.residual_tokens)
+                )
+                k_rows = contract.scanned_rows
         else:
             active_q = contract.query_tokens if pairs else 0
-        k_rows = contract.scanned_rows if pairs else 0
+            k_rows = contract.scanned_rows if pairs else 0
         block_max_raw = max(0, pairs - contract.query_tokens * contract.score_items) if (contract.block_size > 1 and pairs) else 0
     q_elem = float(cache_row_bytes(contract.cache_dtype, contract.index_dim))
     q_bytes = float(active_q * contract.index_heads) * q_elem

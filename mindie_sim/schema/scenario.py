@@ -851,10 +851,6 @@ def _validate_domain_and_modes(contract: ScenarioContract) -> None:
     if policy is not None:
         if not isinstance(policy, SpeculativeWorkloadPolicy):
             raise ModelingError("scenario_speculative_policy_invalid")
-        if policy.num_speculative_tokens and policy.spec_method not in {"ngram", "ngram_gpu"} and not attached_drafts:
-            raise ModelingError(
-                f"speculative_contract_missing_real_draft_spec:method={policy.spec_method}:mode={contract.optimization_mode}"
-            )
         if policy.allow_synthetic_gqa:
             if contract.optimization_mode != "modeling":
                 raise ModelingError(
@@ -866,6 +862,20 @@ def _validate_domain_and_modes(contract: ScenarioContract) -> None:
                     f"synthetic_gqa_requires_explicit_provenance:"
                     f"{policy.synthetic_draft_provenance!r}"
                 )
+        can_synthesize_gqa = (
+            policy.allow_synthetic_gqa
+            and contract.model.attention == "gqa"
+            and policy.spec_method in {None, "eagle3"}
+        )
+        if (
+            policy.num_speculative_tokens
+            and policy.spec_method not in {"ngram", "ngram_gpu"}
+            and not attached_drafts
+            and not can_synthesize_gqa
+        ):
+            raise ModelingError(
+                f"speculative_contract_missing_real_draft_spec:method={policy.spec_method}:mode={contract.optimization_mode}"
+            )
 
 
 def validate_scenario_contract(contract: ScenarioContract) -> None:
