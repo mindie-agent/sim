@@ -118,12 +118,17 @@ _PROLOG_JOINT_DTYPE_TUPLES: dict[str, tuple[str, ...]] = {
     "int8": _PROLOG_INT8_PORTS,
     "w8a8": _PROLOG_INT8_PORTS,
     "w8a8_int8": _PROLOG_INT8_PORTS,
+    "w8a8_dynamic": _PROLOG_INT8_PORTS,
     "mxfp8": _PROLOG_MXFP8_PORTS,
     "fp8": _PROLOG_MXFP8_PORTS,
     "fp8_e4m3": _PROLOG_MXFP8_PORTS,
     "fp8_e4m3fn": _PROLOG_MXFP8_PORTS,
 }
 _PROLOG_ALLOWED_ACT_DTYPES = frozenset({"bf16", "bfloat16"})
+_SFA_PROLOG_V3_QUANT_MODES = frozenset({
+    "int8", "w8a8_int8", "w8a8_dynamic", "mxfp8", "fp8", "fp8_e4m3", "fp8_e4m3fn",
+})
+_SFA_STATIC_MLAPO_QUANT_MODES = frozenset({"w8a8"})
 _PROLOG_ARCH_DEFAULT_SKU: dict[str, str] = {
     "A2": "ascend910b2",
     "A3": "ascend910_9362",
@@ -252,7 +257,9 @@ def _prolog_v3_abi_available(
         "query_out": (t, n_heads, kv_r),
         "query_rope_out": (t, n_heads, rope_d),
         "query_norm_out": (t, q_r),
-        "dequant_scale_q_norm_out": (t, 1),
+        "dequant_scale_q_norm_out": (
+            (t, max(1, q_r // MX_GROUP_SIZE)) if out_bucket == "mxfp8" else (t, 1)
+        ),
     }
     outputs = tuple(
         OperandPortSig(
@@ -306,6 +313,52 @@ def _prolog_v3_abi_available(
     return verdict.status == "admitted_shipping"
 
 
+def _prolog_v3_ready(
+    *,
+    arch_norm: str,
+    wq_norm: str,
+    num_tokens: int,
+    input_size: int | None,
+    q_lora_rank: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    num_q_heads: int,
+    qk_nope_head_dim: int,
+    is_sparse_sfa: bool,
+    is_int8_kv: bool,
+    dcp_size: int,
+    pcp_size: int,
+    registry: ProbedAbiRegistry | None,
+) -> bool:
+    if (int(q_lora_rank) not in ACLNN_SUPPORTED_Q_LORA_RANKS
+            or int(kv_lora_rank) != DEFAULT_KV_LORA_RANK
+            or int(qk_rope_head_dim) != DEFAULT_QK_ROPE_DIM
+            or (int(qk_nope_head_dim) > 0 and int(qk_nope_head_dim) not in ACLNN_SUPPORTED_NOPE_DIMS)
+            or arch_norm not in _PROLOG_ARCH_DEFAULT_SKU):
+        return False
+    joint_tuple = _PROLOG_JOINT_DTYPE_TUPLES.get(wq_norm)
+    if joint_tuple is None:
+        return False
+    reg = registry if registry is not None else default_abi_registry()
+    return _prolog_v3_abi_available(
+        reg,
+        arch_norm,
+        wq_norm,
+        joint_tuple,
+        num_tokens=int(num_tokens),
+        input_size=input_size,
+        q_lora_rank=int(q_lora_rank),
+        kv_lora_rank=int(kv_lora_rank),
+        qk_rope_head_dim=int(qk_rope_head_dim),
+        num_q_heads=int(num_q_heads),
+        qk_nope_head_dim=int(qk_nope_head_dim),
+        is_sparse_sfa=bool(is_sparse_sfa),
+        is_int8_kv=bool(is_int8_kv),
+        dcp_size=int(dcp_size),
+        pcp_size=int(pcp_size),
+    )
+
+
 def resolve_mla_preprocess_mode(
     *,
     arch: str,
@@ -316,6 +369,7 @@ def resolve_mla_preprocess_mode(
     qk_rope_head_dim: int,
     has_rope: bool = True,
     is_sparse_sfa: bool = False,
+    is_kv_consumer: bool = False,
     dcp_size: int = 1,
     pcp_size: int = 1,
     enable_mlapo: bool = False,
@@ -335,15 +389,17 @@ def resolve_mla_preprocess_mode(
     qk_nope_head_dim: int = 0,
     registry: ProbedAbiRegistry | None = None,
 ) -> MlaPreprocessMode:
-    """Exact 5-branch MLA preprocess selector (D1 §2.2 / M1; mla_v1.py:1919-1958).
+    """Exact 5-branch MLA preprocess selector (D1 §2.2 / M1; mla_v1.py & sfa_v1.py).
 
     Grounds ``MlaPrologV3`` admissibility in ``ProbedAbiRegistry.verify()`` and
-    upstream BF16/input-width/strided-draft contracts: FP16 stays ``native_decomposed``;
-    A5 draft models with ``dcp=1, pcp=1, num_kv_heads=1`` and unsupported PrologV3
-    A-projection input width (e.g. Eagle3 14,336; ``mla_v1.py:1948-1958``) select
-    ``strided_kv_adapter``; other drafts stay ``native_decomposed``.
+    upstream BF16/input-width/quant/strided-cache contracts: FP16 stays
+    ``native_decomposed``; sparse SFA routes dynamic quantized layers (and
+    unquantized KV consumers) to ``prolog_v3`` across PCP/DCP and static W8A8
+    layers to ``mlapo`` up to ``MLAPO_MAX_SUPPORTED_TOKENS`` on any phase; dense
+    MLA checks strided ``prolog_v3`` (non-PCP, DCP allowed, supported-width drafts
+    included) before A5 draft ``strided_kv_adapter`` and non-strided decode
+    ``mlapo`` (``enable_mlapo`` or FA-quant INT8 KV with scale).
     """
-    del is_strided_kv_cache
     arch_norm = str(arch or "").strip().upper()
     act_norm = str(act_dtype).strip().lower() if act_dtype is not None else ""
     if not act_norm:
@@ -356,55 +412,62 @@ def resolve_mla_preprocess_mode(
             or int(q_lora_rank) <= 0 or int(kv_lora_rank) <= 0
             or act_norm not in _PROLOG_ALLOWED_ACT_DTYPES):
         return "native_decomposed"
-    if is_sparse_sfa and is_int8_kv and not has_kv_scale:
-        return "native_decomposed"
     unsupported_input_width = (
         input_size is not None and int(input_size) not in PROLOG_V3_SUPPORTED_INPUT_SIZES
     )
-    # Upstream mla_v1.py:1948-1958: _uses_strided_kv_adapter strictly requires A5 + draft
-    # + dcp=1 + pcp=1 + num_kv_heads=1 + input_size not in PROLOG_V3_SUPPORTED_INPUT_SIZES.
-    if (is_draft_model and arch_norm == "A5"
-            and int(dcp_size) == 1 and int(pcp_size) == 1
-            and int(num_kv_heads) == 1
-            and unsupported_input_width):
-        return "strided_kv_adapter"
-    if is_draft_model:
+    prolog_mode: MlaPreprocessMode = (
+        "prolog_v3_learned_rope_tail" if has_learned_rope_tail else "prolog_v3"
+    )
+    if is_sparse_sfa:
+        if is_int8_kv and not has_kv_scale:
+            return "native_decomposed"
+        # Upstream sfa_v1.py:1063-1074, 1109-1117, 2073-2127: dynamic quantized SFA
+        # and unquantized non-C8 KV consumers use prolog_v3 across PCP/DCP; static
+        # W8A8 uses mlapo up to MLAPO_MAX_SUPPORTED_TOKENS on any phase.
+        prolog_eligible = (
+            wq_norm in _SFA_PROLOG_V3_QUANT_MODES
+            or (wq_norm in _PROLOG_ALLOWED_ACT_DTYPES and is_kv_consumer and not is_int8_kv)
+        )
+        if (prolog_eligible and enable_mla_prolog and not unsupported_input_width
+                and _prolog_v3_ready(
+                    arch_norm=arch_norm, wq_norm=wq_norm, num_tokens=int(num_tokens),
+                    input_size=input_size, q_lora_rank=int(q_lora_rank),
+                    kv_lora_rank=int(kv_lora_rank), qk_rope_head_dim=int(qk_rope_head_dim),
+                    num_q_heads=int(num_q_heads), qk_nope_head_dim=int(qk_nope_head_dim),
+                    is_sparse_sfa=True, is_int8_kv=bool(is_int8_kv),
+                    dcp_size=int(dcp_size), pcp_size=int(pcp_size), registry=registry,
+                )):
+            return prolog_mode
+        if (wq_norm in _SFA_STATIC_MLAPO_QUANT_MODES and enable_mlapo
+                and not is_int8_kv and not is_draft_model
+                and 0 < int(num_tokens) <= MLAPO_MAX_SUPPORTED_TOKENS):
+            return "mlapo"
         return "native_decomposed"
-    if (enable_mlapo
+
+    # Dense MLA dispatch order (mla_v1.py:1921-1958, 3439-3495):
+    # strided prolog_v3 (non-PCP, DCP allowed, drafts with supported width included)
+    # -> A5 draft strided_kv_adapter -> non-strided decode mlapo (enable_mlapo or FA-quant).
+    fa_quant_layer = bool(is_int8_kv and has_kv_scale)
+    if (is_strided_kv_cache and enable_mla_prolog and not fa_quant_layer
+            and not unsupported_input_width and int(pcp_size) <= 1
+            and _prolog_v3_ready(
+                arch_norm=arch_norm, wq_norm=wq_norm, num_tokens=int(num_tokens),
+                input_size=input_size, q_lora_rank=int(q_lora_rank),
+                kv_lora_rank=int(kv_lora_rank), qk_rope_head_dim=int(qk_rope_head_dim),
+                num_q_heads=int(num_q_heads), qk_nope_head_dim=int(qk_nope_head_dim),
+                is_sparse_sfa=False, is_int8_kv=bool(is_int8_kv),
+                dcp_size=int(dcp_size), pcp_size=int(pcp_size), registry=registry,
+            )):
+        return prolog_mode
+    if (is_draft_model and is_strided_kv_cache and arch_norm == "A5"
+            and not fa_quant_layer and int(dcp_size) == 1 and int(pcp_size) == 1
+            and int(num_kv_heads) == 1 and unsupported_input_width):
+        return "strided_kv_adapter"
+    if ((fa_quant_layer or (enable_mlapo and not is_draft_model))
+            and not is_strided_kv_cache and int(pcp_size) <= 1
             and str(phase).strip().lower() in _DECODE_MLAPO_PHASES
             and 0 < int(num_tokens) <= MLAPO_MAX_SUPPORTED_TOKENS):
         return "mlapo"
-    if not enable_mla_prolog or unsupported_input_width:
-        return "native_decomposed"
-    if int(dcp_size) > 1 or int(pcp_size) > 1:
-        return "native_decomposed"
-    if (int(q_lora_rank) not in ACLNN_SUPPORTED_Q_LORA_RANKS
-            or int(kv_lora_rank) != DEFAULT_KV_LORA_RANK
-            or int(qk_rope_head_dim) != DEFAULT_QK_ROPE_DIM
-            or (int(qk_nope_head_dim) > 0 and int(qk_nope_head_dim) not in ACLNN_SUPPORTED_NOPE_DIMS)):
-        return "native_decomposed"
-    joint_tuple = _PROLOG_JOINT_DTYPE_TUPLES.get(wq_norm)
-    if joint_tuple is None or arch_norm not in {"A2", "A3", "A5"}:
-        return "native_decomposed"
-    reg = registry if registry is not None else default_abi_registry()
-    if _prolog_v3_abi_available(
-        reg,
-        arch_norm,
-        wq_norm,
-        joint_tuple,
-        num_tokens=int(num_tokens),
-        input_size=input_size,
-        q_lora_rank=int(q_lora_rank),
-        kv_lora_rank=int(kv_lora_rank),
-        qk_rope_head_dim=int(qk_rope_head_dim),
-        num_q_heads=int(num_q_heads),
-        qk_nope_head_dim=int(qk_nope_head_dim),
-        is_sparse_sfa=bool(is_sparse_sfa),
-        is_int8_kv=bool(is_int8_kv),
-        dcp_size=int(dcp_size),
-        pcp_size=int(pcp_size),
-    ):
-        return "prolog_v3_learned_rope_tail" if has_learned_rope_tail else "prolog_v3"
     return "native_decomposed"
 
 

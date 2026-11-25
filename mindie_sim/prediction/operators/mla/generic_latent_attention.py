@@ -111,9 +111,10 @@ def _schedule(op):
     sequences = tuple((int(q), int(keys)) for q, keys in sequences)
     if not sequences or any(q < 0 or keys < 0 for q, keys in sequences):
         raise ModelingError("generic_latent_schedule_sequence_invalid")
-    if any(keys == 0 or q == 0 for q, keys in sequences):
+    active = tuple((q, keys) for q, keys in sequences if q > 0)
+    if not active:
         return None
-    return heads, qk_dim, latent_dim, dv, kv_row, sequences
+    return heads, qk_dim, latent_dim, dv, kv_row, active
 
 
 def _alloc(context, core, cores, tag, heads, q, q_bytes, kv_tile, latent_dim, dv, qk_dim):
@@ -143,6 +144,11 @@ def _item_stages(context, core, cores, tag, heads, qk_dim, latent_dim, dv,
                  q, keys, kv_row, q_bytes, out_bytes, *, after=()):
     read = read_role(context.resource_names)
     place = context.owned(core, cores, (read, "vector", "mte3", "cube"))
+    if keys == 0:
+        fin = f"zero_out{tag}"
+        return [Stage(fin, context.bind(Work(
+            resources={"hbm": out_bytes, "mte3": out_bytes})),
+            after=after, placement=place)], fin
     kv_tile = min(KEY_TILE, keys) * kv_row
     alloc = _alloc(context, core, cores, tag, heads, q, q_bytes, kv_tile, latent_dim, dv, qk_dim)
     m_rows = q * heads
@@ -247,6 +253,12 @@ def build(op, geometry):
                            + _PV_VECTOR_OPS_PER_HEAD_PAIR)
     owner_items = []
     for q, keys in sequences:
+        if keys == 0:
+            out_bytes = q * heads * latent_dim * 2
+            owner_items.append((q, 0, heads))
+            total_out += out_bytes
+            total += Work(resources={"hbm": out_bytes, "mte3": out_bytes})
+            continue
         head_step = _max_heads_per_owner(heads, q, keys, qk_dim, latent_dim, dv, kv_row, geometry)
         for h_start in range(0, heads, head_step):
             h_cur = min(head_step, heads - h_start)

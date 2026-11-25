@@ -114,11 +114,14 @@ def _padding_plan(*, plan, parallel=None, tokens, input_dtype="bf16",
         raise ModelingError("mla_head_padding_requires_logical_le_physical_heads")
     byte = dtype_bytes(input_dtype)
     latent, rope = plan.kv_lora_rank, plan.qk_rope_head_dim
-    copy_volume = tokens * logical * latent * byte if tokens > 1 else 0
-    nope_read = tokens * logical * latent * byte
-    nope_write = tokens * physical * latent * byte
-    rope_read = tokens * logical * rope * byte
-    rope_write = tokens * physical * rope * byte
+    if logical == physical:
+        copy_volume = nope_read = nope_write = rope_read = rope_write = 0
+    else:
+        copy_volume = tokens * logical * latent * byte if tokens > 1 else 0
+        nope_read = tokens * logical * latent * byte
+        nope_write = tokens * physical * latent * byte
+        rope_read = tokens * logical * rope * byte
+        rope_write = tokens * physical * rope * byte
     return {
         "logical_heads": logical,
         "physical_heads": physical,
