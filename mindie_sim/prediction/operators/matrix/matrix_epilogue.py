@@ -30,9 +30,20 @@ SOURCES: tuple[SourceRef, ...] = (
 TOLERANCE = 1e-12
 SUPPORTED_EPILOGUES = ("row_column_scale",)
 TYPED_SCALE_SLOTS = ("activation", "weight", "weight_scale", "activation_scale")
+_ABSENT_ATTR_VALUES = frozenset((None, False, 0, "", "none", "not_present", "absent"))
+_ABSENT_SLOT_DTYPES = frozenset(("", "none", "undefined", "null", "absent", "not_present"))
+_WEIGHT_SCALE_SLOT_INDEX = 2
+_OFFSET_PROTO_SLOT_INDEX = 3
+_PERTOKEN_SCALE_NO_BIAS_INDEX = 3
+_PERTOKEN_SCALE_WITH_BIAS_INDEX = 4
+_PERTOKEN_SCALE_FULL_PROTO_INDEX = 5
+_COMPACT_WITH_BIAS_SLOT_COUNT = 5
+_FULL_PROTO_SLOT_COUNT = 6
 
 
 def _normalize_typed_dtype(value) -> str:
+    if value is None:
+        return "none"
     key = str(value).strip().lower().replace("-", "_")
     if key.startswith("dt_"):
         key = key[3:]
@@ -42,15 +53,93 @@ def _normalize_typed_dtype(value) -> str:
     }.get(key, key)
 
 
+def _resolve_typed_scale_slots(attrs, shapes, dtypes):
+    """Resolve ``(weight_scale_dtype, activation_scale_dtype, slots)`` by schema."""
+    all_slots = tuple(_normalize_typed_dtype(value) for value in dtypes)
+    input_names = attrs.get("input_names")
+    if (isinstance(input_names, (list, tuple))
+            and not isinstance(input_names, (str, bytes))
+            and len(input_names) == len(all_slots)):
+        named = {str(name).strip().lower(): slot
+                 for name, slot in zip(input_names, all_slots)}
+        offset_slot = named.get("offset")
+        if offset_slot is not None and offset_slot not in _ABSENT_SLOT_DTYPES:
+            raise ModelingError("matrix_epilogue_typed_scale_offset_not_supported")
+        weight_fmt = named.get("scale") or named.get("weight_scale")
+        act_fmt = named.get("pertoken_scale") or named.get("activation_scale")
+        if (weight_fmt is None or weight_fmt in _ABSENT_SLOT_DTYPES
+                or act_fmt is None or act_fmt in _ABSENT_SLOT_DTYPES):
+            return None
+        return weight_fmt, act_fmt, all_slots
+    offset = attrs.get("offset")
+    has_offset = (
+        offset not in _ABSENT_ATTR_VALUES
+        or (isinstance(shapes, dict) and shapes.get("offset") is not None)
+    )
+    if has_offset:
+        raise ModelingError("matrix_epilogue_typed_scale_offset_not_supported")
+    bias = attrs.get("bias")
+    has_bias = (
+        bias not in _ABSENT_ATTR_VALUES
+        or bool(attrs.get("has_bias"))
+        or (isinstance(shapes, dict) and shapes.get("bias") is not None)
+    )
+    explicit_no_bias = "bias" in attrs and bias in _ABSENT_ATTR_VALUES
+    explicit_no_offset = "offset" in attrs and offset in _ABSENT_ATTR_VALUES
+    slot_count = len(all_slots)
+    if slot_count >= _FULL_PROTO_SLOT_COUNT:
+        if all_slots[_OFFSET_PROTO_SLOT_INDEX] not in _ABSENT_SLOT_DTYPES:
+            raise ModelingError("matrix_epilogue_typed_scale_offset_not_supported")
+        act_index = _PERTOKEN_SCALE_FULL_PROTO_INDEX
+    elif slot_count == _COMPACT_WITH_BIAS_SLOT_COUNT:
+        # CANN QuantBatchMatmulV3 proto places pertoken_scale last; a 5-slot
+        # compact call carries (x1, x2, scale, bias, pertoken_scale) unless
+        # bias is explicitly absent (making slot 3 an unsupported offset).
+        if (explicit_no_bias and not explicit_no_offset
+                and all_slots[_OFFSET_PROTO_SLOT_INDEX] not in _ABSENT_SLOT_DTYPES):
+            raise ModelingError("matrix_epilogue_typed_scale_offset_not_supported")
+        act_index = _PERTOKEN_SCALE_WITH_BIAS_INDEX
+    else:
+        act_index = (
+            _PERTOKEN_SCALE_WITH_BIAS_INDEX if has_bias
+            else _PERTOKEN_SCALE_NO_BIAS_INDEX
+        )
+    if slot_count <= act_index:
+        return None
+    weight_fmt = all_slots[_WEIGHT_SCALE_SLOT_INDEX]
+    act_fmt = all_slots[act_index]
+    if weight_fmt in _ABSENT_SLOT_DTYPES or act_fmt in _ABSENT_SLOT_DTYPES:
+        return None
+    return weight_fmt, act_fmt, all_slots[:act_index + 1]
+
+
+def _typed_scale_shape(shapes, keys, default_shape):
+    """Extract an explicit non-negative scale tensor shape from ``typed.shapes``."""
+    if not isinstance(shapes, dict):
+        return default_shape
+    for key in keys:
+        raw = shapes.get(key)
+        if raw is None:
+            continue
+        if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+            raise ModelingError("matrix_epilogue_typed_scale_geometry_invalid")
+        dims = []
+        for dim in raw:
+            if isinstance(dim, bool) or not isinstance(dim, int) or dim < 0:
+                raise ModelingError("matrix_epilogue_typed_scale_geometry_invalid")
+            dims.append(dim)
+        return tuple(dims)
+    return default_shape
+
+
 def _typed_scale_storage(op):
     """Return typed row/column scale storage from a native ABI declaration.
 
-    T12 normalizes the real call into ``metadata.native_call.typed.attrs``.
-    For the W8A8 QuantBatchMatmul family the first four input slots are
-    activation, weight, weight_scale and activation_scale.  The slot dtypes
-    are the captured ABI representation, not a catalog default.  Responses
-    with fewer than four typed inputs cannot establish the scale slots and are
-    left to the ordinary declarative path.
+    T12 normalizes the real call into ``metadata.native_call.typed``.
+    For the W8A8 QuantBatchMatmul family the canonical CANN proto order is
+    ``x1, x2, scale, [offset], [bias], [pertoken_scale]``; named slot shapes
+    (e.g. scalar ``scale=[1]`` or optional ``bias``) override fixed defaults.
+    Calls without both scale slots are left to the ordinary declarative path.
     """
     if str(getattr(op, "dtype", "")).strip().lower() not in {"int8", "w8a8"}:
         return None
@@ -67,38 +156,54 @@ def _typed_scale_storage(op):
     dtypes = attrs.get("input_dtypes")
     if isinstance(dtypes, (str, bytes)) or not isinstance(dtypes, (list, tuple)):
         return None
-    if len(dtypes) < len(TYPED_SCALE_SLOTS):
+    shapes = typed.get("shapes")
+    resolved = _resolve_typed_scale_slots(attrs, shapes, dtypes)
+    if resolved is None:
         return None
-    offset = attrs.get("offset")
-    if offset not in (None, False, 0, "", "none", "not_present", "absent"):
-        raise ModelingError("matrix_epilogue_typed_scale_offset_not_supported")
-    slots = tuple(_normalize_typed_dtype(value) for value in dtypes[:4])
+    weight_fmt, act_fmt, slots = resolved
     try:
-        weight_bytes = dtype_bytes(slots[2])
-        activation_bytes = dtype_bytes(slots[3])
+        weight_bytes = dtype_bytes(weight_fmt)
+        activation_bytes = dtype_bytes(act_fmt)
     except ModelingError as exc:
         raise ModelingError(
             "matrix_epilogue_typed_scale_dtype_unsupported:"
-            + ",".join(slots[2:4])) from exc
+            f"{weight_fmt},{act_fmt}") from exc
     m, n, _k = (int(value) for value in op.local_shape[-3:])
     groups = int(metadata.get("matrix_groups", 1) or 1)
     if m < 0 or n < 0 or groups < 1:
         raise ModelingError("matrix_epilogue_typed_scale_geometry_invalid")
+    row_shape = _typed_scale_shape(
+        shapes, ("pertoken_scale", "activation_scale"), (m,))
+    col_shape = _typed_scale_shape(
+        shapes, ("scale", "weight_scale"), (groups * n,))
+    row_elements = math.prod(row_shape)
+    col_elements = math.prod(col_shape)
     return {
-        "row_scale_bytes": float(m * activation_bytes),
-        # One independent per-channel scale per declared output group.
-        "column_scale_bytes": float(groups * n * weight_bytes),
-        "row_shape": (m,), "column_shape": (groups * n,),
-        "weight_scale_format": slots[2],
-        "activation_scale_format": slots[3],
+        "row_scale_bytes": float(row_elements * activation_bytes),
+        "column_scale_bytes": float(col_elements * weight_bytes),
+        "row_shape": row_shape, "column_shape": col_shape,
+        "weight_scale_format": weight_fmt,
+        "activation_scale_format": act_fmt,
         "input_dtypes": list(slots),
         "offset": "not_present_in_four_input_abi",
     }
 
 
+def _is_scalar_scale_shape(shape, extent: int) -> bool:
+    """True when a declared scale tensor is a broadcast scalar over ``extent > 1``."""
+    if extent <= 1 or shape is None or isinstance(shape, (str, bytes)):
+        return False
+    try:
+        dims = tuple(int(dim) for dim in shape)
+    except (TypeError, ValueError):
+        return False
+    return math.prod(dims) == 1
+
+
 def _declared_epilogue(op):
     """Parse the explicit metadata record only, without typed cross-checks."""
-    raw = dict(op.metadata).get("matrix_epilogue")
+    metadata = dict(op.metadata)
+    raw = metadata.get("matrix_epilogue")
     if raw is None:
         return None
     if raw.get("kind") not in SUPPORTED_EPILOGUES:
@@ -106,23 +211,32 @@ def _declared_epilogue(op):
     if set(raw) != {"kind", "row_scale_bytes", "column_scale_bytes",
                     "operations_per_output"}:
         raise ModelingError("matrix_epilogue_requires_explicit_scale_and_operation_work")
-    result = MatrixEpilogue(*(float(raw[key]) for key in
-                              ("row_scale_bytes", "column_scale_bytes",
-                               "operations_per_output")))
+    m, n, _ = op.local_shape[-3:]
+    groups = max(1, int(metadata.get("matrix_groups", 1) or 1))
+    row_bytes = float(raw["row_scale_bytes"])
+    col_bytes = float(raw["column_scale_bytes"])
+    ops_per_out = float(raw["operations_per_output"])
+    row_broadcast = row_bytes > 0.0 and _is_scalar_scale_shape(
+        metadata.get("activation_scale_shape"), int(m))
+    col_broadcast = col_bytes > 0.0 and _is_scalar_scale_shape(
+        metadata.get("weight_scale_shape"), int(groups * n))
+    result = MatrixEpilogue(
+        row_bytes, col_bytes, ops_per_out,
+        row_scale_broadcast=row_broadcast,
+        column_scale_broadcast=col_broadcast,
+    )
     if any(not math.isfinite(value) or value < 0.0 for value in
            (result.row_scale_bytes, result.column_scale_bytes,
             result.operations_per_output)):
         raise ModelingError("matrix_epilogue_work_must_be_finite_nonnegative")
     if not result.operations_per_output:
         raise ModelingError("row_column_scale_requires_positive_output_work")
-    m, n, _ = op.local_shape[-3:]
     if not math.isclose(op.vector_ops, result.operations_per_output * m * n,
                         rel_tol=TOLERANCE, abs_tol=TOLERANCE):
         # Full graph capture may pad local rows to a bucket while the declared
         # epilogue work still describes the active call.  Accept exactly the
         # declared active/physical row counts rather than crashing; unknown
         # rows remain an explicit error.
-        metadata = dict(op.metadata)
         declared = {
             int(metadata.get("graph_active_query_rows", 0) or 0),
             int(metadata.get("graph_physical_query_rows", 0) or 0),
@@ -360,6 +474,8 @@ class MatrixEpilogue:
     row_scale_bytes: float = 0
     column_scale_bytes: float = 0
     operations_per_output: float = 0
+    row_scale_broadcast: bool = False
+    column_scale_broadcast: bool = False
 
     @classmethod
     def from_op(cls, op, *, producer=None):
@@ -388,8 +504,16 @@ class MatrixEpilogue:
                 max(0, weight - self.column_scale_bytes))
 
     def scales(self, a, b, m, n, groups, *, reuse_inputs, reuse_weights):
-        row = self.row_scale_bytes * a / m
-        column = self.column_scale_bytes * b / (n * groups)
+        row = (
+            (self.row_scale_bytes if a > 0 else 0.0)
+            if self.row_scale_broadcast
+            else self.row_scale_bytes * a / m
+        )
+        column = (
+            (self.column_scale_bytes if b > 0 else 0.0)
+            if self.column_scale_broadcast
+            else self.column_scale_bytes * b / (n * groups)
+        )
         fraction = a * b / (m * n)
         hbm = ((self.row_scale_bytes * fraction if reuse_inputs else row)
                + (self.column_scale_bytes * fraction if reuse_weights else column))

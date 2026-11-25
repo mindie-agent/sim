@@ -134,19 +134,16 @@ def critical_output_owner_rate_fraction(
     act = Fraction(act_bytes)
     weight = Fraction(weight_bytes)
     kk = Fraction(int(k))
-    m_tiles = max(1, (int(m) + max(1, int(tile_m)) - 1) // max(1, int(tile_m)))
     copies = [
-        act * Fraction(extent_m) * kk
-        + (weight * Fraction(extent_n) * kk / Fraction(m_tiles))
+        act * Fraction(extent_m) * kk + weight * Fraction(extent_n) * kk
         for _count, extent_m, extent_n, _area in owners
     ]
     peak = max(copies)
     if peak <= 0:
         return Fraction(1)
-    # The W panel is reused across the M tiles; the stage ledger charges W
-    # once while each owner's local panel is replicated per M tile.  Use the
-    # same schedule in the denominator.  For one M tile this is exactly the
-    # old owner-copy law (sparse/tail/single-owner); only real tails lower it.
+    # Each output owner copies its own private A and B panels on its pinned
+    # MTE2 pipe; idle units stay idle, so the makespan scales with the peak
+    # private owner copy ``act * extent_m * k + weight * extent_n * k``.
     basis = Fraction(charged_bytes) if charged_bytes is not None else sum(copies, Fraction(0))
     if basis <= 0:
         return Fraction(1)
@@ -744,18 +741,26 @@ def streamk_fixup_latency_ms(
     context, *, k_splits: int, used_cores: int,
 ) -> float:
     """Upstream DAV_3510 Stream-K AIV fixup loop setup + cross-core sync."""
-    if getattr(context, "primitive_table", None) is None or k_splits <= 1:
+    if k_splits <= 1:
         return 0.0
-    clock_hz = primitive_core_clock_hz(context)
-    cores = max(1, int(getattr(context, "core_count", 1) or 1))
-    used = max(1, min(cores, int(used_cores)))
+    is_arch35 = is_arch35_context(context)
     neg_ms = 0.0
-    if clock_hz is not None and clock_hz > 0.0:
-        cycles = float(k_splits) * STREAMK_NEG_CYCLES_PER_SPLIT + STREAMK_NEG_BASE_CYCLES
-        neg_ms = (cycles / clock_hz) * MS_PER_SECOND * (float(cores) / float(used))
-    sync_ms = primitive_p13_sync_ms(context, "mode0_aiv_barrier_ns")
-    if is_arch35_context(context):
-        sync_ms += primitive_p13_sync_ms(context, "mode4_intra_block_ns")
+    if is_arch35:
+        clock_hz = primitive_core_clock_hz(context)
+        cores = max(1, int(getattr(context, "core_count", 1) or 1))
+        used = max(1, min(cores, int(used_cores)))
+        if clock_hz is not None and clock_hz > 0.0:
+            cycles = float(k_splits) * STREAMK_NEG_CYCLES_PER_SPLIT + STREAMK_NEG_BASE_CYCLES
+            neg_ms = (cycles / clock_hz) * MS_PER_SECOND * (float(cores) / float(used))
+    if getattr(context, "primitive_table", None) is None:
+        return neg_ms
+    if is_arch35:
+        sync_ms = (
+            primitive_p13_sync_ms(context, "mode0_aiv_barrier_ns")
+            + primitive_p13_sync_ms(context, "mode4_intra_block_ns")
+        )
+    else:
+        sync_ms = primitive_p13_sync_ms(context, "mode0_aic_barrier_ns")
     if sync_ms <= 0.0:
         sync_ms = primitive_p13_sync_ms(context, "mode0_aic_barrier_ns")
     return neg_ms + sync_ms

@@ -37,6 +37,23 @@ def align(value, granule):
     return math.ceil(value / granule) * granule
 
 
+def _output_element_bytes(op, total_rows: int, n: int) -> float:
+    """Resolve output element width without silently truncating non-BF16 outputs."""
+    metadata = dict(op.metadata)
+    output_format = metadata.get("output_format")
+    if output_format:
+        return float(dtype_bytes(output_format))
+    abi = getattr(op, "precision_abi", None)
+    abi_output = getattr(abi, "output_dtype", "") if abi is not None else ""
+    if abi_output:
+        return float(dtype_bytes(abi_output))
+    if getattr(op, "mte3_bytes", 0) > 0 and total_rows > 0 and n > 0:
+        return float(op.mte3_bytes) / float(total_rows * n)
+    if getattr(op, "dtype", ""):
+        return float(dtype_bytes(op.dtype))
+    return float(dtype_bytes("bf16"))
+
+
 @dataclass(frozen=True)
 class PartitionedMatrixOutput:
     """A declared physical path, independent of any matrix dispatch selector."""
@@ -89,7 +106,7 @@ class PartitionedMatrixOutput:
         for required in (role, "mte3", context.physical_role(self.transfer_role)):
             if required not in context.resource_names:
                 raise ModelingError(f"matrix_output_resource_required:{required}")
-        width = dtype_bytes(dict(context.op.metadata).get("output_format", "bf16"))
+        width = _output_element_bytes(context.op, total_rows, n)
         resident_rows = math.ceil(buffer_shape[0] / self.partitions)
         resident_columns = align(buffer_shape[1], self.column_alignment)
         row_scale_width = epilogue.row_scale_bytes / total_rows
@@ -111,7 +128,7 @@ class PartitionedMatrixOutput:
         groups = int(dict(context.op.metadata).get("matrix_groups", 1))
         owners = context.core_count * self.partitions
         role = read_role(context.resource_names, aiv=0)
-        width = dtype_bytes(dict(context.op.metadata).get("output_format", "bf16"))
+        width = _output_element_bytes(context.op, total_rows, n)
         per_partition = math.ceil(rows / self.partitions)
         row_scale_width = epilogue.row_scale_bytes / total_rows
         column_scale_width = epilogue.column_scale_bytes / (groups * n)

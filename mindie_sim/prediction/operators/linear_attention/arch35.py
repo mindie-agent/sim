@@ -28,7 +28,6 @@ from ...runtime.ring_buffer import RingBuffer, lower_generation
 from ..contracts import OperatorPlanningContext
 from ._gdn_native import (
     ARCH35_GDN_AIC_MTE2_QK_PANELS,
-    ARCH35_GDN_AIV_MTE2_QKV_PANELS,
     ARCH35_GDN_COMPACT_THRESHOLD,
     RECURRENT_GDN_ABI,
     arch35_gdn_chunk_sync_ms,
@@ -190,10 +189,12 @@ def _chunk_phases(c: LinearAttentionContract, ctx: OperatorPlanningContext, rows
     )
     gate_vec = vf_gate if gdn_wy else (w.gate_ops + (2 * rows * (gate_width - 1) if kda else 0))
     inv_vec = vf_inv if gdn_wy else (w.mask_ops + diagonal)
+    # Both paired AIVs load all ``rows`` gate scalars from GM to UB while Q/K/V and beta
+    # partition across the two AIVs (chunk_gated_delta_rule_vector_compute.h:276-284).
     load_work = (
         transfer(ctx, read=inputs) + Work(resources={
             "mte2_aic": ARCH35_GDN_AIC_MTE2_QK_PANELS * key * elem,
-            "mte2_aiv": ARCH35_GDN_AIV_MTE2_QKV_PANELS * key * elem,
+            "mte2_aiv": gate * element_bytes(c.gate_dtype),
         })
         if gdn_wy else transfer(ctx, read=inputs)
     )
@@ -405,12 +406,21 @@ def _staged_work(c: LinearAttentionContract, ctx: OperatorPlanningContext, *, kd
                      "offdiagonal_inverse", "Kcd_U"):
             prepare += by_name[name]
         if not kda:
-            # The output kernel recomputes QK and owns QH. The state kernel only needs WH.
+            # The output kernel recomputes QK and owns QH. The state kernel only needs WH,
+            # and both Stage0 (WH) and Stage2 (delta) align chunk rows to 16-element Cube
+            # fractals (chunk_fwd_h_cube.h:371,547).
             dtype = c.dtype
+            cube_rows = align_up(rows, FRACTAL_DIM)
             inter = by_name["R_O_inter"]
-            recurrence += Work({dtype: inter.matrix[dtype] - 2 * rows * c.dk * c.dv * count},
-                               {**inter.resources, "mte1": rows * c.dk * size * count})
-            for name in ("R32_to_R16_UB_to_L1", "delta_L0C_to_UB", "S_next"):
+            delta = by_name["delta_L0C_to_UB"]
+            recurrence += Work(
+                {dtype: 2 * cube_rows * c.dk * c.dv * count},
+                {**inter.resources, "mte1": (cube_rows * c.dk + c.dk * c.dv) * size * count},
+            ) + Work(
+                {dtype: 2 * cube_rows * c.dk * c.dv * count},
+                {**delta.resources, "mte1": cube_rows * (c.dk + c.dv) * size * count},
+            )
+            for name in ("R32_to_R16_UB_to_L1", "S_next"):
                 recurrence += by_name[name]
             qk_operands = 2 * c.bt * c.dk
             qh_operands = (c.bt + c.dv) * c.dk

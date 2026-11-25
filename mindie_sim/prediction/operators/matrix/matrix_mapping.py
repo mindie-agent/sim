@@ -20,7 +20,12 @@ from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
-from .matrix import DEFAULT_COMPUTE_TILE_MN, HierarchicalMatmul, plain_store_role
+from .matrix import (
+    DEFAULT_COMPUTE_TILE_MN,
+    HierarchicalMatmul,
+    _active_aic_cores,
+    plain_store_role,
+)
 from .matrix_epilogue import MatrixEpilogue
 from .matrix_mapping_owners import (
     MS_PER_SECOND,
@@ -62,6 +67,7 @@ SOURCES: tuple[SourceRef, ...] = (
 )
 
 FP32_BYTES = 4
+LOW_PRECISION_BYTES = 2
 
 GEMM_SHAPE_AXES = 3
 
@@ -69,10 +75,15 @@ GEMM_SHAPE_AXES = 3
 REFILL_M = 128
 MIN_NARROW_N = 32
 MAX_SPLIT_K = 32
-#: Upstream DAV_3510 Stream-K thresholds (arch35/matmul_v3_basic_streamk_tiling.cpp:257-262).
+#: Upstream DAV_3510 Stream-K thresholds (arch35/matmul_v3_basic_streamk_tiling.cpp:39-44, 105, 489).
 STREAM_K_MIN_K_BYTES = 8192
 STREAM_K_PER_AIC_K_BYTES = 256
+STREAM_K_DPSK_PER_AIC_K_BYTES = 128
 STREAM_K_K_ALIGN = 256
+ARCH35_DPSK_BASE_MN = 256
+ARCH35_CUBE_K_ALIGN = 16
+_DENSE_FLOAT_FORMATS = frozenset(("fp16", "bf16", "fp32", "hf32"))
+_MX_LINEAR_METHODS = frozenset(("mx_fp8", "mx_fp4"))
 #: Upstream DAV_2201 Split-K thresholds (matmul_v3_base_tiling.cpp:61, 87, 2571).
 DAV2201_SPLITK_K_PER_AIC = 384
 DAV2201_SPLITK_LARGE_K = 27392
@@ -350,21 +361,107 @@ def _calibrated_hbm_rate_ms(context, geometry, recipe, *, width, hbm_declared):
     return min(hbm_declared, cold_bps / MS_PER_SECOND)
 
 
-def _candidate_split_k(context, *, m, n, k, tk, output_tiles, groups, compute_format):
+def _arch35_streamk_quant_supported(op, compute_format: str) -> bool:
+    """True iff ``op`` is dense or an upstream QBMMV3 Stream-K quantization mode.
+
+    ``QBMMV3StreamKTiling::IsCapable`` (ops-nn/.../qbmm_streamk_tiling.cpp:921-1010)
+    admits MXFP8/MXFP4 and non-MX per-tensor quantization, and explicitly excludes
+    per-token, per-channel, and non-MX block-quantized modes.
+    """
+    fmt = str(compute_format or "").strip().lower()
+    epilogue = MatrixEpilogue.from_op(op)
+    has_epilogue_scales = (
+        epilogue.row_scale_bytes > 0.0 or epilogue.column_scale_bytes > 0.0
+    )
+    if fmt in _DENSE_FLOAT_FORMATS and not has_epilogue_scales:
+        return True
+    meta = dict(getattr(op, "metadata", ()) or ())
+    abi = getattr(op, "precision_abi", None)
+    linear_method = str(getattr(abi, "linear_method", "") or "").strip().lower()
+    if (linear_method in _MX_LINEAR_METHODS
+            or str(meta.get("weight_scale_format", "") or "").strip().lower() == "fp8_e8m0"
+            or str(meta.get("activation_scale_format", "") or "").strip().lower() == "fp8_e8m0"):
+        return True
+    if epilogue.row_scale_bytes > 0.0 and not epilogue.row_scale_broadcast:
+        return False
+    if epilogue.column_scale_bytes > 0.0 and not epilogue.column_scale_broadcast:
+        return False
+    if fmt in {"int8", "w8a8"} and epilogue.row_scale_bytes > 0.0:
+        return False
+    weight_block = getattr(abi, "weight_block", None) or meta.get("weight_block")
+    if weight_block:
+        return False
+    return True
+
+
+def _arch35_streamk_k_splits(
+    k: int, raw_splits: int, *, elem_b: float, weight_layout: str, is_b_trans: bool,
+) -> int:
+    """Device K-slice count after CANN ``FRACTAL_NZ`` ``singleCoreK`` alignment."""
+    single_core_k = math.ceil(k / max(1, int(raw_splits)))
+    if weight_layout == "FRACTAL_NZ":
+        nz_align = (
+            ARCH35_CUBE_K_ALIGN
+            if (elem_b == LOW_PRECISION_BYTES or (elem_b == FP32_BYTES and not is_b_trans))
+            else ARCH35_CUBE_K_ALIGN // SPLIT_K_HALF_CORE_DIVISOR
+        )
+        single_core_k = math.ceil(single_core_k / nz_align) * nz_align
+    return math.ceil(k / max(1, single_core_k))
+
+
+def _candidate_split_k(
+    context, *, m, n, k, tk, output_tiles, groups, compute_format,
+    tm: int = 0, tn: int = 0,
+):
     """Architecture-grounded Split-K / Stream-K factor for one tile candidate."""
-    if output_tiles >= context.core_count or k <= tk:
+    if groups > 1 or k <= tk:
         return 1
-    if groups > 1:
-        return 1
-    cores = max(1, int(context.core_count))
+    cores = max(1, _active_aic_cores(context))
     half_cores = max(1, cores // SPLIT_K_HALF_CORE_DIVISOR)
     if is_arch35_context(context):
-        elem_b = max(1, int(dtype_bytes(compute_format)))
-        min_k = max(STREAM_K_MIN_K_BYTES, cores * STREAM_K_PER_AIC_K_BYTES) / float(elem_b)
+        if not _arch35_streamk_quant_supported(context.op, compute_format):
+            return 1
+        meta = dict(getattr(context.op, "metadata", ()) or ())
+        elem_b = float(dtype_bytes(compute_format))
+        weight_layout = str(meta.get("weight_layout", "ND") or "ND").strip().upper()
+        is_b_trans = bool(meta.get("trans_b", meta.get("b_transposed", False)))
+        if output_tiles >= cores:
+            # DAV_3510 DP+SK tail-wave Stream-K (ops-nn/.../matmul_v3_basic_streamk_tiling.cpp:36-53,
+            # 483-495): fixed 256x256 base grid; only MC2 excludes standalone FP32.
+            is_mc2 = (
+                "mc2" in str(getattr(context.op, "family", "") or "").lower()
+                or "mc2" in str(getattr(context.op, "recipe", "") or "").lower()
+                or bool(meta.get("is_mc2"))
+            )
+            if is_mc2 and compute_format == "fp32" and not bool(meta.get("is_hf32")):
+                return 1
+            if (tm != ARCH35_DPSK_BASE_MN or tn != ARCH35_DPSK_BASE_MN
+                    or (m % ARCH35_DPSK_BASE_MN) or (n % ARCH35_DPSK_BASE_MN)):
+                return 1
+            min_k_dpsk = max(
+                STREAM_K_MIN_K_BYTES, cores * STREAM_K_DPSK_PER_AIC_K_BYTES
+            ) / elem_b
+            tail = output_tiles % cores
+            if k < min_k_dpsk or tail == 0 or tail > half_cores:
+                return 1
+            raw_splits = max(1, cores // tail)
+            k_cnt = _arch35_streamk_k_splits(
+                k, raw_splits, elem_b=elem_b,
+                weight_layout=weight_layout, is_b_trans=is_b_trans,
+            )
+            return min(k // tk, k_cnt, MAX_SPLIT_K)
+        min_k = max(STREAM_K_MIN_K_BYTES, cores * STREAM_K_PER_AIC_K_BYTES) / elem_b
         k_aligned = math.ceil(k / STREAM_K_K_ALIGN) * STREAM_K_K_ALIGN
         if k_aligned < min_k or output_tiles > half_cores:
             return 1
-        return min(k // tk, max(1, cores // max(1, output_tiles)), MAX_SPLIT_K)
+        raw_splits = max(1, cores // max(1, output_tiles))
+        k_cnt = _arch35_streamk_k_splits(
+            k, raw_splits, elem_b=elem_b,
+            weight_layout=weight_layout, is_b_trans=is_b_trans,
+        )
+        return min(k // tk, k_cnt, MAX_SPLIT_K)
+    if output_tiles >= cores:
+        return 1
     fp32_small = (
         compute_format == "fp32"
         and m <= DAV2201_SPLITK_FP32_MAX_MN and n <= DAV2201_SPLITK_FP32_MAX_MN
@@ -379,10 +476,15 @@ def _candidate_split_k(context, *, m, n, k, tk, output_tiles, groups, compute_fo
 def _arch35_streamk_perf(context, recipe, geometry, *, split_k: int, output_tiles: int) -> float:
     """Upstream DAV_3510 Stream-K perf model (arch35/matmul_v3_basic_streamk_tiling.cpp:70-129)."""
     names = context.resource_names
-    cores = max(1, int(context.core_count))
-    waves = max(1, math.ceil(int(output_tiles) / cores))
-    used = max(1, min(cores, int(output_tiles) * int(split_k)))
-    frac = float(used) / float(cores)
+    die_cores = max(1, int(context.core_count))
+    active_cores = max(1, min(die_cores, _active_aic_cores(context)))
+    tiles = max(1, int(output_tiles))
+    full_waves, tail = divmod(tiles, active_cores)
+    dp_tiles = full_waves * active_cores
+    sk_tiles = tail if (dp_tiles > 0 and tail > 0) else tiles
+    used = max(1, min(active_cores, sk_tiles * int(split_k)))
+    dp_frac = float(active_cores) / float(die_cores)
+    sk_frac = float(used) / float(die_cores)
     hbm_full = _declared_rate(context, names["hbm"])
     meta = dict(context.op.metadata)
     width = dtype_bytes(meta.get("compute_format", context.op.dtype or "bf16"))
@@ -390,10 +492,10 @@ def _arch35_streamk_perf(context, recipe, geometry, *, split_k: int, output_tile
     row_bytes = int(min(recipe.tile_n, n) * width)
     stride_bytes = int(n * width)
     strided_bps = primitive_cold_hbm_bps(
-        context, active_cores=cores,
+        context, active_cores=die_cores,
         row_bytes=row_bytes,
         stride_bytes=stride_bytes,
-        total_tiles=max(1, int(output_tiles)), is_grouped=False,
+        total_tiles=tiles, is_grouped=False,
         m_tiles=int(geometry.nm), panel_rows=max(1, int(k)),
     )
     if strided_bps:
@@ -409,7 +511,7 @@ def _arch35_streamk_perf(context, recipe, geometry, *, split_k: int, output_tile
         b_hbm_full = hbm_full * sector_eff
     else:
         b_hbm_full = hbm_full
-    l2_agg = primitive_p01_scaling_bps(context, cores, warm=True)
+    l2_agg = primitive_p01_scaling_bps(context, die_cores, warm=True)
     l2_full = (l2_agg / MS_PER_SECOND) if (l2_agg and l2_agg > 0.0) else hbm_full
     epilogue = MatrixEpilogue.from_op(context.op)
     inputs, weight = epilogue.operands(context.op)
@@ -419,30 +521,50 @@ def _arch35_streamk_perf(context, recipe, geometry, *, split_k: int, output_tile
         0.0,
         (inputs * max(1, geometry.nn) + weight * max(1, geometry.nm)) - (inputs + weight),
     )
-    mte2_ms = (
-        a_bytes / (hbm_full * frac)
-        + b_bytes / (b_hbm_full * frac)
-        + l2_extra / (l2_full * frac)
+    base_mte2_ms = (
+        a_bytes / hbm_full
+        + b_bytes / b_hbm_full
+        + l2_extra / l2_full
     )
-    if waves > 1:
-        # Multi-wave tile grid under-utilizes the tail wave.
-        wave_eff = float(output_tiles) / float(waves * cores)
-        mte2_ms /= max(wave_eff, 1.0 / float(cores))
+    if tail > 0:
+        # Full DP waves use all stream AICs; only the partial tail wave scales by sk_frac.
+        mte2_ms = base_mte2_ms * (
+            (float(dp_tiles) / float(tiles)) / dp_frac
+            + (float(tail) / float(tiles)) / sk_frac
+        )
+    else:
+        mte2_ms = base_mte2_ms / dp_frac
     cube_key = names.get("cube")
     cube_total = float(context.work.get(cube_key, 0.0)) if cube_key else 0.0
-    cube_units = max(1, int(context.resource_units.get("cube", cores)))
-    if waves > 1:
-        cube_ms = (cube_total * float(cube_units) * float(waves) / float(max(1, int(output_tiles)))) if cube_total > 0.0 else 0.0
+    cube_units = max(1, int(context.resource_units.get("cube", die_cores)))
+    if cube_total > 0.0:
+        if tail > 0 and split_k > 1:
+            # GetCubePerf (matmul_v3_basic_streamk_tiling.cpp:105) aligns each K-slice to 16.
+            k_slice = math.ceil(k / int(split_k))
+            issued_k = math.ceil(k_slice / ARCH35_CUBE_K_ALIGN) * ARCH35_CUBE_K_ALIGN
+            tail_wave_tiles = (
+                float(math.ceil(tail * int(split_k) / used))
+                * (float(issued_k) / float(max(1, k)))
+            )
+        elif tail > 0:
+            tail_wave_tiles = float(math.ceil(tail / used))
+        else:
+            tail_wave_tiles = 0.0
+        cube_ms = (
+            (float(full_waves) + tail_wave_tiles)
+            * cube_total * float(cube_units) / float(tiles)
+        )
     else:
-        cube_ms = (cube_total * float(cube_units) / float(used)) if cube_total > 0.0 else 0.0
+        cube_ms = 0.0
     if split_k <= 1:
         return max(mte2_ms, cube_ms)
-    partial_bytes = float(2 * FP32_BYTES * split_k * total_m * n)
+    sk_area = float(total_m * n) * (float(sk_tiles) / float(tiles))
+    partial_bytes = float(2 * FP32_BYTES * split_k) * sk_area
     vec_r = _declared_rate(context, names["vector"]) if "vector" in names else 0.0
-    merge_ops = float((split_k - 1) * total_m * n)
+    merge_ops = float(split_k - 1) * sk_area
     neg_ms = (
         streamk_fixup_latency_ms(context, k_splits=split_k, used_cores=used)
-        + partial_bytes / (hbm_full * frac)
+        + partial_bytes / (hbm_full * sk_frac)
         + (merge_ops / vec_r if vec_r > 0.0 else 0.0)
     )
     return max(mte2_ms, cube_ms) + neg_ms
@@ -520,9 +642,13 @@ def mapping_bound(context, recipe, *, geometry=None, allow_unequal_groups=False,
     private_parts = [(inputs * a / total_m, weight * b / (n * groups))
                      for _, a, b, _ in owners]
     private = [a_b + b_b for a_b, b_b in private_parts]
-    scales = [epilogue.row_scale_bytes * a / total_m
-              + epilogue.column_scale_bytes * b / (n * groups)
-              for _, a, b, _ in owners]
+    scales = [
+        (epilogue.row_scale_bytes if epilogue.row_scale_broadcast
+         else epilogue.row_scale_bytes * a / total_m)
+        + (epilogue.column_scale_bytes if epilogue.column_scale_broadcast
+           else epilogue.column_scale_bytes * b / (n * groups))
+        for _, a, b, _ in owners
+    ]
     width = dtype_bytes(meta.get("compute_format", context.op.dtype or "bf16"))
     if len(set(geometry.group_rows)) == 1:
         canonical_owners = owner_tiles(
@@ -671,7 +797,12 @@ def _op_matrix_key(op):
     return (
         op.local_shape, op.semantic_shape, op.padded_shape,
         op.dtype, op.hbm_bytes, op.mte2_bytes, op.mte3_bytes, op.vector_ops,
+        getattr(op, "family", ""), getattr(op, "recipe", ""),
+        getattr(getattr(op, "precision_abi", None), "abi_signature", None),
         meta.get("matrix_groups", 1), meta.get("compute_format"), meta.get("output_format"),
+        meta.get("weight_layout", "ND"),
+        bool(meta.get("trans_b", meta.get("b_transposed", False))),
+        bool(meta.get("is_mc2", False)), bool(meta.get("is_hf32", False)),
         meta.get("packed_weight_bytes", 0), meta.get("row_scale_bytes", 0),
         meta.get("column_scale_bytes", 0), meta.get("epilogue_ops_per_element", 0),
         float(meta.get("admitted_l2_read_hit_bytes", 0.0) or 0.0),
@@ -742,7 +873,7 @@ def _evaluate_select_candidate(
         else math.ceil(m / tm) * math.ceil(n / tn) * groups
     )
     split_k = _candidate_split_k(
-        host_ctx, m=m, n=n, k=k, tk=tk, output_tiles=output_tiles,
+        host_ctx, m=m, n=n, k=k, tm=tm, tn=tn, tk=tk, output_tiles=output_tiles,
         groups=groups, compute_format=compute_format,
     )
     recipe = HierarchicalMatmul(
@@ -798,7 +929,8 @@ def _evaluate_select_candidate(
                     mapper.reuse_weights, split_k)
             else:
                 bound = split_bound
-    waves = math.ceil(output_tiles / host_ctx.core_count)
+    active_cores = max(1, _active_aic_cores(host_ctx))
+    waves = math.ceil(output_tiles / active_cores)
     rec = {
         "tile": [tm, tn, tk], "split_k": split_k,
         "footprint_bytes_per_owner": buffers,
@@ -865,7 +997,8 @@ class MappedMatmul:
             is_arch35,
         )
         cache_key = (
-            _matmul_recipe_key(self), _op_matrix_key(host_ctx.op), host_ctx.core_count,
+            _matmul_recipe_key(self), _op_matrix_key(host_ctx.op),
+            host_ctx.core_count, _active_aic_cores(host_ctx),
             arch_key,
             tuple(sorted(host_ctx.compute_peaks.items())),
             tuple(sorted(host_ctx.resource_names.items())),
