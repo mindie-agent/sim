@@ -38,18 +38,7 @@ def _fraction(value: float, total: float) -> float:
 
 def work_from_op(op) -> Work:
     """Recover the declared physical work without re-pricing the operator."""
-    matrix = dict(getattr(op, "matrix_flops", ()) or ())
-    resources = {}
-    for field, role in (("hbm_bytes", "hbm"), ("mte2_bytes", "mte2"),
-                        ("mte3_bytes", "mte3"), ("vector_ops", "vector"),
-                        ("link_bytes", "link")):
-        value = float(getattr(op, field, 0.0) or 0.0)
-        if value:
-            resources[role] = resources.get(role, 0.0) + value
-    metadata = dict(getattr(op, "metadata", ()) or ())
-    for role, value in dict(metadata.get("resource_work", {})).items():
-        resources[role] = resources.get(role, 0.0) + float(value)
-    return Work(matrix, resources)
+    return Work.from_op(op)
 
 
 #: Canonical phase category for each declared physical resource role.  Both

@@ -146,7 +146,17 @@ def node_physical(op, *, recipe_bindings=None, book=None):
     # Directional copy, operand and output pipes remain independent physical
     # services; folding them into HBM or generic MTE2 would double-count bytes.
     work["resource_work"] = dict(dict(op.metadata).get("resource_work", {}))
-    work["launches"] = int(op.family != "barrier")
+    from mindie_sim.prediction.execution.submission import is_zero_kernel_view
+
+    unmaterialized_view = (
+        op.family == "tensor_view"
+        and all(float(getattr(op, key, 0.0) or 0.0) == 0.0 for key in _WORK)
+    )
+    work["launches"] = int(
+        op.family != "barrier"
+        and not is_zero_kernel_view(op)
+        and not unmaterialized_view
+    )
     return {"physical_signature": _signature(declaration), "physical_work": work}
 
 

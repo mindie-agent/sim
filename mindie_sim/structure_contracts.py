@@ -24,6 +24,15 @@ GDN_QKV_OPERAND_COUNT = 3
 GDN_PREPARE_BF16_OUTPUTS = 5
 GDN_PREPARE_FP32_OUTPUTS = 3
 GDN_OUTPUT_BF16_INPUTS = 4
+GDN_GATING_RANK = 2
+GDN_GATING_DTYPES = frozenset({"bf16", "fp16", "fp32"})
+GDN_GATING_FUSED_RECIPE = "vllm_ascend_gdn_fused_gating"
+GDN_GATING_NATIVE_KINDS = frozenset({"", "fused_gdn_gating_kernel"})
+GDN_GATING_BETA_TAGS = {
+    "bf16_beta": "bf16",
+    "fp16_beta": "fp16",
+    "fp32_beta": "fp32",
+}
 #: Fused native cache epilogs keep the active cache-store tensor boundary.
 CACHE_STORE_FAMILIES = frozenset({
     "cache_store", "kv_compress_epilog", "indexer_quant_cache", "kv_cache_write",
@@ -102,6 +111,51 @@ def gdn_contract(op):
         ins = ("bf16",) * GDN_OUTPUT_BF16_INPUTS + (gate_dtype,) + ("int64",) * 2
         outs = ("bf16",)
     return GDN_KINDS[family], inputs, outputs, ins, outs
+
+
+def gdn_gating_contract(op):
+    """Emit declared GDN gating operand and result precisions matching observed ABI."""
+    meta = op["metadata"]
+    native_kind = str(meta.get("native_kind") or "")
+    if native_kind not in GDN_GATING_NATIVE_KINDS:
+        return None
+    shape = tuple(op["local_shape"])
+    if len(shape) != GDN_GATING_RANK or min(shape) <= 0:
+        return None
+    a_dtype = meta.get("a_dtype") or meta.get("input_format") or op.get("dtype")
+    out_dtypes = meta.get("output_dtypes") if isinstance(meta.get("output_dtypes"), dict) else {}
+    outputs_tag = tuple(meta.get("outputs") or ())
+    tagged_beta = next(
+        (GDN_GATING_BETA_TAGS[tag] for tag in outputs_tag if tag in GDN_GATING_BETA_TAGS),
+        None,
+    )
+    b_dtype = meta.get("b_dtype") or meta.get("beta_dtype") or out_dtypes.get("beta") or tagged_beta or a_dtype
+    beta_dtype = out_dtypes.get("beta") or meta.get("beta_dtype") or tagged_beta or b_dtype
+    a_log_dtype = meta.get("a_log_dtype") or meta.get("A_log_dtype") or "fp32"
+    g_dtype = out_dtypes.get("g") or meta.get("decay_dtype") or "fp32"
+    default_dt_bias = (
+        "fp32"
+        if meta.get("has_dt_bias") or op.get("recipe") == GDN_GATING_FUSED_RECIPE
+        else None
+    )
+    dt_bias_dtype = meta.get("dt_bias_dtype") or default_dt_bias
+    checked = (a_log_dtype, a_dtype, b_dtype, *(
+        (dt_bias_dtype,) if dt_bias_dtype is not None else ()
+    ))
+    if any(dtype not in GDN_GATING_DTYPES for dtype in checked):
+        return None
+    if g_dtype != "fp32" or beta_dtype != b_dtype:
+        return None
+    head_shape = (shape[-1],)
+    input_slots = (
+        (head_shape, a_log_dtype, "ND"),
+        (shape, a_dtype, "ND"),
+        (shape, b_dtype, "ND"),
+        *(((head_shape, dt_bias_dtype, "ND"),) if dt_bias_dtype is not None else ()),
+    )
+    out_shape = (1, *shape)
+    output_slots = ((out_shape, g_dtype, "ND"), (out_shape, beta_dtype, "ND"))
+    return ("gdn_gating", shape, input_slots, output_slots)
 
 
 def conv_contract(op):
@@ -325,7 +379,7 @@ def predicted_contract(op):
         from mindie_sim.prediction.operators.mx_quant_matrix.family_shared_quant import tensor_contract
         return tensor_contract(op)
     if op["family"] == "gdn_gating":
-        return ("gdn_gating", shape)
+        return gdn_gating_contract(op)
     if op["family"] == "recurrent_vector":
         # The retained native scalar-decay ABI supports BF16 Q/K/V/beta.
         # Equal byte widths do not make FP16 and BF16 state interchangeable.

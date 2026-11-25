@@ -536,10 +536,29 @@ def _attention_values(operator):
     deps = operator.get("deps") or ()
     query_dtype = gqa.get("query_dtype") or operator.get("dtype")
     kv_dtype = gqa.get("kv_dtype") or query_dtype
+    requests = gqa.get("requests")
+    if isinstance(requests, (list, tuple)) and requests:
+        total_query_tokens = sum(int(req[0]) for req in requests)
+    else:
+        total_query_tokens = gqa.get("uniform_query_tokens")
+    out_head_dim = gqa.get("v_head_dim")
+    if out_head_dim is None:
+        mte3 = operator.get("mte3_bytes")
+        elem_bytes = _nbytes(query_dtype, [1])
+        q_heads = gqa.get("query_heads")
+        if (isinstance(mte3, (int, float)) and mte3 > 0
+                and total_query_tokens and q_heads and elem_bytes):
+            inferred = float(mte3) / (total_query_tokens * q_heads * elem_bytes)
+            rounded = int(round(inferred))
+            if rounded >= 1 and abs(inferred - rounded) < 1e-6:
+                out_head_dim = rounded
+    if out_head_dim is None:
+        out_head_dim = gqa.get("head_dim")
     query_attrs = {
         "source": "operator.metadata.gqa_decode",
         "shape_basis": "semantic_geometry_only",
-        "query_tokens": gqa.get("uniform_query_tokens"),
+        "query_tokens": total_query_tokens,
+        "per_request_query_tokens": gqa.get("uniform_query_tokens"),
         "query_heads": gqa.get("query_heads"),
         "kv_heads": gqa.get("kv_heads"),
         "head_dim": gqa.get("head_dim"),
@@ -573,21 +592,21 @@ def _attention_values(operator):
                contract="declared_cache_access"),
     ]
     output_shape = None
-    if (gqa.get("uniform_query_tokens") is not None
+    if (total_query_tokens is not None
             and gqa.get("query_heads") is not None
-            and gqa.get("head_dim") is not None):
-        output_shape = [gqa["uniform_query_tokens"], gqa["query_heads"],
-                        gqa["head_dim"]]
+            and out_head_dim is not None):
+        output_shape = [total_query_tokens, gqa["query_heads"], out_head_dim]
     outputs = [_value("output", "output", producer=op_id, output="output",
                       dtype=query_dtype, shape=output_shape,
                       attrs={"source": "operator.metadata.gqa_decode",
                              "shape_basis": "semantic_geometry_only",
-                             "query_tokens": gqa.get("uniform_query_tokens"),
+                             "query_tokens": total_query_tokens,
+                             "per_request_query_tokens": gqa.get("uniform_query_tokens"),
                              "query_heads": gqa.get("query_heads"),
-                             "head_dim": gqa.get("head_dim")},
+                             "head_dim": out_head_dim},
                       contract="declared_semantic_geometry")]
     attrs = [
-        {"name": "query_tokens", "value": gqa.get("uniform_query_tokens"),
+        {"name": "query_tokens", "value": total_query_tokens,
          "unit": "tokens", "source": "operator.metadata.gqa_decode"},
         {"name": "context_tokens", "value": gqa.get("uniform_context_tokens"),
          "unit": "tokens", "source": "operator.metadata.gqa_decode"},
