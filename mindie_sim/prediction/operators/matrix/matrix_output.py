@@ -9,11 +9,24 @@
 """
 from dataclasses import dataclass
 import math
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import Work
 from mindie_sim.prediction.ownership import read_role
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_OPS_TRANSFORMER_REV = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "cann/ops-transformer", _OPS_TRANSFORMER_REV,
+        "gmm/grouped_matmul/op_kernel/grouped_matmul_kernel.h",
+        "b5d4e80ce395887f5d95db83e5f36b6f13edf170208c9a7cf0f927858b0c1025",
+    ),
+)
+
 FP32_BYTES = 4
 
 DEFAULT_OUTPUT_CHUNKS = 4
@@ -38,12 +51,31 @@ class PartitionedMatrixOutput:
     buffer_alignment: int = DEFAULT_OUTPUT_BUFFER_ALIGNMENT
     pool: str = "ub"
 
+    def _require_l0c_to_ub(self, context):
+        """Reject direct L0C->UB Fixpipe publication on hardware lacking that datapath."""
+        if context.physical_role(self.transfer_role) != "fixpipe" or self.pool != "ub":
+            return
+        datapath = getattr(context, "datapath", None)
+        if datapath is not None:
+            if not bool(getattr(datapath, "has_l0c_to_ub", False)):
+                raise ModelingError("matrix_output_l0c_to_ub_unsupported")
+            return
+        arch = getattr(context, "compute_arch", None)
+        if arch is not None:
+            paths = getattr(arch, "paths", ()) or ()
+            if paths and not any(
+                getattr(path, "source", "") == "l0c" and getattr(path, "target", "") == "ub"
+                for path in paths
+            ):
+                raise ModelingError("matrix_output_l0c_to_ub_unsupported")
+
     def allocations(self, context, core, buffer_shape, epilogue):
         """Keep declared per-owner buffers resident across the whole invocation."""
         if min(self.partitions, self.publication_row_alignment, self.column_alignment,
                self.accumulator_width, self.output_chunks, self.output_slots,
                self.buffer_alignment) < 1:
             raise ModelingError("matrix_output_geometry_must_be_positive")
+        self._require_l0c_to_ub(context)
         if self.pool not in context.pool_names:
             raise ModelingError(f"matrix_output_pool_required:{self.pool}")
         total_rows, n, _ = context.op.local_shape[-3:]
@@ -74,6 +106,7 @@ class PartitionedMatrixOutput:
 
     def lower(self, context, *, core, rows, columns, buffer_shape, epilogue,
               reuse_inputs, reuse_weights):
+        self._require_l0c_to_ub(context)
         total_rows, n, _ = context.op.local_shape[-3:]
         groups = int(dict(context.op.metadata).get("matrix_groups", 1))
         owners = context.core_count * self.partitions

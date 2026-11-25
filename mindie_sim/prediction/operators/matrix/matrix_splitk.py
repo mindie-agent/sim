@@ -22,8 +22,12 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import math
 import re
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
+from .matrix import directional_mte1_available, operand_transfer
+from .matrix_epilogue import MatrixEpilogue
 from .matrix_mapping import matrix_geometry
 from .matrix_mapping_owners import (
     _FRACTAL_ROWS,
@@ -34,10 +38,29 @@ from .matrix_mapping_owners import (
     primitive_p01_hbm_read_bps,
     streamk_fixup_latency_ms,
 )
+from mindie_sim.prediction.engine import Allocation
 from mindie_sim.prediction.mechanism import PlannedRecipe
+from mindie_sim.prediction.ownership import read_role
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, RecipeContext, Stage
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_OPS_TRANSFORMER_REV = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "cann/ops-transformer", _OPS_TRANSFORMER_REV,
+        "mc2/3rd/mat_mul_v3/op_kernel/arch35/mat_mul_stream_k_block.h",
+        "57d5ad95709e91d15f799aae8fc82b646ddd7efcd297e7699c0d034a504dac69",
+    ),
+    SourceRef(
+        "cann/ops-transformer", _OPS_TRANSFORMER_REV,
+        "mc2/3rd/mat_mul_v3/op_kernel/arch35/mat_mul_stream_k_kernel.h",
+        "ad43c08de3113cbaabe4736fe883dd361ae33fce94c6b3bb8b5ba0da01efb66d",
+    ),
+)
+
 FP32_BYTES = 4
+#: DAV_3510 Stream-K AIV row-burst block alignment (mat_mul_stream_k_block.h:214).
+STREAMK_AIV_BLOCK_ELEMS = 32
 BF16_TO_FP32_FIXPIPE_RATIO = 2.0
 MS_PER_SECOND = 1000
 DRAM_SERVICE_MODE = "mte2_aic_dram"
@@ -349,10 +372,10 @@ class ScopedRouterRecipe(PlannedRecipe):
         return super().prepare(op, geometry)
 
 
-def _split_keys(context, hbm, vector, mte3, cube) -> dict[str, float]:
+def _split_keys(context, hbm, vector, mte3, cube, *, excluded_extra=()) -> dict[str, float]:
     """Declared demand serviced by the split tasks, never the MMA or output."""
     split_keys = {}
-    excluded = {vector, mte3, cube}
+    excluded = {vector, mte3, cube, *excluded_extra}
     for key, value in context.work.items():
         if key in excluded or (hbm is not None and key == hbm):
             continue
@@ -361,24 +384,29 @@ def _split_keys(context, hbm, vector, mte3, cube) -> dict[str, float]:
 
 
 def _local_geometry(context, recipe, geometry):
+    """Return ``(total_m, n, k, tile_dims)`` preserving exact ``(tile_m, tile_n)`` per tile."""
     if geometry is None and recipe is not None:
         geometry = matrix_geometry(context, recipe)
     if geometry is not None:
         total_m, n, k = (int(value) for value in geometry.local_shape)
-        areas = []
-        for count, _m_extent, _n_extent, area in geometry.owners:
-            count = int(count)
-            if count < 1 or area <= 0:
+        tm = int(geometry.tile_m)
+        tn = int(geometry.tile_n)
+        tile_dims: list[tuple[int, int]] = []
+        for row_g in geometry.group_rows:
+            if row_g <= 0 or n <= 0:
                 continue
-            share = float(area) / float(count)
-            areas.extend([share] * count)
-        return float(total_m), float(n), float(k), areas
+            for r0 in range(0, int(row_g), tm):
+                a = min(tm, int(row_g) - r0)
+                for c0 in range(0, n, tn):
+                    b = min(tn, n - c0)
+                    tile_dims.append((a, b))
+        return float(total_m), float(n), float(k), tile_dims
     local = tuple(int(value) for value in context.op.local_shape)
     if len(local) < LOCAL_SHAPE_DIMS:
         raise ModelingError("split_k_requires_three_local_dimensions")
     total_m, n, k = local[-LOCAL_SHAPE_DIMS:]
-    area = float(total_m) * float(n)
-    return float(total_m), float(n), float(k), ([area] if area > 0 else [])
+    dims = [(total_m, n)] if (total_m > 0 and n > 0) else []
+    return float(total_m), float(n), float(k), dims
 
 
 def _k_slices(k: float, count: int) -> tuple[int, ...]:
@@ -515,36 +543,59 @@ def _partial_write_caps(
     return dict(base_caps)
 
 
-def _build_split_slice_stages(load_work, cube_key, cube_val, *, fixpipe, mem_tier, area,
-                              k_slice, tile_k, load_caps, write_caps,
-                              load_place, mma_place, fixpipe_place, pipelined: bool):
+def _build_split_slice_stages(load_work, mte1_work, cube_key, cube_val, *,
+                              fixpipe, mem_tier, area, k_slice, tile_k,
+                              load_caps, write_caps, load_place, mte1_place,
+                              mma_place, fixpipe_place, l0c_alloc, pipelined: bool):
     """Build K-panel stages for one Split-K task conserving exact work."""
     n_panels = max(1, math.ceil(k_slice / float(max(1, tile_k)))) if tile_k else 1
+    has_partial_write = area > 0 and (fixpipe is not None or mem_tier is not None)
+    free_l0c_on_write = l0c_alloc if has_partial_write else ()
     stages = []
     if pipelined and n_panels >= 2 and cube_key is not None and cube_val > 0.0 and load_work:
         p_frac = 1.0 / float(n_panels)
         body_frac = 1.0 - p_frac
         pro_work = {key: val * p_frac for key, val in load_work.items()}
         body_work = {key: val * body_frac for key, val in load_work.items()}
+        for key, val in mte1_work.items():
+            body_work[key] = body_work.get(key, 0.0) + val * body_frac
         body_work[cube_key] = cube_val * body_frac
         epi_work = {cube_key: cube_val * p_frac}
-        body_place = {**load_place, **mma_place}
+        for key, val in mte1_work.items():
+            epi_work[key] = epi_work.get(key, 0.0) + val * p_frac
+        body_place = {**load_place, **mte1_place, **mma_place}
+        epi_place = {**mma_place, **mte1_place} if mte1_work else mma_place
         stages.append(Stage("prologue_load", pro_work, caps=load_caps, placement=load_place))
         stages.append(Stage("k_body", body_work, after=("prologue_load",),
-                            caps=load_caps, placement=body_place, coupled=True))
+                            caps=load_caps, placement=body_place, coupled=True,
+                            acquire=l0c_alloc))
         stages.append(Stage("epilogue_mma", epi_work, after=("k_body",),
-                            caps=load_caps, placement=mma_place))
+                            caps=load_caps, placement=epi_place,
+                            free=() if has_partial_write else l0c_alloc))
         predecessor = "epilogue_mma"
     else:
-        stages.append(Stage("load", load_work,
-                            caps=(load_caps if load_work else {}),
-                            placement=load_place))
+        has_mma = cube_key is not None and cube_val > 0.0
+        stages.append(Stage(
+            "load", load_work,
+            caps=(load_caps if load_work else {}),
+            placement=load_place,
+            acquire=() if has_mma else l0c_alloc,
+            free=() if (has_mma or has_partial_write) else l0c_alloc,
+        ))
         predecessor = "load"
-        if cube_key is not None and cube_val > 0.0:
-            stages.append(Stage("mma", {cube_key: cube_val}, after=(predecessor,),
-                                caps=load_caps, placement=mma_place))
+        if mte1_work:
+            stages.append(Stage("operand", mte1_work, after=(predecessor,),
+                                placement=mte1_place))
+            predecessor = "operand"
+        if has_mma:
+            stages.append(Stage(
+                "mma", {cube_key: cube_val}, after=(predecessor,),
+                caps=load_caps, placement=mma_place,
+                acquire=l0c_alloc,
+                free=() if has_partial_write else l0c_alloc,
+            ))
             predecessor = "mma"
-    if area > 0 and (fixpipe is not None or mem_tier is not None):
+    if has_partial_write:
         write = float(FP32_BYTES) * area
         pw_work: dict[str, float] = {}
         if fixpipe is not None:
@@ -553,7 +604,7 @@ def _build_split_slice_stages(load_work, cube_key, cube_val, *, fixpipe, mem_tie
             pw_work[mem_tier] = write
         stages.append(Stage("partial_write", pw_work,
                             after=(predecessor,), caps=write_caps,
-                            placement=fixpipe_place))
+                            placement=fixpipe_place, free=free_l0c_on_write))
     return KernelProgram(tuple(stages))
 
 
@@ -561,57 +612,120 @@ def _placement(context, index: int, cores: int, roles) -> dict:
     return context.owned(index % cores, cores, tuple(roles))
 
 
-def _tile_merge_program(context, names, area: float, vector_share,
-                        mte3_share, hbm_write_share, partial_read, merges: int,
-                        read_caps, store_caps, index: int, cores: int, *,
-                        mem_tier: str | None = None,
-                        vread_role: str | None = None,
-                        vread_name: str | None = None,
-                        merge_tasks: int = 1, used_cores: int | None = None) -> KernelProgram:
-    active_cores = cores if used_cores is None else used_cores
+def _row_burst_partition(context, *, tile_m: int, tile_n: int, splits: int,
+                         tile_index: int, cores: int):
+    """Row-burst AIV partition per upstream ``mat_mul_stream_k_block.h:212-218``."""
+    total_aivs = max(1, int(context.resource_units.get("vector", cores)))
+    aiv_ratio = max(1, total_aivs // max(1, int(cores)))
+    stream_aivs = context.stream_owner_units("vector")
+    available = tuple(int(u) for u in stream_aivs) if stream_aivs else tuple(range(total_aivs))
+    max_aiv_for_tile = max(1, min(len(available), int(splits) * aiv_ratio))
+    row_align = max(1, math.ceil(STREAMK_AIV_BLOCK_ELEMS / max(1, int(tile_n))))
+    raw_burst = max(1, math.ceil(max(1, int(tile_m)) / max_aiv_for_tile))
+    m_burst_base = math.ceil(raw_burst / row_align) * row_align
+    m_burst_cnt = max(1, min(len(available), math.ceil(max(1, int(tile_m)) / m_burst_base)))
+    m_burst_tail = max(1, int(tile_m) - (m_burst_cnt - 1) * m_burst_base)
+    start = (tile_index * max_aiv_for_tile) % len(available)
+    chosen = tuple(dict.fromkeys(
+        available[(start + offset) % len(available)] for offset in range(m_burst_cnt)
+    ))
+    return chosen, m_burst_base, m_burst_cnt, m_burst_tail
+
+
+def _role_placement_for_units(context, names, cores: int, units: tuple[int, ...],
+                              roles: tuple[str, ...]) -> dict:
+    placement: dict[str, tuple[int, ...]] = {}
+    for role in roles:
+        if not role or role not in names:
+            continue
+        phys = names[role]
+        role_units = max(1, int(context.resource_units.get(role, cores)))
+        placement[phys] = tuple(dict.fromkeys(u % role_units for u in units))
+    return placement
+
+
+def _merge_burst_program(context, names, *, units: tuple[int, ...], frac: float,
+                         area: float, vector_share: float, mte3_share: float,
+                         hbm_write_share: float, partial_read: float,
+                         scale_copy: float, merges: int, read_caps: dict,
+                         store_caps: dict, cores: int, mem_tier: str | None,
+                         vread_role: str | None, vread_name: str | None,
+                         scale_role: str | None, scale_name: str | None) -> KernelProgram:
     hbm, vector, mte3 = names.get("hbm"), names.get("vector"), names.get("mte3")
-    sharded_aiv = getattr(context, "primitive_table", None) is not None and active_cores > merge_tasks
+    scaled_read_caps = {k: v * frac for k, v in read_caps.items()} if frac < 1.0 else read_caps
+    scaled_store_caps = {k: v * frac for k, v in store_caps.items()} if frac < 1.0 else store_caps
     stages = []
     predecessor = ()
     if partial_read > 0 and (vread_name is not None or mem_tier is not None):
         pr_work: dict[str, float] = {}
         if vread_name is not None:
-            pr_work[vread_name] = partial_read
+            pr_work[vread_name] = partial_read * frac
         if mem_tier is not None:
-            pr_work[mem_tier] = partial_read
-        if sharded_aiv or vread_role is None:
-            read_place = {}
-        else:
-            read_place = _placement(context, index, cores, (vread_role,))
-        stages.append(Stage("partial_read", pr_work, caps=read_caps, placement=read_place))
+            pr_work[mem_tier] = partial_read * frac
+        read_place = (
+            _role_placement_for_units(context, names, cores, units, (vread_role,))
+            if vread_role is not None else {}
+        )
+        stages.append(Stage("partial_read", pr_work, caps=scaled_read_caps, placement=read_place))
         predecessor = ("partial_read",)
+    if scale_copy > 0 and scale_name is not None and scale_role is not None:
+        scale_place = _role_placement_for_units(context, names, cores, units, (scale_role,))
+        stages.append(Stage("scales", {scale_name: scale_copy * frac},
+                            after=predecessor, placement=scale_place))
+        predecessor = ("scales",)
     merged = {}
     if vector is not None:
-        amount = vector_share + float(area) * float(merges - 1)
+        amount = (vector_share + float(area) * float(merges - 1)) * frac
         if amount > 0:
             merged[vector] = amount
     if merged:
-        # On calibrated Stream-K (arch35/mat_mul_stream_k_kernel.h:213-259), AIV
-        # fixup shards output reduction across all paired AIVs of the active grid.
-        if sharded_aiv:
-            vec_place = {}
-        else:
-            vec_place = _placement(context, index, cores, ("vector",))
+        vec_place = _role_placement_for_units(context, names, cores, units, ("vector",))
         stages.append(Stage("reduce", merged, after=predecessor, placement=vec_place))
         predecessor = ("reduce",)
     store = {}
     if mte3 is not None and mte3_share > 0:
-        store[mte3] = mte3_share
+        store[mte3] = mte3_share * frac
     if hbm is not None and hbm_write_share > 0:
-        store[hbm] = hbm_write_share
+        store[hbm] = hbm_write_share * frac
     if store:
-        if sharded_aiv:
-            st_place = {}
-        else:
-            st_place = _placement(context, index, cores, ("mte3",))
-        stages.append(Stage("final_store", store, after=predecessor, caps=store_caps,
-                            placement=st_place))
+        st_place = _role_placement_for_units(context, names, cores, units, ("mte3",))
+        stages.append(Stage("final_store", store, after=predecessor,
+                            caps=scaled_store_caps, placement=st_place))
     return KernelProgram(tuple(stages))
+
+
+def _tile_merge_program(context, names, tile_m: int, tile_n: int, area: float,
+                        vector_share, mte3_share, hbm_write_share, partial_read,
+                        scale_copy: float, merges: int, read_caps, store_caps,
+                        index: int, cores: int, *,
+                        mem_tier: str | None = None,
+                        vread_role: str | None = None,
+                        vread_name: str | None = None,
+                        scale_role: str | None = None,
+                        scale_name: str | None = None):
+    chosen, m_burst_base, m_burst_cnt, m_burst_tail = _row_burst_partition(
+        context, tile_m=tile_m, tile_n=tile_n, splits=merges,
+        tile_index=index, cores=cores,
+    )
+    common = dict(
+        area=area, vector_share=vector_share, mte3_share=mte3_share,
+        hbm_write_share=hbm_write_share, partial_read=partial_read,
+        scale_copy=scale_copy, merges=merges, read_caps=read_caps,
+        store_caps=store_caps, cores=cores, mem_tier=mem_tier,
+        vread_role=vread_role, vread_name=vread_name,
+        scale_role=scale_role, scale_name=scale_name,
+    )
+    if m_burst_cnt > 1 and m_burst_tail < m_burst_base and len(chosen) > 1:
+        full_rows = float((m_burst_cnt - 1) * m_burst_base)
+        tail_rows = float(m_burst_tail)
+        total_rows = max(1.0, full_rows + tail_rows)
+        return ParallelProgram((
+            _merge_burst_program(
+                context, names, units=chosen[:-1], frac=full_rows / total_rows, **common),
+            _merge_burst_program(
+                context, names, units=(chosen[-1],), frac=tail_rows / total_rows, **common),
+        ))
+    return _merge_burst_program(context, names, units=chosen, frac=1.0, **common)
 
 
 def _record_traffic(record, *, split_count, slices, tasks, partial_bytes,
@@ -651,6 +765,52 @@ def _record_traffic(record, *, split_count, slices, tasks, partial_bytes,
     })
 
 
+def _splitk_task_loads(context, tasks, weights, *, names, hbm, vector, mte3, cube,
+                       total_m, n, k, groups, compute_width, directional_mte1,
+                       recipe=None):
+    """Build per-task load dicts (private A/B operand copies + HBM) and MTE1 dicts."""
+    operand_read = read_role(names)
+    operand_name = names.get(operand_read)
+    epilogue = MatrixEpilogue.from_op(context.op)
+    inputs, weight = epilogue.operands(context.op)
+    has_private_operands = operand_name is not None and (inputs + weight) > 0.0
+    excluded_extra = (
+        names.get("mte1"), names.get("fixpipe"),
+        operand_name if has_private_operands else None,
+    )
+    split_keys = _split_keys(
+        context, hbm, vector, mte3, cube, excluded_extra=excluded_extra)
+    hbm_total = float(context.work.get(hbm, 0)) if hbm is not None else 0.0
+    mte3_total = float(context.work.get(mte3, 0)) if mte3 is not None else 0.0
+    hbm_write = min(hbm_total, mte3_total)
+    hbm_read = max(0.0, hbm_total - hbm_write)
+    loads = [{} for _ in tasks]
+    for key, value in split_keys.items():
+        for index, share in enumerate(_allocate(value, weights)):
+            if share > 0:
+                loads[index][key] = share
+    if hbm is not None and hbm_read > 0:
+        for index, share in enumerate(_allocate(hbm_read, weights)):
+            if share > 0:
+                loads[index][hbm] = loads[index].get(hbm, 0.0) + share
+    mte1_loads = []
+    rec_cm = int(getattr(recipe, "compute_m", 0) or 0) if recipe is not None else 0
+    rec_cn = int(getattr(recipe, "compute_n", 0) or 0) if recipe is not None else 0
+    for index, (_tile_index, tm, tn, _area, k_slice) in enumerate(tasks):
+        k_frac = k_slice / k if k > 0 else 0.0
+        a_copy = inputs * (float(tm) / total_m) * k_frac if total_m > 0 else 0.0
+        b_copy = weight * (float(tn) / (n * float(groups))) * k_frac if n > 0 else 0.0
+        if has_private_operands and (a_copy + b_copy) > 0.0:
+            loads[index][operand_name] = a_copy + b_copy
+        inner_m = math.ceil(int(tm) / rec_cm) if rec_cm > 0 else 1
+        inner_n = math.ceil(int(tn) / rec_cn) if rec_cn > 0 else 1
+        left_l0 = float(inner_n) * max(a_copy, float(tm) * k_slice * compute_width)
+        right_l0 = float(inner_m) * max(b_copy, float(tn) * k_slice * compute_width)
+        mte1_loads.append(operand_transfer(
+            context, left_l0, right_l0, directional=directional_mte1))
+    return loads, mte1_loads, hbm_total, mte3_total, hbm_write, epilogue
+
+
 def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
                    record=None, ws_l2_resident: bool | None = None) -> KernelProgram:
     """Lower one underfilled output grid onto output-tile x K-slice tasks."""
@@ -667,39 +827,47 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
     if cube is None:
         cube = next((key for key in context.work if key.startswith("matrix@")),
                     None)
-    total_m, n, k, areas = _local_geometry(context, recipe, geometry)
+    total_m, n, k, tile_dims = _local_geometry(context, recipe, geometry)
     slices = _k_slices(k, count)
     volume = total_m * n * k
     tasks, weights = [], []
     if volume > 0:
-        for tile_index, area in enumerate(areas):
+        for tile_index, (tm, tn) in enumerate(tile_dims):
+            area = float(tm * tn)
             for k_slice in slices:
-                weight = area * float(k_slice) / volume
-                if weight > 0:
-                    tasks.append((tile_index, area, float(k_slice)))
-                    weights.append(weight)
+                weight_share = area * float(k_slice) / volume
+                if weight_share > 0:
+                    tasks.append((tile_index, tm, tn, area, float(k_slice)))
+                    weights.append(weight_share)
     if not tasks:
         return KernelProgram((Stage("setup", latency=context.setup_ms),),
                              minimum_ms=context.minimum_ms)
     cores = max(1, int(context.core_count))
+    stream_aic = context.stream_owner_units("cube")
     splits = len(slices)
-    split_keys = _split_keys(context, hbm, vector, mte3, cube)
-    hbm_total = float(context.work.get(hbm, 0)) if hbm is not None else 0
-    mte3_total = float(context.work.get(mte3, 0)) if mte3 is not None else 0
-    hbm_write = min(hbm_total, mte3_total)
-    hbm_read = max(0, hbm_total - hbm_write)
-    cube_total = float(context.work.get(cube, 0)) if cube is not None else 0
-    vector_total = (float(context.work.get(vector, 0))
-                    if vector is not None else 0)
-    loads = [{} for _ in tasks]
-    for key, value in split_keys.items():
-        for index, share in enumerate(_allocate(value, weights)):
-            if share > 0:
-                loads[index][key] = share
-    if hbm is not None and hbm_read > 0:
-        for index, share in enumerate(_allocate(hbm_read, weights)):
-            if share > 0:
-                loads[index][hbm] = loads[index].get(hbm, 0) + share
+    pt = getattr(context, "primitive_table", None)
+    compute_fmt = str(dict(context.op.metadata).get("compute_format") or context.op.dtype or "").strip()
+    if not compute_fmt:
+        raise ModelingError("splitk_compute_format_missing")
+    compute_width = float(dtype_bytes(compute_fmt))
+    elem_bytes = int(compute_width)
+    groups = (
+        geometry.groups if geometry is not None
+        else max(1, int(dict(context.op.metadata).get("matrix_groups", 1) or 1))
+    )
+    loads, mte1_loads, hbm_total, mte3_total, hbm_write, epilogue = _splitk_task_loads(
+        context, tasks, weights, names=names, hbm=hbm, vector=vector,
+        mte3=mte3, cube=cube, total_m=total_m, n=n, k=k, groups=groups,
+        compute_width=compute_width,
+        directional_mte1=(pt is not None and directional_mte1_available(context)),
+        recipe=recipe,
+    )
+    scale_role = read_role(names, aiv=0)
+    scale_name = names.get(scale_role)
+    reuse_inputs = bool(getattr(recipe, "reuse_inputs", True))
+    reuse_weights = bool(getattr(recipe, "reuse_weights", True))
+    cube_total = float(context.work.get(cube, 0)) if cube is not None else 0.0
+    vector_total = float(context.work.get(vector, 0)) if vector is not None else 0.0
     cubes = _allocate(cube_total, weights)
     has_partial_sink = hbm is not None or l2_res is not None or fixpipe is not None
     partial_write = (float(FP32_BYTES) * float(splits) * total_m * n
@@ -710,13 +878,7 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
         else (bool(ws_l2_resident) and l2_res is not None)
     )
     mem_tier = l2_res if l2_resident else hbm
-    vector_merge = (float(splits - 1) * total_m * n
-                    if vector is not None else 0)
-    pt = getattr(context, "primitive_table", None)
-    compute_fmt = str(dict(context.op.metadata).get("compute_format") or context.op.dtype or "").strip()
-    if not compute_fmt:
-        raise ModelingError("splitk_compute_format_missing")
-    elem_bytes = int(dtype_bytes(compute_fmt))
+    vector_merge = float(splits - 1) * total_m * n if vector is not None else 0.0
     tile_m_dim = min(total_m, float(recipe.tile_m)) if recipe is not None else total_m
     tile_n_dim = min(n, float(recipe.tile_n)) if recipe is not None else n
     tile_k_dim = int(recipe.tile_k) if recipe is not None else 0
@@ -730,45 +892,63 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
         context, split_caps, total_partial_bytes=partial_write,
         active_tasks=len(tasks), l2_resident=l2_resident)
     merge_read_caps, merge_store_caps = _merge_owner_cap(
-        context, len(areas), total_partial_bytes=partial_write,
+        context, len(tile_dims), total_partial_bytes=partial_write,
         l2_resident=l2_resident)
-    load_roles = tuple(role for role in ("mte1", "mte2_aic", "mte2")
-                       if role in names)
+    load_roles = tuple(role for role in ("mte2_aic", "mte2") if role in names)
+    mte1_roles = ("mte1",) if "mte1" in names else ()
     mma_roles = ("cube",) if "cube" in names else ()
     fixpipe_roles = ("fixpipe",) if "fixpipe" in names else ()
+    l0c_pool = context.pool_names.get("l0c")
 
     def split_program(index: int) -> KernelProgram:
-        _tile_index, area, k_slice = tasks[index]
-        eff_tm = min(tile_m_dim, area / max(1.0, tile_n_dim)) if area > 0.0 else tile_m_dim
-        eff_tn = min(tile_n_dim, area / max(1.0, eff_tm)) if area > 0.0 else tile_n_dim
+        _tile_index, tm, tn, area, k_slice = tasks[index]
+        phys_core = (
+            int(stream_aic[index % len(stream_aic)]) if stream_aic else index % cores
+        )
         load_caps = _split_stage_caps(
             context, split_caps, loads[index], used_cores=used_cores,
-            tile_m=eff_tm, tile_n=eff_tn, k_slice=k_slice,
-            elem_bytes=elem_bytes, cube_key=cube, core_index=index, cores=cores)
+            tile_m=float(tm), tile_n=float(tn), k_slice=k_slice,
+            elem_bytes=elem_bytes, cube_key=cube, core_index=phys_core, cores=cores)
+        l0c_size = float(tm * tn * FP32_BYTES)
+        l0c_alloc = (
+            (Allocation(f"splitk_l0c_{index}", l0c_pool, l0c_size, (phys_core,)),)
+            if (l0c_pool is not None and l0c_size > 0.0) else ()
+        )
         return _build_split_slice_stages(
-            loads[index], cube, cubes[index], fixpipe=fixpipe, mem_tier=mem_tier,
-            area=area, k_slice=k_slice, tile_k=tile_k_dim, load_caps=load_caps,
+            loads[index], mte1_loads[index], cube, cubes[index],
+            fixpipe=fixpipe, mem_tier=mem_tier, area=area,
+            k_slice=k_slice, tile_k=tile_k_dim, load_caps=load_caps,
             write_caps=write_caps,
-            load_place=_placement(context, index, cores, load_roles),
-            mma_place=_placement(context, index, cores, mma_roles),
-            fixpipe_place=_placement(context, index, cores, fixpipe_roles),
-            pipelined=(pt is not None))
+            load_place=_placement(context, phys_core, cores, load_roles),
+            mte1_place=_placement(context, phys_core, cores, mte1_roles),
+            mma_place=_placement(context, phys_core, cores, mma_roles),
+            fixpipe_place=_placement(context, phys_core, cores, fixpipe_roles),
+            l0c_alloc=l0c_alloc, pipelined=(pt is not None))
 
-    tile_areas = [areas[tile] for tile in sorted({task[0] for task in tasks})]
+    unique_tiles = sorted({task[0] for task in tasks})
+    tile_shapes = [tile_dims[tile] for tile in unique_tiles]
+    tile_areas = [float(tm * tn) for tm, tn in tile_shapes]
     tile_weights = [area / (total_m * n) for area in tile_areas]
     vector_shares = _allocate(vector_total, tile_weights)
     mte3_shares = _allocate(mte3_total, tile_weights)
     hbm_shares = _allocate(hbm_write, tile_weights)
 
-    def merge_program(index: int) -> KernelProgram:
+    def merge_program(index: int):
+        tm, tn = tile_shapes[index]
         area = tile_areas[index]
         partial_read = float(FP32_BYTES) * float(splits) * area
+        scale_copy = (
+            epilogue.scales(
+                tm, tn, total_m, n, groups,
+                reuse_inputs=reuse_inputs, reuse_weights=reuse_weights)[0]
+            if (epilogue.row_scale_bytes + epilogue.column_scale_bytes) > 0.0 else 0.0
+        )
         return _tile_merge_program(
-            context, names, area, vector_shares[index], mte3_shares[index],
-            hbm_shares[index], partial_read, splits, merge_read_caps,
+            context, names, tm, tn, area, vector_shares[index], mte3_shares[index],
+            hbm_shares[index], partial_read, scale_copy, splits, merge_read_caps,
             merge_store_caps, index, cores, mem_tier=mem_tier,
             vread_role=vread_role, vread_name=vread_name,
-            merge_tasks=len(tile_areas), used_cores=used_cores)
+            scale_role=scale_role, scale_name=scale_name)
 
     merges = tuple(merge_program(index) for index in range(len(tile_areas)))
     _record_traffic(
