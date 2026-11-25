@@ -179,19 +179,19 @@ class PeerTraffic:
             return (math.fsum(value for index, value in enumerate(self.values)
                               if index != source) / (self.size - 1))
         if self.kind == "two_tier":
-            rpn = int(self.values[0])
-            node_peers = min(rpn, self.size - (source // rpn) * rpn)
-            if len(self.values) == 3 + self.size:
-                if self.direction == "forward":
-                    row_b = self.values[3 + source]
-                    intra = row_b * self.values[1] if node_peers > 1 else 0.0
-                    inter = row_b * self.values[2] if self.size > node_peers else 0.0
-                    return intra + inter
+            if self.direction == "transpose":
                 return math.fsum(
                     self.payload(source, destination)
                     for destination in range(self.size)
                     if destination != source
                 )
+            rpn = int(self.values[0])
+            node_peers = min(rpn, self.size - (source // rpn) * rpn)
+            if len(self.values) == 3 + self.size:
+                row_b = self.values[3 + source]
+                intra = row_b * self.values[1] if node_peers > 1 else 0.0
+                inter = row_b * self.values[2] if self.size > node_peers else 0.0
+                return intra + inter
             intra = self.values[1] if node_peers > 1 else 0.0
             inter = self.values[2] if self.size > node_peers else 0.0
             return intra + inter

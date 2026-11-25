@@ -253,9 +253,10 @@ class FlowPath:
 class TransportRun:
     """Live completion/credit state for one :class:`TransportPlan` start."""
 
-    def __init__(self, plan, completions, stats, started_ms):
+    def __init__(self, plan, completions, stats, started_ms, send_completions=()):
         self.plan = plan
         self.completions = tuple(completions)
+        self.send_completions = tuple(send_completions) if send_completions else tuple(completions)
         self._stats = stats
         self.started_ms = started_ms
 
@@ -506,6 +507,9 @@ class TransportPlan:
         for rank, value in (release_events or {}).items():
             releases[int(rank)] = tuple(value) if isinstance(value, (tuple, list)) else (value,)
         completions = [engine.future(f"{name}:flow{index}:complete") for index in range(len(self.flows))]
+        send_completions = [
+            engine.future(f"{name}:flow{index}:send_complete") for index in range(len(self.flows))
+        ]
         stats = {
             "chunks": 0, "credit_waits": 0,
             "credit_wait_ms": defaultdict(float),
@@ -527,18 +531,21 @@ class TransportPlan:
         service_events = [{} for _ in self.flows]
         release_cursor = defaultdict(int)
         issued = [0] * len(self.flows)
+        hop0_done = [0] * len(self.flows)
         active = [0] * len(self.flows)
         stats["active_chunks"] = 0
         stats["peak_active_chunks"] = 0
         stats["peak_active_by_flow"] = {}
-        window = []
+        window: list[int | None] = []
         for path in self.flows:
+            if not path.chunks:
+                window.append(0)
+                continue
             capacity = self._capacity(path.flow.destination)
             if capacity is None:
-                window.append(max(1, path.hop_count))
+                window.append(None)
             else:
-                largest = min(float(self.chunk_bytes or path.flow.payload_bytes),
-                              float(path.flow.payload_bytes))
+                largest = chunk_size_at(path.flow.payload_bytes, self.chunk_bytes, 0)
                 window.append(max(1, int(float(capacity) // largest + 1e-9)))
 
         def note_residency(destination, now):
@@ -565,6 +572,9 @@ class TransportPlan:
             if completed[flow_index]:
                 return
             completed[flow_index] = True
+            send_event = send_completions[flow_index]
+            if not send_event.done:
+                engine.resolve(send_event)
             event = completions[flow_index]
             if not event.done:
                 engine.resolve(event)
@@ -574,6 +584,8 @@ class TransportPlan:
             arrived_count[flow_index] += 1
             active[flow_index] -= 1
             stats["active_chunks"] -= 1
+            if self.flows[flow_index].hop_count == 0:
+                hop0_done[flow_index] += 1
             schedule_release(prefix, destination, useful, received_event, allocation)
             pump(flow_index)
             if arrived_count[flow_index] == expected[flow_index]:
@@ -611,17 +623,30 @@ class TransportPlan:
             engine.submit(prefix + ":release", after=tuple(after), **release_credit,
                           owner=owner, on_complete=callback)
 
+        def on_hop0_done(flow_index, chunk_index):
+            hop0_done[flow_index] += 1
+            if chunk_index + 1 >= expected[flow_index]:
+                send_event = send_completions[flow_index]
+                if not send_event.done:
+                    engine.resolve(send_event)
+            else:
+                pump(flow_index)
+
         def issue_chunk(flow_index, chunk_index):
             self._issue_chunk(
                 engine, name, owner, flow_index, chunk_index, initial, pools,
-                service_events, expected, active, stats, track_grant, pump,
+                service_events, expected, active, stats, track_grant, on_hop0_done,
                 arrived)
 
         def pump(flow_index):
             if expected[flow_index] == 0:
                 return
-            limit = min(expected[flow_index],
-                        arrived_count[flow_index] + window[flow_index] + 1)
+            flow_window = window[flow_index]
+            if flow_window is None:
+                limit = min(expected[flow_index], hop0_done[flow_index] + 1)
+            else:
+                limit = min(expected[flow_index],
+                            arrived_count[flow_index] + flow_window + 1)
             while issued[flow_index] < limit:
                 chunk_index = issued[flow_index]
                 issued[flow_index] += 1
@@ -637,11 +662,11 @@ class TransportPlan:
                 continue
             pump(flow_index)
 
-        return TransportRun(self, completions, stats, started)
+        return TransportRun(self, completions, stats, started, send_completions)
 
     def _issue_chunk(
         self, engine, name, owner, flow_index, chunk_index, initial, pools,
-        service_events, expected, active, stats, track_grant, pump, arrived,
+        service_events, expected, active, stats, track_grant, on_hop0_done, arrived,
     ):
         from ..engine import Allocation
 
@@ -653,7 +678,7 @@ class TransportPlan:
         previous_services = service_events[flow_index].get(
             chunk_index - 1) if chunk_index else None
         dependencies = [initial[path.flow.source], initial[destination]]
-        if previous_services is not None:
+        if previous_services:
             dependencies.append(previous_services[0])
         allocation = None
         pool = pools.get(destination)
@@ -675,7 +700,7 @@ class TransportPlan:
         chunk_service = [None] * len(chunk.hops)
         for hop_index, hop in enumerate(chunk.hops):
             hop_dependencies = [previous]
-            if previous_services is not None:
+            if previous_services:
                 hop_dependencies.append(previous_services[hop_index])
             startup = float(self.hop_startup_us)
             if chunk_index == 0 and startup:
@@ -696,9 +721,8 @@ class TransportPlan:
                 prefix + f":hop{hop_index}:service", hop.demand,
                 after=tuple(hop_dependencies), owner=owner, coupled=True,
                 on_complete=(
-                    (lambda _event, fi=flow_index: pump(fi))
+                    (lambda _event, fi=flow_index, ci=chunk_index: on_hop0_done(fi, ci))
                     if hop_index == 0
-                    and chunk_index + 1 < expected[flow_index]
                     else None))
             arrival = engine.submit(
                 prefix + f":hop{hop_index}:arrival", after=(service,),
