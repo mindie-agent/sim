@@ -327,3 +327,221 @@ def test_w4a16_offset_residency_glm_mean_collapse_step5_qk_norm_and_dspark_causa
     assert k31.auxiliary.dspark.noncausal_query_block is False
     k3 = load_model("kimi-k3")
     assert k3.auxiliary.dspark.noncausal_query_block is True
+
+
+def test_w2a_checkpoint_cache_abi_and_quant_isa_contracts():
+    """Lock W2a checkpoint geometry, rehydration, MXFP8 PA_NZ pitch, and A2/A3 ISA checks."""
+    import json
+    import math
+    from pathlib import Path
+    from mindie_sim.compose import resolve_case_contracts
+    from mindie_sim.schema.common import ModelingError
+
+    # 1 & 2: Disk HF config preserves 128x128 block and rehydrates quant="checkpoint" cleanly.
+    cfg_path = Path(__file__).resolve().parents[2] / "mindie_sim" / "model_configs" / "deepseek-v4-flash-0731.json"
+    disk_block = tuple(json.loads(cfg_path.read_text(encoding="utf-8"))["quantization_config"]["weight_block_size"])
+    q_default = resolve_case_contracts(compose_case(cfg_path, "a5", tp=1, layers=2))[1]
+    assert dict(q_default.port_abis)[("target", 0, "mla.q_a_proj")].weight_block == disk_block
+    c_explicit = compose_case(cfg_path, "a5", tp=1, layers=2, quant="checkpoint")
+    _, q_explicit, _ = resolve_case_contracts(c_explicit)
+    assert dict(q_explicit.port_abis)[("target", 0, "mla.q_a_proj")].weight_block == disk_block
+
+    # 3: MXFP8 GQA v_scale physical PA_NZ size matches exact_bytes() with zero page overrun.
+    c_mx = compose_case("qwen3.8-27b", "a5", tp=1, layers=4, quant="auto", block_size=32)
+    kv_abi = resolve_case_contracts(c_mx)[1].kv_cache_abi[0]
+    for plane in kv_abi.planes:
+        if plane.plane_kind != "padding":
+            phys = math.prod(plane.physical_shape)
+            assert plane.exact_bytes() == phys
+            assert plane.offset_in_page + phys <= plane.page_pitch
+
+    # 4: A2/A3 reject FP8 output_format overrides while allowing pure-INT checkpoints like GLM-5.1.
+    for hw in ("a2", "a3"):
+        bad_q = {"name": "bf16", "category_overrides": {"attn": {"output_format": "fp8_e4m3"}}}
+        with pytest.raises(ModelingError, match="quant_unsupported_on_hardware"):
+            compose_case("qwen3-32b", hw, tp=1, layers=1, quant=bad_q)
+    glm51_a3 = compose_case("glm-5.1", "a3", tp=4, ep=4, layers=4)
+    assert glm51_a3["model"]["name"] == "glm-5.1"
+
+
+def test_w2a_spine_adapter_provenance_and_profiler_normalizer_contracts():
+    """Lock W2a speculative verification, PD sweep, adapter bindings, provenance, and profiler receipts."""
+    from _support.axes import GEN3_SKU
+    from mindie_sim.backends.abi_registry import default_abi_registry
+    from mindie_sim.compose import resolve_case_contracts
+    from mindie_sim.onboarding import (
+        build_profiler_subgraph_plan,
+        normalize_profiler_records,
+        synthesize_sku_512_400k_plan,
+    )
+    from mindie_sim.onboarding.profiler_normalizer import resolve_point_measured_binding
+    from mindie_sim.prediction.frontend import Frontend
+    from mindie_sim.prediction.results import LoweringRequest, SlaRequest, StepRequest, SweepRequest
+    from mindie_sim.prediction.spine import default_spine
+    from mindie_sim.prediction.structure_groups import source_reference
+    from mindie_sim.schema.stack import IterationSchedulerState
+    from mindie_sim.stacks.vllm_ascend import VllmAscendStackAdapter
+    from mindie_sim.stacks.vllm_ascend.profiles import load_manifest_bindings
+
+    # 5: Speculative decode emits q_len=1, global_q_len=1+K -> attention (4, 132), no 1+2K double-count.
+    c_spec = parse_case(compose_case(
+        "qwen3-32b", "a3", tp=1, layers=1, quant="bf16",
+        graph_capture_mode="none", mtp_proposal_tokens=3, mtp_acceptance_length=1, spec_method="ngram",
+    ))
+    sc_spec = resolve_case_contracts(c_spec)[0]
+    st_spec = IterationSchedulerState(0, ("r",), request_progress=(("r", 128, 0),), max_num_batched_tokens=4)
+    plan_spec = VllmAscendStackAdapter().plan_iteration(c_spec.model, st_spec, sc_spec.stack_options, phase="decode")
+    ops_spec = Frontend()(plan_spec, c_spec.model, c_spec.runtime, c_spec.machine).ops
+    assert next(o.local_shape[:2] for o in ops_spec if o.family == "attention") == (4, 132)
+
+    # 6 & 7: PD sweep keeps feasible Pareto frontier; spine lowers DeepSeek/Kimi/Qwen with scenario_contract.
+    sp = default_spine()
+    c_pd = parse_case(compose_case(
+        "qwen3-32b", "a3", tp=1, layers=1, quant="bf16",
+        prompt_tokens=8, output_tokens=2, concurrency=1, ttft_slo_ms=1000, tpot_slo_ms=1000,
+    ))
+    pd_res = sp.sweep_topology(c_pd, SweepRequest(SlaRequest(StepRequest("decode", context=8), 1000, 1, 2), (2,), "pd"))
+    assert pd_res.evaluated_count >= 1 and len(pd_res.frontier) >= 1
+    req_d = LoweringRequest(step=StepRequest("decode", context=16))
+    for model_name in ("deepseek-v3.2", "kimi-k3.1", "qwen3.5-35b-a3b"):
+        cm = parse_case(compose_case(model_name, "a5", tp=1, layers=4, quant="bf16"))
+        assert len(sp.lower(cm, req_d, scenario_contract=resolve_case_contracts(cm)[0]).graph.executable[0].ops) > 0
+
+    # 8, 9, 10, 11: MLAPO >1024 guard, plain FP8 vs MXFP MegaMoE, gated shared MC2 downgrade, sp/capture forwarding.
+    c_1025 = compose_case(
+        "deepseek-v3", "a5", tp=1, layers=1, quant="bf16",
+        max_num_seqs=1025, max_num_batched_tokens=1025, concurrency=1025,
+    )
+    _, _, l_1025 = resolve_case_contracts(c_1025)
+    assert next(dict(o)["preprocess_mode"] for k, _, o in l_1025.recipe_bindings if k == "mla_prolog") == "prolog_v3"
+    c_fp8 = compose_case("deepseek-v3", "a5", tp=2, ep=2, layers=4, quant="fp8", feature_track="proposed")
+    assert "megamoe_shared_mxfp_a5" not in resolve_case_contracts(c_fp8)[2].lowering_passes
+    c_gated = compose_case("qwen3.5-35b-a3b", "a5", tp=2, ep=2, layers=4, enable_fused_mc2=3)
+    assert next(dict(o)["enable_fused_mc2"] for k, _, o in resolve_case_contracts(c_gated)[2].recipe_bindings if k == "moe_mc2") == 2
+    c_nosp = parse_case(compose_case(
+        "qwen3-32b", "a5", tp=2, sp=False, layers=1, quant="w8a8", feature_track="proposed", graph_capture_mode="none",
+    ))
+    s_nosp, _, l_nosp = resolve_case_contracts(c_nosp)
+    g_nosp = sp.lower(c_nosp, req_d, scenario_contract=s_nosp)
+    assert "mm_reduce_scatter_fusion" not in l_nosp.lowering_passes
+    assert "tp_mc2_overlap" not in g_nosp.case.runtime.lowering_passes
+    assert len(s_nosp.stack_options.capture_rule.full_keys) == 0
+
+    # 12: source_reference returns pinned Python manifest SHA, never an unrelated CANN C++ header SHA.
+    gdn_ref = source_reference("vllm_ascend/ops/gdn.py", "FusedRMSNormGated")
+    pinned = next(b.provenance for b in load_manifest_bindings() if b.provenance.relative_path == "vllm_ascend/ops/gdn.py")
+    hdr = next(e.source_ref for e in default_abi_registry().get_snapshot("A5").entries if e.abi_id == "aclnnChunkGatedDeltaRule")
+    assert gdn_ref["source_sha256"] == pinned.source_sha256 and gdn_ref["source_sha256"] != hdr.source_sha256
+
+    # 13, 14, 15: Indexer probe single_spine parity, canonical sample_id fallback, slowest-rank event attribution.
+    idx_case = resolve_point_measured_binding({"family": "indexer"}, {"axis": "context_len", "value": 512}, sku=GEN3_SKU)["sim_case"]
+    saved_ss = idx_case["runtime"]["metadata"]["single_spine"]
+    _, q_idx, _ = resolve_case_contracts(idx_case)
+    assert saved_ss["index_cache_abi_count"] == len(q_idx.index_cache_abi) == 1
+    assert saved_ss["quant_plan_digest"] == q_idx.plan_digest
+
+    plan_doc = synthesize_sku_512_400k_plan(sku=GEN3_SKU, core_count=20, l2_bytes=100663296).to_dict()
+    sub_plan = build_profiler_subgraph_plan(plan_doc, sku=GEN3_SKU)
+    c0 = sub_plan["cases"][0]
+    obs_sample = {
+        "record_type": "observation", "sample_id": "obs-canonical-1", "case_id": c0["case_id"],
+        "split": c0["split"], "rank": 0, "repeat_index": 0, "duration_ms": 0.125,
+        "timing_mode": "eager", "actual_shape": c0["shape"],
+    }
+    norm_s = normalize_profiler_records([obs_sample], plan_doc=plan_doc, sku=GEN3_SKU)[0][0]
+    assert norm_s["measured_ns"] == 125_000 and norm_s["event_ids"] == ["obs-canonical-1"]
+
+    c_joint = next(c for c in sub_plan["cases"] if c["stage"] == "s1_joint")
+    rows_mr = [
+        {
+            "record_type": "observation", "case_id": c_joint["case_id"], "split": c_joint["split"],
+            "rank": rk, "repeat_index": 0, "duration_ms": rk + 1, "clock_operator": "elapsed_span",
+            "actual_shape": c_joint["shape"], "event_ids": [f"rank{rk}-start", f"rank{rk}-end"],
+        }
+        for rk in c_joint["group_ranks"]
+    ]
+    norm_mr = normalize_profiler_records(rows_mr, plan_doc=plan_doc, sku=GEN3_SKU)[0][0]
+    assert norm_mr["measured_ns"] == 4_000_000 and norm_mr["event_ids"] == ["rank3-start", "rank3-end"]
+
+    # Pass #2 locks: multi-trial median, PD frontier dominance, expert homogeneity, PLE bytes,
+    # layer-scoped WC-MLA, resolved index ABI, Kimi UB preflight, prefill phase, exclude_optimizations, sp=True, layernorm.
+    pt0 = plan_doc["train_points"][0]
+    sh0 = resolve_point_measured_binding(plan_doc, pt0, sku=GEN3_SKU)["expected_shape"]
+    trial_rows = [
+        {
+            "case_id": pt0["point_id"], "record_type": "observation", "split": "train", "rank": 0,
+            "trial": idx, "repeat_index": 0, "run_id": f"run.eager.t{idx}", "sample_id": f"s{idx}",
+            "timing_mode": "eager", "duration_ms": dur, "actual_shape": sh0,
+        }
+        for idx, dur in enumerate((1.0, 2.0, 9.0))
+    ]
+    norm_tr = normalize_profiler_records(trial_rows, plan_doc=plan_doc, sku=GEN3_SKU)[0][0]
+    assert norm_tr["measured_ns"] == 2_000_000 and norm_tr["event_ids"] == ["s1"]
+
+    from mindie_sim.catalog.qwen4_exp import ple_conv_state_bytes
+    from mindie_sim.onboarding.contracts import OperatorCliffParameters, synthesize_operator_cliff_plan
+    from mindie_sim.schema.checkpoint import (
+        CacheQuantRule, CheckpointProvenance, CheckpointQuantMap, TensorPresenceDomain, TensorQuantRule,
+    )
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.stack import ResolvedStackOptions
+    from mindie_sim.stacks.vllm_ascend.quant_policy import instantiate_runtime_quant_plan
+
+    c_pd3 = parse_case(compose_case(
+        "qwen3-32b", "a3", tp=1, layers=1, quant="bf16",
+        prompt_tokens=384, output_tokens=2, concurrency=1, ttft_slo_ms=1000, tpot_slo_ms=1000,
+    ))
+    pd3_res = sp.sweep_topology(c_pd3, SweepRequest(SlaRequest(StepRequest("decode", context=384), 1000, 1, 2), (3,), "pd"))
+    assert [pt.device_count for pt in pd3_res.frontier] == [2, 3]
+
+    c_moe = parse_case(compose_case("qwen3-30b-a3b", "a3", tp=1, layers=1, quant="bf16"))
+    pat = "model.layers.0.mlp.experts.*.down_proj.weight"
+    ck_mix = CheckpointQuantMap(
+        CheckpointProvenance("mixed", "modelslim_description"), native_float_dtype="bf16",
+        rules=(TensorQuantRule(pat, "W8A8_DYNAMIC", TensorPresenceDomain("target", (0,), tuple(range(8)))),
+               TensorQuantRule(pat, "BF16")),
+    )
+    with pytest.raises(ModelingError, match="heterogeneous"):
+        instantiate_runtime_quant_plan(
+            c_moe.model, ck_mix, c_moe.machine, c_moe.runtime.parallel,
+            ResolvedStackOptions("vllm-ascend", "shipping"), role="colocated", phase="decode",
+        )
+
+    c_ple = parse_case(compose_case("qwen3.8-flash-next", "a5", tp=1, layers=4, quant="bf16"))
+    ple_abi = next(a for a in resolve_case_contracts(c_ple)[1].recurrent_state_abi if a.component_role == "ple_conv_state")
+    assert ple_abi.planes[0].exact_bytes() == int(ple_conv_state_bytes(c_ple.model, c_ple.runtime))
+
+    c_v41 = parse_case(compose_case("deepseek-v4.1-flash", "a3", tp=1, layers=4, quant="bf16"))
+    o_v41 = resolve_case_contracts(c_v41)[0].stack_options
+    ck_wc = CheckpointQuantMap(
+        CheckpointProvenance("wc_bf16", "modelslim_description"), native_float_dtype="bf16",
+        cache_rule=CacheQuantRule(kv_tag="int8", layer_scoped_kv=tuple((i, "bf16") for i in range(4))),
+    )
+    q_wc = VllmAscendStackAdapter().resolve_quant_instantiation(
+        c_v41.model, ck_wc, c_v41.machine, c_v41.runtime.parallel, o_v41, role="colocated", phase="decode",
+    )
+    assert len(q_wc.kv_cache_abi) == 5
+
+    c_k31 = parse_case(compose_case("kimi-k3.1", "a5", tp=1, layers=4, quant="bf16"))
+    assert len(sp.lower(c_k31, LoweringRequest(StepRequest("decode", context=2048)),
+                        scenario_contract=resolve_case_contracts(c_k31)[0]).graph.executable[0].ops) == 91
+
+    c_pf = compose_case("deepseek-v3", "a5", tp=1, layers=1, quant="bf16", _stack_phase="prefill")
+    _, q_pf, l_pf = resolve_case_contracts(c_pf)
+    assert q_pf.kv_cache_abi[0].phase == "prefill"
+    assert not any(r == "vllm_ascend_mlapo_decode" for _, r, _ in l_pf.recipe_bindings)
+
+    c_ex = parse_case(compose_case("qwen3-32b", "a5", tp=1, layers=1, quant="w8a8",
+                                   exclude_optimizations=("add_rmsnorm_quant_fusion",)))
+    ops_ex = sp.lower(c_ex, req_d, scenario_contract=resolve_case_contracts(c_ex)[0]).graph.executable[0].ops
+    assert sum(o.family == "add_rmsnorm_quant" for o in ops_ex) == 0
+
+    c_sp = parse_case(compose_case("qwen3.5-35b-a3b", "a5", tp=2, ep=2, sp=True, layers=4, quant="bf16", feature_track="proposed"))
+    ops_sp = sp.lower(c_sp, LoweringRequest(StepRequest("prefill", tokens=64))).graph.executable[0].ops
+    assert sum(o.family in {"all_gather_matmul", "matmul_reduce_scatter"} for o in ops_sp) == 13
+
+    ln_doc = synthesize_operator_cliff_plan(OperatorCliffParameters("layernorm", "layernorm", 16, 20, 100663296), sku=GEN3_SKU).to_dict()
+    ln_pt = next(p for p in ln_doc["heldout_points"] if p["axis"] == "tokens")
+    ln_b = resolve_point_measured_binding(ln_doc, ln_pt, sku=GEN3_SKU)
+    ln_ops = sp.lower(parse_case(ln_b["sim_case"]), LoweringRequest(StepRequest(ln_b["phase"], tokens=ln_pt["value"]))).graph.executable[0].ops
+    assert any(o.family == "layernorm" and o.local_shape == (ln_pt["value"], ln_b["expected_shape"]["width"]) for o in ln_ops)

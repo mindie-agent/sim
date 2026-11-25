@@ -73,9 +73,12 @@ _VALID_SP_SCOPES = frozenset({"body", "draft"})
 
 
 def _arch_key(sku_or_arch: str) -> str:
+    from mindie_sim.compose.inputs import _arch_key as _inputs_arch_key
     from mindie_sim.stacks.vllm_ascend.profiles import normalize_hw_family
 
-    hw = normalize_hw_family(sku_or_arch)
+    hw = _inputs_arch_key(sku_or_arch)
+    if hw not in {"a2", "a3", "a5"}:
+        hw = normalize_hw_family(sku_or_arch)
     if hw not in {"a2", "a3", "a5"}:
         raise ModelingError(f"unsupported_hardware_arch:{sku_or_arch!r}")
     return hw
@@ -106,9 +109,11 @@ def _checkpoint_map_from_dict(raw: Mapping[str, Any]) -> CheckpointQuantMap:
             pattern=str(r["pattern"]),
             raw_tag=str(r["raw_tag"]),
             presence=pres,
-            group_size=tuple(r.get("group_size") or ()),
+            weight_dtype=str(r.get("weight_dtype") or ""),
+            activation_dtype=str(r.get("activation_dtype") or ""),
             scale_dtype=str(r.get("scale_dtype") or ""),
-            offset_dtype=str(r.get("offset_dtype") or ""),
+            group_size=tuple(int(x) for x in (r.get("group_size") or ())),
+            symmetric=r.get("symmetric") if isinstance(r.get("symmetric"), bool) else None,
         ))
     exceptions = tuple(
         LayerQuantException(
@@ -226,7 +231,21 @@ def resolve_case_contracts(
         raise ModelingError("single_spine_checkpoint_inputs_missing")
     checkpoint_map = _rehydrate_checkpoint_from_metadata(ckpt_encoded)
 
-    hw_selector = str(parsed.machine.architecture or parsed.machine.sku or "ascend")
+    from mindie_sim.compose.inputs import _arch_key as _inputs_arch_key
+    from mindie_sim.stacks.vllm_ascend.profiles import hardware_backend_kind, normalize_hw_family
+
+    hw_gen = normalize_hw_family(parsed.machine)
+    if hw_gen not in {"a2", "a3", "a5"} and parsed.machine.sku:
+        hw_gen = _inputs_arch_key(parsed.machine.sku)
+    if hw_gen in {"a2", "a3", "a5"}:
+        hw_selector = hw_gen
+    else:
+        backend_kind = hardware_backend_kind(parsed.machine)
+        raw_arch = str(parsed.machine.arch_family or "").strip()
+        hw_selector = (
+            backend_kind if backend_kind != "generic"
+            else (raw_arch if raw_arch and raw_arch.lower() != "generic" else "generic")
+        )
     adapter = resolve_stack_for_scenario(
         requested_stack=stack_id or None,
         workload_domain=workload_domain,
@@ -474,6 +493,109 @@ def _execution_policy(case: Mapping[str, Any]) -> dict[str, Any]:
     return dict(policy) if isinstance(policy, Mapping) else {}
 
 
+def _resolve_va_mla_prolog_lowering(
+    model_spec: ModelSpec,
+    *,
+    arch: str,
+    arch_upper: str,
+    p_cfg: ParallelSpec,
+    lowering_passes: Sequence[str],
+    registry: Any,
+) -> Any | None:
+    """Resolve M1 MLA prolog v3 binding grounded in ProbedAbiRegistry and operand domain."""
+    from mindie_sim.prediction.operators.mla_prolog import resolve_mla_preprocess_mode
+
+    mla_layers = [
+        p for p in model_spec.layer_plans
+        if p.attention == "mla" and int(p.q_lora_rank or 0) > 0 and p.mla_variant != "latent_mqa"
+    ]
+    if not mla_layers:
+        return None
+    quant = getattr(model_spec, "quant", None)
+    act_dtype = str(getattr(model_spec, "activation_dtype", "") or "bf16").lower()
+    weight_quant = str(
+        getattr(quant, "weight_format", "") if quant is not None else getattr(model_spec, "weight_dtype", act_dtype)
+    ).lower() or act_dtype
+    is_w4a8 = weight_quant == "int4"
+    is_int8_kv = bool(quant is not None and str(getattr(quant, "kv_dtype", "")).lower() == "int8")
+    modes = [
+        resolve_mla_preprocess_mode(
+            arch=arch_upper,
+            phase="decode",
+            num_tokens=1,
+            q_lora_rank=int(plan.q_lora_rank or 0),
+            kv_lora_rank=int(plan.kv_lora_rank or 0),
+            qk_rope_head_dim=int(plan.qk_rope_head_dim or 0),
+            has_rope=(not bool(plan.mla_use_nope)) and int(plan.qk_rope_head_dim or 0) > 0,
+            is_sparse_sfa=bool(plan.indexer),
+            dcp_size=int(p_cfg.cp or 1),
+            pcp_size=int(p_cfg.pcp or 1),
+            enable_mlapo=False,
+            enable_mla_prolog=True,
+            qkv_a_gate_fused=bool(plan.mla_qkv_a_gate_fused or plan.mla_output_gate),
+            is_w4a8=is_w4a8,
+            is_int8_kv=is_int8_kv,
+            has_kv_scale=is_int8_kv,
+            act_dtype=act_dtype,
+            weight_quant=weight_quant,
+            input_size=int(model_spec.hidden_size),
+            num_kv_heads=1,
+            num_q_heads=int(plan.num_heads or model_spec.num_heads),
+            qk_nope_head_dim=int(plan.qk_nope_head_dim or 0),
+            registry=registry,
+        )
+        for plan in mla_layers
+    ]
+    if not (modes and all(m in {"prolog_v3", "prolog_v3_learned_rope_tail"} for m in modes)):
+        return None
+    if quant is None:
+        return None
+    from mindie_sim.catalog.ops import compute_dtype_for
+    from mindie_sim.prediction.operators.mla_prolog.family_mla_prolog import (
+        BF16_CACHE_DTYPES,
+        MLA_PROLOG_QUERY_LORA_RANKS,
+        _indexer_q_category,
+        _prolog_port_formats,
+    )
+    from mindie_sim.prediction.operators.mla_prolog.mla_prolog_packed import (
+        LAYOUT,
+        SUPPORTED_QUERY_FORMATS,
+    )
+
+    packed = arch in {"a3", "a5"} and is_int8_kv
+    w_ports, act_ports = _prolog_port_formats(quant)
+    proj_w, proj_act = w_ports[0], act_ports[0]
+    domain_ok = (
+        len(set(w_ports)) == 1
+        and len(set(act_ports)) == 1
+        and proj_w in {"bf16", "int8", "fp8_e4m3"}
+        and (quant.kv_dtype in BF16_CACHE_DTYPES or packed)
+        and (not packed or (proj_w in SUPPORTED_QUERY_FORMATS and proj_act == proj_w))
+        and all(
+            plan.mla_variant == "latent_mla"
+            and plan.cache_kind == "dense"
+            and plan.qk_rope_head_dim > 0
+            and plan.q_lora_rank in MLA_PROLOG_QUERY_LORA_RANKS
+            and (
+                proj_act == act_dtype
+                or (
+                    "activation_quantization" in lowering_passes
+                    and (
+                        not (plan.indexer or plan.owns_topk or plan.index_query_per_layer)
+                        or compute_dtype_for(quant, _indexer_q_category(quant))[1] == proj_act
+                    )
+                )
+            )
+            for plan in mla_layers
+        )
+    )
+    if not domain_ok:
+        return None
+    if packed:
+        return {"implementation": "vllm_ascend_mla_prolog_v3", "options": {"cache_layout": LAYOUT}}
+    return "vllm_ascend_mla_prolog_v3"
+
+
 def _resolve_va_lowerings(
     model_spec: ModelSpec, parallel: Mapping[str, int], sku: str,
     lowering_passes: tuple[str, ...], *, notes: list[dict[str, Any]],
@@ -539,55 +661,16 @@ def _resolve_va_lowerings(
         }
 
     # M1: 5-branch MLA Prolog predicate grounded in ProbedAbiRegistry (zero ModelingError swallow).
-    mla_layers = [
-        p for p in model_spec.layer_plans
-        if p.attention == "mla" and int(p.q_lora_rank or 0) > 0 and p.mla_variant != "latent_mqa"
-    ]
-    if mla_layers:
-        quant = getattr(model_spec, "quant", None)
-        act_dtype = str(getattr(model_spec, "activation_dtype", "") or "bf16").lower()
-        weight_quant = str(
-            getattr(quant, "weight_format", "") if quant is not None else getattr(model_spec, "weight_dtype", act_dtype)
-        ).lower() or act_dtype
-        is_w4a8 = weight_quant == "int4"
-        is_int8_kv = bool(quant is not None and str(getattr(quant, "kv_dtype", "")).lower() == "int8")
-        modes = [
-            resolve_mla_preprocess_mode(
-                arch=arch_upper,
-                phase="decode",
-                num_tokens=1,
-                q_lora_rank=int(plan.q_lora_rank or 0),
-                kv_lora_rank=int(plan.kv_lora_rank or 0),
-                qk_rope_head_dim=int(plan.qk_rope_head_dim or 0),
-                has_rope=(not bool(plan.mla_use_nope)) and int(plan.qk_rope_head_dim or 0) > 0,
-                is_sparse_sfa=bool(plan.indexer),
-                dcp_size=int(p_cfg.cp or 1),
-                pcp_size=int(p_cfg.pcp or 1),
-                enable_mlapo=False,
-                enable_mla_prolog=True,
-                qkv_a_gate_fused=bool(plan.mla_qkv_a_gate_fused or plan.mla_output_gate),
-                is_w4a8=is_w4a8,
-                is_int8_kv=is_int8_kv,
-                has_kv_scale=is_int8_kv,
-                act_dtype=act_dtype,
-                weight_quant=weight_quant,
-                input_size=int(model_spec.hidden_size),
-                num_kv_heads=1,
-                num_q_heads=int(plan.num_heads or model_spec.num_heads),
-                qk_nope_head_dim=int(plan.qk_nope_head_dim or 0),
-                registry=registry,
-            )
-            for plan in mla_layers
-        ]
-        if modes and all(m in {"prolog_v3", "prolog_v3_learned_rope_tail"} for m in modes):
-            prolog_options: dict[str, Any] = {}
-            if arch in {"a3", "a5"} and is_int8_kv:
-                from mindie_sim.prediction.operators.mla_prolog.mla_prolog_packed import LAYOUT
-                prolog_options["cache_layout"] = LAYOUT
-            lowerings["mla_prolog"] = (
-                {"implementation": "vllm_ascend_mla_prolog_v3", "options": prolog_options}
-                if prolog_options else "vllm_ascend_mla_prolog_v3"
-            )
+    mla_prolog_binding = _resolve_va_mla_prolog_lowering(
+        model_spec,
+        arch=arch,
+        arch_upper=arch_upper,
+        p_cfg=p_cfg,
+        lowering_passes=lowering_passes,
+        registry=registry,
+    )
+    if mla_prolog_binding is not None:
+        lowerings["mla_prolog"] = mla_prolog_binding
 
     normalization = dict(model_spec.catalog_facts).get("normalization", {})
     if (model_spec.activation_dtype == "bf16"

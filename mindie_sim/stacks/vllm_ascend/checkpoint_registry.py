@@ -153,8 +153,6 @@ DEFAULT_CHECKPOINTS_BY_MODEL_HW: dict[tuple[str, str], str] = {
     ("minimax-m3.1-flash", "a3"): "Eco-Tech/MiniMax-M3.1-Flash-w8a8",
     ("minimax-m3.1-flash", "a2"): "Eco-Tech/MiniMax-M3.1-Flash-w8a8",
     ("step-5-preview", "a5"): "Eco-Tech/Step-5-Preview-w8a8-mxfp8",
-    ("step-5-preview", "a3"): "stepfun-ai/Step-5-Preview",
-    ("step-5-preview", "a2"): "stepfun-ai/Step-5-Preview",
     ("gemma-4-31b", "a5"): "Eco-Tech/gemma-4-31B-it-w4a4-mxfp4",
     ("gemma-4-31b", "a3"): "google/gemma-4-31B-it",
     ("gemma-4-31b", "a2"): "google/gemma-4-31B-it",

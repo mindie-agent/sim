@@ -21,6 +21,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import math
 import re
 from typing import Any
 
@@ -530,41 +531,59 @@ def _expert_boundary_ids(checkpoint: CheckpointQuantMap, num_experts: int) -> tu
     count = max(1, int(num_experts or 1))
     if count <= 1:
         return (0,)
+    expert_rules = [r for r in checkpoint.rules if ".experts." in r.pattern]
     presence_domains = [
-        tuple(sorted(set(rule.presence.expert_indices)))
-        for rule in checkpoint.rules
-        if rule.presence is not None and rule.presence.expert_indices
+        tuple(sorted(set(r.presence.expert_indices)))
+        for r in expert_rules
+        if r.presence is not None and r.presence.expert_indices
     ]
+    has_unconstrained_expert_rule = any(
+        r.presence is None or not r.presence.expert_indices for r in expert_rules
+    )
     eff_count = count
-    if presence_domains and len(set(presence_domains)) == 1:
+    if (
+        presence_domains
+        and len(set(presence_domains)) == 1
+        and not has_unconstrained_expert_rule
+    ):
         dom = presence_domains[0]
         if dom[0] == 0 and dom[-1] == len(dom) - 1 and 0 < len(dom) < count:
-            eff_count = len(dom)
+            has_beyond = any(
+                int(m) >= len(dom)
+                for src in (*checkpoint.ignored_modules, *(e.pattern for e in checkpoint.layer_exceptions))
+                for m in _EXPERT_ID_RE.findall(src)
+            ) or any(
+                val >= len(dom)
+                for exc in checkpoint.layer_exceptions
+                for val in exc.expert_indices
+            )
+            if not has_beyond:
+                eff_count = len(dom)
     if eff_count <= _EXPERT_FULL_ENUM_LIMIT:
         return tuple(range(eff_count))
     ids: set[int] = {0, 1, eff_count - 1}
     for exc in checkpoint.layer_exceptions:
         for m in _EXPERT_ID_RE.findall(exc.pattern):
             val = int(m)
-            if 0 <= val < count:
+            if 0 <= val < eff_count:
                 ids.add(val)
         for val in exc.expert_indices:
-            if 0 <= val < count:
+            if 0 <= val < eff_count:
                 ids.add(val)
     for entry in checkpoint.ignored_modules:
         for m in _EXPERT_ID_RE.findall(entry):
             val = int(m)
-            if 0 <= val < count:
+            if 0 <= val < eff_count:
                 ids.add(val)
     for rule in checkpoint.rules:
         for m in _EXPERT_ID_RE.findall(rule.pattern):
             val = int(m)
-            if 0 <= val < count:
+            if 0 <= val < eff_count:
                 ids.add(val)
         pres = rule.presence
         if pres is not None and pres.expert_indices:
-            present = frozenset(pres.expert_indices)
-            if len(present) < eff_count:
+            present = frozenset(v for v in pres.expert_indices if 0 <= v < eff_count)
+            if present and len(present) < eff_count:
                 ids.add(min(present))
                 ids.add(max(present))
                 for missing in range(eff_count):
@@ -1214,12 +1233,28 @@ def _build_mxfp_gqa_cache_abi(
     page_pitch_override: int = 0,
 ) -> CacheStateABI:
     """Build exact ``QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL`` PA_NZ ``CacheStateABI``."""
-    k_bytes = local_heads * kv_block_size * head_dim
+    k_phys = (local_heads, _ceil_div(head_dim, MXFP_KV_NZ_DIM_FRAG), kv_block_size, MXFP_KV_NZ_DIM_FRAG)
+    k_bytes = math.prod(k_phys)
     ks_groups = _ceil_div(head_dim, MXFP_GROUP_SIZE)
-    ks_bytes = local_heads * kv_block_size * ks_groups
-    v_bytes = local_heads * kv_block_size * head_dim
+    ks_phys = (
+        local_heads,
+        _ceil_div(kv_block_size, MXFP_K_SCALE_NZ_TOKEN_FRAG),
+        _ceil_div(head_dim, MXFP_KV_SCALE_GROUP_SIZE),
+        MXFP_K_SCALE_NZ_TOKEN_FRAG,
+        MXFP_KV_SCALE_VALUES_PER_GROUP,
+    )
+    ks_bytes = math.prod(ks_phys)
+    v_phys = k_phys
+    v_bytes = math.prod(v_phys)
     vs_groups = _ceil_div(kv_block_size, MXFP_GROUP_SIZE)
-    vs_bytes = local_heads * head_dim * vs_groups
+    vs_phys = (
+        local_heads,
+        _ceil_div(head_dim, MXFP_V_SCALE_NZ_DIM_FRAG),
+        _ceil_div(kv_block_size, MXFP_KV_SCALE_GROUP_SIZE),
+        MXFP_V_SCALE_NZ_DIM_FRAG,
+        MXFP_KV_SCALE_VALUES_PER_GROUP,
+    )
+    vs_bytes = math.prod(vs_phys)
     payload_bytes = k_bytes + ks_bytes + v_bytes + vs_bytes
     pitch = max(payload_bytes, int(page_pitch_override or payload_bytes))
     pad_bytes = pitch - payload_bytes
@@ -1229,7 +1264,7 @@ def _build_mxfp_gqa_cache_abi(
         plane_kind="payload",
         logical_axes=("head", "token", "dim"),
         logical_shape=(local_heads, kv_block_size, head_dim),
-        physical_shape=(local_heads, _ceil_div(head_dim, MXFP_KV_NZ_DIM_FRAG), kv_block_size, MXFP_KV_NZ_DIM_FRAG),
+        physical_shape=k_phys,
         dtype="fp8_e4m3",
         layout="PA_NZ",
         offset_in_page=0,
@@ -1244,13 +1279,7 @@ def _build_mxfp_gqa_cache_abi(
         plane_kind="scale",
         logical_axes=("head", "token", "group"),
         logical_shape=(local_heads, kv_block_size, ks_groups),
-        physical_shape=(
-            local_heads,
-            _ceil_div(kv_block_size, MXFP_K_SCALE_NZ_TOKEN_FRAG),
-            _ceil_div(head_dim, MXFP_KV_SCALE_GROUP_SIZE),
-            MXFP_K_SCALE_NZ_TOKEN_FRAG,
-            MXFP_KV_SCALE_VALUES_PER_GROUP,
-        ),
+        physical_shape=ks_phys,
         dtype="e8m0",
         layout="PA_NZ",
         group_axes=(2,),
@@ -1268,7 +1297,7 @@ def _build_mxfp_gqa_cache_abi(
         plane_kind="payload",
         logical_axes=("head", "token", "dim"),
         logical_shape=(local_heads, kv_block_size, head_dim),
-        physical_shape=(local_heads, _ceil_div(head_dim, MXFP_KV_NZ_DIM_FRAG), kv_block_size, MXFP_KV_NZ_DIM_FRAG),
+        physical_shape=v_phys,
         dtype="fp8_e4m3",
         layout="PA_NZ",
         offset_in_page=k_bytes + ks_bytes,
@@ -1283,13 +1312,7 @@ def _build_mxfp_gqa_cache_abi(
         plane_kind="scale",
         logical_axes=("head", "dim", "block_group"),
         logical_shape=(local_heads, head_dim, vs_groups),
-        physical_shape=(
-            local_heads,
-            _ceil_div(head_dim, MXFP_V_SCALE_NZ_DIM_FRAG),
-            _ceil_div(kv_block_size, MXFP_KV_SCALE_GROUP_SIZE),
-            MXFP_V_SCALE_NZ_DIM_FRAG,
-            MXFP_KV_SCALE_VALUES_PER_GROUP,
-        ),
+        physical_shape=vs_phys,
         dtype="e8m0",
         layout="PA_NZ",
         group_axes=(1,),
@@ -1659,10 +1682,16 @@ def _build_engram_or_ple_abi(
     checkpoint_digest: str,
     phase: str,
     role: str,
+    speculative_k: int = 0,
 ) -> CacheStateABI:
     if _is_ple_engram(model, plan):
+        engram_spec = model.engram
+        engram_src = dict(getattr(engram_spec, "source", ()) or ()) if engram_spec is not None else {}
+        ple_conv_k = int(engram_src.get("ple_conv_kernel_size", DEFAULT_CONV_KERNEL_SIZE))
+        max_ngram = max(1, int(getattr(engram_spec, "max_ngram", 1) or 1))
+        ple_hist = max(1, (ple_conv_k - 1) * max_ngram) + max(0, int(speculative_k))
+        hc_mult = max((int(getattr(p, "hc_mult", 1) or 1) for p in model.layer_plans), default=1)
         ple_dim = int(model.hidden_size)
-        ple_hist = max(1, int(plan.conv_kernel or DEFAULT_CONV_KERNEL_SIZE) - 1)
         return CacheStateABI(
             scope="target",
             native_layer=native_layer,
@@ -1671,14 +1700,14 @@ def _build_engram_or_ple_abi(
             planes=(CachePlaneABI(
                 plane_id="ple_conv_state",
                 plane_kind="payload",
-                logical_axes=("ple_dim", "history_slot"),
-                logical_shape=(ple_dim, ple_hist),
-                physical_shape=(ple_dim, ple_hist),
+                logical_axes=("history_slot", "hc_mult", "ple_dim"),
+                logical_shape=(ple_hist, hc_mult, ple_dim),
+                physical_shape=(ple_hist, hc_mult, ple_dim),
                 dtype=native_float,
                 layout="ND",
                 allocation_frequency="request_slot",
                 write_trigger="append",
-                bytes_per_unit=ple_dim * ple_hist * int(dtype_bytes(native_float)),
+                bytes_per_unit=ple_hist * hc_mult * ple_dim * int(dtype_bytes(native_float)),
             ),),
             phase=phase,
             deployment_role=role,
@@ -1918,15 +1947,20 @@ def build_cache_state_abis(
     del model_type
     plans = model.layer_plans
     native_float = _normalize_native_float(checkpoint, model)
+    scoped_kv_layers = {int(lid) for lid, _ in checkpoint.cache_rule.layer_scoped_kv}
     has_mla = any(str(p.attention).lower() == "mla" for p in plans)
-    has_wc_mla = any(_is_window_compressed_mla(p) for p in plans)
+    has_unscoped_wc_mla = any(
+        _is_window_compressed_mla(p)
+        and (p.native_layer_id if p.native_layer_id >= 0 else p.index) not in scoped_kv_layers
+        for p in plans
+    )
     kv_mode, kv_scale_dtype, has_faquant, disps = _detect_kv_mode(
         checkpoint,
         hw=hw,
         native_float=native_float,
         effective_opts=effective_opts,
         is_mla=has_mla,
-        is_window_compressed_mla=has_wc_mla,
+        is_window_compressed_mla=has_unscoped_wc_mla,
     )
     kv_block_size = int(effective_opts.get("kv_block_size") or DEFAULT_KV_BLOCK_SIZE)
     ckpt_digest = checkpoint.digest()
@@ -2027,7 +2061,7 @@ def build_cache_state_abis(
             rec_abis.append(_build_engram_or_ple_abi(
                 model, p, native_layer=n_id, native_float=native_float,
                 engram_offload=engram_offload, checkpoint_digest=ckpt_digest,
-                phase=phase, role=role,
+                phase=phase, role=role, speculative_k=speculative_k,
             ))
 
     return tuple(kv_abis), tuple(idx_abis), tuple(rec_abis), tuple(disps), any_faquant, any_mxfp_gqa

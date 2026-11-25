@@ -565,7 +565,13 @@ def test_draft_prolog_boundary_depends_on_cache_contiguity(contiguous):
     raw = compose_case("kimi-k3.1", hardware=SPARSE_OFFLOAD_SKU, tp=8, ep=8, dcp=8, layers=4,
                        quant=quant, mtp_proposal_tokens=5, prompt_tokens=8, output_tokens=2)
     lowerings = raw["runtime"]["kernels"]["lowerings"]
-    target = lowerings["mla_prolog"]
+    # M1: NoPE + fused qkv_a_gate + DCP=8 target MLA stays native_decomposed by default;
+    # bind an explicit packed-C8 target lowering to test the draft contiguity boundary.
+    assert "mla_prolog" not in lowerings
+    target = {
+        "implementation": "vllm_ascend_mla_prolog_v3",
+        "options": {"cache_layout": "packed_int8_bf16_rope_fp32_scale"},
+    }
     cases = [{"domain": {"model_scopes": ["draft"]}, "binding": "vllm_ascend_mla_prolog_v3"}]
     if contiguous:
         raw["model"].setdefault("metadata", {})["draft_cache_representations"] = {

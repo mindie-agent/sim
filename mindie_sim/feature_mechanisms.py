@@ -279,12 +279,19 @@ def _apply_cann_megamoe(rt: dict[str, Any], ctx: MechanismContext) -> None:
         return
     if int(ctx.parallel.get("redundant_experts_per_rank", 0) or 0) > 0:
         return
-    has_latent_or_situ = any(
-        p.ffn == "moe" and (p.expert_latent_size > 0 or p.ffn_activation == "situ")
+    routed_only = any(
+        p.ffn == "moe"
+        and (
+            p.expert_latent_size > 0
+            or p.ffn_activation == "situ"
+            or bool(getattr(p, "shared_expert_gate", False))
+            or int(getattr(p, "num_shared_experts", 0) or 0) <= 0
+        )
         for p in ctx.model.layer_plans
     )
-    default_mode = FUSED_MC2_ROUTED_MODE if has_latent_or_situ else FUSED_MC2_SHARED_MODE
-    level = int(ctx.options.get("enable_fused_mc2", default_mode))
+    default_mode = FUSED_MC2_ROUTED_MODE if routed_only else FUSED_MC2_SHARED_MODE
+    raw_level = int(ctx.options.get("enable_fused_mc2", default_mode))
+    level = min(raw_level, FUSED_MC2_ROUTED_MODE) if routed_only else raw_level
     _update_meta(
         rt,
         moe_comm_mode="dynamic",
@@ -822,6 +829,9 @@ def _mla_prolog_fusion_eligible(ctx: MechanismContext) -> bool:
             plan.mla_variant != "latent_mla"
             or plan.cache_kind != "dense"
             or plan.qk_rope_head_dim <= 0
+            or bool(plan.mla_use_nope)
+            or bool(plan.mla_qkv_a_gate_fused)
+            or bool(plan.mla_output_gate)
             or plan.q_lora_rank not in MLA_PROLOG_QUERY_LORA_RANKS
         ):
             return False
@@ -1185,7 +1195,7 @@ def _compare_pr_ablations(
     compose_kwargs: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     from mindie_sim.compose import compose_case
-    from mindie_sim.prediction.efficiency.network import analyze_network_efficiency
+    from mindie_sim.prediction.efficiency import analyze_network_efficiency
 
     shipping_ms = shipping_ns / NS_PER_MS
     proposed_ms = proposed_ns / NS_PER_MS
@@ -1340,19 +1350,50 @@ def compare_feature_tracks(
 ) -> dict[str, Any]:
     """Compute canonical 4-track comparison (eager -> shipping -> proposed -> target) with integer-ns deltas."""
     from mindie_sim.compose import compose_case
-    from mindie_sim.prediction.efficiency.network import analyze_network_efficiency
+    from mindie_sim.prediction.efficiency import analyze_network_efficiency
 
     cases: dict[str, dict[str, Any]] = {}
     analyses: dict[str, dict[str, Any]] = {}
     step_ns: dict[str, int] = {}
+    base_kwargs = dict(compose_kwargs)
+    ship_case = compose_case(
+        model,
+        hardware=hardware,
+        runtime_stack=runtime_stack,
+        feature_track="shipping",
+        _stack_phase=phase,
+        **base_kwargs,
+    )
+    pinned_kwargs = dict(base_kwargs)
+    if "quant" not in pinned_kwargs:
+        ss_ship = ((ship_case.get("runtime") or {}).get("metadata") or {}).get("single_spine") or {}
+        if ss_ship.get("checkpoint_origin") == "verified_checkpoint_descriptor" and ss_ship.get("checkpoint_id"):
+            pinned_kwargs["quant"] = "auto"
+        elif ship_case.get("model", {}).get("quant") is not None:
+            pinned_kwargs["quant"] = dict(ship_case["model"]["quant"])
+        else:
+            pinned_kwargs["quant"] = "bf16"
+    ship_req = (
+        (((ship_case.get("runtime") or {}).get("metadata") or {}).get("single_spine") or {})
+        .get("contract_inputs", {})
+        .get("requested_options", {})
+    )
+    if isinstance(ship_req, Mapping):
+        for cache_key in ("kv_cache_dtype", "indexer_kv_dtype"):
+            if cache_key not in pinned_kwargs and ship_req.get(cache_key):
+                pinned_kwargs[cache_key] = ship_req[cache_key]
     for track_name in ("eager", "shipping", "proposed", "target"):
-        case_dict = compose_case(
-            model,
-            hardware=hardware,
-            runtime_stack=runtime_stack,
-            feature_track=track_name,
-            _stack_phase=phase,
-            **compose_kwargs,
+        case_dict = (
+            ship_case
+            if track_name == "shipping"
+            else compose_case(
+                model,
+                hardware=hardware,
+                runtime_stack=runtime_stack,
+                feature_track=track_name,
+                _stack_phase=phase,
+                **pinned_kwargs,
+            )
         )
         eff = analyze_network_efficiency(
             case_dict,
@@ -1386,7 +1427,7 @@ def compare_feature_tracks(
             model, hardware, runtime_stack, reports["proposed"],
             ship_ns, prop_ns,
             phase=phase, tokens=tokens, context=context, sequences=sequences,
-            scope=scope, compose_kwargs=compose_kwargs,
+            scope=scope, compose_kwargs=pinned_kwargs,
         )
 
     tol_ns = _ms_to_ns(MONOTONIC_TOLERANCE_MS)
@@ -1482,21 +1523,28 @@ def excluded_lowering_bindings(
 
 @dataclass(frozen=True)
 class RuntimeStackProfile:
-    """Declarative metadata for one serving runtime stack (zero model-name gates)."""
+    """Declarative metadata for one serving runtime stack (zero built-in model-name gates)."""
 
     name: str
     repository: str
     description: str = ""
     bindings: tuple[Any, ...] = ()
+    supported_models: tuple[str, ...] = ()
+    unmerged_pr_models: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "schema": STACK_MANIFEST_SCHEMA,
             "name": self.name,
             "repository": self.repository,
             "description": self.description,
             "bindings": [b.to_dict() if hasattr(b, "to_dict") else dict(b) for b in self.bindings],
         }
+        if self.supported_models:
+            payload["supported_models"] = list(self.supported_models)
+        if self.unmerged_pr_models:
+            payload["unmerged_pr_models"] = list(self.unmerged_pr_models)
+        return payload
 
 
 StackMechanismBinding = ManifestBinding
@@ -1585,11 +1633,19 @@ def load_runtime_stack_manifest(source: str | Path | Mapping[str, Any]) -> Runti
             options=tuple(sorted((str(k), v) for k, v in raw_opts.items())),
             notes=str(item.get("notes") or ""),
         ))
+    supported_models = tuple(
+        str(m).strip() for m in (raw.get("supported_models") or ()) if str(m).strip()
+    )
+    unmerged_pr_models = tuple(
+        str(m).strip() for m in (raw.get("unmerged_pr_models") or ()) if str(m).strip()
+    )
     return RuntimeStackProfile(
         name=str(raw["name"]).strip(),
         repository=str(raw.get("repository") or ""),
         description=str(raw.get("description") or ""),
         bindings=tuple(bindings),
+        supported_models=supported_models,
+        unmerged_pr_models=unmerged_pr_models,
     )
 
 
@@ -1637,6 +1693,31 @@ def _collapse_binding_group(
     return entry
 
 
+def assert_model_supported_by_runtime_stack(
+    stack_profile: RuntimeStackProfile,
+    *,
+    track: str,
+    model_key: str,
+) -> None:
+    """Enforce explicit custom-manifest model support lists on shipping/proposed tracks."""
+    canonical_track = normalize_feature_track(track)
+    if not (stack_profile.supported_models or stack_profile.unmerged_pr_models):
+        return
+    model_id = str(model_key or "").strip()
+    if canonical_track == "shipping" and model_id not in stack_profile.supported_models:
+        raise ModelingError(
+            f"model_not_supported_by_runtime_stack:{stack_profile.name}:{model_id}:shipping"
+        )
+    if (
+        canonical_track == "proposed"
+        and model_id not in stack_profile.supported_models
+        and model_id not in stack_profile.unmerged_pr_models
+    ):
+        raise ModelingError(
+            f"model_not_supported_by_runtime_stack:{stack_profile.name}:{model_id}:proposed"
+        )
+
+
 def resolve_stack_track(
     stack_profile: RuntimeStackProfile,
     *,
@@ -1647,8 +1728,11 @@ def resolve_stack_track(
     exclude_optimizations: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Resolve active mechanisms strictly via canonical ``StackTrack`` & structural predicates."""
-    del model_key
     canonical_track = normalize_feature_track(track)
+    effective_model_key = str(model_key or getattr(ctx.model, "name", "") or "").strip()
+    assert_model_supported_by_runtime_stack(
+        stack_profile, track=canonical_track, model_key=effective_model_key,
+    )
     include_ids = tuple(str(x).strip() for x in optimizations if str(x).strip())
     exclude_ids = frozenset(str(x).strip() for x in exclude_optimizations if str(x).strip())
     for mid in (*include_ids, *exclude_ids):
@@ -1665,7 +1749,14 @@ def resolve_stack_track(
         pp=int(par_raw.get("pp", 1)), ep=int(par_raw.get("ep", 1)),
         cp=int(par_raw.get("cp", par_raw.get("dcp", 1))), pcp=int(par_raw.get("pcp", 1)),
     )
-    capabilities = extract_model_capabilities(ctx.model, arch=ctx.arch, parallel=par_spec)
+    opts_map = ctx.options or {}
+    capabilities = extract_model_capabilities(
+        ctx.model,
+        arch=ctx.arch,
+        parallel=par_spec,
+        speculative_k=int(opts_map.get("speculative_k") or 0),
+        sp_enabled=bool(opts_map.get("sp", False)),
+    )
 
     merged_list: list[ManifestBinding] = []
     pr_list: list[ManifestBinding] = []
@@ -1717,17 +1808,38 @@ def resolve_stack_track(
 
     unimplemented_gaps: list[dict[str, Any]] = []
     if canonical_track == "target":
+        target_opts = {**dict(ctx.options or {}), "allow_extended_activation_abi": True}
+        if "enable_fused_mc2" not in ctx.caller_explicit and target_opts.get("enable_fused_mc2") == 0:
+            target_opts.pop("enable_fused_mc2", None)
+        target_ctx = MechanismContext(
+            model=ctx.model, sku=ctx.sku, arch=ctx.arch, parallel=ctx.parallel,
+            caller_explicit=ctx.caller_explicit, options=target_opts,
+        )
         for mid, mech in MECHANISM_CATALOG.items():
-            if mid in exclude_ids or mid in active_by_id:
+            if mid in exclude_ids:
                 continue
             if phase and mech.phases and phase not in mech.phases:
                 continue
-            if mech.eligible(ctx):
+            if not mech.eligible(target_ctx):
+                continue
+            target_entry_opts: dict[str, Any] = {}
+            if mid == "mhc_boundary_fusion_overlap":
+                target_entry_opts["unbounded_rows"] = True
+            elif mid == "cann_megamoe_fusion":
+                target_entry_opts["allow_extended_activation_abi"] = True
+            if mid in active_by_id:
+                if target_entry_opts:
+                    prev = active_by_id[mid]
+                    active_by_id[mid] = {
+                        **prev,
+                        "options": {**dict(prev.get("options") or {}), **target_entry_opts},
+                    }
+            else:
                 active_by_id[mid] = {
                     "id": mid,
                     "state": "target_gap",
                     "ref": None,
-                    "options": {},
+                    "options": target_entry_opts,
                     "notes": "theoretical_target_gap",
                 }
                 unimplemented_gaps.append({
@@ -1775,12 +1887,24 @@ def apply_resolved_mechanisms(
     base_ctx: MechanismContext,
 ) -> None:
     """Apply every active mechanism in deterministic catalog order."""
+    is_target = str(resolved_track.get("feature_track") or "").strip().lower() == "target"
+    unlock_profile_mc2 = is_target and "enable_fused_mc2" not in base_ctx.caller_explicit
+    if unlock_profile_mc2:
+        meta = dict(runtime_dict.get("metadata") or {})
+        additional = meta.get("additional_config")
+        if isinstance(additional, Mapping) and additional.get("enable_fused_mc2") == 0:
+            cleaned = dict(additional)
+            cleaned.pop("enable_fused_mc2", None)
+            meta["additional_config"] = cleaned
+            runtime_dict["metadata"] = meta
     active = {entry["id"]: entry for entry in resolved_track["active_mechanisms"]}
     for mid, mech in MECHANISM_CATALOG.items():
         entry = active.get(mid)
         if entry is None:
             continue
         opts = {**dict(base_ctx.options or {}), **dict(entry.get("options") or {})}
+        if unlock_profile_mc2 and opts.get("enable_fused_mc2") == 0:
+            opts.pop("enable_fused_mc2", None)
         if entry.get("notes") == "caller_enabled":
             opts["explicit_opt_in"] = True
         ctx = MechanismContext(

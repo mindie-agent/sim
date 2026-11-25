@@ -154,17 +154,24 @@ _STACK_PASS_TO_TRANSFORM_PASSES: dict[str, tuple[str, ...]] = {
 def _map_executable_lowering_passes(
     existing_passes: tuple[str, ...],
     stack_passes: tuple[str, ...],
+    *,
+    excluded: frozenset[str] = frozenset(),
 ) -> tuple[str, ...]:
     from mindie_sim.prediction.transforms import LOWERING_PASSES
 
+    excluded_mapped: set[str] = set(excluded)
+    for ex in excluded:
+        excluded_mapped.update(_STACK_PASS_TO_TRANSFORM_PASSES.get(ex, ()))
     out: list[str] = list(existing_passes)
     for name in stack_passes:
+        if name in excluded:
+            continue
         if name in LOWERING_PASSES:
-            if name not in out:
+            if name not in excluded_mapped and name not in out:
                 out.append(name)
         elif name in _STACK_PASS_TO_TRANSFORM_PASSES:
             for mapped in _STACK_PASS_TO_TRANSFORM_PASSES[name]:
-                if mapped in LOWERING_PASSES and mapped not in out:
+                if mapped in LOWERING_PASSES and mapped not in excluded_mapped and mapped not in out:
                     out.append(mapped)
     return tuple(out)
 
@@ -182,17 +189,51 @@ def _build_injected_base(
         RECIPE_BINDING_ORIGINS_KEY,
         record_binding_origin,
     )
+    from mindie_sim.prediction.program.implementation_registry import IMPLEMENTATIONS
 
     kernels = deepcopy(dict(case.runtime.kernels))
     meta = deepcopy(dict(case.runtime.metadata))
     layouts = deepcopy(dict(case.runtime.tensor_layouts))
     lowerings = dict(kernels.get("lowerings") or {})
+    selector_remap: dict[str, str] = {}
     for selector, recipe_id, opts in stack_lowering_plan.recipe_bindings:
         opts_dict = dict(opts) if opts else {}
-        lowerings[selector] = (
-            {"implementation": recipe_id, "options": opts_dict}
-            if opts_dict else recipe_id
-        )
+        impl = IMPLEMENTATIONS.get(recipe_id)
+        if impl is None:
+            if recipe_id == "vllm_ascend_mlapo_decode":
+                add_cfg = dict(meta.get("additional_config") or {})
+                add_cfg["enable_mlapo"] = True
+                meta["additional_config"] = add_cfg
+            elif recipe_id == "cann_megamoe_fusion" and "enable_fused_mc2" in opts_dict:
+                add_cfg = dict(meta.get("additional_config") or {})
+                add_cfg["enable_fused_mc2"] = int(opts_dict["enable_fused_mc2"])
+                meta["additional_config"] = add_cfg
+            continue
+        if selector in impl.blocks or selector in impl.operators:
+            canon_selector = selector
+        elif impl.blocks:
+            canon_selector = impl.blocks[0]
+        elif impl.operators:
+            canon_selector = impl.operators[0]
+        else:
+            continue
+        selector_remap[selector] = canon_selector
+        filtered_opts = {k: v for k, v in opts_dict.items() if k in impl.options}
+        existing = lowerings.get(canon_selector)
+        if isinstance(existing, Mapping) and "cases" in existing:
+            continue
+        if isinstance(existing, Mapping) and existing.get("implementation") == recipe_id:
+            merged_opts = dict(existing.get("options") or {})
+            merged_opts.update(filtered_opts)
+            lowerings[canon_selector] = (
+                {"implementation": recipe_id, "options": merged_opts}
+                if merged_opts else recipe_id
+            )
+        else:
+            lowerings[canon_selector] = (
+                {"implementation": recipe_id, "options": filtered_opts}
+                if filtered_opts else recipe_id
+            )
     if lowerings:
         kernels["lowerings"] = lowerings
     for scope_key, role_key, layout_name in stack_lowering_plan.tensor_layouts:
@@ -209,7 +250,7 @@ def _build_injected_base(
         if "." in key:
             section, name = key.split(".", 1)
         else:
-            section, name = "lowerings", key
+            section, name = "lowerings", selector_remap.get(key, key)
         meta = record_binding_origin(meta, section, name, origin)
 
     rt_updates: dict[str, Any] = {
@@ -217,9 +258,21 @@ def _build_injected_base(
         "tensor_layouts": layouts,
     }
     if stack_lowering_plan.lowering_passes:
+        ss_meta = meta.get("single_spine")
+        ci_meta = ss_meta.get("contract_inputs") if isinstance(ss_meta, Mapping) else None
+        req_ci = ci_meta.get("requested_options") if isinstance(ci_meta, Mapping) else None
+        excluded_opt = frozenset(
+            str(x).strip()
+            for x in (
+                (req_ci.get("exclude_optimizations") if isinstance(req_ci, Mapping) else None)
+                or ()
+            )
+            if str(x).strip()
+        )
         exec_passes = _map_executable_lowering_passes(
             tuple(case.runtime.lowering_passes),
             tuple(stack_lowering_plan.lowering_passes),
+            excluded=excluded_opt,
         )
         if exec_passes:
             rt_updates["lowering_passes"] = exec_passes
@@ -924,28 +977,51 @@ class PredictionSpine:
                     raw_span = row.get("effective_tpot_ms")
                     if raw_span is None:
                         raw_span = row.get("decode_step_ms", 0.0)
+                    span_val = float(raw_span or 0.0)
                     tps = float(row.get("sustainable_tps", 0.0) or 0.0)
-                    used = int(row.get("used_dies", budget))
+                    used = max(1, int(row.get("used_dies", budget) or budget))
                     combined_rows.append({
                         **dict(row),
                         "num_devices": used,
-                        "step_ms_feasible": float(raw_span or 0.0),
+                        "step_ms_feasible": span_val,
+                        "step_ms_at_b1": float(row.get("step_ms_at_b1") or span_val),
                         "tps_feasible": tps,
+                        "tps_per_die": float(row.get("tps_per_die") or (tps / used)),
+                        "total_feasible_concurrency": int(
+                            row.get("total_feasible_concurrency")
+                            or row.get("max_concurrency")
+                            or row.get("decode_concurrency")
+                            or 1
+                        ),
                         "feasible": bool(row.get("feasible", True)),
                         "_budget": budget,
                     })
-            if combined_rows:
-                compute_pareto_frontier(combined_rows)
-            frontier: list[TopologyPoint] = []
+            best_by_dies: dict[int, dict[str, Any]] = {}
             for row in combined_rows:
-                if not row.get("pareto_optimal"):
+                if not row.get("feasible", True):
                     continue
+                used_d = int(row["num_devices"])
+                prev = best_by_dies.get(used_d)
+                if prev is None or (
+                    float(row["tps_feasible"]), -float(row["step_ms_feasible"])
+                ) > (
+                    float(prev["tps_feasible"]), -float(prev["step_ms_feasible"])
+                ):
+                    best_by_dies[used_d] = row
+            frontier: list[TopologyPoint] = []
+            best_tps = -1.0
+            for used_d in sorted(best_by_dies):
+                row = best_by_dies[used_d]
+                tps_val = float(row["tps_feasible"])
+                if tps_val <= best_tps:
+                    continue
+                best_tps = tps_val
                 frontier.append(TopologyPoint(
-                    device_count=int(row["num_devices"]),
+                    device_count=used_d,
                     parallel=(("prefill_dies", int(row.get("prefill_dies", 0))),),
                     decode_parallel=(("decode_dies", int(row.get("decode_dies", 0))),),
                     span_ms=float(row["step_ms_feasible"]),
-                    throughput_tokens_s=float(row["tps_feasible"]),
+                    throughput_tokens_s=tps_val,
                     fits_memory=True,
                 ))
             return TopologySweepResult(evaluated_count=total_evaluated, frontier=tuple(frontier))

@@ -215,6 +215,7 @@
       "capability_predicates": [
         "has_mla",
         "qk_rope_head_dim > 0",
+        "not mla_use_nope",
         "not mla_qkv_a_gate_fused"
       ],
       "phase_scope": [

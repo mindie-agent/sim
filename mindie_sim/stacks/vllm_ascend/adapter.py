@@ -116,6 +116,10 @@ MSO_AUX_AIC_DIVISOR = 4
 MSO_AUX_AIV_DIVISOR = 4
 MIN_STREAM_CORES = 1
 NS_PER_US = 1000.0
+_QLI_NATIVE_HEAD_DIM = 128
+_QLI_NATIVE_HEADS = 64
+_QLI_NATIVE_TOPK_MAX = 2048
+_QLI_NATIVE_COMPRESS_MAX = 128
 
 _ALL_FRAMEWORK_REWRITES: tuple[FrameworkRewriteKind, ...] = (
     "merge_sibling_projections",
@@ -607,12 +611,162 @@ def _mla_quant_facts(
     return act_dtype, weight_quant, is_w4a8, is_int8_kv, has_kv_scale
 
 
-def _index_cache_dtype(quant_plan: RuntimeQuantPlan) -> str:
+def _index_cache_dtypes(quant_plan: RuntimeQuantPlan) -> tuple[str, str]:
+    """Return ``(payload_dtype, scale_dtype)`` from resolved ``index_cache_abi``."""
     for idx_abi in quant_plan.index_cache_abi:
+        payload_dt = ""
+        scale_dt = ""
         for plane in idx_abi.planes:
-            if plane.plane_kind == "payload":
-                return str(plane.dtype).lower()
-    return "bf16"
+            if plane.plane_kind == "payload" and not payload_dt:
+                payload_dt = str(plane.dtype).strip().lower()
+            elif plane.plane_kind == "scale" and not scale_dt:
+                scale_dt = str(plane.dtype).strip().lower()
+        if payload_dt:
+            return payload_dt, scale_dt
+    return "", ""
+
+
+def _bf16_lightning_indexer_fits_ub(
+    model: ModelSpec,
+    hardware: Hardware,
+    idx_plans: Sequence[Any],
+    eff_opts: Mapping[str, Any],
+) -> bool:
+    """Verify BF16 LightningIndexerV2 fits UB/L1 at reachable decode row counts."""
+    if str(model.activation_dtype or "").strip().lower() not in {"bf16", "bfloat16"}:
+        return False
+    if any(int(p.index_heads or 0) < 1 or int(p.index_dim or 0) < 1 for p in idx_plans):
+        return False
+    from mindie_sim.prediction.mechanism import Geometry
+    from mindie_sim.prediction.operators.sparse_indexer import bf16_lightning as li
+
+    worst = max(idx_plans, key=lambda p: (int(p.index_heads or 0), int(p.index_topk or 0), int(p.index_dim or 0)))
+    geometry = Geometry.from_devices(
+        hardware.dies,
+        links=hardware.links,
+        transfer_channels=hardware.transfer_channels,
+    )
+    recipe = li.recipes()[li.RECIPE]
+    page = max(1, int(eff_opts.get("kv_block_size") or DEFAULT_KV_BLOCK_SIZE))
+    topk = max(1, int(worst.index_topk or 1))
+    compression = max(1, int(worst.compress_ratio or 1))
+    max_rows = max(1, int(eff_opts.get("max_num_seqs") or 1))
+    probe_rows = (1,) if max_rows == 1 else (1, max_rows)
+    for rows in probe_rows:
+        context = max(page, topk * compression + rows)
+        try:
+            op = li.make_op(
+                query_rows=rows, context=context,
+                heads=int(worst.index_heads), head_dim=int(worst.index_dim),
+                topk=topk, compression=compression, page_size=page,
+                kv_heads=1, query_dtype="bf16", cache_dtype="bf16",
+                weight_dtype="fp32", phase="decode",
+            )
+            recipe.build(op, geometry)
+        except ModelingError:
+            return False
+    return True
+
+
+def _select_mla_prolog_binding(
+    model: ModelSpec,
+    *,
+    hw: str,
+    hw_upper: str,
+    phase: str,
+    parallel: ParallelSpec,
+    quant_plan: RuntimeQuantPlan,
+    eff_opts: Mapping[str, Any],
+    registry: Any,
+) -> tuple[str, str, tuple[tuple[str, Any], ...]] | None:
+    """Resolve M1 MLA prolog / MLAPO recipe binding grounded in ``ProbedAbiRegistry``."""
+    mla_plan = next((p for p in model.layer_plans if str(p.attention).lower() == "mla"), None)
+    if mla_plan is None:
+        return None
+    mla_nid = mla_plan.native_layer_id if mla_plan.native_layer_id >= 0 else mla_plan.index
+    act_dtype, weight_quant, is_w4a8, is_int8_kv, has_kv_scale = _mla_quant_facts(
+        model, quant_plan, mla_nid,
+    )
+    eff_seqs = max(1, int(eff_opts.get("max_num_seqs") or 1))
+    eff_spec_k = max(0, int(eff_opts.get("speculative_k") or 0))
+    est_tokens = eff_seqs * (1 + eff_spec_k)
+    max_batched = int(eff_opts.get("max_num_batched_tokens") or 0)
+    if max_batched > 0:
+        est_tokens = min(est_tokens, max_batched)
+    mla_mode = resolve_mla_preprocess_mode(
+        arch=hw_upper,
+        phase=phase,
+        num_tokens=max(1, est_tokens),
+        q_lora_rank=int(mla_plan.q_lora_rank or 0),
+        kv_lora_rank=int(mla_plan.kv_lora_rank or 0),
+        qk_rope_head_dim=int(mla_plan.qk_rope_head_dim or 0),
+        has_rope=(not bool(mla_plan.mla_use_nope)) and int(mla_plan.qk_rope_head_dim or 0) > 0,
+        is_sparse_sfa=bool(mla_plan.indexer),
+        dcp_size=int(parallel.cp or 1),
+        pcp_size=int(parallel.pcp or 1),
+        enable_mlapo=bool(eff_opts.get("mlapo", False)),
+        enable_mla_prolog=True,
+        qkv_a_gate_fused=bool(mla_plan.mla_qkv_a_gate_fused or mla_plan.mla_output_gate),
+        is_w4a8=is_w4a8,
+        is_int8_kv=is_int8_kv,
+        has_kv_scale=has_kv_scale,
+        has_learned_rope_tail=bool(
+            str(mla_plan.mla_variant or "").lower() == "latent_mqa"
+            and int(mla_plan.qk_rope_head_dim or 0) > 0
+        ),
+        act_dtype=act_dtype,
+        weight_quant=weight_quant,
+        input_size=int(model.hidden_size),
+        num_kv_heads=1,
+        num_q_heads=int(mla_plan.num_heads or model.num_heads),
+        qk_nope_head_dim=int(mla_plan.qk_nope_head_dim or 0),
+        registry=registry,
+    )
+    if mla_mode in {"prolog_v3", "prolog_v3_learned_rope_tail"}:
+        return ("mla_prolog", "vllm_ascend_mla_prolog_v3", (("arch", hw), ("preprocess_mode", mla_mode)))
+    if mla_mode == "mlapo":
+        return ("mla_prolog", "vllm_ascend_mlapo_decode", (("arch", hw), ("preprocess_mode", mla_mode)))
+    return None
+
+
+def _select_indexer_binding(
+    model: ModelSpec,
+    *,
+    hardware: Hardware,
+    parallel: ParallelSpec,
+    quant_plan: RuntimeQuantPlan,
+    eff_opts: Mapping[str, Any],
+) -> tuple[str, str, tuple[tuple[str, Any], ...]] | None:
+    """Resolve INT8/BF16 LightningIndexerV2 binding strictly within declared operator domains."""
+    idx_plans = [p for p in model.layer_plans if p.indexer and int(p.index_kpool or 1) == 1]
+    if not idx_plans:
+        return None
+    abi_idx_dtype, abi_idx_scale = _index_cache_dtypes(quant_plan)
+    q_idx = getattr(model, "quant", None)
+    idx_dtype = abi_idx_dtype or str(getattr(q_idx, "index_dtype", "") or "bf16").strip().lower()
+    idx_scale = abi_idx_scale or str(getattr(q_idx, "index_scale_dtype", "") or "").strip().lower()
+    if (
+        idx_dtype == "int8"
+        and idx_scale == "fp16"
+        and int(parallel.cp or 1) == 1
+        and all(
+            not p.candidate_filter
+            and int(p.index_dim or 0) == _QLI_NATIVE_HEAD_DIM
+            and int(p.index_heads or 0) == _QLI_NATIVE_HEADS
+            and 1 <= int(p.index_topk or 0) <= _QLI_NATIVE_TOPK_MAX
+            and 1 <= int(p.compress_ratio or 0) <= _QLI_NATIVE_COMPRESS_MAX
+            and (int(p.compress_ratio or 0) & (int(p.compress_ratio or 0) - 1)) == 0
+            for p in idx_plans
+        )
+    ):
+        return ("quant_lightning_indexer", "cann_quant_lightning_indexer_v2_complete", ())
+    if (
+        idx_dtype in {"bf16", "bfloat16"}
+        and all(not p.candidate_filter for p in idx_plans)
+        and _bf16_lightning_indexer_fits_ub(model, hardware, idx_plans, eff_opts)
+    ):
+        return ("lightning_indexer", "cann_bf16_lightning_indexer_v2_complete", ())
+    return None
 
 
 def _select_recipe_bindings(
@@ -620,6 +774,7 @@ def _select_recipe_bindings(
     *,
     track: StackTrack,
     hw: str,
+    hardware: Hardware,
     parallel: ParallelSpec,
     quant_plan: RuntimeQuantPlan,
     eff_opts: Mapping[str, Any],
@@ -633,9 +788,16 @@ def _select_recipe_bindings(
     """Select ABI-grounded recipe bindings & manifest lowering passes purely structurally."""
     spec_k = int(eff_opts.get("speculative_k") or 0)
     sp_enabled = bool(eff_opts.get("sp", True))
-    manifest_hits = resolve_manifest_bindings(
+    excluded = frozenset(
+        str(x).strip() for x in (eff_opts.get("exclude_optimizations") or ()) if str(x).strip()
+    )
+    raw_hits = resolve_manifest_bindings(
         track, model, hw, phase=phase, parallel=parallel,
         quant_plan=quant_plan, speculative_k=spec_k, sp_enabled=sp_enabled,
+    )
+    manifest_hits = tuple(
+        b for b in raw_hits
+        if b.mechanism_id not in excluded and b.lowering_pass_id not in excluded
     )
     registry = default_abi_registry()
     hw_upper = hw.upper()
@@ -655,79 +817,50 @@ def _select_recipe_bindings(
             passes.append(b.lowering_pass_id)
 
     if "mla" in attns and track != "eager":
-        mla_plan = next((p for p in model.layer_plans if str(p.attention).lower() == "mla"), None)
-        if mla_plan is not None:
-            mla_nid = mla_plan.native_layer_id if mla_plan.native_layer_id >= 0 else mla_plan.index
-            act_dtype, weight_quant, is_w4a8, is_int8_kv, has_kv_scale = _mla_quant_facts(
-                model, quant_plan, mla_nid,
-            )
-            mla_mode = resolve_mla_preprocess_mode(
-                arch=hw_upper,
-                phase=phase,
-                num_tokens=1,
-                q_lora_rank=int(mla_plan.q_lora_rank or 0),
-                kv_lora_rank=int(mla_plan.kv_lora_rank or 0),
-                qk_rope_head_dim=int(mla_plan.qk_rope_head_dim or 0),
-                has_rope=(not bool(mla_plan.mla_use_nope)) and int(mla_plan.qk_rope_head_dim or 0) > 0,
-                is_sparse_sfa=bool(mla_plan.indexer),
-                dcp_size=int(parallel.cp or 1),
-                pcp_size=int(parallel.pcp or 1),
-                enable_mlapo=bool(eff_opts.get("mlapo", False)),
-                enable_mla_prolog=True,
-                qkv_a_gate_fused=bool(mla_plan.mla_qkv_a_gate_fused or mla_plan.mla_output_gate),
-                is_w4a8=is_w4a8,
-                is_int8_kv=is_int8_kv,
-                has_kv_scale=has_kv_scale,
-                has_learned_rope_tail=bool(
-                    str(mla_plan.mla_variant or "").lower() == "latent_mqa"
-                    and int(mla_plan.qk_rope_head_dim or 0) > 0
-                ),
-                act_dtype=act_dtype,
-                weight_quant=weight_quant,
-                input_size=int(model.hidden_size),
-                num_kv_heads=1,
-                num_q_heads=int(mla_plan.num_heads or model.num_heads),
-                qk_nope_head_dim=int(mla_plan.qk_nope_head_dim or 0),
-                registry=registry,
-            )
-            if mla_mode in {"prolog_v3", "prolog_v3_learned_rope_tail"}:
-                bindings.append(("mla_prolog", "vllm_ascend_mla_prolog_v3", (("arch", hw), ("preprocess_mode", mla_mode))))
-                origins.append(("mla_prolog", "stack_profile"))
-            elif mla_mode == "mlapo":
-                bindings.append(("mla_prolog", "vllm_ascend_mlapo_decode", (("arch", hw), ("preprocess_mode", mla_mode))))
-                origins.append(("mla_prolog", "stack_profile"))
+        mla_binding = _select_mla_prolog_binding(
+            model, hw=hw, hw_upper=hw_upper, phase=phase, parallel=parallel,
+            quant_plan=quant_plan, eff_opts=eff_opts, registry=registry,
+        )
+        if mla_binding is not None:
+            bindings.append(mla_binding)
+            origins.append((mla_binding[0], "stack_profile"))
 
     if "kda" in attns and track != "eager":
         rec_id = "vllm_ascend_recurrent_kda_arch35" if hw == "a5" else "vllm_ascend_recurrent_kda_arch22"
-        bindings.append(("kda_recurrent", rec_id, (("arch", hw),)))
-        bindings.append(("kda_proj", "vllm_ascend_kda_mixed_projection", ()))
-        origins.append(("kda_recurrent", "stack_profile"))
-        origins.append(("kda_proj", "stack_profile"))
+        bindings.append(("kda", rec_id, ()))
+        origins.append(("kda", "stack_profile"))
+        kda_qkv_quantized = any(
+            role in {"q_proj", "k_proj", "v_proj"}
+            and abi.linear_method != "dense"
+            and str(abi.input_dtype or "").lower() not in {"", "bf16", "fp16", "fp32"}
+            for (_sc, _lid, role), abi in quant_plan.port_abis
+        )
+        if kda_qkv_quantized:
+            bindings.append(("kda_input_projection", "vllm_ascend_kda_mixed_projection", ()))
+            origins.append(("kda_input_projection", "stack_profile"))
 
     if "gdn" in attns and track != "eager":
-        bindings.append(("gdn_decode", "vllm_ascend_gdn_decode", (("arch", hw),)))
+        bindings.append(("gdn_decode", "vllm_ascend_gdn_decode", ()))
         origins.append(("gdn_decode", "stack_profile"))
         if hw == "a5":
             bindings.append(("gdn_prefill", "gdn_prefill_arch35", ()))
             origins.append(("gdn_prefill", "stack_profile"))
 
     if has_idx and track != "eager":
-        idx_dtype = _index_cache_dtype(quant_plan)
-        idx_recipe = (
-            "cann_quant_lightning_indexer_v2_complete"
-            if idx_dtype in {"int8", "fp8_e4m3"}
-            else "cann_bf16_lightning_indexer_v2_complete"
+        idx_binding = _select_indexer_binding(
+            model, hardware=hardware, parallel=parallel, quant_plan=quant_plan, eff_opts=eff_opts,
         )
-        bindings.append(("indexer", idx_recipe, (("arch", hw), ("index_dtype", idx_dtype))))
-        origins.append(("indexer", "stack_profile"))
+        if idx_binding is not None:
+            bindings.append(idx_binding)
+            origins.append((idx_binding[0], "stack_profile"))
 
     if has_kpool and track != "eager":
-        bindings.append(("index_kpool", "vllm_ascend_cann_keypool_caller", ()))
-        origins.append(("index_kpool", "stack_profile"))
+        bindings.append(("pool_key_indexer", "vllm_ascend_cann_keypool_caller", ()))
+        origins.append(("pool_key_indexer", "stack_profile"))
 
     if has_attn_res and track != "eager" and registry.is_shipping_available("AttnResFwd", hw_upper):
-        bindings.append(("attn_res", "vllm_ascend_attn_res_prefix", (("arch", hw),)))
-        origins.append(("attn_res", "stack_profile"))
+        bindings.append(("attention_residual", "vllm_ascend_attn_res_prefix", ()))
+        origins.append(("attention_residual", "stack_profile"))
 
     if has_moe and track != "eager" and int(eff_opts.get("enable_fused_mc2") or 0) > FUSED_MC2_DISABLED:
         mc2_lvl = int(eff_opts["enable_fused_mc2"])
@@ -917,10 +1050,16 @@ class VllmAscendStackAdapter:
         effective_mechanisms: list[tuple[str, Any]] = [
             ("optimization_mode", opt_mode),
             ("role", role_norm),
+            ("phase", str(requested_options.get("phase") or "").strip().lower()),
+            ("exclude_optimizations", tuple(sorted(
+                str(x).strip() for x in (requested_options.get("exclude_optimizations") or ()) if str(x).strip()
+            ))),
             ("include_proposed_pr", bool(requested_options.get("include_proposed_pr", track in {"proposed", "target"}))),
             ("kv_cache_dtype", eff_kv),
             ("indexer_kv_dtype", str(requested_options.get("indexer_kv_dtype") or tut_flags.get("indexer_kv_dtype") or "")),
             ("kv_block_size", int(requested_options.get("kv_block_size") or profile_cfg.get("kv_block_size") or DEFAULT_KV_BLOCK_SIZE)),
+            ("max_num_seqs", int(requested_options.get("max_num_seqs") or DEFAULT_MAX_NUM_SEQS)),
+            ("max_num_batched_tokens", int(requested_options.get("max_num_batched_tokens") or 0)),
             ("sp", sp_enabled),
             ("mlapo", bool(requested_options.get("mlapo", profile_cfg.get("mlapo", False)))),
             ("enable_fused_mc2", eff_mc2),
@@ -994,7 +1133,20 @@ class VllmAscendStackAdapter:
             raise ModelingError(f"optimization_mode_invalid:{opt_mode_raw!r}")
         opt_mode: StackOptimizationMode = opt_mode_raw  # type: ignore[assignment]
         role_norm = str(eff.get("role") or "colocated").strip().lower()
-        phase_hint = "prefill" if role_norm == "pd_prefill" else "decode"
+        explicit_phase = str(eff.get("phase") or "").strip().lower()
+        if explicit_phase in {"prefill", "decode", "mixed"}:
+            phase_hint = explicit_phase
+        else:
+            abi_phases = (
+                *(a.phase for a in quant_plan.kv_cache_abi[:1]),
+                *(a.phase for a in quant_plan.recurrent_state_abi[:1]),
+                *(a.phase for a in quant_plan.index_cache_abi[:1]),
+            )
+            abi_phase = next((str(p).strip().lower() for p in abi_phases if str(p).strip()), "")
+            phase_hint = (
+                abi_phase if abi_phase in {"prefill", "decode", "mixed"}
+                else ("prefill" if role_norm == "pd_prefill" else "decode")
+            )
 
         # Strict canonical StackTrack gate (C-1 / S2-W2-01): synthesis unlocks ONLY on target+modeling.
         allows_target_synthesis = (options.track == "target" and opt_mode == "modeling")
@@ -1011,7 +1163,7 @@ class VllmAscendStackAdapter:
             allowed_fw = ()
 
         recipe_bindings, lowering_passes, binding_origins, manifest_hits = _select_recipe_bindings(
-            model, track=options.track, hw=hw, parallel=parallel,
+            model, track=options.track, hw=hw, hardware=hardware, parallel=parallel,
             quant_plan=quant_plan, eff_opts=eff, phase=phase_hint,
         )
         track_spec = StackTrackSpec(
@@ -1167,7 +1319,7 @@ class VllmAscendStackAdapter:
                     draft_verify=(spec_k > 0),
                     draft_prepare=(spec_k > 0),
                     draft_proposal_tokens=spec_k,
-                    global_q_len=1,
+                    global_q_len=verify_stride,
                 ))
                 used_tokens += verify_stride
                 statuses.append((rid, "running_decode"))

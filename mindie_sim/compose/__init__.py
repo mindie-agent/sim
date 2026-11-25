@@ -1119,7 +1119,13 @@ def _resolve_single_spine_contracts(
             "num_speculative_tokens": int(mtp_tokens),
             "speculative_k": int(mtp_tokens),
             "optimization_mode": "modeling" if canonical_track == "target" else "simulation",
+            "phase": eff_phase,
         })
+        excl_opts = tuple(sorted(
+            str(x).strip() for x in (stack_options.get("exclude_optimizations") or ()) if str(x).strip()
+        ))
+        if excl_opts:
+            req_opts["exclude_optimizations"] = excl_opts
         kv_dtype = model_options.get("kv_cache_dtype") or getattr(model_spec, "kv_dtype", None)
         if kv_dtype:
             req_opts["kv_cache_dtype"] = str(kv_dtype)
@@ -1131,6 +1137,18 @@ def _resolve_single_spine_contracts(
         if runtime_options.get("recover_ssm") is not None:
             req_opts["use_replayssm"] = bool(runtime_options["recover_ssm"])
             req_opts["recover_ssm"] = bool(runtime_options["recover_ssm"])
+        if runtime_options.get("max_num_batched_tokens") is not None:
+            req_opts["max_num_batched_tokens"] = int(runtime_options["max_num_batched_tokens"])
+        if policy_options.get("sp") is not None:
+            req_opts["sp"] = bool(policy_options["sp"])
+        raw_cg = str(policy_options.get("graph_capture_mode") or "").strip().lower()
+        if raw_cg == "none":
+            req_opts["cudagraph_mode"] = "NONE"
+            req_opts["enforce_eager"] = True
+        elif raw_cg == "piecewise":
+            req_opts["cudagraph_mode"] = "PIECEWISE"
+        elif raw_cg == "full":
+            req_opts["cudagraph_mode"] = "FULL_DECODE_ONLY"
         if policy_options.get("enable_fused_mc2") is not None:
             req_opts["enable_fused_mc2"] = int(policy_options["enable_fused_mc2"])
         if policy_options.get("multistream_overlap_shared_expert") is not None:
@@ -1230,10 +1248,10 @@ def _build_speculative_policy(
         spec_method = canon_method
     elif canon_method == "mtp" or canon_method.endswith("_mtp"):
         spec_method = "mtp"
-    elif dspark is not None or (draft is not None and str(draft.kind).lower() in {"dspark", "mtp_dspark", "standalone_draft"}):
-        spec_method = "dspark"
     elif draft is not None and (str(draft.kind).lower() == "eagle3" or str(getattr(draft, "execution_mode", "")).lower() == "eagle3_serial"):
         spec_method = "eagle3"
+    elif dspark is not None or (draft is not None and str(draft.kind).lower() in {"dspark", "mtp_dspark", "standalone_draft"}):
+        spec_method = "dspark"
     else:
         spec_method = "mtp"
     return SpeculativeWorkloadPolicy(
@@ -1397,6 +1415,8 @@ def _apply_stack_and_lowerings(
             stack_profile = resolve_runtime_stack(stack_key)
             ctx_opts: dict[str, Any] = {
                 "ranks_per_node": int(machine.get("ranks_per_node", 0) or 0),
+                "sp": bool(runtime_meta.get("sp", False)),
+                "speculative_k": int(runtime_dict.get("mtp_proposal_tokens") or 0),
             }
             additional_cfg = runtime_meta.get("additional_config") or {}
             if isinstance(additional_cfg, Mapping) and additional_cfg.get("enable_fused_mc2") is not None:
@@ -1411,6 +1431,7 @@ def _apply_stack_and_lowerings(
             resolved_track = resolve_stack_track(
                 stack_profile,
                 track=canonical_track,
+                model_key=str(model_spec.name or ""),
                 ctx=mechanism_ctx,
                 optimizations=optimizations,
                 exclude_optimizations=exclude_optimizations,
@@ -1709,6 +1730,85 @@ def _resolve_mtp_policy(
     return prof_mtp, accept, "profile"
 
 
+def _curated_ckpt_safe_for_auto_profile(
+    ckpt_qspec: Any, hw_family: str, model_spec: Any,
+) -> bool:
+    """Return True when a curated checkpoint matches the hardware generation's native ISA."""
+    if ckpt_qspec is None:
+        return False
+    from dataclasses import replace as _replace_q
+    from mindie_sim.compose.inputs import _collect_quant_formats, _qspec_weight_formats
+
+    probe_spec = _replace_q(model_spec, quant=ckpt_qspec, kv_dtype=str(ckpt_qspec.kv_dtype))
+    all_fmts = set(_collect_quant_formats(probe_spec))
+    weight_fmts = _qspec_weight_formats(ckpt_qspec)
+    has_fp8_or_fp4 = any(("fp8" in f or "fp4" in f or "mxfp" in f) for f in all_fmts)
+    has_int_weight = bool(weight_fmts & {"int8", "int4"})
+    if hw_family == "a5":
+        return has_fp8_or_fp4 and not has_int_weight
+    if hw_family in {"a2", "a3"}:
+        primary_wf = str(ckpt_qspec.weight_format or "").strip().lower()
+        return (not has_fp8_or_fp4) and primary_wf != "int4"
+    return False
+
+
+def _resolve_production_profile_quant(
+    *,
+    model_spec: Any,
+    sku: str,
+    hw_family: str,
+    role: str | None,
+    ckpt_qspec: Any,
+    target_proj: str,
+    is_auto_va: bool,
+    explicit_quant: bool,
+    checkpoint_quant_declared: bool,
+    eff_quant: Any,
+    used_curated_ckpt: bool,
+) -> tuple[dict[str, Any], Any, bool]:
+    """Compute structural production profile and decide whether curated checkpoint applies."""
+    va_profile = simulation_config(
+        model_spec, sku, hw_family, role=role, model=model_spec,
+    )
+    model_is_unquantized = (
+        model_spec.quant is None
+        or (
+            str(model_spec.quant.weight_format or "").strip().lower() in {"", "bf16", "fp16", "fp32", "float"}
+            and str(model_spec.quant.expert_weight_format or "").strip().lower() in {"", "bf16", "fp16", "fp32", "float"}
+        )
+    )
+    ckpt_safe_auto = _curated_ckpt_safe_for_auto_profile(ckpt_qspec, hw_family, model_spec)
+    use_curated_for_profile = (
+        ckpt_qspec is not None
+        and (
+            (va_profile.get("quant") is None and model_is_unquantized and ckpt_safe_auto)
+            or curated_quant_compatible_with_profile(
+                ckpt_qspec, va_profile.get("quant"),
+                model_spec=model_spec, mlapo=bool(va_profile.get("mlapo")),
+            )
+        )
+    )
+    can_apply_profile = (
+        not explicit_quant and not is_auto_va
+        and not (checkpoint_quant_declared and model_spec.quant is not None)
+    )
+    va_profile["quantization_action"] = (
+        "curated_checkpoint_applied" if (is_auto_va and used_curated_ckpt) else
+        "curated_checkpoint_applied" if (can_apply_profile and use_curated_for_profile) else
+        "stack_default_quant_projection" if (is_auto_va and target_proj) else
+        "explicit_quant_preserved" if explicit_quant else
+        "checkpoint_quant_preserved" if (checkpoint_quant_declared and model_spec.quant is not None) else
+        "documented_alternative_applied" if va_profile.get("quant") is not None else
+        "no_profile_override"
+    )
+    va_profile.setdefault("graph_capture_mode", None)
+    if can_apply_profile:
+        if use_curated_for_profile:
+            return va_profile, ckpt_qspec, True
+        return va_profile, va_profile.get("quant"), used_curated_ckpt
+    return va_profile, eff_quant, used_curated_ckpt
+
+
 def _prepare_composed_model(
     *,
     model: str | Path | Mapping[str, Any],
@@ -1764,50 +1864,13 @@ def _prepare_composed_model(
         eff_quant = ckpt_qspec if ckpt_qspec is not None else (target_proj or None)
         used_curated_ckpt = ckpt_qspec is not None
     if production and workload_domain != "diffusion" and adapter.capabilities().stack_id != "raw-eager":
-        va_profile = simulation_config(
-            model_spec, sku, _arch_key(sku), role=role, model=model_spec,
+        va_profile, eff_quant, used_curated_ckpt = _resolve_production_profile_quant(
+            model_spec=model_spec, sku=sku, hw_family=hw_family, role=role,
+            ckpt_qspec=ckpt_qspec, target_proj=target_proj,
+            is_auto_va=is_auto_va, explicit_quant=explicit_quant,
+            checkpoint_quant_declared=checkpoint_quant_declared,
+            eff_quant=eff_quant, used_curated_ckpt=used_curated_ckpt,
         )
-        model_is_unquantized = (
-            model_spec.quant is None
-            or (
-                str(model_spec.quant.weight_format or "").strip().lower() in {"", "bf16", "fp16", "fp32", "float"}
-                and str(model_spec.quant.expert_weight_format or "").strip().lower() in {"", "bf16", "fp16", "fp32", "float"}
-            )
-        )
-        ckpt_safe_auto = (
-            ckpt_qspec is not None
-            and str(ckpt_qspec.weight_format or "").strip().lower() != "int4"
-        )
-        use_curated_for_profile = (
-            ckpt_qspec is not None
-            and (
-                (va_profile.get("quant") is None and model_is_unquantized and ckpt_safe_auto)
-                or curated_quant_compatible_with_profile(
-                    ckpt_qspec, va_profile.get("quant"),
-                    model_spec=model_spec, mlapo=bool(va_profile.get("mlapo")),
-                )
-            )
-        )
-        va_profile["quantization_action"] = (
-            "curated_checkpoint_applied" if (is_auto_va and used_curated_ckpt) else
-            "curated_checkpoint_applied" if (
-                not explicit_quant and not is_auto_va
-                and not (checkpoint_quant_declared and model_spec.quant is not None)
-                and use_curated_for_profile
-            ) else
-            "stack_default_quant_projection" if (is_auto_va and target_proj) else
-            "explicit_quant_preserved" if explicit_quant else
-            "checkpoint_quant_preserved" if (checkpoint_quant_declared and model_spec.quant is not None) else
-            "documented_alternative_applied" if va_profile.get("quant") is not None else
-            "no_profile_override"
-        )
-        va_profile.setdefault("graph_capture_mode", None)
-        if not explicit_quant and not is_auto_va and not (checkpoint_quant_declared and model_spec.quant is not None):
-            if use_curated_for_profile:
-                eff_quant = ckpt_qspec
-                used_curated_ckpt = True
-            else:
-                eff_quant = va_profile.get("quant")
     if (
         hw_family in {"a2", "a3"}
         and eff_quant is not None
@@ -1821,6 +1884,25 @@ def _prepare_composed_model(
             quant=_replace_q(model_spec.quant, index_dtype="bf16", index_scale_dtype="none"),
         )
     model_spec = _apply_quant_override(model_spec, eff_quant, machine)
+    if (
+        quant is None
+        and not is_auto_va
+        and not used_curated_ckpt
+        and not checkpoint_quant_declared
+        and (
+            eff_quant is not None
+            or (
+                ckpt_qspec is not None
+                and checkpoint_map.provenance.origin == "verified_checkpoint_descriptor"
+                and not isinstance(model, Path)
+            )
+        )
+    ):
+        checkpoint_map = synthetic_checkpoint_quant_map(
+            model_spec,
+            canon=str(model_spec.name),
+            native_dtype=checkpoint_map.native_float_dtype,
+        )
     resolved_kv_dtype, resolved_idx_dtype = kv_cache_dtype, indexer_kv_dtype
     if is_auto_va:
         if resolved_kv_dtype is None and auto_kv:
@@ -2022,9 +2104,14 @@ def _compose_explicit_case(
         model_limit=model_limit, mtp_tokens=mtp_tokens, role=norm_role, **scenario_options,
     )
 
-    single_spine_rt_opts = dict(runtime_options)
+    single_spine_rt_opts = {**runtime_options, "max_num_batched_tokens": int(resolved_max_batched)}
     if spec_method_norm:
         single_spine_rt_opts["spec_method"] = spec_method_norm
+    single_spine_policy_opts = {
+        **policy_options,
+        "sp": bool(policy_out["sp"]),
+        "graph_capture_mode": str(policy_out["graph_capture_mode"]),
+    }
     resolved_opts, _quant_plan, _lowering_plan, _scenario_contract, single_spine_meta = (
         _resolve_single_spine_contracts(
             adapter=adapter, model_spec=model_spec, checkpoint_map=checkpoint_map,
@@ -2033,7 +2120,7 @@ def _compose_explicit_case(
             canonical_track=canonical_track, raw_eager=raw_eager, norm_role=norm_role,
             mtp_tokens=mtp_tokens, resolved_max_seqs=resolved_max_seqs,
             resolved_block_size=resolved_block_size, model_options=model_options,
-            policy_options=policy_options, runtime_options=single_spine_rt_opts,
+            policy_options=single_spine_policy_opts, runtime_options=single_spine_rt_opts,
             scenario_options=scenario_options, stack_options=stack_options,
         )
     )

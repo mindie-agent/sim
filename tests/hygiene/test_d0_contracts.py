@@ -392,7 +392,7 @@ def test_synthetic_gqa_policy_locked_for_simulation_and_opt_in_for_modeling() ->
     # Full-case shipping replay rejects swapped synthetic draft; scenario/stack/scheduler agree on K=15.
     mm3_raw = compose_case("minimax-m3", "a5", tp=4, ep=4, prompt_tokens=128, output_tokens=16, mtp_proposal_tokens=5, mtp_acceptance_length=3.0)
     mm3_sc, _, mm3_lp = resolve_case_contracts(mm3_raw)
-    assert mm3_sc is not None and mm3_sc.speculative_policy is not None and mm3_sc.speculative_policy.spec_method == "eagle3"
+    assert mm3_sc is not None and mm3_sc.speculative_policy is not None and mm3_sc.speculative_policy.spec_method == "dspark"
     assert mm3_lp.scheduling.speculative_proposal_count == mm3_sc.speculative_policy.num_speculative_tokens == 5
     swapped_mm3 = json.loads(json.dumps(mm3_raw))
     swapped_mm3["model"]["auxiliary"]["mtp"] = synth_draft.to_dict()

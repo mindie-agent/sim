@@ -780,6 +780,72 @@ def _resolve_model_spec(
         raise ModelingError(f"unknown_model:{key} — {_format_model_suggestions(key)}") from exc
 
 
+_QUANT_FORMAT_VALUE_KEYS = frozenset({
+    "weight_format",
+    "activation_format",
+    "expert_weight_format",
+    "output_format",
+    "kv_dtype",
+    "index_dtype",
+    "scale_format",
+    "activation_scale_format",
+})
+
+
+def _as_key_value_pairs(obj: Any) -> tuple[tuple[str, Any], ...] | None:
+    if isinstance(obj, Mapping):
+        return tuple((str(k), v) for k, v in obj.items())
+    if isinstance(obj, (tuple, list)) and obj and all(
+        isinstance(item, (tuple, list)) and len(item) == 2 and isinstance(item[0], (str, int))
+        for item in obj
+    ):
+        return tuple((str(k), v) for k, v in obj)
+    return None
+
+
+def _collect_category_override_formats(entries: Any, formats: list[str]) -> None:
+    pairs = _as_key_value_pairs(entries)
+    if pairs is None:
+        return
+    for _cat, spec in pairs:
+        if isinstance(spec, str):
+            val = spec.strip().lower()
+            if val:
+                formats.append(val)
+            continue
+        sub_pairs = _as_key_value_pairs(spec)
+        if sub_pairs is None:
+            continue
+        for key, val in sub_pairs:
+            if key in _QUANT_FORMAT_VALUE_KEYS and isinstance(val, str):
+                text = val.strip().lower()
+                if text:
+                    formats.append(text)
+
+
+def _collect_layer_override_formats(obj: Any, formats: list[str]) -> None:
+    pairs = _as_key_value_pairs(obj)
+    if pairs is None:
+        if isinstance(obj, str):
+            text = obj.strip().lower()
+            if text:
+                formats.append(text)
+        return
+    for key, val in pairs:
+        if key == "category_overrides":
+            _collect_category_override_formats(val, formats)
+        elif key in _QUANT_FORMAT_VALUE_KEYS and isinstance(val, str):
+            text = val.strip().lower()
+            if text:
+                formats.append(text)
+        elif isinstance(val, (Mapping, tuple, list)):
+            _collect_layer_override_formats(val, formats)
+        elif isinstance(val, str) and key.isdigit():
+            text = val.strip().lower()
+            if text:
+                formats.append(text)
+
+
 def _collect_quant_formats(spec: ModelSpec) -> tuple[str, ...]:
     """Collect every declared weight, activation, KV, index, category, and per-layer format."""
     formats: list[str] = []
@@ -789,26 +855,17 @@ def _collect_quant_formats(spec: ModelSpec) -> tuple[str, ...]:
             "weight_format",
             "activation_format",
             "expert_weight_format",
+            "output_format",
             "kv_dtype",
             "index_dtype",
+            "scale_format",
+            "activation_scale_format",
         ):
             val = str(getattr(q, attr, "") or "").strip().lower()
             if val:
                 formats.append(val)
-        for _cat, fmt in tuple(getattr(q, "category_overrides", ()) or ()):
-            val = str(fmt or "").strip().lower()
-            if val:
-                formats.append(val)
-        for _lyr, entry in tuple(getattr(q, "layer_quant_overrides", ()) or ()):
-            if isinstance(entry, Mapping):
-                for val in entry.values():
-                    text = str(val or "").strip().lower()
-                    if text:
-                        formats.append(text)
-            else:
-                text = str(entry or "").strip().lower()
-                if text:
-                    formats.append(text)
+        _collect_category_override_formats(getattr(q, "category_overrides", ()), formats)
+        _collect_layer_override_formats(getattr(q, "layer_quant_overrides", ()), formats)
     spec_kv = str(getattr(spec, "kv_dtype", "") or "").strip().lower()
     if spec_kv:
         formats.append(spec_kv)

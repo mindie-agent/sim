@@ -245,10 +245,50 @@ def _structural_mla_probe_config(*, indexed: bool = False, topk: int | None = No
     }
 
 
+def _refresh_probe_single_spine(case_dict: dict[str, Any], *, indexed: bool, index_dtype: str) -> dict[str, Any]:
+    from mindie_sim.compose import resolve_case_contracts
+
+    rt = dict(case_dict.get("runtime") or {})
+    meta = dict(rt.get("metadata") or {})
+    ss = dict(meta.get("single_spine") or {})
+    ci = ss.get("contract_inputs")
+    if not isinstance(ci, Mapping):
+        return case_dict
+    ci_copy = dict(ci)
+    if indexed:
+        req = dict(ci_copy.get("requested_options") or {})
+        req["indexer_kv_dtype"] = index_dtype
+        ci_copy["requested_options"] = req
+    ss["contract_inputs"] = ci_copy
+    meta["single_spine"] = ss
+    rt["metadata"] = meta
+    updated = {**case_dict, "runtime": rt}
+    sc, qp, lp = resolve_case_contracts(updated)
+    if qp is not None and lp is not None:
+        ss.update({
+            "quant_plan_digest": qp.plan_digest,
+            "quant_provenance": qp.provenance,
+            "kv_cache_abi_count": len(qp.kv_cache_abi),
+            "index_cache_abi_count": len(qp.index_cache_abi),
+            "recurrent_state_abi_count": len(qp.recurrent_state_abi),
+            "prepared_weights": [item.allocation_id for item in qp.prepared_weights],
+            "packed_groups_count": len(qp.packed_groups),
+            "lowering_plan_digest": lp.plan_digest,
+            "allowed_rewrite_tracks": list(lp.allowed_rewrite_tracks),
+            "recipe_bindings_count": len(lp.recipe_bindings),
+            "scenario_contract_digest": sc.digest() if sc is not None else "",
+        })
+        meta["single_spine"] = ss
+        rt["metadata"] = meta
+        updated = {**updated, "runtime": rt}
+    return updated
+
+
 def _compose_structural_probe_case(
     sku: str, topo_opts: Mapping[str, Any], *, indexed: bool = False,
     topk: int | None = None, hidden_size: int | None = None,
     single_layer: bool = False, index_dtype: str = "bf16",
+    index_head_dim: int | None = None,
 ) -> dict[str, Any]:
     from mindie_sim.compose import compose_case as compose_case_dict
 
@@ -257,14 +297,18 @@ def _compose_structural_probe_case(
     raw = compose_case_dict(model=cfg, hardware=sku, **dict(topo_opts))
     md = dict(raw["model"])
     if indexed:
-        md["mla"] = {**dict(md.get("mla") or {}), "index_topk": idx_topk, "index_head_dim": _DEFAULT_HEAD_DIM, "index_n_heads": _INDEXER_ATTENTION_HEADS}
+        idx_dim = int(index_head_dim or _DEFAULT_HEAD_DIM)
+        md["mla"] = {**dict(md.get("mla") or {}), "index_topk": idx_topk, "index_head_dim": idx_dim, "index_n_heads": _INDEXER_ATTENTION_HEADS}
         md["quant"] = {**dict(md.get("quant") or {}), "index_dtype": index_dtype}
         lp0 = dict(md["layer_plans"][0])
-        lp0.update({"indexer": True, "index_heads": _INDEXER_ATTENTION_HEADS, "index_dim": _DEFAULT_HEAD_DIM, "index_topk": idx_topk, "owns_index_k": True, "owns_topk": True})
+        lp0.update({"indexer": True, "index_heads": _INDEXER_ATTENTION_HEADS, "index_dim": idx_dim, "index_topk": idx_topk, "owns_index_k": True, "owns_topk": True})
         md["layer_plans"] = [lp0]
     if single_layer:
         md["layers"], md["body_layers"], md["layer_plans"] = 1, 1, list(md["layer_plans"])[:1]
-    return {**raw, "model": md}
+    out_case = {**raw, "model": md}
+    if indexed or single_layer:
+        out_case = _refresh_probe_single_spine(out_case, indexed=indexed, index_dtype=index_dtype)
+    return out_case
 
 
 def _materialize_one_layer_case(sku: str, topo: str, sim_case_json: str) -> Any:
@@ -420,7 +464,7 @@ def _lowered_op_to_profiler_node(
         return {"node_id": nid, "op_id": oid, "kind": "operator", "op": bld, "builder": bld, "family": "elementwise", "recipe": rec, "implementation": impl, "dtype": dt, "shape": {"tokens": total_tokens, "width": width}}, {"op_id": oid, "family": "elementwise", "recipe": rec, "builder": bld, "width": width}
     if fam == "elementwise" and rec in _RESIDUAL_ADD_RECIPES:
         width = int(loc[-1]) if loc else _MLA_HIDDEN_WIDTH
-        return {"node_id": nid, "op_id": oid, "kind": "operator", "op": "vector_add", "builder": "vector_add", "family": "elementwise", "recipe": rec, "implementation": "aclnnAdd", "dtype": dt, "shape": {"tokens": total_tokens, "width": width}}, {"op_id": oid, "family": "elementwise", "recipe": rec, "builder": "vector_add", "width": width}
+        return {"node_id": nid, "op_id": oid, "kind": "operator", "op": "vector_add", "builder": "vector_add", "family": "elementwise", "recipe": rec, "implementation": "torch.add", "dtype": dt, "shape": {"tokens": total_tokens, "width": width}}, {"op_id": oid, "family": "elementwise", "recipe": rec, "builder": "vector_add", "width": width}
     if fam == "kv_compress_epilog":
         toks = int(loc[0]) if len(loc) >= _MIN_2D_RANK else total_tokens
         bw = int(loc[-1]) if loc else (_MLA_LATENT_DIM + _MLA_ROPE_DIM) * _MLA_BF16_BYTES
@@ -549,10 +593,12 @@ def resolve_point_binding_and_shape(
     if custom_sim is not None:
         sim_case = dict(custom_sim)
     else:
+        ln_probe = (sim_fam == "layernorm")
         sim_case = _compose_structural_probe_case(
-            sku, topo_opts, indexed=probe_indexed,
+            sku, topo_opts, indexed=(probe_indexed or ln_probe),
             topk=topk_val if (probe_indexed and not is_abi_reject) else None,
-            hidden_size=probe_hidden, single_layer=probe_single_layer,
+            hidden_size=probe_hidden, single_layer=(probe_single_layer or ln_probe),
+            index_head_dim=(probe_hidden if ln_probe else None),
         )
     return pfam, prec, pbld, impl, sim_fam, shape, sim_case
 
@@ -827,6 +873,34 @@ def _sanitize_capture_shape(raw: Any) -> Any:
     return out
 
 
+def _extract_row_event_ids(row: Mapping[str, Any]) -> list[str]:
+    raw = row.get("event_ids")
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        cleaned = [str(ev).strip() for ev in raw if str(ev).strip()]
+        if cleaned:
+            return cleaned
+    sample_id = str(row.get("sample_id") or "").strip()
+    return [sample_id] if sample_id else []
+
+
+def _resolve_attributed_event_ids(
+    p50_row: Mapping[str, Any],
+    rcpts: Sequence[Mapping[str, Any]],
+    group: Sequence[Mapping[str, Any]],
+    cid: str,
+) -> list[str]:
+    win_rank = p50_row.get("rank")
+    candidates: list[Mapping[str, Any]] = [p50_row]
+    candidates.extend(r for r in rcpts if r.get("rank") == win_rank)
+    candidates.extend(r for r in rcpts if r.get("rank") != win_rank)
+    candidates.extend(r for r in group if r is not p50_row)
+    for rec in candidates:
+        ev = _extract_row_event_ids(rec)
+        if ev:
+            return ev
+    raise ModelingError(f"profiler_observation_event_ids_missing:{cid}")
+
+
 def normalize_profiler_records(
     raw_records: Sequence[Mapping[str, Any]], *, plan_doc: Mapping[str, Any], sku: str,
     endpoint_alias: str = "", capture_out_dir: str | Path | None = None,
@@ -878,7 +952,7 @@ def normalize_profiler_records(
                 break
         if plan_pt is not None and binfo is not None:
             verify_actual_geometry_matches_plan(actual_shape, plan_pt, expected_shape=binfo["expected_shape"], cid=cid, measured_binding=binfo["measured_binding"])
-        by_slot: dict[Any, list[int]] = {}
+        by_slot: dict[Any, list[tuple[int, int, Mapping[str, Any]]]] = {}
         ranks_seen: set[int] = set()
         for idx_g, row in enumerate(group):
             dur_ms = float(row.get("duration_ms") or 0.0)
@@ -888,38 +962,34 @@ def normalize_profiler_records(
             if raw_rank is None or isinstance(raw_rank, bool):
                 raise ModelingError(f"profiler_observation_rank_missing:{cid}")
             try:
-                ranks_seen.add(int(raw_rank))
+                rank_int = int(raw_rank)
+                ranks_seen.add(rank_int)
             except (TypeError, ValueError) as exc:
                 raise ModelingError(f"profiler_observation_rank_invalid:{cid}:rank={raw_rank!r}") from exc
-            by_slot.setdefault(row.get("repeat_index", row.get("trial", idx_g)), []).append(int(round(dur_ms * NS_PER_MS)))
-        durs_ns = sorted(max(vals) for vals in by_slot.values())
+            if "trial" in row or "repeat_index" in row:
+                slot_key: Any = (row.get("trial"), row.get("repeat_index"))
+            else:
+                slot_key = idx_g
+            by_slot.setdefault(slot_key, []).append((int(round(dur_ms * NS_PER_MS)), rank_int, row))
+        slot_peaks = sorted(
+            (max(entries, key=lambda item: (item[0], item[1])) for entries in by_slot.values()),
+            key=lambda item: (item[0], item[1]),
+        )
+        durs_ns = [item[0] for item in slot_peaks]
         p50_ns, p99_ns = _quantile_ns(durs_ns, _P50_Q), _quantile_ns(durs_ns, _P99_Q)
+        p50_row = min(slot_peaks, key=lambda item: abs(item[0] - p50_ns))[2]
         first = group[0]
-        raw_clock = first.get("clock_operator")
+        raw_clock = p50_row.get("clock_operator") or first.get("clock_operator")
         if raw_clock is not None and str(raw_clock).strip():
             clock_op = str(raw_clock).strip()
             if clock_op not in VALID_CLOCK_OPERATORS:
                 raise ModelingError(f"profiler_clock_operator_invalid:{cid}:{clock_op!r}")
         else:
-            tmode = str(first.get("timing_mode") or "").strip().lower()
+            tmode = str(p50_row.get("timing_mode") or first.get("timing_mode") or "").strip().lower()
             if not tmode:
                 raise ModelingError(f"profiler_clock_operator_missing:{cid}")
             clock_op = "busy_union" if tmode in _BUSY_UNION_MODES else DEFAULT_CLOCK_OPERATOR
-        raw_events = next(
-            (
-                r["event_ids"]
-                for r in (*rcpts, *group)
-                if isinstance(r.get("event_ids"), Sequence)
-                and not isinstance(r.get("event_ids"), (str, bytes))
-                and len(r["event_ids"]) > 0
-            ),
-            None,
-        )
-        if raw_events is None:
-            raise ModelingError(f"profiler_observation_event_ids_missing:{cid}")
-        event_ids = [str(ev).strip() for ev in raw_events if str(ev).strip()]
-        if not event_ids:
-            raise ModelingError(f"profiler_observation_event_ids_missing:{cid}")
+        event_ids = _resolve_attributed_event_ids(p50_row, rcpts, group, cid)
         level = binfo["level"] if binfo is not None else str(first.get("level") or "L1").upper()
         explicit_acq = str(first.get("acquisition_id") or (rcpts[0].get("acquisition_id") if rcpts else "") or "").strip()
         base_acq = str((plan_doc.get("train_lineage_root") if split == "train" else plan_doc.get("heldout_lineage_root")) or f"acq-{split}")

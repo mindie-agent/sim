@@ -65,7 +65,8 @@ A5_ONLY_QUANT_TOKENS = ("mxfp", "fp8", "fp4")
 
 _DIFFUSION_ARCH_TOKENS = ("dit", "unet", "diffusion", "hunyuan_video", "wan2", "flux", "sdxl", "sd3")
 _VALID_ROLES = frozenset({"colocated", "pd_disaggregated", "pd_prefill", "pd_decode"})
-_MXFP_FORMATS = frozenset({"mxfp8", "mx_fp8", "mxfp4", "mx_fp4", "fp8_e4m3", "fp8", "fp4_e2m1", "fp4"})
+_MXFP_FORMATS = frozenset({"mxfp8", "mx_fp8", "mxfp4", "mx_fp4", "fp4_e2m1", "fp4"})
+_MXFP_SCALE_FORMATS = frozenset({"e8m0", "fp8_e8m0"})
 _FP4_W4A8_EXPERT_FORMATS = frozenset({"mxfp4", "mx_fp4", "fp4", "fp4_e2m1", "int4", "w4a8"})
 _W4A8_EXPERT_FORMATS = frozenset({"int4", "w4a8"})
 _FP8_KV_MODES = frozenset({"fp8", "fp8_e4m3", "mxfp8"})
@@ -256,15 +257,20 @@ def _quant_capabilities(model: ModelSpec, quant_plan: Any) -> dict[str, Any]:
     w_fmts: set[str] = set()
     e_fmts: set[str] = set()
     has_quant_act = False
+    has_mxfp_scale = False
     if qspec is not None:
         wf = str(getattr(qspec, "weight_format", "") or "").strip().lower()
         ef = str(getattr(qspec, "expert_weight_format", "") or "").strip().lower()
         af = str(getattr(qspec, "activation_format", "") or "").strip().lower()
+        sf = str(getattr(qspec, "scale_format", "") or "").strip().lower()
+        asf = str(getattr(qspec, "activation_scale_format", "") or "").strip().lower()
         if wf:
             w_fmts.add(wf)
         if ef:
             e_fmts.add(ef)
             w_fmts.add(ef)
+        if sf in _MXFP_SCALE_FORMATS or asf in _MXFP_SCALE_FORMATS:
+            has_mxfp_scale = True
         if af and af != act_dtype:
             has_quant_act = True
         for _, pairs in getattr(qspec, "category_overrides", ()) or ():
@@ -272,30 +278,34 @@ def _quant_capabilities(model: ModelSpec, quant_plan: Any) -> dict[str, Any]:
                 v_low = str(v or "").strip().lower()
                 if k == "activation_format" and v_low and v_low != act_dtype:
                     has_quant_act = True
+                elif k in {"scale_format", "activation_scale_format"} and v_low in _MXFP_SCALE_FORMATS:
+                    has_mxfp_scale = True
                 elif k in {"weight_format", "expert_weight_format"} and v_low:
                     w_fmts.add(v_low)
                     if k == "expert_weight_format":
                         e_fmts.add(v_low)
     has_fp8_kv = str(getattr(qspec, "kv_dtype", "") or "").strip().lower() in _FP8_KV_MODES
+    has_mxfp_weights = bool(w_fmts & _MXFP_FORMATS) or has_mxfp_scale
     if quant_plan is not None:
+        plan_mxfp = False
         for (_sc, _lid, role_name), abi in getattr(quant_plan, "port_abis", ()) or ():
             lm = str(getattr(abi, "linear_method", "") or "").lower()
             wd = str(getattr(abi, "weight_dtype", "") or "").lower()
+            wsd = str(getattr(abi, "weight_scale_dtype", "") or "").lower()
             id_ = str(getattr(abi, "input_dtype", "") or "").lower()
-            if lm in {"mx_fp8", "mx_fp4", "fp8"}:
-                w_fmts.add(lm)
-            if wd:
-                w_fmts.add(wd)
+            if lm in {"mx_fp8", "mx_fp4"} or wd in _MXFP_FORMATS or wsd in _MXFP_SCALE_FORMATS:
+                plan_mxfp = True
             if "experts" in str(role_name) and (lm in {"mx_fp4", "w4a8"} or wd in {"fp4_e2m1", "int4"}):
                 e_fmts.add(wd or lm)
             if id_ and id_ not in {"bf16", "fp16", "fp32", act_dtype}:
                 has_quant_act = True
+        has_mxfp_weights = plan_mxfp
         for k_abi in getattr(quant_plan, "kv_cache_abi", ()) or ():
             if any(str(pl.dtype).lower() in _FP8_KV_MODES for pl in getattr(k_abi, "planes", ())):
                 has_fp8_kv = True
     return {
         "has_quant_activation": has_quant_act,
-        "has_mxfp_weights": bool(w_fmts & _MXFP_FORMATS),
+        "has_mxfp_weights": has_mxfp_weights,
         "has_fp4_or_w4a8_experts": bool(e_fmts & _FP4_W4A8_EXPERT_FORMATS),
         "has_w4a8_experts": bool(e_fmts & _W4A8_EXPERT_FORMATS),
         "has_fp8_kv": has_fp8_kv,
@@ -543,6 +553,10 @@ def resolve_fused_mc2_and_mso(
     dispositions: list[tuple[str, str, str]] = []
     has_moe = bool(model.num_experts > 0 or any(p.ffn == "moe" for p in model.layer_plans))
     has_shared = bool(model.num_shared_experts > 0 or any(p.num_shared_experts > 0 for p in model.layer_plans))
+    has_gated_shared = any(
+        p.ffn == "moe" and bool(getattr(p, "shared_expert_gate", False))
+        for p in model.layer_plans
+    )
     eff_mc2 = FUSED_MC2_DISABLED
     if requested_fused_mc2 is not None:
         lvl = int(requested_fused_mc2)
@@ -561,6 +575,9 @@ def resolve_fused_mc2_and_mso(
         elif lvl == FUSED_MC2_MEGAMOE_SHARED and not has_shared:
             eff_mc2 = FUSED_MC2_MEGAMOE_ROUTED
             dispositions.append(("enable_fused_mc2", "downgraded", "level_3_downgraded_no_shared_experts"))
+        elif lvl == FUSED_MC2_MEGAMOE_SHARED and has_gated_shared:
+            eff_mc2 = FUSED_MC2_MEGAMOE_ROUTED
+            dispositions.append(("enable_fused_mc2", "downgraded", "level_3_downgraded_gated_shared_expert"))
         elif FUSED_MC2_DISABLED <= lvl <= FUSED_MC2_MEGAMOE_SHARED:
             eff_mc2 = lvl
             dispositions.append(("enable_fused_mc2", "accepted", f"arch={hw}:level={lvl}"))
@@ -626,14 +643,13 @@ def simulation_config(
         spec is not None and any(int(p.expert_latent_size or 0) > 0 for p in spec.layer_plans)
     )
     tutorial_flags: dict[str, Any] = {}
-    if hw == "a5" and caps["has_moe"]:
-        if caps["ffn_activation"] == "situ" or has_latent_moe:
-            tutorial_flags["enable_fused_mc2"] = FUSED_MC2_DISABLED
-        else:
-            tutorial_flags["enable_fused_mc2"] = FUSED_MC2_MEGAMOE_ROUTED
+    if hw == "a5" and caps["has_moe"] and (caps["ffn_activation"] == "situ" or has_latent_moe):
+        tutorial_flags["enable_fused_mc2"] = FUSED_MC2_DISABLED
     if hw == "a5" and caps["has_kpool_indexer"]:
         tutorial_flags["kv_cache_dtype"] = "fp8"
         tutorial_flags["indexer_kv_dtype"] = "fp8"
+    elif hw in A2_A3_INT_ONLY_FAMILIES and caps["has_kpool_indexer"]:
+        tutorial_flags["kv_cache_dtype"] = "int8"
     mso = bool(
         caps["has_moe"]
         and caps["has_shared_expert"]
@@ -654,8 +670,11 @@ def simulation_config(
             str(spec.quant.expert_weight_format or "").strip().lower(),
             str(spec.quant.name or "").strip().lower(),
         }
-        if caps["has_mxfp_weights"] or any(tok in q_fmts for tok in A5_ONLY_QUANT_TOKENS) or "mxfp" in str(spec.quant.name or "").lower():
-            default_quant = "w4a8" if caps["has_moe"] else "w8a8"
+        if (
+            caps["has_mxfp_weights"]
+            or any(any(tok in fmt for tok in A5_ONLY_QUANT_TOKENS) for fmt in q_fmts)
+        ):
+            default_quant = "w4a8" if (caps["has_moe"] and caps["has_fp4_or_w4a8_experts"]) else "w8a8"
     q_basis = (
         "hardware_isa_int_quant_fallback" if default_quant is not None
         else "preserve_caller_no_documented_hardware_quantization"
