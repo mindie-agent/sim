@@ -27,7 +27,17 @@ from collections.abc import Mapping
 from typing import Any
 
 from .common import ModelingError
-from .compute_arch import canonical_format
+_FORMAT_ALIASES = {
+    "bfloat16": "bf16", "float16": "fp16", "float32": "fp32",
+    "float8_e4m3": "fp8_e4m3", "float8_e5m2": "fp8_e5m2",
+    "hif8": "hifloat8",
+}
+
+
+def canonical_format(value):
+    if not isinstance(value, str) or not value.strip():
+        raise ModelingError(f"representation_format_invalid:{value}")
+    return _FORMAT_ALIASES.get(value, value)
 
 
 def _items(value: Any, reason: str) -> tuple[tuple[str, Any], ...]:

@@ -31,11 +31,6 @@ STORAGE_DOMAINS = frozenset({
     "gm", "hbm", "l1", "l0a", "l0b", "l0c", "ub", "ssbuffer", "reg",
 })
 
-_FORMAT_ALIASES = {
-    "bfloat16": "bf16", "float16": "fp16", "float32": "fp32",
-    "float8_e4m3": "fp8_e4m3", "float8_e5m2": "fp8_e5m2",
-    "hif8": "hifloat8",
-}
 _CAPABILITY_MAP_FIELDS = (
     "instruction_services", "representations", "native_compute", "casts",
     "paths", "runtimes",
@@ -54,9 +49,7 @@ def _positive_int(value, reason):
     return value
 
 
-def canonical_format(value):
-    name = _text(value, "representation_format_invalid")
-    return _FORMAT_ALIASES.get(name, name)
+from .compute_peak_aliases import canonical_format  # noqa: E402
 
 
 @dataclass(frozen=True)
