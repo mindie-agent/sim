@@ -337,12 +337,13 @@ class PeriodicSectorRun:
         if hi <= lo or self.rows <= 0 or self.row_bytes <= 0 or self.stride_bytes <= 0:
             return ()
         sec, stride = self.sector_bytes, self.stride_bytes
-        num_lo = lo - self.base_byte - self.row_bytes - sec + 1
-        k_lo = 0 if num_lo <= 0 else (num_lo + stride - 1) // stride
-        num_hi = hi + sec - 2 - self.base_byte
-        if num_hi < 0:
+        hi_limit = ((hi + sec - 1) // sec) * sec - 1
+        if hi_limit < self.base_byte:
             return ()
-        k_hi = min(self.rows - 1, num_hi // stride)
+        k_hi = min(self.rows - 1, (hi_limit - self.base_byte) // stride)
+        lo_sec = (lo // sec) * sec
+        num_lo = lo_sec - self.row_bytes + 1 - self.base_byte
+        k_lo = 0 if num_lo <= 0 else (num_lo + stride - 1) // stride
         if k_lo > k_hi:
             return ()
         ivs = []
@@ -390,42 +391,55 @@ def _measure_periodic_combo(
 
 @dataclass(frozen=True, slots=True)
 class SectorCoverage:
-    """Exact sector coverage combining explicit intervals and periodic strided runs."""
+    """Exact sector coverage combining explicit intervals, periodic runs, and disjoint scale sectors."""
 
     intervals: tuple[tuple[int, int], ...] = ()
     periodic: tuple[PeriodicSectorRun, ...] = ()
+    scale_intervals: tuple[tuple[int, int], ...] = ()
     _canonical: bool = field(default=False, repr=False, compare=False)
     _bytes: int | None = field(default=None, repr=False, compare=False)
 
     @property
     def empty(self) -> bool:
-        return not self.intervals and not self.periodic
+        return not self.intervals and not self.periodic and not self.scale_intervals
 
     def measure_bytes(self) -> int:
         if self._bytes is not None:
             return self._bytes
         if not self.periodic:
-            val = (
+            payload = (
                 _measure_byte_intervals(self.intervals) if self._canonical
                 else _measure_byte_intervals(_merge_byte_intervals(self.intervals))
             )
         else:
-            val = _measure_periodic_combo(self.periodic, (), intersect=False, extra_left_ivs=self.intervals)
+            payload = _measure_periodic_combo(self.periodic, (), intersect=False, extra_left_ivs=self.intervals)
+        scale = (
+            _measure_byte_intervals(self.scale_intervals) if self._canonical
+            else _measure_byte_intervals(_merge_byte_intervals(self.scale_intervals))
+        )
+        val = payload + scale
         object.__setattr__(self, "_bytes", val)
         return val
 
     def overlap_bytes(self, other: SectorCoverage) -> int:
         if self.empty or other.empty:
             return 0
+        from ._periodic_stream import _overlap_canonical_intervals
+        scale_ov = 0
+        if self.scale_intervals and other.scale_intervals:
+            ls = self.scale_intervals if self._canonical else _merge_byte_intervals(self.scale_intervals)
+            rs = other.scale_intervals if other._canonical else _merge_byte_intervals(other.scale_intervals)
+            scale_ov = _overlap_canonical_intervals(ls, rs)
         if not self.periodic and not other.periodic:
-            from ._periodic_stream import _overlap_canonical_intervals
+            if not self.intervals or not other.intervals:
+                return scale_ov
             left = self.intervals if self._canonical else _merge_byte_intervals(self.intervals)
             right = other.intervals if other._canonical else _merge_byte_intervals(other.intervals)
-            return _overlap_canonical_intervals(left, right)
+            return _overlap_canonical_intervals(left, right) + scale_ov
         return _measure_periodic_combo(
             self.periodic, other.periodic, intersect=True,
             extra_left_ivs=self.intervals, extra_right_ivs=other.intervals,
-        )
+        ) + scale_ov
 
     def union(self, other: SectorCoverage) -> SectorCoverage:
         if self.empty:
@@ -435,14 +449,20 @@ class SectorCoverage:
         if self._canonical and other._canonical:
             from ._periodic_stream import _merge_canonical_pairs
             ivs = _merge_canonical_pairs(self.intervals, other.intervals)
+            scale_ivs = _merge_canonical_pairs(self.scale_intervals, other.scale_intervals)
         else:
             ivs = _merge_byte_intervals((*self.intervals, *other.intervals))
+            scale_ivs = _merge_byte_intervals((*self.scale_intervals, *other.scale_intervals))
         per = (
             self.periodic if not other.periodic
             else other.periodic if not self.periodic
             else tuple(dict.fromkeys(r.canonical() for r in (*self.periodic, *other.periodic)))
         )
-        return SectorCoverage(intervals=ivs, periodic=per, _canonical=True)
+        return SectorCoverage(
+            intervals=ivs, periodic=per,
+            scale_intervals=scale_ivs,
+            _canonical=True,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -458,6 +478,7 @@ class AddressRunPlan:
     l2_sector_bytes: int | None = None
     hbm_burst_granule_bytes: int = 0
     hbm_scatter_row_open_bytes: int = 0
+    scale_base_byte: int | None = None
     _default_sector: bool = field(init=False, compare=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -466,8 +487,40 @@ class AddressRunPlan:
             object.__setattr__(self, "sector_bytes", self.l2_sector_bytes or DEFAULT_SECTOR_BYTES)
         if (self.alignment_bytes < 1 or self.sector_bytes < 1 or self.scale_bytes < 0
                 or any(g is not None and g < 1 for g in (self.l2_line_bytes, self.l2_sector_bytes))
-                or min(self.hbm_burst_granule_bytes, self.hbm_scatter_row_open_bytes) < 0):
+                or min(self.hbm_burst_granule_bytes, self.hbm_scatter_row_open_bytes) < 0
+                or (self.scale_base_byte is not None and self.scale_base_byte < 0)):
             raise ModelingError("address_run_plan_invalid_parameters")
+
+    def scale_span(self) -> tuple[int, int] | None:
+        """Logical half-open byte interval on the disjoint scale plane, or ``None``."""
+        if self.scale_bytes <= 0:
+            return None
+        active = [run for run in self.runs if run.rows > 0 and run.row_bytes > 0]
+        if not active:
+            return None
+        if self.scale_base_byte is not None:
+            scale_lo = self.scale_base_byte
+        else:
+            min_base = min(run.base_byte for run in active)
+            if min_base == 0:
+                scale_lo = 0
+            else:
+                max_end = max(
+                    run.base_byte + (run.rows - 1) * run.stride_bytes + run.row_bytes
+                    for run in active
+                )
+                payload_span = max_end - min_base
+                scale_lo = (min_base * self.scale_bytes) // payload_span if payload_span > 0 else 0
+        return scale_lo, scale_lo + self.scale_bytes
+
+    def scale_sector_intervals(self, sector_bytes: int | None = None) -> tuple[tuple[int, int], ...]:
+        """Sector-rounded interval on the disjoint scale plane."""
+        span = self.scale_span()
+        if span is None:
+            return ()
+        sec = self.sector_bytes if sector_bytes is None else sector_bytes
+        lo, hi = span
+        return (((lo // sec) * sec, _align_up(hi, sec)),)
 
     def aligned_copy_bytes(self) -> int:
         """Exact owner-pipe layout transfer bytes (A_f), deduplicating proven aliases."""
@@ -504,7 +557,7 @@ class AddressRunPlan:
                 sector_total += sec_bytes
                 service_total += _burst_service_bytes(self, sec_bytes, run, burst_rules)
         if sector_total > 0 and self.scale_bytes > 0:
-            scale_sec = _align_up(self.scale_bytes, self.sector_bytes)
+            scale_sec = _measure_byte_intervals(self.scale_sector_intervals(self.sector_bytes))
             sector_total += scale_sec
             service_total += float(scale_sec)
         return sector_total, service_total
@@ -523,11 +576,17 @@ class AddressRunPlan:
         ))
 
     def sector_coverage(self) -> SectorCoverage:
-        """Exact sector coverage retaining periodic strided sets without gap collapse."""
-        known_bytes = self.runs[0].sector_union_bytes(self.sector_bytes) if len(self.runs) == 1 else None
+        """Exact sector coverage retaining periodic strided sets and disjoint scale sectors."""
+        scale_ivs = self.scale_sector_intervals(self.sector_bytes)
+        scale_sec = _measure_byte_intervals(scale_ivs)
+        known_bytes = (
+            self.runs[0].sector_union_bytes(self.sector_bytes) + scale_sec
+            if len(self.runs) == 1 else None
+        )
         return SectorCoverage(
             intervals=self.sector_intervals(),
             periodic=self.periodic_sector_runs(),
+            scale_intervals=scale_ivs,
             _canonical=True,
             _bytes=known_bytes,
         )

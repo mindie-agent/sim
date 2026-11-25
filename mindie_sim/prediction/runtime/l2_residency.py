@@ -8,7 +8,7 @@
 """
 from __future__ import annotations
 
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from hashlib import sha256
 import math
@@ -24,8 +24,9 @@ from .memory_physics import (
     DEFAULT_L2_GRANULE_BYTES,
     HbmBusSpec, MemoryAccessPattern,
     ReuseKey, SectorCoverage,
-    _L2_CACHE_DISABLE,
-    _measure_byte_intervals, _subtract_byte_intervals,
+    _L2_CACHE_DISABLE, _MAX_EXPLICIT_SECTOR_INTERVALS,
+    _align_up, _intersect_byte_intervals, _measure_byte_intervals,
+    _merge_byte_intervals, _subtract_byte_intervals,
     burst_turnaround_efficiency,
 )
 from .periodic_runs import (
@@ -134,6 +135,7 @@ class _ResidentL2Entry:
     cache_policy: str = CACHE_POLICY_NORMAL
     line_footprint_bytes: int | None = None
     resident_intervals_mut: list[tuple[int, int]] | None = None
+    resident_scale_intervals: tuple[tuple[int, int], ...] = ()
 
     def coverage_snapshot(self) -> SectorCoverage:
         """Return an immutable ``SectorCoverage`` snapshot for external inspection."""
@@ -141,19 +143,186 @@ class _ResidentL2Entry:
             return self.resident_coverage
         return SectorCoverage(
             intervals=tuple(self.resident_intervals_mut),
+            scale_intervals=self.resident_scale_intervals,
             _canonical=True,
             _bytes=self.resident_bytes,
         )
 
 
-def _entry_overlap_bytes(req_cov: SectorCoverage, entry: _ResidentL2Entry) -> int:
-    """Compute exact byte overlap against ``entry`` without copying its mutable interval list."""
-    if req_cov.empty or entry.resident_bytes <= 0:
+def _payload_only(cov: SectorCoverage) -> SectorCoverage:
+    if not cov.scale_intervals:
+        return cov
+    return SectorCoverage(cov.intervals, cov.periodic, _canonical=cov._canonical)
+
+
+def _cov_payload_bytes(cov: SectorCoverage) -> int:
+    if not cov.intervals and not cov.periodic:
+        return 0
+    return _merged_bytes(_payload_only(cov))
+
+
+def _cov_bytes(cov: SectorCoverage) -> int:
+    return _cov_payload_bytes(cov) + _measure_byte_intervals(cov.scale_intervals)
+
+
+def _cov_overlap(left: SectorCoverage, right: SectorCoverage) -> int:
+    if left.empty or right.empty:
+        return 0
+    from ._periodic_stream import _overlap_canonical_intervals
+    scale_ov = (
+        _overlap_canonical_intervals(left.scale_intervals, right.scale_intervals)
+        if left.scale_intervals and right.scale_intervals else 0
+    )
+    if (not left.intervals and not left.periodic) or (not right.intervals and not right.periodic):
+        return scale_ov
+    return _coverage_overlap(_payload_only(left), _payload_only(right)) + scale_ov
+
+
+def _entry_payload_overlap_bytes(req_cov: SectorCoverage, entry: _ResidentL2Entry) -> int:
+    """Compute exact payload byte overlap without copying the mutable interval list."""
+    scale_b = _measure_byte_intervals(entry.resident_scale_intervals)
+    if (not req_cov.intervals and not req_cov.periodic) or entry.resident_bytes <= scale_b:
         return 0
     if entry.resident_intervals_mut is not None and not req_cov.periodic:
         from ._periodic_stream import _overlap_canonical_intervals
         return _overlap_canonical_intervals(req_cov.intervals, entry.resident_intervals_mut)
-    return _coverage_overlap(req_cov, entry.coverage_snapshot())
+    return _coverage_overlap(_payload_only(req_cov), _payload_only(entry.coverage_snapshot()))
+
+
+def _entry_interval_overlap(lo: int, hi: int, entry: _ResidentL2Entry) -> int:
+    if hi <= lo:
+        return 0
+    if entry.resident_intervals_mut is not None:
+        from ._periodic_stream import _overlap_canonical_intervals
+        return _overlap_canonical_intervals(((lo, hi),), entry.resident_intervals_mut)
+    if not entry.resident_coverage.periodic:
+        from ._periodic_stream import _overlap_canonical_intervals
+        return _overlap_canonical_intervals(((lo, hi),), entry.resident_coverage.intervals)
+    return _coverage_overlap(
+        SectorCoverage(intervals=((lo, hi),), _canonical=True),
+        _payload_only(entry.resident_coverage),
+    )
+
+
+def _entry_overlap_bytes(req_cov: SectorCoverage, entry: _ResidentL2Entry) -> int:
+    """Compute exact byte overlap against ``entry`` across payload and scale planes."""
+    if req_cov.empty or entry.resident_bytes <= 0:
+        return 0
+    from ._periodic_stream import _overlap_canonical_intervals
+    scale_ov = (
+        _overlap_canonical_intervals(req_cov.scale_intervals, entry.resident_scale_intervals)
+        if req_cov.scale_intervals and entry.resident_scale_intervals else 0
+    )
+    return _entry_payload_overlap_bytes(req_cov, entry) + scale_ov
+
+
+def _materialize_runs(runs: Iterable[AddressRun]) -> tuple[tuple[int, int], ...]:
+    ivs: list[tuple[int, int]] = []
+    for run in runs:
+        if run.rows <= 0 or run.row_bytes <= 0:
+            continue
+        if run.rows == 1 or run.stride_bytes <= run.row_bytes:
+            ivs.append((run.base_byte, _run_end(run)))
+        else:
+            base, stride, width = run.base_byte, run.stride_bytes, run.row_bytes
+            ivs.extend((addr, addr + width) for addr in range(base, base + run.rows * stride, stride))
+    return _merge_byte_intervals(ivs)
+
+
+def _single_span_hit_bytes(
+    base: int, logical_len: int, aligned_len: int, sec: int, align: int, interval_overlap_fn,
+) -> int:
+    s_lo = (base // sec) * sec
+    s_hi = _align_up(base + logical_len, sec)
+    sec_ov = interval_overlap_fn(s_lo, s_hi)
+    if sec_ov <= 0:
+        return 0
+    if sec_ov >= s_hi - s_lo:
+        return aligned_len
+    if base % align == 0:
+        return min(aligned_len, interval_overlap_fn(base, base + aligned_len))
+    log_ov = interval_overlap_fn(base, base + logical_len)
+    return min(aligned_len, int(round(aligned_len * (float(log_ov) / float(logical_len)))))
+
+
+def _run_hit_bytes(
+    run: AddressRun, rows_eff: int, run_aligned: int, sec: int, align: int,
+    overlap_fn, interval_overlap_fn,
+) -> int:
+    run_cov = AddressRunPlan((run,), sector_bytes=sec).sector_coverage()
+    run_req = _cov_payload_bytes(run_cov)
+    if run_req <= 0:
+        return 0
+    run_ov = overlap_fn(run_cov)
+    if run_ov <= 0:
+        return 0
+    if run_ov >= run_req:
+        return run_aligned
+    if run.stride_bytes == run.row_bytes:
+        return _single_span_hit_bytes(
+            run.base_byte, rows_eff * run.row_bytes, run_aligned, sec, align, interval_overlap_fn,
+        )
+    row_align = _align_up(run.row_bytes, align)
+    if run.stride_bytes == 0:
+        return rows_eff * _single_span_hit_bytes(
+            run.base_byte, run.row_bytes, row_align, sec, align, interval_overlap_fn,
+        )
+    if rows_eff <= _MAX_EXPLICIT_SECTOR_INTERVALS:
+        hit_sum = 0
+        for step in range(rows_eff):
+            addr = run.base_byte + step * run.stride_bytes
+            hit_sum += _single_span_hit_bytes(
+                addr, run.row_bytes, row_align, sec, align, interval_overlap_fn,
+            )
+        return hit_sum
+    return min(run_aligned, int(round(run_aligned * (float(run_ov) / float(run_req)))))
+
+
+def _plan_hit_bytes(
+    plan: AddressRunPlan, overlap_fn, interval_overlap_fn,
+    resident_scale_intervals: tuple[tuple[int, int], ...], aligned_bytes: int,
+) -> int:
+    """Weighted aligned copy hit bytes across per-row/run payload spans and disjoint scale sectors."""
+    seen_aliases: set[str] = set()
+    plan_aligned = 0
+    plan_hit = 0
+    sec = plan.sector_bytes
+    align = plan.alignment_bytes
+    for run in plan.runs:
+        if run.rows == 0 or run.row_bytes == 0:
+            continue
+        if run.proven_alias_group is not None:
+            if run.proven_alias_group in seen_aliases:
+                continue
+            seen_aliases.add(run.proven_alias_group)
+            rows_eff = 1 if run.stride_bytes == 0 else run.rows
+        else:
+            rows_eff = run.rows
+        run_aligned = (
+            _align_up(rows_eff * run.row_bytes, align)
+            if run.stride_bytes == run.row_bytes
+            else rows_eff * _align_up(run.row_bytes, align)
+        )
+        plan_aligned += run_aligned
+        plan_hit += _run_hit_bytes(
+            run, rows_eff, run_aligned, sec, align, overlap_fn, interval_overlap_fn,
+        )
+    scale_span = plan.scale_span() if plan_aligned > 0 else None
+    if scale_span is not None:
+        scale_lo, scale_hi = scale_span
+        scale_aligned = _align_up(plan.scale_bytes, align)
+        plan_aligned += scale_aligned
+        if resident_scale_intervals:
+            from ._periodic_stream import _overlap_canonical_intervals
+            plan_hit += _single_span_hit_bytes(
+                scale_lo, scale_hi - scale_lo, scale_aligned, sec, align,
+                lambda lo, hi: _overlap_canonical_intervals(((lo, hi),), resident_scale_intervals),
+            )
+    if plan_aligned <= 0:
+        return 0
+    if aligned_bytes == plan_aligned:
+        return plan_hit
+    return min(aligned_bytes, int(round(aligned_bytes * (float(plan_hit) / float(plan_aligned)))))
 
 
 class AdmissionMemoryView:
@@ -253,11 +422,13 @@ class AdmissionMemoryView:
             digest.update(repr(fields).encode())
             digest.update(b"\n")
 
-        def coverage(intervals, periodic):
+        def coverage(intervals, periodic, scale_intervals=()):
             for interval in intervals:
                 record("interval", interval)
             for run in periodic:
                 record("periodic", run)
+            for interval in scale_intervals:
+                record("scale", interval)
 
         record("arch", self.arch_id)
         for key, users in sorted(self._template_key_users.items(), key=lambda pair: repr(pair[0])):
@@ -273,7 +444,8 @@ class AdmissionMemoryView:
                    sorted(map(repr, self._active_keys[rank])))
             for writeback in self._pending_writebacks[rank]:
                 record("writeback", writeback.key, writeback.bytes)
-                coverage(writeback.coverage.intervals or writeback.ranges, writeback.coverage.periodic)
+                coverage(writeback.coverage.intervals or writeback.ranges,
+                         writeback.coverage.periodic, writeback.coverage.scale_intervals)
         for key, entry in self._resident.items():
             if die is not None and die != key.die:
                 continue
@@ -282,9 +454,11 @@ class AdmissionMemoryView:
                    entry.line_footprint_bytes)
             intervals = entry.resident_intervals_mut
             coverage(entry.resident_coverage.intervals if intervals is None else intervals,
-                     entry.resident_coverage.periodic if intervals is None else ())
+                     entry.resident_coverage.periodic if intervals is None else (),
+                     entry.resident_scale_intervals)
             record("dirty")
-            coverage(entry.dirty_coverage.intervals or entry.dirty_ranges, entry.dirty_coverage.periodic)
+            coverage(entry.dirty_coverage.intervals or entry.dirty_ranges,
+                     entry.dirty_coverage.periodic, entry.dirty_coverage.scale_intervals)
         return digest.hexdigest()
 
     def reserved_bytes(self, die: int) -> int:
@@ -305,8 +479,10 @@ class AdmissionMemoryView:
         return granule * (avail // (granule * n_active))
 
     def _hit_fraction(self, working_set: int, capacity: int, *, die: int | None = None) -> float:
+        if capacity <= 0:
+            return 0.0
         curve = self._knee_curves_by_die.get(self._default_die if die is None else die, ())
-        if not curve or capacity <= 0:
+        if not curve:
             return float(working_set <= capacity)
         pressure = working_set / capacity
         x0, y0 = curve[0]
@@ -321,7 +497,7 @@ class AdmissionMemoryView:
     def _settle_eviction(self, entry: _ResidentL2Entry) -> None:
         if entry.dirty and entry.has_future_reader:
             wb_bytes = (
-                _merged_bytes(entry.dirty_coverage)
+                _cov_bytes(entry.dirty_coverage)
                 or _measure_byte_intervals(entry.dirty_ranges)
                 or entry.working_set_bytes
             )
@@ -440,7 +616,7 @@ class AdmissionMemoryView:
             item_cov = item.coverage if not item.coverage.empty else SectorCoverage(intervals=item.ranges)
             if (item.key.backing_allocation == allocation
                     and item.key.tensor_version == version
-                    and _coverage_overlap(coverage, item_cov) > 0):
+                    and _cov_overlap(coverage, item_cov) > 0):
                 matched.append(item)
             else:
                 kept.append(item)
@@ -540,10 +716,10 @@ class AdmissionMemoryView:
     ) -> tuple[int, int]:
         if req_cov.empty or res_cov.empty:
             return 0, aligned_bytes
-        req_b = _merged_bytes(req_cov)
+        req_b = _cov_bytes(req_cov)
         if req_b <= 0:
             return 0, aligned_bytes
-        ov_b = _coverage_overlap(req_cov, res_cov)
+        ov_b = _cov_overlap(req_cov, res_cov)
         if ov_b <= 0:
             return 0, aligned_bytes
         if ov_b >= req_b:
@@ -562,6 +738,14 @@ class AdmissionMemoryView:
         granule = self._granule_by_die[key.die]
         return granule * (avail // (granule * n_eff))
 
+    def access_geometry(
+        self, pattern: MemoryAccessPattern, aligned_bytes: int | None = None,
+    ) -> tuple[SectorCoverage, int]:
+        """Return die-resolved sector coverage and L2 working-set footprint."""
+        if aligned_bytes is None:
+            aligned_bytes = pattern.runs.aligned_copy_bytes()
+        return self._geometry(pattern, aligned_bytes)
+
     def _geometry(self, pattern: MemoryAccessPattern, aligned_bytes: int) -> tuple[SectorCoverage, int]:
         plan = _access_plan(pattern.runs, self.memory_access_for(pattern.die))
         # Track residency at DRAM sector granularity so L2 never credits hits
@@ -570,24 +754,31 @@ class AdmissionMemoryView:
         coverage = plan.sector_coverage()
         alloc_granule = plan.l2_line_bytes or plan.l2_sector_bytes
         if alloc_granule and alloc_granule != plan.sector_bytes:
-            span = (
+            payload_span = (
                 plan.runs[0].sector_union_bytes(alloc_granule) if len(plan.runs) == 1
-                else _merged_bytes(replace(plan, sector_bytes=alloc_granule).sector_coverage())
+                else _cov_payload_bytes(replace(plan, sector_bytes=alloc_granule, scale_bytes=0).sector_coverage())
             )
+            scale_alloc = _measure_byte_intervals(plan.scale_sector_intervals(alloc_granule))
+            span = payload_span + scale_alloc
         else:
-            span = _merged_bytes(coverage)
+            span = _cov_bytes(coverage)
         reuse_distance = pattern.reuse_distance_bytes
-        return coverage, max(aligned_bytes if reuse_distance is None else reuse_distance, span)
+        base_ws = span if not coverage.empty else aligned_bytes
+        return coverage, (base_ws if reuse_distance is None else max(reuse_distance, span))
 
     @staticmethod
     def _footprint(coverage: SectorCoverage, line_bytes: int | None) -> int:
         if line_bytes is None:
-            return _merged_bytes(coverage)
+            return _cov_bytes(coverage)
+        from ._periodic_stream import _aligned_intervals_bytes
+        scale_fp = (
+            _aligned_intervals_bytes(coverage.scale_intervals, line_bytes)
+            if coverage.scale_intervals else 0
+        )
         if not coverage.periodic:
-            from ._periodic_stream import _aligned_intervals_bytes
-            return _aligned_intervals_bytes(coverage.intervals, line_bytes)
+            return _aligned_intervals_bytes(coverage.intervals, line_bytes) + scale_fp
         lines = AddressRunPlan(tuple(_coverage_runs(coverage)), sector_bytes=line_bytes)
-        return _merged_bytes(lines.sector_coverage())
+        return _cov_payload_bytes(lines.sector_coverage()) + scale_fp
 
     def _policy(self, pattern: MemoryAccessPattern) -> str:
         return (pattern.cache_policy if self.arch_id is None
@@ -618,22 +809,39 @@ class AdmissionMemoryView:
         self, pattern, aligned_bytes, eff, coverage, working_set, entry,
     ) -> tuple[int, int, int | None]:
         """Return ``(hit, miss, overlap_bytes_or_None)`` using one overlap scan."""
+        if eff <= 0:
+            return 0, aligned_bytes, None
         if pattern.direction == "read":
-            if entry is not None:
-                fraction = self._hit_fraction(max(working_set, entry.working_set_bytes), eff, die=pattern.die)
-                if fraction:
-                    req_b = _merged_bytes(coverage)
-                    ov_b = 0 if req_b <= 0 else _entry_overlap_bytes(coverage, entry)
-                    if ov_b <= 0:
-                        return 0, aligned_bytes, 0
-                    hit = (aligned_bytes if ov_b >= req_b
-                           else min(aligned_bytes, int(round(aligned_bytes * (float(ov_b) / float(req_b))))))
-                    if fraction != 1.0:
-                        hit = round(hit * fraction)
+            if entry is None:
+                return 0, aligned_bytes, None
+            fraction = self._hit_fraction(max(working_set, entry.working_set_bytes), eff, die=pattern.die)
+            if not fraction:
+                return 0, aligned_bytes, None
+            plan = _access_plan(pattern.runs, self.memory_access_for(pattern.die))
+            ov_cached: int | None = None
+            if len(plan.runs) == 1 and not coverage.scale_intervals:
+                req_b = _cov_payload_bytes(coverage)
+                ov_b = 0 if req_b <= 0 else _entry_payload_overlap_bytes(coverage, entry)
+                if ov_b <= 0:
+                    return 0, aligned_bytes, 0
+                if ov_b >= req_b:
+                    hit = aligned_bytes if fraction == 1.0 else round(aligned_bytes * fraction)
                     return hit, aligned_bytes - hit, ov_b
-        elif (pattern.visibility.private_workspace and not pattern.visibility.live_out
-              and working_set <= eff
-              and not (self.arch_id is None and pattern.cache_policy == CACHE_POLICY_LAST_USE)):
+                ov_cached = ov_b
+            hit = _plan_hit_bytes(
+                plan,
+                lambda rc: _entry_payload_overlap_bytes(rc, entry),
+                lambda lo, hi: _entry_interval_overlap(lo, hi, entry),
+                entry.resident_scale_intervals,
+                aligned_bytes,
+            )
+            if fraction != 1.0:
+                hit = round(hit * fraction)
+            hit = max(0, min(aligned_bytes, hit))
+            return hit, aligned_bytes - hit, ov_cached
+        if (pattern.visibility.private_workspace and not pattern.visibility.live_out
+                and working_set <= eff
+                and not (self.arch_id is None and pattern.cache_policy == CACHE_POLICY_LAST_USE)):
             return aligned_bytes, 0, None
         return 0, aligned_bytes, None
 
@@ -644,21 +852,33 @@ class AdmissionMemoryView:
         )
         return hit, miss
 
-    def preview_access(self, pattern: MemoryAccessPattern, aligned_bytes: int) -> tuple[int, int]:
-        """Read-only hit and miss copy bytes."""
+    def preview_access(
+        self, pattern: MemoryAccessPattern, aligned_bytes: int | None = None,
+    ) -> tuple[int, int]:
+        """Pure read-only addressed hit and miss copy bytes."""
+        if aligned_bytes is None:
+            aligned_bytes = pattern.runs.aligned_copy_bytes()
         key = self._key(pattern, aligned_bytes)
         if key is None:
             return 0, max(0, aligned_bytes)
         eff = self._preview_effective_l2(key)
+        if eff <= 0:
+            return 0, aligned_bytes
         coverage, working_set = self._geometry(pattern, aligned_bytes)
         entry = self._existing(pattern, key, eff, preview=True)
         return self._classify_access(pattern, aligned_bytes, eff, coverage, working_set, entry)
 
-    def resident_coverage_for(self, pattern: MemoryAccessPattern, aligned_bytes: int) -> SectorCoverage:
+    def resident_coverage_for(
+        self, pattern: MemoryAccessPattern, aligned_bytes: int | None = None,
+    ) -> SectorCoverage:
         """Return eligible address coverage before applying any statistical spill."""
+        if aligned_bytes is None:
+            aligned_bytes = pattern.runs.aligned_copy_bytes()
         key = self._key(pattern, aligned_bytes)
         if key is not None and pattern.direction == "read":
             eff = self._preview_effective_l2(key)
+            if eff <= 0:
+                return SectorCoverage()
             existing = self._existing(pattern, key, eff, preview=True)
             if existing is not None:
                 coverage, working_set = self._geometry(pattern, aligned_bytes)
@@ -668,20 +888,56 @@ class AdmissionMemoryView:
                     return existing.coverage_snapshot()
         return SectorCoverage()
 
-    def resident_intervals_for(self, pattern: MemoryAccessPattern, aligned_bytes: int) -> tuple[tuple[int, int], ...]:
+    def resident_intervals_for(
+        self, pattern: MemoryAccessPattern, aligned_bytes: int | None = None,
+    ) -> tuple[tuple[int, int], ...]:
         """Return currently resident L2 sector intervals applicable to ``pattern``."""
-        return self.resident_coverage_for(pattern, aligned_bytes).intervals
+        if aligned_bytes is None:
+            aligned_bytes = pattern.runs.aligned_copy_bytes()
+        res_cov = self.resident_coverage_for(pattern, aligned_bytes)
+        if not res_cov.intervals and not res_cov.periodic:
+            return ()
+        plan = _access_plan(pattern.runs, self.memory_access_for(pattern.die))
+        req_cov = plan.sector_coverage()
+        if not req_cov.intervals and not req_cov.periodic:
+            return ()
+        if not req_cov.periodic and not res_cov.periodic:
+            return _intersect_byte_intervals(req_cov.intervals, res_cov.intervals)
+        warm = (
+            run for is_warm, run in _residency_runs(
+                tuple(_coverage_runs(req_cov)), tuple(_coverage_runs(res_cov)),
+            ) if is_warm
+        )
+        return _materialize_runs(warm)
 
     def miss_intervals(
-        self, pattern: MemoryAccessPattern, aligned_bytes: int,
+        self, pattern: MemoryAccessPattern, aligned_bytes: int | None = None,
     ) -> tuple[tuple[int, int], ...]:
         """Return exact missed sector byte intervals for ``pattern`` against current L2."""
-        req_ivs = pattern.runs.sector_intervals()
-        res_ivs = self.resident_intervals_for(pattern, aligned_bytes)
-        return _subtract_byte_intervals(req_ivs, res_ivs) if res_ivs else req_ivs
+        if aligned_bytes is None:
+            aligned_bytes = pattern.runs.aligned_copy_bytes()
+        plan = _access_plan(pattern.runs, self.memory_access_for(pattern.die))
+        req_cov = plan.sector_coverage()
+        if not req_cov.intervals and not req_cov.periodic:
+            return ()
+        res_cov = self.resident_coverage_for(pattern, aligned_bytes)
+        if not req_cov.periodic and not res_cov.periodic:
+            return _subtract_byte_intervals(req_cov.intervals, res_cov.intervals) if res_cov.intervals else req_cov.intervals
+        if not res_cov.intervals and not res_cov.periodic:
+            return _materialize_runs(_coverage_runs(req_cov))
+        cold = (
+            run for is_warm, run in _residency_runs(
+                tuple(_coverage_runs(req_cov)), tuple(_coverage_runs(res_cov)),
+            ) if not is_warm
+        )
+        return _materialize_runs(cold)
 
-    def admit_access(self, pattern: MemoryAccessPattern, aligned_bytes: int) -> tuple[int, int]:
+    def admit_access(
+        self, pattern: MemoryAccessPattern, aligned_bytes: int | None = None,
+    ) -> tuple[int, int]:
         """Classify copy bytes and update exact address coverage and LRU state."""
+        if aligned_bytes is None:
+            aligned_bytes = pattern.runs.aligned_copy_bytes()
         hit, miss, _ = self._admit_access_with_prior(pattern, aligned_bytes)
         return hit, miss
 
@@ -692,6 +948,11 @@ class AdmissionMemoryView:
         resident_span: int, overlap: int,
     ) -> bool:
         """Attempt exact merge into ``existing``; returns True if updated in-place."""
+        if eff <= 0:
+            return False
+        from ._periodic_stream import _aligned_intervals_bytes, _merge_canonical_pairs
+        merged_scale_ivs = _merge_canonical_pairs(existing.resident_scale_intervals, coverage.scale_intervals)
+        merged_scale_bytes = _measure_byte_intervals(merged_scale_ivs)
         merged_span = existing.resident_bytes + resident_span - overlap
         spec = self.memory_access_for(pattern.die)
         line = (
@@ -700,6 +961,10 @@ class AdmissionMemoryView:
         )
         if line == pattern.runs.sector_bytes:
             line = None
+        scale_fp = (
+            _aligned_intervals_bytes(merged_scale_ivs, line)
+            if (line and merged_scale_ivs) else merged_scale_bytes
+        )
         can_list_merge = (
             not coverage.periodic
             and (existing.resident_intervals_mut is not None or not existing.resident_coverage.periodic)
@@ -713,7 +978,8 @@ class AdmissionMemoryView:
             lo_idx, hi_idx, merged_mid, new_fp = _plan_canonical_list_merge(
                 ivs, coverage.intervals, existing.line_footprint_bytes, line,
             )
-            footprint = merged_span if new_fp is None else new_fp
+            payload_fp = (merged_span - merged_scale_bytes) if new_fp is None else new_fp
+            footprint = payload_fp + scale_fp
             merged_ws = max(existing.working_set_bytes, working_set, footprint)
             if not (self._hit_fraction(merged_ws, eff, die=pattern.die)
                     if read and not existing.dirty else merged_ws <= eff):
@@ -721,6 +987,7 @@ class AdmissionMemoryView:
             ivs[lo_idx:hi_idx] = merged_mid
             existing.working_set_bytes = merged_ws
             existing.resident_bytes = merged_span
+            existing.resident_scale_intervals = merged_scale_ivs
             existing.line_footprint_bytes = new_fp
             existing.cache_policy = pattern.cache_policy
             if dirty:
@@ -740,7 +1007,8 @@ class AdmissionMemoryView:
         existing.resident_coverage = base_cov.union(coverage) if merged is None else merged
         existing.working_set_bytes = merged_ws
         existing.resident_bytes = merged_span
-        existing.line_footprint_bytes = footprint if line else None
+        existing.resident_scale_intervals = merged_scale_ivs
+        existing.line_footprint_bytes = (footprint - scale_fp) if line else None
         existing.cache_policy = pattern.cache_policy
         if dirty:
             existing.dirty = True
@@ -771,13 +1039,13 @@ class AdmissionMemoryView:
         self._last_prior_coverage = prior_out
         read = pattern.direction == "read"
         legacy_last = self.arch_id is None and pattern.cache_policy == CACHE_POLICY_LAST_USE
-        if read and legacy_last and existing is not None and working_set <= eff:
+        if read and legacy_last and existing is not None and eff > 0 and working_set <= eff:
             if not existing.dirty:
                 existing.evicted = True
             return hit, miss, prior_out
 
         previous = self._resident.get(key)
-        if legacy_last or not (self._hit_fraction(working_set, eff, die=key.die) if read else working_set <= eff):
+        if eff <= 0 or legacy_last or not (self._hit_fraction(working_set, eff, die=key.die) if read else working_set <= eff):
             if previous is not None and not previous.evicted:
                 self._settle_eviction(previous)
             return hit, miss, prior_out
@@ -785,7 +1053,7 @@ class AdmissionMemoryView:
         dirty = not read and hit > 0
         merge = existing is not None and (read or dirty)
         dirty_cov = coverage if dirty else SectorCoverage()
-        resident_span = _merged_bytes(coverage)
+        resident_span = _cov_bytes(coverage)
         if merge:
             if read and not miss:
                 existing.cache_policy = pattern.cache_policy
@@ -805,7 +1073,7 @@ class AdmissionMemoryView:
             dirty=dirty, private_workspace=pattern.visibility.private_workspace,
             resident_coverage=coverage, resident_bytes=resident_span,
             dirty_ranges=dirty_cov.intervals, dirty_coverage=dirty_cov, cache_policy=pattern.cache_policy,
-            line_footprint_bytes=None,
+            line_footprint_bytes=None, resident_scale_intervals=coverage.scale_intervals,
         ))
         self._evict_over_capacity(key.die, protect_key=key)
         return hit, miss, prior_out
@@ -884,38 +1152,41 @@ def _dram_segments(
     plan: AddressRunPlan, covered: SectorCoverage,
     *, burst_rules: Sequence[BurstTurnRule] = (),
 ) -> Iterator[tuple[int, int, int, AddressRun | None]]:
-    partial = not covered.empty
+    covered_payload = _payload_only(covered)
+    partial = not covered_payload.empty
     sec = plan.sector_bytes
     ordered = _canonical_dram_runs(plan, burst_rules)
-    missed_sectors = False
     for run in ordered:
         if not partial and len(ordered) == 1:
-            missed_sectors = True
             yield run.sector_union_bytes(sec), run.row_bytes, run.stride_bytes, run
             continue
         run_cov = AddressRunPlan((run,), sector_bytes=sec).sector_coverage()
         if not partial or run_cov.periodic:
-            missed = (_merged_bytes(run_cov) - _coverage_overlap(run_cov, covered)
-                      if run_cov.periodic or covered.periodic else
-                      _measure_byte_intervals(_subtract_byte_intervals(run_cov.intervals, covered.intervals)))
+            missed = (_cov_payload_bytes(run_cov) - _cov_overlap(run_cov, covered_payload)
+                      if run_cov.periodic or covered_payload.periodic else
+                      _measure_byte_intervals(_subtract_byte_intervals(run_cov.intervals, covered_payload.intervals)))
             if missed > 0:
-                missed_sectors = True
                 yield missed, run.row_bytes, run.stride_bytes, run
         else:
-            intervals = (run_cov.intervals if covered.periodic else
-                         _subtract_byte_intervals(run_cov.intervals, covered.intervals))
+            intervals = (run_cov.intervals if covered_payload.periodic else
+                         _subtract_byte_intervals(run_cov.intervals, covered_payload.intervals))
             for lo, hi in intervals:
                 span = hi - lo
-                if covered.periodic:
-                    span -= SectorCoverage(intervals=((lo, hi),)).overlap_bytes(covered)
+                if covered_payload.periodic:
+                    span -= SectorCoverage(intervals=((lo, hi),)).overlap_bytes(covered_payload)
                 if span > 0:
-                    missed_sectors = True
                     stride = run.stride_bytes
                     yield span, span, stride if stride == 0 or stride > run.row_bytes else span, run
         if len(ordered) > 1:
-            covered = covered.union(run_cov)
-    if missed_sectors and plan.scale_bytes:
-        yield ((plan.scale_bytes + sec - 1) // sec) * sec, 0, 0, None
+            covered_payload = covered_payload.union(run_cov)
+    if ordered and plan.scale_bytes:
+        req_scale = plan.scale_sector_intervals(sec)
+        missed_scale = _measure_byte_intervals(
+            _subtract_byte_intervals(req_scale, covered.scale_intervals)
+            if covered.scale_intervals else req_scale
+        )
+        if missed_scale > 0:
+            yield missed_scale, 0, 0, None
 
 
 def _missed_dram_sector_and_service(
@@ -1002,8 +1273,14 @@ def bind_memory_access(
                 plan, res_cov, burst_rules,
             )
             if isinstance(state, AdmissionMemoryView) and state._knee_curves_by_die.get(pattern.die):
-                coverage, _ = state._geometry(pattern, aligned_bytes)
-                spatial_hits, _ = state._coverage_hit_miss(coverage, res_cov, aligned_bytes)
+                res_payload = _payload_only(res_cov)
+                spatial_hits = _plan_hit_bytes(
+                    plan,
+                    lambda rc: _cov_overlap(rc, res_payload),
+                    lambda lo, hi: _cov_overlap(SectorCoverage(intervals=((lo, hi),), _canonical=True), res_payload),
+                    res_cov.scale_intervals,
+                    aligned_bytes,
+                )
                 if spatial_hits > hit_bytes:
                     spill = (spatial_hits - hit_bytes) / spatial_hits
                     cold_sectors, cold_service = plan.dram_sector_and_service(burst_rules)

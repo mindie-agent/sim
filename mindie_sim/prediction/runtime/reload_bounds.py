@@ -16,7 +16,7 @@ from math import gcd, isqrt, lcm
 from typing import Any
 
 from mindie_sim.prediction.runtime.memory_physics import AddressRun
-from mindie_sim.templates.contracts import FusedRegionSummary, TensorRangeObligation
+from mindie_sim.templates.contracts import FusedRegionSummary, TensorRangeObligation, compose_step_obligations
 
 SECTOR_BYTES = 32
 BITS_PER_BYTE = 8
@@ -217,17 +217,11 @@ def compute_compulsory_hbm_cut(
         raise ValueError("sector size must be positive")
     reads: dict[tuple[int, str, int], _SectorSet] = defaultdict(_SectorSet)
     writes: dict[tuple[int, str, int], _SectorSet] = defaultdict(_SectorSet)
-    produced: set[tuple[int, str, int]] = set()
-    for summary in summaries:
-        for item in summary.read_obligations:
-            key = (item.die, item.allocation_id, item.tensor_version)
-            if item.initial_residency == "hbm_cold" and key not in produced:
-                reads[key].add(item, sector_bytes)
-        for item in summary.write_obligations:
-            key = (item.die, item.allocation_id, item.tensor_version)
-            produced.add(key)
-            if item.required_final_visibility in {"device", "host"}:
-                writes[key].add(item, sector_bytes)
+    read_obligations, write_obligations = compose_step_obligations(summaries)
+    for item in read_obligations:
+        reads[(item.die, item.allocation_id, item.tensor_version)].add(item, sector_bytes)
+    for item in write_obligations:
+        writes[(item.die, item.allocation_id, item.tensor_version)].add(item, sector_bytes)
 
     totals: dict[int, CompulsoryHbmCut] = {}
     for (die, _, _), sectors in reads.items():

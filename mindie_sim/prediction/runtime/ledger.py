@@ -156,16 +156,19 @@ def _finite2(value, reason: str) -> float:
 
 @dataclass(slots=True)
 class BackingRecord:
-    """One physical backing: canonical union plus its live holders.
+    """One physical backing: canonical union plus its live holders and active reader pins.
 
     ``segments`` is an ordered disjoint list of ``(lo, hi)``; ``holders`` maps
-    an AllocationKey to its normalised ranges.  Bytes are counted once per
-    backing regardless of how many holders reference the same range.
+    an AllocationKey to its normalised ranges and ``reader_pins`` pins byte
+    ranges for active reader leases (including aliases). Bytes are counted once
+    per backing regardless of how many holders or readers reference the same range.
     """
 
     key: BackingKey
     pool: PoolKey
     holders: dict[AllocationKey, tuple[tuple[int, int], ...]] = field(
+        default_factory=dict)
+    reader_pins: dict[ReaderKey, tuple[tuple[int, int], ...]] = field(
         default_factory=dict)
     segments: tuple[tuple[int, int], ...] = ()
     parent: AllocationKey | None = None
@@ -184,7 +187,10 @@ class BackingRecord:
         )
 
     def rebuild(self) -> int:
-        parts = [part for value in self.holders.values() for part in value]
+        parts = [
+            *(part for value in self.holders.values() for part in value),
+            *(part for value in self.reader_pins.values() for part in value),
+        ]
         before = self.used_bytes
         self.segments = union_ranges(parts)
         return self.used_bytes - before
@@ -343,6 +349,7 @@ class Ledger:
                 record = BackingRecord(
                     key=live.key, pool=live.pool,
                     holders=dict(live.holders),
+                    reader_pins=dict(live.reader_pins),
                     segments=live.segments, parent=live.parent)
             backings[item.backing] = record
         elif record.pool != item.pool:
@@ -475,7 +482,7 @@ class Ledger:
 
         # Commit all components.
         for backing, record in backings.items():
-            if not record.holders:
+            if not record.holders and not record.reader_pins:
                 continue
             domain = cls._domain_for_pool(state, record.pool)
             domain.backings[backing] = record
@@ -534,6 +541,12 @@ class Ledger:
                 raise LedgerError("reader_ranges_outside_allocation")
         else:
             requested = grant.ranges
+        if grant.backing is not None and requested:
+            record = domain.backings.get(grant.backing)
+            if record is None:
+                raise LedgerError("backing_not_live")
+            if not record.contains(requested):
+                raise LedgerError("reader_ranges_not_backed")
         ordinal = len(grant.readers)
         key = ReaderKey(allocation=allocation, event=event_key, ordinal=ordinal)
         while key in domain.readers:
@@ -544,12 +557,37 @@ class Ledger:
             key=key, allocation=allocation, backing=grant.backing,
             ranges=requested)
         grant.readers.add(key)
+        if grant.backing is not None and requested:
+            record = domain.backings[grant.backing]
+            record.reader_pins[key] = requested
+            record.rebuild()
         domain.epoch += 1
         return key
 
+    @staticmethod
+    def _ready_to_complete(grant: _Grant) -> bool:
+        return (
+            grant.deferred and not grant.released
+            and not grant.readers and not grant.children and not grant.pending_uses
+        )
+
+    @staticmethod
+    def _merge_freed(
+        left: Sequence[tuple[PoolKey, float]], right: Sequence[tuple[PoolKey, float]],
+    ) -> tuple[tuple[PoolKey, float], ...]:
+        if not left:
+            return tuple(right)
+        if not right:
+            return tuple(left)
+        totals: dict[PoolKey, float] = {}
+        for pool, amount in (*left, *right):
+            if amount > 0.0:
+                totals[pool] = totals.get(pool, 0.0) + float(amount)
+        return tuple(totals.items())
+
     @classmethod
     def retire_reader(cls, state, reader: ReaderKey) -> ReleaseResult:
-        """End a real reader lease and complete a matching deferred release."""
+        """End a real reader lease and complete any unblocked deferred release."""
         domain, grant = cls._find_grant(state, reader.allocation)
         if grant is None:
             raise LedgerError("allocation_not_live")
@@ -559,10 +597,30 @@ class Ledger:
         lease.active = False
         del domain.readers[reader]
         grant.readers.discard(reader)
-        result = ReleaseResult(released=False, epoch=domain.epoch)
-        if (grant.deferred and not grant.readers and not grant.children
-                and not grant.pending_uses):
-            result = cls._complete_release(state, domain, grant)
+        freed: list[tuple[PoolKey, float]] = []
+        if lease.backing is not None:
+            record = domain.backings.get(lease.backing)
+            if record is not None and reader in record.reader_pins:
+                record.reader_pins.pop(reader, None)
+                freed_bytes = -record.rebuild()
+                if not record.holders and not record.reader_pins:
+                    domain.backings.pop(lease.backing, None)
+                if freed_bytes > 0:
+                    current = float(domain.current.get(record.pool, 0.0))
+                    domain.current[record.pool] = max(0.0, current - float(freed_bytes))
+                    freed.append((record.pool, float(freed_bytes)))
+                    domain.epoch += 1
+        result = ReleaseResult(
+            released=False, epoch=domain.epoch, freed_by_pool=tuple(freed),
+        )
+        if cls._ready_to_complete(grant):
+            completed = cls._complete_release(state, domain, grant)
+            result = ReleaseResult(
+                released=completed.released,
+                deferred=completed.deferred,
+                epoch=completed.epoch,
+                freed_by_pool=cls._merge_freed(freed, completed.freed_by_pool),
+            )
         return result
 
     @classmethod
@@ -582,8 +640,7 @@ class Ledger:
             while progressed:
                 progressed = False
                 for grant in tuple(domain.grants.values()):
-                    if (not grant.deferred or grant.readers or grant.children
-                            or grant.pending_uses):
+                    if not cls._ready_to_complete(grant):
                         continue
                     results.append(cls._complete_release(state, domain, grant))
                     progressed = True
@@ -641,19 +698,27 @@ class Ledger:
                 record = domain.backings.get(grant.backing)
                 if record is not None:
                     record.holders.pop(grant.key, None)
-                    record.rebuild()
-                    if not record.holders:
+                    freed_bytes = -record.rebuild()
+                    if not record.holders and not record.reader_pins:
                         domain.backings.pop(grant.backing, None)
+                    if freed_bytes > 0:
+                        current = float(domain.current.get(grant.pool, 0.0))
+                        domain.current[grant.pool] = max(0.0, current - float(freed_bytes))
+                        freed.append((grant.pool, float(freed_bytes)))
             grant.released = True
             domain.grants.pop(grant.key, None)
             domain.epoch += 1
-            return ReleaseResult(released=True, epoch=domain.epoch)
+            if parent is not None and cls._ready_to_complete(parent):
+                parent_result = cls._complete_release(state, domain, parent)
+                freed = list(cls._merge_freed(freed, parent_result.freed_by_pool))
+            return ReleaseResult(released=True, epoch=domain.epoch,
+                                 freed_by_pool=tuple(freed))
         if grant.backing is not None:
             record = domain.backings.get(grant.backing)
             if record is not None:
                 record.holders.pop(grant.key, None)
                 freed_bytes = -record.rebuild()
-                if not record.holders:
+                if not record.holders and not record.reader_pins:
                     domain.backings.pop(grant.backing, None)
                 current = float(domain.current.get(grant.pool, 0.0))
                 current = max(0.0, current - max(0.0, freed_bytes))
