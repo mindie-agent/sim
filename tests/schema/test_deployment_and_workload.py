@@ -29,10 +29,11 @@ from mindie_sim.catalog.projection_placement import projection_placement, projec
 from mindie_sim.catalog.weight_terms import WeightTerm, term_bytes
 from mindie_sim.catalog.weights import body_head_terms, layer_weight_terms
 from mindie_sim.cli.options import add_runtime_arguments, case_overrides
-from mindie_sim.compose import assemble
 from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.execution.dispatch import cohorts
+from mindie_sim.prediction.frontend import Frontend
+from mindie_sim.prediction.scheduler import Scheduler
 from mindie_sim.prediction.operators.moe_routing.expert_slot_work import bind_expert_slot_work, physical_slot_work
 from mindie_sim.prediction.sharding.local_tp import lower_local_projection_tp
 from mindie_sim.prediction.lowering import Builder
@@ -340,21 +341,37 @@ def test_stack_exclusions_remove_bindings_before_graph_lowering(recommended):
     else:
         assert not case.runtime.kernels and case.runtime.graph_capture_mode == "none"
 
-@pytest.mark.parametrize("proposals,acceptance,iterations,tokens,requests,expected,contexts", [
-    (5, 6, 1, 6, None, [6], [4]), (5, 3.5, 2, 4, None, [6, 5, 2], [4, 7, 10]),
-    (2, 1.5, 3, 1, ("r0", "r1"), [2, 2, 2, 2, 1], None),
+@pytest.mark.parametrize("proposals,acceptance,quota,requests,expected,contexts", [
+    (5, 6, 6, ("r",), [6], [4]), (5, 3.5, 8, ("r",), [6, 5, 2], [4, 7, 10]),
+    (2, 1.5, 3, ("r0", "r1"), [2, 2, 2, 2, 1], None),
 ])
 def test_speculative_model_and_service_share_the_valid_token_ledger(
-        proposals, acceptance, iterations, tokens, requests, expected, contexts):
+        proposals, acceptance, quota, requests, expected, contexts):
+    output = 3 if len(requests) > 1 else 8
     raw = stack_case("glm-5.3-flash", tp=1, dp=1, ep=1, raw_eager=True, prompt_tokens=4,
-                     graph_capture_mode="none", output_tokens=3 if requests else 8,
+                     graph_capture_mode="none", output_tokens=output,
                      mtp_proposal_tokens=proposals, mtp_acceptance_length=acceptance,
-                     **({"max_num_batched_tokens": 2} if requests else {}))
-    rows = [dict(request_id=key, prompt_tokens=4, output_tokens=3) for key in requests] if requests else None
-    model, service = (assemble(parse_case(raw), scope=scope, phase="decode", iterations=iterations,
-                               tokens=tokens, context=4, requests=rows)["steps"] for scope in ("model", "service"))
-    assert [step["valid_tokens"] for step in model] == [step["valid_tokens"] for step in service] == expected
-    assert contexts is None or [step["context_tokens"]["req-0"] for step in model] == contexts
+                     **({"max_num_batched_tokens": 2} if len(requests) > 1 else {}))
+    case = parse_case(raw)
+    case = replace(case, workload=replace(case.workload, requests=tuple(
+        RequestSpec(key, 0, 4, output) for key in requests)))
+    plans = []
+
+    class RecordingScheduler(Scheduler):
+        def next_runtime(self, plan):
+            runtime = super().next_runtime(plan)
+            plans.append((plan, runtime))
+            return runtime
+
+    service = predict(case, window={key: {"computed": 4} for key in requests},
+                      token_quotas=dict.fromkeys(requests, quota), scheduler_factory=RecordingScheduler,
+                      trace_limit=len(expected))
+    frontend = Frontend()
+    model_tokens = [frontend(plan, case.model, runtime, case.machine, assembly="model").valid_tokens
+                    for plan, runtime in plans]
+    assert model_tokens == [step["valid_tokens"] for step in service["traces"]] == expected
+    if contexts is not None:
+        assert [plan.requests[0].context for plan, _ in plans] == contexts
 
 @pytest.mark.parametrize("staged", (False, True))
 def test_expert_rank_table_groups_follow_declared_pipeline_and_context_membership(staged):

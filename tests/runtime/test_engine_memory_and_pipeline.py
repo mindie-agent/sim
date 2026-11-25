@@ -41,12 +41,12 @@ from mindie_sim.prediction.runtime.prepared_terms import (
     POLICY_FAIR, POLICY_FIFO, PreparedCapacityRow, PreparedDelivery,
     PreparedProgress, PreparedTerm, allocate_prepared_epoch, integrate_prepared_epoch,
 )
+from mindie_sim.prediction.runtime.exposed_observer import ServiceGrantObserver
 from mindie_sim.prediction.runtime.ring_buffer import RingBuffer, lower_generation
 from mindie_sim.prediction.runtime.tile_solver import (
     LiveBufferSpec, SubtileWaveSpec, TileCandidate, TileInfeasibleError,
     TilePipelineSpec, TileShape, solve as solve_tiles,
 )
-from mindie_sim.prediction.runtime.wave_recorder import RecordedPipelineSpec, WaveRecorder
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
@@ -425,74 +425,88 @@ def test_tile_solver_owner_kind_scaling_zero_item_flops_and_ladder_order():
     assert solve_tiles(TilePipelineSpec("empty", (empty_c,)), None, hw_ok).issued_flops == 0
 
 @pytest.mark.parametrize("backend", ["python", "c"])
-def test_wave_recorder_invariance_unsorted_half_ns_and_oversized_obs(backend: str):
-    spec = RecordedPipelineSpec("1", "s0", "sig", "fused", "rec", "abi", members=("m0",))
-    def run_unsorted(with_rec: bool):
-        eng = Engine([Resource("cube", 4.0, units=4)], backend=backend)
-        rec = WaveRecorder(declared_pipes=("cube",)) if with_rec else None
-        if rec is not None:
-            eng.attach_wave_recorder(rec)
-        e0, e1 = eng.submit("a", {"cube": 2.0}, placement={"cube": (2, 0)}, coupled=True), eng.submit("b", {"cube": 2.0}, placement={"cube": (1, 3)}, coupled=True)
-        eng.advance(until=(e0, e1), first=False)
-        return (float(e0.time), float(e1.time)), rec.finish(spec, "occ_u") if rec else None
-    t_off, _ = run_unsorted(False)
-    t_on, desc_u = run_unsorted(True)
-    assert t_off == t_on and desc_u is not None
-    assert all(r.busy_ns + r.fill_ns + r.steady_bubble_ns + r.drain_ns + r.handoff_ns == r.span_ns for r in desc_u.timeline.pipe_rows)
-    eng_half, rec_half = Engine([Resource("r", 1.0)], backend=backend), WaveRecorder(declared_pipes=("r",))
-    eng_half.attach_wave_recorder(rec_half)
-    eng_half.advance(until=(eng_half.submit("h", {"r": 5e-7}),))
-    assert rec_half._service_by_pipe == {}
-    if backend == "c":
-        eng_big, rec_big = Engine([Resource("r", 4120.0)], backend="c"), WaveRecorder(declared_pipes=("r",))
-        eng_big.attach_wave_recorder(rec_big)
-        eng_big.advance(until=tuple(eng_big.submit(f"t{i}", {"r": 1.0}) for i in range(4120)), first=False)
-        assert eng_big.accel_status()["native_steps"] > 0 and len(rec_big._service_by_pipe[(0, rec_big._pipe_ids["r"])]) == 4120
-    # Single-pred (1 ms) and multi-pred (0.7 ms) sole-blocker handoff parity on Py & C11.
-    e_ho, r_ho = Engine([Resource("cube", 1.0), Resource("mte2", 1.0), Resource("vector", 1.0)], backend=backend), WaveRecorder(declared_pipes=("cube", "mte2", "vector"))
-    e_ho.attach_wave_recorder(r_ho)
-    p1, p2 = e_ho.submit("p1", {"cube": 0.3}), e_ho.submit("p2", {"mte2": 1.0})
-    e_ho.advance(until=(e_ho.submit("c", {"vector": 0.5}, after=(p1, p2)),))
-    v_row = [r for r in r_ho.finish(spec, "ho").timeline.pipe_rows if r.pipe_name == "vector"][0]
-    assert v_row.handoff_ns == 700_000 and (backend != "c" or e_ho.accel_status()["native_steps"] > 0)
-    e_s, r_s = Engine([Resource("cube", 1.0), Resource("vector", 1.0)], backend=backend), WaveRecorder(declared_pipes=("cube", "vector"))
-    e_s.attach_wave_recorder(r_s)
-    e_s.advance(until=(e_s.submit("c", {"vector": 0.5}, after=(e_s.submit("p", {"cube": 1.0}),)),))
-    assert [r for r in r_s.finish(spec, "s").timeline.pipe_rows if r.pipe_name == "vector"][0].handoff_ns == 1_000_000
+def test_service_grants_preserve_unsorted_placement_and_event_times(backend):
+    def run(observer):
+        engine = Engine([Resource("cube", 4.0, units=4)], backend=backend)
+        if observer is not None:
+            engine.attach_wave_recorder(observer)
+        events = []
+        for node, owners in enumerate(((2, 0), (1, 3))):
+            if observer is not None:
+                observer.current_node_idx = node
+            events.append(engine.submit(str(node), {"cube": 2.0}, placement={"cube": owners}, coupled=True))
+        engine.advance(until=events, first=False)
+        return [event.time for event in events]
 
-def test_wave_recorder_staggered_periodic_and_distinct_slot_generations():
-    spec = RecordedPipelineSpec("1", "s1", "sig", "fused", "rec", "abi")
-    rec = WaveRecorder(declared_pipes=("cube", "vector"))
-    rec.on_period(0.0, 2.0, 100_000, "tpl", "dig", service_pattern=(("cube", 0.0, 1.0), ("vector", 1.0, 2.0)))
-    desc = rec.finish(spec, "occ_p")
-    assert desc.timeline.cube_vector_overlap_ns == 0 and desc.timeline.end_ns - desc.timeline.start_ns == 200_000 * 1_000_000
-    rec_ov = WaveRecorder(declared_pipes=("cube", "vector"))
-    rec_ov.on_period(0.0, 2.0, 5, "t", "d", service_pattern=(("cube", 0.0, 1.0), ("vector", 0.0, 1.0)))
-    assert rec_ov.finish(spec, "ov").timeline.cube_vector_overlap_ns == 5_000_000
-    rec_frac = WaveRecorder(declared_pipes=("cube",))
-    rec_frac.on_period(0.0, 1.5e-6, 10, "t", "d", service_pattern=(("cube", 0.0, 1.5e-6),))
-    f_row = rec_frac.finish(spec, "frac").timeline.pipe_rows[0]
-    assert f_row.busy_ns == 15 and f_row.span_ns == 15
-    eng_occ = Engine([Resource("cube", 1.0), Resource("vector", 1.0)], backend="python")
-    rec_occ = WaveRecorder()
-    eng_occ.attach_wave_recorder(rec_occ)
-    occ1, occ2 = OccurrenceKey(runtime_uid="rt", launch=1), OccurrenceKey(runtime_uid="rt", launch=2)
-    e_o1 = eng_occ.submit("t1", {"cube": 1.0}, metadata={"occurrence": occ1})
-    e_o2 = eng_occ.submit("t2", {"vector": 2.0}, metadata={"occurrence": occ2})
-    eng_occ.advance(until=(e_o1, e_o2), first=False)
-    d1, d2 = rec_occ.finish(spec, occ1), rec_occ.finish(spec, occ2)
-    assert d1.submitted_kernel_count == 1 and [r.pipe_name for r in d1.timeline.pipe_rows] == ["cube"]
-    assert d2.submitted_kernel_count == 1 and [r.pipe_name for r in d2.timeline.pipe_rows] == ["vector"]
-    eng = Engine([Resource("mte2", 1.0)], pools={"l1": 64.0}, pool_units={"l1": 1}, backend="python")
-    rec_a = WaveRecorder(declared_pipes=("mte2",))
-    eng.attach_wave_recorder(rec_a)
-    a0, a1 = Allocation("buf0", "l1", 64.0, (0,)), Allocation("buf1", "l1", 64.0, (0,))
-    e0 = eng.submit("g0", {"mte2": 1.0}, acquire=(a0,), free=(a0,))
-    e1 = eng.submit("g1", {"mte2": 1.0}, acquire=(a1,), free=(a1,))
-    eng.advance(until=(e0, e1), first=False)
-    res_list = rec_a.finish(spec, "occ_a").buffers
-    assert len(res_list) == 2 and {(r.slot, r.generation) for r in res_list} == {(0, 0), (0, 1)}
-    assert rec_a._admitted[e1.sequence][4] == ("buf1",)
+    observer = ServiceGrantObserver()
+    assert run(None) == run(observer) == [1.0, 1.0]
+    grants = observer.to_observed_grants(("a", "b"))
+    assert {(g.occurrence_id, g.start_ns, g.end_ns, g.delivered) for g in grants} == {
+        ("a", 0, 1_000_000, 2.0), ("b", 0, 1_000_000, 2.0)}
+
+@pytest.mark.parametrize("backend", ["python", "c"])
+def test_sub_nanosecond_service_completes_before_rounding_grants(backend):
+    engine = Engine([Resource("r", 1.0)], backend=backend)
+    observer = ServiceGrantObserver()
+    engine.attach_wave_recorder(observer)
+    observer.current_node_idx = 0
+    event = engine.submit("half_ns", {"r": 5e-7})
+    engine.advance(until=(event,))
+    assert event.time == pytest.approx(5e-7)
+    assert observer.to_observed_grants(("half_ns",)) == ()
+
+def test_native_grants_account_for_every_concurrent_task():
+    count = 4120
+    engine = Engine([Resource("r", float(count))], backend="c")
+    observer = ServiceGrantObserver()
+    engine.attach_wave_recorder(observer)
+    names = tuple(f"t{i}" for i in range(count))
+    for node, name in enumerate(names):
+        observer.current_node_idx = node
+        engine.submit(name, {"r": 1.0})
+    engine.advance()
+    grants = observer.to_observed_grants(names)
+    assert len(grants) == count and {g.occurrence_id for g in grants} == set(names)
+    assert all(g.delivered == 1.0 for g in grants)
+    assert engine.accel_status()["native_steps"] > 0
+
+@pytest.mark.parametrize("backend", ["python", "c"])
+@pytest.mark.parametrize("two_predecessors", [False, True])
+def test_dependent_service_starts_when_the_last_predecessor_finishes(backend, two_predecessors):
+    engine = Engine([Resource(name, 1.0) for name in ("cube", "mte2", "vector")], backend=backend, trace_limit=3)
+    predecessors = [engine.submit("load", {"mte2": 1.0})]
+    if two_predecessors:
+        predecessors.append(engine.submit("compute", {"cube": 0.3}))
+    child = engine.submit("consume", {"vector": 0.5}, after=predecessors)
+    engine.advance(until=(child,))
+    start = next(row["start_ms"] for row in engine.trace if row["task"] == "consume")
+    assert start == max(event.time for event in predecessors) == pytest.approx(1.0)
+    assert child.time == pytest.approx(start + 0.5)
+
+@pytest.mark.parametrize("period,repeats,pattern,expected_ms", [
+    (2.0, 100_000, (("cube", 0.0, 1.0), ("vector", 1.0, 2.0)), 200_000.0),
+    (2.0, 5, (("cube", 0.0, 1.0), ("vector", 0.0, 1.0)), 5.0),
+    (1.5e-6, 10, (("cube", 0.0, 1.5e-6),), 15e-6),
+])
+def test_periodic_busy_union_conserves_service_across_repeats(period, repeats, pattern, expected_ms):
+    from mindie_sim.onboarding.whitebox_runner import _BusyUnionObserver
+
+    observer = _BusyUnionObserver()
+    observer.on_period(0.0, period, repeats, service_pattern=pattern)
+    assert observer.total_busy_ms() == pytest.approx(expected_ms)
+
+def test_serial_allocations_preserve_occurrence_identity_and_release_the_slot():
+    engine = Engine([Resource("mte2", 1.0)], pools={"l1": 64.0}, pool_units={"l1": 1},
+                    backend="python", trace_limit=2)
+    keys = [OccurrenceKey(runtime_uid="rt", launch=i) for i in (1, 2)]
+    for key in keys:
+        alloc = Allocation(f"buf{key.launch}", "l1", 64.0, (0,))
+        engine.submit(alloc.name, {"mte2": 1.0}, acquire=(alloc,), free=(alloc,), metadata={"occurrence": key})
+    engine.advance()
+    assert [row["metadata"]["occurrence"] for row in engine.trace] == keys
+    assert [(row["name"], row["action"], row["time"]) for row in engine.allocation_trace] == [
+        ("buf1", "acquire", 0.0), ("buf1", "release", 1.0),
+        ("buf2", "acquire", 1.0), ("buf2", "release", 2.0)]
 
 def test_program_facade_reexports_and_stage_builtin_metadata_guards():
     for name in """

@@ -23,9 +23,9 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 import pytest
 from mindie_sim import target_operators
-from mindie_sim.compose import assemble
 from mindie_sim.prediction.execution import dispatch
 from mindie_sim.prediction.api import predict, run_cohort, simulate_service
 from mindie_sim.prediction.capacity import Memory, MemoryPolicy
@@ -173,19 +173,22 @@ def test_simulate_service_low_critical_and_overload_share_one_loop():
     assert overload["requests"][0]["generated_tokens"] == 0
     assert overload["production_entry"] == "simulate_service"
 def test_framework_fragment_and_actual_transfer_share_link_and_hbm_work():
-    raw = case()
+    raw = case(prompt=1, output=1)
+    baseline = simulate_service(raw)
     raw["runtime"]["serving_io"] = {
         "host_prepare_ms": 0.1, "host_result_ms": 0.1,
         "h2d": {"bytes_per_s": 1000, "fixed_bytes": 64},
         "d2h": {"bytes_per_s": 1000, "fixed_bytes": 64}}
-    result = assemble(raw, scope="framework", iterations=1, emitted_tokens={"r": 1})
-    by_name = {item["name"]: item for item in result["framework_fragments"]}
+    parsed = parse_case(raw)
+    execution = serving_execution(parsed, Memory(parsed), include_io=True)
+    hbm = execution.stage_names[0, 0]["hbm"]
+    fragments = execution.serving_io.fragments(h2d_hbm=hbm, d2h_hbm=hbm)
+    by_name = {fragment.name: fragment for fragment in fragments}
+    serviced = simulate_service(raw)["execution"]["serviced"]
     for name, resource in (("input_transfer", "h2d@r0"), ("output_transfer", "d2h@r0")):
-        work = {item["resource"]: item["fixed"] for item in by_name[name]["work"]}
-        assert work[resource] == 64 and work["memory@r0:s0"] == 64
-    serviced = result["execution"]["serviced"]
-    assert serviced["h2d@r0"] == 64 and serviced["d2h@r0"] == 64
-    assert serviced["memory@r0:s0"] >= 64
+        work = {item.resource: item.fixed for item in by_name[name].work}
+        assert work[resource] == work[hbm] == serviced[resource] == 64
+    assert serviced[hbm] - baseline["execution"]["serviced"][hbm] == pytest.approx(2 * 64)
     occurrence_raw = case(requests=[{"id": "r", "prompt_tokens": 1,
                                      "output_tokens": 1}])
     occurrence_raw["runtime"]["serving_io"] = {
@@ -243,14 +246,12 @@ def test_window_keeps_original_output_and_does_not_submit_unselected_successor()
     raw = case(requests=[
         {"id": "a", "prompt_tokens": 4, "output_tokens": 3, "chain_id": 1},
         {"id": "b", "prompt_tokens": 1, "output_tokens": 1, "chain_id": 1, "gap_ms": 2}])
-    result = assemble(raw, scope="service",
-                      requests=[{"id": "a", "prompt_tokens": 4, "output_tokens": 3}],
-                      phase="decode", context=4, iterations=1, tokens=2,
-                      lower=linear_work)
-    assert [row["request_id"] for row in result["requests"]] == ["a"]
-    assert result["window"]["original_output_tokens"] == {"a": 3}
-    assert result["window"]["unfinished_request_ids"] == ["a"]
-    assert len(result["steps"]) == 2
+    parsed = parse_case(raw)
+    selected = replace(parsed, workload=replace(parsed.workload, requests=parsed.workload.requests[:1]))
+    result = simulate_service(selected, window={"a": {"computed": 4}}, token_quotas={"a": 2}, lower=linear_work)
+    row, = result["requests"]
+    assert (row["request_id"], row["output_tokens"], row["generated_tokens"]) == ("a", 3, 2)
+    assert row["status"] == "unserved" and len(result["traces"]) == 2
 def test_global_cap_reserves_before_async_dp_emits_only_two_first_steps():
     raw = case(dp=2, requests=[
         {"id": "a", "prompt_tokens": 1, "output_tokens": 4},
@@ -332,18 +333,14 @@ def test_selected_allocation_permanent_refusal_issues_zero_model_work():
                        "workspace", "hbm", 8192)])
     assert scheduler.states[0].iterations == 0 and scheduler.states[0].generated == 0
     assert executable.work["flops"] == 0
-def test_assemble_service_uses_the_cohort_driver_and_starts_from_real_prefill():
-    full = assemble(pipeline_case(), full_service=True, trace_limit=0)
-    assert full["assemble_backend"] == "cohort_driver"
-    assert full["production_entry"] == "simulate_service"
+def test_service_microbatches_drain_and_start_from_real_prefill():
+    full = simulate_service(pipeline_case(), trace_limit=0)
     assert full["execution"]["assembly"]["microbatches"] == 2
-    multi = assemble(case(dp=2), scope="service", trace_limit=0)
-    assert multi["assemble_backend"] == "cohort_driver"
-    assert multi["execution"]["cohort_stop"] == "drained"
+    assert full["execution"]["cohort_stop"] == "drained"
     raw = case(requests=[{"id": "r", "prompt_tokens": 4, "output_tokens": 2}])
-    result = assemble(raw, scope="service", trace_limit=0)
+    result = simulate_service(raw)
     assert result["execution"]["assembly"]["declared_commits"] == 2
-    assert [step["mode"] for step in result["steps"]] == ["prefill", "decode"]
+    assert [step["mode"] for step in result["traces"]] == ["prefill", "decode"]
 def test_full_capture_idle_participant_keeps_padding_work_without_fake_progress():
     raw = case(dp=2, ep=2, output=2)
     raw["model"].update(ffn="moe", num_experts=4, top_k=2, moe_intermediate_size=32)
@@ -356,66 +353,41 @@ def test_full_capture_idle_participant_keeps_padding_work_without_fake_progress(
     assert result["execution"]["live_tasks"] == 0
     assert result["execution"]["live_programs"] == 0
     assert result["execution"]["assembly"]["declared_commits"] >= 1
-def test_assemble_explicit_override_and_quota_windows_share_one_driver():
-    override = {"id": "b", "prompt_tokens": 4, "output_tokens": 3}
-    for dp in (1, 2):
-        raw = case(dp=dp, requests=[{"id": "a", "prompt_tokens": 4,
-                                     "output_tokens": 4}])
-        result = assemble(raw, scope="service", requests=[override],
-                          phase="decode", context=4, iterations=1, tokens=2)
-        assert result["window"]["request_ids"] == ["b"]
-        assert result["window"]["unfinished_request_ids"] == ["b"]
-        row = result["requests"][0]
-        assert row["request_id"] == "b" and row["generated_tokens"] == 2
-        assert result["status"] == "incomplete"
-    for dp in (1, 2):
-        raw = case(dp=dp, requests=[
-            {"id": "a", "prompt_tokens": 4, "output_tokens": 3},
-            {"id": "b", "prompt_tokens": 4, "output_tokens": 3}])
+@pytest.mark.parametrize("dp", [1, 2])
+@pytest.mark.parametrize("quota", [1, 2])
+def test_decode_quota_preserves_each_request_output_and_context(dp, quota):
+    for request_ids in (("b",), ("a", "b")):
+        raw = case(dp=dp, requests=[{"id": key, "prompt_tokens": 4, "output_tokens": 3}
+                                    for key in request_ids])
         raw["runtime"]["max_num_seqs"] = 2
-        result = assemble(raw, scope="service", phase="decode", context=4,
-                          iterations=1, tokens=2)
-        assert result["window"]["per_request_token_quota"] == 2
-        assert result["execution"]["assembly"]["declared_commits"] == 4
-        rows = {row["request_id"]: row for row in result["requests"]}
-        assert all(rows[key]["generated_tokens"] == 2 for key in ("a", "b"))
-        assert all(rows[key]["visible_context_tokens"] == 6 for key in ("a", "b"))
-    raw = case(requests=[{"id": "r", "prompt_tokens": 1, "output_tokens": 2}])
-    full = assemble(raw, scope="service", trace_limit=0)
-    assert full["execution"]["cohort_stop"] == "drained"
-    one = assemble(raw, scope="service", iterations=1, trace_limit=0)
-    assert one["execution"]["cohort_stop"] == "token_quota"
-    assert one["requests"][0]["generated_tokens"] == 1
-    assert one["window"]["unfinished_request_ids"] == ["r"]
-    window = assemble(case(requests=[{"id": "r", "prompt_tokens": 4,
-                                      "output_tokens": 2}]), scope="service",
-                      phase="decode", context=4, iterations=1, tokens=1)
-    assert window["execution"]["cohort_stop"] == "token_quota"
-    assert window["window"]["unfinished_request_ids"] == ["r"]
-    row = window["requests"][0]
-    assert row["generated_tokens"] == 1 and row["visible_context_tokens"] == 5
-    assert row["output_tokens"] == 2 and row["status"] == "unserved"
+        result = simulate_service(raw, window={key: {"computed": 4} for key in request_ids},
+                                  token_quotas=dict.fromkeys(request_ids, quota))
+        assert result["status"] == "incomplete" and result["execution"]["cohort_stop"] == "token_quota"
+        assert result["execution"]["assembly"]["declared_commits"] == quota * len(request_ids)
+        assert [row["request_id"] for row in result["requests"]] == list(request_ids)
+        for row in result["requests"]:
+            assert (row["output_tokens"], row["generated_tokens"], row["visible_context_tokens"]) == (3, quota, 4 + quota)
+            assert row["status"] == "unserved"
 def test_quota_keeps_original_output_and_chain_successor_at_zero():
     raw = case(requests=[
         {"id": "a", "prompt_tokens": 4, "output_tokens": 3, "chain_id": 1},
         {"id": "b", "prompt_tokens": 1, "output_tokens": 1, "chain_id": 1}])
     raw["runtime"]["max_num_seqs"] = 2
-    result = assemble(raw, scope="service", phase="decode", context=4,
-                      iterations=1, tokens=2, lower=linear_work)
+    result = simulate_service(raw, window={"a": {"computed": 4}, "b": {"computed": 1}},
+                              token_quotas={"a": 2, "b": 2}, lower=linear_work)
     rows = {row["request_id"]: row for row in result["requests"]}
     assert rows["a"]["generated_tokens"] == 2 and rows["a"]["output_tokens"] == 3
     assert rows["a"]["status"] == "unserved"
     assert rows["b"]["generated_tokens"] == 0 and rows["b"]["admission_ms"] is None
-    assert result["window"]["original_output_tokens"] == {"a": 3, "b": 1}
-    assert result["window"]["unfinished_request_ids"] == ["a", "b"]
+    assert rows["b"]["output_tokens"] == 1 and rows["b"]["status"] == "unserved"
     assert result["execution"]["cohort_stop"] == "token_quota"
     assert result["execution"]["assembly"]["fallback_commits"] == 2
-def test_assemble_default_service_respects_arrivals_and_single_seat_admission():
+def test_service_respects_arrivals_and_single_seat_admission():
     raw = case(requests=[
         {"id": "r0", "prompt_tokens": 1, "output_tokens": 1, "arrival_ms": 0},
         {"id": "r1", "prompt_tokens": 1, "output_tokens": 1, "arrival_ms": 1000}])
     raw["runtime"]["max_num_seqs"] = 1
-    result = assemble(raw, scope="service", phase="prefill", iterations=2)
+    result = simulate_service(raw, max_model_steps=2)
     rows = {row["request_id"]: row for row in result["requests"]}
     assert rows["r0"]["admission_ms"] == 0 and rows["r1"]["admission_ms"] >= 1000
 def test_simulate_service_pd_uses_shared_two_pool_engine_path():

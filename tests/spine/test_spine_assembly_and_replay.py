@@ -18,7 +18,7 @@ from _support.serving_cases import case, linear_work
 from mindie_sim import predict
 from mindie_sim.prediction import runtime, scheduling
 from mindie_sim.catalog.types import QuantSpec
-from mindie_sim.compose import assemble, compose_case
+from mindie_sim.compose import compose_case
 from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Engine, Event, ExecutionError, Resource
 from mindie_sim.prediction.execution import Execution
@@ -119,54 +119,44 @@ def test_generic_graph_executes_service_nodes_in_dependency_order():
 def _request_events(result):
     return result["execution"]["step_summary"]["total"]["request_events"]
 
-def test_service_assembly_feedback_and_host_io_conserve_work():
-    raw = _case_with_io(_request("r0", 4, 4), _request("r1", 3, 4))
-    result = assemble(raw, scope="service", iterations=3, tokens=1, diagnostic_window=True)
-    assert result["same_context"] is True
-    _fields(result, independent_model_invocations=0, iterations_executed=3)
-    _fields(result["triggers"], model_invocation=3, batch_prepare=3, request_commit_callbacks=6,
-            token_commit_nodes=3, sampling=3, client_delivery_batches=3, client_order_events=6)
-    first, *following_steps = rows = result["steps"]
-    assert first["submitted_basis"] == "actual_step_host_submissions"
-    first_host, last_host = first["host_submit_first"], first["host_submit_last"]
-    assert first_host is not None and first["host_submit_event_count"] > 0
-    assert first["submitted_ms"] == first_host["submit_ms"] >= first["host_prepare_done_ms"]
-    assert first["submitted_last_ms"] == last_host["submit_ms"] >= first["submitted_first_ms"]
-    assert first["submitted_ms"] > first["release_ms"]
-    assert all("host_submit" in record["event"] for record in (first_host, last_host))
-    assert max(first["delivery_ms"].values()) > first["step_ready_ms"] > first["device_done_ms"]
-    for current, following in zip(rows, following_steps):
-        assert following["release_ms"] == pytest.approx(max(current["delivery_ms"].values()))
+def test_service_feedback_and_host_io_conserve_work():
+    raw = _case_with_io(_request("r0", 4, 3), _request("r1", 3, 3))
+    result = predict(raw, window={"r0": {"computed": 4}, "r1": {"computed": 3}}, trace_limit=3)
+    steps = result["traces"]
+    occurrences = result["framework_occurrences"]
+    assert len(steps) == len(occurrences) == 3
+    for step, io in zip(steps, occurrences):
+        submits = [host["start_ms"] for host in step["host_submits"]]
+        assert step["start_ms"] < io["host_prepare_ms"] <= min(submits) <= max(submits)
+        assert step["fallback_commit_ms"] == {}
+        assert step["declared_commit_ms"].keys() == io["deliveries_ms"].keys() == {"r0", "r1"}
+        assert min(io["deliveries_ms"].values()) > step["end_ms"] > step["device_end_ms"]
+    for previous, following in zip(steps, steps[1:]):
+        assert following["start_ms"] == pytest.approx(previous["end_ms"])
     for request in result["requests"]:
-        commits = [row["commit_ms"][request["request_id"]] for row in rows]
-        _fields(request, generated_tokens=3, first_commit_ms=pytest.approx(commits[0]),
-                last_commit_ms=pytest.approx(commits[-1]), ttft_ms=pytest.approx(commits[0] - request["arrival_ms"]),
+        commits = [step["declared_commit_ms"][request["request_id"]] for step in steps]
+        _fields(request, generated_tokens=3, first_token_abs_ms=pytest.approx(commits[0]),
+                last_token_abs_ms=pytest.approx(commits[-1]), ttft_ms=pytest.approx(commits[0] - request["arrival_ms"]),
                 tpot_ms=pytest.approx((commits[-1] - commits[0]) / 2))
-        assert request["output_tps"] > 0
-    _fields(result["metrics"], output_tokens=6, commit_events=6, delivery_events=6,
-            client_propagation_events=3, fallback_completion_events=0)
-    _fields(result["framework_occurrences"], client_delivery=3, client_order=6)
+    assert result["metrics"]["output_tps"] > 0
+    _fields(result["metrics"], output_tokens=6)
     _fields(result["execution"], live_tasks=0, live_programs=0)
     serviced = result["execution"]["serviced"]
     assert serviced["scheduler@r0"] > 0
-    assert (serviced["h2d@r0"], serviced["d2h@r0"]) == (3 * 2 * 8, 3 * (1 + 1) * 4)
-    _fields(_request_events(result), commits=6, fallback_completions=0)
-    assert first["declared_commit_ms"] and first["fallback_commit_ms"] == {}
+    assert (serviced["h2d@r0"], serviced["d2h@r0"]) == (3 * 2 * 8, 3 * 2 * 4)
+    _fields(_request_events(result), commits=6, fallback_completions=0, host_results=6, client_deliveries=6)
 
 def test_decode_token_budget_expands_into_single_token_steps():
     raw = _case_with_io(_request("r0", 4, 6), _request("r1", 3, 6))
-    result = assemble(raw, scope="service", iterations=2, tokens=2, diagnostic_window=True)
-    _fields(result, iterations_requested=2, decode_tokens_per_iteration=2,
-            steps_requested=4, iterations_executed=4, steps_executed=4)
-    _fields(result["triggers"], model_invocation=4, request_commit_callbacks=8)
-    assert result["state_contract"]["decode_step"] == "one_token_per_active_request"
-    for offset, row in enumerate(result["steps"]):
-        _fields(row, context_tokens={"r0": 4 + offset, "r1": 3 + offset}, valid_tokens=2,
-                emitted_tokens={"r0": 1, "r1": 1}, submitted_basis="actual_step_host_submissions")
-        assert len(row["commit_ms"]) == 2
+    result = predict(raw, window={"r0": {"computed": 4}, "r1": {"computed": 3}},
+                     token_quotas={"r0": 4, "r1": 4}, trace_limit=4)
+    assert len(result["traces"]) == 4
+    for step in result["traces"]:
+        _fields(step, mode="decode", valid_tokens=2)
+        assert step["declared_commit_ms"].keys() == {"r0", "r1"}
     for request in result["requests"]:
-        assert request["generated_tokens"] == 4 and request["tpot_ms"] > 0
-        assert request["last_commit_ms"] > request["first_commit_ms"]
+        _fields(request, generated_tokens=4, visible_context_tokens=request["prompt_tokens"] + 4)
+        assert request["last_token_abs_ms"] > request["first_token_abs_ms"]
     assert tuple(result["execution"]["serviced"][key] for key in ("h2d@r0", "d2h@r0")) == (4 * 2 * 8, 4 * 2 * 4)
 
 def test_replay_enqueue_and_batch_propagation_bind_real_events():
@@ -177,76 +167,72 @@ def test_replay_enqueue_and_batch_propagation_bind_real_events():
         del config["serving_io"][transfer]["latency_us"]
     config.update(graph_mode="auto", graph_capture_keys=[4], graph_capture_mode="full",
                   submission={"graph_replay_ms": 0.25})
-    result = assemble(raw, scope="service", iterations=1, diagnostic_window=True)
-    step = result["steps"][0]
-    _fields(result["triggers"], graph_replay_submissions=1, client_delivery_batches=1, client_order_events=2)
-    _fields(step, graph_replay_submissions=1, eager_submissions=0, submitted_basis="actual_step_host_submissions")
-    assert step["release_ms"] < step["host_prepare_done_ms"] <= step["submitted_ms"] < min(step["commit_ms"].values())
-    assert step["client_propagation_ms"] is not None
-    assert step["client_propagation_ms"] <= min(step["delivery_ms"].values()) and len(step["delivery_ms"]) == 2
-    assert result["execution"]["submission"]["graph_replays"] == 1
+    result = predict(raw, window={"r0": {"computed": 2}, "r1": {"computed": 2}}, max_model_steps=1)
+    step, = result["traces"]
+    io, = result["framework_occurrences"]
+    host, = step["host_submits"]
+    _fields(result["execution"]["submission"], graph_replays=1, eager_invocations=0)
+    assert step["start_ms"] < io["host_prepare_ms"] <= host["start_ms"] < min(step["declared_commit_ms"].values())
+    assert io["deliveries_ms"].keys() == {"r0", "r1"}
+    assert io["client_propagation_ms"] <= min(io["deliveries_ms"].values())
 
-def test_bulk_token_budget_matches_individual_service_steps():
+def test_decode_quota_and_step_limit_execute_the_same_work():
     raw = _case_with_io(_request("r0", 4, 2))
-    bulk, stepped = (assemble(raw, scope="service", iterations=iterations, tokens=tokens, diagnostic_window=True)
-                     for iterations, tokens in ((1, 2), (2, 1)))
-    for result in (bulk, stepped):
-        assert result["steps_executed"] == 2
-        _fields(result["triggers"], model_invocation=2, request_commit_callbacks=2)
+    quota, limited = (predict(raw, window={"r0": {"computed": 4}}, **limit)
+                      for limit in ({"token_quotas": {"r0": 2}}, {"max_model_steps": 2}))
+    for result in (quota, limited):
+        assert len(result["traces"]) == 2
+        for step in result["traces"]:
+            _fields(step, mode="decode", valid_tokens=1)
+            assert step["declared_commit_ms"].keys() == {"r0"}
         assert result["execution"]["serviced"]["d2h@r0"] == 2 * 4
-        for step in result["steps"]:
-            _fields(step, valid_tokens=1, emitted_tokens={"r0": 1})
-    assert [step["context_tokens"] for step in bulk["steps"]] == [step["context_tokens"] for step in stepped["steps"]]
-    assert bulk["requests"][0]["generated_tokens"] == 2 and bulk["requests"][0]["tpot_ms"] > 0
-    assert bulk["requests"][0]["tpot_ms"] == pytest.approx(stepped["requests"][0]["tpot_ms"])
+        row, = result["requests"]
+        assert row["generated_tokens"] == 2 and row["tpot_ms"] > 0
+    assert quota["requests"] == limited["requests"]
 
-@pytest.mark.parametrize("phase,options,modes,contexts,computed", [
-    ("prefill", {"iterations": 2}, ["prefill", "decode"], [0, 4], [4, 5]),
-    ("decode", {"iterations": 1, "tokens": 2, "context": 4}, ["decode", "decode"], [4, 5], [5, 6]),
+@pytest.mark.parametrize("window,modes,computed", [
+    (None, ["prefill", "decode"], [4, 5]),
+    ({"r": {"computed": 4}}, ["decode", "decode"], [5, 6]),
 ])
-def test_service_context_advances_by_the_written_kv(phase, options, modes, contexts, computed):
+def test_service_context_advances_by_the_written_kv(window, modes, computed):
     raw = case(requests=[_request("r", 4, 2)])
-    result = assemble(raw, scope="service", phase=phase, diagnostic_window=True, **options)
-    assert [row["mode"] for row in result["steps"]] == modes
-    for field, expected in (("context_tokens", contexts), ("computed_kv_tokens_after", computed)):
-        assert [row[field]["r"] for row in result["steps"]] == expected
-    if phase == "prefill":
-        assert result["requests"][0]["generated_tokens"] == 2
-    else:
-        assert result["requests"][0]["tpot_ms"] > 0
+    for steps, expected in enumerate(computed, start=1):
+        result = predict(raw, window=window, max_model_steps=steps)
+        assert [row["mode"] for row in result["traces"]] == modes[:steps]
+        _fields(result["requests"][0], visible_context_tokens=expected, generated_tokens=steps)
 
-def test_framework_scope_accounts_for_host_work_and_no_model_launches():
-    raw = _case_with_io(_request("r0", 1, 2), _request("r1", 1, 2))
-    result = assemble(raw, scope="framework", iterations=2, emitted_tokens={"r0": 1, "r1": 1})
-    assert result["model_fragment"] is None
-    _fields(result["triggers"], model_invocation=0, batch_prepare=2, request_commit_callbacks=0)
-    _fields(result["execution"]["work"], flops=0, vector_ops=0)
-    assert all(result["execution"]["serviced"][key] > 0 for key in ("scheduler@r0", "h2d@r0", "d2h@r0"))
-    for row in result["steps"]:
-        assert row["submitted_ms"] is None and row["submitted_basis"] == "no_engine_launch"
-        assert row["device_done_ms"] > 0
-    fragments = {fragment["name"]: fragment for fragment in result["framework_fragments"]}
+def test_framework_io_accounts_for_host_work_and_no_model_launches():
+    parsed = parse_case(_case_with_io(_request("r0", 1, 2), _request("r1", 1, 2)))
+    execution = Execution(parsed, CostModel(parsed), include_serving_io=True)
+    fragments = {fragment.name: fragment for fragment in execution.serving_io.fragments()}
     for fragment in fragments.values():
-        assert fragment["layer"] is None
-        assert all(port["direction"] in {"in", "out"} for group in fragment["ports"].values() for port in group)
-    for name, trigger, occurrences in (("host_prepare", "per_batch", 2), ("client_delivery", "per_batch_with_emissions", 2),
-                                       ("client_order", "per_request_per_batch", 4)):
-        _fields(fragments[name], trigger=trigger, occurrences=occurrences)
-    _fields(result["metrics"], client_propagation_events=2, delivery_events=4, fallback_completion_events=4)
-    _fields(_request_events(result), commits=0, fallback_completions=4)
-    second = result["steps"][1]
-    assert second["declared_commit_ms"] == {}
-    assert set(second["fallback_commit_ms"]) == set(second["active_requests"])
+        assert fragment.layer is None
+        assert all(port.direction == "in" for port in fragment.ports.event_in)
+        assert all(port.direction == "out" for port in fragment.ports.event_out)
+    for name, trigger in (("host_prepare", "per_batch"), ("client_delivery", "per_batch_with_emissions"),
+                          ("client_order", "per_request_per_batch")):
+        assert fragments[name].trigger == trigger
+    for iteration in range(2):
+        plan = IterationPlan(tuple(RequestView(key, 1, 1 + iteration, True, "decode")
+                                   for key in ("r0", "r1")), iteration=iteration)
+        work = IterationWork((), plan, 1, 2, 2, None, "decode", "framework_only")
+        step = execution.add(work, 0, execution.engine.now, emitted_tokens={"r0": 1, "r1": 1})
+        execution.engine.advance()
+        assert not step.host_submits and not step.declared_commits
+        assert step.fallback_commits.keys() == step.client_deliveries.keys() == {"r0", "r1"}
+    summary = execution.summary()
+    _fields(summary["work"], flops=0, vector_ops=0)
+    assert all(summary["serviced"][key] > 0 for key in ("scheduler@r0", "h2d@r0", "d2h@r0"))
+    _fields(summary["step_summary"]["total"]["request_events"], commits=0, client_deliveries=4, fallback_completions=4)
 
 def test_framework_delivers_only_to_active_requests_after_short_request_finishes():
     raw = _case_with_io(_request("short", 1, 1), _request("long", 2, 3))
-    result = assemble(raw, scope="framework", iterations=2, emitted_tokens={"short": 1, "long": 1})
-    first, second = result["steps"]
-    assert first["active_requests"] == ["long", "short"]
-    _fields(second, active_requests=["long"], emitted_tokens={"long": 1})
-    assert second["delivery_ms"].keys() == {"long"}
-    _fields(result["triggers"], client_delivery_batches=2, client_order_events=3)
-    assert result["requests"][0]["generated_tokens"] == 1
+    result = predict(raw, window={"short": {"computed": 1}, "long": {"computed": 2}}, max_model_steps=2)
+    first, second = result["framework_occurrences"]
+    assert first["deliveries_ms"].keys() == {"long", "short"}
+    assert second["deliveries_ms"].keys() == {"long"}
+    _fields(_request_events(result), client_deliveries=3)
+    assert {r["request_id"]: r["generated_tokens"] for r in result["requests"]} == {"short": 1, "long": 2}
 
 @pytest.mark.parametrize("declared", [True, False])
 def test_kernel_group_commit_classification_uses_declared_event_maps(declared):
@@ -277,27 +263,22 @@ def test_execution_distinguishes_declared_and_implicit_commits():
     _fields(execution.summary()["step_summary"]["total"]["request_events"],
             commits=1, fallback_completions=1, unclassified_commits=0, merged_commits=2)
 
-def test_model_assembly_omits_serving_io_and_host_submission():
-    result = assemble(_case_with_io(), scope="model", iterations=1)
-    assert result["model_fragment"]["service_families_present"] == [] and result["framework_fragments"] == []
-    _fields(result["triggers"], request_commit_callbacks=0, batch_prepare=0)
+def test_model_forward_omits_serving_io_and_host_submission():
+    result = predict(_case_with_io(), scope="model", phase="decode", tokens=1, context=4)
+    assert not ({row["family"] for row in result["timeline"]} & SERVICE_FAMILIES)
+    _fields(result["execution"]["submission"], included=False, eager_invocations=0, graph_replays=0)
     serviced = result["execution"]["serviced"]
     assert all(serviced.get(key, 0) == 0 for key in ("h2d@r0", "d2h@r0", "scheduler@r0"))
-    first = result["steps"][0]
-    _fields(first, submitted_ms=None, submitted_basis="submission_not_included", declared_commit_ms={})
-    assert first["fallback_commit_ms"].keys() == {"r"}
     _fields(_request_events(result), commits=0, fallback_completions=1, host_results=0)
-    _fields(result["metrics"], commit_events=0, fallback_completion_events=1)
 
-@pytest.mark.parametrize("scope,error", [
-    ("everything", "assembly_scope_unknown"), ("framework", "framework_assembly_requires_declared_serving_io"),
-])
-def test_assembly_rejects_invalid_scope_or_missing_framework_io(scope, error):
-    with pytest.raises(ModelingError, match=error):
-        assemble(case(), scope=scope)
+def test_prediction_rejects_invalid_scope():
+    with pytest.raises(ModelingError, match="invalid_prediction_scope"):
+        predict(case(), scope="everything")
 
-def test_multiple_replicas_use_cohort_assembly():
-    assert assemble(case(dp=2), scope="service")["assemble_backend"] == "cohort_driver"
+def test_multiple_replicas_drain_their_own_requests():
+    result = predict(case(dp=2, requests=[_request("a", 1, 1), _request("b", 1, 1)]))
+    assert result["execution"]["cohort_stop"] == "drained"
+    assert {(row["replica"], tuple(row["declared_commit_ms"])) for row in result["traces"]} == {(0, ("a",)), (1, ("b",))}
 
 def _emit_commit(view):
     builder = Builder("s0.l0", SimpleNamespace(index=0, scope="target"), 0, (view,),

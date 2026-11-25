@@ -46,7 +46,6 @@ from mindie_sim.prediction.efficiency.cost import CostModel
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.program import KernelProgram, Stage
-from mindie_sim.prediction.runtime.wave_recorder import WaveRecorder
 from mindie_sim.prediction.topology import MessageFlow as LegacyTopologyMessageFlow
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
@@ -511,7 +510,7 @@ def test_band_algorithm_expansion_multihop_credits_and_production_execution():
     t_cred = _run_prod_allreduce(DUAL_DIE_SMALL_SKU, 1000.0, credit_bytes=4096, scope_m="hop")
     assert t_cred > t_nocred * 2.5
 
-    # 4) lower_with_local_work preserves Stage metadata/deliveries/placement/caps/allocs into Engine + WaveRecorder
+    # 4) lower_with_local_work preserves Stage metadata/deliveries/placement/caps/allocs through Engine execution
     topo_s = Topology(Hardware.from_mapping(_band_hw(DUAL_DIE_SMALL_SKU, 2.5)), ParallelSpec(tp=4))
     plan_s = build_band_collective_plan(topo_s, "allreduce", ((0, 1, 2, 3),), {r: 98304.0 for r in range(4)}, {})
     link_res = next(iter(plan_s.accounting().wire_by_resource))
@@ -532,12 +531,12 @@ def test_band_algorithm_expansion_multihop_credits_and_production_execution():
     assert link_res not in stgs["reduce_scatter"].work and stgs["reduce_scatter"].metadata == {"generation": 8}
     for backend in ("python", "c"):
         eng = Engine([*topo_s.resources(), Resource("hbm@d0", 1e9, units=1), Resource("vec@d0", 1e9, units=1)],
-                     pools={"l1": 64.0}, pool_units={"l1": 1}, backend=backend)
-        rec = WaveRecorder(declared_pipes=("hbm@d0", "vec@d0"))
-        eng.attach_wave_recorder(rec)
+                     pools={"l1": 64.0}, pool_units={"l1": 1}, backend=backend, trace_limit=256)
         eng.advance(until=(low_prog.start(eng, "ar", eng.submit("r")),))
         assert eng.delivered.get("hbm_read@d0") == 32768.0 and eng.delivered.get("hbm_write@d0") == 32768.0
-        assert {7, 8} <= {row[3] for row in rec._admitted.values()}
+        generations = {row["task"]: row["metadata"]["generation"] for row in eng.trace
+                       if "generation" in row.get("metadata", {})}
+        assert generations["ar:pack"] == 7 and generations["ar:reduce_scatter"] == 8
 
 
 def test_startup_scope_and_key_validation_and_catalog_invariants():
