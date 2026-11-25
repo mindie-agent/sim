@@ -52,6 +52,8 @@ from .models import (
     ExportBundle,
     OperatorExportRow,
     TraceScheduleEntry,
+    bundle_step_int_ns,
+    op_exposed_int_ns,
 )
 from .public_view import format_track_label
 
@@ -739,7 +741,7 @@ def _resolve_host_launch_spec(
     scope_lbl = str(getattr(entry, "scope", "") or op_eff.model_scope or "target")
     if is_h2d_op:
         dur = float(getattr(bundle, "h2d_startup_us", 0.0) or 0.0) if bundle is not None else 0.0
-        return "aclrtMemcpyAsync(H2D)", max(0.0, dur)
+        return f"aclrtMemcpyAsync (PLE/Engram H2D: {op_eff.op_id})", max(0.0, dur)
     if is_graph_mode:
         dur = float(getattr(bundle, "graph_launch_us", 0.0) or 0.0) if bundle is not None else 0.0
         return f"aclGraphLaunch[{scope_lbl}]", max(0.0, dur)
@@ -1038,18 +1040,8 @@ def iter_msprof_trace_events(
     coords = _die_coordinates(bundle)
     die_map = {coord: idx for idx, coord in enumerate(coords)}
     yield from _iter_metadata_events(coords)
-    step_ns = (
-        int(bundle.step_span_ns)
-        if int(getattr(bundle, "step_span_ns", 0) or 0) > 0
-        else max(0, int(round(float(bundle.step_span_us) * NS_PER_US)))
-    )
-    exposed_sum_ns = sum(
-        0 if op.is_overlapped else (
-            int(op.exposed_ns) if int(getattr(op, "exposed_ns", 0) or 0) > 0
-            else max(0, int(round(float(op.exposed_dur_us) * max(1, int(op.repeat_count)) * NS_PER_US)))
-        )
-        for op in bundle.operators
-    )
+    exposed_sum_ns = sum(op_exposed_int_ns(op, op.repeat_count) for op in bundle.operators)
+    step_ns = max(bundle_step_int_ns(bundle), exposed_sum_ns)
     idle_ns = max(0, step_ns - exposed_sum_ns)
     yield {
         "ph": "M",

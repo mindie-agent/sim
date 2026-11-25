@@ -39,10 +39,12 @@ from mindie_sim.export.public_view import (
     THREE_TRACK_LABELS,
     diff_public_scenario_configs,
     format_track_label,
+    normalize_public_backend,
     project_agent_brief_mapping,
     project_public_effective_config,
 )
 from mindie_sim.prediction.results import OpOccurrence
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import KernelBinding, OpSpec
 from mindie_sim.schema.scenario import (
@@ -164,9 +166,10 @@ def _make_bundle(
     ops: tuple[OperatorExportRow, ...],
     *,
     step_span_us: float = 1000.0,
-    feature_track: str = "merged",
+    feature_track: str = "shipping",
     effective_config: dict | None = None,
     applied_edit_receipts: tuple[dict, ...] = (),
+    rewrite_verification_passed: bool = False,
     recommended_checkpoint: dict | None = None,
     va_serving_rules_summary: dict | None = None,
     pd_pool_summary: dict | None = None,
@@ -217,6 +220,7 @@ def _make_bundle(
         va_serving_rules_summary=va_serving_rules_summary,
         pd_pool_summary=pd_pool_summary,
         applied_edit_receipts=applied_edit_receipts,
+        rewrite_verification_passed=rewrite_verification_passed,
         effective_config=dict(effective_config or {}),
         co_design_opportunities=co_design_opportunities,
     )
@@ -244,12 +248,17 @@ def _assert_zero_canary_leaks(serialized: str) -> None:
 
 
 def test_public_allowlist_drops_canary_keys_dicts_and_internal_tracks(tmp_path: Path) -> None:
-    assert format_track_label("merged") == "当前栈基线"
-    assert format_track_label("unmerged_pr") == "提案版本"
-    assert format_track_label("expected_ideal") == "目标架构预演"
-    assert format_track_label("raw_eager") == "Eager 基线"
+    assert format_track_label("shipping") == "当前栈基线"
+    assert format_track_label("proposed") == "提案版本"
+    assert format_track_label("target") == "目标架构预演"
+    assert format_track_label("eager") == "Eager 基线"
+    for retired in ("merged", "unmerged_pr", "expected_ideal", "raw_eager"):
+        with pytest.raises(ModelingError, match="invalid_stack_track"):
+            format_track_label(retired)
 
     dsl_tag = f"{LEGACY_DSL_NEEDLE}-dsl"
+    with pytest.raises(ModelingError, match="unknown_public_backend"):
+        normalize_public_backend(dsl_tag)
     before_op1 = _make_op_row("l0.norm", exposed_dur_us=60.0, l_star_lean_us=40.0)
     before_op2 = _make_op_row("l0.act", exposed_dur_us=60.0, l_star_lean_us=40.0)
     after_op = _make_op_row(
@@ -259,10 +268,10 @@ def test_public_allowlist_drops_canary_keys_dicts_and_internal_tracks(tmp_path: 
         l_star_lean_us=40.0,
         needs_new_kernel=True,
         is_shipping_abi=False,
-        kernel_backend=dsl_tag,
-        source_ref=f"cann/{dsl_tag}/samples/norm_act",
+        kernel_backend=BACKEND_TILELANG,
+        source_ref="Ascend/tilelang-ascend:samples/norm_act.py",
         formula_eval={
-            "composed_equations": ["y = RMSNorm(x)", {"audit": "canary"}, "merged expected_ideal"],
+            "composed_equations": ["y = RMSNorm(x)", {"audit": "canary"}],
             "dominant_pipe": {"audit": "canary"},
             "ub_peak_bytes": 16384,
             "ub_budget_bytes": 262144,
@@ -278,7 +287,7 @@ def test_public_allowlist_drops_canary_keys_dicts_and_internal_tracks(tmp_path: 
             track="kernel_new",
             readiness="synthesized_target",
             title="Fuse norm and act",
-            evidence_refs=(f"cann/{dsl_tag}/samples/norm",),
+            evidence_refs=("Ascend/tilelang-ascend:samples/norm.py",),
             mega_fusion=MegaFusionBound(
                 region_op_ids=("l0.norm", "l0.act"),
                 exposed_before_ms=0.12,
@@ -341,14 +350,15 @@ def test_public_allowlist_drops_canary_keys_dicts_and_internal_tracks(tmp_path: 
     before_b = _make_bundle(
         (before_op1, before_op2),
         step_span_us=120.0,
-        feature_track="merged",
-        effective_config={**dirty_eff, "feature_track": "merged", "enable_fused_mc2": 0},
+        feature_track="shipping",
+        effective_config={**dirty_eff, "feature_track": "shipping", "enable_fused_mc2": 0},
     )
     after_b = _make_bundle(
         (after_op,),
         step_span_us=50.0,
-        feature_track="expected_ideal",
+        feature_track="target",
         effective_config=dirty_eff,
+        rewrite_verification_passed=True,
         applied_edit_receipts=(
             {
                 "status": "applied",
@@ -399,10 +409,10 @@ def test_public_allowlist_drops_canary_keys_dicts_and_internal_tracks(tmp_path: 
         "issues_found": [
             {
                 "issue_id": "bad_flag",
-                "title": f"replace {dsl_tag} merged",
+                "title": "replace legacy flag",
                 "current": "{'audit': 'canary'}",
                 "recommended": "use TileLang",
-                "impact": "feature_track expected_ideal",
+                "impact": "feature_track tuning",
                 "extra_secret": {"audit": "canary"},
             },
         ],
@@ -476,7 +486,13 @@ def test_public_allowlist_drops_canary_keys_dicts_and_internal_tracks(tmp_path: 
 def test_materiality_threshold_routes_sub_50us_fusions_to_residual_ops() -> None:
     assert NEW_KERNEL_MIN_SAVED_MS == pytest.approx(0.050)
 
-    def _run_case(before_us: float, after_us: float, *, pre_edit_us: float | None = None):
+    def _run_case(
+        before_us: float,
+        after_us: float,
+        *,
+        pre_edit_us: float | None = None,
+        verified: bool = True,
+    ):
         b1 = _make_op_row("l0.op1", exposed_dur_us=before_us * 0.5, l_star_lean_us=after_us * 0.4)
         b2 = _make_op_row("l0.op2", exposed_dur_us=before_us * 0.5, l_star_lean_us=after_us * 0.4)
         fe = ({"after_pre_edit_exposed_us": pre_edit_us} if pre_edit_us is not None else None)
@@ -497,6 +513,7 @@ def test_materiality_threshold_routes_sub_50us_fusions_to_residual_ops() -> None
             (aft,),
             step_span_us=after_us,
             memory_ledger=a_mem,
+            rewrite_verification_passed=verified,
             applied_edit_receipts=(
                 {
                     "status": "applied",
@@ -523,18 +540,26 @@ def test_materiality_threshold_routes_sub_50us_fusions_to_residual_ops() -> None
         assert plan_sub.waterfall.residual_saved_ms == pytest.approx(saved_us / 1000.0, abs=1e-9)
         assert abs(plan_sub.waterfall.reconciliation_error_ms) <= 1e-9
 
-    # Inclusive boundary: exactly 0.050 ms qualifies for Sheet 4 card and Track [2] roadmap.
-    plan_eq = _run_case(100.0, 50.0)
+    # Unverified rewrites never mint Sheet 4 new-kernel cards even at >= 0.050 ms.
+    plan_unverified = _run_case(100.0, 50.0, verified=False)
+    assert plan_unverified.pending_items == ()
+    assert plan_unverified.group_accounting[0].bucket == "residual"
+
+    # Inclusive boundary: verified >= 0.050 ms qualifies for Sheet 4 card and Track [2] roadmap.
+    plan_eq = _run_case(100.0, 50.0, verified=True)
     assert len(plan_eq.pending_items) == 1
     assert any(r.track == TRACK_FRAMEWORK for r in plan_eq.roadmap)
     assert plan_eq.group_accounting[0].bucket == "new"
     assert plan_eq.waterfall.new_kernel_saved_ms == pytest.approx(0.050, abs=1e-9)
 
-    # Split attribution: net gain 0.200 ms (mostly config), kernel share only 0.014 ms -> Residual Ops.
-    plan_split = _run_case(300.0, 100.0, pre_edit_us=114.0)
+    # Split attribution: net gain 0.200 ms (0.186 ms config, 0.014 ms kernel) -> config preserved + 0.014 ms residual.
+    plan_split = _run_case(300.0, 100.0, pre_edit_us=114.0, verified=True)
     assert plan_split.pending_items == ()
     assert not any(r.track == TRACK_FRAMEWORK for r in plan_split.roadmap)
     assert plan_split.group_accounting[0].bucket == "residual"
+    assert plan_split.waterfall.config_saved_ms == pytest.approx(0.186, abs=1e-9)
+    assert plan_split.waterfall.residual_saved_ms == pytest.approx(0.014, abs=1e-9)
+    assert plan_split.waterfall.reconciliation_error_ns == 0
 
 
 def _make_op_spec(
@@ -602,21 +627,38 @@ def test_kernel_catalog_birth_binding_recover_ssm_and_oss_backends() -> None:
     assert desc_birth.kernel_backend == BACKEND_TILELANG
     assert "tilelang-ascend" in desc_birth.source_ref and "kernels/auth.py" in desc_birth.source_ref
 
-    # 2. RecoverSSMStateCommit resolves cleanly via metadata or op_id (never 'Add').
-    ssm_spec = _make_op_spec(
+    # 2. RecoverSSMStateCommit resolves strictly via typed KernelBinding (read-only: never heuristically forged from 'Add').
+    ssm_birth_spec = _make_op_spec(
+        "s0.l0.tail_op",
+        "elementwise",
+        kernel_binding=KernelBinding(
+            kernel_id="RecoverSSMStateCommit",
+            backend="TileLang",
+            arch_family="dav_3510",
+            readiness="synthesized_target",
+        ),
+    )
+    desc_ssm_birth = resolve_ascend_kernel_identity(
+        "s0.l0.tail_op", ssm_birth_spec, "elementwise", "add", (4, 128), "bf16", a5_case, None, (),
+        native_binding={"kernels": [{"name": "Add"}]},
+    )
+    assert desc_ssm_birth.ascend_kernel == "RecoverSSMStateCommit"
+    assert desc_ssm_birth.kernel_backend == BACKEND_TILELANG
+    assert desc_ssm_birth.needs_new_kernel is True and desc_ssm_birth.is_shipping_abi is False
+
+    ssm_untyped_spec = _make_op_spec(
         "s0.l0.tail_op",
         "elementwise",
         metadata=(("recover_ssm_stage", "commit"),),
     )
-    desc_ssm_meta = resolve_ascend_kernel_identity(
-        "s0.l0.tail_op", ssm_spec, "elementwise", "add", (4, 128), "bf16", a5_case, None, (),
+    desc_ssm_untyped = resolve_ascend_kernel_identity(
+        "s0.l0.tail_op", ssm_untyped_spec, "elementwise", "add", (4, 128), "bf16", a5_case, None, (),
         native_binding={"kernels": [{"name": "Add"}]},
     )
-    assert desc_ssm_meta.ascend_kernel == "RecoverSSMStateCommit"
-    assert desc_ssm_meta.ascend_kernel != "Add"
-    assert desc_ssm_meta.kernel_backend in {BACKEND_TILELANG, BACKEND_ASCENDC}
+    assert desc_ssm_untyped.ascend_kernel == "Add"
+    assert desc_ssm_untyped.is_shipping_abi is False
 
-    # 3. A3-only kernels never leak onto A5; GEMM/grouped-GEMM defaults to Catlass.
+    # 3. A3-only dispatch_ffn_combine is rejected on A5 via sealed ProbedAbiRegistry (never silently shipping).
     a5_moe_spec = _make_op_spec(
         "s0.l0.moe_ep",
         "grouped_moe",
@@ -627,37 +669,48 @@ def test_kernel_catalog_birth_binding_recover_ssm_and_oss_backends() -> None:
         "s0.l0.moe_ep", a5_moe_spec, "grouped_moe", "dispatch_ffn_combine", (4, 2048), "mxfp4", a5_case, None, (),
         native_binding={"kernels": [{"name": "dispatch_ffn_combine"}]},
     )
-    assert desc_a5_moe.ascend_kernel != "dispatch_ffn_combine"
-    assert "MegaMoe" in desc_a5_moe.ascend_kernel
-    assert desc_a5_moe.kernel_backend == BACKEND_CATLASS
-
-    desc_a5_mla = resolve_ascend_kernel_identity(
-        "s0.l0.latent_attention", None, "attention", "paged_mla", (4, 128, 512), "bf16", a5_case, None, (),
-        native_binding={"kernels": [{"name": "FusedInferAttentionScore"}]},
-    )
-    assert "FusedInferAttentionScore" not in desc_a5_mla.ascend_kernel
+    assert desc_a5_moe.ascend_kernel == ""
+    assert desc_a5_moe.needs_new_kernel is True
+    assert desc_a5_moe.is_shipping_abi is False
+    assert desc_a5_moe.abi_entry_id == "a5_csrc_dispatch_ffn_combine"
 
     synth_gemm_spec = _make_op_spec(
         "s0.l0.fused_gemm",
         "gemm",
         shape=(4, 2048),
         metadata=(("target_rewrite_fused", True), ("fused_kernel_name", "FusedCompactGroupedGemm")),
+        kernel_binding=KernelBinding(
+            kernel_id="FusedCompactGroupedGemm",
+            backend="Catlass",
+            arch_family="dav_3510",
+            readiness="synthesized_target",
+        ),
     )
     desc_a5_synth_gemm = resolve_ascend_kernel_identity(
         "s0.l0.fused_gemm", synth_gemm_spec, "gemm", "custom_gemm", (4, 2048), "mxfp4", a5_case, None, (),
     )
+    assert desc_a5_synth_gemm.ascend_kernel == "FusedCompactGroupedGemm"
     assert desc_a5_synth_gemm.kernel_backend == BACKEND_CATLASS
+    assert desc_a5_synth_gemm.needs_new_kernel is True and desc_a5_synth_gemm.is_shipping_abi is False
 
     synth_vec_spec = _make_op_spec(
         "s0.l0.fused_vec",
         "elementwise",
         shape=(4, 2048),
         metadata=(("target_rewrite_fused", True), ("fused_kernel_name", "FusedVecNormAct")),
+        kernel_binding=KernelBinding(
+            kernel_id="FusedVecNormAct",
+            backend="TileLang",
+            arch_family="dav_3510",
+            readiness="synthesized_target",
+        ),
     )
     desc_a5_synth_vec = resolve_ascend_kernel_identity(
         "s0.l0.fused_vec", synth_vec_spec, "elementwise", "custom_vec", (4, 2048), "bf16", a5_case, None, (),
     )
+    assert desc_a5_synth_vec.ascend_kernel == "FusedVecNormAct"
     assert desc_a5_synth_vec.kernel_backend in {BACKEND_TILELANG, BACKEND_ASCENDC}
+    assert desc_a5_synth_vec.needs_new_kernel is True and desc_a5_synth_vec.is_shipping_abi is False
 
 
 def test_zero_legacy_dsl_tokens_and_retired_script_audit_module() -> None:

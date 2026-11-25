@@ -37,8 +37,10 @@ from .kernel_catalog import classify_macro_module, extract_semantic_atoms, strip
 from .models import (
     BINDING_STATE_UNBOUND_FORMULA, L1_MOD_RESIDUAL_MEM, MACRO_L1_HIERARCHY,
     MACRO_MOD_DRAFT_LAYERS, MACRO_MOD_MOE_SHARED, MACRO_MOD_VERIFY_HEAD,
-    MIN_DENOM_EPS, OVERLAP_EXPOSED_EPS_US, US_PER_MS, AlignedComparisonRow,
-    ComparisonRequest, ExportBundle, MacroModuleRow, OperatorExportRow,
+    MIN_DENOM_EPS, NS_PER_MS, NS_PER_US, OVERLAP_EXPOSED_EPS_US, US_PER_MS,
+    AlignedComparisonRow, ComparisonRequest, ExportBundle, MacroModuleRow,
+    OperatorExportRow, bundle_step_int_ns, op_dur_int_ns, op_exposed_int_ns,
+    op_lstar_int_ns,
 )
 from .public_view import format_track_label, is_same_public_config
 
@@ -187,7 +189,7 @@ def _build_side_dag(
     succs: dict[int, set[int]] = {i: set() for i in range(len(ops))}
     for idx, op in enumerate(ops):
         for pred in op.predecessors:
-            pkey = (int(pred.replica), int(pred.stage), int(pred.rank), str(pred.op_id))
+            pkey = (int(pred.replica), int(pred.stage), (-1 if pred.rank is None else int(pred.rank)), str(pred.op_id))
             p_idx = unique_occ.get(pkey)
             if p_idx is None:
                 p_idx = unique_opid.get(str(pred.op_id))
@@ -548,6 +550,15 @@ def _align_archetype_bipartite(
     return rows
 
 
+def _scale_slice_op_count(op: OperatorExportRow, cnt: int) -> OperatorExportRow:
+    if int(op.repeat_count) <= cnt:
+        return op
+    dur_ns = max(0, int(round(float(op.dur_us) * float(cnt) * float(NS_PER_US))))
+    exp_ns = 0 if op.is_overlapped else max(0, int(round(float(op.exposed_dur_us) * float(cnt) * float(NS_PER_US))))
+    ls_ns = 0 if op.is_overlapped else max(0, int(round(float(op.l_star_lean_us) * float(cnt) * float(NS_PER_US))))
+    return replace(op, repeat_count=cnt, dur_ns=dur_ns, exposed_ns=exp_ns, l_star_ns=ls_ns)
+
+
 def _reaggregate_slice_ops(
     bundle: ExportBundle,
     ops: Sequence[OperatorExportRow],
@@ -565,8 +576,9 @@ def _reaggregate_slice_ops(
     for op in ops:
         site = strip_op_prefix(op.op_id)
         durs: list[float] = []
-        exps: list[float] = []
-        lstars: list[float] = []
+        durs_ns: list[int] = []
+        exps_ns: list[int] = []
+        lstars_ns: list[int] = []
         matched_idxs: list[int] = []
         block_size = 0
         for lyr in ordered_idxs:
@@ -579,32 +591,47 @@ def _reaggregate_slice_ops(
             d_val = float(ops_map[site][1])
             durs.append(d_val)
             matched_idxs.append(lyr)
+            dur_ns_map = rec.get("ops_dur_ns")
+            durs_ns.append(
+                int(dur_ns_map[site])
+                if (isinstance(dur_ns_map, Mapping) and site in dur_ns_map)
+                else max(0, int(round(d_val * float(NS_PER_US))))
+            )
+            exp_ns_map = rec.get("ops_exposed_ns")
             exps_map = rec.get("ops_exposed")
-            if isinstance(exps_map, Mapping) and site in exps_map:
-                exps.append(float(exps_map[site]))
+            if isinstance(exp_ns_map, Mapping) and site in exp_ns_map:
+                exps_ns.append(int(exp_ns_map[site]))
+            elif isinstance(exps_map, Mapping) and site in exps_map:
+                exps_ns.append(max(0, int(round(float(exps_map[site]) * float(NS_PER_US)))))
             else:
-                exps.append(0.0 if op.is_overlapped else d_val)
+                exps_ns.append(0 if op.is_overlapped else durs_ns[-1])
+            ls_ns_map = rec.get("ops_lstar_ns")
             ls_map = rec.get("ops_lstar")
-            if isinstance(ls_map, Mapping) and site in ls_map:
-                lstars.append(float(ls_map[site]))
+            if isinstance(ls_ns_map, Mapping) and site in ls_ns_map:
+                lstars_ns.append(int(ls_ns_map[site]))
+            elif isinstance(ls_map, Mapping) and site in ls_map:
+                lstars_ns.append(max(0, int(round(float(ls_map[site]) * float(NS_PER_US)))))
             else:
-                lstars.append(op.l_star_lean_us)
+                lstars_ns.append(max(0, int(round(float(op.l_star_lean_us) * float(NS_PER_US)))))
             bs = int(rec.get("residual_block_size", 0) or 0)
             if bs > 0:
                 block_size = bs
         if not durs:
             if full_arch_len > 0 and int(op.repeat_count) < full_arch_len:
                 continue
-            reagg.append(replace(op, repeat_count=cnt) if int(op.repeat_count) > cnt else op)
+            reagg.append(_scale_slice_op_count(op, cnt))
             continue
         eff_cnt = len(durs)
         if eff_cnt != cnt and not (full_arch_len > 0 and int(op.repeat_count) < full_arch_len):
-            reagg.append(replace(op, repeat_count=cnt) if int(op.repeat_count) > cnt else op)
+            reagg.append(_scale_slice_op_count(op, cnt))
             continue
-        inv = 1.0 / float(eff_cnt)
-        mean_dur = sum(durs) * inv
-        mean_exp = sum(exps) * inv
-        mean_lstar = sum(lstars) * inv
+        tot_dur_ns = sum(durs_ns)
+        tot_exp_ns = sum(exps_ns)
+        tot_lstar_ns = sum(lstars_ns)
+        denom_us = float(eff_cnt) * float(NS_PER_US)
+        mean_dur = float(tot_dur_ns) / denom_us
+        mean_exp = float(tot_exp_ns) / denom_us
+        mean_lstar = float(tot_lstar_ns) / denom_us
         fully_hidden = mean_dur > OVERLAP_EXPOSED_EPS_US and mean_exp <= OVERLAP_EXPOSED_EPS_US
         eff = min(1.0, mean_lstar / mean_dur) if (mean_dur > 0.0 and mean_lstar > 0.0) else None
         base_contract = _DEPTH_NOTE_STRIP_RE.sub("", op.tensor_contract or "").strip(" |")
@@ -630,6 +657,9 @@ def _reaggregate_slice_ops(
             gap_ratio=None if fully_hidden else ((mean_dur / mean_lstar) if mean_lstar > 0.0 else None),
             roofline_efficiency=eff,
             tensor_contract=new_contract,
+            dur_ns=tot_dur_ns,
+            exposed_ns=0 if fully_hidden else tot_exp_ns,
+            l_star_ns=0 if fully_hidden else tot_lstar_ns,
         ))
     return tuple(reagg)
 
@@ -772,23 +802,31 @@ def align_before_after_operators(before_bundle: ExportBundle, after_bundle: Expo
     return tuple(aligned)
 
 
-def _accumulate_macro_stats(bundle: ExportBundle) -> dict[str, dict[str, Any]]:
+MACRO_MOD_IDLE_WAIT = "Idle / Host Wait / Bubble (idle_or_wait)"
+
+
+def _accumulate_macro_stats(bundle: ExportBundle) -> tuple[dict[str, dict[str, Any]], int, int]:
     arch_by_id = {a.archetype_id: a for a in bundle.archetypes}
     stats: dict[str, dict[str, Any]] = {}
+    op_exp_total_ns = 0
     for op in bundle.operators:
         mod = classify_macro_module(op)
         bucket = stats.setdefault(mod, {
-            "exposed_ms": 0.0, "raw_ms": 0.0, "lstar_ms": 0.0, "bound_ms": defaultdict(float),
+            "exposed_ns": 0, "raw_ns": 0, "lstar_ns": 0, "bound_ms": defaultdict(float),
             "masker_ms": defaultdict(float), "target_layer_indices": set(), "draft_layers": 0, "has_head_or_embed": False,
         })
         rep = max(1, int(op.repeat_count))
-        exp_ms = 0.0 if op.is_overlapped else (op.exposed_dur_us * rep / US_PER_MS)
-        raw_ms = op.dur_us * rep / US_PER_MS
+        exp_ns = op_exposed_int_ns(op, rep)
+        raw_ns = op_dur_int_ns(op, rep)
+        ls_ns = op_lstar_int_ns(op, rep)
+        exp_ms = float(exp_ns) / float(NS_PER_MS)
+        raw_ms = float(raw_ns) / float(NS_PER_MS)
         masked_pos_ms = max(0.0, raw_ms - exp_ms)
-        bucket["exposed_ms"] += exp_ms
-        bucket["raw_ms"] += raw_ms
-        bucket["lstar_ms"] += 0.0 if op.is_overlapped else (op.l_star_lean_us * rep / US_PER_MS)
-        if exp_ms > 0.0:
+        bucket["exposed_ns"] += exp_ns
+        bucket["raw_ns"] += raw_ns
+        bucket["lstar_ns"] += ls_ns
+        op_exp_total_ns += exp_ns
+        if exp_ns > 0:
             bucket["bound_ms"][op.bound_display or op.dominant_bound] += exp_ms
         if masked_pos_ms > CONSERVATION_EPS_MS:
             bucket["masker_ms"][op.masked_by or "主计算流并发算子"] += masked_pos_ms
@@ -802,7 +840,9 @@ def _accumulate_macro_stats(bundle: ExportBundle) -> dict[str, dict[str, Any]]:
             bucket["target_layer_indices"].update(int(x) for x in arch.layer_indices)
         else:
             bucket["has_head_or_embed"] = True
-    return stats
+    step_ns = max(bundle_step_int_ns(bundle), op_exp_total_ns)
+    idle_ns = max(0, step_ns - op_exp_total_ns)
+    return stats, step_ns, idle_ns
 
 
 def _format_macro_layer_label(
@@ -839,14 +879,17 @@ def _build_masking_note(
 def build_macro_module_breakdown(
     before_bundle: ExportBundle, after_bundle: ExportBundle | None = None,
 ) -> tuple[MacroModuleRow, ...]:
-    """Aggregate L1/L2 Raw, Masked, Exposed ms and ``us / (tok*die)`` with 100% conservation."""
-    bef_stats = _accumulate_macro_stats(before_bundle)
+    """Aggregate L1/L2 Raw, Masked, Exposed ms and ``us / (tok*die)`` with 0-ns conservation."""
+    bef_stats, tot_bef_ns, idle_b_ns = _accumulate_macro_stats(before_bundle)
     aft_bundle = after_bundle or before_bundle
-    aft_stats = bef_stats if after_bundle is None else _accumulate_macro_stats(after_bundle)
+    if after_bundle is None:
+        aft_stats, tot_aft_ns, idle_a_ns = bef_stats, tot_bef_ns, idle_b_ns
+    else:
+        aft_stats, tot_aft_ns, idle_a_ns = _accumulate_macro_stats(after_bundle)
     b_ntok = max(float(before_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
     a_ntok = max(float(aft_bundle.n_tok_per_die or 1.0), MIN_DENOM_EPS)
-    tot_bef = sum(v["exposed_ms"] for v in bef_stats.values())
-    tot_aft = sum(v["exposed_ms"] for v in aft_stats.values())
+    tot_bef = float(tot_bef_ns) / float(NS_PER_MS)
+    tot_aft = float(tot_aft_ns) / float(NS_PER_MS)
     l1_by_mod = {mod: l1 for l1, mods in MACRO_L1_HIERARCHY for mod in mods}
     ordered_mods = list(dict.fromkeys([*(mod for _, mods in MACRO_L1_HIERARCHY for mod in mods), *bef_stats.keys(), *aft_stats.keys()]))
 
@@ -855,11 +898,16 @@ def build_macro_module_breakdown(
         b_info, a_info = bef_stats.get(mod), aft_stats.get(mod)
         if b_info is None and a_info is None:
             continue
-        bef_ms, aft_ms = float(b_info["exposed_ms"]) if b_info else 0.0, float(a_info["exposed_ms"]) if a_info else 0.0
-        raw_bef, raw_aft = float(b_info["raw_ms"]) if b_info else 0.0, float(a_info["raw_ms"]) if a_info else 0.0
-        lstar_ms = float(a_info["lstar_ms"]) if a_info else 0.0
-        if raw_bef <= 0.0 and raw_aft <= 0.0:
+        bef_ns = int(b_info["exposed_ns"]) if b_info else 0
+        aft_ns = int(a_info["exposed_ns"]) if a_info else 0
+        raw_bef_ns = int(b_info["raw_ns"]) if b_info else 0
+        raw_aft_ns = int(a_info["raw_ns"]) if a_info else 0
+        lstar_ns = int(a_info["lstar_ns"]) if a_info else 0
+        if raw_bef_ns <= 0 and raw_aft_ns <= 0:
             continue
+        bef_ms, aft_ms = float(bef_ns) / float(NS_PER_MS), float(aft_ns) / float(NS_PER_MS)
+        raw_bef, raw_aft = float(raw_bef_ns) / float(NS_PER_MS), float(raw_aft_ns) / float(NS_PER_MS)
+        lstar_ms = float(lstar_ns) / float(NS_PER_MS)
         merged_indices = (set(b_info["target_layer_indices"]) if b_info else set()) | (set(a_info["target_layer_indices"]) if a_info else set())
         d_layers = max(int(b_info["draft_layers"]) if b_info else 0, int(a_info["draft_layers"]) if a_info else 0)
         has_head = bool((b_info and b_info["has_head_or_embed"]) or (a_info and a_info["has_head_or_embed"]))
@@ -870,15 +918,31 @@ def build_macro_module_breakdown(
         else:
             dom_bound = max(bw.items(), key=lambda kv: kv[1])[0] if bw else "已融合 / 100% 掩盖"
         mask_note = _build_masking_note(mod, raw_aft, aft_ms, raw_bef, bef_ms, a_info["masker_ms"] if a_info else {}, b_info["masker_ms"] if b_info else {}, dom_bound)
-        b_upt, a_upt = bef_ms * US_PER_MS / b_ntok, aft_ms * US_PER_MS / a_ntok
+        b_upt = float(bef_ns) / (float(NS_PER_US) * b_ntok)
+        a_upt = float(aft_ns) / (float(NS_PER_US) * a_ntok)
         rows.append(MacroModuleRow(
             module_name=mod, layer_calls_label=layer_lbl, layer_count=layer_cnt,
             before_ms=bef_ms, before_share_pct=(100.0 * bef_ms / tot_bef) if tot_bef > 0.0 else 0.0,
             after_ms=aft_ms, after_share_pct=(100.0 * aft_ms / tot_aft) if tot_aft > 0.0 else 0.0,
-            saved_ms=bef_ms - aft_ms, lstar_ms=lstar_ms, dominant_bound=dom_bound,
+            saved_ms=float(bef_ns - aft_ns) / float(NS_PER_MS), lstar_ms=lstar_ms, dominant_bound=dom_bound,
             raw_before_ms=raw_bef, raw_after_ms=raw_aft, l1_group=l1_by_mod.get(mod, L1_MOD_RESIDUAL_MEM),
-            masked_before_ms=bef_ms - raw_bef, masked_after_ms=aft_ms - raw_aft, masking_note=mask_note,
+            masked_before_ms=float(bef_ns - raw_bef_ns) / float(NS_PER_MS),
+            masked_after_ms=float(aft_ns - raw_aft_ns) / float(NS_PER_MS), masking_note=mask_note,
             before_us_per_tok_die=b_upt, after_us_per_tok_die=a_upt, saved_us_per_tok_die=b_upt - a_upt,
+        ))
+    if idle_b_ns > 0 or idle_a_ns > 0:
+        ib_ms, ia_ms = float(idle_b_ns) / float(NS_PER_MS), float(idle_a_ns) / float(NS_PER_MS)
+        ib_upt = float(idle_b_ns) / (float(NS_PER_US) * b_ntok)
+        ia_upt = float(idle_a_ns) / (float(NS_PER_US) * a_ntok)
+        rows.append(MacroModuleRow(
+            module_name=MACRO_MOD_IDLE_WAIT, layer_calls_label="Step Wall", layer_count=0,
+            before_ms=ib_ms, before_share_pct=(100.0 * ib_ms / tot_bef) if tot_bef > 0.0 else 0.0,
+            after_ms=ia_ms, after_share_pct=(100.0 * ia_ms / tot_aft) if tot_aft > 0.0 else 0.0,
+            saved_ms=float(idle_b_ns - idle_a_ns) / float(NS_PER_MS), lstar_ms=0.0,
+            dominant_bound="Host / Sync / Bubble", raw_before_ms=ib_ms, raw_after_ms=ia_ms,
+            l1_group=L1_MOD_RESIDUAL_MEM, masked_before_ms=0.0, masked_after_ms=0.0,
+            masking_note="Host / Sync / Bubble",
+            before_us_per_tok_die=ib_upt, after_us_per_tok_die=ia_upt, saved_us_per_tok_die=ib_upt - ia_upt,
         ))
     return tuple(rows)
 
@@ -977,18 +1041,18 @@ def classify_waterfall_stage(
     """Classify one ``GroupAccounting`` row into canonical waterfall stage(s) via public config."""
     same_cfg = is_same_public_config(before_bundle, after_bundle)
     if acc.bucket == "config":
-        if acc.reason in _FRAMEWORK_REASONS and same_cfg:
+        if same_cfg or acc.reason in _FRAMEWORK_REASONS:
             return WF_STAGE_FRAMEWORK, None
         return WF_STAGE_CONFIG, None
+    has_cfg_split = (
+        not same_cfg
+        and acc.after_pre_edit_ms is not None
+        and abs(float(acc.config_share_ms)) > CONSERVATION_EPS_MS
+    )
     if acc.bucket in {"new", "tune"}:
-        has_cfg_split = (
-            not same_cfg
-            and acc.after_pre_edit_ms is not None
-            and abs(float(acc.config_share_ms)) > CONSERVATION_EPS_MS
-        )
-        if has_cfg_split:
-            return WF_STAGE_CONFIG, WF_STAGE_KERNEL
-        return WF_STAGE_KERNEL, None
+        return (WF_STAGE_CONFIG, WF_STAGE_KERNEL) if has_cfg_split else (WF_STAGE_KERNEL, None)
+    if has_cfg_split:
+        return WF_STAGE_CONFIG, WF_STAGE_RESIDUAL
     return WF_STAGE_RESIDUAL, None
 
 

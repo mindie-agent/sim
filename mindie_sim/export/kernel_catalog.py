@@ -937,11 +937,12 @@ def _extract_struct_provenance(
     family: str,
     recipe: str,
     shape: Sequence[int],
+    dtype: str,
     struct_node: Mapping[str, Any] | None,
 ) -> tuple[str, str, str, str, str]:
     """Return ``(symbol, backend, readiness, source_ref, role)`` from structure metadata."""
+    sym = backend = readiness = source_ref = role = ""
     if isinstance(struct_node, Mapping):
-        sym = ""
         impl = struct_node.get("implementation")
         if isinstance(impl, Mapping):
             for kind in impl.get("native_kinds") or ():
@@ -954,27 +955,33 @@ def _extract_struct_provenance(
                     sym = _clean_native_symbol(cand.get("native"))
                     if sym:
                         break
-        return (
-            sym,
-            str(struct_node.get("backend_stack") or "").strip(),
-            str(struct_node.get("readiness") or "").strip().lower(),
-            str(struct_node.get("source_ref") or "").strip(),
-            str(struct_node.get("submodule") or "").strip(),
-        )
+        backend = str(struct_node.get("backend_stack") or "").strip()
+        readiness = str(struct_node.get("readiness") or "").strip().lower()
+        source_ref = str(struct_node.get("source_ref") or "").strip()
+        role = str(struct_node.get("submodule") or "").strip()
+        if sym:
+            return sym, backend, readiness, source_ref, role
     if not shape:
-        return "", "", "", "", ""
+        return sym, backend, readiness, source_ref, role
     op_dict = {
         "op_id": op_id,
         "family": family,
         "recipe": recipe,
+        "dtype": str(dtype or (spec.dtype if spec is not None else "") or "bf16"),
         "local_shape": tuple(int(d) for d in shape),
         "metadata": dict(spec.metadata) if (spec is not None and spec.metadata) else {},
     }
     cert = operator_birth_certificate(op_dict, strict=False)
     if cert.readiness == "unmodeled":
-        return "", "", "", "", ""
-    sym = _clean_native_symbol(cert.native_kinds[0]) if cert.native_kinds else ""
-    return sym, str(cert.backend_stack or ""), str(cert.readiness or ""), str(cert.source_ref or ""), str(cert.submodule or "")
+        return sym, backend, readiness, source_ref, role
+    cert_sym = _clean_native_symbol(cert.native_kinds[0]) if cert.native_kinds else ""
+    return (
+        sym or cert_sym,
+        backend or str(cert.backend_stack or ""),
+        readiness or str(cert.readiness or ""),
+        source_ref or str(cert.source_ref or ""),
+        role or str(cert.submodule or ""),
+    )
 
 
 def _project_from_abi_verdict(
@@ -1072,7 +1079,7 @@ def resolve_ascend_kernel_identity(
     )
     meta_source = _format_source_entry(meta_impl.get("source") or meta.get("source_reference"))
     st_sym, st_backend, st_readiness, st_source, st_role = _extract_struct_provenance(
-        op_id, spec, fam, rec, shape, struct_node,
+        op_id, spec, fam, rec, shape, dtype, struct_node,
     )
     role = birth_role or st_role or (f"{fam}:{rec}" if rec else (fam or suffix))
 

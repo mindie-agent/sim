@@ -19,7 +19,7 @@ from typing import Literal
 from mindie_sim.backends.abi_registry import default_abi_registry
 from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO
 from mindie_sim.prediction.execution.operator_replay import operator_costs
-from mindie_sim.prediction.results import OpOccurrence, OperatorSequenceRow, StepEvaluation
+from mindie_sim.prediction.results import FusedPipelineDescriptor, OpOccurrence, OperatorSequenceRow, StepEvaluation
 from mindie_sim.prediction.runtime.reload_bounds import compute_compulsory_hbm_cut, measure_logical_bytes
 from mindie_sim.prediction.spine import _parse_occurrence, _wave_breakdown_from_report, _work_items
 from mindie_sim.prediction.runtime.accel_tables import (
@@ -369,6 +369,7 @@ def _representative_cohorts(cohorts):
 def _evaluation(
     scenario, graphs, report, graph_id, tier, prepared=None,
     *, scenario_sha256: str = "", plan_sha256: str = "",
+    extra_pipelines: tuple[FusedPipelineDescriptor, ...] = (),
 ):
     index = {(replica, op.op_id): op for replica, ops in graphs.items() for op in ops}
     rows, occurrences = [], {}
@@ -423,8 +424,10 @@ def _evaluation(
             ready, min((start for start, _ in spans), default=ready), row["complete_ms"],
             row.get("isolated_ms"),
         ))
-    pipelines = tuple(item.descriptor for item in prepared.operators
-                      if item.descriptor is not None) if prepared is not None else ()
+    base_pipelines = tuple(
+        item.descriptor for item in prepared.operators if item.descriptor is not None
+    ) if prepared is not None else ()
+    pipelines = (*base_pipelines, *extra_pipelines) if extra_pipelines else base_pipelines
     evidence = report.get("execution", {})
     cohort_replicas = {node: {cohort: tuple(spans) for cohort, spans in groups.items()}
                        for node, groups in cohorts.items()}

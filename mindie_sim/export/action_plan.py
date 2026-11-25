@@ -40,7 +40,7 @@ from .models import (
     PENDING_KIND_AT_FLOOR, PENDING_KIND_TO_IMPLEMENT, PENDING_KIND_TO_OPTIMIZE,
     TRACK_CONFIG_ENV, TRACK_FRAMEWORK, TRACK_KERNEL, US_PER_MS,
     ActionRoadmapRow, AlignedComparisonRow, ExportBundle, NewKernelBacklogItem,
-    OperatorExportRow, PendingKernelItem,
+    OperatorExportRow, PendingKernelItem, bundle_step_int_ns, op_exposed_int_ns,
 )
 from .public_view import (
     PUBLIC_PIPE_NAMES,
@@ -196,19 +196,11 @@ def build_parallelism_codesign_note(before_bundle: ExportBundle, after_bundle: E
 
 
 def _op_exposed_ns(op: OperatorExportRow, repeat_count: int) -> int:
-    if op.is_overlapped:
-        return 0
-    if int(getattr(op, "exposed_ns", 0) or 0) > 0:
-        return int(op.exposed_ns)
-    return max(0, int(round(float(op.exposed_dur_us) * max(1, int(repeat_count)) * NS_PER_US)))
+    return op_exposed_int_ns(op, repeat_count)
 
 
 def _bundle_step_and_idle_ns(bundle: ExportBundle) -> tuple[int, int]:
-    step_ns = (
-        int(bundle.step_span_ns)
-        if int(getattr(bundle, "step_span_ns", 0) or 0) > 0
-        else max(0, int(round(float(bundle.step_span_us) * NS_PER_US)))
-    )
+    step_ns = bundle_step_int_ns(bundle)
     op_sum_ns = sum(_op_exposed_ns(op, op.repeat_count) for op in bundle.operators)
     if step_ns < op_sum_ns:
         step_ns = op_sum_ns
@@ -764,7 +756,14 @@ def _project_canonical_stage_waterfall(
         out: list[dict[str, Any]] = []
         prev_ns = b_step_ns
         for idx, st in enumerate(stages):
-            st_ns = b_step_ns if idx == 0 else int(st.span_ns)
+            if idx == 0:
+                st_ns = b_step_ns
+            elif st.status == "committed":
+                st_ns = int(st.span_ns)
+            elif idx == 1 and b_step_ns != first_ns:
+                st_ns = first_ns
+            else:
+                st_ns = prev_ns
             delta_ns = 0 if idx == 0 else int(prev_ns - st_ns)
             prev_ns = st_ns
             out.append({
@@ -827,11 +826,19 @@ def _assemble_waterfall_and_accounting(
         bucket: Literal["config", "new", "tune", "residual"] = rec["cand_bucket"]
         gkey = rec["group_key"]
         if bucket == "new" and gkey not in qualified_new_keys:
-            bucket, cfg_ns, cfg_ms, cfg_upt, kern_ns, kern_ms, kern_upt = "residual", 0, 0.0, 0.0, rec["saved_ns"], rec["saved_ms"], rec["saved_upt"]
-            reason, cid, cat = "below_materiality_threshold", "", PENDING_KIND_AT_FLOOR
+            bucket, reason, cid, cat = "residual", "below_materiality_threshold", "", PENDING_KIND_AT_FLOOR
+            if rec["pre_edit_ms"] is not None:
+                cfg_ns, cfg_ms, cfg_upt = rec["cfg_ns"], rec["cfg_ms"], rec["cfg_upt"]
+                kern_ns, kern_ms, kern_upt = rec["kern_ns"], rec["kern_ms"], rec["kern_upt"]
+            else:
+                cfg_ns, cfg_ms, cfg_upt, kern_ns, kern_ms, kern_upt = 0, 0.0, 0.0, rec["saved_ns"], rec["saved_ms"], rec["saved_upt"]
         elif bucket == "tune" and gkey not in qualified_tune_keys:
-            bucket, cfg_ns, cfg_ms, cfg_upt, kern_ns, kern_ms, kern_upt = "residual", 0, 0.0, 0.0, rec["saved_ns"], rec["saved_ms"], rec["saved_upt"]
-            reason, cid, cat = "below_tuning_threshold", "", PENDING_KIND_AT_FLOOR
+            bucket, reason, cid, cat = "residual", "below_tuning_threshold", "", PENDING_KIND_AT_FLOOR
+            if rec["pre_edit_ms"] is not None:
+                cfg_ns, cfg_ms, cfg_upt = rec["cfg_ns"], rec["cfg_ms"], rec["cfg_upt"]
+                kern_ns, kern_ms, kern_upt = rec["kern_ns"], rec["kern_ms"], rec["kern_upt"]
+            else:
+                cfg_ns, cfg_ms, cfg_upt, kern_ns, kern_ms, kern_upt = 0, 0.0, 0.0, rec["saved_ns"], rec["saved_ms"], rec["saved_upt"]
         else:
             cfg_ns, kern_ns = rec["cfg_ns"], rec["kern_ns"]
             cfg_ms, cfg_upt, kern_ms, kern_upt, reason = rec["cfg_ms"], rec["cfg_upt"], rec["kern_ms"], rec["kern_upt"], rec["reason"]
@@ -840,7 +847,7 @@ def _assemble_waterfall_and_accounting(
         accounting.append(GroupAccounting(
             row_index=rec["row_index"], bucket=bucket, card_id=cid, category=cat, before_ms=rec["b_ms"], after_ms=rec["a_ms"],
             saved_ms=rec["saved_ms"], before_upt=rec["b_upt"], after_upt=rec["a_upt"], saved_upt=rec["saved_upt"],
-            after_pre_edit_ms=rec["pre_edit_ms"] if bucket in {"new", "tune"} else None,
+            after_pre_edit_ms=rec["pre_edit_ms"] if (bucket in {"new", "tune"} or cfg_ns != 0) else None,
             config_share_ms=cfg_ms, config_share_upt=cfg_upt, kernel_share_ms=kern_ms, kernel_share_upt=kern_upt, reason=reason,
         ))
         totals_ns["s2_b"] += int(rec["b_ns"])
@@ -1050,6 +1057,6 @@ def build_actionable_roadmap(
 __all__ = [
     "CONSERVATION_EPS_MS", "MAX_DISPLAY_CARDS", "NEW_KERNEL_MIN_SAVED_MS", "TUNE_MIN_SAVED_MS",
     "ComparisonPlan", "GroupAccounting", "WaterfallSummary",
-    "anchor_stage_waterfall", "build_actionable_roadmap", "build_comparison_plan", "build_new_kernel_backlog",
+    "build_actionable_roadmap", "build_comparison_plan", "build_new_kernel_backlog",
     "build_parallelism_codesign_note", "build_pending_kernel_details", "format_signed_gain_text",
 ]

@@ -37,9 +37,10 @@ US_PER_SECOND = 1_000_000.0
 #: Positive denominator floors.
 MIN_POSITIVE_SECONDS = 1e-12
 MIN_DENOM_EPS = 1e-9
-#: Default number of top gap-radar entries and top existing kernels to optimize.
+#: Default number of top gap-radar entries, top existing kernels to optimize, and target ladder trials.
 DEFAULT_GAP_RADAR_TOP_K = 20
 DEFAULT_TOP_OPTIMIZE_KERNELS = 6
+DEFAULT_EXPORT_TARGET_TRIALS = 3
 #: Absolute tolerance floor (us) and relative APE threshold (%) for reconciliation.
 RECONCILE_ABS_FLOOR_US = 2.0
 RECONCILE_APE_THRESHOLD_PCT = 10.0
@@ -825,3 +826,57 @@ class ComparisonRequest:
     after_plan_sha256: str = ""
     comparison_policy: str = "monotonic_optimization"
     require_model_scope: bool = True
+
+
+NS_FLOAT_CONSISTENCY_ABS_NS = 1.0
+NS_FLOAT_CONSISTENCY_REL_TOL = 1e-6
+
+
+def _ns_consistent(stored_ns: int, expected_ns_float: float) -> bool:
+    if stored_ns <= 0:
+        return False
+    tol = max(NS_FLOAT_CONSISTENCY_ABS_NS, NS_FLOAT_CONSISTENCY_REL_TOL * float(stored_ns))
+    return abs(float(stored_ns) - expected_ns_float) <= tol
+
+
+def op_dur_int_ns(op: OperatorExportRow, repeat_count: int) -> int:
+    """Resolve exact integer-ns total duration for ``op`` over ``repeat_count`` calls."""
+    rep = max(1, int(repeat_count))
+    expected = float(op.dur_us) * float(rep) * float(NS_PER_US)
+    stored = int(getattr(op, "dur_ns", 0) or 0)
+    if int(op.repeat_count) == rep and _ns_consistent(stored, expected):
+        return stored
+    return max(0, int(round(expected)))
+
+
+def op_exposed_int_ns(op: OperatorExportRow, repeat_count: int) -> int:
+    """Resolve exact integer-ns exposed duration for ``op`` over ``repeat_count`` calls."""
+    if op.is_overlapped:
+        return 0
+    rep = max(1, int(repeat_count))
+    expected = float(op.exposed_dur_us) * float(rep) * float(NS_PER_US)
+    stored = int(getattr(op, "exposed_ns", 0) or 0)
+    if int(op.repeat_count) == rep and _ns_consistent(stored, expected):
+        return stored
+    return max(0, int(round(expected)))
+
+
+def op_lstar_int_ns(op: OperatorExportRow, repeat_count: int) -> int:
+    """Resolve exact integer-ns L* lower bound for ``op`` over ``repeat_count`` calls."""
+    if op.is_overlapped:
+        return 0
+    rep = max(1, int(repeat_count))
+    expected = float(op.l_star_lean_us) * float(rep) * float(NS_PER_US)
+    stored = int(getattr(op, "l_star_ns", 0) or 0)
+    if int(op.repeat_count) == rep and _ns_consistent(stored, expected):
+        return stored
+    return max(0, int(round(expected)))
+
+
+def bundle_step_int_ns(bundle: ExportBundle) -> int:
+    """Resolve exact integer-ns step span for ``bundle``."""
+    expected = float(bundle.step_span_us) * float(NS_PER_US)
+    stored = int(getattr(bundle, "step_span_ns", 0) or 0)
+    if _ns_consistent(stored, expected):
+        return stored
+    return max(0, int(round(expected)))

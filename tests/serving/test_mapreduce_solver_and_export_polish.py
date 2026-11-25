@@ -30,8 +30,8 @@ import pytest
 from mindie_sim.compose import compose_case
 from mindie_sim.export import (
     align_before_after_operators,
-    anchor_stage_waterfall,
     build_export_bundle,
+    compose_export_case,
     export_comparison_xlsx,
 )
 from mindie_sim.export.action_plan import build_comparison_plan
@@ -259,113 +259,82 @@ def test_closed_form_pd_join_matches_exhaustive_ratio_grid() -> None:
         )
 
 
+def _compose_4layer_export(model_id: str, hardware: str, *, track: str) -> dict:
+    raw, _ = compose_export_case(
+        model_id, hardware, dp=8, tp=1, ep=8, pp=1,
+        prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
+        concurrency=8, feature_track=track,
+    )
+    model_cfg = dict(raw["model"])
+    model_cfg["layers"] = _TEST_LAYERS
+    if isinstance(model_cfg.get("layer_plans"), list):
+        model_cfg["layer_plans"] = model_cfg["layer_plans"][:_TEST_LAYERS]
+    return {**raw, "model": model_cfg}
+
+
 def test_anchored_four_stage_waterfall_telescopes_with_zero_gap(tmp_path: Path) -> None:
     req = StepRequest(phase="decode", tokens=1, context=_TEST_PROMPT_TOKENS, sequences=8, scope="model")
-    raw_before = compose_case(
-        "qwen3.8-flash-next", hardware="a5", parallel="fixed",
-        dp=8, tp=1, ep=8, pp=1,
-        prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
-        max_num_seqs=8, layers=_TEST_LAYERS, feature_track="merged",
-    )
-    raw_after = compose_case(
-        "qwen3.8-flash-next", hardware="a5", parallel="fixed",
-        dp=8, tp=1, ep=8, pp=1,
-        prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
-        max_num_seqs=8, layers=_TEST_LAYERS, feature_track="expected_ideal",
-    )
+    raw_before = _compose_4layer_export("qwen3.8-flash-next", "a5", track="shipping")
+    raw_after = _compose_4layer_export("qwen3.8-flash-next", "a5", track="target")
     b_before = build_export_bundle(raw_before, request=req, apply_target_envelope=False)
-    b_after_unanchored = build_export_bundle(raw_after, request=req, apply_target_envelope=True)
-    b_after_anchored = build_export_bundle(
-        raw_after, request=req, apply_target_envelope=True, compare_source=b_before,
-    )
-    # Confirm unanchored expected_ideal stage-0 actually differed from merged Before.
-    assert abs(float(b_after_unanchored.stage_waterfall[0]["step_span_us"]) - b_before.step_span_us) > 100.0
+    b_after = build_export_bundle(raw_after, request=req, apply_target_envelope=True)
+    assert b_after.engine_step_receipt is not None
+    assert len(b_after.stage_waterfall) == 4
 
-    for wf in (
-        b_after_anchored.stage_waterfall,
-        anchor_stage_waterfall(b_before, b_after_unanchored),
-    ):
-        assert len(wf) == 4
-        assert [row["stage"] for row in wf] == ["before", "config_only", "framework_rewrite", "after"]
-        assert math.isclose(wf[0]["step_span_us"], b_before.step_span_us, abs_tol=_WATERFALL_TOL_US)
-        assert math.isclose(wf[-1]["step_span_us"], b_after_unanchored.step_span_us, abs_tol=_WATERFALL_TOL_US)
-        total_delta = sum(float(row["delta_from_prev_us"]) for row in wf)
-        assert math.isclose(
-            total_delta, b_after_unanchored.step_span_us - b_before.step_span_us, abs_tol=_WATERFALL_TOL_US,
-        )
-        assert math.isclose(
-            float(wf[-1]["cumulative_saved_us"]),
-            b_before.step_span_us - b_after_unanchored.step_span_us,
-            abs_tol=_WATERFALL_TOL_US,
-        )
-        if b_before.step_span_us >= b_after_unanchored.step_span_us:
-            spans = [float(row["step_span_us"]) for row in wf]
-            assert spans[0] >= spans[1] >= spans[2] >= spans[3]
-
-    aligned = align_before_after_operators(b_before, b_after_unanchored)
-    plan = build_comparison_plan(b_before, b_after_unanchored, aligned)
-    assert len(plan.stage_waterfall) == 4
-    assert math.isclose(plan.stage_waterfall[0]["step_span_us"], b_before.step_span_us, abs_tol=_WATERFALL_TOL_US)
-    assert math.isclose(plan.stage_waterfall[-1]["step_span_us"], b_after_unanchored.step_span_us, abs_tol=_WATERFALL_TOL_US)
+    aligned = align_before_after_operators(b_before, b_after)
+    plan = build_comparison_plan(b_before, b_after, aligned)
+    wf = plan.stage_waterfall
+    assert len(wf) == 4
+    assert [row["stage_id"] for row in wf] == [
+        "before_merged", "stage1_ops_config", "stage2_unmerged_pr", "stage3_target_after",
+    ]
+    assert int(wf[0]["span_ns"]) == b_before.step_span_ns
+    assert int(wf[-1]["span_ns"]) == b_after.step_span_ns
+    assert sum(int(row["delta_ns"]) for row in wf) == b_before.step_span_ns - b_after.step_span_ns
+    assert plan.waterfall.reconciliation_error_ns == 0
 
     out_xlsx = tmp_path / "anchored_waterfall.xlsx"
-    export_comparison_xlsx(b_before, out_xlsx, compare_source=b_after_unanchored)
+    export_comparison_xlsx(b_before, out_xlsx, after_bundle=b_after)
     cells = _read_xlsx_sheet_cells(out_xlsx, sheet_index=1)
     h14_note = cells.get("H14", "")
     assert "4-Stage:" in h14_note
-    assert f"Before {b_before.step_span_us / 1000.0:.3f}" in h14_note
-    assert f"[3]算子/After {b_after_unanchored.step_span_us / 1000.0:.3f}" in h14_note
+    assert f"Before {b_before.step_span_ns / 1_000_000.0:.3f}" in h14_note
+    assert f"[3]算子/After {b_after.step_span_ns / 1_000_000.0:.3f}" in h14_note
 
 
 def test_mxfp4_expert_operator_dtype_and_tensor_contract_surface_precision_abi() -> None:
     req = StepRequest(phase="decode", tokens=1, context=_TEST_PROMPT_TOKENS, sequences=8, scope="model")
     for model_id in ("kimi-k3.1", "qwen3.8-flash-next"):
-        raw_merged = compose_case(
-            model_id, hardware="a5", parallel="fixed", dp=8, tp=1, ep=8, pp=1,
-            prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
-            max_num_seqs=8, layers=_TEST_LAYERS, feature_track="merged",
-        )
-        bun_merged = build_export_bundle(raw_merged, request=req, apply_target_envelope=False)
+        raw_shipping = _compose_4layer_export(model_id, "a5", track="shipping")
+        bun_shipping = build_export_bundle(raw_shipping, request=req, apply_target_envelope=False)
         expert_rows = [
-            op for op in bun_merged.operators
+            op for op in bun_shipping.operators
             if op.family in {"grouped_gemm", "grouped_moe"} or "megamoe" in op.recipe.lower()
         ]
         assert expert_rows, f"expected routed expert rows on {model_id}"
         assert all(op.dtype == "mxfp4" for op in expert_rows)
         assert all("MXFP4" in op.tensor_contract for op in expert_rows)
 
-        raw_ideal = compose_case(
-            model_id, hardware="a5", parallel="fixed", dp=8, tp=1, ep=8, pp=1,
-            prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
-            max_num_seqs=8, layers=_TEST_LAYERS, feature_track="expected_ideal",
-        )
-        bun_ideal = build_export_bundle(raw_ideal, request=req, apply_target_envelope=True)
-        ideal_experts = [
-            op for op in bun_ideal.operators
+        raw_target = _compose_4layer_export(model_id, "a5", track="target")
+        bun_target = build_export_bundle(raw_target, request=req, apply_target_envelope=True)
+        target_experts = [
+            op for op in bun_target.operators
             if op.family in {"grouped_gemm", "grouped_moe"} or "megamoe" in op.recipe.lower()
         ]
-        assert ideal_experts, f"expected routed expert rows on {model_id} expected_ideal"
-        assert all(op.dtype == "mxfp4" for op in ideal_experts)
-        assert all("MXFP4" in op.tensor_contract for op in ideal_experts)
+        assert target_experts, f"expected routed expert rows on {model_id} target"
+        assert all(op.dtype == "mxfp4" for op in target_experts)
+        assert all("MXFP4" in op.tensor_contract for op in target_experts)
 
-        norm_rows = [op for op in bun_merged.operators if op.family in {"rmsnorm", "add_rmsnorm"}]
+        norm_rows = [op for op in bun_shipping.operators if op.family in {"rmsnorm", "add_rmsnorm"}]
         assert norm_rows and all(op.dtype != "mxfp4" for op in norm_rows)
 
     # Control checks: MXFP8 and W4A8 experts preserve their native display dtypes.
-    raw_mxfp8 = compose_case(
-        "glm-5.3-flash", hardware="a5", parallel="fixed", dp=8, tp=1, ep=8, pp=1,
-        prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
-        max_num_seqs=8, layers=_TEST_LAYERS, feature_track="merged",
-    )
+    raw_mxfp8 = _compose_4layer_export("glm-5.3-flash", "a5", track="shipping")
     bun_mxfp8 = build_export_bundle(raw_mxfp8, request=req, apply_target_envelope=False)
     mxfp8_experts = [op for op in bun_mxfp8.operators if op.family in {"grouped_gemm", "grouped_moe"}]
     assert mxfp8_experts and all(op.dtype == "fp8_e4m3" for op in mxfp8_experts)
 
-    raw_w4a8 = compose_case(
-        "deepseek-v4.1-flash", hardware="a3", parallel="fixed", dp=8, tp=1, ep=8, pp=1,
-        prompt_tokens=_TEST_PROMPT_TOKENS, output_tokens=_TEST_OUTPUT_TOKENS,
-        max_num_seqs=8, layers=_TEST_LAYERS, feature_track="merged",
-    )
+    raw_w4a8 = _compose_4layer_export("deepseek-v4.1-flash", "a3", track="shipping")
     bun_w4a8 = build_export_bundle(raw_w4a8, request=req, apply_target_envelope=False)
     w4a8_experts = [op for op in bun_w4a8.operators if op.family in {"grouped_gemm", "grouped_moe"}]
     assert w4a8_experts and all(op.dtype == "int8" for op in w4a8_experts)

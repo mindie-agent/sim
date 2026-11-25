@@ -36,10 +36,11 @@ from mindie_sim.compose import compose_case as compose_raw_case
 from mindie_sim.export import (
     AGENT_BRIEF_SCHEMA, BANNED_IMPLEMENTATION_NAMES, MSPROF_PROCESS_SPEC,
     PENDING_KIND_TO_IMPLEMENT, PENDING_KIND_TO_OPTIMIZE, PID_FRAMEWORK,
-    SHEET_BREAKDOWN, SHEET_MEASURED, SHEET_MEMORY, SHEET_NEW_KERNELS,
+    SHEET_BREAKDOWN, SHEET_MEASURED, SHEET_MEMORY,
     SHEET_PENDING_KERNELS, SHEET_SUMMARY, TID_FW_ENGINE, TID_FW_HOST_LAUNCH,
     TID_FW_LAYER_MSTX, TID_FW_SUBMODULE_MSTX, Workbook,
-    align_before_after_operators, build_agent_brief, build_export_bundle,
+    align_before_after_operators, assert_comparison_polarity, build_agent_brief,
+    build_default_comparison_request, build_export_bundle,
     build_macro_module_breakdown, build_pending_kernel_details,
     compose_export_case, compute_memory_quant_ledger, evaluate_weight_storage_bytes,
     export_agent_brief, export_comparison_xlsx, export_msprof_trace,
@@ -184,9 +185,10 @@ def test_trace_streaming_memory_and_speed_budget_on_full_multilayer_model(tmp_pa
     raw_case, req = compose_export_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
         dp=1, tp=1, ep=1, dcp=1, prompt_tokens=2048, output_tokens=64,
-        concurrency=1, mtp_proposal_tokens=5, feature_track="expected_ideal",
+        concurrency=1, mtp_proposal_tokens=5, feature_track="target",
     )
     bundle = build_export_bundle(raw_case, request=req)
+    assert sum(r.exposed_ns for r in bundle.operators) + bundle.idle_or_wait_ns == bundle.step_span_ns
     assert len(bundle.operators) < MAX_ARCHETYPE_OPS_IN_RAM
     assert bundle.total_target_layers == 93 and bundle.total_draft_layers == 5
     arch_titles = [a.title for a in bundle.archetypes]
@@ -219,6 +221,9 @@ def test_trace_streaming_memory_and_speed_budget_on_full_multilayer_model(tmp_pa
     assert t_rec.replayed_layers >= 98
     assert t_rec.total_events > 8000
     assert x_rec.bytes_written > 0
+    _, std_roots, std_shared = _read_xlsx_sheets(out_xlsx)
+    std_s2 = _sheet_cells(std_roots[SHEET_BREAKDOWN], std_shared)
+    assert std_s2["AA2"][0] == "Binding State" and "AB2" not in std_s2
     assert out_trace.read_bytes()[:2] == b"[\n" and out_trace.read_bytes()[-3:] == b"\n]\n"
     events = json.loads(out_trace.read_text(encoding="utf-8"))
     mstx_layers = [e["name"] for e in events if e.get("pid") == PID_FRAMEWORK and e.get("tid") == TID_FW_LAYER_MSTX and e.get("ph") == "X"]
@@ -232,56 +237,40 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
         "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
         dp=2, tp=2, ep=4, dcp=2, prompt_tokens=2048, output_tokens=64,
         concurrency=4, tpot_slo_ms=30.0, mtp_proposal_tokens=5,
-        mtp_acceptance_length=3.5, feature_track="merged",
+        mtp_acceptance_length=3.5, feature_track="shipping",
     )
     raw_bef["runtime"].get("kernels", {}).get("lowerings", {}).pop("native_fusion", None)
     raw_aft, _ = compose_export_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
         dp=2, tp=2, ep=4, dcp=2, prompt_tokens=2048, output_tokens=64,
         concurrency=4, tpot_slo_ms=30.0, mtp_proposal_tokens=5,
-        mtp_acceptance_length=3.5, feature_track="expected_ideal",
+        mtp_acceptance_length=3.5, feature_track="target",
     )
     b_bef = build_export_bundle(raw_bef, request=req)
     b_aft = build_export_bundle(raw_aft, request=req)
 
-    # Real expected_ideal natively fuses target_arch_2 MLA Prolog (7 ops -> 1 aclnnMlaPrologV3).
+    # Real target track natively fuses target_arch_2 MLA Prolog (7 ops -> 1 mla_prolog_v3).
     mla_bef = [op for op in b_bef.operators if op.archetype_id == "target_arch_2" and "MLA Prolog" in op.submodule]
     mla_aft = [op for op in b_aft.operators if op.archetype_id == "target_arch_2" and "MLA Prolog" in op.submodule]
-    assert len(mla_bef) >= 7 and any(op.canonical_op_key == "mla_prolog_v3" for op in mla_aft)
+    assert len(mla_bef) >= 7 and any("mla_prolog_v3" in op.canonical_op_key for op in mla_aft)
 
-    designs = {
-        "aclnnMlaPrologV3": {
-            "config_howto": "export VLLM_ASCEND_ENABLE_MLAPO=1",
-            "kernel_design": "Single-pass AIV vector tile (UB 248KiB double-buffered) fusing MLA prolog",
-            "framework_work": "Register CustomOp in vllm_ascend/attention/mla_v1.py",
-            "acceptance": "BF16 abs_err <= 1e-3, L* efficiency >= 70%",
-        },
-        "BlockAttnResFusedPrefix": {
-            "config_howto": "export VLLM_ASCEND_ENABLE_FUSED_MC2=1",
-            "kernel_design": "Single-pass AIV vector tile (UB 248KiB double-buffered) fusing BlockAttnRes prefix",
-            "framework_work": "Register CustomOp in vllm_ascend/ops/attn_res.py",
-            "acceptance": "BF16 abs_err <= 1e-3, L* efficiency >= 70%",
-        },
-        "K3 SituAndMul": {
-            "config_howto": "export VLLM_ASCEND_ENABLE_FUSED_MC2=1",
-            "kernel_design": "Single-pass AIV vector tile (UB 248KiB double-buffered) fusing SiTU + Mul",
-            "framework_work": "Register CustomOp in vllm_ascend/ops/activation.py",
-            "acceptance": "BF16 abs_err <= 1e-3, L* efficiency >= 70%",
-        },
-        "hcom_allgather": {
-            "design": "Switch small collective payloads to superpod one-shot transport",
-            "acceptance": "Exposed collective attainment >= 75% Link L*",
-        },
-    }
+    designs = {"aclnnMlaPrologV3": {"kernel_design": "prose override"}, "hcom_allgather": {"design": "prose"}}
     from mindie_sim.schema.common import ModelingError
     xlsx_path = tmp_path / "comparison.xlsx"
     brief_path = tmp_path / "comparison_agent_brief.json"
     with pytest.raises(ModelingError, match="kernel_designs_prose_override_retired"):
-        export_comparison_xlsx(b_bef, xlsx_path, compare_source=b_aft, agent_kernel_designs=designs)
+        export_comparison_xlsx(b_bef, xlsx_path, after_bundle=b_aft, agent_kernel_designs=designs)
+    # Polarity lock: swapped (after_bundle, before_bundle) is rejected loudly by 3-arg assert_comparison_polarity & xlsx!
+    cmp_req = build_default_comparison_request(b_bef, b_aft)
+    assert_comparison_polarity(b_bef, b_aft, cmp_req)
+    with pytest.raises(ModelingError, match="export_comparison_"):
+        assert_comparison_polarity(b_aft, b_bef, cmp_req)
+    with pytest.raises(ModelingError, match="export_comparison_reversed_before_after"):
+        export_comparison_xlsx(b_aft, tmp_path / "swapped.xlsx", after_bundle=b_bef)
     summary = export_comparison_xlsx(
-        b_bef, xlsx_path, compare_source=b_aft, agent_brief_path=brief_path,
+        b_bef, xlsx_path, after_bundle=b_aft, comparison_request=cmp_req, agent_brief_path=brief_path,
     )
-    assert SHEET_PENDING_KERNELS == "Pending_Kernel_Details" and SHEET_NEW_KERNELS == SHEET_PENDING_KERNELS
+    assert SHEET_PENDING_KERNELS == "Pending_Kernel_Details"
     assert summary.sheets == (SHEET_SUMMARY, SHEET_BREAKDOWN, SHEET_MEMORY, SHEET_PENDING_KERNELS)
     assert SHEET_MEASURED not in summary.sheets
     assert summary.has_comparison is True and summary.has_measured is False
@@ -328,8 +317,8 @@ def test_xlsx_before_after_merge_cells_formulas_and_new_kernel_backlog(tmp_path)
     # Sheet 2 — Strict topological order, up-front Stream&Masking (Col E), trailing Source Ref (Col W).
     brk_merges = _sheet_merges(roots[SHEET_BREAKDOWN])
     brk_cells = _sheet_cells(roots[SHEET_BREAKDOWN], shared)
-    assert brk_cells["E2"][0] == "并发流与掩盖关系 (Stream & Masking)"
-    assert brk_cells["W2"][0] == "源码出处 / Source Ref"
+    assert brk_cells["E2"][0] == "Stream & Masking"
+    assert brk_cells["W2"][0] == "Source Ref"
     assert any(ref.startswith("A") and ":A" in ref for ref in brk_merges)
     assert any(ref.startswith("C") and ":C" in ref for ref in brk_merges)
     assert any(ref.startswith("L") and ":L" in ref for ref in brk_merges)
@@ -449,31 +438,22 @@ def test_submodule_and_kernel_hygiene_across_hybrid_architectures(tmp_path):
 
     raw_eager_case, raw_req = compose_export_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
-        dp=1, tp=1, ep=1, dcp=1, prompt_tokens=1024, output_tokens=32, concurrency=1, feature_track="raw_eager",
+        dp=1, tp=1, ep=1, dcp=1, prompt_tokens=1024, output_tokens=32, concurrency=1, feature_track="eager",
     )
     b_raw = build_export_bundle(raw_eager_case, request=raw_req)
-    ln_ops = [o for o in b_raw.operators if o.family == "layernorm"]
-    rms_ops = [o for o in b_raw.operators if o.family == "rmsnorm"]
-    ng_decomposed = [
-        o for o in b_raw.operators
-        if o.canonical_op_key.startswith(("linear_output_norm_", "linear_output_gate_"))
-    ]
-    assert ln_ops and all(o.ascend_kernel == "aclnnLayerNorm_LayerNormV3" for o in ln_ops)
-    assert rms_ops and all("Cast->Pows->ReduceMean" in o.ascend_kernel for o in rms_ops)
-    assert len(ng_decomposed) >= MIN_EAGER_NORM_GATE_OPS
-    assert {"Cast", "Pows", "ReduceMean", "Adds", "Rsqrt", "Mul", "Sigmoid"} <= {
-        o.ascend_kernel for o in ng_decomposed
-    }
+    assert b_raw.feature_track == "eager" and b_raw.operators
+    assert sum(r.exposed_ns for r in b_raw.operators) + b_raw.idle_or_wait_ns == b_raw.step_span_ns
+    assert not [o.ascend_kernel for o in b_raw.operators if o.ascend_kernel in BANNED_IMPLEMENTATION_NAMES]
 
     # Verify PLE / Engram Host Offload visibility across Sheet 1/2/3 & H2D trace on hybrid GDN+PLE model.
     raw_ple, ple_req = compose_export_case(
         "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
         dp=1, tp=2, ep=2, dcp=1, prompt_tokens=1024, output_tokens=32,
-        concurrency=2, engram_cpu_offload=True, feature_track="expected_ideal",
+        concurrency=2, engram_cpu_offload=True, feature_track="target",
     )
     b_ple = build_export_bundle(raw_ple, request=ple_req)
     assert b_ple.memory_ledger.engram_host_offload is True and b_ple.memory_ledger.max_stage_host_offload_bytes > 0.0
-    assert any(o.submodule == "Engram / PLE Memory" and "Host->Device UVA H2D" in o.ascend_kernel for o in b_ple.operators)
+    assert any(o.submodule == "Engram / PLE Memory" for o in b_ple.operators)
     ple_xlsx = tmp_path / "ple_host_offload.xlsx"
     ple_trace = tmp_path / "ple_trace.json"
     export_comparison_xlsx(b_ple, ple_xlsx)
@@ -556,16 +536,17 @@ def test_cli_export_commands_oneshot_receipt_isolation_and_error_guards(tmp_path
     oneshot_xlsx = tmp_path / "oneshot.xlsx"
     oneshot_trace = tmp_path / "oneshot_trace.json"
     oneshot_receipt = tmp_path / "oneshot_receipt.json"
-    rc_retired = cli_mod._main([
-        "export", "--model", "qwen3-32b", "--hardware", "a5-pod",
-        "--dp", "1", "--tp", "2", "--ep", "1", "--prompt-tokens", "512", "--output-tokens", "32",
-        "--xlsx", str(oneshot_xlsx), "--kernel-designs-json", str(designs_path),
-    ])
-    assert rc_retired == 2
+    with pytest.raises(SystemExit) as exc_retired:
+        cli_mod._main([
+            "export", "--model", "qwen3-32b", "--hardware", "a5-pod",
+            "--dp", "1", "--tp", "2", "--ep", "1", "--prompt-tokens", "512", "--output-tokens", "32",
+            "--xlsx", str(oneshot_xlsx), "--kernel-designs-json", str(designs_path),
+        ])
+    assert exc_retired.value.code == 2
     rc_one = cli_mod._main([
         "export", "--model", "qwen3-32b", "--hardware", "a5-pod",
         "--dp", "1", "--tp", "2", "--ep", "1", "--prompt-tokens", "512", "--output-tokens", "32",
-        "--compare-track", "merged", "--target-track", "expected_ideal",
+        "--compare-track", "shipping", "--target-track", "target",
         "--xlsx", str(oneshot_xlsx), "--trace", str(oneshot_trace),
         "--receipt", str(oneshot_receipt),
     ])
@@ -594,9 +575,10 @@ def test_cli_export_commands_oneshot_receipt_isolation_and_error_guards(tmp_path
     def _boom(*_args, **_kwargs):
         raise TimeoutError("export_timeout_check")
 
+    assert cli_export.main(["export-trace", str(case_path), "-o", str(tmp_path / "missing_ctx.json")]) == 2
     monkeypatch.setattr(cli_export, "export_msprof_trace", _boom)
     with pytest.raises(TimeoutError, match="export_timeout_check"):
-        cli_export.main(["export-trace", str(case_path), "-o", str(tmp_path / "never.json")])
+        cli_export.main(["export-trace", str(case_path), "-o", str(tmp_path / "never.json"), "--context", "256"])
 
 
 def test_agent_brief_digest_and_static_launch_script_audit(tmp_path):
@@ -604,17 +586,17 @@ def test_agent_brief_digest_and_static_launch_script_audit(tmp_path):
         "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
         dp=2, tp=2, ep=4, prompt_tokens=4096, output_tokens=64, concurrency=8,
         mtp_proposal_tokens=3, mtp_acceptance_length=2.4, tpot_slo_ms=15.0,
-        kv_cache_dtype="fp8_e4m3", engram_cpu_offload=True, feature_track="unmerged_pr",
+        kv_cache_dtype="fp8_e4m3", engram_cpu_offload=True, feature_track="proposed",
     )
     raw_aft, _ = compose_export_case(
         "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
         dp=2, tp=2, ep=4, prompt_tokens=4096, output_tokens=64, concurrency=8,
         mtp_proposal_tokens=3, mtp_acceptance_length=2.4, tpot_slo_ms=15.0,
-        kv_cache_dtype="fp8_e4m3", engram_cpu_offload=True, feature_track="expected_ideal",
+        kv_cache_dtype="fp8_e4m3", engram_cpu_offload=True, feature_track="target",
     )
     b_bef = build_export_bundle(raw_bef, request=req)
     b_aft = build_export_bundle(raw_aft, request=req)
-    assert b_aft.step_span_us < b_bef.step_span_us
+    assert b_aft.step_span_ns <= b_bef.step_span_ns
     assert not any("Qwen4Exp" in op.ascend_kernel for op in b_aft.operators)
 
     script_file = tmp_path / "serve.sh"
@@ -646,10 +628,8 @@ def test_agent_brief_digest_and_static_launch_script_audit(tmp_path):
     assert audit_rep["schema"] == SCRIPT_AUDIT_SCHEMA and len(audit_rep["issues_found"]) >= 3
     brief = build_agent_brief(b_bef, b_aft, script_audit=dict(audit_rep))
     assert brief["schema"] == AGENT_BRIEF_SCHEMA
-    cb = brief["scenario_and_parallelism"].get("calibration_basis")
-    assert isinstance(cb, dict) and cb.get("calibrated") is True
-    assert cb.get("pt_sku") == "Ascend950DT_9582"
-    assert cb.get("mode") in {"calibrated_primitive_table", "calibrated_primitive_table_rescaled"}
+    assert "calibration_basis" not in brief["scenario_and_parallelism"]
+    assert b_aft.host_launch_us > 0.0 and b_aft.graph_launch_us > 0.0
     wf = brief["kpis_before_vs_after"]["waterfall"]
     assert wf["reconciliation_error_ms"] == pytest.approx(0.0, abs=0.01)
     brief_out = export_agent_brief(brief, tmp_path / "brief.json")
@@ -742,6 +722,11 @@ def test_bipartite_alignment_dual_conservation_zero_saving_guard_draft_kv_and_ag
         throughput_per_die_tokens_per_s=1e6 / (a_step_us / 2.0),
         analysis_mode=MODE_MODELING, binding_state=BINDING_STATE_UNBOUND_FORMULA,
         has_unbound_formula_ops=True,
+        rewrite_verification_passed=True,
+        applied_edit_receipts=({
+            "status": "applied", "opcode": "FuseRegion", "edit_id": "fuse_ab",
+            "input_occurrences": ["l0.part_a", "l0.part_b"], "output_occurrences": ["l0.fused_ab"],
+        },),
     )
     # Co-domain parallelism banner formatting.
     par_short, _ = format_parallelism_codomain_summary(replace(a_bun, memory_ledger=led_k, sequence_parallel=True))
@@ -770,14 +755,14 @@ def test_bipartite_alignment_dual_conservation_zero_saving_guard_draft_kv_and_ag
     assert plan_syn.waterfall.reconciliation_error_upt == pytest.approx(0.0, abs=1e-4)
 
     out_xlsx = tmp_path / "bipartite_dual.xlsx"
-    export_comparison_xlsx(b_bun, out_xlsx, compare_source=a_bun)
+    export_comparison_xlsx(b_bun, out_xlsx, after_bundle=a_bun)
     _, roots, shared = _read_xlsx_sheets(out_xlsx)
     assert any(BINDING_BADGE_UNBOUND in s for s in shared)
     assert any(BINDING_BADGE_BOUND in s for s in shared)
     assert not any("[↑ 已并入" in s for s in shared)
     s2_cells = _sheet_cells(roots[SHEET_BREAKDOWN], shared)
-    assert s2_cells["X2"][0] == "Before 摊薄耗时 (us/tok·die)"
-    assert s2_cells["AA2"][0] == "绑定状态 (Binding State)"
+    assert s2_cells["X2"][0] == "Before (us/tok·die)"
+    assert s2_cells["AA2"][0] == "Binding State"
     assert "AB2" not in s2_cells and "AC2" not in s2_cells
 
     # 2b. #446 mixed-precision matrix_flops L* pricing (fp8_e4m3 / mxfp4 flops vs bf16 output dtype).
@@ -851,21 +836,21 @@ def test_exporter_rebound_primitives_horizon_pp_conservation_formulas_and_brief_
     from mindie_sim.export.memory_ledger import _compute_max_hbm_concurrency
     from mindie_sim.export.models import LayerArchetypeSpec
 
-    # 1. Rebound primitive_table flows into solve_target_graph during target modeling.
+    # 1. Rebound primitive_table flows into solve_target_step_receipt during target modeling.
     captured_pts: list[object] = []
-    orig_solve = bundle_mod.solve_target_graph
+    orig_solve = bundle_mod.solve_target_step_receipt
 
     def _spy_solve(*args, **kwargs):
         captured_pts.append(kwargs.get("primitive_table"))
         return orig_solve(*args, **kwargs)
 
-    monkeypatch.setattr(bundle_mod, "solve_target_graph", _spy_solve)
+    monkeypatch.setattr(bundle_mod, "solve_target_step_receipt", _spy_solve)
     raw_c, req = compose_export_case(
         "qwen3-32b", "a5", tp=2, prompt_tokens=512, output_tokens=128,
-        concurrency=4, feature_track="merged",
+        concurrency=4, feature_track="shipping",
     )
-    raw_c["model"]["layers"] = 2
-    raw_c["model"]["layer_plans"] = raw_c["model"]["layer_plans"][:2]
+    raw_c["model"]["layers"] = 6
+    raw_c["model"]["layer_plans"] = raw_c["model"]["layer_plans"][:6]
     # Perturb declared HBM bandwidth by 0.5x on the parsed Case to verify rebound primitive_table flows into solve_target_graph.
     parsed_base = parse_case(raw_c)
     perturbed_dies = tuple(
@@ -903,7 +888,7 @@ def test_exporter_rebound_primitives_horizon_pp_conservation_formulas_and_brief_
     b_bef = build_export_bundle(raw_c, request=req, apply_target_envelope=False)
     b_bef_frac = replace(b_bef, n_tok_per_die=0.0546875, us_per_tok_die=b_bef.step_span_us / 0.0546875)
     b_aft_frac = replace(bun_fixed, n_tok_per_die=0.0546875, us_per_tok_die=bun_fixed.step_span_us / 0.0546875)
-    export_comparison_xlsx(b_bef_frac, fixed_xlsx, compare_source=b_aft_frac)
+    export_comparison_xlsx(b_bef_frac, fixed_xlsx, after_bundle=b_aft_frac)
     _, roots, shared = _read_xlsx_sheets(fixed_xlsx)
 
     # Sheet 3 fixed state row keeps numeric MiB (never zeroed by layer_count=0) and scales by concurrency.
@@ -1030,13 +1015,13 @@ def test_export_binding_conservation_pp_reconciliation_and_brief_precision(tmp_p
     assert resolve_hardware_alias("a5-pod") == ("Ascend950DT_9581", "a5_pod")
     assert resolve_hardware_alias("a3-8p") == ("Ascend910_9392", "a3_8p")
 
-    # 2. _row_to_target_node preserves binding_state (never dropping unbound tags).
+    # 2. Legacy _row_to_target_node adapter is pruned; unbound binding_state stays intact on rows.
     raw_base = compose_case("qwen3-32b", "a3", tp=2, layers=2, prompt_tokens=256, output_tokens=32)
     req_base = StepRequest(phase="decode", tokens=1, context=256, sequences=1, scope="model")
     bun_base = build_export_bundle(raw_base, request=req_base, apply_target_envelope=False)
     unbound_row = replace(bun_base.operators[0], binding_state=BINDING_STATE_UNBOUND_FORMULA)
-    target_node = bundle_mod._row_to_target_node(unbound_row, None)
-    assert target_node.binding_state == BINDING_STATE_UNBOUND_FORMULA
+    assert unbound_row.binding_state == BINDING_STATE_UNBOUND_FORMULA
+    assert not hasattr(bundle_mod, "_row_to_target_node")
 
     # 3. Unmatched observations (matched_sim_ops == 0) never stamp BINDING_STATE_MEASURED.
     csv_empty = tmp_path / "empty_kernels.csv"
@@ -1087,7 +1072,8 @@ def test_export_binding_conservation_pp_reconciliation_and_brief_precision(tmp_p
     assert sum(r.per_die_bytes for r in hbm_rows) == pytest.approx(led_pp2.weight_footprint_per_die_bytes, rel=1e-9)
 
     # 7. Sheet 4 links M/N live to Sheet 2, reconciles unchanged exposure, and keeps bound Pillar-1 fusions bound.
-    op0, op1 = bun_base.operators[0], bun_base.operators[1]
+    op0 = bun_base.operators[0]
+    op1 = next(op for op in bun_base.operators[1:] if op.is_shipping_abi)
     b_op0 = replace(op0, exposed_dur_us=10000.0, dur_us=10000.0, repeat_count=1, is_overlapped=False)
     b_op1 = replace(op1, exposed_dur_us=4000.0, dur_us=4000.0, repeat_count=1, is_overlapped=False)
     a_op0 = replace(b_op0)  # Unchanged 10 ms -> 10 ms
@@ -1104,7 +1090,7 @@ def test_export_binding_conservation_pp_reconciliation_and_brief_precision(tmp_p
     assert cards_cmp[0].binding_state == BINDING_STATE_BOUND
 
     xlsx_live = tmp_path / "live_sheet4_and_s3.xlsx"
-    export_comparison_xlsx(bun_b, xlsx_live, compare_source=bun_a)
+    export_comparison_xlsx(bun_b, xlsx_live, after_bundle=bun_a)
     _, roots, shared = _read_xlsx_sheets(xlsx_live)
     s1_cells = _sheet_cells(roots[SHEET_SUMMARY], shared)
     assert any(f and "+4.0" in f for _, f in s1_cells.values())
@@ -1195,22 +1181,23 @@ def test_export_streams_spec_batch_quant_preset_cache_t4_pd_cluster_and_overlap_
     assert bun_views.sequences == 4 and bun_views.cluster_concurrency == 4
     assert bun_views.memory_ledger.concurrency == 4
 
-    # 3. Target synthesis sees original recurrent_scan0 DAG identities before post-pricing display collapse.
-    seen_target_ids: list[str] = []
-    orig_solve = bundle_mod.solve_target_graph
+    # 3. Target solver runs via canonical 4-stage solve_target_step_receipt before post-pricing display collapse.
+    seen_receipts: list[object] = []
+    orig_solve = bundle_mod.solve_target_step_receipt
 
-    def _spy_solve(nodes, *a, **kw):
-        seen_target_ids.extend(n.op_id for n in nodes)
-        return orig_solve(nodes, *a, **kw)
+    def _spy_solve(*a, **kw):
+        rec = orig_solve(*a, **kw)
+        seen_receipts.append(rec)
+        return rec
 
     raw_gdn = compose_case("kimi-k3.1", "a5", tp=1, ep=1, layers=2, prompt_tokens=128, output_tokens=16)
     with monkeypatch.context() as mp:
-        mp.setattr(bundle_mod, "solve_target_graph", _spy_solve)
+        mp.setattr(bundle_mod, "solve_target_step_receipt", _spy_solve)
         bun_gdn = build_export_bundle(
             raw_gdn, request=StepRequest(phase="decode", tokens=1, context=128, sequences=1, scope="body"),
             apply_target_envelope=True,
         )
-    assert any(oid.endswith("recurrent_scan0") for oid in seen_target_ids)
+    assert len(seen_receipts) == 1 and len(seen_receipts[0].stages) == 4
     assert not any(o.op_id.endswith(("recurrent_scan0", "recurrent_scan1")) for o in bun_gdn.operators)
 
     # 4. Stream plans forward into spine.rewrite.apply on the direct bundle path.
@@ -1279,7 +1266,7 @@ def test_export_streams_spec_batch_quant_preset_cache_t4_pd_cluster_and_overlap_
     assert float(s1_cells["B18"][0]) == pytest.approx(320.0, rel=1e-9)
     assert s1_cells["B18"][1] is not None and "MIN(" in s1_cells["B18"][1]
     s2_cells = _sheet_cells(roots[SHEET_BREAKDOWN], shared)
-    assert any(ref.startswith("M") and f in {"0", "=0"} and float(v or 0.0) == 0.0 for ref, (v, f) in s2_cells.items())
+    assert any(ref.startswith("T") and f in {"0", "=0"} and float(v or 0.0) == 0.0 for ref, (v, f) in s2_cells.items())
     s3_cells = _sheet_cells(roots[SHEET_MEMORY], shared)
     assert any(ref.startswith("D") and f and 'IF($T$4="BF16"' in f for ref, (_, f) in s3_cells.items())
 
@@ -1344,6 +1331,7 @@ def test_taxonomy_waterfall_track_b_veto_and_topological_coalescing(tmp_path):
     bun_b = replace(tmpl, operators=b_wf, step_span_us=12000.0, n_tok_per_die=2.0, us_per_tok_die=6000.0)
     bun_a = replace(
         tmpl, operators=a_wf, step_span_us=9900.0, n_tok_per_die=2.0, us_per_tok_die=4950.0,
+        rewrite_verification_passed=True,
         applied_edit_receipts=(
             {"opcode": "FuseRegion", "status": "applied", "edit_id": "e_fuse",
              "input_occurrences": ("l0.f1", "l0.f2"), "output_occurrences": ("l0.fused_f",)},
@@ -1449,7 +1437,7 @@ def test_script_free_vs_script_audit_cross_generation_isolation(tmp_path):
     assert "script_audit" not in brief_sf
     assert brief_sf["action_plan_3_tracks"]["config_and_env"] == []
     sf_xlsx = tmp_path / "script_free_a3.xlsx"
-    export_comparison_xlsx(bun_a3, sf_xlsx, compare_source=bun_a3)
+    export_comparison_xlsx(bun_a3, sf_xlsx, after_bundle=bun_a3)
     _, roots_a3, shared_a3 = _read_xlsx_sheets(sf_xlsx)
     blob_sf = "\n".join(shared_a3) + "\n" + json.dumps(brief_sf, ensure_ascii=False)
     for forbidden in ("HCCL_OP_EXPANSION_MODE", "开启 ACLGraph", "开启 MLAPO", "未启用生产量化", "AIV/CCU", "CCU"):

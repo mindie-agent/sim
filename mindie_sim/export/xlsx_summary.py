@@ -23,7 +23,7 @@ from .comparison import format_parallelism_codomain_summary
 from .models import (
     BINDING_STATE_BOUND, GIB_BYTES, MACRO_L1_HIERARCHY, MIN_DENOM_EPS, MODE_MODELING,
     NS_PER_MS, OVERLAP_EXPOSED_EPS_US, TRACK_CONFIG_ENV, TRACK_FRAMEWORK, US_PER_MS,
-    ActionRoadmapRow, ExportBundle, MacroModuleRow, format_binding_badge,
+    ActionRoadmapRow, ExportBundle, MacroModuleRow, bundle_step_int_ns, format_binding_badge,
 )
 from .public_view import format_track_label
 from .ooxml import (
@@ -339,16 +339,8 @@ def _populate_summary_kpi_block(
     ))
     ws.merge_range(SUM_B2_HDR_ROW, SUM_KPI_NOTE_START_COL, SUM_B2_HDR_ROW, SUMMARY_COLS)
 
-    b_step = (
-        float(bundle.step_span_ns) / float(NS_PER_MS)
-        if int(getattr(bundle, "step_span_ns", 0) or 0) > 0
-        else bundle.step_span_us / US_PER_MS
-    )
-    a_step = (
-        float(after.step_span_ns) / float(NS_PER_MS)
-        if int(getattr(after, "step_span_ns", 0) or 0) > 0
-        else after.step_span_us / US_PER_MS
-    )
+    b_step = float(bundle_step_int_ns(bundle)) / float(NS_PER_MS)
+    a_step = float(bundle_step_int_ns(after)) / float(NS_PER_MS)
     b_acc, acc = max(1.0, bundle.avg_accepted_tokens), max(1.0, after.avg_accepted_tokens)
     b_hf = float(getattr(bundle, "handoff_tpot_ms", 0.0) or 0.0) if is_decode else 0.0
     a_hf = float(getattr(after, "handoff_tpot_ms", 0.0) or 0.0) if is_decode else 0.0

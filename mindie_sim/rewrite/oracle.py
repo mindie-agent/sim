@@ -23,6 +23,7 @@ from mindie_sim.catalog.ops import comm_op
 from mindie_sim.prediction.collectives import OneShotCollective
 from mindie_sim.prediction.collectives.ring_pairwise import PairwiseCollective, RingCollective
 from mindie_sim.prediction.evaluation import ACTIVE_DEADLINE_MONO, EvaluationContext
+from mindie_sim.prediction.execution.layer_runs import execute_native_cohort_graph
 from mindie_sim.prediction.execution.split_barrier import DEFAULT_SPLIT_DTYPE_BYTES
 from mindie_sim.prediction.execution.runner import EAGER_MOE_DISPATCH_RECIPES
 from mindie_sim.prediction.operators.grouped_moe.expected_grouped import ExpectedGroupedMatmul
@@ -33,7 +34,9 @@ from mindie_sim.prediction.mechanism import Work
 from mindie_sim.prediction.operators.moe_transport.moe_callers import RoutingPolicy
 from mindie_sim.prediction.program.primitives import PrimitiveStore
 from mindie_sim.prediction.program import KernelProgram, RecipeBook, Stage
-from mindie_sim.prediction.results import RankOps, ReplayOptions, StepEvaluation, StepRequest
+from mindie_sim.prediction.results import (
+    FusedPipelineDescriptor, OpOccurrence, RankOps, ReplayOptions, StepEvaluation, StepRequest,
+)
 from mindie_sim.prediction.runtime.tile_solver import TilePipelineSpec
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
@@ -42,7 +45,7 @@ from mindie_sim.templates.contracts import FormulaKernelSpec
 from mindie_sim.templates.fuse_region import FusedPipelineRecipe, solve_formula_sram
 
 from ._oracle_prefetch import bind_prefetch_ops, bind_prefetch_streams, primitive_table_digest_token
-from .apply import AppliedPlan, DEFAULT_STACK_ID, ResolvedScenario, _solve_tiles, apply_plan, resolve_scenario
+from .apply import AppliedPlan, DEFAULT_STACK_ID, ResolvedScenario, _die, _solve_tiles, apply_plan, resolve_scenario
 from .catalog_replay import _replay_ops, catalog_recipe_id, replay_catalog_binding
 from .dual_cert import build_dual_inputs_from_scenario, solve_dual_lower_bound
 from .schema import (
@@ -287,13 +290,26 @@ def _check_budget(budget, deadline):
 def _report(case, graphs, context, book, replay, *, deadline=None, fast=False, trace_limit=0, streams=(), cut=False):
     external = {dep: 0.0 for ops in graphs.values()
                 for dep in _external_dependencies(ops) if cut or dep == "analysis_input"}
+    replay_graphs = {rank: _replay_ops(ops) for rank, ops in graphs.items()}
+    eff_trace = max(trace_limit, replay.event_limit) if not fast else 0
     token = ACTIVE_DEADLINE_MONO.set(deadline)
     try:
+        if (
+            not cut and not replay.isolated and eff_trace == 0
+            and not streams and len(replay_graphs) == 1 and 0 in replay_graphs
+        ):
+            report, _, _ = execute_native_cohort_graph(
+                case, replay_graphs, recipes=book, external_inputs=external,
+                include_submission=replay.include_submission, isolated=False,
+                trace_limit=0, compact=False, evaluation=context,
+                fast_span_only=fast, stream_plans=None, timeline_replicas=(0,),
+            )
+            return report
         return graph_costs(
-            case, {rank: _replay_ops(ops) for rank, ops in graphs.items()},
+            case, replay_graphs,
             recipes=book, external_inputs=external, evaluation=context,
             isolated=replay.isolated and not cut, include_submission=replay.include_submission,
-            trace_limit=max(trace_limit, replay.event_limit) if not fast else 0,
+            trace_limit=eff_trace,
             fast_span_only=fast, stream_plans=streams or None,
         )
     finally:
@@ -810,10 +826,35 @@ def _estimate(handle, seed, scenario, applied, budget, deadline, *, allow_unboun
         tile.cohort_split == "dbo_2cohort" for tile in applied.tile_bindings)
     rebind = any(isinstance(edit.operation, (FuseRegion, SelectTemplate)) for edit in applied.plan.edits)
     need_eval = overlap or rebind
+    catalog_layers = {
+        op.layer
+        for summary in summaries
+        for rank_entry in applied.executable
+        for op in rank_entry.ops
+        if op.op_id == summary.region_id
+    }
+    grouped_cuts: OrderedDict[tuple[Any, ...], list[tuple[int, dict[int, tuple[Any, ...]], tuple[Any, ...]]]] = OrderedDict()
     for layer in changed:
-        _check_budget(budget, deadline)
         graph = {rank: tuple(by_layer.get(layer, ())) for rank, by_layer in layers.items()}
-        span, row = _replay_cut(handle, seed, graph, book, _cut_plans(graph, bound_streams),
+        cut_streams = _cut_plans(graph, bound_streams)
+        if layer in catalog_layers or overlap:
+            gkey: tuple[Any, ...] = ("unique", layer)
+        else:
+            after_sig = _cut_layer_key(graph, book, cut_streams, False)
+            if rebind:
+                orig_graph = seed.layers[layer]
+                before_sig = _cut_layer_key(
+                    orig_graph, seed.book, _cut_plans(orig_graph, scenario.stream_plans), False,
+                )
+            else:
+                before_sig = ""
+            gkey = (after_sig, before_sig, int(seed.reference[layer]))
+        grouped_cuts.setdefault(gkey, []).append((layer, graph, cut_streams))
+    for members in grouped_cuts.values():
+        _check_budget(budget, deadline)
+        layer, graph, cut_streams = members[0]
+        mult = len(members)
+        span, row = _replay_cut(handle, seed, graph, book, cut_streams,
                                 need_eval, MAX_OVERLAP_TRACE_EVENTS if overlap else 0, deadline)
         reference = seed.reference[layer]
         if rebind:
@@ -821,7 +862,7 @@ def _estimate(handle, seed, scenario, applied, budget, deadline, *, allow_unboun
             reference, comparison = _replay_cut(handle, seed, original, seed.book,
                 _cut_plans(original, scenario.stream_plans), True, 0, deadline)
             comparisons.append(comparison)
-        archetype_ns += span - reference
+        archetype_ns += (span - reference) * mult
         if row is not None:
             rows.append(row)
     return (max(0, baseline_ns + archetype_ns - seed.total_ns), archetype_ns,
@@ -912,12 +953,28 @@ def finalize_plan(
     report = _report(resolved.atomic_step.case, graphs, scenario.evaluation_context, book, scenario._replay,
                      deadline=deadline, streams=bound_streams,
                      trace_limit=MAX_OVERLAP_TRACE_EVENTS if overlap else 0)
+    absorbed_map = dict(applied.absorbed_atoms)
+    fused_pipelines = tuple(
+        FusedPipelineDescriptor(
+            owner=OpOccurrence(replica, op.stage, _die(resolved, replica, op.stage).rank, op.op_id),
+            family=op.family,
+            implementation=op.recipe or op.family,
+            member_op_ids=(op.op_id,),
+            absorbed_source_op_ids=tuple(absorbed_map[op.op_id]),
+            phases=(),
+            sources=(),
+        )
+        for replica, ops in graphs.items()
+        for op in ops
+        if absorbed_map.get(op.op_id)
+    )
     step = _evaluation(
         resolved, graphs, report, applied.plan_sha256,
         baseline.tier if not plan.edits else "should_achieve",
         resolved.atomic_step if not plan.edits else None,
         scenario_sha256=resolved.scenario_sha256,
         plan_sha256=applied.plan_sha256,
+        extra_pipelines=fused_pipelines,
     )
     wall = round(step.span_ms * NS_PER_MS)
     if dual_certificate is None and dual_program is None and event_dag is None:

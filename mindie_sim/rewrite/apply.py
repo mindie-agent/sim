@@ -878,7 +878,7 @@ class _RankDraft:
             ports = input_port_entries(op.metadata)
             typed = {port.get("producer") for _, port in _typed_inputs(op)}
             controls = declared_control_order(op.metadata)
-            named = _named_inputs(op)
+            named = {k: v for k, v in _named_inputs(op).items() if v in self.ops or v in removed}
             inputs = (*op.deps, *controls, *(dep for dep, _ in ports), *sorted(typed - {None}), *named.values())
             if removed.intersection(inputs):
                 metadata = rewritten_control_metadata(op.metadata, redirects) if replacement else tuple(

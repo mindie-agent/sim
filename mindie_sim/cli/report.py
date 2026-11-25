@@ -51,7 +51,7 @@ from mindie_sim.export import (
     project_two_step_gain, sanitize_public_text,
 )
 from mindie_sim.export.action_plan import build_comparison_plan
-from mindie_sim.export.models import NS_PER_MS
+from mindie_sim.export.models import NS_PER_MS, bundle_step_int_ns
 from mindie_sim.prediction.results import ReplayOptions, StepRequest
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.scenario import validate_deployment_mode
@@ -916,11 +916,7 @@ def _assemble_report_receipt(
 ) -> dict[str, Any]:
     """Compute canonical SLA/HBM feasibility and assemble the CLI report receipt."""
     is_decode = after_bundle.phase == "decode"
-    after_step_ms = (
-        float(after_bundle.step_span_ns) / float(NS_PER_MS)
-        if int(getattr(after_bundle, "step_span_ns", 0) or 0) > 0
-        else after_bundle.step_span_us / US_PER_MS
-    )
+    after_step_ms = float(bundle_step_int_ns(after_bundle)) / float(NS_PER_MS)
     eff_tpot_ms = (
         (after_step_ms / max(1.0, float(after_bundle.avg_accepted_tokens)))
         + float(getattr(after_bundle, "handoff_tpot_ms", 0.0) or 0.0)

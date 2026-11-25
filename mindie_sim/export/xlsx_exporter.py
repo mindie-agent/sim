@@ -144,11 +144,14 @@ def _resolve_xlsx_bundles(
             prompt_tokens=prompt_tokens, output_tokens=output_tokens, concurrency=concurrency,
             mtp_proposal_tokens=mtp_proposal_tokens, mtp_acceptance_length=mtp_acceptance_length,
             feature_track=b_track,
+            quant=weight_quant, kv_cache_dtype=cache_dtype,
+            engram_cpu_offload=engram_host_offload,
         )
         eff_req = request if request is not None else req_bef
+        composed_build_kw = {**build_kw, "weight_quant": None}
         resolved_before = build_export_bundle(
             raw_bef, request=eff_req, step_eval=step_eval,
-            observations_path=observations_path, **build_kw,
+            observations_path=observations_path, **composed_build_kw,
         )
         resolved_after: ExportBundle | None = None
         if after_bundle is not None:
@@ -163,9 +166,11 @@ def _resolve_xlsx_bundles(
                 prompt_tokens=prompt_tokens, output_tokens=output_tokens, concurrency=concurrency,
                 mtp_proposal_tokens=mtp_proposal_tokens, mtp_acceptance_length=mtp_acceptance_length,
                 feature_track=str(after_track).strip().lower(),
+                quant=weight_quant, kv_cache_dtype=cache_dtype,
+                engram_cpu_offload=engram_host_offload,
             )
             resolved_after = build_export_bundle(
-                raw_aft, request=(request if request is not None else req_aft), **build_kw,
+                raw_aft, request=(request if request is not None else req_aft), **composed_build_kw,
             )
     else:
         resolved_before = (

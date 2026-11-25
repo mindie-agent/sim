@@ -1,8 +1,9 @@
 """Sheet 2 (``Layer_Operator_Breakdown``) & conditional ``Measured_msprof_Calibration`` writers.
 
-[Role] Render topological Before-vs-After operator breakdown strictly inside
-  visible columns ``A..AA`` (``CMP_COLS = 27``, zero ``AB..AF`` accounting
-  columns), standalone breakdown (``A..P``), and conditional 1-to-N
+[Role] Render topological Before-vs-After and standalone operator breakdown strictly
+  inside visible columns ``A..AA`` (``CMP_COLS = 27``, zero ``AB..AF`` accounting
+  columns) with an explicit visible ``Idle / Host Wait / Bubble (idle_or_wait)``
+  row for exact 0-ns conservation, plus conditional 1-to-N
   ``Measured_msprof_Calibration`` worksheet (``A..N``).
 [Invariants] Every independent ``N->1`` fusion renders as ONE contiguous merged
   After cell with zero ``[↑ 已并入`` split rows; Sheet 2 populated column index
@@ -27,7 +28,10 @@ from .models import (
     AlignedComparisonRow,
     ExportBundle,
     OperatorExportRow,
+    bundle_step_int_ns,
     format_binding_badge,
+    op_exposed_int_ns,
+    op_lstar_int_ns,
 )
 from .public_view import format_track_label
 from .ooxml import (
@@ -139,10 +143,6 @@ CMP_COL_WIDTHS = (
     26.0, 28.0, 13.0, 13.0, 14.0, 13.0, 10.0, 20.0, 13.0, 12.0, 38.0, 30.0,
     15.0, 15.0, 15.0, 26.0,
 )
-STD_COL_WIDTHS = (
-    30.0, 9.0, 22.0, 28.0, 34.0, 32.0, 26.0, 28.0, 13.0, 13.0,
-    14.0, 13.0, 13.0, 12.0, 20.0, 30.0,
-)
 MEAS_COL_WIDTHS = (
     28.0, 22.0, 24.0, 24.0, 24.0, 28.0, 12.0, 14.0, 14.0, 28.0, 14.0, 14.0, 12.0, 20.0,
 )
@@ -161,19 +161,11 @@ class BreakdownSheetReceipt:
 
 
 def _op_exposed_int_ns(op: OperatorExportRow, rep: int) -> int:
-    if op.is_overlapped:
-        return 0
-    if int(getattr(op, "exposed_ns", 0) or 0) > 0:
-        return int(op.exposed_ns)
-    return max(0, int(round(float(op.exposed_dur_us) * max(1, int(rep)) * NS_PER_US)))
+    return op_exposed_int_ns(op, rep)
 
 
 def _op_lstar_int_ns(op: OperatorExportRow, rep: int) -> int:
-    if op.is_overlapped:
-        return 0
-    if int(getattr(op, "l_star_ns", 0) or 0) > 0:
-        return int(op.l_star_ns)
-    return max(0, int(round(float(op.l_star_lean_us) * max(1, int(rep)) * NS_PER_US)))
+    return op_lstar_int_ns(op, rep)
 
 
 def _stream_masking_badge(op: OperatorExportRow) -> tuple[str, int]:
@@ -298,7 +290,7 @@ def _write_cmp_after_cluster(
             ws.set_cell(r, CMP_COL_AFT_EXP_US, a_exp_us, style=STYLE_FLOAT3)
             ws.set_cell(r, CMP_COL_AFT_EXP_MS, a_ms, formula=f"=O{r}*B{r}/1000" if same_rep else f"=O{r}*{eff_a_rep}/1000", style=STYLE_FLOAT3)
             ws.set_cell(r, CMP_COL_AFT_BOUND, a_op.bound_display, style=STYLE_OVERLAP if a_op.is_overlapped else STYLE_TEXT)
-            ws.set_cell(r, CMP_COL_LSTAR_MS, l_ms, style=STYLE_FLOAT3)
+            ws.set_cell(r, CMP_COL_LSTAR_MS, l_ms, formula="=0" if a_op.is_overlapped else None, style=STYLE_FLOAT3)
             ws.set_cell(r, CMP_COL_AFT_UPT, a_upt, formula=f"=IF({SUM_AFT_NTOK_REF}>0,P{r}*1000/{SUM_AFT_NTOK_REF},0)", style=STYLE_FLOAT2)
             ws.set_cell(r, CMP_COL_BINDING, format_binding_badge(a_op.binding_state or BINDING_STATE_BOUND), style=STYLE_TEXT_WRAP)
         else:
@@ -378,7 +370,7 @@ def _write_comparison_group(
             (saved_ms, f"=SUM(J{r_start}:J{r_end})-P{r_start}", STYLE_FLOAT3),
             (speedup, f"=IF(P{r_start}>0,SUM(J{r_start}:J{r_end})/P{r_start},0)", STYLE_RATIO),
             (a_primary.bound_display, None, STYLE_OVERLAP if a_primary.is_overlapped else STYLE_TEXT),
-            (lstar_ms, None, STYLE_FLOAT3),
+            (lstar_ms, "=0" if a_primary.is_overlapped else None, STYLE_FLOAT3),
             (gap_ms, f"=MAX(0,P{r_start}-T{r_start})", STYLE_FLOAT3),
             (_sanitize_backend_text(item.action_note), None, STYLE_TEXT_WRAP),
         ), start_col=CMP_COL_AFT_KERN)
@@ -610,16 +602,8 @@ def populate_comparison_breakdown_sheet(
         tot_aft_upt += arch_aft_upt
         row_cursor += 1
 
-    b_step_ns = (
-        int(before_bundle.step_span_ns)
-        if int(getattr(before_bundle, "step_span_ns", 0) or 0) > 0
-        else max(0, int(round(float(before_bundle.step_span_us) * NS_PER_US)))
-    )
-    a_step_ns = (
-        int(after_bundle.step_span_ns)
-        if int(getattr(after_bundle, "step_span_ns", 0) or 0) > 0
-        else max(0, int(round(float(after_bundle.step_span_us) * NS_PER_US)))
-    )
+    b_step_ns = bundle_step_int_ns(before_bundle)
+    a_step_ns = bundle_step_int_ns(after_bundle)
     idle_bef_ns = max(0, b_step_ns - tot_bef_ns)
     idle_aft_ns = max(0, a_step_ns - tot_aft_ns)
     idle_row = 0

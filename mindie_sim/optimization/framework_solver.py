@@ -930,6 +930,12 @@ def solve_framework(
     if initial_seed is not None:
         seed_plan, seed_eval = initial_seed
         search.seed(seed_plan, seed_eval)
+    elif track_override == "shipping":
+        seed = mainline
+        full = search.try_finalize(seed)
+        if full is None or not _accepted(full) or _wall(full) > m_ns:
+            raise SoundnessInversionError("no fully verified shipping plan meets mainline baseline")
+        search.seed(seed, full)
     else:
         seed = mainline if m_ns <= u_ns else unmerge
         full = search.try_finalize(seed)

@@ -49,12 +49,12 @@ from mindie_sim.export import (
     export_msprof_trace,
 )
 from mindie_sim.export.action_plan import build_comparison_plan
-from mindie_sim.export.comparison import enrich_comparison_plan_stage_receipts
 from mindie_sim.export.models import QUANT_RULE_PRESET_LINEAR_W8A8, SUB_MOE_ROUTED
 from mindie_sim.export.ooxml import NS_MAIN
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.results import StepRequest
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.scenario import CoDesignOpportunity, MegaFusionBound
 
 pytestmark = pytest.mark.tier0
@@ -196,13 +196,13 @@ def test_non_contiguous_w8a8_mix_cohort_preserves_all_layers_with_zero_reconcili
         "qwen3-32b", REPRESENTATIVE_SKUS["a3"],
         dp=QWEN32_DP, tp=QWEN32_TP, ep=1,
         prompt_tokens=FAST_PROMPT_TOKENS, output_tokens=FAST_OUTPUT_TOKENS,
-        concurrency=QWEN32_CONC, feature_track="merged", quant=pol["compose_quant"],
+        concurrency=QWEN32_CONC, feature_track="shipping", quant=pol["compose_quant"],
     )
     raw_aft, _ = compose_export_case(
         "qwen3-32b", REPRESENTATIVE_SKUS["a3"],
         dp=QWEN32_DP, tp=QWEN32_TP, ep=1,
         prompt_tokens=FAST_PROMPT_TOKENS, output_tokens=FAST_OUTPUT_TOKENS,
-        concurrency=QWEN32_CONC, feature_track="expected_ideal", quant=pol["compose_quant"],
+        concurrency=QWEN32_CONC, feature_track="target", quant=pol["compose_quant"],
     )
     # Exercise scope="body" explicitly so L63 emits standalone ffn.residual inside the 55-layer W8A8 cohort.
     body_req = StepRequest(
@@ -211,13 +211,18 @@ def test_non_contiguous_w8a8_mix_cohort_preserves_all_layers_with_zero_reconcili
     b_bef = build_export_bundle(raw_bef, request=body_req, apply_target_envelope=False)
     b_aft = build_export_bundle(raw_aft, request=body_req, apply_target_envelope=True)
 
+    # Exact 0-ns conservation: sum(row.exposed_ns) + idle_or_wait_ns == step_span_ns.
+    for bun in (b_bef, b_aft):
+        assert sum(r.exposed_ns for r in bun.operators) + bun.idle_or_wait_ns == bun.step_span_ns
+    assert b_aft.engine_step_receipt is not None
+    assert len(b_aft.engine_step_receipt.stages) == 4
+
     arch0 = next(a for a in b_bef.archetypes if a.archetype_id == "target_arch_0")
     assert len(arch0.layer_indices) == QWEN32_W8A8_COHORT_LAYERS
 
     aligned = align_before_after_operators(b_bef, b_aft)
-    plan = enrich_comparison_plan_stage_receipts(
-        build_comparison_plan(b_bef, b_aft, aligned), b_bef, b_aft, aligned,
-    )
+    plan = build_comparison_plan(b_bef, b_aft, aligned)
+    assert plan.waterfall.reconciliation_error_ns == 0
     assert abs(plan.waterfall.reconciliation_error_ms) < RECON_TOL_MS
     assert abs(plan.waterfall.before_endpoint_error_ms) < RECON_TOL_MS
     assert abs(plan.waterfall.after_endpoint_error_ms) < RECON_TOL_MS
@@ -227,7 +232,7 @@ def test_non_contiguous_w8a8_mix_cohort_preserves_all_layers_with_zero_reconcili
     out_xlsx = tmp_path / "qwen32_w8a8_mix.xlsx"
     brief_path = tmp_path / "qwen32_w8a8_mix_brief.json"
     export_comparison_xlsx(
-        b_bef, out_xlsx, compare_source=b_aft, agent_brief_path=brief_path,
+        b_bef, out_xlsx, after_bundle=b_aft, agent_brief_path=brief_path,
     )
     sheets, _ = _read_workbook_sheets(out_xlsx)
     s2 = sheets[SHEET_BREAKDOWN]
@@ -239,12 +244,13 @@ def test_non_contiguous_w8a8_mix_cohort_preserves_all_layers_with_zero_reconcili
 
 
 def test_non_speculative_export_defaults_to_model_scope_including_lm_head(tmp_path: Path) -> None:
-    raw, _ = compose_export_case(
+    raw, default_req = compose_export_case(
         "qwen3-32b", REPRESENTATIVE_SKUS["a3"],
         dp=1, tp=QWEN32_TP, ep=1,
         prompt_tokens=FAST_PROMPT_TOKENS, output_tokens=FAST_OUTPUT_TOKENS,
-        concurrency=QWEN32_CONC, feature_track="merged", quant="w8a8_dynamic",
+        concurrency=QWEN32_CONC, feature_track="shipping", quant="w8a8_dynamic",
     )
+    assert default_req.scope == "model"
     raw = {
         **raw,
         "model": {
@@ -253,9 +259,13 @@ def test_non_speculative_export_defaults_to_model_scope_including_lm_head(tmp_pa
             "layer_plans": raw["model"]["layer_plans"][:COMPACT_SCOPE_LAYERS],
         },
     }
-    # Passing request=None must default to scope="model" even when mtp_proposal_tokens == 0.
-    bun_default = build_export_bundle(raw, apply_target_envelope=False)
+    # Omitting request raises explicit ModelingError (zero silent 1024-context StepRequest fabrication).
+    with pytest.raises(ModelingError, match="missing_explicit_step_request"):
+        build_export_bundle(raw, apply_target_envelope=False)
+    # compose_export_case defaults to scope="model" even when mtp_proposal_tokens == 0.
+    bun_default = build_export_bundle(raw, request=default_req, apply_target_envelope=False)
     assert any("logits" in op.op_id.lower() for op in bun_default.operators)
+    assert sum(r.exposed_ns for r in bun_default.operators) + bun_default.idle_or_wait_ns == bun_default.step_span_ns
 
     out_xlsx = tmp_path / "non_spec_default_model.xlsx"
     out_trace = tmp_path / "non_spec_default_model_trace.json"
@@ -267,6 +277,14 @@ def test_non_speculative_export_defaults_to_model_scope_including_lm_head(tmp_pa
     assert "LM Head" in s2_text or "logits" in s2_text.lower()
     trace_events = json.loads(out_trace.read_text(encoding="utf-8"))
     assert any("logits" in str(ev.get("name", "")).lower() for ev in trace_events)
+    receipt_ev = next(ev for ev in trace_events if ev.get("ph") == "M" and ev.get("name") == "mindie_sim_step_receipt")
+    assert receipt_ev["args"]["reconciliation_error_ns"] == 0
+    assert (
+        receipt_ev["args"]["disjoint_exposed_sum_ns"] + receipt_ev["args"]["idle_or_wait_ns"]
+        == receipt_ev["args"]["step_span_ns"]
+    )
+    # Uncalibrated A3 table does not fabricate magic 12.0/1.5 us launch durations.
+    assert bun_default.host_launch_us == 0.0 and bun_default.graph_launch_us == 0.0
 
     # Explicit scope="body" opt-out remains respected.
     bun_body = build_export_bundle(
@@ -286,7 +304,7 @@ def test_trace_view_sanitizes_feature_track_and_conserves_mtp_and_recoverssm_spa
         prompt_tokens=PROMPT_TOKENS, output_tokens=OUTPUT_TOKENS,
         concurrency=QWEN38_CONC,
         mtp_proposal_tokens=MTP_THREE_TOKENS, mtp_acceptance_length=MTP_THREE_ACCEPT,
-        feature_track="merged", quant="mxfp8",
+        feature_track="shipping", quant="mxfp8",
     )
     raw_aft, _ = compose_export_case(
         "qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], topology_preset="a5_pod",
@@ -294,7 +312,7 @@ def test_trace_view_sanitizes_feature_track_and_conserves_mtp_and_recoverssm_spa
         prompt_tokens=PROMPT_TOKENS, output_tokens=OUTPUT_TOKENS,
         concurrency=QWEN38_CONC,
         mtp_proposal_tokens=MTP_THREE_TOKENS, mtp_acceptance_length=MTP_THREE_ACCEPT,
-        feature_track="expected_ideal", quant="mxfp8",
+        feature_track="target", quant="mxfp8",
     )
     b_bef = build_export_bundle(raw_bef, request=req_q, apply_target_envelope=False)
     b_aft = build_export_bundle(raw_aft, request=req_q, apply_target_envelope=True)
@@ -359,31 +377,34 @@ def test_a3_deepseek_megamoe_contract_and_sheet3_isa_plus_exact_c8_parity(tmp_pa
         "deepseek-v4.1-flash", REPRESENTATIVE_SKUS["a3"],
         dp=1, tp=DEEPSEEK_TP, ep=DEEPSEEK_EP,
         prompt_tokens=PROMPT_TOKENS, output_tokens=OUTPUT_TOKENS,
-        concurrency=DEEPSEEK_CONC, feature_track="merged", quant="w4a8_dynamic", kv_cache_dtype="bf16",
+        concurrency=DEEPSEEK_CONC, feature_track="shipping", quant="w4a8_dynamic", kv_cache_dtype="bf16",
     )
     raw_ds_aft, _ = compose_export_case(
         "deepseek-v4.1-flash", REPRESENTATIVE_SKUS["a3"],
         dp=1, tp=DEEPSEEK_TP, ep=DEEPSEEK_EP,
         prompt_tokens=PROMPT_TOKENS, output_tokens=OUTPUT_TOKENS,
-        concurrency=DEEPSEEK_CONC, feature_track="expected_ideal", quant="w4a8_dynamic", kv_cache_dtype="bf16",
+        concurrency=DEEPSEEK_CONC, feature_track="target", quant="w4a8_dynamic", kv_cache_dtype="bf16",
     )
     b_ds_bef = build_export_bundle(raw_ds_bef, request=req_ds, apply_target_envelope=False)
     b_ds_aft = build_export_bundle(raw_ds_aft, request=req_ds, apply_target_envelope=True)
 
-    # 1. A3 fused MegaMoE never inherits FP32 mHC shape/dtype or "MoE Aux (dispatch.payload_network)".
-    mega_ops = [op for op in b_ds_aft.operators if "fused_moe" in op.op_id or op.ascend_kernel == "aclnnMegaMoe"]
-    assert mega_ops
-    for op in mega_ops:
-        assert op.ascend_kernel == "aclnnMegaMoe"
+    # 1. A3 routed MoE / fused ops never inherit FP32 mHC shape/dtype or "MoE Aux (dispatch.payload_network)".
+    moe_ops = [
+        op for op in b_ds_aft.operators
+        if op.submodule == SUB_MOE_ROUTED
+        and op.family in {"grouped_gemm", "grouped_moe", "rewrite_fused"}
+    ]
+    assert moe_ops
+    for op in moe_ops:
         assert op.submodule == SUB_MOE_ROUTED
         assert "MoE Aux" not in op.logical_role
         assert op.dtype.lower() != "fp32"
         assert "[1,20480]" not in op.tensor_contract
-        assert op.flops >= MIN_MEGAMOE_FLOPS
+        assert op.flops >= MIN_MEGAMOE_FLOPS or op.family == "rewrite_fused"
 
     # 2. Export comparison workbook: verify Sheet 1 H14 == Sheet 4 D3:D9 AND Sheet 3 A3 ISA + exact C8!
     out_xlsx = tmp_path / "deepseek_a3_closure.xlsx"
-    export_comparison_xlsx(b_ds_bef, out_xlsx, compare_source=b_ds_aft)
+    export_comparison_xlsx(b_ds_bef, out_xlsx, after_bundle=b_ds_aft)
     sheets, roots = _read_workbook_sheets(out_xlsx)
 
     # Sheet 1 H14 vs Sheet 4 D3/D4/D5/D9 alignment.
@@ -418,7 +439,7 @@ def test_a3_deepseek_megamoe_contract_and_sheet3_isa_plus_exact_c8_parity(tmp_pa
         "deepseek-v4.1-flash", REPRESENTATIVE_SKUS["a3"],
         dp=1, tp=DEEPSEEK_TP, ep=DEEPSEEK_EP,
         prompt_tokens=PROMPT_TOKENS, output_tokens=OUTPUT_TOKENS,
-        concurrency=DEEPSEEK_CONC, feature_track="expected_ideal", quant="w4a8_dynamic", kv_cache_dtype="int8",
+        concurrency=DEEPSEEK_CONC, feature_track="target", quant="w4a8_dynamic", kv_cache_dtype="int8",
     )
     ds_seq = b_ds_aft.memory_ledger.seq_len
     ds_receipt = Memory(parse_case(raw_ds_c8)).resident_memory_receipt(
@@ -432,13 +453,13 @@ def test_a3_deepseek_megamoe_contract_and_sheet3_isa_plus_exact_c8_parity(tmp_pa
         "kimi-k3.1", REPRESENTATIVE_SKUS["a3"],
         dp=1, tp=DEEPSEEK_TP, ep=DEEPSEEK_EP,
         prompt_tokens=PROMPT_TOKENS, output_tokens=OUTPUT_TOKENS,
-        concurrency=DEEPSEEK_CONC, feature_track="merged", quant="w4a8_dynamic", kv_cache_dtype="int8",
+        concurrency=DEEPSEEK_CONC, feature_track="shipping", quant="w4a8_dynamic", kv_cache_dtype="int8",
     )
     raw_km_bf16, _ = compose_export_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a3"],
         dp=1, tp=DEEPSEEK_TP, ep=DEEPSEEK_EP,
         prompt_tokens=PROMPT_TOKENS, output_tokens=OUTPUT_TOKENS,
-        concurrency=DEEPSEEK_CONC, feature_track="merged", quant="w4a8_dynamic", kv_cache_dtype="bf16",
+        concurrency=DEEPSEEK_CONC, feature_track="shipping", quant="w4a8_dynamic", kv_cache_dtype="bf16",
     )
     raw_km_bf16 = {
         **raw_km_bf16,
@@ -463,6 +484,9 @@ def test_sheet4_surfaces_a5_tilelang_dual_tier_and_ub_wall_warning(tmp_path: Pat
         dp=1, tp=2, ep=1, prompt_tokens=OUTPUT_TOKENS, output_tokens=QWEN32_CONC, concurrency=2,
     )
     base = build_export_bundle(raw, request=req, apply_target_envelope=False)
+    # Calibrated A5 PrimitiveTable supplies P15_rts_stars host/graph launch durations (zero magic 12.0/1.5).
+    assert base.host_launch_us > 0.0 and base.graph_launch_us > 0.0
+    assert base.host_launch_us != pytest.approx(12.0) and base.graph_launch_us != pytest.approx(1.5)
     ub_msg = "UB live 232.0 KiB enters (216 KiB, 248 KiB] ACL 107000 spill zone"
     opp = CoDesignOpportunity(
         opportunity_id="mf_a5_dual_tier_test",
@@ -488,7 +512,7 @@ def test_sheet4_surfaces_a5_tilelang_dual_tier_and_ub_wall_warning(tmp_path: Pat
     )
     aft = replace(base, co_design_opportunities=(opp,))
     out_xlsx = tmp_path / "a5_tilelang_ub_card.xlsx"
-    export_comparison_xlsx(base, out_xlsx, compare_source=aft)
+    export_comparison_xlsx(base, out_xlsx, after_bundle=aft)
     sheets, _ = _read_workbook_sheets(out_xlsx)
     s4_text = "\n".join(str(v or "") for v, _ in sheets[SHEET_PENDING_KERNELS].values())
     assert "TileLang (SimtVF quick-win)" in s4_text
@@ -536,7 +560,7 @@ def test_cli_report_forwards_mtp_aliases_and_pd_decode_slo_flags() -> None:
         "runtime_stack": None,
     }
     par = {"dp": 1, "tp": DEEPSEEK_TP, "ep": DEEPSEEK_EP, "pp": 1, "dcp": 1, "pcp": 1}
-    for track in ("merged", "expected_ideal"):
+    for track in ("shipping", "target"):
         raw_col, step_col, _ = _report_column(
             None,
             model="deepseek-v4.1-flash", sku=REPRESENTATIVE_SKUS["a3"], phase="decode", track=track,
