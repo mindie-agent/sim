@@ -71,11 +71,13 @@ def _window_sweeps(query, context, window, query_tile, *, noncausal=False, kv_le
         horizon = max(0, int(kv_len) if kv_len is not None else int(context) + int(query))
         return ((query + query_tile - 1) // query_tile) * min(horizon, window)
     full, tail = divmod(query, query_tile)
-    unsaturated = min(full, max(0, (window - context - 1) // query_tile))
+    saturated = window + query_tile - 1
+    diff = window - context - 1
+    unsaturated = min(full, (diff + query_tile - 1) // query_tile) if diff > 0 else 0
     rows = (unsaturated * context
             + query_tile * unsaturated * (unsaturated + 1) // 2
-            + (full - unsaturated) * window)
-    return rows + (min(context + query, window) if tail else 0)
+            + (full - unsaturated) * saturated)
+    return rows + (min(context + query, window + tail - 1) if tail else 0)
 
 
 def sparse_attention_traffic(query, context, topk, *, compression_ratio=1,

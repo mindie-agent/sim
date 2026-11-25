@@ -24,13 +24,27 @@ POOL_ROW_PAIR_BYTES = 8
 POOL_VECTOR_OPS_PER_VALUE = 8
 
 FLOPS_PER_FMA = 2
+PER_HEAD_SCORE_REDUCE_OPS = 3
 FP32_BYTES = int(dtype_bytes("fp32"))
 INT32_BYTES = int(dtype_bytes("int32"))
 
 
 def _op_dtype(b, op_id: str, fallback: str) -> str:
     op = next((item for item in reversed(b.ops) if item.op_id == op_id), None)
-    return str(op.dtype) if (op is not None and op.dtype) else fallback
+    if op is None:
+        return fallback
+    meta = dict(getattr(op, "metadata", ()) or ())
+    return str(meta.get("output_format") or op.dtype or fallback)
+
+
+def _op_row_bytes(b, op_id: str, width: int, elem_bytes: float) -> float:
+    op = next((item for item in reversed(b.ops) if item.op_id == op_id), None)
+    if op is not None:
+        meta = dict(getattr(op, "metadata", ()) or ())
+        phys = meta.get("physical_row_bytes")
+        if phys is not None:
+            return float(phys)
+    return float(width) * elem_bytes
 
 
 SOURCE = {
@@ -647,24 +661,22 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
                                 else "ub_online_topk"),))
         entries.append(scores)
     else:
-        matrix = ()
-        score_flops = 0.0
-        if score_implementation == "per_head_mma":
-            score_flops = float(FLOPS_PER_FMA * scanned * heads * width)
-            matrix = ((query_dtype, score_flops),)
-        materialized_scores = not matrix
-        qw_bytes = tokens * heads * (width * query_elem_b + weights_elem_b)
+        score_flops = float(FLOPS_PER_FMA * scanned * heads * width)
+        matrix = ((query_dtype, score_flops),) if score_flops else ()
+        materialized_scores = raw_eager and score_implementation != "per_head_mma"
+        query_row_b = _op_row_bytes(b, query, width, query_elem_b)
+        qw_bytes = tokens * heads * (query_row_b + weights_elem_b)
         scores = b.work(
             "index_pool_scores", (query, weights, cache), (tokens, heads, width),
             flops=score_flops, matrix_flops=matrix,
-            vector=scanned * heads * FLOPS_PER_FMA,
+            vector=scanned * max(1, PER_HEAD_SCORE_REDUCE_OPS * heads - 1),
             read=float(scanned) * row_bytes + qw_bytes,
             hbm_read=l2_bounded_pool_read + qw_bytes,
             write=scanned * score_elem_b if materialized_scores else 0.0,
             family="indexer", dtype=query_dtype,
             metadata=common + (("score_materialization",
-                                "per_head_mma" if matrix else
-                                "separate_fp32_score_then_topk"),))
+                                "separate_fp32_score_then_topk" if materialized_scores
+                                else "per_head_mma"),))
         entries.append(scores)
     members.append(scores)
     topk_score_read = scanned * score_elem_b if materialized_scores else 0.0
