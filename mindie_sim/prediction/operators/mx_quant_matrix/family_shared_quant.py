@@ -13,18 +13,56 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from math import isfinite
+from typing import Literal
 
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
-from mindie_sim.prediction.program import KernelProgram, Stage
-FP32_BYTES = 4
+from mindie_sim.prediction.ownership import read_role, unit_group
+from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, check_live_buffers
+from mindie_sim.prediction.values.typed import rebind_op_precision
+from .mxfp4_geometry import effective_l2_bytes
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="ae923905948f360f4b7ab06df52d0789a0c9316e",
+        relative_path="vllm_ascend/ops/fused_moe/shared_experts.py",
+        source_sha256="f1780df8ec2fc290bfeb946e5d48edcb8c1b4aee0f50c1bd9d10291def201e77",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="ae923905948f360f4b7ab06df52d0789a0c9316e",
+        relative_path="csrc/moe/dequant_swiglu_quant/op_kernel/dequant_swiglu_quant.h",
+        source_sha256="2e516dc7332449057ea8379eebd61a0b6f2a2917907b7f88d07b6025d3cf72b2",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="csrc/moe/dequant_swiglu_quant/op_host/dequant_swiglu_quant_tiling.cpp",
+        source_sha256="318a4dc604cf10307c8d150de6fe15705014df7bc69b7d6a8389d61f6d524d73",
+    ),
+)
+
+FP32_BYTES = 4
 INT32_BYTES = 4
+UINT8_BYTES = 1
 GENERIC_EPILOGUE_SCALE_WIDTHS = frozenset({2, 2.0, FP32_BYTES, float(FP32_BYTES)})
 CLAMP_OPS_PER_ELEMENT = 3
 SCALE_BROADCAST_OPS_PER_ROW = 8
+# Host tiler constants (vllm-ascend dequant_swiglu_quant_tiling.cpp:41-63,617-676).
+TILING_BLOCK_BYTES = 32
+SWIGLU_SPLIT_FACTOR = 2
+BLOCK_FP32_ELEMENTS = TILING_BLOCK_BYTES // FP32_BYTES
+UB_RESERVE_BYTES = 1024
+DOUBLE_BUFFER_SLOTS = 2
+PERFORMANCE_CORE_LIMIT = 36
+MAX_DIMY_FIXED_FP32_SLOTS = 5
+SWIGLU_MODE1_TMP_BYTES_PER_COL = UINT8_BYTES + INT32_BYTES
 
 
 BINDING_SELECTOR = "shared_expert"
@@ -213,23 +251,28 @@ def transfer_ledger(rows, width, *, weight_scale_bytes):
     return {"read_bytes": read, "write_bytes": write}
 
 
-def _weight_scale_descriptor(metadata, gate_width):
+def _weight_scale_descriptor(metadata, gate_width, *, precision_abi=None):
     generic_epilogue = (
         metadata.get("matrix_output_contract") == "int32_cast_row_scale_column_scale_output_cast"
         and "weight_scale_dtype" not in metadata
     )
-    fmt = (
-        "bf16"
-        if generic_epilogue and metadata.get("weight_scale_bytes") in GENERIC_EPILOGUE_SCALE_WIDTHS
-        else metadata.get("weight_scale_format", metadata.get("weight_scale_dtype", "bf16"))
-    )
     aliases = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}
-    fmt = aliases.get(fmt, fmt)
+    abi_raw = getattr(precision_abi, "weight_scale_dtype", "") or ""
+    abi_fmt = aliases.get(abi_raw, abi_raw) if abi_raw else ""
+    meta_raw = metadata.get("weight_scale_format") or metadata.get("weight_scale_dtype") or ""
+    meta_fmt = aliases.get(meta_raw, meta_raw) if meta_raw else ""
+    if abi_fmt and meta_fmt and abi_fmt != meta_fmt:
+        raise ModelingError(f"shared_gate_up_weight_scale_format_conflict:{abi_fmt}:{meta_fmt}")
+    fmt = abi_fmt or meta_fmt or "bf16"
     if fmt not in {"bf16", "fp16", "fp32"}:
         raise ModelingError(f"shared_gate_up_weight_scale_format_unsupported:{fmt}")
     declared = metadata.get("weight_scale_bytes")
-    expected = gate_width * dtype_bytes(fmt)
-    if declared is None or (generic_epilogue and declared in GENERIC_EPILOGUE_SCALE_WIDTHS):
+    unit_bytes = dtype_bytes(fmt)
+    abi_bytes = int(getattr(precision_abi, "weight_scale_bytes", 0) or 0)
+    if abi_bytes and abi_bytes != int(unit_bytes):
+        raise ModelingError("shared_gate_up_weight_scale_bytes_disagree_with_abi")
+    expected = gate_width * unit_bytes
+    if declared is None or (generic_epilogue and declared in (unit_bytes, float(unit_bytes))):
         declared = expected
     if not isfinite(float(declared)) or int(declared) != expected:
         raise ModelingError("shared_gate_up_weight_scale_bytes_disagree_with_abi")
@@ -384,7 +427,7 @@ def _rewrite(ops, gate):
         raise ModelingError("shared_quant_activation_has_other_consumers")
 
     weight_scale_format, weight_scale_bytes = _weight_scale_descriptor(
-        metadata, gate_width)
+        metadata, gate_width, precision_abi=gate.precision_abi)
     weight_payload = int(metadata.get("weight_payload_bytes", gate_width * hidden))
     if weight_payload != gate_width * hidden:
         raise ModelingError("shared_gate_up_weight_payload_must_be_int8_matrix")
@@ -420,6 +463,18 @@ def _rewrite(ops, gate):
         gate, hbm_bytes=gate_read + gate_write, mte2_bytes=gate_read,
         mte3_bytes=gate_write, vector_ops=0,
         metadata=tuple(gate_updates.items()))
+    if gate.precision_abi is not None:
+        new_gate_abi = replace(
+            gate.precision_abi,
+            output_dtype="int32",
+            weight_scale_dtype=weight_scale_format,
+            weight_scale_bytes=int(dtype_bytes(weight_scale_format)),
+            act_group_size=0,
+            act_scale_dtype="",
+            act_scale_pack="",
+            activation_quant_mode="none",
+        )
+        new_gate = rebind_op_precision(new_gate, new_gate_abi, metadata=gate_updates)
 
     consumer = _build_dequant_swiglu_consumer(
         gate, activation, down, scale_source, metadata, rows, width, gate_width)
@@ -472,27 +527,165 @@ def lower_shared_experts(ops, bindings):
     return current
 
 
+def _tiling_plan(config: Config, geometry) -> tuple[int, int, int]:
+    """Mirror DequantSwigluQuantDskTiling alignment, UB ceiling, row block & usedCoreNum."""
+    if config.width % TILING_BLOCK_BYTES != 0:
+        raise ModelingError(f"shared_quant_width_must_be_multiple_of_{TILING_BLOCK_BYTES}:{config.width}")
+    ub = geometry.buffers.get("ub")
+    if ub is None or ub <= 0:
+        raise ModelingError("shared_quant_requires_ub_capacity")
+    ub = int(ub)
+    fixed_max_y = (
+        UB_RESERVE_BYTES + TILING_BLOCK_BYTES
+        + DOUBLE_BUFFER_SLOTS * TILING_BLOCK_BYTES + FP32_BYTES
+        + BLOCK_FP32_ELEMENTS * BLOCK_FP32_ELEMENTS * FP32_BYTES
+    )
+    per_col_max_y = (
+        MAX_DIMY_FIXED_FP32_SLOTS * FP32_BYTES
+        + DOUBLE_BUFFER_SLOTS * SWIGLU_SPLIT_FACTOR * FP32_BYTES
+        + UINT8_BYTES + SWIGLU_MODE1_TMP_BYTES_PER_COL
+    )
+    required_single_row_ub = fixed_max_y + per_col_max_y * config.width
+    max_out_dimy = (
+        ((ub - fixed_max_y) // per_col_max_y) // TILING_BLOCK_BYTES * TILING_BLOCK_BYTES
+        if ub > fixed_max_y else 0
+    )
+    if config.width > max_out_dimy:
+        check_live_buffers(
+            (LiveBufferSpec(
+                "dequant_swiglu_quant_ub", "ub", required_single_row_ub, 0, 1,
+                owner_kind="aiv", alignment_bytes=1,
+            ),),
+            geometry,
+            family=RECIPE,
+        )
+        raise ModelingError(f"shared_quant_width_exceeds_ub_limit:{config.width}:{max_out_dimy}")
+    fixed_ub = (
+        UB_RESERVE_BYTES + TILING_BLOCK_BYTES
+        + (1 + SWIGLU_SPLIT_FACTOR) * config.width * FP32_BYTES
+    )
+    per_row_ub = (
+        DOUBLE_BUFFER_SLOTS * (config.width * SWIGLU_SPLIT_FACTOR + BLOCK_FP32_ELEMENTS) * FP32_BYTES
+        + config.width * UINT8_BYTES + FP32_BYTES
+        + config.width * SWIGLU_SPLIT_FACTOR * FP32_BYTES
+        + config.width * SWIGLU_MODE1_TMP_BYTES_PER_COL
+        + BLOCK_FP32_ELEMENTS * FP32_BYTES
+    )
+    ub_factor_dimx = min(config.rows, max(1, (ub - fixed_ub) // per_row_ub))
+    ub_used = fixed_ub + ub_factor_dimx * per_row_ub
+    while ub_factor_dimx > 1 and ((ub_used + TILING_BLOCK_BYTES - 1) // TILING_BLOCK_BYTES) * TILING_BLOCK_BYTES > ub:
+        ub_factor_dimx -= 1
+        ub_used = fixed_ub + ub_factor_dimx * per_row_ub
+    check_live_buffers(
+        (LiveBufferSpec(
+            "dequant_swiglu_quant_ub", "ub", ub_used, 0, 1,
+            owner_kind="aiv", alignment_bytes=TILING_BLOCK_BYTES,
+        ),),
+        geometry,
+        family=RECIPE,
+    )
+    blocks = (config.rows + ub_factor_dimx - 1) // ub_factor_dimx
+    aiv_count = int(geometry.resource_units.get("vector", geometry.compute_units))
+    used_cores = max(1, min(blocks, PERFORMANCE_CORE_LIMIT, aiv_count))
+    return ub_factor_dimx, ub_used, used_cores
+
+
 def build(op, geometry):
-    del geometry
     config = config_from_op(op)
+    ub_factor_dimx, ub_used, used_cores = _tiling_plan(config, geometry)
     ledger = vector_ledger(
         config.rows, config.width, clamp_limit=config.clamp_limit)
     transfer = transfer_ledger(
         config.rows, config.width, weight_scale_bytes=config.weight_scale_bytes)
-    read, write = transfer["read_bytes"], transfer["write_bytes"]
-    work = Work(resources={
-        "hbm": read + write, "mte2": read, "mte3": write,
+    row_read = INT32_BYTES * config.rows * config.gate_width + FP32_BYTES * config.rows
+    write = transfer["write_bytes"]
+    read_pipe = read_role(geometry.resource_units, aiv=0)
+    scale_bytes = config.weight_scale_bytes
+    # Every active AIV loads the full channel-scale vector into its private UB;
+    # subsequent cores hit shared L2 when the die has an L2 pipe with capacity.
+    scale_l2_hit = (
+        used_cores > 1
+        and "l2" in geometry.resource_units
+        and effective_l2_bytes(geometry) >= scale_bytes
+    )
+    total_read_pipe = row_read + used_cores * scale_bytes
+    scale_hbm = scale_bytes if scale_l2_hit else used_cores * scale_bytes
+    scale_l2 = (used_cores - 1) * scale_bytes if scale_l2_hit else 0
+    work_resources = {
+        "hbm": row_read + scale_hbm + write,
+        read_pipe: total_read_pipe,
+        "mte3": write,
         "vector": float(sum(ledger.values())),
-    })
+    }
+    if scale_l2:
+        work_resources["l2"] = scale_l2
+    work = Work(resources=work_resources)
+    base_rows, extra_rows = divmod(config.rows, used_cores)
+    core_row_counts = tuple(base_rows + (1 if idx < extra_rows else 0) for idx in range(used_cores))
 
-    def program(context):
-        load = context.bind(Work(resources={"hbm": read, "mte2": read}))
-        compute = context.bind(Work(resources={"vector": float(sum(ledger.values()))}))
-        store = context.bind(Work(resources={"hbm": write, "mte3": write}))
+    def core_program(context, core_id, core_rows):
+        aiv_units = context.resource_units.get("vector", context.core_count)
+        read_place = context.owned(core_id, aiv_units, (read_pipe,))
+        vec_place = context.owned(core_id, aiv_units, ("vector",))
+        store_place = context.owned(core_id, aiv_units, ("mte3",))
+        allocs = ()
+        if "ub" in context.pool_names:
+            ub_units = context.pool_units.get("ub", aiv_units)
+            allocs = (context.allocate(
+                f"dequant_swiglu_quant_ub{core_id}", "ub", ub_used,
+                unit_group(core_id, aiv_units, ub_units)),)
+        use_l2_scale = (
+            scale_l2_hit and core_id > 0
+            and context.resource_names.get("l2") is not None
+        )
+        scale_tier = "l2" if use_l2_scale else "hbm"
+        n_tiles = (core_rows + ub_factor_dimx - 1) // ub_factor_dimx
+        if n_tiles == 1:
+            tile_read = INT32_BYTES * core_rows * config.gate_width + FP32_BYTES * core_rows
+            load_res = {read_pipe: tile_read + scale_bytes, "hbm": tile_read}
+            load_res[scale_tier] = load_res.get(scale_tier, 0) + scale_bytes
+            tile_vec = float(sum(vector_ledger(core_rows, config.width, clamp_limit=config.clamp_limit).values()))
+            tile_write = core_rows * config.width + FP32_BYTES * core_rows
+            return KernelProgram((
+                Stage("load", context.bind(Work(resources=load_res)),
+                      acquire=allocs, placement=read_place),
+                Stage("dequant_swiglu_quant", context.bind(Work(resources={"vector": tile_vec})),
+                      after=("load",), placement=vec_place),
+                Stage("store", context.bind(Work(resources={"hbm": tile_write, "mte3": tile_write})),
+                      after=("dequant_swiglu_quant",), free=allocs, placement=store_place),
+            ))
+
+        def tile(tile_index):
+            rows_in_tile = min(ub_factor_dimx, core_rows - tile_index * ub_factor_dimx)
+            tile_read = INT32_BYTES * rows_in_tile * config.gate_width + FP32_BYTES * rows_in_tile
+            tile_vec = float(sum(vector_ledger(rows_in_tile, config.width, clamp_limit=config.clamp_limit).values()))
+            tile_write = rows_in_tile * config.width + FP32_BYTES * rows_in_tile
+            return (
+                Stage("load", context.bind(Work(resources={"hbm": tile_read, read_pipe: tile_read})),
+                      placement=read_place),
+                Stage("dequant_swiglu_quant", context.bind(Work(resources={"vector": tile_vec})),
+                      after=("load",), placement=vec_place),
+                Stage("store", context.bind(Work(resources={"hbm": tile_write, "mte3": tile_write})),
+                      after=("dequant_swiglu_quant",), placement=store_place),
+            )
+
+        scale_work = context.bind(Work(resources={scale_tier: scale_bytes, read_pipe: scale_bytes}))
         return KernelProgram((
-            Stage("load", load),
-            Stage("dequant_swiglu_quant", compute, after=("load",)),
-            Stage("store", store, after=("dequant_swiglu_quant",)),
+            Stage("scale_load", scale_work, acquire=allocs, placement=read_place),
+            Stage("row_tiles", after=("scale_load",), program=PipelineProgram(n_tiles, 1, tile)),
+            Stage("ub_release", after=("row_tiles",), free=allocs),
         ))
 
-    return OperatorPlan(work, program)
+    def program(context):
+        if len(core_row_counts) == 1:
+            return core_program(context, 0, core_row_counts[0])
+        return ParallelProgram(tuple(
+            core_program(context, core_id, core_rows)
+            for core_id, core_rows in enumerate(core_row_counts)
+        ))
+
+    return OperatorPlan(work, program, {
+        "ub_factor_dimx": ub_factor_dimx,
+        "ub_bytes_per_aiv": ub_used,
+        "used_cores": used_cores,
+    })

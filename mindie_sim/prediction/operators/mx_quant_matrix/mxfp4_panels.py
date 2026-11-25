@@ -13,15 +13,34 @@ from dataclasses import dataclass, replace
 from functools import lru_cache
 from math import lcm
 from types import MappingProxyType
+from typing import Literal
 
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import Work
-from .mxfp4_geometry import (MX_SCALE_PUBLISH_K, Config, activation_scale_bytes, panel_sizes,
-                              panel_work)
+from .mxfp4_geometry import (
+    MX_SCALE_PUBLISH_K, Config, activation_scale_bytes,
+    panel_sizes, panel_work,
+)
 from .mxfp4_registers import CLASSES, widen, transpose
 from mindie_sim.prediction.program import KernelProgram, RecipeContext, Stage
 from mindie_sim.prediction.operators.matrix.refill_steady import compact_refill
 from .mxfp4_pipeline import Slots
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/weight_quant_cube_compute.h",
+        source_sha256="8515f2f55c6b7fa9140193f231334c0d9b57ca6d1c6d9bb9d3509e994eb23846",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/weight_quant_vec_compute.h",
+        source_sha256="7ee00904eade2145ce3a3bd12d67883733b549240dd562be316563f6282f3493",
+    ),
+)
 REGISTER_ROLES = ('reg_data_writes', 'reg_ub_accesses', 'reg_ub_stores', 'reg_shuffle_lanes')
 TEMPLATE_CACHE_SIZE = 128
 
@@ -51,8 +70,22 @@ class _Binding:
                              service_modes=dict(self.modes))
 
 
+def _l2_permitted(context, *, l2_die: int | None = None) -> bool:
+    if context.resource_names.get('l2') is None:
+        return False
+    view = getattr(context, 'admission_memory_view', None)
+    if view is not None:
+        if l2_die is not None:
+            return view.effective_l2_bytes(l2_die) > 0
+        caps = getattr(view, '_l2_capacity', None)
+        if isinstance(caps, dict) and len(caps) == 1:
+            sole_die = next(iter(caps))
+            return view.effective_l2_bytes(sole_die) > 0
+    return True
+
+
 def panel_parts(context, *, k, m, n, repeat, index, owner, cores, aivs, directional,
-                ownership=None, activation_l2=0.0, weight_l2=0.0):
+                ownership=None, activation_l2=0.0, weight_l2=0.0, l2_die=None):
     """The existing source producer and micro-consumer DAG for one K panel.
 
     This helper is also available to the uncompressed caller; it does not
@@ -70,8 +103,7 @@ def panel_parts(context, *, k, m, n, repeat, index, owner, cores, aivs, directio
     payload = a - activation_scale_bytes(config, m, offset)
     share = float(activation_l2)
     wshare = float(weight_l2)
-    l2 = context.resource_names.get('l2')
-    if (share > 0 or wshare > 0) and l2 is None:
+    if (share > 0 or wshare > 0) and not _l2_permitted(context, l2_die=l2_die):
         share = wshare = 0.0
     activation = {'hbm': (payload * (1.0 - share) + (a - payload)) * repeat,
                   'mte2_aic': a * repeat}
@@ -206,7 +238,7 @@ def _clear():
 
 def compiled_panels(context, *, k, m, n, repeat, owner, cores, aivs,
                     directional=False, shared_clients=None, producer_mode="serial",
-                    producer_slots=Slots(), activation_l2=0.0, weight_l2=0.0):
+                    producer_slots=Slots(), activation_l2=0.0, weight_l2=0.0, l2_die=None):
     """Return reusable, event-free IR; only scalar physical bindings are retained.
 
     The outer cache distinguishes physical ranks; its inner templates preserve
@@ -216,10 +248,13 @@ def compiled_panels(context, *, k, m, n, repeat, owner, cores, aivs,
     """
     if producer_mode not in ("serial", "dynamic_buffer4"):
         raise ValueError("mxa8w4_unknown_producer_mode")
+    act_l2 = float(activation_l2)
+    wgt_l2 = float(weight_l2)
+    if (act_l2 > 0.0 or wgt_l2 > 0.0) and not _l2_permitted(context, l2_die=l2_die):
+        act_l2 = wgt_l2 = 0.0
     return _compile(_Binding.from_context(context), k, m, n, repeat, owner, cores,
                     aivs, directional, tuple(sorted((shared_clients or {}).items())),
-                    producer_mode, producer_slots, float(activation_l2),
-                    float(weight_l2))
+                    producer_mode, producer_slots, act_l2, wgt_l2)
 
 
 compiled_panels.cache_info = _compile.cache_info
