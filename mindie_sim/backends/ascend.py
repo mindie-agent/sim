@@ -283,7 +283,8 @@ def apply_observed_aicore_clock(device, profile, *, reference_mhz=None, explicit
     observed = _positive_float(observed, "observed_aicore_freq_mhz_invalid")
     nominal = (reference_mhz if reference_mhz is not None
                else profile["source"]["declaration"]["configured_clock_mhz"])
-    reference = device.get("aicore_freq_mhz", nominal)
+    reference = (nominal if explicit is not None
+                 else device.get("aicore_freq_mhz", nominal))
     reference = _positive_float(reference, "aicore_freq_mhz_invalid")
     ratio = observed / reference
     clock = {"observed_aicore_freq_mhz": observed, "aicore_freq_mhz": observed}
@@ -311,7 +312,8 @@ def apply_observed_aicore_clock(device, profile, *, reference_mhz=None, explicit
         if name in clock_rates and name not in explicit_rates:
             data["rates"][name] = rate * ratio
     for name, mode in data.get("service_modes", {}).items():
-        if (mode["resource"] in clock_rates and mode["resource"] not in explicit_rates
+        resource = mode.get("resource")
+        if (resource in clock_rates and resource not in explicit_rates
                 and name not in {"mte2_aic_dram", "mte2_aiv_dram"}
                 and "rate" not in explicit.get("service_modes", {}).get(name, {})):
             mode["rate"] *= ratio
