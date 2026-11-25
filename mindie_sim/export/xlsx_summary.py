@@ -216,22 +216,37 @@ def _populate_summary_deployment_block(
         sla_detail = f"{tpot_label} ({ttft_label})"
     else:
         sla_detail = ttft_label
+    prefill_tok_txt = (
+        str(int(ref.avg_accepted_tokens))
+        if float(ref.avg_accepted_tokens).is_integer()
+        else f"{ref.avg_accepted_tokens:.2f}"
+    )
     spec_detail = (
         f"Method={ref.spec_method}, Proposals={ref.spec_proposals}, Avg Accepted={ref.avg_accepted_tokens:.2f} tok/step"
         if is_decode and ref.spec_proposals > 0
-        else (f"Standard Decode (Avg Accepted={ref.avg_accepted_tokens:.1f} tok/step)" if is_decode else f"Prefill Tokens/Seq={int(ref.avg_accepted_tokens)}")
+        else (f"Standard Decode (Avg Accepted={ref.avg_accepted_tokens:.1f} tok/step)" if is_decode else f"Prefill Tokens/Seq={prefill_tok_txt}")
     )
+    ref_hf = max(0.0, float(getattr(ref, "handoff_tpot_ms", 0.0) or 0.0)) if is_decode else 0.0
     if sla_constrained:
-        step_budget: Any = float(raw_sla_target) * ref.avg_accepted_tokens if is_decode else float(raw_sla_target)
-        budget_formula: str | None = f"=B{SUM_ROW_SLA}*B{SUM_ROW_SPEC}" if is_decode else f"=B{SUM_ROW_SLA}"
+        if is_decode and ref_hf > 0.0:
+            step_budget: Any = max(0.0, float(raw_sla_target) - ref_hf) * ref.avg_accepted_tokens
+            budget_formula: str | None = f"=MAX(0,B{SUM_ROW_SLA}-{ref_hf!r})*B{SUM_ROW_SPEC}"
+            budget_detail = f"= MAX(0, TPOT SLA - PD 传输开销 {ref_hf:.2f} ms) × 平均每步接受 Token 数"
+        elif is_decode:
+            step_budget = float(raw_sla_target) * ref.avg_accepted_tokens
+            budget_formula = f"=B{SUM_ROW_SLA}*B{SUM_ROW_SPEC}"
+            budget_detail = "= TPOT SLA × 平均每步接受 Token 数"
+        else:
+            step_budget = float(raw_sla_target)
+            budget_formula = f"=B{SUM_ROW_SLA}"
+            budget_detail = "= TTFT SLA 约束上限"
         budget_style = STYLE_FLOAT2
-        budget_detail = "= TPOT SLA × 平均每步接受 Token 数" if is_decode else "= TTFT SLA 约束上限"
     else:
         step_budget = _UNCONSTRAINED_SLA_TEXT
         budget_formula = None
         budget_style = STYLE_TEXT
         budget_detail = "未设置 SLA 延迟上限 (不限 / N/A)"
-    eff_cc = int(ref.cluster_concurrency) if int(getattr(ref, "cluster_concurrency", 0) or 0) > 0 else (mem.concurrency * mem.dp)
+    eff_cc = int(ref.cluster_concurrency) if getattr(ref, "cluster_concurrency", None) is not None and (int(ref.cluster_concurrency) > 0 or int(ref.sequences) == 0) else (mem.concurrency * mem.dp)
     cc_formula = f"=G{SUM_ROW_MODE}*{mem.dp}" if eff_cc == mem.concurrency * mem.dp else None
     pd_pool = ref.pd_pool_summary if isinstance(ref.pd_pool_summary, Mapping) else None
     dies_detail = f"DP={mem.dp} × TP={mem.tp} × PP={mem.pp} (PCP={mem.pcp})"
@@ -322,7 +337,8 @@ def _populate_summary_kpi_block(
     stage_waterfall: Sequence[Mapping[str, Any]] = (),
 ) -> None:
     after = compare_bundle or bundle
-    is_cmp, is_decode = compare_bundle is not None, bundle.phase == "decode"
+    is_cmp = compare_bundle is not None
+    b_is_decode, a_is_decode = bundle.phase == "decode", after.phase == "decode"
     is_modeling = after.analysis_mode == MODE_MODELING or after.has_unbound_formula_ops
     title = (
         "2. 优化前后端到端性能对比 (Before [当前栈仿真基线] vs After [卡SLA目标建模终态] — 双口径守恒)" if (is_cmp and is_modeling)
@@ -341,12 +357,14 @@ def _populate_summary_kpi_block(
 
     b_step = float(bundle_step_int_ns(bundle)) / float(NS_PER_MS)
     a_step = float(bundle_step_int_ns(after)) / float(NS_PER_MS)
-    b_acc, acc = max(1.0, bundle.avg_accepted_tokens), max(1.0, after.avg_accepted_tokens)
-    b_hf = float(getattr(bundle, "handoff_tpot_ms", 0.0) or 0.0) if is_decode else 0.0
-    a_hf = float(getattr(after, "handoff_tpot_ms", 0.0) or 0.0) if is_decode else 0.0
-    b_tpot, a_tpot = ((b_step / b_acc) + b_hf) if is_decode else b_step, ((a_step / acc) + a_hf) if is_decode else a_step
-    b_raw_sla = bundle.tpot_slo_ms if is_decode else bundle.ttft_slo_ms
-    a_raw_sla = after.tpot_slo_ms if is_decode else after.ttft_slo_ms
+    b_acc = max(0.0, float(bundle.avg_accepted_tokens))
+    acc = max(0.0, float(after.avg_accepted_tokens))
+    b_hf = max(0.0, float(getattr(bundle, "handoff_tpot_ms", 0.0) or 0.0)) if b_is_decode else 0.0
+    a_hf = max(0.0, float(getattr(after, "handoff_tpot_ms", 0.0) or 0.0)) if a_is_decode else 0.0
+    b_tpot = ((b_step / b_acc if b_acc > 0.0 else b_step) + b_hf) if b_is_decode else b_step
+    a_tpot = ((a_step / acc if acc > 0.0 else a_step) + a_hf) if a_is_decode else a_step
+    b_raw_sla = bundle.tpot_slo_ms if b_is_decode else bundle.ttft_slo_ms
+    a_raw_sla = after.tpot_slo_ms if a_is_decode else after.ttft_slo_ms
     b_sla = float(b_raw_sla) if b_raw_sla is not None else None
     a_sla = float(a_raw_sla) if a_raw_sla is not None else None
     b_ctps, a_ctps = bundle.throughput_tokens_per_s, after.throughput_tokens_per_s
@@ -354,16 +372,23 @@ def _populate_summary_kpi_block(
     b_lstar, a_lstar = bundle.step_l_star_lean_us / US_PER_MS, after.step_l_star_lean_us / US_PER_MS
     b_att, a_att = (b_lstar / b_step) if b_step > 0.0 else 0.0, (a_lstar / a_step) if a_step > 0.0 else 0.0
     a_gap_ratio = (a_step / a_lstar) if a_lstar > 0.0 else 0.0
-    b_cc = int(bundle.cluster_concurrency) if int(getattr(bundle, "cluster_concurrency", 0) or 0) > 0 else max(1, bundle.memory_ledger.concurrency * bundle.memory_ledger.dp)
-    a_cc = int(after.cluster_concurrency) if int(getattr(after, "cluster_concurrency", 0) or 0) > 0 else max(1, after.memory_ledger.concurrency * after.memory_ledger.dp)
+    b_cc = int(bundle.cluster_concurrency) if (int(getattr(bundle, "cluster_concurrency", 0) or 0) > 0 or int(bundle.sequences) == 0) else max(1, bundle.memory_ledger.concurrency * bundle.memory_ledger.dp)
+    a_cc = int(after.cluster_concurrency) if (int(getattr(after, "cluster_concurrency", 0) or 0) > 0 or int(after.sequences) == 0) else max(1, after.memory_ledger.concurrency * after.memory_ledger.dp)
     same_deploy = bundle.memory_ledger.total_dies == after.memory_ledger.total_dies and b_cc == a_cc and abs(b_acc - acc) <= MIN_DENOM_EPS
     b_dies = max(1, bundle.memory_ledger.total_dies)
 
     r_step, r_tpot, r_sla = SUM_KPI_STEP_ROW, SUM_KPI_TPOT_ROW, SUM_KPI_SLA_ROW
     r_dtps, r_ctps, r_ls, r_att = SUM_KPI_DIE_TPS_ROW, SUM_KPI_CLUSTER_TPS_ROW, SUM_KPI_LSTAR_ROW, SUM_KPI_ATTAIN_ROW
     b_hfs, a_hfs = (f"+{b_hf!r}" if b_hf > 0.0 else ""), (f"+{a_hf!r}" if a_hf > 0.0 else "")
-    tpot_b_f = f"=IF($B${SUM_ROW_SPEC}>0,B{r_step}/$B${SUM_ROW_SPEC},B{r_step}){b_hfs}" if (is_decode and same_deploy) else (f"=B{r_step}/{b_acc!r}{b_hfs}" if is_decode else f"=B{r_step}")
-    tpot_a_f = f"=IF($B${SUM_ROW_SPEC}>0,C{r_step}/$B${SUM_ROW_SPEC},C{r_step}){a_hfs}" if is_decode else f"=C{r_step}"
+    tpot_b_f = (
+        f"=IF($B${SUM_ROW_SPEC}>0,B{r_step}/$B${SUM_ROW_SPEC},B{r_step}){b_hfs}"
+        if (b_is_decode and a_is_decode and same_deploy)
+        else (f"=B{r_step}/{b_acc!r}{b_hfs}" if b_is_decode else f"=B{r_step}")
+    )
+    tpot_a_f = (
+        f"=IF($B${SUM_ROW_SPEC}>0,C{r_step}/$B${SUM_ROW_SPEC},C{r_step}){a_hfs}"
+        if a_is_decode else f"=C{r_step}"
+    )
     dtps_b_f = f"=IF($G${SUM_ROW_MODEL}>0,B{r_ctps}/$G${SUM_ROW_MODEL},0)" if same_deploy else f"=B{r_ctps}/{b_dies}"
     ctps_b_f: str | None = f"=IF(B{r_step}>0,$G${SUM_ROW_LEN}*$B${SUM_ROW_SPEC}*1000/B{r_step},0)" if same_deploy else f"=IF(B{r_step}>0,{b_cc}*{b_acc!r}*1000/B{r_step},0)"
     ctps_a_f: str | None = f"=IF(C{r_step}>0,$G${SUM_ROW_LEN}*$B${SUM_ROW_SPEC}*1000/C{r_step},0)"
@@ -388,6 +413,10 @@ def _populate_summary_kpi_block(
         else:
             b_verdict_f = f'=IF(B{r_tpot}<={b_sla!r},"PASS","FAIL")'
 
+    tpot_base_note = (
+        f"= 单步耗时 / 平均每步接受 Token 数 + PD 传输开销 {a_hf:.2f} ms" if a_hf > 0.0
+        else "= 单步耗时 / 平均每步接受 Token 数"
+    ) if a_is_decode else "首字延迟 (Prefill TTFT)"
     if a_sla is None:
         a_verdict, a_verdict_f, a_verdict_st = _UNCONSTRAINED_SLA_TEXT, None, STYLE_TEXT
         sla_margin_v: Any = ""
@@ -397,7 +426,7 @@ def _populate_summary_kpi_block(
         sla_margin_pct_f: str | None = None
         sla_margin_pct_st = STYLE_TEXT
         step_note = "全网端到端单步耗时 (未设 SLA 单步上限，与 Block 3 实际暴露总和 100% 守恒)"
-        tpot_note = f"{'= 单步耗时 / 平均每步接受 Token 数' if is_decode else '首字延迟 (Prefill TTFT)'} | SLA 目标: {_UNCONSTRAINED_SLA_TEXT}"
+        tpot_note = f"{tpot_base_note} | SLA 目标: {_UNCONSTRAINED_SLA_TEXT}"
         sla_note = "未设置 SLA 延迟约束 (各列独立按自身契约判定)"
     else:
         a_ok = a_tpot <= a_sla
@@ -410,18 +439,25 @@ def _populate_summary_kpi_block(
         sla_margin_pct_v = (a_sla - a_tpot) / a_sla if a_sla > 0.0 else 0.0
         sla_margin_pct_f = f"=IF($B${SUM_ROW_SLA}>0,($B${SUM_ROW_SLA}-C{r_tpot})/$B${SUM_ROW_SLA},0)"
         sla_margin_pct_st = STYLE_PCT
-        step_note = f"全网端到端单步耗时 (单步预算 <= {a_sla * acc if is_decode else a_sla:.1f} ms，与 Block 3 实际暴露总和 100% 守恒)"
-        tpot_note = f"{'= 单步耗时 / 平均每步接受 Token 数' if is_decode else '首字延迟 (Prefill TTFT)'} | SLA 目标 <= {a_sla:.1f} ms"
+        a_step_budget = (max(0.0, a_sla - a_hf) * acc) if a_is_decode else a_sla
+        step_note = f"全网端到端单步耗时 (单步预算 <= {a_step_budget:.1f} ms，与 Block 3 实际暴露总和 100% 守恒)"
+        tpot_note = f"{tpot_base_note} | SLA 目标 <= {a_sla:.1f} ms"
         sla_note = "等效延迟 <= 各自 SLA 目标为 PASS；左侧差异列为优化后余量"
 
     wf_note = _format_stage_waterfall_note(stage_waterfall) if is_cmp else ""
     if wf_note:
         step_note = f"{step_note} | {wf_note}"
 
+    tpot_lbl = (
+        ("等效 TPOT (Effective TPOT)" if a_is_decode else "首字延迟 (Prefill TTFT)")
+        if b_is_decode == a_is_decode
+        else "等效延迟 (TPOT / TTFT)"
+    )
+    tpot_unit = "ms/tok" if (b_is_decode and a_is_decode) else "ms"
     bottleneck_note = _format_physical_bottleneck_note(after.step_tight_resources)
     kpi_specs = (
         (r_step, "单步总耗时 (Step Latency)", b_step, None, STYLE_FLOAT3, a_step, None, STYLE_FLOAT3, a_step - b_step, f"=C{r_step}-B{r_step}", STYLE_FLOAT3, (a_step - b_step) / b_step if b_step > 0.0 else 0.0, f"=IF(B{r_step}>0,(C{r_step}-B{r_step})/B{r_step},0)", STYLE_PCT, b_step / a_step if a_step > 0.0 else 0.0, f"=IF(C{r_step}>0,B{r_step}/C{r_step},0)", STYLE_RATIO, "ms", step_note),
-        (r_tpot, "等效 TPOT (Effective TPOT)" if is_decode else "首字延迟 (Prefill TTFT)", b_tpot, tpot_b_f, STYLE_KPI_HIGHLIGHT, a_tpot, tpot_a_f, STYLE_KPI_HIGHLIGHT, a_tpot - b_tpot, f"=C{r_tpot}-B{r_tpot}", STYLE_FLOAT3, (a_tpot - b_tpot) / b_tpot if b_tpot > 0.0 else 0.0, f"=IF(B{r_tpot}>0,(C{r_tpot}-B{r_tpot})/B{r_tpot},0)", STYLE_PCT, b_tpot / a_tpot if a_tpot > 0.0 else 0.0, f"=IF(C{r_tpot}>0,B{r_tpot}/C{r_tpot},0)", STYLE_RATIO, "ms/tok" if is_decode else "ms", tpot_note),
+        (r_tpot, tpot_lbl, b_tpot, tpot_b_f, STYLE_KPI_HIGHLIGHT, a_tpot, tpot_a_f, STYLE_KPI_HIGHLIGHT, a_tpot - b_tpot, f"=C{r_tpot}-B{r_tpot}", STYLE_FLOAT3, (a_tpot - b_tpot) / b_tpot if b_tpot > 0.0 else 0.0, f"=IF(B{r_tpot}>0,(C{r_tpot}-B{r_tpot})/B{r_tpot},0)", STYLE_PCT, b_tpot / a_tpot if a_tpot > 0.0 else 0.0, f"=IF(C{r_tpot}>0,B{r_tpot}/C{r_tpot},0)", STYLE_RATIO, tpot_unit, tpot_note),
         (r_sla, "SLA 达标判定 (SLA Verdict)", b_verdict, b_verdict_f, b_verdict_st, a_verdict, a_verdict_f, a_verdict_st, sla_margin_v, sla_margin_f, sla_margin_st, sla_margin_pct_v, sla_margin_pct_f, sla_margin_pct_st, "", None, STYLE_TEXT, "ms margin", sla_note),
         (r_dtps, "单卡吞吐 (Single-Die TPS)", b_dtps, dtps_b_f, STYLE_KPI_HIGHLIGHT, a_dtps, dtps_a_f, STYLE_KPI_HIGHLIGHT, a_dtps - b_dtps, f"=C{r_dtps}-B{r_dtps}", STYLE_FLOAT2, (a_dtps - b_dtps) / b_dtps if b_dtps > 0.0 else 0.0, f"=IF(B{r_dtps}>0,(C{r_dtps}-B{r_dtps})/B{r_dtps},0)", STYLE_PCT, a_dtps / b_dtps if b_dtps > 0.0 else 0.0, f"=IF(B{r_dtps}>0,C{r_dtps}/B{r_dtps},0)", STYLE_RATIO, "tok/s/die", "= 集群总吞吐 / 总卡数 — 越高越好"),
         (r_ctps, "集群总吞吐 (Cluster Total TPS)", b_ctps, ctps_b_f, STYLE_KPI_HIGHLIGHT, a_ctps, ctps_a_f, STYLE_KPI_HIGHLIGHT, a_ctps - b_ctps, f"=C{r_ctps}-B{r_ctps}", STYLE_FLOAT2, (a_ctps - b_ctps) / b_ctps if b_ctps > 0.0 else 0.0, f"=IF(B{r_ctps}>0,(C{r_ctps}-B{r_ctps})/B{r_ctps},0)", STYLE_PCT, a_ctps / b_ctps if b_ctps > 0.0 else 0.0, f"=IF(B{r_ctps}>0,C{r_ctps}/B{r_ctps},0)", STYLE_RATIO, "tok/s", ctps_note),
@@ -431,7 +467,7 @@ def _populate_summary_kpi_block(
     for r, lbl, bv, bf, bst, av, af, ast, dv, df, dst, pv, pf, pst, sv, sf, sst, unit, note in kpi_specs:
         write_row(ws, r, ((lbl, None, STYLE_TEXT), (bv, bf, bst), (av, af, ast), (dv, df, dst), (pv, pf, pst), (sv, sf, sst), (unit, None, STYLE_TEXT), (note, None, STYLE_TEXT_WRAP)))
         ws.merge_range(r, SUM_KPI_NOTE_START_COL, r, SUMMARY_COLS)
-    _write_summary_util_and_wall_rows(ws, bundle, after, is_decode=is_decode)
+    _write_summary_util_and_wall_rows(ws, bundle, after, is_decode=a_is_decode)
 
 
 def _write_summary_util_and_wall_rows(ws: Worksheet, bundle: ExportBundle, after: ExportBundle, *, is_decode: bool) -> None:
@@ -468,9 +504,17 @@ def _write_summary_util_and_wall_rows(ws: Worksheet, bundle: ExportBundle, after
     r_ntok = SUM_KPI_NTOK_ROW
     b_ntok, a_ntok = float(bundle.n_tok_per_die), float(after.n_tok_per_die)
     b_mem, a_mem = bundle.memory_ledger, after.memory_ledger
-    a_exp = float(max(1, a_mem.concurrency * a_mem.dp)) * max(1.0, float(after.avg_accepted_tokens)) / float(max(1, a_mem.total_dies))
-    b_exp = float(max(1, b_mem.concurrency * b_mem.dp)) * max(1.0, float(bundle.avg_accepted_tokens)) / float(max(1, b_mem.total_dies))
-    same_d = b_mem.total_dies == a_mem.total_dies and (b_mem.concurrency * b_mem.dp) == (a_mem.concurrency * a_mem.dp) and abs(float(bundle.avg_accepted_tokens) - float(after.avg_accepted_tokens)) <= MIN_DENOM_EPS
+    b_cc = int(bundle.cluster_concurrency) if (int(getattr(bundle, "cluster_concurrency", 0) or 0) > 0 or int(bundle.sequences) == 0) else max(1, b_mem.concurrency * b_mem.dp)
+    a_cc = int(after.cluster_concurrency) if (int(getattr(after, "cluster_concurrency", 0) or 0) > 0 or int(after.sequences) == 0) else max(1, a_mem.concurrency * a_mem.dp)
+    b_acc = max(0.0, float(bundle.avg_accepted_tokens))
+    a_acc = max(0.0, float(after.avg_accepted_tokens))
+    a_exp = float(a_cc) * a_acc / float(max(1, a_mem.total_dies))
+    b_exp = float(b_cc) * b_acc / float(max(1, b_mem.total_dies))
+    same_d = (
+        b_mem.total_dies == a_mem.total_dies
+        and b_cc == a_cc
+        and abs(b_acc - a_acc) <= MIN_DENOM_EPS
+    )
     ntok_f = f"=IF($G${SUM_ROW_MODEL}>0,$G${SUM_ROW_LEN}*$B${SUM_ROW_SPEC}/$G${SUM_ROW_MODEL},0)"
     write_row(ws, r_ntok, (
         ("单卡单步有效 Token 数 (N_tok_per_die)", None, STYLE_TEXT),

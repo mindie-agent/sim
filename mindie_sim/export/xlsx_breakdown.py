@@ -205,7 +205,7 @@ def _write_cmp_before_sides(
 ) -> tuple[int, float]:
     """Populate Before columns (B, D..K, W, X) across ``row_count`` rows with exact int-ns sum."""
     eff_b_rep = int(b_rep) if b_rep is not None else rep
-    same_rep = eff_b_rep == rep
+    hetero_b = len({max(1, int(op.repeat_count)) for op in item.before_ops}) > 1
     before_ns_sum = 0
     before_upt_sum = 0.0
     a_primary = item.after_ops[0] if item.after_ops else None
@@ -213,12 +213,13 @@ def _write_cmp_before_sides(
         r = r_start + offset
         ws.set_row_height(r, WRAP_ROW_HEIGHT_PT)
         ws.set_cell(r, CMP_COL_REP, rep, style=STYLE_INT)
-        ms_formula = f"=I{r}*B{r}/1000" if same_rep else f"=I{r}*{eff_b_rep}/1000"
         upt_formula = f"=IF({SUM_BEF_NTOK_REF}>0,J{r}*1000/{SUM_BEF_NTOK_REF},0)"
         if offset < len(item.before_ops):
             b_op = item.before_ops[offset]
-            b_ns = _op_exposed_int_ns(b_op, eff_b_rep)
-            b_exp_us = float(b_ns) / (NS_PER_US * float(max(1, eff_b_rep))) if b_ns > 0 else 0.0
+            op_b_rep = max(1, int(b_op.repeat_count)) if hetero_b else eff_b_rep
+            ms_formula = f"=I{r}*B{r}/1000" if op_b_rep == rep else f"=I{r}*{op_b_rep}/1000"
+            b_ns = _op_exposed_int_ns(b_op, op_b_rep)
+            b_exp_us = float(b_ns) / (NS_PER_US * float(max(1, op_b_rep))) if b_ns > 0 else 0.0
             b_ms = float(b_ns) / float(NS_PER_MS)
             b_upt = float(b_ns) / (NS_PER_US * b_ntok)
             before_ns_sum += b_ns
@@ -240,6 +241,7 @@ def _write_cmp_before_sides(
         else:
             ref_a = item.after_ops[offset] if offset < len(item.after_ops) else a_primary
             assert ref_a is not None
+            ms_formula = f"=I{r}*B{r}/1000" if eff_b_rep == rep else f"=I{r}*{eff_b_rep}/1000"
             stream_txt, stream_style = _stream_masking_badge(ref_a)
             placeholder = "— [优化后新增, 0.000 ms]" if item.relation == "added" else "(Cluster Pad)"
             write_row(ws, r, (
@@ -264,16 +266,17 @@ def _write_cmp_after_cluster(
 ) -> tuple[int, int, float]:
     """Populate After columns for M->N (len(after_ops) >= 2) re-association clusters."""
     eff_a_rep = int(a_rep) if a_rep is not None else rep
-    same_rep = eff_a_rep == rep
+    hetero_a = len({max(1, int(op.repeat_count)) for op in item.after_ops}) > 1
     aft_ns_sum = lstar_ns_sum = 0
     aft_upt_sum = 0.0
     for offset in range(r_end - r_start + 1):
         r = r_start + offset
         if offset < len(item.after_ops):
             a_op = item.after_ops[offset]
-            a_ns = _op_exposed_int_ns(a_op, eff_a_rep)
-            l_ns = _op_lstar_int_ns(a_op, eff_a_rep)
-            a_exp_us = float(a_ns) / (NS_PER_US * float(max(1, eff_a_rep))) if a_ns > 0 else 0.0
+            op_a_rep = max(1, int(a_op.repeat_count)) if hetero_a else eff_a_rep
+            a_ns = _op_exposed_int_ns(a_op, op_a_rep)
+            l_ns = _op_lstar_int_ns(a_op, op_a_rep)
+            a_exp_us = float(a_ns) / (NS_PER_US * float(max(1, op_a_rep))) if a_ns > 0 else 0.0
             a_ms = float(a_ns) / float(NS_PER_MS)
             l_ms = float(l_ns) / float(NS_PER_MS)
             a_upt = float(a_ns) / (NS_PER_US * a_ntok)
@@ -288,7 +291,7 @@ def _write_cmp_after_cluster(
             ws.set_cell(r, CMP_COL_STATUS, a_op.kernel_status, style=st_style)
             ws.set_cell(r, CMP_COL_AFT_RAW_US, a_op.dur_us, style=STYLE_FLOAT3)
             ws.set_cell(r, CMP_COL_AFT_EXP_US, a_exp_us, style=STYLE_FLOAT3)
-            ws.set_cell(r, CMP_COL_AFT_EXP_MS, a_ms, formula=f"=O{r}*B{r}/1000" if same_rep else f"=O{r}*{eff_a_rep}/1000", style=STYLE_FLOAT3)
+            ws.set_cell(r, CMP_COL_AFT_EXP_MS, a_ms, formula=f"=O{r}*B{r}/1000" if op_a_rep == rep else f"=O{r}*{op_a_rep}/1000", style=STYLE_FLOAT3)
             ws.set_cell(r, CMP_COL_AFT_BOUND, a_op.bound_display, style=STYLE_OVERLAP if a_op.is_overlapped else STYLE_TEXT)
             ws.set_cell(r, CMP_COL_LSTAR_MS, l_ms, formula="=0" if a_op.is_overlapped else None, style=STYLE_FLOAT3)
             ws.set_cell(r, CMP_COL_AFT_UPT, a_upt, formula=f"=IF({SUM_AFT_NTOK_REF}>0,P{r}*1000/{SUM_AFT_NTOK_REF},0)", style=STYLE_FLOAT2)

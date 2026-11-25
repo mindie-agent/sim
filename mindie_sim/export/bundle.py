@@ -471,10 +471,12 @@ def _die_peaks_for_stage(case: Case, stage: int, replica: int = 0) -> dict[str, 
     die = peaks["die"]
     dpath = datapath_for_die(die)
     hbm_peak = float(peaks["hbm_peak_bytes_per_s"])
+    hbm_read = float(dpath.hbm_read_bytes_per_s) if float(dpath.hbm_read_bytes_per_s) > 0.0 else hbm_peak
+    hbm_write = float(dpath.hbm_write_bytes_per_s) if float(dpath.hbm_write_bytes_per_s) > 0.0 else hbm_peak
     return {
         **peaks,
-        "hbm_read_bytes_per_s": max(float(dpath.hbm_read_bytes_per_s), hbm_peak),
-        "hbm_write_bytes_per_s": max(float(dpath.hbm_write_bytes_per_s), hbm_peak),
+        "hbm_read_bytes_per_s": hbm_read,
+        "hbm_write_bytes_per_s": hbm_write,
         "hbm_rw_alpha": float(dpath.hbm_rw_alpha),
     }
 
@@ -526,11 +528,22 @@ def _op_lean_resource_demands_ns(
         cube_rate = _die_cube_peak_rate(die, default_dt, "") if default_dt else 0.0
         cube_ns = 0
 
+    t_r_frac = (
+        Fraction(hbm_read) * NS_PER_SECOND / Fraction(hbm_r_rate)
+        if (hbm_read > 0.0 and hbm_r_rate > 0.0) else Fraction(0)
+    )
+    t_w_frac = (
+        Fraction(hbm_write) * NS_PER_SECOND / Fraction(hbm_w_rate)
+        if (hbm_write > 0.0 and hbm_w_rate > 0.0) else Fraction(0)
+    )
+    alpha_frac = Fraction(alpha)
+    coupled_r = t_r_frac + alpha_frac * t_w_frac
+    coupled_w = t_w_frac + alpha_frac * t_r_frac
     return (
         cube_ns,
         _demand_ns(vector_ops, vec_rate),
-        _demand_ns(hbm_read + alpha * hbm_write, hbm_r_rate),
-        _demand_ns(hbm_write + alpha * hbm_read, hbm_w_rate),
+        inward_floor_ns(coupled_r) if coupled_r > 0 else 0,
+        inward_floor_ns(coupled_w) if coupled_w > 0 else 0,
         _demand_ns(link_bytes, link_rate),
     ), cube_rate
 
@@ -696,6 +709,126 @@ def _assign_op_archetype(
     return archetypes_by_id["target_tail"]
 
 
+def _harmonic_cube_peak_rate(
+    pairs: Sequence[tuple[float, float]], fallback: float,
+) -> float:
+    """Compute FLOP-weighted harmonic Cube peak rate across mixed-precision members."""
+    tot_flops = 0.0
+    busy_s = 0.0
+    for fl, pk in pairs:
+        if fl > 0.0 and pk > 0.0:
+            tot_flops += fl
+            busy_s += fl / pk
+    return (tot_flops / busy_s) if (tot_flops > 0.0 and busy_s > 0.0) else fallback
+
+
+def _reachable_external_succs(
+    start: OpOccurrence,
+    member_set: set[OpOccurrence],
+    succs_by_occ: Mapping[OpOccurrence, set[OpOccurrence]],
+) -> set[OpOccurrence]:
+    """Return all external successors reachable from ``start`` through ``member_set``."""
+    ext: set[OpOccurrence] = set()
+    visited: set[OpOccurrence] = {start}
+    stack = [start]
+    while stack:
+        cur = stack.pop()
+        for succ in succs_by_occ.get(cur, ()):
+            if succ in member_set:
+                if succ not in visited:
+                    visited.add(succ)
+                    stack.append(succ)
+            else:
+                ext.add(succ)
+    return ext
+
+
+def _contract_collapsed_dag_preds(
+    rows: Sequence[OperatorExportRow],
+    out_rows: list[OperatorExportRow],
+    group_members: Mapping[tuple[Any, ...], Sequence[OpOccurrence]],
+    group_collapsed_occ: Mapping[tuple[Any, ...], OpOccurrence],
+    renamed_occ: Mapping[OpOccurrence, OpOccurrence],
+) -> list[OperatorExportRow]:
+    """Rewrite collapsed-node predecessors by ``OpOccurrence`` without cycles or lost causality."""
+    preds_by_occ: dict[OpOccurrence, list[OpOccurrence]] = {r.occurrence: list(r.predecessors) for r in rows}
+    succs_by_occ: dict[OpOccurrence, set[OpOccurrence]] = defaultdict(set)
+    for r in rows:
+        for p in r.predecessors:
+            if p in preds_by_occ and p != r.occurrence:
+                succs_by_occ[p].add(r.occurrence)
+
+    for key, members in group_members.items():
+        collapsed_occ = group_collapsed_occ[key]
+        member_set = set(members)
+        desc: set[OpOccurrence] = set()
+        stack = [s for m in members for s in succs_by_occ.get(m, ()) if s not in member_set]
+        while stack:
+            cur = stack.pop()
+            if cur in desc:
+                continue
+            desc.add(cur)
+            for nxt in succs_by_occ.get(cur, ()):
+                if nxt not in desc and nxt not in member_set:
+                    stack.append(nxt)
+
+        safe_preds: list[OpOccurrence] = []
+        back_preds_by_member: dict[OpOccurrence, list[OpOccurrence]] = {}
+        for m in members:
+            back_list: list[OpOccurrence] = []
+            for p in preds_by_occ.get(m, ()):
+                if p in member_set:
+                    continue
+                if p in desc:
+                    back_list.append(p)
+                else:
+                    safe_preds.append(p)
+            if back_list:
+                back_preds_by_member[m] = back_list
+
+        ext_succs: set[OpOccurrence] = set()
+        for m in members:
+            for succ in succs_by_occ.get(m, ()):
+                if succ not in member_set:
+                    ext_succs.add(succ)
+        for m, back_list in back_preds_by_member.items():
+            for succ in _reachable_external_succs(m, member_set, succs_by_occ):
+                preds_by_occ[succ].extend(back_list)
+                for bp in back_list:
+                    if bp in preds_by_occ and bp != succ:
+                        succs_by_occ[bp].add(succ)
+
+        new_preds = list(dict.fromkeys(
+            p for p in safe_preds if p not in member_set and p != collapsed_occ
+        ))
+        for m in members:
+            for p in preds_by_occ.get(m, ()):
+                succs_by_occ.get(p, set()).discard(m)
+            preds_by_occ.pop(m, None)
+            succs_by_occ.pop(m, None)
+        preds_by_occ[collapsed_occ] = new_preds
+        succs_by_occ[collapsed_occ] = ext_succs
+        for p in new_preds:
+            if p in preds_by_occ and p != collapsed_occ:
+                succs_by_occ[p].add(collapsed_occ)
+        for succ in ext_succs:
+            preds_by_occ[succ] = list(dict.fromkeys(
+                collapsed_occ if p in member_set else p
+                for p in preds_by_occ.get(succ, ())
+            ))
+
+    rebuilt: list[OperatorExportRow] = []
+    for row in out_rows:
+        raw_preds = preds_by_occ.get(row.occurrence, list(row.predecessors))
+        clean_preds = tuple(dict.fromkeys(
+            renamed_occ.get(p, p)
+            for p in raw_preds
+            if renamed_occ.get(p, p) != row.occurrence
+        ))
+        rebuilt.append(replace(row, predecessors=clean_preds) if clean_preds != row.predecessors else row)
+    return rebuilt
+
+
 def _collapse_micro_split_ops(
     rows: list[OperatorExportRow],
     demands: list[tuple[int, int, int, int, int]],
@@ -703,11 +836,12 @@ def _collapse_micro_split_ops(
     """Group micro-split recurrent scan & tail RecoverSSM commit rows after pricing & DAG attribution."""
     out_rows: list[OperatorExportRow] = []
     out_demands: list[tuple[int, int, int, int, int]] = []
-    group_pos: dict[tuple[str, str], int] = {}
-    group_counts: dict[tuple[str, str], int] = {}
-    group_is_recover: dict[tuple[str, str], bool] = {}
-    group_preds: dict[tuple[str, str], list[OpOccurrence]] = {}
-    renamed: dict[str, str] = {}
+    group_pos: dict[tuple[Any, ...], int] = {}
+    group_counts: dict[tuple[Any, ...], int] = {}
+    group_is_recover: dict[tuple[Any, ...], bool] = {}
+    group_members: dict[tuple[Any, ...], list[OpOccurrence]] = {}
+    group_collapsed_occ: dict[tuple[Any, ...], OpOccurrence] = {}
+    renamed_occ: dict[OpOccurrence, OpOccurrence] = {}
     for row, dem in zip(rows, demands):
         match = _RECURRENT_MICRO_PATTERN.match(row.op_id)
         is_recover_ssm = False
@@ -722,52 +856,60 @@ def _collapse_micro_split_ops(
             f"{match.group(1)}.{match.group(2)}"
             if match.group(1) else str(match.group(2))
         )
-        key = (row.archetype_id, collapsed_id)
-        renamed[row.op_id] = collapsed_id
+        occ = row.occurrence
+        collapsed_occ = replace(occ, op_id=collapsed_id)
+        key = (row.archetype_id, int(occ.replica), int(occ.stage), occ.rank, collapsed_id)
+        renamed_occ[occ] = collapsed_occ
         prev_idx = group_pos.get(key)
         row_rep = max(1, int(row.repeat_count))
-        work_scale = float(row_rep) if is_recover_ssm else 1.0
         if prev_idx is None:
+            first_scale = float(row_rep) if is_recover_ssm else 1.0
             group_pos[key] = len(out_rows)
             group_counts[key] = row_rep
             group_is_recover[key] = is_recover_ssm
-            group_preds[key] = list(row.predecessors)
+            group_members[key] = [occ]
+            group_collapsed_occ[key] = collapsed_occ
             first_dur_ns = op_dur_int_ns(row, row_rep)
             first_exp_ns = op_exposed_int_ns(row, row_rep)
             first_ls_ns = int(max(dem)) if max(dem) > 0 else op_lstar_int_ns(row, row_rep)
             out_rows.append(replace(
                 row,
-                occurrence=replace(row.occurrence, op_id=collapsed_id),
+                occurrence=collapsed_occ,
                 op_id=collapsed_id,
                 layer=None if is_recover_ssm else row.layer,
                 dur_ns=first_dur_ns,
                 exposed_ns=first_exp_ns,
                 l_star_ns=first_ls_ns,
-                flops=row.flops * work_scale,
-                vector_ops=row.vector_ops * work_scale,
-                hbm_read_bytes=row.hbm_read_bytes * work_scale,
-                hbm_write_bytes=row.hbm_write_bytes * work_scale,
-                hbm_total_bytes=row.hbm_total_bytes * work_scale,
-                mte2_bytes=row.mte2_bytes * work_scale,
-                mte3_bytes=row.mte3_bytes * work_scale,
-                fixpipe_bytes=row.fixpipe_bytes * work_scale,
-                link_bytes=row.link_bytes * work_scale,
+                flops=row.flops * first_scale,
+                vector_ops=row.vector_ops * first_scale,
+                hbm_read_bytes=row.hbm_read_bytes * first_scale,
+                hbm_write_bytes=row.hbm_write_bytes * first_scale,
+                hbm_total_bytes=row.hbm_total_bytes * first_scale,
+                mte2_bytes=row.mte2_bytes * first_scale,
+                mte3_bytes=row.mte3_bytes * first_scale,
+                fixpipe_bytes=row.fixpipe_bytes * first_scale,
+                link_bytes=row.link_bytes * first_scale,
             ))
             out_demands.append(dem)
             continue
         group_counts[key] += row_rep
-        group_preds[key].extend(row.predecessors)
+        group_members[key].append(occ)
         base = out_rows[prev_idx]
         b_dem = out_demands[prev_idx]
         base_rep = max(1, int(base.repeat_count))
+        work_scale = float(row_rep) if is_recover_ssm else (float(row_rep) / float(base_rep))
         merged_dem = tuple(b_dem[i] + dem[i] for i in range(CERT_RESOURCE_COUNT))
         new_dur_ns = int(base.dur_ns) + op_dur_int_ns(row, row_rep)
         new_exposed_ns = int(base.exposed_ns) + op_exposed_int_ns(row, row_rep)
         new_l_star_ns = int(max(merged_dem))
         denom_us = float(base_rep) * NS_PER_US
-        new_dur = float(new_dur_ns) / denom_us if new_dur_ns > 0 else (base.dur_us + row.dur_us)
-        new_exposed = float(new_exposed_ns) / denom_us if new_exposed_ns > 0 else (base.exposed_dur_us + row.exposed_dur_us)
+        new_dur = float(new_dur_ns) / denom_us if new_dur_ns > 0 else (base.dur_us + row.dur_us * work_scale)
+        new_exposed = float(new_exposed_ns) / denom_us if new_exposed_ns > 0 else (base.exposed_dur_us + row.exposed_dur_us * work_scale)
         new_l_star = float(new_l_star_ns) / denom_us
+        merged_cube_peak = _harmonic_cube_peak_rate(
+            ((base.flops, base.cube_peak_flops_per_s), (row.flops * work_scale, row.cube_peak_flops_per_s)),
+            base.cube_peak_flops_per_s,
+        )
         out_rows[prev_idx] = replace(
             base,
             start_us=min(base.start_us, row.start_us), end_us=max(base.end_us, row.end_us),
@@ -775,6 +917,7 @@ def _collapse_micro_split_ops(
             dur_ns=new_dur_ns, exposed_ns=new_exposed_ns, l_star_ns=new_l_star_ns,
             is_overlapped=(new_exposed_ns == 0 and new_dur_ns > 0),
             flops=base.flops + row.flops * work_scale,
+            cube_peak_flops_per_s=merged_cube_peak,
             vector_ops=base.vector_ops + row.vector_ops * work_scale,
             hbm_read_bytes=base.hbm_read_bytes + row.hbm_read_bytes * work_scale,
             hbm_write_bytes=base.hbm_write_bytes + row.hbm_write_bytes * work_scale,
@@ -787,7 +930,7 @@ def _collapse_micro_split_ops(
             gap_ratio=(new_dur / new_l_star) if new_l_star > 0.0 else None,
         )
         out_demands[prev_idx] = merged_dem  # type: ignore[assignment]
-    if renamed:
+    if renamed_occ:
         for key, pos in group_pos.items():
             cnt = max(1, int(group_counts.get(key, 1)))
             row_cur = out_rows[pos]
@@ -826,23 +969,8 @@ def _collapse_micro_split_ops(
                     roofline_efficiency=eff,
                     ascend_kernel=_RECOVER_SSM_KERNEL_NAME,
                     logical_role=clean_role or row_cur.logical_role,
-                    predecessors=tuple(group_preds[key]),
                 )
-            else:
-                out_rows[pos] = replace(row_cur, predecessors=tuple(group_preds[key]))
-        out_rows = [
-            replace(
-                r,
-                predecessors=tuple(dict.fromkeys(
-                    replace(p, op_id=renamed.get(p.op_id, p.op_id))
-                    for p in r.predecessors
-                    if renamed.get(p.op_id, p.op_id) != r.op_id
-                )),
-            )
-            if (any(p.op_id in renamed for p in r.predecessors) or (r.archetype_id, r.op_id) in group_pos)
-            else r
-            for r in out_rows
-        ]
+        out_rows = _contract_collapsed_dag_preds(rows, out_rows, group_members, group_collapsed_occ, renamed_occ)
     return out_rows, out_demands
 
 
@@ -1414,6 +1542,7 @@ def _extract_per_layer_timings(
         op_dur_ns_map: dict[str, int] = {}
         op_exp_ns_map: dict[str, int] = {}
         op_lstar_ns_map: dict[str, int] = {}
+        op_work_map: dict[str, tuple[float, ...]] = {}
         micro_groups: dict[
             str,
             list[tuple[OperatorExportRow, int, int, int, tuple[int, int, int, int, int] | None]],
@@ -1450,6 +1579,12 @@ def _extract_per_layer_timings(
             micro_site = _micro_collapsed_site(r)
             if micro_site:
                 micro_groups[micro_site].append((r, dur_ns_v, exp_ns_v, ls_ns_v, r_dem))
+            work_tup = (
+                float(r.flops), float(r.vector_ops),
+                float(r.hbm_read_bytes), float(r.hbm_write_bytes), float(r.hbm_total_bytes),
+                float(r.mte2_bytes), float(r.mte3_bytes), float(r.fixpipe_bytes),
+                float(r.link_bytes), float(r.cube_peak_flops_per_s),
+            )
             for site in sites:
                 if site not in op_map:
                     op_map[site] = (max(0.0, r.start_us - min_s), dur_u)
@@ -1458,6 +1593,7 @@ def _extract_per_layer_timings(
                     op_dur_ns_map[site] = dur_ns_v
                     op_exp_ns_map[site] = exp_ns_v
                     op_lstar_ns_map[site] = ls_ns_v
+                    op_work_map[site] = work_tup
         for micro_site, m_items in micro_groups.items():
             if not m_items or (micro_site in op_map and len(m_items) <= 1):
                 continue
@@ -1470,10 +1606,27 @@ def _extract_per_layer_timings(
             )
             call_count = sum(max(1, int(mr.repeat_count)) for mr, _, _, _, _ in m_items)
             denom_us = float(call_count) * NS_PER_US if is_recover_tail else NS_PER_US
+            w_inv = (1.0 / float(call_count)) if is_recover_tail else 1.0
+            m_cube_pk = _harmonic_cube_peak_rate(
+                [(float(mr.flops) * float(max(1, int(mr.repeat_count)) if is_recover_tail else 1), float(mr.cube_peak_flops_per_s)) for mr, _, _, _, _ in m_items],
+                float(m_items[0][0].cube_peak_flops_per_s),
+            )
             op_map[micro_site] = (max(0.0, m_start - min_s), float(m_dur_ns) / denom_us)
             op_exp_map[micro_site] = float(m_exp_ns) / denom_us
             op_dur_ns_map[micro_site] = m_dur_ns
             op_exp_ns_map[micro_site] = m_exp_ns
+            op_work_map[micro_site] = (
+                sum(float(mr.flops) * (float(max(1, int(mr.repeat_count))) if is_recover_tail else 1.0) for mr, _, _, _, _ in m_items) * w_inv,
+                sum(float(mr.vector_ops) * (float(max(1, int(mr.repeat_count))) if is_recover_tail else 1.0) for mr, _, _, _, _ in m_items) * w_inv,
+                sum(float(mr.hbm_read_bytes) * (float(max(1, int(mr.repeat_count))) if is_recover_tail else 1.0) for mr, _, _, _, _ in m_items) * w_inv,
+                sum(float(mr.hbm_write_bytes) * (float(max(1, int(mr.repeat_count))) if is_recover_tail else 1.0) for mr, _, _, _, _ in m_items) * w_inv,
+                sum(float(mr.hbm_total_bytes) * (float(max(1, int(mr.repeat_count))) if is_recover_tail else 1.0) for mr, _, _, _, _ in m_items) * w_inv,
+                sum(float(mr.mte2_bytes) * (float(max(1, int(mr.repeat_count))) if is_recover_tail else 1.0) for mr, _, _, _, _ in m_items) * w_inv,
+                sum(float(mr.mte3_bytes) * (float(max(1, int(mr.repeat_count))) if is_recover_tail else 1.0) for mr, _, _, _, _ in m_items) * w_inv,
+                sum(float(mr.fixpipe_bytes) * (float(max(1, int(mr.repeat_count))) if is_recover_tail else 1.0) for mr, _, _, _, _ in m_items) * w_inv,
+                sum(float(mr.link_bytes) * (float(max(1, int(mr.repeat_count))) if is_recover_tail else 1.0) for mr, _, _, _, _ in m_items) * w_inv,
+                m_cube_pk,
+            )
             fully_hidden = m_dur_ns > 0 and m_exp_ns == 0
             if fully_hidden:
                 m_ls_ns: int | None = 0
@@ -1502,6 +1655,7 @@ def _extract_per_layer_timings(
             "ops_dur_ns": op_dur_ns_map,
             "ops_exposed_ns": op_exp_ns_map,
             "ops_lstar_ns": op_lstar_ns_map,
+            "ops_work": op_work_map,
             "residual_block_size": block_by_layer.get(key[1], 0) if key[0] == "target" else 0,
         }
     return out
@@ -1558,6 +1712,10 @@ def _aggregate_bundle_cohort_rows(
         if depth_note and depth_note not in role_txt:
             role_txt = f"{role_txt} [{depth_note}]" if role_txt else depth_note
         eff = min(1.0, avg_lstar_us / avg_dur_us) if (avg_dur_us > 0.0 and avg_lstar_us > 0.0) else rep.roofline_efficiency
+        agg_cube_peak = _harmonic_cube_peak_rate(
+            [(float(m[0].flops) * float(max(1, int(m[0].repeat_count))), float(m[0].cube_peak_flops_per_s)) for m in members],
+            rep.cube_peak_flops_per_s,
+        )
         folded_rows.append(replace(
             rep,
             ordinal=len(folded_rows),
@@ -1572,15 +1730,16 @@ def _aggregate_bundle_cohort_rows(
             gap_ratio=None if fully_hidden else ((avg_dur_us / avg_lstar_us) if avg_lstar_us > 0.0 else None),
             roofline_efficiency=eff,
             is_overlapped=fully_hidden,
-            flops=sum(float(m[0].flops) for m in members) * inv,
-            vector_ops=sum(float(m[0].vector_ops) for m in members) * inv,
-            hbm_read_bytes=sum(float(m[0].hbm_read_bytes) for m in members) * inv,
-            hbm_write_bytes=sum(float(m[0].hbm_write_bytes) for m in members) * inv,
-            hbm_total_bytes=sum(float(m[0].hbm_total_bytes) for m in members) * inv,
-            mte2_bytes=sum(float(m[0].mte2_bytes) for m in members) * inv,
-            mte3_bytes=sum(float(m[0].mte3_bytes) for m in members) * inv,
-            fixpipe_bytes=sum(float(m[0].fixpipe_bytes) for m in members) * inv,
-            link_bytes=sum(float(m[0].link_bytes) for m in members) * inv,
+            flops=sum(float(m[0].flops) * float(max(1, int(m[0].repeat_count))) for m in members) * inv,
+            cube_peak_flops_per_s=agg_cube_peak,
+            vector_ops=sum(float(m[0].vector_ops) * float(max(1, int(m[0].repeat_count))) for m in members) * inv,
+            hbm_read_bytes=sum(float(m[0].hbm_read_bytes) * float(max(1, int(m[0].repeat_count))) for m in members) * inv,
+            hbm_write_bytes=sum(float(m[0].hbm_write_bytes) * float(max(1, int(m[0].repeat_count))) for m in members) * inv,
+            hbm_total_bytes=sum(float(m[0].hbm_total_bytes) * float(max(1, int(m[0].repeat_count))) for m in members) * inv,
+            mte2_bytes=sum(float(m[0].mte2_bytes) * float(max(1, int(m[0].repeat_count))) for m in members) * inv,
+            mte3_bytes=sum(float(m[0].mte3_bytes) * float(max(1, int(m[0].repeat_count))) for m in members) * inv,
+            fixpipe_bytes=sum(float(m[0].fixpipe_bytes) * float(max(1, int(m[0].repeat_count))) for m in members) * inv,
+            link_bytes=sum(float(m[0].link_bytes) * float(max(1, int(m[0].repeat_count))) for m in members) * inv,
             logical_role=role_txt,
         ))
         folded_demands.append(sum_dem)  # type: ignore[arg-type]
@@ -1694,7 +1853,6 @@ def _reorder_rows_by_archetype(
 def _compute_network_efficiency_summary(
     rows: Sequence[OperatorExportRow], step_span_us: float, peaks: Mapping[str, Any],
 ) -> tuple[float, float, float, float, float, dict[str, float], dict[str, dict[str, float]]]:
-    tot_flops = sum(r.flops * r.repeat_count for r in rows)
     tot_vec = sum(r.vector_ops * r.repeat_count for r in rows)
     tot_hbm = sum(r.hbm_total_bytes * r.repeat_count for r in rows)
     tot_link = sum(r.link_bytes * r.repeat_count for r in rows)
@@ -1705,7 +1863,13 @@ def _compute_network_efficiency_summary(
     hbm_peak = float(peaks.get("hbm_peak_bytes_per_s") or 0.0)
     link_peak = float(peaks.get("link_peak_bytes_per_s") or 0.0)
 
-    cube_mfu = min(100.0, 100.0 * (tot_flops / step_s) / cube_peak) if cube_peak > 0.0 else 0.0
+    cube_busy_s = 0.0
+    for r in rows:
+        if r.flops > 0.0:
+            op_peak = float(r.cube_peak_flops_per_s) if float(r.cube_peak_flops_per_s) > 0.0 else cube_peak
+            if op_peak > 0.0:
+                cube_busy_s += (r.flops * r.repeat_count) / op_peak
+    cube_mfu = min(100.0, 100.0 * cube_busy_s / step_s)
     vec_mfu = min(100.0, 100.0 * (tot_vec / step_s) / vec_peak) if vec_peak > 0.0 else 0.0
     hbm_mbu = min(100.0, 100.0 * (tot_hbm / step_s) / hbm_peak) if hbm_peak > 0.0 else 0.0
     link_util = min(100.0, 100.0 * (tot_link / step_s) / link_peak) if link_peak > 0.0 else 0.0
@@ -2125,7 +2289,47 @@ def _extract_scenario_meta(
     # Only a decode query width implies draft proposals; a prefill prompt width never does.
     inferred = max(0, int(step_req.tokens) - 1) if step_req.phase == "decode" else 0
     proposals = spec_tokens if spec_tokens > 0 else inferred
-    if step_req.phase == "decode":
+    if step_req.requests:
+        active_views = [v for v in step_req.requests if not v.padding]
+        if not active_views:
+            avg_accepted = 0.0
+            proposals = 0
+        elif step_req.phase == "decode":
+            view_props = max((int(getattr(v, "draft_proposal_tokens", 0) or 0) for v in active_views), default=0)
+            if view_props > 0:
+                proposals = view_props
+            has_realized = any(
+                int(getattr(v, "draft_advanced_tokens", 0) or 0) > 0
+                or int(getattr(v, "draft_accepted_tokens", 0) or 0) > 0
+                for v in active_views
+            )
+            if has_realized:
+                committed = 0
+                for v in active_views:
+                    adv = int(getattr(v, "draft_advanced_tokens", 0) or 0)
+                    acc_tok = int(getattr(v, "draft_accepted_tokens", 0) or 0)
+                    if adv > 0:
+                        committed += adv
+                    elif acc_tok > 0:
+                        committed += acc_tok + (1 if getattr(v, "samples", True) else 0)
+                    else:
+                        committed += 1 if getattr(v, "samples", True) else 0
+                avg_accepted = float(committed) / float(len(active_views))
+            elif all(not getattr(v, "samples", True) for v in active_views):
+                avg_accepted = 0.0
+            else:
+                q_width, avg_accepted = _resolve_speculative_tokens(
+                    parsed, output_budget=output_toks, tokens_per_seq=int(step_req.tokens),
+                    emitted_tokens_per_seq=None,
+                )
+                proposals = min(proposals, q_width - 1)
+        else:
+            total_req_toks = sum(
+                max(0, int(getattr(v, "global_q_len", 0) or v.q_len))
+                for v in active_views
+            )
+            avg_accepted = float(total_req_toks) / float(len(active_views))
+    elif step_req.phase == "decode":
         q_width, avg_accepted = _resolve_speculative_tokens(
             parsed, output_budget=output_toks, tokens_per_seq=int(step_req.tokens),
             emitted_tokens_per_seq=None,
@@ -2696,7 +2900,7 @@ def _resolve_bundle_step_context(
     dp_width = int(parsed.runtime.parallel.dp)
     if step_req.requests:
         # Explicit RequestViews own the per-replica batch, matching the graph builder's precedence.
-        active = max(1, sum(1 for view in step_req.requests if not view.padding))
+        active = sum(1 for view in step_req.requests if not view.padding)
         seq_count, cluster_conc = active, active * max(1, dp_width)
     else:
         seq_count, cluster_conc = _normalize_bundle_sequences(step_req.sequences, dp_width)
@@ -3010,18 +3214,29 @@ def _build_bundle_memory_and_sla(
         max((int(getattr(req, "output_tokens", 0) or 0) for req in parsed.workload.requests), default=0)
         if parsed.workload.requests else 0
     )
-    req_ctx = int(step_req.context)
-    if req_ctx <= 0 and step_req.requests:
-        req_ctx = max((int(getattr(v, "context", 0) or 0) for v in step_req.requests), default=0)
-    horizon_tokens = (
-        max(int(step_req.tokens), declared_out)
-        if step_req.phase == "decode" else int(step_req.tokens)
-    )
-    ledger_seq_len = max(req_ctx + horizon_tokens, int(step_req.tokens))
+    if step_req.requests:
+        geom_views = [v for v in step_req.requests if not v.padding] or list(step_req.requests)
+        view_ctx = max((max(0, int(getattr(v, "context", 0) or 0)) for v in geom_views), default=0)
+        view_q = max((max(0, int(getattr(v, "global_q_len", 0) or v.q_len)) for v in geom_views), default=0)
+        view_seq = max(
+            (max(0, int(getattr(v, "context", 0) or 0)) + max(0, int(getattr(v, "global_q_len", 0) or v.q_len)) for v in geom_views),
+            default=0,
+        )
+        req_ctx = view_ctx if view_ctx > 0 else int(step_req.context)
+        horizon_tokens = max(view_q, declared_out) if step_req.phase == "decode" else view_q
+        ledger_seq_len = max(req_ctx + horizon_tokens, view_seq, 1)
+    else:
+        req_ctx = int(step_req.context)
+        horizon_tokens = (
+            max(int(step_req.tokens), declared_out)
+            if step_req.phase == "decode" else int(step_req.tokens)
+        )
+        ledger_seq_len = max(req_ctx + horizon_tokens, int(step_req.tokens))
+    ledger_conc = max(1, seq_count if seq_count > 0 else (len(step_req.requests) if step_req.requests else 1))
     mem_ledger = compute_memory_quant_ledger(
         parsed, phase=step_req.phase,
         seq_len=ledger_seq_len,
-        concurrency=seq_count, weight_quant=weight_quant,
+        concurrency=ledger_conc, weight_quant=weight_quant,
         cache_dtype=cache_dtype, engram_host_offload=engram_host_offload,
         include_vision_tower=include_vision_tower,
         apply_preset_to_ignored=apply_preset_to_ignored,
@@ -3031,8 +3246,9 @@ def _build_bundle_memory_and_sla(
         max(0.0, float(handoff_tpot_ms if handoff_tpot_ms is not None else (meta_dict.get("handoff_tpot_ms", 0.0) or 0.0)))
         if step_req.phase == "decode" else 0.0
     )
+    avg_acc_val = float(scen["avg_accepted_tokens"])
     eff_tpot_ms = (
-        (step_span_us / US_PER_MS / max(1.0, float(scen["avg_accepted_tokens"]))) + eff_handoff
+        (step_span_us / US_PER_MS / (avg_acc_val if avg_acc_val > 0.0 else 1.0)) + eff_handoff
         if step_req.phase == "decode" else (step_span_us / US_PER_MS)
     )
     raw_sla_target = scen["tpot_slo_ms"] if step_req.phase == "decode" else scen["ttft_slo_ms"]
@@ -3231,6 +3447,13 @@ def _compute_bundle_case_digest(
     cache_dtype: str,
     target_envelope_applied: bool,
     rewrite_plan_sha256: str,
+    tpot_slo_ms: float | None = None,
+    ttft_slo_ms: float | None = None,
+    handoff_tpot_ms: float = 0.0,
+    deployment_mode: str = "",
+    avg_accepted_tokens: float = 1.0,
+    deployment_total_dies: int = 0,
+    pd_pool_summary: Mapping[str, Any] | None = None,
 ) -> str:
     p = parsed.runtime.parallel
     payload = {
@@ -3244,8 +3467,18 @@ def _compute_bundle_case_digest(
         "cache_dtype": str(cache_dtype),
         "target_envelope": bool(target_envelope_applied),
         "plan_sha256": str(rewrite_plan_sha256),
+        "tpot_slo_ms": (float(tpot_slo_ms) if tpot_slo_ms is not None else None),
+        "ttft_slo_ms": (float(ttft_slo_ms) if ttft_slo_ms is not None else None),
+        "handoff_tpot_ms": float(handoff_tpot_ms),
+        "deployment_mode": str(deployment_mode),
+        "avg_accepted_tokens": float(avg_accepted_tokens),
+        "deployment_total_dies": int(deployment_total_dies),
+        "pd_pool_summary": (
+            {str(k): v for k, v in sorted(pd_pool_summary.items())}
+            if isinstance(pd_pool_summary, Mapping) else None
+        ),
     }
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
 
@@ -3303,6 +3536,9 @@ def _resolve_bundle_identity_and_extras(
     step_l_star_ns: int,
     engine_step_receipt: EngineStepReceipt | None,
     reverted_to_native_baseline: bool,
+    handoff_tpot_ms: float = 0.0,
+    deployment_total_dies: int = 0,
+    pd_pool_summary: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     eff_cfg = _build_effective_config_dict(
         parsed, mem_ledger, scen, graph_capture_mode=graph_mode, track_name=track_name,
@@ -3322,6 +3558,13 @@ def _resolve_bundle_identity_and_extras(
         cache_dtype=str(getattr(mem_ledger, "cache_dtype", "") or ""),
         target_envelope_applied=target_envelope_applied,
         rewrite_plan_sha256=rewrite_plan_sha256,
+        tpot_slo_ms=scen.get("tpot_slo_ms"),
+        ttft_slo_ms=scen.get("ttft_slo_ms"),
+        handoff_tpot_ms=float(handoff_tpot_ms),
+        deployment_mode=str(scen.get("deployment_mode") or ""),
+        avg_accepted_tokens=float(scen.get("avg_accepted_tokens", 1.0)),
+        deployment_total_dies=int(deployment_total_dies),
+        pd_pool_summary=pd_pool_summary,
     )
     exec_key = ""
     if engine_step_receipt is not None:
@@ -3403,12 +3646,6 @@ def _assemble_export_bundle(
         final_rows, rank_order, step_span_us=step_span_us, top_k_radar=top_k_radar,
     )
     scen = _extract_scenario_meta(parsed, step_req, final_rows)
-    step_s = max(step_span_us / US_PER_SECOND, MIN_POSITIVE_SECONDS)
-    eff_cluster_conc = max(1, int(cluster_conc))
-    tps = float(eff_cluster_conc) * float(scen["avg_accepted_tokens"]) / step_s
-    num_dies = max(1, len(parsed.machine.dies))
-    n_tok_per_die = float(eff_cluster_conc) * float(scen["avg_accepted_tokens"]) / float(num_dies)
-    us_per_tok_die = step_span_us / max(n_tok_per_die, MIN_DENOM_EPS)
     hw_peaks_summary, die_summary = _build_hw_peaks_and_die_summary(parsed, p0)
     mem_ledger, eff_handoff, sla_slack, sla_regime, macro_wall = _build_bundle_memory_and_sla(
         parsed, step_req=step_req, seq_count=seq_count, step_span_us=step_span_us,
@@ -3416,8 +3653,15 @@ def _assemble_export_bundle(
         engram_host_offload=engram_host_offload, include_vision_tower=include_vision_tower,
         apply_preset_to_ignored=apply_preset_to_ignored, handoff_tpot_ms=handoff_tpot_ms,
     )
+    step_s = max(step_span_us / US_PER_SECOND, MIN_POSITIVE_SECONDS)
+    eff_cluster_conc = max(0, int(cluster_conc))
+    avg_tok = max(0.0, float(scen["avg_accepted_tokens"]))
+    tps = float(eff_cluster_conc) * avg_tok / step_s
+    num_dies = max(1, int(getattr(mem_ledger, "total_dies", 0) or len(parsed.machine.dies)))
+    n_tok_per_die = float(eff_cluster_conc) * avg_tok / float(num_dies)
+    us_per_tok_die = (step_span_us / n_tok_per_die) if n_tok_per_die > MIN_DENOM_EPS else 0.0
     meta_dict = dict(parsed.runtime.metadata)
-    ckpt_summary, va_summary = _build_checkpoint_and_va_summary(parsed, mem_ledger, scen, seq_count)
+    ckpt_summary, va_summary = _build_checkpoint_and_va_summary(parsed, mem_ledger, scen, max(1, seq_count))
     track_name = _resolve_case_stack_track(parsed)
     active_ids = {r.archetype_id for r in final_rows}
     filtered_schedule = tuple(e for e in full_schedule if e.archetype_id in active_ids) if use_archetype_dedup else ()
@@ -3454,6 +3698,9 @@ def _assemble_export_bundle(
         step_span_ns=step_span_ns, idle_or_wait_ns=idle_or_wait_ns,
         step_l_star_ns=step_l_star_ns, engine_step_receipt=engine_step_receipt,
         reverted_to_native_baseline=reverted_to_native_baseline,
+        handoff_tpot_ms=eff_handoff,
+        deployment_total_dies=eff_dep_dies,
+        pd_pool_summary=eff_pd_pool,
     )
     return ExportBundle(
         schema=EXPORT_BUNDLE_SCHEMA, model_name=str(parsed.model.name),
