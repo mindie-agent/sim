@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import math
 
+from mindie_sim.observed_contracts.vocabulary import DTYPES as _OBSERVED_DTYPES
+
 
 def _capture_float(value):
     if value is None:
@@ -191,11 +193,35 @@ _PIPE_TO_OWNER_PHASE = {
 
 
 _CAPTURE_MATMUL_ARITY = 2
+_CAPTURE_QBMM_MIN_ARITY = 3
 _CAPTURE_QBMM_ARITY = 4
-_CAPTURE_NATIVE_ARITY = {
+_CAPTURE_NATIVE_MIN_ARITY = {
     "MatMulV3": _CAPTURE_MATMUL_ARITY,
-    "QuantBatchMatmulV3": _CAPTURE_QBMM_ARITY,
+    "QuantBatchMatmulV3": _CAPTURE_QBMM_MIN_ARITY,
 }
+_FRACTAL_NZ_RANK = 4
+_FRACTAL_NZ_ROW_TILE = 16
+_MX_MICROSCALE_BLOCK = 64
+_MX_SCALE_MIN_RANK = 3
+_FRACTAL_NZ_C0_BY_DTYPE = {
+    "fp8_e4m3": frozenset({32}),
+    "fp8_e5m2": frozenset({32}),
+    "fp8_e8m0": frozenset({32}),
+    "hif8": frozenset({32}),
+    "int8": frozenset({32}),
+    "uint8": frozenset({32}),
+    "bf16": frozenset({16}),
+    "fp16": frozenset({16}),
+    "int16": frozenset({16}),
+    "uint16": frozenset({16}),
+    "fp32": frozenset({8}),
+    "int32": frozenset({8}),
+    "uint32": frozenset({8}),
+    "int4": frozenset({32, 64}),
+    "uint4": frozenset({32, 64}),
+    "fp4_e2m1": frozenset({32, 64}),
+}
+_FRACTAL_NZ_VALID_C0_TILES = frozenset({8, 16, 32, 64})
 
 
 def _capture_binary_contract(image_id, native_type):
@@ -255,28 +281,170 @@ def parse_capture_abi(row):
     }
 
 
-def _capture_geometry(native_type, inputs, outputs):
-    """Derive M/K/N from the captured ABI shapes, not from an image table."""
-    first, second = list(inputs[0]), list(inputs[1])
-    if len(first) < _CAPTURE_MATMUL_ARITY or len(second) < _CAPTURE_MATMUL_ARITY:
-        raise ValueError("capture_abi_requires_rank_two_matmul_operands")
-    rows = 1
-    for dim in first[:-1]:
-        rows *= int(dim)
-    inner = int(first[-1])
-    if native_type == "MatMulV3":
-        columns = int(second[-1])
-        declared_inner = int(second[0])
-        if declared_inner != inner and columns == inner:
-            columns, inner = declared_inner, int(second[-1])
+def _is_fractal_nz(fmt):
+    text = str(fmt or "").strip().upper()
+    return text == "FRACTAL_NZ" or text.startswith("FRACTAL_NZ_")
+
+
+def _expected_fractal_nz_c0(fmt, dtype):
+    text = str(fmt or "").strip().upper()
+    if text.startswith("FRACTAL_NZ_C0_"):
+        suffix = text.removeprefix("FRACTAL_NZ_C0_")
+        if suffix.isdigit() and int(suffix) > 0:
+            return frozenset({int(suffix)})
+        return frozenset()
+    raw = str(dtype or "").strip()
+    canonical = (
+        _OBSERVED_DTYPES.get(raw)
+        or _OBSERVED_DTYPES.get(raw.upper())
+        or _OBSERVED_DTYPES.get(raw.lower())
+    )
+    if canonical in _FRACTAL_NZ_C0_BY_DTYPE:
+        return _FRACTAL_NZ_C0_BY_DTYPE[canonical]
+    return _FRACTAL_NZ_VALID_C0_TILES
+
+
+def _ceil_div(value, divisor):
+    return (value + divisor - 1) // divisor
+
+
+def _broadcast_batch_matches(a_batch, b_batch, out_batch):
+    if len(a_batch) > len(out_batch) or len(b_batch) > len(out_batch):
+        return False
+    pad_a = [1] * (len(out_batch) - len(a_batch)) + [int(d) for d in a_batch]
+    pad_b = [1] * (len(out_batch) - len(b_batch)) + [int(d) for d in b_batch]
+    for da, db, dy in zip(pad_a, pad_b, (int(d) for d in out_batch)):
+        if da == db:
+            expected = da
+        elif da == 1:
+            expected = db
+        elif db == 1:
+            expected = da
+        else:
+            return False
+        if expected != dy:
+            return False
+    return True
+
+
+def _scale_weight_orientation(scale_shape, k, n):
+    if not scale_shape:
+        return None
+    groups = _ceil_div(k, _MX_MICROSCALE_BLOCK)
+    if len(scale_shape) >= _MX_SCALE_MIN_RANK and int(scale_shape[-1]) == 2:
+        tail = (int(scale_shape[-_MX_SCALE_MIN_RANK]), int(scale_shape[-2]))
+        if tail == (n, groups) and tail != (groups, n):
+            return "n_k"
+        if tail == (groups, n) and tail != (n, groups):
+            return "k_n"
+    if len(scale_shape) == _CAPTURE_MATMUL_ARITY:
+        dims = (int(scale_shape[0]), int(scale_shape[1]))
+        if dims[0] == n and dims[1] != n and dims[1] > 1:
+            return "n_k"
+        if dims[1] == n and dims[0] != n and dims[0] > 1:
+            return "k_n"
+    return None
+
+
+def _validate_matrix_weight(weight_shape, k, n, x2_format, x2_dtype, scale_shape=None):
+    is_nz = _is_fractal_nz(x2_format)
+    scale_hint = _scale_weight_orientation(scale_shape, k, n)
+    if len(weight_shape) == _CAPTURE_MATMUL_ARITY:
+        nk_match = int(weight_shape[0]) == n and int(weight_shape[1]) == k
+        kn_match = int(weight_shape[0]) == k and int(weight_shape[1]) == n
+        if nk_match and kn_match:
+            chosen = scale_hint or "n_k"
+            return (f"fractal_nz_{chosen}" if is_nz else chosen), None
+        if nk_match:
+            return ("fractal_nz_n_k" if is_nz else "n_k"), None
+        if kn_match:
+            return ("fractal_nz_k_n" if is_nz else "k_n"), None
+        return None, "logical_matrix_work_x2_does_not_match_output_n_and_k"
+    if len(weight_shape) == _FRACTAL_NZ_RANK and is_nz:
+        d1_tiles, d0_tiles, tile_0, tile_1 = (int(dim) for dim in weight_shape)
+        allowed_c0 = _expected_fractal_nz_c0(x2_format, x2_dtype)
+        if tile_0 != _FRACTAL_NZ_ROW_TILE or tile_1 not in allowed_c0:
+            return None, "logical_matrix_work_invalid_fractal_nz_tile"
+        kn_match = (d1_tiles == _ceil_div(n, tile_1)
+                    and d0_tiles == _ceil_div(k, tile_0))
+        nk_match = (d1_tiles == _ceil_div(k, tile_1)
+                    and d0_tiles == _ceil_div(n, tile_0))
+        if kn_match and nk_match:
+            return f"fractal_nz_{scale_hint or 'k_n'}", None
+        if kn_match:
+            return "fractal_nz_k_n", None
+        if nk_match:
+            return "fractal_nz_n_k", None
+        return None, "logical_matrix_work_x2_does_not_match_output_n_and_k"
+    return None, "logical_matrix_work_requires_rank_two_ABI"
+
+
+def _capture_matrix_geometry(abi):
+    """Derive logical M/K/N from activation and output, validating weight layout."""
+    inputs = abi["input_shapes"]
+    outputs = abi["output_shapes"]
+    if (len(inputs) < _CAPTURE_MATMUL_ARITY or not inputs[0] or not inputs[1]
+            or not outputs or not outputs[0]):
+        return None, "logical_matrix_work_requires_rank_two_ABI"
+    first, second, output = list(inputs[0]), list(inputs[1]), list(outputs[0])
+    if (len(first) < _CAPTURE_MATMUL_ARITY or len(second) < _CAPTURE_MATMUL_ARITY
+            or len(output) < _CAPTURE_MATMUL_ARITY):
+        return None, "logical_matrix_work_requires_rank_two_ABI"
+    if any(int(dim) < 0 for shape in (first, second, output) for dim in shape):
+        return None, "logical_matrix_work_requires_nonnegative_dimensions"
+    input_formats = abi.get("input_formats") or ()
+    output_formats = abi.get("output_formats") or ()
+    x1_format = input_formats[0] if len(input_formats) > 0 else ""
+    x2_format = input_formats[1] if len(input_formats) > 1 else ""
+    y_format = output_formats[0] if len(output_formats) > 0 else ""
+    if ((_is_fractal_nz(x1_format) and len(first) != _CAPTURE_MATMUL_ARITY)
+            or (_is_fractal_nz(y_format) and len(output) != _CAPTURE_MATMUL_ARITY)):
+        return None, "logical_matrix_work_requires_rank_two_ABI"
+    out_batch = output[:-_CAPTURE_MATMUL_ARITY]
+    a_batch = first[:-_CAPTURE_MATMUL_ARITY]
+    m_inner, n = int(output[-2]), int(output[-1])
+    if int(first[-2]) == m_inner:
+        k = int(first[-1])
+        orientation = "x1_mk"
+    elif int(first[-1]) == m_inner:
+        k = int(first[-2])
+        orientation = "x1_km"
     else:
-        declared_inner = int(second[0])
-        columns = (int(second[-1]) if declared_inner == inner
-                   else declared_inner)
+        return None, "logical_matrix_work_x1_does_not_match_output_m"
+    input_dtypes = abi.get("input_dtypes") or ()
+    x2_dtype = input_dtypes[1] if len(input_dtypes) > 1 else ""
+    scale_shape = inputs[2] if len(inputs) > 2 else None
+    is_nz = _is_fractal_nz(x2_format)
+    splits = []
+    if is_nz and len(second) >= _FRACTAL_NZ_RANK:
+        splits.append((second[:-_FRACTAL_NZ_RANK], second[-_FRACTAL_NZ_RANK:]))
+        if len(second) <= len(out_batch) + _CAPTURE_MATMUL_ARITY:
+            splits.append((second[:-_CAPTURE_MATMUL_ARITY], second[-_CAPTURE_MATMUL_ARITY:]))
+    else:
+        splits.append((second[:-_CAPTURE_MATMUL_ARITY], second[-_CAPTURE_MATMUL_ARITY:]))
+    b_layout = None
+    last_reason = "logical_matrix_work_requires_rank_two_ABI"
+    for b_batch, weight_shape in splits:
+        if not _broadcast_batch_matches(a_batch, b_batch, out_batch):
+            last_reason = "logical_matrix_work_x1_does_not_match_output_m"
+            continue
+        b_layout, reason = _validate_matrix_weight(
+            weight_shape, k, n, x2_format, x2_dtype, scale_shape)
+        if reason is None:
+            break
+        last_reason = reason
+    if b_layout is None:
+        return None, last_reason
+    batch_rows = math.prod(int(dim) for dim in out_batch) if out_batch else 1
+    m = batch_rows * m_inner
     return {
-        "m": int(rows), "k": int(inner), "n": int(columns),
-        "macs": int(rows) * int(inner) * int(columns),
-    }
+        "m": m,
+        "k": k,
+        "n": n,
+        "macs": m * k * n,
+        "x1_orientation": orientation,
+        "x2_layout": b_layout,
+    }, None
 
 
 def _capture_tensor(name, shape, dtype, layout=None):
@@ -326,19 +494,25 @@ def bind_capture_native_plan(row, *, image_id=None):
         "source_role_status": "not_identified_from_capture",
         "dispatch_status": "not_established_from_capture",
     }
-    arity = _CAPTURE_NATIVE_ARITY.get(native_type)
-    parsed = list(inputs[:arity]) if arity else []
-    if (arity is None or len(inputs) < arity or not outputs
+    min_arity = _CAPTURE_NATIVE_MIN_ARITY.get(native_type)
+    arity = min(len(inputs), _CAPTURE_QBMM_ARITY) if native_type == "QuantBatchMatmulV3" else min_arity
+    parsed = list(inputs[:arity]) if min_arity and len(inputs) >= min_arity else []
+    if (min_arity is None or len(inputs) < min_arity or not outputs
             or any(shape is None for shape in parsed + list(outputs[:1]))):
         result["status"] = "unsupported"
         result["reasons"] = ["no_canonical_geometry_for_capture_family"]
         return result
-    try:
-        geometry = _capture_geometry(native_type, inputs, outputs)
-    except (TypeError, ValueError, IndexError) as error:
+    geometry_info, reason = _capture_matrix_geometry(abi)
+    if geometry_info is None:
         result["status"] = "adapter_error"
-        result["reasons"] = [type(error).__name__ + ":" + str(error)]
+        result["reasons"] = ["ValueError:" + reason]
         return result
+    geometry = {
+        "m": geometry_info["m"],
+        "k": geometry_info["k"],
+        "n": geometry_info["n"],
+        "macs": geometry_info["macs"],
+    }
     input_bytes = _capture_bytes(inputs, abi["input_dtypes"])
     output_bytes = _capture_bytes(outputs, abi["output_dtypes"])
     issued = {
@@ -548,34 +722,19 @@ def logical_capture_work(row):
     input_dtypes = abi["input_dtypes"]
     outputs = abi["output_shapes"]
     output_dtypes = abi["output_dtypes"]
-    if native_type in {"MatMulV3", "QuantBatchMatmulV3"} and len(inputs) >= 2 \
-            and inputs[0] and inputs[1] and outputs and outputs[0]:
-        first, second, output = inputs[0], inputs[1], outputs[0]
-        if len(first) != 2 or len(second) != 2 or len(output) != 2:
+    min_arity = _CAPTURE_NATIVE_MIN_ARITY.get(native_type)
+    if (min_arity is not None and len(inputs) >= min_arity
+            and inputs[0] and inputs[1] and outputs and outputs[0]):
+        geometry_info, reason = _capture_matrix_geometry(abi)
+        if geometry_info is None:
             return {"native_type": native_type, "work_unit": None,
-                    "logical_work": None,
-                    "reason": "logical_matrix_work_requires_rank_two_ABI"}
-        m, n = int(output[0]), int(output[1])
-        orientation = None
-        if first[0] == m:
-            k = int(first[1])
-            orientation = "x1_mk"
-        elif first[1] == m:
-            k = int(first[0])
-            orientation = "x1_km"
-        else:
-            return {"native_type": native_type, "work_unit": None,
-                    "logical_work": None,
-                    "reason": "logical_matrix_work_x1_does_not_match_output_m"}
-        if second[0] == n and second[1] == k:
-            b_layout = "n_k"
-        elif second[0] == k and second[1] == n:
-            b_layout = "k_n"
-        else:
-            return {"native_type": native_type, "work_unit": None,
-                    "logical_work": None,
-                    "reason": "logical_matrix_work_x2_does_not_match_output_n_and_k"}
-        macs = m * n * k
+                    "logical_work": None, "reason": reason}
+        m = geometry_info["m"]
+        n = geometry_info["n"]
+        k = geometry_info["k"]
+        macs = geometry_info["macs"]
+        orientation = geometry_info["x1_orientation"]
+        b_layout = geometry_info["x2_layout"]
         bytes_by_tensor = {}
         total_bytes = 0
         for index, (shape, dtype) in enumerate(zip(inputs, input_dtypes)):

@@ -605,164 +605,12 @@ import math
 from .resource_services import (
     RESOURCE_SERVICE_BINDING_SCHEMA,
     NormalizedResourceService,
+    _profiler_service_id,
     identity_digest,
     normalize_resource_service,
+    select_resource_service_candidate,
+    service_conditions_match,
 )
-
-
-_CONDITION_MISSING = object()
-
-
-def _condition_value(context, path):
-    value = context
-    for part in str(path).split("."):
-        if isinstance(value, Mapping):
-            if part not in value:
-                return _CONDITION_MISSING
-            value = value[part]
-        elif (isinstance(value, (list, tuple)) and part.isdigit()
-              and int(part) < len(value)):
-            value = value[int(part)]
-        else:
-            return _CONDITION_MISSING
-    return value
-
-
-def _condition_matches(actual, expected, path=""):
-    if str(path).endswith("image_digest"):
-        return identity_digest(actual) == identity_digest(expected)
-    if str(path) == "dtype":
-        return str(actual).lower() == str(expected).lower()
-    if isinstance(expected, Mapping) and set(expected) <= {"min", "max"}:
-        try:
-            number = float(actual)
-            if "min" in expected and number < float(expected["min"]):
-                return False
-            if "max" in expected and number > float(expected["max"]):
-                return False
-            return True
-        except (TypeError, ValueError):
-            return False
-    if (isinstance(actual, (int, float)) and not isinstance(actual, bool)
-            and isinstance(expected, (int, float))
-            and not isinstance(expected, bool)):
-        return math.isclose(float(actual), float(expected),
-                            rel_tol=1e-9, abs_tol=1e-12)
-    if isinstance(actual, Mapping) and isinstance(expected, Mapping):
-        return (actual.keys() == expected.keys()
-                and all(_condition_matches(actual[key], expected[key], path)
-                        for key in expected))
-    if (isinstance(actual, (list, tuple))
-            and isinstance(expected, (list, tuple))):
-        return (len(actual) == len(expected)
-                and all(_condition_matches(a, b, path)
-                        for a, b in zip(actual, expected)))
-    return actual == expected
-
-
-def service_conditions_match(service, context):
-    """Check only the conditions the service actually declares.
-
-    Extra keys in a broader physical contract (unrelated rates, modes, owners or
-    environment fields) are not identity.  A declared rate/mode/unit/environment
-    condition must still match, so a real change in the depended-on supply is
-    rejected.  ``conditions`` may use dotted paths such as
-    ``resource_units.mte2_aiv`` or ``rates.hbm``.
-    """
-    if not isinstance(context, Mapping):
-        raise ValueError("service_condition_context_requires_mapping")
-    conditions = getattr(service, "conditions", None)
-    if conditions is None and isinstance(service, Mapping):
-        conditions = service.get("conditions")
-    if conditions is None:
-        raise ValueError("service_condition_service_requires_conditions")
-    if not isinstance(conditions, Mapping):
-        raise ValueError("service_condition_conditions_requires_mapping")
-    checks = []
-    for path, expected in conditions.items():
-        actual = _condition_value(context, path)
-        present = actual is not _CONDITION_MISSING
-        matched = present and _condition_matches(actual, expected, path)
-        checks.append({
-            "path": str(path),
-            "expected": deepcopy(expected),
-            "actual": deepcopy(actual) if present else None,
-            "present": present,
-            "matched": matched,
-            "optional": False,
-        })
-    optional = getattr(service, "optional_conditions", None)
-    if optional is None and isinstance(service, Mapping):
-        optional = service.get("optional_conditions")
-    if optional:
-        if not isinstance(optional, Mapping):
-            raise ValueError("service_optional_conditions_requires_mapping")
-        for path, expected in optional.items():
-            actual = _condition_value(context, path)
-            present = actual is not _CONDITION_MISSING
-            if not present or actual is None:
-                checks.append({
-                    "path": str(path), "expected": deepcopy(expected),
-                    "actual": None, "present": present, "matched": True,
-                    "optional": True,
-                })
-                continue
-            matched = _condition_matches(actual, expected, path)
-            checks.append({
-                "path": str(path), "expected": deepcopy(expected),
-                "actual": deepcopy(actual), "present": True,
-                "matched": matched, "optional": True,
-            })
-    return {
-        "applies": all(check["matched"] for check in checks),
-        "checks": checks,
-        "policy": ("only_declared_condition_paths; unrelated physical "
-                   "contract keys are ignored"),
-    }
-
-
-def _condition_failure_reason(service, result):
-    failed = [check for check in result["checks"] if not check["matched"]]
-    if not failed:
-        return "conditions_matched"
-    parts = []
-    for check in failed:
-        actual = check["actual"] if check["present"] else "<missing>"
-        parts.append(f"{check['path']}={actual!r}!={check['expected']!r}")
-    return service.service_id + ":" + ";".join(parts)
-
-
-def select_resource_service_candidate(services, context, *, service_id=None):
-    """Narrow by optional ID, then apply the one condition matcher to all.
-
-    Explicit ID, single candidate and automatic selection all pass through the
-    same condition check.  A missing ID, missing condition, value mismatch or
-    ambiguity raises a specific error; there is no nominal fallback.
-    """
-    if not isinstance(context, Mapping):
-        raise ValueError("resource_service_context_requires_mapping")
-    candidates = list(services or ())
-    if service_id is not None:
-        candidates = [item for item in candidates
-                      if item.service_id == service_id]
-        if not candidates:
-            raise ValueError("resource_service_id_not_found:" + str(service_id))
-    checked = []
-    selected = []
-    for service in candidates:
-        result = service_conditions_match(service, context)
-        checked.append((service, result))
-        if result["applies"]:
-            selected.append(service)
-    if len(selected) == 1:
-        return selected[0]
-    if not selected:
-        reasons = ";".join(
-            _condition_failure_reason(service, result)
-            for service, result in checked)
-        raise ValueError("resource_service_conditions_have_no_match:" + reasons)
-    raise ValueError("resource_service_conditions_are_ambiguous:"
-                     + ",".join(item.service_id for item in selected))
 
 
 def resource_service_binding(service, *, resource_role=None, phase=None,
@@ -792,7 +640,8 @@ def resource_service_binding(service, *, resource_role=None, phase=None,
         raise ValueError(
             "resource_service_binding_phase_mismatch:"
             + service.service_id + ":" + selected_phase + ":" + service.phase)
-    if service.conditions:
+    has_conditions = bool(service.conditions or service.optional_conditions)
+    if has_conditions:
         if conditions is None:
             raise ValueError(
                 "resource_service_binding_requires_conditions_context:"
@@ -817,7 +666,7 @@ def resource_service_binding(service, *, resource_role=None, phase=None,
         "formula": service.formula,
         "conditions": deepcopy(service.conditions),
         "optional_conditions": deepcopy(service.optional_conditions),
-        "conditions_checked": bool(service.conditions or service.optional_conditions),
+        "conditions_checked": has_conditions,
         "boundary": service.boundary,
         "resource": service.resource,
         "resources": list(service.resources),
@@ -1146,9 +995,7 @@ def _normalize_profiler_resource_services(resources, *, hardware, source,
         optional_conditions = dict(applicability["optional_conditions"])
         geometry = dict(raw.get("geometry_binding") or {})
         source_sha = str(raw.get("source_sha256") or "")
-        identifier = (f"profiler:{resource}:"
-                      f"{raw.get('shape_class') or 'default'}:"
-                      f"{source_sha[:12] or 'unhashed'}")
+        identifier = _profiler_service_id(raw, resource)
         source_scope = str(raw.get("scope") or "")
         effective_rate = float(rate)
         rate_conversion = "per_owner_rate_preserved_critical_owner_work"
