@@ -6,8 +6,9 @@
 [Side-Effect Policy] Read-only."""
 from __future__ import annotations
 
+from copy import deepcopy
 import math
-from typing import Mapping
+from typing import Any, Mapping, Sequence
 
 
 _RATE_SCOPES = frozenset({"aggregate", "per_owner"})
@@ -211,23 +212,47 @@ def c7_applicability(record: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _c7_value(context, path):
+_CONDITION_MISSING = object()
+_SOURCE_SHA_PREFIX_LEN = 12
+
+
+def _profiler_service_id(record: Mapping[str, Any], resource: str) -> str:
+    source_sha = str(record.get("source_sha256") or "")
+    return (
+        f"profiler:{resource}:"
+        f"{record.get('shape_class') or 'default'}:"
+        f"{source_sha[:_SOURCE_SHA_PREFIX_LEN] or 'unhashed'}"
+    )
+
+
+def _service_id(service: Any) -> str:
+    service_id = getattr(service, "service_id", None)
+    if service_id is not None:
+        return str(service_id)
+    if isinstance(service, Mapping):
+        return str(service.get("service_id") or service.get("id") or "")
+    return ""
+
+
+def _condition_value(context, path):
     value = context
     for part in str(path).split("."):
-        if isinstance(value, Mapping) and part in value:
+        if isinstance(value, Mapping):
+            if part not in value:
+                return _CONDITION_MISSING
             value = value[part]
+        elif (isinstance(value, (list, tuple)) and part.isdigit()
+              and int(part) < len(value)):
+            value = value[int(part)]
         else:
-            return _C7_MISSING
+            return _CONDITION_MISSING
     return value
 
 
-_C7_MISSING = object()
-
-
-def _c7_condition_matches(path, actual, expected):
-    if path.endswith("image_digest"):
+def _condition_matches(actual, expected, path=""):
+    if str(path).endswith("image_digest"):
         return identity_digest(actual) == identity_digest(expected)
-    if path == "dtype":
+    if str(path) == "dtype":
         return str(actual).lower() == str(expected).lower()
     if isinstance(expected, Mapping) and set(expected) <= {"min", "max"}:
         try:
@@ -239,24 +264,134 @@ def _c7_condition_matches(path, actual, expected):
             return True
         except (TypeError, ValueError):
             return False
+    if (isinstance(actual, (int, float)) and not isinstance(actual, bool)
+            and isinstance(expected, (int, float))
+            and not isinstance(expected, bool)):
+        return math.isclose(float(actual), float(expected),
+                            rel_tol=1e-9, abs_tol=1e-12)
+    if isinstance(actual, Mapping) and isinstance(expected, Mapping):
+        return (actual.keys() == expected.keys()
+                and all(_condition_matches(actual[key], expected[key], path)
+                        for key in expected))
+    if (isinstance(actual, (list, tuple))
+            and isinstance(expected, (list, tuple))):
+        return (len(actual) == len(expected)
+                and all(_condition_matches(a, b, path)
+                        for a, b in zip(actual, expected)))
     return actual == expected
+
+
+def service_conditions_match(service, context):
+    """Check only the conditions the service actually declares.
+
+    Extra keys in a broader physical contract (unrelated rates, modes, owners or
+    environment fields) are not identity.  A declared rate/mode/unit/environment
+    condition must still match, so a real change in the depended-on supply is
+    rejected.  ``conditions`` may use dotted paths such as
+    ``resource_units.mte2_aiv`` or ``rates.hbm``.
+    """
+    if not isinstance(context, Mapping):
+        raise ValueError("service_condition_context_requires_mapping")
+    conditions = getattr(service, "conditions", None)
+    optional = getattr(service, "optional_conditions", None)
+    if isinstance(service, Mapping):
+        if conditions is None and "conditions" in service:
+            conditions = service["conditions"]
+        if optional is None and "optional_conditions" in service:
+            optional = service["optional_conditions"]
+    if conditions is None:
+        if optional is None:
+            raise ValueError("service_condition_service_requires_conditions")
+        conditions = {}
+    if not isinstance(conditions, Mapping):
+        raise ValueError("service_condition_conditions_requires_mapping")
+    checks = []
+    for path, expected in conditions.items():
+        actual = _condition_value(context, path)
+        present = actual is not _CONDITION_MISSING
+        matched = present and _condition_matches(actual, expected, path)
+        checks.append({
+            "path": str(path),
+            "expected": deepcopy(expected),
+            "actual": deepcopy(actual) if present else None,
+            "present": present,
+            "matched": matched,
+            "optional": False,
+        })
+    if optional:
+        if not isinstance(optional, Mapping):
+            raise ValueError("service_optional_conditions_requires_mapping")
+        for path, expected in optional.items():
+            actual = _condition_value(context, path)
+            present = actual is not _CONDITION_MISSING
+            if not present or actual is None:
+                checks.append({
+                    "path": str(path), "expected": deepcopy(expected),
+                    "actual": None, "present": present, "matched": True,
+                    "optional": True,
+                })
+                continue
+            matched = _condition_matches(actual, expected, path)
+            checks.append({
+                "path": str(path), "expected": deepcopy(expected),
+                "actual": deepcopy(actual), "present": True,
+                "matched": matched, "optional": True,
+            })
+    return {
+        "applies": all(check["matched"] for check in checks),
+        "checks": checks,
+        "policy": ("only_declared_condition_paths; unrelated physical "
+                   "contract keys are ignored"),
+    }
+
+
+def _condition_failure_reason(service, result):
+    failed = [check for check in result["checks"] if not check["matched"]]
+    if not failed:
+        return "conditions_matched"
+    parts = []
+    for check in failed:
+        actual = check["actual"] if check["present"] else "<missing>"
+        parts.append(f"{check['path']}={actual!r}!={check['expected']!r}")
+    return _service_id(service) + ":" + ";".join(parts)
+
+
+def select_resource_service_candidate(services, context, *, service_id=None):
+    """Narrow by optional ID, then apply the one condition matcher to all.
+
+    Explicit ID, single candidate and automatic selection all pass through the
+    same condition check.  A missing ID, missing condition, value mismatch or
+    ambiguity raises a specific error; there is no nominal fallback.
+    """
+    if not isinstance(context, Mapping):
+        raise ValueError("resource_service_context_requires_mapping")
+    candidates = list(services or ())
+    if service_id is not None:
+        candidates = [item for item in candidates
+                      if _service_id(item) == service_id]
+        if not candidates:
+            raise ValueError("resource_service_id_not_found:" + str(service_id))
+    checked = []
+    selected = []
+    for service in candidates:
+        result = service_conditions_match(service, context)
+        checked.append((service, result))
+        if result["applies"]:
+            selected.append(service)
+    if len(selected) == 1:
+        return selected[0]
+    if not selected:
+        reasons = ";".join(
+            _condition_failure_reason(service, result)
+            for service, result in checked)
+        raise ValueError("resource_service_conditions_have_no_match:" + reasons)
+    raise ValueError("resource_service_conditions_are_ambiguous:"
+                     + ",".join(sorted(_service_id(item) for item in selected)))
 
 
 def c7_applicability_matches(record: Mapping[str, Any], context: Mapping[str, Any]) -> bool:
     """Apply the same extracted conditions used by normalized selection."""
-    applicability = c7_applicability(record)
-    for path, expected in applicability["conditions"].items():
-        actual = _c7_value(context, path)
-        if actual is _C7_MISSING or not _c7_condition_matches(
-                path, actual, expected):
-            return False
-    for path, expected in applicability["optional_conditions"].items():
-        actual = _c7_value(context, path)
-        if actual is _C7_MISSING or actual is None:
-            continue
-        if not _c7_condition_matches(path, actual, expected):
-            return False
-    return True
+    return bool(service_conditions_match(c7_applicability(record), context)["applies"])
 
 
 def select_resource_service(
@@ -280,53 +415,72 @@ def select_resource_service(
         "geometry": {"q_len": q_len},
         "mix_block_num": mix_block_num,
     }
+    candidates = []
     for record in resource_services or ():
+        if not isinstance(record, Mapping):
+            continue
         if str(record.get("resource")) != "mte1":
             continue
-        if not c7_applicability_matches(record, applicability_context):
+        if record.get("rate_bytes_per_s") is None:
             continue
-        try:
-            geometry = sparse_mte1_bytes(
-                q_len, int(context), int(kv_len), causal=bool(causal), owners=owners,
-                g=int((record.get("geometry_binding") or {}).get("g", _SPARSE_GROUP_SIZE)),
-                dq=int((record.get("geometry_binding") or {}).get("dq", _SPARSE_QUERY_WIDTH)),
-                dv=int((record.get("geometry_binding") or {}).get("dv", _SPARSE_VALUE_WIDTH)),
-                s2_tile=int((record.get("geometry_binding") or {}).get("s2_tile", _SPARSE_KV_TILE_ROWS)),
-            )
-            rate = float(record["rate_bytes_per_s"])
-        except (KeyError, TypeError, ValueError):
+        applicability = c7_applicability(record)
+        candidates.append({
+            "service_id": _profiler_service_id(record, "mte1"),
+            "conditions": applicability["conditions"],
+            "optional_conditions": applicability["optional_conditions"],
+            "record": record,
+        })
+    if not candidates:
+        return None
+    try:
+        selected = select_resource_service_candidate(
+            candidates, applicability_context)
+    except ValueError as exc:
+        if str(exc).startswith("resource_service_conditions_have_no_match:"):
             return None
-        if rate <= 0:
-            return None
-        critical = int(geometry["critical_qk_pv_bytes"])
-        return {
-            "schema_version": str(record.get("schema_version") or ""),
-            "resource": "mte1",
-            "native_type": native_type,
-            "source_identity": dict(source_identity),
-            "hardware": str(hardware),
-            "dtype": str(dtype),
-            "layout": str(record.get("layout") or ""),
-            "phase": str(phase),
-            "op_state": str(op_state),
-            "shape_class": str(record.get("shape_class") or ""),
-            "owners": owners,
-            "q_tokens": q_len,
-            "context": int(context),
-            "kv_len": int(kv_len),
-            "causal": bool(causal),
-            "measured_q_tokens": int(record.get("measured_q_tokens") or 0),
-            "mix_block_num": record.get("mix_block_num"),
-            "measured_critical_bytes": int(record.get("measured_critical_bytes") or 0),
-            "query_critical_bytes": critical,
-            "query_total_bytes": int(geometry["total_qk_pv_bytes"]),
-            "rate_bytes_per_s": rate,
-            "time_us": critical / rate * 1e6,
-            "event_count": int(record.get("event_count") or 0),
-            "median_mte1_us": float(record.get("median_mte1_us") or 0.0),
-            "geometry_binding": dict(record.get("geometry_binding") or {}),
-        }
-    return None
+        raise
+    record = selected["record"]
+    try:
+        geometry = sparse_mte1_bytes(
+            q_len, int(context), int(kv_len), causal=bool(causal), owners=owners,
+            g=int((record.get("geometry_binding") or {}).get("g", _SPARSE_GROUP_SIZE)),
+            dq=int((record.get("geometry_binding") or {}).get("dq", _SPARSE_QUERY_WIDTH)),
+            dv=int((record.get("geometry_binding") or {}).get("dv", _SPARSE_VALUE_WIDTH)),
+            s2_tile=int((record.get("geometry_binding") or {}).get("s2_tile", _SPARSE_KV_TILE_ROWS)),
+        )
+        rate = float(record["rate_bytes_per_s"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if rate <= 0:
+        return None
+    critical = int(geometry["critical_qk_pv_bytes"])
+    return {
+        "schema_version": str(record.get("schema_version") or ""),
+        "resource": "mte1",
+        "native_type": native_type,
+        "source_identity": dict(source_identity or {}),
+        "hardware": str(hardware),
+        "dtype": str(dtype),
+        "layout": str(record.get("layout") or ""),
+        "phase": str(phase),
+        "op_state": str(op_state),
+        "shape_class": str(record.get("shape_class") or ""),
+        "owners": owners,
+        "q_tokens": q_len,
+        "context": int(context),
+        "kv_len": int(kv_len),
+        "causal": bool(causal),
+        "measured_q_tokens": int(record.get("measured_q_tokens") or 0),
+        "mix_block_num": record.get("mix_block_num"),
+        "measured_critical_bytes": int(record.get("measured_critical_bytes") or 0),
+        "query_critical_bytes": critical,
+        "query_total_bytes": int(geometry["total_qk_pv_bytes"]),
+        "rate_bytes_per_s": rate,
+        "time_us": critical / rate * 1e6,
+        "event_count": int(record.get("event_count") or 0),
+        "median_mte1_us": float(record.get("median_mte1_us") or 0.0),
+        "geometry_binding": dict(record.get("geometry_binding") or {}),
+    }
 
 
 from copy import deepcopy
@@ -1008,5 +1162,7 @@ __all__ = [
     "normalize_resource_service",
     "resolve_nominal_rate",
     "select_resource_service",
+    "select_resource_service_candidate",
+    "service_conditions_match",
     "sparse_mte1_bytes",
 ]

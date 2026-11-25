@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 
 
 
@@ -21,8 +22,9 @@ _ROLE_ALIASES = {
 }
 _ROLE_SCOPES = frozenset({"independent_resource", "joint_phase"})
 _PHASE_WINDOWS = frozenset({"resource_phase", "resource", "phase"})
-_JOINT_ROLE_WINDOWS = frozenset({"joint", "mixed", "overlapping", "joint_phase"})
-_FORBIDDEN_ROLE_WINDOWS = frozenset({
+_WINDOW_PROVENANCE_KEYS = ("window", "observation_kind", "boundary_kind", "scope")
+_JOINT_WINDOWS = frozenset({"joint", "mixed", "overlapping", "joint_phase"})
+_FORBIDDEN_WINDOWS = frozenset({
     "step", "body", "request", "serving", "e2e", "engine_step", "body_step",
     "whole_step", "whole_body",
 })
@@ -31,6 +33,19 @@ _ROLE_NEEDED_EVIDENCE = (
     "resource_duration_us", "owner_units", "boundary",
 )
 _ROLE_SERVICE_BOUNDARIES = frozenset({"resource_phase", "device_kernel"})
+
+
+def _declared_window_tags(provenance, top_window=None):
+    tags = []
+    if top_window is not None:
+        declared = str(top_window).strip().lower()
+        if declared:
+            tags.append(("window", declared))
+    for key in _WINDOW_PROVENANCE_KEYS:
+        declared = str(provenance.get(key, "")).strip().lower()
+        if declared:
+            tags.append((key, declared))
+    return tags
 
 
 _HASH_CHUNK_BYTES = 1024 * 1024
@@ -94,9 +109,23 @@ def calibration_role_partitions(records):
     }
 
 
+def _normalize_numeric(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if math.isfinite(value) and value.is_integer() else value
+    if isinstance(value, Mapping):
+        return {key: _normalize_numeric(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_numeric(item) for item in value]
+    return value
+
+
 def _canonical(value):
     import json
-    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+    return json.dumps(_normalize_numeric(value), sort_keys=True, separators=(",", ":"),
                       allow_nan=False)
 
 
@@ -220,7 +249,8 @@ def _role_contract(record, *, resource, phase, work_unit, boundary,
               or record.get("window"))
     if window is not None:
         window = str(window).strip().lower()
-    if window in _FORBIDDEN_ROLE_WINDOWS:
+    window_tags = _declared_window_tags(provenance, record.get("window"))
+    if any(declared in _FORBIDDEN_WINDOWS for _, declared in window_tags):
         return {**base, "state": "gap", "reason":
                 "whole_step_or_body_window_is_not_a_service_phase",
                 "missing": ["resource_phase_window"]}
@@ -242,7 +272,8 @@ def _role_contract(record, *, resource, phase, work_unit, boundary,
     else:
         duration_selector = None
         missing.append("resource_duration_us")
-    if scope_decl == "independent_resource" and window in _JOINT_ROLE_WINDOWS:
+    if (scope_decl == "independent_resource"
+            and any(declared in _JOINT_WINDOWS for _, declared in window_tags)):
         return {**base, "state": "gap",
                 "reason": "mixed_window_declared_as_independent_resource",
                 "missing": ["independent_resource_window"]}
@@ -484,29 +515,33 @@ def _resolve_homogeneous_role_fit(candidates, *, scope, supply, startup_us):
         raise ValueError(
             "resource_service_role_record_contract_not_homogeneous:window")
     common_window = next(iter(windows))
-    if scope == "independent_resource" and common_window in _JOINT_ROLE_WINDOWS:
+    if scope == "independent_resource" and common_window in _JOINT_WINDOWS:
         raise ValueError(
             "resource_service_role_record_contract_not_homogeneous:window")
-    declared_supplies = {_canonical(item["supply"])
-                         for item in candidates
-                         if item.get("supply") is not None}
-    if supply is not None and declared_supplies and \
-            _canonical(supply) not in declared_supplies:
+    declared_supplies = [
+        item["supply"] for item in candidates
+        if item.get("supply") is not None
+    ]
+    canonical_supplies = {_canonical(item) for item in declared_supplies}
+    if supply is not None and canonical_supplies and \
+            _canonical(supply) not in canonical_supplies:
         raise ValueError("resource_service_role_record_supply_conflict")
-    if len(declared_supplies) > 1:
+    if len(canonical_supplies) > 1:
         raise ValueError("resource_service_role_record_supply_conflict")
     if supply is None and declared_supplies:
-        supply = candidates[0]["supply"]
-    declared_startups = {_canonical(item["startup_us"])
-                         for item in candidates
-                         if item.get("startup_us") is not None}
-    if startup_us is not None and declared_startups and \
-            _canonical(startup_us) not in declared_startups:
+        supply = declared_supplies[0]
+    declared_startups = [
+        item["startup_us"] for item in candidates
+        if item.get("startup_us") is not None
+    ]
+    canonical_startups = {_canonical(item) for item in declared_startups}
+    if startup_us is not None and canonical_startups and \
+            _canonical(startup_us) not in canonical_startups:
         raise ValueError("resource_service_role_record_startup_conflict")
-    if len(declared_startups) > 1:
+    if len(canonical_startups) > 1:
         raise ValueError("resource_service_role_record_startup_conflict")
     if startup_us is None and declared_startups:
-        startup_us = candidates[0]["startup_us"]
+        startup_us = declared_startups[0]
     return common_window, supply, startup_us
 
 
@@ -554,6 +589,7 @@ def _role_fit_packet(
         packet["supply"] = dict(supply)
     if startup_us is not None:
         packet["startup_us"] = startup_us
+    if response_us is not None:
         packet["response_us"] = response_us
     if scope == "joint_phase":
         packet["identification"] = {"resource_identified": False,
@@ -716,19 +752,10 @@ from mindie_sim.observations.resource_services import (
 from mindie_sim.prediction.service_regime_domains.services import ServiceCurve
 
 
-_FORBIDDEN_SERVICE_BOUNDARIES = frozenset({
-    "step", "body", "request", "serving", "e2e", "engine_step", "body_step",
-    "whole_step", "whole_body",
-})
 _TARGET_KEYS = frozenset({
     "target_ms", "target_us", "target_duration_ms", "target_duration_us",
     "body_residual_ms", "step_residual_ms", "residual_ms",
 })
-_FORBIDDEN_WINDOWS = frozenset({
-    "step", "body", "serving", "e2e", "engine_step", "body_step",
-    "whole_step", "whole_body", "request",
-})
-_JOINT_ONLY_WINDOWS = frozenset({"joint", "mixed", "overlapping"})
 _FIXED_TERM_TOLERANCE_US = 1e-9
 
 
@@ -958,10 +985,7 @@ def _resource_fit_contract(packet, hardware):
     if not work_unit:
         raise ValueError("resource_service_fit_requires_work_unit")
     boundary = str(packet.get("boundary") or "").strip()
-    if boundary in _FORBIDDEN_SERVICE_BOUNDARIES:
-        raise ValueError(
-            "resource_service_fit_boundary_must_be_resource_phase_or_device_kernel")
-    if boundary not in {"resource_phase", "device_kernel"}:
+    if boundary in _FORBIDDEN_WINDOWS or boundary not in _ROLE_SERVICE_BOUNDARIES:
         raise ValueError(
             "resource_service_fit_boundary_must_be_resource_phase_or_device_kernel")
 
@@ -969,12 +993,11 @@ def _resource_fit_contract(packet, hardware):
     if not isinstance(provenance, Mapping):
         raise ValueError("resource_service_fit_provenance_requires_mapping")
     provenance = dict(provenance)
-    for key in ("window", "observation_kind", "boundary_kind", "scope"):
-        declared = str(provenance.get(key, "")).strip().lower()
+    for key, declared in _declared_window_tags(provenance, packet.get("window")):
         if declared in _FORBIDDEN_WINDOWS:
             raise ValueError(
                 "resource_service_fit_rejects_step_or_body_window:" + key)
-        if scope == "independent_resource" and declared in _JOINT_ONLY_WINDOWS:
+        if scope == "independent_resource" and declared in _JOINT_WINDOWS:
             raise ValueError(
                 "resource_service_mixed_window_cannot_identify_independent_resource:"
                 + key)
