@@ -111,12 +111,15 @@ def _declare_ordinary_qk_norm_rope(ops, qkv, norm_ids, rope, views, dtype):
     )
 
 
-def _qkv_views(tokens, heads, kv_heads, width, has_gate, k_eq_v=False):
+def _qkv_views(tokens, heads, kv_heads, width, has_gate, k_eq_v=False, *, v_width: int | None = None):
     """Q and gate alternate by head; all slices retain the projected row pitch."""
-    query, kv = heads * width, kv_heads * width
+    eff_v_width = width if v_width is None else int(v_width)
+    query, key = heads * width, kv_heads * width
+    value = kv_heads * eff_v_width
     gate = query if has_gate else 0
-    pitch = query + gate + (1 if k_eq_v else 2) * kv
+    pitch = query + gate + key + (0 if k_eq_v else value)
     storage = (tokens, pitch)
+    val_dim = width if k_eq_v else eff_v_width
     views = {
         "query": TensorLayout(
             (tokens, heads, width), (pitch, width * (2 if has_gate else 1), 1),
@@ -125,8 +128,8 @@ def _qkv_views(tokens, heads, kv_heads, width, has_gate, k_eq_v=False):
             (tokens, kv_heads, width), (pitch, width, 1),
             offset=query + gate, storage_shape=storage),
         "value": TensorLayout(
-            (tokens, kv_heads, width), (pitch, width, 1),
-            offset=query + gate if k_eq_v else query + gate + kv, storage_shape=storage),
+            (tokens, kv_heads, val_dim), (pitch, val_dim, 1),
+            offset=query + gate if k_eq_v else query + gate + key, storage_shape=storage),
     }
     if has_gate:
         views["gate"] = TensorLayout(
@@ -202,6 +205,31 @@ class AttentionPolicy:
             raise ModelingError("attention_kv_storage_requires_auto_or_paged")
 
 
+def _format_dict(fmt) -> dict[str, object]:
+    """Serialize one resolved ``CacheFormat`` for layer-exact downstream ``kv_access``."""
+    return {
+        "dtype": fmt.dtype,
+        "group_size": fmt.group_size,
+        "scale_dtype": fmt.scale_dtype,
+        "suffix_elements": fmt.suffix_elements,
+        "suffix_dtype": fmt.suffix_dtype,
+        "packed_elements": fmt.packed_elements,
+    }
+
+
+def _resolved_cache_regions(key_fmt, value_fmt, shared: bool, regions) -> dict[str, object]:
+    """Emit layer/phase-resolved cache representations without losing scoped overrides."""
+    has_nondefault = any(
+        fmt.group_size or fmt.suffix_elements or fmt.packed_elements > 1
+        for fmt in (key_fmt, value_fmt)
+    )
+    if not regions and not has_nondefault and key_fmt == value_fmt:
+        return {}
+    if shared:
+        return {"gqa_kv": _format_dict(key_fmt)}
+    return {"gqa_kv_key": _format_dict(key_fmt), "gqa_kv_value": _format_dict(value_fmt)}
+
+
 def _gqa_formats(model, *, plan=None, phase=None):
     """Resolve shared or independent K/V cache formats once."""
     regions = dict(getattr(model, "metadata", ())).get("cache_representations", {})
@@ -209,18 +237,28 @@ def _gqa_formats(model, *, plan=None, phase=None):
     return key_fmt, value_fmt, regions, shared
 
 
-def _contiguous_tensor_view(views, heads, kv_heads, width, model, quant, parallel, *, cacheless=False):
+def _contiguous_tensor_view(
+    views, heads, kv_heads, width, model, quant, parallel, *,
+    cacheless=False, v_width: int | None = None,
+):
     """Fresh prefill has explicit TND operands, before any paged-cache reuse."""
     if parallel.cp != 1 or parallel.pcp != 1 or any(
-        (not cacheless and view.phase != "prefill") or view.context for view in views
+        (not cacheless and view.phase != "prefill") or view.context
+        for view in views if int(view.logical_q_len) > 0
     ):
         return ()
-    query = (sum(view.q_len for view in views), heads, width)
-    kv = (sum(view.kv_len for view in views), kv_heads, width)
+    eff_v_width = width if v_width is None else int(v_width)
+    q_total = sum(int(view.logical_q_len) for view in views)
+    kv_total = sum(int(view.kv_len) for view in views if int(view.logical_q_len) > 0)
+    query = (q_total, heads, width)
+    output = (q_total, heads, eff_v_width)
+    key = (kv_total, kv_heads, width)
+    value = (kv_total, kv_heads, eff_v_width)
     return (("attention_tensor_view", {
-        "query_shape": query, "key_shape": kv, "value_shape": kv, "output_shape": query,
+        "query_shape": query, "key_shape": key, "value_shape": value, "output_shape": output,
         "query_dtype": model.activation_dtype, "key_dtype": quant.kv_dtype,
         "value_dtype": quant.kv_dtype, "output_dtype": model.activation_dtype,
+        "head_dim": width, "v_head_dim": eff_v_width,
         "logical_layout": "TND", "kv_storage": "contiguous",
     }),)
 
@@ -230,71 +268,90 @@ def _attention_tensor_view(
     causal=True, cacheless=False, *, plan=None, phase=None,
 ):
     """A paged ABI requires an explicit storage declaration, not a query length."""
+    v_width = int(getattr(plan, "v_head_dim", 0) or width)
     if cacheless or policy.kv_storage != "paged":
         return _contiguous_tensor_view(
-            views, heads, kv_heads, width, model, quant, parallel, cacheless=cacheless)
+            views, heads, kv_heads, width, model, quant, parallel,
+            cacheless=cacheless, v_width=v_width)
     if runtime is None or parallel.cp != 1 or parallel.pcp != 1:
         return ()
-    query = (sum(view.q_len for view in views), heads, width)
-    tail = (runtime.kv_block_size, kv_heads * width)
+    active_views = tuple(view for view in views if int(view.logical_q_len) > 0)
+    q_total = sum(int(view.logical_q_len) for view in active_views)
+    query = (q_total, heads, width)
+    output = (q_total, heads, v_width)
+    key_tail = (runtime.kv_block_size, kv_heads * width)
+    value_tail = (runtime.kv_block_size, kv_heads * v_width)
     eff_phase = phase or (getattr(views[0], "phase", None) if views else None)
     key_fmt, value_fmt, regions, _shared = _gqa_formats(model, plan=plan, phase=eff_phase)
+    window = int(getattr(plan, "window", 0) or 0)
     native = None
     page_size = int(getattr(runtime, "kv_block_size", 0) or 0)
-    if page_size > 0 and all(view.q_len > 0 for view in views):
+    if page_size > 0 and active_views:
         native = paged_fia_plan(
-            requests=tuple((view.q_len, view.context + view.q_len) for view in views),
-            query_lengths=tuple(view.q_len for view in views),
-            kv_lengths=tuple(view.context + view.q_len for view in views),
+            requests=tuple((int(view.logical_q_len), int(view.context) + int(view.logical_q_len))
+                           for view in active_views),
+            query_lengths=tuple(int(view.logical_q_len) for view in active_views),
+            kv_lengths=tuple(int(view.context) + int(view.logical_q_len) for view in active_views),
             page_size=page_size, query_heads=heads, kv_heads=kv_heads, head_dim=width,
+            v_head_dim=v_width, window=window, shared_format=_shared,
             query_dtype=model.activation_dtype, output_dtype=model.activation_dtype,
             key_format=key_fmt, value_format=value_fmt,
-            phase=getattr(views[0], "phase", "decode"),
+            phase=getattr(active_views[0], "phase", "decode"),
             mask="causal" if causal else "none", return_lse=False, output_prepare=None,
         )
     residency = str(dict(getattr(model, "metadata", ())).get("cache_source_residency", "unresolved"))
+    resolved_regions = _resolved_cache_regions(key_fmt, value_fmt, _shared, regions)
     return (("attention_tensor_view", {
         "kind": "paged_gqa", "logical_layout": "TND", "kv_storage": "paged",
-        "query_shape": query, "output_shape": query,
-        "key_tail_shape": tail, "value_tail_shape": tail,
+        "query_shape": query, "output_shape": output,
+        "key_tail_shape": key_tail, "value_tail_shape": value_tail,
         "query_dtype": model.activation_dtype, "output_dtype": model.activation_dtype,
         "key_dtype": key_fmt.dtype, "value_dtype": value_fmt.dtype,
-        "batch_count": len(views), "kv_block_size": runtime.kv_block_size,
-        "local_kv_heads": kv_heads, "head_dim": width,
-        "cache_row_width": 2 * kv_heads * width, "cache_head_width": width,
+        "batch_count": len(active_views) or len(views), "kv_block_size": runtime.kv_block_size,
+        "local_kv_heads": kv_heads, "head_dim": width, "v_head_dim": v_width,
+        "cache_row_width": kv_heads * (width + v_width), "cache_head_width": width,
         "cache_source_residency": residency,
-        **({"cache_representations": regions} if regions else {}),
+        **({"cache_representations": resolved_regions} if resolved_regions else {}),
         **({"native_paged_fia": native} if native is not None else {}),
     }),)
 
 
 def _cache_tensor_view(
     views, kv_heads, width, key_fmt, value_fmt, shared, model, parallel,
-    *, v_head_width: int | None = None,
+    *, v_head_width: int | None = None, region: str = "gqa_kv",
 ):
     """Declare newly written tokens without inventing cache allocation or slots."""
     del model
     if parallel.cp != 1 or parallel.pcp != 1:
         return ()
-    tokens = sum(view.q_len for view in views)
+    tokens = sum(int(view.logical_q_len) for view in views)
     v_width = width if v_head_width is None else int(v_head_width)
     total = (
         key_fmt.row_bytes(kv_heads * (width + v_width)) if shared
         else key_fmt.row_bytes(kv_heads * width) + value_fmt.row_bytes(kv_heads * v_width)
     )
+    plane_extra: dict[str, object] = {}
+    if not shared and region == "gqa_kv_key":
+        plane_extra = {"plane": "key", "plane_row_bytes": key_fmt.row_bytes(kv_heads * width)}
+    elif not shared and region == "gqa_kv_value":
+        plane_extra = {"plane": "value", "plane_row_bytes": value_fmt.row_bytes(kv_heads * v_width)}
     return (("cache_tensor_view", {
         "key_shape": (tokens, kv_heads, width), "value_shape": (tokens, kv_heads, v_width),
         "key_dtype": key_fmt.dtype, "value_dtype": value_fmt.dtype,
         "slot_shape": (tokens,), "cache_row_bytes": total,
         "cache_group_size": key_fmt.group_size if shared else 0,
         "cache_scale_dtype": key_fmt.scale_dtype if shared else "mixed",
+        **plane_extra,
     }),)
 
 
 def _decode_contract(views, heads, kv_heads, width, model, quant, parallel, plan, mode, *, window=None, cp=None):
     if plan.cache_kind == "none" or mode not in {"decode", "draft"}:
         return ()
-    requests = tuple((view.q_len, view.context) for view in views)
+    requests = tuple(
+        (int(view.logical_q_len), int(view.context) if int(view.logical_q_len) > 0 else 0)
+        for view in views
+    )
     queries = {query for query, _ in requests}
     contexts = {context for _, context in requests}
     eff_win = int(plan.window or 0) if window is None else int(window)
@@ -318,7 +375,10 @@ def _prefill_contract(views, heads, kv_heads, width, model, quant, parallel, pla
     eff_cp = int(parallel.cp) if cp is None else int(cp)
     v_width = int(getattr(plan, "v_head_dim", 0) or width)
     return (("gqa_prefill", {
-        "requests": tuple((view.q_len, view.context) for view in views),
+        "requests": tuple(
+            (int(view.logical_q_len), int(view.context) if int(view.logical_q_len) > 0 else 0)
+            for view in views
+        ),
         "query_heads": heads, "kv_heads": kv_heads, "head_dim": width, "v_head_dim": v_width,
         "query_dtype": model.activation_dtype, "kv_dtype": quant.kv_dtype,
         "causal": not plan.noncausal_attention, "window": eff_win, "cp": eff_cp,
@@ -719,7 +779,7 @@ def _store_cache(
     store_id = representation_store(producer, name, deps, rows, width, region)
     view = _cache_tensor_view(
         views, kv_heads, head_width, key_fmt, value_fmt, shared_format, model, parallel,
-        v_head_width=v_head_width,
+        v_head_width=v_head_width, region=region,
     )
     if ops:
         op = ops[-1]

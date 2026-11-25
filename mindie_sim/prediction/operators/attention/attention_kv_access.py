@@ -122,9 +122,39 @@ def _side(fmt: CacheFormat, width: int, query_dtype: str) -> dict:
             "operand": int(operand), "quantized": quantized}
 
 
+def _shared_scale_split(
+    fmt: CacheFormat,
+    *,
+    total_quantized: int,
+    head_quantized: int,
+    key_quantized: int,
+    kv_heads: int,
+) -> tuple[int, int]:
+    """Derive combined ``gqa_kv`` row scale bytes once in whole addressable units."""
+    if not fmt.group_size or total_quantized <= 0:
+        return 0, 0
+    scale_unit = int(dtype_bytes(fmt.scale_dtype))
+    total_scale = int(ceil(total_quantized / fmt.group_size) * scale_unit)
+    if total_scale % (kv_heads * scale_unit) == 0:
+        per_head_scale = total_scale // kv_heads
+    else:
+        per_head_scale = (
+            int(ceil(head_quantized / fmt.group_size) * scale_unit)
+            if head_quantized > 0 else 0
+        )
+    raw_key_scale = (
+        int(ceil(key_quantized / fmt.group_size) * scale_unit)
+        if key_quantized > 0 else 0
+    )
+    key_scale = min(per_head_scale, raw_key_scale)
+    value_scale = per_head_scale - key_scale
+    return key_scale, value_scale
+
+
 def _shared_suffix_side(shared: Mapping, *, row_width: int, kv_heads: int,
-                        head_dim: int, query_dtype: str):
-    """Split one ``gqa_kv`` row with a suffix once, not once per side."""
+                        head_dim: int, v_head_dim: int | None = None,
+                        query_dtype: str = "bf16"):
+    """Split one ``gqa_kv`` row with a suffix once, intersecting suffix per plane."""
     fmt = CacheFormat(**shared)
     if fmt.suffix_elements <= 0:
         return None
@@ -133,24 +163,34 @@ def _shared_suffix_side(shared: Mapping, *, row_width: int, kv_heads: int,
         # without a declared head layout.  Keep this a concrete gap.
         raise ModelingError(
             "attention_kv_shared_row_suffix_requires_single_kv_head")
+    v_dim = head_dim if v_head_dim is None else v_head_dim
     total_quantized = row_width - fmt.suffix_elements
+    if total_quantized < 0:
+        raise ModelingError("attention_kv_suffix_exceeds_row_width")
     key_width = kv_heads * head_dim
-    value_width = kv_heads * head_dim
+    value_width = kv_heads * v_dim
     key_quantized = min(key_width, total_quantized)
-    value_quantized = total_quantized - key_quantized
-    suffix = row_width - total_quantized
+    key_suffix = key_width - key_quantized
+    value_quantized = max(0, total_quantized - key_width)
+    value_suffix = value_width - value_quantized
     payload_fmt = replace(fmt, group_size=0, scale_dtype="none",
                           suffix_elements=0)
-    key_payload = int(payload_fmt.row_bytes(key_quantized))
-    value_payload = int(payload_fmt.row_bytes(value_quantized)
-                        + suffix * dtype_bytes(fmt.suffix_dtype))
-    key_scale = (int(ceil(key_quantized / fmt.group_size)
-                     * dtype_bytes(fmt.scale_dtype)) if fmt.group_size else 0)
-    value_scale = (int(ceil(value_quantized / fmt.group_size)
-                       * dtype_bytes(fmt.scale_dtype)) if fmt.group_size else 0)
-    key_needs = key_quantized > 0 and fmt.dtype != query_dtype
-    value_needs = ((value_quantized > 0 and fmt.dtype != query_dtype)
-                   or fmt.suffix_dtype != query_dtype)
+    suffix_bytes = dtype_bytes(fmt.suffix_dtype)
+    key_payload = int(payload_fmt.row_bytes(key_quantized) + key_suffix * suffix_bytes)
+    value_payload = int(payload_fmt.row_bytes(value_quantized) + value_suffix * suffix_bytes)
+    key_scale, value_scale = _shared_scale_split(
+        fmt, total_quantized=total_quantized,
+        head_quantized=total_quantized,
+        key_quantized=key_quantized, kv_heads=kv_heads,
+    )
+    key_needs = (
+        (key_quantized > 0 and fmt.dtype != query_dtype)
+        or (key_suffix > 0 and fmt.suffix_dtype != query_dtype)
+    )
+    value_needs = (
+        (value_quantized > 0 and fmt.dtype != query_dtype)
+        or (value_suffix > 0 and fmt.suffix_dtype != query_dtype)
+    )
     key_operand = (key_width * dtype_bytes(query_dtype)
                    if key_needs else key_payload)
     value_operand = (value_width * dtype_bytes(query_dtype)
@@ -158,10 +198,10 @@ def _shared_suffix_side(shared: Mapping, *, row_width: int, kv_heads: int,
     return {
         "key": {"payload": key_payload, "scale": key_scale,
                 "needs": key_needs, "operand": int(key_operand),
-                "quantized": key_quantized, "suffix": 0},
+                "quantized": key_quantized, "suffix": key_suffix},
         "value": {"payload": value_payload, "scale": value_scale,
                   "needs": value_needs, "operand": int(value_operand),
-                  "quantized": value_quantized, "suffix": suffix},
+                  "quantized": value_quantized, "suffix": value_suffix},
         "format": fmt,
     }
 
@@ -189,6 +229,7 @@ class KVCacheAccess:
     value_needs_conversion: bool = False
     query_dtype: str = ""
     head_dim: int = 0
+    v_head_dim: int = 0
     key_suffix: int = 0
     value_suffix: int = 0
     key_quantized_width: int = 0
@@ -216,8 +257,13 @@ class KVCacheAccess:
         return rows * (self.key_scale_row + self.value_scale_row)
 
     def key_conversion_elements(self, rows: int) -> int:
+        if not self.key_needs_conversion:
+            return 0
         return rows * (self.key_quantized_width
-                       if self.key_needs_conversion else 0)
+                       + (self.key_suffix
+                          if self.key_format is not None
+                          and self.key_format.suffix_dtype != self.query_dtype
+                          else 0))
 
     def value_conversion_elements(self, rows: int) -> int:
         if not self.value_needs_conversion:
@@ -307,39 +353,47 @@ def _page_scale(view: Mapping, key: CacheFormat, value: CacheFormat) -> int:
     return int(2 * dtype_bytes(_dtype(scale_dtype, "scale_dtype")))
 
 
-def kv_access(op, *, query_dtype: str, kv_dtype: str, head_dim: int) -> KVCacheAccess:
+def kv_access(
+    op, *, query_dtype: str, kv_dtype: str, head_dim: int,
+    v_head_dim: int | None = None,
+) -> KVCacheAccess:
     """Resolve one attention operator's declared K/V storage access."""
     raw = dict(getattr(op, "metadata", ())).get("attention_tensor_view")
     if raw is None:
+        v_dim = head_dim if v_head_dim is None else _positive_int(v_head_dim, "v_head_dim")
         key_fmt = CacheFormat(kv_dtype)
         value_fmt = CacheFormat(kv_dtype)
         key = _side(key_fmt, head_dim, query_dtype)
-        value = _side(value_fmt, head_dim, query_dtype)
+        value = _side(value_fmt, v_dim, query_dtype)
         needs = key["needs"] or value["needs"]
         return KVCacheAccess(
             declared=False, key_format=key_fmt, value_format=value_fmt,
             key_payload_row=key["payload"], value_payload_row=value["payload"],
             key_operand_row=key["operand"], value_operand_row=value["operand"],
-            key_scale_row=key["scale"], value_scale_row=value["scale"],
+            key_scale_row=int(key["scale"]), value_scale_row=int(value["scale"]),
             dequant_ops_per_element=_dequant_ops({}, needs),
             key_needs_conversion=key["needs"],
             value_needs_conversion=value["needs"],
-            query_dtype=query_dtype, head_dim=head_dim,
+            query_dtype=query_dtype, head_dim=head_dim, v_head_dim=v_dim,
             key_suffix=key_fmt.suffix_elements,
             value_suffix=value_fmt.suffix_elements,
             key_quantized_width=key["quantized"],
             value_quantized_width=value["quantized"],
-            row_width=2 * head_dim,
+            row_width=head_dim + v_dim,
             source_residency="unresolved",
         )
     if not isinstance(raw, Mapping):
         raise ModelingError("attention_kv_tensor_view_must_be_mapping")
+    v_dim = _positive_int(
+        v_head_dim if v_head_dim is not None else raw.get("v_head_dim", head_dim),
+        "v_head_dim",
+    )
     storage = raw.get("kv_storage")
     if storage not in {"paged", "contiguous"}:
         raise ModelingError("attention_kv_storage_requires_paged_or_contiguous")
     kv_heads = _positive_int(raw.get("local_kv_heads", 1), "local_kv_heads")
     row_width = _positive_int(
-        raw.get("cache_row_width", 2 * kv_heads * head_dim), "cache_row_width")
+        raw.get("cache_row_width", kv_heads * (head_dim + v_dim)), "cache_row_width")
     key_dtype = _dtype(raw.get("key_dtype", kv_dtype), "key_dtype")
     value_dtype = _dtype(raw.get("value_dtype", kv_dtype), "value_dtype")
     shared_raw, key_raw, value_raw = _regions(raw)
@@ -347,7 +401,7 @@ def kv_access(op, *, query_dtype: str, kv_dtype: str, head_dim: int) -> KVCacheA
         key_fmt = _legacy_format(raw, key_dtype)
         value_fmt = _legacy_format(raw, value_dtype)
         key = _side(key_fmt, head_dim, query_dtype)
-        value = _side(value_fmt, head_dim, query_dtype)
+        value = _side(value_fmt, v_dim, query_dtype)
         shared = False
     elif shared_raw is not None and key_raw is shared_raw and value_raw is shared_raw:
         shared_fmt = _format_from_declaration(shared_raw, key_dtype)
@@ -356,23 +410,30 @@ def kv_access(op, *, query_dtype: str, kv_dtype: str, head_dim: int) -> KVCacheA
                 "attention_kv_shared_row_requires_one_storage_dtype")
         split = _shared_suffix_side(
             shared_raw, row_width=row_width, kv_heads=kv_heads,
-            head_dim=head_dim, query_dtype=query_dtype)
+            head_dim=head_dim, v_head_dim=v_dim, query_dtype=query_dtype)
         if split is not None:
             key, value = split["key"], split["value"]
             key_fmt = value_fmt = split["format"]
-            shared = True
         else:
             key_fmt = value_fmt = shared_fmt
             key = _side(key_fmt, head_dim, query_dtype)
-            value = _side(value_fmt, head_dim, query_dtype)
-            shared = False
+            value = _side(value_fmt, v_dim, query_dtype)
+            if shared_fmt.group_size:
+                k_scale, v_scale = _shared_scale_split(
+                    shared_fmt, total_quantized=row_width,
+                    head_quantized=head_dim + v_dim,
+                    key_quantized=head_dim, kv_heads=kv_heads,
+                )
+                key = {**key, "scale": k_scale}
+                value = {**value, "scale": v_scale}
+        shared = True
     else:
         if key_raw is None or value_raw is None:
             raise ModelingError("attention_kv_independent_formats_require_both_sides")
         key_fmt = _format_from_declaration(key_raw, key_dtype)
         value_fmt = _format_from_declaration(value_raw, value_dtype)
         key = _side(key_fmt, head_dim, query_dtype)
-        value = _side(value_fmt, head_dim, query_dtype)
+        value = _side(value_fmt, v_dim, query_dtype)
         shared = False
     if not raw.get("cache_representations") and (
             key_dtype != kv_dtype or value_dtype != kv_dtype):
@@ -411,7 +472,7 @@ def kv_access(op, *, query_dtype: str, kv_dtype: str, head_dim: int) -> KVCacheA
         dequant_ops_per_element=dequant,
         key_needs_conversion=key["needs"],
         value_needs_conversion=value["needs"],
-        query_dtype=query_dtype, head_dim=head_dim,
+        query_dtype=query_dtype, head_dim=head_dim, v_head_dim=v_dim,
         key_suffix=key.get("suffix", key_fmt.suffix_elements),
         value_suffix=value.get("suffix", value_fmt.suffix_elements),
         key_quantized_width=key["quantized"],
@@ -428,24 +489,109 @@ PAGED_FIA_PLAN_SCHEMA = "mindie-sim/paged-fia-native-plan/1"
 PAGED_FIA_ENTRY = "torch_npu.npu_fused_infer_attention_score"
 
 
+def noncausal_window_pairs_and_span(
+    q: int, context: int, kv: int, window: int,
+) -> tuple[int, int, int]:
+    """O(1) symmetric band ``(W-1, W-1)`` pairs and union ``[lo, hi)`` for noncausal SWA.
+
+    Mirrors ``vllm_ascend/attention/attention_v1.py:679-686`` where each query at
+    position ``p`` attends to ``[max(0, p - (W - 1)), min(kv, p + W))``.
+    """
+    if q <= 0 or kv <= 0:
+        return 0, 0, 0
+    if window <= 0:
+        return q * kv, 0, kv
+    radius = window - 1
+    p0 = max(0, int(context))
+    p1 = p0 + q - 1
+    u_lo = max(0, p0 - radius)
+    u_hi = min(kv, p1 + radius + 1)
+    if u_hi <= u_lo:
+        return 0, 0, 0
+    # sum_{p=p0}^{p1} min(kv, p + radius + 1) - sum_{p=p0}^{p1} max(0, p - radius)
+    x0 = p0 + radius + 1
+    x1 = p1 + radius + 1
+    if x0 <= kv:
+        n_lin = min(x1, kv) - x0 + 1
+        sum_hi = n_lin * (2 * x0 + n_lin - 1) // 2 + (q - n_lin) * kv
+    else:
+        sum_hi = q * kv
+    y0 = p0 - radius
+    y1 = p1 - radius
+    if y1 <= 0:
+        sum_lo = 0
+    else:
+        s_start = max(0, y0)
+        count = y1 - s_start + 1
+        sum_lo = count * (s_start + y1) // 2
+    return max(0, sum_hi - sum_lo), u_lo, u_hi
+
+
+def _paged_fia_request_span(
+    q: int, kv: int, *, mask: str, window: int, page_size: int,
+) -> tuple[int, int, int]:
+    """Return ``(visible_pairs, active_kv_rows, active_pages)`` for one request."""
+    if q <= 0 or kv <= 0:
+        return 0, 0, 0
+    past = max(0, kv - q)
+    if mask != "causal":
+        pairs, lo, hi = noncausal_window_pairs_and_span(q, past, kv, window)
+        active = max(0, hi - lo)
+        pages = ((hi - 1) // page_size - lo // page_size + 1) if active > 0 else 0
+        return pairs, active, pages
+    if window <= 0:
+        if kv >= q:
+            pairs = q * past + q * (q + 1) // 2
+        else:
+            pairs = sum(min(kv, past + i + 1) for i in range(q))
+        lo, hi = 0, kv
+    else:
+        lo = max(0, past + 1 - window)
+        hi = kv
+        if kv >= q:
+            first_vis = past + 1
+            if first_vis >= window:
+                pairs = q * window
+            elif kv <= window:
+                pairs = q * past + q * (q + 1) // 2
+            else:
+                ramp = window - past - 1
+                pairs = ramp * past + ramp * (ramp + 1) // 2 + (q - ramp) * window
+        else:
+            pairs = sum(
+                max(0, min(kv, past + i + 1) - max(0, past + i + 1 - window))
+                for i in range(q)
+            )
+    active = max(0, hi - lo)
+    pages = ((hi - 1) // page_size - lo // page_size + 1) if active > 0 else 0
+    return pairs, active, pages
+
+
 def paged_fia_plan(*, requests, query_lengths, kv_lengths, page_size,
                    query_heads, kv_heads, head_dim, query_dtype, output_dtype,
                    key_format, value_format, phase="decode", mask="causal",
-                   return_lse=False, output_prepare=None):
+                   return_lse=False, output_prepare=None,
+                   v_head_dim=None, window=0, shared_format=False):
     """Ordinary paged FIA typed ports and executable-plan geometry.
 
-    ``kv_lengths`` are the actual per-request KV extents (past context plus
-    current query tokens), not a page-pool capacity.  K/V are static reads:
-    no state/KV write is published.  An LSE port exists only when the caller
-    requests it; the ordinary no-LSE path materializes zero bytes.
+    ``kv_lengths`` are the actual per-request backing KV extents (past context
+    plus current query tokens), not a page-pool capacity.  When ``window > 0``,
+    active pairs, KV read bytes, and page reads reflect the sliding-window span
+    while backing cache/block-table ports retain full ``kv_lengths``.  K/V are
+    static reads: no state/KV write is published.  An LSE port exists only when
+    the caller requests it; the ordinary no-LSE path materializes zero bytes.
     """
     requests = tuple((int(q), int(kv)) for q, kv in requests)
     query_lengths = tuple(int(value) for value in query_lengths)
     kv_lengths = tuple(int(value) for value in kv_lengths)
     if not requests or len(requests) != len(query_lengths) or len(requests) != len(kv_lengths):
         raise ModelingError("paged_fia_plan_requests_mismatch")
-    if page_size < 1 or query_heads < 1 or kv_heads < 1 or head_dim < 1:
+    v_dim = head_dim if v_head_dim is None else int(v_head_dim)
+    win = int(window or 0)
+    if page_size < 1 or query_heads < 1 or kv_heads < 1 or head_dim < 1 or v_dim < 1:
         raise ModelingError("paged_fia_plan_nonpositive_geometry")
+    if win < 0:
+        raise ModelingError("paged_fia_plan_negative_window")
     if query_heads % kv_heads:
         raise ModelingError("paged_fia_plan_query_heads_not_divisible")
     query_dtype = _canonical(str(query_dtype))
@@ -455,38 +601,40 @@ def paged_fia_plan(*, requests, query_lengths, kv_lengths, page_size,
     max_pages = max(page_counts)
     q_total = sum(query_lengths)
 
-    def visible_pairs(q, kv):
-        if mask != "causal":
-            return q * kv
-        # kv_lengths already include the current query tokens.  Query token i
-        # sees past + i + 1 keys, so a q>1 causal request is not q*kv.
-        past = max(0, kv - q)
-        return sum(min(kv, past + i + 1) for i in range(q))
-
-    pairs = query_heads * sum(visible_pairs(q, kv)
-                              for q, kv in zip(query_lengths, kv_lengths))
+    spans = tuple(
+        _paged_fia_request_span(q, kv, mask=mask, window=win, page_size=page_size)
+        for q, kv in zip(query_lengths, kv_lengths)
+    )
+    pairs = query_heads * sum(item[0] for item in spans)
+    active_kv_lengths = tuple(item[1] for item in spans)
+    active_page_counts = tuple(item[2] for item in spans)
+    active_pages = sum(active_page_counts)
     qk_mac = pairs * head_dim
-    pv_mac = qk_mac
+    pv_mac = pairs * v_dim
     q_bytes = q_total * query_heads * head_dim * dtype_bytes(query_dtype)
-    out_bytes = q_total * query_heads * head_dim * dtype_bytes(output_dtype)
-    kv_bytes = sum(
-        kv * (int(key_format.row_bytes(kv_heads * head_dim))
-              + int(value_format.row_bytes(kv_heads * head_dim)))
-        for kv in kv_lengths)
-    block_table_bytes = total_pages * _PAGE_TABLE_BYTES
+    out_bytes = q_total * query_heads * v_dim * dtype_bytes(output_dtype)
+    kv_row_b = (
+        int(key_format.row_bytes(kv_heads * (head_dim + v_dim)))
+        if shared_format
+        else (int(key_format.row_bytes(kv_heads * head_dim))
+              + int(value_format.row_bytes(kv_heads * v_dim)))
+    )
+    kv_bytes = sum(akv * kv_row_b for akv in active_kv_lengths)
+    block_table_bytes = active_pages * _PAGE_TABLE_BYTES
     q_shape = (q_total, query_heads, head_dim)
-    out_shape = (q_total, query_heads, head_dim)
-    cache_shape = (total_pages, page_size, kv_heads, head_dim)
+    out_shape = (q_total, query_heads, v_dim)
+    key_cache_shape = (total_pages, page_size, kv_heads, head_dim)
+    value_cache_shape = (total_pages, page_size, kv_heads, v_dim)
     block_shape = (len(requests), max_pages)
     ports = {
         "query": {"role": "query", "direction": "in", "shape": q_shape,
                   "dtype": query_dtype, "layout": "TND", "offset": 0,
                   "required": True},
         "key_cache": {"role": "key", "direction": "in",
-                      "shape": cache_shape, "dtype": key_format.dtype,
+                      "shape": key_cache_shape, "dtype": key_format.dtype,
                       "layout": "PA_BBND", "required": True},
         "value_cache": {"role": "value", "direction": "in",
-                        "shape": cache_shape, "dtype": value_format.dtype,
+                        "shape": value_cache_shape, "dtype": value_format.dtype,
                         "layout": "PA_BBND", "required": True},
         "block_table": {"role": "block_table", "direction": "in",
                         "shape": block_shape, "dtype": "int32",
@@ -498,6 +646,7 @@ def paged_fia_plan(*, requests, query_lengths, kv_lengths, page_size,
                   "dtype": "fp32", "value": 1.0 / sqrt(head_dim),
                   "required": True},
         "mask": {"role": "mask", "direction": "in", "kind": mask,
+                 **({"window": win} if win > 0 else {}),
                  "required": True},
         "output": {"role": "output", "direction": "out", "shape": out_shape,
                    "dtype": output_dtype, "layout": "TND", "offset": 0,
@@ -510,17 +659,18 @@ def paged_fia_plan(*, requests, query_lengths, kv_lengths, page_size,
     work = {
         "query_tokens": q_total,
         "kv_lengths": kv_lengths,
+        "active_kv_lengths": active_kv_lengths,
         "head_token_pairs": pairs,
         "qk_mac": qk_mac,
         "pv_mac": pv_mac,
         "q_bytes": q_bytes,
         "out_bytes": out_bytes,
         "kv_valid_bytes": kv_bytes,
-        "page_counts": page_counts,
-        "pages": total_pages,
+        "page_counts": active_page_counts,
+        "pages": active_pages,
         "page_table_bytes": block_table_bytes,
-        "key_page_reads": total_pages,
-        "value_page_reads": total_pages,
+        "key_page_reads": active_pages,
+        "value_page_reads": active_pages,
         "lse_bytes": 0 if not return_lse else q_total * query_heads * LSE_ELEMENT_BYTES,
         "state_writes": 0,
     }
@@ -533,6 +683,8 @@ def paged_fia_plan(*, requests, query_lengths, kv_lengths, page_size,
             "query_heads": query_heads,
             "kv_heads": kv_heads,
             "head_dim": head_dim,
+            "v_head_dim": v_dim,
+            "window": win,
             "group": query_heads // kv_heads,
             "hq_equals_hkv": query_heads == kv_heads,
             "page_size": page_size,
