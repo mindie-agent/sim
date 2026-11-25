@@ -899,6 +899,12 @@ def emit_mtp_current_attention(
     return current.op_id
 
 
+DCP_BATCHED_ROW_CORE_RATIO = 4
+DCP_BATCHED_BLOCK_ROWS = 8
+DCP_BATCHED_MAX_HEAD_DIM = 512
+DCP_FAST_MERGE_MAX_BLOCK_D = 512
+
+
 def _emit_dcp_lse_merge(
     ops: list[OpSpec], *, prefix: str, stage: int, layer: int,
     requests: tuple[str, ...], mode: str, merge_deps: tuple[str, ...],
@@ -909,10 +915,19 @@ def _emit_dcp_lse_merge(
     local_current_dep: str | None, meta_extra: tuple[tuple[str, Any], ...],
 ) -> str:
     elements = float(out_rows * local_heads * v_dim)
-    merge_read = float(dcp_total * out_rows * local_heads) * row_packed_bytes
+    if fast and v_dim > 0:
+        pow2_d = 1 << (int(v_dim) - 1).bit_length()
+        block_d = min(pow2_d, DCP_FAST_MERGE_MAX_BLOCK_D)
+        d_tiles = max(1, math.ceil(int(v_dim) / block_d))
+        merge_read = float(dcp_total * out_rows * local_heads) * (
+            float(v_dim) * elem_bytes + float(d_tiles * lse_wire)
+        )
+    else:
+        merge_read = float(dcp_total * out_rows * local_heads) * row_packed_bytes
     if local_current_dep is not None:
         merge_read += float(out_rows * local_heads) * (float(v_dim) * elem_bytes + float(FP32_BYTES))
-    merge_write = elements * elem_bytes
+    merge_out_dtype = "fp32" if fast else act_dtype
+    merge_write = elements * (float(FP32_BYTES) if fast else elem_bytes)
     merge_kernel = "_fused_merge_kernel" if fast else "_fused_dcp_lse_combine_kernel"
     merge_op = OpSpec(
         op_id=f"{prefix}.dcp_lse_merge", deps=merge_deps,
@@ -924,7 +939,7 @@ def _emit_dcp_lse_merge(
         launch_shape=(out_rows, local_heads, v_dim),
         vector_ops=float(MERGE_OPS) * elements * float(partial_count),
         hbm_bytes=merge_read + merge_write, mte2_bytes=merge_read, mte3_bytes=merge_write,
-        dtype=act_dtype,
+        dtype=merge_out_dtype,
         metadata=(
             ("cp", int(dcp_total)),
             ("cp_strategy", CP_STRATEGY),
@@ -934,12 +949,38 @@ def _emit_dcp_lse_merge(
             ("partial_count", int(partial_count)),
             ("partial_reduction", "logsumexp"),
             ("merge_dtype", "fp32"),
+            ("output_format", merge_out_dtype),
             ("defer_combine", local_current_dep is not None),
             ("kernel", merge_kernel),
             ("native_kinds", (merge_kernel,)),
         ) + tuple(meta_extra),
     )
     ops.append(merge_op)
+    if fast and str(act_dtype).strip().lower() not in {"fp32", "float32"}:
+        cast_read = elements * float(FP32_BYTES)
+        cast_write = elements * elem_bytes
+        cast_op = OpSpec(
+            op_id=f"{prefix}.dcp_lse_merge_cast", deps=(merge_op.op_id,),
+            stage=stage, layer=layer, requests=requests, phase=mode,
+            family="cast", recipe="dcp_lse_merge_cast",
+            semantic_shape=(out_rows, local_heads, v_dim),
+            local_shape=(out_rows, local_heads, v_dim),
+            padded_shape=(out_rows, local_heads, v_dim),
+            launch_shape=(out_rows, local_heads, v_dim),
+            vector_ops=elements,
+            hbm_bytes=cast_read + cast_write, mte2_bytes=cast_read, mte3_bytes=cast_write,
+            dtype=act_dtype,
+            metadata=(
+                ("cp", int(dcp_total)),
+                ("cp_strategy", CP_STRATEGY),
+                ("dcp_exchange_path", "sfa_dcp_exchange_int32"),
+                ("input_format", "fp32"),
+                ("output_format", act_dtype),
+                ("native_kinds", ("Cast",)),
+            ) + tuple(meta_extra),
+        )
+        ops.append(cast_op)
+        return cast_op.op_id
     return merge_op.op_id
 
 
@@ -1827,8 +1868,42 @@ def _build_dcp_lse_merge(op: OpSpec, geometry: Any) -> OperatorPlan:
     partial_count = max(2, int(meta.get("partial_count") or meta.get("cp") or 2))
     shape = tuple(int(d) for d in (op.local_shape or op.semantic_shape or (1, 1, 1)))
     total_rows = max(1, shape[0] * shape[1]) if len(shape) >= 2 else max(1, shape[0])
+    head_dim = int(shape[2]) if len(shape) >= 3 else 0
     aiv_count = max(1, int((getattr(geometry, "resource_units", {}) or {}).get("vector", 1)))
-    active_aiv = max(1, min(aiv_count, total_rows))
+    is_fast = (
+        meta.get("dcp_exchange_path") == "sfa_dcp_exchange_int32"
+        or meta.get("kernel") == "_fused_merge_kernel"
+    )
+    factors = meta.get("dcp_factors")
+    token_only_scatter = (
+        isinstance(factors, (tuple, list))
+        and len(factors) == 3
+        and int(factors[2]) > 1
+        and int(factors[0]) <= 1
+        and int(factors[1]) <= 1
+    )
+    batched = (
+        not is_fast
+        and not token_only_scatter
+        and str(op.dtype or "").strip().lower() in {"bf16", "bfloat16"}
+        and 0 < head_dim <= DCP_BATCHED_MAX_HEAD_DIM
+        and total_rows >= DCP_BATCHED_ROW_CORE_RATIO * aiv_count
+    )
+    if batched:
+        block_rows = DCP_BATCHED_BLOCK_ROWS
+        logical_blocks = math.ceil(total_rows / block_rows)
+        selected_kernel = "_fused_dcp_lse_combine_batched_kernel"
+    elif is_fast and head_dim > 0:
+        block_rows = 1
+        pow2_d = 1 << (head_dim - 1).bit_length()
+        block_d = min(pow2_d, DCP_FAST_MERGE_MAX_BLOCK_D)
+        logical_blocks = total_rows * math.ceil(head_dim / block_d)
+        selected_kernel = "_fused_merge_kernel"
+    else:
+        block_rows = 1
+        logical_blocks = total_rows
+        selected_kernel = str(meta.get("kernel") or "_fused_dcp_lse_combine_kernel")
+    active_aiv = max(1, min(aiv_count, logical_blocks))
     sp_step = ATTENTION_UPDATE_MAX_EFFECTIVE_SP - 1
     sp_loops = (
         1
@@ -1851,7 +1926,9 @@ def _build_dcp_lse_merge(op: OpSpec, geometry: Any) -> OperatorPlan:
             Phase("lse_combine", {"vector": 1.0}, after=("copy_in_sp",)),
             Phase("copy_out", {IO_HBM_CATEGORY: write_share, "mte3": 1.0}, after=("lse_combine",)),
         )
-        tile_count = max(1, min(ATTENTION_UPDATE_TILE_CAP, sp_loops * math.ceil(total_rows / active_aiv)))
+        tile_count = max(
+            1, min(ATTENTION_UPDATE_TILE_CAP, sp_loops * math.ceil(logical_blocks / active_aiv)),
+        )
         if occupancy < 1.0:
             scaled_rates = dict(context.rates)
             for role in ("vector", "mte2", "mte2_aiv", "mte3"):
@@ -1869,6 +1946,9 @@ def _build_dcp_lse_merge(op: OpSpec, geometry: Any) -> OperatorPlan:
         {
             "execution_class": "aiv_only",
             "launched_blocks": active_aiv,
+            "block_rows": block_rows,
+            "kernel": selected_kernel,
+            "native_kinds": (selected_kernel,),
             "partial_count": partial_count,
             "sp_loops": sp_loops,
             "source": ATTENTION_UPDATE_SOURCE,
@@ -1878,14 +1958,33 @@ def _build_dcp_lse_merge(op: OpSpec, geometry: Any) -> OperatorPlan:
     )
 
 
+class _DcpLseMergeRecipe(PlannedRecipe):
+    """Synchronize emitted kernel/native_kinds with the device-selected DCP merge kernel."""
+
+    def prepare(self, op: OpSpec, geometry: Any):
+        prepared, plan = super().prepare(op, geometry)
+        selected_kernel = plan.metadata.get("kernel")
+        if selected_kernel:
+            meta = dict(prepared.metadata)
+            selected_native = plan.metadata.get("native_kinds", (selected_kernel,))
+            if (
+                meta.get("kernel") != selected_kernel
+                or meta.get("native_kinds") != selected_native
+            ):
+                meta["kernel"] = selected_kernel
+                meta["native_kinds"] = tuple(selected_native)
+                prepared = replace(prepared, metadata=tuple(sorted(meta.items())))
+        return prepared, plan
+
+
 def recipes() -> dict[str, PlannedRecipe]:
     return {
         PAIRED_FP8_QSFA_IMPLEMENTATION: PlannedRecipe(_build_paired_qsfa),
-        DCP_LSE_MERGE_RECIPE: PlannedRecipe(
+        DCP_LSE_MERGE_RECIPE: _DcpLseMergeRecipe(
             _build_dcp_lse_merge,
             traffic_rewrite_capable=True,
         ),
-        DCP_LSE_MERGE_EAGER_RECIPE: PlannedRecipe(
+        DCP_LSE_MERGE_EAGER_RECIPE: _DcpLseMergeRecipe(
             _build_dcp_lse_merge,
             kernels=_expand_dcp_lse_merge_kernels,
             traffic_rewrite_capable=True,

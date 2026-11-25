@@ -121,7 +121,10 @@ def balanced_realization(runtime, layer, *, tokens, valid_tokens, global_tokens,
     first = (replica % width) * local_ep if ep_spans_dp else 0
     ranks = tuple(range(first, first + local_ep))
     if owner is not None:
-        ranks = (owner,)
+        owner_idx = int(owner)
+        if not 0 <= owner_idx < p.ep:
+            raise ModelingError(f"balanced_routing_owner_out_of_range:{owner_idx}:{p.ep}")
+        ranks = (owner_idx,)
     representative = max(ranks, key=lambda rank: sum(_rank_rows(counts, p.ep, rank)))
     local_rows = _rank_rows(counts, p.ep, representative)
     # PCP prefill tokens are already split across PCP ranks. Dividing by the
@@ -466,9 +469,54 @@ def _explicit_topk_ids(value, *, tokens, top_k, experts, rows):
     return tuple(result)
 
 
+def _balanced_ep_owner(parallel, physical_rank: int, *, replica: int = 0, machine=None) -> int:
+    """Resolve one explicit physical rank to its EP-group shard index ``0..ep-1``."""
+    rank = int(physical_rank)
+    ep = max(1, int(parallel.ep))
+    if machine is not None and hasattr(machine, "validate_placement"):
+        rank_map = machine.validate_placement(parallel)
+        total_replicas = max(1, int(getattr(parallel, "external_dp", 1) or 1) * int(parallel.dp))
+        stages = max(1, int(parallel.pp))
+        order = [int(replica)] + [r for r in range(total_replicas) if r != int(replica)]
+        for rep in order:
+            if not 0 <= rep < total_replicas:
+                continue
+            for stage in range(stages):
+                stage_ranks = rank_map.stage_ranks(rep, stage)
+                if rank in stage_ranks:
+                    lane = stage_ranks.index(rank)
+                    ep_group = rank_map.ep_group_ranks(rep, stage, lane=lane)
+                    return ep_group.index(rank)
+        raise ModelingError(f"balanced_routing_physical_rank_unknown:{rank}")
+    table = getattr(parallel, "rank_table", None)
+    if table is not None:
+        for group in table:
+            if rank in group:
+                return tuple(int(item) for item in group).index(rank)
+        raise ModelingError(f"balanced_routing_physical_rank_unknown:{rank}")
+    tp = max(1, int(parallel.tp))
+    pcp = max(1, int(parallel.pcp))
+    pp = max(1, int(parallel.pp))
+    stage_slot, lane = divmod(rank, tp * pcp)
+    rep, _stage = divmod(stage_slot, pp)
+    if not (bool(getattr(parallel, "ep_spans_dp", False))
+            or bool(getattr(parallel, "ep_spans_pcp", False))):
+        return lane % ep
+    etp = max(1, int(getattr(parallel, "etp", 1) or 1))
+    ep_tp_w = max(1, tp // etp)
+    copy_idx, tp_lane = divmod(lane, tp)
+    offset = tp_lane % ep_tp_w
+    copy_count = min(pcp, max(1, ep // ep_tp_w)) if bool(getattr(parallel, "ep_spans_pcp", False)) else 1
+    local_copy = copy_idx % max(1, copy_count)
+    ep_dp_w = max(1, int(getattr(parallel, "ep_dp_width", 1) or 1))
+    local_rep = rep % ep_dp_w
+    return (local_rep * copy_count + local_copy) * ep_tp_w + offset
+
+
 def select_realization(runtime, layer, *, phase, tokens, valid_tokens, global_tokens=None,
                        token_shards=1, valid_source_tokens=None, replica=0, views=None,
-                       physical_rank=None, query_position=None, source_geometry=None):
+                       physical_rank=None, query_position=None, source_geometry=None,
+                       explicit_physical_rank: bool = False, machine=None):
     raw = runtime.routing
     from mindie_sim.prediction.sharding.routing import select as source_realization
     selected = source_realization(
@@ -479,11 +527,18 @@ def select_realization(runtime, layer, *, phase, tokens, valid_tokens, global_to
         return selected
     if raw.get("policy") == "balanced" and set(raw) == {"policy"}:
         from mindie_sim.prediction.sharding.routing import balanced_realization
+        owner = (
+            source_geometry.owner if source_geometry is not None
+            else _balanced_ep_owner(
+                runtime.parallel, int(physical_rank), replica=int(replica), machine=machine,
+            ) if explicit_physical_rank and physical_rank is not None
+            else None
+        )
         return balanced_realization(runtime, layer, tokens=tokens,
                                     valid_tokens=valid_tokens, global_tokens=global_tokens,
                                     token_shards=token_shards,
                                     valid_source_tokens=valid_source_tokens, replica=replica,
-                                    owner=source_geometry.owner if source_geometry else None)
+                                    owner=owner)
     if set(raw) - {"realizations"}:
         raise ModelingError("routing_configuration_requires_explicit_realizations")
     declarations = raw.get("realizations", ())
