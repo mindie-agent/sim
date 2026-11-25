@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 
 from mindie_sim.schema.common import ModelingError
 
@@ -75,6 +76,25 @@ class CacheStage:
     terminal: bool = False
 
 
+def _result_line_bytes(result: CacheAccessResult) -> int:
+    if result.hbm_read_lines:
+        return result.hbm_read_bytes // result.hbm_read_lines
+    if result.hbm_write_lines:
+        return result.hbm_write_bytes // result.hbm_write_lines
+    return A5_LINE_BYTES
+
+
+def _round_hbm_bytes(amount: int | float, transaction_bytes: int) -> float:
+    """Round an external HBM transfer up to the next-level transaction granule."""
+    if not amount:
+        return 0.0
+    if type(amount) is int:
+        count = (amount + transaction_bytes - 1) // transaction_bytes
+    else:
+        count = math.ceil(amount / transaction_bytes)
+    return float(count * transaction_bytes)
+
+
 def cache_work_stages(result: CacheAccessResult, *,
                       hbm_resource: str = "hbm",
                       onchip_resource: str = "mte2",
@@ -82,7 +102,8 @@ def cache_work_stages(result: CacheAccessResult, *,
                       vector_resource: str = "vector",
                       source_bytes: int = 0,
                       source_residency: str = "on_chip",
-                      convert_ops: float = 0.0) -> tuple[CacheStage, ...]:
+                      convert_ops: float = 0.0,
+                      transaction_bytes: int | None = None) -> tuple[CacheStage, ...]:
     """One explicit immutable phase DAG consumed by both adapters.
 
     Every stage names its real predecessors; there is no implicit ``ready``
@@ -90,6 +111,10 @@ def cache_work_stages(result: CacheAccessResult, *,
     drain (when a dirty slot is reused) -> publish/stage -> direct writeback ->
     retire. Only absent phases are collapsed.
     """
+    if transaction_bytes is None:
+        transaction_bytes = _result_line_bytes(result)
+    if type(transaction_bytes) is not int or transaction_bytes < 1:
+        raise ModelingError("cache_work_stages_transaction_bytes_invalid")
     stages: list[CacheStage] = []
     labels: set[str] = set()
 
@@ -113,7 +138,9 @@ def cache_work_stages(result: CacheAccessResult, *,
     basis = ("ready",)
     if source_bytes:
         if source_residency != "on_chip":
-            label = add("source_hbm", hbm_resource, source_bytes, after=basis)
+            label = add(
+                "source_hbm", hbm_resource,
+                _round_hbm_bytes(source_bytes, transaction_bytes), after=basis)
             basis = (label,)
         label = add("source_onchip", onchip_resource, source_bytes, after=basis)
         basis = (label,)
@@ -126,27 +153,39 @@ def cache_work_stages(result: CacheAccessResult, *,
         if drain_bytes:
             # A miss may replace a dirty slot. The old bytes leave HBM before
             # the fill overwrites that physical slot.
-            label = add("drain", hbm_resource, drain_bytes, after=basis)
+            label = add(
+                "drain", hbm_resource,
+                _round_hbm_bytes(drain_bytes, transaction_bytes), after=basis)
             basis = (label,)
         if result.hbm_read_bytes:
-            fill = add("fill", hbm_resource, result.hbm_read_bytes, after=basis)
+            fill = add(
+                "fill", hbm_resource,
+                _round_hbm_bytes(result.hbm_read_bytes, transaction_bytes),
+                after=basis)
             basis = (add("publish", after=(fill,), publish=True),)
         deliver = add("deliver", onchip_resource, result.onchip_bytes,
                       after=basis)
         add("retire", after=(deliver,), terminal=True)
     else:
         if result.hbm_read_bytes:
-            label = add("rmw", hbm_resource, result.hbm_read_bytes, after=basis)
+            label = add(
+                "rmw", hbm_resource,
+                _round_hbm_bytes(result.hbm_read_bytes, transaction_bytes),
+                after=basis)
             basis = (label,)
         if drain_bytes:
-            label = add("drain", hbm_resource, drain_bytes, after=basis)
+            label = add(
+                "drain", hbm_resource,
+                _round_hbm_bytes(drain_bytes, transaction_bytes), after=basis)
             basis = (label,)
         stage = add("stage", write_resource or onchip_resource,
                     result.onchip_bytes, after=basis, publish=True)
         terminal = (stage,)
         if direct_bytes:
-            label = add("writeback", hbm_resource, direct_bytes,
-                        after=terminal)
+            label = add(
+                "writeback", hbm_resource,
+                _round_hbm_bytes(direct_bytes, transaction_bytes),
+                after=terminal)
             terminal = (label,)
         add("retire", after=terminal, terminal=True)
 
@@ -227,7 +266,7 @@ class CacheAccessProgram:
     write_resource: str | None = None
     outstanding: int = 0
     response_ms: float = 0.0
-    transaction_bytes: int = A5_LINE_BYTES
+    transaction_bytes: int | None = None
 
     def __post_init__(self):
         if type(self.outstanding) is not int or self.outstanding < 0:
@@ -235,7 +274,10 @@ class CacheAccessProgram:
         if (not isinstance(self.response_ms, (int, float))
                 or isinstance(self.response_ms, bool) or self.response_ms < 0):
             raise ModelingError("cache_access_program_response_invalid")
-        if type(self.transaction_bytes) is not int or self.transaction_bytes < 1:
+        if self.transaction_bytes is None:
+            object.__setattr__(
+                self, "transaction_bytes", _result_line_bytes(self.result))
+        elif type(self.transaction_bytes) is not int or self.transaction_bytes < 1:
             raise ModelingError("cache_access_program_transaction_bytes_invalid")
 
     def start(self, engine: Engine, name: str, ready: Event, *,
@@ -282,7 +324,8 @@ class CacheAccessProgram:
             vector_resource=self.vector_resource,
             source_bytes=self.source_bytes,
             source_residency=self.source_residency,
-            convert_ops=self.convert_ops)
+            convert_ops=self.convert_ops,
+            transaction_bytes=self.transaction_bytes)
         for item in items:
             if item.resource is not None and item.resource not in engine.resources:
                 raise ModelingError(

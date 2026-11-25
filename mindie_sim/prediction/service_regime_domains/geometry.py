@@ -436,14 +436,167 @@ def _check_seams(group, domains, support):
     return checked
 
 
+_MISSING = object()
+
+
+def _match_values_equal(left, right) -> bool:
+    """Mirror runtime axis_equal: list/tuple normalize; mappings match keys."""
+    if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
+        return len(left) == len(right) and all(
+            _match_values_equal(a, b) for a, b in zip(left, right))
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        return left.keys() == right.keys() and all(
+            _match_values_equal(left[key], right[key]) for key in left)
+    return left == right
+
+
+def _match_subpath(value, suffix: str):
+    current = value
+    for part in suffix.split("."):
+        if isinstance(current, Mapping):
+            current = current.get(part, _MISSING)
+        elif (isinstance(current, (list, tuple))
+              and part.isdigit() and int(part) < len(current)):
+            current = current[int(part)]
+        else:
+            return _MISSING
+    return current
+
+
+def _matches_overlap(left_match, right_match) -> bool:
+    """True iff some axis assignment can satisfy both match selectors."""
+    if not isinstance(left_match, Mapping) or not isinstance(right_match, Mapping):
+        raise ModelingError("service_regime_requires_mapping")
+    for path, left_val in left_match.items():
+        if path in right_match and not _match_values_equal(left_val, right_match[path]):
+            return False
+    for parent_map, child_map in ((left_match, right_match), (right_match, left_match)):
+        for parent_path, parent_val in parent_map.items():
+            prefix = parent_path + "."
+            for child_path, child_val in child_map.items():
+                if not child_path.startswith(prefix):
+                    continue
+                resolved = _match_subpath(parent_val, child_path[len(prefix):])
+                if resolved is _MISSING or not _match_values_equal(resolved, child_val):
+                    return False
+    return True
+
+
+_REDUCERS = {
+    "sum": sum,
+    "max": max,
+    "min": min,
+    "len": len,
+    "product": math.prod,
+    "positive_count": lambda xs: sum(v > 0 for v in xs),
+}
+
+
+def _axis_key(spec) -> str:
+    if not isinstance(spec, Mapping):
+        return _canonical(spec)
+    key = {"path": spec.get("path")}
+    if "reduce" in spec:
+        key["reduce"] = spec["reduce"]
+    return _canonical(key)
+
+
+def _resolve_match_value(match: Mapping, path: str):
+    if path in match:
+        return match[path]
+    for parent_path, parent_val in match.items():
+        prefix = parent_path + "."
+        if path.startswith(prefix):
+            return _match_subpath(parent_val, path[len(prefix):])
+    return _MISSING
+
+
+def _eval_coord_value(spec: Mapping, raw):
+    if "reduce" in spec:
+        reducer = _REDUCERS.get(spec["reduce"])
+        if reducer is None or not isinstance(raw, (list, tuple)) or not raw:
+            return _MISSING
+        raw = reducer(raw)
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not math.isfinite(raw):
+        return _MISSING
+    scale = spec.get("scale", 1)
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale):
+        return _MISSING
+    return float(raw) * float(scale)
+
+
+def _interval_contains_match(spec: Mapping, interval: Interval, match: Mapping) -> bool:
+    path = spec.get("path")
+    if not isinstance(path, str) or not path:
+        return True
+    raw = _resolve_match_value(match, path)
+    if raw is _MISSING:
+        return True
+    value = _eval_coord_value(spec, raw)
+    return value is not _MISSING and interval.contains(value)
+
+
+def _unscaled_interval(spec: Mapping, interval: Interval) -> Interval | None:
+    scale = spec.get("scale", 1)
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)) or not math.isfinite(scale):
+        return None
+    scale_f = float(scale)
+    if scale_f == 0.0:
+        return (Interval(interval.name, 0.0, math.inf, True, True)
+                if interval.contains(0.0)
+                else Interval(interval.name, 1.0, 0.0, True, True))
+    if scale_f < 0.0:
+        return None
+    lower = interval.lower / scale_f
+    upper = interval.upper / scale_f if math.isfinite(interval.upper) else math.inf
+    return Interval(interval.name, lower, upper, interval.lower_inclusive, interval.upper_inclusive)
+
+
+def _default_satisfies(spec: Mapping, interval: Interval) -> bool:
+    if "default" not in spec:
+        return False
+    value = _eval_coord_value(spec, spec["default"])
+    return value is not _MISSING and interval.contains(value)
+
+
+def _rule_interval(rule, name):
+    declared = rule.get("domain") or {}
+    if not isinstance(declared, Mapping):
+        raise ModelingError("service_regime_domain_requires_mapping")
+    bounds = declared.get(name)
+    interval = _interval(name, bounds) if bounds is not None else None
+    continuity = rule.get("continuity")
+    if isinstance(continuity, Mapping):
+        support = continuity.get("support")
+        if isinstance(support, Mapping) and name in support:
+            support_interval = _interval(name, support[name], require_max=True)
+            interval = (support_interval if interval is None
+                        else interval.intersect(support_interval))
+    return interval
+
+
 def _overlaps_support(rule, member_raw, domain):
     if not rules_overlap(rule, member_raw):
         return False
     declared = rule.get("domain") or {}
+    rule_coords = rule.get("coordinates") or {}
+    if not isinstance(declared, Mapping):
+        return True
     for name, interval in domain.support.items():
-        bounds = declared.get(name) if isinstance(declared, Mapping) else None
+        bounds = declared.get(name)
         if bounds is None:
             continue
+        if isinstance(rule_coords, Mapping) and name in rule_coords:
+            if _axis_key(rule_coords[name]) != _axis_key(domain.coordinates[name]):
+                continue
+            left_raw = _unscaled_interval(rule_coords[name], _interval(name, bounds))
+            right_raw = _unscaled_interval(domain.coordinates[name], interval)
+            if left_raw is not None and right_raw is not None:
+                if left_raw.intersect(right_raw).empty:
+                    if not (_default_satisfies(rule_coords[name], _interval(name, bounds))
+                            and _default_satisfies(domain.coordinates[name], interval)):
+                        return False
+                continue
         if _interval(name, bounds).intersect(interval).empty:
             return False
     return True
@@ -489,12 +642,27 @@ def compile_service_regime_domains(declarations):
                          for domain in members},
             "probes": probes, "seam_vertices": seams,
         })
-    for rule in legacy:
-        if not isinstance(rule, Mapping):
-            continue
-        match = _canonical(rule.get("match") or {})
+    group_items = list(domains.items())
+    for position, (group, members) in enumerate(group_items):
+        for other_group, other_members in group_items[position + 1:]:
+            if not _matches_overlap(members[0].match, other_members[0].match):
+                continue
+            if any(_overlaps_support(declarations[other.index], declarations[member.index], member)
+                   and _overlaps_support(declarations[member.index], declarations[other.index], other)
+                   for member in members for other in other_members):
+                raise ModelingError("service_regime_overlapping_domains:"
+                                    + group + "," + other_group)
+    legacy_mappings = [rule for rule in legacy if isinstance(rule, Mapping)]
+    for position, left_rule in enumerate(legacy_mappings):
+        for right_rule in legacy_mappings[position + 1:]:
+            if rules_overlap(left_rule, right_rule):
+                raise ModelingError("service_regime_overlapping_domains:"
+                                    + str(left_rule.get("id")) + ","
+                                    + str(right_rule.get("id")))
+    for rule in legacy_mappings:
+        rule_match = rule.get("match") or {}
         for group, members in domains.items():
-            if match != _canonical(members[0].match):
+            if not _matches_overlap(rule_match, members[0].match):
                 continue
             if any(_overlaps_support(rule, declarations[domain.index], domain)
                    for domain in members):
@@ -512,17 +680,40 @@ def rules_overlap(first, second):
     """Conservative static overlap of two declarations on shared coordinates."""
     if not isinstance(first, Mapping) or not isinstance(second, Mapping):
         raise ModelingError("service_regime_requires_mapping")
-    if _canonical(first.get("match") or {}) != _canonical(second.get("match") or {}):
+    first_match = first.get("match") or {}
+    second_match = second.get("match") or {}
+    if not _matches_overlap(first_match, second_match):
         return False
     left = first.get("coordinates") or {}
     right = second.get("coordinates") or {}
     if not isinstance(left, Mapping) or not isinstance(right, Mapping):
         raise ModelingError("service_regime_coordinates_require_mapping")
-    for name in set(left) & set(right):
-        first_bounds = (first.get("domain") or {}).get(name)
-        second_bounds = (second.get("domain") or {}).get(name)
-        if first_bounds is None or second_bounds is None:
+    for coords, rule, other_match in ((left, first, second_match), (right, second, first_match)):
+        for name, spec in coords.items():
+            if not isinstance(spec, Mapping):
+                continue
+            interval = _rule_interval(rule, name)
+            if interval is not None and not _interval_contains_match(spec, interval, other_match):
+                return False
+    right_by_axis: dict[str, list[tuple[str, Mapping]]] = {}
+    for name, spec in right.items():
+        if isinstance(spec, Mapping):
+            right_by_axis.setdefault(_axis_key(spec), []).append((name, spec))
+    for left_name, left_spec in left.items():
+        if not isinstance(left_spec, Mapping):
             continue
-        if _interval(name, first_bounds).intersect(_interval(name, second_bounds)).empty:
-            return False
+        left_interval = _rule_interval(first, left_name)
+        if left_interval is None:
+            continue
+        left_raw = _unscaled_interval(left_spec, left_interval)
+        for right_name, right_spec in right_by_axis.get(_axis_key(left_spec), ()):
+            right_interval = _rule_interval(second, right_name)
+            if right_interval is None:
+                continue
+            right_raw = _unscaled_interval(right_spec, right_interval)
+            if left_raw is not None and right_raw is not None:
+                if left_raw.intersect(right_raw).empty:
+                    if not (_default_satisfies(left_spec, left_interval)
+                            and _default_satisfies(right_spec, right_interval)):
+                        return False
     return True

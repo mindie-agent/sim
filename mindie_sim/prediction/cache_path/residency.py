@@ -443,6 +443,7 @@ class CacheAccessReservation:
     # stage both close this explicitly.
     drain_bytes: int = 0
     drain_completed: bool = True
+    preflushed_ranges: tuple = ()
     journal: CacheAccessJournal | None = None
 
     def __post_init__(self):
@@ -532,12 +533,19 @@ class CacheAccessReservation:
             self.state._reserved_bytes -= self.existing_reserved_lines * line
         restorations = []
         if self.existing_ranges:
-            # If a preflush already reached HBM, the old prefix is durable.
-            # Restore it as clean rather than re-creating a dirty writeback.
-            dirty_ranges = (() if self.drain_completed and self.drain_bytes
-                            else self.existing_dirty)
-            dirty_bytes = (() if self.drain_completed and self.drain_bytes
-                           else self.existing_dirty_bytes)
+            # Only the dirty lines that actually drained during preflush are
+            # durable in HBM; untouched dirty lines and target-overlapped dirty
+            # lines whose direct write never ran remain dirty on rollback.
+            if self.drain_completed and self.preflushed_ranges:
+                dirty_ranges = subtract_spans(
+                    self.existing_dirty, self.preflushed_ranges)
+                preflushed_bytes = _byte_spans_of_lines(
+                    self.preflushed_ranges, line)
+                dirty_bytes = subtract_spans(
+                    self.existing_dirty_bytes, preflushed_bytes)
+            else:
+                dirty_ranges = self.existing_dirty
+                dirty_bytes = self.existing_dirty_bytes
             restorations.append((
                 self.existing_recency, self.identity,
                 _Resident(range_count(self.existing_ranges),
