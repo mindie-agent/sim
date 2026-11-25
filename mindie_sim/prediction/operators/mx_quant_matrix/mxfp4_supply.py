@@ -18,6 +18,10 @@ from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, PlannedRecip
 from mindie_sim.prediction.ownership import read_role
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage, RecipeBook
 from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, check_live_buffers
+from mindie_sim.prediction.operators.grouped_moe.gmmsq_quant_typed import (
+    CLASSES as GMMSQ_CLASSES,
+    inventory as gmmsq_inventory,
+)
 from .mxfp4_geometry import MX_SCALE_GROUP, MX_SCALE_GROUP_PAIR
 
 TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
@@ -48,7 +52,8 @@ WIDE_OUTPUT_HALF_TILE = 128
 NARROW_OUTPUT_HALF_TILE = 64
 WIDE_OUTPUT_K_TILE = 256
 NARROW_OUTPUT_K_TILE = 512
-WIDEN_LANES_PER_ELEMENT = 3.5
+WIDEN_PACKED_GROUP_BYTES = 256
+GMMSQ_GROUPS_PER_CALLBACK = 64
 GROUP_LIST_SCAN_PASSES = 3
 
 RECIPE = "mxfp4_grouped_weight_supply"
@@ -69,6 +74,12 @@ L1_WEIGHT_BYTES = 2 * 256 * 256
 # gmmsq_weight_quant_vcv_basic_block.h:128,301 places slot 1 at fixed L1
 # offset 512 KiB - 64 KiB = 458,752 B, requiring a full 512 KiB L1 span.
 L1_FIXED_SLOT_SPAN_BYTES = 512 * 1024
+
+
+def output_half_tile(output_width: int) -> int:
+    """Canonical SiTU MXFP4 N/2 tile width (grouped_matmul_situ_quant_tiling.cpp:115-125)."""
+    return (WIDE_OUTPUT_HALF_TILE if output_width % WIDE_OUTPUT_HALF_TILE == 0
+            else NARROW_OUTPUT_HALF_TILE)
 
 
 @dataclass(frozen=True)
@@ -97,8 +108,7 @@ class Config:
 
     @property
     def half_tile(self):
-        return (WIDE_OUTPUT_HALF_TILE if self.output_width % WIDE_OUTPUT_HALF_TILE == 0
-                else NARROW_OUTPUT_HALF_TILE)
+        return output_half_tile(self.output_width)
 
     @property
     def k_tile(self):
@@ -127,25 +137,60 @@ def panels(config, owner, aic_count):
             yield expert, rows, column, offset
 
 
+def widen_panel_work(packed_bytes: int):
+    """Unconditional WeightAntiQuantComputeNzNk VF invocation (gmmsq_weight_quant_vec_compute.h:343-384).
+
+    Even when kRealSize == 0, AntiQuantProcessNzMxA8W4 is entered once and executes
+    its CreateMask + 3 DuplicateU8 prologue with zero body iterations.
+    """
+    groups = packed_bytes // WIDEN_PACKED_GROUP_BYTES
+    vf_groups = max(1, (groups + GMMSQ_GROUPS_PER_CALLBACK - 1) // GMMSQ_GROUPS_PER_CALLBACK)
+    inv, counts = gmmsq_inventory(groups, vf_groups)
+    return inv.capacity_work(GMMSQ_CLASSES), counts, inv
+
+
 def half_work(config, k_offset, sub, read):
     k = min(config.k_tile // 2, max(0, config.k - k_offset - sub * config.k_tile // 2))
     elements = k * 2 * config.half_tile
-    # Pinned widening: five 256-lane bit operations and one two-output
-    # 256-lane interleave per 512 FP8 values. Register loads/stores and scalar
-    # broadcasts are not invented vector arithmetic or extra HBM transfers.
-    return Work(resources={"hbm": elements / 2, read: elements / 2,
-                           "vector": elements * WIDEN_LANES_PER_ELEMENT, "mte3": elements})
+    packed = elements // 2
+    # Canonical typed U8 widening inventory (gmmsq_quant_mx_vf.h:344-379).
+    typed, _, _ = widen_panel_work(packed)
+    return typed + Work(resources={"hbm": packed, read: packed, "mte3": elements})
+
+
+def _tile_widen_totals(config):
+    tile_widen = Work()
+    raw_alu_lanes = raw_shuffle_lanes = vf_groups = 0
+    for offset in range(0, config.k, config.k_tile):
+        for sub in (0, 1):
+            k = min(config.k_tile // 2, max(0, config.k - offset - sub * config.k_tile // 2))
+            packed = k * config.half_tile
+            typed, counts, _ = widen_panel_work(packed)
+            tile_widen += typed
+            raw_alu_lanes += counts.raw_alu_lanes
+            raw_shuffle_lanes += counts.raw_shuffle_lanes
+            vf_groups += counts.vf_groups
+    return tile_widen, raw_alu_lanes, raw_shuffle_lanes, vf_groups
 
 
 def ledger(config, aic_count):
     count = config.active * config.output_width // config.half_tile
     elements = config.active * 2 * config.output_width * config.k
+    tile_widen, raw_alu, raw_shuffle, vf_groups = _tile_widen_totals(config)
+    widen_work = tile_widen.scaled(count) if count else Work()
     # Both MaxGroupL1M and Process read the group-list on every AIC/AIV.
     loads_per_scan = len(config.group_rows) if config.group_list_type == 1 else 2 * len(config.group_rows) - 1
     return {"valid_rows": sum(config.group_rows), "allocated_rows": config.allocated_rows,
             "active_banks": config.active, "declared_banks": len(config.group_rows),
             "source_output_tiles": count, "packed_weight_read_bytes": elements // 2,
-            "expanded_l1_write_bytes": elements, "widen_vector_lanes": elements * WIDEN_LANES_PER_ELEMENT,
+            "expanded_l1_write_bytes": elements,
+            "widen_register_work": dict(widen_work.resources),
+            "unpriced_typed_lanes": {
+                "reg_alu_lanes": raw_alu * count,
+                "reg_shuffle_lanes": raw_shuffle * count,
+                "vf_groups": vf_groups * count,
+                "boundary": "raw opcode lanes; no physical shared port",
+            },
             "scalar_group_list_loads": 2 * loads_per_scan * GROUP_LIST_SCAN_PASSES * aic_count,
             "scalar_load_latency_and_cache_policy": "unpriced; not presumed uncached HBM",
             "owner_tile_counts": [sum(1 for _ in tiles(config, i, aic_count)) for i in range(aic_count)],
@@ -174,10 +219,12 @@ def build(op, geometry: Geometry):
     if read != "mte2_aiv" or "mte3" not in geometry.resource_units:
         raise ModelingError("mxfp4_supply_requires_split_aiv_read_and_write_pipes")
     details = ledger(config, aic)
-    total = Work(resources={"hbm": details["packed_weight_read_bytes"],
-                           read: details["packed_weight_read_bytes"],
-                           "vector": details["widen_vector_lanes"],
-                           "mte3": details["expanded_l1_write_bytes"]})
+    total = Work(resources={
+        "hbm": details["packed_weight_read_bytes"],
+        read: details["packed_weight_read_bytes"],
+        "mte3": details["expanded_l1_write_bytes"],
+        **details["widen_register_work"],
+    })
 
     def owner_program(context, owner):
         sequence = tuple(panels(config, owner, aic))
@@ -190,15 +237,18 @@ def build(op, geometry: Geometry):
             *_, offset = sequence[index]
             stages = []
             for sub in (0, 1):
-                work = half_work(config, offset, sub, read).resources
-                placement = context.owned(2 * owner + sub, aiv, (read, "vector", "mte3"))
+                res = half_work(config, offset, sub, read).resources
+                widen_res = {k: v for k, v in res.items() if k not in {"hbm", read, "mte3"}}
+                read_place = context.owned(2 * owner + sub, aiv, (read,))
+                widen_place = context.owned(2 * owner + sub, aiv, tuple(widen_res))
+                pub_place = context.owned(2 * owner + sub, aiv, ("mte3",))
                 stages.extend((
-                    Stage(f"read{sub}", context.bind(Work(resources={"hbm": work["hbm"], read: work[read]})),
-                          placement=placement),
-                    Stage(f"widen{sub}", context.bind(Work(resources={"vector": work["vector"]})),
-                          after=(f"read{sub}",), placement=placement),
-                    Stage(f"publish{sub}", context.bind(Work(resources={"mte3": work["mte3"]})),
-                          after=(f"widen{sub}",), placement=placement),
+                    Stage(f"read{sub}", context.bind(Work(resources={"hbm": res["hbm"], read: res[read]})),
+                          placement=read_place),
+                    Stage(f"widen{sub}", context.bind(Work(resources=widen_res)),
+                          after=(f"read{sub}",), placement=widen_place),
+                    Stage(f"publish{sub}", context.bind(Work(resources={"mte3": res["mte3"]})),
+                          after=(f"widen{sub}",), placement=pub_place),
                 ))
             return stages
 

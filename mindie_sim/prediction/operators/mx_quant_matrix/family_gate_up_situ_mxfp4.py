@@ -21,7 +21,6 @@ from .mxfp4_geometry import (
     CUBE_MN_FRACTAL, MX_SCALE_GROUP, MX_SCALE_PUBLISH_K, Config as GeoConfig,
     activation_scale_bytes, align, panel_sizes, panel_work,
 )
-from mindie_sim.prediction.operators.grouped_moe.gmmsq_quant_typed import work as gmmsq_widen_work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage, RecipeBook
 from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec, check_live_buffers
 from mindie_sim.prediction.operators.mx_quant_matrix import mxfp4_supply
@@ -45,15 +44,15 @@ FP32_BYTES = 4
 
 DEFAULT_L1_K = 256
 BASE_TILE_M = 128
-OUTPUT_TILE_N = 128
 BASE_TILE_K = 128
 SOURCE_N_ALIGNMENT = 64
 SOURCE_K_ALIGNMENT = 64
 GATE_UP_PROJECTIONS = 2
 GATE_UP_FLOPS_PER_K_STEP = GATE_UP_PROJECTIONS * 2
 GATE_UP_FIXPIPE_BYTES_PER_POSITION = GATE_UP_PROJECTIONS * FP32_BYTES
-WIDEN_PACKED_GROUP_BYTES = 256
 CUBE_M_ROUNDUP = CUBE_MN_FRACTAL - 1
+DUAL_ROLE_M_THRESHOLD = mxfp4_supply.DUAL_ROLE_MIN_ROWS
+DUAL_ROLE_RELAY_TILE_ELEMS = 16384
 
 RECIPE = PROFILE = "grouped_gate_up_situ_mxfp4_source"
 SOURCE = mxfp4_supply.SOURCE
@@ -73,18 +72,27 @@ class Tile:
     n: int
 
 
+def _max_group_l1_m(rows: tuple[int, ...]) -> int:
+    """MaxGroupL1M() from gmsq_vcv_controller.h:200-237."""
+    return max(
+        (ceil(m / ceil(m / BASE_TILE_M)) for m in rows if m > 0),
+        default=0,
+    )
+
+
 def owner_tiles(rows, width, tile, cores):
     owners, cursor = [[] for _ in range(cores)], 0
     for bank, rows_in_bank in enumerate(rows):
         if not rows_in_bank:
             continue
         nm = ceil(rows_in_bank / tile.m)
+        m_step = ceil(rows_in_bank / nm)
         nn = ceil(width / tile.n)
         for mi in range(nm):
             for ni in range(nn):
                 owners[cursor % cores].append(
-                    (bank, min(tile.m, rows_in_bank - mi * tile.m),
-                     min(tile.n, width - ni * tile.n), mi * tile.m, ni * tile.n))
+                    (bank, min(m_step, rows_in_bank - mi * m_step),
+                     min(tile.n, width - ni * tile.n), mi * m_step, ni * tile.n))
                 cursor += 1
     return tuple(tuple(items) for items in owners)
 
@@ -128,8 +136,21 @@ def build(op, geometry):
     for role in ("mte1", "mte2_aic", "fixpipe"):
         if geometry.resource_units.get(role) != cores:
             raise ModelingError("mxfp4_gate_requires_private_aic:" + role)
-    # Source N output tile is 128; 24 populated tiles for 3072 and 32 AIC.
-    tile = Tile(BASE_TILE_M, OUTPUT_TILE_N)
+    # grouped_matmul_situ_quant_tiling.cpp:115-125 picks uniform 128-col when
+    # output_width % 128 == 0 and uniform 64-col otherwise.
+    tile_n = mxfp4_supply.output_half_tile(cfg.width)
+    tile = Tile(BASE_TILE_M, tile_n)
+    max_l1_m = _max_group_l1_m(cfg.rows)
+    # gmsq_vcv_controller.h:190-193 launch-wide dual-role predicate:
+    # sub0 owns all weight supply and sub1 owns the SiTU epilogue.
+    dual_role = (
+        max_l1_m >= DUAL_ROLE_M_THRESHOLD
+        and max_l1_m * (GATE_UP_PROJECTIONS * tile_n) <= DUAL_ROLE_RELAY_TILE_ELEMS
+    )
+    base_kb, _, base_micro_k = panel_sizes(
+        min(max_l1_m, BASE_TILE_M) if max_l1_m else BASE_TILE_M,
+        GATE_UP_PROJECTIONS * tile_n,
+    )
     owners = owner_tiles(cfg.rows, cfg.width, tile, cores)
     aiv = geometry.resource_units.get("vector", 2 * cores)
     total = Work()
@@ -158,8 +179,7 @@ def build(op, geometry):
                     scale = vector["scale"]
                     weight_scale_bytes += scale
                     producer_packed_weight_bytes += vector["weight"]
-                    groups = vector["weight"] // WIDEN_PACKED_GROUP_BYTES
-                    typed, counts, _ = gmmsq_widen_work(groups)
+                    typed, counts, _ = mxfp4_supply.widen_panel_work(vector["weight"])
                     raw_alu_lanes += counts.raw_alu_lanes
                     raw_shuffle_lanes += counts.raw_shuffle_lanes
                     vf_groups_total += counts.vf_groups
@@ -189,13 +209,15 @@ def build(op, geometry):
             fixpipe_bytes += released
             physical_ms.add(hw_m)
             total += Work(resources={"fixpipe": released})
-    lower = _make_gate_up_program(owners, cfg, cores, aiv)
+    lower = _make_gate_up_program(owners, cfg, cores, aiv, dual_role)
     return OperatorPlan(total, lower, {
         "implementation": RECIPE, "source": SOURCE,
         "source_execution_domain": "mixed_cube_aiv",
         "source_output_tiles": sum(map(len, owners)),
         "active_aic_owners": sum(bool(x) for x in owners),
-        "matrix_base_tile": (BASE_TILE_M, OUTPUT_TILE_N, BASE_TILE_K),
+        "matrix_base_tile": (BASE_TILE_M, tile_n, base_micro_k),
+        "l1_k_tile": base_kb,
+        "dual_role_mode": dual_role,
         "matrix_group_rows": cfg.rows, "output_width": cfg.width, "k": cfg.k,
         "logical_valid_flops": logical_flops,
         "source_api_flops": api_flops,
@@ -219,7 +241,7 @@ def build(op, geometry):
     })
 
 
-def _append_tile_stages(stages, ctx, stage, owner_id, tile_index, m, n, cfg, aiv, previous):
+def _append_tile_stages(stages, ctx, stage, owner_id, tile_index, m, n, cfg, aiv, previous, dual_role):
     geo = GeoConfig(cfg.k, 2 * n, (m,))
     kb, ka, _ = panel_sizes(m, 2 * n)
     offsets = tuple(range(0, cfg.k, kb))
@@ -271,18 +293,19 @@ def _append_tile_stages(stages, ctx, stage, owner_id, tile_index, m, n, cfg, aiv
         publishes = []
         for sub, vector in enumerate(vectors):
             prefix = f"owner{owner_id}:t{tile_index}:k{offset}:s{sub}"
+            aiv_owner = 2 * owner_id if dual_role else 2 * owner_id + sub
+            read_after = (publishes[-1],) if (dual_role and publishes) else (panel_prev,)
             read = stage(prefix + ":read", Work(resources={
                 "hbm": vector["weight"],
                 "mte2_aiv": vector["weight"]}),
-                2 * owner_id + sub, aiv, after=(panel_prev,))
-            groups = vector["weight"] // WIDEN_PACKED_GROUP_BYTES
-            typed, _, _ = gmmsq_widen_work(groups)
+                aiv_owner, aiv, after=read_after)
+            typed, _, _ = mxfp4_supply.widen_panel_work(vector["weight"])
             widen_stage = stage(prefix + ":widen",
-                                typed, 2 * owner_id + sub, aiv,
+                                typed, aiv_owner, aiv,
                                 after=(prefix + ":read",))
             publish = stage(prefix + ":publish",
                             Work(resources={"mte3": vector["expanded"]}),
-                            2 * owner_id + sub, aiv,
+                            aiv_owner, aiv,
                             after=(prefix + ":widen",))
             stages.extend((read, widen_stage, publish))
             publishes.append(prefix + ":publish")
@@ -322,7 +345,7 @@ def _append_tile_stages(stages, ctx, stage, owner_id, tile_index, m, n, cfg, aiv
     return fix.name
 
 
-def _make_gate_up_program(owners, cfg, cores, aiv):
+def _make_gate_up_program(owners, cfg, cores, aiv, dual_role):
     def lower(ctx):
         def stage(name, work, owner, units=None, **kwargs):
             roles = set(work.resources) - {"hbm"} | ({"cube"} if work.matrix else set())
@@ -336,16 +359,17 @@ def _make_gate_up_program(owners, cfg, cores, aiv):
                                       2 * mxfp4_supply.L1_WEIGHT_BYTES, (owner_id,))
             ub0 = ctx.allocate(f"gate_ub_{owner_id}_0", "ub",
                                mxfp4_supply.UB_BYTES, (2 * owner_id,))
-            ub1 = ctx.allocate(f"gate_ub_{owner_id}_1", "ub",
-                               mxfp4_supply.UB_BYTES, (2 * owner_id + 1,))
-            stages = [Stage(f"owner{owner_id}:reserve",
-                            acquire=(allocation, ub0, ub1))]
+            allocs = (allocation, ub0)
+            if not dual_role:
+                ub1 = ctx.allocate(f"gate_ub_{owner_id}_1", "ub",
+                                   mxfp4_supply.UB_BYTES, (2 * owner_id + 1,))
+                allocs = (allocation, ub0, ub1)
+            stages = [Stage(f"owner{owner_id}:reserve", acquire=allocs)]
             previous = f"owner{owner_id}:reserve"
             for tile_index, (_, m, n, _, _) in enumerate(items):
                 previous = _append_tile_stages(
-                    stages, ctx, stage, owner_id, tile_index, m, n, cfg, aiv, previous)
-            stages.append(Stage(f"owner{owner_id}:release", after=(previous,),
-                                free=(allocation, ub0, ub1)))
+                    stages, ctx, stage, owner_id, tile_index, m, n, cfg, aiv, previous, dual_role)
+            stages.append(Stage(f"owner{owner_id}:release", after=(previous,), free=allocs))
             return KernelProgram(tuple(stages))
 
         return ParallelProgram(tuple(one(i, items)

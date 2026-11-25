@@ -40,6 +40,17 @@ SOURCE_REFS: tuple[SourceRef, ...] = (
 NZ_N_GRANULE = 32
 N_TILE_COLUMNS = 256
 N_TILE_RESPLIT_COLUMNS = N_TILE_COLUMNS // 2
+MX_A8W4_BASE_M_MIN = 128
+MX_A8W4_BASE_N_STEP = 32
+MX_A8W4_TAIL_USAGE_NUMERATOR = 8
+MX_A8W4_TAIL_USAGE_DENOMINATOR = 10
+MX_A8W4_GROUP_DISTRIBUTED_N_MIN = 4096
+MX_A8W4_DISTRIBUTED_TAIL_MIN_DIVISOR = 3
+MX_A8W4_COMPUTE_PER_AIC_TFLOPS = 27.36
+MX_A8W4_A_BYTES_IN_SCALE_GROUP = 33.0
+MX_A8W4_B_BYTES_IN_SCALE_GROUP = 17.0
+MX_A8W4_BANDWIDTH_THRESHOLD_TBS = 2.0
+BYTES_PER_TERABYTE = 1e12
 CUBE_MN_FRACTAL = 16
 CUBE_K_FRACTAL = 32
 A_REFILL_BUFFER_BYTES = 80 * 1024
@@ -83,17 +94,122 @@ class Config:
             raise ModelingError("mxa8w4_nznk_requires_integer_expert_histogram")
 
 
+def device_bandwidths_tbs(geometry) -> tuple[float | None, float | None]:
+    """Extract declared HBM and L2 bandwidths (TB/s) from the active die profile."""
+    rates = getattr(geometry, "rates", None) or {}
+    hbm_raw = rates.get("hbm")
+    l2_raw = rates.get("l2")
+    hbm_tbs = float(hbm_raw) / BYTES_PER_TERABYTE if hbm_raw and float(hbm_raw) > 0 else None
+    l2_tbs = float(l2_raw) / BYTES_PER_TERABYTE if l2_raw and float(l2_raw) > 0 else None
+    return hbm_tbs, l2_tbs
+
+
 def _require_positive_cores(cores) -> int:
     if isinstance(cores, bool) or not isinstance(cores, int) or cores <= 0:
         raise ModelingError("mx_quant_requires_positive_cores")
     return cores
 
 
-def columns(config, cores):
+def _calc_mx_a8w4_bandwidth_resplit(
+    config: Config, cores: int, hbm_bw_tbs: float | None, l2_bw_tbs: float | None,
+) -> tuple[int, int] | None:
+    """CANN 9.3 CalcMxA8W4BandwidthResplit (grouped_weight_quant_batch_matmul_tiling.cpp:944-1019)."""
+    n, groups = config.n, len(config.rows)
+    if (groups == 0 or n > cores * N_TILE_COLUMNS
+            or hbm_bw_tbs is None or l2_bw_tbs is None
+            or hbm_bw_tbs <= MX_A8W4_BANDWIDTH_THRESHOLD_TBS or l2_bw_tbs <= 0.0):
+        return None
+    m_size = sum(config.rows)
+    expected_group_m = ceildiv(m_size, groups)
+    m_block_count = 1 if expected_group_m == 0 else ceildiv(expected_group_m, M_TILE_ROWS)
+    effective_base_m = 0 if expected_group_m == 0 else ceildiv(expected_group_m, m_block_count)
+    if effective_base_m < MX_A8W4_BASE_M_MIN:
+        return None
+    compute_tflops = MX_A8W4_COMPUTE_PER_AIC_TFLOPS * float(cores)
+    task_per_n_block = groups * m_block_count
+    requested_b = float(m_block_count) * float(n) * MX_A8W4_B_BYTES_IN_SCALE_GROUP
+    unique_bytes = (
+        float(m_size) * MX_A8W4_A_BYTES_IN_SCALE_GROUP
+        + float(n) * MX_A8W4_B_BYTES_IN_SCALE_GROUP
+    )
+    base_m_term = 1.0 / (2.0 * float(effective_base_m))
+    for cand_base_n in range(N_TILE_COLUMNS, N_TILE_RESPLIT_COLUMNS - 1, -MX_A8W4_BASE_N_STEP):
+        cand_n_blocks = ceildiv(n, cand_base_n)
+        task_num = task_per_n_block * cand_n_blocks
+        tail_cores = task_num % cores
+        tail_ok = (
+            tail_cores == 0
+            or tail_cores * MX_A8W4_TAIL_USAGE_DENOMINATOR > cores * MX_A8W4_TAIL_USAGE_NUMERATOR
+        )
+        if task_num < cores or not tail_ok:
+            continue
+        requested_a = float(cand_n_blocks) * float(m_size) * MX_A8W4_A_BYTES_IN_SCALE_GROUP
+        hit_rate = 1.0 - unique_bytes / (requested_a + requested_b)
+        est_bw = 1.0 / (hit_rate / l2_bw_tbs + (1.0 - hit_rate) / hbm_bw_tbs)
+        cube_min_bw = compute_tflops / 2.0 * (1.0 / float(cand_base_n) + base_m_term)
+        if est_bw <= cube_min_bw:
+            continue
+        selected_size = align(ceildiv(n, cand_n_blocks), NZ_N_GRANULE)
+        if N_TILE_RESPLIT_COLUMNS <= selected_size <= N_TILE_COLUMNS:
+            return selected_size, cand_n_blocks
+    return None
+
+
+def _traverse_balance_base_n(n: int, groups: int, cores: int) -> tuple[int, int] | None:
+    """CANN 9.3 TraverseForBalanceBaseN descending baseN search (256..128 step 32)."""
+    loop_num = ceildiv(groups * ceildiv(n, N_TILE_COLUMNS), cores)
+    for base_n in range(N_TILE_COLUMNS, N_TILE_RESPLIT_COLUMNS - 1, -MX_A8W4_BASE_N_STEP):
+        block_count = ceildiv(n, base_n)
+        total_blocks = block_count * groups
+        tail_blocks = total_blocks % cores
+        if ((tail_blocks == 0
+             or tail_blocks * MX_A8W4_TAIL_USAGE_DENOMINATOR > MX_A8W4_TAIL_USAGE_NUMERATOR * cores)
+                and ceildiv(total_blocks, cores) == loop_num):
+            return base_n, block_count
+    return None
+
+
+def _no_full_num_blocks_widths(n: int, groups: int, cores: int) -> list[int]:
+    """CANN 9.3 CalcNoFullNumBlocksResplitTiling (lines 2031-2067)."""
+    tasks = ceildiv(n, N_TILE_COLUMNS)
+    if groups * tasks >= cores:
+        balanced = _traverse_balance_base_n(n, groups, cores)
+        if balanced is not None:
+            base_n, block_count = balanced
+            return [base_n] * block_count
+        return [align(ceildiv(n, tasks), NZ_N_GRANULE)] * tasks
+    tasks = max(1, n // N_TILE_RESPLIT_COLUMNS)
+    units, extra = divmod(n // NZ_N_GRANULE, tasks)
+    return ([units * NZ_N_GRANULE] * (tasks - extra)
+            + [(units + 1) * NZ_N_GRANULE] * extra)
+
+
+def columns(
+    config, cores, *,
+    hbm_bw_tbs: float | None = None,
+    l2_bw_tbs: float | None = None,
+):
     """CalcResplitTiling uses declared groups, including inactive groups."""
     cores = _require_positive_cores(cores)
     n, groups = config.n, len(config.rows)
-    if n % (cores * N_TILE_COLUMNS) == 0:
+    bw_selected = _calc_mx_a8w4_bandwidth_resplit(config, cores, hbm_bw_tbs, l2_bw_tbs)
+    n_block_count = ceildiv(n, N_TILE_COLUMNS)
+    group_dist_tail = (groups * n_block_count) % cores
+    prefer_group_dist = (
+        groups > 1
+        and MX_A8W4_GROUP_DISTRIBUTED_N_MIN <= n <= cores * N_TILE_COLUMNS
+        and n_block_count >= ceildiv(cores, groups)
+        and (group_dist_tail == 0
+             or group_dist_tail >= ceildiv(cores, MX_A8W4_DISTRIBUTED_TAIL_MIN_DIVISOR))
+        and hbm_bw_tbs is not None
+        and hbm_bw_tbs > MX_A8W4_BANDWIDTH_THRESHOLD_TBS
+    )
+    if bw_selected is not None:
+        sel_size, sel_count = bw_selected
+        widths = [sel_size] * sel_count
+    elif prefer_group_dist:
+        widths = _no_full_num_blocks_widths(n, groups, cores)
+    elif n % (cores * N_TILE_COLUMNS) == 0:
         widths = [N_TILE_COLUMNS] * (n // N_TILE_COLUMNS)
     elif n > cores * N_TILE_RESPLIT_COLUMNS:
         main = max(n // (cores * N_TILE_COLUMNS) - 1, 0) * cores
@@ -104,14 +220,7 @@ def columns(config, cores):
                   + [units * NZ_N_GRANULE] * (tasks - extra)
                   + [(units + 1) * NZ_N_GRANULE] * extra)
     else:
-        tasks = ceildiv(n, N_TILE_COLUMNS)
-        if groups * tasks >= cores:
-            widths = [align(ceildiv(n, tasks), NZ_N_GRANULE)] * tasks
-        else:
-            tasks = max(1, n // N_TILE_RESPLIT_COLUMNS)
-            units, extra = divmod(n // NZ_N_GRANULE, tasks)
-            widths = ([units * NZ_N_GRANULE] * (tasks - extra)
-                      + [(units + 1) * NZ_N_GRANULE] * extra)
+        widths = _no_full_num_blocks_widths(n, groups, cores)
     result = []
     offset = 0
     for width in widths:
@@ -122,10 +231,14 @@ def columns(config, cores):
     return tuple(result)
 
 
-def owner_tiles(config, owner, cores):
+def owner_tiles(
+    config, owner, cores, *,
+    hbm_bw_tbs: float | None = None,
+    l2_bw_tbs: float | None = None,
+):
     """Rolling output-tile index across experts, then M and N."""
     cores = _require_positive_cores(cores)
-    ntiles = columns(config, cores)
+    ntiles = columns(config, cores, hbm_bw_tbs=hbm_bw_tbs, l2_bw_tbs=l2_bw_tbs)
 
     def _iter():
         start = 0
@@ -143,9 +256,13 @@ def owner_tiles(config, owner, cores):
     return _iter()
 
 
-def tile_runs(config, owner, cores, compact):
+def tile_runs(
+    config, owner, cores, compact, *,
+    hbm_bw_tbs: float | None = None,
+    l2_bw_tbs: float | None = None,
+):
     """Consecutive equal physical tiles; each repeat still reads its own bank."""
-    tiles = owner_tiles(config, owner, cores)
+    tiles = owner_tiles(config, owner, cores, hbm_bw_tbs=hbm_bw_tbs, l2_bw_tbs=l2_bw_tbs)
     for (m, n), members in groupby(tiles, key=lambda tile: tile[-2:]):
         if compact:
             yield m, n, sum(1 for _ in members)
@@ -200,24 +317,42 @@ def m_tile_repeats(config):
     return repeats, passes
 
 
-def owner_panel_bytes(config, cores):
+def owner_panel_bytes(
+    config, cores, *,
+    hbm_bw_tbs: float | None = None,
+    l2_bw_tbs: float | None = None,
+):
     """Concurrent multi-owner 256-column B panel set, including MX scale pairs."""
     cores = _require_positive_cores(cores)
-    width = max((width for _, width in columns(config, cores)), default=config.n)
+    width = max(
+        (width for _, width in columns(config, cores, hbm_bw_tbs=hbm_bw_tbs, l2_bw_tbs=l2_bw_tbs)),
+        default=config.n,
+    )
     payload = config.k * width // 2
     scales = config.k * width // MX_SCALE_GROUP
     return float(cores * (payload + scales))
 
 
-def resplit_columns(config, cores):
+def resplit_columns(
+    config, cores, *,
+    hbm_bw_tbs: float | None = None,
+    l2_bw_tbs: float | None = None,
+):
     """True when ``CalcResplitTiling`` narrows the declared 256-column tiling."""
     cores = _require_positive_cores(cores)
     if config.n <= cores * N_TILE_RESPLIT_COLUMNS:
         return False
-    return any(width < N_TILE_COLUMNS for _, width in columns(config, cores))
+    return any(
+        width < N_TILE_COLUMNS
+        for _, width in columns(config, cores, hbm_bw_tbs=hbm_bw_tbs, l2_bw_tbs=l2_bw_tbs)
+    )
 
 
-def weight_l2_fraction(config, cores, l2_bytes):
+def weight_l2_fraction(
+    config, cores, l2_bytes, *,
+    hbm_bw_tbs: float | None = None,
+    l2_bw_tbs: float | None = None,
+):
     """Share of a repeated 256-column B panel served by resident L2.
 
     The declared working set is the concurrent multi-owner panel set plus one
@@ -231,7 +366,10 @@ def weight_l2_fraction(config, cores, l2_bytes):
     repeats, passes = m_tile_repeats(config)
     if not passes:
         return 0.0
-    working = owner_panel_bytes(config, cores) + activation_bank_bytes(config)
+    working = (
+        owner_panel_bytes(config, cores, hbm_bw_tbs=hbm_bw_tbs, l2_bw_tbs=l2_bw_tbs)
+        + activation_bank_bytes(config)
+    )
     retention = min(1.0, float(l2_bytes) / working) if working else 0.0
     return retention * repeats / passes
 
@@ -356,7 +494,9 @@ class GeometryLedger:
 @lru_cache(maxsize=GEOMETRY_CACHE_SIZE)
 def geometry_ledger(config: Config, cores: int, compact: bool = True,
                     directional_mte1: bool = False,
-                    l2_bytes: int | None = None) -> GeometryLedger:
+                    l2_bytes: int | None = None,
+                    hbm_bw_tbs: float | None = None,
+                    l2_bw_tbs: float | None = None) -> GeometryLedger:
     """Reuse exact source work for repeated layer geometry, independent of rates.
 
     The source has two AIVs per AIC. InitMx reads its 256-byte permutation on
@@ -376,11 +516,15 @@ def geometry_ledger(config: Config, cores: int, compact: bool = True,
     inventory = InstructionInventory({})
     counts, runs = [], []
     activation_l2 = activation_l2_fraction(config, cores, resolved_l2)
-    weight_l2 = weight_l2_fraction(config, cores, resolved_l2)
+    weight_l2 = weight_l2_fraction(
+        config, cores, resolved_l2, hbm_bw_tbs=hbm_bw_tbs, l2_bw_tbs=l2_bw_tbs)
     for owner in range(cores):
-        count = sum(1 for _ in owner_tiles(config, owner, cores))
+        count = sum(
+            1 for _ in owner_tiles(config, owner, cores, hbm_bw_tbs=hbm_bw_tbs, l2_bw_tbs=l2_bw_tbs))
         run_count = 0
-        for m, n, repeat in tile_runs(config, owner, cores, compact):
+        for m, n, repeat in tile_runs(
+            config, owner, cores, compact, hbm_bw_tbs=hbm_bw_tbs, l2_bw_tbs=l2_bw_tbs
+        ):
             work += tile_work(config, m, n, cores=cores,
                               directional_mte1=directional_mte1,
                               activation_l2=activation_l2,
