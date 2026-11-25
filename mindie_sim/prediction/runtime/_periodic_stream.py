@@ -190,16 +190,26 @@ def _overlap_canonical_intervals(
     return total
 
 
+def _row_index_bounds(
+    base: int, rows: int, row_bytes: int, stride: int, sec: int, lo: int, hi: int,
+) -> tuple[int, int]:
+    """Exact inclusive row-index bounds whose sector intervals intersect ``[lo, hi)``."""
+    if hi <= lo or rows <= 0 or row_bytes <= 0 or stride <= 0:
+        return 1, 0
+    hi_limit = ((hi + sec - 1) // sec) * sec - 1
+    if hi_limit < base:
+        return 1, 0
+    k_hi = min(rows - 1, (hi_limit - base) // stride)
+    lo_sec = (lo // sec) * sec
+    num_lo = lo_sec - row_bytes + 1 - base
+    k_lo = 0 if num_lo <= 0 else (num_lo + stride - 1) // stride
+    return k_lo, k_hi
+
+
 def _run_overlap_small_interval(run: PeriodicSectorRun, lo: int, hi: int) -> int:
     """Exact byte overlap of ``run`` with a small window ``[lo, hi)`` in O(1) memory."""
-    if hi <= lo or run.rows <= 0 or run.row_bytes <= 0 or run.stride_bytes <= 0:
-        return 0
     sec, stride, base, rb = run.sector_bytes, run.stride_bytes, run.base_byte, run.row_bytes
-    if hi - 1 < base:
-        return 0
-    num_lo = lo - sec - base - rb
-    k_lo = 0 if num_lo < 0 else (num_lo // stride) + 1
-    k_hi = min(run.rows - 1, (hi - 1 - base) // stride)
+    k_lo, k_hi = _row_index_bounds(base, run.rows, rb, stride, sec, lo, hi)
     if k_lo > k_hi:
         return 0
     total = 0
@@ -235,11 +245,9 @@ def _iter_two_run_overlap(a: PeriodicSectorRun, b: PeriodicSectorRun, lo: int, h
     ba, bb = a.base_byte, b.base_byte
     ra, rb = a.row_bytes, b.row_bytes
     seca, secb = a.sector_bytes, b.sector_bytes
-    if sa <= 0 or sb <= 0 or hi - 1 < ba:
+    if sa <= 0 or sb <= 0:
         return
-    num_lo = lo - seca - ba - ra
-    ka_lo = 0 if num_lo < 0 else (num_lo // sa) + 1
-    ka_hi = min(a.rows - 1, (hi - 1 - ba) // sa)
+    ka_lo, ka_hi = _row_index_bounds(ba, a.rows, ra, sa, seca, lo, hi)
     if ka_lo > ka_hi:
         return
     hi_mod = rb + seca + secb - 1
@@ -268,25 +276,22 @@ def _iter_two_run_overlap(a: PeriodicSectorRun, b: PeriodicSectorRun, lo: int, h
         e_a = ((addr_a + ra + seca - 1) // seca) * seca
         c_lo = lo if s_a < lo else s_a
         c_hi = hi if e_a > hi else e_a
-        if c_hi > c_lo and c_hi - 1 >= bb:
-            n_lo_b = c_lo - secb - bb - rb
-            jb_lo = 0 if n_lo_b < 0 else (n_lo_b // sb) + 1
-            jb_hi = min(b.rows - 1, (c_hi - 1 - bb) // sb)
-            for j in range(jb_lo, jb_hi + 1):
-                addr_b = bb + j * sb
-                s_b = (addr_b // secb) * secb
-                e_b = ((addr_b + rb + secb - 1) // secb) * secb
-                o_lo = c_lo if s_b < c_lo else s_b
-                o_hi = c_hi if e_b > c_hi else e_b
-                if o_hi > o_lo:
-                    if cur_hi < 0:
-                        cur_lo, cur_hi = o_lo, o_hi
-                    elif o_lo <= cur_hi:
-                        if o_hi > cur_hi:
-                            cur_hi = o_hi
-                    else:
-                        yield cur_lo, cur_hi
-                        cur_lo, cur_hi = o_lo, o_hi
+        jb_lo, jb_hi = _row_index_bounds(bb, b.rows, rb, sb, secb, c_lo, c_hi)
+        for j in range(jb_lo, jb_hi + 1):
+            addr_b = bb + j * sb
+            s_b = (addr_b // secb) * secb
+            e_b = ((addr_b + rb + secb - 1) // secb) * secb
+            o_lo = c_lo if s_b < c_lo else s_b
+            o_hi = c_hi if e_b > c_hi else e_b
+            if o_hi > o_lo:
+                if cur_hi < 0:
+                    cur_lo, cur_hi = o_lo, o_hi
+                elif o_lo <= cur_hi:
+                    if o_hi > cur_hi:
+                        cur_hi = o_hi
+                else:
+                    yield cur_lo, cur_hi
+                    cur_lo, cur_hi = o_lo, o_hi
         i += 1
     if cur_hi >= 0:
         yield cur_lo, cur_hi
@@ -329,15 +334,13 @@ def _iter_union_stream(runs: tuple[PeriodicSectorRun, ...], lo: int, hi: int):
     active: list[int] = []
     for idx, r in enumerate(runs):
         sec, stride, base, rb = secs[idx], strides[idx], bases[idx], rbs[idx]
-        if r.rows <= 0 or rb <= 0 or stride <= 0 or hi - 1 < base:
+        k_lo, k_hi = _row_index_bounds(base, r.rows, rb, stride, sec, lo, hi)
+        if k_lo > k_hi:
             steps.append(1)
             k_his.append(0)
             cur_los.append(-1)
             cur_his.append(-1)
             continue
-        num_lo = lo - sec - base - rb
-        k_lo = 0 if num_lo < 0 else (num_lo // stride) + 1
-        k_hi = min(r.rows - 1, (hi - 1 - base) // stride)
         c_lo = c_hi = -1
         st = k_lo
         while st <= k_hi:
