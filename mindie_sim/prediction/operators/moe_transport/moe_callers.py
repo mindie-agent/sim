@@ -16,6 +16,7 @@ import math
 from typing import Any, Literal, Mapping, Sequence
 
 from mindie_sim.catalog.expert_slots import expert_slot_plan
+from mindie_sim.catalog.quant import projection_quant
 from mindie_sim.prediction.operators.moe_routing.expert_slot_work import physical_slot_work
 from mindie_sim.schema.common import (
     EPLB_VARIANCE_DAMPING,
@@ -53,6 +54,7 @@ _FLOAT_EXPERT_FORMATS = {"bf16": "bf16", "bfloat16": "bf16",
 _W8A8_FORMATS = {"int8": "int8", "w8a8": "int8"}
 _FULL_EAGER_GROUPED = "full_eager_allocation"
 _ROUTING_INDEX_BYTES = int(dtype_bytes("int32"))
+_FP32_BYTES = int(dtype_bytes("fp32"))
 _RAW_EXPERT_COUNT_BYTES = int(dtype_bytes("int32"))
 _CAST_EXPERT_COUNT_BYTES = int(dtype_bytes("int64"))
 _STRAGGLER_ORDER_EPS = 1e-12
@@ -250,11 +252,11 @@ def _category_format(quant, category):
     return quant.for_category(category).format_for(category)
 
 
-def _expert_path(model):
+def _expert_path(model, plan=None):
     """Float experts stay on the original caller. W8A8 is a separate legal path.
 
-    Routed int8 or w8a8 with a floating activation is accepted when the shared
-    expert is that same activation float or the same int8. Shared int8 beside
+    Routed W8A8 with a floating activation is accepted when any present shared
+    expert is that same activation float or W8A8. W8A16, shared W8A8 beside
     floating routed experts, mixed floats, and every other quantized format
     stay rejected. The recipe still has to be selected explicitly.
     """
@@ -262,12 +264,26 @@ def _expert_path(model):
     if activation is None:
         raise ModelingError(
             f"local_expert_reduce_requires_floating_activation_dtype:{model.activation_dtype}")
-    routed_shown = _category_format(model.quant, "routed_expert")
-    shared_shown = _category_format(model.quant, "shared_expert")
+    quant = projection_quant(model.quant, plan) if plan is not None else model.quant
+    has_shared = plan is None or int(getattr(plan, "num_shared_experts", 0) or 0) > 0
+    routed_shown = _category_format(quant, "routed_expert")
     routed_f = _FLOAT_EXPERT_FORMATS.get(str(routed_shown).strip().lower())
+    routed_w8a8 = quant.linear_method("routed_expert") == "w8a8"
+    if not has_shared:
+        if routed_f is not None:
+            if routed_f != activation:
+                raise ModelingError(
+                    "local_expert_reduce_rejects_mixed_expert_format:"
+                    f"routed_expert:{routed_f}!={activation}")
+            return "float"
+        if routed_w8a8:
+            return "w8a8"
+        raise ModelingError(
+            "local_expert_reduce_rejects_quantized_expert_format:"
+            f"routed_expert:{routed_shown}")
+    shared_shown = _category_format(quant, "shared_expert")
     shared_f = _FLOAT_EXPERT_FORMATS.get(str(shared_shown).strip().lower())
-    routed_q = _W8A8_FORMATS.get(str(routed_shown).strip().lower())
-    shared_q = _W8A8_FORMATS.get(str(shared_shown).strip().lower())
+    shared_w8a8 = quant.linear_method("shared_expert") == "w8a8"
     if routed_f is not None and shared_f is not None:
         if routed_f != activation:
             raise ModelingError(
@@ -278,7 +294,7 @@ def _expert_path(model):
                 "local_expert_reduce_rejects_mixed_expert_format:"
                 f"shared_expert:{shared_f}!={activation}")
         return "float"
-    if routed_q == "int8" and (shared_f == activation or shared_q == "int8"):
+    if routed_w8a8 and (shared_f == activation or shared_w8a8):
         return "w8a8"
     if routed_f is None:
         raise ModelingError(
@@ -607,6 +623,8 @@ class LocalExpertReduce:
     reduce_after_join: bool = True
     #: W8A8 eager allocation is a witness; matrix m stays the local bank rows.
     full_buffer_grouped: bool = False
+    #: Exact count of tokens whose slot-0 top-k expert belongs to this local bank.
+    slot0_active_tokens: int | None = None
 
     def __post_init__(self):
         if self.ep < 1 or self.experts % self.ep:
@@ -794,7 +812,22 @@ class LocalExpertReduce:
         allocation = self.allocated_rows
         read = local_rows * latent * act_bytes + allocation * (_ROUTING_INDEX_BYTES + weight_bytes)
         write = tokens * latent * act_bytes
-        return read, write, 2 * tokens * latent * self.top_k + allocation
+        # CANN KernelMoeTokenUnpermute (moe_token_unpermute.h:249-358):
+        # masked slot-0 tokens zero-fill (Duplicate), active slot-0 tokens scale
+        # without Add (CalFirstToken), later active slots scale+accumulate
+        # (CalToken), and non-FP32 rows cast on load and output store.
+        if self.slot0_active_tokens is not None:
+            first_active = min(float(tokens), float(local_rows), float(self.slot0_active_tokens))
+        else:
+            first_active = (
+                min(float(tokens), float(local_rows) / float(self.top_k))
+                if self.top_k > 0 else 0.0
+            )
+        zero_fill_ops = max(0.0, float(tokens) - first_active) * latent
+        mul_ops = float(local_rows) * latent
+        add_ops = max(0.0, float(local_rows) - first_active) * latent
+        cast_ops = (float(local_rows) + float(tokens)) * latent if act_bytes < _FP32_BYTES else 0.0
+        return read, write, zero_fill_ops + mul_ops + add_ops + cast_ops + allocation
 
     def unpack_metadata(self, local_rows, weight_dtype):
         return (
@@ -873,7 +906,7 @@ def select(runtime, plan, parallel, model, tokens: int, *,
         raise ModelingError("local_expert_reduce_rejects_routed_output_transform")
     if global_tokens not in (None, tokens):
         raise ModelingError("local_expert_reduce_requires_replicated_dp1_tokens")
-    path = _expert_path(model)
+    path = _expert_path(model, plan)
     # The full grouped-matmul buffer is an explicit W8A8 witness. A float
     # caller that does not declare it keeps the heaviest contiguous bank.
     full_buffer = (
@@ -914,6 +947,21 @@ def select(runtime, plan, parallel, model, tokens: int, *,
             raise ModelingError("local_expert_reduce_topk_ids_must_match_tokens")
         if getattr(routing_realization, "ep", parallel.ep) != parallel.ep:
             raise ModelingError("local_expert_reduce_realization_ep_must_match_parallel_ep")
+        if topk_ids is not None:
+            bank = plan.num_experts // parallel.ep
+            if basis == EXPLICIT_TOKEN_ROUTING:
+                rep = getattr(routing_realization, "representative_rank", None)
+                rep_valid = type(rep) is int and 0 <= rep < parallel.ep
+            else:
+                rank_totals = tuple(
+                    sum(rows[rank * bank:(rank + 1) * bank]) for rank in range(parallel.ep)
+                )
+                rep = max(range(parallel.ep), key=rank_totals.__getitem__)
+                rep_valid = True
+            if rep_valid:
+                lo, hi = rep * bank, (rep + 1) * bank
+                slot0_active = sum(1 for slots in topk_ids if slots and lo <= int(slots[0]) < hi)
+                policy = replace(policy, slot0_active_tokens=slot0_active)
     return policy
 
 

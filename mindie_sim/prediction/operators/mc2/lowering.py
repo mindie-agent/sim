@@ -115,6 +115,28 @@ def peer_stages(name: str, after: tuple[str, ...], route: PeerRoute, transport: 
     return tuple(phases)
 
 
+def _mx_pack_quant_ops(layout) -> int:
+    """MX group-32 pack vector ops grounded in CANN ``QuantDynamicMx``.
+
+    ``ComputeMaxExp`` iterates ``ceil(width / 256)`` tiles and ``ComputeScale``
+    emits ``align_up(ceil(width / 32), 2)`` E8M0 scales.  FP8 E4M3 and E5M2
+    share ``ComputeFp8Data``; FP4 uses ``ComputeFp4Data`` (mul + direct packed
+    cast + pair add, ``quantize_functions.h:515-521``).
+    """
+    from .common import MX_GROUP_SIZE
+    from .mc2_mx_quant import MX32_TILE_ELEMS, _SCALE_OPS_PER_GROUP, mx32_work
+
+    aligned = align_up(layout.width, MX32_TILE_ELEMS)
+    base = mx32_work(aligned, "bf16", "fp8_e4m3")
+    scales = align_up(align_up(layout.width, MX_GROUP_SIZE) // MX_GROUP_SIZE, 2)
+    scale_ops = base["scale_construction"] - _SCALE_OPS_PER_GROUP * (aligned // MX_GROUP_SIZE - scales)
+    if layout.payload_dtype in {"fp4_e2m1", "fp4"}:
+        rescale_ops = 2 * layout.width + align_up(layout.width, 2) // 2
+    else:
+        rescale_ops = FP8_QUANT_OPS * layout.width
+    return base["max_exponent"] + scale_ops + rescale_ops
+
+
 def cohort_stages(
     contract: Mc2Contract, cohort_slice: Mc2CohortSlice, transport: Transport,
     framing: tuple[int, int, int, int], *,
@@ -135,9 +157,14 @@ def cohort_stages(
     meta_bytes = layout.expert_scale_bytes + INT32_BYTES if dispatch else TRIPLE_META_BYTES
     pack = working * (layout.input_bytes + layout.input_scale_bytes + meta_bytes)
     vector = working  # One validity test per packed or masked assignment.
-    if dispatch and layout.quant_mode != "none":
-        ops = INT8_QUANT_OPS if layout.payload_dtype == "int8" else FP8_QUANT_OPS
-        vector += working * (ops * layout.width - 1)
+    if dispatch and layout.quant_mode != "none" and part.source_assignments:
+        if layout.quant_mode == "mx":
+            quant_ops = _mx_pack_quant_ops(layout)
+        else:
+            ops = INT8_QUANT_OPS if layout.payload_dtype == "int8" else FP8_QUANT_OPS
+            quant_ops = ops * layout.width - 1
+        # CANN SendToMoeExpert bounds quantization by active count, skipping masked rows.
+        vector += part.source_assignments * quant_ops
     pack_name = prefix + "pack"
     phases = [Phase(pack_name, after, read_work(pack) + Work(resources={"vector": vector}), "aiv", tag + (
         ("pack_input_bytes", pack), ("masked_padding_rows", part.masked_padding_rows),

@@ -26,7 +26,7 @@ from typing import Mapping
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.program import KernelProgram
-from .mc2_program import Mc2LaunchView, _peer_class_for
+from .mc2_program import Mc2LaunchView, _as_fraction, _peer_class_for
 from .mc2_program_state import Mc2ProgramState
 
 TARGET_BACKEND = "ascend"
@@ -265,7 +265,7 @@ class _Mc2Program(Mc2ProgramState):
             phase_ready, event = self._start_local_phase(
                 engine, name, phase, ready, events, view, transport,
                 placeholder_map, handles, local_count_event, local_payload_event,
-                payload_transport_arrivals,
+                payload_transport_arrivals, source_map=source_map,
             )
             if phase.name == "count_status_exchange":
                 local_count_event = event
@@ -314,7 +314,7 @@ class _Mc2Program(Mc2ProgramState):
 
     def _receive_flag_attempts(
         self, phase, plan, program, events, view, transport, placeholder_map, handles,
-        local_payload_event=None, payload_transport_arrivals=(),
+        local_payload_event=None, payload_transport_arrivals=(), source_map=None,
     ):
         # The real MTE2/Compare success chain starts after the
         # selected inbound payload arrivals and local prerequisites.
@@ -337,8 +337,9 @@ class _Mc2Program(Mc2ProgramState):
         incoming = ()
         if owners:
             incoming = tuple(dict.fromkeys(
-                event_ for (source, destination, phase_name), event_
-                in placeholder_map.items()
+                event_
+                for table in (placeholder_map, source_map or {})
+                for (source, destination, phase_name), event_ in table.items()
                 if destination in local_destinations
                 and phase_name == "payload_exchange"
                 and source != destination))
@@ -400,7 +401,9 @@ class _Mc2Program(Mc2ProgramState):
                     failure_sff_program) if retry else None
         return deps, incoming, programs
 
-    def _receive_count_specs(self, plan, program, view, transport, placeholder_map):
+    def _receive_count_specs(
+        self, plan, program, view, transport, placeholder_map, source_map=None,
+    ):
         count_specs = []
         active = tuple((plan.metadata or {}).get(
             "active_owner_domain") or ())
@@ -413,8 +416,8 @@ class _Mc2Program(Mc2ProgramState):
             count_local = {int(view.rank)}
         count_cells = {
             (source, destination, pname): ev
-            for (source, destination, pname), ev
-            in placeholder_map.items()
+            for table in (placeholder_map, source_map or {})
+            for (source, destination, pname), ev in table.items()
             if pname == "count_status_exchange"
             and destination in count_local
             and source != destination}
@@ -583,7 +586,7 @@ class _Mc2Program(Mc2ProgramState):
     def _start_local_phase(
         self, engine, name, phase, ready, events, view, transport,
         placeholder_map, handles, local_count_event, local_payload_event=None,
-        payload_transport_arrivals=(),
+        payload_transport_arrivals=(), source_map=None,
     ):
         plan = self.plans[phase.name]
         program = plan.program(self._context(view))
@@ -599,6 +602,7 @@ class _Mc2Program(Mc2ProgramState):
                 phase, plan, program, events, view, transport, placeholder_map, handles,
                 local_payload_event=local_payload_event,
                 payload_transport_arrivals=payload_transport_arrivals,
+                source_map=source_map,
             )
         else:
             deps = tuple(
@@ -614,7 +618,9 @@ class _Mc2Program(Mc2ProgramState):
 
         count_specs = []
         if phase.name == "receive_counts":
-            count_specs = self._receive_count_specs(plan, program, view, transport, placeholder_map)
+            count_specs = self._receive_count_specs(
+                plan, program, view, transport, placeholder_map, source_map=source_map,
+            )
             if count_specs and local_count_event is not None:
                 deps = (local_count_event,)
 
@@ -633,7 +639,9 @@ class _Mc2Program(Mc2ProgramState):
             event = program.start(engine, f"{name}:{phase.name}", phase_ready)
         return phase_ready, event
 
-    def _start_frame_exchange(self, engine, name, phase, event, view, placeholder_map, handles):
+    def _start_frame_exchange(
+        self, engine, name, phase, event, view, placeholder_map, handles, source_map=None,
+    ):
         # Whole-frame projected token payload: exact selected
         # destinations.  The source transmission is one physical issue
         # per real edge; the reservation resolves only on the arrival
@@ -679,8 +687,11 @@ class _Mc2Program(Mc2ProgramState):
                     "send_placeholder": placeholder,
                     "remote_send": None}
         for index, peer in enumerate(view.peer_labels):
-            incoming = placeholder_map.get(
+            incoming = (source_map or {}).get(
                 (peer, view.rank, phase.name))
+            if incoming is None:
+                incoming = placeholder_map.get(
+                    (peer, view.rank, phase.name))
             if incoming is None:
                 continue
             klass = view.class_for(index, peer)
@@ -739,6 +750,11 @@ class _Mc2Program(Mc2ProgramState):
                 weight = (view.peer_weights[index] /
                           class_weight[klass]
                           if class_weight[klass] else Fraction(0))
+                if (phase.name == "payload_exchange"
+                        and self.route_matrix_bytes is not None):
+                    peer_bytes = _as_fraction(self.payload_bytes(view.rank, peer))
+                else:
+                    peer_bytes = total * weight
                 send = send_by_peer.get(peer)
                 if send is None:
                     send = source_map.get(
@@ -747,19 +763,19 @@ class _Mc2Program(Mc2ProgramState):
                     (view.rank, peer, phase.name))
                 arrival = None
                 if send is None:
-                    work = ({key: float(total * weight)}
-                            if total * weight else {})
+                    work = {key: float(peer_bytes)} if peer_bytes > 0 else {}
                     send = engine.submit(
                         f"{name}:{phase.name}:peer{peer}:send",
                         work=work, after=(event,))
-                    arrival = engine.submit(
-                        f"{name}:{phase.name}:peer{peer}:arrival",
-                        latency=float(view.latency_for(klass)),
-                        after=(send,), native_hook=placeholder is not None,
-                        on_complete=(
-                            (lambda _event, _placeholder=placeholder:
-                             engine.resolve(_placeholder))
-                            if placeholder is not None else None))
+                    if peer_bytes > 0 or placeholder is not None:
+                        arrival = engine.submit(
+                            f"{name}:{phase.name}:peer{peer}:arrival",
+                            latency=float(view.latency_for(klass)) if peer_bytes > 0 else 0.0,
+                            after=(send,), native_hook=placeholder is not None,
+                            on_complete=(
+                                (lambda _event, _placeholder=placeholder:
+                                 engine.resolve(_placeholder))
+                                if placeholder is not None else None))
                 incoming = source_map.get(
                     (peer, view.rank, phase.name))
                 if incoming is None:
@@ -781,6 +797,11 @@ class _Mc2Program(Mc2ProgramState):
                         after=(check,))
                     peer_events.append(retire)
                 peer_events.append(send)
+                if arrival is not None and placeholder is None and peer_bytes > 0:
+                    # No peer receive will consume this arrival (isolated
+                    # representative launch). The send is complete only
+                    # when its declared propagation has elapsed.
+                    peer_events.append(arrival)
                 slot = handles["peer_events"].setdefault(
                     phase.name, {}).setdefault(peer, {})
                 slot.update({
@@ -827,6 +848,7 @@ class _Mc2Program(Mc2ProgramState):
         elif phase.name == "payload_exchange" and view.payload_frames:
             event = self._start_frame_exchange(
                 engine, name, phase, event, view, placeholder_map, handles,
+                source_map=source_map,
             )
         elif (link and view.peer_labels and
               not (phase.name == "payload_exchange" and
@@ -843,8 +865,11 @@ class _Mc2Program(Mc2ProgramState):
             # do not invent a local send.
             incoming_events = []
             for index, peer in enumerate(view.peer_labels):
-                incoming = placeholder_map.get(
+                incoming = source_map.get(
                     (peer, view.rank, phase.name))
+                if incoming is None:
+                    incoming = placeholder_map.get(
+                        (peer, view.rank, phase.name))
                 if incoming is None:
                     continue
                 klass = view.class_for(index, peer)
