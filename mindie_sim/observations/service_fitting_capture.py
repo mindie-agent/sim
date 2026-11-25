@@ -167,16 +167,17 @@ def capture_image_identity(capture_path):
             "checks": checks, "reason": "capture_image_identity_not_declared"}
 
 
-_CAPTURE_DTYPE_BYTES = {
-    "DT_BF16": 2, "DT_FLOAT16": 2, "DT_FLOAT": 4, "DT_INT8": 1,
-    "DT_UINT8": 1, "DT_FLOAT8_E4M3FN": 1, "DT_FLOAT8_E8M0": 1,
-    "DT_INT64": 8, "DT_INT32": 4,
+_BITS_PER_BYTE = 8
+_CANONICAL_DTYPE_BITS = {
+    "bf16": 16, "fp16": 16, "fp32": 32, "fp64": 64,
+    "int8": 8, "uint8": 8, "int16": 16, "uint16": 16,
+    "int32": 32, "uint32": 32, "int64": 64, "uint64": 64,
+    "bool": 8, "fp8_e4m3": 8, "fp8_e5m2": 8, "fp8_e8m0": 8, "hif8": 8,
+    "int4": 4, "uint4": 4, "fp4_e2m1": 4, "uint1": 1,
 }
-_CAPTURE_DTYPE_ALIASES = {
-    "DT_BF16": "bf16", "DT_FLOAT16": "fp16", "DT_FLOAT": "fp32",
-    "DT_INT8": "int8", "DT_UINT8": "uint8", "DT_FLOAT8_E4M3FN": "fp8_e4m3",
-    "DT_FLOAT8_E8M0": "fp8_e8m0", "DT_INT64": "int64", "DT_INT32": "int32",
-}
+_SCATTER_MIN_INPUTS = 5
+_SCATTER_OUTPUT_COUNT = 2
+_SCATTER_SLOT_DTYPES = frozenset({"int32", "int64"})
 _PIPE_RATIO_ABSOLUTE_TOLERANCE = 0.0005
 _PIPE_RATIO_RELATIVE_TOLERANCE = 0.02
 _AIC_PIPES = ("mac", "scalar", "mte1", "mte2", "mte3", "fixpipe")
@@ -249,11 +250,17 @@ def parse_capture_abi(row):
         return str(value or "").strip().strip("\"").strip("'").strip()
 
     def split(value):
-        return [item.strip() for item in clean(value).split(";") if item.strip()]
+        text = clean(value)
+        if not text:
+            return []
+        return [item.strip() for item in text.split(";")]
 
     def shaped(values):
         parsed = []
         for item in values:
+            if not item:
+                parsed.append([])
+                continue
             try:
                 parsed.append([int(part) for part in item.split(",") if part])
             except ValueError:
@@ -447,25 +454,65 @@ def _capture_matrix_geometry(abi):
     }, None
 
 
+def _canonical_capture_dtype(dtype):
+    raw = str(dtype or "").strip()
+    if not raw:
+        return None
+    return (
+        _OBSERVED_DTYPES.get(raw)
+        or _OBSERVED_DTYPES.get(raw.upper())
+        or _OBSERVED_DTYPES.get(raw.lower())
+    )
+
+
+def _shape_elements(shape):
+    return math.prod(int(dim) for dim in shape)
+
+
+def _tensor_nbytes(shape, dtype):
+    canonical = _canonical_capture_dtype(dtype)
+    bits = _CANONICAL_DTYPE_BITS.get(canonical)
+    if bits is None:
+        return None
+    return (_shape_elements(shape) * bits + _BITS_PER_BYTE - 1) // _BITS_PER_BYTE
+
+
+def _capture_tensor_bytes(shapes, dtypes, prefix):
+    """Return ``(total_or_none, by_tensor, unknown_entries)`` for captured tensors."""
+    total = 0
+    by_tensor = {}
+    unknown = []
+    for index, shape in enumerate(shapes):
+        if shape is None:
+            unknown.append({"tensor": f"{prefix}{index}", "dtype": None})
+            continue
+        if not shape:
+            continue
+        raw_dtype = dtypes[index] if index < len(dtypes) else ""
+        nbytes = _tensor_nbytes(shape, raw_dtype)
+        if nbytes is None:
+            unknown.append({
+                "tensor": f"{prefix}{index}",
+                "dtype": raw_dtype or None,
+            })
+            continue
+        by_tensor[f"{prefix}{index}"] = nbytes
+        total += nbytes
+    return (None if unknown else int(total)), by_tensor, unknown
+
+
 def _capture_tensor(name, shape, dtype, layout=None):
+    canonical = _canonical_capture_dtype(dtype)
     return {
         "name": name,
         "shape": [int(item) for item in shape],
-        "dtype": _CAPTURE_DTYPE_ALIASES.get(dtype, str(dtype).lower()),
+        "dtype": canonical if canonical is not None else str(dtype).lower(),
         **({"layout": layout} if layout else {}),
     }
 
 
 def _capture_bytes(shapes, dtypes):
-    total = 0
-    for shape, dtype in zip(shapes, dtypes):
-        width = _CAPTURE_DTYPE_BYTES.get(dtype)
-        if width is None or not shape:
-            continue
-        elements = 1
-        for dim in shape:
-            elements *= int(dim)
-        total += elements * width
+    total, _, _ = _capture_tensor_bytes(shapes, dtypes, "tensor")
     return total
 
 
@@ -513,8 +560,15 @@ def bind_capture_native_plan(row, *, image_id=None):
         "n": geometry_info["n"],
         "macs": geometry_info["macs"],
     }
-    input_bytes = _capture_bytes(inputs, abi["input_dtypes"])
-    output_bytes = _capture_bytes(outputs, abi["output_dtypes"])
+    input_bytes, _, input_unknown = _capture_tensor_bytes(
+        inputs, abi["input_dtypes"], "input")
+    output_bytes, _, output_unknown = _capture_tensor_bytes(
+        outputs, abi["output_dtypes"], "output")
+    unknown_dtypes = input_unknown + output_unknown
+    logical_bytes = (
+        None if (input_bytes is None or output_bytes is None)
+        else input_bytes + output_bytes
+    )
     issued = {
         "macs": geometry["macs"],
         "mte2_bytes": input_bytes,
@@ -573,7 +627,10 @@ def bind_capture_native_plan(row, *, image_id=None):
         "work": {
             "work_unit": "macs",
             "logical_work": geometry["macs"],
-            "logical_bytes": input_bytes + output_bytes,
+            "logical_bytes": logical_bytes,
+            "logical_bytes_status": (
+                "incomplete_unknown_dtype" if unknown_dtypes else "complete"),
+            **({"unknown_dtype_tensors": unknown_dtypes} if unknown_dtypes else {}),
             "issued_work": None,
             "issued_work_status": "requires_selected_dispatch_and_tiling",
         },
@@ -709,6 +766,228 @@ def capture_measurement(row):
     }
 
 
+def _is_positive_shape(shape):
+    return bool(shape) and all(int(dim) > 0 for dim in shape)
+
+
+def _is_nonnegative_shape(shape):
+    return bool(shape) and all(int(dim) >= 0 for dim in shape)
+
+
+def _resolve_scatter_slots(inputs, outputs):
+    """Identify (key, key_cache, slot_mapping, value, value_cache) slot indices."""
+    if (len(inputs) < _SCATTER_MIN_INPUTS
+            or not 1 <= len(outputs) <= _SCATTER_OUTPUT_COUNT):
+        return None
+    out_k = outputs[0]
+    out_v = outputs[1] if len(outputs) > 1 else []
+    if not _is_positive_shape(inputs[0]) or not _is_positive_shape(out_k):
+        return None
+    if out_v != [] and not _is_positive_shape(out_v):
+        return None
+    # CANN graph order: (key, keyCacheRef, slotMapping, value, valueCacheRef)
+    # ACLNN order:      (key, value, keyCache, valueCache, slotMapping)
+    candidates = (
+        (0, 1, 2, 3, 4),
+        (0, 2, 4, 1, 3),
+    )
+    for key_idx, kcache_idx, slot_idx, val_idx, vcache_idx in candidates:
+        if inputs[kcache_idx] != out_k or inputs[vcache_idx] != out_v:
+            continue
+        if not _is_positive_shape(inputs[slot_idx]):
+            continue
+        val_shape = inputs[val_idx]
+        if out_v == []:
+            if val_shape == []:
+                return key_idx, kcache_idx, slot_idx, None, None
+        elif _is_positive_shape(val_shape):
+            return key_idx, kcache_idx, slot_idx, val_idx, vcache_idx
+    return None
+
+
+def _scatter_pa_kv_cache_work(abi):
+    """Derive active K/V scatter work and active transfer bytes from the contract."""
+    inputs = abi["input_shapes"]
+    input_dtypes = abi["input_dtypes"]
+    outputs = abi["output_shapes"]
+    output_dtypes = abi["output_dtypes"]
+    slots = _resolve_scatter_slots(inputs, outputs)
+    if slots is None:
+        return {
+            "native_type": "ScatterPaKvCache",
+            "work_unit": None,
+            "logical_work": None,
+            "reason": "logical_scatter_work_requires_valid_kv_cache_contract",
+            "issued_work": None,
+        }
+    if any(shape is None or bool(shape) for shape in inputs[_SCATTER_MIN_INPUTS:]):
+        return {
+            "native_type": "ScatterPaKvCache",
+            "work_unit": None,
+            "logical_work": None,
+            "reason": "logical_scatter_work_requires_runtime_compress_lens",
+            "issued_work": None,
+        }
+    key_idx, key_cache_idx, slot_idx, value_idx, value_cache_idx = slots
+    key_shape, slot_shape = inputs[key_idx], inputs[slot_idx]
+    value_shape = inputs[value_idx] if value_idx is not None else None
+    if (len(key_shape) == 1 and len(slot_shape) == 1
+            and int(key_shape[0]) % int(slot_shape[0]) != 0):
+        return {
+            "native_type": "ScatterPaKvCache",
+            "work_unit": None,
+            "logical_work": None,
+            "reason": "logical_scatter_work_kv_not_divisible_by_slots",
+            "issued_work": None,
+        }
+    if (value_shape is not None and len(value_shape) == 1 and len(slot_shape) == 1
+            and int(value_shape[0]) % int(slot_shape[0]) != 0):
+        return {
+            "native_type": "ScatterPaKvCache",
+            "work_unit": None,
+            "logical_work": None,
+            "reason": "logical_scatter_work_kv_not_divisible_by_slots",
+            "issued_work": None,
+        }
+    slot_dtype_raw = input_dtypes[slot_idx] if slot_idx < len(input_dtypes) else ""
+    slot_dtype = _canonical_capture_dtype(slot_dtype_raw)
+    if slot_dtype is not None and slot_dtype not in _SCATTER_SLOT_DTYPES:
+        return {
+            "native_type": "ScatterPaKvCache",
+            "work_unit": None,
+            "logical_work": None,
+            "reason": "logical_scatter_work_invalid_slot_dtype",
+            "issued_work": None,
+        }
+    key_dtype_raw = input_dtypes[key_idx] if key_idx < len(input_dtypes) else ""
+    kcache_dtype_raw = input_dtypes[key_cache_idx] if key_cache_idx < len(input_dtypes) else ""
+    out_k_dtype_raw = output_dtypes[0] if len(output_dtypes) > 0 else kcache_dtype_raw
+    if (_canonical_capture_dtype(key_dtype_raw) and _canonical_capture_dtype(kcache_dtype_raw)
+            and _canonical_capture_dtype(key_dtype_raw) != _canonical_capture_dtype(kcache_dtype_raw)):
+        return {
+            "native_type": "ScatterPaKvCache",
+            "work_unit": None,
+            "logical_work": None,
+            "reason": "logical_scatter_work_kv_cache_dtype_mismatch",
+            "issued_work": None,
+        }
+    active_specs = [
+        ("key_read", key_shape, key_dtype_raw),
+        ("slot_mapping_read", slot_shape, slot_dtype_raw),
+        ("key_write", key_shape, out_k_dtype_raw),
+    ]
+    logical_elements = _shape_elements(key_shape)
+    formula = "key_elements"
+    if value_shape is not None and value_cache_idx is not None:
+        val_dtype_raw = input_dtypes[value_idx] if value_idx < len(input_dtypes) else ""
+        vcache_dtype_raw = input_dtypes[value_cache_idx] if value_cache_idx < len(input_dtypes) else ""
+        out_v_dtype_raw = output_dtypes[1] if len(output_dtypes) > 1 else vcache_dtype_raw
+        if (_canonical_capture_dtype(val_dtype_raw) and _canonical_capture_dtype(vcache_dtype_raw)
+                and _canonical_capture_dtype(val_dtype_raw) != _canonical_capture_dtype(vcache_dtype_raw)):
+            return {
+                "native_type": "ScatterPaKvCache",
+                "work_unit": None,
+                "logical_work": None,
+                "reason": "logical_scatter_work_kv_cache_dtype_mismatch",
+                "issued_work": None,
+            }
+        active_specs.extend([
+            ("value_read", value_shape, val_dtype_raw),
+            ("value_write", value_shape, out_v_dtype_raw),
+        ])
+        logical_elements += _shape_elements(value_shape)
+        formula = "key_elements+value_elements"
+    total_bytes = 0
+    bytes_by_tensor = {}
+    unknown = []
+    for name, shape, raw_dtype in active_specs:
+        nbytes = _tensor_nbytes(shape, raw_dtype)
+        if nbytes is None:
+            unknown.append({"tensor": name, "dtype": raw_dtype or None})
+            continue
+        bytes_by_tensor[name] = nbytes
+        total_bytes += nbytes
+    return {
+        "native_type": "ScatterPaKvCache",
+        "work_unit": "elements",
+        "logical_work": int(logical_elements),
+        "formula": formula,
+        "logical_bytes": None if unknown else int(total_bytes),
+        "logical_bytes_by_tensor": bytes_by_tensor,
+        "logical_bytes_status": (
+            "incomplete_unknown_dtype" if unknown else "complete"),
+        **({"unknown_dtype_tensors": unknown} if unknown else {}),
+        "logical_work_status": "derived_from_raw_ABI_shapes",
+        "issued_work": None,
+        "issued_work_status": "requires_selected_native_program_and_dispatch",
+    }
+
+
+def _slice_capture_work(abi):
+    """Derive active Slice work and active transfer bytes from the output extent."""
+    inputs = abi["input_shapes"]
+    input_dtypes = abi["input_dtypes"]
+    outputs = abi["output_shapes"]
+    output_dtypes = abi["output_dtypes"]
+    if (not inputs or not _is_nonnegative_shape(inputs[0])
+            or len(outputs) != 1 or not _is_nonnegative_shape(outputs[0])
+            or len(outputs[0]) != len(inputs[0])
+            or any(int(out_dim) > int(src_dim)
+                   for src_dim, out_dim in zip(inputs[0], outputs[0]))):
+        return {
+            "native_type": "Slice",
+            "work_unit": None,
+            "logical_work": None,
+            "reason": "logical_slice_work_requires_valid_output_extent",
+            "issued_work": None,
+        }
+    src_dtype_raw = input_dtypes[0] if input_dtypes else ""
+    out_dtype_raw = output_dtypes[0] if output_dtypes else ""
+    src_dtype = _canonical_capture_dtype(src_dtype_raw)
+    out_dtype = _canonical_capture_dtype(out_dtype_raw)
+    if src_dtype is not None and out_dtype is not None and src_dtype != out_dtype:
+        return {
+            "native_type": "Slice",
+            "work_unit": None,
+            "logical_work": None,
+            "reason": "logical_slice_work_dtype_mismatch",
+            "issued_work": None,
+        }
+    out_shape = outputs[0]
+    read_bytes = _tensor_nbytes(out_shape, src_dtype_raw)
+    write_bytes = _tensor_nbytes(out_shape, out_dtype_raw)
+    desc_bytes, desc_by_tensor, desc_unknown = _capture_tensor_bytes(
+        inputs[1:], input_dtypes[1:], "descriptor")
+    bytes_by_tensor = {}
+    unknown = list(desc_unknown)
+    total_bytes = 0 if desc_bytes is None else desc_bytes
+    if read_bytes is None:
+        unknown.append({"tensor": "input0", "dtype": src_dtype_raw or None})
+    else:
+        bytes_by_tensor["input0_sliced"] = read_bytes
+        total_bytes += read_bytes
+    if write_bytes is None:
+        unknown.append({"tensor": "output0", "dtype": out_dtype_raw or None})
+    else:
+        bytes_by_tensor["output0"] = write_bytes
+        total_bytes += write_bytes
+    bytes_by_tensor.update(desc_by_tensor)
+    return {
+        "native_type": "Slice",
+        "work_unit": "elements",
+        "logical_work": int(_shape_elements(out_shape)),
+        "formula": "output_element_count",
+        "logical_bytes": None if unknown else int(total_bytes),
+        "logical_bytes_by_tensor": bytes_by_tensor,
+        "logical_bytes_status": (
+            "incomplete_unknown_dtype" if unknown else "complete"),
+        **({"unknown_dtype_tensors": unknown} if unknown else {}),
+        "logical_work_status": "derived_from_raw_ABI_shapes",
+        "issued_work": None,
+        "issued_work_status": "requires_selected_native_program_and_dispatch",
+    }
+
+
 def logical_capture_work(row):
     """Derive only source-declared logical work from the raw ABI shapes.
 
@@ -729,70 +1008,59 @@ def logical_capture_work(row):
         if geometry_info is None:
             return {"native_type": native_type, "work_unit": None,
                     "logical_work": None, "reason": reason}
-        m = geometry_info["m"]
-        n = geometry_info["n"]
-        k = geometry_info["k"]
-        macs = geometry_info["macs"]
-        orientation = geometry_info["x1_orientation"]
-        b_layout = geometry_info["x2_layout"]
-        bytes_by_tensor = {}
-        total_bytes = 0
-        for index, (shape, dtype) in enumerate(zip(inputs, input_dtypes)):
-            width = _CAPTURE_DTYPE_BYTES.get(dtype)
-            if width is None or not shape:
-                continue
-            count = 1
-            for dim in shape:
-                count *= int(dim)
-            bytes_by_tensor[f"input{index}"] = count * width
-            total_bytes += count * width
-        for index, (shape, dtype) in enumerate(zip(outputs, output_dtypes)):
-            width = _CAPTURE_DTYPE_BYTES.get(dtype)
-            if width is None or not shape:
-                continue
-            count = 1
-            for dim in shape:
-                count *= int(dim)
-            bytes_by_tensor[f"output{index}"] = count * width
-            total_bytes += count * width
+        in_bytes, in_by_tensor, in_unknown = _capture_tensor_bytes(
+            inputs, input_dtypes, "input")
+        out_bytes, out_by_tensor, out_unknown = _capture_tensor_bytes(
+            outputs, output_dtypes, "output")
+        unknown_dtypes = in_unknown + out_unknown
+        total_bytes = (
+            None if (in_bytes is None or out_bytes is None)
+            else in_bytes + out_bytes
+        )
         return {
             "native_type": native_type,
             "work_unit": "mac",
-            "logical_work": int(macs),
+            "logical_work": int(geometry_info["macs"]),
             "formula": "M*N*K",
-            "m": m, "n": n, "k": k,
-            "x1_orientation": orientation,
-            "x2_layout": b_layout,
-            "logical_bytes": int(total_bytes),
-            "logical_bytes_by_tensor": bytes_by_tensor,
+            "m": geometry_info["m"], "n": geometry_info["n"], "k": geometry_info["k"],
+            "x1_orientation": geometry_info["x1_orientation"],
+            "x2_layout": geometry_info["x2_layout"],
+            "logical_bytes": total_bytes,
+            "logical_bytes_by_tensor": {**in_by_tensor, **out_by_tensor},
+            "logical_bytes_status": (
+                "incomplete_unknown_dtype" if unknown_dtypes else "complete"),
+            **({"unknown_dtype_tensors": unknown_dtypes} if unknown_dtypes else {}),
             "logical_work_status": "derived_from_raw_ABI_shapes",
             "issued_work": None,
             "issued_work_status": "requires_selected_native_program_and_dispatch",
         }
-    if native_type in {"RmsNorm", "SwiGlu", "DynamicMxQuant", "HcPost",
-                       "Slice", "ScatterPaKvCache"} and inputs:
-        shape = max(inputs, key=lambda item: (len(item or []), item or []))
+    if native_type == "ScatterPaKvCache":
+        return _scatter_pa_kv_cache_work(abi)
+    if native_type == "Slice":
+        return _slice_capture_work(abi)
+    if native_type in {"RmsNorm", "SwiGlu", "DynamicMxQuant", "HcPost"} and inputs:
+        valid_shapes = [item for item in inputs if _is_positive_shape(item)]
+        shape = max(valid_shapes, key=_shape_elements) if valid_shapes else None
         if shape:
-            count = 1
-            for dim in shape:
-                count *= int(dim)
-            total_bytes = 0
-            for shapes, dtypes in ((inputs, input_dtypes),
-                                   (outputs, output_dtypes)):
-                for item, dtype in zip(shapes, dtypes):
-                    width = _CAPTURE_DTYPE_BYTES.get(dtype)
-                    if width is None or not item:
-                        continue
-                    elements = 1
-                    for dim in item:
-                        elements *= int(dim)
-                    total_bytes += elements * width
+            in_bytes, in_by_tensor, in_unknown = _capture_tensor_bytes(
+                inputs, input_dtypes, "input")
+            out_bytes, out_by_tensor, out_unknown = _capture_tensor_bytes(
+                outputs, output_dtypes, "output")
+            unknown_dtypes = in_unknown + out_unknown
+            total_bytes = (
+                None if (in_bytes is None or out_bytes is None)
+                else in_bytes + out_bytes
+            )
             return {
                 "native_type": native_type,
                 "work_unit": "elements",
-                "logical_work": int(count),
+                "logical_work": int(_shape_elements(shape)),
                 "formula": "max_input_element_count",
-                "logical_bytes": int(total_bytes),
+                "logical_bytes": total_bytes,
+                "logical_bytes_by_tensor": {**in_by_tensor, **out_by_tensor},
+                "logical_bytes_status": (
+                    "incomplete_unknown_dtype" if unknown_dtypes else "complete"),
+                **({"unknown_dtype_tensors": unknown_dtypes} if unknown_dtypes else {}),
                 "logical_work_status": "derived_from_raw_ABI_shapes",
                 "issued_work": None,
                 "issued_work_status": "requires_selected_native_program_and_dispatch",

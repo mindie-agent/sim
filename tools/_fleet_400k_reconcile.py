@@ -41,6 +41,9 @@ DIGEST_PREFIX_LEN = 16
 PCT_SCALE = 100.0
 ROUND_APE_DIGITS = 4
 DEFAULT_Q_LEN = 1
+DEFAULT_RECURRENT_BATCH = 1
+GDN_REC_DEFAULT_H = 16
+KDA_REC_DEFAULT_H = 8
 MAX_DIFF_PREVIEW = 5
 MIN_POSITIVE = 0.0
 P99_ORDER_EPS = 1e-9
@@ -207,6 +210,49 @@ def dcp_reference_verified(record: Mapping[str, Any]) -> tuple[bool, str]:
     return True, ""
 
 
+def recurrent_executed_geometry(
+    op_name: str, record: Mapping[str, Any],
+) -> tuple[int, int, int]:
+    """Normalize executed (batch, heads, q_len) for recurrent linear-attention records."""
+    raw_shape = record.get("actual_executed_shape")
+    shape = raw_shape if isinstance(raw_shape, Mapping) else {}
+    default_h = GDN_REC_DEFAULT_H if op_name == "gdn_recurrent" else KDA_REC_DEFAULT_H
+    batch_candidates = (
+        record.get("B"),
+        record.get("batch"),
+        shape.get("batch"),
+        shape.get("B"),
+        record.get("seqlen"),
+    )
+    heads_candidates = (
+        record.get("H"),
+        record.get("heads"),
+        shape.get("heads"),
+        shape.get("H"),
+    )
+    q_candidates = (
+        record.get("q_len"),
+        shape.get("q_len"),
+        shape.get("T"),
+    )
+    batch = next(
+        (int(val) for val in batch_candidates
+         if val is not None and not isinstance(val, bool) and int(val) > 0),
+        DEFAULT_RECURRENT_BATCH,
+    )
+    heads = next(
+        (int(val) for val in heads_candidates
+         if val is not None and not isinstance(val, bool) and int(val) > 0),
+        default_h,
+    )
+    q_len = next(
+        (int(val) for val in q_candidates
+         if val is not None and not isinstance(val, bool) and int(val) > 0),
+        DEFAULT_Q_LEN,
+    )
+    return batch, heads, q_len
+
+
 def seq_geometry_key(op_name: str, record: Mapping[str, Any]) -> str:
     """Canonical geometry string independent of split-tagged case_id."""
     if op_name == "ragged_suite":
@@ -217,7 +263,8 @@ def seq_geometry_key(op_name: str, record: Mapping[str, Any]) -> str:
     if op_name == "dcp_lse_attention_merge":
         return f"{op_name}:cp={int(record.get('cp', 0))}:q={int(record.get('q_len', DEFAULT_Q_LEN))}"
     if op_name in {"gdn_recurrent", "kda_recurrent"}:
-        return f"{op_name}:B={int(record.get('B', 0))}:q={int(record.get('q_len', DEFAULT_Q_LEN))}"
+        batch, heads, q_len = recurrent_executed_geometry(op_name, record)
+        return f"{op_name}:B={batch}:H={heads}:q={q_len}"
     return f"{op_name}:L={int(record.get('seqlen', 0))}:q={int(record.get('q_len', DEFAULT_Q_LEN))}"
 
 

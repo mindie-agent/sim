@@ -605,9 +605,6 @@ def apply_capture_observed_clock(
     observed = extract_observed_aicore_freq_mhz(envelope)
     if observed is None:
         return out
-    from mindie_sim.backends.ascend import apply_observed_aicore_clock, profiles
-
-    known = profiles()
     for section_key in ("machine", "hardware"):
         section = out.get(section_key)
         if not isinstance(section, dict):
@@ -615,13 +612,7 @@ def apply_capture_observed_clock(
         device = section.setdefault("device", {})
         if not isinstance(device, dict) or "observed_aicore_freq_mhz" in device:
             return out
-        sku = section.get("sku")
-        if sku in known and ("compute_peaks" in device or "rates" in device):
-            section["device"] = apply_observed_aicore_clock(
-                {**device, "observed_aicore_freq_mhz": observed}, known[sku],
-            )
-        else:
-            device["observed_aicore_freq_mhz"] = observed
+        device["observed_aicore_freq_mhz"] = observed
         return out
     if isinstance(out.get("device"), dict) and "observed_aicore_freq_mhz" not in out["device"]:
         out["device"]["observed_aicore_freq_mhz"] = observed
