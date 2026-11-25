@@ -622,7 +622,7 @@ def test_megamoe_typed_activation_abi_predicate_and_mc2_protocol_floor_work():
     assert emeta["activation_compute_dtype"] == "fp32" and emeta["ub_working_bytes_per_elem"] == 4
     assert emeta["activation_params"] == {"activation": "situ", "beta": 4.0, "linear_beta": 25.0}
 
-    for track in ("merged", "unmerged_pr", "expected_ideal"):
+    for track in ("shipping", "proposed", "target"):
         raw = compose_case(
             "kimi-k3.1", MESH_SKU, dp=4, tp=8, dcp=8, ep=32, layers=4,
             prompt_tokens=131072, output_tokens=1024, mtp_proposal_tokens=5,
@@ -631,7 +631,7 @@ def test_megamoe_typed_activation_abi_predicate_and_mc2_protocol_floor_work():
         raw["runtime"]["metadata"].setdefault("additional_config", {})["enable_mega_moe"] = 1
         graph = target_graphs(raw, phase="decode", tokens=6, context=131072, sequences=8, scope="body")[0]
         megas = [op for op in graph if op.recipe == "megamoe_arch35"]
-        if track in ("merged", "unmerged_pr"):
+        if track in ("shipping", "proposed"):
             assert len(megas) == 0
             protos = [op for op in graph if op.family == "mc2_protocol"]
             assert protos and all(op.hbm_bytes > 0 and op.link_bytes > 0 for op in protos)
@@ -641,7 +641,7 @@ def test_megamoe_typed_activation_abi_predicate_and_mc2_protocol_floor_work():
 
     raw_ds = compose_case(
         "deepseek-v3.2", MESH_SKU, dp=1, tp=8, ep=8, layers=4,
-        prompt_tokens=2048, output_tokens=64, feature_track="merged",
+        prompt_tokens=2048, output_tokens=64, feature_track="shipping",
         quant="mxfp8_mxfp4", enable_fused_mc2=2,
     )
     raw_ds["runtime"]["metadata"].setdefault("additional_config", {})["enable_mega_moe"] = 1
@@ -658,7 +658,7 @@ def test_megamoe_ep_fusion_preserves_topology_dispatch_and_combine_wire_service(
 
     raw = compose_case(
         "deepseek-v3.2", MESH_SKU, dp=1, tp=8, ep=8, layers=4,
-        prompt_tokens=2048, output_tokens=64, feature_track="merged",
+        prompt_tokens=2048, output_tokens=64, feature_track="shipping",
         quant="mxfp8_mxfp4", enable_fused_mc2=2,
     )
     raw["runtime"]["metadata"].setdefault("additional_config", {})["enable_mega_moe"] = 1
@@ -747,7 +747,7 @@ def test_w4a4_mxfp4_preserves_fp4_payload_and_megamoe_charges_gmm2_activation_wo
     # GLM-5.2 W4A4 checkpoint preserves fp4_e2m1 on routed experts through dispatch and MegaMoE lowering.
     raw_w4a4 = compose_case(
         "Eco-Tech/GLM-5.2-w4a4c8-mxfp4", MESH_SKU, dp=1, tp=8, ep=8, layers=4,
-        prompt_tokens=2048, output_tokens=64, feature_track="merged", enable_fused_mc2=2,
+        prompt_tokens=2048, output_tokens=64, feature_track="shipping", enable_fused_mc2=2,
     )
     routed_ovr = dict(dict(raw_w4a4["model"]["quant"]["category_overrides"])["routed_expert"])
     assert routed_ovr["activation_format"] == "fp4_e2m1"

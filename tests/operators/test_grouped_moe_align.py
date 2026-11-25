@@ -495,11 +495,15 @@ def test_rolling_aswt_matches_literal_source_block_index_oracle():
             }.items())),
             geom,
         )
-        for m in (1, 7)
+        for m in (1, 7, 17)
     ]
+    # Arch35 FP8 Cube subtile pads M to 16: m=1 and m=7 issue identical Cube/MTE1 work,
+    # m=17 crosses the fractal boundary (2x Cube), while FixPipe scales with valid rows.
     assert plans[0].work.resources["mte1"] == plans[1].work.resources["mte1"]
-    assert plans[1].work.matrix["fp8_e4m3"] == 7 * plans[0].work.matrix["fp8_e4m3"]
+    assert plans[1].work.matrix["fp8_e4m3"] == plans[0].work.matrix["fp8_e4m3"]
+    assert plans[2].work.matrix["fp8_e4m3"] == 2 * plans[0].work.matrix["fp8_e4m3"]
     assert plans[1].work.resources["fixpipe"] == 7 * plans[0].work.resources["fixpipe"]
+    assert plans[2].work.resources["fixpipe"] == 17 * plans[0].work.resources["fixpipe"]
 
 
 def test_mx_source_fifo_slots_and_l1_operand_reuse_ordering():
@@ -549,7 +553,9 @@ def test_mx_source_fifo_slots_and_l1_operand_reuse_ordering():
     raw["runtime"].setdefault("kernels", {}).setdefault("families", {})["grouped_gemm"] = {"kind": "ascend_mxa8w4_nznk"}
     gate = next(op for op in target_graphs(raw, scope="body", phase="decode", tokens=1, context=8, sequences=1)[0] if op.family == "grouped_gemm")
     op = replace(gate, local_shape=(1, 128, 2048), semantic_shape=(1, 128, 2048), launch_shape=(1, 128, 2048),
-                 metadata=tuple({**dict(gate.metadata), "matrix_group_rows": (1,), "matrix_weight_bank_groups": 1, "matrix_groups": 1}.items()))
+                 metadata=tuple({**dict(gate.metadata), "matrix_group_rows": (1,),
+                                 "matrix_weight_bank_groups": 1, "matrix_groups": 1,
+                                 "activation_scale_shape": (1, 32, 2)}.items()))
     reg_roles = ("reg_data_writes", "reg_ub_accesses", "reg_ub_stores", "reg_shuffle_lanes")
     roles = {role: (1 if role == "cube" else 1e9) for role in ("hbm", "mte1", "mte2_aic", "mte2_aiv", "mte3", "vector", "fixpipe", "cube", *reg_roles)}
     units = {role: (2 if role in ("vector", "mte2_aiv", "mte3", *reg_roles) else 1) for role in roles}

@@ -317,7 +317,9 @@ def test_explicit_cohort_rebinds_banks_payload_and_transposed_peer_cells(quantiz
             assert quant.deps == (selection["pack"].op_id,)
             assert (quant.mte2_bytes, quant.mte3_bytes) == (issued * WIDTH * BF16_BYTES, issued * (WIDTH + FP32_BYTES))
             assert dict(selection["moe_histogram"].metadata)["source_assignments"] == issued
-        assert set(ops["expert_up"].deps) == {ops[key].op_id for key in (*forward, "moe_transport_quantize")}
+        reorder = ops["moe_receive_reorder"]
+        assert set(reorder.deps) == {ops[key].op_id for key in forward}
+        assert ops["expert_up"].deps == (reorder.op_id,)
     else:
         changed = _route_case(local=True)
         assert _by_name(_ops(changed, local))["expert_up"].local_shape[0] == sum(SOURCE_COUNTS) * TOP_K
@@ -438,7 +440,7 @@ def _compose(model, **options):
     return parse_case(compose_case(model=model, hardware=SKUS[-1].id, tp=1, layers=4, **options))
 
 @pytest.mark.parametrize("model,mode,members", [
-    ("deepseek-v4-flash-0731", "hash", 1), ("deepseek-v4-flash-0731", "sqrtsoftplus", 2),
+    ("deepseek-v4-flash-0731", "hash", 2), ("deepseek-v4-flash-0731", "sqrtsoftplus", 2),
     ("deepseek-v3", "noaux_tc", 9),
 ])
 def test_gating_conserves_score_work_and_preserves_external_hash_normalization(model, mode, members):
@@ -453,14 +455,16 @@ def test_gating_conserves_score_work_and_preserves_external_hash_normalization(m
     kind = (HASH_NATIVE_KIND if mode in {"hash", "sqrtsoftplus"}
             else ("aclnnMoeGatingTopK" if mode == "noaux_tc" else SOFTMAX_NATIVE_KIND))
     assert (meta["native_kind"], meta["fused_member_count"]) == (kind, members)
-    if mode == "hash":
-        assert not meta["renorm"] and fused.vector_ops == raw[0].vector_ops
-        assert len(selected.ops) == 1 or selected.ops[-1].deps == (fused.op_id,)
+    assert fused.vector_ops == pytest.approx(sum(op.vector_ops for op in raw))
+    assert len(selected.ops) == 1
+    assert fused.mte3_bytes == 8 * plan.top_k * (FP32_BYTES + 4)
+    if mode in {"hash", "sqrtsoftplus"}:
+        assert meta["norm_type"] == 2 and not meta["renorm"]
+        extra = 8 * (8 + plan.top_k * 4) if mode == "hash" else 0
+        assert fused.mte2_bytes == 8 * plan.num_experts * FP32_BYTES + extra
     else:
         bias = plan.num_experts * FP32_BYTES if mode == "noaux_tc" else 0
-        assert fused.vector_ops == pytest.approx(sum(op.vector_ops for op in raw))
         assert fused.mte2_bytes == 8 * plan.num_experts * FP32_BYTES + bias
-        assert fused.mte3_bytes == 8 * plan.top_k * (FP32_BYTES + 4)
         assert meta["renorm"] and not any(op.recipe == "router_routed_scale" for op in selected.ops)
 
 def test_gating_respects_backend_raw_eager_and_explicit_recipe_guards():
@@ -504,7 +508,7 @@ def test_ep_dispatch_owns_absorbed_quantization_and_publishes_scales_once(mc2):
     producer = next(op for op in ops if "moe_init_routing" in dict(op.metadata))
     meta = dict(producer.metadata)
     config = meta["moe_init_routing"]
-    assert (config["native_kind"], config["quant_mode"]) == (INIT_ROUTING_NATIVE_KIND, 1)
+    assert (config["native_kind"], config["quant_mode"]) == (INIT_ROUTING_NATIVE_KIND, 3)
     assert dict(_experts(ops)[0].metadata)["activation_scale_producer"] == producer.op_id
     if mc2:
         assert "send_read_quantize" in meta["mc2_phases"] and meta["mc2_phase"]["dispatch_quant"] == "mx"

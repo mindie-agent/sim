@@ -244,9 +244,11 @@ def test_eplb_variance_damping_reduces_skew_cleanly_while_preserving_floors():
         model, layer, plain_parallel, tokens=6, owner=None, runtime=rt_meta,
     )
 
-    assert (r_explicit, a_explicit) == pytest.approx((r_redundant, a_redundant))
     assert (r_explicit, a_explicit) == pytest.approx((r_force, a_force))
     assert (r_explicit, a_explicit) == pytest.approx((r_meta, a_meta))
+    # Redundant physical slots activate EPLB row damping while splitting replicated experts across 2 copies.
+    assert r_redundant == pytest.approx(r_explicit)
+    assert a_explicit < a_redundant < a_plain
     assert r_explicit < r_plain and a_explicit < a_plain
     assert r_explicit >= math.ceil((6 * 8) / 16) and a_explicit >= 1.0
 
@@ -464,9 +466,9 @@ def test_g2_zero_demand_fractal_m16_and_m2b_m2_abi_activations():
     u_a3_bf16, _, m_a3_bf16 = _activation_abi_lowering(plan_situ, SimpleNamespace(metadata=(("arch_family", "A3"),)), QuantSpec("bf16"), "routed_expert")
     u_a3_q, _, m_a3_q = _activation_abi_lowering(plan_situ, SimpleNamespace(metadata=(("arch_family", "A3"),)), quant_preset("w8a8_int8"), "routed_expert")
     u_a5, _, m_a5 = _activation_abi_lowering(plan_situ, SimpleNamespace(metadata=(("arch_family", "A5"),)), QuantSpec("bf16"), "routed_expert")
-    assert u_a3_bf16 is False and "aclnn_symbol" not in dict(m_a3_bf16) and dict(m_a3_bf16).get("situ_bf16_unfused") is True and len(dict(m_a3_bf16).get("native_kinds", ())) == 14
+    assert u_a3_bf16 is True and "aclnn_symbol" not in dict(m_a3_bf16) and dict(m_a3_bf16).get("situ_bf16_unfused") is True and len(dict(m_a3_bf16).get("native_kinds", ())) == 14
     assert u_a3_q is False and dict(m_a3_q).get("aclnn_symbol") == "aclnnDequantSituQuant"
-    assert u_a5 is False and "aclnn_symbol" not in dict(m_a5) and dict(m_a5).get("situ_bf16_unfused") is True and len(dict(m_a5).get("native_kinds", ())) == 14
+    assert u_a5 is True and "aclnn_symbol" not in dict(m_a5) and dict(m_a5).get("situ_bf16_unfused") is True and len(dict(m_a5).get("native_kinds", ())) == 14
 
     plan_clip = SimpleNamespace(ffn_activation="swigluoai", swiglu_limit=7.0, index=0, swiglu_alpha=1.702, swiglu_beta=1.0)
     _, uc_a3, cm_a3 = _activation_abi_lowering(plan_clip, SimpleNamespace(metadata=(("arch_family", "A3"),)), QuantSpec("bf16"), "routed_expert")

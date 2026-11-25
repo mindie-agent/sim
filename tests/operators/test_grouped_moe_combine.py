@@ -7,6 +7,7 @@
 [Side-Effect Policy] In-memory modeling and Engine execution only.
 """
 from dataclasses import asdict, replace
+import math
 
 import numpy as np
 import pytest
@@ -44,7 +45,8 @@ def test_combine_reads_routed_values_and_publishes_one_row_per_token(hardware, t
     shape = (sum(rows), n, hidden)
     op = OpSpec("routed", "grouped_moe", "decode", 0, 0, (), shape, shape, shape, shape,
                 dtype="bf16", recipe="mega_moe",
-                metadata=tuple(dict(group_rows=rows, n=n, k=hidden, tokens=tokens, top_k=topk).items()))
+                metadata=tuple(dict(group_rows=rows, n=n, k=hidden, tokens=tokens, top_k=topk,
+                                    ep=2, dispatch_link_bytes=0, combine_link_bytes=0).items()))
     plan = grouped_moe.build(op, geometry)
     phase = next(item for item in plan.pipeline_spec.phases if item.phase_id == "combine:local")
     payload = 2 * tokens * hidden
@@ -186,7 +188,9 @@ def test_deepep_two_stage_volume_deduplicates_remote_nodes(ep, node_width, remot
     case = dict(ep=ep, ranks_per_node=node_width, dtype_bytes_val=element_bytes)
     group = deepep.deepep_group_volume(tokens, width, top_k, **case)
     intra = deepep.deepep_intra_volume(tokens, width, top_k, **case)
-    assert group == tokens * width * element_bytes * remote_nodes
+    other = ep - node_width
+    hit_prob = 1.0 if top_k > other else 1.0 - math.comb(other, top_k) / math.comb(ep, top_k)
+    assert group == pytest.approx(tokens * width * element_bytes * remote_nodes * hit_prob)
     assert intra == pytest.approx(tokens * width * element_bytes * top_k * (node_width - 1) / node_width)
     assert deepep.deepep_group_volume(tokens, width, top_k, eplb_peak_to_avg=1.25,
                                     **case) == pytest.approx(group * 1.25)
@@ -206,7 +210,12 @@ def test_deepep_forward_and_inverse_transport_share_integer_row_cut(ep, node_wid
     chunks = target_graphs(raw, phase="prefill", tokens=4, scope="model")[0]
     tokens, width, top_k = 4, 32, 2
     flat = tokens * width * 2 * top_k * (ep - 1) / ep
-    two_stage = tokens * width * 2 * (ep // node_width - 1 + top_k * (node_width - 1) / node_width)
+    nodes = ep // node_width
+    remote_hit = (
+        (nodes - 1) * (1.0 - math.comb(ep - node_width, top_k) / math.comb(ep, top_k))
+        if nodes > 1 else 0.0
+    )
+    two_stage = tokens * width * 2 * (remote_hit + top_k * (node_width - 1) / node_width)
     for kind in ("dispatch", "combine"):
         recipe = f"expert_{kind}"
         full, tail = one(chunks, recipe), one(chunks, recipe + "_overlap")
@@ -229,12 +238,16 @@ def test_block_scaled_dispatch_and_bf16_combine_conserve_transport(factor):
     }}
     graphs = target_graphs(raw, phase="prefill", tokens=4, scope="model")
     ops = graphs[0]
-    dispatch, combine = one(ops, "expert_quantized_dispatch"), one(ops, "expert_combine")
-    assert dict(dispatch.metadata)["row_bytes"] == 33
-    assert dispatch.link_bytes == 8 * 33 / 2 * factor
+    dispatch = one(ops, "expert_quantized_dispatch")
+    scale_dispatch = one(ops, "expert_scale_dispatch")
+    combine = one(ops, "expert_combine")
+    assert dict(dispatch.metadata)["row_bytes"] == 32
+    assert dict(scale_dispatch.metadata)["row_bytes"] == 2
+    assert dispatch.link_bytes == 8 * 32 / 2 * factor
+    assert scale_dispatch.link_bytes == 8 * 2 / 2 * factor
     assert combine.link_bytes == 8 * 64 / 2 * factor
     producer = next(op for op in ops if op.op_id in dispatch.deps and op.family == "quantize")
-    assert producer.mte3_bytes == 8 * 33
+    assert producer.mte3_bytes == 8 * (32 + 2)
     result = graph_costs(raw, graphs)
     assert result["execution"]["live_tasks"] == 0
 
@@ -380,7 +393,9 @@ def test_mx_panel_template_alias_topology_and_cache_invalidation():
     raw["runtime"].setdefault("kernels", {}).setdefault("families", {})["grouped_gemm"] = {"kind": "ascend_mxa8w4_nznk"}
     gate = next(op for op in target_graphs(raw, scope="body", phase="decode", tokens=1, context=8, sequences=1)[0] if op.family == "grouped_gemm")
     op = replace(gate, local_shape=(1, 160, 320), semantic_shape=(1, 160, 320), launch_shape=(1, 160, 320),
-                 metadata=tuple({**dict(gate.metadata), "matrix_group_rows": (1,), "matrix_weight_bank_groups": 1, "matrix_groups": 1}.items()))
+                 metadata=tuple({**dict(gate.metadata), "matrix_group_rows": (1,),
+                                 "matrix_weight_bank_groups": 1, "matrix_groups": 1,
+                                 "activation_scale_shape": (1, 5, 2)}.items()))
     contexts = []
 
     def capture(cur_op, geom):
@@ -637,6 +652,7 @@ def test_grouped_moe_abi_fp32_ub_expected_groups_and_a5_sector_eff_monotonicity(
         ("mode", "mega_moe"), ("group_rows", (4, 4)), ("n", 128), ("k", 64),
         ("dtype_a", "bf16"), ("dtype_b", "bf16"), ("output_dtype", "bf16"),
         ("activation", "situ"), ("handoff_dtype", "bf16"),
+        ("ep", 2), ("dispatch_link_bytes", 0), ("combine_link_bytes", 0),
     )
     situ_op = OpSpec("gm_situ", "grouped_moe", "decode", 0, 0, ("r0",), (8, 128, 64),
                      (8, 128, 64), (8, 128, 64), (8, 128, 64), dtype="bf16",
