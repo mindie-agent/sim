@@ -15,9 +15,116 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import replace
 import math
-from typing import Any
+from typing import Any, Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_REVISION = "175ef4d49c2072f9233619636f0309f4f88b4e2c"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-ascend",
+        revision=_VLLM_ASCEND_REVISION,
+        relative_path="vllm_ascend/ops/fused_moe/token_dispatcher.py",
+        source_sha256="6126304014959e8c52d87284ccac078f7622a6d72c7a7fc8be25929dfe644cfb",
+    ),
+    SourceRef(
+        repository="vllm-ascend",
+        revision=_VLLM_ASCEND_REVISION,
+        relative_path="vllm_ascend/ops/fused_moe/moe_comm_method.py",
+        source_sha256="b785ade12a81349d01d4806c95ab17d37537db9548b3aae492135c8f4318fe39",
+    ),
+)
+
+_DOWN_OVERLAP_COLUMN_ALIGNMENT = 64
+_VOLUME_EPS = 1e-12
+_INT_ROW_TOL = 1e-9
+_EXPLICIT_ROUTING_BASES = frozenset({
+    "explicit_token_routing_integer",
+    "source_force_eplb_masked_integer_counts",
+})
+
+
+def down_overlap_columns(width: int, overlap: float) -> tuple[int, int]:
+    """Aligned output-column cut shared by expert_down and early/late combine."""
+    n = int(width)
+    if n < 2 or overlap <= 0.0:
+        return n, 0
+    raw_n1 = max(1, min(n - 1, round(n * overlap)))
+    alignment = _DOWN_OVERLAP_COLUMN_ALIGNMENT
+    n1 = raw_n1
+    if n >= 2 * alignment and n % alignment == 0:
+        n1 = max(alignment, min(n - alignment, raw_n1 // alignment * alignment))
+    return n1, n - n1
+
+
+def _hypergeometric_node_hit_prob(total_items: int, node_items: int, top_k: int) -> float:
+    """Exact P(at least one of top_k distinct draws hits a node of size node_items)."""
+    k = max(0, int(top_k))
+    if k <= 0 or node_items <= 0 or total_items <= 0:
+        return 0.0
+    other = total_items - node_items
+    if k > other or total_items <= node_items:
+        return 1.0
+    return 1.0 - (math.comb(other, k) / math.comb(total_items, k))
+
+
+def _node_rank_and_expert_sizes(
+    ep: int, ranks_per_node: int, num_experts: int | None = None,
+) -> tuple[list[int], list[int], int]:
+    """Return (rank_sizes_per_node, expert_counts_per_node, total_experts)."""
+    rpn = max(1, min(int(ep), int(ranks_per_node)))
+    nodes = max(1, math.ceil(int(ep) / rpn))
+    rank_sizes = [min(rpn, int(ep) - idx * rpn) for idx in range(nodes)]
+    total_e = int(num_experts) if (num_experts is not None and int(num_experts) >= int(ep)) else int(ep)
+    if total_e == int(ep):
+        return rank_sizes, list(rank_sizes), total_e
+    base, rem = divmod(total_e, int(ep))
+    rank_experts = [base + (1 if r < rem else 0) for r in range(int(ep))]
+    node_experts: list[int] = []
+    offset = 0
+    for size in rank_sizes:
+        node_experts.append(sum(rank_experts[offset:offset + size]))
+        offset += size
+    return rank_sizes, node_experts, total_e
+
+
+def _expected_remote_nodes_hit(
+    ep: int, ranks_per_node: int, top_k: int, *, num_experts: int | None = None,
+) -> float:
+    """Expected distinct remote nodes hit per token under uniform top-k expert draws."""
+    if ep <= 1 or top_k <= 0:
+        return 0.0
+    rank_sizes, node_experts, total_e = _node_rank_and_expert_sizes(
+        ep, ranks_per_node, num_experts=num_experts,
+    )
+    if len(rank_sizes) <= 1:
+        return 0.0
+    hit_probs = [_hypergeometric_node_hit_prob(total_e, e_n, top_k) for e_n in node_experts]
+    total_hit = math.fsum(hit_probs)
+    return math.fsum(
+        (size / float(ep)) * (total_hit - prob)
+        for size, prob in zip(rank_sizes, hit_probs)
+    )
+
+
+def _expected_intra_hops_per_assignment(
+    ep: int, ranks_per_node: int, *, num_experts: int | None = None,
+) -> float:
+    """Exact probability an assignment requires an intra-node hop across (possibly uneven) nodes."""
+    if ep <= 1:
+        return 0.0
+    rank_sizes, node_experts, total_e = _node_rank_and_expert_sizes(
+        ep, ranks_per_node, num_experts=num_experts,
+    )
+    if total_e <= 0:
+        return 0.0
+    return math.fsum(
+        (float(e_n) / float(total_e)) * (float(s_n - 1) / float(s_n))
+        for s_n, e_n in zip(rank_sizes, node_experts)
+        if s_n > 1
+    )
 
 
 def _validate_eplb(value):
@@ -42,28 +149,36 @@ def _validate_overlap(value):
 
 def deepep_group_volume(tokens: float, hidden_size: int, top_k: int, *,
                         ep: int, ranks_per_node: int, dtype_bytes_val: float,
-                        eplb_peak_to_avg: float = 1.0) -> float:
-    """Inter-node group volume with one delivery per token and remote node."""
+                        eplb_peak_to_avg: float = 1.0,
+                        num_experts: int | None = None) -> float:
+    """Inter-node group volume with exact hypergeometric remote-node deduplication."""
     ratio = _validate_eplb(eplb_peak_to_avg)
-    nodes = max(1, math.ceil(ep / max(1, ranks_per_node)))
+    rpn = max(1, int(ranks_per_node))
+    nodes = max(1, math.ceil(ep / rpn))
     if nodes <= 1 or ep <= 1 or tokens <= 0:
         return 0.0
-    node_hit_prob = min(float(top_k) / float(nodes), 1.0)
-    remote_nodes = float(nodes - 1)
+    expected_remote = _expected_remote_nodes_hit(
+        ep, rpn, top_k, num_experts=num_experts,
+    )
     return (float(tokens) * float(hidden_size) * float(dtype_bytes_val)
-            * node_hit_prob * remote_nodes * ratio)
+            * expected_remote * ratio)
 
 
 def deepep_intra_volume(tokens: float, hidden_size: int, top_k: int, *,
                         ep: int, ranks_per_node: int, dtype_bytes_val: float,
-                        eplb_peak_to_avg: float = 1.0) -> float:
-    """Intra-node scatter volume: every top-k assignment stays local."""
+                        eplb_peak_to_avg: float = 1.0,
+                        num_experts: int | None = None) -> float:
+    """Intra-node scatter volume across (possibly uneven) node groups."""
     ratio = _validate_eplb(eplb_peak_to_avg)
-    intra_ep = min(max(1, int(ep)), max(1, int(ranks_per_node)))
-    if intra_ep <= 1 or tokens <= 0:
+    if ep <= 1 or tokens <= 0:
+        return 0.0
+    hop_prob = _expected_intra_hops_per_assignment(
+        ep, ranks_per_node, num_experts=num_experts,
+    )
+    if hop_prob <= 0.0:
         return 0.0
     return (float(tokens) * float(hidden_size) * float(dtype_bytes_val)
-            * float(top_k) * (float(intra_ep - 1) / float(intra_ep)) * ratio)
+            * float(top_k) * hop_prob * ratio)
 
 
 def standard_alltoall_volume(tokens: float, hidden_size: int, top_k: int, *,
@@ -104,15 +219,19 @@ def resolve_exchange_options(runtime, transport, *, layer_scope: str = "body"):
         raise ModelingError("deepep_ranks_per_node_invalid") from exc
     if ranks < 0:
         raise ModelingError("deepep_ranks_per_node_invalid")
+    parallel = getattr(runtime, "parallel", None)
+    ep = int(getattr(parallel, "ep", 0) or 0) if parallel is not None else 0
     return {
         "eplb": _validate_eplb(eplb),
         "deepep": cfg.get("mode") == "deepep" or bool(metadata.get("enable_deepep", False)),
         "overlap": _validate_overlap(overlap),
         "ranks_per_node": ranks,
+        **({"ep": ep} if ep > 0 else {}),
     }
 
 
-def deepep_exchange_factor(*, options, ep, top_k, tokens, hidden, dtype_bytes_val):
+def deepep_exchange_factor(*, options, ep, top_k, tokens, hidden, dtype_bytes_val,
+                           num_experts: int | None = None):
     """DeepEP group+intra deduplication ratio over a flat AllToAll (bytes conserved)."""
     if not options["deepep"]:
         return 1.0
@@ -121,35 +240,193 @@ def deepep_exchange_factor(*, options, ep, top_k, tokens, hidden, dtype_bytes_va
         return 1.0
     eff_tokens = max(1.0, float(tokens))
     common = dict(ep=ep, ranks_per_node=ranks_per_node,
-                  dtype_bytes_val=dtype_bytes_val, eplb_peak_to_avg=1.0)
+                  dtype_bytes_val=dtype_bytes_val, eplb_peak_to_avg=1.0,
+                  num_experts=num_experts)
     group = deepep_group_volume(eff_tokens, hidden, top_k, **common)
     intra = deepep_intra_volume(eff_tokens, hidden, top_k, **common)
     standard = standard_alltoall_volume(
         eff_tokens, hidden, top_k, ep=ep, dtype_bytes_val=dtype_bytes_val,
         eplb_peak_to_avg=1.0)
-    return (group + intra) / max(standard, 1e-12)
+    return (group + intra) / max(standard, _VOLUME_EPS)
 
 
 def _deepep_peer_traffic_matrix(total_bytes: float, *, ep: int,
-                                ranks_per_node: int, top_k: int) -> dict[str, Any]:
-    rpn = max(1, min(int(ep), int(ranks_per_node)))
-    nodes = max(1, math.ceil(ep / rpn))
-    w_intra = float(top_k) * (float(rpn - 1) / float(rpn)) if rpn > 1 else 0.0
-    w_group = min(float(top_k) / float(nodes), 1.0) * float(nodes - 1) if nodes > 1 else 0.0
-    w_total = max(w_intra + w_group, 1e-12)
+                                ranks_per_node: int, top_k: int,
+                                num_experts: int | None = None) -> dict[str, Any]:
+    """Exact expected relay peer matrix matching the average of exact DeepEP routes."""
+    size = int(ep)
+    rpn = max(1, min(size, int(ranks_per_node)))
+    nodes = max(1, math.ceil(size / rpn))
+    w_intra = float(top_k) * _expected_intra_hops_per_assignment(
+        size, rpn, num_experts=num_experts,
+    )
+    w_group = (
+        _expected_remote_nodes_hit(size, rpn, top_k, num_experts=num_experts)
+        if nodes > 1 else 0.0
+    )
+    w_total = max(w_intra + w_group, _VOLUME_EPS)
     intra_share = w_intra / w_total
-    inter_share = 1.0 - intra_share if w_intra + w_group > 0 else 0.0
     intra_row = float(total_bytes) * intra_share
     inter_row = float(total_bytes) - intra_row
+    cells = [[0.0] * size for _ in range(size)]
+    intra_peer = intra_row / float(rpn - 1) if rpn > 1 else 0.0
+    inter_peer = inter_row / float(nodes - 1) if nodes > 1 else 0.0
+    for src in range(size):
+        src_node = src // rpn
+        lane = src % rpn
+        for dst in range(size):
+            if dst == src:
+                continue
+            dst_node = dst // rpn
+            if dst_node == src_node:
+                cells[src][dst] = intra_peer
+            elif dst == min(size - 1, dst_node * rpn + lane):
+                cells[src][dst] = inter_peer
     return {
-        "kind": "two_tier",
-        "ranks_per_node": int(rpn),
-        "intra_share": intra_share,
-        "inter_share": inter_share,
-        "intra_row_bytes": intra_row,
-        "inter_row_bytes": inter_row,
+        "kind": "matrix",
+        "payload_bytes": tuple(tuple(row) for row in cells),
         "direction": "forward",
     }
+
+
+def _matrix_link_bytes(matrix, *, peer_volume_basis: str, rank: int) -> float:
+    """Derive scalar link_bytes matching peer_volume_basis from a peer matrix."""
+    size = len(matrix)
+    if size == 0:
+        return 0.0
+    if peer_volume_basis == "group_mean":
+        return math.fsum(float(cell) for row in matrix for cell in row) / float(size)
+    idx = rank if 0 <= rank < size else 0
+    return math.fsum(float(cell) for cell in matrix[idx])
+
+
+def _extract_exact_token_route(metadata: Mapping[str, Any]):
+    """Read token-level (source_owners, topk_ids, expert_placement) if declared."""
+    route = metadata.get("moe_token_route")
+    if isinstance(route, Mapping):
+        owners = route.get("source_owners")
+        topk = route.get("topk_ids")
+        placement = route.get("expert_placement")
+        if owners is not None and topk is not None and placement is not None:
+            return owners, topk, placement
+    mask = metadata.get("source_token_mask")
+    if isinstance(mask, Mapping):
+        owners = mask.get("source_owners")
+        topk = mask.get("topk_ids")
+        placement = mask.get("expert_placement")
+        if owners is not None and topk is not None and placement is not None:
+            return owners, topk, placement
+    return None
+
+
+def _transpose_matrix(cells: list[list[float]]) -> tuple[tuple[float, ...], ...]:
+    size = len(cells)
+    return tuple(tuple(cells[dst][src] for dst in range(size)) for src in range(size))
+
+
+def _deepep_exact_stage_matrices(
+    source_owners, topk_ids, expert_placement, *,
+    ep: int, ranks_per_node: int, row_bytes: float, is_combine: bool,
+) -> tuple[tuple[tuple[float, ...], ...], tuple[tuple[float, ...], ...] | None]:
+    """Build exact causal stage matrices: (single, None) or (stage1, stage2) for relays."""
+    size = int(ep)
+    rpn = max(1, min(size, int(ranks_per_node)))
+    inter = [[0.0] * size for _ in range(size)]
+    intra = [[0.0] * size for _ in range(size)]
+    has_two_hop = False
+    for src_raw, ids in zip(source_owners, topk_ids):
+        src = int(src_raw)
+        src_node = src // rpn
+        by_node: dict[int, list[int]] = {}
+        for expert in ids:
+            dst = int(expert_placement[int(expert)][0])
+            by_node.setdefault(dst // rpn, []).append(dst)
+        for dst_node, dests in by_node.items():
+            if dst_node == src_node:
+                for dst in dests:
+                    if dst != src:
+                        intra[src][dst] += float(row_bytes)
+            else:
+                relay = min(size - 1, dst_node * rpn + (src % rpn))
+                if relay != src:
+                    inter[src][relay] += float(row_bytes)
+                for dst in dests:
+                    if dst != relay:
+                        intra[relay][dst] += float(row_bytes)
+                        if relay != src:
+                            has_two_hop = True
+    if not has_two_hop:
+        combined = [
+            [inter[s][d] + intra[s][d] for d in range(size)]
+            for s in range(size)
+        ]
+        if is_combine:
+            return _transpose_matrix(combined), None
+        return tuple(tuple(row) for row in combined), None
+    if is_combine:
+        # Reverse causal order: intra-node gather into relay first, then inter-node return.
+        return _transpose_matrix(intra), _transpose_matrix(inter)
+    # Forward causal order: inter-node transfer to relay first, then intra-node fanout.
+    return tuple(tuple(row) for row in inter), tuple(tuple(row) for row in intra)
+
+
+def _deepep_exact_peer_matrix(
+    source_owners, topk_ids, expert_placement, *,
+    ep: int, ranks_per_node: int, row_bytes: float, is_combine: bool,
+) -> tuple[tuple[float, ...], ...]:
+    """Combined exact two-stage deduplicated inter-node + intra-node peer matrix."""
+    stage1, stage2 = _deepep_exact_stage_matrices(
+        source_owners, topk_ids, expert_placement,
+        ep=ep, ranks_per_node=ranks_per_node, row_bytes=row_bytes,
+        is_combine=is_combine,
+    )
+    if stage2 is None:
+        return stage1
+    size = len(stage1)
+    return tuple(
+        tuple(stage1[s][d] + stage2[s][d] for d in range(size))
+        for s in range(size)
+    )
+
+
+def _resolve_exact_row_bytes(op, metadata: Mapping[str, Any]) -> float | None:
+    row_bytes = metadata.get("row_bytes", metadata.get("payload_row_bytes"))
+    if row_bytes is not None:
+        return float(row_bytes)
+    if op.local_shape and op.dtype:
+        return float(int(op.local_shape[-1]) * dtype_bytes(op.dtype))
+    return None
+
+
+def _exact_stage_op(
+    op, matrix, *, metadata: dict[str, Any], options: Mapping[str, Any],
+    orig_bytes: float, suffix: str = "", deps: tuple[str, ...] | None = None,
+    stage_role: str = "",
+):
+    basis = str(metadata.get("peer_volume_basis") or "")
+    rank = int(metadata.get("peer_source_rank", 0) or 0)
+    scaled_bytes = _matrix_link_bytes(matrix, peer_volume_basis=basis, rank=rank)
+    stage_meta = dict(metadata)
+    traffic = stage_meta.get("peer_traffic") or {"kind": "matrix"}
+    stage_meta["peer_traffic"] = {**traffic, "payload_bytes": matrix}
+    stage_meta["eplb_peak_to_avg"] = options["eplb"]
+    if suffix and "collective_id" in stage_meta:
+        stage_meta["collective_id"] = str(stage_meta["collective_id"]) + suffix
+    if stage_role:
+        stage_meta["deepep_relay_stage"] = stage_role
+    if options["deepep"]:
+        stage_meta["deepep_mode"] = True
+        stage_meta["deepep_overlap_ratio"] = options["overlap"]
+        stage_meta["deepep_dedup_scale"] = (
+            scaled_bytes / orig_bytes if orig_bytes > 0.0 else 1.0
+        )
+    return replace(
+        op,
+        op_id=(op.op_id + suffix) if suffix else op.op_id,
+        deps=op.deps if deps is None else deps,
+        link_bytes=scaled_bytes,
+        metadata=tuple(stage_meta.items()),
+    )
 
 
 _UNSCALED_MATRIX_KEYS = frozenset({"ranks_per_node", "intra_share", "inter_share"})
@@ -168,33 +445,88 @@ def _scale_matrix(value, factor):
     return value
 
 
-def scale_exchange_operator(op, factor, options, *, ep: int = 1,
-                            top_k: int = 1, is_combine: bool = False):
-    """Scale token payload traffic and retain EPLB/DeepEP provenance."""
+def scale_exchange_stages(
+    op, factor, options, *, ep: int = 1, top_k: int = 1,
+    is_combine: bool = False, num_experts: int | None = None,
+) -> tuple[Any, ...]:
+    """Scale exchange traffic and split causal two-stage DeepEP relays when needed."""
     if factor == 1.0 and not options["deepep"] and options["eplb"] == 1.0:
-        return op
-    scaled_bytes = op.link_bytes * factor
+        return (op,)
     metadata = dict(op.metadata)
+    traffic = metadata.get("peer_traffic")
+    is_exact_matrix = (
+        isinstance(traffic, Mapping)
+        and traffic.get("kind") == "matrix"
+        and (metadata.get("routing_basis") in _EXPLICIT_ROUTING_BASES
+             or metadata.get("traffic_model") in _EXPLICIT_ROUTING_BASES)
+    )
+    if is_exact_matrix:
+        orig_bytes = float(op.link_bytes)
+        stage1 = traffic["payload_bytes"]
+        stage2 = None
+        rpn = int(options.get("ranks_per_node", 0) or 0)
+        if options["deepep"] and 0 < rpn < ep:
+            exact_route = _extract_exact_token_route(metadata)
+            row_bytes = _resolve_exact_row_bytes(op, metadata)
+            if exact_route is not None and row_bytes is not None:
+                owners, topk, placement = exact_route
+                stage1, stage2 = _deepep_exact_stage_matrices(
+                    owners, topk, placement, ep=ep, ranks_per_node=rpn,
+                    row_bytes=row_bytes, is_combine=is_combine,
+                )
+        if stage2 is not None:
+            first_suffix = ".intra" if is_combine else ".inter"
+            first_role = "intra_gather" if is_combine else "inter_relay"
+            second_role = "inter_return" if is_combine else "intra_fanout"
+            first_op = _exact_stage_op(
+                op, stage1, metadata=metadata, options=options,
+                orig_bytes=orig_bytes, suffix=first_suffix, stage_role=first_role,
+            )
+            second_op = _exact_stage_op(
+                op, stage2, metadata=metadata, options=options,
+                orig_bytes=orig_bytes,
+                deps=tuple(dict.fromkeys((*op.deps, first_op.op_id))),
+                stage_role=second_role,
+            )
+            return (first_op, second_op)
+        single = _exact_stage_op(
+            op, stage1, metadata=metadata, options=options, orig_bytes=orig_bytes,
+        )
+        return (single,)
+    scaled_bytes = op.link_bytes * factor
     if "peer_traffic" in metadata:
         metadata["peer_traffic"] = _scale_matrix(metadata["peer_traffic"], factor)
     elif (options["deepep"] and not is_combine
           and options["ranks_per_node"] > 0 and ep > options["ranks_per_node"]
           and ep % options["ranks_per_node"] == 0):
         metadata["peer_traffic"] = _deepep_peer_traffic_matrix(
-            scaled_bytes, ep=ep, ranks_per_node=options["ranks_per_node"], top_k=top_k)
+            scaled_bytes, ep=ep, ranks_per_node=options["ranks_per_node"],
+            top_k=top_k, num_experts=num_experts,
+        )
     metadata["eplb_peak_to_avg"] = options["eplb"]
     if options["deepep"]:
         metadata["deepep_mode"] = True
         metadata["deepep_overlap_ratio"] = options["overlap"]
-        metadata["deepep_dedup_scale"] = factor / max(options["eplb"], 1e-12)
-    return replace(op, link_bytes=scaled_bytes,
-                   metadata=tuple(metadata.items()))
+        metadata["deepep_dedup_scale"] = factor / max(options["eplb"], _VOLUME_EPS)
+    return (replace(op, link_bytes=scaled_bytes, metadata=tuple(metadata.items())),)
+
+
+def scale_exchange_operator(op, factor, options, *, ep: int = 1,
+                            top_k: int = 1, is_combine: bool = False,
+                            num_experts: int | None = None):
+    """Single-op wrapper over :func:`scale_exchange_stages` for direct callers."""
+    stages = scale_exchange_stages(
+        op, factor, options, ep=ep, top_k=top_k, is_combine=is_combine,
+        num_experts=num_experts,
+    )
+    return stages[-1]
 
 
 def _scale_op_portion(op, ratio: float, *, suffix: str = "", stream: str | None = None,
                       deps: tuple[str, ...] | None = None,
                       peer_traffic=None, extra_metadata=(),
-                      suffix_reverse: bool = True):
+                      suffix_reverse: bool = True,
+                      link_bytes_override: float | None = None):
     meta = dict(op.metadata)
     if peer_traffic is not None:
         meta["peer_traffic"] = peer_traffic
@@ -213,7 +545,8 @@ def _scale_op_portion(op, ratio: float, *, suffix: str = "", stream: str | None 
         recipe=(op.recipe + suffix) if suffix else op.recipe,
         deps=op.deps if deps is None else deps,
         stream=op.stream if stream is None else stream,
-        link_bytes=op.link_bytes * ratio,
+        link_bytes=(float(link_bytes_override) if link_bytes_override is not None
+                    else op.link_bytes * ratio),
         metadata=tuple(meta.items()),
     )
 
@@ -261,13 +594,14 @@ def _allocate_rows(byte_rows, *, row_bytes, first, total_rows):
     return main, tail
 
 
-def split_peer_traffic_rows(traffic, *, rows: int, first: int, row_bytes: float):
-    """Split directed payload cells by complete assignment rows.
+def split_peer_traffic_rows(traffic, *, rows: int, first: int, row_bytes: float,
+                            overlap: float | None = None):
+    """Split directed payload cells by complete assignment rows (or continuous ratio).
 
     Uniform peers and two-tier source totals are allocated in source order.
-    An explicit matrix allocates each destination column by the same integer
-    fraction so a destination's received range is never partly counted.  No
-    bytes are dropped or invented: both chunks sum to the original cell.
+    An explicit integer matrix allocates each destination column by complete
+    integer rows so a single row is never split fractionally; fractional
+    statistical matrix columns split proportionally with zero dropped bytes.
     """
     if not isinstance(traffic, Mapping):
         return None, None
@@ -283,15 +617,44 @@ def split_peer_traffic_rows(traffic, *, rows: int, first: int, row_bytes: float)
         size = len(matrix)
         main = [[0.0] * size for _ in range(size)]
         tail = [[0.0] * size for _ in range(size)]
+        keep_fraction = (
+            (1.0 - float(overlap))
+            if overlap is not None
+            else (first / float(rows) if rows else 0.0)
+        )
         for destination in range(size):
             column = [float(matrix[source][destination])
                       for source in range(size)]
-            column_rows = (math.fsum(column) / float(row_bytes)
-                           if row_bytes else 0.0)
-            cut = int(math.floor(column_rows * first / rows + 0.5)) if rows else 0
-            cut = max(0, min(int(column_rows), cut))
-            before, after = _allocate_rows(column, row_bytes=row_bytes,
-                                           first=cut, total_rows=int(column_rows) or 1)
+            col_total = math.fsum(column)
+            if col_total <= 0.0:
+                continue
+            column_rows = col_total / float(row_bytes) if row_bytes else 0.0
+            column_int = int(round(column_rows))
+            is_integer_col = (
+                bool(row_bytes)
+                and column_int > 0
+                and math.isclose(column_rows, float(column_int),
+                                 rel_tol=0.0, abs_tol=_INT_ROW_TOL)
+                and all(
+                    math.isclose(
+                        cell / float(row_bytes),
+                        float(round(cell / float(row_bytes))),
+                        rel_tol=0.0, abs_tol=_INT_ROW_TOL,
+                    )
+                    for cell in column
+                )
+            )
+            if is_integer_col:
+                if column_int == 1:
+                    cut = 1
+                else:
+                    cut = int(math.floor(column_int * keep_fraction + 0.5))
+                    cut = max(1, min(column_int - 1, cut))
+                before, after = _allocate_rows(column, row_bytes=row_bytes,
+                                               first=cut, total_rows=column_int)
+            else:
+                before = [cell * keep_fraction for cell in column]
+                after = [cell - b for cell, b in zip(column, before)]
             for source in range(size):
                 main[source][destination] = before[source]
                 tail[source][destination] = after[source]
@@ -373,11 +736,11 @@ def split_deepep_dispatch_overlap(op, options, *, rows=None, row_bytes=None,
     """Split dispatch by complete destination rows, not by the ratio scalar.
 
     ``row_cut`` is the integer boundary already chosen on the received-row
-    basis.  When this payload edge uses another basis, the same boundary is
-    projected by row fraction; the result is still an integer row edge.
+    basis.  Cohort-wide explicit matrices split strictly from cohort-wide
+    column counts and ``overlap`` so every rank declares identical peer traffic.
     """
     overlap = float(options.get("overlap", 0.0))
-    if not options.get("deepep") or overlap <= 0.0:
+    if not options.get("deepep") or overlap <= 0.0 or options.get("ep") == 1:
         return (op,), None
     metadata = dict(op.metadata)
     if rows is None:
@@ -385,10 +748,49 @@ def split_deepep_dispatch_overlap(op, options, *, rows=None, row_bytes=None,
                             metadata.get("assignment_rows",
                                          op.local_shape[0] if op.local_shape else 0))
     rows = int(rows)
+    if row_bytes is None:
+        row_bytes = metadata.get("payload_row_bytes", metadata.get("row_bytes"))
+    traffic = metadata.get("peer_traffic")
+    is_matrix = isinstance(traffic, Mapping) and traffic.get("kind") == "matrix"
+    is_explicit_matrix = (
+        is_matrix
+        and (metadata.get("routing_basis") in _EXPLICIT_ROUTING_BASES
+             or metadata.get("traffic_model") in _EXPLICIT_ROUTING_BASES)
+    )
+    if is_explicit_matrix:
+        eff_row_bytes = float(
+            row_bytes if row_bytes is not None
+            else (_resolve_exact_row_bytes(op, metadata) or 0.0)
+        )
+        main_traffic, tail_traffic = split_peer_traffic_rows(
+            traffic, rows=rows, first=0, row_bytes=eff_row_bytes, overlap=overlap,
+        )
+        basis = str(metadata.get("peer_volume_basis") or "")
+        rank = int(metadata.get("peer_source_rank", 0) or 0)
+        main_link = _matrix_link_bytes(
+            main_traffic["payload_bytes"], peer_volume_basis=basis, rank=rank,
+        )
+        tail_link = _matrix_link_bytes(
+            tail_traffic["payload_bytes"], peer_volume_basis=basis, rank=rank,
+        )
+        common = (
+            ("deepep_completion_basis", "cohort_integer_destination_rows"),
+            ("deepep_transport_row_basis", "cohort_peer_matrix"),
+        )
+        main_op = _scale_op_portion(
+            op, 1.0 - overlap, peer_traffic=main_traffic,
+            link_bytes_override=main_link, extra_metadata=common,
+        )
+        over_op = _scale_op_portion(
+            op, overlap, suffix="_overlap", stream="deepep_comm_stream",
+            deps=(main_op.op_id,), peer_traffic=tail_traffic,
+            link_bytes_override=tail_link, extra_metadata=common,
+        )
+        return (main_op, over_op), over_op.op_id
     if rows < 2:
-        # A zero/one-row edge has no integer second segment.  Keep the declared
-        # transport parts so every cohort rank exposes the same completion
-        # identities; the gate itself still stays unsplit.
+        # A zero/one-row statistical edge has no integer second segment. Keep
+        # the declared transport parts so every cohort rank exposes the same
+        # completion identities; the gate itself still stays unsplit.
         main_op = _scale_op_portion(
             op, 1.0 - overlap,
             extra_metadata=(("deepep_completion_basis",
@@ -399,8 +801,6 @@ def split_deepep_dispatch_overlap(op, options, *, rows=None, row_bytes=None,
             extra_metadata=(("deepep_completion_basis",
                              "overlap_ratio_single_row"),))
         return (main_op, over_op), over_op.op_id
-    if row_bytes is None:
-        row_bytes = metadata.get("payload_row_bytes", metadata.get("row_bytes"))
     if row_cut is None:
         first, second = overlap_row_cut(rows, overlap)
     else:
@@ -413,9 +813,15 @@ def split_deepep_dispatch_overlap(op, options, *, rows=None, row_bytes=None,
             first = max(1, min(rows - 1,
                                int(math.floor(rows * fraction + 0.5))))
         second = rows - first
-    traffic = metadata.get("peer_traffic")
-    main_traffic, tail_traffic = split_peer_traffic_rows(
-        traffic, rows=rows, first=first, row_bytes=float(row_bytes or 0.0))
+    if is_matrix:
+        # Statistical peer matrix (e.g. two-stage DeepEP relay expectation):
+        # scale proportionally by the declared row_cut fraction so fractional
+        # expected rows are conserved exactly across main and overlap chunks.
+        main_traffic = _scale_matrix(traffic, first / float(rows))
+        tail_traffic = _scale_matrix(traffic, second / float(rows))
+    else:
+        main_traffic, tail_traffic = split_peer_traffic_rows(
+            traffic, rows=rows, first=first, row_bytes=float(row_bytes or 0.0))
     edge_bytes = float(rows) * float(row_bytes or 0.0)
     common = (
         ("deepep_row_cut", (first, second)),
@@ -441,19 +847,102 @@ def split_deepep_dispatch_overlap(op, options, *, rows=None, row_bytes=None,
     return (main_op, over_op), over_op.op_id
 
 
+def _with_column_width(op, new_width: int, *, ratio: float):
+    """Update a column-split combine op's declared tensor width to its chunk span."""
+    meta = dict(op.metadata)
+    local_shape = (
+        (*op.local_shape[:-1], int(new_width))
+        if op.local_shape else op.local_shape
+    )
+    sem_shape = (
+        (*op.semantic_shape[:-1], int(new_width))
+        if op.semantic_shape and len(op.semantic_shape) == len(op.local_shape)
+        else op.semantic_shape
+    )
+    launch_shape = (
+        (*op.launch_shape[:-1], int(new_width))
+        if op.launch_shape and len(op.launch_shape) == len(op.local_shape)
+        else op.launch_shape
+    )
+    if isinstance(meta.get("output_shape"), (list, tuple)) and meta["output_shape"]:
+        meta["output_shape"] = (*tuple(meta["output_shape"])[:-1], int(new_width))
+    if "payload_row_elements" in meta:
+        meta["payload_row_elements"] = int(new_width)
+    if "payload_row_bytes" in meta:
+        meta["payload_row_bytes"] = float(meta["payload_row_bytes"]) * ratio
+    if "payload_edge_bytes" in meta:
+        meta["payload_edge_bytes"] = float(meta["payload_edge_bytes"]) * ratio
+    return replace(
+        op, local_shape=local_shape, semantic_shape=sem_shape,
+        launch_shape=launch_shape, metadata=tuple(meta.items()),
+    )
+
+
 def split_deepep_combine_overlap(op, options, *, overlap_deps: tuple[str, ...],
                                  main_deps: tuple[str, ...],
-                                 dispatch_overlap_id: str | None = None):
-    """Split combine into concurrent-stream and critical-path ops conserving bytes."""
+                                 dispatch_overlap_id: str | None = None,
+                                 column_split: tuple[int, int] | None = None):
+    """Split combine along the actual aligned down-projection output columns."""
     overlap = float(options.get("overlap", 0.0))
-    if not options.get("deepep") or overlap <= 0.0:
+    meta = dict(op.metadata)
+    orig_reverse = meta.get("reverse_of_collective")
+    if not options.get("deepep") or overlap <= 0.0 or options.get("ep") == 1:
         return (op,), op.op_id
+    if column_split is not None:
+        n1, n2 = int(column_split[0]), int(column_split[1])
+        width = n1 + n2
+    elif op.local_shape:
+        width = int(op.local_shape[-1])
+        n1, n2 = down_overlap_columns(width, overlap)
+    else:
+        width = n1 = n2 = 0
+    if width < 2 or n1 < 1 or n2 < 1:
+        if orig_reverse is not None and dispatch_overlap_id is not None:
+            meta["reverse_of_collective_parts"] = (
+                str(orig_reverse), str(dispatch_overlap_id),
+            )
+            updated = replace(
+                op,
+                deps=tuple(dict.fromkeys((*op.deps, dispatch_overlap_id))),
+                metadata=tuple(meta.items()),
+            )
+            return (updated,), updated.op_id
+        return (op,), op.op_id
+    early_ratio = n1 / float(width)
+    late_ratio = n2 / float(width)
+    reverse_extra_early: tuple[tuple[str, Any], ...] = (
+        ("deepep_column_cut", (n1, n2)),
+        ("deepep_column_span", (0, n1)),
+    )
+    reverse_extra_late: tuple[tuple[str, Any], ...] = (
+        ("deepep_column_cut", (n1, n2)),
+        ("deepep_column_span", (n1, width)),
+    )
+    if orig_reverse is not None:
+        parts = (
+            (str(orig_reverse), str(dispatch_overlap_id))
+            if dispatch_overlap_id is not None else (str(orig_reverse),)
+        )
+        reverse_extra_early += (
+            ("reverse_of_collective", str(orig_reverse)),
+            ("reverse_of_collective_parts", parts),
+            ("reverse_column_fraction", early_ratio),
+        )
+        reverse_extra_late += (
+            ("reverse_of_collective", str(orig_reverse)),
+            ("reverse_of_collective_parts", parts),
+            ("reverse_column_fraction", late_ratio),
+        )
     over_op = _scale_op_portion(
-        op, overlap, suffix="_overlap", stream="deepep_comm_stream",
+        op, early_ratio, suffix="_overlap", stream="deepep_comm_stream",
         deps=overlap_deps or op.deps,
-        suffix_reverse=dispatch_overlap_id is not None,
+        suffix_reverse=False,
+        extra_metadata=reverse_extra_early,
     )
+    over_op = _with_column_width(over_op, n1, ratio=early_ratio)
     main_op = _scale_op_portion(
-        op, 1.0 - overlap, deps=tuple(dict.fromkeys((*main_deps, over_op.op_id))),
+        op, late_ratio, deps=tuple(dict.fromkeys((*main_deps, over_op.op_id))),
+        extra_metadata=reverse_extra_late,
     )
+    main_op = _with_column_width(main_op, n2, ratio=late_ratio)
     return (over_op, main_op), main_op.op_id
