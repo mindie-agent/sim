@@ -270,12 +270,12 @@ def test_paired_allocator_resolves_defaults_and_honors_explicit_page_size(width,
         assert width == 1 or memory.capacity[0][0] > 0
 
 @pytest.mark.parametrize("model,phase,level,ep,path,expected", [
-    ("qwen3.5-397b-a17b", "decode", "merged", 8, ("metadata", "additional_config", "enable_fused_mc2"), 2),
-    ("qwen3.8-flash-next", "prefill", "unmerged_pr", 8, ("metadata", "text_gated_residual_min_rows"), 513),
-    ("qwen3.8-flash-next", "decode", "unmerged_pr", 8, ("metadata", "text_gated_residual"), None),
-    ("qwen3.8-27b", "prefill", "merged", 1, ("attention_policy", "recurrent_chunk"), 64),
-    ("qwen3.8-27b", "prefill", "unmerged_pr", 1, ("attention_policy", "recurrent_chunk"), 32),
-    ("qwen3.8-2.4t-a95b", "prefill", "unmerged_pr", 8, ("kernels", "lowerings", "gdn_prefill"), None),
+    ("qwen3.5-397b-a17b", "decode", "shipping", 8, ("metadata", "additional_config", "enable_fused_mc2"), 2),
+    ("qwen3.8-flash-next", "prefill", "proposed", 8, ("metadata", "text_gated_residual_min_rows"), 513),
+    ("qwen3.8-flash-next", "decode", "proposed", 8, ("metadata", "text_gated_residual"), None),
+    ("qwen3.8-27b", "prefill", "shipping", 1, ("attention_policy", "recurrent_chunk"), 64),
+    ("qwen3.8-27b", "prefill", "proposed", 1, ("attention_policy", "recurrent_chunk"), 32),
+    ("qwen3.8-2.4t-a95b", "prefill", "proposed", 8, ("kernels", "lowerings", "gdn_prefill"), None),
 ])
 def test_stack_bindings_respect_phase_and_operand_geometry(model, phase, level, ep, path, expected):
     value = stack_case(model, ep=ep, layers=2, feature_track=level, _stack_phase=phase)["runtime"]
@@ -286,21 +286,23 @@ def test_stack_bindings_respect_phase_and_operand_geometry(model, phase, level, 
 def test_stack_manifest_support_roundtrip_and_resolution(tmp_path):
     repo = "jd-opensource/xllm"
     models = ("deepseek-v3.2", "qwen3.8-flash-next", "deepseek-v4.1-flash")
+    prov = {"repository": repo, "revision": "0" * 40, "relative_path": "xllm/pass.py", "source_sha256": "a" * 64}
     path = tmp_path / "stack.json"
     path.write_text(json.dumps({
         "schema": "mindie-sim.stack-manifest/1", "stack_id": "custom-stack", "name": "custom-stack",
         "manifest_revision": "main", "repository": repo,
         "supported_domains": ["llm", "vlm"],
+        "supported_tracks": ["eager", "shipping", "proposed", "target"],
         "supported_models": [models[0]], "unmerged_pr_models": [models[1]],
         "bindings": [
-            {"mechanism_id": "aclgraph_decode_capture", "state": "merged", "ref": repo + "@main"},
-            {"mechanism_id": "gmm_swiglu_quant_fusion", "state": "unmerged_pr", "ref": repo + "#888"},
+            {"mechanism_id": "aclgraph_decode_capture", "state": "merged", "ref": repo + "@main", "lowering_pass_id": "aclgraph_decode_capture", "provenance": prov},
+            {"mechanism_id": "gmm_swiglu_quant_fusion", "state": "unmerged_pr", "ref": repo + "#888", "lowering_pass_id": "gmm_swiglu_quant_fusion", "provenance": prov},
         ],
     }), encoding="utf-8")
     profile = load_runtime_stack_manifest(path)
     assert profile == load_runtime_stack_manifest(profile.to_dict())
     for minimum, model in enumerate(models):
-        for index, level in enumerate(("merged", "unmerged_pr", "expected_ideal")):
+        for index, level in enumerate(("shipping", "proposed", "target")):
             options = dict(runtime_stack=path, feature_track=level)
             if index < minimum:
                 with pytest.raises(ModelingError, match=f"model_not_supported_by_runtime_stack:custom-stack:{model}:{level}"):
@@ -308,7 +310,7 @@ def test_stack_manifest_support_roundtrip_and_resolution(tmp_path):
             else:
                 report = stack_case(model, **options)["runtime"]["metadata"]["feature_track_report"]
                 assert (report["stack"], report["feature_track"]) == (profile.name, level)
-    for level, expected in (("merged", False), ("unmerged_pr", True)):
+    for level, expected in (("shipping", False), ("proposed", True)):
         runtime = stack_case(models[0], runtime_stack=path, feature_track=level)["runtime"]
         active = runtime["metadata"]["feature_track_report"]["active_mechanisms"]
         assert any(binding["id"] == "gmm_swiglu_quant_fusion" and binding["ref"] == repo + "#888"
@@ -606,7 +608,7 @@ def test_shipping_baseline_enables_quant_capture_mlapo_and_arch_disjoint_collect
     for family, (exp_mode, fabric, expect_nz, expect_kv) in expected.items():
         case_dict = compose_case(
             "deepseek-v3.2", REPRESENTATIVE_SKUS[family],
-            tp=1, dp=8, ep=8, layers=4, feature_track="merged",
+            tp=1, dp=8, ep=8, layers=4, feature_track="shipping",
         )
         rt = case_dict["runtime"]
         meta = rt["metadata"]
@@ -634,13 +636,13 @@ def test_shipping_baseline_enables_quant_capture_mlapo_and_arch_disjoint_collect
 
     prefill = compose_case(
         "deepseek-v3.2", REPRESENTATIVE_SKUS["a5"],
-        tp=1, dp=8, ep=8, layers=4, role="pd_prefill", feature_track="merged",
+        tp=1, dp=8, ep=8, layers=4, role="pd_prefill", feature_track="shipping",
     )
     assert prefill["runtime"]["metadata"]["execution_policy"]["mlapo"] is False
     assert "VLLM_ASCEND_ENABLE_MLAPO" not in prefill["runtime"]["metadata"]["va_env"]
 
     non_mla = compose_case(
-        "qwen3.5-397b-a17b", REPRESENTATIVE_SKUS["a5"], tp=8, ep=8, layers=2, feature_track="merged",
+        "qwen3.5-397b-a17b", REPRESENTATIVE_SKUS["a5"], tp=8, ep=8, layers=2, feature_track="shipping",
     )
     assert non_mla["runtime"]["metadata"]["execution_policy"]["mlapo"] is False
     assert "VLLM_ASCEND_ENABLE_MLAPO" not in non_mla["runtime"]["metadata"]["va_env"]
@@ -651,7 +653,7 @@ def test_moe_route_policy_enforces_fused_collective_mutex_and_shared_fusion_guar
 
     eligible = compose_case(
         "deepseek-v3.2", REPRESENTATIVE_SKUS["a5"],
-        tp=1, dp=8, ep=8, layers=4, feature_track="merged",
+        tp=1, dp=8, ep=8, layers=4, feature_track="shipping",
         enable_fused_mc2=3, multistream_overlap_shared_expert=True,
     )
     rt = eligible["runtime"]
@@ -662,7 +664,7 @@ def test_moe_route_policy_enforces_fused_collective_mutex_and_shared_fusion_guar
 
     gated = compose_case(
         "qwen3.5-397b-a17b", REPRESENTATIVE_SKUS["a5"],
-        tp=8, ep=8, layers=2, feature_track="merged",
+        tp=8, ep=8, layers=2, feature_track="shipping",
         multistream_overlap_shared_expert=True,
     )
     assert gated["runtime"]["metadata"]["additional_config"]["enable_fused_mc2"] == 2
@@ -670,7 +672,7 @@ def test_moe_route_policy_enforces_fused_collective_mutex_and_shared_fusion_guar
 
     kimi_merged = compose_case(
         "kimi-k3.1", REPRESENTATIVE_SKUS["a5"],
-        tp=8, ep=8, layers=4, role="pd_decode", feature_track="merged",
+        tp=8, ep=8, layers=4, role="pd_decode", feature_track="shipping",
     )
     assert kimi_merged["runtime"]["metadata"]["additional_config"]["enable_fused_mc2"] == 0
     assert kimi_merged["runtime"].get("multistream_overlap_shared_expert") is True

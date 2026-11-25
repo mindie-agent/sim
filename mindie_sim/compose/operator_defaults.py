@@ -227,6 +227,38 @@ def static_mqsmla_reason(*, arch, cp, tp, layer_plans, model) -> str | None:
     return reason or packed_cache_reason(model)
 
 
+def _effective_binding_name(entry) -> str | None:
+    """Return the effective winning implementation name from a lowering entry."""
+    if isinstance(entry, str):
+        text = entry.strip()
+        return text or None
+    if isinstance(entry, Mapping):
+        if "implementation" in entry and entry["implementation"] is not None:
+            text = str(entry["implementation"]).strip()
+            return text or None
+        cases = entry.get("cases")
+        if isinstance(cases, (list, tuple)) and cases:
+            for item in cases:
+                if isinstance(item, Mapping) and "binding" in item:
+                    resolved = _effective_binding_name(item["binding"])
+                    if resolved is not None:
+                        return resolved
+        otherwise = entry.get("otherwise")
+        if otherwise is not None:
+            return _effective_binding_name(otherwise)
+    return None
+
+
+def _winning_indexer_binding(lowerings: Mapping) -> str | None:
+    for selector in ("lightning_indexer", "quant_lightning_indexer", "indexed_attention", "sharedkv_attention"):
+        if selector in lowerings:
+            return _effective_binding_name(lowerings[selector])
+    fusion = lowerings.get("native_fusion")
+    if isinstance(fusion, Mapping):
+        return _effective_binding_name(fusion) or "native_fusion"
+    return None
+
+
 def apply_compose_v41_a5_defaults(*, model_dict, lowerings, backend, arch,
                                  layer_plans, activation_dtype, tp, cp,
                                  runtime_metadata=None, structural_v41=None):
@@ -250,14 +282,31 @@ def apply_compose_v41_a5_defaults(*, model_dict, lowerings, backend, arch,
         metadata["cache_representations"] = deepcopy(V41_A5_CACHE_FORMATS)
     if override:
         notes.append(fallback_note(PACKED_CACHE_FAMILY, CACHE_OVERRIDE_REASON))
-    if V41_ROTARY_SELECTOR in lowerings or MQSMLA_SELECTOR in lowerings:
-        raise NotImplementedError(
-            "LEGACY_PURGED: derive V41 rotary and MQSMLA selection notes strictly from "
-            "the effective winning lowerings entry after precedence resolution"
-        )
-    lowerings[V41_ROTARY_SELECTOR] = V41_ROTARY_IMPLEMENTATION
-    notes.append(selected_note(V41_ROTARY_SELECTOR, V41_ROTARY_IMPLEMENTATION,
-                               V41_ROTARY_NATIVE, ROTARY_REASON))
+    if V41_ROTARY_SELECTOR in lowerings:
+        eff_rotary = _effective_binding_name(lowerings[V41_ROTARY_SELECTOR])
+        if eff_rotary is None or eff_rotary == "analytical":
+            notes.append(fallback_note(V41_ROTARY_SELECTOR, "explicit_analytical_preserved"))
+        elif eff_rotary == V41_ROTARY_IMPLEMENTATION:
+            notes.append(selected_note(V41_ROTARY_SELECTOR, eff_rotary,
+                                       V41_ROTARY_NATIVE, "explicit_declaration_preserved"))
+        else:
+            notes.append(selected_note(V41_ROTARY_SELECTOR, eff_rotary,
+                                       eff_rotary, "explicit_declaration_preserved"))
+    else:
+        lowerings[V41_ROTARY_SELECTOR] = V41_ROTARY_IMPLEMENTATION
+        notes.append(selected_note(V41_ROTARY_SELECTOR, V41_ROTARY_IMPLEMENTATION,
+                                   V41_ROTARY_NATIVE, ROTARY_REASON))
+    if MQSMLA_SELECTOR in lowerings:
+        eff_mqsmla = _effective_binding_name(lowerings[MQSMLA_SELECTOR])
+        if eff_mqsmla is None or eff_mqsmla == "analytical":
+            notes.append(fallback_note(MQSMLA_FAMILY, "explicit_analytical_preserved"))
+        elif eff_mqsmla == MQSMLA_RECIPE:
+            notes.append(selected_note(MQSMLA_FAMILY, MQSMLA_RECIPE, MQSMLA_NATIVE,
+                                       "explicit_declaration_preserved"))
+        else:
+            notes.append(selected_note(MQSMLA_FAMILY, eff_mqsmla, eff_mqsmla,
+                                       "explicit_declaration_preserved"))
+        return notes
     if override:
         notes.append(fallback_note(MQSMLA_FAMILY, CACHE_OVERRIDE_REASON))
         return notes
@@ -303,10 +352,28 @@ def mqsmla_default(case, kernels):
         arch=case.machine.arch_family, cp=parallel.cp, tp=parallel.tp,
         layer_plans=layers, model=case.model)
     if MQSMLA_SELECTOR in lowerings:
-        raise NotImplementedError(
-            "LEGACY_PURGED: derive mqsmla_default summary strictly from the effective "
-            "winning lowerings[MQSMLA_SELECTOR] entry instead of fabricating native claims"
-        )
+        eff_mqsmla = _effective_binding_name(lowerings[MQSMLA_SELECTOR])
+        if automatic and reason is not None:
+            return {"family": MQSMLA_FAMILY, "selection": "preserved",
+                    "reason": reason, "degraded": True, "installed": True}
+        if eff_mqsmla is None or eff_mqsmla == "analytical":
+            return {"family": MQSMLA_FAMILY, "selection": "preserved",
+                    "binding": "analytical",
+                    "reason": "explicit_analytical_preserved",
+                    "degraded": True, "installed": automatic}
+        if eff_mqsmla == MQSMLA_RECIPE:
+            return {"family": MQSMLA_FAMILY,
+                    "selection": "default_installed" if automatic else "preserved",
+                    "binding": MQSMLA_RECIPE,
+                    "reason": SELECTED_REASON if automatic
+                              else "explicit_implementation_preserved",
+                    "native_kind": MQSMLA_NATIVE, "degraded": False,
+                    "installed": automatic}
+        return {"family": MQSMLA_FAMILY, "selection": "preserved",
+                "binding": eff_mqsmla,
+                "reason": "explicit_implementation_preserved",
+                "native_kind": eff_mqsmla, "degraded": False,
+                "installed": automatic}
     if reason is not None:
         return {"family": MQSMLA_FAMILY, "selection": "preserved", "reason": reason,
                 "degraded": True, "installed": False}
@@ -396,10 +463,14 @@ def lightning_indexer_default(case, kernels):
                 "reason": "raw_eager_requested", "degraded": True}
     lowerings = kernels.setdefault("lowerings", {})
     if indexer_boundary_declared(lowerings):
-        raise NotImplementedError(
-            "LEGACY_PURGED: derive lightning_indexer_default summary strictly from the "
-            "effective winning indexer lowering entry instead of claiming BF16 native binding"
-        )
+        eff_idx = _winning_indexer_binding(lowerings)
+        if eff_idx is None or eff_idx == "analytical":
+            return {"family": LIGHTNING_INDEXER_FAMILY, "selection": "preserved",
+                    "binding": "analytical",
+                    "reason": "explicit_analytical_preserved", "degraded": True}
+        return {"family": LIGHTNING_INDEXER_FAMILY, "selection": "preserved",
+                "binding": eff_idx,
+                "reason": "explicit_implementation_preserved", "degraded": False}
     reason = lightning_indexer_reason(case, layers)
     if reason is not None:
         return {"family": LIGHTNING_INDEXER_FAMILY, "selection": "preserved",

@@ -144,6 +144,31 @@ def _reconcile_injected_contracts(
     return eff_scenario, eff_quant, eff_lowering
 
 
+_STACK_PASS_TO_TRANSFORM_PASSES: dict[str, tuple[str, ...]] = {
+    "norm_quant_fusion": ("norm_quant", "residual_norm"),
+    "mm_reduce_scatter_fusion": ("tp_mc2_overlap",),
+    "add_rmsnorm_quant_fusion": ("norm_quant", "residual_norm"),
+}
+
+
+def _map_executable_lowering_passes(
+    existing_passes: tuple[str, ...],
+    stack_passes: tuple[str, ...],
+) -> tuple[str, ...]:
+    from mindie_sim.prediction.transforms import LOWERING_PASSES
+
+    out: list[str] = list(existing_passes)
+    for name in stack_passes:
+        if name in LOWERING_PASSES:
+            if name not in out:
+                out.append(name)
+        elif name in _STACK_PASS_TO_TRANSFORM_PASSES:
+            for mapped in _STACK_PASS_TO_TRANSFORM_PASSES[name]:
+                if mapped in LOWERING_PASSES and mapped not in out:
+                    out.append(mapped)
+    return tuple(out)
+
+
 def _build_injected_base(
     case: Case,
     request: LoweringRequest,
@@ -152,11 +177,78 @@ def _build_injected_base(
     runtime_quant_plan: RuntimeQuantPlan | None,
     stack_lowering_plan: StackLoweringPlan,
 ) -> ResolvedBase:
-    """Unplugged socket: dropped recipe_bindings options, origin coercion, and missing RECIPE_BINDING_ORIGINS_KEY purged."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: preserve full recipe_bindings (selector, recipe_id, options) dicts, "
-        "validate binding_origins strictly against ALLOWED_BINDING_ORIGINS, and write "
-        "RECIPE_BINDING_ORIGINS_KEY into working.runtime.metadata in _build_injected_base"
+    from mindie_sim.prediction.implementation_selection import (
+        ALLOWED_BINDING_ORIGINS,
+        RECIPE_BINDING_ORIGINS_KEY,
+        record_binding_origin,
+    )
+
+    kernels = deepcopy(dict(case.runtime.kernels))
+    meta = deepcopy(dict(case.runtime.metadata))
+    layouts = deepcopy(dict(case.runtime.tensor_layouts))
+    lowerings = dict(kernels.get("lowerings") or {})
+    for selector, recipe_id, opts in stack_lowering_plan.recipe_bindings:
+        opts_dict = dict(opts) if opts else {}
+        lowerings[selector] = (
+            {"implementation": recipe_id, "options": opts_dict}
+            if opts_dict else recipe_id
+        )
+    if lowerings:
+        kernels["lowerings"] = lowerings
+    for scope_key, role_key, layout_name in stack_lowering_plan.tensor_layouts:
+        layouts[f"{scope_key}.{role_key}" if scope_key else role_key] = layout_name
+
+    origins: list[tuple[str, OriginKind]] = []
+    meta.setdefault(RECIPE_BINDING_ORIGINS_KEY, {})
+    for key, origin in stack_lowering_plan.binding_origins:
+        if origin not in ALLOWED_BINDING_ORIGINS:
+            raise ModelingError(
+                f"spine_binding_origin_invalid:{key}:{origin!r}:allowed={sorted(ALLOWED_BINDING_ORIGINS)}"
+            )
+        origins.append((key, origin))  # type: ignore[arg-type]
+        if "." in key:
+            section, name = key.split(".", 1)
+        else:
+            section, name = "lowerings", key
+        meta = record_binding_origin(meta, section, name, origin)
+
+    rt_updates: dict[str, Any] = {
+        "kernels": kernels,
+        "tensor_layouts": layouts,
+    }
+    if stack_lowering_plan.lowering_passes:
+        exec_passes = _map_executable_lowering_passes(
+            tuple(case.runtime.lowering_passes),
+            tuple(stack_lowering_plan.lowering_passes),
+        )
+        if exec_passes:
+            rt_updates["lowering_passes"] = exec_passes
+    cap_rule = stack_lowering_plan.scheduling.capture_bucket_rule
+    if cap_rule is not None:
+        graph_mode, raw_mode = _CAPTURE_MODE_TO_CASE[cap_rule.mode]
+        rt_updates["graph_capture_mode"] = graph_mode
+        if cap_rule.full_keys:
+            rt_updates["graph_capture_keys"] = cap_rule.full_keys
+        if cap_rule.piecewise_keys:
+            rt_updates["piecewise_capture_keys"] = cap_rule.piecewise_keys
+        meta["captured_execution_mode"] = raw_mode
+    rt_updates["metadata"] = tuple(sorted(meta.items()))
+    working = replace(case, runtime=replace(case.runtime, **rt_updates))
+    eff_req = replace(
+        request,
+        scenario_contract=scenario_contract,
+        runtime_quant_plan=runtime_quant_plan,
+        stack_lowering_plan=stack_lowering_plan,
+    )
+    return ResolvedBase(
+        case=working,
+        request=eff_req,
+        stack=None,
+        recipe_origins=tuple(origins),
+        sources=(),
+        scenario_contract=scenario_contract,
+        runtime_quant_plan=runtime_quant_plan,
+        stack_lowering_plan=stack_lowering_plan,
     )
 
 
@@ -277,10 +369,10 @@ class PredictionSpine:
         width = p.tp * p.pcp
         start = (int(replica) * p.pp + int(stage)) * width
         dies = case.machine.dies[start : start + width]
-        if not dies:
-            raise NotImplementedError(
-                "LEGACY_PURGED: raise ModelingError('stage_geometry_dies_out_of_range') "
-                "instead of silently falling back to case.machine.dies[:1]"
+        if start < 0 or start + width > len(case.machine.dies) or not dies:
+            raise ModelingError(
+                f"stage_geometry_dies_out_of_range:replica={replica}:stage={stage}:"
+                f"start={start}:width={width}:available={len(case.machine.dies)}"
             )
         return Geometry.from_devices(
             dies,
@@ -807,11 +899,56 @@ class PredictionSpine:
         from mindie_sim.sweep.engine import compute_pareto_frontier
 
         if request.mode == "pd":
-            raise NotImplementedError(
-                "LEGACY_PURGED: evaluate every budget in request.device_counts (not device_counts[0] only) "
-                "with request.sla.max_sequences_per_dp forwarded to sweep_pd_disaggregation_ratios "
-                "and compute the Pareto frontier across all budgets"
+            budgets = (
+                tuple(int(d) for d in request.device_counts)
+                if request.device_counts
+                else (max(len(case.machine.dies), DEFAULT_PD_TOTAL_DIES),)
             )
+            prompt_toks = max(1, request.sla.step.context or request.sla.step.tokens)
+            output_toks = max(1, request.sla.output_budget)
+            total_evaluated = 0
+            combined_rows: list[dict[str, Any]] = []
+            for budget in budgets:
+                report = sweep_pd_disaggregation_ratios(
+                    case,
+                    decode_case or case,
+                    total_dies=budget,
+                    prompt_tokens=prompt_toks,
+                    output_tokens=output_toks,
+                    tpot_sla_ms=request.sla.latency_ms,
+                    max_sequences_per_dp=request.sla.max_sequences_per_dp,
+                )
+                all_rows = report.get("candidates", ())
+                total_evaluated += len(all_rows)
+                for row in report.get("pareto_frontier", ()):
+                    raw_span = row.get("effective_tpot_ms")
+                    if raw_span is None:
+                        raw_span = row.get("decode_step_ms", 0.0)
+                    tps = float(row.get("sustainable_tps", 0.0) or 0.0)
+                    used = int(row.get("used_dies", budget))
+                    combined_rows.append({
+                        **dict(row),
+                        "num_devices": used,
+                        "step_ms_feasible": float(raw_span or 0.0),
+                        "tps_feasible": tps,
+                        "feasible": bool(row.get("feasible", True)),
+                        "_budget": budget,
+                    })
+            if combined_rows:
+                compute_pareto_frontier(combined_rows)
+            frontier: list[TopologyPoint] = []
+            for row in combined_rows:
+                if not row.get("pareto_optimal"):
+                    continue
+                frontier.append(TopologyPoint(
+                    device_count=int(row["num_devices"]),
+                    parallel=(("prefill_dies", int(row.get("prefill_dies", 0))),),
+                    decode_parallel=(("decode_dies", int(row.get("decode_dies", 0))),),
+                    span_ms=float(row["step_ms_feasible"]),
+                    throughput_tokens_s=float(row["tps_feasible"]),
+                    fits_memory=True,
+                ))
+            return TopologySweepResult(evaluated_count=total_evaluated, frontier=tuple(frontier))
 
         grid = list(request.device_counts) if request.device_counts else None
         evaluated_rows = list(sweep_topologies_iter(

@@ -1,13 +1,14 @@
 """vLLM-Ascend runtime profiles, manifest loader, ISA guards, and MC2/MSO policy.
 
 [Role] Own the packaged ``vllm-ascend`` plugin manifest (``manifest.json``),
-  strict A2/A3 (INT8/INT4/C8) vs A5 (MXFP8/MXFP4/FP8) ISA guards,
-  workload-domain classification, and MC2-vs-MSO mutual exclusion.
+  10-axis structural capability extraction, strict A2/A3 (INT8/INT4/C8) vs A5
+  (MXFP8/MXFP4/FP8) ISA guards, workload-domain classification, structural
+  collective policy, and MC2-vs-MSO mutual exclusion.
 [Invariants] Strictly LLM/VLM scope (Diffusion/DiT models classify as
   ``"diffusion"`` and are rejected at the plugin boundary). Zero imports from
   ``mindie_sim.export`` or ``mindie_sim.compose`` (AG010). Zero per-model-name
   executable branches (AG014). A2/A3 never admit MXFP/FP8 weights or FP8 KV
-  cache.
+  cache. Zero cross-generation checkpoint fallback.
 [Timeouts & Locks] Single bounded read (< 50 MiB) of packaged ``manifest.json``
   cached via ``lru_cache``; no network I/O or locks.
 [Side-Effect Policy] Read-only over packaged manifest; returns fresh dicts and
@@ -26,7 +27,13 @@ from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.parallel import ParallelSpec
-from mindie_sim.schema.stack import ManifestBinding, StackTrack, WorkloadDomain
+from mindie_sim.schema.stack import STACK_TRACKS, ManifestBinding, StackTrack, WorkloadDomain
+
+from .checkpoint_registry import (
+    DEFAULT_CHECKPOINTS_BY_MODEL_HW,
+    lookup_default_checkpoint_repo,
+    normalize_checkpoint_model_key,
+)
 
 VLLM_ASCEND_STACK_ID = "vllm-ascend"
 VLLM_ASCEND_REPO = "vllm-project/vllm-ascend"
@@ -44,6 +51,8 @@ SINGLE_MTP_PROPOSAL_TOKEN = 1
 MTP_STANDARD_PROPOSAL_TOKENS = 3
 MTP_DSPARK_PROPOSAL_TOKENS = 5
 PAIRED_SFA_DOC_BLOCK_SIZE = 544
+COMPRESSED_KV_BLOCK_SIZE = 32
+QSA_GROUP_KPOOL_RATIO = 4
 
 _A5_FAMILY_TOKENS = ("a5", "950", "9582", "9581", "9579", "958b", "9599", "3510", "arch35")
 _A3_FAMILY_TOKENS = ("a3", "910c", "910_93", "9392", "9391", "9382", "9362")
@@ -55,11 +64,13 @@ A2_A3_ALLOWED_KV_DTYPES = frozenset({"bf16", "fp16", "int8", "c8", "auto", ""})
 A5_ONLY_QUANT_TOKENS = ("mxfp", "fp8", "fp4")
 
 _DIFFUSION_ARCH_TOKENS = ("dit", "unet", "diffusion", "hunyuan_video", "wan2", "flux", "sdxl", "sd3")
+_VALID_ROLES = frozenset({"colocated", "pd_disaggregated", "pd_prefill", "pd_decode"})
+_MXFP_FORMATS = frozenset({"mxfp8", "mx_fp8", "mxfp4", "mx_fp4", "fp8_e4m3", "fp8", "fp4_e2m1", "fp4"})
+_FP4_W4A8_EXPERT_FORMATS = frozenset({"mxfp4", "mx_fp4", "fp4", "fp4_e2m1", "int4", "w4a8"})
+_W4A8_EXPERT_FORMATS = frozenset({"int4", "w4a8"})
+_FP8_KV_MODES = frozenset({"fp8", "fp8_e4m3", "mxfp8"})
 
-# Purged model-name lookup tables: Commit #2 must move pure checkpoint URL
-# metadata to stacks/vllm_ascend/checkpoint_registry.py and remove model-keyed
-# runtime profile defaults in favor of structural ModelSpec + Hardware rules.
-DEFAULT_CHECKPOINTS_BY_MODEL_HW: dict[tuple[str, str], str] = {}
+# Retired model-keyed profile table: kept empty for export compatibility only.
 VA_RECOMMENDED_PROFILES: dict[str, dict[str, Any]] = {}
 
 
@@ -107,20 +118,17 @@ def hardware_backend_kind(hardware: Hardware) -> str:
 
 
 def normalize_canonical_model(model_or_name: ModelSpec | str) -> str:
-    """Unplugged socket: model-name routing purged per AG014."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire pure checkpoint-URL normalization in "
-        "stacks/vllm_ascend/checkpoint_registry.py and replace executable "
-        "model-name routing with structural ModelSpec predicates"
-    )
+    """Delegate pure checkpoint-URL slug normalization to ``checkpoint_registry``."""
+    return normalize_checkpoint_model_key(model_or_name)
 
 
 def resolve_model_type(model: ModelSpec) -> str:
-    """Unplugged socket: model-name fallback mapping purged per AG014."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: eliminate model-name resolve_model_type heuristics; "
-        "dispatch purely on structural LayerPlan and ModelSpec fields"
-    )
+    """Extract declared HF ``model_type`` metadata without model-name heuristics."""
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    meta = dict(getattr(model, "metadata", ()) or ())
+    return str(
+        facts.get("model_type") or meta.get("source_model_type") or meta.get("model_type") or ""
+    ).strip().lower()
 
 
 def infer_model_workload_domain(model: ModelSpec) -> WorkloadDomain:
@@ -140,11 +148,11 @@ def infer_model_workload_domain(model: ModelSpec) -> WorkloadDomain:
 
 
 def default_checkpoint_repo(canonical_model: str, hw_family: str) -> str | None:
-    """Unplugged socket: checkpoint URL table + cross-gen fallback purged."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: move curated checkpoint lookup into "
-        "stacks/vllm_ascend/checkpoint_registry.py without cross-generation fallback"
-    )
+    """Return exact curated checkpoint repository for ``(canonical_model, hw_family)``."""
+    hw = normalize_hw_family(hw_family)
+    if hw not in {"a2", "a3", "a5"}:
+        return None
+    return lookup_default_checkpoint_repo(canonical_model, hw)
 
 
 def validate_vllm_ascend_quant_isa(
@@ -241,28 +249,285 @@ def load_manifest_bindings() -> tuple[ManifestBinding, ...]:
     return tuple(bindings)
 
 
+def _quant_capabilities(model: ModelSpec, quant_plan: Any) -> dict[str, Any]:
+    """Extract weight/activation/KV quantization capability flags structurally."""
+    qspec = getattr(model, "quant", None)
+    act_dtype = str(getattr(model, "activation_dtype", "bf16") or "bf16").strip().lower()
+    w_fmts: set[str] = set()
+    e_fmts: set[str] = set()
+    has_quant_act = False
+    if qspec is not None:
+        wf = str(getattr(qspec, "weight_format", "") or "").strip().lower()
+        ef = str(getattr(qspec, "expert_weight_format", "") or "").strip().lower()
+        af = str(getattr(qspec, "activation_format", "") or "").strip().lower()
+        if wf:
+            w_fmts.add(wf)
+        if ef:
+            e_fmts.add(ef)
+            w_fmts.add(ef)
+        if af and af != act_dtype:
+            has_quant_act = True
+        for _, pairs in getattr(qspec, "category_overrides", ()) or ():
+            for k, v in pairs:
+                v_low = str(v or "").strip().lower()
+                if k == "activation_format" and v_low and v_low != act_dtype:
+                    has_quant_act = True
+                elif k in {"weight_format", "expert_weight_format"} and v_low:
+                    w_fmts.add(v_low)
+                    if k == "expert_weight_format":
+                        e_fmts.add(v_low)
+    has_fp8_kv = str(getattr(qspec, "kv_dtype", "") or "").strip().lower() in _FP8_KV_MODES
+    if quant_plan is not None:
+        for (_sc, _lid, role_name), abi in getattr(quant_plan, "port_abis", ()) or ():
+            lm = str(getattr(abi, "linear_method", "") or "").lower()
+            wd = str(getattr(abi, "weight_dtype", "") or "").lower()
+            id_ = str(getattr(abi, "input_dtype", "") or "").lower()
+            if lm in {"mx_fp8", "mx_fp4", "fp8"}:
+                w_fmts.add(lm)
+            if wd:
+                w_fmts.add(wd)
+            if "experts" in str(role_name) and (lm in {"mx_fp4", "w4a8"} or wd in {"fp4_e2m1", "int4"}):
+                e_fmts.add(wd or lm)
+            if id_ and id_ not in {"bf16", "fp16", "fp32", act_dtype}:
+                has_quant_act = True
+        for k_abi in getattr(quant_plan, "kv_cache_abi", ()) or ():
+            if any(str(pl.dtype).lower() in _FP8_KV_MODES for pl in getattr(k_abi, "planes", ())):
+                has_fp8_kv = True
+    return {
+        "has_quant_activation": has_quant_act,
+        "has_mxfp_weights": bool(w_fmts & _MXFP_FORMATS),
+        "has_fp4_or_w4a8_experts": bool(e_fmts & _FP4_W4A8_EXPERT_FORMATS),
+        "has_w4a8_experts": bool(e_fmts & _W4A8_EXPERT_FORMATS),
+        "has_fp8_kv": has_fp8_kv,
+    }
+
+
+def extract_model_capabilities(
+    model: ModelSpec | None,
+    *,
+    arch: str,
+    parallel: ParallelSpec | None = None,
+    quant_plan: Any = None,
+    speculative_k: int = 0,
+    sp_enabled: bool = False,
+) -> dict[str, Any]:
+    """Derive 10-axis structural capability predicates solely from ``ModelSpec`` & topology."""
+    hw = normalize_hw_family(arch)
+    tp = int(parallel.tp) if parallel is not None else 1
+    ep = int(parallel.ep) if parallel is not None else 1
+    pp = int(parallel.pp) if parallel is not None else 1
+    pcp = int(parallel.pcp) if parallel is not None else 1
+    dcp = int(parallel.cp) if parallel is not None else 1
+    base: dict[str, Any] = {
+        "arch": hw,
+        "workload_domain": "llm",
+        "tp": tp,
+        "ep": ep,
+        "pp": pp,
+        "pcp": pcp,
+        "dcp": dcp,
+        "sp_enabled": bool(sp_enabled),
+        "speculative_k": int(speculative_k),
+        "has_quant_activation": False,
+        "has_mla": False,
+        "qk_rope_head_dim": 0,
+        "mla_use_nope": False,
+        "mla_qkv_a_gate_fused": False,
+        "has_attn_res": False,
+        "has_mhc_sinkhorn": False,
+        "has_low_rank_hc": False,
+        "has_unit_offset_rmsnorm": False,
+        "has_fp32_residual_norm": False,
+        "has_recurrent": False,
+        "has_kda": False,
+        "has_gdn": False,
+        "gdn_hv_hk_ratio": 0,
+        "has_moe": False,
+        "has_shared_expert": False,
+        "has_mxfp_weights": False,
+        "has_fp4_or_w4a8_experts": False,
+        "has_w4a8_experts": False,
+        "ffn_activation": "silu",
+        "has_gqa": False,
+        "has_mla_indexer": False,
+        "has_kpool_indexer": False,
+        "has_csa2_compressed_indexer": False,
+        "has_qsa_indexed_gbsa": False,
+        "has_msa_gbsa": False,
+        "has_region_gbsa_indexer": False,
+        "has_sfa_packed_fp8_kv": False,
+        "supports_torch_compile": True,
+        "has_dspark_draft": False,
+        "has_dspark_mla_draft": False,
+    }
+    if model is None:
+        return base
+
+    plans = tuple(model.layer_plans or ())
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    q_caps = _quant_capabilities(model, quant_plan)
+    mla_plans = [p for p in plans if str(p.attention).lower() == "mla"]
+    gdn_plans = [p for p in plans if str(p.attention).lower() == "gdn"]
+    kda_plans = [p for p in plans if str(p.attention).lower() == "kda"]
+    gqa_plans = [p for p in plans if str(p.attention).lower() not in {"mla", "kda", "gdn"}]
+    gdn_ratio = 0
+    if gdn_plans:
+        p0 = gdn_plans[0]
+        hk = int(p0.linear_key_heads or p0.linear_heads or 0)
+        hv = int(p0.linear_value_heads or p0.linear_heads or 0)
+        gdn_ratio = (hv // hk) if (hk > 0 and hv % hk == 0) else 0
+
+    moe_acts = [str(p.ffn_activation or "silu").lower() for p in plans if p.ffn == "moe"]
+    all_acts = [str(p.ffn_activation or "silu").lower() for p in plans]
+    ffn_act = moe_acts[0] if moe_acts else (all_acts[0] if all_acts else "silu")
+    aux = getattr(model, "auxiliary", None)
+    dspark = getattr(aux, "dspark", None) if aux is not None else None
+    has_mla_idx = any(p.indexer for p in mla_plans)
+    norm_offset = float(facts.get("norm_weight_offset", 0.0) or 0.0)
+    base.update({
+        "workload_domain": infer_model_workload_domain(model),
+        "has_quant_activation": q_caps["has_quant_activation"],
+        "has_mla": bool(mla_plans),
+        "qk_rope_head_dim": max((int(p.qk_rope_head_dim) for p in mla_plans), default=0),
+        "mla_use_nope": bool(mla_plans) and all(bool(p.mla_use_nope) for p in mla_plans),
+        "mla_qkv_a_gate_fused": any(bool(p.mla_qkv_a_gate_fused) for p in mla_plans),
+        "has_attn_res": any(int(p.residual_block_size) > 0 for p in plans),
+        "has_mhc_sinkhorn": any(int(p.hc_mult) > 1 and int(p.hc_sinkhorn_iters) > 0 for p in plans),
+        "has_low_rank_hc": any(int(p.hc_mult) > 1 and int(p.hc_lowrank) > 0 for p in plans),
+        "has_unit_offset_rmsnorm": any(bool(p.norm_unit_offset) for p in plans) or norm_offset != 0.0,
+        "has_fp32_residual_norm": bool(facts.get("fp32_residual_connection", False)),
+        "has_recurrent": bool(kda_plans or gdn_plans),
+        "has_kda": bool(kda_plans),
+        "has_gdn": bool(gdn_plans),
+        "gdn_hv_hk_ratio": gdn_ratio,
+        "has_moe": bool(model.num_experts > 0 or any(p.ffn == "moe" for p in plans)),
+        "has_shared_expert": bool(
+            model.num_shared_experts > 0 or any(int(p.num_shared_experts) > 0 for p in plans)
+        ),
+        "has_mxfp_weights": q_caps["has_mxfp_weights"],
+        "has_fp4_or_w4a8_experts": q_caps["has_fp4_or_w4a8_experts"],
+        "has_w4a8_experts": q_caps["has_w4a8_experts"],
+        "ffn_activation": ffn_act,
+        "has_gqa": bool(gqa_plans),
+        "has_mla_indexer": has_mla_idx,
+        "has_kpool_indexer": any(p.indexer and int(p.index_kpool) > 1 for p in mla_plans),
+        "has_csa2_compressed_indexer": any(
+            p.mla_variant == "latent_mqa" and p.cache_kind == "window_compressed" and int(p.compress_ratio) > 0
+            for p in mla_plans
+        ),
+        "has_qsa_indexed_gbsa": any(
+            p.indexer and int(p.index_kpool) == QSA_GROUP_KPOOL_RATIO and bool(p.q_output_gate)
+            for p in gqa_plans
+        ),
+        "has_msa_gbsa": any(p.indexer and int(p.index_kpool) == 1 for p in gqa_plans),
+        "has_region_gbsa_indexer": any(p.indexer and int(p.index_kpool) > QSA_GROUP_KPOOL_RATIO for p in gqa_plans),
+        "has_sfa_packed_fp8_kv": bool(has_mla_idx and q_caps["has_fp8_kv"]),
+        "supports_torch_compile": bool(facts.get("supports_torch_compile", True)),
+        "has_dspark_draft": dspark is not None,
+        "has_dspark_mla_draft": dspark is not None and str(getattr(dspark, "attention_kind", "")).lower() == "mla",
+    })
+    return base
+
+
+def _load_structural_model_if_str(model_or_name: ModelSpec | str | None) -> ModelSpec | None:
+    if isinstance(model_or_name, ModelSpec):
+        return model_or_name
+    if isinstance(model_or_name, str) and model_or_name.strip():
+        from mindie_sim.model_catalog import load_model
+        key = normalize_checkpoint_model_key(model_or_name)
+        for cand in dict.fromkeys((model_or_name.strip(), key)):
+            try:
+                return load_model(cand)
+            except (KeyError, FileNotFoundError, ModelingError):
+                continue
+    return None
+
+
 def resolve_manifest_bindings(
     track: StackTrack,
-    canonical_model: str,
+    model_or_name: ModelSpec | str | None,
     arch: str,
     *,
     phase: str | None = None,
+    capabilities: Mapping[str, Any] | None = None,
+    parallel: ParallelSpec | None = None,
+    quant_plan: Any = None,
+    speculative_k: int = 0,
+    sp_enabled: bool = False,
 ) -> tuple[ManifestBinding, ...]:
-    """Unplugged socket: model-name manifest matching purged per AG014."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: wire structural capability_predicates + canonical StackTrack "
-        "+ phase_scope filtering in resolve_manifest_bindings (zero canonical_model)"
-    )
+    """Select active manifest bindings strictly via canonical ``StackTrack`` & structural predicates."""
+    if track not in STACK_TRACKS:
+        raise ModelingError(f"stack_track_invalid:{track!r}:expected={sorted(STACK_TRACKS)}")
+    if track == "eager":
+        return ()
+    allowed_states = frozenset({"merged"}) if track == "shipping" else frozenset({"merged", "unmerged_pr"})
+    hw = normalize_hw_family(arch)
+    if capabilities is None:
+        spec = _load_structural_model_if_str(model_or_name)
+        caps: Mapping[str, Any] = extract_model_capabilities(
+            spec, arch=hw, parallel=parallel, quant_plan=quant_plan,
+            speculative_k=speculative_k, sp_enabled=sp_enabled,
+        )
+    else:
+        caps = capabilities
+    phase_norm = str(phase).strip().lower() if phase else None
+    matched: list[ManifestBinding] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for binding in load_manifest_bindings():
+        if binding.state not in allowed_states:
+            continue
+        if not binding.matches("", hw, phase=phase_norm, capabilities=caps):
+            continue
+        key = (binding.mechanism_id, binding.state)
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        matched.append(binding)
+    return tuple(matched)
 
 
 def shipping_collective_policy(
-    arch: str, *, canonical: str = "", role: str | None = None,
+    arch: str,
+    *,
+    canonical: str = "",
+    role: str | None = None,
+    model: ModelSpec | None = None,
 ) -> dict[str, Any] | None:
-    """Unplugged socket: model-name collective policy sets purged per AG014."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: derive shipping collective policy strictly from Hardware arch, "
-        "deployment role, and structural ModelSpec predicates (zero model-name sets)"
-    )
+    """Resolve arch-disjoint shipping collective policy strictly from hardware arch and role."""
+    del canonical, model
+    arch_norm = normalize_hw_family(arch)
+    role_norm = str(role or "").strip().lower() or "colocated"
+    if role_norm not in _VALID_ROLES:
+        raise ModelingError(f"shipping_collective_policy_invalid_role:{role!r}")
+    if arch_norm == "a5":
+        env_mode = "CCU_SCHED" if role_norm == "pd_decode" else "CCU_MS"
+        return {
+            "arch": "a5",
+            "role": role_norm,
+            "process_env_mode": env_mode,
+            "executor": "ccu_ms",
+            "fabric": "ub_direct",
+            "oneshot_active": True,
+        }
+    if arch_norm == "a3":
+        return {
+            "arch": "a3",
+            "role": role_norm,
+            "process_env_mode": "AIV",
+            "executor": "aiv",
+            "fabric": "hccs_sw",
+            "oneshot_active": True,
+        }
+    if arch_norm == "a2":
+        return {
+            "arch": "a2",
+            "role": role_norm,
+            "process_env_mode": "AIV",
+            "executor": "aiv",
+            "fabric": "hccs_8p_roce",
+            "oneshot_active": True,
+        }
+    return None
 
 
 def resolve_fused_mc2_and_mso(
@@ -319,14 +584,103 @@ def resolve_fused_mc2_and_mso(
 
 
 def simulation_config(
-    canonical: str, sku: str, arch: str, *, role: str | None = None,
+    model_or_key: ModelSpec | str,
+    sku: str,
+    arch: str,
+    *,
+    role: str | None = None,
+    model: ModelSpec | None = None,
 ) -> dict[str, Any]:
-    """Unplugged socket: model-keyed VA_RECOMMENDED_PROFILES lookup purged."""
-    raise NotImplementedError(
-        "LEGACY_PURGED: retire model-keyed VA_RECOMMENDED_PROFILES/simulation_config "
-        "and arbitrary role-topology fallback; resolve defaults purely from structural "
-        "ModelSpec + Hardware capabilities"
+    """Derive vLLM-Ascend runtime defaults purely from structural ``ModelSpec``, hardware, and role."""
+    if not str(sku or "").strip():
+        raise ModelingError("simulation_config_sku_required")
+    hw = normalize_hw_family(arch or sku)
+    if hw not in {"a2", "a3", "a5"}:
+        raise ModelingError(f"simulation_config_unsupported_arch:{arch!r}:{sku!r}")
+    role_norm = str(role or "colocated").strip().lower()
+    if role_norm not in _VALID_ROLES:
+        raise ModelingError(f"simulation_config_invalid_role:{role!r}")
+
+    spec = model if model is not None else _load_structural_model_if_str(model_or_key)
+    caps = extract_model_capabilities(spec, arch=hw)
+    coll = shipping_collective_policy(hw, role=role_norm, model=spec)
+    env: dict[str, str] = {"VLLM_USE_V1": "1"}
+    if coll and coll.get("process_env_mode"):
+        env["HCCL_OP_EXPANSION_MODE"] = str(coll["process_env_mode"])
+
+    has_latent_mla_rope = bool(
+        spec is not None and any(
+            p.attention == "mla"
+            and p.mla_variant == "latent_mla"
+            and p.cache_kind == "dense"
+            and int(p.qk_rope_head_dim or 0) > 0
+            and not bool(p.mla_use_nope)
+            for p in spec.layer_plans
+        )
     )
+    mlapo = bool(has_latent_mla_rope and role_norm != "pd_prefill")
+    if mlapo:
+        env["VLLM_ASCEND_ENABLE_MLAPO"] = "1"
+
+    has_latent_moe = bool(
+        spec is not None and any(int(p.expert_latent_size or 0) > 0 for p in spec.layer_plans)
+    )
+    tutorial_flags: dict[str, Any] = {}
+    if hw == "a5" and caps["has_moe"]:
+        if caps["ffn_activation"] == "situ" or has_latent_moe:
+            tutorial_flags["enable_fused_mc2"] = FUSED_MC2_DISABLED
+        else:
+            tutorial_flags["enable_fused_mc2"] = FUSED_MC2_MEGAMOE_ROUTED
+    if hw == "a5" and caps["has_kpool_indexer"]:
+        tutorial_flags["kv_cache_dtype"] = "fp8"
+        tutorial_flags["indexer_kv_dtype"] = "fp8"
+    mso = bool(
+        caps["has_moe"]
+        and caps["has_shared_expert"]
+        and int(tutorial_flags.get("enable_fused_mc2") or 0) <= FUSED_MC2_DISABLED
+    )
+    engram_offload = bool(spec is not None and getattr(spec, "engram", None) is not None)
+    spec_meta = dict(getattr(spec, "metadata", ()) or ()) if spec is not None else {}
+    if spec_meta.get("cache_allocator") == "paired_sfa":
+        kv_block_size: int | None = PAIRED_SFA_DOC_BLOCK_SIZE
+    elif hw == "a5" and caps["has_csa2_compressed_indexer"] and not engram_offload:
+        kv_block_size = COMPRESSED_KV_BLOCK_SIZE
+    else:
+        kv_block_size = None
+    default_quant: str | None = None
+    if hw in A2_A3_INT_ONLY_FAMILIES and spec is not None and spec.quant is not None:
+        q_fmts = {
+            str(spec.quant.weight_format or "").strip().lower(),
+            str(spec.quant.expert_weight_format or "").strip().lower(),
+            str(spec.quant.name or "").strip().lower(),
+        }
+        if caps["has_mxfp_weights"] or any(tok in q_fmts for tok in A5_ONLY_QUANT_TOKENS) or "mxfp" in str(spec.quant.name or "").lower():
+            default_quant = "w4a8" if caps["has_moe"] else "w8a8"
+    q_basis = (
+        "hardware_isa_int_quant_fallback" if default_quant is not None
+        else "preserve_caller_no_documented_hardware_quantization"
+    )
+    return {
+        "model": str(spec.name) if spec is not None else str(model_or_key or ""),
+        "sku": str(sku).strip(),
+        "hardware_arch": hw,
+        "role": role_norm,
+        "quant": default_quant,
+        "quantization_basis": q_basis,
+        "coverage": "supported_simulation_subset",
+        "graph_capture_mode": "full",
+        "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
+        "sp": True,
+        "mlapo": mlapo,
+        "mtp_proposal_tokens": NO_MTP_PROPOSAL_TOKENS,
+        "multistream_overlap_shared_expert": mso,
+        "engram_cpu_offload": engram_offload,
+        "kv_block_size": kv_block_size,
+        "env": env,
+        "tutorial_flags": tutorial_flags,
+        "shipping_collective_policy": coll,
+        "source": "structural_vllm_ascend_defaults",
+    }
 
 
 __all__ = [
@@ -350,6 +704,7 @@ __all__ = [
     "VLLM_ASCEND_STACK_ID",
     "ManifestBinding",
     "default_checkpoint_repo",
+    "extract_model_capabilities",
     "hardware_backend_kind",
     "infer_model_workload_domain",
     "load_manifest_bindings",

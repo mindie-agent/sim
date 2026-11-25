@@ -360,13 +360,13 @@ def test_synthetic_gqa_policy_locked_for_simulation_and_opt_in_for_modeling() ->
     # Replay opt-out and old fabricated kimi-k2 NextN draft must fail fast; scenario agrees with stack.
     synth_case = compose_case(
         "qwen3-32b", "a3", tp=4, dp=1, layers=2, prompt_tokens=256, output_tokens=32,
-        mtp_proposal_tokens=3, mtp_acceptance_length=2.2, feature_track="expected_ideal",
+        mtp_proposal_tokens=3, mtp_acceptance_length=2.2, feature_track="target",
         allow_synthetic_gqa_draft=True,
     )
     with pytest.raises(ModelingError, match="synthetic_draft_requires_explicit_allow_synthetic_gqa"):
         compose_case(
             synth_case["model"], "a3", tp=4, dp=1, layers=2, prompt_tokens=256, output_tokens=32,
-            mtp_proposal_tokens=3, mtp_acceptance_length=2.2, feature_track="expected_ideal",
+            mtp_proposal_tokens=3, mtp_acceptance_length=2.2, feature_track="target",
             allow_synthetic_gqa_draft=False,
         )
     with pytest.raises(ModelingError, match="draft_structure_required_for_mtp_proposal_tokens"):
@@ -446,7 +446,7 @@ def test_common_math_stack_track_structural_layer_and_kernel_backends() -> None:
 
     ship_hits = resolve_manifest_bindings("shipping", "qwen3-32b", "a3")
     assert ship_hits and all(isinstance(b, ManifestBinding) for b in ship_hits)
-    assert all(b.lowering_pass_id == "" for b in ship_hits)
+    assert all(bool(b.lowering_pass_id) for b in ship_hits)
     spec_a = StackTrackSpec(stack_id="vllm-ascend", track="shipping", optimization_mode="simulation", active_bindings=ship_hits[:1])
     spec_b = replace(spec_a, active_bindings=ship_hits[:2])
     assert spec_a.spec_digest != spec_b.spec_digest

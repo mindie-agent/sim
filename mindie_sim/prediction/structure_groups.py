@@ -1,59 +1,30 @@
 """Declared native correspondences over existing semantic operator groups.
 
-[Role] Retain fusion membership, scope and evidence at the composing builder.
+[Role] Retain fusion membership, scope and evidence at the composing builder,
+  resolving portable ``SourceRef`` provenance via ``ProbedAbiRegistry``.
 [Invariants] Declarations use model/runtime geometry, never captured shapes.
   A group adds no execution node, work or measured duration. Zero hardcoded
   model-name source tables (AG014).
-[Timeouts & Locks] Finite layer metadata updates; no I/O or locks.
+[Timeouts & Locks] Finite layer metadata updates; cached read-only ABI lookup;
+  no locks.
 [Side-Effect Policy] Replaces records in the caller-owned operator list.
 """
-from collections.abc import Mapping
+from __future__ import annotations
+
 from dataclasses import replace
+from functools import lru_cache
 from typing import Any
 
-_LEGACY_PURGED_SOURCE_REF_MSG = (
-    "LEGACY_PURGED: resolve portable SourceRef provenance from "
-    "stacks/vllm_ascend/manifest.json without hardcoded _SOURCE_FILES model-name lookup"
-)
+from mindie_sim.backends.abi_registry import default_abi_registry
 
-
-class _PurgedSourceReference(Mapping[str, Any]):
-    """Import-safe lazy socket; any runtime dereference fails loudly."""
-
-    __slots__ = ("_path", "_symbol")
-
-    def __init__(self, path: str, symbol: str) -> None:
-        self._path = path
-        self._symbol = symbol
-
-    def _fail(self) -> Any:
-        raise NotImplementedError(_LEGACY_PURGED_SOURCE_REF_MSG)
-
-    def __getitem__(self, key: str) -> Any:
-        return self._fail()
-
-    def __iter__(self):
-        return self._fail()
-
-    def __len__(self) -> int:
-        return self._fail()
-
-    def __bool__(self) -> bool:
-        return self._fail()
-
-    def get(self, key: str, default: Any = None) -> Any:
-        return self._fail()
-
-    def copy(self) -> dict[str, Any]:
-        return self._fail()
+_DEFAULT_REPOSITORY = "vllm-project/vllm-ascend"
+_ABI_ARCH_SEARCH_ORDER = ("A5", "A3", "A2")
 
 
 def declare_group(ops, *, key, role, family, members, entries, anchor, view,
                   implementation, source=None, block="attention", scope_role=None,
                   coverage=None, fusion_status=None, fusion_reason=None,
                   native_fusion_eligible=True):
-    if isinstance(source, _PurgedSourceReference):
-        raise NotImplementedError(_LEGACY_PURGED_SOURCE_REF_MSG)
     declaration = {
         "key": key, "role": role, "family": family,
         "op_ids": tuple(members), "entry_op_ids": tuple(entries),
@@ -86,12 +57,44 @@ def declare_group(ops, *, key, role, family, members, entries, anchor, view,
         ops[index] = replace(op, metadata=tuple(meta.items()))
 
 
-def source_reference(path, symbol):
-    """Unplugged socket: hardcoded _SOURCE_FILES model-name lookup purged per AG014.
+_SOURCE_REF_CACHE_MAXSIZE = 256
 
-    Returns an import-safe lazy socket so module-level bindings in external
-    operators do not break ``import mindie_sim``, while any dereference or
-    ``declare_group(..., source=...)`` call raises ``NotImplementedError("LEGACY_PURGED: ...")``.
-    """
-    return _PurgedSourceReference(path, symbol)
 
+@lru_cache(maxsize=_SOURCE_REF_CACHE_MAXSIZE)
+def _lookup_sealed_source_ref(norm_path: str, norm_symbol: str) -> tuple[tuple[str, str], ...]:
+    registry = default_abi_registry()
+    for arch in _ABI_ARCH_SEARCH_ORDER:
+        snapshot = registry.get_snapshot(arch)
+        for entry in snapshot.entries:
+            ref = entry.source_ref
+            rel = str(ref.relative_path or "").strip().lstrip("./") if ref is not None else ""
+            va_ref = str(entry.vllm_ascend_ref or "").strip().lstrip("./")
+            path_match = bool(norm_path and (rel == norm_path or va_ref == norm_path))
+            sym_match = bool(
+                norm_symbol
+                and (entry.symbol_or_kernel == norm_symbol or entry.abi_id == norm_symbol)
+            )
+            if path_match or sym_match:
+                return (
+                    ("repository", str(ref.repository if ref is not None else _DEFAULT_REPOSITORY)),
+                    ("revision", str(ref.revision if ref is not None else "")),
+                    ("relative_path", norm_path or rel),
+                    ("symbol", norm_symbol),
+                    ("source_sha256", str(ref.source_sha256 if ref is not None else "")),
+                    ("provenance", "abi_registry"),
+                )
+    return (
+        ("repository", _DEFAULT_REPOSITORY),
+        ("revision", ""),
+        ("relative_path", norm_path),
+        ("symbol", norm_symbol),
+        ("source_sha256", ""),
+        ("provenance", "declared_path"),
+    )
+
+
+def source_reference(path: str, symbol: str) -> dict[str, Any]:
+    """Resolve portable ``SourceRef`` metadata from ``ProbedAbiRegistry`` (AG014=0)."""
+    norm_path = str(path or "").strip().lstrip("./")
+    norm_symbol = str(symbol or "").strip()
+    return dict(_lookup_sealed_source_ref(norm_path, norm_symbol))

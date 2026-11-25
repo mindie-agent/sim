@@ -135,8 +135,9 @@ def test_kimi_k31_a5_mxfp_and_a3_w4a8_quant_packing_cache_and_recoverssm() -> No
             TensorQuantRule("model.layers.*.self_attn.indexer.wk.weight", "FLOAT"),
             TensorQuantRule("model.layers.*.self_attn.indexer.weights_proj.weight", "FLOAT"),
             TensorQuantRule("model.layers.*.mlp.latent_proj.weight", "W8A8_MXFP8"),
-            TensorQuantRule("model.layers.*.mlp.experts.0.gate_proj.weight", "W4A8_MXFP"),
-            TensorQuantRule("model.layers.*.mlp.experts.0.down_proj.weight", "W4A8_MXFP"),
+            TensorQuantRule("model.layers.*.mlp.experts.*.gate_proj.weight", "W4A8_MXFP"),
+            TensorQuantRule("model.layers.*.mlp.experts.*.up_proj.weight", "W4A8_MXFP"),
+            TensorQuantRule("model.layers.*.mlp.experts.*.down_proj.weight", "W4A8_MXFP"),
             TensorQuantRule("model.layers.*.mlp.shared_experts.gate_proj.weight", "W8A8_MXFP8"),
             TensorQuantRule("model.layers.*.mlp.shared_experts.up_proj.weight", "W8A8_MXFP8"),
             TensorQuantRule("model.layers.*.mlp.shared_experts.down_proj.weight", "W8A8_MXFP8"),
@@ -179,7 +180,7 @@ def test_kimi_k31_a5_mxfp_and_a3_w4a8_quant_packing_cache_and_recoverssm() -> No
     assert ports[("target", 4, "mlp.experts.w13")].linear_method == "mx_fp4"
 
     # Prepared runtime-only BF16 F = F_b @ F_a at TP4: (3072, 7168) * 2 B = 44,040,192 B.
-    prep_f = next(p for p in qplan.prepared_weights if p.allocation_id == "kimi_k3.kda.prepared_f_matmul")
+    prep_f = next(p for p in qplan.prepared_weights if p.allocation_id == "kda.prepared_f_matmul")
     assert prep_f.local_shape == (3072, 7168)
     assert prep_f.dtype == "bf16"
     assert prep_f.local_shape[0] * prep_f.local_shape[1] * 2 == 44040192
@@ -219,8 +220,9 @@ def test_kimi_k31_a5_mxfp_and_a3_w4a8_quant_packing_cache_and_recoverssm() -> No
         model_quant_type="W4A8_DYNAMIC",
         rules=(
             TensorQuantRule("model.layers.*.self_attn.q_proj.weight", "W8A8_DYNAMIC"),
-            TensorQuantRule("model.layers.*.mlp.experts.0.gate_proj.weight", "W4A8_DYNAMIC"),
-            TensorQuantRule("model.layers.*.mlp.experts.0.down_proj.weight", "W4A8_DYNAMIC"),
+            TensorQuantRule("model.layers.*.mlp.experts.*.gate_proj.weight", "W4A8_DYNAMIC"),
+            TensorQuantRule("model.layers.*.mlp.experts.*.up_proj.weight", "W4A8_DYNAMIC"),
+            TensorQuantRule("model.layers.*.mlp.experts.*.down_proj.weight", "W4A8_DYNAMIC"),
         ),
         cache_rule=CacheQuantRule(kv_tag="INT8", index_tag="INT8", kv_scale_dtype="fp32", provenance="checkpoint"),
     )
@@ -254,11 +256,13 @@ def test_qwen38_flash_next_mxfp_keeps_linear_ple_hc_and_mtp_bf16() -> None:
             TensorQuantRule("model.layers.*.self_attn.o_proj.weight", "W8A8_MXFP8"),
             TensorQuantRule("model.layers.*.self_attn.index_qk_proj.weight", "W8A8_MXFP8"),
             TensorQuantRule("model.layers.*.linear_attn.in_proj_qkv.weight", "FLOAT"),
-            TensorQuantRule("model.layers.*.mlp.experts.0.gate_proj.weight", "W4A8_MXFP"),
-            TensorQuantRule("model.layers.*.mlp.experts.0.down_proj.weight", "W4A8_MXFP"),
+            TensorQuantRule("model.layers.*.mlp.experts.*.gate_proj.weight", "W4A8_MXFP"),
+            TensorQuantRule("model.layers.*.mlp.experts.*.up_proj.weight", "W4A8_MXFP"),
+            TensorQuantRule("model.layers.*.mlp.experts.*.down_proj.weight", "W4A8_MXFP"),
             TensorQuantRule("model.layers.*.mlp.shared_experts.gate_proj.weight", "FLOAT"),
-            TensorQuantRule("mtp.layers.*.mlp.experts.0.gate_proj.weight", "FLOAT"),
-            TensorQuantRule("mtp.layers.*.mlp.experts.0.down_proj.weight", "FLOAT"),
+            TensorQuantRule("mtp.layers.*.mlp.experts.*.gate_proj.weight", "FLOAT"),
+            TensorQuantRule("mtp.layers.*.mlp.experts.*.up_proj.weight", "FLOAT"),
+            TensorQuantRule("mtp.layers.*.mlp.experts.*.down_proj.weight", "FLOAT"),
         ),
         cache_rule=CacheQuantRule(kv_tag="FP8", index_tag="FP8", provenance="checkpoint"),
     )
@@ -640,7 +644,9 @@ def test_simulation_vs_modeling_tracks_full_and_piecewise_and_plan_iteration() -
     )
     assert isinstance(step, IterationPlan)
     assert step.requests[0].request_id == "req_high"
-    assert step.valid_tokens == 8
+    assert step.valid_tokens == 2
+    assert all(r.q_len == 1 and r.draft_proposal_tokens == 3 for r in step.requests)
+    assert sum(r.q_len + r.draft_proposal_tokens for r in step.requests) == 8
 
     wait = adapter.plan_iteration(
         model,
@@ -739,7 +745,7 @@ def test_hf_awq_gptq_compressed_quark_and_all_modelslim_weight_tags() -> None:
 
     # Every declared weight tag in checkpoint_reader resolves cleanly on A5 without unknown_checkpoint_quant_tag.
     for raw_tag in sorted(KNOWN_MODELSLIM_WEIGHT_TAGS):
-        abi = resolve_raw_tag_to_abi(raw_tag, hw_family="a5")
+        abi = resolve_raw_tag_to_abi(raw_tag, hw_family="a5", native_float_dtype="bf16")
         if raw_tag not in {"FLOAT", "BF16", "FP16", "NONE"}:
             assert abi.linear_method != "dense", f"unexpected dense fallback for {raw_tag}"
 

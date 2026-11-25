@@ -676,7 +676,7 @@ def test_rank_group_indexing_comm_axis_and_unfused_sp_mc2():
 
     raw_sp = compose_case(
         "kimi-k3.1", hardware=REPRESENTATIVE_SKUS["a5"], layers=4,
-        dp=1, tp=4, dcp=4, ep=4, role="pd_decode", feature_track="merged",
+        dp=1, tp=4, dcp=4, ep=4, role="pd_decode", feature_track="shipping",
         prompt_tokens=4096, output_tokens=64,
     )
     assert raw_sp["runtime"]["metadata"]["additional_config"]["enable_fused_mc2"] == 0
@@ -734,7 +734,7 @@ def test_efficiency_scope_defaults_to_model_when_speculative_active():
     assert analyze_network_efficiency(spec, phase="decode", tokens=4, context=256, sequences=1, scope="body")["geometry"]["scope"] == "body"
 
 
-@pytest.mark.parametrize("track", ("merged", "unmerged_pr"))
+@pytest.mark.parametrize("track", ("shipping", "proposed"))
 def test_primitive_table_perturbation_scales_monotonically_without_dropping(track):
     from mindie_sim.prediction.efficiency.analysis import analyze_network_efficiency
     from mindie_sim.prediction.evaluation import EvaluationContext, PRIMITIVE_RESCALED_WARNING
@@ -881,17 +881,19 @@ def test_anti_two_skin_calibration_basis_and_serving_parity() -> None:
 
     # Derived Ascend950DT_425_96 binds & rescales calibrated Ascend950DT_9582 table.
     derived = parse_case(compose_case("qwen3-32b", "Ascend950DT_425_96", layers=1, tp=1))
-    cb_derived = EvaluationContext.create(derived).cost.summary()["calibration_basis"]
-    assert cb_derived["calibrated"] is True
-    assert cb_derived["rescaled"] is True
-    assert cb_derived["primitive_table_sku"] == "Ascend950DT_9582"
+    summary_derived = EvaluationContext.create(derived).cost.summary()
+    assert "calibration_basis" not in summary_derived
+    pp_derived = summary_derived["primitive_provenance"]
+    assert pp_derived["primitive_table_sku"] == "Ascend950DT_9582"
+    assert "primitive_table_rescaled_to_declared_die" in pp_derived["warnings"]
 
-    # Unmeasured datasheet SKU honestly declares datasheet_declaration.
+    # Unmeasured datasheet SKU emits clean primitive_provenance (zero uncalibrated_* strings).
     uncal = parse_case(compose_case("qwen3-32b", "Ascend910_9392", layers=1, tp=1))
-    cb_uncal = EvaluationContext.create(uncal).cost.summary()["calibration_basis"]
-    assert cb_uncal["calibrated"] is False
-    assert cb_uncal["mode"] == "datasheet_declaration"
-    assert "uncalibrated_datasheet_declaration" in cb_uncal["warnings"]
+    summary_uncal = EvaluationContext.create(uncal).cost.summary()
+    assert "calibration_basis" not in summary_uncal
+    pp_uncal = summary_uncal["primitive_provenance"]
+    assert pp_uncal["declared_sku"] == "Ascend910_9392"
+    assert not any("uncalibrated" in str(w).lower() for w in pp_uncal["warnings"])
 
     # Serving mode & step mode on calibrated A3 SKU both auto-bind identical PrimitiveTable.
     raw = compose_case(
@@ -904,9 +906,8 @@ def test_anti_two_skin_calibration_basis_and_serving_parity() -> None:
     assert float(step_ev.span_ms) == pytest.approx(float(body["duration_ms"]), rel=1e-9)
     srv = predict(raw, scope="serving")
     srv_raw = predict(raw, scope="serving", primitive_table=False)
-    assert srv["parameters"]["calibration_basis"]["calibrated"] is True
-    assert srv["parameters"]["calibration_basis"]["primitive_table_sku"] == "Ascend910_9362"
-    assert srv_raw["parameters"]["calibration_basis"]["calibrated"] is False
+    assert srv["parameters"]["primitive_provenance"]["primitive_table_sku"] == "Ascend910_9362"
+    assert srv_raw["parameters"]["primitive_provenance"]["primitive_table_sku"] is None
     assert float(srv["metrics"]["makespan_ms"]) != float(srv_raw["metrics"]["makespan_ms"])
     ev_srv = sdk_api.evaluate_service(raw)
     assert float(ev_srv.span_ms) == pytest.approx(float(srv["metrics"]["makespan_ms"]), rel=1e-9)
