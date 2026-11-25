@@ -11,24 +11,44 @@
 [Side-Effect Policy] Appends one immutable operator to the caller's builder.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage
 
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 IMPLEMENTATION = "v41_partial_rotary"
 NATIVE_KIND = "InplacePartialRotaryMul"
+VLLM_REVISION = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=VLLM_REVISION,
+        relative_path="csrc/attention/inplace_partial_rotary_mul/op_host/rope_regbase_tiling_a_and_b.cpp",
+        source_sha256="c460ce395d075ef4a95a7d16ed855b601cdd77c1bbeefde5d9a135e3b749191a",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=VLLM_REVISION,
+        relative_path="csrc/attention/inplace_partial_rotary_mul/op_kernel/rotary_position_embedding_reg_a_and_b_mixed.h",
+        source_sha256="4af72e46cfdfc1be5cf4a55f4e8d10a8725ef3e38966b67b9fb9d27e9fa883ef",
+    ),
+)
+_BF16_ELEMENT_BYTES = 2
 _FP32_COEFFICIENT_BYTES = 4
+_COS_SIN_TENSORS = 2
 _UB_ALIGNMENT_BYTES = 32
 _SBND_UB_BUFFER_FACTOR = 4
+_A_AND_B_X_BUFFER_FACTOR = 4
+_A_AND_B_COS_SIN_BUFFER_FACTOR = 2
+_A_AND_B_MAX_COPY_BLOCK_COUNT = 4095
+_A_AND_B_MAX_UB_FACTOR = _A_AND_B_MAX_COPY_BLOCK_COUNT // 2
 _A_AND_B_BROADCAST_UB_BYTES = 1024
 _A_AND_B_NO_BROADCAST_UB_BYTES = 1536
-_A_AND_B_X_ROW_BYTES = 128
-_A_AND_B_COEFFICIENT_ROW_BYTES = 256
 _A_AND_B_UB_QUEUE_COUNT = 4
-_AB_DECLARATION_VECTOR_CORES = 64
-_AB_DECLARATION_HEAD_SPLIT_TOKEN_LIMIT = _AB_DECLARATION_VECTOR_CORES // 2
 SOURCE = {
     "caller": {
         "repository": "vllm-ascend",
@@ -52,6 +72,81 @@ def recipes():
             ("q_rotary", "kv_rotary", "output_inverse_rotary")}
 
 
+def _partition_windows(total: int, ub_factor: int) -> tuple[int, ...]:
+    windows = []
+    left = total
+    while left > 0:
+        part = min(left, ub_factor)
+        windows.append(part)
+        left -= part
+    return tuple(windows) or (1,)
+
+
+def _owner_partition(tokens: int, heads: int, domain: int) -> dict[str, int]:
+    """Single owner-partition helper shared by declaration and execution."""
+    eff_domain = max(1, int(domain))
+    if tokens > 1 and heads > 1:
+        block_factor_bs = max(1, -(-tokens // eff_domain))
+        block_num_bs = max(1, -(-tokens // block_factor_bs))
+        if tokens <= eff_domain // 2:
+            block_num_n = max(1, eff_domain // block_num_bs)
+            block_factor_n = max(1, -(-heads // block_num_n))
+            block_num_n = max(1, -(-heads // block_factor_n))
+        else:
+            block_num_n = 1
+            block_factor_n = heads
+        return {
+            "block_factor": block_factor_bs,
+            "block_num_bs": block_num_bs,
+            "block_factor_n": block_factor_n,
+            "block_num_n": block_num_n,
+            "owners": block_num_bs * block_num_n,
+            "coeff_groups": block_num_n,
+        }
+    if tokens > 1:
+        block_factor = max(1, -(-tokens // eff_domain))
+        owners = max(1, -(-tokens // block_factor))
+        return {
+            "block_factor": block_factor,
+            "block_num_bs": owners,
+            "block_factor_n": heads,
+            "block_num_n": 1,
+            "owners": owners,
+            "coeff_groups": 1,
+        }
+    merged = tokens * heads
+    block_factor = max(1, -(-merged // eff_domain))
+    owners = max(1, -(-merged // block_factor))
+    return {
+        "block_factor": block_factor,
+        "block_num_bs": 1,
+        "block_factor_n": block_factor,
+        "block_num_n": owners,
+        "owners": owners,
+        "coeff_groups": max(1, owners),
+    }
+
+
+def _rotary_width(op) -> tuple[int, int, int, int]:
+    tokens, heads, head_dim = (int(v) for v in op.local_shape)
+    view = dict(dict(op.metadata).get("native_tensor_view") or {})
+    declared = dict(dict(op.metadata).get("partial_rotary_work") or {})
+    rotary = int(declared.get("rotated_elements", 0) or 0)
+    rotary = (rotary // max(1, tokens * heads)) if rotary else int(
+        view.get("partial_slice", (0, head_dim))[1] - view.get("partial_slice", (0, head_dim))[0])
+    return tokens, heads, head_dim, rotary
+
+
+def issued_mte2_bytes(op, *, domain: int) -> int:
+    """Compute physical GM->UB MTE2 issue bytes for a target AIV core count."""
+    tokens, heads, _head_dim, rotary = _rotary_width(op)
+    part = _owner_partition(tokens, heads, domain)
+    tensor_bytes = tokens * heads * rotary * _BF16_ELEMENT_BYTES
+    coeff_bytes = (_COS_SIN_TENSORS * tokens * part["coeff_groups"] * rotary
+                   * _FP32_COEFFICIENT_BYTES)
+    return int(tensor_bytes + coeff_bytes)
+
+
 def _host_tiling(op, domain, ub_size):
     """Retained Ascend950 RegBase dispatch for the measured V41 shapes.
 
@@ -59,85 +154,94 @@ def _host_tiling(op, domain, ub_size):
     Prefill: X[T,1,H,D] -> AB/SBND for Q/inverse; KV is AAndB NO_BROADCAST.
     The host tiler constants are source and machine geometry, not a case name.
     """
-    tokens, heads, head_dim = (int(v) for v in op.local_shape)
-    view = dict(dict(op.metadata).get("native_tensor_view") or {})
-    declared = dict(dict(op.metadata).get("partial_rotary_work") or {})
-    rotary = int(declared.get("rotated_elements", 0) or 0)
-    rotary = (rotary // max(1, tokens * heads)) if rotary else int(
-        view.get("partial_slice", (0, head_dim))[1] - view.get("partial_slice", (0, head_dim))[0])
+    tokens, heads, head_dim, rotary = _rotary_width(op)
     block = _UB_ALIGNMENT_BYTES
+    d_size_x = ((rotary * _BF16_ELEMENT_BYTES + block - 1) // block) * block
+    d_size_cos = ((rotary * _FP32_COEFFICIENT_BYTES + block - 1) // block) * block
+    part = _owner_partition(tokens, heads, domain)
     if tokens > 1 and heads > 1:
-        b, s_, n = tokens, 1, heads
-        cosb = tokens
-        bs = b * s_
-        if cosb == 1:
-            bs = s_
-            n = b * n
-        block_factor_bs = max(1, -(-bs // domain))
-        block_num_bs = max(1, -(-bs // block_factor_bs))
-        if bs <= domain // 2:
-            block_num_n = max(1, domain // block_num_bs)
-            block_factor_n = max(1, -(-n // block_num_n))
-            block_num_n = max(1, -(-n // block_factor_n))
-        else:
-            block_num_n = 1
-            block_factor_n = n
-        owners = block_num_bs * block_num_n
-        d_size_x = ((rotary * 2 + block - 1) // block) * block
-        d_size_cos = ((rotary * _FP32_COEFFICIENT_BYTES + block - 1) // block) * block
+        block_factor_bs = part["block_factor"]
+        block_num_bs = part["block_num_bs"]
+        block_factor_n = part["block_factor_n"]
+        block_num_n = part["block_num_n"]
+        owners = part["owners"]
         base = ((ub_size // _SBND_UB_BUFFER_FACTOR) // block) * block // d_size_x
         effective = max(1, (d_size_cos + d_size_x - 1) // d_size_x)
+        if base < 1 + effective:
+            raise ModelingError(f"partial_rotary_ub_insufficient:{rotary}:{ub_size}")
         ub_n = max(1, min(block_factor_n, base - effective))
         ub_bs = max(1, min(base // (ub_n + effective), block_factor_bs))
-        windows = []
-        left = block_factor_bs
-        while left > 0:
-            part = min(left, ub_bs)
-            windows.append(part)
-            left -= part
+        bs_windows = _partition_windows(block_factor_bs, ub_bs)
+        n_windows = _partition_windows(block_factor_n, ub_n)
+        windows = tuple(b_part * n_part for b_part in bs_windows for n_part in n_windows)
         return {
             "class": "RopeRegBaseTilingClassAB", "layout": "SBND",
             "tokens": tokens, "heads": heads, "head_dim": head_dim,
-            "rotary_width": rotary, "merged_b": bs,
+            "rotary_width": rotary, "merged_b": tokens,
             "core_num": domain, "block_factor": block_factor_bs,
             "block_num_bs": block_num_bs, "block_factor_n": block_factor_n,
             "block_num_n": block_num_n, "owners": owners,
+            "coeff_groups": part["coeff_groups"],
             "ub_factor_n": ub_n, "ub_factor_bs": ub_bs,
-            "ub_loops": len(windows), "ub_windows": tuple(windows),
+            "ub_windows_bs": bs_windows, "ub_windows_n": n_windows,
+            "ub_loops": len(windows), "ub_windows": windows,
             "ub_bytes": ub_size,
             "ub_bytes_owner": _SBND_UB_BUFFER_FACTOR * ub_bs * (ub_n * d_size_x + d_size_cos),
             "d_size_x": d_size_x, "d_size_cos": d_size_cos,
             "implemented": True,
         }
     if tokens > 1:
-        block_factor = max(1, -(-tokens // domain))
-        owners = max(1, -(-tokens // block_factor))
+        block_factor = part["block_factor"]
+        owners = part["owners"]
+        unit_ub = _A_AND_B_X_BUFFER_FACTOR * (d_size_x + d_size_cos)
+        num_avail = ub_size // unit_ub
+        if num_avail < 1:
+            raise ModelingError(f"partial_rotary_ub_insufficient:{rotary}:{ub_size}")
+        ub_factor = min(block_factor, num_avail, _A_AND_B_MAX_UB_FACTOR)
+        windows = _partition_windows(block_factor, ub_factor)
         return {
             "class": "RopeRegBaseTilingClassAAndB", "layout": "NO_BROADCAST",
             "tokens": tokens, "heads": heads, "head_dim": head_dim,
             "rotary_width": rotary, "merged_b": tokens,
             "core_num": domain, "block_factor": block_factor,
-            "owners": owners, "ub_factor": block_factor,
-            "ub_loops": 1, "ub_windows": (block_factor,),
-            "ub_bytes": ub_size, "ub_bytes_owner": _A_AND_B_NO_BROADCAST_UB_BYTES * block_factor,
-            "d_size_x": _A_AND_B_X_ROW_BYTES, "d_size_cos": _A_AND_B_COEFFICIENT_ROW_BYTES,
+            "owners": owners, "coeff_groups": part["coeff_groups"],
+            "ub_factor": ub_factor,
+            "ub_loops": len(windows), "ub_windows": windows,
+            "ub_bytes": ub_size, "ub_bytes_owner": unit_ub * ub_factor,
+            "d_size_x": d_size_x, "d_size_cos": d_size_cos,
             "implemented": True,
         }
     broadcast = heads > 1
     merged = tokens * heads
-    block_factor = max(1, -(-merged // domain))
-    owners = max(1, -(-merged // block_factor))
+    block_factor = part["block_factor"]
+    owners = part["owners"]
+    if broadcast:
+        cos_ub = _A_AND_B_COS_SIN_BUFFER_FACTOR * d_size_cos
+        x_unit_ub = _A_AND_B_X_BUFFER_FACTOR * d_size_x
+        avail = ub_size - cos_ub
+        if avail < x_unit_ub:
+            raise ModelingError(f"partial_rotary_ub_insufficient:{rotary}:{ub_size}")
+        ub_factor = min(block_factor, avail // x_unit_ub, _A_AND_B_MAX_UB_FACTOR)
+        ub_bytes_owner = x_unit_ub * ub_factor + cos_ub
+    else:
+        unit_ub = _A_AND_B_X_BUFFER_FACTOR * (d_size_x + d_size_cos)
+        num_avail = ub_size // unit_ub
+        if num_avail < 1:
+            raise ModelingError(f"partial_rotary_ub_insufficient:{rotary}:{ub_size}")
+        ub_factor = min(block_factor, num_avail, _A_AND_B_MAX_UB_FACTOR)
+        ub_bytes_owner = unit_ub * ub_factor
+    windows = _partition_windows(block_factor, ub_factor)
     return {
         "class": "RopeRegBaseTilingClassAAndB",
         "layout": "BROADCAST_BSN" if broadcast else "NO_BROADCAST",
         "tokens": tokens, "heads": heads, "head_dim": head_dim,
         "rotary_width": rotary, "merged_b": merged,
         "core_num": domain, "block_factor": block_factor,
-        "owners": owners, "ub_factor": 1, "ub_loops": 1,
-        "ub_windows": (1,), "ub_bytes": ub_size,
-        "ub_bytes_owner": (_A_AND_B_BROADCAST_UB_BYTES if broadcast
-                           else _A_AND_B_NO_BROADCAST_UB_BYTES) * block_factor,
-        "d_size_x": _A_AND_B_X_ROW_BYTES, "d_size_cos": _A_AND_B_COEFFICIENT_ROW_BYTES,
+        "owners": owners, "coeff_groups": part["coeff_groups"],
+        "ub_factor": ub_factor, "ub_loops": len(windows),
+        "ub_windows": windows, "ub_bytes": ub_size,
+        "ub_bytes_owner": ub_bytes_owner,
+        "d_size_x": d_size_x, "d_size_cos": d_size_cos,
         "implemented": True,
     }
 
@@ -170,17 +274,13 @@ def _build(op, geometry):
     ub_size = int(dict(geometry.buffers)["ub"])
     tiling = _host_tiling(op, domain, ub_size)
     elements, coeff_bytes, operations = _cycle_work(op)
-    tensor_bytes = elements * 2
-    coefficient_once = 2 * tiling["tokens"] * tiling["rotary_width"] * _FP32_COEFFICIENT_BYTES
+    tensor_bytes = elements * _BF16_ELEMENT_BYTES
+    coefficient_once = (_COS_SIN_TENSORS * tiling["tokens"] * tiling["rotary_width"]
+                        * _FP32_COEFFICIENT_BYTES)
     total_vector = sum(operations.values())
-    if tiling.get("tokens", 0) <= 1:
-        coeff_groups = max(1, int(tiling.get("owners", 1)))
-    elif tiling.get("heads", 1) > 1:
-        coeff_groups = max(1, int(tiling.get("block_num_n", 1)))
-    else:
-        coeff_groups = 1
-    mte2_issue = (tensor_bytes + 2 * tiling["tokens"] * coeff_groups * tiling["rotary_width"]
-                  * _FP32_COEFFICIENT_BYTES)
+    coeff_groups = max(1, int(tiling.get("coeff_groups", 1)))
+    mte2_issue = (tensor_bytes + _COS_SIN_TENSORS * tiling["tokens"] * coeff_groups
+                  * tiling["rotary_width"] * _FP32_COEFFICIENT_BYTES)
     owners = max(1, int(tiling["owners"]))
     windows = tuple(int(v) for v in tiling.get("ub_windows", (tiling.get("ub_factor", 1),))) or (1,)
     loops = len(windows)
@@ -204,11 +304,28 @@ def _build(op, geometry):
         physical = dict(context.work)
         roles = ("vector", "mte2_aiv", "mte3")
         live_owners = owners
-        windows = tuple(int(v) for v in tiling.get("ub_windows", (1,))) or (1,)
-        loops = len(windows)
-        window_total = max(1, sum(windows))
+        bs_windows = tuple(int(v) for v in tiling.get("ub_windows_bs", ()))
+        n_windows = tuple(int(v) for v in tiling.get("ub_windows_n", ()))
+        sbnd_loop = bool(bs_windows and n_windows)
+        if sbnd_loop:
+            bs_total = max(1, sum(bs_windows))
+            n_total = max(1, sum(n_windows))
+            iter_specs = [
+                (b_part / bs_total, n_part / n_total, n_idx == 0)
+                for b_part in bs_windows
+                for n_idx, n_part in enumerate(n_windows)
+            ]
+        else:
+            windows = tuple(int(v) for v in tiling.get("ub_windows", (1,))) or (1,)
+            window_total = max(1, sum(windows))
+            iter_specs = [(window / window_total, 1.0, True) for window in windows]
+        loops = len(iter_specs)
         ub_pool = context.pool_names.get("ub") or next(
             (name for name in context.pool_names if name == "ub"), None)
+        coeff_mte2_total = (
+            _COS_SIN_TENSORS * tiling["tokens"] * coeff_groups * tiling["rotary_width"]
+            * _FP32_COEFFICIENT_BYTES
+        )
         programs = []
         for owner in range(live_owners):
             placement = context.owned(owner, domain, roles)
@@ -220,28 +337,31 @@ def _build(op, geometry):
                 free = (alloc,)
             stages = []
             previous = ()
-            for index, window in enumerate(windows):
-                share = window / window_total
+            for index, (bs_share, n_share, load_coeff) in enumerate(iter_specs):
+                share = bs_share * n_share
                 load = {}
                 compute = {}
                 store = {}
                 for key, amount in physical.items():
                     if not amount:
                         continue
-                    value = amount * share / live_owners
                     if key.startswith("vector"):
-                        compute[key] = value
+                        compute[key] = amount * share / live_owners
                     elif key.startswith("mte3"):
-                        store[key] = value
+                        store[key] = amount * share / live_owners
                     elif key.startswith("memory"):
-                        # HBM unique input is copy-in; output is copy-out.
                         input_hbm = tensor_bytes + coefficient_once
                         out_hbm = tensor_bytes
                         scale = amount / max(1, input_hbm + out_hbm)
-                        load[key] = (input_hbm * scale) * share / live_owners
+                        coeff_hbm = (coefficient_once * scale * bs_share / live_owners) if load_coeff else 0.0
+                        load[key] = (tensor_bytes * scale * share / live_owners) + coeff_hbm
                         store[key] = (out_hbm * scale) * share / live_owners
+                    elif sbnd_loop and key.startswith("mte2"):
+                        scale = amount / max(1, tensor_bytes + coeff_mte2_total)
+                        coeff_mte2 = (coeff_mte2_total * scale * bs_share / live_owners) if load_coeff else 0.0
+                        load[key] = (tensor_bytes * scale * share / live_owners) + coeff_mte2
                     else:
-                        load[key] = value
+                        load[key] = amount * share / live_owners
                 vkey = next((key for key in physical if key.startswith("vector")), "")
                 if vkey and vkey not in compute:
                     compute[vkey] = total_vector * share / live_owners
@@ -288,7 +408,8 @@ def validate(plan, *, fused_prolog):
         raise ModelingError("partial_rotary_caller_requires_unfused_shared_kv_mqa")
 
 
-def declare(builder, *, name, deps, tokens, heads, head_dim, rotary_width, inverse=False):
+def declare(builder, *, name, deps, tokens, heads, head_dim, rotary_width,
+            inverse=False, vector_cores: int | None = None):
     """Append one BF16/FP32-coefficient in-place partial interleaved rotation.
 
     The caller selects this mechanism explicitly and supplies the full active
@@ -304,23 +425,16 @@ def declare(builder, *, name, deps, tokens, heads, head_dim, rotary_width, inver
         raise ModelingError("partial_rotary_requires_bf16_even_slice_inside_head")
     elements = tokens * heads * rotary_width
     tensor_bytes = elements * dtype_bytes(dtype)
-    # BROADCAST_BSN: each source owner performs its private CopyInCosAndSin;
-    # NO_BROADCAST (KV) has one owner. This is GM issue bytes, not DRAM misses.
-    if tokens > 1 and heads > 1:
-        # AB N-group owners each reload the per-token coefficient row.
-        factor = max(1, -(-tokens // _AB_DECLARATION_VECTOR_CORES))
-        groups = max(1, -(-tokens // factor))
-        if tokens <= _AB_DECLARATION_HEAD_SPLIT_TOKEN_LIMIT:
-            n_blocks = max(1, _AB_DECLARATION_VECTOR_CORES // groups)
-            n_factor = max(1, -(-heads // n_blocks))
-            groups = max(1, -(-heads // n_factor))
-        else:
-            groups = 1
-    elif tokens <= 1:
-        groups = heads
-    else:
-        groups = 1
-    coefficient_bytes = (2 * tokens * groups * rotary_width
+    # Without a bound target core count, declare the hardware-independent
+    # compulsory minimum (1 coefficient load per token) so OpSpec.mte2_bytes
+    # remains a sound lower bound across all AIV core counts; when target
+    # vector_cores is given, derive exact groups via _owner_partition.
+    groups = (
+        _owner_partition(tokens, heads, vector_cores)["coeff_groups"]
+        if vector_cores is not None
+        else 1
+    )
+    coefficient_bytes = (_COS_SIN_TENSORS * tokens * groups * rotary_width
                          * dtype_bytes("fp32"))
     operations = {
         "multiply": 2 * elements, "add": elements,

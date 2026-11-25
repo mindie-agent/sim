@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import replace
 from functools import partial
 import math
+from typing import Literal
 
 from mindie_sim.catalog.attention_common import (
     AttentionResult, _allreduce, _causal_pairs, _long_selected_pairs,
@@ -50,8 +51,9 @@ from mindie_sim.catalog.context_parallel import (
     split_causal_pairs,
     split_sparse_dcp_batch_per_sequence,
 )
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
-from mindie_sim.schema.common import dtype_bytes
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 from .batch_prefix_attention import (
     annotate_sparse_prefix_unknown, apply_attention_prefix_reads,
 )
@@ -63,6 +65,7 @@ from .gqa_contracts import (
     _cache_tensor_view,
     _contiguous_tensor_view,
     _decode_contract,
+    gqa_kv_memory_accesses,
     _declare_ordinary_qk_norm_rope,
     _declare_qkv_norm_rope,
     _gqa_formats,
@@ -392,6 +395,27 @@ def _resolve_gqa_recipe(cacheless: bool, mode: str, configured_recipes) -> str:
     return "flash_attention"
 
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="vllm_ascend/attention/attention_v1.py",
+        source_sha256="1194f995eccb90309140d2e19e6dcc2291548cd58d8523c24a5ee1c79836360a",
+    ),
+)
+_SPARSE_FLOP_TOLERANCE: float = 1e-6
+
+
+def _selected_supports_sparse_selection(selected) -> bool:
+    """True only when a custom gqa_attention lowering explicitly consumes sparse TopK."""
+    module = getattr(selected, "module", None)
+    if bool(getattr(module, "SUPPORTS_SPARSE_SELECTION", False)):
+        return True
+    caps = getattr(module, "CAPABILITIES", ()) or ()
+    return "block_sparse_attention" in caps
+
+
 def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         padded_tokens, policy=AttentionPolicy(), cp_interleave_size=DEFAULT_CP_INTERLEAVE,
         runtime=None, cache_ids=None, stage_of=None, topk_ids=None,
@@ -411,13 +435,17 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         views = _cap_draft_views(views, draft_cap)
     selected = select(runtime.kernels.get("lowerings", {}), "gqa_attention") if runtime else None
     if selected:
+        if int(getattr(plan, "index_topk", 0) or 0) > 0 and not _selected_supports_sparse_selection(selected):
+            raise ModelingError(
+                f"gqa_attention_lowering_ignores_sparse_selection:{getattr(selected, 'name', selected.module)}"
+            )
         selected.module.validate(views=views, plan=plan, parallel=parallel, policy=policy,
                                  quant=quant, model=model, **selected.options)
     heads = plan.num_heads // parallel.tp
     kv_heads = local_kv_heads(plan.num_kv_heads, parallel.tp)
     width = plan.head_dim
     v_width = int(getattr(plan, "v_head_dim", 0) or width)
-    key_fmt, value_fmt, cache_regions, shared_format = _gqa_formats(model)
+    key_fmt, value_fmt, cache_regions, shared_format = _gqa_formats(model, plan=plan, phase=mode)
     if cacheless:
         key_fmt = value_fmt = CacheFormat(model.activation_dtype)
         shared_format = True
@@ -513,9 +541,12 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         local_attn_deps=local_attn_deps, dcp_attn_deps=dcp_attn_deps,
         local_fia_attn_deps=local_fia_attn_deps, dcp_fia_attn_deps=dcp_fia_attn_deps,
         attention_recipe=attention_recipe, streams=streams, quant=quant,
-        parallel=parallel, eff_window=eff_window, runtime=runtime, cacheless=cacheless,
+        parallel=parallel, eff_window=eff_window, dense_win=dense_win,
+        runtime=runtime, cacheless=cacheless,
         selected=selected, query_producer=query_producer,
-        dcp_query_producer=dcp_query_producer, add_input_ports=add_input_ports)
+        dcp_query_producer=dcp_query_producer, add_input_ports=add_input_ports,
+        key_fmt=key_fmt, value_fmt=value_fmt, shared_format=shared_format,
+        cp_interleave_size=cp_interleave_size, block_size=block_size)
     attention = _append_gqa_attention(
         ops, views, parallel, prefix, eff_topk, eff_window, plan, policy, dense_win,
         cp_interleave_size, block_size, kv_heads, heads, dcp_heads, width, kv_row_bytes,
@@ -527,7 +558,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         local_dp_pos=local_dp_pos, physical_rank=physical_rank,
         explicit_dp_cohort=(dcp_cohort_views_by_member is not None),
         explicit_physical_rank=bool(explicit_physical_rank),
-        qsa_dispatch=qsa_dispatch)
+        qsa_dispatch=qsa_dispatch,
+        key_fmt=key_fmt, value_fmt=value_fmt, shared_format=shared_format)
     if idle_dcp_owner:
         return AttentionResult(ops=ops, last=attention[-1],
                                cache_store_id=None, index_store_id=None,
@@ -765,18 +797,20 @@ def _publish_gqa_cache(
             stage=stage, layer=plan.index, requests=requests, phase=mode,
             model=model, views=views, kv_heads=kv_heads, head_width=width,
             parallel=parallel, quant=quant, key_fmt=key_fmt, value_fmt=value_fmt,
-            shared_format=True),)
+            shared_format=True, v_head_width=v_width, plan=plan),)
     else:
         key_store = _store_cache(
             ops, prefix=prefix, deps=store_deps, rows=store_rows, width=kv_heads * width,
             region="gqa_kv_key", name="cache_key", stage=stage, layer=plan.index, requests=requests,
             phase=mode, model=model, views=views, kv_heads=kv_heads, head_width=width,
-            parallel=parallel, quant=quant, key_fmt=key_fmt, value_fmt=value_fmt, shared_format=False)
+            parallel=parallel, quant=quant, key_fmt=key_fmt, value_fmt=value_fmt,
+            shared_format=False, plan=plan)
         value_store = _store_cache(
             ops, prefix=prefix, deps=store_deps, rows=store_rows, width=kv_heads * v_width,
             region="gqa_kv_value", name="cache_value", stage=stage, layer=plan.index, requests=requests,
             phase=mode, model=model, views=views, kv_heads=kv_heads, head_width=v_width,
-            parallel=parallel, quant=quant, key_fmt=key_fmt, value_fmt=value_fmt, shared_format=False)
+            parallel=parallel, quant=quant, key_fmt=key_fmt, value_fmt=value_fmt,
+            shared_format=False, plan=plan)
         store_ids = (key_store, value_store)
     return valid, pcp_prefill, store_ids
 
@@ -947,8 +981,10 @@ def _gqa_request_op(
     kv_heads, local_heads, dcp_heads, dp_width, width, kv_row_bytes, plan, mode, hierarchy,
     policy, model, sel_topk, topk_id, eff_topk, prefix, stage,
     local_attn_deps, dcp_attn_deps, attention_recipe, streams, quant,
-    parallel, eff_window, runtime, cacheless, selected, query_producer,
-    dcp_query_producer, add_input_ports, chunked_pf_pcp=False,
+    parallel, eff_window, dense_win, runtime, cacheless, selected, query_producer,
+    dcp_query_producer, add_input_ports, key_fmt, value_fmt, shared_format,
+    cp_interleave_size, block_size, chunked_pf_pcp=False, cp_rank=None,
+    physical_rank=None, selected_rows=None,
     local_fia_attn_deps=None, dcp_fia_attn_deps=None,
 ):
     heads = dcp_heads if eff_cp > 1 else local_heads
@@ -998,9 +1034,10 @@ def _gqa_request_op(
         if topk_id and eff_topk > 0 else 0.0
     )
     sparse_nk_meta = (("native_kind", sparse_nk),) if (sparse_nk and not selected) else ()
+    op_id = f"{prefix}.attention.{orig_idx}"
     shape = (q_eff, view.kv_len, heads, qk_width)
     op = OpSpec(
-        op_id=f"{prefix}.attention.{orig_idx}", family="attention", phase=mode,
+        op_id=op_id, family="attention", phase=mode,
         stage=stage, layer=plan.index, requests=(view.request_id,),
         semantic_shape=shape, local_shape=(q_eff, local_rows, heads, qk_width),
         padded_shape=shape, launch_shape=shape,
@@ -1027,12 +1064,37 @@ def _gqa_request_op(
                  + _attention_tensor_view(
                      (view,), heads, kv_heads, width, model, quant, parallel,
                      policy, runtime, causal=not plan.noncausal_attention,
-                     cacheless=cacheless),
+                     cacheless=cacheless, plan=plan, phase=mode)
+                 + gqa_kv_memory_accesses(
+                     (view,), op_id=op_id, stage=stage, layer=plan.index,
+                     kv_heads=kv_heads, width=qk_width, v_width=v_width,
+                     key_fmt=key_fmt, value_fmt=value_fmt, shared_format=shared_format,
+                     mode=mode, window=dense_win, cp=eff_cp,
+                     cp_interleave=cp_interleave_size, cp_rank=cp_rank,
+                     physical_rank=physical_rank,
+                     block_size=block_size,
+                     prefix_cache_mode=str(getattr(runtime, "prefix_cache_mode", "private") or "private"),
+                     cacheless=cacheless, noncausal=bool(plan.noncausal_attention),
+                     allow_shared_prefix=False,
+                     use_global_q=chunked_pf_pcp,
+                     selected_topk=eff_topk,
+                     selected_rows_by_view=((int(selected_rows),) if selected_rows is not None else None),
+                 ),
     )
     if selected:
+        sparse_layer = eff_topk > 0 or int(getattr(plan, "index_topk", 0) or 0) > 0
+        if sparse_layer and not _selected_supports_sparse_selection(selected):
+            raise ModelingError(
+                f"gqa_attention_lowering_ignores_sparse_selection:{getattr(selected, 'name', selected.module)}"
+            )
+        sparse_flops = float(op.flops)
         op = selected.module.lower_op(
             op, view=view, plan=plan, key_heads=kv_heads, model=model,
             runtime=runtime, **selected.options)
+        if sparse_layer and float(op.flops) > sparse_flops * (1.0 + _SPARSE_FLOP_TOLERANCE):
+            raise ModelingError(
+                f"gqa_attention_lowering_violated_sparse_topk_flops:{getattr(selected, 'name', selected.module)}"
+            )
     if q_prod == query_producer:
         op = add_input_ports(op, ({"op": query_producer, "output": "query"},))
     return op, kv_bytes, kv_refill_bytes
@@ -1041,7 +1103,7 @@ def _gqa_request_op(
 def _build_gqa_requests(
     indexed_views, per_view_pairs, per_view_sweeps, per_view_rows, per_view_spans,
     per_view_shared, worst_r, worst_sweeps_r, eff_cp, cp_interleave_size, request_op,
-    *, chunked_pf_pcp: bool = False,
+    *, chunked_pf_pcp: bool = False, physical_rank=None,
 ):
     batches: list[OpSpec] = []
     sweeps_by_view: list[int] = []
@@ -1071,7 +1133,9 @@ def _build_gqa_requests(
         total_rows_sum += view.kv_len
         op, kv_bytes, kv_refill_bytes = request_op(
             orig_idx, view, pairs, v_pairs, per_view_sweeps[v_pos], local_pairs,
-            view_sweeps, local_rows, eff_cp, chunked_pf_pcp=chunked_pf_pcp)
+            view_sweeps, local_rows, eff_cp, chunked_pf_pcp=chunked_pf_pcp,
+            cp_rank=worst_r, physical_rank=physical_rank,
+            selected_rows=per_view_sweeps[v_pos][worst_r])
         kv_hbm_total += kv_bytes
         kv_mte2_total += kv_refill_bytes
         kv_components.append((float(kv_bytes), float(kv_refill_bytes)))
@@ -1230,9 +1294,12 @@ def _finalize_gqa_group_batches(
     sweeps_by_view, shared_sweeps_by_view, unique_win_by_view, shared_iv_by_view,
     kv_hbm_total, kv_mte2_total, kv_components, rank_pairs, rank_sweeps, rank_rows,
     sel_r, worst_r, worst_sweeps_r, split_curr, sparse_imb_meta,
-    heads, kv_heads, width, streams, kv_row_bytes, eff_topk, eff_window, eff_cp,
+    heads, kv_heads, width, v_width, streams, kv_row_bytes, eff_topk, eff_window,
+    dense_win, eff_cp, cp_interleave_size, block_size,
+    key_fmt, value_fmt, shared_format,
     policy, model, quant, parallel, plan, mode, hierarchy, runtime, cacheless,
-    selected, user_pinned_attn,
+    selected, user_pinned_attn, chunked_pf_pcp=False, physical_rank=None,
+    selected_rows_by_view=None,
 ) -> list[str]:
     """Fuse or annotate per-group GQA attention batch ops with prefix-read accounting."""
     if policy.fused_batch and not selected and batches:
@@ -1240,8 +1307,9 @@ def _finalize_gqa_group_batches(
         batched_nk = dict(batches[0].metadata).get("native_kind")
         batched_nk_meta = (("native_kind", batched_nk),) if batched_nk else ()
         batched_sel_bytes = sum(float(dict(op.metadata).get("selection_read_bytes", 0.0)) for op in batches)
+        batched_op_id = grp_prefix + ".attention"
         batched = replace(
-            batches[0], op_id=grp_prefix + ".attention", requests=grp_reqs,
+            batches[0], op_id=batched_op_id, requests=grp_reqs,
             semantic_shape=(grp_hist_valid, max(v.kv_len for v in grp_views), heads, width),
             local_shape=(grp_hist_valid, rank_rows[sel_r], heads, width),
             metadata=(("request_shapes", tuple((v.q_len, v.context) for v in grp_views)),
@@ -1265,7 +1333,22 @@ def _finalize_gqa_group_batches(
                      + _attention_tensor_view(
                          grp_views, heads, kv_heads, width, model, quant, parallel,
                          policy, runtime, causal=not plan.noncausal_attention,
-                         cacheless=cacheless),
+                         cacheless=cacheless, plan=plan, phase=mode)
+                     + gqa_kv_memory_accesses(
+                         grp_views, op_id=batched_op_id, stage=batches[0].stage,
+                         layer=plan.index, kv_heads=kv_heads, width=width, v_width=v_width,
+                         key_fmt=key_fmt, value_fmt=value_fmt, shared_format=shared_format,
+                         mode=mode, window=dense_win, cp=eff_cp,
+                         cp_interleave=cp_interleave_size, cp_rank=sel_r,
+                         physical_rank=physical_rank,
+                         block_size=block_size,
+                         prefix_cache_mode=str(getattr(runtime, "prefix_cache_mode", "private") or "private"),
+                         cacheless=cacheless, noncausal=bool(plan.noncausal_attention),
+                         allow_shared_prefix=(eff_topk <= 0),
+                         use_global_q=chunked_pf_pcp,
+                         selected_topk=eff_topk,
+                         selected_rows_by_view=selected_rows_by_view,
+                     ),
             **{key: sum(getattr(op, key) for op in batches) for key in fields})
         if eff_topk > 0:
             batched = annotate_sparse_prefix_unknown(batched, runtime)
@@ -1322,7 +1405,7 @@ def _append_gqa_attention(
     user_pinned_attn, request_op, *, pcp_factor, tp_gather, dp_width, local_attn_deps,
     cohort_decode_views=None, peer_decode_rows=None, local_dp_pos=0,
     physical_rank=None, explicit_dp_cohort=False, explicit_physical_rank=False,
-    qsa_dispatch: bool = False,
+    qsa_dispatch: bool = False, key_fmt=None, value_fmt=None, shared_format: bool = True,
 ):
     phase_groups = _group_gqa_phase_views(
         views, plan, parallel, dp_width=dp_width, cacheless=cacheless,
@@ -1376,12 +1459,22 @@ def _append_gqa_attention(
             explicit_physical_rank=explicit_physical_rank)
         sel_r = max(cand_ranks, key=lambda r: (rank_pairs[r], rank_sweeps[r]))
         sel_sweeps_r = max(cand_ranks, key=lambda r: (rank_sweeps[r], rank_pairs[r]))
+        eff_phys_rank = (
+            int(physical_rank)
+            if (explicit_physical_rank and physical_rank is not None)
+            else None
+        )
+        sel_sparse_rows = (
+            tuple(int(per_view_sweeps[pos][sel_r]) for pos in range(len(indexed_views)))
+            if eff_topk > 0
+            else None
+        )
         (batches, sweeps_by_view, shared_sweeps_by_view, unique_win_by_view,
          shared_iv_by_view, _total_pairs, _total_rows, kv_hbm_total,
          kv_mte2_total, kv_components) = _build_gqa_requests(
             indexed_views, per_view_pairs, per_view_sweeps, per_view_rows, per_view_spans,
             per_view_shared, sel_r, sel_sweeps_r, eff_cp, cp_interleave_size,
-            request_op, chunked_pf_pcp=chunked_pf_pcp)
+            request_op, chunked_pf_pcp=chunked_pf_pcp, physical_rank=eff_phys_rank)
         grp_attn = _finalize_gqa_group_batches(
             ops, batches, grp_prefix=grp_prefix, grp_reqs=grp_reqs, grp_views=grp_views,
             grp_hist_valid=grp_hist_valid, indexed_views=indexed_views,
@@ -1391,11 +1484,15 @@ def _append_gqa_attention(
             rank_pairs=rank_pairs, rank_sweeps=rank_sweeps, rank_rows=rank_rows,
             sel_r=sel_r, worst_r=worst_r, worst_sweeps_r=worst_sweeps_r,
             split_curr=split_curr, sparse_imb_meta=sparse_imb_meta,
-            heads=heads, kv_heads=kv_heads, width=width, streams=streams,
-            kv_row_bytes=kv_row_bytes, eff_topk=eff_topk, eff_window=eff_window, eff_cp=eff_cp,
+            heads=heads, kv_heads=kv_heads, width=width, v_width=v_width, streams=streams,
+            kv_row_bytes=kv_row_bytes, eff_topk=eff_topk, eff_window=eff_window,
+            dense_win=dense_win, eff_cp=eff_cp, cp_interleave_size=cp_interleave_size,
+            block_size=block_size, key_fmt=key_fmt, value_fmt=value_fmt,
+            shared_format=shared_format,
             policy=policy, model=model, quant=quant, parallel=parallel, plan=plan, mode=mode,
             hierarchy=hierarchy, runtime=runtime, cacheless=cacheless, selected=selected,
-            user_pinned_attn=user_pinned_attn,
+            user_pinned_attn=user_pinned_attn, chunked_pf_pcp=chunked_pf_pcp,
+            physical_rank=eff_phys_rank, selected_rows_by_view=sel_sparse_rows,
         )
         if eff_cp > 1 and grp_attn:
             grp_attn = [_lower_gqa_dcp_combine(

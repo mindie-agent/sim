@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from functools import partial
 from itertools import islice
 from math import ceil
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import ArchId, SourceRef
@@ -33,14 +34,17 @@ from ..sharedkv.sfa_native import SFA_SPLIT_G_HEADS, build_arch35_split_g_sfa
 from ._fia import dense_fia
 from .common import (
     ARCH35, BF16_BYTES, C8_ABI, C8_LATENT_DIM, C8_MODES, C8_ROPE_DIM, C8_ROW_BYTES, C8_V1_ABI,
-    FIA_ABI, FIA_TILE, FP32_BYTES, GBSA_ABI, INDEX_BYTES, MINDIE_ABIS, MINDIE_V1_ABI, MINDIE_V3_ABI,
-    NOPE_ABI, PAGED_LAYOUTS, QUANT_MODE_BF16, QUANT_MODE_FP8_C8, QUANT_MODE_INT8_C8,
-    QUANT_MODE_MINDIE_FP8, QUANT_MODE_MXFP4_CX, QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP8,
-    QUANT_MODE_TQ4, SCALE_ADDRESS_BYTES, SECTOR_BYTES, SFA_V1_ABI, SOFTMAX_OPS, SUPPORTED_ABIS, TQ4_ROW_BYTES,
-    AttentionContract, AttentionPhase, _placement, _stage, attention_owner_waves, bsh_kv_access_plan, contract_for_requests,
-    make_plan, output_phases, owner_pairs, packed_gather_run_plans, packed_selection_runs, read_work, sparse_kv_extents, unmodeled,
+    C8_VLLM_ABI, C8_VLLM_MODES, C8_VLLM_ROW_BYTES, FIA_ABI, FIA_TILE, FP32_BYTES, GBSA_ABI, GBSA_LAYOUTS,
+    INDEX_BYTES, MINDIE_ABIS, MINDIE_V1_ABI, MINDIE_V3_ABI, NOPE_ABI, PAGED_LAYOUTS, QUANT_MODE_BF16,
+    QUANT_MODE_FP8_C8, QUANT_MODE_INT8_C8, QUANT_MODE_MINDIE_FP8, QUANT_MODE_MXFP4_CX, QUANT_MODE_MXFP4_OCP,
+    QUANT_MODE_MXFP8, QUANT_MODE_TQ4, SCALE_ADDRESS_BYTES, SECTOR_BYTES, SFA_V1_ABI, SOFTMAX_OPS,
+    SOFTMAX_STATS_SLOTS, SUPPORTED_ABIS, TQ4_ROW_BYTES, AttentionContract, AttentionMemoryRead, AttentionPhase,
+    _placement, _stage, attention_owner_waves, bsh_kv_access_plan, contract_for_requests, make_plan,
+    output_phases, owner_pairs, packed_gather_run_plans, packed_selection_runs, planning_sequence_spans,
+    read_work, sparse_kv_extents, unmodeled,
 )
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 UPSTREAM_ABI = "aclnnGenericBlockSparseAttention"
 OPS_TRANSFORMER_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
 MINDIE_SD_REVISION = "9fe772dfb90696e21b5e5d4e92ca07dffab84cf4"
@@ -104,6 +108,26 @@ SOURCES: tuple[SourceRef, ...] = (
         "0439249128d71f67a2146d5ad775c7e340a2cb00e0aa301370065bf4281d1f84",
     ),
     SourceRef(
+        "cann/ops-transformer", OPS_TRANSFORMER_REVISION,
+        "attention/generic_block_sparse_attention/op_host/generic_block_sparse_attention_tiling.cpp",
+        "364f718e71332eb506cdb5e62a857652186049e049d7d9e217296c4e13800790",
+    ),
+    SourceRef(
+        "cann/ops-transformer", OPS_TRANSFORMER_REVISION,
+        "attention/generic_block_sparse_attention/op_host/op_api/aclnn_generic_block_sparse_attention.cpp",
+        "b5baedb2018d9fef02332e3e945b95e543d26ca72fe7a8b71f43ad0edc406542",
+    ),
+    SourceRef(
+        "cann/ops-transformer", OPS_TRANSFORMER_REVISION,
+        "attention/generic_block_sparse_attention/op_kernel/arch35/generic_block_sparse_attention_kernel_arch35_mxfp8_full_quant.h",
+        "c0c2e6ca31009f228b9f29db310bcc7588bf5584f11722cc1cf072e456435177",
+    ),
+    SourceRef(
+        "cann/ops-transformer", OPS_TRANSFORMER_REVISION,
+        "attention/sparse_flash_mla/op_host/sparse_flash_mla_tiling.cpp",
+        "080e57921cff3b6ef825581b77b7efe2cb1da31270fd90b6f0d8450eda4b1195",
+    ),
+    SourceRef(
         "vllm-project/vllm-ascend", VLLM_REVISION, "vllm_ascend/attention/attention_v1.py",
         "1194f995eccb90309140d2e19e6dcc2291548cd58d8523c24a5ee1c79836360a",
     ),
@@ -138,11 +162,17 @@ SOURCES: tuple[SourceRef, ...] = (
 )
 (FIA_SOURCE, GBSA_SOURCE, C8_TILING_SOURCE, C8_VECTOR_SOURCE, NOPE_SOURCE, MINDIE_SOURCE,
  FIA_KERNEL_SOURCE, MXFP4_KERNEL_SOURCE, MXFP4_TILING_SOURCE, MXFP4_CALLER_SOURCE,
- MINDIE_FP8_KERNEL_SOURCE, *CP_SOURCES) = SOURCES
+ MINDIE_FP8_KERNEL_SOURCE, GBSA_TILING_SOURCE, GBSA_ACLNN_SOURCE, GBSA_MXFP8_KERNEL_SOURCE,
+ NOPE_TILING_SOURCE, *CP_SOURCES) = SOURCES
 SOURCES_BY_ABI = {
-    FIA_ABI: (FIA_SOURCE, FIA_KERNEL_SOURCE), GBSA_ABI: (GBSA_SOURCE,),
-    C8_ABI: (C8_TILING_SOURCE, C8_VECTOR_SOURCE), C8_V1_ABI: (C8_TILING_SOURCE, C8_VECTOR_SOURCE),
-    SFA_V1_ABI: (NOPE_SOURCE,), NOPE_ABI: (NOPE_SOURCE,), **{abi: (MINDIE_SOURCE,) for abi in MINDIE_ABIS},
+    FIA_ABI: (FIA_SOURCE, FIA_KERNEL_SOURCE),
+    GBSA_ABI: (GBSA_SOURCE, GBSA_TILING_SOURCE, GBSA_ACLNN_SOURCE),
+    C8_ABI: (C8_TILING_SOURCE, C8_VECTOR_SOURCE),
+    C8_V1_ABI: (C8_TILING_SOURCE, C8_VECTOR_SOURCE),
+    C8_VLLM_ABI: (C8_TILING_SOURCE, C8_VECTOR_SOURCE),
+    SFA_V1_ABI: (NOPE_SOURCE,),
+    NOPE_ABI: (NOPE_SOURCE, NOPE_TILING_SOURCE),
+    **{abi: (MINDIE_SOURCE,) for abi in MINDIE_ABIS},
 }
 MXFP4_SCALE_GROUP = 32
 MXFP4_BLOCK_ALIGNMENT = 2 * MXFP4_SCALE_GROUP
@@ -151,6 +181,9 @@ FP8_SCALE_GROUP = 128
 FP8_MIXED_KV_TILE = 256
 FP8_MAX_KV_TILE = 512
 MXFP8_SCALE_GROUP = 32
+MXFP8_V_CHANNEL_SCALE_BYTES = 2
+GBSA_MAX_HEAD_DIM = 256
+GBSA_MXFP8_HEAD_DIMS = frozenset({192, 256})
 SSMAX_EXTRA_OPS = 2
 DEQUANT_OPS = 2
 GBSA_OFFSET_WORDS_PER_BLOCK = 2
@@ -343,7 +376,11 @@ class _PackedAttention:
 
     def finish(self, splits):
         c = self.contract
-        output = output_phases(self.ctx, c, BF16_BYTES, ("online_output",), splits * c.num_heads, queries=1)
+        lse_slots = SOFTMAX_STATS_SLOTS if c.abi in {C8_ABI, C8_VLLM_ABI} else 1
+        output = output_phases(
+            self.ctx, c, BF16_BYTES, ("online_output",), splits * c.num_heads,
+            queries=1, lse_slots=lse_slots,
+        )
         return output if splits == 1 else output[1:]
 
     def __call__(self, context):
@@ -389,15 +426,40 @@ class _PackedAttention:
 def _validate_c8_abi(contract: AttentionContract) -> None:
     if contract.quant_mode == QUANT_MODE_TQ4:
         raise unmodeled("attention_arch35_tq4_unsupported", "TQ4 packed latent cache is supported on Arch22 only, not Arch35")
+    if contract.abi == C8_V1_ABI and contract.return_lse:
+        raise unmodeled("attention_c8_v1_no_lse", "aclnnKvQuantSparseFlashAttention V1 does not expose softmax statistics outputs")
+    if contract.abi == C8_VLLM_ABI:
+        if (contract.quant_mode not in C8_VLLM_MODES or contract.num_kv_heads != 1
+                or contract.v_head_dim != C8_LATENT_DIM
+                or contract.head_dim not in {C8_LATENT_DIM, C8_LATENT_DIM + C8_ROPE_DIM}):
+            raise unmodeled("attention_c8_vllm_abi_shape", "Bind vLLM packed latent C8 geometry (Dk in {512, 576}, Dv=512)")
+        return
     if (contract.quant_mode not in C8_MODES or contract.num_kv_heads != 1
             or contract.v_head_dim != C8_LATENT_DIM
-            or contract.head_dim not in {C8_LATENT_DIM, C8_LATENT_DIM + C8_ROPE_DIM}):
-        raise unmodeled("attention_c8_abi_shape", "Bind the packed latent C8 cache geometry")
+            or contract.head_dim != C8_LATENT_DIM + C8_ROPE_DIM):
+        raise unmodeled("attention_c8_abi_shape", "Bind the packed latent C8+RoPE cache geometry (Dk=576, Dv=512)")
+
+
+def _validate_gbsa_abi(contract: AttentionContract) -> None:
+    if contract.kv_layout not in GBSA_LAYOUTS:
+        raise unmodeled("attention_gbsa_layout", f"GBSA rejects kv_layout={contract.kv_layout}; bind a valid CANN GBSA layout")
+    if contract.head_dim != contract.v_head_dim:
+        raise unmodeled("attention_gbsa_head_dim", "GBSA requires head_dim == v_head_dim")
+    if contract.quant_mode == QUANT_MODE_MXFP8:
+        if contract.head_dim not in GBSA_MXFP8_HEAD_DIMS:
+            raise unmodeled("attention_gbsa_mxfp8_head_dim", "Arch35 GBSA MXFP8 requires head_dim in {192, 256}")
+    elif contract.head_dim > GBSA_MAX_HEAD_DIM:
+        raise unmodeled("attention_gbsa_head_dim", f"Arch35 GBSA requires head_dim <= {GBSA_MAX_HEAD_DIM}")
 
 
 def _packed_kv(op, contract, ctx, sources):
     _validate_c8_abi(contract)
-    size = TQ4_ROW_BYTES if contract.quant_mode == QUANT_MODE_TQ4 else C8_ROW_BYTES
+    if contract.abi == C8_VLLM_ABI:
+        size = C8_VLLM_ROW_BYTES if contract.head_dim == C8_LATENT_DIM else C8_ROW_BYTES
+    elif contract.quant_mode == QUANT_MODE_TQ4:
+        size = TQ4_ROW_BYTES
+    else:
+        size = C8_ROW_BYTES
     counts = tuple(contract.row_counts())
     capacity = _l2_capacity(ctx)
     key = None
@@ -434,52 +496,168 @@ def _packed_kv(op, contract, ctx, sources):
     return make_plan(op, contract, ctx, phases, sources, metadata=metadata, program=replace(loop, phases=phases))
 
 
+@dataclass(frozen=True, slots=True)
+class _SharedReadWait:
+    """Wait for a sibling owner's shared KV transfer when group_rows > 1."""
+
+    key: tuple[int, int]
+    reader: AttentionMemoryRead | None
+
+    def start(self, engine, name, ready, *, owner=""):
+        events = getattr(engine, "_sparse_shared_kv_events", None)
+        if events is None:
+            events = engine._sparse_shared_kv_events = {}
+        done = events.get(self.key)
+        if done is None:
+            done = events[self.key] = engine.future(f"{name}:shared_kv")
+        if self.reader is not None:
+            transfer = self.reader.start(engine, name, ready, owner=owner)
+            engine.on_complete(transfer, lambda _: engine.resolve(done))
+            return done
+        joined = engine.future(f"{name}:wait")
+        engine.submit(f"{name}:join", after=(ready, done), owner=owner,
+                      on_complete=lambda _: engine.resolve(joined), native_hook=True)
+        return joined
+
+
+@dataclass(frozen=True, slots=True)
+class _SparseSharedKvMemory:
+    """Defer shared-prefix L2 residency fills to Engine transfer completion."""
+
+    phase_name: str
+    patterns: tuple[MemoryAccessPattern, ...]
+    ctx: OperatorPlanningContext
+    capacity: int
+
+    def __call__(self, context, owner_index, owner_count, core, aic_count, deps):
+        if not self.patterns:
+            return Stage(self.phase_name, {}, after=deps, keep_empty=True)
+        hbm = context.resource_names["hbm"]
+        pipe_role = "mte2_aic" if "mte2_aic" in context.resource_names else "mte2"
+        pipe_units = context.resource_units.get(pipe_role, 1)
+        pipe_rate = context.rates[context.resource_names[pipe_role]] / pipe_units
+        owner_unit = unit_group(core, aic_count, pipe_units)[0]
+        if owner_count > len(self.patterns):
+            pat_idx = owner_index % len(self.patterns)
+            is_leader = owner_index < len(self.patterns)
+            reader = None
+            if is_leader:
+                pat = replace(self.patterns[pat_idx], owner=owner_unit)
+                bus = HbmBusSpec(pat.die, 1, 1, 0, row_r=hbm, ctr_r=hbm)
+                bound = context.bind_access(
+                    pat, hbm_bus=bus, copy_hit_bytes_per_ms=pipe_rate, copy_miss_bytes_per_ms=pipe_rate,
+                )
+                reader = AttentionMemoryRead(pat, bound, self.capacity, hbm, self.ctx)
+            return Stage(
+                self.phase_name, after=deps,
+                program=_SharedReadWait((id(self), pat_idx), reader),
+                keep_empty=True,
+            )
+        assigned = self.patterns[owner_index::owner_count]
+        stages = []
+        for idx, pattern in enumerate(assigned):
+            pat = replace(pattern, owner=owner_unit)
+            bus = HbmBusSpec(pat.die, 1, 1, 0, row_r=hbm, ctr_r=hbm)
+            bound = context.bind_access(
+                pat, hbm_bus=bus, copy_hit_bytes_per_ms=pipe_rate, copy_miss_bytes_per_ms=pipe_rate,
+            )
+            reader = AttentionMemoryRead(pat, bound, self.capacity, hbm, self.ctx)
+            stages.append(Stage(f"{self.phase_name}_{idx}", program=reader))
+        if len(stages) == 1:
+            return Stage(self.phase_name, after=deps, program=stages[0].program, keep_empty=True)
+        return Stage(self.phase_name, after=deps, program=KernelProgram(tuple(stages)), keep_empty=True)
+
+
+def _sparse_tile_specs(
+    contract: AttentionContract, ctx: OperatorPlanningContext, *, tiled: bool,
+) -> tuple[tuple[int, int, int, int, int, int | None], ...]:
+    """Return (seq_idx, tile_q, tile_kv_rows, tile_pair_rows, base, stride) per task tile."""
+    if not tiled:
+        return tuple(
+            (idx, 1, rows, rows, base, stride)
+            for idx, (rows, base, stride) in enumerate(sparse_kv_extents(contract, ctx))
+        )
+    q_block = contract.query_block_size or contract.block_size
+    # CANN MindIE BlockSparseAttention caps each AIC query tile at FIA_TILE (128).
+    q_tile = min(q_block, FIA_TILE) if contract.abi in MINDIE_ABIS else q_block
+    spans = planning_sequence_spans(ctx, contract.kv_layout)
+    if spans:
+        seq_meta = [
+            (q, base, request.physical_kv_len if contract.kv_layout == "BNSD" else None)
+            for request, (q, _, _, base, _) in zip(ctx.requests, spans, strict=True)
+        ]
+    elif contract.sequences:
+        seq_meta = [(q, 0, None) for q, _ in contract.sequences]
+    else:
+        batch = min(contract.batch_size, contract.query_tokens)
+        base_q, extra_q = divmod(contract.query_tokens, batch)
+        seq_meta = [(base_q + (i < extra_q), 0, None) for i in range(batch)]
+    counts = iter(contract.row_counts())
+    specs = []
+    for seq_idx, (seq_q, base, stride) in enumerate(seq_meta):
+        for block_start in range(0, seq_q, q_block):
+            block_end = min(block_start + q_block, seq_q)
+            for tile_start in range(block_start, block_end, q_tile):
+                tile_q = min(q_tile, block_end - tile_start)
+                tile_counts = tuple(islice(counts, tile_q))
+                specs.append((seq_idx, tile_q, max(tile_counts, default=0), sum(tile_counts), base, stride))
+    return tuple(specs)
+
+
 def _sparse_kv_load(
     contract: AttentionContract, ctx: OperatorPlanningContext, dim: int, tensor: str,
-    *, native_fp8: bool = False, shared_l2: AdmissionMemoryView | None = None,
-) -> Work:
+    *, native_fp8: bool = False, gbsa_fp8: bool = False, is_value: bool = False,
+    shared_l2: AdmissionMemoryView | None = None,
+    extents: tuple[tuple[int, int, int | None], ...] | None = None,
+) -> tuple[Work, tuple[MemoryAccessPattern, ...]]:
     mode = contract.quant_mode
     elem = BF16_BYTES if mode == QUANT_MODE_BF16 else 1
-    if native_fp8:
-        scale_bytes = 0  # Native FP8 scalar operands have their own GM loads.
+    if native_fp8 or gbsa_fp8:
+        scale_bytes = 0  # Native/direct FP8 scalar operands have no per-group BF16 scales.
     elif mode == QUANT_MODE_INT8_C8:
         scale_bytes = FP32_BYTES
     elif mode == QUANT_MODE_FP8_C8:
         scale_bytes = ceil(dim / FP8_SCALE_GROUP) * BF16_BYTES
+    elif mode == QUANT_MODE_MXFP8:
+        # GBSA MXFP8 stores K scales per 32-elem group along D on AIC; V uses
+        # per-channel scales loaded separately on AIV (SetValueScale).
+        scale_bytes = 0 if (contract.abi == GBSA_ABI and is_value) else ceil(dim / MXFP8_SCALE_GROUP)
     else:
-        scale_bytes = ceil(dim / MXFP8_SCALE_GROUP) if mode == QUANT_MODE_MXFP8 else 0
+        scale_bytes = 0
     hbm = copied = hit = 0
     row_bytes = contract.num_kv_heads * dim * elem
+    kv_extents = extents if extents is not None else tuple(sparse_kv_extents(contract, ctx))
     if shared_l2 is not None and not scale_bytes:
         die = ctx.geometry.rank or 0
-        # The two prefix tensors have independent backing allocations.
-        key = ReuseKey(die, tensor, 0, reuse_stream=tensor)
+        key = ReuseKey(die, f"{contract.kv_tensor_id}:{tensor}", contract.kv_version, reuse_stream=tensor)
         bus = HbmBusSpec(die, 1, 1, 0)
-        for rows, base, stride in sparse_kv_extents(contract, ctx):
-            runs = tuple(
-                run for owner in range(contract.num_kv_heads)
-                for run in bsh_kv_access_plan(
+        patterns = []
+        for rows, base, stride in kv_extents:
+            if not rows:
+                continue
+            for owner in range(contract.num_kv_heads):
+                plan = bsh_kv_access_plan(
                     contract.num_kv_heads, dim, elem, contract.kv_layout,
                     rows=rows, first_head=owner, block_size=contract.block_size,
                     base_byte=base * row_bytes, tokens_per_head=stride,
-                ).runs
-            )
-            plan = AddressRunPlan(runs)
-            pattern = MemoryAccessPattern(
-                tensor, 0, die, 0, "read", "mte2_aic",
-                rows * contract.num_kv_heads * dim * elem, plan, reuse_key=key,
-            )
-            ledger = bind_memory_access(
-                pattern, shared_l2, hbm_bus=bus, copy_hit_bytes_per_ms=1,
-                copy_miss_bytes_per_ms=1, l2_bytes_per_ms=1, pipe_row_id="mte2_aic",
-                l2_row_id="l2", commit=True,
-            ).ledger
-            copied += ledger.aligned_transfer_bytes
-            hbm += ledger.dram_sector_bytes
-            hit += ledger.l2_hit_bytes
-        return read_work(ctx, copied, hbm=hbm, l2=hit)
+                )
+                pattern = MemoryAccessPattern(
+                    f"{contract.kv_tensor_id}:{tensor}", contract.kv_version, die, owner, "read", "mte2_aic",
+                    rows * dim * elem, plan, reuse_key=key,
+                )
+                # Pure read-only preview during planning; Engine settles fills at completion.
+                ledger = bind_memory_access(
+                    pattern, shared_l2, hbm_bus=bus, copy_hit_bytes_per_ms=1,
+                    copy_miss_bytes_per_ms=1, l2_bytes_per_ms=1, pipe_row_id="mte2_aic",
+                    l2_row_id="l2", commit=False,
+                ).ledger
+                copied += ledger.aligned_transfer_bytes
+                hbm += ledger.dram_sector_bytes
+                hit += ledger.l2_hit_bytes
+                patterns.append(pattern)
+        return read_work(ctx, copied, hbm=hbm, l2=hit), tuple(patterns)
 
-    for rows, base, stride in sparse_kv_extents(contract, ctx):
+    for rows, base, stride in kv_extents:
         block = contract.block_size
         full, tail = divmod(rows, block)
         for count, repeats in ((block, full), (tail, 1)):
@@ -494,17 +672,17 @@ def _sparse_kv_load(
                                               count * (dim * elem + scale_bytes), plan)
                 hbm += pattern.runs.dram_sector_and_service()[0] * repeats
                 copied += pattern.runs.aligned_copy_bytes() * repeats
-    return read_work(ctx, copied, hbm=hbm)
+    return read_work(ctx, copied, hbm=hbm), ()
 
 
-def _mxfp4_inputs(contract, q_rows, rows):
+def _mxfp4_inputs(contract, q_rows, kv_tile_rows, tile_kv_counts):
     dk, dv = contract.head_dim, contract.v_head_dim
     heads, block = contract.num_kv_heads, contract.block_size
-    counts = sum(ceil(n / MXFP4_BLOCK_ALIGNMENT) for n in contract.row_counts()) * heads
+    counts = sum(ceil(n / MXFP4_BLOCK_ALIGNMENT) for n in tile_kv_counts) * heads
     payloads = {
         "query": (q_rows * (dk // 2), q_rows * (dk // MXFP4_SCALE_GROUP)),
-        "key": (rows * heads * (dk // 2), rows * heads * (dk // MXFP4_SCALE_GROUP)),
-        "value": (rows * heads * (dv // 2), counts * dv * 2),
+        "key": (kv_tile_rows * heads * (dk // 2), kv_tile_rows * heads * (dk // MXFP4_SCALE_GROUP)),
+        "value": (kv_tile_rows * heads * (dv // 2), counts * dv * 2),
     }
     return {
         "quant_mode": contract.quant_mode, "dst_type_max": contract.dst_type_max,
@@ -555,36 +733,36 @@ def _load_sparse_kv_pair(
     nope: bool,
     mxfp4: bool,
     native_fp8: bool,
+    gbsa_fp8: bool,
     packed_bytes: dict[str, int],
-) -> tuple[Work, Work | None]:
+    extents: tuple[tuple[int, int, int | None], ...],
+) -> tuple[Work, Work | None, _SparseSharedKvMemory | None, _SparseSharedKvMemory | None]:
+    capacity = _l2_capacity(ctx)
     shared_l2 = (
         ctx.admission_memory_view
-        if (contract.shared_prefix and mode == QUANT_MODE_BF16
-            and ctx.admission_memory_view is not None and _l2_capacity(ctx) > 0)
+        if (contract.shared_prefix and contract.kv_tensor_id and mode == QUANT_MODE_BF16
+            and ctx.admission_memory_view is not None and capacity > 0)
         else None
     )
-    die = ctx.geometry.rank or 0
-    if shared_l2 is not None:
-        shared_l2.enter_stream(die, "key")
-        if not nope:
-            shared_l2.enter_stream(die, "value")
-    try:
-        k_load = read_work(ctx, packed_bytes["key"]) if mxfp4 else _sparse_kv_load(
-            contract, ctx, contract.head_dim, "key", native_fp8=native_fp8, shared_l2=shared_l2,
+    if mxfp4:
+        k_load, k_pats = read_work(ctx, packed_bytes["key"]), ()
+    else:
+        k_load, k_pats = _sparse_kv_load(
+            contract, ctx, contract.head_dim, "key", native_fp8=native_fp8, gbsa_fp8=gbsa_fp8,
+            shared_l2=shared_l2, extents=extents,
         )
-        if mxfp4:
-            v_load = read_work(ctx, packed_bytes["value"])
-        elif not nope:
-            v_load = _sparse_kv_load(contract, ctx, contract.v_head_dim, "value",
-                                     native_fp8=native_fp8, shared_l2=shared_l2)
-        else:
-            v_load = None
-    finally:
-        if shared_l2 is not None:
-            shared_l2.exit_stream(die, "key")
-            if not nope:
-                shared_l2.exit_stream(die, "value")
-    return k_load, v_load
+    if mxfp4:
+        v_load, v_pats = read_work(ctx, packed_bytes["value"]), ()
+    elif not nope:
+        v_load, v_pats = _sparse_kv_load(
+            contract, ctx, contract.v_head_dim, "value", native_fp8=native_fp8, gbsa_fp8=gbsa_fp8,
+            is_value=True, shared_l2=shared_l2, extents=extents,
+        )
+    else:
+        v_load, v_pats = None, ()
+    k_mem = _SparseSharedKvMemory("key_load", k_pats, ctx, capacity) if k_pats else None
+    v_mem = _SparseSharedKvMemory("value_load", v_pats, ctx, capacity) if v_pats else None
+    return k_load, v_load, k_mem, v_mem
 
 
 def _sparse(op: OpSpec, contract: AttentionContract, ctx: OperatorPlanningContext,
@@ -593,7 +771,11 @@ def _sparse(op: OpSpec, contract: AttentionContract, ctx: OperatorPlanningContex
     nope = abi == NOPE_ABI
     mindie = abi in MINDIE_ABIS
     native_fp8 = mindie and mode == QUANT_MODE_MINDIE_FP8
+    gbsa_fp8 = abi == GBSA_ABI and mode == QUANT_MODE_FP8_C8
+    gbsa_mxfp8 = abi == GBSA_ABI and mode == QUANT_MODE_MXFP8
     mxfp4 = mindie and mode in {QUANT_MODE_MXFP4_OCP, QUANT_MODE_MXFP4_CX}
+    if abi == GBSA_ABI:
+        _validate_gbsa_abi(contract)
     if mxfp4:
         if abi != MINDIE_V3_ABI:
             raise unmodeled("attention_mindie_mxfp4_version", "MXFP4 requires aclnnBlockSparseAttentionV3")
@@ -610,46 +792,62 @@ def _sparse(op: OpSpec, contract: AttentionContract, ctx: OperatorPlanningContex
         raise unmodeled("attention_sparse_dtype", f"Bind a supported sparse attention dtype for {abi}")
     if contract.selection_lists:
         raise unmodeled("attention_sparse_addresses", "Bind explicit row addresses to packed SFA")
-    if (nope and (mode != QUANT_MODE_BF16 or contract.head_dim != contract.v_head_dim
-                  or contract.num_kv_heads != 1)):
-        raise unmodeled("attention_nope_shape", "Bind a shared, nonquantized NoPE latent cache")
+    if (nope and (mode != QUANT_MODE_BF16 or contract.head_dim != C8_LATENT_DIM
+                  or contract.v_head_dim != C8_LATENT_DIM or contract.num_kv_heads != 1)):
+        raise unmodeled("attention_nope_shape", "Bind a shared, nonquantized NoPE latent cache (Dk=Dv=512)")
     if mindie and (contract.kv_layout not in {"TND", "BNSD"}
                    or (not mxfp4 and not native_fp8 and mode != QUANT_MODE_BF16)
                    or (abi == MINDIE_V1_ABI and native_fp8)):
         raise unmodeled("attention_mindie_sd_abi", f"Bind a supported layout and storage format for {abi}")
     if mode == QUANT_MODE_TQ4 and not mxfp4:
         raise unmodeled("attention_tq4_abi", f"TQ4 packed latent cache requires {C8_ABI}")
-    dtype = "mxfp4" if mxfp4 else ("fp8_e4m3" if native_fp8 or mode == QUANT_MODE_MXFP8 else op.dtype)
-    q_elem = 1 if native_fp8 else BF16_BYTES
-    operand_elem = 1 if native_fp8 or mode == QUANT_MODE_MXFP8 else BF16_BYTES
-    rows = blocks = tiles = split_rows = 0
-    for count in contract.row_counts():
-        rows += count
-        blocks += ceil(count / contract.block_size)
-        tiles += ceil(count / FIA_TILE)
-        split_rows += min(contract.splits, max(1, count))
-    pairs = rows * contract.num_heads
-    kv_rows = rows * contract.num_kv_heads
-    q_rows = split_rows * contract.num_heads
+    dtype = ("mxfp4" if mxfp4 else
+             ("fp8_e4m3" if native_fp8 or gbsa_fp8 or mode == QUANT_MODE_MXFP8 else op.dtype))
+    q_elem = 1 if (native_fp8 or gbsa_fp8 or gbsa_mxfp8) else BF16_BYTES
+    operand_elem = 1 if (native_fp8 or gbsa_fp8 or mode == QUANT_MODE_MXFP8) else BF16_BYTES
+    tiled_sparse = mindie or (abi == GBSA_ABI and contract.query_block_size is not None)
+    tile_specs = _sparse_tile_specs(contract, ctx, tiled=tiled_sparse)
+    pair_rows = kv_tile_rows = blocks = tiles = q_split_rows = task_tiles = 0
+    active_seqs: set[int] = set()
+    for seq_idx, tile_q, tile_kv, tile_pairs, _, _ in tile_specs:
+        pair_rows += tile_pairs
+        kv_tile_rows += tile_kv
+        if tile_kv > 0:
+            active_seqs.add(seq_idx)
+        blocks += ceil(tile_kv / contract.block_size)
+        tiles += tile_q * ceil(tile_kv / FIA_TILE)
+        splits = min(contract.splits, max(1, tile_kv))
+        q_split_rows += tile_q * splits
+        task_tiles += splits
+    pairs = pair_rows * contract.num_heads
+    kv_rows = kv_tile_rows * contract.num_kv_heads
+    q_rows = q_split_rows * contract.num_heads
     q_bytes = q_rows * contract.head_dim * q_elem
     metadata = {"source_program": sources[0].to_dict()}
     packed_bytes = {}
     if mxfp4:
-        binding = _mxfp4_inputs(contract, q_rows, rows)
+        tile_kv_counts = tuple(tile_kv for _, _, tile_kv, _, _, _ in tile_specs)
+        binding = _mxfp4_inputs(contract, q_rows, kv_tile_rows, tile_kv_counts)
         metadata.update(binding)
         packed_bytes = binding["operand_bytes"]
         q_bytes = packed_bytes["query"]
     elif native_fp8:
         sources = (*sources, MINDIE_FP8_KERNEL_SOURCE)
         metadata.update(quant_mode=mode, scale_dtype="fp32", scale_bytes=_mindie_fp8_scale_bytes(contract))
+    elif gbsa_mxfp8:
+        sources = (*sources, GBSA_MXFP8_KERNEL_SOURCE)
+        q_scale = q_rows * ceil(contract.head_dim / MXFP8_SCALE_GROUP)
+        # SetValueScale loads D * 2 E8M0 bytes on AIV once per unique (batch, kv_head) scale address.
+        v_scale = len(active_seqs) * contract.num_kv_heads * contract.v_head_dim * MXFP8_V_CHANNEL_SCALE_BYTES
+        metadata.update(quant_mode=mode, scale_dtype="fp8_e8m0", scale_bytes={"query": q_scale, "value": v_scale})
     scales = metadata.get("scale_bytes", {})
     phases = [AttentionPhase("query_load", read_work(ctx, q_bytes), ())]
     qk_deps = ("query_load",)
-    if scales:
+    if scales.get("query", 0):
         phases.append(AttentionPhase("query_scale_load", read_work(ctx, scales["query"]), ()))
         qk_deps += ("query_scale_load",)
     v_load = None
-    index_count = (rows if nope else blocks) * contract.num_kv_heads
+    index_count = (kv_tile_rows if nope else blocks) * contract.num_kv_heads
     index_bytes = 0 if contract.metadata_reuse else index_count * INDEX_BYTES
     phases.append(AttentionPhase("sparse_index", read_work(ctx, index_bytes, aiv=True), ()))
     offset_deps = ("sparse_index",)
@@ -664,17 +862,19 @@ def _sparse(op: OpSpec, contract: AttentionContract, ctx: OperatorPlanningContex
         phases.append(AttentionPhase("offset_workspace_write", Work(resources={"mte3": size, "hbm": size}), k_deps))
         phases.append(AttentionPhase("offset_workspace_read", read_work(ctx, size), ("offset_workspace_write",)))
         k_deps = ("offset_workspace_read",)
-    k_load, v_load = _load_sparse_kv_pair(
-        contract, ctx, mode=mode, nope=nope, mxfp4=mxfp4, native_fp8=native_fp8, packed_bytes=packed_bytes,
+    kv_extents = tuple((tile_kv, base, stride) for _, _, tile_kv, _, base, stride in tile_specs)
+    k_load, v_load, k_mem, v_mem = _load_sparse_kv_pair(
+        contract, ctx, mode=mode, nope=nope, mxfp4=mxfp4, native_fp8=native_fp8, gbsa_fp8=gbsa_fp8,
+        packed_bytes=packed_bytes, extents=kv_extents,
     )
-    phases.append(AttentionPhase("key_load", k_load, k_deps))
+    phases.append(AttentionPhase("key_load", k_load, k_deps, memory=k_mem))
     qk_deps += ("key_load",)
-    if scales:
+    if scales.get("key", 0):
         phases.append(AttentionPhase("key_scale_load", read_work(ctx, scales["key"]), k_deps))
         qk_deps += ("key_scale_load",)
     metadata["l2_shared_kv_bytes"] = k_load.resources["l2"] + (v_load.resources["l2"] if v_load else 0)
 
-    if mode in {QUANT_MODE_INT8_C8, QUANT_MODE_FP8_C8} and not native_fp8:
+    if mode in {QUANT_MODE_INT8_C8, QUANT_MODE_FP8_C8} and not native_fp8 and not gbsa_fp8:
         phases.append(AttentionPhase("key_dequant", Work(resources={
             "vector": kv_rows * contract.head_dim * DEQUANT_OPS,
         }), qk_deps))
@@ -686,7 +886,7 @@ def _sparse(op: OpSpec, contract: AttentionContract, ctx: OperatorPlanningContex
         key_operand_bytes = packed_bytes["key"]
         probability_bytes = ceil(pairs / 2)
         value_operand_bytes = packed_bytes["value"]
-    l0_scales = scales if mxfp4 else {}
+    l0_scales = scales if mxfp4 else ({"query": scales["query"]} if gbsa_mxfp8 else {})
     phases.extend((
         AttentionPhase("qk", Work({dtype: 2 * pairs * contract.head_dim},
                                    {"mte1": q_bytes + key_operand_bytes + l0_scales.get("query", 0)
@@ -698,13 +898,18 @@ def _sparse(op: OpSpec, contract: AttentionContract, ctx: OperatorPlanningContex
         AttentionPhase("probability_transfer", Work(resources={"mte3": probability_bytes}), ("online_softmax",)),
     ))
     pv_deps = ("probability_transfer",)
+    out_deps = ("pv_fixpipe",)
     if v_load is not None:
-        phases.append(AttentionPhase("value_load", v_load, pv_deps))
+        phases.append(AttentionPhase("value_load", v_load, pv_deps, memory=v_mem))
         pv_deps = ("value_load",)
-        if scales:
-            phases.append(AttentionPhase("value_scale_load", read_work(ctx, scales["value"]), ("probability_transfer",)))
-            pv_deps += ("value_scale_load",)
-        if mode in {QUANT_MODE_INT8_C8, QUANT_MODE_FP8_C8} and not native_fp8:
+        if scales.get("value", 0):
+            if gbsa_mxfp8:
+                phases.append(AttentionPhase("value_scale_load", read_work(ctx, scales["value"], aiv=True), ()))
+                out_deps = ("pv_fixpipe", "value_scale_load")
+            else:
+                phases.append(AttentionPhase("value_scale_load", read_work(ctx, scales["value"]), ("probability_transfer",)))
+                pv_deps += ("value_scale_load",)
+        if mode in {QUANT_MODE_INT8_C8, QUANT_MODE_FP8_C8} and not native_fp8 and not gbsa_fp8:
             phases.append(AttentionPhase("value_dequant", Work(resources={
                 "vector": kv_rows * contract.v_head_dim * DEQUANT_OPS,
             }), pv_deps))
@@ -717,12 +922,12 @@ def _sparse(op: OpSpec, contract: AttentionContract, ctx: OperatorPlanningContex
         }), ("pv",)),
         AttentionPhase("online_output", Work(resources={
             "vector": (tiles * contract.num_heads + q_rows) * contract.v_head_dim,
-        }), ("pv_fixpipe",)),
+        }), out_deps),
     ))
     phases.extend(output_phases(ctx, contract, BF16_BYTES, ("online_output",), q_rows))
     group_rows = (ceil(contract.num_heads / (contract.num_kv_heads * GBSA_HEAD_GROUP_ROWS))
                   if abi == GBSA_ABI else 1)
-    work_items = split_rows * contract.num_kv_heads * group_rows
+    work_items = task_tiles * contract.num_kv_heads * group_rows
     return make_plan(op, contract, ctx, tuple(phases), sources, metadata=metadata, work_items=work_items)
 
 
@@ -748,11 +953,13 @@ class _Strategy:
         ctx.datapath.route("ub", "l1")
         if contract.abi == FIA_ABI:
             return dense_fia(op, contract, ctx, sources, gm_workspace=False)
-        if contract.abi in {C8_ABI, C8_V1_ABI}:
+        if contract.abi in {C8_ABI, C8_V1_ABI, C8_VLLM_ABI}:
             _validate_c8_abi(contract)
         if contract.abi == SFA_V1_ABI and contract.splits == 1:
             return build_arch35_split_g_sfa(op, contract, ctx, sources)
-        if contract.abi in {C8_V1_ABI, C8_ABI} and contract.splits == 1 and not contract.selection_lists and contract.num_heads > SFA_SPLIT_G_HEADS:
+        if (contract.abi in {C8_V1_ABI, C8_ABI} and contract.splits == 1
+                and not contract.selection_lists and contract.num_heads > SFA_SPLIT_G_HEADS
+                and not contract.return_lse):
             return build_arch35_split_g_sfa(op, contract, ctx, sources)
-        return _packed_kv(op, contract, ctx, sources) if contract.abi in {C8_ABI, C8_V1_ABI} else _sparse(op, contract, ctx, sources)
+        return _packed_kv(op, contract, ctx, sources) if contract.abi in {C8_ABI, C8_V1_ABI, C8_VLLM_ABI} else _sparse(op, contract, ctx, sources)
 STRATEGY = _Strategy()

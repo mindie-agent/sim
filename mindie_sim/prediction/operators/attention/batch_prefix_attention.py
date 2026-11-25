@@ -24,15 +24,25 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 import math
-from typing import Any
+from typing import Any, Literal
 
 from mindie_sim.prediction.prefix_reads import (
     CacheAccess, apply_prefix_read_plan, plan_prefix_reads,
 )
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
 
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="vllm_ascend/attention/attention_v1.py",
+        source_sha256="1194f995eccb90309140d2e19e6dcc2291548cd58d8523c24a5ee1c79836360a",
+    ),
+)
 TILE_SLOTS = 2
 KEY_TILE_BYTES = 262144.0
 MAX_KEY_TILES = 32
@@ -91,11 +101,12 @@ def prefix_members(shape, sequences):
     extents = raw if isinstance(raw, (list, tuple)) else (raw,) * len(sequences)
     names = shape.get("prefix_cache_keys")
     shared = shape.get("prefix_cache_mode") == "shared"
+    mode = "shared" if shared else "private"
     members = []
     for i, (query, context) in enumerate(sequences):
         extent = min(context, max(0, int(extents[i]))) if query and shared else 0
-        key = (str(names[i] or "") if names and i < len(names) else
-               "" if names else "__implicit__")
+        raw_key = names[i] if names and i < len(names) else ""
+        key = canonical_prefix_cache_key(mode, raw_key) if shared else str(raw_key or "")
         members.append((key, extent))
     counts = Counter(key for key, extent in members if key and extent)
     return tuple((key, extent if counts[key] > 1 else 0) for key, extent in members)

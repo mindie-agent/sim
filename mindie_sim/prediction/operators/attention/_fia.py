@@ -18,11 +18,21 @@ from dataclasses import asdict, dataclass, replace
 from functools import partial
 from itertools import accumulate
 from math import ceil, gcd
-from typing import Callable
+from typing import Callable, Literal
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/fused_infer_attention_score/op_host/fused_infer_attention_score_tiling.cpp",
+        source_sha256="bac8846fe180d6b95311a7a80b333e0e37a4a587c81c9cfd798e910c14197be0",
+    ),
+)
 from ...mechanism import OperatorPlan, Work
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from ...program.stages import scope_allocations
@@ -42,7 +52,6 @@ from ..sharedkv.l0_sync import (
 from ..sharedkv.split_core import (
     CorePartition,
     _p01_active_core_bps,
-    compact_arch35_preload_s2,
     p01_cold_mte2_aic_cap,
     resolve_arch22_fia_gqa_tiling,
     resolve_arch35_fia_gqa_tiling,
@@ -556,17 +565,24 @@ class _FiaLoop:
         paged = self.contract.kv_layout in PAGED_LAYOUTS
         page = self.contract.block_size if paged else self.s2_tile
         has_live_mem = bool(self.contract.kv_tensor_id and (self.contract.block_table or self.ctx.requests))
-        uniform_interior = (not has_live_mem) and (
+        reuse_uniform = True
+        if (not has_live_mem and rect.rect_in_head > 0
+                and self.kv_reuse_hit_frac > 0.0 and n_tiles > 2):
+            inner_start = tiles[1] * self.s2_tile
+            inner_end = min((tiles[-2] + 1) * self.s2_tile, rect.kv)
+            all_inside = (rect.prev_touched_start <= inner_start
+                          and inner_end <= rect.prev_touched_end)
+            all_outside = (inner_end <= rect.prev_touched_start
+                           or inner_start >= rect.prev_touched_end)
+            reuse_uniform = all_inside or all_outside
+        uniform_interior = (not has_live_mem) and reuse_uniform and (
             (not paged) or (page % self.s2_tile == 0 or self.s2_tile % page == 0)
         )
         if n_tiles > COMPACT_TILE_THRESHOLD and uniform_interior:
             if not self.gm_workspace and self.contract.panel_mode == "shipping":
-                return compact_arch35_preload_s2(
-                    context, n_tiles, lambda i, tiles=tiles: self.s2_phases(rect, tiles[i]), lower_phase, place,
-                    compact_fn=compact_periodic_pipeline, preload_slots=FIA_PRELOAD_SLOTS,
-                    pipeline_slots=ARCH35_PIPELINE_SLOTS, cycle_slots=ARCH22_WORKSPACE_SLOTS,
-                    threshold=COMPACT_TILE_THRESHOLD,
-                )
+                if is_a35_decode:
+                    return _ShippingS2(n_tiles, min(FIA_PRELOAD_SLOTS, slots), tile)
+                return _compact_s2_pipeline(context, n_tiles, min(n_tiles, slots), tile)
             return _compact_s2_pipeline(context, n_tiles, max(1, slots), tile)
         if min(n_tiles, slots) > 1 and not self.gm_workspace and self.contract.panel_mode == "shipping":
             if is_a35_decode:
@@ -841,7 +857,7 @@ def dense_fia(
         width = solution.tile_shape.k
         plan = FiaPanelPlan(panels(contract.head_dim, width), panels(contract.v_head_dim, width),
                             1, 2, 2, 1, 1, solution.depth, 1)
-        buffers = tuple((peak.pool, peak.peak_bytes) for peak in solution.pool_peaks if peak.pool != "ub")
+        buffers = tuple((peak.pool, peak.peak_bytes) for peak in solution.pool_peaks)
         ub_peaks = tuple(peak.peak_bytes for peak in solution.pool_peaks if peak.pool == "ub")
         metadata["tile_solution"] = {
             "algorithm": solution.algorithm, "panel_width": width,
