@@ -37,6 +37,7 @@ _STAGE1_CAST_SCRATCH_BYTES_PER_ROW = 32
 _RMS_ACCUMULATOR_LANES = 64
 MK_SPLIT_TILING_KEY = 1000
 M_SPLIT_TILING_KEY = 1001
+_ASCENDC_SYSTEM_WORKSPACE_BYTES = 16 * 1024 * 1024
 _PRE_CUBE_BUFFERS = {'l1': 512 * 1024, 'l0a': 65536, 'l0b': 65536, 'l0c': 262144}
 _K_PARTIAL_EXTRA_REDUCTIONS = 3
 _K_PARTIAL_REDUCTION_THRESHOLD = 4
@@ -208,7 +209,7 @@ def cast_rms_ops(rows, cols, *, accumulate):
                    + lanes + max(0, lanes - 1) + bool(accumulate))
 
 
-def pre_owner(g, owner, *, msplit=False):
+def pre_owner(g, owner, *, msplit=False, round_deps=None):
     """Literal source K-panel/M-tile DAG; one owner = (M core, K part).
 
     ``msplit`` selects the key1001 HcPreMSplitCorePart1 local path: no
@@ -253,11 +254,15 @@ def pre_owner(g, owner, *, msplit=False):
         if rows <= 0:
             break
         m_pad = align(rows, _BF16_ALIGN_ELEMS)
+        # Key1001 assigns ceil(rows/2) to even AIV (sub=0) to match local Stage2 UB;
+        # Key1000 assigns floor(rows/2) to even AIV (hc_pre_m_k_split_core_arch35.h:123).
+        row_split = ((rows + 1) // 2, rows // 2) if msplit else (rows // 2, rows - rows // 2)
         prefix = f'm{tile}.' if m_tiles > 1 else ''
         phases, tails = [], {}
         releases, cubes, operands = [], [], []
         ub_stores = [[], []]
         input_frees = [[], []]
+        prev_round = round_deps[tile - 1] if (round_deps and tile > 0) else (None, None)
         for panel, offset in enumerate(range(0, width, g.k_l1)):
             cols = min(g.k_l1, width - offset)
             reuse = (releases[panel - 2],) if panel >= 2 else ()
@@ -266,12 +271,14 @@ def pre_owner(g, owner, *, msplit=False):
                      (*tile_tail, *reuse) if panel == 0 else reuse,
                      fifo=('weight_read',))
             ready_a = []
-            for sub, count in enumerate((rows // 2, rows - rows // 2)):
+            for sub, count in enumerate(row_split):
                 for chunk, start in enumerate(range(0, cols, g.k_ub)):
                     kk = min(g.k_ub, cols - start)
                     tag = f'{prefix}p{panel}.v{sub}.c{chunk}'
                     input_reuse = ((input_frees[sub][-2],)
                                    if len(input_frees[sub]) >= 2 else ())
+                    if panel == 0 and chunk == 0 and prev_round[sub] is not None:
+                        input_reuse = (*input_reuse, prev_round[sub])
                     load = emit(phases, tails, tag + '.read',
                                 memory(read=count * kk * 2), input_reuse,
                                 aiv=sub, fifo=(f'read{sub}',))
@@ -316,7 +323,7 @@ def pre_owner(g, owner, *, msplit=False):
                                           **({} if msplit else {'hbm': rows * MIXED_COEFFS * FP32_BYTES})}),
                           (cubes[-1],))
         rms = []
-        for sub, count in enumerate((rows // 2, rows - rows // 2)):
+        for sub, count in enumerate(row_split):
             rms.append(emit(phases, tails,
                             f'{prefix}rms_out{sub}',
                             Work() if msplit else memory(write=count * FP32_BYTES),
@@ -374,7 +381,16 @@ def pre_second_owner(g, owner, iterations, *, after=(), msplit=False):
     return tuple(phases)
 
 
-def _msplit_rows(g, m_core):
+def pre_workspace_breakdown(g):
+    """Return ``(payload_bytes, reserved_bytes, total_bytes)`` matching upstream GetWorkspaceSize."""
+    if g.tiling_key != MK_SPLIT_TILING_KEY:
+        return 0, 0, 0
+    payload = g.rows * g.k_parts * PARTIAL_VALUES_PER_ROW * FP32_BYTES
+    reserved = _ASCENDC_SYSTEM_WORKSPACE_BYTES
+    return payload, reserved, payload + reserved
+
+
+def _msplit_tile_rows(g, m_core):
     m_cnt = ceil(g.rows / g.m_l1)
     single_round = ceil(m_cnt / g.m_dim)
     main = m_cnt % g.m_dim
@@ -382,41 +398,104 @@ def _msplit_rows(g, m_core):
         start = m_core * single_round * g.m_l1
         tiles = single_round
     else:
-        start = (main * single_round + (m_core - main)
-                 * (single_round - 1)) * g.m_l1
+        start = (main * single_round + (m_core - main) * (single_round - 1)) * g.m_l1
         tiles = single_round - 1
-    return start, min(tiles * g.m_l1, g.rows - start)
+    result = []
+    for tile in range(tiles):
+        rows = min(g.m_l1, g.rows - (start + tile * g.m_l1))
+        if rows <= 0:
+            break
+        result.append(rows)
+    return tuple(result)
+
+
+def _msplit_second_with_tails(g, m_core, iterations, *, after=()):
+    """Build per-round key1001 Stage2 phases plus per-round terminal phase names per AIV."""
+    tile_rows = _msplit_tile_rows(g, m_core)
+    m_tiles = len(tile_rows)
+    phases = []
+    round_tails = [[None, None] for _ in range(m_tiles)]
+    for sub in range(2):
+        owner = 2 * m_core + sub
+        first_tp = 'm0.' if m_tiles > 1 else ''
+        first_deps = tuple(after) if after else (f'{first_tp}projection_local', f'{first_tp}rms_out{sub}')
+        base_name = f'v{sub}.base'
+        phases.append(Phase(base_name, memory(read=MIXED_COEFFS * FP32_BYTES), first_deps, owner, g.aivs))
+        prev_tail = base_name
+        for tile, rows in enumerate(tile_rows):
+            count = (rows + 1) // 2 if sub == 0 else rows // 2
+            if count <= 0:
+                continue
+            tp = f'm{tile}.' if m_tiles > 1 else ''
+            entry_deps = (prev_tail,) if tile == 0 else (
+                prev_tail, f'{tp}projection_local', f'{tp}rms_out{sub}',
+            )
+            clone = replace(g, rows=count, k_parts=1, row_former=count,
+                            row_factor=min(g.row_factor, count))
+            local = pre_second_owner(clone, 0, iterations, after=(), msplit=True)
+            prefix = f'v{sub}.m{tile}.' if m_tiles > 1 else f'v{sub}.'
+            for phase in local[1:]:
+                mapped_after = []
+                for dep in phase.after:
+                    if dep == 'base':
+                        mapped_after.extend(entry_deps)
+                    else:
+                        mapped_after.append(prefix + dep)
+                phases.append(replace(
+                    phase,
+                    name=prefix + phase.name,
+                    after=tuple(dict.fromkeys(mapped_after)),
+                    owner=owner,
+                ))
+            prev_tail = phases[-1].name
+            round_tails[tile][sub] = prev_tail
+    return tuple(phases), tuple((t[0], t[1]) for t in round_tails)
 
 
 def pre_msplit_second(g, m_core, iterations, *, after=()):
-    """key1001 local vector post stage; one AIC and two AIVs, no K partials."""
-    _, rows = _msplit_rows(g, m_core)
-    phases = []
-    for sub in range(2):
-        count = rows // 2 + (1 if sub == 0 and rows % 2 else 0)
-        clone = replace(g, rows=count, k_parts=1, row_former=max(1, count),
-                        row_factor=min(g.row_factor, max(1, count)))
-        local = pre_second_owner(clone, 0, iterations, after=after, msplit=True)
-        owner = 2 * m_core + sub
-        phases.extend(replace(phase, owner=owner) for phase in local)
-    return tuple(phases)
+    """key1001 local vector post stage; one AIC and two AIVs, per M-tile round."""
+    phases, _ = _msplit_second_with_tails(g, m_core, iterations, after=after)
+    return phases
 
 
 def pre_msplit_parts(g, iterations):
-    """Key1001 local stage1 owner DAG and its unchanged stage2 vector part."""
+    """Key1001 per-round Stage1 and local Stage2 DAGs preserving private UB lifetimes."""
     parts = []
     for m_core in range(g.m_dim):
-        local = pre_owner(g, m_core, msplit=True)
-        tails = tuple(phase.name for phase in local
-                      if phase.name.endswith('projection_local')
-                      or '.rms_out' in phase.name or phase.name.startswith('rms_out'))
-        parts.append((tuple(local), pre_msplit_second(
-            g, m_core, iterations, after=tails)))
+        second, round_tails = _msplit_second_with_tails(g, m_core, iterations)
+        local = pre_owner(g, m_core, msplit=True, round_deps=round_tails)
+        parts.append((tuple(local), second))
     return tuple(parts)
 
 
+def _order_msplit_phases(stage1, stage2):
+    """Interleave multi-M-tile key1001 rounds in topological execution order."""
+    if not any(p.name.startswith('m0.') for p in stage1):
+        return stage1 + stage2
+    s1_by_tile = {}
+    for p in stage1:
+        tile = int(p.name.split('.', 1)[0][1:])
+        s1_by_tile.setdefault(tile, []).append(p)
+    bases = []
+    s2_by_tile = {}
+    for p in stage2:
+        parts = p.name.split('.')
+        if len(parts) == 2 and parts[1] == 'base':
+            bases.append(p)
+        else:
+            tile = int(parts[1][1:])
+            s2_by_tile.setdefault(tile, []).append(p)
+    ordered = []
+    for tile in sorted(s1_by_tile):
+        ordered.extend(s1_by_tile[tile])
+        if tile == 0:
+            ordered.extend(bases)
+        ordered.extend(s2_by_tile.get(tile, ()))
+    return tuple(ordered)
+
+
 def pre_msplit_groups(g, iterations):
-    return tuple(first + second for first, second in pre_msplit_parts(g, iterations))
+    return tuple(_order_msplit_phases(first, second) for first, second in pre_msplit_parts(g, iterations))
 
 
 def pre_program(g, first, second, context, *, compact=False, parts=None):
@@ -431,8 +510,8 @@ def pre_program(g, first, second, context, *, compact=False, parts=None):
         alloc += allocations(context, 'pre_msplit', {'ub': ub},
                              range(2 * g.m_dim), g.aivs)
         def group_program(stage1, stage2):
-            if not compact:
-                return phase_program(stage1 + stage2, context)
+            if not compact or any(p.name.startswith('m0.') for p in stage1):
+                return phase_program(_order_msplit_phases(stage1, stage2), context)
             owner = first_owner(g, stage1, context, terminal='projection_local')
             stages = owner.stages + phase_program(stage2, context).stages
             return KernelProgram(stages)
@@ -450,6 +529,13 @@ def _pre_program_key1000(g, first, second, context, *, compact=False):
     first_alloc = allocations(context, 'pre1', _PRE_CUBE_BUFFERS, range(g.cores), g.cores)
     first_alloc += allocations(context, 'pre1', {'ub': g.first_ub}, range(g.aivs), g.aivs)
     second_alloc = allocations(context, 'pre2', {'ub': g.second_ub}, range(g.aivs), g.aivs)
+    _, _, ws_bytes = pre_workspace_breakdown(g)
+    ws_alloc = ()
+    if ws_bytes > 0 and 'workspace' in context.pool_names:
+        ws_alloc = (context.allocate(
+            'pre:workspace', 'workspace', ws_bytes,
+            unit_group(0, g.cores, context.pool_units.get('workspace', 1)),
+        ),)
     finite = compact and g.m_tiles == 1 and finite_template_available()
     if finite:
         # Same source Phase classes, now repeated by the existing ordered
@@ -459,12 +545,19 @@ def _pre_program_key1000(g, first, second, context, *, compact=False):
     else:
         owners=tuple(first_owner(g,p,context) if compact else
                      phase_program(p, context) for p in first)
-    return KernelProgram((
-        Stage('source_stage1', acquire=first_alloc, free=first_alloc,
+    stage1_after = ('workspace_acquire',) if ws_alloc else ()
+    stages = []
+    if ws_alloc:
+        stages.append(Stage('workspace_acquire', acquire=ws_alloc))
+    stages.extend((
+        Stage('source_stage1', after=stage1_after, acquire=first_alloc, free=first_alloc,
               program=ParallelProgram(owners)),
         Stage('source_stage2', after=('source_stage1',), acquire=second_alloc, free=second_alloc,
               program=ParallelProgram(tuple(phase_program(p, context) for p in second))),
     ))
+    if ws_alloc:
+        stages.append(Stage('workspace_release', after=('source_stage2',), free=ws_alloc))
+    return KernelProgram(tuple(stages))
 
 
 def _iterations_from_context(g, context):

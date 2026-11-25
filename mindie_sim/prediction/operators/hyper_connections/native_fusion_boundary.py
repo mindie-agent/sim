@@ -284,7 +284,10 @@ def fusion_typed_context(
     }
 
 
-def w4a8_metadata(declaration, members, outputs, configuration, selection, described):
+def w4a8_metadata(
+    declaration, members, outputs, configuration, selection, described, *,
+    external_output_names=(),
+):
     """Build ``w4a8_msd`` native fusion metadata dictionary."""
     anchor = members[-1]
     producer = dict(members[0].metadata)
@@ -316,7 +319,9 @@ def w4a8_metadata(declaration, members, outputs, configuration, selection, descr
             }
             for member in members
         ],
-        "fusion_external_outputs": outputs,
+        "fusion_external_outputs": list(outputs),
+        **({"fusion_external_output_names": tuple(external_output_names)}
+           if external_output_names else {}),
         "fusion_role": declaration["role"],
         "fusion_tensor_view": declaration["tensor_view"],
         "fusion_program_profile": described["profile"],

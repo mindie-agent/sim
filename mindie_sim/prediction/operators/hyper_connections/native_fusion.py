@@ -288,7 +288,9 @@ def _lower_program_profile(
         total = w4a8.work_from_config(config)
         metadata = _w4a8_metadata(
             declaration, members, outputs, configuration, selection,
-            w4a8.describe(config))
+            w4a8.describe(config),
+            external_output_names=tuple(value["port"] for value in external["values"]),
+        )
         fused_recipe = w4a8.RECIPE
         coverage = "declared_w4a8_msd_program"
     context = _fusion_typed_context(
@@ -600,10 +602,7 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None, public_outputs=()):
         external = external_value_plan(original, members, values_by_id,
                                        public_outputs=public_outputs,
                                        consumer_map=consumer_map)
-        legacy_outputs = [member.op_id for member in members
-                          if users[member.op_id] - ids
-                          or not users[member.op_id] & ids]
-        outputs = legacy_outputs
+        outputs = list(external["member_ids"])
         for member in members:
             if member.op_id not in external["member_ids"]:
                 continue

@@ -668,10 +668,12 @@ def make_op(
     padded = (padded_tokens, cfg.dim)
     active_tokens = 0
     active_seqs = 0
+    warm_slots: set[tuple[str, int]] = set()
     for seq in range(cfg.batch):
         seq_len = cfg.qsl[seq + 1] - cfg.qsl[seq]
         if seq_len <= 0:
             continue
+        cache_idx = seq
         if cfg.cache_index_present and cfg.cache_indices is not None:
             cache_idx = cfg.cache_indices[seq]
             if cache_idx == cfg.pad_slot_id or (
@@ -680,10 +682,13 @@ def make_op(
                 continue
         active_tokens += seq_len
         active_seqs += 1
+        if cfg.has_init(seq):
+            warm_slots.add(("slot", cache_idx) if cache_idx is not None else ("seq", seq))
     elem_bytes = _dtype_width(cfg.dtype)
+    weight_and_bias_rows = (cfg.width + int(cfg.bias)) if active_tokens > 0 else 0
+    init_history_rows = len(warm_slots) * cfg.history_count
     conv_reads = float(
-        active_tokens * cfg.dim * elem_bytes
-        + (cfg.width * cfg.dim * elem_bytes if active_tokens > 0 else 0)
+        (active_tokens + weight_and_bias_rows + init_history_rows) * cfg.dim * elem_bytes
     )
     conv_writes = float(
         active_tokens * cfg.dim * elem_bytes

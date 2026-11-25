@@ -895,12 +895,24 @@ def build_governed_bindings(
     return precision_abi, kernel_binding, owner_schedule
 
 
+def _contract_work_rows(op: OpSpec, kind: str) -> int:
+    shape = op.local_shape or op.semantic_shape
+    if kind in ABI_NAMES and shape:
+        contract, _ = operator_contract(op, kind)
+        if isinstance(contract, (MhcContract, TextGatedResidualContract)):
+            return int(contract.rows)
+        if isinstance(contract, AttnResContract):
+            return int(contract.tokens)
+        if isinstance(contract, EngramGateContract):
+            return int(contract.tokens) * int(contract.branches)
+    return int(shape[0]) if shape else 0
+
+
 def _owner_schedule_from_plan(
     op: OpSpec, ctx: OperatorPlanningContext, plan: OperatorPlan,
     kind: str, meta: Mapping[str, Any],
 ) -> OwnerScheduleSpec:
-    shape = op.local_shape or op.semantic_shape
-    rows = int(shape[0]) if shape else 0
+    rows = _contract_work_rows(op, kind)
     total_aiv = max(0, int(ctx.effective_aiv_cores))
     total_aic = max(0, int(ctx.effective_aic_cores))
     uses_aic = bool(plan.work.matrix)
@@ -908,7 +920,12 @@ def _owner_schedule_from_plan(
     total_owners = total_aiv if owner_kind != "aic" else total_aic
     launched = min(rows, total_owners) if rows > 0 and total_owners > 0 else 0
     max_tiles = _ceil(rows, launched) if launched > 0 else 0
-    active = _ceil(rows, max_tiles) if max_tiles > 0 else 0
+    # Only token-local attn_res_fwd assigns fixed contiguous ceil(rows/owners) chunks;
+    # grid/row-sharded kernels (engram_gate, hc_*, text_gated_residual) populate all launched owners.
+    if kind == "attn_res_fwd":
+        active = _ceil(rows, max_tiles) if max_tiles > 0 else 0
+    else:
+        active = launched
     ub_cap = int(meta.get("ub_bytes") or dict(ctx.datapath.buffers).get("ub", 0) or 0)
     res_map = plan.work.resources
     mte2_total = float(res_map.get("mte2_aiv", 0.0) + res_map.get("mte2_aic", 0.0) + res_map.get("mte2", 0.0))
