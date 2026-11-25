@@ -41,7 +41,6 @@ def _prov(kind, architecture, basis, source):
 _2201_SOURCE = "registered A2/A3 profile npu_arch=2201 and design 4.7"
 _3510_SOURCE = ("data/observations/sources/arch3510-physical-services/"
                 "platform-units/npu_arch_3510.md")
-_COMMON_FORMATS = ("bf16", "fp16", "fp32")
 
 
 def _storage_representations(architecture, source, *, fp8_operand,

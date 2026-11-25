@@ -8,6 +8,11 @@ from __future__ import annotations
 
 import math
 
+from .moe import (
+    MOE_FUSION_TYPES, QUANT_FUSION_TYPES,
+    moe_fusion_contract, moe_fusion_scope,
+    quant_fusion_contract, quant_fusion_scope,
+)
 from .vocabulary import native_tensor_contract, native_tensor_diagnostic
 
 
@@ -205,8 +210,6 @@ def fused_contract_diagnostic(row):
         "unobserved_fields": list(UNOBSERVED_FIELDS[row.kind]),
     }
 
-
-import math
 
 LIGHTNING_QUERY_RANK = 3
 LIGHTNING_CACHE_RANK = 4
@@ -518,13 +521,6 @@ def subgraph_contract_scope(row):
         "excluded_capture_missing_fields": missing_auxiliary,
         "optional_query_norm_limit": "Empty recorded outputs are compared; the scalar flag is not observed.",
     }
-
-
-import math
-
-from .vocabulary import native_tensor_contract, native_tensor_diagnostic
-from .moe import MOE_FUSION_TYPES, moe_fusion_contract, moe_fusion_scope
-from .moe import QUANT_FUSION_TYPES, quant_fusion_contract, quant_fusion_scope
 
 
 QUANT_INDEXER = "VllmAscendQuantLightningIndexerV2"

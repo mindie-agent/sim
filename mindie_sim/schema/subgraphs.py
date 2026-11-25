@@ -26,7 +26,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -136,39 +135,6 @@ EVENT_PORT_KINDS = frozenset({
     "ready", "complete", "commit", "release", "grant", "record", "wait",
 })
 
-#: Fusion membership may never cross these boundaries.
-_FUSION_BOUNDARIES = frozenset({"stream", "stage", "phase", "capture"})
-
-
-def _freeze_value(item: Any, reason: str) -> Any:
-    if item is None or isinstance(item, (bool, int, float, str)):
-        return item
-    if isinstance(item, Mapping):
-        raise ModelingError(f"{reason}:mapping_value_invalid")
-    if isinstance(item, (tuple, list)):
-        return tuple(_freeze_value(sub, reason) for sub in item)
-    raise ModelingError(f"{reason}:mutable_value_invalid:{type(item).__name__}")
-
-
-def _tuple_of_pairs(value: Any, reason: str) -> tuple[tuple[str, Any], ...]:
-    """Normalise a mapping or iterable of pairs into sorted immutable pairs."""
-    if not value:
-        return ()
-    if isinstance(value, dict) or isinstance(value, Mapping):
-        value = tuple(value.items())
-    try:
-        pairs = tuple((str(key), _freeze_value(item, reason)) for key, item in value)
-    except ModelingError:
-        raise
-    except (TypeError, ValueError) as exc:
-        raise ModelingError(reason) from exc
-    seen: set[str] = set()
-    for key, _ in pairs:
-        if not key or key in seen:
-            raise ModelingError(f"{reason}:duplicate_or_empty:{key}")
-        seen.add(key)
-    return tuple(sorted(pairs))
-
 
 def _typed_port_tuple(value: Any, cls: type, reason: str) -> tuple:
     if value is None:
@@ -182,10 +148,6 @@ def _typed_port_tuple(value: Any, cls: type, reason: str) -> tuple:
     if len(set(names)) != len(names):
         raise ModelingError(f"{reason}:duplicate_port")
     return result
-
-
-def _port_tuple(value: Any, reason: str) -> tuple["StatePortSpec", ...]:
-    return _typed_port_tuple(value, StatePortSpec, reason)
 
 
 @dataclass(frozen=True)

@@ -269,23 +269,13 @@ class Link:
                 or self.switch_hops < 0 or not math.isfinite(self.switch_hop_latency_us)
                 or self.switch_hop_latency_us < 0):
             raise ModelingError(f"link_switch_latency_invalid:{self.name}")
-        if (self.switch_capacity_bytes_per_ms is not None
-                and (not math.isfinite(self.switch_capacity_bytes_per_ms)
-                     or self.switch_capacity_bytes_per_ms <= 0)):
-            raise ModelingError(f"link_switch_capacity_invalid:{self.name}")
-        utilization = self.bw_utilization
-        if (not isinstance(utilization, (int, float)) or isinstance(utilization, bool)
-                or not math.isfinite(float(utilization)) or float(utilization) <= 0):
-            raise ModelingError(f"link_bw_utilization_invalid:{self.name}")
-        if float(utilization) > 1.0:
+        if self.switch_capacity_bytes_per_ms is not None:
+            _positive_float(self.switch_capacity_bytes_per_ms, f"link_switch_capacity_invalid:{self.name}")
+        if _positive_float(self.bw_utilization, f"link_bw_utilization_invalid:{self.name}") > 1.0:
             raise ModelingError("link_bw_utilization_exceeds_unity")
-        if not math.isfinite(self.capacity_bytes_per_ms) or self.capacity_bytes_per_ms <= 0:
-            raise ModelingError(f"link_rate_invalid:{self.name}")
+        _positive_float(self.capacity_bytes_per_ms, f"link_rate_invalid:{self.name}")
         if self.peak_capacity_bytes_per_ms is not None:
-            peak = self.peak_capacity_bytes_per_ms
-            if (not isinstance(peak, (int, float)) or isinstance(peak, bool)
-                    or not math.isfinite(float(peak)) or float(peak) <= 0):
-                raise ModelingError(f"link_peak_capacity_invalid:{self.name}")
+            peak = _positive_float(self.peak_capacity_bytes_per_ms, f"link_peak_capacity_invalid:{self.name}")
             if self.capacity_bytes_per_ms > peak:
                 raise ModelingError(f"link_effective_capacity_exceeds_peak:{self.name}")
         if self.scope is not None:
@@ -308,9 +298,7 @@ class Link:
             if (isinstance(rank, bool) or not isinstance(rank, int) or rank < 0
                     or rank in seen):
                 raise ModelingError(f"link_endpoint_rank_invalid:{self.name}")
-            if (isinstance(rate, bool) or not isinstance(rate, (int, float))
-                    or not math.isfinite(float(rate)) or float(rate) <= 0):
-                raise ModelingError(f"link_endpoint_rate_invalid:{self.name}")
+            _positive_float(rate, f"link_endpoint_rate_invalid:{self.name}")
             seen.add(rank)
         if seen and not seen <= set(self.members):
             raise ModelingError(f"link_endpoint_member_unknown:{self.name}")
@@ -510,6 +498,10 @@ def apply_network_overrides(links, raw: Mapping, *,
 _CHANNEL_BANDWIDTH_TIERS = (
     "effective_uni_bw_gbps", "calibrated_uni_bw_gbps", "derived_uni_bw_gbps", "uni_peak_bw_gbps",
 )
+_LINK_BANDWIDTH_KEYS = (
+    *_CHANNEL_BANDWIDTH_TIERS, "gbps", "capacity_gbps",
+    "capacity_bytes_per_ms", "peak_capacity_bytes_per_ms",
+)
 
 
 def _channel_rate_gbps(record):
@@ -604,8 +596,7 @@ def _neutral_transfer_channel_links(raw, placements):
         record = dict(channel)
         if not {"latency_us", "alpha_us"} & record.keys() and raw.get(f"{kind}_latency_us") is not None:
             record["latency_us"] = raw[f"{kind}_latency_us"]
-        if not {*_CHANNEL_BANDWIDTH_TIERS, "gbps", "capacity_gbps",
-                "capacity_bytes_per_ms", "peak_capacity_bytes_per_ms"} & record.keys():
+        if not set(_LINK_BANDWIDTH_KEYS) & record.keys():
             if raw.get(f"{kind}_bw_bytes_per_s") is not None:
                 record["peak_capacity_bytes_per_ms"] = raw[f"{kind}_bw_bytes_per_s"] * BYTES_PER_S_TO_BYTES_PER_MS
             elif raw.get(f"{kind}_bw_gbps") is not None:

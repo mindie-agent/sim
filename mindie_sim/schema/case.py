@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field, fields
-import json
 from typing import Any
 
 from .hardware import Hardware

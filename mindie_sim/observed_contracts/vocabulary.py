@@ -7,12 +7,15 @@
 [Side-Effect Policy] Read-only."""
 from __future__ import annotations
 
+from collections import defaultdict
+from collections.abc import Mapping, Sequence
+import hashlib
+import json
+from typing import Any
+
+
 class StructureTargetError(ValueError):
     """A declared structure carrier is not a valid target set."""
-
-
-from collections.abc import Mapping as _AbcMapping
-from typing import Any
 
 
 CARRIER_MAX_NESTING_DEPTH = 64
@@ -48,7 +51,7 @@ def _snapshot_structure_carrier(value: Any, name: str = "structure metadata", _d
                 for item in value
             ]
         return [_snapshot_structure_carrier(item, name, _depth + 1) for item in value]
-    if isinstance(value, _AbcMapping):
+    if isinstance(value, Mapping):
         try:
             _ = len(value)
             out = {}
@@ -285,8 +288,6 @@ def mismatch_diagnostic(contract, declared):
     }
 
 
-from typing import Any
-
 _MISSING_TEXT = frozenset({"", "N/A", "NULL", "NONE", "UNDEFINED"})
 _UNDEFINED_DTYPES = frozenset({"", "N/A", "NULL", "NONE", "UNDEFINED", "DT_UNDEFINED"})
 _ATTENTION_AUX_DTYPES = frozenset(
@@ -422,11 +423,6 @@ _DECLARED_INPUT_DTYPE_ROLES: tuple[tuple[str, frozenset[str]], ...] = (
     ("index_dtype", frozenset({"indices", "sparse_indices"})),
 )
 
-
-import hashlib
-import json
-from collections.abc import Mapping, Sequence
-
 ABI_SCHEMA = "mindie-native-tensor-abi/1"
 
 DTYPES = {
@@ -461,8 +457,6 @@ DTYPES = {
     "MXFP4": "fp4_e2m1", "float4_e2m1": "fp4_e2m1",
 }
 _MISSING = {"", "N/A", "NULL", "UNDEFINED", "DT_UNDEFINED"}
-_EMPTY_DTYPES = {"UNDEFINED", "DT_UNDEFINED"}
-_EMPTY_FORMATS = {"NULL", "UNDEFINED"}
 
 
 def _missing_layout(value):
@@ -840,11 +834,6 @@ def native_abi_identity(record):
     if digest is None or not isinstance(operator, str) or not operator:
         return None
     return {"native_operator": operator, "native_abi_sha256": digest}
-
-
-from collections import defaultdict
-from collections.abc import Mapping, Sequence
-
 
 
 class StructureTargets:

@@ -40,12 +40,6 @@ class FeasibilityError(ValueError):
     """A structural graph contract is violated (not a rejected candidate)."""
 
 
-def _align(value: int, alignment: int = UB_ALIGNMENT) -> int:
-    if alignment < 1:
-        raise FeasibilityError("alignment_must_be_positive")
-    return int(math.ceil(max(0, value) / alignment) * alignment)
-
-
 def _numel(shape: tuple[int, ...]) -> int:
     total = 1
     for dim in shape:

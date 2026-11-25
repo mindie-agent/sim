@@ -101,14 +101,11 @@ def router_contract_scope(row):
                          "token_ids", "hash_table_capacity_dtype_and_values"],
         "normalization_scope": (
             "Hash source call uses renorm=0; any declared top-k renormalization is external"
-            if row.kind == "MoeGatingTopKHash" else
+            if hash_router else
             "TopK supports internal renormalization; the scalar mode is not captured"),
         "excluded_semantic_work": ["router_logits_matrix_multiplication"],
         "occurrence_identity": False,
     }
-
-
-from .vocabulary import native_tensor_contract, native_tensor_diagnostic
 
 
 MATRIX_BODY_TYPES = {"QuantBatchMatmulV3", "QuantBatchMatmulV4", "GroupedMatmul"}

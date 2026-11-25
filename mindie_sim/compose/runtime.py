@@ -494,15 +494,6 @@ def filter_fp4_norm_quant_domain(
     return out
 
 
-def _execution_policy(case: Mapping[str, Any]) -> dict[str, Any]:
-    """Resolved execution policy stored by ``compose_case`` on the declaration."""
-    runtime = case.get("runtime") if isinstance(case, Mapping) else None
-    if not isinstance(runtime, Mapping):
-        return {}
-    policy = dict(runtime.get("metadata") or {}).get("execution_policy")
-    return dict(policy) if isinstance(policy, Mapping) else {}
-
-
 def _resolve_va_mla_prolog_lowering(
     model_spec: ModelSpec,
     *,

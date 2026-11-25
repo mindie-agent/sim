@@ -43,9 +43,6 @@ from mindie_sim.compose.inputs import (
     _apply_quant_override,
     _apply_structural_overrides,
     _arch_key,
-    _ensure_registered_profiles,
-    _hardware_backend,
-    _read_config_json,
     _resolve_hardware,
     _resolve_max_position_embeddings,
     _resolve_model_spec,
@@ -63,7 +60,6 @@ from mindie_sim.compose.inputs import (
 from mindie_sim.compose.runtime import (
     PIECEWISE_CAPTURE_BASE_KEYS,
     _bind_case_contracts,
-    _execution_policy,
     _resolve_stack_plans,
     _resolve_va_lowerings,
     _supports_sequence_parallel,
@@ -92,7 +88,6 @@ from mindie_sim.schema.case import Case
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.scenario import (
-    DEPLOYMENT_MODES,
     ConcurrencyLimits,
     ReadyStateAssumption,
     SLAContract,
@@ -201,7 +196,7 @@ def _materialize_machine(
     if preset:
         machine_input["topology_preset"] = preset
     if "device" in machine_input and "links" in machine_input:
-        from mindie_sim.schema.hardware import Link, apply_network_overrides
+        from mindie_sim.schema.hardware_links import Link, apply_network_overrides
         parsed_links = tuple(
             Link.from_mapping(l, default_members=range(resolved_devices))
             for l in machine_input["links"]
@@ -1175,7 +1170,7 @@ def _prepare_stack_binding(
             "eff_role": eff_role,
             "eff_phase": eff_phase,
             "norm_role": norm_role,
-            "requested_options": dict(req_opts),
+            "requested_options": req_opts,
             "field_origins": {},
             "prompt_tokens": scenario_options.get("prompt_tokens"),
             "concurrency": scenario_options.get("concurrency"),

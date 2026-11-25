@@ -8,23 +8,30 @@
 from __future__ import annotations
 
 from collections import Counter
+from typing import Any, Mapping
 from typing import Any as Event
-from typing import Mapping
 
+from .attention import (
+    ATTENTION_CACHE_TYPES, attention_contract_diagnostic, attention_contract_scope,
+    observed_attention_contract,
+)
+from .fusion import (
+    FUSED_TYPES, FUSION_TYPES, fused_contract_diagnostic, fused_contract_scope,
+    fusion_contract_diagnostic, fusion_contract_scope, observed_fused_contract,
+    observed_fusion_contract,
+)
+from .matrix import (
+    MATRIX_BODY_TYPES, ROUTER_TYPES, matrix_contract_diagnostic, matrix_contract_scope,
+    observed_matrix_contract, observed_router_contract, router_contract_diagnostic,
+    router_contract_scope,
+)
 from .vocabulary import (
-    _ATTENTION_AUX_DTYPES,
-    _AUX_ONLY_ROLES,
-    _INPUT_ROLE_ORDER,
-    _MISSING_TEXT,
-    _NON_CONTIGUOUS_FORMATS,
-    _OUTPUT_ROLE_ORDER,
-    _PARTIAL_CACHE_ROLES,
-    _PRIMARY_INPUT_KEYS,
-    _QUANTIZE_FAMILIES,
-    _ROLE_DTYPE_KEYS,
-    _TAIL_INPUT_ROLES,
-    _UNDEFINED_DTYPES,
-    _norm_dtype,
+    DTYPES, LAYOUT_BODY_TYPES, _ATTENTION_AUX_DTYPES, _AUX_ONLY_ROLES, _COARSE_SHAPE_KEYS,
+    _DECLARED_INPUT_DTYPE_ROLES, _INPUT_ROLE_ORDER, _MISSING_TEXT, _NON_CONTIGUOUS_FORMATS,
+    _OUTPUT_ROLE_ORDER, _OUTPUT_SHAPE_KEYS, _PARTIAL_CACHE_ROLES, _PRIMARY_INPUT_KEYS,
+    _QUANTIZE_FAMILIES, _ROLE_DTYPE_KEYS, _TAIL_INPUT_ROLES, _UNDEFINED_DTYPES, _norm_dtype,
+    layout_contract_diagnostic, layout_contract_scope, native_tensor_contract,
+    observed_layout_contract,
 )
 
 
@@ -320,24 +327,6 @@ def native_call_signature_match(binding: Mapping[str, Any], event: Event) -> boo
 __all__ = ["event_signature", "native_call_signature_match", "parse_paired_lanes"]
 
 
-from collections import Counter
-from typing import Any, Mapping
-
-from .vocabulary import (
-    _ATTENTION_AUX_DTYPES,
-    _AUX_ONLY_ROLES,
-    _COARSE_SHAPE_KEYS,
-    _DECLARED_INPUT_DTYPE_ROLES,
-    _INPUT_ROLE_ORDER,
-    _OUTPUT_SHAPE_KEYS,
-    _PARTIAL_CACHE_ROLES,
-    _PRIMARY_INPUT_KEYS,
-    _ROLE_DTYPE_KEYS,
-    _TAIL_INPUT_ROLES,
-    _norm_dtype,
-)
-
-
 def _counter_leq(left: Counter[Any], right: Counter[Any]) -> bool:
     return all(left[key] <= right[key] for key in left)
 
@@ -556,27 +545,6 @@ def _match_input_dtypes(
         return False
     return True if len(set(obs_seq)) <= 1 else None
 
-
-from .vocabulary import DTYPES, native_tensor_contract
-from .fusion import (
-    FUSED_TYPES, fused_contract_diagnostic, fused_contract_scope, observed_fused_contract,
-)
-from .attention import (
-    ATTENTION_CACHE_TYPES, attention_contract_diagnostic, attention_contract_scope,
-    observed_attention_contract,
-)
-from .fusion import (
-    FUSION_TYPES, fusion_contract_diagnostic, fusion_contract_scope, observed_fusion_contract,
-)
-from .vocabulary import (
-    LAYOUT_BODY_TYPES, layout_contract_diagnostic, layout_contract_scope, observed_layout_contract,
-)
-from .matrix import (
-    ROUTER_TYPES, router_contract_diagnostic, router_contract_scope, observed_router_contract,
-)
-from .matrix import (
-    MATRIX_BODY_TYPES, matrix_contract_diagnostic, matrix_contract_scope, observed_matrix_contract,
-)
 
 GDN_NATIVE_TYPES = {"ChunkGatedDeltaRuleFwdPrepare", "ChunkFwdH", "ChunkFwdO"}
 MATRIX_TYPES = {"MatMulV2", "MatMulV3"}

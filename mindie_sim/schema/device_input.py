@@ -541,12 +541,8 @@ def _merge_service_modes(base, declared, ratios):
     return merged
 
 
-def _update_cacheline_supply(device, patch):
+def _update_cacheline_supply(device):
     """Redistribute the inherited HBM line service when its bus or owner count changes."""
-    if not ("hbm" in patch.get("rates", {}) or "resource_units" in patch or "compute_units" in patch):
-        return
-    if HBM_CACHELINE_SERVICE in patch.get("compute_arch", {}).get("instruction_services", {}):
-        return
     arch = device.get("compute_arch", {})
     services = arch.get("instruction_services", {})
     service = services.get(HBM_CACHELINE_SERVICE)
@@ -567,7 +563,10 @@ def merge_device_inputs(*declarations):
     for raw in declarations:
         data = _normalize(raw)
         _normalize_l2(data, result.get("buffers", {}))
-        patch = data.copy()
+        resync_cacheline = (
+            ("hbm" in data.get("rates", {}) or "resource_units" in data or "compute_units" in data)
+            and HBM_CACHELINE_SERVICE not in data.get("compute_arch", {}).get("instruction_services", {})
+        )
         changed_preset = False
         if "compute_arch" in data:
             previous_arch = result.get("compute_arch", {})
@@ -618,7 +617,8 @@ def merge_device_inputs(*declarations):
             data["physical_mechanisms"] = _merge_physical_mechanisms(
                 result.get("physical_mechanisms"), data["physical_mechanisms"])
         result.update(data)
-        _update_cacheline_supply(result, patch)
+        if resync_cacheline:
+            _update_cacheline_supply(result)
     return result
 
 

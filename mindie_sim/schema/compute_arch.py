@@ -21,6 +21,7 @@ import math
 
 from .common import ModelingError
 from .compute_arch_presets import CAPABILITY_PRESETS
+from .compute_peak_aliases import canonical_format
 from .device_input import HBM_CACHELINE_SERVICE
 
 
@@ -47,9 +48,6 @@ def _positive_int(value, reason):
     if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ModelingError(f"{reason}:{value}")
     return value
-
-
-from .compute_peak_aliases import canonical_format  # noqa: E402
 
 
 @dataclass(frozen=True)

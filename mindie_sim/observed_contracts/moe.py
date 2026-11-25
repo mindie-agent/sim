@@ -6,6 +6,8 @@
 [Side-Effect Policy] Read-only."""
 from __future__ import annotations
 
+import math
+
 QUANT_FUSION_TYPES = {"DynamicQuant", "DynamicQuantV2", "AddRmsNormDynamicQuant", "RmsNormCast"}
 _FLOAT = {"bf16", "fp16"}
 _EMPTY = ((), None, None)
@@ -99,9 +101,6 @@ def quant_fusion_scope(kind):
                      "primary_quantized_residual_and_scale_slots"],
         "not_compared": [*scope["not_compared"], "auxiliary_mask_output_values"],
     }
-
-
-import math
 
 
 MOE_FUSION_TYPES = {

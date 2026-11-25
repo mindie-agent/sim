@@ -123,22 +123,22 @@ def _normalise_cp_plan(value: Any, cp: int, pcp: int, tp: int) -> str:
     if plan == "dsa_cp":
         # DSA-CP is query-token SP over the TP group; it is neither DCP nor
         # PCP, and both exclusions are reported with their own reason.
-        if int(cp) > 1:
+        if cp > 1:
             raise ModelingError("dsa_cp_query_token_sp_excludes_dcp")
-        if int(pcp) > 1:
+        if pcp > 1:
             raise ModelingError("dsa_cp_query_token_sp_excludes_pcp")
-        if int(tp) <= 1:
+        if tp <= 1:
             raise ModelingError("dsa_cp_query_token_sp_requires_tp")
         return plan
-    if int(pcp) > 1 and plan not in {"pcp", CP_PLAN_PCP_DCP}:
+    if pcp > 1 and plan not in {"pcp", CP_PLAN_PCP_DCP}:
         raise ModelingError(f"pcp_requires_pcp_plan:{plan}")
-    if int(pcp) <= 1 and plan in {"pcp", CP_PLAN_PCP_DCP}:
+    if pcp <= 1 and plan in {"pcp", CP_PLAN_PCP_DCP}:
         raise ModelingError("pcp_plan_requires_pcp")
-    if int(cp) > 1 and plan not in {"dcp", CP_PLAN_PCP_DCP}:
+    if cp > 1 and plan not in {"dcp", CP_PLAN_PCP_DCP}:
         raise ModelingError(f"cp_requires_dcp_plan:{plan}")
-    if plan == "dcp" and int(cp) <= 1:
+    if plan == "dcp" and cp <= 1:
         raise ModelingError("dcp_plan_requires_cp")
-    if plan == CP_PLAN_PCP_DCP and int(cp) <= 1:
+    if plan == CP_PLAN_PCP_DCP and cp <= 1:
         raise ModelingError("pcp_dcp_plan_requires_cp")
     return plan
 
@@ -244,9 +244,7 @@ class ParallelSpec:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ModelingError(f"{name}_invalid:{value}")
-        cp, dcp = int(self.cp), int(self.dcp)
-        if cp < 1 or dcp < 1:
-            raise ModelingError("cp_invalid")
+        cp, dcp = self.cp, self.dcp
         if cp != 1 and dcp != 1 and cp != dcp:
             raise ModelingError(f"cp_dcp_conflict:{cp}!={dcp}")
         value = cp if cp != 1 else dcp
@@ -254,12 +252,7 @@ class ParallelSpec:
             object.__setattr__(self, "cp", value)
         if dcp != value:
             object.__setattr__(self, "dcp", value)
-        pcp = int(self.pcp)
-        if pcp < 1:
-            raise ModelingError("pcp_invalid")
-        if pcp != self.pcp:
-            object.__setattr__(self, "pcp", pcp)
-        plan = _normalise_cp_plan(self.cp_plan, value, pcp, int(self.tp))
+        plan = _normalise_cp_plan(self.cp_plan, value, self.pcp, self.tp)
         enable_dsa_cp = bool(self.enable_dsa_cp)
         if enable_dsa_cp:
             # The source switch is authoritative; auto/none resolves to the

@@ -40,11 +40,11 @@ from .device_input import (
 from .hardware_links import (
     GBPS_TO_BYTES_PER_MS,
     Link,
+    _LINK_BANDWIDTH_KEYS,
     _PRESERVED_TOPOLOGY_KEYS,
     _collective_protocols,
     _link_bandwidth,
     _neutral_transfer_channel_links,
-    apply_network_overrides,
     calibration_warnings,
 )
 from .invocation import InvocationTiming
@@ -64,7 +64,6 @@ NATIVE_WORK_UNITS = {
     "scalar_store_issue": "stores",
 }
 
-_CAPABILITY_REQUIRED_FAMILIES = frozenset({"A2", "A3", "A5"})
 _HOST_CHANNEL_ALIASES = {"host_to_device": "h2d", "device_to_host": "d2h"}
 _QUANTITY_SCOPES = {
     "memory": "per_device",
@@ -423,10 +422,7 @@ class Hardware:
         limits = [_positive_float(record[k], f"transfer_channel_bw_invalid:{channel}")
                   for k in ("solo_uni_bw_gbps", "solo_effective_uni_bw_gbps")
                   if record.get(k) is not None]
-        if any(record.get(k) is not None for k in (
-                "effective_uni_bw_gbps", "calibrated_uni_bw_gbps", "derived_uni_bw_gbps",
-                "uni_peak_bw_gbps", "gbps", "capacity_gbps", "capacity_bytes_per_ms",
-                "peak_capacity_bytes_per_ms")):
+        if any(record.get(k) is not None for k in _LINK_BANDWIDTH_KEYS):
             _, effective, _ = _link_bandwidth(record, channel)
             limits.append(effective / GBPS_TO_BYTES_PER_MS)
         return min(limits, default=None)
