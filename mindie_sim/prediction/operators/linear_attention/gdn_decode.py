@@ -44,17 +44,11 @@ FUSED_QKVZBA_OPS_PER_ELEMENT = 1
 
 
 def _is_interleaved_qkvzba(model, plan=None) -> bool:
-    """True strictly when the layer or model declares interleaved QKVZ/BA layout."""
-    if plan is not None:
-        layout = str(getattr(plan, "gdn_layout", "") or "").strip().lower()
-        if layout == "interleaved":
-            return True
-        if layout and layout != "standard":
-            return False
-    facts = dict(getattr(model, "catalog_facts", ()) or {})
-    if "gdn_interleaved_qkvzba" in facts:
-        return bool(facts["gdn_interleaved_qkvzba"])
-    return False
+    """True strictly when the layer plan declares interleaved QKVZ/BA layout."""
+    del model
+    if plan is None:
+        return False
+    return str(getattr(plan, "gdn_layout", "") or "").strip().lower() == "interleaved"
 
 
 def _split_conv_qkv(tensors, conv, tokens, heads, key_heads, dk, dv):

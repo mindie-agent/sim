@@ -14,14 +14,12 @@ from typing import Any
 
 from mindie_sim.catalog.cache import (
     _context_shard_blocks,
-    _context_shard_rows,
     block_round,
     cache_component_split,
     cache_row_split,
     index_row_parts,
     layer_cache_components,
     local_kv_heads,
-    owned_block_rows,
     owned_token_rows,
 )
 from mindie_sim.catalog.cache_format import gqa_kv_formats
@@ -37,6 +35,7 @@ from mindie_sim.catalog.context_parallel import (
     cp_interleave,
     dcp_indexer_sharded,
     layer_dcp_factors,
+    owned_positions,
 )
 
 _DCP_KV_SHARDED_COMPONENTS = frozenset({
@@ -343,10 +342,10 @@ class _MemoryCacheMixin:
                 blocks = _ceil_div(tokens_int, blk) if tokens_int else 0
                 count = ((blocks - 1 - cp_rank) // cp + 1) if cp_rank < blocks else 0
                 return int(count * blk)
-            return int(owned_block_rows(tokens_int, blk, cp, cp_rank))
+            return int(owned_positions(0, tokens_int - 1, cp, blk, cp_rank))
         if padded:
             return int(_context_shard_blocks(tokens_int, blk, cp))
-        return int(_context_shard_rows(tokens_int, cp))
+        return int(_ceil_div(tokens_int, cp))
 
     def _non_inherited_draft_cache_bytes(
         self, model, tokens: int, *, padded: bool, rank: int | None = None,

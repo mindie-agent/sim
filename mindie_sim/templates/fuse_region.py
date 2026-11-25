@@ -1857,9 +1857,14 @@ def resolve_tilelang_dual_tier_bounds(
     if has_cube:
         if not cube_dtype:
             raise ModelingError("tilelang_dual_tier_cube_dtype_missing")
-        eta_cube = cal.cube_attainment(
-            cube_dtype, blockscaled=(cube_dtype.strip().lower() == "mxfp8"),
-        )
+        try:
+            eta_cube = cal.cube_attainment(
+                cube_dtype, blockscaled=(cube_dtype.strip().lower() == "mxfp8"),
+            )
+        except ModelingError as exc:
+            if not str(exc).startswith("tilelang_cube_attainment_dtype_unsupported:"):
+                raise
+            return None, simd_gain_ms, ub_warn
         cube_tl_ms = tiled_ms / eta_cube
     if has_cube and not has_aiv:
         t_quick_ms = max(simd_target_ms, cube_tl_ms, disp_ms)

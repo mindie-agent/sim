@@ -595,6 +595,7 @@ def test_two_receivers_read_one_named_source_extent():
         cfg["machine"].update(num_devices=len(ranks), devices=[{"rank": r} for r in ranks])
         cfg["machine"]["links"][0]["members"] = ranks
         cfg["runtime"]["parallel"].update(tp=len(ranks), dcp=2, cp=2, cp_plan="dcp")
+        cfg["runtime"].setdefault("metadata", {})["cp_kv_cache_interleave_size"] = 5
     raw["model"]["layer_plans"][0].update(num_kv_heads=0, window=8, owns_index_k=False)
     result = predict_pd(raw, lower=linear_work, event_limit=100000)
     transfers = result["execution"]["pd_handoffs"][0]["transfers"]

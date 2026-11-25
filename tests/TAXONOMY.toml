@@ -211,7 +211,7 @@ path = "runtime/test_stage4a_target_precision_and_links.py"
 tier = "tier0"
 owns = [
   "mindie_sim/optimization/causal_tail.py",
-  "mindie_sim/optimization/kernel_synthesis.py",
+  "mindie_sim/optimization/ladder.py",
   "mindie_sim/optimization/_dual_obligations.py",
   "mindie_sim/prediction/operators/matrix/matrix_precision.py",
   "mindie_sim/prediction/execution/context.py",
@@ -728,7 +728,8 @@ owns = [
 path = "product/test_unified_engine_and_codesign.py"
 tier = "tier1"
 owns = [
-  "mindie_sim/optimization/kernel_synthesis.py",
+  "mindie_sim/optimization/codesign.py",
+  "mindie_sim/optimization/ladder.py",
   "mindie_sim/optimization/causal_tail.py",
   "mindie_sim/prediction/runtime/exposed_observer.py",
   "mindie_sim/rewrite/algebra.py",

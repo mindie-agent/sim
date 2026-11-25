@@ -403,14 +403,22 @@ def test_hybrid_pool_kpool_mamba_shared_slab_ple_and_aliased_window_contracts():
         resolve_pool_allocator_contract(
             case_v41.model, ParallelSpec(tp=8, dp=1, ep=8, pp=1, cp=2), runtime=case_v41.runtime,
         )
-    raw_v41_a3_c8 = compose_case(
+    with pytest.raises(ModelingError, match="kv_cache_int8_unsupported_on_window_compressed_mla"):
+        compose_case(
+            "deepseek-v4.1-flash", hardware="a3", tp=8, dp=1, ep=8, num_devices=8,
+            prompt_tokens=8192, output_tokens=16, quant="w4a8_dynamic", kv_cache_dtype="int8",
+        )
+    case_v41_a3_bf16 = parse_case(compose_case(
         "deepseek-v4.1-flash", hardware="a3", tp=8, dp=1, ep=8, num_devices=8,
-        prompt_tokens=8192, output_tokens=16, quant="w4a8_dynamic", kv_cache_dtype="int8",
+        prompt_tokens=8192, output_tokens=16, quant="w4a8_dynamic", kv_cache_dtype="bf16",
+    ))
+    model_v41_a3_c8 = replace(
+        case_v41_a3_bf16.model,
+        quant=replace(case_v41_a3_bf16.model.quant, kv_dtype="int8"),
     )
-    case_v41_a3_c8 = parse_case(raw_v41_a3_c8)
     with pytest.raises(ModelingError, match="aliased_window_compressed_rejects_int8_kv"):
         resolve_pool_allocator_contract(
-            case_v41_a3_c8.model, case_v41_a3_c8.runtime.parallel, runtime=case_v41_a3_c8.runtime,
+            model_v41_a3_c8, case_v41_a3_bf16.runtime.parallel, runtime=case_v41_a3_bf16.runtime,
         )
 
     # 4. Prefill chunk length never expands speculative state; expired prefix never frees private SWA pages;

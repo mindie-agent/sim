@@ -106,6 +106,7 @@ def simulate_operator(case: Any, ops: Any, *, extensions: Any = None,
         enforce_simulation_binding_guard(
             built_ops, capability="operator", entry="simulate_operator",
             allow_unbound_formula=allow_unbound, has_bound_provider=False,
+            recipes=merged.get("recipes"),
         )
         active_env = environment or (
             _profile_environment(case, built_ops)
@@ -133,6 +134,7 @@ def simulate_operator(case: Any, ops: Any, *, extensions: Any = None,
     enforce_simulation_binding_guard(
         ops, capability="operator", entry="simulate_operator",
         allow_unbound_formula=allow_unbound, has_bound_provider=(selected is not None),
+        recipes=kwargs.get("recipes"),
     )
     handler = selected.factory if selected is not None else None
     if handler is not None:
@@ -189,6 +191,7 @@ def simulate_native_call(case: Any, ops: Any, *, extensions: Any = None,
         enforce_simulation_binding_guard(
             built_ops, capability="native", entry="simulate_native_call",
             allow_unbound_formula=allow_unbound, has_bound_provider=False,
+            recipes=merged.get("recipes"),
         )
         active_env = environment or (
             _profile_environment(case, built_ops)
@@ -225,6 +228,7 @@ def simulate_native_call(case: Any, ops: Any, *, extensions: Any = None,
     enforce_simulation_binding_guard(
         ops, capability="native", entry="simulate_native_call",
         allow_unbound_formula=allow_unbound, has_bound_provider=(selected is not None),
+        recipes=kwargs.get("recipes"),
     )
     handler = selected.factory if selected is not None else None
     if handler is not None:
@@ -333,6 +337,7 @@ def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
         enforce_simulation_binding_guard(
             built_ops, capability="graph", entry="simulate_graph",
             allow_unbound_formula=allow_unbound, has_bound_provider=False,
+            recipes=merged.get("recipes"),
         )
         active_env = environment or (
             _profile_environment(case, built_ops)
@@ -363,6 +368,7 @@ def simulate_graph(case: Any, ops: Any, *, extensions: Any = None,
     enforce_simulation_binding_guard(
         ops, capability="graph", entry="simulate_graph",
         allow_unbound_formula=allow_unbound, has_bound_provider=(selected is not None),
+        recipes=kwargs.get("recipes"),
     )
     handler = selected.factory if selected is not None else None
     if handler is not None:

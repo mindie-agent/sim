@@ -3,7 +3,9 @@
 [Role] Lock end-to-end invariants of the unified single-Engine execution and
   optimization spine:
   - Retirement of ``target_schedule.py``, ``dsl_solver.py``, ``causal_tail``
-    shadow schedulers, and the legacy ``kernel_synthesis`` IR body;
+    shadow schedulers, and legacy ``kernel_synthesis`` helpers in favor of
+    canonical ``optimization.codesign``, ``optimization.ladder``, and
+    ``rewrite.schema`` APIs;
   - Strict separation between ``comparison_policy="simulation_only"`` and
     ``stack_track="target"`` 4-stage ``EngineStepReceipt`` execution on ONE
     ``Engine`` + ONE ``PrimitiveTable`` (including ``{"activation": "silu"}``
@@ -35,12 +37,14 @@ from mindie_sim.compose import compose_case
 from mindie_sim.export import bundle as bundle_mod
 from mindie_sim.export.models import STRUCTURE_BACKEND_MAP
 from mindie_sim.optimization import causal_tail as causal_tail_mod
-from mindie_sim.optimization import kernel_synthesis as ks_mod
+from mindie_sim.optimization import codesign as codesign_mod
+from mindie_sim.optimization import ladder as ladder_mod
 from mindie_sim.optimization.codesign import (
     collect_codesign_opportunities,
     evaluate_macro_wall_trigger,
 )
 from mindie_sim.optimization.ladder import solve_target_step_receipt
+from mindie_sim.rewrite.schema import load_rewrite_plan
 from mindie_sim.prediction.evaluation import EvaluationContext
 from mindie_sim.prediction.program.physical_key import HOISTED_PROLOGUE_PREFIX, physical_key
 from mindie_sim.prediction.results import StepRequest
@@ -103,19 +107,22 @@ def _reference_bruteforce_stream0(
 
 
 def test_retired_legacy_schedule_and_dsl_solver_modules_removed() -> None:
-    """Legacy target_schedule, dsl_solver, shadow schedulers, and kernel_synthesis body stay purged."""
+    """Legacy target_schedule, dsl_solver, and shadow schedulers stay purged; canonical APIs own synthesis."""
     assert importlib.util.find_spec("mindie_sim.optimization.target_schedule") is None
     assert importlib.util.find_spec("mindie_sim.optimization.dsl_solver") is None
     assert importlib.util.find_spec("mindie_sim.optimization.reload_bounds") is None
-    assert not hasattr(ks_mod, "_apply_pillar23_envelopes")
-    assert not hasattr(ks_mod, "evaluate_formula_kernel")
+    assert not hasattr(codesign_mod, "_apply_pillar23_envelopes")
+    assert not hasattr(codesign_mod, "evaluate_formula_kernel")
+    assert not hasattr(ladder_mod, "solve_target_graph")
+    assert callable(solve_target_step_receipt)
+    assert callable(collect_codesign_opportunities)
+    assert callable(evaluate_macro_wall_trigger)
+    assert callable(load_rewrite_plan)
     assert not hasattr(bundle_mod, "_build_archetype_representative_case")
     assert not hasattr(pd_mod, "build_archetype_representative_case")
     assert not hasattr(causal_tail_mod, "restore_folded_tail_commits")
     assert not hasattr(causal_tail_mod, "schedule_target_graph_on_engine")
     assert not hasattr(causal_tail_mod, "enforce_moe_mutex_on_nodes")
-    with pytest.raises(NotImplementedError, match="LEGACY_PURGED"):
-        ks_mod.solve_target_graph()
 
 
 def test_target_step_receipt_simulation_vs_target_track_and_silu_activation_params() -> None:
