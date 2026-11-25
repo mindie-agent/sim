@@ -77,6 +77,7 @@ _DEFAULT_HCCL_PAYLOAD_35 = 480
 _DEFAULT_HCCL_WIRE_35 = 512
 _DEFAULT_HCCL_FRAME_22 = 1024
 _DEFAULT_SORTALL_LENGTHS = (64, 128, 256, 512, 1024, 2048)
+_SORT_PROBE_PASSES = 4
 _TILE_16 = 16
 _TILE_8 = 8
 _TILE_32 = 32
@@ -203,6 +204,8 @@ def _service_rate_or_default(die_dict: Mapping[str, Any], mode_key: str, default
     modes = die_dict.get("service_modes")
     if isinstance(modes, Mapping):
         entry = modes.get(mode_key)
+        if isinstance(entry, Mapping) and entry.get("rate") is not None:
+            return float(entry["rate"])
         if isinstance(entry, (list, tuple)) and len(entry) >= _MIN_STDEV_SAMPLES:
             return float(entry[1])
     return float(default)
@@ -347,6 +350,71 @@ def _build_p06_mmad_modes(
     return p06_modes, any_p06
 
 
+def _build_p10_sort_cell(
+    p10r: Mapping[str, Any],
+    spec: Mapping[str, Any],
+    *,
+    aiv: int,
+    is_arch35: bool,
+    allow: bool,
+    conflict_meta: Mapping[str, Any],
+    band_fn: Any,
+    make_cell_fn: Any,
+) -> dict[str, Any]:
+    sort_per_aiv_cap = spec["vector_ops_per_s"] / aiv
+    valid_algs = ("sort32_mrgsort4", "masked_hist256") if is_arch35 else ("sort32_mrgsort4",)
+    raw_alg = str(p10r.get("measured_algorithm") or "").strip()
+    target_alg = raw_alg if raw_alg in valid_algs else "sort32_mrgsort4"
+    raw_per_aiv = p10r.get("sort_elems_per_s_per_aiv")
+    if raw_per_aiv is None and p10r.get("sort_elems_per_s") is not None:
+        raw_die = p10r["sort_elems_per_s"]
+        raw_per_aiv = [float(v) / aiv for v in raw_die] if isinstance(raw_die, Sequence) and not isinstance(raw_die, (str, bytes)) else raw_die
+    passes = (
+        _SORT_PROBE_PASSES
+        if (target_alg == "sort32_mrgsort4" and p10r.get("work_unit") != "elem_passes_per_s")
+        else 1
+    )
+    if isinstance(raw_per_aiv, Sequence) and not isinstance(raw_per_aiv, (str, bytes)):
+        p10_samples: Sequence[float] | None = [float(v) * float(passes) for v in raw_per_aiv]
+    else:
+        p10_samples = raw_per_aiv
+    raw_modes = p10r.get("modes") if isinstance(p10r.get("modes"), Mapping) else {}
+    p10_modes: dict[str, Any] = {}
+    any_calibrated = False
+    for alg in valid_algs:
+        alg_samples = raw_modes.get(alg) if alg in raw_modes else (p10_samples if alg == target_alg else None)
+        b = band_fn(
+            "P10_sort_topk",
+            "sort_elems_per_s_per_aiv",
+            alg_samples,
+            sort_per_aiv_cap,
+            allow_meas=allow,
+            mode=alg,
+        )
+        st = _cell_status({"r": b})
+        any_calibrated = any_calibrated or (st == "calibrated")
+        p10_modes[alg] = {
+            "status": st,
+            "sort_elems_per_s_per_aiv": b if st == "calibrated" else _clean_band(b),
+        }
+    primary_band = p10_modes[target_alg]["sort_elems_per_s_per_aiv"]
+    return make_cell_fn(
+        "P10_sort_topk",
+        {"rate": "elem_passes_per_s_per_aiv"},
+        {
+            "sort_algorithm": "sort32_mrgsort4",
+            "masked_hist256_supported": is_arch35,
+            "work_unit": "elem_passes_per_s",
+            "supported_sortall_lengths": list(_DEFAULT_SORTALL_LENGTHS),
+            "histogram_trunk_elems": _DEFAULT_HIST_TRUNK_35 if is_arch35 else 0,
+            **conflict_meta,
+        },
+        {"sort_elems_per_s_per_aiv": primary_band},
+        status_override="calibrated" if any_calibrated else "unmeasured",
+        modes=p10_modes,
+    )
+
+
 def _assemble_primitive_cells(
     *,
     raw: Mapping[str, Any],
@@ -416,7 +484,10 @@ def _assemble_primitive_cells(
     p["P07_vec_alu"] = make_cell_fn("P07_vec_alu", {"rate": "ops_per_s_per_aiv"}, {"vector_width_bytes": _DEFAULT_VEC_WIDTH_BYTES, "fp32_lanes": _DEFAULT_FP32_LANES, "bf16_lanes": _DEFAULT_BF16_LANES, **conflict_meta}, {"vec_alu_ops_per_s_per_aiv": band_fn("P07_vec_alu", "vec_alu_ops_per_s_per_aiv", raw.get("P07_vec_alu", {}).get("vec_alu_ops_per_s_per_aiv"), spec["vec_alu_ops_per_s"] / aiv, allow_meas=allow)}, {"raw_latency_cycles": _bound_only(0.0, "latency_lower")})
     p["P08_vec_sfu"] = make_cell_fn("P08_vec_sfu", {"rate": "ops_per_s_per_aiv"}, {"vector_width_bytes": _DEFAULT_VEC_WIDTH_BYTES, "fp32_lanes": _DEFAULT_FP32_LANES, "bf16_lanes": _DEFAULT_BF16_LANES, **conflict_meta}, {"vec_sfu_ops_per_s_per_aiv": band_fn("P08_vec_sfu", "vec_sfu_ops_per_s_per_aiv", raw.get("P08_vec_sfu", {}).get("vec_sfu_ops_per_s_per_aiv"), spec["vec_sfu_ops_per_s"] / aiv, allow_meas=allow)}, {"raw_latency_cycles": _bound_only(0.0, "latency_lower")})
     p["P09_vec_reduce_cast"] = make_cell_fn("P09_vec_reduce_cast", {"rate": "ops_per_s_per_aiv", "cast_rate": "bytes_per_s_per_aiv"}, {"mx_scale_group": _DEFAULT_SCALE_GROUP, "mx_dynamic_quant_supported": is_arch35, **conflict_meta}, {"vec_reduce_ops_per_s_per_aiv": band_fn("P09_vec_reduce_cast", "vec_reduce_ops_per_s_per_aiv", p09r.get("vec_reduce_ops_per_s_per_aiv"), spec["vec_reduce_ops_per_s"] / aiv, allow_meas=allow), "cast_bytes_per_s_per_aiv": band_fn("P09_vec_reduce_cast", "cast_bytes_per_s_per_aiv", p09r.get("cast_bytes_per_s_per_aiv"), spec["cast_bytes_per_s"] / aiv, allow_meas=allow)})
-    p["P10_sort_topk"] = make_cell_fn("P10_sort_topk", {"rate": "elems_per_s"}, {"sort_algorithm": "masked_hist256" if is_arch35 else "sort32_mrgsort4", "supported_sortall_lengths": list(_DEFAULT_SORTALL_LENGTHS), "histogram_trunk_elems": _DEFAULT_HIST_TRUNK_35 if is_arch35 else 0, **conflict_meta}, {"sort_elems_per_s": band_fn("P10_sort_topk", "sort_elems_per_s", raw.get("P10_sort_topk", {}).get("sort_elems_per_s"), spec["vector_ops_per_s"], allow_meas=allow)})
+    p["P10_sort_topk"] = _build_p10_sort_cell(
+        raw.get("P10_sort_topk", {}), spec, aiv=aiv, is_arch35=is_arch35, allow=allow,
+        conflict_meta=conflict_meta, band_fn=band_fn, make_cell_fn=make_cell_fn,
+    )
     vec_cap = max(1.0, spec["vector_ops_per_s"] / aiv)
     p["P11_simt"] = make_cell_fn("P11_simt", {"rate": "ops_per_s_per_aiv", "latency": "ns"}, {"supported": is_arch35, "simt_ub_carveout_bytes": spec["simt_ub_carveout_bytes"], "tla_max_threads": _DEFAULT_TLA_THREADS_35 if is_arch35 else 0, "catlass_max_threads": _DEFAULT_CATLASS_THREADS_35 if is_arch35 else 0, "warp_size": _DEFAULT_WARP_SIZE}, {}, {"simt_ops_per_s_per_aiv": _bound_only(vec_cap if is_arch35 else 0.0), "syncthreads_ns": _bound_only(0.0, "latency_lower"), "simt_launch_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured" if is_arch35 else "unsupported")
     p["P12_intracore_flag"] = make_cell_fn("P12_intracore_flag", {"latency": "ns"}, {"event_ids": _DEFAULT_EVENT_IDS, "unit_flag_requires_single_l0c_stage": True}, {}, {"flag_ns": _bound_only(0.0, "latency_lower"), "unitflag_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured")

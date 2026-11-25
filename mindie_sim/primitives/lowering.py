@@ -55,6 +55,7 @@ MX_SCALE_BYTES_PER_CYCLE = 32
 MIB = 1024 ** 2
 SORT_BLOCK_ELEMS = 32
 SORTALL_LENGTHS = (64, 128, 256, 512, 1024, 2048)
+_SORT_ALGORITHMS = frozenset({"sort32_mrgsort4", "masked_hist256"})
 MERGE_FAN_IN = 4
 HISTOGRAM_TRUNK_ELEMS = 16384
 HISTOGRAM_BINS = 256
@@ -99,6 +100,7 @@ class _Lowering:
         self.cell = table.cell(primitive_id)
         self.stages, self.times, self.meta, self.extra = [], {}, {}, {}
         self.warnings, self.live, self.stars_plan = list(table.warnings), None, None
+        self.selected_mode: str | None = None
         self.req_res: dict[str, tuple[str, float, str, int]] = {}
 
     def gap(self, code):
@@ -122,7 +124,7 @@ class _Lowering:
 
     def value(self, metric, default=None, *, mode=None, pid=None):
         if mode is None and (pid is None or pid == self.pid):
-            mode = _declared_mode(self.cell, self.p.get("mode"))
+            mode = self.selected_mode if self.selected_mode is not None else _declared_mode(self.cell, self.p.get("mode"))
         value, warnings = _optional_rate(self.table, pid or self.pid, metric, mode, self.role, self.allow, default)
         self.warnings.extend(warnings)
         return value
@@ -188,7 +190,9 @@ class _Lowering:
                 work_map[row] = max(work_map.get(row, 0.0), float(amount))
                 caps_map[row] = float(rate)
                 if self.ctx is not None:
-                    self.req_res.setdefault(row, (row, float(rate), "work", 1))
+                    prev = self.req_res.get(row)
+                    if prev is None or float(rate) > prev[1]:
+                        self.req_res[row] = (row, float(rate), "work", 1)
         return self.append(Stage(
             name, work=work_map, after=after,
             placement={key: (owner,) for key in work_map} if owner is not None else {},
@@ -202,10 +206,98 @@ class _Lowering:
         elif flag is not None and not self.cell.parameters.get(flag, False):
             self.gap(f"datapath_route_unsupported:{src}->{dst}")
 
+    def _has_concurrent_shared_resource(self) -> bool:
+        if len(self.stages) < 2 or self.live is not None or self.stars_plan is not None:
+            return False
+        if all(self.stages[i - 1].name in self.stages[i].after for i in range(1, len(self.stages))):
+            return False
+        seen_rows: set[str] = set()
+        shared_rows: set[str] = set()
+        for stage in self.stages:
+            for row in stage.work:
+                if row in seen_rows:
+                    shared_rows.add(row)
+                else:
+                    seen_rows.add(row)
+        if not shared_rows:
+            return False
+        row_stages: dict[str, list[str]] = {}
+        ancestors: dict[str, set[str]] = {}
+        for stage in self.stages:
+            anc: set[str] = set()
+            for dep in stage.after:
+                anc.add(dep)
+                anc.update(ancestors.get(dep, ()))
+            ancestors[stage.name] = anc
+            for row in stage.work:
+                if row not in shared_rows:
+                    continue
+                prev = row_stages.setdefault(row, [])
+                if any(other not in anc for other in prev):
+                    return True
+                prev.append(stage.name)
+        return False
+
+    def _engine_span_ms(self, program: KernelProgram) -> float | None:
+        from mindie_sim.prediction.runtime.engine import Engine, Resource
+
+        rows: list[str] = []
+        caps: dict[str, float] = {}
+        max_owner: dict[str, int] = {}
+        pools: dict[str, float] = {}
+        ctx_rates = getattr(self.ctx, "rates", {}) if self.ctx is not None else {}
+        ctx_units = getattr(self.ctx, "resource_units", {}) if self.ctx is not None else {}
+        role_by_row = (
+            {v: k for k, v in getattr(self.ctx, "resource_names", {}).items()}
+            if self.ctx is not None else {}
+        )
+        for stage in self.stages:
+            if stage.program is not None:
+                return None
+            for row in stage.work:
+                if row not in ctx_rates and row not in stage.caps:
+                    return None
+                rows.append(row)
+                if row in stage.caps:
+                    caps[row] = max(caps.get(row, 0.0), float(stage.caps[row]))
+                owners = stage.placement.get(row, ())
+                if owners:
+                    max_owner[row] = max(max_owner.get(row, 0), max(owners))
+            for alloc in stage.acquire:
+                pools[alloc.pool] = pools.get(alloc.pool, 0.0) + float(alloc.size)
+        if self.ctx is not None and getattr(self.ctx, "pool_names", None) and getattr(self.ctx, "pool_capacities", None):
+            for role, cap in self.ctx.pool_capacities.items():
+                pname = self.ctx.pool_names.get(role)
+                if pname:
+                    pools[pname] = float(cap)
+        resources = []
+        for row in dict.fromkeys(rows):
+            if row in ctx_rates:
+                role = role_by_row.get(row, row)
+                units = int(ctx_units.get(row, ctx_units.get(role, 1)))
+                if row in max_owner:
+                    units = max(units, max_owner[row] + 1)
+                resources.append(Resource(row, float(ctx_rates[row]), units=units))
+            else:
+                units = max_owner[row] + 1 if row in max_owner else 1
+                resources.append(Resource(row, float(caps[row]) * units, units=units))
+        scratch = Engine(resources, backend="python", pools=pools or None)
+        done = program.start(scratch, "span", scratch.submit("span:start"))
+        scratch.advance(until=(done,))
+        return float(done.time)
+
     def finish(self):
         stages = tuple(self.stages)
+        program = KernelProgram(stages)
+        span_ms = (
+            self._engine_span_ms(program) if self._has_concurrent_shared_resource() else None
+        )
+        if span_ms is None:
+            span_ms = max(self.times.values(), default=0.0)
+        elif "bound_vector" in self.extra:
+            self.extra["bound_vector"] = replace(self.extra["bound_vector"], span_ms=span_ms)
         result = PrimitiveLoweringResult(
-            self.pid, stages, KernelProgram(stages), max(self.times.values(), default=0.0),
+            self.pid, stages, program, span_ms,
             warnings=tuple(dict.fromkeys(self.warnings)), metadata=tuple(self.meta.items()), **self.extra,
         )
         object.__setattr__(result, "_live_access", self.live)
@@ -516,7 +608,7 @@ def _vector(b):
     if pipe == "vec_reduce" and width:
         depth = min(width, lanes, MX_SCALE_GROUP if b.get("mx_dynamic_quant") else lanes)
         raw += b.value("tree_base_cycles", 0) + b.value("tree_step_cycles", 0) * (depth - 1).bit_length()
-    repeats = rows * _ceil(width if pipe == "vec_reduce" else elems * ops_per_elem, lanes)
+    repeats = rows * (_ceil(width, lanes) if pipe == "vec_reduce" else ops_per_elem * _ceil(elems, lanes))
     groups = b.get("groups")
     if groups is None:
         graph = [(pipe, pipe, repeats, raw)]
@@ -584,10 +676,48 @@ def _vector(b):
     b.extra["bound_vector"] = replace(bound, stages=stages)
 
 
+def _resolve_sort_selection(b: _Lowering) -> tuple[str, str | None]:
+    explicit_alg = b.p.get("algorithm")
+    explicit_mode = b.p.get("mode")
+    if (
+        isinstance(explicit_alg, str)
+        and isinstance(explicit_mode, str)
+        and explicit_alg != explicit_mode
+    ):
+        raise ModelingError(f"primitive_sort_mode_algorithm_mismatch:{explicit_mode}:{explicit_alg}")
+    if explicit_alg is not None:
+        algorithm = explicit_alg
+    elif isinstance(explicit_mode, str) and explicit_mode in _SORT_ALGORITHMS:
+        algorithm = explicit_mode
+    else:
+        algorithm = b.cell.parameters.get("sort_algorithm")
+    if algorithm not in _SORT_ALGORITHMS:
+        b.gap("sort_algorithm_required")
+    if algorithm == "masked_hist256" and (
+        not b.arch35 or b.cell.parameters.get("masked_hist256_supported") is False
+    ):
+        b.gap("masked_hist256_requires_dav_3510")
+    requested_mode = explicit_mode if explicit_mode is not None else algorithm
+    if b.cell.modes:
+        mode = requested_mode if isinstance(requested_mode, str) else None
+    else:
+        mode = _declared_mode(b.cell, requested_mode)
+    return str(algorithm), mode
+
+
 def _sort(b):
     n, owner = b.integer("n"), b.owner("aiv")
-    aggregate = b.speed("sort_elems_per_s_per_aiv") if "sort_elems_per_s_per_aiv" in b.cell.metrics else b.speed("sort_elems_per_s")
-    if b.get("algorithm", b.cell.parameters.get("sort_algorithm")) == "sort32_mrgsort4":
+    algorithm, _ = _resolve_sort_selection(b)
+    metric = "sort_elems_per_s_per_aiv"
+    mode_entry = b.cell.modes.get(b.selected_mode, {}) if b.selected_mode is not None else {}
+    mode_nested = mode_entry.get("metrics", {}) if isinstance(mode_entry.get("metrics"), Mapping) else {}
+    if metric not in b.cell.metrics and metric not in mode_entry and metric not in mode_nested:
+        metric = "sort_elems_per_s"
+    aggregate = b.speed(metric)
+    if metric == "sort_elems_per_s" and not str(b.cell.units.get("rate", "")).endswith("_per_aiv"):
+        aiv_count = max(1, int(getattr(b.dp or b.table.provenance.silicon_fingerprint, "aiv_count")))
+        aggregate /= float(aiv_count)
+    if algorithm == "sort32_mrgsort4":
         if n not in SORTALL_LENGTHS:
             raise ModelingError("primitive_sortall_length_unsupported")
         groups, passes, after = n // SORT_BLOCK_ELEMS, 0, ()
@@ -604,8 +734,6 @@ def _sort(b):
             done = b.work(name, ((pipe, count, rate),), after, owner=owner, metadata=meta)
             after = (b.delay(f"{name}:PipeBarrier<PIPE_V>", "pipe_v_barrier_ns", (done,)),)
         return
-    if b.get("algorithm", b.cell.parameters.get("sort_algorithm")) != "masked_hist256":
-        b.gap("sort_algorithm_required")
     after = ()
     for start in range(0, n, HISTOGRAM_TRUNK_ELEMS):
         width = min(n - start, HISTOGRAM_TRUNK_ELEMS)
@@ -616,9 +744,25 @@ def _sort(b):
             after = (name,)
     splits = b.integer("splits", 1, 1)
     if splits > 1:
-        io_bytes = b.integer("merge_bytes", splits * b.integer("k", minimum=1) * 2 * L0C_ACCUMULATOR_BYTES)
-        read = b.work("split_merge:workspace_read", (("hbm", io_bytes, b.speed("hbm_read_bytes_per_s", pid="P01_datacopy")),), after)
-        b.work("split_merge", (("vhist256", splits * b.integer("k", minimum=1), aggregate),), (read,), owner=owner)
+        k = b.integer("k", minimum=1)
+        default_bytes = splits * k * 2 * L0C_ACCUMULATOR_BYTES
+        write_bytes = b.integer("workspace_write_bytes", default_bytes)
+        read_bytes = b.integer("merge_bytes", default_bytes)
+        write = b.work(
+            "split_merge:workspace_write",
+            (("hbm", write_bytes, b.speed("hbm_write_bytes_per_s", pid="P01_datacopy")),),
+            after,
+            metadata={"workspace": "split_merge", "direction": "write"},
+            scale_pipe=False,
+        )
+        read = b.work(
+            "split_merge:workspace_read",
+            (("hbm", read_bytes, b.speed("hbm_read_bytes_per_s", pid="P01_datacopy")),),
+            (write,),
+            metadata={"workspace": "split_merge", "direction": "read"},
+            scale_pipe=False,
+        )
+        b.work("split_merge", (("vhist256", splits * k, aggregate),), (read,), owner=owner)
 
 
 def _simt(b):
@@ -692,8 +836,13 @@ def lower_primitive(
     datapath = datapath if datapath is not None else getattr(context, "datapath", None)
     lowering = _Lowering(primitive_id, params, table, datapath, context, memory_state, role,
                          allow_uncalibrated_declaration)
-    if primitive_id != "P06_mmad":
+    if primitive_id == "P10_sort_topk":
+        _, selected = _resolve_sort_selection(lowering)
+        lowering.selected_mode = selected
+        lowering.warnings.extend(_simulation_warnings(lowering.cell, selected, role, allow_uncalibrated_declaration))
+    elif primitive_id != "P06_mmad":
         selected = _declared_mode(lowering.cell, params.get("mode"))
+        lowering.selected_mode = selected
         lowering.warnings.extend(_simulation_warnings(lowering.cell, selected, role, allow_uncalibrated_declaration))
     _LOWERERS[primitive_id](lowering)
     return lowering.finish()
