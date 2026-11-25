@@ -33,7 +33,7 @@ from .attention_prefill_geometry import (
     _SOURCE_QUERY_TILE_LARGE_HEAD, _Spec, _Task, _ceil_div, _dtype,
     _explicit_reconstruct, _iter_tasks, _native_tasks, _nonnegative_int,
     _positive_int, _report, _task_at, _task_at_for, _task_pairs, _task_work,
-    _time_major_tasks, _total_work, logical_causal_pairs,
+    _time_major_tasks, _total_work, fd_split_partial_rows, logical_causal_pairs,
     prefill_handoff_workspace_bytes, source_query_tile,
 )
 from mindie_sim.prediction.operators.attention.attention_prefill_issue import (
@@ -48,6 +48,12 @@ from mindie_sim.schema.operators import OpSpec
 
 
 DOUBLE_BUFFERED_L0A_KIB = 64
+_C2_DV_ALIGN_64 = 64
+_C2_DV_ALIGN_128 = 128
+_C2_DV_ALIGN_256 = 256
+_C2_DV_ALIGN_512 = 512
+_C2_PRELOAD_SLOTS = 3
+_DEFAULT_CV_RATIO = 2
 FIA_HOST_QUERY_TILE = 128
 FIA_KEY_TILE = 128
 FIA_WIDE_HEAD_THRESHOLD = 128
@@ -101,6 +107,52 @@ def source_softmax_outer(head_dim: int) -> int:
     """
     dim = _positive_int(head_dim, "head_dim")
     return WIDE_FIA_QUERY_TILE if dim > FIA_WIDE_HEAD_THRESHOLD else STANDARD_FIA_QUERY_TILE
+
+
+def _pv_c2_handoff_policy(
+    source, spec: _Spec, c1_handoff: FixpipeHandoffPolicy,
+) -> FixpipeHandoffPolicy:
+    """Resolve PV C2 handoff: D256 128x128 Simplified routes PV via GM workspace."""
+    if not (spec.native_fia and spec.issue_kind is not None
+            and c1_handoff.enabled and not c1_handoff.via_gm):
+        return c1_handoff
+    # CANN GetC2Position (flash_attention_noquant_block_vec_base_fused_infer.h:75)
+    # and SetWorkspace (fused_infer_attention_score_tiling_impl.cpp:1565) dispatch on Dv.
+    v_dim = spec.v_head_dim or spec.head_dim
+    c2 = source_c2_path(v_dim, spec.query_tile, spec.key_tile, spec.reconstruct)
+    if not c2 or c2.get("path") != "gm_workspace":
+        return c1_handoff
+    if v_dim <= _C2_DV_ALIGN_64:
+        dv_block = _C2_DV_ALIGN_64
+    elif v_dim <= _C2_DV_ALIGN_128:
+        dv_block = _C2_DV_ALIGN_128
+    elif v_dim <= _C2_DV_ALIGN_256:
+        dv_block = _C2_DV_ALIGN_256
+    else:
+        dv_block = _C2_DV_ALIGN_512
+    bmm2_bytes = spec.query_tile * dv_block * _FP32_BYTES
+    vec2_bytes = bmm2_bytes if dv_block > _C2_DV_ALIGN_256 else 0
+    units = getattr(source, "resource_units", None) or {}
+    aiv_num = int(
+        units.get("vector")
+        or units.get("mte2_aiv")
+        or (getattr(source, "compute_units", 0) or getattr(source, "core_count", 0) or 1) * _DEFAULT_CV_RATIO
+    )
+    workspace_bytes = (bmm2_bytes + vec2_bytes) * _C2_PRELOAD_SLOTS * max(1, aiv_num)
+    names = getattr(source, "resource_names", None)
+    if names is not None:
+        has_l2 = "l2" in names
+    else:
+        rates = getattr(source, "rates", ())
+        has_l2 = "l2" in rates or "l2" in units
+    mech = getattr(source, "physical_mechanisms", None)
+    hierarchy = getattr(mech, "memory_hierarchy", None)
+    buffers = getattr(source, "buffers", None)
+    if buffers is None:
+        buffers = getattr(source, "pool_capacities", {})
+    l2_cap = int(getattr(hierarchy, "effective_l2_bytes", buffers.get("l2", 0)) or 0)
+    mem_tier = ("l2" if has_l2 else None) if (l2_cap > 0 and workspace_bytes <= l2_cap) else "hbm"
+    return FixpipeHandoffPolicy(enabled=True, via_gm=True, mem_tier=mem_tier)
 
 
 def arch35_query_tile(head_dim: int) -> int:
@@ -186,18 +238,19 @@ class StagedGQAPrefill:
                 kv_prefix=fields.get("kv_prefix", False),
             )
         plan = owner_s2_plan(spec, cores)
-        rows = min(spec.query_tile, max((q for q, _ in spec.requests), default=0))
-        partial = plan["fd_splits"] * rows * spec.head_dim * _FP32_BYTES
-        lse = plan["fd_splits"] * rows * 2 * _FP32_BYTES
+        v_dim = spec.v_head_dim or spec.head_dim
+        fd_partial_rows = fd_split_partial_rows(spec, plan) if spec.native_fia else 0
+        partial = fd_partial_rows * v_dim * _FP32_BYTES
+        lse = fd_partial_rows * 2 * _FP32_BYTES
         report.update({
             "owner_s2_loads": plan["loads"],
             "owner_s2_total": plan["total"],
-            "fd_splits": plan["fd_splits"],
-            "fd_fragments": plan["fd_fragments"],
+            "fd_splits": plan["fd_splits"] if spec.native_fia else 0,
+            "fd_fragments": plan["fd_fragments"] if spec.native_fia else 0,
             "fd_partial_write_bytes": partial,
             "fd_partial_read_bytes": partial,
             "fd_lse_bytes": lse,
-            "fd_reduce_ops": plan["fd_splits"] * rows * (spec.head_dim + 2),
+            "fd_reduce_ops": fd_partial_rows * (v_dim + 2),
             "fd_service_basis": "source_owner_split_diagnostic",
         })
         if resource_roles is not None:
@@ -222,6 +275,7 @@ class StagedGQAPrefill:
             read, vread, write, operand = "mte2", "mte2", "mte3", "mte1"
             mte1 = False
             handoff = FixpipeHandoffPolicy()
+            pv_handoff = handoff
         else:
             read = read_role(geometry.resource_units)
             vread = read_role(geometry.resource_units, aiv=0)
@@ -234,6 +288,7 @@ class StagedGQAPrefill:
             handoff = gqa_fixpipe_policy(
                 geometry, prefill_handoff_workspace_bytes(spec, cores),
             )
+            pv_handoff = _pv_c2_handoff_policy(geometry, spec, handoff)
             if spec.kv_cache.needs_conversion and operand is None:
                 raise ModelingError(
                     "attention_prefill_conversion_requires_mte1_operand_copy")
@@ -245,7 +300,8 @@ class StagedGQAPrefill:
             plan = owner_s2_plan(spec, cores)
         work = _total_work(
             spec, include_mte1=mte1, read=read, vread=vread,
-            write=write, operand=operand, plan=plan, handoff=handoff)
+            write=write, operand=operand, plan=plan,
+            handoff=handoff, pv_handoff=pv_handoff)
         metadata = {"kv_cache_access": spec.kv_cache.report()}
         if plan is not None:
             metadata["prefill_plan"] = {
@@ -294,6 +350,7 @@ def _spec(op: OpSpec, recipe: StagedGQAPrefill) -> _Spec:
     heads = _positive_int(raw.get("query_heads"), "query_heads")
     kv_heads = _positive_int(raw.get("kv_heads"), "kv_heads")
     dim = _positive_int(raw.get("head_dim"), "head_dim")
+    v_dim = _positive_int(raw.get("v_head_dim", dim), "v_head_dim")
     if heads % kv_heads:
         raise ModelingError("attention_prefill_query_heads_not_divisible_by_kv_heads")
     query_dtype = _dtype(raw.get("query_dtype"), "query_dtype")
@@ -321,7 +378,7 @@ def _spec(op: OpSpec, recipe: StagedGQAPrefill) -> _Spec:
         tile_counts.append(tiles)
         total += heads * tiles
         ends.append(total)
-    softmax_outer = (source_softmax_outer(dim) if native_fia else GENERIC_SOFTMAX_OUTER_ROWS)
+    softmax_outer = (source_softmax_outer(v_dim) if native_fia else GENERIC_SOFTMAX_OUTER_ROWS)
     # Preload 3 stays on the unselected path.  issue_kind is set only from an
     # explicit reconstruct flag and is never inferred from the head dimension.
     s2_preload = NATIVE_S2_PRELOAD if native_fia else recipe.slots
@@ -332,7 +389,8 @@ def _spec(op: OpSpec, recipe: StagedGQAPrefill) -> _Spec:
                  recipe.softmax_slots, softmax_outer, native_fia,
                  reconstruct, issue_kind, tuple(ends), tuple(tile_counts),
                  kv_access(op, query_dtype=query_dtype, kv_dtype=kv_dtype,
-                           head_dim=dim))
+                           head_dim=dim, v_head_dim=v_dim),
+                 v_head_dim=v_dim)
 
 
 def build(op: OpSpec, geometry: Geometry | None = None) -> OperatorPlan:
@@ -354,6 +412,7 @@ def _task_program(context: RecipeContext, recipe: StagedGQAPrefill,
                   spec: _Spec, task: _Task, core: int,
                   *, partial: bool = False) -> tuple[KernelProgram, PeriodicPipelineSpec]:
     dim, rows = spec.head_dim, task.rows
+    v_dim = spec.v_head_dim or dim
     q_bytes = rows * dim * spec.query_bytes
     read = _read_role(context)
     write = _write_role(context)
@@ -373,10 +432,10 @@ def _task_program(context: RecipeContext, recipe: StagedGQAPrefill,
     # buffers; full Q is not resident in L0A.
     q_l0a = _allocation(context, core, "l0a", "q_l0a", min(q_bytes, OPERAND_MICROTILE_KIB * 1024))
     ub_state = _allocation(context, core, "ub", "online_state",
-                           rows * (dim * _FP32_BYTES + 2 * _FP32_BYTES))
+                           rows * (v_dim * _FP32_BYTES + 2 * _FP32_BYTES))
     persistent = _allocations((q_l1, q_l0a, ub_state))
     outer, preload = _validate_prefill_working_set(
-        context, recipe, spec, task, cache, rows, dim, q_bytes)
+        context, recipe, spec, task, cache, rows, v_dim, q_bytes)
     q_work = {"hbm": q_bytes, read: q_bytes}
     stages = [
         Stage("q_load", context.bind(Work(resources=q_work)),
@@ -437,18 +496,18 @@ def _task_program(context: RecipeContext, recipe: StagedGQAPrefill,
     if page_scale_ub is not None:
         stages.append(Stage("page_scale_release", after=("key_tiles",),
                             free=_allocations((page_scale_ub,))))
-    out_bytes = rows * dim * spec.query_bytes
+    out_bytes = rows * v_dim * spec.output_bytes
     if partial:
         # A split S2 owner publishes an FP32 accumulator plus LSE partial;
         # the FD merge below consumes both and writes the final BF16 output.
-        part = rows * dim * _FP32_BYTES
+        part = rows * v_dim * _FP32_BYTES
         lse = rows * 2 * _FP32_BYTES
         stages.append(Stage(
             "final_store", after=("key_tiles",),
             work=context.bind(Work(resources={
                 "hbm": part + lse,
                 **(({write: part + lse}) if write else {}),
-                "vector": rows * (dim + 2),
+                "vector": rows * (v_dim + 2),
             })),
             free=persistent,
             placement={**_placement(context, core, *copy_out),
@@ -460,7 +519,7 @@ def _task_program(context: RecipeContext, recipe: StagedGQAPrefill,
             work=context.bind(Work(resources={
                 "hbm": out_bytes,
                 **(({write: out_bytes}) if write else {}),
-                "vector": rows * (dim + 1),
+                "vector": rows * (v_dim + 1),
             })),
             free=persistent,
             placement={**_placement(context, core, *copy_out),
@@ -480,6 +539,7 @@ def _validate_prefill_working_set(context, recipe, spec, task, cache, rows, dim,
     ub_required = rows * (dim * _FP32_BYTES + 2 * _FP32_BYTES) \
         + softmax_window * outer * min(recipe.key_tile, task.horizon) * _FP32_BYTES
     max_rows = min(recipe.key_tile, task.horizon)
+    p_l1_bytes = rows * max_rows * spec.query_bytes
     if cache.needs_conversion:
         # conversion needs packed input + converted output + scales in UB,
         # and the converted operand in L1 before the MTE1 L1->L0B copy.
@@ -496,10 +556,10 @@ def _validate_prefill_working_set(context, recipe, spec, task, cache, rows, dim,
                        + softmax_window * outer * max_rows * _FP32_BYTES
                        + slots * per_slot + ub_conv)
         operand_row = max(cache.key_operand_row, cache.value_operand_row)
-        l1_required = q_bytes + slots * max_rows * operand_row
+        l1_required = q_bytes + p_l1_bytes + slots * max_rows * operand_row
         l0b_required = slots * max_rows * operand_row
     else:
-        l1_required = q_bytes + max_rows * (
+        l1_required = q_bytes + p_l1_bytes + max_rows * (
             cache.key_payload_row + cache.value_payload_row)
         l0b_required = 0
     required_pools = [("l0a", l0a_required), ("ub", ub_required),
@@ -517,11 +577,14 @@ def _validate_prefill_working_set(context, recipe, spec, task, cache, rows, dim,
 def _append_prefill_key_load(
     emitted, context, core, cache, valid, suffix, key_needs, key_payload, key_operand,
     key_scale, k_l1, k_l0b, read, write, operand, vector_copy_in,
+    *, retain_scale_for_value: bool = False,
 ):
     copy_in = (read,)
     copy_out = (write,) if write else ()
     operand_roles = (operand,) if operand else ()
     vector = ("vector",)
+    retained_scale = None
+    scale_stage = None
     if key_needs:
         k_payload_ub = _allocation(
             context, core, "ub", f"k_payload_{suffix}", key_payload)
@@ -549,11 +612,17 @@ def _append_prefill_key_load(
                 after=("k_load",), acquire=_allocations((k_scale_ub,)),
                 placement=_placement(context, core, *vector_copy_in)))
             after = ("k_scale_load",)
+            scale_stage = "k_scale_load"
+        if retain_scale_for_value and k_scale_ub is not None:
+            retained_scale = k_scale_ub
+            dequant_free = _allocations((k_payload_ub,))
+        else:
+            dequant_free = _allocations((k_payload_ub, k_scale_ub))
         emitted.append(Stage(
             "dequant_k", context.bind(Work(resources={
                 "vector": cache.key_conversion_ops(valid)})),
             after=after, acquire=_allocations((k_conv_ub,)),
-            free=_allocations((k_payload_ub, k_scale_ub)),
+            free=dequant_free,
             placement=_placement(context, core, *vector)))
         emitted.append(Stage(
             "conv_store_k", context.bind(Work(resources={write: key_operand})),
@@ -578,12 +647,13 @@ def _append_prefill_key_load(
                        **_placement(context, core, *operand_roles)}))
         k_ready = "k_load"
         k_free = _allocations((k_l1, k_l0b))
-    return k_ready, k_free
+    return k_ready, k_free, retained_scale, scale_stage
 
 
 def _append_prefill_value_load(
     emitted, context, core, cache, valid, suffix, value_needs, value_payload, value_operand,
     value_scale, v_l1, v_l0b, read, write, operand, vector_copy_in,
+    *, shared_scale_ub=None, shared_scale_stage: str | None = None,
 ):
     copy_in = (read,)
     copy_out = (write,) if write else ()
@@ -611,10 +681,13 @@ def _append_prefill_value_load(
                 })), after=("v_load",), acquire=_allocations((v_scale_ub,)),
                 placement=_placement(context, core, *vector_copy_in)))
             after = ("v_scale_load",)
+        elif shared_scale_stage is not None:
+            after = ("v_load", shared_scale_stage)
         emitted.append(Stage(
             "dequant_v", context.bind(Work(resources={"vector": cache.value_conversion_ops(valid)})),
             after=after, acquire=_allocations((v_conv_ub,)),
-            free=_allocations((v_payload_ub, v_scale_ub)), placement=_placement(context, core, *vector)))
+            free=_allocations((v_payload_ub, v_scale_ub, shared_scale_ub)),
+            placement=_placement(context, core, *vector)))
         emitted.append(Stage(
             "conv_store_v", context.bind(Work(resources={write: value_operand})),
             after=("dequant_v",), acquire=_allocations((v_post_l1,)),
@@ -639,6 +712,7 @@ def _prefill_tile_stages(
     operand, vector_copy_in, handoff: FixpipeHandoffPolicy = FixpipeHandoffPolicy(),
 ):
     operand_roles = (operand,) if operand else ()
+    copy_out = (write,) if write else ()
     cube, vector = ("cube",), ("vector",)
     rect = rows * valid
     key_needs, value_needs = cache.key_needs_conversion, cache.value_needs_conversion
@@ -659,19 +733,25 @@ def _prefill_tile_stages(
     v_l0b = (_allocation(
         context, core, "l0b", f"v_l0b_{suffix}",
         min(value_payload, OPERAND_MICROTILE_KIB * 1024)) if not value_needs else None)
-    pv_acc = _allocation(context, core, "l0c", f"pv_acc_{suffix}", rows * dim * _FP32_BYTES)
+    v_dim = spec.v_head_dim or dim
+    pv_acc = _allocation(context, core, "l0c", f"pv_acc_{suffix}", rows * v_dim * _FP32_BYTES)
     score_acquire, prob_acquire, pv_acquire = _allocations((scores,)), _allocations((probs,)), _allocations((pv_acc,))
     score_release, prob_release = _allocations((scores,)), _allocations((probs,))
 
     qk = Work(matrix={spec.query_dtype: 2 * dim * rect}, resources=({"mte1": q_bytes} if operand else {}))
     softmax = Work(resources={"vector": SOFTMAX_OPS_PER_SCORE * rect + rows})
-    pv = Work(matrix={spec.query_dtype: 2 * dim * rect})
-    online = Work(resources={"vector": rows * (ONLINE_UPDATE_OPS_PER_VALUE * dim + ONLINE_UPDATE_STATE_OPS)})
+    pv = Work(matrix={spec.query_dtype: 2 * v_dim * rect})
+    online = Work(resources={"vector": rows * (ONLINE_UPDATE_OPS_PER_VALUE * v_dim + ONLINE_UPDATE_STATE_OPS)})
     emitted = []
 
-    k_ready, k_free = _append_prefill_key_load(
+    retain_shared_scale = bool(
+        cache.shared_row and cache.scale_scope == "row"
+        and key_scale > 0 and value_scale == 0 and value_needs
+    )
+    k_ready, k_free, shared_scale_ub, shared_scale_stage = _append_prefill_key_load(
         emitted, context, core, cache, valid, suffix, key_needs, key_payload, key_operand,
-        key_scale, k_l1, k_l0b, read, write, operand, vector_copy_in)
+        key_scale, k_l1, k_l0b, read, write, operand, vector_copy_in,
+        retain_scale_for_value=retain_shared_scale)
     emitted.append(Stage(
         "qk", context.bind(qk), after=(k_ready,), acquire=score_acquire, free=k_free,
         placement={**_placement(context, core, *cube), **_placement(context, core, *operand_roles)}))
@@ -681,10 +761,23 @@ def _prefill_tile_stages(
     emitted.append(Stage(
         "softmax", context.bind(softmax), after=(score_ready,),
         acquire=prob_acquire, free=softmax_free, placement=_placement(context, core, *vector)))
+    prob_ready = "softmax"
+    p_l1 = (
+        _allocation(context, core, "l1", f"p_l1_{suffix}", rect * spec.query_bytes)
+        if write else None
+    )
+    if write:
+        emitted.append(Stage(
+            "probability_store",
+            context.bind(Work(resources={write: rect * spec.query_bytes})),
+            after=("softmax",), acquire=_allocations((p_l1,)),
+            placement=_placement(context, core, *copy_out)))
+        prob_ready = "probability_store"
 
     v_ready, v_l0b = _append_prefill_value_load(
         emitted, context, core, cache, valid, suffix, value_needs, value_payload, value_operand,
-        value_scale, v_l1, v_l0b, read, write, operand, vector_copy_in)
+        value_scale, v_l1, v_l0b, read, write, operand, vector_copy_in,
+        shared_scale_ub=shared_scale_ub, shared_scale_stage=shared_scale_stage)
     pv_free = (
         _allocations((v_l0b, p_l0a))
         + (_allocations((v_l1,)) if not value_needs else ())
@@ -693,13 +786,14 @@ def _prefill_tile_stages(
     emitted.extend((
         Stage("probability_operand",
               context.bind(Work(resources=({"mte1": rect * spec.query_bytes} if operand else {}))),
-              after=("softmax",), acquire=_allocations((p_l0a,)),
+              after=(prob_ready,), acquire=_allocations((p_l0a,)),
+              free=_allocations((p_l1,)),
               placement=_placement(context, core, *operand_roles)),
         Stage("pv", context.bind(pv), after=(v_ready, "probability_operand"),
               acquire=pv_acquire, free=pv_free, placement=_placement(context, core, *cube)),
     ))
     pv_ready, _ = append_gqa_handoff_stages(
-        emitted, "pv", "pv", rows * dim * _FP32_BYTES, tuple(pv_acquire), handoff, context, core, vector_copy_in[0],
+        emitted, "pv", "pv", rows * v_dim * _FP32_BYTES, tuple(pv_acquire), handoff, context, core, vector_copy_in[0],
     )
     emitted.append(Stage(
         "online_update", context.bind(online), after=(pv_ready,),

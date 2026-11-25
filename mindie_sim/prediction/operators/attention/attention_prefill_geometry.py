@@ -29,6 +29,7 @@ _DTYPE_ALIASES = {
 }
 _FP32_BYTES = 4
 _NATIVE_QUERY_TILE = 128
+_FLOPS_PER_FMA = 2
 _QK_PV_FLOPS_PER_DIM = 4
 _SOFTMAX_OPS_PER_PAIR = 7
 _ONLINE_UPDATE_OPS_PER_DIM = 3
@@ -135,6 +136,7 @@ class _Spec:
     request_ends: tuple[int, ...]
     request_tile_counts: tuple[int, ...]
     kv_cache: KVCacheAccess = KVCacheAccess()
+    v_head_dim: int = 0
 
     @property
     def group(self) -> int:
@@ -143,6 +145,10 @@ class _Spec:
     @property
     def query_bytes(self) -> int:
         return int(dtype_bytes(self.query_dtype))
+
+    @property
+    def output_bytes(self) -> int:
+        return self.query_bytes
 
     @property
     def kv_bytes(self) -> int:
@@ -247,7 +253,21 @@ def prefill_handoff_workspace_bytes(spec: _Spec, core_count: int) -> int:
         return 0
     max_rows = _NATIVE_QUERY_TILE if spec.native_fia else spec.query_tile
     active = min(max(1, int(core_count)), spec.task_count)
-    return active * spec.slots * max_rows * (spec.key_tile + spec.head_dim) * _FP32_BYTES
+    v_dim = spec.v_head_dim or spec.head_dim
+    return active * spec.slots * max_rows * (spec.key_tile + v_dim) * _FP32_BYTES
+
+
+def fd_split_partial_rows(spec: _Spec, plan: Mapping) -> int:
+    """Total flattened partial output rows across all multi-owner split tasks."""
+    task_owners: dict[int, list[int]] = {}
+    for core, ranges in enumerate(plan["ranges"]):
+        for ti, _key_start, _key_end in ranges:
+            task_owners.setdefault(ti, []).append(core)
+    return sum(
+        len(owners) * _task_at_for(spec, ti).rows
+        for ti, owners in task_owners.items()
+        if len(owners) >= 2
+    )
 
 
 def _task_work(spec: _Spec, task: _Task, *, include_mte1: bool, partial: bool,
@@ -256,13 +276,14 @@ def _task_work(spec: _Spec, task: _Task, *, include_mte1: bool, partial: bool,
     cache = spec.kv_cache
     _query, context = spec.requests[task.request]
     rows, dim = task.rows, spec.head_dim
+    v_dim = spec.v_head_dim or dim
     q_bytes = rows * dim * spec.query_bytes
     if partial:
-        out_bytes = rows * (dim * _FP32_BYTES + 2 * _FP32_BYTES)
-        vector_out = rows * (dim + 2)
+        out_bytes = rows * (v_dim * _FP32_BYTES + 2 * _FP32_BYTES)
+        vector_out = rows * (v_dim + 2)
     else:
-        out_bytes = rows * dim * spec.query_bytes
-        vector_out = rows * (dim + 1)
+        out_bytes = rows * v_dim * spec.output_bytes
+        vector_out = rows * (v_dim + 1)
     load_start = task.key_start * spec.key_tile
     load_end = min((task.key_start + task.key_tiles) * spec.key_tile,
                    task.horizon)
@@ -297,34 +318,39 @@ def _task_work(spec: _Spec, task: _Task, *, include_mte1: bool, partial: bool,
                  if cache.value_needs_conversion else value_payload)
     vector = vector_out + cache.conversion_ops(kv_rows)
     flops = 0
-    handoff_bytes = 0
+    score_handoff = 0
+    pv_handoff = 0
     for tile in range(task.key_tiles):
         valid = min(spec.key_tile, task.horizon
                     - (task.key_start + tile) * spec.key_tile)
         rect = rows * valid
+        mte3_extra += rect * spec.query_bytes
         if include_mte1:
             mte1 += rect * spec.query_bytes
-        handoff_bytes += (rect + rows * dim) * _FP32_BYTES
-        flops += _QK_PV_FLOPS_PER_DIM * dim * rect
+        score_handoff += rect * _FP32_BYTES
+        pv_handoff += rows * v_dim * _FP32_BYTES
+        flops += _FLOPS_PER_FMA * (dim + v_dim) * rect
         vector += _SOFTMAX_OPS_PER_PAIR * rect + rows * (
-            _ONLINE_UPDATE_OPS_PER_DIM * dim + _SOFTMAX_AND_UPDATE_OPS_PER_ROW
+            _ONLINE_UPDATE_OPS_PER_DIM * v_dim + _SOFTMAX_AND_UPDATE_OPS_PER_ROW
         )
     return {
         "producer": producer, "vector_reads": vector_reads,
         "writes": out_bytes, "mte3_extra": mte3_extra,
         "vector": vector, "mte1": mte1, "flops": flops,
-        "handoff": handoff_bytes,
+        "score_handoff": score_handoff, "pv_handoff": pv_handoff,
+        "handoff": score_handoff + pv_handoff,
     }
 
 
 def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
                 vread: str | None = None, write: str | None = "mte3",
                 operand: str | None = "mte1", plan=None,
-                handoff: FixpipeHandoffPolicy | None = None) -> Work:
+                handoff: FixpipeHandoffPolicy | None = None,
+                pv_handoff: FixpipeHandoffPolicy | None = None) -> Work:
     cache = spec.kv_cache
     vread = vread or read
     producer = vector_reads = writes = mte3_extra = vector = mte1 = 0
-    handoff_total = 0
+    score_handoff_total = pv_handoff_total = 0
     flops = 0
     if plan is None:
         for task in _iter_tasks(spec):
@@ -338,7 +364,8 @@ def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
             vector += part["vector"]
             mte1 += part["mte1"]
             flops += part["flops"]
-            handoff_total += part["handoff"]
+            score_handoff_total += part["score_handoff"]
+            pv_handoff_total += part["pv_handoff"]
     else:
         task_owners = {}
         for core, ranges in enumerate(plan["ranges"]):
@@ -358,24 +385,26 @@ def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
                 vector += part["vector"]
                 mte1 += part["mte1"]
                 flops += part["flops"]
-                handoff_total += part["handoff"]
+                score_handoff_total += part["score_handoff"]
+                pv_handoff_total += part["pv_handoff"]
         for ti, owners in sorted(task_owners.items()):
             if len(owners) < 2:
                 continue
             base = _task_at_for(spec, ti)
-            rows, dim = base.rows, spec.head_dim
+            rows = base.rows
+            v_dim = spec.v_head_dim or spec.head_dim
             fragments = len(owners)
             frag_rows = _ceil_div(rows, 2)
             for fragment in range(2):
                 this_rows = min(frag_rows, rows - fragment * frag_rows)
                 if this_rows <= 0:
                     continue
-                part = fragments * this_rows * (dim * _FP32_BYTES
+                part = fragments * this_rows * (v_dim * _FP32_BYTES
                                                 + 2 * _FP32_BYTES)
-                out = this_rows * dim * spec.query_bytes
+                out = this_rows * v_dim * spec.output_bytes
                 vector_reads += part
                 writes += out
-                vector += fragments * this_rows * (dim + 2)
+                vector += fragments * this_rows * (v_dim + 2)
     resources = {"hbm": producer + vector_reads + writes, "vector": vector}
     if read:
         resources[read] = resources.get(read, 0) + producer
@@ -385,13 +414,15 @@ def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
         resources[write] = (resources.get(write, 0) + writes + mte3_extra)
     if include_mte1 and operand:
         resources[operand] = mte1
-    if handoff is not None and handoff.enabled and handoff_total > 0:
-        resources["fixpipe"] = resources.get("fixpipe", 0) + handoff_total
-        if handoff.via_gm:
-            if vread:
-                resources[vread] = resources.get(vread, 0) + handoff_total
-            if handoff.mem_tier:
-                resources[handoff.mem_tier] = resources.get(handoff.mem_tier, 0) + 2 * handoff_total
+    eff_pv_handoff = handoff if pv_handoff is None else pv_handoff
+    for policy, nbytes in ((handoff, score_handoff_total), (eff_pv_handoff, pv_handoff_total)):
+        if policy is not None and policy.enabled and nbytes > 0:
+            resources["fixpipe"] = resources.get("fixpipe", 0) + nbytes
+            if policy.via_gm:
+                if vread:
+                    resources[vread] = resources.get(vread, 0) + nbytes
+                if policy.mem_tier:
+                    resources[policy.mem_tier] = resources.get(policy.mem_tier, 0) + 2 * nbytes
     return Work(matrix={spec.query_dtype: flops}, resources=resources)
 
 def _report(spec: _Spec) -> dict:
@@ -410,7 +441,7 @@ def _report(spec: _Spec) -> dict:
         task_q = task.rows * spec.head_dim * spec.query_bytes
         q_read += task_q
         q_l1_l0a += task_q * task.key_tiles
-        out_write += task.rows * spec.head_dim * spec.query_bytes
+        out_write += task.rows * (spec.v_head_dim or spec.head_dim) * spec.output_bytes
         payload = cache.payload_bytes(task.horizon)
         kv_payload += payload
         if cache.scale_scope == "row":

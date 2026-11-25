@@ -42,6 +42,8 @@ DEFAULT_DECODE_KEY_TILE = 128
 DEFAULT_DECODE_QUERY_TILE = 64
 FP32_BYTES = 4
 _MX_SCALE_GROUP_SIZE = 32
+_MX_V_SCALE_TOKEN_GROUP = 32
+_QFA_MXFP8_ENTRY = "cann_ops_transformer.ops.quant_flash_attn"
 _MXFP8_KV_TAGS = frozenset({"mxfp8", "qk_mxfp8_dynamic_v_mxfp8_per_channel"})
 
 # Mechanism-only references pinning represented source features.
@@ -65,9 +67,9 @@ _DTYPE_ALIASES = {
 
 
 def _resolve_arch35_mxfp8_access(
-    raw_kv_dtype: Any, query_dtype: str, kv_dtype: str, dim: int,
+    raw_kv_dtype: Any, query_dtype: str, kv_dtype: str, dim: int, v_dim: int,
     cache: KVCacheAccess, recipe: StagedGQADecode,
-) -> tuple[str, KVCacheAccess]:
+) -> tuple[str, KVCacheAccess, bool]:
     """Use direct PA_NZ MXFP8 Cube MMA without AIV BF16 dequant writeback on Arch35."""
     raw_norm = str(raw_kv_dtype or "").strip().lower()
     is_mxfp8_kv = (
@@ -76,14 +78,14 @@ def _resolve_arch35_mxfp8_access(
             and cache.scale_scope == "row" and cache.key_scale_row > 0)
     )
     if not is_mxfp8_kv:
-        return query_dtype, cache
-    row_bytes = dim + _ceil_div(dim, _MX_SCALE_GROUP_SIZE)
+        return query_dtype, cache, False
+    k_row_bytes = dim + _ceil_div(dim, _MX_SCALE_GROUP_SIZE)
     direct = replace(
         cache,
-        key_payload_row=row_bytes,
-        value_payload_row=row_bytes,
-        key_operand_row=row_bytes,
-        value_operand_row=row_bytes,
+        key_payload_row=k_row_bytes,
+        value_payload_row=v_dim,
+        key_operand_row=k_row_bytes,
+        value_operand_row=v_dim,
         key_scale_row=0,
         value_scale_row=0,
         scale_scope="none",
@@ -92,7 +94,7 @@ def _resolve_arch35_mxfp8_access(
         value_needs_conversion=False,
         query_dtype="fp8_e4m3",
     )
-    return "fp8_e4m3", direct
+    return "fp8_e4m3", direct, True
 
 
 def _positive_int(value, name: str) -> int:
@@ -147,6 +149,9 @@ class _Spec:
     slots: int
     outputs: tuple[_Output, ...]
     kv_cache: KVCacheAccess = KVCacheAccess()
+    v_head_dim: int = 0
+    output_dtype: str = ""
+    mxfp8_qfa: bool = False
 
     @property
     def group(self) -> int:
@@ -155,6 +160,10 @@ class _Spec:
     @property
     def query_bytes(self) -> int:
         return int(dtype_bytes(self.query_dtype))
+
+    @property
+    def output_bytes(self) -> int:
+        return int(dtype_bytes(self.output_dtype or self.query_dtype))
 
 
 @dataclass(frozen=True)
@@ -211,10 +220,19 @@ def _spec(op: OpSpec, recipe: StagedGQADecode) -> _Spec:
     heads = _positive_int(raw.get("query_heads"), "query_heads")
     kv_heads = _positive_int(raw.get("kv_heads"), "kv_heads")
     dim = _positive_int(raw.get("head_dim"), "head_dim")
+    v_dim = _positive_int(raw.get("v_head_dim", dim), "v_head_dim")
     if heads % kv_heads:
         raise ModelingError("attention_decode_query_heads_not_divisible_by_kv_heads")
     query_dtype = _dtype(raw.get("query_dtype"), "query_dtype")
     kv_dtype = _dtype(raw.get("kv_dtype"), "kv_dtype")
+    view = metadata.get("attention_tensor_view")
+    raw_output_dtype = raw.get("output_dtype")
+    if raw_output_dtype is None and isinstance(view, Mapping):
+        raw_output_dtype = view.get("output_dtype")
+    output_dtype = (
+        _dtype(raw_output_dtype, "output_dtype")
+        if raw_output_dtype is not None else query_dtype
+    )
     if raw.get("causal") is not True:
         raise ModelingError("attention_decode_causal_true_required")
     if raw.get("window", 0) != 0:
@@ -286,15 +304,21 @@ def _spec(op: OpSpec, recipe: StagedGQADecode) -> _Spec:
                 for index, (owner, start, end) in enumerate(
                     mapping[output.request, output.kv_head]))) for output in outputs]
             splits = max((len(output.contributions) for output in outputs), default=1)
-    access = kv_access(op, query_dtype=query_dtype, kv_dtype=kv_dtype, head_dim=dim)
-    effective_query_dtype, access = _resolve_arch35_mxfp8_access(
-        raw.get("kv_dtype"), query_dtype, kv_dtype, dim, access, recipe,
+    access = kv_access(
+        op, query_dtype=query_dtype, kv_dtype=kv_dtype,
+        head_dim=dim, v_head_dim=v_dim,
+    )
+    effective_query_dtype, access, is_mxfp8_qfa = _resolve_arch35_mxfp8_access(
+        raw.get("kv_dtype"), query_dtype, kv_dtype, dim, v_dim, access, recipe,
     )
     return _Spec(
         requests, heads, kv_heads, dim, effective_query_dtype, kv_dtype,
         recipe.key_tile, recipe.query_tile, splits, recipe.slots,
         tuple(outputs),
         access,
+        v_head_dim=v_dim,
+        output_dtype=output_dtype,
+        mxfp8_qfa=is_mxfp8_qfa,
     )
 
 
@@ -329,8 +353,19 @@ def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
         q_bytes = contributions * output.rows * spec.head_dim * spec.query_bytes
         key_payload = output.horizon * cache.key_payload_row
         value_payload = output.horizon * cache.value_payload_row
-        output_bytes = output.rows * spec.head_dim * spec.query_bytes
-        partial = contributions * output.rows * _partial_row_bytes(spec.head_dim)
+        v_dim = spec.v_head_dim or spec.head_dim
+        if spec.mxfp8_qfa:
+            # Per-channel E8M0 V scales are broadcast per 32-token group across all v_dim channels.
+            value_payload += sum(
+                _ceil_div(
+                    max(0, min((c.tile_start + c.tile_count) * spec.key_tile, output.horizon)
+                        - c.tile_start * spec.key_tile),
+                    _MX_V_SCALE_TOKEN_GROUP,
+                ) * v_dim
+                for c in output.contributions
+            )
+        output_bytes = output.rows * v_dim * spec.output_bytes
+        partial = contributions * output.rows * _partial_row_bytes(v_dim)
         page_meta = 0
         page_scale = 0
         if cache.paged:
@@ -351,6 +386,8 @@ def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
                          + (key_payload if cache.key_needs_conversion else 0)
                          + (value_payload if cache.value_needs_conversion else 0))
         writes += output_bytes
+        # Probabilities written from UB to L1 before the MTE1 PV operand copy.
+        mte3_extra += pairs * spec.query_bytes
         if cache.key_needs_conversion:
             mte3_extra += output.horizon * cache.key_operand_row
         if cache.value_needs_conversion:
@@ -361,10 +398,10 @@ def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
                      if cache.key_needs_conversion else key_payload)
             mte1 += (output.horizon * cache.value_operand_row
                      if cache.value_needs_conversion else value_payload)
-        flops += 2 * pairs * (spec.head_dim + spec.head_dim)
-        handoff_bytes += (pairs + row_tiles * spec.head_dim) * FP32_BYTES
+        flops += 2 * pairs * (spec.head_dim + v_dim)
+        handoff_bytes += (pairs + row_tiles * v_dim) * FP32_BYTES
         vector += (2 + DECODE_SOFTMAX_OPS_PER_PAIR) * pairs + (
-            DECODE_OUTPUT_UPDATE_OPS_PER_VALUE * spec.head_dim + DECODE_ONLINE_STATE_OPS + 1
+            DECODE_OUTPUT_UPDATE_OPS_PER_VALUE * v_dim + DECODE_ONLINE_STATE_OPS + 1
         ) * row_tiles
         vector += cache.conversion_ops(output.horizon)
         if include_mte1:
@@ -372,12 +409,12 @@ def _total_work(spec: _Spec, *, include_mte1: bool, read: str = "mte2",
             # leaves the on-chip hierarchy or becomes an HBM read.
             mte1 += pairs * spec.query_bytes
         if contributions == 1:
-            vector += output.rows * (spec.head_dim + 1)
+            vector += output.rows * (v_dim + 1)
         else:
             vector_reads += partial
             writes += partial
-            vector += (contributions * output.rows * (DECODE_OUTPUT_UPDATE_OPS_PER_VALUE * spec.head_dim + DECODE_ONLINE_STATE_OPS)
-                       + output.rows * (spec.head_dim + 1))
+            vector += (contributions * output.rows * (DECODE_OUTPUT_UPDATE_OPS_PER_VALUE * v_dim + DECODE_ONLINE_STATE_OPS)
+                       + output.rows * (v_dim + 1))
     resources = {"hbm": producer_reads + vector_reads + writes, "vector": vector}
     if read:
         resources[read] = resources.get(read, 0) + producer_reads
@@ -460,10 +497,10 @@ class _MergeStream:
 
 def _merge_program(context: RecipeContext, spec: _Spec,
                    output: _Output, core: int) -> KernelProgram:
-    dim, rows = spec.head_dim, output.rows
+    dim, rows = spec.v_head_dim or spec.head_dim, output.rows
     contributions = len(output.contributions)
     partial = contributions * rows * _partial_row_bytes(dim)
-    out_bytes = rows * dim * spec.query_bytes
+    out_bytes = rows * dim * spec.output_bytes
     read = _read_role(context, vector=True)
     write = _write_role(context)
     ub_partial = _allocation(context, core, "ub", "merge_partial",
@@ -546,17 +583,25 @@ class StagedGQADecode:
         cache = spec.kv_cache
         if not cache.paged or cache.key_format is None or cache.value_format is None:
             return None
+        active_indices = [idx for idx, (q, _) in enumerate(spec.requests) if q > 0]
+        if not active_indices:
+            return None
+        active_map = {orig: compact for compact, orig in enumerate(active_indices)}
+        active_requests = tuple(spec.requests[idx] for idx in active_indices)
+        v_dim = spec.v_head_dim or spec.head_dim
         plan = paged_fia_plan(
-            requests=spec.requests,
-            query_lengths=tuple(query for query, _ in spec.requests),
+            requests=active_requests,
+            query_lengths=tuple(query for query, _ in active_requests),
             kv_lengths=tuple(context + query
-                             for query, context in spec.requests),
+                             for query, context in active_requests),
             page_size=cache.page_size,
             query_heads=spec.query_heads,
             kv_heads=spec.kv_heads,
             head_dim=spec.head_dim,
+            v_head_dim=v_dim,
+            shared_format=cache.shared_row,
             query_dtype=spec.query_dtype,
-            output_dtype=spec.query_dtype,
+            output_dtype=spec.output_dtype or spec.query_dtype,
             key_format=cache.key_format,
             value_format=cache.value_format,
             phase=getattr(op, "phase", "decode"),
@@ -564,6 +609,49 @@ class StagedGQADecode:
             return_lse=False,
             output_prepare=None,
         )
+        if spec.mxfp8_qfa:
+            q_total = sum(query for query, _ in active_requests)
+            kv_lens = tuple(context + query for query, context in active_requests)
+            total_pages = plan["geometry"]["max_pages"] if len(active_requests) == 1 else sum(
+                plan["geometry"]["page_counts"]
+            )
+            k_scale_groups = _ceil_div(spec.head_dim, _MX_SCALE_GROUP_SIZE)
+            v_scale_groups = max(1, cache.page_size // _MX_V_SCALE_TOKEN_GROUP)
+            plan["kind"] = "paged_qfa_mxfp8"
+            plan["abi"] = {
+                "namespace": "cann_ops_transformer",
+                "entry": _QFA_MXFP8_ENTRY,
+                "aclnn_symbol": None,
+                "source_state": "vllm_ascend_attention_c8_mxfp",
+                "binary_identity": "unresolved",
+                "basis": "arch35_mxfp8_quant_flash_attn_pa_nz",
+            }
+            plan["layouts"]["key"] = "PA_NZ"
+            plan["layouts"]["value"] = "PA_NZ"
+            plan["ports"]["key_cache"]["layout"] = "PA_NZ"
+            plan["ports"]["value_cache"]["layout"] = "PA_NZ"
+            plan["ports"]["query_scale"] = {
+                "role": "query_scale", "direction": "in",
+                "shape": (q_total, spec.query_heads, k_scale_groups),
+                "dtype": "fp8_e8m0", "layout": "TND", "required": True,
+            }
+            plan["ports"]["key_scale"] = {
+                "role": "key_scale", "direction": "in",
+                "shape": (total_pages, cache.page_size, spec.kv_heads, k_scale_groups),
+                "dtype": "fp8_e8m0", "layout": "PA_NZ", "required": True,
+            }
+            plan["ports"]["value_scale"] = {
+                "role": "value_scale", "direction": "in",
+                "shape": (total_pages, v_scale_groups, spec.kv_heads, v_dim),
+                "dtype": "fp8_e8m0", "layout": "PA_NZ", "required": True,
+            }
+            kv_scale_bytes = sum(
+                kv * spec.kv_heads * k_scale_groups
+                + _ceil_div(kv, _MX_V_SCALE_TOKEN_GROUP) * spec.kv_heads * v_dim
+                for kv in kv_lens
+            )
+            plan["work"]["kv_scale_bytes"] = kv_scale_bytes
+            plan["work"]["kv_valid_bytes"] += kv_scale_bytes
         outputs = []
         full_tiles = tail_tiles = 0
         for output in spec.outputs:
@@ -580,7 +668,7 @@ class StagedGQADecode:
                     else:
                         full_tiles += 1
                 outputs.append({
-                    "request": output.request, "kv_head": output.kv_head,
+                    "request": active_map[output.request], "kv_head": output.kv_head,
                     "tiles": contribution.tile_count,
                     "tile_start": contribution.tile_start,
                     "last_valid": last_valid,
@@ -836,11 +924,12 @@ def _build_decode_contract(spec) -> dict[str, Any]:
     rows = max((item.rows for item in outputs), default=0)
     horizon = max((item.horizon for item in outputs), default=0)
     full = min(spec.key_tile, max(1, horizon))
+    v_dim = spec.v_head_dim or spec.head_dim
     q_bytes = rows * spec.head_dim * spec.query_bytes
-    online = rows * (spec.head_dim * _CONTRACT_FP32_BYTES + _CONTRACT_ONLINE_META_BYTES)
+    online = rows * (v_dim * _CONTRACT_FP32_BYTES + _CONTRACT_ONLINE_META_BYTES)
     scores = rows * full * _CONTRACT_FP32_BYTES
     p_l0a = rows * full * spec.query_bytes
-    pv_acc = rows * spec.head_dim * _CONTRACT_FP32_BYTES
+    pv_acc = rows * v_dim * _CONTRACT_FP32_BYTES
     key, value = full * cache.key_payload_row, full * cache.value_payload_row
     key_op = full * cache.key_operand_row if cache.needs_conversion else key
     val_op = full * cache.value_operand_row if cache.needs_conversion else value
@@ -851,7 +940,7 @@ def _build_decode_contract(spec) -> dict[str, Any]:
     k_conv = key_op if cache.needs_conversion else 0
     v_conv = val_op if cache.needs_conversion else 0
     cap = {
-        "l1": q_bytes + slots * (key + value),
+        "l1": q_bytes + slots * (key + value + p_l0a),
         "l0a": q_bytes + slots * p_l0a,
         "l0b": slots * (key_op + val_op),
         "l0c": slots * (scores + pv_acc),
@@ -865,6 +954,7 @@ def _build_decode_contract(spec) -> dict[str, Any]:
         ("online_state", "ub", online, "persistent", "q_load", "final"),
         ("scores", "l0c", scores, sl, "qk", "softmax"),
         ("probs", "ub", scores, sl, "softmax", "online_update"),
+        ("p_l1", "l1", p_l0a, sl, "probability_store", "probability_operand"),
         ("p_l0a", "l0a", p_l0a, sl, "probability_operand", "pv"),
         ("pv_acc", "l0c", pv_acc, sl, "v_load", "pv"),
         ("k_l1", "l1", key, sl, "k_load", "dequant_k" if cache.needs_conversion else "qk"),
@@ -897,7 +987,8 @@ def _build_decode_contract(spec) -> dict[str, Any]:
             "value_format": rep["value_format"],
             "dequant_ops_per_element": cache.dequant_ops_per_element,
             "elements_per_valid_row": (
-                (cache.head_dim - cache.key_suffix) + (cache.head_dim - cache.value_suffix)
+                (cache.head_dim - cache.key_suffix)
+                + ((cache.v_head_dim or cache.head_dim) - cache.value_suffix)
             ),
             "operand_copy_pipe": "mte1" if cache.needs_conversion else "",
             "scope": "on_chip_operand_materialization_no_hbm_writeback",
