@@ -299,16 +299,19 @@ from copy import deepcopy
 from dataclasses import replace
 from typing import Mapping
 
+from mindie_sim.prediction.collectives.topology import Topology
 from mindie_sim.prediction.service_regime_domains.services import ServiceCurve, service_identity
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from .schema import A5_HARDWARE_KEY
 from .schema import (
     INTRA_NODE_MAX_RANKS,
+    _CANONICAL_EXPANSION_MODES,
     _collective,
     _dtype,
     _explicit_pair,
     _explicit_scope,
+    _mc2_callback_measurement,
     _require_a5,
 )
 from .schema import (
@@ -331,12 +334,26 @@ _EXPANSION_MODES = frozenset({"aicpu", "aiv"})
 _BYTE_RESOURCES = frozenset({"link", "hbm", "mte1", "mte2", "mte3", "fixpipe"})
 _SUPPORTED_COLLECTIVES = frozenset({
     "all_reduce", "reduce_scatter", "all_gather", "all_to_all", "all_to_allv",
-    "p2p_send_recv",
+    "p2p_send_recv", "mc2_dispatch", "mc2_combine",
 })
 _COLLECTIVE_DIRECTIONS = {
     "all_gather": "read", "all_reduce": "send", "reduce_scatter": "send",
     "all_to_all": "send", "all_to_allv": "send", "p2p_send_recv": "directed",
+    "mc2_dispatch": "dispatch", "mc2_combine": "combine",
 }
+_TOPOLOGY_GROUP_AXES = frozenset({
+    "tp", "ep", "dp", "cp", "dcp", "pcp", "dcp_tp", "dcp_pcp", "dcp_dp",
+    "dcp_a2a", "etp", "local_tp",
+})
+_GROUP_SIZE_META_KEYS = (
+    "world_size", "comm_group_size", "group_size", "ranks", "group_ranks",
+)
+_PER_RANK_INPUT_COORDINATES = frozenset({
+    "per_rank_input_bytes", "bytes_per_rank_input",
+})
+_DIRECT_LINK_COORDINATES = frozenset({
+    "link_bytes", "wire_bytes",
+})
 
 
 def __getattr__(name: str):
@@ -348,7 +365,26 @@ def __getattr__(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-def _wire_factor(collective, world_size, curve=None):
+def _curve_work_coordinate(curve, measurement=None) -> str:
+    if isinstance(measurement, Mapping) and measurement.get("work_coordinate"):
+        return str(measurement["work_coordinate"])
+    if curve is None:
+        return ""
+    provenance = getattr(curve, "provenance", None) or {}
+    identity = getattr(curve, "identity", None) or {}
+    for container in (provenance, identity):
+        boundary = container.get("measurement_boundary")
+        if isinstance(boundary, Mapping) and boundary.get("work_coordinate"):
+            return str(boundary["work_coordinate"])
+    declared = str(provenance.get("work_scope") or identity.get("work_scope") or "")
+    if declared:
+        return declared
+    if getattr(curve, "resource", None) == "aicpu_child":
+        return "per_rank_input_bytes"
+    return ""
+
+
+def _wire_factor(collective, world_size, curve=None, *, measurement=None):
     """Captured payload per rank -> the declared collective's physical work.
 
     This is a coordinate conversion for the ring/tree recipe, not a hop price.
@@ -360,21 +396,34 @@ def _wire_factor(collective, world_size, curve=None):
     name = _collective(collective)
     if rank_count <= 1:
         return 1.0
-    if name in {"all_gather", "reduce_scatter"}:
-        # The worker's payload_bytes is per-rank ag_in / rs_out while the model
-        # accounts the complete ring traffic, (r - 1) * local_bytes.
+    coord = _curve_work_coordinate(curve, measurement)
+    if coord in _DIRECT_LINK_COORDINATES:
+        return 1.0
+    if name == "all_gather":
+        # Per-rank input shard (N/W) -> complete ring/mesh remote wire traffic (W - 1) * N/W.
+        return float(rank_count - 1)
+    if name == "reduce_scatter":
+        # Native captures record full per-rank input bytes (N), so directional
+        # remote traffic is (W - 1)/W * N. Legacy campaign rows record the local
+        # output shard (N/W), whose remote traffic is (W - 1) * (N/W).
+        if coord in _PER_RANK_INPUT_COORDINATES:
+            return float(rank_count - 1) / rank_count
         return float(rank_count - 1)
     if name == "all_reduce":
         return 2.0 * (rank_count - 1) / rank_count
     if name == "all_to_all":
         return float(rank_count - 1) / rank_count
     if name == "all_to_allv":
+        if coord in _PER_RANK_INPUT_COORDINATES:
+            return float(rank_count - 1) / rank_count
         provenance = getattr(curve, "provenance", None) or {}
         identity = getattr(curve, "identity", None) or {}
         if (dict(provenance).get("derived_from") == "all_to_all"
                 or dict(identity).get("derived_from") == "all_to_all"):
             return float(rank_count - 1) / rank_count
-        # A measured mc2-quant comm-lane row already recorded link_bytes.
+        return 1.0
+    if name in {"mc2_dispatch", "mc2_combine"}:
+        # MC2 comm-lane rows already record directional link_bytes.
         return 1.0
     return 1.0
 
@@ -416,19 +465,95 @@ def _require_case_a5(parsed):
         _require_a5(machine.sku, machine.arch_family)
 
 
-def _world_size(case, op):
-    metadata = dict(op.metadata)
-    for key in ("world_size", "group_size", "ranks", "group_ranks"):
-        if metadata.get(key):
-            return int(metadata[key])
-    axis = metadata.get("group_axis")
+def _group_size_from_metadata(metadata: Mapping) -> int | None:
+    for key in _GROUP_SIZE_META_KEYS:
+        value = metadata.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        if isinstance(value, (list, tuple, set, frozenset)):
+            if value:
+                return len(value)
+            continue
+        size = int(value)
+        if size > 0:
+            return size
+    return None
+
+
+def _explicit_rank_list(metadata: Mapping, topo: Topology) -> tuple[int, ...] | None:
+    for key in ("group_ranks", "ranks"):
+        raw = metadata.get(key)
+        if isinstance(raw, (list, tuple)) and raw:
+            if all(isinstance(r, int) and not isinstance(r, bool) and r in topo._rank_node for r in raw):
+                return tuple(int(r) for r in raw)
+    return None
+
+
+def _resolved_group_ranks(case, op, metadata: Mapping, *, device=None) -> tuple[Topology, tuple[int, ...]] | tuple[None, ()]:
+    dies = tuple(getattr(case.machine, "dies", ()) or ())
+    if not dies:
+        return None, ()
     parallel = case.runtime.parallel
-    if axis and hasattr(parallel, axis):
-        return int(getattr(parallel, axis))
-    return int(parallel.tp * parallel.cp or len(case.machine.dies) or 1)
+    stage = int(metadata.get("source_stage", getattr(op, "stage", 0) or 0))
+    width = max(1, int(parallel.tp) * int(parallel.pcp))
+    stage_span = max(1, int(parallel.pp) * width)
+    selected = device if device is not None else dies[stage * width]
+    die_idx = next(
+        (i for i, die in enumerate(dies) if die is selected or die.rank == selected.rank),
+        stage * width,
+    )
+    replica = die_idx // stage_span
+    total_replicas = max(1, int(parallel.dp) * int(getattr(parallel, "external_dp", 1) or 1))
+    max_replicas = min(total_replicas, len(dies) // stage_span)
+    topo = Topology(case.machine, parallel)
+    explicit_ranks = _explicit_rank_list(metadata, topo)
+    if explicit_ranks is not None:
+        return topo, explicit_ranks
+    axis = metadata.get("group_axis", "tp")
+    if axis == "pp" or str(metadata.get("collective", op.family)).strip().lower() == "pp_p2p":
+        dest_stage = (
+            int(metadata["destination_stage"])
+            if "destination_stage" in metadata
+            else stage + 1
+        )
+        if 0 <= stage < parallel.pp and 0 <= dest_stage < parallel.pp and dest_stage != stage:
+            pairs = tuple(
+                (src, dst)
+                for src, dst in zip(topo.ranks(replica, stage), topo.ranks(replica, dest_stage))
+                if src != dst
+            )
+            matched = [pair for pair in pairs if selected.rank in pair]
+            if matched or pairs:
+                return topo, matched[0] if matched else pairs[0]
+        return topo, ()
+    if 0 <= replica < max_replicas and 0 <= stage < parallel.pp and axis in _TOPOLOGY_GROUP_AXES:
+        if axis != "local_tp" or metadata.get("local_tp_width"):
+            groups = tuple(topo.groups(axis, replica, stage, metadata=metadata))
+            if groups:
+                matched = [grp for grp in groups if selected.rank in grp]
+                chosen = matched[0] if matched else groups[0]
+                return topo, tuple(int(rank) for rank in chosen)
+    return topo, ()
 
 
-def _placement_for(case, op, collective, world_size, pair):
+def _world_size(case, op, *, device=None):
+    metadata = dict(op.metadata)
+    explicit = _group_size_from_metadata(metadata)
+    if explicit is not None:
+        return explicit
+    if case is not None:
+        _topo, ranks = _resolved_group_ranks(case, op, metadata, device=device)
+        if ranks:
+            return len(ranks)
+        axis = metadata.get("group_axis")
+        parallel = case.runtime.parallel
+        if axis and hasattr(parallel, axis):
+            return int(getattr(parallel, axis))
+        return int(parallel.tp * parallel.cp or len(case.machine.dies) or 1)
+    return INTRA_NODE_MAX_RANKS
+
+
+def _placement_for(case, op, collective, world_size, pair, *, device=None):
     del collective
     metadata = dict(op.metadata)
     if "placement_scope" in metadata and metadata["placement_scope"] is not None:
@@ -437,18 +562,38 @@ def _placement_for(case, op, collective, world_size, pair):
             raise ModelingError(
                 f"a5_placement_scope_unknown:{metadata['placement_scope']}")
         return explicit
-    if pair == "0->24":
-        return "cross_node_urma_far"
-    if pair == "0->1":
-        return "intra_node_ub"
-    if pair and int(world_size) > INTRA_NODE_MAX_RANKS:
-        return "cross_node_urma"
+    if pair is not None:
+        norm_pair = _explicit_pair(pair) or str(pair).strip()
+        if case is not None and getattr(case.machine, "dies", ()):
+            topo = Topology(case.machine, case.runtime.parallel)
+            parts = norm_pair.split("->", 1)
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+                src, dst = int(parts[0]), int(parts[1])
+                if src in topo._rank_node and dst in topo._rank_node:
+                    if topo.location(src)["node"] == topo.location(dst)["node"]:
+                        return "intra_node_ub"
+                    return "cross_node_urma_far" if norm_pair == "0->24" else "cross_node_urma"
+        if norm_pair == "0->24":
+            return "cross_node_urma_far"
+        if norm_pair == "0->1":
+            return "intra_node_ub"
+        return "cross_node_urma" if int(world_size) > INTRA_NODE_MAX_RANKS else "intra_node_ub"
+    if case is not None:
+        topo, ranks = _resolved_group_ranks(case, op, metadata, device=device)
+        if topo is not None and ranks and len(ranks) == int(world_size):
+            nodes = {topo.location(rank)["node"] for rank in ranks}
+            if len(nodes) > 1:
+                return "cross_node_urma"
+            linked_ranks = {int(rank) for link in case.machine.links for rank in link.members}
+            for idx, src in enumerate(ranks):
+                dst = ranks[(idx + 1) % len(ranks)]
+                if src != dst and src in linked_ranks and dst in linked_ranks:
+                    if any(topo.link_scope(link_name) == "cross_node"
+                           for link_name, _, _ in topo.route(src, dst)):
+                        return "cross_node_urma"
+            return "intra_node_ub"
     if int(world_size) > INTRA_NODE_MAX_RANKS:
         return "cross_node_urma"
-    if case is not None:
-        for link in case.machine.links:
-            if link.members and max(link.members) >= INTRA_NODE_MAX_RANKS:
-                return "cross_node_urma"
     return "intra_node_ub"
 
 
@@ -467,7 +612,10 @@ def _measurement_boundary(curve, collective):
     descriptor = dict(declared) if isinstance(declared, Mapping) else {}
     semantics = curve.provenance.get("service_semantics")
     if not descriptor:
-        if semantics == "aicpu_child_collective_phase" or curve.resource == "aicpu_child":
+        if collective in {"mc2_dispatch", "mc2_combine"}:
+            direction = "dispatch" if collective == "mc2_dispatch" else "combine"
+            descriptor = _mc2_callback_measurement(direction)
+        elif semantics == "aicpu_child_collective_phase" or curve.resource == "aicpu_child":
             phase, complete = "aicpu_child", False
         elif curve.boundary == "resource_phase" or curve.resource == "collective_phase":
             phase, complete = "collective_phase", False
@@ -475,25 +623,26 @@ def _measurement_boundary(curve, collective):
             phase, complete = "directed_p2p_call", False
         else:
             phase, complete = "collective_call", True
-        descriptor = {
-            "kind": "native_target_call" if phase == "aicpu_child" else "device_call",
-            "phase": phase, "resource": curve.resource,
-            "work_coordinate": ("per_rank_input_bytes" if phase == "aicpu_child"
-                                else "captured_per_rank_payload"),
-            "duration_unit": "ms",
-            "source_kind": ("native_ai_cpu_child" if phase == "aicpu_child"
-                            else "campaign_device_call"),
-            "service_semantics": semantics or (
-                "aicpu_child_collective_phase" if phase == "aicpu_child" else
-                "directed_p2p_call" if phase == "directed_p2p_call" else
-                "collective_phase_service" if phase == "collective_phase" else
-                "whole_collective_call_envelope"),
-            "complete_collective_call": complete,
-            "complete_directed_call": phase == "directed_p2p_call",
-            "link_transit_identified": False, "hop_scaling": "not_derived",
-            "algorithm_identified": False,
-            "direction_observed": phase == "directed_p2p_call",
-        }
+        if not descriptor:
+            descriptor = {
+                "kind": "native_target_call" if phase == "aicpu_child" else "device_call",
+                "phase": phase, "resource": curve.resource,
+                "work_coordinate": ("per_rank_input_bytes" if phase == "aicpu_child"
+                                    else "captured_per_rank_payload"),
+                "duration_unit": "ms",
+                "source_kind": ("native_ai_cpu_child" if phase == "aicpu_child"
+                                else "campaign_device_call"),
+                "service_semantics": semantics or (
+                    "aicpu_child_collective_phase" if phase == "aicpu_child" else
+                    "directed_p2p_call" if phase == "directed_p2p_call" else
+                    "collective_phase_service" if phase == "collective_phase" else
+                    "whole_collective_call_envelope"),
+                "complete_collective_call": complete,
+                "complete_directed_call": phase == "directed_p2p_call",
+                "link_transit_identified": False, "hop_scaling": "not_derived",
+                "algorithm_identified": False,
+                "direction_observed": phase == "directed_p2p_call",
+            }
     descriptor.setdefault("complete_collective_call", False)
     descriptor.setdefault("complete_directed_call", False)
     descriptor.setdefault("link_transit_identified", False)
@@ -510,6 +659,8 @@ def _consumer_role(descriptor):
     phase = descriptor.get("phase")
     if phase == "aicpu_child":
         return "aicpu_child_completion_floor"
+    if phase in {"mc2_dispatch", "mc2_combine"}:
+        return f"{phase}_callback_envelope"
     if phase == "collective_phase":
         return "resource_phase_envelope"
     if phase == "directed_p2p_call":
@@ -536,6 +687,9 @@ def _bind_to_bundle(bundle, case, op, scope="none", *, device=None,
               else parse_case(case))
     _require_case_a5(parsed)
     metadata = dict(op.metadata)
+    if device is None:
+        device = parsed.machine.dies[
+            op.stage * parsed.runtime.parallel.tp * parsed.runtime.parallel.pcp]
     selectors = dict(lookup_kwargs)
     explicit = {key: selectors.get(key) for key in (
         "world_size", "expansion_mode", "placement_scope", "pair",
@@ -549,11 +703,11 @@ def _bind_to_bundle(bundle, case, op, scope="none", *, device=None,
     hardware_key = (hardware_key or sku or parsed.machine.hardware_key
                     or parsed.machine.sku)
     placement = selectors.pop("placement_scope", None)
-    world = selectors.pop("world_size", None) or _world_size(parsed, op)
+    world = selectors.pop("world_size", None) or _world_size(parsed, op, device=device)
     mode = selectors.pop("expansion_mode", None) or metadata.get(
         "expansion_mode", metadata.get("expansion_regime", "unspecified"))
     dtype = selectors.pop("dtype", None) or _dtype(
-        op.dtype or parsed.model.compute_dtype)
+        metadata.get("comm_dtype") or op.dtype or parsed.model.compute_dtype)
     pair = selectors.pop("pair", None) or _explicit_pair(metadata.get("p2p_pair"))
     collective = _collective(
         selectors.pop("collective", None) or metadata.get("collective")
@@ -562,7 +716,8 @@ def _bind_to_bundle(bundle, case, op, scope="none", *, device=None,
         collective = _collective(metadata.get("kernel") or op.recipe)
     if collective not in _SUPPORTED_COLLECTIVES:
         raise ModelingError(f"a5_curve_unavailable:{collective}")
-    placement = placement or _placement_for(parsed, op, collective, world, pair)
+    placement = placement or _placement_for(
+        parsed, op, collective, world, pair, device=device)
     boundary = (boundary or selectors.pop("boundary", None)
                 or ("resource_phase" if metadata.get("device_kernel_group")
                     else "device_kernel"))
@@ -573,13 +728,10 @@ def _bind_to_bundle(bundle, case, op, scope="none", *, device=None,
         collective, world, placement_scope=placement, dtype=dtype,
         expansion_mode=mode, pair=pair, hardware_key=hardware_key,
         arch_family=arch_family, boundary=boundary, **selectors)
-    if device is None:
-        device = parsed.machine.dies[
-            op.stage * parsed.runtime.parallel.tp * parsed.runtime.parallel.pcp]
     bound_metadata = dict(metadata)
     if "world_size" in explicit:
         bound_metadata["world_size"] = int(world)
-        for alias in ("group_size", "ranks", "group_ranks", "steps"):
+        for alias in ("comm_group_size", "group_size", "ranks", "group_ranks", "steps"):
             bound_metadata.pop(alias, None)
     if "expansion_mode" in explicit:
         bound_metadata["expansion_mode"] = mode
@@ -594,6 +746,8 @@ def _bind_to_bundle(bundle, case, op, scope="none", *, device=None,
     for key in ("algorithm", "protocol", "stack", "cann"):
         if key in explicit:
             bound_metadata[key] = selectors[key]
+    if "dtype" in explicit and "comm_dtype" in bound_metadata:
+        bound_metadata["comm_dtype"] = dtype
     bound_op = op
     if bound_metadata != metadata:
         bound_op = replace(op, metadata=tuple(sorted(bound_metadata.items())))
@@ -607,7 +761,8 @@ def _bind_to_bundle(bundle, case, op, scope="none", *, device=None,
     units = active_units or device.units(resource)
     measurement = _measurement_boundary(curve, collective)
     _require_complete_call(measurement, require_complete_call)
-    wire_factor = _wire_factor(collective, world, curve) if resource == "link" else 1.0
+    link_wire_factor = _wire_factor(collective, world, curve, measurement=measurement)
+    wire_factor = link_wire_factor if resource == "link" else 1.0
     knots = curve.knots
     source_semantics = (curve.provenance.get("service_semantics")
                         or measurement.get("service_semantics")
@@ -641,6 +796,8 @@ def _bind_to_bundle(bundle, case, op, scope="none", *, device=None,
             measurement.get("link_transit_identified", False)),
         "hop_scaling": measurement.get("hop_scaling", "not_derived"),
     }
+    if link_wire_factor != 1.0:
+        provenance["link_wire_factor"] = link_wire_factor
     if wire_factor != 1.0:
         knots = tuple((float(work) * wire_factor, float(duration))
                       for work, duration in curve.knots)
@@ -689,14 +846,18 @@ def _regime_from_bundle(bundle, case, op, scope="none", *, regime_id=None,
     else:
         match["kernel"] = identity["kernel"]
     metadata = dict(curve.provenance.get("bound_metadata") or op.metadata)
-    for key in ("collective", "a5_collective", "group_axis", "steps", "world_size",
-                "group_size", "ranks", "group_ranks", "placement_scope",
-                "p2p_pair", "expansion_mode", "expansion_regime",
-                "algorithm", "protocol", "stack", "cann"):
+    for key in ("collective", "a5_collective", "comm_dtype", "group_axis", "steps",
+                "world_size", "comm_group_size", "group_size", "ranks",
+                "group_ranks", "placement_scope", "p2p_pair", "expansion_mode",
+                "expansion_regime", "algorithm", "protocol", "stack", "cann"):
         if key in metadata:
             match[f"metadata.{key}"] = metadata[key]
     raw_knots = curve.provenance.get("raw_knots") or curve.knots
-    wire_factor = float(curve.provenance.get("wire_factor") or 1.0)
+    wire_factor = float(
+        curve.provenance.get("wire_factor")
+        or curve.provenance.get("link_wire_factor")
+        or 1.0
+    )
     knots = [[float(work), float(duration * 1000.0)]
              for work, duration in raw_knots]
     coord_spec = {"path": f"work.{coordinate}"}
@@ -861,6 +1022,7 @@ def _a5_collective_program(context, *, hbm, mte2, mte3, vector, duration,
 
 
 def _recipe_from_bundle(bundle, collective=None, *, world_size=None,
+                        case=None,
                         expansion_mode="unspecified",
                         active_aiv_blocks=DEFAULT_ACTIVE_AIV_BLOCKS,
                         allow_unspecified_fallback=False,
@@ -868,8 +1030,15 @@ def _recipe_from_bundle(bundle, collective=None, *, world_size=None,
                         **lookup_kwargs):
     if production:
         raise ModelingError("measured_call_recipe_is_diagnostic_only")
+    parsed_case = (
+        None if case is None
+        else case if hasattr(case, "machine") and not isinstance(case, Mapping)
+        else parse_case(case)
+    )
+    if parsed_case is not None:
+        _require_case_a5(parsed_case)
     mode = _mode(expansion_mode)
-    if mode not in _EXPANSION_MODES and mode != "unspecified":
+    if mode not in _CANONICAL_EXPANSION_MODES and mode != "unspecified":
         raise ModelingError(f"a5_expansion_mode_unknown:{expansion_mode}")
     spec = dict(lookup_kwargs)
     coordinate = spec.pop("coordinate", "link")
@@ -897,19 +1066,24 @@ def _recipe_from_bundle(bundle, collective=None, *, world_size=None,
         ):
             op_mode = _mode(
                 meta.get("expansion_mode") or meta.get("expansion_regime"))
-            if op_mode not in _EXPANSION_MODES and op_mode != "unspecified":
+            if op_mode not in _CANONICAL_EXPANSION_MODES and op_mode != "unspecified":
                 raise ModelingError(f"a5_expansion_mode_unknown:{op_mode}")
         name = _collective(
             collective or meta.get("collective")
             or meta.get("a5_collective") or op.family)
-        world = (world_size or meta.get("world_size")
-                 or meta.get("group_size") or meta.get("ranks")
-                 or INTRA_NODE_MAX_RANKS)
+        world = world_size or _group_size_from_metadata(meta)
+        if world is None and parsed_case is not None:
+            world = _world_size(parsed_case, op)
+        if world is None:
+            if meta.get("group_axis"):
+                raise ModelingError(
+                    f"a5_comm_recipe_world_size_required:{meta['group_axis']}")
+            world = INTRA_NODE_MAX_RANKS
         dtype = _dtype(
-            spec.get("dtype") or getattr(op, "dtype", None)
-            or meta.get("dtype") or "bf16")
+            spec.get("dtype") or meta.get("comm_dtype")
+            or getattr(op, "dtype", None) or meta.get("dtype") or "bf16")
         pair = spec.get("pair") or _explicit_pair(meta.get("p2p_pair"))
-        scope = placement or _placement_for(None, op, name, world, pair)
+        scope = placement or _placement_for(parsed_case, op, name, world, pair)
         software = {
             k: spec[k] if k in spec else meta.get(k)
             for k in ("stack", "cann", "algorithm", "protocol")
@@ -942,7 +1116,8 @@ def _recipe_from_bundle(bundle, collective=None, *, world_size=None,
                for k in ("stack", "cann", "algorithm", "protocol")},
         }
         wire_factor = (
-            _wire_factor(name, world, curve) if coordinate == "link" else 1.0)
+            _wire_factor(name, world, curve, measurement=measurement)
+            if coordinate == "link" else 1.0)
         raw_amount = float(
             getattr(op, coordinate + "_bytes", 0)
             or getattr(op, "link_bytes", 0)

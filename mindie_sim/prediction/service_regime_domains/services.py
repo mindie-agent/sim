@@ -17,6 +17,7 @@ import math
 from typing import Mapping
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.prediction.collectives.topology import Topology, _declared_peer_traffic
 from mindie_sim.prediction.program import KernelProgram, Stage
 
 
@@ -24,12 +25,186 @@ _COMMUNICATION_FAMILIES = frozenset({
     "collective", "alltoall", "alltoallv", "allreduce", "allgather",
     "all_to_all", "all_to_allv", "all_reduce", "all_gather",
     "reduce_scatter", "reducescatter", "broadcast", "send", "recv",
-    "send_recv", "p2p", "p2p_send_recv"})
+    "send_recv", "p2p", "p2p_send_recv", "pp_p2p",
+    "mc2_dispatch", "mc2_combine"})
 _COMMUNICATION_KEYS = (
-    "collective", "a5_collective", "group_axis", "steps", "world_size",
-    "group_size", "ranks", "group_ranks", "placement_scope", "p2p_pair",
-    "expansion_mode", "expansion_regime", "algorithm", "protocol",
-    "stack", "cann")
+    "collective", "a5_collective", "comm_dtype", "group_axis", "steps",
+    "world_size", "comm_group_size", "group_size", "ranks", "group_ranks",
+    "placement_scope", "p2p_pair", "expansion_mode", "expansion_regime",
+    "algorithm", "protocol", "stack", "cann")
+_TOPOLOGY_GROUP_AXES = frozenset({
+    "tp", "ep", "dp", "cp", "dcp", "pcp", "dcp_tp", "dcp_pcp", "dcp_dp",
+    "dcp_a2a", "etp", "local_tp",
+})
+_PAIRWISE_FAMILIES = frozenset({
+    "alltoall", "alltoallv", "all_to_all", "all_to_allv",
+    "mc2_dispatch", "mc2_combine",
+})
+_PAIRWISE_RECIPES = frozenset({"expert_dispatch", "expert_combine"})
+_FULL_PAIRWISE_ROUTE_LIMIT = 8
+_ROUTE_SHARE_DIGITS = 12
+
+
+def _parse_rank_pair(value) -> tuple[int, int] | None:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        try:
+            return int(value[0]), int(value[1])
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, Mapping):
+        src, dst = value.get("source"), value.get("destination")
+        if src is not None and dst is not None:
+            return int(src), int(dst)
+    text = str(value or "").strip()
+    if "->" in text:
+        left, right = text.split("->", 1)
+        if left.strip().isdigit() and right.strip().isdigit():
+            return int(left.strip()), int(right.strip())
+    return None
+
+
+def _route_pairs_for_group(group: tuple[int, ...], topo: Topology, *,
+                           directed: bool, pairwise: bool) -> list[tuple[int, int]]:
+    if len(group) < 2:
+        return []
+    if len(group) == 2:
+        return [(group[0], group[1])] if directed else [(group[0], group[1]), (group[1], group[0])]
+    if pairwise and len(group) <= _FULL_PAIRWISE_ROUTE_LIMIT:
+        return [(src, dst) for src in group for dst in group if src != dst]
+    pairs: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for idx, src in enumerate(group):
+        dst = group[(idx + 1) % len(group)]
+        if src != dst and (src, dst) not in seen:
+            seen.add((src, dst))
+            pairs.append((src, dst))
+    representatives: dict[tuple[int, int], int] = {}
+    for rank in group:
+        loc = topo.location(rank)
+        representatives.setdefault((loc["node"], loc["package"]), rank)
+    rep_ranks = list(representatives.values())
+    for src in rep_ranks:
+        for dst in rep_ranks:
+            if src != dst and (src, dst) not in seen:
+                seen.add((src, dst))
+                pairs.append((src, dst))
+    return pairs
+
+
+def _explicit_group_ranks(metadata: Mapping, topo: Topology) -> tuple[int, ...] | None:
+    for key in ("group_ranks", "ranks"):
+        raw = metadata.get(key)
+        if isinstance(raw, (list, tuple)) and raw:
+            if all(isinstance(r, int) and not isinstance(r, bool) and r in topo._rank_node for r in raw):
+                return tuple(int(r) for r in raw)
+    return None
+
+
+def _peer_traffic_pairs(group: tuple[int, ...], metadata: Mapping) -> list[tuple[int, int, float]] | None:
+    if "peer_traffic" not in metadata or len(group) < 2:
+        return None
+    peer = _declared_peer_traffic(metadata, len(group))
+    active = [
+        (int(group[i]), int(group[j]), float(payload))
+        for i in range(len(group))
+        for j in range(len(group))
+        if i != j and (payload := peer.payload(i, j)) > 0
+    ]
+    total = sum(weight for _, _, weight in active)
+    if total <= 0.0:
+        return []
+    return [(src, dst, round(weight / total, _ROUTE_SHARE_DIGITS)) for src, dst, weight in active]
+
+
+def _resolved_transport_route(case, op, metadata: Mapping, device, *,
+                              device_explicit: bool = False) -> dict | None:
+    dies = tuple(getattr(case.machine, "dies", ()) or ())
+    if not dies:
+        return None
+    parallel = case.runtime.parallel
+    stage = int(metadata.get("source_stage", getattr(op, "stage", 0) or 0))
+    width = max(1, int(parallel.tp) * int(parallel.pcp))
+    stage_span = max(1, int(parallel.pp) * width)
+    die_idx = next(
+        (i for i, die in enumerate(dies) if die is device or die.rank == device.rank),
+        stage * width,
+    )
+    replica = die_idx // stage_span
+    total_replicas = max(1, int(parallel.dp) * int(getattr(parallel, "external_dp", 1) or 1))
+    max_replicas = min(total_replicas, len(dies) // stage_span)
+    topo = Topology(case.machine, parallel)
+    family = str(metadata.get("collective", op.family)).strip().lower()
+    axis = metadata.get("group_axis", "tp")
+    groups: tuple[tuple[int, ...], ...] = ()
+    directed = False
+    explicit_ranks = _explicit_group_ranks(metadata, topo)
+    if family == "pp_p2p" or axis == "pp":
+        dest_stage = (
+            int(metadata["destination_stage"])
+            if "destination_stage" in metadata
+            else stage + 1
+        )
+        if 0 <= stage < parallel.pp and 0 <= dest_stage < parallel.pp and dest_stage != stage:
+            groups = tuple(
+                (src, dst)
+                for src, dst in zip(topo.ranks(replica, stage), topo.ranks(replica, dest_stage))
+                if src != dst
+            )
+            directed = True
+    elif family in {"p2p", "p2p_send_recv", "send", "recv", "send_recv"}:
+        pair = _parse_rank_pair(metadata.get("p2p_pair"))
+        if pair is not None and all(r in topo._rank_node for r in pair):
+            groups = (pair,)
+            directed = True
+    elif explicit_ranks is not None:
+        groups = (explicit_ranks,)
+    elif 0 <= replica < max_replicas and 0 <= stage < parallel.pp and axis in _TOPOLOGY_GROUP_AXES:
+        if axis != "local_tp" or metadata.get("local_tp_width"):
+            groups = tuple(topo.groups(axis, replica, stage, metadata=metadata))
+            if device_explicit:
+                device_groups = tuple(grp for grp in groups if device.rank in grp)
+                if device_groups:
+                    groups = device_groups
+    if not groups:
+        return None
+    linked_ranks = {int(rank) for link in case.machine.links for rank in link.members}
+    pairwise = (
+        family in _PAIRWISE_FAMILIES
+        or "peer_traffic" in metadata
+        or getattr(op, "recipe", "") in _PAIRWISE_RECIPES
+    )
+    routes = []
+    for grp in groups:
+        peer_pairs = _peer_traffic_pairs(grp, metadata)
+        weighted_pairs = (
+            peer_pairs
+            if peer_pairs is not None
+            else [(src, dst, None) for src, dst in _route_pairs_for_group(
+                grp, topo, directed=directed, pairwise=pairwise)]
+        )
+        for src, dst, share in weighted_pairs:
+            if src not in linked_ranks or dst not in linked_ranks:
+                continue
+            path = topo.route(src, dst)
+            entry = {
+                "source": int(src),
+                "destination": int(dst),
+                "hops": [
+                    {
+                        "link": link_name,
+                        "channel": topo.links[link_name].channel,
+                        "scope": topo.link_scope(link_name),
+                    }
+                    for link_name, _, _ in path
+                ],
+            }
+            if share is not None:
+                entry["share"] = share
+            routes.append(entry)
+    return {
+        "groups": [[int(rank) for rank in grp] for grp in groups],
+        "routes": routes,
+    }
 
 
 def _zero_resource_node(op) -> bool:
@@ -93,6 +268,7 @@ def service_identity(case, op, scope="none", *, device=None):
         return json.loads(json.dumps(
             _zero_resource_identity(case, op, metadata, scope, device),
             sort_keys=True, allow_nan=False))
+    device_explicit = device is not None
     device = device or case.machine.dies[
         op.stage * case.runtime.parallel.tp * case.runtime.parallel.pcp]
     identity = {
@@ -132,8 +308,14 @@ def service_identity(case, op, scope="none", *, device=None):
                 "ep": parallel.ep, "cp": parallel.cp, "pcp": parallel.pcp,
                 "sp": bool(getattr(parallel, "sp", dict(
                     getattr(case.runtime, "metadata", ()) or ()).get("sp", False))),
+                **({"rank_table": [list(group) for group in parallel.rank_table]}
+                   if getattr(parallel, "rank_table", None) is not None else {}),
             },
         }
+        resolved_route = _resolved_transport_route(
+            case, op, metadata, device, device_explicit=device_explicit)
+        if resolved_route is not None:
+            identity["transport"].update(resolved_route)
         for key in _COMMUNICATION_KEYS:
             if key in metadata:
                 identity["transport"][key] = metadata[key]
