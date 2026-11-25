@@ -976,11 +976,90 @@ def bind_transport_gate(gate, down, *, transport, latent, local_rows, payload, s
     ))
 
 
+def _exact_slot_realization(routing_realization, slot_plan, num_experts: int):
+    """Extract an exact per-rank or per-expert routing map when explicitly declared."""
+    if routing_realization is None:
+        return None
+    rank_rows = getattr(routing_realization, "rank_expert_rows", None)
+    placement = getattr(routing_realization, "expert_placement", None)
+    slot_ids = slot_plan.expert_ids_by_rank
+    owned = [frozenset(ids) for ids in slot_ids]
+    if rank_rows and len(rank_rows) == len(slot_ids):
+        by_rank: dict[int, dict[int, int]] = {rank: {} for rank in range(len(rank_rows))}
+        if placement and len(placement) == num_experts:
+            for expert, (rank, bank) in enumerate(placement):
+                rk, bk = int(rank), int(bank)
+                by_rank[rk][int(expert)] = int(rank_rows[rk][bk])
+        else:
+            for rank, banks in enumerate(rank_rows):
+                base = rank * len(banks)
+                for bank, count in enumerate(banks):
+                    by_rank[rank][base + bank] = int(count)
+        if all(
+            expert in owned[rank]
+            for rank, mapping in by_rank.items()
+            for expert, count in mapping.items()
+            if count > 0
+        ):
+            return by_rank
+    declared = tuple(getattr(routing_realization, "expert_rows", ()) or ())
+    if not declared or len(declared) != num_experts:
+        return None
+    if (
+        getattr(routing_realization, "basis", "") == "forced_balanced_integer_counts"
+        and int(getattr(routing_realization, "ep", 0) or 0) == len(slot_ids)
+    ):
+        ep = len(slot_ids)
+        strided: dict[int, dict[int, int]] = {rank: {} for rank in range(ep)}
+        if ep <= num_experts:
+            for expert, count in enumerate(declared):
+                if int(count) > 0:
+                    strided[expert % ep][expert] = int(count)
+        else:
+            for rank in range(ep):
+                expert = rank % num_experts
+                replicas = 1 + (ep - 1 - expert) // num_experts
+                rep = rank // num_experts
+                cnt = int(declared[expert]) // replicas + int(rep < int(declared[expert]) % replicas)
+                if cnt > 0:
+                    strided[rank][expert] = cnt
+        if all(
+            expert in owned[rank]
+            for rank, mapping in strided.items()
+            for expert, count in mapping.items()
+            if count > 0
+        ):
+            return strided
+        # BalancedRouting assigns experts strided across EP ranks, whereas the
+        # base slot layout without full redundancy is contiguous per rank; map
+        # each rank's balanced local bank counts onto that rank's base slots so
+        # per-rank active counts and weight reads match BalancedRouting 1:1.
+        base = (num_experts + ep - 1) // ep
+        per_rank: dict[int, dict[int, int]] = {rank: {} for rank in range(ep)}
+        for rank in range(ep):
+            local_counts = declared[rank::ep]
+            for bank, count in enumerate(local_counts):
+                if int(count) > 0:
+                    slot_expert = (rank * base + bank) % num_experts
+                    per_rank[rank][slot_expert] = per_rank[rank].get(slot_expert, 0) + int(count)
+        if all(
+            expert in owned[rank]
+            for rank, mapping in per_rank.items()
+            for expert, count in mapping.items()
+            if count > 0
+        ):
+            return per_rank
+    return {expert: int(count) for expert, count in enumerate(declared)}
+
+
 def bind_expert_slots(ops, *, model, plan, parallel, routing, runtime_routing,
                       routing_realization, group_tokens, expert_width, latent):
     """Bind each routed matrix's active weight read to its physical slot plan."""
     _, slot_routing = split_routing_features(runtime_routing)
     slot_plan = expert_slot_plan(model, plan, parallel, routing=slot_routing)
+    exact_realization = _exact_slot_realization(
+        routing_realization, slot_plan, int(plan.num_experts),
+    )
     declared = tuple(getattr(routing_realization, "expert_rows", ()) or ())
     if declared and len(declared) == int(plan.num_experts):
         assignments = sum(float(value) for value in declared)
@@ -1002,11 +1081,13 @@ def bind_expert_slots(ops, *, model, plan, parallel, routing, runtime_routing,
     gate_work = physical_slot_work(
         slot_plan=slot_plan, logical_inclusions=inclusions,
         global_tokens=int(group_tokens),
-        packed_weight_bytes=tuple([gate_unit] * experts))
+        packed_weight_bytes=tuple([gate_unit] * experts),
+        routing_realization=exact_realization)
     down_work = physical_slot_work(
         slot_plan=slot_plan, logical_inclusions=inclusions,
         global_tokens=int(group_tokens),
-        packed_weight_bytes=tuple([down_unit] * experts))
+        packed_weight_bytes=tuple([down_unit] * experts),
+        routing_realization=exact_realization)
     kinds = {
         op.op_id: str(dict(op.metadata).get("expert_slot_weight_kind", ""))
         for op in ops

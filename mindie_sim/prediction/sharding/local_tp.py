@@ -11,7 +11,11 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, Iterable, Mapping, Sequence
 
-from mindie_sim.catalog.ops import comm_op
+from mindie_sim.catalog.ops import (
+    W4A16_DEQUANT_OPS_PER_WEIGHT,
+    W4A16_WEIGHT_FORMATS,
+    comm_op,
+)
 from mindie_sim.catalog.projection_placement import (
     ROLE_ATTENTION_INPUT, ROLE_DENSE_MLP_DOWN, ROLE_DENSE_MLP_UP,
     ROLE_DRAFT_LOGITS, ROLE_LINEAR_INPUT, ROLE_LOGITS,
@@ -31,6 +35,32 @@ def _enabled_widths(parallel: Any) -> tuple[int, ...]:
         int(getattr(parallel, name, 1) or 1)
         for name in LOCAL_TP_AXIS_NAMES
     } - {1}))
+
+
+def _lm_head_tp(parallel: Any) -> int:
+    return max(1, int(getattr(parallel, "lm_head_tp", 1) or 1))
+
+
+def _non_lm_head_widths(parallel: Any) -> tuple[int, ...]:
+    return tuple(sorted({
+        int(getattr(parallel, name, 1) or 1)
+        for name in LOCAL_TP_AXIS_NAMES
+        if name != "lm_head_tp"
+    } - {1}))
+
+
+def _model_is_moe(model: Any) -> bool:
+    """True when the model architecture is MoE (including dense prefix slices)."""
+    if model is None:
+        return True
+    if int(getattr(model, "num_experts", 0) or 0) > 0:
+        return True
+    if int(getattr(model, "moe_intermediate_size", 0) or 0) > 0:
+        return True
+    if any(getattr(lp, "ffn", "") == "moe" for lp in (getattr(model, "layer_plans", ()) or ())):
+        return True
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    return int(facts.get("moe_layers", 0) or 0) > 0
 
 
 def _rank_order(machine: Any) -> tuple[int, ...]:
@@ -84,7 +114,7 @@ def local_tp_groups(
     buckets = _stage_rank_buckets(machine, parallel, stage=stage, stride=stride)
     for (ext, node, lane, _tp_off), ranks in sorted(buckets.items()):
         del ext
-        ordered = tuple(sorted(ranks))
+        ordered = tuple(ranks)
         if width > len(ordered):
             raise ModelingError(
                 f"local_tp_width_exceeds_node_lane:{width}>{len(ordered)}")
@@ -141,13 +171,18 @@ def local_tp_cohorts(
             if cp_spans:
                 for group in topology.groups("cp", replica, stage):
                     edges.extend((group[0], rank) for rank in group[1:])
-        for width in _enabled_widths(parallel):
+        for width in _non_lm_head_widths(parallel):
             for group in local_tp_groups(machine, parallel, stage=stage, width=width):
                 edges.extend((group[0], rank) for rank in group[1:])
             if tp > 1 and width > tp and width % tp == 0:
                 for group in local_tp_groups(
                         machine, parallel, stage=stage, width=width // tp, stride=tp):
                     edges.extend((group[0], rank) for rank in group[1:])
+        lm_w = _lm_head_tp(parallel)
+        if lm_w > 1:
+            for group in local_tp_groups(
+                    machine, parallel, stage=stage, width=lm_w, stride=tp):
+                edges.extend((group[0], rank) for rank in group[1:])
     return _union_components(_rank_order(machine), edges)
 
 
@@ -173,7 +208,7 @@ def local_tp_replica_cohorts(
                 for group in topology.groups("cp", r, stage):
                     reps = [owner[int(rk)] for rk in group if int(rk) in owner]
                     edges.extend((reps[0], rep) for rep in reps[1:])
-        for width in _enabled_widths(parallel):
+        for width in _non_lm_head_widths(parallel):
             for group in local_tp_groups(machine, parallel, stage=stage, width=width):
                 reps = [owner[int(rk)] for rk in group if int(rk) in owner]
                 edges.extend((reps[0], rep) for rep in reps[1:])
@@ -182,7 +217,35 @@ def local_tp_replica_cohorts(
                         machine, parallel, stage=stage, width=width // tp, stride=tp):
                     reps = [owner[int(rk)] for rk in group if int(rk) in owner]
                     edges.extend((reps[0], rep) for rep in reps[1:])
+        lm_w = _lm_head_tp(parallel)
+        if lm_w > 1:
+            for group in local_tp_groups(
+                    machine, parallel, stage=stage, width=lm_w, stride=tp):
+                reps = [owner[int(rk)] for rk in group if int(rk) in owner]
+                edges.extend((reps[0], rep) for rep in reps[1:])
     return _union_components(range(dp), edges)
+
+
+def _validate_stage_groups(
+    hardware: Any, parallel: Any, devices: Mapping[int, Any], expected: set[int],
+    *, width: int, stride: int = 1,
+) -> None:
+    seen: set[int] = set()
+    for stage in range(max(1, int(parallel.pp))):
+        groups = local_tp_groups(hardware, parallel, stage=stage, width=width, stride=stride)
+        stage_ranks = [rank for group in groups for rank in group]
+        if len(stage_ranks) != len(set(stage_ranks)):
+            raise ModelingError("local_tp_rank_in_multiple_groups")
+        for group in groups:
+            signatures = {devices[rank].resource_signature for rank in group}
+            if len(signatures) > 1:
+                raise ModelingError("local_tp_group_spans_heterogeneous_devices")
+            nodes = {int(getattr(devices[rank], "node", 0)) for rank in group}
+            if len(nodes) > 1:
+                raise ModelingError("local_tp_group_spans_nodes")
+        seen.update(stage_ranks)
+    if not expected <= seen:
+        raise ModelingError("local_tp_group_coverage_incomplete")
 
 
 def validate_local_projection_tp(case: Any) -> None:
@@ -192,7 +255,12 @@ def validate_local_projection_tp(case: Any) -> None:
     widths = _enabled_widths(parallel)
     if not widths:
         return
-    lane_plane = int(parallel.dp) * int(parallel.tp)
+    model = getattr(case, "model", None)
+    if model is not None and not _model_is_moe(model):
+        raise ModelingError("local_tp_requires_moe_model")
+    dp = max(1, int(parallel.dp))
+    tp = max(1, int(parallel.tp))
+    lane_plane = dp * tp
     ranks_per_node = max(1, int(getattr(hardware, "ranks_per_node", 1) or 1))
     hardware.validate_placement(parallel)
     devices = _device_map(hardware)
@@ -203,13 +271,12 @@ def validate_local_projection_tp(case: Any) -> None:
     ext_dp = max(1, int(getattr(parallel, "external_dp", 1) or 1))
     expected = {
         rank
-        for replica in range(max(1, ext_dp * int(parallel.dp)))
+        for replica in range(max(1, ext_dp * dp))
         for stage in range(max(1, int(parallel.pp)))
         for rank in topology.ranks(replica, stage)
     }
     if not expected <= declared:
         raise ModelingError("local_tp_physical_rank_missing")
-    tp = max(1, int(parallel.tp))
     for width in widths:
         if width > ranks_per_node:
             raise ModelingError(
@@ -217,26 +284,15 @@ def validate_local_projection_tp(case: Any) -> None:
         if width > lane_plane:
             raise ModelingError(
                 f"local_tp_width_exceeds_lane_plane:{width}>{lane_plane}")
+        if dp % width != 0:
+            raise ModelingError(f"local_tp_width_not_divisor_of_dp:{width}!|{dp}")
+    for width in _non_lm_head_widths(parallel):
         if tp > 1 and width > tp and width % tp != 0:
             raise ModelingError(f"local_tp_width_not_multiple_of_tp:{width}%{tp}")
-        seen: set[int] = set()
-        for stage in range(max(1, int(parallel.pp))):
-            groups = local_tp_groups(hardware, parallel, stage=stage, width=width)
-            stage_ranks = [
-                rank for group in groups for rank in group
-            ]
-            if len(stage_ranks) != len(set(stage_ranks)):
-                raise ModelingError("local_tp_rank_in_multiple_groups")
-            for group in groups:
-                signatures = {devices[rank].resource_signature for rank in group}
-                if len(signatures) > 1:
-                    raise ModelingError("local_tp_group_spans_heterogeneous_devices")
-                nodes = {int(getattr(devices[rank], "node", 0)) for rank in group}
-                if len(nodes) > 1:
-                    raise ModelingError("local_tp_group_spans_nodes")
-            seen.update(stage_ranks)
-        if not expected <= seen:
-            raise ModelingError("local_tp_group_coverage_incomplete")
+        _validate_stage_groups(hardware, parallel, devices, expected, width=width)
+    lm_w = _lm_head_tp(parallel)
+    if lm_w > 1:
+        _validate_stage_groups(hardware, parallel, devices, expected, width=lm_w, stride=tp)
 
 
 def local_tp_spans_dp(parallel: Any) -> bool:
@@ -246,7 +302,9 @@ def local_tp_spans_dp(parallel: Any) -> bool:
         return False
     if bool(getattr(parallel, "cp_spans_dp", False)):
         return True
-    return any(width > tp for width in _enabled_widths(parallel))
+    if _lm_head_tp(parallel) > 1:
+        return True
+    return any(width > tp for width in _non_lm_head_widths(parallel))
 
 
 def rank_zero_graph_reuse(parallel: Any, replicas: int, has_device_group: bool) -> bool:
@@ -410,6 +468,8 @@ def _effective_factor(
     if width <= 1:
         return 1, 1
     tp = max(1, int(getattr(runtime.parallel, "tp", 1) or 1))
+    if role in {ROLE_LOGITS, ROLE_DRAFT_LOGITS}:
+        return width, tp
     if tp <= 1 or _is_globally_replicated(op, role, metadata, runtime, model):
         return width, 1
     if width == tp:
@@ -572,12 +632,23 @@ def _collective(op: OpSpec, *, suffix: str, family: str, recipe: str, payload: f
     return replace(built, op_id=public_id or built.op_id, dtype=dtype)
 
 
+def _scaled_matrix_flops(op: OpSpec, new_flops: float) -> tuple[tuple[str, float], ...]:
+    if not op.matrix_flops:
+        return ()
+    total = sum(float(v) for _, v in op.matrix_flops)
+    if total > 0.0:
+        ratio = new_flops / total
+        return tuple((dt, float(v) * ratio) for dt, v in op.matrix_flops)
+    return tuple((dt, new_flops if idx == 0 else 0.0) for idx, (dt, _) in enumerate(op.matrix_flops))
+
+
 def _rewrite_matrix(op: OpSpec, *, gemm_id: str, rows: int, cols: int, reduced: int,
                     role: str, width: int, dep_ids: tuple[str, ...],
                     weight_ratio: float, quant: Any, groups: int = 1,
                     extra_metadata: Mapping[str, Any] | None = None,
                     scale_ratio: float | None = None) -> OpSpec:
-    metadata = {**dict(op.metadata), **dict(extra_metadata or ())}
+    orig_meta = dict(op.metadata)
+    metadata = {**orig_meta, **dict(extra_metadata or ())}
     original_weight = float(metadata.get("packed_weight_bytes", 0.0) or 0.0)
     cat = str(metadata.get("quant_category", metadata.get("catalog_category", "")) or "")
     if quant is not None and cat and rows > 0:
@@ -590,6 +661,13 @@ def _rewrite_matrix(op: OpSpec, *, gemm_id: str, rows: int, cols: int, reduced: 
     m, n, k = int(rows), int(cols), int(reduced)
     in_b, out_b = float(m * k) * dtype_bytes(act), float(m * n) * dtype_bytes(out)
     orig_m = max(1, int(op.local_shape[0]))
+    orig_n = max(1, int(op.local_shape[1]))
+    orig_k = max(1, int(op.local_shape[2]))
+    orig_groups = max(1, int(orig_meta.get("matrix_groups", 1) or 1))
+    new_groups = max(1, int(groups))
+    weight_elem_ratio = (
+        float(new_groups * n * k) / float(orig_groups * orig_n * orig_k)
+    )
     ratio = float(m) / float(orig_m) if scale_ratio is None else float(scale_ratio)
     scale_shape, geometry_bytes = _local_scale_geometry(metadata, m, k)
     scale_b = (geometry_bytes if scale_shape else
@@ -597,17 +675,70 @@ def _rewrite_matrix(op: OpSpec, *, gemm_id: str, rows: int, cols: int, reduced: 
                * ratio)
     if scale_shape:
         metadata["activation_scale_shape"] = scale_shape
+    epilogue = metadata.get("matrix_epilogue")
+    w_fmt = str(metadata.get("weight_format", "") or "").strip().lower()
+    comp_fmt = str(metadata.get("compute_format", op.dtype or "") or "").strip().lower()
+    is_w4a16 = (
+        metadata.get("dequant") == "groupwise_fused"
+        or (w_fmt in W4A16_WEIGHT_FORMATS and comp_fmt != "int8")
+    )
+    if isinstance(epilogue, Mapping) and epilogue.get("kind") == "row_column_scale":
+        ep_copy = dict(epilogue)
+        ep_copy["row_scale_bytes"] = float(scale_b) if m > 0 else 0.0
+        col_scale = float(ep_copy.get("column_scale_bytes", 0.0) or 0.0)
+        ep_copy["column_scale_bytes"] = (
+            col_scale * float(new_groups * n) / float(orig_groups * orig_n)
+            if m > 0 else 0.0
+        )
+        metadata["matrix_epilogue"] = ep_copy
+        ops_per_out = float(ep_copy.get("operations_per_output", 0) or 0)
+        new_vector_ops = ops_per_out * float(m * n)
+    elif is_w4a16:
+        if m > 0:
+            if float(op.vector_ops) > 0.0:
+                new_vector_ops = float(op.vector_ops) * weight_elem_ratio
+            else:
+                ops_per_w = float(
+                    metadata.get("dequant_ops_per_weight", W4A16_DEQUANT_OPS_PER_WEIGHT)
+                    or W4A16_DEQUANT_OPS_PER_WEIGHT
+                )
+                base_elems = float(metadata.get("dequant_weight_elements", 0.0) or 0.0)
+                new_elems = (
+                    base_elems * weight_elem_ratio
+                    if base_elems > 0.0 else float(new_groups * n * k)
+                )
+                new_vector_ops = ops_per_w * new_elems
+            if "dequant_weight_elements" in metadata:
+                metadata["dequant_weight_elements"] = (
+                    float(metadata["dequant_weight_elements"]) * weight_elem_ratio
+                )
+            elif metadata.get("dequant") != "groupwise_fused":
+                metadata["dequant"] = "groupwise_fused"
+                metadata["dequant_ops_per_weight"] = float(W4A16_DEQUANT_OPS_PER_WEIGHT)
+                metadata["dequant_weight_elements"] = float(new_groups * n * k)
+        else:
+            new_vector_ops = 0.0
+    elif float(op.vector_ops) > 0.0:
+        new_vector_ops = (
+            float(op.vector_ops) * float(m * n) / float(orig_m * orig_n)
+            if m > 0 else 0.0
+        )
+    else:
+        new_vector_ops = 0.0
     metadata.update({
         "packed_weight_bytes": local_weight, "weight_bytes": local_weight,
         "activation_scale_bytes": scale_b, "placement_role": role,
         "local_tp_width": int(width), "local_tp_applied": True,
         "matrix_groups": max(1, int(groups)),
     })
+    new_flops = float(2 * m * n * k)
     pad_m = align_up(m, ALIGN_ELEMENT) if m > 0 else 0
     return replace(
         op, op_id=gemm_id, local_shape=(m, n, k),
         padded_shape=(pad_m, align_up(n, ALIGN_ELEMENT), align_up(k, ALIGN_ELEMENT)),
-        launch_shape=(m, n, k), flops=float(2 * m * n * k),
+        launch_shape=(m, n, k), flops=new_flops,
+        matrix_flops=_scaled_matrix_flops(op, new_flops),
+        vector_ops=new_vector_ops,
         hbm_bytes=in_b + local_weight + out_b + scale_b,
         mte2_bytes=in_b + local_weight + scale_b, mte3_bytes=out_b,
         deps=dep_ids, metadata=tuple(sorted(metadata.items(), key=lambda pair: pair[0])),
@@ -626,10 +757,20 @@ def _partition_kind(role: str, metadata: Mapping[str, Any]) -> str:
 
 
 def _empty_passthrough(op: OpSpec, metadata: Mapping[str, Any], width: int) -> OpSpec:
-    meta = {**dict(metadata), "local_tp_applied": True, "local_tp_width": int(width),
-            "packed_weight_bytes": 0.0, "weight_bytes": 0.0}
-    return replace(op, flops=0.0, hbm_bytes=0.0, mte2_bytes=0.0,
-                   mte3_bytes=0.0,
+    meta = {
+        **dict(metadata), "local_tp_applied": True, "local_tp_width": int(width),
+        "packed_weight_bytes": 0.0, "weight_bytes": 0.0, "activation_scale_bytes": 0.0,
+    }
+    epilogue = meta.get("matrix_epilogue")
+    if isinstance(epilogue, Mapping):
+        ep_copy = dict(epilogue)
+        if "row_scale_bytes" in ep_copy:
+            ep_copy["row_scale_bytes"] = 0.0
+        if "column_scale_bytes" in ep_copy:
+            ep_copy["column_scale_bytes"] = 0.0
+        meta["matrix_epilogue"] = ep_copy
+    return replace(op, flops=0.0, matrix_flops=(), vector_ops=0.0,
+                   hbm_bytes=0.0, mte2_bytes=0.0, mte3_bytes=0.0,
                    metadata=tuple(sorted(meta.items(), key=lambda pair: pair[0])))
 
 
@@ -841,11 +982,26 @@ def _rewrite_paired_ffn(
     return tuple(emitted)
 
 
+def _logits_tp_gather(
+    op: OpSpec, by_id: Mapping[str, OpSpec], users: Mapping[str, list[str]],
+) -> OpSpec | None:
+    """Trailing TP ``allgather`` replaced when DP-axis LM-head TP owns full vocab."""
+    for uid in users.get(op.op_id) or ():
+        cand = by_id.get(uid)
+        if (cand is not None and cand.family == "allgather"
+                and cand.op_id == f"{op.op_id}_gather"
+                and cand.deps == (op.op_id,)
+                and dict(cand.metadata).get("group_axis") == "tp"):
+            return cand
+    return None
+
+
 def _rewrite_single_projection(
     op: OpSpec, *, role: str, partition: str, factor: int, stride: int,
     group: Sequence[int], total_tok: int, pad_tok: int,
     quant: Any, op_scope: str, by_id: Mapping[str, OpSpec],
     users: Mapping[str, list[str]], metadata: dict[str, Any],
+    model: Any = None,
 ) -> tuple[OpSpec, ...]:
     m, n, k = (int(op.local_shape[0]), int(op.local_shape[1]), int(op.local_shape[2]))
     act = _dtype(metadata, "activation_format", op.dtype or FALLBACK_ACTIVATION)
@@ -873,20 +1029,36 @@ def _rewrite_single_projection(
                               dtype=out, public_id=op.op_id, stride=stride)
         return (gemm, restore)
     if partition == ROLE_COLUMN:
-        local_n = _packed_local_width(metadata, factor, n, quant, role=role)
+        full_n = n
+        if role in {ROLE_LOGITS, ROLE_DRAFT_LOGITS} and stride > 1:
+            tp_gather = _logits_tp_gather(op, by_id, users)
+            padded_v = int(metadata.get("vocab_padded_size") or 0)
+            if padded_v > 0:
+                full_n = padded_v
+            elif tp_gather is not None and len(tp_gather.local_shape) >= 2 and int(tp_gather.local_shape[1]) > n:
+                full_n = int(tp_gather.local_shape[1])
+            elif role == ROLE_LOGITS and model is not None and int(getattr(model, "vocab_size", 0) or 0) > 0:
+                full_n = int(model.vocab_size)
+            elif not _is_globally_replicated(op, role, metadata, SimpleNamespace(metadata=()), model):
+                full_n = n * stride
+        local_n = _packed_local_width(metadata, factor, full_n, quant, role=role)
         replicated_n = _replicated_local_width(metadata, factor)
-        _localize_packed_slices(metadata, factor, quant, rows=total_tok)
+        col_rows = (
+            factor * pad_tok if role in {ROLE_LOGITS, ROLE_DRAFT_LOGITS}
+            else total_tok
+        )
+        _localize_packed_slices(metadata, factor, quant, rows=col_rows)
         gather = _collective(op, suffix="gather", family="allgather", recipe="ring_allgather",
-                             payload=float((factor - 1) * pad_tok * k) * dtype_bytes(act), shape=(total_tok, k),
+                             payload=float((factor - 1) * pad_tok * k) * dtype_bytes(act), shape=(col_rows, k),
                              role=role, group=group, width=factor, deps=op.deps, scope=op_scope, dtype=act,
                              stride=stride)
-        gemm = _rewrite_matrix(op, gemm_id=gemm_id, rows=total_tok, cols=local_n, reduced=k,
+        gemm = _rewrite_matrix(op, gemm_id=gemm_id, rows=col_rows, cols=local_n, reduced=k,
                                role=role, width=factor, dep_ids=(gather.op_id,),
                                weight_ratio=float(local_n) / float(max(1, n)), quant=quant, extra_metadata=metadata)
         exchanged_n = max(0, local_n - replicated_n)
         restore = _collective(op, suffix="exchange", family="alltoall", recipe="alltoall",
                               payload=float((factor - 1) * pad_tok * exchanged_n)
-                                      * dtype_bytes(out), shape=(m, n),
+                                      * dtype_bytes(out), shape=(m, full_n),
                               role=role, group=group, width=factor, deps=(gemm.op_id,), scope=op_scope,
                               dtype=out, public_id=op.op_id, stride=stride)
         return (gather, gemm, restore)
@@ -934,7 +1106,7 @@ def lower_local_projection_tp(
     if not runtime.parallel.has_local_tp:
         return tuple(ops)
 
-    validate_local_projection_tp(SimpleNamespace(runtime=runtime, machine=machine))
+    validate_local_projection_tp(SimpleNamespace(model=model, runtime=runtime, machine=machine))
     by_id = {op.op_id: op for op in ops}
     users: dict[str, list[str]] = {}
     for consumer in ops:
@@ -943,14 +1115,20 @@ def lower_local_projection_tp(
     paired_blocks: dict[str, tuple[OpSpec, OpSpec | None, OpSpec]] = {}
     paired_members: set[str] = set()
     retire: set[str] = set()
+    dep_aliases: dict[str, str] = {}
     for candidate in ops:
         candidate_meta = dict(candidate.metadata)
         candidate_role = _role(candidate_meta)
         if not candidate_role or candidate_meta.get("local_tp_applied"):
             continue
-        factor, _ = _effective_factor(candidate, candidate_role, candidate_meta, runtime, model)
+        factor, stride = _effective_factor(candidate, candidate_role, candidate_meta, runtime, model)
         if factor <= 1:
             continue
+        if candidate_role in {ROLE_LOGITS, ROLE_DRAFT_LOGITS} and stride > 1:
+            tp_gather = _logits_tp_gather(candidate, by_id, users)
+            if tp_gather is not None:
+                retire.add(tp_gather.op_id)
+                dep_aliases[tp_gather.op_id] = candidate.op_id
         matched = _match_paired_ffn(candidate, candidate_role, by_id, users)
         if matched is not None:
             paired_blocks[candidate.op_id] = matched
@@ -968,6 +1146,8 @@ def lower_local_projection_tp(
     for op in ops:
         if op.op_id in retire or op.op_id in paired_members:
             continue
+        if dep_aliases and any(d in dep_aliases for d in op.deps):
+            op = replace(op, deps=tuple(dep_aliases.get(d, d) for d in op.deps))
         metadata = dict(op.metadata)
         role = _role(metadata)
         if not role or metadata.get("local_tp_applied"):
@@ -1017,6 +1197,7 @@ def lower_local_projection_tp(
             op, role=role, partition=partition, factor=factor, stride=stride,
             group=group, total_tok=total_tok, pad_tok=pad_tok, quant=quant,
             op_scope=op_scope, by_id=by_id, users=users, metadata=metadata,
+            model=model,
         ))
     return tuple(rewritten)
 
@@ -1030,8 +1211,8 @@ def _synth_idle_block(
     z_pad = (0, int(tmpl.padded_shape[1]), int(tmpl.padded_shape[2]))
     z_launch = (0, int(tmpl.launch_shape[1]), int(tmpl.launch_shape[2]))
     gate = replace(tmpl, requests=(), deps=dep_ids, local_shape=z_local, padded_shape=z_pad,
-                   launch_shape=z_launch, flops=0.0, hbm_bytes=0.0,
-                   mte2_bytes=0.0, mte3_bytes=0.0)
+                   launch_shape=z_launch, flops=0.0, matrix_flops=(), vector_ops=0.0,
+                   hbm_bytes=0.0, mte2_bytes=0.0, mte3_bytes=0.0)
     if paired is None:
         return [gate]
     act_tmpl, pq_tmpl, down_tmpl = paired
@@ -1063,8 +1244,8 @@ def _synth_idle_block(
     dz_launch = (0, int(down_tmpl.launch_shape[1]), int(down_tmpl.launch_shape[2]))
     synth_down = replace(down_tmpl, requests=(), deps=(down_dep,),
                          local_shape=dz_local, padded_shape=dz_pad, launch_shape=dz_launch,
-                         flops=0.0, hbm_bytes=0.0,
-                         mte2_bytes=0.0, mte3_bytes=0.0)
+                         flops=0.0, matrix_flops=(), vector_ops=0.0,
+                         hbm_bytes=0.0, mte2_bytes=0.0, mte3_bytes=0.0)
     chain.append(synth_down)
     return chain
 
@@ -1077,7 +1258,7 @@ def lower_local_projection_tp_cohort(
         return {int(r): tuple(ops) for r, ops in graphs.items()}
     from mindie_sim.prediction.topology import Topology
 
-    validate_local_projection_tp(SimpleNamespace(runtime=runtime, machine=machine))
+    validate_local_projection_tp(SimpleNamespace(model=model, runtime=runtime, machine=machine))
     topo = Topology(machine, runtime.parallel)
     identifiers = [tuple(op.op_id for op in ops) for ops in graphs.values()]
     homogeneous = all(ids == identifiers[0] for ids in identifiers)

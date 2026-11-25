@@ -43,12 +43,17 @@ _OPTIONAL_DECLARATION_KEYS = frozenset({
     "rejects_sp_with_pp",
 })
 _MMRS_ALLOWED_TP = frozenset({2, 4, 8})
-_MMRS_ALLOWED_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16"})
+_MMRS_CANONICAL_DTYPES = MappingProxyType({
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "fp16": "fp16",
+    "float16": "fp16",
+})
+_MMRS_ALLOWED_DTYPES = frozenset(_MMRS_CANONICAL_DTYPES)
 _MMRS_K_MIN = 256
 _MMRS_K_MAX_EXCLUSIVE = 65535
 _MMRS_PRODUCER_FAMILIES = frozenset({
     "gemm",
-    "grouped_gemm",
     "projection",
     "output_projection",
     "o_projection",
@@ -62,6 +67,14 @@ _MMRS_PRODUCER_FAMILIES = frozenset({
     "vision_projector",
 })
 _MC2_MASK_CAST_COUNT = 3
+_EAGER_GRAPH_MODES = frozenset({"none", "off", "eager", "disabled"})
+_MMRS_INTERNAL_CHUNKS = 1
+_MMRS_REQUIRED_DIMS = 3
+_MMRS_REQUIRED_RATES = (
+    "hbm", "l2", "mte1", "mte2_aic", "mte2_aiv", "mte3", "fixpipe", "vector",
+)
+_ARCH22_PRESET = "npu_arch_2201"
+_ARCH35_PRESET = "npu_arch_3510"
 
 #: Exact selected source declaration. Unknown or unsupported options are errors,
 #: not silently ignored alternatives.
@@ -146,6 +159,8 @@ class SequenceParallelPlan:
     mc2_active_mask_active: bool = False
     mmrs_fused: bool = False
     pp: int = 1
+    eager_execution: bool = False
+    pcp: int = 1
 
     @property
     def physical_global(self):
@@ -414,6 +429,42 @@ def mmrs_eligible(
     )
 
 
+def _is_eager_execution(runtime, values: tuple[Any, ...], *, capture_bucket_rows: int) -> bool:
+    """Resolve whether this invocation runs eagerly rather than inside a captured graph."""
+    if capture_bucket_rows > 0:
+        return False
+    is_mapping = isinstance(runtime, Mapping)
+    graph_mode = str(
+        runtime.get("graph_mode", "") if is_mapping
+        else getattr(runtime, "graph_mode", "") or ""
+    ).strip().lower()
+    capture_mode = str(
+        runtime.get("graph_capture_mode", "") if is_mapping
+        else getattr(runtime, "graph_capture_mode", "") or ""
+    ).strip().lower()
+    if graph_mode in _EAGER_GRAPH_MODES or capture_mode in _EAGER_GRAPH_MODES:
+        return True
+    if not is_mapping and hasattr(runtime, "graph_mode") and hasattr(runtime, "graph_buckets"):
+        if values and all(hasattr(v, "phase") and hasattr(v, "padding") for v in values):
+            from mindie_sim.prediction.graph import GraphPolicy
+
+            _, scope = GraphPolicy().select(values, runtime)
+            return scope == "none"
+        has_buckets = bool(
+            getattr(runtime, "graph_buckets", ())
+            or getattr(runtime, "graph_capture_keys", ())
+            or getattr(runtime, "piecewise_capture_keys", ())
+        )
+        return graph_mode == "auto" and not has_buckets
+    if is_mapping and graph_mode == "auto":
+        has_buckets = any(
+            runtime.get(key)
+            for key in ("graph_buckets", "graph_capture_keys", "piecewise_capture_keys")
+        )
+        return not has_buckets
+    return False
+
+
 def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=None,
            valid_global_tokens=None, allow_draft_scope: bool = True):
     """Return the immutable plan, or ``None`` when no declaration is present.
@@ -435,11 +486,6 @@ def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=Non
     sp_scope = str(declaration.get("sp_scope", "stage_entry_all_layers"))
     if sp_scope == "off":
         return None
-    sp_pad_provider = str(declaration.get(
-        "sp_pad_provider",
-        "none" if padding == "none"
-        else ("cat_zeros" if sp_scope == "moe_flashcomm1_only" else "constant_pad_nd"),
-    ))
     capture_bucket_rows = int(declaration.get("capture_bucket_rows", 0) or 0)
     mc2_active_mask_active = bool(declaration.get("mc2_active_mask_active", False))
     mmrs_fused = bool(declaration.get("mmrs_fused", False))
@@ -448,6 +494,14 @@ def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=Non
         raise ModelingError(f"sequence_parallel_requires_nonnegative_tokens:{tokens!r}")
     parallel = _parallel(runtime)
     values = _validate_views(views, tokens, padding=padding, pcp=int(parallel.pcp))
+    eager_execution = _is_eager_execution(
+        runtime, values, capture_bucket_rows=capture_bucket_rows,
+    )
+    default_provider = (
+        "none" if padding == "none"
+        else ("cat_zeros" if (sp_scope == "moe_flashcomm1_only" or eager_execution) else "constant_pad_nd")
+    )
+    sp_pad_provider = str(declaration.get("sp_pad_provider", default_provider))
     # A padding view is a physical graph row, not a logical request.  Its
     # q_len remains the source allocation; valid_global excludes it.
     valid = sum(view.q_len for view in values
@@ -502,16 +556,17 @@ def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=Non
         if not cohort:
             raise ModelingError("sequence_parallel_requires_nonempty_ep_cohort")
         if (global_tokens is not None and global_tokens != tokens
-                and not (padding == "right_to_tp" and global_tokens in {input_rows, valid})):
+                and not (padding == "right_to_tp" and global_tokens in {input_rows, valid})
+                and not (dp > 1 and global_tokens >= tokens)):
             raise ModelingError(
                 f"sequence_parallel_global_tokens_outside_ep_cohort:"
                 f"{global_tokens}!={tokens}")
     if rank_ledger is not None:
         valid_cohort = int(sum(rank_ledger.valid))
-    elif valid_global_tokens is not None:
-        valid_cohort = max(0, int(valid_global_tokens))
     elif ep <= tp:
         valid_cohort = valid
+    elif valid_global_tokens is not None:
+        valid_cohort = min(cohort, max(0, int(valid_global_tokens)))
     elif padding == "right_to_tp":
         if dp == 1:
             pcp_in_ep = (min(pcp, max(1, ep // tp))
@@ -551,7 +606,7 @@ def select(runtime, model, views, *, tokens, global_tokens=None, rank_ledger=Non
         sp_scope=sp_scope, sp_pad_provider=sp_pad_provider,
         capture_bucket_rows=capture_bucket_rows,
         mc2_active_mask_active=mc2_active_mask_active,
-        mmrs_fused=mmrs_fused, pp=pp,
+        mmrs_fused=mmrs_fused, pp=pp, eager_execution=eager_execution, pcp=pcp,
     )
 
 
@@ -611,8 +666,8 @@ def _common(plan: SequenceParallelPlan, *, role: str, input_shape: tuple[int, ..
 def input_shard(*, plan: SequenceParallelPlan, op_id: str, deps: tuple[str, ...],
                 stage: int, layer: int, requests: tuple[str, ...], phase: str,
                 width: int, dtype: str, row_multiplier: int = 1,
-                channel_multiplier: int = 1) -> OpSpec:
-    """Right-padding materializes once; the subsequent TP slice is a view."""
+                channel_multiplier: int = 1, clone_aligned: bool = True) -> OpSpec:
+    """Right-padding materializes once; aligned eager SP shards clone their local slice."""
     local_rows, global_rows, width = _shape(
         plan, width, row_multiplier=row_multiplier,
         channel_multiplier=channel_multiplier)
@@ -636,7 +691,6 @@ def input_shard(*, plan: SequenceParallelPlan, op_id: str, deps: tuple[str, ...]
         input_rows = plan.input_rows * row_multiplier
         read_bytes = input_rows * width * dtype_bytes(dtype)
         write_bytes = global_rows * width * dtype_bytes(dtype)
-        provider = str(plan.sp_pad_provider or "native")
         pad_metadata = dict(metadata)
         pad_metadata.update({
             "input_shape": (input_rows, width),
@@ -645,15 +699,11 @@ def input_shard(*, plan: SequenceParallelPlan, op_id: str, deps: tuple[str, ...]
             "physical_payload_bytes": read_bytes + write_bytes,
             "padding_rows": global_rows - input_rows,
             "full_allocation_shape": (global_rows, width),
-            "sp_pad_provider": provider,
+            "sp_pad_provider": "constant_pad_nd",
+            "aclnn_symbol": "aclnnConstantPadNd",
+            "native_kinds": ("MemSet", "PadV3"),
             "mapping_basis": "analytical_pad_copy_and_zero; native_tiling_not_inferred",
         })
-        if provider == "cat_zeros":
-            pad_metadata["aclnn_symbols"] = ("aclnnInplaceZero", "aclnnCat")
-            pad_metadata["native_kinds"] = ("ZerosLike", "ConcatD")
-        else:
-            pad_metadata["aclnn_symbol"] = "aclnnConstantPadNd"
-            pad_metadata["native_kinds"] = ("MemSet", "PadV3")
         pad_metadata.pop("zero_payload_reason")
         return vector_op(
             op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
@@ -662,6 +712,26 @@ def input_shard(*, plan: SequenceParallelPlan, op_id: str, deps: tuple[str, ...]
             shape=(local_rows, width), read_bytes_override=read_bytes,
             write_bytes_override=write_bytes, metadata=tuple(pad_metadata.items()),
             notes=("source right-padding copies existing physical rows and zeros only added rows; TP slicing is a view",),
+        )
+    if clone_aligned and plan.padding == "right_to_tp" and plan.eager_execution and local_rows > 0:
+        copy_bytes = float(local_rows * width * dtype_bytes(dtype))
+        clone_metadata = dict(metadata)
+        clone_metadata.update({
+            "materialization": "aligned_clone",
+            "shard_materialization": "clone",
+            "physical_payload_bytes": 2.0 * copy_bytes,
+            "native_kinds": ("Copy",),
+            "source_expression": "out.clone() if sp_pad == 0 else out",
+        })
+        clone_metadata.pop("zero_payload_reason")
+        return vector_op(
+            op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
+            phase=phase, dtype=str(dtype), family="copy",
+            recipe="sequence_parallel_aligned_clone",
+            elements=local_rows * width, ops_per_element=0,
+            shape=(local_rows, width), read_bytes_override=copy_bytes,
+            write_bytes_override=copy_bytes, metadata=tuple(clone_metadata.items()),
+            notes=("eager aligned sp_shard clones the local TP slice (vllm_ascend sequence_parallel.py:43)",),
         )
     return replace(
         barrier_op(
@@ -789,7 +859,7 @@ def _close_replicated_output(
         plan=shard_plan, op_id=shard_id, deps=(tail.op_id,), stage=tail.stage,
         layer=tail.layer, requests=tail.requests, phase=tail.phase,
         width=width, dtype=dtype, row_multiplier=row_multiplier,
-        channel_multiplier=channel_multiplier,
+        channel_multiplier=channel_multiplier, clone_aligned=False,
     )
     shard_meta = dict(shard_op.metadata)
     shard_meta["sequence_parallel_role"] = "output_shard"
@@ -830,9 +900,15 @@ def emit_reduce_scatter_pad(
     if pad_rows <= 0:
         return None
     padded_rows = src_rows + pad_rows
-    payload_read = src_rows * int(width) * dtype_bytes(dtype)
-    payload_write = padded_rows * int(width) * dtype_bytes(dtype)
+    elem_bytes = dtype_bytes(dtype)
     is_cat_zeros = plan.sp_pad_provider == "cat_zeros"
+    if is_cat_zeros:
+        # Eager vllm-ascend materializes x.new_zeros([pad, H]) then torch.cat([x, zeros], dim=0).
+        payload_read = padded_rows * int(width) * elem_bytes
+        payload_write = (pad_rows + padded_rows) * int(width) * elem_bytes
+    else:
+        payload_read = src_rows * int(width) * elem_bytes
+        payload_write = padded_rows * int(width) * elem_bytes
     recipe = "sequence_parallel_cat_zeros_pad" if is_cat_zeros else "sequence_parallel_reduce_scatter_pad"
     expansion = ("ZerosLike", "ConcatD") if is_cat_zeros else ("MemSet", "PadV3")
     abi_meta: tuple[tuple[str, Any], ...] = (
@@ -896,10 +972,207 @@ def emit_mc2_mask_pad(
     return replace(op, stream=stream) if stream else op
 
 
+def _resolve_mmrs_ranks(
+    machine: Any,
+    plan: SequenceParallelPlan,
+    tail: OpSpec,
+    tail_meta: Mapping[str, Any],
+    *,
+    replica: int | None,
+    physical_rank: int | None,
+    group_ranks: tuple[int, ...] | None,
+) -> tuple[bool, tuple[int, ...] | None]:
+    """Resolve the physical TP group for MC2 MMRS, failing closed on ambiguous non-contiguous layouts."""
+    die_ranks = tuple(int(die.rank) for die in machine.dies)
+    die_set = set(die_ranks)
+    tp = int(plan.tp)
+    raw_group = group_ranks if group_ranks is not None else tail_meta.get("group_ranks")
+    if raw_group is not None:
+        resolved = tuple(int(rk) for rk in raw_group)
+        if len(resolved) == tp and len(set(resolved)) == tp and set(resolved) <= die_set:
+            return True, resolved
+        return False, None
+    pcp = max(1, int(plan.pcp))
+    pp = max(1, int(plan.pp))
+    stage = int(tail.stage)
+    width = tp * pcp
+    replica_span = pp * width
+    replica_count = len(die_ranks) // replica_span if replica_span > 0 else 0
+    stage_tp_groups: list[tuple[int, ...]] = []
+    for rep in range(replica_count):
+        base = (rep * pp + stage) * width
+        for copy_idx in range(pcp):
+            grp = die_ranks[base + copy_idx * tp : base + (copy_idx + 1) * tp]
+            if len(grp) == tp:
+                stage_tp_groups.append(grp)
+    raw_rank = physical_rank if physical_rank is not None else tail_meta.get("physical_rank")
+    if raw_rank is not None:
+        target = int(raw_rank)
+        for grp in stage_tp_groups:
+            if target in grp:
+                return True, grp
+        return False, None
+    raw_replica = replica if replica is not None else tail_meta.get("replica")
+    if raw_replica is not None and pcp == 1:
+        start = (int(raw_replica) * pp + stage) * width
+        if 0 <= start and start + tp <= len(die_ranks):
+            return True, die_ranks[start : start + tp]
+        return False, None
+    if len(stage_tp_groups) == 1:
+        return True, stage_tp_groups[0]
+    if not stage_tp_groups:
+        return False, None
+    contiguous = all(
+        set(grp) == set(range((rk // tp) * tp, (rk // tp) * tp + tp))
+        for grp in stage_tp_groups
+        for rk in grp
+    )
+    return (True, None) if contiguous else (False, None)
+
+
+def _build_executable_mmrs(
+    producer_op: OpSpec,
+    replacement: OpSpec,
+    tail: OpSpec,
+    *,
+    plan: SequenceParallelPlan,
+    dtype: str,
+    tail_meta: Mapping[str, Any],
+    machine: Any | None,
+    replica: int | None = None,
+    physical_rank: int | None = None,
+    group_ranks: tuple[int, ...] | None = None,
+) -> OpSpec | None:
+    """Build a governed ``mc2_matmul_reduce_scatter`` op iff it has an executable matrix+collective plan."""
+    if (producer_op.plan_required or producer_op.family not in _MMRS_PRODUCER_FAMILIES
+            or producer_op.stage != tail.stage
+            or (producer_op.stream or "") != (tail.stream or "")):
+        return None
+    prod_meta = dict(producer_op.metadata)
+    if int(prod_meta.get("matrix_groups", 1) or 1) != 1:
+        return None
+    dims: tuple[int, int, int] | None = None
+    for shp in (producer_op.local_shape, producer_op.semantic_shape):
+        if len(shp) >= _MMRS_REQUIRED_DIMS:
+            m_dim, n_dim, k_dim = int(shp[0]), int(shp[1]), int(shp[2])
+            if m_dim > 0 and n_dim > 0 and k_dim > 0:
+                dims = (m_dim, n_dim, k_dim)
+                break
+    if dims is None:
+        return None
+    m_dim, n_dim, k_dim = dims
+    if m_dim % plan.tp != 0:
+        return None
+    has_bias = bool(prod_meta.get("has_bias", tail_meta.get("has_bias", False)))
+    comp_dt = str(prod_meta.get("compute_format") or producer_op.dtype or dtype).strip().lower()
+    out_dt = str(prod_meta.get("output_format") or comp_dt).strip().lower()
+    act_dt = str(prod_meta.get("activation_format") or comp_dt).strip().lower()
+    weight_dt = str(prod_meta.get("weight_format") or comp_dt).strip().lower()
+    comp_canon = _MMRS_CANONICAL_DTYPES.get(comp_dt)
+    out_canon = _MMRS_CANONICAL_DTYPES.get(out_dt)
+    act_canon = _MMRS_CANONICAL_DTYPES.get(act_dt)
+    weight_canon = _MMRS_CANONICAL_DTYPES.get(weight_dt)
+    req_canon = (
+        _MMRS_CANONICAL_DTYPES.get(str(dtype).strip().lower())
+        if dtype else comp_canon
+    )
+    if (
+        comp_canon is None
+        or out_canon != comp_canon
+        or act_canon != comp_canon
+        or weight_canon != comp_canon
+        or req_canon != comp_canon
+    ):
+        return None
+    if not mmrs_eligible(
+        tp=plan.tp, dtype=comp_canon, has_bias=has_bias, k_dim=k_dim,
+        enable_mmrs_fusion=True,
+    ):
+        return None
+    if machine is None or not getattr(machine, "dies", ()) or not getattr(machine, "links", ()):
+        return None
+    die = machine.dies[0]
+    die_rates = dict(getattr(die, "rates", ()) or ())
+    if any(float(die_rates.get(role, 0.0) or 0.0) <= 0.0 for role in _MMRS_REQUIRED_RATES):
+        return None
+    arch = getattr(die, "compute_arch", None)
+    if arch is None or not arch.declared:
+        return None
+    if arch.has_native_modes and not arch.supports_native("matrix", comp_canon):
+        return None
+    arch_preset = str(getattr(arch, "preset", "") or "").strip().lower()
+    if arch_preset == _ARCH22_PRESET:
+        transport_binding = {"caller_abi": "hccl_client", "server_mode": "aiv"}
+    elif arch_preset == _ARCH35_PRESET:
+        transport_binding = {"caller_abi": "ccu"}
+    else:
+        return None
+    ranks_ok, explicit_ranks = _resolve_mmrs_ranks(
+        machine, plan, tail, tail_meta,
+        replica=replica, physical_rank=physical_rank, group_ranks=group_ranks,
+    )
+    if not ranks_ok:
+        return None
+    mc2_contract: dict[str, Any] = {
+        "abi": "matmul_reduce_scatter",
+        "world_size": int(plan.tp),
+        "m": m_dim,
+        "k": k_dim,
+        "n": n_dim,
+        "compute_dtype": comp_canon,
+        "output_dtype": comp_canon,
+        "operand_dtype": comp_canon,
+        "internal_chunks": _MMRS_INTERNAL_CHUNKS,
+        "independent_buffers": True,
+        "independent_handles": True,
+        "transport_binding": transport_binding,
+    }
+    if explicit_ranks is not None:
+        mc2_contract["ranks"] = explicit_ranks
+    rep_meta = dict(replacement.metadata)
+    rep_meta.update({
+        "mmrs_fused": True,
+        "mc2_contract": mc2_contract,
+        "abi_symbol": "aclnnMatmulReduceScatterV2",
+        "aclnn_symbol": "aclnnMatmulReduceScatterV2",
+        "native_kinds": ("MatmulReduceScatter",),
+        "fused_producer_op_id": producer_op.op_id,
+        "original_gemm_recipe": producer_op.recipe,
+        "compute_format": comp_canon,
+        "output_format": comp_canon,
+        "activation_format": comp_canon,
+        "weight_format": comp_canon,
+    })
+    if explicit_ranks is not None:
+        rep_meta["group_ranks"] = explicit_ranks
+    return replace(
+        replacement,
+        family="matmul_reduce_scatter",
+        recipe="mc2_matmul_reduce_scatter",
+        deps=producer_op.deps,
+        semantic_shape=producer_op.semantic_shape,
+        local_shape=(m_dim, n_dim, k_dim),
+        padded_shape=producer_op.padded_shape,
+        launch_shape=producer_op.launch_shape,
+        flops=producer_op.flops,
+        matrix_flops=producer_op.matrix_flops,
+        hbm_bytes=producer_op.hbm_bytes + replacement.hbm_bytes,
+        mte2_bytes=producer_op.mte2_bytes + replacement.mte2_bytes,
+        mte3_bytes=producer_op.mte3_bytes + replacement.mte3_bytes,
+        dtype=comp_canon,
+        stream=tail.stream,
+        metadata=tuple(rep_meta.items()),
+    )
+
+
 def close_output(ops, last, *, plan: SequenceParallelPlan, width: int, dtype: str,
                  op_id: str | None = None, row_multiplier: int = 1,
                  channel_multiplier: int = 1,
-                 input_rows: int | None = None) -> tuple[tuple[OpSpec, ...], str]:
+                 input_rows: int | None = None,
+                 machine: Any | None = None,
+                 replica: int | None = None,
+                 physical_rank: int | None = None,
+                 group_ranks: tuple[int, ...] | None = None) -> tuple[tuple[OpSpec, ...], str]:
     """Close a TP-sharded attention/MLP output into SP-local rows.
 
     Replaces an exact trailing TP ``allreduce`` (sole producer) with
@@ -956,9 +1229,6 @@ def close_output(ops, last, *, plan: SequenceParallelPlan, width: int, dtype: st
             None,
         )
         producer_op = prefix[producer_idx] if producer_idx is not None else None
-        prod_is_matmul = (
-            producer_op is not None and producer_op.family in _MMRS_PRODUCER_FAMILIES
-        )
         has_other_consumer = (
             producer_op is not None
             and any(
@@ -967,45 +1237,19 @@ def close_output(ops, last, *, plan: SequenceParallelPlan, width: int, dtype: st
                 if i != producer_idx
             )
         )
-        prod_meta = dict(producer_op.metadata) if producer_op is not None else {}
-        has_bias = bool(prod_meta.get("has_bias", metadata.get("has_bias", False)))
-        raw_k = prod_meta.get("k")
-        if raw_k is None and producer_op is not None:
-            for shp in (producer_op.local_shape, producer_op.semantic_shape):
-                if len(shp) >= 3:
-                    raw_k = shp[2]
-                    break
-        k_dim = int(raw_k or 0)
-        mmrs_ok = (
-            pad is None
-            and prod_is_matmul
-            and not has_other_consumer
-            and k_dim > 0
-            and mmrs_eligible(
-                tp=plan.tp, dtype=dtype, has_bias=has_bias, k_dim=k_dim,
-                enable_mmrs_fusion=True,
+        fused = (
+            _build_executable_mmrs(
+                producer_op, replacement, tail, plan=plan, dtype=dtype,
+                tail_meta=metadata, machine=machine,
+                replica=replica, physical_rank=physical_rank, group_ranks=group_ranks,
             )
+            if (pad is None and producer_op is not None and not has_other_consumer)
+            else None
         )
-        rep_meta = dict(replacement.metadata)
-        rep_meta["mmrs_fused"] = mmrs_ok
-        if mmrs_ok and producer_op is not None and producer_idx is not None:
-            rep_meta["abi_symbol"] = "aclnnMatmulReduceScatterV2"
-            rep_meta["aclnn_symbol"] = "aclnnMatmulReduceScatterV2"
-            rep_meta["native_kinds"] = ("MatmulReduceScatter",)
-            rep_meta["fused_producer_op_id"] = producer_op.op_id
-            # Replace the unfused producer GEMM directly so it does not remain alongside MMRS.
+        if fused is not None and producer_idx is not None:
             prefix = prefix[:producer_idx] + prefix[producer_idx + 1:]
-            replacement = replace(
-                replacement,
-                deps=producer_op.deps,
-                flops=producer_op.flops,
-                matrix_flops=producer_op.matrix_flops,
-                hbm_bytes=producer_op.hbm_bytes + replacement.hbm_bytes,
-                mte2_bytes=producer_op.mte2_bytes + replacement.mte2_bytes,
-                mte3_bytes=producer_op.mte3_bytes + replacement.mte3_bytes,
-                recipe="matmul_reduce_scatter_v2",
-                metadata=tuple(rep_meta.items()),
-            )
-        else:
-            replacement = replace(replacement, metadata=tuple(rep_meta.items()))
+            return prefix + (fused,), replacement_id
+        rep_meta = dict(replacement.metadata)
+        rep_meta["mmrs_fused"] = False
+        replacement = replace(replacement, metadata=tuple(rep_meta.items()))
     return prefix + (replace(replacement, stream=tail.stream),), replacement_id
