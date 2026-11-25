@@ -2290,8 +2290,15 @@ class _MemoryLedgerMixin:
             delta_stage[0] = -vision_all
         return vision_stage, delta_stage
 
-    def _stage_checkpoint_vs_prepared_split(self, stage: int) -> tuple[int, int]:
-        """Split ``self.weights[stage]`` into source checkpoint vs runtime-only prepared bytes."""
+    def _stage_checkpoint_vs_prepared_split(
+        self,
+        stage: int,
+        *,
+        ep_rank: int | None = None,
+        weight_bytes: float | None = None,
+        all_stage_terms: Sequence[Sequence[Any]] | None = None,
+    ) -> tuple[int, int]:
+        """Split resident stage weights into source checkpoint vs runtime-only prepared bytes."""
         from mindie_sim.catalog.draft_weights import require_model_quant
         from mindie_sim.catalog.weight_terms import term_bytes
         from mindie_sim.catalog.weights import _expand_resident_terms, stage_weight_terms
@@ -2299,20 +2306,23 @@ class _MemoryLedgerMixin:
         model = self.case.model
         p = self.case.runtime.parallel
         quant = require_model_quant(model)
-        include_vision = self.vision_accounting == "full_checkpoint"
-        all_stage_terms = stage_weight_terms(
-            model, p,
-            include_draft=bool(self.draft_kind),
-            draft_kind=self.draft_kind or None,
-            include_engram_tables=not self.case.runtime.engram_cpu_offload,
-            include_vision=include_vision,
-            layer_partition=self.layers,
-            slot_plans=self.slot_plans,
-            runtime=self.case.runtime,
-        )
+        if all_stage_terms is None:
+            include_vision = self.vision_accounting == "full_checkpoint"
+            all_stage_terms = stage_weight_terms(
+                model, p,
+                include_draft=bool(self.draft_kind),
+                draft_kind=self.draft_kind or None,
+                include_engram_tables=not self.case.runtime.engram_cpu_offload,
+                include_vision=include_vision,
+                layer_partition=self.layers,
+                slot_plans=self.slot_plans,
+                ep_rank=ep_rank,
+                runtime=self.case.runtime,
+            )
         shared_dp = bool(getattr(self, "enable_shared_expert_dp", False))
         pcp_o_proj = bool(getattr(self, "enable_pcp_o_proj_weight_sharding", False))
         dcp_q_rep = bool(getattr(self, "dcp_q_replicate", False))
+        off_ratio = float(getattr(self, "offload", {}).get("expert_ddr_ratio", 0.0) or 0.0)
         runtime_only = 0.0
         for term in all_stage_terms[stage]:
             if term.source_owned:
@@ -2324,10 +2334,78 @@ class _MemoryLedgerMixin:
                 model=model,
             )
             for t_sub, placed in expanded:
-                runtime_only += term_bytes(t_sub, quant, placed, self.case.machine.ranks_per_node)
-        prep_b = int(round(runtime_only))
-        ckpt_b = max(0, int(round(self.weights[stage])) - prep_b)
+                tb = term_bytes(t_sub, quant, placed, self.case.machine.ranks_per_node)
+                if off_ratio > 0.0 and t_sub.category == "routed_expert":
+                    tb *= 1.0 - off_ratio
+                runtime_only += tb
+        total_w = max(0, int(round(self.weights[stage] if weight_bytes is None else weight_bytes)))
+        prep_b = min(total_w, max(0, int(round(runtime_only))))
+        ckpt_b = max(0, total_w - prep_b)
         return ckpt_b, prep_b
+
+    def _resolve_die_weight_splits(
+        self,
+        vision_stage: Sequence[int],
+        vision_delta: Sequence[int],
+    ) -> dict[tuple[int, int, int], tuple[int, int]]:
+        """Resolve per-die ``(ckpt_b, term_prep_b)`` from per-die ``rank_weights`` and EP rank."""
+        from mindie_sim.catalog.weights import stage_weight_terms
+        from mindie_sim.schema.common import ModelingError
+
+        p = self.case.runtime.parallel
+        weights_by_ep = tuple(getattr(self, "weights_by_ep_rank", ()) or ())
+        multi_ep = len(weights_by_ep) > 1
+        placement = None
+        if multi_ep:
+            try:
+                placement = self.case.machine.validate_placement(p)
+            except ModelingError:
+                placement = None
+        default_ep = 0 if self.slot_plans is not None else None
+        include_vision = self.vision_accounting == "full_checkpoint"
+        rank_weights = getattr(self, "rank_weights", None)
+        terms_by_ep: dict[int | None, list[list[Any]]] = {}
+        split_cache: dict[tuple[int, int | None, int], tuple[int, int]] = {}
+        per_die: dict[tuple[int, int, int], tuple[int, int]] = {}
+        for replica in range(p.dp):
+            for stage in range(p.pp):
+                for rank in range(self.width):
+                    ep_id = (
+                        self._ep_rank_for_die(replica, stage, rank, placement)
+                        if multi_ep else default_ep
+                    )
+                    die_w = (
+                        float(rank_weights[replica][stage][rank])
+                        if (rank_weights is not None and replica < len(rank_weights)
+                            and stage < len(rank_weights[replica])
+                            and rank < len(rank_weights[replica][stage]))
+                        else float(self.weights[stage])
+                    )
+                    die_w_int = max(0, int(round(die_w)))
+                    skey = (stage, ep_id, die_w_int)
+                    split = split_cache.get(skey)
+                    if split is None:
+                        all_terms = terms_by_ep.get(ep_id)
+                        if all_terms is None:
+                            all_terms = stage_weight_terms(
+                                self.case.model, p,
+                                include_draft=bool(self.draft_kind),
+                                draft_kind=self.draft_kind or None,
+                                include_engram_tables=not self.case.runtime.engram_cpu_offload,
+                                include_vision=include_vision,
+                                layer_partition=self.layers,
+                                slot_plans=self.slot_plans,
+                                ep_rank=ep_id,
+                                runtime=self.case.runtime,
+                            )
+                            terms_by_ep[ep_id] = all_terms
+                        ck, tp_b = self._stage_checkpoint_vs_prepared_split(
+                            stage, ep_rank=ep_id, weight_bytes=die_w, all_stage_terms=all_terms,
+                        )
+                        split = (max(0, ck + vision_delta[stage] - vision_stage[stage]), tp_b)
+                        split_cache[skey] = split
+                    per_die[(replica, stage, rank)] = split
+        return per_die
 
     def _unified_pool_stride_reserve_by_stage(
         self,
@@ -3124,7 +3202,14 @@ class _MemoryLedgerMixin:
         req_reclaim_events: Sequence[str] = (),
     ) -> DieResidentReceipt:
         usable = int(math.floor(die_obj.hbm_bytes * self.case.runtime.gpu_memory_utilization))
-        ws_b = int(round(self.workspace[stage] + self.temporary_dequant[stage]))
+        rank_ws = getattr(self, "rank_workspace", None)
+        die_ws = (
+            rank_ws[replica][stage][rank]
+            if (rank_ws is not None and replica < len(rank_ws)
+                and stage < len(rank_ws[replica]) and rank < len(rank_ws[replica][stage]))
+            else self.workspace[stage]
+        )
+        ws_b = int(round(die_ws + self.temporary_dequant[stage]))
         res_b = int(round(self.policy.reserved))
         c8_stages = tuple(getattr(self, "c8_static_channel_scale_by_stage", ()))
         c8_static_b = int(c8_stages[stage]) if stage < len(c8_stages) else 0
@@ -3469,12 +3554,7 @@ class _MemoryLedgerMixin:
         staging_ranks = self._staging_usage_ranks()
         req_recl_ranks, req_recl_events = self._request_reclaimable_usage_and_events()
         non_req_backings = self._collect_non_request_backings()
-        ckpt_by_stage: list[int] = []
-        term_prep_by_stage: list[int] = []
-        for st in range(p.pp):
-            ck, tp_b = self._stage_checkpoint_vs_prepared_split(st)
-            ckpt_by_stage.append(max(0, ck + vision_delta[st] - vision_stage[st]))
-            term_prep_by_stage.append(tp_b)
+        die_weight_splits = self._resolve_die_weight_splits(vision_stage, vision_delta)
         dp_width = max(1, int(getattr(p, "dcp_dp_width", 1) or 1))
         spans_dp = bool(getattr(p, "cp_spans_dp", False)) and dp_width > 1 and self.rank_token_owners is None
         projected_map = self._resolve_receipt_projected_by_replica(
@@ -3524,10 +3604,11 @@ class _MemoryLedgerMixin:
                         int(round(self.peak_rank[replica][stage][rank])),
                         int(round(self._domain_peak_hbm(replica, stage, rank))),
                     )
+                    die_ckpt_b, die_term_prep_b = die_weight_splits[(replica, stage, rank)]
                     dies.append(self._build_die_receipt(
                         replica=replica, stage=stage, rank=rank, die_obj=stage_dies[rank],
-                        ckpt_b=ckpt_by_stage[stage], vision_b=vision_stage[stage],
-                        term_prep_b=term_prep_by_stage[stage],
+                        ckpt_b=die_ckpt_b, vision_b=vision_stage[stage],
+                        term_prep_b=die_term_prep_b,
                         prep_persist_b=prep_persist[stage], prep_load_b=prep_load[stage],
                         stage_prep_grants=prep_grants[stage], extra_grants=extra_grants,
                         projected=projected, live_pool=live_pool,
@@ -3636,16 +3717,31 @@ class _MemoryLedgerMixin:
             extra_grants=extra_grants,
         )
         rank_divergent = self.rank_token_owners is not None or int(getattr(p, "cp", 1) or 1) > 1
+        dp_width = max(1, int(getattr(p, "dcp_dp_width", 1) or 1))
+        spans_dp = bool(getattr(p, "cp_spans_dp", False)) and dp_width > 1 and self.rank_token_owners is None
         bottleneck_ranks: list[int] = []
         stage_comp_batch: list[dict[str, int]] = []
         stage_comp_per_req: list[dict[str, float]] = []
         hybrid_receipt: Any = None
         cached_uniform: list[dict[str, Any]] | None = None
         for st in range(p.pp):
-            best_rk = max(
-                range(self.width),
-                key=lambda rk: receipt.die_receipt(0, st, rk).simultaneous_live_hbm_bytes,
-            )
+            st_dies = [d for d in receipt.dies if d.stage == st]
+            if st_dies:
+                best_die = max(
+                    st_dies,
+                    key=lambda d: (d.simultaneous_peak_hbm_bytes, d.simultaneous_live_hbm_bytes),
+                )
+                best_rk = int(best_die.rank)
+                phys_rk = (
+                    ((int(best_die.replica) % dp_width) * p.pp) * self.width + best_rk
+                    if spans_dp else best_rk
+                )
+            else:
+                best_rk = max(
+                    range(self.width),
+                    key=lambda rk: receipt.die_receipt(0, st, rk).simultaneous_live_hbm_bytes,
+                )
+                phys_rk = best_rk
             bottleneck_ranks.append(best_rk)
             if seq <= 0 or b_int <= 0:
                 c8_b = int(self.c8_static_channel_scale_by_stage[st])
@@ -3654,7 +3750,7 @@ class _MemoryLedgerMixin:
                 continue
             if rank_divergent:
                 rank_stages, h_rec = self._projected_die_cache_pools(
-                    seq, b_int, query_tokens, rank=best_rk, phase=str(phase),
+                    seq, b_int, query_tokens, rank=phys_rk, phase=str(phase),
                 )
                 entry = rank_stages[st]
                 if hybrid_receipt is None and h_rec is not None:

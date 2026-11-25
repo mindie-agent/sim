@@ -33,6 +33,7 @@ _LAYER_QUANT_OVERRIDE_FIELDS = (
     "scale_bytes", "weight_block", "expert_block",
     "activation_group_size", "activation_scale_format",
     "activation_scale_pack", "output_format", "native_format",
+    "expert_quant_count", "expert_quant_overrides",
 )
 
 

@@ -633,6 +633,61 @@ def _partition_stage_of(partition: tuple[int, ...]) -> Any:
     return stage
 
 
+def _draft_routed_terms_for_rank(
+    draft: Any,
+    model: ModelSpec,
+    parallel: ParallelSpec,
+    *,
+    slot_plans: Mapping[Any, Any] | None,
+    ep_rank: int | None,
+) -> list[WeightTerm]:
+    """Resolve draft terms with per-EP-rank expert IDs when mixed-quant or sharded unevenly."""
+    raw_terms = [
+        term for term in draft_terms(draft, model, ep=parallel.ep)
+        if term.category not in TARGET_ALIAS_CATEGORIES
+    ]
+    num_experts = int(getattr(draft, "num_experts", 0) or 0)
+    if num_experts <= 0:
+        return raw_terms
+    from mindie_sim.catalog.expert_slots import ROUTED_TERMS, routed_expert_weight_terms
+    if not any(term.name in ROUTED_TERMS for term in raw_terms):
+        return raw_terms
+    target_ep = 0 if ep_rank is None else int(ep_rank)
+    if slot_plans:
+        for key in (f"draft:{getattr(draft, 'kind', '')}", getattr(draft, "kind", ""), "draft"):
+            slots = slot_plans.get(key)
+            if slots is not None and int(getattr(slots, "logical_experts", 0) or 0) == num_experts:
+                return list(routed_expert_weight_terms(raw_terms, slots, ep_rank=target_ep))
+    ep = max(1, int(parallel.ep))
+    base_quant = _require_model_quant(model)
+    has_mixed = any(
+        term.name in ROUTED_TERMS
+        and bool(getattr(
+            (term.runtime_quant or term.quant or base_quant).for_category(term.category),
+            "expert_quant_overrides",
+            (),
+        ))
+        for term in raw_terms
+    )
+    non_divisible = ep > 1 and num_experts > ep and num_experts % ep != 0
+    if not has_mixed and not non_divisible:
+        return raw_terms
+    if target_ep < 0 or target_ep >= ep:
+        raise ModelingError(f"expert_slot_ep_rank_invalid:{target_ep}")
+    if ep <= num_experts:
+        quotient, remainder = divmod(num_experts, ep)
+        base_count = quotient + (1 if target_ep < remainder else 0)
+        start = target_ep * quotient + min(target_ep, remainder)
+        draft_ids = tuple(range(start, start + base_count))
+    else:
+        draft_ids = (target_ep % num_experts,)
+    return [
+        replace(term, resident_count=len(draft_ids), expert_ids=draft_ids)
+        if term.name in ROUTED_TERMS else term
+        for term in raw_terms
+    ]
+
+
 def stage_weight_terms(
     model: ModelSpec, parallel: ParallelSpec, *,
     include_draft: bool = False, include_engram: bool = True,
@@ -721,8 +776,9 @@ def stage_weight_terms(
                 continue
             seen_drafts.append(draft)
             stages[pp - 1].extend(
-                term for term in draft_terms(draft, model)
-                if term.category not in TARGET_ALIAS_CATEGORIES
+                _draft_routed_terms_for_rank(
+                    draft, model, parallel, slot_plans=slot_plans, ep_rank=ep_rank,
+                )
             )
     return stages
 
