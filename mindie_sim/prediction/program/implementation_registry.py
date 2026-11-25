@@ -135,63 +135,11 @@ IMPLEMENTATIONS = {
         options=("cache_layout", "cache_group_size")),
     "gdn_prefill_arch35": Implementation(
         "mindie_sim.prediction.operators.linear_attention.gdn_prefill", blocks=("gdn_prefill",)),
-    "vllm_triton_unified_attention_2d_pointer": Implementation(
-        "mindie_sim.prediction.operators.attention.family_attention", blocks=("gqa_attention",),
-        options=("compute_capability",)),
-    "vllm_cuda_rms_norm": Implementation(
-        "mindie_sim.prediction.operators.vector.family_norm", operators=("rmsnorm", "add_rmsnorm"),
-        options=("aligned", "batch_invariant")),
     "ascendc_grouped_nd_bf16": Implementation(
         "mindie_sim.prediction.operators.grouped_moe.family_grouped_gemm", operators=("grouped_gemm",)),
     "ascend_w4a8_msd_grouped_down": Implementation(
         "mindie_sim.prediction.operators.mx_quant_matrix.w4a8_down", operators=("grouped_gemm",),
         after_activation_quantization=True),
-    "vllm_triton_mla_decode_tuple": Implementation(
-        "mindie_sim.prediction.operators.mla.family_mla", blocks=("mla_decode",),
-        options=("num_kv_splits",)),
-    "cuda_dynamic_int8_quant_symmetric_no_azp": Implementation(
-        "mindie_sim.prediction.operators.vector.family_quant", operators=("quantize",),
-        options=("input_byte_offset", "output_byte_offset", "zero_absmax")),
-    "cuda_moe_align_block_size": Implementation(
-        "mindie_sim.prediction.operators.moe_routing.family_moe", operators=("route_pack",),
-        options=("block_size", "pad_sorted_ids", "ignore_invalid_experts",
-                 "topk_ids_dtype")),
-    "triton_moe_fused_mul_sum": Implementation(
-        "mindie_sim.prediction.operators.moe_routing.family_moe", operators=("route_unpack",),
-        options=("compute_capability", "weight_dtype")),
-    "xllm_custom_xllm_math": Implementation(
-        "mindie_sim.prediction.operators.custom_framework",
-        operators=(
-            "smla_va", "sparse_flash_attention_lse", "moe_grouped_matmul_swiglu_quant",
-            "mega_gdn_decode", "onerec_final_beam_select", "reshape_and_cache_a5",
-            "mla_attention", "paged_mla_attention", "indexed_attention", "grouped_gemm",
-            "gdn_decode", "beam_select", "elementwise", "kv_cache_write",
-        ),
-        options=("op_name", "soc_family", "return_lse", "beam_width", "kv_page_size")),
-    "xllm_smla_va": Implementation(
-        "mindie_sim.prediction.operators.custom_framework",
-        operators=("smla_va", "mla_attention", "paged_mla_attention"),
-        options=("op_name", "soc_family")),
-    "xllm_sparse_flash_attention_lse": Implementation(
-        "mindie_sim.prediction.operators.custom_framework",
-        operators=("sparse_flash_attention_lse", "indexed_attention", "mla_attention"),
-        options=("op_name", "soc_family", "return_lse")),
-    "xllm_moe_grouped_matmul_swiglu_quant": Implementation(
-        "mindie_sim.prediction.operators.custom_framework",
-        operators=("moe_grouped_matmul_swiglu_quant", "grouped_gemm"),
-        options=("op_name", "soc_family")),
-    "xllm_mega_gdn_decode": Implementation(
-        "mindie_sim.prediction.operators.custom_framework",
-        operators=("mega_gdn_decode", "gdn_decode"),
-        options=("op_name", "soc_family")),
-    "xllm_onerec_final_beam_select": Implementation(
-        "mindie_sim.prediction.operators.custom_framework",
-        operators=("onerec_final_beam_select", "beam_select", "elementwise"),
-        options=("op_name", "soc_family", "beam_width")),
-    "xllm_reshape_and_cache_a5": Implementation(
-        "mindie_sim.prediction.operators.custom_framework",
-        operators=("reshape_and_cache_a5", "kv_cache_write"),
-        options=("op_name", "soc_family", "kv_page_size")),
     "mindie_sd_custom_ops": Implementation(
         "mindie_sim.prediction.operators.diffusion",
         operators=(
@@ -296,9 +244,7 @@ def select(bindings, selector):
     if selector not in (*registered.operators, *registered.blocks):
         raise ModelingError(f"implementation_selector_mismatch:{selector}:{name}")
     options = dict(declaration.get("options", {}))
-    if isinstance(name, str) and name.startswith("xllm_") and name != "xllm_custom_xllm_math":
-        options.setdefault("op_name", name.removeprefix("xllm_"))
-    elif isinstance(name, str) and name.startswith("mindie_sd_") and name != "mindie_sd_custom_ops":
+    if isinstance(name, str) and name.startswith("mindie_sd_") and name != "mindie_sd_custom_ops":
         options.setdefault("op_name", name.removeprefix("mindie_sd_"))
     unknown_options = options.keys() - set(registered.options)
     if unknown_options:
