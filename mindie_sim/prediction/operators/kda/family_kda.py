@@ -6,9 +6,28 @@
 [Timeouts & Locks] Pure metadata validation; no I/O or locks.
 [Side-Effect Policy] No device work, source reads or global mutation.
 """
+from typing import Literal
+
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_REV = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/ops/kimi_kda.py",
+        source_sha256="af37687463f9b34ca4797bdcefb14c333d3b70b2956d6aa1f15217815d5fbc10",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/ops/kda.py",
+        source_sha256="db94b9d9c2a11d3d7d6fcc0e4619328b01deb74f486f74787a6fd28805fa2a4c",
+    ),
+)
 IMPLEMENTATION = "vllm_ascend_kda_in_kernel_gates"
 CAPABILITIES = frozenset({"prefill", "decode", "in_kernel_gates"})
 SOURCE = {
