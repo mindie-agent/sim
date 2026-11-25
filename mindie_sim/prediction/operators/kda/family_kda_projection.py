@@ -101,8 +101,9 @@ def _view(tensors, b, producer, role):
         1, part['offset_elements'], part['shape'][1])
 
 
-def lower(b, tensors, *, plan, tokens, hidden, key_width, value_width, heads, dk, deps):
-    """Return QKV producers, output gate, FP32 beta, raw decay, and join event."""
+def lower(b, tensors, *, plan, tokens, hidden, key_width, value_width, heads, dk, deps,
+          beta_preprocessed: bool = True):
+    """Return QKV producers, output gate, beta, raw decay, and join event."""
     # The three hidden-input groups use the same K dimension. Composition is
     # performed on weights at load time, so online F is one hidden->decay GEMM.
     saved_quant = b.quant
@@ -143,28 +144,43 @@ def lower(b, tensors, *, plan, tokens, hidden, key_width, value_width, heads, dk
 
     beta_view = _view(tensors, b, bfg_id, 'b')
     start = len(b.ops)
-    # A multi-row beta slice has the BFG row stride. Native Cast consumes a
-    # compact slice; a one-row view is already compact and has no Slice launch.
-    beta_view = tensors.contiguous(beta_view, 'kda_beta_contiguous',
-                                   reason='packed_BFG_beta_Cast.AutoContiguous')
-    cast = tensors.materialize(beta_view, 'linear_beta_cast',
-                               reason='packed_BFG_beta_float', dtype='fp32')
-    beta = b.vector('linear_beta_sigmoid', (cast.producer,), tokens * heads, BETA_SIGMOID_OPS_PER_HEAD,
-                    dtype='fp32', family='sigmoid', shape=(tokens, heads))
-    _placement(b, start, stream='kda_bfg', after=(conversion,))
+    if beta_preprocessed:
+        # A multi-row beta slice has the BFG row stride. Native Cast consumes a
+        # compact slice; a one-row view is already compact and has no Slice launch.
+        beta_view = tensors.contiguous(beta_view, 'kda_beta_contiguous',
+                                       reason='packed_BFG_beta_Cast.AutoContiguous')
+        cast = tensors.materialize(beta_view, 'linear_beta_cast',
+                                   reason='packed_BFG_beta_float', dtype='fp32')
+        beta = b.vector('linear_beta_sigmoid', (cast.producer,), tokens * heads, BETA_SIGMOID_OPS_PER_HEAD,
+                        dtype='fp32', family='sigmoid', shape=(tokens, heads))
+        raw_beta = beta_view.producer
+    else:
+        # RecoverSSM verify consumes raw BF16 beta directly via stride_beta_token
+        # and computes sigmoid inside the kernel (kimi_kda.py:445-447, 745-764).
+        beta = raw_beta = beta_view.producer
 
     raw_gate = _view(tensors, b, bfg_id, 'f')
-    output_gate = _view(tensors, b, bfg_id, 'g')
-    # Default consumers accept the source strided views. Explicit layout
-    # contracts materialize exactly their selected payload, never the BFG bank.
+    # kimi_kda.py:450 unconditionally packs raw_gate on kda_bfg before bfg_ready.
+    raw_gate_start = len(b.ops)
     raw_gate = tensors.reshape(raw_gate, (1, tokens, heads, dk), name='kda_decay_reshape')
-    raw_gate = tensors.require(raw_gate, 'kda_recurrent', 'gate', name='kda_decay_contiguous')
+    raw_gate = tensors.contiguous(raw_gate, 'kda_decay_contiguous',
+                                  reason='packed_BFG_raw_gate_contiguous')
+    if beta_preprocessed and len(b.ops) > raw_gate_start:
+        # Preserve kda_bfg FIFO order so the stream join waits for both beta and raw_gate.
+        _placement(b, raw_gate_start, stream='kda_bfg', after=(beta,))
+    _placement(b, start, stream='kda_bfg', after=(conversion,))
+    join = b.ops[-1].op_id if len(b.ops) > start else bfg_id
+
+    output_gate = _view(tensors, b, bfg_id, 'g')
+    # Default consumers accept the source strided output_gate view. Explicit
+    # layout contracts materialize exactly their selected payload, never the BFG bank.
     output_gate = tensors.reshape(output_gate, (tokens, heads, value_width // heads),
                                   name='kda_output_gate_reshape')
     output_gate = tensors.require(output_gate, 'linear_output_norm_gate', 'gate',
                                   name='kda_output_gate_contiguous')
     return {'sources': [qkv[role] for role in ('q', 'k', 'v')],
             'output_gate': output_gate.producer, 'decay': raw_gate.producer,
-            'beta': beta, 'raw_beta': beta_view.producer, 'join': beta,
+            'beta': beta, 'raw_beta': raw_beta, 'join': join,
+            'beta_preprocessed': beta_preprocessed,
             'views': {'decay': raw_gate.layout.to_dict(),
                       'output_gate': output_gate.layout.to_dict()}}
