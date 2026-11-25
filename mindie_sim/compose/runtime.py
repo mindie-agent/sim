@@ -268,6 +268,14 @@ def _bind_case_contracts(parsed, single_spine, adapter, checkpoint_map):
     eff_role = str(inputs.get("eff_role") or single_spine.get("deployment_mode") or "colocated")
     eff_phase = str(inputs.get("eff_phase") or "decode")
     req_opts = dict(inputs.get("requested_options") or {})
+    if "prompt_tokens" not in req_opts:
+        pt_val = inputs.get("prompt_tokens")
+        if pt_val is None and parsed.workload.requests:
+            pt_val = max(int(r.prompt_tokens) for r in parsed.workload.requests)
+        if pt_val is not None:
+            req_opts["prompt_tokens"] = int(pt_val)
+    if "pp_layer_partition" not in req_opts and parsed.runtime.pp_layer_partition:
+        req_opts["pp_layer_partition"] = tuple(int(x) for x in parsed.runtime.pp_layer_partition)
     field_origins = dict(inputs.get("field_origins") or {})
     resolved_opts = adapter.resolve_options(
         parsed.model, parsed.machine, parsed.runtime.parallel,
@@ -502,6 +510,7 @@ def _resolve_va_mla_prolog_lowering(
     p_cfg: ParallelSpec,
     lowering_passes: Sequence[str],
     registry: Any,
+    role: str | None = None,
 ) -> Any | None:
     """Resolve M1 MLA prolog v3 binding grounded in ProbedAbiRegistry and operand domain."""
     from mindie_sim.prediction.operators.mla_prolog import resolve_mla_preprocess_mode
@@ -519,6 +528,11 @@ def _resolve_va_mla_prolog_lowering(
     ).lower() or act_dtype
     is_w4a8 = weight_quant == "int4"
     is_int8_kv = bool(quant is not None and str(getattr(quant, "kv_dtype", "")).lower() == "int8")
+    spec_meta = dict(getattr(model_spec, "metadata", ()) or ())
+    kv_tag_low = str(spec_meta.get("kv_cache_tag") or "").strip().lower()
+    has_faquant = "faquant" in kv_tag_low or "fakquant" in kv_tag_low
+    is_kv_consumer = str(role or "").strip().lower() == "pd_decode"
+    explicit_strided = spec_meta.get("is_strided_kv_cache")
     modes = [
         resolve_mla_preprocess_mode(
             arch=arch_upper,
@@ -529,6 +543,7 @@ def _resolve_va_mla_prolog_lowering(
             qk_rope_head_dim=int(plan.qk_rope_head_dim or 0),
             has_rope=(not bool(plan.mla_use_nope)) and int(plan.qk_rope_head_dim or 0) > 0,
             is_sparse_sfa=bool(plan.indexer),
+            is_kv_consumer=is_kv_consumer,
             dcp_size=int(p_cfg.cp or 1),
             pcp_size=int(p_cfg.pcp or 1),
             enable_mlapo=False,
@@ -536,11 +551,15 @@ def _resolve_va_mla_prolog_lowering(
             qkv_a_gate_fused=bool(plan.mla_qkv_a_gate_fused or plan.mla_output_gate),
             is_w4a8=is_w4a8,
             is_int8_kv=is_int8_kv,
-            has_kv_scale=is_int8_kv,
+            has_kv_scale=(is_int8_kv if bool(plan.indexer) else (is_int8_kv and has_faquant)),
+            is_strided_kv_cache=(
+                bool(explicit_strided) if explicit_strided is not None
+                else bool(plan.cache_kind == "dense" and not (is_int8_kv and has_faquant))
+            ),
             act_dtype=act_dtype,
             weight_quant=weight_quant,
             input_size=int(model_spec.hidden_size),
-            num_kv_heads=1,
+            num_kv_heads=int(plan.num_kv_heads or 1),
             num_q_heads=int(plan.num_heads or model_spec.num_heads),
             qk_nope_head_dim=int(plan.qk_nope_head_dim or 0),
             registry=registry,
@@ -600,6 +619,7 @@ def _resolve_va_mla_prolog_lowering(
 def _resolve_va_lowerings(
     model_spec: ModelSpec, parallel: Mapping[str, int], sku: str,
     lowering_passes: tuple[str, ...], *, notes: list[dict[str, Any]],
+    role: str | None = None,
 ) -> dict[str, Any]:
     """Select ABI-grounded vLLM-Ascend lowerings (cross-arch AttnRes, M1 MLA Prolog, M12 compressor)."""
     from mindie_sim.catalog.paired_sfa import execution
@@ -669,6 +689,7 @@ def _resolve_va_lowerings(
         p_cfg=p_cfg,
         lowering_passes=lowering_passes,
         registry=registry,
+        role=role,
     )
     if mla_prolog_binding is not None:
         lowerings["mla_prolog"] = mla_prolog_binding

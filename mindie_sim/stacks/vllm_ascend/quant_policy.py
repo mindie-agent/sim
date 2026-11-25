@@ -22,10 +22,26 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
+import fnmatch
 import math
 import re
 from typing import Any
 
+from mindie_sim.catalog.cache import layer_stage_map
+from mindie_sim.catalog.cache_format import (
+    _lookup_region_decl,
+    _resolve_index_cache_format,
+    _row_planes_from_format,
+    cache_format,
+)
+from mindie_sim.catalog.cache_pools import (
+    REGIME_ALIASED_WINDOW_COMPRESSED,
+    resolve_pool_allocator_contract,
+)
+from mindie_sim.catalog.context_parallel import dcp_indexer_sharded, layer_dcp_factors
+from mindie_sim.catalog.draft import optional_draft_spec
+from mindie_sim.catalog.draft_geometry import draft_layer_plans
+from mindie_sim.catalog.draft_spec import effective_draft_context_cap
 from mindie_sim.catalog.mqsmla_layout import (
     EXPONENT_SCALE_TYPES as MQSMLA_EXPONENT_SCALES,
     HEAD_WIDTH as MQSMLA_HEAD_WIDTH,
@@ -39,6 +55,7 @@ from mindie_sim.schema.checkpoint import (
     CheckpointOrigin,
     CheckpointQuantMap,
     ModelScope,
+    TensorQuantRule,
 )
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.hardware import Hardware
@@ -66,6 +83,7 @@ from .profiles import (
     normalize_hw_family,
     resolve_model_type,
 )
+from .speculative import ZERO_NEURAL_DRAFT_METHODS, resolve_speculative_companion
 
 #: Upstream ``packed_modules_mapping`` + ``UPDATED_PACKED_MODULES_MAPPING``.
 UPDATED_PACKED_MODULES_MAPPING: dict[str, tuple[str, ...]] = {
@@ -138,7 +156,7 @@ _MXFP4_W4A8_TAGS = frozenset({
     "MXFP4", "MX_FP4", "FP4", "NVFP4", "QUARK_MXFP4",
 })
 _MXFP4_W4A4_TAGS = frozenset({"W4A4_MXFP4", "W4A4_MXFP"})
-_FP8_TAGS = frozenset({"FP8", "FP8_DYNAMIC", "W8A8_FP8", "FP8_E4M3", "QUARK_FP8"})
+_FP8_TAGS = frozenset({"FP8", "FP8_DYNAMIC", "W8A8_FP8", "FP8_E4M3", "FP8_E5M2", "QUARK_FP8"})
 _W8A8_DYNAMIC_TAGS = frozenset({
     "W8A8_DYNAMIC", "W8A8D", "W8A8_INT8", "INT8_DYNAMIC", "INT8_SYM", "QUARK_INT8",
 })
@@ -177,11 +195,11 @@ _PROJECTION_PRESET_TAGS: dict[str, tuple[str, str]] = {
     "w8a8_mxfp8": ("W8A8_MXFP8", "W8A8_MXFP8"),
     "w8a8_mxfp": ("W8A8_MXFP8", "W8A8_MXFP8"),
     "mxfp8_mxfp4": ("W8A8_MXFP8", "W4A8_MXFP"),
-    "mxfp4_routed_only": ("W8A8_MXFP8", "W4A8_MXFP"),
+    "mxfp4_routed_only": ("FLOAT", "W4A8_MXFP"),
     "mxfp4_all": ("W4A8_MXFP", "W4A8_MXFP"),
-    "mxfp4": ("W8A8_MXFP8", "W4A8_MXFP"),
+    "mxfp4": ("W4A8_MXFP", "W4A8_MXFP"),
     "w4a8_mxfp": ("W8A8_MXFP8", "W4A8_MXFP"),
-    "w4a4_mxfp4": ("W8A8_MXFP8", "W4A4_MXFP4"),
+    "w4a4_mxfp4": ("W4A4_MXFP4", "W4A4_MXFP4"),
     "fp8": ("FP8_DYNAMIC", "FP8_DYNAMIC"),
     "fp8_dynamic": ("FP8_DYNAMIC", "FP8_DYNAMIC"),
     "w8a8": ("W8A8_DYNAMIC", "W8A8_DYNAMIC"),
@@ -342,12 +360,13 @@ def _resolve_a5_fp_tag_to_abi(
     if tag in _FP8_TAGS:
         _guard_a5_only(hw, "fp8", tag)
         blk = group_size if group_size else (FP8_DEFAULT_BLOCK_SIZE, FP8_DEFAULT_BLOCK_SIZE)
+        fp8_dt = "fp8_e5m2" if tag == "FP8_E5M2" else "fp8_e4m3"
         return TensorPrecisionABI(
             linear_method="fp8",
-            input_dtype="fp8_e4m3",
-            weight_dtype="fp8_e4m3",
+            input_dtype=fp8_dt,
+            weight_dtype=fp8_dt,
             output_dtype=nat,
-            compute_dtype="fp8_e4m3",
+            compute_dtype=fp8_dt,
             accum_dtype="fp32",
             weight_layout="ND",
             weight_block=blk,
@@ -439,6 +458,30 @@ def map_quant_prefix(model_type: str, tensor_path: str) -> tuple[str, ...]:
     return expand_checkpoint_tensor_paths(tensor_path, model_type)
 
 
+def _apply_typed_rule_overrides(
+    abi: TensorPrecisionABI, rule: TensorQuantRule | None,
+) -> TensorPrecisionABI:
+    """Honor explicit typed weight/activation/scale dtypes declared on a ``TensorQuantRule``."""
+    if rule is None:
+        return abi
+    w_dt = str(rule.weight_dtype or "").strip().lower()
+    a_dt = str(rule.activation_dtype or "").strip().lower()
+    if abi.linear_method == "fp8":
+        if w_dt in {"fp8_e4m3", "fp8_e5m2"}:
+            in_dt = a_dt if a_dt in {"fp8_e4m3", "fp8_e5m2"} else w_dt
+            abi = replace(abi, weight_dtype=w_dt, input_dtype=in_dt, compute_dtype=w_dt)
+        elif a_dt in {"fp8_e4m3", "fp8_e5m2"}:
+            abi = replace(abi, input_dtype=a_dt)
+    elif abi.linear_method in {"mx_fp4", "mx_fp8"} and a_dt in {"fp4_e2m1", "mxfp4", "fp8_e4m3", "fp8_e5m2"}:
+        in_dt = "fp4_e2m1" if a_dt == "mxfp4" else a_dt
+        abi = replace(abi, input_dtype=in_dt)
+    sc_raw = str(rule.scale_dtype or "").strip().lower()
+    if sc_raw and sc_raw != "none" and abi.weight_scale_dtype:
+        sc_dt, sc_bytes = _normalize_scale_dtype(sc_raw, default_dtype=abi.weight_scale_dtype)
+        abi = replace(abi, weight_scale_dtype=sc_dt, weight_scale_bytes=sc_bytes)
+    return abi
+
+
 def resolve_raw_tag_to_abi(
     raw_tag: str,
     *,
@@ -451,6 +494,7 @@ def resolve_raw_tag_to_abi(
     k_dim: int = 0,
     n_dim: int = 0,
     group_size: tuple[int, ...] = (),
+    rule: TensorQuantRule | None = None,
 ) -> TensorPrecisionABI:
     """Resolve one raw checkpoint quantization tag into a strict ``TensorPrecisionABI``."""
     tag = str(raw_tag or "").strip().upper()
@@ -470,14 +514,14 @@ def resolve_raw_tag_to_abi(
 
     a5_abi = _resolve_a5_fp_tag_to_abi(tag, hw=hw, nat=nat, group_size=group_size)
     if a5_abi is not None:
-        return a5_abi
+        return _apply_typed_rule_overrides(a5_abi, rule)
 
     int_abi = _resolve_int_tag_to_abi(
         tag, nat=nat, phase=phase, role=role, is_moe=is_moe,
         use_nz=use_nz, k_dim=k_dim, n_dim=n_dim, group_size=group_size,
     )
     if int_abi is not None:
-        return int_abi
+        return _apply_typed_rule_overrides(int_abi, rule)
 
     raise ModelingError(f"unknown_checkpoint_quant_tag:{raw_tag}")
 
@@ -487,6 +531,7 @@ def _hf_quant_tag_for_role(
 ) -> tuple[str, tuple[int, ...]] | None:
     method = str(hf_cfg.get("quant_method") or "").strip().lower()
     scale_fmt = str(hf_cfg.get("scale_fmt") or "").strip().lower()
+    fmt = str(hf_cfg.get("fmt") or "").strip().lower()
     expert_dtype = str(hf_cfg.get("expert_dtype") or "").strip().lower()
     raw_block = hf_cfg.get("weight_block_size")
     blk: tuple[int, ...] = ()
@@ -500,7 +545,8 @@ def _hf_quant_tag_for_role(
     if method in {"mxfp4", "mx_fp4"}:
         return "W4A8_MXFP", blk or (1, MXFP_GROUP_SIZE)
     if method == "fp8":
-        return "FP8_DYNAMIC", blk or (FP8_DEFAULT_BLOCK_SIZE, FP8_DEFAULT_BLOCK_SIZE)
+        fp8_tag = "FP8_E5M2" if fmt == "e5m2" else "FP8_DYNAMIC"
+        return fp8_tag, blk or (FP8_DEFAULT_BLOCK_SIZE, FP8_DEFAULT_BLOCK_SIZE)
     if method in {"w8a8", "w8a8_dynamic"}:
         return "W8A8_DYNAMIC", blk
     if method in {"w4a8", "w4a8_dynamic"}:
@@ -643,6 +689,25 @@ def _lookup_exception_or_ignored(
     return None
 
 
+def _rule_matches_candidate(
+    rule: TensorQuantRule,
+    cand: str,
+    *,
+    scope: ModelScope,
+    lid: int,
+    expert_id: int | None,
+) -> bool:
+    if rule.matches(cand, scope=scope, source_native_layer_id=lid, expert_id=expert_id):
+        return True
+    if not (rule.pattern.startswith("*") or rule.pattern.endswith("*")):
+        return False
+    if rule.presence is not None and not rule.presence.contains(
+        scope=scope, source_native_layer_id=lid, expert_id=expert_id,
+    ):
+        return False
+    return fnmatch.fnmatchcase(cand, rule.pattern)
+
+
 def _lookup_non_wildcard_rule(
     checkpoint: CheckpointQuantMap,
     *,
@@ -651,7 +716,7 @@ def _lookup_non_wildcard_rule(
     scope: ModelScope,
     layer_ids: Sequence[int],
     expert_id: int | None = None,
-) -> tuple[str, tuple[int, ...]] | None:
+) -> TensorQuantRule | None:
     specific_rules = tuple(r for r in checkpoint.rules if r.pattern != "*")
     if not specific_rules:
         return None
@@ -661,10 +726,10 @@ def _lookup_non_wildcard_rule(
         for lid in layer_ids:
             for cand in mapped:
                 for rule in specific_rules:
-                    if rule.matches(
-                        cand, scope=scope, source_native_layer_id=lid, expert_id=expert_id,
+                    if _rule_matches_candidate(
+                        rule, cand, scope=scope, lid=lid, expert_id=expert_id,
                     ):
-                        return rule.raw_tag, rule.group_size
+                        return rule
     return None
 
 
@@ -676,7 +741,7 @@ def _lookup_hf_rule_tag(
     scope: ModelScope,
     layer_ids: Sequence[int],
     expert_id: int | None = None,
-) -> tuple[str, tuple[int, ...]] | None:
+) -> TensorQuantRule | None:
     specific = _lookup_non_wildcard_rule(
         checkpoint, model_type=model_type, candidate_paths=candidate_paths,
         scope=scope, layer_ids=layer_ids, expert_id=expert_id,
@@ -690,7 +755,7 @@ def _lookup_hf_rule_tag(
             rule.presence.contains(scope=scope, source_native_layer_id=lid, expert_id=expert_id)
             for lid in layer_ids
         ):
-            return rule.raw_tag, rule.group_size
+            return rule
     return None
 
 
@@ -725,6 +790,49 @@ def _lookup_modelslim_w13_tag(
     return gate_tag if gate_tag is not None else up_tag
 
 
+def _rule_signature(rule: TensorQuantRule | None) -> tuple[str, tuple[int, ...], str, str, str]:
+    if rule is None:
+        return ("", (), "", "", "")
+    return (
+        rule.raw_tag.upper(),
+        rule.group_size,
+        rule.weight_dtype,
+        rule.activation_dtype,
+        rule.scale_dtype,
+    )
+
+
+def _lookup_non_wildcard_w13_rule(
+    checkpoint: CheckpointQuantMap,
+    *,
+    model_type: str,
+    candidate_paths: Sequence[str],
+    scope: ModelScope,
+    layer_ids: Sequence[int],
+    expert_id: int | None,
+) -> TensorQuantRule | None:
+    """Resolve HF ``mlp.experts.w13`` specific rule and fail closed on gate/up mismatch."""
+    gate_paths = [p for p in candidate_paths if any(tok in p for tok in ("gate_proj", ".w1.", "w13"))]
+    up_paths = [p for p in candidate_paths if any(tok in p for tok in ("up_proj", ".w3."))]
+    gate_rule = _lookup_non_wildcard_rule(
+        checkpoint, model_type=model_type, candidate_paths=gate_paths or candidate_paths,
+        scope=scope, layer_ids=layer_ids, expert_id=expert_id,
+    )
+    up_rule = (
+        _lookup_non_wildcard_rule(
+            checkpoint, model_type=model_type, candidate_paths=up_paths,
+            scope=scope, layer_ids=layer_ids, expert_id=expert_id,
+        )
+        if up_paths else None
+    )
+    if gate_rule is not None and up_rule is not None and _rule_signature(gate_rule) != _rule_signature(up_rule):
+        raise ModelingError(
+            f"heterogeneous_expert_gate_up_quantization:scope={scope}:layers={tuple(layer_ids)}:"
+            f"expert={expert_id}:gate={gate_rule.raw_tag}:up={up_rule.raw_tag}"
+        )
+    return gate_rule if gate_rule is not None else up_rule
+
+
 def _resolve_single_expert_role_tag(
     checkpoint: CheckpointQuantMap,
     *,
@@ -737,7 +845,7 @@ def _resolve_single_expert_role_tag(
     expert_id: int | None,
     target_quant_projection: str,
     hf_cfg: Mapping[str, Any],
-) -> tuple[str, tuple[int, ...], bool]:
+) -> tuple[str, tuple[int, ...], bool, TensorQuantRule | None]:
     if checkpoint.source_format == "modelslim_description":
         if role_name == "mlp.experts.w13":
             explicit = _lookup_modelslim_w13_tag(
@@ -749,50 +857,69 @@ def _resolve_single_expert_role_tag(
                 checkpoint, model_type=model_type, candidate_paths=candidate_paths,
                 scope=scope, layer_ids=layer_ids, expert_id=expert_id,
             )
-        return (explicit, (), False) if explicit is not None else ("FLOAT", (), False)
+        return (explicit, (), False, None) if explicit is not None else ("FLOAT", (), False, None)
 
     exc_or_ignored = _lookup_exception_or_ignored(
         checkpoint, model_type=model_type, candidate_paths=candidate_paths,
         scope=scope, layer_ids=layer_ids, expert_id=expert_id,
     )
     if exc_or_ignored is not None:
-        return exc_or_ignored, (), False
+        return exc_or_ignored, (), False, None
 
     if role_name in CONSTRUCTOR_UNQUANTIZED_ROLES:
-        return "FLOAT", (), False
+        return "FLOAT", (), False, None
 
     if checkpoint.source_format == "hf_quantization_config":
-        if hf_cfg:
-            hf_hit = _hf_quant_tag_for_role(hf_cfg, is_routed_expert=is_routed_expert)
-            if hf_hit is not None:
-                return hf_hit[0], hf_hit[1], False
-        rule_hit = _lookup_hf_rule_tag(
+        if role_name == "mlp.experts.w13":
+            specific_rule = _lookup_non_wildcard_w13_rule(
+                checkpoint, model_type=model_type, candidate_paths=candidate_paths,
+                scope=scope, layer_ids=layer_ids, expert_id=expert_id,
+            )
+        else:
+            specific_rule = _lookup_non_wildcard_rule(
+                checkpoint, model_type=model_type, candidate_paths=candidate_paths,
+                scope=scope, layer_ids=layer_ids, expert_id=expert_id,
+            )
+        if specific_rule is not None:
+            return specific_rule.raw_tag, specific_rule.group_size, False, specific_rule
+        wildcard_rule = _lookup_hf_rule_tag(
             checkpoint, model_type=model_type, candidate_paths=candidate_paths,
             scope=scope, layer_ids=layer_ids, expert_id=expert_id,
         )
-        if rule_hit is not None:
-            return rule_hit[0], rule_hit[1], False
+        if hf_cfg:
+            hf_hit = _hf_quant_tag_for_role(hf_cfg, is_routed_expert=is_routed_expert)
+            if hf_hit is not None:
+                if hf_hit[0] in _MXFP8_TAGS or hf_hit[0] in _MXFP4_W4A8_TAGS:
+                    mx_rule = (
+                        replace(wildcard_rule, weight_dtype="", scale_dtype="")
+                        if (wildcard_rule is not None and str(wildcard_rule.activation_dtype or "").strip())
+                        else None
+                    )
+                    return hf_hit[0], hf_hit[1], False, mx_rule
+                return hf_hit[0], hf_hit[1], False, wildcard_rule
+        if wildcard_rule is not None:
+            return wildcard_rule.raw_tag, wildcard_rule.group_size, False, wildcard_rule
         if hf_cfg and str(hf_cfg.get("quant_method") or "").strip().lower() == "ascend":
             raise ModelingError(
                 f"unresolved_ascend_hf_quant_role:scope={scope}:layers={tuple(layer_ids)}:role={role_name}"
             )
-        return "FLOAT", (), False
+        return "FLOAT", (), False, None
 
     if checkpoint.source_format == "unquantized_native":
         if target_quant_projection:
             proj_tag = _project_blind_box_tag(
                 target_quant_projection, role_name=role_name, is_routed_expert=is_routed_expert,
             )
-            return proj_tag, (), (proj_tag != "FLOAT")
-        return "FLOAT", (), False
+            return proj_tag, (), (proj_tag != "FLOAT"), None
+        return "FLOAT", (), False, None
 
     if checkpoint.source_format == "explicit_synthetic_preset" and checkpoint.model_quant_type:
         proj_tag = _project_blind_box_tag(
             checkpoint.model_quant_type, role_name=role_name, is_routed_expert=is_routed_expert,
         )
-        return proj_tag, (), False
+        return proj_tag, (), False, None
 
-    return "FLOAT", (), False
+    return "FLOAT", (), False, None
 
 
 def _resolve_role_tag(
@@ -807,8 +934,8 @@ def _resolve_role_tag(
     expert_ids: Sequence[int],
     target_quant_projection: str,
     hf_cfg: Mapping[str, Any],
-) -> tuple[str, tuple[int, ...], bool]:
-    """Return ``(raw_tag, group_size, used_projection)`` enforcing per-expert homogeneity."""
+) -> tuple[str, tuple[int, ...], bool, TensorQuantRule | None]:
+    """Return ``(raw_tag, group_size, used_projection, rule)`` enforcing per-expert homogeneity."""
     if not is_routed_expert:
         return _resolve_single_expert_role_tag(
             checkpoint, model_type=model_type, role_name=role_name,
@@ -823,7 +950,13 @@ def _resolve_role_tag(
         is_routed_expert=True, expert_id=check_ids[0],
         target_quant_projection=target_quant_projection, hf_cfg=hf_cfg,
     )
-    first_key = (first[0].upper(), first[1])
+    first_key = (
+        first[0].upper(),
+        first[1],
+        first[3].weight_dtype if first[3] is not None else "",
+        first[3].activation_dtype if first[3] is not None else "",
+        first[3].scale_dtype if first[3] is not None else "",
+    )
     for eid in check_ids[1:]:
         cur = _resolve_single_expert_role_tag(
             checkpoint, model_type=model_type, role_name=role_name,
@@ -831,7 +964,14 @@ def _resolve_role_tag(
             is_routed_expert=True, expert_id=eid,
             target_quant_projection=target_quant_projection, hf_cfg=hf_cfg,
         )
-        if (cur[0].upper(), cur[1]) != first_key:
+        cur_key = (
+            cur[0].upper(),
+            cur[1],
+            cur[3].weight_dtype if cur[3] is not None else "",
+            cur[3].activation_dtype if cur[3] is not None else "",
+            cur[3].scale_dtype if cur[3] is not None else "",
+        )
+        if cur_key != first_key:
             raise ModelingError(
                 f"heterogeneous_expert_quantization:scope={scope}:layers={tuple(layer_ids)}:"
                 f"role={role_name}:expert_{check_ids[0]}={first[0]}:expert_{eid}={cur[0]}"
@@ -1111,9 +1251,9 @@ def _resolve_draft_ports(
                     raise ModelingError(
                         f"heterogeneous_draft_expert_quantization:layer={local_idx}:role={role_name}:tags={sorted(set(found_tags))}"
                     )
-                tag, blk, did_proj = found_tags[0], (), False
+                tag, blk, did_proj, matched_rule = found_tags[0], (), False, None
             else:
-                tag, blk, did_proj = _resolve_role_tag(
+                tag, blk, did_proj, matched_rule = _resolve_role_tag(
                     checkpoint,
                     model_type=model_type,
                     role_name=role_name,
@@ -1128,7 +1268,8 @@ def _resolve_draft_ports(
             used_proj = used_proj or did_proj
             abi = resolve_raw_tag_to_abi(
                 tag, hw_family=hw, native_float_dtype=native_float,
-                phase=phase, role=role, is_moe=is_expert, use_nz=use_nz, group_size=blk,
+                phase=phase, role=role, is_moe=is_expert, use_nz=use_nz,
+                group_size=blk, rule=matched_rule,
             )
             ports.append((("draft", local_idx, role_name), abi))
     return ports, used_proj
@@ -1301,7 +1442,7 @@ def _build_unaligned_mxfp_gqa_planes(
             physical_shape=ks_phys, dtype="e8m0", layout="PA_NZ",
             group_axes=(2,), group_extents=(MXFP_GROUP_SIZE,), scale_dtype="e8m0",
             offset_in_page=k_bytes, alignment=MXFP_K_SCALE_NZ_TOKEN_FRAG, page_pitch=pitch,
-            allocation_frequency="token", write_trigger="append", bytes_per_unit=ks_bytes,
+            allocation_frequency="page", write_trigger="append", bytes_per_unit=ks_bytes,
         ),
         CachePlaneABI(
             plane_id="v_payload", plane_kind="payload",
@@ -1432,7 +1573,7 @@ def _apply_speculative_recurrent_overlay(
             logical_axes=("verify_slot", "record_byte"),
             logical_shape=(q_slots, max(1, replay_bytes // q_slots)),
             physical_shape=(q_slots, max(1, replay_bytes // q_slots)),
-            dtype="fp32",
+            dtype="uint8",
             layout="ND",
             offset_in_page=rec_bytes + conv_bytes,
             allocation_frequency="request_slot",
@@ -1453,43 +1594,75 @@ def _apply_speculative_recurrent_overlay(
 def _apply_vllm_index_overlay(
     abi: CacheStateABI,
     *,
+    model: ModelSpec,
+    plan: LayerPlan,
     native_float: str,
     checkpoint_digest: str,
     placement: CachePlacementRule,
+    kv_block_size: int = DEFAULT_KV_BLOCK_SIZE,
+    phase: str = "decode",
 ) -> CacheStateABI:
-    """Apply vLLM-Ascend KPool ``tail_slots = pool - 1``, E8M0 groups, and ``index_tail``."""
-    planes = list(_materialize_plane_bytes(abi.planes))
-    idx_dim = int(planes[0].logical_shape[-1])
+    """Apply explicit ``cache_representations``, E8M0 scale groups, and exact KPool ``index_tail``."""
+    model_meta = dict(getattr(model, "metadata", ()) or ())
+    if _lookup_region_decl(model_meta, "index_k", plan=plan, phase=phase) is not None:
+        planes = list(_row_planes_from_format(
+            _resolve_index_cache_format(model, plan, phase=phase),
+            int(plan.index_dim),
+            prefix=f"l{abi.native_layer}.index_k",
+            block_size=kv_block_size,
+        ))
+    else:
+        planes = list(_materialize_plane_bytes(abi.planes))
+    idx_dim = int(plan.index_dim or planes[0].logical_shape[-1])
     for i, plane in enumerate(planes):
         if plane.plane_kind == "scale" and plane.dtype == "e8m0":
             groups = _ceil_div(idx_dim, MXFP_GROUP_SIZE)
-            if plane.logical_shape != (groups,):
+            target_shape = (1, groups) if len(plane.logical_axes) == 2 else (groups,)
+            if plane.logical_shape != target_shape:
                 planes[i] = replace(
                     plane,
-                    logical_shape=(groups,),
-                    physical_shape=(groups,),
-                    group_axes=(0,),
+                    logical_shape=target_shape,
+                    physical_shape=target_shape,
+                    group_axes=(len(target_shape) - 1,),
                     group_extents=(MXFP_GROUP_SIZE,),
                     bytes_per_unit=groups,
                 )
     pool = max(1, int(abi.pooling_ratio))
-    tail_slots = max(0, pool - 1) if pool > 1 else 0
+    tail_slots = 0
     if pool > 1:
         planes = [replace(p, allocation_frequency="token_group") for p in planes]
-    if tail_slots > 0:
-        tail_bytes = tail_slots * idx_dim * int(dtype_bytes(native_float))
-        planes.append(CachePlaneABI(
-            plane_id="index_tail",
-            plane_kind="suffix",
-            logical_axes=("tail_slot", "index_dim"),
-            logical_shape=(tail_slots, idx_dim),
-            physical_shape=(tail_slots, idx_dim),
-            dtype=native_float,
-            layout="ND",
-            allocation_frequency="request_slot",
-            write_trigger="append",
-            bytes_per_unit=tail_bytes,
-        ))
+        if str(plan.attention or "").lower() == "gqa":
+            tail_slots = 2 * pool
+            tail_bytes = tail_slots * idx_dim * int(dtype_bytes(native_float))
+            tail_plane = CachePlaneABI(
+                plane_id="index_tail",
+                plane_kind="suffix",
+                logical_axes=("tail_slot", "index_dim"),
+                logical_shape=(tail_slots, idx_dim),
+                physical_shape=(tail_slots, idx_dim),
+                dtype=native_float,
+                layout="ND",
+                allocation_frequency="request_slot",
+                write_trigger="append",
+                bytes_per_unit=tail_bytes,
+            )
+        else:
+            raw_cap = (model_meta.get("native_keypool_caller") or {}).get("tail_capacity", pool)
+            tail_slots = max(1, int(raw_cap))
+            tail_bytes = tail_slots * 2 * idx_dim * SCALE_BYTES_FP32
+            tail_plane = CachePlaneABI(
+                plane_id="index_tail",
+                plane_kind="suffix",
+                logical_axes=("tail_slot", "vector", "index_dim"),
+                logical_shape=(tail_slots, 2, idx_dim),
+                physical_shape=(tail_slots, 2, idx_dim),
+                dtype="fp32",
+                layout="ND",
+                allocation_frequency="request_slot",
+                write_trigger="append",
+                bytes_per_unit=tail_bytes,
+            )
+        planes.append(tail_plane)
     return replace(
         abi,
         planes=tuple(planes),
@@ -1682,9 +1855,12 @@ def _collect_delegated_cache_rules(
         if attn not in {"kda", "gdn"} and p.cache_kind != "none":
             if attn != "mla" and l_mode == "int8" and str(role).lower() == "pd_prefill":
                 l_mode = native_float
-                if not c8_producer_recorded:
-                    disps.append(("kv_cache_c8_producer", "downgraded", "kv_c8_producer_role_keeps_native_bf16"))
-                    c8_producer_recorded = True
+                disps.append((
+                    "kv_cache_c8_producer",
+                    "downgraded",
+                    f"scope=target:layer={n_id}:kv_c8_producer_role_keeps_native_{native_float}",
+                ))
+                c8_producer_recorded = True
             layer_kv_meta[n_id] = (l_mode, l_scale, l_faq)
             h_dim = int(p.head_dim or model.head_dim)
             v_dim = int(p.v_head_dim or h_dim)
@@ -1725,6 +1901,401 @@ def _collect_delegated_cache_rules(
         provenance=checkpoint.cache_rule.provenance,
     )
     return rule, layer_kv_meta, unaligned_mxfp_layers, plan_by_native, eff_kv_scale, any_faquant, any_mxfp_gqa
+
+
+def _cache_placement_for_layer(
+    model: ModelSpec,
+    plan: LayerPlan,
+    parallel: ParallelSpec,
+    *,
+    stage: int,
+    base: CachePlacementRule,
+) -> CachePlacementRule:
+    is_mla_p = str(plan.attention or model.attention).lower() == "mla"
+    _, tp_gather, _ = layer_dcp_factors(plan, parallel)
+    pcp = max(1, int(parallel.pcp or 1))
+    cp_shard = max(1, tp_gather * pcp)
+    ranks = tuple(range(cp_shard)) if cp_shard > 1 else ()
+    if is_mla_p:
+        tok_ax = "dcp_head" if parallel.cp > 1 else ("cp_striped" if pcp > 1 else "replicated")
+        return CachePlacementRule(
+            pp_stage=stage,
+            rank_ids=ranks,
+            token_ownership_axis=tok_ax,
+            replication_factor=max(1, parallel.tp // max(1, tp_gather)),
+        )
+    kv_heads = max(1, int(plan.num_kv_heads or plan.num_heads or model.num_kv_heads or model.num_heads or 1))
+    raw_rep = max(1, parallel.tp // kv_heads)
+    tok_ax = "dcp_head" if tp_gather > 1 else ("cp_striped" if pcp > 1 else base.token_ownership_axis)
+    return replace(
+        base,
+        pp_stage=stage,
+        rank_ids=ranks,
+        token_ownership_axis=tok_ax,
+        replication_factor=max(1, raw_rep // max(1, tp_gather)),
+    )
+
+
+def _index_placement_for_layer(
+    model: ModelSpec,
+    parallel: ParallelSpec,
+    *,
+    stage: int,
+) -> CachePlacementRule:
+    """Resolve index-K placement using ``dcp_indexer_sharded`` and shared 1-head replication."""
+    idx_sharded = bool(parallel.cp > 1 and dcp_indexer_sharded(model))
+    idx_dcp = min(max(1, parallel.tp), max(1, parallel.cp)) if idx_sharded else 1
+    pcp = max(1, int(parallel.pcp or 1))
+    cp_shard = max(1, idx_dcp * pcp)
+    tok_ax = "dcp_head" if idx_dcp > 1 else ("cp_striped" if pcp > 1 else "replicated")
+    return CachePlacementRule(
+        pp_stage=stage,
+        rank_ids=tuple(range(cp_shard)) if cp_shard > 1 else (),
+        token_ownership_axis=tok_ax,
+        replication_factor=max(1, parallel.tp // idx_dcp),
+    )
+
+
+def _finalize_kv_cache_abi(
+    abi: CacheStateABI,
+    model: ModelSpec,
+    plan: LayerPlan,
+    *,
+    parallel: ParallelSpec,
+    model_meta: Mapping[str, Any],
+    stage: int,
+    kv_block_size: int,
+    phase: str,
+    native_float: str,
+    ckpt_digest: str,
+    eff_kv_scale: str,
+    l_mode: str,
+    l_scale: str,
+    l_faq: bool,
+    unaligned_mxfp: bool,
+    draft_cap: int | None = None,
+) -> CacheStateABI:
+    is_mla = str(plan.attention or model.attention).lower() == "mla"
+    comp_ratio = 1 if abi.component_role == "window_kv" else abi.compression_ratio
+    place = _cache_placement_for_layer(model, plan, parallel, stage=stage, base=abi.placement)
+    if unaligned_mxfp:
+        n_kv = int(plan.num_kv_heads or model.num_kv_heads or model.num_heads)
+        h_dim = int(plan.head_dim or model.head_dim)
+        v_dim = int(plan.v_head_dim or h_dim)
+        planes = _build_unaligned_mxfp_gqa_planes(
+            local_heads=local_kv_heads(n_kv, parallel.tp), head_dim=h_dim,
+            v_head_dim=v_dim, kv_block_size=kv_block_size,
+        )
+        recipe = "qk_mxfp8_dynamic_v_mxfp8_per_channel"
+    elif (not is_mla) and l_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel":
+        planes = _append_mxfp_page_padding(abi.planes)
+        recipe = "qk_mxfp8_dynamic_v_mxfp8_per_channel"
+    else:
+        region = (
+            "window" if abi.component_role == "window_kv"
+            else ("compressed_kv" if abi.component_role == "compressed_kv" else "mla_kv")
+        )
+        has_region_decl = is_mla and _lookup_region_decl(model_meta, region, plan=plan, phase=phase) is not None
+        if has_region_decl:
+            planes = _row_planes_from_format(
+                cache_format(model, region, plan=plan, phase=phase),
+                int(plan.cache_row_elements),
+                prefix=f"{abi.scope}.l{abi.native_layer}.{region}",
+                block_size=kv_block_size,
+            )
+            p_dt = planes[0].dtype
+            s_dt = next((pl.dtype for pl in planes if pl.plane_kind == "scale"), native_float)
+            recipe = f"mla_{p_dt}_{s_dt}"
+        else:
+            mqsmla = (
+                _mqsmla_stack_planes(plan, l_scale)
+                if (is_mla and abi.component_role in {"window_kv", "compressed_kv"} and l_mode == "fp8_e4m3")
+                else None
+            )
+            if mqsmla is not None:
+                planes = mqsmla
+            else:
+                planes = _materialize_plane_bytes(abi.planes)
+                if l_scale and l_scale != eff_kv_scale:
+                    planes = tuple(
+                        replace(pl, dtype=l_scale, scale_dtype=l_scale, bytes_per_unit=replace(pl, dtype=l_scale).exact_bytes())
+                        if pl.plane_kind == "scale" else pl
+                        for pl in planes
+                    )
+            recipe = (
+                f"mla_{l_mode}_{l_scale or native_float}" if is_mla
+                else ("gqa_faquant" if l_faq else f"gqa_{l_mode}")
+            )
+    cp_interleave = kv_block_size if len(place.rank_ids) > 1 else abi.cp_interleave_size
+    return replace(
+        abi, planes=planes, checkpoint_digest=ckpt_digest, recipe_abi_id=recipe,
+        compression_ratio=comp_ratio, placement=place, cp_interleave_size=cp_interleave,
+        draft_context_cap=(draft_cap if draft_cap is not None else abi.draft_context_cap),
+    )
+
+
+def _build_compressor_state_abis(
+    plans: Sequence[LayerPlan],
+    *,
+    stage_for: Any,
+    ckpt_digest: str,
+    role: str,
+    phase: str,
+) -> list[CacheStateABI]:
+    """Emit FP32 ``compressor_state`` / ``index_compressor_state`` ABIs matching ``catalog.cache``."""
+    out: list[CacheStateABI] = []
+    for p in plans:
+        n_id = p.native_layer_id if p.native_layer_id >= 0 else p.index
+        rows = int(p.compressor_state_rows or 0)
+        if rows <= 0:
+            continue
+        stage = stage_for(p)
+        width = max(1, int(p.compressor_width or 1))
+        if p.owns_long_kv:
+            h_dim = int(p.head_dim or 1)
+            shape = (rows, 2, width, h_dim)
+            n_bytes = math.prod(shape) * SCALE_BYTES_FP32
+            out.append(CacheStateABI(
+                scope="target", native_layer=n_id, component_role="compressor_state",
+                producer_key=f"target.l{n_id}.compressor_state",
+                planes=(CachePlaneABI(
+                    plane_id="compressor_state", plane_kind="payload",
+                    logical_axes=("state_row", "kv", "width", "dim"),
+                    logical_shape=shape, physical_shape=shape, dtype="fp32", layout="ND",
+                    allocation_frequency="request_slot", write_trigger="append", bytes_per_unit=n_bytes,
+                ),),
+                phase=phase, deployment_role=role, checkpoint_digest=ckpt_digest,
+                recipe_abi_id="compressor_state_fp32",
+                placement=CachePlacementRule(pp_stage=stage, token_ownership_axis="replicated"),
+            ))
+        if p.owns_index_k and p.index_input == "hidden" and int(p.compress_ratio or 0) > 0:
+            idx_dim = int(p.index_dim or 1)
+            shape = (rows, 2, width, idx_dim)
+            n_bytes = math.prod(shape) * SCALE_BYTES_FP32
+            out.append(CacheStateABI(
+                scope="target", native_layer=n_id, component_role="compressor_state",
+                producer_key=f"target.l{n_id}.index_compressor_state",
+                planes=(CachePlaneABI(
+                    plane_id="index_compressor_state", plane_kind="payload",
+                    logical_axes=("state_row", "kv", "width", "dim"),
+                    logical_shape=shape, physical_shape=shape, dtype="fp32", layout="ND",
+                    allocation_frequency="request_slot", write_trigger="append", bytes_per_unit=n_bytes,
+                ),),
+                phase=phase, deployment_role=role, checkpoint_digest=ckpt_digest,
+                recipe_abi_id="index_compressor_state_fp32",
+                placement=CachePlacementRule(pp_stage=stage, token_ownership_axis="replicated"),
+            ))
+    return out
+
+
+def _apply_aliased_window_backing_tags(
+    model: ModelSpec,
+    parallel: ParallelSpec,
+    *,
+    stage_map: Sequence[int],
+    kv_block_size: int,
+    draft_kind: str,
+    speculative_k: int,
+    kv_abis: list[CacheStateABI],
+    idx_abis: list[CacheStateABI],
+    rec_abis: list[CacheStateABI],
+) -> None:
+    """Stamp ``page_group`` / ``overlay_region`` / ``alias_of`` matching ``cache_pools`` backings."""
+    contract = resolve_pool_allocator_contract(
+        model, parallel, block_size=kv_block_size,
+        draft_kind=(draft_kind if (speculative_k > 0 and draft_kind) else None),
+        query_tokens=(1 + speculative_k if speculative_k > 0 else 1),
+    )
+    if contract.pool_regime != REGIME_ALIASED_WINDOW_COMPRESSED:
+        return
+    pp = max(1, int(parallel.pp))
+    last_stage = pp - 1
+    owner_pg: dict[int, tuple[str, str]] = {}
+    win_alias: dict[int, tuple[str, str]] = {}
+    draft_alias: dict[int, tuple[str, str]] = {}
+    for st in range(pp):
+        st_plans = [p for p in model.layer_plans if (stage_map[p.index] if p.index < len(stage_map) else last_stage) == st]
+        owners = sorted((p for p in st_plans if p.owns_long_kv), key=lambda p: int(p.index))
+        swas = sorted((p for p in st_plans if int(p.window or 0) > 0), key=lambda p: int(p.index))
+        if not owners:
+            continue
+        n_back = len(owners)
+        for slot_idx, own in enumerate(owners):
+            o_nid = own.native_layer_id if own.native_layer_id >= 0 else own.index
+            pg = f"s{st}.alias_backing_{slot_idx}"
+            o_key = f"target.l{o_nid}.compressed_kv"
+            owner_pg[o_nid] = (pg, o_key)
+            for sp in swas[slot_idx::n_back]:
+                s_nid = sp.native_layer_id if sp.native_layer_id >= 0 else sp.index
+                win_alias[s_nid] = (pg, o_key)
+            if st == last_stage:
+                draft_alias[slot_idx] = (pg, o_key)
+    for i, a in enumerate(kv_abis):
+        if a.scope == "target" and a.component_role == "compressed_kv" and a.native_layer in owner_pg:
+            pg, _ = owner_pg[a.native_layer]
+            kv_abis[i] = replace(a, page_group=pg, overlay_region="compressed_kv")
+        elif a.scope == "target" and a.component_role == "window_kv" and a.native_layer in win_alias:
+            pg, o_key = win_alias[a.native_layer]
+            kv_abis[i] = replace(a, page_group=pg, overlay_region="window_kv", alias_of=o_key)
+        elif a.scope == "draft" and a.component_role == "window_kv" and a.native_layer in draft_alias:
+            pg, o_key = draft_alias[a.native_layer]
+            kv_abis[i] = replace(a, page_group=pg, overlay_region="draft_window_kv", alias_of=o_key)
+    for i, a in enumerate(idx_abis):
+        if a.scope == "target" and a.native_layer in owner_pg:
+            pg, _ = owner_pg[a.native_layer]
+            idx_abis[i] = replace(a, page_group=pg, overlay_region="index_k")
+    for i, a in enumerate(rec_abis):
+        if a.scope == "target" and a.component_role == "compressor_state" and a.native_layer in owner_pg:
+            pg, _ = owner_pg[a.native_layer]
+            rec_abis[i] = replace(a, page_group=pg, overlay_region="compressor_state")
+
+
+def _resolve_draft_kv_tag(
+    model: ModelSpec,
+    *,
+    draft_kind: str,
+    draft_spec: Any,
+    hw: str,
+    parallel: ParallelSpec,
+    kv_mode: str,
+    speculative_k: int,
+    checkpoint: CheckpointQuantMap,
+) -> str | None:
+    """Resolve draft-specific KV dtype override before inheriting target cache rules."""
+    dq = getattr(draft_spec, "quant", None)
+    if dq is not None and str(getattr(dq, "kv_dtype", "") or "").strip():
+        return str(dq.kv_dtype).strip().upper()
+    try:
+        comp = resolve_speculative_companion(
+            model.name, target_tp=parallel.tp, target_kv_dtype=kv_mode,
+            hw_family=hw, method=draft_kind, num_speculative_tokens=speculative_k,
+        )
+        if comp.draft_kv_cache_dtype:
+            return str(comp.draft_kv_cache_dtype).strip().upper()
+    except ModelingError:
+        pass
+    return checkpoint.cache_rule.kv_tag or None
+
+
+def _append_draft_cache_abis(
+    model: ModelSpec,
+    checkpoint: CheckpointQuantMap,
+    *,
+    hw: str,
+    delegated_rule: CacheQuantRule,
+    parallel: ParallelSpec,
+    effective_opts: Mapping[str, Any],
+    model_meta: Mapping[str, Any],
+    last_stage: int,
+    kv_block_size: int,
+    role: str,
+    phase: str,
+    native_float: str,
+    ckpt_digest: str,
+    kv_mode: str,
+    eff_kv_scale: str,
+    has_faquant: bool,
+    speculative_k: int,
+    recoverssm_active: bool,
+    disps: list[tuple[str, str, str]],
+    kv_abis: list[CacheStateABI],
+    idx_abis: list[CacheStateABI],
+    rec_abis: list[CacheStateABI],
+) -> str:
+    """Append active neural speculative draft (MTP / DSpark) cache ABIs on the final PP stage."""
+    spec_method = str(effective_opts.get("spec_method") or "").strip().lower()
+    aux = getattr(model, "auxiliary", None)
+    if speculative_k <= 0 or aux is None or spec_method in ZERO_NEURAL_DRAFT_METHODS:
+        return ""
+    draft_kind = (
+        "dspark" if (spec_method in {"dspark", "dflash"} and aux.dspark is not None)
+        else ("mtp" if aux.mtp is not None else ("dspark" if aux.dspark is not None else ""))
+    )
+    d_plans = draft_layer_plans(model, draft_kind) if draft_kind else ()
+    if not d_plans:
+        return draft_kind
+    draft_spec = optional_draft_spec(model, draft_kind)
+    raw_dml = int(effective_opts.get("draft_max_model_len") or 0)
+    cap_hint = type("_DraftCapHint", (), {"metadata": (("draft_max_model_len", raw_dml),)})() if raw_dml > 0 else None
+    d_cap_val = effective_draft_context_cap(draft_spec, cap_hint)
+    d_cap = d_cap_val if d_cap_val > 0 else None
+
+    d_tag_override = _resolve_draft_kv_tag(
+        model, draft_kind=draft_kind, draft_spec=draft_spec, hw=hw,
+        parallel=parallel, kv_mode=kv_mode, speculative_k=speculative_k, checkpoint=checkpoint,
+    )
+    d_has_mla = any(str(p.attention or model.attention).lower() == "mla" for p in d_plans)
+    d_kv_mode, d_kv_scale, d_has_faq, _ = _detect_kv_mode(
+        checkpoint, hw=hw, native_float=native_float, effective_opts=effective_opts,
+        is_mla=d_has_mla, kv_tag_override=d_tag_override,
+    )
+    d_eff_scale = "" if d_kv_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel" else d_kv_scale
+    d_layer_tags: list[tuple[int, str]] = []
+    d_layer_meta: dict[int, tuple[str, str, bool]] = {}
+    d_unaligned: set[int] = set()
+    for p in d_plans:
+        dn = p.native_layer_id if p.native_layer_id >= 0 else p.index
+        d_is_mla = str(p.attention or model.attention).lower() == "mla"
+        dm, ds, df = d_kv_mode, d_eff_scale, d_has_faq
+        if (not d_is_mla) and dm == "int8" and str(role).lower() == "pd_prefill":
+            dm = native_float
+            disps.append(("kv_cache_c8_producer", "downgraded", f"scope=draft:layer={dn}:kv_c8_producer_role_keeps_native_{native_float}"))
+        d_layer_meta[dn] = (dm, ds, df)
+        h_dim = int(p.head_dim or model.head_dim)
+        v_dim = int(p.v_head_dim or h_dim)
+        if (not d_is_mla) and dm == "qk_mxfp8_dynamic_v_mxfp8_per_channel" and (
+            kv_block_size % MXFP_KV_SCALE_GROUP_SIZE != 0 or h_dim % MXFP_KV_SCALE_GROUP_SIZE != 0 or v_dim % MXFP_KV_NZ_DIM_FRAG != 0
+        ):
+            d_unaligned.add(dn)
+            d_layer_tags.append((dn, "FLOAT"))
+        else:
+            d_layer_tags.append((dn, _schema_kv_tag(dm, ds, is_mla=d_is_mla, has_faquant=df, native_float=native_float)))
+    draft_rule = replace(
+        delegated_rule,
+        kv_tag=_schema_kv_tag(d_kv_mode, d_eff_scale, is_mla=d_has_mla, has_faquant=d_has_faq, native_float=native_float),
+        kv_scale_dtype=d_eff_scale,
+        layer_scoped_kv=tuple(d_layer_tags),
+        layer_scoped_index=(),
+    )
+    d_raw_kv, d_raw_idx, d_raw_rec = resolve_checkpoint_cache_abis(
+        d_plans, replace(checkpoint, cache_rule=draft_rule), parallel, native_float,
+        role=role, phase=phase, kv_block_size=kv_block_size,
+        kda_parallel_axis="tp_x_pcp", stage=last_stage,
+    )
+    d_plan_by_native = {(p.native_layer_id if p.native_layer_id >= 0 else p.index): p for p in d_plans}
+    for d_abi in d_raw_kv:
+        d_plan = d_plan_by_native[d_abi.native_layer]
+        dm, ds, df = d_layer_meta.get(d_abi.native_layer, (d_kv_mode, d_eff_scale, d_has_faq))
+        kv_abis.append(_finalize_kv_cache_abi(
+            d_abi, model, d_plan, parallel=parallel, model_meta=model_meta, stage=last_stage,
+            kv_block_size=kv_block_size, phase=phase, native_float=native_float,
+            ckpt_digest=ckpt_digest, eff_kv_scale=d_eff_scale,
+            l_mode=dm, l_scale=ds, l_faq=df,
+            unaligned_mxfp=(d_abi.native_layer in d_unaligned), draft_cap=d_cap,
+        ))
+    for d_abi in d_raw_idx:
+        d_plan = d_plan_by_native[d_abi.native_layer]
+        idx_place = _index_placement_for_layer(model, parallel, stage=last_stage)
+        idx_abis.append(replace(
+            _apply_vllm_index_overlay(
+                d_abi, model=model, plan=d_plan, native_float=native_float,
+                checkpoint_digest=ckpt_digest, placement=idx_place,
+                kv_block_size=kv_block_size, phase=phase,
+            ),
+            cp_interleave_size=(kv_block_size if len(idx_place.rank_ids) > 1 else d_abi.cp_interleave_size),
+            draft_context_cap=d_cap,
+        ))
+    for d_abi in d_raw_rec:
+        d_plan = d_plan_by_native[d_abi.native_layer]
+        d_rec = _apply_speculative_recurrent_overlay(
+            model, d_plan, d_abi,
+            parallel=parallel, checkpoint_digest=ckpt_digest,
+            speculative_k=speculative_k, recoverssm_active=recoverssm_active,
+        )
+        rec_abis.append(replace(
+            d_rec, placement=replace(d_rec.placement, pp_stage=last_stage), draft_context_cap=d_cap,
+        ))
+    return draft_kind
 
 
 def build_cache_state_abis(
@@ -1772,98 +2343,84 @@ def build_cache_state_abis(
     index_scale_dtype, _ = _normalize_scale_dtype(
         checkpoint.cache_rule.index_scale_dtype, default_dtype="fp32",
     )
-
     (
-        delegated_rule,
-        layer_kv_meta,
-        unaligned_mxfp_layers,
-        plan_by_native,
-        eff_kv_scale,
-        any_faquant,
-        any_mxfp_gqa,
+        delegated_rule, layer_kv_meta, unaligned_mxfp_layers, plan_by_native,
+        eff_kv_scale, any_faquant, any_mxfp_gqa,
     ) = _collect_delegated_cache_rules(
         model, checkpoint, hw=hw, native_float=native_float, effective_opts=effective_opts,
         role=role, kv_block_size=kv_block_size, kv_mode=kv_mode, kv_scale_dtype=kv_scale_dtype,
         has_faquant=has_faquant, default_idx_dtype=default_idx_dtype,
         index_scale_dtype=index_scale_dtype, disps=disps,
     )
-    delegated_ckpt = replace(checkpoint, cache_rule=delegated_rule)
     raw_kv, raw_idx, raw_rec = resolve_checkpoint_cache_abis(
-        plans, delegated_ckpt, parallel, native_float,
+        plans, replace(checkpoint, cache_rule=delegated_rule), parallel, native_float,
         role=role, phase=phase, kv_block_size=kv_block_size, kda_parallel_axis="tp_x_pcp",
     )
+    pp_part = tuple(int(x) for x in (effective_opts.get("pp_layer_partition") or ()))
+    runtime_pp_hint = type("_PpHint", (), {"pp_layer_partition": pp_part})() if pp_part else None
+    stage_map = layer_stage_map(model, parallel, runtime_pp_hint)
+    last_stage = max(0, int(parallel.pp) - 1)
+    model_meta = dict(getattr(model, "metadata", ()) or ())
 
-    token_axis = "dcp_head" if parallel.cp > 1 else ("cp_striped" if parallel.pcp > 1 else "replicated")
-    mla_rep = max(1, parallel.tp // max(1, parallel.cp))
-    mla_place = CachePlacementRule(token_ownership_axis=token_axis, replication_factor=mla_rep)
+    def _stage_for(plan: LayerPlan) -> int:
+        return stage_map[plan.index] if 0 <= int(plan.index) < len(stage_map) else last_stage
 
     kv_abis: list[CacheStateABI] = []
     for abi in raw_kv:
         l_mode, l_scale, l_faq = layer_kv_meta.get(abi.native_layer, (kv_mode, eff_kv_scale, has_faquant))
         plan = plan_by_native[abi.native_layer]
-        is_mla = str(plan.attention or model.attention).lower() == "mla"
-        comp_ratio = 1 if abi.component_role == "window_kv" else abi.compression_ratio
-        place = mla_place if is_mla else abi.placement
-        if abi.native_layer in unaligned_mxfp_layers:
-            n_kv = int(plan.num_kv_heads or model.num_kv_heads or model.num_heads)
-            h_dim = int(plan.head_dim or model.head_dim)
-            v_dim = int(plan.v_head_dim or h_dim)
-            planes = _build_unaligned_mxfp_gqa_planes(
-                local_heads=local_kv_heads(n_kv, parallel.tp), head_dim=h_dim,
-                v_head_dim=v_dim, kv_block_size=kv_block_size,
-            )
-            recipe = "qk_mxfp8_dynamic_v_mxfp8_per_channel"
-        elif (not is_mla) and l_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel":
-            planes = _append_mxfp_page_padding(abi.planes)
-            recipe = "qk_mxfp8_dynamic_v_mxfp8_per_channel"
-        else:
-            mqsmla = (
-                _mqsmla_stack_planes(plan, l_scale)
-                if (is_mla and abi.component_role in {"window_kv", "compressed_kv"} and l_mode == "fp8_e4m3")
-                else None
-            )
-            if mqsmla is not None:
-                planes = mqsmla
-            else:
-                planes = _materialize_plane_bytes(abi.planes)
-                if l_scale and l_scale != eff_kv_scale:
-                    planes = tuple(
-                        replace(pl, dtype=l_scale, scale_dtype=l_scale, bytes_per_unit=replace(pl, dtype=l_scale).exact_bytes())
-                        if pl.plane_kind == "scale" else pl
-                        for pl in planes
-                    )
-            recipe = (
-                f"mla_{l_mode}_{l_scale or native_float}" if is_mla
-                else ("gqa_faquant" if l_faq else f"gqa_{l_mode}")
-            )
-        kv_abis.append(replace(
-            abi, planes=planes, checkpoint_digest=ckpt_digest, recipe_abi_id=recipe,
-            compression_ratio=comp_ratio, placement=place,
+        kv_abis.append(_finalize_kv_cache_abi(
+            abi, model, plan, parallel=parallel, model_meta=model_meta, stage=_stage_for(plan),
+            kv_block_size=kv_block_size, phase=phase, native_float=native_float,
+            ckpt_digest=ckpt_digest, eff_kv_scale=eff_kv_scale,
+            l_mode=l_mode, l_scale=l_scale, l_faq=l_faq,
+            unaligned_mxfp=(abi.native_layer in unaligned_mxfp_layers),
         ))
-
-    idx_abis = [
-        _apply_vllm_index_overlay(
-            abi, native_float=native_float, checkpoint_digest=ckpt_digest, placement=mla_place,
-        )
-        for abi in raw_idx
-    ]
-    rec_abis: list[CacheStateABI] = [
-        _apply_speculative_recurrent_overlay(
-            model, plan_by_native[abi.native_layer], abi,
+    idx_abis: list[CacheStateABI] = []
+    for abi in raw_idx:
+        plan = plan_by_native[abi.native_layer]
+        idx_place = _index_placement_for_layer(model, parallel, stage=_stage_for(plan))
+        idx_abis.append(replace(
+            _apply_vllm_index_overlay(
+                abi, model=model, plan=plan, native_float=native_float,
+                checkpoint_digest=ckpt_digest, placement=idx_place,
+                kv_block_size=kv_block_size, phase=phase,
+            ),
+            cp_interleave_size=(kv_block_size if len(idx_place.rank_ids) > 1 else abi.cp_interleave_size),
+        ))
+    rec_abis: list[CacheStateABI] = []
+    for abi in raw_rec:
+        plan = plan_by_native[abi.native_layer]
+        rec_abi = _apply_speculative_recurrent_overlay(
+            model, plan, abi,
             parallel=parallel, checkpoint_digest=ckpt_digest,
             speculative_k=speculative_k, recoverssm_active=recoverssm_active,
         )
-        for abi in raw_rec
-    ]
+        rec_abis.append(replace(rec_abi, placement=replace(rec_abi.placement, pp_stage=_stage_for(plan))))
+    rec_abis.extend(_build_compressor_state_abis(plans, stage_for=_stage_for, ckpt_digest=ckpt_digest, role=role, phase=phase))
     for p in plans:
         if p.engram:
             n_id = p.native_layer_id if p.native_layer_id >= 0 else p.index
-            rec_abis.append(_build_engram_or_ple_abi(
+            engram_abi = _build_engram_or_ple_abi(
                 model, p, native_layer=n_id, native_float=native_float,
                 engram_offload=engram_offload, checkpoint_digest=ckpt_digest,
                 phase=phase, role=role, speculative_k=speculative_k,
-            ))
+            )
+            rec_abis.append(replace(engram_abi, placement=replace(engram_abi.placement, pp_stage=_stage_for(p))))
 
+    draft_kind = _append_draft_cache_abis(
+        model, checkpoint, hw=hw, delegated_rule=delegated_rule, parallel=parallel,
+        effective_opts=effective_opts, model_meta=model_meta, last_stage=last_stage,
+        kv_block_size=kv_block_size, role=role, phase=phase, native_float=native_float,
+        ckpt_digest=ckpt_digest, kv_mode=kv_mode, eff_kv_scale=eff_kv_scale,
+        has_faquant=has_faquant, speculative_k=speculative_k, recoverssm_active=recoverssm_active,
+        disps=disps, kv_abis=kv_abis, idx_abis=idx_abis, rec_abis=rec_abis,
+    )
+    _apply_aliased_window_backing_tags(
+        model, parallel, stage_map=stage_map, kv_block_size=kv_block_size,
+        draft_kind=draft_kind, speculative_k=speculative_k,
+        kv_abis=kv_abis, idx_abis=idx_abis, rec_abis=rec_abis,
+    )
     return tuple(kv_abis), tuple(idx_abis), tuple(rec_abis), tuple(disps), any_faquant, any_mxfp_gqa
 
 
@@ -1993,14 +2550,15 @@ def _resolve_port_abis_and_packs(
         ("embed_tokens", ("model.embed_tokens.weight",)),
         ("lm_head", ("lm_head.weight", "language_model.lm_head.weight")),
     ):
-        tag, blk, did_proj = _resolve_role_tag(
+        tag, blk, did_proj, matched_rule = _resolve_role_tag(
             checkpoint, model_type=model_type, role_name=top_role, candidate_paths=top_paths,
             scope="target", layer_ids=(0,), is_routed_expert=False, expert_ids=expert_ids,
             target_quant_projection=target_proj, hf_cfg=hf_cfg,
         )
         used_projection = used_projection or did_proj
         port_abis.append((("target", 0, top_role), resolve_raw_tag_to_abi(
-            tag, hw_family=hw, native_float_dtype=native_float, phase=phase, role=role, use_nz=use_nz, group_size=blk,
+            tag, hw_family=hw, native_float_dtype=native_float, phase=phase, role=role,
+            use_nz=use_nz, group_size=blk, rule=matched_rule,
         )))
 
     if any(int(p.residual_block_size or 0) > 0 for p in model.layer_plans):
@@ -2015,7 +2573,7 @@ def _resolve_port_abis_and_packs(
         role_specs, candidate_packs = _layer_role_descriptors(plan, model=model)
         layer_abi_map: dict[str, TensorPrecisionABI] = {}
         for role_name, cands, is_expert in role_specs:
-            tag, blk, did_proj = _resolve_role_tag(
+            tag, blk, did_proj, matched_rule = _resolve_role_tag(
                 checkpoint, model_type=model_type, role_name=role_name, candidate_paths=cands,
                 scope="target", layer_ids=layer_ids, is_routed_expert=is_expert, expert_ids=expert_ids,
                 target_quant_projection=target_proj, hf_cfg=hf_cfg,
@@ -2025,7 +2583,7 @@ def _resolve_port_abis_and_packs(
                 tag, hw_family=hw, native_float_dtype=native_float, phase=phase, role=role,
                 is_moe=is_expert, use_nz=use_nz, k_dim=int(model.hidden_size),
                 n_dim=int(model.moe_intermediate_size if is_expert else model.intermediate_size),
-                group_size=blk,
+                group_size=blk, rule=matched_rule,
             )
             layer_abi_map[role_name] = abi
             port_abis.append((("target", native_layer, role_name), abi))

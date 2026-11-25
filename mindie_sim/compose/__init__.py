@@ -198,6 +198,10 @@ def _materialize_machine(
         "num_devices": resolved_devices,
         "ranks_per_node": resolved_rpn,
         "physical_ranks_per_node": phys_rpn,
+        "ranks_per_node_explicit": (
+            True if ranks_per_node is not None
+            else bool(hw_raw.get("ranks_per_node_explicit", "ranks_per_node" in hw_raw))
+        ),
     }
     if preset:
         machine_input["topology_preset"] = preset
@@ -415,6 +419,7 @@ def _resolve_parallel_axes(
     dcp: int | None,
     parallel: str | Mapping[str, Any] | None,
     deployment: str | None,
+    role: str | None = None,
     num_devices: int | None,
     prompt_tokens: int | None,
     output_tokens: int | None,
@@ -424,6 +429,10 @@ def _resolve_parallel_axes(
     """Resolve explicit parallel axes or detect Domain-3 auto-optimal search."""
     if deployment is not None:
         validate_deployment_mode(deployment)
+    eff_dep_raw = deployment if deployment is not None else role
+    is_pd_prefill = bool(
+        eff_dep_raw is not None and str(eff_dep_raw).strip().lower() == "pd_prefill"
+    )
     raw_axes: dict[str, int | None] = {
         "tp": tp, "dp": dp, "ep": ep, "pp": pp, "pcp": pcp, "dcp": dcp,
     }
@@ -448,23 +457,25 @@ def _resolve_parallel_axes(
             raise ModelingError(f"invalid_parallel_dimension:{name}={val}")
 
     any_pinned = any(v is not None for v in raw_axes.values())
+    has_sla_budget = (ttft_slo_ms is not None) if is_pd_prefill else (tpot_slo_ms is not None)
     has_full_serving_budget = (
         num_devices is not None
         and prompt_tokens is not None
         and output_tokens is not None
-        and tpot_slo_ms is not None
+        and has_sla_budget
     )
     auto_mode = (
         parallel_mode == "auto"
         or (parallel_mode is None and not any_pinned and has_full_serving_budget)
     )
     if auto_mode:
+        sla_field = ("ttft_slo_ms", ttft_slo_ms) if is_pd_prefill else ("tpot_slo_ms", tpot_slo_ms)
         missing = [
             name for name, val in (
                 ("num_devices", num_devices),
                 ("prompt_tokens", prompt_tokens),
                 ("output_tokens", output_tokens),
-                ("tpot_slo_ms", tpot_slo_ms),
+                sla_field,
             ) if val is None
         ]
         if missing:
@@ -614,6 +625,8 @@ def _model_mla_prolog_eligible(
     pcp: int,
     dcp: int = 1,
     enable_mlapo: bool = False,
+    role: str | None = None,
+    is_strided_kv_cache: bool | None = None,
 ) -> bool:
     """Delegate MLA Prolog eligibility strictly to canonical M1 5-branch predicate."""
     if not arch:
@@ -632,6 +645,10 @@ def _model_mla_prolog_eligible(
     ).lower() or act_dtype
     is_w4a8 = weight_quant == "int4"
     is_int8_kv = bool(quant is not None and str(getattr(quant, "kv_dtype", "")).lower() == "int8")
+    spec_meta = dict(getattr(model_spec, "metadata", ()) or ())
+    kv_tag_low = str(spec_meta.get("kv_cache_tag") or "").strip().lower()
+    has_faquant = "faquant" in kv_tag_low or "fakquant" in kv_tag_low
+    is_kv_consumer = str(role or "").strip().lower() == "pd_decode"
     registry = default_abi_registry()
     modes = [
         resolve_mla_preprocess_mode(
@@ -643,6 +660,7 @@ def _model_mla_prolog_eligible(
             qk_rope_head_dim=int(plan.qk_rope_head_dim or 0),
             has_rope=(not bool(plan.mla_use_nope)) and int(plan.qk_rope_head_dim or 0) > 0,
             is_sparse_sfa=bool(plan.indexer),
+            is_kv_consumer=is_kv_consumer,
             dcp_size=int(dcp or 1),
             pcp_size=int(pcp or 1),
             enable_mlapo=enable_mlapo,
@@ -650,11 +668,16 @@ def _model_mla_prolog_eligible(
             qkv_a_gate_fused=bool(plan.mla_qkv_a_gate_fused or plan.mla_output_gate),
             is_w4a8=is_w4a8,
             is_int8_kv=is_int8_kv,
-            has_kv_scale=is_int8_kv,
+            has_kv_scale=(is_int8_kv if bool(plan.indexer) else (is_int8_kv and has_faquant)),
+            is_strided_kv_cache=(
+                bool(is_strided_kv_cache)
+                if is_strided_kv_cache is not None
+                else bool(plan.cache_kind == "dense" and not (is_int8_kv and has_faquant))
+            ),
             act_dtype=act_dtype,
             weight_quant=weight_quant,
             input_size=int(model_spec.hidden_size),
-            num_kv_heads=1,
+            num_kv_heads=int(plan.num_kv_heads or 1),
             num_q_heads=int(plan.num_heads or model_spec.num_heads),
             qk_nope_head_dim=int(plan.qk_nope_head_dim or 0),
             registry=registry,
@@ -684,7 +707,9 @@ def _resolve_shipping_mlapo_and_collective(
         and norm_role != "pd_prefill"
         and int(pcp) == 1
         and (not prof or env_mlapo not in {"0", "false", "no"})
-        and _model_mla_prolog_eligible(model_spec, arch=arch, pcp=int(pcp), dcp=int(dcp), enable_mlapo=False)
+        and _model_mla_prolog_eligible(
+            model_spec, arch=arch, pcp=int(pcp), dcp=int(dcp), enable_mlapo=True, role=norm_role,
+        )
     )
     collective_policy = (
         deepcopy(prof["shipping_collective_policy"])
@@ -885,6 +910,7 @@ def _apply_va_profile_lowerings(
         runtime_dict["lowering_passes"] = list(passes)
     lowerings = _resolve_va_lowerings(
         model_spec, runtime_dict["parallel"], sku, passes, notes=notes,
+        role=runtime_meta.get("deployment_role"),
     )
     lowerings = {k: v for k, v in lowerings.items() if k not in excluded_selectors}
     if excluded_passes:
@@ -934,7 +960,7 @@ def _attach_mla_prolog_native_fusion(
         and int(axes.get("pcp", 1)) == 1
         and _model_mla_prolog_eligible(
             model_spec, arch=arch, pcp=int(axes.get("pcp", 1)),
-            dcp=int(axes.get("dcp", 1)), enable_mlapo=False,
+            dcp=int(axes.get("dcp", 1)), enable_mlapo=policy_mlapo, role=norm_role,
         )
     ):
         return
@@ -1134,6 +1160,12 @@ def _prepare_stack_binding(
             req_opts["recover_ssm"] = bool(runtime_options["recover_ssm"])
         if runtime_options.get("max_num_batched_tokens") is not None:
             req_opts["max_num_batched_tokens"] = int(runtime_options["max_num_batched_tokens"])
+        if scenario_options.get("prompt_tokens") is not None:
+            req_opts["prompt_tokens"] = int(scenario_options["prompt_tokens"])
+        if runtime_options.get("pp_layer_partition") is not None:
+            req_opts["pp_layer_partition"] = tuple(int(x) for x in runtime_options["pp_layer_partition"])
+        if runtime_options.get("draft_max_model_len") is not None:
+            req_opts["draft_max_model_len"] = int(runtime_options["draft_max_model_len"])
         if policy_options.get("sp") is not None:
             req_opts["sp"] = bool(policy_options["sp"])
         raw_cg = str(policy_options.get("graph_capture_mode") or "").strip().lower()
@@ -2439,12 +2471,16 @@ def compose_case(
         raise ModelingError(f"invalid_deployment_role:{role}")
     axes, auto_mode = _resolve_parallel_axes(
         tp=tp, dp=dp, ep=ep, pp=pp, pcp=pcp, dcp=dcp,
-        parallel=parallel, deployment=eff_deployment, num_devices=num_devices,
+        parallel=parallel, deployment=eff_deployment, role=norm_role, num_devices=num_devices,
         prompt_tokens=prompt_tokens, output_tokens=output_tokens,
         ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms,
     )
     if auto_mode:
-        auto_opts = {**_select_group(args, "auto"), **_select_group(args, "auto_extra")}
+        auto_opts = {
+            **_select_group(args, "auto"),
+            **_select_group(args, "auto_extra"),
+            **_select_group(args, "derivation"),
+        }
         return _compose_auto_deployment(
             model, hardware, axes, num_devices=num_devices, prompt_tokens=prompt_tokens,
             output_tokens=output_tokens, ttft_slo_ms=ttft_slo_ms, tpot_slo_ms=tpot_slo_ms,

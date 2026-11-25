@@ -362,11 +362,13 @@ def _lower_one_layer_cached(
             "local_shape": tuple(int(x) if isinstance(x, (int, float)) else x for x in (op.local_shape or ())),
             "deps": tuple(str(d) for d in (op.deps or ())), "link_bytes": int(round(float(op.link_bytes or 0.0))),
             "matrix_groups": int(meta.get("matrix_weight_bank_groups") or meta.get("matrix_groups") or 1),
+            "matrix_group_rows": tuple(int(x) for x in meta["matrix_group_rows"]) if isinstance(meta.get("matrix_group_rows"), Sequence) and not isinstance(meta.get("matrix_group_rows"), (str, bytes)) else (),
             "group_axis": str(meta.get("group_axis") or ""),
             "query_layout": str(nabi.get("query_layout") or ""), "cache_layout": str(nabi.get("cache_layout") or ""),
             "output_layout": str(nabi.get("output_layout") or ""),
             "kv_len": int(pgeo["kv_lengths"][0]) if pgeo.get("kv_lengths") else 0,
             "page_count": int(pgeo["page_counts"][0]) if pgeo.get("page_counts") else 0,
+            "partial_count": int(meta["partial_count"]) if meta.get("partial_count") is not None else 0,
         })
     return tuple(out)
 
@@ -439,8 +441,11 @@ def _lowered_op_to_profiler_node(
         qm = str(op_rec.get("quant_mode") or "none").strip().lower()
         if mg > 1:
             impl = _resolve_abi_symbol(arch, _FAMILY_ABI_TABLE["grouped_gemm"][3], family="grouped_gemm")
+            raw_gl = op_rec.get("matrix_group_rows") or ()
+            q_base, q_rem = divmod(max(0, m_d), mg)
+            glist = [int(x) for x in raw_gl] if (len(raw_gl) == mg and sum(int(x) for x in raw_gl) == max(0, m_d)) else ([q_base + 1] * q_rem + [q_base] * (mg - q_rem))
             return (
-                {"node_id": nid, "op_id": oid, "kind": "operator", "op": "grouped_matmul", "builder": "grouped_matmul", "family": "grouped_gemm", "recipe": "grouped_matmul", "implementation": impl, "dtype": dt, "group_list": [max(1, m_d // mg)] * mg, "group_list_type": 1, "shape": {"m": m_d, "n": n_d, "k": k_d, "e": mg, "matrix_groups": mg, "dtype": dt}},
+                {"node_id": nid, "op_id": oid, "kind": "operator", "op": "grouped_matmul", "builder": "grouped_matmul", "family": "grouped_gemm", "recipe": "grouped_matmul", "implementation": impl, "dtype": dt, "group_list": glist, "group_list_type": 1, "shape": {"m": m_d, "n": n_d, "k": k_d, "e": mg, "matrix_groups": mg, "dtype": dt}},
                 {"op_id": oid, "family": fam, "recipe": rec, "builder": "grouped_matmul", "dtype": dt, "quant_mode": qm, "m": m_d, "n": n_d, "k": k_d, "matrix_groups": mg},
             )
         impl = _resolve_abi_symbol(arch, _FAMILY_ABI_TABLE["gemm"][3], family="gemm")
@@ -477,7 +482,7 @@ def _lowered_op_to_profiler_node(
         toks = int(loc[0]) if len(loc) >= _MIN_GEMM_RANK else total_tokens
         heads = int(loc[1]) if len(loc) >= _MIN_GEMM_RANK else local_heads
         hdim = int(loc[2]) if len(loc) >= _MIN_GEMM_RANK else _MLA_LATENT_DIM
-        partials = max(_MIN_DCP_PARTIALS, dcp)
+        partials = int(op_rec.get("partial_count") or 0) or max(_MIN_DCP_PARTIALS, dcp)
         impl = _resolve_abi_symbol(arch, _FAMILY_ABI_TABLE["attention_merge"][3], family=fam)
         return {"node_id": nid, "op_id": oid, "kind": "operator", "op": "dcp_lse_attention_merge", "builder": "dcp_lse_attention_merge", "family": fam, "recipe": rec, "implementation": impl, "dtype": dt, "shape": {"tokens": toks, "heads": heads, "kv_heads": 1, "head_dim": hdim, "partial_count": partials, "dtype": dt}}, {"op_id": oid, "family": fam, "recipe": rec, "builder": "dcp_lse_attention_merge", "dtype": dt, "partial_count": partials}
     if fam in _SPARSE_INDEXER_FAMILIES:
@@ -541,16 +546,18 @@ def resolve_point_binding_and_shape(
     level = assign_plan_point_level(plan_doc, pt)
     raw_custom = pt.get("sim_case") or plan_doc.get("sim_case")
     custom_sim: Mapping[str, Any] | None = raw_custom if isinstance(raw_custom, Mapping) else None
-    probe_indexed = False
-    probe_single_layer = False
-    probe_hidden: int | None = None
+    probe_indexed, probe_single_layer, probe_hidden, idx_dt = False, False, None, "bf16"
     if topk_val is not None or plan_family in _SPARSE_INDEXER_FAMILIES:
         pfam, prec, pbld, abi_cands = _FAMILY_ABI_TABLE["indexer"]
-        impl = _resolve_abi_symbol(arch, abi_cands, family="indexer")
+        cm_q = custom_sim.get("model", {}).get("quant", {}) if isinstance(custom_sim, Mapping) and isinstance(custom_sim.get("model"), Mapping) and isinstance(custom_sim["model"].get("quant"), Mapping) else {}
+        exp_dt = str(pt.get("query_dtype") or pt.get("cache_dtype") or plan_doc.get("query_dtype") or plan_doc.get("cache_dtype") or cm_q.get("index_dtype") or "").strip().lower()
+        is_q_idx = (exp_dt in {"int8", "fp8", "fp8_e4m3"}) if exp_dt else (plan_family == "sparse_indexer" and arch == "A5")
+        idx_dt = (exp_dt if exp_dt in {"int8", "fp8_e4m3"} else "fp8_e4m3") if is_q_idx else "bf16"
+        impl = _resolve_abi_symbol(arch, ("aclnnQuantLightningIndexerV2", "aclnnLightningIndexer") if is_q_idx else abi_cands, family="indexer")
         sim_fam, probe_indexed = "indexer", True
         ctx_len = val if axis == "context_len" else max(val, _DEFAULT_CONTEXT_FALLBACK)
         kv_len = ctx_len if is_abi_reject else (ctx_len + q_tok)
-        shape: dict[str, Any] = {"tokens": max(1, batch * q_tok), "heads": _INDEXER_ATTENTION_HEADS, "kv_heads": 1, "head_dim": _DEFAULT_HEAD_DIM, "seq_len": kv_len, "kv_len": kv_len, "context_len": ctx_len, "batch_size": batch, "sequences": batch, "query_tokens": q_tok, "q_len": q_tok, "query_dtype": "bf16", "cache_dtype": "bf16", "input_layout": "TND", "query_layout": "TND", "parallel_topology": topo}
+        shape: dict[str, Any] = {"tokens": max(1, batch * q_tok), "heads": _INDEXER_ATTENTION_HEADS, "kv_heads": 1, "head_dim": _DEFAULT_HEAD_DIM, "seq_len": kv_len, "kv_len": kv_len, "context_len": ctx_len, "batch_size": batch, "sequences": batch, "query_tokens": q_tok, "q_len": q_tok, "query_dtype": idx_dt, "cache_dtype": idx_dt, "input_layout": "TND", "query_layout": "TND", "parallel_topology": topo}
         if topk_val is not None:
             shape.update({"top_k": topk_val, "sparse_count": topk_val, "enforce_exact_topk": True})
     elif (plan_family == "sku_suite" and axis in {"context_len", "batch_x_kv_heads"}) or plan_family == "attention":
@@ -598,7 +605,7 @@ def resolve_point_binding_and_shape(
             sku, topo_opts, indexed=(probe_indexed or ln_probe),
             topk=topk_val if (probe_indexed and not is_abi_reject) else None,
             hidden_size=probe_hidden, single_layer=(probe_single_layer or ln_probe),
-            index_head_dim=(probe_hidden if ln_probe else None),
+            index_dtype=idx_dt, index_head_dim=(probe_hidden if ln_probe else None),
         )
     return pfam, prec, pbld, impl, sim_fam, shape, sim_case
 
@@ -687,25 +694,33 @@ def resolve_point_measured_binding(plan_doc: Mapping[str, Any], pt: Mapping[str,
     return {"level": level, "phase": "prefill" if int(pt.get("query_tokens", 1)) > 1 else "decode", "target_family": sim_fam, "target_op_id": target_op_id, "target_op_ids": list(tids) if level == "L2" else [], "measured_binding": binding, "sim_case": sim_case, "expected_shape": shape, "profiler_family": pfam, "profiler_recipe": prec, "profiler_builder": pbld, "implementation": impl}
 
 
+def _plan_backend_kind(plan_doc: Mapping[str, Any], pt: Mapping[str, Any]) -> str:
+    if (bk := str(pt.get("backend_kind") or plan_doc.get("backend_kind") or "").strip().lower()):
+        return bk
+    sc = pt.get("sim_case") or plan_doc.get("sim_case")
+    if isinstance(sc, Mapping):
+        if isinstance(mdl := sc.get("model"), Mapping) and (att := str(mdl.get("attention") or "").strip().lower()):
+            return att
+        if sc.get("compose_model"):
+            from mindie_sim.compose.inputs import _resolve_model_spec
+            return str(getattr(_resolve_model_spec(sc["compose_model"]), "attention", "") or "").lower()
+    return ""
+
+
 def build_profiler_subgraph_plan(plan_doc: Mapping[str, Any], *, sku: str, split_tag: str = "", acquisition_id: str = "", profile_override: Mapping[str, Any] | None = None) -> dict[str, Any]:
     if str(plan_doc.get("schema") or "") == _SUBGRAPH_PLAN_SCHEMA:
         return {**dict(plan_doc), "sku": sku, **({"acquisition_id": acquisition_id} if acquisition_id else {})}
-    world = required_ranks_for_plan(plan_doc)
-    plan_sha = str(plan_doc["plan_sha256"])
-    cases: list[dict[str, Any]] = []
+    world, plan_sha, cases = required_ranks_for_plan(plan_doc), str(plan_doc["plan_sha256"]), []
     with temporary_scaffold_profile(sku, profile_override):
         for split_key in ("train_points", "heldout_points", "abi_rejection_points"):
             for pt in plan_doc.get(split_key) or ():
                 if not isinstance(pt, Mapping) or not pt.get("point_id"):
                     continue
                 pid, topo = str(pt["point_id"]), str(pt.get("parallel_topology") or "tp1")
-                pt_ranks, topo_opts = validate_parallel_topology(topo), parse_topo_options(topo)
+                pt_ranks, topo_opts = validate_parallel_topology(topo, backend_kind=_plan_backend_kind(plan_doc, pt)), parse_topo_options(topo)
                 pfam, prec, pbld, impl, _sf, shape, sim_case = resolve_point_binding_and_shape(plan_doc, pt, sku=sku, profile_override=profile_override)
                 level = assign_plan_point_level(plan_doc, pt)
-                nodes, edges, _nb, _tids = _build_case_nodes(
-                    pid, sku=sku, pt=pt, level=level, pfam=pfam, prec=prec, pbld=pbld, impl=impl,
-                    shape=shape, topo_opts=topo_opts, sim_case=sim_case, profile_override=profile_override,
-                )
+                nodes, edges, _nb, _tids = _build_case_nodes(pid, sku=sku, pt=pt, level=level, pfam=pfam, prec=prec, pbld=pbld, impl=impl, shape=shape, topo_opts=topo_opts, sim_case=sim_case, profile_override=profile_override)
                 entry_dt = str(shape.get("dtype") or shape.get("query_dtype") or "bf16").strip().lower()
                 entry: dict[str, Any] = {
                     "case_id": pid, "split": str(pt.get("split") or "heldout"), "level": level, "boundary": STANDARD_LEVEL_BOUNDARY_KINDS[level],
@@ -884,19 +899,12 @@ def _extract_row_event_ids(row: Mapping[str, Any]) -> list[str]:
 
 
 def _resolve_attributed_event_ids(
-    p50_row: Mapping[str, Any],
-    rcpts: Sequence[Mapping[str, Any]],
-    group: Sequence[Mapping[str, Any]],
-    cid: str,
+    p50_row: Mapping[str, Any], rcpts: Sequence[Mapping[str, Any]], group: Sequence[Mapping[str, Any]], cid: str,
 ) -> list[str]:
     win_rank = p50_row.get("rank")
-    candidates: list[Mapping[str, Any]] = [p50_row]
-    candidates.extend(r for r in rcpts if r.get("rank") == win_rank)
-    candidates.extend(r for r in rcpts if r.get("rank") != win_rank)
-    candidates.extend(r for r in group if r is not p50_row)
-    for rec in candidates:
-        ev = _extract_row_event_ids(rec)
-        if ev:
+    cands = [p50_row, *(r for r in rcpts if r.get("rank") == win_rank), *(r for r in rcpts if r.get("rank") != win_rank), *(r for r in group if r is not p50_row)]
+    for rec in cands:
+        if ev := _extract_row_event_ids(rec):
             return ev
     raise ModelingError(f"profiler_observation_event_ids_missing:{cid}")
 
@@ -915,31 +923,32 @@ def normalize_profiler_records(
             for r in raw_records if str(r.get("status") or "").lower() in _ABI_REJECT_STATUSES
         ]
     plan_pts = {str(p["point_id"]): p for sk in ("train_points", "heldout_points") for p in (plan_doc.get(sk) or ()) if isinstance(p, Mapping) and p.get("point_id")}
-    buckets: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
-    receipts: dict[tuple[str, str], list[Mapping[str, Any]]] = {}
+    buckets: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
+    receipts: dict[tuple[str, str, str], list[Mapping[str, Any]]] = {}
     abi_rows: list[dict[str, Any]] = []
     for rec in raw_records:
         cid = str(rec.get("case_id") or rec.get("point_id") or "").strip()
-        status = str(rec.get("status") or "ok").strip().lower()
-        rtype = str(rec.get("record_type") or "").strip().lower()
+        status, rtype = str(rec.get("status") or "ok").strip().lower(), str(rec.get("record_type") or "").strip().lower()
         if status in _ABI_REJECT_STATUSES:
             abi_rows.append({"point_id": cid, "rejected": True, "abi_error": str(rec.get("reason") or rec.get("abi_error") or ""), "executed_shape": dict(rec.get("executed_shape") or rec.get("actual_shape") or {})})
             continue
         split = str(rec.get("split") or (plan_pts.get(cid) or {}).get("split") or "heldout").strip().lower()
+        acq_k = str(rec.get("acquisition_id") or rec.get("acquisition_root") or "").strip()
         if rtype == "receipt" or str(rec.get("schema") or "") == _SUBGRAPH_RUN_SCHEMA:
-            receipts.setdefault((cid, split), []).append(rec)
+            receipts.setdefault((cid, split, acq_k), []).append(rec)
         elif rtype == "observation" or rec.get("duration_ms") is not None:
             if status not in {"", "ok", "passed", "pass"}:
                 raise ModelingError(f"profiler_observation_status_invalid:{cid}:status={status}")
-            buckets.setdefault((cid, split), []).append(rec)
+            buckets.setdefault((cid, split, acq_k), []).append(rec)
 
-    clean_ep = sanitize_public_alias(endpoint_alias or sku, sku)
-    plan_family = str(plan_doc.get("family") or "").strip()
-    out_rows: list[dict[str, Any]] = []
-    for (cid, split), group in sorted(buckets.items()):
+    clean_ep, plan_family, out_rows = sanitize_public_alias(endpoint_alias or sku, sku), str(plan_doc.get("family") or "").strip(), []
+    for (cid, split, acq_k), group in sorted(buckets.items()):
         plan_pt = plan_pts.get(cid)
         binfo = resolve_point_measured_binding(plan_doc, plan_pt, sku=sku) if plan_pt is not None else None
-        rcpts = receipts.get((cid, split), [])
+        rcpts = receipts.get((cid, split, acq_k)) or []
+        if not rcpts and acq_k and (unkeyed := receipts.get((cid, split, ""))):
+            obs_rids = {_TRIAL_SUFFIX_RE.sub("", str(g.get("run_id") or "").strip()) for g in group}
+            rcpts = [r for r in unkeyed if not (rr := _TRIAL_SUFFIX_RE.sub("", str(r.get("run_id") or "").strip())) or any(o == rr or o.startswith(f"{rr}.") for o in obs_rids)]
         # Extract executed shape + top-level node_shapes (matching profiler@57dc39c1 _with_node_shapes)
         actual_shape: dict[str, Any] = {}
         for src in (*rcpts, *group):
@@ -991,7 +1000,7 @@ def normalize_profiler_records(
             clock_op = "busy_union" if tmode in _BUSY_UNION_MODES else DEFAULT_CLOCK_OPERATOR
         event_ids = _resolve_attributed_event_ids(p50_row, rcpts, group, cid)
         level = binfo["level"] if binfo is not None else str(first.get("level") or "L1").upper()
-        explicit_acq = str(first.get("acquisition_id") or (rcpts[0].get("acquisition_id") if rcpts else "") or "").strip()
+        explicit_acq = acq_k or str(first.get("acquisition_id") or first.get("acquisition_root") or ((rcpts[0].get("acquisition_id") or rcpts[0].get("acquisition_root")) if rcpts else "") or "").strip()
         base_acq = str((plan_doc.get("train_lineage_root") if split == "train" else plan_doc.get("heldout_lineage_root")) or f"acq-{split}")
         acq_id = explicit_acq or (f"{base_acq}-{level.lower()}" if split == "heldout" else base_acq)
         base_rid = _TRIAL_SUFFIX_RE.sub("", str(first.get("run_id") or f"run-{cid}"))
