@@ -104,10 +104,17 @@ from typing import Any, Mapping, Sequence
 
 _SPARSE_OWNER_COUNT = 32
 _SPARSE_GROUP_SIZE = 64
+_SPARSE_MAX_SINGLE_CORE_HEADS = 64
+_SPARSE_MAX_SPLIT_HEADS = 128
 _SPARSE_QUERY_WIDTH = 576
 _SPARSE_VALUE_WIDTH = 512
 _SPARSE_KV_TILE_ROWS = 128
 _SPARSE_KV_ROW_ALIGNMENT = 16
+
+
+def _align_sparse_fractal(value: int) -> int:
+    return ((value + _SPARSE_KV_ROW_ALIGNMENT - 1)
+            // _SPARSE_KV_ROW_ALIGNMENT) * _SPARSE_KV_ROW_ALIGNMENT
 
 
 def sparse_mte1_bytes(q_len: int, context: int, kv_len: int, *, causal: bool = True,
@@ -117,34 +124,50 @@ def sparse_mte1_bytes(q_len: int, context: int, kv_len: int, *, causal: bool = T
                       s2_tile: int = _SPARSE_KV_TILE_ROWS) -> dict[str, Any]:
     """Derive per-critical-owner QK/PV L1->L0A/B bytes for one geometry."""
     q_len, context, kv_len, owners = int(q_len), int(context), int(kv_len), int(owners)
-    if q_len <= 0 or owners <= 0 or kv_len <= 0 or context < 0:
+    g, dq, dv, s2_tile = int(g), int(dq), int(dv), int(s2_tile)
+    if (q_len <= 0 or owners <= 0 or kv_len <= 0 or context < 0
+            or g <= 0 or g > _SPARSE_MAX_SPLIT_HEADS
+            or dq <= 0 or dv <= 0 or s2_tile <= 0):
         raise ValueError("sparse_mte1_geometry_invalid")
-    width = -(-q_len // owners)
+    split_g = g > _SPARSE_MAX_SINGLE_CORE_HEADS
+    if split_g:
+        query_owners = owners // 2
+        if query_owners <= 0:
+            raise ValueError("sparse_mte1_geometry_invalid")
+        head_splits = ((g + 1) // 2, g // 2)
+    else:
+        query_owners = owners
+        head_splits = (g,)
+    aligned_dq = _align_sparse_fractal(dq)
+    aligned_dv = _align_sparse_fractal(dv)
+    width = -(-q_len // query_owners)
     per_owner = []
     for start in range(0, q_len, width):
-        qk = pv = ub = tiles = 0
-        for index in range(start, min(start + width, q_len)):
-            selected = min(kv_len, context + index + 1) if causal else min(
-                kv_len, context + q_len)
-            remaining = selected
-            while remaining > 0:
-                rows = min(int(s2_tile), remaining)
-                aligned = ((rows + _SPARSE_KV_ROW_ALIGNMENT - 1)
-                           // _SPARSE_KV_ROW_ALIGNMENT) * _SPARSE_KV_ROW_ALIGNMENT
-                qk += 2 * g * dq + 2 * aligned * dq
-                pv += 2 * g * aligned + 2 * dv * aligned
-                ub += 2 * g * s2_tile
-                tiles += 1
-                remaining -= int(s2_tile)
-        per_owner.append({"qk_pv_bytes": qk + pv, "qk_bytes": qk, "pv_bytes": pv,
-                          "ub_bytes": ub, "tiles": tiles})
+        stop = min(start + width, q_len)
+        for local_g in head_splits:
+            aligned_m = _align_sparse_fractal(local_g)
+            qk = pv = ub = tiles = 0
+            for index in range(start, stop):
+                selected = min(kv_len, context + index + 1) if causal else min(
+                    kv_len, context + q_len)
+                remaining = selected
+                while remaining > 0:
+                    rows = min(s2_tile, remaining)
+                    aligned_kv = _align_sparse_fractal(rows)
+                    qk += 2 * aligned_m * aligned_dq + 2 * aligned_kv * aligned_dq
+                    pv += 2 * aligned_m * aligned_kv + 2 * aligned_kv * aligned_dv
+                    ub += 2 * local_g * s2_tile
+                    tiles += 1
+                    remaining -= rows
+            per_owner.append({"qk_pv_bytes": qk + pv, "qk_bytes": qk, "pv_bytes": pv,
+                              "ub_bytes": ub, "tiles": tiles})
     critical_index = max(range(len(per_owner)),
                          key=lambda index: per_owner[index]["qk_pv_bytes"])
     critical = per_owner[critical_index]
     return {
         "q_len": q_len, "context": context, "kv_len": kv_len, "causal": bool(causal),
-        "owners": owners, "g": int(g), "dq": int(dq), "dv": int(dv),
-        "s2_tile": int(s2_tile), "per_owner_width": width,
+        "owners": owners, "g": g, "dq": dq, "dv": dv,
+        "s2_tile": s2_tile, "per_owner_width": width,
         "critical_owner_index": critical_index,
         "critical_qk_pv_bytes": critical["qk_pv_bytes"],
         "critical_qk_bytes": critical["qk_bytes"],

@@ -851,6 +851,9 @@ CONDITION_FIELDS = (
     "model", "hardware", "parallel", "phase", "tokens", "context", "sequences",
     "precision", "branch",
 )
+PARTITION_CONDITION_FIELDS = (
+    "active_sequences", "padding_sequences",
+)
 
 
 def gap(predicted, observed):
@@ -890,6 +893,35 @@ def _unknowns(value, path):
     return []
 
 
+def _expected_rank_keys(left, right, *, use_sequences=True):
+    if use_sequences:
+        for side in (left, right):
+            seq = side.get("sequences")
+            if isinstance(seq, dict) and seq:
+                return tuple(sorted(seq))
+    for side in (left, right):
+        parallel = side.get("parallel")
+        if isinstance(parallel, dict):
+            dp = parallel.get("dp")
+            if isinstance(dp, int) and not isinstance(dp, bool) and dp > 0:
+                return tuple(str(rank) for rank in range(dp))
+    return None
+
+
+def _aligned_condition_pair(left, right, key):
+    lval, rval = left.get(key), right.get(key)
+    if (key in ("sequences", *PARTITION_CONDITION_FIELDS)
+            and isinstance(lval, dict) != isinstance(rval, dict)):
+        rank_keys = _expected_rank_keys(
+            left, right, use_sequences=(key != "sequences"))
+        if rank_keys is not None:
+            if not isinstance(lval, dict) and lval is not None:
+                lval = {rank: lval for rank in rank_keys}
+            if not isinstance(rval, dict) and rval is not None:
+                rval = {rank: rval for rank in rank_keys}
+    return lval, rval
+
+
 def _step_comparison(entry):
     observed, predicted = entry["observed"], entry.get("predicted", {})
     if predicted.get("scenarios"):
@@ -916,11 +948,15 @@ def _step_comparison(entry):
         return {**result, "status": "incomparable",
                 "reasons": predicted["identity_issues"]}
     left, right = observed.get("conditions", {}), predicted.get("conditions", {})
-    unknown = sorted({item for key in CONDITION_FIELDS
+    fields = CONDITION_FIELDS + tuple(
+        key for key in PARTITION_CONDITION_FIELDS
+        if key in left or key in right
+    )
+    unknown = sorted({item for key in fields
                       for side in (left, right)
                       for item in _unknowns(side.get(key), key)})
-    differences = [item for key in CONDITION_FIELDS
-                   for item in _differences(left.get(key), right.get(key), key)]
+    differences = [item for key in fields
+                   for item in _differences(*_aligned_condition_pair(left, right, key), key)]
     if unknown or differences:
         return {**result, "status": "incomparable",
                 "reasons": [f"unknown_condition:{key}" for key in unknown]
