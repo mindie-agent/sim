@@ -16,8 +16,8 @@ from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.operators.matrix.matrix_precision import EXPLICIT_ORIGINS
 from .mxfp4_geometry import (
-    MX_SCALE_GROUP, MX_SCALE_GROUP_PAIR, MX_SCALE_PUBLISH_K, Config,
-    activation_l2_fraction, align, ceildiv, columns,
+    MX_SCALE_GROUP, MX_SCALE_GROUP_PAIR, MX_SCALE_PUBLISH_K, NZ_N_GRANULE, Config,
+    activation_l2_fraction, align, ceildiv, columns, device_bandwidths_tbs,
     effective_l2_bytes, geometry_ledger, panel_sizes,
     resplit_columns, tile_runs, weight_l2_fraction,
 )
@@ -57,11 +57,11 @@ B8_PROLOGUE_DUPLICATE = 3
 _US_PER_SECOND = 1e6
 SOURCE = {
     "repository": "https://gitcode.com/cann/ops-transformer",
-    "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+    "revision": "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
     "selector": "MXA8W4_NZNK/VECTOR_ANTIQUANT/N_FIRST_TAIL_RESPLIT/DYNAMIC_BUFFER4",
     "files": (
         "gmm/grouped_matmul/op_kernel/grouped_matmul_apt.cpp:425-432",
-        "gmm/grouped_matmul/op_host/op_tiling/arch35/grouped_weight_quant_batch_matmul_tiling.cpp:850-884,1757-1820",
+        "gmm/grouped_matmul/op_host/op_tiling/arch35/grouped_weight_quant_batch_matmul_tiling.cpp:1028-1091,1974-2067",
         "gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/grouped_matmul_weight_quant_resplit_controller.h:136-251",
         "gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/weight_quant_basic_block.h:267-393",
         "gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/weight_quant_cube_compute.h:135-185",
@@ -148,6 +148,8 @@ def config_from_op(op):
         raise ModelingError("mxa8w4_nznk_requires_fp8_mxfp4_group32_e8m0_to_bf16")
     rows = tuple(meta.get("matrix_group_rows", ()))
     m, n, k = op.local_shape[-3:]
+    if type(n) is not int or n <= 0 or n % NZ_N_GRANULE:
+        raise ModelingError("mxa8w4_nznk_requires_k64_n32_source_domain")
     config = Config(k, n, rows)
     if sum(rows) != m:
         raise ModelingError("mxa8w4_nznk_integer_rows_disagree_with_operator")
@@ -181,21 +183,23 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
         int(effective_l2_bytes(geometry))
         if "l2" in geometry.resource_units else 0
     )
+    hbm_bw_tbs, l2_bw_tbs = device_bandwidths_tbs(geometry)
+    bw_kwargs = {"hbm_bw_tbs": hbm_bw_tbs, "l2_bw_tbs": l2_bw_tbs}
     # ``N_FIRST_TAIL_RESPLIT`` narrows the 256-column tiling into a 32-owner
     # 128/160-column traversal and keeps the source DYNAMIC_BUFFER4 producer
     # with its finite per-tile window.  Wide 256-column runs retain the compact
     # equal-tile repetition; both schedules declare the same physical work.
-    resplit = resplit_columns(config, cores)
+    resplit = resplit_columns(config, cores, **bw_kwargs)
     tile_compact = compact and not resplit
     panel_compact = compact_panels and not resplit
     producer = "dynamic_buffer4" if resplit else producer_mode
-    ledger = geometry_ledger(config, cores, tile_compact, directional, l2_bytes)
+    ledger = geometry_ledger(config, cores, tile_compact, directional, l2_bytes, **bw_kwargs)
     total, inventory, counts, runs = ledger.work, ledger.inventory, ledger.counts, ledger.runs
     # Repeated column passes over one expert's activation rows hit the die's
     # resident L2; only the first pass streams from off-chip memory.
     activation_l2 = activation_l2_fraction(config, cores, l2_bytes)
-    weight_l2 = weight_l2_fraction(config, cores, l2_bytes)
-    owner_signatures = [tuple(tile_runs(config, owner, cores, tile_compact))
+    weight_l2 = weight_l2_fraction(config, cores, l2_bytes, **bw_kwargs)
+    owner_signatures = [tuple(tile_runs(config, owner, cores, tile_compact, **bw_kwargs))
                         for owner in range(cores)]
     synchronous_owners = Counter(owner_signatures)
 
@@ -207,7 +211,7 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
                             for pool, size in pools.items() if pool != "ub") if counts[owner] else ()
         allocations += tuple(context.allocate(f"ub{owner}_{sub}", "ub", UB_BYTES,
                                                (2 * owner + sub,)) for sub in (0, 1))
-        schedule = tuple(tile_runs(config, owner, cores, tile_compact))
+        schedule = tuple(tile_runs(config, owner, cores, tile_compact, **bw_kwargs))
 
         def tile(index):
             m, n, repeat = schedule[index]
@@ -263,7 +267,7 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
         "mxa8w4": {
             "group_rows": config.rows, "valid_rows": sum(config.rows),
             "active_banks": sum(m > 0 for m in config.rows),
-            "declared_banks": len(config.rows), "columns": tuple(columns(config, cores)),
+            "declared_banks": len(config.rows), "columns": tuple(columns(config, cores, **bw_kwargs)),
             "owner_tiles": counts, "owner_runs": runs,
             "effective_l2_bytes": l2_bytes,
             "activation_l2_fraction": activation_l2,
@@ -272,6 +276,7 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
             **_source_issue_metadata(
                 config, cores, compact, total, inventory,
                 clock_hz=getattr(geometry.compute_arch, "clock_hz", None),
+                **bw_kwargs,
             ),
             "mte1_mode": mte1_mode,
             "register_inventory": inventory.to_dict(),
@@ -310,16 +315,16 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
     })
 
 
-def _source_issue_metadata(config, cores, compact, total, inventory, *, clock_hz=None):
+def _source_issue_metadata(config, cores, compact, total, inventory, *, clock_hz=None, **bw_kwargs):
     return {
         # Source-facing matrix issue distinction: MMAD/FixPipe parameter m
         # is the valid row count, L0A is a full 16-row fractal transfer.
         "mmad_parameter_m": tuple(sorted({m for owner in range(cores)
-                                           for m, _n, _r in tile_runs(config, owner, cores, compact)})),
+                                           for m, _n, _r in tile_runs(config, owner, cores, compact, **bw_kwargs)})),
         "fixpipe_m": tuple(sorted({m for owner in range(cores)
-                                    for m, _n, _r in tile_runs(config, owner, cores, compact)})),
+                                    for m, _n, _r in tile_runs(config, owner, cores, compact, **bw_kwargs)})),
         "l0a_issue_fractal_m": tuple(sorted({align(m, L0A_FRACTAL_M) for owner in range(cores)
-                                              for m, _n, _r in tile_runs(config, owner, cores, compact)})),
+                                              for m, _n, _r in tile_runs(config, owner, cores, compact, **bw_kwargs)})),
         "matrix_issue_basis": "normal arch3510 FP8 Mmad 16x16x32; physical "
                               "Cube M=16*ceil(m_arg/16); source API/FIX m=valid; "
                               "matrix ledger only, never elapsed x16",

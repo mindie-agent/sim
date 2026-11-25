@@ -102,7 +102,7 @@ def matrix_work(schedule, resource_units, *, directional=None):
 
 @dataclass(frozen=True)
 class WorkspacePublication:
-    """SetQuantVector's existing scale work, then GetTensorC FP16 to GM."""
+    """SetQuantVector scale load and GetTensorC FP16 Fixpipe publication to GM."""
 
     def allocations(self, context, core, buffer_shape, epilogue):
         return ()
@@ -118,10 +118,7 @@ class WorkspacePublication:
         return KernelProgram((
             Stage("scales", context.bind(Work(resources=scales)),
                   placement=context.owned(core, context.core_count, (read,))),
-            Stage("scale_vector", context.bind(Work(resources={"vector": rows * columns})),
-                  after=("scales",),
-                  placement=context.owned(core, context.core_count, ("vector",))),
-            Stage("publish", context.bind(Work(resources=output)), after=("scale_vector",),
+            Stage("publish", context.bind(Work(resources=output)), after=("scales",),
                   placement=context.owned(core, context.core_count, ("fixpipe",))),
         ))
 
@@ -250,7 +247,7 @@ def matrix_program(context, schedule, *, compact=True):
         "packed_weight_bytes": 0.5 * n * k,
         "activation_format": "int4", "compute_format": "int4", "output_format": "fp16",
         "matrix_epilogue": {"kind": "row_column_scale", "row_scale_bytes": 0,
-                            "column_scale_bytes": 0, "operations_per_output": 1},
+                            "column_scale_bytes": 0, "operations_per_output": 0},
     }
     bound = replace(bound, op=replace(bound.op, local_shape=(m, n, k),
                                       metadata=tuple(metadata.items())))

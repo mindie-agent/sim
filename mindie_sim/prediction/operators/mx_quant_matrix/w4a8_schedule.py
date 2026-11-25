@@ -62,6 +62,9 @@ MSD_DIGITS = 2
 MSD_FLOPS_PER_K_STEP = MSD_DIGITS * 2
 MSD_WORKSPACE_BYTES_PER_OUTPUT = MSD_DIGITS * 2  # One FP16 value per digit.
 PRE_OPS_PER_INPUT = 6.5
+PRE_MASK_INIT_LANES = 128
+GATE_USER_WORKSPACE_LIMIT_BYTES = 64 * 1024 * 1024
+GATE_DOUBLE_WORKSPACE_SPLIT = 2
 POST_DEQUANT_OPS_PER_OUTPUT = 6
 SWIGLU_OPS_PER_OUTPUT = 5
 QUANT_OPS_PER_OUTPUT = 5
@@ -328,8 +331,7 @@ def _matrix_tiles(rows, n, k, base_m, base_n, aic_owners, fixpipe, *, subtile_di
                 resources["fixpipe"] = 2 * m_tile * n_tile
             issued_m = align_up(m_tile, sub_m)
             issued_n = align_up(n_tile, sub_n)
-            _add(add, Work({"int4": 2 * issued_m * issued_n * issued_k}, resources),
-                 Work(resources={"vector": m_tile * n_tile}))
+            _add(add, Work({"int4": 2 * issued_m * issued_n * issued_k}, resources))
             owner_tiles[owner] = owner_tiles.get(owner, 0) + 1
             owner_m[owner] = owner_m.get(owner, 0) + m_tile
             owner_n[owner] = owner_n.get(owner, 0) + n_tile
@@ -337,15 +339,34 @@ def _matrix_tiles(rows, n, k, base_m, base_n, aic_owners, fixpipe, *, subtile_di
     return owners_acc, owner_tiles, owner_m, owner_n, start
 
 
-def _gate_pre(rows, k, aiv_owners):
-    acc = {}
-    row_records = source_row_partition(sum(rows), aiv_owners)
-    for owner, _, count in row_records:
-        acc[owner] = _acc()
-        _add(acc[owner], Work(resources={
-            "hbm": 2 * count * k, "mte2": count * k, "mte3": count * k,
-            "vector": PRE_OPS_PER_INPUT * count * k}))
-    return _owner_records(acc, {}, rows={owner: count for owner, _, count in row_records})
+def _gate_pre(rows, n, k, aiv_owners):
+    acc = {owner: _acc() for owner in range(aiv_owners)}
+    total_owner_rows = {owner: 0 for owner in range(aiv_owners)}
+    per_row_workspace = k + MSD_WORKSPACE_BYTES_PER_OUTPUT * n
+    # grouped_matmul_swiglu_quant_v2_base_tiling.cpp:376-380 & a8w4_msd_pipeline.h:101-114:
+    # workspace is halved into double-buffer chunks of m_limit rows; each chunk re-runs
+    # the vector pre-pass mask initialization on every launched AIV.
+    m_limit = max(
+        1,
+        (GATE_USER_WORKSPACE_LIMIT_BYTES // GATE_DOUBLE_WORKSPACE_SPLIT) // per_row_workspace,
+    )
+    remaining = sum(rows)
+    while remaining > 0:
+        chunk_m = min(m_limit, remaining)
+        remaining -= chunk_m
+        chunk_counts = {
+            owner: count for owner, _, count in source_row_partition(chunk_m, aiv_owners)
+        }
+        for owner in range(aiv_owners):
+            count = chunk_counts.get(owner, 0)
+            total_owner_rows[owner] += count
+            _add(acc[owner], Work(resources={
+                "hbm": 2 * count * k,
+                "mte2": count * k,
+                "mte3": count * k,
+                "vector": PRE_OPS_PER_INPUT * count * k + PRE_MASK_INIT_LANES,
+            }))
+    return _owner_records(acc, {}, rows=total_owner_rows)
 
 
 def _gate_post(rows, n, k, aiv_owners):
@@ -392,7 +413,7 @@ def gate_schedule(m, n, k, expert_rows, *, aic_owners, aiv_owners, fixpipe=False
         expert_rows, n, k, GATE_BASE_M, GATE_BASE_N, aic_owners, fixpipe,
         subtile_dims=(sub_m, sub_n, sub_k))
     matrix = _owner_records(acc, {}, tiles=tiles)
-    pre = _gate_pre(expert_rows, k, aiv_owners)
+    pre = _gate_pre(expert_rows, n, k, aiv_owners)
     post, swiglu, quant = _gate_post(expert_rows, n, k, aiv_owners)
     zeros = tuple(expert.weight_offset_elements for expert in experts if not expert.active)
     return GateSchedule(
@@ -422,7 +443,7 @@ def _down_pre(rows, k, aic_owners, task_ratio):
         _add(acc[owner], Work(resources={
             "hbm": 2 * count * k + metadata_bytes,
             "mte2": count * k + metadata_bytes, "mte3": count * k,
-            "vector": PRE_OPS_PER_INPUT * count * k + 2 * len(rows),
+            "vector": PRE_OPS_PER_INPUT * count * k + 2 * len(rows) + PRE_MASK_INIT_LANES,
         }))
     return _owner_records(acc, {}, rows=physical_counts)
 

@@ -39,6 +39,12 @@ SOURCES: tuple[SourceRef, ...] = (
         relative_path="gmm/common/cgmct/block/block_mmad_mx.h",
         source_sha256="5916126d45f67f593e796391d6c275cfaf7921a0c9655f5017da37a8b32f881c",
     ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="gmm/common/cgmct/tile/copy_out/copy_out_split_m_with_params.h",
+        source_sha256="07f2903270f5a86522fc7a4c5c6e38aeeb01110ab70fddc01bfa594b6e7593c0",
+    ),
 )
 
 OUTPUT_N_ALIGNMENT = MX_SCALE_GROUP_PAIR
@@ -116,7 +122,7 @@ def vector_work(rows, width):
 def matrix_work(
     m, n, k, tile, *, subtile_m=CUBE_MN_FRACTAL, subtile_n=CUBE_MN_FRACTAL, subtile_k=MX_SCALE_GROUP_PAIR,
 ):
-    total = Work(resources={'fixpipe': FP32_BYTES*m*n})
+    total = Work(resources={'fixpipe': FP32_BYTES * align(m, 2) * n})
     for start in range(0,k,tile.l1_k):
         load, steps = panel_work(
             m, n, min(tile.l1_k, k - start), tile.k,
@@ -200,7 +206,7 @@ def build(op, geometry):
                         return loads[0],iter((pair,index+1 == len(steps)) for index,pair in enumerate(steps)),()
                     program=RefillPipeline(count+bool(tail),2,2,panel)
                 return KernelProgram((Stage('K',program=program),
-                    stage('fp32_to_ub',Work(resources={'fixpipe':FP32_BYTES*m*n}),after=('K',))))
+                    stage('fp32_to_ub',Work(resources={'fixpipe':FP32_BYTES*align(m,2)*n}),after=('K',))))
             def output(index):
                 _,m,n,_,_=items[index]
                 vec=[]
