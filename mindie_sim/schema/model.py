@@ -114,9 +114,6 @@ INDEXER_TYPE_ALIASES = {
 }
 INDEXER_TYPES = frozenset({"none", "c4", "full", "shared"})
 Q_OUTPUT_GATE_KINDS = frozenset({"none", "elementwise", "headwise"})
-Q_PROJECTION_PACKED_WIDTH = 2
-Q_PROJECTION_PLAIN_WIDTH = 1
-KV_CACHE_PLANES = 2
 DEFAULT_NORM_EPS = 1e-6
 Q_GATE_PROJECTIONS = frozenset({"packed_q", "separate"})
 HC_FINAL_COLLAPSE_MODES = frozenset({"learned", "mean", "none"})
@@ -296,11 +293,10 @@ class LayerPlan:
             object.__setattr__(self, "gdn_layout", layout)
 
     def q_projection_width(self, local_heads: int, head_dim: int) -> int:
-        if self.q_gate_separate:
-            return int(local_heads) * int(head_dim) * Q_PROJECTION_PLAIN_WIDTH
-        width = (Q_PROJECTION_PACKED_WIDTH if self.q_output_gate
-                 else Q_PROJECTION_PLAIN_WIDTH)
-        return int(local_heads) * int(head_dim) * width
+        width = local_heads * head_dim
+        if self.q_gate_separate or self.q_output_gate_kind == "none":
+            return width
+        return width + (local_heads if self.q_output_gate_kind == "headwise" else width)
 
     @property
     def q_gate_separate(self) -> bool:
@@ -328,7 +324,7 @@ class LayerPlan:
             return int(self.kv_lora_rank + self.qk_rope_head_dim)
         # k_eq_v shares projection weights; post-norm/RoPE K and V cache
         # tensors remain distinct planes.
-        return int(KV_CACHE_PLANES * self.num_kv_heads * self.head_dim)
+        return self.num_kv_heads * (self.head_dim + (self.v_head_dim or self.head_dim))
 
     @property
     def state_bytes_total(self) -> float:
@@ -459,7 +455,7 @@ class ModelSpec:
             "q_lora_rank", "kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim",
             "v_head_dim", "o_lora_rank", "o_groups", "index_topk", "index_head_dim",
             "index_n_heads", "compress_ratio", "sliding_window",
-            "norm_eps", "layer_plans", "layer_overrides", "auxiliary", "quant",
+            "norm_eps", "layer_plans", "layer_overrides", "auxiliary", "quant", "vision",
         }
         _unknown(raw, allowed, "model")
         catalog_key = raw.get("catalog_key", raw.get("model_catalog_key", raw.get("preset")))
@@ -563,6 +559,7 @@ class ModelSpec:
             num_shared_experts=shared, expert_routing=routing,
             expert_routing_source=routing_source, mla=mla,
             norm_eps=float(raw.get("norm_eps", DEFAULT_NORM_EPS)), quant=quant,
+            vision=VisionSpec(**immutable_sequences(raw["vision"])) if raw.get("vision") else None,
             auxiliary=auxiliary(immutable_sequences(raw["auxiliary"])) if raw.get("auxiliary") else None,
             tie_word_embeddings=bool(raw.get("tie_word_embeddings", False)),
             metadata=_metadata(raw),
@@ -600,9 +597,15 @@ def _quant_weight_dtype(quantization: str) -> str:
         return "fp8"
     if q in {"int8", "w8a8"}:
         return "int8"
-    if q in {"int4", "awq", "gptq"}:
+    if q in {"w4a16", "int4", "awq", "gptq"}:
         return "int4"
-    return "bf16"
+    if q in {"none", "bf16", "bfloat16", "float"}:
+        return "bf16"
+    if q in {"fp16", "float16"}:
+        return "fp16"
+    if q in {"fp32", "float32"}:
+        return "fp32"
+    raise ModelingError(f"unknown_checkpoint_quant_tag:{quantization}")
 
 def _quant_activation_dtype(quantization: str) -> str:
     q = quantization.lower()
@@ -613,9 +616,15 @@ def _quant_activation_dtype(quantization: str) -> str:
     return "bf16"
 
 def _parse_routing(raw: Mapping[str, Any], experts: int) -> tuple[tuple[float, ...], str]:
-    value = raw.get("expert_routing", raw.get("expert_routing_histogram"))
-    if value is None:
-        return (), "uniform"
+    declared = [_normalize_routing(raw[key], experts) for key in
+                ("expert_routing", "expert_routing_histogram", "expert_routing_distribution")
+                if raw.get(key) is not None]
+    if declared and any(routing != declared[0] for routing in declared[1:]):
+        raise ModelingError("model.expert_routing_conflict")
+    return declared[0] if declared else ((), "uniform")
+
+
+def _normalize_routing(value: Any, experts: int) -> tuple[tuple[float, ...], str]:
     if isinstance(value, Mapping):
         entries = [float(value.get(str(i), value.get(i, 0.0))) for i in range(experts)]
     elif isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
@@ -691,17 +700,16 @@ class RequestSpec:
                        "chain_id", "gap_ms", "text_prompt_tokens",
                        "prefix_cache_key"}, "workload.request")
         request_id = raw.get("request_id", raw.get("id", f"r{index}"))
-        text_prompt = _request_int("prompt_tokens",
-            raw.get("text_prompt_tokens",
-                    raw.get("text_tokens", raw.get("prompt_tokens", raw.get("prompt_len")))),
-            reason="workload", minimum=0,
-        )
         media_tokens = _request_int("media_tokens", raw.get("media_tokens", 0), reason="workload")
-        # Encoding status may skip vision work, but media positions remain part
-        # of the sequence budget and cache.
-        prompt = text_prompt + media_tokens
-        if ("text_prompt_tokens" in raw or "text_tokens" in raw) and "prompt_tokens" in raw:
-            if _request_int("prompt_tokens", raw["prompt_tokens"], minimum=1, reason="workload") != prompt:
+        text = raw.get("text_prompt_tokens", raw.get("text_tokens"))
+        total = raw.get("prompt_tokens", raw.get("prompt_len"))
+        if text is None:
+            prompt = _request_int("prompt_tokens", total, minimum=1, reason="workload")
+            text_prompt = max(0, prompt - media_tokens)
+        else:
+            text_prompt = _request_int("text_prompt_tokens", text, reason="workload")
+            prompt = text_prompt + media_tokens
+            if total is not None and _request_int("prompt_tokens", total, minimum=1, reason="workload") != prompt:
                 raise ModelingError("workload.text_media_prompt_mismatch")
         return cls(
             request_id=request_id,
@@ -784,7 +792,9 @@ class WorkloadSpec:
                 )
             if request.prompt_tokens > runtime.max_model_len:
                 raise ModelingError("request_prompt_exceeds_max_model_len")
-            if not runtime.enable_chunked_prefill and request.prompt_tokens > runtime.max_num_batched_tokens:
+            uncached = max(1, request.prompt_tokens - request.prefix_tokens)
+            budget = min(runtime.max_num_batched_tokens, runtime.max_num_input_tokens or runtime.max_num_batched_tokens)
+            if not runtime.enable_chunked_prefill and uncached > budget:
                 raise ModelingError("prompt_exceeds_batch_budget_without_chunking")
 
     def to_dict(self) -> dict[str, Any]:

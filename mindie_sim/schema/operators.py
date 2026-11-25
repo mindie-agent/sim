@@ -52,8 +52,10 @@ FIELD_ACTIONS = frozenset({"preserve", "rewrite", "consume"})
 #: implementation really executes.  Only issued work consumes resource service.
 WORK_KINDS = frozenset({"useful", "issued"})
 
-LinearMethod = Literal["dense", "w8a8", "w4a8", "w4a16", "fp8", "mx_fp8", "mx_fp4", "none"]
-LINEAR_METHODS = frozenset({"dense", "w8a8", "w4a8", "w4a16", "fp8", "mx_fp8", "mx_fp4", "none"})
+LinearMethod = Literal["dense", "w8a8", "w4a8", "w4a16", "w8a16", "w4a4_laos", "fp8", "mx_fp8", "mx_fp4", "none"]
+LINEAR_METHODS = frozenset({"dense", "w8a8", "w4a8", "w4a16", "w8a16", "w4a4_laos", "fp8", "mx_fp8", "mx_fp4", "none"})
+
+ActivationQuantMode = Literal["none", "static_per_tensor", "dynamic_per_token", "dynamic_mx32", "pd_mixed"]
 
 KernelReadiness = Literal["shipping", "proposed_pr", "synthesized_target", "tiler_extension"]
 KERNEL_READINESS_VALUES = frozenset({
@@ -126,8 +128,12 @@ class TensorPrecisionABI:
     act_scale_pack: str = ""
     explicit_cast_on_entry: str = ""
     explicit_cast_on_exit: str = ""
+    activation_quant_mode: ActivationQuantMode = "none"
+    weight_offset_dtype: str = ""
 
     def __post_init__(self) -> None:
+        if self.activation_quant_mode not in {"none", "static_per_tensor", "dynamic_per_token", "dynamic_mx32", "pd_mixed"}:
+            raise ModelingError(f"tensor_precision_abi_quant_mode_invalid:{self.activation_quant_mode}")
         if self.linear_method not in LINEAR_METHODS:
             raise ModelingError(f"tensor_precision_abi_method_invalid:{self.linear_method!r}")
         if not isinstance(self.input_dtype, str) or not self.input_dtype.strip():
@@ -135,7 +141,7 @@ class TensorPrecisionABI:
         for attr in (
             "weight_dtype", "output_dtype", "compute_dtype", "accum_dtype",
             "weight_layout", "weight_scale_dtype", "act_scale_dtype",
-            "act_scale_pack", "explicit_cast_on_entry", "explicit_cast_on_exit",
+            "act_scale_pack", "explicit_cast_on_entry", "explicit_cast_on_exit", "weight_offset_dtype",
         ):
             if not isinstance(getattr(self, attr), str):
                 raise ModelingError(f"tensor_precision_abi_field_invalid:{attr}")
@@ -171,27 +177,7 @@ class TensorPrecisionABI:
 
     def is_fusion_compatible(self, other: "TensorPrecisionABI") -> bool:
         """Return True iff two ports can merge without an undeclared precision cast."""
-        if not isinstance(other, TensorPrecisionABI):
-            return False
-        if self.abi_signature == other.abi_signature:
-            return True
-        return (
-            self.linear_method == other.linear_method
-            and self.input_dtype == other.input_dtype
-            and self.weight_dtype == other.weight_dtype
-            and self.output_dtype == other.output_dtype
-            and self.compute_dtype == other.compute_dtype
-            and self.accum_dtype == other.accum_dtype
-            and self.weight_layout == other.weight_layout
-            and self.weight_block == other.weight_block
-            and self.weight_scale_dtype == other.weight_scale_dtype
-            and self.weight_scale_bytes == other.weight_scale_bytes
-            and self.act_group_size == other.act_group_size
-            and self.act_scale_dtype == other.act_scale_dtype
-            and self.act_scale_pack == other.act_scale_pack
-            and self.explicit_cast_on_entry == other.explicit_cast_on_entry
-            and self.explicit_cast_on_exit == other.explicit_cast_on_exit
-        )
+        return isinstance(other, TensorPrecisionABI) and self.abi_signature == other.abi_signature
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -206,6 +192,8 @@ class TensorPrecisionABI:
             "weight_scale_dtype": self.weight_scale_dtype,
             "weight_scale_bytes": self.weight_scale_bytes,
             "weight_metadata": dict(self.weight_metadata),
+            "activation_quant_mode": self.activation_quant_mode,
+            "weight_offset_dtype": self.weight_offset_dtype,
             "act_group_size": self.act_group_size,
             "act_scale_dtype": self.act_scale_dtype,
             "act_scale_pack": self.act_scale_pack,
@@ -395,8 +383,8 @@ class OwnerScheduleSpec:
             raise ModelingError(f"owner_schedule_launched_exceeds_total:{launched}>{total}")
         if work_tiles > 0 and active < 1:
             raise ModelingError(f"owner_schedule_zero_active_for_positive_tiles:{work_tiles}")
-        if work_tiles > 0 and launched > 0:
-            min_max_tiles = (work_tiles + launched - 1) // launched
+        if work_tiles > 0:
+            min_max_tiles = (work_tiles + active - 1) // active
             if max_tiles < min_max_tiles:
                 raise ModelingError(
                     f"owner_schedule_max_tiles_understated:{max_tiles}<{min_max_tiles}"
@@ -933,7 +921,7 @@ class OpSpec:
     local_shape: tuple[int, ...]
     padded_shape: tuple[int, ...]
     launch_shape: tuple[int, ...]
-    flops: float = 0.0
+    flops: float | None = None
     hbm_bytes: float = 0.0
     mte2_bytes: float = 0.0
     mte3_bytes: float = 0.0
@@ -969,6 +957,27 @@ class OpSpec:
     precision_abi: TensorPrecisionABI | None = None
     kernel_binding: KernelBinding | None = None
     owner_schedule: OwnerScheduleSpec | None = None
+
+    def __post_init__(self) -> None:
+        # A single precision uses the scalar work count, including after a
+        # sharding pass replaces just flops. Mixed work needs an explicit split.
+        portions: dict[str, float] = {}
+        for dtype, amount in self.matrix_flops:
+            portions[dtype] = portions.get(dtype, 0) + _nonneg_finite(amount, "matrix_flops_invalid")
+        declared = sum(portions.values())
+        total = declared if self.flops is None else _nonneg_finite(self.flops, "matrix_flops_invalid")
+        if not portions:
+            dtype = (self.precision_abi.compute_dtype if self.precision_abi else "") or self.dtype
+            if total and dtype:
+                portions[dtype] = total
+        elif len(self.matrix_flops) == 1:
+            portions[next(iter(portions))] = total
+        elif not math.isclose(declared, total):
+            raise ModelingError(f"matrix_flops_total_mismatch:{self.op_id}")
+        else:
+            total = declared
+        object.__setattr__(self, "flops", total)
+        object.__setattr__(self, "matrix_flops", tuple(sorted((k, v) for k, v in portions.items() if v)))
 
     @property
     def plan_required(self) -> bool:

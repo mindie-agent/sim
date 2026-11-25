@@ -131,11 +131,11 @@ def _pattern_matches(pattern: str, tensor_path: str) -> bool:
 
 
 def _ignored_module_matches(entry: str, tensor_path: str) -> bool:
-    if entry == tensor_path:
-        return True
-    if "*" in entry and _pattern_matches(entry, tensor_path):
-        return True
-    return tensor_path.startswith(entry + ".")
+    pattern = entry.split(".")
+    path = tensor_path.split(".")
+    return len(pattern) <= len(path) and all(
+        part == "*" or part == actual for part, actual in zip(pattern, path)
+    )
 
 
 def _presence_matches(

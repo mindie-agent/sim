@@ -129,6 +129,8 @@ def override_catalog(model, raw):
         raise ModelingError("catalog_override_requires_layer_plans:" + ",".join(sorted(unknown)))
     if "mla" in raw:
         raise ModelingError("catalog_mla_override_requires_layer_overrides")
+    if isinstance(scalar.get("vision"), Mapping):
+        scalar["vision"] = VisionSpec(**immutable_sequences(scalar["vision"]))
     if "quant" in scalar:
         scalar["quant"] = QuantSpec(**immutable_sequences(scalar["quant"]))
     elif any(key in scalar for key in ("weight_dtype", "kv_dtype")):
@@ -151,12 +153,21 @@ def override_catalog(model, raw):
     layer_names = {field.name for field in fields(LayerPlan)}
     changes = {key: value for key, value in scalar.items() if key in layer_names}
     overrides = raw.get("layer_overrides", {})
-    plans = tuple(replace(plan, **{
-        **{key: value for key, value in changes.items()
-           if key not in {"index", "native_layer_id"} and (
-               getattr(plan, key) or key in {"num_shared_experts", "ffn", "attention"})},
-        **overrides.get(str(plan.index), {}),
-    }) for plan in plans)
+    updated_plans = []
+    for plan in plans:
+        patch = {key: value for key, value in changes.items()
+                 if key not in {"index", "native_layer_id"} and (
+                     getattr(plan, key) or key in {"num_shared_experts", "ffn", "attention"})}
+        patch.update(overrides.get(str(plan.index), {}))
+        updated = replace(plan, **patch)
+        if updated.attention == "mla" and updated.cache_kind == "dense" and (
+                {"kv_lora_rank", "qk_rope_head_dim", "kv_cache_elements"} & patch.keys()):
+            width = updated.kv_lora_rank + updated.qk_rope_head_dim
+            if "kv_cache_elements" in patch and updated.kv_cache_elements not in (0, width):
+                raise ModelingError(f"mla_cache_width_mismatch:{updated.kv_cache_elements}!={width}")
+            updated = replace(updated, kv_cache_elements=width)
+        updated_plans.append(updated)
+    plans = tuple(updated_plans)
     if "auxiliary" in raw:
         scalar["auxiliary"] = auxiliary(immutable_sequences(raw["auxiliary"])) if raw["auxiliary"] else None
     return replace(model, **scalar, layer_plans=plans)
@@ -195,7 +206,7 @@ def apply_model_overrides(model, raw):
             )
         model = replace(
             model, quantization=str(declared), quant=quant,
-            weight_dtype=quant.weight_format,
+            weight_dtype=quant.weight_format, kv_dtype=quant.kv_dtype,
             # Matrix constructors derive their own precision. A
             # quantized projection does not quantize attention math.
         )
@@ -210,7 +221,7 @@ def apply_model_overrides(model, raw):
     result = override_catalog(model, raw)
     if "quant" in raw:
         result = replace(result, quantization=result.quant.name,
-                         weight_dtype=result.quant.weight_format)
+                         weight_dtype=result.quant.weight_format, kv_dtype=result.quant.kv_dtype)
     # The quant override is the single representation authority.  An Engram
     # table mode declared there must move the table's storage ledger too, or
     # the graph retains BF16 tables while capacity charges INT8 rows.
