@@ -13,7 +13,9 @@ from typing import Literal, TypeAlias
 from mindie_sim.backends.abi_registry import ProbedAbiRegistry, default_abi_registry
 from mindie_sim.schema.abi import AbiQueryKey, OperandPortSig
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.schema.datapath import GENERIC_ARCH_ID, ArchId, ComputeArchIdentity, DatapathCapabilitySpec
+from mindie_sim.schema.datapath import (
+    GENERIC_ARCH_ID, ArchId, ComputeArchIdentity, DatapathCapabilitySpec, SourceRef,
+)
 from mindie_sim.schema.operators import OpSpec
 
 from ...mechanism import Geometry, OperatorPlan, PlannedRecipe
@@ -22,6 +24,8 @@ from ..contracts import OperatorFamilySpec, OperatorPlanningContext, ResolvedOpe
 from ..attention.common import with_sequence_context
 from . import arch22 as _arch22, arch35 as _arch35
 from .common import (
+    ACLNN_SUPPORTED_NOPE_DIMS,
+    ACLNN_SUPPORTED_Q_LORA_RANKS,
     BF16_BYTES,
     C8_BLOCK_SIZE,
     DEFAULT_KV_LORA_RANK,
@@ -47,6 +51,13 @@ from .common import (
     w_uk_ownership,
 )
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCE_REF = SourceRef(
+    repository="cann/ops-transformer",
+    revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+    relative_path="attention/mla_prolog_v3/op_api/aclnn_mla_prolog_v3_weight_nz.cpp",
+    source_sha256="0950916bb2813a68a0019b13fda325d929da6fc56616423307a3ff158c19def9",
+)
 _STRATEGIES = {"npu_arch_2201": _arch22.STRATEGY, "npu_arch_3510": _arch35.STRATEGY}
 
 MlaPreprocessMode: TypeAlias = Literal[
@@ -68,6 +79,7 @@ PROLOG_V3_SUPPORTED_INPUT_SIZES: frozenset[int] = frozenset({
     1024, 2048, 3072, 4096, 5120, 6144, 7168, 7680, 8192,
 })
 _DECODE_MLAPO_PHASES = frozenset({"decode", "draft"})
+_PROLOG_WEIGHT_UK_PORT = "weight_uk:bf16:ND:dense::none"
 _PROLOG_BF16_TAIL_PORTS: tuple[str, ...] = (
     "rmsnorm_gamma_cq:bf16:ND:dense::none",
     "rmsnorm_gamma_ckv:bf16:ND:dense::none",
@@ -76,79 +88,40 @@ _PROLOG_BF16_TAIL_PORTS: tuple[str, ...] = (
     "kv_cache_ref:bf16:ND:dense::none",
     "kr_cache_ref:bf16:ND:dense::none",
 )
+_PROLOG_BF16_PORTS: tuple[str, ...] = (
+    "token_x:bf16:ND:dense::none",
+    "weight_dq:bf16:FRACTAL_NZ:dense::none",
+    "weight_uq_qr:bf16:FRACTAL_NZ:dense::none",
+    _PROLOG_WEIGHT_UK_PORT,
+    "weight_dkv_kr:bf16:FRACTAL_NZ:dense::none",
+    *_PROLOG_BF16_TAIL_PORTS,
+)
+_PROLOG_INT8_PORTS: tuple[str, ...] = (
+    "token_x:int8:ND:per_token_int8::fp32",
+    "weight_dq:int8:FRACTAL_NZ:per_channel_int8::fp32",
+    "weight_uq_qr:int8:FRACTAL_NZ:per_channel_int8::fp32",
+    _PROLOG_WEIGHT_UK_PORT,
+    "weight_dkv_kr:int8:FRACTAL_NZ:per_channel_int8::fp32",
+    *_PROLOG_BF16_TAIL_PORTS,
+)
+_PROLOG_MXFP8_PORTS: tuple[str, ...] = (
+    "token_x:bf16:ND:dense::none",
+    "weight_dq:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
+    "weight_uq_qr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
+    _PROLOG_WEIGHT_UK_PORT,
+    "weight_dkv_kr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
+    *_PROLOG_BF16_TAIL_PORTS,
+)
 _PROLOG_JOINT_DTYPE_TUPLES: dict[str, tuple[str, ...]] = {
-    "bf16": (
-        "token_x:bf16:ND:dense::none",
-        "weight_dq:bf16:FRACTAL_NZ:dense::none",
-        "weight_uq_qr:bf16:FRACTAL_NZ:dense::none",
-        "weight_uk:bf16:FRACTAL_NZ:dense::none",
-        "weight_dkv_kr:bf16:FRACTAL_NZ:dense::none",
-        *_PROLOG_BF16_TAIL_PORTS,
-    ),
-    "bfloat16": (
-        "token_x:bf16:ND:dense::none",
-        "weight_dq:bf16:FRACTAL_NZ:dense::none",
-        "weight_uq_qr:bf16:FRACTAL_NZ:dense::none",
-        "weight_uk:bf16:FRACTAL_NZ:dense::none",
-        "weight_dkv_kr:bf16:FRACTAL_NZ:dense::none",
-        *_PROLOG_BF16_TAIL_PORTS,
-    ),
-    "int8": (
-        "token_x:int8:ND:per_token_int8::fp32",
-        "weight_dq:int8:FRACTAL_NZ:per_channel_int8::fp32",
-        "weight_uq_qr:int8:FRACTAL_NZ:per_channel_int8::fp32",
-        "weight_uk:int8:FRACTAL_NZ:per_channel_int8::fp32",
-        "weight_dkv_kr:int8:FRACTAL_NZ:per_channel_int8::fp32",
-        *_PROLOG_BF16_TAIL_PORTS,
-    ),
-    "w8a8": (
-        "token_x:int8:ND:per_token_int8::fp32",
-        "weight_dq:int8:FRACTAL_NZ:per_channel_int8::fp32",
-        "weight_uq_qr:int8:FRACTAL_NZ:per_channel_int8::fp32",
-        "weight_uk:int8:FRACTAL_NZ:per_channel_int8::fp32",
-        "weight_dkv_kr:int8:FRACTAL_NZ:per_channel_int8::fp32",
-        *_PROLOG_BF16_TAIL_PORTS,
-    ),
-    "w8a8_int8": (
-        "token_x:int8:ND:per_token_int8::fp32",
-        "weight_dq:int8:FRACTAL_NZ:per_channel_int8::fp32",
-        "weight_uq_qr:int8:FRACTAL_NZ:per_channel_int8::fp32",
-        "weight_uk:int8:FRACTAL_NZ:per_channel_int8::fp32",
-        "weight_dkv_kr:int8:FRACTAL_NZ:per_channel_int8::fp32",
-        *_PROLOG_BF16_TAIL_PORTS,
-    ),
-    "mxfp8": (
-        "token_x:bf16:ND:dense::none",
-        "weight_dq:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        "weight_uq_qr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        "weight_uk:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        "weight_dkv_kr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        *_PROLOG_BF16_TAIL_PORTS,
-    ),
-    "fp8": (
-        "token_x:bf16:ND:dense::none",
-        "weight_dq:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        "weight_uq_qr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        "weight_uk:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        "weight_dkv_kr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        *_PROLOG_BF16_TAIL_PORTS,
-    ),
-    "fp8_e4m3": (
-        "token_x:bf16:ND:dense::none",
-        "weight_dq:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        "weight_uq_qr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        "weight_uk:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        "weight_dkv_kr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        *_PROLOG_BF16_TAIL_PORTS,
-    ),
-    "fp8_e4m3fn": (
-        "token_x:bf16:ND:dense::none",
-        "weight_dq:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        "weight_uq_qr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        "weight_uk:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        "weight_dkv_kr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
-        *_PROLOG_BF16_TAIL_PORTS,
-    ),
+    "bf16": _PROLOG_BF16_PORTS,
+    "bfloat16": _PROLOG_BF16_PORTS,
+    "int8": _PROLOG_INT8_PORTS,
+    "w8a8": _PROLOG_INT8_PORTS,
+    "w8a8_int8": _PROLOG_INT8_PORTS,
+    "mxfp8": _PROLOG_MXFP8_PORTS,
+    "fp8": _PROLOG_MXFP8_PORTS,
+    "fp8_e4m3": _PROLOG_MXFP8_PORTS,
+    "fp8_e4m3fn": _PROLOG_MXFP8_PORTS,
 }
 _PROLOG_ALLOWED_ACT_DTYPES = frozenset({"bf16", "bfloat16"})
 _PROLOG_ARCH_DEFAULT_SKU: dict[str, str] = {
@@ -404,6 +377,11 @@ def resolve_mla_preprocess_mode(
     if not enable_mla_prolog or unsupported_input_width:
         return "native_decomposed"
     if int(dcp_size) > 1 or int(pcp_size) > 1:
+        return "native_decomposed"
+    if (int(q_lora_rank) not in ACLNN_SUPPORTED_Q_LORA_RANKS
+            or int(kv_lora_rank) != DEFAULT_KV_LORA_RANK
+            or int(qk_rope_head_dim) != DEFAULT_QK_ROPE_DIM
+            or (int(qk_nope_head_dim) > 0 and int(qk_nope_head_dim) not in ACLNN_SUPPORTED_NOPE_DIMS)):
         return "native_decomposed"
     joint_tuple = _PROLOG_JOINT_DTYPE_TUPLES.get(wq_norm)
     if joint_tuple is None or arch_norm not in {"A2", "A3", "A5"}:

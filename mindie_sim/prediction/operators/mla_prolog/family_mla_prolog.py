@@ -7,21 +7,34 @@
 [Side-Effect Policy] Returns declarations and updates caller-owned OpSpec records.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.catalog.ops import compute_dtype_for
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 
 from mindie_sim.prediction.structure_groups import declare_group
 
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCE_REF = SourceRef(
+    repository="vllm-project/vllm-ascend",
+    revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+    relative_path="vllm_ascend/attention/sfa_v1.py",
+    source_sha256="058aeb723a4ef3cdb0e07a5fc0180ec53f8227f62d98710144ecffb9cc66678f",
+)
 IMPLEMENTATION = "vllm_ascend_mla_prolog_v3"
 ABSORBED_CATEGORY = "mla_absorb"
 CACHE_GROUP_SIZE = 128
 BF16_CACHE_DTYPES = frozenset({"bf16", "fp8_e4m3"})
-#: Declared V3/V4 prolog Q-LoRA ranks (V4-Flash 1024, V4.1 1280, V3/R1 1536, GLM 2048).
-MLA_PROLOG_QUERY_LORA_RANKS = frozenset({1024, 1280, 1536, 2048})
+#: CANN 9.3 V3/V4 prolog shape invariants (mla_prolog_tiling_check.cpp:248,259,318,340).
+MLA_PROLOG_QUERY_LORA_RANKS = frozenset({1536, 2048})
+MLA_PROLOG_KV_LORA_RANK = 512
+MLA_PROLOG_NOPE_HEAD_DIMS = frozenset({128, 192})
+MLA_PROLOG_ROPE_HEAD_DIM = 64
+ARCH_A2_A3 = frozenset({"A2", "A3"})
+SUPPORTED_PROLOG_ARCHS = frozenset({"A2", "A3", "A5"})
 MXFP8_FORMAT = "fp8_e4m3"
-MXFP8_QUERY_QUANT_MODE = 3
 E8M0_GROUP_SIZE = 32
 BF16_QUERY_QUANT_MODE = 0
 SOURCE = {
@@ -43,15 +56,27 @@ def recipes():
     return {}
 
 
+def _resolve_arch(*, runtime=None, model=None, arch=None) -> str:
+    if arch:
+        return str(arch).strip().upper()
+    for carrier in (runtime, model):
+        meta = dict(getattr(carrier, "metadata", ()) or ()) if carrier is not None else {}
+        raw = meta.get("arch_family")
+        if raw:
+            return str(raw).strip().upper()
+    return ""
+
+
 def prepare_model(model, runtime):
     from mindie_sim.catalog.quant import projection_quant
     from mindie_sim.prediction.implementation_selection import prepared_selection
     options = prepared_selection(runtime.kernels.get("lowerings", {}), "mla_prolog").options
+    arch = _resolve_arch(runtime=runtime, model=model)
     for plan in model.layer_plans:
         if plan.attention == "mla":
             validate(plan=plan, parallel=runtime.parallel, model=model,
                      quant=projection_quant(model.quant, plan),
-                     lowering_passes=runtime.lowering_passes, **options)
+                     lowering_passes=runtime.lowering_passes, arch=arch, **options)
     if options.get("cache_layout"):
         from mindie_sim.catalog.cache_format import with_packed_mla_cache
         rope = max((int(plan.qk_rope_head_dim) for plan in model.layer_plans
@@ -97,33 +122,51 @@ def _prolog_port_formats(quant) -> tuple[tuple[str, str, str], tuple[str, str, s
     return (qa_w, qb_w, kva_w), (qa_act, qb_act, kva_act)
 
 
+def _resolved_projection_format(quant) -> tuple[str, str]:
+    w_ports, act_ports = _prolog_port_formats(quant)
+    if len(set(w_ports)) != 1 or len(set(act_ports)) != 1:
+        raise ModelingError("mla_prolog_v3_projection_port_precision_mismatch")
+    return w_ports[0], act_ports[0]
+
+
 def validate(*, plan, parallel, model, quant, lowering_passes,
-             cache_layout=None, cache_group_size=CACHE_GROUP_SIZE):
+             cache_layout=None, cache_group_size=CACHE_GROUP_SIZE, arch=None):
     from .mla_prolog_packed import (
         SUPPORTED_QUERY_FORMATS, LAYOUT, view,
     )
     cache_layout = _effective_cache_layout(plan, quant, cache_layout)
     packed = cache_layout == LAYOUT
-    if cache_layout not in (None, LAYOUT) or (packed and quant.kv_dtype != "int8"):
+    if cache_layout not in (None, LAYOUT):
         raise ModelingError("mla_prolog_v3_cache_layout_dtype_mismatch")
-    w_ports, act_ports = _prolog_port_formats(quant)
-    if len(set(w_ports)) != 1 or len(set(act_ports)) != 1:
-        raise ModelingError("mla_prolog_v3_projection_port_precision_mismatch")
-    proj_w, proj_act = w_ports[0], act_ports[0]
+    proj_w, proj_act = _resolved_projection_format(quant)
+    arch_norm = _resolve_arch(model=model, arch=arch)
+    if arch_norm:
+        if arch_norm not in SUPPORTED_PROLOG_ARCHS:
+            raise ModelingError(f"mla_prolog_v3_arch_unsupported:{arch_norm}")
+        if arch_norm in ARCH_A2_A3:
+            if proj_w == MXFP8_FORMAT or proj_act == MXFP8_FORMAT:
+                raise ModelingError("mla_prolog_v4_mxfp8_requires_a5")
+            if str(quant.kv_dtype or "").strip().lower().startswith("fp8"):
+                raise ModelingError("mla_prolog_v3_fp8_kv_requires_a5")
+    allowed_packed_kv = {"int8", MXFP8_FORMAT} if proj_w == MXFP8_FORMAT else {"int8"}
+    if packed and quant.kv_dtype not in allowed_packed_kv:
+        raise ModelingError("mla_prolog_v3_cache_layout_dtype_mismatch")
     if packed:
         # DCP keeps one rank-owned row slice; it does not change the C8 row ABI.
-        view(plan.kv_lora_rank, plan.qk_rope_head_dim, cache_group_size)
+        view(plan.kv_lora_rank, plan.qk_rope_head_dim, cache_group_size, query_format=proj_act)
         if proj_w not in SUPPORTED_QUERY_FORMATS or proj_act != proj_w:
             raise ModelingError("mla_prolog_packed_requires_declared_projection_operands")
     if (plan.mla_variant != "latent_mla" or plan.cache_kind != "dense"
-            or plan.qk_rope_head_dim <= 0
+            or plan.kv_lora_rank != MLA_PROLOG_KV_LORA_RANK
+            or plan.qk_nope_head_dim not in MLA_PROLOG_NOPE_HEAD_DIMS
+            or plan.qk_rope_head_dim != MLA_PROLOG_ROPE_HEAD_DIM
             or parallel.cp < 1 or parallel.pcp < 1
             or model.activation_dtype != "bf16"
             or (quant.kv_dtype not in BF16_CACHE_DTYPES and not packed)
             or proj_w not in {"bf16", "int8", "fp8_e4m3"}):
         raise ModelingError("mla_prolog_v3_declared_operand_domain_unsupported")
     # The V3/V4 prolog owns one fused Q-A reduction; its source kernel is
-    # admitted only for the two declared LoRA ranks.
+    # admitted only for CANN's declared LoRA ranks (1536, 2048).
     if (plan.q_lora_rank
             and plan.q_lora_rank not in MLA_PROLOG_QUERY_LORA_RANKS):
         # A direct-Q plan has no Q-LoRA prolog at all; its own builder raises
@@ -153,14 +196,32 @@ def _native_kind(packed, quant):
 def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
             q_a, q_b, kv_a, q_absorb, cache_layout=None, cache_group_size=CACHE_GROUP_SIZE):
     from .mla_prolog_packed import (
-        LAYOUT, MXFP8_QUERY_FORMAT, SOURCE as PACKED_SOURCE, SOURCE_V4,
-        view as packed_view,
+        LAYOUT, SOURCE as PACKED_SOURCE, SOURCE_V4,
+        packed_operand_scales, view as packed_view,
     )
     cache_layout = _effective_cache_layout(plan, quant, cache_layout)
     packed = cache_layout == LAYOUT
-    cache = packed_view(plan.kv_lora_rank, plan.qk_rope_head_dim, cache_group_size) if packed else None
     by_id = {op.op_id: op for op in ops}
     qa, qb, kva, absorb = (dict(by_id[key].metadata) for key in (q_a, q_b, kv_a, q_absorb))
+    proj_act = _resolved_projection_format(quant)[1]
+    local_heads = plan.num_heads // parallel.tp
+    cache = (
+        packed_view(plan.kv_lora_rank, plan.qk_rope_head_dim, cache_group_size, query_format=proj_act)
+        if packed else None
+    )
+    packed_scales: dict[str, object] = {}
+    if packed:
+        tok_s_dt, tok_s_sh, proj_s_dt, proj_s_sh = packed_operand_scales(
+            tokens=tokens, hidden=model.hidden_size, local_heads=local_heads,
+            q_lora_rank=plan.q_lora_rank, kv_lora_rank=plan.kv_lora_rank,
+            qk_nope_head_dim=plan.qk_nope_head_dim, qk_rope_head_dim=plan.qk_rope_head_dim,
+            query_format=proj_act,
+        )
+        packed_scales = {
+            "packed_cache": cache,
+            "token_scale_dtype": tok_s_dt, "token_scale_shape": tok_s_sh,
+            "projection_scale_dtype": proj_s_dt, "projection_scale_shapes": proj_s_sh,
+        }
     do_rope = bool(plan.mla_do_rope)
     native_kind = _native_kind(packed, quant)
     mxfp8_query = native_kind.endswith("V4WeightNz")
@@ -183,7 +244,7 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
         members=members, entries=(q_a, kv_a), anchor=q_absorb,
         view={
             "tokens": tokens, "hidden": model.hidden_size,
-            "heads": plan.num_heads // parallel.tp,
+            "heads": local_heads,
             "query_rank": plan.q_lora_rank, "latent_rank": plan.kv_lora_rank,
             "nope_width": plan.qk_nope_head_dim, "rope_width": plan.qk_rope_head_dim,
             "token_dtype": qa["activation_format"],
@@ -191,12 +252,7 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
                 qa["weight_format"], qb["weight_format"], kva["weight_format"]),
             "absorbed_weight_dtype": absorb["weight_format"],
             "norm_dtype": model.activation_dtype, "cache_dtype": quant.kv_dtype,
-            **({"packed_cache": cache,
-                "token_scale_dtype": "fp32", "token_scale_shape": (tokens, 1),
-                "projection_scale_dtype": "fp32",
-                "projection_scale_shapes": ((1, plan.q_lora_rank),
-                    (1, plan.num_heads // parallel.tp * (plan.qk_nope_head_dim + plan.qk_rope_head_dim)),
-                    (1, plan.kv_lora_rank + plan.qk_rope_head_dim)),
+            **({**packed_scales,
                 "query_norm_scale_dtype": query_norm_scale_dtype,
                 "query_norm_scale_shape": query_norm_scale_shape,
                 "query_nope_scale_shape": (), "rope_cache_output_shape": (),
@@ -205,9 +261,7 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
             "query_norm_output": query_norm_output,
             "do_rope": do_rope,
             "parallel_cp": int(parallel.cp),
-            "query_quant_mode": (MXFP8_QUERY_QUANT_MODE
-                                 if qb["activation_format"] == MXFP8_QUERY_FORMAT
-                                 else BF16_QUERY_QUANT_MODE),
+            "query_quant_mode": BF16_QUERY_QUANT_MODE,
         },
         implementation={
             "native_kind": native_kind,
@@ -276,9 +330,7 @@ def declare_semantic(ops, *, prefix, plan, model, parallel, quant, tokens, membe
             "query_norm_output": query_norm_output,
             "do_rope": bool(plan.mla_do_rope),
             "parallel_cp": int(parallel.cp),
-            "query_quant_mode": (MXFP8_QUERY_QUANT_MODE
-                                 if default_fmt == MXFP8_FORMAT
-                                 else BF16_QUERY_QUANT_MODE),
+            "query_quant_mode": BF16_QUERY_QUANT_MODE,
         },
         implementation={
             "native_kind": native_kind,
@@ -309,8 +361,9 @@ def cache_store(builder, *, deps, rows, plan, cache_layout=None, cache_group_siz
     from .mla_prolog_packed import LAYOUT, store
     cache_layout = _effective_cache_layout(plan, builder.quant, cache_layout)
     if cache_layout == LAYOUT:
+        _, proj_act = _resolved_projection_format(builder.quant)
         return store(builder, "kv_store", deps, rows, plan,
-                     query_format=quant_format(builder.quant, "mla"))
+                     query_format=proj_act)
     return None
 
 

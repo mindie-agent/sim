@@ -12,22 +12,27 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from math import gcd
+from typing import Literal
 
 from mindie_sim.schema.datapath import ArchId, SourceRef
 from mindie_sim.schema.operators import OpSpec
 
 from ...mechanism import OperatorPlan
+from ...runtime.tile_solver import LiveBufferSpec, TileInfeasibleError, check_live_buffers
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from ._lowering import (
     BF16_BYTES, FP32_BYTES, FRACTAL_K_BYTE, FRACTAL_MN, MX_GROUP_SIZE,
     _GenericTiling, _ResidentTiling, _align, ceil_div,
 )
 from .common import (
-    WEIGHT_QUANT_MXFP8, PrologContract, build_plan, contract_for, unsupported, uses_split_m,
+    ABI_V3_NZ, FAMILY, KV_QUANT_PER_TENSOR, WEIGHT_QUANT_MXFP8, PrologContract, aclnn_contract_supported,
+    build_plan, contract_for, unsupported, uses_split_m,
 )
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
 ARCH_ID = ArchId("npu_arch_3510")
 UPSTREAM_ABI = "aclnnMlaPrologV4WeightNz"
+DSL_SUPPORTED_HEADS: frozenset[int] = frozenset({16, 64})
 AIV_PER_BLOCK = 2
 DSL_TOKEN_RANGE_UPPERS = (16, 32, 48, 64, 80, 96, 192, 256)
 DSL_RESIDENT_GEOMETRIES = (
@@ -157,10 +162,68 @@ def _largest_aligned_divisor(value: int, limit: int, alignment: int) -> int:
     return next((n for n in range(limit // alignment * alignment, 0, -alignment) if value % n == 0), 0)
 
 
-def _dsl_long_prefill_tiles(
+def _dsl_mx_bytes(k: int) -> int:
+    return k + k // MX_GROUP_SIZE
+
+
+def _dsl_prefill_buffers_fit(
+    c: PrologContract, ctx: OperatorPlanningContext, columns: int,
+    a1_rows: int, a1_k: tuple[int, int], reduce_rows: int,
+    qb_rows: int, qb_cols: int, qb_k: tuple[int, int],
+    *, resident: bool = False, split: bool = False,
+) -> bool:
+    a1_window, a1_block = a1_k
+    qb_window, qb_block = qb_k
+    if not a1_block or not qb_window or not qb_block:
+        return False
+    rank, head, lanes = c.q_lora_rank, c.dsl_d_width, DSL_VECTOR_LANES
+    exp_stride = _align(rank // MX_GROUP_SIZE, DSL_UB_ALIGNMENT // FP32_BYTES)
+    scale_stride = _align(rank // MX_GROUP_SIZE, DSL_UB_ALIGNMENT)
+    a1_l1 = 2 * (a1_rows * _dsl_mx_bytes(a1_block) + columns * _dsl_mx_bytes(a1_window))
+    qb_x = _dsl_mx_bytes(rank) if resident else 2 * _dsl_mx_bytes(qb_block)
+    qb_l1 = qb_rows * qb_x + 2 * qb_cols * _dsl_mx_bytes(qb_window)
+    ub_a2 = FP32_BYTES * (
+        (reduce_rows + 1) * (rank + head + max(exp_stride, lanes))
+        + (2 * reduce_rows + DSL_A2_FIXED_SCRATCH_VECTORS) * lanes
+    ) + reduce_rows * (rank * (1 + BF16_BYTES) + scale_stride) + 2 * c.kv_row_bytes
+    if split:
+        ub_a2 += reduce_rows * (2 * rank + head) * FP32_BYTES
+    qb_vector_cols = qb_cols // 2 if resident else ceil_div(head, 2)
+    ub_b = qb_rows * (qb_vector_cols * (FP32_BYTES + BF16_BYTES) + 2 * lanes * FP32_BYTES)
+    qb_l0b_slots = 1 if qb_cols == DSL_QB_FULL_HEAD_TILE else 2
+    l0b_a_bytes = 2 * (a1_rows * a1_block + qb_rows * qb_block)
+    l0b_b_bytes = 2 * columns * a1_block + qb_l0b_slots * qb_cols * qb_block
+    l0c_bytes = (a1_rows * columns + qb_rows * (qb_cols if resident else head)) * FP32_BYTES + DSL_L0C_RESERVE
+    # Generic DSL uses the L0B budget for both static operand allocations (separate intervals).
+    live = (
+        LiveBufferSpec("dsl_l1", "l1", a1_l1 + qb_l1, 0, 0, owner_kind="aic", alignment_bytes=1),
+        LiveBufferSpec("dsl_l0b_a", "l0b", l0b_a_bytes, 0, 0, owner_kind="aic", alignment_bytes=1),
+        LiveBufferSpec("dsl_l0b_b", "l0b", l0b_b_bytes, 1, 1, owner_kind="aic", alignment_bytes=1),
+        LiveBufferSpec("dsl_l0c", "l0c", l0c_bytes, 0, 0, owner_kind="aic", alignment_bytes=1),
+        LiveBufferSpec("dsl_ub", "ub", ub_a2 + ub_b + lanes * FP32_BYTES, 0, 0, owner_kind="aiv", alignment_bytes=1),
+    )
+    try:
+        check_live_buffers(live, ctx.geometry, family=FAMILY)
+    except TileInfeasibleError:
+        return False
+    return True
+
+
+def _dsl_search_tile_pair(predicate, rows: int, qb_rows: int) -> tuple[int, int] | None:
+    while not predicate(rows, qb_rows):
+        if qb_rows > FRACTAL_MN:
+            qb_rows = max(FRACTAL_MN, qb_rows // 2 // FRACTAL_MN * FRACTAL_MN)
+        elif rows > FRACTAL_MN:
+            rows = max(FRACTAL_MN, rows // 2 // FRACTAL_MN * FRACTAL_MN)
+        else:
+            return None
+    return rows, qb_rows
+
+
+def _dsl_prefill_tiles(
     c: PrologContract, ctx: OperatorPlanningContext, cores: int, rows: int, columns: int,
-) -> tuple[int, int] | None:
-    """Return A1 rows and split count after the DSL's final transfer capacity check."""
+) -> tuple[int, int, int] | None:
+    """Return (A1 rows, QB rows, split count) after checking DSL prefill buffer ceilings."""
     buffers = dict(ctx.datapath.buffers) | dict(ctx.geometry.buffers)
     l0b = buffers.get("l0b", 0) // 2 * 2
     rank, head = c.q_lora_rank, c.dsl_d_width
@@ -168,42 +231,11 @@ def _dsl_long_prefill_tiles(
         return None
     mx_pair = 2 * MX_GROUP_SIZE
     lanes = DSL_VECTOR_LANES
-    exp_stride = _align(rank // MX_GROUP_SIZE, DSL_UB_ALIGNMENT // FP32_BYTES)
-    scale_stride = _align(rank // MX_GROUP_SIZE, DSL_UB_ALIGNMENT)
 
     def k_tiles(reduction: int, cols: int) -> tuple[int, int]:
         window = _largest_aligned_divisor(reduction, min(reduction, DSL_K_L1_MAX), mx_pair)
         block = _largest_aligned_divisor(window, min(window, DSL_K_L0_MAX, l0b // 2 // 2 // cols), mx_pair)
         return window, block
-
-    def mx_bytes(k: int) -> int:
-        return k + k // MX_GROUP_SIZE
-
-    def fits(a1_rows, a1_k, reduce_rows, qb_rows, qb_cols, qb_k, *, resident=False, split=False) -> bool:
-        a1_window, a1_block = a1_k
-        qb_window, qb_block = qb_k
-        if not a1_block or not qb_window or not qb_block:
-            return False
-        a1_l1 = 2 * (a1_rows * mx_bytes(a1_block) + columns * mx_bytes(a1_window))
-        qb_x = mx_bytes(rank) if resident else 2 * mx_bytes(qb_block)
-        qb_l1 = qb_rows * qb_x + 2 * qb_cols * mx_bytes(qb_window)
-        ub_a2 = FP32_BYTES * (
-            (reduce_rows + 1) * (rank + head + max(exp_stride, lanes))
-            + (2 * reduce_rows + DSL_A2_FIXED_SCRATCH_VECTORS) * lanes
-        ) + reduce_rows * (rank * (1 + BF16_BYTES) + scale_stride) + 2 * c.kv_row_bytes
-        if split:
-            ub_a2 += reduce_rows * (2 * rank + head) * FP32_BYTES
-        qb_vector_cols = qb_cols // 2 if resident else ceil_div(head, 2)
-        ub_b = qb_rows * (qb_vector_cols * (FP32_BYTES + BF16_BYTES) + 2 * lanes * FP32_BYTES)
-        # Generic DSL uses the L0B budget for both static operand allocations.
-        return (
-            a1_l1 + qb_l1 <= buffers.get("l1", 0)
-            and 2 * (a1_rows * a1_block + qb_rows * qb_block) <= l0b
-            and 2 * columns * a1_block + (1 if qb_cols == DSL_QB_FULL_HEAD_TILE else 2) * qb_cols * qb_block <= l0b
-            and (a1_rows * columns + qb_rows * (qb_cols if resident else head)) * FP32_BYTES
-            + DSL_L0C_RESERVE <= buffers.get("l0c", 0)
-            and ub_a2 + ub_b + lanes * FP32_BYTES <= buffers.get("ub", 0)
-        )
 
     qb_cols = DSL_QB_FULL_HEAD_TILE
     if head % qb_cols == 0:
@@ -214,29 +246,58 @@ def _dsl_long_prefill_tiles(
             return None
         qb_k = k_tiles(rank, qb_cols)
 
-    # Fit the initial 20-way tiling, reducing QB rows before QA/KV rows as the DSL does.
-    initial_k = k_tiles(c.hidden_size // DSL_LONG_K_SPLITS, columns)
-    qb_rows = rows
-    while not fits(rows, initial_k, 1, qb_rows, qb_cols, qb_k, split=True):
-        if qb_rows > FRACTAL_MN:
-            qb_rows = max(FRACTAL_MN, qb_rows // 2 // FRACTAL_MN * FRACTAL_MN)
-        elif rows > FRACTAL_MN:
-            rows = max(FRACTAL_MN, rows // 2 // FRACTAL_MN * FRACTAL_MN)
-        else:
-            return None
-
     single_k = k_tiles(c.hidden_size, columns)
     qb_grid_fits = rank % qb_k[0] == 0
-    if qb_grid_fits and fits(rows, single_k, DSL_PREFILL_REDUCE_ROWS, qb_rows, qb_cols, qb_k):
-        return rows, 1
     head_slices = 2 * AIV_PER_BLOCK
-    if head % (head_slices * lanes) == 0 and head // head_slices >= c.qk_rope_head_dim and c.num_heads * 2 >= cores:
-        # Windowed A1 only adds L1 bytes. Every resident QB capacity term is
-        # monotone in its rows, so the smallest searched tile decides feasibility.
-        qb_window = _largest_aligned_divisor(rank, min(DSL_RESIDENT_K_WINDOW, rank), mx_pair)
-        if fits(rows, single_k, DSL_PREFILL_REDUCE_ROWS, FRACTAL_MN, head // 2, (qb_window, mx_pair), resident=True):
-            return rows, 1
-    return (rows, DSL_LONG_K_SPLITS) if qb_grid_fits else None
+    resident_eligible = (
+        head % (head_slices * lanes) == 0
+        and head // head_slices >= c.qk_rope_head_dim
+        and c.num_heads * 2 >= cores
+    )
+    res_qb_window = _largest_aligned_divisor(rank, min(DSL_RESIDENT_K_WINDOW, rank), mx_pair) if resident_eligible else 0
+
+    if c.tokens >= DSL_LONG_TOKEN_THRESHOLD:
+        if c.hidden_size % (DSL_LONG_K_SPLITS * mx_pair) != 0:
+            return None
+        initial_k = k_tiles(c.hidden_size // DSL_LONG_K_SPLITS, columns)
+        found = _dsl_search_tile_pair(
+            lambda r, qr: _dsl_prefill_buffers_fit(c, ctx, columns, r, initial_k, 1, qr, qb_cols, qb_k, split=True),
+            rows, rows,
+        )
+        if found is None:
+            return None
+        fit_rows, fit_qb_rows = found
+        if qb_grid_fits and _dsl_prefill_buffers_fit(
+            c, ctx, columns, fit_rows, single_k, DSL_PREFILL_REDUCE_ROWS, fit_qb_rows, qb_cols, qb_k,
+        ):
+            return fit_rows, fit_qb_rows, 1
+        if resident_eligible and _dsl_prefill_buffers_fit(
+            c, ctx, columns, fit_rows, single_k, DSL_PREFILL_REDUCE_ROWS,
+            FRACTAL_MN, head // 2, (res_qb_window, mx_pair), resident=True,
+        ):
+            return fit_rows, FRACTAL_MN, 1
+        return (fit_rows, fit_qb_rows, DSL_LONG_K_SPLITS) if qb_grid_fits else None
+
+    if qb_grid_fits:
+        found = _dsl_search_tile_pair(
+            lambda r, qr: _dsl_prefill_buffers_fit(
+                c, ctx, columns, r, single_k, DSL_PREFILL_REDUCE_ROWS, qr, qb_cols, qb_k,
+            ),
+            rows, rows,
+        )
+        if found is not None:
+            return found[0], found[1], 1
+    if resident_eligible:
+        found = _dsl_search_tile_pair(
+            lambda r, _: _dsl_prefill_buffers_fit(
+                c, ctx, columns, r, single_k, DSL_PREFILL_REDUCE_ROWS,
+                FRACTAL_MN, head // 2, (res_qb_window, mx_pair), resident=True,
+            ),
+            rows, FRACTAL_MN,
+        )
+        if found is not None:
+            return found[0], FRACTAL_MN, 1
+    return None
 
 
 def _dsl_generic_tiling(op: OpSpec, c: PrologContract, ctx: OperatorPlanningContext, cores: int) -> _GenericTiling:
@@ -262,11 +323,12 @@ def _dsl_generic_tiling(op: OpSpec, c: PrologContract, ctx: OperatorPlanningCont
     if large_decode:
         column_limit = DSL_LARGE_DECODE_COLUMNS
     column_tile = next((n for n in range(column_limit, 0, -FRACTAL_K_BYTE) if width % n == 0), width)
-    if tokens >= DSL_LONG_TOKEN_THRESHOLD:
-        tuned = _dsl_long_prefill_tiles(c, ctx, cores, token_tile, column_tile)
+    qb_token_tile = token_tile
+    if not decode:
+        tuned = _dsl_prefill_tiles(c, ctx, cores, token_tile, column_tile)
         if tuned is None:
-            raise unsupported(op, ctx, "dsl_long_prefill_tiles_exceed_capacity_or_nz_grid")
-        token_tile, splits = tuned
+            raise unsupported(op, ctx, "dsl_prefill_tiles_exceed_capacity_or_nz_grid")
+        token_tile, qb_token_tile, splits = tuned
     reduce_tile = DSL_PREFILL_REDUCE_ROWS if not decode and splits == 1 else 1
     if decode and DSL_DECODE_REDUCE_THRESHOLD < tokens <= DSL_DECODE_SPLIT_THRESHOLD and splits == DSL_RESIDENT_K_SPLITS:
         reduce_tile = 2
@@ -275,7 +337,7 @@ def _dsl_generic_tiling(op: OpSpec, c: PrologContract, ctx: OperatorPlanningCont
     shared = ceil_div(qa_jobs + kv_jobs, cores)
     separate = ceil_div(qa_jobs, cores) + ceil_div(kv_jobs, cores)
     split_queue = 100 * (separate - shared) <= DSL_MAX_EXTRA_PROJECTION_WAVE_PERCENT * shared
-    return _GenericTiling(token_tile, column_tile, splits, reduce_tile, split_queue)
+    return _GenericTiling(token_tile, column_tile, splits, reduce_tile, split_queue, qb_token_tile=qb_token_tile)
 
 
 def _resident_groups(jobs: int, columns: int, cores: int, weight: int, activation: int) -> int:
@@ -316,13 +378,21 @@ def _dsl_resident_tiling(c: PrologContract, ctx: OperatorPlanningContext, cores:
         l1 += qb_scales + qa_panels + DSL_RESIDENT_ALIGNMENT_RESERVE
         l0c_columns = 2 * (panel + n) if twin else head + n
         ub_b = rows * (head // 2) * (FP32_BYTES + BF16_BYTES) + (1 + concurrent_tiles * rows) * vector_bytes
-        required = {"l1": l1, "l0a": 2 * rows * window, "l0b": 2 * n * window,
-                    "l0c": rows * l0c_columns * FP32_BYTES + DSL_L0C_RESERVE, "ub": ub_a2 + ub_b}
-        if all(buffers.get(name, 0) >= size for name, size in required.items()):
-            a_groups = _resident_groups(token_tiles * split_k, (rank + head) // n, cores, n * k, rows * k)
-            b_groups = cores if twin else _resident_groups(token_tiles, c.num_heads, cores, head * rank, rows * rank)
-            gm_alignment = ctx.datapath.route("l0c", "gm").path.alignment_bytes
-            return _ResidentTiling(rows, token_tiles, split_k, n, panel, a_groups, b_groups, gm_alignment)
+        live = (
+            LiveBufferSpec("res_l1", "l1", l1, 0, 0, owner_kind="aic", alignment_bytes=1),
+            LiveBufferSpec("res_l0a", "l0a", 2 * rows * window, 0, 0, owner_kind="aic", alignment_bytes=1),
+            LiveBufferSpec("res_l0b", "l0b", 2 * n * window, 0, 0, owner_kind="aic", alignment_bytes=1),
+            LiveBufferSpec("res_l0c", "l0c", rows * l0c_columns * FP32_BYTES + DSL_L0C_RESERVE, 0, 0, owner_kind="aic", alignment_bytes=1),
+            LiveBufferSpec("res_ub", "ub", ub_a2 + ub_b, 0, 0, owner_kind="aiv", alignment_bytes=1),
+        )
+        try:
+            check_live_buffers(live, ctx.geometry, family=FAMILY)
+        except TileInfeasibleError:
+            continue
+        a_groups = _resident_groups(token_tiles * split_k, (rank + head) // n, cores, n * k, rows * k)
+        b_groups = cores if twin else _resident_groups(token_tiles, c.num_heads, cores, head * rank, rows * rank)
+        gm_alignment = ctx.datapath.route("l0c", "gm").path.alignment_bytes
+        return _ResidentTiling(rows, token_tiles, split_k, n, panel, a_groups, b_groups, gm_alignment)
     return None
 
 
@@ -367,8 +437,16 @@ def _split_m_owners(ctx: OperatorPlanningContext):
 
 def _supports(c: PrologContract) -> bool:
     if c.is_dsl:
-        return c.weight_quant_mode == WEIGHT_QUANT_MXFP8 and c.kv_cache_quant_mode == 1 and not c.query_quant_mode
-    return c.weight_quant_mode != WEIGHT_QUANT_MXFP8 or c.abi == UPSTREAM_ABI
+        return (
+            c.weight_quant_mode == WEIGHT_QUANT_MXFP8
+            and c.kv_cache_quant_mode == KV_QUANT_PER_TENSOR
+            and not c.query_quant_mode
+            and c.num_heads in DSL_SUPPORTED_HEADS
+        )
+    return (
+        (c.weight_quant_mode != WEIGHT_QUANT_MXFP8 or c.abi in {ABI_V3_NZ, UPSTREAM_ABI})
+        and aclnn_contract_supported(c)[0]
+    )
 
 
 @dataclass(frozen=True, slots=True)

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
@@ -23,6 +24,13 @@ from ...runtime.ring_buffer import RingBuffer, lower_generation
 from ...streams import StreamOwners
 
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCE_REF = SourceRef(
+    repository="cann/ops-transformer",
+    revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+    relative_path="attention/mla_prolog/op_host/mla_prolog_tiling.cpp",
+    source_sha256="1770937bd4a58222c5606ce03bec3c574e23bd563ea341c03a1710f153962909",
+)
 FRACTAL_MN = 16
 FRACTAL_K_BF16 = 16
 FRACTAL_K_BYTE = 32
@@ -122,28 +130,50 @@ class _Demand:
     audit: tuple[tuple[str, int | str], ...] = ()
 
 
-def _transfer(
-    owner: int, axis: str, pipe: str, tensor: str, *runs: AddressRun,
-    write: bool = False, gm: bool = True, l2: bool = False, alignment: int | None = None,
+def _transfer_operands(
+    owner: int, axis: str, pipe: str, tensor: str,
+    allocations: tuple[tuple[str, tuple[AddressRun, ...]], ...],
+    *, write: bool = False, gm: bool = True, l2: bool = False, alignment: int | None = None,
     logical_bytes: int | None = None,
 ) -> _Demand:
-    addresses = AddressRunPlan(runs) if alignment is None else AddressRunPlan(runs, alignment_bytes=alignment)
-    pattern = MemoryAccessPattern(
-        tensor, 0, 0, owner, "write" if write else "read", pipe,
-        sum(run.rows * run.row_bytes for run in runs) if logical_bytes is None else logical_bytes,
-        addresses,
-    )
-    aligned = addresses.aligned_copy_bytes()
-    sectors = addresses.dram_sector_and_service()[0] if gm else 0
+    """Account for distinct backing allocations without aliasing their offset-0 spans."""
+    aligned = 0
+    sectors = 0
+    inferred_logical = 0
+    direction = "write" if write else "read"
+    for backing, runs in allocations:
+        if not runs:
+            continue
+        addresses = AddressRunPlan(runs) if alignment is None else AddressRunPlan(runs, alignment_bytes=alignment)
+        run_logical = sum(run.rows * run.row_bytes for run in runs)
+        pattern = MemoryAccessPattern(
+            f"{tensor}:{backing}", 0, 0, owner, direction, pipe, run_logical, addresses,
+        )
+        inferred_logical += pattern.logical_bytes
+        aligned += addresses.aligned_copy_bytes()
+        if gm:
+            sectors += addresses.dram_sector_and_service()[0]
+    total_logical = inferred_logical if logical_bytes is None else logical_bytes
     work = {pipe: aligned}
     if gm:
         work["hbm"] = sectors
         if l2:
             work["l2"] = sectors
     return _Demand(owner, axis, Work(resources=work), (
-        ("tensor", pattern.tensor_id), ("logical_bytes", pattern.logical_bytes),
+        ("tensor", tensor), ("logical_bytes", total_logical),
         ("aligned_bytes", aligned), ("sector_bytes", sectors),
     ))
+
+
+def _transfer(
+    owner: int, axis: str, pipe: str, tensor: str, *runs: AddressRun,
+    write: bool = False, gm: bool = True, l2: bool = False, alignment: int | None = None,
+    logical_bytes: int | None = None,
+) -> _Demand:
+    return _transfer_operands(
+        owner, axis, pipe, tensor, (("data", runs),),
+        write=write, gm=gm, l2=l2, alignment=alignment, logical_bytes=logical_bytes,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,6 +202,7 @@ class _GenericTiling:
     k_splits: int
     reduce_tile: int
     separate_projections: bool
+    qb_token_tile: int | None = None
 
 
 def _generic_projection(name, rows, width, hidden, owners, tiling, start_owner, *, l2, alignment):
@@ -194,7 +225,14 @@ def _generic_projection(name, rows, width, hidden, owners, tiling, start_owner, 
             continue
         full = max(0, ceil_div(jobs - jobs_per_tile - first, len(owners)))
         live = count * m - (count - full) * (padded - rows)
-        load = _transfer(owner, "aic", "mte2_aic", name, *activation, *weight, l2=l2)
+        load = _transfer_operands(
+            owner, "aic", "mte2_aic", name, (
+                ("act", (activation[0],)),
+                ("act_scale", (activation[1],)),
+                ("weight", (weight[0],)),
+                ("weight_scale", weight[1:]),
+            ), l2=l2,
+        )
         pipe_bytes = load.work.resources["mte2_aic"]
         reads.append(_repeat_demand(load, count))
         operands.append(_Demand(owner, "aic", Work(resources={"mte1": pipe_bytes * count})))
