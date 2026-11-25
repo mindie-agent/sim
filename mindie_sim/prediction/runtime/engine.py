@@ -443,19 +443,17 @@ class _EnginePeriodicMixin:
             svc_pat, ho_pat = wave_rec.extract_cycle_pattern(
                 start_before - cycle_dt, start_before,
             )
-            if not svc_pat:
-                cycle_busy = (
-                    dict(per_cycle.busy_by_resource)
-                    if per_cycle is not None else dict(total.busy_by_resource)
+            if svc_pat or ho_pat:
+                wave_rec.on_period(
+                    start_before, cycle_dt, cycle_count,
+                    template_id="periodic_skip", state_digest="skip",
+                    service_pattern=svc_pat, handoff_pattern=ho_pat,
                 )
-                svc_pat = tuple(
-                    (rname, 0.0, float(busy)) for rname, busy in cycle_busy.items() if busy > 0.0
-                )
-            wave_rec.on_period(
-                start_before, cycle_dt, cycle_count,
-                template_id="periodic_skip", state_digest="skip",
-                service_pattern=svc_pat, handoff_pattern=ho_pat,
-            )
+            elif hasattr(wave_rec, "_service_by_pipe") and any(
+                float(amt) > 0.0
+                for amt in dict(getattr(per_cycle, "busy_by_resource", None) or ()).values()
+            ):
+                raise ExecutionError("periodic_skip_missing_proved_cycle_pattern")
         self._sequence += int(total.sequence_count)
         self.allocation_event_count += int(total.allocation_event_count)
         self.completed_count += int(total.logical_completions)

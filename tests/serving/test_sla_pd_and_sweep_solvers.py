@@ -247,8 +247,8 @@ def test_pd_handoff_pairs_replicated_heads_with_every_token_shard():
     transfers = _handoff(raw)[1]
     assert len(transfers) == 4 and sum(row["payload_bytes"] for row in transfers) == pytest.approx(512.0)
     assert all(row["payload_bytes"] == pytest.approx(128.0) for row in transfers)
-    assert {(row["source_rank"], tuple(row["source_token_span"])) for row in transfers} == {(0, (0, 2)), (1, (0, 2)), (2, (2, 4)), (3, (2, 4))}
-    assert {(row["source_rank"], tuple(row["source_heads"])) for row in transfers} == {(0, (0, 1)), (1, (1, 2)), (2, (0, 1)), (3, (1, 2))}
+    assert {(row["source_rank"], tuple(row["source_token_span"])) for row in transfers} == {(0, (0, 2)), (1, (2, 4)), (2, (0, 2)), (3, (2, 4))}
+    assert {(row["source_rank"], tuple(row["source_heads"])) for row in transfers} == {(0, (0, 1)), (1, (0, 1)), (2, (1, 2)), (3, (1, 2))}
 def test_pd_handoff_weights_destination_shards_by_exact_token_rows():
     raw = pd_model_case(5, 1); bind_pd_pool(raw, "prefill", (0,), tp=1, cp=1); bind_pd_pool(raw, "decode", (1, 2), tp=2, cp=2)
     transfers = _handoff(raw)[1]

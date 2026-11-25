@@ -220,3 +220,158 @@ def test_multinode_link_peaks_and_target_receipt_monotonicity() -> None:
             spans = [st.span_ns for st in receipt.stages]
             assert all(cur <= prev for prev, cur in zip(spans, spans[1:]))
             assert all(0 < st.l_star_ns <= st.span_ns for st in receipt.stages if st.status == "committed")
+
+
+def test_hoffman_cp_circulation_noncausal_swa_and_dcp_legality() -> None:
+    """Verify Hoffman exact-lcm circulation, noncausal SWA span, and structural DCP legality."""
+    from mindie_sim.catalog.context_parallel import (
+        legal_vllm_ascend_dcp_values,
+        round_sparse_dcp_matrix,
+        split_causal_pairs,
+        validate_vllm_ascend_dcp_codomain,
+    )
+    from mindie_sim.schema.common import ModelingError
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    # Noncausal SWA (window > 0): exact upstream min(context + q_len, window + q_len).
+    swa_hi = split_causal_pairs(context=100, q_len=4, cp=2, interleave=1, window=16, noncausal=True)
+    assert swa_hi.total == pytest.approx(4.0 * 20.0)
+    swa_lo = split_causal_pairs(context=8, q_len=4, cp=2, interleave=1, window=16, noncausal=True)
+    assert swa_lo.total == pytest.approx(4.0 * 12.0)
+
+    # Exact Hoffman min-cost circulation preserves row/column totals on [0.4,0.6] & [1/3,2/3].
+    for weights, col_tgt in (
+        (((0.4, 0.6), (0.6, 0.4)), None),
+        (((1.0 / 3.0, 2.0 / 3.0), (2.0 / 3.0, 1.0 / 3.0)), (1, 1)),
+    ):
+        mat = round_sparse_dcp_matrix(weights, (1, 1), ((1, 1), (1, 1)), column_targets=col_tgt)
+        assert [sum(row) for row in mat] == [1, 1]
+        assert [sum(row[c] for row in mat) for c in range(2)] == [1, 1]
+        assert all(isinstance(v, int) and v >= 0 for row in mat for v in row)
+
+    # Infeasible column_targets fail fast instead of silently breaking conservation.
+    with pytest.raises(ModelingError, match="dcp_column_targets_infeasible"):
+        round_sparse_dcp_matrix(((0.5, 0.5),), (1,), ((1, 1),), column_targets=(2, 0))
+
+    # Structural DCP legality: KPool (glm-5.3-flash) and DS-V4.1 restrict DCP to {1}.
+    for model_id in ("glm-5.3-flash", "deepseek-v4.1-flash"):
+        raw = compose_case(model_id, GEN5_DT_SKU, tp=8, dp=1, ep=1, layers=2)
+        parsed = parse_case(raw)
+        assert legal_vllm_ascend_dcp_values(parsed.model, tp=8) == (1,)
+        ok, reason = validate_vllm_ascend_dcp_codomain(parsed.model, ParallelSpec(tp=8, cp=2))
+        assert ok is False and reason is not None
+
+
+def test_exposed_observer_clipped_grant_live_retention_and_eviction_fail_closed() -> None:
+    """Verify clipped grant proportional scaling (500/500), live predecessor retention, and fail-closed eviction."""
+    from mindie_sim.prediction.runtime.engine import Engine, Resource
+    from mindie_sim.prediction.runtime.exposed_observer import (
+        ExposedObserver,
+        ObservedInterval,
+        ObservedServiceGrant,
+        StageDescriptor,
+        attribute_stream0_intervals,
+    )
+    from mindie_sim.schema.common import ModelingError
+
+    res = attribute_stream0_intervals(
+        [
+            ObservedInterval("opA", "compute", 0, 0, 1000),
+            ObservedInterval("opB", "compute", 0, 0, 1000),
+        ],
+        start_ns=0,
+        terminal_ns=1000,
+        grants=[
+            ObservedServiceGrant("opA", "cube", 0, 2000, 2.0),
+            ObservedServiceGrant("opB", "cube", 0, 1000, 1.0),
+        ],
+    )
+    assert res.exposed_ns_by_op == {"opA": 500, "opB": 500}
+    assert res.conservation_delta_ns == 0
+
+    # Active predecessor with refcount > 0 is retained across unrelated submits until child resolves.
+    obs_live = ExposedObserver(max_events=3)
+    obs_live.begin_scope("live", 0.0)
+    obs_live.on_submit("old0", declaration=StageDescriptor("cube", cube_ms=1.0))
+    obs_live.on_submit("parent", declaration=StageDescriptor("cube", cube_ms=5.0))
+    obs_live.on_submit("child", after=("parent",), declaration=StageDescriptor("vector", vector_ms=2.0))
+    obs_live.on_submit("unrelated", declaration=StageDescriptor("cube", cube_ms=1.0))
+    assert "parent" in obs_live.scope_events("live") and "child" in obs_live.scope_events("live")
+    child_clock = obs_live.on_resolve("child", after=("parent",), moment_ms=7.0)
+    assert child_clock.all_ms == pytest.approx(7.0)
+
+    # Evicted unreferenced event fails closed on both dependent submit and late resolve.
+    obs_ev = ExposedObserver(max_events=2)
+    obs_ev.begin_scope("ev", 0.0)
+    for idx in range(5):
+        obs_ev.on_submit(f"u{idx}", declaration=StageDescriptor("cube", cube_ms=1.0))
+    assert len(obs_ev.scope_events("ev")) <= 2
+    with pytest.raises(ModelingError, match="exposed_observer_evicted_predecessor:u0"):
+        obs_ev.on_submit("late_dep", after=("u0",), declaration=StageDescriptor("cube", cube_ms=1.0))
+    with pytest.raises(ModelingError, match="exposed_observer_evicted_predecessor:u0"):
+        obs_ev.on_resolve("u0", moment_ms=1.0)
+    with pytest.raises(ModelingError, match="exposed_observer_evicted_predecessor:u0"):
+        obs_ev.release("u0")
+
+    # Exact Fraction sweep-line attribution is cut-invariant and conserves 2**53+3 ns exactly.
+    for span, cuts in ((10, 1), (10, 10), (2**53 + 3, 1)):
+        ivs = [ObservedInterval(k, f"s{j}", j, 0, span) for j, k in enumerate("abx")]
+        grants = [ObservedServiceGrant(k, "hbm", 0, span, float(span)) for k in "ab"]
+        for j in range(cuts):
+            a_ns, b_ns = j * span // cuts, (j + 1) * span // cuts
+            grants.append(ObservedServiceGrant("x", "aux", a_ns, b_ns, float(b_ns - a_ns)))
+        cut_res = attribute_stream0_intervals(ivs, start_ns=0, terminal_ns=span, grants=grants)
+        assert cut_res.conservation_delta_ns == 0
+        if span == 10:
+            assert (cut_res.exposed_ns_by_op["a"], cut_res.exposed_ns_by_op["b"]) == (5, 5)
+
+    eng = Engine([Resource("cube", 1.0)], backend="python", trace_limit=1)
+    e1 = eng.submit("t1", {"cube": 2.0})
+    e2 = eng.submit("t2", {"cube": 3.0}, after=(e1,))
+    eng.advance(until=(e2,))
+    assert e2.done and e2.time == pytest.approx(5.0)
+    assert eng.now == pytest.approx(5.0)
+
+
+def test_cohort_reciprocity_rejects_asymmetric_expected_bytes_and_replica_wire_bytes() -> None:
+    """Reject non-reciprocal expected-byte matrices and cross-replica wire_bytes asymmetry."""
+    from dataclasses import replace
+    from mindie_sim.api import compose_case as compose_spec
+    from mindie_sim.prediction.efficiency.cost import CostModel
+    from mindie_sim.prediction.execution import Execution
+    from mindie_sim.prediction.operators.mc2.mc2_program import native_program_from_contract
+    from mindie_sim.prediction.program import NativeProgram, RecipeContext
+    from mindie_sim.prediction.runtime.dp_cohort_dedup import is_symmetric_native_program
+    from mindie_sim.schema.hardware_links import Link
+
+    ctx = RecipeContext(object(), {}, {}, {"hbm": 1.0, "vector": 1.0, "link": 1.0}, 2)
+    asym_row = (1536.0, 512.0)
+    raw_asym = dict(
+        kind="dispatch", width=32, dtype="bf16", source_assignments=4, received_assignments=6,
+        experts=2, ep=2, source_tokens=4, top_k=1,
+        route_matrix_bytes=(asym_row, asym_row), payload_basis="expected",
+    )
+    prog_asym = native_program_from_contract(raw_asym, ctx)
+    assert is_symmetric_native_program(NativeProgram(prog_asym, prog_asym.work), 2) is False
+
+    grp = tuple(range(4))
+    spec = compose_spec("deepseek-v3.2", "a5", options=dict(tp=1, dp=4, ep=4, layers=4, ranks_per_node=2))
+    pair_links = tuple(
+        Link(str(i), 1.0, (i, i + 1), semantics="per_pair", scope="node", transaction_bytes=512 * (1 + i // 2))
+        for i in (0, 2)
+    )
+    spec = replace(spec, machine=replace(
+        spec.machine, links=pair_links + (Link("inter", 1.0, grp, semantics="per_pair", scope="cross_node"),),
+    ))
+    exe = Execution(spec, CostModel(spec))
+    mat = tuple(tuple(int((i ^ 1) == j) for j in grp) for i in grp)
+    raw_eq = dict(
+        kind="dispatch", width=32, dtype="bf16", source_assignments=1, received_assignments=1,
+        experts=4, ep=4, source_tokens=1, top_k=1, route_matrix=mat, payload_basis="exact",
+    )
+    prog_eq = native_program_from_contract(raw_eq, ctx)
+    target = dict(group=grp, sources=(0,), route=exe.topology.route_message)
+    ok_rec, _, _ = exe._verify_canonical_cohort_reciprocity(
+        NativeProgram(prog_eq, prog_eq.work), target, grp, 0, is_symmetric_native_program,
+    )
+    assert ok_rec is False

@@ -16,6 +16,8 @@ from ..communication import MessageFlow
 
 
 def _non_negative_number(value, label):
+    # Out-of-scope Wave S-Global caller: pd_connector/connector.py:17,36,42,46
+    # (hop_startup_us/chunk_bytes); NEVER used by PDTransfer or PDHandoff.
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ModelingError(f"{label}_invalid:{value}")
     result = float(value)
@@ -24,13 +26,19 @@ def _non_negative_number(value, label):
     return result
 
 
+def _strict_positive_int(value, label):
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ModelingError(f"{label}_invalid:{value}")
+    return value
+
+
 @dataclass(frozen=True)
 class PDTransfer:
     """One directed physical-rank shard inside a request handoff."""
 
     source_rank: int
     destination_rank: int
-    payload_bytes: float
+    payload_bytes: int
     source_stage: int = 0
     destination_stage: int = 0
     source_layers: tuple[int, ...] = ()
@@ -51,9 +59,9 @@ class PDTransfer:
     destination_tier: str = "hbm"
     source_storage: str = ""
     destination_storage: str = ""
-    #: Half-open byte ranges inside the named source/destination storage.
-    source_byte_range: tuple[float, float] = ()
-    destination_byte_range: tuple[float, float] = ()
+    #: Exact integer half-open byte ranges ``[start, end)`` inside source/destination storage.
+    source_byte_range: tuple[int, int] = ()
+    destination_byte_range: tuple[int, int] = ()
     source_scope: str = ""
     destination_scope: str = ""
 
@@ -63,9 +71,7 @@ class PDTransfer:
                 or isinstance(self.destination_rank, bool)
                 or not isinstance(self.destination_rank, int)):
             raise ModelingError("pd_transfer_requires_integer_ranks")
-        value = _non_negative_number(self.payload_bytes, "pd_transfer_payload")
-        if value <= 0:
-            raise ModelingError("pd_transfer_payload_requires_positive_bytes")
+        _strict_positive_int(self.payload_bytes, "pd_transfer_payload_requires_positive_int_bytes")
         for name in ("source_stage", "destination_stage"):
             if (isinstance(getattr(self, name), bool)
                     or not isinstance(getattr(self, name), int)
@@ -108,11 +114,10 @@ class PDTransfer:
             if not value:
                 continue
             if (not isinstance(value, tuple) or len(value) != 2
-                    or any(isinstance(item, bool)
-                           or not isinstance(item, (int, float))
-                           or not math.isfinite(float(item)) or item < 0
-                           for item in value)
-                    or value[0] > value[1]):
+                    or any(isinstance(item, bool) or not isinstance(item, int)
+                           or item < 0 for item in value)
+                    or value[0] >= value[1]
+                    or (value[1] - value[0]) != self.payload_bytes):
                 raise ModelingError(f"pd_transfer_{name}_invalid")
 
 
@@ -133,10 +138,10 @@ class PDHandoff:
     request_id: str
     transfers: tuple[PDTransfer, ...]
     memory_work: tuple[tuple[str, float], ...] = ()
-    receive_capacity_bytes: tuple[tuple[int, float], ...] = ()
+    receive_capacity_bytes: tuple[tuple[int, int], ...] = ()
     receive_buffer_ids: tuple[tuple[int, str], ...] = ()
-    receive_pool_capacity_bytes: tuple[tuple[int, float], ...] = ()
-    receive_host_bytes: tuple[tuple[int, float], ...] = ()
+    receive_pool_capacity_bytes: tuple[tuple[int, int], ...] = ()
+    receive_host_bytes: tuple[tuple[int, int], ...] = ()
 
     def __post_init__(self):
         if not self.request_id:
@@ -145,19 +150,20 @@ class PDHandoff:
             return
         if any(not isinstance(item, PDTransfer) for item in self.transfers):
             raise ModelingError("pd_handoff_transfer_record_invalid")
-        totals = defaultdict(float)
-        host_totals = defaultdict(float)
+        totals = defaultdict(int)
+        host_totals = defaultdict(int)
         for item in self.transfers:
             if item.destination_tier == "host":
-                host_totals[item.destination_rank] += float(item.payload_bytes)
+                host_totals[item.destination_rank] += item.payload_bytes
             else:
-                totals[item.destination_rank] += float(item.payload_bytes)
+                totals[item.destination_rank] += item.payload_bytes
         capacities = dict(self.receive_capacity_bytes)
         if len(capacities) != len(self.receive_capacity_bytes):
             raise ModelingError("pd_handoff_duplicate_receive_capacity")
         for rank, value in capacities.items():
             if (isinstance(rank, bool) or not isinstance(rank, int)
-                    or not math.isfinite(float(value)) or float(value) <= 0):
+                    or isinstance(value, bool) or not isinstance(value, int)
+                    or value <= 0):
                 raise ModelingError(
                     f"pd_handoff_receive_capacity_invalid:{rank}:{value}")
         buffers = dict(self.receive_buffer_ids)
@@ -171,7 +177,7 @@ class PDHandoff:
         for rank, value in capacities.items():
             if rank not in totals:
                 raise ModelingError(f"pd_handoff_capacity_without_destination:{rank}")
-            if value + 1e-9 < totals[rank]:
+            if value < totals[rank]:
                 raise ModelingError(
                     "pd_handoff_receive_capacity_below_physical_shard:"
                     f"{rank}:{value}<{totals[rank]}")
@@ -182,7 +188,7 @@ class PDHandoff:
             if rank not in capacities:
                 raise ModelingError(
                     f"pd_handoff_pool_capacity_without_destination:{rank}")
-            if not math.isfinite(float(value)) or float(value) <= 0:
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ModelingError(
                     f"pd_handoff_pool_capacity_invalid:{rank}:{value}")
             # C may legitimately be smaller than this call's F: that is a
@@ -199,13 +205,14 @@ class PDHandoff:
             raise ModelingError("pd_handoff_duplicate_host_capacity")
         for rank, value in host_capacity.items():
             if (isinstance(rank, bool) or not isinstance(rank, int)
-                    or not math.isfinite(float(value)) or float(value) <= 0):
+                    or isinstance(value, bool) or not isinstance(value, int)
+                    or value <= 0):
                 raise ModelingError(
                     f"pd_handoff_host_capacity_invalid:{rank}:{value}")
             if rank not in host_totals:
                 raise ModelingError(
                     f"pd_handoff_host_capacity_without_host_transfer:{rank}")
-            if float(value) + 1e-9 < host_totals[rank]:
+            if value < host_totals[rank]:
                 raise ModelingError(
                     "pd_handoff_host_capacity_below_host_shard:"
                     f"{rank}:{value}<{host_totals[rank]}")
@@ -215,22 +222,23 @@ class PDHandoff:
               receive_capacity_bytes=None, receive_buffer_ids=None,
               receive_pool_capacity_bytes=None, receive_host_bytes=None):
         transfers = tuple(transfers)
-        totals = defaultdict(float)
-        host_totals = defaultdict(float)
+        totals = defaultdict(int)
+        host_totals = defaultdict(int)
         for item in transfers:
             if item.destination_tier == "host":
-                host_totals[item.destination_rank] += float(item.payload_bytes)
+                host_totals[item.destination_rank] += item.payload_bytes
             else:
-                totals[item.destination_rank] += float(item.payload_bytes)
+                totals[item.destination_rank] += item.payload_bytes
         if receive_capacity_bytes is None:
             capacity = tuple(sorted(totals.items()))
         elif isinstance(receive_capacity_bytes, Mapping):
             capacity = tuple(sorted(
-                (int(rank), float(value))
+                (int(rank), _strict_positive_int(value, "pd_handoff_receive_capacity"))
                 for rank, value in receive_capacity_bytes.items()))
         else:
             capacity = tuple(sorted(
-                (int(rank), float(value)) for rank, value in receive_capacity_bytes))
+                (int(rank), _strict_positive_int(value, "pd_handoff_receive_capacity"))
+                for rank, value in receive_capacity_bytes))
         if receive_buffer_ids is None:
             buffers = tuple((rank, f"pd:{request_id}:rank{rank}")
                             for rank in sorted(totals))
@@ -246,21 +254,22 @@ class PDHandoff:
             pool_capacity = capacity
         elif isinstance(receive_pool_capacity_bytes, Mapping):
             pool_capacity = tuple(sorted(
-                (int(rank), float(value))
+                (int(rank), _strict_positive_int(value, "pd_handoff_pool_capacity"))
                 for rank, value in receive_pool_capacity_bytes.items()))
         else:
             pool_capacity = tuple(sorted(
-                (int(rank), float(value))
+                (int(rank), _strict_positive_int(value, "pd_handoff_pool_capacity"))
                 for rank, value in receive_pool_capacity_bytes))
         if receive_host_bytes is None:
             host = tuple(sorted(host_totals.items()))
         elif isinstance(receive_host_bytes, Mapping):
             host = tuple(sorted(
-                (int(rank), float(value))
+                (int(rank), _strict_positive_int(value, "pd_handoff_host_capacity"))
                 for rank, value in receive_host_bytes.items()))
         else:
             host = tuple(sorted(
-                (int(rank), float(value)) for rank, value in receive_host_bytes))
+                (int(rank), _strict_positive_int(value, "pd_handoff_host_capacity"))
+                for rank, value in receive_host_bytes))
         return cls(str(request_id), transfers, memory, capacity, buffers,
                    pool_capacity, host)
 

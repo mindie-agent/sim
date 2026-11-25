@@ -329,3 +329,40 @@ def test_dcp_factorization_sweep_streaming_errors_and_parallel_parity():
     for jobs in (1, 2):
         with pytest.raises(ValueError):
             sweep_topologies(raw_case, candidates=bad_cands, num_devices=4, sla_ms=50.0, context=1024, phase="decode", scope="body", output_budget=64, max_sequences_per_dp=8, jobs=jobs)
+
+
+def test_cross_node_non_superpod_tp16_admission_and_solve_four_track_contract():
+    """Non-SuperPod cross-node TP=16 is admitted (zero SuperPod whitelist) and solve_deployment drops compare_source."""
+    from mindie_sim.solve import solve_deployment
+
+    # Non-SuperPod 2x8 node (950dt-96g, ranks_per_node=8) admits cross-node TP=16 without hard ban.
+    cands = enumerate_parallel_candidates(
+        "qwen3-32b", num_devices=16, allow_dp=True, allow_ep=False, allow_dcp=True,
+    )
+    assert any(c["tp"] == 16 and c["dp"] == 1 for c in cands)
+    raw_tp16 = compose_case("qwen3-32b", "950dt-96g", tp=16, dp=1, ep=1, layers=1)
+    parsed_tp16 = parse_case(raw_tp16)
+    assert parsed_tp16.runtime.parallel.tp == 16 and parsed_tp16.machine.ranks_per_node == 8
+
+    # Anti-restoration: solve_deployment rejects removed compare_source & expected_ideal kwargs.
+    for removed_kw in ("compare_source", "expected_ideal"):
+        with pytest.raises(TypeError):
+            solve_deployment("qwen3-32b", "950dt-96g", **{removed_kw: "legacy"})
+
+    # Factorized PD join retains full-budget Pareto frontier matching sweep_pd_disaggregation_ratios.
+    from mindie_sim.sweep.pd import solve_optimal_deployment, sweep_pd_disaggregation_ratios
+    pd_kw = dict(
+        prompt_tokens=128, output_tokens=8, tpot_sla_ms=100.0, ttft_sla_ms=1000.0,
+        max_sequences_per_dp=1, pd_transfer_mode="direct_blocking_d2d",
+    )
+    pin_pd = dict(tp=1, ep=1, pp=1, dp=1, pcp=1, dcp=1)
+    opt_pd = solve_optimal_deployment(
+        "qwen3-32b", "a5", num_devices=8, layers=1, mtp_proposal_tokens=0,
+        pinned_parallel=pin_pd, deployment_mode="pd_disaggregated", granted_workers=1, **pd_kw,
+    )
+    sw_pd = sweep_pd_disaggregation_ratios(opt_pd["prefill_case"], opt_pd["decode_case"], total_dies=8, **pd_kw)
+    opt_max = max(opt_pd["pareto_frontier"], key=lambda x: x["sustainable_tps"])
+    sw_max = max(sw_pd["pareto_frontier"], key=lambda x: x["sustainable_tps"])
+    assert opt_pd["best_configuration"]["pd_ratio"] == sw_pd["best_configuration"]["pd_ratio"]
+    assert opt_max["pd_ratio"] == sw_max["pd_ratio"] == "1P:7D"
+    assert opt_max["sustainable_tps"] == pytest.approx(sw_max["sustainable_tps"], rel=1e-9)

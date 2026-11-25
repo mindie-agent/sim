@@ -1,79 +1,184 @@
 """Cache handoff binding for prefill and decode.
 
-[Role] Map published source ranges to physical destination shards and bind releases.
-[Invariants] Handoff bytes and releases follow the physical owners and original
-  versions.
+[Role] Map published source ranges to physical destination shards and bind releases
+  with exact integer half-open ``[start, end)`` byte intervals.
+[Invariants] Handoff bytes and releases follow upstream-exact GQA/MLA/Mamba/Draft
+  rank ownership, exact 0-byte disjoint integer partition conservation, and
+  structural ``MooncakeHybridConnector`` legality (AG014-clean).
 [Timeouts & Locks] Finite spans and Engine dependencies for the current handoff.
 [Side-Effect Policy] Queries endpoint memory and registers release callbacks on the
   shared Engine.
 """
+from __future__ import annotations
+
+from collections import defaultdict
 from collections.abc import Mapping
+from dataclasses import dataclass
+from types import SimpleNamespace
+from typing import Any
 
 from mindie_sim.catalog.cache import layer_cache_components
-from mindie_sim.catalog.context_parallel import cp_interleave
+from mindie_sim.catalog.context_parallel import cp_interleave, layer_dcp_degree
+from mindie_sim.catalog.draft import optional_draft_spec
+from mindie_sim.catalog.draft_geometry import draft_layer_plans
 from mindie_sim.schema.common import ModelingError
 
 from ..pd_connector import PDHandoff, PDTransfer
-from ..disaggregated.ranges import address, owned_runs, transfers_for_runs
+from ..disaggregated.ranges import address, exact_int_bytes, owned_runs, transfers_for_runs
+
+_NON_NEURAL_SPEC_METHODS = frozenset({"none", "ngram", "ngram_gpu"})
+
+HEAD_COMPONENTS = frozenset({"gqa_kv", "window"})
+ROW_COMPONENTS = frozenset({"mla_kv", "window", "compressed_kv", "index_k"})
+SHARDED_STATE_COMPONENTS = frozenset({"recurrent_state", "conv_state"})
+TRANSIENT_STATE_COMPONENTS = frozenset({"replay_records", "state_transient"})
+VALID_PD_CONNECTORS = frozenset({
+    "auto", "MooncakeConnector", "MooncakePushWorker", "MooncakeHybridConnector",
+})
+_LINEAR_ATTENTION_KINDS = frozenset({"gdn", "kda", "mamba", "mamba2", "linear"})
+_CONV_PROJECTION_COUNT = 3
+
+
+def resolve_and_validate_pd_connector(
+    model_spec: Any,
+    p_par: Any,
+    d_par: Any,
+    *,
+    deployment_mode: str = "pd_disaggregated",
+    connector_kind: str = "auto",
+    disable_hybrid_kv_cache_manager: bool = False,
+    p_pp_layer_partition: tuple[int, ...] = (),
+) -> tuple[bool, str, str | None]:
+    """Structural PD connector resolver & gate (AG014-clean: zero model_name checks)."""
+    if connector_kind not in VALID_PD_CONNECTORS:
+        raise ModelingError(f"pd_connector_unknown:{connector_kind}")
+    if deployment_mode != "pd_disaggregated":
+        return True, "none", None
+
+    plans = tuple(getattr(model_spec, "layer_plans", ()) or ())
+    has_recurrent = any(
+        str(getattr(lp, "attention", "") or "").strip().lower() in _LINEAR_ATTENTION_KINDS
+        for lp in plans
+    )
+    has_non_full = any(
+        str(getattr(lp, "attention", "") or "").strip().lower() in _LINEAR_ATTENTION_KINDS
+        or int(getattr(lp, "window", 0) or 0) > 0
+        or int(getattr(lp, "compress_ratio", 0) or 0) > 1
+        for lp in plans
+    )
+    kv_group_kinds = {
+        (
+            "mamba"
+            if str(getattr(lp, "attention", "") or "").strip().lower() in _LINEAR_ATTENTION_KINDS
+            else f"swa_{int(getattr(lp, 'window', 0) or 0)}"
+            if int(getattr(lp, "window", 0) or 0) > 0
+            else f"cmp_{int(getattr(lp, 'compress_ratio', 0) or 0)}"
+            if int(getattr(lp, "compress_ratio", 0) or 0) > 1
+            else "full"
+        )
+        for lp in plans
+    }
+    use_hybrid = (not disable_hybrid_kv_cache_manager) and has_non_full and len(kv_group_kinds) > 1
+    meta = dict(getattr(model_spec, "metadata", ()) or ())
+    is_paired_sfa = str(meta.get("cache_allocator") or "").strip().lower() == "paired_sfa"
+
+    if connector_kind == "auto":
+        resolved = "MooncakeHybridConnector" if (has_recurrent and not is_paired_sfa) else "MooncakePushWorker"
+    else:
+        resolved = connector_kind
+
+    if resolved != "MooncakeHybridConnector":
+        return True, resolved, None
+
+    if int(d_par.pp) != 1:
+        return False, resolved, "mooncake_hybrid_connector_requires_decode_pp_1"
+    if int(p_par.cp) != 1 or int(d_par.cp) != 1:
+        return False, resolved, "mooncake_hybrid_connector_requires_dcp_1"
+    if int(d_par.pcp) != 1:
+        return False, resolved, "mooncake_hybrid_connector_requires_decode_pcp_1"
+    if int(p_par.pp) > 1 and int(p_par.pcp) > 1:
+        return False, resolved, "mooncake_hybrid_connector_forbids_pp_and_pcp"
+    if int(p_par.tp) < int(d_par.tp):
+        return False, resolved, "mooncake_hybrid_connector_requires_prefill_tp_ge_decode_tp"
+    if has_recurrent:
+        if not use_hybrid:
+            return False, resolved, "mooncake_hybrid_connector_mamba_requires_hybrid_groups"
+        if int(p_par.tp) != int(d_par.tp):
+            return False, resolved, "mooncake_hybrid_connector_mamba_requires_equal_tp"
+    if int(p_par.pp) > 1 and p_pp_layer_partition and sum(p_pp_layer_partition) != len(plans):
+        return False, resolved, "mooncake_hybrid_connector_invalid_prefill_pp_partition"
+    return True, resolved, None
 
 
 def _local_head_spans(count, tp):
-    """Physical KV-head ownership for one TP rank, including legal replicas.
-
-    ``local_kv_heads`` is ``max(1, ceil(count/tp))``.  When the TP degree
-    exceeds the head count, several ranks hold the *same* head (GQA/MQA
-    replication); the previous clipped arithmetic gave the extra ranks an empty
-    span and silently dropped their real copy.  Ownership here is the local
-    consecutive block starting at ``rank*local`` modulo the head count.
-    """
+    """Contiguous ``r // replicas`` KV-head ownership matching upstream ``push_worker.py``."""
     count = max(0, int(count))
     tp = max(1, int(tp))
     if count <= 0:
         return ()
-    local = max(1, (count + tp - 1) // tp)
-    spans = []
-    for index in range(tp):
-        start = (index * local) % count
-        end = min(count, start + local)
-        if end <= start:
-            end = count
-        spans.append((start, end))
-    return tuple(spans)
+    if max(count, tp) % min(count, tp) != 0:
+        raise ModelingError(
+            f"pd_handoff_unsupported_head_partition:heads={count},tp={tp}"
+        )
+    replicas = max(1, tp // count)
+    local = max(1, count // tp)
+    return tuple(
+        ((r // replicas) * local, (r // replicas + 1) * local)
+        for r in range(tp)
+    )
+
+
+def _upstream_rank_coord(index: int, parallel: Any) -> int:
+    """Upstream ``push_worker.py`` rank coordinate with PCP innermost."""
+    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+    pcp = max(1, int(getattr(parallel, "pcp", 1) or 1))
+    idx = int(index)
+    tp_i = idx % tp
+    pcp_i = (idx // tp) % pcp
+    dp_i = idx // (tp * pcp)
+    return (dp_i * tp + tp_i) * pcp + pcp_i
 
 
 def _token_span(memory, index, tokens):
-    """Actual half-open token rows owned by one physical rank (or the span)."""
+    """Actual half-open integer token rows owned by one physical rank."""
     tokens = max(0, int(tokens))
     owners = getattr(memory, "rank_token_owners", None)
     if owners is not None and 0 <= index < len(owners):
         lo, hi = owners[index]
         return (max(0, min(tokens, int(lo))), max(0, min(tokens, int(hi))))
-    cp = max(1, int(memory.case.runtime.parallel.cp))
+    parallel = memory.case.runtime.parallel
+    cp = max(1, int(parallel.cp))
     if cp > 1:
-        # Without a T05 owner partition, the declared CP/PCP axis still owns a
-        # contiguous local row range; never claim the whole token span.
-        axis = index % cp
-        lo = tokens * axis // cp
-        hi = tokens * (axis + 1) // cp
-        return (lo, hi)
+        axis = _upstream_rank_coord(index, parallel) % cp
+        return (tokens * axis // cp, tokens * (axis + 1) // cp)
     return (0, tokens)
 
 
-def _head_token_span(index, tokens, head_spans, cp):
-    """Token rows paired with one rank's replicated head span.
-
-    When TP exceeds the KV-head count several ranks hold the same head, while
-    the CP/DCP axis splits tokens.  The rank grid must pair every head with
-    every token shard: head replicas advance the head span, and the next rank
-    slot inside that replica group advances the token shard.  Enumerating both
-    axes from the same linear index leaves half of the ``(token, head)`` pairs
-    uncovered.
-    """
+def _head_token_span(index, tokens, head_spans, cp, *, total_ranks: int | None = None,
+                     parallel: Any = None):
+    """Exact half-open integer token rows paired with one rank's contiguous head span."""
     tokens = max(0, int(tokens))
     cp = max(1, int(cp))
-    distinct = len({(int(lo), int(hi)) for lo, hi in head_spans})
-    slots = distinct or 1
-    axis = (int(index) // slots) % cp
+    if cp <= 1:
+        return (0, tokens)
+    if head_spans:
+        tp = len(head_spans)
+        distinct = len({(int(lo), int(hi)) for lo, hi in head_spans})
+        rep_per_head = max(1, tp // max(1, distinct))
+        if total_ranks is not None:
+            outer_planes = max(1, int(total_ranks) // max(1, tp))
+            slots_per_head = outer_planes * rep_per_head
+            if slots_per_head < cp or slots_per_head % cp != 0:
+                raise ModelingError(
+                    f"pd_handoff_cp_slots_not_divisible:slots={slots_per_head},cp={cp}"
+                )
+        outer_slot = int(index) // tp
+        intra_ord = (int(index) % tp) % rep_per_head
+        axis = (outer_slot * rep_per_head + intra_ord) % cp
+    elif parallel is not None:
+        axis = _upstream_rank_coord(index, parallel) % cp
+    else:
+        axis = int(index) % cp
     return (tokens * axis // cp, tokens * (axis + 1) // cp)
 
 
@@ -127,296 +232,555 @@ def _component_versions(memory, replica, request, layer, component):
     return int(memory.request_versions.get((replica, request), 0))
 
 
-HEAD_COMPONENTS = frozenset({"gqa_kv", "window"})
+@dataclass(frozen=True)
+class _ActiveDraftHandoff:
+    """Resolved compatible neural draft cache contract for PD transfer."""
+
+    kind: str
+    inherited: bool
+    eff_tokens: int
+    p_draft_spec: Any
+    d_draft_spec: Any
+    p_draft_plans: tuple[Any, ...]
+    d_draft_plans: tuple[Any, ...]
+    p_row_bytes: int = 0
+    d_row_bytes: int = 0
+    p_sharded: bool = False
+    d_sharded: bool = False
 
 
-def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
-                        decode_local, volume, demands, shared_buffer_prefix=None,
-                        shared_buffer_capacity=None, published=None):
-    """Bind actual source/destination layer, component, head and token ranges.
+@dataclass(frozen=True)
+class PdExpectedDemand:
+    """Authoritative integer handoff demand shared by sweep and live serving."""
 
-    The transfer set is the intersection of the source's published component
-    storage with the destination's real storage need.  Replicated KV heads
-    (TP > KV heads) stay as separate destination copies; PP stages keep their
-    own source rank; the sparse SFA connector contributes one Host RD2H copy
-    and per-destination hot-HBM/index bytes instead of rebuilding the static
-    dense total.  Each transfer also carries the source/destination
-    storage/generation and half-open byte range later consumed by T08/T09.
-    """
-    from collections import defaultdict as _defaultdict
-    prefill_exec = execution["prefill"]
-    decode_exec = execution["decode"]
-    prefill_rep = placement["prefill", request]
-    decode_rep = placement["decode", request]
-    prefill_case, decode_case = cases["prefill"], cases["decode"]
-    prefill_p, decode_p = prefill_case.runtime.parallel, decode_case.runtime.parallel
-    prefill_mem, decode_mem = memory["prefill"], memory["decode"]
-    sparse = getattr(decode_mem, "sparse_offload", None)
-    offload = bool(sparse) and not bool(
-        dict(sparse.get("options", {})).get("keep_device_kv_cache"))
-    offload_layers = set(sparse.get("offload_layers", ())) if offload else set()
-    use_copy_sfa = bool(dict(sparse.get("options", {})).get(
-        "use_fused_copy_sfa", True)) if offload else False
-    topk_buffer = int(sparse.get("topk_buffer_size", 0)) if offload else 0
-    hot_tokens = (min(int(tokens), topk_buffer)
-                  if use_copy_sfa and topk_buffer > 0 else 0)
-    transfers = []
-    destination_bytes = _defaultdict(float)
-    host_bytes = _defaultdict(float)
-    source_ranks = set()
-    destination_ranks = set()
-    plane_bases, source_extents = {}, _defaultdict(float)
-    destination_planes, destination_offsets = {}, _defaultdict(float)
+    total_volume_bytes: int
+    hbm_volume_bytes: int
+    host_volume_bytes: int
+    draft_kv_bytes: int
+    draft_state_bytes: int
+    decode_local_stage_bytes: tuple[float, ...]
+    active_draft: _ActiveDraftHandoff | None
 
-    def emit(source_rank, destination_rank, component, payload, *,
-             source_stage, destination_stage, layer, source_span,
-             destination_span, source_tokens, destination_tokens,
-             tier="hbm", source_storage, destination_storage,
-             source_component=None, destination_component=None,
-             source_size, source_displacement=0, destination_size, destination_displacement=0):
-        payload = float(payload)
-        if payload <= 0.0:
-            return
-        source_component = source_component or component
-        destination_component = destination_component or component
-        src_rec = _published_for(published, "prefill", request, layer,
-                                 source_component)
-        dst_rec = _published_for(published, "decode", request, layer,
-                                 destination_component)
-        producer = (str(src_rec.get("output")) if src_rec and src_rec.get("output")
-                    else f"prefill:{request}:s{source_stage}:l{layer}:{source_component}")
-        output = (str(dst_rec.get("output")) if dst_rec and dst_rec.get("output")
-                  else f"decode:{request}:s{destination_stage}:l{layer}:{destination_component}")
-        src_version = (int(src_rec["version"]) if src_rec and src_rec.get("version")
-                       is not None else _component_versions(
-                           prefill_mem, prefill_rep, request, layer,
-                           source_component))
-        dst_version = (int(dst_rec["version"]) if dst_rec and dst_rec.get("version")
-                       is not None else _component_versions(
-                           decode_mem, decode_rep, request, layer,
-                           destination_component))
-        if src_rec and src_rec.get("storage"):
-            src_storage = str(src_rec["storage"])
-        else:
-            src_storage = source_storage
-        if dst_rec and dst_rec.get("storage"):
-            dst_storage = str(dst_rec["storage"])
-        else:
-            dst_storage = destination_storage
-        src_offset = address(plane_bases, source_extents,
-                             (source_rank, src_storage, src_version),
-                             (layer, source_component), source_size,
-                             source_displacement, payload)
-        dst_key = (destination_rank, dst_storage, dst_version, tier)
-        dst_offset = address(destination_planes, destination_offsets, dst_key,
-                             (layer, destination_component), destination_size,
-                             destination_displacement, payload)
-        transfers.append(PDTransfer(
-            source_rank, destination_rank, payload,
-            source_stage=source_stage,
-            destination_stage=destination_stage,
-            source_layers=(layer,), destination_layers=(layer,),
-            component=component,
-            source_version=src_version,
-            destination_version=dst_version,
-            source_heads=source_span,
-            destination_heads=destination_span,
-            source_token_span=source_tokens,
-            destination_token_span=destination_tokens,
-            producer=producer, output=output,
-            destination_tier=tier,
-            source_storage=src_storage,
-            destination_storage=dst_storage,
-            source_byte_range=(src_offset, src_offset + payload),
-            destination_byte_range=(dst_offset, dst_offset + payload),
-            source_scope=(str(src_rec.get("scope")) if src_rec else
-                          f"prefill:r{prefill_rep}:s{source_stage}:rank{source_rank}"),
-            destination_scope=(str(dst_rec.get("scope")) if dst_rec else
-                               f"decode:r{decode_rep}:s{destination_stage}:rank{destination_rank}"),
-        ))
-        if tier == "host":
-            host_bytes[destination_rank] += payload
-        else:
-            destination_bytes[destination_rank] += payload
-        source_ranks.add(source_rank)
-        destination_ranks.add(destination_rank)
 
-    for layer in prefill_case.model.layer_plans:
-        _bind_layer_handoff(
-            layer, request, tokens, published, emit, prefill_exec, decode_exec,
-            prefill_rep, decode_rep, prefill_case, decode_case, prefill_p, decode_p,
-            prefill_mem, decode_mem, offload, offload_layers, hot_tokens)
-    if not transfers:
-        return PDHandoff.build(
-            request, (), memory_work=tuple(sorted(demands.items()))), (), ()
-    expected = sum(destination_bytes.values()) + sum(host_bytes.values())
-    if abs(float(volume) - expected) > max(1e-6, abs(float(volume)) * 1e-9):
+def _spec_method_from_runtime(runtime: Any) -> str:
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    return str(meta.get("spec_method") or "").strip().lower()
+
+
+def _resolve_active_draft_handoff(
+    p_case: Any, d_case: Any, p_mem: Any, d_mem: Any, tokens: int,
+) -> _ActiveDraftHandoff | None:
+    """Resolve compatible neural draft cache transfer contract (0 for ngram/none)."""
+    d_method = _spec_method_from_runtime(d_case.runtime)
+    if d_method in _NON_NEURAL_SPEC_METHODS:
+        return None
+    d_kind = str(getattr(d_mem, "draft_kind", "") or "")
+    if not d_kind:
+        return None
+    d_spec = optional_draft_spec(d_case.model, d_kind)
+    if d_spec is None or int(getattr(d_spec, "layers", 0) or 0) <= 0:
+        return None
+    p_method = _spec_method_from_runtime(p_case.runtime)
+    p_kind = str(getattr(p_mem, "draft_kind", "") or "")
+    p_spec = (
+        optional_draft_spec(p_case.model, p_kind)
+        if p_kind and p_method not in _NON_NEURAL_SPEC_METHODS
+        else None
+    )
+    if p_spec is None or int(getattr(p_spec, "layers", 0) or 0) <= 0:
+        raise ModelingError("pd_handoff_missing_producer_draft_cache")
+    if (
+        int(p_spec.layers) != int(d_spec.layers)
+        or str(p_spec.attention_kind) != str(d_spec.attention_kind)
+    ):
         raise ModelingError(
-            "pd_handoff_physical_range_not_conserved:"
-            f"{request}:{volume}!={expected}")
-    if shared_buffer_prefix is not None:
-        buffers = {
-            rank: f"{shared_buffer_prefix}:rank{rank}"
-            for rank in destination_ranks}
-    else:
-        buffers = {
-            rank: f"pd:kv:{request}:decode:r{decode_rep}:rank{rank}"
-            for rank in destination_ranks}
-    handoff = PDHandoff.build(
-        request, transfers, memory_work=tuple(sorted(demands.items())),
-        receive_capacity_bytes=dict(destination_bytes),
-        receive_buffer_ids=buffers,
-        receive_pool_capacity_bytes=(
-            {rank: float(shared_buffer_capacity)
-             for rank in destination_ranks}
-            if shared_buffer_capacity is not None else None),
-        receive_host_bytes=dict(host_bytes))
-    return handoff, tuple(sorted(source_ranks)), tuple(sorted(destination_ranks))
+            "pd_handoff_incompatible_draft_cache:"
+            f"p=({p_spec.layers},{p_spec.attention_kind}),"
+            f"d=({d_spec.layers},{d_spec.attention_kind})"
+        )
+    p_cap = int(p_mem._draft_context_cap(p_spec) or 0)
+    d_cap = int(d_mem._draft_context_cap(d_spec) or 0)
+    eff_tokens = int(tokens)
+    if p_cap > 0:
+        eff_tokens = min(eff_tokens, p_cap)
+    if d_cap > 0:
+        eff_tokens = min(eff_tokens, d_cap)
+    if eff_tokens <= 0:
+        return None
+    if d_mem._uses_inherited_draft_cache(d_case.model):
+        p_plans = tuple(draft_layer_plans(p_case.model, p_kind))
+        d_plans = tuple(draft_layer_plans(d_case.model, d_kind))
+        return _ActiveDraftHandoff(
+            kind=d_kind, inherited=True, eff_tokens=eff_tokens,
+            p_draft_spec=p_spec, d_draft_spec=d_spec,
+            p_draft_plans=p_plans, d_draft_plans=d_plans,
+        )
+    from mindie_sim.prediction.capacity.cache import _draft_is_dcp_sharded, _draft_row_bytes_int
+
+    p_par, d_par = p_case.runtime.parallel, d_case.runtime.parallel
+    p_block = max(1, int(cp_interleave(p_case.runtime)))
+    d_block = max(1, int(cp_interleave(d_case.runtime)))
+    p_row = int(_draft_row_bytes_int(p_case.model, p_spec, tp=p_par.tp))
+    d_row = int(_draft_row_bytes_int(d_case.model, d_spec, tp=d_par.tp))
+    p_shd = bool(_draft_is_dcp_sharded(
+        p_case.model, p_par, p_kind,
+        dcp=int(getattr(p_par, "cp", 1) or 1), draft_page=p_block * p_row,
+    ))
+    d_shd = bool(_draft_is_dcp_sharded(
+        d_case.model, d_par, d_kind,
+        dcp=int(getattr(d_par, "cp", 1) or 1), draft_page=d_block * d_row,
+    ))
+    return _ActiveDraftHandoff(
+        kind=d_kind, inherited=False, eff_tokens=eff_tokens,
+        p_draft_spec=p_spec, d_draft_spec=d_spec,
+        p_draft_plans=(), d_draft_plans=(),
+        p_row_bytes=p_row, d_row_bytes=d_row,
+        p_sharded=p_shd, d_sharded=d_shd,
+    )
 
 
 def _handoff_rank_views(case, layer, parallel, ranks, ledger, owners,
                         head_spans, has_head_axis, tokens):
+    eff_cp = layer_dcp_degree(layer, parallel)
     if owners is not None:
-        # A T05 owner partition is the exact physical fact.
-        spans = tuple(
-            _token_span(ledger, index, tokens)
-            for index in range(len(ranks)))
+        spans = tuple(_token_span(ledger, index, tokens) for index in range(len(ranks)))
         component_owners = owners
     else:
         spans = tuple(
-            _head_token_span(index, tokens, head_spans if has_head_axis else (), parallel.cp)
-            for index in range(len(ranks)))
-        # Feed the same exact partition to the cache ledger: an even
-        # ``rows / cp`` split would bill 160/160 B for the [0,2) and
-        # [2,5) shards instead of the exact 128/192 B they own.
-        component_owners = spans
+            _head_token_span(
+                index, tokens, head_spans if has_head_axis else (), eff_cp,
+                total_ranks=len(ranks), parallel=parallel,
+            )
+            for index in range(len(ranks))
+        )
+        # Preserve exact DCP interleaved ownership in layer_cache_components for row/MLA caches
+        # when caller did not provide explicit T05 owner spans.
+        component_owners = spans if (has_head_axis or eff_cp <= 1) else None
     interleave = cp_interleave(case.runtime)
     result = []
     for index, rank in enumerate(ranks):
-        components = layer_cache_components(
+        raw_components = layer_cache_components(
             case.model, layer, parallel, tokens, capacity_padded=False,
             interleave=interleave,
             rank=index, owner_spans=component_owners,
-            runtime=case.runtime, query_tokens=1, phase="prefill")
+            runtime=case.runtime, query_tokens=1, phase="prefill",
+        )
+        components = {
+            name: exact_int_bytes(val, f"pd_component_bytes:{name}")
+            for name, val in raw_components.items()
+            if name not in TRANSIENT_STATE_COMPONENTS
+        }
         result.append((index, rank, components, spans[index]))
     return result
 
 
-def _bind_layer_handoff(
-    layer, request, tokens, published, emit, prefill_exec, decode_exec,
-    prefill_rep, decode_rep, prefill_case, decode_case, prefill_p, decode_p,
-    prefill_mem, decode_mem, offload, offload_layers, hot_tokens,
-):
-    source_stage = prefill_mem.layer_stage[layer.index]
-    destination_stage = decode_mem.layer_stage[layer.index]
-    source = tuple(prefill_exec.topology.ranks(prefill_rep, source_stage))
-    destination = tuple(decode_exec.topology.ranks(decode_rep, destination_stage))
-    if not source or not destination:
-        raise ModelingError("pd_handoff_missing_stage_ranks:" + request)
-    num_heads = int(getattr(layer, "num_kv_heads", 0) or 0)
-    has_head_axis = layer.attention in {"gqa", "projection_only"}
-    source_spans = _local_head_spans(num_heads, prefill_p.tp)
-    target_spans = _local_head_spans(num_heads, decode_p.tp)
-    source_owners = getattr(prefill_mem, "rank_token_owners", None)
-    target_owners = getattr(decode_mem, "rank_token_owners", None)
+def _sparse_offload_params(decode_mem: Any, tokens: int) -> tuple[bool, set[int], int]:
+    sparse = getattr(decode_mem, "sparse_offload", None)
+    offload = bool(sparse) and not bool(
+        dict(sparse.get("options", {})).get("keep_device_kv_cache")
+    )
+    if not offload:
+        return False, set(), 0
+    offload_layers = set(sparse.get("offload_layers", ()))
+    use_copy_sfa = bool(dict(sparse.get("options", {})).get("use_fused_copy_sfa", True))
+    topk_buffer = int(sparse.get("topk_buffer_size", 0))
+    hot_tokens = min(int(tokens), topk_buffer) if use_copy_sfa and topk_buffer > 0 else 0
+    return True, offload_layers, hot_tokens
 
 
-    src_views = _handoff_rank_views(
-        prefill_case, layer, prefill_p, source, prefill_mem,
-        source_owners, source_spans, has_head_axis, tokens)
-    dst_views = _handoff_rank_views(
-        decode_case, layer, decode_p, destination, decode_mem,
-        target_owners, target_spans, has_head_axis, tokens)
-    components = {name for _, _, values, _ in src_views for name in values}
-    components |= {name for _, _, values, _ in dst_views for name in values}
-    gqa_components = {name for name in HEAD_COMPONENTS
-                      if has_head_axis and num_heads > 0}
-    split_kv = (num_heads > 0
-                and _published_for(published, "prefill", request,
-                                   layer.index, "gqa_k") is not None
-                and _published_for(published, "prefill", request,
-                                   layer.index, "gqa_v") is not None)
-    for component in sorted(components):
+def compute_expected_pd_handoff_demand(
+    prefill_case: Any,
+    decode_case: Any,
+    prefill_memory: Any,
+    decode_memory: Any,
+    tokens: int,
+) -> PdExpectedDemand:
+    """Authoritative exact integer demand shared by ``compute_pd_handoff_plan`` and ``serving.py``."""
+    n_tokens = max(0, int(tokens))
+    d_par = decode_case.runtime.parallel
+    pp = max(1, int(d_par.pp))
+    if n_tokens <= 0:
+        return PdExpectedDemand(0, 0, 0, 0, 0, tuple(0.0 for _ in range(pp)), None)
+    d_topo = _CohortStageTopology(d_par, rank_offset=0)
+    offload, offload_layers, hot_tokens = _sparse_offload_params(decode_memory, n_tokens)
+    target_owners = getattr(decode_memory, "rank_token_owners", None)
+    stage_hbm_total = [0] * pp
+    host_total = 0
+    draft_kv_total = 0
+    draft_state_total = 0
+
+    for layer in decode_case.model.layer_plans:
+        st = int(decode_memory.layer_stage[layer.index])
+        dst_ranks = d_topo.ranks(0, st)
+        num_heads = int(getattr(layer, "num_kv_heads", 0) or 0)
+        has_head_axis = layer.attention in {"gqa", "projection_only"}
+        target_spans = _local_head_spans(num_heads, d_par.tp) if has_head_axis else ()
+        dst_views = _handoff_rank_views(
+            decode_case, layer, d_par, dst_ranks, decode_memory,
+            target_owners, target_spans, has_head_axis, n_tokens,
+        )
         window = int(getattr(layer, "window", 0) or 0)
-        windowed = component == "window" or (
-            component in {"gqa_kv", "mla_kv"} and window > 0)
-        window_start = max(0, tokens - window) if windowed else 0
-        if component in gqa_components:
-            _emit_head_transfers(
-                emit, request, component, layer, source_stage, destination_stage,
-                prefill_rep, decode_rep, src_views, dst_views, source_spans,
-                target_spans, windowed, window_start, tokens, split_kv)
-            continue
-        row_component = component in {"mla_kv", "window", "compressed_kv", "index_k"}
-        if row_component:
-            _emit_row_transfers(
-                emit, request, component, layer, source_stage, destination_stage,
-                prefill_rep, decode_rep, src_views, dst_views, prefill_case,
-                decode_case, prefill_p, decode_p, tokens, window_start, num_heads,
-                offload, offload_layers, hot_tokens, destination)
-            continue
-        for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
-            need = float(dest_values.get(component, 0))
-            dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{dest_rank}"
-            remaining = need
-            for src_index, src_rank, src_values, src_tokens in src_views:
-                if remaining <= 1e-9:
-                    break
-                if windowed:
-                    src_tokens = (max(window_start, src_tokens[0]),
-                                  min(tokens, src_tokens[1]))
-                available = float(src_values.get(component, 0.0))
-                take = min(available, remaining)
-                if take <= 0.0:
+        host_counted = False
+        for index, _rank, values, span in dst_views:
+            for comp, comp_bytes in values.items():
+                if comp_bytes <= 0:
                     continue
-                emit(src_rank, dest_rank, component, take,
-                     source_stage=source_stage,
-                     destination_stage=destination_stage,
-                     layer=layer.index,
-                     source_span=(0, num_heads),
-                     destination_span=(0, num_heads),
-                     source_tokens=src_tokens,
-                     destination_tokens=dest_tokens,
-                     source_storage=f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}",
-                     destination_storage=dst_storage, source_size=available,
-                     destination_size=need, destination_displacement=need - remaining)
-                remaining -= take
-            if remaining > max(1e-9, need * 1e-12):
+                if offload and comp == "mla_kv" and layer.index in offload_layers:
+                    win_start = max(0, n_tokens - window) if window > 0 else 0
+                    runs = owned_runs(
+                        comp, layer, decode_case.model, d_par, index, span,
+                        n_tokens, win_start, runtime=decode_case.runtime,
+                        explicit_span=(target_owners is not None),
+                    )
+                    owned_rows = sum(hi - lo for lo, hi in runs)
+                    if owned_rows > 0:
+                        if comp_bytes % owned_rows != 0:
+                            raise ModelingError(
+                                f"pd_handoff_offload_non_integer_row_bytes:{comp_bytes}:{owned_rows}"
+                            )
+                        row_unit = comp_bytes // owned_rows
+                        if not host_counted:
+                            host_total += (n_tokens - win_start) * row_unit
+                            host_counted = True
+                        hot_rows = sum(
+                            hi - max(lo, n_tokens - hot_tokens)
+                            for lo, hi in runs if hi > max(lo, n_tokens - hot_tokens)
+                        )
+                        stage_hbm_total[st] += hot_rows * row_unit
+                else:
+                    stage_hbm_total[st] += comp_bytes
+
+    active_draft = _resolve_active_draft_handoff(
+        prefill_case, decode_case, prefill_memory, decode_memory, n_tokens,
+    )
+    if active_draft is not None:
+        draft_st = pp - 1
+        dst_ranks = d_topo.ranks(0, draft_st)
+        if active_draft.inherited:
+            for d_layer in active_draft.d_draft_plans:
+                num_heads = int(getattr(d_layer, "num_kv_heads", 0) or 0)
+                has_head_axis = d_layer.attention in {"gqa", "projection_only"}
+                target_spans = _local_head_spans(num_heads, d_par.tp) if has_head_axis else ()
+                dst_views = _handoff_rank_views(
+                    decode_case, d_layer, d_par, dst_ranks, decode_memory,
+                    target_owners, target_spans, has_head_axis, active_draft.eff_tokens,
+                )
+                for _index, _rank, values, _span in dst_views:
+                    for comp, comp_bytes in values.items():
+                        if comp_bytes <= 0:
+                            continue
+                        stage_hbm_total[draft_st] += comp_bytes
+                        if comp in SHARDED_STATE_COMPONENTS:
+                            draft_state_total += comp_bytes
+                        else:
+                            draft_kv_total += comp_bytes
+        else:
+            d_cp = int(d_par.cp) if active_draft.d_sharded else 1
+            draft_num_heads = int(getattr(active_draft.d_draft_spec, "num_kv_heads", 0) or 0)
+            draft_gqa = (
+                str(getattr(active_draft.d_draft_spec, "attention_kind", "")) != "mla"
+                and draft_num_heads > 0
+            )
+            draft_head_spans = _local_head_spans(draft_num_heads, d_par.tp) if draft_gqa else ()
+            for index in range(len(dst_ranks)):
+                lo, hi = _head_token_span(
+                    index, active_draft.eff_tokens, draft_head_spans, d_cp,
+                    total_ranks=len(dst_ranks), parallel=d_par,
+                )
+                layer_bytes = (hi - lo) * active_draft.d_row_bytes
+                total_rank_draft = layer_bytes * int(active_draft.d_draft_spec.layers)
+                stage_hbm_total[draft_st] += total_rank_draft
+                draft_kv_total += total_rank_draft
+
+    hbm_total = sum(stage_hbm_total)
+    stage_width = max(1, d_topo._width)
+    decode_local = tuple(float(st_bytes) / float(stage_width) for st_bytes in stage_hbm_total)
+    return PdExpectedDemand(
+        total_volume_bytes=hbm_total + host_total,
+        hbm_volume_bytes=hbm_total,
+        host_volume_bytes=host_total,
+        draft_kv_bytes=draft_kv_total,
+        draft_state_bytes=draft_state_total,
+        decode_local_stage_bytes=decode_local,
+        active_draft=active_draft,
+    )
+
+
+def _conv_projection_byte_widths(layer: Any, row_bytes: int, tp_ratio: int) -> tuple[int, ...]:
+    """Projection byte widths inside one conv-state row (``base_worker.py:197-260``)."""
+    attn = str(getattr(layer, "attention", "") or "").strip().lower()
+    if attn == "kda" and row_bytes % _CONV_PROJECTION_COUNT == 0:
+        third = row_bytes // _CONV_PROJECTION_COUNT
+        if third % tp_ratio == 0:
+            return (third, third, third)
+    if attn == "gdn":
+        conv_k = max(2, int(getattr(layer, "conv_kernel", 0) or 2))
+        conv_rows = conv_k - 1
+        conv_elems = int(getattr(layer, "conv_state_elements", 0) or 0)
+        row_elems = conv_elems // conv_rows if conv_rows > 0 and conv_elems > 0 else 0
+        state_elems = int(getattr(layer, "num_heads", 0) or 0) * int(getattr(layer, "head_dim", 0) or 0)
+        if row_elems > 0 and 0 < state_elems < row_elems and (row_elems - state_elems) % 2 == 0:
+            q_elems = (row_elems - state_elems) // 2
+            if row_bytes % row_elems == 0:
+                elem_b = row_bytes // row_elems
+                q_b = q_elems * elem_b
+                v_b = state_elems * elem_b
+                if q_b % tp_ratio == 0 and v_b % tp_ratio == 0:
+                    return (q_b, q_b, v_b)
+    return (row_bytes,)
+
+
+def _emit_conv_displaced_slices(
+    emit, *, src_rank: int, dst_rank: int, component: str,
+    source_stage: int, destination_stage: int, logical_layer: int, num_heads: int,
+    src_tokens: tuple[int, int], dst_tokens: tuple[int, int],
+    src_storage: str, dst_storage: str, src_size: int, dst_size: int,
+    layer: Any, tp_ratio: int, rank_offset: int, src_is_wider: bool,
+) -> None:
+    """Emit exact 2D conv-state per-row, per-projection displaced integer byte slices."""
+    conv_rows = max(1, int(getattr(layer, "conv_kernel", 0) or 1) - 1)
+    if src_size % conv_rows != 0 or dst_size % conv_rows != 0:
+        slice_len = dst_size if src_is_wider else src_size
+        emit(
+            src_rank, dst_rank, component, slice_len,
+            source_stage=source_stage, destination_stage=destination_stage,
+            layer=logical_layer, source_span=(0, num_heads), destination_span=(0, num_heads),
+            source_tokens=src_tokens, destination_tokens=dst_tokens,
+            source_storage=src_storage, destination_storage=dst_storage,
+            source_size=src_size,
+            source_displacement=(rank_offset * slice_len if src_is_wider else 0),
+            destination_size=dst_size,
+            destination_displacement=(0 if src_is_wider else rank_offset * slice_len),
+        )
+        return
+    wide_row = (src_size if src_is_wider else dst_size) // conv_rows
+    narrow_row = (dst_size if src_is_wider else src_size) // conv_rows
+    proj_widths = _conv_projection_byte_widths(layer, wide_row, tp_ratio)
+    for row_idx in range(conv_rows):
+        wide_row_base = row_idx * wide_row
+        narrow_row_base = row_idx * narrow_row
+        wide_off = 0
+        narrow_off = 0
+        for p_wide in proj_widths:
+            p_narrow = p_wide // tp_ratio
+            wide_disp = wide_row_base + wide_off + rank_offset * p_narrow
+            narrow_disp = narrow_row_base + narrow_off
+            emit(
+                src_rank, dst_rank, component, p_narrow,
+                source_stage=source_stage, destination_stage=destination_stage,
+                layer=logical_layer, source_span=(0, num_heads), destination_span=(0, num_heads),
+                source_tokens=src_tokens, destination_tokens=dst_tokens,
+                source_storage=src_storage, destination_storage=dst_storage,
+                source_size=src_size,
+                source_displacement=(wide_disp if src_is_wider else narrow_disp),
+                destination_size=dst_size,
+                destination_displacement=(narrow_disp if src_is_wider else wide_disp),
+            )
+            wide_off += p_wide
+            narrow_off += p_narrow
+
+
+def _emit_state_transfers(
+    emit, request, emitted_component, raw_component, layer, logical_layer,
+    source_stage, destination_stage, prefill_rep, decode_rep,
+    src_views, dst_views, prefill_p, decode_p, num_heads,
+):
+    """Exact Mamba/KDA/GDN TP-sharded state slicing (zero rank-0 hotspot & exact offsets)."""
+    is_sharded = raw_component in SHARDED_STATE_COMPONENTS
+    attn = str(getattr(layer, "attention", "") or "").strip().lower()
+    if not is_sharded:
+        for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
+            need = dest_values.get(raw_component, 0)
+            if need <= 0:
+                continue
+            src_index, src_rank, src_values, src_tokens = src_views[dest_index % len(src_views)]
+            avail = src_values.get(raw_component, 0)
+            if avail < need:
                 raise ModelingError(
-                    "pd_handoff_component_range_uncovered:"
-                    f"{request}:{layer.index}:{component}:{remaining}")
+                    f"pd_handoff_component_range_uncovered:{request}:{logical_layer}:{emitted_component}"
+                )
+            emit(
+                src_rank, dest_rank, emitted_component, need,
+                source_stage=source_stage, destination_stage=destination_stage,
+                layer=logical_layer, source_span=(0, num_heads), destination_span=(0, num_heads),
+                source_tokens=src_tokens, destination_tokens=dest_tokens,
+                source_storage=f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}",
+                destination_storage=f"pd:kv:{request}:decode:r{decode_rep}:rank{dest_rank}",
+                source_size=avail, source_displacement=0,
+                destination_size=need, destination_displacement=0,
+            )
+        return
+
+    kda_sharded_pcp = attn == "kda"
+    s_p = int(prefill_p.tp) * (int(prefill_p.pcp) if kda_sharded_pcp else 1)
+    s_d = int(decode_p.tp) * (int(decode_p.pcp) if kda_sharded_pcp else 1)
+    if max(s_p, s_d) % min(s_p, s_d) != 0:
+        raise ModelingError(f"pd_mamba_tp_ratio_non_integer:src={s_p},dst={s_d}")
+    tp_ratio = max(s_p, s_d) // min(s_p, s_d)
+
+    def _shard_and_plane(idx: int, par: Any) -> tuple[int, int]:
+        tp_n = max(1, int(par.tp))
+        pcp_n = max(1, int(par.pcp))
+        tp_i = idx % tp_n
+        pcp_i = (idx // tp_n) % pcp_n
+        dp_i = idx // (tp_n * pcp_n)
+        if kda_sharded_pcp:
+            return tp_i * pcp_n + pcp_i, dp_i
+        return tp_i, dp_i * pcp_n + pcp_i
+
+    src_by_shard: dict[int, list[tuple[int, int, int, tuple[int, int]]]] = defaultdict(list)
+    for src_index, src_rank, src_values, src_tokens in src_views:
+        avail = src_values.get(raw_component, 0)
+        if avail > 0:
+            j_p, p_plane = _shard_and_plane(src_index, prefill_p)
+            src_by_shard[j_p].append((p_plane, src_rank, avail, src_tokens))
+
+    for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
+        need = dest_values.get(raw_component, 0)
+        if need <= 0:
+            continue
+        j_d, d_plane = _shard_and_plane(dest_index, decode_p)
+        dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{dest_rank}"
+        if s_p <= s_d:
+            # 1 producer feeds tp_ratio receivers (s_p == s_d => tp_ratio == 1, rank_offset == 0).
+            j_p = j_d // tp_ratio
+            rank_offset = j_d % tp_ratio
+            cands = src_by_shard.get(j_p, ())
+            if not cands:
+                raise ModelingError(
+                    f"pd_handoff_component_range_uncovered:{request}:{logical_layer}:{emitted_component}"
+                )
+            _, src_rank, avail, src_tokens = cands[d_plane % len(cands)]
+            src_storage = f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}"
+            if tp_ratio == 1:
+                emit(
+                    src_rank, dest_rank, emitted_component, need,
+                    source_stage=source_stage, destination_stage=destination_stage,
+                    layer=logical_layer, source_span=(0, num_heads), destination_span=(0, num_heads),
+                    source_tokens=src_tokens, destination_tokens=dest_tokens,
+                    source_storage=src_storage, destination_storage=dst_storage,
+                    source_size=avail, source_displacement=0,
+                    destination_size=need, destination_displacement=0,
+                )
+            elif raw_component == "conv_state":
+                _emit_conv_displaced_slices(
+                    emit, src_rank=src_rank, dst_rank=dest_rank, component=emitted_component,
+                    source_stage=source_stage, destination_stage=destination_stage,
+                    logical_layer=logical_layer, num_heads=num_heads,
+                    src_tokens=src_tokens, dst_tokens=dest_tokens,
+                    src_storage=src_storage, dst_storage=dst_storage,
+                    src_size=avail, dst_size=need, layer=layer,
+                    tp_ratio=tp_ratio, rank_offset=rank_offset, src_is_wider=True,
+                )
+            else:
+                emit(
+                    src_rank, dest_rank, emitted_component, need,
+                    source_stage=source_stage, destination_stage=destination_stage,
+                    layer=logical_layer, source_span=(0, num_heads), destination_span=(0, num_heads),
+                    source_tokens=src_tokens, destination_tokens=dest_tokens,
+                    source_storage=src_storage, destination_storage=dst_storage,
+                    source_size=avail, source_displacement=rank_offset * need,
+                    destination_size=need, destination_displacement=0,
+                )
+        else:
+            # tp_ratio producers merge into 1 receiver.
+            for rank_offset in range(tp_ratio):
+                j_p = j_d * tp_ratio + rank_offset
+                cands = src_by_shard.get(j_p, ())
+                if not cands:
+                    raise ModelingError(
+                        f"pd_handoff_component_range_uncovered:{request}:{logical_layer}:{emitted_component}"
+                    )
+                _, src_rank, avail, src_tokens = cands[d_plane % len(cands)]
+                src_storage = f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}"
+                if raw_component == "conv_state":
+                    _emit_conv_displaced_slices(
+                        emit, src_rank=src_rank, dst_rank=dest_rank, component=emitted_component,
+                        source_stage=source_stage, destination_stage=destination_stage,
+                        logical_layer=logical_layer, num_heads=num_heads,
+                        src_tokens=src_tokens, dst_tokens=dest_tokens,
+                        src_storage=src_storage, dst_storage=dst_storage,
+                        src_size=avail, dst_size=need, layer=layer,
+                        tp_ratio=tp_ratio, rank_offset=rank_offset, src_is_wider=False,
+                    )
+                else:
+                    emit(
+                        src_rank, dest_rank, emitted_component, avail,
+                        source_stage=source_stage, destination_stage=destination_stage,
+                        layer=logical_layer, source_span=(0, num_heads), destination_span=(0, num_heads),
+                        source_tokens=src_tokens, destination_tokens=dest_tokens,
+                        source_storage=src_storage, destination_storage=dst_storage,
+                        source_size=avail, source_displacement=0,
+                        destination_size=need, destination_displacement=rank_offset * avail,
+                    )
+
+
+def _gqa_kv_plane_weights(model: Any, layer: Any) -> tuple[int, int]:
+    """Return exact positive integer ``(k_bytes, v_bytes)`` weights per head-token."""
+    if model is None:
+        return 1, 1
+    from mindie_sim.catalog.cache_format import gqa_kv_formats
+
+    k_fmt, v_fmt, is_shared = gqa_kv_formats(model, plan=layer)
+    if is_shared:
+        return 1, 1
+    head_dim = max(1, int(getattr(layer, "head_dim", 0) or getattr(model, "head_dim", 1) or 1))
+    k_b = max(1, int(k_fmt.row_bytes(head_dim)))
+    v_b = max(1, int(v_fmt.row_bytes(head_dim)))
+    return k_b, v_b
 
 
 def _emit_head_transfers(
-    emit, request, component, layer, source_stage, destination_stage,
-    prefill_rep, decode_rep, src_views, dst_views, source_spans, target_spans,
-    windowed, window_start, tokens, split_kv,
+    emit, request, emitted_component, raw_component, layer, logical_layer,
+    source_stage, destination_stage, prefill_rep, decode_rep,
+    src_views, dst_views, source_spans, target_spans, prefill_p, decode_p,
+    windowed, window_start, tokens, split_kv, *, model: Any = None,
 ):
+    """Upstream ``push_worker.py:482-505`` contiguous GQA head transfer with replica balance."""
+    tp_p = max(1, int(prefill_p.tp))
+    pcp_p = max(1, int(prefill_p.pcp))
+    tp_d = max(1, int(decode_p.tp))
+    pcp_d = max(1, int(decode_p.pcp))
+    distinct_p = len(set(source_spans)) if source_spans else 1
+    replicas_p = max(1, tp_p // max(1, distinct_p))
+    p_dcp = layer_dcp_degree(layer, prefill_p)
+    d_dcp = layer_dcp_degree(layer, decode_p)
+
     for dest_index, dest_rank, dest_values, dest_tokens in dst_views:
-        need = float(dest_values.get(component, 0.0))
+        need = dest_values.get(raw_component, 0)
         dspan = target_spans[dest_index % max(1, len(target_spans))]
         d_lo, d_hi = dest_tokens
         if windowed:
             d_lo, d_hi = max(window_start, d_lo), min(tokens, d_hi)
-        if (need <= 0.0 or dspan[1] <= dspan[0]
-                or d_hi <= d_lo):
+        if need <= 0 or dspan[1] <= dspan[0] or d_hi <= d_lo:
             continue
-        # A destination row needs a per-head payload only for the
-        # token rows a source rank actually owns.  The head and
-        # token axes are independent intersections.
-        per_head_token = (need / float(dspan[1] - dspan[0])
-                          / float(d_hi - d_lo))
+        denom = (dspan[1] - dspan[0]) * (d_hi - d_lo)
+        if need % denom != 0:
+            raise ModelingError(
+                f"pd_transfer_non_integer_head_bytes:{request}:{logical_layer}:{need}:{denom}"
+            )
+        per_head_token = need // denom
+        d_tp = dest_index % tp_d
+        d_pcp = (dest_index // tp_d) % pcp_d
+        if p_dcp == 1 and d_dcp == 1:
+            ordered_sources = [
+                entry for entry in src_views
+                if ((entry[0] // tp_p) % pcp_p) == (d_pcp % pcp_p)
+                and (entry[0] % tp_p) % replicas_p == (d_tp % replicas_p)
+            ]
+        else:
+            shift = dest_index % max(1, len(src_views))
+            ordered_sources = list(src_views[shift:]) + list(src_views[:shift])
+
         covered: dict[int, list[tuple[int, int]]] = {}
-        for src_index, src_rank, src_values, src_tokens in src_views:
+        for src_index, src_rank, src_values, src_tokens in ordered_sources:
             sspan = source_spans[src_index % max(1, len(source_spans))]
-            common = [head for head in range(dspan[0], dspan[1])
-                      if sspan[0] <= head < sspan[1]]
+            common = [h for h in range(dspan[0], dspan[1]) if sspan[0] <= h < sspan[1]]
             if not common:
                 continue
             s_lo, s_hi = src_tokens
             if windowed:
-                s_lo, s_hi = (max(window_start, s_lo),
-                              min(tokens, s_hi))
+                s_lo, s_hi = max(window_start, s_lo), min(tokens, s_hi)
             lo, hi = max(s_lo, d_lo), min(s_hi, d_hi)
             if hi <= lo:
                 continue
@@ -424,95 +788,645 @@ def _emit_head_transfers(
             dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{dest_rank}"
             grouped: dict[tuple[int, int], list[int]] = {}
             for head in common:
-                for piece_lo, piece_hi in _uncovered_intervals(
-                        covered.get(head, ()), lo, hi):
-                    grouped.setdefault(
-                        (piece_lo, piece_hi), []).append(head)
-                    covered.setdefault(head, []).append(
-                        (piece_lo, piece_hi))
+                for piece_lo, piece_hi in _uncovered_intervals(covered.get(head, ()), lo, hi):
+                    grouped.setdefault((piece_lo, piece_hi), []).append(head)
+                    covered.setdefault(head, []).append((piece_lo, piece_hi))
+            src_comp_bytes = src_values.get(raw_component, 0)
             for (piece_lo, piece_hi), heads in grouped.items():
-                spans_all_rows = (piece_lo, piece_hi) == (s_lo, s_hi)
-                spans_all_rows &= (piece_lo, piece_hi) == (d_lo, d_hi)
+                spans_all_rows = (piece_lo, piece_hi) == (s_lo, s_hi) == (d_lo, d_hi)
                 consecutive = heads[-1] - heads[0] + 1 == len(heads)
-                groups = ([heads] if spans_all_rows and consecutive
-                          else ([head] for head in heads))
-                planes = ("gqa_k", "gqa_v") if split_kv else (component,)
+                groups = [heads] if (spans_all_rows and consecutive) else [[h] for h in heads]
+                if split_kv:
+                    k_w, v_w = _gqa_kv_plane_weights(model, layer)
+                    tot_w = k_w + v_w
+                    plane_specs = (("gqa_k", k_w), ("gqa_v", v_w))
+                    for total_val in (per_head_token, src_comp_bytes, need):
+                        if (total_val * k_w) % tot_w != 0 or (total_val * v_w) % tot_w != 0:
+                            raise ModelingError(f"pd_transfer_split_kv_non_integer:{request}:{logical_layer}")
+                else:
+                    tot_w = 1
+                    plane_specs = ((emitted_component, 1),)
                 for group in groups:
-                    first = (group[0] - sspan[0]) * (s_hi - s_lo)
-                    offset = first + piece_lo - s_lo
-                    for plane in planes:
-                        unit = per_head_token / len(planes)
-                        emit(src_rank, dest_rank, plane,
-                             unit * (piece_hi - piece_lo) * len(group),
-                             source_stage=source_stage,
-                             destination_stage=destination_stage,
-                             layer=layer.index, source_span=sspan,
-                             destination_span=dspan,
-                             source_tokens=(piece_lo, piece_hi),
-                             destination_tokens=(piece_lo, piece_hi),
-                             source_storage=src_storage,
-                             destination_storage=dst_storage,
-                             source_size=src_values[component] / len(planes),
-                             source_displacement=unit * offset,
-                             destination_size=need / len(planes),
-                             destination_displacement=unit * (
-                                 (group[0] - dspan[0]) * (d_hi - d_lo)
-                                 + piece_lo - d_lo))
-        missing = [head for head in range(dspan[0], dspan[1])
-                   if sum(piece_hi - piece_lo for piece_lo, piece_hi
-                          in covered.get(head, ())) < d_hi - d_lo]
+                    src_off = (group[0] - sspan[0]) * (s_hi - s_lo) + (piece_lo - s_lo)
+                    dst_off = (group[0] - dspan[0]) * (d_hi - d_lo) + (piece_lo - d_lo)
+                    for plane, plane_w in plane_specs:
+                        unit = (per_head_token * plane_w) // tot_w
+                        src_plane_size = (src_comp_bytes * plane_w) // tot_w
+                        dst_plane_size = (need * plane_w) // tot_w
+                        payload = unit * (piece_hi - piece_lo) * len(group)
+                        emit(
+                            src_rank, dest_rank, plane, payload,
+                            source_stage=source_stage, destination_stage=destination_stage,
+                            layer=logical_layer, source_span=sspan, destination_span=dspan,
+                            source_tokens=(piece_lo, piece_hi), destination_tokens=(piece_lo, piece_hi),
+                            source_storage=src_storage, destination_storage=dst_storage,
+                            source_size=src_plane_size, source_displacement=unit * src_off,
+                            destination_size=dst_plane_size, destination_displacement=unit * dst_off,
+                        )
+        missing = [
+            h for h in range(dspan[0], dspan[1])
+            if sum(p_hi - p_lo for p_lo, p_hi in covered.get(h, ())) < d_hi - d_lo
+        ]
         if missing:
             raise ModelingError(
-                "pd_handoff_source_head_uncovered:"
-                f"{request}:{layer.index}:{dest_rank}:{missing}")
+                f"pd_handoff_source_head_uncovered:{request}:{logical_layer}:{dest_rank}:{missing}"
+            )
 
 
 def _emit_row_transfers(
-    emit, request, component, layer, source_stage, destination_stage,
-    prefill_rep, decode_rep, src_views, dst_views, prefill_case, decode_case,
-    prefill_p, decode_p, tokens, window_start, num_heads, offload,
-    offload_layers, hot_tokens, destination,
+    emit, request, emitted_component, raw_component, layer, logical_layer,
+    source_stage, destination_stage, prefill_rep, decode_rep,
+    src_views, dst_views, prefill_case, decode_case, prefill_p, decode_p,
+    tokens, window_start, num_heads, offload, offload_layers, hot_tokens,
+    destination, *, source_owners=None, target_owners=None,
 ):
-    def manifest(case, parallel, entries):
-        return [(rank, owned_runs(component, layer, case.model, parallel,
-                                  index, span, tokens, window_start,
-                                  runtime=case.runtime),
-                 values.get(component, 0))
-                for index, rank, values, span in entries]
+    """Upstream ``push_worker.py:470-481`` DCP-group-filtered MLA/index row transfer."""
+    def manifest(case, parallel, entries, *, explicit_span: bool):
+        return [
+            (
+                index,
+                rank,
+                owned_runs(
+                    raw_component, layer, case.model, parallel, index, span,
+                    tokens, window_start, runtime=case.runtime,
+                    explicit_span=explicit_span,
+                ),
+                values.get(raw_component, 0),
+            )
+            for index, rank, values, span in entries
+        ]
 
-    sources = manifest(prefill_case, prefill_p, src_views)
-    destinations = manifest(decode_case, decode_p, dst_views)
-    sparse_layer = offload and component == "mla_kv" and layer.index in offload_layers
-    receivers = []
+    src_manifest = manifest(prefill_case, prefill_p, src_views, explicit_span=(source_owners is not None))
+    dst_manifest = manifest(decode_case, decode_p, dst_views, explicit_span=(target_owners is not None))
+    all_sources = [(rank, runs, size) for _idx, rank, runs, size in src_manifest]
+
+    # Upstream push_worker.py:478-481 replica group partitioning (zero 8x rank-0 hotspot).
+    if raw_component == "index_k":
+        from mindie_sim.catalog.context_parallel import dcp_indexer_sharded
+
+        eff_p_dcp = (
+            layer_dcp_degree(layer, prefill_p)
+            if (dcp_indexer_sharded(prefill_case.model, prefill_case.runtime)
+                or prefill_p.cp_plan == "dsa_cp")
+            else 1
+        )
+    else:
+        eff_p_dcp = layer_dcp_degree(layer, prefill_p)
+    p_total = len(src_manifest)
+    use_groups = (
+        source_owners is None
+        and eff_p_dcp >= 1
+        and p_total >= eff_p_dcp
+        and p_total % eff_p_dcp == 0
+        and (p_total // eff_p_dcp) > 1
+    )
+    replicas = (p_total // eff_p_dcp) if use_groups else 1
+    grouped_sources: dict[int, list[tuple[int, tuple[tuple[int, int], ...], int]]] = defaultdict(list)
+    if use_groups:
+        for src_idx, rank, runs, size in src_manifest:
+            j_p = _upstream_rank_coord(src_idx, prefill_p)
+            grouped_sources[j_p // eff_p_dcp].append((rank, runs, size))
+
+    sparse_layer = offload and raw_component == "mla_kv" and logical_layer in offload_layers
+    receivers: list[tuple[int, int, tuple[tuple[int, int], ...], str, str]] = []
     if sparse_layer:
-        receivers.append((destination[0], ((window_start, tokens),),
-                          "host", f"pd:host:{request}:decode:r{decode_rep}"))
-    for rank, runs, need in destinations:
+        host_slot = logical_layer % len(destination)
+        receivers.append((
+            host_slot, destination[host_slot], ((window_start, tokens),),
+            "host", f"pd:host:{request}:decode:r{decode_rep}",
+        ))
+    for dst_idx, rank, runs, need in dst_manifest:
         if need <= 0:
             continue
         if sparse_layer:
-            runs = tuple((max(lo, tokens - hot_tokens), hi) for lo, hi in runs
-                         if hi > max(lo, tokens - hot_tokens))
+            runs = tuple(
+                (max(lo, tokens - hot_tokens), hi)
+                for lo, hi in runs if hi > max(lo, tokens - hot_tokens)
+            )
+            if not runs:
+                continue
         storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{rank}"
-        receivers.append((rank, runs, "hbm", storage))
-    ratio = (max(1, layer.compress_ratio, layer.index_kpool)
-             if component == "index_k" else max(1, layer.compress_ratio)
-             if component == "compressed_kv" else 1)
-    for dst_rank, runs, tier, storage in receivers:
+        receivers.append((dst_idx, rank, runs, "hbm", storage))
+
+    ratio = (
+        max(1, int(layer.compress_ratio or 1), int(layer.index_kpool or 1))
+        if raw_component == "index_k"
+        else max(1, int(layer.compress_ratio or 1))
+        if raw_component == "compressed_kv"
+        else 1
+    )
+    for dst_idx, dst_rank, runs, tier, storage in receivers:
+        if use_groups:
+            j_d = _upstream_rank_coord(dst_idx, decode_p) if tier == "hbm" else dst_idx
+            cand_sources = grouped_sources.get(j_d % replicas) or all_sources
+        else:
+            cand_sources = all_sources
         target_rows = sum(hi - lo for lo, hi in runs)
         received = 0
-        for src_rank, lo, hi, size, offset, unit in transfers_for_runs(sources, runs):
+        for src_rank, lo, hi, size, offset, unit in transfers_for_runs(cand_sources, runs):
             token_span = (lo * ratio, hi * ratio)
-            emit(src_rank, dst_rank, component, (hi - lo) * unit,
-                 source_stage=source_stage, destination_stage=destination_stage,
-                 layer=layer.index, source_span=(0, num_heads),
-                 destination_span=(0, num_heads), source_tokens=token_span,
-                 destination_tokens=token_span, tier=tier,
-                 source_storage=f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}",
-                 destination_storage=storage, source_size=size,
-                 source_displacement=offset, destination_size=target_rows * unit,
-                 destination_displacement=received * unit)
+            emit(
+                src_rank, dst_rank, emitted_component, (hi - lo) * unit,
+                source_stage=source_stage, destination_stage=destination_stage,
+                layer=logical_layer, source_span=(0, num_heads), destination_span=(0, num_heads),
+                source_tokens=token_span, destination_tokens=token_span, tier=tier,
+                source_storage=f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rank}",
+                destination_storage=storage, source_size=size, source_displacement=offset,
+                destination_size=target_rows * unit, destination_displacement=received * unit,
+            )
             received += hi - lo
+
+
+def _bind_layer_handoff(
+    layer, logical_layer, source_stage, destination_stage, request, tokens,
+    published, emit, prefill_exec, decode_exec, prefill_rep, decode_rep,
+    prefill_case, decode_case, prefill_p, decode_p, prefill_mem, decode_mem,
+    offload, offload_layers, hot_tokens, *, component_prefix: str = "",
+):
+    source = tuple(prefill_exec.topology.ranks(prefill_rep, source_stage))
+    destination = tuple(decode_exec.topology.ranks(decode_rep, destination_stage))
+    if not source or not destination:
+        raise ModelingError("pd_handoff_missing_stage_ranks:" + request)
+    num_heads = int(getattr(layer, "num_kv_heads", 0) or 0)
+    has_head_axis = layer.attention in {"gqa", "projection_only"}
+    source_spans = _local_head_spans(num_heads, prefill_p.tp) if has_head_axis else ()
+    target_spans = _local_head_spans(num_heads, decode_p.tp) if has_head_axis else ()
+    source_owners = getattr(prefill_mem, "rank_token_owners", None)
+    target_owners = getattr(decode_mem, "rank_token_owners", None)
+
+    src_views = _handoff_rank_views(
+        prefill_case, layer, prefill_p, source, prefill_mem,
+        source_owners, source_spans, has_head_axis, tokens,
+    )
+    dst_views = _handoff_rank_views(
+        decode_case, layer, decode_p, destination, decode_mem,
+        target_owners, target_spans, has_head_axis, tokens,
+    )
+    components = {name for _, _, values, _ in src_views for name in values}
+    components |= {name for _, _, values, _ in dst_views for name in values}
+    gqa_components = {name for name in HEAD_COMPONENTS if has_head_axis and num_heads > 0}
+    split_kv = (
+        not component_prefix
+        and num_heads > 0
+        and _published_for(published, "prefill", request, logical_layer, "gqa_k") is not None
+        and _published_for(published, "prefill", request, logical_layer, "gqa_v") is not None
+    )
+    for raw_component in sorted(components):
+        emitted_component = f"{component_prefix}{raw_component}"
+        window = int(getattr(layer, "window", 0) or 0)
+        windowed = raw_component == "window" or (
+            raw_component in {"gqa_kv", "mla_kv"} and window > 0
+        )
+        window_start = max(0, tokens - window) if windowed else 0
+        if raw_component in gqa_components:
+            _emit_head_transfers(
+                emit, request, emitted_component, raw_component, layer, logical_layer,
+                source_stage, destination_stage, prefill_rep, decode_rep,
+                src_views, dst_views, source_spans, target_spans, prefill_p, decode_p,
+                windowed, window_start, tokens, split_kv, model=decode_case.model,
+            )
+            continue
+        if raw_component in ROW_COMPONENTS:
+            _emit_row_transfers(
+                emit, request, emitted_component, raw_component, layer, logical_layer,
+                source_stage, destination_stage, prefill_rep, decode_rep,
+                src_views, dst_views, prefill_case, decode_case, prefill_p, decode_p,
+                tokens, window_start, num_heads, offload, offload_layers, hot_tokens,
+                destination, source_owners=source_owners, target_owners=target_owners,
+            )
+            continue
+        _emit_state_transfers(
+            emit, request, emitted_component, raw_component, layer, logical_layer,
+            source_stage, destination_stage, prefill_rep, decode_rep,
+            src_views, dst_views, prefill_p, decode_p, num_heads,
+        )
+
+
+def _emit_non_inherited_gqa_draft_handoff(
+    draft_info: _ActiveDraftHandoff,
+    *,
+    body_layers: int,
+    request: str,
+    emit,
+    source_stage: int,
+    destination_stage: int,
+    source: tuple[int, ...],
+    destination: tuple[int, ...],
+    prefill_rep: int,
+    decode_rep: int,
+    prefill_p: Any,
+    decode_p: Any,
+    num_heads: int,
+    p_cp: int,
+    d_cp: int,
+    comp: str,
+) -> None:
+    """Emit exact integer head+token intersected ``PDTransfer`` records for GQA draft caches."""
+    src_head_spans = _local_head_spans(num_heads, prefill_p.tp)
+    dst_head_spans = _local_head_spans(num_heads, decode_p.tp)
+    p_local_h = src_head_spans[0][1] - src_head_spans[0][0]
+    d_local_h = dst_head_spans[0][1] - dst_head_spans[0][0]
+    if (
+        p_local_h <= 0
+        or d_local_h <= 0
+        or draft_info.p_row_bytes % p_local_h != 0
+        or draft_info.d_row_bytes % d_local_h != 0
+    ):
+        raise ModelingError(
+            f"pd_draft_non_integer_head_bytes:{request}:{draft_info.p_row_bytes}:{draft_info.d_row_bytes}"
+        )
+    per_head_token = draft_info.d_row_bytes // d_local_h
+    if draft_info.p_row_bytes // p_local_h != per_head_token:
+        raise ModelingError(
+            f"pd_draft_incompatible_head_bytes:{request}:{draft_info.p_row_bytes // p_local_h}:{per_head_token}"
+        )
+    toks = draft_info.eff_tokens
+    tp_p, pcp_p = max(1, int(prefill_p.tp)), max(1, int(prefill_p.pcp))
+    tp_d, pcp_d = max(1, int(decode_p.tp)), max(1, int(decode_p.pcp))
+    replicas_p = max(1, tp_p // max(1, len(set(src_head_spans))))
+    src_entries = [
+        (
+            s_idx,
+            s_rank,
+            src_head_spans[s_idx % len(src_head_spans)],
+            _head_token_span(
+                s_idx, toks, src_head_spans, p_cp,
+                total_ranks=len(source), parallel=prefill_p,
+            ),
+        )
+        for s_idx, s_rank in enumerate(source)
+    ]
+    dst_entries = [
+        (
+            d_idx,
+            d_rank,
+            dst_head_spans[d_idx % len(dst_head_spans)],
+            _head_token_span(
+                d_idx, toks, dst_head_spans, d_cp,
+                total_ranks=len(destination), parallel=decode_p,
+            ),
+        )
+        for d_idx, d_rank in enumerate(destination)
+    ]
+    for layer_offset in range(int(draft_info.d_draft_spec.layers)):
+        logical_layer = body_layers + layer_offset
+        for d_idx, d_rank, dspan, (d_lo, d_hi) in dst_entries:
+            if d_hi <= d_lo or dspan[1] <= dspan[0]:
+                continue
+            dst_size = (d_hi - d_lo) * draft_info.d_row_bytes
+            dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{d_rank}"
+            if p_cp == 1 and d_cp == 1:
+                d_tp, d_pcp = d_idx % tp_d, (d_idx // tp_d) % pcp_d
+                ordered = [
+                    entry for entry in src_entries
+                    if ((entry[0] // tp_p) % pcp_p) == (d_pcp % pcp_p)
+                    and (entry[0] % tp_p) % replicas_p == (d_tp % replicas_p)
+                ]
+            else:
+                shift = d_idx % max(1, len(src_entries))
+                ordered = src_entries[shift:] + src_entries[:shift]
+            covered: dict[int, list[tuple[int, int]]] = {}
+            for _s_idx, s_rank, sspan, (s_lo, s_hi) in ordered:
+                common = [h for h in range(dspan[0], dspan[1]) if sspan[0] <= h < sspan[1]]
+                lo, hi = max(s_lo, d_lo), min(s_hi, d_hi)
+                if not common or hi <= lo:
+                    continue
+                src_size = (s_hi - s_lo) * draft_info.p_row_bytes
+                src_storage = f"pd:kv:{request}:prefill:r{prefill_rep}:rank{s_rank}"
+                grouped: dict[tuple[int, int], list[int]] = {}
+                for head in common:
+                    for piece_lo, piece_hi in _uncovered_intervals(covered.get(head, ()), lo, hi):
+                        grouped.setdefault((piece_lo, piece_hi), []).append(head)
+                        covered.setdefault(head, []).append((piece_lo, piece_hi))
+                for (piece_lo, piece_hi), heads in grouped.items():
+                    all_rows = (piece_lo, piece_hi) == (s_lo, s_hi) == (d_lo, d_hi)
+                    consecutive = heads[-1] - heads[0] + 1 == len(heads)
+                    groups = [heads] if (all_rows and consecutive) else [[h] for h in heads]
+                    for group in groups:
+                        src_off = (group[0] - sspan[0]) * (s_hi - s_lo) + (piece_lo - s_lo)
+                        dst_off = (group[0] - dspan[0]) * (d_hi - d_lo) + (piece_lo - d_lo)
+                        payload = per_head_token * (piece_hi - piece_lo) * len(group)
+                        emit(
+                            s_rank, d_rank, comp, payload,
+                            source_stage=source_stage, destination_stage=destination_stage,
+                            layer=logical_layer, source_span=sspan, destination_span=dspan,
+                            source_tokens=(piece_lo, piece_hi), destination_tokens=(piece_lo, piece_hi),
+                            tier="hbm", source_storage=src_storage, destination_storage=dst_storage,
+                            source_size=src_size, source_displacement=per_head_token * src_off,
+                            destination_size=dst_size, destination_displacement=per_head_token * dst_off,
+                        )
+            missing = [
+                h for h in range(dspan[0], dspan[1])
+                if sum(p_hi - p_lo for p_lo, p_hi in covered.get(h, ())) < d_hi - d_lo
+            ]
+            if missing:
+                raise ModelingError(
+                    f"pd_handoff_source_head_uncovered:{request}:{logical_layer}:{d_rank}:{missing}"
+                )
+
+
+def _bind_non_inherited_draft_handoff(
+    draft_info: _ActiveDraftHandoff, body_layers: int, request: str, emit,
+    prefill_exec, decode_exec, prefill_rep: int, decode_rep: int,
+    prefill_p: Any, decode_p: Any,
+) -> None:
+    """Emit explicit integer ``PDTransfer`` records for paired-SFA / non-inherited draft caches."""
+    source_stage = max(0, int(prefill_p.pp) - 1)
+    destination_stage = max(0, int(decode_p.pp) - 1)
+    source = tuple(prefill_exec.topology.ranks(prefill_rep, source_stage))
+    destination = tuple(decode_exec.topology.ranks(decode_rep, destination_stage))
+    if not source or not destination:
+        raise ModelingError("pd_handoff_missing_stage_ranks:" + request)
+    p_cp = int(prefill_p.cp) if draft_info.p_sharded else 1
+    d_cp = int(decode_p.cp) if draft_info.d_sharded else 1
+    comp = f"draft.{draft_info.d_draft_spec.attention_kind}_kv"
+    num_heads = int(getattr(draft_info.d_draft_spec, "num_kv_heads", 0) or 0)
+    if str(getattr(draft_info.d_draft_spec, "attention_kind", "")) != "mla" and num_heads > 0:
+        _emit_non_inherited_gqa_draft_handoff(
+            draft_info, body_layers=body_layers, request=request, emit=emit,
+            source_stage=source_stage, destination_stage=destination_stage,
+            source=source, destination=destination,
+            prefill_rep=prefill_rep, decode_rep=decode_rep,
+            prefill_p=prefill_p, decode_p=decode_p,
+            num_heads=num_heads, p_cp=p_cp, d_cp=d_cp, comp=comp,
+        )
+        return
+    toks = draft_info.eff_tokens
+    src_runs_all = []
+    for s_idx, s_rank in enumerate(source):
+        s_lo, s_hi = _head_token_span(
+            s_idx, toks, (), p_cp, total_ranks=len(source), parallel=prefill_p,
+        )
+        src_runs_all.append((s_idx, s_rank, ((s_lo, s_hi),), (s_hi - s_lo) * draft_info.p_row_bytes))
+
+    replicas = len(source) // max(1, p_cp) if len(source) % max(1, p_cp) == 0 else 1
+    grouped: dict[int, list[tuple[int, tuple[tuple[int, int], ...], int]]] = defaultdict(list)
+    if replicas > 1:
+        for s_idx, s_rank, runs, size in src_runs_all:
+            j_p = _upstream_rank_coord(s_idx, prefill_p)
+            grouped[j_p // p_cp].append((s_rank, runs, size))
+    flat_sources = [(s_rank, runs, size) for _idx, s_rank, runs, size in src_runs_all]
+
+    for layer_offset in range(int(draft_info.d_draft_spec.layers)):
+        logical_layer = body_layers + layer_offset
+        for d_idx, d_rank in enumerate(destination):
+            d_lo, d_hi = _head_token_span(
+                d_idx, toks, (), d_cp, total_ranks=len(destination), parallel=decode_p,
+            )
+            if d_hi <= d_lo:
+                continue
+            j_d = _upstream_rank_coord(d_idx, decode_p)
+            cand_sources = grouped.get(j_d % replicas) or flat_sources if replicas > 1 else flat_sources
+            target_rows = d_hi - d_lo
+            received = 0
+            dst_storage = f"pd:kv:{request}:decode:r{decode_rep}:rank{d_rank}"
+            for s_rank, lo, hi, size, offset, unit in transfers_for_runs(cand_sources, ((d_lo, d_hi),)):
+                emit(
+                    s_rank, d_rank, comp, (hi - lo) * unit,
+                    source_stage=source_stage, destination_stage=destination_stage,
+                    layer=logical_layer, source_span=(0, num_heads), destination_span=(0, num_heads),
+                    source_tokens=(lo, hi), destination_tokens=(lo, hi), tier="hbm",
+                    source_storage=f"pd:kv:{request}:prefill:r{prefill_rep}:rank{s_rank}",
+                    destination_storage=dst_storage, source_size=size, source_displacement=offset,
+                    destination_size=target_rows * draft_info.d_row_bytes,
+                    destination_displacement=received * draft_info.d_row_bytes,
+                )
+                received += hi - lo
+
+
+def _verify_disjoint_integer_partition(
+    request: str,
+    transfers: list[PDTransfer],
+    source_extents: Mapping[tuple[int, str, int], int],
+    destination_extents: Mapping[tuple[int, str, int], int],
+    expected_volume: int,
+) -> None:
+    """Verify exact 0-byte disjoint integer half-open ``[start, end)`` range conservation."""
+    if not transfers:
+        if expected_volume > 0:
+            raise ModelingError(
+                f"pd_handoff_empty_transfers_with_nonzero_demand:{request}:{expected_volume}"
+            )
+        return
+    emitted_total = 0
+    dst_intervals: dict[tuple[int, str, int], list[tuple[int, int]]] = defaultdict(list)
+    for item in transfers:
+        emitted_total += item.payload_bytes
+        if not item.source_byte_range or not item.destination_byte_range:
+            raise ModelingError(f"pd_handoff_missing_byte_range:{request}:{item.component}")
+        s_lo, s_hi = item.source_byte_range
+        s_key = (item.source_rank, item.source_storage, item.source_version)
+        if s_lo < 0 or s_hi > source_extents.get(s_key, 0):
+            raise ModelingError(f"pd_handoff_source_range_out_of_bounds:{request}:{s_key}")
+        d_key = (item.destination_rank, item.destination_storage, item.destination_version)
+        dst_intervals[d_key].append(item.destination_byte_range)
+    if emitted_total != expected_volume:
+        raise ModelingError(
+            f"pd_handoff_physical_range_not_conserved:{request}:{expected_volume}!={emitted_total}"
+        )
+    for d_key, spans in dst_intervals.items():
+        ordered = sorted(spans)
+        cursor = 0
+        for d_lo, d_hi in ordered:
+            if d_lo < cursor:
+                raise ModelingError(
+                    f"pd_handoff_destination_range_overlap:{request}:{d_key}:{d_lo}<{cursor}"
+                )
+            if d_lo > cursor:
+                raise ModelingError(
+                    f"pd_handoff_destination_range_gap:{request}:{d_key}:{cursor}->{d_lo}"
+                )
+            cursor = d_hi
+        if cursor != destination_extents.get(d_key, 0):
+            raise ModelingError(
+                f"pd_handoff_destination_extent_mismatch:{request}:{d_key}:{cursor}"
+            )
+
+
+def _make_pd_transfer_emitter(
+    *,
+    request,
+    published,
+    prefill_mem,
+    decode_mem,
+    prefill_rep: int,
+    decode_rep: int,
+    plane_bases: dict[Any, int],
+    source_extents: dict[tuple[int, str, int], int],
+    destination_planes: dict[Any, int],
+    destination_offsets: dict[tuple[int, str, int], int],
+    transfers: list[PDTransfer],
+    destination_bytes: dict[int, int],
+    host_bytes: dict[int, int],
+    source_ranks: set[int],
+    destination_ranks: set[int],
+):
+    """Build the integer-byte ``PDTransfer`` emitter bound to one handoff plan."""
+    def emit(source_rank, destination_rank, component, payload, *,
+             source_stage, destination_stage, layer, source_span,
+             destination_span, source_tokens, destination_tokens,
+             tier="hbm", source_storage, destination_storage,
+             source_component=None, destination_component=None,
+             source_size, source_displacement=0, destination_size, destination_displacement=0):
+        payload_i = exact_int_bytes(payload, f"pd_transfer_payload:{component}")
+        if payload_i <= 0:
+            return
+        src_size_i = exact_int_bytes(source_size, f"pd_transfer_src_size:{component}")
+        src_disp_i = exact_int_bytes(source_displacement, f"pd_transfer_src_disp:{component}")
+        dst_size_i = exact_int_bytes(destination_size, f"pd_transfer_dst_size:{component}")
+        dst_disp_i = exact_int_bytes(destination_displacement, f"pd_transfer_dst_disp:{component}")
+        src_comp = source_component or component
+        dst_comp = destination_component or component
+        src_rec = _published_for(published, "prefill", request, layer, src_comp)
+        dst_rec = _published_for(published, "decode", request, layer, dst_comp)
+        producer = (
+            str(src_rec.get("output")) if src_rec and src_rec.get("output")
+            else f"prefill:{request}:s{source_stage}:l{layer}:{src_comp}"
+        )
+        output = (
+            str(dst_rec.get("output")) if dst_rec and dst_rec.get("output")
+            else f"decode:{request}:s{destination_stage}:l{layer}:{dst_comp}"
+        )
+        src_version = (
+            int(src_rec["version"]) if src_rec and src_rec.get("version") is not None
+            else _component_versions(prefill_mem, prefill_rep, request, layer, src_comp)
+        )
+        dst_version = (
+            int(dst_rec["version"]) if dst_rec and dst_rec.get("version") is not None
+            else _component_versions(decode_mem, decode_rep, request, layer, dst_comp)
+        )
+        src_stor = str(src_rec["storage"]) if src_rec and src_rec.get("storage") else source_storage
+        dst_stor = str(dst_rec["storage"]) if dst_rec and dst_rec.get("storage") else destination_storage
+        src_offset = address(
+            plane_bases, source_extents, (int(source_rank), src_stor, src_version),
+            (int(layer), src_comp), src_size_i, src_disp_i, payload_i,
+        )
+        dst_offset = address(
+            destination_planes, destination_offsets, (int(destination_rank), dst_stor, dst_version),
+            (int(layer), dst_comp), dst_size_i, dst_disp_i, payload_i,
+        )
+        transfers.append(PDTransfer(
+            int(source_rank), int(destination_rank), payload_i,
+            source_stage=int(source_stage), destination_stage=int(destination_stage),
+            source_layers=(int(layer),), destination_layers=(int(layer),),
+            component=component,
+            source_version=src_version, destination_version=dst_version,
+            source_heads=source_span, destination_heads=destination_span,
+            source_token_span=source_tokens, destination_token_span=destination_tokens,
+            producer=producer, output=output, destination_tier=tier,
+            source_storage=src_stor, destination_storage=dst_stor,
+            source_byte_range=(src_offset, src_offset + payload_i),
+            destination_byte_range=(dst_offset, dst_offset + payload_i),
+            source_scope=(
+                str(src_rec.get("scope")) if src_rec
+                else f"prefill:r{prefill_rep}:s{source_stage}:rank{source_rank}"
+            ),
+            destination_scope=(
+                str(dst_rec.get("scope")) if dst_rec
+                else f"decode:r{decode_rep}:s{destination_stage}:rank{destination_rank}"
+            ),
+        ))
+        if tier == "host":
+            host_bytes[int(destination_rank)] += payload_i
+        else:
+            destination_bytes[int(destination_rank)] += payload_i
+        source_ranks.add(int(source_rank))
+        destination_ranks.add(int(destination_rank))
+
+    return emit
+
+
+def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
+                        decode_local, volume, demands, shared_buffer_prefix=None,
+                        shared_buffer_capacity=None, published=None, *,
+                        active_draft: _ActiveDraftHandoff | None = None):
+    """Bind actual source/destination layer, component, head and token integer ranges."""
+    del decode_local
+    prefill_exec = execution["prefill"]
+    decode_exec = execution["decode"]
+    prefill_rep = placement["prefill", request]
+    decode_rep = placement["decode", request]
+    prefill_case, decode_case = cases["prefill"], cases["decode"]
+    prefill_p, decode_p = prefill_case.runtime.parallel, decode_case.runtime.parallel
+    prefill_mem, decode_mem = memory["prefill"], memory["decode"]
+    offload, offload_layers, hot_tokens = _sparse_offload_params(decode_mem, tokens)
+    expected_volume = exact_int_bytes(volume, "pd_handoff_expected_volume")
+
+    transfers: list[PDTransfer] = []
+    destination_bytes: dict[int, int] = defaultdict(int)
+    host_bytes: dict[int, int] = defaultdict(int)
+    source_ranks: set[int] = set()
+    destination_ranks: set[int] = set()
+    plane_bases: dict[Any, int] = {}
+    source_extents: dict[tuple[int, str, int], int] = defaultdict(int)
+    destination_planes: dict[Any, int] = {}
+    destination_offsets: dict[tuple[int, str, int], int] = defaultdict(int)
+
+    emit = _make_pd_transfer_emitter(
+        request=request, published=published,
+        prefill_mem=prefill_mem, decode_mem=decode_mem,
+        prefill_rep=prefill_rep, decode_rep=decode_rep,
+        plane_bases=plane_bases, source_extents=source_extents,
+        destination_planes=destination_planes, destination_offsets=destination_offsets,
+        transfers=transfers, destination_bytes=destination_bytes,
+        host_bytes=host_bytes, source_ranks=source_ranks, destination_ranks=destination_ranks,
+    )
+
+    for layer in prefill_case.model.layer_plans:
+        _bind_layer_handoff(
+            layer, int(layer.index),
+            int(prefill_mem.layer_stage[layer.index]),
+            int(decode_mem.layer_stage[layer.index]),
+            request, tokens, published, emit, prefill_exec, decode_exec,
+            prefill_rep, decode_rep, prefill_case, decode_case, prefill_p, decode_p,
+            prefill_mem, decode_mem, offload, offload_layers, hot_tokens,
+        )
+
+    if active_draft is not None:
+        body_len = len(prefill_case.model.layer_plans)
+        if active_draft.inherited:
+            src_st = max(0, int(prefill_p.pp) - 1)
+            dst_st = max(0, int(decode_p.pp) - 1)
+            for idx, d_layer in enumerate(active_draft.d_draft_plans):
+                _bind_layer_handoff(
+                    d_layer, body_len + idx, src_st, dst_st,
+                    request, active_draft.eff_tokens, published, emit,
+                    prefill_exec, decode_exec, prefill_rep, decode_rep,
+                    prefill_case, decode_case, prefill_p, decode_p,
+                    prefill_mem, decode_mem, False, set(), 0,
+                    component_prefix="draft.",
+                )
+        else:
+            _bind_non_inherited_draft_handoff(
+                active_draft, body_len, request, emit, prefill_exec, decode_exec,
+                prefill_rep, decode_rep, prefill_p, decode_p,
+            )
+
+    _verify_disjoint_integer_partition(
+        request, transfers, source_extents, destination_offsets, expected_volume,
+    )
+    if not transfers:
+        return PDHandoff.build(
+            request, (), memory_work=tuple(sorted(demands.items()))), (), ()
+
+    buffers = (
+        {rank: f"{shared_buffer_prefix}:rank{rank}" for rank in destination_ranks}
+        if shared_buffer_prefix is not None
+        else {rank: f"pd:kv:{request}:decode:r{decode_rep}:rank{rank}" for rank in destination_ranks}
+    )
+    pool_caps = (
+        {rank: exact_int_bytes(shared_buffer_capacity, "pd_shared_buffer_capacity")
+         for rank in destination_bytes}
+        if shared_buffer_capacity is not None else None
+    )
+    handoff = PDHandoff.build(
+        request, transfers, memory_work=tuple(sorted(demands.items())),
+        receive_capacity_bytes=dict(destination_bytes),
+        receive_buffer_ids=buffers,
+        receive_pool_capacity_bytes=pool_caps,
+        receive_host_bytes=dict(host_bytes),
+    )
+    return handoff, tuple(sorted(source_ranks)), tuple(sorted(destination_ranks))
 
 
 def _consumer_release_done(engine, target, on_consumer, rank):
@@ -526,12 +1440,7 @@ def _consumer_release_done(engine, target, on_consumer, rank):
 
 
 def _pending_release_targets(memory):
-    """Real hold/consumer events currently retaining this service's ledgers.
-
-    These are the only tails the serving loop may advance to when destination
-    admission is waiting for a release.  An unrelated Engine timer is never a
-    target.
-    """
+    """Real hold/consumer events currently retaining this service's ledgers."""
     events = []
     for ledger in memory.values():
         for holds in getattr(ledger, "async_consumer_holds", {}).values():
@@ -573,14 +1482,14 @@ class _CohortStageTopology:
         return tuple(range(base, base + self._width))
 
 
-def _union_interval_length(intervals) -> float:
-    """Exact total length of the union of half-open ``(lo, hi)`` byte intervals."""
+def _union_interval_length(intervals) -> int:
+    """Exact integer length of the union of half-open ``[lo, hi)`` byte intervals."""
     ordered = sorted(
-        (float(lo), float(hi)) for lo, hi in intervals if float(hi) > float(lo)
+        (int(lo), int(hi)) for lo, hi in intervals if int(hi) > int(lo)
     )
     if not ordered:
-        return 0.0
-    total = 0.0
+        return 0
+    total = 0
     cur_lo, cur_hi = ordered[0]
     for lo, hi in ordered[1:]:
         if lo <= cur_hi:
@@ -591,6 +1500,66 @@ def _union_interval_length(intervals) -> float:
     return total + (cur_hi - cur_lo)
 
 
+def _summarize_unique_logical_handoff_bytes(handoff: PDHandoff, p_case, p_topo) -> int:
+    """Compute replica-deduplicated logical KV/state bytes across emitted transfers."""
+    logical_row_units: dict[tuple[Any, ...], tuple[int, int]] = {}
+    logical_row_spans: dict[tuple[Any, ...], list[tuple[int, int]]] = defaultdict(list)
+    logical_plane_spans: dict[tuple[Any, ...], list[tuple[int, int]]] = defaultdict(list)
+    p_par = p_case.runtime.parallel
+    p_rank_to_idx: dict[tuple[int, int], int] = {}
+    for st in range(p_topo._pp):
+        for idx, rk in enumerate(p_topo.ranks(0, st)):
+            p_rank_to_idx[(st, rk)] = idx
+    for item in handoff.transfers:
+        layer_id = item.source_layers[0] if item.source_layers else 0
+        raw_comp = item.component.removeprefix("draft.")
+        if raw_comp in ROW_COMPONENTS and item.source_token_span:
+            t_lo, t_hi = item.source_token_span
+            if t_hi > t_lo:
+                key = (layer_id, item.component)
+                logical_row_spans[key].append((t_lo, t_hi))
+                logical_row_units[key] = (item.payload_bytes, t_hi - t_lo)
+        elif raw_comp in HEAD_COMPONENTS or raw_comp in {"gqa_k", "gqa_v"}:
+            if item.source_token_span and item.source_heads:
+                t_lo, t_hi = item.source_token_span
+                h_lo, h_hi = item.source_heads
+                if t_hi > t_lo and h_hi > h_lo:
+                    n_units = (h_hi - h_lo) * (t_hi - t_lo)
+                    for head_id in range(h_lo, h_hi):
+                        h_key = (layer_id, item.component, head_id)
+                        logical_row_spans[h_key].append((t_lo, t_hi))
+                        logical_row_units[h_key] = (item.payload_bytes, n_units)
+                    continue
+            key = (layer_id, item.component, item.source_heads, item.source_token_span)
+            if item.source_byte_range:
+                logical_plane_spans[key].append(item.source_byte_range)
+        elif raw_comp in SHARDED_STATE_COMPONENTS:
+            s_idx = p_rank_to_idx.get((item.source_stage, item.source_rank), 0)
+            layer_obj = (
+                p_case.model.layer_plans[layer_id]
+                if 0 <= layer_id < len(p_case.model.layer_plans) else None
+            )
+            attn = str(getattr(layer_obj, "attention", "") or "").strip().lower()
+            tp_n = max(1, int(p_par.tp))
+            pcp_n = max(1, int(p_par.pcp))
+            shard_id = ((s_idx % tp_n) * pcp_n + (s_idx // tp_n) % pcp_n) if attn == "kda" else (s_idx % tp_n)
+            key = (layer_id, item.component, shard_id)
+            if item.source_byte_range:
+                logical_plane_spans[key].append(item.source_byte_range)
+        else:
+            key = (layer_id, item.component, "rep")
+            if item.source_byte_range:
+                logical_plane_spans[key].append(item.source_byte_range)
+    unique_total = 0
+    for key, spans in logical_row_spans.items():
+        union_toks = _union_interval_length(spans)
+        pay_ref, span_ref = logical_row_units[key]
+        unique_total += (union_toks * pay_ref) // span_ref
+    for spans in logical_plane_spans.values():
+        unique_total += _union_interval_length(spans)
+    return int(unique_total)
+
+
 def compute_pd_handoff_plan(
     prefill_case,
     decode_case,
@@ -598,39 +1567,50 @@ def compute_pd_handoff_plan(
     tokens: int,
     prefill_memory=None,
     decode_memory=None,
+    connector_kind: str = "auto",
+    strict_connector: bool = False,
 ) -> dict:
-    """Compute exact shard-aware PD KV/Indexer handoff bytes via ``_pd_handoff_binding``.
-
-    Accounts for TP, DCP (including ``dcp_dp_width > 1`` cohorts), PCP, PP,
-    sliding-window clipping, MLA/GQA/Indexer components, and sparse offload,
-    returning both direct D2D transfer totals and deduplicated unique KV bytes
-    for three-tier HBM/DRAM/SSD KV pooling.
-    """
-    from collections import defaultdict as _defaultdict
-    from types import SimpleNamespace
+    """Compute exact integer shard-aware PD KV/Indexer/State/Draft handoff plan."""
     from ..capacity import Memory
     from ..structure import parse_case
 
-    p_case = parse_case(prefill_case)
-    d_case = parse_case(decode_case)
+    p_case = parse_case(prefill_case) if isinstance(prefill_case, Mapping) else prefill_case
+    d_case = parse_case(decode_case) if isinstance(decode_case, Mapping) else decode_case
+    conn_ok, resolved_conn, conn_reason = resolve_and_validate_pd_connector(
+        d_case.model, p_case.runtime.parallel, d_case.runtime.parallel,
+        deployment_mode="pd_disaggregated", connector_kind=connector_kind,
+    )
+    if not conn_ok and (strict_connector or connector_kind == "MooncakeHybridConnector"):
+        raise ModelingError(str(conn_reason or "pd_connector_incompatible"))
+
     p_mem = prefill_memory if prefill_memory is not None else Memory(p_case)
     d_mem = decode_memory if decode_memory is not None else Memory(d_case)
     n_tokens = max(0, int(tokens))
     if n_tokens <= 0:
         return {
-            "total_transfer_bytes": 0.0,
-            "unique_kv_bytes": 0.0,
-            "hbm_transfer_bytes": 0.0,
-            "host_transfer_bytes": 0.0,
+            "connector_kind": resolved_conn,
+            "hybrid_connector_valid": bool(conn_ok),
+            "hybrid_connector_reason": conn_reason,
+            "total_transfer_bytes": 0,
+            "unique_kv_bytes": 0,
+            "draft_kv_bytes": 0,
+            "draft_state_bytes": 0,
+            "hbm_transfer_bytes": 0,
+            "host_transfer_bytes": 0,
             "per_layer_bytes": {},
-            "tail_layer_bytes": 0.0,
+            "tail_layer_bytes": 0,
             "source_rank_bytes": {},
             "destination_rank_bytes": {},
+            "destination_hbm_rank_bytes": {},
+            "destination_host_rank_bytes": {},
             "unique_source_rank_bytes": {},
             "source_ranks": (),
             "destination_ranks": (),
             "transfer_count": 0,
+            "transfers": (),
         }
+
+    demand = compute_expected_pd_handoff_demand(p_case, d_case, p_mem, d_mem, n_tokens)
     p_topo = _CohortStageTopology(p_case.runtime.parallel, rank_offset=0)
     p_span = p_topo._pp * p_topo._width
     d_topo = _CohortStageTopology(d_case.runtime.parallel, rank_offset=p_span)
@@ -638,80 +1618,80 @@ def compute_pd_handoff_plan(
         "prefill": SimpleNamespace(topology=p_topo),
         "decode": SimpleNamespace(topology=d_topo),
     }
-    d_par = d_case.runtime.parallel
-    d_cohort_width = d_par.tp * d_par.pcp * max(1, int(d_par.dcp_dp_width))
-    if d_mem.sparse_offload:
-        volume, decode_local = d_mem.pd_handoff_volume_and_stage_hbm(n_tokens)
-        draft_kv_bytes = 0.0
-    else:
-        target_stage = [0.0] * max(1, int(d_par.pp))
-        d_interleave = cp_interleave(d_case.runtime)
-        for layer in d_case.model.layer_plans:
-            comps = layer_cache_components(
-                d_case.model, layer, d_par, n_tokens,
-                capacity_padded=False, interleave=d_interleave,
-                runtime=d_case.runtime, query_tokens=1, phase="prefill",
-            )
-            target_stage[d_mem.layer_stage[layer.index]] += sum(
-                float(v) for v in comps.values()
-            )
-        decode_local = tuple(target_stage)
-        volume = float(sum(decode_local)) * float(d_cohort_width)
-        full_decode_bytes = (
-            float(sum(d_mem.cache_bytes(n_tokens, padded=False, query_tokens=1)))
-            * float(d_cohort_width)
-        )
-        both_draft = bool(
-            dict(p_case.runtime.metadata).get("draft_proposal_tokens", 0)
-            and dict(d_case.runtime.metadata).get("draft_proposal_tokens", 0)
-        )
-        draft_kv_bytes = max(0.0, full_decode_bytes - volume) if both_draft else 0.0
     req_id = "__pd_handoff__"
     placement = {("prefill", req_id): 0, ("decode", req_id): 0}
     handoff, src_ranks, dst_ranks = _pd_handoff_binding(
         req_id, n_tokens, placement,
         {"prefill": p_case, "decode": d_case},
         {"prefill": p_mem, "decode": d_mem},
-        execution, decode_local, volume, {},
+        execution, demand.decode_local_stage_bytes, demand.total_volume_bytes, {},
+        active_draft=demand.active_draft,
     )
-    src_bytes: dict[int, float] = _defaultdict(float)
-    dst_bytes: dict[int, float] = _defaultdict(float)
-    per_layer: dict[int, float] = _defaultdict(float)
-    unique_ranges: dict[tuple[int, str], list[tuple[float, float]]] = _defaultdict(list)
-    hbm_total = 0.0
-    host_total = 0.0
+
+    src_bytes: dict[int, int] = defaultdict(int)
+    dst_bytes: dict[int, int] = defaultdict(int)
+    dst_hbm_bytes: dict[int, int] = defaultdict(int)
+    dst_host_bytes: dict[int, int] = defaultdict(int)
+    per_layer: dict[int, int] = defaultdict(int)
+    unique_ranges: dict[tuple[int, str], list[tuple[int, int]]] = defaultdict(list)
+    hbm_total = 0
+    host_total = 0
+    body_layers = len(p_case.model.layer_plans)
     for item in handoff.transfers:
-        payload = float(item.payload_bytes)
-        src_bytes[int(item.source_rank)] += payload
-        dst_bytes[int(item.destination_rank)] += payload
+        payload = item.payload_bytes
+        src_bytes[item.source_rank] += payload
+        dst_bytes[item.destination_rank] += payload
         if item.destination_tier == "host":
             host_total += payload
+            dst_host_bytes[item.destination_rank] += payload
         else:
             hbm_total += payload
-        for layer_idx in item.source_layers or (0,):
-            per_layer[int(layer_idx)] += payload / float(max(1, len(item.source_layers or (0,))))
+            dst_hbm_bytes[item.destination_rank] += payload
+        layers_tup = item.source_layers or (0,)
+        if len(layers_tup) == 1:
+            per_layer[layers_tup[0]] += payload
+        else:
+            share = payload // len(layers_tup)
+            for layer_idx in layers_tup:
+                per_layer[layer_idx] += share
         if item.source_byte_range:
-            unique_ranges[(int(item.source_rank), str(item.source_storage))].append(
-                (float(item.source_byte_range[0]), float(item.source_byte_range[1]))
-            )
-    unique_by_src: dict[int, float] = _defaultdict(float)
-    for (s_rank, _storage), spans in unique_ranges.items():
-        unique_by_src[s_rank] += _union_interval_length(spans)
+            unique_ranges[(item.source_rank, item.source_storage)].append(item.source_byte_range)
+
+    unique_by_src = {
+        s_rank: sum(
+            _union_interval_length(spans)
+            for (rank_k, _stor), spans in unique_ranges.items()
+            if rank_k == s_rank
+        )
+        for s_rank in sorted({rk for rk, _ in unique_ranges})
+    }
+    unique_total = _summarize_unique_logical_handoff_bytes(handoff, p_case, p_topo)
     total_bytes = hbm_total + host_total
-    unique_total = sum(unique_by_src.values()) if unique_by_src else total_bytes
-    tail_bytes = float(per_layer[max(per_layer)]) if per_layer else 0.0
+    if unique_total <= 0:
+        unique_total = total_bytes
+    body_layer_keys = [k for k in per_layer if k < body_layers]
+    tail_key = max(body_layer_keys) if body_layer_keys else (max(per_layer) if per_layer else -1)
+    tail_bytes = per_layer[tail_key] if tail_key >= 0 else 0
+
     return {
-        "total_transfer_bytes": float(total_bytes),
-        "unique_kv_bytes": float(unique_total),
-        "draft_kv_bytes": float(draft_kv_bytes),
-        "hbm_transfer_bytes": float(hbm_total),
-        "host_transfer_bytes": float(host_total),
-        "per_layer_bytes": {k: float(v) for k, v in sorted(per_layer.items())},
-        "tail_layer_bytes": float(tail_bytes),
-        "source_rank_bytes": {k: float(v) for k, v in sorted(src_bytes.items())},
-        "destination_rank_bytes": {k: float(v) for k, v in sorted(dst_bytes.items())},
-        "unique_source_rank_bytes": {k: float(v) for k, v in sorted(unique_by_src.items())},
+        "connector_kind": resolved_conn,
+        "hybrid_connector_valid": bool(conn_ok),
+        "hybrid_connector_reason": conn_reason,
+        "total_transfer_bytes": int(total_bytes),
+        "unique_kv_bytes": int(unique_total),
+        "draft_kv_bytes": int(demand.draft_kv_bytes),
+        "draft_state_bytes": int(demand.draft_state_bytes),
+        "hbm_transfer_bytes": int(hbm_total),
+        "host_transfer_bytes": int(host_total),
+        "per_layer_bytes": {int(k): int(v) for k, v in sorted(per_layer.items())},
+        "tail_layer_bytes": int(tail_bytes),
+        "source_rank_bytes": {int(k): int(v) for k, v in sorted(src_bytes.items())},
+        "destination_rank_bytes": {int(k): int(v) for k, v in sorted(dst_bytes.items())},
+        "destination_hbm_rank_bytes": {int(k): int(v) for k, v in sorted(dst_hbm_bytes.items())},
+        "destination_host_rank_bytes": {int(k): int(v) for k, v in sorted(dst_host_bytes.items())},
+        "unique_source_rank_bytes": {int(k): int(v) for k, v in sorted(unique_by_src.items())},
         "source_ranks": tuple(int(r) for r in src_ranks),
         "destination_ranks": tuple(int(r) for r in dst_ranks),
         "transfer_count": len(handoff.transfers),
+        "transfers": handoff.transfers,
     }

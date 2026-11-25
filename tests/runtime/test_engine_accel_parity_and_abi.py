@@ -463,11 +463,11 @@ def test_coupled_placement_must_be_proportional_to_owner_counts(sku, extra):
 
 
 def test_arena_resource_and_unit_ceilings_decline_one_past_limit():
-    for count, reason in ((2048, None), (2049, "resource_count")):
+    for count in (2048, 4096):
         eng = Engine([Resource(f"r{i}", 1.0) for i in range(count)], backend="c")
         [eng.submit(f"t{i}", {f"r{i}": 1.0}) for i in range(count)]
         eng.advance()
-        assert eng.accel_status()["fallback_reason"] == reason and (eng.accel_status()["native_steps"] > 0) == (reason is None)
+        assert eng.accel_status()["fallback_reason"] is None and eng.accel_status()["native_steps"] > 0
         close(eng)
     for units, reason in ((128, None), (129, "resource_shape")):
         eng = Engine([Resource("r", float(units), units=units)], backend="c")

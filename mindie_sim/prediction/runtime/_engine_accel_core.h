@@ -42,13 +42,14 @@ enum {
     MSIM_COMP_STRIDE = 3,     /* u64 cells per completion record */
     MSIM_SVC_STRIDE = 3,      /* f64 cells per per-link service record */
     MSIM_MAX_T = 65536,       /* reusable task slots per context */
-    MSIM_MAX_R = 2048,        /* multi-node EP/DP up to ~256 dies */
+    MSIM_MAX_R = 2048,        /* ABI probe wire compatibility constant */
+    MSIM_MAX_RES = 65536,     /* dynamic growable resource-table ceiling */
     MSIM_MAX_U = 128,         /* 36-AIC / 72-AIV and wider owner groups */
     MSIM_MAX_L = 262144,      /* live link cells per context */
     MSIM_MAX_F = 65536,       /* one flow per live link at most */
     MSIM_MAX_COEF = 262144,   /* one coefficient per live link at most */
     MSIM_MAX_MROW = 65536,    /* one solver row per live task at most */
-    MSIM_MAX_SLOT = 264192,   /* == MAX_R * (MAX_U + 1), the structural bound */
+    MSIM_MAX_SLOT = 2097152,  /* dynamic ceiling matching MSIM_MAX_UENT for growable nres */
     MSIM_MAX_SENT = 2097152,  /* dynamic ceiling for owner/entry scratch */
     MSIM_MAX_OWN = 262144,    /* mirrored dependency-edge quota */
     MSIM_MAX_UENT = 2097152   /* dynamic ceiling for effective unit memberships:
@@ -192,6 +193,27 @@ typedef struct msim_ctx {
     double *busy;
     double *serv;
     int32_t counter_cap;
+    uint32_t fifo_epoch, coef_epoch, mode_epoch, seen_epoch, comp_epoch, ord_epoch;
+    uint32_t *res_fifo_ep;
+    uint32_t *res_coef_ep;
+    uint32_t *res_mode_ep;
+    uint32_t *res_seen_ep;
+    uint32_t *res_comp_ep;
+    uint32_t *res_ord_ep;
+    int32_t *res_chead;
+    int32_t *res_ctail;
+    int32_t *touched_res;
+    int32_t *res_lhead;
+    int32_t *res_ltail;
+    msim_ubits *res_hot_units;
+    int32_t *coef_next;
+    int32_t *coef_flow;
+    int32_t *link_rnext;
+    int32_t link_rnext_cap;
+    int32_t *act_links;
+    int32_t act_links_cap;
+    int32_t *comp_q;
+    int32_t comp_q_cap;
     uint8_t resume_compl;     /* resume an interrupted completion snapshot */
     int32_t pending_hold;     /* preserve admission hold across B_OUTPUT */
     /* Task slots: fixed cap, free list, append-only link cells. */
@@ -399,6 +421,7 @@ static bool msim_slot_reserve(msim_ctx *c, int32_t need)
     int32_t target;
     msim_slot *next_slot;
     double *next_rem, *next_slope, *next_bounds;
+    bool *next_changed;
     if (need < 0) return false;
     if (need <= c->slot_cap) return true;
     if (need > MSIM_MAX_SLOT) return false;
@@ -421,8 +444,174 @@ static bool msim_slot_reserve(msim_ctx *c, int32_t need)
     next_bounds = (double *)realloc(c->slot_bounds, (size_t)target * sizeof(double));
     if (next_bounds == NULL) return false;
     c->slot_bounds = next_bounds;
+    next_changed = (bool *)realloc(c->changed, (size_t)target * sizeof(bool));
+    if (next_changed == NULL) return false;
+    c->changed = next_changed;
     c->slot_cap = target;
     return true;
+}
+
+/* Amortized O(1) monotonic epoch reset: zeroes ``arr`` only on 32-bit wraparound. */
+static void msim_next_epoch(uint32_t *epoch, uint32_t *arr, int32_t n)
+{
+    (*epoch)++;
+    if (*epoch == 0u) {
+        if (n > 0 && arr != NULL) memset(arr, 0, (size_t)n * sizeof(uint32_t));
+        *epoch = 1u;
+    }
+}
+
+static int32_t msim_res_mode_get(const msim_ctx *c, int32_t r)
+{
+    return (c->res_mode_ep[r] == c->mode_epoch) ? c->res[r].mode : -1;
+}
+
+static void msim_res_mode_set(msim_ctx *c, int32_t r, int32_t mode)
+{
+    c->res_mode_ep[r] = c->mode_epoch;
+    c->res[r].mode = mode;
+}
+
+static void msim_reset_epochs(msim_ctx *c)
+{
+    int32_t n = c->counter_cap;
+    c->fifo_epoch = 0u;
+    c->coef_epoch = 0u;
+    c->mode_epoch = 0u;
+    c->seen_epoch = 0u;
+    c->comp_epoch = 0u;
+    c->ord_epoch = 0u;
+    if (n > 0) {
+        if (c->res_fifo_ep) memset(c->res_fifo_ep, 0, (size_t)n * sizeof(uint32_t));
+        if (c->res_coef_ep) memset(c->res_coef_ep, 0, (size_t)n * sizeof(uint32_t));
+        if (c->res_mode_ep) memset(c->res_mode_ep, 0, (size_t)n * sizeof(uint32_t));
+        if (c->res_seen_ep) memset(c->res_seen_ep, 0, (size_t)n * sizeof(uint32_t));
+        if (c->res_comp_ep) memset(c->res_comp_ep, 0, (size_t)n * sizeof(uint32_t));
+        if (c->res_ord_ep) memset(c->res_ord_ep, 0, (size_t)n * sizeof(uint32_t));
+    }
+}
+
+/* Demand-grow all per-resource arrays cleanly and zero-init newly grown epoch tails. */
+static bool msim_res_reserve(msim_ctx *c, int32_t need)
+{
+    int32_t old_cap = c->counter_cap, target;
+    double *nbusy, *nserv;
+    int32_t *nact_res, *nfifo, *nchead, *nctail, *ntouched, *nlhead, *nltail;
+    uint8_t *nseen;
+    uint32_t *efifo, *ecoef, *emode, *eseen, *ecomp, *eord;
+    msim_ubits *nhot;
+    if (need < 0 || need > MSIM_MAX_RES) return false;
+    if (!msim_grow((void **)&c->res, &c->res_cap, need, sizeof(msim_res)))
+        return false;
+    if (need <= old_cap) return true;
+    target = old_cap > 0 ? old_cap : 64;
+    while (target < need) {
+        if (target > MSIM_MAX_RES / 2) { target = need; break; }
+        target *= 2;
+    }
+    if (target > MSIM_MAX_RES) target = MSIM_MAX_RES;
+    if (target < need) return false;
+    nbusy = (double *)realloc(c->busy, (size_t)target * sizeof(double));
+    if (!nbusy) return false;
+    c->busy = nbusy;
+    nserv = (double *)realloc(c->serv, (size_t)target * sizeof(double));
+    if (!nserv) return false;
+    c->serv = nserv;
+    nact_res = (int32_t *)realloc(c->act_res, (size_t)target * sizeof(int32_t));
+    if (!nact_res) return false;
+    c->act_res = nact_res;
+    nseen = (uint8_t *)realloc(c->res_seen, (size_t)target * sizeof(uint8_t));
+    if (!nseen) return false;
+    c->res_seen = nseen;
+    nfifo = (int32_t *)realloc(c->fifo_first, (size_t)target * sizeof(int32_t));
+    if (!nfifo) return false;
+    c->fifo_first = nfifo;
+    nchead = (int32_t *)realloc(c->res_chead, (size_t)target * sizeof(int32_t));
+    if (!nchead) return false;
+    c->res_chead = nchead;
+    nctail = (int32_t *)realloc(c->res_ctail, (size_t)target * sizeof(int32_t));
+    if (!nctail) return false;
+    c->res_ctail = nctail;
+    ntouched = (int32_t *)realloc(c->touched_res, (size_t)target * sizeof(int32_t));
+    if (!ntouched) return false;
+    c->touched_res = ntouched;
+    nlhead = (int32_t *)realloc(c->res_lhead, (size_t)target * sizeof(int32_t));
+    if (!nlhead) return false;
+    c->res_lhead = nlhead;
+    nltail = (int32_t *)realloc(c->res_ltail, (size_t)target * sizeof(int32_t));
+    if (!nltail) return false;
+    c->res_ltail = nltail;
+    nhot = (msim_ubits *)realloc(c->res_hot_units, (size_t)target * sizeof(msim_ubits));
+    if (!nhot) return false;
+    c->res_hot_units = nhot;
+    efifo = (uint32_t *)realloc(c->res_fifo_ep, (size_t)target * sizeof(uint32_t));
+    if (!efifo) return false;
+    c->res_fifo_ep = efifo;
+    ecoef = (uint32_t *)realloc(c->res_coef_ep, (size_t)target * sizeof(uint32_t));
+    if (!ecoef) return false;
+    c->res_coef_ep = ecoef;
+    emode = (uint32_t *)realloc(c->res_mode_ep, (size_t)target * sizeof(uint32_t));
+    if (!emode) return false;
+    c->res_mode_ep = emode;
+    eseen = (uint32_t *)realloc(c->res_seen_ep, (size_t)target * sizeof(uint32_t));
+    if (!eseen) return false;
+    c->res_seen_ep = eseen;
+    ecomp = (uint32_t *)realloc(c->res_comp_ep, (size_t)target * sizeof(uint32_t));
+    if (!ecomp) return false;
+    c->res_comp_ep = ecomp;
+    eord = (uint32_t *)realloc(c->res_ord_ep, (size_t)target * sizeof(uint32_t));
+    if (!eord) return false;
+    c->res_ord_ep = eord;
+    {
+        size_t tail = (size_t)(target - old_cap);
+        memset(c->res_fifo_ep + old_cap, 0, tail * sizeof(uint32_t));
+        memset(c->res_coef_ep + old_cap, 0, tail * sizeof(uint32_t));
+        memset(c->res_mode_ep + old_cap, 0, tail * sizeof(uint32_t));
+        memset(c->res_seen_ep + old_cap, 0, tail * sizeof(uint32_t));
+        memset(c->res_comp_ep + old_cap, 0, tail * sizeof(uint32_t));
+        memset(c->res_ord_ep + old_cap, 0, tail * sizeof(uint32_t));
+    }
+    c->res_seen_cap = target;
+    c->counter_cap = target;
+    return true;
+}
+
+/* In-place O(n log n) ascending sort with zero recursion. */
+static void msim_heapsort_i32(int32_t *a, int32_t n)
+{
+    int32_t i;
+    if (n <= 1) return;
+    if (n <= 16) {
+        for (i = 1; i < n; i++) {
+            int32_t key = a[i], j = i - 1;
+            while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; j--; }
+            a[j + 1] = key;
+        }
+        return;
+    }
+    for (i = n / 2 - 1; i >= 0; i--) {
+        int32_t root = i;
+        for (;;) {
+            int32_t ch = 2 * root + 1, sw = root;
+            if (ch < n && a[ch] > a[sw]) sw = ch;
+            if (ch + 1 < n && a[ch + 1] > a[sw]) sw = ch + 1;
+            if (sw == root) break;
+            { int32_t tmp = a[root]; a[root] = a[sw]; a[sw] = tmp; }
+            root = sw;
+        }
+    }
+    for (i = n - 1; i > 0; i--) {
+        int32_t tmp = a[0], root = 0;
+        a[0] = a[i]; a[i] = tmp;
+        for (;;) {
+            int32_t ch = 2 * root + 1, sw = root;
+            if (ch < i && a[ch] > a[sw]) sw = ch;
+            if (ch + 1 < i && a[ch + 1] > a[sw]) sw = ch + 1;
+            if (sw == root) break;
+            { int32_t t2 = a[root]; a[root] = a[sw]; a[sw] = t2; }
+            root = sw;
+        }
+    }
 }
 
 static void msim_ctx_zero(msim_ctx *c)
@@ -436,6 +625,12 @@ static void msim_ctx_release(msim_ctx *c)
 {
     if (c == NULL) return;
     free(c->res); free(c->busy); free(c->serv);
+    free(c->res_fifo_ep); free(c->res_coef_ep); free(c->res_mode_ep);
+    free(c->res_seen_ep); free(c->res_comp_ep); free(c->res_ord_ep);
+    free(c->res_chead); free(c->res_ctail); free(c->touched_res);
+    free(c->res_lhead); free(c->res_ltail); free(c->res_hot_units);
+    free(c->coef_next); free(c->coef_flow);
+    free(c->link_rnext); free(c->act_links); free(c->comp_q);
     free(c->task); free(c->free); free(c->link); free(c->units);
     free(c->heap); free(c->rheap); free(c->cheap); free(c->act);
     free(c->new_ready); free(c->act_res); free(c->res_seen);
@@ -457,12 +652,15 @@ static void msim_ctx_release(msim_ctx *c)
 static bool msim_ctx_scratch(msim_ctx *c)
 {
     c->coef = (msim_coef *)msim_zalloc((size_t)MSIM_MAX_COEF, sizeof(msim_coef));
+    c->coef_next = (int32_t *)msim_zalloc((size_t)MSIM_MAX_COEF, sizeof(int32_t));
+    c->coef_flow = (int32_t *)msim_zalloc((size_t)MSIM_MAX_COEF, sizeof(int32_t));
     c->flow = (msim_flow *)msim_zalloc((size_t)MSIM_MAX_F, sizeof(msim_flow));
     c->entry = NULL;
     c->slot = NULL;
     c->slot_rem = NULL;
     c->slot_slope = NULL;
     c->slot_bounds = NULL;
+    c->changed = NULL;
     c->slot_cap = 0;
     c->row = (msim_row *)msim_zalloc((size_t)MSIM_MAX_MROW, sizeof(msim_row));
     c->ohead = (int32_t *)msim_zalloc((size_t)MSIM_MAX_F, sizeof(int32_t));
@@ -473,7 +671,7 @@ static bool msim_ctx_scratch(msim_ctx *c)
     c->rep = (int32_t *)msim_zalloc((size_t)MSIM_MAX_L, sizeof(int32_t));
     c->pend = (int32_t *)msim_zalloc((size_t)MSIM_MAX_L, sizeof(int32_t));
     c->surv = (int32_t *)msim_zalloc((size_t)MSIM_MAX_L, sizeof(int32_t));
-    c->fifo_first = (int32_t *)msim_zalloc((size_t)MSIM_MAX_R, sizeof(int32_t));
+    c->fifo_first = NULL;
     c->uhead = (int32_t *)msim_zalloc((size_t)MSIM_MAX_U, sizeof(int32_t));
     c->unext = NULL;
     c->uflow = NULL;
@@ -484,14 +682,13 @@ static bool msim_ctx_scratch(msim_ctx *c)
     c->slope = (double *)msim_zalloc((size_t)MSIM_MAX_U, sizeof(double));
     c->active = (bool *)msim_zalloc((size_t)MSIM_MAX_L, sizeof(bool));
     c->active2 = (bool *)msim_zalloc((size_t)MSIM_MAX_U, sizeof(bool));
-    c->changed = (bool *)msim_zalloc((size_t)MSIM_MAX_SLOT, sizeof(bool));
     c->task = (msim_task *)msim_zalloc((size_t)MSIM_MAX_T, sizeof(msim_task));
     c->task_cap = MSIM_MAX_T;
-    return c->coef && c->flow && c->row && c->ohead
+    return c->coef && c->coef_next && c->coef_flow && c->flow && c->row && c->ohead
         && c->idx && c->gid && c->rep && c->pend
-        && c->surv && c->fifo_first && c->uhead && c->over
+        && c->surv && c->uhead && c->over
         && c->remu && c->bounds && c->slope
-        && c->active && c->active2 && c->changed && c->task;
+        && c->active && c->active2 && c->task;
 }
 
 #endif /* MSIM_ENGINE_ACCEL_CORE_H */

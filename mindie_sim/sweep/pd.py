@@ -17,13 +17,12 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
-from dataclasses import replace
-from fractions import Fraction
 import ctypes
+from fractions import Fraction
 import gc
+import hashlib
 import json
 import math
-import re
 import sys
 from typing import Any
 
@@ -31,23 +30,17 @@ from mindie_sim.catalog.context_parallel import (
     legal_vllm_ascend_dcp_values,
     validate_vllm_ascend_dcp_codomain,
 )
-from mindie_sim.optimization.causal_tail import (
-    compute_acceptance_tail_closure,
-    resolve_barrier_predecessors,
-)
-from mindie_sim.optimization.dual_bound import NS_PER_SECOND, inward_floor_ns
-from mindie_sim.optimization.kernel_synthesis import (
-    TargetOpNode,
-    load_rewrite_plan,
-    solve_target_graph,
-)
+from mindie_sim.optimization.codesign import evaluate_macro_wall_trigger
+from mindie_sim.optimization.ladder import solve_target_step_receipt
 from mindie_sim.prediction.body_defaults import TargetGraphSet
 from mindie_sim.prediction.capacity import Memory
-from mindie_sim.prediction.disaggregated.handoff import compute_pd_handoff_plan
+from mindie_sim.prediction.disaggregated.handoff import (
+    compute_pd_handoff_plan,
+    resolve_and_validate_pd_connector,
+)
 from mindie_sim.prediction.efficiency import (
     _lower_and_run_graph,
     _resolve_speculative_tokens,
-    extract_hardware_peaks,
 )
 from mindie_sim.prediction.evaluation import EvaluationContext
 from mindie_sim.prediction.execution.layer_runs import (
@@ -56,11 +49,6 @@ from mindie_sim.prediction.execution.layer_runs import (
     execute_native_cohort_graph,
 )
 from mindie_sim.prediction.graph_analysis import graph_costs
-from mindie_sim.prediction.results import OpOccurrence
-from mindie_sim.prediction.runtime.exposed_observer import (
-    ObservedInterval,
-    attribute_stream0_intervals,
-)
 from mindie_sim.prediction.sharding.local_tp import rank_zero_graph_reuse
 from mindie_sim.prediction.offload.policy import (
     _DEFAULT_SSD_BANDWIDTH_UTILIZATION,
@@ -68,10 +56,11 @@ from mindie_sim.prediction.offload.policy import (
     missing_scenario_error,
     resolve_sku_host_dma_rates,
 )
-from mindie_sim.prediction.frontend.speculation import compute_speculative_accept_step
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.public.errors import UnmodeledCapabilityError
+from mindie_sim.rewrite.schema import load_rewrite_plan
 from mindie_sim.schema.case import Case as CaseSpec
-from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.common import ModelingError, dtype_bytes, inclusion_probability
 from mindie_sim.schema.datapath import datapath_for_die
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.scenario import (
@@ -90,6 +79,7 @@ MS_PER_S = 1000.0
 US_PER_MS = 1000.0
 US_PER_SECOND = 1_000_000.0
 NS_PER_US = 1000.0
+NS_PER_MS = 1_000_000.0
 BYTES_PER_GIB = float(1024 ** 3)
 BYTES_PER_MS_PER_GBPS = 1_000_000.0
 PARETO_EPS = 1e-12
@@ -97,14 +87,22 @@ CLOSED_FORM_TIE_EPS = 1e-11
 KV_RATE_FLOOR_MS = 1e-9
 POOL_RATIO_SUM_TOL = 1e-6
 HALF_RATIO = 0.5
-DEFAULT_ELEM_BYTES = 2.0
-EMBED_MAX_ELEM_BYTES = 4.0
-OVERLAP_BARRIER_EPS_US = 1e-3
-DEMAND_CHANNELS = 5
-LAUNCH_SHORT_US = 12.0
-LAUNCH_WORK_SHARE = 0.35
 RANK_TPS_DECIMALS = 6
-DEFAULT_SPECULATIVE_ACCEPT_RATE = 0.70
+_VRAM_SOLVE_CACHE_MAX = 256
+_SWEEP_TARGET_LADDER_TRIALS = 2
+_EMBED_FALLBACK_DTYPE = "fp32"
+_SINGLE_TOKEN_ACCEPTANCE = 1.0
+_PREFILL_SPECULATIVE_SEED_K = 1
+_PORT_LINK_SEMANTICS = frozenset({"per_port", "fully_connected", "mesh"})
+_DIRECT_PAIR_SEMANTICS = frozenset({"per_pair"})
+_SHARED_LINK_SEMANTICS = frozenset({"shared", "explicit_aggregate"})
+_TRACK_TO_LEGACY_COMPOSE: Mapping[str, str] = {
+    "eager": "eager",
+    "shipping": "merged",
+    "proposed": "unmerged_pr",
+    "target": "ideal",
+}
+_VRAM_SOLVE_CACHE: OrderedDict[str, tuple[tuple[float, ...], int]] = OrderedDict()
 VALID_PD_TRANSFER_MODES = frozenset({
     "direct_blocking_d2d",
     "layerwise_overlap_d2d",
@@ -119,15 +117,10 @@ ARCHETYPE_FOLD_MIN_LAYERS = 2
 SLA_SLACK_BOUND_TOLERANCE_MS = 0.5
 MIN_DISAGGREGATED_DEVICES = 2
 MIN_ADMISSION_PROBE_SEQS = 16
-DEFAULT_DERIVED_MAX_NUM_SEQS_CAP = 128
-GALLOP_SEARCH_DIRECT_LIMIT = 128
-GALLOP_SEARCH_START_BATCH = 16
-PD_DECODE_MIN_BATCHED_TOKENS = 768
 REGIME_HBM_CAPACITY_BOUND = "HBM_CAPACITY_BOUND"
 REGIME_CONFIGURED_SEQ_CAP_BOUND = "CONFIGURED_SEQ_CAP_BOUND"
 REGIME_TOKEN_BUDGET_BOUND = "TOKEN_BUDGET_BOUND"
 REGIME_SLA_LATENCY_BOUND = "SLA_LATENCY_BOUND"
-_OP_LAYER_PREFIX_RE = re.compile(r"^(?:draft\.)?s\d+\.l\d+\.")
 _LOCAL_TP_AXES = (
     "q_proj_tp",
     "o_proj_tp",
@@ -139,11 +132,8 @@ _LOCAL_TP_AXES = (
 )
 _PREFILL_PCP_WIDTHS = (1, 2, 4)
 PREFILL_PCP_MIN_PROMPT_TOKENS = 1024
-DECODE_DCP_MIN_PROMPT_TOKENS = 2048
 DEFAULT_CHUNKED_PREFILL_TOKENS = 8192
 DEFAULT_CHUNKED_BATCH_SEQ_FLOOR = 64
-PREFILL_DIRECT_MAX_TOKENS = 1024
-PREFILL_CHUNK_PROBE_TOKENS = 512
 GC_RECLAIM_MIN_WORLD_SIZE = 8
 STATIC_ADMIT_RECLAIM_STRIDE = 4
 
@@ -210,38 +200,108 @@ def _prefill_workspace_tokens(parsed: CaseSpec, compute_tokens: int) -> int:
     return max(1, int(compute_tokens))
 
 
-def _pool_kv_hbm_ms(parsed_pool: CaseSpec, memory: Memory, tokens: int) -> float:
-    if tokens <= 0:
+def _compose_track_arg(track: str) -> str:
+    """Resolve canonical StackTrack names cleanly against active ``feature_mechanisms`` aliases."""
+    from mindie_sim.feature_mechanisms import TRACK_ALIASES
+
+    key = str(track or "shipping").strip().lower()
+    if key in TRACK_ALIASES:
+        return key
+    mapped = _TRACK_TO_LEGACY_COMPOSE.get(key)
+    if mapped is not None and mapped in TRACK_ALIASES:
+        return mapped
+    return key
+
+
+def _die_hbm_bytes_per_ms(die: Any, *, direction: str = "read") -> float:
+    """Return physical directional HBM service rate (B/ms) for one die."""
+    dp = datapath_for_die(die)
+    rate_bps = (
+        float(getattr(dp, "hbm_write_bytes_per_s", 0.0) or 0.0)
+        if direction == "write"
+        else float(getattr(dp, "hbm_read_bytes_per_s", 0.0) or 0.0)
+    )
+    if rate_bps <= 0.0:
+        rate_bps = float(dict(getattr(die, "rates", ()) or ()).get("hbm", 0.0) or 0.0)
+    return rate_bps / MS_PER_S if rate_bps > 0.0 else 0.0
+
+
+def _pool_kv_hbm_ms(
+    parsed_pool: CaseSpec,
+    memory: Memory,
+    tokens: int,
+    *,
+    direction: str = "read",
+    per_die_bytes: Mapping[int, float] | None = None,
+    rank_offset: int | None = None,
+) -> float:
+    """Compute bottleneck per-die HBM read/write service time for KV handoff."""
+    dies = tuple(getattr(parsed_pool.machine, "dies", ()) or ())
+    if not dies:
         return 0.0
-    parallel = parsed_pool.runtime.parallel
-    width = parallel.tp * parallel.pcp
-    best = 0.0
-    for stage, stage_bytes in enumerate(memory.cache_bytes(tokens, padded=False)):
-        dies = (
-            parsed_pool.machine.dies[stage * width:(stage + 1) * width]
-            or (parsed_pool.machine.dies[0],)
+    if per_die_bytes:
+        die_by_rank = {int(getattr(d, "rank", idx)): d for idx, d in enumerate(dies)}
+        all_missing = all(int(rk) not in die_by_rank for rk in per_die_bytes)
+        base_rank = (
+            int(rank_offset) if rank_offset is not None
+            else (min(int(rk) for rk in per_die_bytes) if all_missing else 0)
         )
-        hbm_rate_ms = min(float(dict(die.rates)["hbm"]) for die in dies) / MS_PER_S
-        best = max(best, float(stage_bytes) / max(hbm_rate_ms, PARETO_EPS))
-    return best
+        worst = 0.0
+        for rank, nbytes in per_die_bytes.items():
+            amt = float(nbytes)
+            if amt <= 0.0:
+                continue
+            rk_i = int(rank)
+            die = die_by_rank.get(rk_i)
+            if die is None:
+                local_rk = rk_i - base_rank
+                die = die_by_rank.get(local_rk)
+                if die is None:
+                    die = dies[local_rk % len(dies)]
+            rate_bpms = _die_hbm_bytes_per_ms(die, direction=direction)
+            if rate_bpms > 0.0:
+                worst = max(worst, amt / rate_bpms)
+        return float(worst)
+    if int(tokens) <= 0:
+        return 0.0
+    stage_bytes = tuple(float(v) for v in memory.cache_bytes(int(tokens), padded=False))
+    par = parsed_pool.runtime.parallel
+    width = max(1, int(par.tp) * int(par.pcp))
+    worst = 0.0
+    for st_idx, st_kv in enumerate(stage_bytes):
+        if st_kv <= 0.0:
+            continue
+        stage_dies = dies[st_idx * width:(st_idx + 1) * width] or (dies[0],)
+        rates = [_die_hbm_bytes_per_ms(d, direction=direction) for d in stage_dies]
+        pos_rates = [r for r in rates if r > 0.0]
+        if pos_rates:
+            worst = max(worst, st_kv / min(pos_rates))
+    return float(worst)
 
 
 def _extract_machine_link_tier(
     machine: Any, preferred: str,
-) -> tuple[float, float, str, str] | None:
-    """Return ``(bytes_per_ms, latency_us, semantics, tier_name)`` from machine."""
-    fallback = "d2d_intra_node" if preferred == "d2d_inter_node" else "d2d_inter_node"
-    for tier in (preferred, fallback):
+) -> tuple[float, float, str, str, float | None, Any] | None:
+    """Return ``(bytes_per_ms, latency_us, semantics, tier_name, switch_bpms, link)``."""
+    for tier in (preferred,):
         matched = [
             link for link in getattr(machine, "links", ()) or ()
             if str(link.name).startswith(tier) or str(getattr(link, "channel", "") or "") == tier
         ]
         if matched:
-            cap = min(float(link.capacity_bytes_per_ms) for link in matched)
+            chosen = min(matched, key=lambda lk: float(lk.capacity_bytes_per_ms))
+            cap = float(chosen.capacity_bytes_per_ms)
             lat = max(float(getattr(link, "latency_us", 0.0) or 0.0) for link in matched)
-            sem = str(getattr(matched[0], "semantics", "per_port") or "per_port")
+            sem = str(getattr(chosen, "semantics", "per_port") or "per_port")
+            sw_vals = [
+                float(link.switch_capacity_bytes_per_ms)
+                for link in matched
+                if getattr(link, "switch_capacity_bytes_per_ms", None) is not None
+                and float(link.switch_capacity_bytes_per_ms) > 0.0
+            ]
+            sw_cap = min(sw_vals) if sw_vals else None
             if cap > 0.0:
-                return cap, lat, sem, tier
+                return cap, lat, sem, tier, sw_cap, chosen
         tc = dict(getattr(machine, "transfer_channels", ()) or {})
         ch_raw = tc.get(tier)
         if ch_raw is not None:
@@ -256,7 +316,9 @@ def _extract_machine_link_tier(
                 if val is not None and not isinstance(val, bool) and float(val) > 0.0:
                     lat = float(ch.get("alpha_us") or 0.0)
                     sem = str(ch.get("semantics") or "per_port")
-                    return float(val) * BYTES_PER_MS_PER_GBPS, lat, sem, tier
+                    raw_sw = ch.get("switch_capacity_bytes_per_ms")
+                    sw_cap = float(raw_sw) if (raw_sw is not None and float(raw_sw) > 0.0) else None
+                    return float(val) * BYTES_PER_MS_PER_GBPS, lat, sem, tier, sw_cap, None
     return None
 
 
@@ -277,22 +339,27 @@ def _resolve_pd_link_bandwidth(
             "semantics": "explicit_aggregate",
             "source": "explicit",
             "same_domain": False,
+            "switch_capacity_bytes_per_ms": None,
+            "link": None,
         }
     p_rpn = int(getattr(p_parsed.machine, "ranks_per_node", 1) or 1)
     d_rpn = int(getattr(d_parsed.machine, "ranks_per_node", 1) or 1)
     p_phys_rpn = int(getattr(p_parsed.machine, "physical_ranks_per_node", 0) or p_rpn)
     d_phys_rpn = int(getattr(d_parsed.machine, "physical_ranks_per_node", 0) or d_rpn)
-    same_domain = int(total_dies) <= min(p_phys_rpn, d_phys_rpn)
+    eff_rpn = min(p_rpn, d_rpn, p_phys_rpn, d_phys_rpn)
+    same_domain = int(total_dies) <= eff_rpn
     preferred = "d2d_intra_node" if same_domain else "d2d_inter_node"
     p_tier = _extract_machine_link_tier(p_parsed.machine, preferred)
     d_tier = _extract_machine_link_tier(d_parsed.machine, preferred)
     tiers = [item for item in (p_tier, d_tier) if item is not None]
     if not tiers:
         raise ModelingError("missing_required_hardware_pd_link_bandwidth")
-    cap_bpms = min(item[0] for item in tiers)
+    chosen_tier = min(tiers, key=lambda item: item[0])
+    cap_bpms = chosen_tier[0]
     lat_us = max(item[1] for item in tiers)
-    semantics = tiers[0][2]
-    source_tier = tiers[0][3]
+    semantics = chosen_tier[2]
+    source_tier = chosen_tier[3]
+    sw_vals = [item[4] for item in tiers if item[4] is not None and item[4] > 0.0]
     return {
         "bw_gbps": cap_bpms / BYTES_PER_MS_PER_GBPS,
         "bw_bytes_per_ms": cap_bpms,
@@ -300,21 +367,77 @@ def _resolve_pd_link_bandwidth(
         "semantics": semantics,
         "source": f"sku_link:{source_tier}",
         "same_domain": same_domain,
+        "switch_capacity_bytes_per_ms": min(sw_vals) if sw_vals else None,
+        "link": chosen_tier[5],
     }
 
 
+def _framed_d2d_transfer_demands(
+    handoff_plan: Mapping[str, Any], link_info: Mapping[str, Any],
+) -> tuple[float, float, float, float]:
+    """Return ``(total_wire, max_tx_port, max_rx_port, max_pair)`` honoring Link framing & NIC sharing."""
+    transfers = handoff_plan.get("transfers") or ()
+    link = link_info.get("link")
+    if transfers and link is not None and hasattr(link, "physical_endpoint_id"):
+        from mindie_sim.prediction.communication import MessageFlow
+
+        total_wire = 0.0
+        tx_by_ep: dict[str, float] = {}
+        rx_by_ep: dict[str, float] = {}
+        pair_by_ep: dict[tuple[str, str], float] = {}
+        for tr in transfers:
+            src_r, dst_r = int(tr.source_rank), int(tr.destination_rank)
+            wire_b, _ = MessageFlow(src_r, dst_r, float(tr.payload_bytes)).on_link(link)
+            wire_f = float(wire_b)
+            total_wire += wire_f
+            src_ep = str(link.physical_endpoint_id(src_r))
+            dst_ep = str(link.physical_endpoint_id(dst_r))
+            tx_by_ep[src_ep] = tx_by_ep.get(src_ep, 0.0) + wire_f
+            rx_by_ep[dst_ep] = rx_by_ep.get(dst_ep, 0.0) + wire_f
+            p_key = (src_ep, dst_ep)
+            pair_by_ep[p_key] = pair_by_ep.get(p_key, 0.0) + wire_f
+        return (
+            total_wire,
+            max(tx_by_ep.values(), default=0.0),
+            max(rx_by_ep.values(), default=0.0),
+            max(pair_by_ep.values(), default=0.0),
+        )
+    total_bytes = float(handoff_plan.get("total_transfer_bytes", 0.0) or 0.0)
+    src_max = max((float(v) for v in (handoff_plan.get("source_rank_bytes") or {}).values()), default=0.0)
+    dst_max = max((float(v) for v in (handoff_plan.get("destination_rank_bytes") or {}).values()), default=0.0)
+    pair_max = _max_directed_pair_bytes(handoff_plan)
+    return total_bytes, src_max, dst_max, pair_max
+
+
+def _max_directed_pair_bytes(handoff_plan: Mapping[str, Any]) -> float:
+    """Aggregate directed ``(source_rank, destination_rank)`` bytes from exact integer transfers."""
+    pair_totals: dict[tuple[int, int], int] = {}
+    for tr in handoff_plan.get("transfers") or ():
+        key = (int(tr.source_rank), int(tr.destination_rank))
+        pair_totals[key] = pair_totals.get(key, 0) + int(tr.payload_bytes)
+    return float(max(pair_totals.values(), default=0))
+
+
 def _compute_d2d_wire_ms(handoff_plan: Mapping[str, Any], link_info: Mapping[str, Any]) -> float:
-    """Compute exact P->D wire transfer time from shard-aware handoff bytes."""
-    total_bytes = float(handoff_plan["total_transfer_bytes"])
-    if total_bytes <= 0.0:
+    """Compute physical P->D wire time from framed per-endpoint/per-pair/switch transfer demands."""
+    total_raw = float(handoff_plan.get("total_transfer_bytes", 0.0) or 0.0)
+    if total_raw <= 0.0:
         return 0.0
-    rate_bpms = float(link_info["bw_bytes_per_ms"])
-    lat_ms = float(link_info["latency_us"]) / US_PER_MS
-    if link_info["semantics"] == "explicit_aggregate":
-        return total_bytes / max(rate_bpms, PARETO_EPS) + lat_ms
-    src_max = max((float(v) for v in handoff_plan["source_rank_bytes"].values()), default=total_bytes)
-    dst_max = max((float(v) for v in handoff_plan["destination_rank_bytes"].values()), default=total_bytes)
-    return max(src_max, dst_max) / max(rate_bpms, PARETO_EPS) + lat_ms
+    cap_bpms = float(link_info["bw_bytes_per_ms"])
+    if cap_bpms <= 0.0:
+        raise ModelingError("pd_link_bandwidth_nonpositive")
+    total_bytes, src_max, dst_max, pair_max = _framed_d2d_transfer_demands(handoff_plan, link_info)
+    lat_ms = float(link_info.get("latency_us", 0.0) or 0.0) / US_PER_MS
+    semantics = str(link_info.get("semantics") or "per_port").strip().lower()
+    sw_bpms = link_info.get("switch_capacity_bytes_per_ms")
+    sw_ms = (total_bytes / float(sw_bpms)) if (sw_bpms is not None and float(sw_bpms) > 0.0) else 0.0
+    if semantics in _SHARED_LINK_SEMANTICS:
+        return float(max(total_bytes / cap_bpms, sw_ms) + lat_ms)
+    if semantics in _DIRECT_PAIR_SEMANTICS:
+        wire_core = pair_max / cap_bpms if pair_max > 0.0 else (max(src_max, dst_max) / cap_bpms)
+        return float(max(wire_core, sw_ms) + lat_ms)
+    bottleneck_port = max(src_max, dst_max) if (src_max > 0.0 or dst_max > 0.0) else total_bytes
+    return float(max(bottleneck_port / cap_bpms, sw_ms) + lat_ms)
 
 
 def _compute_pooled_kv_timing(
@@ -386,9 +509,14 @@ def _compute_pooled_kv_timing(
         + d_lat_ms
         if pull_total > 0.0 and pool_dram_ratio > 0.0 else 0.0
     )
-    if pull_total > 0.0 and pool_dram_ratio > 0.0 and link_info["source"] == "explicit":
-        net_ms = (pull_total * pool_dram_ratio) / float(link_info["bw_bytes_per_ms"])
-        d_dram_ms = max(d_dram_ms, net_ms)
+    if pull_total > 0.0 and pool_dram_ratio > 0.0:
+        if link_info["source"] == "explicit":
+            net_ms = (pull_total * pool_dram_ratio) / float(link_info["bw_bytes_per_ms"])
+            d_dram_ms = max(d_dram_ms, net_ms)
+        sw_bpms = link_info.get("switch_capacity_bytes_per_ms")
+        if sw_bpms is not None and float(sw_bpms) > 0.0:
+            sw_ms = (pull_total * pool_dram_ratio) / float(sw_bpms)
+            d_dram_ms = max(d_dram_ms, sw_ms)
     d_ssd_ms = (
         max((pull_rank_max * pool_ssd_ratio) / d_h2d_bpms, (pull_total * pool_ssd_ratio) / ssd_bpms)
         + (_DEFAULT_SSD_LATENCY_US / US_PER_MS)
@@ -487,31 +615,19 @@ def _eval_prefill_with_plan(
     apply_target_envelope: bool = False,
     rewrite_plan: Any = None,
     allow_unbound_formula: bool = True,
-    allow_plan_fallback: bool = False,
+    layer_finish_ms_out: dict[int, float] | None = None,
 ) -> tuple[float, bool]:
-    """Price prefill with optional ``rewrite_plan``, falling back only on decode-scoped plan mismatch."""
-    try:
-        ms = _prefill_step_ms(
-            parsed, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
-            min_layers=min_layers, rep_info=rep_info, eval_ctx_box=eval_ctx_box,
-            reclaim_on_exit=reclaim_on_exit,
-            apply_target_envelope=apply_target_envelope,
-            rewrite_plan=rewrite_plan,
-            allow_unbound_formula=allow_unbound_formula,
-        )
-        return ms, (rewrite_plan is not None)
-    except (ModelingError, ValueError) as exc:
-        if allow_plan_fallback and rewrite_plan is not None and _is_plan_phase_mismatch(exc):
-            ms = _prefill_step_ms(
-                parsed, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
-                min_layers=min_layers, rep_info=rep_info, eval_ctx_box=eval_ctx_box,
-                reclaim_on_exit=reclaim_on_exit,
-                apply_target_envelope=apply_target_envelope,
-                rewrite_plan=None,
-                allow_unbound_formula=allow_unbound_formula,
-            )
-            return ms, False
-        raise
+    """Price prefill with optional ``rewrite_plan`` (fail-fast on mismatch; zero silent drop)."""
+    ms = _prefill_step_ms(
+        parsed, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
+        min_layers=min_layers, rep_info=rep_info, eval_ctx_box=eval_ctx_box,
+        reclaim_on_exit=reclaim_on_exit,
+        apply_target_envelope=apply_target_envelope,
+        rewrite_plan=rewrite_plan,
+        allow_unbound_formula=allow_unbound_formula,
+        layer_finish_ms_out=layer_finish_ms_out,
+    )
+    return ms, (rewrite_plan is not None)
 
 
 def _measure_prefill_stage(
@@ -520,12 +636,12 @@ def _measure_prefill_stage(
     prompt: int,
     compute_tokens: int,
     hit_tokens: int,
-    cache: dict[tuple[Any, ...], tuple[Memory, bool, int, float]] | None,
+    cache: dict[tuple[Any, ...], tuple[Any, ...]] | None,
     cache_id: int | None,
     apply_target_envelope: bool = False,
     rewrite_plan: Any = None,
     allow_unbound_formula: bool = True,
-    allow_plan_fallback: bool = False,
+    layer_finish_ms_out: dict[int, float] | None = None,
 ) -> tuple[Memory, bool, int, float]:
     key = (
         _prefill_cache_key(
@@ -535,7 +651,10 @@ def _measure_prefill_stage(
         if (cache is not None and cache_id is not None) else None
     )
     if key is not None and key in cache:
-        return cache[key]
+        cached = cache[key]
+        if layer_finish_ms_out is not None and len(cached) > 4 and isinstance(cached[4], Mapping):
+            layer_finish_ms_out.update(cached[4])
+        return cached[0], cached[1], cached[2], cached[3]
     p_mem = Memory(p_parsed, workspace_tokens=_prefill_workspace_tokens(p_parsed, compute_tokens))
     p_kv = p_mem.cache_bytes(prompt + 1, padded=True)
     prefill_hbm_ok = bool(
@@ -552,6 +671,7 @@ def _measure_prefill_stage(
                for capacity, kv in zip(row, p_kv) if kv > 0])
         if prefill_hbm_ok else 0
     )
+    layer_clocks: dict[int, float] = {}
     if compute_tokens > 0 and prefill_hbm_ok:
         p_step, _ = _eval_prefill_with_plan(
             p_parsed, compute_tokens=compute_tokens,
@@ -559,16 +679,17 @@ def _measure_prefill_stage(
             apply_target_envelope=apply_target_envelope,
             rewrite_plan=rewrite_plan,
             allow_unbound_formula=allow_unbound_formula,
-            allow_plan_fallback=allow_plan_fallback,
+            layer_finish_ms_out=layer_clocks,
         )
     elif compute_tokens > 0:
         p_step = math.inf
     else:
         p_step = 0.0
-    result = (p_mem, prefill_hbm_ok, p_slots, p_step)
+    if layer_finish_ms_out is not None and layer_clocks:
+        layer_finish_ms_out.update(layer_clocks)
     if key is not None:
-        cache[key] = result
-    return result
+        cache[key] = (p_mem, prefill_hbm_ok, p_slots, p_step, dict(layer_clocks))
+    return p_mem, prefill_hbm_ok, p_slots, p_step
 
 
 def _compute_layerwise_overlap_ms(
@@ -577,35 +698,50 @@ def _compute_layerwise_overlap_ms(
     *,
     per_layer_bytes: Mapping[int, float] | None,
     num_layers: int,
+    connector_kind: str | None = None,
+    layer_finish_ms: Mapping[int, float] | None = None,
 ) -> tuple[float, float]:
-    """Derive ``(slot_hold_ms, exposed_kv_ms)`` from layer-publish/layer-consume timing.
+    """Derive ``(slot_hold_ms, exposed_kv_ms)`` via exact Lindley causal publish recurrence.
 
-    Layer ``i`` publishes at ``prefill_ms * (i + 1) / L`` and streams over the
-    serialized KV transfer channel for ``transfer_ms * b_i / sum(b)``. Always
-    satisfies ``0 <= exposed_kv_ms <= transfer_ms`` (exact ``transfer_ms`` for
-    a 1-layer transfer; strictly ``< transfer_ms`` when overlapping >=2 layers).
+    For request-level pull connectors (``MooncakeHybridConnector``), KV transfer starts only
+    after full prefill completes (zero layerwise overlap).  For layerwise push
+    (``MooncakePushWorker``), each layer ``i`` releases at ``a_i`` and consumes transfer
+    service ``s_i = transfer_ms * (b_i / B_tot)`` on the FIFO transfer pipeline:
+    ``F_i = max(F_{i-1}, a_i) + s_i``, ``slot_hold = max(T_prefill, F_last)``.
     """
-    p_ms = max(0.0, float(prefill_ms))
-    t_ms = max(0.0, float(transfer_ms))
-    if t_ms <= 0.0:
-        return p_ms, 0.0
-    positive = [
-        (int(idx), float(b))
-        for idx, b in sorted((per_layer_bytes or {}).items())
-        if float(b) > 0.0
-    ]
-    total_layers = max(1, int(num_layers))
-    if not positive:
-        positive = [(idx, 1.0) for idx in range(total_layers)]
-    eff_layers = max(total_layers, max(idx for idx, _ in positive) + 1)
-    total_bytes = sum(b for _, b in positive)
-    chan_done = 0.0
-    for layer_idx, layer_bytes in positive:
-        publish_ms = p_ms * (float(layer_idx + 1) / float(eff_layers))
-        tau_ms = t_ms * (layer_bytes / max(total_bytes, PARETO_EPS))
-        chan_done = max(chan_done, publish_ms) + tau_ms
-    complete_ms = max(p_ms, chan_done)
-    return complete_ms, max(0.0, complete_ms - p_ms)
+    t_pre = max(0.0, float(prefill_ms))
+    t_xfr = max(0.0, float(transfer_ms))
+    if t_xfr <= 0.0:
+        return t_pre, 0.0
+    if str(connector_kind or "").strip() == "MooncakeHybridConnector":
+        return t_pre + t_xfr, t_xfr
+    n_layers = max(1, int(num_layers))
+    if per_layer_bytes:
+        layer_items = sorted(
+            ((int(idx), max(0.0, float(amt))) for idx, amt in per_layer_bytes.items()),
+            key=lambda item: item[0],
+        )
+        total_b = sum(amt for _, amt in layer_items)
+    else:
+        layer_items = []
+        total_b = 0.0
+    if total_b <= 0.0:
+        layer_items = [(idx, 1.0) for idx in range(n_layers)]
+        total_b = float(n_layers)
+    finish_ms = 0.0
+    for idx, amt in layer_items:
+        if amt <= 0.0:
+            continue
+        if layer_finish_ms is not None and idx in layer_finish_ms:
+            arrival = max(0.0, float(layer_finish_ms[idx]))
+        else:
+            clamped = min(max(0, idx), n_layers - 1)
+            arrival = t_pre * (float(clamped + 1) / float(n_layers))
+        service = t_xfr * (amt / total_b)
+        finish_ms = max(finish_ms, arrival) + service
+    slot_hold = max(t_pre, finish_ms)
+    exposed = max(0.0, slot_hold - t_pre)
+    return float(slot_hold), float(exposed)
 
 
 def _resolve_decode_batch_bounds(
@@ -750,7 +886,9 @@ def _measure_decode_stage(
     rep_info: tuple[CaseSpec, dict[int, int], float] | None = None,
 ) -> dict[str, Any]:
     d_par = d_parsed.runtime.parallel
-    dcp_ok, dcp_reason = validate_vllm_ascend_dcp_codomain(d_parsed.model, d_par)
+    dcp_ok, dcp_reason = validate_vllm_ascend_dcp_codomain(
+        d_parsed.model, d_par, runtime=d_parsed.runtime,
+    )
     handoff_tpot = exposed_kv_ms / float(decode_tokens)
     decode_budget = tpot_sla_ms - handoff_tpot
     if not dcp_ok:
@@ -862,6 +1000,185 @@ def _prefill_only_pd_stage_result(
     }
 
 
+def _compute_d2d_handoff_rates(
+    p_parsed: CaseSpec,
+    d_parsed: CaseSpec,
+    *,
+    p_mem: Memory,
+    d_mem: Memory,
+    handoff: Mapping[str, Any],
+    link_info: Mapping[str, Any],
+    prompt: int,
+    p_step: float,
+    p_slots: int,
+    mode: str,
+    connector_kind: str,
+    kv_bytes: float,
+    tail_frac: float,
+    layer_finish_ms: Mapping[int, float] | None = None,
+) -> dict[str, Any]:
+    """Compute direct/layerwise D2D transfer duration, slot hold, and per-instance/fleet caps."""
+    p_dp = int(p_parsed.runtime.parallel.dp)
+    d_dp = max(1, int(d_parsed.runtime.parallel.dp))
+    wire_ms = _compute_d2d_wire_ms(handoff, link_info)
+    p_hbm_ms = _pool_kv_hbm_ms(
+        p_parsed, p_mem, prompt, direction="read",
+        per_die_bytes=handoff.get("source_rank_bytes"),
+        rank_offset=0,
+    )
+    d_hbm_ms = _pool_kv_hbm_ms(
+        d_parsed, d_mem, prompt, direction="write",
+        per_die_bytes=handoff.get("destination_rank_bytes"),
+        rank_offset=len(p_parsed.machine.dies),
+    )
+    kv_ms = max(wire_ms, p_hbm_ms, d_hbm_ms)
+    tail_layer_kv_ms = kv_ms * tail_frac
+    if mode == "layerwise_overlap_d2d":
+        p_slot_hold_ms, exposed_kv_ms = _compute_layerwise_overlap_ms(
+            p_step, kv_ms,
+            per_layer_bytes=handoff.get("per_layer_bytes"),
+            num_layers=int(p_parsed.model.layers),
+            connector_kind=connector_kind,
+            layer_finish_ms=layer_finish_ms,
+        )
+    else:
+        p_slot_hold_ms = p_step + kv_ms
+        exposed_kv_ms = kv_ms
+    per_rep = min(
+        MS_PER_S / max(p_step, PARETO_EPS),
+        (float(p_slots) * MS_PER_S) / max(p_slot_hold_ms, PARETO_EPS),
+    )
+    semantics = str(link_info.get("semantics") or "per_port").strip().lower()
+    cap_bpms = float(link_info["bw_bytes_per_ms"])
+    lat_ms = float(link_info.get("latency_us", 0.0) or 0.0) / US_PER_MS
+    sw_bpms = link_info.get("switch_capacity_bytes_per_ms")
+    total_wire, src_max, dst_max, pair_max = _framed_d2d_transfer_demands(handoff, link_info)
+    fleet_caps: list[float] = []
+    if sw_bpms is not None and float(sw_bpms) > 0.0 and total_wire > 0.0:
+        fleet_caps.append((float(sw_bpms) * MS_PER_S) / total_wire)
+    if semantics in _SHARED_LINK_SEMANTICS:
+        if total_wire > 0.0:
+            fleet_caps.append((cap_bpms * MS_PER_S) / total_wire)
+        p_kv_rps_per_inst = (
+            (float(p_dp) * MS_PER_S) / max(p_hbm_ms, KV_RATE_FLOOR_MS)
+            if p_hbm_ms > 0.0 else float("inf")
+        )
+        d_kv_rps_per_inst = (
+            (float(d_dp) * MS_PER_S) / max(d_hbm_ms, KV_RATE_FLOOR_MS)
+            if d_hbm_ms > 0.0 else float("inf")
+        )
+    else:
+        if semantics in _DIRECT_PAIR_SEMANTICS:
+            p_port_ms = (pair_max / cap_bpms + lat_ms) if pair_max > 0.0 else 0.0
+            d_port_ms = p_port_ms
+        else:
+            p_port_ms = (src_max / cap_bpms + lat_ms) if src_max > 0.0 else 0.0
+            d_port_ms = (dst_max / cap_bpms + lat_ms) if dst_max > 0.0 else 0.0
+        p_local_ms = max(p_port_ms, p_hbm_ms)
+        d_local_ms = max(d_port_ms, d_hbm_ms)
+        p_kv_rps_per_inst = (
+            (float(p_dp) * MS_PER_S) / max(p_local_ms, KV_RATE_FLOOR_MS)
+            if p_local_ms > 0.0 else float("inf")
+        )
+        d_kv_rps_per_inst = (
+            (float(d_dp) * MS_PER_S) / max(d_local_ms, KV_RATE_FLOOR_MS)
+            if d_local_ms > 0.0 else float("inf")
+        )
+    return {
+        "kv_ms": kv_ms,
+        "tail_layer_kv_ms": tail_layer_kv_ms,
+        "p_slot_hold_ms": p_slot_hold_ms,
+        "exposed_kv_ms": exposed_kv_ms,
+        "per_rep": per_rep,
+        "p_kv_rps_per_inst": p_kv_rps_per_inst,
+        "d_kv_rps_per_inst": d_kv_rps_per_inst,
+        "fleet_kv_rps_cap": min(fleet_caps) if fleet_caps else None,
+    }
+
+
+def _compute_pooled_handoff_rates(
+    p_parsed: CaseSpec,
+    d_parsed: CaseSpec,
+    *,
+    p_mem: Memory,
+    d_mem: Memory,
+    handoff: Mapping[str, Any],
+    link_info: Mapping[str, Any],
+    prompt: int,
+    compute_tokens: int,
+    p_step: float,
+    p_slots: int,
+    connector_kind: str,
+    kv_bytes: float,
+    tail_frac: float,
+    dram_r: float,
+    ssd_r: float,
+    ddr_bw_gbps: float | None,
+    ssd_bw_gbps: float | None,
+    layer_finish_ms: Mapping[int, float] | None = None,
+) -> dict[str, Any]:
+    """Compute pooled DRAM/SSD KV flush/pull timing and fleet-wide rate caps."""
+    p_dp = max(1, int(p_parsed.runtime.parallel.dp))
+    d_dp = max(1, int(d_parsed.runtime.parallel.dp))
+    pool_metrics = _compute_pooled_kv_timing(
+        p_parsed, d_parsed, handoff_plan=handoff, p_mem=p_mem, d_mem=d_mem,
+        prompt_tokens=prompt, compute_tokens=compute_tokens,
+        pool_dram_ratio=dram_r, pool_ssd_ratio=ssd_r,
+        ddr_bw_gbps=ddr_bw_gbps, ssd_bw_gbps=ssd_bw_gbps, link_info=link_info,
+    )
+    p_flush_ms, d_pull_ms = float(pool_metrics["p_flush_ms"]), float(pool_metrics["d_pull_ms"])
+    kv_ms = p_flush_ms + d_pull_ms
+    tail_layer_kv_ms = p_flush_ms * tail_frac
+    p_slot_hold_ms, exposed_flush_ms = _compute_layerwise_overlap_ms(
+        p_step, p_flush_ms,
+        per_layer_bytes=handoff.get("per_layer_bytes"),
+        num_layers=int(p_parsed.model.layers),
+        connector_kind=connector_kind,
+        layer_finish_ms=layer_finish_ms,
+    )
+    exposed_kv_ms = exposed_flush_ms + d_pull_ms
+    per_rep = (
+        min(
+            MS_PER_S / max(p_step, PARETO_EPS) if p_step > 0.0 else float("inf"),
+            (float(p_slots) * MS_PER_S) / max(p_slot_hold_ms, PARETO_EPS),
+        ) if p_slot_hold_ms > 0.0 else float(p_slots) * MS_PER_S
+    )
+    p_kv_rps_per_inst = (
+        (float(p_dp) * MS_PER_S) / max(p_flush_ms, KV_RATE_FLOOR_MS)
+        if p_flush_ms > 0.0 else float("inf")
+    )
+    d_kv_rps_per_inst = (
+        (float(d_dp) * MS_PER_S) / max(d_pull_ms, KV_RATE_FLOOR_MS)
+        if d_pull_ms > 0.0 else float("inf")
+    )
+    fleet_caps: list[float] = []
+    if link_info["source"] == "explicit" and kv_bytes * dram_r > 0.0:
+        fleet_caps.append((float(link_info["bw_bytes_per_ms"]) * MS_PER_S) / (kv_bytes * dram_r))
+    sw_bpms = link_info.get("switch_capacity_bytes_per_ms")
+    if sw_bpms is not None and float(sw_bpms) > 0.0 and kv_bytes * dram_r > 0.0:
+        fleet_caps.append((float(sw_bpms) * MS_PER_S) / (kv_bytes * dram_r))
+    if ssd_r > 0.0 and ssd_bw_gbps is not None:
+        ssd_bpms = (
+            check_pos_float("ssd_bw_gbps", ssd_bw_gbps)
+            * _DEFAULT_SSD_BANDWIDTH_UTILIZATION
+            * BYTES_PER_MS_PER_GBPS
+        )
+        ssd_req_bytes = (float(pool_metrics["unique_flush_bytes"]) + kv_bytes) * ssd_r
+        if ssd_req_bytes > 0.0:
+            fleet_caps.append((ssd_bpms * MS_PER_S) / ssd_req_bytes)
+    return {
+        "pool_metrics": pool_metrics,
+        "kv_ms": kv_ms,
+        "tail_layer_kv_ms": tail_layer_kv_ms,
+        "p_slot_hold_ms": p_slot_hold_ms,
+        "exposed_kv_ms": exposed_kv_ms,
+        "per_rep": per_rep,
+        "p_kv_rps_per_inst": p_kv_rps_per_inst,
+        "d_kv_rps_per_inst": d_kv_rps_per_inst,
+        "fleet_kv_rps_cap": min(fleet_caps) if fleet_caps else None,
+    }
+
+
 def _compute_pd_handoff_metrics(
     p_parsed: CaseSpec,
     d_parsed: CaseSpec,
@@ -886,6 +1203,7 @@ def _compute_pd_handoff_metrics(
     kv_transfer_bw_gbps: float | None,
     ddr_bw_gbps: float | None,
     ssd_bw_gbps: float | None,
+    layer_finish_ms: Mapping[int, float] | None = None,
 ) -> dict[str, Any]:
     """Compute exact P->D handoff/pool overlap and prefill rates without Engine calls."""
     p_dp = int(p_parsed.runtime.parallel.dp)
@@ -906,53 +1224,40 @@ def _compute_pd_handoff_metrics(
     handoff = compute_pd_handoff_plan(
         p_parsed, d_parsed, tokens=prompt, prefill_memory=p_mem, decode_memory=d_mem,
     )
+    connector_kind = str(
+        handoff.get("connector_kind")
+        or resolve_and_validate_pd_connector(
+            d_parsed.model, p_parsed.runtime.parallel, d_parsed.runtime.parallel,
+        )[1]
+    )
     kv_bytes = float(handoff["total_transfer_bytes"])
     tail_frac = (float(handoff["tail_layer_bytes"]) / kv_bytes) if kv_bytes > 0.0 else 0.0
-    pool_metrics: dict[str, Any] | None = None
-    d_kv_rps_per_inst: float | None = None
-
     if mode == "pooled_dram_ssd":
-        pool_metrics = _compute_pooled_kv_timing(
-            p_parsed, d_parsed, handoff_plan=handoff, p_mem=p_mem, d_mem=d_mem,
-            prompt_tokens=prompt, compute_tokens=compute_tokens,
-            pool_dram_ratio=dram_r, pool_ssd_ratio=ssd_r,
-            ddr_bw_gbps=ddr_bw_gbps, ssd_bw_gbps=ssd_bw_gbps, link_info=link_info,
+        rates = _compute_pooled_handoff_rates(
+            p_parsed, d_parsed, p_mem=p_mem, d_mem=d_mem, handoff=handoff,
+            link_info=link_info, prompt=prompt, compute_tokens=compute_tokens,
+            p_step=p_step, p_slots=p_slots, connector_kind=connector_kind,
+            kv_bytes=kv_bytes, tail_frac=tail_frac, dram_r=dram_r, ssd_r=ssd_r,
+            ddr_bw_gbps=ddr_bw_gbps, ssd_bw_gbps=ssd_bw_gbps,
+            layer_finish_ms=layer_finish_ms,
         )
-        p_flush_ms, d_pull_ms = float(pool_metrics["p_flush_ms"]), float(pool_metrics["d_pull_ms"])
-        kv_ms = p_flush_ms + d_pull_ms
-        tail_layer_kv_ms = p_flush_ms * tail_frac
-        p_slot_hold_ms, exposed_flush_ms = _compute_layerwise_overlap_ms(
-            p_step, p_flush_ms,
-            per_layer_bytes=handoff.get("per_layer_bytes"),
-            num_layers=int(p_parsed.model.layers),
-        )
-        exposed_kv_ms = exposed_flush_ms + d_pull_ms
-        per_rep = (
-            min(
-                MS_PER_S / max(p_step, PARETO_EPS) if p_step > 0.0 else float("inf"),
-                (float(p_slots) * MS_PER_S) / max(p_slot_hold_ms, PARETO_EPS),
-            ) if p_slot_hold_ms > 0.0 else float(p_slots) * MS_PER_S
-        )
-        p_kv_rps_per_inst = (MS_PER_S / max(p_flush_ms, KV_RATE_FLOOR_MS)) if p_flush_ms > 0.0 else float("inf")
-        d_kv_rps_per_inst = MS_PER_S / max(d_pull_ms, KV_RATE_FLOOR_MS)
+        pool_metrics: dict[str, Any] | None = rates["pool_metrics"]
     else:
-        wire_ms = _compute_d2d_wire_ms(handoff, link_info)
-        kv_ms = max(wire_ms, _pool_kv_hbm_ms(p_parsed, p_mem, prompt), _pool_kv_hbm_ms(d_parsed, d_mem, prompt))
-        tail_layer_kv_ms = kv_ms * tail_frac
-        if mode == "layerwise_overlap_d2d":
-            p_slot_hold_ms, exposed_kv_ms = _compute_layerwise_overlap_ms(
-                p_step, kv_ms,
-                per_layer_bytes=handoff.get("per_layer_bytes"),
-                num_layers=int(p_parsed.model.layers),
-            )
-        else:
-            p_slot_hold_ms = p_step + kv_ms
-            exposed_kv_ms = kv_ms
-        per_rep = min(
-            MS_PER_S / max(p_step, PARETO_EPS),
-            (float(p_slots) * MS_PER_S) / max(p_slot_hold_ms, PARETO_EPS),
+        rates = _compute_d2d_handoff_rates(
+            p_parsed, d_parsed, p_mem=p_mem, d_mem=d_mem, handoff=handoff,
+            link_info=link_info, prompt=prompt, p_step=p_step, p_slots=p_slots,
+            mode=mode, connector_kind=connector_kind, kv_bytes=kv_bytes, tail_frac=tail_frac,
+            layer_finish_ms=layer_finish_ms,
         )
-        p_kv_rps_per_inst = MS_PER_S / max(kv_ms, KV_RATE_FLOOR_MS)
+        pool_metrics = None
+
+    kv_ms = float(rates["kv_ms"])
+    tail_layer_kv_ms = float(rates["tail_layer_kv_ms"])
+    exposed_kv_ms = float(rates["exposed_kv_ms"])
+    per_rep = float(rates["per_rep"])
+    p_kv_rps_per_inst = float(rates["p_kv_rps_per_inst"])
+    d_kv_rps_per_inst: float | None = float(rates["d_kv_rps_per_inst"])
+    fleet_kv_rps_cap: float | None = rates["fleet_kv_rps_cap"]
 
     prefill_compute_ok = bool(p_step <= ttft_sla_ms)
     effective_ttft_ms = p_step + (exposed_kv_ms if mode == "direct_blocking_d2d" else 0.0)
@@ -978,6 +1283,8 @@ def _compute_pd_handoff_metrics(
         "rps_p": rps_p,
         "p_kv_rps_per_inst": p_kv_rps_per_inst,
         "d_kv_rps_per_inst": d_kv_rps_per_inst,
+        "fleet_kv_rps_cap": fleet_kv_rps_cap,
+        "connector_kind": connector_kind,
         "link_info": link_info,
         "pool_metrics": pool_metrics,
         "handoff_plan": handoff,
@@ -1014,6 +1321,8 @@ def _finalize_pd_stage_dict(handoff_info: Mapping[str, Any], dec: Mapping[str, A
         "rps_p": handoff_info["rps_p"],
         "p_kv_rps_per_inst": handoff_info["p_kv_rps_per_inst"],
         "d_kv_rps_per_inst": handoff_info["d_kv_rps_per_inst"],
+        "fleet_kv_rps_cap": handoff_info.get("fleet_kv_rps_cap"),
+        "connector_kind": handoff_info.get("connector_kind"),
         "infeasible": infeasible,
         "link_info": handoff_info["link_info"],
         "pool_metrics": handoff_info["pool_metrics"],
@@ -1054,14 +1363,18 @@ def _evaluate_pd_stages(
     _decode_rep_info: tuple[CaseSpec, dict[int, int], float] | None = None,
 ) -> dict[str, Any]:
     """Evaluate prefill, KV handoff / 3-tier pool, and decode stage rates."""
-    p_dcp_ok, p_dcp_reason = validate_vllm_ascend_dcp_codomain(p_parsed.model, p_parsed.runtime.parallel)
+    p_dcp_ok, p_dcp_reason = validate_vllm_ascend_dcp_codomain(
+        p_parsed.model, p_parsed.runtime.parallel, runtime=p_parsed.runtime,
+    )
     hit_tokens = min(int(math.floor(prompt * hit_r)), max(0, prompt - 1)) if mode == "pooled_dram_ssd" else 0
     compute_tokens = max(0, prompt - hit_tokens)
+    layer_clocks: dict[int, float] = {}
     p_mem, prefill_hbm_ok, p_slots, p_step = _measure_prefill_stage(
         p_parsed, prompt=prompt, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
         cache=_prefill_step_cache, cache_id=_prefill_cache_id,
         apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
-        allow_unbound_formula=allow_unbound_formula, allow_plan_fallback=(output > 1),
+        allow_unbound_formula=allow_unbound_formula,
+        layer_finish_ms_out=layer_clocks,
     )
     decode_q_tokens, _ = _resolve_speculative_tokens(
         d_parsed, output_budget=output, tokens_per_seq=None, emitted_tokens_per_seq=None,
@@ -1074,6 +1387,7 @@ def _evaluate_pd_stages(
         tpot_sla_ms=tpot_sla_ms, mode=mode, dram_r=dram_r, ssd_r=ssd_r,
         compute_tokens=compute_tokens, hit_tokens=hit_tokens,
         kv_transfer_bw_gbps=kv_transfer_bw_gbps, ddr_bw_gbps=ddr_bw_gbps, ssd_bw_gbps=ssd_bw_gbps,
+        layer_finish_ms=layer_clocks or None,
     )
     if handoff_info["prefill_only"]:
         return handoff_info["stage"]
@@ -1154,16 +1468,18 @@ def _build_pd_ratio_row(
 ) -> dict[str, Any]:
     decode_tokens = output - 1
     used = n_p * p_dies + n_d * d_dies
-    r_p = n_p * float(st["rps_p"])
+    r_p = float(n_p) * float(st["rps_p"])
     if decode_tokens <= 0:
         r_kv, r_d = r_p, r_p
     else:
-        r_kv_p = n_p * float(st["p_kv_rps_per_inst"])
-        r_kv = (
-            min(r_kv_p, n_d * float(st["d_kv_rps_per_inst"]))
-            if st["d_kv_rps_per_inst"] is not None else r_kv_p
-        )
-        r_d = n_d * float(st["rps_d"])
+        r_kv_terms = [float(n_p) * float(st["p_kv_rps_per_inst"])]
+        if st.get("d_kv_rps_per_inst") is not None:
+            r_kv_terms.append(float(n_d) * float(st["d_kv_rps_per_inst"]))
+        fleet_cap = st.get("fleet_kv_rps_cap")
+        if fleet_cap is not None:
+            r_kv_terms.append(float(fleet_cap))
+        r_kv = min(r_kv_terms)
+        r_d = float(n_d) * float(st["rps_d"])
     feasible = bool(st["infeasible"] is None and min(r_p, r_kv, r_d) > 0.0)
     r_sys = min(r_p, r_kv, r_d) if feasible else 0.0
     sustainable = r_sys * float(output)
@@ -1172,7 +1488,7 @@ def _build_pd_ratio_row(
     if decode_tokens <= 0:
         bottleneck = "prefill"
     else:
-        d_cmp = r_d if st["decode_budget"] > 0.0 else n_d * float(st["raw_rps_d"])
+        d_cmp = r_d if st["decode_budget"] > 0.0 else float(n_d) * float(st["raw_rps_d"])
         bottleneck = min(
             (("prefill", r_p), ("kv_transfer", r_kv), ("decode", d_cmp)),
             key=lambda item: item[1],
@@ -1192,14 +1508,97 @@ def _build_pd_ratio_row(
     }
 
 
+def _add_scaled_pd_pair(
+    cands: set[tuple[int, int]],
+    total: int,
+    p_dies: int,
+    d_dies: int,
+    n_p: int,
+    n_d: int,
+    *,
+    fc: Fraction | None = None,
+    rp: Fraction | None = None,
+    rd: Fraction | None = None,
+) -> None:
+    if n_p < 1 or n_d < 1:
+        return
+    unit = n_p * p_dies + n_d * d_dies
+    if unit > total:
+        return
+    cands.add((n_p, n_d))
+    mult_max = total // unit
+    if mult_max > 1:
+        cands.add((n_p * mult_max, n_d * mult_max))
+        if fc is not None and rp is not None and rd is not None:
+            for rate in (n_p * rp, n_d * rd):
+                if rate > 0:
+                    m_cap = int(fc // rate)
+                    for m in (m_cap, m_cap + 1):
+                        if 1 < m <= mult_max:
+                            cands.add((n_p * m, n_d * m))
+
+
+def _add_sb_jump_candidates(
+    cands: set[tuple[int, int]],
+    *,
+    total: int,
+    p_dies: int,
+    d_dies: int,
+    base_p: int,
+    base_q: int,
+    dir_p: int,
+    dir_q: int,
+    step: int,
+    fc: Fraction | None,
+    rp: Fraction,
+    rd: Fraction,
+) -> None:
+    """Add exact piecewise fractional-linear breakpoints along one accelerated SB ray."""
+    ks = {1, step}
+    if step > 1:
+        ks.add(step - 1)
+    if fc is not None:
+        if dir_p > 0:
+            kp = int((fc - base_p * rp) // (dir_p * rp))
+            ks.update((kp, kp + 1))
+        if dir_q > 0:
+            kq = int((fc - base_q * rd) // (dir_q * rd))
+            ks.update((kq, kq + 1))
+    for k in ks:
+        if 1 <= k <= step:
+            _add_scaled_pd_pair(
+                cands, total, p_dies, d_dies,
+                base_p + k * dir_p, base_q + k * dir_q,
+                fc=fc, rp=rp, rd=rd,
+            )
+
+
 def _stern_brocot_pd_candidates(
-    total: int, p_dies: int, d_dies: int, rate_p: float, rate_d: float,
+    total: int,
+    p_dies: int,
+    d_dies: int,
+    rate_p: float,
+    rate_d: float,
+    *,
+    fleet_cap: float | None = None,
 ) -> set[tuple[int, int]]:
-    """Bounded Stern-Brocot / continued-fraction search for optimal ``(n_p, n_d)`` splits."""
-    cands: set[tuple[int, int]] = {
-        (1, (total - p_dies) // d_dies),
-        ((total - d_dies) // p_dies, 1),
-    }
+    """Exact ``Fraction`` Stern-Brocot density optimizer (+ fleet-cap saturation knees)."""
+    cands: set[tuple[int, int]] = set()
+    if p_dies + d_dies > total:
+        return cands
+    fc = (
+        Fraction(fleet_cap)
+        if (fleet_cap is not None and math.isfinite(fleet_cap) and fleet_cap > 0.0)
+        else None
+    )
+    if rate_p <= 0.0 or rate_d <= 0.0 or not (math.isfinite(rate_p) and math.isfinite(rate_d)):
+        _add_scaled_pd_pair(cands, total, p_dies, d_dies, 1, (total - p_dies) // d_dies)
+        _add_scaled_pd_pair(cands, total, p_dies, d_dies, (total - d_dies) // p_dies, 1)
+        return cands
+    rp = Fraction(rate_p)
+    rd = Fraction(rate_d)
+    _add_scaled_pd_pair(cands, total, p_dies, d_dies, 1, (total - p_dies) // d_dies, fc=fc, rp=rp, rd=rd)
+    _add_scaled_pd_pair(cands, total, p_dies, d_dies, (total - d_dies) // p_dies, 1, fc=fc, rp=rp, rd=rd)
     lo_p, lo_q, hi_p, hi_q = 0, 1, 1, 0
     while True:
         mp, mq = lo_p + hi_p, lo_q + hi_q
@@ -1207,82 +1606,244 @@ def _stern_brocot_pd_candidates(
             break
         lo_cost = lo_p * p_dies + lo_q * d_dies
         hi_cost = hi_p * p_dies + hi_q * d_dies
-        if mp * rate_p <= mq * rate_d:
+        if mp * rp <= mq * rd:
             k_bud = (total - lo_cost) // hi_cost
-            denom = hi_p * rate_p - hi_q * rate_d
-            k_val = int(math.floor((lo_q * rate_d - lo_p * rate_p) / denom)) if denom > 0.0 else k_bud
+            denom = hi_p * rp - hi_q * rd
+            k_val = int((lo_q * rd - lo_p * rp) // denom) if denom > 0 else k_bud
             step = max(1, min(k_bud, k_val))
+            _add_sb_jump_candidates(
+                cands, total=total, p_dies=p_dies, d_dies=d_dies,
+                base_p=lo_p, base_q=lo_q, dir_p=hi_p, dir_q=hi_q,
+                step=step, fc=fc, rp=rp, rd=rd,
+            )
             lo_p += step * hi_p
             lo_q += step * hi_q
-            if lo_p >= 1 and lo_q >= 1:
-                cands.add((lo_p, lo_q))
-                if step > 1 and (lo_p - hi_p) >= 1 and (lo_q - hi_q) >= 1:
-                    cands.add((lo_p - hi_p, lo_q - hi_q))
         else:
             k_bud = (total - hi_cost) // lo_cost
-            denom = lo_q * rate_d - lo_p * rate_p
-            k_val = int(math.floor((hi_p * rate_p - hi_q * rate_d) / denom)) if denom > 0.0 else k_bud
+            denom = lo_q * rd - lo_p * rp
+            k_val = int((hi_p * rp - hi_q * rd) // denom) if denom > 0 else k_bud
             step = max(1, min(k_bud, k_val))
+            _add_sb_jump_candidates(
+                cands, total=total, p_dies=p_dies, d_dies=d_dies,
+                base_p=hi_p, base_q=hi_q, dir_p=lo_p, dir_q=lo_q,
+                step=step, fc=fc, rp=rp, rd=rd,
+            )
             hi_p += step * lo_p
             hi_q += step * lo_q
-            if hi_p >= 1 and hi_q >= 1:
-                cands.add((hi_p, hi_q))
-                if step > 1 and (hi_p - lo_p) >= 1 and (hi_q - lo_q) >= 1:
-                    cands.add((hi_p - lo_p, hi_q - lo_q))
+    if fc is not None:
+        np_sat = max(1, int(fc // rp))
+        np_ceil = max(1, int(math.ceil(fc / rp)))
+        nd_sat = max(1, int(fc // rd))
+        nd_ceil = max(1, int(math.ceil(fc / rd)))
+        for np_c in {1, np_sat, np_ceil}:
+            for nd_c in {1, nd_sat, nd_ceil}:
+                _add_scaled_pd_pair(cands, total, p_dies, d_dies, np_c, nd_c, fc=fc, rp=rp, rd=rd)
     return cands
 
 
+def _pareto_pd_ratio_candidates(
+    total: int,
+    p_dies: int,
+    d_dies: int,
+    rate_p: float,
+    rate_d: float,
+    *,
+    fleet_cap: float | None = None,
+) -> set[tuple[int, int]]:
+    """Exact full-budget Pareto frontier candidate generator (distinct from density SB)."""
+    cands = _stern_brocot_pd_candidates(
+        total, p_dies, d_dies, rate_p, rate_d, fleet_cap=fleet_cap,
+    )
+    if rate_p <= 0.0 or rate_d <= 0.0 or not (math.isfinite(rate_p) and math.isfinite(rate_d)):
+        return cands
+    rp = Fraction(rate_p)
+    rd = Fraction(rate_d)
+    fc = Fraction(fleet_cap) if (fleet_cap is not None and math.isfinite(fleet_cap) and fleet_cap > 0.0) else None
+    max_np = (total - d_dies) // p_dies
+    for n_p in range(1, max_np + 1):
+        max_nd = (total - n_p * p_dies) // d_dies
+        if max_nd < 1:
+            continue
+        target = min(n_p * rp, fc) if fc is not None else (n_p * rp)
+        nd_floor = max(1, min(max_nd, int(target // rd)))
+        nd_ceil = max(1, min(max_nd, int(math.ceil(target / rd))))
+        cands.add((n_p, nd_floor))
+        cands.add((n_p, nd_ceil))
+        cands.add((n_p, max_nd))
+    max_nd_all = (total - p_dies) // d_dies
+    for n_d in range(1, max_nd_all + 1):
+        max_np_for_nd = (total - n_d * d_dies) // p_dies
+        if max_np_for_nd < 1:
+            continue
+        target_p = min(n_d * rd, fc) if fc is not None else (n_d * rd)
+        np_floor = max(1, min(max_np_for_nd, int(target_p // rp)))
+        np_ceil = max(1, min(max_np_for_nd, int(math.ceil(target_p / rp))))
+        cands.add((np_floor, n_d))
+        cands.add((np_ceil, n_d))
+    return cands
+
+
+def _pd_ratio_exact_rank_key_from_rates(
+    n_p: int,
+    n_d: int,
+    *,
+    p_dies: int,
+    d_dies: int,
+    output: int,
+    rp: Fraction,
+    rd: Fraction,
+    fc: Fraction | None = None,
+    objective: str = "density",
+) -> tuple[Fraction, Fraction, int]:
+    """Exact rational tie-free ranking computed before any floating-point multiplication."""
+    used = max(1, int(n_p) * int(p_dies) + int(n_d) * int(d_dies))
+    rps = min(int(n_p) * rp, int(n_d) * rd)
+    if fc is not None and rps > fc:
+        rps = fc
+    tps = rps * int(output)
+    density = tps / used
+    if objective == "total_tps":
+        return (tps, density, -used)
+    return (density, tps, -used)
+
+
 def _solve_optimal_pd_ratio_closed_form(
-    st: Mapping[str, Any], *, total: int, p_dies: int, d_dies: int, output: int, mode: str,
+    st: Mapping[str, Any],
+    *,
+    total: int,
+    p_dies: int,
+    d_dies: int,
+    output: int,
+    mode: str,
+    objective: str = "density",
 ) -> dict[str, Any] | None:
-    """Closed-form O(log total) join selecting optimal feasible ``(n_p, n_d)`` split."""
-    if p_dies + d_dies > total or st["infeasible"] is not None:
+    """Closed-form PD ratio solver with G7 fleet shared-resource cap & exact Fraction SB."""
+    if st.get("infeasible") is not None or p_dies + d_dies > total:
         return None
     decode_tokens = output - 1
     if decode_tokens <= 0:
-        if float(st["rps_p"]) <= 0.0:
+        max_np = (total - d_dies) // p_dies
+        if max_np < 1:
             return None
-        return _build_pd_ratio_row(
-            st, n_p=(total - d_dies) // p_dies, n_d=1,
-            total=total, p_dies=p_dies, d_dies=d_dies, output=output, mode=mode,
+        row = _build_pd_ratio_row(
+            st, n_p=max_np, n_d=1, total=total, p_dies=p_dies, d_dies=d_dies,
+            output=output, mode=mode,
         )
+        return row if row["feasible"] else None
     rate_p = min(float(st["rps_p"]), float(st["p_kv_rps_per_inst"]))
     rate_d = (
         min(float(st["rps_d"]), float(st["d_kv_rps_per_inst"]))
-        if st["d_kv_rps_per_inst"] is not None else float(st["rps_d"])
+        if st.get("d_kv_rps_per_inst") is not None
+        else float(st["rps_d"])
     )
+    fleet_cap = st.get("fleet_kv_rps_cap")
     if rate_p <= 0.0 or rate_d <= 0.0:
         return None
-    raw_cands = _stern_brocot_pd_candidates(total, p_dies, d_dies, rate_p, rate_d)
-    scaled_pairs: set[tuple[int, int]] = set()
-    for cp, cq in raw_cands:
-        cost = cp * p_dies + cq * d_dies
-        if cp >= 1 and cq >= 1 and cost <= total:
-            mult = total // cost
-            scaled_pairs.add((cp * mult, cq * mult))
-    best: dict[str, Any] | None = None
-    for n_p, n_d in sorted(scaled_pairs):
+    if fleet_cap is not None and float(fleet_cap) <= 0.0:
+        return None
+    rp_frac = Fraction(rate_p)
+    rd_frac = Fraction(rate_d)
+    fc_frac = (
+        Fraction(float(fleet_cap))
+        if (fleet_cap is not None and math.isfinite(float(fleet_cap)) and float(fleet_cap) > 0.0)
+        else None
+    )
+    if objective == "density":
+        pairs = _stern_brocot_pd_candidates(
+            total, p_dies, d_dies, rate_p, rate_d, fleet_cap=fleet_cap,
+        )
+    else:
+        pairs = _pareto_pd_ratio_candidates(
+            total, p_dies, d_dies, rate_p, rate_d, fleet_cap=fleet_cap,
+        )
+    best_row: dict[str, Any] | None = None
+    best_key: tuple[Fraction, Fraction, int] | None = None
+    for n_p, n_d in sorted(pairs):
+        if n_p < 1 or n_d < 1 or n_p * p_dies + n_d * d_dies > total:
+            continue
+        cand = _build_pd_ratio_row(
+            st, n_p=n_p, n_d=n_d, total=total, p_dies=p_dies, d_dies=d_dies,
+            output=output, mode=mode,
+        )
+        if not cand["feasible"]:
+            continue
+        key = _pd_ratio_exact_rank_key_from_rates(
+            n_p, n_d, p_dies=p_dies, d_dies=d_dies, output=output,
+            rp=rp_frac, rd=rd_frac, fc=fc_frac, objective=objective,
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best_row = cand
+    return best_row
+
+
+def _solve_pareto_pd_ratios_closed_form(
+    st: Mapping[str, Any],
+    *,
+    total: int,
+    p_dies: int,
+    d_dies: int,
+    output: int,
+    mode: str,
+) -> list[dict[str, Any]]:
+    """Return full-budget Pareto-undominated ``(used_dies, sustainable_tps)`` PD ratio rows."""
+    if st.get("infeasible") is not None or p_dies + d_dies > total:
+        return []
+    if output - 1 <= 0:
+        row = _solve_optimal_pd_ratio_closed_form(
+            st, total=total, p_dies=p_dies, d_dies=d_dies, output=output, mode=mode,
+        )
+        return [row] if row is not None else []
+    rate_p = min(float(st["rps_p"]), float(st["p_kv_rps_per_inst"]))
+    rate_d = (
+        min(float(st["rps_d"]), float(st["d_kv_rps_per_inst"]))
+        if st.get("d_kv_rps_per_inst") is not None
+        else float(st["rps_d"])
+    )
+    fleet_cap = st.get("fleet_kv_rps_cap")
+    if rate_p <= 0.0 or rate_d <= 0.0:
+        return []
+    if fleet_cap is not None and float(fleet_cap) <= 0.0:
+        return []
+    rp_frac = Fraction(rate_p)
+    rd_frac = Fraction(rate_d)
+    fc_frac = (
+        Fraction(float(fleet_cap))
+        if (fleet_cap is not None and math.isfinite(float(fleet_cap)) and float(fleet_cap) > 0.0)
+        else None
+    )
+    pairs = (
+        _stern_brocot_pd_candidates(total, p_dies, d_dies, rate_p, rate_d, fleet_cap=fleet_cap)
+        | _pareto_pd_ratio_candidates(total, p_dies, d_dies, rate_p, rate_d, fleet_cap=fleet_cap)
+    )
+    by_dies: dict[int, tuple[Fraction, int, int]] = {}
+    for n_p, n_d in sorted(pairs):
+        if n_p < 1 or n_d < 1:
+            continue
+        used = n_p * p_dies + n_d * d_dies
+        if used > total:
+            continue
+        rps = min(n_p * rp_frac, n_d * rd_frac)
+        if fc_frac is not None and rps > fc_frac:
+            rps = fc_frac
+        tps = rps * int(output)
+        prev = by_dies.get(used)
+        if prev is None or tps > prev[0]:
+            by_dies[used] = (tps, n_p, n_d)
+    frontier_rows: list[dict[str, Any]] = []
+    best_tps_so_far: Fraction | None = None
+    for used in sorted(by_dies):
+        tps, n_p, n_d = by_dies[used]
+        if best_tps_so_far is not None and tps <= best_tps_so_far:
+            continue
         row = _build_pd_ratio_row(
             st, n_p=n_p, n_d=n_d, total=total, p_dies=p_dies, d_dies=d_dies,
             output=output, mode=mode,
         )
-        if not row["feasible"]:
-            continue
-        if best is None:
-            best = row
-            continue
-        e_diff = float(row["e2e_tps_per_die"]) - float(best["e2e_tps_per_die"])
-        if e_diff > CLOSED_FORM_TIE_EPS:
-            best = row
-        elif abs(e_diff) <= CLOSED_FORM_TIE_EPS:
-            cur_tie = (float(row["sustainable_tps"]), -int(row["used_dies"]), -n_p, -n_d)
-            best_tie = (
-                float(best["sustainable_tps"]), -int(best["used_dies"]),
-                -int(best["n_prefill"]), -int(best["n_decode"]),
-            )
-            if cur_tie > best_tie:
-                best = row
-    return best
+        if row["feasible"]:
+            frontier_rows.append(row)
+            best_tps_so_far = tps
+    return frontier_rows
 
 
 def _build_pd_ratio_rows(
@@ -1442,32 +2003,26 @@ def _resolve_pd_prefill_speculative_k(
     decode_mtp_tokens: int,
     hw_family: str,
 ) -> int:
-    """Resolve Prefill speculative proposal count via the stack adapter PD K-rule.
-
-    Hybrid recurrent models and DSpark require matching ``K`` on Prefill and
-    Decode; pure-attention models use ``P=1 / D=K`` when ``K > 0`` rather than
-    silently forcing ``K=0`` on Prefill.
-    """
+    """Resolve Prefill speculative proposal count strictly from structural model contracts."""
+    del model_id, hw_family
     k_decode = max(0, int(decode_mtp_tokens))
     if k_decode <= 0:
         return 0
-    from mindie_sim.stacks.vllm_ascend.speculative import (
-        build_pd_spec_configs,
-        is_hybrid_recurrent_model,
-        resolve_speculative_companion,
-    )
+    from mindie_sim.catalog.cache_pools import LINEAR_ATTENTION_KINDS
 
-    plans = tuple(getattr(model_spec, "layer_plans", ()) or ())
-    has_recurrent = any(
-        str(getattr(lp, "attention", "") or "").lower() in {"kda", "gdn", "mamba", "linear_attention"}
-        for lp in plans
+    layer_plans = getattr(model_spec, "layer_plans", ()) or ()
+    has_linear_attn = any(
+        str(getattr(lp, "attention", "") or "").strip().lower() in LINEAR_ATTENTION_KINDS
+        for lp in layer_plans
     )
-    is_hybrid = bool(has_recurrent or is_hybrid_recurrent_model(model_id))
-    resolved = resolve_speculative_companion(
-        model_id, hw_family=hw_family, num_speculative_tokens=k_decode,
+    aux = getattr(model_spec, "auxiliary", None)
+    has_paired_draft = bool(
+        getattr(aux, "dspark", None) is not None
+        or getattr(aux, "paired_sfa", False)
     )
-    p_cfg, _, _ = build_pd_spec_configs(resolved, is_hybrid=is_hybrid)
-    return max(0, int(p_cfg.get("num_speculative_tokens", k_decode)))
+    if has_linear_attn or has_paired_draft:
+        return k_decode
+    return _PREFILL_SPECULATIVE_SEED_K
 
 
 def _sync_derived_runtime_limits(
@@ -1488,7 +2043,7 @@ def _sync_derived_runtime_limits(
     min_tokens = eff_seqs * verify_width
     cur_batched = int(rt.get("max_num_batched_tokens") or 0)
     if role == "pd_decode":
-        rt["max_num_batched_tokens"] = max(min_tokens, PD_DECODE_MIN_BATCHED_TOKENS)
+        rt["max_num_batched_tokens"] = max(cur_batched, min_tokens) if cur_batched > 0 else min_tokens
     elif cur_batched > 0:
         rt["max_num_batched_tokens"] = max(cur_batched, min_tokens)
     comp_cfg = rt.get("compilation_config")
@@ -1515,12 +2070,9 @@ def _sync_derived_runtime_limits(
 
 _DENSE_KV_ATTENTION_KINDS = frozenset({"gqa", "mla"})
 _SOLVE_COMPOSE_CACHE_MAX = 32
-_VRAM_SOLVE_CACHE_MAX = 64
 _PARALLEL_ADMIT_MIN_CANDS = 4
 _ANCHOR_WAVE_UB_RATIO = 0.5
-_SECANT_CLUSTER_MIN_BUDGET = 3
 _SOLVE_COMPOSE_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
-_VRAM_SOLVE_CACHE: OrderedDict[tuple[Any, ...], tuple[tuple[float, ...], int]] = OrderedDict()
 
 
 def _provable_decode_per_seq_read_by_stage(
@@ -1593,6 +2145,28 @@ def _provable_decode_per_seq_read_by_stage(
     return out
 
 
+def _public_routed_expert_bytes_by_stage(parsed: CaseSpec, pp_stages: int) -> list[float]:
+    """Compute per-stage routed MoE weight bytes strictly via public catalog weight contracts."""
+    from mindie_sim.catalog.cache import layer_stage_map
+    from mindie_sim.catalog.types import QuantSpec
+    from mindie_sim.catalog.weight_terms import term_bytes
+    from mindie_sim.catalog.weights import layer_weight_terms
+
+    par = parsed.runtime.parallel
+    smap = layer_stage_map(parsed.model, par, parsed.runtime)
+    q_spec = parsed.model.quant or QuantSpec("bf16")
+    rpn = int(getattr(parsed.machine, "ranks_per_node", 1) or 1)
+    out = [0.0] * pp_stages
+    for lp in parsed.model.layer_plans:
+        if lp.ffn != "moe" or int(lp.num_experts) <= 0:
+            continue
+        st = smap[lp.index] if lp.index < len(smap) else pp_stages - 1
+        for term in layer_weight_terms(lp, parsed.model):
+            if "routed_expert" in str(getattr(term, "category", "") or ""):
+                out[st] += float(term_bytes(term, q_spec, par, rpn))
+    return out
+
+
 def _provable_decode_tps_upper_bound(
     parsed: CaseSpec,
     mem: Memory,
@@ -1605,14 +2179,7 @@ def _provable_decode_tps_upper_bound(
     rewrite_plan: Any = None,
     allow_unbound_formula: bool = True,
 ) -> float:
-    """Strictly optimistic decode throughput ceiling (tok/s/die) for sound pruning.
-
-    For ``W(b) = C_eff + b * K + R * (1 - p^b)`` with ``C_eff >= 0``, ``K >= 0``,
-    and ``0 < p <= 1``, ``W(b)`` is concave with ``W(0) >= 0``, so ``b / W(b)``
-    is monotonically non-decreasing in ``b`` and attains its exact maximum over
-    SLA-feasible ``1 <= b <= b_eff`` at ``b = b_eff`` (where ``b_eff <= b_limit``
-    is the largest integer with ``min_step_ms(b_eff) <= tpot_sla_ms * emit_est``).
-    """
+    """Strictly optimistic decode throughput ceiling (tok/s/die) for sound pruning."""
     if b_limit < 1 or emit_est <= 0.0:
         return 0.0
     if rewrite_plan is not None and allow_unbound_formula:
@@ -1621,33 +2188,25 @@ def _provable_decode_tps_upper_bound(
     pp_stages = max(1, int(par.pp))
     per_dp_dies = max(1, int(par.tp) * int(par.pcp) * pp_stages)
 
-    from mindie_sim.prediction.capacity.residency import _routed_expert_bytes_by_stage
-
     moe_plans = [lp for lp in parsed.model.layer_plans if lp.ffn == "moe" and int(lp.num_experts) > 0]
-    if moe_plans:
-        routed_by_stage, _, _ = _routed_expert_bytes_by_stage(
-            parsed, mem.layer_stage, workspace_tokens=1, slot_plans=mem.slot_plans,
-        )
-    else:
-        routed_by_stage = [0.0] * pp_stages
+    routed_by_stage = _public_routed_expert_bytes_by_stage(parsed, pp_stages) if moe_plans else [0.0] * pp_stages
     use_routed_floor = bool(
         moe_plans
         and not parsed.runtime.routing
         and int(getattr(par, "redundant_experts_per_rank", 0) or 0) == 0
         and float(mem.offload.get("expert_ddr_ratio", 0.0) or 0.0) <= 0.0
     )
-    min_k = 1
-    max_e = 1
-    ep_dp = 1
-    if use_routed_floor:
-        min_k = min(max(1, int(lp.top_k)) for lp in moe_plans)
-        max_e = max(max(1, int(lp.num_experts)) for lp in moe_plans)
-        tp_pcp = max(1, int(par.tp) * int(par.pcp))
-        ep_dp = max(1, min(int(par.dp), int(par.ep) // tp_pcp)) if int(par.ep) > tp_pcp else 1
+    min_k = min((max(1, int(lp.top_k)) for lp in moe_plans), default=1) if use_routed_floor else 1
+    max_e = max((max(1, int(lp.num_experts)) for lp in moe_plans), default=1) if use_routed_floor else 1
+    tp_pcp = max(1, int(par.tp) * int(par.pcp))
+    ep_dp = (
+        max(1, min(int(par.dp), int(par.ep) // tp_pcp))
+        if (use_routed_floor and int(par.ep) > tp_pcp)
+        else 1
+    )
     per_seq_read_by_stage = _provable_decode_per_seq_read_by_stage(
         parsed, mem, prompt_tokens=prompt_tokens, pp_stages=pp_stages,
     )
-
     vision_stage = [0.0] * pp_stages
     if getattr(mem, "vision_accounting", "text_backbone") == "full_checkpoint":
         _, v_delta = mem._resolve_vision_delta_by_stage("text_backbone")
@@ -1665,8 +2224,9 @@ def _provable_decode_tps_upper_bound(
         ))
         engram_stage = [e_bytes] * pp_stages
     vocab = int(getattr(parsed.model, "vocab_size", 0) or 0)
-    hidden = int(getattr(parsed.model, "hidden", 0) or 0)
-    embed_stage0 = (float(vocab * hidden) * EMBED_MAX_ELEM_BYTES) / float(max(1, int(par.tp)))
+    hidden = int(getattr(parsed.model, "hidden_size", 0) or 0)
+    embed_elem_bytes = float(dtype_bytes(_EMBED_FALLBACK_DTYPE))
+    embed_stage0 = (float(vocab * hidden) * embed_elem_bytes) / float(max(1, int(par.tp)))
     width = max(1, int(par.tp) * int(par.pcp))
     stage_terms: list[tuple[float, float, float, float]] = []
     for st in range(pp_stages):
@@ -1684,22 +2244,19 @@ def _provable_decode_tps_upper_bound(
         if hbm_peak_ms <= 0.0:
             return math.inf
         c_eff = max(0.0, non_routed - max_l2)
-        # Only add routed expert + per-seq KV/state reads when non_routed >= max_l2 so W(0) >= 0 and W(b) is concave.
         r_bytes = float(routed_by_stage[st]) if (use_routed_floor and non_routed >= max_l2) else 0.0
         k_bytes = float(per_seq_read_by_stage[st]) if (non_routed >= max_l2) else 0.0
         stage_terms.append((c_eff, r_bytes, k_bytes, hbm_peak_ms))
 
     pp_overlap = max(1, min(pp_stages, int(getattr(parsed.runtime, "pipeline_microbatches", 1) or 1)))
     eff_q = max(1, int(q_tok))
-    base_miss = (1.0 - float(min_k) / float(max_e)) if (use_routed_floor and min_k < max_e) else 0.0
+    hit_prob = (float(min_k) / float(max_e)) if (use_routed_floor and max_e > 0) else 0.0
 
     def _min_step_ms(batch: int) -> float:
-        if not use_routed_floor:
-            r_frac = 0.0
-        elif min_k >= max_e:
-            r_frac = 1.0
-        else:
-            r_frac = 1.0 - (base_miss ** float(ep_dp * batch * eff_q))
+        r_frac = (
+            inclusion_probability(float(ep_dp * batch * eff_q), hit_prob)
+            if use_routed_floor else 0.0
+        )
         tot_ms = 0.0
         b_f = float(batch)
         for c_eff, r_bytes, k_bytes, hbm_ms in stage_terms:
@@ -1723,8 +2280,8 @@ def _provable_decode_tps_upper_bound(
     step_at_top = _min_step_ms(b_eff)
     if step_at_top <= 0.0:
         return math.inf
-    n_tok_eff = (float(b_eff) * float(emit_est)) / float(per_dp_dies)
-    return (n_tok_eff * MS_PER_S) / max(step_at_top, PARETO_EPS)
+    raw_ub = (float(b_eff) * float(emit_est) * MS_PER_S) / (float(per_dp_dies) * step_at_top)
+    return float(math.nextafter(raw_ub, math.inf))
 
 
 def _matches_pinned(cand: Mapping[str, int], pinned: Mapping[str, int]) -> bool:
@@ -1768,21 +2325,16 @@ def _dcp_choices_for_candidate(
     prompt_tokens: int,
     pinned: Mapping[str, int],
 ) -> tuple[int, ...]:
+    """Derive legal DCP widths strictly from physical model/parallel contracts (zero heuristics)."""
+    del prompt_tokens
     if "dcp" in pinned:
-        cand_dcp = max(1, int(pinned["dcp"]))
-        if model_spec is not None:
-            ok, _ = validate_vllm_ascend_dcp_codomain(
-                model_spec, ParallelSpec(tp=tp, pcp=pcp, cp=cand_dcp),
-            )
-            if not ok:
-                return ()
-        return (cand_dcp,)
+        return (int(pinned["dcp"]),)
+    if "cp" in pinned:
+        return (int(pinned["cp"]),)
     if model_spec is None:
-        return (1, tp) if (tp > 1 and pcp == 1 and prompt_tokens >= DECODE_DCP_MIN_PROMPT_TOKENS) else (1,)
-    legal = legal_vllm_ascend_dcp_values(model_spec, tp=tp, pcp=pcp)
-    if prompt_tokens < DECODE_DCP_MIN_PROMPT_TOKENS and pcp == 1:
         return (1,)
-    return legal
+    legal = legal_vllm_ascend_dcp_values(model_spec, tp=int(tp), pcp=int(pcp))
+    return legal if legal else (1,)
 
 
 def _build_colocated_candidates(
@@ -1839,13 +2391,8 @@ def _build_colocated_candidates(
                     (pinned["dp"],) if "dp" in pinned
                     else tuple(dict.fromkeys([num_devices // unit, 1]))
                 )
-                raw_dcp = _dcp_choices_for_candidate(
+                dcp_choices = _dcp_choices_for_candidate(
                     model_spec, tp=tp, pcp=pcp, prompt_tokens=prompt_tokens, pinned=pinned,
-                )
-                dcp_choices = (
-                    tuple(reversed(raw_dcp))
-                    if prompt_tokens >= DECODE_DCP_MIN_PROMPT_TOKENS
-                    else raw_dcp
                 )
                 for dp in dp_choices:
                     if dp * unit > num_devices or dp < 1:
@@ -1930,13 +2477,8 @@ def _build_pd_stage_candidates(
                     if dp * tp * pp * pcp > max_dies:
                         continue
                     ep = int(pinned.get("ep", dp * tp * pcp if is_moe else 1))
-                    raw_dcp = _dcp_choices_for_candidate(
+                    dcp_choices = _dcp_choices_for_candidate(
                         model_spec, tp=tp, pcp=pcp, prompt_tokens=prompt_tokens, pinned=pinned,
-                    )
-                    dcp_choices = (
-                        tuple(reversed(raw_dcp))
-                        if prompt_tokens >= DECODE_DCP_MIN_PROMPT_TOKENS
-                        else raw_dcp
                     )
                     for dcp in dcp_choices:
                         add({"dp": dp, "tp": tp, "ep": ep, "pp": pp, "pcp": pcp, "dcp": dcp, **local_pins})
@@ -2029,7 +2571,9 @@ def _evaluate_pd_prefill_candidate(
     parsed = parse_case(raw_case)
     par = parsed.runtime.parallel
     used_dies = par.world_size
-    dcp_ok, dcp_reason = validate_vllm_ascend_dcp_codomain(parsed.model, par)
+    dcp_ok, dcp_reason = validate_vllm_ascend_dcp_codomain(
+        parsed.model, par, runtime=parsed.runtime,
+    )
     if not dcp_ok:
         return _colocated_infeasible_row(
             par, used_dies=used_dies, mtp_tokens=mtp_tokens, reason=dcp_reason,
@@ -2063,7 +2607,7 @@ def _evaluate_pd_prefill_candidate(
             parsed, compute_tokens=prompt_tokens, hit_tokens=0,
             min_layers=ARCHETYPE_FOLD_MIN_LAYERS, rep_info=rep_info, eval_ctx_box=ctx_box,
             apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
-            allow_unbound_formula=allow_unbound_formula, allow_plan_fallback=False,
+            allow_unbound_formula=allow_unbound_formula,
         )
     finally:
         if ctx_box[0] is not None:
@@ -2099,7 +2643,9 @@ def _evaluate_colocated_candidate(
     par = parsed.runtime.parallel
     used_dies = par.world_size
     is_pd_decode = deployment_mode == "pd_decode"
-    dcp_ok, dcp_reason = validate_vllm_ascend_dcp_codomain(parsed.model, par)
+    dcp_ok, dcp_reason = validate_vllm_ascend_dcp_codomain(
+        parsed.model, par, runtime=parsed.runtime,
+    )
     if not dcp_ok:
         return _colocated_infeasible_row(
             par, used_dies=used_dies, mtp_tokens=mtp_tokens, reason=dcp_reason,
@@ -2146,7 +2692,7 @@ def _evaluate_colocated_candidate(
                 parsed, compute_tokens=prompt_tokens, hit_tokens=0,
                 min_layers=ARCHETYPE_FOLD_MIN_LAYERS, rep_info=rep_info, eval_ctx_box=ctx_box_p,
                 apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
-                allow_unbound_formula=allow_unbound_formula, allow_plan_fallback=False,
+                allow_unbound_formula=allow_unbound_formula,
             )
         finally:
             if ctx_box_p[0] is not None:
@@ -2177,41 +2723,28 @@ def _evaluate_colocated_candidate(
     ctx_box: list[EvaluationContext | None] = [None]
     try:
         defer_prefill = is_pd_decode or (math.isinf(ttft_sla_ms) and rewrite_plan is None)
-        p_step, prefill_plan_matched = (0.0, False) if defer_prefill else _eval_prefill_with_plan(
+        p_step, _ = (0.0, False) if defer_prefill else _eval_prefill_with_plan(
             parsed, compute_tokens=prompt_tokens, hit_tokens=0,
             min_layers=ARCHETYPE_FOLD_MIN_LAYERS, rep_info=rep_info, eval_ctx_box=ctx_box,
             apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
-            allow_unbound_formula=allow_unbound_formula, allow_plan_fallback=True,
+            allow_unbound_formula=allow_unbound_formula,
         )
-        try:
-            d_sla = _solve_sla_archetype_aware(
-                parsed, sla_ms=tpot_sla_ms * max(1.0, float(emit_est)),
-                context=prompt_tokens, output_budget=output_tokens,
-                max_sequences_per_dp=max_sequences_per_dp, workspace_tokens=base_ws,
-                rep_info=rep_info, probe_cache=probe_cache, eval_ctx_box=ctx_box,
-                apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
-                allow_unbound_formula=allow_unbound_formula, vram_info=resolved_vram,
-                measure_b1=measure_b1,
-            )
-        except (ModelingError, ValueError) as exc:
-            if not (prefill_plan_matched and _is_plan_phase_mismatch(exc)):
-                raise
-            d_sla = _solve_sla_archetype_aware(
-                parsed, sla_ms=tpot_sla_ms * max(1.0, float(emit_est)),
-                context=prompt_tokens, output_budget=output_tokens,
-                max_sequences_per_dp=max_sequences_per_dp, workspace_tokens=base_ws,
-                rep_info=rep_info, probe_cache=probe_cache, eval_ctx_box=ctx_box,
-                apply_target_envelope=apply_target_envelope, rewrite_plan=None,
-                allow_unbound_formula=allow_unbound_formula, vram_info=resolved_vram,
-                measure_b1=measure_b1,
-            )
+        d_sla = _solve_sla_archetype_aware(
+            parsed, sla_ms=tpot_sla_ms * max(1.0, float(emit_est)),
+            context=prompt_tokens, output_budget=output_tokens,
+            max_sequences_per_dp=max_sequences_per_dp, workspace_tokens=base_ws,
+            rep_info=rep_info, probe_cache=probe_cache, eval_ctx_box=ctx_box,
+            apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
+            allow_unbound_formula=allow_unbound_formula, vram_info=resolved_vram,
+            measure_b1=measure_b1,
+        )
         scen = d_sla["scenarios"][0]
         if (not is_pd_decode) and defer_prefill and int(scen["b_feasible"]) >= 1:
             p_step, _ = _eval_prefill_with_plan(
                 parsed, compute_tokens=prompt_tokens, hit_tokens=0,
                 min_layers=ARCHETYPE_FOLD_MIN_LAYERS, rep_info=rep_info, eval_ctx_box=ctx_box,
                 apply_target_envelope=apply_target_envelope, rewrite_plan=None,
-                allow_unbound_formula=allow_unbound_formula, allow_plan_fallback=True,
+                allow_unbound_formula=allow_unbound_formula,
             )
         ttft_ok = True if is_pd_decode else bool(p_step <= ttft_sla_ms)
     finally:
@@ -2302,250 +2835,6 @@ def _assemble_single_pool_row(
     }
 
 
-def _strip_layer_site_key(op_id: str) -> str:
-    return _OP_LAYER_PREFIX_RE.sub("", str(op_id))
-
-
-def _attribute_full_records_stream0(
-    kept: Sequence[Mapping[str, Any]],
-) -> tuple[list[float], list[str]]:
-    """Run conserved ``ExposedObserver`` Stream 0 attribution over real Engine intervals."""
-    if not kept:
-        return [], []
-    stream_idx: dict[str, int] = {"main": 0}
-    occ_to_id = {rec["occurrence"]: str(idx) for idx, rec in enumerate(kept)}
-    intervals: list[ObservedInterval] = []
-    preds: dict[str, tuple[str, ...]] = {}
-    min_ns: int | None = None
-    max_ns = 0
-    for idx, rec in enumerate(kept):
-        s_ns = max(0, int(round(float(rec["start_us"]) * NS_PER_US)))
-        e_ns = max(s_ns, int(round(float(rec["end_us"]) * NS_PER_US)))
-        min_ns = s_ns if min_ns is None else min(min_ns, s_ns)
-        max_ns = max(max_ns, e_ns)
-        st = str(rec["stream"] or "main")
-        s_i = stream_idx.setdefault(st, len(stream_idx))
-        oid = str(idx)
-        intervals.append(ObservedInterval(
-            occurrence_id=oid, stream=st, stream_index=s_i,
-            start_ns=s_ns, end_ns=e_ns, ordinal=idx, label=str(rec["family"] or rec["op_id"]),
-        ))
-        preds[oid] = tuple(occ_to_id[p] for p in rec.get("predecessors", ()) if p in occ_to_id)
-    start_i = min_ns if min_ns is not None else 0
-    res = attribute_stream0_intervals(intervals, start_ns=start_i, terminal_ns=max_ns, causal_preds=preds)
-    exposed_us = [float(res.exposed_ns_by_op.get(str(i), 0)) / NS_PER_US for i in range(len(kept))]
-    masked = [res.masked_by.get(str(i), "") for i in range(len(kept))]
-    return exposed_us, masked
-
-
-def _aggregate_cohort_target_nodes(
-    nodes: Sequence[TargetOpNode],
-    demands_ns: Sequence[tuple[int, int, int, int, int]],
-) -> tuple[list[TargetOpNode], list[tuple[int, int, int, int, int]]]:
-    """Fold full-depth native occurrences into structural cohort rows with exact unrounded means."""
-    groups: OrderedDict[tuple[str, str], list[int]] = OrderedDict()
-    for idx, node in enumerate(nodes):
-        if node.archetype_id.startswith("target_arch_") or node.archetype_id == "draft_arch_0":
-            key = (node.archetype_id, _strip_layer_site_key(node.op_id))
-        else:
-            key = (node.archetype_id, f"__exact_{idx}")
-        groups.setdefault(key, []).append(idx)
-
-    occ_remap: dict[OpOccurrence, OpOccurrence] = {}
-    out_nodes: list[TargetOpNode] = []
-    out_dems: list[tuple[int, int, int, int, int]] = []
-    for idxs in groups.values():
-        anchor = nodes[idxs[0]]
-        cnt = len(idxs)
-        for i in idxs:
-            occ_remap[nodes[i].occurrence] = anchor.occurrence
-        if cnt == 1:
-            out_nodes.append(anchor)
-            out_dems.append(demands_ns[idxs[0]])
-            continue
-        inv = 1.0 / float(cnt)
-        mean_dur = sum(nodes[i].dur_us for i in idxs) * inv
-        mean_exp = sum(nodes[i].exposed_dur_us for i in idxs) * inv
-        mean_dem = tuple(int(round(sum(demands_ns[i][k] for i in idxs) * inv)) for k in range(DEMAND_CHANNELS))
-        l_star = float(max(mean_dem)) / NS_PER_US
-        eff = min(1.0, l_star / mean_dur) if (mean_dur > 0.0 and l_star > 0.0) else None
-        out_dems.append(mean_dem)  # type: ignore[arg-type]
-        out_nodes.append(replace(
-            anchor,
-            ordinal=len(out_nodes),
-            repeat_count=cnt,
-            end_us=anchor.start_us + mean_dur,
-            dur_us=mean_dur,
-            exposed_dur_us=mean_exp,
-            is_overlapped=(mean_exp <= OVERLAP_BARRIER_EPS_US and mean_dur > OVERLAP_BARRIER_EPS_US),
-            flops=sum(nodes[i].flops for i in idxs) * inv,
-            vector_ops=sum(nodes[i].vector_ops for i in idxs) * inv,
-            hbm_read_bytes=sum(nodes[i].hbm_read_bytes for i in idxs) * inv,
-            hbm_write_bytes=sum(nodes[i].hbm_write_bytes for i in idxs) * inv,
-            hbm_total_bytes=sum(nodes[i].hbm_total_bytes for i in idxs) * inv,
-            mte2_bytes=sum(nodes[i].mte2_bytes for i in idxs) * inv,
-            mte3_bytes=sum(nodes[i].mte3_bytes for i in idxs) * inv,
-            fixpipe_bytes=sum(nodes[i].fixpipe_bytes for i in idxs) * inv,
-            link_bytes=sum(nodes[i].link_bytes for i in idxs) * inv,
-            l_star_lean_us=l_star,
-            gap_us=max(0.0, mean_dur - l_star),
-            gap_ratio=(mean_dur / l_star) if l_star > 0.0 else None,
-            roofline_efficiency=eff,
-        ))
-    valid_occs = {n.occurrence for n in out_nodes}
-    rewired = [
-        replace(
-            n,
-            ordinal=i,
-            predecessors=tuple(dict.fromkeys(
-                mapped for p in n.predecessors
-                if (mapped := occ_remap.get(p, p)) != n.occurrence and mapped in valid_occs
-            )),
-        )
-        for i, n in enumerate(out_nodes)
-    ]
-    return rewired, out_dems
-
-
-def _die_peaks_for_target_stage(case: CaseSpec, stage: int) -> dict[str, Any]:
-    peaks = extract_hardware_peaks(case, stage=stage, replica=0)
-    die = peaks["die"]
-    dpath = datapath_for_die(die)
-    hbm_peak = float(peaks["hbm_peak_bytes_per_s"])
-    return {
-        **peaks,
-        "hbm_read_bytes_per_s": max(float(dpath.hbm_read_bytes_per_s), hbm_peak),
-        "hbm_write_bytes_per_s": max(float(dpath.hbm_write_bytes_per_s), hbm_peak),
-        "hbm_rw_alpha": float(dpath.hbm_rw_alpha),
-    }
-
-
-def _die_cube_peak_rate(die: Any, dtype: str, default_dtype: str = "bf16") -> float:
-    for cand in (dtype, default_dtype, "bf16", "fp16"):
-        if not cand:
-            continue
-        try:
-            return float(die.peak(str(cand).strip().lower()))
-        except ModelingError:
-            continue
-    return 0.0
-
-
-def _demand_ns_floor(work: float, rate: float) -> int:
-    if work <= 0.0 or rate <= 0.0:
-        return 0
-    return inward_floor_ns(Fraction(work) * NS_PER_SECOND / Fraction(rate))
-
-
-def _target_op_work_and_demands(
-    spec: Any,
-    *,
-    dur_us: float,
-    shape: tuple[int, ...],
-    dtype: str,
-    family: str,
-    peaks: Mapping[str, Any],
-) -> tuple[tuple[int, int, int, int, int], float, float, float, float, float, float, float, float, float]:
-    meta = dict(spec.metadata) if (spec is not None and spec.metadata) else {}
-    flops = float((spec.flops if spec is not None else 0.0) or 0.0)
-    vec_ops = float((spec.vector_ops if spec is not None else 0.0) or 0.0)
-    link_bytes = float((spec.link_bytes if spec is not None else 0.0) or 0.0)
-    hbm_tot = float((spec.hbm_bytes if spec is not None else 0.0) or 0.0)
-    mte2 = float((spec.mte2_bytes if spec is not None else 0.0) or 0.0)
-    mte3 = float((spec.mte3_bytes if spec is not None else 0.0) or 0.0)
-    fixpipe = float(meta.get("fixpipe_bytes", 0.0) or 0.0)
-    raw_write = mte3 + fixpipe
-    copy_total = mte2 + raw_write
-    if copy_total > 0.0 and hbm_tot > 0.0:
-        scale = hbm_tot / copy_total
-        hbm_r, hbm_w = mte2 * scale, raw_write * scale
-    elif "read_bytes" in meta:
-        hbm_r = float(meta["read_bytes"] or 0.0)
-        hbm_w = max(0.0, hbm_tot - hbm_r)
-    elif copy_total > 0.0:
-        hbm_r, hbm_w = mte2, raw_write
-    else:
-        hbm_r, hbm_w = hbm_tot, 0.0
-    if flops == 0.0 and vec_ops == 0.0 and hbm_tot == 0.0 and link_bytes == 0.0:
-        if dur_us > 0.0 and shape and family.lower() != "barrier":
-            try:
-                elem_b = float(dtype_bytes(str(dtype or "bf16").lower()))
-            except ModelingError:
-                elem_b = DEFAULT_ELEM_BYTES
-            elems = 1
-            for dim in shape:
-                elems *= max(1, int(dim))
-            hbm_r = float(elems) * elem_b
-            hbm_w = hbm_r
-            hbm_tot = hbm_r + hbm_w
-            mte2, mte3 = hbm_r, hbm_w
-    die = peaks["die"]
-    default_dt = str(peaks.get("default_dtype") or "bf16")
-    matrix_flops = (spec.matrix_flops if spec is not None else ()) or ()
-    valid_pairs = [(str(dt), float(fl)) for dt, fl in matrix_flops if float(fl) > 0.0]
-    if valid_pairs:
-        cube_frac = Fraction(0)
-        for dt, mf in valid_pairs:
-            rate = _die_cube_peak_rate(die, dt, default_dt)
-            if rate > 0.0:
-                cube_frac += Fraction(mf) * NS_PER_SECOND / Fraction(rate)
-        cube_ns = inward_floor_ns(cube_frac) if cube_frac > 0 else 0
-    else:
-        cube_ns = _demand_ns_floor(flops, _die_cube_peak_rate(die, dtype, default_dt))
-    alpha = float(peaks.get("hbm_rw_alpha", 0.0) or 0.0)
-    demands = (
-        cube_ns,
-        _demand_ns_floor(vec_ops, float(peaks.get("vector_peak_ops_per_s") or 0.0)),
-        _demand_ns_floor(hbm_r + alpha * hbm_w, float(peaks.get("hbm_read_bytes_per_s") or 0.0)),
-        _demand_ns_floor(hbm_w + alpha * hbm_r, float(peaks.get("hbm_write_bytes_per_s") or 0.0)),
-        _demand_ns_floor(link_bytes, float(peaks.get("link_peak_bytes_per_s") or 0.0)),
-    )
-    return demands, flops, vec_ops, hbm_r, hbm_w, hbm_tot, mte2, mte3, fixpipe, link_bytes
-
-
-def _prepare_target_records(
-    eff_case: CaseSpec,
-    timeline_rows: Sequence[Mapping[str, Any]],
-    spec_by_id: Mapping[str, Any],
-) -> tuple[list[dict[str, Any]], frozenset[OpOccurrence]]:
-    width = max(1, int(eff_case.runtime.parallel.tp) * int(eff_case.runtime.parallel.pcp))
-    raw_recs: list[dict[str, Any]] = []
-    occ_by_node: dict[str, OpOccurrence] = {}
-    for row in timeline_rows:
-        if not isinstance(row, Mapping) or int(row.get("replica", 0) or 0) != 0:
-            continue
-        oid = str(row.get("op_id") or "")
-        spec = spec_by_id.get(oid)
-        stage = int(spec.stage) if spec is not None else int(row.get("stage", 0) or 0)
-        rank_idx = stage * width
-        phys_rank = int(eff_case.machine.dies[rank_idx].rank) if 0 <= rank_idx < len(eff_case.machine.dies) else 0
-        occ = OpOccurrence(replica=0, stage=stage, rank=phys_rank, op_id=oid)
-        occ_by_node[f"r0:{oid}"] = occ
-        if row.get("id"):
-            occ_by_node[str(row["id"])] = occ
-        start_us = max(0.0, float(row.get("start_ms", row.get("ready_ms", 0.0)) or 0.0) * US_PER_MS)
-        end_ms = row.get("complete_ms", row.get("end_ms"))
-        dur_ms = float(row.get("duration_ms", 0.0) or 0.0)
-        end_us = max(start_us, float(end_ms) * US_PER_MS) if end_ms is not None else (start_us + max(0.0, dur_ms) * US_PER_MS)
-        raw_recs.append({
-            "occurrence": occ, "op_id": oid, "spec": spec, "row_layer": row.get("layer"),
-            "family": str(spec.family if spec is not None else row.get("family", "")),
-            "recipe": str(spec.recipe if spec is not None else row.get("recipe", "")),
-            "stream": str((spec.stream if spec is not None else "") or row.get("stream", "") or "main"),
-            "shape": tuple(spec.local_shape) if spec is not None else tuple(row.get("shape", ())),
-            "dtype": str((spec.dtype if spec is not None else "") or row.get("dtype", "") or eff_case.model.compute_dtype or "bf16"),
-            "raw_preds": tuple(row.get("predecessors") or ()),
-            "start_us": start_us, "end_us": end_us,
-        })
-    for rec in raw_recs:
-        rec["predecessors"] = tuple(occ_by_node[p_id] for p_id in rec.pop("raw_preds", ()) if p_id in occ_by_node)
-    tail_closure = compute_acceptance_tail_closure(raw_recs)
-    kept = resolve_barrier_predecessors(
-        raw_recs, protected_occurrences=tail_closure, barrier_eps_us=OVERLAP_BARRIER_EPS_US,
-    )
-    return kept, tail_closure
-
-
 _REWRITE_PLAN_ERROR_TOKENS = (
     "REWRITE_PLAN_",
     "rewrite_fusion_recipe_unbound",
@@ -2556,22 +2845,10 @@ _REWRITE_PLAN_ERROR_TOKENS = (
 )
 
 
-_PLAN_PHASE_MISMATCH_TOKENS = (
-    "rewrite_digest_mismatch:",
-    "rewrite_unresolved_op",
-)
-
-
 def _is_rewrite_plan_error(exc: Exception) -> bool:
     """Return True when ``exc`` signals an explicit rewrite-plan or strict-binding failure."""
     msg = str(exc)
     return any(tok in msg for tok in _REWRITE_PLAN_ERROR_TOKENS)
-
-
-def _is_plan_phase_mismatch(exc: Exception) -> bool:
-    """Return True when ``exc`` indicates a rewrite plan does not belong to the tested phase/graph."""
-    msg = str(exc)
-    return any(tok in msg for tok in _PLAN_PHASE_MISMATCH_TOKENS)
 
 
 def _is_draft_op(spec: Any, row: Mapping[str, Any] | None = None) -> bool:
@@ -2590,6 +2867,13 @@ def _is_draft_op(spec: Any, row: Mapping[str, Any] | None = None) -> bool:
     return False
 
 
+def _load_canonical_rewrite_plan(rewrite_plan: Any) -> Any:
+    """Load and validate a canonical ``RewritePlan`` via ``rewrite.schema.load_rewrite_plan``."""
+    if rewrite_plan is None:
+        return None
+    return load_rewrite_plan(rewrite_plan)
+
+
 def _solve_target_step_ms(
     eff_case: CaseSpec,
     timeline_rows: Sequence[Mapping[str, Any]],
@@ -2604,112 +2888,33 @@ def _solve_target_step_ms(
     step_request: Any = None,
     scenario_case: CaseSpec | None = None,
 ) -> float:
-    """Evaluate rewritten target graph on the same Engine + PrimitiveTable and return exposed ms."""
-    kept, tail_closure = _prepare_target_records(eff_case, timeline_rows, spec_by_id)
-    if not kept:
-        return 0.0
-    plan = cohort_plan if cohort_plan is not None else discover_layer_cohorts(eff_case)
-    exposed_us_list, masked_list = _attribute_full_records_stream0(kept)
-    peaks_by_stage: dict[int, dict[str, Any]] = {}
-    demand_memo: dict[tuple[Any, ...], tuple[Any, ...]] = {}
-    stream_indices: dict[str, int] = {"main": 0}
-    nodes: list[TargetOpNode] = []
-    demands_ns: list[tuple[int, int, int, int, int]] = []
-    for idx, rec in enumerate(kept):
-        occ: OpOccurrence = rec["occurrence"]
-        spec = rec["spec"]
-        if occ.stage not in peaks_by_stage:
-            peaks_by_stage[occ.stage] = _die_peaks_for_target_stage(eff_case, occ.stage)
-        peaks = peaks_by_stage[occ.stage]
-        oid = rec["op_id"]
-        is_draft = _is_draft_op(spec, rec)
-        lyr = spec.layer if (spec is not None and spec.layer is not None) else rec["row_layer"]
-        if occ in tail_closure or oid.startswith("final."):
-            arch_id = "target_tail"
-        elif is_draft:
-            arch_id = "draft_arch_0" if (lyr is not None and int(lyr) >= 0) else "draft_misc"
-        elif lyr is not None and int(lyr) >= 0:
-            c_idx = plan.cohort_by_layer.get(int(lyr), int(lyr))
-            arch_id = f"target_arch_{c_idx}"
-        else:
-            arch_id = "target_embed" if str(rec["family"]).lower() == "embedding" else "target_tail"
-        dur_us = max(0.0, float(rec["end_us"]) - float(rec["start_us"]))
-        exp_us = min(dur_us, max(0.0, float(exposed_us_list[idx])))
-        if spec is not None:
-            meta_dict = dict(spec.metadata) if spec.metadata else {}
-            dem_key: tuple[Any, ...] = (
-                occ.stage, spec.flops, spec.vector_ops, spec.hbm_bytes, spec.mte2_bytes,
-                spec.mte3_bytes, spec.link_bytes, spec.matrix_flops,
-                meta_dict.get("fixpipe_bytes"), meta_dict.get("read_bytes"),
-                rec["shape"], rec["dtype"], rec["family"], dur_us > 0.0,
-            )
-            cached_dem = demand_memo.get(dem_key)
-            if cached_dem is None:
-                cached_dem = _target_op_work_and_demands(
-                    spec, dur_us=dur_us, shape=rec["shape"], dtype=rec["dtype"], family=rec["family"], peaks=peaks,
-                )
-                demand_memo[dem_key] = cached_dem
-            dem, flops, vec_ops, hbm_r, hbm_w, hbm_tot, mte2, mte3, fixpipe, link_b = cached_dem
-        else:
-            dem, flops, vec_ops, hbm_r, hbm_w, hbm_tot, mte2, mte3, fixpipe, link_b = _target_op_work_and_demands(
-                spec, dur_us=dur_us, shape=rec["shape"], dtype=rec["dtype"], family=rec["family"], peaks=peaks,
-            )
-        l_star_us = float(max(dem)) / NS_PER_US
-        dom = (
-            "link_bound" if (link_b > 0.0 and float(dem[4]) / NS_PER_US >= l_star_us)
-            else "launch_bound" if (l_star_us <= 0.0 or (dur_us <= LAUNCH_SHORT_US and l_star_us < dur_us * LAUNCH_WORK_SHARE))
-            else "cube_bound" if float(dem[0]) / NS_PER_US >= l_star_us
-            else "vector_bound" if float(dem[1]) / NS_PER_US >= l_star_us
-            else "memory_bound"
-        )
-        fam_l = rec["family"].lower()
-        task_type = (
-            "HOST" if fam_l in {"engram_rh2d", "h2d", "offload"}
-            else "HCCL" if link_b > 0.0
-            else "AI_CORE" if flops > 0.0
-            else "AI_VECTOR_CORE"
-        )
-        s_idx = stream_indices.setdefault(rec["stream"], len(stream_indices))
-        eff = min(1.0, l_star_us / dur_us) if (dur_us > 0.0 and l_star_us > 0.0) else None
-        demands_ns.append(dem)
-        nodes.append(TargetOpNode(
-            ordinal=len(nodes), occurrence=occ, op_id=oid, archetype_id=arch_id,
-            repeat_count=1, family=rec["family"], recipe=rec["recipe"],
-            stream=rec["stream"], stream_index=s_idx, task_type=task_type,
-            shape=rec["shape"], dtype=rec["dtype"], predecessors=rec["predecessors"],
-            start_us=float(rec["start_us"]), end_us=float(rec["end_us"]),
-            dur_us=dur_us, exposed_dur_us=exp_us,
-            is_overlapped=(exp_us <= OVERLAP_BARRIER_EPS_US and dur_us > OVERLAP_BARRIER_EPS_US),
-            masked_by=masked_list[idx],
-            flops=flops, vector_ops=vec_ops,
-            hbm_read_bytes=hbm_r, hbm_write_bytes=hbm_w, hbm_total_bytes=hbm_tot,
-            mte2_bytes=mte2, mte3_bytes=mte3, fixpipe_bytes=fixpipe, link_bytes=link_b,
-            dominant_bound=dom, bound_display=dom, l_star_lean_us=l_star_us,
-            gap_us=max(0.0, dur_us - l_star_us),
-            gap_ratio=(dur_us / l_star_us) if l_star_us > 0.0 else None,
-            roofline_efficiency=eff, absorbed_source_ops=(), semantic_atoms=(),
-            logical_role=rec["family"], ascend_kernel=rec["recipe"] or rec["family"],
-            kernel_backend="", kernel_status="", needs_new_kernel=False,
-            new_kernel_spec="", canonical_op_key=oid, spec=spec,
-        ))
-    has_explicit_plan = ext_plan is not None and (
-        bool(getattr(ext_plan, "edits", ()))
-        or bool(getattr(ext_plan, "base_graph_sha256", ""))
-        or bool(getattr(ext_plan, "framing_sha256", ""))
+    """Route target step pricing directly through canonical ``optimization.ladder.solve_target_step_receipt``."""
+    del timeline_rows, spec_by_id, cohort_plan, n_tok_per_die
+    from mindie_sim.prediction.results import StepRequest
+
+    req = (
+        step_request if isinstance(step_request, StepRequest)
+        else StepRequest(phase=phase, tokens=1, context=0, sequences=1, scope="model")
     )
-    if not has_explicit_plan:
-        nodes, demands_ns = _aggregate_cohort_target_nodes(nodes, demands_ns)
-    solved = solve_target_graph(
-        nodes, demands_ns, eff_case, peaks_by_stage,
-        phase=phase, rewrite_plan=ext_plan,
-        n_tok_per_die=max(float(n_tok_per_die), PARETO_EPS),
+    target_case = scenario_case if scenario_case is not None else eff_case
+    policy = "exploratory_counterfactual" if ext_plan is not None else "monotonic_optimization"
+    receipt = solve_target_step_receipt(
+        target_case,
+        req,
         primitive_table=primitive_table,
-        allow_unbound_formula=allow_unbound_formula,
-        step_request=step_request,
-        scenario_case=scenario_case,
-        compute_waterfall_and_codesign=False,
+        stack_track="target",
+        comparison_policy=policy,
+        rewrite_plan=ext_plan,
+        max_trials=_SWEEP_TARGET_LADDER_TRIALS,
+        allow_unbound_formula=bool(allow_unbound_formula),
     )
-    return sum(n.exposed_dur_us * max(1, int(n.repeat_count)) for n in solved.nodes) / US_PER_MS
+    stage3 = receipt.stage_for("stage3_target_after")
+    if stage3 is not None and stage3.status == "committed":
+        return float(stage3.span_ns) / NS_PER_MS
+    stage2 = receipt.stage_for("stage2_framework")
+    if stage2 is not None and stage2.status == "committed":
+        return float(stage2.span_ns) / NS_PER_MS
+    return float(receipt.stages[0].span_ns) / NS_PER_MS
 
 
 def _archetype_weighted_step_ms(
@@ -2731,65 +2936,81 @@ def _archetype_weighted_step_ms(
     skip_target_if_baseline_le_ms: float | None = None,
     reclaim_on_exit: bool = True,
     exact_flag_out: list[bool] | None = None,
+    layer_finish_ms_out: dict[int, float] | None = None,
 ) -> float:
     """Exact native ``0..L-1 + final`` Engine replay with unified ``PrimitiveTable`` binding."""
-    del min_layers
+    del min_layers, skip_target_if_baseline_le_ms
     cohort_plan = rep_info if isinstance(rep_info, LayerCohortPlan) else discover_layer_cohorts(parsed)
     use_target = bool(apply_target_envelope or rewrite_plan is not None)
-    ext_plan = load_rewrite_plan(rewrite_plan) if (use_target and rewrite_plan is not None) else None
-    graphs, eff_case, _ = _lower_and_run_graph(
-        parsed, phase=phase, tokens=tokens, context=context,
-        sequences=sequences, scope=scope, run_graph=False,
-    )
-    need_timeline = bool(use_target)
+    ext_plan = _load_canonical_rewrite_plan(rewrite_plan) if (use_target and rewrite_plan is not None) else None
+    if not use_target:
+        graphs, eff_case, _ = _lower_and_run_graph(
+            parsed, phase=phase, tokens=tokens, context=context,
+            sequences=sequences, scope=scope, run_graph=False,
+        )
+        if evaluation_context is not None:
+            eval_ctx = evaluation_context
+            owns_ctx = False
+        elif eval_ctx_box is not None:
+            if eval_ctx_box[0] is None:
+                eval_ctx_box[0] = EvaluationContext.create(eff_case)
+            eval_ctx = eval_ctx_box[0]
+            owns_ctx = False
+        else:
+            eval_ctx = EvaluationContext.create(eff_case)
+            owns_ctx = True
+        ext_in = {"analysis_input": 0} if scope == "body" else None
+        has_kg = any("device_kernel_group" in dict(op.metadata) for op in graphs[0])
+        sg = (
+            TargetGraphSet({0: graphs[0]}, kernels=graphs.effective_kernels, selection=graphs.default_selection)
+            if isinstance(graphs, TargetGraphSet) else {0: graphs[0]}
+        ) if rank_zero_graph_reuse(eff_case.runtime.parallel, len(graphs), has_kg) else graphs
+        want_layers = layer_finish_ms_out is not None
+        try:
+            graph, _, _ = execute_native_cohort_graph(
+                eff_case, sg, cohort_plan=cohort_plan,
+                external_inputs=ext_in, isolated=False,
+                evaluation=eval_ctx, fast_span_only=(not want_layers),
+                timeline_replicas=((0,) if want_layers else None),
+            )
+            baseline_ms = float(graph["duration_ms"])
+            if want_layers:
+                for row in graph.get("timeline", ()) or ():
+                    lid = row.get("layer") if isinstance(row, Mapping) else None
+                    if isinstance(lid, int) and lid >= 0:
+                        comp = float(row.get("complete_ms", 0.0) or 0.0)
+                        prev = layer_finish_ms_out.get(lid, 0.0)
+                        if comp > prev:
+                            layer_finish_ms_out[lid] = comp
+        finally:
+            del graphs, sg
+            if owns_ctx:
+                del eval_ctx
+                if reclaim_on_exit and (len(parsed.machine.dies) >= GC_RECLAIM_MIN_WORLD_SIZE or int(parsed.runtime.parallel.dp) > 1):
+                    _reclaim_sweep_memory()
+        if exact_flag_out is not None:
+            exact_flag_out.append(True)
+        return baseline_ms
+
+    # Target mode delegates directly to canonical solve_target_step_receipt on ONE shared PrimitiveTable.
     if evaluation_context is not None:
         eval_ctx = evaluation_context
         owns_ctx = False
     elif eval_ctx_box is not None:
         if eval_ctx_box[0] is None:
-            eval_ctx_box[0] = EvaluationContext.create(eff_case)
+            eval_ctx_box[0] = EvaluationContext.create(parsed)
         eval_ctx = eval_ctx_box[0]
         owns_ctx = False
     else:
-        eval_ctx = EvaluationContext.create(eff_case)
+        eval_ctx = EvaluationContext.create(parsed)
         owns_ctx = True
-    ext_in = {"analysis_input": 0} if scope == "body" else None
-    has_kg = any("device_kernel_group" in dict(op.metadata) for op in graphs[0])
-    sg = (
-        TargetGraphSet({0: graphs[0]}, kernels=graphs.effective_kernels, selection=graphs.default_selection)
-        if isinstance(graphs, TargetGraphSet) else {0: graphs[0]}
-    ) if rank_zero_graph_reuse(eff_case.runtime.parallel, len(graphs), has_kg) else graphs
-    spec_by_id = {op.op_id: op for op in graphs[0]} if need_timeline else {}
-    # Unify Before and After on the EXACT SAME PrimitiveTable (zero conditional None split).
     rebound_pt = eval_ctx.bindings.primitive_table
-    timeline_rows: tuple[Mapping[str, Any], ...] = ()
-    try:
-        graph, _, _ = execute_native_cohort_graph(
-            eff_case, sg, cohort_plan=cohort_plan,
-            external_inputs=ext_in, isolated=False,
-            evaluation=eval_ctx, fast_span_only=(not need_timeline),
-            timeline_replicas=(0,) if need_timeline else None,
-        )
-        baseline_ms = float(graph["duration_ms"])
-        timeline_rows = tuple(graph.get("timeline", ()) or ()) if need_timeline else ()
-    finally:
-        del graphs, sg
-        if owns_ctx:
-            del eval_ctx
-            if reclaim_on_exit and (len(parsed.machine.dies) >= GC_RECLAIM_MIN_WORLD_SIZE or int(parsed.runtime.parallel.dp) > 1):
-                _reclaim_sweep_memory()
-    if not use_target:
-        if exact_flag_out is not None:
-            exact_flag_out.append(True)
-        return baseline_ms
-    if ext_plan is None and skip_target_if_baseline_le_ms is not None and baseline_ms <= skip_target_if_baseline_le_ms:
-        if exact_flag_out is not None:
-            exact_flag_out.append(False)
-        return baseline_ms
+    if owns_ctx:
+        del eval_ctx
     from mindie_sim.prediction.results import StepRequest
 
     target_ms = _solve_target_step_ms(
-        eff_case, timeline_rows, spec_by_id,
+        parsed, (), {},
         phase=phase, cohort_plan=cohort_plan,
         n_tok_per_die=n_tok_per_die, ext_plan=ext_plan,
         primitive_table=rebound_pt, allow_unbound_formula=allow_unbound_formula,
@@ -2830,69 +3051,20 @@ def _fits_vram_batch(
     return fits, mem
 
 
-def _fits_vram_batch_fast(
-    base_mem: Memory,
-    *,
-    cand_b: int,
-    base_ws: int,
-    decode_q: int,
-    kv_by_stage: Sequence[float],
-) -> bool:
-    """Bit-identical workspace-delta check reusing ``base_mem`` weights (zero extra Memory init)."""
-    ws = max(int(base_ws), max(1, int(cand_b)) * max(1, int(decode_q)))
-    pp = int(base_mem.case.runtime.parallel.pp)
-    raw_ws = base_mem._workspace(ws) if base_mem.policy.derive_workspace else [0.0] * pp
-    async_ws = (
-        base_mem._async_inflight_workspace(ws)
-        if (base_mem.policy.derive_workspace and base_mem.async_workspace_buffer_multiplier > 0)
-        else [0.0] * pp
-    )
-    total_ws = [
-        b * base_mem.concurrent_workspace_copies + a + s + o
-        for b, a, s, o in zip(
-            raw_ws, async_ws, base_mem.workspace_expert_staging, base_mem.workspace_static_offload,
-        )
-    ]
-    deltas = [new_w - old_w for new_w, old_w in zip(total_ws, base_mem.workspace)]
-    if cand_b <= 0:
-        return all(
-            (float(cap) - delta) >= 0.0
-            for row in base_mem.capacity
-            for cap, delta in zip(row, deltas)
-        )
-    return all(
-        (float(cap) - delta) >= 0.0 and (float(cap) - delta) >= float(cand_b) * float(kv)
-        for row in base_mem.capacity
-        for cap, delta, kv in zip(row, deltas, kv_by_stage)
-    )
-
-
 def _vram_solve_cache_key(
     parsed: CaseSpec, *, base_ws: int, decode_q: int, seq_len: int, cap_bound: int | None,
-) -> tuple[Any, ...] | None:
-    """Lossless physical capacity fingerprint for ``_solve_b_vram_max`` memoization."""
+) -> str | None:
+    """Lossless SHA-256 fingerprint over full immutable CaseSpec + capacity query inputs."""
     try:
-        model = parsed.model
-        rt = parsed.runtime
-        mach = parsed.machine
-        return (
-            model.name, int(model.layers),
-            int(getattr(model, "hidden", 0) or 0),
-            int(getattr(model, "vocab_size", 0) or 0),
-            str(getattr(model, "kv_dtype", "")), repr(model.quant),
-            repr(model.auxiliary), repr(model.engram),
-            tuple(repr(lp) for lp in model.layer_plans),
-            mach.sku, int(mach.ranks_per_node),
-            tuple((float(d.memory_bytes), float(getattr(d, "l2_bytes", 0.0) or 0.0)) for d in mach.dies),
-            rt.parallel, rt.pp_layer_partition, int(rt.kv_block_size),
-            float(rt.gpu_memory_utilization), bool(rt.recover_ssm),
-            bool(rt.engram_cpu_offload), repr(rt.dspark),
-            int(rt.max_num_seqs),
-            json.dumps(rt.memory, sort_keys=True, default=repr),
-            repr(rt.metadata),
-            int(base_ws), int(decode_q), int(seq_len),
-            None if cap_bound is None else int(cap_bound),
-        )
+        payload = {
+            "case": parsed.to_dict(),
+            "base_ws": int(base_ws),
+            "decode_q": int(decode_q),
+            "seq_len": int(seq_len),
+            "cap_bound": None if cap_bound is None else int(cap_bound),
+        }
+        blob = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=repr).encode("utf-8")
+        return hashlib.sha256(blob).hexdigest()
     except (TypeError, ValueError):
         return None
 
@@ -2905,7 +3077,7 @@ def _solve_b_vram_max(
     seq_len: int,
     cap_bound: int | None = None,
 ) -> tuple[Memory, tuple[float, ...], int]:
-    """Binary-search physical HBM concurrency evaluating ``workspace_tokens(b)`` per candidate."""
+    """Solve physical HBM concurrency via canonical ``Memory`` admission (zero private surgery)."""
     cache_key = _vram_solve_cache_key(
         parsed, base_ws=base_ws, decode_q=decode_q, seq_len=seq_len, cap_bound=cap_bound,
     )
@@ -2917,10 +3089,11 @@ def _solve_b_vram_max(
             if cached_b > 0 else max(1, int(base_ws))
         )
         return Memory(parsed, workspace_tokens=final_ws), cached_kv, int(cached_b)
+
     base_mem = Memory(parsed, workspace_tokens=max(1, int(base_ws)))
     d_kv = tuple(float(v) for v in base_mem.dp_cohort_cache_bytes(seq_len, padded=True))
 
-    def _store_and_return(mem_obj: Memory, b_val: int) -> tuple[Memory, tuple[float, ...], int]:
+    def _store(mem_obj: Memory, b_val: int) -> tuple[Memory, tuple[float, ...], int]:
         if cache_key is not None:
             _VRAM_SOLVE_CACHE[cache_key] = (d_kv, int(b_val))
             while len(_VRAM_SOLVE_CACHE) > _VRAM_SOLVE_CACHE_MAX:
@@ -2928,7 +3101,7 @@ def _solve_b_vram_max(
         return mem_obj, d_kv, int(b_val)
 
     if not all(float(cap) >= 0.0 for row in base_mem.capacity for cap in row):
-        return _store_and_return(base_mem, 0)
+        return _store(base_mem, 0)
     upper: int | None = max(0, int(cap_bound)) if cap_bound is not None else None
     for row in base_mem.capacity:
         for cap, kv in zip(row, d_kv):
@@ -2938,46 +3111,27 @@ def _solve_b_vram_max(
     if upper is None:
         upper = max(0, int(parsed.runtime.max_num_seqs))
     if upper <= 0:
-        return _store_and_return(base_mem, 0)
+        return _store(base_mem, 0)
     if int(upper * max(1, int(decode_q))) <= int(base_ws):
-        return _store_and_return(base_mem, upper)
-    can_fast = bool(
-        hasattr(base_mem, "_workspace")
-        and hasattr(base_mem, "workspace")
-        and hasattr(base_mem, "offload")
-        and float(base_mem.offload.get("expert_ddr_ratio", 0.0) or 0.0) <= 0.0
-    )
-    if can_fast:
-        if _fits_vram_batch_fast(base_mem, cand_b=upper, base_ws=base_ws, decode_q=decode_q, kv_by_stage=d_kv):
-            final_ws = max(int(base_ws), upper * max(1, int(decode_q)))
-            return _store_and_return(Memory(parsed, workspace_tokens=final_ws), upper)
-        lo, hi = 0, upper
-        while lo + 1 < hi:
-            mid = (lo + hi) // 2
-            if _fits_vram_batch_fast(base_mem, cand_b=mid, base_ws=base_ws, decode_q=decode_q, kv_by_stage=d_kv):
-                lo = mid
-            else:
-                hi = mid
-        final_ws = max(int(base_ws), max(1, lo) * max(1, int(decode_q)))
-        mem_out = base_mem if final_ws <= int(base_ws) else Memory(parsed, workspace_tokens=final_ws)
-        return _store_and_return(mem_out, lo)
-    hi_fits, hi_mem = _fits_vram_batch(
+        return _store(base_mem, upper)
+    ok_top, mem_top = _fits_vram_batch(
         parsed, cand_b=upper, base_ws=base_ws, decode_q=decode_q, kv_by_stage=d_kv,
     )
-    if hi_fits:
-        return _store_and_return(hi_mem, upper)
+    if ok_top:
+        return _store(mem_top, upper)
     lo, hi = 0, upper
     best_mem = base_mem
     while lo + 1 < hi:
         mid = (lo + hi) // 2
-        ok, mid_mem = _fits_vram_batch(
+        ok_mid, mem_mid = _fits_vram_batch(
             parsed, cand_b=mid, base_ws=base_ws, decode_q=decode_q, kv_by_stage=d_kv,
         )
-        if ok:
-            lo, best_mem = mid, mid_mem
+        if ok_mid:
+            lo = mid
+            best_mem = mem_mid
         else:
             hi = mid
-    return _store_and_return(best_mem, lo)
+    return _store(best_mem, lo)
 
 
 def _headroom_gib_at_batch(
@@ -3009,41 +3163,48 @@ def _prefill_step_ms(
     apply_target_envelope: bool = False,
     rewrite_plan: Any = None,
     allow_unbound_formula: bool = True,
+    layer_finish_ms_out: dict[int, float] | None = None,
 ) -> float:
-    """Compute prefill latency via direct step or chunked-prefill midpoint quadrature."""
-    if compute_tokens <= 0:
+    """Compute exact prefill latency via full-step or exact chunked-prefill stepping."""
+    comp = int(compute_tokens)
+    if comp <= 0:
         return 0.0
-    if not parsed.runtime.enable_chunked_prefill or compute_tokens <= PREFILL_DIRECT_MAX_TOKENS:
+    hit = max(0, int(hit_tokens))
+    chunk_cap = int(parsed.runtime.max_num_batched_tokens or 0)
+    use_chunks = bool(parsed.runtime.enable_chunked_prefill and 0 < chunk_cap < comp)
+    if not use_chunks:
         return _archetype_weighted_step_ms(
-            parsed, phase="prefill", tokens=compute_tokens,
-            context=hit_tokens, sequences=1, min_layers=min_layers,
-            rep_info=rep_info, evaluation_context=evaluation_context,
-            eval_ctx_box=eval_ctx_box, reclaim_on_exit=reclaim_on_exit,
+            parsed, phase="prefill", tokens=comp, context=hit, sequences=1,
+            min_layers=min_layers, rep_info=rep_info,
+            evaluation_context=evaluation_context, eval_ctx_box=eval_ctx_box,
+            reclaim_on_exit=reclaim_on_exit,
             apply_target_envelope=apply_target_envelope,
-            rewrite_plan=rewrite_plan,
-            allow_unbound_formula=allow_unbound_formula,
+            rewrite_plan=rewrite_plan, allow_unbound_formula=allow_unbound_formula,
+            layer_finish_ms_out=layer_finish_ms_out,
         )
-    batched_cap = int(parsed.runtime.max_num_batched_tokens or PREFILL_CHUNK_PROBE_TOKENS)
-    chunk_tok = max(1, min(int(compute_tokens), batched_cap, PREFILL_CHUNK_PROBE_TOKENS))
-    mid_ctx = int(hit_tokens) + max(0, (int(compute_tokens) - chunk_tok) // 2)
-    chunk_ms = _archetype_weighted_step_ms(
-        parsed, phase="prefill", tokens=chunk_tok,
-        context=mid_ctx, sequences=1, min_layers=min_layers,
-        rep_info=rep_info, evaluation_context=evaluation_context,
-        eval_ctx_box=eval_ctx_box, reclaim_on_exit=reclaim_on_exit,
-        apply_target_envelope=apply_target_envelope,
-        rewrite_plan=rewrite_plan,
-        allow_unbound_formula=allow_unbound_formula,
-    )
-    return chunk_ms * (float(compute_tokens) / float(chunk_tok))
-
-
-def _decode_batch_limit(parsed: CaseSpec, q_tok: int, b_vram: int) -> int:
-    """Largest uniform decode batch the scheduler can issue in one step."""
-    budget = int(parsed.runtime.max_num_batched_tokens or 0)
-    if budget <= 0:
-        return int(b_vram)
-    return min(int(b_vram), budget // max(1, int(q_tok)))
+    total_ms = 0.0
+    offset = 0
+    while offset < comp:
+        chunk_n = min(chunk_cap, comp - offset)
+        is_last = (offset + chunk_n) >= comp
+        chunk_clocks: dict[int, float] | None = {} if layer_finish_ms_out is not None else None
+        chunk_ms = _archetype_weighted_step_ms(
+            parsed, phase="prefill", tokens=chunk_n, context=hit + offset, sequences=1,
+            min_layers=min_layers, rep_info=rep_info,
+            evaluation_context=evaluation_context, eval_ctx_box=eval_ctx_box,
+            reclaim_on_exit=(reclaim_on_exit and is_last),
+            apply_target_envelope=apply_target_envelope,
+            rewrite_plan=rewrite_plan, allow_unbound_formula=allow_unbound_formula,
+            layer_finish_ms_out=chunk_clocks,
+        )
+        if layer_finish_ms_out is not None and chunk_clocks:
+            for lid, c_ms in chunk_clocks.items():
+                shifted = total_ms + c_ms
+                if shifted > layer_finish_ms_out.get(lid, 0.0):
+                    layer_finish_ms_out[lid] = shifted
+        total_ms += chunk_ms
+        offset += chunk_n
+    return float(total_ms)
 
 
 def _tighten_sla_bracket(
@@ -3097,6 +3258,171 @@ def _build_sla_scenario_result(
     }
 
 
+def _decode_batch_capture_boundaries(parsed: CaseSpec, q_tok: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return sorted positive batch-equivalent full and piecewise ACLGraph capture sizes."""
+    q_step = max(1, int(q_tok))
+    raw_full = list(getattr(parsed.runtime, "graph_capture_keys", ()) or ())
+    meta = dict(getattr(parsed.runtime, "metadata", ()) or ())
+    comp_cfg = meta.get("compilation_config")
+    if isinstance(comp_cfg, Mapping):
+        raw_full.extend(comp_cfg.get("cudagraph_capture_sizes") or ())
+    raw_pw = list(getattr(parsed.runtime, "piecewise_capture_keys", ()) or ())
+
+    def _to_bs(items: Sequence[Any]) -> tuple[int, ...]:
+        out: set[int] = set()
+        for raw_cap in items:
+            if isinstance(raw_cap, bool):
+                continue
+            try:
+                cap_tok = int(raw_cap)
+            except (TypeError, ValueError):
+                continue
+            if cap_tok >= q_step:
+                out.add(cap_tok // q_step)
+        return tuple(sorted(out))
+
+    return _to_bs(raw_full), _to_bs(raw_pw)
+
+
+def _padding_bucket(k: int, capture_bs: Sequence[int]) -> int:
+    """Return the padded capture batch size for ``k`` (or ``k`` when uncaptured/unpadded)."""
+    for cap_b in capture_bs:
+        if cap_b >= k:
+            return cap_b
+    return k
+
+
+def _prev_padding_boundary(k: int, lo_bound: int, capture_bs: Sequence[int]) -> int | None:
+    """Return the largest capture key in ``[lo_bound, k)`` when ``k`` is strictly padded."""
+    if not capture_bs or k <= lo_bound:
+        return None
+    if _padding_bucket(k, capture_bs) <= k:
+        return None
+    prev_c: int | None = None
+    for cap_b in capture_bs:
+        if cap_b >= k:
+            break
+        if cap_b >= lo_bound:
+            prev_c = cap_b
+    return prev_c
+
+
+def _decode_batch_regime_intervals(
+    parsed: CaseSpec, limit: int, q_tok: int, *, use_target: bool, has_rewrite_plan: bool = False,
+) -> tuple[tuple[int, int, bool, bool], ...]:
+    """Partition ``1..limit`` by true execution-mode & collective-threshold regime transitions."""
+    del use_target
+    if limit < 1:
+        return ()
+    q_step = max(1, int(q_tok))
+    split_ends: set[int] = {int(limit)}
+    full_bs, pw_bs = _decode_batch_capture_boundaries(parsed, q_step)
+    if full_bs and 1 <= full_bs[-1] < limit:
+        split_ends.add(full_bs[-1])
+    if pw_bs and 1 <= pw_bs[-1] < limit:
+        split_ends.add(pw_bs[-1])
+    meta = dict(getattr(parsed.runtime, "metadata", ()) or ())
+    for thr_key in ("mc2_token_threshold", "dispatch_combine_threshold"):
+        raw_thr = meta.get(thr_key)
+        if raw_thr is not None and not isinstance(raw_thr, bool):
+            try:
+                b_edge = int(raw_thr) // q_step
+            except (TypeError, ValueError):
+                continue
+            if 1 <= b_edge < limit:
+                split_ends.add(b_edge)
+    ordered_ends = sorted(split_ends)
+    mono_cert = not bool(has_rewrite_plan)
+    intervals: list[tuple[int, int, bool, bool]] = []
+    cur_lo = 1
+    for end_b in ordered_ends:
+        if end_b >= cur_lo:
+            intervals.append((cur_lo, end_b, mono_cert, mono_cert))
+            cur_lo = end_b + 1
+    return tuple(intervals)
+
+
+def _has_non_monotone_probe(memo: Mapping[int, float], a: int, b: int) -> bool:
+    """True when any pair of probed batches in ``[a, b]`` violates ``T(x) <= T(y)``."""
+    pts = [(k, float(v)) for k, v in sorted(memo.items()) if a <= k <= b]
+    for (k1, v1), (k2, v2) in zip(pts, pts[1:]):
+        if k1 < k2 and v1 > v2 + PARETO_EPS:
+            return True
+    return False
+
+
+def _select_best_feasible_batch(
+    memo: Mapping[int, float], limit: int, sla_ms: float,
+) -> tuple[int, float | None, int]:
+    """Select exact throughput-optimal feasible batch ``argmax (b / T(b), b)`` and max feasible ``b``."""
+    best_b = 0
+    best_t: float | None = None
+    best_key: tuple[Fraction, int] | None = None
+    max_feas_b = 0
+    for k, raw_t in sorted(memo.items()):
+        if k < 1 or k > limit:
+            continue
+        t_val = float(raw_t)
+        if t_val <= sla_ms + PARETO_EPS and t_val > 0.0:
+            if k > max_feas_b:
+                max_feas_b = k
+            key = (Fraction(k) / Fraction(t_val), k)
+            if best_key is None or key > best_key:
+                best_key = key
+                best_b = k
+                best_t = t_val
+    return best_b, best_t, max_feas_b
+
+
+def _has_throughput_dip(
+    memo: Mapping[int, float],
+    a: int,
+    b: int,
+    sla_ms: float,
+    *,
+    capture_bs: Sequence[int] = (),
+) -> bool:
+    """True when any non-padding-cliff pair of probed feasible batches in ``[a, b]`` drops ``k / T(k)``."""
+    feas = [
+        (k, Fraction(k) / Fraction(float(v)))
+        for k, v in sorted(memo.items())
+        if a <= k <= b and 0.0 < float(v) <= sla_ms + PARETO_EPS
+    ]
+    for (k1, rate1), (k2, rate2) in zip(feas, feas[1:]):
+        if rate2 < rate1:
+            if capture_bs:
+                bkt2 = _padding_bucket(k2, capture_bs)
+                if k2 < bkt2 and bkt2 > _padding_bucket(k1, capture_bs):
+                    continue
+            return True
+    return False
+
+
+def _search_certified_sla_interval(
+    a: int,
+    b: int,
+    *,
+    mono_cert: bool,
+    tps_cert: bool | None = None,
+    sla_ms: float,
+    memo: dict[int, float],
+    probe_fn: Any,
+    capture_bs: Sequence[int] = (),
+) -> None:
+    """Search one regime interval ``[a, b]`` via deterministic ``_interval_next_probes``."""
+    if a > b:
+        return
+    while True:
+        next_bs = _interval_next_probes(
+            a, b, mono_cert, memo, sla_ms, tps_cert=tps_cert, capture_bs=capture_bs,
+        )
+        if not next_bs:
+            return
+        for cand_b in next_bs:
+            if cand_b not in memo:
+                memo[cand_b] = float(probe_fn(cand_b))
+
+
 def _solve_sla_archetype_aware(
     parsed: CaseSpec,
     *,
@@ -3116,137 +3442,69 @@ def _solve_sla_archetype_aware(
     eval_ctx_box: list[EvaluationContext | None] | None = None,
     measure_b1: bool = True,
 ) -> dict[str, Any]:
-    """Exact SLA concurrency solver using O(Archetypes x 1 Rank) steps."""
+    """Dual-certificate non-monotone SLA concurrency solver (exact across regime buckets)."""
     q_tok, emit_est = _resolve_speculative_tokens(
         parsed, output_budget=output_budget, tokens_per_seq=None, emitted_tokens_per_seq=None,
     )
-    base_ws = int(workspace_tokens) if workspace_tokens is not None else max(1, int(q_tok))
-    if vram_info is not None:
-        d_mem, d_kv, b_vram = vram_info
-    else:
-        d_mem, d_kv, b_vram = _solve_b_vram_max(
-            parsed, base_ws=base_ws, decode_q=max(1, int(q_tok)),
-            seq_len=context + output_budget, cap_bound=None,
-        )
+    base_ws = max(1, int(workspace_tokens)) if workspace_tokens is not None else max(1, int(q_tok))
+    d_mem, d_kv, b_vram = vram_info or _solve_b_vram_max(
+        parsed, base_ws=base_ws, decode_q=max(1, int(q_tok)),
+        seq_len=int(context) + int(output_budget), cap_bound=None,
+    )
     limit, cfg_seqs, tok_lim = _resolve_decode_batch_bounds(
         parsed, q_tok=q_tok, b_vram=b_vram, max_sequences_per_dp=max_sequences_per_dp,
     )
-
-    def _result(b_sla: int, b_feas: int, t1_val: float, t_feas: float | None, headroom_b: int) -> dict[str, Any]:
-        return _build_sla_scenario_result(
-            parsed, d_mem, d_kv, emit_est=float(emit_est), b_vram=b_vram, cfg_seqs=cfg_seqs,
-            tok_lim=tok_lim, base_ws=base_ws, decode_q=max(1, int(q_tok)),
-            b_sla=b_sla, b_feas=b_feas, t1_val=t1_val, t_feas=t_feas, headroom_b=headroom_b,
-        )
-
-    # Static-infeasible early abort: NEVER invoke Engine at B=1 when physical or scheduler admission is 0.
     if b_vram < 1 or limit < 1:
-        return _result(0, 0, 0.0, None, 0)
-
-    rep_info = rep_info or discover_layer_cohorts(parsed)
-    memo: dict[int, float] = {}
-    exact_keys: set[int] = set()
-    for raw_k, raw_v in (probe_cache or {}).items():
-        k_int = int(raw_k)
-        v_flt = float(raw_v)
-        if k_int >= 1:
-            memo[k_int] = v_flt
-            exact_keys.add(k_int)
-        elif k_int <= -1 and rewrite_plan is None and v_flt <= sla_ms + PARETO_EPS:
-            memo[-k_int] = v_flt
+        return _build_sla_scenario_result(
+            parsed, d_mem, d_kv, emit_est=emit_est, b_vram=b_vram,
+            cfg_seqs=cfg_seqs, tok_lim=tok_lim, base_ws=base_ws, decode_q=max(1, int(q_tok)),
+            b_sla=0, b_feas=0, t1_val=0.0, t_feas=None, headroom_b=0,
+        )
     par = parsed.runtime.parallel
     per_dp_dies = max(1, int(par.tp) * int(par.pcp) * int(par.pp))
-    owns_box = eval_ctx_box is None
-    ctx_box: list[EvaluationContext | None] = [evaluation_context] if owns_box else eval_ctx_box
+    cohort_plan = rep_info if isinstance(rep_info, LayerCohortPlan) else discover_layer_cohorts(parsed)
+    memo: dict[int, float] = {int(k): float(v) for k, v in (probe_cache or {}).items()}
     use_target = bool(apply_target_envelope or rewrite_plan is not None)
 
-    def eval_b(seq_count: int, *, require_exact: bool = True) -> float:
-        key = max(1, int(seq_count))
-        if key in memo and (not require_exact or key in exact_keys):
+    def _probe(batch_b: int) -> float:
+        key = int(batch_b)
+        if key in memo:
             return memo[key]
-        skip_thresh = (
-            (sla_ms + PARETO_EPS)
-            if (use_target and rewrite_plan is None and not require_exact)
-            else None
-        )
-        exact_box: list[bool] = []
-        t_val = _archetype_weighted_step_ms(
-            parsed, phase="decode", tokens=max(1, int(q_tok)),
-            context=context, sequences=key,
-            rep_info=rep_info, evaluation_context=evaluation_context,
-            apply_target_envelope=apply_target_envelope,
-            rewrite_plan=rewrite_plan,
+        val = float(_archetype_weighted_step_ms(
+            parsed, phase="decode", tokens=max(1, int(q_tok)), context=int(context),
+            sequences=key, rep_info=cohort_plan, evaluation_context=evaluation_context,
+            apply_target_envelope=apply_target_envelope, rewrite_plan=rewrite_plan,
             allow_unbound_formula=allow_unbound_formula,
             n_tok_per_die=(float(key) * float(emit_est)) / float(per_dp_dies),
-            eval_ctx_box=ctx_box,
-            skip_target_if_baseline_le_ms=skip_thresh,
-            exact_flag_out=exact_box,
+            eval_ctx_box=eval_ctx_box, reclaim_on_exit=False,
+        ))
+        memo[key] = val
+        if probe_sink is not None:
+            probe_sink[key] = val
+        return val
+
+    full_bs, _ = _decode_batch_capture_boundaries(parsed, q_tok)
+    intervals = _decode_batch_regime_intervals(
+        parsed, limit, q_tok, use_target=use_target, has_rewrite_plan=(rewrite_plan is not None),
+    )
+    if measure_b1:
+        _probe(1)
+    for a, b, mono_cert, tps_cert in intervals:
+        _search_certified_sla_interval(
+            a, b, mono_cert=mono_cert, tps_cert=tps_cert,
+            sla_ms=float(sla_ms), memo=memo, probe_fn=_probe, capture_bs=full_bs,
         )
-        memo[key] = t_val
-        is_exact = (
-            bool(exact_box and exact_box[-1])
-            or (not use_target)
-            or require_exact
-            or (t_val > sla_ms + PARETO_EPS)
-        )
-        if is_exact:
-            exact_keys.add(key)
-            if probe_sink is not None:
-                probe_sink[key] = t_val
-        return t_val
-
-    try:
-        lo, hi, best_b, best_t = _tighten_sla_bracket(memo, limit, sla_ms)
-        if lo == 0 and not measure_b1 and hi > limit and limit <= GALLOP_SEARCH_DIRECT_LIMIT:
-            t_top = eval_b(limit, require_exact=True)
-            if t_top <= sla_ms + PARETO_EPS:
-                t1 = float(memo.get(1) or (t_top if limit == 1 else 0.0))
-                return _result(limit, limit, t1, t_top, limit)
-            hi = limit
-            if limit == 1:
-                return _result(0, 0, t_top, None, 0)
-        if lo == 0:
-            t1 = eval_b(1, require_exact=False)
-            if t1 > sla_ms + PARETO_EPS:
-                return _result(0, 0, t1, None, 0)
-            lo, best_b, best_t = 1, 1, t1
-        if hi > limit and lo < limit:
-            if limit <= GALLOP_SEARCH_DIRECT_LIMIT:
-                t_top = eval_b(limit, require_exact=True)
-                if t_top <= sla_ms + PARETO_EPS:
-                    t1 = eval_b(1, require_exact=True) if measure_b1 else float(memo.get(1) or (t_top if limit == 1 else 0.0))
-                    return _result(limit, limit, t1, t_top, limit)
-                hi = limit
-            else:
-                probe = max(lo + 1, min(limit, GALLOP_SEARCH_START_BATCH))
-                while probe <= limit:
-                    t_p = eval_b(probe, require_exact=False)
-                    if t_p <= sla_ms + PARETO_EPS:
-                        lo, best_b, best_t = probe, probe, t_p
-                        if probe == limit:
-                            break
-                        probe = min(limit, probe * 2)
-                    else:
-                        hi = probe
-                        break
-        while lo + 1 < hi:
-            mid = (lo + hi) // 2
-            t_mid = eval_b(mid, require_exact=False)
-            if t_mid <= sla_ms + PARETO_EPS:
-                lo, best_b, best_t = mid, mid, t_mid
-            else:
-                hi = mid
-        exact_best_t = eval_b(best_b, require_exact=True)
-        t1 = eval_b(1, require_exact=True) if measure_b1 else float(memo.get(1) or (exact_best_t if best_b == 1 else 0.0))
-        return _result(best_b, best_b, t1, exact_best_t, best_b)
-    finally:
-        if owns_box and evaluation_context is None and ctx_box[0] is not None:
-            ctx_box[0] = None
-            if len(parsed.machine.dies) >= GC_RECLAIM_MIN_WORLD_SIZE or int(par.dp) > 1:
-                _reclaim_sweep_memory()
+    best_b, best_t, max_feas_b = _select_best_feasible_batch(memo, limit, float(sla_ms))
+    t1_val = float(memo.get(1) or (best_t if best_b == 1 and best_t is not None else 0.0))
+    return _build_sla_scenario_result(
+        parsed, d_mem, d_kv, emit_est=emit_est, b_vram=b_vram,
+        cfg_seqs=cfg_seqs, tok_lim=tok_lim, base_ws=base_ws, decode_q=max(1, int(q_tok)),
+        b_sla=max_feas_b, b_feas=best_b, t1_val=t1_val, t_feas=best_t,
+        headroom_b=(best_b if best_b >= 1 else 0),
+    )
 
 
-def _rank_single_pool_row(row: Mapping[str, Any]) -> tuple[float, int, float, float]:
+def _rank_single_pool_row(row: Mapping[str, Any]) -> tuple[Any, ...]:
     """Iso-SLA ranking key for colocated, pd_decode, and pd_disaggregated rows."""
     tpot_val = row.get("effective_tpot_ms")
     return (
@@ -3254,16 +3512,17 @@ def _rank_single_pool_row(row: Mapping[str, Any]) -> tuple[float, int, float, fl
         -int(row["used_dies"]),
         float(row.get("e2e_tps_per_die", row.get("sustainable_tps_per_die", 0.0)) or 0.0),
         -(float(tpot_val) if tpot_val is not None else 0.0),
+        canonical_deployment_row_key(row),
     )
 
 
-def _rank_pd_prefill_row(row: Mapping[str, Any]) -> tuple[float, int, float]:
+def _rank_pd_prefill_row(row: Mapping[str, Any]) -> tuple[Any, ...]:
     """Iso-SLA ranking key for standalone ``pd_prefill`` rows."""
     rps_per_die = float(row.get("prefill_rps_per_die", 0.0) or 0.0)
     if rps_per_die <= 0.0 and row.get("feasible"):
         rps_per_die = float(row.get("sustainable_rps", 0.0) or 0.0) / float(max(1, int(row["used_dies"])))
     ttft_val = float(row.get("ttft_ms", 0.0) or 0.0)
-    return (rps_per_die, -int(row["used_dies"]), -ttft_val)
+    return (rps_per_die, -int(row["used_dies"]), -ttft_val, canonical_deployment_row_key(row))
 
 
 def _static_admit_single_pool_candidate(
@@ -3282,13 +3541,17 @@ def _static_admit_single_pool_candidate(
     """Run static HBM admission and provable throughput ceiling with zero Engine calls."""
     try:
         parsed = parse_case(raw_case)
+    except UnmodeledCapabilityError:
+        raise
     except (ModelingError, ValueError) as exc:
         if rewrite_plan is not None and _is_rewrite_plan_error(exc):
             raise
         return None, None
     par = parsed.runtime.parallel
     used_dies = par.world_size
-    dcp_ok, dcp_reason = validate_vllm_ascend_dcp_codomain(parsed.model, par)
+    dcp_ok, dcp_reason = validate_vllm_ascend_dcp_codomain(
+        parsed.model, par, runtime=parsed.runtime,
+    )
     if not dcp_ok:
         return None, _colocated_infeasible_row(
             par, used_dies=used_dies, mtp_tokens=mtp_n, reason=dcp_reason,
@@ -3334,7 +3597,7 @@ def _static_admit_single_pool_candidate(
             limiting_constraint="static_weights_exceed_hbm",
         )
     if max_sequences_per_dp is None:
-        b_limit = min(b_vram, DEFAULT_DERIVED_MAX_NUM_SEQS_CAP)
+        b_limit = b_vram
     else:
         b_limit, cfg_seqs, _ = _resolve_decode_batch_bounds(
             parsed, q_tok=q_tok, b_vram=b_vram, max_sequences_per_dp=max_sequences_per_dp,
@@ -3388,6 +3651,8 @@ def _static_admit_single_pool_worker(task: tuple[Any, ...]) -> tuple[bool, Any]:
             rewrite_plan=rewrite_plan, allow_unbound_formula=allow_unbound_formula,
         )
         return True, (True, desc, fail_row)
+    except UnmodeledCapabilityError:
+        raise
     except (ModelingError, ValueError) as exc:
         return False, (isinstance(exc, ModelingError), str(exc))
     finally:
@@ -3441,79 +3706,118 @@ def _eval_decode_probe_worker(task: tuple[Any, ...]) -> tuple[bool, Any]:
             or (t_val > sla_ms + PARETO_EPS)
         )
         return True, (cand_idx, int(batch_b), float(t_val), bool(is_exact))
+    except UnmodeledCapabilityError:
+        raise
     except (ModelingError, ValueError) as exc:
         return False, (cand_idx, isinstance(exc, ModelingError), str(exc))
+
+
+def _alignment_probes_inside(a: int, b: int, capture_bs: Sequence[int], memo: Mapping[int, float]) -> list[int]:
+    """Return unprobed alignment/capture batch points strictly inside ``(a, b)``, largest first."""
+    cands = [int(c) for c in capture_bs if a < int(c) < b and int(c) not in memo]
+    if cands:
+        cands.sort(reverse=True)
+        return cands
+    pows: list[int] = []
+    cur = 1
+    while cur < b:
+        if cur > a and cur not in memo:
+            pows.append(cur)
+        cur <<= 1
+    pows.reverse()
+    return pows
+
+
+def _interval_next_probes(
+    a: int,
+    b: int,
+    mono_cert: bool,
+    memo: Mapping[int, float],
+    sla_ms: float,
+    *,
+    tps_cert: bool | None = None,
+    capture_bs: Sequence[int] = (),
+) -> list[int]:
+    """Determine exact unprobed batches still needed inside regime interval ``[a, b]``."""
+    eff_tps_cert = mono_cert if tps_cert is None else bool(tps_cert)
+    if a == b:
+        return [a] if a not in memo else []
+    if b not in memo:
+        if mono_cert and eff_tps_cert:
+            return [b]
+        return [k for k in (a, b) if k not in memo]
+    t_b = float(memo[b])
+    if (
+        mono_cert
+        and eff_tps_cert
+        and t_b <= sla_ms + PARETO_EPS
+        and not _has_non_monotone_probe(memo, a, b)
+    ):
+        c_prev = _prev_padding_boundary(b, a, capture_bs)
+        if c_prev is not None and c_prev not in memo:
+            return [c_prev]
+        if not _has_throughput_dip(memo, a, b, sla_ms, capture_bs=capture_bs):
+            return []
+    if a not in memo:
+        return [a]
+    non_mono = (not mono_cert) or _has_non_monotone_probe(memo, a, b)
+    non_tps = (not eff_tps_cert) or _has_throughput_dip(memo, a, b, sla_ms, capture_bs=capture_bs)
+    if non_mono:
+        return [cand_b for cand_b in range(a + 1, b) if cand_b not in memo]
+    if float(memo[a]) > sla_ms + PARETO_EPS and t_b > sla_ms + PARETO_EPS:
+        # Real NPU kernels (e.g. MLA prolog 8-row cube alignment) can dip below SLA at
+        # interior capture/power-of-two alignments even when both endpoints exceed SLA.
+        align_cands = _alignment_probes_inside(a, b, capture_bs, memo)
+        return [align_cands[0]] if align_cands else []
+    if t_b <= sla_ms + PARETO_EPS:
+        if non_tps:
+            return [cand_b for cand_b in range(a + 1, b) if cand_b not in memo]
+        c_prev = _prev_padding_boundary(b, a, capture_bs)
+        return [c_prev] if (c_prev is not None and c_prev not in memo) else []
+    lo, hi = a, b
+    for k in range(a + 1, b):
+        if k not in memo:
+            continue
+        if float(memo[k]) <= sla_ms + PARETO_EPS:
+            if k > lo:
+                lo = k
+        elif k < hi:
+            hi = k
+    if lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if mid in memo:
+            return [cand_b for cand_b in range(a + 1, b) if cand_b not in memo]
+        return [mid]
+    c_prev = _prev_padding_boundary(lo, a, capture_bs)
+    if c_prev is not None and c_prev not in memo:
+        return [c_prev]
+    if non_tps:
+        return [cand_b for cand_b in range(a + 1, lo) if cand_b not in memo]
+    return []
 
 
 def _pick_parallel_decode_probes(
     st: Mapping[str, Any], budget: int,
 ) -> list[tuple[int, bool]]:
-    """Choose up to ``budget`` deterministic batch probes ``(batch, require_exact)``."""
-    lo, hi, limit = int(st["lo"]), int(st["hi"]), int(st["limit"])
+    """Choose deterministic dual-certificate batch probes independent of worker count."""
+    if st.get("done") or budget < 1:
+        return []
     memo = st["memo"]
-    exact_keys = st["exact_keys"]
-    best_b = int(st["best_b"])
-    if lo >= 1 and lo + 1 >= hi:
-        return [(best_b, True)] if (best_b >= 1 and best_b not in exact_keys) else []
-    if lo == 0 and hi > limit:
-        if limit == 1:
-            return [(1, True)]
-        if budget <= 1:
-            return [(limit, True)] if limit <= GALLOP_SEARCH_DIRECT_LIMIT else [(1, False)]
-        if limit <= GALLOP_SEARCH_DIRECT_LIMIT:
-            pts = [1, limit]
-            interior = max(0, budget - 2)
-            for j in range(1, interior + 1):
-                pts.append(1 + (j * (limit - 1)) // (interior + 1))
-            uniq = sorted(set(b for b in pts if 1 <= b <= limit and b not in memo))
-            cover_all = len(uniq) >= (limit - len(memo))
-            return [(b, (b == limit) or cover_all) for b in uniq[:budget]]
-        pts = [1]
-        probe = min(limit, GALLOP_SEARCH_START_BATCH)
-        while len(pts) < budget and probe <= limit:
-            pts.append(probe)
-            if probe == limit:
-                break
-            probe = min(limit, probe * 2)
-        uniq = sorted(set(b for b in pts if 1 <= b <= limit and b not in memo))
-        return [(b, b == limit) for b in uniq[:budget]]
-    start_b = max(1, lo + 1)
-    end_b = min(limit, hi - 1)
-    untested = [b for b in range(start_b, end_b + 1) if b not in memo]
-    if not untested:
-        return [(best_b, True)] if (best_b >= 1 and best_b not in exact_keys) else []
-    if len(untested) <= budget:
-        need_ex = lo >= 1 or (1 in memo) or (1 in untested)
-        return [(b, need_ex) for b in untested]
-    chosen: list[tuple[int, bool]] = []
-    chosen_set: set[int] = set()
-    if lo == 0 and 1 in untested:
-        chosen.append((1, False))
-        chosen_set.add(1)
-    elif (lo >= 1 and hi <= limit and budget >= _SECANT_CLUSTER_MIN_BUDGET
-            and lo in memo and hi in memo):
-        t_lo = float(memo[lo])
-        t_hi = float(memo[hi])
-        sla_ms = float(st["sla_ms"])
-        if t_hi > t_lo + PARETO_EPS and t_lo <= sla_ms + PARETO_EPS < t_hi:
-            frac = max(0.0, min(1.0, (sla_ms - t_lo) / (t_hi - t_lo)))
-            b_est = max(start_b, min(end_b, lo + int(round(frac * float(hi - lo)))))
-            for cand_b in (b_est - 1, b_est, b_est + 1):
-                if start_b <= cand_b <= end_b and cand_b not in memo and cand_b not in chosen_set:
-                    chosen.append((cand_b, True))
-                    chosen_set.add(cand_b)
-    rem = budget - len(chosen)
-    if rem > 0:
-        pool_pts = [b for b in untested if b not in chosen_set]
-        step_span = len(pool_pts)
-        for j in range(1, rem + 1):
-            pos = min(step_span - 1, max(0, (j * step_span) // (rem + 1)))
-            val = pool_pts[pos]
-            if val not in chosen_set:
-                chosen.append((val, False))
-                chosen_set.add(val)
-    chosen.sort(key=lambda item: item[0])
-    return chosen[:budget]
+    sla_ms = float(st["sla_ms"])
+    intervals = st.get("intervals") or ((1, int(st["limit"]), True, True),)
+    capture_bs = st.get("capture_bs") or ()
+    probes: list[tuple[int, bool]] = []
+    seen: set[int] = set()
+    for a, b, mono_cert, tps_cert in intervals:
+        for cand_b in _interval_next_probes(
+            a, b, mono_cert, memo, sla_ms, tps_cert=tps_cert, capture_bs=capture_bs,
+        ):
+            if cand_b not in seen and cand_b not in memo:
+                seen.add(cand_b)
+                probes.append((int(cand_b), True))
+                if len(probes) >= budget:
+                    return probes
+    return probes
 
 
 def _init_pd_decode_wave_states(
@@ -3523,19 +3827,25 @@ def _init_pd_decode_wave_states(
     output: int,
     tpot: float,
     max_sequences_per_dp: int | None,
+    use_target: bool = False,
+    has_rewrite_plan: bool = False,
 ) -> list[dict[str, Any]]:
     """Initialize per-candidate SLA search states for parallel ``pd_decode`` probing."""
     states: list[dict[str, Any]] = []
     for idx, (desc, eval_case) in enumerate(wave_items):
         try:
             parsed = parse_case(eval_case)
+        except UnmodeledCapabilityError:
+            raise
         except (ModelingError, ValueError) as exc:
             states.append({"done": True, "ok": False, "err": (isinstance(exc, ModelingError), str(exc))})
             continue
         par = parsed.runtime.parallel
         used_dies = par.world_size
         mtp_n = int(desc["mtp_n"])
-        dcp_ok, dcp_reason = validate_vllm_ascend_dcp_codomain(parsed.model, par)
+        dcp_ok, dcp_reason = validate_vllm_ascend_dcp_codomain(
+            parsed.model, par, runtime=parsed.runtime,
+        )
         if not dcp_ok:
             row = _colocated_infeasible_row(
                 par, used_dies=used_dies, mtp_tokens=mtp_n, reason=dcp_reason,
@@ -3572,14 +3882,22 @@ def _init_pd_decode_wave_states(
             )
             states.append({"done": True, "ok": True, "row": row})
             continue
+        case_digest = hashlib.sha256(
+            json.dumps(eval_case, sort_keys=True, separators=(",", ":"), default=repr).encode("utf-8")
+        ).hexdigest()
+        full_bs, _ = _decode_batch_capture_boundaries(parsed, q_tok)
+        intervals = _decode_batch_regime_intervals(
+            parsed, limit, q_tok, use_target=use_target, has_rewrite_plan=has_rewrite_plan,
+        )
         states.append({
-            "idx": idx, "cand_key": f"w_{idx}_{par.dp}_{par.tp}_{par.ep}_{par.pp}_{par.cp}_{par.pcp}_{mtp_n}_{limit}",
+            "idx": idx, "cand_key": case_digest,
             "eval_case": eval_case, "parsed": parsed, "par": par, "used_dies": used_dies,
             "mtp_n": mtp_n, "base_ws": base_ws, "emit_est": float(emit_est),
             "per_dp_dies": max(1, int(par.tp) * int(par.pcp) * int(par.pp)),
             "sla_ms": float(tpot) * max(1.0, float(emit_est)),
             "d_mem": d_mem, "d_kv": d_kv, "b_vram": int(b_vram),
             "limit": int(limit), "cfg_seqs": int(cfg_seqs), "tok_lim": int(tok_lim),
+            "intervals": intervals, "capture_bs": full_bs, "b_sla": 0,
             "lo": 0, "hi": int(limit) + 1, "best_b": 0, "best_t": None,
             "memo": {}, "exact_keys": set(), "done": False, "ok": True, "row": None, "err": None,
         })
@@ -3594,8 +3912,9 @@ def _finalize_pd_decode_state(
         return False, st["err"]
     if st["row"] is not None:
         return True, st["row"]
-    best_b = int(st["best_b"])
-    best_t = st["best_t"]
+    best_b, best_t, max_feas_b = _select_best_feasible_batch(
+        st["memo"], int(st["limit"]), float(st["sla_ms"]),
+    )
     memo = st["memo"]
     t1 = float(memo.get(1) or (best_t if best_b == 1 and best_t is not None else 0.0))
     headroom_b = best_b if best_b >= 1 else 0
@@ -3603,7 +3922,7 @@ def _finalize_pd_decode_state(
         "b_vram_max": st["b_vram"],
         "configured_max_num_seqs": st["cfg_seqs"],
         "token_batch_limit": st["tok_lim"],
-        "b_sla": best_b, "b_feasible": best_b,
+        "b_sla": max_feas_b, "b_feasible": best_b,
         "step_ms_at_b1": t1, "step_ms_feasible": best_t,
         "free_hbm_headroom_gib": _headroom_gib_at_batch(
             st["parsed"], st["d_mem"], st["d_kv"], b_vram=st["b_vram"],
@@ -3635,10 +3954,12 @@ def _eval_pd_decode_wave_parallel(
     allow_unbound_formula: bool,
     num_devices: int,
 ) -> list[tuple[bool, Any]]:
-    """Run synchronized k-ary multi-probe SLA rounds across all granted workers."""
+    """Run synchronized dual-certificate SLA rounds across all granted workers."""
+    use_target = bool(apply_target_envelope or rewrite_plan is not None)
     states = _init_pd_decode_wave_states(
         wave_items, prompt=prompt, output=output, tpot=tpot,
-        max_sequences_per_dp=max_sequences_per_dp,
+        max_sequences_per_dp=max_sequences_per_dp, use_target=use_target,
+        has_rewrite_plan=(rewrite_plan is not None),
     )
     while True:
         active = [st for st in states if not st["done"]]
@@ -3677,11 +3998,11 @@ def _eval_pd_decode_wave_parallel(
         for st in active:
             if st["done"]:
                 continue
-            lo, hi, best_b, best_t = _tighten_sla_bracket(st["memo"], st["limit"], st["sla_ms"])
-            st["lo"], st["hi"], st["best_b"], st["best_t"] = lo, hi, best_b, best_t
-            if lo == 0 and 1 in st["memo"] and st["memo"][1] > st["sla_ms"] + PARETO_EPS:
-                st["best_b"], st["best_t"], st["done"] = 0, None, True
-            elif lo >= 1 and lo + 1 >= hi and best_b in st["exact_keys"]:
+            best_b, best_t, max_feas_b = _select_best_feasible_batch(
+                st["memo"], int(st["limit"]), float(st["sla_ms"]),
+            )
+            st["best_b"], st["best_t"], st["b_sla"] = best_b, best_t, max_feas_b
+            if not _pick_parallel_decode_probes(st, 1):
                 st["done"] = True
     return [_finalize_pd_decode_state(st, output=output, tpot=tpot) for st in states]
 
@@ -3702,6 +4023,8 @@ def _eval_single_pool_worker(task: tuple[Any, ...]) -> tuple[bool, Any]:
             deployment_mode=dep_mode, measure_b1=False,
         )
         return True, row
+    except UnmodeledCapabilityError:
+        raise
     except (ModelingError, ValueError) as exc:
         return False, (isinstance(exc, ModelingError), str(exc))
     finally:
@@ -3722,6 +4045,8 @@ def _eval_pd_prefill_worker(task: tuple[Any, ...]) -> tuple[bool, Any]:
             rewrite_plan=rewrite_plan, allow_unbound_formula=allow_unbound_formula,
         )
         return True, row
+    except UnmodeledCapabilityError:
+        raise
     except (ModelingError, ValueError) as exc:
         return False, (isinstance(exc, ModelingError), str(exc))
     finally:
@@ -3978,6 +4303,8 @@ def _search_pd_prefill_deployments(
             coverage["total_candidates"] += 1
             try:
                 parsed = parse_case(raw_p)
+            except UnmodeledCapabilityError:
+                raise
             except (ModelingError, ValueError) as exc:
                 if rewrite_plan is not None and _is_rewrite_plan_error(exc):
                     raise
@@ -4032,66 +4359,6 @@ def _search_pd_prefill_deployments(
             if best_entry is None or _rank_pd_prefill_row(row) > _rank_pd_prefill_row(best_entry[0]):
                 best_entry = (row, raw_p)
     return rows, ([best_entry] if best_entry is not None else []), coverage
-
-
-def _build_pd_candidate_row(
-    rep: Mapping[str, Any],
-    *,
-    pd_mode: str,
-    mtp_n: int,
-    p_world: int,
-    d_world: int,
-) -> dict[str, Any]:
-    best_ratio = rep.get("best_configuration")
-    d_inst = rep["decode_instance"]
-    d_us = float(d_inst["us_per_tok_die"])
-    e2e_tps = float(best_ratio["sustainable_tps"]) if best_ratio else 0.0
-    e2e_per_die = float(best_ratio["e2e_tps_per_die"]) if best_ratio else 0.0
-    d_tps_per_die = (US_PER_SECOND / d_us) if (best_ratio is not None and d_us > 0.0) else 0.0
-    return {
-        "deployment_mode": "pd_disaggregated",
-        "pd_transfer_mode": pd_mode,
-        "mtp_proposal_tokens": mtp_n,
-        "prefill_parallel": rep["prefill_instance"]["parallel"],
-        "decode_parallel": d_inst["parallel"],
-        "pd_ratio": best_ratio["pd_ratio"] if best_ratio else None,
-        "prefill_instances": int(best_ratio["n_prefill"]) if best_ratio else 1,
-        "decode_instances": int(best_ratio["n_decode"]) if best_ratio else 1,
-        "prefill_used_dies": int(best_ratio["prefill_dies"]) if best_ratio else p_world,
-        "decode_used_dies": int(best_ratio["decode_dies"]) if best_ratio else d_world,
-        "used_dies": int(best_ratio["used_dies"]) if best_ratio else (p_world + d_world),
-        "b_feasible": int(d_inst["b_feasible"]),
-        "b_vram_max": int(d_inst["b_vram_max"]),
-        "configured_max_num_seqs": int(d_inst.get("configured_max_num_seqs", d_inst["b_vram_max"])),
-        "ttft_ms": float(rep["prefill_instance"].get("effective_ttft_ms", rep["prefill_instance"]["step_ms"])),
-        "decode_step_ms": float(d_inst["step_ms_feasible"]),
-        "handoff_tpot_ms": float(rep.get("handoff_tpot_ms", 0.0) or 0.0),
-        "effective_tpot_ms": float(rep["effective_tpot_ms"]),
-        "avg_accepted_tokens": float(d_inst["avg_accepted_tokens"]),
-        "n_tok_per_die": float(d_inst["n_tok_per_die"]),
-        "us_per_tok_die": d_us,
-        "unused_sla_slack_ms": float(d_inst["unused_sla_slack_ms"]),
-        "operating_regime": str(d_inst["operating_regime"]),
-        "limiting_constraint": str(d_inst.get("limiting_constraint", "")),
-        "free_hbm_headroom_gib": float(d_inst["free_hbm_headroom_gib"]),
-        "kv_transfer_ms_per_request": float(rep["kv_transfer_ms_per_request"]),
-        "sustainable_rps": float(best_ratio["sustainable_rps"]) if best_ratio else 0.0,
-        "prefill_kv_rps": (
-            min(float(best_ratio["prefill_rps"]), float(best_ratio["kv_transfer_rps"])) if best_ratio else 0.0
-        ),
-        "sustainable_tps": e2e_tps,
-        "sustainable_tps_per_die": d_tps_per_die if d_tps_per_die > 0.0 else e2e_per_die,
-        "decode_tps_per_die": d_tps_per_die,
-        "e2e_total_tps": e2e_tps,
-        "e2e_tps_per_die": e2e_per_die,
-        "dcp_codomain_valid": bool(d_inst.get("dcp_codomain_valid", True)),
-        "dcp_codomain_reason": d_inst.get("dcp_codomain_reason"),
-        "feasible": bool(best_ratio is not None),
-        "infeasible_reason": (
-            None if best_ratio is not None
-            else (rep["candidates"][0]["infeasible_reason"] if rep["candidates"] else "infeasible")
-        ),
-    }
 
 
 def _pd_static_infeasible_row(
@@ -4164,13 +4431,17 @@ def _static_admit_pd_stages(
             coverage["total_candidates"] += 1
             try:
                 parsed_p = parse_case(raw_p)
+            except UnmodeledCapabilityError:
+                raise
             except (ModelingError, ValueError) as exc:
                 if rewrite_plan is not None and _is_rewrite_plan_error(exc):
                     raise
                 coverage["static_rejected"] += 1
                 continue
             par_p = parsed_p.runtime.parallel
-            if not validate_vllm_ascend_dcp_codomain(parsed_p.model, par_p)[0]:
+            if not validate_vllm_ascend_dcp_codomain(
+                parsed_p.model, par_p, runtime=parsed_p.runtime,
+            )[0]:
                 coverage["static_rejected"] += 1
                 continue
             p_mem = Memory(parsed_p, workspace_tokens=_prefill_workspace_tokens(parsed_p, compute_tokens))
@@ -4237,16 +4508,22 @@ def _eval_pd_stage_worker(task: tuple[Any, ...]) -> tuple[bool, Any]:
                 apply_target_envelope, rewrite_plan, allow_unbound_formula, _,
             ) = task
             p_parsed = parse_case(p_raw)
+            layer_clocks: dict[int, float] = {}
             _, prefill_hbm_ok, p_slots, p_step = _measure_prefill_stage(
                 p_parsed, prompt=prompt, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
                 cache=None, cache_id=None, apply_target_envelope=apply_target_envelope,
                 rewrite_plan=rewrite_plan, allow_unbound_formula=allow_unbound_formula,
-                allow_plan_fallback=(output > 1),
+                layer_finish_ms_out=layer_clocks,
             )
             return True, (
                 "prefill",
                 (p_idx, compute_tokens, hit_tokens),
-                {"prefill_hbm_ok": bool(prefill_hbm_ok), "p_slots": int(p_slots), "p_step": float(p_step)},
+                {
+                    "prefill_hbm_ok": bool(prefill_hbm_ok),
+                    "p_slots": int(p_slots),
+                    "p_step": float(p_step),
+                    "layer_finish_ms": layer_clocks,
+                },
             )
         (
             _, d_idx, d_raw, prompt, output, tpot, max_sequences_per_dp,
@@ -4254,7 +4531,9 @@ def _eval_pd_stage_worker(task: tuple[Any, ...]) -> tuple[bool, Any]:
             explicit_eff_sla_ms, seed_probe_cache, _,
         ) = task
         d_parsed = parse_case(d_raw)
-        dcp_ok, _ = validate_vllm_ascend_dcp_codomain(d_parsed.model, d_parsed.runtime.parallel)
+        dcp_ok, _ = validate_vllm_ascend_dcp_codomain(
+            d_parsed.model, d_parsed.runtime.parallel, runtime=d_parsed.runtime,
+        )
         d_q_tok, d_emit_est = _resolve_speculative_tokens(
             d_parsed, output_budget=output, tokens_per_seq=None, emitted_tokens_per_seq=None,
         )
@@ -4285,6 +4564,8 @@ def _eval_pd_stage_worker(task: tuple[Any, ...]) -> tuple[bool, Any]:
             key,
             {"static_skip": False, "eff_sla_ms": eff_sla_ms, "d_sla": d_sla, "probe_cache": probe_sink},
         )
+    except UnmodeledCapabilityError:
+        raise
     except (ModelingError, ValueError) as exc:
         err_key = (task[1], task[2], task[3]) if kind == "prefill" else (task[1], task[10])
         return False, (kind, err_key, isinstance(exc, ModelingError), str(exc))
@@ -4304,6 +4585,7 @@ def _resolve_decode_sla_from_cache(
     d_q_tok: int,
     d_emit_est: float,
     max_sequences_per_dp: int | None,
+    has_rewrite_plan: bool = False,
 ) -> dict[str, Any] | None:
     """Resolve exact decode SLA concurrency in O(1) from Phase-1 baseline + probe cache."""
     if eff_sla_ms >= zero_sla_ms - PARETO_EPS:
@@ -4320,7 +4602,15 @@ def _resolve_decode_sla_from_cache(
     limit, cfg_seqs, tok_lim = _resolve_decode_batch_bounds(
         d_parsed, q_tok=d_q_tok, b_vram=b_vram, max_sequences_per_dp=max_sequences_per_dp,
     )
-    lo, hi, best_b, best_t = _tighten_sla_bracket(probe_cache, limit, eff_sla_ms)
+    full_bs, _ = _decode_batch_capture_boundaries(d_parsed, d_q_tok)
+    intervals = _decode_batch_regime_intervals(
+        d_parsed, limit, d_q_tok, use_target=False, has_rewrite_plan=has_rewrite_plan,
+    )
+    if len(intervals) != 1 or not (intervals[0][2] and intervals[0][3]):
+        return None
+    if _has_non_monotone_probe(probe_cache, 1, limit):
+        return None
+    lo, hi, _, _ = _tighten_sla_bracket(probe_cache, limit, eff_sla_ms)
     if lo == 0 and 1 in probe_cache and float(probe_cache[1]) > eff_sla_ms + PARETO_EPS:
         return {
             "emitted_tokens_per_seq": float(d_emit_est),
@@ -4334,13 +4624,21 @@ def _resolve_decode_sla_from_cache(
                 ),
             }],
         }
-    if lo >= 1 and hi == lo + 1 and best_t is not None:
+    if lo >= 1 and hi == lo + 1:
+        c_prev = _prev_padding_boundary(lo, 1, full_bs)
+        if c_prev is not None and c_prev not in probe_cache:
+            return None
+        if _has_throughput_dip(probe_cache, 1, limit, eff_sla_ms, capture_bs=full_bs):
+            return None
+        best_b, best_t, max_feas_b = _select_best_feasible_batch(probe_cache, limit, eff_sla_ms)
+        if best_b < 1 or best_t is None:
+            return None
         t1 = float(probe_cache.get(1) or (best_t if best_b == 1 else 0.0))
         return {
             "emitted_tokens_per_seq": float(d_emit_est),
             "scenarios": [{
                 "b_vram_max": b_vram, "configured_max_num_seqs": cfg_seqs,
-                "token_batch_limit": tok_lim, "b_sla": best_b, "b_feasible": best_b,
+                "token_batch_limit": tok_lim, "b_sla": max_feas_b, "b_feasible": best_b,
                 "step_ms_at_b1": t1, "step_ms_feasible": float(best_t),
                 "free_hbm_headroom_gib": _headroom_gib_at_batch(
                     d_parsed, d_mem, d_kv, b_vram=b_vram, batch=best_b,
@@ -4436,6 +4734,8 @@ def _resolve_pd_mode_params(
             hit_tokens = min(int(math.floor(prompt * hit_r)), max(0, prompt - 1)) if is_pool else 0
             compute_tokens = max(0, prompt - hit_tokens)
             resolved[pd_mode] = (dram_r, ssd_r, hit_r, hit_tokens, compute_tokens)
+        except UnmodeledCapabilityError:
+            raise
         except (ModelingError, ValueError) as exc:
             if _is_ingress_contradiction(exc):
                 raise
@@ -4494,7 +4794,9 @@ def _build_pd_factorized_handoff_records(
                 parsed_p, workspace_tokens=_prefill_workspace_tokens(parsed_p, compute_tokens),
             )
         if p_idx not in p_dcp_cache:
-            p_dcp_cache[p_idx] = validate_vllm_ascend_dcp_codomain(parsed_p.model, parsed_p.runtime.parallel)
+            p_dcp_cache[p_idx] = validate_vllm_ascend_dcp_codomain(
+                parsed_p.model, parsed_p.runtime.parallel, runtime=parsed_p.runtime,
+            )
         if d_idx not in d_mem_cache:
             d_mem_cache[d_idx] = Memory(parsed_d, workspace_tokens=d_spec_tokens[d_idx][0])
         p_dcp_ok, p_dcp_reason = p_dcp_cache[p_idx]
@@ -4509,7 +4811,10 @@ def _build_pd_factorized_handoff_records(
                 ttft_sla_ms=ttft, tpot_sla_ms=tpot, mode=pd_mode,
                 dram_r=dram_r, ssd_r=ssd_r, compute_tokens=compute_tokens, hit_tokens=hit_tokens,
                 kv_transfer_bw_gbps=kv_transfer_bw_gbps, ddr_bw_gbps=ddr_bw_gbps, ssd_bw_gbps=ssd_bw_gbps,
+                layer_finish_ms=(p_res.get("layer_finish_ms") or None),
             )
+        except UnmodeledCapabilityError:
+            raise
         except (ModelingError, ValueError) as exc:
             if _is_ingress_contradiction(exc) or (rewrite_plan is not None and _is_rewrite_plan_error(exc)):
                 raise
@@ -4529,6 +4834,7 @@ def _build_pd_factorized_handoff_records(
                     parsed_d, d_sla_zero=d_base["d_sla"], probe_cache=d_base["probe_cache"],
                     vram_info=d_vram_caches[d_idx], eff_sla_ms=eff_sla_ms, zero_sla_ms=zero_sla_ms,
                     d_q_tok=d_q_tok, d_emit_est=d_emit_est, max_sequences_per_dp=max_sequences_per_dp,
+                    has_rewrite_plan=(rewrite_plan is not None),
                 )
                 if resolved_sla is None:
                     refine_key = (d_idx, eff_sla_ms)
@@ -4722,9 +5028,22 @@ def _reduce_pd_factorized_pairs(
             pd_mode=rec["pd_mode"], mtp_n=rec["mtp_n"], p_world=p_world, d_world=d_world,
         )
         rows.append(row)
+        emitted_ratios = {row["pd_ratio"]}
         if row["feasible"]:
             if best_entry is None or _rank_single_pool_row(row) > _rank_single_pool_row(best_entry[0]):
                 best_entry = (row, p_item["raw"], d_item["raw"])
+            for p_ratio in _solve_pareto_pd_ratios_closed_form(
+                st, total=num_devices, p_dies=p_world, d_dies=d_world,
+                output=output, mode=rec["pd_mode"],
+            ):
+                if p_ratio["pd_ratio"] in emitted_ratios:
+                    continue
+                emitted_ratios.add(p_ratio["pd_ratio"])
+                p_row = _build_pd_candidate_row_from_stage(
+                    st, p_parsed=parsed_p, d_parsed=parsed_d, best_ratio=p_ratio,
+                    pd_mode=rec["pd_mode"], mtp_n=rec["mtp_n"], p_world=p_world, d_world=d_world,
+                )
+                rows.append(p_row)
     return rows, ([best_entry] if best_entry is not None else [])
 
 
@@ -4968,7 +5287,7 @@ def _recompose_winner_case(
     if "cp" in topo and "dcp" not in topo:
         topo["dcp"] = topo.pop("cp")
     try:
-        eff_override = min(int(b_vram_max), DEFAULT_DERIVED_MAX_NUM_SEQS_CAP)
+        eff_override = int(b_vram_max)
         fresh = compose_for(topo, int(mtp_n), role, max_num_seqs_override=eff_override)
     except TypeError:
         return case_dict
@@ -5062,6 +5381,52 @@ def _outcome_to_dict(outcome: DeploymentOutcome) -> dict[str, Any]:
     }
 
 
+def canonical_deployment_row_key(row: Mapping[str, Any]) -> tuple[Any, ...]:
+    """Deterministic total-order tie-break key across workers (``W=1 == W=N``)."""
+    par = row.get("parallel") or row.get("decode_parallel") or {}
+    p_par = row.get("prefill_parallel") or {}
+    return (
+        str(row.get("deployment_mode") or ""),
+        str(row.get("pd_transfer_mode") or ""),
+        int(row.get("used_dies", 0) or 0),
+        int(row.get("mtp_proposal_tokens", 0) or 0),
+        tuple(sorted((str(k), int(v)) for k, v in par.items() if isinstance(v, (int, float)) and not isinstance(v, bool))),
+        tuple(sorted((str(k), int(v)) for k, v in p_par.items() if isinstance(v, (int, float)) and not isinstance(v, bool))),
+        str(row.get("pd_ratio") or ""),
+    )
+
+
+def _evaluate_winner_macro_wall(
+    winner_row: Mapping[str, Any] | None,
+    recommended_case: Mapping[str, Any] | None,
+    tpot_sla_ms: float,
+) -> dict[str, Any] | None:
+    """Classify the macro deployment wall via canonical ``optimization.codesign.evaluate_macro_wall_trigger``."""
+    if winner_row is None or recommended_case is None or math.isinf(tpot_sla_ms):
+        return None
+    raw_tpot = winner_row.get("effective_tpot_ms")
+    if raw_tpot is None or float(raw_tpot) <= 0.0:
+        return None
+    try:
+        parsed = parse_case(recommended_case)
+    except (ModelingError, ValueError):
+        return None
+    headroom_bytes = max(0.0, float(winner_row.get("free_hbm_headroom_gib", 0.0) or 0.0)) * BYTES_PER_GIB
+    dies = tuple(getattr(parsed.machine, "dies", ()) or ())
+    if not dies:
+        return None
+    usable_bytes = min(float(d.memory_bytes) for d in dies) * float(parsed.runtime.gpu_memory_utilization)
+    used_bytes = max(0.0, usable_bytes - headroom_bytes)
+    trigger = evaluate_macro_wall_trigger(
+        tpot_ms=float(raw_tpot),
+        tpot_slo_ms=float(tpot_sla_ms),
+        hbm_used_bytes=used_bytes,
+        hbm_usable_bytes=usable_bytes,
+        hbm_headroom_bytes=headroom_bytes,
+    )
+    return trigger.to_dict()
+
+
 def _finalize_optimal_deployment(
     *,
     model_id: str,
@@ -5131,10 +5496,17 @@ def _finalize_optimal_deployment(
         recommended_case=recommended_case, prefill_case=prefill_case_out,
         decode_case=decode_case_out, ttft=ttft, tpot=tpot, search_coverage=search_coverage,
     )
-    pareto_metric = (
-        (lambda r: float(r.get("prefill_rps_per_die", 0.0) or 0.0))
-        if dep_mode == "pd_prefill" else _single_die_decode_tps
+    if dep_mode == "pd_prefill":
+        pareto_metric = lambda r: float(r.get("prefill_rps_per_die", 0.0) or 0.0)
+    elif dep_mode == "pd_disaggregated":
+        pareto_metric = lambda r: float(r.get("sustainable_tps", 0.0) or 0.0)
+    else:
+        pareto_metric = _single_die_decode_tps
+    pareto_rows = sorted(
+        _mark_pd_pareto(all_candidates, metric_fn=pareto_metric),
+        key=lambda r: (int(r["used_dies"]), -float(pareto_metric(r)), canonical_deployment_row_key(r)),
     )
+    macro_wall = _evaluate_winner_macro_wall(winner_row, recommended_case, tpot)
     return {
         "schema": "mindie-sim.optimal-deployment/1",
         "model": model_id, "hardware": sku, "num_devices": n_dev,
@@ -5146,11 +5518,12 @@ def _finalize_optimal_deployment(
         "winner_mode": winner_row["deployment_mode"] if winner_row else None,
         "feasible": winner_row is not None,
         "deployment_outcome": _outcome_to_dict(outcome),
+        "macro_wall": macro_wall,
         "search_coverage": dict(search_coverage or {}),
         "best_configuration": winner_row,
         "best_pd": best_pd_entry[0] if best_pd_entry else None,
         "best_colocated": best_coloc_entry[0] if (best_coloc_entry and dep_mode == "colocated") else None,
-        "pareto_frontier": _mark_pd_pareto(all_candidates, metric_fn=pareto_metric),
+        "pareto_frontier": pareto_rows,
         "candidates": all_candidates,
         "recommended_case": recommended_case,
         "prefill_case": prefill_case_out,
@@ -5164,6 +5537,7 @@ def _make_solve_compose_fn(
     mtp_acceptance_length: float | None,
 ):
     from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.frontend.speculation import compute_speculative_accept_step
 
     base_kw = {k: v for k, v in common_kw.items() if k != "role"}
 
@@ -5174,25 +5548,30 @@ def _make_solve_compose_fn(
         *,
         max_num_seqs_override: int | None = None,
     ) -> dict[str, Any] | None:
-        accept = (
-            1.0 if int(mtp_n) <= 0
-            else (
-                float(mtp_acceptance_length) if mtp_acceptance_length is not None
-                else compute_speculative_accept_step(DEFAULT_SPECULATIVE_ACCEPT_RATE, mtp_n)
+        if int(mtp_n) <= 0:
+            accept: float | None = _SINGLE_TOKEN_ACCEPTANCE
+        elif mtp_acceptance_length is not None:
+            accept = float(mtp_acceptance_length)
+        else:
+            contract = base_kw.get("speculative_contract")
+            contract_rate = getattr(contract, "acceptance_rate", None) if contract is not None else None
+            accept = (
+                compute_speculative_accept_step(float(contract_rate), int(mtp_n))
+                if contract_rate is not None else None
             )
-        )
         eff_seqs = (
             int(max_num_seqs_override) if max_num_seqs_override is not None
             else (int(max_sequences_per_dp) if max_sequences_per_dp is not None else MIN_ADMISSION_PROBE_SEQS)
         )
         verify_width = 1 + max(0, int(mtp_n))
         call_kw = dict(base_kw)
+        if "feature_track" in call_kw and call_kw["feature_track"] is not None:
+            call_kw["feature_track"] = _compose_track_arg(str(call_kw["feature_track"]))
         call_kw["max_num_seqs"] = max(1, eff_seqs)
         if role == "pd_decode":
             call_kw["ttft_slo_ms"] = None
-            call_kw["max_num_batched_tokens"] = max(
-                call_kw["max_num_seqs"] * verify_width, PD_DECODE_MIN_BATCHED_TOKENS,
-            )
+            cur_batched = int(call_kw.get("max_num_batched_tokens") or 0)
+            call_kw["max_num_batched_tokens"] = max(cur_batched, call_kw["max_num_seqs"] * verify_width)
         elif role == "pd_prefill":
             call_kw["tpot_slo_ms"] = None
             seq_floor = max(call_kw["max_num_seqs"], DEFAULT_CHUNKED_BATCH_SEQ_FLOOR)
@@ -5216,7 +5595,7 @@ def _make_solve_compose_fn(
                 cache_key = json.dumps(
                     {
                         "kw": call_kw, "role": role, "topo": topo_int,
-                        "mtp_n": int(mtp_n), "accept": float(accept),
+                        "mtp_n": int(mtp_n), "accept": accept,
                     },
                     sort_keys=True, separators=(",", ":"), default=repr,
                 )
@@ -5235,6 +5614,8 @@ def _make_solve_compose_fn(
                 while len(_SOLVE_COMPOSE_CACHE) > _SOLVE_COMPOSE_CACHE_MAX:
                     _SOLVE_COMPOSE_CACHE.popitem(last=False)
             return composed
+        except UnmodeledCapabilityError:
+            raise
         except (ModelingError, ValueError) as exc:
             if _is_ingress_contradiction(exc):
                 raise
@@ -5257,7 +5638,7 @@ def solve_optimal_deployment(
     mtp_acceptance_length: float | None = None, max_sequences_per_dp: int | None = None,
     quant: str | Mapping[str, Any] | None = None, layers: int | None = None,
     ranks_per_node: int | None = None, topology_preset: str | None = None,
-    va_recommended: bool | None = None, raw_eager: bool = False, feature_track: str = "merged",
+    va_recommended: bool | None = None, raw_eager: bool = False, feature_track: str = "shipping",
     runtime_stack: str | Mapping[str, Any] | None = None, optimizations: Sequence[str] = (),
     exclude_optimizations: Sequence[str] = (), engram_cpu_offload: bool | None = None,
     multistream_overlap_shared_expert: bool | None = None, enable_shared_expert_dp: bool | None = None,
@@ -5299,7 +5680,7 @@ def solve_optimal_deployment(
         pinned_decode_parallel if pinned_decode_parallel is not None else coloc_pin,
         "pinned_decode_parallel",
     )
-    ext_plan = load_rewrite_plan(rewrite_plan) if rewrite_plan is not None else None
+    ext_plan = _load_canonical_rewrite_plan(rewrite_plan) if rewrite_plan is not None else None
     use_target_env = bool(apply_target_envelope or ext_plan is not None)
 
     from mindie_sim.compose.inputs import _arch_key, _resolve_hardware, _resolve_model_spec

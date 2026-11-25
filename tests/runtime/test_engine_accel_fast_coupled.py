@@ -477,3 +477,57 @@ def test_dp_cohort_dedup_fast_span_only_matches_detailed_peer_die_overlap_decisi
     detailed_res = _has_unsynced_peer_die_overlap(detailed_ex, w0, 0)
     fast_res = _has_unsynced_peer_die_overlap(fast_ex, w0, 0)
     assert fast_res is detailed_res is True
+
+
+def test_c11_sparse_epoch_dynamic_4096_res_and_multiunit_parity() -> None:
+    """C11 dynamic resource table (>2048), multi-unit overlaps, & repeated epochs match Python."""
+    from mindie_sim.prediction.runtime.engine import Engine, Resource
+
+    count = 4096
+    res_list = [Resource(f"r{i}", 1.0 + float(i % 7) * 0.25) for i in range(count)]
+    res_list.extend([
+        Resource("mu_fair", 16.0, units=8, policy="fair"),
+        Resource("mu_wide", 8.0, units=4, policy="fair"),
+    ])
+    eng_py = Engine(res_list, backend="python")
+    eng_c = Engine(res_list, backend="c")
+    try:
+        # Epoch 1: >2048 resources with coupled + uncoupled sparse active-coeff flows.
+        ev_py = [
+            eng_py.submit(f"t{i}", {f"r{i}": 1.0, f"r{(i + 1) % count}": 0.5}, coupled=(i % 3 == 0))
+            for i in range(64)
+        ]
+        ev_c = [
+            eng_c.submit(f"t{i}", {f"r{i}": 1.0, f"r{(i + 1) % count}": 0.5}, coupled=(i % 3 == 0))
+            for i in range(64)
+        ]
+        # Overlapping & disjoint multi-unit placements (proportional widths on coupled multi-res).
+        placements = [
+            ({"mu_fair": 3.0, "mu_wide": 1.5}, {"mu_fair": (0, 1, 2, 3), "mu_wide": (0, 1)}, True),
+            ({"mu_fair": 2.5, "mu_wide": 1.25}, {"mu_fair": (2, 3, 4, 5), "mu_wide": (1, 2)}, True),
+            ({"mu_fair": 2.0}, {"mu_fair": (6, 7)}, True),
+            ({"mu_wide": 2.0}, {"mu_wide": (2, 3)}, False),
+        ]
+        for idx, (work, place, cpl) in enumerate(placements):
+            ev_py.append(eng_py.submit(f"mu{idx}", work, placement=place, coupled=cpl))
+            ev_c.append(eng_c.submit(f"mu{idx}", work, placement=place, coupled=cpl))
+        eng_py.advance()
+        eng_c.advance()
+        # Epoch 2: post-drain reuse verifies O(1) epoch bump clears stale res_chead/touched_res.
+        e2_py = eng_py.submit("ep2_a", {"r4095": 1.5, "mu_fair": 2.0}, placement={"mu_fair": tuple(range(8))}, coupled=True)
+        e2_c = eng_c.submit("ep2_a", {"r4095": 1.5, "mu_fair": 2.0}, placement={"mu_fair": tuple(range(8))}, coupled=True)
+        e3_py = eng_py.submit("ep2_b", {"mu_fair": 1.0, "mu_wide": 0.5}, placement={"mu_fair": (0, 1), "mu_wide": (0,)}, coupled=True)
+        e3_c = eng_c.submit("ep2_b", {"mu_fair": 1.0, "mu_wide": 0.5}, placement={"mu_fair": (0, 1), "mu_wide": (0,)}, coupled=True)
+        eng_py.advance()
+        eng_c.advance()
+        ev_py.extend((e2_py, e3_py))
+        ev_c.extend((e2_c, e3_c))
+
+        st = eng_c.accel_status()
+        assert st["fallback_reason"] is None and int(st["native_steps"]) > 0
+        for a, b in zip(ev_py, ev_c, strict=True):
+            assert b.time == pytest.approx(a.time, rel=1e-12, abs=1e-12)
+        assert eng_c.now == pytest.approx(eng_py.now, rel=1e-12, abs=1e-12)
+    finally:
+        _close(eng_py)
+        _close(eng_c)

@@ -39,7 +39,7 @@ from .accel_sync import (
 from .accel_tables import (
     ABI_VERSION, Arena, B_BUDGET, B_CALLBACK, B_HORIZON, B_IDLE, B_OUTPUT,
     B_STOP, E_ARITH, E_STALL, E_STATE, INT32_MAX, KernelFault, MAX_L, MAX_OWN,
-    MAX_R, MAX_T, MAX_U, _free_ctx_box, _inert_pool_set, _stable_task_payloads,
+    MAX_T, MAX_U, _free_ctx_box, _inert_pool_set, _stable_task_payloads,
     is_inert_trace_entry, needs_external_start, pure_task, resource_table,
     wide_integer,
 )
@@ -47,9 +47,10 @@ from .accel_tables import (
 #: ``auto`` keeps smaller Engines on pure Python: zero build and marshalling.
 AUTO_MIN_TASKS = 64
 AUTO_GRAPH_MIN_TASKS = 16
+#: Dynamic growable C11 resource table ceiling (matching ``MSIM_MAX_RES``).
+MAX_RES_DYNAMIC = 65536
 #: Bounded prepared-stage compatibility memo and ``auto`` overhead guards.
 _PREP_CACHE_MAX = 2048
-_AUTO_LARGE_RES_LIMIT = 1024
 _AUTO_CHURN_MIN_CALLS = 512
 _AUTO_CHURN_MIN_RESOURCES = 64
 _AUTO_CHURN_MIN_STEPS_PER_CALL = 4
@@ -77,31 +78,6 @@ _TRANSIENT_C_REASONS = frozenset({"alloc_boundary"})
 EPOCH_ENABLED = os.environ.get("MINDIE_SIM_ACCEL_EPOCH", "1") != "0"
 
 
-def _coupled_explicit_placement_proportional(engine, task) -> bool:
-    """True when explicitly placed multi-unit resources on a coupled task match width ratios.
-
-    Unplaced multi-unit resources (e.g. a shared die HBM bus ``memory@r0:s0``
-    with ``placement=None``) span all declared units identically in both
-    Python ``coupled.py`` and C11 ``rates_coupled``.
-    """
-    if not (task.coupled and task.placement and len(task.remaining) > 1):
-        return True
-    first_u = first_tot = 0
-    for name in task.remaining:
-        units = task.placement.get(name)
-        if units is None:
-            continue
-        res_obj = engine.resources[name]
-        if res_obj.units <= 1:
-            continue
-        u_len = len(units)
-        if first_tot == 0:
-            first_u, first_tot = u_len, res_obj.units
-        elif u_len * first_tot != first_u * res_obj.units:
-            return False
-    return True
-
-
 def _remaining_shapes_valid(engine, task) -> bool:
     """Validate remaining work, caps and unit placements for C11 mirroring."""
     resources = engine.resources
@@ -124,7 +100,10 @@ def _remaining_shapes_valid(engine, task) -> bool:
             return False
         if any(type(unit) is not int or unit < 0 or unit >= limit for unit in units):
             return False
-    return _coupled_explicit_placement_proportional(engine, task)
+    if task.coupled and task.placement and len(task.remaining) > 1:
+        from .accel_terms import coupled_placement_proportional
+        return coupled_placement_proportional(engine, task)
+    return True
 
 
 def _task_c11_compatible(
@@ -143,7 +122,7 @@ def _task_c11_compatible(
             return False
     if task.callback is not None and not task.native_hook and not allow_non_hook_cb:
         return False
-    if task.cohort_widened and len(task.remaining) > MAX_R:
+    if task.cohort_widened and len(task.remaining) > MAX_RES_DYNAMIC:
         return False
     if not _stable_task_payloads(task, engine):
         return False
@@ -255,11 +234,6 @@ class NativeBackend:
         if self.mode == "auto" and engine._sequence < self.min_tasks:
             self.disabled_reason = "auto_tiny_workload"
             return False
-        if self.mode == "auto" and len(engine.resources) > _AUTO_LARGE_RES_LIMIT:
-            self.disabled_reason = "auto_large_resource_table"
-            self.dormant = True
-            self.recoverable = False
-            return False
         reuse_config = False
         if self.arena is None:
             try:
@@ -305,7 +279,7 @@ class NativeBackend:
             )
         if not reuse_config:
             rates, units, policy = resource_table(engine)
-            if len(rates) < 1 or len(rates) > MAX_R:
+            if len(rates) < 1 or len(rates) > MAX_RES_DYNAMIC:
                 self.disabled_reason = "resource_count"
                 self.dormant = True
                 return False
@@ -1083,7 +1057,7 @@ class NativeBackend:
         if names == self.res_names:
             self.res_version = engine._resource_version
             return True
-        if engine._native_slots or not 1 <= len(names) <= MAX_R:
+        if engine._native_slots or not 1 <= len(names) <= MAX_RES_DYNAMIC:
             return False
         rates, units, policy = resource_table(engine)
         if not all(math.isfinite(rate) and rate > 0 and 1 <= unit <= MAX_U
