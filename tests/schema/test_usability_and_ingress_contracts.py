@@ -117,6 +117,7 @@ def test_single_node_pd_handoff_uses_intra_node_link() -> None:
         p_case = compose_case(
             "deepseek-v2-lite", hardware=sku, dp=1, tp=dies, ep=dies,
             parallel="fixed", role="pd_prefill", prompt_tokens=1024, output_tokens=64,
+            ttft_slo_ms=5000.0,
         )
         d_case = compose_case(
             "deepseek-v2-lite", hardware=sku, dp=1, tp=dies, ep=dies,
@@ -172,7 +173,8 @@ def test_collective_band_selection_and_wildcard_normalization() -> None:
     a3_topo = Topology(a3_parsed.machine, a3_parsed.runtime.parallel, primitive_table=a3_ptab)
     opt_link = next(lnk for lnk in a3_parsed.machine.links if lnk.channel == "d2d_inter_node")
     assert opt_link.channel == "d2d_inter_node"
-    assert a3_topo.p18_allreduce_rate_applies("allreduce", (0, 1, 2, 3), scope="node") is True
+    assert a3_topo.p18_allreduce_rate_applies("allreduce", (0, 1), scope="package") is True
+    assert a3_topo.p18_allreduce_rate_applies("allreduce", (0, 1, 2, 3), scope="node") is False
     assert a3_topo.p18_allreduce_rate_applies("allreduce", (0, 16), scope="cross_node") is False
     ep32 = tuple(range(32))
     for coll in COLLECTIVES:
@@ -348,16 +350,33 @@ def test_v5_five_content_bugs_regression_locks() -> None:
     ]
     assert _pick_stream0_witness(ivs, frozenset({"aux0"})).occurrence_id == "main0"
 
-    # Bug 2a/2b: 69 target_tail RecoverSSM rows collapse to 1 and never use generic Add kernel name.
+    # Bug 2a/2b: 69 target_tail RecoverSSM rows collapse to 1 and birth KernelBinding overrides generic Add.
+    from mindie_sim.prediction.operators.recurrent.recover_ssm_commit import (
+        COMMIT_KERNEL_BACKEND,
+        KDA_COMMIT_KERNEL_ID,
+    )
+    from mindie_sim.schema.operators import KernelBinding, OpSpec
+
     a5_case_obj = parse_case(compose_case(
         "deepseek-v2-lite", hardware="Ascend950DT_9582", dp=1, tp=2, ep=1, layers=1, parallel="fixed",
     ))
+    commit_spec = OpSpec(
+        op_id="s0.l0.recover_ssm_commit", family="elementwise", phase="decode", stage=0, layer=0,
+        requests=("r0",), semantic_shape=(4, 128), local_shape=(4, 128), padded_shape=(4, 128),
+        launch_shape=(4, 128), flops=0.0, vector_ops=512.0, hbm_bytes=2048.0, mte2_bytes=1024.0,
+        mte3_bytes=1024.0, deps=("accept",), recipe="recover_ssm_commit", dtype="bf16",
+        kernel_binding=KernelBinding(
+            kernel_id=KDA_COMMIT_KERNEL_ID, backend=COMMIT_KERNEL_BACKEND, arch_family="A5",
+            submodule="RecoverSSM State Commit", macro_module="attention", readiness="shipping",
+            recipe_id="recover_ssm_commit",
+        ),
+    )
     desc = resolve_ascend_kernel_identity(
-        "s0.l0.recover_ssm_commit", None, "elementwise", "recover_ssm_commit",
+        "s0.l0.recover_ssm_commit", commit_spec, "elementwise", "recover_ssm_commit",
         (4, 128), "bf16", a5_case_obj, None, (),
         native_binding={"kernels": [{"name": "Add"}]},
     )
-    assert desc.ascend_kernel == "RecoverSSMStateCommit"
+    assert desc.ascend_kernel == KDA_COMMIT_KERNEL_ID and desc.ascend_kernel != "Add"
     rows, demands = [], []
     for idx in range(69):
         oid = f"s0.l{idx}.recover_ssm_commit"
@@ -443,7 +462,7 @@ def test_h3_single_spine_ingress_deployment_mode_domain_routing_and_auto_va(tmp_
         "--no-xlsx", "--no-trace", "--out-dir", str(tmp_path / "missing_dep"),
     ])
     with pytest.raises(ModelingError, match="colocated.*pd_disaggregated.*pd_prefill.*pd_decode"):
-        run_report_command(missing_args, load_designs=lambda _p: None)
+        run_report_command(missing_args)
 
     # Script with explicit kv_role=kv_consumer supplies pd_decode via adapter.launch_codec without --deployment-mode.
     dec_sh = tmp_path / "decode_serve.sh"
@@ -486,7 +505,7 @@ def test_h3_single_spine_ingress_deployment_mode_domain_routing_and_auto_va(tmp_
         "--no-xlsx", "--no-trace", "--out-dir", str(tmp_path / "bad_pd_dec"),
     ])
     with pytest.raises(ModelingError, match="pd_decode_ttft_unavailable"):
-        run_report_command(bad_pd_dec_args, load_designs=lambda _p: None)
+        run_report_command(bad_pd_dec_args)
 
     # (c) Diffusion/DiT defaults to diffusion-native (zero LLM KV cache) and rejects --stack vllm-ascend.
     dit_case = compose_case("hunyuan-video-dit", hardware="a5", dp=1, tp=1, parallel="fixed")
@@ -503,7 +522,7 @@ def test_h3_single_spine_ingress_deployment_mode_domain_routing_and_auto_va(tmp_
         "--no-xlsx", "--no-trace", "--out-dir", str(tmp_path / "bad_dit"),
     ])
     with pytest.raises(ModelingError, match="stack_domain_mismatch"):
-        run_report_command(bad_dit_args, load_designs=lambda _p: None)
+        run_report_command(bad_dit_args)
 
     # (d) Kimi-K3.1 & Qwen3.8-Flash-Next via compose_case(..., quant="auto_va") carry real CheckpointQuantMap -> RuntimeQuantPlan.
     kimi_raw = compose_case(
@@ -515,7 +534,13 @@ def test_h3_single_spine_ingress_deployment_mode_domain_routing_and_auto_va(tmp_
     assert sc_k is not None and qp_k is not None and lp_k is not None
     assert qp_k.provenance == "verified_checkpoint_descriptor"
     assert sc_k.sla.ttft_ms is None
-    assert kimi_raw["runtime"]["recover_ssm"] is True
+    assert kimi_raw["runtime"]["recover_ssm"] is False
+    kimi_opt_in = compose_case(
+        "kimi-k3.1", hardware="950dt-96g-pod", dp=1, tp=8, dcp=8, ep=8, role="pd_decode",
+        prompt_tokens=131072, output_tokens=1024, mtp_proposal_tokens=5, mtp_acceptance_length=3.5,
+        quant="auto_va", recover_ssm=True,
+    )
+    assert kimi_opt_in["runtime"]["recover_ssm"] is True
     ports_k = dict(qp_k.port_abis)
     assert ports_k[("target", 1, "self_attention_res_proj")].linear_method == "dense"
     assert ports_k[("target", 1, "mlp_res_proj")].linear_method == "dense"

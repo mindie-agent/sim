@@ -697,7 +697,7 @@ def test_w2a_spine_adapter_provenance_and_profiler_normalizer_contracts():
 
     c_k31 = parse_case(compose_case("kimi-k3.1", "a5", tp=1, layers=4, quant="bf16"))
     assert len(sp.lower(c_k31, LoweringRequest(StepRequest("decode", context=2048)),
-                        scenario_contract=resolve_case_contracts(c_k31)[0]).graph.executable[0].ops) == 91
+                        scenario_contract=resolve_case_contracts(c_k31)[0]).graph.executable[0].ops) == 203
 
     c_pf = compose_case("deepseek-v3", "a5", tp=1, layers=1, quant="bf16", _stack_phase="prefill")
     _, q_pf, l_pf = resolve_case_contracts(c_pf)

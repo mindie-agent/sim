@@ -540,6 +540,10 @@ def test_direct_and_lowrank_mla_queries_are_mutually_exclusive() -> None:
     assert (lowrank_terms["q_a"].rows, lowrank_terms["q_a"].cols) == (8, 32)
     assert (lowrank_terms["q_b"].rows, lowrank_terms["q_b"].cols) == (96, 8)
     _, refused = _direct_mla_case(0)
+    refused_plan = replace(plan, head_dim=192, kv_lora_rank=512, qk_nope_head_dim=128,
+                           qk_rope_head_dim=64, v_head_dim=128, kv_cache_elements=576)
+    refused["model"]["head_dim"] = 192
+    refused["model"]["layer_plans"] = [refused_plan.to_dict()]
     refused["runtime"]["kernels"] = {"lowerings": {"mla_prolog": "vllm_ascend_mla_prolog_v3"}}
     with pytest.raises(ModelingError, match="mla_prolog_v3_direct_q_unsupported"):
         target_operators(refused, phase="prefill", tokens=3)

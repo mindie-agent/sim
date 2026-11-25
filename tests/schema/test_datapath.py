@@ -143,8 +143,10 @@ def test_geometry_rejects_heterogeneous_compute_arch_stage():
     die22, die35 = _compose_tiny(MEM_WIDE_SKU).machine.dies[0], _compose_tiny(REG_SKU).machine.dies[0]
     with pytest.raises(ModelingError, match="stage_devices_heterogeneous_compute_arch"):
         Geometry.from_devices((die22, die35))
+    with pytest.raises(ModelingError, match="stage_devices_heterogeneous_compute_arch"):
+        Geometry.from_devices((die22, _compose_tiny(MEM_SKU).machine.dies[0]))  # 1.8 GHz vs 1.5 GHz
     with pytest.raises(ModelingError, match="stage_devices_heterogeneous_datapath"):
-        Geometry.from_devices((die22, _compose_tiny(MEM_SKU).machine.dies[0]))  # 24/48 vs 20/40
+        Geometry.from_devices((die22, _compose_tiny("Ascend910B3").machine.dies[0]))  # same 1.8 GHz, 24/48 vs 20/40
     die35_mod = replace(die35, compute_arch=replace(die35.compute_arch, instruction_services=()))
     with pytest.raises(ModelingError, match="stage_devices_heterogeneous_compute_arch"):
         Geometry.from_devices((die35, die35_mod))

@@ -359,7 +359,7 @@ def test_supported_representations_reach_public_serving(model: str, quantization
 def test_fp8_alias_does_not_grant_an_undeclared_matrix_capability() -> None:
     raw = _deployment_case("qwen3.8", "fp8", SKUS[0])
     assert parse_case(raw).model.quant == quant_preset("w8a8_mxfp8")
-    with pytest.raises(ModelingError, match="compute_precision_rate_required:fp8_e4m3"):
+    with pytest.raises(ModelingError, match="native_compute_mode_unsupported:matrix:fp8_e4m3"):
         predict(raw)
     raw["machine"]["sku"] = SKUS[1]
     supported = predict(raw)
@@ -500,14 +500,18 @@ def test_situ_declarations_replace_swiglu_and_bound_mx_quant_operands() -> None:
     raw = json.loads((ROOT / "examples/cases/kimi-k3-a5.json").read_text())
     raw["model"]["layers"] = 2
     case = parse_case(raw)
-    activations = [op for op in target_operators(case, phase="prefill", tokens=8) if op.family == "situ"]
-    assert {op.recipe for op in activations} == {"situ", "grouped_situ"}
-    assert any(".shared." in op.op_id for op in activations)
-    assert not any(op.family == "swiglu" for op in target_operators(case, phase="prefill", tokens=8))
-    for op in activations:
+    ops = target_operators(case, phase="prefill", tokens=8)
+    activations = [op for op in ops if op.family == "situ"]
+    assert {op.recipe for op in activations} == {"grouped_situ"}
+    eager_situ = [op for op in ops if op.recipe.startswith("situ_")]
+    assert sum(op.op_id.startswith("s0.l0.situ") for op in eager_situ) == 14
+    assert sum(op.op_id.startswith("s0.l1.shared.situ") for op in eager_situ) == 14
+    assert not any(op.family == "swiglu" for op in ops)
+    for op in (*activations, *eager_situ):
         meta = dict(op.metadata)
         assert (meta["activation_beta"], meta["activation_linear_beta"]) == (4, 25)
         assert meta["activation_compute_dtype"] == "fp32"
+    for op in activations:
         elements = op.mte3_bytes / 2
         assert op.vector_ops == pytest.approx(12 * elements)
         assert op.mte2_bytes == pytest.approx(4 * elements)
