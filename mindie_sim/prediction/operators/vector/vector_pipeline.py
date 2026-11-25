@@ -57,7 +57,7 @@ class AIVTiledVectorAndGatherRecipe:
             dram_rate = context.service_rate("hbm_write_dram") or context.service_rate("mte2_aiv_dram")
         elif hbm_write <= 0.0:
             dram_rate = context.service_rate("mte2_aiv_dram")
-        elif read_bytes > HBM_RW_ASYMMETRY_RATIO * write_bytes:
+        elif hbm_read > HBM_RW_ASYMMETRY_RATIO * hbm_write:
             dram_rate = context.service_rate("hbm_rw21_dram") or context.service_rate("mte2_aiv_dram")
         else:
             dram_rate = (

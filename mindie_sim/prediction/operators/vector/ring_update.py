@@ -49,7 +49,7 @@ INPUT_ATTN_TENSORS = 2
 INPUT_STATS_TENSORS = 4
 OUTPUT_STATS_TENSORS = 2
 ATTN_ELEM_OPS = 6  # 2 FP32 upcasts + 2 muls + 1 add + 1 BF16 downcast (ring_attention_update_tnd.h:298)
-STATS_LANE_OPS = 8  # max + 2*(sub+exp+mul) + add + 2*div (ring_attention_update_tnd.h:210)
+STATS_LANE_OPS = 10  # max + 2*(sub+exp+mul) + add + 2*div (ring_attention_update_tnd.h:230-271)
 _RING_UPDATE_SUPPORTED_DTYPES = frozenset({"fp16", "bf16", "fp32"})
 _ARCH22_TND_HEAD_DIM_ALIGN = 64
 
