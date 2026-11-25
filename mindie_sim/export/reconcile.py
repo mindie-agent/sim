@@ -54,16 +54,42 @@ _FUSED_KERNEL_HINTS: dict[str, tuple[str, ...]] = {
     "gate_up_projection": ("gate", "up", "matmul", "mm"),
     "grouped_gemm": ("grouped", "gmm", "moe", "matmul"),
     "attention": ("flashattention", "mla", "attention", "fia", "ifa", "pfa", "sfa"),
-    "allreduce": ("allreduce", "hccl", "hcom"),
-    "allgather": ("allgather", "hccl", "hcom"),
-    "reduce_scatter": ("reducescatter", "hccl", "hcom"),
-    "reducescatter": ("reducescatter", "hccl", "hcom"),
-    "alltoall": ("alltoall", "dispatch", "combine", "hccl", "hcom"),
+    "allreduce": ("allreduce", "all_reduce"),
+    "all_reduce": ("allreduce", "all_reduce"),
+    "allgather": ("allgather", "all_gather"),
+    "all_gather": ("allgather", "all_gather"),
+    "reduce_scatter": ("reducescatter", "reduce_scatter"),
+    "reducescatter": ("reducescatter", "reduce_scatter"),
+    "alltoall": ("alltoall", "all_to_all"),
+    "all_to_all": ("alltoall", "all_to_all"),
+    "alltoallv": ("alltoallv", "all_to_all_v"),
+    "all_to_all_v": ("alltoallv", "all_to_all_v"),
+    "moe_dispatch": ("moedistributedispatch", "dispatch"),
+    "moe_combine": ("moedistributecombine", "combine"),
+    "broadcast": ("hcombroadcast", "hcclbroadcast", "broadcast"),
+    "reduce": ("hcomreduce", "hcclreduce", "reduce"),
+    "p2p_send": ("hcomsend", "hcclsend", "p2psend", "send"),
+    "p2p_recv": ("hcomrecv", "hcomreceive", "hcclrecv", "hcclreceive", "p2precv", "p2preceive", "recv", "receive"),
+    "scatter": ("hcomscatter", "hcclscatter", "scatter"),
+    "gather": ("hcomgather", "hcclgather", "gather"),
     "rmsnorm": ("rmsnorm", "rms_norm", "norm"),
     "rotary": ("rotary", "rope"),
     "swiglu": ("swiglu", "silu", "mul"),
     "quantize": ("quant", "dynamicquant"),
 }
+_GENERIC_COLLECTIVE_TOKENS = frozenset({"hccl", "hcom", "collective", "p2p"})
+_COLLECTIVE_FAMILIES = frozenset({
+    "collective", "allreduce", "all_reduce", "allgather", "all_gather",
+    "reduce_scatter", "reducescatter", "alltoall", "all_to_all",
+    "alltoallv", "all_to_all_v", "broadcast", "reduce", "scatter", "gather",
+    "p2p", "send", "recv", "receive", "moe_dispatch", "moe_combine",
+    "mc2_dispatch", "mc2_combine",
+})
+_COMPUTE_CORES = frozenset({"AI_CORE", "AI_VECTOR_CORE", "MIX_AIC", "MIX_AIV", "AIC", "AIV"})
+_NON_COLLECTIVE_VECTOR_KINDS = (
+    "broadcastto", "reducesum", "reducemean", "reducemax", "reducemin",
+    "reduceprod", "reduceany", "reduceall", "reducestd", "argmax", "argmin",
+)
 
 
 def _clean_text(raw: Any) -> str:
@@ -173,8 +199,10 @@ def load_observation_bundle(
         sim_id = str(group.get("sim_op_id") or group.get("op_id") or "").strip()
         if not sim_id:
             continue
+        has_kernels_field = "kernels" in group
+        raw_k_list = group.get("kernels")
         names: list[str] = []
-        for k_entry in group.get("kernels", ()) or ():
+        for k_entry in (raw_k_list or ()):
             if isinstance(k_entry, str):
                 names.append(k_entry)
             elif isinstance(k_entry, Mapping):
@@ -194,26 +222,146 @@ def load_observation_bundle(
                         input_dtypes=str(k_entry.get("input_dtypes", "")),
                     ))
                     next_index += 1
-        if names:
+        if names or (
+            has_kernels_field
+            and isinstance(raw_k_list, Sequence)
+            and not isinstance(raw_k_list, (str, bytes))
+        ):
             explicit_map[sim_id] = tuple(names)
     return tuple(kernels), explicit_map
 
 
-def _operator_match_tokens(op: OperatorExportRow) -> tuple[str, ...]:
+def _collective_kind_from_text(
+    text: str,
+    *,
+    is_hccl: bool = False,
+    is_compute_core: bool = False,
+) -> str | None:
+    """Classify canonical collective operation kind from an op/kernel descriptor."""
+    compact = "".join(ch for ch in text.lower() if ch.isalnum())
+    if not compact:
+        return None
+    has_hcom_prefix = "hcom" in compact or "hccl" in compact
+    if not has_hcom_prefix and any(tok in compact for tok in _NON_COLLECTIVE_VECTOR_KINDS):
+        return None
+    if "reducescatter" in compact:
+        return "reduce_scatter"
+    if "allgather" in compact:
+        return "all_gather"
+    if "allreduce" in compact:
+        return "all_reduce"
+    if "alltoallv" in compact:
+        return "all_to_all_v"
+    if "alltoall" in compact:
+        return "all_to_all"
+    if "moedistributedispatch" in compact:
+        return "moe_dispatch"
+    if "moedistributecombine" in compact:
+        return "moe_combine"
+    if "broadcast" in compact:
+        if is_hccl or has_hcom_prefix or (not is_compute_core and compact == "broadcast"):
+            return "broadcast"
+        return None
+    if "hcomsend" in compact or "hcclsend" in compact or "p2psend" in compact:
+        return "p2p_send"
+    if (
+        "hcomrecv" in compact or "hcomreceive" in compact
+        or "hcclrecv" in compact or "hcclreceive" in compact
+        or "p2precv" in compact or "p2preceive" in compact
+    ):
+        return "p2p_recv"
+    if "hcomreduce" in compact or "hcclreduce" in compact:
+        return "reduce"
+    if is_hccl or has_hcom_prefix:
+        if "dispatch" in compact:
+            return "moe_dispatch"
+        if "combine" in compact:
+            return "moe_combine"
+        if compact == "send" or compact.endswith("send"):
+            return "p2p_send"
+        if compact in {"recv", "receive"} or compact.endswith("recv") or compact.endswith("receive"):
+            return "p2p_recv"
+        if compact == "reduce":
+            return "reduce"
+        if compact == "scatter":
+            return "scatter"
+        if compact == "gather":
+            return "gather"
+    return None
+
+
+def _operator_collective_kinds(op: OperatorExportRow) -> tuple[frozenset[str], bool]:
+    """Return ``(collective_kinds, is_pure_collective)`` for heuristic agreement checks."""
+    is_hccl = op.task_type.strip().upper() == "HCCL" or op.family.strip().lower() in _COLLECTIVE_FAMILIES
+    kinds: set[str] = set()
+    for text in (
+        op.family,
+        op.recipe,
+        op.ascend_kernel or op.implementation,
+        op.op_id.rsplit(".", 1)[-1],
+        *op.absorbed_source_ops,
+    ):
+        if not text:
+            continue
+        kind = _collective_kind_from_text(text, is_hccl=is_hccl)
+        if kind is not None:
+            kinds.add(kind)
+    # Prefer specific all-to-all specializations over the broad ``alltoall`` family tag.
+    if "all_to_all" in kinds and (kinds & {"all_to_all_v", "moe_dispatch", "moe_combine"}):
+        kinds.discard("all_to_all")
+    fam_rec = f"{op.family} {op.recipe}".lower()
+    has_compute = any(tok in fam_rec for tok in ("matmul", "gemm", "mm_", "_mm"))
+    return frozenset(kinds), bool(is_hccl and not has_compute)
+
+
+def _kernel_collective_kind(kernel: KernelObservationRow) -> str | None:
+    core_up = kernel.core.strip().upper()
+    is_hccl = core_up == "HCCL"
+    is_compute = core_up in _COMPUTE_CORES
+    for text in (kernel.name, kernel.op_type):
+        kind = _collective_kind_from_text(text, is_hccl=is_hccl, is_compute_core=is_compute)
+        if kind is not None:
+            return kind
+    return None
+
+
+def _operator_match_tokens(op: OperatorExportRow, op_colls: frozenset[str] = frozenset()) -> tuple[str, ...]:
     tokens: list[str] = []
+    skip_broad_a2a = bool(op_colls & {"all_to_all_v", "moe_dispatch", "moe_combine"}) and "all_to_all" not in op_colls
     suffix = op.op_id.rsplit(".", 1)[-1].lower()
-    if suffix and len(suffix) >= MIN_MATCH_TOKEN_LEN:
-        tokens.append(suffix)
+    if suffix and len(suffix) >= MIN_MATCH_TOKEN_LEN and suffix not in _GENERIC_COLLECTIVE_TOKENS:
+        if not (skip_broad_a2a and suffix in {"alltoall", "all_to_all"}):
+            tokens.append(suffix)
     for source in (op.family, op.recipe, op.ascend_kernel or op.implementation, *op.absorbed_source_ops):
         lower = source.strip().lower()
-        if lower and len(lower) >= MIN_MATCH_TOKEN_LEN:
+        if lower and len(lower) >= MIN_MATCH_TOKEN_LEN and lower not in _GENERIC_COLLECTIVE_TOKENS:
+            if skip_broad_a2a and lower in {"alltoall", "all_to_all"}:
+                continue
             tokens.append(lower)
             for hint in _FUSED_KERNEL_HINTS.get(lower, ()):
                 tokens.append(hint)
+    for kind in sorted(op_colls):
+        for hint in _FUSED_KERNEL_HINTS.get(kind, ()):
+            tokens.append(hint)
     return tuple(dict.fromkeys(tokens))
 
 
-def _kernel_matches_tokens(kernel: KernelObservationRow, tokens: Sequence[str]) -> bool:
+def _kernel_matches_tokens(
+    kernel: KernelObservationRow,
+    tokens: Sequence[str],
+    *,
+    op_colls: frozenset[str] = frozenset(),
+    op_is_pure_collective: bool = False,
+) -> bool:
+    kern_coll = _kernel_collective_kind(kernel)
+    if kern_coll is not None and kern_coll not in op_colls:
+        return False
+    if op_is_pure_collective:
+        if op_colls:
+            if kern_coll not in op_colls:
+                return False
+        elif kern_coll is None and kernel.core.strip().upper() != "HCCL":
+            return False
     haystack = f"{kernel.name} {kernel.op_type}".lower()
     return any(tok in haystack for tok in tokens)
 
@@ -250,17 +398,27 @@ def _consume_explicit_kernels(
     consumed: set[int],
 ) -> list[KernelObservationRow]:
     matched: list[KernelObservationRow] = []
+    tentative: set[int] = set()
     for pattern in wanted:
-        chosen = next(((pos, k) for pos, k in by_name.get(pattern, ()) if pos not in consumed), None)
+        chosen = next(
+            ((pos, k) for pos, k in by_name.get(pattern, ()) if pos not in consumed and pos not in tentative),
+            None,
+        )
         if chosen is None:
             pat_low = pattern.lower()
             chosen = next(
-                ((pos, k) for pos, k in enumerate(kernels) if pos not in consumed and pat_low in k.name.lower()),
+                (
+                    (pos, k)
+                    for pos, k in enumerate(kernels)
+                    if pos not in consumed and pos not in tentative and pat_low in k.name.lower()
+                ),
                 None,
             )
-        if chosen is not None:
-            consumed.add(chosen[0])
-            matched.append(chosen[1])
+        if chosen is None:
+            return []
+        tentative.add(chosen[0])
+        matched.append(chosen[1])
+    consumed.update(tentative)
     return matched
 
 
@@ -285,8 +443,12 @@ def reconcile_operators_with_kernels(
     for pos, row in enumerate(kernels):
         by_name[row.name].append((pos, row))
 
+    explicit_bound: set[OpOccurrence] = set()
     for op in operators:
-        wanted = explicit.get(op.occurrence)
+        if op.occurrence not in explicit:
+            continue
+        explicit_bound.add(op.occurrence)
+        wanted = explicit[op.occurrence]
         if not wanted:
             continue
         matched = _consume_explicit_kernels(wanted, by_name, kernels, consumed)
@@ -294,9 +456,10 @@ def reconcile_operators_with_kernels(
             groups[op.occurrence] = _build_reconciled_group(op, tuple(matched))
 
     for op in operators:
-        if op.occurrence in groups or op.occurrence in explicit:
+        if op.occurrence in explicit_bound or op.op_id not in explicit:
             continue
-        wanted = explicit.get(op.op_id)
+        explicit_bound.add(op.occurrence)
+        wanted = explicit[op.op_id]
         if not wanted:
             continue
         matched = _consume_explicit_kernels(wanted, by_name, kernels, consumed)
@@ -305,9 +468,10 @@ def reconcile_operators_with_kernels(
 
     cursor = 0
     for op in operators:
-        if op.occurrence in groups:
+        if op.occurrence in groups or op.occurrence in explicit_bound:
             continue
-        tokens = _operator_match_tokens(op)
+        op_colls, op_is_pure_coll = _operator_collective_kinds(op)
+        tokens = _operator_match_tokens(op, op_colls)
         matched = []
         scan_idx = cursor
         max_group = max(1, len(op.absorbed_source_ops) + 1)
@@ -317,7 +481,12 @@ def reconcile_operators_with_kernels(
             scan_idx += 1
             if pos in consumed:
                 continue
-            if _kernel_matches_tokens(cand, tokens):
+            if _kernel_matches_tokens(
+                cand,
+                tokens,
+                op_colls=op_colls,
+                op_is_pure_collective=op_is_pure_coll,
+            ):
                 consumed.add(pos)
                 matched.append(cand)
                 cursor = scan_idx
