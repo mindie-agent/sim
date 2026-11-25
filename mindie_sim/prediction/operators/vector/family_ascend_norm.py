@@ -13,11 +13,36 @@
 [Side-Effect Policy] Returns operators; no source, checkpoint or device access.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 
 from .mx_dynamic_quant import group32_work
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-nn",
+        revision="238f76a06d0cfc5ee90071e2c08310e2b517c3a6",
+        relative_path="norm/add_rms_norm_dynamic_quant/op_host/add_rms_norm_dynamic_quant_def.cpp",
+        source_sha256="efabe02000c51b72722e15c05ee00847668f008c0c116b84d44176fc3b5b23a7",
+    ),
+    SourceRef(
+        repository="vllm-ascend",
+        revision="175ef4d49c2072f9233619636f0309f4f88b4e2c",
+        relative_path="vllm_ascend/compilation/passes/norm_quant_fusion_pass.py",
+        source_sha256="e17b2cb3afeb45283885bf807022e7608b70400e153983f15f8967bd76cb0748",
+    ),
+    SourceRef(
+        repository="vllm-ascend",
+        revision="175ef4d49c2072f9233619636f0309f4f88b4e2c",
+        relative_path="csrc/moe/add_rms_norm_bias/op_kernel/add_rms_norm_bias.h",
+        source_sha256="5ad66e31f5cdea5c7c61ddf3bde84743deca97965381f049fd197a272a281eed",
+    ),
+)
 
 
 ADD_SOURCE = {
@@ -74,6 +99,7 @@ MX_QUANT_SOURCE = {
 
 _MX_GROUP = 32
 _FP32_BYTES = 4
+_QUANT_INPUT_DTYPES = frozenset({"bf16", "fp16"})
 # Declared RMSNorm work with zero, one or two fused elementwise operations.
 _NORM_OPS_PER_ELEMENT = (5, 6, 7)
 _GENERIC_QUANT_OPS_PER_ELEMENT = 4
@@ -136,8 +162,15 @@ def _quant_component(op, rows, width, *, group_size, mx):
     return None, generic, None, "unknown"
 
 
-def _quant_contract(meta, family, rows, width, *, bias):
+def _quant_contract(meta, family, rows, width, *, dtype, bias):
     """Validate the selected quantizer ABI and return its materialization."""
+    if dtype not in _QUANT_INPUT_DTYPES:
+        raise ModelingError(
+            f"ascend_native_norm_quant_input_dtype_unsupported:{family}:{dtype}")
+    gamma_dtype = str(meta.get("norm_gamma_runtime_format") or "").strip().lower()
+    if gamma_dtype and gamma_dtype != dtype:
+        raise ModelingError(
+            f"ascend_native_norm_quant_gamma_dtype_mismatch:{family}:{dtype}:{gamma_dtype}")
     output = meta.get("output_format")
     elements = int(rows) * int(width)
     if family == "add_rmsnorm_quant" and output == "int8":
@@ -334,7 +367,7 @@ def lower_op(op, *, has_bias=None, external_gamma_shift=False):
     bias = bias_before if has_bias is None else has_bias
     if not isinstance(bias, bool) or (bias_before and not bias):
         raise ModelingError("ascend_native_norm_bias_cannot_remove_declared_affine")
-    qmeta = _quant_contract(meta, op.family, rows, width, bias=bias) \
+    qmeta = _quant_contract(meta, op.family, rows, width, dtype=op.dtype, bias=bias) \
         if op.family in {"rmsnorm_quant", "add_rmsnorm_quant"} else None
     declared_api = meta.get("norm_native_api")
     if op.family == "add_rmsnorm":
