@@ -18,7 +18,7 @@ from .native_fusion_hc_program import (
     FP32_BYTES, MAX_M_L1, MIXED_COEFFS, MK_SPLIT_TILING_KEY, M_SPLIT_TILING_KEY,
     PARTIAL_VALUES_PER_ROW, POST_D_TILE,
     allocations, phase_program, post_geometry, post_owner, pre_geometry,
-    pre_owner, pre_program, pre_second_owner, total_work,
+    pre_owner, pre_program, pre_second_owner, pre_workspace_breakdown, total_work,
 )
 
 PRE_PROFILE = 'hc_pre_arch35_mk_175ef4d4'
@@ -132,6 +132,7 @@ def selected_plan(op, geometry):
         else:
             first, second, work = _pre_template(g, view['sinkhorn_iters'])
             compact = profile == COMPACT_PRE_PROFILE and eligible(g)
+        workspace_payload_bytes, workspace_reserved_bytes, workspace_bytes = pre_workspace_breakdown(g)
         diagnostic.update(geometry=vars(g), logical_projection_flops=2 * g.rows * g.width * MIXED_COEFFS,
                           physical_projection_flops=int(work.matrix.get('hf32', 0)),
                           m_k_tiling={
@@ -147,7 +148,9 @@ def selected_plan(op, geometry):
                               'm_cnt': g.m_cnt, 'm_rounds': g.m_rounds,
                               'm_main': g.m_main,
                           },
-                          source_workspace_bytes=g.rows * g.k_parts * PARTIAL_VALUES_PER_ROW * FP32_BYTES,
+                          source_workspace_bytes=workspace_bytes,
+                          source_workspace_payload_bytes=workspace_payload_bytes,
+                          source_workspace_reserved_bytes=workspace_reserved_bytes,
                           compact_pipeline={
                               'requested':profile==COMPACT_PRE_PROFILE,
                               'applied':compact,

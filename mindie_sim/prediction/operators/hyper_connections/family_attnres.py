@@ -141,11 +141,21 @@ ATTNRES_COOP_CORE_GAIN = 2
 ATTNRES_COOP_LOW_OCCUPANCY_DIV = 4
 ATTNRES_COOP_MIN_HIDDEN = 512
 ATTNRES_COOP_MAX_ROWS = 128
+ATTNRES_COOP_MAX_OUTPUT_SPLITS = 8
+ATTNRES_COOP_MAX_SCORE_SPLITS = 32
 ATTNRES_COOP_WHOLE_BF16_ROWS = 4
+ATTNRES_COOP_SPLIT_BF16_ROWS = 3
 ATTNRES_COOP_FP32_ROWS = 3
 ATTNRES_COOP_SCALAR_SLOTS = 2
 ATTNRES_COOP_HIDDEN_ALIGN = 64
 ATTNRES_COOP_SLOT_BYTES = 32
+ATTNRES_COOP_ROW_PADDING_BYTES = 256
+ATTNRES_COOP_UB_PERIOD_BYTES = 512
+_HSPLIT_PASS1A_SCORE_OPS = 3
+_HSPLIT_PASS1B_SCORE_OPS = 3
+_HSPLIT_PASS2_NORM_STAT_OPS = 3
+_HSPLIT_PASS3_NORM_APPLY_OPS = 4
+_COOP_STRATEGIES = frozenset({"coop_token_group", "coop_global_row", "coop_h_split"})
 MS_PER_SECOND = 1000.0
 NS_PER_MS = 1_000_000.0
 NS_PER_SECOND = 1_000_000_000.0
@@ -371,12 +381,95 @@ def _coop_row_parallel_ub_bytes(rows: int, tile: int, regbase: bool = True) -> i
         if regbase else max(meta_align, ATTNRES_COOP_HIDDEN_ALIGN)
     )
     slots = max(meta_align, rows)
+    row_padding = (
+        ATTNRES_COOP_ROW_PADDING_BYTES
+        if (not regbase and (tile * FP32_BYTES) % ATTNRES_COOP_UB_PERIOD_BYTES == 0)
+        else 0
+    )
     return (
         tile * (ATTNRES_COOP_WHOLE_BF16_ROWS * _BF16_BYTES + ATTNRES_COOP_FP32_ROWS * FP32_BYTES)
         + (2 * meta_elems + meta_align * float_block + slots * float_block
            + ATTNRES_COOP_SCALAR_SLOTS * float_block) * FP32_BYTES
+        + ATTNRES_COOP_SLOT_BYTES + UB_OVERHEAD_BYTES + row_padding
+    )
+
+
+def _coop_token_group_ub_bytes(rows: int, tile: int, regbase: bool = True) -> int:
+    base = _coop_row_parallel_ub_bytes(rows, tile, regbase=regbase)
+    return base - tile * _BF16_BYTES if regbase else base
+
+
+def _coop_h_split_ub_bytes(
+    rows: int, tile: int, score_splits: int, output_splits: int, *, regbase: bool = True,
+) -> int:
+    float_block = ATTNRES_COOP_SLOT_BYTES // FP32_BYTES
+    meta_align = _align(rows, float_block)
+    meta_elems = (
+        _align(meta_align, ATTNRES_COOP_HIDDEN_ALIGN)
+        if regbase else max(meta_align, ATTNRES_COOP_HIDDEN_ALIGN)
+    )
+    slot_count = max(meta_align, rows * score_splits, output_splits)
+    return (
+        tile * (ATTNRES_COOP_SPLIT_BF16_ROWS * _BF16_BYTES + ATTNRES_COOP_FP32_ROWS * FP32_BYTES)
+        + (2 * meta_elems + meta_align * float_block + slot_count * float_block
+           + ATTNRES_COOP_SCALAR_SLOTS * float_block) * FP32_BYTES
         + ATTNRES_COOP_SLOT_BYTES + UB_OVERHEAD_BYTES
     )
+
+
+def _coop_slice_count(hidden: int, splits: int, slice_idx: int) -> int:
+    units = _ceil_div(hidden, ATTNRES_COOP_HIDDEN_ALIGN)
+    base, tail = divmod(units, splits)
+    start = (slice_idx * base + min(slice_idx, tail)) * ATTNRES_COOP_HIDDEN_ALIGN
+    count = (base + (1 if slice_idx < tail else 0)) * ATTNRES_COOP_HIDDEN_ALIGN
+    return max(0, min(count, hidden - start))
+
+
+def _select_coop_h_split(
+    tokens_local: int, rows: int, hidden: int, ub_bytes: int, aiv: int,
+    *, output_norm: bool, regbase: bool,
+) -> dict[str, Any] | None:
+    row_tasks = tokens_local * rows
+    max_score_splits = min(ATTNRES_COOP_MAX_SCORE_SPLITS, hidden // ATTNRES_COOP_MIN_HIDDEN)
+    first_score_splits = min(max_score_splits, max(2, aiv // row_tasks))
+    output_splits = min(
+        ATTNRES_COOP_MAX_OUTPUT_SPLITS, aiv // tokens_local, hidden // ATTNRES_COOP_MIN_HIDDEN,
+    )
+    units = _ceil_div(hidden, ATTNRES_COOP_HIDDEN_ALIGN)
+    for score_splits in range(first_score_splits, max_score_splits + 1):
+        tile_elems = max(
+            _ceil_div(units, score_splits), _ceil_div(units, output_splits),
+        ) * ATTNRES_COOP_HIDDEN_ALIGN
+        required_ub = _coop_h_split_ub_bytes(
+            rows, tile_elems, score_splits, output_splits, regbase=regbase,
+        )
+        if required_ub > ub_bytes:
+            continue
+        score_tasks = row_tasks * score_splits
+        output_tasks = tokens_local * output_splits
+        used = max(min(aiv, score_tasks), output_tasks)
+        ws_slots = score_tasks * (2 if score_splits > 1 else 1) + (output_tasks if output_norm else 0)
+        ranges = tuple(
+            (idx // output_splits if idx < output_tasks else (idx // (rows * score_splits)) % tokens_local, 1)
+            for idx in range(used)
+        )
+        return {
+            "tiling_strategy": "coop_h_split",
+            "launched_owners": used,
+            "active_owners": used,
+            "tokens_per_core": 1,
+            "token_group_size": 0,
+            "score_splits": score_splits,
+            "output_splits": output_splits,
+            "tile_elems": tile_elems,
+            "cached_rows": 0,
+            "cached_prefix": False,
+            "coop_ub_bytes": required_ub,
+            "coop_leader_ub_bytes": required_ub,
+            "workspace_bytes": ws_slots * ATTNRES_COOP_SLOT_BYTES,
+            "core_ranges": ranges,
+        }
+    return None
 
 
 def select_attnres_dispatch_plan(
@@ -387,9 +480,13 @@ def select_attnres_dispatch_plan(
     aiv: int,
     *,
     mix: bool = True,
-    mode: str = "token_local",
+    mode: str = "auto",
+    output_norm: bool = False,
+    regbase: bool = True,
+    need_backward: bool = False,
+    supports_cooperative: bool = True,
 ) -> dict[str, Any]:
-    """Resolve physical owner tiling for token-local or upstream cooperative dispatch."""
+    """Resolve physical owner tiling matching upstream ``AttnResFwd::MakeParallelPlan``."""
     if tokens_local <= 0 or aiv <= 0:
         return {
             "tiling_strategy": "empty",
@@ -397,14 +494,24 @@ def select_attnres_dispatch_plan(
             "active_owners": 0,
             "tokens_per_core": 0,
             "token_group_size": 0,
+            "score_splits": 0,
+            "output_splits": 0,
+            "tile_elems": 0,
+            "cached_rows": 0,
+            "cached_prefix": False,
+            "coop_ub_bytes": 0,
+            "coop_leader_ub_bytes": 0,
+            "workspace_bytes": 0,
             "core_ranges": (),
         }
     rows = valid_blocks + 1
-    if (mode == "cooperative" and mix and valid_blocks > 0
+    if (mode in {"auto", "cooperative"} and supports_cooperative and not need_backward
+            and mix and valid_blocks > 0
             and rows <= ATTNRES_COOP_MAX_ROWS and hidden >= ATTNRES_COOP_MIN_HIDDEN
             and tokens_local <= aiv // ATTNRES_COOP_CORE_GAIN):
         whole_tile = _align(hidden, ATTNRES_COOP_HIDDEN_ALIGN)
-        if _coop_row_parallel_ub_bytes(rows, whole_tile, regbase=True) <= ub_bytes:
+        row_parallel_ub = _coop_row_parallel_ub_bytes(rows, whole_tile, regbase=regbase)
+        if row_parallel_ub <= ub_bytes:
             max_group = min(rows, aiv // tokens_local)
             group_waves = _ceil_div(rows, max_group)
             group = _ceil_div(rows, group_waves)
@@ -413,23 +520,52 @@ def select_attnres_dispatch_plan(
             global_waves = _ceil_div(row_tasks, aiv)
             occupied = tokens_local > aiv // ATTNRES_COOP_LOW_OCCUPANCY_DIV
             if occupied or (group_waves <= global_waves and tokens_local * group < global_cores):
-                used = tokens_local * group
+                if group > 1:
+                    used = tokens_local * group
+                    owned_rows = _ceil_div(rows, group)
+                    token_group_ub = _coop_token_group_ub_bytes(rows, whole_tile, regbase=regbase)
+                    spare = max(0, ub_bytes - token_group_ub)
+                    cached_rows = min(owned_rows - 1, spare // (whole_tile * _BF16_BYTES))
+                    return {
+                        "tiling_strategy": "coop_token_group",
+                        "launched_owners": used,
+                        "active_owners": used,
+                        "tokens_per_core": 1,
+                        "token_group_size": group,
+                        "score_splits": 1,
+                        "output_splits": 1,
+                        "tile_elems": whole_tile,
+                        "cached_rows": cached_rows,
+                        "cached_prefix": True,
+                        "coop_ub_bytes": token_group_ub,
+                        "coop_leader_ub_bytes": token_group_ub + cached_rows * whole_tile * _BF16_BYTES,
+                        "workspace_bytes": row_tasks * ATTNRES_COOP_SLOT_BYTES,
+                        "core_ranges": tuple((idx // group, 1) for idx in range(used)),
+                    }
+            elif global_cores > tokens_local:
                 return {
-                    "tiling_strategy": "coop_token_group",
-                    "launched_owners": used,
-                    "active_owners": used,
+                    "tiling_strategy": "coop_global_row",
+                    "launched_owners": global_cores,
+                    "active_owners": global_cores,
                     "tokens_per_core": 1,
-                    "token_group_size": group,
-                    "core_ranges": tuple((idx // group, 1) for idx in range(used)),
+                    "token_group_size": 0,
+                    "score_splits": 1,
+                    "output_splits": 1,
+                    "tile_elems": whole_tile,
+                    "cached_rows": 0,
+                    "cached_prefix": row_tasks <= global_cores,
+                    "coop_ub_bytes": row_parallel_ub,
+                    "coop_leader_ub_bytes": row_parallel_ub,
+                    "workspace_bytes": row_tasks * ATTNRES_COOP_SLOT_BYTES,
+                    "core_ranges": tuple(((idx // rows) % tokens_local, 1) for idx in range(global_cores)),
                 }
-            return {
-                "tiling_strategy": "coop_global_row",
-                "launched_owners": global_cores,
-                "active_owners": global_cores,
-                "tokens_per_core": 1,
-                "token_group_size": 0,
-                "core_ranges": tuple((idx % tokens_local, 1) for idx in range(global_cores)),
-            }
+        else:
+            h_split = _select_coop_h_split(
+                tokens_local, rows, hidden, ub_bytes, aiv,
+                output_norm=output_norm, regbase=regbase,
+            )
+            if h_split is not None:
+                return h_split
     launched = min(tokens_local, aiv)
     per_core = _ceil_div(tokens_local, launched)
     ranges = tuple((start, min(per_core, tokens_local - start))
@@ -441,6 +577,14 @@ def select_attnres_dispatch_plan(
         "active_owners": active,
         "tokens_per_core": per_core,
         "token_group_size": 1,
+        "score_splits": 0,
+        "output_splits": 0,
+        "tile_elems": 0,
+        "cached_rows": 0,
+        "cached_prefix": False,
+        "coop_ub_bytes": 0,
+        "coop_leader_ub_bytes": 0,
+        "workspace_bytes": 0,
         "core_ranges": ranges,
     }
 
@@ -473,12 +617,20 @@ def _geometry_arch_family(geometry) -> str:
     return ""
 
 
-def _attnres_kernel_binding(arch_family: str = "", *, resident: bool = True) -> KernelBinding:
+def _attnres_kernel_binding(
+    arch_family: str = "", *, resident: bool = True, tiling_strategy: str = "token_local",
+) -> KernelBinding:
     arch_norm = str(arch_family or "").strip().upper()
     shipping = (
         arch_norm in {"A2", "A3", "A5"}
         and default_abi_registry().is_shipping_available(NATIVE_KIND, arch_norm)
     )
+    if tiling_strategy == "coop_token_group":
+        template_id = "tk_token_group"
+    elif tiling_strategy in {"coop_global_row", "coop_h_split"}:
+        template_id = "tk_cooperative"
+    else:
+        template_id = "tk_resident" if resident else "tk_reload"
     return KernelBinding(
         kernel_id=NATIVE_KIND,
         backend="CANN",
@@ -488,7 +640,7 @@ def _attnres_kernel_binding(arch_family: str = "", *, resident: bool = True) -> 
         readiness="shipping" if shipping else "proposed_pr",
         source_ref=ATTNRES_CALLER_SOURCES[0],
         recipe_id=RECIPE,
-        template_id="tk_resident" if resident else "tk_reload",
+        template_id=template_id,
     )
 
 
@@ -569,100 +721,298 @@ def _build_owner_schedule(
     )
 
 
+def _build_coop_h_split_cores(
+    view: dict[str, Any], dispatch: dict[str, Any],
+) -> tuple[list[dict[str, Any]], int, int, int, int]:
+    """Derive exact Pass-1a/1b/2/3 traffic and compute per owner for H-split cooperative dispatch."""
+    tokens = int(view["tokens_local"])
+    hidden = int(view["hidden"])
+    valid = int(view["valid_blocks"])
+    rows = valid + 1
+    fuse_add = bool(view["fuse_add"])
+    output_norm = bool(view["output_norm"])
+    bank_write = view["block_write_idx"] >= 0
+    save_mat = bool(view["save_materialized"])
+    score_splits = int(dispatch["score_splits"])
+    output_splits = int(dispatch["output_splits"])
+    used = int(dispatch["active_owners"])
+    ub_core = int(dispatch["coop_ub_bytes"])
+    partial_tasks = tokens * rows * score_splits
+    output_tasks = tokens * output_splits
+    reload_1b = partial_tasks > used
+    softmax_ops = ATTNRES_SOFTMAX_OPS_PER_ROW * rows - 1
+    cores: list[dict[str, Any]] = []
+    bank_read = score_weights = gamma = writes = 0
+    for core_idx in range(used):
+        p1a_read = p1a_write = p1a_vec = 0
+        p1b_read = p1b_write = p1b_vec = 0
+        core_hist = 0
+        for task in range(core_idx, partial_tasks, used):
+            slice_idx = task % score_splits
+            row_task = task // score_splits
+            is_prefix = (row_task % rows) == valid
+            cnt = _coop_slice_count(hidden, score_splits, slice_idx)
+            sbytes = _BF16_BYTES * cnt
+            w_r = 2 * sbytes
+            c_r = (1 + int(fuse_add)) * sbytes if is_prefix else sbytes
+            p_w = (int(fuse_add) + int(bank_write)) * sbytes if is_prefix else 0
+            add_v = _FUSED_ADD_OPS_PER_ELEMENT * cnt if (is_prefix and fuse_add) else 0
+            setup_v = _PROJECTION_SETUP_OPS_PER_ELEMENT * cnt
+            p1a_read += w_r + c_r
+            p1a_write += p_w + ATTNRES_COOP_SLOT_BYTES
+            p1a_vec += setup_v + add_v + _HSPLIT_PASS1A_SCORE_OPS * cnt
+            score_weights += w_r
+            if not is_prefix:
+                bank_read += sbytes
+                core_hist += 1
+            if reload_1b:
+                p1b_read += w_r + c_r
+                p1b_write += p_w
+                p1b_vec += setup_v + add_v + cnt
+                score_weights += w_r
+                if not is_prefix:
+                    bank_read += sbytes
+            p1b_read += score_splits * ATTNRES_COOP_SLOT_BYTES
+            p1b_write += ATTNRES_COOP_SLOT_BYTES
+            p1b_vec += _HSPLIT_PASS1B_SCORE_OPS * cnt + 2
+        is_out = core_idx < output_tasks
+        p2_score_read = p2_row_read = p2_vec = p2_mat_write = p2_out_write = p2_stat_write = 0
+        p3_read = p3_vec = p3_write = 0
+        if is_out:
+            tok, out_slice = divmod(core_idx, output_splits)
+            out_cnt = _coop_slice_count(hidden, output_splits, out_slice)
+            obytes = _BF16_BYTES * out_cnt
+            p2_score_read = rows * score_splits * ATTNRES_COOP_SLOT_BYTES
+            p2_row_read = rows * obytes
+            bank_read += valid * obytes
+            p2_vec = softmax_ops + rows * _WEIGHTED_MIX_OPS_PER_ELEMENT * out_cnt + out_cnt
+            p2_mat_write = obytes if save_mat else 0
+            if output_norm:
+                p2_vec += _HSPLIT_PASS2_NORM_STAT_OPS * out_cnt
+                p2_stat_write = ATTNRES_COOP_SLOT_BYTES
+                p3_read = output_splits * ATTNRES_COOP_SLOT_BYTES + obytes
+                gamma += obytes
+                p3_vec = _HSPLIT_PASS3_NORM_APPLY_OPS * out_cnt + _OUTPUT_NORM_SCALAR_OPS
+                p3_write = obytes
+            else:
+                p2_out_write = obytes
+        else:
+            tok = (core_idx // (rows * score_splits)) % tokens
+        read = p1a_read + p1b_read + p2_score_read + p2_row_read + p3_read
+        write = p1a_write + p1b_write + p2_mat_write + p2_out_write + p2_stat_write + p3_write
+        vec = p1a_vec + p1b_vec + p2_vec + p3_vec
+        writes += write
+        cores.append({
+            "token_start": tok, "token_count": 1,
+            "writes_output": is_out, "is_primary": is_out,
+            "owner_valid_blocks": core_hist,
+            "output_tokens": 1 if is_out else 0,
+            "p1a_read": p1a_read, "p1a_write": p1a_write, "p1a_vec": p1a_vec,
+            "p1b_read": p1b_read, "p1b_write": p1b_write, "p1b_vec": p1b_vec,
+            "p2_score_read": p2_score_read, "p2_row_read": p2_row_read, "p2_vec": p2_vec,
+            "p2_mat_write": p2_mat_write, "p2_out_write": p2_out_write, "p2_stat_write": p2_stat_write,
+            "p3_read": p3_read, "p3_vec": p3_vec, "p3_write": p3_write,
+            "ub_bytes": ub_core, "read_bytes": read, "write_bytes": write, "vector_ops": vec,
+        })
+    return cores, bank_read, score_weights, gamma, writes
+
+
+def _build_coop_cores(
+    view: dict[str, Any], dispatch: dict[str, Any], vector: dict[str, int],
+) -> tuple[list[dict[str, Any]], int, int, int, int]:
+    """Derive exact Pass-1 score and Pass-2 output ownership for cooperative dispatch."""
+    strategy = str(dispatch["tiling_strategy"])
+    if strategy == "coop_h_split":
+        return _build_coop_h_split_cores(view, dispatch)
+    tokens = int(view["tokens_local"])
+    hidden = int(view["hidden"])
+    valid = int(view["valid_blocks"])
+    rows = valid + 1
+    fuse_add = bool(view["fuse_add"])
+    output_norm = bool(view["output_norm"])
+    bank_write = view["block_write_idx"] >= 0
+    save_mat = bool(view["save_materialized"])
+    row_bytes = _BF16_BYTES * hidden
+    score_ops = _SCORE_OPS_PER_ELEMENT * hidden + 2
+    mix_ops = _WEIGHTED_MIX_OPS_PER_ELEMENT * hidden
+    softmax_ops = ATTNRES_SOFTMAX_OPS_PER_ROW * rows - 1
+    add_ops = _FUSED_ADD_OPS_PER_ELEMENT * hidden if fuse_add else 0
+    norm_ops = (_OUTPUT_NORM_OPS_PER_ELEMENT * hidden + _OUTPUT_NORM_SCALAR_OPS) if output_norm else 0
+    used = int(dispatch["active_owners"])
+    cached_rows = int(dispatch["cached_rows"])
+    cached_prefix = bool(dispatch["cached_prefix"])
+    output_owner_tokens: dict[int, list[int]] = {}
+    if strategy == "coop_global_row":
+        for tok in range(tokens):
+            owner_c = (tok * used) // tokens
+            output_owner_tokens.setdefault(owner_c, []).append(tok)
+    cores: list[dict[str, Any]] = []
+    bank_read = score_weights = gamma = writes = 0
+    for core_idx in range(used):
+        if strategy == "coop_token_group":
+            group = int(dispatch["token_group_size"])
+            tok, lane = divmod(core_idx, group)
+            tok_count = 1
+            is_leader = lane == 0
+            prefix_tasks = 1 if is_leader else 0
+            score_hist = sum(1 for pos in range(lane, rows, group) if pos > 0)
+            out_tokens = 1 if is_leader else 0
+            cached_mix = (1 + cached_rows) if is_leader else 0
+            reload_mix = (rows - cached_mix) if is_leader else 0
+            score_write_bytes = 0 if is_leader else score_hist * ATTNRES_COOP_SLOT_BYTES
+            score_read_bytes = (rows - 1 - score_hist) * ATTNRES_COOP_SLOT_BYTES if is_leader else 0
+            ub_core = int(dispatch["coop_leader_ub_bytes"]) if is_leader else int(dispatch["coop_ub_bytes"])
+        else:
+            owned_out = output_owner_tokens.get(core_idx, [])
+            tok = owned_out[0] if owned_out else (core_idx // rows) % tokens
+            tok_count = len(owned_out) if owned_out else 1
+            prefix_tasks = score_hist = 0
+            for task in range(core_idx, tokens * rows, used):
+                if task % rows == 0:
+                    prefix_tasks += 1
+                else:
+                    score_hist += 1
+            out_tokens = len(owned_out)
+            is_leader = out_tokens > 0
+            cached_mix = (1 if cached_prefix else 0) * out_tokens
+            reload_mix = (rows - (1 if cached_prefix else 0)) * out_tokens
+            score_write_bytes = (prefix_tasks + score_hist) * ATTNRES_COOP_SLOT_BYTES
+            score_read_bytes = out_tokens * rows * ATTNRES_COOP_SLOT_BYTES
+            ub_core = int(dispatch["coop_ub_bytes"])
+        weight_r = 2 * row_bytes
+        prefix_r = prefix_tasks * (1 + int(fuse_add)) * row_bytes
+        hist_r = score_hist * row_bytes
+        reload_r = reload_mix * row_bytes
+        gamma_r = out_tokens * row_bytes if output_norm else 0
+        read = weight_r + prefix_r + hist_r + reload_r + gamma_r + score_read_bytes
+        write = (
+            prefix_tasks * (int(fuse_add) + int(bank_write)) * row_bytes
+            + out_tokens * (1 + int(save_mat)) * row_bytes
+            + score_write_bytes
+        )
+        vec = (
+            vector["per_owner"]
+            + prefix_tasks * (add_ops + score_ops)
+            + score_hist * score_ops
+            + out_tokens * (softmax_ops + rows * mix_ops + hidden + norm_ops)
+        )
+        score_weights += weight_r
+        bank_read += hist_r + (reload_r - (0 if cached_prefix else out_tokens * row_bytes))
+        gamma += gamma_r
+        writes += write
+        cores.append({
+            "token_start": tok, "token_count": tok_count,
+            "writes_output": is_leader, "is_primary": is_leader,
+            "owner_valid_blocks": score_hist,
+            "prefix_tasks": prefix_tasks, "score_history_rows": score_hist,
+            "output_tokens": out_tokens, "cached_mix_rows": cached_mix,
+            "reload_mix_rows": reload_mix,
+            "score_write_bytes": score_write_bytes, "score_read_bytes": score_read_bytes,
+            "ub_bytes": ub_core,
+            "read_bytes": read, "write_bytes": write, "vector_ops": vec,
+        })
+    return cores, bank_read, score_weights, gamma, writes
+
+
 def point_metrics(view, ub_bytes, aiv, *, arch_family: str = ""):
     """Independent traffic/vector arithmetic and owner schedule for one native point.
 
-    ``T`` rows use ``launched=min(T,AIV)`` contiguous owners, ``q=ceil(T/launched)``
-    rows per owner, and ``active=ceil(T/q)`` nonempty owners; owners past the last
-    real row are absent. Resident history is read once (2 bytes per element);
-    reload reads it twice (4 bytes).
+    Selects cooperative multi-core dispatch matching ``MakeParallelPlan`` when
+    eligible, or token-local resident/reload dispatch otherwise.
     """
     tokens, hidden = view["tokens_local"], view["hidden"]
     valid = view["valid_blocks"]
     mixing = view["mix"] and valid > 0
-    dispatch_mode = str(view.get("tiling_mode", "token_local") or "token_local")
+    dispatch_mode = str(view.get("tiling_mode", "auto") or "auto")
+    regbase = arch_family not in {"A2", "A3"}
+    supports_coop = arch_family in {"", "A2", "A3", "A5"}
     dispatch = select_attnres_dispatch_plan(
-        tokens, valid, hidden, ub_bytes, aiv, mix=bool(view["mix"]), mode=dispatch_mode,
+        tokens, valid, hidden, ub_bytes, aiv, mix=bool(view["mix"]),
+        mode=dispatch_mode, output_norm=bool(view["output_norm"]),
+        regbase=regbase,
+        need_backward=bool(view.get("need_backward", False)),
+        supports_cooperative=supports_coop,
     )
     ranges = dispatch["core_ranges"]
     per_core = dispatch["tokens_per_core"]
     fuse_add = bool(view["fuse_add"])
-    resident = valid + 1 <= max_resident_rows(hidden, ub_bytes, fuse_add)
-    if resident and estimate_ub_bytes(valid + 1, hidden, True, fuse_add) > ub_bytes:
-        # Exact aligned UB exceeds capacity on the boundary; fall back to reload.
+    is_coop = dispatch["tiling_strategy"] in _COOP_STRATEGIES
+    if is_coop:
         resident = False
+    else:
+        resident = valid + 1 <= max_resident_rows(hidden, ub_bytes, fuse_add)
+        if resident and estimate_ub_bytes(valid + 1, hidden, True, fuse_add) > ub_bytes:
+            # Exact aligned UB exceeds capacity on the boundary; fall back to reload.
+            resident = False
     ready = dict(view, resident=resident, used_cores=len(ranges),
                  launched_owners=dispatch["launched_owners"],
                  active_owners=dispatch["active_owners"],
                  tiling_strategy=dispatch["tiling_strategy"],
                  token_group_size=dispatch["token_group_size"],
+                 score_splits=dispatch["score_splits"],
+                 output_splits=dispatch["output_splits"],
+                 tile_elems=dispatch["tile_elems"],
+                 cached_rows=dispatch["cached_rows"],
+                 cached_prefix=dispatch["cached_prefix"],
+                 cooperative_workspace_bytes=dispatch["workspace_bytes"],
                  tokens_per_core=per_core, core_ranges=ranges)
-    ready["output_norm_cached"] = _cache_output_norm(ready, ub_bytes)
-    footprint = estimate_ub_bytes(valid + 1, hidden, resident, fuse_add)
-    if ready["output_norm_cached"]:
-        footprint += _align(hidden, ELEM_BF16_BLOCK) * 2
+    ready["output_norm_cached"] = False if is_coop else _cache_output_norm(ready, ub_bytes)
+    if is_coop:
+        footprint = int(dispatch["coop_leader_ub_bytes"])
+    else:
+        footprint = estimate_ub_bytes(valid + 1, hidden, resident, fuse_add)
+        if ready["output_norm_cached"]:
+            footprint += _align(hidden, ELEM_BF16_BLOCK) * 2
     if footprint > ub_bytes:
         raise ModelingError("attn_res_source_ub_footprint_exceeds_capacity")
     ready["ub_bytes_per_owner"] = footprint
-    byte2, byte4 = dtype_bytes("bf16"), dtype_bytes("float32")
-    bank_read = ((byte2 if resident else byte4) * tokens * valid * hidden
-                 if mixing else 0)
-    score_weights = (byte2 * hidden + byte2 * hidden) * len(ranges) if mixing else 0
-    gamma = (byte2 * hidden * (len(ranges) if ready["output_norm_cached"] else tokens)
-             if view["output_norm"] else 0)
-    prefix_read = byte2 * tokens * hidden
-    addend_read = byte2 * tokens * hidden if view["fuse_add"] else 0
-    writes = byte2 * tokens * hidden * (
-        1 + int(view["fuse_add"]) + int(view["block_write_idx"] >= 0)
-        + int(view["save_materialized"]))
     vector = _vector_work(hidden, valid, mixing=mixing,
                           fuse_add=view["fuse_add"], output_norm=view["output_norm"])
     ready["vector_work_basis"] = vector
-    owners_per_token: dict[int, int] = {}
-    for start, _ in ranges:
-        owners_per_token[start] = owners_per_token.get(start, 0) + 1
-    token_rank: dict[int, int] = {}
-    row_mix_ops = (_SCORE_OPS_PER_ELEMENT + _WEIGHTED_MIX_OPS_PER_ELEMENT) * hidden + 2
-    cores = []
-    for start, count in ranges:
-        rank = token_rank.get(start, 0)
-        token_rank[start] = rank + 1
-        primary = rank == 0
-        group_k = owners_per_token[start]
-        base_h, rem_h = divmod(valid, group_k)
-        owner_valid = base_h + (1 if rank < rem_h else 0)
-        read = (
-            (_BF16_BYTES * count * hidden if primary else 0)
-            + (_BF16_BYTES * count * hidden if (primary and view["fuse_add"]) else 0)
-            + ((_BF16_BYTES if resident else 2 * _BF16_BYTES) * count * owner_valid * hidden
-               if mixing else 0)
-            + (2 * _BF16_BYTES * hidden if mixing else 0)
-            + (_BF16_BYTES * hidden if ready["output_norm_cached"]
-               else (_BF16_BYTES * count * hidden if (primary and view["output_norm"]) else 0))
-        )
-        write = (
-            _BF16_BYTES * count * hidden * (
+    if is_coop:
+        cores, bank_read, score_weights, gamma, writes = _build_coop_cores(ready, dispatch, vector)
+        total_read = sum(core["read_bytes"] for core in cores)
+        total_vector = sum(core["vector_ops"] for core in cores)
+    else:
+        byte2, byte4 = dtype_bytes("bf16"), dtype_bytes("float32")
+        bank_read = ((byte2 if resident else byte4) * tokens * valid * hidden
+                     if mixing else 0)
+        score_weights = (byte2 * hidden + byte2 * hidden) * len(ranges) if mixing else 0
+        gamma = (byte2 * hidden * (len(ranges) if ready["output_norm_cached"] else tokens)
+                 if view["output_norm"] else 0)
+        prefix_read = byte2 * tokens * hidden
+        addend_read = byte2 * tokens * hidden if view["fuse_add"] else 0
+        writes = byte2 * tokens * hidden * (
+            1 + int(view["fuse_add"]) + int(view["block_write_idx"] >= 0)
+            + int(view["save_materialized"]))
+        cores = []
+        for start, count in ranges:
+            read = (
+                _BF16_BYTES * count * hidden
+                + (_BF16_BYTES * count * hidden if view["fuse_add"] else 0)
+                + ((_BF16_BYTES if resident else 2 * _BF16_BYTES) * count * valid * hidden
+                   if mixing else 0)
+                + (2 * _BF16_BYTES * hidden if mixing else 0)
+                + (_BF16_BYTES * hidden if ready["output_norm_cached"]
+                   else (_BF16_BYTES * count * hidden if view["output_norm"] else 0))
+            )
+            write = _BF16_BYTES * count * hidden * (
                 1 + int(view["fuse_add"]) + int(view["block_write_idx"] >= 0)
                 + int(view["save_materialized"]))
-            if primary else 0
-        )
-        if primary:
-            owner_token_vec = vector["per_token"] - ((valid - owner_valid) * row_mix_ops if mixing else 0)
-        else:
-            owner_token_vec = owner_valid * row_mix_ops if mixing else 0
-        cores.append({
-            "token_start": start, "token_count": count,
-            "writes_output": primary, "is_primary": primary,
-            "owner_valid_blocks": owner_valid,
-            "read_bytes": read, "write_bytes": write,
-            "vector_ops": count * owner_token_vec + vector["per_owner"],
-        })
-    total_read = prefix_read + addend_read + bank_read + score_weights + gamma
+            cores.append({
+                "token_start": start, "token_count": count,
+                "writes_output": True, "is_primary": True,
+                "owner_valid_blocks": valid,
+                "read_bytes": read, "write_bytes": write,
+                "vector_ops": count * vector["per_token"] + vector["per_owner"],
+            })
+        total_read = prefix_read + addend_read + bank_read + score_weights + gamma
+        total_vector = tokens * vector["per_token"] + len(ranges) * vector["per_owner"]
     resources = {
         "hbm": total_read + writes,
         "mte2": total_read,
         "mte3": writes,
-        "vector": tokens * vector["per_token"] + len(ranges) * vector["per_owner"],
+        "vector": total_vector,
     }
     owner_schedule = _build_owner_schedule(
         ready, dispatch, cores, vector,
@@ -677,7 +1027,10 @@ def point_metrics(view, ub_bytes, aiv, *, arch_family: str = ""):
         "output_gamma_read": gamma,
         "write_bytes": writes,
         "owner_schedule": owner_schedule,
-        "kernel_binding": _attnres_kernel_binding(arch_family=arch_family, resident=resident),
+        "kernel_binding": _attnres_kernel_binding(
+            arch_family=arch_family, resident=resident,
+            tiling_strategy=str(dispatch["tiling_strategy"]),
+        ),
         "precision_abi": _attnres_precision_abi(),
     }
 
@@ -1137,89 +1490,294 @@ class _AttnResPrefixProgram:
         ))
         return stages, "pass2_prefix_mix"
 
-    def _build_coop_secondary_stages(
-        self,
-        context: Any,
-        placement: dict[str, tuple[int, ...]],
-        timings: dict[str, Any],
-        *,
-        local_valid: int,
-        resident: bool,
-        row_bytes: float,
-        score_ops: float,
-        mix_ops: float,
-    ) -> tuple[Stage, ...]:
-        if local_valid <= 0:
-            return ()
-        read_caps = timings["read_caps"]
-        if resident:
-            hist_bytes = float(local_valid) * row_bytes
-            return (
-                Stage(
-                    "history_load",
-                    context.bind(Work({}, {"hbm": hist_bytes, self.role: hist_bytes})),
-                    placement=placement, caps=read_caps, coupled=True,
-                ),
-                Stage(
-                    "history_ub_copy",
-                    latency=float(local_valid) * timings["ub_copy_row_ms"],
-                    after=("history_load",), placement=placement,
-                ),
-                Stage(
-                    "score_rows",
-                    context.bind(Work({}, {"vector": float(local_valid) * score_ops})),
-                    latency=float(local_valid) * timings["score_row_ms"],
-                    after=("history_ub_copy",), placement=placement,
-                ),
-                Stage(
-                    "mix_rows",
-                    context.bind(Work({}, {"vector": float(local_valid) * mix_ops})),
-                    latency=float(local_valid) * timings["mix_row_ms"],
-                    after=("score_rows",), placement=placement,
-                ),
-            )
+    def _build_coop_pass1_owner(
+        self, context: Any, owner: int, core: dict[str, Any], timings: dict[str, Any],
+    ) -> KernelProgram:
+        view = self.view
+        hidden = int(view["hidden"])
+        fuse_add = bool(view["fuse_add"])
+        bank_write = view["block_write_idx"] >= 0
+        strategy = str(view.get("tiling_strategy", "coop_global_row"))
+        row_bytes = float(_BF16_BYTES * hidden)
+        slot_bytes = float(ATTNRES_COOP_SLOT_BYTES)
+        read_caps, write_caps = timings["read_caps"], timings["write_caps"]
+        placement = context.owned(owner, self.aiv, (self.role, "vector", "mte3"))
+        score_ops = float(_SCORE_OPS_PER_ELEMENT * hidden + 2)
+        add_ops = float(_FUSED_ADD_OPS_PER_ELEMENT * hidden)
+        setup_vec = float(_PROJECTION_SETUP_OPS_PER_ELEMENT * hidden)
         load_one = context.bind(Work({}, {"hbm": row_bytes, self.role: row_bytes}))
         score_one = context.bind(Work({}, {"vector": score_ops}))
+        slot_write = context.bind(Work({}, {"hbm": slot_bytes, "mte3": slot_bytes}))
+        s_lat = timings["score_row_ms"]
+        setup_read = 2.0 * row_bytes
+        write_prefix_slot = strategy == "coop_global_row"
+        write_hist_slot = strategy == "coop_global_row" or not bool(core.get("writes_output", False))
+        stages: list[Stage] = [
+            Stage("weight_load", context.bind(Work({}, {"hbm": setup_read, self.role: setup_read})),
+                  placement=placement, caps=read_caps, coupled=True),
+            Stage("weight_setup", context.bind(Work({}, {"vector": setup_vec})),
+                  latency=timings["setup_ms"], after=("weight_load",), placement=placement),
+        ]
+        prev = "weight_setup"
+        prefix_tasks = int(core["prefix_tasks"])
+        if prefix_tasks > 0:
+            prefix_bytes = float(1 + int(fuse_add)) * row_bytes
+            p_stages: list[Stage] = [
+                Stage("prefix_load", context.bind(Work({}, {"hbm": prefix_bytes, self.role: prefix_bytes})),
+                      placement=placement, caps=read_caps, coupled=True),
+            ]
+            p_prev = "prefix_load"
+            if fuse_add:
+                p_stages.append(Stage("fused_add", context.bind(Work({}, {"vector": add_ops})),
+                                      latency=timings["fuse_add_ms"], after=(p_prev,), placement=placement))
+                p_prev = "fused_add"
+            if fuse_add or bank_write:
+                p_write = float(int(fuse_add) + int(bank_write)) * row_bytes
+                p_stages.append(Stage("prefix_write", context.bind(Work({}, {"hbm": p_write, "mte3": p_write})),
+                                      after=(p_prev,), placement=placement, caps=write_caps, coupled=True))
+            p_stages.append(Stage("score_prefix", score_one, latency=s_lat, after=(p_prev,), placement=placement))
+            if write_prefix_slot:
+                p_stages.append(Stage(
+                    "score_prefix_write", slot_write, after=("score_prefix",),
+                    placement=placement, caps=write_caps, coupled=True,
+                ))
+            p_tuple = tuple(p_stages)
+            stages.append(Stage(
+                "pass1_prefix", after=(prev,),
+                program=PipelineProgram(prefix_tasks, 1, lambda _i, ps=p_tuple: ps),
+            ))
+            prev = "pass1_prefix"
+        score_hist = int(core["score_history_rows"])
+        if score_hist > 0:
+            def _score_step(_i: int):
+                step = [
+                    Stage("load_row", load_one, previous=("load_row",),
+                          placement=placement, caps=read_caps, coupled=True),
+                    Stage("score_row", score_one, latency=s_lat,
+                          after=("load_row",), previous=("score_row",), placement=placement),
+                ]
+                if write_hist_slot:
+                    step.append(Stage(
+                        "score_row_write", slot_write, after=("score_row",),
+                        previous=("score_row_write",), placement=placement, caps=write_caps, coupled=True,
+                    ))
+                return tuple(step)
+            stages.append(Stage(
+                "pass1_history", after=(prev,),
+                program=PipelineProgram(score_hist, ATTNRES_RELOAD_PIPELINE_SLOTS, _score_step),
+            ))
+        return KernelProgram(tuple(stages))
+
+    def _build_coop_pass2_owner(
+        self, context: Any, owner: int, core: dict[str, Any], timings: dict[str, Any],
+    ) -> KernelProgram:
+        view = self.view
+        hidden = int(view["hidden"])
+        valid = int(view["valid_blocks"])
+        output_norm = bool(view["output_norm"])
+        save_mat = bool(view["save_materialized"])
+        row_bytes = float(_BF16_BYTES * hidden)
+        read_caps, write_caps = timings["read_caps"], timings["write_caps"]
+        placement = context.owned(owner, self.aiv, (self.role, "vector", "mte3"))
+        mix_ops = float(_WEIGHTED_MIX_OPS_PER_ELEMENT * hidden)
+        softmax_ops = float(ATTNRES_SOFTMAX_OPS_PER_ROW * (valid + 1) - 1)
+        norm_ops = float(_OUTPUT_NORM_OPS_PER_ELEMENT * hidden + _OUTPUT_NORM_SCALAR_OPS)
+        load_one = context.bind(Work({}, {"hbm": row_bytes, self.role: row_bytes}))
+        store_one = context.bind(Work({}, {"hbm": row_bytes, "mte3": row_bytes}))
         mix_one = context.bind(Work({}, {"vector": mix_ops}))
-        s_lat, m_lat = timings["score_row_ms"], timings["mix_row_ms"]
+        m_lat = timings["mix_row_ms"]
+        out_tokens = int(core["output_tokens"])
+        cached_per = int(core["cached_mix_rows"]) // out_tokens
+        reload_per = int(core["reload_mix_rows"]) // out_tokens
+        score_read_per = float(int(core.get("score_read_bytes", 0)) // out_tokens)
+        tok_stages: list[Stage] = []
+        prev: str | None = None
+        if score_read_per > 0.0:
+            tok_stages.append(Stage(
+                "read_scores",
+                context.bind(Work({}, {"hbm": score_read_per, self.role: score_read_per})),
+                placement=placement, caps=read_caps, coupled=True,
+            ))
+            prev = "read_scores"
+        tok_stages.append(Stage(
+            "softmax", context.bind(Work({}, {"vector": softmax_ops})),
+            latency=timings["softmax_ms"], after=(prev,) if prev else (), placement=placement,
+        ))
+        prev = "softmax"
+        if reload_per > 0:
+            def _mix_step(_i: int):
+                return (
+                    Stage("reload_row", load_one, previous=("reload_row",),
+                          placement=placement, caps=read_caps, coupled=True),
+                    Stage("mix_row", mix_one, latency=m_lat,
+                          after=("reload_row",), previous=("mix_row",), placement=placement),
+                )
+            tok_stages.append(Stage(
+                "pass2_mix", after=(prev,),
+                program=PipelineProgram(reload_per, ATTNRES_RELOAD_PIPELINE_SLOTS, _mix_step),
+            ))
+            prev = "pass2_mix"
+        if cached_per > 0:
+            tok_stages.append(Stage(
+                "mix_cached", context.bind(Work({}, {"vector": float(cached_per) * mix_ops})),
+                latency=float(cached_per) * m_lat, after=(prev,), placement=placement,
+            ))
+            prev = "mix_cached"
+        tok_stages.append(Stage(
+            "output_round", context.bind(Work({}, {"vector": float(hidden)})),
+            latency=timings["cast_row_ms"], after=(prev,), placement=placement,
+        ))
+        prev = "output_round"
+        if save_mat:
+            tok_stages.append(Stage(
+                "materialized_store", store_one,
+                after=(prev,), placement=placement, caps=write_caps, coupled=True,
+            ))
+            prev = "materialized_store"
+        if output_norm:
+            tok_stages.append(Stage(
+                "output_gamma_load", load_one, after=(prev,),
+                placement=placement, caps=read_caps, coupled=True,
+            ))
+            tok_stages.append(Stage(
+                "output_norm", context.bind(Work({}, {"vector": norm_ops})),
+                latency=timings["norm_row_ms"], after=("output_gamma_load",), placement=placement,
+            ))
+            prev = "output_norm"
+        tok_stages.append(Stage(
+            "output_store", store_one,
+            after=(prev,), placement=placement, caps=write_caps, coupled=True,
+        ))
+        tok_tuple = tuple(tok_stages)
+        return KernelProgram((Stage(
+            "tokens", program=PipelineProgram(out_tokens, 1, lambda _i, ts=tok_tuple: ts),
+        ),))
 
-        def _score_step(_i: int):
-            return (
-                Stage("load_row", load_one, previous=("load_row",),
-                      placement=placement, caps=read_caps, coupled=True),
-                Stage("score_row", score_one, latency=s_lat,
-                      after=("load_row",), previous=("score_row",), placement=placement),
+    def _build_h_split_stage_owner(
+        self, context: Any, owner: int, read_b: int, vec_ops: int, write_b: int,
+        timings: dict[str, Any], prefix: str,
+    ) -> KernelProgram:
+        if read_b <= 0 and vec_ops <= 0 and write_b <= 0:
+            return KernelProgram(())
+        placement = context.owned(owner, self.aiv, (self.role, "vector", "mte3"))
+        read_caps, write_caps = timings["read_caps"], timings["write_caps"]
+        stages: list[Stage] = []
+        prev: str | None = None
+        if read_b > 0:
+            stages.append(Stage(
+                f"{prefix}_read",
+                context.bind(Work({}, {"hbm": float(read_b), self.role: float(read_b)})),
+                placement=placement, caps=read_caps, coupled=True,
+            ))
+            prev = f"{prefix}_read"
+        if vec_ops > 0:
+            stages.append(Stage(
+                f"{prefix}_vec",
+                context.bind(Work({}, {"vector": float(vec_ops)})),
+                after=(prev,) if prev else (), placement=placement,
+            ))
+            prev = f"{prefix}_vec"
+        if write_b > 0:
+            stages.append(Stage(
+                f"{prefix}_write",
+                context.bind(Work({}, {"hbm": float(write_b), "mte3": float(write_b)})),
+                after=(prev,) if prev else (), placement=placement, caps=write_caps, coupled=True,
+            ))
+        return KernelProgram(tuple(stages))
+
+    def _build_coop_h_split_program(self, context: Any, timings: dict[str, Any]) -> KernelProgram:
+        ub_pool_units = context.pool_units.get("ub", self.aiv)
+        all_allocs = tuple(
+            context.allocate(
+                f"attn_res_ub_{owner}", "ub",
+                int(core.get("ub_bytes", self.view["ub_bytes_per_owner"])),
+                unit_group(owner, self.aiv, ub_pool_units),
             )
-
-        def _mix_step(_i: int):
-            return (
-                Stage("reload_row", load_one, previous=("reload_row",),
-                      placement=placement, caps=read_caps, coupled=True),
-                Stage("mix_row", mix_one, latency=m_lat,
-                      after=("reload_row",), previous=("mix_row",), placement=placement),
-            )
-
-        return (
-            Stage("pass1_history", program=PipelineProgram(
-                local_valid, ATTNRES_RELOAD_PIPELINE_SLOTS, _score_step)),
-            Stage("pass2_history", after=("pass1_history",), program=PipelineProgram(
-                local_valid, ATTNRES_RELOAD_PIPELINE_SLOTS, _mix_step)),
+            for owner, core in enumerate(self.cores)
         )
+        p1a = tuple(
+            self._build_h_split_stage_owner(
+                context, owner, int(c["p1a_read"]), int(c["p1a_vec"]), int(c["p1a_write"]),
+                timings, "p1a",
+            )
+            for owner, c in enumerate(self.cores)
+        )
+        p1b = tuple(
+            self._build_h_split_stage_owner(
+                context, owner, int(c["p1b_read"]), int(c["p1b_vec"]), int(c["p1b_write"]),
+                timings, "p1b",
+            )
+            for owner, c in enumerate(self.cores)
+        )
+        p2 = tuple(
+            self._build_h_split_stage_owner(
+                context, owner,
+                int(c["p2_score_read"]) + int(c["p2_row_read"]),
+                int(c["p2_vec"]),
+                int(c["p2_mat_write"]) + int(c["p2_out_write"]) + int(c["p2_stat_write"]),
+                timings, "p2",
+            )
+            for owner, c in enumerate(self.cores)
+            if int(c.get("output_tokens", 0)) > 0
+        )
+        stages: list[Stage] = [
+            Stage("ub_acquire", acquire=all_allocs),
+            Stage("pass1a_sqsum", after=("ub_acquire",), program=ParallelProgram(p1a)),
+            Stage("pass1b_score", after=("pass1a_sqsum",), program=ParallelProgram(p1b)),
+            Stage("pass2_output", after=("pass1b_score",), program=ParallelProgram(p2)),
+        ]
+        prev = "pass2_output"
+        if bool(self.view["output_norm"]):
+            p3 = tuple(
+                self._build_h_split_stage_owner(
+                    context, owner, int(c["p3_read"]), int(c["p3_vec"]), int(c["p3_write"]),
+                    timings, "p3",
+                )
+                for owner, c in enumerate(self.cores)
+                if int(c.get("output_tokens", 0)) > 0
+            )
+            stages.append(Stage("pass3_output_norm", after=(prev,), program=ParallelProgram(p3)))
+            prev = "pass3_output_norm"
+        stages.append(Stage("ub_release", after=(prev,), free=all_allocs))
+        return KernelProgram(tuple(stages))
+
+    def _build_cooperative_program(self, context: Any, timings: dict[str, Any]) -> KernelProgram:
+        if self.view.get("tiling_strategy") == "coop_h_split":
+            return self._build_coop_h_split_program(context, timings)
+        ub_pool_units = context.pool_units.get("ub", self.aiv)
+        all_allocs = tuple(
+            context.allocate(
+                f"attn_res_ub_{owner}", "ub",
+                int(core.get("ub_bytes", self.view["ub_bytes_per_owner"])),
+                unit_group(owner, self.aiv, ub_pool_units),
+            )
+            for owner, core in enumerate(self.cores)
+        )
+        pass1 = tuple(
+            self._build_coop_pass1_owner(context, owner, core, timings)
+            for owner, core in enumerate(self.cores)
+        )
+        pass2 = tuple(
+            self._build_coop_pass2_owner(context, owner, core, timings)
+            for owner, core in enumerate(self.cores)
+            if int(core.get("output_tokens", 0)) > 0
+        )
+        return KernelProgram((
+            Stage("ub_acquire", acquire=all_allocs),
+            Stage("pass1_score", after=("ub_acquire",), program=ParallelProgram(pass1)),
+            Stage("pass2_output", after=("pass1_score",), program=ParallelProgram(pass2)),
+            Stage("ub_release", after=("pass2_output",), free=all_allocs),
+        ))
 
     def _build_token_stages(
         self,
         context: Any,
         placement: dict[str, tuple[int, ...]],
         timings: dict[str, Any],
-        *,
-        writes_output: bool = True,
-        is_primary: bool = True,
-        owner_valid: int | None = None,
     ) -> tuple[Stage, ...]:
         view = self.view
         hidden = int(view["hidden"])
         valid = int(view["valid_blocks"])
-        local_valid = valid if owner_valid is None else int(owner_valid)
         mixing = bool(view["mix"] and valid > 0)
         resident = bool(view["resident"])
         fuse_add = bool(view["fuse_add"])
@@ -1238,14 +1796,6 @@ class _AttnResPrefixProgram:
         # while total declared vector work stays strictly conserved.
         score_ops = float((_SCORE_OPS_PER_ELEMENT + 1) * hidden + 2)
         mix_ops = float((_WEIGHTED_MIX_OPS_PER_ELEMENT - 1) * hidden)
-        if not is_primary:
-            if not mixing:
-                return ()
-            return self._build_coop_secondary_stages(
-                context, placement, timings,
-                local_valid=local_valid, resident=resident, row_bytes=row_bytes,
-                score_ops=score_ops, mix_ops=mix_ops,
-            )
         softmax_ops = float(ATTNRES_SOFTMAX_OPS_PER_ROW * (valid + 1) - 1)
         norm_ops = float(_OUTPUT_NORM_OPS_PER_ELEMENT * hidden + _OUTPUT_NORM_SCALAR_OPS)
         add_ops = float(_FUSED_ADD_OPS_PER_ELEMENT * hidden)
@@ -1265,8 +1815,8 @@ class _AttnResPrefixProgram:
             ))
             prev = "fused_add"
         if mixing and resident:
-            if local_valid > 0:
-                hist_bytes = float(local_valid) * row_bytes
+            if valid > 0:
+                hist_bytes = float(valid) * row_bytes
                 stages.append(Stage(
                     "history_load",
                     context.bind(Work({}, {"hbm": hist_bytes, self.role: hist_bytes})),
@@ -1274,14 +1824,14 @@ class _AttnResPrefixProgram:
                 ))
                 stages.append(Stage(
                     "history_ub_copy",
-                    latency=float(local_valid) * timings["ub_copy_row_ms"],
+                    latency=float(valid) * timings["ub_copy_row_ms"],
                     after=("history_load",), placement=placement,
                 ))
                 prev = "history_ub_copy"
             stages.append(Stage(
                 "score_rows",
-                context.bind(Work({}, {"vector": float(local_valid + 1) * score_ops})),
-                latency=float(local_valid + 1) * timings["score_row_ms"],
+                context.bind(Work({}, {"vector": float(valid + 1) * score_ops})),
+                latency=float(valid + 1) * timings["score_row_ms"],
                 after=(prev,), placement=placement,
             ))
             stages.append(Stage(
@@ -1291,15 +1841,15 @@ class _AttnResPrefixProgram:
             ))
             stages.append(Stage(
                 "mix_rows",
-                context.bind(Work({}, {"vector": float(local_valid + 1) * mix_ops})),
-                latency=float(local_valid + 1) * timings["mix_row_ms"],
+                context.bind(Work({}, {"vector": float(valid + 1) * mix_ops})),
+                latency=float(valid + 1) * timings["mix_row_ms"],
                 after=("softmax",), placement=placement,
             ))
             prev = "mix_rows"
         elif mixing:
             reload_stages, prev = self._build_reload_stages(
                 context, placement, timings,
-                prev=prev, valid=local_valid, row_bytes=row_bytes,
+                prev=prev, valid=valid, row_bytes=row_bytes,
                 score_ops=score_ops, mix_ops=mix_ops, softmax_ops=softmax_ops,
             )
             stages.extend(reload_stages)
@@ -1330,25 +1880,26 @@ class _AttnResPrefixProgram:
                 latency=timings["norm_row_ms"], after=(prev,), placement=placement,
             ))
             prev = "output_norm"
-        if writes_output:
-            write_bytes = float(write_mult) * row_bytes
-            stages.append(Stage(
-                "output_store",
-                context.bind(Work({}, {"hbm": write_bytes, "mte3": write_bytes})),
-                after=(prev,), placement=placement, caps=write_caps, coupled=True,
-            ))
+        write_bytes = float(write_mult) * row_bytes
+        stages.append(Stage(
+            "output_store",
+            context.bind(Work({}, {"hbm": write_bytes, "mte3": write_bytes})),
+            after=(prev,), placement=placement, caps=write_caps, coupled=True,
+        ))
         return tuple(stages)
 
     def __call__(self, context: Any) -> ParallelProgram | KernelProgram:
         if not self.cores:
             return KernelProgram(())
         view = self.view
+        timings = _attnres_phase_timings(context, view, self.role, self.aiv)
+        if view.get("tiling_strategy") in _COOP_STRATEGIES:
+            return self._build_cooperative_program(context, timings)
         hidden = int(view["hidden"])
         mixing = bool(view["mix"] and int(view["valid_blocks"]) > 0)
         gamma_cached = bool(view["output_norm"] and view["output_norm_cached"])
         row_bytes = float(_BF16_BYTES * hidden)
         setup_vec = float(_PROJECTION_SETUP_OPS_PER_ELEMENT * hidden)
-        timings = _attnres_phase_timings(context, view, self.role, self.aiv)
         ub_pool_units = context.pool_units.get("ub", self.aiv)
         programs: list[KernelProgram] = []
         for owner, core in enumerate(self.cores):
@@ -1373,12 +1924,7 @@ class _AttnResPrefixProgram:
                     latency=timings["setup_ms"], after=(prev,), placement=placement,
                 ))
                 prev = "weight_setup"
-            token_stages = self._build_token_stages(
-                context, placement, timings,
-                writes_output=bool(core.get("writes_output", True)),
-                is_primary=bool(core.get("is_primary", True)),
-                owner_valid=core.get("owner_valid_blocks"),
-            )
+            token_stages = self._build_token_stages(context, placement, timings)
             count = int(core["token_count"])
             if token_stages and count > 0:
                 stages.append(Stage(
