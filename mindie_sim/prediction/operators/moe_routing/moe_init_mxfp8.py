@@ -8,17 +8,55 @@
 [Side-Effect Policy] Pure plans on the common Engine; no measurements or locks.
 """
 from math import ceil
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.engine import Allocation
 from mindie_sim.prediction.instructions import PrimitiveInventory
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from .moe_init_instructions import INDEX_BYTES, SORT_BLOCK_ROWS, diagnostics, source_operations
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+        relative_path="moe/moe_init_routing_v3/op_kernel/arch35/moe_v3_gather_mxfp8_quant.h",
+        source_sha256="34b49b8e82da39bfe59dc4e80c46fc3eea96f93ae16ade54b913c0cfea5df813",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+        relative_path="moe/moe_init_routing_v3/op_kernel/arch35/moe_v3_sort_one_core_arch35.h",
+        source_sha256="920534d82fd33eb308a4b3493e978b598e5bfba1da51f6700794a12197e94709",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+        relative_path="moe/moe_init_routing_v3/op_kernel/arch35/moe_v3_expert_tokens_count_arch35.h",
+        source_sha256="d0dfd8f977596357f37fddd1ea871789657b128e9c0d4bda03badbbd99ce7077",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+        relative_path="moe/moe_init_routing_v3/op_kernel/arch35/moe_v3_row_idx_gather_arch35.h",
+        source_sha256="cfc375ee5bb0a5f9ddb845ba349ea09e3ed64ada80c3e947e6ff3fc25ce6d353",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+        relative_path="moe/moe_init_routing_v3/op_host/moe_init_routing_v3_tiling_arch35.cpp",
+        source_sha256="1507153599d4ccae0cc056dc5b1e4f4849c02cf97893736f3d6913a43b52385d",
+    ),
+)
+
 RECIPE = "ascend_moe_init_routing_v3_mxfp8"
 MX_SCALE_GROUP_SIZE = 32
 MX_WIDTH_ALIGNMENT = 256
+MAX_COUNT_MODE_EXPERTS = 10240
+_ARCH35_IDS = frozenset({"npu_arch_3510", "dav_3510"})
 _BF16_BYTES = int(dtype_bytes("bf16"))
 _PUBLISHED_COUNT_BYTES = int(dtype_bytes("int64"))
 _UB_ALIGNMENT_BYTES = 32
@@ -172,14 +210,57 @@ def _gather_quantize_owner(
 
 
 
+def _validate_arch35_mxfp8(geometry) -> None:
+    """Require Arch35 (``npu_arch_3510``) and native E4M3 quantization support."""
+    datapath = getattr(geometry, "datapath", None)
+    ca = (
+        getattr(datapath, "compute_arch", None)
+        if datapath is not None
+        else getattr(geometry, "compute_arch", None)
+    )
+    arch_id = str(getattr(ca, "arch_id", "") or getattr(ca, "preset", "") or "").strip().lower()
+    if arch_id not in _ARCH35_IDS:
+        raise ModelingError(
+            f"moe_init_mxfp8_requires_arch35_npu_arch_3510:{arch_id or 'unknown'}"
+        )
+    declared = ca if hasattr(ca, "supports_native") else getattr(ca, "declared", None)
+    if declared is not None and hasattr(declared, "supports_native") and not declared.supports_native("matrix", "fp8_e4m3"):
+        raise ModelingError("moe_init_mxfp8_requires_native_fp8_e4m3")
+
+
+def _resolve_stream_aiv(geometry) -> tuple[int, int, tuple[int, ...], str, tuple[int, ...]]:
+    """Resolve ``(die_units, effective_units, aiv_pool, isolation, shared_pool)``."""
+    die_units = int(geometry.resource_units.get("vector", 0))
+    owners = getattr(geometry, "stream_owners", None)
+    if owners is None:
+        return die_units, die_units, tuple(range(max(0, die_units))), "full", ()
+    aiv_limit = int(owners.aiv_limit)
+    if aiv_limit < 1:
+        raise ModelingError("moe_init_mxfp8_requires_positive_stream_aiv_budget")
+    units = min(die_units, aiv_limit)
+    if owners.isolation == "disjoint":
+        pool = owners.aiv if owners.aiv else tuple(range(units))
+        units = min(units, len(pool))
+        return die_units, units, tuple(pool[:units]), "disjoint", ()
+    shared_pool = tuple(owners.pool_aiv) if owners.pool_aiv else ()
+    if shared_pool:
+        units = min(units, len(shared_pool))
+        pool = shared_pool[:units]
+    else:
+        pool = tuple(range(units))
+    return die_units, units, tuple(pool), "shared_cap", shared_pool
+
+
 def _build_moe_init_program(
-    context, *, units, active, assignments, per_owner, topk, experts, use_gather_copy,
-    memory, init, assignment_ids_read, sort_services, sort_input_rows, sort_vector,
-    sort_out, count_parts, count_services, primitive_work, operation_work, count_reduce,
-    inverse_parts, inverse_services, idle_index, row_load, row_quant, row_write, ub_bytes,
+    context, *, die_units, units, aiv_pool, isolation, shared_pool, active, assignments,
+    per_owner, topk, experts, use_gather_copy, memory, init, assignment_ids_read,
+    sort_services, sort_input_rows, sort_vector, sort_out, count_parts, count_services,
+    primitive_work, operation_work, count_reduce, inverse_parts, inverse_services,
+    idle_index, row_load, row_quant, row_write, ub_bytes,
 ):
     def owned(owner):
-        return context.owned(owner, units, (
+        phys_owner = aiv_pool[owner] if owner < len(aiv_pool) else owner
+        return context.owned(phys_owner, die_units, (
             "vector", "mte2_aiv", "mte3", *primitive_work.resources, *operation_work.resources))
 
     def stage(name, work, owner, **kwargs):
@@ -208,18 +289,33 @@ def _build_moe_init_program(
                       use_gather_copy, row_load, row_quant, row_write,
                   ) for owner in range(active)))),
     ))
-    allocation = (Allocation("source_ub", context.pool_names["ub"], ub_bytes,
-                             tuple(range(context.pool_units.get("ub", units)))),)
+    if isolation == "disjoint":
+        ub_alloc_bytes, ub_owners = ub_bytes, aiv_pool
+    elif isolation == "shared_cap":
+        # Shared-cap lanes do not own fixed physical AIV indices; spread the
+        # lane's total UB footprint evenly across its shared AIV pool so
+        # independent launches conserve aggregate UB without pinning unit 0.
+        ub_owners = shared_pool or tuple(range(context.pool_units.get("ub", die_units)))
+        ub_alloc_bytes = ub_bytes * (float(units) / float(max(1, len(ub_owners))))
+    else:
+        ub_alloc_bytes = ub_bytes
+        ub_owners = tuple(range(context.pool_units.get("ub", units)))
+    allocation = (Allocation("source_ub", context.pool_names["ub"], ub_alloc_bytes, ub_owners),)
     return KernelProgram((Stage("reserve", acquire=allocation),
                           Stage("source", after=("reserve",), program=phases),
                           Stage("release", after=("source",), free=allocation)))
 
 
 def build(op, geometry):
+    _validate_arch35_mxfp8(geometry)
     cfg = dict(op.metadata)["moe_init_config"]
     tokens, topk, width, experts = (cfg[k] for k in ("tokens", "topk", "width", "experts"))
+    if experts > MAX_COUNT_MODE_EXPERTS:
+        raise ModelingError(
+            f"moe_init_mxfp8_count_mode_experts_exceed_limit:{experts}:{MAX_COUNT_MODE_EXPERTS}"
+        )
     assignments = tokens * topk
-    units = geometry.resource_units.get("vector", 0)
+    die_units, units, aiv_pool, isolation, shared_pool = _resolve_stream_aiv(geometry)
     ub = geometry.buffers.get("ub", 0)
     available = ub - _SIMT_CACHE_BYTES
     sort_capacity_blocks = min(available // _SORT_UB_BYTES_PER_ROW // SORT_BLOCK_ROWS,
@@ -317,14 +413,18 @@ def build(op, geometry):
 
     def program(context):
         return _build_moe_init_program(
-            context, units=units, active=active, assignments=assignments, per_owner=per_owner,
-            topk=topk, experts=experts, use_gather_copy=use_gather_copy, memory=memory,
-            init=init, assignment_ids_read=assignment_ids_read, sort_services=sort_services,
+            context, die_units=die_units, units=units, aiv_pool=aiv_pool,
+            isolation=isolation, shared_pool=shared_pool, active=active,
+            assignments=assignments, per_owner=per_owner, topk=topk, experts=experts,
+            use_gather_copy=use_gather_copy, memory=memory, init=init,
+            assignment_ids_read=assignment_ids_read, sort_services=sort_services,
             sort_input_rows=sort_input_rows, sort_vector=sort_vector, sort_out=sort_out,
-            count_parts=count_parts, count_services=count_services, primitive_work=primitive_work,
-            operation_work=operation_work, count_reduce=count_reduce, inverse_parts=inverse_parts,
-            inverse_services=inverse_services, idle_index=idle_index, row_load=row_load,
-            row_quant=row_quant, row_write=row_write, ub_bytes=ub_bytes)
+            count_parts=count_parts, count_services=count_services,
+            primitive_work=primitive_work, operation_work=operation_work,
+            count_reduce=count_reduce, inverse_parts=inverse_parts,
+            inverse_services=inverse_services, idle_index=idle_index,
+            row_load=row_load, row_quant=row_quant, row_write=row_write,
+            ub_bytes=ub_bytes)
     source_branch = (
         "onecore_sort_GATHER_count_mode_full_range_useGatherCopy"
         if use_gather_copy else "onecore_sort_GATHER_count_mode_full_range_scatterCopy"

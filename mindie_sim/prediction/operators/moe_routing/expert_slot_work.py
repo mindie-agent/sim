@@ -26,7 +26,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 import math
-from typing import Any
+from typing import Any, Literal
 
 from mindie_sim.catalog.expert_slots import ExpertSlotPlan
 from mindie_sim.schema.common import (
@@ -35,7 +35,17 @@ from mindie_sim.schema.common import (
     inclusion_probability,
     normal_max_order_z,
 )
+from mindie_sim.schema.datapath import SourceRef
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="175ef4d49c2072f9233619636f0309f4f88b4e2c",
+        relative_path="vllm_ascend/ops/fused_moe/token_dispatcher.py",
+        source_sha256="6126304014959e8c52d87284ccac078f7622a6d72c7a7fc8be25929dfe644cfb",
+    ),
+)
 
 POLICY_BALANCED = "balanced_expectation"
 POLICY_EXPLICIT = "explicit"
@@ -386,9 +396,20 @@ def physical_slot_work(
     )
 
 
-def bind_expert_slot_work(ops: Sequence[Any], *, slot_work: PhysicalSlotWork) -> tuple[Any, ...]:
-    """Attach resolved physical-slot reads to routed grouped-GEMM records."""
+def bind_expert_slot_work(
+    ops: Sequence[Any],
+    *,
+    slot_work: PhysicalSlotWork,
+    barrier: bool = False,
+) -> tuple[Any, ...]:
+    """Attach resolved physical-slot reads to routed grouped-GEMM records.
+
+    Per-rank physical operators bind additive ``weight_read_bytes(rank)`` so
+    summing across EP ranks conserves total routed cold weight reads; single-rank
+    barrier callers pass ``barrier=True`` to bind ``critical_rank_weight_read_bytes()``.
+    """
     result = []
+    barrier_bytes = slot_work.critical_rank_weight_read_bytes()
     for op in ops:
         metadata = dict(getattr(op, "metadata", ()) or ())
         rank = metadata.get("ep_rank", metadata.get("rank"))
@@ -399,14 +420,15 @@ def bind_expert_slot_work(ops: Sequence[Any], *, slot_work: PhysicalSlotWork) ->
         rank = int(rank)
         if rank < 0 or rank >= len(slot_work.per_rank_slot_rows):
             raise ModelingError(f"expert_slot_work_rank_invalid:{rank}")
-        active_bytes = slot_work.rank_barrier_weight_read_bytes(rank)
-        mean_bytes = slot_work.rank_mean_weight_read_bytes(rank)
+        mean_bytes = slot_work.weight_read_bytes(rank)
+        active_bytes = barrier_bytes if barrier else mean_bytes
         previous = float(metadata.get("routed_weight_read_bytes", 0) or 0)
         metadata.update({
             "physical_slot_rows": slot_work.per_rank_slot_rows[rank],
             "physical_slot_active": slot_work.active_slots_by_rank[rank],
             "physical_slot_weight_bytes": active_bytes,
             "physical_slot_mean_weight_bytes": mean_bytes,
+            "physical_slot_barrier_weight_bytes": barrier_bytes,
             "routed_weight_read_bytes": active_bytes,
             "packed_weight_bytes": active_bytes,
             "expert_slot_active_weight_bytes": active_bytes,

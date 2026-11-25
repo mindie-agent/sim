@@ -14,13 +14,34 @@ from __future__ import annotations
 
 from bisect import bisect_right
 import math
-from typing import Any, Iterator, Mapping
+from typing import Any, Iterator, Literal, Mapping
 
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, Work
 from mindie_sim.prediction.ownership import unit_group
 from mindie_sim.prediction.program import ParallelProgram, PipelineProgram, Stage
+from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="175ef4d49c2072f9233619636f0309f4f88b4e2c",
+        relative_path="vllm_ascend/ops/fused_moe/moe_mlp.py",
+        source_sha256="6b5f4f6d3259cb14e0613a6f7b1c2592331f143a14cf7240dd9d49a0a57dd53b",
+    ),
+    SourceRef(
+        repository="Ascend/op-plugin",
+        revision="48189acf95882e23fae56ea96ceeb89358cb42da",
+        relative_path="op_plugin/ops/opapi/GroupedMatmulKernelNpuOpApi.cpp",
+        source_sha256="a58dd51addfa3511735fcf1f46355a4597f62920cc5d24edc335b59610128fdc",
+    ),
+)
+
+_ARCH22_IDS = frozenset({"npu_arch_2201", "dav_2201"})
+_GENERIC_ARCH_IDS = frozenset({"", "generic"})
+_L1_DOUBLE_BUFFER_DEPTH = 2
 _IMPLEMENTATION = "ascendc_grouped_nd_bf16"
 _ND_NONTRANSPOSED_TILING_KEY = 10
 _HOST_TILE_ALIGNMENT = 16
@@ -444,15 +465,16 @@ def host_tiling(op: OpSpec, geometry: Geometry) -> dict[str, Any]:
         step_ka = step_ka // step_kb * step_kb
     elif step_ka < step_kb:
         step_kb = step_kb // step_ka * step_ka
-    # One declared K-panel residency: full A and B step groups, no double buffer.
-    l1_panel = (step_ka * base_m * base_k * _MM_DTYPE_BYTES
-                + step_kb * _BASE_N * base_k * _MM_DTYPE_BYTES)
+    depth_a1 = step_ka * _L1_DOUBLE_BUFFER_DEPTH
+    depth_b1 = step_kb * _L1_DOUBLE_BUFFER_DEPTH
+    # Programmed L1 residency matches configured depthA1 A1 and depthB1 B1 buffers.
+    l1_panel = (depth_a1 * base_m + depth_b1 * _BASE_N) * base_k * _MM_DTYPE_BYTES
     allocation_bytes["l1"] = float(l1_panel)
     result.update({
         "step_ka": step_ka,
         "step_kb": step_kb,
-        "depth_a1": step_ka * 2,
-        "depth_b1": step_kb * 2,
+        "depth_a1": depth_a1,
+        "depth_b1": depth_b1,
         "l1_a_size": l1_a_size,
         "l1_b_size": l1_b_size,
         "allocation_bytes": allocation_bytes,
@@ -566,13 +588,84 @@ def make_op(params: dict) -> OpSpec:
     )
 
 
-def _total_work(entries: tuple[dict[str, Any], ...]) -> Work:
-    flops = float(sum(entry["flops"] for entry in entries))
+def _validate_supported_arch(geometry: Geometry) -> None:
+    """Gate this Arch22 (910B/910_93) BF16 ND kernel away from Arch35/other targets."""
+    datapath = getattr(geometry, "datapath", None)
+    if datapath is not None:
+        ca = getattr(datapath, "compute_arch", None)
+        arch_id = str(getattr(ca, "arch_id", "") or getattr(ca, "preset", "") or "").strip().lower()
+        if getattr(datapath, "has_l0c_to_ub", False) or (
+            arch_id not in _ARCH22_IDS and arch_id not in _GENERIC_ARCH_IDS
+        ):
+            raise ModelingError(
+                f"grouped_gemm_source_unsupported_arch:{arch_id or 'unknown'}"
+            )
+        return
+    ca = getattr(geometry, "compute_arch", None)
+    arch_id = str(getattr(ca, "arch_id", "") or getattr(ca, "preset", "") or "").strip().lower()
+    if arch_id and arch_id not in _ARCH22_IDS and arch_id not in _GENERIC_ARCH_IDS:
+        raise ModelingError(f"grouped_gemm_source_unsupported_arch:{arch_id}")
+
+
+def _uses_aic_fixpipe_path(geometry: Geometry) -> bool:
+    """True when hardware declares AIC MTE1 L1->L0 and Fixpipe L0C->GM pipes."""
+    rates = getattr(geometry, "rates", None) or {}
+    units = getattr(geometry, "resource_units", None) or {}
+    has_mte1 = "mte1" in rates or "mte1" in units
+    has_fixpipe = "fixpipe" in rates or "fixpipe" in units
+    return has_mte1 and has_fixpipe
+
+
+def _aic_read_role(geometry: Geometry) -> str:
+    rates = getattr(geometry, "rates", None) or {}
+    units = getattr(geometry, "resource_units", None) or {}
+    if "mte2_aic" in rates or "mte2_aic" in units:
+        return "mte2_aic"
+    return "mte2"
+
+
+def _bf16_fractal_block(geometry: Geometry) -> tuple[int, int, int]:
+    """Return declared BF16 Cube fractal (tile_m, tile_n, tile_k), or (1, 1, 1) on controls."""
+    datapath = getattr(geometry, "datapath", None)
+    for spec in getattr(datapath, "subtile_wave", ()):
+        mode = str(getattr(spec, "native_mode", "") or "").strip().lower()
+        if mode in {"bf16", "bfloat16"}:
+            return (int(spec.tile_m), int(spec.tile_n), int(spec.tile_k))
+    return (1, 1, 1)
+
+
+def _issued_tile_flops(rows: int, cols: int, k: int, block: tuple[int, int, int]) -> int:
+    bm, bn, bk = block
+    if bm == 1 and bn == 1 and bk == 1:
+        return 2 * rows * cols * k
+    return (
+        2
+        * (math.ceil(rows / bm) * bm)
+        * (math.ceil(cols / bn) * bn)
+        * (math.ceil(k / bk) * bk)
+    )
+
+
+def _total_work(
+    entries: tuple[dict[str, Any], ...],
+    *,
+    n: int,
+    k: int,
+    block: tuple[int, int, int],
+    use_aic_fixpipe: bool,
+    read_role: str,
+) -> Work:
+    flops = float(sum(
+        _issued_tile_flops(int(entry["rows"]), n, k, block) for entry in entries
+    ))
     hbm = float(sum(entry["hbm_bytes"] for entry in entries))
     mte2 = float(sum(entry["mte2_bytes"] for entry in entries))
-    mte3 = float(sum(entry["mte3_bytes"] for entry in entries))
-    resources = {role: value for role, value in (("hbm", hbm), ("mte2", mte2),
-                                                ("mte3", mte3)) if value}
+    output_bytes = float(sum(entry["mte3_bytes"] for entry in entries))
+    if use_aic_fixpipe:
+        pairs = (("hbm", hbm), (read_role, mte2), ("mte1", mte2), ("fixpipe", output_bytes))
+    else:
+        pairs = (("hbm", hbm), ("mte2", mte2), ("mte3", output_bytes))
+    resources = {role: value for role, value in pairs if value}
     return Work(matrix={"bf16": flops} if flops else {}, resources=resources)
 
 
@@ -666,6 +759,7 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
         raise ValueError("grouped_gemm_build_requires_selected_dispatch_flags")
     if op.dtype != "bf16" or op.layout != "ND":
         raise ValueError("grouped_gemm_build_requires_bf16_nd")
+    _validate_supported_arch(geometry)
     if not {"processed_entries", "n", "k", "host", "input_rows"}.issubset(meta):
         raise ValueError("grouped_gemm_build_requires_make_op_metadata")
     entries = tuple(meta["processed_entries"])
@@ -681,8 +775,85 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     if entries and core_num < 1:
         raise ValueError("grouped_gemm_requires_positive_core_num")
     sizes = dict(host.get("allocation_bytes", {}))
-    work = _total_work(entries)
+    use_aic_fixpipe = _uses_aic_fixpipe_path(geometry)
+    read_role = _aic_read_role(geometry)
+    fractal_block = _bf16_fractal_block(geometry)
+    base_k = int(host["base_k"]) if host.get("base_k") else k
+    work = _total_work(
+        entries,
+        n=n,
+        k=k,
+        block=fractal_block,
+        use_aic_fixpipe=use_aic_fixpipe,
+        read_role=read_role,
+    )
     spans = _core_spans(entries, core_num)
+
+    def _aic_tile_stages(context, rows: int, cols: int, core: int):
+        c_bytes = rows * cols * _ELEM_BYTES
+        l1 = _allocation(context, "l1", sizes, core)
+        l0a = _allocation(context, "l0a", sizes, core)
+        l0b = _allocation(context, "l0b", sizes, core)
+        l0c = _allocation(context, "l0c", sizes, core)
+        l0_ab = tuple(item for item in (l0a, l0b) if item)
+        k_steps = max(1, math.ceil(k / base_k))
+        if k_steps == 1:
+            a_bytes = rows * k * _ELEM_BYTES
+            b_bytes = k * cols * _ELEM_BYTES
+            flops = _issued_tile_flops(rows, cols, k, fractal_block)
+            return (
+                Stage("load", context.bind(Work(resources={
+                    "hbm": a_bytes + b_bytes,
+                    read_role: a_bytes + b_bytes,
+                })), acquire=(l1,) if l1 else (),
+                    placement=_pin(context, read_role, core)),
+                Stage("l1_to_l0", context.bind(Work(resources={
+                    "mte1": a_bytes + b_bytes,
+                })), after=("load",), acquire=l0_ab, free=(l1,) if l1 else (),
+                    placement=_pin(context, "mte1", core)),
+                Stage("compute", context.bind(Work(matrix={"bf16": flops})),
+                      after=("l1_to_l0",), acquire=(l0c,) if l0c else (), free=l0_ab,
+                      placement=_pin(context, "cube", core)),
+                Stage("store", context.bind(Work(resources={
+                    "hbm": c_bytes, "fixpipe": c_bytes,
+                })), after=("compute",), free=(l0c,) if l0c else (),
+                    placement=_pin(context, "fixpipe", core)),
+            )
+
+        def k_panel(k_idx: int):
+            k_chunk = min(base_k, k - k_idx * base_k)
+            a_k = rows * k_chunk * _ELEM_BYTES
+            b_k = k_chunk * cols * _ELEM_BYTES
+            flops_k = _issued_tile_flops(rows, cols, k_chunk, fractal_block)
+            return (
+                Stage("load", context.bind(Work(resources={
+                    "hbm": a_k + b_k, read_role: a_k + b_k,
+                })), acquire=(l1,) if l1 else (),
+                    placement=_pin(context, read_role, core)),
+                Stage("l1_to_l0", context.bind(Work(resources={
+                    "mte1": a_k + b_k,
+                })), after=("load",), acquire=l0_ab, free=(l1,) if l1 else (),
+                    placement=_pin(context, "mte1", core)),
+                Stage("compute", context.bind(Work(matrix={"bf16": flops_k})),
+                      after=("l1_to_l0",), free=l0_ab,
+                      placement=_pin(context, "cube", core)),
+            )
+
+        stages = []
+        k_after: tuple[str, ...] = ()
+        if l0c:
+            stages.append(Stage("l0c_reserve", acquire=(l0c,)))
+            k_after = ("l0c_reserve",)
+        stages.append(Stage(
+            "k_loop", after=k_after,
+            program=PipelineProgram(k_steps, 1, k_panel, 0.0, 0.0),
+        ))
+        stages.append(Stage(
+            "store", context.bind(Work(resources={"hbm": c_bytes, "fixpipe": c_bytes})),
+            after=("k_loop",), free=(l0c,) if l0c else (),
+            placement=_pin(context, "fixpipe", core),
+        ))
+        return tuple(stages)
 
     def program(context):
         if context.core_count < core_num:
@@ -703,10 +874,12 @@ def build(op: OpSpec, geometry: Geometry) -> OperatorPlan:
                 entry = entries[group_index]
                 m_index, n_index = divmod(task, int(entry["n_tiles"]))
                 rows, cols, _, _ = _tile_geometry(entry, m_index, n_index, n)
+                if use_aic_fixpipe:
+                    return _aic_tile_stages(context, rows, cols, core)
                 a_bytes = rows * k * _ELEM_BYTES
                 b_bytes = k * cols * _ELEM_BYTES
                 c_bytes = rows * cols * _ELEM_BYTES
-                flops = 2 * rows * cols * k
+                flops = _issued_tile_flops(rows, cols, k, fractal_block)
                 l1 = _allocation(context, "l1", sizes, core)
                 l0a = _allocation(context, "l0a", sizes, core)
                 l0b = _allocation(context, "l0b", sizes, core)

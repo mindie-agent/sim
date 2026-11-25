@@ -7,12 +7,30 @@
 [Side-Effect Policy] Returns immutable operators and recipe declarations.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.implementations import select
 from mindie_sim.prediction.mechanism import PlannedRecipe
 from .moe_init_mxfp8 import (
-    MX_SCALE_GROUP_SIZE, MX_WIDTH_ALIGNMENT, RECIPE, SOURCE, build,
+    MAX_COUNT_MODE_EXPERTS, MX_SCALE_GROUP_SIZE, MX_WIDTH_ALIGNMENT, RECIPE, SOURCE, build,
+)
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+        relative_path="moe/moe_init_routing_v3/op_host/moe_init_routing_v3_tiling_arch35.cpp",
+        source_sha256="1507153599d4ccae0cc056dc5b1e4f4849c02cf97893736f3d6913a43b52385d",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+        relative_path="moe/moe_init_routing_v3/op_kernel/arch35/moe_v3_gather_mxfp8_quant.h",
+        source_sha256="34b49b8e82da39bfe59dc4e80c46fc3eea96f93ae16ade54b913c0cfea5df813",
+    ),
 )
 
 CAPABILITIES = frozenset({
@@ -63,6 +81,10 @@ def apply(ops, bindings, runtime):
     selected = select(bindings, "moe_init_routing")
     if not selected:
         return ops
+    rt_meta = dict(getattr(runtime, "metadata", ()) or ())
+    arch_family = str(rt_meta.get("arch_family") or "").strip().upper()
+    if arch_family and arch_family != "A5":
+        raise ModelingError(f"moe_init_mxfp8_requires_arch35_a5:{arch_family}")
     if runtime.parallel.ep != 1 or runtime.kernels.get("moe_transport"):
         raise ModelingError("moe_init_mxfp8_requires_local_experts_without_transport_quantization")
     replacements = {}
@@ -121,6 +143,10 @@ def apply(ops, bindings, runtime):
         experts = pm["num_experts"]
         if type(experts) is not int or experts < 1:
             raise ModelingError("moe_init_mxfp8_requires_positive_local_experts")
+        if experts > MAX_COUNT_MODE_EXPERTS:
+            raise ModelingError(
+                f"moe_init_mxfp8_count_mode_experts_exceed_limit:{experts}:{MAX_COUNT_MODE_EXPERTS}"
+            )
         pm.update({
             "implementation": RECIPE, "implementation_binding": {"selector": "moe_init_routing",
                                                                    "implementation": RECIPE},

@@ -12,13 +12,36 @@
 [Side-Effect Policy] Immutable caller metadata and operator descriptions only.
 """
 from dataclasses import dataclass, replace
+import math
+from typing import Literal
 
+from mindie_sim.catalog.expert_slots import expert_slot_plan
 from mindie_sim.catalog.ops import barrier_op, comm_op, vector_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
+from mindie_sim.schema.runtime_features import split_routing_features
+
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="175ef4d49c2072f9233619636f0309f4f88b4e2c",
+        relative_path="vllm_ascend/ops/fused_moe/prepare_finalize.py",
+        source_sha256="88560c839172f5b433753c796d17a5d41278204f33b2e9ca9d4b2af9ccbe16d8",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="175ef4d49c2072f9233619636f0309f4f88b4e2c",
+        relative_path="vllm_ascend/ops/fused_moe/routed_experts.py",
+        source_sha256="c5d0bce5c8ef7ceebc0711d45d919a21dca7ea5c3a36822a60977a8120a67006",
+    ),
+)
 
 KIND = "vllm_ascend_mc2_tp_slice"
 ALLTOALL_KIND = "vllm_ascend_alltoall_tp_slice"
 _PAD_V3_PADDING_SHAPE = (4,)  # One before/after pair for each of the two input axes.
+_UNIFORM_SHARE_TOL = 1e-12
+_LOGITS_DTYPE_ALIASES = {"float32": "fp32", "bfloat16": "bf16", "float16": "fp16"}
 SOURCE = {
     "repository": "vllm-ascend",
     "revision": "8c30e4f491f73cba737a1dacc522894e437cdf3d",
@@ -61,6 +84,8 @@ class TokenPartition:
     logits_dtype: str = ""
     activation_tensor_rows: int = 0
     activation_owners: int = 0
+    producer_logits_dtype: str = ""
+    destination_rank_shares: tuple[float, ...] = ()
 
     @property
     def caller(self):
@@ -99,8 +124,39 @@ class TokenPartition:
 
     def prepare(self, *, prefix, input_id, logits_id, width, experts,
                 stage, layer, requests, phase, dtype, logits_dtype):
-        logits_dtype = self.logits_dtype or logits_dtype
+        # Zero-copy TP views inherit the producer tensor's output format.
+        # Padded paths emit an explicit cast op whenever target logits_dtype
+        # differs from the producer's output format instead of silently retyping.
+        producer_dt = _canonical_logits_dtype(self.producer_logits_dtype)
+        target_logits_dtype = self.logits_dtype or logits_dtype
+        target_dt = _canonical_logits_dtype(target_logits_dtype)
+        if self.allocated_rows == self.full_rows:
+            resolved_logits_dtype = self.producer_logits_dtype or logits_dtype
+        else:
+            resolved_logits_dtype = target_logits_dtype
         prepared = []
+        if (
+            self.allocated_rows != self.full_rows
+            and producer_dt
+            and target_dt
+            and producer_dt != target_dt
+        ):
+            cast_id = prefix + f".{self.caller}_logits_cast"
+            prepared.append(vector_op(
+                op_id=cast_id, deps=(logits_id,), stage=stage, layer=layer,
+                requests=requests, phase=phase, family="cast",
+                recipe=f"{self.caller}_logits_cast", dtype=resolved_logits_dtype,
+                elements=self.full_rows * experts, ops_per_element=1,
+                shape=(self.full_rows, experts),
+                read_bytes_override=self.full_rows * experts * dtype_bytes(producer_dt),
+                write_bytes_override=self.full_rows * experts * dtype_bytes(target_dt),
+                metadata=self.metadata() + (
+                    ("input_format", producer_dt),
+                    ("output_format", target_dt),
+                    ("invocation_class", "vector"),
+                ),
+            ))
+            logits_id = cast_id
         def view(suffix, dependency, columns, element_dtype):
             if self.allocated_rows != self.full_rows:
                 # Source revisions use either a persistent zero tensor or
@@ -138,7 +194,7 @@ class TokenPartition:
                     ("output_shape", (self.local_rows, columns)),
                     ("physical_payload_bytes", 0.0))), dtype=element_dtype)
         hidden = view(f".{self.caller}_input_view", input_id, width, dtype)
-        logits = view(f".{self.caller}_logits_view", logits_id, experts, logits_dtype)
+        logits = view(f".{self.caller}_logits_view", logits_id, experts, resolved_logits_dtype)
         return (*prepared, hidden, logits)
 
     def finalize(self, *, prefix, source, width, stage, layer, requests, phase, dtype):
@@ -194,10 +250,25 @@ class TokenPartition:
 
 @dataclass(frozen=True)
 class MaskedTraffic:
-    """Known source mask plus declared uniform destinations, not captured IDs."""
+    """Known source mask plus canonical expert-to-rank destination probabilities."""
     partition: TokenPartition
     top_k: int
-    basis = "masked_source_uniform_destination_expectation"
+
+    def _shares(self, ep: int) -> tuple[float, ...]:
+        shares = self.partition.destination_rank_shares
+        if len(shares) == ep:
+            return shares
+        return (1.0 / float(ep),) * ep
+
+    @property
+    def basis(self) -> str:
+        p = self.partition
+        ep = p.ep or p.tp
+        shares = self._shares(ep)
+        uniform = 1.0 / float(ep)
+        if all(abs(share - uniform) <= _UNIFORM_SHARE_TOL for share in shares):
+            return "masked_source_uniform_destination_expectation"
+        return "masked_source_routed_destination_expectation"
 
     @property
     def valid_local_tokens(self):
@@ -206,14 +277,67 @@ class MaskedTraffic:
     def payload_matrix(self, row_bytes, *, reverse=False):
         p = self.partition
         ep = p.ep or p.tp
-        return tuple(tuple(0 if src == dst else row_bytes * self.top_k
-                           * p.valid_per_rank[(dst if reverse else src) % p.tp] / ep
-                           for dst in range(ep)) for src in range(ep))
+        shares = self._shares(ep)
+        return tuple(
+            tuple(
+                0 if src == dst else (
+                    row_bytes * self.top_k
+                    * p.valid_per_rank[(dst if reverse else src) % p.tp]
+                    * shares[src if reverse else dst]
+                )
+                for dst in range(ep)
+            )
+            for src in range(ep)
+        )
 
     def to_dict(self):
         return {"basis": self.basis, "valid_tokens_per_rank": self.partition.valid_per_rank,
                 "allocated_tokens_per_rank": self.partition.local_rows,
                 "source": SOURCE, "destination_expert_ids": "unobserved"}
+
+
+def _canonical_logits_dtype(value: str) -> str:
+    low = str(value or "").strip().lower()
+    return _LOGITS_DTYPE_ALIASES.get(low, low)
+
+
+def _destination_rank_shares(*, model, plan, parallel, runtime) -> tuple[float, ...]:
+    """Derive normalized per-EP-rank destination shares matching grouped compute placement."""
+    ep = int(getattr(parallel, "ep", 0) or getattr(parallel, "tp", 0))
+    experts = int(getattr(plan, "num_experts", 0) or 0)
+    top_k = int(getattr(plan, "top_k", 0) or 0)
+    if ep < 1 or experts < 1 or top_k < 1:
+        return ()
+    from mindie_sim.prediction.operators.moe_transport.moe_callers import RoutingPolicy
+
+    rows_per_token, _ = RoutingPolicy().expert_moments(model, plan, 1)
+    total_mass = math.fsum(rows_per_token)
+    if total_mass <= 0.0:
+        return (1.0 / float(ep),) * ep
+    runtime_routing = dict(getattr(runtime, "routing", {}) or {})
+    has_slots = (
+        int(getattr(parallel, "redundant_experts_per_rank", 0) or 0) > 0
+        or "expert_slot_map" in runtime_routing
+        or (experts > 0 and ep > 0 and experts % ep != 0)
+    )
+    rank_shares = [0.0] * ep
+    if has_slots:
+        _, slot_routing = split_routing_features(runtime_routing)
+        slot_plan = expert_slot_plan(model, plan, parallel, routing=slot_routing)
+        copies = slot_plan.copies_per_expert()
+        for rank, expert_ids in enumerate(slot_plan.expert_ids_by_rank):
+            for expert in expert_ids:
+                count = copies.get(int(expert), 1)
+                rank_shares[rank] += (float(rows_per_token[int(expert)]) / total_mass) / float(max(1, count))
+    elif ep <= experts:
+        for expert, rows in enumerate(rows_per_token):
+            rank_shares[expert % ep] += float(rows) / total_mass
+    else:
+        for rank in range(ep):
+            expert = rank % experts
+            replicas = 1 + (ep - 1 - expert) // experts
+            rank_shares[rank] += (float(rows_per_token[expert]) / total_mass) / float(replicas)
+    return tuple(rank_shares)
 
 
 
@@ -272,8 +396,18 @@ def select(runtime, *, parallel, plan, model, tokens, sequence_plan=None,
     if tokens <= 0 or (tokens % parallel.tp and padding == "none"):
         raise ModelingError("mc2_tp_slice_requires_positive_tp_divisible_physical_rows")
     local = (tokens + parallel.tp - 1) // parallel.tp
+    producer_logits_dtype = _canonical_logits_dtype(
+        getattr(plan, "router_output_dtype", "")
+        or getattr(plan, "router_dtype", "")
+        or getattr(model, "activation_dtype", "")
+    )
+    destination_rank_shares = _destination_rank_shares(
+        model=model, plan=plan, parallel=parallel, runtime=runtime,
+    )
     return TokenPartition(tokens, local, parallel.tp, materialization, padding, raw["kind"],
                           padding_implementation, ep=parallel.ep,
                           logits_dtype=logits_dtype,
                           activation_tensor_rows=int(activation_tensor_rows or 0),
-                          activation_owners=int(activation_owners or 0))
+                          activation_owners=int(activation_owners or 0),
+                          producer_logits_dtype=producer_logits_dtype,
+                          destination_rank_shares=destination_rank_shares)
