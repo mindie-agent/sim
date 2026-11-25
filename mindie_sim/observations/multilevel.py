@@ -474,6 +474,7 @@ class EngineRunReceipt:
     arm_a_receipt_id: str = ""
     arm_b_receipt_id: str = ""
     clock_operator: str = "elapsed_span"
+    device_ranks: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -511,12 +512,13 @@ def _sign_receipt(
     arm_a_id: str = "", arm_b_id: str = "",
     arm_a_ns: int | None = None, arm_b_ns: int | None = None, *,
     clock_operator: str, elapsed_span_ns: int | None, busy_union_ns: int | None,
+    device_ranks: tuple[int, ...] = (),
 ) -> str:
     payload = "|".join((
         receipt_id, case_id, level, boundary_kind, engine_uid, start_event_name, end_event_name,
         str(start_event_seq), str(end_event_seq), str(start_ns), str(end_ns), str(predicted_ns),
         arm_a_id, arm_b_id, "" if arm_a_ns is None else str(arm_a_ns), "" if arm_b_ns is None else str(arm_b_ns),
-        clock_operator, str(elapsed_span_ns), str(busy_union_ns),
+        clock_operator, str(elapsed_span_ns), str(busy_union_ns), ",".join(str(r) for r in device_ranks),
     )).encode("utf-8")
     return hmac.new(_RECEIPT_HMAC_KEY, payload, "sha256").hexdigest()
 
@@ -563,9 +565,16 @@ def _validate_live_engine_events(
     if start_event.time < -_CLOCK_EPS_MS or end_event.time > engine.now + _CLOCK_EPS_MS or end_event.time < start_event.time:
         raise ModelingError(f"engine_event_clock_bounds_invalid:{case.case_id}")
     uid = _req_str(getattr(engine, "uid", ""), f"engine_uid_missing:{case.case_id}")
+    for ev in (start_event, end_event):
+        if ev.runtime_uid != uid:
+            raise ModelingError(f"engine_event_not_owned_by_engine:{case.case_id}:cross_engine_handle")
     if engine._trace_maxlen <= 0 and clock_op == "elapsed_span":
         raise ModelingError(f"engine_event_not_owned_by_engine:{case.case_id}:trace_required")
-    busy_ns = _busy_union_ns(engine, start_event.time, end_event.time)
+    busy_ns = _busy_union_ns(
+        engine, start_event.time, end_event.time,
+        device_ranks=case.boundary.device_ranks,
+        start_event_name=start_event.name, end_event_name=end_event.name,
+    )
     if clock_op == "busy_union" and busy_ns is None:
         raise ModelingError(f"busy_union_trace_incomplete:{case.case_id}")
     if not (_trace_owns_event(engine, start_event) and _trace_owns_event(engine, end_event)):
@@ -582,6 +591,8 @@ def _validate_live_engine_events(
     start_ns, end_ns = int(round(start_event.time * MS_TO_NS)), int(round(end_event.time * MS_TO_NS))
     if (elapsed_span_ns := end_ns - start_ns) <= 0:
         raise ModelingError(f"interval_span_or_duration_invalid:{case.case_id}")
+    if busy_ns is not None:
+        busy_ns = min(busy_ns, elapsed_span_ns)
     return uid, start_ns, end_ns, elapsed_span_ns, busy_ns
 
 
@@ -591,29 +602,196 @@ def _validate_clock_operator(value: Any, case_id: str) -> Literal["elapsed_span"
     return cast(Literal["elapsed_span", "busy_union"], value)
 
 
-def _busy_union_ns(engine: Any, start_ms: float, end_ms: float) -> int | None:
-    """Union settled device work spans when the trace can account for the interval."""
-    from mindie_sim.prediction.execution.submission import interval_union_ns
+_HOST_RESOURCE_EXACT = frozenset({"host", "host_memory", "host_vector", "scheduler"})
+_HOST_RESOURCE_PREFIXES = ("host@", "host_memory@", "host_vector@", "scheduler@")
+_SHARED_FABRIC_TAGS = frozenset({"link", "port", "pair", "host_rc"})
+_RESOURCE_DIE_RE = re.compile(r"(?:@r\d+\.p\d+\.d|@d|@die|@rank|:die|:port)(\d+)(?::|$)")
+_RESOURCE_TAIL_DIE_RE = re.compile(r":d(\d+)(?::|$)")
+_RESOURCE_PAIR_RE = re.compile(r":(?:pair)?(\d+)-?>(\d+)(?::|$)")
+_RESOURCE_STAGE_RE = re.compile(r"@r(\d+):s(\d+)(?::|$)")
+_RESOURCE_REPLICA_RE = re.compile(r"@r(\d+)(?::|$)")
 
-    if (engine._trace_maxlen <= 0 or engine.trace_dropped or len(engine.trace) != engine.completed_count
-            or any(task.start is not None and task.start < end_ms for task in engine._tasks.values())):
-        return None
-    host_resources = {
-        name for name in engine.resources
-        if any(part == "host" or part.startswith(("host@", "scheduler@")) for part in name.split(":"))
+
+def _is_host_resource(name: str) -> bool:
+    return any(part in _HOST_RESOURCE_EXACT or part.startswith(_HOST_RESOURCE_PREFIXES) for part in name.split(":"))
+
+
+def _is_shared_fabric_resource(name: str) -> bool:
+    return any(part in _SHARED_FABRIC_TAGS for part in name.split(":"))
+
+
+def _replica_stage_maps(
+    resources: Iterable[str], host_resources: set[str], participating: tuple[int, ...],
+) -> tuple[dict[tuple[int, int], tuple[int, ...]], dict[tuple[int, str], tuple[int, ...]], bool]:
+    explicit_ranks: set[int] = set()
+    stage_slots: set[tuple[int, int]] = set()
+    replica_only: set[int] = set()
+    for name in resources:
+        if name in host_resources:
+            continue
+        if (die := _RESOURCE_DIE_RE.search(name)) is not None:
+            explicit_ranks.add(int(die.group(1)))
+        elif (pair := _RESOURCE_PAIR_RE.search(name)) is not None:
+            explicit_ranks.update((int(pair.group(1)), int(pair.group(2))))
+        elif (td := _RESOURCE_TAIL_DIE_RE.search(name)) is not None:
+            explicit_ranks.add(int(td.group(1)))
+        elif (st := _RESOURCE_STAGE_RE.search(name)) is not None:
+            stage_slots.add((int(st.group(1)), int(st.group(2))))
+        elif (rp := _RESOURCE_REPLICA_RE.search(name)) is not None:
+            replica_only.add(int(rp.group(1)))
+    has_any_rank_tag = bool(explicit_ranks or stage_slots or replica_only)
+    all_reps = {rep for rep, _ in stage_slots} | replica_only
+    if not all_reps:
+        return {}, {}, has_any_rank_tag
+    n_stages = (max(stage for _, stage in stage_slots) + 1) if stage_slots else 1
+    n_slots = (max(all_reps) + 1) * n_stages
+    world = max(max((*participating, *explicit_ranks)) + 1, n_slots)
+    width = world // n_slots if world % n_slots == 0 else 1
+    stage_map = {
+        (rep, stage): tuple(range((rep * n_stages + stage) * width, (rep * n_stages + stage + 1) * width))
+        for rep in range(max(all_reps) + 1)
+        for stage in range(n_stages)
     }
-    spans = []
+    replica_map: dict[tuple[int, str], tuple[int, ...]] = {}
+    for rep in range(max(all_reps) + 1):
+        replica_map[(rep, "h2d")] = stage_map[(rep, 0)]
+        replica_map[(rep, "d2h")] = stage_map[(rep, n_stages - 1)]
+        replica_map[(rep, "")] = tuple(r for s in range(n_stages) for r in stage_map[(rep, s)])
+    return stage_map, replica_map, has_any_rank_tag
+
+
+def _demand_ranks(
+    demand: Mapping[str, float], host_resources: set[str],
+    stage_map: Mapping[tuple[int, int], tuple[int, ...]],
+    replica_map: Mapping[tuple[int, str], tuple[int, ...]],
+    has_any_rank_tag: bool, participating_set: set[int], *, tagged_only: bool = False,
+) -> set[int]:
+    device_res = [r for r, amount in demand.items() if amount > 0 and r not in host_resources]
+    if not device_res:
+        return set()
+    specific: set[int] = set()
+    replica_ranks: set[int] = set()
+    has_specific = has_replica = False
+    for resource in device_res:
+        if (die := _RESOURCE_DIE_RE.search(resource)) is not None:
+            has_specific = True
+            specific.add(int(die.group(1)))
+        elif (pair := _RESOURCE_PAIR_RE.search(resource)) is not None:
+            has_specific = True
+            specific.update((int(pair.group(1)), int(pair.group(2))))
+        elif (td := _RESOURCE_TAIL_DIE_RE.search(resource)) is not None:
+            has_specific = True
+            specific.add(int(td.group(1)))
+        elif (st := _RESOURCE_STAGE_RE.search(resource)) is not None:
+            has_specific = True
+            specific.update(stage_map.get((int(st.group(1)), int(st.group(2))), ()))
+        elif (rp := _RESOURCE_REPLICA_RE.search(resource)) is not None:
+            has_replica = True
+            prefix = resource.split("@", 1)[0].rsplit(":", 1)[-1]
+            role = prefix if prefix in {"h2d", "d2h"} else ""
+            replica_ranks.update(replica_map.get((int(rp.group(1)), role), ()))
+    if has_specific:
+        return specific & participating_set
+    if has_replica:
+        return replica_ranks & participating_set
+    if tagged_only or (has_any_rank_tag and all(_is_shared_fabric_resource(r) for r in device_res)):
+        return set()
+    return set(participating_set)
+
+
+def _boundary_time(row: Mapping[str, Any], event_name: str) -> float | None:
+    task_name = str(row.get("task", ""))
+    if event_name.endswith(":start") and task_name == event_name.removesuffix(":start"):
+        val = row.get("start_ms")
+        return None if val is None else float(val)
+    if task_name == event_name:
+        val = row.get("end_ms")
+        return None if val is None else float(val)
+    return None
+
+
+def _rank_windows(
+    trace: Iterable[Mapping[str, Any]], start_ms: float, end_ms: float, participating: tuple[int, ...],
+    start_event_name: str | None, end_event_name: str | None,
+    resolve_tagged: Callable[[Mapping[str, float]], set[int]],
+) -> dict[int, tuple[float, float]]:
+    windows = {rank: (start_ms, end_ms) for rank in participating}
+    if not (start_event_name and end_event_name):
+        return windows
+    starts: dict[int, list[float]] = {rank: [] for rank in participating}
+    ends: dict[int, list[float]] = {rank: [] for rank in participating}
+    for row in trace:
+        demand = row.get("demand")
+        if not demand or not (ranks := resolve_tagged(demand)):
+            continue
+        if (t_s := _boundary_time(row, start_event_name)) is not None and start_ms - _CLOCK_EPS_MS <= t_s <= end_ms + _CLOCK_EPS_MS:
+            for rank in ranks:
+                starts[rank].append(t_s)
+        if (t_e := _boundary_time(row, end_event_name)) is not None and start_ms - _CLOCK_EPS_MS <= t_e <= end_ms + _CLOCK_EPS_MS:
+            for rank in ranks:
+                ends[rank].append(t_e)
+    for rank in participating:
+        if len(starts[rank]) == 1 and len(ends[rank]) == 1 and starts[rank][0] <= ends[rank][0]:
+            windows[rank] = (starts[rank][0], ends[rank][0])
+    return windows
+
+
+def _union_spans_ns(spans: list[tuple[float, float]]) -> int:
+    if not spans:
+        return 0
+    ordered = sorted(spans)
+    merged: list[float] = []
+    cur_start, cur_end = ordered[0]
+    for start, end in ordered[1:]:
+        if start <= cur_end:
+            if end > cur_end:
+                cur_end = end
+        else:
+            merged.append(cur_end - cur_start)
+            cur_start, cur_end = start, end
+    merged.append(cur_end - cur_start)
+    return int(round(math.fsum(merged) * MS_TO_NS))
+
+
+def _busy_union_ns(
+    engine: Any, start_ms: float, end_ms: float,
+    device_ranks: Sequence[int] | None = None, *,
+    start_event_name: str | None = None, end_event_name: str | None = None,
+) -> int | None:
+    """Union settled device work spans per participating rank and take the max."""
+    if engine._trace_maxlen <= 0 or engine.trace_dropped or len(engine.trace) != engine.completed_count:
+        return None
+    participating = tuple(dict.fromkeys(device_ranks)) if device_ranks is not None else (0,)
+    if not participating:
+        return None
+    participating_set = set(participating)
+    host_resources = {name for name in engine.resources if _is_host_resource(name)}
+    stage_map, replica_map, has_any_rank_tag = _replica_stage_maps(engine.resources, host_resources, participating)
+    resolve = partial(
+        _demand_ranks, host_resources=host_resources, stage_map=stage_map,
+        replica_map=replica_map, has_any_rank_tag=has_any_rank_tag, participating_set=participating_set,
+    )
+    windows = _rank_windows(
+        engine.trace, start_ms, end_ms, participating, start_event_name, end_event_name,
+        partial(resolve, tagged_only=True),
+    )
+    for task in engine._tasks.values():
+        if task.start is not None and any(task.start < windows[rank][1] for rank in resolve(task.demand)):
+            return None
+    spans_by_rank: dict[int, list[tuple[float, float]]] = {rank: [] for rank in participating}
     for row in engine.trace:
         if (demand := row.get("demand")) is None:
             return None
-        if not any(amount > 0 and resource not in host_resources for resource, amount in demand.items()):
+        if not (targets := resolve(demand)):
             continue
         start, end = row.get("start_ms"), row.get("end_ms")
         if start is None or end is None:
             return None
-        if (start := max(start_ms, start)) < (end := min(end_ms, end)):
-            spans.append((start, end))
-    return interval_union_ns(spans)
+        for rank in targets:
+            left, right = windows[rank]
+            if (clipped_s := max(left, start)) < (clipped_e := min(right, end)):
+                spans_by_rank[rank].append((clipped_s, clipped_e))
+    return max(_union_spans_ns(spans) for spans in spans_by_rank.values())
 
 
 def bind_engine_interval(
@@ -632,12 +810,14 @@ def bind_engine_interval(
         f"{CAPTURE_URI_SCHEME}engine-receipt/{uid}/{case.level}/{case.case_id}/{start_event.sequence}-{end_event.sequence}",
         field_name="engine_receipt",
     )
+    ranks = tuple(case.boundary.device_ranks)
     tok = _sign_receipt(rid, case.case_id, case.level, case.boundary.boundary_kind, uid,
                         start_event.name, end_event.name, start_event.sequence, end_event.sequence, s_ns, e_ns, pred_ns,
-                        clock_operator=clock_op, elapsed_span_ns=elapsed_span_ns, busy_union_ns=busy_union_ns)
+                        clock_operator=clock_op, elapsed_span_ns=elapsed_span_ns, busy_union_ns=busy_union_ns,
+                        device_ranks=ranks)
     rcpt = EngineRunReceipt(rid, case.case_id, case.level, case.boundary.boundary_kind, uid,
                             start_event.name, end_event.name, start_event.sequence, end_event.sequence, s_ns, e_ns, pred_ns, tok,
-                            clock_operator=clock_op)
+                            clock_operator=clock_op, device_ranks=ranks)
     return EngineInterval(
         case.case_id, case.level, case.boundary.boundary_kind, start_event.name, end_event.name, s_ns, e_ns, pred_ns,
         rid, True, 0, "ok", "", source_level, derived_from_step_division, wire_bytes, kernel_sequence, None, None, diagnostics, rcpt,
@@ -666,11 +846,13 @@ def bind_engine_rung_interval(
     b_id = f"{CAPTURE_URI_SCHEME}engine-receipt/{uid_b}/L2/{case.case_id}/arm_b/{s_b.sequence}-{e_b.sequence}"
     delta_ns, uid = pred_b - pred_a, f"{uid_a}+{uid_b}"
     rid = validate_provenance_text(f"{CAPTURE_URI_SCHEME}engine-receipt/{uid}/L2/{case.case_id}/rung/{s_a.sequence}-{e_b.sequence}", field_name="engine_receipt")
+    ranks = tuple(case.boundary.device_ranks)
     tok = _sign_receipt(rid, case.case_id, "L2", "paired_rung_delta", uid, s_a.name, e_b.name,
                         s_a.sequence, e_b.sequence, 0, delta_ns, delta_ns, a_id, b_id, pred_a, pred_b,
-                        clock_operator=clock_op, elapsed_span_ns=elapsed_delta, busy_union_ns=busy_delta)
+                        clock_operator=clock_op, elapsed_span_ns=elapsed_delta, busy_union_ns=busy_delta,
+                        device_ranks=ranks)
     rcpt = EngineRunReceipt(rid, case.case_id, "L2", "paired_rung_delta", uid, s_a.name, e_b.name,
-                            s_a.sequence, e_b.sequence, 0, delta_ns, delta_ns, tok, a_id, b_id, clock_op)
+                            s_a.sequence, e_b.sequence, 0, delta_ns, delta_ns, tok, a_id, b_id, clock_op, ranks)
     return EngineInterval(
         case.case_id, "L2", "paired_rung_delta", s_a.name, e_b.name, 0, delta_ns, delta_ns,
         rid, True, 0, "ok", "", "", False, None, (), pred_a, pred_b, diagnostics, rcpt,
@@ -716,12 +898,16 @@ def validate_engine_interval(case: Any, interval: EngineInterval, *, expected_le
             != (interval.engine_receipt, case.case_id, expected_level, case.boundary.boundary_kind,
                 case.boundary.start_event, case.boundary.end_event, interval.start_ns, interval.end_ns, interval.predicted_ns, clock_op)):
         raise ModelingError(f"engine_receipt_binding_mismatch:{case.case_id}")
+    expected_ranks = tuple(case.boundary.device_ranks)
+    if rcpt.device_ranks and rcpt.device_ranks != expected_ranks:
+        raise ModelingError(f"engine_receipt_binding_mismatch:{case.case_id}")
     expected_tok = _sign_receipt(
         rcpt.receipt_id, rcpt.case_id, rcpt.level, rcpt.boundary_kind, rcpt.engine_uid,
         rcpt.start_event_name, rcpt.end_event_name, rcpt.start_event_seq, rcpt.end_event_seq,
         rcpt.start_ns, rcpt.end_ns, rcpt.predicted_ns, rcpt.arm_a_receipt_id, rcpt.arm_b_receipt_id,
         interval.arm_a_predicted_ns, interval.arm_b_predicted_ns,
         clock_operator=rcpt.clock_operator, elapsed_span_ns=interval.elapsed_span_ns, busy_union_ns=interval.busy_union_ns,
+        device_ranks=expected_ranks,
     )
     if not hmac.compare_digest(rcpt.receipt_token, expected_tok):
         raise ModelingError(f"engine_receipt_signature_invalid:{case.case_id}")
@@ -851,6 +1037,7 @@ class Residual:
     capture_ranks: frozenset[int] = frozenset()
     expected_components: tuple[str, ...] = ()
     capture_verification: CaptureVerificationReceipt | None = None
+    split: SplitName = "heldout"
     def to_dict(self) -> dict[str, Any]:
         out = asdict(self)
         out["signed_error"] = None if math.isnan(self.signed_error) else self.signed_error
@@ -1324,7 +1511,7 @@ def _make_residual(
         signed_error, math.nan if math.isnan(signed_error) else abs(signed_error),
         status, excluded_reason, case.boundary.boundary_kind, signed_delta_ns, arm_a_err, arm_b_err, case.regime_dims,
         case.boundary.clock_operator, interval.elapsed_span_ns if interval else None, interval.busy_union_ns if interval else None,
-        scope, events, ranks, expected, capture_verification,
+        scope, events, ranks, expected, capture_verification, case.split,
     )
 
 
@@ -1489,6 +1676,7 @@ class _CohortRows:
     evaluated: set[str] = field(default_factory=set)
     excluded: Counter[str] = field(default_factory=Counter)
     steps: list[Residual] = field(default_factory=list)
+    train_steps: list[Residual] = field(default_factory=list)
     missing: int = 0
     independent: int = 0
 
@@ -1509,8 +1697,9 @@ def summarize_cohorts(
         bucket = buckets.get(row.cohort)
         if bucket is None:
             bucket = buckets[row.cohort] = _CohortRows()
-        bucket.independent += not diagnostic
-        if not diagnostic and row.status == "ok" and math.isfinite(row.absolute_percentage_error):
+        non_heldout = row.split != "heldout"
+        bucket.independent += not diagnostic and not non_heldout
+        if not diagnostic and not non_heldout and row.status == "ok" and math.isfinite(row.absolute_percentage_error):
             bucket.apes.append(row.absolute_percentage_error * PERCENT_SCALE)
             bucket.signed.append(row.signed_error * PERCENT_SCALE)
             bucket.roots.add(row.acquisition_root)
@@ -1520,12 +1709,16 @@ def summarize_cohorts(
             if row.level == "L3":
                 bucket.steps.append(row)
         else:
-            bucket.excluded[row.excluded_reason or row.status] += 1
-            bucket.missing += not diagnostic and row.status in {"missing_evidence", "invalid_evidence"}
+            if non_heldout and row.level == "L3" and row.status == "ok" and math.isfinite(row.absolute_percentage_error):
+                bucket.train_steps.append(row)
+            reason = row.excluded_reason or ("train_split_not_blind_acceptance" if non_heldout else row.status)
+            bucket.excluded[reason] += 1
+            bucket.missing += not diagnostic and not non_heldout and row.status in {"missing_evidence", "invalid_evidence"}
 
     summaries: dict[CohortKey, CohortSummary] = {}
     for key, bucket in buckets.items():
         complete, drilldowns = _score_step_censuses(bucket.steps, inner, exceeds)
+        _, train_drilldowns = _score_step_censuses(bucket.train_steps, inner, exceeds)
         failed = (("max_ape_pct",) if strict_pointwise and bucket.tails else ())
         if any(report["failed_components"] for _, report in drilldowns):
             failed += ("vertical_drilldown",)
@@ -1541,7 +1734,7 @@ def summarize_cohorts(
             bucket.missing, tuple(sorted(bucket.excluded.items())), threshold_pct, failed,
             tuple(bucket.tails), tuple(sorted(bucket.roots)), tuple(sorted(bucket.evaluated)),
             atol_ns=atol_ns, pointwise_failed_count=len(bucket.tails), complete_drilldowns=complete,
-            drilldowns=drilldowns, diagnostic_only=not bucket.independent,
+            drilldowns=(*drilldowns, *train_drilldowns), diagnostic_only=not bucket.independent,
         )
     return summaries
 

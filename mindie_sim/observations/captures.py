@@ -829,27 +829,34 @@ def _verify_l1_ownership(
     case_id: str, selected: Mapping[int, list[_CaptureRow]], occurrences: frozenset[_KernelOccurrence],
     all_rows: Iterable[_CaptureRow], trace_meta: Mapping[str, Any] | None,
 ) -> None:
-    owners = {}
+    owners: dict[int, tuple[set[str], set[str]]] = {}
     for rank, rows in selected.items():
-        calls = {row.call_id or "" for row in rows}
-        if len(calls) == 1 and all(calls):
-            owners[rank] = "call_id", calls
-            continue
-        connections = {row.connection_id or "" for row in rows}
-        if all(connections):
-            owned = (_trace_call_connections(trace_meta, connections) if trace_meta is not None
-                     else connections if len(connections) == 1 else None)
-            if owned is not None and connections <= owned:
-                owners[rank] = "connection_id", owned
-                continue
-        if trace_meta is not None or len(rows) != 1:
+        if any(not (row.call_id or row.connection_id) for row in rows):
             raise ModelingError(f"capture_l1_call_ownership_unverified:{case_id}:rank={rank}")
-    if owners:
-        for row in all_rows:
-            if row.rank in owners and row.occurrence not in occurrences and row.end > (row.start or 0):
-                field, ids = owners[row.rank]
-                if getattr(row, field) in ids:
-                    raise ModelingError(f"capture_l1_call_ownership_unverified:{case_id}:rank={row.rank}")
+        calls = {row.call_id for row in rows if row.call_id}
+        connections = {row.connection_id for row in rows if row.connection_id}
+        if len(calls) > 1:
+            raise ModelingError(f"capture_l1_call_ownership_unverified:{case_id}:rank={rank}")
+        if calls:
+            call_conns = {row.connection_id for row in rows if row.call_id and row.connection_id}
+            trace_conns = (_trace_call_connections(trace_meta, connections)
+                           if trace_meta is not None and connections else None)
+            owned_conns = (trace_conns | connections) if trace_conns is not None else connections
+            reachable = (trace_conns | call_conns) if trace_conns is not None else call_conns
+            if not all(row.call_id in calls or row.connection_id in reachable for row in rows):
+                raise ModelingError(f"capture_l1_call_ownership_unverified:{case_id}:rank={rank}")
+            owners[rank] = calls, owned_conns
+        else:
+            owned_conns = (_trace_call_connections(trace_meta, connections) if trace_meta is not None
+                           else connections if len(connections) == 1 else None)
+            if owned_conns is None or not (connections <= owned_conns):
+                raise ModelingError(f"capture_l1_call_ownership_unverified:{case_id}:rank={rank}")
+            owners[rank] = set(), owned_conns
+    for row in all_rows:
+        if row.rank in owners and row.occurrence not in occurrences and row.end > (row.start or 0):
+            owned_calls, owned_conns = owners[row.rank]
+            if (row.call_id and row.call_id in owned_calls) or (row.connection_id and row.connection_id in owned_conns):
+                raise ModelingError(f"capture_l1_call_ownership_unverified:{case_id}:rank={row.rank}")
 
 
 def _verify_timed_capture(
