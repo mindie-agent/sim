@@ -128,35 +128,57 @@ class FrozenHardwareView:
     identity: str
     architecture: str
     hardware_key: str
-    compute_peaks: Mapping[str, float]
+    compute_peaks: Mapping[str, float] | None
     dies: tuple[Mapping[str, Any], ...]
     die_signatures: tuple[str, ...]
     signature: tuple
+    homogeneous: bool = True
+    per_placement_compute_peaks: Mapping[int, Mapping[str, float]] = field(default_factory=dict)
 
     @classmethod
     def from_machine(cls, machine: Any) -> "FrozenHardwareView":
         payloads: list[Mapping[str, Any]] = []
         signatures: list[str] = []
+        per_placement_peaks: dict[int, dict[str, float]] = {}
         for die in machine.dies:
             payload = die.to_dict()
             payloads.append(payload)
             signatures.append(_canonical(payload))
+            per_placement_peaks[int(die.rank)] = dict(die.compute_peaks)
         identity = str(machine.hardware_key or machine.sku)
-        peaks = dict(machine.compute_peaks)
+        is_homogeneous = bool(getattr(machine, "homogeneous", True))
+        if is_homogeneous and machine.dies:
+            peaks: Mapping[str, float] | None = dict(machine.compute_peaks)
+            peaks_sig = _canonical(peaks)
+        else:
+            peaks = None
+            peaks_sig = _canonical({
+                str(rank): rank_peaks
+                for rank, rank_peaks in sorted(per_placement_peaks.items())
+            })
         signature = (
             identity, str(machine.arch_family), str(machine.sku),
-            tuple(signatures), _canonical(peaks),
+            tuple(signatures), peaks_sig,
         )
         return cls(identity=identity, architecture=str(machine.arch_family),
                    hardware_key=str(machine.hardware_key or machine.sku),
                    compute_peaks=peaks, dies=tuple(payloads),
-                   die_signatures=tuple(signatures), signature=signature)
+                   die_signatures=tuple(signatures), signature=signature,
+                   homogeneous=is_homogeneous,
+                   per_placement_compute_peaks=per_placement_peaks)
 
     def payload(self) -> dict[str, Any]:
         """The mapping expected by ``primitive_key`` and topology construction."""
+        if self.compute_peaks is not None:
+            return {"identity": self.identity,
+                    "dies": list(self.dies),
+                    "compute_peaks": dict(self.compute_peaks)}
         return {"identity": self.identity,
                 "dies": list(self.dies),
-                "compute_peaks": dict(self.compute_peaks)}
+                "per_placement_compute_peaks": {
+                    str(rank): dict(rank_peaks)
+                    for rank, rank_peaks in sorted(self.per_placement_compute_peaks.items())
+                }}
 
     def digest(self) -> str:
         return _digest(self.signature)

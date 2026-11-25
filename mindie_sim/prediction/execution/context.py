@@ -528,6 +528,24 @@ def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
     return tuple(profiles)
 
 
+def _admission_l2_cache_key(
+    view: Any, die_id: int,
+) -> tuple[int | None, str | None] | None:
+    """Live per-die L2 budget and residency fingerprint for prepare/program caches."""
+    if view is None:
+        return None
+    eff_fn = getattr(view, "effective_l2_bytes", None)
+    fp_fn = getattr(view, "residency_fingerprint", None)
+    caps = getattr(view, "_l2_capacity", None)
+    eff = (
+        int(eff_fn(die_id))
+        if callable(eff_fn) and (caps is None or die_id in caps)
+        else None
+    )
+    fp = str(fp_fn(die_id)) if callable(fp_fn) else None
+    return (eff, fp)
+
+
 class _ContextMixin:
     """Operator preparation, stage context binding, and program lowering."""
 
@@ -610,6 +628,12 @@ class _ContextMixin:
                 eval_map.pop(next(iter(eval_map)))
             eval_map[key] = op
 
+    def _live_admission_memory_view(self):
+        """Return the live engine-attached AdmissionMemoryView, falling back to self."""
+        engine = getattr(self, "engine", None)
+        view = getattr(engine, "admission_memory_view", None) if engine is not None else None
+        return view if view is not None else getattr(self, "admission_memory_view", None)
+
     def prepare(self, op, replica=0):
         from ..efficiency.unmodeled_gate import assert_timing_supported
         assert_timing_supported(None, (op,), entry="execution_prepare")
@@ -619,7 +643,7 @@ class _ContextMixin:
         active_reqs = tuple(getattr(self, "_active_requests", ()) or ())
         active_padded = int(getattr(self, "_active_padded_tokens", 0) or 0)
         active_layout = str(getattr(self, "_active_layout", "") or "")
-        admission_view = getattr(self, "admission_memory_view", None)
+        admission_view = self._live_admission_memory_view()
         if (stream_owners is not None or geom.replica != int(replica)
                 or admission_view is not None or active_reqs or active_padded or active_layout):
             geom = replace(
@@ -637,9 +661,11 @@ class _ContextMixin:
             frozen_geom = _freeze_key(replace(geom, admission_memory_view=None))
             geom_keys[gcache_key] = frozen_geom
         startup_mode = self.case.runtime.collective_startup_mode
+        die_id = 0 if getattr(geom, "rank", None) is None else int(geom.rank)
+        l2_state_key = _admission_l2_cache_key(admission_view, die_id)
         prep_key = (
-            id(self.recipes), frozen_geom, stream_owners, startup_mode, op.stage,
-            op.family, op.recipe, op.phase, op.dtype, op.layout,
+            id(self.recipes), frozen_geom, l2_state_key, stream_owners, startup_mode, op.stage,
+            op.family, op.recipe, op.phase, op.dtype, op.layout, op.requests,
             op.semantic_shape, op.local_shape, op.padded_shape,
             op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
             op.mte3_bytes, op.vector_ops, op.hbm_bytes, op.link_bytes,
@@ -777,11 +803,16 @@ class _ContextMixin:
         sid = self._cached_service_identity(op, replica, scope, dies[0])
         declared = _declaration_of(op)
         stream_owners = self.stream_owners.get((replica, op.stage, op.stream or "main"))
+        live_admission_view = self._live_admission_memory_view()
         context = replace(
             template, op=op, native_work=cost.work, compute_peaks=peaks,
             service_identity=sid,
             service_boundary="resource_phase" if declared else "device_kernel",
             stream_owners=stream_owners,
+            admission_memory_view=(
+                template.admission_memory_view if live_admission_view is None
+                else live_admission_view
+            ),
             requests=tuple(getattr(self, "_active_requests", ()) or ()),
             padded_tokens=int(getattr(self, "_active_padded_tokens", 0) or 0),
             layout=str(getattr(self, "_active_layout", "") or ""))
@@ -1110,9 +1141,22 @@ class _ContextMixin:
         cp_binding = getattr(context, "collective_plan", None)
         cp_plan = getattr(cp_binding, "plan", None) if cp_binding is not None else None
         band_key = cp_plan.cache_key() if hasattr(cp_plan, "cache_key") else None
+        stage_geom = (
+            self.stage_geometry.get((replica, op.stage))
+            if replica is not None else None
+        )
+        die_rank = getattr(stage_geom, "rank", None)
+        if die_rank is None and replica is not None:
+            dies = self.stage_dies.get((replica, op.stage))
+            if dies:
+                die_rank = int(dies[0].rank)
+        die_id = 0 if die_rank is None else int(die_rank)
+        l2_state_key = _admission_l2_cache_key(
+            getattr(context, "admission_memory_view", None), die_id,
+        )
         prog_key = (
             owner, do_compact, _freeze_key(recipe), op.family, op.recipe, op.phase, op.stage,
-            op.dtype, op.layout, op.semantic_shape, op.local_shape, op.padded_shape,
+            op.dtype, op.layout, op.requests, op.semantic_shape, op.local_shape, op.padded_shape,
             op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
             op.mte3_bytes, op.vector_ops, op.hbm_bytes, op.link_bytes,
             op.link_scope, op.source_boundary, op.returns,
@@ -1133,6 +1177,7 @@ class _ContextMixin:
             op.stream or "main",
             context.stream_owners,
             band_key,
+            l2_state_key,
         )
         token = _rank_token(context)
         replayable = (

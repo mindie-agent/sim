@@ -53,6 +53,10 @@ ZERO_KERNEL_VIEW_FAMILIES = frozenset({
     "view", "reshape", "alias", "slice_view", "transpose_view",
     "permute_view", "no_op", "noop", "metadata_only",
 })
+_ZERO_WORK_FIELDS = (
+    "flops", "hbm_bytes", "mte2_bytes", "mte3_bytes", "vector_ops", "link_bytes",
+)
+_ZERO_META_WORK_KEYS = ("mte1_bytes", "fixpipe_bytes")
 
 
 @dataclass(frozen=True)
@@ -128,6 +132,18 @@ def is_zero_kernel_view(op) -> bool:
         return True
     if meta.get("internal_stage_only"):
         return True
+    if family == "tensor_view" and not meta.get("materialized"):
+        matrix_flops = getattr(op, "matrix_flops", ()) or ()
+        has_matrix = any(float(amount or 0.0) != 0.0 for _, amount in matrix_flops)
+        has_meta_work = any(float(meta.get(key, 0.0) or 0.0) != 0.0 for key in _ZERO_META_WORK_KEYS)
+        res_work = meta.get("resource_work")
+        has_res_work = isinstance(res_work, Mapping) and any(
+            float(val or 0.0) != 0.0 for val in res_work.values()
+        )
+        if not has_matrix and not has_meta_work and not has_res_work and all(
+            float(getattr(op, key, 0.0) or 0.0) == 0.0 for key in _ZERO_WORK_FIELDS
+        ):
+            return True
     return False
 
 
