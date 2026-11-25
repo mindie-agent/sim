@@ -199,11 +199,21 @@ class NpuCheckpointSpec:
     def weight_pattern_map(self) -> dict[str, tuple[str, ...]]:
         return {tag: patterns for tag, patterns in self.weight_patterns}
 
+    def _curated_if_isa_compatible(self) -> CheckpointQuantMap | None:
+        curated = lookup_curated_checkpoint(self.repo_id)
+        if curated is None:
+            return None
+        if normalize_hw_family(self.hw_family) in A2_A3_INT_ONLY_FAMILIES:
+            curated_q = quant_spec_from_checkpoint_map(curated)
+            if _validate_quant_spec_for_hardware(curated_q, self.hw_family):
+                return None
+        return curated
+
     def build_checkpoint_quant_map(
         self, *, base_config: Mapping[str, Any] | None = None,
     ) -> CheckpointQuantMap:
         """Build a lossless ``CheckpointQuantMap`` from curated data or descriptor."""
-        curated = lookup_curated_checkpoint(self.repo_id)
+        curated = self._curated_if_isa_compatible()
         if curated is not None:
             if not curated.native_float_dtype and isinstance(base_config, Mapping):
                 native = _extract_native_format(base_config)
@@ -236,7 +246,7 @@ class NpuCheckpointSpec:
         primary_url = self.modelers_url or self.modelscope_url or self.hf_url
         kv_ov = self.kv_cache_dtype if self.kv_cache_dtype and self.kv_cache_dtype != "bf16" else ""
         idx_ov = self.indexer_kv_dtype if self.indexer_kv_dtype and self.indexer_kv_dtype != "bf16" else ""
-        curated = lookup_curated_checkpoint(self.repo_id)
+        curated = self._curated_if_isa_compatible()
         if curated is not None:
             return quant_spec_from_checkpoint_map(
                 curated,
@@ -352,6 +362,74 @@ def _repo_urls(repo_id: str) -> tuple[str, str, str]:
         "moonshotai", "minimaxai", "meta-llama", "tencent", "meituan-longcat",
     }
     return modelers, modelscope, (f"{HF_PAGE_BASE}/{repo_id}" if owner in hf_owners else "")
+
+
+_ISA_FORMAT_KEYS = frozenset({
+    "weight_format", "expert_weight_format", "activation_format", "kv_dtype",
+})
+
+
+def _collect_nested_isa_formats(obj: Any, out: list[tuple[str, str]]) -> None:
+    if isinstance(obj, Mapping):
+        for key, value in obj.items():
+            if key in _ISA_FORMAT_KEYS and isinstance(value, str) and value.strip():
+                out.append((key, value.strip()))
+            elif isinstance(value, (Mapping, tuple, list)):
+                _collect_nested_isa_formats(value, out)
+        return
+    if isinstance(obj, (tuple, list)):
+        if (
+            len(obj) == 2
+            and isinstance(obj[0], str)
+            and obj[0] in _ISA_FORMAT_KEYS
+            and isinstance(obj[1], str)
+            and obj[1].strip()
+        ):
+            out.append((obj[0], obj[1].strip()))
+            return
+        for item in obj:
+            if isinstance(item, (Mapping, tuple, list)):
+                _collect_nested_isa_formats(item, out)
+
+
+def _validate_quant_spec_for_hardware(
+    qspec: QuantSpec | None,
+    hw_family: str,
+    *,
+    strict: bool = False,
+) -> tuple[str, ...]:
+    if qspec is None:
+        return ()
+    warns: list[str] = list(
+        validate_quant_for_hardware(
+            qspec.name, hw_family, kv_cache_dtype=qspec.kv_dtype, strict=strict,
+        )
+    )
+    nested: list[tuple[str, str]] = [
+        ("weight_format", qspec.weight_format),
+        ("expert_weight_format", qspec.expert_weight_format),
+        ("activation_format", qspec.activation_format),
+    ]
+    _collect_nested_isa_formats(getattr(qspec, "category_overrides", ()), nested)
+    _collect_nested_isa_formats(getattr(qspec, "expert_quant_overrides", ()), nested)
+    if getattr(qspec, "layer_quant_overrides", ()):
+        _collect_nested_isa_formats(qspec.layer_quant_overrides_dict(), nested)
+    for key, fmt in nested:
+        if not fmt:
+            continue
+        if key == "kv_dtype":
+            warns.extend(
+                validate_quant_for_hardware(
+                    "bf16", hw_family, kv_cache_dtype=fmt, strict=strict,
+                )
+            )
+        else:
+            warns.extend(
+                validate_quant_for_hardware(
+                    fmt, hw_family, kv_cache_dtype="bf16", strict=strict,
+                )
+            )
+    return tuple(dict.fromkeys(warns))
 
 
 def validate_quant_for_hardware(
@@ -883,6 +961,10 @@ def _weight_quant_from_tag(
     )
 
 
+_FLOAT_WEIGHT_TOKENS = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"})
+_EXPERT_ROLE_FAMILIES = frozenset({"routed_expert", "dspark_routed_expert"})
+
+
 def _classify_from_quant_spec(
     role_name: str, quant: QuantSpec, *, native_format: str,
 ) -> WeightTensorQuant:
@@ -890,18 +972,28 @@ def _classify_from_quant_spec(
     wf = str(resolved.format_for(role_name) or native_format).lower()
     af = str(resolved.activation_format or native_format).lower()
     sf = str(resolved.scale_format or "none").lower()
-    mx_group = int(resolved.expert_block or resolved.weight_block[1] or 0)
-    if wf in {"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"}:
+    is_expert = role_name.split(".", 1)[0] in _EXPERT_ROLE_FAMILIES
+    wb_col = int(resolved.weight_block[1] if len(resolved.weight_block) > 1 else 0)
+    group = int(resolved.expert_block or wb_col or 0) if is_expert else wb_col
+    if wf in _FLOAT_WEIGHT_TOKENS:
         return WeightTensorQuant("FLOAT", wf, wf, "FP32" if "32" in wf else "BF16", "none", 0, False, f"quant_spec:{role_name}", role_name)
     if wf in {"mxfp4", "fp4", "fp4_e2m1"}:
+        mx_group = group or int(resolved.expert_block or MXFP_GROUP_SIZE)
         tag = "W4A4_MXFP4" if af in {"fp4", "fp4_e2m1"} else "W4A8_MXFP"
-        return WeightTensorQuant(tag, "mxfp4", af, "MXFP4", "fp8_e8m0", mx_group or MXFP_GROUP_SIZE, True, f"quant_spec:{role_name}", role_name)
+        return WeightTensorQuant(tag, "mxfp4", af, "MXFP4", "fp8_e8m0", mx_group, True, f"quant_spec:{role_name}", role_name)
     if wf in {"fp8", "fp8_e4m3", "fp8_e5m2"}:
-        is_mx = sf in {"fp8_e8m0", "ue8m0"} and mx_group == MXFP_GROUP_SIZE
-        return WeightTensorQuant("W8A8_MXFP8" if is_mx else "FP8_DYNAMIC", "fp8_e4m3", af, "MXFP8" if is_mx else "FP8", sf, mx_group or (MXFP_GROUP_SIZE if is_mx else FP8_BLOCK_SIZE), True, f"quant_spec:{role_name}", role_name)
-    if wf in {"int4", "w4a8"}:
-        return WeightTensorQuant("W4A8_DYNAMIC", "int4", "int8", "W4A8", "fp32", 1, True, f"quant_spec:{role_name}", role_name)
-    return WeightTensorQuant("W8A8_DYNAMIC", "int8", "int8", "W8A8", "fp32", 1, True, f"quant_spec:{role_name}", role_name)
+        w_canon = "fp8_e5m2" if wf == "fp8_e5m2" else "fp8_e4m3"
+        is_mx = sf in {"fp8_e8m0", "ue8m0"} and group == MXFP_GROUP_SIZE
+        eff_group = group or (MXFP_GROUP_SIZE if is_mx else FP8_BLOCK_SIZE)
+        return WeightTensorQuant("W8A8_MXFP8" if is_mx else "FP8_DYNAMIC", w_canon, af, "MXFP8" if is_mx else "FP8", sf, eff_group, True, f"quant_spec:{role_name}", role_name)
+    s_eff = sf if sf not in {"", "none"} else (native_format or "bf16")
+    if wf in {"int4", "w4a8", "w4a16"}:
+        if af in _FLOAT_WEIGHT_TOKENS:
+            return WeightTensorQuant("W4A16", "int4", af, "W4A16", s_eff, group or 1, True, f"quant_spec:{role_name}", role_name)
+        return WeightTensorQuant("W4A8_DYNAMIC", "int4", "int8", "W4A8", sf if sf not in {"", "none"} else "fp32", group or 1, True, f"quant_spec:{role_name}", role_name)
+    if af in _FLOAT_WEIGHT_TOKENS:
+        return WeightTensorQuant("W8A16", "int8", af, "W8A16", s_eff, group or 1, True, f"quant_spec:{role_name}", role_name)
+    return WeightTensorQuant("W8A8_DYNAMIC", "int8", "int8", "W8A8", sf if sf not in {"", "none"} else "fp32", wb_col or 1, True, f"quant_spec:{role_name}", role_name)
 
 
 def classify_weight_tensor_quant(
@@ -926,7 +1018,7 @@ def classify_weight_tensor_quant(
         qspec = quant_spec_from_checkpoint_map(desc_or_quant_spec)
         return _classify_from_quant_spec(cat, qspec, native_format=native_format)
     if isinstance(desc_or_quant_spec, NpuCheckpointSpec):
-        curated = lookup_curated_checkpoint(desc_or_quant_spec.repo_id)
+        curated = desc_or_quant_spec._curated_if_isa_compatible()
         if curated is not None:
             return classify_weight_tensor_quant(name, curated, native_format=native_format)
         if desc_or_quant_spec.weight_patterns:
@@ -1060,30 +1152,37 @@ def _infer_offline_spec_for_repo(
 ) -> tuple[NpuCheckpointSpec | None, QuantSpec | None, CheckpointQuantMap | None, tuple[str, ...]]:
     hw = normalize_hw_family(hw_family)
     repo_lower = repo_id.lower()
-    fallback_match: NpuCheckpointSpec | None = None
-    for (_m, _hw), spec in DEFAULT_NPU_CHECKPOINTS.items():
-        if spec.repo_id.lower() == repo_lower:
-            if _hw == hw:
-                return (
-                    spec,
-                    spec.build_quant_spec(),
-                    spec.build_checkpoint_quant_map(),
-                    validate_quant_for_hardware(spec.quant_preset, hw, kv_cache_dtype=spec.kv_cache_dtype),
-                )
-            if fallback_match is None:
-                fallback_match = spec
-    if fallback_match is not None:
-        return (
-            fallback_match,
-            fallback_match.build_quant_spec(),
-            fallback_match.build_checkpoint_quant_map(),
-            validate_quant_for_hardware(fallback_match.quant_preset, hw, kv_cache_dtype=fallback_match.kv_cache_dtype),
-        )
     curated = lookup_curated_checkpoint(repo_id)
     if curated is not None:
         m_url, ms_url, hf_url = _repo_urls(repo_id)
         qspec = quant_spec_from_checkpoint_map(curated, checkpoint_url=m_url or ms_url or hf_url)
-        return None, qspec, curated, validate_quant_for_hardware(qspec.name, hw, kv_cache_dtype=qspec.kv_dtype)
+        warns = _validate_quant_spec_for_hardware(qspec, hw)
+        matched_spec = next(
+            (spec for (_m, _hw), spec in DEFAULT_NPU_CHECKPOINTS.items() if spec.repo_id.lower() == repo_lower and _hw == hw),
+            next((spec for spec in DEFAULT_NPU_CHECKPOINTS.values() if spec.repo_id.lower() == repo_lower), None),
+        )
+        return matched_spec, qspec, curated, warns
+    fallback_match: NpuCheckpointSpec | None = None
+    for (_m, _hw), spec in DEFAULT_NPU_CHECKPOINTS.items():
+        if spec.repo_id.lower() == repo_lower:
+            if _hw == hw:
+                qspec = spec.build_quant_spec()
+                return (
+                    spec,
+                    qspec,
+                    spec.build_checkpoint_quant_map(),
+                    _validate_quant_spec_for_hardware(qspec, hw),
+                )
+            if fallback_match is None:
+                fallback_match = spec
+    if fallback_match is not None:
+        qspec = fallback_match.build_quant_spec()
+        return (
+            fallback_match,
+            qspec,
+            fallback_match.build_checkpoint_quant_map(),
+            _validate_quant_spec_for_hardware(qspec, hw),
+        )
     lower = repo_id.lower()
     kv = "fp8" if ("c8" in lower and "mxfp" in lower) else ("int8" if "c8" in lower else "bf16")
     preset = (
@@ -1096,13 +1195,19 @@ def _infer_offline_spec_for_repo(
     if preset:
         m_url, ms_url, hf_url = _repo_urls(repo_id)
         qspec = _quant_spec_from_preset(preset, kv_dtype=kv, checkpoint_repo=repo_id, checkpoint_url=m_url or ms_url or hf_url)
-        return None, qspec, None, validate_quant_for_hardware(preset, hw, kv_cache_dtype=kv)
+        return None, qspec, None, _validate_quant_spec_for_hardware(qspec, hw)
     default_ckpt = resolve_default_checkpoint(normalize_model_key(repo_id), hw_family=hw)
     if default_ckpt is not None:
-        return default_ckpt, default_ckpt.build_quant_spec(), default_ckpt.build_checkpoint_quant_map(), ()
+        qspec = default_ckpt.build_quant_spec()
+        return (
+            default_ckpt,
+            qspec,
+            default_ckpt.build_checkpoint_quant_map(),
+            _validate_quant_spec_for_hardware(qspec, hw),
+        )
     m_url, ms_url, hf_url = _repo_urls(repo_id)
     qspec = _quant_spec_from_preset("bf16", kv_dtype=kv, checkpoint_repo=repo_id, checkpoint_url=m_url or ms_url or hf_url)
-    return None, qspec, None, validate_quant_for_hardware("bf16", hw, kv_cache_dtype=kv)
+    return None, qspec, None, _validate_quant_spec_for_hardware(qspec, hw)
 
 
 def _resolve_local_checkpoint(path: Path, hw_family: str) -> CheckpointMetadataResult:
@@ -1140,7 +1245,7 @@ def _resolve_local_checkpoint(path: Path, hw_family: str) -> CheckpointMetadataR
         qmap = ckpt.build_checkpoint_quant_map(base_config=cfg or None) if ckpt else None
         qspec = ckpt.build_quant_spec(base_config=cfg or None) if ckpt else None
 
-    warns = validate_quant_for_hardware(qspec.name, hw, kv_cache_dtype=qspec.kv_dtype) if qspec is not None else ()
+    warns = _validate_quant_spec_for_hardware(qspec, hw)
     return CheckpointMetadataResult(
         spec_or_url=str(path), source_kind="local_dir" if path.is_dir() else "local_file",
         repo_id=repo_label, canonical_model=canon, hw_family=hw,
@@ -1180,7 +1285,7 @@ def _build_remote_result(
         qmap = fallback_qmap
         qspec = fallback_q
     all_warns = list(warnings)
-    all_warns.extend(validate_quant_for_hardware(qspec.name, hw, kv_cache_dtype=qspec.kv_dtype) if qspec is not None else isa_warns)
+    all_warns.extend(_validate_quant_spec_for_hardware(qspec, hw) if qspec is not None else isa_warns)
     return CheckpointMetadataResult(
         spec_or_url=raw, source_kind=source_kind, repo_id=repo_id,
         canonical_model=normalize_model_key(repo_id), hw_family=hw,
@@ -1214,13 +1319,15 @@ def resolve_checkpoint_metadata(
         ckpt = resolve_default_checkpoint(raw, hw_family=hw)
         if ckpt is None:
             raise ModelingError(f"checkpoint_model_unknown:{raw}")
+        qspec = ckpt.build_quant_spec()
         return CheckpointMetadataResult(
             spec_or_url=raw, source_kind="builtin_registry", repo_id=ckpt.repo_id,
             canonical_model=ckpt.canonical_model, hw_family=ckpt.hw_family,
             modelers_url=ckpt.modelers_url, modelscope_url=ckpt.modelscope_url, hf_url=ckpt.hf_url,
             config={}, quant_model_description=ckpt.weight_pattern_map(), quantize_config={},
-            quant_spec=ckpt.build_quant_spec(), checkpoint=ckpt,
+            quant_spec=qspec, checkpoint=ckpt,
             checkpoint_quant_map=ckpt.build_checkpoint_quant_map(),
+            warnings=_validate_quant_spec_for_hardware(qspec, hw),
         )
 
     source_kind, repo_id, raw_bases = _parse_remote_target(raw)

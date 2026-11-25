@@ -11,22 +11,18 @@ from __future__ import annotations
 
 import hashlib
 import json
-import re
 from dataclasses import replace
 from collections.abc import Mapping
 from typing import Any
 
 from .config import flatten_config
 from .hf_config import (
-    declared_context, declared_rope, json_sequences, native_dtype, normalize_config, positive,
+    declared_context, declared_rope, json_sequences, normalize_config, positive,
     resolve_native_formats, resolve_quant, unrecognized_fields,
 )
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import LayerPlan, MlaSpec, ModelSpec
 
-_INDEXED_LAYER_ATTN_EXCLUSION_RE = re.compile(
-    r"(?:^|\.)layers\.(\d+)\.(?:self_attn|linear_attn|attention)(?:\.|$)"
-)
 _LONGCAT_MODEL_TYPES = frozenset({"longcat_flash", "longcat_flash_ngram"})
 _LONGCAT_SUBLAYERS_PER_BLOCK = 2
 
@@ -90,20 +86,6 @@ def _longcat_plans(c: Mapping[str, Any]) -> tuple[list[LayerPlan], list[str]]:
     return plans, gaps
 
 
-def _indexed_layer_projection_exclusions(c: Mapping[str, Any]) -> set[int]:
-    """Return concrete layer indices whose attention projections are explicitly unquantized."""
-    raw = c.get("quantization_config") or {}
-    if not isinstance(raw, Mapping):
-        return set()
-    patterns = raw.get("modules_to_not_convert") or raw.get("ignore") or ()
-    out: set[int] = set()
-    for item in patterns:
-        match = _INDEXED_LAYER_ATTN_EXCLUSION_RE.search(str(item).strip().lower())
-        if match is not None:
-            out.add(int(match.group(1)))
-    return out
-
-
 def _schedule(c, layers, gaps):
     schedule = c.get("layer_attention_schedule", c.get("layer_types"))
     if schedule is not None:
@@ -148,10 +130,6 @@ def generic_plans(c):
     if isinstance(moe_layers, str):
         moe_layers = {int(v.strip()) for v in moe_layers.split(",") if v.strip()}
     dense_layers = set(c.get("mlp_only_layers") or ())
-    indexed_attn_exclusions = _indexed_layer_projection_exclusions(c)
-    native = native_dtype(c)
-    if native not in {"bf16", "fp16", "fp32"}:
-        native = "bf16"
     sparse = c.get("sparse_attention_config") or {}
     for index, original_kind in enumerate(schedule):
         kind = {"full_attention": "gqa", "mha": "gqa", "mqa": "gqa",
@@ -222,8 +200,6 @@ def generic_plans(c):
         if sparse and index >= int(sparse.get("sparse_layers_start", 0)):
             fields["attention"] = "projection_only"
             gaps.append(f"sparse_selection_and_attention_core:layer{index}")
-        if index in indexed_attn_exclusions:
-            fields["projection_dtype"] = native
         plans.append(LayerPlan(**fields))
     for name in ("num_mtp_layers", "num_nextn_predict_layers", "mtp_num_hidden_layers"):
         if c.get(name):

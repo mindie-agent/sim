@@ -45,7 +45,11 @@ from mindie_sim.model_catalog import (
     customize_model_spec,
     load_model,
 )
-from mindie_sim.schema.checkpoint import CheckpointProvenance, CheckpointQuantMap
+from mindie_sim.schema.checkpoint import (
+    CheckpointProvenance,
+    CheckpointQuantMap,
+    LayerQuantException,
+)
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.serialization import apply_model_overrides
@@ -169,12 +173,63 @@ _INT8_PROFILE_KEYS = frozenset({"w8a8", "w8a8_dynamic", "w8a8_int8", "int8"})
 _INT4_PROFILE_KEYS = frozenset({"w4a8", "w4a8_dynamic", "w4a8-int8"})
 
 
-def _qspec_weight_formats(qspec: QuantSpec) -> set[str]:
+_WEIGHT_FORMAT_KEYS = frozenset({"weight_format", "expert_weight_format"})
+_CUSTOM_TEMPLATE_SKU = "CUSTOM_SKU_TEMPLATE"
+_CUSTOM_HARDWARE_DECL_KEYS = frozenset({
+    "archetype", "hbm_gb", "hbm_bw_gbps", "cube_fp16_tflops", "vector_fp32_tflops",
+    "cube_fp8_tflops", "cube_int8_tops", "cube_mxfp4_tflops", "l2_mb", "ub_kb",
+    "l1_kb", "aic_count", "aiv_count", "max_dies", "dies_per_package",
+})
+_FLOAT_CANON_MAP: dict[str, str] = {
+    "bf16": "bf16", "bfloat16": "bf16",
+    "fp16": "fp16", "float16": "fp16",
+    "fp32": "fp32", "float32": "fp32",
+}
+
+
+def _collect_weight_formats_nested(obj: Any, fmts: set[str]) -> None:
+    if isinstance(obj, Mapping):
+        for key, value in obj.items():
+            if key in _WEIGHT_FORMAT_KEYS and isinstance(value, str) and value.strip():
+                fmts.add(value.strip().lower())
+            elif isinstance(value, (Mapping, tuple, list)):
+                _collect_weight_formats_nested(value, fmts)
+        return
+    if isinstance(obj, (tuple, list)):
+        if (
+            len(obj) == 2
+            and isinstance(obj[0], str)
+            and obj[0] in _WEIGHT_FORMAT_KEYS
+            and isinstance(obj[1], str)
+            and obj[1].strip()
+        ):
+            fmts.add(obj[1].strip().lower())
+            return
+        for item in obj:
+            if isinstance(item, (Mapping, tuple, list)):
+                _collect_weight_formats_nested(item, fmts)
+
+
+def _qspec_weight_formats(
+    qspec: QuantSpec,
+    *,
+    model_spec: ModelSpec | None = None,
+) -> set[str]:
+    if getattr(qspec, "layer_quant_overrides", ()) and model_spec is not None and getattr(model_spec, "layer_plans", ()):
+        from mindie_sim.catalog.quant import projection_quant
+        fmts: set[str] = set()
+        for plan in model_spec.layer_plans:
+            layer_q = projection_quant(qspec, plan)
+            fmts.add(str(layer_q.weight_format).lower())
+            fmts.add(str(layer_q.expert_weight_format).lower())
+            _collect_weight_formats_nested(getattr(layer_q, "category_overrides", ()), fmts)
+            _collect_weight_formats_nested(getattr(layer_q, "expert_quant_overrides", ()), fmts)
+        return fmts
     fmts = {str(qspec.weight_format).lower(), str(qspec.expert_weight_format).lower()}
-    for _, override in getattr(qspec, "category_overrides", ()) or ():
-        for key, value in override:
-            if key in {"weight_format", "expert_weight_format"}:
-                fmts.add(str(value).lower())
+    _collect_weight_formats_nested(getattr(qspec, "category_overrides", ()), fmts)
+    _collect_weight_formats_nested(getattr(qspec, "expert_quant_overrides", ()), fmts)
+    if getattr(qspec, "layer_quant_overrides", ()):
+        _collect_weight_formats_nested(qspec.layer_quant_overrides_dict(), fmts)
     return fmts
 
 
@@ -200,7 +255,7 @@ def curated_quant_compatible_with_profile(
         native_act = str(model_spec.activation_dtype or "bf16").strip().lower()
         if proj_act != native_act and idx_act != proj_act:
             return False
-    fmts = _qspec_weight_formats(ckpt_qspec)
+    fmts = _qspec_weight_formats(ckpt_qspec, model_spec=model_spec)
     has_int = bool(fmts & {"int8", "int4"})
     has_fp8 = bool(fmts & _MX_FP8_FORMATS)
     has_fp4 = bool(fmts & _MX_FP4_FORMATS)
@@ -264,6 +319,266 @@ def canonical_quant_preset_key(qspec: QuantSpec | Mapping[str, Any] | None) -> s
     return None
 
 
+_QUANT_AFFECTING_OVERRIDE_KEYS = frozenset({
+    "weight_format", "expert_weight_format", "activation_format",
+    "weight_block", "expert_block", "scale_format", "scale_bytes",
+    "weight_symmetric", "expert_quant_count", "expert_quant_overrides",
+})
+_EXPERT_OVERRIDE_CATS = frozenset({"routed_expert", "dspark_routed_expert"})
+
+
+def _explicit_float_dtype(
+    quant: str | Mapping[str, Any] | QuantSpec | None,
+    fallback_native: str,
+) -> str:
+    if isinstance(quant, str):
+        return _FLOAT_CANON_MAP.get(quant.strip().lower(), fallback_native)
+    if isinstance(quant, QuantSpec):
+        wf = str(quant.weight_format or "").strip().lower()
+        ewf = str(quant.expert_weight_format or wf).strip().lower()
+        unquant = _UNQUANTIZED_QUANT_TOKENS | {""}
+        if wf in unquant and ewf in unquant:
+            candidates = (quant.weight_format, quant.native_format, quant.activation_format, quant.name)
+        else:
+            candidates = (quant.native_format, quant.activation_format, quant.weight_format, quant.name)
+    elif isinstance(quant, Mapping):
+        wf = str(quant.get("weight_format") or "").strip().lower()
+        ewf = str(quant.get("expert_weight_format") or wf).strip().lower()
+        unquant = _UNQUANTIZED_QUANT_TOKENS | {""}
+        if wf in unquant and ewf in unquant:
+            candidates = (quant.get("weight_format"), quant.get("native_format"), quant.get("activation_format"), quant.get("name"))
+        else:
+            candidates = (quant.get("native_format"), quant.get("activation_format"), quant.get("weight_format"), quant.get("name"))
+    else:
+        return fallback_native
+    for raw in candidates:
+        mapped = _FLOAT_CANON_MAP.get(str(raw or "").strip().lower())
+        if mapped:
+            return mapped
+    return fallback_native
+
+
+def _plan_tensor_category_pairs(plan: Any) -> tuple[tuple[str, str], ...]:
+    pairs: list[tuple[str, str]] = []
+    attn = str(getattr(plan, "attention", "gqa") or "gqa").lower()
+    if attn == "mla":
+        pairs.extend([
+            ("model.layers.*.self_attn.q_a_proj.weight", "mla.q_a"),
+            ("model.layers.*.self_attn.q_b_proj.weight", "mla.q_b"),
+            ("model.layers.*.self_attn.kv_a_proj_with_mqa.weight", "mla.kv_a"),
+            ("model.layers.*.self_attn.kv_b_proj.weight", "mla_absorb"),
+            ("model.layers.*.self_attn.o_proj.weight", "mla.o"),
+        ])
+        if getattr(plan, "mla_output_gate", False):
+            pairs.append(("model.layers.*.self_attn.g_proj.weight", "mla.g"))
+        if getattr(plan, "indexer", False):
+            pairs.append(("model.layers.*.self_attn.indexer.wk.weight", "indexer.wk"))
+            pairs.append(("model.layers.*.self_attn.indexer.weights_proj.weight", "indexer.weights"))
+    elif attn == "gdn":
+        pairs.extend([
+            ("model.layers.*.linear_attn.in_proj_qkv.weight", "gdn.qkvz"),
+            ("model.layers.*.linear_attn.in_proj_z.weight", "gdn.qkvz"),
+            ("model.layers.*.linear_attn.in_proj_b.weight", "gdn.beta_alpha"),
+            ("model.layers.*.linear_attn.in_proj_a.weight", "gdn.beta_alpha"),
+            ("model.layers.*.linear_attn.out_proj.weight", "gdn.o"),
+        ])
+    elif attn == "kda":
+        pairs.extend([
+            ("model.layers.*.self_attn.q_proj.weight", "kda.q"),
+            ("model.layers.*.self_attn.k_proj.weight", "kda.k"),
+            ("model.layers.*.self_attn.v_proj.weight", "kda.v"),
+            ("model.layers.*.self_attn.o_proj.weight", "kda.o"),
+            ("model.layers.*.self_attn.b_proj.weight", "kda.b"),
+            ("model.layers.*.self_attn.f_a_proj.weight", "kda.f_a"),
+            ("model.layers.*.self_attn.f_b_proj.weight", "kda.f_b"),
+            ("model.layers.*.self_attn.g_a_proj.weight", "kda.g"),
+            ("model.layers.*.self_attn.g_b_proj.weight", "kda.g"),
+            ("model.layers.*.self_attn.g_proj.weight", "kda.g"),
+        ])
+    else:
+        pairs.extend([
+            ("model.layers.*.self_attn.q_proj.weight", "attn.qkv"),
+            ("model.layers.*.self_attn.k_proj.weight", "attn.qkv"),
+            ("model.layers.*.self_attn.v_proj.weight", "attn.qkv"),
+            ("model.layers.*.self_attn.o_proj.weight", "attn.o"),
+        ])
+        if getattr(plan, "indexer", False):
+            pairs.append(("model.layers.*.self_attn.index_q_proj.weight", "indexer.wq"))
+            pairs.append(("model.layers.*.self_attn.index_k_proj.weight", "indexer.wk"))
+    if int(getattr(plan, "residual_block_size", 0) or 0) > 0:
+        pairs.append(("model.layers.*.self_attention_res_proj.weight", "attn_res_proj"))
+        pairs.append(("model.layers.*.mlp_res_proj.weight", "attn_res_proj"))
+    if str(getattr(plan, "ffn", "dense") or "dense").lower() == "moe":
+        if int(getattr(plan, "expert_latent_size", 0) or 0) > 0:
+            pairs.append(("model.layers.*.mlp.latent_proj.weight", "latent_moe"))
+        pairs.extend([
+            ("model.layers.*.mlp.experts.*.gate_proj.weight", "routed_expert"),
+            ("model.layers.*.mlp.experts.*.up_proj.weight", "routed_expert"),
+            ("model.layers.*.mlp.experts.*.down_proj.weight", "routed_expert"),
+        ])
+        if int(getattr(plan, "num_shared_experts", 0) or 0) > 0:
+            pairs.extend([
+                ("model.layers.*.mlp.shared_experts.gate_proj.weight", "shared_expert"),
+                ("model.layers.*.mlp.shared_experts.up_proj.weight", "shared_expert"),
+                ("model.layers.*.mlp.shared_experts.down_proj.weight", "shared_expert"),
+            ])
+    else:
+        pairs.extend([
+            ("model.layers.*.mlp.gate_proj.weight", "dense_mlp"),
+            ("model.layers.*.mlp.up_proj.weight", "dense_mlp"),
+            ("model.layers.*.mlp.down_proj.weight", "dense_mlp"),
+        ])
+    return tuple(pairs)
+
+
+def _category_touched_by_override(category: str, touched_cats: set[str]) -> bool:
+    if category in touched_cats:
+        return True
+    if category == "mla_absorb" and "mla" in touched_cats:
+        return True
+    parts = category.split(".")
+    for idx in range(1, len(parts)):
+        if ".".join(parts[:idx]) in touched_cats:
+            return True
+    return False
+
+
+def _override_mapping_affects_quant(fields: Any) -> bool:
+    if isinstance(fields, Mapping):
+        return bool(set(fields.keys()) & _QUANT_AFFECTING_OVERRIDE_KEYS)
+    if isinstance(fields, (tuple, list)):
+        return any(
+            isinstance(item, (tuple, list)) and len(item) == 2 and str(item[0]) in _QUANT_AFFECTING_OVERRIDE_KEYS
+            for item in fields
+        )
+    return False
+
+
+def _layer_override_touched_cats(layer_ov: Any) -> tuple[bool, set[str]]:
+    if layer_ov is None:
+        return False, set()
+    if isinstance(layer_ov, QuantSpec):
+        return True, {k for k, f in layer_ov.category_overrides if _override_mapping_affects_quant(f)}
+    if isinstance(layer_ov, Mapping):
+        all_touched = any(k in layer_ov for k in ("weight_format", "expert_weight_format", "activation_format"))
+        sub = layer_ov.get("category_overrides")
+        cats = (
+            {str(k) for k, v in sub.items() if _override_mapping_affects_quant(v)}
+            if isinstance(sub, Mapping)
+            else set()
+        )
+        return all_touched, cats
+    return False, set()
+
+
+def _tag_from_classified_quant(
+    cat: str,
+    layer_q: QuantSpec,
+    *,
+    eff_native: str,
+    classify_fn: Any,
+) -> str:
+    wtq = classify_fn(cat, layer_q, native_format=eff_native)
+    tag = wtq.raw_tag
+    if tag == "W8A16":
+        return "W8A16_GPTQ"
+    if tag == "W8A8_DYNAMIC" and "static" in str(layer_q.name or "").lower():
+        return "W8A8_STATIC"
+    if tag == "FLOAT" and wtq.weight_format in _FLOAT_CANON_MAP and _FLOAT_CANON_MAP[wtq.weight_format] != eff_native:
+        return _FLOAT_CANON_MAP[wtq.weight_format].upper()
+    return tag
+
+
+def _emit_role_exceptions(
+    grouped: dict[tuple[str, str, tuple[int, ...]], set[int]],
+    *,
+    pattern: str,
+    cat: str,
+    layer_q: QuantSpec,
+    lid: int,
+    eff_native: str,
+    classify_fn: Any,
+) -> None:
+    if cat in _EXPERT_OVERRIDE_CATS:
+        resolved_cat = layer_q.for_category(cat)
+        if resolved_cat.expert_quant_overrides:
+            for eids, _fields in resolved_cat.expert_quant_overrides:
+                exp_q = resolved_cat.for_expert(eids[0])
+                exp_tag = _tag_from_classified_quant(cat, exp_q, eff_native=eff_native, classify_fn=classify_fn)
+                grouped.setdefault((pattern, exp_tag, tuple(eids)), set()).add(lid)
+            return
+    tag = _tag_from_classified_quant(cat, layer_q, eff_native=eff_native, classify_fn=classify_fn)
+    grouped.setdefault((pattern, tag, ()), set()).add(lid)
+
+
+def _build_override_layer_exceptions(
+    qspec: QuantSpec | None,
+    model_spec: ModelSpec | None,
+    *,
+    eff_native: str,
+) -> tuple[LayerQuantException, ...]:
+    if qspec is None or model_spec is None or not getattr(model_spec, "layer_plans", ()):
+        return ()
+    wf_low = str(qspec.weight_format or "").strip().lower()
+    ewf_low = str(qspec.expert_weight_format or wf_low).strip().lower()
+    dense_float_mixed_expert = (
+        wf_low in _FLOAT_CANON_MAP
+        and ewf_low not in (_UNQUANTIZED_QUANT_TOKENS | {""})
+    )
+    has_ov = bool(
+        getattr(qspec, "category_overrides", ())
+        or getattr(qspec, "layer_quant_overrides", ())
+        or getattr(qspec, "expert_quant_overrides", ())
+        or dense_float_mixed_expert
+    )
+    if not has_ov:
+        return ()
+    from mindie_sim.catalog.npu_checkpoints import _classify_from_quant_spec
+    from mindie_sim.catalog.quant import lookup_layer_quant_override, projection_quant
+
+    global_ov_cats = {
+        str(k) for k, f in qspec.category_overrides if _override_mapping_affects_quant(f)
+    }
+    if getattr(qspec, "expert_quant_overrides", ()):
+        global_ov_cats.add("routed_expert")
+    layer_ov_dict = qspec.layer_quant_overrides_dict() if qspec.layer_quant_overrides else {}
+    grouped: dict[tuple[str, str, tuple[int, ...]], set[int]] = {}
+    for plan in model_spec.layer_plans:
+        layer_ov = lookup_layer_quant_override(layer_ov_dict, plan) if layer_ov_dict else None
+        all_touched, layer_cats = _layer_override_touched_cats(layer_ov)
+        touched = global_ov_cats | layer_cats
+        if not touched and not all_touched and not dense_float_mixed_expert:
+            continue
+        layer_q = projection_quant(qspec, plan)
+        native_id = int(getattr(plan, "native_layer_id", -1))
+        lid = native_id if native_id >= 0 else int(plan.index)
+        for pattern, cat in _plan_tensor_category_pairs(plan):
+            is_dense_role = cat not in _EXPERT_OVERRIDE_CATS
+            if not (all_touched or _category_touched_by_override(cat, touched) or (dense_float_mixed_expert and is_dense_role)):
+                continue
+            _emit_role_exceptions(
+                grouped,
+                pattern=pattern,
+                cat=cat,
+                layer_q=layer_q,
+                lid=lid,
+                eff_native=eff_native,
+                classify_fn=_classify_from_quant_spec,
+            )
+
+    return tuple(
+        LayerQuantException(
+            pattern=pat,
+            scope="target",
+            layer_indices=tuple(sorted(lids)),
+            raw_tag=tag,
+            expert_indices=eids,
+        )
+        for (pat, tag, eids), lids in sorted(grouped.items())
+        if lids
+    )
+
+
 def synthetic_checkpoint_quant_map(
     model_spec: ModelSpec,
     *,
@@ -271,20 +586,26 @@ def synthetic_checkpoint_quant_map(
     native_dtype: str = "bf16",
 ) -> CheckpointQuantMap:
     """Build an explicit-preset or unquantized ``CheckpointQuantMap`` from ``model_spec.quant``."""
+    eff_native = _explicit_float_dtype(model_spec.quant, native_dtype)
+    exceptions = _build_override_layer_exceptions(
+        model_spec.quant, model_spec, eff_native=eff_native,
+    )
     preset = canonical_quant_preset_key(model_spec.quant)
     if preset is None:
         return CheckpointQuantMap(
             provenance=CheckpointProvenance(
                 f"native/{canon or model_spec.name}", "unquantized_native", origin="unquantized_native",
             ),
-            native_float_dtype=native_dtype,
+            native_float_dtype=eff_native,
+            layer_exceptions=exceptions,
         )
     return CheckpointQuantMap(
         provenance=CheckpointProvenance(
             f"explicit-preset/{preset}", "explicit_synthetic_preset", origin="explicit_synthetic_preset",
         ),
-        native_float_dtype=native_dtype,
+        native_float_dtype=eff_native,
         model_quant_type=preset,
+        layer_exceptions=exceptions,
     )
 
 
@@ -419,12 +740,21 @@ def _hardware_backend(sku: str) -> str:
     raise ModelingError(f"unknown_hardware_sku:{sku}")
 
 
+def _has_custom_hardware_decl_keys(raw: Mapping[str, Any]) -> bool:
+    from mindie_sim.custom_hardware import _FIELD_DOCS
+    known_custom = (set(_FIELD_DOCS) | set(_CUSTOM_HARDWARE_DECL_KEYS)) - {"sku"}
+    return any(k in raw for k in known_custom)
+
+
 def _resolve_hardware(hardware: str | Mapping[str, Any]) -> tuple[str, str, str]:
     """Return the canonical SKU, vendor adapter and any alias topology preset."""
     if isinstance(hardware, Mapping):
         raw = dict(hardware)
-        requested = raw.get("sku", "a3")
         preset = str(raw.get("topology_preset")) if raw.get("topology_preset") else ""
+        has_sku = bool(str(raw.get("sku") or "").strip())
+        if not has_sku and "device" not in raw and _has_custom_hardware_decl_keys(raw):
+            return _CUSTOM_TEMPLATE_SKU, "custom", preset
+        requested = raw.get("sku", "a3")
         lower_req = str(requested).strip().lower()
         if lower_req in HARDWARE_TOPOLOGY_ALIASES:
             sku, alias_preset = HARDWARE_TOPOLOGY_ALIASES[lower_req]
@@ -433,7 +763,7 @@ def _resolve_hardware(hardware: str | Mapping[str, Any]) -> tuple[str, str, str]
             sku = resolve_hardware_sku(str(requested))
             return sku, _hardware_backend(sku), preset
         except ModelingError:
-            if any(k in raw for k in ("archetype", "hbm_gb", "hbm_bw_gbps", "cube_fp16_tflops")):
+            if _has_custom_hardware_decl_keys(raw):
                 return str(requested).strip() or "CUSTOM_INLINE_SKU", "custom", preset
             raise
     lower = str(hardware).strip().lower()
@@ -457,6 +787,25 @@ def _read_config_json(path: Path) -> dict[str, Any]:
     return dict(data)
 
 
+def _sync_kv_cache_tag(meta: dict[str, Any], quant_spec: Any) -> None:
+    if quant_spec is None:
+        return
+    src = dict(getattr(quant_spec, "source", ()) or ())
+    tag = str(src.get("kv_cache_tag") or "").strip()
+    kv_low = str(getattr(quant_spec, "kv_dtype", "") or "").strip().lower()
+    if tag and "fp8" in kv_low:
+        meta["kv_cache_tag"] = tag
+    else:
+        meta.pop("kv_cache_tag", None)
+
+
+def _mapping_declares_hf_quant(raw: Mapping[str, Any]) -> bool:
+    if isinstance(raw.get("quantization_config"), Mapping) and raw.get("quantization_config"):
+        return True
+    text_cfg = raw.get("text_config")
+    return isinstance(text_cfg, Mapping) and isinstance(text_cfg.get("quantization_config"), Mapping) and bool(text_cfg.get("quantization_config"))
+
+
 def _attach_checkpoint_quant(
     spec: ModelSpec,
     quant_spec: Any,
@@ -472,10 +821,12 @@ def _attach_checkpoint_quant(
         meta["checkpoint_quant_declared"] = True
         if getattr(quant_spec, "layer_quant_overrides", ()) and "layer_quant_overrides" not in meta:
             meta["layer_quant_overrides"] = quant_spec.layer_quant_overrides_dict()
+        _sync_kv_cache_tag(meta, quant_spec)
         return replace(
             spec,
             quant=quant_spec,
             quantization=str(quant_spec.name),
+            weight_dtype=str(quant_spec.weight_format),
             kv_dtype=str(quant_spec.kv_dtype),
             metadata=tuple(sorted(meta.items())),
         )
@@ -514,6 +865,14 @@ def _local_checkpoint_quant_map(
     model_arg: Any,
     model_spec: ModelSpec,
 ) -> CheckpointQuantMap | None:
+    if isinstance(model_arg, Mapping):
+        if _mapping_declares_hf_quant(model_arg):
+            from mindie_sim.catalog.checkpoint_reader import read_hf_quantization_config
+            return read_hf_quantization_config(
+                model_arg,
+                checkpoint_id=f"inline/{model_spec.name or 'hf-config'}",
+            )
+        return None
     if not isinstance(model_arg, (Path, str)):
         return None
     candidate = Path(model_arg).expanduser() if isinstance(model_arg, str) else model_arg.expanduser()
@@ -543,14 +902,12 @@ def _explicit_checkpoint_quant_map(
     model_name: str,
     native_dtype: str,
     lookup_curated: Any,
+    model_spec: ModelSpec | None = None,
 ) -> tuple[CheckpointQuantMap, QuantSpec | None, str, str | None, str | None] | None:
     if isinstance(quant, str):
         raw_q_str = quant.strip().lower()
         if raw_q_str in _UNQUANTIZED_QUANT_TOKENS:
-            dtype_val = (
-                "fp16" if raw_q_str in {"fp16", "float16"}
-                else ("fp32" if raw_q_str == "fp32" else "bf16")
-            )
+            dtype_val = _explicit_float_dtype(raw_q_str, "bf16")
             return (
                 CheckpointQuantMap(
                     provenance=CheckpointProvenance(
@@ -577,7 +934,33 @@ def _explicit_checkpoint_quant_map(
         ckpt_ref = dict(getattr(quant, "source", ()) or ()).get("checkpoint")
         curated = lookup_curated(str(ckpt_ref)) if ckpt_ref else None
         if curated is not None:
+            from mindie_sim.catalog.checkpoint_reader import quant_spec_from_checkpoint_map
+            base_cur = quant_spec_from_checkpoint_map(curated)
+            if (
+                quant.category_overrides != base_cur.category_overrides
+                or quant.layer_quant_overrides != base_cur.layer_quant_overrides
+            ):
+                base_cat = dict(base_cur.category_overrides)
+                changed_cats = {
+                    k: dict(v) for k, v in quant.category_overrides
+                    if base_cat.get(k) != v
+                }
+                diff_q = replace(
+                    quant,
+                    category_overrides=changed_cats,
+                    layer_quant_overrides=(
+                        quant.layer_quant_overrides_dict()
+                        if quant.layer_quant_overrides != base_cur.layer_quant_overrides
+                        else {}
+                    ),
+                )
+                eff_native = _explicit_float_dtype(quant, curated.native_float_dtype or native_dtype)
+                extra_exc = _build_override_layer_exceptions(diff_q, model_spec, eff_native=eff_native)
+                if extra_exc:
+                    curated = replace(curated, layer_exceptions=(*curated.layer_exceptions, *extra_exc))
             return curated, quant, "", None, None
+        eff_native = _explicit_float_dtype(quant, native_dtype)
+        exceptions = _build_override_layer_exceptions(quant, model_spec, eff_native=eff_native)
         preset = canonical_quant_preset_key(quant)
         if preset is None:
             return (
@@ -585,7 +968,8 @@ def _explicit_checkpoint_quant_map(
                     provenance=CheckpointProvenance(
                         f"native/{canon or model_name}", "unquantized_native", origin="unquantized_native",
                     ),
-                    native_float_dtype=native_dtype,
+                    native_float_dtype=eff_native,
+                    layer_exceptions=exceptions,
                 ),
                 quant, "", None, None,
             )
@@ -594,12 +978,18 @@ def _explicit_checkpoint_quant_map(
                 provenance=CheckpointProvenance(
                     f"explicit-preset/{preset}", "explicit_synthetic_preset", origin="explicit_synthetic_preset",
                 ),
-                native_float_dtype=native_dtype,
+                native_float_dtype=eff_native,
                 model_quant_type=preset,
+                layer_exceptions=exceptions,
             ),
             quant, "", None, None,
         )
     if isinstance(quant, Mapping):
+        eff_native = _explicit_float_dtype(quant, native_dtype)
+        exceptions: tuple[LayerQuantException, ...] = ()
+        if model_spec is not None and (quant.get("category_overrides") or quant.get("layer_quant_overrides")):
+            parsed_q = apply_model_overrides(model_spec, {"quant": dict(quant)}).quant
+            exceptions = _build_override_layer_exceptions(parsed_q, model_spec, eff_native=eff_native)
         preset = canonical_quant_preset_key(quant)
         if preset is None:
             return (
@@ -607,7 +997,8 @@ def _explicit_checkpoint_quant_map(
                     provenance=CheckpointProvenance(
                         f"native/{canon or model_name}", "unquantized_native", origin="unquantized_native",
                     ),
-                    native_float_dtype=native_dtype,
+                    native_float_dtype=eff_native,
+                    layer_exceptions=exceptions,
                 ),
                 None, "", None, None,
             )
@@ -616,8 +1007,9 @@ def _explicit_checkpoint_quant_map(
                 provenance=CheckpointProvenance(
                     f"explicit-preset/{preset}", "explicit_synthetic_preset", origin="explicit_synthetic_preset",
                 ),
-                native_float_dtype=native_dtype,
+                native_float_dtype=eff_native,
                 model_quant_type=preset,
+                layer_exceptions=exceptions,
             ),
             None, "", None, None,
         )
@@ -656,6 +1048,7 @@ def resolve_checkpoint_quant_map(
         explicit = _explicit_checkpoint_quant_map(
             quant, canon=canon, model_name=model_spec.name,
             native_dtype=native_dtype, lookup_curated=lookup_curated_checkpoint,
+            model_spec=model_spec,
         )
         if explicit is not None:
             return explicit
@@ -739,7 +1132,30 @@ def _resolve_model_spec(
         if "layers" in raw and "hidden_size" in raw and "model_type" not in raw:
             return ModelSpec.from_mapping(raw)
         name = str(raw.get("name") or raw.get("model_type") or "inline-model")
-        return build_model_spec(name, raw)
+        spec = build_model_spec(name, raw)
+        if _mapping_declares_hf_quant(raw):
+            meta = dict(spec.metadata)
+            unmodeled = tuple(meta.get("unmodeled_features") or ())
+            quant_degraded = any(
+                "quantization_" in str(g) or "quant_" in str(g) for g in unmodeled
+            )
+            if quant_degraded:
+                from mindie_sim.catalog.checkpoint_reader import (
+                    quant_spec_from_checkpoint_map,
+                    read_hf_quantization_config,
+                )
+                try:
+                    qmap = read_hf_quantization_config(raw, checkpoint_id=f"inline/{name}")
+                except ModelingError:
+                    qmap = None
+                if qmap is not None and qmap.source_format != "unquantized_native":
+                    qspec = quant_spec_from_checkpoint_map(qmap, base_config=raw)
+                    return _attach_checkpoint_quant(spec, qspec)
+            meta["checkpoint_quant_declared"] = True
+            if spec.quant is not None and getattr(spec.quant, "layer_quant_overrides", ()) and "layer_quant_overrides" not in meta:
+                meta["layer_quant_overrides"] = spec.quant.layer_quant_overrides_dict()
+            return replace(spec, metadata=tuple(sorted(meta.items())))
+        return spec
     if isinstance(model, Path):
         resolved_path = model.expanduser()
         raw = _read_config_json(resolved_path)
@@ -891,9 +1307,14 @@ def _apply_quant_override(
 ) -> ModelSpec:
     if isinstance(quant, QuantSpec):
         base_quant = getattr(model_spec, "quant", None)
+        q_source = dict(getattr(quant, "source", ()) or ())
+        idx_unspecified = (
+            not str(quant.index_dtype or "").strip()
+            or q_source.get("index_dtype_source") == "unspecified"
+        )
         if (
             base_quant is not None
-            and str(quant.index_dtype or "bf16") == "bf16"
+            and idx_unspecified
             and str(quant.index_scale_dtype or "none") in {"", "none"}
             and str(base_quant.index_dtype or "bf16") not in {"", "bf16", "fp16"}
         ):
@@ -905,10 +1326,12 @@ def _apply_quant_override(
         meta = dict(model_spec.metadata)
         if getattr(quant, "layer_quant_overrides", ()) and "layer_quant_overrides" not in meta:
             meta["layer_quant_overrides"] = quant.layer_quant_overrides_dict()
+        _sync_kv_cache_tag(meta, quant)
         updated = replace(
             model_spec,
             quant=quant,
             quantization=str(quant.name),
+            weight_dtype=str(quant.weight_format),
             kv_dtype=str(quant.kv_dtype),
             metadata=tuple(sorted(meta.items())),
         )
@@ -930,6 +1353,10 @@ def _apply_quant_override(
             raise ModelingError(
                 f"invalid_quant_override:{quant} — {_format_quant_suggestions(raw_key)}"
             ) from exc
+        meta = dict(updated.metadata)
+        if "kv_cache_tag" in meta and "fp8" not in str(updated.kv_dtype or "").lower():
+            meta.pop("kv_cache_tag", None)
+            updated = replace(updated, metadata=tuple(sorted(meta.items())))
         _validate_explicit_quant_for_hardware(updated, machine, quant)
         return updated
     if isinstance(quant, Mapping):
@@ -938,6 +1365,10 @@ def _apply_quant_override(
             model_spec,
             {"quant": qdict, "kv_dtype": str(qdict.get("kv_dtype", model_spec.kv_dtype))},
         )
+        meta = dict(updated.metadata)
+        if "kv_cache_tag" in meta and "fp8" not in str(updated.kv_dtype or "").lower():
+            meta.pop("kv_cache_tag", None)
+            updated = replace(updated, metadata=tuple(sorted(meta.items())))
         _validate_explicit_quant_for_hardware(updated, machine, qdict.get("name", qdict))
         return updated
     raise ModelingError(f"invalid_quant_override:{quant} — {_format_quant_suggestions(str(quant))}")
@@ -1148,7 +1579,7 @@ def ensure_native_mla_draft(model_spec: ModelSpec, proposals: int) -> ModelSpec:
             base_logits=True, pp_capability=PP_CAP_DEFAULT,
             vocab_size=model_spec.vocab_size,
             target_layer_ids=(int(donor.index),),
-            mhc_mult=int(donor.hyper_connections),
+            mhc_mult=int(donor.hc_mult) if donor.hyper_connections else 0,
             mhc_sinkhorn_iters=int(donor.hc_sinkhorn_iters),
             mhc_lowrank=int(donor.hc_lowrank),
             source=merge_source({"kind": "native_mla_nextn_mtp"}),
