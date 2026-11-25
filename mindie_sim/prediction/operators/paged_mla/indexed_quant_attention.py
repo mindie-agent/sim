@@ -94,8 +94,8 @@ C8_PACKED_ROW_BYTES = C8_PAYLOAD_BYTES + C8_SCALE_BYTES + 64 * 2
 ROW_ALIGNMENT_BYTES = 32
 C8_TILE_CACHE_SIZE = 4096
 OWNER_TILE_CACHE_SIZE = 8
-#: The caller passes one key cache and one value cache that alias those bytes.
-C8_ALIAS_READS = 2
+#: ``IS_SPLIT_G`` triple-buffered GM KV workspace slots (tiling.cpp:517).
+C8_SPLIT_G_WS_SLOTS = 3
 #: ``sparse_indices -> block_table`` resolves two dependent INT32 scalar reads.
 C8_ADDRESS_LOOKUPS = 2
 C8_ADDRESS_ENTRY_BYTES = 4
@@ -120,6 +120,8 @@ C8_ACCUM_PASS_OPS = 2
 C8_FP32_BYTES = 4
 C8_BF16_BYTES = 2
 C8_HEAD_ALIGN = 16
+C8_FIXPIPE_M_ALIGN = 2
+C8_FIXPIPE_N_ALIGN = 8
 
 
 def packed_row_bytes(rope):
@@ -158,10 +160,11 @@ def recipe(*, scratch_policy, compact=True, operand_modes=True,
 
 
 def phases(keys, heads, latent, rope, *, first, last, scratch_policy,
-           operand_modes=False):
+           operand_modes=False, flash_decode=False):
     """Alias-aware gather plus element work of the declared conversion chain."""
     common = _phases(keys, heads, latent, rope, first=first, last=last,
-                     scratch_policy=scratch_policy, operand_modes=operand_modes)
+                     scratch_policy=scratch_policy, operand_modes=operand_modes,
+                     flash_decode=flash_decode)
     # DataCopyPad transfers valid bytes, pads only the local destination. The
     # retained kernel's arbitrary-index/page reads are accounted as two INT32
     # fields per selected row; dependent scalar response remains unmodeled.
@@ -299,43 +302,53 @@ def build(op, geometry, *, scratch_policy, compact=True, operand_modes=True,
     })
 
 
-def arch35_tile_phases(keys, heads, latent, rope, *, first, last, private_hbm=0):
+def arch35_tile_phases(keys, heads, latent, rope, *, first, last, private_hbm=0,
+                       ws_hbm=False, ws_l2=False):
     """One ``arch35`` C8 key tile: address, gather/dequant, QK, PV, accumulate.
 
     The ``2-AIV`` ``index/page lookup -> packed-row gather -> C8 dequant + NZ
     publish`` block is one source subtile loop over a double-buffered UB slot,
     so its steady service is the busiest of the copy, vector and publish pipes.
-    The AIC ``QK -> Fixpipe -> online softmax -> PV`` chain stays explicit
-    because every step consumes the result of the previous one.
+    The AIC ``QK -> Fixpipe -> online softmax -> probability -> PV`` chain stays
+    explicit because every step consumes the result of the previous one.
     """
     padded_h = _align(heads, C8_HEAD_ALIGN)
     width = latent + rope
     row_bytes = packed_row_bytes(rope)
     first_size = heads * width * C8_BF16_BYTES if first else 0
     output_bytes = heads * latent * C8_BF16_BYTES if last else 0
+    kv_publish_bytes = keys * width * C8_BF16_BYTES
+    # kv_quant_sparse_flash_attention_service_vector_mla_arch35.h:661 copies full s2BaseSize columns.
+    prob_bytes = heads * C8_KEY_TILE * C8_BF16_BYTES if keys else 0
+    kv_resources = {
+        # One aliased KV row plus the two dependent INT32 scalar lookups.
+        "mte2_aiv": keys * (row_bytes
+                            + C8_ADDRESS_LOOKUPS * C8_ADDRESS_ENTRY_BYTES),
+        "vector": keys * _dequant_lane_ops(latent),
+        "mte3": kv_publish_bytes,
+        "hbm": private_hbm + (kv_publish_bytes if ws_hbm else 0),
+    }
+    if ws_l2:
+        kv_resources["l2"] = kv_publish_bytes
     # QK and PV are each one matrix-pipeline unit: MTE1 operand loads, the cube
     # MMA and the Fixpipe result write overlap inside the unit, so the steady
     # service of the unit is its busiest declared pipe, never their sum.
+    # service_cube_mla_arch35.h:276-278 aligns Fixpipe output to Align2(M) x Align8(S2).
     qk_work = Work(matrix={"bf16": 2 * padded_h * keys * width}, resources={
         "mte1": (padded_h + keys) * width * C8_BF16_BYTES,
-        "fixpipe": padded_h * keys * C8_FP32_BYTES})
+        "fixpipe": _align(heads, C8_FIXPIPE_M_ALIGN) * _align(keys, C8_FIXPIPE_N_ALIGN) * C8_FP32_BYTES})
     pv_work = Work(matrix={"bf16": 2 * padded_h * keys * latent}, resources={
         "mte1": (padded_h * keys + keys * latent) * C8_BF16_BYTES,
         "fixpipe": padded_h * latent * C8_FP32_BYTES})
     return (
-        ("kv_stage", Work(resources={
-            # One aliased KV row plus the two dependent INT32 scalar lookups.
-            "mte2_aiv": keys * (row_bytes
-                                + C8_ADDRESS_LOOKUPS * C8_ADDRESS_ENTRY_BYTES),
-            "vector": keys * _dequant_lane_ops(latent),
-            "mte3": keys * width * C8_BF16_BYTES * C8_ALIAS_READS,
-            "hbm": private_hbm}), ()),
+        ("kv_stage", Work(resources=kv_resources), ()),
         ("query", Work(resources={"hbm": first_size, "mte2_aic": first_size}), ()),
         ("qk", qk_work, ("kv_stage", "query") if first else ("kv_stage",)),
         ("softmax", Work(resources={
             "vector": C8_SOFTMAX_PAIR_OPS * heads * keys
                       + C8_SOFTMAX_ROW_OPS * heads}), ("qk",)),
-        ("pv", pv_work, ("softmax",)),
+        ("probability", Work(resources={"mte3": prob_bytes}), ("softmax",)),
+        ("pv", pv_work, ("probability",)),
         ("accumulate", Work(resources={"vector": heads * latent * (
             C8_ACCUM_FIRST_OPS if first else C8_ACCUM_PASS_OPS)}), ("pv",)),
         ("output", Work(resources={
@@ -344,10 +357,11 @@ def arch35_tile_phases(keys, heads, latent, rope, *, first, last, private_hbm=0)
 
 
 @lru_cache(maxsize=C8_TILE_CACHE_SIZE)
-def cached_tile(keys, heads, latent, rope, first, last, private_hbm=0):
+def cached_tile(keys, heads, latent, rope, first, last, private_hbm=0,
+                ws_hbm=False, ws_l2=False):
     """Bounded cache of the pure per-tile phase payloads."""
     return arch35_tile_phases(keys, heads, latent, rope, first=first, last=last,
-                              private_hbm=private_hbm)
+                              private_hbm=private_hbm, ws_hbm=ws_hbm, ws_l2=ws_l2)
 
 
 def tile_stream(sequences, topk, compute_units, tile_size, pool_size, pool_tail,
@@ -429,17 +443,63 @@ def _priced_streams(streams, sequences, units, private):
     return tuple(result)
 
 
-def _arch35_split_g_phases(keys, head_splits, latent, rope, *, first, last, private_hbm=0):
-    """``IS_SPLIT_G`` (``heads > 64``) pair of AIC cores sharing one dequantized KV tile."""
+def _kv_stage_work(keys, latent, rope, *, private_hbm=0, ws_hbm=False, ws_l2=False):
+    width = latent + rope
+    row_bytes = packed_row_bytes(rope)
+    publish_bytes = keys * width * C8_BF16_BYTES
+    resources = {
+        "mte2_aiv": keys * (row_bytes + C8_ADDRESS_LOOKUPS * C8_ADDRESS_ENTRY_BYTES),
+        "vector": keys * _dequant_lane_ops(latent),
+        "mte3": publish_bytes,
+        "hbm": private_hbm + (publish_bytes if ws_hbm else 0),
+    }
+    if ws_l2:
+        resources["l2"] = publish_bytes
+    return Work(resources=resources)
+
+
+def _arch35_split_g_phases(keys, head_splits, latent, rope, *, first, last, private_rows=0,
+                           ws_hbm=False, ws_l2=False):
+    """``IS_SPLIT_G`` (``heads > 64``): split gather across both AIV pairs, publish to GM, refill both AICs."""
     h0, h1 = head_splits
-    base = cached_tile(keys, h0, latent, rope, first, last, private_hbm)
+    width = latent + rope
+    row_bytes = packed_row_bytes(rope)
+    # service_vector_mla_arch35.h:499-521 splits keys CeilDiv(s2, 2) / remainder across the two AIC pairs.
+    k0 = (keys + 1) // 2
+    k1 = keys - k0
+    priv0 = (private_rows * k0) // keys if keys else 0
+    priv1 = private_rows - priv0
+    # service_cube_mla_arch35.h:244 refills Align16(s2RealSize) * dSize into each AIC's L1.
+    refill_bytes = _align(keys, C8_HEAD_ALIGN) * width * C8_BF16_BYTES
+    refill_res = {"mte2_aic": refill_bytes}
+    if ws_hbm:
+        refill_res["hbm"] = refill_bytes
+    elif ws_l2:
+        refill_res["l2"] = refill_bytes
+    refill_work = Work(resources=refill_res)
+    kv_work_0 = _kv_stage_work(k0, latent, rope, private_hbm=priv0 * row_bytes,
+                               ws_hbm=ws_hbm, ws_l2=ws_l2)
+    kv_deps = ("kv_stage", "kv_stage_g1") if k1 else ("kv_stage",)
+    base = cached_tile(keys, h0, latent, rope, first, last, 0, ws_hbm=ws_hbm, ws_l2=ws_l2)
     peer = cached_tile(keys, h1, latent, rope, first, last, 0)
-    stages = [(name, work, after, 0) for name, work, after in base]
+    stages = []
+    for name, work, after in base:
+        if name == "kv_stage":
+            stages.append(("kv_stage", kv_work_0, after, 0))
+            if k1:
+                kv_work_1 = _kv_stage_work(k1, latent, rope, private_hbm=priv1 * row_bytes,
+                                           ws_hbm=ws_hbm, ws_l2=ws_l2)
+                stages.append(("kv_stage_g1", kv_work_1, after, 1))
+            stages.append(("kv_refill", refill_work, kv_deps, 0))
+            continue
+        remapped = tuple("kv_refill" if dep == "kv_stage" else dep for dep in after)
+        stages.append((name, work, remapped, 0))
+    stages.append(("kv_refill_g1", refill_work, kv_deps, 1))
     for name, work, after in peer:
         if name == "kv_stage":
             continue
         remapped = tuple(
-            "kv_stage" if dep == "kv_stage" else f"{dep}_g1" for dep in after
+            "kv_refill_g1" if dep == "kv_stage" else f"{dep}_g1" for dep in after
         )
         stages.append((f"{name}_g1", work, remapped, 1))
     return tuple(stages)
@@ -479,6 +539,14 @@ def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
     private_rows = sum(map(sum, private))
     streams = _priced_streams(streams, sequences, owner_units, private)
     external = shared_rows * packed_row_bytes(rope)
+    ws_bytes = (
+        C8_SPLIT_G_WS_SLOTS * tile_size * (latent + rope) * C8_BF16_BYTES * len(streams)
+        if split_g else 0
+    )
+    l2_cap = int(geometry.buffers.get("l2", 0) or 0)
+    ws_l2_resident = split_g and l2_cap > 0 and ws_bytes <= l2_cap
+    ws_hbm = split_g and not ws_l2_resident
+    ws_l2 = ws_l2_resident and "l2" in geometry.rates
     from collections import Counter
     counts = Counter(tile for parts in streams for tile in parts)
     call_work = Work()
@@ -487,7 +555,8 @@ def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
             keys, first, last, priv = tile
             for _name, work, _after, _half in _arch35_split_g_phases(
                     keys, head_splits, latent, rope,
-                    first=first, last=last, private_hbm=priv * packed_row_bytes(rope)):
+                    first=first, last=last, private_rows=priv,
+                    ws_hbm=ws_hbm, ws_l2=ws_l2):
                 call_work += work.scaled(count)
         else:
             for _name, work, _after in _tile_phases(tile, heads, latent, rope):
@@ -505,7 +574,7 @@ def arch35_plan(shape, geometry, *, tile_size=None, slots=None):
         call_work.scaled(paired) + fill + stats_work,
         _arch35_program(streams, head_splits, latent, rope, kv_slot_bytes,
                         accumulator_bytes, fill, paired,
-                        stats_work, empty_rows),
+                        stats_work, empty_rows, ws_hbm=ws_hbm, ws_l2=ws_l2),
         _arch35_metadata(shape, external, private_rows, sequences, tile_size,
                          slots, paired, head_splits),
         context_binder=bind_sustained_dram)
@@ -518,12 +587,21 @@ def _tile_phases(key, heads, latent, rope):
 
 
 def _arch35_program(streams, head_splits, latent, rope, kv_slot_bytes, accumulator_bytes,
-                    fill, paired, stats_work, empty_rows=()):
+                    fill, paired, stats_work, empty_rows=(), *, ws_hbm=False, ws_l2=False):
     """Cold prefix fill once, then the declared paired query-owner programs."""
     split_g = len(head_splits) == 2
 
     def program(context):
         context = bind_sustained_dram(context)
+        has_l2 = "l2" in context.resource_names
+
+        def bind_work(work):
+            if not has_l2 and "l2" in work.resources:
+                work = Work(
+                    matrix=work.matrix,
+                    resources={k: v for k, v in work.resources.items() if k != "l2"},
+                )
+            return context.bind(work)
 
         def one(owner, parts):
             flat = parts
@@ -542,7 +620,8 @@ def _arch35_program(streams, head_splits, latent, rope, kv_slot_bytes, accumulat
                     keys, first, last, priv = key
                     items = _arch35_split_g_phases(
                         keys, head_splits, latent, rope,
-                        first=first, last=last, private_hbm=priv * packed_row_bytes(rope))
+                        first=first, last=last, private_rows=priv,
+                        ws_hbm=ws_hbm, ws_l2=ws_l2)
                 else:
                     items = tuple(
                         (name, work, after, 0)
@@ -554,10 +633,10 @@ def _arch35_program(streams, head_splits, latent, rope, kv_slot_bytes, accumulat
                     is_acc = name in {"accumulate", "accumulate_g1"}
                     previous = ((name,) if is_acc and not key[1] else ())
                     result.append(Stage(
-                        name, context.bind(work), after=tuple(after),
+                        name, bind_work(work), after=tuple(after),
                         previous=previous,
                         placement=context.owned(
-                            phys_owners[half], context.core_count, roles - {"hbm"})))
+                            phys_owners[half], context.core_count, roles - {"hbm", "l2"})))
                 return tuple(result)
 
             owner_stages = [

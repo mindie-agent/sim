@@ -21,8 +21,10 @@ from ...runtime.tile_solver import (
     LiveBufferSpec, TileCandidate, TileInfeasibleError, TilePipelineSpec, TileShape, solve,
 )
 from ..contracts import ArchStrategy, OperatorPlanningContext
-from ..sharedkv.split_core import resolve_fia_mla_tiling
-from ._lowering import SOFTMAX_STATE_SCALARS, PipelineLayout, RowCuts, fixpipe_rectangle_bytes, make_plan, owner_pairs
+from ._lowering import (
+    DENSE_CANN_ABIS, SOFTMAX_STATE_SCALARS, PipelineLayout, RowCuts,
+    fixpipe_rectangle_bytes, make_plan, owner_pairs, resolve_fia_host_plan,
+)
 from .common import (
     DSL_FLASH_ABI, DSL_MQS_ABI, FIA_ABI, FP32_BYTES, MQS_ABI,
     MQS_ORIGINAL_ROW_BYTES, SUPPORTED_ABIS, PagedMlaContract, align_bytes, capability_gap, ceil_div, contract_for,
@@ -269,12 +271,15 @@ def _solve(op, ctx, c, keys, head_tile, mm1_depth, resident, result_alignment, p
     is_flash = c.abi == UPSTREAM_ABI
     is_fia = c.abi == FIA_ABI
     fixed_cube_alloc = is_flash or is_fia
+    m_extent = (
+        max((q * c.physical_heads for q, _ in c.sequences if q), default=c.physical_heads)
+        if fixed_cube_alloc else c.physical_heads
+    )
     while head_tile:
-        heads = min(head_tile, c.physical_heads)
+        heads = min(head_tile, m_extent)
         vec_heads = ceil_div(heads, aiv_count)
         pv_columns = min(c.dv, PV_L0C_WIDTH)
-        scores = (fixpipe_rectangle_bytes(heads, keys) // aiv_count if is_flash
-                  else vec_heads * keys * FP32_BYTES)
+        scores = fixpipe_rectangle_bytes(heads, keys) // aiv_count
         pv = vec_heads * pv_columns * FP32_BYTES
         # Compiled Arch35 FlashMLA (M96/S2_112, 519,168 B L1) and FIA (M64/S2_128,
         # 516,096 B L1) reserve fixed cube L1 and 256 KiB L0C regardless of live
@@ -378,10 +383,9 @@ class _DirectStrategy:
             elem = int(dtype_bytes(op.dtype or "bf16"))
             for aic, aivs in pairs:
                 vec_heads = ceil_div(heads, len(aivs))
-                score_bytes = (fixpipe_rectangle_bytes(heads, keys) // len(aivs) if panel_width
-                               else vec_heads * keys * FP32_BYTES)
+                score_bytes = fixpipe_rectangle_bytes(heads, keys) // len(aivs)
                 partial_bytes = vec_heads * min(c.dv, PV_L0C_WIDTH) * FP32_BYTES
-                probability_bytes = vec_heads * keys * elem
+                probability_bytes = vec_heads * key_tile * elem
                 for aiv in aivs:
                     ctx.datapath.route(
                         "l0c", "ub", "fp32", (aic, aiv),
@@ -404,21 +408,21 @@ class _DirectStrategy:
             *((("kv_ws", KVP_DEPTH, "kv_to_l1", "kv_refill"),) if c.abi == MQS_ABI else ()),
         )
         clocks = FLASH_CLOCKS if panel_width else DSL_MQS_CLOCKS if c.sinks else CLOCKS
-        if (c.abi == FIA_ABI and c.splits == 1
-                and c.physical_heads >= FIA_M_TILE and max_extent > key_tile):
-            tiling = resolve_fia_mla_tiling(
+        host_plan = None
+        if c.abi == FIA_ABI and c.splits == 1 and max_extent > 0:
+            aiv_per_aic = min(len(aivs) for _, aivs in pairs)
+            host = resolve_fia_host_plan(
                 sequences=c.sequences, physical_heads=c.physical_heads,
-                aic_count=ctx.effective_aic_cores, is_arch35=True,
+                aic_count=len(pairs), aiv_per_aic=aiv_per_aic, is_arch35=True,
             )
-            head_groups = ceil_div(c.physical_heads, heads)
-            max_splits_per_group = max(1, ctx.effective_aic_cores // max(1, head_groups))
-            eff_splits = min(tiling.fd_splits_per_row, max_splits_per_group)
-            if eff_splits > 1:
-                c = replace(c, splits=eff_splits)
+            if host.fd_enabled:
+                host_plan = host
         elem_b = int(dtype_bytes(op.dtype or "bf16"))
         l2_cap = int(ctx.geometry.buffers.get("l2", dict(ctx.datapath.buffers).get("l2", 0)))
-        head_groups_cnt = ceil_div(c.physical_heads, heads)
-        total_groups = sum(q for q, _ in c.sequences) * head_groups_cnt
+        if c.abi in DENSE_CANN_ABIS:
+            total_groups = sum(ceil_div(q * c.physical_heads, heads) for q, _ in c.sequences if q)
+        else:
+            total_groups = sum(q for q, _ in c.sequences) * ceil_div(c.physical_heads, heads)
         most_splits = min(ceil_div(max_extent, key_tile), c.splits) if max_extent else 0
         lanes = min(len(pairs), max(1, most_splits))
         groups_per_wave = len(pairs) // lanes
@@ -454,6 +458,7 @@ class _DirectStrategy:
             row_cuts = _dsl_row_cuts(c, len(pairs))
         return make_plan(
             op, ctx, c, layout, ABI_SOURCES[c.abi], pairs=pairs, row_cuts=row_cuts,
+            fia_host_plan=host_plan,
             buffer_depths=(Q_DEPTH, mm1_depth, MM2_DEPTH), pool_peaks=peaks,
             matrix_output_path=direct.path.name, probability_path=probability.path.name,
             resident_latent=resident, **workspace,

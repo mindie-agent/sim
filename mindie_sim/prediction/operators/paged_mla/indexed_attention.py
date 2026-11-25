@@ -28,7 +28,9 @@ from mindie_sim.prediction.operators.sparse_indexer.sparse_attention import sele
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage
 
 SPLIT_KV_STATE_SCALARS = 2
-SPLIT_KV_MERGE_OPS_PER_ELEM = 3
+# sfa_split_kv_merge.h:72-96,146-149: Mul+Add per partial plus 5 scalar stats ops per partial.
+SPLIT_KV_MERGE_OPS_PER_ELEM = 2
+SPLIT_KV_MERGE_STAT_OPS_PER_PART = 5
 PRELOAD_SLOTS_VALID = frozenset({2, 3})
 
 
@@ -241,7 +243,11 @@ def _phases(keys, heads, latent, rope, *, first, last, scratch_policy,
     score = padded_h * padded_k * FP32_ELEMENT_BYTES
     probability = heads * padded_k * 2
     partial_output = padded_h * latent * FP32_ELEMENT_BYTES
-    output = heads * latent * 2 if last else 0
+    output = (
+        heads * (latent + SPLIT_KV_STATE_SCALARS) * FP32_ELEMENT_BYTES
+        if flash_decode
+        else heads * latent * BF16_ELEMENT_BYTES
+    ) if last else 0
     offchip = scratch_policy == "offchip"
 
     def scratch(read=0, write=0, *, vector=False, fixpipe=False):
@@ -343,6 +349,145 @@ def build(op, geometry, *, scratch_policy, key_tile=INDEXED_KEY_TILE, slots=INDE
     return plan
 
 
+def _check_resident_l2(geometry, scratch_policy, owners, per_owner_scratch):
+    if scratch_policy == "resident":
+        if (geometry.buffer_units.get("l2", 1) != 1
+                or geometry.buffers.get("l2", 0) < owners * per_owner_scratch):
+            raise ModelingError("indexed_attention_resident_scratch_requires_shared_cache_capacity")
+
+
+def _build_split_kv_plan(
+    shape, sequences, query, topk, heads, latent, rope, geometry,
+    scratch_policy, key_tile, slots, compact, operand_modes, phase_factory,
+    source_items, paired_vector_stages, vector_buffer_bytes, phase_unit_weights,
+    per_seq_tuple, per_owner_scratch,
+):
+    """CANN >= 9.3 Arch22 split-KV partitioning along half-open 512-key tile boundaries."""
+    pool_size = shape.get("index_pool_size", 1)
+    pool_tail = shape.get("index_pool_tail", False)
+    # sparse_flash_attention_tiling.cpp:414-418: split-KV requires s2Size >= sparseTokens and no sinks.
+    sparse_tokens = max(per_seq_tuple) if per_seq_tuple is not None else int(topk)
+    max_s2 = max((ctx_len + q_cnt for q_cnt, ctx_len in sequences if q_cnt > 0), default=0)
+    if sparse_tokens <= 0 or max_s2 < sparse_tokens or shape.get("sinks"):
+        return None
+    n_tiles = (sparse_tokens + key_tile - 1) // key_tile
+    p_cap = min(geometry.compute_units // query, n_tiles) if n_tiles > 1 else 1
+    tiles_per_part = (n_tiles + p_cap - 1) // p_cap if p_cap > 1 else n_tiles
+    parts = (n_tiles + tiles_per_part - 1) // tiles_per_part if p_cap > 1 else 1
+    if parts <= 1:
+        return None
+    owner_tiles: dict[int, tuple[tuple[int, bool, bool], ...]] = {}
+    merge_specs = []
+    empty_rows = []
+    q_flat = 0
+    for seq_idx, (q_cnt, ctx_len) in enumerate(sequences):
+        seq_topk = per_seq_tuple[seq_idx] if per_seq_tuple is not None else topk
+        for pos in range(q_cnt):
+            k_row = selected_tokens(ctx_len + pos + 1, seq_topk, pool_size, pool_tail)
+            merge_owner = q_flat * parts
+            if k_row == 0:
+                empty_rows.append((q_flat, merge_owner))
+            else:
+                active_parts = 0
+                for p_idx in range(parts):
+                    k_start = ((n_tiles * p_idx) // parts) * key_tile
+                    k_end = min(k_row, ((n_tiles * (p_idx + 1)) // parts) * key_tile)
+                    pk = k_end - k_start
+                    if pk > 0:
+                        part_tiles = tuple(
+                            (min(key_tile, pk - off), off == 0, off + min(key_tile, pk - off) == pk)
+                            for off in range(0, pk, key_tile)
+                        )
+                        owner_tiles[merge_owner + p_idx] = part_tiles
+                        active_parts += 1
+                if active_parts > 0:
+                    merge_specs.append((q_flat, active_parts, merge_owner))
+            q_flat += 1
+    active_owners = tuple(sorted(owner_tiles))
+    _check_resident_l2(geometry, scratch_policy, len(active_owners), per_owner_scratch)
+    fd_factory = _FD_PHASES if phase_factory is _phases else partial(phase_factory, flash_decode=True)
+
+    @lru_cache(maxsize=TILE_CACHE_ENTRIES)
+    def fd_phases(key):
+        keys, first, last = key
+        return fd_factory(keys, heads, latent, rope, first=first, last=last,
+                          scratch_policy=scratch_policy, operand_modes=operand_modes)
+
+    owner_work: dict[int, Work] = {}
+    parts_work = Work()
+    for owner in active_owners:
+        w = Work()
+        for key, count in Counter(owner_tiles[owner]).items():
+            for _, phase in fd_phases(key):
+                w += phase.scaled(count)
+        owner_work[owner] = w
+        parts_work += w
+
+    state_bytes = heads * (latent + SPLIT_KV_STATE_SCALARS) * FP32_ELEMENT_BYTES
+    row_output_bytes = heads * latent * BF16_ELEMENT_BYTES
+    merge_work = Work()
+    merge_per_q = []
+    for q_idx, active_parts, merge_owner in merge_specs:
+        # sfa_split_kv_merge.h:66-158: Mul+Add+stats over all active_parts (incl. split 0) + Cast.
+        per_q = Work(resources={
+            "mte2_aiv": active_parts * state_bytes,
+            "mte3": row_output_bytes,
+            "hbm": active_parts * state_bytes + row_output_bytes,
+            "vector": (
+                active_parts * heads * (SPLIT_KV_MERGE_OPS_PER_ELEM * latent + SPLIT_KV_MERGE_STAT_OPS_PER_PART)
+                + max(0, active_parts - 1) * heads
+                + heads * latent
+            ),
+        })
+        merge_work += per_q
+        merge_per_q.append((q_idx, merge_owner, per_q))
+    empty_per_q = Work(resources={"hbm": row_output_bytes, "mte3": row_output_bytes})
+    empty_work = empty_per_q.scaled(len(empty_rows)) if empty_rows else Work()
+    nominal_cache: OrderedDict = OrderedDict()
+
+    def _split_kv_lower(ctx):
+        body_prog = _lower_indexed_attention(
+            ctx, scratch_policy, operand_modes, nominal_cache, heads, phase_unit_weights,
+            geometry.compute_units, tuple(paired_vector_stages), fd_phases, per_owner_scratch,
+            vector_buffer_bytes, compact, owner_tiles.__getitem__, slots, owner_work, source_items,
+            len(active_owners), key_tile, sequences, {o: 0 for o in active_owners}, row_output_bytes,
+            owner_ids=active_owners,
+        )
+        branches = []
+        for q_idx, merge_owner, per_q in merge_per_q:
+            # sfa_split_kv_merge.h:44-46 splits heads across both AIV subblocks for heads >= 2.
+            m_place = ctx.owned(merge_owner, geometry.compute_units, {"mte2_aiv", "mte3", "vector"})
+            if heads == 1:
+                for role in ("mte2_aiv", "mte3", "vector"):
+                    res = ctx.resource_names.get(ctx.physical_role(role))
+                    if res in m_place:
+                        m_place[res] = m_place[res][:1]
+            branches.append(KernelProgram((Stage(
+                f"merge_q{q_idx}", ctx.bind(per_q), placement=m_place, coupled=True,
+            ),)))
+        e_work = ctx.bind(empty_per_q) if empty_rows else {}
+        for q_idx, merge_owner in empty_rows:
+            e_place = ctx.owned(merge_owner, geometry.compute_units, {"mte3"})
+            if heads <= SINGLE_AIV_HEAD_LIMIT:
+                mte3_res = ctx.resource_names[ctx.physical_role("mte3")]
+                if mte3_res in e_place:
+                    e_place[mte3_res] = e_place[mte3_res][:1]
+            branches.append(KernelProgram((Stage(
+                f"empty_q{q_idx}", e_work, placement=e_place, coupled=True,
+            ),)))
+        barrier_ms = p13_syncall_ms(ctx) if merge_per_q else 0.0
+        stages = [Stage("split_kv_parts", program=body_prog)]
+        prev = "split_kv_parts"
+        if barrier_ms > 0.0:
+            stages.append(Stage("split_kv_barrier", after=(prev,), latency=barrier_ms, keep_empty=True))
+            prev = "split_kv_barrier"
+        if branches:
+            stages.append(Stage("split_kv_merge", after=(prev,), program=ParallelProgram(tuple(branches))))
+        return KernelProgram(tuple(stages))
+
+    return OperatorPlan(parts_work + merge_work + empty_work, _split_kv_lower)
+
+
 def build_pipeline(shape, geometry, *, scratch_policy, key_tile=INDEXED_KEY_TILE, slots=INDEXED_PIPELINE_SLOTS,
                    compact=True, operand_modes=False, phase_factory=_phases,
                    source_items=tuple(SOURCE.items()), paired_vector_stages=(),
@@ -356,114 +501,29 @@ def build_pipeline(shape, geometry, *, scratch_policy, key_tile=INDEXED_KEY_TILE
         raise ModelingError("indexed_attention_requires_integer_sequence_geometry")
     query, topk = sum(row[0] for row in sequences), shape["topk"]
     heads, latent, rope = shape["heads"], shape["latent"], shape["rope"]
-    if shape.get("split_kv") and query > 0 and geometry.compute_units > query:
-        # sparse_flash_attention_tiling.cpp:409 (CANN >= 9.3.0): N=512, T=ceil(K/N),
-        # p=min(C//queryCount, T), parts=ceil(T/ceil(T/p)); part 0 merges partials.
-        max_k = max(
-            (selected_tokens(ctx_len + 1, topk, shape.get("index_pool_size", 1), shape.get("index_pool_tail", False))
-             for q_cnt, ctx_len in sequences if q_cnt > 0),
-            default=0,
-        )
-        n_tiles = (max_k + key_tile - 1) // key_tile if max_k > 0 else 0
-        p_cap = min(geometry.compute_units // query, n_tiles) if n_tiles > 1 else 1
-        parts = (n_tiles + ((n_tiles + p_cap - 1) // p_cap) - 1) // ((n_tiles + p_cap - 1) // p_cap) if p_cap > 1 else 1
-        if parts > 1:
-            pool_size = shape.get("index_pool_size", 1)
-            pool_tail = shape.get("index_pool_tail", False)
-            part_seqs = []
-            merge_specs = []
-            empty_rows = []
-            q_flat = 0
-            for q_cnt, ctx_len in sequences:
-                for pos in range(q_cnt):
-                    k_row = selected_tokens(ctx_len + pos + 1, topk, pool_size, pool_tail)
-                    if k_row == 0:
-                        empty_rows.append(q_flat)
-                    else:
-                        base_k, rem_k = divmod(k_row, parts)
-                        active_parts = 0
-                        for p_idx in range(parts):
-                            pk = base_k + (1 if p_idx < rem_k else 0)
-                            if pk > 0:
-                                part_seqs.append((1, pk - 1))
-                                active_parts += 1
-                        if active_parts > 1:
-                            merge_specs.append((q_flat, active_parts))
-                    q_flat += 1
-            fd_factory = _FD_PHASES if phase_factory is _phases else phase_factory
-            sub_plan = _plan(
-                tuple(part_seqs), topk, heads, latent, rope, geometry.compute_units,
-                scratch_policy, key_tile, slots, compact, operand_modes,
-                fd_factory, source_items, tuple(paired_vector_stages), vector_buffer_bytes,
-                phase_unit_weights, 1, False,
-            )
-            state_bytes = heads * (latent + SPLIT_KV_STATE_SCALARS) * FP32_ELEMENT_BYTES
-            row_output_bytes = heads * latent * BF16_ELEMENT_BYTES
-            merge_work = Work()
-            merge_per_q = []
-            for q_idx, active_parts in merge_specs:
-                per_q = Work(resources={
-                    "mte2_aiv": active_parts * state_bytes,
-                    "mte3": state_bytes,
-                    "hbm": (active_parts + 1) * state_bytes,
-                    "vector": (active_parts - 1) * heads * (
-                        SPLIT_KV_MERGE_OPS_PER_ELEM * latent + SPLIT_KV_STATE_SCALARS),
-                })
-                merge_work += per_q
-                merge_per_q.append((q_idx, per_q))
-            empty_per_q = Work(resources={"hbm": row_output_bytes, "mte3": row_output_bytes})
-            empty_work = empty_per_q.scaled(len(empty_rows)) if empty_rows else Work()
-            base_lower = sub_plan.program
-
-            def _split_kv_lower(ctx):
-                body_prog = base_lower(ctx)
-                branches = [
-                    KernelProgram((Stage(
-                        f"merge_q{q_idx}", ctx.bind(per_q),
-                        placement=ctx.owned((q_idx * parts) % geometry.compute_units, geometry.compute_units,
-                                            {"mte2_aiv", "mte3", "vector"}),
-                        coupled=True,
-                    ),))
-                    for q_idx, per_q in merge_per_q
-                ]
-                e_work = ctx.bind(empty_per_q) if empty_rows else {}
-                for q_idx in empty_rows:
-                    e_place = ctx.owned((q_idx * parts) % geometry.compute_units, geometry.compute_units, {"mte3"})
-                    if heads <= SINGLE_AIV_HEAD_LIMIT:
-                        mte3_res = ctx.resource_names[ctx.physical_role("mte3")]
-                        if mte3_res in e_place:
-                            e_place[mte3_res] = e_place[mte3_res][:1]
-                    branches.append(KernelProgram((Stage(
-                        f"empty_q{q_idx}", e_work, placement=e_place, coupled=True,
-                    ),)))
-                barrier_ms = p13_syncall_ms(ctx) if merge_per_q else 0.0
-                stages = [Stage("split_kv_parts", program=body_prog)]
-                prev = "split_kv_parts"
-                if barrier_ms > 0.0:
-                    stages.append(Stage("split_kv_barrier", after=(prev,), latency=barrier_ms, keep_empty=True))
-                    prev = "split_kv_barrier"
-                if branches:
-                    stages.append(Stage("split_kv_merge", after=(prev,), program=ParallelProgram(tuple(branches))))
-                return KernelProgram(tuple(stages))
-
-            return replace(sub_plan, work=sub_plan.work + merge_work + empty_work, program=_split_kv_lower)
-    owners = selected_query_owners(query, geometry.compute_units)
-    # The source reserves four KV rings and three score/probability/output
-    # rings per owner. Cache residency is an explicit conditional placement.
-    hpad = _align(heads, FRACTAL_ALIGNMENT)
-    per_owner_scratch = (GATHER_SCRATCH_SLOTS * key_tile * (latent + rope) * 2
-                         + INDEXED_PIPELINE_SLOTS * hpad * (key_tile * SCORE_AND_PROBABILITY_BYTES + latent * FP32_ELEMENT_BYTES))
-    if scratch_policy == "resident":
-        if (geometry.buffer_units.get("l2", 1) != 1
-                or geometry.buffers.get("l2", 0) < owners * per_owner_scratch):
-            raise ModelingError("indexed_attention_resident_scratch_requires_shared_cache_capacity")
-
     per_seq_topk = shape.get("per_sequence_topk")
     per_seq_tuple = (
         tuple(int(v) for v in per_seq_topk)
         if isinstance(per_seq_topk, (tuple, list)) and len(per_seq_topk) == len(sequences)
         else None
     )
+    # The source reserves four KV rings and three score/probability/output
+    # rings per owner. Cache residency is an explicit conditional placement.
+    hpad = _align(heads, FRACTAL_ALIGNMENT)
+    per_owner_scratch = (GATHER_SCRATCH_SLOTS * key_tile * (latent + rope) * 2
+                         + INDEXED_PIPELINE_SLOTS * hpad * (key_tile * SCORE_AND_PROBABILITY_BYTES + latent * FP32_ELEMENT_BYTES))
+    split_kv = bool(shape.get("split_kv", phase_factory is _phases))
+    if split_kv and query > 0 and geometry.compute_units > query:
+        split_plan = _build_split_kv_plan(
+            shape, sequences, query, topk, heads, latent, rope, geometry,
+            scratch_policy, key_tile, slots, compact, operand_modes, phase_factory,
+            source_items, paired_vector_stages, vector_buffer_bytes, phase_unit_weights,
+            per_seq_tuple, per_owner_scratch,
+        )
+        if split_plan is not None:
+            return split_plan
+    owners = selected_query_owners(query, geometry.compute_units)
+    _check_resident_l2(geometry, scratch_policy, owners, per_owner_scratch)
     return _plan(sequences, topk, heads, latent, rope, geometry.compute_units,
                  scratch_policy, key_tile, slots, compact, operand_modes,
                  phase_factory, source_items, tuple(paired_vector_stages), vector_buffer_bytes,
@@ -912,6 +972,7 @@ def _lower_indexed_attention(
     ctx, scratch_policy, operand_modes, nominal_cache, heads, phase_unit_weights, compute_units,
     paired_vector_stages, phases, per_owner_scratch, vector_buffer_bytes, compact, tile_keys,
     slots, owner_work, source_items, owners, key_tile, sequences, empty_counts, row_output_bytes,
+    *, owner_ids=None,
 ):
     # Copy latency/issue limits are deliberately not guessed from residuals.
     required = {"mte2_aic", "mte2_aiv", "mte1", "mte3", "fixpipe"}
@@ -982,4 +1043,5 @@ def _lower_indexed_attention(
             "paired_vector_stages": paired_vector_stages,
             "vector_buffer_bytes_per_aiv": vector_buffer_bytes,
         })
-    return ParallelProgram(tuple(lower_owner(owner) for owner in range(owners)))
+    target_owners = range(owners) if owner_ids is None else owner_ids
+    return ParallelProgram(tuple(lower_owner(owner) for owner in target_owners))

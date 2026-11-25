@@ -2,8 +2,8 @@
 
 [Role] Price the retained whole-row, scalar-address source branch.
 [Invariants] One query's original and compressed lists share online state.
-  A padded tile repeats valid KV reads; QK computes 128 rows and PV rounds its
-  valid prefix to 16. UB/L1 exchanges never become invented HBM workspaces.
+  A padded tile repeats valid KV reads; QK and PV both execute fixed 128-row
+  tiles. UB/L1 exchanges never become invented HBM workspaces.
 [Timeouts & Locks] O(active query rows) metadata; two live phase tiles per owner.
 [Side-Effect Policy] Pure plans and the common causal Engine, no observations.
 """
@@ -230,14 +230,13 @@ def tile_phases(branch, valid, first, last, addressing="scalar",
     physical = PHYSICAL_KV_TILE_ROWS
     row_bytes = (ORIGINAL_CACHE_ROW_BYTES if branch == "original"
                  else COMPRESSED_CACHE_ROW_BYTES)
-    # The QK M face keeps at least one aligned head face; wider TP shards round
-    # their local heads up to the same 16-row granularity.
+    # The QK/PV M face keeps at least one aligned head face; wider TP shards
+    # round their local heads up to the same 16-row granularity.
     cube_heads = max(
         CUBE_HEAD_TILE_ALIGN,
         ((heads + CUBE_HEAD_TILE_ALIGN - 1) // CUBE_HEAD_TILE_ALIGN) * CUBE_HEAD_TILE_ALIGN,
     )
     # Four 16-row subtiles per AIV; duplicate tail indices still issue copies.
-    padded_pv = (valid + CUBE_HEAD_TILE_ALIGN - 1) // CUBE_HEAD_TILE_ALIGN * CUBE_HEAD_TILE_ALIGN
     q = row_io_bytes if first else 0
     output = row_io_bytes if last else 0
     phases = [
@@ -274,7 +273,7 @@ def tile_phases(branch, valid, first, last, addressing="scalar",
             "mte1": (cube_heads * physical + physical * MQSMLA_HEAD_WIDTH)
                     * BF16_ELEMENT_BYTES})),
         ("pv", Work(matrix={
-            "bf16": BF16_ELEMENT_BYTES * cube_heads * padded_pv * MQSMLA_HEAD_WIDTH})),
+            "bf16": BF16_ELEMENT_BYTES * cube_heads * physical * MQSMLA_HEAD_WIDTH})),
         ("values", Work(resources={
             "fixpipe": cube_heads * MQSMLA_HEAD_WIDTH * FP32_ELEMENT_BYTES})),
         ("accumulate", Work(resources={"vector": heads * MQSMLA_HEAD_WIDTH * (

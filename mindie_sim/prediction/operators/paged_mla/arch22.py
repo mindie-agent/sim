@@ -20,8 +20,7 @@ from ...runtime.tile_solver import (
     LiveBufferSpec, TileCandidate, TileInfeasibleError, TilePipelineSpec, TileShape, solve,
 )
 from ..contracts import ArchStrategy, OperatorPlanningContext
-from ..sharedkv.split_core import resolve_fia_mla_tiling
-from ._lowering import FIA_WORKSPACE_DEPTH, PipelineLayout, make_plan
+from ._lowering import FIA_WORKSPACE_DEPTH, PipelineLayout, make_plan, owner_pairs, resolve_fia_host_plan
 from .common import FP32_BYTES, capability_gap, contract_for, validate_dense_cann_geometry
 
 TARGET_BACKEND: Literal["ascend"] = "ascend"
@@ -107,26 +106,30 @@ class _FiaStrategy:
         validate_dense_cann_geometry(c, self.arch_id)
         elem = int(dtype_bytes(op.dtype or "bf16"))
         l2_cap = int(ctx.geometry.buffers.get("l2", dict(ctx.datapath.buffers).get("l2", 0)))
-        native_mla = (
-            c.splits == 1
-            and c.physical_heads > HEAD_TILE
-            and c.s2_base_size >= NATIVE_S2_MIN
-        )
+        max_m = max((q * c.physical_heads for q, _ in c.sequences if q), default=c.physical_heads)
+        native_tile = c.s2_base_size >= NATIVE_S2_MIN
+        native_mla = c.splits == 1 and native_tile
+        pairs = owner_pairs(ctx, c.abi)
+        aiv_per_aic = min(len(aivs) for _, aivs in pairs)
         head_tile = HEAD_TILE
         s2_tile = c.s2_base_size
         used_cores = 1
-        if native_mla:
-            tiling = resolve_fia_mla_tiling(
+        host_plan = None
+        if native_tile:
+            paged = bool(c.kv_layout and c.kv_layout.startswith("PA_"))
+            host = resolve_fia_host_plan(
                 sequences=c.sequences, physical_heads=c.physical_heads,
-                aic_count=ctx.effective_aic_cores, is_arch35=False,
+                aic_count=len(pairs), aiv_per_aic=aiv_per_aic, is_arch35=False,
+                page_size=c.page_size, paged=paged,
             )
-            head_tile = min(tiling.m_tile, c.physical_heads)
-            s2_tile = tiling.s2_tile
-            used_cores = tiling.used_cores
-            if tiling.fd_splits_per_row > 1:
-                c = replace(c, splits=tiling.fd_splits_per_row)
+            head_tile = min(host.m_tile, max_m)
+            s2_tile = host.s2_tile
+            if native_mla:
+                used_cores = host.used_cores
+                if host.fd_enabled:
+                    host_plan = host
         keys = min(s2_tile, max((kv for q, kv in c.sequences if q), default=0))
-        heads = min(head_tile, c.physical_heads) if keys or not ctx.requests else 0
+        heads = min(head_tile, max_m) if keys or not ctx.requests else 0
         geometry = replace(
             ctx.geometry, buffers={**dict(ctx.datapath.buffers), **ctx.geometry.buffers},
             datapath=ctx.datapath, stream_owners=ctx.stream_owners,
@@ -169,7 +172,7 @@ class _FiaStrategy:
             gm_workspace=True, ws_l2_resident=ws_l2_resident, latent_l2_hit=latent_l2_hit,
         )
         return make_plan(
-            op, ctx, c, layout, self.sources,
+            op, ctx, c, layout, self.sources, pairs=pairs, fia_host_plan=host_plan,
             task_record_count=TASK_RECORD_COUNT, workspace_depth=WORKSPACE_DEPTH,
             workspace_regions=workspace_regions, pool_peaks=peaks,
         )
