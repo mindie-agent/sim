@@ -33,9 +33,12 @@ from .prepared_terms import (
 DEFAULT_OBS_BUFFER_CAP = 4096
 NS_PER_MS = 1_000_000.0
 MAX_WIDENED_LINK_BITS = 64
-TERMS_ABI_VERSION = 3
+TERMS_ABI_VERSION = 4
 TERMS_ABI_PROBE_CELLS = 16
-_PAD_BYTES_CAPACITY_ROW = 7
+_PAD_BYTES_CAPACITY_ROW = 2
+_INT64_MIN = -(1 << 63)
+_INT64_MAX = (1 << 63) - 1
+_UINT64_MAX = (1 << 64) - 1
 _OBS_BUFFERS: weakref.WeakKeyDictionary[Any, tuple[Any, Any, int]] = (
     weakref.WeakKeyDictionary()
 )
@@ -93,10 +96,11 @@ class MsimDelivery(ctypes.Structure):
 class MsimProgress(ctypes.Structure):
     _fields_ = [
         ("sequence", ctypes.c_uint64),
+        ("priority", ctypes.c_int64),
         ("task", ctypes.c_uint32),
         ("placement_id", ctypes.c_uint32),
         ("member_map", ctypes.c_uint32),
-        ("priority", ctypes.c_int32),
+        ("pad", ctypes.c_uint32),
         ("z_left", ctypes.c_double),
         ("weight", ctypes.c_double),
         ("max_dz_ms", ctypes.c_double),
@@ -109,8 +113,10 @@ class MsimCapacityRow(ctypes.Structure):
         ("scope", ctypes.c_uint32),
         ("unit", ctypes.c_uint32),
         ("policy", ctypes.c_uint8),
+        ("has_fifo_owner", ctypes.c_uint8),
         ("pad", ctypes.c_uint8 * _PAD_BYTES_CAPACITY_ROW),
         ("capacity", ctypes.c_double),
+        ("fifo_owner_seq", ctypes.c_uint64),
     ]
 
 
@@ -281,7 +287,19 @@ def coupled_placement_proportional(engine: Any, task: Any) -> bool:
 
 
 def _peer_breaks_cohort(task: Any, peer: Any) -> bool:
-    if not task.cohort_members or not peer.placement or not peer.remaining:
+    if not peer.remaining:
+        return False
+    if not task.coupled and task.cohort_size > 1:
+        t_place = task.placement or {}
+        p_place = peer.placement or {}
+        for rname in task.remaining:
+            if peer.remaining.get(rname, 0.0) <= 0.0:
+                continue
+            t_units = t_place.get(rname)
+            p_units = p_place.get(rname)
+            if t_units is None or p_units is None or not set(p_units).isdisjoint(t_units):
+                return True
+    if not task.cohort_members or not peer.placement:
         return False
     for rname, members in task.cohort_members:
         if rname not in task.remaining or peer.remaining.get(rname, 0.0) <= 0.0:
@@ -308,7 +326,7 @@ def has_asymmetric_cohort(engine: Any) -> bool:
             continue
         if fifo_names and any(r in fifo_names for r in task.remaining):
             return True
-        if not task.cohort_members:
+        if not task.cohort_members and task.coupled:
             continue
         for peer in live_now:
             if peer is not task and _peer_breaks_cohort(task, peer):
@@ -319,7 +337,7 @@ def has_asymmetric_cohort(engine: Any) -> bool:
 def _cohort_needs_split_with(cohort: Any, all_tasks: Sequence[Any], fifo_names: Any) -> bool:
     if fifo_names and any(r in fifo_names for r in cohort.remaining):
         return True
-    if not cohort.cohort_members:
+    if not cohort.cohort_members and cohort.coupled:
         return False
     return any(other is not cohort and _peer_breaks_cohort(cohort, other) for other in all_tasks)
 
@@ -327,7 +345,7 @@ def _cohort_needs_split_with(cohort: Any, all_tasks: Sequence[Any], fifo_names: 
 def cohort_break_horizon(engine: Any, horizon: float) -> float:
     """Clamp epoch horizon to the earliest future peer or cohort release breaking symmetry."""
     all_tasks = [t for t in engine._tasks.values() if t.remaining]
-    cohorts = [t for t in all_tasks if t.cohort_size > 1 and t.cohort_members]
+    cohorts = [t for t in all_tasks if t.cohort_size > 1 and (t.cohort_members or not t.coupled)]
     fifo_names = engine.fifo_resource_names() if engine._fifo_live else ()
     if not cohorts and not any(t.cohort_size > 1 for t in all_tasks):
         return horizon
@@ -348,7 +366,7 @@ def stop_slots_for_epoch(engine: Any, until: Sequence[Any]) -> list[int]:
     slots = engine._native_slots
     out = [slots[e.sequence] for e in until if not e.done and e.sequence in slots]
     all_tasks = [t for t in engine._tasks.values() if t.remaining]
-    cohorts = [t for t in all_tasks if t.cohort_size > 1 and t.cohort_members]
+    cohorts = [t for t in all_tasks if t.cohort_size > 1 and (t.cohort_members or not t.coupled)]
     fifo_names = engine.fifo_resource_names() if engine._fifo_live else ()
     if not cohorts and not any(t.cohort_size > 1 for t in all_tasks):
         return out
@@ -524,7 +542,10 @@ def sync_native_deliveries(backend: Any, engine: Any) -> None:
             ref_d = task.demand[ref_r]
             frac = min(1.0, svc / ref_d) if ref_d > 0.0 else 1.0
         acc = task.delivered_acc
+        totals: dict[str, float] = {}
         for ctr_id, total_amt in task.deliveries:
+            totals[ctr_id] = totals.get(ctr_id, 0.0) + total_amt
+        for ctr_id, total_amt in totals.items():
             prev = acc.get(ctr_id, 0.0) if acc is not None else 0.0
             target = total_amt * frac
             delta = target - prev
@@ -632,6 +653,15 @@ class PreparedTermsRunner:
             arr[i].scope = int(row.scope)
             arr[i].unit = int(row.unit)
             arr[i].policy = int(row.policy)
+            if row.fifo_owner_seq is None:
+                arr[i].has_fifo_owner = 0
+                arr[i].fifo_owner_seq = 0
+            else:
+                owner_seq = int(row.fifo_owner_seq)
+                if owner_seq < 0 or owner_seq > _UINT64_MAX:
+                    raise ModelingError(f"prepared_fifo_owner_out_of_range:{owner_seq}")
+                arr[i].has_fifo_owner = 1
+                arr[i].fifo_owner_seq = owner_seq
             arr[i].capacity = float(row.capacity)
         rc = int(self.library.msim_config_rows(self.ctx, arr if n else None, n))
         if rc != 0:
@@ -701,10 +731,16 @@ class PreparedTermsRunner:
         np, nt, nd = len(progs), len(terms), len(deliveries)
         p_arr = (MsimProgress * max(1, np))()
         for i, p in enumerate(progs):
+            seq = int(p.sequence)
+            prio = int(p.priority)
+            if seq < 0 or seq > _UINT64_MAX:
+                raise ModelingError(f"prepared_sequence_out_of_range:{seq}")
+            if prio < _INT64_MIN or prio > _INT64_MAX:
+                raise ModelingError(f"prepared_priority_out_of_range:{prio}")
             p_arr[i] = MsimProgress(
-                sequence=int(p.sequence), task=int(p.task),
+                sequence=seq, priority=prio, task=int(p.task),
                 placement_id=int(p.placement_id), member_map=int(p.member_map),
-                priority=int(p.priority), z_left=float(p.z_left),
+                pad=0, z_left=float(p.z_left),
                 weight=float(p.weight), max_dz_ms=float(p.max_dz_ms),
             )
         t_arr = (MsimTerm * max(1, nt))()

@@ -18,7 +18,6 @@ import ctypes
 import math
 import threading
 
-_MIN_RATE_PER_MS = 1e-12
 _HALF_STEP = 0.5
 _CAP_ULPS = 8.0
 _SAT_ULPS = 16.0
@@ -153,6 +152,8 @@ def _collect_single_tier(tasks, active) -> list[int] | None:
         task = tasks[key]
         if not task.remaining:
             continue
+        if not task.coupled and getattr(task, "cohort_size", 1) > 1:
+            return None
         prio = task.priority
         if first_prio is None:
             first_prio = prio
@@ -296,12 +297,35 @@ def fast_single_tier_coupled(
     return fast_single_tier_coupled_py(resources, tasks, active)
 
 
-def _collect_coupled_flow(resources, task, key, res_info, flow_keys, flow_limits, flow_rates):
+def _push_slot_item(sbox, is_full: bool, is_unplaced: bool, units, item) -> None:
+    """Append ``(flow_idx, weight, span_id)`` into resource full/unit buckets."""
+    if is_unplaced:
+        sbox[2] = True
+    if is_full:
+        fslot = sbox[0]
+        if fslot is None:
+            sbox[0] = item
+        elif type(fslot) is tuple:
+            sbox[0] = [fslot, item]
+        else:
+            fslot.append(item)
+        return
+    umap = sbox[1]
+    if umap is None:
+        umap = sbox[1] = {}
+    for u in units:
+        cur = umap.get(u)
+        if cur is None:
+            umap[u] = item
+        elif type(cur) is tuple:
+            umap[u] = [cur, item]
+        else:
+            cur.append(item)
+
+
+def _collect_coupled_flow(resources, task, key, res_info, flow_keys, flow_limits, flow_rates, span_meta):
     res_get = res_info.get
     range_get = _UNIT_RANGE_CACHE.get
-    fk_append = flow_keys.append
-    fl_append = flow_limits.append
-    fr_append = flow_rates.append
     ulp = math.ulp
     remaining = task.remaining
     placement = task.placement
@@ -312,8 +336,7 @@ def _collect_coupled_flow(resources, task, key, res_info, flow_keys, flow_limits
     if cohort < 1:
         cohort = 1
     widened_set = getattr(task, "cohort_widened", ())
-    spans: list[tuple[str, float, tuple[int, ...], int, float, list, bool]] = []
-    spans_append = spans.append
+    spans: list[tuple[str, float, tuple[int, ...], int, float, list, bool, bool]] = []
     blocked = False
     scale = 0.0
     for name, amount in remaining.items():
@@ -326,22 +349,19 @@ def _collect_coupled_flow(resources, task, key, res_info, flow_keys, flow_limits
                 return False
             cnt = max(1, int(res.units))
             u_cap = float(res.rate) / cnt
-            cap_scale = 1.0 if u_cap < 1.0 else u_cap
-            sat_tol = max(_MIN_RATE_PER_MS, _SAT_ULPS * ulp(cap_scale))
-            bind_thresh = u_cap - max(_MIN_RATE_PER_MS, _SAT_ULPS * 2.0 * ulp(cap_scale))
+            sat_tol = _SAT_ULPS * ulp(u_cap)
+            bind_thresh = u_cap - _SAT_ULPS * 2.0 * ulp(u_cap)
             full_u = range_get(cnt)
             if full_u is None:
                 full_u = _UNIT_RANGE_CACHE[cnt] = tuple(range(cnt))
-            info = res_info[name] = (u_cap, cnt, sat_tol, bind_thresh, [None, None], full_u)
+            info = res_info[name] = (u_cap, cnt, sat_tol, bind_thresh, [None, None, False], full_u)
         u_cap, cnt, _sat_tol, _bind_thresh, sbox, full_u = info
-        if u_cap <= _MIN_RATE_PER_MS:
+        if u_cap <= 0.0:
             blocked = True
             break
         decl = placement.get(name) if placement else None
         if decl is None:
-            units = full_u
-            n_u = cnt
-            is_full = True
+            units, n_u, is_full, is_unplaced = full_u, cnt, True, cnt > 1
         else:
             units = (decl if (decl and 0 <= decl[0] and decl[-1] < cnt
                               and (len(decl) <= 2 or all(0 <= u < cnt for u in decl)))
@@ -351,6 +371,7 @@ def _collect_coupled_flow(resources, task, key, res_info, flow_keys, flow_limits
                 blocked = True
                 break
             is_full = units == full_u
+            is_unplaced = False
         amt_f = float(amount)
         denom = u_cap * n_u
         if cohort > 1 and name not in widened_set:
@@ -361,7 +382,7 @@ def _collect_coupled_flow(resources, task, key, res_info, flow_keys, flow_limits
             val = amt_f / denom
             if val > scale:
                 scale = val
-        spans_append((name, amt_f, units, n_u, u_cap, sbox, is_full))
+        spans.append((name, amt_f, units, n_u, u_cap, sbox, is_full, is_unplaced))
     if blocked or not spans:
         return True
     if scale == 0.0:
@@ -370,7 +391,7 @@ def _collect_coupled_flow(resources, task, key, res_info, flow_keys, flow_limits
         return True
     limit = 1.0
     if caps_map:
-        for name, amt_f, _units, _n_u, _u_cap, _sbox, _is_full in spans:
+        for name, amt_f, _u, _nu, _uc, _sb, _if, _iu in spans:
             cap = caps_map.get(name)
             if cap is not None:
                 demand = amt_f / scale
@@ -380,46 +401,32 @@ def _collect_coupled_flow(resources, task, key, res_info, flow_keys, flow_limits
         if limit <= 0.0:
             return True
     f_idx = len(flow_keys)
-    fk_append(key)
-    fl_append(limit)
-    fr_append([(name, amt_f / scale)
-               for name, amt_f, _u, _nu, _uc, _sb, _if in spans])
-    for name, amt_f, units, n_u, _u_cap, sbox, is_full in spans:
-        weight = (amt_f / scale) / n_u
-        item = (f_idx, weight)
-        if is_full:
-            fslot = sbox[0]
-            if fslot is None:
-                sbox[0] = item
-            elif type(fslot) is tuple:
-                sbox[0] = [fslot, item]
-            else:
-                fslot.append(item)
-        else:
-            umap = sbox[1]
-            if umap is None:
-                umap = sbox[1] = {}
-            for u in units:
-                cur = umap.get(u)
-                if cur is None:
-                    umap[u] = item
-                elif type(cur) is tuple:
-                    umap[u] = [cur, item]
-                else:
-                    cur.append(item)
+    flow_keys.append(key)
+    flow_limits.append(limit)
+    flow_rates.append([(name, amt_f / scale) for name, amt_f, _u, _nu, _uc, _sb, _if, _iu in spans])
+    s_flow, s_dem, s_rem, s_unp, s_w, s_ba = span_meta
+    for name, amt_f, units, n_u, _u_cap, sbox, is_full, is_unplaced in spans:
+        demand = amt_f / scale
+        weight = demand / n_u
+        s_id = len(s_flow)
+        s_flow.append(f_idx)
+        s_dem.append(demand)
+        s_rem.append(n_u)
+        s_unp.append(is_unplaced)
+        s_w.append(weight)
+        s_ba.append(0.0)
+        _push_slot_item(sbox, is_full, is_unplaced, units, (f_idx, weight, s_id))
     return True
 
 
-def _collect_independent_flows(resources, task, key, res_info, flow_keys, flow_limits, flow_rates):
+def _collect_independent_flows(resources, task, key, res_info, flow_keys, flow_limits, flow_rates, span_meta):
     res_get = res_info.get
     range_get = _UNIT_RANGE_CACHE.get
-    fk_append = flow_keys.append
-    fl_append = flow_limits.append
-    fr_append = flow_rates.append
     ulp = math.ulp
     remaining = task.remaining
     placement = task.placement
     caps_map = task.caps
+    s_flow, s_dem, s_rem, s_unp, s_w, s_ba = span_meta
     for name, amount in remaining.items():
         if amount <= 0.0:
             continue
@@ -430,21 +437,18 @@ def _collect_independent_flows(resources, task, key, res_info, flow_keys, flow_l
                 return False
             cnt = max(1, int(res.units))
             u_cap = float(res.rate) / cnt
-            cap_scale = 1.0 if u_cap < 1.0 else u_cap
-            sat_tol = max(_MIN_RATE_PER_MS, _SAT_ULPS * ulp(cap_scale))
-            bind_thresh = u_cap - max(_MIN_RATE_PER_MS, _SAT_ULPS * 2.0 * ulp(cap_scale))
+            sat_tol = _SAT_ULPS * ulp(u_cap)
+            bind_thresh = u_cap - _SAT_ULPS * 2.0 * ulp(u_cap)
             full_u = range_get(cnt)
             if full_u is None:
                 full_u = _UNIT_RANGE_CACHE[cnt] = tuple(range(cnt))
-            info = res_info[name] = (u_cap, cnt, sat_tol, bind_thresh, [None, None], full_u)
+            info = res_info[name] = (u_cap, cnt, sat_tol, bind_thresh, [None, None, False], full_u)
         u_cap, cnt, _sat_tol, _bind_thresh, sbox, full_u = info
-        if u_cap <= _MIN_RATE_PER_MS:
+        if u_cap <= 0.0:
             continue
         decl = placement.get(name) if placement else None
         if decl is None:
-            units = full_u
-            n_u = cnt
-            is_full = True
+            units, n_u, is_full, is_unplaced = full_u, cnt, True, cnt > 1
         else:
             units = (decl if (decl and 0 <= decl[0] and decl[-1] < cnt
                               and (len(decl) <= 2 or all(0 <= u < cnt for u in decl)))
@@ -453,6 +457,7 @@ def _collect_independent_flows(resources, task, key, res_info, flow_keys, flow_l
             if not n_u:
                 continue
             is_full = units == full_u
+            is_unplaced = False
         demand = u_cap * n_u
         if demand <= 0.0:
             continue
@@ -466,114 +471,107 @@ def _collect_independent_flows(resources, task, key, res_info, flow_keys, flow_l
             if limit <= 0.0:
                 continue
         f_idx = len(flow_keys)
-        fk_append(key)
-        fl_append(limit)
-        fr_append(((name, demand),))
+        flow_keys.append(key)
+        flow_limits.append(limit)
+        flow_rates.append(((name, demand),))
         weight = demand / n_u
-        item = (f_idx, weight)
-        if is_full:
-            fslot = sbox[0]
-            if fslot is None:
-                sbox[0] = item
-            elif type(fslot) is tuple:
-                sbox[0] = [fslot, item]
-            else:
-                fslot.append(item)
-        else:
-            umap = sbox[1]
-            if umap is None:
-                umap = sbox[1] = {}
-            for u in units:
-                cur = umap.get(u)
-                if cur is None:
-                    umap[u] = item
-                elif type(cur) is tuple:
-                    umap[u] = [cur, item]
-                else:
-                    cur.append(item)
+        s_id = len(s_flow)
+        s_flow.append(f_idx)
+        s_dem.append(demand)
+        s_rem.append(n_u)
+        s_unp.append(is_unplaced)
+        s_w.append(weight)
+        s_ba.append(0.0)
+        _push_slot_item(sbox, is_full, is_unplaced, units, (f_idx, weight, s_id))
     return True
 
 
+def _fold_private_slot(pc_append, flow_limits, name: str, u: int, u_cap: float, item) -> None:
+    f_idx, w, _sid = item
+    pc_append((name, u, u_cap, f_idx, w))
+    if w > 0.0:
+        b = u_cap / w
+        if b < flow_limits[f_idx]:
+            flow_limits[f_idx] = b
+        while flow_limits[f_idx] > 0.0 and flow_limits[f_idx] * w > u_cap:
+            flow_limits[f_idx] = math.nextafter(flow_limits[f_idx], 0.0)
+
+
 def _partition_capacity_slots(res_info, flow_limits):
-    shared_units: list[tuple[str, int, float, float, float, list[tuple[int, float]]]] = []
+    shared_units = []
     su_append = shared_units.append
-    nextafter = math.nextafter
     private_checks: list[tuple[str, int, float, int, float]] = []
     pc_append = private_checks.append
     for name, (u_cap, cnt, sat_tol, bind_thresh, sbox, full_u) in res_info.items():
-        fslot = sbox[0]
-        umap = sbox[1]
+        fslot, umap, has_unplaced = sbox
         if umap is None:
             if type(fslot) is tuple:
-                f_idx, w = fslot
-                pc_append((name, 0, u_cap, f_idx, w))
-                if w > 0.0:
-                    b = u_cap / w
-                    if b < flow_limits[f_idx]:
-                        flow_limits[f_idx] = b
-                    while flow_limits[f_idx] > 0.0 and flow_limits[f_idx] * w > u_cap:
-                        flow_limits[f_idx] = nextafter(flow_limits[f_idx], 0.0)
+                _fold_private_slot(pc_append, flow_limits, name, 0, u_cap, fslot)
             elif fslot is not None:
-                su_append((name, 0, u_cap, sat_tol, bind_thresh, fslot))
+                su_append((name, 0, u_cap, sat_tol, bind_thresh, fslot, False))
             continue
         if fslot is None:
             for u in (sorted(umap) if len(umap) > 1 else umap):
                 cur = umap[u]
                 if type(cur) is tuple:
-                    f_idx, w = cur
-                    pc_append((name, u, u_cap, f_idx, w))
-                    if w > 0.0:
-                        b = u_cap / w
-                        if b < flow_limits[f_idx]:
-                            flow_limits[f_idx] = b
-                        while flow_limits[f_idx] > 0.0 and flow_limits[f_idx] * w > u_cap:
-                            flow_limits[f_idx] = nextafter(flow_limits[f_idx], 0.0)
+                    _fold_private_slot(pc_append, flow_limits, name, u, u_cap, cur)
                 else:
-                    su_append((name, u, u_cap, sat_tol, bind_thresh, cur))
+                    su_append((name, u, u_cap, sat_tol, bind_thresh, cur, False))
+            continue
+        f_is_tuple = type(fslot) is tuple
+        f_part = (fslot,) if f_is_tuple else fslot
+        if has_unplaced and cnt > 1:
+            for u in range(cnt):
+                cur = umap.get(u)
+                if cur is None:
+                    terms = list(f_part)
+                else:
+                    u_part = (cur,) if type(cur) is tuple else cur
+                    terms = sorted([*f_part, *u_part])
+                su_append((name, u, u_cap, sat_tol, bind_thresh, terms, True))
             continue
         if len(umap) < cnt:
             u_rep = next(u for u in full_u if u not in umap)
-            if type(fslot) is tuple:
-                f_idx, w = fslot
-                pc_append((name, u_rep, u_cap, f_idx, w))
-                if w > 0.0:
-                    b = u_cap / w
-                    if b < flow_limits[f_idx]:
-                        flow_limits[f_idx] = b
-                    while flow_limits[f_idx] > 0.0 and flow_limits[f_idx] * w > u_cap:
-                        flow_limits[f_idx] = nextafter(flow_limits[f_idx], 0.0)
+            if f_is_tuple:
+                _fold_private_slot(pc_append, flow_limits, name, u_rep, u_cap, fslot)
             else:
-                su_append((name, u_rep, u_cap, sat_tol, bind_thresh, fslot))
-        f_is_tuple = type(fslot) is tuple
+                su_append((name, u_rep, u_cap, sat_tol, bind_thresh, fslot, False))
         for u in (sorted(umap) if len(umap) > 1 else umap):
             cur = umap[u]
             if f_is_tuple and type(cur) is tuple:
                 terms = [fslot, cur] if fslot[0] <= cur[0] else [cur, fslot]
             else:
-                f_part = (fslot,) if f_is_tuple else fslot
                 u_part = (cur,) if type(cur) is tuple else cur
                 terms = sorted([*f_part, *u_part])
-            su_append((name, u, u_cap, sat_tol, bind_thresh, terms))
+            su_append((name, u, u_cap, sat_tol, bind_thresh, terms, False))
     return private_checks, shared_units
 
 
 def _binding_capacity_slots(shared_units, flow_limits):
     fsum = math.fsum
-    binding_units: list[tuple[float, float, list[tuple[int, float]]]] = []
-    seen_binding: set[tuple[float, tuple[tuple[int, float], ...]]] = set()
-    for _name, _u, cap, sat_tol, bind_thresh, terms in shared_units:
+    binding_units = []
+    shared_to_bind: list[int] = [-1] * len(shared_units)
+    seen_binding: dict[tuple[float, tuple[tuple[int, float], ...]], int] = {}
+    for idx, (_name, _u, cap, sat_tol, bind_thresh, terms, force_bind) in enumerate(shared_units):
+        if force_bind:
+            shared_to_bind[idx] = len(binding_units)
+            binding_units.append((cap, sat_tol, terms, True))
+            continue
         n_t = len(terms)
         max_tot = (
             terms[0][1] * flow_limits[terms[0][0]] if n_t == 1
             else (terms[0][1] * flow_limits[terms[0][0]] + terms[1][1] * flow_limits[terms[1][0]]) if n_t == 2
-            else fsum([flow_limits[f_idx] * w for f_idx, w in terms])
+            else fsum([flow_limits[f_idx] * w for f_idx, w, _sid in terms])
         )
         if max_tot > bind_thresh:
-            key_u = (cap, tuple(terms))
-            if key_u not in seen_binding:
-                seen_binding.add(key_u)
-                binding_units.append((cap, sat_tol, terms))
-    return binding_units
+            key_u = (cap, tuple((f_idx, w) for f_idx, w, _sid in terms))
+            hit = seen_binding.get(key_u)
+            if hit is None:
+                hit = len(binding_units)
+                seen_binding[key_u] = hit
+                binding_units.append((cap, sat_tol, terms, False))
+            shared_to_bind[idx] = hit
+    return binding_units, shared_to_bind
 
 
 def _isolated_slot_delta(cap, sat_tol, terms, flow_limits):
@@ -585,11 +583,11 @@ def _isolated_slot_delta(cap, sat_tol, terms, flow_limits):
     slope = (
         terms[0][1] if n_t == 1
         else (terms[0][1] + terms[1][1]) if n_t == 2
-        else fsum([w for _f, w in terms])
+        else fsum([w for _f, w, _sid in terms])
     )
     denom = slope if n_t == 1 else nextafter(slope, math.inf)
     delta = cap / denom
-    if not all(delta <= flow_limits[f_idx] for f_idx, _w in terms):
+    if not all(delta <= flow_limits[f_idx] for f_idx, _w, _sid in terms):
         return None
     for attempt in range(_MAX_ATTEMPTS):
         if delta <= 0.0:
@@ -597,12 +595,12 @@ def _isolated_slot_delta(cap, sat_tol, terms, flow_limits):
         tot = (
             (delta * terms[0][1]) if n_t == 1
             else (delta * terms[0][1] + delta * terms[1][1]) if n_t == 2
-            else fsum([delta * w for _f, w in terms])
+            else fsum([delta * w for _f, w, _sid in terms])
         )
         if tot <= cap:
             res_v = cap - tot
             tol = (sat_tol if 0.0 <= res_v <= cap
-                   else max(_MIN_RATE_PER_MS, _SAT_ULPS * ulp(max(1.0, abs(cap), abs(res_v)))))
+                   else _SAT_ULPS * ulp(max(abs(cap), abs(res_v))))
             if res_v <= tol:
                 return delta
             break
@@ -610,12 +608,13 @@ def _isolated_slot_delta(cap, sat_tol, terms, flow_limits):
     return None
 
 
-def _solve_binding_slots(binding_units, flow_limits):
+def _solve_binding_slots(binding_units, flow_limits, span_meta):
     n_flows = len(flow_limits)
+    s_unp = span_meta[3]
     alphas = [0.0] * n_flows
     deg = [0] * n_flows
-    for _cap, _sat_tol, terms in binding_units:
-        for f_idx, _w in terms:
+    for _cap, _sat_tol, terms, _fb in binding_units:
+        for f_idx, _w, _sid in terms:
             deg[f_idx] += 1
     active_flags = [False] * n_flows
     for f_idx in range(n_flows):
@@ -624,66 +623,128 @@ def _solve_binding_slots(binding_units, flow_limits):
             alphas[f_idx] = lim
         elif lim > 0.0:
             active_flags[f_idx] = True
-    rem_units: list[tuple[float, float, list[tuple[int, float]]]] = []
-    for cap, sat_tol, terms in binding_units:
-        if all(deg[f_idx] == 1 and active_flags[f_idx] for f_idx, _w in terms):
+    rem_units = []
+    bind_to_rem: list[int] = [-1] * len(binding_units)
+    for b_idx, (cap, sat_tol, terms, force_bind) in enumerate(binding_units):
+        if not force_bind and all(
+            deg[f_idx] == 1 and active_flags[f_idx] and not s_unp[s_id]
+            for f_idx, _w, s_id in terms
+        ):
             delta = _isolated_slot_delta(cap, sat_tol, terms, flow_limits)
             if delta is not None:
-                for f_idx, _w in terms:
+                for f_idx, _w, _sid in terms:
                     alphas[f_idx] = delta
                     active_flags[f_idx] = False
                 continue
+        bind_to_rem[b_idx] = len(rem_units)
         rem_units.append((cap, sat_tol, terms))
-    if rem_units:
-        _fill_shared_slots(rem_units, flow_limits, alphas, active_flags)
-    return alphas
+    committed = (
+        _fill_shared_slots(rem_units, flow_limits, alphas, active_flags, span_meta)
+        if rem_units else []
+    )
+    return alphas, bind_to_rem, committed
 
 
-def _fit_shared_step(delta, act_indices, open_shared, rem_units, committed, alphas, flow_limits, active_flags):
+def _slot_term_val(f_idx: int, s_id: int, alpha_next: float, base_c: float, s_w, s_ba) -> float:
+    ba = s_ba[s_id]
+    w = s_w[s_id]
+    return (base_c + (alpha_next - ba) * w) if ba else (alpha_next * w)
+
+
+def _fit_shared_step(delta, act_indices, open_shared, rem_units, base_comm, committed,
+                     alphas, flow_limits, active_flags, s_w, s_ba):
     nextafter = math.nextafter
     fsum = math.fsum
-    cand_sub: list[tuple[int, float]] = []
+    blocking: set[int] = set()
     for attempt in range(_MAX_ATTEMPTS):
         if delta <= 0.0:
-            cand_sub = []
-            break
+            return 0.0, [], blocking
         c_sub: list[tuple[int, float]] = []
-        unsafe = any(alphas[f_idx] + delta > flow_limits[f_idx] for f_idx in act_indices)
-        if not unsafe:
+        failed: set[int] = set()
+        cap_fail = any(alphas[f_idx] + delta > flow_limits[f_idx] for f_idx in act_indices)
+        if not cap_fail:
             for s_idx in open_shared:
                 cap, _sat_tol, terms = rem_units[s_idx]
                 comm_s = committed[s_idx]
-                if len(terms) == 2:
-                    (f0, w0), (f1, w1) = terms
-                    v0 = (alphas[f0] + delta) * w0 if active_flags[f0] else comm_s[0]
-                    v1 = (alphas[f1] + delta) * w1 if active_flags[f1] else comm_s[1]
-                    tot = v0 + v1
-                else:
-                    vals = [((alphas[f_idx] + delta) * w if active_flags[f_idx] else comm_s[j])
-                            for j, (f_idx, w) in enumerate(terms)]
-                    tot = vals[0] if len(vals) == 1 else fsum(vals)
+                bcomm_s = base_comm[s_idx]
+                vals = [
+                    (_slot_term_val(f_idx, s_id, alphas[f_idx] + delta, bcomm_s[j], s_w, s_ba)
+                     if active_flags[f_idx] else comm_s[j])
+                    for j, (f_idx, _w, s_id) in enumerate(terms)
+                ]
+                tot = vals[0] if len(vals) == 1 else (vals[0] + vals[1] if len(vals) == 2 else fsum(vals))
                 if tot > cap:
-                    unsafe = True
-                    break
-                c_sub.append((s_idx, tot))
-        if not unsafe:
-            cand_sub = c_sub
-            break
+                    failed.add(s_idx)
+                else:
+                    c_sub.append((s_idx, tot))
+        if not cap_fail and not failed:
+            return delta, c_sub, blocking
+        if failed:
+            blocking = failed
         delta = nextafter(delta, 0.0) if attempt < _NEXTAFTER_STEPS else delta * _HALF_STEP
-    else:
-        delta = 0.0
-        cand_sub = []
-    return delta, cand_sub
+    return 0.0, [], blocking
 
 
-def _fill_shared_slots(rem_units, flow_limits, alphas, active_flags):
+def _retire_shared_units(open_shared, rem_units, totals, blocking,
+                         alphas, flow_limits, active_flags,
+                         base_comm, committed, span_meta):
+    """Freeze pinned flows and redistribute unplaced spans on saturated slots."""
+    ulp = math.ulp
+    s_flow, s_dem, s_rem, s_unp, s_w, s_ba = span_meta
+    next_open: list[int] = []
+    redist: set[int] = set()
+    froze_any = False
+    for s_idx in open_shared:
+        cap, sat_tol, terms = rem_units[s_idx]
+        res_v = cap - totals[s_idx]
+        tol = sat_tol if 0.0 <= res_v <= cap else _SAT_ULPS * ulp(max(abs(cap), abs(res_v)))
+        has_uncapped = any(
+            active_flags[f_idx]
+            and alphas[f_idx] < flow_limits[f_idx] - _CAP_ULPS * ulp(
+                max(abs(flow_limits[f_idx]), abs(alphas[f_idx])))
+            for f_idx, _w, _sid in terms
+        )
+        unit_bound = res_v <= 0.0 or ((s_idx in blocking or has_uncapped) and res_v <= tol)
+        if not unit_bound:
+            next_open.append(s_idx)
+            continue
+        for f_idx, _w, s_id in terms:
+            if not active_flags[f_idx]:
+                continue
+            froze_any = True
+            if not s_unp[s_id]:
+                active_flags[f_idx] = False
+                continue
+            s_rem[s_id] -= 1
+            if s_rem[s_id] <= 0:
+                active_flags[f_idx] = False
+            else:
+                redist.add(s_id)
+    if redist:
+        for os_idx in next_open:
+            comm_s = committed[os_idx]
+            bcomm_s = base_comm[os_idx]
+            for j, (_f_idx, _w, s_id) in enumerate(rem_units[os_idx][2]):
+                if s_id in redist:
+                    bcomm_s[j] = comm_s[j]
+        for s_id in redist:
+            f_idx = s_flow[s_id]
+            if active_flags[f_idx]:
+                s_ba[s_id] = alphas[f_idx]
+                s_w[s_id] = s_dem[s_id] / s_rem[s_id]
+    return next_open, froze_any
+
+
+def _fill_shared_slots(rem_units, flow_limits, alphas, active_flags, span_meta):
     nextafter = math.nextafter
     fsum = math.fsum
     ulp = math.ulp
     inf = math.inf
     isfinite = math.isfinite
+    s_w, s_ba = span_meta[4], span_meta[5]
     n_rem = len(rem_units)
     act_indices = [i for i, ok in enumerate(active_flags) if ok]
+    base_comm = [[0.0] * len(rem_units[s_idx][2]) for s_idx in range(n_rem)]
     committed = [[0.0] * len(rem_units[s_idx][2]) for s_idx in range(n_rem)]
     totals = [0.0] * n_rem
     open_shared = list(range(n_rem))
@@ -692,48 +753,29 @@ def _fill_shared_slots(rem_units, flow_limits, alphas, active_flags):
         still_open: list[int] = []
         for s_idx in open_shared:
             cap, _sat_tol, terms = rem_units[s_idx]
-            if len(terms) == 2:
-                (f0, w0), (f1, w1) = terms
-                a0, a1 = active_flags[f0], active_flags[f1]
-                if not a0 and not a1:
-                    continue
-                still_open.append(s_idx)
-                if a0 and a1:
-                    slope = w0 + w1
-                    denom = nextafter(slope, inf) if slope > 0.0 else 0.0
-                else:
-                    slope = w0 if a0 else w1
-                    denom = slope
-                if denom > 0.0:
-                    b = (cap - totals[s_idx]) / denom
-                    if b < bound_limit:
-                        bound_limit = b
-            else:
-                weights = [w for f_idx, w in terms if active_flags[f_idx]]
-                if weights:
-                    still_open.append(s_idx)
-                    cnt_w = len(weights)
-                    slope = weights[0] if cnt_w == 1 else fsum(weights)
-                    if slope > 0.0:
-                        denom = slope if cnt_w == 1 else nextafter(slope, inf)
-                        b = (cap - totals[s_idx]) / denom
-                        if b < bound_limit:
-                            bound_limit = b
+            weights = [s_w[s_id] for f_idx, _w, s_id in terms if active_flags[f_idx]]
+            if not weights:
+                continue
+            still_open.append(s_idx)
+            cnt_w = len(weights)
+            slope = weights[0] if cnt_w == 1 else (weights[0] + weights[1] if cnt_w == 2 else fsum(weights))
+            if slope > 0.0:
+                denom = slope if cnt_w == 1 else nextafter(slope, inf)
+                b = (cap - totals[s_idx]) / denom
+                if b < bound_limit:
+                    bound_limit = b
         open_shared = still_open
         if not open_shared:
             for f_idx in act_indices:
                 alphas[f_idx] = flow_limits[f_idx]
             break
-        headroom = inf
-        for f_idx in act_indices:
-            hr = flow_limits[f_idx] - alphas[f_idx]
-            if hr < headroom:
-                headroom = hr
-        delta = bound_limit if bound_limit < headroom else headroom
-        if not isfinite(delta) or delta < 0.0:
+        headroom = min(flow_limits[f_idx] - alphas[f_idx] for f_idx in act_indices)
+        raw_delta = bound_limit if bound_limit < headroom else headroom
+        if not isfinite(raw_delta) or raw_delta < 0.0:
             break
-        delta, cand_sub = _fit_shared_step(
-            delta, act_indices, open_shared, rem_units, committed, alphas, flow_limits, active_flags,
+        delta, cand_sub, blocking = _fit_shared_step(
+            raw_delta, act_indices, open_shared, rem_units, base_comm, committed,
+            alphas, flow_limits, active_flags, s_w, s_ba,
         )
         advanced = False
         if delta > 0.0:
@@ -746,26 +788,16 @@ def _fill_shared_slots(rem_units, flow_limits, alphas, active_flags):
                 alphas[f_idx] = val
             for s_idx in open_shared:
                 comm_s = committed[s_idx]
-                for j, (f_idx, w) in enumerate(rem_units[s_idx][2]):
+                bcomm_s = base_comm[s_idx]
+                for j, (f_idx, _w, s_id) in enumerate(rem_units[s_idx][2]):
                     if active_flags[f_idx]:
-                        comm_s[j] = alphas[f_idx] * w
+                        comm_s[j] = _slot_term_val(f_idx, s_id, alphas[f_idx], bcomm_s[j], s_w, s_ba)
             for s_idx, tot in cand_sub:
                 totals[s_idx] = tot
-        next_open: list[int] = []
-        froze_any = False
-        for s_idx in open_shared:
-            cap, sat_tol, terms = rem_units[s_idx]
-            res_v = cap - totals[s_idx]
-            tol = (sat_tol if 0.0 <= res_v <= cap
-                   else max(_MIN_RATE_PER_MS, _SAT_ULPS * ulp(max(1.0, abs(cap), abs(res_v)))))
-            if res_v <= tol:
-                for f_idx, _w in terms:
-                    if active_flags[f_idx]:
-                        active_flags[f_idx] = False
-                        froze_any = True
-            else:
-                next_open.append(s_idx)
-        open_shared = next_open
+        open_shared, froze_any = _retire_shared_units(
+            open_shared, rem_units, totals, blocking,
+            alphas, flow_limits, active_flags, base_comm, committed, span_meta,
+        )
         no_step = not advanced
         next_act: list[int] = []
         for f_idx in act_indices:
@@ -782,57 +814,56 @@ def _fill_shared_slots(rem_units, flow_limits, alphas, active_flags):
         if not froze_any:
             break
         act_indices = next_act
+    return committed
 
 
 def fast_single_tier_coupled_py(resources, tasks, active) -> dict[str, dict[int, float]] | None:
     """Pure-Python reference for single-priority non-FIFO coupled tiers."""
-    first_prio = None
-    tier: list[int] = []
-    tier_append = tier.append
-    for key in active:
-        task = tasks[key]
-        if not task.remaining:
-            continue
-        prio = task.priority
-        if first_prio is None:
-            first_prio = prio
-        elif prio != first_prio:
-            return None
-        tier_append(key)
+    tier = _collect_single_tier(tasks, active)
+    if tier is None:
+        return None
     if not tier:
         return {}
-    if len(tier) > 1:
-        tier.sort()
 
     res_info: dict[str, tuple[float, int, float, float, list, tuple[int, ...]]] = {}
     flow_keys: list[int] = []
     flow_limits: list[float] = []
     flow_rates: list[tuple[tuple[str, float], ...]] = []
+    span_meta = ([], [], [], [], [], [])
     for key in tier:
         task = tasks[key]
         collect = _collect_coupled_flow if task.coupled else _collect_independent_flows
-        if not collect(resources, task, key, res_info, flow_keys, flow_limits, flow_rates):
+        if not collect(resources, task, key, res_info, flow_keys, flow_limits, flow_rates, span_meta):
             return None
 
-    n_flows = len(flow_keys)
-    if not n_flows:
+    if not flow_keys:
         return {}
 
     private_checks, shared_units = _partition_capacity_slots(res_info, flow_limits)
-    binding_units = _binding_capacity_slots(shared_units, flow_limits)
-    alphas = _solve_binding_slots(binding_units, flow_limits) if binding_units else flow_limits
+    binding_units, shared_to_bind = _binding_capacity_slots(shared_units, flow_limits)
+    if binding_units:
+        alphas, bind_to_rem, committed = _solve_binding_slots(binding_units, flow_limits, span_meta)
+    else:
+        alphas, bind_to_rem, committed = flow_limits, [], []
 
     fsum = math.fsum
     for name, u, cap, f_idx, w in private_checks:
         if alphas[f_idx] * w > cap:
             raise AssertionError(f"unit_service_overallocated:{name}:{u}")
-    for name, u, cap, _sat_tol, _bind_thresh, terms in shared_units:
-        n_t = len(terms)
-        tot_u = (
-            alphas[terms[0][0]] * terms[0][1] if n_t == 1
-            else (alphas[terms[0][0]] * terms[0][1] + alphas[terms[1][0]] * terms[1][1]) if n_t == 2
-            else fsum([alphas[f_idx] * w for f_idx, w in terms])
-        )
+    for s_idx, (name, u, cap, _sat_tol, _bind_thresh, terms, _fb) in enumerate(shared_units):
+        b_idx = shared_to_bind[s_idx]
+        r_idx = bind_to_rem[b_idx] if b_idx >= 0 else -1
+        if r_idx >= 0:
+            vals = committed[r_idx]
+            n_t = len(vals)
+            tot_u = vals[0] if n_t == 1 else (vals[0] + vals[1] if n_t == 2 else fsum(vals))
+        else:
+            n_t = len(terms)
+            tot_u = (
+                alphas[terms[0][0]] * terms[0][1] if n_t == 1
+                else (alphas[terms[0][0]] * terms[0][1] + alphas[terms[1][0]] * terms[1][1]) if n_t == 2
+                else fsum([alphas[f_idx] * w for f_idx, w, _sid in terms])
+            )
         if tot_u > cap:
             raise AssertionError(f"unit_service_overallocated:{name}:{u}")
 

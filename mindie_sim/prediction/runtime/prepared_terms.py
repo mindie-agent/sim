@@ -186,15 +186,32 @@ def bind_vector_groups(
     pipe_totals: dict[str, float] = {}
     stages: list[Stage] = []
     raw_ready_by_id: dict[str, float] = {}
+    ancestors_by_id: dict[str, set[str]] = {}
+    issue_by_id: dict[str, float] = {}
+    exec_by_id: dict[str, tuple[str, float]] = {}
     max_raw_lat = 0.0
 
     for grp in groups:
+        ancestors: set[str] = set()
         for dep in grp.dependencies:
             if dep not in by_id:
                 raise ModelingError(f"vector_group_unknown_dep:{grp.group_id}:{dep}")
+            ancestors.add(dep)
+            ancestors.update(ancestors_by_id[dep])
+        ancestors_by_id[grp.group_id] = ancestors
         start_ms = max((raw_ready_by_id[d] for d in grp.dependencies), default=0.0)
+        if ancestors:
+            anc_issue = sum(issue_by_id[u] for u in ancestors) / eff_issue
+            anc_pipes: dict[str, float] = {}
+            for u in ancestors:
+                u_pipe, u_exec = exec_by_id[u]
+                anc_pipes[u_pipe] = anc_pipes.get(u_pipe, 0.0) + u_exec
+            anc_pipe_lb = max((w / eff_pipes[p] for p, w in anc_pipes.items()), default=0.0)
+            start_ms = max(start_ms, anc_issue, anc_pipe_lb)
         issue_w = float(grp.count * grp.issue_slots)
         exec_w = float(grp.count * grp.initiation_cycles)
+        issue_by_id[grp.group_id] = issue_w
+        exec_by_id[grp.group_id] = (grp.pipe, exec_w)
         total_issue += issue_w
         pipe_totals[grp.pipe] = pipe_totals.get(grp.pipe, 0.0) + exec_w
         thru_ms = max(issue_w / eff_issue, exec_w / eff_pipes[grp.pipe]) if grp.count > 0 else 0.0
@@ -224,14 +241,11 @@ def bind_vector_groups(
             raw_lat_ms, target_eff, pl,
         )
 
-    if not any(g.dependencies for g in groups):
-        span_ms = max(
-            total_issue / eff_issue,
-            max((w / eff_pipes[p] for p, w in pipe_totals.items()), default=0.0),
-            max(raw_ready_by_id.values(), default=0.0),
-        )
-    else:
-        span_ms = max(raw_ready_by_id.values(), default=0.0)
+    span_ms = max(
+        total_issue / eff_issue,
+        max((w / eff_pipes[p] for p, w in pipe_totals.items()), default=0.0),
+        max(raw_ready_by_id.values(), default=0.0),
+    )
 
     return BoundVectorOp(
         owner=owner,
@@ -244,7 +258,7 @@ def bind_vector_groups(
     )
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class PreparedCapacityRow:
     """One normalized capacity row matching C11 ``msim_capacity_row``."""
 
@@ -253,6 +267,7 @@ class PreparedCapacityRow:
     unit: int = 0
     policy: int = POLICY_FAIR
     capacity: float = 1.0
+    fifo_owner_seq: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,12 +329,18 @@ def allocate_prepared_epoch(
         flow_terms[flow].append((row, coeff))
 
     fifo_winner: dict[int, int] = {}
-    for f in order:
-        if progs[f].z_left <= 0.0 or progs[f].weight <= 0.0 or progs[f].max_dz_ms <= 0.0:
+    for row_idx, row_obj in enumerate(rows):
+        if row_obj.policy != POLICY_FIFO or row_obj.fifo_owner_seq is None:
             continue
-        for row, coeff in flow_terms[f]:
-            if coeff > 0.0 and rows[row].policy == POLICY_FIFO and row not in fifo_winner:
-                fifo_winner[row] = f
+        incumbent_seq = row_obj.fifo_owner_seq
+        for f in order:
+            if progs[f].sequence == incumbent_seq and progs[f].z_left > 0.0 and any(
+                r == row_idx and coeff > 0.0 for r, coeff in flow_terms[f]
+            ):
+                fifo_winner[row_idx] = f
+                break
+        if row_idx not in fifo_winner:
+            row_obj.fifo_owner_seq = None
 
     rem_cap = [float(r.capacity) for r in rows]
     by_prio: dict[int, list[int]] = {}
@@ -335,13 +356,16 @@ def allocate_prepared_epoch(
             blocked = False
             for row, coeff in flow_terms[f]:
                 if coeff > 0.0:
-                    if rows[row].policy == POLICY_FIFO and fifo_winner.get(row) != f:
+                    if rows[row].policy == POLICY_FIFO and row in fifo_winner and fifo_winner[row] != f:
                         blocked = True
                         break
                     if rem_cap[row] <= 0.0:
                         blocked = True
                         break
             if not blocked:
+                for row, coeff in flow_terms[f]:
+                    if coeff > 0.0 and rows[row].policy == POLICY_FIFO and row not in fifo_winner:
+                        fifo_winner[row] = f
                 free.append(f)
         guard = 0
         while free and guard <= n_progs + 1:
@@ -382,6 +406,9 @@ def allocate_prepared_epoch(
                     continue
                 next_free.append(f)
             free = next_free
+    for row_idx, winner_f in fifo_winner.items():
+        if rows[row_idx].fifo_owner_seq is None and dz[winner_f] > 0.0:
+            rows[row_idx].fifo_owner_seq = progs[winner_f].sequence
     return dz
 
 

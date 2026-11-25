@@ -75,10 +75,11 @@ typedef struct {
 
 typedef struct {
     uint64_t sequence;
+    int64_t priority;
     uint32_t task;
     uint32_t placement_id;
     uint32_t member_map;
-    int32_t priority;
+    uint32_t pad;
     double z_left;
     double weight;
     double max_dz_ms;
@@ -89,11 +90,13 @@ typedef struct {
     uint32_t scope;
     uint32_t unit;
     uint8_t policy;
-    uint8_t pad[7];
+    uint8_t has_fifo_owner;
+    uint8_t pad[2];
     double capacity;
+    uint64_t fifo_owner_seq;
 } msim_capacity_row;
 
-#define MSIM_TERMS_ABI_VERSION 3u
+#define MSIM_TERMS_ABI_VERSION 4u
 #define MSIM_TERMS_ABI_PROBE_CELLS 16u
 
 typedef struct {
@@ -302,6 +305,7 @@ MSIM_EXPORT int32_t msim_config_rows(
     if (nrows > 0 && rows == NULL) return MSIM_E_RANGE;
     for (i = 0; i < nrows; i++) {
         if (rows[i].policy > MSIM_ROW_POLICY_FIFO) return MSIM_E_VALUE;
+        if (rows[i].has_fifo_owner > 1u) return MSIM_E_VALUE;
         if (!isfinite(rows[i].capacity) || rows[i].capacity < 0.0)
             return MSIM_E_VALUE;
     }
@@ -412,7 +416,7 @@ MSIM_EXPORT int32_t msim_prepare_terms(
 MSIM_EXPORT int32_t msim_allocate_epoch(void *ctx, double *out_dz, uint32_t nprogs)
 {
     msim_ctx *c = (msim_ctx *)ctx;
-    const msim_capacity_row *rows;
+    msim_capacity_row *rows;
     const msim_progress *progs;
     const msim_term *terms;
     int32_t nr, np, nt, i, j, p_start;
@@ -429,7 +433,7 @@ MSIM_EXPORT int32_t msim_allocate_epoch(void *ctx, double *out_dz, uint32_t npro
     for (i = 0; i < np; i++) out_dz[i] = 0.0;
     if (nr == 0 || np == 0) return 0;
 
-    rows = (const msim_capacity_row *)c->pt_rows;
+    rows = (msim_capacity_row *)c->pt_rows;
     progs = (const msim_progress *)c->pt_progs;
     terms = (const msim_term *)c->pt_terms;
     for (i = 0; i < nt; i++) {
@@ -472,22 +476,31 @@ MSIM_EXPORT int32_t msim_allocate_epoch(void *ctx, double *out_dz, uint32_t npro
     for (j = 0; j < nr; j++) {
         fifo_win[j] = -1;
         rem_cap[j] = rows[j].capacity;
-    }
-    for (i = 0; i < np; i++) {
-        int32_t f = (int32_t)order[i];
-        if (progs[f].z_left <= 0.0 || progs[f].weight <= 0.0 || progs[f].max_dz_ms <= 0.0)
-            continue;
-        for (j = t_start[f]; j < t_end[f]; j++) {
-            uint32_t r = terms[j].row;
-            if (terms[j].ms_per_z > 0.0 && rows[r].policy == MSIM_ROW_POLICY_FIFO
-                && fifo_win[r] < 0)
-                fifo_win[r] = f;
+        if (rows[j].policy == MSIM_ROW_POLICY_FIFO && rows[j].has_fifo_owner) {
+            uint64_t inc_seq = rows[j].fifo_owner_seq;
+            for (i = 0; i < np; i++) {
+                int32_t f = (int32_t)order[i];
+                int32_t k;
+                if (progs[f].sequence != inc_seq || progs[f].z_left <= 0.0)
+                    continue;
+                for (k = t_start[f]; k < t_end[f]; k++) {
+                    if (terms[k].row == (uint32_t)j && terms[k].ms_per_z > 0.0) {
+                        fifo_win[j] = f;
+                        break;
+                    }
+                }
+                if (fifo_win[j] >= 0) break;
+            }
+            if (fifo_win[j] < 0) {
+                rows[j].has_fifo_owner = 0u;
+                rows[j].fifo_owner_seq = 0u;
+            }
         }
     }
 
     p_start = 0;
     while (p_start < np) {
-        int32_t prio = progs[order[p_start]].priority;
+        int64_t prio = progs[order[p_start]].priority;
         int32_t p_end = p_start + 1, nf = 0, guard = 0;
         while (p_end < np && progs[order[p_end]].priority == prio) p_end++;
         for (i = p_start; i < p_end; i++) {
@@ -498,13 +511,22 @@ MSIM_EXPORT int32_t msim_allocate_epoch(void *ctx, double *out_dz, uint32_t npro
             for (j = t_start[f]; j < t_end[f]; j++) {
                 uint32_t r = terms[j].row;
                 if (terms[j].ms_per_z > 0.0) {
-                    if (rows[r].policy == MSIM_ROW_POLICY_FIFO && fifo_win[r] != f) {
+                    if (rows[r].policy == MSIM_ROW_POLICY_FIFO
+                        && fifo_win[r] >= 0 && fifo_win[r] != f) {
                         blocked = true; break;
                     }
                     if (rem_cap[r] <= 0.0) { blocked = true; break; }
                 }
             }
-            if (!blocked) free_list[nf++] = f;
+            if (!blocked) {
+                for (j = t_start[f]; j < t_end[f]; j++) {
+                    uint32_t r = terms[j].row;
+                    if (terms[j].ms_per_z > 0.0 && rows[r].policy == MSIM_ROW_POLICY_FIFO
+                        && fifo_win[r] < 0)
+                        fifo_win[r] = f;
+                }
+                free_list[nf++] = f;
+            }
         }
         while (nf > 0 && guard++ <= np + 1) {
             double delta = INFINITY;
@@ -553,6 +575,14 @@ MSIM_EXPORT int32_t msim_allocate_epoch(void *ctx, double *out_dz, uint32_t npro
             nf = nnf;
         }
         p_start = p_end;
+    }
+
+    for (j = 0; j < nr; j++) {
+        if (rows[j].policy == MSIM_ROW_POLICY_FIFO && !rows[j].has_fifo_owner
+            && fifo_win[j] >= 0 && out_dz[fifo_win[j]] > 0.0) {
+            rows[j].has_fifo_owner = 1u;
+            rows[j].fifo_owner_seq = progs[fifo_win[j]].sequence;
+        }
     }
 
     free(order); free(t_start); free(t_end); free(free_list); free(next_free);
@@ -604,6 +634,31 @@ MSIM_EXPORT int32_t msim_integrate_epoch(
             }
         }
         steps_buf[i] = used;
+    }
+    {
+        msim_capacity_row *rows = (msim_capacity_row *)c->pt_rows;
+        const msim_term *terms = (const msim_term *)c->pt_terms;
+        int32_t r, k;
+        for (r = 0; r < c->pt_nrows; r++) {
+            uint64_t inc_seq;
+            bool still_live = false;
+            if (rows[r].policy != MSIM_ROW_POLICY_FIFO || !rows[r].has_fifo_owner)
+                continue;
+            inc_seq = rows[r].fifo_owner_seq;
+            for (k = 0; k < c->pt_nterms; k++) {
+                uint32_t f = terms[k].flow;
+                if (terms[k].row == (uint32_t)r && terms[k].ms_per_z > 0.0
+                    && f < (uint32_t)np && progs[f].sequence == inc_seq
+                    && progs[f].z_left > 0.0) {
+                    still_live = true;
+                    break;
+                }
+            }
+            if (!still_live) {
+                rows[r].has_fifo_owner = 0u;
+                rows[r].fifo_owner_seq = 0u;
+            }
+        }
     }
     for (i = 0; i < nd; i++) {
         double s = steps_buf[dels[i].flow];
