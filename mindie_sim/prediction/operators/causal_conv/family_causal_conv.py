@@ -13,8 +13,10 @@
 """
 from collections.abc import Mapping
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import (
     ProgramFragment as ProgramFragment, SemanticAttr as SemanticAttr,
     StateEffect as StateEffect,
@@ -38,6 +40,16 @@ from mindie_sim.prediction.operators.kda.kda_state_selection import (
     state_ports as state_ports, state_records as state_records, state_value as state_value,
 )
 from mindie_sim.prediction.program import KernelProgram, Stage
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "vllm_ascend/ops/kimi_kda.py",
+        "af37687463f9b34ca4797bdcefb14c333d3b70b2956d6aa1f15217815d5fbc10",
+    ),
+)
 
 IMPLEMENTATION = CONV
 SOURCE = {
@@ -201,6 +213,8 @@ def _attach_rebase_accesses(b, *, index, view, plan, width, context, target,
             "producer": staging_id, "direction": "write",
             "position": "state", "temporary": True,
             "storage": f"{binding['storage']}:staging",
+            "span": ((0, copy_rows), (0, width)),
+            "window": (0, copy_rows),
             "source": staging_id, "decision": "staging_complete",
             "last_use": "before_rebase_write",
         }
@@ -212,6 +226,10 @@ def _attach_rebase_accesses(b, *, index, view, plan, width, context, target,
                     metadata=staged_op.metadata + (
                         ("state_accesses", staging_accesses),))
                 break
+    rebase_read_span = (
+        ((0, copy_rows), (0, width)) if staged
+        else ((source_offset, source_offset + copy_rows), (0, width))
+    )
     rebase_read = {
         "occurrence": f"{rebase_id}:read:{index}",
         "producer": (staging_id if staged else source_producer),
@@ -224,7 +242,8 @@ def _attach_rebase_accesses(b, *, index, view, plan, width, context, target,
         "owner": layer_target, "representation": "history",
         "persistent": True, "temporary": False,
         "state_version": context,
-        "span": ((source_offset, source_offset + copy_rows), (0, width)),
+        "span": rebase_read_span,
+        "window": (0, copy_rows) if staged else (source_offset, source_offset + copy_rows),
         "bytes": float(copy_bytes),
         "source": (staging_id if staged else source_ready),
         "reader": "", "grant": hold_grant, "decision": None,
@@ -249,8 +268,7 @@ def _attach_rebase_accesses(b, *, index, view, plan, width, context, target,
         "last_use": "before_short_convolution",
     }
     b.ops[-1] = replace(b.ops[-1], metadata=b.ops[-1].metadata + (
-        ("state_accesses", (*staging_accesses, rebase_read)),
-        ("state_accesses_write", (rebase_write,)),
+        ("state_accesses", (rebase_read, rebase_write)),
         ("state_ready", tuple(state_ready)),
         ("reader_hold", hold_event),
         ("grant", hold_grant),
@@ -263,7 +281,7 @@ def _attach_rebase_accesses(b, *, index, view, plan, width, context, target,
 def _rebase_history(b, *, index, view, plan, dtype, history_slots, width, byte,
                     accepted, binding, hold, state_staging, state_ready,
                     context, target, layer_target,
-                    rebase_outputs, rebase_records):
+                    rebase_outputs, rebase_records, op_suffix=""):
     if plan.conv_kernel != CONV_SPECULATIVE_WIDTH:
         raise ModelingError(
             "causal_conv_update_history_rebase_requires_width4")
@@ -291,6 +309,13 @@ def _rebase_history(b, *, index, view, plan, dtype, history_slots, width, byte,
         if end > start:
             protected = (start, end)
     staged = bool(state_staging or (protected and not hold_event))
+    # Backing-scoped copy elision: elide ONLY when (backing_pool, version, byte_span)
+    # are identical in-place; separate staging/destination pools keep physical service.
+    same_backing = (source_view.storage == dest_view.storage) and not staged
+    same_version = (source_view.state_version == dest_view.state_version == context)
+    same_span = (source_offset == 0 and source_view.layout == dest_view.layout)
+    if same_backing and same_version and same_span:
+        return None, ((hold_event,) if hold_event else ())
     copy_bytes = copy_rows * width * byte
     copy_deps = tuple(state_ready)
     if hold_event:
@@ -298,9 +323,10 @@ def _rebase_history(b, *, index, view, plan, dtype, history_slots, width, byte,
     staging_id = None
     staging_value = None
     staging_grant = hold_grant or f"{b.prefix}.rebase_grant"
+    req_name = str(getattr(view, "request_id", index))
     if staged:
         staging_id = b.work(
-            "conv_history_staging", copy_deps, (copy_rows, width),
+            f"conv_history_staging{op_suffix}", copy_deps, (copy_rows, width),
             read=copy_bytes, write=copy_bytes, family="tensor_copy",
             dtype=dtype,
             metadata=(("materialization_reason",
@@ -312,6 +338,7 @@ def _rebase_history(b, *, index, view, plan, dtype, history_slots, width, byte,
                       ("grant", staging_grant),
                       ("temporary", True),
                       ("caller_boundary", "old_reader_may_overlap_destination")))
+        b.ops[-1] = replace(b.ops[-1], requests=(req_name,))
         staging_value = replace(
             source_view, producer=staging_id, output=0,
             storage=f"{binding['storage']}:staging",
@@ -319,7 +346,7 @@ def _rebase_history(b, *, index, view, plan, dtype, history_slots, width, byte,
             binding_name="")
         copy_deps = (staging_id,)
     rebase_id = b.work(
-        "conv_history_rebase", copy_deps, (copy_rows, width),
+        f"conv_history_rebase{op_suffix}", copy_deps, (copy_rows, width),
         read=copy_bytes, write=copy_bytes, family="tensor_copy", dtype=dtype,
         metadata=(("materialization_reason",
                    "committed_history_window_normalize"),
@@ -337,6 +364,7 @@ def _rebase_history(b, *, index, view, plan, dtype, history_slots, width, byte,
                   ("state_dtype", plan.conv_state_dtype),
                   ("caller_boundary", "before_ordinary_q1_update"),
                   ("invocation_class", "vector")))
+    b.ops[-1] = replace(b.ops[-1], requests=(req_name,))
     copy_value = TensorValue(
         rebase_id, plan.conv_state_dtype, dest_view.layout, output=0,
         storage=binding["storage"], alias_of=(source_value.alias_of
@@ -388,7 +416,7 @@ def _rebase_history(b, *, index, view, plan, dtype, history_slots, width, byte,
         "held_rows": hold_window,
         "protected_rows": protected,
     })
-    return rebase_id
+    return rebase_id, ()
 
 
 def _prepare_conv_input(b, tensors, *, sources, tokens, rows, width, key_width,
@@ -493,54 +521,55 @@ def _resolve_conv_targets(views, padding_slots, layer_target, state_targets):
     return tuple(None if index in padded else resolved[index] for index in range(len(views)))
 
 
-def lower(b, tensors, *, plan, views, tokens, sources, key_width, value_width,
-          history_acceptance=None, state_ready=(), state_values=None,
-          state_slots=None, state_grants=(), state_reader_holds=None,
-          state_targets=None, state_staging=False, state_decisions=()):
-    """Bind one native update; the selected recipe owns the state writeback."""
-    if not views:
-        raise ModelingError("causal_conv_update_requires_decode_views")
-    if any(view.phase != "decode" for view in views):
-        raise ModelingError("causal_conv_update_requires_decode_only_views")
+def _is_speculative_view(view) -> bool:
+    return (
+        int(view.q_len) > 1
+        or int(getattr(view, "draft_proposal_tokens", 0) or 0) > 0
+        or int(getattr(view, "draft_advanced_tokens", 0) or 0) > 1
+    )
+
+
+def _slice_partition_arg(value, indices, total_count):
+    if value is None or value == () or value == []:
+        return value
+    if isinstance(value, TensorValue):
+        return value
+    if isinstance(value, Mapping):
+        remapped = {k: v for k, v in value.items() if not isinstance(k, int)}
+        for pos, orig in enumerate(indices):
+            if orig in value:
+                remapped[pos] = value[orig]
+        return remapped
+    seq = tuple(value)
+    if len(seq) == 1 and total_count > 1:
+        return seq
+    if len(seq) == total_count:
+        return tuple(seq[index] for index in indices)
+    return seq
+
+
+def _emit_conv_partition(
+    b, *, plan, views, incoming, adaptation, width, dtype, byte, history_slots,
+    speculative, history_acceptance, state_ready, state_values, slots,
+    state_grants, reader_holds, targets_by_view, state_staging, state_decisions,
+    layer_target, op_name="short_convolution",
+):
     q_lens = tuple(int(view.q_len) for view in views)
-    if any(q < 1 for q in q_lens):
-        raise ModelingError("causal_conv_update_requires_positive_query_rows")
     rows = sum(q_lens)
-    if tokens < rows:
-        raise ModelingError(
-            "causal_conv_update_tokens_must_equal_sequence_partition_rows")
-    width = 2 * key_width + value_width
-    dtype = b.model.activation_dtype
-    byte = dtype_bytes(dtype)
-    history_slots = _history_slots(b.model, plan)
     padding_slots = tuple(index for index, view in enumerate(views)
                           if getattr(view, "padding", False))
     active = tuple(index for index in range(len(views))
                    if index not in set(padding_slots))
-    history_acceptance, speculative = _validate_update_window(
-        b.model, plan, views=views, q_lens=q_lens, active=active, history_slots=history_slots,
-        history_acceptance=history_acceptance)
-    state_ready = ((state_ready,) if isinstance(state_ready, str)
-                   else tuple(state_ready))
-    state_grants = tuple(state_grants) if state_grants else ()
     contexts = tuple(int(getattr(view, "context", 0)) for view in views)
-    layer_target = (f"kda.layer[{plan.index}]" if plan.index >= 0
-                    else "kda.call")
-    targets_by_view = _resolve_conv_targets(views, padding_slots, layer_target, state_targets)
-    slots = _per_sequence(state_slots, len(views))
-    if all(slot is None for slot in slots):
-        slots = tuple(index for index in range(len(views)))
     bindings = _conv_bindings(
         views=views, active=active, targets=targets_by_view,
         contexts=contexts, history_slots=history_slots, width=width,
         dtype=plan.conv_state_dtype, values=state_values, slots=slots,
         owner=layer_target, ready=state_ready, grants=state_grants)
     # A q1 following a speculative q4 has no source numAcceptedTokens branch
-    # for its own one-row query.  The committed window is normalized by an
-    # ordered history copy before the ordinary UPDATE.  In a mixed speculative
-    # call the native branch is selected once for the whole call; every
-    # sequence then applies its own accepted-1 offset exactly once and no
-    # sequence may additionally rebase.
+    # for its own one-row query. The committed window is normalized by an
+    # ordered history copy before the ordinary UPDATE unless backing, version,
+    # and span are already identical in place.
     rebase = tuple(
         index for index in active
         if not speculative and q_lens[index] == 1
@@ -549,15 +578,24 @@ def lower(b, tensors, *, plan, views, tokens, sources, key_width, value_width,
     rebase_records = []
     rebase_outputs = {}
     rebase_ids = ()
-    reader_holds = _per_sequence(state_reader_holds, len(views))
+    elided_deps = ()
     for index in rebase:
-        rebase_id = _rebase_history(
+        req_ready = (
+            (state_ready[index],)
+            if len(state_ready) == len(views)
+            else state_ready
+        )
+        suffix = "" if len(rebase) == 1 else f"_{index}"
+        rebase_id, extra_deps = _rebase_history(
             b, index=index, view=views[index], plan=plan, dtype=dtype, history_slots=history_slots,
             width=width, byte=byte, accepted=history_acceptance[index], binding=bindings[index],
-            hold=reader_holds[index], state_staging=state_staging, state_ready=state_ready,
+            hold=reader_holds[index], state_staging=state_staging, state_ready=req_ready,
             context=contexts[index], target=targets_by_view[index], layer_target=layer_target,
-            rebase_outputs=rebase_outputs, rebase_records=rebase_records)
-        rebase_ids = (*rebase_ids, rebase_id)
+            rebase_outputs=rebase_outputs, rebase_records=rebase_records, op_suffix=suffix)
+        if rebase_id is not None:
+            rebase_ids = (*rebase_ids, rebase_id)
+        if extra_deps:
+            elided_deps = tuple(dict.fromkeys((*elided_deps, *extra_deps)))
     contract, effects, state_read, state_write = _state_contract(
         views=views, q_lens=q_lens, padding_slots=padding_slots, width=width,
         byte=byte, kernel_width=plan.conv_kernel, history_slots=history_slots,
@@ -570,9 +608,6 @@ def lower(b, tensors, *, plan, views, tokens, sources, key_width, value_width,
                 "state_grants": tuple(state_grants),
                 "slots": tuple(slots),
                 "reader_holds": tuple(reader_holds)}
-    incoming, adaptation = _prepare_conv_input(
-        b, tensors, sources=sources, tokens=tokens, rows=rows, width=width, key_width=key_width,
-        value_width=value_width, dtype=dtype, byte=byte)
     num_accepted_values = history_acceptance if speculative else None
     metadata = (
         ("sequence_tokens", q_lens), ("physical_sequence_tokens", q_lens),
@@ -623,12 +658,146 @@ def lower(b, tensors, *, plan, views, tokens, sources, key_width, value_width,
     conv_hbm, conv_reads, conv_writes, conv_vec = conv_spec_terms(
         q_lens, padding_slots, plan.conv_kernel, width, False, speculative,
     )
-    op_id = b.work("short_convolution",
-                   (incoming, *state_ready, *rebase_ids), (rows, width),
+    deps = tuple(dict.fromkeys((incoming, *state_ready, *rebase_ids, *elided_deps)))
+    op_id = b.work(op_name, deps, (rows, width),
                    vector=conv_vec, read=conv_reads, write=conv_writes,
                    family="short_convolution", dtype=dtype, metadata=metadata)
-    op = b.ops[-1]
+    part_requests = tuple(str(getattr(view, "request_id", index))
+                          for index, view in enumerate(views))
+    op = replace(
+        b.ops[-1], hbm_bytes=float(conv_hbm), recipe=CONV,
+        source_boundary="kernel", requests=part_requests,
+    )
     b.ops[-1] = replace(
-        op, hbm_bytes=float(conv_hbm), recipe=CONV, source_boundary="kernel",
-        metadata=op.metadata + (("state_accesses", state_accesses(op)),))
+        op, metadata=op.metadata + (("state_accesses", state_accesses(op)),))
     return op_id
+
+
+def lower(b, tensors, *, plan, views, tokens, sources, key_width, value_width,
+          history_acceptance=None, state_ready=(), state_values=None,
+          state_slots=None, state_grants=(), state_reader_holds=None,
+          state_targets=None, state_staging=False, state_decisions=()):
+    """Bind native decode/verify update(s); split mixed speculative/ordinary batches."""
+    if not views:
+        raise ModelingError("causal_conv_update_requires_decode_views")
+    if any(view.phase != "decode" for view in views):
+        raise ModelingError("causal_conv_update_requires_decode_only_views")
+    q_lens = tuple(int(view.q_len) for view in views)
+    if any(q < 1 for q in q_lens):
+        raise ModelingError("causal_conv_update_requires_positive_query_rows")
+    rows = sum(q_lens)
+    if tokens < rows:
+        raise ModelingError(
+            "causal_conv_update_tokens_must_equal_sequence_partition_rows")
+    width = 2 * key_width + value_width
+    dtype = b.model.activation_dtype
+    byte = dtype_bytes(dtype)
+    history_slots = _history_slots(b.model, plan)
+    padding_slots = tuple(index for index, view in enumerate(views)
+                          if getattr(view, "padding", False))
+    active = tuple(index for index in range(len(views))
+                   if index not in set(padding_slots))
+    history_acceptance, speculative = _validate_update_window(
+        b.model, plan, views=views, q_lens=q_lens, active=active, history_slots=history_slots,
+        history_acceptance=history_acceptance)
+    state_ready = ((state_ready,) if isinstance(state_ready, str)
+                   else tuple(state_ready))
+    state_grants = tuple(state_grants) if state_grants else ()
+    layer_target = (f"kda.layer[{plan.index}]" if plan.index >= 0
+                    else "kda.call")
+    targets_by_view = _resolve_conv_targets(views, padding_slots, layer_target, state_targets)
+    slots = _per_sequence(state_slots, len(views))
+    if all(slot is None for slot in slots):
+        slots = tuple(index for index in range(len(views)))
+    reader_holds = _per_sequence(state_reader_holds, len(views))
+    incoming, adaptation = _prepare_conv_input(
+        b, tensors, sources=sources, tokens=tokens, rows=rows, width=width, key_width=key_width,
+        value_width=value_width, dtype=dtype, byte=byte)
+    spec_indices = tuple(index for index in active if _is_speculative_view(views[index]))
+    ord_indices = tuple(index for index in active if not _is_speculative_view(views[index]))
+    if spec_indices and ord_indices:
+        # Upstream vllm_ascend/ops/kimi_kda.py:709-716 gathers per-partition
+        # QKV rows before launching speculative and ordinary UPDATE separately,
+        # then restores token order.
+        ord_part = tuple(index for index in range(len(views)) if index not in set(spec_indices))
+        total_views = len(views)
+        row_offsets = []
+        cursor = 0
+        for q_len in q_lens:
+            row_offsets.append((cursor, cursor + q_len))
+            cursor += q_len
+
+        def _gather_partition(part_indices, gather_name):
+            part_rows = sum(q_lens[i] for i in part_indices)
+            part_ranges = tuple(row_offsets[i] for i in part_indices)
+            gather_id = b.work(
+                gather_name, (incoming,), (part_rows, width),
+                read=part_rows * width * byte, write=part_rows * width * byte,
+                family="tensor_copy", dtype=dtype,
+                metadata=(
+                    ("materialization_reason", "speculative_ordinary_conv_input_gather"),
+                    ("partition_view_indices", part_indices),
+                    ("partition_row_ranges", part_ranges),
+                    ("invocation_class", "vector"),
+                ),
+            )
+            b.ops[-1] = replace(
+                b.ops[-1],
+                requests=tuple(str(getattr(views[i], "request_id", i)) for i in part_indices),
+            )
+            return gather_id
+
+        spec_in = _gather_partition(spec_indices, "conv_partition_gather_spec")
+        spec_id = _emit_conv_partition(
+            b, plan=plan, views=tuple(views[i] for i in spec_indices),
+            incoming=spec_in, adaptation=adaptation, width=width, dtype=dtype, byte=byte,
+            history_slots=history_slots, speculative=True,
+            history_acceptance=(None if history_acceptance is None
+                                else tuple(history_acceptance[i] for i in spec_indices)),
+            state_ready=_slice_partition_arg(state_ready, spec_indices, total_views),
+            state_values=_slice_partition_arg(state_values, spec_indices, total_views),
+            slots=tuple(slots[i] for i in spec_indices),
+            state_grants=_slice_partition_arg(state_grants, spec_indices, total_views),
+            reader_holds=tuple(reader_holds[i] for i in spec_indices),
+            targets_by_view=tuple(targets_by_view[i] for i in spec_indices),
+            state_staging=state_staging,
+            state_decisions=_slice_partition_arg(state_decisions, spec_indices, total_views),
+            layer_target=layer_target, op_name="short_convolution",
+        )
+        ord_in = _gather_partition(ord_part, "conv_partition_gather_ordinary")
+        ord_id = _emit_conv_partition(
+            b, plan=plan, views=tuple(views[i] for i in ord_part),
+            incoming=ord_in, adaptation=adaptation, width=width, dtype=dtype, byte=byte,
+            history_slots=history_slots, speculative=False,
+            history_acceptance=(None if history_acceptance is None
+                                else tuple(history_acceptance[i] for i in ord_part)),
+            state_ready=_slice_partition_arg(state_ready, ord_part, total_views),
+            state_values=_slice_partition_arg(state_values, ord_part, total_views),
+            slots=tuple(slots[i] for i in ord_part),
+            state_grants=_slice_partition_arg(state_grants, ord_part, total_views),
+            reader_holds=tuple(reader_holds[i] for i in ord_part),
+            targets_by_view=tuple(targets_by_view[i] for i in ord_part),
+            state_staging=state_staging,
+            state_decisions=_slice_partition_arg(state_decisions, ord_part, total_views),
+            layer_target=layer_target, op_name="short_convolution_ordinary",
+        )
+        return b.work(
+            "conv_partition_restore", (spec_id, ord_id), (rows, width),
+            read=rows * width * byte, write=rows * width * byte,
+            family="tensor_copy", dtype=dtype,
+            metadata=(
+                ("materialization_reason", "speculative_ordinary_conv_order_restore"),
+                ("partition_ops", (spec_id, ord_id)),
+                ("invocation_class", "vector"),
+            ),
+        )
+    return _emit_conv_partition(
+        b, plan=plan, views=views, incoming=incoming, adaptation=adaptation,
+        width=width, dtype=dtype, byte=byte, history_slots=history_slots,
+        speculative=speculative, history_acceptance=history_acceptance,
+        state_ready=state_ready, state_values=state_values, slots=slots,
+        state_grants=state_grants, reader_holds=reader_holds,
+        targets_by_view=targets_by_view, state_staging=state_staging,
+        state_decisions=state_decisions, layer_target=layer_target,
+        op_name="short_convolution",
+    )

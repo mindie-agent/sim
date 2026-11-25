@@ -9,13 +9,31 @@
 """
 from dataclasses import replace
 import math
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.engine import Allocation
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.ownership import read_role, unit_group
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.source_program_service import SourceProgramService
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "8c30e4f491f73cba737a1dacc522894e437cdf3d",
+        "vllm_ascend/models/glm5next/ops/causal_conv1d.py",
+        "106311478c25ef1981b95b33b9c4e7fb94fc4856cef53bca6a484ef2cd0061b8",
+    ),
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "vllm_ascend/ops/triton/kda/conv_state.py",
+        "7ec7617ebb078161a26009c0db9b1b947018adf6aa58cb75ad46d0fd2bcbe300",
+    ),
+)
 
 COPY_TILE_ELEMENTS = 256
 COPY_METADATA_LOADS_PER_PROGRAM = 3
@@ -58,7 +76,10 @@ def wrap(b, *, conv, views, width, state_slots=None, cache_index_dtype="int32",
     copy_meta_reads = copy_programs * (
         int(dtype_bytes(cache_index_dtype)) + 2 * int(dtype_bytes(query_start_dtype))
     )
-    copy_payload = requests * state_slots * width * dtype_bytes(dtype)
+    active_requests = tuple(not bool(getattr(view, "padding", False)) for view in views)
+    active_count = sum(active_requests)
+    packed_payload = requests * state_slots * width * dtype_bytes(dtype)
+    active_payload = active_count * state_slots * width * dtype_bytes(dtype)
     copy_idx_write = requests * COPY_TARGET_INDEX_BYTES
     common = (("implementation", IMPLEMENTATION), ("source", SOURCE),
               ("native_kind", "_copy_conv_state_kernel"), ("invocation_class", "vector"),
@@ -67,13 +88,13 @@ def wrap(b, *, conv, views, width, state_slots=None, cache_index_dtype="int32",
               ("state_strides", (1, state_slots)),
               ("cache_indices", "declared_distinct_valid_slot_per_active_request"),
               ("cache_index_dtype", cache_index_dtype), ("query_start_dtype", query_start_dtype),
-              ("active_requests", (True,) * requests),
+              ("active_requests", active_requests),
               ("logical_grid", (requests, copy_columns)))
     if joint_program_service:
         common += (("joint_program_service", joint_program_service),)
     gather = b.work("convolution_state_gather", kernel.deps, (requests, state_slots, width),
-                    read=copy_payload, write=copy_payload + copy_idx_write,
-                    hbm_read=copy_payload + copy_meta_reads,
+                    read=active_payload, write=packed_payload + copy_idx_write,
+                    hbm_read=active_payload + copy_meta_reads,
                     family="conv_state_copy", dtype=dtype,
                     metadata=common + (("direction", "gather"),))
     b.ops[-1] = replace(b.ops[-1], recipe=IMPLEMENTATION, source_boundary="kernel")
@@ -84,8 +105,8 @@ def wrap(b, *, conv, views, width, state_slots=None, cache_index_dtype="int32",
                   metadata=(("caller", SOURCE), ("reason", "torch.zeros_like(x)"),
                             ("invocation_class", "vector")))
     scatter = b.work("convolution_state_scatter", (conv,), (requests, state_slots, width),
-                     read=copy_payload, write=copy_payload,
-                     hbm_read=copy_payload + copy_meta_reads,
+                     read=packed_payload, write=active_payload,
+                     hbm_read=packed_payload + copy_meta_reads,
                      family="conv_state_copy", dtype=dtype,
                      metadata=common + (("direction", "scatter"),
                                         ("passthrough_result", conv)))

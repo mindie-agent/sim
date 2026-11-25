@@ -8,11 +8,12 @@
 [Side-Effect Policy] Returns records/programs; no hardware contexts or captures.
 """
 from collections import defaultdict
-from typing import Mapping
+from typing import Literal, Mapping
 from dataclasses import replace
 import heapq
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 
 from mindie_sim.prediction.fusion_regions import resolve_subgraph_groups
@@ -25,6 +26,28 @@ from .native_fusion_boundary import (
 )
 from .native_fusion_traffic import apply_traffic_profile
 from mindie_sim.prediction.program import KernelProgram, RecipeBook, Stage, TransferRecipe
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "csrc/moe/hc_pre/op_host/hc_pre_tiling.cpp",
+        "29bd7606b274d6a9289ce02b6e6cc03ff947c3a163850263cfea622b53b5d26c",
+    ),
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "csrc/moe/hc_post/op_kernel/hc_post.cpp",
+        "c735e1e4534bc2d701fbd06636e42082567c81ea3f0ed24e4e10b9a71867eda4",
+    ),
+    SourceRef(
+        "cann/ops-transformer",
+        "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "attention/mla_prolog_v3/op_kernel/mla_prolog_v3.cpp",
+        "d3c82f11d11de218b21687efa80ab20e64a9038d06da8e42061b7ec02a66f0cb",
+    ),
+)
 
 
 RECIPE = "declared_native_fusion"
@@ -115,10 +138,36 @@ def _phase_op(record):
     return OpSpec(**value)
 
 
+def _require_profile_arch(op, geometry) -> None:
+    from .family_hc import ALLOWED_ARCHS as HC_ARCHS, POST_PROFILE, PRE_PROFILE
+    from .native_fusion_mla_membase import ALLOWED_ARCHS as MLA_ARCHS, PROFILE as MLA_PROFILE
+
+    metadata = dict(op.metadata)
+    profile = metadata.get("fusion_boundary", {}).get("traffic_profile")
+    allowed = {
+        PRE_PROFILE: HC_ARCHS,
+        POST_PROFILE: HC_ARCHS,
+        MLA_PROFILE: MLA_ARCHS,
+    }.get(profile)
+    if allowed is None:
+        return
+    dp_arch = getattr(getattr(geometry, "datapath", None), "compute_arch", None)
+    compute_arch = dp_arch or getattr(geometry, "compute_arch", None)
+    arch_id = str(
+        getattr(compute_arch, "arch_id", "")
+        or getattr(compute_arch, "preset", "")
+        or ""
+    ).strip().lower()
+    if arch_id and arch_id not in allowed:
+        raise ModelingError(f"{profile}_unsupported_arch:{arch_id}")
+
+
 def build(op, geometry):
     from mindie_sim.prediction.mechanism import PlannedRecipe
     from .family_hc import selected_plan
     from .native_fusion_mla_membase import selected_plan as selected_mla_membase
+
+    _require_profile_arch(op, geometry)
 
     from .native_fusion_hc_regbase import selected_plan as selected_hc_regbase
     selected = selected_hc_regbase(op, geometry)
@@ -257,7 +306,7 @@ def _lower_program_profile(
     metadata["fusion_boundary"] = boundary
     fused = total.apply(replace(
         anchor, op_id=op_id, family="native_fusion", recipe=fused_recipe,
-        deps=inputs, metadata=tuple(metadata.items()), matrix_flops=(),
+        deps=inputs, metadata=tuple(metadata.items()), flops=0.0, matrix_flops=(),
         source_boundary="kernel", coverage=coverage,
         returns=external["returns"]))
     origin_ports = tuple(
@@ -374,6 +423,7 @@ def _lower_traffic_profile(
     fused = total.apply(replace(
         anchor, op_id=op_id, family="native_fusion", recipe=RECIPE,
         deps=inputs, metadata=tuple(metadata.items()),
+        flops=float(sum(total.matrix.values())),
         matrix_flops=tuple(sorted(total.matrix.items())),
         source_boundary="kernel", coverage="declared_native_resource_phases",
         returns=external["returns"]))
