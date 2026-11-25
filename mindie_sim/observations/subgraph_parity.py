@@ -26,11 +26,11 @@
 from __future__ import annotations
 
 import argparse
-from array import array
 from bisect import bisect_left
 from collections import deque
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+from decimal import Decimal, ROUND_HALF_EVEN
 import hashlib
 import json
 from pathlib import Path
@@ -60,12 +60,44 @@ _NPU_COMPUTE_TASK_TYPES: frozenset[str] = REAL_NPU_TASK_TYPES - {"COMMUNICATION"
 AI_CPU_TASK_TYPE = "AI_CPU"
 DEFAULT_MIN_ATTRIBUTION_RATE = 1.0
 PROXIMITY_AMBIGUITY_WINDOW_US = 5.0
+_NS_PER_US_INT = 1000
+_NS_PER_US = Decimal(_NS_PER_US_INT)
+_PROXIMITY_AMBIGUITY_WINDOW_NS = int(PROXIMITY_AMBIGUITY_WINDOW_US * _NS_PER_US_INT)
 _STREAM_CHUNK_BYTES = 1024 * 1024
 _MAX_SINGLE_EVENT_BYTES = 8 * 1024 * 1024
 _MAX_SKIP_DEPTH = 128
-_TIMESTAMP_EPS_US = 1e-6
 _MAX_REPORTED_SAMPLES = 64
 _STREAM_WINDOW_FLUSH = 256
+_GDN_CHUNK_SIZE = 64
+_GDN_PREPARE_ARITY = 7
+_RANK_3D = 3
+_RANK_4D = 4
+_NZ_R0 = 16
+_NZ_C0_1B = 32
+_NZ_C0_2B = 16
+_GROUPED_MATMUL_FIXED_SLOTS = 8
+_GROUPED_MATMUL_BIAS_SLOT = 2
+_GROUPED_MATMUL_WEIGHT_SCALE_SLOT = 3
+_GROUPED_MATMUL_GROUP_LIST_SLOT = 7
+_ONE_BYTE_DTYPES: frozenset[str] = frozenset({
+    "int8", "uint8", "s8", "u8", "fp8", "fp8_e4m3", "fp8_e4m3fn", "fp8_e5m2", "hif8", "hifloat8", "mxfp8",
+})
+_GEMM_OP_FAMILIES: frozenset[str] = frozenset({
+    "qkv_projection",
+    "output_projection",
+    "gate_up_projection",
+    "down_projection",
+    "dense_gemm",
+    "gemm",
+    "grouped_gemm",
+    "linear",
+    "router",
+})
+_GDN_EXPANSION_KERNELS: tuple[str, str, str] = (
+    "ChunkGatedDeltaRuleFwdPrepare",
+    "ChunkFwdH",
+    "ChunkFwdO",
+)
 _FLOW_CATEGORIES: frozenset[str] = frozenset({"hosttodevice", "async_npu", "torch_to_npu", "flow"})
 _KERNEL_CATEGORIES: frozenset[str] = frozenset({"kernel", "device_kernel", "hccl", "npu_kernel"})
 _ACLGRAPH_CATEGORIES: frozenset[str] = frozenset({"aclgraph_capture", "graph_node", "hosttodevice(graph)"})
@@ -126,6 +158,8 @@ class ObservedKernelNode:
     collective_group: str = ""
     comm_ranks: tuple[int, ...] = ()
     count: int = 1
+    start_ns: int | None = None
+    dur_ns: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +201,7 @@ class PredictedKernelNode:
     is_ai_cpu_metadata: bool = False
     min_count: int = 1
     max_count: int | None = None
+    expected_input_shapes: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,9 +362,59 @@ def _intern(text: str) -> str:
     return sys.intern(text) if text else ""
 
 
+def _parse_us_to_ns(value: Any) -> int | None:
+    """Convert microsecond capture timestamp/duration to exact integer nanoseconds."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, Decimal):
+        dec = value
+    elif isinstance(value, int):
+        dec = Decimal(value)
+    elif isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return None
+        dec = Decimal(stripped)
+    else:
+        dec = Decimal(str(value))
+    return int((dec * _NS_PER_US).to_integral_value(rounding=ROUND_HALF_EVEN))
+
+
+def _node_time_bounds_ns(
+    node: ObservedKernelNode,
+    *,
+    dag_has_timing: bool = False,
+) -> tuple[int, int] | None:
+    """Return ``(start_ns, end_ns)`` when timing was recorded, else ``None``."""
+    if node.start_ns is not None:
+        dur_ns = max(0, node.dur_ns) if node.dur_ns is not None else max(0, _parse_us_to_ns(node.dur_us) or 0)
+        return node.start_ns, node.start_ns + dur_ns
+    if dag_has_timing or node.start_us != 0.0 or node.dur_us != 0.0:
+        start_ns = _parse_us_to_ns(node.start_us) or 0
+        dur_ns = max(0, _parse_us_to_ns(node.dur_us) or 0)
+        return start_ns, start_ns + dur_ns
+    return None
+
+
+def _dag_has_timing(obs_dag: ObservedRankDAG) -> bool:
+    if obs_dag.is_offline_summary:
+        return False
+    return any(
+        n.start_ns is not None or n.start_us != 0.0 or n.dur_us != 0.0
+        for n in obs_dag.nodes
+    )
+
+
+def _format_ns_as_us(ns: int) -> str:
+    """Format exact integer nanoseconds as microsecond string with 3 fractional digits."""
+    sign = "-" if ns < 0 else ""
+    whole, frac = divmod(abs(ns), _NS_PER_US_INT)
+    return f"{sign}{whole}.{frac:03d}"
+
+
 @dataclass(frozen=True, slots=True)
 class _FlowRecord:
-    ts: float
+    ts_ns: int | None
     cann_api: str
     cpu_op: str
     vllm_scope: str
@@ -345,6 +430,8 @@ class _RawDeviceLaunch:
     gid: str
     ts: float
     dur: float
+    ts_ns: int | None
+    dur_ns: int | None
     cann_api: str
     cpu_op: str
     vllm_scope: str
@@ -358,7 +445,7 @@ class _RawDeviceLaunch:
 def _extract_host_record(ev: Mapping[str, Any], *, explicit_stream: str = "") -> _FlowRecord:
     args = ev.get("args") if isinstance(ev.get("args"), Mapping) else {}
     return _FlowRecord(
-        ts=float(ev.get("ts", 0.0)),
+        ts_ns=_parse_us_to_ns(ev.get("ts")),
         cann_api=_intern(str(args.get("cann_api", ev.get("name", ""))).strip()),
         cpu_op=_intern(str(args.get("cpu_op", "")).strip()),
         vllm_scope=_intern(str(args.get("vllm_scope", "")).strip()),
@@ -378,14 +465,22 @@ def _extract_device_launch(ev: Mapping[str, Any]) -> _RawDeviceLaunch:
         else ()
     )
     lane = _intern(str(args.get("stream_lane", "")).strip() or _infer_stream_lane(stream_id, kernel, task_type))
+    raw_ts = ev.get("ts")
+    raw_dur = ev.get("dur")
+    ts_ns = _parse_us_to_ns(raw_ts)
+    dur_ns = _parse_us_to_ns(raw_dur)
+    if ts_ns is not None and dur_ns is None:
+        dur_ns = 0
     return _RawDeviceLaunch(
         kernel=kernel,
         stream_id=stream_id,
         task_type=task_type,
         fid=str(args.get("flow_id", ev.get("flow_id", ""))).strip(),
         gid=str(args.get("graph_node_id", "")).strip(),
-        ts=float(ev.get("ts", 0.0)),
-        dur=float(ev.get("dur", 0.0)),
+        ts=float(raw_ts) if ts_ns is not None else 0.0,
+        dur=float(raw_dur) if raw_dur is not None and dur_ns is not None else 0.0,
+        ts_ns=ts_ns,
+        dur_ns=dur_ns,
         cann_api=_intern(str(args.get("cann_api", "")).strip()),
         cpu_op=_intern(str(args.get("cpu_op", "")).strip()),
         vllm_scope=_intern(str(args.get("vllm_scope", "")).strip()),
@@ -404,11 +499,11 @@ def _is_device_kernel_event(ev: Mapping[str, Any], cat: str, args: Mapping[str, 
     return tt in (REAL_NPU_TASK_TYPES | {AI_CPU_TASK_TYPE})
 
 
-def _near_sorted_ts(sorted_ts: array, target: float, window: float) -> bool:
-    if not sorted_ts:
+def _near_sorted_ns(sorted_ns: Sequence[int], target: int, window_ns: int) -> bool:
+    if not sorted_ns:
         return False
-    idx = bisect_left(sorted_ts, target - window)
-    return idx < len(sorted_ts) and sorted_ts[idx] <= target + window
+    idx = bisect_left(sorted_ns, target - window_ns)
+    return idx < len(sorted_ns) and sorted_ns[idx] <= target + window_ns
 
 
 class _CausalFlowState:
@@ -418,7 +513,7 @@ class _CausalFlowState:
         "rank_id", "exec_mode", "stream_flows", "unbound_flows", "unbound_tid",
         "finish_by_ts", "finish_by_id", "graph_nodes",
         "consumed_flows", "_consumed_ring", "_max_consumed_ring",
-        "host_ts", "host_sorted",
+        "host_ts_ns", "host_sorted",
     )
 
     def __init__(self, rank_id: int, exec_mode: ExecModeKind, *, max_consumed_ring: int = 0) -> None:
@@ -430,16 +525,16 @@ class _CausalFlowState:
         self.unbound_flows: dict[str, _FlowRecord | None] = {}
         # fid -> host tid recorded alongside unbound Chrome 's' so completion reclaims stream_flows
         self.unbound_tid: dict[str, str] = {}
-        # (stream_id, ts) -> fid or None (Chrome 'f' endpoint; duplicate poisoned)
-        self.finish_by_ts: dict[tuple[str, float], str | None] = {}
-        # (stream_id, fid) -> dest_ts or None (Chrome 'f' endpoint)
-        self.finish_by_id: dict[tuple[str, str], float | None] = {}
+        # (stream_id, ts_ns) -> fid or None (Chrome 'f' endpoint; duplicate poisoned)
+        self.finish_by_ts: dict[tuple[str, int], str | None] = {}
+        # (stream_id, fid) -> dest_ts_ns or None (Chrome 'f' endpoint)
+        self.finish_by_id: dict[tuple[str, str], int | None] = {}
         # (stream_id, gid) -> _FlowRecord or None (used ONLY when exec_mode == "aclgraph")
         self.graph_nodes: dict[tuple[str, str], _FlowRecord | None] = {}
         self.consumed_flows: set[tuple[str, str]] = set()
         self._consumed_ring: deque[tuple[str, str]] = deque()
         self._max_consumed_ring = max(0, int(max_consumed_ring))
-        self.host_ts: array = array("d")
+        self.host_ts_ns: list[int] = []
         self.host_sorted: bool = True
 
     def _mark_consumed(self, fkey: tuple[str, str]) -> None:
@@ -481,13 +576,13 @@ class _CausalFlowState:
         elif ph == "f" and cat in _FLOW_CATEGORIES:
             fid = str(ev.get("id", "")).strip()
             dest_sid = _intern(str(args.get("stream_id", ev.get("tid", ""))).strip())
-            dest_ts = float(ev.get("ts", 0.0))
-            if not fid or not dest_sid:
+            dest_ts_ns = _parse_us_to_ns(ev.get("ts"))
+            if not fid or not dest_sid or dest_ts_ns is None:
                 return
-            ts_key = (dest_sid, dest_ts)
+            ts_key = (dest_sid, dest_ts_ns)
             self.finish_by_ts[ts_key] = None if ts_key in self.finish_by_ts else fid
             id_key = (dest_sid, fid)
-            self.finish_by_id[id_key] = None if id_key in self.finish_by_id else dest_ts
+            self.finish_by_id[id_key] = None if id_key in self.finish_by_id else dest_ts_ns
         elif ph == "X" and cat in _ACLGRAPH_CATEGORIES and self.exec_mode == "aclgraph":
             gid = str(args.get("graph_node_id", ev.get("id", ""))).strip()
             sid = _intern(str(args.get("stream_id", ev.get("tid", "0"))).strip())
@@ -495,10 +590,11 @@ class _CausalFlowState:
                 gkey = (sid, gid)
                 self.graph_nodes[gkey] = None if gkey in self.graph_nodes else _extract_host_record(ev, explicit_stream=sid)
         elif ph == "X" and cat in _HOST_OP_CATEGORIES:
-            ts = float(ev.get("ts", 0.0))
-            if self.host_ts and ts < self.host_ts[-1]:
-                self.host_sorted = False
-            self.host_ts.append(ts)
+            ts_ns = _parse_us_to_ns(ev.get("ts"))
+            if ts_ns is not None:
+                if self.host_ts_ns and ts_ns < self.host_ts_ns[-1]:
+                    self.host_sorted = False
+                self.host_ts_ns.append(ts_ns)
 
     def _resolve_flow(self, dev: _RawDeviceLaunch) -> tuple[_FlowRecord | None, str, bool]:
         """Return ``(matched_record, resolved_fid, saw_ambiguous_or_invalid_flow)``."""
@@ -512,24 +608,26 @@ class _CausalFlowState:
             if rec is None and fkey in self.stream_flows:
                 return None, dev.fid, True
             if fkey in self.finish_by_id:
-                f_ts = self.finish_by_id.pop(fkey)
-                if f_ts is None or abs(f_ts - dev.ts) > _TIMESTAMP_EPS_US:
+                f_ts_ns = self.finish_by_id.pop(fkey)
+                if f_ts_ns is None or dev.ts_ns is None or f_ts_ns != dev.ts_ns:
                     return None, dev.fid, True
-                self.finish_by_ts.pop((sid, f_ts), None)
+                self.finish_by_ts.pop((sid, f_ts_ns), None)
                 if rec is None:
                     u_rec = self.unbound_flows.get(dev.fid)
                     if u_rec is None:
                         return None, dev.fid, True
                     rec = u_rec
             if rec is not None:
-                if rec.ts > dev.ts + _TIMESTAMP_EPS_US:
+                if rec.ts_ns is not None and dev.ts_ns is not None and rec.ts_ns > dev.ts_ns:
                     return None, dev.fid, True
                 self._reclaim_flow(fkey, dev.fid)
                 return rec, dev.fid, False
             return None, dev.fid, False
 
-        # Path B: standard Chrome 's' -> 'f' ending on (dev.stream_id, dev.ts).
-        ts_key = (sid, dev.ts)
+        # Path B: standard Chrome 's' -> 'f' ending on (dev.stream_id, dev.ts_ns).
+        if dev.ts_ns is None:
+            return None, "", False
+        ts_key = (sid, dev.ts_ns)
         if ts_key not in self.finish_by_ts:
             return None, "", False
         fid = self.finish_by_ts.pop(ts_key)
@@ -547,7 +645,7 @@ class _CausalFlowState:
             rec = self.unbound_flows.get(fid)
             if rec is None:
                 return None, fid, True
-        if rec.ts > dev.ts + _TIMESTAMP_EPS_US:
+        if rec.ts_ns is not None and rec.ts_ns > dev.ts_ns:
             return None, fid, True
         self._reclaim_flow(fkey, fid)
         return rec, fid, False
@@ -582,9 +680,9 @@ class _CausalFlowState:
         if invalid_flow:
             return "ambiguous_proximity", resolved_fid, cann_api, cpu_op, scope
         if not self.host_sorted:
-            self.host_ts = array("d", sorted(self.host_ts))
+            self.host_ts_ns.sort()
             self.host_sorted = True
-        if _near_sorted_ts(self.host_ts, dev.ts, PROXIMITY_AMBIGUITY_WINDOW_US):
+        if dev.ts_ns is not None and _near_sorted_ns(self.host_ts_ns, dev.ts_ns, _PROXIMITY_AMBIGUITY_WINDOW_NS):
             return "ambiguous_proximity", resolved_fid, cann_api, cpu_op, scope
         return "unattributed", resolved_fid, cann_api, cpu_op, scope
 
@@ -621,7 +719,7 @@ def correlate_trace_view_events(
         else:
             state.ingest_non_kernel(ev, ph, cat, args)
 
-    device_launches.sort(key=lambda item: (item.ts, item.kernel))
+    device_launches.sort(key=lambda item: (item.ts_ns is None, item.ts_ns or 0))
     nodes: list[ObservedKernelNode] = []
     ambiguous: list[str] = []
     unattributed: list[str] = []
@@ -667,6 +765,8 @@ def correlate_trace_view_events(
             collective_group=dev.collective_group,
             comm_ranks=dev.comm_ranks,
             count=1,
+            start_ns=dev.ts_ns,
+            dur_ns=dev.dur_ns,
         ))
     device_launches.clear()
 
@@ -702,12 +802,134 @@ def _node_matches_kernel(obs: ObservedKernelNode, expected_tokens: tuple[str, ..
     return any(_token_matches_node(obs, tok) for tok in expected_tokens)
 
 
+def _parse_operand_shapes(text: str) -> tuple[tuple[int, ...], ...] | None:
+    """Parse profiler/predicted semicolon-separated operand shapes into normalized int tuples."""
+    cleaned = str(text or "").strip().strip('"').strip("'").strip()
+    if not cleaned or cleaned.upper() == "N/A":
+        return None
+    operands: list[tuple[int, ...]] = []
+    for raw_slot in cleaned.split(";"):
+        slot = raw_slot.strip().strip("()[]").strip()
+        if not slot:
+            operands.append(())
+            continue
+        dims: list[int] = []
+        for token in slot.split(","):
+            tok = token.strip()
+            if not tok:
+                continue
+            try:
+                dims.append(int(tok))
+            except ValueError:
+                return None
+        operands.append(tuple(dims))
+    return tuple(operands) if operands else None
+
+
+def _format_operand_shapes(operands: Sequence[Sequence[int]]) -> str:
+    return ";".join(",".join(str(int(d)) for d in shp) for shp in operands)
+
+
+def _shapes_match(expected: str, observed: str) -> bool:
+    exp_clean = str(expected or "").strip().strip('"').strip("'").strip()
+    obs_clean = str(observed or "").strip().strip('"').strip("'").strip()
+    if not exp_clean or not obs_clean or obs_clean.upper() == "N/A":
+        return False
+    exp_parsed = _parse_operand_shapes(exp_clean)
+    obs_parsed = _parse_operand_shapes(obs_clean)
+    if exp_parsed is not None and obs_parsed is not None:
+        return exp_parsed == obs_parsed
+    return exp_clean == obs_clean
+
+
+def _derive_expansion_stage_shapes(
+    expected_kernels: tuple[str, ...],
+    entry_shapes: str,
+) -> tuple[str, ...]:
+    """Derive per-stage operand shape descriptors for known multi-kernel expansions."""
+    if expected_kernels == _PAD_MULTI_KERNEL:
+        return ("", entry_shapes)
+    if expected_kernels == _GDN_EXPANSION_KERNELS:
+        parsed = _parse_operand_shapes(entry_shapes)
+        if parsed is not None and len(parsed) == _GDN_PREPARE_ARITY:
+            q, k, v, g, beta, cu_seq, chunk_idx = parsed
+            if (
+                len(q) == _RANK_4D
+                and len(k) == _RANK_4D
+                and len(v) == _RANK_4D
+                and len(g) == _RANK_3D
+                and len(beta) == _RANK_3D
+            ):
+                b_dim, _, t_dim, k_dim = q
+                hv_dim, v_dim = v[1], v[_RANK_3D]
+                seq_num = (
+                    cu_seq[0] - 1
+                    if len(cu_seq) == 1 and cu_seq[0] > 1
+                    else b_dim
+                )
+                num_chunks = (
+                    chunk_idx[0] // 2
+                    if len(chunk_idx) == 1 and chunk_idx[0] > 0 and chunk_idx[0] % 2 == 0
+                    else (t_dim + _GDN_CHUNK_SIZE - 1) // _GDN_CHUNK_SIZE
+                )
+                stage_h = _format_operand_shapes((
+                    k,
+                    (b_dim, hv_dim, t_dim, k_dim),
+                    (b_dim, hv_dim, t_dim, v_dim),
+                    g,
+                    (seq_num, hv_dim, k_dim, v_dim),
+                    cu_seq,
+                    chunk_idx,
+                ))
+                stage_o = _format_operand_shapes((
+                    q,
+                    k,
+                    (b_dim, hv_dim, t_dim, v_dim),
+                    (b_dim, hv_dim, num_chunks, k_dim, v_dim),
+                    g,
+                    cu_seq,
+                    chunk_idx,
+                ))
+                return (entry_shapes, stage_h, stage_o)
+    return (entry_shapes,) + ("",) * (len(expected_kernels) - 1)
+
+
+def _resolve_stage_expected_shapes(
+    pred: PredictedKernelNode,
+    expected_kernels: tuple[str, ...],
+) -> tuple[str, ...]:
+    stage_count = len(expected_kernels)
+    if pred.expected_input_shapes:
+        return tuple(
+            pred.expected_input_shapes[i] if i < len(pred.expected_input_shapes) else ""
+            for i in range(stage_count)
+        )
+    if not pred.input_shapes:
+        return ("",) * stage_count
+    if stage_count == 1:
+        return (pred.input_shapes,)
+    return _derive_expansion_stage_shapes(expected_kernels, pred.input_shapes)
+
+
+def _offline_unknown_task_budget(obs_dag: ObservedRankDAG) -> dict[str, int] | None:
+    """Compute remaining per-task-type capacity for offline ``UNKNOWN`` rows from ``task_type_counts``."""
+    if not obs_dag.is_offline_summary or not obs_dag.task_type_counts:
+        return None
+    budget = {_normalize_task_type(k): int(v) for k, v in obs_dag.task_type_counts}
+    for node in obs_dag.nodes:
+        tt = _normalize_task_type(node.task_type)
+        if tt != "UNKNOWN" and tt in budget:
+            budget[tt] = max(0, budget[tt] - max(0, int(node.count)))
+    return budget
+
+
 def _task_type_compatible(
     pred: PredictedKernelNode,
     obs: ObservedKernelNode,
     *,
     expected_override: str = "",
-    allow_multi_compute_fallback: bool = False,
+    is_offline_summary: bool = False,
+    unknown_task_budget: Mapping[str, int] | None = None,
 ) -> bool:
     expected = _normalize_task_type(expected_override or pred.task_type) if (expected_override or pred.task_type) else ""
     observed = _normalize_task_type(obs.task_type)
@@ -719,8 +941,10 @@ def _task_type_compatible(
         return observed in REAL_NPU_TASK_TYPES
     if observed == expected:
         return True
-    if allow_multi_compute_fallback and expected in _NPU_COMPUTE_TASK_TYPES:
-        return observed in _NPU_COMPUTE_TASK_TYPES
+    if is_offline_summary and observed == "UNKNOWN" and expected in REAL_NPU_TASK_TYPES:
+        if unknown_task_budget is not None:
+            return unknown_task_budget.get(expected, 0) > 0
+        return True
     return False
 
 
@@ -741,154 +965,347 @@ def _expected_expansion_for(
     return exp if exp else (pred.api_or_symbol,)
 
 
+def _stage_attrs_strict_ok(
+    pred: PredictedKernelNode,
+    node: ObservedKernelNode,
+    exp_shape: str,
+    *,
+    is_offline_summary: bool,
+) -> bool:
+    if pred.stream_lane and node.stream_lane != pred.stream_lane:
+        return False
+    if pred.vllm_scope and not is_offline_summary and node.vllm_scope != pred.vllm_scope:
+        return False
+    if exp_shape:
+        has_obs_shape = bool(node.input_shapes and node.input_shapes != "N/A")
+        if is_offline_summary:
+            if has_obs_shape and not _shapes_match(exp_shape, node.input_shapes):
+                return False
+        elif not _shapes_match(exp_shape, node.input_shapes):
+            return False
+    return True
+
+
 def _candidate_preference_key(
     pred: PredictedKernelNode,
     item: tuple[int, ObservedKernelNode],
-) -> tuple[int, int, int]:
-    """Prefer exact ``vllm_scope`` and ``input_shapes`` matches before earliest trace index."""
+    exp_shape: str = "",
+) -> tuple[int, int, int, int]:
+    """Prefer exact ``vllm_scope``, normalized ``input_shapes``, and ``stream_lane`` before earliest pos."""
     pos, node = item
     scope_miss = 0 if (pred.vllm_scope and node.vllm_scope and node.vllm_scope == pred.vllm_scope) else (
         1 if (pred.vllm_scope and node.vllm_scope) else 0
     )
+    target_shape = exp_shape or pred.input_shapes
+    has_obs_shape = bool(node.input_shapes and node.input_shapes != "N/A")
     shape_miss = 0 if (
-        pred.input_shapes
-        and node.input_shapes
-        and node.input_shapes != "N/A"
-        and node.input_shapes == pred.input_shapes
-    ) else (
-        1 if (pred.input_shapes and node.input_shapes and node.input_shapes != "N/A") else 0
-    )
-    return (scope_miss, shape_miss, pos)
+        target_shape and has_obs_shape and _shapes_match(target_shape, node.input_shapes)
+    ) else (1 if (target_shape and has_obs_shape) else 0)
+    lane_miss = 0 if (not pred.stream_lane or node.stream_lane == pred.stream_lane) else 1
+    return (scope_miss, shape_miss, lane_miss, pos)
 
 
-def _consume_matching_occurrences(
+def _match_live_multi_from_anchor(
     pred: PredictedKernelNode,
     expected_kernels: tuple[str, ...],
+    stage_expected: tuple[str, ...],
+    scoped_pool: Sequence[tuple[int, ObservedKernelNode]],
+    anchor: tuple[int, ObservedKernelNode],
+    remaining_counts: Mapping[int, int],
+    *,
+    dag_has_timing: bool,
+    strict_attrs: bool,
+) -> tuple[tuple[tuple[int, ObservedKernelNode], ...] | None, list[tuple[int, ObservedKernelNode]]]:
+    a_pos, a_node = anchor
+    first_tok = expected_kernels[0]
+    first_tok_unique = first_tok not in expected_kernels[1:]
+    ordered_picks: list[tuple[int, ObservedKernelNode]] = [(a_pos, a_node)]
+    cursor = a_pos
+    used_pos: set[int] = {a_pos}
+    a_bounds = _node_time_bounds_ns(a_node, dag_has_timing=dag_has_timing)
+    prev_end_ns: int | None = a_bounds[1] if a_bounds is not None else None
+    for sub_idx in range(1, len(expected_kernels)):
+        tok = expected_kernels[sub_idx]
+        exp_tt = _subkernel_task_type(pred, sub_idx)
+        exp_shape = stage_expected[sub_idx] if sub_idx < len(stage_expected) else ""
+        found: tuple[int, ObservedKernelNode, tuple[int, int] | None] | None = None
+        for pos, node in scoped_pool:
+            if pos <= cursor or pos in used_pos or remaining_counts.get(pos, 0) <= 0:
+                continue
+            if node.stream_id != a_node.stream_id or node.vllm_scope != a_node.vllm_scope:
+                continue
+            if strict_attrs and first_tok_unique and _token_matches_node(node, first_tok):
+                break
+            bounds = _node_time_bounds_ns(node, dag_has_timing=dag_has_timing)
+            if prev_end_ns is not None and bounds is not None and bounds[0] < prev_end_ns:
+                continue
+            if not (_token_matches_node(node, tok) and _task_type_compatible(
+                pred, node, expected_override=exp_tt, is_offline_summary=False,
+            )):
+                continue
+            if strict_attrs and not _stage_attrs_strict_ok(
+                pred, node, exp_shape, is_offline_summary=False,
+            ):
+                continue
+            found = (pos, node, bounds)
+            break
+        if found is None:
+            return None, ordered_picks
+        f_pos, f_node, f_bounds = found
+        ordered_picks.append((f_pos, f_node))
+        cursor = f_pos
+        used_pos.add(f_pos)
+        if f_bounds is not None:
+            prev_end_ns = f_bounds[1]
+    return tuple(ordered_picks), ordered_picks
+
+
+def _try_consume_one_live_multi(
+    pred: PredictedKernelNode,
+    expected_kernels: tuple[str, ...],
+    stage_expected: tuple[str, ...],
     obs_dag: ObservedRankDAG,
     remaining_counts: dict[int, int],
-) -> tuple[list[tuple[int, ObservedKernelNode]], int, bool]:
-    """Consume observed occurrences 1:1 with strict task_type and ordered multi-kernel expansion.
+    *,
+    dag_has_timing: bool,
+    strict_attrs: bool,
+) -> tuple[tuple[tuple[int, ObservedKernelNode], ...] | None, list[tuple[int, ObservedKernelNode]]]:
+    """Consume one complete ordered, same-call, non-overlapping live multi-kernel invocation."""
+    scoped_pool = [
+        (pos, node)
+        for pos, node in enumerate(obs_dag.nodes)
+        if remaining_counts.get(pos, 0) > 0 and _node_matches_kernel(node, expected_kernels)
+    ]
+    if pred.vllm_scope and any(n.vllm_scope == pred.vllm_scope for _, n in scoped_pool):
+        scoped_pool = [(pos, n) for pos, n in scoped_pool if n.vllm_scope == pred.vllm_scope]
+    first_tok = expected_kernels[0]
+    first_tt = _subkernel_task_type(pred, 0)
+    first_shape = stage_expected[0] if stage_expected else ""
+    best_partial: list[tuple[int, ObservedKernelNode]] = []
+    for pos, node in scoped_pool:
+        if not (_token_matches_node(node, first_tok) and _task_type_compatible(
+            pred, node, expected_override=first_tt, is_offline_summary=False,
+        )):
+            continue
+        if strict_attrs and not _stage_attrs_strict_ok(
+            pred, node, first_shape, is_offline_summary=False,
+        ):
+            continue
+        matched, partial = _match_live_multi_from_anchor(
+            pred, expected_kernels, stage_expected, scoped_pool, (pos, node),
+            remaining_counts, dag_has_timing=dag_has_timing, strict_attrs=strict_attrs,
+        )
+        if matched is not None:
+            for m_pos, _ in matched:
+                remaining_counts[m_pos] -= 1
+            return matched, list(matched)
+        if len(partial) > len(best_partial):
+            best_partial = partial
+    return None, best_partial
 
-    Returns ``(selected_hits, observed_total, expansion_order_ok)``.
-    """
-    is_multi = len(expected_kernels) > 1
-    offline_multi_fallback = bool(obs_dag.is_offline_summary and is_multi)
-    if is_multi and not obs_dag.is_offline_summary:
-        # Live trace multi-kernel: check EACH subkernel's exact task_type & strict order!
-        scoped_pool = [
-            (pos, node)
-            for pos, node in enumerate(obs_dag.nodes)
-            if remaining_counts.get(pos, 0) > 0
-            and _node_matches_kernel(node, expected_kernels)
-        ]
-        if pred.max_count == 0:
-            total_avail = sum(remaining_counts[pos] for pos, _ in scoped_pool)
-            return scoped_pool, total_avail, True
-        # When vllm_scope is present on both pred and observed nodes, bind to matching scope first.
-        if pred.vllm_scope and any(n.vllm_scope == pred.vllm_scope for _, n in scoped_pool):
-            scoped_pool = [(pos, n) for pos, n in scoped_pool if n.vllm_scope == pred.vllm_scope]
-        cursor = -1
-        prev_end_us = -1.0
-        ordered_picks: list[tuple[int, ObservedKernelNode]] = []
+
+def _consume_offline_multi(
+    pred: PredictedKernelNode,
+    expected_kernels: tuple[str, ...],
+    stage_expected: tuple[str, ...],
+    obs_dag: ObservedRankDAG,
+    remaining_counts: dict[int, int],
+    limit: int,
+    *,
+    strict_attrs: bool,
+    unknown_task_budget: dict[str, int] | None,
+) -> tuple[list[tuple[tuple[int, ObservedKernelNode], ...]], int, list[tuple[int, ObservedKernelNode]]]:
+    """Consume up to ``limit`` complete offline multi-kernel invocations with per-subkernel task types."""
+    invocations: list[tuple[tuple[int, ObservedKernelNode], ...]] = []
+    consumed = 0
+    partial_sample: list[tuple[int, ObservedKernelNode]] = []
+    while consumed < limit:
+        spent: dict[int, int] = {}
+        unknown_spent: dict[str, int] = {}
+        picks: list[tuple[int, ObservedKernelNode]] = []
+        complete = True
         for sub_idx, tok in enumerate(expected_kernels):
             exp_tt = _subkernel_task_type(pred, sub_idx)
-            found = None
-            for pos, node in scoped_pool:
-                if pos <= cursor or remaining_counts.get(pos, 0) <= 0:
+            exp_shape = stage_expected[sub_idx] if sub_idx < len(stage_expected) else ""
+            picked: tuple[int, ObservedKernelNode] | None = None
+            for pos, node in enumerate(obs_dag.nodes):
+                if remaining_counts.get(pos, 0) - spent.get(pos, 0) <= 0:
                     continue
-                if prev_end_us > 0.0 and node.start_us + _TIMESTAMP_EPS_US < prev_end_us:
+                if not _token_matches_node(node, tok):
                     continue
-                if _token_matches_node(node, tok) and _task_type_compatible(
-                    pred, node, expected_override=exp_tt, allow_multi_compute_fallback=False,
+                if not _task_type_compatible(
+                    pred, node, expected_override=exp_tt, is_offline_summary=True,
+                    unknown_task_budget=unknown_task_budget,
                 ):
-                    found = (pos, node)
-                    break
-            if found is None:
-                return ordered_picks, len(ordered_picks), False
-            ordered_picks.append(found)
-            cursor = found[0]
-            prev_end_us = found[1].start_us + max(0.0, found[1].dur_us)
-        for pos, _ in ordered_picks:
-            remaining_counts[pos] -= 1
-        return ordered_picks, len(ordered_picks), True
+                    continue
+                if (
+                    unknown_task_budget is not None
+                    and _normalize_task_type(node.task_type) == "UNKNOWN"
+                    and exp_tt
+                    and unknown_task_budget.get(exp_tt, 0) - unknown_spent.get(exp_tt, 0) <= 0
+                ):
+                    continue
+                if strict_attrs and not _stage_attrs_strict_ok(
+                    pred, node, exp_shape, is_offline_summary=True,
+                ):
+                    continue
+                picked = (pos, node)
+                break
+            if picked is None:
+                complete = False
+                break
+            spent[picked[0]] = spent.get(picked[0], 0) + 1
+            if unknown_task_budget is not None and _normalize_task_type(picked[1].task_type) == "UNKNOWN" and exp_tt:
+                unknown_spent[exp_tt] = unknown_spent.get(exp_tt, 0) + 1
+            picks.append(picked)
+        if not complete:
+            partial_sample = picks
+            break
+        batch = min(
+            limit - consumed,
+            min(remaining_counts[pos] // need for pos, need in spent.items()),
+        )
+        if unknown_task_budget is not None and unknown_spent:
+            batch = min(
+                batch,
+                min(unknown_task_budget.get(tt, 0) // need for tt, need in unknown_spent.items()),
+            )
+        if batch <= 0:
+            break
+        for pos, need in spent.items():
+            remaining_counts[pos] -= need * batch
+        if unknown_task_budget is not None:
+            for tt, need in unknown_spent.items():
+                unknown_task_budget[tt] -= need * batch
+        invocations.append(tuple(picks))
+        consumed += batch
+    return invocations, consumed, partial_sample
 
-    single_exp_tt = _subkernel_task_type(pred, 0) if not is_multi else ""
+
+def _consume_single_occurrences(
+    pred: PredictedKernelNode,
+    tok: str,
+    exp_shape: str,
+    obs_dag: ObservedRankDAG,
+    remaining_counts: dict[int, int],
+    limit: int,
+    *,
+    strict_attrs: bool,
+    unknown_task_budget: dict[str, int] | None,
+) -> tuple[list[tuple[tuple[int, ObservedKernelNode], ...]], int]:
+    """Consume up to ``limit`` occurrences of a single-kernel prediction."""
+    exp_tt = _subkernel_task_type(pred, 0)
     candidates: list[tuple[int, ObservedKernelNode]] = [
         (pos, node)
         for pos, node in enumerate(obs_dag.nodes)
         if remaining_counts.get(pos, 0) > 0
-        and _node_matches_kernel(node, expected_kernels)
+        and _token_matches_node(node, tok)
         and _task_type_compatible(
-            pred, node,
-            expected_override=single_exp_tt,
-            allow_multi_compute_fallback=offline_multi_fallback,
+            pred, node, expected_override=exp_tt,
+            is_offline_summary=obs_dag.is_offline_summary,
+            unknown_task_budget=unknown_task_budget,
+        )
+        and (
+            not strict_attrs
+            or _stage_attrs_strict_ok(pred, node, exp_shape, is_offline_summary=obs_dag.is_offline_summary)
         )
     ]
-    if is_multi:
-        if pred.max_count == 0:
-            total_avail = sum(remaining_counts[pos] for pos, _ in candidates)
-            return candidates, total_avail, True
-        need_per_tok = max(1, pred.min_count)
-        selected: list[tuple[int, ObservedKernelNode]] = []
-        selected_positions: set[int] = set()
-        tok_counts: list[int] = []
-        for tok in expected_kernels:
-            tok_avail = sum(
-                remaining_counts.get(pos, 0) for pos, node in candidates if _token_matches_node(node, tok)
-            )
-            tok_counts.append(tok_avail)
-        min_tok = min(tok_counts) if tok_counts else 0
-        max_tok = max(tok_counts) if tok_counts else 0
-        if min_tok < need_per_tok:
-            present = [(pos, node) for pos, node in candidates if remaining_counts.get(pos, 0) > 0]
-            return present, min_tok, False
-        if pred.max_count is not None and max_tok > pred.max_count:
-            return candidates, max_tok, True
-        for tok in expected_kernels:
-            rem_need = need_per_tok
-            for pos, node in candidates:
-                if rem_need <= 0:
-                    break
-                avail = remaining_counts.get(pos, 0)
-                if avail > 0 and _token_matches_node(node, tok):
-                    take = min(avail, rem_need)
-                    remaining_counts[pos] -= take
-                    rem_need -= take
-                    if pos not in selected_positions:
-                        selected.append((pos, node))
-                        selected_positions.add(pos)
-        selected.sort(key=lambda item: item[0])
-        return selected, need_per_tok, True
-
-    total_available = sum(remaining_counts[pos] for pos, _ in candidates)
-    if pred.max_count == 0 or total_available < pred.min_count:
-        return candidates, total_available, True
-    if pred.max_count is not None and total_available > pred.max_count:
-        return candidates, total_available, True
-
     if not obs_dag.is_offline_summary:
-        candidates.sort(key=lambda item: _candidate_preference_key(pred, item))
-    need = max(1, pred.min_count)
-    selected_single: list[tuple[int, ObservedKernelNode]] = []
-    consumed_total = 0
+        candidates.sort(key=lambda item: _candidate_preference_key(pred, item, exp_shape))
+    need = limit
+    invocations: list[tuple[tuple[int, ObservedKernelNode], ...]] = []
+    consumed = 0
     for pos, node in candidates:
         if need <= 0:
             break
         avail = remaining_counts.get(pos, 0)
         if avail <= 0:
             continue
+        is_unknown = unknown_task_budget is not None and _normalize_task_type(node.task_type) == "UNKNOWN" and exp_tt
+        if is_unknown:
+            avail = min(avail, unknown_task_budget.get(exp_tt, 0))
+            if avail <= 0:
+                continue
         take = min(avail, need)
         remaining_counts[pos] -= take
-        consumed_total += take
+        if is_unknown and unknown_task_budget is not None:
+            unknown_task_budget[exp_tt] -= take
+        consumed += take
         need -= take
-        selected_single.append((pos, node))
-    return selected_single, consumed_total, True
+        invocations.append(((pos, node),))
+    return invocations, consumed
+
+
+def _consume_invocations(
+    pred: PredictedKernelNode,
+    expected_kernels: tuple[str, ...],
+    stage_expected: tuple[str, ...],
+    obs_dag: ObservedRankDAG,
+    remaining_counts: dict[int, int],
+    limit: int,
+    *,
+    dag_has_timing: bool,
+    strict_attrs: bool,
+    unknown_task_budget: dict[str, int] | None,
+) -> tuple[list[tuple[tuple[int, ObservedKernelNode], ...]], int, list[tuple[int, ObservedKernelNode]]]:
+    """Consume up to ``limit`` complete invocations; return ``(invocations, count, partial_sample)``."""
+    if limit <= 0:
+        return [], 0, []
+    if len(expected_kernels) == 1:
+        exp_shape = stage_expected[0] if stage_expected else ""
+        invs, count = _consume_single_occurrences(
+            pred, expected_kernels[0], exp_shape, obs_dag, remaining_counts, limit,
+            strict_attrs=strict_attrs, unknown_task_budget=unknown_task_budget,
+        )
+        return invs, count, []
+    if obs_dag.is_offline_summary:
+        return _consume_offline_multi(
+            pred, expected_kernels, stage_expected, obs_dag, remaining_counts, limit,
+            strict_attrs=strict_attrs, unknown_task_budget=unknown_task_budget,
+        )
+    invs: list[tuple[tuple[int, ObservedKernelNode], ...]] = []
+    partial_sample: list[tuple[int, ObservedKernelNode]] = []
+    for _ in range(limit):
+        matched, partial = _try_consume_one_live_multi(
+            pred, expected_kernels, stage_expected, obs_dag, remaining_counts,
+            dag_has_timing=dag_has_timing, strict_attrs=strict_attrs,
+        )
+        if matched is None:
+            partial_sample = partial
+            break
+        invs.append(matched)
+    return invs, len(invs), partial_sample
+
+
+def _count_remaining_forbidden(
+    pred: PredictedKernelNode,
+    expected_kernels: tuple[str, ...],
+    obs_dag: ObservedRankDAG,
+    remaining_counts: dict[int, int],
+    *,
+    unknown_task_budget: Mapping[str, int] | None = None,
+) -> int:
+    total = 0
+    for pos, node in enumerate(obs_dag.nodes):
+        rem = remaining_counts.get(pos, 0)
+        if rem <= 0:
+            continue
+        for sub_idx, tok in enumerate(expected_kernels):
+            exp_tt = _subkernel_task_type(pred, sub_idx)
+            if _token_matches_node(node, tok) and _task_type_compatible(
+                pred, node, expected_override=exp_tt,
+                is_offline_summary=obs_dag.is_offline_summary,
+                unknown_task_budget=unknown_task_budget,
+            ):
+                total += rem
+                break
+    return total
 
 
 def _verify_matched_node_attributes(
     pred: PredictedKernelNode,
     expected_kernels: tuple[str, ...],
-    hits: Sequence[tuple[int, ObservedKernelNode]],
+    invocations: Sequence[tuple[tuple[int, ObservedKernelNode], ...]],
     rank_id: int,
     *,
     is_offline_summary: bool,
@@ -898,7 +1315,8 @@ def _verify_matched_node_attributes(
     shape_diffs: list[ParityDiff],
     launch_diffs: list[ParityDiff],
 ) -> None:
-    """Validate expansion completeness, lane, collective ranks, vllm_scope, and shapes."""
+    """Validate expansion completeness, lane, collective ranks, vllm_scope, and per-stage shapes."""
+    hits: list[tuple[int, ObservedKernelNode]] = [hit for inv in invocations for hit in inv]
     if len(expected_kernels) > 1 and pred.min_count > 0:
         present = {
             tok for tok in expected_kernels
@@ -958,33 +1376,65 @@ def _verify_matched_node_attributes(
                 observed=",".join(obs_scopes),
             ))
 
-    if pred.input_shapes:
-        obs_shapes = [n.input_shapes for _, n in hits if n.input_shapes and n.input_shapes != "N/A"]
-        if not is_offline_summary:
-            if len(obs_shapes) != len(hits) or any(s != pred.input_shapes for s in obs_shapes):
-                bad_shape = next((s for s in obs_shapes if s != pred.input_shapes), "missing")
+    stage_expected = _resolve_stage_expected_shapes(pred, expected_kernels)
+    if any(stage_expected):
+        _verify_stage_shapes(
+            pred, expected_kernels, stage_expected, invocations, rank_id,
+            is_offline_summary=is_offline_summary,
+            shape_diffs=shape_diffs,
+        )
+
+
+def _verify_stage_shapes(
+    pred: PredictedKernelNode,
+    expected_kernels: tuple[str, ...],
+    stage_expected: tuple[str, ...],
+    invocations: Sequence[tuple[tuple[int, ObservedKernelNode], ...]],
+    rank_id: int,
+    *,
+    is_offline_summary: bool,
+    shape_diffs: list[ParityDiff],
+) -> None:
+    if not is_offline_summary:
+        for inv in invocations:
+            for sub_idx, (_, obs_node) in enumerate(inv):
+                exp_shape = stage_expected[sub_idx] if sub_idx < len(stage_expected) else ""
+                if not exp_shape or _shapes_match(exp_shape, obs_node.input_shapes):
+                    continue
                 shape_diffs.append(ParityDiff(
                     code="SHAPE_MISMATCH",
                     rank_id=rank_id,
                     node_id=pred.node_id,
-                    detail=f"shape mismatch for {pred.api_or_symbol}: expected {pred.input_shapes}",
-                    expected=pred.input_shapes,
-                    observed=bad_shape,
+                    detail=f"shape mismatch for {pred.api_or_symbol} stage {sub_idx} ({obs_node.kernel_name}): expected {exp_shape}",
+                    expected=exp_shape,
+                    observed=obs_node.input_shapes or "missing",
                 ))
-        elif obs_shapes and pred.input_shapes not in obs_shapes:
+                return
+        return
+    for sub_idx, (_, exp_shape) in enumerate(zip(expected_kernels, stage_expected)):
+        if not exp_shape:
+            continue
+        obs_shapes = [
+            inv[sub_idx][1].input_shapes
+            for inv in invocations
+            if sub_idx < len(inv) and inv[sub_idx][1].input_shapes and inv[sub_idx][1].input_shapes != "N/A"
+        ]
+        bad_shape = next((s for s in obs_shapes if not _shapes_match(exp_shape, s)), "")
+        if bad_shape:
             shape_diffs.append(ParityDiff(
                 code="SHAPE_MISMATCH",
                 rank_id=rank_id,
                 node_id=pred.node_id,
-                detail=f"shape mismatch for {pred.api_or_symbol}: expected {pred.input_shapes}",
-                expected=pred.input_shapes,
-                observed=obs_shapes[0],
+                detail=f"shape mismatch for {pred.api_or_symbol} stage {sub_idx}: expected {exp_shape}",
+                expected=exp_shape,
+                observed=bad_shape,
             ))
+            return
 
 
 def _verify_rank_dependency_order(
     pred_nodes: Sequence[PredictedKernelNode],
-    matched_bounds: Mapping[str, tuple[int, int, float, float]],
+    matched_bounds: Mapping[str, tuple[int, int, int | None, int | None]],
     rank_id: int,
 ) -> list[ParityDiff]:
     """Enforce predecessor completion strictly before consumer start across every edge."""
@@ -992,7 +1442,7 @@ def _verify_rank_dependency_order(
     for pred in pred_nodes:
         if pred.node_id not in matched_bounds:
             continue
-        cur_start_pos, _, cur_start_us, _ = matched_bounds[pred.node_id]
+        cur_start_pos, _, cur_start_ns, _ = matched_bounds[pred.node_id]
         for dep_id in pred.predecessors:
             if dep_id not in matched_bounds:
                 dag_diffs.append(ParityDiff(
@@ -1004,7 +1454,7 @@ def _verify_rank_dependency_order(
                     observed="missing_predecessor",
                 ))
                 continue
-            _, dep_end_pos, _, dep_end_us = matched_bounds[dep_id]
+            _, dep_end_pos, _, dep_end_ns = matched_bounds[dep_id]
             if dep_end_pos >= cur_start_pos:
                 dag_diffs.append(ParityDiff(
                     code="DEPENDENCY_ORDER_MISMATCH",
@@ -1017,19 +1467,125 @@ def _verify_rank_dependency_order(
                     expected=f"{dep_id}.end_pos < {pred.node_id}.start_pos",
                     observed=f"{dep_end_pos} >= {cur_start_pos}",
                 ))
-            elif dep_end_us > 0.0 and cur_start_us > 0.0 and dep_end_us > cur_start_us + _TIMESTAMP_EPS_US:
+            elif dep_end_ns is not None and cur_start_ns is not None and dep_end_ns > cur_start_ns:
+                dep_end_str = _format_ns_as_us(dep_end_ns)
+                cur_start_str = _format_ns_as_us(cur_start_ns)
                 dag_diffs.append(ParityDiff(
                     code="DEPENDENCY_ORDER_MISMATCH",
                     rank_id=rank_id,
                     node_id=pred.node_id,
                     detail=(
-                        f"dependency {dep_id} ended at {dep_end_us:.3f}us "
-                        f"after consumer {pred.node_id} started at {cur_start_us:.3f}us"
+                        f"dependency {dep_id} ended at {dep_end_str}us "
+                        f"after consumer {pred.node_id} started at {cur_start_str}us"
                     ),
                     expected=f"{dep_id}.end_us <= {pred.node_id}.start_us",
-                    observed=f"{dep_end_us:.3f} > {cur_start_us:.3f}",
+                    observed=f"{dep_end_str} > {cur_start_str}",
                 ))
     return dag_diffs
+
+
+def _allocation_priority_order(
+    pred_nodes: Sequence[PredictedKernelNode],
+    expected_list: Sequence[tuple[str, ...]],
+    stage_shapes_list: Sequence[tuple[str, ...]],
+) -> list[int]:
+    """Order more-constrained predictions first (multi-kernel, scoped, shaped) stably."""
+    return sorted(
+        range(len(pred_nodes)),
+        key=lambda idx: (
+            0 if len(expected_list[idx]) > 1 else 1,
+            -len(expected_list[idx]),
+            0 if pred_nodes[idx].vllm_scope else 1,
+            0 if any(stage_shapes_list[idx]) else 1,
+        ),
+    )
+
+
+def _allocate_rank_invocations(
+    pred_nodes: Sequence[PredictedKernelNode],
+    expected_list: Sequence[tuple[str, ...]],
+    obs_dag: ObservedRankDAG,
+    remaining_counts: dict[int, int],
+    *,
+    dag_has_timing: bool,
+    unknown_task_budget: dict[str, int] | None,
+) -> tuple[
+    list[list[tuple[tuple[int, ObservedKernelNode], ...]]],
+    list[int],
+    list[bool],
+    list[list[tuple[int, ObservedKernelNode]]],
+]:
+    """Allocate complete invocations across predicted nodes (strict min -> relaxed min -> strict slack)."""
+    n_preds = len(pred_nodes)
+    stage_shapes_list = [
+        _resolve_stage_expected_shapes(pred, exp)
+        for pred, exp in zip(pred_nodes, expected_list)
+    ]
+    order = _allocation_priority_order(pred_nodes, expected_list, stage_shapes_list)
+    alloc_invs: list[list[tuple[tuple[int, ObservedKernelNode], ...]]] = [[] for _ in range(n_preds)]
+    alloc_counts: list[int] = [0] * n_preds
+    order_ok: list[bool] = [True] * n_preds
+    partial_samples: list[list[tuple[int, ObservedKernelNode]]] = [[] for _ in range(n_preds)]
+
+    # Pass 1a: satisfy mandatory minimum invocations with strict attribute/shape matching first.
+    for idx in order:
+        pred = pred_nodes[idx]
+        if pred.min_count <= 0 or pred.max_count == 0:
+            continue
+        invs, count, _ = _consume_invocations(
+            pred, expected_list[idx], stage_shapes_list[idx], obs_dag, remaining_counts, pred.min_count,
+            dag_has_timing=dag_has_timing, strict_attrs=True, unknown_task_budget=unknown_task_budget,
+        )
+        alloc_invs[idx].extend(invs)
+        alloc_counts[idx] += count
+
+    # Pass 1b: bind remaining unsatisfied mandatory minimums without attribute filtering for exact diffs.
+    for idx in order:
+        pred = pred_nodes[idx]
+        if pred.min_count <= 0 or pred.max_count == 0 or alloc_counts[idx] >= pred.min_count:
+            continue
+        rem_need = pred.min_count - alloc_counts[idx]
+        invs, count, partial = _consume_invocations(
+            pred, expected_list[idx], stage_shapes_list[idx], obs_dag, remaining_counts, rem_need,
+            dag_has_timing=dag_has_timing, strict_attrs=False, unknown_task_budget=unknown_task_budget,
+        )
+        alloc_invs[idx].extend(invs)
+        alloc_counts[idx] += count
+        if len(expected_list[idx]) > 1 and alloc_counts[idx] < pred.min_count and (alloc_counts[idx] == 0 or partial):
+            order_ok[idx] = False
+            partial_samples[idx] = partial
+
+    # Pass 2: absorb remaining invocations within explicitly declared [min_count, max_count] slack (strict).
+    for idx in order:
+        pred = pred_nodes[idx]
+        if pred.max_count is None or pred.max_count <= alloc_counts[idx]:
+            continue
+        slack = pred.max_count - alloc_counts[idx]
+        invs, count, _ = _consume_invocations(
+            pred, expected_list[idx], stage_shapes_list[idx], obs_dag, remaining_counts, slack,
+            dag_has_timing=dag_has_timing, strict_attrs=True, unknown_task_budget=unknown_task_budget,
+        )
+        alloc_invs[idx].extend(invs)
+        alloc_counts[idx] += count
+
+    return alloc_invs, alloc_counts, order_ok, partial_samples
+
+
+def _bounds_for_invocations(
+    invocations: Sequence[tuple[tuple[int, ObservedKernelNode], ...]],
+    *,
+    dag_has_timing: bool,
+) -> tuple[int, int, int | None, int | None]:
+    flat = [hit for inv in invocations for hit in inv]
+    min_pos = min(pos for pos, _ in flat)
+    max_pos = max(pos for pos, _ in flat)
+    known = [
+        tb for _, node in flat
+        if (tb := _node_time_bounds_ns(node, dag_has_timing=dag_has_timing)) is not None
+    ]
+    if known:
+        return min_pos, max_pos, min(tb[0] for tb in known), max(tb[1] for tb in known)
+    return min_pos, max_pos, None, None
 
 
 def _check_rank_nodes(
@@ -1053,16 +1609,38 @@ def _check_rank_nodes(
         pos: (max(0, int(node.count)) if obs_dag.is_offline_summary else 1)
         for pos, node in enumerate(obs_dag.nodes)
     }
-    matched_bounds: dict[str, tuple[int, int, float, float]] = {}
+    has_timing = _dag_has_timing(obs_dag)
+    unknown_budget = _offline_unknown_task_budget(obs_dag)
+    expected_list = [_expected_expansion_for(pred, device_arch, registry) for pred in pred_nodes]
+    alloc_invs, alloc_counts, order_ok, partial_samples = _allocate_rank_invocations(
+        pred_nodes, expected_list, obs_dag, remaining_counts,
+        dag_has_timing=has_timing, unknown_task_budget=unknown_budget,
+    )
+
+    matched_bounds: dict[str, tuple[int, int, int | None, int | None]] = {}
     rank_id = obs_dag.rank_id
 
-    for pred in pred_nodes:
-        expected_kernels = _expected_expansion_for(pred, device_arch, registry)
-        hits, observed_total, order_ok = _consume_matching_occurrences(
-            pred, expected_kernels, obs_dag, remaining_counts,
-        )
+    for idx, (pred, expected_kernels) in enumerate(zip(pred_nodes, expected_list)):
+        observed_total = alloc_counts[idx]
+        invocations = alloc_invs[idx]
 
-        if len(expected_kernels) > 1 and pred.min_count > 0 and not order_ok:
+        if pred.max_count == 0:
+            forbidden_seen = _count_remaining_forbidden(
+                pred, expected_kernels, obs_dag, remaining_counts, unknown_task_budget=unknown_budget,
+            )
+            if forbidden_seen > 0:
+                launch_diffs.append(ParityDiff(
+                    code="MISSING_OR_EXTRA_LAUNCH",
+                    rank_id=rank_id,
+                    node_id=pred.node_id,
+                    detail=f"expected<=0 launches of {expected_kernels}, got {forbidden_seen}",
+                    expected="<=0",
+                    observed=str(forbidden_seen),
+                ))
+            continue
+
+        if len(expected_kernels) > 1 and pred.min_count > 0 and not order_ok[idx]:
+            sample_hits = partial_samples[idx] or [hit for inv in invocations for hit in inv]
             exp_diffs.append(ParityDiff(
                 code="EXPANSION_MISMATCH",
                 rank_id=rank_id,
@@ -1072,11 +1650,11 @@ def _check_rank_nodes(
                     f"expected ordered {expected_kernels}"
                 ),
                 expected=",".join(expected_kernels),
-                observed=",".join(n.kernel_name for _, n in hits) or "none",
+                observed=",".join(n.kernel_name for _, n in sample_hits) or "none",
             ))
             continue
 
-        if pred.is_ai_cpu_metadata and observed_total == 0:
+        if pred.is_ai_cpu_metadata and pred.min_count > 0 and observed_total == 0:
             launch_diffs.append(ParityDiff(
                 code="MISSING_AI_CPU_METADATA",
                 rank_id=rank_id,
@@ -1111,17 +1689,12 @@ def _check_rank_nodes(
             ))
             continue
 
-        if not hits:
+        if not invocations:
             continue
 
-        matched_bounds[pred.node_id] = (
-            hits[0][0],
-            hits[-1][0],
-            min(n.start_us for _, n in hits),
-            max(n.start_us + n.dur_us for _, n in hits),
-        )
+        matched_bounds[pred.node_id] = _bounds_for_invocations(invocations, dag_has_timing=has_timing)
         _verify_matched_node_attributes(
-            pred, expected_kernels, hits, rank_id,
+            pred, expected_kernels, invocations, rank_id,
             is_offline_summary=obs_dag.is_offline_summary,
             exp_diffs=exp_diffs,
             lane_diffs=lane_diffs,
@@ -1360,7 +1933,9 @@ class SubgraphParityChecker:
         )
 
 
-def _infer_offline_task_type(kname: str) -> str:
+def _infer_offline_task_type(kname: str, *, device_arch: str = "A3") -> str:
+    if kname == "PadV3":
+        return "AI_VECTOR_CORE" if device_arch == "A5" else "MIX_AIV"
     if kname.startswith("hcom_"):
         return "COMMUNICATION"
     if kname.endswith(("Metadata", "AicpuKernel")) or kname == "SearchSorted":
@@ -1519,6 +2094,15 @@ def load_offline_a5_capture_dags(
     return va_rev, dags
 
 
+def _parse_json_float(raw: str) -> float | Decimal:
+    """Preserve exact Decimal precision whenever IEEE-754 float64 would round."""
+    dec = Decimal(raw)
+    flt = float(raw)
+    if Decimal(str(flt)) == dec:
+        return flt
+    return dec
+
+
 class _JsonStreamReader:
     """Chunked 1 MiB JSON scanner validating depth-1 ``traceEvents`` and full-document EOF."""
 
@@ -1530,7 +2114,7 @@ class _JsonStreamReader:
         self._buf = ""
         self._pos = 0
         self._eof = False
-        self._decoder = json.JSONDecoder()
+        self._decoder = json.JSONDecoder(parse_float=_parse_json_float)
 
     def _refill(self) -> bool:
         if self._eof:
@@ -1808,8 +2392,11 @@ def evaluate_trace_view_stream(
         _expected_expansion_for(pred, device_arch, registry) for pred in pred_nodes
     ]
     needed_tokens: set[str] = {tok for exp in expected_sets for tok in exp}
-    needed_budget = sum(max(1, len(exp), pred.min_count) for pred, exp in zip(pred_nodes, expected_sets))
-    retain_limit = max(_MAX_REPORTED_SAMPLES, needed_budget * 4)
+    needed_budget = sum(
+        max(1, len(exp)) * max(1, pred.max_count if pred.max_count is not None else pred.min_count)
+        for pred, exp in zip(pred_nodes, expected_sets)
+    )
+    retain_limit = max(_MAX_REPORTED_SAMPLES, needed_budget * _RANK_4D)
 
     # Pass 1: ingest every non-kernel flow, ACLGraph node, and host timestamp record.
     for ev in iter_trace_view_events(trace_path):
@@ -1878,6 +2465,8 @@ def evaluate_trace_view_stream(
                 collective_group=dev.collective_group,
                 comm_ranks=dev.comm_ranks,
                 count=1,
+                start_ns=dev.ts_ns,
+                dur_ns=dev.dur_ns,
             ))
         elif len(extra_launch_diffs) < _MAX_REPORTED_SAMPLES:
             extra_launch_diffs.append(ParityDiff(
@@ -1889,7 +2478,7 @@ def evaluate_trace_view_stream(
                 observed=dev.kernel,
             ))
 
-    retained_nodes.sort(key=lambda item: (item.start_us, item.node_id))
+    retained_nodes.sort(key=lambda item: (item.start_ns is None, item.start_ns or 0))
     rate = (exact_count / total_events) if total_events > 0 else 0.0
     compact_dag = ObservedRankDAG(
         rank_id=rank_id,
@@ -2058,12 +2647,57 @@ def _arch_from_sku_name(sku: str) -> str | None:
     return None
 
 
-def _infer_arch_from_case(case: Case) -> str:
+def _declared_arch_from_case(case: Case) -> str | None:
+    """Return explicitly declared Ascend architecture family on ``case``, else ``None``."""
     family = str(getattr(case.machine, "arch_family", "") or "").strip().upper()
     if family in _VALID_ARCHES:
         return family
     inferred = _arch_from_sku_name(str(getattr(case.machine, "sku", "") or ""))
-    return inferred if inferred is not None else "A3"
+    if inferred is not None:
+        return inferred
+    dies = getattr(case.machine, "dies", ())
+    if dies:
+        preset = str(getattr(getattr(dies[0], "compute_arch", None), "preset", "") or "")
+        preset_arch = _arch_from_sku_name(preset)
+        if preset_arch is not None:
+            return preset_arch
+    return None
+
+
+def _infer_arch_from_case(case: Case) -> str:
+    return _declared_arch_from_case(case) or "A3"
+
+
+def _resolve_live_target_device(
+    parsed_case: Case | None,
+    *,
+    device_arch: str | None,
+    hardware_sku: str | None,
+) -> tuple[str, str, str | None]:
+    """Derive canonical ``(device_arch, hardware_sku)`` from ``parsed_case`` and validate overrides."""
+    case_sku = str(getattr(parsed_case.machine, "sku", "") or "").strip() if parsed_case is not None else ""
+    declared_arch = _declared_arch_from_case(parsed_case) if parsed_case is not None else None
+    if declared_arch is not None and device_arch is not None and device_arch != declared_arch:
+        label = case_sku or declared_arch
+        return (
+            declared_arch,
+            case_sku,
+            f"--arch {device_arch} conflicts with case SKU {label} ({declared_arch})",
+        )
+    if hardware_sku is not None:
+        arg_sku = hardware_sku.strip()
+        if not arg_sku:
+            return device_arch or declared_arch or "A3", "", "--sku must be non-empty"
+        if case_sku and _canonical_sku(arg_sku) != _canonical_sku(case_sku):
+            return device_arch or declared_arch or "A3", arg_sku, f"--sku {arg_sku} conflicts with case SKU {case_sku}"
+        sku_arch = _arch_from_sku_name(arg_sku)
+        resolved_arch = device_arch or declared_arch or sku_arch or "A3"
+        if sku_arch is not None and sku_arch != resolved_arch:
+            return resolved_arch, arg_sku, f"--sku {arg_sku} ({sku_arch}) conflicts with arch {resolved_arch}"
+        return resolved_arch, _canonical_sku(arg_sku), None
+    resolved_arch = device_arch or declared_arch or "A3"
+    canonical_case_sku = _canonical_sku(case_sku) if case_sku else ""
+    return resolved_arch, canonical_case_sku or _default_sku_for_arch(resolved_arch), None
 
 
 def _default_sku_for_arch(device_arch: str) -> str:
@@ -2131,15 +2765,208 @@ def _format_shape_tuple(shape: Any) -> str:
     if isinstance(shape, str):
         return shape.strip()
     if isinstance(shape, Sequence) and not isinstance(shape, (str, bytes)):
+        if shape and all(isinstance(item, Sequence) and not isinstance(item, (str, bytes)) for item in shape):
+            slots = [
+                ",".join(str(int(d)) for d in sub if isinstance(d, (int, float)) and not isinstance(d, bool))
+                for sub in shape
+            ]
+            return ";".join(slots)
         dims = [str(int(d)) for d in shape if isinstance(d, (int, float)) and not isinstance(d, bool)]
         return ",".join(dims)
     return ""
 
 
+def _int_shape_tuple(raw: Any) -> tuple[int, ...] | None:
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        dims = tuple(int(d) for d in raw if isinstance(d, (int, float)) and not isinstance(d, bool))
+        return dims if dims else None
+    return None
+
+
+def _gdn_stage_operand_shapes(op: OpSpec, meta: Mapping[str, Any]) -> str:
+    """Build 7-operand CANN input descriptor for lowered prefill ``gdn_{prepare,state,output}`` ops."""
+    raw_lengths = meta.get("lengths")
+    lengths = _int_shape_tuple(raw_lengths)
+    if not lengths:
+        return ""
+    hv_dim = int(meta.get("heads") or 0)
+    hk_dim = int(meta.get("key_heads") or hv_dim)
+    k_dim = int(meta.get("head_dim_k") or (op.local_shape[-1] if op.local_shape else 0))
+    v_dim = int(meta.get("head_dim_v") or k_dim)
+    if hv_dim <= 0 or hk_dim <= 0 or k_dim <= 0 or v_dim <= 0:
+        return ""
+    t_dim = sum(lengths)
+    seq_num = len(lengths)
+    chunk = max(1, int(meta.get("chunk") or _GDN_CHUNK_SIZE))
+    chunks_per_seq = _int_shape_tuple(meta.get("chunks_per_sequence"))
+    num_chunks = sum(chunks_per_seq) if chunks_per_seq else sum((ln + chunk - 1) // chunk for ln in lengths)
+    cu_seq = (seq_num + 1,)
+    chunk_idx = (num_chunks * 2,)
+    b_dim = 1
+    q_shp = (b_dim, hk_dim, t_dim, k_dim)
+    v_shp = (b_dim, hv_dim, t_dim, v_dim)
+    g_shp = (b_dim, hv_dim, t_dim)
+    if op.family == "gdn_prepare":
+        return _format_operand_shapes((q_shp, q_shp, v_shp, g_shp, g_shp, cu_seq, chunk_idx))
+    if op.family == "gdn_state":
+        return _format_operand_shapes((
+            q_shp, (b_dim, hv_dim, t_dim, k_dim), v_shp, g_shp,
+            (seq_num, hv_dim, k_dim, v_dim), cu_seq, chunk_idx,
+        ))
+    if op.family == "gdn_output":
+        return _format_operand_shapes((
+            q_shp, q_shp, v_shp, (b_dim, hv_dim, num_chunks, k_dim, v_dim),
+            g_shp, cu_seq, chunk_idx,
+        ))
+    return ""
+
+
+def _gemm_scale_shapes(
+    op: OpSpec,
+    meta: Mapping[str, Any],
+    *,
+    n_dim: int,
+    k_dim: int,
+    groups: int,
+    raw_tb: Any,
+) -> tuple[tuple[int, ...] | None, tuple[int, ...] | None]:
+    abi = op.precision_abi
+    w_scale_dtype = str(
+        meta.get("weight_scale_format")
+        or (abi.weight_scale_dtype if abi is not None else "")
+        or ""
+    ).strip().lower()
+    w_scale_shape = _int_shape_tuple(meta.get("weight_scale_shape"))
+    if w_scale_shape is None and w_scale_dtype:
+        w_block = abi.weight_block if abi is not None else ()
+        act_pack = str(abi.act_scale_pack if abi is not None else "").strip().lower()
+        if w_scale_dtype == "fp8_e8m0" and len(w_block) >= 2 and w_block[-1] > 1:
+            k_groups = (k_dim + w_block[-1] - 1) // w_block[-1]
+            if act_pack == "pack2" or w_scale_dtype == "fp8_e8m0":
+                k_packed = (k_groups + 1) // 2
+                inner_s: tuple[int, ...] = (n_dim, k_packed, 2) if raw_tb is True else (k_packed, n_dim, 2)
+            else:
+                inner_s = (n_dim, k_groups) if raw_tb is True else (k_groups, n_dim)
+            w_scale_shape = (groups, *inner_s) if groups > 0 else inner_s
+        else:
+            w_scale_shape = (groups, n_dim) if groups > 0 else (n_dim,)
+    a_scale_shape = _int_shape_tuple(meta.get("activation_scale_shape"))
+    return w_scale_shape, a_scale_shape
+
+
+def _gemm_bias_shape(meta: Mapping[str, Any], n_dim: int) -> tuple[int, ...] | None:
+    explicit = _int_shape_tuple(meta.get("bias_shape"))
+    if explicit is not None:
+        return explicit
+    if bool(meta.get("has_bias") or meta.get("bias")):
+        return (n_dim,)
+    return None
+
+
+def _gemm_operand_shapes(op: OpSpec, meta: Mapping[str, Any]) -> str:
+    geom = op.local_shape or op.launch_shape or op.semantic_shape
+    if len(geom) not in (_RANK_3D, _RANK_4D):
+        return ""
+    explicit_weight = _int_shape_tuple(meta.get("weight_shape"))
+    trans_a = bool(meta.get("transpose_a", meta.get("trans_a", False)))
+    raw_tb = meta.get("transpose_b", meta.get("trans_b"))
+    if len(geom) == _RANK_4D:
+        batch, m_dim, n_dim, k_dim = (int(d) for d in geom)
+        trans_b = True if raw_tb is None else bool(raw_tb)
+        a_shape: tuple[int, ...] = (batch, k_dim, m_dim) if trans_a else (batch, m_dim, k_dim)
+        b_shape: tuple[int, ...] = (
+            explicit_weight
+            if explicit_weight is not None
+            else ((batch, n_dim, k_dim) if trans_b else (batch, k_dim, n_dim))
+        )
+        operands: list[tuple[int, ...]] = [a_shape, b_shape]
+        bias_shp = _gemm_bias_shape(meta, n_dim)
+        if bias_shp is not None:
+            operands.append(bias_shp)
+        return _format_operand_shapes(operands)
+
+    m_dim, n_dim, k_dim = (int(d) for d in geom)
+    a_shape = (k_dim, m_dim) if trans_a else (m_dim, k_dim)
+    is_grouped = op.family == "grouped_gemm"
+    groups = int(meta.get("matrix_weight_bank_groups") or meta.get("matrix_groups") or 0) if is_grouped else 0
+    if explicit_weight is not None:
+        b_shape = explicit_weight
+    elif is_grouped:
+        trans_b = bool(raw_tb) if raw_tb is not None else False
+        inner = (n_dim, k_dim) if trans_b else (k_dim, n_dim)
+        b_shape = (groups, *inner) if groups > 0 else inner
+    else:
+        trans_b = True if raw_tb is None else bool(raw_tb)
+        w_layout = str(
+            meta.get("weight_layout")
+            or (op.precision_abi.weight_layout if op.precision_abi is not None else "")
+            or ""
+        ).strip().upper()
+        w_dtype = str(
+            meta.get("weight_dtype")
+            or (op.precision_abi.weight_dtype if op.precision_abi is not None else "")
+            or op.dtype
+            or ""
+        ).strip().lower()
+        if w_layout.startswith("FRACTAL_NZ"):
+            if "C0_16" in w_layout:
+                c0 = _NZ_C0_2B
+            elif "C0_32" in w_layout or w_dtype in _ONE_BYTE_DTYPES:
+                c0 = _NZ_C0_1B
+            else:
+                c0 = _NZ_C0_2B
+            if raw_tb is True:
+                b_shape = ((k_dim + c0 - 1) // c0, (n_dim + _NZ_R0 - 1) // _NZ_R0, _NZ_R0, c0)
+            else:
+                b_shape = ((n_dim + c0 - 1) // c0, (k_dim + _NZ_R0 - 1) // _NZ_R0, _NZ_R0, c0)
+        else:
+            b_shape = (n_dim, k_dim) if trans_b else (k_dim, n_dim)
+
+    bias_shp = _gemm_bias_shape(meta, n_dim)
+    w_scale_shp, a_scale_shp = _gemm_scale_shapes(
+        op, meta, n_dim=n_dim, k_dim=k_dim, groups=groups, raw_tb=raw_tb,
+    )
+    if is_grouped and groups > 0:
+        slots: list[tuple[int, ...]] = [() for _ in range(_GROUPED_MATMUL_FIXED_SLOTS)]
+        slots[0] = a_shape
+        slots[1] = b_shape
+        if bias_shp is not None:
+            slots[_GROUPED_MATMUL_BIAS_SLOT] = bias_shp
+        if w_scale_shp is not None:
+            slots[_GROUPED_MATMUL_WEIGHT_SCALE_SLOT] = w_scale_shp
+        slots[_GROUPED_MATMUL_GROUP_LIST_SLOT] = (groups,)
+        if a_scale_shp is not None:
+            slots.append(a_scale_shp)
+        return _format_operand_shapes(slots)
+
+    operands = [a_shape, b_shape]
+    if bias_shp is not None:
+        operands.append(bias_shp)
+    if w_scale_shp is not None:
+        operands.append(w_scale_shp)
+    if a_scale_shp is not None:
+        operands.append(a_scale_shp)
+    return _format_operand_shapes(operands)
+
+
 def _format_input_shapes(op: OpSpec, meta: Mapping[str, Any]) -> str:
     for candidate in (
-        meta.get("input_shape"),
+        meta.get("operand_shapes"),
         meta.get("input_shapes"),
+        meta.get("input_shape"),
+    ):
+        text = _format_shape_tuple(candidate)
+        if text:
+            return text
+    if op.family in {"gdn_prepare", "gdn_state", "gdn_output"}:
+        gdn_shapes = _gdn_stage_operand_shapes(op, meta)
+        if gdn_shapes:
+            return gdn_shapes
+    if meta.get("program_kind") == "matmul" or op.family in _GEMM_OP_FAMILIES:
+        gemm_shapes = _gemm_operand_shapes(op, meta)
+        if gemm_shapes:
+            return gemm_shapes
+    for candidate in (
         op.local_shape,
         op.padded_shape,
         op.semantic_shape,
@@ -2414,13 +3241,18 @@ def build_predicted_nodes_from_case(
         case = parse_case(_read_case_file(case_source))
     else:
         case = parse_case(dict(case_source))
+    resolved_arch, _, dev_err = _resolve_live_target_device(
+        case, device_arch=device_arch, hardware_sku=None,
+    )
+    if dev_err is not None:
+        raise ModelingError(f"live_parity_device_conflict:{dev_err}")
     spine = PredictionSpine()
     prepared = spine.lower(
         case,
         LoweringRequest(step=StepRequest(phase, tokens=tokens, context=context, sequences=sequences)),
     )
     preds = build_predicted_nodes_from_prepared_step(
-        prepared, device_arch=device_arch, registry=registry,
+        prepared, device_arch=resolved_arch, registry=registry,
     )
     return prepared, preds
 
@@ -2439,7 +3271,7 @@ class OfflineCaptureCaseConfig:
     quant: str = "bf16"
     kv_cache_dtype: str = "bf16"
     phase: PhaseKind = "decode"
-    tokens: int = _A5_DEFAULT_BATCH
+    tokens: int = 1
     context: int = _DEFAULT_PROMPT_LEN
     sequences: int = _A5_DEFAULT_BATCH
     mtp_proposal_tokens: int = 0
@@ -2454,90 +3286,90 @@ class OfflineCaptureCaseConfig:
 _OFFLINE_A3_TAG_CONFIGS: Mapping[str, OfflineCaptureCaseConfig] = {
     "deepseek_v32_dcp4_w4a8_c8_sp": OfflineCaptureCaseConfig(
         "deepseek-v3.2", layers=_DEFAULT_LAYERS_MOE, tp=_TP_QUAD, ep=_TP_QUAD, dcp=_TP_QUAD,
-        quant="w4a8", kv_cache_dtype="int8", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH,
+        quant="w4a8", kv_cache_dtype="int8", sequences=_A3_DEFAULT_BATCH,
         enable_flashcomm1=True,
     ),
     "deepseek_v32_mtp_spec": OfflineCaptureCaseConfig(
         "deepseek-v3.2", layers=_DEFAULT_LAYERS_MOE, tp=_TP_QUAD, ep=_TP_QUAD, dcp=_TP_SINGLE,
-        quant="bf16", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH,
+        quant="bf16", sequences=_A3_DEFAULT_BATCH,
         mtp_proposal_tokens=1, enable_flashcomm1=True,
     ),
     "deepseek_v32_pcp2_dcp2_tp2": OfflineCaptureCaseConfig(
         "deepseek-v3.2", layers=_DEFAULT_LAYERS_MOE, tp=_TP_PAIR, ep=_TP_QUAD, dcp=_TP_PAIR, pcp=_TP_PAIR,
-        quant="w4a8", kv_cache_dtype="int8", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH,
+        quant="w4a8", kv_cache_dtype="int8", sequences=_A3_DEFAULT_BATCH,
         enable_flashcomm1=True,
     ),
     "deepseek_v41_flash_4layer_c2_swa": OfflineCaptureCaseConfig(
         "deepseek-v4.1-flash", layers=_DEFAULT_LAYERS_MOE, tp=_TP_QUAD, ep=_TP_QUAD,
-        quant="w8a8", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH, enable_flashcomm1=True,
+        quant="w8a8", sequences=_A3_DEFAULT_BATCH, enable_flashcomm1=True,
     ),
     "gemma4_26b_a4b_swa_moe": OfflineCaptureCaseConfig(
         "gemma-4-26b-a4b", layers=_DEFAULT_LAYERS_MOE, tp=_TP_QUAD, ep=_TP_QUAD,
-        quant="bf16", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH, enable_flashcomm1=True,
+        quant="bf16", sequences=_A3_DEFAULT_BATCH, enable_flashcomm1=True,
     ),
     "glm52_dcp4_w4a8_c8_sp": OfflineCaptureCaseConfig(
         "glm-5.2", layers=_DEFAULT_LAYERS_MOE, tp=_TP_QUAD, ep=_TP_QUAD, dcp=_TP_QUAD,
-        quant="w4a8", kv_cache_dtype="int8", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH,
+        quant="w4a8", kv_cache_dtype="int8", sequences=_A3_DEFAULT_BATCH,
         enable_flashcomm1=True,
     ),
     "glm53_flash_dcp1_w8a8_c8": OfflineCaptureCaseConfig(
         "glm-5.3-flash", layers=_DEFAULT_LAYERS_MOE, tp=_TP_QUAD, ep=_TP_QUAD,
-        quant="w8a8", kv_cache_dtype="int8", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH,
+        quant="w8a8", kv_cache_dtype="int8", sequences=_A3_DEFAULT_BATCH,
         enable_flashcomm1=True,
     ),
     "kimi_k31_dcp4_sharded1_aclgraph": OfflineCaptureCaseConfig(
         "kimi-k3.1", layers=_DEFAULT_LAYERS_MOE, tp=_TP_QUAD, ep=_TP_QUAD, dcp=_TP_QUAD,
-        quant="w8a8", kv_cache_dtype="int8", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH,
+        quant="w8a8", kv_cache_dtype="int8", sequences=_A3_DEFAULT_BATCH,
         enable_sfa_dcp_sharded_indexer=True,
     ),
     "kimi_k31_dcp4_sharded1_c8qli": OfflineCaptureCaseConfig(
         "kimi-k3.1", layers=_DEFAULT_LAYERS_MOE, tp=_TP_QUAD, ep=_TP_QUAD, dcp=_TP_QUAD,
-        quant="w8a8", kv_cache_dtype="int8", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH,
+        quant="w8a8", kv_cache_dtype="int8", sequences=_A3_DEFAULT_BATCH,
         enable_sfa_dcp_sharded_indexer=True,
     ),
     "kimi_k3_dcp4_bf16kv_mlapo_mso": OfflineCaptureCaseConfig(
         "kimi-k3", layers=_DEFAULT_LAYERS_MOE, tp=_TP_QUAD, ep=_TP_QUAD, dcp=_TP_QUAD,
-        quant="w8a8", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH,
+        quant="w8a8", sequences=_A3_DEFAULT_BATCH,
     ),
     "minimax_m3_gqa_indexer": OfflineCaptureCaseConfig(
         "minimax-m3", layers=_DEFAULT_LAYERS_MOE, tp=_TP_QUAD, ep=_TP_QUAD,
-        quant="bf16", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH, enable_flashcomm1=True,
+        quant="bf16", sequences=_A3_DEFAULT_BATCH, enable_flashcomm1=True,
     ),
     "nemotron3_mamba2_attn": OfflineCaptureCaseConfig(None),
     "qwen35_moe_gdn_gqa": OfflineCaptureCaseConfig(
         "qwen3.5-moe", layers=_DEFAULT_LAYERS_MOE, tp=_TP_QUAD, ep=_TP_QUAD,
-        quant="w8a8", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH, enable_flashcomm1=True,
+        quant="w8a8", sequences=_A3_DEFAULT_BATCH, enable_flashcomm1=True,
     ),
     "qwen38_flash_gdn_gqa": OfflineCaptureCaseConfig(
         "qwen3.8-flash-next", layers=_DEFAULT_LAYERS_MOE, tp=_TP_QUAD, ep=_TP_QUAD,
-        quant="bf16", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH, enable_flashcomm1=True,
+        quant="bf16", sequences=_A3_DEFAULT_BATCH, enable_flashcomm1=True,
     ),
     "qwen3_235b_a22b_moe_mc2": OfflineCaptureCaseConfig(
         "qwen3-235b-a22b", layers=_DEFAULT_LAYERS_MOE, tp=_TP_QUAD, ep=_TP_QUAD,
-        quant="w8a8", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH, enable_flashcomm1=True,
+        quant="w8a8", sequences=_A3_DEFAULT_BATCH, enable_flashcomm1=True,
     ),
     "qwen3_32b_w8a8mix_c8_fixed": OfflineCaptureCaseConfig(
         "qwen3-32b", layers=_DEFAULT_LAYERS_MOE, tp=_TP_QUAD, ep=None,
-        quant="w8a8", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH,
+        quant="w8a8", sequences=_A3_DEFAULT_BATCH,
     ),
 }
 
 _OFFLINE_A5_TAG_CONFIGS: Mapping[str, OfflineCaptureCaseConfig] = {
     "deepseek_v32": OfflineCaptureCaseConfig(
         "deepseek-v3.2", layers=_DEFAULT_LAYERS_MOE, tp=_TP_PAIR, ep=_TP_PAIR, dcp=_TP_PAIR,
-        quant="bf16", tokens=_A5_DEFAULT_BATCH, sequences=_A5_DEFAULT_BATCH,
+        quant="bf16", sequences=_A5_DEFAULT_BATCH,
     ),
     "deepseek_v32_aclgraph": OfflineCaptureCaseConfig(
         "deepseek-v3.2", layers=_DEFAULT_LAYERS_MOE, tp=_TP_PAIR, ep=_TP_PAIR, dcp=_TP_PAIR,
-        quant="bf16", tokens=_A5_DEFAULT_BATCH, sequences=_A5_DEFAULT_BATCH,
+        quant="bf16", sequences=_A5_DEFAULT_BATCH,
     ),
     "deepseek_v32_b3_sp": OfflineCaptureCaseConfig(
         "deepseek-v3.2", layers=_DEFAULT_LAYERS_MOE, tp=_TP_PAIR, ep=_TP_PAIR, dcp=_TP_PAIR,
-        quant="bf16", tokens=_A3_DEFAULT_BATCH, sequences=_A3_DEFAULT_BATCH,
+        quant="bf16", sequences=_A3_DEFAULT_BATCH,
     ),
     "deepseek_v41_c2_compressor_submod": OfflineCaptureCaseConfig(
         "deepseek-v4.1-flash", layers=_SUBMOD_LAYERS, tp=_TP_SINGLE, ep=_TP_SINGLE,
-        quant="bf16", tokens=_A5_DEFAULT_BATCH, sequences=_A5_DEFAULT_BATCH,
+        quant="bf16", sequences=_A5_DEFAULT_BATCH,
         submodule_recipes=("aclnn_compressor", "compressed_store", "compress_pool", "index_compress_pool"),
     ),
     "gemma4_26b_a4b": OfflineCaptureCaseConfig(
@@ -2626,16 +3458,26 @@ def _aggregate_step_nodes_for_offline_audit(
     rank_nodes = [n for n in step_nodes if n.rank_id == rank_id]
     if not rank_nodes:
         raise ModelingError(f"offline_parity_empty_rank_nodes:{tag}:rank={rank_id}")
-    grouped: dict[tuple[tuple[str, ...], str, bool], list[PredictedKernelNode]] = {}
+    grouped: dict[
+        tuple[tuple[str, ...], tuple[str, ...], str, bool, str, tuple[str, ...]],
+        list[PredictedKernelNode],
+    ] = {}
     for node in rank_nodes:
-        key = (node.expected_kernels, node.task_type, node.is_ai_cpu_metadata)
+        key = (
+            node.expected_kernels,
+            node.expected_task_types,
+            node.task_type,
+            node.is_ai_cpu_metadata,
+            node.input_shapes,
+            node.expected_input_shapes,
+        )
         grouped.setdefault(key, []).append(node)
     if not grouped:
         raise ModelingError(f"offline_parity_empty_expected_inventory:{tag}")
 
     out: list[PredictedKernelNode] = []
     has_sp_pad = False
-    for idx, ((kernels, ttype, is_aicpu), items) in enumerate(sorted(grouped.items())):
+    for idx, ((kernels, exp_tts, ttype, is_aicpu, in_shapes, exp_in_shapes), items) in enumerate(sorted(grouped.items())):
         if kernels == _PAD_MULTI_KERNEL or "PadV3" in kernels:
             has_sp_pad = True
         per_step_count = len(items)
@@ -2647,10 +3489,12 @@ def _aggregate_step_nodes_for_offline_audit(
             task_type=ttype,
             api_or_symbol=first.api_or_symbol,
             expected_kernels=kernels,
-            expected_task_types=first.expected_task_types,
+            expected_task_types=exp_tts,
+            input_shapes=in_shapes,
             is_ai_cpu_metadata=is_aicpu,
             min_count=per_step_count,
             max_count=per_step_count * max(1, int(step_upper_bound)),
+            expected_input_shapes=exp_in_shapes,
         ))
     if not has_sp_pad:
         out.append(PredictedKernelNode(
@@ -2664,6 +3508,51 @@ def _aggregate_step_nodes_for_offline_audit(
             max_count=0,
         ))
     return tuple(out)
+
+
+def _first_int_field(mapping: Mapping[str, Any] | None, keys: tuple[str, ...]) -> int | None:
+    if not mapping:
+        return None
+    for key in keys:
+        val = mapping.get(key)
+        if val is not None and not isinstance(val, bool):
+            return int(val)
+    return None
+
+
+def _resolve_offline_step_geometry(
+    cfg: OfflineCaptureCaseConfig,
+    *,
+    phase: PhaseKind,
+    capture_config: Mapping[str, Any] | None,
+) -> tuple[int, int, int]:
+    """Resolve independent ``(tokens_per_sequence, context_len, sequences)`` for offline lowering."""
+    sequences = _first_int_field(capture_config, ("sequences_per_replica", "sequences", "batch_size"))
+    if sequences is None:
+        sequences = int(cfg.sequences)
+    prompt_len = _first_int_field(capture_config, ("prompt_len", "prompt_tokens"))
+    explicit_context = _first_int_field(capture_config, ("context_tokens", "context_len", "context", "prefix_tokens"))
+    explicit_tokens = _first_int_field(capture_config, ("tokens_per_sequence", "query_tokens", "tokens"))
+    if phase == "prefill":
+        # Cold prefill starts with 0 prior cached KV; RequestView.kv_len = q_len + context.
+        context = explicit_context if explicit_context is not None else 0
+        if explicit_tokens is not None:
+            tokens = explicit_tokens
+        else:
+            tokens = prompt_len if prompt_len is not None else (
+                int(cfg.tokens) if cfg.phase == "prefill" else int(cfg.context)
+            )
+    else:
+        context = (
+            explicit_context
+            if explicit_context is not None
+            else (prompt_len if prompt_len is not None else int(cfg.context))
+        )
+        if explicit_tokens is not None:
+            tokens = explicit_tokens
+        else:
+            tokens = int(cfg.tokens) + max(0, int(cfg.mtp_proposal_tokens))
+    return tokens, context, sequences
 
 
 def _compose_offline_case(
@@ -2729,15 +3618,16 @@ def build_offline_expected_nodes(
     if cfg.model_id is None:
         return None
     case_dict = _compose_offline_case(cfg, device_arch=device_arch, capture_config=capture_config)
-    tokens = int((capture_config or {}).get("batch_size") or cfg.tokens)
-    context = int((capture_config or {}).get("prompt_len") or cfg.context)
     eff_phase: PhaseKind = capture_phase if capture_phase is not None else cfg.phase
+    tokens, context, sequences = _resolve_offline_step_geometry(
+        cfg, phase=eff_phase, capture_config=capture_config,
+    )
     prepared, full_preds = build_predicted_nodes_from_case(
         case_dict,
         phase=eff_phase,
         tokens=tokens,
         context=context,
-        sequences=tokens,
+        sequences=sequences,
         device_arch=device_arch,
         registry=reg,
     )
@@ -3028,8 +3918,8 @@ def _build_live_parity_report(
 def evaluate_live_dir(
     live_dir: Path,
     *,
-    device_arch: str,
-    hardware_sku: str,
+    device_arch: str | None = None,
+    hardware_sku: str | None = None,
     case: Case | Mapping[str, Any] | Path | None = None,
     predicted_nodes: Sequence[PredictedKernelNode] | None = None,
     phase: PhaseKind = "decode",
@@ -3043,17 +3933,30 @@ def evaluate_live_dir(
 ) -> dict[str, Any]:
     """Stream one rank trace at a time in bounded memory against independent predictions."""
     reg = registry if registry is not None else default_abi_registry()
+    parsed_case: Case | None = None
+    if case is not None:
+        if isinstance(case, Case):
+            parsed_case = case
+        elif isinstance(case, Path):
+            parsed_case = parse_case(_read_case_file(case))
+        else:
+            parsed_case = parse_case(dict(case))
+    resolved_arch, resolved_sku, dev_err = _resolve_live_target_device(
+        parsed_case, device_arch=device_arch, hardware_sku=hardware_sku,
+    )
+    if dev_err is not None:
+        raise ModelingError(f"live_parity_device_conflict:{dev_err}")
     if predicted_nodes is not None:
         expected_preds = tuple(predicted_nodes)
         graph_id = ""
-    elif case is not None:
+    elif parsed_case is not None:
         prepared, expected_preds = build_predicted_nodes_from_case(
-            case,
+            parsed_case,
             phase=phase,
             tokens=tokens,
             context=context,
             sequences=sequences,
-            device_arch=device_arch,
+            device_arch=resolved_arch,
             registry=reg,
         )
         graph_id = prepared.graph_id
@@ -3110,7 +4013,7 @@ def evaluate_live_dir(
             rank_id=rank_idx,
             phase=phase,
             exec_mode=exec_mode,
-            device_arch=device_arch,
+            device_arch=resolved_arch,
             registry=reg,
         )
         observed_ranks.append(rank_idx)
@@ -3136,7 +4039,7 @@ def evaluate_live_dir(
 
     return _build_live_parity_report(
         live_dir,
-        hardware_sku=hardware_sku,
+        hardware_sku=resolved_sku,
         graph_id=graph_id,
         phase=phase,
         exec_mode=exec_mode,
@@ -3194,20 +4097,11 @@ def main(
             if args.case is None:
                 parser.error("--live-dir requires --case for independent predictions")
             parsed_case = parse_case(_read_case_file(args.case))
-            case_sku = str(getattr(parsed_case.machine, "sku", "") or "").strip()
-            case_family = str(getattr(parsed_case.machine, "arch_family", "") or "").strip().upper()
-            case_arch = _infer_arch_from_case(parsed_case)
-            if (case_sku or case_family in _VALID_ARCHES) and args.arch is not None and args.arch != case_arch:
-                parser.error(f"--arch {args.arch} conflicts with case SKU {case_sku or case_family} ({case_arch})")
-            device_arch = args.arch or case_arch
-            if args.sku is not None:
-                arg_sku = args.sku.strip()
-                if case_sku and _canonical_sku(arg_sku) != _canonical_sku(case_sku):
-                    parser.error(f"--sku {arg_sku} conflicts with case SKU {case_sku}")
-                sku_arch = _arch_from_sku_name(arg_sku)
-                if sku_arch is not None and sku_arch != device_arch:
-                    parser.error(f"--sku {arg_sku} ({sku_arch}) conflicts with arch {device_arch}")
-            hardware_sku = (args.sku.strip() if args.sku else "") or case_sku or _default_sku_for_arch(device_arch)
+            device_arch, hardware_sku, dev_err = _resolve_live_target_device(
+                parsed_case, device_arch=args.arch, hardware_sku=args.sku,
+            )
+            if dev_err is not None:
+                parser.error(dev_err)
             result = evaluate_live_dir(
                 args.live_dir,
                 device_arch=device_arch,
