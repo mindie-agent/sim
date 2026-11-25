@@ -1650,6 +1650,9 @@ _E8M0_SCALE_BYTES = 1
 _DEFAULT_CONV_KERNEL_SIZE = 4
 _DEFAULT_LINEAR_HEAD_DIM = 128
 _MIN_CONV_KERNEL_SIZE = 2
+_LINEAR_ATTENTION_KINDS = frozenset({
+    "kda", "gdn", "mamba", "gla", "deltanet", "lightning", "retnet",
+})
 
 
 def resolve_checkpoint_tensor_abi(
@@ -1947,31 +1950,30 @@ def _resolve_recurrent_cache_abi(
     rec_dtype = str(plan.recurrent_state_dtype or "fp32").lower()
     rec_bytes = int(math.ceil(local_heads * k_dim * v_dim * dtype_bytes(rec_dtype)))
 
-    conv_k = max(_MIN_CONV_KERNEL_SIZE, int(plan.conv_kernel or _DEFAULT_CONV_KERNEL_SIZE))
-    history_slots = conv_k - 1
-    conv_w = int(plan.conv_width or (plan.conv_state_elements // max(1, history_slots)) or 0)
-    local_conv_w = max(1, conv_w // shard_div) if conv_w > 0 else max(1, local_heads * v_dim)
-    conv_dtype = str(plan.conv_state_dtype or "bf16").lower()
-    conv_bytes = int(math.ceil(local_conv_w * history_slots * dtype_bytes(conv_dtype)))
-
-    return CacheStateABI(
-        scope=scope,
-        native_layer=native_id,
-        component_role="recurrent_state",
-        producer_key=f"{scope}.l{native_id}.recurrent_state",
-        planes=(
-            CachePlaneABI(
-                plane_id="recurrent_state",
-                plane_kind="payload",
-                logical_axes=("head", "k_dim", "v_dim"),
-                logical_shape=(local_heads, k_dim, v_dim),
-                physical_shape=(local_heads, k_dim, v_dim),
-                dtype=rec_dtype,
-                layout="ND",
-                allocation_frequency="request_slot",
-                write_trigger="accepted_commit",
-                bytes_per_unit=rec_bytes,
-            ),
+    raw_conv_k = int(plan.conv_kernel) if plan.conv_kernel is not None else _DEFAULT_CONV_KERNEL_SIZE
+    has_conv = raw_conv_k >= _MIN_CONV_KERNEL_SIZE and not (
+        plan.conv_state_elements is not None and int(plan.conv_state_elements) == 0 and raw_conv_k <= 1
+    )
+    history_slots = max(0, raw_conv_k - 1) if has_conv else 0
+    rec_plane = CachePlaneABI(
+        plane_id="recurrent_state",
+        plane_kind="payload",
+        logical_axes=("head", "k_dim", "v_dim"),
+        logical_shape=(local_heads, k_dim, v_dim),
+        physical_shape=(local_heads, k_dim, v_dim),
+        dtype=rec_dtype,
+        layout="ND",
+        allocation_frequency="request_slot",
+        write_trigger="accepted_commit",
+        bytes_per_unit=rec_bytes,
+    )
+    if has_conv:
+        conv_w = int(plan.conv_width or (plan.conv_state_elements // max(1, history_slots)) or 0)
+        local_conv_w = max(1, conv_w // shard_div) if conv_w > 0 else max(1, local_heads * v_dim)
+        conv_dtype = str(plan.conv_state_dtype or "bf16").lower()
+        conv_bytes = int(math.ceil(local_conv_w * history_slots * dtype_bytes(conv_dtype)))
+        planes: tuple[CachePlaneABI, ...] = (
+            rec_plane,
             CachePlaneABI(
                 plane_id="conv_history",
                 plane_kind="payload",
@@ -1985,7 +1987,16 @@ def _resolve_recurrent_cache_abi(
                 write_trigger="append",
                 bytes_per_unit=conv_bytes,
             ),
-        ),
+        )
+    else:
+        planes = (rec_plane,)
+
+    return CacheStateABI(
+        scope=scope,
+        native_layer=native_id,
+        component_role="recurrent_state",
+        producer_key=f"{scope}.l{native_id}.recurrent_state",
+        planes=planes,
         phase=phase,
         deployment_role=role,
         checkpoint_digest=ckpt_digest,
@@ -2068,7 +2079,7 @@ def resolve_checkpoint_cache_abis(
     for plan in layers:
         scope = _cache_scope(plan)
         native = native_ids[scope, plan.index]
-        if plan.attention in {"kda", "gdn"}:
+        if plan.attention in _LINEAR_ATTENTION_KINDS:
             rec_abis.append(_resolve_recurrent_cache_abi(
                 plan, parallel, native_id=native, role=role, phase=phase, ckpt_digest=digest,
                 scope=scope, kda_parallel_axis=kda_parallel_axis, stage=stage,
@@ -2099,7 +2110,7 @@ def resolve_checkpoint_cache_abis(
                 kv_abis.append(CacheStateABI(
                     **common, component_role=component, producer_key=f"{scope}.l{native}.{component}",
                     planes=planes, window=None if component == "compressed_kv" else plan.window or None,
-                    compression_ratio=ratio, consumer_keys=shared,
+                    compression_ratio=1 if component == "window_kv" else ratio, consumer_keys=shared,
                 ))
         if (plan.indexer or plan.owns_index_k) and owner_id(scope, plan.index_k_owner_layer_id, native) == native:
             pool = max(1, plan.index_kpool)
