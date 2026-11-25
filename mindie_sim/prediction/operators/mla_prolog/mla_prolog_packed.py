@@ -7,7 +7,10 @@
 [Timeouts & Locks] Constant geometry arithmetic; no source/capture reads.
 [Side-Effect Policy] Builds immutable graph records only.
 """
+from typing import Literal
+
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.invocation import Occurrence
 from mindie_sim.schema.operators import (
     FieldDisposition, ProgramFragment, SemanticAttr, SemanticRef, StateEffect,
@@ -18,7 +21,15 @@ from mindie_sim.schema.subgraphs import (
 )
 
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCE_REF = SourceRef(
+    repository="vllm-project/vllm-ascend",
+    revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+    relative_path="vllm_ascend/attention/sfa_v1.py",
+    source_sha256="058aeb723a4ef3cdb0e07a5fc0180ec53f8227f62d98710144ecffb9cc66678f",
+)
 PACKED_KV_GROUP_SIZE = 128
+PACKED_E8M0_GROUP_SIZE = 32
 PACKED_KV_LATENT_DIM = 512
 PACKED_KV_QUANT_MODE = 3
 PACKED_KV_ROPE_DIM = 64
@@ -66,10 +77,13 @@ SOURCE_V4 = {
 }
 
 
-def view(latent, rope, group_size=PACKED_KV_GROUP_SIZE):
+def view(latent, rope, group_size=PACKED_KV_GROUP_SIZE, *, query_format=INT8_QUERY_FORMAT):
     if latent != PACKED_KV_LATENT_DIM or rope != PACKED_KV_ROPE_DIM or group_size != PACKED_KV_GROUP_SIZE:
         raise ModelingError('mla_prolog_packed_int8_requires_latent512_rope64_tile128')
-    return {'layout': LAYOUT, 'latent_dtype': 'int8', 'rope_dtype': 'bf16',
+    if query_format not in SUPPORTED_QUERY_FORMATS:
+        raise ModelingError('mla_prolog_packed_query_format_unsupported')
+    latent_dtype = MXFP8_QUERY_FORMAT if query_format == MXFP8_QUERY_FORMAT else INT8_QUERY_FORMAT
+    return {'layout': LAYOUT, 'latent_dtype': latent_dtype, 'rope_dtype': 'bf16',
             'scale_dtype': 'fp32', 'group_size': group_size,
             'payload_bytes': latent, 'rope_bytes': rope * 2,
             'scale_bytes': latent // group_size * PACKED_KV_SCALE_BYTES,
@@ -79,8 +93,35 @@ def view(latent, rope, group_size=PACKED_KV_GROUP_SIZE):
             'ckvkr_repo_mode': 1, 'quant_scale_repo_mode': 1}
 
 
+def packed_operand_scales(
+    *, tokens: int, hidden: int, local_heads: int, q_lora_rank: int,
+    kv_lora_rank: int, qk_nope_head_dim: int, qk_rope_head_dim: int,
+    query_format: str,
+) -> tuple[str, tuple[int, int], str, tuple[tuple[int, int], ...]]:
+    """Return CANN-exact (token_scale_dtype, shape, proj_scale_dtype, shapes) by query format."""
+    if query_format not in SUPPORTED_QUERY_FORMATS:
+        raise ModelingError('mla_prolog_packed_query_format_unsupported')
+    uq_qr_cols = local_heads * (qk_nope_head_dim + qk_rope_head_dim)
+    dkv_kr_cols = kv_lora_rank + qk_rope_head_dim
+    if query_format == MXFP8_QUERY_FORMAT:
+        hidden_groups = hidden // PACKED_E8M0_GROUP_SIZE
+        q_lora_groups = q_lora_rank // PACKED_E8M0_GROUP_SIZE
+        return (
+            'fp8_e8m0',
+            (tokens, hidden_groups),
+            'fp8_e8m0',
+            ((q_lora_rank, hidden_groups), (uq_qr_cols, q_lora_groups), (dkv_kr_cols, hidden_groups)),
+        )
+    return (
+        'fp32',
+        (tokens, 1),
+        'fp32',
+        ((1, q_lora_rank), (1, uq_qr_cols), (1, dkv_kr_cols)),
+    )
+
+
 def _packed_plan(*, plan, rows, query_format=INT8_QUERY_FORMAT):
-    cache = view(plan.kv_lora_rank, plan.qk_rope_head_dim)
+    cache = view(plan.kv_lora_rank, plan.qk_rope_head_dim, query_format=query_format)
     if type(rows) is not int or isinstance(rows, bool) or rows < 0:
         raise ModelingError('mla_prolog_packed_requires_nonnegative_rows')
     if query_format not in SUPPORTED_QUERY_FORMATS:
@@ -194,7 +235,7 @@ def store(builder, name, deps, rows, plan, query_format=INT8_QUERY_FORMAT):
     spec = _packed_plan(plan=plan, rows=rows, query_format=query_format)
     cache = spec['cache']
     return builder.work(
-        name, deps, (rows, cache['row_bytes']), family='cache_store', dtype='int8',
+        name, deps, (rows, cache['row_bytes']), family='cache_store', dtype=cache['latent_dtype'],
         read=spec['read'], write=spec['write'], vector=spec['vector'],
         metadata=(('cache_kind', name), ('cache_visible', True), ('shared_owner', False),
                   ('packed_cache', cache), ('source', SOURCE),
@@ -206,15 +247,18 @@ def store(builder, name, deps, rows, plan, query_format=INT8_QUERY_FORMAT):
 
 def validate_view(declaration):
     """One C8 row ABI; INT8 and MXFP8 query/projection modes share it."""
-    expected = view(declaration['latent_rank'], declaration['rope_width'])
     token = declaration.get('token_dtype')
+    if token not in SUPPORTED_QUERY_FORMATS:
+        raise ModelingError(
+            'mla_prolog_packed_requires_declared_token_projections_bf16_uk_and_tile128_cache')
+    expected = view(declaration['latent_rank'], declaration['rope_width'], query_format=token)
+    allowed_cache = {'int8', 'fp8_e4m3'} if token == MXFP8_QUERY_FORMAT else {'int8'}
     if (declaration.get('packed_cache') != expected
-            or token not in SUPPORTED_QUERY_FORMATS
             or tuple(declaration.get('projection_weight_dtypes', ())
                      ) != (token,) * TOKEN_PROJECTION_COUNT
             or declaration.get('absorbed_weight_dtype') != 'bf16'
             or declaration.get('norm_dtype') != 'bf16'
-            or declaration.get('cache_dtype') != 'int8'
+            or declaration.get('cache_dtype') not in allowed_cache
             or declaration.get('query_norm_dtype') != token):
         raise ModelingError(
             'mla_prolog_packed_requires_declared_token_projections_bf16_uk_and_tile128_cache')

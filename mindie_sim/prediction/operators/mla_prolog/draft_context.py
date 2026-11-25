@@ -11,14 +11,23 @@
 """
 from dataclasses import replace
 from math import ceil
+from typing import Literal
 
-from mindie_sim.catalog.ops import cache_store_op, gemm_op, vector_op, barrier_op
+from mindie_sim.catalog.ops import cache_store_op, compute_dtype_for, gemm_op, vector_op, barrier_op
 from mindie_sim.schema.common import dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 
 from mindie_sim.prediction.mechanism import Work
 from mindie_sim.prediction.physical_recipe_base import Phase, io_weight, tiled_phased_program
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
+SOURCE_REF = SourceRef(
+    repository="vllm-project/vllm-ascend",
+    revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+    relative_path="vllm_ascend/attention/mla_v1.py",
+    source_sha256="f7f672e001651a748d2e88ef0f36797ef78db63321ac657f1c7a944c0f561c22",
+)
 NORM_OPS = 5
 ROPE_OPS = 6
 PROLOG_RECIPE = "draft_context_mla_prolog_v3"
@@ -241,12 +250,24 @@ def prepare(ops, *, projection, model, draft, rows, query_rows,
         qkv_width = (draft.q_lora_rank + draft.kv_lora_rank
                      + draft.qk_rope_head_dim)
         if use_prolog_v3:
-            mla_format = model.quant.format_for("mla")
+            qa_fmt = model.quant.format_for("mla.q_a")
+            kva_fmt = model.quant.format_for("mla.kv_a")
+            qb_fmt = model.quant.format_for("mla.q_b")
+            mla_format = qa_fmt if qa_fmt == kva_fmt == qb_fmt else model.quant.format_for("mla")
             is_mxfp8 = mla_format == "fp8_e4m3"
             native_kind = PROLOG_V4_NATIVE_KIND if is_mxfp8 else PROLOG_NATIVE_KIND
-            prolog_dtype = mla_format if is_mxfp8 else draft.activation_dtype
+            qa_dtype = compute_dtype_for(model.quant, "mla.q_a")[0]
+            kva_dtype = compute_dtype_for(model.quant, "mla.kv_a")[0]
+            qb_dtype = compute_dtype_for(model.quant, "mla.q_b")[0]
+            prolog_dtype = (
+                qa_dtype if qa_dtype == kva_dtype == qb_dtype
+                else compute_dtype_for(model.quant, "mla")[0]
+            ) or draft.activation_dtype
             do_rope = bool(draft.qk_rope_head_dim > 0)
-            weight_bytes = model.quant.matrix_bytes(qkv_width, draft.hidden_size, "mla")
+            weight_bytes = (
+                model.quant.matrix_bytes(draft.q_lora_rank, draft.hidden_size, "mla.q_a")
+                + model.quant.matrix_bytes(kv_width, draft.hidden_size, "mla.kv_a")
+            )
             prolog = OpSpec(
                 op_id=name + ".mla_prolog_v3", deps=(norm.op_id,),
                 recipe=PROLOG_RECIPE, family="mla",
