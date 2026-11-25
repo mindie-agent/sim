@@ -6,7 +6,7 @@
 [Side-Effect Policy] Read-only."""
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 import hashlib
@@ -15,7 +15,7 @@ import json
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.invocation import FloorConstraint, InvocationTiming
 from mindie_sim.prediction.engine import Engine, Event
-from mindie_sim.prediction.program import Program
+from mindie_sim.prediction.program import KernelProgram, Program, Stage
 from mindie_sim.prediction.service_regime_domains.services import ResourceService
 
 
@@ -27,6 +27,8 @@ class InvocationProgram:
     timing: InvocationTiming
     #: Independently provenanced merged floors; empty keeps legacy timing only.
     constraints: tuple[FloorConstraint, ...] = ()
+    #: Optional deferred body resolver evaluated when startup finishes.
+    body_resolver: Callable[[], Program] | None = None
 
     def __post_init__(self):
         if not isinstance(self.timing, InvocationTiming):
@@ -42,7 +44,8 @@ class InvocationProgram:
         minimum_ms = max((self.timing.minimum_ms, *(item.minimum_ms
                           for item in self.constraints)), default=self.timing.minimum_ms)
         if startup_ms == 0 and ready.done:
-            body = self.body.start(engine, name + ":body", ready, owner=owner)
+            body_prog = self.body_resolver() if self.body_resolver is not None else self.body
+            body = body_prog.start(engine, name + ":body", ready, owner=owner)
             if minimum_ms == 0:
                 return body
             floor = engine.submit(
@@ -59,7 +62,8 @@ class InvocationProgram:
         def launch(startup: Event) -> None:
             # Expand the body only after startup has completed. This keeps idle
             # invocation state bounded and preserves the body's input readiness.
-            body = self.body.start(engine, name + ":body", startup, owner=owner)
+            body_prog = self.body_resolver() if self.body_resolver is not None else self.body
+            body = body_prog.start(engine, name + ":body", startup, owner=owner)
             dependencies = (body,) if floor is None else (body, floor)
             engine.submit(
                 name + ":body_complete", after=dependencies, owner=owner,
@@ -229,15 +233,124 @@ def _constraints(context, timing):
     return tuple(constraints)
 
 
+def _plan_exec_meta(recipe, context) -> Mapping | None:
+    recipe_meta = getattr(recipe, "metadata", None)
+    if isinstance(recipe_meta, Mapping) and (
+        "launch_count" in recipe_meta or "launch_boundaries" in recipe_meta
+    ):
+        return recipe_meta
+    op = getattr(context, "op", None)
+    op_meta = getattr(op, "metadata", None) if op is not None else None
+    if op_meta:
+        prog_exec = dict(op_meta).get("program_execution")
+        if isinstance(prog_exec, Mapping):
+            return prog_exec
+    return None
+
+
+def _declared_launch_count(recipe, context) -> int:
+    """Return declared sequential device kernel launch count (default 1)."""
+    meta = _plan_exec_meta(recipe, context)
+    raw = meta.get("launch_count") if meta is not None else None
+    if type(raw) is int and raw >= 0:
+        return raw
+    return 1
+
+
+def _declared_launch_boundaries(recipe, context) -> tuple[str, ...]:
+    """Return declared sequential launch-boundary stage names when present."""
+    meta = _plan_exec_meta(recipe, context)
+    raw = meta.get("launch_boundaries") if meta is not None else None
+    if isinstance(raw, (list, tuple)) and raw and all(type(item) is str and item for item in raw):
+        return tuple(raw)
+    return ()
+
+
+def _wrap_launch_program(
+    body: Program, timing: InvocationTiming, constraints: tuple[FloorConstraint, ...],
+) -> Program:
+    if timing.startup_ms == 0 and timing.minimum_ms > 0:
+        return _FloorJoinProgram(body, timing.minimum_ms, timing.provenance, constraints)
+    return InvocationProgram(body, timing, constraints)
+
+
+def _wrap_boundary_stages(
+    program: Program,
+    boundaries: tuple[str, ...],
+    timing: InvocationTiming,
+    single_constraints: tuple[FloorConstraint, ...],
+) -> Program | None:
+    """Wrap each declared launch-boundary Stage in its own per-launch invocation."""
+    if not isinstance(program, KernelProgram):
+        return None
+    stage_names = [s.name for s in program.stages]
+    if len(stage_names) == len(boundaries) and set(stage_names) == set(boundaries):
+        if any(s.acquire or s.free or s.previous for s in program.stages):
+            return None
+        wrapped = tuple(
+            Stage(
+                s.name,
+                after=s.after,
+                program=_wrap_launch_program(
+                    KernelProgram((replace(s, after=()),)),
+                    timing,
+                    single_constraints,
+                ),
+            )
+            for s in program.stages
+        )
+        return KernelProgram(wrapped, minimum_ms=program.minimum_ms)
+    if (
+        len(program.stages) == 2
+        and program.stages[0].name == "setup"
+        and program.stages[1].name == "body"
+        and program.stages[1].program is not None
+    ):
+        inner = _wrap_boundary_stages(
+            program.stages[1].program, boundaries, timing, single_constraints,
+        )
+        if inner is not None:
+            return KernelProgram(
+                (program.stages[0], replace(program.stages[1], program=inner)),
+                minimum_ms=program.minimum_ms,
+            )
+    return None
+
+
 def lower_invocation(recipe, context):
     timing = context.invocation_timing
     if timing is None:
         return recipe.lower(context)
+    launch_count = _declared_launch_count(recipe, context)
+    if launch_count == 0:
+        return recipe.lower(replace(context, invocation_timing=None))
     body = recipe.lower(replace(context, minimum_ms=0, invocation_timing=None))
+    if launch_count > 1 and (timing.startup_ms > 0.0 or timing.minimum_ms > 0.0):
+        boundaries = _declared_launch_boundaries(recipe, context)
+        if len(boundaries) == launch_count:
+            single_constraints = (
+                FloorConstraint(timing.startup_ms, timing.minimum_ms,
+                                timing.provenance, "invocation"),
+            )
+            wrapped_body = _wrap_boundary_stages(body, boundaries, timing, single_constraints)
+            if wrapped_body is not None:
+                regime_min = float(getattr(context, "minimum_ms", 0.0) or 0.0)
+                if regime_min > 0.0:
+                    regime_prov = dict(getattr(context, "minimum_provenance", {}) or {})
+                    regime_constraint = (
+                        FloorConstraint(0.0, regime_min, regime_prov, "service_regime"),
+                    )
+                    return _FloorJoinProgram(
+                        wrapped_body, regime_min, regime_prov, regime_constraint,
+                    )
+                return wrapped_body
+        provenance = {**dict(timing.provenance), "launch_count": launch_count}
+        timing = InvocationTiming(
+            startup_ms=timing.startup_ms * launch_count,
+            minimum_ms=timing.minimum_ms * launch_count,
+            provenance=provenance,
+        )
     constraints = _constraints(context, timing)
     # Keep ``timing`` as the invocation's own declaration; the merged floor
     # stays in ``constraints`` so its provenance is never overwritten.
-    if timing.startup_ms == 0 and timing.minimum_ms > 0:
-        return _FloorJoinProgram(body, timing.minimum_ms, timing.provenance,
-                                 constraints)
-    return InvocationProgram(body, timing, constraints)
+    return _wrap_launch_program(body, timing, constraints)

@@ -230,6 +230,7 @@ class Memory(
             enable_pcp_o_proj_weight_sharding=pcp_o_proj_shard,
             dcp_q_replicate=dcp_q_rep,
             slot_plans=self.slot_plans,
+            runtime=case.runtime,
         )
         weight_totals, weight_payloads = _weight_ledger_by_stage(
             case, self.layers, draft_kind=self.draft_kind,

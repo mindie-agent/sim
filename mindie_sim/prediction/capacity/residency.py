@@ -139,6 +139,7 @@ def _weight_ledger_by_stage(
         model, parallel, include_draft=include_draft, draft_kind=draft_kind or None,
         include_engram_tables=include_engram_tables, include_vision=include_vision,
         layer_partition=layer_stage, slot_plans=slot_plans, ep_rank=ep_rank,
+        runtime=case.runtime,
     ):
         total = payload = 0.0
         from mindie_sim.catalog.weights import _expand_resident_terms

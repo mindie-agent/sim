@@ -90,25 +90,50 @@ def _cached_p20_metrics(sku: str) -> dict[str, float | None]:
     return out
 
 
+_HOST_CHANNEL_BW_KEYS = (
+    ("solo_uni_bw_gbps", True),
+    ("solo_effective_uni_bw_gbps", True),
+    ("calibrated_uni_bw_gbps", True),
+    ("effective_uni_bw_gbps", True),
+    ("derived_uni_bw_gbps", True),
+    ("uni_peak_bw_gbps", False),
+)
+
+
+def _pos_bw_gbps(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    parsed = float(value)
+    return parsed if parsed > 0.0 else None
+
+
 def _channel_bw_gbps(channel: Mapping[str, Any] | None) -> tuple[float | None, bool]:
-    """Extract (bandwidth_gbps, is_effective) from one transfer-channel mapping."""
+    """Extract (bandwidth_gbps, is_effective) matching Hardware.host_solo_bw_gbps."""
     if not isinstance(channel, Mapping):
         return None, False
-    for key, is_eff in (
-        ("calibrated_uni_bw_gbps", True),
-        ("solo_effective_uni_bw_gbps", True),
-        ("effective_uni_bw_gbps", True),
-        ("derived_uni_bw_gbps", True),
-        ("uni_peak_bw_gbps", False),
-    ):
-        val = channel.get(key)
-        if val is not None and not isinstance(val, bool) and float(val) > 0.0:
-            return float(val), is_eff
+    if "effective_uni_bw_gbps" in channel and channel["effective_uni_bw_gbps"] is None:
+        return None, False
+    limits = [
+        val for key in ("solo_uni_bw_gbps", "solo_effective_uni_bw_gbps")
+        if (val := _pos_bw_gbps(channel.get(key))) is not None
+    ]
+    channel_eff = None
+    for key in ("effective_uni_bw_gbps", "calibrated_uni_bw_gbps", "derived_uni_bw_gbps"):
+        channel_eff = _pos_bw_gbps(channel.get(key))
+        if channel_eff is not None:
+            break
+    if channel_eff is not None:
+        limits.append(channel_eff)
+    if limits:
+        return min(limits), True
+    peak = _pos_bw_gbps(channel.get("uni_peak_bw_gbps"))
+    if peak is not None:
+        return peak, False
     return None, False
 
 
-def _profile_channel_default_gbps(sku: str, channel_name: str) -> float | None:
-    """Return the registered Ascend profile's baseline effective BW for override detection."""
+def _profile_channel(sku: str, channel_name: str) -> Mapping[str, Any] | None:
+    """Return the registered Ascend profile's baseline transfer-channel mapping."""
     if not sku:
         return None
     try:
@@ -119,10 +144,15 @@ def _profile_channel_default_gbps(sku: str, channel_name: str) -> float | None:
     if not isinstance(prof, Mapping):
         return None
     ch = (prof.get("transfer_channels") or {}).get(channel_name)
-    if not isinstance(ch, Mapping):
+    return ch if isinstance(ch, Mapping) else None
+
+
+def _profile_channel_default_gbps(sku: str, channel_name: str) -> float | None:
+    """Return the registered Ascend profile's baseline effective BW for override detection."""
+    ch = _profile_channel(sku, channel_name)
+    if ch is None:
         return None
-    val = ch.get("effective_uni_bw_gbps")
-    return float(val) if (val is not None and not isinstance(val, bool) and float(val) > 0.0) else None
+    return _pos_bw_gbps(ch.get("effective_uni_bw_gbps"))
 
 
 def _as_channel_dict(raw: Any) -> dict[str, Any] | None:
@@ -176,15 +206,19 @@ def _extract_machine_host_fields(
 
 def _channel_is_caller_override(sku: str, ch_name: str, ch: Mapping[str, Any] | None) -> bool:
     """True when the machine's transfer channel differs from the registered profile default."""
-    if not isinstance(ch, Mapping):
+    if not isinstance(ch, Mapping) or _channel_bw_gbps(ch)[0] is None:
         return False
-    eff = ch.get("effective_uni_bw_gbps")
-    if eff is None or isinstance(eff, bool) or float(eff) <= 0.0:
-        return False
-    default_eff = _profile_channel_default_gbps(sku, ch_name)
-    if default_eff is None:
+    prof_ch = _profile_channel(sku, ch_name)
+    if prof_ch is None:
         return True
-    return not math.isclose(float(eff), default_eff, rel_tol=1e-6, abs_tol=1e-6)
+    for key, _is_eff in _HOST_CHANNEL_BW_KEYS:
+        val = _pos_bw_gbps(ch.get(key))
+        if val is None:
+            continue
+        default_val = _pos_bw_gbps(prof_ch.get(key))
+        if default_val is None or not math.isclose(val, default_val, rel_tol=1e-6, abs_tol=1e-6):
+            return True
+    return False
 
 
 def resolve_sku_host_dma_rates(machine: Any) -> dict[str, Any]:

@@ -102,6 +102,7 @@ class CacheAccessResult:
     bypassed: bool
     cold_path: bool
     ready_ms: float
+    line_bytes: int = A5_LINE_BYTES
 
     @property
     def hbm_bytes(self) -> int:
