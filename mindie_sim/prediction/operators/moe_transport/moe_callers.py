@@ -13,8 +13,10 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, replace
 import math
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
+from mindie_sim.catalog.expert_slots import expert_slot_plan
+from mindie_sim.prediction.operators.moe_routing.expert_slot_work import physical_slot_work
 from mindie_sim.schema.common import (
     EPLB_VARIANCE_DAMPING,
     ORDER_STAT_M2_Z,
@@ -23,6 +25,7 @@ from mindie_sim.schema.common import (
     normal_max_order_z,
     normal_max_order_z as _normal_max_order_z,
 )
+from mindie_sim.schema.datapath import SourceRef
 from .moe_callers_receipts import (
     ExpertReceipt,
     _build_expert_receipt,
@@ -35,6 +38,8 @@ from .moe_callers_receipts import (
     _receipt_vector,
     project_expert_receipt,
 )
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 
 
 LOCAL_EXPERT_REDUCE = "local_expert_reduce"
@@ -88,6 +93,54 @@ def _eplb_damping_active(parallel, runtime=None) -> bool:
     return False
 
 
+def _zero_expert_count(layer, model) -> int:
+    """Count zero/identity MoE slots competing in routing."""
+    facts = dict(getattr(model, "catalog_facts", ()) or {})
+    return max(0, int(
+        getattr(layer, "zero_expert_num", 0)
+        or getattr(model, "zero_expert_num", 0)
+        or facts.get("zero_expert_num", 0)
+        or 0
+    ))
+
+
+def _apply_zero_expert_share(
+    rows: Sequence[float], active: Sequence[float], tokens: int, zero_experts: int,
+) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Project real-expert rows and active probabilities under zero-expert slots."""
+    num_experts = len(rows)
+    if zero_experts <= 0 or num_experts <= 0:
+        return tuple(rows), tuple(active)
+    real_share = float(num_experts) / float(num_experts + int(zero_experts))
+    scaled_rows = tuple(value * real_share for value in rows)
+    scaled_active = []
+    for value in scaled_rows:
+        inclusion = (value / float(tokens)) if tokens > 0 else 0.0
+        scaled_active.append(
+            -math.expm1(float(tokens) * math.log1p(-inclusion))
+            if 0.0 < inclusion < 1.0
+            else float(tokens > 0 and inclusion > 0.0)
+        )
+    return scaled_rows, tuple(scaled_active)
+
+
+def _hypergeometric_any_real_prob(
+    pool: int, real_experts: int, top_k: int, tokens: int,
+) -> float:
+    """Exact P(>=1 real expert drawn across tokens independent top-k draws)."""
+    if tokens <= 0 or top_k <= 0 or real_experts <= 0 or pool <= 0:
+        return 0.0
+    zero_pool = max(0, int(pool) - int(real_experts))
+    if top_k > zero_pool:
+        return 1.0
+    p_miss_token = math.comb(zero_pool, top_k) / math.comb(int(pool), top_k)
+    if p_miss_token <= 0.0:
+        return 1.0
+    if p_miss_token >= 1.0:
+        return 0.0
+    return -math.expm1(float(tokens) * math.log(p_miss_token))
+
+
 def _straggler_rank_moments(
     *,
     tokens: int,
@@ -101,6 +154,11 @@ def _straggler_rank_moments(
     local_expert_count: int,
     eplb_damped: bool,
     pool_experts: int | None = None,
+    local_slot_probs: Sequence[float] | None = None,
+    slot_copies: Sequence[int] | None = None,
+    total_slots: int | None = None,
+    uncertain_global_mass: float | None = None,
+    active_rank_count: int | None = None,
 ) -> tuple[float, float]:
     """Closed-form O(E) order-statistic slowest EP rank rows and active banks."""
     if tokens <= 0 or top_k <= 0 or total_rows <= 0.0 or local_expert_count <= 0:
@@ -108,30 +166,64 @@ def _straggler_rank_moments(
     if ep <= 1:
         return mean_rows, math.fsum(local_active)
     pool = max(1, int(pool_experts if pool_experts is not None else num_experts))
+    fpc_pool = max(pool, int(total_slots or 0))
     variance_scale = EPLB_VARIANCE_DAMPING if eplb_damped else 1.0
     rank_share = min(1.0, max(0.0, mean_rows / max(1.0, total_rows)))
-    fpc = max(0.0, 1.0 - float(top_k - 1) / float(max(1, pool - 1)))
-    sigma_rows = math.sqrt(max(
-        0.0,
-        total_rows * rank_share * (1.0 - rank_share) * fpc * variance_scale,
-    ))
-    active_ranks = min(ep, max(1, math.ceil(total_rows - _STRAGGLER_ORDER_EPS)))
+    fpc = max(0.0, 1.0 - float(top_k - 1) / float(max(1, fpc_pool - 1)))
+    hypergeom_var = total_rows * rank_share * (1.0 - rank_share) * fpc * variance_scale
+    if local_slot_probs is not None:
+        copies_seq = (
+            slot_copies if slot_copies is not None else (1,) * len(local_slot_probs)
+        )
+        reachable_local = sum(1 for p in local_slot_probs if p > _STRAGGLER_ORDER_EPS)
+        replicated_var = 0.0
+        uncertain_local = 0.0
+        uncertain_bernoulli = 0.0
+        for p, copy_count in zip(local_slot_probs, copies_seq):
+            if p <= _STRAGGLER_ORDER_EPS:
+                continue
+            if int(copy_count) > 1:
+                replicated_var += p * (1.0 - p)
+            elif p < 1.0 - _STRAGGLER_ORDER_EPS:
+                uncertain_local += p
+                uncertain_bernoulli += p * (1.0 - p)
+        if uncertain_global_mass is not None and uncertain_global_mass > _STRAGGLER_ORDER_EPS:
+            share_uncertain = min(1.0, max(0.0, uncertain_local / uncertain_global_mass))
+            uncertain_var = min(
+                uncertain_bernoulli,
+                uncertain_local * (1.0 - share_uncertain),
+            )
+        else:
+            uncertain_var = uncertain_bernoulli
+        slot_var = float(tokens) * (replicated_var + uncertain_var) * variance_scale
+        row_var = min(hypergeom_var, slot_var)
+    else:
+        reachable_local = local_expert_count
+        row_var = hypergeom_var
+    if reachable_local <= 0:
+        return 0.0, 0.0
+    sigma_rows = math.sqrt(max(0.0, row_var))
+    rank_cap = max(1, min(ep, int(active_rank_count))) if active_rank_count is not None else ep
+    active_ranks = min(rank_cap, max(1, math.ceil(total_rows - _STRAGGLER_ORDER_EPS)))
     z_order = normal_max_order_z(active_ranks)
-    row_cap = float(tokens * min(top_k, local_expert_count))
+    row_cap = float(tokens * min(top_k, reachable_local))
+    row_upper = min(total_rows, row_cap)
+    is_integer_total = math.isclose(
+        total_rows, round(total_rows), rel_tol=0.0, abs_tol=_STRAGGLER_ORDER_EPS,
+    )
     if total_rows < 1.0:
         # Exact indicator lower bound when zero_experts shrinks N_eff < 1.0:
-        # E[max_r R_r] >= P(at least one real assignment) = 1 - (1 - p_real)^(tokens * top_k).
-        n_draws = max(1, int(tokens) * int(top_k))
-        p_real = min(1.0, max(0.0, total_rows / float(n_draws)))
-        p_any = 1.0 - (1.0 - p_real) ** n_draws
+        # E[max_r R_r] >= P(at least one real assignment) under without-replacement top-k.
+        p_any = _hypergeometric_any_real_prob(pool, num_experts, top_k, tokens)
         row_lower = max(mean_rows, p_any)
-        row_upper = min(total_rows, row_cap)
+        r_max = min(row_upper, max(row_lower, mean_rows + z_order * sigma_rows))
+    elif not is_integer_total:
+        row_lower = max(mean_rows, total_rows / float(ep))
         r_max = min(row_upper, max(row_lower, mean_rows + z_order * sigma_rows))
     else:
         row_lower = float(math.ceil(total_rows / float(ep) - _STRAGGLER_ORDER_EPS))
-        row_upper = min(float(math.ceil(total_rows - _STRAGGLER_ORDER_EPS)), row_cap)
         r_max = float(min(
-            int(row_upper),
+            int(round(row_upper)),
             max(int(row_lower), int(round(mean_rows + z_order * sigma_rows))),
         ))
     mu_act = math.fsum(local_active)
@@ -142,14 +234,12 @@ def _straggler_rank_moments(
     )
     sigma_act = math.sqrt(max(0.0, var_act))
     if total_active < 1.0:
-        n_draws = max(1, int(tokens) * int(top_k))
-        p_real = min(1.0, max(0.0, total_rows / float(n_draws)))
-        p_any = 1.0 - (1.0 - p_real) ** n_draws
+        p_any = _hypergeometric_any_real_prob(pool, num_experts, top_k, tokens)
         act_lower = min(r_max, max(mu_act, p_any))
     else:
         act_lower = max(1.0, float(math.ceil(total_active / float(ep) - _STRAGGLER_ORDER_EPS)))
     a_max = min(
-        float(local_expert_count),
+        float(reachable_local),
         r_max,
         max(act_lower, mu_act + z_order * sigma_act),
     )
@@ -234,6 +324,17 @@ SOURCE = {
 }
 
 
+SOURCES: tuple[SourceRef, ...] = tuple(
+    SourceRef(
+        repository=SOURCE["repository"],
+        revision=SOURCE["revision"],
+        relative_path=rel_path,
+        source_sha256=sha256,
+    )
+    for rel_path, (sha256, _lines, _symbol) in SOURCE["files"].items()
+)
+
+
 @dataclass(frozen=True)
 class RoutingPolicy:
     tile_rows: int = 1
@@ -246,16 +347,43 @@ class RoutingPolicy:
         if (any(value < 0 or not math.isfinite(value) for value in probabilities)
                 or sum(value > 0 for value in probabilities) < layer.top_k):
             raise ValueError("routing_support_must_cover_top_k")
-        # Weighted sampling without replacement: saturate certain selections,
-        # then redistribute remaining probability mass. Sum inclusions = top-k.
-        remaining, available = float(layer.top_k), math.fsum(probabilities)
+        # Weighted sampling without replacement: exact two-phase water-filling.
+        # Phase 1 peels off strictly saturated experts using exact integer
+        # remaining slots ((remaining_int - 1) * p_i >= tail_after) to avoid
+        # floating-point absorption; Phase 2 distributes remaining slots
+        # proportionally over the tail without iterative subtraction.
+        ordered = sorted(range(layer.num_experts), key=lambda i: probabilities[i], reverse=True)
+        positive = [index for index in ordered if probabilities[index] > 0.0]
         inclusions = [0.0] * layer.num_experts
-        for index in sorted(range(layer.num_experts), key=lambda i: probabilities[i], reverse=True):
-            probability = probabilities[index]
-            inclusion = min(1.0, remaining * probability / available) if available else 0
-            inclusions[index] = inclusion
-            remaining -= inclusion
-            available -= probability
+        if len(positive) <= layer.top_k:
+            for index in positive:
+                inclusions[index] = 1.0
+        else:
+            suffix = [0.0] * (len(positive) + 1)
+            for pos in range(len(positive) - 1, -1, -1):
+                suffix[pos] = math.fsum(
+                    probabilities[positive[j]] for j in range(pos, len(positive))
+                )
+            remaining_int = int(layer.top_k)
+            split = len(positive)
+            for pos, index in enumerate(positive):
+                if remaining_int <= 0:
+                    break
+                tail_after = suffix[pos + 1]
+                if float(remaining_int - 1) * probabilities[index] >= tail_after:
+                    inclusions[index] = 1.0
+                    remaining_int -= 1
+                else:
+                    split = pos
+                    break
+            if remaining_int > 0 and split < len(positive):
+                denom = suffix[split]
+                if denom > 0.0:
+                    for pos in range(split, len(positive)):
+                        index = positive[pos]
+                        inclusions[index] = min(
+                            1.0, float(remaining_int) * (probabilities[index] / denom),
+                        )
         rows, active = [], []
         for inclusion in inclusions:
             rows.append(tokens * inclusion)
@@ -271,18 +399,7 @@ class RoutingPolicy:
         rows, active = self.expert_moments(model, layer, tokens)
         num_experts = len(rows)
         pool_experts = num_experts + max(0, int(zero_experts))
-        if zero_experts > 0 and num_experts > 0:
-            real_share = float(num_experts) / float(pool_experts)
-            rows = tuple(value * real_share for value in rows)
-            scaled_active = []
-            for value in rows:
-                inclusion = (value / float(tokens)) if tokens > 0 else 0.0
-                scaled_active.append(
-                    -math.expm1(float(tokens) * math.log1p(-inclusion))
-                    if 0.0 < inclusion < 1.0
-                    else float(tokens > 0 and inclusion > 0.0)
-                )
-            active = tuple(scaled_active)
+        rows, active = _apply_zero_expert_share(rows, active, tokens, zero_experts)
         ep = int(parallel.ep)
         damped = (
             _eplb_damping_active(parallel, runtime)
@@ -293,49 +410,56 @@ class RoutingPolicy:
             if zero_experts > 0
             else float(max(0, int(tokens)) * int(layer.top_k))
         )
-        if ep > num_experts and num_experts > 0:
-            def copies(expert):
-                return 1 + (ep - 1 - expert) // num_experts
-            rank_rows = [rows[r % num_experts] / copies(r % num_experts) for r in range(ep)]
-            slowest = max(range(ep), key=rank_rows.__getitem__) if owner is None else owner
-            expert_idx = slowest % num_experts
-            replicas = copies(expert_idx)
-            inclusion = (rows[expert_idx] / tokens) if tokens > 0 else 0.0
-            rep_tokens = tokens / replicas
-            act_val = (-math.expm1(rep_tokens * math.log1p(-inclusion))
-                       if 0 < inclusion < 1 else float(rep_tokens > 0 and inclusion > 0))
-            if owner is not None or tokens <= 0 or ep <= 1:
-                return rank_rows[slowest], act_val
-            return _straggler_rank_moments(
-                tokens=tokens,
-                top_k=int(layer.top_k),
-                num_experts=num_experts,
-                ep=ep,
-                total_rows=total_rows,
-                total_active=math.fsum(active),
-                mean_rows=rank_rows[slowest],
-                local_active=(act_val,),
-                local_expert_count=1,
-                eplb_damped=damped,
-                pool_experts=pool_experts,
-            )
-        rank_rows = [math.fsum(rows[index::ep]) for index in range(ep)]
-        slowest = max(range(ep), key=rank_rows.__getitem__) if owner is None else owner
-        local_active = active[slowest::ep]
-        if owner is not None or tokens <= 0 or ep <= 1:
-            return rank_rows[slowest], math.fsum(local_active)
+        if tokens <= 0 or num_experts <= 0:
+            return 0.0, 0.0
+        logical_inclusions = tuple(
+            min(1.0, max(0.0, value / float(tokens))) for value in rows
+        )
+        slot_plan = expert_slot_plan(model, layer, parallel)
+        slot_work = physical_slot_work(
+            slot_plan=slot_plan,
+            logical_inclusions=logical_inclusions,
+            global_tokens=int(tokens),
+        )
+        rank_rows = slot_work.expected_rows_by_rank
+        slowest = max(range(ep), key=rank_rows.__getitem__) if owner is None else int(owner)
+        local_active = slot_work.active_probabilities[slowest]
+        if owner is not None or ep <= 1:
+            return float(rank_rows[slowest]), float(math.fsum(local_active))
+        copies = slot_plan.copies_per_expert()
+        local_ids = slot_plan.expert_ids_by_rank[slowest]
+        local_slot_probs = tuple(
+            logical_inclusions[expert] / float(max(1, copies[expert]))
+            for expert in local_ids
+        )
+        local_slot_copies = tuple(max(1, int(copies[expert])) for expert in local_ids)
+        total_slots = sum(len(ids) for ids in slot_plan.expert_ids_by_rank)
+        uncertain_global_mass = math.fsum(
+            logical_inclusions[e]
+            for e in range(num_experts)
+            if copies.get(e, 1) == 1 and _STRAGGLER_ORDER_EPS < logical_inclusions[e] < 1.0 - _STRAGGLER_ORDER_EPS
+        )
+        active_rank_count = sum(1 for r in rank_rows if r > _STRAGGLER_ORDER_EPS)
+        total_active = math.fsum(
+            math.fsum(probs) for probs in slot_work.active_probabilities
+        )
         return _straggler_rank_moments(
             tokens=tokens,
             top_k=int(layer.top_k),
             num_experts=num_experts,
             ep=ep,
             total_rows=total_rows,
-            total_active=math.fsum(active),
-            mean_rows=rank_rows[slowest],
+            total_active=total_active,
+            mean_rows=float(rank_rows[slowest]),
             local_active=local_active,
             local_expert_count=len(local_active),
             eplb_damped=damped,
             pool_experts=pool_experts,
+            local_slot_probs=local_slot_probs,
+            slot_copies=local_slot_copies,
+            total_slots=total_slots,
+            uncertain_global_mass=uncertain_global_mass,
+            active_rank_count=active_rank_count,
         )
 
 
@@ -572,6 +696,10 @@ class LocalExpertReduce:
             expert_rows, expert_active = moments(model, layer, tokens)
             if len(expert_rows) != self.experts or len(expert_active) != self.experts:
                 raise ModelingError("local_expert_reduce_expert_moment_width_mismatch")
+            zero_experts = _zero_expert_count(layer, model)
+            expert_rows, expert_active = _apply_zero_expert_share(
+                expert_rows, expert_active, tokens, zero_experts,
+            )
             rank_rows = tuple(math.fsum(expert_rows[rank * bank:(rank + 1) * bank])
                               for rank in range(self.ep))
             representative = max(range(self.ep), key=rank_rows.__getitem__)
@@ -579,17 +707,22 @@ class LocalExpertReduce:
             bank_active = tuple(
                 expert_active[representative * bank:(representative + 1) * bank])
             if tokens > 0 and self.ep > 1:
+                local_slot_probs = tuple(
+                    min(1.0, max(0.0, value / float(tokens))) for value in bank_rows
+                )
                 local_rows, active = _straggler_rank_moments(
                     tokens=tokens,
                     top_k=int(layer.top_k),
                     num_experts=self.experts,
                     ep=self.ep,
-                    total_rows=float(tokens * int(layer.top_k)),
+                    total_rows=math.fsum(expert_rows),
                     total_active=math.fsum(expert_active),
                     mean_rows=rank_rows[representative],
                     local_active=bank_active,
                     local_expert_count=len(bank_active),
                     eplb_damped=_eplb_damping_active(parallel, runtime),
+                    pool_experts=self.experts + zero_experts,
+                    local_slot_probs=local_slot_probs,
                 )
             else:
                 local_rows = rank_rows[representative]
@@ -730,9 +863,8 @@ def select(runtime, plan, parallel, model, tokens: int, *,
         raise ModelingError(
             f"local_expert_reduce_requires_divisible_expert_banks:"
             f"{plan.num_experts}%{parallel.ep}")
-    # PCP/PP do not change the replicated token view inside one EP=TP group.
-    # CP still shards the KV context this caller does not model.
-    if parallel.cp != 1 or parallel.pcp < 1 or parallel.pp < 1:
+    # CP and PCP shard context/prompt tokens across collectives not emitted by this caller.
+    if parallel.cp != 1 or parallel.pcp != 1 or parallel.pp < 1:
         raise ModelingError(
             f"local_expert_reduce_requires_cp_pcp1:{parallel.cp},{parallel.pcp}")
     if sequence_plan is not None:

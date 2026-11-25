@@ -19,9 +19,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 import math
+from typing import Literal
 
 from mindie_sim.catalog.ops import comm_op, vector_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from .moe_transport_exchange import (
     _EXPERT_ROW_FORMAT,
     _PeerRouteId,
@@ -29,16 +31,56 @@ from .moe_transport_exchange import (
     _peer_metadata,
     _peer_payload,
     _routing_peer_counts,
+    _token_route_from_op,
     combine,
+    combine_unorder,
     dispatch,
+    receive_reorder,
 )
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_REVISION = "175ef4d49c2072f9233619636f0309f4f88b4e2c"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-ascend",
+        revision=_VLLM_ASCEND_REVISION,
+        relative_path="vllm_ascend/ops/fused_moe/token_dispatcher.py",
+        source_sha256="6126304014959e8c52d87284ccac078f7622a6d72c7a7fc8be25929dfe644cfb",
+    ),
+    SourceRef(
+        repository="vllm-ascend",
+        revision=_VLLM_ASCEND_REVISION,
+        relative_path="vllm_ascend/ops/fused_moe/prepare_finalize.py",
+        source_sha256="88560c839172f5b433753c796d17a5d41278204f33b2e9ca9d4b2af9ccbe16d8",
+    ),
+    SourceRef(
+        repository="vllm-ascend",
+        revision=_VLLM_ASCEND_REVISION,
+        relative_path="vllm_ascend/ops/fused_moe/moe_comm_method.py",
+        source_sha256="b785ade12a81349d01d4806c95ab17d37537db9548b3aae492135c8f4318fe39",
+    ),
+)
 
 _SELECTOR = "moe_transport"
 _KIND = "separate_quantized_payload"
 _MX_SCALE_GROUP_SIZE = 32
+_MX_SCALE_PACK = 2
 _QUANT_OPS_PER_ELEMENT = 4
 _QUANT_SCALE_OPS_PER_GROUP = 3
+
+
+def scale_tensor_geometry(
+    rows: int, width: int, *, group: int, pack: int = 1,
+) -> tuple[tuple[int, ...], int]:
+    """Canonical scale tensor shape and per-row element count (handles MX pack=2)."""
+    groups = max(1, math.ceil(width / max(1, int(group))))
+    pack_width = max(1, int(pack))
+    if pack_width > 1:
+        packed_pairs = math.ceil(groups / pack_width)
+        return (int(rows), packed_pairs, pack_width), packed_pairs * pack_width
+    if groups > 1:
+        return (int(rows), groups), groups
+    return (int(rows),), 1
 _EXPERT_ID_DTYPE = "int32"
 _EXPERT_ID_BYTES = dtype_bytes(_EXPERT_ID_DTYPE)
 _MXFP8 = frozenset({"mxfp8", "mx_fp8", "mxfp8_e4m3"})
@@ -61,8 +103,20 @@ _CONFIG = {
 }
 
 
-def _normalized_dtype(value, reason):
+_FLOAT_DTYPE_ALIASES = {
+    "bfloat16": "bf16",
+    "float16": "fp16",
+    "float32": "fp32",
+}
+
+
+def _canonical_dtype(value: str) -> str:
     text = str(value).strip().lower().replace("-", "_")
+    return _FLOAT_DTYPE_ALIASES.get(text, text)
+
+
+def _normalized_dtype(value, reason):
+    text = _canonical_dtype(value)
     if text not in _DISPATCH_DTYPES:
         raise ModelingError(f"{reason}:{value!r}")
     return text
@@ -140,6 +194,7 @@ class Transport:
     deepep_mode: bool = False
     deepep_overlap_ratio: float = 0.0
     ranks_per_node: int = 0
+    scale_pack: int = 1
 
     @property
     def payload_bytes(self):
@@ -163,18 +218,20 @@ class Transport:
 
     @property
     def inline_scales(self):
-        """Block scales travel inside each payload row (MXFP8)."""
-        return bool(self.scale_group and self.scale_granularity not in {"row", "per_row"})
+        """ALLTOALL sends scales in a separate collective from payload."""
+        return False
 
     def scale_bytes(self, width):
         if not self.quantized:
             return 0.0
         if self.scale_group:
-            return math.ceil(width / self.scale_group) * dtype_bytes(self.scale_dtype)
-        return dtype_bytes(self.scale_dtype)
+            _, count = scale_tensor_geometry(
+                1, width, group=self.scale_group, pack=self.scale_pack)
+            return float(count) * dtype_bytes(self.scale_dtype)
+        return float(dtype_bytes(self.scale_dtype))
 
     def row_bytes(self, width):
-        """Total wire bytes for one token row, including inline block scales."""
+        """Wire bytes for one payload row (inline scales added only if inline)."""
         return width * self.payload_bytes + (
             self.scale_bytes(width) if self.inline_scales else 0.0)
 
@@ -194,6 +251,7 @@ class Transport:
             "payload_bytes": float(payload),
             "scale_dtype": self.scale_dtype,
             "scale_group": int(self.scale_group),
+            "scale_pack": int(self.scale_pack),
             "scale_bytes": float(scales),
             "row_bytes": float(payload + scales),
             "element_bytes": float((payload + scales) / width) if width else 0.0,
@@ -239,7 +297,7 @@ def _parse(raw, metadata, layer_scope):
         if payload is not None:
             wire = _normalized_dtype(payload, "moe_transport_unsupported:payload_dtype")
             expected = _payload_dtype(dispatch)
-            if wire != expected and not (wire in _FP8 and expected in _FP8):
+            if _payload_dtype(wire) != expected:
                 raise ModelingError(
                     "moe_transport_dispatch_payload_conflict:"
                     f"{dispatch}!={payload}")
@@ -267,11 +325,15 @@ def _parse(raw, metadata, layer_scope):
         group = _MX_SCALE_GROUP_SIZE
     else:
         group = 0
+    scale_pack = 1
     if not quantized:
         if group:
             raise ModelingError("moe_transport_unquantized_payload_has_no_scales")
         scale_dtype, granularity = "", "none"
     elif dispatch in _MXFP8:
+        if group != _MX_SCALE_GROUP_SIZE:
+            raise ModelingError(
+                f"moe_transport_mxfp8_requires_block32_scale_group:{group}")
         scale_dtype = str(raw.get("scale_dtype", "fp8_e8m0")).strip().lower()
         granularity = str(raw.get("scale_granularity", "block")).strip().lower()
         if scale_dtype not in {"fp8_e8m0", "e8m0"}:
@@ -280,6 +342,7 @@ def _parse(raw, metadata, layer_scope):
                 "expected='fp8_e8m0'")
         if granularity not in {"block", "block32", "group"}:
             raise ModelingError("moe_transport_mxfp8_requires_block_scale_granularity")
+        scale_pack = _MX_SCALE_PACK
     else:
         scale_dtype = str(raw.get("scale_dtype", "fp32")).strip().lower()
         granularity = str(raw.get("scale_granularity", "row")).strip().lower()
@@ -292,7 +355,7 @@ def _parse(raw, metadata, layer_scope):
     return Transport(
         kind=kind, payload_dtype=wire_dtype, scale_dtype=scale_dtype,
         scale_granularity=granularity, histogram_dtype=histogram,
-        dispatch_dtype=dispatch, scale_group=group,
+        dispatch_dtype=dispatch, scale_group=group, scale_pack=scale_pack,
         eplb_peak_to_avg=_eplb_ratio(raw, metadata),
         deepep_mode=_mode(raw) == "deepep",
         deepep_overlap_ratio=_overlap_ratio(raw, metadata),
@@ -340,28 +403,48 @@ def default_dispatch_spec(model, plan=None, width=None):
         scale_format = str(getattr(quant, "activation_scale_format", "")
                            or getattr(quant, "scale_format", ""))
         pack = int(getattr(quant, "activation_scale_pack", 0) or 1)
-        groups = (latent + group - 1) // group
+        _, packed_count = scale_tensor_geometry(1, latent, group=group, pack=pack)
         scale_bytes_per_row = (
-            float(((groups + pack - 1) // pack) * pack * dtype_bytes(scale_format))
+            float(packed_count * dtype_bytes(scale_format))
             if scale_format else 0.0)
         payload_bytes_per_row = float(latent * dtype_bytes("fp4_e2m1"))
+    elif act in _MXFP8:
+        # MXFP8 is a 1 B E4M3 payload plus one E8M0 byte per 32-element block;
+        # strip the scale already folded into dtype_bytes('mxfp8').
+        group, scale_format, _, scale_bytes_per_row = activation_scales(
+            quant, act, 1, latent)
+        pack = int(getattr(quant, "activation_scale_pack", 0) or 1)
+        payload_bytes_per_row = float(latent * dtype_bytes("fp8_e4m3"))
     else:
         group, scale_format, _, scale_bytes_per_row = activation_scales(
             quant, act, 1, latent)
+        pack = int(getattr(quant, "activation_scale_pack", 0) or 1)
         payload_bytes_per_row = float(latent * dtype_bytes(act))
     quantized = act not in {"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"}
-    if act in _FP8 and group == _MX_SCALE_GROUP_SIZE and scale_format in {"fp8_e8m0", "e8m0"}:
+    is_mxfp8_block = (
+        act in (_MXFP8 | {"fp8", "fp8_e4m3"})
+        and group == _MX_SCALE_GROUP_SIZE
+        and scale_format in {"fp8_e8m0", "e8m0"}
+    )
+    if is_mxfp8_block:
         dispatch_dtype = "mxfp8"
+        if pack < _MX_SCALE_PACK:
+            pack = _MX_SCALE_PACK
+            _, packed_count = scale_tensor_geometry(
+                1, latent, group=group, pack=pack,
+            )
+            scale_bytes_per_row = float(packed_count * dtype_bytes(scale_format))
     else:
         dispatch_dtype = act
     dispatch_row_bytes = payload_bytes_per_row + (float(scale_bytes_per_row) if quantized else 0.0)
     return {
         "dispatch_dtype": dispatch_dtype,
-        "payload_dtype": act,
+        "payload_dtype": _payload_dtype(act) if act in _MXFP8 else act,
         "combine_dtype": combine_dtype,
         "quantized": quantized,
         "scale_dtype": scale_format if quantized else "",
         "scale_group": int(group) if quantized else 0,
+        "scale_pack": int(pack) if quantized else 1,
         "payload_bytes_per_row": payload_bytes_per_row,
         "scale_bytes_per_row": float(scale_bytes_per_row) if quantized else 0.0,
         "dispatch_row_bytes": dispatch_row_bytes,
@@ -402,8 +485,10 @@ def default_exchange_contract(model, runtime, plan, transport, latent, *,
         rows_int = _ceil_rows(rows)
         group = spec["scale_group"] or latent
         groups = max(1, math.ceil(latent / group))
+        scale_pack = int(spec.get("scale_pack", 1) or 1)
         scale_bytes = rows * spec["scale_bytes_per_row"]
-        scale_shape = (rows_int, groups) if groups > 1 else (rows_int,)
+        scale_shape, _ = scale_tensor_geometry(
+            rows_int, latent, group=group, pack=scale_pack)
         pack_quant = vector_op(
             op_id=prefix + ".pack.quantize", deps=(pack.op_id,), stage=stage,
             layer=plan.index, requests=requests, elements=rows_int * latent,
@@ -436,9 +521,8 @@ def select(runtime, *, layer_scope="body"):
 def _transport_format(case, layer, width):
     """Resolve the declared dispatch format for one layer and hidden width.
 
-    ``case`` may be a parsed :class:`Case` or its mapping form. MXFP8 defaults
-    are materialized here so callers see the exact wire ledger: 32 E4M3 payload
-    bytes plus one E8M0 block-scale byte per 32 elements.
+    Delegates directly to :func:`select` and :func:`default_dispatch_spec` so
+    format queries and lowered graphs never diverge.
     """
     if isinstance(case, Mapping):
         from mindie_sim.prediction.structure import parse_case
@@ -446,45 +530,56 @@ def _transport_format(case, layer, width):
     else:
         parsed = case
     runtime = parsed.runtime
+    layer_scope = getattr(layer, "scope", "body")
+    selected = select(runtime, layer_scope=layer_scope)
+    if selected is not None:
+        return selected.format(width, layer_index=getattr(layer, "index", None))
     raw = dict((getattr(runtime, "kernels", None) or {}).get(_SELECTOR) or {})
     metadata = dict(getattr(runtime, "metadata", ()) or ())
-    layer_scope = getattr(layer, "scope", "body")
-    eplb = _eplb_ratio(raw, metadata)
-    dispatch = raw.get("dispatch_dtype")
-    if dispatch is None:
-        # An options-only block intentionally leaves the ordinary BF16 path.
-        dispatch = "bf16" if not (set(raw) & set(_CONFIG)) else raw.get("payload_dtype", "int8")
-    dispatch = _normalized_dtype(dispatch, "moe_transport_unsupported:dispatch_dtype")
-    if not _scopes(raw, layer_scope):
-        dispatch = "bf16"
-    group = raw.get("scale_Group", raw.get("scale_group"))
-    if dispatch in _MXFP8 and group is None:
-        group = _MX_SCALE_GROUP_SIZE
-    scale_dtype = raw.get("scale_dtype", "fp8_e8m0" if dispatch in _MXFP8 else "fp32")
-    granularity = raw.get("scale_granularity",
-                          "block" if dispatch in _MXFP8 else "row")
-    if group is None:
-        group = 0
-    else:
-        try:
-            group_value = int(group)
-        except (TypeError, ValueError) as exc:
-            raise ModelingError("moe_transport_scale_group_invalid") from exc
-        if float(group) != float(group_value) or group_value < 1:
-            raise ModelingError("moe_transport_scale_group_invalid")
-        group = group_value
-    transport = Transport(
-        kind=_KIND, payload_dtype=_payload_dtype(dispatch),
-        scale_dtype=str(scale_dtype).strip().lower(),
-        scale_granularity=str(granularity).strip().lower(),
-        histogram_dtype=str(raw.get("histogram_dtype", "int64")),
-        dispatch_dtype=dispatch, scale_group=int(group or 0),
-        eplb_peak_to_avg=eplb,
-        deepep_mode=_mode(raw) == "deepep",
-        deepep_overlap_ratio=_overlap_ratio(raw, metadata),
-        ranks_per_node=_ranks_per_node(raw, metadata),
+    in_scope = _scopes(raw, layer_scope) if raw else True
+    deepep_mode = (
+        (_mode(raw) == "deepep" or bool(metadata.get("enable_deepep", False)))
+        if in_scope else False
     )
-    return transport.format(width, layer_index=getattr(layer, "index", None))
+    eplb = _eplb_ratio(raw, metadata) if in_scope else 1.0
+    overlap = _overlap_ratio(raw, metadata) if in_scope else 0.0
+    ranks = _ranks_per_node(raw, metadata) if in_scope else 0
+    ep = int(getattr(getattr(runtime, "parallel", None), "ep", 1) or 1)
+    if metadata.get("moe_dispatch_quantization") == "routed_expert" and ep > 1:
+        spec = default_dispatch_spec(parsed.model, plan=layer, width=width)
+        return {
+            "kind": _KIND,
+            "dispatch_dtype": spec["dispatch_dtype"],
+            "payload_dtype": spec["payload_dtype"],
+            "op_dtype": spec["payload_dtype"],
+            "quantized": bool(spec["quantized"]),
+            "payload_bytes": float(spec["payload_bytes_per_row"]),
+            "scale_dtype": spec["scale_dtype"],
+            "scale_group": int(spec["scale_group"]),
+            "scale_pack": int(spec.get("scale_pack", 1) or 1),
+            "scale_bytes": float(spec["scale_bytes_per_row"]),
+            "row_bytes": float(spec["dispatch_row_bytes"]),
+            "element_bytes": float(spec["element_bytes"]),
+            "combine_dtype": spec["combine_dtype"],
+            "eplb_peak_to_avg": eplb,
+            "deepep_mode": deepep_mode,
+            "deepep_overlap_ratio": overlap,
+            "width": int(width),
+            "layer_index": (None if getattr(layer, "index", None) is None else int(layer.index)),
+        }
+    act_dtype = _canonical_dtype(getattr(parsed.model, "activation_dtype", "bf16"))
+    fallback = Transport(
+        kind=_KIND, payload_dtype=act_dtype, scale_dtype="",
+        scale_granularity="none",
+        histogram_dtype=str(raw.get("histogram_dtype", "int64")),
+        dispatch_dtype=act_dtype, scale_group=0,
+        eplb_peak_to_avg=eplb,
+        deepep_mode=deepep_mode,
+        deepep_overlap_ratio=overlap,
+        ranks_per_node=ranks,
+        scale_pack=1,
+    )
+    return fallback.format(width, layer_index=getattr(layer, "index", None))
 
 
 def validate_contract(model, plan, transport=None):
@@ -502,6 +597,7 @@ def validate_contract(model, plan, transport=None):
                 f"{weight_format}")
         group = quant.activation_group_size or transport.scale_group
         scale_format = quant.activation_scale_format or "fp8_e8m0"
+        scale_pack = int(getattr(quant, "activation_scale_pack", 0) or 1)
         if group not in (0, transport.scale_group):
             raise ModelingError(
                 "moe_transport_mxfp8_requires_block32_activation:"
@@ -510,6 +606,10 @@ def validate_contract(model, plan, transport=None):
             raise ModelingError(
                 "moe_transport_mxfp8_requires_e8m0_scales:"
                 f"{scale_format}")
+        if scale_pack != transport.scale_pack:
+            raise ModelingError(
+                "moe_transport_mxfp8_requires_packed_e8m0_scales:"
+                f"pack={scale_pack}!={transport.scale_pack}")
         return
     if transport is not None and transport.fp8:
         if weight_format not in {"fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8",
@@ -528,7 +628,9 @@ def validate_contract(model, plan, transport=None):
         raise ModelingError(
             "moe_transport_requires_int8_activations:"
             f"{weight_format}")
-    group = quant.activation_group_size or width
+    quant_group = quant.activation_group_size or width
+    transport_group = (transport.scale_group if transport is not None else 0) or width
+    group = min(quant_group, transport_group)
     scale_format = quant.activation_scale_format or "fp32"
     if group < width:
         raise ModelingError(
@@ -617,7 +719,10 @@ def histogram(*, prefix, plan, stage, requests, rows, ep, deps,
 
 def quantize(*, prefix, plan, stage, requests, pack, transport, rows, width,
              partitions, mode):
-    """One dynamic payload producer after pack: row INT8 or block MXFP8."""
+    """One dynamic payload producer after pack, or None for matching unquantized dtype."""
+    if (not transport.quantized
+            and _canonical_dtype(pack.dtype) == _canonical_dtype(transport.payload_dtype)):
+        return None
     rows_int = _ceil_rows(rows)
     if transport.quantized:
         group = transport.scale_group or width
@@ -626,7 +731,8 @@ def quantize(*, prefix, plan, stage, requests, pack, transport, rows, width,
         vector = (_QUANT_OPS_PER_ELEMENT * rows * width - groups_total
                   + _QUANT_SCALE_OPS_PER_GROUP * groups_total)
         scale_bytes = rows * transport.scale_bytes(width)
-        scale_shape = (rows_int, groups) if transport.inline_scales else (rows_int,)
+        scale_shape, _ = scale_tensor_geometry(
+            rows_int, width, group=group, pack=transport.scale_pack)
         scale_format = transport.scale_dtype
         group_size = group
         write = rows * width * transport.payload_bytes + scale_bytes
@@ -639,11 +745,12 @@ def quantize(*, prefix, plan, stage, requests, pack, transport, rows, width,
         groups = 0
         write = rows * width * transport.payload_bytes
     routing = _routing_peer_counts(pack)
+    token_route = _token_route_from_op(pack)
     routing_metadata = (() if routing is None else (
         ("moe_peer_counts", routing[0]),
         ("moe_peer_rank", routing[1]),
         ("moe_peer_basis", routing[2]),
-    ))
+    )) + ((("moe_token_route", token_route),) if token_route is not None else ())
     op = vector_op(
         op_id=prefix + ".moe_transport_quantize", deps=(pack.op_id,), stage=stage,
         layer=plan.index, requests=requests, elements=rows_int * width,
@@ -671,14 +778,15 @@ def quantize(*, prefix, plan, stage, requests, pack, transport, rows, width,
                   ("quantizer_count", 1),
                   ("eplb_peak_to_avg", transport.eplb_peak_to_avg),
                   *routing_metadata,
-                  ("formula", ("dynamic_per_row_symmetric_int8_fp32"
-                               if not transport.inline_scales
-                               else "dynamic_block32_e4m3_e8m0"))),
+                  ("formula", ("dynamic_block32_e4m3_e8m0"
+                               if transport.mxfp8
+                               else "dynamic_per_row_symmetric_int8_fp32"))),
     )
     return op
 
 
 __all__ = [
     "Transport", "default_dispatch_spec", "select", "_transport_format", "validate_contract",
-    "source_partitions", "source_rows", "histogram", "quantize", "dispatch", "combine",
+    "source_partitions", "source_rows", "histogram", "quantize", "dispatch",
+    "combine_unorder", "combine", "scale_tensor_geometry",
 ]

@@ -10,9 +10,27 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_REVISION = "175ef4d49c2072f9233619636f0309f4f88b4e2c"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-ascend",
+        revision=_VLLM_ASCEND_REVISION,
+        relative_path="vllm_ascend/ops/fused_moe/token_dispatcher.py",
+        source_sha256="6126304014959e8c52d87284ccac078f7622a6d72c7a7fc8be25929dfe644cfb",
+    ),
+    SourceRef(
+        repository="vllm-ascend",
+        revision=_VLLM_ASCEND_REVISION,
+        relative_path="vllm_ascend/ops/fused_moe/moe_mlp.py",
+        source_sha256="6b5f4f6d3259cb14e0613a6f7b1c2592331f143a14cf7240dd9d49a0a57dd53b",
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -210,9 +228,37 @@ def _resolve_local_routing(
         except ModelingError:
             geometry_counts = None
 
-    if (state_counts is not None and geometry_counts is not None
-            and tuple(state_counts) != tuple(geometry_counts)):
-        conflicts.append("state_geometry_counts_disagree")
+    rank = _receipt_int(explicit.get("rank_index",
+                                     explicit.get("current_rank")))
+    explicit_ids = _receipt_ids(explicit.get("local_expert_ids"), layer, rank)
+    if explicit_ids is not None and state_ids is not None \
+            and tuple(explicit_ids) != tuple(state_ids):
+        conflicts.append("state_explicit_local_expert_ids_disagree")
+    local_ids = explicit_ids if explicit_ids is not None else state_ids
+
+    if local_experts < 1:
+        local_experts = (len(local_ids) if local_ids is not None
+                         else len(state_counts) if state_counts is not None
+                         else len(geometry_counts) if geometry_counts is not None else 0)
+    if experts < 1:
+        experts = (len(geometry_counts) if geometry_counts is not None
+                   else len(state_counts) if state_counts is not None else local_experts)
+    if ep < 1:
+        ep = (experts // local_experts
+              if local_experts > 0 and experts % local_experts == 0 else 0)
+    if local_ids is not None and len(local_ids) != local_experts:
+        conflicts.append("local_expert_ids_length_mismatch")
+        local_ids = None
+
+    if state_counts is not None and geometry_counts is not None:
+        compared_geometry = geometry_counts
+        if (len(state_counts) == local_experts
+                and len(geometry_counts) == experts
+                and local_ids is not None
+                and not any(index >= len(geometry_counts) for index in local_ids)):
+            compared_geometry = tuple(geometry_counts[index] for index in local_ids)
+        if tuple(state_counts) != tuple(compared_geometry):
+            conflicts.append("state_geometry_counts_disagree")
     counts = state_counts if state_counts is not None else geometry_counts
     basis = ("state_routing" if state_counts is not None
              else "geometry_routing" if geometry_counts is not None
@@ -221,42 +267,12 @@ def _resolve_local_routing(
         counts = None
         basis = "state_geometry_conflict"
 
-    explicit_ids = _receipt_ids(
-        explicit.get("local_expert_ids"), layer,
-        _receipt_int(explicit.get("rank_index",
-                                  explicit.get("current_rank"))))
-    if explicit_ids is not None and state_ids is not None \
-            and tuple(explicit_ids) != tuple(state_ids):
-        conflicts.append("state_explicit_local_expert_ids_disagree")
-    local_ids = explicit_ids if explicit_ids is not None else state_ids
-    rank = _receipt_int(explicit.get("rank_index",
-                                     explicit.get("current_rank")))
-
-    if local_experts < 1:
-        local_experts = (len(local_ids) if local_ids is not None
-                         else len(state_counts) if state_counts is not None
-                         else len(counts) if counts is not None else 0)
-    if experts < 1:
-        experts = len(counts) if counts is not None else local_experts
-    if ep < 1:
-        ep = (experts // local_experts
-              if local_experts > 0 and experts % local_experts == 0 else 0)
-    if local_ids is not None and len(local_ids) != local_experts:
-        conflicts.append("local_expert_ids_length_mismatch")
-        local_ids = None
-
     local_counts = None
     ownership_known = False
     if counts is not None and local_experts > 0:
-        if len(counts) == local_experts:
-            if basis == "state_routing":
-                local_counts = counts
-                ownership_known = local_ids is not None
-            elif local_ids is not None:
-                local_counts = counts
-                ownership_known = True
-            else:
-                conflicts.append("geometry_local_counts_without_local_expert_ids")
+        if basis == "state_routing" and len(counts) == local_experts:
+            local_counts = counts
+            ownership_known = local_ids is not None
         elif len(counts) == experts:
             if local_ids is not None:
                 if any(index >= len(counts) for index in local_ids):
@@ -266,6 +282,12 @@ def _resolve_local_routing(
                     ownership_known = True
             else:
                 conflicts.append("global_counts_without_local_expert_ids")
+        elif len(counts) == local_experts:
+            if local_ids is not None:
+                local_counts = counts
+                ownership_known = True
+            else:
+                conflicts.append("geometry_local_counts_without_local_expert_ids")
         else:
             conflicts.append("routing_count_length_mismatch")
     return local_ids, rank, ep, local_counts, ownership_known, basis

@@ -21,7 +21,7 @@ from mindie_sim.prediction.operators.vector.gated_activation import (
     situ_eager_chain,
 )
 from mindie_sim.prediction.operators.moe_transport.deepep import (deepep_exchange_factor, resolve_exchange_options,
-                     scale_exchange_operator, split_deepep_combine_overlap,
+                     scale_exchange_operator, scale_exchange_stages, split_deepep_combine_overlap,
                      split_deepep_dispatch_overlap, split_deepep_down_overlap,
                      split_deepep_up_overlap)
 from mindie_sim.prediction.operators.moe_transport.moe_callers import RoutingPolicy, local_expert_reduce_recipe, tp_join_reduce
@@ -731,7 +731,8 @@ def _pack_routed_inputs(
         options=exchange_options, ep=parallel.ep, top_k=plan.top_k,
         tokens=tokens, hidden=latent,
         dtype_bytes_val=(transport.element_bytes(latent) if transport is not None
-                         else dtype_bytes(model.activation_dtype)))
+                         else dtype_bytes(model.activation_dtype)),
+        num_experts=plan.num_experts)
     source_traffic, payload_tokens = source_issuance(
         routing_realization=routing_realization, token_partition=token_partition,
         sequence_plan=sequence_plan, plan=plan, tokens=tokens,
@@ -813,9 +814,147 @@ def _masked_collective(op, source_traffic, row_bytes, ep, *, reverse=False):
     matrix = source_traffic.payload_matrix(row_bytes, reverse=reverse)
     meta = {k: v for k, v in op.metadata if k != "reverse_of_collective"}
     meta.update(peer_volume_basis="group_mean", peer_traffic={"kind": "matrix", "payload_bytes": matrix},
-                traffic_model=source_traffic.basis, source_token_mask=source_traffic.to_dict())
+                traffic_model=source_traffic.basis, source_token_mask=source_traffic.to_dict(),
+                row_bytes=float(row_bytes))
     return replace(op, family="alltoallv", link_bytes=sum(map(sum, matrix)) / ep,
                    metadata=tuple(meta.items()))
+
+
+def _physical_local_experts(plan, parallel) -> int:
+    ep = max(1, int(parallel.ep))
+    return math.ceil(int(plan.num_experts) / ep) + int(
+        getattr(parallel, "redundant_experts_per_rank", 0) or 0
+    )
+
+
+def _rescale_deepep_slot_weights(ops: list) -> list:
+    """Preserve DeepEP row/column weight split scaling after bind_expert_slots."""
+    updated = []
+    for op in ops:
+        meta = dict(op.metadata)
+        scale = meta.get("deepep_weight_scale")
+        if scale is None or float(scale) >= 1.0:
+            updated.append(op)
+            continue
+        factor = float(scale)
+        bound = float(meta.get("routed_weight_read_bytes", 0.0) or 0.0)
+        if bound <= 0.0:
+            updated.append(op)
+            continue
+        scaled = bound * factor
+        delta = scaled - bound
+        for key in (
+            "packed_weight_bytes", "routed_weight_read_bytes",
+            "physical_slot_weight_bytes", "physical_slot_mean_weight_bytes",
+            "expert_slot_active_weight_bytes",
+        ):
+            if key in meta and isinstance(meta[key], (int, float)):
+                meta[key] = float(meta[key]) * factor
+        updated.append(replace(
+            op,
+            mte2_bytes=max(0.0, float(op.mte2_bytes) + delta),
+            hbm_bytes=max(0.0, float(op.hbm_bytes) + delta),
+            metadata=tuple(meta.items()),
+        ))
+    return updated
+
+
+def _dispatch_explicit_transport(
+    ops, packing, *, prefix, plan, stage, requests, parallel, mode,
+    transport, transport_rows, transport_histogram_gather, latent, partitions,
+    exchange_options, exchange_factor, receive_rows, phys_local_experts,
+    mc2_mask_pad_id,
+):
+    """Lower explicit moe_transport quantize, scale/payload dispatch, and reorder."""
+    mask_pad_consumed = False
+    dispatch_overlap_id = None
+    transport_quantized = moe_transport.quantize(
+        prefix=prefix, plan=plan, stage=stage, requests=requests,
+        pack=packing, transport=transport, rows=transport_rows,
+        width=latent, partitions=partitions, mode=mode)
+    if transport_quantized is not None:
+        ops.append(transport_quantized)
+    else:
+        # Unquantized pass-through: declare packed activation output shape on
+        # pack so downstream gate consumers see (rows, latent) instead of
+        # routing index geometry (tokens, top_k).
+        pack_rows = int(math.ceil(transport_rows - 1e-12))
+        packing = replace(
+            packing,
+            metadata=packing.metadata + (("output_shape", (pack_rows, latent)),),
+        )
+        pack_idx = next(
+            (i for i in range(len(ops) - 1, -1, -1) if ops[i].op_id == packing.op_id),
+            len(ops) - 1,
+        )
+        ops[pack_idx] = packing
+    transport_input = transport_quantized if transport_quantized is not None else packing
+    exchange_ops, transport_scale, transport_payload = moe_transport.dispatch(
+        prefix=prefix, plan=plan, stage=stage, requests=requests,
+        quantized=transport_input, transport=transport,
+        rows=transport_rows, width=latent, ep=parallel.ep,
+        partitions=partitions, mode=mode,
+        hist_gather=transport_histogram_gather,
+        receive_rows=receive_rows,
+        local_experts=phys_local_experts)
+    for exchange_op in exchange_ops:
+        if mc2_mask_pad_id is not None and not mask_pad_consumed:
+            exchange_op = replace(
+                exchange_op,
+                deps=tuple(dict.fromkeys((*exchange_op.deps, mc2_mask_pad_id))),
+                metadata=exchange_op.metadata + (("mc2_active_mask_producer", mc2_mask_pad_id),),
+            )
+            mask_pad_consumed = True
+        if exchange_op.recipe == "expert_scale_dispatch":
+            stages = scale_exchange_stages(
+                exchange_op, exchange_factor * exchange_options["eplb"],
+                exchange_options, ep=parallel.ep, top_k=plan.top_k,
+                num_experts=plan.num_experts)
+            ops.extend(stages)
+        elif exchange_op.recipe == "expert_quantized_dispatch":
+            stages = scale_exchange_stages(
+                exchange_op, exchange_factor * exchange_options["eplb"],
+                exchange_options, ep=parallel.ep, top_k=plan.top_k,
+                num_experts=plan.num_experts)
+            ops.extend(stages[:-1])
+            final_stage = stages[-1]
+            transport_cut = deepep.overlap_row_cut(
+                final_stage.local_shape[0], exchange_options["overlap"])
+            split_ops, dispatch_overlap_id = split_deepep_dispatch_overlap(
+                final_stage, exchange_options, row_cut=transport_cut)
+            ops.extend(split_ops)
+        elif exchange_op.recipe == "moe_receive_reorder":
+            if dispatch_overlap_id is not None:
+                exchange_op = replace(
+                    exchange_op,
+                    deps=tuple(dict.fromkeys((*exchange_op.deps, dispatch_overlap_id))),
+                )
+            ops.append(exchange_op)
+        else:
+            ops.append(exchange_op)
+    if mc2_mask_pad_id is not None and not mask_pad_consumed:
+        if transport_quantized is not None:
+            transport_quantized = replace(
+                transport_quantized,
+                deps=tuple(dict.fromkeys((*transport_quantized.deps, mc2_mask_pad_id))),
+                metadata=transport_quantized.metadata + (("mc2_active_mask_producer", mc2_mask_pad_id),),
+            )
+            ops[-1] = transport_quantized
+        else:
+            packing = replace(
+                packing,
+                deps=tuple(dict.fromkeys((*packing.deps, mc2_mask_pad_id))),
+                metadata=packing.metadata + (("mc2_active_mask_producer", mc2_mask_pad_id),),
+            )
+            pack_idx = next(
+                (i for i in range(len(ops) - 1, -1, -1) if ops[i].op_id == packing.op_id),
+                len(ops) - 1,
+            )
+            ops[pack_idx] = packing
+        mask_pad_consumed = True
+    last = str(transport_payload) if transport_payload is not None else transport_input.op_id
+    return (packing, last, transport_scale, transport_payload, transport_quantized,
+            dispatch_overlap_id, mask_pad_consumed)
 
 
 def _dispatch_routed_inputs(
@@ -823,56 +962,26 @@ def _dispatch_routed_inputs(
     transport, transport_rows, transport_histogram_gather, latent, tokens, payload_tokens,
     partitions, routing_realization, source_traffic, exchange, exchange_options,
     exchange_factor, local_rows, receive_rows, mc2_mask_pad_id=None,
+    token_partition=None,
 ):
     transport_scale = transport_payload = transport_quantized = None
     dispatch_overlap_id = None
     dispatch_source = None
     gate_row_cut = None
+    default_reorder_id = None
     mask_pad_consumed = False
+    phys_local_experts = _physical_local_experts(plan, parallel)
     if transport is not None:
-        transport_quantized = moe_transport.quantize(
-            prefix=prefix, plan=plan, stage=stage, requests=requests,
-            pack=packing, transport=transport, rows=transport_rows,
-            width=latent, partitions=partitions,
-            mode=mode)
-        ops.append(transport_quantized)
-        exchange_ops, transport_scale, transport_payload = moe_transport.dispatch(
-            prefix=prefix, plan=plan, stage=stage, requests=requests,
-            quantized=transport_quantized, transport=transport,
-            rows=transport_rows, width=latent, ep=parallel.ep,
-            partitions=partitions, mode=mode,
-            hist_gather=transport_histogram_gather)
-        for exchange_op in exchange_ops:
-            if mc2_mask_pad_id is not None and not mask_pad_consumed:
-                exchange_op = replace(
-                    exchange_op,
-                    deps=tuple(dict.fromkeys((*exchange_op.deps, mc2_mask_pad_id))),
-                    metadata=exchange_op.metadata + (("mc2_active_mask_producer", mc2_mask_pad_id),),
-                )
-                mask_pad_consumed = True
-            if exchange_op.recipe == "expert_quantized_dispatch":
-                exchange_op = scale_exchange_operator(
-                    exchange_op, exchange_factor * exchange_options["eplb"],
-                    exchange_options, ep=parallel.ep, top_k=plan.top_k)
-                transport_cut = deepep.overlap_row_cut(
-                    exchange_op.local_shape[0], exchange_options["overlap"])
-                split_ops, dispatch_overlap_id = split_deepep_dispatch_overlap(
-                    exchange_op, exchange_options, row_cut=transport_cut)
-                ops.extend(split_ops)
-            else:
-                ops.append(exchange_op)
-        if mc2_mask_pad_id is not None and not mask_pad_consumed:
-            transport_quantized = replace(
-                transport_quantized,
-                deps=tuple(dict.fromkeys((*transport_quantized.deps, mc2_mask_pad_id))),
-                metadata=transport_quantized.metadata + (("mc2_active_mask_producer", mc2_mask_pad_id),),
-            )
-            ops[-1] = transport_quantized
-            mask_pad_consumed = True
-        if transport_payload is not None:
-            last = transport_payload
-        else:
-            last = transport_quantized.op_id
+        (packing, last, transport_scale, transport_payload, transport_quantized,
+         dispatch_overlap_id, mask_pad_consumed) = _dispatch_explicit_transport(
+            ops, packing, prefix=prefix, plan=plan, stage=stage, requests=requests,
+            parallel=parallel, mode=mode, transport=transport,
+            transport_rows=transport_rows,
+            transport_histogram_gather=transport_histogram_gather, latent=latent,
+            partitions=partitions, exchange_options=exchange_options,
+            exchange_factor=exchange_factor, receive_rows=receive_rows,
+            phys_local_experts=phys_local_experts, mc2_mask_pad_id=mc2_mask_pad_id,
+        )
     # One logical source assignment belongs to one local EP rank. Both routing
     # paths use the same token-to-EP-rank ownership, so the declared volume is
     # per physical source rank rather than a replicated TP total. ETP groups
@@ -946,17 +1055,29 @@ def _dispatch_routed_inputs(
         )
         dispatch = _masked_collective(
             dispatch, source_traffic, dispatch_row_bytes, parallel.ep)
-        dispatch = scale_exchange_operator(
+        dispatch_stages = scale_exchange_stages(
             dispatch, exchange_factor * exchange_options["eplb"],
-            exchange_options, ep=parallel.ep, top_k=plan.top_k)
+            exchange_options, ep=parallel.ep, top_k=plan.top_k,
+            num_experts=plan.num_experts)
+        ops.extend(dispatch_stages[:-1])
+        dispatch = dispatch_stages[-1]
         # The receive allocation is a concrete value of this collective: the
         # row views below alias it instead of searching an ancestry for dtype.
-        received_dtype = (absorbed_routing_meta or {}).get(
-            "activation_payload_format") or model.activation_dtype
+        quant_meta_map = dict(dispatch_quant_meta)
+        received_dtype = (
+            (absorbed_routing_meta or {}).get("activation_payload_format")
+            or quant_meta_map.get("payload_dtype")
+            or model.activation_dtype
+        )
+        received_row_bytes = (
+            float(dispatch_row_bytes)
+            if quant_meta_map
+            else float(latent) * dtype_bytes(str(received_dtype))
+        )
         dispatch = deepep.declare_received_value(
             dispatch, dtype=str(received_dtype),
             shape=(receive_rows, latent),
-            row_bytes=latent * dtype_bytes(str(received_dtype)),
+            row_bytes=received_row_bytes,
             storage=f"moe.rx:{prefix}.dispatch",
             binding="static", binding_name=f"{prefix}.dispatch.rx")
         dispatch_source = deepep.received_value_contract(dispatch)
@@ -964,10 +1085,28 @@ def _dispatch_routed_inputs(
             dispatch, exchange_options, row_cut=gate_row_cut)
         ops.extend(split_ops)
         last = split_ops[0].op_id
+        if (token_partition is not None
+                and token_partition.kind == "vllm_ascend_alltoall_tp_slice"
+                and phys_local_experts > 1):
+            reorder_deps = (
+                (last, dispatch_overlap_id) if dispatch_overlap_id is not None else (last,)
+            )
+            reorder = moe_transport.receive_reorder(
+                prefix=prefix, plan=plan, stage=stage, requests=requests,
+                deps=reorder_deps, payload_id=last, width=latent,
+                recv_rows=int(receive_rows), local_experts=phys_local_experts,
+                payload_dtype=str(received_dtype),
+                payload_row_bytes=received_row_bytes, mode=mode,
+            )
+            ops.append(reorder)
+            last = reorder.op_id
+            default_reorder_id = reorder.op_id
+            dispatch_source = deepep.received_value_contract(reorder)
     return (packing, last, transport_scale, transport_payload, transport_quantized,
             dispatch_overlap_id, dispatch_source, gate_row_cut, absorbed_routing,
             dispatch_quant_meta, combine_quant_meta, combine_row_bytes,
-            combine_exchange_bytes, collective_meta, mask_pad_consumed)
+            combine_exchange_bytes, collective_meta, mask_pad_consumed,
+            default_reorder_id)
 
 
 def _emit_routed_activation(
@@ -1050,10 +1189,10 @@ def _run_routed_experts(
     routing_realization, routing_metadata, balanced, transport, transport_scale,
     transport_payload, transport_quantized, dispatch_quant_meta, absorbed_routing,
     dispatch_overlap_id, dispatch_source, gate_row_cut, exchange_options, token_partition,
-    caller, reduce_after_join,
+    caller, reduce_after_join, exchange=True,
 ):
     if not local_rows:
-        return last, None
+        return last, None, None
     from mindie_sim.catalog.quant import projection_quant
 
     layer_quant = projection_quant(model.quant, plan)
@@ -1062,13 +1201,18 @@ def _run_routed_experts(
     common = dict(stage=stage, layer=plan.index, requests=requests,
                   quant=layer_quant, category="routed_expert", phase=mode, m=math.ceil(local_rows))
     expert_input_deps = (last,)
+    quant_producer_id = transport_quantized.op_id if transport_quantized is not None else last
     if transport is not None and parallel.ep > 1:
-        # Both received quantities are real inputs. The payload already
-        # waits for scale completion, but the gate retains the direct edge.
-        expert_input_deps = tuple(dict.fromkeys(
-            dependency for dependency in
-            (transport_scale, transport_payload, transport_quantized.op_id)
-            if dependency))
+        if getattr(transport_payload, "reorder_op_id", None):
+            expert_input_deps = (str(transport_payload),)
+        else:
+            # Both received quantities are real inputs. The payload already
+            # waits for scale completion, but the gate retains the direct edge.
+            expert_input_deps = tuple(dict.fromkeys(
+                dependency for dependency in
+                (transport_scale, transport_payload,
+                 transport_quantized.op_id if transport_quantized is not None else None)
+                if dependency))
     gate = gemm_op(
         op_id=prefix + ".expert_up", deps=expert_input_deps, n=2 * expert_width, k=latent,
         family="grouped_gemm", recipe="grouped_gate_up", weight_bytes_override=gate_weight, **common,
@@ -1101,8 +1245,8 @@ def _run_routed_experts(
         gate = bind_transport_gate(
             gate, down, transport=transport, latent=latent,
             local_rows=local_rows,
-            payload=transport_payload or transport_quantized.op_id,
-            scale=transport_scale or transport_quantized.op_id)
+            payload=str(transport_payload) if transport_payload else quant_producer_id,
+            scale=transport_scale or quant_producer_id)
     allow_up_split = not bool((getattr(runtime, "kernels", None) or {}).get("lowerings"))
     activation_rows = (
         token_partition.activation_tensor_rows
@@ -1130,7 +1274,11 @@ def _run_routed_experts(
         expert_width=expert_width, routing_metadata=routing_metadata,
         model=model)
     down_ops, down_mid_id, last = split_deepep_down_overlap(
-        ops.pop(), exchange_options)
+        ops.pop(), exchange_options, has_combine=(parallel.ep > 1 and exchange))
+    down_column_split = (
+        (int(down_ops[0].local_shape[1]), int(down_ops[1].local_shape[1]))
+        if len(down_ops) == 2 else None
+    )
     ops.extend(down_ops)
     if parallel.etp > 1 and not reduce_after_join:
         reduce = replace(
@@ -1148,7 +1296,42 @@ def _run_routed_experts(
         ops.append(reduce)
         last = reduce.op_id
         down_mid_id = reduce.op_id
-    return last, down_mid_id
+    return last, down_mid_id, down_column_split
+
+
+def _emit_combine_stages(
+    ops, combine_stages, *, last, down_mid_id, dispatch_overlap_id,
+    exchange_options, down_column_split,
+):
+    """Append causal 1-stage or 2-stage DeepEP combine ops with column overlap."""
+    overlap_deps = tuple(dict.fromkeys(
+        dep for dep in (down_mid_id, dispatch_overlap_id) if dep
+    ))
+    if len(combine_stages) == 2:
+        intra_c, inter_c = combine_stages
+        intra_ops, intra_last = split_deepep_combine_overlap(
+            intra_c, exchange_options, overlap_deps=overlap_deps,
+            main_deps=(last,), dispatch_overlap_id=dispatch_overlap_id,
+            column_split=down_column_split)
+        ops.extend(intra_ops)
+        if len(intra_ops) == 2:
+            inter_ops, last = split_deepep_combine_overlap(
+                inter_c, exchange_options,
+                overlap_deps=(intra_ops[0].op_id,),
+                main_deps=(intra_last,),
+                dispatch_overlap_id=dispatch_overlap_id,
+                column_split=down_column_split)
+            ops.extend(inter_ops)
+            return last
+        inter_final = replace(inter_c, deps=(intra_last,))
+        ops.append(inter_final)
+        return inter_final.op_id
+    combine_ops, last = split_deepep_combine_overlap(
+        combine_stages[0], exchange_options, overlap_deps=overlap_deps,
+        main_deps=(last,), dispatch_overlap_id=dispatch_overlap_id,
+        column_split=down_column_split)
+    ops.extend(combine_ops)
+    return last
 
 
 def _combine_routed_outputs(
@@ -1158,16 +1341,41 @@ def _combine_routed_outputs(
     source_traffic, combine_row_bytes, exchange_factor, exchange_options,
     down_mid_id, dispatch_overlap_id, weights_producer, weight_dtype, weight_bytes,
     routing_metadata, routing_realization, local_rows, absorbed_routing, caller,
-    token_partition, full_tokens,
+    token_partition, full_tokens, receive_rows=None, down_column_split=None,
+    default_reorder_id=None,
 ):
     if parallel.ep > 1 and exchange:
+        phys_local_experts = _physical_local_experts(plan, parallel)
         if transport is not None:
+            unorder = moe_transport.combine_unorder(
+                prefix=prefix, plan=plan, stage=stage, requests=requests,
+                deps=last, transport=transport, rows=transport_rows,
+                width=latent, ep=parallel.ep, mode=mode,
+                payload_dispatch=transport_payload, receive_rows=receive_rows,
+                local_experts=phys_local_experts)
+            if unorder is not None:
+                ops.append(unorder)
+                last = unorder.op_id
+                down_mid_id = unorder.op_id
             combine = moe_transport.combine(
                 prefix=prefix, plan=plan, stage=stage, requests=requests,
                 deps=last, transport=transport, rows=transport_rows, width=latent,
                 ep=parallel.ep, partitions=partitions,
                 mode=mode, payload_dispatch=transport_payload)
         else:
+            if default_reorder_id is not None:
+                unorder = moe_transport.combine_unorder(
+                    prefix=prefix, plan=plan, stage=stage, requests=requests,
+                    deps=last, transport=None, rows=tokens * plan.top_k,
+                    width=latent, ep=parallel.ep, mode=mode,
+                    payload_dispatch=None, receive_rows=receive_rows,
+                    local_experts=phys_local_experts,
+                    reorder_op_id=default_reorder_id,
+                    return_dtype=model.activation_dtype)
+                if unorder is not None:
+                    ops.append(unorder)
+                    last = unorder.op_id
+                    down_mid_id = unorder.op_id
             combine = replace(
                 comm_op(
                     op_id=prefix + ".combine", deps=(last,), stage=stage, layer=plan.index,
@@ -1181,16 +1389,15 @@ def _combine_routed_outputs(
         if transport is None:
             combine = _masked_collective(
                 combine, source_traffic, combine_row_bytes, parallel.ep, reverse=True)
-        combine = scale_exchange_operator(
+        combine_stages = scale_exchange_stages(
             combine, exchange_factor * exchange_options["eplb"],
-            exchange_options, ep=parallel.ep, top_k=plan.top_k, is_combine=True)
-        overlap_deps = tuple(dict.fromkeys(
-            dep for dep in (down_mid_id, dispatch_overlap_id) if dep
-        ))
-        combine_ops, last = split_deepep_combine_overlap(
-            combine, exchange_options, overlap_deps=overlap_deps,
-            main_deps=(last,), dispatch_overlap_id=dispatch_overlap_id)
-        ops.extend(combine_ops)
+            exchange_options, ep=parallel.ep, top_k=plan.top_k, is_combine=True,
+            num_experts=plan.num_experts)
+        last = _emit_combine_stages(
+            ops, combine_stages, last=last, down_mid_id=down_mid_id,
+            dispatch_overlap_id=dispatch_overlap_id,
+            exchange_options=exchange_options, down_column_split=down_column_split,
+        )
     unpack_inputs = tuple(dict.fromkeys(
         (last, packing.op_id) + ((weights_producer,) if weights_producer is not None else ())))
     unpack_metadata = [
@@ -1419,7 +1626,8 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     (packing, last, transport_scale, transport_payload, transport_quantized,
      dispatch_overlap_id, dispatch_source, gate_row_cut, absorbed_routing,
      dispatch_quant_meta, combine_quant_meta, combine_row_bytes,
-     combine_exchange_bytes, collective_meta, _mask_pad_consumed) = _dispatch_routed_inputs(
+     combine_exchange_bytes, collective_meta, _mask_pad_consumed,
+     default_reorder_id) = _dispatch_routed_inputs(
         ops, packing, last, prefix=prefix, plan=plan, stage=stage, requests=requests,
         model=model, parallel=parallel, mode=mode, runtime=runtime,
         transport=transport, transport_rows=transport_rows,
@@ -1429,8 +1637,9 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         exchange=exchange, exchange_options=exchange_options, exchange_factor=exchange_factor,
         local_rows=local_rows, receive_rows=receive_rows,
         mc2_mask_pad_id=mc2_mask_pad_id,
+        token_partition=token_partition,
     )
-    last, down_mid_id = _run_routed_experts(
+    last, down_mid_id, down_column_split = _run_routed_experts(
         ops, last, prefix=prefix, plan=plan, stage=stage, requests=requests,
         model=model, parallel=parallel, mode=mode, runtime=runtime,
         local_rows=local_rows, active=active, expert_width=expert_width, latent=latent,
@@ -1442,6 +1651,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         dispatch_overlap_id=dispatch_overlap_id, dispatch_source=dispatch_source,
         gate_row_cut=gate_row_cut, exchange_options=exchange_options,
         token_partition=token_partition, caller=caller, reduce_after_join=reduce_after_join,
+        exchange=exchange,
     )
     last, tokens, routed_tokens = _combine_routed_outputs(
         ops, packing, last, prefix=prefix, plan=plan, stage=stage, requests=requests,
@@ -1456,7 +1666,9 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         weight_dtype=weight_dtype, weight_bytes=weight_bytes, routing_metadata=routing_metadata,
         routing_realization=routing_realization, local_rows=local_rows,
         absorbed_routing=absorbed_routing, caller=caller, token_partition=token_partition,
-        full_tokens=full_tokens,
+        full_tokens=full_tokens, receive_rows=receive_rows,
+        down_column_split=down_column_split,
+        default_reorder_id=default_reorder_id,
     )
     last = _join_routed_and_shared(
         ops, last, prefix=prefix, plan=plan, stage=stage, requests=requests,
@@ -1473,6 +1685,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             ops, model=model, plan=plan, parallel=parallel, routing=routing,
             runtime_routing=runtime_routing, routing_realization=routing_realization,
             group_tokens=group_tokens, expert_width=expert_width, latent=latent)
+        ops = _rescale_deepep_slot_weights(ops)
     if overlap_shared:
         ops = reorder_overlapped_shared(ops)
     from mindie_sim.prediction.operators.mc2.mc2_graph import lower as lower_native_mc2

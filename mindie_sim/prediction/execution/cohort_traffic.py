@@ -37,10 +37,8 @@ def _peer_row_widths(metadata):
             elements * dtype_bytes(raw["reverse_dtype"]))
 
 
-def _peer_rows_at_reverse_width(forward, widths):
-    """Transpose declared forward rows, then encode each return cell at BF16 width."""
-    forward_bytes, reverse_bytes = widths
-    ratio = reverse_bytes / forward_bytes
+def _scale_peer_descriptor(forward, ratio):
+    """Scale peer-traffic payloads by a positive scalar (row-width or column fraction)."""
     if forward.get("kind") == "uniform_peers":
         source = forward.get("source_bytes")
         return {**forward, "source_bytes": [float(value) * ratio for value in source]}
@@ -58,6 +56,137 @@ def _peer_rows_at_reverse_width(forward, widths):
         return {**forward, "payload_bytes": [
             [float(value) * ratio for value in row] for row in rows]}
     raise ModelingError("peer_traffic_row_format_requires_declared_payload")
+
+
+def _peer_rows_at_reverse_width(forward, widths):
+    """Transpose declared forward rows, then encode each return cell at BF16 width."""
+    forward_bytes, reverse_bytes = widths
+    return _scale_peer_descriptor(forward, reverse_bytes / forward_bytes)
+
+
+def _sum_peer_descriptors(descriptors):
+    """Sum split forward collective peer descriptors into one complete cohort."""
+    if len(descriptors) == 1:
+        return descriptors[0]
+    first = descriptors[0]
+    kind = first.get("kind")
+    if any(item.get("kind") != kind for item in descriptors[1:]):
+        raise ModelingError("dispatch_peer_traffic_declarations_differ")
+    if kind == "uniform_peers":
+        return {
+            **first,
+            "source_bytes": [
+                math.fsum(float(item["source_bytes"][idx]) for item in descriptors)
+                for idx in range(len(first["source_bytes"]))
+            ],
+        }
+    if kind == "two_tier":
+        updated = dict(first)
+        if "source_bytes" in first:
+            updated["source_bytes"] = [
+                math.fsum(float(item["source_bytes"][idx]) for item in descriptors)
+                for idx in range(len(first["source_bytes"]))
+            ]
+        if "intra_row_bytes" in first:
+            updated["intra_row_bytes"] = math.fsum(
+                float(item["intra_row_bytes"]) for item in descriptors
+            )
+        if "inter_row_bytes" in first:
+            updated["inter_row_bytes"] = math.fsum(
+                float(item["inter_row_bytes"]) for item in descriptors
+            )
+        return updated
+    if kind == "matrix":
+        size = len(first["payload_bytes"])
+        return {
+            **first,
+            "payload_bytes": [
+                [
+                    math.fsum(float(item["payload_bytes"][src][dst]) for item in descriptors)
+                    for dst in range(size)
+                ]
+                for src in range(size)
+            ],
+        }
+    raise ModelingError("dispatch_peer_traffic_declarations_differ")
+
+
+def _resolve_forward_group(
+    part_id, group, stage, axis, owner, declarations, replacements,
+):
+    """Validate and bind one forward collective part over a physical group."""
+    source_ops = []
+    for rank in group:
+        if rank not in owner or (owner[rank], stage, part_id) not in declarations:
+            raise ModelingError("inverse_traffic_requires_complete_dispatch_cohort")
+        source_ops.append(declarations[owner[rank], stage, part_id])
+    for op in source_ops:
+        source_meta = dict(op.metadata)
+        if (source_meta.get("group_axis", "ep") != axis
+                or op.family not in {"alltoall", "alltoallv"}):
+            raise ModelingError("inverse_traffic_requires_matching_dispatch_group")
+    widths = [_peer_row_widths(dict(op.metadata)) for op in source_ops]
+    declared_widths = next((value for value in widths if value is not None), None)
+    if declared_widths is not None and any(value != declared_widths for value in widths):
+        raise ModelingError("dispatch_peer_traffic_row_widths_differ")
+    explicit = [dict(op.metadata).get("peer_traffic") for op in source_ops]
+    if any(value is not None for value in explicit):
+        if all(isinstance(v, dict) and v.get("kind") == "two_tier" for v in explicit):
+            sig0 = (explicit[0].get("ranks_per_node"),
+                    explicit[0].get("intra_share"),
+                    explicit[0].get("inter_share"))
+            if any((v.get("ranks_per_node"), v.get("intra_share"), v.get("inter_share")) != sig0
+                   for v in explicit):
+                raise ModelingError("dispatch_peer_traffic_declarations_differ")
+            if sig0[1] is not None and sig0[2] is not None:
+                forward = {
+                    "kind": "two_tier",
+                    "ranks_per_node": int(sig0[0]),
+                    "intra_share": float(sig0[1]),
+                    "inter_share": float(sig0[2]),
+                    "source_bytes": [op.link_bytes for op in source_ops],
+                    "direction": "forward",
+                }
+            else:
+                if any(value != explicit[0] for value in explicit):
+                    raise ModelingError("dispatch_peer_traffic_declarations_differ")
+                forward = explicit[0]
+        else:
+            if any(value != explicit[0] for value in explicit):
+                all_stat_deepep = all(
+                    isinstance(v, dict) and v.get("kind") == "matrix"
+                    and dict(op.metadata).get("deepep_mode")
+                    and dict(op.metadata).get("routing_basis") == "probability_moments"
+                    for v, op in zip(explicit, source_ops)
+                )
+                if all_stat_deepep:
+                    forward = {
+                        **explicit[0],
+                        "payload_bytes": tuple(
+                            tuple(explicit[idx]["payload_bytes"][idx])
+                            for idx in range(len(group))
+                        ),
+                    }
+                else:
+                    raise ModelingError("dispatch_peer_traffic_declarations_differ")
+            else:
+                forward = explicit[0]
+    else:
+        if any(op.family == "alltoallv" for op in source_ops):
+            raise ModelingError("alltoallv_requires_explicit_peer_matrix")
+        forward = {"kind": "uniform_peers",
+                   "source_bytes": [op.link_bytes for op in source_ops],
+                   "direction": "forward"}
+    plan = PeerTraffic.from_mapping(forward, len(group))
+    for index, op in enumerate(source_ops):
+        if not math.isclose(plan.row_total(index), op.link_bytes, rel_tol=1e-12, abs_tol=1e-9):
+            raise ModelingError("dispatch_peer_traffic_row_total_mismatch")
+        key = owner[group[index]], op.op_id
+        replacement = replace(op, metadata=tuple({**dict(op.metadata), "peer_traffic": forward}.items()))
+        if key in replacements and replacements[key] != replacement:
+            raise ModelingError("representative_dispatch_groups_require_equal_traffic")
+        replacements[key] = replacement
+    return forward, declared_widths
 
 
 def bind_cohort_traffic(case, graphs):
@@ -86,6 +215,8 @@ def bind_cohort_traffic(case, graphs):
         stage = int(meta.get("source_stage", reverse.stage))
         axis = meta.get("group_axis", "ep")
         source_id = meta["reverse_of_collective"]
+        part_ids = tuple(meta.get("reverse_of_collective_parts") or (source_id,))
+        col_fraction = float(meta.get("reverse_column_fraction", 1.0))
         owner = owner_by_stage.get(stage)
         if owner is None:
             owner = {rank: r for r in graphs for rank in topology.ranks(r, stage)}
@@ -93,68 +224,25 @@ def bind_cohort_traffic(case, graphs):
         own_ranks = set(topology.ranks(replica, stage))
         descriptors, totals = [], []
         for group in topology.groups(axis, replica, stage, metadata=meta):
-            cache_key = (stage, axis, source_id, group, _peer_row_widths(meta))
+            cache_key = (stage, axis, part_ids, col_fraction, group, _peer_row_widths(meta))
             cached = group_plan_cache.get(cache_key)
             if cached is not None:
                 backward, return_plan = cached
                 descriptors.append(backward)
                 totals.extend(return_plan.row_total(i) for i, rank in enumerate(group) if rank in own_ranks)
                 continue
-            source_ops = []
-            for rank in group:
-                if rank not in owner or (owner[rank], stage, source_id) not in declarations:
-                    raise ModelingError("inverse_traffic_requires_complete_dispatch_cohort")
-                source_ops.append(declarations[owner[rank], stage, source_id])
-            for op in source_ops:
-                source_meta = dict(op.metadata)
-                if (source_meta.get("group_axis", "ep") != axis
-                        or op.family not in {"alltoall", "alltoallv"}):
-                    raise ModelingError("inverse_traffic_requires_matching_dispatch_group")
-            widths = [_peer_row_widths(dict(op.metadata)) for op in source_ops]
-            declared_widths = next((value for value in widths if value is not None), None)
-            if declared_widths is not None and any(value != declared_widths for value in widths):
+            resolved_parts = [
+                _resolve_forward_group(
+                    part_id, group, stage, axis, owner, declarations, replacements,
+                )
+                for part_id in part_ids
+            ]
+            forward_parts = [item[0] for item in resolved_parts]
+            part_widths = [item[1] for item in resolved_parts]
+            declared_widths = next((value for value in part_widths if value is not None), None)
+            if declared_widths is not None and any(value != declared_widths for value in part_widths):
                 raise ModelingError("dispatch_peer_traffic_row_widths_differ")
-            explicit = [dict(op.metadata).get("peer_traffic") for op in source_ops]
-            if any(value is not None for value in explicit):
-                if all(isinstance(v, dict) and v.get("kind") == "two_tier" for v in explicit):
-                    sig0 = (explicit[0].get("ranks_per_node"),
-                            explicit[0].get("intra_share"),
-                            explicit[0].get("inter_share"))
-                    if any((v.get("ranks_per_node"), v.get("intra_share"), v.get("inter_share")) != sig0
-                           for v in explicit):
-                        raise ModelingError("dispatch_peer_traffic_declarations_differ")
-                    if sig0[1] is not None and sig0[2] is not None:
-                        forward = {
-                            "kind": "two_tier",
-                            "ranks_per_node": int(sig0[0]),
-                            "intra_share": float(sig0[1]),
-                            "inter_share": float(sig0[2]),
-                            "source_bytes": [op.link_bytes for op in source_ops],
-                            "direction": "forward",
-                        }
-                    else:
-                        if any(value != explicit[0] for value in explicit):
-                            raise ModelingError("dispatch_peer_traffic_declarations_differ")
-                        forward = explicit[0]
-                else:
-                    if any(value != explicit[0] for value in explicit):
-                        raise ModelingError("dispatch_peer_traffic_declarations_differ")
-                    forward = explicit[0]
-            else:
-                if any(op.family == "alltoallv" for op in source_ops):
-                    raise ModelingError("alltoallv_requires_explicit_peer_matrix")
-                forward = {"kind": "uniform_peers",
-                           "source_bytes": [op.link_bytes for op in source_ops],
-                           "direction": "forward"}
-            plan = PeerTraffic.from_mapping(forward, len(group))
-            for index, op in enumerate(source_ops):
-                if not math.isclose(plan.row_total(index), op.link_bytes, rel_tol=1e-12, abs_tol=1e-9):
-                    raise ModelingError("dispatch_peer_traffic_row_total_mismatch")
-                key = owner[group[index]], op.op_id
-                replacement = replace(op, metadata=tuple({**dict(op.metadata), "peer_traffic": forward}.items()))
-                if key in replacements and replacements[key] != replacement:
-                    raise ModelingError("representative_dispatch_groups_require_equal_traffic")
-                replacements[key] = replacement
+            forward = _sum_peer_descriptors(forward_parts)
             reverse_widths = _peer_row_widths(meta)
             if declared_widths is None and reverse_widths is not None:
                 raise ModelingError("reverse_peer_row_width_requires_dispatch_rows")
@@ -163,6 +251,8 @@ def bind_cohort_traffic(case, graphs):
                 raise ModelingError("dispatch_and_reverse_peer_row_widths_differ")
             routed_forward = (forward if declared_widths is None else
                               _peer_rows_at_reverse_width(forward, declared_widths))
+            if col_fraction != 1.0:
+                routed_forward = _scale_peer_descriptor(routed_forward, col_fraction)
             backward = {**routed_forward, "direction": (
                 "transpose" if routed_forward.get("direction", "forward") == "forward" else "forward")}
             return_plan = PeerTraffic.from_mapping(backward, len(group))

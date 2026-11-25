@@ -17,11 +17,13 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import replace
 import math
-from typing import Any
+from typing import Any, Literal
 
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from .deepep_exchange import (
+    _DOWN_OVERLAP_COLUMN_ALIGNMENT,
     _UNSCALED_MATRIX_KEYS,
     _allocate_rows,
     _deepep_peer_traffic_matrix,
@@ -33,10 +35,12 @@ from .deepep_exchange import (
     deepep_exchange_factor,
     deepep_group_volume,
     deepep_intra_volume,
+    down_overlap_columns,
     overlap_row_cut,
     received_value_contract,
     resolve_exchange_options,
     scale_exchange_operator,
+    scale_exchange_stages,
     split_deepep_combine_overlap,
     split_deepep_dispatch_overlap,
     split_peer_traffic_rows,
@@ -44,11 +48,27 @@ from .deepep_exchange import (
 )
 from mindie_sim.prediction.implementations import append_audit, typed_value
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_REVISION = "175ef4d49c2072f9233619636f0309f4f88b4e2c"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-ascend",
+        revision=_VLLM_ASCEND_REVISION,
+        relative_path="vllm_ascend/ops/fused_moe/token_dispatcher.py",
+        source_sha256="6126304014959e8c52d87284ccac078f7622a6d72c7a7fc8be25929dfe644cfb",
+    ),
+    SourceRef(
+        repository="vllm-ascend",
+        revision=_VLLM_ASCEND_REVISION,
+        relative_path="vllm_ascend/ops/fused_moe/moe_comm_method.py",
+        source_sha256="b785ade12a81349d01d4806c95ab17d37537db9548b3aae492135c8f4318fe39",
+    ),
+)
+
 DEFAULT_TOKENS = 1
 DEFAULT_CONTEXT = 4096
 DEFAULT_SEQUENCES = 16
 _MATRIX_SHAPE_ALIGNMENT = 16
-_DOWN_OVERLAP_COLUMN_ALIGNMENT = 64
 
 
 def expert_bank_segments(bank_rows, first: int):
@@ -217,28 +237,48 @@ def _build_deepep_up_part(
         meta["activation_scale_shape"] = (shape[0], *tuple(meta["activation_scale_shape"])[1:])
     if idx == 1:
         meta["deepep_overlap_branch"] = True
-    for key in ("matrix_weight_bytes", "packed_weight_bytes", "weight_scale_bytes", "weight_bytes"):
-        if key in meta and isinstance(meta[key], (int, float)):
-            meta[key] = float(meta[key]) * frac
-    if "matrix_epilogue" in meta:
-        ep_m = dict(meta["matrix_epilogue"])
-        ep_m["row_scale_bytes"] = float(ep_m.get("row_scale_bytes", 0.0)) * frac
-        ep_m["column_scale_bytes"] = float(ep_m.get("column_scale_bytes", 0.0)) * frac
-        ep_m["operations_per_output"] = (up.vector_ops * frac) / (shape[0] * shape[1])
-        meta["matrix_epilogue"] = ep_m
+    weight_scale = 1.0
     realization = meta.get("routing_realization")
     if isinstance(realization, Mapping) and realization.get("basis") == "explicit_token_routing_integer":
         bank = tuple(int(value) for value in realization.get("local_expert_rows") or ())
         if bank and sum(bank) == m:
             seg_main, seg_tail = expert_bank_segments(bank, first)
             segment = seg_main if idx == 0 else seg_tail
+            active_full = sum(1 for value in bank if value)
+            active_seg = sum(1 for value in segment if value)
+            weight_scale = (active_seg / float(active_full)) if active_full > 0 else 1.0
             meta["routing_realization"] = {
                 **dict(realization), "local_expert_rows": segment,
-                "rows": sum(segment), "active": sum(1 for value in segment if value)}
+                "rows": sum(segment), "active": active_seg}
             meta["matrix_group_rows"] = segment
-            meta["matrix_groups"] = sum(1 for value in segment if value)
+            meta["matrix_groups"] = active_seg
             meta["deepep_expert_bank_rows"] = bank
             meta["deepep_segment_expert_bank_rows"] = segment
+    else:
+        # A chunk of shape[0] rows can touch at most min(active_full, shape[0])
+        # local expert banks; clamp weight reads accordingly.
+        active_full = float(
+            meta.get("expected_active_experts")
+            or meta.get("active_local_experts")
+            or 0.0
+        )
+        if active_full > float(shape[0]) > 0.0:
+            weight_scale = float(shape[0]) / active_full
+    meta["deepep_weight_scale"] = float(weight_scale)
+    # Row-splitting along M keeps full participating expert weight bytes;
+    # cross-chunk weight reuse is handled strictly by L2 residency.
+    for key in (
+        "matrix_weight_bytes", "packed_weight_bytes", "weight_scale_bytes",
+        "weight_bytes", "routed_weight_read_bytes",
+    ):
+        if key in meta and isinstance(meta[key], (int, float)):
+            meta[key] = float(meta[key]) * weight_scale
+    if "matrix_epilogue" in meta:
+        ep_m = dict(meta["matrix_epilogue"])
+        ep_m["row_scale_bytes"] = float(ep_m.get("row_scale_bytes", 0.0)) * frac
+        ep_m["column_scale_bytes"] = float(ep_m.get("column_scale_bytes", 0.0)) * weight_scale
+        ep_m["operations_per_output"] = (up.vector_ops * frac) / (shape[0] * shape[1])
+        meta["matrix_epilogue"] = ep_m
     gate_input_format = str(meta.get("activation_format") or "int8")
     gate_read = shape[0] * k * dtype_bytes(gate_input_format) + float(meta.get("activation_scale_bytes", 0.0))
     gate_mte2 = float(meta.get("packed_weight_bytes", 0.0)) + gate_read
@@ -345,22 +385,21 @@ def split_deepep_up_overlap(up, options, *, dispatch_overlap_id: str | None,
     return tuple(result), last_gate
 
 
-def split_deepep_down_overlap(down, options):
+def split_deepep_down_overlap(down, options, *, has_combine: bool = True):
     """Split expert_down along output columns N so combine_overlap sends complete outputs."""
     overlap = float(options.get("overlap", 0.0))
-    if not options.get("deepep") or overlap <= 0.0 or len(down.local_shape) < 3:
+    if (not has_combine or not options.get("deepep") or overlap <= 0.0
+            or options.get("ep") == 1 or len(down.local_shape) < 3):
         return (down,), down.op_id, down.op_id
     m, n, k = down.local_shape[-3:]
-    if n < 2:
+    n1, n2 = down_overlap_columns(n, overlap)
+    if n < 2 or n1 < 1 or n2 < 1:
         return (down,), down.op_id, down.op_id
-    raw_n1 = max(1, min(n - 1, round(n * overlap)))
-    alignment = _DOWN_OVERLAP_COLUMN_ALIGNMENT
-    n1 = raw_n1
-    if n >= 2 * alignment and n % alignment == 0:
-        n1 = max(alignment, min(n - alignment, raw_n1 // alignment * alignment))
-    n2 = max(1, n - n1)
     shapes = ((m, n1, k), (m, n2, k))
     fracs = (n1 / n, n2 / n)
+    base_meta = dict(down.metadata)
+    full_weight_bytes = float(base_meta.get("packed_weight_bytes", 0.0))
+    full_act_read_bytes = max(0.0, float(down.mte2_bytes) - full_weight_bytes)
     parts = []
     for idx, (shape, frac) in enumerate(zip(shapes, fracs)):
         meta = dict(down.metadata)
@@ -368,19 +407,29 @@ def split_deepep_down_overlap(down, options):
             meta.pop("input_conversion_subgraphs", None)
             meta["activation_producer"] = "explicit_quantization"
             meta["deepep_overlap_branch"] = True
-        for key in ("matrix_weight_bytes", "packed_weight_bytes", "weight_scale_bytes", "weight_bytes"):
+        meta["deepep_column_cut"] = (n1, n2)
+        meta["deepep_column_span"] = (0, n1) if idx == 0 else (n1, n)
+        meta["deepep_weight_scale"] = float(frac)
+        for key in (
+            "matrix_weight_bytes", "packed_weight_bytes", "weight_scale_bytes",
+            "weight_bytes", "routed_weight_read_bytes",
+        ):
             if key in meta and isinstance(meta[key], (int, float)):
                 meta[key] = float(meta[key]) * frac
         if "matrix_epilogue" in meta:
             ep_m = dict(meta["matrix_epilogue"])
-            ep_m["row_scale_bytes"] = float(ep_m.get("row_scale_bytes", 0.0)) * frac
             ep_m["column_scale_bytes"] = float(ep_m.get("column_scale_bytes", 0.0)) * frac
             meta["matrix_epilogue"] = ep_m
+        # Column-splitting along N splits weights and outputs, while each chunk
+        # reads the full activation rows (reuse is governed by L2 residency).
+        part_mte2 = full_weight_bytes * frac + full_act_read_bytes
+        part_mte3 = float(down.mte3_bytes) * frac
         parts.append(replace(
             down,
             op_id=down.op_id if idx == 0 else down.op_id + "_overlap",
             recipe=down.recipe,
-            deps=down.deps if idx == 0 else (down.op_id,),
+            deps=(down.deps if idx == 0
+                  else tuple(dict.fromkeys((*down.deps, down.op_id)))),
             local_shape=shape,
             semantic_shape=shape if len(down.semantic_shape) == 3 else down.semantic_shape,
             launch_shape=shape if len(down.launch_shape) == 3 else down.launch_shape,
@@ -388,10 +437,10 @@ def split_deepep_down_overlap(down, options):
                                for v in shape),
             flops=down.flops * frac,
             matrix_flops=tuple((dt, val * frac) for dt, val in down.matrix_flops),
-            hbm_bytes=down.hbm_bytes * frac,
+            hbm_bytes=part_mte2 + part_mte3,
             vector_ops=down.vector_ops * frac,
-            mte2_bytes=down.mte2_bytes * frac,
-            mte3_bytes=down.mte3_bytes * frac,
+            mte2_bytes=part_mte2,
+            mte3_bytes=part_mte3,
             metadata=tuple(meta.items()),
         ))
     return (parts[0], parts[1]), parts[0].op_id, parts[1].op_id
@@ -452,6 +501,6 @@ def analyze_shared_expert_overlap(
 __all__ = [
     "deepep_group_volume", "deepep_intra_volume", "standard_alltoall_volume",
     "resolve_exchange_options", "deepep_exchange_factor",
-    "scale_exchange_operator",
+    "scale_exchange_operator", "scale_exchange_stages",
     "analyze_shared_expert_overlap",
 ]
