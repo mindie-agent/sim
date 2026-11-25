@@ -13,9 +13,11 @@
 """
 from dataclasses import replace
 import math
+from typing import Literal
 
 from mindie_sim.catalog.attention_common import AttentionResult
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
 from ...graph import GraphPolicy
 from ...lowering import Builder
@@ -32,6 +34,36 @@ from ._gdn_decode_programs import (
     CONV, GATING, CONV_SOURCE, conv_plan, conv_spec_terms, gating_plan, gating_spec_terms,
 )
 from .common import request_layout_metadata
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_REV = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
+_OPS_TRANSFORMER_REV = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/ops/gdn.py",
+        source_sha256="b170b30626cf46bc4ec1e47080f9487c1e5443e51add42bb8c67bfd20a79fac4",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/ops/triton/fla/fused_qkvzba_split_reshape.py",
+        source_sha256="3b51906217f16ba69e711a5694cdd9012b7fd2fcc0730761bf1373607de3c389",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_TRANSFORMER_REV,
+        relative_path="attention/recurrent_gated_delta_rule/op_kernel/arch35/recurrent_gated_delta_rule_arch35.h",
+        source_sha256="2a0085a85082d74d7cf6a72c26c78b2f65cac597509506c1d28ca9c4a8767ed8",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_TRANSFORMER_REV,
+        relative_path="mamba/causal_conv1d/op_kernel/arch35/causal_conv1d_update.h",
+        source_sha256="812584ad8fd5b8dbb76fa53fb15648a15d2942fec7c6d23a1fa866355fea13c3",
+    ),
+)
 
 SOURCE = {"path": "data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
           "sha256": "e9ed210b4ca4431ee40916f06f0272e5e781eb04b61b084bacea216799fbca98",
@@ -397,10 +429,13 @@ def _lower_gdn_inputs(b, tensors, *, deps, model, plan, tp: int, tokens: int, co
                      * (key_replication - 1) / key_replication)
         rep_id = b.communicate(
             "gdn_key_head_replicate", (conv_view.producer,), rep_bytes, "allgather",
-            recipe="ring_allgather", shape=(tokens, width),
-            metadata=(("group_axis", "tp"), ("comm_group_size", key_replication),
-                      ("steps", key_replication - 1),
-                      ("gdn_key_head_replication", key_replication)),
+            axis="local_tp",
+            shape=(tokens, width),
+            comm_group_size=key_replication,
+            local_tp_width=key_replication,
+            local_tp_stride=1,
+            steps=key_replication - 1,
+            gdn_key_head_replication=key_replication,
         )
         conv_view = tensors.result(rep_id, (tokens, width))
     if _is_interleaved_qkvzba(model, plan):

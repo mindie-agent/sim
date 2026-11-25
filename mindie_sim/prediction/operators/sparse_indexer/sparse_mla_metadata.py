@@ -9,11 +9,30 @@
 [Side-Effect Policy] Constructs operators and ordinary Engine programs only.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import KernelProgram, Stage
 
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_VLLM_ASCEND_REV = "8c30e4f491f73cba737a1dacc522894e437cdf3d"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/attention/sfa_v1.py",
+        source_sha256="f5fbfc63cf488f9839f85a3814a65a080bf484ac67c25aced0ee4a42162577b6",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision=_VLLM_ASCEND_REV,
+        relative_path="vllm_ascend/attention/sparse_flash_mla.py",
+        source_sha256="fba55170e4b99a401918dd9ab0f59ddd1af0772e640faec43edbd9d31d7e178c",
+    ),
+)
 
 METADATA_WORD_BYTES = 4
 
