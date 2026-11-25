@@ -468,6 +468,14 @@ def _check_required_roles(roles, matched_roles, original, groups, local_tokens, 
         # Hybrid PP stages (e.g. KDA-only stages) own zero MLA layers while
         # peer stages own and fuse MLA prolog normally.
         required_roles = required_roles - {"mla_prolog"}
+    if ("mla_prolog" in required_roles
+            and "mla_prolog" not in matched_roles
+            and original and all(op.phase == "prefill" for op in original)
+            and any(d["role"] == "mla_prolog" for d, _ in groups)
+            and all(d.get("native_fusion_eligible") is False
+                    and d.get("fusion_reason") == "unabsorbed_mla_prefill"
+                    for d, _ in groups if d["role"] == "mla_prolog")):
+        required_roles = required_roles - {"mla_prolog"}
     realized_rows = None
     for op in original:
         if not any(k in {"routing_realization", "source_token_mask"} for k, _ in op.metadata):

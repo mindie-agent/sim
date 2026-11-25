@@ -16,7 +16,8 @@ from typing import Literal
 from mindie_sim.catalog.cache import completed_rows, index_row_bytes, index_selection_cost
 from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.context_parallel import dcp_indexer_sharded, layer_dcp_degree
-from mindie_sim.catalog.ops import compute_dtype_for
+from mindie_sim.catalog.ops import compute_dtype_for, gemm_op
+from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction.sharding.context_parallel import (
     CP_DECODE_COMM_STREAM,
     SHARDED_A3_CAST_OPS_PER_SORT,
@@ -36,7 +37,7 @@ from .generic_latent_attention import (
 )
 from mindie_sim.prediction.implementations import produced_values, select, set_input_ports
 from mindie_sim.prediction.operators.sparse_indexer.indexer_representation import index_representation
-from .mla_native import index_layer_norm
+from .mla_native import index_layer_norm, index_rms_norm
 from .mla_structure import declare_indexer
 
 TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
@@ -90,10 +91,24 @@ BLOCK_QUANT_TILE = 128
 INDEXER_QUANT_CACHE_RECIPE = "cann_indexer_quant_cache_c8"
 FP32_BYTES = int(dtype_bytes("fp32"))
 FP16_BYTES = int(dtype_bytes("fp16"))
+BF16_BYTES = int(dtype_bytes("bf16"))
 FP32_WEIGHT_DTYPE = "fp32"
 INT32_BYTES = int(dtype_bytes("int32"))
+INT64_BYTES = int(dtype_bytes("int64"))
 ROPE_OPS = 6
 CANDIDATE_BYTES = 8
+SHARDED_PREPARE_VECTOR_OPS = 4
+SHARDED_PACK_VECTOR_OPS = 4
+SHARDED_GATHER_VECTOR_OPS = 1
+SHARDED_FUSED_SORT_BITONIC_HALF = 0.5
+SHARDED_RADIX_ID_BITS = 20
+SHARDED_RADIX_DIGIT_BITS = 13
+SHARDED_SCORE_BITS_BF16 = 16
+SHARDED_SCORE_BITS_FP32 = 32
+SHARDED_RADIX_GATHER_STREAMS = 2
+SHARDED_NON_PRESORTED_UNPACK_READ_MULT = 2
+C2_SCATTER_COORD_INTS = 2
+MXFP4_INDEXER_NATIVE_KIND = "quantize_mxfp4_indexer"
 MIN_LOG_TOPK = 2
 M10_INTERLEAVE_ALIGN = 128
 SMLA_METADATA_SIZE_A23 = 1024
@@ -151,21 +166,152 @@ def _machine_vector_cores(machine) -> int | None:
     return aiv if aiv > 0 else None
 
 
+def _emit_unfused_presorted_pack(
+    b, *, deps: tuple[str, ...], suffix: str, tile_idx: int, tile_rows: int, index_topk: int,
+    r_tile: int, cand_tiles: int, is_a5: bool, raw_cand_bytes: int, log_k: float,
+) -> str:
+    """Emit ordered 6-kernel (A5) or 8-kernel (A3 + 2 Cast) presorted local pack sequence.
+
+    Matches ``vllm_ascend/ops/triton/sharded_indexer.py:438-470, 520-539``:
+    ``_prepare_local_sort_inputs -> Sort -> [Cast ->] GatherElements[V2]
+    -> Sort -> [Cast ->] GatherElements[V2] -> _pack_candidates``.
+    """
+    tile_elems = tile_rows * index_topk
+    gather_kernel = "GatherElements" if is_a5 else "GatherElementsV2"
+    idx_bytes = INT64_BYTES if is_a5 else INT32_BYTES
+    prep = b.work(
+        f"candidate_sort_prepare{suffix}", deps, (tile_rows, index_topk),
+        vector=tile_elems * SHARDED_PREPARE_VECTOR_OPS,
+        read=tile_elems * raw_cand_bytes,
+        write=tile_elems * CANDIDATE_BYTES,
+        family="elementwise", dtype="fp32",
+        metadata=(
+            ("native_kinds", ("_prepare_local_sort_inputs",)),
+            ("kernel", "_prepare_local_sort_inputs"),
+            ("candidate_tile_index", int(tile_idx)),
+        ),
+    )
+    sort_ids = b.work(
+        f"candidate_sort_ids{suffix}", (prep,), (tile_rows, index_topk),
+        vector=tile_elems * log_k,
+        read=tile_elems * FP32_BYTES,
+        write=tile_elems * (FP32_BYTES + INT64_BYTES),
+        family="topk", dtype="fp32",
+        metadata=(
+            ("native_kinds", ("Sort",)),
+            ("kernel", "Sort"),
+            ("candidate_tile_index", int(tile_idx)),
+        ),
+    )
+    id_idx_dep = sort_ids
+    if not is_a5:
+        id_idx_dep = b.vector(
+            f"candidate_sort_cast{suffix}", (sort_ids,), tile_elems, 1.0,
+            dtype="int32", family="cast",
+            read_bytes_override=tile_elems * INT64_BYTES,
+            write_bytes_override=tile_elems * INT32_BYTES,
+            metadata=(
+                ("native_kinds", ("Cast",)),
+                ("kernel", "Cast"),
+                ("sort_cast_launches", 1),
+                ("candidate_tile_index", int(tile_idx)),
+            ),
+        )
+    gather_scores = b.work(
+        f"candidate_gather_scores{suffix}", (prep, id_idx_dep), (tile_rows, index_topk),
+        vector=tile_elems * SHARDED_GATHER_VECTOR_OPS,
+        read=tile_elems * (FP32_BYTES + idx_bytes),
+        write=tile_elems * FP32_BYTES,
+        family="elementwise", dtype="fp32",
+        metadata=(
+            ("native_kinds", (gather_kernel,)),
+            ("kernel", gather_kernel),
+            ("candidate_tile_index", int(tile_idx)),
+        ),
+    )
+    sort_scores = b.work(
+        f"candidate_sort_scores{suffix}", (gather_scores,), (tile_rows, index_topk),
+        vector=tile_elems * log_k,
+        read=tile_elems * FP32_BYTES,
+        write=tile_elems * (FP32_BYTES + INT64_BYTES),
+        family="topk", dtype="fp32",
+        metadata=(
+            ("native_kinds", ("Sort",)),
+            ("kernel", "Sort"),
+            ("candidate_tile_index", int(tile_idx)),
+        ),
+    )
+    score_idx_dep = sort_scores
+    if not is_a5:
+        score_idx_dep = b.vector(
+            f"candidate_sort_cast_scores{suffix}", (sort_scores,), tile_elems, 1.0,
+            dtype="int32", family="cast",
+            read_bytes_override=tile_elems * INT64_BYTES,
+            write_bytes_override=tile_elems * INT32_BYTES,
+            metadata=(
+                ("native_kinds", ("Cast",)),
+                ("kernel", "Cast"),
+                ("sort_cast_launches", 1),
+                ("candidate_tile_index", int(tile_idx)),
+            ),
+        )
+    gather_ids = b.work(
+        f"candidate_gather_ids{suffix}", (sort_ids, score_idx_dep), (tile_rows, index_topk),
+        vector=tile_elems * SHARDED_GATHER_VECTOR_OPS,
+        read=tile_elems * (FP32_BYTES + idx_bytes),
+        write=tile_elems * FP32_BYTES,
+        family="elementwise", dtype="fp32",
+        metadata=(
+            ("native_kinds", (gather_kernel,)),
+            ("kernel", gather_kernel),
+            ("candidate_tile_index", int(tile_idx)),
+        ),
+    )
+    pack_seq = (
+        ("_prepare_local_sort_inputs", "Sort", "GatherElements",
+         "Sort", "GatherElements", "_pack_candidates")
+        if is_a5 else
+        ("_prepare_local_sort_inputs", "Sort", "Cast", "GatherElementsV2",
+         "Sort", "Cast", "GatherElementsV2", "_pack_candidates")
+    )
+    cast_launches = 0 if is_a5 else SHARDED_A3_CAST_OPS_PER_SORT
+    return b.work(
+        f"candidate_pack{suffix}", (gather_ids, sort_scores), (tile_rows, index_topk),
+        vector=tile_elems * SHARDED_PACK_VECTOR_OPS,
+        read=tile_elems * CANDIDATE_BYTES,
+        write=tile_elems * CANDIDATE_BYTES,
+        family="elementwise",
+        metadata=(
+            ("sharded_indexer_tile_rows", int(r_tile)),
+            ("candidate_allgather_tiles", int(cand_tiles)),
+            ("candidate_tile_index", int(tile_idx)),
+            ("candidate_tile_rows", int(tile_rows)),
+            ("sharded_presorted", True),
+            ("sharded_fused_sort", False),
+            ("sort_cast_launches", int(cast_launches)),
+            ("native_kinds", pack_seq),
+            ("kernel", "_pack_candidates"),
+        ),
+    )
+
+
 def _emit_sharded_candidate_merge(
     b, topk: str, *, valid: int, index_topk: int, eff_dcp: int, runtime, machine,
+    score_rows: float | None = None, return_local: bool = True,
 ) -> str:
-    """Emit executable per-tile sharded-indexer pack -> (A3 Cast) -> AllGather -> merge.
+    """Emit executable per-tile sharded-indexer pack -> AllGather -> merge.
 
-    Matches upstream ``sharded_indexer.py:36-65`` and ``ops/triton/sharded_indexer.py:489-656``:
+    Matches upstream ``sharded_indexer.py:36-65`` and ``ops/triton/sharded_indexer.py:186-656``:
       * ``valid <= 0`` returns immediately with zero tiles, zero AllGathers, zero Casts.
-      * Presorting and fused merge (``_merge_candidates`` / ``_merge_owner_prefix``) are
-        enabled only when ``index_topk == SHARDED_FUSED_SORT_TOPK`` (2048).
-      * Other K values (e.g. K=128) run unsorted ``_pack_candidates`` -> AllGather ->
-        ``_unpack_candidates`` + 2×(``Sort`` + ``GatherElements[V2]``) +
-        ``_select_local_candidates`` (with A3 ``Cast`` before ``GatherElementsV2``,
-        0 ``Cast`` on A5).
-      * Fused-sort occupancy (>=75% vector cores) is evaluated PER TILE on ``tile_rows``,
-        not on the aggregate ``valid`` row count.
+      * Presorting and fused merge (``_merge_owner_prefix`` for local output /
+        ``_merge_candidates`` otherwise) are enabled only when ``index_topk == 2048``.
+      * Fused local sort executes ``ceil((20 + score_bits) / 13)`` radix passes
+        (3 passes for BF16 on A5, 4 passes for FP32 on A3).
+      * Unfused presorted tiles expand into the explicit 6-kernel A5 (8-kernel A3 with
+        2 Casts) sequence: prepare -> sort -> gather -> sort -> gather -> pack.
+      * Every tile reads ``(ids, scores)`` from ``topk``; empty owner-prefix ranks
+        read only their local ``8K`` packed slice without probing peers; non-presorted
+        merges account for ``_unpack_candidates`` scratch write/read traffic.
     """
     n_valid = int(valid)
     if n_valid <= 0:
@@ -177,83 +323,109 @@ def _emit_sharded_candidate_merge(
         return topk
     vector_cores = _machine_vector_cores(machine)
     presorted = int(index_topk) == SHARDED_FUSED_SORT_TOPK
+    raw_cand_bytes = INT32_BYTES + (BF16_BYTES if is_a5 else FP32_BYTES)
+    score_bits = SHARDED_SCORE_BITS_BF16 if is_a5 else SHARDED_SCORE_BITS_FP32
+    radix_passes = math.ceil((SHARDED_RADIX_ID_BITS + score_bits) / SHARDED_RADIX_DIGIT_BITS)
+    log_k = math.log2(max(MIN_LOG_TOPK, index_topk))
+    empty_local_shard = score_rows is not None and float(score_rows) <= 0.0
     remaining = n_valid
     dep = topk
     last_merge = topk
     for tile_idx in range(cand_tiles):
         tile_rows = min(r_tile, remaining)
         remaining -= tile_rows
-        tile_fused_sort = presorted and sharded_fused_sort_eligible(
+        tile_elems = tile_rows * index_topk
+        tile_fused_sort = presorted and return_local and sharded_fused_sort_eligible(
             world_size=eff_dcp, topk=index_topk, rows=tile_rows, vector_cores=vector_cores,
         )
+        suffix = "" if tile_idx == 0 else f"_t{tile_idx}"
+        tile_deps = (dep,) if tile_idx == 0 else (dep, last_merge)
         if not presorted:
-            sort_kernels: tuple[str, ...] = ("_pack_candidates",)
             merge_kernels: tuple[str, ...] = (
                 ("_unpack_candidates", "Sort", "GatherElements", "Sort", "GatherElements", "_select_local_candidates")
                 if is_a5 else
                 ("_unpack_candidates", "Sort", "Cast", "GatherElementsV2", "Sort", "Cast", "GatherElementsV2", "_select_local_candidates")
             )
             cast_launches = 0 if is_a5 else (2 * SHARDED_A3_CAST_OPS_PER_SORT)
-        elif tile_fused_sort:
-            sort_kernels = ("_pack_sorted_candidates",)
-            merge_kernels = ("_merge_candidates",)
-            cast_launches = 0
-        elif is_a5:
-            sort_kernels = ("_prepare_local_sort_inputs", "Sort", "GatherElements")
-            merge_kernels = ("_merge_owner_prefix",)
-            cast_launches = 0
-        else:
-            sort_kernels = ("_prepare_local_sort_inputs", "Sort", "Cast", "GatherElementsV2")
-            merge_kernels = ("_merge_owner_prefix",)
-            cast_launches = SHARDED_SORT_STAGES_PER_LAYER * SHARDED_A3_CAST_OPS_PER_SORT
-        suffix = "" if tile_idx == 0 else f"_t{tile_idx}"
-        packed = b.work(
-            f"candidate_pack{suffix}", (dep if tile_idx == 0 else last_merge,),
-            (tile_rows, index_topk),
-            read=tile_rows * index_topk * CANDIDATE_BYTES,
-            write=tile_rows * index_topk * CANDIDATE_BYTES,
-            family="elementwise",
-            metadata=(
-                ("sharded_indexer_tile_rows", int(r_tile)),
-                ("candidate_allgather_tiles", int(cand_tiles)),
-                ("candidate_tile_index", int(tile_idx)),
-                ("candidate_tile_rows", int(tile_rows)),
-                ("sharded_presorted", bool(presorted)),
-                ("sharded_fused_sort", bool(tile_fused_sort)),
-                ("sort_cast_launches", int(cast_launches if presorted else 0)),
-                ("native_kinds", sort_kernels),
-                ("kernel", sort_kernels[0]),
-            ),
-        )
-        gather_dep = packed
-        if presorted and not is_a5 and not tile_fused_sort:
-            # Explicit A3 INT32/FP32 Cast launches before GatherElementsV2 (0 Cast on A5).
-            gather_dep = b.vector(
-                f"candidate_sort_cast{suffix}", (packed,),
-                tile_rows * index_topk * SHARDED_A3_CAST_OPS_PER_SORT,
-                1.0,
-                dtype="fp32", family="cast",
+            gather_dep = b.work(
+                f"candidate_pack{suffix}", tile_deps, (tile_rows, index_topk),
+                vector=tile_elems * SHARDED_PACK_VECTOR_OPS,
+                read=tile_elems * raw_cand_bytes,
+                write=tile_elems * CANDIDATE_BYTES,
+                family="elementwise",
                 metadata=(
-                    ("native_kinds", ("Cast",)),
-                    ("kernel", "Cast"),
-                    ("sort_cast_launches", int(SHARDED_A3_CAST_OPS_PER_SORT)),
+                    ("sharded_indexer_tile_rows", int(r_tile)),
+                    ("candidate_allgather_tiles", int(cand_tiles)),
                     ("candidate_tile_index", int(tile_idx)),
+                    ("candidate_tile_rows", int(tile_rows)),
+                    ("sharded_presorted", False),
+                    ("sharded_fused_sort", False),
+                    ("sort_cast_launches", 0),
+                    ("native_kinds", ("_pack_candidates",)),
+                    ("kernel", "_pack_candidates"),
                 ),
+            )
+        elif tile_fused_sort:
+            merge_kernels = ("_merge_owner_prefix",) if return_local else ("_merge_candidates",)
+            cast_launches = 0
+            per_pass_ops = (
+                SHARDED_FUSED_SORT_BITONIC_HALF * log_k * (log_k + 1.0)
+                + SHARDED_RADIX_GATHER_STREAMS * SHARDED_GATHER_VECTOR_OPS
+            )
+            radix_ops = tile_elems * (radix_passes * per_pass_ops + SHARDED_PACK_VECTOR_OPS)
+            gather_dep = b.work(
+                f"candidate_pack{suffix}", tile_deps, (tile_rows, index_topk),
+                vector=radix_ops,
+                read=tile_elems * raw_cand_bytes,
+                write=tile_elems * CANDIDATE_BYTES,
+                family="elementwise",
+                metadata=(
+                    ("sharded_indexer_tile_rows", int(r_tile)),
+                    ("candidate_allgather_tiles", int(cand_tiles)),
+                    ("candidate_tile_index", int(tile_idx)),
+                    ("candidate_tile_rows", int(tile_rows)),
+                    ("sharded_presorted", True),
+                    ("sharded_fused_sort", True),
+                    ("sharded_radix_passes", int(radix_passes)),
+                    ("sort_cast_launches", 0),
+                    ("native_kinds", ("_pack_sorted_candidates",)),
+                    ("kernel", "_pack_sorted_candidates"),
+                ),
+            )
+        else:
+            merge_kernels = ("_merge_owner_prefix",) if return_local else ("_merge_candidates",)
+            cast_launches = 0
+            gather_dep = _emit_unfused_presorted_pack(
+                b, deps=tile_deps, suffix=suffix, tile_idx=tile_idx,
+                tile_rows=tile_rows, index_topk=index_topk,
+                r_tile=r_tile, cand_tiles=cand_tiles, is_a5=is_a5,
+                raw_cand_bytes=raw_cand_bytes, log_k=log_k,
             )
         gathered = b.communicate(
             f"candidate_gather{suffix}", (gather_dep,),
-            tile_rows * index_topk * CANDIDATE_BYTES * (eff_dcp - 1),
+            tile_elems * CANDIDATE_BYTES * (eff_dcp - 1),
             "allgather", "cp", dtype="fp32",
             comm_group_size=int(eff_dcp), dcp_degree=int(eff_dcp),
             candidate_allgather_tiles=int(cand_tiles),
             candidate_tile_index=int(tile_idx),
             sharded_indexer_tile_rows=int(r_tile),
         )
+        if not presorted:
+            merge_read_bytes = tile_elems * eff_dcp * CANDIDATE_BYTES * SHARDED_NON_PRESORTED_UNPACK_READ_MULT
+            merge_write_bytes = tile_elems * eff_dcp * CANDIDATE_BYTES + tile_elems * INT32_BYTES
+        elif return_local and empty_local_shard:
+            merge_read_bytes = tile_elems * CANDIDATE_BYTES
+            merge_write_bytes = tile_elems * INT32_BYTES
+        else:
+            merge_read_bytes = tile_elems * eff_dcp * CANDIDATE_BYTES
+            merge_write_bytes = tile_elems * INT32_BYTES
         last_merge = b.vector(
             f"candidate_merge{suffix}", (gathered,),
-            tile_rows * index_topk * eff_dcp,
-            math.log2(max(MIN_LOG_TOPK, index_topk)),
-            dtype="fp32", family="topk",
+            tile_elems * eff_dcp,
+            log_k,
+            dtype="int32", family="topk",
+            read_bytes_override=merge_read_bytes,
+            write_bytes_override=merge_write_bytes,
             metadata=(
                 ("sharded_presorted", bool(presorted)),
                 ("sharded_fused_sort", bool(tile_fused_sort)),
@@ -704,9 +876,50 @@ def index_head_weights(builder, *, plan, model, quant, deps, pool_weights, token
     return weights
 
 
-def _store_rows(rows_by_view, views, parallel, block, *, contexts=None):
-    return max(1, owned_store_rows(
-        rows_by_view, views, parallel, block, contexts=contexts))
+def _indexer_rotates_basis(plan, model) -> bool:
+    """Gate indexer Hadamard rotation on explicit representation/compressor policy."""
+    explicit_plan = getattr(plan, "index_rotate_basis", None)
+    if explicit_plan is not None:
+        return bool(explicit_plan)
+    meta = dict(getattr(model, "metadata", ()) or ())
+    exec_meta = meta.get("attention_execution")
+    if isinstance(exec_meta, dict) and "index_rotate_basis" in exec_meta:
+        return bool(exec_meta["index_rotate_basis"])
+    cache_reps = meta.get("cache_representations")
+    if isinstance(cache_reps, dict):
+        idx_rep = cache_reps.get("index_k")
+        if isinstance(idx_rep, dict) and "rotate_basis" in idx_rep:
+            return bool(idx_rep["rotate_basis"])
+    return bool(
+        plan.compress_ratio > 1
+        and getattr(plan, "compressor_kind", "") == "weighted_pool"
+        and getattr(plan, "index_input", "hidden") != "compressed"
+    )
+
+
+def _indexer_uses_rmsnorm(plan, model) -> bool:
+    """True when the indexer k_norm uses BF16 RMSNorm instead of FP32 LayerNorm."""
+    explicit = str(getattr(plan, "index_norm_kind", "") or "").strip().lower()
+    if explicit in {"rmsnorm", "layernorm"}:
+        return explicit == "rmsnorm"
+    meta = dict(getattr(model, "metadata", ()) or ())
+    exec_meta = meta.get("attention_execution")
+    if isinstance(exec_meta, dict) and exec_meta.get("index_norm_kind"):
+        return str(exec_meta["index_norm_kind"]).strip().lower() == "rmsnorm"
+    return (
+        getattr(plan, "compressor_kind", "") == "gated_ring"
+        and getattr(plan, "index_input", "") == "compressed"
+    )
+
+
+def _store_rows(
+    rows_by_view, views, parallel, block, *, contexts=None,
+    rank_candidates=None, storage_degrees=None, ratio: int = 1,
+):
+    return owned_store_rows(
+        rows_by_view, views, parallel, block, contexts=contexts,
+        rank_candidates=rank_candidates, storage_degrees=storage_degrees, ratio=ratio,
+    )
 
 
 def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runtime,
@@ -717,7 +930,7 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                      shared_topk=None, fused_compressor=False,
                      cache_hidden_dep=None, cache_views=None,
                      cache_padded_tokens=None, skip_pcp_index_gather=False,
-                     machine=None):
+                     machine=None, store_rank_candidates=None):
     """Produce the index cache and (optionally) its TopK selection."""
     b = builder
     q = padded_tokens
@@ -747,7 +960,8 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
         b, plan, pool_binding, prod_views, prod_deps, model, quant, prod_q, long_store,
         compressed_latent, ratio, prod_valid, fused_compressor, runtime, native_indexer,
         index_rope, parallel, idx_block, sharded_index,
-        pcp_prefill=(pcp_prefill and not skip_pcp_index_gather), machine=machine)
+        pcp_prefill=(pcp_prefill and not skip_pcp_index_gather), machine=machine,
+        store_rank_candidates=store_rank_candidates, raw_block=own_block)
     if (pcp_prefill and not skip_pcp_index_gather and plan.index_kpool <= 1
             and plan.indexer and plan.owns_index_k and index_store is not None):
         # One stored index vector is index_dim wide, not index_heads copies of it.
@@ -796,7 +1010,7 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
         q_index = index_representation(
             b, "index_query", q_index,
             (score_q if plan.index_kpool > 1 else valid) * plan.index_heads, plan.index_dim,
-            quant=quant, model=model, rotate_basis=plan.compress_ratio > 1)
+            quant=quant, model=model, rotate_basis=_indexer_rotates_basis(plan, model))
         weights = index_head_weights(
             b, plan=plan, model=model, quant=quant, deps=deps,
             pool_weights=pool_weights, tokens=score_q, native=native_indexer)
@@ -812,7 +1026,8 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                  else eff_dcp if sharded_index else 1)
         score_rows = (
             sharded_index_visible_rows(
-                views, parallel, idx_block, ratio, sharded_dcp=eff_dcp,
+                views, parallel, own_block if ratio > 1 else idx_block, ratio,
+                sharded_dcp=eff_dcp, rank_candidates=store_rank_candidates,
             )
             if sharded_index else None
         )
@@ -821,9 +1036,13 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
             runtime, hierarchy, shard_sizes, selection_deps, parallel, stage, ratio, shard,
             score_rows, machine=machine, cp_interleave_size=idx_block)
         if shard > 1 and not dsa_prefill:
+            return_local = int(getattr(parallel, "pcp", 1) or 1) <= 1 or not any(
+                v.phase == "prefill" for v in views
+            )
             topk = _emit_sharded_candidate_merge(
                 b, topk, valid=valid, index_topk=plan.index_topk,
                 eff_dcp=eff_dcp, runtime=runtime, machine=machine,
+                score_rows=score_rows, return_local=return_local,
             )
         if plan.owns_candidate_blocks:
             candidate = b.vector("candidate_blocks", (topk,),
@@ -837,6 +1056,7 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
 
 def _emit_decomposed_index_quant_store(
     b, quantize_op, *, normalized, index_rows, index_store_rows, total_row_b, quant,
+    c2_token_aligned: bool = False,
 ):
     """Emit dynamic-quant FP32 scale output + scale cast + two slot-indexed scatters."""
     q_meta = dict(quantize_op.metadata)
@@ -871,7 +1091,9 @@ def _emit_decomposed_index_quant_store(
                 ("source_semantics", "dynamic_quant_scale_cast"),
             ),
         )
-    slots_bytes = float(index_store_rows * INT32_BYTES)
+    slot_rows = index_rows if c2_token_aligned else index_store_rows
+    slot_ints = C2_SCATTER_COORD_INTS if c2_token_aligned else 1
+    slots_bytes = float(slot_rows * slot_ints * INT32_BYTES)
     store_deps: tuple[str, ...] = (normalized,)
     if scale_row_b > 0:
         scale_store = b.store(
@@ -899,10 +1121,39 @@ def _emit_decomposed_index_quant_store(
     return index_store
 
 
+def _emit_packed_mxfp4_index_store(
+    b, quantize_op, *, quant_rows: int, index_store_rows: int, total_row_b: int, width: int,
+) -> str:
+    """Fuse Triton MXFP4 index quantizer + masked cache write (``quantize_mxfp4_indexer.py:127``)."""
+    q_meta = dict(quantize_op.metadata)
+    slots_bytes = float(quant_rows * C2_SCATTER_COORD_INTS * INT32_BYTES)
+    mte2 = float(quantize_op.mte2_bytes) + slots_bytes
+    mte3 = float(index_store_rows * total_row_b)
+    b.ops = [op for op in b.ops if op.op_id != quantize_op.op_id]
+    return b.work(
+        "index_store", tuple(quantize_op.deps), (index_store_rows, width),
+        vector=float(quantize_op.vector_ops),
+        read=mte2,
+        write=mte3,
+        family="kv_cache_write",
+        dtype=quantize_op.dtype,
+        recipe="index_store",
+        metadata=(
+            ("native_kind", MXFP4_INDEXER_NATIVE_KIND),
+            ("scatter_slot_bytes", slots_bytes),
+            ("payload_dtype", q_meta.get("output_format")),
+            ("scale_dtype", q_meta.get("scale_format")),
+            ("valid_store_rows", int(index_store_rows)),
+            ("token_aligned_rows", int(quant_rows)),
+        ),
+    )
+
+
 def _produce_index_cache(
     b, plan, pool_binding, views, deps, model, quant, q, long_store, compressed_latent, ratio,
     valid, fused_compressor, runtime, native_indexer, index_rope, parallel, idx_block,
-    sharded_index, *, pcp_prefill=False, machine=None,
+    sharded_index, *, pcp_prefill=False, machine=None, store_rank_candidates=None,
+    raw_block=None,
 ):
     index_store = pool_weights = None
     if plan.owns_index_k and plan.index_kpool > 1:
@@ -943,27 +1194,48 @@ def _produce_index_cache(
             padded_tokens=kpool_q, **producer_options)
     elif plan.owns_index_k:
         index_source = long_store if plan.index_input == "compressed" else deps
-        if (plan.index_input == "compressed"
-                and cache_format(model, "compressed_kv").group_size):
-            if compressed_latent is None:
+        if plan.index_input == "compressed":
+            if compressed_latent is not None:
+                index_source = compressed_latent
+            elif cache_format(model, "compressed_kv").group_size:
                 raise ModelingError("packed_compressed_indexer_requires_pre_rope_latent_producer")
-            index_source = compressed_latent
         index_rows_by_view = [owned_completed_rows(view, ratio) for view in views]
         index_rows = sum(index_rows_by_view)
-        input_rows = index_rows if plan.index_input == "compressed" else valid
+        c2_token_aligned = (
+            plan.index_input == "compressed"
+            and getattr(plan, "compressor_kind", "") == "gated_ring"
+        )
+        producer_rows = valid if (c2_token_aligned or plan.index_input != "compressed") else index_rows
         input_width = plan.head_dim if plan.index_input == "compressed" else model.hidden_size
         if plan.compress_ratio > 1 and plan.index_input == "hidden":
             from mindie_sim.prediction.operators.mla_prolog.compression import compressor
             normalized = compressor(
                 b, name="index_compress", source=deps, tokens=valid, padded_tokens=q,
                 valid_rows=index_rows, width=plan.index_dim, plan=plan, model=model,
-                fused=fused_compressor)
+                fused=fused_compressor, tokens_by_view=[v.q_len for v in views])
+            quant_rows = index_rows
         else:
-            projected = b.matrix(
-                "index_k", (index_source,), input_rows, plan.index_dim,
-                input_width,
-                category=_indexer_matrix_category(b.quant, "indexer.wk"),
-            )
+            if c2_token_aligned:
+                # Upstream ``deepseek_v41/indexer.py:85`` creates ``wk`` as unquantized BF16 nn.Linear.
+                wk_quant = QuantSpec(
+                    name=model.activation_dtype,
+                    weight_format=model.activation_dtype,
+                    activation_format=model.activation_dtype,
+                    native_format=model.activation_dtype,
+                )
+                projected = b.add(gemm_op(
+                    op_id=b.prefix + ".index_k", deps=(index_source,),
+                    m=producer_rows, n=plan.index_dim, k=input_width,
+                    quant=wk_quant, category="indexer.wk", recipe="index_k",
+                    activation_dtype=model.activation_dtype,
+                    output_dtype=model.activation_dtype, **b.common,
+                ))
+            else:
+                projected = b.matrix(
+                    "index_k", (index_source,), producer_rows, plan.index_dim,
+                    input_width,
+                    category=_indexer_matrix_category(b.quant, "indexer.wk"),
+                )
             if plan.index_input == "compressed":
                 producer = next((op for op in reversed(b.ops)
                                  if op.op_id == index_source), None)
@@ -976,58 +1248,77 @@ def _produce_index_cache(
                     b.ops[-1] = set_input_ports(b.ops[-1], ({
                         "op": index_source, "output": "latent",
                         "source_op": index_source},))
-            explicit_quant_indexer = (
-                runtime is not None
-                and select(dict(getattr(runtime, "kernels", {}).get("lowerings", {}) or {}),
-                           "quant_lightning_indexer") is not None
-            )
-            fp32_wrapper = (
-                not _is_a5_runtime(runtime, machine)
-                and not explicit_quant_indexer
-                and quant.index_dtype in {"bf16", "fp16"}
-            )
-            normalized = index_layer_norm(
-                b, source=projected, rows=index_rows, width=plan.index_dim,
-                native=not fp32_wrapper,
-                explicit_fp32_wrapper=fp32_wrapper)
+            if _indexer_uses_rmsnorm(plan, model):
+                normalized = index_rms_norm(
+                    b, source=projected, rows=producer_rows, width=plan.index_dim)
+            else:
+                explicit_quant_indexer = (
+                    runtime is not None
+                    and select(dict(getattr(runtime, "kernels", {}).get("lowerings", {}) or {}),
+                               "quant_lightning_indexer") is not None
+                )
+                fp32_wrapper = (
+                    not _is_a5_runtime(runtime, machine)
+                    and not explicit_quant_indexer
+                    and quant.index_dtype in {"bf16", "fp16"}
+                )
+                normalized = index_layer_norm(
+                    b, source=projected, rows=producer_rows, width=plan.index_dim,
+                    native=not fp32_wrapper,
+                    explicit_fp32_wrapper=fp32_wrapper)
             if index_rope:
+                act_b = dtype_bytes(model.activation_dtype)
                 normalized = b.vector(
-                    "index_rotary", (normalized,), index_rows * index_rope, ROPE_OPS,
-                    family="rotary", shape=(index_rows, plan.index_dim),
-                    read_bytes_override=index_rows * (
-                        plan.index_dim * dtype_bytes(model.activation_dtype)
-                        + index_rope * CANDIDATE_BYTES),
-                    write_bytes_override=index_rows * plan.index_dim
-                    * dtype_bytes(model.activation_dtype))
+                    "index_rotary", (normalized,), producer_rows * index_rope, ROPE_OPS,
+                    family="rotary", shape=(producer_rows, plan.index_dim),
+                    read_bytes_override=producer_rows * (
+                        index_rope * act_b + index_rope * CANDIDATE_BYTES),
+                    write_bytes_override=producer_rows * index_rope * act_b)
+            quant_rows = producer_rows
         normalized = index_representation(
-            b, "index_key", normalized, index_rows, plan.index_dim,
-            quant=quant, model=model, rotate_basis=plan.compress_ratio > 1)
+            b, "index_key", normalized, quant_rows, plan.index_dim,
+            quant=quant, model=model, rotate_basis=_indexer_rotates_basis(plan, model))
         last = b.ops[-1]
         quantize_id = (last.op_id if last.family == "quantize"
                        and last.op_id == b.prefix + ".index_key_quantize" else None)
-        index_starts = [completed_rows(view.context, ratio) for view in views]
-        index_store_rows = (
-            _store_rows(index_rows_by_view, views, parallel, idx_block,
-                        contexts=index_starts)
-            if sharded_index and index_rows else index_rows
-        )
+        if sharded_index and index_rows:
+            if ratio > 1:
+                index_store_rows = _store_rows(
+                    [view.q_len for view in views], views, parallel,
+                    int(raw_block) if raw_block is not None else max(1, idx_block * ratio),
+                    rank_candidates=store_rank_candidates, ratio=ratio,
+                )
+            else:
+                index_store_rows = _store_rows(
+                    index_rows_by_view, views, parallel, idx_block,
+                    rank_candidates=store_rank_candidates,
+                )
+        else:
+            index_store_rows = index_rows
         total_row_b = index_row_bytes(model, plan.index_dim)
         arch = _resolve_arch(runtime, machine)
         q_meta = dict(last.metadata) if quantize_id is not None else {}
+        packed_elems = int(q_meta.get("packed_elements") or 1)
         iqc_supported = (
             quantize_id is not None
             and _indexer_quant_cache_available(arch)
             and _indexer_quant_cache_operands_supported(
                 last.dtype, q_meta.get("output_format"), q_meta.get("scale_format"),
-                packed_elements=int(q_meta.get("packed_elements") or 1),
+                packed_elements=packed_elems,
             )
         )
-        if quantize_id is not None and native_indexer and not iqc_supported:
+        if quantize_id is not None and native_indexer and packed_elems > 1 and arch == "A5":
+            index_store = _emit_packed_mxfp4_index_store(
+                b, last, quant_rows=quant_rows, index_store_rows=index_store_rows,
+                total_row_b=total_row_b, width=plan.index_dim,
+            )
+        elif quantize_id is not None and native_indexer and not iqc_supported:
             # Target arch or operand tuple lacks shipping aclnnIndexerQuantCache:
             # keep dynamic quant (FP32 scale) + scale cast + two slot-indexed scatters.
             index_store = _emit_decomposed_index_quant_store(
-                b, last, normalized=normalized, index_rows=index_rows,
+                b, last, normalized=normalized, index_rows=quant_rows,
                 index_store_rows=index_store_rows, total_row_b=total_row_b, quant=quant,
+                c2_token_aligned=c2_token_aligned,
             )
         else:
             index_store = b.store("index_store", (normalized,), index_store_rows,
