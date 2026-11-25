@@ -104,17 +104,18 @@ class _MemoryRequestsMixin:
     def _resident_admission(
         self, replica: int, request: str, tokens: int,
         *, query_tokens: int | None = None, proposal_tokens: int | None = None,
+        phase: str = "decode",
     ) -> dict:
         key = replica, request
         eff_q = self._resolve_request_query_tokens(
             key, query_tokens=query_tokens, proposal_tokens=proposal_tokens,
         )
         resident_ranks, staging_ranks = self._kv_residency_ranks(
-            tokens, query_tokens=eff_q,
+            tokens, query_tokens=eff_q, phase=phase,
         )
         demand = tuple(max(row) for row in resident_ranks)
         demand_staging = tuple(max(row) for row in staging_ranks)
-        host_demand = self.host_dram_cache_bytes(tokens) if self.sparse_offload else 0.0
+        host_demand = self.host_dram_cache_bytes(tokens, query_tokens=eff_q, phase=phase)
         (physical, host_physical, physical_staging,
          physical_ranks, physical_staging_ranks) = self._physical_union(
             key, demand, host_demand, demand_staging,
@@ -156,6 +157,7 @@ class _MemoryRequestsMixin:
     def admissible_tokens(
         self, replica: int, request: str, tokens: int, *, granularity: int = 1,
         query_tokens: int | None = None, proposal_tokens: int | None = None,
+        phase: str = "decode",
     ) -> int:
         """Largest requested KV span that fits without changing the ledger.
 
@@ -182,6 +184,7 @@ class _MemoryRequestsMixin:
             candidate = self._resident_admission(
                 replica, request, mid,
                 query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+                phase=phase,
             )
             if candidate["ok"]:
                 best = max(best, mid)
@@ -193,6 +196,7 @@ class _MemoryRequestsMixin:
     def admission_decision(
         self, replica: int, request: str, tokens: int,
         *, query_tokens: int | None = None, proposal_tokens: int | None = None,
+        phase: str = "decode",
     ) -> dict:
         """Pure request-admission decision with the same refusal vocabulary.
 
@@ -209,6 +213,7 @@ class _MemoryRequestsMixin:
         candidate = self._resident_admission(
             replica, request, tokens,
             query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+            phase=phase,
         )
         base_hbm, base_host = self._state_usage(exclude_request=key)
         decision = self._grant_decision_payload(
@@ -224,11 +229,13 @@ class _MemoryRequestsMixin:
     def resize(
         self, replica: int, request: str, tokens: int,
         *, query_tokens: int | None = None, proposal_tokens: int | None = None,
+        phase: str = "decode", valid_tokens: int | None = None,
     ) -> bool:
         key = replica, request
         candidate = self._resident_admission(
             replica, request, tokens,
             query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+            phase=phase,
         )
         if not candidate["ok"]:
             return False
@@ -250,6 +257,10 @@ class _MemoryRequestsMixin:
         self.logical_host_owners[key] = candidate["host_demand"]
         self.logical_staging_owners[key] = candidate["demand_staging"]
         self.logical_staging_rank[key] = candidate["demand_staging_ranks"]
+        eff_valid = int(tokens) if valid_tokens is None else max(0, min(int(tokens), int(valid_tokens)))
+        self.request_tokens[key] = int(tokens)
+        self.request_valid_tokens[key] = eff_valid
+        self.request_phases[key] = str(phase or "decode")
         self.request_query_tokens[key] = int(candidate["query_tokens"])
         self.request_versions[key] = self.request_versions.get(key, 0) + 1
         if changed:
@@ -268,6 +279,7 @@ class _MemoryRequestsMixin:
         key = (replica, request)
         before = self._replica_occupied(replica)
         self.async_consumer_holds.pop(key, None)
+        self._request_hold_tokens.pop(key, None)
         self.logical_owners.pop(key, None)
         self.logical_owner_ranks.pop(key, None)
         self.logical_host_owners.pop(key, None)
@@ -275,6 +287,9 @@ class _MemoryRequestsMixin:
         self.logical_staging_rank.pop(key, None)
         self.staging_owners.pop(key, None)
         self.staging_owner_ranks.pop(key, None)
+        self.request_tokens.pop(key, None)
+        self.request_valid_tokens.pop(key, None)
+        self.request_phases.pop(key, None)
         self.request_query_tokens.pop(key, None)
         self.request_versions.pop(key, None)
         self.retired_requests.discard(key)
@@ -302,6 +317,8 @@ class _MemoryRequestsMixin:
         key = (replica, request)
         if key in self.async_consumer_holds and self.async_consumer_holds[key]:
             self.retired_requests.add(key)
+            self.request_tokens[key] = 0
+            self.request_valid_tokens[key] = 0
             self.logical_owners[key] = (0.0,) * len(self.weights)
             self.logical_owner_ranks[key] = tuple(
                 (0.0,) * self.width for _ in range(self.case.runtime.parallel.pp))
@@ -456,6 +473,13 @@ class _MemoryRequestsMixin:
         if existing is not None:
             return existing == snapshot
         self.async_consumer_holds.setdefault(key, {})[consumer] = snapshot
+        if key in self.request_tokens:
+            held_alloc = int(self.request_tokens.get(key, 0))
+            held_valid = int(self.request_valid_tokens.get(key, held_alloc))
+            held_phase = str(self.request_phases.get(key, "decode") or "decode")
+            self._request_hold_tokens.setdefault(key, {})[consumer] = (
+                held_alloc, held_valid, held_phase,
+            )
         self.budget_version += 1
         return True
 
@@ -484,6 +508,11 @@ class _MemoryRequestsMixin:
             del holds[consumer]
             if not holds:
                 del self.async_consumer_holds[key]
+            held_map = self._request_hold_tokens.get(key)
+            if held_map is not None:
+                held_map.pop(consumer, None)
+                if not held_map:
+                    del self._request_hold_tokens[key]
             if key in self.retired_requests and not holds:
                 self._free_request(replica, request)
             elif key in self.owners:

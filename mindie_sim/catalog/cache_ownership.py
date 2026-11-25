@@ -25,15 +25,21 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Any
 
 from mindie_sim.catalog.cache import (
     _LINEAR_ATTENTION_KINDS, layer_cache_components, layer_stage_map,
+    owned_token_rows,
 )
 from mindie_sim.catalog.cache_pools import _ceil_div
-from mindie_sim.catalog.context_parallel import cp_interleave
+from mindie_sim.catalog.context_parallel import (
+    cp_interleave,
+    layer_dcp_degree,
+    layer_dcp_factors,
+    owned_positions,
+)
 from mindie_sim.schema.common import ModelingError
 
 
@@ -48,8 +54,16 @@ SHARING_PRIVATE = "private"
 STATE_COMPONENTS = frozenset({
     "recurrent_state", "conv_state", "replay_records", "state_transient",
     "compressor_state", "index_compressor_state", "index_pool_tail",
+    "ple_conv_state",
 })
 WINDOW_BOUND_COMPONENTS = frozenset({"window", "gqa_kv", "mla_kv"})
+_TARGET_ONLY_KV_META_KEYS = (
+    "kv_cache_tag",
+    "kv_cache_type",
+    "cache_representations",
+    "layer_cache_representations",
+    "kv_scale_dtype",
+)
 
 
 @dataclass(frozen=True)
@@ -151,6 +165,85 @@ def _page_id_span(start_token: int, end_token: int, page_tokens: int) -> tuple[i
     return tuple(range(first_page, last_page))
 
 
+def _rank_owned_subintervals(
+    layer: Any,
+    parallel: Any,
+    start: int,
+    end: int,
+    *,
+    interleave: int,
+    rank: int,
+    owner_spans: Any,
+) -> tuple[tuple[int, int], ...]:
+    """Exact disjoint half-open token intervals owned by ``rank`` inside ``[start, end)``."""
+    lo_bound, hi_bound = max(0, int(start)), max(0, int(end))
+    if hi_bound <= lo_bound:
+        return ()
+    if owner_spans is not None:
+        spans = tuple((int(lo), int(hi)) for lo, hi in owner_spans)
+        r_idx = int(rank)
+        if not 0 <= r_idx < len(spans):
+            raise ModelingError(f"cache_owner_rank_out_of_range:{rank}")
+        out: list[tuple[int, int]] = []
+        lo, hi = spans[r_idx]
+        a, b = max(lo_bound, lo), min(hi_bound, hi)
+        if b > a:
+            out.append((a, b))
+        if r_idx == len(spans) - 1:
+            max_hi = max((span_hi for _, span_hi in spans), default=0)
+            tail_a = max(lo_bound, max_hi)
+            if hi_bound > tail_a:
+                out.append((tail_a, hi_bound))
+        return tuple(out)
+    cp = layer_dcp_degree(layer, parallel)
+    if cp <= 1:
+        return ((lo_bound, hi_bound),)
+    pcp_f, tp_g, dp_w = layer_dcp_factors(layer, parallel)
+    tp_dim = max(1, int(parallel.tp))
+    pcp_dim = max(1, int(parallel.pcp))
+    pp_dim = max(1, int(parallel.pp))
+    dp_dim = max(1, int(parallel.dp))
+    r_int = int(rank)
+    tp_i = r_int % tp_dim
+    pcp_i = (r_int // tp_dim) % pcp_dim
+    dp_i = (r_int // (tp_dim * pcp_dim * pp_dim)) % dp_dim
+    if dp_w > 1:
+        cp_rank = ((dp_i % dp_w) * (pcp_f * tp_g) + (pcp_i % pcp_f) * tp_g + (tp_i % tp_g)) % cp
+    else:
+        cp_rank = ((tp_i % tp_g) * pcp_f + (pcp_i % pcp_f)) % cp
+    stride = max(1, int(interleave))
+    first_chunk = lo_bound // stride
+    chunk = first_chunk + ((cp_rank - (first_chunk % cp)) % cp)
+    out = []
+    while chunk * stride < hi_bound:
+        a = max(lo_bound, chunk * stride)
+        b = min(hi_bound, (chunk + 1) * stride)
+        if b > a:
+            out.append((a, b))
+        chunk += cp
+    return tuple(out)
+
+
+def _rank_owned_interval(
+    layer: Any,
+    parallel: Any,
+    start: int,
+    end: int,
+    *,
+    interleave: int,
+    rank: int,
+    owner_spans: Any,
+) -> int:
+    """Exact token count owned by ``rank`` in half-open interval ``[start, end)``."""
+    return sum(
+        b - a
+        for a, b in _rank_owned_subintervals(
+            layer, parallel, start, end,
+            interleave=interleave, rank=rank, owner_spans=owner_spans,
+        )
+    )
+
+
 def cache_component_ranges(
     model: Any, layer: Any, parallel: Any, *, sequence_tokens: int,
     prefix_tokens: int, interleave: int, rank: int | None,
@@ -214,26 +307,65 @@ def cache_component_ranges(
             continue
         if win > 0 and str(name) in WINDOW_BOUND_COMPONENTS:
             win_start = max(0, length - win)
-            live_len = max(0, length - win_start)
-            live_shared = max(0, min(prefix, length) - win_start)
-            shared = (
-                valid * (float(live_shared) / float(live_len))
-                if live_len > 0 and live_shared > 0 else 0.0
-            )
             sh_start = win_start
             sh_end = max(win_start, min(prefix, length))
+            if sh_end <= sh_start:
+                shared = 0.0
+            elif rank is not None:
+                owned_live = _rank_owned_interval(
+                    layer, parallel, win_start, length,
+                    interleave=interleave, rank=rank, owner_spans=owner_spans,
+                )
+                owned_shared = _rank_owned_interval(
+                    layer, parallel, sh_start, sh_end,
+                    interleave=interleave, rank=rank, owner_spans=owner_spans,
+                )
+                shared = (
+                    valid * (float(owned_shared) / float(owned_live))
+                    if owned_live > 0 and owned_shared > 0 else 0.0
+                )
+            else:
+                live_len = max(0, length - win_start)
+                live_shared = max(0, sh_end - win_start)
+                shared = (
+                    valid * (float(live_shared) / float(live_len))
+                    if live_len > 0 and live_shared > 0 else 0.0
+                )
         else:
             shared = min(valid, float(prefix_values.get(name, 0.0)))
             sh_start = 0
             sh_end = prefix
         private = max(0.0, valid - shared)
         if shared > 0.0:
-            ranges.append(CacheRange(
-                int(layer.index), str(name), str(name), sh_start, sh_end,
-                "", gen, SHARING_SHARED, rank, shared, shared,
-                f"layer{layer.index}:{name}:{sh_start}:{sh_end}:shared",
-                _page_id_span(sh_start, sh_end, page_tokens),
-            ))
+            if rank is not None:
+                sub_spans = _rank_owned_subintervals(
+                    layer, parallel, sh_start, sh_end,
+                    interleave=interleave, rank=rank, owner_spans=owner_spans,
+                )
+                total_sub = sum(b - a for a, b in sub_spans)
+                if sub_spans and total_sub > 0:
+                    for sub_a, sub_b in sub_spans:
+                        sub_bytes = shared * (float(sub_b - sub_a) / float(total_sub))
+                        ranges.append(CacheRange(
+                            int(layer.index), str(name), str(name), sub_a, sub_b,
+                            "", gen, SHARING_SHARED, rank, sub_bytes, sub_bytes,
+                            f"layer{layer.index}:{name}:{sub_a}:{sub_b}:shared",
+                            _page_id_span(sub_a, sub_b, page_tokens),
+                        ))
+                else:
+                    ranges.append(CacheRange(
+                        int(layer.index), str(name), str(name), sh_start, sh_end,
+                        "", gen, SHARING_SHARED, rank, shared, shared,
+                        f"layer{layer.index}:{name}:{sh_start}:{sh_end}:shared",
+                        _page_id_span(sh_start, sh_end, page_tokens),
+                    ))
+            else:
+                ranges.append(CacheRange(
+                    int(layer.index), str(name), str(name), sh_start, sh_end,
+                    "", gen, SHARING_SHARED, rank, shared, shared,
+                    f"layer{layer.index}:{name}:{sh_start}:{sh_end}:shared",
+                    _page_id_span(sh_start, sh_end, page_tokens),
+                ))
         ranges.append(CacheRange(
             int(layer.index), str(name), str(name), sh_end, length,
             "", gen, SHARING_PRIVATE, rank, max(0.0, allocated_value - shared),
@@ -256,20 +388,91 @@ def _prefixed(ranges: Sequence[CacheRange], prefix_key: str,
         for item in ranges)
 
 
+def _effective_draft_sequence_tokens(
+    model: Any, draft_kind: str, sequence_tokens: int, runtime: Any = None,
+) -> int:
+    """Clamp draft sequence length by ``effective_draft_context_cap`` at source."""
+    from mindie_sim.catalog.draft import optional_draft_spec
+    from mindie_sim.catalog.draft_spec import effective_draft_context_cap
+
+    seq = max(0, int(sequence_tokens))
+    if not draft_kind or getattr(model, "auxiliary", None) is None:
+        return seq
+    draft = optional_draft_spec(model, draft_kind)
+    cap = effective_draft_context_cap(draft, runtime)
+    return min(seq, cap) if cap > 0 else seq
+
+
+def _draft_cache_model(model: Any, draft_kind: str) -> Any:
+    """Model view carrying the draft's own resolved KV quantization contract."""
+    from mindie_sim.catalog.draft import draft_quant, optional_draft_spec
+
+    if not draft_kind or getattr(model, "auxiliary", None) is None:
+        return model
+    draft = optional_draft_spec(model, draft_kind)
+    dq = draft_quant(model, draft)
+    target_kv = getattr(getattr(model, "quant", None), "kv_dtype", "")
+    differs = dq.kv_dtype != target_kv
+    if not draft.independent_context and dq == getattr(model, "quant", None) and not differs:
+        return model
+    meta = dict(getattr(model, "metadata", ()) or ())
+    if draft.independent_context or differs:
+        for key in _TARGET_ONLY_KV_META_KEYS:
+            meta.pop(key, None)
+    return replace(model, quant=dq, kv_dtype=dq.kv_dtype, metadata=tuple(meta.items()))
+
+
+def _draft_cache_parallel(
+    model: Any,
+    parallel: Any,
+    draft_kind: str,
+    *,
+    interleave: int = DEFAULT_INTERLEAVE,
+) -> Any:
+    """Resolve draft parallel placement honoring ``draft.dcp_sharded``."""
+    from mindie_sim.catalog.cache import uses_inherited_draft_cache
+    from mindie_sim.catalog.cache_pools import _draft_is_dcp_sharded, _draft_row_bytes_int
+    from mindie_sim.catalog.draft import optional_draft_spec
+
+    cp = int(getattr(parallel, "cp", 1) or 1)
+    if cp <= 1 or not draft_kind or getattr(model, "auxiliary", None) is None:
+        return parallel
+    draft = optional_draft_spec(model, draft_kind)
+    if getattr(draft, "dcp_sharded", None) is False:
+        sharded = False
+    elif uses_inherited_draft_cache(model, draft_kind):
+        sharded = True
+    else:
+        row_bytes = _draft_row_bytes_int(
+            model, draft, tp=max(1, int(getattr(parallel, "tp", 1) or 1)),
+        )
+        sharded = _draft_is_dcp_sharded(
+            model, parallel, draft_kind, dcp=cp,
+            draft_page=max(1, int(interleave)) * row_bytes,
+        )
+    if sharded:
+        return parallel
+    pcp = int(getattr(parallel, "pcp", 1) or 1)
+    return replace(parallel, cp=1, dcp=1, cp_plan="pcp" if pcp > 1 else "none")
+
+
 def draft_cache_components(
     model: Any, parallel: Any, *, draft_kind: str, sequence_tokens: int,
     runtime: Any = None, rank: int | None = None, capacity_padded: bool = True,
     owner_spans=None, query_tokens: int | None = None, phase: str = "decode",
 ) -> Mapping[str, float]:
-    """Inherited draft cache components, keeping the public ``draft_kv`` key."""
+    """Draft cache components honoring draft quant, context cap, DCP policy, and ``draft_kv``."""
     from mindie_sim.catalog.draft_geometry import draft_layer_plans
 
     components: dict[str, float] = {}
     interleave = max(
         ONE, int(getattr(runtime, "kv_block_size", DEFAULT_INTERLEAVE) or DEFAULT_INTERLEAVE))
+    eff_seq = _effective_draft_sequence_tokens(model, draft_kind, sequence_tokens, runtime)
+    draft_model = _draft_cache_model(model, draft_kind)
+    draft_parallel = _draft_cache_parallel(model, parallel, draft_kind, interleave=interleave)
     for plan in draft_layer_plans(model, draft_kind):
         values = layer_cache_components(
-            model, plan, parallel, sequence_tokens, capacity_padded=capacity_padded,
+            draft_model, plan, draft_parallel, eff_seq, capacity_padded=capacity_padded,
             interleave=interleave, rank=rank, owner_spans=owner_spans,
             runtime=runtime, query_tokens=query_tokens, phase=phase)
         for name, value in values.items():
@@ -408,6 +611,7 @@ def _paired_sfa_batch_footprint(
     shared_page_sets: dict[tuple[str, int, int], set[int]] = {}
     interleave = cp_interleave(runtime)
     block_size = max(1, int(getattr(runtime, "kv_block_size", DEFAULT_INTERLEAVE) or DEFAULT_INTERLEAVE))
+    active_draft = _active_draft_kind(model, runtime)
 
     for view in requests:
         length = max(0, int(getattr(view, "kv_len", 0) or 0))
@@ -421,7 +625,10 @@ def _paired_sfa_batch_footprint(
         for group_idx, group in enumerate(groups):
             stage = _resolve_group_stage(group, layer_stages, stages)
             tpp = max(1, int(group["tokens_per_page"]))
-            page_bytes = float(group["bytes_per_group_page"])
+            page_bytes = (
+                float(group["bytes_per_group_page"])
+                + float(group.get("metadata_bytes_per_page", 0) or 0)
+            )
             is_aux = bool(group.get("auxiliary", False))
             fixed = int(group.get("fixed_pages", 0) or 0)
             rec_pages = int(group.get("recycling_pages", 0) or 0)
@@ -431,9 +638,13 @@ def _paired_sfa_batch_footprint(
                 state[stage] += fixed_bytes
                 continue
             cap = group.get("resident_tokens")
-            eff_len = min(length, int(cap)) if (cap is not None and int(cap) > 0) else length
-            eff_declared = min(declared, eff_len)
-            prefix_pages = eff_declared // tpp if shared_mode else 0
+            base_len = (
+                _effective_draft_sequence_tokens(model, active_draft, length, runtime)
+                if is_aux else length
+            )
+            eff_len = min(base_len, int(cap)) if (cap is not None and int(cap) > 0) else base_len
+            eff_declared = 0 if is_aux else min(declared, eff_len)
+            prefix_pages = eff_declared // tpp if (shared_mode and not is_aux) else 0
             history_pages = _ceil_div(eff_len, tpp) if eff_len > 0 else 0
             if prefix_pages > 0:
                 page_key = (key, generation, group_idx)
@@ -649,8 +860,9 @@ def _hybrid_batch_footprint(
                 if is_sub:
                     subsumed_priv[stage] += alloc_val
         if draft_kind:
+            draft_seq = _effective_draft_sequence_tokens(model, draft_kind, length, runtime)
             values = draft_cache_components(
-                model, parallel, draft_kind=draft_kind, sequence_tokens=length,
+                model, parallel, draft_kind=draft_kind, sequence_tokens=draft_seq,
                 runtime=runtime, capacity_padded=True, query_tokens=q_tok, phase=phase,
             )
             d_kv = float(values.get("draft_kv", 0.0))
@@ -704,6 +916,175 @@ def _hybrid_batch_footprint(
     )
 
 
+def _explicit_group_stage_costs(
+    group: Any, stage_map: tuple[int, ...],
+) -> list[tuple[int, float]]:
+    meta = float(group.metadata_bytes_per_page)
+    if group.bytes_per_group_page:
+        return [(int(stage_map[group.layers[0]]), float(group.bytes_per_group_page) + meta)]
+    per_layer = float(group.bytes_per_layer_page) + meta
+    return [(int(stage_map[layer]), per_layer) for layer in group.layers]
+
+
+def _explicit_group_shareable_pages(
+    group: Any, *, length: int, declared: int, total_pages: int, shared_mode: bool,
+) -> range:
+    if not shared_mode or group.allocation != "live":
+        return range(0)
+    tpp = max(1, int(group.tokens_per_page))
+    if group.resident_tokens is not None and length > group.resident_tokens:
+        win_start = length - int(group.resident_tokens)
+        sh_lo = _ceil_div(win_start, tpp)
+        sh_hi = min(declared, length) // tpp
+        return range(sh_lo, sh_hi) if sh_hi > sh_lo else range(0)
+    eff_len = min(length, group.resident_tokens) if group.resident_tokens is not None else length
+    eff_decl = min(declared, eff_len)
+    if eff_decl <= 0:
+        return range(0)
+    shareable_cap = max(0, total_pages - group.recycling_pages)
+    return range(min(shareable_cap, eff_decl // tpp))
+
+
+def _explicit_page_group_batch_footprint(
+    case: Any,
+    *,
+    requests: Sequence[Any],
+    phase: str,
+    padded: bool,
+    stages: int,
+    shared_mode: bool,
+) -> BatchCacheFootprint:
+    """Physical batch footprint for explicit ``runtime.memory['cache_page_groups']``."""
+    from mindie_sim.catalog.cache_pages import CachePages
+    from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
+
+    model, runtime = case.model, case.runtime
+    parallel = runtime.parallel
+    raw_groups = tuple(dict(getattr(runtime, "memory", ()) or ()).get("cache_page_groups") or ())
+    stage_map = layer_stage_map(model, parallel, runtime)
+    max_q = max((max(1, int(getattr(v, "q_len", 1) or 1)) for v in requests), default=1)
+    comp_names = {
+        plan.index: set(layer_cache_components(
+            model, plan, parallel, runtime.max_model_len,
+            capacity_padded=False, runtime=runtime, query_tokens=max_q, phase=phase,
+        ))
+        for plan in model.layer_plans
+    }
+    pages_obj = CachePages(raw_groups, comp_names, stage_map)
+    shared_once = [0.0] * stages
+    private = [0.0] * stages
+    state = [0.0] * stages
+    draft = [0.0] * stages
+    boundary = [0.0] * stages
+    seen_shared_pages: dict[tuple[str, int, int], set[int]] = {}
+    shared_spans: dict[tuple[int, str, str, int, int], list[tuple[int, int, float]]] = {}
+    interleave = cp_interleave(runtime)
+    block_size = max(1, int(getattr(runtime, "kv_block_size", DEFAULT_INTERLEAVE) or DEFAULT_INTERLEAVE))
+    is_prefill = str(phase or "decode").strip().lower() == "prefill"
+    has_aux = any(group.auxiliary for group in pages_obj.groups)
+    active_draft = _active_draft_kind(model, runtime)
+    draft_kind = "" if has_aux else active_draft
+
+    for view in requests:
+        length = max(0, int(getattr(view, "kv_len", 0) or 0))
+        q_tok = 1 if is_prefill else max(1, int(getattr(view, "q_len", 1) or 1))
+        declared = max(0, min(int(getattr(view, "prefix_tokens", 0) or 0), length))
+        generation = _view_generation(view)
+        p_key = (
+            canonical_prefix_cache_key("shared", getattr(view, "prefix_cache_key", ""))
+            if shared_mode else f"private:{getattr(view, 'request_id', '')}"
+        )
+        for group_idx, group in enumerate(pages_obj.groups):
+            eff_len = (
+                _effective_draft_sequence_tokens(model, active_draft, length, runtime)
+                if group.auxiliary else length
+            )
+            total_pages = group.pages(eff_len, runtime.max_model_len)
+            stage_costs = _explicit_group_stage_costs(group, stage_map)
+            if group.fixed_pages:
+                for st, cost in stage_costs:
+                    val = float(total_pages) * cost
+                    if group.auxiliary:
+                        draft[st] += val
+                    else:
+                        private[st] += val
+                        state[st] += val
+                continue
+            shareable_ids = (
+                range(0) if group.auxiliary
+                else _explicit_group_shareable_pages(
+                    group, length=eff_len, declared=declared,
+                    total_pages=total_pages, shared_mode=shared_mode,
+                )
+            )
+            if shareable_ids:
+                seen = seen_shared_pages.setdefault((p_key, generation, group_idx), set())
+                new_ids = set(shareable_ids) - seen
+                if new_ids:
+                    for st, cost in stage_costs:
+                        shared_once[st] += float(len(new_ids)) * cost
+                    seen.update(new_ids)
+            priv_pages = max(0, total_pages - len(shareable_ids))
+            for st, cost in stage_costs:
+                if group.auxiliary:
+                    draft[st] += float(priv_pages) * cost
+                else:
+                    private[st] += float(priv_pages) * cost
+                    if group.recycling_pages > 0:
+                        state[st] += float(min(priv_pages, group.recycling_pages)) * cost
+        for plan in model.layer_plans:
+            layer_cov = pages_obj.covered.get(plan.index, ())
+            ranges = cache_component_ranges(
+                model, plan, parallel, sequence_tokens=length,
+                prefix_tokens=declared if shared_mode else 0,
+                interleave=interleave, rank=None, capacity_padded=padded,
+                runtime=runtime, query_tokens=q_tok, block_size=block_size,
+                generation=generation, phase=phase,
+            )
+            stage = int(stage_map[plan.index])
+            for item in ranges:
+                if item.component in layer_cov:
+                    continue
+                if item.sharing == SHARING_SHARED and item.valid_bytes > 0.0:
+                    span_len = max(1, item.end_token - item.start_token)
+                    rate = float(item.valid_bytes) / float(span_len)
+                    s_key = (stage, item.component, p_key, generation, plan.index)
+                    shared_spans.setdefault(s_key, []).append(
+                        (int(item.start_token), int(item.end_token), rate)
+                    )
+                    continue
+                private[stage] += float(item.valid_bytes)
+                boundary[stage] += max(0.0, float(item.allocated_bytes) - float(item.valid_bytes))
+                if item.component in STATE_COMPONENTS:
+                    state[stage] += float(item.valid_bytes)
+        if draft_kind:
+            draft_seq = _effective_draft_sequence_tokens(model, draft_kind, length, runtime)
+            values = draft_cache_components(
+                model, parallel, draft_kind=draft_kind, sequence_tokens=draft_seq,
+                runtime=runtime, capacity_padded=bool(padded), query_tokens=q_tok,
+                phase=phase,
+            )
+            draft[-1] += float(values.get("draft_kv", 0.0))
+            d_st = float(values.get("draft_state", 0.0))
+            state[-1] += d_st
+            private[-1] += d_st
+
+    for (stage, _comp, _p_key, _gen, _layer), spans in shared_spans.items():
+        shared_once[stage] += _union_elementary_spans(spans)
+    totals = tuple(
+        shared_once[s] + private[s] + draft[s] + boundary[s] for s in range(stages)
+    )
+    return BatchCacheFootprint(
+        tuple(float(v) for v in shared_once),
+        tuple(float(v) for v in private),
+        tuple(float(v) for v in state),
+        tuple(float(v) for v in draft),
+        tuple(float(v) for v in boundary),
+        totals,
+        requests=len(requests), stages=stages,
+    )
+
+
 def batch_cache_footprint(
     case: Any, *, requests: Sequence[Any], replica: int, phase: str,
     padded: bool,
@@ -719,6 +1100,11 @@ def batch_cache_footprint(
         return _paired_sfa_batch_footprint(
             case, requests=requests, phase=phase, padded=padded,
             layer_stages=layer_stages, stages=stages, shared_mode=shared_mode,
+        )
+    if padded and dict(getattr(runtime, "memory", ()) or ()).get("cache_page_groups"):
+        return _explicit_page_group_batch_footprint(
+            case, requests=requests, phase=phase, padded=padded,
+            stages=stages, shared_mode=shared_mode,
         )
     block_size = max(1, int(getattr(runtime, "kv_block_size", DEFAULT_INTERLEAVE) or DEFAULT_INTERLEAVE))
     interleave = cp_interleave(runtime)
@@ -778,9 +1164,10 @@ def batch_cache_footprint(
                     0.0, float(item.allocated_bytes) - float(item.valid_bytes))
                 if item.component in STATE_COMPONENTS:
                     state[stage] += float(item.valid_bytes)
-        if str(phase) == "decode" and draft_kind:
+        if draft_kind and (str(phase) == "decode" or bool(getattr(view, "draft_prepare", False))):
+            draft_seq = _effective_draft_sequence_tokens(model, draft_kind, length, runtime)
             values = draft_cache_components(
-                model, parallel, draft_kind=draft_kind, sequence_tokens=length,
+                model, parallel, draft_kind=draft_kind, sequence_tokens=draft_seq,
                 runtime=runtime, capacity_padded=bool(padded), query_tokens=q_tok,
                 phase=phase)
             draft[-1] += float(values.get("draft_kv", 0.0))

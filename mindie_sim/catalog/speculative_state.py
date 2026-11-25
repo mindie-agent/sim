@@ -150,7 +150,7 @@ def speculative_state_plan(
     runtime: Any = None,
 ) -> SpeculativeStatePlan:
     """Resolve one layer's active verify-window state/record residency."""
-    del model, capacity_padded
+    del capacity_padded
     kind = str(getattr(layer, "attention", ""))
     if kind not in LINEAR_ATTENTION_KINDS:
         raise ModelingError(f"speculative_state_requires_linear_attention:{kind}")
@@ -164,7 +164,12 @@ def speculative_state_plan(
     state_dtype = str(getattr(layer, "recurrent_state_dtype", "") or "").strip()
     if not state_dtype:
         raise ModelingError("linear_attention_recurrent_state_dtype_missing")
-    kg_dtype = str(contract.get("record_kg_dtype", DEFAULT_RECORD_KG_DTYPE))
+    model_act_dtype = (
+        str(getattr(model, "activation_dtype", "") or "").strip()
+        if model is not None else ""
+    )
+    default_kg_dtype = model_act_dtype or DEFAULT_RECORD_KG_DTYPE
+    kg_dtype = str(contract.get("record_kg_dtype") or default_kg_dtype)
     total_shards = max(1, int(parallel.tp)) * shards
     recurrent_elements = _ceil_div(
         int(getattr(layer, "recurrent_state_elements", 0) or 0), total_shards,

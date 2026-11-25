@@ -173,18 +173,29 @@ def _expand_resident_terms(
             and int(parallel.dcp_tp_gather) > 1
             and int(parallel.dcp_pcp_factor) == 1
             and int(parallel.dcp_dp_width) == 1):
-        uk_rows = term.rows // 2
-        if model is not None:
-            mla_plan = next((lp for lp in model.layer_plans if lp.attention == "mla"), None)
-            if mla_plan is not None and (mla_plan.qk_nope_head_dim + mla_plan.v_head_dim) > 0:
-                uk_rows = int(mla_plan.num_heads) * int(mla_plan.qk_nope_head_dim)
+        if int(term.units) > 0:
+            uk_rows = int(term.units) * int(term.unit_width)
+        else:
+            uk_rows = term.rows // 2
+            if model is not None:
+                mla_plan = next(
+                    (
+                        lp for lp in model.layer_plans
+                        if lp.attention == "mla"
+                        and (lp.qk_nope_head_dim + lp.v_head_dim) > 0
+                        and int(lp.num_heads) * (int(lp.qk_nope_head_dim) + int(lp.v_head_dim)) == term.rows
+                    ),
+                    None,
+                ) or next((lp for lp in model.layer_plans if lp.attention == "mla"), None)
+                if mla_plan is not None and (mla_plan.qk_nope_head_dim + mla_plan.v_head_dim) > 0:
+                    uk_rows = int(mla_plan.num_heads) * int(mla_plan.qk_nope_head_dim)
         uv_rows = max(0, term.rows - uk_rows)
         if uk_rows > 0 and uv_rows > 0:
             eff_tp = max(1, int(placed.tp) // int(parallel.dcp_tp_gather))
             placed_uk = replace(placed, tp=eff_tp, q_proj_tp=1, dcp_linear_tp=1)
             return (
-                (replace(term, name="w_uk_t", rows=uk_rows), placed_uk),
-                (replace(term, name="w_uv", rows=uv_rows), placed),
+                (replace(term, name="w_uk_t", rows=uk_rows, units=0, unit_width=0), placed_uk),
+                (replace(term, name="w_uv", rows=uv_rows, units=0, unit_width=0), placed),
             )
     return ((term, placed),)
 
@@ -228,20 +239,37 @@ def _cache_key(obj: Any) -> Any:
         return None
 
 
+def _tag_mla_kv_b_terms(plan: Any, terms: Sequence[WeightTerm]) -> tuple[WeightTerm, ...]:
+    """Attach per-layer ``(num_heads, qk_nope_head_dim)`` to MLA ``kv_b`` terms for DCP split."""
+    if getattr(plan, "attention", "") != "mla":
+        return tuple(terms)
+    if int(getattr(plan, "qk_nope_head_dim", 0) or 0) + int(getattr(plan, "v_head_dim", 0) or 0) <= 0:
+        return tuple(terms)
+    num_heads = int(plan.num_heads)
+    nope_dim = int(plan.qk_nope_head_dim)
+    out: list[WeightTerm] = []
+    for term in terms:
+        if term.name == "kv_b" and term.category == "mla_absorb" and term.shard == "out_tp":
+            out.append(replace(term, units=num_heads, unit_width=nope_dim))
+        else:
+            out.append(term)
+    return tuple(out)
+
+
 def _iter_model_layer_terms(model: ModelSpec):
     special_idx, special_native = _special_layer_keys(model)
     memo: dict[Any, tuple[WeightTerm, ...]] = {}
     for plan in model.layer_plans:
         native_id = int(getattr(plan, "native_layer_id", -1))
         if str(plan.index) in special_idx or (native_id >= 0 and str(native_id) in special_native):
-            yield plan.index, tuple(layer_weight_terms(plan, model))
+            yield plan.index, _tag_mla_kv_b_terms(plan, layer_weight_terms(plan, model))
             continue
         shares_kv = 0 <= plan.kv_owner_layer_id < plan.index
         layer_quant = _layer_resolved_quant(model, plan)
         ck = _cache_key((replace(plan, index=0, native_layer_id=0), shares_kv, layer_quant))
         cached = memo.get(ck) if ck is not None else None
         if cached is None:
-            cached = tuple(layer_weight_terms(plan, model))
+            cached = _tag_mla_kv_b_terms(plan, layer_weight_terms(plan, model))
             if ck is not None:
                 memo[ck] = cached
         yield plan.index, cached
@@ -256,6 +284,7 @@ def stage_weight_decomposition(
     enable_shared_expert_dp: bool = False,
     enable_pcp_o_proj_weight_sharding: bool = False,
     dcp_q_replicate: bool = False,
+    runtime: Any = None,
 ) -> list[dict[str, float]]:
     """Per-PP-stage weight bytes split into payload and quant metadata."""
     quant = _require_model_quant(model)
@@ -264,7 +293,7 @@ def stage_weight_decomposition(
     for terms in stage_weight_terms(
         model, parallel, include_draft=include_draft, include_engram=include_engram,
         include_engram_tables=include_engram_tables, include_vision=include_vision,
-        layer_partition=layer_partition,
+        layer_partition=layer_partition, runtime=runtime,
     ):
         total = 0.0
         payload = 0.0
@@ -290,8 +319,107 @@ def stage_weight_decomposition(
     return stages
 
 
+def _vision_tp(
+    vision: Any,
+    parallel: ParallelSpec | None,
+    runtime: Any = None,
+) -> int:
+    """Resolve effective vision encoder TP width matching ``catalog/media.py``."""
+    if runtime is not None:
+        meta = dict(getattr(runtime, "metadata", ()) or ())
+        if str(meta.get("mm_encoder_tp_mode", "") or "").strip().lower() == "data":
+            return 1
+    if parallel is None:
+        return 1
+    tp = max(1, int(getattr(parallel, "tp", 1) or 1))
+    if tp > 1 and int(vision.num_heads) % tp != 0:
+        return 1
+    return tp
+
+
+def _vision_projector_terms(
+    vision: Any,
+    *,
+    aligner_sharded: bool,
+    merger_sharded: bool,
+) -> list[WeightTerm]:
+    """Final spatial-merge projector plus optional DeepStack tap merger weights."""
+    aligner_in = vision.aligner_input_width
+    aligner_out = "out_tp" if aligner_sharded else "replicated"
+    aligner_in_shard = "in_tp" if aligner_sharded else "replicated"
+    merger_out = "out_tp" if merger_sharded else "replicated"
+    merger_in_shard = "in_tp" if merger_sharded else "replicated"
+    deepstack_taps = len(getattr(vision, "deepstack_visual_indexes", ()) or ())
+    terms: list[WeightTerm] = []
+    if vision.aligner_hidden_size > 0 and vision.bias:
+        terms.extend([
+            _t("aligner_norm", aligner_in, 1, "norm"),
+            _t("aligner_w1", vision.out_hidden_size, aligner_in, "projector", aligner_out),
+            _t("aligner_w1_bias", vision.out_hidden_size, 1, "vision", aligner_out),
+            _t("aligner_w2", vision.out_hidden_size, vision.out_hidden_size, "projector", aligner_in_shard),
+            _t("aligner_w2_bias", vision.out_hidden_size, 1, "vision"),
+        ])
+        if deepstack_taps > 0:
+            terms.extend([
+                _t("vision_deepstack_aligner_norm", aligner_in, 1, "norm", count=deepstack_taps),
+                _t("vision_deepstack_aligner_w1", vision.out_hidden_size, aligner_in,
+                   "projector", aligner_out, count=deepstack_taps),
+                _t("vision_deepstack_aligner_w1_bias", vision.out_hidden_size, 1,
+                   "vision", aligner_out, count=deepstack_taps),
+                _t("vision_deepstack_aligner_w2", vision.out_hidden_size, vision.out_hidden_size,
+                   "projector", aligner_in_shard, count=deepstack_taps),
+                _t("vision_deepstack_aligner_w2_bias", vision.out_hidden_size, 1,
+                   "vision", count=deepstack_taps),
+            ])
+        return terms
+    if vision.aligner_hidden_size > 0:
+        # Native MoonViT PatchMergerV2 uses ReplicatedLinear for both projections.
+        terms.extend([
+            _t("projector_w0", vision.aligner_hidden_size, aligner_in, "projector"),
+            _t("projector_w2", vision.out_hidden_size, vision.aligner_hidden_size, "projector"),
+            _t("projector_norm", vision.out_hidden_size, 1, "norm"),
+        ])
+        if deepstack_taps > 0:
+            terms.extend([
+                _t("vision_deepstack_projector_w0", vision.aligner_hidden_size, aligner_in,
+                   "projector", count=deepstack_taps),
+                _t("vision_deepstack_projector_w2", vision.out_hidden_size, vision.aligner_hidden_size,
+                   "projector", count=deepstack_taps),
+                _t("vision_deepstack_projector_norm", vision.out_hidden_size, 1,
+                   "norm", count=deepstack_taps),
+            ])
+        return terms
+    # Final Qwen PatchMerger runs pre-shuffle norm via vision_final_norm (no extra merger_norm).
+    terms.extend([
+        _t("merger_w1", aligner_in, aligner_in, "projector", merger_out),
+        _t("merger_w1_bias", aligner_in, 1, "vision", merger_out),
+        _t("merger", vision.out_hidden_size, aligner_in, "projector", merger_in_shard),
+        _t("merger_bias", vision.out_hidden_size, 1, "vision"),
+    ])
+    if deepstack_taps > 0:
+        # Each DeepStack tap applies post-shuffle norm on aligner_in before its 2-layer merger.
+        terms.append(_t("vision_deepstack_merger_norm", aligner_in, 1, "norm", count=deepstack_taps))
+        if vision.norm_type == "layernorm":
+            terms.append(_t("vision_deepstack_merger_norm_bias", aligner_in, 1, "norm", count=deepstack_taps))
+        terms.extend([
+            _t("vision_deepstack_merger_w1", aligner_in, aligner_in,
+               "projector", merger_out, count=deepstack_taps),
+            _t("vision_deepstack_merger_w1_bias", aligner_in, 1,
+               "vision", merger_out, count=deepstack_taps),
+            _t("vision_deepstack_merger", vision.out_hidden_size, aligner_in,
+               "projector", merger_in_shard, count=deepstack_taps),
+            _t("vision_deepstack_merger_bias", vision.out_hidden_size, 1,
+               "vision", count=deepstack_taps),
+        ])
+    return terms
+
+
 def vision_weight_terms(
-    model: ModelSpec, *, include_vision: bool | None = None,
+    model: ModelSpec,
+    *,
+    include_vision: bool | None = None,
+    parallel: ParallelSpec | None = None,
+    runtime: Any = None,
 ) -> list[WeightTerm]:
     vision = model.vision
     if vision is None:
@@ -300,6 +428,20 @@ def vision_weight_terms(
         return []
     if include_vision is None and (model.auxiliary is not None and not model.auxiliary.include_vision_weights):
         return []
+    if parallel is None:
+        meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
+        data_parallel = str(meta.get("mm_encoder_tp_mode", "") or "").strip().lower() == "data"
+        attn_sharded = mlp_sharded = aligner_sharded = merger_sharded = not data_parallel
+    else:
+        v_tp = _vision_tp(vision, parallel, runtime)
+        attn_sharded = v_tp > 1
+        mlp_sharded = v_tp > 1 and vision.intermediate_size % v_tp == 0
+        aligner_sharded = v_tp > 1 and vision.out_hidden_size % v_tp == 0
+        merger_sharded = v_tp > 1 and vision.aligner_input_width % v_tp == 0
+    attn_out = "out_tp" if attn_sharded else "replicated"
+    attn_in = "in_tp" if attn_sharded else "replicated"
+    mlp_out = "out_tp" if mlp_sharded else "replicated"
+    mlp_in = "in_tp" if mlp_sharded else "replicated"
     terms = [
         _t("vision_patch", vision.hidden_size, vision.patch_input_width, "vision"),
         _t("vision_pos", max(1, vision.pos_embed_tokens or 1), vision.hidden_size, "vision_pos"),
@@ -307,19 +449,20 @@ def vision_weight_terms(
     if vision.bias:
         terms.append(_t("vision_patch_bias", vision.hidden_size, 1, "vision"))
     per = [
-        _t("vision_qkv", vision.qkv_width, vision.hidden_size, "vision"),
-        _t("vision_wo", vision.hidden_size, vision.query_width, "vision"),
+        _t("vision_qkv", vision.qkv_width, vision.hidden_size, "vision", attn_out),
+        _t("vision_wo", vision.hidden_size, vision.query_width, "vision", attn_in),
         _t("vision_fc0", (2 if vision.gated_mlp else 1) * vision.intermediate_size,
-           vision.hidden_size, "vision"),
-        _t("vision_fc1", vision.hidden_size, vision.intermediate_size, "vision"),
+           vision.hidden_size, "vision", mlp_out),
+        _t("vision_fc1", vision.hidden_size, vision.intermediate_size, "vision", mlp_in),
         _t("vision_norm1", vision.hidden_size, 1, "norm"),
         _t("vision_norm2", vision.hidden_size, 1, "norm"),
     ]
     if vision.bias:
         per.extend([
-            _t("vision_qkv_bias", vision.qkv_width, 1, "vision"),
+            _t("vision_qkv_bias", vision.qkv_width, 1, "vision", attn_out),
             _t("vision_wo_bias", vision.hidden_size, 1, "vision"),
-            _t("vision_fc0_bias", (2 if vision.gated_mlp else 1) * vision.intermediate_size, 1, "vision"),
+            _t("vision_fc0_bias", (2 if vision.gated_mlp else 1) * vision.intermediate_size,
+               1, "vision", mlp_out),
             _t("vision_fc1_bias", vision.hidden_size, 1, "vision"),
         ])
     if vision.norm_type == "layernorm":
@@ -333,30 +476,9 @@ def vision_weight_terms(
     terms.append(_t("vision_final_norm", vision.hidden_size, 1, "norm"))
     if vision.norm_type == "layernorm":
         terms.append(_t("vision_final_norm_bias", vision.hidden_size, 1, "norm"))
-    aligner_in = vision.aligner_input_width
-    if vision.aligner_hidden_size > 0 and vision.bias:
-        terms.extend([
-            _t("aligner_norm", aligner_in, 1, "norm"),
-            _t("aligner_w1", vision.out_hidden_size, aligner_in, "projector"),
-            _t("aligner_w1_bias", vision.out_hidden_size, 1, "vision"),
-            _t("aligner_w2", vision.out_hidden_size, vision.out_hidden_size, "projector"),
-            _t("aligner_w2_bias", vision.out_hidden_size, 1, "vision"),
-        ])
-    elif vision.aligner_hidden_size > 0:
-        terms.extend([
-            _t("projector_w0", vision.aligner_hidden_size, aligner_in, "projector"),
-            _t("projector_w2", vision.out_hidden_size, vision.aligner_hidden_size, "projector"),
-            _t("projector_norm", vision.out_hidden_size, 1, "norm"),
-        ])
-    else:
-        terms.extend([
-            _t("merger_norm", aligner_in, 1, "norm"),
-            _t("merger_norm_bias", aligner_in, 1, "norm"),
-            _t("merger_w1", aligner_in, aligner_in, "projector"),
-            _t("merger_w1_bias", aligner_in, 1, "vision"),
-            _t("merger", vision.out_hidden_size, aligner_in, "projector"),
-            _t("merger_bias", vision.out_hidden_size, 1, "vision"),
-        ])
+    terms.extend(_vision_projector_terms(
+        vision, aligner_sharded=aligner_sharded, merger_sharded=merger_sharded,
+    ))
     for name in ("image_start", "image_end", "image_newline"):
         terms.append(_t(name, model.hidden_size, 1, "image_token"))
     return terms
@@ -520,6 +642,7 @@ def stage_weight_terms(
     draft_kind: str | None = None,
     slot_plans: Mapping[int, Any] | None = None,
     ep_rank: int | None = None,
+    runtime: Any = None,
 ) -> list[list[WeightTerm]]:
     pp = max(1, parallel.pp)
     if layer_partition is None:
@@ -546,14 +669,38 @@ def stage_weight_terms(
         stages[stage_of(layer_idx)].extend(terms)
     for term in body_head_terms(model):
         stages[0 if term.name == "embedding" else pp - 1].append(term)
+    if pp > 1 and not model.is_standalone_draft and model.tie_word_embeddings:
+        stages[pp - 1].append(
+            replace(_t("lm_head", model.vocab_size, model.hidden_size, "lm_head", "out_tp"),
+                    placement_role="logits")
+        )
+    for term in gemma4_ple_terms(model):
+        if term.name == "ple_model_projection":
+            col_term = replace(term, shard="out_tp")
+            for stage in stages:
+                stage.append(col_term)
+        elif term.name == "ple_projection_norm":
+            for stage in stages:
+                stage.append(term)
+        else:
+            stages[0].append(term)
     if model.vision is not None:
-        stages[0].extend(vision_weight_terms(model, include_vision=include_vision))
+        stages[0].extend(
+            vision_weight_terms(
+                model, include_vision=include_vision, parallel=parallel, runtime=runtime,
+            )
+        )
     tables_in_hbm = include_engram if include_engram_tables is None else include_engram_tables
     if include_engram:
         if tables_in_hbm:
-            tables = engram_table_terms(model)
-            for stage in stages:
-                stage.extend(tables)
+            engram = model.engram
+            if engram is not None and is_ple_engram(engram):
+                for table, term in zip(engram.tables, ple_table_terms(model)):
+                    stages[stage_of(table.layer_id)].append(term)
+            else:
+                tables = engram_table_terms(model)
+                for stage in stages:
+                    stage.extend(tables)
         for layer_id, gate_terms in engram_gate_terms_by_layer(model).items():
             stages[stage_of(layer_id)].extend(gate_terms)
     if model.is_standalone_draft:
@@ -564,14 +711,19 @@ def stage_weight_terms(
         )
     if include_draft and model.auxiliary is not None and not model.auxiliary.standalone_draft:
         from mindie_sim.catalog.draft import optional_draft_spec
-        selected = ((optional_draft_spec(model, draft_kind),) if draft_kind else
-                    (model.auxiliary.mtp, model.auxiliary.dspark))
-        for draft in selected:
-            if draft is not None:
-                stages[pp - 1].extend(
-                    term for term in draft_terms(draft, model)
-                    if term.category not in TARGET_ALIAS_CATEGORIES
-                )
+        raw_selected = (
+            (optional_draft_spec(model, draft_kind),)
+            if draft_kind else (model.auxiliary.mtp, model.auxiliary.dspark)
+        )
+        seen_drafts: list[Any] = []
+        for draft in raw_selected:
+            if draft is None or any(draft is prev or draft == prev for prev in seen_drafts):
+                continue
+            seen_drafts.append(draft)
+            stages[pp - 1].extend(
+                term for term in draft_terms(draft, model)
+                if term.category not in TARGET_ALIAS_CATEGORIES
+            )
     return stages
 
 
@@ -585,6 +737,7 @@ def stage_weight_bytes(
     enable_pcp_o_proj_weight_sharding: bool = False,
     dcp_q_replicate: bool = False,
     slot_plans: Mapping[int, Any] | None = None, ep_rank: int | None = None,
+    runtime: Any = None,
 ) -> list[float]:
     quant = _require_model_quant(model)
     result: list[float] = []
@@ -593,7 +746,7 @@ def stage_weight_bytes(
         model, parallel, include_draft=include_draft, draft_kind=draft_kind,
         include_engram=include_engram, include_engram_tables=include_engram_tables,
         include_vision=include_vision, layer_partition=layer_partition,
-        slot_plans=slot_plans, ep_rank=ep_rank,
+        slot_plans=slot_plans, ep_rank=ep_rank, runtime=runtime,
     ):
         stage_total = 0.0
         for term in terms:
@@ -621,6 +774,7 @@ def sharded_weight_bytes(
     enable_shared_expert_dp: bool = False,
     enable_pcp_o_proj_weight_sharding: bool = False,
     dcp_q_replicate: bool = False,
+    runtime: Any = None,
 ) -> float:
     return float(max(stage_weight_bytes(
         model, parallel, node_ranks, include_draft=include_draft,
@@ -630,6 +784,7 @@ def sharded_weight_bytes(
         enable_shared_expert_dp=enable_shared_expert_dp,
         enable_pcp_o_proj_weight_sharding=enable_pcp_o_proj_weight_sharding,
         dcp_q_replicate=dcp_q_replicate,
+        runtime=runtime,
     )))
 
 

@@ -129,7 +129,13 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
         "bfloat16": "bf16", "bf16": "bf16",
         "float16": "fp16", "fp16": "fp16",
     }.get(ssm_raw, ssm_raw)
-    moe = experts > 0
+    experts_step_raw = c.get("decoder_sparse_step", 1)
+    decoder_sparse_step = 1 if experts_step_raw is None else int(experts_step_raw)
+    if experts > 0 and decoder_sparse_step <= 0:
+        raise ModelingError(
+            f"model_config_qwen_decoder_sparse_step_invalid:{decoder_sparse_step}"
+        )
+    mlp_only = {int(layer_id) for layer_id in (c.get("mlp_only_layers") or ())}
     # Qwen3-Next and Qwen3.5 MoE share SharedFusedMoE's softmax router
     # and normalize the selected expert weights, including omitted HF defaults.
     router_mode = str(c.get("scoring_func", "softmax"))
@@ -142,19 +148,24 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     gdn_layout = _qwen_gdn_layout(c)
     plans: list[LayerPlan] = []
     for index, kind in enumerate(layer_types):
+        layer_moe = (
+            experts > 0
+            and index not in mlp_only
+            and (index + 1) % decoder_sparse_step == 0
+        )
         if kind == "linear_attention":
             plans.append(LayerPlan(
                 index=index, attention="gdn", architecture="gdn",
-                ffn="moe" if moe else "dense",
+                ffn="moe" if layer_moe else "dense",
                 num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
-                intermediate_size=dense_i if not moe else 0,
-                num_experts=experts if moe else 0, top_k=top_k if moe else 0,
-                moe_intermediate_size=moe_i if moe else 0,
-                num_shared_experts=1 if moe else 0,
-                shared_intermediate_size=shared_i if moe else 0,
-                shared_expert_gate=bool(moe),
-                router_input_size=h, router_mode=router_mode,
-                router_norm_topk=router_norm_topk,
+                intermediate_size=dense_i if not layer_moe else 0,
+                num_experts=experts if layer_moe else 0, top_k=top_k if layer_moe else 0,
+                moe_intermediate_size=moe_i if layer_moe else 0,
+                num_shared_experts=1 if layer_moe else 0,
+                shared_intermediate_size=shared_i if layer_moe else 0,
+                shared_expert_gate=bool(layer_moe),
+                router_input_size=h if layer_moe else 0, router_mode=router_mode,
+                router_norm_topk=router_norm_topk if layer_moe else False,
                 linear_heads=value_heads, linear_head_dim=value_dim,
                 linear_key_heads=key_heads, linear_key_head_dim=key_dim,
                 linear_value_heads=value_heads,
@@ -177,16 +188,16 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
         elif kind in {"full_attention", "indexed_attention"} or kind.endswith("_sparse_attention"):
             plans.append(LayerPlan(
                 index=index, attention="gqa", architecture="gated_gqa" if gate else "gqa",
-                ffn="moe" if moe else "dense",
+                ffn="moe" if layer_moe else "dense",
                 num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
-                intermediate_size=dense_i if not moe else 0,
-                num_experts=experts if moe else 0, top_k=top_k if moe else 0,
-                moe_intermediate_size=moe_i if moe else 0,
-                num_shared_experts=1 if moe else 0,
-                shared_intermediate_size=shared_i if moe else 0,
-                shared_expert_gate=bool(moe),
-                router_input_size=h, router_mode=router_mode,
-                router_norm_topk=router_norm_topk,
+                intermediate_size=dense_i if not layer_moe else 0,
+                num_experts=experts if layer_moe else 0, top_k=top_k if layer_moe else 0,
+                moe_intermediate_size=moe_i if layer_moe else 0,
+                num_shared_experts=1 if layer_moe else 0,
+                shared_intermediate_size=shared_i if layer_moe else 0,
+                shared_expert_gate=bool(layer_moe),
+                router_input_size=h if layer_moe else 0, router_mode=router_mode,
+                router_norm_topk=router_norm_topk if layer_moe else False,
                 qk_norm=True,
                 qk_rope_head_dim=rope_dim, qk_nope_head_dim=nope_dim,
                 q_output_gate=gate,

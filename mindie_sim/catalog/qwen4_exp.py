@@ -302,14 +302,15 @@ def _ple_lookup_owner_schedule(
     tiles = max(1, int(hits_local))
     owners = max(1, min(cap, tiles))
     max_tiles = _ceil_div(tiles, owners)
-    per_owner_read = read_bytes / float(owners)
-    per_owner_write = write_bytes / float(owners)
+    owner_share = float(max_tiles) / float(tiles)
+    per_owner_read = read_bytes * owner_share
+    per_owner_write = write_bytes * owner_share
     phases = [
-        SerialPhaseSpec("index_address", "vec_alu", index_ops / float(owners), "op"),
+        SerialPhaseSpec("index_address", "vec_alu", index_ops * owner_share, "op"),
         SerialPhaseSpec("table_gather", "mte2", per_owner_read, "bytes"),
     ]
     if dequant_ops > 0.0:
-        phases.append(SerialPhaseSpec("table_dequant", "vec_alu", dequant_ops / float(owners), "op"))
+        phases.append(SerialPhaseSpec("table_dequant", "vec_alu", dequant_ops * owner_share, "op"))
     phases.append(SerialPhaseSpec("activation_publish", "mte3", per_owner_write, "bytes"))
     return OwnerScheduleSpec(
         owner_kind="aiv",
@@ -351,8 +352,9 @@ def _ple_gate_owner_schedule(
     rows = max(1, int(padded_tokens))
     owners = max(1, min(cap, rows))
     max_tiles = _ceil_div(rows, owners)
-    per_owner_read = read_bytes / float(owners)
-    per_owner_write = write_bytes / float(owners)
+    owner_share = float(max_tiles) / float(rows)
+    per_owner_read = read_bytes * owner_share
+    per_owner_write = write_bytes * owner_share
     elems_per_owner = float(max_tiles * hc_mult * hidden)
     return OwnerScheduleSpec(
         owner_kind="aiv",

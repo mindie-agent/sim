@@ -1117,11 +1117,13 @@ class _MemoryLedgerMixin:
     def _resident_admission(
         self, replica: int, request: str, tokens: int,
         *, query_tokens: int | None = None, proposal_tokens: int | None = None,
+        phase: str = "decode",
     ) -> dict:
         if not self._is_cross_dp_dcp_cohort_active():
             return super()._resident_admission(
                 replica, request, tokens,
                 query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+                phase=phase,
             )
         key = (replica, request)
         eff_q = self._resolve_request_query_tokens(
@@ -1141,15 +1143,18 @@ class _MemoryLedgerMixin:
                     cohort_rk = ((peer_rep - cohort_start) * p.pp) * self.width + rk
                     if peer_rep == int(replica):
                         gross = self._rank_cache_bytes(
-                            tokens, padded=True, rank=cohort_rk, query_tokens=eff_q,
+                            tokens, padded=True, rank=cohort_rk,
+                            query_tokens=eff_q, phase=phase,
                         )
                     else:
                         gross = self._dp_cohort_extra_by_stage(
                             tokens, padded=True, rank=cohort_rk,
-                            query_tokens=eff_q, peer_count_override=1,
+                            query_tokens=eff_q, phase=phase, peer_count_override=1,
                         )
                     layer_max = (
-                        self._rank_max_layer_cache_bytes(tokens, cohort_rk, query_tokens=eff_q)
+                        self._rank_max_layer_cache_bytes(
+                            tokens, cohort_rk, query_tokens=eff_q, phase=phase,
+                        )
                         if self.kvc_hbm_ratio < 1.0 else (0.0,) * p.pp
                     )
                     for st in range(p.pp):
@@ -1162,7 +1167,7 @@ class _MemoryLedgerMixin:
                 stg_map[peer_rep] = tuple(tuple(row) for row in peer_stg)
         else:
             _ra, _sa, res_map, stg_map = self._kv_residency_cohort(
-                replica, tokens, query_tokens=eff_q,
+                replica, tokens, query_tokens=eff_q, phase=phase,
             )
         logical_res_map = dict(res_map)
         logical_stg_map = dict(stg_map)
@@ -1179,7 +1184,7 @@ class _MemoryLedgerMixin:
         own_logical_stg = logical_stg_map[int(replica)]
         demand = tuple(max(row) for row in own_logical_res)
         demand_staging = tuple(max(row) for row in own_logical_stg)
-        host_demand = self.host_dram_cache_bytes(tokens) if self.sparse_offload else 0.0
+        host_demand = self.host_dram_cache_bytes(tokens, query_tokens=eff_q, phase=phase)
         (physical, host_physical, physical_staging,
          physical_ranks, physical_staging_ranks) = self._physical_union(
             key, demand, host_demand, demand_staging,
@@ -1222,16 +1227,19 @@ class _MemoryLedgerMixin:
     def resize(
         self, replica: int, request: str, tokens: int,
         *, query_tokens: int | None = None, proposal_tokens: int | None = None,
+        phase: str = "decode", valid_tokens: int | None = None,
     ) -> bool:
         if not self._is_cross_dp_dcp_cohort_active():
             return super().resize(
                 replica, request, tokens,
                 query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+                phase=phase, valid_tokens=valid_tokens,
             )
         key = (replica, request)
         candidate = self._resident_admission(
             replica, request, tokens,
             query_tokens=query_tokens, proposal_tokens=proposal_tokens,
+            phase=phase,
         )
         if not candidate["ok"]:
             return False
@@ -1260,6 +1268,10 @@ class _MemoryLedgerMixin:
         self.logical_host_owners[key] = candidate["host_demand"]
         self.logical_staging_owners[key] = candidate["demand_staging"]
         self.logical_staging_rank[key] = candidate["demand_staging_ranks"]
+        eff_valid = int(tokens) if valid_tokens is None else max(0, min(int(tokens), int(valid_tokens)))
+        self.request_tokens[key] = int(tokens)
+        self.request_valid_tokens[key] = eff_valid
+        self.request_phases[key] = str(phase or "decode")
         self.request_query_tokens[key] = int(candidate["query_tokens"])
         self.request_versions[key] = self.request_versions.get(key, 0) + 1
         if changed:
@@ -2262,7 +2274,7 @@ class _MemoryLedgerMixin:
         quant = require_model_quant(model)
         vision_all = int(round(sum(
             term_bytes(term, quant, p, self.case.machine.ranks_per_node)
-            for term in vision_weight_terms(model, include_vision=True)
+            for term in vision_weight_terms(model, include_vision=True, parallel=p)
         )))
         currently_included = (self.vision_accounting == "full_checkpoint") and (vision_all > 0)
         want_included = (vision_accounting == "full_checkpoint") and (vision_all > 0)
@@ -2366,7 +2378,7 @@ class _MemoryLedgerMixin:
             block_size_override=eff_block, phase=phase,
         )
         group_parts = (
-            self._group_cache_parts(seq, rank=rank, query_tokens=q_tok)
+            self._group_cache_parts(seq, rank=rank, query_tokens=q_tok, phase=phase)
             if self.pages.groups else None
         )
         group_payload = (
@@ -2394,16 +2406,19 @@ class _MemoryLedgerMixin:
             cohort_alloc_parts = [{"kv": 0.0, "index": 0.0, "draft": 0.0} for _ in range(p.pp)]
             cohort_valid_parts = [{"kv": 0.0, "index": 0.0, "draft": 0.0} for _ in range(p.pp)]
             rank_base_per_req = (
-                list(self.cache_bytes(seq, padded=True, query_tokens=q_tok))
+                list(self.cache_bytes(seq, padded=True, query_tokens=q_tok, phase=phase))
                 if rank is None
-                else self._rank_cache_bytes(seq, padded=True, rank=int(rank), query_tokens=q_tok)
+                else self._rank_cache_bytes(
+                    seq, padded=True, rank=int(rank), query_tokens=q_tok, phase=phase,
+                )
             )
         c8_static_stages = tuple(getattr(self, "c8_static_channel_scale_by_stage", (0,) * p.pp))
         hbm_ratio = float(self.kvc_hbm_ratio)
         if hbm_ratio < 1.0:
             layer_max = (
-                self._rank_max_layer_cache_bytes(seq, int(rank), query_tokens=q_tok)
-                if rank is not None else self._max_layer_cache_bytes(seq, query_tokens=q_tok)
+                self._rank_max_layer_cache_bytes(seq, int(rank), query_tokens=q_tok, phase=phase)
+                if rank is not None
+                else self._max_layer_cache_bytes(seq, query_tokens=q_tok, phase=phase)
             )
             proj_staging_stages = tuple(
                 int(round(float(layer_max[st]) * (1.0 - hbm_ratio) * b_int))
@@ -2829,7 +2844,7 @@ class _MemoryLedgerMixin:
                 phase=phase, peer_count_override=1,
             )
             layer_max = (
-                self._rank_max_layer_cache_bytes(seq_v, rank, query_tokens=q_v)
+                self._rank_max_layer_cache_bytes(seq_v, rank, query_tokens=q_v, phase=phase)
                 if hbm_ratio < 1.0 else (0.0,) * p.pp
             )
             for st in range(p.pp):
@@ -2869,6 +2884,7 @@ class _MemoryLedgerMixin:
         *,
         dp_width: int,
         phase: str,
+        include_c8: bool = True,
     ) -> dict[tuple[int, int], list[dict[str, Any]]]:
         """Scatter each source replica's requests onto its true destination cohort dies."""
         p = self.case.runtime.parallel
@@ -2895,13 +2911,14 @@ class _MemoryLedgerMixin:
                             specs, rank=phys_rk, phase=phase,
                         )
                     self._merge_stage_acc(resolved[key], part)
-        for stages in resolved.values():
-            for st in range(p.pp):
-                c8_b = int(c8_stages[st]) if st < len(c8_stages) else 0
-                if c8_b > 0:
-                    stages[st]["kv_alloc"] += c8_b
-                    stages[st]["kv_valid"] += c8_b
-                    stages[st]["components_batch"]["c8_static_channel_scale"] = c8_b
+        if include_c8:
+            for stages in resolved.values():
+                for st in range(p.pp):
+                    c8_b = int(c8_stages[st]) if st < len(c8_stages) else 0
+                    if c8_b > 0:
+                        stages[st]["kv_alloc"] += c8_b
+                        stages[st]["kv_valid"] += c8_b
+                        stages[st]["components_batch"]["c8_static_channel_scale"] = c8_b
         return resolved
 
     def _merge_die_non_request_and_extra_grants(
@@ -2955,6 +2972,129 @@ class _MemoryLedgerMixin:
                 evs.update(b_evs)
         return int(round(live_total)), recl_total, evs
 
+    def _eval_live_phase_specs(
+        self,
+        phase_map: Mapping[str, Mapping[int, Sequence[tuple[int, int, int, str, int]]]],
+        *,
+        dp_width: int,
+        spans_dp: bool,
+        rank_divergent: bool,
+    ) -> dict[tuple[int, int], list[dict[str, Any]]]:
+        """Evaluate live request specs grouped by ``phase -> replica`` onto physical dies."""
+        p = self.case.runtime.parallel
+        out: dict[tuple[int, int], list[dict[str, Any]]] = {}
+        for req_phase, rep_specs in phase_map.items():
+            frozen = {rep: tuple(vals) for rep, vals in rep_specs.items() if vals}
+            if not frozen:
+                continue
+            if spans_dp:
+                part = self._scatter_dp_cohort_projected(
+                    frozen, dp_width=dp_width, phase=req_phase, include_c8=False,
+                )
+                for key, stages in part.items():
+                    if key not in out:
+                        out[key] = self._empty_projected_stage_acc()
+                    self._merge_stage_acc(out[key], stages)
+                continue
+            for rep, specs in frozen.items():
+                if rank_divergent:
+                    for local_rk in range(self.width):
+                        part_st = self._projected_ragged_die_cache_pools(
+                            specs, rank=local_rk, phase=req_phase,
+                            include_dp_cohort_extra=True, include_c8=False,
+                        )
+                        key = (rep, local_rk)
+                        if key not in out:
+                            out[key] = self._empty_projected_stage_acc()
+                        self._merge_stage_acc(out[key], part_st)
+                else:
+                    part_st = self._projected_ragged_die_cache_pools(
+                        specs, rank=None, phase=req_phase,
+                        include_dp_cohort_extra=True, include_c8=False,
+                    )
+                    for local_rk in range(self.width):
+                        key = (rep, local_rk)
+                        if key not in out:
+                            out[key] = self._empty_projected_stage_acc()
+                        self._merge_stage_acc(out[key], part_st)
+        return out
+
+    def _live_die_cache_pools(
+        self,
+        *,
+        default_phase: str,
+        dp_width: int,
+        spans_dp: bool,
+    ) -> dict[tuple[int, int], list[dict[str, Any]]]:
+        """Decompose live admitted requests (including held readers) into per-die cache pools."""
+        p = self.case.runtime.parallel
+        keys = set(self.owners) | set(self.owner_ranks) | set(self._cohort_owner_ranks)
+        if not keys:
+            return {}
+        rank_divergent = self.rank_token_owners is not None or int(getattr(p, "cp", 1) or 1) > 1
+        alloc_by_phase: dict[str, dict[int, list[tuple[int, int, int, str, int]]]] = {}
+        valid_by_phase: dict[str, dict[int, list[tuple[int, int, int, str, int]]]] = {}
+        untracked = [[[0.0] * self.width for _ in range(p.pp)] for _ in range(p.dp)]
+        has_untracked = False
+        for key in keys:
+            rep, _req = key
+            if key not in self.request_tokens:
+                if key in self.retired_requests:
+                    continue
+                has_untracked = True
+                cohort_rows = self._cohort_owner_ranks.get(key)
+                if cohort_rows is not None:
+                    for peer_rep, rows in cohort_rows.items():
+                        for st in range(p.pp):
+                            for rk in range(self.width):
+                                untracked[peer_rep][st][rk] += float(rows[st][rk])
+                else:
+                    rows = self.owner_ranks.get(key) or self._replicate_ranks(self.owners[key])
+                    for st in range(p.pp):
+                        for rk in range(self.width):
+                            untracked[rep][st][rk] += float(rows[st][rk])
+                continue
+            retired = key in self.retired_requests
+            active_alloc = 0 if retired else int(self.request_tokens.get(key, 0))
+            active_valid = 0 if retired else int(self.request_valid_tokens.get(key, active_alloc))
+            active_q = int(self.request_query_tokens.get(key, 1) or 1)
+            req_phase = str(self.request_phases.get(key, default_phase) or default_phase)
+            holds = self._request_hold_tokens.get(key, {})
+            eff_alloc = max([active_alloc, *(int(h[0]) for h in holds.values())])
+            eff_valid = max([active_valid, *(int(h[1]) for h in holds.values())])
+            if eff_alloc > 0:
+                alloc_by_phase.setdefault(req_phase, {}).setdefault(int(rep), []).append(
+                    (eff_alloc, active_q, 0, "", 0)
+                )
+            if eff_valid > 0:
+                valid_by_phase.setdefault(req_phase, {}).setdefault(int(rep), []).append(
+                    (eff_valid, active_q, 0, "", 0)
+                )
+        resolved = self._eval_live_phase_specs(
+            alloc_by_phase, dp_width=dp_width, spans_dp=spans_dp, rank_divergent=rank_divergent,
+        )
+        if valid_by_phase != alloc_by_phase:
+            valid_resolved = self._eval_live_phase_specs(
+                valid_by_phase, dp_width=dp_width, spans_dp=spans_dp, rank_divergent=rank_divergent,
+            )
+            for dkey, stages in resolved.items():
+                v_stages = valid_resolved.get(dkey)
+                for st in range(p.pp):
+                    stages[st]["kv_valid"] = int(v_stages[st]["kv_valid"]) if v_stages is not None else 0
+                    stages[st]["idx_valid"] = int(v_stages[st]["idx_valid"]) if v_stages is not None else 0
+        if has_untracked:
+            for rep in range(p.dp):
+                for rk in range(self.width):
+                    if any(untracked[rep][st][rk] > 0.0 for st in range(p.pp)):
+                        dkey = (rep, rk)
+                        if dkey not in resolved:
+                            resolved[dkey] = self._empty_projected_stage_acc()
+                        for st in range(p.pp):
+                            extra_b = int(round(untracked[rep][st][rk]))
+                            resolved[dkey][st]["kv_alloc"] += extra_b
+                            resolved[dkey][st]["kv_valid"] += extra_b
+        return resolved
+
     def _build_die_receipt(
         self,
         *,
@@ -2970,6 +3110,7 @@ class _MemoryLedgerMixin:
         stage_prep_grants: Sequence[ResidentGrantEntry],
         extra_grants: Sequence[ResidentGrantEntry],
         projected: dict[str, int] | None,
+        live_pool: dict[str, Any] | None = None,
         dyn_live_b: int,
         dyn_peak_b: int,
         req_b: int,
@@ -2985,12 +3126,33 @@ class _MemoryLedgerMixin:
         c8_stages = tuple(getattr(self, "c8_static_channel_scale_by_stage", ()))
         c8_static_b = int(c8_stages[stage]) if stage < len(c8_stages) else 0
         dyn_grant_only = max(0, dyn_live_b - req_b - stg_b)
-        kv_a = projected["kv_alloc"] if projected is not None else (req_b + c8_static_b)
-        kv_v = projected["kv_valid"] if projected is not None else (req_b + c8_static_b)
-        idx_a = projected["idx_alloc"] if projected is not None else 0
-        idx_v = projected["idx_valid"] if projected is not None else 0
-        rec_b = projected["rec"] if projected is not None else 0
-        drf_b = projected["draft"] if projected is not None else 0
+        if projected is not None:
+            kv_a = projected["kv_alloc"]
+            kv_v = projected["kv_valid"]
+            idx_a = projected["idx_alloc"]
+            idx_v = projected["idx_valid"]
+            rec_b = projected["rec"]
+            drf_b = projected["draft"]
+        elif live_pool is not None:
+            pool_kv_a = int(live_pool["kv_alloc"])
+            pool_kv_v = int(live_pool["kv_valid"])
+            idx_a = int(live_pool["idx_alloc"])
+            idx_v = int(live_pool["idx_valid"])
+            rec_b = int(live_pool["rec"])
+            drf_b = int(live_pool["draft"])
+            non_kv = idx_a + rec_b + drf_b
+            if req_b > pool_kv_a + non_kv:
+                pool_kv_a += req_b - (pool_kv_a + non_kv)
+            kv_a = pool_kv_a + c8_static_b
+            kv_v = min(pool_kv_a, pool_kv_v) + c8_static_b
+            idx_v = min(idx_a, idx_v)
+        else:
+            kv_a = req_b + c8_static_b
+            kv_v = req_b + c8_static_b
+            idx_a = 0
+            idx_v = 0
+            rec_b = 0
+            drf_b = 0
 
         ckpt_gid = f"r{replica}:s{stage}:k{rank}:checkpoint_weights"
         vis_gid = f"r{replica}:s{stage}:k{rank}:vision_weights"
@@ -3050,6 +3212,7 @@ class _MemoryLedgerMixin:
         peak_dyn = max(live_dyn, dyn_peak_b + c8_static_b + extra_delta)
         sim_live = fixed_total + live_dyn
         sim_peak = fixed_total + peak_dyn
+        load_peak = fixed_total + c8_static_b + prep_load_b
         return DieResidentReceipt(
             replica=replica,
             stage=stage,
@@ -3072,7 +3235,7 @@ class _MemoryLedgerMixin:
             dynamic_grant_bytes=combined_grant_live,
             simultaneous_live_hbm_bytes=sim_live,
             simultaneous_peak_hbm_bytes=sim_peak,
-            load_peak_hbm_bytes=sim_peak + prep_load_b,
+            load_peak_hbm_bytes=load_peak,
             free_hbm_headroom_bytes=usable - sim_peak,
             host_dram_bytes=host_b,
             grants=dedup_grants,
@@ -3202,6 +3365,74 @@ class _MemoryLedgerMixin:
                     resolved[(rep, local_rk)] = cache_by_key[ckey]
         return resolved
 
+    def _projected_host_by_replica(
+        self,
+        *,
+        phase: str,
+        sequence_tokens: int | None,
+        batch_per_dp: int | Sequence[int],
+        query_tokens: int | None,
+        request_views: Sequence[Any] | None,
+        request_views_by_replica: Mapping[int, Sequence[Any]] | Sequence[Sequence[Any]] | None,
+        sequence_lengths: Sequence[int] | None,
+        query_lengths: Sequence[int] | None,
+    ) -> dict[int, float]:
+        """Projected host-DRAM cache bytes per replica when offload tiers are active."""
+        if not self.sparse_offload and float(self.offload.get("kvc_ddr_ratio", 0.0) or 0.0) <= 0.0:
+            return {}
+        p = self.case.runtime.parallel
+        host_map: dict[int, float] = {}
+        is_prefill = str(phase or "decode").strip().lower() == "prefill"
+        default_q = 1 if is_prefill else self._effective_cache_query_tokens(query_tokens)
+        if request_views_by_replica is not None:
+            for rep in range(p.dp):
+                raw_views = (
+                    request_views_by_replica.get(rep, ())
+                    if isinstance(request_views_by_replica, Mapping)
+                    else (request_views_by_replica[rep] if rep < len(request_views_by_replica) else ())
+                )
+                specs = self._extract_ragged_request_specs(raw_views, default_phase=phase)
+                if specs:
+                    host_map[rep] = float(sum(
+                        self.host_dram_cache_bytes(s, padded=True, query_tokens=q, phase=str(phase))
+                        for s, q, _pt, _pk, _pg in specs if s > 0
+                    ))
+            return host_map
+        if request_views is not None:
+            specs = self._extract_ragged_request_specs(request_views, default_phase=phase)
+            if specs:
+                val = float(sum(
+                    self.host_dram_cache_bytes(s, padded=True, query_tokens=q, phase=str(phase))
+                    for s, q, _pt, _pk, _pg in specs if s > 0
+                ))
+                return {rep: val for rep in range(p.dp)}
+            return {}
+        if sequence_lengths is not None:
+            seq_list = [int(s) for s in sequence_lengths]
+            q_list = (
+                [int(q) for q in query_lengths] if query_lengths is not None
+                else [default_q] * len(seq_list)
+            )
+            val = float(sum(
+                self.host_dram_cache_bytes(s, padded=True, query_tokens=q, phase=str(phase))
+                for s, q in zip(seq_list, q_list) if s > 0
+            ))
+            return {rep: val for rep in range(p.dp)} if val > 0.0 else {}
+        if sequence_tokens is None or int(sequence_tokens) <= 0:
+            return {}
+        batches = (
+            [int(v) for v in batch_per_dp]
+            if isinstance(batch_per_dp, Sequence) and not isinstance(batch_per_dp, (str, bytes))
+            else [int(batch_per_dp)] * p.dp
+        )
+        per_req = self.host_dram_cache_bytes(
+            int(sequence_tokens), padded=True, query_tokens=default_q, phase=str(phase),
+        )
+        for rep, b_int in enumerate(batches):
+            if b_int > 0:
+                host_map[rep] = float(per_req) * float(b_int)
+        return host_map
+
     def resident_memory_receipt(
         self,
         *,
@@ -3255,14 +3486,35 @@ class _MemoryLedgerMixin:
             dp_width=dp_width,
             spans_dp=spans_dp,
         )
+        proj_host_map = self._projected_host_by_replica(
+            phase=str(phase),
+            sequence_tokens=sequence_tokens,
+            batch_per_dp=batch_per_dp,
+            query_tokens=query_tokens,
+            request_views=request_views,
+            request_views_by_replica=request_views_by_replica,
+            sequence_lengths=sequence_lengths,
+            query_lengths=query_lengths,
+        )
+        live_pool_map = (
+            self._live_die_cache_pools(
+                default_phase=str(phase), dp_width=dp_width, spans_dp=spans_dp,
+            )
+            if len(projected_map) < p.dp * self.width else {}
+        )
         dies: list[DieResidentReceipt] = []
         for replica in range(p.dp):
             for stage in range(p.pp):
                 stage_dies = self._stage_dies(replica, stage)
-                host_b = int(round(host_live[replica] + self.engram_host_dram_bytes[stage]))
+                host_req = (
+                    proj_host_map[replica] if replica in proj_host_map else host_live[replica]
+                )
+                host_b = int(round(host_req + self.engram_host_dram_bytes[stage]))
                 for rank in range(self.width):
                     proj_stages = projected_map.get((replica, rank))
                     projected = proj_stages[stage] if proj_stages is not None else None
+                    live_stages = live_pool_map.get((replica, rank)) if projected is None else None
+                    live_pool = live_stages[stage] if live_stages is not None else None
                     dyn_live_b = int(round(hbm_live[replica][stage][rank]))
                     dyn_peak_b = max(
                         dyn_live_b,
@@ -3275,7 +3527,8 @@ class _MemoryLedgerMixin:
                         term_prep_b=term_prep_by_stage[stage],
                         prep_persist_b=prep_persist[stage], prep_load_b=prep_load[stage],
                         stage_prep_grants=prep_grants[stage], extra_grants=extra_grants,
-                        projected=projected, dyn_live_b=dyn_live_b, dyn_peak_b=dyn_peak_b,
+                        projected=projected, live_pool=live_pool,
+                        dyn_live_b=dyn_live_b, dyn_peak_b=dyn_peak_b,
                         req_b=int(round(request_ranks[replica][stage][rank])),
                         stg_b=int(round(staging_ranks[replica][stage][rank])),
                         host_b=host_b,

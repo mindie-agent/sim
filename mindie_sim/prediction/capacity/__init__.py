@@ -279,13 +279,30 @@ class Memory(
         ]
         if case.runtime.engram_cpu_offload and case.model.engram is not None:
             from mindie_sim.catalog.draft_weights import require_model_quant
-            from mindie_sim.catalog.weights import engram_table_terms
+            from mindie_sim.catalog.weights import (
+                engram_table_terms,
+                is_ple_engram,
+                ple_table_terms,
+            )
             quant = require_model_quant(case.model)
-            table_bytes = float(sum(
-                term_bytes(term, quant, p, case.machine.ranks_per_node)
-                for term in engram_table_terms(case.model)
-            ))
-            self.engram_host_dram_bytes = [table_bytes] * p.pp
+            if is_ple_engram(case.model.engram):
+                host_by_stage = [0.0] * p.pp
+                for table, term in zip(case.model.engram.tables, ple_table_terms(case.model)):
+                    stage = (
+                        self.layer_stage[table.layer_id]
+                        if 0 <= int(table.layer_id) < len(self.layer_stage)
+                        else p.pp - 1
+                    )
+                    host_by_stage[stage] += float(
+                        term_bytes(term, quant, p, case.machine.ranks_per_node)
+                    )
+                self.engram_host_dram_bytes = host_by_stage
+            else:
+                table_bytes = float(sum(
+                    term_bytes(term, quant, p, case.machine.ranks_per_node)
+                    for term in engram_table_terms(case.model)
+                ))
+                self.engram_host_dram_bytes = [table_bytes] * p.pp
         else:
             self.engram_host_dram_bytes = [0.0] * p.pp
         self.c8_static_channel_scale_by_stage = self._resolve_c8_static_channel_scale_by_stage(
@@ -293,20 +310,33 @@ class Memory(
         )
 
     def _resolve_c8_static_channel_scale_by_stage(self, case, p) -> tuple[int, ...]:
-        """Resolve fixed per-die checkpoint-frequency GQA C8 static channel scales."""
+        """Resolve fixed per-die load-time GQA static C8/FAQuant scale/offset planes."""
         from mindie_sim.catalog.cache import DEFAULT_CACHE_BLOCK_SIZE
-        from mindie_sim.catalog.cache_format import dense_c8_kv_planes, gqa_kv_formats
+        from mindie_sim.catalog.cache_format import (
+            FAQUANT_KV_TAG,
+            _declared_kv_tag,
+            dense_c8_kv_planes,
+            gqa_kv_formats,
+            resolve_layer_cache_abis,
+        )
 
         model = case.model
         pp = max(1, int(p.pp))
         stage_bytes = [0] * pp
         if not model.layer_plans:
             return tuple(stage_bytes)
+        is_faquant = _declared_kv_tag(model).upper().replace("-", "_") == FAQUANT_KV_TAG
+        allowed_freq = {"checkpoint", "layer"} if is_faquant else {"checkpoint"}
         block = max(1, int(getattr(case.runtime, "kv_block_size", 0) or DEFAULT_CACHE_BLOCK_SIZE))
+        meta = dict(getattr(model, "metadata", ()) or ())
+        quant = getattr(model, "quant", None)
+        scale_dtype = str(
+            meta.get("kv_scale_dtype")
+            or (getattr(quant, "kv_scale_dtype", "") if quant is not None else "")
+            or "fp32"
+        ).strip().lower()
         for plan in model.layer_plans:
             if plan.attention not in {"gqa", "projection_only"}:
-                continue
-            if 0 <= int(plan.kv_owner_layer_id) < int(plan.index):
                 continue
             key_fmt, val_fmt, _shared = gqa_kv_formats(model, plan=plan)
             is_static_c8 = (
@@ -315,17 +345,32 @@ class Memory(
             )
             if not is_static_c8:
                 continue
-            heads = local_kv_heads(int(plan.num_kv_heads or model.kv_heads), int(p.tp))
-            head_dim = int(plan.head_dim or model.head_dim)
-            if heads <= 0 or head_dim <= 0:
+            stage = self.layer_stage[plan.index] if plan.index < len(self.layer_stage) else pp - 1
+            if 0 <= int(plan.kv_owner_layer_id) < int(plan.index):
+                if is_faquant:
+                    heads = local_kv_heads(int(plan.num_kv_heads or model.kv_heads), int(p.tp))
+                    q_heads = max(1, int(plan.num_heads or model.heads) // max(1, int(p.tp)))
+                    head_dim = int(plan.head_dim or model.head_dim)
+                    if heads > 0 and head_dim > 0:
+                        q_planes = dense_c8_kv_planes(
+                            heads, block, head_dim,
+                            scale_dtype=scale_dtype, faquant=True, num_q_heads=q_heads,
+                        )
+                        stage_bytes[stage] += sum(
+                            int(pl.bytes_per_unit)
+                            for pl in q_planes
+                            if pl.allocation_frequency == "layer" and pl.write_trigger == "load"
+                        )
                 continue
-            planes = dense_c8_kv_planes(heads, block, head_dim)
+            abis = resolve_layer_cache_abis(
+                model, plan, p, runtime=case.runtime, stage=stage,
+            )
             per_layer = sum(
                 int(pl.bytes_per_unit)
-                for pl in planes
-                if pl.allocation_frequency == "checkpoint"
+                for abi in abis
+                for pl in abi.planes
+                if pl.allocation_frequency in allowed_freq and pl.write_trigger == "load"
             )
-            stage = self.layer_stage[plan.index] if plan.index < len(self.layer_stage) else pp - 1
             stage_bytes[stage] += per_layer
         return tuple(stage_bytes)
 
@@ -415,7 +460,11 @@ class Memory(
             [[0.0] * self.width for _ in range(p.pp)] for _ in range(p.dp)
         ]
         self.live = [[0.0] * p.pp for _ in range(p.dp)]
+        self.request_tokens: dict[tuple[int, str], int] = {}
+        self.request_valid_tokens: dict[tuple[int, str], int] = {}
+        self.request_phases: dict[tuple[int, str], str] = {}
         self.request_query_tokens: dict[tuple[int, str], int] = {}
+        self._request_hold_tokens: dict[tuple[int, str], dict[str, tuple[int, int, str]]] = {}
         self._prepared_weights: dict[str, object] = {}
         self._prepared_persistent_by_stage = [0.0] * p.pp
         self._prepared_load_peak_by_stage = [0.0] * p.pp
