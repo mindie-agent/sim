@@ -62,7 +62,9 @@ from mindie_sim.compose.inputs import (
 )
 from mindie_sim.compose.runtime import (
     PIECEWISE_CAPTURE_BASE_KEYS,
+    _bind_case_contracts,
     _execution_policy,
+    _resolve_stack_plans,
     _resolve_va_lowerings,
     _supports_sequence_parallel,
     apply_arch_weight_nz_policy,
@@ -86,6 +88,7 @@ from mindie_sim.prediction.feedforward import (
 )
 from mindie_sim.prediction.offload.policy import missing_scenario_error
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.schema.case import Case
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.scenario import (
@@ -1061,7 +1064,7 @@ def _effective_stack_profile_key(
     return "vllm-ascend"
 
 
-def _resolve_single_spine_contracts(
+def _prepare_stack_binding(
     *,
     adapter: Any,
     model_spec: Any,
@@ -1082,7 +1085,7 @@ def _resolve_single_spine_contracts(
     runtime_options: Mapping[str, Any],
     scenario_options: Mapping[str, Any],
     stack_options: Mapping[str, Any],
-) -> tuple[Any, Any, Any, ScenarioContract | None, dict[str, Any]]:
+) -> tuple[Any, int, dict[str, Any]]:
     cap = adapter.capabilities()
     hw_obj = Hardware.from_mapping(machine)
     parallel_obj = ParallelSpec(
@@ -1155,53 +1158,33 @@ def _resolve_single_spine_contracts(
         model_spec, hw_obj, parallel_obj, role=eff_role, track=adapter_track,
         requested_options=req_opts, field_origins={},
     )
-    quant_plan = adapter.resolve_quant_instantiation(
-        model_spec, checkpoint_map, hw_obj, parallel_obj, resolved_opts,
-        role=eff_role, phase=eff_phase,
-    )
-    lowering_plan = adapter.select_lowering_plan(
-        model_spec, quant_plan, hw_obj, parallel_obj, resolved_opts,
-    )
-    scenario_contract = _build_scenario_contract(
-        model_spec=model_spec, checkpoint_map=checkpoint_map, hw_obj=hw_obj,
-        stack_id=cap.stack_id, adapter_track=adapter_track,
-        workload_domain=workload_domain, work_unit_kind=work_unit_kind,
-        resolved_opts=resolved_opts, quant_plan=quant_plan, lowering_plan=lowering_plan,
-        eff_role=eff_role, norm_role=norm_role,
-        prompt_tokens=scenario_options.get("prompt_tokens"),
-        ttft_slo_ms=scenario_options.get("ttft_slo_ms"),
-        tpot_slo_ms=scenario_options.get("tpot_slo_ms"),
-        resolved_max_seqs=resolved_max_seqs, concurrency=scenario_options.get("concurrency"),
-        canonical_track=canonical_track,
-        mtp_tokens=mtp_tokens,
-        require_scenario=bool(scenario_options.get("require_scenario", False)),
-    )
-    register_composed_contracts(
-        quant_plan=quant_plan, lowering_plan=lowering_plan, scenario_contract=scenario_contract,
-    )
-    summary = summarize_single_spine_metadata(
-        stack_id=cap.stack_id, stack_track=adapter_track,
-        workload_domain=workload_domain, work_unit_kind=work_unit_kind,
-        deployment_mode=eff_role, deployment_mode_origin="api_argument",
-        checkpoint_map=checkpoint_map, quant_plan=quant_plan,
-        lowering_plan=lowering_plan, scenario_contract=scenario_contract,
-        contract_inputs={
+    proposal_count = mtp_tokens
+    if mtp_tokens > 0:
+        _, plan = _resolve_stack_plans(adapter, model_spec, hw_obj, parallel_obj, checkpoint_map,
+                                      resolved_opts, role=eff_role, phase=eff_phase)
+        proposal_count = plan.scheduling.speculative_proposal_count or mtp_tokens
+    # Case assembly uses the effective options and proposal count. The frozen
+    # scenario is bound after parsing, when all physical inputs are final.
+    binding = {
+        "stack_id": cap.stack_id,
+        "stack_track": adapter_track,
+        "workload_domain": workload_domain,
+        "work_unit_kind": work_unit_kind,
+        "deployment_mode": eff_role,
+        "contract_inputs": {
             "eff_role": eff_role,
             "eff_phase": eff_phase,
             "norm_role": norm_role,
             "requested_options": dict(req_opts),
             "field_origins": {},
             "prompt_tokens": scenario_options.get("prompt_tokens"),
-            "ttft_slo_ms": scenario_options.get("ttft_slo_ms"),
-            "tpot_slo_ms": scenario_options.get("tpot_slo_ms"),
-            "resolved_max_seqs": int(resolved_max_seqs),
             "concurrency": scenario_options.get("concurrency"),
             "canonical_track": canonical_track,
             "mtp_tokens": int(mtp_tokens),
             "require_scenario": bool(scenario_options.get("require_scenario", False)),
         },
-    )
-    return resolved_opts, quant_plan, lowering_plan, scenario_contract, summary
+    }
+    return resolved_opts, proposal_count, binding
 
 
 def _build_speculative_policy(
@@ -1255,9 +1238,8 @@ def _build_speculative_policy(
 
 def _build_scenario_contract(
     *,
-    model_spec: Any,
+    case: Case,
     checkpoint_map: Any,
-    hw_obj: Hardware,
     stack_id: str,
     adapter_track: StackTrack,
     workload_domain: str,
@@ -1268,9 +1250,6 @@ def _build_scenario_contract(
     eff_role: str,
     norm_role: str | None,
     prompt_tokens: int | None,
-    ttft_slo_ms: float | None,
-    tpot_slo_ms: float | None,
-    resolved_max_seqs: int,
     concurrency: int | None,
     canonical_track: str,
     mtp_tokens: int = 0,
@@ -1278,70 +1257,54 @@ def _build_scenario_contract(
 ) -> ScenarioContract | None:
     """Validate all 4 deployment modes strictly via ``schema.scenario`` (zero 4096 fallback)."""
     mode = validate_deployment_mode(eff_role)
+    boundaries = {}
+    ready = None
     if mode == "pd_decode":
-        kv_layout = quant_plan.kv_cache_abi[0].planes[0].layout if quant_plan.kv_cache_abi else "BNSD"
         if prompt_tokens is None:
             if not require_scenario:
                 return None
-            ready = None
         else:
+            abis = quant_plan.all_cache_abis()
             ready = ReadyStateAssumption(
                 source="pre_populated_hbm",
                 context_tokens=int(prompt_tokens),
-                layout=kv_layout,
-                cache_abi_digests=tuple(
-                    a.checkpoint_digest or a.producer_key for a in quant_plan.kv_cache_abi[:1]
-                ),
+                layout=abis[0].planes[0].layout if abis else "BNSD",
+                cache_abi_digests=tuple(abi.digest() for abi in abis),
             )
-        sla = SLAContract(
-            ttft_ms=(float(ttft_slo_ms) if ttft_slo_ms is not None else None),
-            tpot_ms=(float(tpot_slo_ms) if tpot_slo_ms is not None else None),
-            ttft_boundary="unavailable",
-            tpot_boundary="ready_state_decode",
-        )
+        boundaries = {"ttft_boundary": "unavailable", "tpot_boundary": "ready_state_decode"}
     elif mode == "pd_prefill":
-        ready = None
-        sla = SLAContract(
-            ttft_ms=(float(ttft_slo_ms) if ttft_slo_ms is not None else None),
-            tpot_ms=(float(tpot_slo_ms) if tpot_slo_ms is not None else None),
-            ttft_boundary="prefill_completion_only",
-            tpot_boundary="unavailable",
-        )
-    else:
-        ready = None
-        sla = SLAContract(
-            ttft_ms=(float(ttft_slo_ms) if ttft_slo_ms is not None else None),
-            tpot_ms=(float(tpot_slo_ms) if tpot_slo_ms is not None else None),
-        )
+        boundaries = {"ttft_boundary": "prefill_completion_only", "tpot_boundary": "unavailable"}
     return ScenarioContract(
         deployment_mode=mode,
         deployment_mode_origin="api_argument",
         workload_domain=workload_domain,  # type: ignore[arg-type]
         work_unit_kind=work_unit_kind,  # type: ignore[arg-type]
-        model=model_spec,
+        model=case.model,
         checkpoint=checkpoint_map,
         stack_id=stack_id,
         stack_track=adapter_track,
         stack_options=resolved_opts,
         quant_plan=quant_plan,
         lowering_plan=lowering_plan,
-        hardware=hw_obj,
+        hardware=case.machine,
+        workload=case.workload if prompt_tokens is not None else None,
+        parallel=case.runtime.parallel,
         primitive_table_digest="",
         optimization_mode="modeling" if canonical_track == "target" else "simulation",
         execution_stage="after" if canonical_track == "target" else "before",
-        sla=sla,
+        sla=SLAContract(**case.slo.to_dict(), **boundaries),
         limits=ConcurrencyLimits(
-            runtime_max_num_seqs=int(resolved_max_seqs),
+            runtime_max_num_seqs=case.runtime.max_num_seqs,
             runtime_max_num_seqs_origin="compose_case",
             workload_requested_concurrency=(int(concurrency) if concurrency is not None else None),
         ),
-        num_devices=len(hw_obj.dies),
+        num_devices=len(case.machine.dies),
         allow_solver_pd_split=(mode == "pd_disaggregated"),
         ready_state=ready,
         pd_transfer=lowering_plan.scheduling.pd_kv_transfer if mode == "pd_disaggregated" else None,
         provenance=(("role_arg", str(norm_role or "default_colocated")),),
         speculative_policy=_build_speculative_policy(
-            workload_domain, model_spec, mtp_tokens, resolved_opts, lowering_plan,
+            workload_domain, case.model, mtp_tokens, resolved_opts, lowering_plan,
         ),
     )
 
@@ -1498,8 +1461,8 @@ def _apply_stack_and_lowerings(
     )
 
 
-def _apply_hardware_derivation(
-    case_dict: dict[str, Any],
+def _finalize_composed_case(
+    case_dict: dict[str, Any], adapter, checkpoint,
     *,
     hardware_derivation: Mapping[str, Any] | None,
     aic_count: int | None,
@@ -1528,7 +1491,13 @@ def _apply_hardware_derivation(
         parsed = parse_case(case_dict)
         derived = derived_machine(parsed.machine, derivation)
         case_dict["machine"] = _to_jsonable(derived)
-        parse_case(case_dict)
+    single_spine_meta = case_dict["runtime"]["metadata"]["single_spine"]
+    scenario, quant, lowering = _bind_case_contracts(parse_case(case_dict), single_spine_meta, adapter, checkpoint)
+    register_composed_contracts(quant_plan=quant, lowering_plan=lowering, scenario_contract=scenario)
+    case_dict["runtime"]["metadata"]["single_spine"] = summarize_single_spine_metadata(
+        **single_spine_meta, deployment_mode_origin="api_argument", checkpoint_map=checkpoint,
+        quant_plan=quant, lowering_plan=lowering, scenario_contract=scenario,
+    )
     return case_dict
 
 
@@ -1962,15 +1931,6 @@ def _compose_auto_deployment(
     return winner_case
 
 
-def _effective_mtp_from_plan(
-    lowering_plan: Any, mtp_tokens: int, resolved_mtp_accept: float,
-) -> tuple[int, float]:
-    sched_k = int(getattr(getattr(lowering_plan, "scheduling", None), "speculative_proposal_count", 0) or 0)
-    eff_k = sched_k if (sched_k > 0 and mtp_tokens > 0) else mtp_tokens
-    eff_accept = min(float(resolved_mtp_accept), float(1 + eff_k)) if eff_k > 0 else float(resolved_mtp_accept)
-    return eff_k, eff_accept
-
-
 def _prepare_spec_and_block_size(
     model_spec: Any, *, canonical_track: str, mtp_tokens: int,
     allow_synthetic_gqa_draft: bool, spec_method_norm: str | None,
@@ -2103,8 +2063,8 @@ def _compose_explicit_case(
         "sp": bool(policy_out["sp"]),
         "graph_capture_mode": str(policy_out["graph_capture_mode"]),
     }
-    resolved_opts, _quant_plan, _lowering_plan, _scenario_contract, single_spine_meta = (
-        _resolve_single_spine_contracts(
+    resolved_opts, eff_mtp_tokens, single_spine_meta = (
+        _prepare_stack_binding(
             adapter=adapter, model_spec=model_spec, checkpoint_map=checkpoint_map,
             target_quant_projection=target_proj, machine=machine, axes=resolved_axes,
             workload_domain=workload_domain, work_unit_kind=work_unit_kind,
@@ -2133,7 +2093,7 @@ def _compose_explicit_case(
     model_dict["n_routed_experts"] = int(model_spec.num_experts)
     model_dict["num_experts_per_tok"] = int(model_spec.top_k)
 
-    eff_mtp_tokens, eff_mtp_accept = _effective_mtp_from_plan(_lowering_plan, mtp_tokens, resolved_mtp_accept)
+    eff_mtp_accept = min(resolved_mtp_accept, 1 + eff_mtp_tokens) if eff_mtp_tokens else resolved_mtp_accept
     return _assemble_composed_case(
         model_spec, model_dict, machine, requests, slo_dict,
         resolved_axes=resolved_axes, sku=sku, hardware_backend=hardware_backend,
@@ -2150,7 +2110,7 @@ def _compose_explicit_case(
         runtime_options=effective_runtime_options,
         recover_ssm_explicit=(runtime_options["recover_ssm"] is not None),
         cp_options=cp_options, stack_options=stack_options,
-    )
+    ), adapter, checkpoint_map
 
 
 def _assemble_composed_case(
@@ -2289,11 +2249,14 @@ def _assemble_composed_case(
         "workload": {"requests": requests},
         "slo": slo_dict,
     }
-    parse_case(case_dict)
     return case_dict
 
 
 _COMPOSE_OPTION_GROUPS: dict[str, tuple[str, ...]] = {
+    "derivation": (
+        "hardware_derivation", "aic_count", "aiv_count", "memory_bytes", "hbm_peak_bytes_per_s",
+        "hbm_efficiency", "mte2_ceiling_bytes_per_s", "mte2_efficiency",
+    ),
     "auto": (
         "quant", "layers", "ranks_per_node", "topology_preset", "va_recommended",
         "raw_eager", "feature_track", "runtime_stack", "optimizations",
@@ -2493,19 +2456,18 @@ def compose_case(
             "policy_options", "runtime_options", "cp_options", "stack_options",
         )
     }
-    case_dict = _compose_explicit_case(
+    if eff_deployment is not None:
+        mode = validate_deployment_mode(eff_deployment)
+        if norm_role is not None and norm_role != mode:
+            raise ModelingError(f"conflicting_deployment_role:{mode}!={norm_role}")
+        norm_role = mode
+    case_dict, adapter, checkpoint = _compose_explicit_case(
         model, hardware, axes, norm_role, graph_capture_mode=graph_capture_mode,
         raw_eager=raw_eager, feature_track=feature_track, va_recommended=va_recommended,
         block_size=block_size, allow_synthetic_gqa_draft=allow_synthetic_gqa_draft,
         moe_comm_mode=moe_comm_mode, **grouped,
     )
-    return _apply_hardware_derivation(
-        case_dict,
-        hardware_derivation=hardware_derivation,
-        aic_count=aic_count, aiv_count=aiv_count, memory_bytes=memory_bytes,
-        hbm_peak_bytes_per_s=hbm_peak_bytes_per_s, hbm_efficiency=hbm_efficiency,
-        mte2_ceiling_bytes_per_s=mte2_ceiling_bytes_per_s, mte2_efficiency=mte2_efficiency,
-    )
+    return _finalize_composed_case(case_dict, adapter, checkpoint, **_select_group(args, "derivation"))
 
 
 __all__ = [

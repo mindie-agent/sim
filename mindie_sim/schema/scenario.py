@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
 import hashlib
 import json
 import math
@@ -219,6 +219,12 @@ class PoolSpec:
         object.__setattr__(self, "device_ids", ids)
         if self.parallel is not None and not isinstance(self.parallel, ParallelSpec):
             raise ModelingError("pool_parallel_invalid")
+        if self.parallel is not None:
+            world = self.parallel.world_size
+            if world > num:
+                raise ModelingError(f"pool_parallel_exceeds_devices:{world}>{num}")
+            if ids and world != len(ids):
+                raise ModelingError(f"pool_parallel_device_ids_mismatch:{world}!={len(ids)}")
         object.__setattr__(self, "speculative_k", _int_val(self.speculative_k, "pool_spec_k_invalid", minimum=0))
 
 
@@ -453,6 +459,10 @@ class MegaFusionBound:
             _finite_float(self.tilelang_simd_or_ascendc_gain_ms, "mega_fusion_tilelang_simd_gain_invalid", allow_negative=True)
             if self.tilelang_simd_or_ascendc_gain_ms is not None else None
         )
+        if simt_gain is not None and simt_gain > ceil_gain + FLOAT_TOL:
+            raise ModelingError(
+                f"mega_fusion_simt_gain_exceeds_ceiling:simt={simt_gain}>ceiling={ceil_gain}"
+            )
         if simd_gain is not None and simd_gain > ceil_gain + FLOAT_TOL:
             raise ModelingError(
                 f"mega_fusion_simd_gain_exceeds_ceiling:simd={simd_gain}>ceiling={ceil_gain}"
@@ -506,7 +516,7 @@ class SpaceTimeTradeoffSpec:
             raise ModelingError("space_time_time_for_space_requires_nonpos_delta_hbm")
         if not isinstance(self.feasible_under_hbm_and_sla, bool):
             raise ModelingError("space_time_feasible_flag_invalid")
-        if self.feasible_under_hbm_and_sla and delta_hbm > 0 and delta_hbm > headroom:
+        if self.feasible_under_hbm_and_sla and delta_hbm > headroom:
             raise ModelingError(
                 f"space_time_hbm_exceeds_headroom:delta={delta_hbm}>headroom={headroom}"
             )
@@ -635,6 +645,7 @@ class ScenarioContract:
     vision_accounting: VisionAccountingScope = "text_backbone"
     provenance: tuple[tuple[str, str], ...] = ()
     speculative_policy: SpeculativeWorkloadPolicy | None = None
+    parallel: ParallelSpec | None = None
 
     def __post_init__(self) -> None:
         mode = validate_deployment_mode(self.deployment_mode)
@@ -649,29 +660,22 @@ class ScenarioContract:
         validate_scenario_contract(self)
 
     def digest(self) -> str:
-        payload: dict[str, Any] = {
-            "deployment_mode": self.deployment_mode,
-            "workload_domain": self.workload_domain,
-            "work_unit_kind": self.work_unit_kind,
-            "optimization_mode": self.optimization_mode,
-            "execution_stage": self.execution_stage,
-            "model_name": self.model.name,
-            "checkpoint_digest": self.checkpoint.digest(),
-            "stack_id": self.stack_id,
-            "stack_track": self.stack_track,
-            "options_digest": self.stack_options.options_digest,
-            "quant_plan_digest": self.quant_plan.plan_digest,
-            "lowering_plan_digest": self.lowering_plan.plan_digest,
-            "primitive_table_digest": self.primitive_table_digest,
-            "num_devices": self.num_devices,
-            "pinned_parallel": list(self.pinned_parallel),
-            "vision_accounting": self.vision_accounting,
-        }
-        if self.speculative_policy is not None:
-            payload["speculative_policy"] = self.speculative_policy.to_dict()
-        return hashlib.sha256(
-            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-        ).hexdigest()
+        """Identify the complete frozen contract, including placement and per-layer ABIs."""
+        def json_value(value: Any) -> Any:
+            if is_dataclass(value):
+                return {item.name: getattr(value, item.name) for item in fields(value)}
+            if isinstance(value, (set, frozenset)):
+                return sorted(value)
+            if isinstance(value, Mapping):
+                return dict(value)
+            raise TypeError(f"unsupported scenario digest value: {type(value).__name__}")
+
+        # Stream the rank topology and layer plans without deep-copying the scenario.
+        encoder = json.JSONEncoder(default=json_value, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256()
+        for chunk in encoder.iterencode(self):
+            digest.update(chunk.encode("utf-8"))
+        return digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -740,6 +744,8 @@ def _validate_pools_and_mode(contract: ScenarioContract) -> None:
             raise ModelingError(
                 "pd_prefill_rejects_decode_sla:tpot_ms and itl_ms are not measurable at pd_prefill boundary"
             )
+        if contract.sla.ttft_ms is None:
+            raise ModelingError("pd_prefill_requires_ttft_slo_ms")
         if contract.ready_state is not None:
             raise ModelingError("pd_prefill_forbids_ready_state_assumption")
         if pools and (len(pools) != 1 or pools[0].role != "prefill"):
@@ -816,22 +822,22 @@ def _validate_domain_and_modes(contract: ScenarioContract) -> None:
             raise ModelingError(
                 f"simulation_mode_allows_config_track_only:{plan.allowed_rewrite_tracks!r}"
             )
-    if contract.execution_stage == "framework_rewrite":
-        if not plan.allowed_rewrite_classes.issubset(SIMULATION_ALLOWED_READINESS):
+    if contract.execution_stage in {"config_only", "framework_rewrite"}:
+        stages = canonical_comparison_stages(contract.optimization_mode, include_proposed_pr=True)
+        stage = next((item for item in stages if item.stage == contract.execution_stage), None)
+        if stage is None:
+            raise ModelingError(f"scenario_execution_stage_unavailable:{contract.execution_stage}")
+        if not plan.allowed_rewrite_classes.issubset(stage.allowed_readiness):
             raise ModelingError(
-                f"framework_rewrite_stage_forbids_new_kernels:{sorted(plan.allowed_rewrite_classes)}"
+                f"{stage.stage}_stage_forbids_new_kernels:{sorted(plan.allowed_rewrite_classes)}"
             )
-    if contract.execution_stage == "config_only":
-        if not plan.allowed_rewrite_classes.issubset(SIMULATION_ALLOWED_READINESS):
-            raise ModelingError(
-                f"config_only_stage_forbids_new_kernels:{sorted(plan.allowed_rewrite_classes)}"
-            )
-    aux = getattr(contract.model, "auxiliary", None)
-    attached_drafts = (
-        tuple(d for d in (getattr(aux, "mtp", None), getattr(aux, "dspark", None)) if d is not None)
-        if aux is not None else ()
-    )
-    has_synthetic_draft = any(bool(getattr(d, "is_synthetic", False)) for d in attached_drafts)
+        if not set(plan.allowed_rewrite_tracks).issubset(stage.allowed_rewrite_tracks):
+            raise ModelingError(f"{stage.stage}_stage_forbids_rewrite_tracks:{plan.allowed_rewrite_tracks!r}")
+        if plan.allowed_framework_rewrites and "framework" not in stage.allowed_rewrite_tracks:
+            raise ModelingError(f"{stage.stage}_stage_forbids_framework_rewrites")
+    aux = contract.model.auxiliary
+    attached_drafts = tuple(d for d in (aux.mtp, aux.dspark) if d is not None) if aux else ()
+    has_synthetic_draft = any(d.is_synthetic for d in attached_drafts)
     if has_synthetic_draft and contract.optimization_mode != "modeling":
         raise ModelingError(
             "simulation_mode_forbids_synthetic_gqa_draft:"
@@ -841,19 +847,24 @@ def _validate_domain_and_modes(contract: ScenarioContract) -> None:
         contract.speculative_policy is None or not contract.speculative_policy.allow_synthetic_gqa
     ):
         raise ModelingError("scenario_synthetic_draft_requires_policy_opt_in")
-    if contract.speculative_policy is not None:
-        if not isinstance(contract.speculative_policy, SpeculativeWorkloadPolicy):
+    policy = contract.speculative_policy
+    if policy is not None:
+        if not isinstance(policy, SpeculativeWorkloadPolicy):
             raise ModelingError("scenario_speculative_policy_invalid")
-        if contract.speculative_policy.allow_synthetic_gqa:
+        if policy.num_speculative_tokens and policy.spec_method not in {"ngram", "ngram_gpu"} and not attached_drafts:
+            raise ModelingError(
+                f"speculative_contract_missing_real_draft_spec:method={policy.spec_method}:mode={contract.optimization_mode}"
+            )
+        if policy.allow_synthetic_gqa:
             if contract.optimization_mode != "modeling":
                 raise ModelingError(
                     "simulation_mode_forbids_synthetic_gqa_draft:"
                     "actual_deployment_requires_real_speculative_checkpoint"
                 )
-            if contract.speculative_policy.synthetic_draft_provenance != SYNTHETIC_EAGLE3_GQA_PROVENANCE:
+            if policy.synthetic_draft_provenance != SYNTHETIC_EAGLE3_GQA_PROVENANCE:
                 raise ModelingError(
                     f"synthetic_gqa_requires_explicit_provenance:"
-                    f"{contract.speculative_policy.synthetic_draft_provenance!r}"
+                    f"{policy.synthetic_draft_provenance!r}"
                 )
 
 

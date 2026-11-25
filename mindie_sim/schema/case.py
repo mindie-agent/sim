@@ -54,8 +54,7 @@ def _capture_sizes(value: Any, reason: str) -> tuple[int, ...]:
     return tuple(sorted(set(sizes)))
 
 
-def _compilation_fields(raw: Mapping[str, Any], declared: Mapping[str, Any]
-                         ) -> dict[str, Any]:
+def _compilation_fields(raw: Mapping[str, Any], default_mode: str) -> dict[str, Any]:
     """Map a vLLM ``compilation_config`` onto the simulation graph fields.
 
     The raw cudagraph mode is preserved as ``captured_execution_mode`` metadata
@@ -76,32 +75,21 @@ def _compilation_fields(raw: Mapping[str, Any], declared: Mapping[str, Any]
     if unknown:
         raise ModelingError(
             "runtime_compilation_config_unknown:" + ",".join(sorted(unknown)))
-    mode_raw = str(config.get("cudagraph_mode") or "").strip().upper()
+    declared_mode = str(config.get("cudagraph_mode") or "").strip().upper()
+    metadata_mode = dict(raw.get("metadata") or ()).get("captured_execution_mode")
+    mode_raw = declared_mode or str(metadata_mode or raw.get("graph_capture_mode") or default_mode).strip().upper()
+    if mode_raw not in _CUDAGRAPH_MODES:
+        raise ModelingError(f"runtime_cudagraph_mode_unsupported:{mode_raw}")
+    mode, full_keys, piecewise_keys = _CUDAGRAPH_MODES[mode_raw]
     fields: dict[str, Any] = {}
-    if mode_raw:
-        if mode_raw not in _CUDAGRAPH_MODES:
-            raise ModelingError(f"runtime_cudagraph_mode_unsupported:{mode_raw}")
-        mode, full_keys, piecewise_keys = _CUDAGRAPH_MODES[mode_raw]
-        if declared.get("graph_capture_mode") is not None and str(
-                declared["graph_capture_mode"]) != mode:
-            raise ModelingError(
-                "runtime_compilation_conflict:graph_capture_mode:"
-                f"{declared['graph_capture_mode']}!={mode}")
+    if declared_mode:
         fields["graph_capture_mode"] = mode
-        sizes = _capture_sizes(config.get("cudagraph_capture_sizes"),
-                               "runtime_cudagraph_capture_sizes_invalid")
-        if sizes:
-            if full_keys:
-                if declared.get("graph_capture_keys") not in (None, (), sizes):
-                    raise ModelingError(
-                        "runtime_compilation_conflict:graph_capture_keys")
-                fields["graph_capture_keys"] = sizes
-            if piecewise_keys:
-                if declared.get("piecewise_capture_keys") not in (None, (), sizes):
-                    raise ModelingError(
-                        "runtime_compilation_conflict:piecewise_capture_keys")
-                fields["piecewise_capture_keys"] = sizes
         fields["metadata"] = (("captured_execution_mode", mode_raw),)
+    sizes = _capture_sizes(config.get("cudagraph_capture_sizes"),
+                           "runtime_cudagraph_capture_sizes_invalid")
+    for key, active in (("graph_capture_keys", full_keys), ("piecewise_capture_keys", piecewise_keys)):
+        if active and sizes:
+            fields[key] = sizes
     npu_cfg = config.get("npugraph_ex_config")
     if npu_cfg is not None:
         if not isinstance(npu_cfg, Mapping):
@@ -128,7 +116,7 @@ def _compilation_fields(raw: Mapping[str, Any], declared: Mapping[str, Any]
         if not isinstance(ops, (list, tuple)) or not all(
                 isinstance(item, str) and item for item in ops):
             raise ModelingError("runtime_splitting_ops_invalid")
-        declared_ops = declared.get("splitting_ops")
+        declared_ops = raw.get("splitting_ops")
         if declared_ops is not None and tuple(declared_ops) != tuple(ops):
             raise ModelingError("runtime_compilation_conflict:splitting_ops")
         fields["splitting_ops"] = tuple(ops)
@@ -266,7 +254,7 @@ class Software:
         if norm_phase == "prefill" and uniform and self.supports_full_prefill_capture:
             return "full"
         if self.supports_piecewise_capture and (
-            norm_phase == "decode"
+            norm_phase in {"decode", "prefill"}
             or self.mixed_mode not in {"none", "off"}
             or self.captured_execution_mode == "FULL_AND_PIECEWISE"
         ):
@@ -304,16 +292,17 @@ class Software:
             raise ModelingError("runtime_unknown_fields:" + ",".join(sorted(unknown)))
         kwargs = {key: value for key, value in raw.items() if key in names}
         kwargs["parallel"] = ParallelSpec.from_mapping(cls.parallel_mapping(raw))
-        declared = dict(raw)
         metadata = dict(raw.get("metadata", {}) or {})
         # --- vLLM graph / compilation configuration ---------------------
-        compiled = _compilation_fields(raw, declared)
+        compiled = _compilation_fields(raw, cls.graph_capture_mode)
         merged_metadata = dict(compiled.pop("metadata", ()))
         for key, value in merged_metadata.items():
             if key in metadata and metadata[key] != value:
                 raise ModelingError(f"runtime_metadata_conflict:{key}")
             metadata[key] = value
         for key, value in compiled.items():
+            if key in kwargs and key in {"graph_capture_keys", "piecewise_capture_keys"}:
+                kwargs[key] = _capture_sizes(kwargs[key], f"runtime_{key}_invalid")
             if key in kwargs and kwargs[key] != value:
                 raise ModelingError(f"runtime_compilation_conflict:{key}")
             kwargs[key] = value

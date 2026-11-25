@@ -378,6 +378,8 @@ class PortSet:
                                       f"port_set_{group}_invalid")
             object.__setattr__(self, group, ports)
             for port in ports:
+                if not (port.is_consumer if group.endswith("_in") else port.is_producer):
+                    raise ModelingError(f"port_set_direction_mismatch:{group}:{port.name}:{port.direction}")
                 if port.name in names:
                     raise ModelingError(
                         f"port_set_name_duplicate:{port.name}:"

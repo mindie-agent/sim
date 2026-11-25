@@ -166,14 +166,15 @@ def _rehydrate_checkpoint_from_metadata(encoded: Mapping[str, Any]) -> Checkpoin
     from mindie_sim.catalog.checkpoint_reader import lookup_curated_checkpoint
 
     ref = str(encoded.get("ref") or "")
-    if ref:
-        curated = lookup_curated_checkpoint(ref)
-        if curated is not None:
-            return curated
-    payload = encoded.get("payload")
-    if not isinstance(payload, Mapping):
-        raise ModelingError("single_spine_checkpoint_payload_missing")
-    return _checkpoint_map_from_dict(payload)
+    checkpoint = lookup_curated_checkpoint(ref) if ref else None
+    if checkpoint is None:
+        payload = encoded.get("payload")
+        if not isinstance(payload, Mapping):
+            raise ModelingError("single_spine_checkpoint_payload_missing")
+        checkpoint = _checkpoint_map_from_dict(payload)
+    if checkpoint.digest() != encoded.get("digest"):
+        raise ModelingError("single_spine_checkpoint_digest_mismatch")
+    return checkpoint
 
 
 def register_composed_contracts(
@@ -195,7 +196,6 @@ def resolve_case_contracts(
     case_or_dict: Any,
 ) -> tuple[ScenarioContract | None, RuntimeQuantPlan | None, StackLoweringPlan | None]:
     """Deterministically rehydrate frozen single-spine contracts directly from ``case_or_dict``."""
-    from mindie_sim.compose import _build_scenario_contract
     from mindie_sim.prediction.structure import parse_case
     from mindie_sim.stacks.registry import resolve_stack_for_scenario
 
@@ -219,13 +219,8 @@ def resolve_case_contracts(
         return None, None, None
 
     stack_id = str(single_spine.get("stack_id") or "")
-    adapter_track = str(single_spine.get("stack_track") or "shipping")
     workload_domain = str(single_spine.get("workload_domain") or "llm")
     work_unit_kind = str(single_spine.get("work_unit_kind") or "token")
-    eff_role = str(inputs.get("eff_role") or single_spine.get("deployment_mode") or "colocated")
-    eff_phase = str(inputs.get("eff_phase") or "decode")
-    req_opts = dict(inputs.get("requested_options") or {})
-    field_origins = dict(inputs.get("field_origins") or {})
     ckpt_encoded = inputs.get("checkpoint")
     if not isinstance(ckpt_encoded, Mapping):
         raise ModelingError("single_spine_checkpoint_inputs_missing")
@@ -252,22 +247,40 @@ def resolve_case_contracts(
         work_unit=work_unit_kind,
         hardware_family=hw_selector,
     )
+    return _bind_case_contracts(parsed, single_spine, adapter, checkpoint_map)
+
+
+def _resolve_stack_plans(adapter, model, hardware, parallel, checkpoint, options, *, role, phase):
+    quant = adapter.resolve_quant_instantiation(model, checkpoint, hardware, parallel, options,
+                                               role=role, phase=phase)
+    return quant, adapter.select_lowering_plan(model, quant, hardware, parallel, options)
+
+
+def _bind_case_contracts(parsed, single_spine, adapter, checkpoint_map):
+    """Bind the scenario and plans to the final parsed case on compose and replay."""
+    from mindie_sim.compose import _build_scenario_contract
+
+    inputs = single_spine["contract_inputs"]
+    stack_id = adapter.capabilities().stack_id
+    adapter_track = str(single_spine.get("stack_track") or "shipping")
+    workload_domain = str(single_spine.get("workload_domain") or "llm")
+    work_unit_kind = str(single_spine.get("work_unit_kind") or "token")
+    eff_role = str(inputs.get("eff_role") or single_spine.get("deployment_mode") or "colocated")
+    eff_phase = str(inputs.get("eff_phase") or "decode")
+    req_opts = dict(inputs.get("requested_options") or {})
+    field_origins = dict(inputs.get("field_origins") or {})
     resolved_opts = adapter.resolve_options(
         parsed.model, parsed.machine, parsed.runtime.parallel,
         role=eff_role, track=adapter_track,  # type: ignore[arg-type]
         requested_options=req_opts, field_origins=field_origins,
     )
-    quant_plan = adapter.resolve_quant_instantiation(
-        parsed.model, checkpoint_map, parsed.machine, parsed.runtime.parallel,
-        resolved_opts, role=eff_role, phase=eff_phase,
-    )
-    lowering_plan = adapter.select_lowering_plan(
-        parsed.model, quant_plan, parsed.machine, parsed.runtime.parallel, resolved_opts,
+    quant_plan, lowering_plan = _resolve_stack_plans(
+        adapter, parsed.model, parsed.machine, parsed.runtime.parallel, checkpoint_map, resolved_opts,
+        role=eff_role, phase=eff_phase,
     )
     scenario_contract = _build_scenario_contract(
-        model_spec=parsed.model,
+        case=parsed,
         checkpoint_map=checkpoint_map,
-        hw_obj=parsed.machine,
         stack_id=stack_id,
         adapter_track=adapter_track,  # type: ignore[arg-type]
         workload_domain=workload_domain,
@@ -278,9 +291,6 @@ def resolve_case_contracts(
         eff_role=eff_role,
         norm_role=inputs.get("norm_role"),
         prompt_tokens=inputs.get("prompt_tokens"),
-        ttft_slo_ms=inputs.get("ttft_slo_ms"),
-        tpot_slo_ms=inputs.get("tpot_slo_ms"),
-        resolved_max_seqs=int(inputs.get("resolved_max_seqs") or parsed.runtime.max_num_seqs),
         concurrency=inputs.get("concurrency"),
         canonical_track=str(inputs.get("canonical_track") or adapter_track),
         mtp_tokens=int(inputs.get("mtp_tokens") or 0),

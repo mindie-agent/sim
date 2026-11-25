@@ -162,6 +162,10 @@ class RequestView:
             "query_ranges": self.query_ranges,
             "prefix_cache_key": self.prefix_cache_key,
         }
+        if self.mamba_block_table:
+            payload["mamba_block_table"] = self.mamba_block_table
+        if self.recover_ssm_boundary:
+            payload["recover_ssm_boundary"] = dict(self.recover_ssm_boundary)
         if self.padded_q_len:
             payload["padded_q_len"] = self.padded_q_len
         if self.padded_seq_len:
