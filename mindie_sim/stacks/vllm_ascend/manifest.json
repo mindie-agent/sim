@@ -4,22 +4,39 @@
   "name": "vllm-ascend",
   "repository": "vllm-project/vllm-ascend",
   "manifest_revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
-  "baseline_revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+  "baseline_revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
   "cann_toolkit_revision": "9.3.0-20261112_192141454",
   "cann_ops_transformer_revision": "1.0.0",
   "fla_npu_revision": "26.10.0+feature",
   "description": "vLLM-Ascend@0c99d3fc + CANN 9.3.0 baseline and audited performance PRs",
-  "supported_domains": ["llm", "vlm"],
-  "supported_work_units": ["prefill_decode_step", "vision_encode"],
-  "supported_hardware_backends": ["ascend"],
-  "supported_phases": ["prefill", "decode", "mixed"],
+  "supported_domains": [
+    "llm",
+    "vlm"
+  ],
+  "supported_work_units": [
+    "prefill_decode_step",
+    "vision_encode"
+  ],
+  "supported_hardware_backends": [
+    "ascend"
+  ],
+  "supported_phases": [
+    "prefill",
+    "decode",
+    "mixed"
+  ],
   "supported_checkpoint_formats": [
     "modelslim_description",
     "hf_quantization_config",
     "unquantized_native",
     "explicit_synthetic_preset"
   ],
-  "supported_tracks": ["eager", "shipping", "proposed", "target"],
+  "supported_tracks": [
+    "eager",
+    "shipping",
+    "proposed",
+    "target"
+  ],
   "supported_recipe_ids": [
     "aclnn_mixed_quant_sparse_flash_mla",
     "ascend_attn_res_prefix",
@@ -63,204 +80,399 @@
     "vllm_ascend_sparse_mla_metadata"
   ],
   "promoted_merged_prs": [
-    {"pr": 15851, "summary": "Kimi-K3 5L GQA DSpark dcp_sharded=False"},
-    {"pr": 20167, "summary": "MiniMax-M3 7-token dense DSpark drafter adapter"},
-    {"pr": 20756, "summary": "Qwen3.5/3.6/3.8-27B dense FlashComm sequence parallelism"},
-    {"pr": 20946, "summary": "AscendStep5ForCausalLM, Step5 CSA region score, and 3L NextN MTP"},
-    {"pr": 21510, "summary": "GLM-5.3-Flash KDA TPxPCP head/context sharding"},
-    {"pr": 21549, "summary": "Kimi-K3 KDA RecoverSSM speculative state verification"},
-    {"pr": 21550, "summary": "Step-5 Triton swiglustep clamped-SwiGLU kernel"},
-    {"pr": 21568, "summary": "Qwen GDN RecoverSSM Triton kernels (Part 1)"},
-    {"pr": 21588, "summary": "GLM-5.3-Flash NoPE C16 cann_ops_transformer.sparse_flash_mla"},
-    {"pr": 21751, "summary": "Qwen4Exp pinned host UVA AscendPLEHostEmbedding (BF16/INT8/MXFP8)"},
-    {"pr": 21771, "summary": "Qwen4Exp weight-free QSA native cann_ops_transformer.lightning_indexer"},
-    {"pr": 21941, "summary": "Kimi-K3 KDA TPxPCP sharding (supersedes #21017)"},
-    {"pr": 22048, "summary": "GLM-5.3-Flash chunk_kda(use_qk_l2norm_in_kernel=True)"}
+    {
+      "pr": 15851,
+      "summary": "Kimi-K3 5L GQA DSpark dcp_sharded=False"
+    },
+    {
+      "pr": 20167,
+      "summary": "MiniMax-M3 7-token dense DSpark drafter adapter"
+    },
+    {
+      "pr": 20756,
+      "summary": "Qwen3.5/3.6/3.8-27B dense FlashComm sequence parallelism"
+    },
+    {
+      "pr": 20946,
+      "summary": "AscendStep5ForCausalLM, Step5 CSA region score, and 3L NextN MTP"
+    },
+    {
+      "pr": 21510,
+      "summary": "GLM-5.3-Flash KDA TPxPCP head/context sharding"
+    },
+    {
+      "pr": 21549,
+      "summary": "Kimi-K3 KDA RecoverSSM speculative state verification"
+    },
+    {
+      "pr": 21550,
+      "summary": "Step-5 Triton swiglustep clamped-SwiGLU kernel"
+    },
+    {
+      "pr": 21568,
+      "summary": "Qwen GDN RecoverSSM Triton kernels (Part 1)"
+    },
+    {
+      "pr": 21588,
+      "summary": "GLM-5.3-Flash NoPE C16 cann_ops_transformer.sparse_flash_mla"
+    },
+    {
+      "pr": 21751,
+      "summary": "Qwen4Exp pinned host UVA AscendPLEHostEmbedding (BF16/INT8/MXFP8)"
+    },
+    {
+      "pr": 21771,
+      "summary": "Qwen4Exp weight-free QSA native cann_ops_transformer.lightning_indexer"
+    },
+    {
+      "pr": 21941,
+      "summary": "Kimi-K3 KDA TPxPCP sharding (supersedes #21017)"
+    },
+    {
+      "pr": 22048,
+      "summary": "GLM-5.3-Flash chunk_kda(use_qk_l2norm_in_kernel=True)"
+    }
   ],
   "bindings": [
     {
       "mechanism_id": "aclgraph_decode_capture",
       "state": "merged",
-      "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
       "notes": "FULL_DECODE_ONLY and FULL_AND_PIECEWISE NPUGraph capture across vLLM-Ascend LLM/VLM models",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/platform.py",
         "source_sha256": "75e8784f57fd5125ee29dd3407dab8b0cf43bf6532104fe5a89540bf7df41ddf"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "aclgraph_decode_capture",
+      "capability_predicates": [
+        "workload_domain in ('llm', 'vlm')"
+      ],
+      "phase_scope": [
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "sequence_parallel",
       "state": "merged",
-      "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
       "notes": "TP sequence parallelism including merged #20756 FlashComm dense SP for Qwen3.5/3.6/3.8-27B",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/patch/worker/patch_qwen3_5.py",
         "source_sha256": "399b34cbe264ab2c2599c5390ad594e90f9b172125fec13decd87601ea20678e"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "sequence_parallel_sharding",
+      "capability_predicates": [
+        "tp > 1"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "add_rmsnorm_quant_fusion",
       "state": "merged",
-      "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
       "notes": "AddRMSNormQuantPass and NormQuantFusionPass including A5 DYNAMIC_MX_QUANT_FUSION",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/compilation/passes/norm_quant_fusion_pass.py",
         "source_sha256": "519038f25a5be25a1acf3cc784245036c700fb9771fa8d8fc5054d3c2bb6fa04"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "norm_quant_fusion",
+      "capability_predicates": [
+        "has_quant_activation"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "mla_prolog_fusion",
       "state": "merged",
-      "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
       "notes": "MlaPrologV3/V4WeightNz native MXFP8/INT8/BF16 prolog fusion",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/attention/mla_v1.py",
         "source_sha256": "f7f672e001651a748d2e88ef0f36797ef78db63321ac657f1c7a944c0f561c22"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "mla_prolog_v3_fusion",
+      "capability_predicates": [
+        "has_mla",
+        "qk_rope_head_dim > 0",
+        "not mla_use_nope",
+        "not mla_qkv_a_gate_fused"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "attn_res_prefix_fusion",
       "state": "merged",
-      "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
       "notes": "Block Attention Residuals prefix kernel (Kimi-K3 family)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/models/kimi_k3/kimi_k3.py",
         "source_sha256": "aa666ec743d3c8cd10d58196be9e05d0606aa4ca89d14a94f327a75c9fd44613"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "attn_res_prefix_fusion",
+      "capability_predicates": [
+        "has_attn_res"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "recurrent_decode_native_kernels",
       "state": "merged",
-      "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
       "notes": "Arch22/Arch35 recurrent_gated_delta_rule & recurrent_kda (+ merged #21510, #21549, #21568, #21941)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/gdn.py",
         "source_sha256": "b170b30626cf46bc4ec1e47080f9487c1e5443e51add42bb8c67bfd20a79fac4"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "recurrent_decode_native",
+      "capability_predicates": [
+        "has_recurrent"
+      ],
+      "phase_scope": [
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "kda_recoverssm_shipping",
       "state": "merged",
       "ref": "vllm-project/vllm-ascend#21549",
-      "models": ["kimi-k3", "kimi-k3.1"],
       "notes": "Kimi-K3/K3.1 KDA RecoverSSM speculative state verification merged with DSpark",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/triton/kda/recoverssm.py",
-        "source_sha256": "af37687463f9b34ca4797bdcefb14c333d3b70b2956d6aa1f15217815d5fbc10"
-      }
+        "source_sha256": "7db140838acc15653aa73cc9df1bdb8e0452545caf6ab583401565fa8d0a6252"
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "kda_recoverssm_verify",
+      "capability_predicates": [
+        "has_kda",
+        "speculative_k > 0"
+      ],
+      "phase_scope": [
+        "decode"
+      ]
     },
     {
       "mechanism_id": "gdn_chunk64_prefill",
       "state": "merged",
       "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
-      "archs": ["a5"],
+      "archs": [
+        "a5"
+      ],
       "notes": "FLA_GDN_PREFILL Chunk64(use_exp2=True) merged on A5 for Hv/Hk in {1,2,3,4}",
       "provenance": {
         "repository": "flash-linear-attention-npu-a5",
         "revision": "26.10.0+feature",
         "relative_path": "fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/dynamic/chunk_gated_delta_rule_fwd.py",
         "source_sha256": "524967882b658fd57b7d5516deb518314fe231a2877885cf38d47d874db4dbb5"
-      }
+      },
+      "provenance_scope": "external_package_snapshot",
+      "lowering_pass_id": "gdn_chunk64_prefill",
+      "capability_predicates": [
+        "has_gdn",
+        "gdn_hv_hk_ratio in (1, 2, 3, 4)"
+      ],
+      "phase_scope": [
+        "prefill",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "cann_megamoe_fusion",
       "state": "merged",
-      "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
-      "archs": ["a5"],
-      "options": {"enable_fused_mc2": 3},
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+      "archs": [
+        "a5"
+      ],
+      "options": {
+        "enable_fused_mc2": 3
+      },
       "notes": "CANN_MEGAMOE + CANN_MEGAMOE_MXFP + CANN_MEGAMOE_SHARED_EXPERT_FUSION (enable_fused_mc2=3) merged structurally on A5 MXFP MoE models",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/fused_moe/moe_mlp.py",
         "source_sha256": "7882f9d0847e0303c78f2b216cfc50da9d3d062d6bd6f0cd22c94d1c7e78af0e"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "megamoe_shared_mxfp_a5",
+      "capability_predicates": [
+        "has_moe",
+        "ep > 1",
+        "has_mxfp_weights",
+        "ffn_activation != 'situ'"
+      ],
+      "phase_scope": [
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "kda_in_kernel_l2norm",
       "state": "merged",
-      "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
-      "models": ["glm-5.3-flash"],
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
       "notes": "PR #22048 merged for GLM-5.3-Flash (ops/kda.py passes use_qk_l2norm_in_kernel=True)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/kda.py",
         "source_sha256": "db94b9d9c2a11d3d7d6fcc0e4619328b01deb74f486f74787a6fd28805fa2a4c"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "kda_in_kernel_l2norm",
+      "capability_predicates": [
+        "has_kda",
+        "has_mhc_sinkhorn"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "qkv_norm_rope_fusion",
       "state": "merged",
-      "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
-      "archs": ["a2", "a3"],
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+      "archs": [
+        "a2",
+        "a3"
+      ],
       "notes": "GRAPH_QKV_NORM_ROPE_FUSION FX pass active on A2/A3",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/device/hardware_profile.py",
         "source_sha256": "1a881d2d4b2d302c2958740927f89a09c3388f4e1bfac27afdc99616ea17d63e"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "qkv_norm_rope",
+      "capability_predicates": [
+        "has_gqa or has_gdn"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "qkv_norm_rope_fusion",
       "state": "merged",
-      "ref": "vllm-project/vllm-ascend@405617bae227fe5b097ff163efaa60bb7f22c698",
-      "archs": ["a5"],
-      "models": [
-        "qwen3.5-27b", "qwen3.6-27b", "qwen3.8-27b", "qwen3.5-35b-a3b", "qwen3.6-35b-a3b",
-        "qwen3.5-397b-a17b", "qwen3-next-80b-a3b", "qwen3.8-2.4t-a95b", "qwen3.5-moe",
-        "minimax-m3", "minimax-m3.1-flash", "step-5-preview"
+      "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+      "archs": [
+        "a5"
       ],
       "notes": "Direct model-level Triton QKNorm+RoPE calls on A5",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/patch/worker/patch_qwen3_5.py",
         "source_sha256": "399b34cbe264ab2c2599c5390ad594e90f9b172125fec13decd87601ea20678e"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "qkv_norm_rope_triton",
+      "capability_predicates": [
+        "has_gqa or has_gdn"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "gdn_chunk32_prefill",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22147",
-      "archs": ["a5"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Switch A5 GDN prefill to fla-npu Chunk32 (Hv/Hk in {1,2,3,4})",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "57de212f6a",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/gdn.py",
         "source_sha256": "b170b30626cf46bc4ec1e47080f9487c1e5443e51add42bb8c67bfd20a79fac4"
-      }
+      },
+      "upstream_pr_revision": "57de212f6a",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "gdn_chunk32_prefill",
+      "capability_predicates": [
+        "has_gdn",
+        "gdn_hv_hk_ratio in (1, 2, 3, 4)"
+      ],
+      "phase_scope": [
+        "prefill",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "cann_megamoe_fusion",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22333",
-      "archs": ["a5"],
-      "models": ["kimi-k3", "kimi-k3.1"],
-      "options": {"enable_fused_mc2": 2},
+      "archs": [
+        "a5"
+      ],
+      "options": {
+        "enable_fused_mc2": 2
+      },
       "notes": "Fix packed MXFP4 uint8 validation in MegaMoE(activation=situglu, enable_fused_mc2=2) on A5",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "a45c664d76",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/fused_moe/moe_mlp.py",
         "source_sha256": "7882f9d0847e0303c78f2b216cfc50da9d3d062d6bd6f0cd22c94d1c7e78af0e"
-      }
+      },
+      "upstream_pr_revision": "a45c664d76",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "megamoe_routed_situ_packed",
+      "capability_predicates": [
+        "has_moe",
+        "ep > 1",
+        "ffn_activation == 'situ'",
+        "has_fp4_or_w4a8_experts"
+      ],
+      "phase_scope": [
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "unit_offset_rmsnorm_fusion",
@@ -269,171 +481,317 @@
       "notes": "Pre-fold (1+w) GemmaRMSNorm gamma at load time structurally across all unit-offset RMSNorm models",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "bbf28393cc",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/layernorm.py",
         "source_sha256": "5d23daa6eba43ddcefcb7ef79a1a2894e3d38a90d9c02ddfe9120f88e8ef745d"
-      }
+      },
+      "upstream_pr_revision": "bbf28393cc",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "unit_offset_rmsnorm_prefold",
+      "capability_predicates": [
+        "has_unit_offset_rmsnorm"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "mhc_boundary_fusion_overlap",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22142",
-      "models": ["deepseek-v4.1-flash"],
       "notes": "Fuse DSV4.1 mhc_post_collapse_norm (<=72 rows) and overlap HcPreCoefficients with MoE",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "09d2eaea4d",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/models/deepseek_v41/model.py",
         "source_sha256": "1006ded6d3c5b394299bdabb7619752198adbd6ab3612c058ef3659bbf9e24c0"
-      }
+      },
+      "upstream_pr_revision": "09d2eaea4d",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "mhc_boundary_pr",
+      "capability_predicates": [
+        "has_mhc_sinkhorn"
+      ],
+      "phase_scope": [
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "mhc_boundary_fusion_overlap",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#20824",
-      "models": ["qwen3.8-flash-next"],
       "notes": "Overlap Qwen4Exp low-rank HC injection on auxiliary stream (+ #21901 retiled Triton fallback)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "f7f43a0cec",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/triton/qwen4_exp/hc.py",
         "source_sha256": "28c6c8c6f26ff6c92023334eaed86d3c8606200dd27a67446cef1d624a0c1f91"
-      }
+      },
+      "upstream_pr_revision": "f7f43a0cec",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "low_rank_hc_aux_overlap",
+      "capability_predicates": [
+        "has_low_rank_hc"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "text_gated_residual_fusion",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#21794",
-      "archs": ["a5"],
-      "models": ["qwen3.8-flash-next"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Replace 5-op Triton Low-Rank HC chain with CANN 9.3 cann_ops_transformer.text_gated_residual",
       "provenance": {
         "repository": "cann_ops_transformer",
         "revision": "1.0.0",
         "relative_path": "cann_ops_transformer/ops/mhc/text_gated_residual/text_gated_residual.py",
         "source_sha256": "8c3fde722b28617b1eebd12411ee19358cf2c1bb529e9e58741043f39318c9ca"
-      }
+      },
+      "provenance_scope": "external_package_snapshot",
+      "lowering_pass_id": "text_gated_residual_fusion",
+      "capability_predicates": [
+        "has_low_rank_hc"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "qsa_gbsa_prologue_fusion",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22365",
-      "archs": ["a5"],
-      "models": ["qwen3.8-flash-next"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Port of #21820 (#22372..#22377) + #22351 MXFP8 GBSA + #22278 INT8 GBSA + #21627 union GBSA prefill + #21693 PCP",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "664a884ded",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/models/qwen4_exp/qsa.py",
         "source_sha256": "f4881d5e8b3574a39509700eea4b430d357bb7c7e310cf94331953c9cd2069f0"
-      }
+      },
+      "upstream_pr_revision": "664a884ded",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "qsa_gbsa_prologue_fusion",
+      "capability_predicates": [
+        "has_qsa_indexed_gbsa"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "kv_quant_sfa_scale_precompute",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22467",
-      "archs": ["a5"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Precompute A5 C8 FP8 scale addresses structurally for all indexed MLA/SFA models",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "1b33178393",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/attention/sfa_v1.py",
         "source_sha256": "058aeb723a4ef3cdb0e07a5fc0180ec53f8227f62d98710144ecffb9cc66678f"
-      }
+      },
+      "upstream_pr_revision": "1b33178393",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "sfa_fp8_addr_precompute",
+      "capability_predicates": [
+        "has_sfa_packed_fp8_kv"
+      ],
+      "phase_scope": [
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "msa_index_score_v2_topk",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22235",
-      "archs": ["a5"],
-      "models": ["minimax-m3", "minimax-m3.1-flash"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Enable return_choice=1 in-kernel TopK in CANN 9.3 msa_index_score_v2",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "a49b2d6758",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/models/minimax_m3/msa_m3.py",
         "source_sha256": "44a6db287b70eaff21f0a46c428ff6dad7abeaf70963af0283cd529682b0edc7"
-      }
+      },
+      "upstream_pr_revision": "a49b2d6758",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "msa_index_score_v2_topk",
+      "capability_predicates": [
+        "has_msa_gbsa"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "torch_compile_support",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22342",
-      "models": ["step-5-preview"],
       "notes": "Remove do_not_compile=True on AscendStep5Model, unlocking npugraph_ex FX passes",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "1921c8c1a1",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/models/step5/model.py",
         "source_sha256": "193afc949e580505e5a7e1e48110d12efd58cbc911c60ad4f1692e107637c36e"
-      }
+      },
+      "upstream_pr_revision": "1921c8c1a1",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "unlock_torch_compile_fx",
+      "capability_predicates": [
+        "not supports_torch_compile"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "fp32_residual_norm_fusion",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22336",
-      "models": ["step-5-preview"],
       "notes": "Fuse Step-5 FP32 residual accumulate + (1+w) RMSNorm + BF16 cast",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "9656f0535a",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/models/step5/model.py",
         "source_sha256": "193afc949e580505e5a7e1e48110d12efd58cbc911c60ad4f1692e107637c36e"
-      }
+      },
+      "upstream_pr_revision": "9656f0535a",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "fp32_residual_norm_fusion",
+      "capability_predicates": [
+        "has_fp32_residual_norm"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
-      "mechanism_id": "step5_qkvg_indexer_fusion",
+      "mechanism_id": "region_gbsa_qkvg_indexer_fusion",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22401",
-      "archs": ["a5"],
-      "models": ["step-5-preview"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Packed SWA qkvg + Triton indexer_qkz_norm_rope + CANN 9.3 FA3",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "e9f6ae7b4c",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/models/step5/sparse_attention.py",
         "source_sha256": "3fabfbd4f115f296472d9c567fec4d243587611dc503cdad2e32b819f4aef4a6"
-      }
+      },
+      "upstream_pr_revision": "e9f6ae7b4c",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "region_gbsa_qkvg_indexer_fusion",
+      "capability_predicates": [
+        "has_region_gbsa_indexer"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "tp_mc2_overlap",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22385",
-      "archs": ["a5"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Dense MLP & MoE TP MC2 AllGatherMatmulV2 + MatmulReduceScatterV2 structurally on TP>1",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "2ed6a1dc5b",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/compilation/passes/mm_reduce_scatter_fusion_pass.py",
         "source_sha256": "5e67e099d20e82ef9490ada2f3c29abafa61dc25f5daa73d1c45ad186773903f"
-      }
+      },
+      "upstream_pr_revision": "2ed6a1dc5b",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "mm_reduce_scatter_fusion",
+      "capability_predicates": [
+        "tp > 1",
+        "sp_enabled"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "dspark_static_kernel_allowlist",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22184",
-      "archs": ["a5"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Add dspark to enable_static_kernel speculative method allowlist in platform.py",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "faf0e92410",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/platform.py",
         "source_sha256": "75e8784f57fd5125ee29dd3407dab8b0cf43bf6532104fe5a89540bf7df41ddf"
-      }
+      },
+      "upstream_pr_revision": "faf0e92410",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "dspark_static_kernel_allowlist",
+      "capability_predicates": [
+        "has_dspark_draft"
+      ],
+      "phase_scope": [
+        "decode"
+      ]
     },
     {
-      "mechanism_id": "dsv41_indexer_epilogue_fusion",
+      "mechanism_id": "csa2_indexer_epilogue_fusion",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#21830",
-      "archs": ["a5"],
-      "models": ["deepseek-v4.1-flash"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Fused dsv41_indexer_prologue (#21830), dsv41_attn_epilogue (#21826), Engram overlap (#22328)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "cd12a9c7f4",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/models/deepseek_v41/indexer.py",
         "source_sha256": "45ec4290a41c25497d3cadfdb40c7466b5a40ae467a76200d82d4fa34b15fa02"
-      }
+      },
+      "upstream_pr_revision": "cd12a9c7f4",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "csa2_indexer_qw_prologue",
+      "capability_predicates": [
+        "has_csa2_compressed_indexer"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "gdn_strided_gate_zero_copy",
@@ -442,10 +800,21 @@
       "notes": "Consume strided b/a views directly in Triton fused_gdn_gating without slice copies",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "989bf2c2bb",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/gdn.py",
         "source_sha256": "b170b30626cf46bc4ec1e47080f9487c1e5443e51add42bb8c67bfd20a79fac4"
-      }
+      },
+      "upstream_pr_revision": "989bf2c2bb",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "gdn_strided_gate_zero_copy",
+      "capability_predicates": [
+        "has_gdn"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "gdn_projection_multistream_overlap",
@@ -454,87 +823,123 @@
       "notes": "Overlap GDN in_proj_ba on auxiliary NPU stream with in_proj_qkvz during ACLGraph decode",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "12f1e61127",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/gdn.py",
         "source_sha256": "b170b30626cf46bc4ec1e47080f9487c1e5443e51add42bb8c67bfd20a79fac4"
-      }
+      },
+      "upstream_pr_revision": "12f1e61127",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "gdn_projection_overlap",
+      "capability_predicates": [
+        "has_gdn"
+      ],
+      "phase_scope": [
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "in_kernel_gdn_decode_gate",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#21720",
-      "archs": ["a5"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Fold GDN gating & Q/K L2Norm into recurrent_gated_delta_rule (#21720)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "0c04ed50e3",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/gdn.py",
         "source_sha256": "b170b30626cf46bc4ec1e47080f9487c1e5443e51add42bb8c67bfd20a79fac4"
-      }
+      },
+      "upstream_pr_revision": "0c04ed50e3",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "in_kernel_gdn_decode_gate",
+      "capability_predicates": [
+        "has_gdn"
+      ],
+      "phase_scope": [
+        "decode"
+      ]
     },
     {
-      "mechanism_id": "kda_in_kernel_l2norm",
-      "state": "unmerged_pr",
-      "ref": "vllm-project/vllm-ascend#22048",
-      "notes": "Enable use_qk_l2norm_in_kernel=True structurally across all KDA prefill models",
-      "provenance": {
-        "repository": "vllm-project/vllm-ascend",
-        "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
-        "relative_path": "vllm_ascend/ops/kimi_kda.py",
-        "source_sha256": "af37687463f9b34ca4797bdcefb14c333d3b70b2956d6aa1f15217815d5fbc10"
-      }
-    },
-    {
-      "mechanism_id": "fused_recover_ssm",
-      "state": "unmerged_pr",
-      "ref": "vllm-project/vllm-ascend#22045",
-      "notes": "End-to-end --use-replayssm GDN Part 2 (#22045) and colocated PCP KDA RecoverSSM (#22146)",
-      "provenance": {
-        "repository": "vllm-project/vllm-ascend",
-        "revision": "fb1826af03",
-        "relative_path": "vllm_ascend/ops/gdn.py",
-        "source_sha256": "b170b30626cf46bc4ec1e47080f9487c1e5443e51add42bb8c67bfd20a79fac4"
-      }
-    },
-    {
-      "mechanism_id": "kimi_dspark_c8_mla",
+      "mechanism_id": "latent_moe_dspark_c8_mla",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22115",
-      "archs": ["a5"],
-      "models": ["kimi-k3", "kimi-k3.1"],
+      "archs": [
+        "a5"
+      ],
       "notes": "5L MLA DSpark C8 QuantFlashMLA (#22115), Latent-MoE norm+quant overlap (#22450), KDA decode gate fusion (#22346)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "2f91831ee2",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/models/kimi_k3/kimi_k3_dspark.py",
         "source_sha256": "6af8077aab72054aca0df8d3dd97e1ece568acd4c32976015e30b9f61f0a63d6"
-      }
+      },
+      "upstream_pr_revision": "2f91831ee2",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "dspark_mla_c8_quant_mla",
+      "capability_predicates": [
+        "has_dspark_mla_draft"
+      ],
+      "phase_scope": [
+        "decode"
+      ]
     },
     {
       "mechanism_id": "keypool_int8_indexer",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22191",
-      "archs": ["a5"],
+      "archs": [
+        "a5"
+      ],
       "notes": "Dynamic INT8 quant_mode=2 pool_key_indexer structurally on all keypool MLA models",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "46b9d6c1d8",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/cann_keypool.py",
         "source_sha256": "5deb787e94c4b31f5246747778b2bbe3a9c69447b2ca9701c90b500c0da94696"
-      }
+      },
+      "upstream_pr_revision": "46b9d6c1d8",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "keypool_int8_indexer_quant",
+      "capability_predicates": [
+        "has_kpool_indexer"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "activation_quant_fusion",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#21543",
-      "archs": ["a2", "a3"],
+      "archs": [
+        "a2",
+        "a3"
+      ],
       "notes": "Triton INT8 swiglu_quantize fusion scoped strictly to A2/A3",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "4c0c1d30c0",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/activation.py",
         "source_sha256": "ade25ace4722c1ae01c684fc914135c2ef6bbd901958afa5e83614d86e30271d"
-      }
+      },
+      "upstream_pr_revision": "4c0c1d30c0",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "activation_quant",
+      "capability_predicates": [
+        "has_moe",
+        "ffn_activation in ('silu', 'swiglu')",
+        "has_quant_activation"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "moe_tail_residual_fusion",
@@ -543,23 +948,47 @@
       "notes": "3-way shared+routed+residual combine eliminating ForeachAddList launch",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "405617bae227fe5b097ff163efaa60bb7f22c698",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/fused_moe/moe_mlp.py",
         "source_sha256": "7882f9d0847e0303c78f2b216cfc50da9d3d062d6bd6f0cd22c94d1c7e78af0e"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "moe_tail_residual",
+      "capability_predicates": [
+        "has_moe",
+        "has_shared_expert"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "shared_expert_multistream_overlap",
       "state": "unmerged_pr",
       "ref": "vllm-project/vllm-ascend#22128",
-      "archs": ["a3"],
+      "archs": [
+        "a3"
+      ],
       "notes": "A3 W4A8 INT MegaMoE shared-expert fusion only (A5 MXFP enable_fused_mc2=3 is already merged)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
-        "revision": "fbeab2eb9a",
+        "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/fused_moe/moe_mlp.py",
         "source_sha256": "7882f9d0847e0303c78f2b216cfc50da9d3d062d6bd6f0cd22c94d1c7e78af0e"
-      }
+      },
+      "upstream_pr_revision": "fbeab2eb9a",
+      "provenance_scope": "baseline_anchor_pr_revision_unreachable",
+      "lowering_pass_id": "megamoe_shared_w4a8_a3",
+      "capability_predicates": [
+        "has_shared_expert",
+        "has_w4a8_experts"
+      ],
+      "phase_scope": [
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "universal_dcp_query_gather",
@@ -571,7 +1000,17 @@
         "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/attention/context_parallel/mla_cp.py",
         "source_sha256": "10c820fc90a228efa8088c8e5e37ddef8621e8625c2fdfdca9c892e59d71f55c"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "universal_dcp_query_gather",
+      "capability_predicates": [
+        "dcp > 1",
+        "has_mla"
+      ],
+      "phase_scope": [
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "local_projection_tp",
@@ -583,7 +1022,17 @@
         "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/distributed/parallel_state.py",
         "source_sha256": "308d7e59d02673a8c2fd44c8539f70396e69c08085d8104d4ce569bd1265dbce"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "local_projection_tp",
+      "capability_predicates": [
+        "tp > 1"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "pcp_decode_request_sharding",
@@ -595,7 +1044,17 @@
         "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/attention/context_parallel/common_cp.py",
         "source_sha256": "e20eaa698b825c24a9ab37f83870391d944aef7d57fa7e6d680db0c306cc5f65"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "pcp_decode_request_sharding",
+      "capability_predicates": [
+        "pcp > 1",
+        "dcp == 1"
+      ],
+      "phase_scope": [
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "kda_pcp_head_sharding",
@@ -607,7 +1066,18 @@
         "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/ops/kda_pcp.py",
         "source_sha256": "16e66eb6fecb95de2d1bf252046fb2090659078ffd58fe55dfcf6272cfdff47b"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "kda_pcp_head_sharding",
+      "capability_predicates": [
+        "has_kda",
+        "pcp > 1"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "dsv41_pcp_c2_ring_gather",
@@ -619,7 +1089,17 @@
         "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/attention/context_parallel/dsa_v41_cp.py",
         "source_sha256": "c1fc6cfbdf9d151ff0587709a3a448ec434025dc78c23bf3956b8954f8cfdb14"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "csa2_pcp_ring_gather",
+      "capability_predicates": [
+        "has_csa2_compressed_indexer",
+        "pcp > 1"
+      ],
+      "phase_scope": [
+        "prefill",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "sfa_dcp_sharded_indexer",
@@ -631,7 +1111,18 @@
         "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/attention/context_parallel/sharded_indexer.py",
         "source_sha256": "0a7e01b3006d277090e3589253596a6bc2c46e437cae3503d463d29564dfc54d"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "sfa_dcp_sharded_indexer",
+      "capability_predicates": [
+        "has_mla_indexer",
+        "dcp > 1"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "pcp_o_proj_weight_sharding",
@@ -643,7 +1134,17 @@
         "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/attention/context_parallel/dsa_cp.py",
         "source_sha256": "0b1bbc0201c63441f1a163ce8d4a59edd4079202b2f5b3ce09d31ec9015185c5"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "pcp_o_proj_weight_sharding",
+      "capability_predicates": [
+        "pcp > 1"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "pcp_w8a8_quantized_allgather",
@@ -655,20 +1156,44 @@
         "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/attention/context_parallel/common_cp.py",
         "source_sha256": "e20eaa698b825c24a9ab37f83870391d944aef7d57fa7e6d680db0c306cc5f65"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "pcp_w8a8_quantized_allgather",
+      "capability_predicates": [
+        "pcp > 1",
+        "has_quant_activation"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     },
     {
       "mechanism_id": "quantized_allreduce",
       "state": "merged",
       "ref": "vllm-project/vllm-ascend@0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
-      "archs": ["a2"],
+      "archs": [
+        "a2"
+      ],
       "notes": "Opt-in INT8 quantized TP AllReduce on A2 (BF16, 2<=TP<=8, >=16,777,216 elements)",
       "provenance": {
         "repository": "vllm-project/vllm-ascend",
         "revision": "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
         "relative_path": "vllm_ascend/distributed/device_communicators/quantized_all_reduce.py",
         "source_sha256": "d59bd4cd53418ae508ee6983401f9195bb3c4f5bc1f4d560e138da472922b8a8"
-      }
+      },
+      "provenance_scope": "verified_mounted_baseline",
+      "lowering_pass_id": "quantized_allreduce_a2",
+      "capability_predicates": [
+        "tp >= 2",
+        "tp <= 8"
+      ],
+      "phase_scope": [
+        "prefill",
+        "decode",
+        "mixed"
+      ]
     }
   ]
 }

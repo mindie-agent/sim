@@ -144,6 +144,38 @@ def _reconcile_injected_contracts(
     return eff_scenario, eff_quant, eff_lowering
 
 
+_STACK_PASS_TO_TRANSFORM_PASSES: dict[str, tuple[str, ...]] = {
+    "norm_quant_fusion": ("norm_quant", "residual_norm"),
+    "mm_reduce_scatter_fusion": ("tp_mc2_overlap",),
+    "add_rmsnorm_quant_fusion": ("norm_quant", "residual_norm"),
+}
+
+
+def _map_executable_lowering_passes(
+    existing_passes: tuple[str, ...],
+    stack_passes: tuple[str, ...],
+    *,
+    excluded: frozenset[str] = frozenset(),
+) -> tuple[str, ...]:
+    from mindie_sim.prediction.transforms import LOWERING_PASSES
+
+    excluded_mapped: set[str] = set(excluded)
+    for ex in excluded:
+        excluded_mapped.update(_STACK_PASS_TO_TRANSFORM_PASSES.get(ex, ()))
+    out: list[str] = list(existing_passes)
+    for name in stack_passes:
+        if name in excluded:
+            continue
+        if name in LOWERING_PASSES:
+            if name not in excluded_mapped and name not in out:
+                out.append(name)
+        elif name in _STACK_PASS_TO_TRANSFORM_PASSES:
+            for mapped in _STACK_PASS_TO_TRANSFORM_PASSES[name]:
+                if mapped in LOWERING_PASSES and mapped not in excluded_mapped and mapped not in out:
+                    out.append(mapped)
+    return tuple(out)
+
+
 def _build_injected_base(
     case: Case,
     request: LoweringRequest,
@@ -152,22 +184,98 @@ def _build_injected_base(
     runtime_quant_plan: RuntimeQuantPlan | None,
     stack_lowering_plan: StackLoweringPlan,
 ) -> ResolvedBase:
+    from mindie_sim.prediction.implementation_selection import (
+        ALLOWED_BINDING_ORIGINS,
+        RECIPE_BINDING_ORIGINS_KEY,
+        record_binding_origin,
+    )
+    from mindie_sim.prediction.program.implementation_registry import IMPLEMENTATIONS
+
     kernels = deepcopy(dict(case.runtime.kernels))
     meta = deepcopy(dict(case.runtime.metadata))
     layouts = deepcopy(dict(case.runtime.tensor_layouts))
     lowerings = dict(kernels.get("lowerings") or {})
-    for selector, recipe_id, _opts in stack_lowering_plan.recipe_bindings:
-        lowerings[selector] = recipe_id
+    selector_remap: dict[str, str] = {}
+    for selector, recipe_id, opts in stack_lowering_plan.recipe_bindings:
+        opts_dict = dict(opts) if opts else {}
+        impl = IMPLEMENTATIONS.get(recipe_id)
+        if impl is None:
+            if recipe_id == "vllm_ascend_mlapo_decode":
+                add_cfg = dict(meta.get("additional_config") or {})
+                add_cfg["enable_mlapo"] = True
+                meta["additional_config"] = add_cfg
+            elif recipe_id == "cann_megamoe_fusion" and "enable_fused_mc2" in opts_dict:
+                add_cfg = dict(meta.get("additional_config") or {})
+                add_cfg["enable_fused_mc2"] = int(opts_dict["enable_fused_mc2"])
+                meta["additional_config"] = add_cfg
+            continue
+        if selector in impl.blocks or selector in impl.operators:
+            canon_selector = selector
+        elif impl.blocks:
+            canon_selector = impl.blocks[0]
+        elif impl.operators:
+            canon_selector = impl.operators[0]
+        else:
+            continue
+        selector_remap[selector] = canon_selector
+        filtered_opts = {k: v for k, v in opts_dict.items() if k in impl.options}
+        existing = lowerings.get(canon_selector)
+        if isinstance(existing, Mapping) and "cases" in existing:
+            continue
+        if isinstance(existing, Mapping) and existing.get("implementation") == recipe_id:
+            merged_opts = dict(existing.get("options") or {})
+            merged_opts.update(filtered_opts)
+            lowerings[canon_selector] = (
+                {"implementation": recipe_id, "options": merged_opts}
+                if merged_opts else recipe_id
+            )
+        else:
+            lowerings[canon_selector] = (
+                {"implementation": recipe_id, "options": filtered_opts}
+                if filtered_opts else recipe_id
+            )
     if lowerings:
         kernels["lowerings"] = lowerings
     for scope_key, role_key, layout_name in stack_lowering_plan.tensor_layouts:
         layouts[f"{scope_key}.{role_key}" if scope_key else role_key] = layout_name
+
+    origins: list[tuple[str, OriginKind]] = []
+    meta.setdefault(RECIPE_BINDING_ORIGINS_KEY, {})
+    for key, origin in stack_lowering_plan.binding_origins:
+        if origin not in ALLOWED_BINDING_ORIGINS:
+            raise ModelingError(
+                f"spine_binding_origin_invalid:{key}:{origin!r}:allowed={sorted(ALLOWED_BINDING_ORIGINS)}"
+            )
+        origins.append((key, origin))  # type: ignore[arg-type]
+        if "." in key:
+            section, name = key.split(".", 1)
+        else:
+            section, name = "lowerings", selector_remap.get(key, key)
+        meta = record_binding_origin(meta, section, name, origin)
+
     rt_updates: dict[str, Any] = {
         "kernels": kernels,
         "tensor_layouts": layouts,
     }
     if stack_lowering_plan.lowering_passes:
-        rt_updates["lowering_passes"] = stack_lowering_plan.lowering_passes
+        ss_meta = meta.get("single_spine")
+        ci_meta = ss_meta.get("contract_inputs") if isinstance(ss_meta, Mapping) else None
+        req_ci = ci_meta.get("requested_options") if isinstance(ci_meta, Mapping) else None
+        excluded_opt = frozenset(
+            str(x).strip()
+            for x in (
+                (req_ci.get("exclude_optimizations") if isinstance(req_ci, Mapping) else None)
+                or ()
+            )
+            if str(x).strip()
+        )
+        exec_passes = _map_executable_lowering_passes(
+            tuple(case.runtime.lowering_passes),
+            tuple(stack_lowering_plan.lowering_passes),
+            excluded=excluded_opt,
+        )
+        if exec_passes:
+            rt_updates["lowering_passes"] = exec_passes
     cap_rule = stack_lowering_plan.scheduling.capture_bucket_rule
     if cap_rule is not None:
         graph_mode, raw_mode = _CAPTURE_MODE_TO_CASE[cap_rule.mode]
@@ -179,10 +287,6 @@ def _build_injected_base(
         meta["captured_execution_mode"] = raw_mode
     rt_updates["metadata"] = tuple(sorted(meta.items()))
     working = replace(case, runtime=replace(case.runtime, **rt_updates))
-    origins: list[tuple[str, OriginKind]] = []
-    for key, origin in stack_lowering_plan.binding_origins:
-        label = origin if origin in {"caller", "stack_profile", "body_default"} else "stack_profile"
-        origins.append((key, label))  # type: ignore[arg-type]
     eff_req = replace(
         request,
         scenario_contract=scenario_contract,
@@ -318,8 +422,11 @@ class PredictionSpine:
         width = p.tp * p.pcp
         start = (int(replica) * p.pp + int(stage)) * width
         dies = case.machine.dies[start : start + width]
-        if not dies:
-            dies = case.machine.dies[:1]
+        if start < 0 or start + width > len(case.machine.dies) or not dies:
+            raise ModelingError(
+                f"stage_geometry_dies_out_of_range:replica={replica}:stage={stage}:"
+                f"start={start}:width={width}:available={len(case.machine.dies)}"
+            )
         return Geometry.from_devices(
             dies,
             links=case.machine.links,
@@ -845,34 +952,79 @@ class PredictionSpine:
         from mindie_sim.sweep.engine import compute_pareto_frontier
 
         if request.mode == "pd":
-            total_dies = (
-                int(request.device_counts[0])
-                if request.device_counts else max(len(case.machine.dies), DEFAULT_PD_TOTAL_DIES)
+            budgets = (
+                tuple(int(d) for d in request.device_counts)
+                if request.device_counts
+                else (max(len(case.machine.dies), DEFAULT_PD_TOTAL_DIES),)
             )
-            report = sweep_pd_disaggregation_ratios(
-                case,
-                decode_case or case,
-                total_dies=total_dies,
-                prompt_tokens=max(1, request.sla.step.context or request.sla.step.tokens),
-                output_tokens=max(1, request.sla.output_budget),
-                tpot_sla_ms=request.sla.latency_ms,
-            )
-            all_rows = report.get("candidates", ())
-            front_rows = report.get("pareto_frontier", ())
+            prompt_toks = max(1, request.sla.step.context or request.sla.step.tokens)
+            output_toks = max(1, request.sla.output_budget)
+            total_evaluated = 0
+            combined_rows: list[dict[str, Any]] = []
+            for budget in budgets:
+                report = sweep_pd_disaggregation_ratios(
+                    case,
+                    decode_case or case,
+                    total_dies=budget,
+                    prompt_tokens=prompt_toks,
+                    output_tokens=output_toks,
+                    tpot_sla_ms=request.sla.latency_ms,
+                    max_sequences_per_dp=request.sla.max_sequences_per_dp,
+                )
+                all_rows = report.get("candidates", ())
+                total_evaluated += len(all_rows)
+                for row in report.get("pareto_frontier", ()):
+                    raw_span = row.get("effective_tpot_ms")
+                    if raw_span is None:
+                        raw_span = row.get("decode_step_ms", 0.0)
+                    span_val = float(raw_span or 0.0)
+                    tps = float(row.get("sustainable_tps", 0.0) or 0.0)
+                    used = max(1, int(row.get("used_dies", budget) or budget))
+                    combined_rows.append({
+                        **dict(row),
+                        "num_devices": used,
+                        "step_ms_feasible": span_val,
+                        "step_ms_at_b1": float(row.get("step_ms_at_b1") or span_val),
+                        "tps_feasible": tps,
+                        "tps_per_die": float(row.get("tps_per_die") or (tps / used)),
+                        "total_feasible_concurrency": int(
+                            row.get("total_feasible_concurrency")
+                            or row.get("max_concurrency")
+                            or row.get("decode_concurrency")
+                            or 1
+                        ),
+                        "feasible": bool(row.get("feasible", True)),
+                        "_budget": budget,
+                    })
+            best_by_dies: dict[int, dict[str, Any]] = {}
+            for row in combined_rows:
+                if not row.get("feasible", True):
+                    continue
+                used_d = int(row["num_devices"])
+                prev = best_by_dies.get(used_d)
+                if prev is None or (
+                    float(row["tps_feasible"]), -float(row["step_ms_feasible"])
+                ) > (
+                    float(prev["tps_feasible"]), -float(prev["step_ms_feasible"])
+                ):
+                    best_by_dies[used_d] = row
             frontier: list[TopologyPoint] = []
-            for row in front_rows:
-                raw_span = row.get("effective_tpot_ms")
-                if raw_span is None:
-                    raw_span = row.get("decode_step_ms", 0.0)
+            best_tps = -1.0
+            for used_d in sorted(best_by_dies):
+                row = best_by_dies[used_d]
+                tps_val = float(row["tps_feasible"])
+                if tps_val <= best_tps:
+                    continue
+                best_tps = tps_val
                 frontier.append(TopologyPoint(
-                    device_count=int(row.get("used_dies", total_dies)),
+                    device_count=used_d,
                     parallel=(("prefill_dies", int(row.get("prefill_dies", 0))),),
                     decode_parallel=(("decode_dies", int(row.get("decode_dies", 0))),),
-                    span_ms=float(raw_span or 0.0),
-                    throughput_tokens_s=float(row.get("sustainable_tps", 0.0) or 0.0),
+                    span_ms=float(row["step_ms_feasible"]),
+                    throughput_tokens_s=tps_val,
                     fits_memory=True,
                 ))
-            return TopologySweepResult(evaluated_count=len(all_rows), frontier=tuple(frontier))
+            return TopologySweepResult(evaluated_count=total_evaluated, frontier=tuple(frontier))
 
         grid = list(request.device_counts) if request.device_counts else None
         evaluated_rows = list(sweep_topologies_iter(

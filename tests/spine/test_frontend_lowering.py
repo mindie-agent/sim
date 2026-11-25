@@ -544,7 +544,7 @@ def test_feedforward_and_collective_lowering_enforce_mutex_and_architecture_guar
 
     base = compose_case(
         "deepseek-v3.2", REPRESENTATIVE_SKUS["a5"],
-        tp=1, dp=8, ep=8, layers=4, feature_track="merged",
+        tp=1, dp=8, ep=8, layers=4, feature_track="shipping",
     )
     # Shipping Before track activates MLAPO native fusion on eligible MLA layers.
     merged_ops = target_graphs(parse_case(base), phase="decode", tokens=1, context=128, sequences=1, scope="body")[0]

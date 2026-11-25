@@ -354,7 +354,7 @@ def test_catalog_carries_stage_cohort_size_and_matches_direct_execution():
 
 @pytest.mark.parametrize('ideal', [False, True])
 def test_mhc_norm_waits_for_the_correct_pre_gate_producer(ideal):
-    case = _case('deepseek-v4.1-flash', feature_track='expected_ideal')
+    case = _case('deepseek-v4.1-flash', feature_track='target')
     case = _with_passes(case, 'mhc_boundary_ideal' if ideal else 'mhc_boundary_pr')
     layer = {op.op_id.removeprefix('s0.l0.'): op for op in _ops(case, phase='decode', tokens=1, context=2048, sequences=2)}
     for block, norm_id in (('attention', 'norm1'), ('ffn', 'norm2')):

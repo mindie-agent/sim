@@ -447,7 +447,7 @@ def test_host_queue_leases_profiler_normalizer_and_cli_roundtrip(tmp_path):
         **{n["node_id"]: ({**n["shape"], "dtype": "bf16", "weight_dtype": "bf16"} if n["family"] in {"gemm", "grouped_gemm", "gate_up_projection", "down_projection"} else n["shape"]) for n in l3_c200["nodes"] if n["op_id"] != "s0.l0.kv_store"},
     }
     l3_norm, _ = normalize_profiler_records([
-        {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_200000", "run_id": "r200.base.eager.t0", "trial": 0, "rank": 0, "split": "heldout", "timing_mode": "eager", "duration_ms": 1.5, "sku": A2_SKU},
+        {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": "offgrid_ctx_200000", "run_id": "r200.base.eager.t0", "trial": 0, "rank": 0, "split": "heldout", "timing_mode": "eager", "duration_ms": 1.5, "sku": A2_SKU, "event_ids": ["r200-s", "r200-e"]},
         {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": "offgrid_ctx_200000", "run_id": "r200", "rank": 0, "status": "ok", "actual_shape": {"tokens": 1, "width": 2048, "dtype": "bf16"}, "node_shapes": l3_ns_kv1, "timed_nodes": [n["node_id"] for n in l3_c200["nodes"]]},
     ], plan_doc=b4_plan, sku=A2_SKU, capture_out_dir=tmp_path / "l3_caps")
     assert l3_norm[0]["context_len"] == 200000
@@ -465,7 +465,7 @@ def test_host_queue_leases_profiler_normalizer_and_cli_roundtrip(tmp_path):
         "obs_p, out_p = Path(args[args.index('--observations') + 1]), Path(args[args.index('--out') + 1])\n"
         "rk, ws = int(os.environ.get('RANK', '0')), int(os.environ.get('WORLD_SIZE', '1'))\n"
         "c0 = next(c for c in plan['cases'] if c['split'] != 'abi_rejection')\n"
-        "obs_p.write_text(json.dumps({'schema':'mindie-bench-observation/1','record_type':'observation','case_id':c0['case_id'],'run_id':f'r{rk}.base.eager.t0','trial':0,'repeat_index':0,'rank':rk,'split':c0['split'],'timing_mode':'eager','duration_ms':0.02 + 0.001*rk,'sku':plan['sku']}) + '\\n', encoding='utf-8')\n"
+        "obs_p.write_text(json.dumps({'schema':'mindie-bench-observation/1','record_type':'observation','case_id':c0['case_id'],'run_id':f'r{rk}.base.eager.t0','trial':0,'repeat_index':0,'rank':rk,'split':c0['split'],'timing_mode':'eager','duration_ms':0.02 + 0.001*rk,'sku':plan['sku'],'event_ids':[f'r{rk}-s',f'r{rk}-e']}) + '\\n', encoding='utf-8')\n"
         f"recs = [{{'case_id': c0['case_id'], 'status': 'ok', 'actual_shape': c0.get('shape') or {{}}, 'timed_nodes': [n['node_id'] for n in c0['nodes']]}}, {{'case_id': {abi_pt['point_id']!r}, 'status': 'unsupported_binding', 'reason': {abi_pt['abi_expected_error']!r}}}]\n"
         "Path(f'{out_p}.rank{rk}.json' if ws > 1 else str(out_p)).write_text(json.dumps({'schema':'mindie-bench-subgraph-run/1','status':'partial','run_id':f'r{rk}','records':recs}), encoding='utf-8')\n"
         "sys.exit(2)\n",
@@ -532,7 +532,7 @@ def test_whitebox_runner_l1_l2_l3_gemm_grouped_gemm_and_isolation(tmp_path):
         g_sh = {k: v for k, v in resolve_point_measured_binding(g_plan, g_pt, sku=A2_SKU)["expected_shape"].items() if k in {"m", "n", "k", "e", "matrix_groups", "dtype"}}
         g_sh["weight_dtype"] = "bf16"
         g_rows, _ = normalize_profiler_records([
-            {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": g_pt["point_id"], "run_id": f"g-{g_fam}.base.eager.t0", "acquisition_id": f"acq-{g_fam}", "trial": 0, "rank": 0, "split": "heldout", "timing_mode": "eager", "duration_ms": 0.05, "sku": A2_SKU},
+            {"schema": "mindie-bench-observation/1", "record_type": "observation", "case_id": g_pt["point_id"], "run_id": f"g-{g_fam}.base.eager.t0", "acquisition_id": f"acq-{g_fam}", "trial": 0, "rank": 0, "split": "heldout", "timing_mode": "eager", "duration_ms": 0.05, "sku": A2_SKU, "event_ids": [f"g-{g_fam}-s", f"g-{g_fam}-e"]},
             {"schema": "mindie-bench-subgraph-run/1", "record_type": "receipt", "case_id": g_pt["point_id"], "run_id": f"g-{g_fam}", "acquisition_id": f"acq-{g_fam}", "rank": 0, "status": "ok", "actual_shape": g_sh, "timed_nodes": [f"{g_pt['point_id']}:op0"]},
         ], plan_doc=g_plan, sku=A2_SKU)
         g_sc = score_sealed_gate_cases(g_rows, sku=A2_SKU, expected_family=g_fam, runner=WhiteboxSpineRunner(clock_operator="elapsed_span"))

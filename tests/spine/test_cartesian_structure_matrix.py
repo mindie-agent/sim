@@ -91,8 +91,8 @@ MATRIX_QUANTS = (
     "mxfp8",
     "mxfp4_routed_only",
 )
-ALL_TRACKS = ("raw_eager", "merged", "unmerged_pr", "expected_ideal")
-CORE_TRACKS = ("raw_eager", "expected_ideal")
+ALL_TRACKS = ("eager", "shipping", "proposed", "target")
+CORE_TRACKS = ("eager", "target")
 
 _INDEXER_ROLES = frozenset({
     "lightning_indexer", "quant_lightning_indexer", "pool_key_indexer", "key_pool",
@@ -160,7 +160,7 @@ def _build_cartesian_jobs() -> list[tuple[Any, ...]]:
 
         for quant in MATRIX_QUANTS:
             for phase, tok, ctx in (("prefill", PREFILL_TOKENS, 0), ("decode", DECODE_TOKENS, DECODE_CONTEXT)):
-                add(model, PRIMARY_A5_SKU, phase, tok, ctx, "expected_ideal", base_par, {"quant": quant})
+                add(model, PRIMARY_A5_SKU, phase, tok, ctx, "target", base_par, {"quant": quant})
 
         for sku in (PRIMARY_A5_SKU, PRIMARY_A3_SKU):
             for track in ALL_TRACKS:
@@ -169,9 +169,9 @@ def _build_cartesian_jobs() -> list[tuple[Any, ...]]:
 
         dp_nd = DP_PAIR * tp_v
         dp_par = {"dp": DP_PAIR, "tp": tp_v, "num_devices": dp_nd, **({"ep": dp_nd} if has_moe else {})}
-        add(model, PRIMARY_A5_SKU, "prefill", PREFILL_TOKENS, 0, "expected_ideal", dp_par, {})
-        add(model, PRIMARY_A5_SKU, "decode", DECODE_TOKENS, DECODE_CONTEXT, "expected_ideal", dp_par, {})
-        add(model, PRIMARY_A5_SKU, "decode", SPEC_DECODE_TOKENS, DECODE_CONTEXT, "expected_ideal", base_par, {})
+        add(model, PRIMARY_A5_SKU, "prefill", PREFILL_TOKENS, 0, "target", dp_par, {})
+        add(model, PRIMARY_A5_SKU, "decode", DECODE_TOKENS, DECODE_CONTEXT, "target", dp_par, {})
+        add(model, PRIMARY_A5_SKU, "decode", SPEC_DECODE_TOKENS, DECODE_CONTEXT, "target", base_par, {})
 
         if has_ctx_attn:
             tp_cp = max(TP_UNIT, tp_v // CP_PAIR)
@@ -179,11 +179,11 @@ def _build_cartesian_jobs() -> list[tuple[Any, ...]]:
             ep_cp = {"ep": nd_cp} if has_moe else {}
             dcp_par = {"dp": TP_UNIT, "tp": tp_cp, "dcp": CP_PAIR, "num_devices": nd_cp, **ep_cp}
             pcp_par = {"dp": TP_UNIT, "tp": tp_cp, "pcp": CP_PAIR, "num_devices": nd_cp, **ep_cp}
-            add(model, PRIMARY_A5_SKU, "decode", DECODE_TOKENS, DECODE_CONTEXT, "expected_ideal",
+            add(model, PRIMARY_A5_SKU, "decode", DECODE_TOKENS, DECODE_CONTEXT, "target",
                 dcp_par, {"kv_cache_dtype": "fp8_e4m3"})
-            add(model, PRIMARY_A5_SKU, "decode", DECODE_TOKENS, DECODE_CONTEXT, "raw_eager", dcp_par, {})
-            add(model, PRIMARY_A5_SKU, "prefill", PREFILL_TOKENS, 0, "expected_ideal", pcp_par, {})
-            add(model, PRIMARY_A5_SKU, "prefill", PREFILL_TOKENS, 0, "raw_eager", pcp_par, {})
+            add(model, PRIMARY_A5_SKU, "decode", DECODE_TOKENS, DECODE_CONTEXT, "eager", dcp_par, {})
+            add(model, PRIMARY_A5_SKU, "prefill", PREFILL_TOKENS, 0, "target", pcp_par, {})
+            add(model, PRIMARY_A5_SKU, "prefill", PREFILL_TOKENS, 0, "eager", pcp_par, {})
     return jobs
 
 
@@ -278,7 +278,7 @@ def test_indexer_subgraph_persists_across_dcp_pcp_and_gqa_indexer_models() -> No
     case_dcp = compose_case(
         "deepseek-v3.2", hardware=PRIMARY_A5_SKU, dp=TP_UNIT, tp=TP_LARGE, dcp=DCP_EIGHT,
         ep=TP_LARGE, num_devices=TP_LARGE, layers=SAMPLE_LAYERS,
-        feature_track="expected_ideal", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
+        feature_track="target", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
     )
     rep_dcp = export_structure(case_dcp, phase="decode", tokens=DECODE_TOKENS, context=DECODE_CONTEXT, scope="model")
     idx_sgs = [sg for sg in rep_dcp["subgraphs"] if sg["role"] in _INDEXER_ROLES]
@@ -287,7 +287,7 @@ def test_indexer_subgraph_persists_across_dcp_pcp_and_gqa_indexer_models() -> No
     case_pcp = compose_case(
         "deepseek-v3.2", hardware=PRIMARY_A5_SKU, dp=TP_UNIT, tp=CP_PAIR, pcp=PCP_FOUR,
         ep=CP_PAIR, num_devices=TP_LARGE, layers=SAMPLE_LAYERS,
-        feature_track="expected_ideal", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
+        feature_track="target", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
     )
     rep_pcp = export_structure(case_pcp, phase="prefill", tokens=PREFILL_TOKENS, context=0, scope="model")
     assert any(sg["role"] in _INDEXER_ROLES for sg in rep_pcp["subgraphs"])
@@ -296,7 +296,7 @@ def test_indexer_subgraph_persists_across_dcp_pcp_and_gqa_indexer_models() -> No
         case_gqa = compose_case(
             model_name, hardware=PRIMARY_A5_SKU, dp=TP_UNIT, tp=TP_MEDIUM,
             num_devices=TP_MEDIUM, layers=SAMPLE_LAYERS,
-            feature_track="expected_ideal", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
+            feature_track="target", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
         )
         for phase, tok, ctx in (("prefill", PREFILL_TOKENS, 0), ("decode", DECODE_TOKENS, DECODE_CONTEXT)):
             rep = export_structure(case_gqa, phase=phase, tokens=tok, context=ctx, scope="model")
@@ -316,7 +316,7 @@ def test_hybrid_gdn_gqa_ple_parallel_grid_preserves_subgraphs_and_mappings() -> 
     for phase, tok, ctx, tp, dp, dcp, ep, nd in configs:
         case = compose_case(
             "qwen3.8-flash-next", hardware=PRIMARY_A5_SKU, dp=dp, tp=tp, dcp=dcp, ep=ep,
-            num_devices=nd, layers=HYBRID_SAMPLE_LAYERS, feature_track="expected_ideal",
+            num_devices=nd, layers=HYBRID_SAMPLE_LAYERS, feature_track="target",
             prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
             mtp_proposal_tokens=MTP_PROPOSALS,
         )
@@ -336,7 +336,7 @@ def test_mla_prolog_fp8_v4_admission_and_unfused_semantic_fallback() -> None:
     case_fp8 = compose_case(
         "deepseek-v3.2", hardware=PRIMARY_A5_SKU, dp=TP_UNIT, tp=TP_LARGE, ep=TP_LARGE,
         num_devices=TP_LARGE, layers=SAMPLE_LAYERS, quant="mxfp8",
-        feature_track="expected_ideal", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
+        feature_track="target", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
     )
     rep_fp8 = export_structure(case_fp8, phase="decode", tokens=DECODE_TOKENS, context=DECODE_CONTEXT, scope="model")
     prologs = [sg for sg in rep_fp8["subgraphs"] if sg["role"] == "mla_prolog"]
@@ -347,7 +347,7 @@ def test_mla_prolog_fp8_v4_admission_and_unfused_semantic_fallback() -> None:
     case_eager = compose_case(
         "deepseek-v3.2", hardware=PRIMARY_A5_SKU, dp=TP_UNIT, tp=TP_LARGE, ep=TP_LARGE,
         num_devices=TP_LARGE, layers=SAMPLE_LAYERS,
-        feature_track="raw_eager", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
+        feature_track="eager", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
     )
     rep_eager = export_structure(case_eager, phase="decode", tokens=DECODE_TOKENS, context=DECODE_CONTEXT, scope="model")
     eager_prologs = [sg for sg in rep_eager["subgraphs"] if sg["role"] == "mla_prolog"]
@@ -358,7 +358,7 @@ def test_recurrent_gdn_subgraphs_and_eager_vs_fused_norm_decomposition() -> None
     case_fused = compose_case(
         "qwen3.5-35b-a3b", hardware=PRIMARY_A5_SKU, dp=TP_UNIT, tp=TP_MEDIUM, ep=TP_MEDIUM,
         num_devices=TP_MEDIUM, layers=SAMPLE_LAYERS,
-        feature_track="expected_ideal", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
+        feature_track="target", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
     )
     rep_pf = export_structure(case_fused, phase="prefill", tokens=PREFILL_TOKENS, context=0, scope="model")
     rep_dc = export_structure(case_fused, phase="decode", tokens=DECODE_TOKENS, context=DECODE_CONTEXT, scope="model")
@@ -370,7 +370,7 @@ def test_recurrent_gdn_subgraphs_and_eager_vs_fused_norm_decomposition() -> None
     case_eager = compose_case(
         "qwen3.5-35b-a3b", hardware=PRIMARY_A5_SKU, dp=TP_UNIT, tp=TP_MEDIUM, ep=TP_MEDIUM,
         num_devices=TP_MEDIUM, layers=SAMPLE_LAYERS,
-        feature_track="raw_eager", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
+        feature_track="eager", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
     )
     rep_eager = export_structure(case_eager, phase="decode", tokens=DECODE_TOKENS, context=DECODE_CONTEXT, scope="model")
     eager_norms = [sg for sg in rep_eager["subgraphs"] if sg["role"] == "gated_rmsnorm"]
@@ -385,7 +385,7 @@ def test_standard_layernorm_emits_single_kernel_without_external_casts() -> None
     case = parse_case(compose_case(
         "deepseek-v3.2", hardware=PRIMARY_A5_SKU, dp=TP_UNIT, tp=TP_LARGE, ep=TP_LARGE,
         num_devices=TP_LARGE, layers=SAMPLE_LAYERS,
-        feature_track="raw_eager", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
+        feature_track="eager", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
     ))
     plan = case.model.layer_plans[0]
     builder = Builder("s0.l0", plan, 0, (), case.model, "decode")
@@ -400,7 +400,7 @@ def test_routed_only_mxfp4_preserves_bf16_exclusions_and_emits_situ_quant_subgra
     case = compose_case(
         "kimi-k3.1", hardware=PRIMARY_A5_SKU, dp=TP_UNIT, tp=TP_LARGE, ep=TP_LARGE,
         num_devices=TP_LARGE, layers=SAMPLE_LAYERS, quant="mxfp4_routed_only",
-        feature_track="expected_ideal", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
+        feature_track="target", prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
     )
     rep = export_structure(case, phase="decode", tokens=DECODE_TOKENS, context=DECODE_CONTEXT, scope="model")
     assert any(sg["role"] == "grouped_gate_up_situ_quant" for sg in rep["subgraphs"])

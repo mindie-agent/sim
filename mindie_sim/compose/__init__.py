@@ -27,12 +27,15 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
+from mindie_sim.backends.abi_registry import default_abi_registry
 from mindie_sim.backends.ascend import (
     ASCEND_TOPOLOGY_PRESETS,
     default_ranks_per_node,
     materialize as materialize_ascend,
 )
 from mindie_sim.backends.nvidia import materialize as materialize_nvidia
+from mindie_sim.catalog.draft_spec import canonical_speculative_method
+from mindie_sim.prediction.operators.mla_prolog import resolve_mla_preprocess_mode
 from mindie_sim.compose.assembly import (
     _assembly_emit_counts,
     _assembly_metric_rows,
@@ -100,13 +103,15 @@ from mindie_sim.schema.scenario import (
     ScenarioContract,
     validate_deployment_mode,
 )
-from mindie_sim.schema.stack import StackTrack
+from mindie_sim.schema.stack import STACK_TRACKS, StackTrack
 from mindie_sim.schema.workload import SpeculativeWorkloadPolicy
 from mindie_sim.stacks.registry import resolve_stack_for_scenario
 from mindie_sim.stacks.vllm_ascend.profiles import (
     VA_RECOMMENDED_PROFILES,
     shipping_collective_policy,
+    simulation_config,
 )
+from mindie_sim.stacks.vllm_ascend.speculative import ZERO_NEURAL_DRAFT_METHODS
 from mindie_sim.schema.common import ModelingError
 
 BYTES_PER_GB = 1_000_000_000.0
@@ -362,7 +367,7 @@ def _apply_cp_and_tutorial_flags(
     enable_fused_mc2: int | None,
     enable_prefill_mc2: bool | None,
     enable_pcp_o_proj_weight_sharding: bool,
-    enable_sfa_dcp_sharded_indexer: bool,
+    enable_sfa_dcp_sharded_indexer: bool | None,
     dcp_q_replicate: bool,
 ) -> None:
     """Attach tutorial execution flags and non-blocking KV-replication metadata."""
@@ -384,8 +389,8 @@ def _apply_cp_and_tutorial_flags(
         runtime_meta["additional_config"] = additional
     if enable_pcp_o_proj_weight_sharding:
         runtime_meta["enable_pcp_o_proj_weight_sharding"] = True
-    if enable_sfa_dcp_sharded_indexer:
-        runtime_meta["enable_sfa_dcp_sharded_indexer"] = True
+    if enable_sfa_dcp_sharded_indexer is not None:
+        runtime_meta["enable_sfa_dcp_sharded_indexer"] = bool(enable_sfa_dcp_sharded_indexer)
     if dcp_q_replicate:
         runtime_meta["dcp_q_replicate"] = True
     p_spec = ParallelSpec.from_mapping(parallel_dict)
@@ -607,6 +612,63 @@ def _resolve_bool_feature(
     return False, "default"
 
 
+def _model_mla_prolog_eligible(
+    model_spec: Any,
+    *,
+    arch: str,
+    pcp: int,
+    dcp: int = 1,
+    enable_mlapo: bool = False,
+) -> bool:
+    """Delegate MLA Prolog eligibility strictly to canonical M1 5-branch predicate."""
+    if not arch:
+        return False
+    mla_layers = [
+        p for p in getattr(model_spec, "layer_plans", ())
+        if p.attention == "mla" and int(p.q_lora_rank or 0) > 0 and p.mla_variant != "latent_mqa"
+    ]
+    if not mla_layers:
+        return False
+    arch_upper = str(arch).strip().upper()
+    quant = getattr(model_spec, "quant", None)
+    act_dtype = str(getattr(model_spec, "activation_dtype", "") or "bf16").lower()
+    weight_quant = str(
+        getattr(quant, "weight_format", "") if quant is not None else getattr(model_spec, "weight_dtype", act_dtype)
+    ).lower() or act_dtype
+    is_w4a8 = weight_quant == "int4"
+    is_int8_kv = bool(quant is not None and str(getattr(quant, "kv_dtype", "")).lower() == "int8")
+    registry = default_abi_registry()
+    modes = [
+        resolve_mla_preprocess_mode(
+            arch=arch_upper,
+            phase="decode",
+            num_tokens=1,
+            q_lora_rank=int(plan.q_lora_rank or 0),
+            kv_lora_rank=int(plan.kv_lora_rank or 0),
+            qk_rope_head_dim=int(plan.qk_rope_head_dim or 0),
+            has_rope=(not bool(plan.mla_use_nope)) and int(plan.qk_rope_head_dim or 0) > 0,
+            is_sparse_sfa=bool(plan.indexer),
+            dcp_size=int(dcp or 1),
+            pcp_size=int(pcp or 1),
+            enable_mlapo=enable_mlapo,
+            enable_mla_prolog=True,
+            qkv_a_gate_fused=bool(plan.mla_qkv_a_gate_fused or plan.mla_output_gate),
+            is_w4a8=is_w4a8,
+            is_int8_kv=is_int8_kv,
+            has_kv_scale=is_int8_kv,
+            act_dtype=act_dtype,
+            weight_quant=weight_quant,
+            input_size=int(model_spec.hidden_size),
+            num_kv_heads=1,
+            num_q_heads=int(plan.num_heads or model_spec.num_heads),
+            qk_nope_head_dim=int(plan.qk_nope_head_dim or 0),
+            registry=registry,
+        )
+        for plan in mla_layers
+    ]
+    return all(m in {"prolog_v3", "prolog_v3_learned_rope_tail", "mlapo"} for m in modes)
+
+
 def _resolve_shipping_mlapo_and_collective(
     *,
     production: bool,
@@ -616,25 +678,23 @@ def _resolve_shipping_mlapo_and_collective(
     exclude_set: frozenset[str],
     norm_role: str | None,
     pcp: int,
+    dcp: int = 1,
 ) -> tuple[bool, dict[str, Any] | None]:
-    """Resolve shipping MLAPO eligibility and arch-disjoint collective policy."""
-    has_eligible_mla = any(
-        p.attention == "mla" and p.q_lora_rank > 0 and p.mla_variant != "latent_mqa"
-        for p in getattr(model_spec, "layer_plans", ())
-    )
+    """Resolve shipping MLAPO eligibility via canonical M1 predicate & structural collective policy."""
     env_mlapo = str((prof.get("env") or {}).get("VLLM_ASCEND_ENABLE_MLAPO", "")).strip().lower()
     mlapo_active = bool(
         production
-        and has_eligible_mla
+        and arch
         and "mla_prolog_fusion" not in exclude_set
         and norm_role != "pd_prefill"
         and int(pcp) == 1
         and (not prof or env_mlapo not in {"0", "false", "no"})
+        and _model_mla_prolog_eligible(model_spec, arch=arch, pcp=int(pcp), dcp=int(dcp), enable_mlapo=False)
     )
     collective_policy = (
         deepcopy(prof["shipping_collective_policy"])
         if prof.get("shipping_collective_policy")
-        else shipping_collective_policy(arch, role=norm_role)
+        else shipping_collective_policy(arch, role=norm_role, model=model_spec)
         if (production and arch)
         else None
     )
@@ -664,17 +724,14 @@ def _resolve_domain2_policy(
     mtp_source: str,
     exclude_set: frozenset[str],
     notes: list[dict[str, Any]],
-    canonical_track: str = "merged",
+    canonical_track: str = "shipping",
     norm_role: str | None = None,
 ) -> dict[str, Any]:
     """Resolve Domain-2 model-intrinsic offload & production stack features (opt-out only)."""
     prof = va_profile or {}
     prof_flags = dict(prof.get("tutorial_flags") or {})
     arch = _arch_key(sku) if hardware_backend == "ascend" else ""
-    # Preserve explicit stack disable workarounds (e.g. enable_fused_mc2=0) on
-    # both merged and unmerged_pr ('Before') tracks; only expected_ideal lifts
-    # them when evaluating theoretical ceiling unless caller explicitly pins 0.
-    allow_merged_workarounds = canonical_track in {"merged", "unmerged_pr"}
+    allow_shipping_workarounds = canonical_track in {"shipping", "proposed"}
     explicit_sp_flag = (sp is not None) or (enable_flashcomm1 is not None)
     eff_sp = bool(enable_flashcomm1) if (sp is None and enable_flashcomm1 is not None and not raw_eager) else sp
 
@@ -701,7 +758,7 @@ def _resolve_domain2_policy(
     prof_fused_mc2 = prof_flags.get("enable_fused_mc2")
     use_prof_fused_mc2 = (
         production and prof_fused_mc2 is not None
-        and (allow_merged_workarounds or int(prof_fused_mc2) != 0)
+        and (allow_shipping_workarounds or int(prof_fused_mc2) != 0)
     )
     resolved_fused_mc2 = (
         None if raw_eager else
@@ -767,7 +824,8 @@ def _resolve_domain2_policy(
     }
     mlapo_active, collective_policy = _resolve_shipping_mlapo_and_collective(
         production=production, arch=arch, model_spec=model_spec, prof=prof,
-        exclude_set=exclude_set, norm_role=norm_role, pcp=int(axes.get("pcp", 1)),
+        exclude_set=exclude_set, norm_role=norm_role,
+        pcp=int(axes.get("pcp", 1)), dcp=int(axes.get("dcp", 1)),
     )
     policy = {
         "backend": hardware_backend, "production": bool(production),
@@ -851,14 +909,6 @@ def _apply_va_profile_lowerings(
     runtime_dict["metadata"] = runtime_meta
 
 
-def _has_eligible_mla(model_spec: Any) -> bool:
-    """Return True when the model owns at least one eligible MLA layer."""
-    return any(
-        p.attention == "mla" and p.q_lora_rank > 0 and p.mla_variant != "latent_mqa"
-        for p in getattr(model_spec, "layer_plans", ())
-    )
-
-
 def _attach_mla_prolog_native_fusion(
     lowerings: dict[str, Any],
     *,
@@ -871,14 +921,15 @@ def _attach_mla_prolog_native_fusion(
     axes: Mapping[str, int],
     sku: str,
 ) -> None:
-    """Fold ``mla_prolog`` into one ``aclnnMlaPrologV3/V4`` kernel when active."""
+    """Fold ``mla_prolog`` into one ``aclnnMlaPrologV3/V4`` kernel when M1-eligible."""
     policy_mlapo = bool(
         ((runtime_dict.get("metadata") or {}).get("execution_policy") or {}).get("mlapo", False)
     )
     track_allows_mlapo = (
-        canonical_track == "expected_ideal"
-        or (canonical_track in {"merged", "unmerged_pr"} and policy_mlapo)
+        canonical_track == "target"
+        or (canonical_track in {"shipping", "proposed"} and policy_mlapo)
     )
+    arch = _arch_key(sku)
     if not (
         track_allows_mlapo
         and not raw_eager
@@ -886,7 +937,10 @@ def _attach_mla_prolog_native_fusion(
         and "mla_prolog" in lowerings
         and "mla_prolog_fusion" not in set(exclude_optimizations)
         and int(axes.get("pcp", 1)) == 1
-        and _has_eligible_mla(model_spec)
+        and _model_mla_prolog_eligible(
+            model_spec, arch=arch, pcp=int(axes.get("pcp", 1)),
+            dcp=int(axes.get("dcp", 1)), enable_mlapo=False,
+        )
     ):
         return
     prolog_cfg = lowerings["mla_prolog"]
@@ -898,7 +952,7 @@ def _attach_mla_prolog_native_fusion(
         "mla_prolog_packed_int8_tile128_analytic"
         if prolog_opts.get("cache_layout")
         else "mla_prolog_arch35_split_m_n_ae923905"
-        if _arch_key(sku) == "a5"
+        if arch == "a5"
         else "preserve_workspaces"
     )
     existing_nf = lowerings.get("native_fusion")
@@ -991,17 +1045,14 @@ def _finalize_stack_runtime_policy(
 def _adapter_track_for(
     canonical_track: str, *, raw_eager: bool, stack_id: str, supported_tracks: Sequence[str],
 ) -> StackTrack:
-    if raw_eager or canonical_track == "raw_eager" or stack_id == "raw-eager":
-        wanted: StackTrack = "eager"
-    elif canonical_track == "unmerged_pr":
-        wanted = "proposed"
-    elif canonical_track == "expected_ideal":
-        wanted = "target"
-    else:
-        wanted = "shipping"
-    if wanted in supported_tracks:
-        return wanted
-    return supported_tracks[0] if supported_tracks else "shipping"  # type: ignore[return-value]
+    """Enforce canonical ``StackTrack`` strictly; fail closed on unsupported tracks."""
+    del stack_id
+    requested = "eager" if raw_eager else str(canonical_track or "").strip().lower()
+    if requested not in STACK_TRACKS:
+        raise ModelingError(f"unsupported_stack_track:{requested}:{tuple(supported_tracks)}")
+    if requested not in set(supported_tracks):
+        raise ModelingError(f"unsupported_stack_track:{requested}:{tuple(supported_tracks)}")
+    return requested  # type: ignore[return-value]
 
 
 def _effective_stack_profile_key(
@@ -1067,8 +1118,14 @@ def _resolve_single_spine_contracts(
             "kv_block_size": int(resolved_block_size),
             "num_speculative_tokens": int(mtp_tokens),
             "speculative_k": int(mtp_tokens),
-            "optimization_mode": "modeling" if canonical_track == "expected_ideal" else "simulation",
+            "optimization_mode": "modeling" if canonical_track == "target" else "simulation",
+            "phase": eff_phase,
         })
+        excl_opts = tuple(sorted(
+            str(x).strip() for x in (stack_options.get("exclude_optimizations") or ()) if str(x).strip()
+        ))
+        if excl_opts:
+            req_opts["exclude_optimizations"] = excl_opts
         kv_dtype = model_options.get("kv_cache_dtype") or getattr(model_spec, "kv_dtype", None)
         if kv_dtype:
             req_opts["kv_cache_dtype"] = str(kv_dtype)
@@ -1080,6 +1137,18 @@ def _resolve_single_spine_contracts(
         if runtime_options.get("recover_ssm") is not None:
             req_opts["use_replayssm"] = bool(runtime_options["recover_ssm"])
             req_opts["recover_ssm"] = bool(runtime_options["recover_ssm"])
+        if runtime_options.get("max_num_batched_tokens") is not None:
+            req_opts["max_num_batched_tokens"] = int(runtime_options["max_num_batched_tokens"])
+        if policy_options.get("sp") is not None:
+            req_opts["sp"] = bool(policy_options["sp"])
+        raw_cg = str(policy_options.get("graph_capture_mode") or "").strip().lower()
+        if raw_cg == "none":
+            req_opts["cudagraph_mode"] = "NONE"
+            req_opts["enforce_eager"] = True
+        elif raw_cg == "piecewise":
+            req_opts["cudagraph_mode"] = "PIECEWISE"
+        elif raw_cg == "full":
+            req_opts["cudagraph_mode"] = "FULL_DECODE_ONLY"
         if policy_options.get("enable_fused_mc2") is not None:
             req_opts["enable_fused_mc2"] = int(policy_options["enable_fused_mc2"])
         if policy_options.get("multistream_overlap_shared_expert") is not None:
@@ -1088,6 +1157,8 @@ def _resolve_single_spine_contracts(
             req_opts["engram_cpu_offload"] = bool(policy_options["engram_cpu_offload"])
         if target_quant_projection:
             req_opts["target_quant_projection"] = target_quant_projection
+        if runtime_options.get("spec_method"):
+            req_opts["spec_method"] = str(runtime_options["spec_method"]).strip().lower()
 
     resolved_opts = adapter.resolve_options(
         model_spec, hw_obj, parallel_obj, role=eff_role, track=adapter_track,
@@ -1112,6 +1183,7 @@ def _resolve_single_spine_contracts(
         resolved_max_seqs=resolved_max_seqs, concurrency=scenario_options.get("concurrency"),
         canonical_track=canonical_track,
         mtp_tokens=mtp_tokens,
+        require_scenario=bool(scenario_options.get("require_scenario", False)),
     )
     register_composed_contracts(
         quant_plan=quant_plan, lowering_plan=lowering_plan, scenario_contract=scenario_contract,
@@ -1122,22 +1194,23 @@ def _resolve_single_spine_contracts(
         deployment_mode=eff_role, deployment_mode_origin="api_argument",
         checkpoint_map=checkpoint_map, quant_plan=quant_plan,
         lowering_plan=lowering_plan, scenario_contract=scenario_contract,
+        contract_inputs={
+            "eff_role": eff_role,
+            "eff_phase": eff_phase,
+            "norm_role": norm_role,
+            "requested_options": dict(req_opts),
+            "field_origins": {},
+            "prompt_tokens": scenario_options.get("prompt_tokens"),
+            "ttft_slo_ms": scenario_options.get("ttft_slo_ms"),
+            "tpot_slo_ms": scenario_options.get("tpot_slo_ms"),
+            "resolved_max_seqs": int(resolved_max_seqs),
+            "concurrency": scenario_options.get("concurrency"),
+            "canonical_track": canonical_track,
+            "mtp_tokens": int(mtp_tokens),
+            "require_scenario": bool(scenario_options.get("require_scenario", False)),
+        },
     )
     return resolved_opts, quant_plan, lowering_plan, scenario_contract, summary
-
-
-_STACK_SPEC_METHOD_TO_CANONICAL: dict[str, str] = {
-    "none": "none",
-    "mtp": "mtp",
-    "deepseek_mtp": "mtp",
-    "qwen3_5_mtp": "mtp",
-    "dspark": "dspark",
-    "dflash": "dspark",
-    "eagle": "eagle",
-    "eagle3": "eagle3",
-    "ngram": "ngram",
-    "ngram_gpu": "ngram_gpu",
-}
 
 
 def _build_speculative_policy(
@@ -1147,6 +1220,7 @@ def _build_speculative_policy(
     resolved_opts: Any,
     lowering_plan: Any,
 ) -> SpeculativeWorkloadPolicy | None:
+    """Resolve ``SpeculativeWorkloadPolicy`` structurally (zero model-name dispatch tables)."""
     if workload_domain == "diffusion":
         return None
     sched_k = int(getattr(getattr(lowering_plan, "scheduling", None), "speculative_proposal_count", 0) or 0)
@@ -1162,15 +1236,22 @@ def _build_speculative_policy(
     draft = mtp if mtp is not None else dspark
     is_synth = bool(getattr(draft, "is_synthetic", False)) if draft is not None else False
     eff_map = dict(getattr(resolved_opts, "effective_mechanisms", ()) or ())
-    stack_method = _STACK_SPEC_METHOD_TO_CANONICAL.get(str(eff_map.get("spec_method") or "").strip().lower(), "")
+    raw_method = str(eff_map.get("spec_method") or "").strip().lower()
+    canon_method = canonical_speculative_method(raw_method) if raw_method else ""
     if is_synth:
         spec_method = "eagle3"
-    elif stack_method and stack_method != "none":
-        spec_method = stack_method
-    elif dspark is not None or (draft is not None and draft.kind in {"dspark", "mtp_dspark", "standalone_draft"}):
+    elif canon_method in ZERO_NEURAL_DRAFT_METHODS:
+        spec_method = canon_method
+    elif canon_method in {"dspark", "dflash"}:
         spec_method = "dspark"
-    elif draft is not None and (draft.kind == "eagle3" or draft.execution_mode == "eagle3_serial"):
+    elif canon_method in {"eagle", "eagle3"}:
+        spec_method = canon_method
+    elif canon_method == "mtp" or canon_method.endswith("_mtp"):
+        spec_method = "mtp"
+    elif draft is not None and (str(draft.kind).lower() == "eagle3" or str(getattr(draft, "execution_mode", "")).lower() == "eagle3_serial"):
         spec_method = "eagle3"
+    elif dspark is not None or (draft is not None and str(draft.kind).lower() in {"dspark", "mtp_dspark", "standalone_draft"}):
+        spec_method = "dspark"
     else:
         spec_method = "mtp"
     return SpeculativeWorkloadPolicy(
@@ -1202,30 +1283,36 @@ def _build_scenario_contract(
     concurrency: int | None,
     canonical_track: str,
     mtp_tokens: int = 0,
+    require_scenario: bool = False,
 ) -> ScenarioContract | None:
-    if eff_role not in {"colocated", "pd_disaggregated", "pd_prefill", "pd_decode"}:
-        return None
-    if eff_role == "pd_decode":
+    """Validate all 4 deployment modes strictly via ``schema.scenario`` (zero 4096 fallback)."""
+    mode = validate_deployment_mode(eff_role)
+    if mode == "pd_decode":
         kv_layout = quant_plan.kv_cache_abi[0].planes[0].layout if quant_plan.kv_cache_abi else "BNSD"
-        ready = ReadyStateAssumption(
-            source="pre_populated_hbm",
-            context_tokens=max(1, int(prompt_tokens or DEFAULT_CONTEXT_TOKENS_FOR_QUANT)),
-            layout=kv_layout,
-            cache_abi_digests=tuple(
-                a.checkpoint_digest or a.producer_key for a in quant_plan.kv_cache_abi[:1]
-            ),
-        )
+        if prompt_tokens is None:
+            if not require_scenario:
+                return None
+            ready = None
+        else:
+            ready = ReadyStateAssumption(
+                source="pre_populated_hbm",
+                context_tokens=int(prompt_tokens),
+                layout=kv_layout,
+                cache_abi_digests=tuple(
+                    a.checkpoint_digest or a.producer_key for a in quant_plan.kv_cache_abi[:1]
+                ),
+            )
         sla = SLAContract(
-            ttft_ms=None,
+            ttft_ms=(float(ttft_slo_ms) if ttft_slo_ms is not None else None),
             tpot_ms=(float(tpot_slo_ms) if tpot_slo_ms is not None else None),
             ttft_boundary="unavailable",
             tpot_boundary="ready_state_decode",
         )
-    elif eff_role == "pd_prefill":
+    elif mode == "pd_prefill":
         ready = None
         sla = SLAContract(
             ttft_ms=(float(ttft_slo_ms) if ttft_slo_ms is not None else None),
-            tpot_ms=None,
+            tpot_ms=(float(tpot_slo_ms) if tpot_slo_ms is not None else None),
             ttft_boundary="prefill_completion_only",
             tpot_boundary="unavailable",
         )
@@ -1235,10 +1322,8 @@ def _build_scenario_contract(
             ttft_ms=(float(ttft_slo_ms) if ttft_slo_ms is not None else None),
             tpot_ms=(float(tpot_slo_ms) if tpot_slo_ms is not None else None),
         )
-    if eff_role == "pd_disaggregated" and lowering_plan.scheduling.pd_kv_transfer is None:
-        return None
     return ScenarioContract(
-        deployment_mode=eff_role,  # type: ignore[arg-type]
+        deployment_mode=mode,
         deployment_mode_origin="api_argument",
         workload_domain=workload_domain,  # type: ignore[arg-type]
         work_unit_kind=work_unit_kind,  # type: ignore[arg-type]
@@ -1251,8 +1336,8 @@ def _build_scenario_contract(
         lowering_plan=lowering_plan,
         hardware=hw_obj,
         primitive_table_digest="",
-        optimization_mode="modeling" if canonical_track == "expected_ideal" else "simulation",
-        execution_stage="after" if canonical_track == "expected_ideal" else "before",
+        optimization_mode="modeling" if canonical_track == "target" else "simulation",
+        execution_stage="after" if canonical_track == "target" else "before",
         sla=sla,
         limits=ConcurrencyLimits(
             runtime_max_num_seqs=int(resolved_max_seqs),
@@ -1260,9 +1345,9 @@ def _build_scenario_contract(
             workload_requested_concurrency=(int(concurrency) if concurrency is not None else None),
         ),
         num_devices=len(hw_obj.dies),
-        allow_solver_pd_split=(eff_role == "pd_disaggregated"),
+        allow_solver_pd_split=(mode == "pd_disaggregated"),
         ready_state=ready,
-        pd_transfer=lowering_plan.scheduling.pd_kv_transfer if eff_role == "pd_disaggregated" else None,
+        pd_transfer=lowering_plan.scheduling.pd_kv_transfer if mode == "pd_disaggregated" else None,
         provenance=(("role_arg", str(norm_role or "default_colocated")),),
         speculative_policy=_build_speculative_policy(
             workload_domain, model_spec, mtp_tokens, resolved_opts, lowering_plan,
@@ -1324,13 +1409,14 @@ def _apply_stack_and_lowerings(
             resolve_stack_track,
         )
         if (track_raw_eager or va_recommended is not False
-                or bool(optimizations) or canonical_track != "merged"):
+                or bool(optimizations) or canonical_track != "shipping"):
             mechanism_track_active = not raw_eager
             stack_key = _effective_stack_profile_key(runtime_stack, stack_id)
             stack_profile = resolve_runtime_stack(stack_key)
-            stack_model_key = str((va_profile or {}).get("canonical_model") or model_spec.name)
             ctx_opts: dict[str, Any] = {
                 "ranks_per_node": int(machine.get("ranks_per_node", 0) or 0),
+                "sp": bool(runtime_meta.get("sp", False)),
+                "speculative_k": int(runtime_dict.get("mtp_proposal_tokens") or 0),
             }
             additional_cfg = runtime_meta.get("additional_config") or {}
             if isinstance(additional_cfg, Mapping) and additional_cfg.get("enable_fused_mc2") is not None:
@@ -1343,8 +1429,11 @@ def _apply_stack_and_lowerings(
                 caller_explicit=caller_explicit, options=ctx_opts,
             )
             resolved_track = resolve_stack_track(
-                stack_profile, track=canonical_track, model_key=stack_model_key,
-                ctx=mechanism_ctx, optimizations=optimizations,
+                stack_profile,
+                track=canonical_track,
+                model_key=str(model_spec.name or ""),
+                ctx=mechanism_ctx,
+                optimizations=optimizations,
                 exclude_optimizations=exclude_optimizations,
             )
             if not raw_eager or optimizations:
@@ -1383,7 +1472,10 @@ def _apply_stack_and_lowerings(
         lowerings = dict(kernels.get("lowerings") or {})
         if any(plan.ffn == "moe" for plan in model_spec.layer_plans):
             kernels.setdefault("moe_gating", {"implementation": "vllm_ascend_cann_gating"})
-        if any(int(getattr(plan, "compress_ratio", 0) or 0) > 0 for plan in model_spec.layer_plans):
+        if (
+            any(int(getattr(plan, "compress_ratio", 0) or 0) > 0 for plan in model_spec.layer_plans)
+            and default_abi_registry().is_shipping_available("aclnnCompressor", _arch_key(sku).upper())
+        ):
             lowerings.setdefault("compressor", "vllm_ascend_cann_compressor")
         if any(int(getattr(plan, "index_kpool", 1) or 1) > 1 for plan in model_spec.layer_plans):
             lowerings.setdefault("pool_key_indexer", "vllm_ascend_cann_keypool_caller")
@@ -1515,7 +1607,7 @@ def _build_runtime_dict(
         },
         "collective_startup_mode": (
             str(collective_startup_mode) if collective_startup_mode is not None
-            else "topology" if machine.get("collective_protocols") else "legacy"
+            else ("topology" if machine.get("collective_protocols") else "legacy")
         ),
         "matrix_compute_policy": str(matrix_compute_policy),
         "recover_ssm": bool(recover_ssm) if recover_ssm is not None else False,
@@ -1638,6 +1730,85 @@ def _resolve_mtp_policy(
     return prof_mtp, accept, "profile"
 
 
+def _curated_ckpt_safe_for_auto_profile(
+    ckpt_qspec: Any, hw_family: str, model_spec: Any,
+) -> bool:
+    """Return True when a curated checkpoint matches the hardware generation's native ISA."""
+    if ckpt_qspec is None:
+        return False
+    from dataclasses import replace as _replace_q
+    from mindie_sim.compose.inputs import _collect_quant_formats, _qspec_weight_formats
+
+    probe_spec = _replace_q(model_spec, quant=ckpt_qspec, kv_dtype=str(ckpt_qspec.kv_dtype))
+    all_fmts = set(_collect_quant_formats(probe_spec))
+    weight_fmts = _qspec_weight_formats(ckpt_qspec)
+    has_fp8_or_fp4 = any(("fp8" in f or "fp4" in f or "mxfp" in f) for f in all_fmts)
+    has_int_weight = bool(weight_fmts & {"int8", "int4"})
+    if hw_family == "a5":
+        return has_fp8_or_fp4 and not has_int_weight
+    if hw_family in {"a2", "a3"}:
+        primary_wf = str(ckpt_qspec.weight_format or "").strip().lower()
+        return (not has_fp8_or_fp4) and primary_wf != "int4"
+    return False
+
+
+def _resolve_production_profile_quant(
+    *,
+    model_spec: Any,
+    sku: str,
+    hw_family: str,
+    role: str | None,
+    ckpt_qspec: Any,
+    target_proj: str,
+    is_auto_va: bool,
+    explicit_quant: bool,
+    checkpoint_quant_declared: bool,
+    eff_quant: Any,
+    used_curated_ckpt: bool,
+) -> tuple[dict[str, Any], Any, bool]:
+    """Compute structural production profile and decide whether curated checkpoint applies."""
+    va_profile = simulation_config(
+        model_spec, sku, hw_family, role=role, model=model_spec,
+    )
+    model_is_unquantized = (
+        model_spec.quant is None
+        or (
+            str(model_spec.quant.weight_format or "").strip().lower() in {"", "bf16", "fp16", "fp32", "float"}
+            and str(model_spec.quant.expert_weight_format or "").strip().lower() in {"", "bf16", "fp16", "fp32", "float"}
+        )
+    )
+    ckpt_safe_auto = _curated_ckpt_safe_for_auto_profile(ckpt_qspec, hw_family, model_spec)
+    use_curated_for_profile = (
+        ckpt_qspec is not None
+        and (
+            (va_profile.get("quant") is None and model_is_unquantized and ckpt_safe_auto)
+            or curated_quant_compatible_with_profile(
+                ckpt_qspec, va_profile.get("quant"),
+                model_spec=model_spec, mlapo=bool(va_profile.get("mlapo")),
+            )
+        )
+    )
+    can_apply_profile = (
+        not explicit_quant and not is_auto_va
+        and not (checkpoint_quant_declared and model_spec.quant is not None)
+    )
+    va_profile["quantization_action"] = (
+        "curated_checkpoint_applied" if (is_auto_va and used_curated_ckpt) else
+        "curated_checkpoint_applied" if (can_apply_profile and use_curated_for_profile) else
+        "stack_default_quant_projection" if (is_auto_va and target_proj) else
+        "explicit_quant_preserved" if explicit_quant else
+        "checkpoint_quant_preserved" if (checkpoint_quant_declared and model_spec.quant is not None) else
+        "documented_alternative_applied" if va_profile.get("quant") is not None else
+        "no_profile_override"
+    )
+    va_profile.setdefault("graph_capture_mode", None)
+    if can_apply_profile:
+        if use_curated_for_profile:
+            return va_profile, ckpt_qspec, True
+        return va_profile, va_profile.get("quant"), used_curated_ckpt
+    return va_profile, eff_quant, used_curated_ckpt
+
+
 def _prepare_composed_model(
     *,
     model: str | Path | Mapping[str, Any],
@@ -1661,7 +1832,10 @@ def _prepare_composed_model(
     model_limit = _resolve_max_position_embeddings(model, model_spec)
     workload_domain = infer_workload_domain(model_spec)
     work_unit_kind = default_work_unit_for_domain(workload_domain)
-    hw_selector = sku if hardware_backend == "ascend" else hardware_backend
+    hw_selector = (
+        str(machine.get("architecture") or _arch_key(sku) or sku)
+        if hardware_backend == "ascend" else hardware_backend
+    )
     adapter = resolve_stack_for_scenario(
         requested_stack=runtime_stack,
         workload_domain=workload_domain,
@@ -1690,49 +1864,38 @@ def _prepare_composed_model(
         eff_quant = ckpt_qspec if ckpt_qspec is not None else (target_proj or None)
         used_curated_ckpt = ckpt_qspec is not None
     if production and workload_domain != "diffusion" and adapter.capabilities().stack_id != "raw-eager":
-        model_id = (
-            str(model_spec.name)
-            if spec_meta.get("checkpoint_repo_id") or not isinstance(model, str)
-            else str(model)
+        va_profile, eff_quant, used_curated_ckpt = _resolve_production_profile_quant(
+            model_spec=model_spec, sku=sku, hw_family=hw_family, role=role,
+            ckpt_qspec=ckpt_qspec, target_proj=target_proj,
+            is_auto_va=is_auto_va, explicit_quant=explicit_quant,
+            checkpoint_quant_declared=checkpoint_quant_declared,
+            eff_quant=eff_quant, used_curated_ckpt=used_curated_ckpt,
         )
-        va_profile = va_recommended_config(model_id, sku, role=role)
-        use_curated_for_profile = (
-            not explicit_quant
-            and not is_auto_va
-            and not (checkpoint_quant_declared and model_spec.quant is not None)
-            and curated_quant_compatible_with_profile(
-                ckpt_qspec, va_profile["quant"],
-                model_spec=model_spec, mlapo=bool(va_profile.get("mlapo")),
-            )
+    if (
+        hw_family in {"a2", "a3"}
+        and eff_quant is not None
+        and not isinstance(eff_quant, (str, Mapping))
+        and model_spec.quant is not None
+        and "fp8" in str(model_spec.quant.index_dtype or "").lower()
+    ):
+        from dataclasses import replace as _replace_q
+        model_spec = _replace_q(
+            model_spec,
+            quant=_replace_q(model_spec.quant, index_dtype="bf16", index_scale_dtype="none"),
         )
-        va_profile["quantization_action"] = (
-            "checkpoint_descriptor_applied" if (
-                (is_auto_va and ckpt_qspec is not None)
-                or (use_curated_for_profile and va_profile["quant"] is None)
-            ) else
-            "stack_default_quant_projection" if (is_auto_va and target_proj) else
-            "explicit_quant_preserved" if explicit_quant else
-            "checkpoint_quant_preserved" if (checkpoint_quant_declared and model_spec.quant is not None) else
-            "documented_alternative_applied" if va_profile["quant"] is not None else
-            "no_profile_override"
-        )
-        va_profile.setdefault("graph_capture_mode", None)
-        if not explicit_quant and not is_auto_va and not (checkpoint_quant_declared and model_spec.quant is not None):
-            if use_curated_for_profile:
-                eff_quant = ckpt_qspec
-                used_curated_ckpt = True
-            else:
-                eff_quant = va_profile["quant"]
     model_spec = _apply_quant_override(model_spec, eff_quant, machine)
     if (
-        not is_auto_va
+        quant is None
+        and not is_auto_va
         and not used_curated_ckpt
+        and not checkpoint_quant_declared
         and (
-            (
-                checkpoint_map.source_format in {"explicit_synthetic_preset", "unquantized_native"}
-                and checkpoint_map.provenance.checkpoint_id.startswith(("explicit-preset/", "native/"))
+            eff_quant is not None
+            or (
+                ckpt_qspec is not None
+                and checkpoint_map.provenance.origin == "verified_checkpoint_descriptor"
+                and not isinstance(model, Path)
             )
-            or (quant is None and ckpt_qspec is not None)
         )
     ):
         checkpoint_map = synthetic_checkpoint_quant_map(
@@ -1753,7 +1916,6 @@ def _prepare_composed_model(
         and quant.strip().lower() in {"bf16", "bfloat16", "fp16", "float16", "fp32"}
     )
     if (production and va_profile is not None
-            and va_profile.get("quant") is not None
             and not unquantized_override
             and not is_auto_va
             and not (checkpoint_quant_declared and not explicit_quant)):
@@ -1818,6 +1980,36 @@ def _effective_mtp_from_plan(
     return eff_k, eff_accept
 
 
+def _prepare_spec_and_block_size(
+    model_spec: Any, *, canonical_track: str, mtp_tokens: int,
+    allow_synthetic_gqa_draft: bool, spec_method_norm: str | None,
+    block_size: int | None, va_profile: Mapping[str, Any] | None, tp: int,
+) -> tuple[Any, int]:
+    optimization_mode = "modeling" if canonical_track == "target" else "simulation"
+    allow_gqa_draft = bool(allow_synthetic_gqa_draft)
+    if allow_gqa_draft and optimization_mode != "modeling":
+        raise ModelingError(
+            "simulation_mode_forbids_synthetic_gqa_draft:"
+            "actual_deployment_requires_real_speculative_checkpoint"
+        )
+    if mtp_tokens > 0:
+        model_spec = prepare_speculation(
+            model_spec, mtp_tokens,
+            allow_synthetic_gqa=allow_gqa_draft,
+            spec_method=spec_method_norm,
+        )
+    if block_size is not None:
+        return model_spec, int(block_size)
+    resolved_block_size = int((va_profile or {}).get("kv_block_size") or DEFAULT_BLOCK_SIZE)
+    if dict(model_spec.metadata).get("cache_allocator") == "paired_sfa":
+        from mindie_sim.catalog.paired_sfa import minimum_block_size
+        resolved_block_size = max(
+            resolved_block_size,
+            minimum_block_size(model_spec, tp=tp, proposals=mtp_tokens),
+        )
+    return model_spec, resolved_block_size
+
+
 def _compose_explicit_case(
     model, hardware, axes, norm_role, *, graph_capture_mode, raw_eager, feature_track,
     va_recommended, machine_options, model_options, mtp_options, scenario_options,
@@ -1835,8 +2027,8 @@ def _compose_explicit_case(
     )
     ascend_backend = hardware_backend == "ascend"
     from mindie_sim.feature_mechanisms import normalize_feature_track
-    canonical_track = normalize_feature_track(feature_track) if ascend_backend else "merged"
-    track_raw_eager = canonical_track == "raw_eager"
+    canonical_track = normalize_feature_track(feature_track) if ascend_backend else "shipping"
+    track_raw_eager = canonical_track == "eager"
     if track_raw_eager:
         raw_eager = True
     if raw_eager and va_recommended:
@@ -1855,11 +2047,13 @@ def _compose_explicit_case(
     stack_id = adapter.capabilities().stack_id
     if stack_id == "raw-eager" and not raw_eager:
         raw_eager = True
-        canonical_track = "raw_eager"
+        canonical_track = "eager"
         track_raw_eager = True
         production = False
     if workload_domain == "diffusion":
         production = False
+    raw_spec_method = mtp_options.get("spec_method")
+    spec_method_norm = str(raw_spec_method).strip().lower() if raw_spec_method else None
     mtp_tokens, resolved_mtp_accept, mtp_source = _resolve_mtp_policy(
         raw_eager=raw_eager, production=production, va_profile=va_profile,
         model_spec=model_spec, model_limit=model_limit,
@@ -1869,28 +2063,15 @@ def _compose_explicit_case(
         tpot_slo_ms=scenario_options["tpot_slo_ms"],
         require_scenario=scenario_options["require_scenario"],
         max_model_len=scenario_options["max_model_len"],
-        **mtp_options,
+        mtp_proposal_tokens=mtp_options["mtp_proposal_tokens"],
+        mtp_acceptance_length=mtp_options["mtp_acceptance_length"],
     )
-    optimization_mode = "modeling" if canonical_track == "expected_ideal" else "simulation"
-    allow_gqa_draft = bool(allow_synthetic_gqa_draft)
-    if allow_gqa_draft and optimization_mode != "modeling":
-        raise ModelingError(
-            "simulation_mode_forbids_synthetic_gqa_draft:"
-            "actual_deployment_requires_real_speculative_checkpoint"
-        )
-    model_spec = prepare_speculation(
-        model_spec, mtp_tokens, allow_synthetic_gqa=allow_gqa_draft,
+    model_spec, resolved_block_size = _prepare_spec_and_block_size(
+        model_spec, canonical_track=canonical_track, mtp_tokens=mtp_tokens,
+        allow_synthetic_gqa_draft=allow_synthetic_gqa_draft,
+        spec_method_norm=spec_method_norm, block_size=block_size,
+        va_profile=va_profile, tp=resolved_axes["tp"],
     )
-    if block_size is not None:
-        resolved_block_size = int(block_size)
-    else:
-        resolved_block_size = int((va_profile or {}).get("kv_block_size") or DEFAULT_BLOCK_SIZE)
-        if dict(model_spec.metadata).get("cache_allocator") == "paired_sfa":
-            from mindie_sim.catalog.paired_sfa import minimum_block_size
-            resolved_block_size = max(
-                resolved_block_size,
-                minimum_block_size(model_spec, tp=resolved_axes["tp"], proposals=mtp_tokens),
-            )
 
     notes: list[dict[str, Any]] = []
     exclude_set = frozenset(
@@ -1907,11 +2088,14 @@ def _compose_explicit_case(
         **policy_options,
     )
 
-    model_spec = ensure_native_mla_draft(model_spec, mtp_tokens)
+    is_zero_neural_spec = bool(spec_method_norm and spec_method_norm in ZERO_NEURAL_DRAFT_METHODS)
+    if not is_zero_neural_spec:
+        model_spec = ensure_native_mla_draft(model_spec, mtp_tokens)
     if mtp_tokens > 0:
-        aux = model_spec.auxiliary
-        if getattr(aux, "mtp", None) is None and getattr(aux, "dspark", None) is None:
-            raise ModelingError("draft_structure_required_for_mtp_proposal_tokens")
+        if not is_zero_neural_spec:
+            aux = model_spec.auxiliary
+            if getattr(aux, "mtp", None) is None and getattr(aux, "dspark", None) is None:
+                raise ModelingError("draft_structure_required_for_mtp_proposal_tokens")
         if not (1.0 <= float(resolved_mtp_accept) <= float(1 + mtp_tokens)):
             raise ModelingError("invalid_mtp_acceptance_length")
 
@@ -1920,6 +2104,14 @@ def _compose_explicit_case(
         model_limit=model_limit, mtp_tokens=mtp_tokens, role=norm_role, **scenario_options,
     )
 
+    single_spine_rt_opts = {**runtime_options, "max_num_batched_tokens": int(resolved_max_batched)}
+    if spec_method_norm:
+        single_spine_rt_opts["spec_method"] = spec_method_norm
+    single_spine_policy_opts = {
+        **policy_options,
+        "sp": bool(policy_out["sp"]),
+        "graph_capture_mode": str(policy_out["graph_capture_mode"]),
+    }
     resolved_opts, _quant_plan, _lowering_plan, _scenario_contract, single_spine_meta = (
         _resolve_single_spine_contracts(
             adapter=adapter, model_spec=model_spec, checkpoint_map=checkpoint_map,
@@ -1928,7 +2120,7 @@ def _compose_explicit_case(
             canonical_track=canonical_track, raw_eager=raw_eager, norm_role=norm_role,
             mtp_tokens=mtp_tokens, resolved_max_seqs=resolved_max_seqs,
             resolved_block_size=resolved_block_size, model_options=model_options,
-            policy_options=policy_options, runtime_options=runtime_options,
+            policy_options=single_spine_policy_opts, runtime_options=single_spine_rt_opts,
             scenario_options=scenario_options, stack_options=stack_options,
         )
     )
@@ -2010,8 +2202,14 @@ def _assemble_composed_case(
     if mtp_tokens > 0:
         mtp_draft = getattr(model_spec.auxiliary, "mtp", None)
         dspark_draft = getattr(model_spec.auxiliary, "dspark", None)
+        sp_req_opts = (single_spine_meta.get("contract_inputs") or {}).get("requested_options") or {}
+        eff_spec_method = str(sp_req_opts.get("spec_method") or "").strip().lower()
+        if eff_spec_method:
+            runtime_meta["spec_method"] = eff_spec_method
         if mtp_draft is not None or dspark_draft is not None:
             runtime_meta["draft_mode"] = "mtp" if mtp_draft is not None else "dspark"
+        elif eff_spec_method in ZERO_NEURAL_DRAFT_METHODS:
+            runtime_meta["draft_mode"] = eff_spec_method
         if bool(getattr(mtp_draft, "is_synthetic", False)):
             runtime_meta["allow_synthetic_gqa_draft"] = True
         runtime_meta["draft_proposal_tokens"] = mtp_tokens
@@ -2073,7 +2271,7 @@ def _assemble_composed_case(
             ("multistream_overlap_shared_expert", policy_options["multistream_overlap_shared_expert"] is not None),
             ("moe_comm_mode", moe_comm_mode is not None),
             ("enable_fused_mc2", policy_options["enable_fused_mc2"] is not None or (
-                canonical_track in {"merged", "unmerged_pr"} and (
+                canonical_track in {"shipping", "proposed"} and (
                     policy_out["enable_fused_mc2"] == 0
                     or (policy_out["mso"] and policy_out["execution_policy"].get("mso_source") == "caller")
                 )
@@ -2134,7 +2332,7 @@ _COMPOSE_OPTION_GROUPS: dict[str, tuple[str, ...]] = {
         "quant", "kv_cache_dtype", "indexer_kv_dtype", "layers",
         "n_routed_experts", "num_experts_per_tok", "promote_dense_to_moe",
     ),
-    "mtp_options": ("mtp_proposal_tokens", "mtp_acceptance_length"),
+    "mtp_options": ("mtp_proposal_tokens", "mtp_acceptance_length", "spec_method"),
     "scenario_options": (
         "prompt_tokens", "output_tokens", "concurrency", "prefix_tokens",
         "arrival_gap_ms", "ttft_slo_ms", "tpot_slo_ms", "require_scenario",
@@ -2200,6 +2398,7 @@ def compose_case(
     graph_capture_mode: str | None = None,
     mtp_proposal_tokens: int | None = None,
     mtp_acceptance_length: float | None = None,
+    spec_method: str | None = None,
     draft_max_model_len: int | None = None,
     draft_enforce_eager: bool | None = None,
     ttft_slo_ms: float | None = None,
@@ -2243,7 +2442,7 @@ def compose_case(
     enable_fused_mc2: int | None = None,
     enable_prefill_mc2: bool | None = None,
     enable_pcp_o_proj_weight_sharding: bool = False,
-    enable_sfa_dcp_sharded_indexer: bool = False,
+    enable_sfa_dcp_sharded_indexer: bool | None = None,
     dcp_q_replicate: bool = False,
     kv_cache_dtype: str | None = None,
     indexer_kv_dtype: str | None = None,
@@ -2264,7 +2463,7 @@ def compose_case(
     mte2_ceiling_bytes_per_s: float | None = None,
     mte2_efficiency: Any = None,
     runtime_stack: str | Path | Mapping[str, Any] | None = None,
-    feature_track: str = "merged",
+    feature_track: str = "shipping",
     optimizations: Sequence[str] = (),
     exclude_optimizations: Sequence[str] = (),
     parallel: str | Mapping[str, Any] | None = None,

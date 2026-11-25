@@ -1,18 +1,16 @@
 """Optimization mechanism registry, stack profiles, software stack registry and 4-track waterfall.
 
 [Role] Own optimization mechanism declarations, structural applicability rules,
-  pluggable ``RuntimeStackProfile`` / ``SoftwareStackRegistry`` resolution, and
-  4-track (raw_eager -> merged -> unmerged_pr -> expected_ideal) waterfall evaluation.
+  and canonical 4-track (eager -> shipping -> proposed -> target) contracts.
 [Invariants] Mechanisms apply strictly by model/hardware structural capability,
-  never by hardcoded model names. ``SoftwareStackRegistry.resolve_base`` never
-  mutates caller ``Case`` objects or ``Software.kernels`` dictionaries.
+  never by hardcoded model names (AG014). Zero legacy track wire aliases, zero
+  silent ModelingError swallows, zero model-keyed stack defaults.
 [Timeouts & Locks] Bounded JSON manifest reads (< 50 MiB); delegates step
   evaluation to canonical Engine; no locks.
 [Side-Effect Policy] Pure planning and read-only simulation; returns new frozen
   ``ResolvedBase`` and ``Case`` records."""
 from __future__ import annotations
 
-from collections import defaultdict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -21,7 +19,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from mindie_sim.prediction.efficiency import analyze_network_efficiency
+from mindie_sim.backends.abi_registry import default_abi_registry
+from mindie_sim.catalog.draft_spec import validate_fia_speculative_tokens
 from mindie_sim.prediction.operators.linear_attention.gdn_domain import (
     GDN_CHUNK32_TOKENS,
     model_supports_gdn_chunk32,
@@ -36,8 +35,14 @@ from mindie_sim.schema.case import Case, Software
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.model import ModelSpec
+from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.speculative import SpeculativeSpec
-from mindie_sim.stacks.vllm_ascend.profiles import VA_RECOMMENDED_PROFILES
+from mindie_sim.schema.stack import STACK_TRACKS
+from mindie_sim.stacks.vllm_ascend.profiles import (
+    ManifestBinding,
+    extract_model_capabilities,
+)
+from mindie_sim.stacks.vllm_ascend.speculative import build_capture_bucket_rule
 
 MX_SCALE_GROUP_SIZE = 32
 MSA_MIN_BLOCK_SIZE = 64
@@ -274,12 +279,19 @@ def _apply_cann_megamoe(rt: dict[str, Any], ctx: MechanismContext) -> None:
         return
     if int(ctx.parallel.get("redundant_experts_per_rank", 0) or 0) > 0:
         return
-    has_latent_or_situ = any(
-        p.ffn == "moe" and (p.expert_latent_size > 0 or p.ffn_activation == "situ")
+    routed_only = any(
+        p.ffn == "moe"
+        and (
+            p.expert_latent_size > 0
+            or p.ffn_activation == "situ"
+            or bool(getattr(p, "shared_expert_gate", False))
+            or int(getattr(p, "num_shared_experts", 0) or 0) <= 0
+        )
         for p in ctx.model.layer_plans
     )
-    default_mode = FUSED_MC2_ROUTED_MODE if has_latent_or_situ else FUSED_MC2_SHARED_MODE
-    level = int(ctx.options.get("enable_fused_mc2", default_mode))
+    default_mode = FUSED_MC2_ROUTED_MODE if routed_only else FUSED_MC2_SHARED_MODE
+    raw_level = int(ctx.options.get("enable_fused_mc2", default_mode))
+    level = min(raw_level, FUSED_MC2_ROUTED_MODE) if routed_only else raw_level
     _update_meta(
         rt,
         moe_comm_mode="dynamic",
@@ -311,9 +323,20 @@ def _apply_msa_score_v2(rt: dict[str, Any], _ctx: MechanismContext) -> None:
     _update_meta(rt, msa_index_score_v2=True)
 
 
-def _apply_step5_qkvg_indexer(rt: dict[str, Any], _ctx: MechanismContext) -> None:
+def _apply_region_gbsa_qkvg_indexer(rt: dict[str, Any], _ctx: MechanismContext) -> None:
     _append_passes(rt, "qkv_norm_rope", "indexer_online_topk")
     _update_meta(rt, flash_attn_npu_3=True, packed_qkvg_indexer=True)
+
+
+def _apply_csa2_indexer_epilogue(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    if default_abi_registry().is_shipping_available("aclnnCompressor", ctx.arch.upper()):
+        _set_lowering(rt, "compressor", "vllm_ascend_cann_compressor")
+    _update_meta(rt, csa2_epilogue_engram_overlap=True)
+
+
+def _apply_latent_moe_dspark_c8(rt: dict[str, Any], ctx: MechanismContext) -> None:
+    _apply_shared_expert_overlap(rt, ctx)
+    _update_meta(rt, latent_moe_dspark_c8_mla=True)
 
 
 def _apply_dspark_static_kernel(rt: dict[str, Any], ctx: MechanismContext) -> None:
@@ -328,19 +351,9 @@ def _apply_dspark_static_kernel(rt: dict[str, Any], ctx: MechanismContext) -> No
     )
 
 
-def _apply_dsv41_epilogue(rt: dict[str, Any], _ctx: MechanismContext) -> None:
-    _set_lowering(rt, "compressor", "vllm_ascend_cann_compressor")
-    _update_meta(rt, dsv41_epilogue_engram_overlap=True)
-
-
 def _apply_in_kernel_gdn_decode_gate(rt: dict[str, Any], _ctx: MechanismContext) -> None:
     _set_layout_strided(rt, "gdn_gating", "beta", "alpha")
     _update_meta(rt, skip_gdn_output_zero=True)
-
-
-def _apply_kimi_dspark_c8(rt: dict[str, Any], ctx: MechanismContext) -> None:
-    _apply_shared_expert_overlap(rt, ctx)
-    _update_meta(rt, kimi_dspark_c8_mla=True)
 
 
 def _has_any_local_tp(parallel: Any) -> bool:
@@ -521,15 +534,17 @@ def _source_attention_and_moe_mechanisms() -> tuple[OptimizationMechanism, ...]:
             apply=_apply_tp_mc2_overlap,
         ),
         OptimizationMechanism(
-            id="step5_qkvg_indexer_fusion", category="attention_fusion",
+            id="region_gbsa_qkvg_indexer_fusion", category="attention_fusion",
             phases=("prefill", "decode"),
-            summary="Packed SWA qkvg + Triton indexer_qkz_norm_rope + CANN 9.3 FA3 hd=192 SWA",
+            summary="Packed SWA qkvg + Triton indexer_qkz_norm_rope + CANN 9.3 FA3 SWA",
             eligible=lambda ctx: (
                 ctx.arch == "a5"
-                and any(p.q_output_gate_kind == "headwise" and p.indexer
-                        for p in ctx.model.layer_plans)
+                and any(
+                    p.q_output_gate_kind == "headwise" and p.indexer
+                    for p in ctx.model.layer_plans
+                )
             ),
-            apply=_apply_step5_qkvg_indexer,
+            apply=_apply_region_gbsa_qkvg_indexer,
         ),
         OptimizationMechanism(
             id="dspark_static_kernel_allowlist", category="compilation", phases=("decode",),
@@ -543,15 +558,17 @@ def _source_attention_and_moe_mechanisms() -> tuple[OptimizationMechanism, ...]:
             apply=_apply_dspark_static_kernel,
         ),
         OptimizationMechanism(
-            id="dsv41_indexer_epilogue_fusion", category="attention_fusion",
+            id="csa2_indexer_epilogue_fusion", category="attention_fusion",
             phases=("prefill", "decode"),
-            summary="Fused DSV4.1 indexer prologue, MQSMLA epilogue, C1-only DSpark share & Engram overlap",
+            summary="Fused CSA2 indexer prologue, MQSMLA epilogue, C1-only DSpark share & Engram overlap",
             eligible=lambda ctx: (
                 ctx.arch == "a5"
-                and any(p.mla_variant == "latent_mqa" and p.compressor_kind == "gated_ring"
-                        for p in ctx.model.layer_plans)
+                and any(
+                    p.mla_variant == "latent_mqa" and p.compressor_kind == "gated_ring"
+                    for p in ctx.model.layer_plans
+                )
             ),
-            apply=_apply_dsv41_epilogue,
+            apply=_apply_csa2_indexer_epilogue,
         ),
         OptimizationMechanism(
             id="in_kernel_gdn_decode_gate", category="recurrent", phases=("decode",),
@@ -563,13 +580,13 @@ def _source_attention_and_moe_mechanisms() -> tuple[OptimizationMechanism, ...]:
             apply=_apply_in_kernel_gdn_decode_gate,
         ),
         OptimizationMechanism(
-            id="kimi_dspark_c8_mla", category="moe_overlap", phases=("prefill", "decode"),
-            summary="5L MLA DSpark C8 QuantFlashMLA + Kimi Latent-MoE norm/quant & full-width shared overlap",
+            id="latent_moe_dspark_c8_mla", category="moe_overlap", phases=("prefill", "decode"),
+            summary="5L MLA DSpark C8 QuantFlashMLA + Latent-MoE norm/quant & shared expert overlap",
             eligible=lambda ctx: (
                 ctx.arch == "a5"
                 and any(p.expert_latent_size > 0 for p in ctx.model.layer_plans)
             ),
-            apply=_apply_kimi_dspark_c8,
+            apply=_apply_latent_moe_dspark_c8,
         ),
         OptimizationMechanism(
             id="keypool_int8_indexer", category="attention_fusion",
@@ -705,10 +722,7 @@ def _apply_sp(rt: dict[str, Any], ctx: MechanismContext) -> None:
         or (ep == 1 and not has_moe_layers and dense_sp_requested)
     )
     if pcp >= 1 and pp >= 1 and tp > 1 and ep_compatible:
-        try:
-            _validate_model(ctx.model, padding="right_to_tp")
-        except ModelingError:
-            return
+        _validate_model(ctx.model, padding="right_to_tp")
         kernels = dict(rt.get("kernels") or {})
         kernels.setdefault(
             "sequence_parallel",
@@ -782,6 +796,53 @@ def _apply_norm_quant_materialize_all(rt: dict[str, Any], ctx: MechanismContext)
     rt["kernels"] = kernels
 
 
+def _mla_prolog_fusion_eligible(ctx: MechanismContext) -> bool:
+    """Check structural domain preconditions for fused MLA Prolog (zero ModelingError swallow)."""
+    from mindie_sim.prediction.operators.mla_prolog.family_mla_prolog import (
+        BF16_CACHE_DTYPES,
+        MLA_PROLOG_QUERY_LORA_RANKS,
+        _indexer_q_category,
+        _prolog_port_formats,
+    )
+    from mindie_sim.prediction.operators.mla_prolog.mla_prolog_packed import SUPPORTED_QUERY_FORMATS
+    from mindie_sim.catalog.ops import compute_dtype_for
+
+    mla_layers = [p for p in ctx.model.layer_plans if p.attention == "mla" and p.q_lora_rank > 0]
+    if not mla_layers or ctx.model.activation_dtype != "bf16":
+        return False
+    quant = ctx.model.quant
+    if quant is None:
+        return False
+    w_ports, act_ports = _prolog_port_formats(quant)
+    if len(set(w_ports)) != 1 or len(set(act_ports)) != 1:
+        return False
+    proj_w, proj_act = w_ports[0], act_ports[0]
+    if proj_w not in {"bf16", "int8", "fp8_e4m3"}:
+        return False
+    packed = ctx.arch in {"a3", "a5"} and quant.kv_dtype == "int8"
+    if packed and (proj_w not in SUPPORTED_QUERY_FORMATS or proj_act != proj_w):
+        return False
+    if quant.kv_dtype not in BF16_CACHE_DTYPES and not packed:
+        return False
+    for plan in mla_layers:
+        if (
+            plan.mla_variant != "latent_mla"
+            or plan.cache_kind != "dense"
+            or plan.qk_rope_head_dim <= 0
+            or bool(plan.mla_use_nope)
+            or bool(plan.mla_qkv_a_gate_fused)
+            or bool(plan.mla_output_gate)
+            or plan.q_lora_rank not in MLA_PROLOG_QUERY_LORA_RANKS
+        ):
+            return False
+        if proj_act != ctx.model.activation_dtype and (
+            plan.indexer or plan.owns_topk or plan.index_query_per_layer
+        ):
+            if compute_dtype_for(quant, _indexer_q_category(quant))[1] != proj_act:
+                return False
+    return True
+
+
 def _apply_mla_prolog(rt: dict[str, Any], ctx: MechanismContext) -> None:
     from mindie_sim.prediction.operators.mla_prolog.family_mla_prolog import validate as validate_mla_prolog
     from mindie_sim.schema.parallel import ParallelSpec
@@ -800,15 +861,12 @@ def _apply_mla_prolog(rt: dict[str, Any], ctx: MechanismContext) -> None:
     if ctx.arch in {"a3", "a5"} and quant is not None and quant.kv_dtype == "int8":
         from mindie_sim.prediction.operators.mla_prolog.mla_prolog_packed import LAYOUT
         options["cache_layout"] = LAYOUT
-    try:
-        for plan in mla_layers:
-            validate_mla_prolog(plan=plan, parallel=p_cfg, model=ctx.model,
-                                quant=quant, lowering_passes=passes, **options)
-        _set_lowering(rt, "mla_prolog", (
-            {"implementation": "vllm_ascend_mla_prolog_v3", "options": options}
-            if options else "vllm_ascend_mla_prolog_v3"))
-    except ModelingError:
-        return
+    for plan in mla_layers:
+        validate_mla_prolog(plan=plan, parallel=p_cfg, model=ctx.model,
+                            quant=quant, lowering_passes=passes, **options)
+    _set_lowering(rt, "mla_prolog", (
+        {"implementation": "vllm_ascend_mla_prolog_v3", "options": options}
+        if options else "vllm_ascend_mla_prolog_v3"))
 
 
 def _apply_attn_res(rt: dict[str, Any], _ctx: MechanismContext) -> None:
@@ -954,14 +1012,13 @@ for _item in (
     OptimizationMechanism(
         id="mla_prolog_fusion", category="attention_fusion", phases=("prefill", "decode"),
         summary="Fused MLA Prolog (q_a/kv_a norm, RoPE, KV cache write)",
-        eligible=lambda ctx: any(p.attention == "mla" and p.q_lora_rank > 0 for p in ctx.model.layer_plans),
+        eligible=_mla_prolog_fusion_eligible,
         apply=_apply_mla_prolog,
     ),
     OptimizationMechanism(
         id="attn_res_prefix_fusion", category="residual_fusion", phases=("prefill", "decode"),
         summary="Fused AttentionResidual prefix accumulator (AttnResFwd)",
-        eligible=lambda ctx: (ctx.arch == "a5"
-                              and any(p.residual_block_size > 0 for p in ctx.model.layer_plans)),
+        eligible=lambda ctx: any(p.residual_block_size > 0 for p in ctx.model.layer_plans),
         apply=_apply_attn_res,
     ),
     OptimizationMechanism(
@@ -1115,160 +1172,165 @@ def _network(analysis: Mapping[str, Any]) -> dict[str, float]:
     }
 
 
-def _compare_pr_ablations(
-    model, hardware, runtime_stack, pr_report, merged_ms, pr_ms, *,
-    phase, tokens, context, sequences, scope, compose_kwargs,
-):
-    from mindie_sim.compose import compose_case
+NS_PER_MS = 1_000_000
 
+
+def _ms_to_ns(duration_ms: float) -> int:
+    return int(round(float(duration_ms) * NS_PER_MS))
+
+
+def _compare_pr_ablations(
+    model: str | Mapping[str, Any],
+    hardware: str | Mapping[str, Any],
+    runtime_stack: str | Mapping[str, Any] | None,
+    proposed_report: Mapping[str, Any],
+    shipping_ns: int,
+    proposed_ns: int,
+    *,
+    phase: str,
+    tokens: int,
+    context: int,
+    sequences: int,
+    scope: str,
+    compose_kwargs: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.efficiency import analyze_network_efficiency
+
+    shipping_ms = shipping_ns / NS_PER_MS
+    proposed_ms = proposed_ns / NS_PER_MS
     pr_ablations: list[dict[str, Any]] = []
     loo_ablations: list[dict[str, Any]] = []
-    single_cache: dict[str, float] = {}
-    loo_cache: dict[str, float] = {}
-    for pr_item in pr_report["unmerged_pr_mechanisms"]:
-        mid = pr_item["mechanism_id"]
+    single_cache: dict[str, int] = {}
+    loo_cache: dict[str, int] = {}
+    for pr_item in proposed_report.get("unmerged_pr_mechanisms", ()):
+        mid = str(pr_item["mechanism_id"])
         if mid not in single_cache:
             single_case = compose_case(
                 model, hardware=hardware, runtime_stack=runtime_stack,
-                feature_track="merged", optimizations=(mid,),
+                feature_track="shipping", optimizations=(mid,),
                 _stack_phase=phase, **compose_kwargs,
             )
             single_eff = analyze_network_efficiency(
                 single_case, phase=phase, tokens=tokens, context=context,
                 sequences=sequences, scope=scope,
             )
-            single_cache[mid] = float(single_eff["graph_duration_ms"])
+            single_cache[mid] = _ms_to_ns(float(single_eff["graph_duration_ms"]))
         if mid not in loo_cache:
             loo_case = compose_case(
                 model, hardware=hardware, runtime_stack=runtime_stack,
-                feature_track="unmerged_pr", exclude_optimizations=(mid,),
+                feature_track="proposed", exclude_optimizations=(mid,),
                 _stack_phase=phase, **compose_kwargs,
             )
             loo_eff = analyze_network_efficiency(
                 loo_case, phase=phase, tokens=tokens, context=context,
                 sequences=sequences, scope=scope,
             )
-            loo_cache[mid] = float(loo_eff["graph_duration_ms"])
-        single_ms = single_cache[mid]
-        without_ms = loo_cache[mid]
+            loo_cache[mid] = _ms_to_ns(float(loo_eff["graph_duration_ms"]))
+        single_ns = single_cache[mid]
+        without_ns = loo_cache[mid]
+        single_ms = single_ns / NS_PER_MS
+        without_ms = without_ns / NS_PER_MS
         pr_ablations.append({
             "mechanism_id": mid,
-            "ref": pr_item["ref"],
-            "notes": pr_item["notes"],
+            "ref": pr_item.get("ref"),
+            "notes": pr_item.get("notes", ""),
+            "step_ns": single_ns,
             "step_ms": round(single_ms, MS_PRECISION_DIGITS),
-            "delta_vs_merged_ms": round(single_ms - merged_ms, MS_PRECISION_DIGITS),
-            "delta_vs_merged_pct": round(_pct_delta(merged_ms, single_ms), PCT_PRECISION_DIGITS),
-            "speedup_vs_merged": round(_speedup(merged_ms, single_ms), RATIO_PRECISION_DIGITS),
+            "delta_vs_shipping_ns": single_ns - shipping_ns,
+            "delta_vs_shipping_ms": round((single_ns - shipping_ns) / NS_PER_MS, MS_PRECISION_DIGITS),
+            "delta_vs_shipping_pct": round(_pct_delta(shipping_ms, single_ms), PCT_PRECISION_DIGITS),
+            "speedup_vs_shipping": round(_speedup(shipping_ms, single_ms), RATIO_PRECISION_DIGITS),
         })
         loo_ablations.append({
             "mechanism_id": mid,
-            "ref": pr_item["ref"],
-            "notes": pr_item["notes"],
+            "ref": pr_item.get("ref"),
+            "notes": pr_item.get("notes", ""),
+            "without_pr_step_ns": without_ns,
             "without_pr_step_ms": round(without_ms, MS_PRECISION_DIGITS),
-            "delta_vs_without_pr_ms": round(pr_ms - without_ms, MS_PRECISION_DIGITS),
-            "delta_vs_without_pr_pct": round(_pct_delta(without_ms, pr_ms), PCT_PRECISION_DIGITS),
-            "speedup_vs_without_pr": round(_speedup(without_ms, pr_ms), RATIO_PRECISION_DIGITS),
+            "delta_vs_without_pr_ns": proposed_ns - without_ns,
+            "delta_vs_without_pr_ms": round((proposed_ns - without_ns) / NS_PER_MS, MS_PRECISION_DIGITS),
+            "delta_vs_without_pr_pct": round(_pct_delta(without_ms, proposed_ms), PCT_PRECISION_DIGITS),
+            "speedup_vs_without_pr": round(_speedup(without_ms, proposed_ms), RATIO_PRECISION_DIGITS),
         })
-    pr_ablations.sort(key=lambda row: row["delta_vs_merged_ms"])
-    loo_ablations.sort(key=lambda row: row["delta_vs_without_pr_ms"])
-
+    pr_ablations.sort(key=lambda row: row["delta_vs_shipping_ns"])
+    loo_ablations.sort(key=lambda row: row["delta_vs_without_pr_ns"])
     return pr_ablations, loo_ablations
-
-
-_UNQUANTIZED_PRESET_NAMES = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32"})
 
 
 def _build_waterfall_payload(
     *,
-    cases: Mapping[str, Mapping[str, Any]],
     analyses: Mapping[str, Mapping[str, Any]],
-    geometry: Mapping[str, Any],
+    reports: Mapping[str, Mapping[str, Any]],
+    step_ns: Mapping[str, int],
+    roof_ns: int,
+    roof_1p0_ms: float,
     pr_ablations: list[dict[str, Any]],
     loo_ablations: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    eager_ms = float(analyses["raw_eager"]["graph_duration_ms"])
-    merged_ms = float(analyses["merged"]["graph_duration_ms"])
-    pr_ms = float(analyses["unmerged_pr"]["graph_duration_ms"])
-    ideal_ms = float(analyses["expected_ideal"]["graph_duration_ms"])
-    ideal_eff = analyses["expected_ideal"]
-    roof_1p0_ms = max(
-        float(ideal_eff.get("critical_path_roofline_ms") or 0.0),
-        float(ideal_eff.get("physical_resource_cut_ms") or 0.0),
-    ) or float(ideal_eff.get("total_roofline_ideal_ms") or 0.0)
-    eager_report = cases["raw_eager"]["runtime"]["metadata"]["feature_track_report"]
-    merged_report = cases["merged"]["runtime"]["metadata"]["feature_track_report"]
-    pr_report = cases["unmerged_pr"]["runtime"]["metadata"]["feature_track_report"]
-    ideal_report = cases["expected_ideal"]["runtime"]["metadata"]["feature_track_report"]
-    eager_monotonic = eager_ms + MONOTONIC_TOLERANCE_MS >= merged_ms
-    monotonic = (
-        eager_monotonic
-        and merged_ms + MONOTONIC_TOLERANCE_MS >= pr_ms
-        and pr_ms + MONOTONIC_TOLERANCE_MS >= ideal_ms
-        and ideal_ms + MONOTONIC_TOLERANCE_MS >= roof_1p0_ms
-    )
+    eager_ns, ship_ns = step_ns["eager"], step_ns["shipping"]
+    prop_ns, targ_ns = step_ns["proposed"], step_ns["target"]
+    eager_ms, ship_ms = eager_ns / NS_PER_MS, ship_ns / NS_PER_MS
+    prop_ms, targ_ms = prop_ns / NS_PER_MS, targ_ns / NS_PER_MS
     return {
-        "schema": WATERFALL_SCHEMA,
-        "model": cases["merged"]["model"]["name"],
-        "hardware_sku": cases["merged"]["machine"]["sku"],
-        "runtime_stack": merged_report["stack"],
-        "repository": merged_report["repository"],
-        "geometry": dict(geometry),
-        "monotonic_verified": bool(monotonic),
-        "eager_vs_merged_monotonic": bool(eager_monotonic),
-        "waterfall": {
-            "raw_eager": {
-                "step_ms": round(eager_ms, MS_PRECISION_DIGITS),
-                "operator_sum_ms": round(float(analyses["raw_eager"]["operator_sum_ms"]), MS_PRECISION_DIGITS),
-                "hbm_bytes": float(analyses["raw_eager"]["total_hbm_bytes"]),
-                "network": _network(analyses["raw_eager"]),
-                "active_mechanisms": [m["id"] for m in eager_report["active_mechanisms"]],
-            },
-            "current_merged": {
-                "step_ms": round(merged_ms, MS_PRECISION_DIGITS),
-                "operator_sum_ms": round(float(analyses["merged"]["operator_sum_ms"]), MS_PRECISION_DIGITS),
-                "hbm_bytes": float(analyses["merged"]["total_hbm_bytes"]),
-                "network": _network(analyses["merged"]),
-                "delta_vs_raw_eager_ms": round(merged_ms - eager_ms, MS_PRECISION_DIGITS),
-                "delta_vs_raw_eager_pct": round(_pct_delta(eager_ms, merged_ms), PCT_PRECISION_DIGITS),
-                "speedup_vs_raw_eager": round(_speedup(eager_ms, merged_ms), RATIO_PRECISION_DIGITS),
-                "active_mechanisms": [m["id"] for m in merged_report["active_mechanisms"]],
-            },
-            "current_unmerged_pr": {
-                "step_ms": round(pr_ms, MS_PRECISION_DIGITS),
-                "operator_sum_ms": round(float(analyses["unmerged_pr"]["operator_sum_ms"]), MS_PRECISION_DIGITS),
-                "hbm_bytes": float(analyses["unmerged_pr"]["total_hbm_bytes"]),
-                "network": _network(analyses["unmerged_pr"]),
-                "delta_vs_merged_ms": round(pr_ms - merged_ms, MS_PRECISION_DIGITS),
-                "delta_vs_merged_pct": round(_pct_delta(merged_ms, pr_ms), PCT_PRECISION_DIGITS),
-                "speedup_vs_merged": round(_speedup(merged_ms, pr_ms), RATIO_PRECISION_DIGITS),
-                "active_open_prs": [
-                    {"mechanism_id": m["mechanism_id"], "ref": m["ref"], "notes": m["notes"]}
-                    for m in pr_report["unmerged_pr_mechanisms"]
-                ],
-                "single_pr_ablation": pr_ablations,
-                "leave_one_out_ablation": loo_ablations,
-            },
-            "expected_ideal": {
-                "step_ms": round(ideal_ms, MS_PRECISION_DIGITS),
-                "operator_sum_ms": round(float(analyses["expected_ideal"]["operator_sum_ms"]), MS_PRECISION_DIGITS),
-                "hbm_bytes": float(analyses["expected_ideal"]["total_hbm_bytes"]),
-                "network": _network(analyses["expected_ideal"]),
-                "delta_vs_unmerged_pr_ms": round(ideal_ms - pr_ms, MS_PRECISION_DIGITS),
-                "delta_vs_unmerged_pr_pct": round(_pct_delta(pr_ms, ideal_ms), PCT_PRECISION_DIGITS),
-                "delta_vs_merged_ms": round(ideal_ms - merged_ms, MS_PRECISION_DIGITS),
-                "delta_vs_merged_pct": round(_pct_delta(merged_ms, ideal_ms), PCT_PRECISION_DIGITS),
-                "speedup_vs_merged": round(_speedup(merged_ms, ideal_ms), RATIO_PRECISION_DIGITS),
-                "unimplemented_architectural_gaps": ideal_report["unimplemented_gaps"],
-                "active_mechanisms": [m["id"] for m in ideal_report["active_mechanisms"]],
-            },
-            "hardware_roofline": {
-                "physical_ideal_1p0x_ms": round(roof_1p0_ms, MS_PRECISION_DIGITS),
-                "remaining_kernel_micro_gap_to_1p0x_ms": round(max(0.0, ideal_ms - roof_1p0_ms), MS_PRECISION_DIGITS),
-            },
+        "eager": {
+            "step_ns": eager_ns,
+            "step_ms": round(eager_ms, MS_PRECISION_DIGITS),
+            "operator_sum_ms": round(float(analyses["eager"]["operator_sum_ms"]), MS_PRECISION_DIGITS),
+            "hbm_bytes": float(analyses["eager"]["total_hbm_bytes"]),
+            "network": _network(analyses["eager"]),
+            "active_mechanisms": [m["id"] for m in reports["eager"].get("active_mechanisms", ())],
         },
-        "efficiency_reference": {
-            "physical_ideal_ms": round(roof_1p0_ms, MS_PRECISION_DIGITS),
-            "basis": "physical_1p0x_critical_path_roofline",
+        "shipping": {
+            "step_ns": ship_ns,
+            "step_ms": round(ship_ms, MS_PRECISION_DIGITS),
+            "operator_sum_ms": round(float(analyses["shipping"]["operator_sum_ms"]), MS_PRECISION_DIGITS),
+            "hbm_bytes": float(analyses["shipping"]["total_hbm_bytes"]),
+            "network": _network(analyses["shipping"]),
+            "delta_vs_eager_ns": ship_ns - eager_ns,
+            "delta_vs_eager_ms": round((ship_ns - eager_ns) / NS_PER_MS, MS_PRECISION_DIGITS),
+            "delta_vs_eager_pct": round(_pct_delta(eager_ms, ship_ms), PCT_PRECISION_DIGITS),
+            "speedup_vs_eager": round(_speedup(eager_ms, ship_ms), RATIO_PRECISION_DIGITS),
+            "active_mechanisms": [m["id"] for m in reports["shipping"].get("active_mechanisms", ())],
+        },
+        "proposed": {
+            "step_ns": prop_ns,
+            "step_ms": round(prop_ms, MS_PRECISION_DIGITS),
+            "operator_sum_ms": round(float(analyses["proposed"]["operator_sum_ms"]), MS_PRECISION_DIGITS),
+            "hbm_bytes": float(analyses["proposed"]["total_hbm_bytes"]),
+            "network": _network(analyses["proposed"]),
+            "delta_vs_shipping_ns": prop_ns - ship_ns,
+            "delta_vs_shipping_ms": round((prop_ns - ship_ns) / NS_PER_MS, MS_PRECISION_DIGITS),
+            "delta_vs_shipping_pct": round(_pct_delta(ship_ms, prop_ms), PCT_PRECISION_DIGITS),
+            "speedup_vs_shipping": round(_speedup(ship_ms, prop_ms), RATIO_PRECISION_DIGITS),
+            "active_open_prs": [
+                {"mechanism_id": m["mechanism_id"], "ref": m.get("ref"), "notes": m.get("notes", "")}
+                for m in reports["proposed"].get("unmerged_pr_mechanisms", ())
+            ],
+            "single_pr_ablation": pr_ablations,
+            "leave_one_out_ablation": loo_ablations,
+        },
+        "target": {
+            "step_ns": targ_ns,
+            "step_ms": round(targ_ms, MS_PRECISION_DIGITS),
+            "operator_sum_ms": round(float(analyses["target"]["operator_sum_ms"]), MS_PRECISION_DIGITS),
+            "hbm_bytes": float(analyses["target"]["total_hbm_bytes"]),
+            "network": _network(analyses["target"]),
+            "delta_vs_proposed_ns": targ_ns - prop_ns,
+            "delta_vs_proposed_ms": round((targ_ns - prop_ns) / NS_PER_MS, MS_PRECISION_DIGITS),
+            "delta_vs_proposed_pct": round(_pct_delta(prop_ms, targ_ms), PCT_PRECISION_DIGITS),
+            "delta_vs_shipping_ns": targ_ns - ship_ns,
+            "delta_vs_shipping_ms": round((targ_ns - ship_ns) / NS_PER_MS, MS_PRECISION_DIGITS),
+            "delta_vs_shipping_pct": round(_pct_delta(ship_ms, targ_ms), PCT_PRECISION_DIGITS),
+            "speedup_vs_shipping": round(_speedup(ship_ms, targ_ms), RATIO_PRECISION_DIGITS),
+            "unimplemented_architectural_gaps": list(reports["target"].get("unimplemented_gaps", ())),
+            "active_mechanisms": [m["id"] for m in reports["target"].get("active_mechanisms", ())],
+        },
+        "hardware_roofline": {
+            "physical_ideal_1p0x_ns": roof_ns,
+            "physical_ideal_1p0x_ms": round(roof_1p0_ms, MS_PRECISION_DIGITS),
+            "remaining_kernel_micro_gap_to_1p0x_ns": max(0, targ_ns - roof_ns),
+            "remaining_kernel_micro_gap_to_1p0x_ms": round(max(0.0, (targ_ns - roof_ns) / NS_PER_MS), MS_PRECISION_DIGITS),
         },
     }
 
@@ -1282,80 +1344,122 @@ def compare_feature_tracks(
     tokens: int = 1,
     context: int = DEFAULT_WATERFALL_CONTEXT,
     sequences: int = DEFAULT_WATERFALL_SEQUENCES,
-    scope: str = "body",
+    scope: str = "model",
     ablate_prs: bool = True,
     **compose_kwargs: Any,
 ) -> dict[str, Any]:
-    """Return the complete 4-rung software-to-silicon performance waterfall."""
+    """Compute canonical 4-track comparison (eager -> shipping -> proposed -> target) with integer-ns deltas."""
     from mindie_sim.compose import compose_case
-
-    cleaned_kwargs = dict(compose_kwargs)
-    for key in ("feature_track", "optimizations", "exclude_optimizations", "raw_eager", "_stack_phase"):
-        cleaned_kwargs.pop(key, None)
+    from mindie_sim.prediction.efficiency import analyze_network_efficiency
 
     cases: dict[str, dict[str, Any]] = {}
     analyses: dict[str, dict[str, Any]] = {}
-    for track in ("merged", "unmerged_pr", "expected_ideal"):
-        case = compose_case(
-            model, hardware=hardware, runtime_stack=runtime_stack,
-            feature_track=track, _stack_phase=phase, **cleaned_kwargs,
+    step_ns: dict[str, int] = {}
+    base_kwargs = dict(compose_kwargs)
+    ship_case = compose_case(
+        model,
+        hardware=hardware,
+        runtime_stack=runtime_stack,
+        feature_track="shipping",
+        _stack_phase=phase,
+        **base_kwargs,
+    )
+    pinned_kwargs = dict(base_kwargs)
+    if "quant" not in pinned_kwargs:
+        ss_ship = ((ship_case.get("runtime") or {}).get("metadata") or {}).get("single_spine") or {}
+        if ss_ship.get("checkpoint_origin") == "verified_checkpoint_descriptor" and ss_ship.get("checkpoint_id"):
+            pinned_kwargs["quant"] = "auto"
+        elif ship_case.get("model", {}).get("quant") is not None:
+            pinned_kwargs["quant"] = dict(ship_case["model"]["quant"])
+        else:
+            pinned_kwargs["quant"] = "bf16"
+    ship_req = (
+        (((ship_case.get("runtime") or {}).get("metadata") or {}).get("single_spine") or {})
+        .get("contract_inputs", {})
+        .get("requested_options", {})
+    )
+    if isinstance(ship_req, Mapping):
+        for cache_key in ("kv_cache_dtype", "indexer_kv_dtype"):
+            if cache_key not in pinned_kwargs and ship_req.get(cache_key):
+                pinned_kwargs[cache_key] = ship_req[cache_key]
+    for track_name in ("eager", "shipping", "proposed", "target"):
+        case_dict = (
+            ship_case
+            if track_name == "shipping"
+            else compose_case(
+                model,
+                hardware=hardware,
+                runtime_stack=runtime_stack,
+                feature_track=track_name,
+                _stack_phase=phase,
+                **pinned_kwargs,
+            )
         )
-        cases[track] = case
-        analyses[track] = analyze_network_efficiency(
-            case, phase=phase, tokens=tokens, context=context,
-            sequences=sequences, scope=scope,
+        eff = analyze_network_efficiency(
+            case_dict,
+            phase=phase,
+            tokens=tokens,
+            context=context,
+            sequences=sequences,
+            scope=scope,
         )
+        cases[track_name] = case_dict
+        analyses[track_name] = eff
+        step_ns[track_name] = _ms_to_ns(float(eff["graph_duration_ms"]))
 
-    eager_kwargs = dict(cleaned_kwargs)
-    merged_meta = cases["merged"]["runtime"]["metadata"] or {}
-    merged_quant = cases["merged"]["model"].get("quant")
-    va_prof = merged_meta.get("va_profile") or {}
-    va_flags = dict(va_prof.get("tutorial_flags") or {})
-    explicit_quant = eager_kwargs.get("quant")
-    unquantized_override = (
-        isinstance(explicit_quant, str)
-        and explicit_quant.strip().lower() in _UNQUANTIZED_PRESET_NAMES
-    )
-    if "quant" not in eager_kwargs:
-        if isinstance(merged_quant, Mapping) and merged_quant:
-            eager_kwargs["quant"] = dict(merged_quant)
-        elif va_prof.get("quant") is not None:
-            eager_kwargs["quant"] = va_prof["quant"]
-    if not unquantized_override:
-        if "kv_cache_dtype" not in eager_kwargs:
-            resolved_kv = (merged_quant.get("kv_dtype") if isinstance(merged_quant, Mapping) else None) or va_flags.get("kv_cache_dtype")
-            if resolved_kv:
-                eager_kwargs["kv_cache_dtype"] = str(resolved_kv)
-        if "indexer_kv_dtype" not in eager_kwargs:
-            resolved_idx = (merged_quant.get("index_dtype") if isinstance(merged_quant, Mapping) else None) or va_flags.get("indexer_kv_dtype")
-            if resolved_idx:
-                eager_kwargs["indexer_kv_dtype"] = str(resolved_idx)
-    cases["raw_eager"] = compose_case(
-        model, hardware=hardware, runtime_stack=runtime_stack,
-        feature_track="raw_eager", _stack_phase=phase, **eager_kwargs,
-    )
-    analyses["raw_eager"] = analyze_network_efficiency(
-        cases["raw_eager"], phase=phase, tokens=tokens, context=context,
-        sequences=sequences, scope=scope,
-    )
+    eager_ns, ship_ns = step_ns["eager"], step_ns["shipping"]
+    prop_ns, targ_ns = step_ns["proposed"], step_ns["target"]
+    target_eff = analyses["target"]
+    roof_1p0_ms = max(
+        float(target_eff.get("critical_path_roofline_ms") or 0.0),
+        float(target_eff.get("physical_resource_cut_ms") or 0.0),
+    ) or float(target_eff.get("total_roofline_ideal_ms") or 0.0)
+    roof_ns = _ms_to_ns(roof_1p0_ms)
 
-    pr_ablations, loo_ablations = [], []
-    if ablate_prs:
-        pr_report = cases["unmerged_pr"]["runtime"]["metadata"]["feature_track_report"]
+    reports = {
+        t: (cases[t]["runtime"].get("metadata") or {}).get("feature_track_report") or {}
+        for t in ("eager", "shipping", "proposed", "target")
+    }
+    pr_ablations: list[dict[str, Any]] = []
+    loo_ablations: list[dict[str, Any]] = []
+    if ablate_prs and reports["proposed"].get("unmerged_pr_mechanisms"):
         pr_ablations, loo_ablations = _compare_pr_ablations(
-            model, hardware, runtime_stack, pr_report,
-            float(analyses["merged"]["graph_duration_ms"]),
-            float(analyses["unmerged_pr"]["graph_duration_ms"]),
+            model, hardware, runtime_stack, reports["proposed"],
+            ship_ns, prop_ns,
             phase=phase, tokens=tokens, context=context, sequences=sequences,
-            scope=scope, compose_kwargs=cleaned_kwargs,
+            scope=scope, compose_kwargs=pinned_kwargs,
         )
 
-    return _build_waterfall_payload(
-        cases=cases, analyses=analyses,
-        geometry={"phase": phase, "tokens": tokens, "context": context,
-                  "sequences": sequences, "scope": scope},
-        pr_ablations=pr_ablations, loo_ablations=loo_ablations,
+    tol_ns = _ms_to_ns(MONOTONIC_TOLERANCE_MS)
+    eager_monotonic = eager_ns + tol_ns >= ship_ns
+    monotonic = (
+        eager_monotonic
+        and ship_ns + tol_ns >= prop_ns
+        and prop_ns + tol_ns >= targ_ns
+        and targ_ns + tol_ns >= roof_ns
     )
+    return {
+        "schema": WATERFALL_SCHEMA,
+        "model": cases["shipping"]["model"]["name"],
+        "hardware_sku": cases["shipping"]["machine"]["sku"],
+        "runtime_stack": reports["shipping"].get("stack", "vllm-ascend"),
+        "repository": reports["shipping"].get("repository", ""),
+        "geometry": {
+            "phase": phase, "tokens": int(tokens), "context": int(context),
+            "sequences": int(sequences), "scope": scope,
+        },
+        "monotonic_verified": bool(monotonic),
+        "eager_vs_shipping_monotonic": bool(eager_monotonic),
+        "waterfall": _build_waterfall_payload(
+            analyses=analyses, reports=reports, step_ns=step_ns,
+            roof_ns=roof_ns, roof_1p0_ms=roof_1p0_ms,
+            pr_ablations=pr_ablations, loo_ablations=loo_ablations,
+        ),
+        "efficiency_reference": {
+            "physical_ideal_ms": round(roof_1p0_ms, MS_PRECISION_DIGITS),
+            "basis": "physical_1p0x_critical_path_roofline",
+        },
+    }
 
 
 # --- Layer 2 RuntimeStackProfile Registry & JSON Manifest Loader ------------
@@ -1368,14 +1472,10 @@ MAX_MANIFEST_BYTES = 50 * 1024 * 1024
 MIN_CAPTURE_SEQS = 16
 
 TRACK_ALIASES: dict[str, str] = {
-    "raw_eager": "raw_eager",
-    "eager": "raw_eager",
-    "merged": "merged",
-    "current_merged": "merged",
-    "unmerged_pr": "unmerged_pr",
-    "current_unmerged_pr": "unmerged_pr",
-    "expected_ideal": "expected_ideal",
-    "ideal": "expected_ideal",
+    "eager": "eager",
+    "shipping": "shipping",
+    "proposed": "proposed",
+    "target": "target",
 }
 
 _MECHANISM_LOWERING_SELECTORS: dict[str, tuple[str, ...]] = {
@@ -1422,68 +1522,32 @@ def excluded_lowering_bindings(
 
 
 @dataclass(frozen=True)
-class StackMechanismBinding:
-    """Binds one universal mechanism ID to a stack's merge state and PR ref."""
-
-    mechanism_id: str
-    state: str  # "merged" | "unmerged_pr"
-    ref: str | None = None
-    models: tuple[str, ...] = ()
-    archs: tuple[str, ...] = ()
-    phases: tuple[str, ...] = ()
-    options: Mapping[str, Any] = field(default_factory=dict)
-    notes: str = ""
-
-    def __post_init__(self) -> None:
-        if self.mechanism_id not in MECHANISM_CATALOG:
-            raise ModelingError(f"unknown_optimization_mechanism:{self.mechanism_id}")
-        if self.state not in {"merged", "unmerged_pr"}:
-            raise ModelingError(f"invalid_stack_binding_state:{self.state}")
-
-    def matches(self, model_key: str, arch: str, phase: str | None = None) -> bool:
-        if self.models and model_key not in self.models:
-            return False
-        if self.archs and arch not in self.archs:
-            return False
-        if phase and self.phases and phase.lower() not in self.phases:
-            return False
-        return True
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "mechanism_id": self.mechanism_id,
-            "state": self.state,
-            "ref": self.ref,
-            "models": list(self.models),
-            "archs": list(self.archs),
-            "phases": list(self.phases),
-            "options": dict(self.options),
-            "notes": self.notes,
-        }
-
-
-@dataclass(frozen=True)
 class RuntimeStackProfile:
-    """Complete feature-track declaration for one serving runtime stack."""
+    """Declarative metadata for one serving runtime stack (zero built-in model-name gates)."""
 
     name: str
     repository: str
     description: str = ""
-    model_defaults: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
-    bindings: tuple[StackMechanismBinding, ...] = ()
+    bindings: tuple[Any, ...] = ()
     supported_models: tuple[str, ...] = ()
     unmerged_pr_models: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "schema": STACK_MANIFEST_SCHEMA,
             "name": self.name,
             "repository": self.repository,
             "description": self.description,
-            "supported_models": list(self.supported_models),
-            "unmerged_pr_models": list(self.unmerged_pr_models),
-            "bindings": [b.to_dict() for b in self.bindings],
+            "bindings": [b.to_dict() if hasattr(b, "to_dict") else dict(b) for b in self.bindings],
         }
+        if self.supported_models:
+            payload["supported_models"] = list(self.supported_models)
+        if self.unmerged_pr_models:
+            payload["unmerged_pr_models"] = list(self.unmerged_pr_models)
+        return payload
+
+
+StackMechanismBinding = ManifestBinding
 
 
 RUNTIME_STACKS: dict[str, RuntimeStackProfile] = {}
@@ -1504,7 +1568,7 @@ def register_runtime_stack(profile: RuntimeStackProfile) -> RuntimeStackProfile:
 
 
 def load_runtime_stack_manifest(source: str | Path | Mapping[str, Any]) -> RuntimeStackProfile:
-    """Load a ``RuntimeStackProfile`` from a JSON file or plain Python dict."""
+    """Load a ``RuntimeStackProfile`` strictly into canonical ``ManifestBinding`` records."""
     if isinstance(source, (str, Path)):
         path = Path(source).expanduser()
         if not path.is_file():
@@ -1521,27 +1585,67 @@ def load_runtime_stack_manifest(source: str | Path | Mapping[str, Any]) -> Runti
     schema = raw.get("schema", STACK_MANIFEST_SCHEMA)
     if schema != STACK_MANIFEST_SCHEMA:
         raise ModelingError(f"stack_manifest_schema_unsupported:{schema}")
-    bindings = tuple(
-        StackMechanismBinding(
-            mechanism_id=str(item["mechanism_id"]),
-            state=str(item["state"]),
-            ref=item.get("ref"),
-            models=tuple(str(m) for m in (item.get("models") or ())),
-            archs=tuple(str(a).lower() for a in (item.get("archs") or ())),
-            phases=tuple(str(p).lower() for p in (item.get("phases") or ())),
-            options=dict(item.get("options") or {}),
-            notes=str(item.get("notes") or ""),
+    bindings: list[ManifestBinding] = []
+    for item in (raw.get("bindings") or ()):
+        if not isinstance(item, Mapping):
+            raise ModelingError("stack_manifest_binding_invalid")
+        mid = str(item.get("mechanism_id") or "").strip()
+        if mid not in MECHANISM_CATALOG:
+            raise ModelingError(f"unknown_optimization_mechanism:{mid}")
+        raw_models = tuple(str(m) for m in (item.get("models") or ()) if str(m).strip())
+        if raw_models:
+            raise ModelingError(f"stack_manifest_models_forbidden_ag014:{mid}")
+        raw_preds = item.get("capability_predicates") or ()
+        if isinstance(raw_preds, (str, bytes)) or not isinstance(raw_preds, Sequence):
+            raise ModelingError(f"stack_manifest_capability_predicates_invalid:{mid}")
+        cap_preds = tuple(str(p).strip() for p in raw_preds if str(p).strip())
+        raw_opts = item.get("options") or {}
+        if not isinstance(raw_opts, Mapping):
+            raise ModelingError(f"stack_manifest_options_invalid:{mid}")
+        lowering_pass_id = str(item.get("lowering_pass_id") or "").strip()
+        if not lowering_pass_id:
+            raise ModelingError(f"stack_manifest_missing_lowering_pass_id:{mid}")
+        prov_raw = item.get("provenance") if isinstance(item.get("provenance"), Mapping) else {}
+        source_sha = str(prov_raw.get("source_sha256") or item.get("source_sha256") or "").strip()
+        if not source_sha:
+            raise ModelingError(f"stack_manifest_missing_source_sha256:{mid}")
+        prov = SourceRef(
+            repository=str(prov_raw.get("repository") or raw.get("repository") or ""),
+            revision=str(prov_raw.get("revision") or raw.get("manifest_revision") or ""),
+            relative_path=str(prov_raw.get("relative_path") or "manifest.json"),
+            source_sha256=source_sha,
         )
-        for item in (raw.get("bindings") or ())
+        raw_phase_scope = item.get("phase_scope") or item.get("phases") or ()
+        if isinstance(raw_phase_scope, str):
+            phase_scope = (raw_phase_scope.strip().lower(),) if raw_phase_scope.strip() else ()
+        else:
+            phase_scope = tuple(str(p).strip().lower() for p in raw_phase_scope if str(p).strip())
+        bindings.append(ManifestBinding(
+            mechanism_id=mid,
+            state=str(item.get("state") or "").strip(),  # type: ignore[arg-type]
+            ref=str(item.get("ref") or "").strip(),
+            lowering_pass_id=lowering_pass_id,
+            provenance=prov,
+            models=(),
+            archs=tuple(str(a).strip().lower() for a in (item.get("archs") or ()) if str(a).strip()),
+            phase_scope=phase_scope,
+            capability_predicates=cap_preds,
+            options=tuple(sorted((str(k), v) for k, v in raw_opts.items())),
+            notes=str(item.get("notes") or ""),
+        ))
+    supported_models = tuple(
+        str(m).strip() for m in (raw.get("supported_models") or ()) if str(m).strip()
+    )
+    unmerged_pr_models = tuple(
+        str(m).strip() for m in (raw.get("unmerged_pr_models") or ()) if str(m).strip()
     )
     return RuntimeStackProfile(
         name=str(raw["name"]).strip(),
         repository=str(raw.get("repository") or ""),
         description=str(raw.get("description") or ""),
-        model_defaults=dict(raw.get("model_defaults") or {}),
-        bindings=bindings,
-        supported_models=tuple(str(m).strip() for m in (raw.get("supported_models") or ())),
-        unmerged_pr_models=tuple(str(m).strip() for m in (raw.get("unmerged_pr_models") or ())),
+        bindings=tuple(bindings),
+        supported_models=supported_models,
+        unmerged_pr_models=unmerged_pr_models,
     )
 
 
@@ -1556,6 +1660,8 @@ def resolve_runtime_stack(
     lower = key.lower()
     if lower in RUNTIME_STACKS:
         return RUNTIME_STACKS[lower]
+    if lower == "raw-eager" and "raw_eager" in RUNTIME_STACKS:
+        return RUNTIME_STACKS["raw_eager"]
     candidate = Path(key).expanduser()
     if candidate.is_file():
         return load_runtime_stack_manifest(candidate)
@@ -1563,7 +1669,7 @@ def resolve_runtime_stack(
 
 
 def _collapse_binding_group(
-    mid: str, state: str, group: Sequence[StackMechanismBinding],
+    mid: str, state: str, group: Sequence[ManifestBinding],
 ) -> dict[str, Any]:
     merged_options: dict[str, Any] = {}
     refs: list[str] = []
@@ -1587,27 +1693,46 @@ def _collapse_binding_group(
     return entry
 
 
-def resolve_stack_track(
+def assert_model_supported_by_runtime_stack(
     stack_profile: RuntimeStackProfile,
     *,
     track: str,
     model_key: str,
+) -> None:
+    """Enforce explicit custom-manifest model support lists on shipping/proposed tracks."""
+    canonical_track = normalize_feature_track(track)
+    if not (stack_profile.supported_models or stack_profile.unmerged_pr_models):
+        return
+    model_id = str(model_key or "").strip()
+    if canonical_track == "shipping" and model_id not in stack_profile.supported_models:
+        raise ModelingError(
+            f"model_not_supported_by_runtime_stack:{stack_profile.name}:{model_id}:shipping"
+        )
+    if (
+        canonical_track == "proposed"
+        and model_id not in stack_profile.supported_models
+        and model_id not in stack_profile.unmerged_pr_models
+    ):
+        raise ModelingError(
+            f"model_not_supported_by_runtime_stack:{stack_profile.name}:{model_id}:proposed"
+        )
+
+
+def resolve_stack_track(
+    stack_profile: RuntimeStackProfile,
+    *,
+    track: str,
+    model_key: str = "",
     ctx: MechanismContext,
     optimizations: Sequence[str] = (),
     exclude_optimizations: Sequence[str] = (),
 ) -> dict[str, Any]:
-    """Resolve active mechanisms, PR provenance, and unimplemented gaps."""
+    """Resolve active mechanisms strictly via canonical ``StackTrack`` & structural predicates."""
     canonical_track = normalize_feature_track(track)
-    if stack_profile.supported_models or stack_profile.unmerged_pr_models:
-        if canonical_track == "merged" and model_key not in stack_profile.supported_models:
-            raise ModelingError(
-                f"model_not_supported_by_runtime_stack:{stack_profile.name}:{model_key}:merged")
-        if (canonical_track == "unmerged_pr"
-                and model_key not in stack_profile.supported_models
-                and model_key not in stack_profile.unmerged_pr_models):
-            raise ModelingError(
-                f"model_not_supported_by_runtime_stack:{stack_profile.name}:{model_key}:unmerged_pr")
-
+    effective_model_key = str(model_key or getattr(ctx.model, "name", "") or "").strip()
+    assert_model_supported_by_runtime_stack(
+        stack_profile, track=canonical_track, model_key=effective_model_key,
+    )
     include_ids = tuple(str(x).strip() for x in optimizations if str(x).strip())
     exclude_ids = frozenset(str(x).strip() for x in exclude_optimizations if str(x).strip())
     for mid in (*include_ids, *exclude_ids):
@@ -1615,106 +1740,139 @@ def resolve_stack_track(
             raise ModelingError(f"unknown_optimization_mechanism:{mid}")
     overlap_conflict = set(include_ids) & exclude_ids
     if overlap_conflict:
-        raise ModelingError(
-            "optimization_include_exclude_conflict:" + ",".join(sorted(overlap_conflict)))
+        raise ModelingError("conflicting_optimization_flags:" + ",".join(sorted(overlap_conflict)))
 
-    model_cfg = dict(stack_profile.model_defaults.get(model_key) or {})
-    ctx_phase = str((ctx.options or {}).get("phase") or "").strip().lower() or None
-    eligible_ids = [
-        mech.id for mech in MECHANISM_CATALOG.values()
-        if mech.eligible(ctx) and (not ctx_phase or not mech.phases or ctx_phase in mech.phases)
-    ]
-    eligible_set = set(eligible_ids)
-    merged_list: list[StackMechanismBinding] = []
-    pr_list: list[StackMechanismBinding] = []
-    merged_by_id: dict[str, list[StackMechanismBinding]] = defaultdict(list)
-    pr_by_id: dict[str, list[StackMechanismBinding]] = defaultdict(list)
+    phase = str((ctx.options or {}).get("phase") or "").strip().lower() or None
+    par_raw = ctx.parallel or {}
+    par_spec = ParallelSpec(
+        dp=int(par_raw.get("dp", 1)), tp=int(par_raw.get("tp", 1)),
+        pp=int(par_raw.get("pp", 1)), ep=int(par_raw.get("ep", 1)),
+        cp=int(par_raw.get("cp", par_raw.get("dcp", 1))), pcp=int(par_raw.get("pcp", 1)),
+    )
+    opts_map = ctx.options or {}
+    capabilities = extract_model_capabilities(
+        ctx.model,
+        arch=ctx.arch,
+        parallel=par_spec,
+        speculative_k=int(opts_map.get("speculative_k") or 0),
+        sp_enabled=bool(opts_map.get("sp", False)),
+    )
+
+    merged_list: list[ManifestBinding] = []
+    pr_list: list[ManifestBinding] = []
     for binding in stack_profile.bindings:
-        if not binding.matches(model_key, ctx.arch, phase=ctx_phase):
+        if not isinstance(binding, ManifestBinding):
             continue
-        if binding.mechanism_id not in eligible_set:
+        if not binding.matches("", ctx.arch, phase=phase, capabilities=capabilities):
+            continue
+        mech = MECHANISM_CATALOG.get(binding.mechanism_id)
+        if mech is None:
+            continue
+        b_opts = {**dict(ctx.options or {}), **dict(binding.options)}
+        b_ctx = MechanismContext(
+            model=ctx.model, sku=ctx.sku, arch=ctx.arch, parallel=ctx.parallel,
+            caller_explicit=ctx.caller_explicit, options=b_opts,
+        )
+        if not mech.eligible(b_ctx):
             continue
         if binding.state == "merged":
-            if binding.mechanism_id == "sequence_parallel" and model_cfg.get("sp") is False:
-                continue
             merged_list.append(binding)
-            merged_by_id[binding.mechanism_id].append(binding)
-        else:
+        elif binding.state == "unmerged_pr":
             pr_list.append(binding)
-            pr_by_id[binding.mechanism_id].append(binding)
 
-    active: dict[str, dict[str, Any]] = {}
-    if canonical_track in {"merged", "unmerged_pr", "expected_ideal"}:
-        for mid, group in merged_by_id.items():
-            active[mid] = _collapse_binding_group(mid, "merged", group)
-    if canonical_track in {"unmerged_pr", "expected_ideal"}:
-        for mid, group in pr_by_id.items():
-            prev_opts = dict(active[mid]["options"]) if mid in active else {}
-            collapsed = _collapse_binding_group(mid, "unmerged_pr", group)
-            collapsed["options"] = {**prev_opts, **collapsed["options"]}
-            active[mid] = collapsed
-    ideal_eligible_ids: list[str] = eligible_ids
-    if canonical_track == "expected_ideal":
-        ideal_opts = {**dict(ctx.options or {}), "allow_extended_activation_abi": True}
-        if "enable_fused_mc2" not in ctx.caller_explicit and ideal_opts.get("enable_fused_mc2") == 0:
-            ideal_opts.pop("enable_fused_mc2", None)
-        ideal_ctx = MechanismContext(
+    grouped_merged: dict[str, list[ManifestBinding]] = {}
+    for b in merged_list:
+        grouped_merged.setdefault(b.mechanism_id, []).append(b)
+    grouped_pr: dict[str, list[ManifestBinding]] = {}
+    for b in pr_list:
+        grouped_pr.setdefault(b.mechanism_id, []).append(b)
+
+    active_by_id: dict[str, dict[str, Any]] = {}
+    if canonical_track in {"shipping", "proposed", "target"}:
+        for mid, group in grouped_merged.items():
+            if mid not in exclude_ids:
+                active_by_id[mid] = _collapse_binding_group(mid, "merged", group)
+    if canonical_track in {"proposed", "target"}:
+        for mid, group in grouped_pr.items():
+            if mid not in exclude_ids:
+                if mid in active_by_id:
+                    merged_entry = dict(active_by_id[mid])
+                    pr_entry = _collapse_binding_group(mid, "unmerged_pr", group)
+                    merged_entry["options"] = {**dict(merged_entry["options"]), **dict(pr_entry["options"])}
+                    merged_entry["state"] = "unmerged_pr"
+                    if pr_entry.get("ref"):
+                        merged_entry["ref"] = pr_entry["ref"]
+                    active_by_id[mid] = merged_entry
+                else:
+                    active_by_id[mid] = _collapse_binding_group(mid, "unmerged_pr", group)
+
+    unimplemented_gaps: list[dict[str, Any]] = []
+    if canonical_track == "target":
+        target_opts = {**dict(ctx.options or {}), "allow_extended_activation_abi": True}
+        if "enable_fused_mc2" not in ctx.caller_explicit and target_opts.get("enable_fused_mc2") == 0:
+            target_opts.pop("enable_fused_mc2", None)
+        target_ctx = MechanismContext(
             model=ctx.model, sku=ctx.sku, arch=ctx.arch, parallel=ctx.parallel,
-            caller_explicit=ctx.caller_explicit,
-            options=ideal_opts,
+            caller_explicit=ctx.caller_explicit, options=target_opts,
         )
-        ideal_eligible_ids = [
-            mech.id for mech in MECHANISM_CATALOG.values()
-            if mech.eligible(ideal_ctx) and (not ctx_phase or not mech.phases or ctx_phase in mech.phases)
-        ]
-        for mid in ideal_eligible_ids:
-            prev = active.get(mid)
-            opts: dict[str, Any] = {}
+        for mid, mech in MECHANISM_CATALOG.items():
+            if mid in exclude_ids:
+                continue
+            if phase and mech.phases and phase not in mech.phases:
+                continue
+            if not mech.eligible(target_ctx):
+                continue
+            target_entry_opts: dict[str, Any] = {}
             if mid == "mhc_boundary_fusion_overlap":
-                opts["unbounded_rows"] = True
+                target_entry_opts["unbounded_rows"] = True
             elif mid == "cann_megamoe_fusion":
-                opts["allow_extended_activation_abi"] = True
-            if prev is None:
-                active[mid] = {
-                    "id": mid, "state": "expected_ideal", "ref": None,
-                    "options": opts, "notes": "architectural_ideal",
+                target_entry_opts["allow_extended_activation_abi"] = True
+            if mid in active_by_id:
+                if target_entry_opts:
+                    prev = active_by_id[mid]
+                    active_by_id[mid] = {
+                        **prev,
+                        "options": {**dict(prev.get("options") or {}), **target_entry_opts},
+                    }
+            else:
+                active_by_id[mid] = {
+                    "id": mid,
+                    "state": "target_gap",
+                    "ref": None,
+                    "options": target_entry_opts,
+                    "notes": "theoretical_target_gap",
                 }
-            elif opts:
-                active[mid] = {**prev, "options": {**prev["options"], **opts}}
+                unimplemented_gaps.append({
+                    "mechanism_id": mid,
+                    "category": mech.category,
+                    "summary": mech.summary,
+                })
 
     for mid in include_ids:
+        if mid in active_by_id:
+            continue
         mech = MECHANISM_CATALOG[mid]
         opt_ctx = MechanismContext(
             model=ctx.model, sku=ctx.sku, arch=ctx.arch, parallel=ctx.parallel,
             caller_explicit=ctx.caller_explicit,
             options={**dict(ctx.options or {}), "explicit_opt_in": True},
         )
-        if not mech.eligible(opt_ctx):
-            continue
-        group = pr_by_id.get(mid) or merged_by_id.get(mid)
-        if group:
-            collapsed = _collapse_binding_group(mid, group[0].state, group)
-            collapsed["notes"] = "caller_enabled"
-            active[mid] = collapsed
-        else:
-            active[mid] = {
-                "id": mid, "state": "explicit_override", "ref": None,
-                "options": {}, "notes": "caller_enabled",
+        if mech.eligible(opt_ctx):
+            active_by_id[mid] = {
+                "id": mid,
+                "state": "caller_override",
+                "ref": None,
+                "options": {},
+                "notes": "caller_enabled",
             }
-    for mid in exclude_ids:
-        active.pop(mid, None)
 
-    gap_pool = ideal_eligible_ids if canonical_track == "expected_ideal" else eligible_ids
-    unimplemented_gaps = [
-        mid for mid in gap_pool
-        if mid not in merged_by_id and mid not in pr_by_id
-    ]
+    ordered_active = [active_by_id[mid] for mid in MECHANISM_CATALOG if mid in active_by_id]
     return {
         "stack": stack_profile.name,
         "repository": stack_profile.repository,
         "feature_track": canonical_track,
-        "eligible_mechanisms": eligible_ids,
-        "active_mechanisms": [active[key] for key in MECHANISM_CATALOG if key in active],
+        "arch": ctx.arch,
+        "active_mechanisms": ordered_active,
         "merged_mechanisms": [b.to_dict() for b in merged_list],
         "unmerged_pr_mechanisms": [b.to_dict() for b in pr_list],
         "unimplemented_gaps": unimplemented_gaps,
@@ -1729,12 +1887,24 @@ def apply_resolved_mechanisms(
     base_ctx: MechanismContext,
 ) -> None:
     """Apply every active mechanism in deterministic catalog order."""
+    is_target = str(resolved_track.get("feature_track") or "").strip().lower() == "target"
+    unlock_profile_mc2 = is_target and "enable_fused_mc2" not in base_ctx.caller_explicit
+    if unlock_profile_mc2:
+        meta = dict(runtime_dict.get("metadata") or {})
+        additional = meta.get("additional_config")
+        if isinstance(additional, Mapping) and additional.get("enable_fused_mc2") == 0:
+            cleaned = dict(additional)
+            cleaned.pop("enable_fused_mc2", None)
+            meta["additional_config"] = cleaned
+            runtime_dict["metadata"] = meta
     active = {entry["id"]: entry for entry in resolved_track["active_mechanisms"]}
     for mid, mech in MECHANISM_CATALOG.items():
         entry = active.get(mid)
         if entry is None:
             continue
         opts = {**dict(base_ctx.options or {}), **dict(entry.get("options") or {})}
+        if unlock_profile_mc2 and opts.get("enable_fused_mc2") == 0:
+            opts.pop("enable_fused_mc2", None)
         if entry.get("notes") == "caller_enabled":
             opts["explicit_opt_in"] = True
         ctx = MechanismContext(
@@ -1749,42 +1919,6 @@ def apply_resolved_mechanisms(
             mech.apply(runtime_dict, ctx)
 
 
-def _vllm_ascend_profile() -> RuntimeStackProfile:
-    profile = load_runtime_stack_manifest(VLLM_ASCEND_MANIFEST_PATH)
-    model_defaults = {
-        key: {
-            "quant": dict(value.get("quant") or {}),
-            "sp": value.get("sp", True),
-            "mlapo": "VLLM_ASCEND_ENABLE_MLAPO" in (value.get("env") or {}),
-            "kv_block_size": value.get("kv_block_size"),
-            "mtp_proposal_tokens": value.get("mtp_proposal_tokens", 0),
-            "graph_capture_mode": value.get("graph_capture_mode", "full"),
-            "multistream_overlap_shared_expert": bool(
-                value.get("multistream_overlap_shared_expert", False)
-            ),
-            "engram_cpu_offload": bool(value.get("engram_cpu_offload", False)),
-            "tutorial_flags": dict(value.get("tutorial_flags") or {}),
-        }
-        for key, value in VA_RECOMMENDED_PROFILES.items()
-    }
-    return replace(
-        profile,
-        description="vLLM-Ascend main baseline and audited open performance PRs",
-        model_defaults=model_defaults,
-        bindings=profile.bindings,
-    )
-
-
-register_runtime_stack(_vllm_ascend_profile())
-
-register_runtime_stack(RuntimeStackProfile(
-    name="raw_eager",
-    repository="eager-baseline",
-    description="Unfused eager PyTorch/ATen execution baseline with zero optional fusions",
-    bindings=(),
-))
-
-
 # --- Unified Software Stack Registry & Lowering-Base Resolver ---------------
 
 
@@ -1797,7 +1931,7 @@ class SoftwareStackSpec:
     description: str
     profile: RuntimeStackProfile
     sources: tuple[SourceRef, ...] = ()
-    default_track: str = "merged"
+    default_track: str = "shipping"
     decode_capture_mode: str = "full"
 
 
@@ -1827,12 +1961,12 @@ def _stack_name_for_case(case: Case, requested: str | None) -> str:
 
 
 def _mtp_proposal_tokens(case: Case) -> int:
-    """Resolve draft/MTP proposal token count matching ``scheduler.py``."""
+    """Resolve draft/MTP proposal token count strictly validated via ``catalog.draft_spec``."""
     dspark = getattr(case.runtime, "dspark", None)
     if dspark is not None:
         step_spec = dspark.step_spec()
         if getattr(step_spec, "draft_len", 0):
-            return int(step_spec.draft_len)
+            return validate_fia_speculative_tokens(int(step_spec.draft_len))
     meta = dict(case.runtime.metadata)
     raw_spec = meta.get("speculative")
     if raw_spec:
@@ -1842,16 +1976,16 @@ def _mtp_proposal_tokens(case: Case) -> int:
             parsed = json.loads(raw_spec) if isinstance(raw_spec, str) else raw_spec
             spec_obj = SpeculativeSpec.from_mapping(parsed) if isinstance(parsed, Mapping) else None
         if spec_obj is not None and spec_obj.draft_len:
-            return int(spec_obj.draft_len)
+            return validate_fia_speculative_tokens(int(spec_obj.draft_len))
     if meta.get("draft_proposal_tokens"):
-        return int(meta["draft_proposal_tokens"])
+        return validate_fia_speculative_tokens(int(meta["draft_proposal_tokens"]))
     aux = getattr(case.model, "auxiliary", None)
     mtp = getattr(aux, "mtp", None) if aux is not None else None
     if mtp is not None and getattr(mtp, "proposal_tokens", 0):
-        return int(mtp.proposal_tokens)
+        return validate_fia_speculative_tokens(int(mtp.proposal_tokens))
     model_spec = getattr(case.model, "speculative", None)
     if model_spec is not None and getattr(model_spec, "proposal_tokens", 0):
-        return int(model_spec.proposal_tokens)
+        return validate_fia_speculative_tokens(int(model_spec.proposal_tokens))
     return 0
 
 
@@ -1869,8 +2003,6 @@ def _apply_production_decode_capture(
     )
     if case.runtime.graph_capture_mode == target_mode and case.runtime.graph_capture_keys:
         return case
-    from mindie_sim.compose.runtime import capture_keys
-
     max_seqs = max(
         MIN_CAPTURE_SEQS,
         int(case.runtime.max_num_seqs or MIN_CAPTURE_SEQS),
@@ -1878,7 +2010,12 @@ def _apply_production_decode_capture(
         else max(request.step.sequences, default=1),
     )
     mtp = _mtp_proposal_tokens(case)
-    keys = tuple(case.runtime.graph_capture_keys or capture_keys(max_seqs, mtp))
+    rule = build_capture_bucket_rule(
+        cudagraph_mode="FULL_DECODE_ONLY" if target_mode == "full" else target_mode.upper(),
+        num_speculative_tokens=mtp,
+        max_num_seqs=max_seqs,
+    )
+    keys = tuple(case.runtime.graph_capture_keys or rule.full_keys)
     runtime = replace(
         case.runtime,
         graph_capture_mode=target_mode,
@@ -1940,12 +2077,7 @@ def _apply_tier_policy(
         caller_explicit=frozenset(),
         options={"phase": phase} if phase else {},
     )
-    resolved = resolve_stack_track(
-        stack.profile,
-        track="expected_ideal",
-        model_key=str(case.model.name),
-        ctx=ctx,
-    )
+    resolved = resolve_stack_track(stack.profile, track="target", ctx=ctx)
     apply_resolved_mechanisms(rt_dict, resolved, ctx)
     finalize_compilation_spine(rt_dict, raw_eager=False)
     new_runtime = Software.from_mapping(rt_dict)
@@ -1953,7 +2085,7 @@ def _apply_tier_policy(
 
 
 class SoftwareStackRegistry:
-    """Registry of supported inference software stacks and tier resolution."""
+    """Registry facade delegating stack resolution to canonical ``stacks.registry``."""
 
     def __init__(self, specs: Iterable[SoftwareStackSpec] = (), /) -> None:
         self._specs: dict[str, SoftwareStackSpec] = {}
@@ -1983,7 +2115,7 @@ class SoftwareStackRegistry:
         return tuple(sorted(self._specs))
 
     def resolve_base(self, case: Case, request: LoweringRequest, /) -> ResolvedBase:
-        """Resolve stack profile, tier rules, capture policy, and binding origins."""
+        """Resolve stack profile, canonical track tier, capture policy, and binding origins."""
         stack = self.get(_stack_name_for_case(case, request.stack))
         working = replace(
             case,
@@ -2005,17 +2137,26 @@ class SoftwareStackRegistry:
         )
 
 
+register_runtime_stack(load_runtime_stack_manifest(VLLM_ASCEND_MANIFEST_PATH))
+register_runtime_stack(RuntimeStackProfile(
+    name="raw_eager",
+    repository="eager-baseline",
+    description="Unfused eager PyTorch/ATen execution baseline with zero optional fusions",
+    bindings=(),
+))
+
+
 @lru_cache(maxsize=1)
 def default_stack_registry() -> SoftwareStackRegistry:
-    """Return the built-in ``SoftwareStackRegistry`` populated from audited stacks."""
+    """Return the built-in ``SoftwareStackRegistry`` facade."""
     specs = [
         SoftwareStackSpec(
             name=profile.name,
             repository=profile.repository,
             description=profile.description,
             profile=profile,
-            default_track="raw_eager" if profile.name == "raw_eager" else "merged",
-            decode_capture_mode="none" if profile.name == "raw_eager" else "full",
+            default_track="eager" if profile.name in {"raw_eager", "raw-eager"} else "shipping",
+            decode_capture_mode="none" if profile.name in {"raw_eager", "raw-eager"} else "full",
         )
         for profile in RUNTIME_STACKS.values()
     ]

@@ -597,6 +597,6 @@ def test_indexer_online_mechanism_is_ideal_only():
     runtime = {}
     mechanism.apply(runtime, context)
     assert 'indexer_online_topk' in runtime['lowering_passes']
-    for track, selected in (('merged', False), ('unmerged_pr', False), ('expected_ideal', True)):
+    for track, selected in (('shipping', False), ('proposed', False), ('target', True)):
         result = resolve_stack_track(RUNTIME_STACKS['vllm-ascend'], track=track, model_key='deepseek-v4.1-flash', ctx=context)
         assert any(item['id'] == 'indexer_online_ub_topk' for item in result['active_mechanisms']) is selected

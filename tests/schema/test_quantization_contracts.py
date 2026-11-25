@@ -666,8 +666,7 @@ def test_dynamic_quant_exclusions_mxfp4_all_and_a5_recommended_profiles() -> Non
         assert q.format_for("mhc") == "fp32"
 
     assert quant_preset("mxfp4_all").exclusions == ()
-    for model_key in ("glm-5.1", "glm-5.2"):
-        assert VA_RECOMMENDED_PROFILES[model_key]["quant"]["a5"] == "mxfp8_mxfp4"
+    assert VA_RECOMMENDED_PROFILES == {}
 
 
 def test_before_baseline_honesty_mc2_megamoe_and_a3_int8_kv_mlapo() -> None:
@@ -701,14 +700,14 @@ def test_before_baseline_honesty_mc2_megamoe_and_a3_int8_kv_mlapo() -> None:
         assert MECHANISM_CATALOG[mech_id].eligible(ctx_profile_disabled) is False
 
     res_merged = resolve_stack_track(
-        va_profile, track="merged", model_key="kimi-k3.1", ctx=ctx_profile_disabled,
+        va_profile, track="shipping", model_key="kimi-k3.1", ctx=ctx_profile_disabled,
     )
     merged_ids = {entry["id"] for entry in res_merged["active_mechanisms"]}
     assert "cann_megamoe_fusion" not in merged_ids
     assert "tp_mc2_overlap" not in merged_ids
 
     res_ideal = resolve_stack_track(
-        va_profile, track="expected_ideal", model_key="kimi-k3.1", ctx=ctx_profile_disabled,
+        va_profile, track="target", model_key="kimi-k3.1", ctx=ctx_profile_disabled,
     )
     ideal_ids = {entry["id"] for entry in res_ideal["active_mechanisms"]}
     assert "cann_megamoe_fusion" in ideal_ids
@@ -718,7 +717,7 @@ def test_before_baseline_honesty_mc2_megamoe_and_a3_int8_kv_mlapo() -> None:
         ctx_profile_disabled, caller_explicit=frozenset({"enable_fused_mc2"}),
     )
     res_ideal_locked = resolve_stack_track(
-        va_profile, track="expected_ideal", model_key="kimi-k3.1", ctx=ctx_caller_disabled,
+        va_profile, track="target", model_key="kimi-k3.1", ctx=ctx_caller_disabled,
     )
     locked_ids = {entry["id"] for entry in res_ideal_locked["active_mechanisms"]}
     assert "cann_megamoe_fusion" not in locked_ids

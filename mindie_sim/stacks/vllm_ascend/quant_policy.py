@@ -1,23 +1,18 @@
 """1:1 vLLM-Ascend quantization instantiation, shard packing, and CacheStateABI builder.
 
-[Role] Mirror upstream ``vllm-ascend`` quantization instantiation verbatim:
-  - ``modelslim_config.py`` prefix/substring mappings and ``packed_modules_mapping``,
-  - constructor ``quant_config=None`` unquantized module enforcement,
-  - strict Homogeneous Shard-Packing Law (shards merge iff ``vllm-ascend`` packs
-    them AND every shard resolves to identical ``TensorPrecisionABI``),
-  - runtime-only ``PreparedWeightSpec`` materializations (Kimi-K3.1 BF16
-    ``F = F_b @ F_a``, W4A8 INT64 scale + FP32 ``scale_bias``, FAQuant derived
-    scales, MXFP8 ``v_cache_scale_float_reciprocal``),
+[Role] Mirror upstream ``vllm-ascend`` quantization instantiation strictly via
+  structural ``ModelSpec`` / ``LayerPlan`` fields and ``CheckpointQuantMap``:
+  - strict Homogeneous Shard-Packing Law across all experts,
+  - runtime-only ``PreparedWeightSpec`` materializations,
   - exact per-native-layer typed ``CacheStateABI`` for KV, Indexer, and
-    recurrent/PLE/Engram state across Kimi-K3.1, Qwen3.8-Flash-Next,
-    GLM-5.3-Flash, DeepSeek-V4.1, and Qwen3-32B (BF16 / C8 / FAQuant /
-    ``QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL``).
-[Invariants] Zero invented quantization heuristics. Unknown non-empty checkpoint
-  tags raise ``ModelingError("unknown_checkpoint_quant_tag:...")``. A2/A3 never
-  admit MXFP/FP8 weights or FP8 KV cache. Blind-box ``unquantized_native`` with
-  production target projection quantizes ONLY modules receiving ``quant_config``
-  and stamps ``provenance="stack_default_quant_projection"``. Zero imports from
-  ``mindie_sim.export`` or ``mindie_sim.compose`` (AG010).
+    recurrent/PLE/Engram state.
+[Invariants] Zero per-model-name executable branches (AG014). Zero silent BF16
+  or FLOAT fallbacks, zero ``BF16 -> fp16`` coercions, zero expert-0-only
+  sampling, zero heterogeneous gate/up ``FLOAT`` downgrades. Unknown non-empty
+  checkpoint tags raise ``ModelingError("unknown_checkpoint_quant_tag:...")``.
+  A2/A3 never admit MXFP/FP8 weights or FP8 KV cache, and reject INT8 KV on
+  window-compressed MLA. Zero imports from ``mindie_sim.export`` or
+  ``mindie_sim.compose`` (AG010).
 [Timeouts & Locks] Pure in-memory resolution over immutable descriptors; no I/O
   or locks.
 [Side-Effect Policy] Returns frozen ``RuntimeQuantPlan`` records; zero input
@@ -25,8 +20,9 @@
 """
 from __future__ import annotations
 
-from collections import OrderedDict
 from collections.abc import Mapping, Sequence
+import math
+import re
 from typing import Any
 
 from mindie_sim.catalog.speculative_state import speculative_state_plan
@@ -49,38 +45,17 @@ from mindie_sim.schema.stack import (
     RuntimeQuantPlan,
 )
 
+from .checkpoint_registry import (
+    QUANT_MODEL_PREFIX_MAPPINGS,
+    QUANT_MODEL_SUBSTR_MAPPINGS,
+    expand_checkpoint_tensor_paths,
+)
 from .profiles import (
     A2_A3_INT_ONLY_FAMILIES,
     VLLM_ASCEND_STACK_ID,
-    normalize_canonical_model,
     normalize_hw_family,
     resolve_model_type,
 )
-
-#: Verbatim upstream ``modelslim_config.py`` prefix mappings.
-QUANT_MODEL_PREFIX_MAPPINGS: dict[str, tuple[tuple[str, str], ...]] = {
-    "qwen3_vl": (("model.language_model.", "model."),),
-    "qwen3_vl_moe": (("model.language_model.", "model."),),
-    "qwen3_5": (("model.language_model.", "model."),),
-    "qwen3_5_moe": (("model.language_model.", "model."),),
-    "qwen3_5_text": (("model.language_model.", "model."),),
-    "qwen3_5_moe_text": (("model.language_model.", "model."),),
-    "qwen4_exp": (("model.language_model.", "model."),),
-    "qwen4_exp_text": (("model.language_model.", "model."),),
-    "kimi_k25": (("language_model.model.", "model."),),
-    "kimi_k3": (("language_model.model.", "model."), ("model.language_model.", "model.")),
-    "kimi_k31": (("language_model.model.", "model."), ("model.language_model.", "model.")),
-    "glm5_next": (("model.language_model.", "model."),),
-    "glm5_next_text": (("model.language_model.", "model."),),
-}
-
-#: Verbatim upstream ``modelslim_config.py`` substring mappings.
-QUANT_MODEL_SUBSTR_MAPPINGS: dict[str, tuple[tuple[str, str], ...]] = {
-    "qwen3_5": ((".mlp.shared_expert.", ".mlp.shared_experts."),),
-    "qwen3_5_moe": ((".mlp.shared_expert.", ".mlp.shared_experts."),),
-    "qwen4_exp": ((".mlp.shared_expert.", ".mlp.shared_experts."),),
-    "qwen4_exp_text": ((".mlp.shared_expert.", ".mlp.shared_experts."),),
-}
 
 #: Upstream ``packed_modules_mapping`` + ``UPDATED_PACKED_MODULES_MAPPING``.
 UPDATED_PACKED_MODULES_MAPPING: dict[str, tuple[str, ...]] = {
@@ -130,6 +105,9 @@ FP8_DEFAULT_BLOCK_SIZE = 128
 MLA_SCALE_GROUP_SIZE = 128
 INDEX_SCALE_GROUP_SIZE = 128
 DEFAULT_KV_BLOCK_SIZE = 128
+DEFAULT_MLA_LATENT_DIM = 512
+DEFAULT_INDEX_DIM = 128
+DEFAULT_CONV_KERNEL_SIZE = 4
 
 NZ_K_ALIGN = 16
 NZ_N_ALIGN = 64
@@ -144,14 +122,10 @@ MXFP_KV_NZ_DIM_FRAG = 32
 MXFP_K_SCALE_NZ_TOKEN_FRAG = 16
 MXFP_V_SCALE_NZ_DIM_FRAG = 16
 
-DEFAULT_CONV_KERNEL_SIZE = 4
-DEFAULT_MLA_LATENT_DIM = 512
-DEFAULT_INDEX_DIM = 128
-DEFAULT_ENGRAM_SLOTS = 65536
 W4A8_SCALE_BIAS_DIM = 16
 W8A16_WEIGHT_BITS = 8
+_EXPERT_ID_RE = re.compile(r"\bexperts\.(\d+)\.")
 
-_FLOAT_TAGS = frozenset({"", "NONE", "FLOAT", "BF16", "BFLOAT16", "FP16", "FLOAT16", "FP32", "FLOAT32"})
 _MXFP8_TAGS = frozenset({"W8A8_MXFP8", "MXFP8", "MX_FP8", "W8A8_MXFP", "MXFP8_DYNAMIC"})
 _MXFP4_W4A8_TAGS = frozenset({
     "W4A8_MXFP", "W4A8_MXFP4", "W4A8_MXFP4_DYNAMIC",
@@ -173,28 +147,24 @@ _W4A16_TAGS = frozenset({
 
 _MXFP8_KV_TAGS = frozenset({
     "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL",
-    "MXFP8_C8",
-    "C8_MXFP8",
-    "C8_MXFP",
-    "MXFP8",
+    "MXFP8_KV",
+    "MXFP8_PER_CHANNEL",
 })
 _MLA_FP8_KV_TAGS = frozenset({"FP8", "FP8_E4M3", "FP8_DYNAMIC", "MXFP8", "MXFP8_DYNAMIC", "W8A8_MXFP8"})
 _INT8_KV_TAGS = frozenset({"INT8", "C8", "KV_C8", "INT8_DYNAMIC", "INT8_SYM", "FAQUANT", "FAKQUANT"})
+_NATIVE_KV_TAGS = frozenset({"", "AUTO", "NONE", "FLOAT", "BF16", "BFLOAT16", "FP16", "FLOAT16"})
 _FP8_INDEX_TAGS = frozenset({"fp8", "fp8_e4m3", "fp8_dynamic", "mxfp8", "mxfp8_dynamic"})
 _INT8_INDEX_TAGS = frozenset({"int8", "c8", "int8_dynamic", "int8_sym"})
 _FAQUANT_BUFFER_TOKENS = ("fa_q", "fa_k", "fa_v", "faquant", "fakquant")
-_KIMI_K3_TYPES = frozenset({"kimi_k3", "kimi_k31"})
-_GLM5_NEXT_TYPES = frozenset({"glm5_next", "glm5_next_text"})
-_QWEN4_EXP_TYPES = frozenset({"qwen4_exp", "qwen4_exp_text"})
-PORT_ABI_PLAN_CACHE_MAX = 64
-_PORT_ABI_PLAN_CACHE: OrderedDict[
-    tuple[Any, ...],
-    tuple[
-        tuple[tuple[tuple[str, int, str], TensorPrecisionABI], ...],
-        tuple[tuple[str, tuple[str, ...], str], ...],
-        bool,
-    ],
-] = OrderedDict()
+
+_FLOAT_DTYPE_CANON: dict[str, str] = {
+    "bfloat16": "bf16",
+    "bf16": "bf16",
+    "float16": "fp16",
+    "fp16": "fp16",
+    "float32": "fp32",
+    "fp32": "fp32",
+}
 
 _PROJECTION_PRESET_TAGS: dict[str, tuple[str, str]] = {
     "mxfp8": ("W8A8_MXFP8", "W8A8_MXFP8"),
@@ -223,46 +193,81 @@ _PROJECTION_PRESET_TAGS: dict[str, tuple[str, str]] = {
 }
 
 
-def map_quant_prefix(model_type: str, tensor_path: str) -> tuple[str, ...]:
-    """Generate upstream ``modelslim_config.py`` prefix/substring lookup candidates."""
-    mtype = str(model_type or "").strip().lower()
-    base = str(tensor_path or "").strip()
-    if not base:
-        return ()
-    candidates: list[str] = [base]
-    for src, dst in QUANT_MODEL_PREFIX_MAPPINGS.get(mtype, ()):
-        if base.startswith(src):
-            candidates.append(dst + base[len(src):])
-        elif base.startswith(dst):
-            candidates.append(src + base[len(dst):])
-    expanded: list[str] = list(candidates)
-    for cand in candidates:
-        for src_sub, dst_sub in QUANT_MODEL_SUBSTR_MAPPINGS.get(mtype, ()):
-            if src_sub in cand:
-                expanded.append(cand.replace(src_sub, dst_sub))
-            if dst_sub in cand:
-                expanded.append(cand.replace(dst_sub, src_sub))
-    with_unweighted: list[str] = []
-    for cand in expanded:
-        with_unweighted.append(cand)
-        if cand.endswith(".weight"):
-            with_unweighted.append(cand[: -len(".weight")])
-    return tuple(dict.fromkeys(with_unweighted))
+def _ceil_div(numerator: int, denominator: int) -> int:
+    if denominator <= 0:
+        raise ModelingError(f"invalid_scale_group_extent:{denominator}")
+    return max(1, (int(numerator) + int(denominator) - 1) // int(denominator))
+
+
+def _validate_native_float_dtype(raw: str) -> str:
+    norm = str(raw or "").strip().lower()
+    canon = _FLOAT_DTYPE_CANON.get(norm)
+    if canon is None:
+        raise ModelingError(f"native_float_dtype_invalid:{raw!r}")
+    return canon
 
 
 def _normalize_native_float(checkpoint: CheckpointQuantMap, model: ModelSpec) -> str:
-    raw = str(checkpoint.native_float_dtype or model.weight_dtype or model.activation_dtype or "bf16").strip().lower()
-    if raw in {"bfloat16", "bf16"}:
-        return "bf16"
-    if raw in {"float16", "fp16"}:
-        return "fp16"
-    if raw in {"float32", "fp32"}:
-        return "fp32"
-    return "bf16"
+    if str(checkpoint.native_float_dtype or "").strip():
+        return _validate_native_float_dtype(checkpoint.native_float_dtype)
+    qspec = getattr(model, "quantization", None)
+    for cand in (
+        getattr(qspec, "native_format", "") if qspec is not None else "",
+        getattr(model, "activation_dtype", ""),
+        getattr(model, "weight_dtype", ""),
+    ):
+        text = str(cand or "").strip().lower()
+        if text in _FLOAT_DTYPE_CANON:
+            return _FLOAT_DTYPE_CANON[text]
+    raise ModelingError(
+        f"native_float_dtype_missing:checkpoint={checkpoint.provenance.checkpoint_id}:model={model.name}"
+    )
+
+
+def _normalize_scale_dtype(raw: str, *, default_dtype: str = "fp32") -> tuple[str, int]:
+    norm = str(raw or "").strip().lower()
+    if not norm:
+        norm = default_dtype
+    if norm in {"e8m0", "fp8_e8m0"}:
+        return "e8m0", SCALE_BYTES_E8M0
+    if norm in {"bf16", "bfloat16"}:
+        return "bf16", SCALE_BYTES_FP16
+    if norm in {"fp16", "float16"}:
+        return "fp16", SCALE_BYTES_FP16
+    if norm in {"fp32", "float32"}:
+        return "fp32", SCALE_BYTES_FP32
+    raise ModelingError(f"unknown_cache_scale_dtype:{raw!r}")
 
 
 def _effective_option_map(options: ResolvedStackOptions) -> dict[str, Any]:
     return {str(k): v for k, v in options.effective_mechanisms}
+
+
+def _is_ple_engram(model: ModelSpec, plan: LayerPlan) -> bool:
+    if not plan.engram:
+        return False
+    if int(plan.conv_kernel or 0) > 0:
+        return True
+    src = getattr(model.engram, "source", ()) or ()
+    return any(str(k).startswith("ple_") for k, _ in src)
+
+
+def _is_window_compressed_mla(plan: LayerPlan) -> bool:
+    return bool(
+        str(plan.attention or "").lower() == "mla"
+        and (
+            str(plan.mla_variant or "").lower() == "latent_mqa"
+            or (int(plan.window or 0) > 0 and (bool(plan.owns_long_kv) or int(plan.compress_ratio or 1) > 1))
+        )
+    )
+
+
+def _guard_a5_only(hw: str, method: str, tag: str) -> None:
+    if hw in A2_A3_INT_ONLY_FAMILIES:
+        raise ModelingError(
+            f"hw_isa_incompatible:{hw}:linear_method={method}:tag={tag}:"
+            "A2/A3 supports INT8/INT4 quantization only"
+        )
 
 
 def _w4a8_nz_eligible(*, is_moe: bool, use_nz: bool, k_dim: int, n_dim: int) -> bool:
@@ -273,6 +278,18 @@ def _w4a8_nz_eligible(*, is_moe: bool, use_nz: bool, k_dim: int, n_dim: int) -> 
     if k_dim > 0 and n_dim > 0:
         return (k_dim % NZ_K_ALIGN == 0) and (n_dim % NZ_N_ALIGN == 0)
     return True
+
+
+def _dense_float_abi(dtype: str) -> TensorPrecisionABI:
+    return TensorPrecisionABI(
+        linear_method="dense",
+        input_dtype=dtype,
+        weight_dtype=dtype,
+        output_dtype=dtype,
+        compute_dtype=dtype,
+        accum_dtype="fp32",
+        weight_layout="ND",
+    )
 
 
 def _resolve_a5_fp_tag_to_abi(
@@ -411,11 +428,16 @@ def _resolve_int_tag_to_abi(
     return None
 
 
+def map_quant_prefix(model_type: str, tensor_path: str) -> tuple[str, ...]:
+    """Generate checkpoint lookup candidates via declarative ``checkpoint_registry`` tables."""
+    return expand_checkpoint_tensor_paths(tensor_path, model_type)
+
+
 def resolve_raw_tag_to_abi(
     raw_tag: str,
     *,
     hw_family: str,
-    native_float_dtype: str = "bf16",
+    native_float_dtype: str = "",
     phase: str = "decode",
     role: str = "colocated",
     is_moe: bool = False,
@@ -424,22 +446,21 @@ def resolve_raw_tag_to_abi(
     n_dim: int = 0,
     group_size: tuple[int, ...] = (),
 ) -> TensorPrecisionABI:
-    """Resolve one raw checkpoint quantization tag into exact ``TensorPrecisionABI``."""
+    """Resolve one raw checkpoint quantization tag into a strict ``TensorPrecisionABI``."""
     tag = str(raw_tag or "").strip().upper()
     hw = normalize_hw_family(hw_family)
-    nat = native_float_dtype or "bf16"
 
-    if tag in _FLOAT_TAGS:
-        dtype_out = "fp16" if tag in {"FP16", "FLOAT16"} else ("fp32" if tag in {"FP32", "FLOAT32"} else nat)
-        return TensorPrecisionABI(
-            linear_method="dense",
-            input_dtype=dtype_out,
-            weight_dtype=dtype_out,
-            output_dtype=dtype_out,
-            compute_dtype=dtype_out,
-            accum_dtype="fp32",
-            weight_layout="ND",
-        )
+    # Explicit floating-point tags are preserved verbatim (never coerced to native_float_dtype).
+    if tag in {"BF16", "BFLOAT16"}:
+        return _dense_float_abi("bf16")
+    if tag in {"FP16", "FLOAT16"}:
+        return _dense_float_abi("fp16")
+    if tag in {"FP32", "FLOAT32"}:
+        return _dense_float_abi("fp32")
+
+    nat = _validate_native_float_dtype(native_float_dtype)
+    if tag in {"", "NONE", "FLOAT"}:
+        return _dense_float_abi(nat)
 
     a5_abi = _resolve_a5_fp_tag_to_abi(tag, hw=hw, nat=nat, group_size=group_size)
     if a5_abi is not None:
@@ -453,14 +474,6 @@ def resolve_raw_tag_to_abi(
         return int_abi
 
     raise ModelingError(f"unknown_checkpoint_quant_tag:{raw_tag}")
-
-
-def _guard_a5_only(hw: str, method: str, tag: str) -> None:
-    if hw in A2_A3_INT_ONLY_FAMILIES:
-        raise ModelingError(
-            f"hw_isa_incompatible:{hw}:linear_method={method}:tag={tag}:"
-            "A2/A3 supports INT8/INT4 quantization only"
-        )
 
 
 def _hf_quant_tag_for_role(
@@ -489,27 +502,6 @@ def _hf_quant_tag_for_role(
     return None
 
 
-def _lookup_modelslim_tag(
-    checkpoint: CheckpointQuantMap,
-    *,
-    model_type: str,
-    candidate_paths: Sequence[str],
-    scope: ModelScope,
-    layer_ids: Sequence[int],
-    expert_id: int | None = None,
-) -> str | None:
-    for path in candidate_paths:
-        mapped = map_quant_prefix(model_type, path)
-        for lid in layer_ids:
-            for cand in mapped:
-                tag = checkpoint.resolve_raw_tag(
-                    cand, scope=scope, source_native_layer_id=lid, expert_id=expert_id,
-                )
-                if tag is not None:
-                    return tag
-    return None
-
-
 def _project_blind_box_tag(
     projection_preset: str, *, role_name: str, is_routed_expert: bool,
 ) -> str:
@@ -524,6 +516,105 @@ def _project_blind_box_tag(
     return pair[1] if is_routed_expert else pair[0]
 
 
+def _substitute_expert_paths(candidate_paths: Sequence[str], expert_id: int | None) -> tuple[str, ...]:
+    if expert_id is None or expert_id == 0:
+        return tuple(candidate_paths)
+    tok = f".experts.{expert_id}."
+    return tuple(p.replace(".experts.0.", tok) if ".experts.0." in p else p for p in candidate_paths)
+
+
+_EXPERT_FULL_ENUM_LIMIT = 16
+
+
+def _expert_boundary_ids(checkpoint: CheckpointQuantMap, num_experts: int) -> tuple[int, ...]:
+    """Collect every expert ID that can differ across rules/exceptions/ignores plus endpoints."""
+    count = max(1, int(num_experts or 1))
+    if count <= 1:
+        return (0,)
+    expert_rules = [r for r in checkpoint.rules if ".experts." in r.pattern]
+    presence_domains = [
+        tuple(sorted(set(r.presence.expert_indices)))
+        for r in expert_rules
+        if r.presence is not None and r.presence.expert_indices
+    ]
+    has_unconstrained_expert_rule = any(
+        r.presence is None or not r.presence.expert_indices for r in expert_rules
+    )
+    eff_count = count
+    if (
+        presence_domains
+        and len(set(presence_domains)) == 1
+        and not has_unconstrained_expert_rule
+    ):
+        dom = presence_domains[0]
+        if dom[0] == 0 and dom[-1] == len(dom) - 1 and 0 < len(dom) < count:
+            has_beyond = any(
+                int(m) >= len(dom)
+                for src in (*checkpoint.ignored_modules, *(e.pattern for e in checkpoint.layer_exceptions))
+                for m in _EXPERT_ID_RE.findall(src)
+            ) or any(
+                val >= len(dom)
+                for exc in checkpoint.layer_exceptions
+                for val in exc.expert_indices
+            )
+            if not has_beyond:
+                eff_count = len(dom)
+    if eff_count <= _EXPERT_FULL_ENUM_LIMIT:
+        return tuple(range(eff_count))
+    ids: set[int] = {0, 1, eff_count - 1}
+    for exc in checkpoint.layer_exceptions:
+        for m in _EXPERT_ID_RE.findall(exc.pattern):
+            val = int(m)
+            if 0 <= val < eff_count:
+                ids.add(val)
+        for val in exc.expert_indices:
+            if 0 <= val < eff_count:
+                ids.add(val)
+    for entry in checkpoint.ignored_modules:
+        for m in _EXPERT_ID_RE.findall(entry):
+            val = int(m)
+            if 0 <= val < eff_count:
+                ids.add(val)
+    for rule in checkpoint.rules:
+        for m in _EXPERT_ID_RE.findall(rule.pattern):
+            val = int(m)
+            if 0 <= val < eff_count:
+                ids.add(val)
+        pres = rule.presence
+        if pres is not None and pres.expert_indices:
+            present = frozenset(v for v in pres.expert_indices if 0 <= v < eff_count)
+            if present and len(present) < eff_count:
+                ids.add(min(present))
+                ids.add(max(present))
+                for missing in range(eff_count):
+                    if missing not in present:
+                        ids.add(missing)
+                        break
+    return tuple(sorted(ids))
+
+
+def _lookup_modelslim_tag(
+    checkpoint: CheckpointQuantMap,
+    *,
+    model_type: str,
+    candidate_paths: Sequence[str],
+    scope: ModelScope,
+    layer_ids: Sequence[int],
+    expert_id: int | None = None,
+) -> str | None:
+    paths = _substitute_expert_paths(candidate_paths, expert_id)
+    for path in paths:
+        mapped = map_quant_prefix(model_type, path)
+        for lid in layer_ids:
+            for cand in mapped:
+                tag = checkpoint.resolve_raw_tag(
+                    cand, scope=scope, source_native_layer_id=lid, expert_id=expert_id,
+                )
+                if tag is not None:
+                    return tag
+    return None
+
+
 def _lookup_exception_or_ignored(
     checkpoint: CheckpointQuantMap,
     *,
@@ -533,7 +624,8 @@ def _lookup_exception_or_ignored(
     layer_ids: Sequence[int],
     expert_id: int | None = None,
 ) -> str | None:
-    for path in candidate_paths:
+    paths = _substitute_expert_paths(candidate_paths, expert_id)
+    for path in paths:
         mapped = map_quant_prefix(model_type, path)
         for lid in layer_ids:
             for cand in mapped:
@@ -557,7 +649,8 @@ def _lookup_non_wildcard_rule(
     specific_rules = tuple(r for r in checkpoint.rules if r.pattern != "*")
     if not specific_rules:
         return None
-    for path in candidate_paths:
+    paths = _substitute_expert_paths(candidate_paths, expert_id)
+    for path in paths:
         mapped = map_quant_prefix(model_type, path)
         for lid in layer_ids:
             for cand in mapped:
@@ -579,12 +672,8 @@ def _lookup_hf_rule_tag(
     expert_id: int | None = None,
 ) -> tuple[str, tuple[int, ...]] | None:
     specific = _lookup_non_wildcard_rule(
-        checkpoint,
-        model_type=model_type,
-        candidate_paths=candidate_paths,
-        scope=scope,
-        layer_ids=layer_ids,
-        expert_id=expert_id,
+        checkpoint, model_type=model_type, candidate_paths=candidate_paths,
+        scope=scope, layer_ids=layer_ids, expert_id=expert_id,
     )
     if specific is not None:
         return specific
@@ -608,7 +697,7 @@ def _lookup_modelslim_w13_tag(
     layer_ids: Sequence[int],
     expert_id: int | None,
 ) -> str | None:
-    """Resolve ``mlp.experts.w13`` while enforcing gate/up homogeneity when both exist."""
+    """Resolve ``mlp.experts.w13`` and fail closed if gate/up tags are heterogeneous."""
     gate_paths = [p for p in candidate_paths if any(tok in p for tok in ("gate_proj", ".w1.", "w13"))]
     up_paths = [p for p in candidate_paths if any(tok in p for tok in ("up_proj", ".w3."))]
     gate_tag = _lookup_modelslim_tag(
@@ -623,11 +712,14 @@ def _lookup_modelslim_w13_tag(
         if up_paths else None
     )
     if gate_tag is not None and up_tag is not None and gate_tag.upper() != up_tag.upper():
-        return "FLOAT"
+        raise ModelingError(
+            f"heterogeneous_expert_gate_up_quantization:scope={scope}:layers={tuple(layer_ids)}:"
+            f"expert={expert_id}:gate={gate_tag}:up={up_tag}"
+        )
     return gate_tag if gate_tag is not None else up_tag
 
 
-def _resolve_role_tag(
+def _resolve_single_expert_role_tag(
     checkpoint: CheckpointQuantMap,
     *,
     model_type: str,
@@ -636,41 +728,26 @@ def _resolve_role_tag(
     scope: ModelScope,
     layer_ids: Sequence[int],
     is_routed_expert: bool,
+    expert_id: int | None,
     target_quant_projection: str,
     hf_cfg: Mapping[str, Any],
 ) -> tuple[str, tuple[int, ...], bool]:
-    """Return ``(raw_tag, group_size, used_projection)`` for one role."""
-    expert_id = 0 if is_routed_expert else None
     if checkpoint.source_format == "modelslim_description":
         if role_name == "mlp.experts.w13":
             explicit = _lookup_modelslim_w13_tag(
-                checkpoint,
-                model_type=model_type,
-                candidate_paths=candidate_paths,
-                scope=scope,
-                layer_ids=layer_ids,
-                expert_id=expert_id,
+                checkpoint, model_type=model_type, candidate_paths=candidate_paths,
+                scope=scope, layer_ids=layer_ids, expert_id=expert_id,
             )
         else:
             explicit = _lookup_modelslim_tag(
-                checkpoint,
-                model_type=model_type,
-                candidate_paths=candidate_paths,
-                scope=scope,
-                layer_ids=layer_ids,
-                expert_id=expert_id,
+                checkpoint, model_type=model_type, candidate_paths=candidate_paths,
+                scope=scope, layer_ids=layer_ids, expert_id=expert_id,
             )
-        if explicit is not None:
-            return explicit, (), False
-        return "FLOAT", (), False
+        return (explicit, (), False) if explicit is not None else ("FLOAT", (), False)
 
     exc_or_ignored = _lookup_exception_or_ignored(
-        checkpoint,
-        model_type=model_type,
-        candidate_paths=candidate_paths,
-        scope=scope,
-        layer_ids=layer_ids,
-        expert_id=expert_id,
+        checkpoint, model_type=model_type, candidate_paths=candidate_paths,
+        scope=scope, layer_ids=layer_ids, expert_id=expert_id,
     )
     if exc_or_ignored is not None:
         return exc_or_ignored, (), False
@@ -684,17 +761,15 @@ def _resolve_role_tag(
             if hf_hit is not None:
                 return hf_hit[0], hf_hit[1], False
         rule_hit = _lookup_hf_rule_tag(
-            checkpoint,
-            model_type=model_type,
-            candidate_paths=candidate_paths,
-            scope=scope,
-            layer_ids=layer_ids,
-            expert_id=expert_id,
+            checkpoint, model_type=model_type, candidate_paths=candidate_paths,
+            scope=scope, layer_ids=layer_ids, expert_id=expert_id,
         )
         if rule_hit is not None:
             return rule_hit[0], rule_hit[1], False
         if hf_cfg and str(hf_cfg.get("quant_method") or "").strip().lower() == "ascend":
-            return "W8A8_DYNAMIC", (), False
+            raise ModelingError(
+                f"unresolved_ascend_hf_quant_role:scope={scope}:layers={tuple(layer_ids)}:role={role_name}"
+            )
         return "FLOAT", (), False
 
     if checkpoint.source_format == "unquantized_native":
@@ -714,10 +789,54 @@ def _resolve_role_tag(
     return "FLOAT", (), False
 
 
+def _resolve_role_tag(
+    checkpoint: CheckpointQuantMap,
+    *,
+    model_type: str,
+    role_name: str,
+    candidate_paths: Sequence[str],
+    scope: ModelScope,
+    layer_ids: Sequence[int],
+    is_routed_expert: bool,
+    expert_ids: Sequence[int],
+    target_quant_projection: str,
+    hf_cfg: Mapping[str, Any],
+) -> tuple[str, tuple[int, ...], bool]:
+    """Return ``(raw_tag, group_size, used_projection)`` enforcing per-expert homogeneity."""
+    if not is_routed_expert:
+        return _resolve_single_expert_role_tag(
+            checkpoint, model_type=model_type, role_name=role_name,
+            candidate_paths=candidate_paths, scope=scope, layer_ids=layer_ids,
+            is_routed_expert=False, expert_id=None,
+            target_quant_projection=target_quant_projection, hf_cfg=hf_cfg,
+        )
+    check_ids = tuple(expert_ids) if expert_ids else (0,)
+    first = _resolve_single_expert_role_tag(
+        checkpoint, model_type=model_type, role_name=role_name,
+        candidate_paths=candidate_paths, scope=scope, layer_ids=layer_ids,
+        is_routed_expert=True, expert_id=check_ids[0],
+        target_quant_projection=target_quant_projection, hf_cfg=hf_cfg,
+    )
+    first_key = (first[0].upper(), first[1])
+    for eid in check_ids[1:]:
+        cur = _resolve_single_expert_role_tag(
+            checkpoint, model_type=model_type, role_name=role_name,
+            candidate_paths=candidate_paths, scope=scope, layer_ids=layer_ids,
+            is_routed_expert=True, expert_id=eid,
+            target_quant_projection=target_quant_projection, hf_cfg=hf_cfg,
+        )
+        if (cur[0].upper(), cur[1]) != first_key:
+            raise ModelingError(
+                f"heterogeneous_expert_quantization:scope={scope}:layers={tuple(layer_ids)}:"
+                f"role={role_name}:expert_{check_ids[0]}={first[0]}:expert_{eid}={cur[0]}"
+            )
+    return first
+
+
 def _layer_role_descriptors(
-    plan: LayerPlan, *, model: ModelSpec, model_type: str,
+    plan: LayerPlan, *, model: ModelSpec,
 ) -> tuple[list[tuple[str, tuple[str, ...], bool]], list[tuple[str, tuple[str, ...]]]]:
-    """Return ``(role_specs, candidate_pack_groups)`` for one target layer."""
+    """Return structural ``(role_specs, candidate_pack_groups)`` for one target layer."""
     idx = int(plan.index)
     attn = str(plan.attention or model.attention).lower()
     roles: list[tuple[str, tuple[str, ...], bool]] = []
@@ -725,7 +844,7 @@ def _layer_role_descriptors(
 
     if attn == "kda":
         prefix_a, prefix_b = f"model.layers.{idx}.self_attn", f"model.layers.{idx}.linear_attn"
-        if model_type in _GLM5_NEXT_TYPES:
+        if int(plan.gate_rank or 0) > 0:
             for r in ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj", "f_b_proj", "g_b_proj", "o_proj"):
                 roles.append((r, (f"{prefix_b}.{r}.weight", f"{prefix_a}.{r}.weight"), False))
             packs.append(("fused_qkvbfg_a_proj", ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")))
@@ -754,16 +873,14 @@ def _layer_role_descriptors(
         }
         for r in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"):
             roles.append((f"mla.{r}", (f"{prefix}.{r}.weight", *mla_alt[r]), False))
-        if plan.mla_output_gate or model_type in _KIMI_K3_TYPES:
+        if plan.mla_output_gate:
             roles.append(("mla.g_proj", (f"{prefix}.g_proj.weight",), False))
         packs.append(("fused_qkv_a_proj", ("mla.q_a_proj", "mla.kv_a_proj_with_mqa")))
         if plan.indexer:
-            idx_p = f"{prefix}.indexer"
-            idx_short = f"{attn_short}.indexer"
+            idx_p, idx_short = f"{prefix}.indexer", f"{attn_short}.indexer"
             roles.append(("indexer.wk", (f"{idx_p}.wk.weight", f"{idx_short}.wk.weight"), False))
             roles.append(("indexer.weights_proj", (f"{idx_p}.weights_proj.weight", f"{idx_short}.weights_proj.weight"), False))
-            if model_type in _KIMI_K3_TYPES:
-                packs.append(("wk_weights_proj", ("indexer.wk", "indexer.weights_proj")))
+            packs.append(("wk_weights_proj", ("indexer.wk", "indexer.weights_proj")))
     else:
         prefix = f"model.layers.{idx}.self_attn"
         for r in ("q_proj", "k_proj", "v_proj", "o_proj"):
@@ -783,24 +900,22 @@ def _layer_role_descriptors(
                 ))
             packs.append(("index_qk_proj", ("index_q_proj", "index_k_proj")))
 
-    if plan.residual_block_size > 0 or model_type in _KIMI_K3_TYPES:
+    if int(plan.residual_block_size or 0) > 0:
         roles.append(("self_attention_res_proj", (f"model.layers.{idx}.self_attention_res_proj.weight",), False))
         roles.append(("mlp_res_proj", (f"model.layers.{idx}.mlp_res_proj.weight",), False))
-    if plan.hyper_connections or model_type in _QWEN4_EXP_TYPES:
+    if plan.hyper_connections or int(plan.hc_mult or 1) > 1:
         roles.append(("hyper_connection.pre_proj", (f"model.layers.{idx}.hyper_connection.pre_proj.weight",), False))
         roles.append(("hyper_connection.post_proj", (f"model.layers.{idx}.hyper_connection.post_proj.weight",), False))
-    if plan.engram and model_type in _QWEN4_EXP_TYPES:
+    if _is_ple_engram(model, plan):
         roles.append(("ple.embed_proj", (f"model.layers.{idx}.ple.embed_proj.weight",), False))
         roles.append(("ple.key_proj", (f"model.layers.{idx}.ple.key_proj.weight",), False))
         roles.append(("ple.value_proj", (f"model.layers.{idx}.ple.value_proj.weight",), False))
         roles.append(("ple.conv1d", (f"model.layers.{idx}.ple.conv1d.weight",), False))
 
-    mlp_p = f"model.layers.{idx}.mlp"
-    bsm_p = f"model.layers.{idx}.block_sparse_moe"
-    moe_p = f"model.layers.{idx}.moe"
-    ffn_p = f"layers.{idx}.ffn"
+    mlp_p, bsm_p = f"model.layers.{idx}.mlp", f"model.layers.{idx}.block_sparse_moe"
+    moe_p, ffn_p = f"model.layers.{idx}.moe", f"layers.{idx}.ffn"
     if str(plan.ffn).lower() == "moe":
-        if plan.expert_latent_size > 0:
+        if int(plan.expert_latent_size or 0) > 0:
             roles.append((
                 "mlp.latent_moe",
                 (
@@ -820,8 +935,10 @@ def _layer_role_descriptors(
             "mlp.experts.w13",
             (
                 f"{mlp_p}.experts.0.gate_proj.weight",
+                f"{mlp_p}.experts.0.up_proj.weight",
                 f"{mlp_p}.experts.w13.weight",
                 f"{bsm_p}.experts.0.w1.weight",
+                f"{bsm_p}.experts.0.w3.weight",
                 f"{moe_p}.experts.w13_weight",
                 f"{ffn_p}.experts.0.w1.weight",
                 f"{ffn_p}.experts.0.w3.weight",
@@ -842,7 +959,7 @@ def _layer_role_descriptors(
             ),
             True,
         ))
-        if plan.num_shared_experts > 0 or model.num_shared_experts > 0:
+        if int(plan.num_shared_experts or 0) > 0 or int(model.num_shared_experts or 0) > 0:
             se_p = f"model.layers.{idx}.share_expert"
             roles.append(("mlp.shared_expert.gate_proj", (f"{mlp_p}.shared_experts.gate_proj.weight", f"{mlp_p}.shared_expert.gate_proj.weight", f"{bsm_p}.shared_experts.gate_proj.weight", f"{se_p}.gate_proj.weight", f"{ffn_p}.shared_experts.w1.weight"), False))
             roles.append(("mlp.shared_expert.up_proj", (f"{mlp_p}.shared_experts.up_proj.weight", f"{mlp_p}.shared_expert.up_proj.weight", f"{bsm_p}.shared_experts.up_proj.weight", f"{se_p}.up_proj.weight", f"{ffn_p}.shared_experts.w3.weight"), False))
@@ -863,7 +980,6 @@ def _apply_homogeneous_packs(
     native_layer: int,
     layer_abis: Mapping[str, TensorPrecisionABI],
     candidate_packs: Sequence[tuple[str, tuple[str, ...]]],
-    model_type: str,
 ) -> list[tuple[str, tuple[str, ...], str]]:
     """Enforce Homogeneous Shard-Packing Law: pack iff every shard has identical ABI."""
     packed: list[tuple[str, tuple[str, ...], str]] = []
@@ -873,8 +989,7 @@ def _apply_homogeneous_packs(
         sigs = {layer_abis[role].abi_signature for role in shards}
         if len(sigs) == 1:
             packed.append((f"{scope}.L{native_layer}.{pack_name}", tuple(shards), next(iter(sigs))))
-        elif pack_name == "fused_qkvbfg_a_proj" and model_type in _GLM5_NEXT_TYPES:
-            # Heterogeneous GLM-5.3-Flash KDA falls back to homogeneous QKV + BFG sub-packs.
+        elif pack_name == "fused_qkvbfg_a_proj":
             for sub_name, sub_shards in (
                 ("in_proj_qkv", ("q_proj", "k_proj", "v_proj")),
                 ("fused_bfg_a_proj", ("b_proj", "f_a_proj", "g_a_proj")),
@@ -896,10 +1011,11 @@ def _resolve_draft_ports(
     phase: str,
     role: str,
     use_nz: bool,
+    expert_ids: Sequence[int],
     target_quant_projection: str,
     hf_cfg: Mapping[str, Any],
 ) -> tuple[list[tuple[tuple[str, int, str], TensorPrecisionABI]], bool]:
-    """Resolve optional draft (MTP / DSpark) ports preserving Qwen4Exp MTP BF16."""
+    """Resolve optional draft (MTP / DSpark) ports structurally."""
     aux = model.auxiliary
     if aux is None or (aux.mtp is None and aux.dspark is None):
         return [], False
@@ -907,6 +1023,7 @@ def _resolve_draft_ports(
     draft_layers = max(1, int(getattr(draft_spec, "layers", 1) or 1))
     start_id = int(model.body_layers or model.layers)
     has_moe_draft = bool(model.num_experts > 0 and aux.mtp is not None)
+    draft_is_ple = any(_is_ple_engram(model, p) for p in model.layer_plans)
     ports: list[tuple[tuple[str, int, str], TensorPrecisionABI]] = []
     used_proj = False
 
@@ -932,10 +1049,14 @@ def _resolve_draft_ports(
                     "mlp.experts.w13",
                     (
                         f"mtp.layers.{local_idx}.mlp.experts.0.gate_proj.weight",
+                        f"mtp.layers.{local_idx}.mlp.experts.0.up_proj.weight",
                         f"mtp.layers.{offset_id}.mlp.experts.0.gate_proj.weight",
+                        f"mtp.layers.{offset_id}.mlp.experts.0.up_proj.weight",
                         f"mtp.layers.{local_idx}.mlp.experts.w13.weight",
                         f"mtp.{local_idx}.ffn.experts.0.w1.weight",
+                        f"mtp.{local_idx}.ffn.experts.0.w3.weight",
                         f"model.layers.{offset_id}.mlp.experts.0.gate_proj.weight",
+                        f"model.layers.{offset_id}.mlp.experts.0.up_proj.weight",
                     ),
                     True,
                 ),
@@ -956,18 +1077,35 @@ def _resolve_draft_ports(
 
         for role_name, cands, is_expert in role_defs:
             if checkpoint.source_format == "modelslim_description":
-                exp_id = 0 if is_expert else None
-                explicit = _lookup_modelslim_tag(
-                    checkpoint, model_type=model_type, candidate_paths=cands,
-                    scope="draft", layer_ids=layer_ids, expert_id=exp_id,
-                )
-                if explicit is None:
-                    # Appended native MTP layers (e.g. DeepSeek-R1 L61) live in target scope.
-                    explicit = _lookup_modelslim_tag(
-                        checkpoint, model_type=model_type, candidate_paths=cands,
-                        scope="target", layer_ids=(offset_id,), expert_id=exp_id,
+                check_ids = tuple(expert_ids) if is_expert else (None,)
+                found_tags: list[str] = []
+                for eid in check_ids:
+                    if role_name == "mlp.experts.w13":
+                        explicit = _lookup_modelslim_w13_tag(
+                            checkpoint, model_type=model_type, candidate_paths=cands,
+                            scope="draft", layer_ids=layer_ids, expert_id=eid,
+                        )
+                        if explicit is None:
+                            explicit = _lookup_modelslim_w13_tag(
+                                checkpoint, model_type=model_type, candidate_paths=cands,
+                                scope="target", layer_ids=(offset_id,), expert_id=eid,
+                            )
+                    else:
+                        explicit = _lookup_modelslim_tag(
+                            checkpoint, model_type=model_type, candidate_paths=cands,
+                            scope="draft", layer_ids=layer_ids, expert_id=eid,
+                        )
+                        if explicit is None:
+                            explicit = _lookup_modelslim_tag(
+                                checkpoint, model_type=model_type, candidate_paths=cands,
+                                scope="target", layer_ids=(offset_id,), expert_id=eid,
+                            )
+                    found_tags.append(explicit if explicit is not None else "FLOAT")
+                if len({t.upper() for t in found_tags}) > 1:
+                    raise ModelingError(
+                        f"heterogeneous_draft_expert_quantization:layer={local_idx}:role={role_name}:tags={sorted(set(found_tags))}"
                     )
-                tag, blk, did_proj = (explicit if explicit is not None else "FLOAT"), (), False
+                tag, blk, did_proj = found_tags[0], (), False
             else:
                 tag, blk, did_proj = _resolve_role_tag(
                     checkpoint,
@@ -977,8 +1115,9 @@ def _resolve_draft_ports(
                     scope="draft",
                     layer_ids=layer_ids,
                     is_routed_expert=is_expert,
-                    target_quant_projection="" if model_type in _QWEN4_EXP_TYPES else target_quant_projection,
-                    hf_cfg=hf_cfg if model_type not in _QWEN4_EXP_TYPES else {},
+                    expert_ids=expert_ids,
+                    target_quant_projection="" if draft_is_ple else target_quant_projection,
+                    hf_cfg={} if draft_is_ple else hf_cfg,
                 )
             used_proj = used_proj or did_proj
             abi = resolve_raw_tag_to_abi(
@@ -993,9 +1132,10 @@ def _detect_kv_mode(
     checkpoint: CheckpointQuantMap,
     *,
     hw: str,
-    model_type: str,
+    native_float: str,
     effective_opts: Mapping[str, Any],
     is_mla: bool,
+    is_window_compressed_mla: bool = False,
     kv_tag_override: str | None = None,
 ) -> tuple[str, str, bool, list[tuple[str, str, str]]]:
     """Resolve effective KV cache mode, scale dtype, FAQuant active flag, and dispositions."""
@@ -1029,34 +1169,55 @@ def _detect_kv_mode(
     if raw_kv in _MLA_FP8_KV_TAGS:
         if hw in A2_A3_INT_ONLY_FAMILIES:
             raise ModelingError(f"hw_isa_incompatible:{hw}:kv_cache={raw_kv}:A2/A3_requires_bf16_or_c8")
-        default_scale = "fp16" if model_type in _GLM5_NEXT_TYPES else "fp32"
-        scale_dtype = str(checkpoint.cache_rule.kv_scale_dtype or default_scale).strip().lower()
+        scale_dtype, _ = _normalize_scale_dtype(checkpoint.cache_rule.kv_scale_dtype, default_dtype="fp32")
         return "fp8_e4m3", scale_dtype, has_faquant, disps
 
     if raw_kv in _INT8_KV_TAGS:
-        scale_dtype = str(checkpoint.cache_rule.kv_scale_dtype or "fp32").strip().lower()
+        if is_window_compressed_mla and hw in A2_A3_INT_ONLY_FAMILIES:
+            raise ModelingError(
+                f"kv_cache_int8_unsupported_on_window_compressed_mla:{hw}:kv_cache={raw_kv}"
+            )
+        scale_dtype, _ = _normalize_scale_dtype(checkpoint.cache_rule.kv_scale_dtype, default_dtype="fp32")
         return "int8", scale_dtype, has_faquant, disps
 
-    return "bf16", "", has_faquant, disps
+    if raw_kv in _NATIVE_KV_TAGS:
+        if raw_kv in {"BF16", "BFLOAT16"}:
+            return "bf16", "", has_faquant, disps
+        if raw_kv in {"FP16", "FLOAT16"}:
+            return "fp16", "", has_faquant, disps
+        return native_float, "", has_faquant, disps
+
+    raise ModelingError(f"unknown_kv_cache_dtype:{raw_kv}")
 
 
 def _resolve_index_dtype(
     raw_tag: str | None,
     *,
     hw: str,
+    native_float: str,
     fallback_kv_mode: str,
 ) -> str:
-    norm = str(
-        raw_tag
-        or ("fp8_e4m3" if fallback_kv_mode == "fp8_e4m3" else ("int8" if fallback_kv_mode == "int8" else "bf16"))
-    ).strip().lower()
-    if norm in _FP8_INDEX_TAGS:
+    text = str(raw_tag or "").strip().lower()
+    if not text or text in {"auto", "none"}:
+        if fallback_kv_mode == "fp8_e4m3":
+            text = "fp8_e4m3"
+        elif fallback_kv_mode == "int8":
+            text = "int8"
+        else:
+            return native_float
+    if text in _FP8_INDEX_TAGS:
         if hw in A2_A3_INT_ONLY_FAMILIES:
-            raise ModelingError(f"hw_isa_incompatible:{hw}:indexer_kv_dtype={norm}")
+            raise ModelingError(f"hw_isa_incompatible:{hw}:indexer_kv_dtype={text}")
         return "fp8_e4m3"
-    if norm in _INT8_INDEX_TAGS:
+    if text in _INT8_INDEX_TAGS:
         return "int8"
-    return "bf16"
+    if text in {"bf16", "bfloat16"}:
+        return "bf16"
+    if text in {"fp16", "float16"}:
+        return "fp16"
+    if text == "float":
+        return native_float
+    raise ModelingError(f"unknown_indexer_kv_dtype:{raw_tag!r}")
 
 
 def _build_mxfp_gqa_cache_abi(
@@ -1072,10 +1233,28 @@ def _build_mxfp_gqa_cache_abi(
     page_pitch_override: int = 0,
 ) -> CacheStateABI:
     """Build exact ``QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL`` PA_NZ ``CacheStateABI``."""
-    k_bytes = local_heads * kv_block_size * head_dim
-    ks_bytes = local_heads * kv_block_size * head_dim // MXFP_GROUP_SIZE
-    v_bytes = local_heads * kv_block_size * head_dim
-    vs_bytes = local_heads * kv_block_size * head_dim // MXFP_GROUP_SIZE
+    k_phys = (local_heads, _ceil_div(head_dim, MXFP_KV_NZ_DIM_FRAG), kv_block_size, MXFP_KV_NZ_DIM_FRAG)
+    k_bytes = math.prod(k_phys)
+    ks_groups = _ceil_div(head_dim, MXFP_GROUP_SIZE)
+    ks_phys = (
+        local_heads,
+        _ceil_div(kv_block_size, MXFP_K_SCALE_NZ_TOKEN_FRAG),
+        _ceil_div(head_dim, MXFP_KV_SCALE_GROUP_SIZE),
+        MXFP_K_SCALE_NZ_TOKEN_FRAG,
+        MXFP_KV_SCALE_VALUES_PER_GROUP,
+    )
+    ks_bytes = math.prod(ks_phys)
+    v_phys = k_phys
+    v_bytes = math.prod(v_phys)
+    vs_groups = _ceil_div(kv_block_size, MXFP_GROUP_SIZE)
+    vs_phys = (
+        local_heads,
+        _ceil_div(head_dim, MXFP_V_SCALE_NZ_DIM_FRAG),
+        _ceil_div(kv_block_size, MXFP_KV_SCALE_GROUP_SIZE),
+        MXFP_V_SCALE_NZ_DIM_FRAG,
+        MXFP_KV_SCALE_VALUES_PER_GROUP,
+    )
+    vs_bytes = math.prod(vs_phys)
     payload_bytes = k_bytes + ks_bytes + v_bytes + vs_bytes
     pitch = max(payload_bytes, int(page_pitch_override or payload_bytes))
     pad_bytes = pitch - payload_bytes
@@ -1085,7 +1264,7 @@ def _build_mxfp_gqa_cache_abi(
         plane_kind="payload",
         logical_axes=("head", "token", "dim"),
         logical_shape=(local_heads, kv_block_size, head_dim),
-        physical_shape=(local_heads, head_dim // MXFP_KV_NZ_DIM_FRAG, kv_block_size, MXFP_KV_NZ_DIM_FRAG),
+        physical_shape=k_phys,
         dtype="fp8_e4m3",
         layout="PA_NZ",
         offset_in_page=0,
@@ -1099,14 +1278,8 @@ def _build_mxfp_gqa_cache_abi(
         plane_id="k_scale",
         plane_kind="scale",
         logical_axes=("head", "token", "group"),
-        logical_shape=(local_heads, kv_block_size, head_dim // MXFP_GROUP_SIZE),
-        physical_shape=(
-            local_heads,
-            max(1, kv_block_size // MXFP_K_SCALE_NZ_TOKEN_FRAG),
-            max(1, head_dim // MXFP_KV_SCALE_GROUP_SIZE),
-            MXFP_K_SCALE_NZ_TOKEN_FRAG,
-            MXFP_KV_SCALE_VALUES_PER_GROUP,
-        ),
+        logical_shape=(local_heads, kv_block_size, ks_groups),
+        physical_shape=ks_phys,
         dtype="e8m0",
         layout="PA_NZ",
         group_axes=(2,),
@@ -1124,7 +1297,7 @@ def _build_mxfp_gqa_cache_abi(
         plane_kind="payload",
         logical_axes=("head", "token", "dim"),
         logical_shape=(local_heads, kv_block_size, head_dim),
-        physical_shape=(local_heads, head_dim // MXFP_KV_NZ_DIM_FRAG, kv_block_size, MXFP_KV_NZ_DIM_FRAG),
+        physical_shape=v_phys,
         dtype="fp8_e4m3",
         layout="PA_NZ",
         offset_in_page=k_bytes + ks_bytes,
@@ -1138,14 +1311,8 @@ def _build_mxfp_gqa_cache_abi(
         plane_id="v_scale",
         plane_kind="scale",
         logical_axes=("head", "dim", "block_group"),
-        logical_shape=(local_heads, head_dim, max(1, kv_block_size // MXFP_GROUP_SIZE)),
-        physical_shape=(
-            local_heads,
-            max(1, head_dim // MXFP_V_SCALE_NZ_DIM_FRAG),
-            max(1, kv_block_size // MXFP_KV_SCALE_GROUP_SIZE),
-            MXFP_V_SCALE_NZ_DIM_FRAG,
-            MXFP_KV_SCALE_VALUES_PER_GROUP,
-        ),
+        logical_shape=(local_heads, head_dim, vs_groups),
+        physical_shape=vs_phys,
         dtype="e8m0",
         layout="PA_NZ",
         group_axes=(1,),
@@ -1161,7 +1328,7 @@ def _build_mxfp_gqa_cache_abi(
     pad_plane = CachePlaneABI(
         plane_id="page_padding",
         plane_kind="padding",
-        logical_axes=("byte",),
+        logical_axes=("pad_byte",),
         logical_shape=(pad_bytes,),
         physical_shape=(pad_bytes,),
         dtype="uint8",
@@ -1195,6 +1362,7 @@ def _build_mla_cache_abi(
     native_layer: int,
     kv_mode: str,
     kv_scale_dtype: str,
+    native_float: str,
     kv_block_size: int,
     placement: CachePlacementRule,
     checkpoint_digest: str,
@@ -1219,16 +1387,10 @@ def _build_mla_cache_abi(
             write_trigger="append",
             bytes_per_unit=latent_dim,
         ))
-        if kv_scale_dtype in {"e8m0", "fp8_e8m0"}:
-            scale_group_ext = MXFP_GROUP_SIZE
-            scale_groups = max(1, latent_dim // MXFP_GROUP_SIZE)
-            s_dtype = "e8m0"
-            s_bytes = scale_groups * SCALE_BYTES_E8M0
-        else:
-            scale_group_ext = MLA_SCALE_GROUP_SIZE
-            scale_groups = max(1, latent_dim // MLA_SCALE_GROUP_SIZE)
-            s_dtype = "fp16" if kv_scale_dtype in {"fp16", "bf16", "float16", "bfloat16"} else "fp32"
-            s_bytes = scale_groups * (SCALE_BYTES_FP16 if s_dtype == "fp16" else SCALE_BYTES_FP32)
+        s_dtype, elem_scale_bytes = _normalize_scale_dtype(kv_scale_dtype, default_dtype="fp32")
+        scale_group_ext = MXFP_GROUP_SIZE if s_dtype == "e8m0" else MLA_SCALE_GROUP_SIZE
+        scale_groups = _ceil_div(latent_dim, scale_group_ext)
+        s_bytes = scale_groups * elem_scale_bytes
         planes.append(CachePlaneABI(
             plane_id="mla_latent_scale",
             plane_kind="scale",
@@ -1247,14 +1409,15 @@ def _build_mla_cache_abi(
         ))
         offset_next = latent_dim + s_bytes
     else:
-        lat_bytes = latent_dim * int(dtype_bytes("bf16"))
+        lat_dtype = kv_mode if kv_mode in {"bf16", "fp16", "fp32"} else native_float
+        lat_bytes = latent_dim * int(dtype_bytes(lat_dtype))
         planes.append(CachePlaneABI(
             plane_id="mla_latent",
             plane_kind="payload",
             logical_axes=("latent",),
             logical_shape=(latent_dim,),
             physical_shape=(latent_dim,),
-            dtype="bf16",
+            dtype=lat_dtype,
             layout="ND",
             allocation_frequency="token",
             write_trigger="append",
@@ -1263,17 +1426,17 @@ def _build_mla_cache_abi(
         offset_next = lat_bytes
 
     if rope_dim > 0:
-        rope_bytes = rope_dim * int(dtype_bytes("bf16"))
+        rope_bytes = rope_dim * int(dtype_bytes(native_float))
         planes.append(CachePlaneABI(
             plane_id="mla_rotary",
             plane_kind="suffix",
             logical_axes=("rope",),
             logical_shape=(rope_dim,),
             physical_shape=(rope_dim,),
-            dtype="bf16",
+            dtype=native_float,
             layout="ND",
             suffix_shape=(rope_dim,),
-            suffix_dtype="bf16",
+            suffix_dtype=native_float,
             offset_in_page=offset_next,
             allocation_frequency="token",
             write_trigger="append",
@@ -1290,7 +1453,7 @@ def _build_mla_cache_abi(
         phase=phase,
         deployment_role=role,
         checkpoint_digest=checkpoint_digest,
-        recipe_abi_id=f"mla_{kv_mode}_{kv_scale_dtype or 'bf16'}",
+        recipe_abi_id=f"mla_{kv_mode}_{kv_scale_dtype or native_float}",
         kv_block_size=kv_block_size,
         kernel_block_size=kv_block_size,
         window=int(plan.window) if plan.window > 0 and component_role == "window_kv" else None,
@@ -1305,6 +1468,7 @@ def _build_index_cache_abi(
     native_layer: int,
     index_dtype: str,
     index_scale_dtype: str,
+    native_float: str,
     kv_block_size: int,
     placement: CachePlacementRule,
     checkpoint_digest: str,
@@ -1312,7 +1476,7 @@ def _build_index_cache_abi(
     role: str,
     consumer_keys: tuple[str, ...] = (),
 ) -> CacheStateABI:
-    """Build exact DSA/KPool Index-K CacheStateABI (zero phantom per-token weights row)."""
+    """Build exact DSA/KPool Index-K CacheStateABI with exact ceiling scale groups."""
     idx_dim = int(plan.index_dim or DEFAULT_INDEX_DIM)
     pool_ratio = max(1, int(plan.index_kpool or 1))
     tail_slots = max(0, pool_ratio - 1) if pool_ratio > 1 else 0
@@ -1330,18 +1494,20 @@ def _build_index_cache_abi(
             write_trigger="append",
             bytes_per_unit=idx_dim,
         ))
-        s_dtype = "fp16" if index_scale_dtype in {"fp16", "bf16"} else "fp32"
-        s_bytes = SCALE_BYTES_FP16 if s_dtype == "fp16" else SCALE_BYTES_FP32
+        s_dtype, elem_scale_bytes = _normalize_scale_dtype(index_scale_dtype, default_dtype="fp32")
+        group_ext = min(idx_dim, MXFP_GROUP_SIZE if s_dtype == "e8m0" else INDEX_SCALE_GROUP_SIZE)
+        scale_groups = _ceil_div(idx_dim, group_ext)
+        s_bytes = scale_groups * elem_scale_bytes
         planes.append(CachePlaneABI(
             plane_id="index_k_scale",
             plane_kind="scale",
             logical_axes=("scale_group",),
-            logical_shape=(1,),
-            physical_shape=(1,),
+            logical_shape=(scale_groups,),
+            physical_shape=(scale_groups,),
             dtype=s_dtype,
             layout="ND",
             group_axes=(0,),
-            group_extents=(min(idx_dim, INDEX_SCALE_GROUP_SIZE),),
+            group_extents=(group_ext,),
             scale_dtype=s_dtype,
             offset_in_page=idx_dim,
             allocation_frequency="token_group" if pool_ratio > 1 else "token",
@@ -1349,28 +1515,29 @@ def _build_index_cache_abi(
             bytes_per_unit=s_bytes,
         ))
     else:
+        eff_dtype = index_dtype if index_dtype in {"bf16", "fp16", "fp32"} else native_float
         planes.append(CachePlaneABI(
             plane_id="index_k",
             plane_kind="payload",
             logical_axes=("index_dim",),
             logical_shape=(idx_dim,),
             physical_shape=(idx_dim,),
-            dtype="bf16",
+            dtype=eff_dtype,
             layout="ND",
             allocation_frequency="token_group" if pool_ratio > 1 else "token",
             write_trigger="append",
-            bytes_per_unit=idx_dim * int(dtype_bytes("bf16")),
+            bytes_per_unit=idx_dim * int(dtype_bytes(eff_dtype)),
         ))
 
     if tail_slots > 0:
-        tail_bytes = tail_slots * idx_dim * int(dtype_bytes("bf16"))
+        tail_bytes = tail_slots * idx_dim * int(dtype_bytes(native_float))
         planes.append(CachePlaneABI(
             plane_id="index_tail",
             plane_kind="suffix",
             logical_axes=("tail_slot", "index_dim"),
             logical_shape=(tail_slots, idx_dim),
             physical_shape=(tail_slots, idx_dim),
-            dtype="bf16",
+            dtype=native_float,
             layout="ND",
             allocation_frequency="request_slot",
             write_trigger="append",
@@ -1430,12 +1597,13 @@ def _build_recurrent_cache_abi(
         recover_ssm=recoverssm_active,
         capacity_padded=False,
     )
-    rec_bytes = int(round(spec_plan.recurrent_bytes)) or (
-        local_heads * h_dim * h_dim * int(dtype_bytes(rec_dtype))
-    )
-    conv_bytes = int(round(spec_plan.conv_bytes)) or (
-        local_conv_w * (history_slots + rollback_slots) * int(dtype_bytes(conv_dtype))
-    )
+    rec_bytes = int(round(spec_plan.recurrent_bytes))
+    conv_bytes = int(round(spec_plan.conv_bytes))
+    if rec_bytes <= 0 or conv_bytes <= 0:
+        raise ModelingError(
+            f"recurrent_state_plan_empty:layer={native_layer}:attn={attn}:"
+            f"rec_bytes={rec_bytes}:conv_bytes={conv_bytes}"
+        )
     conv_total_slots = history_slots + rollback_slots
 
     planes: list[CachePlaneABI] = [
@@ -1506,17 +1674,24 @@ def _build_recurrent_cache_abi(
 
 def _build_engram_or_ple_abi(
     model: ModelSpec,
+    plan: LayerPlan,
     *,
     native_layer: int,
-    model_type: str,
+    native_float: str,
     engram_offload: bool,
     checkpoint_digest: str,
     phase: str,
     role: str,
+    speculative_k: int = 0,
 ) -> CacheStateABI:
-    if model_type in _QWEN4_EXP_TYPES:
+    if _is_ple_engram(model, plan):
+        engram_spec = model.engram
+        engram_src = dict(getattr(engram_spec, "source", ()) or ()) if engram_spec is not None else {}
+        ple_conv_k = int(engram_src.get("ple_conv_kernel_size", DEFAULT_CONV_KERNEL_SIZE))
+        max_ngram = max(1, int(getattr(engram_spec, "max_ngram", 1) or 1))
+        ple_hist = max(1, (ple_conv_k - 1) * max_ngram) + max(0, int(speculative_k))
+        hc_mult = max((int(getattr(p, "hc_mult", 1) or 1) for p in model.layer_plans), default=1)
         ple_dim = int(model.hidden_size)
-        ple_hist = DEFAULT_CONV_KERNEL_SIZE - 1
         return CacheStateABI(
             scope="target",
             native_layer=native_layer,
@@ -1525,19 +1700,19 @@ def _build_engram_or_ple_abi(
             planes=(CachePlaneABI(
                 plane_id="ple_conv_state",
                 plane_kind="payload",
-                logical_axes=("ple_dim", "history_slot"),
-                logical_shape=(ple_dim, ple_hist),
-                physical_shape=(ple_dim, ple_hist),
-                dtype="bf16",
+                logical_axes=("history_slot", "hc_mult", "ple_dim"),
+                logical_shape=(ple_hist, hc_mult, ple_dim),
+                physical_shape=(ple_hist, hc_mult, ple_dim),
+                dtype=native_float,
                 layout="ND",
                 allocation_frequency="request_slot",
                 write_trigger="append",
-                bytes_per_unit=ple_dim * ple_hist * int(dtype_bytes("bf16")),
+                bytes_per_unit=ple_hist * hc_mult * ple_dim * int(dtype_bytes(native_float)),
             ),),
             phase=phase,
             deployment_role=role,
             checkpoint_digest=checkpoint_digest,
-            recipe_abi_id="qwen4_exp_ple_conv_state",
+            recipe_abi_id="ple_conv_state",
             history_slots=ple_hist,
             placement=CachePlacementRule(token_ownership_axis="none", memory_tier="hbm"),
         )
@@ -1549,15 +1724,18 @@ def _build_engram_or_ple_abi(
     if matched_tables:
         table_slots = sum(int(t.rows) for t in matched_tables)
         table_dim = int(matched_tables[0].width)
-        row_b = float(getattr(engram_spec, "row_bytes", 0.0) or (table_dim * int(dtype_bytes("bf16"))))
+        row_b = float(getattr(engram_spec, "row_bytes", 0.0) or (table_dim * int(dtype_bytes(native_float))))
         storage_mode = str(getattr(engram_spec, "storage_mode", "device_bf16") or "device_bf16").lower()
-        table_dtype = "fp8_e4m3" if "fp8" in storage_mode else ("int8" if "int8" in storage_mode else "bf16")
+        table_dtype = "fp8_e4m3" if "fp8" in storage_mode else ("int8" if "int8" in storage_mode else native_float)
         total_bytes = int(round(float(table_slots) * row_b))
     else:
-        table_slots = int(getattr(engram_spec, "vocab_size", DEFAULT_ENGRAM_SLOTS) or DEFAULT_ENGRAM_SLOTS)
+        declared_slots = int(getattr(engram_spec, "vocab_size", 0) or 0)
+        if declared_slots <= 0:
+            raise ModelingError(f"engram_table_spec_missing:layer={native_layer}")
+        table_slots = declared_slots
         table_dim = int(getattr(engram_spec, "embed_dim", model.hidden_size) or model.hidden_size)
-        table_dtype = "bf16"
-        total_bytes = table_slots * table_dim * int(dtype_bytes("bf16"))
+        table_dtype = native_float
+        total_bytes = table_slots * table_dim * int(dtype_bytes(native_float))
     return CacheStateABI(
         scope="target",
         native_layer=native_layer,
@@ -1586,152 +1764,13 @@ def _build_engram_or_ple_abi(
     )
 
 
-def build_cache_state_abis(
-    model: ModelSpec,
-    checkpoint: CheckpointQuantMap,
-    *,
-    hw: str,
-    model_type: str,
-    parallel: ParallelSpec,
-    effective_opts: Mapping[str, Any],
-    role: str,
-    phase: str,
-    speculative_k: int,
-    recoverssm_active: bool,
-) -> tuple[
-    tuple[CacheStateABI, ...],
-    tuple[CacheStateABI, ...],
-    tuple[CacheStateABI, ...],
-    tuple[tuple[str, str, str], ...],
-    bool,
-    bool,
-]:
-    """Build exact per-native-layer typed KV, Indexer, and recurrent/PLE/Engram ABIs."""
-    plans = model.layer_plans
-    has_mla = any(str(p.attention).lower() == "mla" for p in plans)
-    kv_mode, kv_scale_dtype, has_faquant, disps = _detect_kv_mode(
-        checkpoint, hw=hw, model_type=model_type, effective_opts=effective_opts, is_mla=has_mla,
-    )
-    kv_block_size = int(effective_opts.get("kv_block_size") or DEFAULT_KV_BLOCK_SIZE)
-    ckpt_digest = checkpoint.digest()
-    engram_offload = bool(effective_opts.get("engram_cpu_offload", False))
-
-    default_idx_dtype = _resolve_index_dtype(
-        checkpoint.cache_rule.index_tag or effective_opts.get("indexer_kv_dtype"),
-        hw=hw, fallback_kv_mode=kv_mode,
-    )
-    index_scale_dtype = str(checkpoint.cache_rule.index_scale_dtype or "fp32").strip().lower()
-
-    long_kv_consumers: dict[int, list[str]] = {}
-    index_consumers: dict[int, list[str]] = {}
-    for p in plans:
-        n_id = p.native_layer_id if p.native_layer_id >= 0 else p.index
-        if p.kv_owner_layer_id >= 0 and p.kv_owner_layer_id != n_id:
-            long_kv_consumers.setdefault(p.kv_owner_layer_id, []).append(f"target.L{n_id}.mla_consumer")
-        if p.index_k_owner_layer_id >= 0 and p.index_k_owner_layer_id != n_id:
-            index_consumers.setdefault(p.index_k_owner_layer_id, []).append(f"target.L{n_id}.index_consumer")
-
-    kv_abis: list[CacheStateABI] = []
-    idx_abis: list[CacheStateABI] = []
-    rec_abis: list[CacheStateABI] = []
-    c8_producer_recorded = False
-    any_faquant = has_faquant
-    any_mxfp_gqa = (kv_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel")
-    token_axis = "dcp_head" if parallel.cp > 1 else ("cp_striped" if parallel.pcp > 1 else "replicated")
-    mla_rep = max(1, parallel.tp // max(1, parallel.cp))
-    has_layer_kv = bool(checkpoint.cache_rule.layer_scoped_kv)
-    has_layer_idx = bool(checkpoint.cache_rule.layer_scoped_index)
-
-    for p in plans:
-        n_id = p.native_layer_id if p.native_layer_id >= 0 else p.index
-        attn = str(p.attention or model.attention).lower()
-        layer_kv_mode, layer_kv_scale, layer_faquant = kv_mode, kv_scale_dtype, has_faquant
-        if has_layer_kv and attn not in {"kda", "gdn"}:
-            l_tag = checkpoint.cache_rule.kv_tag_for_layer(n_id)
-            layer_kv_mode, layer_kv_scale, layer_faquant, l_disps = _detect_kv_mode(
-                checkpoint, hw=hw, model_type=model_type, effective_opts=effective_opts,
-                is_mla=(attn == "mla"), kv_tag_override=l_tag,
-            )
-            for item in l_disps:
-                if item not in disps:
-                    disps.append(item)
-            any_faquant = any_faquant or layer_faquant
-            any_mxfp_gqa = any_mxfp_gqa or (layer_kv_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel")
-        if attn in {"kda", "gdn"}:
-            rec_abis.append(_build_recurrent_cache_abi(
-                model, p, native_layer=n_id, parallel=parallel, checkpoint_digest=ckpt_digest,
-                phase=phase, role=role, speculative_k=speculative_k, recoverssm_active=recoverssm_active,
-            ))
-        elif attn == "mla":
-            mla_place = CachePlacementRule(token_ownership_axis=token_axis, replication_factor=mla_rep)
-            role_name = "window_kv" if p.window > 0 else "mla_latent"
-            kv_abis.append(_build_mla_cache_abi(
-                p, native_layer=n_id, kv_mode=layer_kv_mode, kv_scale_dtype=layer_kv_scale,
-                kv_block_size=kv_block_size, placement=mla_place, checkpoint_digest=ckpt_digest,
-                phase=phase, role=role, component_role=role_name,
-            ))
-            if p.owns_long_kv:
-                kv_abis.append(_build_mla_cache_abi(
-                    p, native_layer=n_id, kv_mode=layer_kv_mode, kv_scale_dtype=layer_kv_scale,
-                    kv_block_size=kv_block_size, placement=mla_place, checkpoint_digest=ckpt_digest,
-                    phase=phase, role=role, component_role="compressed_kv",
-                    consumer_keys=tuple(long_kv_consumers.get(n_id, ())),
-                ))
-        else:
-            n_kv = int(p.num_kv_heads or model.num_kv_heads or model.num_heads)
-            h_dim = int(p.head_dim or model.head_dim)
-            l_kv = local_kv_heads(n_kv, parallel.tp)
-            rep = max(1, parallel.tp // n_kv) if n_kv < parallel.tp else 1
-            gqa_place = CachePlacementRule(
-                head_range=(0, l_kv), token_ownership_axis=token_axis, replication_factor=rep,
-            )
-            if layer_kv_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel":
-                kv_abis.append(_build_mxfp_gqa_cache_abi(
-                    native_layer=n_id, local_heads=l_kv, head_dim=h_dim, kv_block_size=kv_block_size,
-                    placement=gqa_place, checkpoint_digest=ckpt_digest, phase=phase, role=role,
-                ))
-            else:
-                eff_gqa_mode = layer_kv_mode
-                if layer_kv_mode == "int8" and str(role).lower() == "pd_prefill":
-                    eff_gqa_mode = "bf16"
-                    if not c8_producer_recorded:
-                        disps.append(("kv_cache_c8_producer", "downgraded", "kv_c8_producer_role_keeps_native_bf16"))
-                        c8_producer_recorded = True
-                kv_abis.append(_build_standard_gqa_cache_abi(
-                    native_layer=n_id, local_heads=l_kv, head_dim=h_dim, kv_mode=eff_gqa_mode,
-                    kv_block_size=kv_block_size, placement=gqa_place, checkpoint_digest=ckpt_digest,
-                    phase=phase, role=role, has_faquant=layer_faquant,
-                ))
-
-        if p.indexer and (p.owns_index_k or p.index_k_owner_layer_id < 0 or p.index_k_owner_layer_id == n_id):
-            layer_idx_dtype = (
-                _resolve_index_dtype(
-                    checkpoint.cache_rule.index_tag_for_layer(n_id) or effective_opts.get("indexer_kv_dtype"),
-                    hw=hw, fallback_kv_mode=layer_kv_mode,
-                )
-                if has_layer_idx else default_idx_dtype
-            )
-            idx_place = CachePlacementRule(token_ownership_axis=token_axis, replication_factor=mla_rep)
-            idx_abis.append(_build_index_cache_abi(
-                p, native_layer=n_id, index_dtype=layer_idx_dtype, index_scale_dtype=index_scale_dtype,
-                kv_block_size=kv_block_size, placement=idx_place, checkpoint_digest=ckpt_digest,
-                phase=phase, role=role, consumer_keys=tuple(index_consumers.get(n_id, ())),
-            ))
-        if p.engram:
-            rec_abis.append(_build_engram_or_ple_abi(
-                model, native_layer=n_id, model_type=model_type, engram_offload=engram_offload,
-                checkpoint_digest=ckpt_digest, phase=phase, role=role,
-            ))
-
-    return tuple(kv_abis), tuple(idx_abis), tuple(rec_abis), tuple(disps), any_faquant, any_mxfp_gqa
-
-
 def _build_standard_gqa_cache_abi(
     *,
     native_layer: int,
     local_heads: int,
     head_dim: int,
     kv_mode: str,
+    native_float: str,
     kv_block_size: int,
     placement: CachePlacementRule,
     checkpoint_digest: str,
@@ -1739,7 +1778,7 @@ def _build_standard_gqa_cache_abi(
     role: str,
     has_faquant: bool,
 ) -> CacheStateABI:
-    elem_dtype = kv_mode if kv_mode in {"int8", "fp8_e4m3"} else "bf16"
+    elem_dtype = kv_mode if kv_mode in {"int8", "fp8_e4m3", "bf16", "fp16", "fp32"} else native_float
     elem_bytes = int(dtype_bytes(elem_dtype))
     half_bytes = local_heads * head_dim * elem_bytes
     planes: list[CachePlaneABI] = [
@@ -1840,38 +1879,227 @@ def _build_standard_gqa_cache_abi(
     )
 
 
+def _build_layer_gqa_cache_abi(
+    model: ModelSpec,
+    plan: LayerPlan,
+    *,
+    native_layer: int,
+    parallel: ParallelSpec,
+    token_axis: str,
+    layer_kv_mode: str,
+    native_float: str,
+    kv_block_size: int,
+    ckpt_digest: str,
+    phase: str,
+    role: str,
+    layer_faquant: bool,
+    c8_producer_recorded: bool,
+    disps: list[tuple[str, str, str]],
+) -> tuple[CacheStateABI, bool]:
+    n_kv = int(plan.num_kv_heads or model.num_kv_heads or model.num_heads)
+    h_dim = int(plan.head_dim or model.head_dim)
+    l_kv = local_kv_heads(n_kv, parallel.tp)
+    rep = max(1, parallel.tp // n_kv) if n_kv < parallel.tp else 1
+    gqa_place = CachePlacementRule(
+        head_range=(0, l_kv), token_ownership_axis=token_axis, replication_factor=rep,
+    )
+    if layer_kv_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel":
+        return _build_mxfp_gqa_cache_abi(
+            native_layer=native_layer, local_heads=l_kv, head_dim=h_dim,
+            kv_block_size=kv_block_size, placement=gqa_place,
+            checkpoint_digest=ckpt_digest, phase=phase, role=role,
+        ), c8_producer_recorded
+    eff_gqa_mode = layer_kv_mode
+    if layer_kv_mode == "int8" and str(role).lower() == "pd_prefill":
+        eff_gqa_mode = native_float
+        if not c8_producer_recorded:
+            disps.append(("kv_cache_c8_producer", "downgraded", "kv_c8_producer_role_keeps_native_bf16"))
+            c8_producer_recorded = True
+    return _build_standard_gqa_cache_abi(
+        native_layer=native_layer, local_heads=l_kv, head_dim=h_dim,
+        kv_mode=eff_gqa_mode, native_float=native_float, kv_block_size=kv_block_size,
+        placement=gqa_place, checkpoint_digest=ckpt_digest, phase=phase, role=role,
+        has_faquant=layer_faquant,
+    ), c8_producer_recorded
+
+
+def build_cache_state_abis(
+    model: ModelSpec,
+    checkpoint: CheckpointQuantMap,
+    *,
+    hw: str,
+    model_type: str = "",
+    parallel: ParallelSpec,
+    effective_opts: Mapping[str, Any],
+    role: str,
+    phase: str,
+    speculative_k: int,
+    recoverssm_active: bool,
+) -> tuple[
+    tuple[CacheStateABI, ...],
+    tuple[CacheStateABI, ...],
+    tuple[CacheStateABI, ...],
+    tuple[tuple[str, str, str], ...],
+    bool,
+    bool,
+]:
+    """Build exact per-native-layer typed KV, Indexer, and recurrent/PLE/Engram ABIs."""
+    del model_type
+    plans = model.layer_plans
+    native_float = _normalize_native_float(checkpoint, model)
+    scoped_kv_layers = {int(lid) for lid, _ in checkpoint.cache_rule.layer_scoped_kv}
+    has_mla = any(str(p.attention).lower() == "mla" for p in plans)
+    has_unscoped_wc_mla = any(
+        _is_window_compressed_mla(p)
+        and (p.native_layer_id if p.native_layer_id >= 0 else p.index) not in scoped_kv_layers
+        for p in plans
+    )
+    kv_mode, kv_scale_dtype, has_faquant, disps = _detect_kv_mode(
+        checkpoint,
+        hw=hw,
+        native_float=native_float,
+        effective_opts=effective_opts,
+        is_mla=has_mla,
+        is_window_compressed_mla=has_unscoped_wc_mla,
+    )
+    kv_block_size = int(effective_opts.get("kv_block_size") or DEFAULT_KV_BLOCK_SIZE)
+    ckpt_digest = checkpoint.digest()
+    engram_offload = bool(effective_opts.get("engram_cpu_offload", False))
+
+    default_idx_dtype = _resolve_index_dtype(
+        checkpoint.cache_rule.index_tag or effective_opts.get("indexer_kv_dtype"),
+        hw=hw, native_float=native_float, fallback_kv_mode=kv_mode,
+    )
+    index_scale_dtype = str(checkpoint.cache_rule.index_scale_dtype or "fp32").strip().lower()
+
+    long_kv_consumers: dict[int, list[str]] = {}
+    index_consumers: dict[int, list[str]] = {}
+    for p in plans:
+        n_id = p.native_layer_id if p.native_layer_id >= 0 else p.index
+        if p.kv_owner_layer_id >= 0 and p.kv_owner_layer_id != n_id:
+            long_kv_consumers.setdefault(p.kv_owner_layer_id, []).append(f"target.L{n_id}.mla_consumer")
+        if p.index_k_owner_layer_id >= 0 and p.index_k_owner_layer_id != n_id:
+            index_consumers.setdefault(p.index_k_owner_layer_id, []).append(f"target.L{n_id}.index_consumer")
+
+    kv_abis: list[CacheStateABI] = []
+    idx_abis: list[CacheStateABI] = []
+    rec_abis: list[CacheStateABI] = []
+    c8_producer_recorded = False
+    any_faquant = has_faquant
+    any_mxfp_gqa = (kv_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel")
+    token_axis = "dcp_head" if parallel.cp > 1 else ("cp_striped" if parallel.pcp > 1 else "replicated")
+    mla_rep = max(1, parallel.tp // max(1, parallel.cp))
+    has_layer_kv = bool(checkpoint.cache_rule.layer_scoped_kv)
+    has_layer_idx = bool(checkpoint.cache_rule.layer_scoped_index)
+
+    for p in plans:
+        n_id = p.native_layer_id if p.native_layer_id >= 0 else p.index
+        attn = str(p.attention or model.attention).lower()
+        layer_kv_mode, layer_kv_scale, layer_faquant = kv_mode, kv_scale_dtype, has_faquant
+        if has_layer_kv and attn not in {"kda", "gdn"}:
+            l_tag = checkpoint.cache_rule.kv_tag_for_layer(n_id)
+            layer_kv_mode, layer_kv_scale, layer_faquant, l_disps = _detect_kv_mode(
+                checkpoint,
+                hw=hw,
+                native_float=native_float,
+                effective_opts=effective_opts,
+                is_mla=(attn == "mla"),
+                is_window_compressed_mla=_is_window_compressed_mla(p),
+                kv_tag_override=l_tag,
+            )
+            for item in l_disps:
+                if item not in disps:
+                    disps.append(item)
+            any_faquant = any_faquant or layer_faquant
+            any_mxfp_gqa = any_mxfp_gqa or (layer_kv_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel")
+        if attn in {"kda", "gdn"}:
+            rec_abis.append(_build_recurrent_cache_abi(
+                model, p, native_layer=n_id, parallel=parallel, checkpoint_digest=ckpt_digest,
+                phase=phase, role=role, speculative_k=speculative_k, recoverssm_active=recoverssm_active,
+            ))
+        elif attn == "mla":
+            mla_place = CachePlacementRule(token_ownership_axis=token_axis, replication_factor=mla_rep)
+            role_name = "window_kv" if p.window > 0 else "mla_latent"
+            kv_abis.append(_build_mla_cache_abi(
+                p, native_layer=n_id, kv_mode=layer_kv_mode, kv_scale_dtype=layer_kv_scale,
+                native_float=native_float, kv_block_size=kv_block_size, placement=mla_place,
+                checkpoint_digest=ckpt_digest, phase=phase, role=role, component_role=role_name,
+            ))
+            if p.owns_long_kv:
+                kv_abis.append(_build_mla_cache_abi(
+                    p, native_layer=n_id, kv_mode=layer_kv_mode, kv_scale_dtype=layer_kv_scale,
+                    native_float=native_float, kv_block_size=kv_block_size, placement=mla_place,
+                    checkpoint_digest=ckpt_digest, phase=phase, role=role,
+                    component_role="compressed_kv", consumer_keys=tuple(long_kv_consumers.get(n_id, ())),
+                ))
+        else:
+            gqa_abi, c8_producer_recorded = _build_layer_gqa_cache_abi(
+                model, p, native_layer=n_id, parallel=parallel, token_axis=token_axis,
+                layer_kv_mode=layer_kv_mode, native_float=native_float,
+                kv_block_size=kv_block_size, ckpt_digest=ckpt_digest,
+                phase=phase, role=role, layer_faquant=layer_faquant,
+                c8_producer_recorded=c8_producer_recorded, disps=disps,
+            )
+            kv_abis.append(gqa_abi)
+
+        if p.indexer and (p.owns_index_k or p.index_k_owner_layer_id < 0 or p.index_k_owner_layer_id == n_id):
+            layer_idx_dtype = (
+                _resolve_index_dtype(
+                    checkpoint.cache_rule.index_tag_for_layer(n_id) or effective_opts.get("indexer_kv_dtype"),
+                    hw=hw, native_float=native_float, fallback_kv_mode=layer_kv_mode,
+                )
+                if has_layer_idx else default_idx_dtype
+            )
+            idx_place = CachePlacementRule(token_ownership_axis=token_axis, replication_factor=mla_rep)
+            idx_abis.append(_build_index_cache_abi(
+                p, native_layer=n_id, index_dtype=layer_idx_dtype, index_scale_dtype=index_scale_dtype,
+                native_float=native_float, kv_block_size=kv_block_size, placement=idx_place,
+                checkpoint_digest=ckpt_digest, phase=phase, role=role,
+                consumer_keys=tuple(index_consumers.get(n_id, ())),
+            ))
+        if p.engram:
+            rec_abis.append(_build_engram_or_ple_abi(
+                model, p, native_layer=n_id, native_float=native_float,
+                engram_offload=engram_offload, checkpoint_digest=ckpt_digest,
+                phase=phase, role=role, speculative_k=speculative_k,
+            ))
+
+    return tuple(kv_abis), tuple(idx_abis), tuple(rec_abis), tuple(disps), any_faquant, any_mxfp_gqa
+
+
 def _build_prepared_weights(
     model: ModelSpec,
     *,
-    model_type: str,
     parallel: ParallelSpec,
     port_abis: Sequence[tuple[tuple[str, int, str], TensorPrecisionABI]],
     has_faquant: bool,
     is_mxfp_gqa: bool,
 ) -> tuple[PreparedWeightSpec, ...]:
-    """Emit runtime-only ``PreparedWeightSpec`` allocations (0 checkpoint bytes, real HBM)."""
+    """Emit runtime-only ``PreparedWeightSpec`` allocations structurally."""
     prepared: list[PreparedWeightSpec] = []
     plans = model.layer_plans
 
-    if model_type in _KIMI_K3_TYPES:
-        kda_plans = [p for p in plans if str(p.attention).lower() == "kda"]
-        if kda_plans:
-            kda_layers = tuple(p.native_layer_id if p.native_layer_id >= 0 else p.index for p in kda_plans)
-            lin_heads = int(kda_plans[0].linear_heads or model.num_heads)
-            lin_dim = int(kda_plans[0].linear_head_dim or model.head_dim)
-            local_proj = max(1, (lin_heads * lin_dim) // max(1, parallel.tp))
-            prepared.append(PreparedWeightSpec(
-                allocation_id="kimi_k3.kda.prepared_f_matmul",
-                source_tensors=("f_a_proj.weight", "f_b_proj.weight"),
-                transform="matmul_f_b_f_a_bf16",
-                scope="target",
-                layer_indices=kda_layers,
-                local_shape=(local_proj, int(model.hidden_size)),
-                dtype="bf16",
-                layout="ND",
-                retains_source_tensors=True,
-                lifetime="persistent",
-            ))
+    kda_plans = [
+        p for p in plans
+        if str(p.attention).lower() == "kda" and int(p.gate_rank or 0) <= 0 and bool(p.packed_input_projection)
+    ]
+    if kda_plans:
+        kda_layers = tuple(p.native_layer_id if p.native_layer_id >= 0 else p.index for p in kda_plans)
+        lin_heads = int(kda_plans[0].linear_heads or model.num_heads)
+        lin_dim = int(kda_plans[0].linear_head_dim or model.head_dim)
+        local_proj = max(1, (lin_heads * lin_dim) // max(1, parallel.tp))
+        prepared.append(PreparedWeightSpec(
+            allocation_id="kda.prepared_f_matmul",
+            source_tensors=("f_a_proj.weight", "f_b_proj.weight"),
+            transform="matmul_f_b_f_a_bf16",
+            scope="target",
+            layer_indices=kda_layers,
+            local_shape=(local_proj, int(model.hidden_size)),
+            dtype="bf16",
+            layout="ND",
+            retains_source_tensors=True,
+            lifetime="persistent",
+        ))
 
     w4a8_layers = sorted({
         coord[1] for coord, abi in port_abis
@@ -1928,7 +2156,7 @@ def _build_prepared_weights(
             transform="reciprocal_fp32_from_v_cache_scale",
             scope="target",
             layer_indices=gqa_layers,
-            local_shape=(l_kv, max(1, h_dim // MXFP_GROUP_SIZE)),
+            local_shape=(l_kv, _ceil_div(h_dim, MXFP_GROUP_SIZE)),
             dtype="fp32",
             layout="ND",
             retains_source_tensors=True,
@@ -1938,53 +2166,10 @@ def _build_prepared_weights(
     return tuple(prepared)
 
 
-def _port_plan_model_fingerprint(model: ModelSpec, model_type: str) -> tuple[Any, ...]:
-    """Hashable structural fingerprint of every ModelSpec field read during port ABI resolution."""
-    aux = model.auxiliary
-    if aux is None or (aux.mtp is None and aux.dspark is None):
-        aux_sig: tuple[Any, ...] | None = None
-    else:
-        draft_spec = aux.mtp if aux.mtp is not None else aux.dspark
-        aux_sig = (
-            aux.mtp is not None,
-            aux.dspark is not None,
-            max(1, int(getattr(draft_spec, "layers", 1) or 1)),
-        )
-    layer_sigs = tuple(
-        (
-            int(p.index),
-            int(p.native_layer_id),
-            str(p.attention or model.attention).lower(),
-            bool(p.mla_output_gate),
-            bool(p.indexer),
-            int(p.residual_block_size),
-            bool(p.hyper_connections),
-            bool(p.engram),
-            str(p.ffn).lower(),
-            int(p.expert_latent_size),
-            int(p.num_shared_experts),
-        )
-        for p in model.layer_plans
-    )
-    return (
-        model_type,
-        int(model.hidden_size),
-        int(model.intermediate_size),
-        int(model.moe_intermediate_size),
-        int(model.num_shared_experts),
-        str(model.attention).lower(),
-        int(model.body_layers or model.layers),
-        int(model.num_experts),
-        aux_sig,
-        layer_sigs,
-    )
-
-
-def _resolve_port_abis_and_packs_cached(
+def _resolve_port_abis_and_packs(
     model: ModelSpec,
     checkpoint: CheckpointQuantMap,
     *,
-    ckpt_digest: str,
     hw: str,
     model_type: str,
     native_float: str,
@@ -1997,34 +2182,20 @@ def _resolve_port_abis_and_packs_cached(
     tuple[tuple[str, tuple[str, ...], str], ...],
     bool,
 ]:
-    """Resolve parallel-independent port ABIs & homogeneous packs with bounded caching."""
-    cache_key = (
-        ckpt_digest,
-        _port_plan_model_fingerprint(model, model_type),
-        hw,
-        native_float,
-        use_nz,
-        target_proj,
-        phase,
-        role,
-    )
-    cached = _PORT_ABI_PLAN_CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-
+    """Resolve port ABIs & homogeneous packs purely structurally (zero global mutable cache)."""
     hf_cfg = dict(checkpoint.hf_quant_config)
+    expert_ids = _expert_boundary_ids(checkpoint, int(model.num_experts or 0))
     port_abis: list[tuple[tuple[str, int, str], TensorPrecisionABI]] = []
     packed_groups: list[tuple[str, tuple[str, ...], str]] = []
     used_projection = False
 
-    # Model-level embedding & LM head (quant_config=None unless explicitly quantized in checkpoint).
     for top_role, top_paths in (
         ("embed_tokens", ("model.embed_tokens.weight",)),
         ("lm_head", ("lm_head.weight", "language_model.lm_head.weight")),
     ):
         tag, blk, did_proj = _resolve_role_tag(
             checkpoint, model_type=model_type, role_name=top_role, candidate_paths=top_paths,
-            scope="target", layer_ids=(0,), is_routed_expert=False,
+            scope="target", layer_ids=(0,), is_routed_expert=False, expert_ids=expert_ids,
             target_quant_projection=target_proj, hf_cfg=hf_cfg,
         )
         used_projection = used_projection or did_proj
@@ -2032,7 +2203,7 @@ def _resolve_port_abis_and_packs_cached(
             tag, hw_family=hw, native_float_dtype=native_float, phase=phase, role=role, use_nz=use_nz, group_size=blk,
         )))
 
-    if model_type in _KIMI_K3_TYPES:
+    if any(int(p.residual_block_size or 0) > 0 for p in model.layer_plans):
         port_abis.append((
             ("target", 0, "output_attn_res_proj"),
             resolve_raw_tag_to_abi("FLOAT", hw_family=hw, native_float_dtype=native_float, phase=phase, role=role),
@@ -2041,12 +2212,12 @@ def _resolve_port_abis_and_packs_cached(
     for plan in model.layer_plans:
         native_layer = plan.native_layer_id if plan.native_layer_id >= 0 else plan.index
         layer_ids = (plan.index, native_layer) if native_layer != plan.index else (plan.index,)
-        role_specs, candidate_packs = _layer_role_descriptors(plan, model=model, model_type=model_type)
+        role_specs, candidate_packs = _layer_role_descriptors(plan, model=model)
         layer_abi_map: dict[str, TensorPrecisionABI] = {}
         for role_name, cands, is_expert in role_specs:
             tag, blk, did_proj = _resolve_role_tag(
                 checkpoint, model_type=model_type, role_name=role_name, candidate_paths=cands,
-                scope="target", layer_ids=layer_ids, is_routed_expert=is_expert,
+                scope="target", layer_ids=layer_ids, is_routed_expert=is_expert, expert_ids=expert_ids,
                 target_quant_projection=target_proj, hf_cfg=hf_cfg,
             )
             used_projection = used_projection or did_proj
@@ -2061,22 +2232,17 @@ def _resolve_port_abis_and_packs_cached(
 
         packed_groups.extend(_apply_homogeneous_packs(
             scope="target", native_layer=native_layer, layer_abis=layer_abi_map,
-            candidate_packs=candidate_packs, model_type=model_type,
+            candidate_packs=candidate_packs,
         ))
 
     draft_ports, draft_proj = _resolve_draft_ports(
         model, checkpoint, model_type=model_type, hw=hw, native_float=native_float,
-        phase=phase, role=role, use_nz=use_nz, target_quant_projection=target_proj, hf_cfg=hf_cfg,
+        phase=phase, role=role, use_nz=use_nz, expert_ids=expert_ids,
+        target_quant_projection=target_proj, hf_cfg=hf_cfg,
     )
     port_abis.extend(draft_ports)
     used_projection = used_projection or draft_proj
-
-    result = (tuple(port_abis), tuple(packed_groups), used_projection)
-    _PORT_ABI_PLAN_CACHE[cache_key] = result
-    _PORT_ABI_PLAN_CACHE.move_to_end(cache_key)
-    while len(_PORT_ABI_PLAN_CACHE) > PORT_ABI_PLAN_CACHE_MAX:
-        _PORT_ABI_PLAN_CACHE.popitem(last=False)
-    return result
+    return tuple(port_abis), tuple(packed_groups), used_projection
 
 
 def instantiate_runtime_quant_plan(
@@ -2089,17 +2255,16 @@ def instantiate_runtime_quant_plan(
     role: str,
     phase: str,
 ) -> RuntimeQuantPlan:
-    """Instantiate exact ``RuntimeQuantPlan`` mirroring ``vllm-ascend`` load/pack logic."""
+    """Instantiate exact ``RuntimeQuantPlan`` purely from structural model/checkpoint specs."""
     hw = normalize_hw_family(hardware)
     model_type = resolve_model_type(model)
     native_float = _normalize_native_float(checkpoint, model)
     eff_opts = _effective_option_map(options)
     use_nz = bool(eff_opts.get("enable_weight_nz_layout", hw in A2_A3_INT_ONLY_FAMILIES))
     target_proj = str(eff_opts.get("target_quant_projection") or "").strip()
-    ckpt_digest = checkpoint.digest()
 
-    port_abis, packed_groups, used_projection = _resolve_port_abis_and_packs_cached(
-        model, checkpoint, ckpt_digest=ckpt_digest, hw=hw, model_type=model_type,
+    port_abis, packed_groups, used_projection = _resolve_port_abis_and_packs(
+        model, checkpoint, hw=hw, model_type=model_type,
         native_float=native_float, use_nz=use_nz, target_proj=target_proj,
         phase=phase, role=role,
     )
@@ -2107,12 +2272,12 @@ def instantiate_runtime_quant_plan(
     spec_k = int(options.speculative.draft_len if options.speculative is not None else eff_opts.get("speculative_k", 0))
     recoverssm_active = bool(eff_opts.get("recoverssm_enabled", False))
     kv_abis, idx_abis, rec_abis, cache_disps, has_faquant, is_mxfp_gqa = build_cache_state_abis(
-        model, checkpoint, hw=hw, model_type=model_type, parallel=parallel,
+        model, checkpoint, hw=hw, parallel=parallel,
         effective_opts=eff_opts, role=role, phase=phase,
         speculative_k=spec_k, recoverssm_active=recoverssm_active,
     )
     prepared = _build_prepared_weights(
-        model, model_type=model_type, parallel=parallel, port_abis=port_abis,
+        model, parallel=parallel, port_abis=port_abis,
         has_faquant=has_faquant, is_mxfp_gqa=is_mxfp_gqa,
     )
 
@@ -2126,20 +2291,20 @@ def instantiate_runtime_quant_plan(
         dispositions.append((
             "blind_box_quant_projection",
             "applied",
-            f"projected={target_proj}:canonical={normalize_canonical_model(model)}:quant_config_none_preserved",
+            f"projected={target_proj}:quant_config_none_preserved",
         ))
 
     return RuntimeQuantPlan(
-        checkpoint_digest=ckpt_digest,
         stack_id=VLLM_ASCEND_STACK_ID,
+        checkpoint_digest=checkpoint.digest(),
+        provenance=provenance,
         port_abis=port_abis,
         packed_groups=packed_groups,
+        prepared_weights=prepared,
         kv_cache_abi=kv_abis,
         index_cache_abi=idx_abis,
         recurrent_state_abi=rec_abis,
-        prepared_weights=prepared,
         dispositions=tuple(dispositions),
-        provenance=provenance,
     )
 
 
