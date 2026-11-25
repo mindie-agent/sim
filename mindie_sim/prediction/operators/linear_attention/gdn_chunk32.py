@@ -27,9 +27,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Callable, Literal, Mapping, Sequence
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 from ..contracts import OperatorPlanningContext
 from .common import missing, owner_units
@@ -50,6 +51,7 @@ from mindie_sim.prediction.operators.matrix.refill_steady import (
     compact_periodic_pipeline,
 )
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 PREPARE_RECIPE = "gdn_prepare_arch35_chunk32"
 STATE_RECIPE = "gdn_state_arch35_chunk32"
 OUTPUT_RECIPE = "gdn_output_arch35_chunk32"
@@ -60,7 +62,18 @@ PR22147_SOURCE = {
     "relative_path": "vllm_ascend/ops/gdn.py",
     "source_sha256": "b170b30626cf46bc4ec1e47080f9487c1e5443e51add42bb8c67bfd20a79fac4",
 }
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="57de212f6a",
+        relative_path="vllm_ascend/ops/gdn.py",
+        source_sha256="b170b30626cf46bc4ec1e47080f9487c1e5443e51add42bb8c67bfd20a79fac4",
+    ),
+)
 
+ARCH22_ID = "npu_arch_2201"
+ARCH35_ID = "npu_arch_3510"
+DEFAULT_ARCH35_AIC_CORES = 32
 BF16_BYTES = 2
 FP32_BYTES = 4
 MAX_TASK_GROUP_HEADS = 4
@@ -101,11 +114,79 @@ def _validate_chunk32_params(
     dv = int(params.get("dv", GDN_CHUNK32_HEAD_DIM_V))
     chunk = int(params.get("chunk", GDN_CHUNK32_TOKENS))
     dtype = str(params.get("dtype", "bf16")).lower()
+    state_dtype = str(params.get("state_dtype", "fp32")).lower()
     if chunk != GDN_CHUNK32_TOKENS:
         raise ValueError("gdn_chunk32_requires_chunk_32")
-    if not can_run_gdn_chunk32(keys, heads, dk, dv, activation_dtype=dtype, state_dtype="fp32"):
+    if not can_run_gdn_chunk32(keys, heads, dk, dv, activation_dtype=dtype, state_dtype=state_dtype):
         raise ValueError("gdn_chunk32_domain_unsupported")
     return lengths, heads, keys, dk, dv
+
+
+def _require_arch35(geometry: Geometry, ctx: OperatorPlanningContext | None) -> None:
+    arch_id: str | None = None
+    if ctx is not None:
+        arch_id = str(ctx.compute_arch.arch_id)
+    elif geometry.datapath is not None:
+        arch_id = str(geometry.datapath.compute_arch.arch_id)
+    elif geometry.compute_arch is not None and geometry.compute_arch.preset:
+        arch_id = str(geometry.compute_arch.preset)
+    if arch_id is not None and arch_id != ARCH35_ID:
+        code = (
+            "linear_attention_arch22_abi_unsupported"
+            if arch_id == ARCH22_ID
+            else "linear_attention_arch35_abi_required"
+        )
+        raise missing(code, f"gdn_chunk32 requires Arch35 (got {arch_id})")
+
+
+def _require_chunk32_domain(
+    keys: int, heads: int, dk: int, dv: int, *, dtype: str, state_dtype: str = "fp32",
+) -> None:
+    if not can_run_gdn_chunk32(keys, heads, dk, dv, activation_dtype=dtype, state_dtype=state_dtype):
+        raise missing("gdn_chunk32_domain_unsupported", "gdn_chunk32 requires bf16, fp32 state, dk=128, dv=128, hv/hk in {1,2,3,4}")
+
+
+def _state_task_group_size(
+    lengths: tuple[int, ...],
+    heads: int,
+    keys: int,
+    *,
+    cores: int,
+    requested_group: int | None = None,
+) -> int:
+    max_group = min(MAX_TASK_GROUP_HEADS, heads // keys)
+    if requested_group is not None:
+        group = int(requested_group)
+        if group < 1 or group > max_group:
+            raise ValueError("gdn_chunk32_task_group_size_unsupported")
+        return group
+    return max(1, min(max_group, (len(lengths) * heads + cores - 1) // cores))
+
+
+def _peer_group_interior_homogeneous(
+    owners: tuple[Sequence[Any], ...],
+    slots: int,
+    item_key_fn: Callable[[Any], Any],
+    *,
+    head: int,
+    tail: int,
+    threshold: int,
+) -> bool:
+    """Return True iff every compacted owner's entire interior shares one tile shape."""
+    step = max(2, int(slots))
+    for items in owners:
+        count = len(items)
+        if count <= max(threshold, head + tail + step):
+            continue
+        effective_tail = tail + ((count - head - tail) % step)
+        interior_end = count - effective_tail
+        if interior_end - head <= step:
+            continue
+        first_key = item_key_fn(items[head])
+        for idx in range(head + 1, interior_end):
+            if item_key_fn(items[idx]) != first_key:
+                return False
+    return True
 
 
 def _build_mixed_plan(
@@ -114,6 +195,7 @@ def _build_mixed_plan(
     owners: tuple[Sequence[Any], ...],
     work_fn: Callable[[Any], tuple[Work, Work]],
     *,
+    item_key_fn: Callable[[Any], Any],
     aiv_first: bool,
     slots: int,
     recurrence_sync: bool = False,
@@ -131,6 +213,10 @@ def _build_mixed_plan(
             aiv_w, aic_w = work_fn(item)
             total_work += split_reads(aiv_w, 0, geometry.resource_units)
             total_work += split_reads(aic_w, aic_w.resources["mte2"], geometry.resource_units)
+    can_compact = _peer_group_interior_homogeneous(
+        owners, slots, item_key_fn,
+        head=1, tail=COMPACT_TAIL_CHUNKS, threshold=COMPACT_CHUNK_THRESHOLD,
+    )
 
     def program(context):
         setup_ms, sync_ms = chunk32_plan_timing(context, recurrence_sync=recurrence_sync)
@@ -167,7 +253,10 @@ def _build_mixed_plan(
             )
             for core, items in zip(cores, owners, strict=True)
         )
-        pipes = compact_periodic_peer_group(context, specs, compactor=compact_periodic_pipeline)
+        if can_compact:
+            pipes = compact_periodic_peer_group(context, specs, compactor=compact_periodic_pipeline)
+        else:
+            pipes = tuple(spec.literal() for spec in specs)
         branches = tuple(
             resident(context, core, buf_sizes, KernelProgram((
                 Stage("setup", latency=setup_ms, keep_empty=setup_ms <= 0.0),
@@ -251,10 +340,16 @@ def make_prepare_op(params: Mapping[str, Any]) -> OpSpec:
 
 
 def build_prepare(op: OpSpec, geometry: Geometry, *, ctx: OperatorPlanningContext | None = None) -> OperatorPlan:
+    _require_arch35(geometry, ctx)
     meta = dict(op.metadata)
     lengths = tuple(int(v) for v in meta["lengths"])
     heads, keys = int(meta["heads"]), int(meta["key_heads"])
     dk, dv, gqa = int(meta["head_dim_k"]), int(meta["head_dim_v"]), heads // keys
+    _require_chunk32_domain(
+        keys, heads, dk, dv,
+        dtype=str(meta.get("dtype", op.dtype or "bf16")).lower(),
+        state_dtype=str(meta.get("state_dtype", "fp32")).lower(),
+    )
     bt = GDN_CHUNK32_TOKENS
     chunks = PackedChunks.from_lengths(lengths, bt)
     gate_bytes = FP32_BYTES if meta.get("gate_dtype", "fp32") == "fp32" else BF16_BYTES
@@ -293,6 +388,7 @@ def build_prepare(op: OpSpec, geometry: Geometry, *, ctx: OperatorPlanningContex
 
     return _build_mixed_plan(
         geometry, cores, _tile_spans(cores, chunks.total * keys), group_work,
+        item_key_fn=lambda gid: chunks.range(gid // keys)[3],
         aiv_first=True, slots=PIPELINE_WINDOW_SLOTS,
         first_label="aiv_vcs32", second_label="aic_wy32",
         extra_meta={"gqa_ratio": gqa},
@@ -306,17 +402,26 @@ def make_state_op(params: Mapping[str, Any]) -> OpSpec:
     use_init = bool(params.get("use_initial_state", True))
     out_final = bool(params.get("output_final_state", True))
     state_v_first = bool(params.get("state_v_first", True))
+    explicit_group = params.get("task_group_size")
+    has_explicit_partition = explicit_group is not None or "cores" in params
+    cores = max(1, int(params.get("cores", DEFAULT_ARCH35_AIC_CORES)))
+    group = _state_task_group_size(
+        lengths, heads, keys, cores=cores, requested_group=explicit_group,
+    )
+    groups_per_key = (heads // keys + group - 1) // group
     shape = (len(lengths), heads, dv, dk) if state_v_first else (len(lengths), heads, dk, dv)
+    partition_meta = {"task_group_size": group} if has_explicit_partition else {}
     meta = {
         "implementation": STATE_RECIPE, "lengths": lengths, "heads": heads,
         "key_heads": keys, "dk": dk, "dv": dv, "head_dim_k": dk, "head_dim_v": dv,
         "chunk": GDN_CHUNK32_TOKENS, "dtype": "bf16", "gate_dtype": gate_dtype,
         "use_initial_state": use_init, "output_final_state": out_final,
-        "state_v_first": state_v_first, "use_exp2": False,
+        "state_v_first": state_v_first, **partition_meta, "use_exp2": False,
         "dispatch": {
             "implementation": STATE_RECIPE, "state_v_first": state_v_first,
             "use_exp2": False, "gate_dtype": gate_dtype,
             "use_initial_state": use_init, "output_final_state": out_final,
+            **partition_meta,
         },
         "native_source": FLA_GDN_CHUNK_SOURCE,
     }
@@ -329,7 +434,7 @@ def make_state_op(params: Mapping[str, Any]) -> OpSpec:
     aiv_read = (len(lengths) * heads * state_fp32 if use_init else 0.0) + float(heads * tokens * (dv * BF16_BYTES + FP32_BYTES))
     aiv_write = (len(lengths) * heads * state_fp32 if out_final else 0.0) + total_snaps * heads * state_bf16 + float(heads * tokens * dv * BF16_BYTES)
     aiv_vec = float(heads * (chunks.total * dk * dv + tokens * dv) * STATE_DECAY_OPS_PER_ELEM)
-    aic_read = float((keys * tokens * dk + heads * tokens * (dk + dv)) * BF16_BYTES) + total_aic_states * heads * state_bf16
+    aic_read = float((keys * groups_per_key * tokens * dk + heads * tokens * (dk + dv)) * BF16_BYTES) + total_aic_states * heads * state_bf16
     flops = float(chunks.total * heads * 2 * (2 * bt * dv * dk))
     return OpSpec(
         op_id=f"gdn-state-c32:h{heads}:c{chunks.total}",
@@ -344,12 +449,20 @@ def make_state_op(params: Mapping[str, Any]) -> OpSpec:
 
 
 def build_state(op: OpSpec, geometry: Geometry, *, ctx: OperatorPlanningContext | None = None) -> OperatorPlan:
+    _require_arch35(geometry, ctx)
     meta = dict(op.metadata)
     lengths = tuple(int(v) for v in meta["lengths"])
     heads, keys, dk, dv = int(meta["heads"]), int(meta["key_heads"]), int(meta["dk"]), int(meta["dv"])
+    _require_chunk32_domain(
+        keys, heads, dk, dv,
+        dtype=str(meta.get("dtype", "bf16")).lower(),
+        state_dtype=str(meta.get("state_dtype", "fp32")).lower(),
+    )
     bt, use_init, out_final = GDN_CHUNK32_TOKENS, bool(meta.get("use_initial_state", True)), bool(meta.get("output_final_state", True))
     cores = _active_cores(geometry, ctx)
-    group = max(1, min(MAX_TASK_GROUP_HEADS, heads // keys, (len(lengths) * heads + len(cores) - 1) // len(cores)))
+    group = _state_task_group_size(
+        lengths, heads, keys, cores=len(cores), requested_group=meta.get("task_group_size"),
+    )
     groups_per_key = (heads // keys + group - 1) // group
     chunks = PackedChunks.from_lengths(lengths, bt)
     state_fp32, state_bf16 = float(dk * dv * FP32_BYTES), float(dk * dv * BF16_BYTES)
@@ -381,9 +494,16 @@ def build_state(op: OpSpec, geometry: Geometry, *, ctx: OperatorPlanningContext 
             tiles.extend((chunk, sub_group) for chunk in range(chunk_starts[sequence], chunk_starts[sequence + 1]))
         return tuple(tiles)
 
+    def state_item_key(item: tuple[int, int]) -> tuple[int, int, bool, bool]:
+        chunk_idx, sub_idx = item
+        active_h = min(group, heads // keys - sub_idx * group)
+        seq_idx, chunk_local, _, rows = chunks.range(chunk_idx)
+        return (active_h, rows, chunk_local == 0, chunk_local == (lengths[seq_idx] + bt - 1) // bt - 1)
+
     return _build_mixed_plan(
         geometry, cores, tuple(state_tiles(span) for span in _tile_spans(cores, len(lengths) * chains_per_sequence)),
         group_work,
+        item_key_fn=state_item_key,
         aiv_first=False, slots=RECURRENCE_SERIAL_SLOTS,
         recurrence_sync=True,
         first_label="state_aic", second_label="state_aiv", extra_meta={"task_group_size": group},
@@ -431,10 +551,16 @@ def make_output_op(params: Mapping[str, Any]) -> OpSpec:
 
 
 def build_output(op: OpSpec, geometry: Geometry, *, ctx: OperatorPlanningContext | None = None) -> OperatorPlan:
+    _require_arch35(geometry, ctx)
     meta = dict(op.metadata)
     lengths = tuple(int(v) for v in meta["lengths"])
     heads, keys = int(meta["heads"]), int(meta["key_heads"])
     dk, dv, group = int(meta["dk"]), int(meta["dv"]), int(meta["task_group_size"])
+    _require_chunk32_domain(
+        keys, heads, dk, dv,
+        dtype=str(meta.get("dtype", op.dtype or "bf16")).lower(),
+        state_dtype=str(meta.get("state_dtype", "fp32")).lower(),
+    )
     bt = GDN_CHUNK32_TOKENS
     chunks = PackedChunks.from_lengths(lengths, bt)
     groups_per_key = (heads // keys + group - 1) // group
@@ -462,8 +588,15 @@ def build_output(op: OpSpec, geometry: Geometry, *, ctx: OperatorPlanningContext
         })
         return aiv, aic
 
+    def output_item_key(gid: int) -> tuple[int, int]:
+        chunk_idx = gid // (keys * groups_per_key)
+        sub_idx = (gid % (keys * groups_per_key)) % groups_per_key
+        active_h = min(group, heads // keys - sub_idx * group)
+        return (active_h, chunks.range(chunk_idx)[3])
+
     return _build_mixed_plan(
         geometry, cores, _tile_spans(cores, total_groups), group_work,
+        item_key_fn=output_item_key,
         aiv_first=False, slots=PIPELINE_WINDOW_SLOTS,
         first_label="out_aic", second_label="out_aiv",
         extra_meta={"task_group_size": group},

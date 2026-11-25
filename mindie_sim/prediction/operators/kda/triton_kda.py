@@ -16,6 +16,7 @@ Upstream-ABI: vllm_ascend.ops.triton.kda.kda.chunk_kda
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
@@ -44,13 +45,15 @@ from ..matrix.refill_steady import compact_periodic_pipeline
 from ..sharedkv.l0_sync import p03_fixpipe_setup_ms, p12_flag_ms, p13_paired_ms
 from ..sharedkv.split_core import p01_cold_hbm_group_cap
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 VLLM_ASCEND_REV = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
 TRITON_CHUNK_KDA_ABI = "vllm_ascend.ops.triton.kda.kda.chunk_kda"
 TRITON_RECURRENT_KDA_ABI = "vllm_ascend.ops.triton.kda.kda.fused_recurrent_kda"
 TRITON_KDA_CHUNK_ABIS = frozenset({TRITON_CHUNK_KDA_ABI, "triton_chunk_kda"})
 TRITON_KDA_RECURRENT_ABIS = frozenset({TRITON_RECURRENT_KDA_ABI, "triton_recurrent_kda"})
+TRITON_CHUNK_KDA_MAX_K = 256  # kda.py:905 & chunk_delta_h.py:299 assert K <= 256
 
-TRITON_KDA_SOURCES: tuple[SourceRef, ...] = (
+SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
         repository="vllm-project/vllm-ascend",
         revision=VLLM_ASCEND_REV,
@@ -69,9 +72,6 @@ TRITON_KDA_SOURCES: tuple[SourceRef, ...] = (
         relative_path="vllm_ascend/ops/triton/kda/solve_tril.py",
         source_sha256="1920c0d8a5e213efe51e1273279b7e4161aac8a0bec3a778c2616435277daecc",
     ),
-)
-TRITON_RECURRENT_SOURCES: tuple[SourceRef, ...] = (
-    TRITON_KDA_SOURCES[0],
     SourceRef(
         repository="vllm-project/vllm-ascend",
         revision=VLLM_ASCEND_REV,
@@ -79,6 +79,8 @@ TRITON_RECURRENT_SOURCES: tuple[SourceRef, ...] = (
         source_sha256="6d18c60c4ef58e8972b7cbec785d3c1325a5b130e628ab27ab08c7b37a9c6728",
     ),
 )
+TRITON_KDA_SOURCES: tuple[SourceRef, ...] = SOURCES[:3]
+TRITON_RECURRENT_SOURCES: tuple[SourceRef, ...] = (SOURCES[0], SOURCES[3])
 
 # Upstream vllm_ascend/ops/triton/kda tiling & op-count constants (zero fitted timings)
 STATE_TILE_BV = 64
@@ -507,6 +509,11 @@ def build_triton_chunk_kda(
     c: LinearAttentionContract, ctx: OperatorPlanningContext,
 ) -> OperatorPlan:
     """Lower vllm_ascend.ops.triton.kda.kda.chunk_kda (7 kernels + 4 eager ops)."""
+    if c.dk > TRITON_CHUNK_KDA_MAX_K:
+        raise missing(
+            "triton_chunk_kda_head_dim_k_unsupported",
+            f"vllm_ascend Triton chunk_kda requires dk <= {TRITON_CHUNK_KDA_MAX_K} (got dk={c.dk})",
+        )
     aics, aivs = owner_units(ctx)
     pairs = tuple(
         (aic, peers[:2]) for aic, peers in ctx.datapath.aic_aiv_pairs
@@ -703,6 +710,49 @@ def _lower_recurrent_kda(
     ))
 
 
+def _resolve_triton_recurrent_state_counts(c: LinearAttentionContract) -> tuple[int, int]:
+    """Return ``(loaded_initial_seqs, stored_checkpoint_tokens)`` per fused_recurrent_kda.py."""
+    n_seqs = len(c.lengths)
+    total_tokens = sum(c.lengths)
+    inplace_final_state = bool(c.metadata.get("inplace_final_state", True))
+    raw_indices = c.metadata.get("ssm_state_indices")
+    if not isinstance(raw_indices, (tuple, list)):
+        return (n_seqs if c.use_initial_state else 0), total_tokens
+    if raw_indices and isinstance(raw_indices[0], (tuple, list)):
+        rows = tuple(tuple(int(v) for v in row) for row in raw_indices)
+    elif len(raw_indices) == total_tokens and n_seqs > 0:
+        flat = tuple(int(v) for v in raw_indices)
+        rows_list: list[tuple[int, ...]] = []
+        cursor = 0
+        for seq_len in c.lengths:
+            rows_list.append(flat[cursor : cursor + seq_len])
+            cursor += seq_len
+        rows = tuple(rows_list)
+    else:
+        rows = tuple((int(v),) for v in raw_indices)
+    num_accepted = c.metadata.get("num_accepted_tokens")
+    loaded_seqs = 0
+    stored_tokens = 0
+    for seq_idx, seq_len in enumerate(c.lengths):
+        row = rows[seq_idx] if seq_idx < len(rows) else ()
+        if c.use_initial_state:
+            init_pos = (
+                max(0, int(num_accepted[seq_idx]) - 1)
+                if isinstance(num_accepted, (tuple, list)) and seq_idx < len(num_accepted)
+                else 0
+            )
+            init_slot = row[init_pos] if init_pos < len(row) else 0
+            # fused_recurrent_kda.py:106-107: state_idx <= 0 returns early before h0 load and token loop.
+            if init_slot <= 0:
+                continue
+            loaded_seqs += 1
+        if inplace_final_state:
+            stored_tokens += sum(1 for v in row[:seq_len] if v > 0)
+        else:
+            stored_tokens += seq_len
+    return loaded_seqs, stored_tokens
+
+
 def build_triton_recurrent_kda(
     c: LinearAttentionContract, ctx: OperatorPlanningContext,
 ) -> OperatorPlan:
@@ -729,9 +779,14 @@ def build_triton_recurrent_kda(
     waves = ceil_div(total_progs, active_aivs)
     burst = _hbm_burst_granule(ctx)
 
+    # fused_recurrent_kda.py:99-148: kernel stores every token checkpoint to ht
+    # whenever INPLACE_FINAL_STATE=False, or for every positive ssm_state_idx when True,
+    # independent of the wrapper return flag output_final_state; state_idx <= 0 early-returns.
+    loaded_seqs, stored_tokens = _resolve_triton_recurrent_state_counts(c)
+
     head_state_bytes = c.dk * c.dv * state_elem
-    h0_read_total = n_seqs * c.hv * head_state_bytes * c.use_initial_state
-    ht_write_total = total_tokens * c.hv * head_state_bytes * c.output_final_state
+    h0_read_total = loaded_seqs * c.hv * head_state_bytes
+    ht_write_total = stored_tokens * c.hv * head_state_bytes
     qkvgb_per_tok_head = (2 * c.dk + c.dv) * elem + c.dk * gate_elem + beta_elem
     qkvgb_hbm_total = total_tokens * c.hv * qkvgb_per_tok_head
     # Each program issues 5 separate small vector GM loads (q, k, v, gk, beta) -> min burst per load on MTE2.

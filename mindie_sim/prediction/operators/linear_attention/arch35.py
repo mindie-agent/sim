@@ -15,6 +15,7 @@ from dataclasses import replace
 from functools import lru_cache
 from heapq import heapify, heapreplace
 from itertools import chain
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, align_up
 from mindie_sim.schema.datapath import ArchId, SourceRef
@@ -39,15 +40,17 @@ from ._gdn_native import (
 from ..kda.triton_kda import TRITON_KDA_CHUNK_ABIS, TRITON_KDA_RECURRENT_ABIS
 TRITON_KDA_ARCH22_ABIS = TRITON_KDA_CHUNK_ABIS | TRITON_KDA_RECURRENT_ABIS
 from .common import (
-    CHUNK32_KERNELS, CHUNK32_LEAVES, DIAG_BLOCK_WIDTH, FLASH_KDA_TEMPLATE_BY_ABI, FLA_GDN_ABIS,
-    FP32_BYTES, GDN_CHUNK64_TOKENS, KDA_MAX_AIC_CORES, KDA_WORKSPACE_SLOTS,
+    CANN_GDN_ABI, CHUNK32_KERNELS, CHUNK32_LEAVES, DIAG_BLOCK_WIDTH, FLASH_KDA_TEMPLATE_BY_ABI,
+    FLA_GDN_ABIS, FP32_BYTES, GDN_CHUNK64_TOKENS, KDA_MAX_AIC_CORES, KDA_WORKSPACE_SLOTS,
     CausalConvContract, LinearAttentionContract, Phase, RecoverSsmCommitPlan,
     analyze_state_residency, bind_phase, build_causal_conv1d_plan, build_recover_ssm_plan,
     ceil_div, compute_wy_chunk_work, element_bytes,
     flash_kda_workspace_groups, make_plan, missing, owner_units,
-    transfer, validate_contract,
+    transfer, validate_contract, verify_native_gdn_abi,
 )
+from .gdn_domain import GDN_CHUNK32_HEAD_DIM_V, GDN_HEAD_DIM_K, can_run_gdn_chunk32
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
 DSL_REVISION = "5e7ace8cdcc16a5b062ba69d8fdf93d4f1d62223"
 SOURCES: tuple[SourceRef, ...] = (
@@ -668,6 +671,7 @@ def _build_recurrent(c: LinearAttentionContract, ctx: OperatorPlanningContext, *
 
 
 def _build_gdn(c: LinearAttentionContract, ctx: OperatorPlanningContext) -> OperatorPlan:
+    verify_native_gdn_abi(c, ctx, abi_id=CANN_GDN_ABI)
     if max(c.dk, c.dv) > GDN_CUBE_DIM:
         raise missing("linear_attention_gdn_dimension_unsupported", "CANN Arch35 GDN supports Dk and Dv up to 128")
     streaming, wy = [], []
@@ -774,9 +778,16 @@ class Arch35LinearAttentionStrategy:
             return _build_recurrent(c, ctx)
         if c.operation == "gdn_prefill" and c.bt != DIAG_BLOCK_WIDTH:
             return _build_gdn(c, ctx)
-        pairs = _pairs(ctx, c)
         if c.operation == "gdn_chunk32" or c.bt == DIAG_BLOCK_WIDTH:
-            return _build_staged(c, ctx, kda=False, pairs=pairs)
+            if not can_run_gdn_chunk32(
+                c.hk, c.hv, c.dk, c.dv, activation_dtype=c.dtype, state_dtype=c.state_dtype,
+            ):
+                raise missing(
+                    "gdn_chunk32_domain_unsupported",
+                    f"gdn_chunk32 requires bf16, fp32 state, dk={GDN_HEAD_DIM_K}, dv={GDN_CHUNK32_HEAD_DIM_V}",
+                )
+            return _build_staged(c, ctx, kda=False, pairs=_pairs(ctx, c))
+        pairs = _pairs(ctx, c)
 
         from mindie_sim.templates.dsl_catalog import resolve_flash_kda_route
 

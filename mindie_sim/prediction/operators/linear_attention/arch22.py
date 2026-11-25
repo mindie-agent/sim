@@ -13,6 +13,7 @@ from collections import Counter
 from dataclasses import replace
 from functools import lru_cache
 from itertools import chain
+from typing import Literal
 
 from mindie_sim.schema.datapath import ArchId, SourceRef
 from mindie_sim.schema.operators import OpSpec
@@ -28,11 +29,12 @@ from ..sharedkv.l0_sync import p03_fixpipe_setup_ms, p12_flag_ms, p13_paired_ms,
 from ..sharedkv.split_core import p01_cold_hbm_group_cap
 from ._gdn_native import RECURRENT_GDN_ABI, build_native_recurrent_gdn
 from .common import (
-    FLA_GDN_ABIS, FP32_BYTES, CausalConvContract, LinearAttentionContract, Phase, analyze_state_residency,
-    bind_phase, ceil_div, compute_wy_chunk_work, element_bytes, make_plan, missing,
-    owner_units, transfer, validate_contract,
+    CANN_GDN_ABI, FLA_GDN_ABIS, FP32_BYTES, CausalConvContract, LinearAttentionContract, Phase,
+    analyze_state_residency, bind_phase, ceil_div, compute_wy_chunk_work, element_bytes, make_plan,
+    missing, owner_units, transfer, validate_contract, verify_native_gdn_abi,
 )
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
         repository="cann/ops-transformer",
@@ -189,16 +191,15 @@ def _work_for_group(c: LinearAttentionContract, ctx: OperatorPlanningContext, ro
         },
     )
     if rolling:
+        # chunk_gated_delta_rule_arch22.h:159,220 & stage2_arch22.h:113,126-127:
+        # Stage2 unconditionally copies curState (initState on chunk 0, finalState thereafter)
+        # on AIV0 and reads it on AIC in CalVPrime/CalAttnInter.
         recurrence = Work()
         for chunk_rows, count in sizes:
             if not count:
                 continue
-            initial = not load_state and chunk_rows == sizes[0][0]
-            if initial:
-                for phase in _rolling_chunk_phases(c, ctx, chunk_rows, False):
-                    recurrence += phase.work
             for phase in _rolling_chunk_phases(c, ctx, chunk_rows, True):
-                recurrence += phase.work.scaled(count - initial)
+                recurrence += phase.work.scaled(count)
     else:
         recurrence = (
             transfer(ctx, read=recurrence_inputs + bank_transfer, aiv=False, hits=report.l2_hit_bytes)
@@ -271,20 +272,21 @@ def _lower_rolling_group(
 
     def chunk_tile(chunk: int) -> tuple[Stage, ...]:
         valid = min(c.bt, rows - chunk * c.bt)
-        loaded = load_state or chunk > 0
+        # Stage2 unconditionally copies curState (initState on chunk 0, finalState on chunk > 0).
+        loaded = True
         stages = tuple(replace(_with_caps(bind_phase(p, rc, ctx, stage2_cores, stage2_aiv0), stage2_caps),
                                metadata={"phase": p.name, **slot})
                        for p in _rolling_chunk_phases(c, ctx, valid, loaded))
         if chunk_sync_ms > 0.0:
             read = replace(stages[0], previous=("stage2_crosscore_sync",),
                            metadata={**stages[0].metadata,
-                                     "initial_state_read": first_group and chunk == 0 and loaded})
+                                     "initial_state_read": first_group and chunk == 0})
             sync = Stage("stage2_crosscore_sync", after=("write_rolling_state",),
                          latency=chunk_sync_ms, keep_empty=True)
             return (read, *stages[1:], sync)
         read = replace(stages[0], previous=("write_rolling_state",),
                        metadata={**stages[0].metadata,
-                                 "initial_state_read": first_group and chunk == 0 and loaded})
+                                 "initial_state_read": first_group and chunk == 0})
         return (read, *stages[1:])
 
     stage2_prog = (
@@ -334,6 +336,8 @@ def _build_staged(c: LinearAttentionContract, ctx: OperatorPlanningContext) -> O
         raise missing("linear_attention_no_mixed_owners", "Staged prefill needs paired AIC and AIV owners")
     gdn = c.operation == "gdn_prefill"
     rolling = gdn and c.abi not in FLA_GDN_ABIS
+    if rolling:
+        verify_native_gdn_abi(c, ctx, abi_id=CANN_GDN_ABI)
     group_rows = GROUP_CHUNKS_PER_AIC * len(pairs) * c.bt
     if not gdn:
         group_rows = c.bt * max(1, len(pairs) // c.hv)
