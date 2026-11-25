@@ -38,6 +38,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 import hashlib
 import json
+import math
 import re
 from typing import Any
 
@@ -146,7 +147,13 @@ IDENTITY_FIELDS = (
     "vector_ops", "link_bytes", "link_scope", "recipe", "coverage", "dtype",
     "layout",
 )
+_SCALAR_WORK_FIELDS = frozenset({
+    "flops", "hbm_bytes", "mte2_bytes", "mte3_bytes", "vector_ops", "link_bytes",
+})
 OPTIONAL_IDENTITY_FIELDS = ("returns", "source_boundary")
+OPTIONAL_STRUCTURED_IDENTITY_FIELDS = (
+    "precision_abi", "kernel_binding", "owner_schedule",
+)
 ASCII = "utf-8"
 
 
@@ -307,6 +314,13 @@ def _store_attribute(op: Any, name: str, value: Any) -> None:
         pass
 
 
+def _canonical_scalar(value: Any) -> Any:
+    """Normalize integral floats to exact int without losing >53-bit int precision."""
+    if isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        return int(value)
+    return value
+
+
 def physical_key(op: Any) -> tuple:
     """Typed immutable physical identity of one operator occurrence.
 
@@ -320,14 +334,26 @@ def physical_key(op: Any) -> tuple:
         return cached
     key = [IDENTITY_VERSION]
     for field in IDENTITY_FIELDS:
-        key.append(getattr(op, field, None))
+        val = getattr(op, field, None)
+        if field in _SCALAR_WORK_FIELDS and isinstance(val, (int, float)) and not isinstance(val, bool):
+            val = _canonical_scalar(val)
+        key.append(val)
     for field in OPTIONAL_IDENTITY_FIELDS:
         if getattr(op, field, None):
             key.append((field, getattr(op, field)))
     if getattr(op, "matrix_flops", ()):
         key.append(("matrix_flops", tuple(sorted(
-            (str(name), float(value))
+            (str(name), _canonical_scalar(value))
             for name, value in op.matrix_flops))))
+    logical_reqs = getattr(op, "logical_precision_reqs", ())
+    if logical_reqs:
+        key.append(("logical_precision_reqs", tuple(sorted(
+            (str(name), str(value)) for name, value in logical_reqs))))
+    for field in OPTIONAL_STRUCTURED_IDENTITY_FIELDS:
+        structured = getattr(op, field, None)
+        if structured is not None:
+            payload = structured.to_dict() if hasattr(structured, "to_dict") else structured
+            key.append((field, _hashable(payload)))
     key.append(operator_metadata_key(
         getattr(op, "metadata", ()), int(op.stage), int(op.layer)))
     key = tuple(key)

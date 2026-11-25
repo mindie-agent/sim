@@ -118,29 +118,101 @@ def compact_refill(context, pattern, repeats, tail=(), *, refill_slots=2, consum
 
 
 _PROBE_CACHE_MAX = (2 * 2 * 2 * 2) * (2 * 2 * 2 * 2) * (2 * 2)
+_PROBE_TRACE_TASKS_PER_STAGE = 2
+_PROBE_TRACE_OVERHEAD_TASKS = 8
+_PERIODIC_SLOPE_REL_TOL = 1e-7
+
+
+def _encoded_tile_stage_count(records):
+    total = 0
+    for rec in records:
+        total += 1
+        nested = rec[-1]
+        if nested is not None:
+            if nested[0] == "kernel":
+                total += _encoded_tile_stage_count(nested[2])
+            elif nested[0] == "parallel":
+                total += sum(_encoded_tile_stage_count(branch[2]) for branch in nested[1])
+    return total
+
+
+def _trace_tile_index(task_name: str) -> int | None:
+    marker = ":tile"
+    pos = task_name.find(marker)
+    if pos < 0:
+        return None
+    rest = task_name[pos + len(marker):]
+    sep = rest.find(":")
+    token = rest if sep < 0 else rest[:sep]
+    return int(token) if token.isdigit() else None
+
+
+def _decode_periodic_program(nested, slot):
+    if nested is None:
+        return None
+    kind = nested[0]
+    if kind == "kernel":
+        _, minimum_ms, children = nested
+        return KernelProgram(
+            tuple(_decode_periodic_stage(rec, slot) for rec in children),
+            minimum_ms=minimum_ms,
+        )
+    if kind == "parallel":
+        return ParallelProgram(tuple(
+            KernelProgram(
+                tuple(_decode_periodic_stage(rec, slot) for rec in children),
+                minimum_ms=minimum_ms,
+            )
+            for _, minimum_ms, children in nested[1]
+        ))
+    raise ValueError(f"unsupported_encoded_nested_program:{kind}")
+
+
+def _decode_periodic_stage(record, slot):
+    (
+        name, work, after, previous, previous_lags, acq, fr,
+        placement, caps, coupled, latency, latency_from_first_service,
+        priority, cohort_size, cohort_widened, cohort_members, nested,
+    ) = record
+    return Stage(
+        name, dict(work), after=after, previous=previous,
+        previous_lags=previous_lags,
+        acquire=tuple(Allocation(f"{n}_s{slot}", p, s, u) for n, p, s, u in acq),
+        free=tuple(Allocation(f"{n}_s{slot}", p, s, u) for n, p, s, u in fr),
+        placement=dict(placement), caps=dict(caps), coupled=coupled,
+        latency=latency, latency_from_first_service=latency_from_first_service,
+        priority=priority, cohort_size=cohort_size,
+        cohort_widened=cohort_widened, cohort_members=dict(cohort_members),
+        program=_decode_periodic_program(nested, slot),
+    )
 
 
 @lru_cache(maxsize=_PROBE_CACHE_MAX)
-def _periodic_probe(resources, pools, slots, head_records, steady_records, tail_records, s_count):
+def _periodic_probe(
+    resources, pools, resident_records, slots,
+    head_records, steady_records, tail_records, s_count,
+):
     """Simulate one finite PipelineProgram probe of length ``h_len + s_count + t_len``."""
     @lru_cache(maxsize=None)
     def to_stages(records, slot):
-        return tuple(
-            Stage(name, dict(work), after=after, previous=previous,
-                  acquire=tuple(Allocation(f"{n}_s{slot}", p, s, (0,)) for n, p, s in acq),
-                  free=tuple(Allocation(f"{n}_s{slot}", p, s, (0,)) for n, p, s in fr),
-                  placement=dict(placement), caps=dict(caps),
-                  coupled=coupled, latency=latency)
-            for name, work, after, previous, acq, fr, placement, caps, coupled, latency in records
-        )
+        return tuple(_decode_periodic_stage(rec, slot) for rec in records)
+
     h_len, t_len = len(head_records), len(tail_records)
-    pool_dict = dict(pools)
-    pool_units = {k: 1 for k in pool_dict}
+    pool_dict = {pid: cap for pid, cap, _ in pools}
+    pool_units = {pid: units for pid, _, units in pools}
     total = h_len + s_count + t_len
+    trace_limit = 0
+    if h_len:
+        per_tile = max(
+            (_encoded_tile_stage_count(rec) for rec in (*head_records, steady_records, *tail_records)),
+            default=1,
+        )
+        trace_limit = total * (per_tile * _PROBE_TRACE_TASKS_PER_STAGE + _TWO_FACTOR) + _PROBE_TRACE_OVERHEAD_TASKS
     engine = Engine(
-        tuple(Resource(name, rate, units=1) for name, rate in resources),
-        pools=pool_dict, pool_units=pool_units,
+        tuple(Resource(name, rate, policy=policy, units=units) for name, rate, units, policy in resources),
+        pools=pool_dict, pool_units=pool_units, trace_limit=trace_limit,
     )
+
     def tile(idx):
         slot = idx % slots
         if idx < h_len:
@@ -148,9 +220,42 @@ def _periodic_probe(resources, pools, slots, head_records, steady_records, tail_
         if idx >= total - t_len:
             return to_stages(tail_records[idx - (total - t_len)], slot)
         return to_stages(steady_records, slot)
-    done = PipelineProgram(total, slots, tile).start(engine, "p", engine.submit("r"))
+
+    program = PipelineProgram(total, slots, tile)
+    resident_by_unit = {}
+    if resident_records:
+        res_allocs = tuple(Allocation(n, p, s, u) for n, p, s, u in resident_records)
+        for _, p, s, u_tuple in resident_records:
+            for unit in u_tuple:
+                resident_by_unit[(p, unit)] = resident_by_unit.get((p, unit), 0.0) + s
+        program = KernelProgram((Stage(
+            "resident", acquire=res_allocs, free=res_allocs, program=program,
+        ),))
+    done = program.start(engine, "p", engine.submit("r"))
     engine.advance(until=(done,))
-    return done.time, tuple(sorted(engine.peak_allocated.items()))
+    peak_per_unit = engine.summary()["peak_allocated_per_unit"]
+    peaks = []
+    for pid, _, n_units in pools:
+        for unit in range(n_units):
+            peak = float(peak_per_unit.get(f"{pid}:unit{unit}", 0.0))
+            delta = peak - resident_by_unit.get((pid, unit), 0.0)
+            if delta > 0.0:
+                peaks.append((pid, unit, delta))
+    head_end = 0.0
+    steady_starts: list[float] = [done.time] * s_count
+    if h_len:
+        for entry in engine.trace:
+            idx = _trace_tile_index(entry["task"])
+            if idx is None:
+                continue
+            if idx < h_len:
+                if entry["end_ms"] > head_end:
+                    head_end = float(entry["end_ms"])
+            elif h_len <= idx < h_len + s_count:
+                offset = idx - h_len
+                if entry["start_ms"] < steady_starts[offset]:
+                    steady_starts[offset] = float(entry["start_ms"])
+    return done.time, tuple(peaks), head_end, tuple(steady_starts)
 
 
 _PERIODIC_CACHE_SIZE = 1024
@@ -161,48 +266,73 @@ _JOINT_WARMUP_PERIODS = (2, 12, 24)
 _JOINT_PROBE_TILE_LIMIT = 128
 
 
+def _merge_probe_peaks(*peak_sets):
+    merged: dict[tuple[str, int], float] = {}
+    for peaks in peak_sets:
+        for pid, unit, size in peaks:
+            key = (pid, unit)
+            if size > merged.get(key, 0.0):
+                merged[key] = size
+    return tuple((pid, unit, size) for (pid, unit), size in sorted(merged.items()))
+
+
 @lru_cache(maxsize=_PERIODIC_CACHE_SIZE)
-def _periodic_pair(resources, pools, slots, head_records, steady_records, tail_records, max_steady):
+def _periodic_pair(
+    resources, pools, resident_records, slots,
+    head_records, steady_records, tail_records, max_steady, max_lag=_ONE_TILE,
+):
     """Verify 3-point periodic convergence and extract (base_w, t0, slope, peaks, converged)."""
-    step = max(2, slots)
+    step = max(_TWO_FACTOR, slots)
 
     def run_for(s_count):
-        return _periodic_probe(resources, pools, slots, head_records, steady_records, tail_records, s_count)
+        return _periodic_probe(
+            resources, pools, resident_records, slots,
+            head_records, steady_records, tail_records, s_count,
+        )
 
     bn = _FOUR_TILES
     b0 = bn * _TWO_FACTOR
     b1 = b0 * _THREE_FACTOR
     b2 = b1 * _THREE_FACTOR
     b3 = b2 * _TWO_FACTOR
+    min_w = max(step, ((max_lag + step - 1) // step) * step)
+    tried = set()
     for base in (bn, b0, b1, b2, b3):
-        w = (base // step) * step
-        if w + 2 * step > max_steady:
+        w = max((base // step) * step, min_w)
+        if w in tried:
+            continue
+        tried.add(w)
+        if w + _TWO_FACTOR * step > max_steady:
             break
-        (t0, peaks), (t1, _), (t2, _) = run_for(w), run_for(w + step), run_for(w + 2 * step)
+        r0, r1, r2 = run_for(w), run_for(w + step), run_for(w + _TWO_FACTOR * step)
+        if head_records and r1[2] > r1[3][w] + _JOINT_TIME_EPS_MS:
+            continue
+        t0, t1, t2 = r0[0], r1[0], r2[0]
         d1 = t1 - t0
         d2 = t2 - t1
-        if d1 > 0 and abs(d2 - d1) <= 1e-7 * max(1e-9, abs(d1)):
-            return w, t0, d1 / step, peaks, True
+        if d1 > 0 and abs(d2 - d1) <= _PERIODIC_SLOPE_REL_TOL * max(_JOINT_TIME_EPS_MS, abs(d1)):
+            return w, t0, d1 / step, _merge_probe_peaks(r0[1], r1[1], r2[1]), True
     return 0, 0.0, 0.0, (), False
 
 
-def _extract_leaves(stage):
-    """Yield (work_dict, placement_dict) leaf stages; reject unsupported nested programs."""
-    if stage.program is None:
-        yield dict(stage.work), {k: tuple(sorted(set(u))) for k, u in stage.placement.items() if u}
+def _iter_tree_stages(stage):
+    """Yield every Stage in a stage tree (parent and nested Kernel/Parallel children)."""
+    yield stage
+    program = stage.program
+    if program is None:
         return
-    if isinstance(stage.program, KernelProgram):
-        for sub in stage.program.stages:
-            yield from _extract_leaves(sub)
+    if isinstance(program, KernelProgram):
+        for sub in program.stages:
+            yield from _iter_tree_stages(sub)
         return
-    if isinstance(stage.program, ParallelProgram):
-        for branch in stage.program.programs:
+    if isinstance(program, ParallelProgram):
+        for branch in program.programs:
             if not isinstance(branch, KernelProgram):
                 raise ValueError(f"unsupported_nested_stage_program:{type(branch).__name__}")
             for sub in branch.stages:
-                yield from _extract_leaves(sub)
+                yield from _iter_tree_stages(sub)
         return
-    raise ValueError(f"unsupported_nested_stage_program:{type(stage.program).__name__}")
+    raise ValueError(f"unsupported_nested_stage_program:{type(program).__name__}")
 
 
 def _extract_stage(stage):
@@ -239,6 +369,22 @@ def _extract_stage(stage):
         }
         return c_work, n_work, place
     raise ValueError(f"unsupported_nested_stage_program:{type(stage.program).__name__}")
+
+
+def _collect_tile_alloc_map(stages):
+    """Assign normalized tile-local buffer names, or None if lifetimes cross tiles."""
+    acquired = {}
+    freed = set()
+    for root in stages:
+        for st in _iter_tree_stages(root):
+            for a in st.acquire:
+                if a.name not in acquired:
+                    acquired[a.name] = f"b{len(acquired)}"
+            for a in st.free:
+                freed.add(a.name)
+    if freed - acquired.keys() or acquired.keys() - freed:
+        return None
+    return acquired
 
 
 def _can_compact_count(
@@ -283,40 +429,87 @@ def _matching_peer_boundaries(active):
 
 
 def _stage_has_latency(stage):
-    if stage.latency:
-        return True
-    if isinstance(stage.program, KernelProgram):
-        return any(map(_stage_has_latency, stage.program.stages))
-    if isinstance(stage.program, ParallelProgram):
-        return any(_stage_has_latency(child) for program in stage.program.programs for child in program.stages)
-    return False
+    return any(item.latency for item in _iter_tree_stages(stage))
 
 
-def _encode_periodic_stages(stages, id_map, pool_id):
-    alloc_map = {}
-    for st in stages:
-        for a in st.acquire:
-            if a.name not in alloc_map:
-                alloc_map[a.name] = f"b{len(alloc_map)}"
-    encoded = []
-    for st in stages:
-        _, nw, pl = _extract_stage(st)
-        encoded.append((
-            st.name,
-            tuple(sorted((id_map[k], float(v)) for k, v in nw.items() if v and k in id_map)),
-            tuple(st.after),
-            tuple(st.previous),
-            tuple((alloc_map[a.name], pool_id[a.pool], float(a.size)) for a in st.acquire if a.pool in pool_id),
-            tuple((alloc_map[a.name], pool_id[a.pool], float(a.size)) for a in st.free if a.pool in pool_id),
-            tuple((id_map[k], (0,)) for k in sorted(pl) if k in id_map),
-            tuple(sorted((id_map[k], float(v)) for k, v in st.caps.items() if k in id_map)),
-            st.coupled,
-            float(st.latency),
-        ))
-    return tuple(encoded)
+def _encode_nested_program(program, id_map, unit_maps, pool_id, pool_unit_maps, alloc_map):
+    if program is None:
+        return None
+    if isinstance(program, KernelProgram):
+        children = tuple(
+            _encode_one_stage(sub, id_map, unit_maps, pool_id, pool_unit_maps, alloc_map)
+            for sub in program.stages
+        )
+        return ("kernel", float(program.minimum_ms), children)
+    if isinstance(program, ParallelProgram):
+        branches = tuple(
+            (
+                "kernel",
+                float(branch.minimum_ms),
+                tuple(
+                    _encode_one_stage(sub, id_map, unit_maps, pool_id, pool_unit_maps, alloc_map)
+                    for sub in branch.stages
+                ),
+            )
+            for branch in program.programs
+        )
+        return ("parallel", branches)
+    raise ValueError(f"unsupported_nested_stage_program:{type(program).__name__}")
 
 
-def _build_grouped_steady_program(context, by_res, max_groups, span_ms, slot_allocs):
+def _encode_one_stage(st, id_map, unit_maps, pool_id, pool_unit_maps, alloc_map):
+    def encode_allocs(items):
+        return tuple(
+            (
+                alloc_map[a.name],
+                pool_id[a.pool],
+                float(a.size),
+                tuple(pool_unit_maps[a.pool][u] for u in (a.units or (0,))),
+            )
+            for a in items
+        )
+
+    return (
+        st.name,
+        tuple(sorted((id_map[k], float(v)) for k, v in st.work.items() if v)),
+        tuple(st.after),
+        tuple(st.previous),
+        tuple(st.previous_lags),
+        encode_allocs(st.acquire),
+        encode_allocs(st.free),
+        tuple(
+            (id_map[k], tuple(unit_maps[k][u] for u in sorted(set(u_list))))
+            for k, u_list in sorted(st.placement.items()) if u_list
+        ),
+        tuple(sorted((id_map[k], float(v)) for k, v in st.caps.items() if k in id_map)),
+        bool(st.coupled),
+        float(st.latency),
+        bool(st.latency_from_first_service),
+        int(st.priority),
+        int(st.cohort_size),
+        tuple(id_map[k] for k in st.cohort_widened if k in id_map),
+        tuple(
+            (id_map[k], tuple(tuple(unit_maps[k][u] for u in member) for member in members))
+            for k, members in sorted(st.cohort_members.items()) if k in id_map
+        ),
+        _encode_nested_program(st.program, id_map, unit_maps, pool_id, pool_unit_maps, alloc_map),
+    )
+
+
+def _encode_periodic_stages(stages, id_map, unit_maps, pool_id, pool_unit_maps):
+    alloc_map = _collect_tile_alloc_map(stages)
+    if alloc_map is None:
+        return None
+    try:
+        return tuple(
+            _encode_one_stage(st, id_map, unit_maps, pool_id, pool_unit_maps, alloc_map)
+            for st in stages
+        )
+    except (KeyError, ValueError):
+        return None
+
+
+def _build_grouped_steady_program(by_res, max_groups, span_ms, slot_allocs):
     """Build multi-group steady pipeline stages preserving distinct unit placements."""
     steady_stages_out = []
     steady_names = []
@@ -345,10 +538,153 @@ def _build_grouped_steady_program(context, by_res, max_groups, span_ms, slot_all
             name, g_work, after=("setup",), caps=g_caps, placement=g_pl, coupled=True,
         ))
     return KernelProgram((
-        Stage("setup", latency=context.setup_ms, acquire=slot_allocs),
+        Stage("setup", acquire=slot_allocs),
         *steady_stages_out,
         Stage("steady_release", after=tuple(steady_names), free=slot_allocs),
     ))
+
+
+def _summarize_periodic_tiles(head_tiles, steady_stages, tail_tiles, steady_count):
+    """Aggregate conserved work, placements, pool units, and max lag."""
+    total_work = {}
+    all_placement = {}
+    unplaced_res = set()
+    unit_group_work = {}
+    pool_units_used = {}
+    max_lag = _ONE_TILE
+    weighted_tiles = (
+        *((t, 1) for t in head_tiles),
+        (steady_stages, steady_count),
+        *((t, 1) for t in tail_tiles),
+    )
+    for tile_stages, mult in weighted_tiles:
+        for root in tile_stages:
+            for item in _iter_tree_stages(root):
+                if item.fragment is not None or item.deliveries:
+                    return None
+                for _, lag in item.previous_lags:
+                    if lag > max_lag:
+                        max_lag = lag
+                for alloc in (*item.acquire, *item.free):
+                    pool_units_used.setdefault(alloc.pool, set()).update(alloc.units or (0,))
+                if item.program is not None and not item.work:
+                    continue
+                lpl = {k: tuple(sorted(set(u))) for k, u in item.placement.items() if u}
+                for k, v in item.work.items():
+                    if v:
+                        total_work[k] = total_work.get(k, 0.0) + v * mult
+                        units = lpl.get(k, ())
+                        if not units:
+                            unplaced_res.add(k)
+                        unit_group_work[(k, units)] = unit_group_work.get((k, units), 0.0) + v * mult
+                for k, units in lpl.items():
+                    all_placement.setdefault(k, set()).update(units)
+    return (
+        total_work, all_placement, unplaced_res, unit_group_work,
+        pool_units_used, max_lag,
+    )
+
+
+def _build_probe_keys(context, total_work, all_placement, unplaced_res, pool_units_used, resident):
+    """Build normalized per-unit resource, pool, and resident keys for _periodic_probe."""
+    names = sorted(total_work)
+    id_map = {name: str(i) for i, name in enumerate(names)}
+    declared = _units(context)
+    host = context.resource_names.get("host")
+    unit_maps = {}
+    resources_list = []
+    for k in names:
+        used = sorted(all_placement.get(k, ()))
+        if used and k not in unplaced_res:
+            unit_maps[k] = {u: idx for idx, u in enumerate(used)}
+            probe_units = len(used)
+            probe_rate = context.rates[k] * (probe_units / declared[k])
+        elif used:
+            unit_maps[k] = {u: u for u in used}
+            probe_units = declared[k]
+            probe_rate = context.rates[k]
+        else:
+            unit_maps[k] = {}
+            probe_units = _ONE_TILE
+            probe_rate = context.rates[k]
+        policy = "fifo" if k == host else "fair"
+        resources_list.append((id_map[k], probe_rate, probe_units, policy))
+
+    phys_pools = sorted(pool_units_used)
+    pool_id = {p: f"p{i}" for i, p in enumerate(phys_pools)}
+    id_to_phys = {f"p{i}": p for i, p in enumerate(phys_pools)}
+    phys_to_role = {v: k for k, v in context.pool_names.items()}
+    for alloc in resident:
+        if alloc.pool in pool_units_used:
+            pool_units_used[alloc.pool].update(alloc.units or (0,))
+    pool_unit_maps = {}
+    pool_unit_inv = {}
+    pools_list = []
+    for p in phys_pools:
+        p_units = sorted(pool_units_used[p]) or [0]
+        pool_unit_maps[p] = {u: idx for idx, u in enumerate(p_units)}
+        pool_unit_inv[pool_id[p]] = tuple(p_units)
+        cap = float(context.pool_capacities.get(phys_to_role.get(p), UNDECLARED_POOL_CAPACITY_BYTES))
+        pools_list.append((pool_id[p], cap, len(p_units)))
+    resident_records = tuple(
+        (
+            f"res{idx}",
+            pool_id[alloc.pool],
+            float(alloc.size),
+            tuple(pool_unit_maps[alloc.pool][u] for u in (alloc.units or (0,))),
+        )
+        for idx, alloc in enumerate(resident) if alloc.pool in pool_id
+    )
+    return (
+        id_map, unit_maps, tuple(resources_list),
+        pool_id, id_to_phys, pool_unit_maps, pool_unit_inv, tuple(pools_list), resident_records,
+    )
+
+
+def _interior_tiles_homogeneous(
+    tile_fn, head, tail, count, step, encoded_steady,
+    id_map, unit_maps, pool_id, pool_unit_maps,
+):
+    """Verify sampled interior tiles across a full slot period match encoded_steady."""
+    end = count - tail
+    steady_count = end - head
+    sample_indices = sorted({
+        idx
+        for idx in (
+            *range(head + 1, min(head + step, end)),
+            head + steady_count // _TWO_FACTOR,
+            end - 1,
+        )
+        if head < idx < end
+    })
+    for idx in sample_indices:
+        stages = tile_fn(idx)
+        try:
+            for root in stages:
+                for item in _iter_tree_stages(root):
+                    if item.fragment is not None or item.deliveries:
+                        return False
+        except ValueError:
+            return False
+        encoded = _encode_periodic_stages(stages, id_map, unit_maps, pool_id, pool_unit_maps)
+        if encoded != encoded_steady:
+            return False
+    return True
+
+
+def _build_slot_allocations(peaks, id_to_phys, pool_unit_inv):
+    """Map probe per-unit peak deltas back to physical per-unit Allocations."""
+    grouped = {}
+    for pid, local_u, size in peaks:
+        if size <= 0.0:
+            continue
+        phys = id_to_phys[pid]
+        orig_u = pool_unit_inv[pid][local_u]
+        grouped.setdefault((phys, size), []).append(orig_u)
+    result = []
+    for idx, ((phys, size), units) in enumerate(sorted(grouped.items())):
+        result.append(Allocation(f"compact_{phys}_{idx}", phys, size, tuple(sorted(units))))
+    return tuple(result)
 
 
 def compact_periodic_pipeline(
@@ -365,8 +701,8 @@ def compact_periodic_pipeline(
     Engine as a coupled fluid steady-state approximation. A peer group requires
     a joint decision by compact_periodic_peer_group before any candidate runs.
     """
-    counts = () if peer_counts is None else tuple(int(count) for count in peer_counts)
-    active_counts = [count for count in counts if count > 0]
+    counts = () if peer_counts is None else tuple(int(c) for c in peer_counts)
+    active_counts = [c for c in counts if c > 0]
     shared = len(active_counts) > 1
     if shared and not _peer_group_verified:
         return PipelineProgram(count, slots, tile_fn)
@@ -378,92 +714,79 @@ def compact_periodic_pipeline(
             return PipelineProgram(count, slots, tile_fn)
     if not _can_compact_count(count, slots, head=head, tail=tail, threshold=threshold):
         return PipelineProgram(count, slots, tile_fn)
-    step = max(2, slots)
+    step = max(_TWO_FACTOR, slots)
     tail += (count - head - tail) % step
     steady_count = count - head - tail
     head_tiles = [tile_fn(i) for i in range(head)]
     steady_stages = tile_fn(head)
     tail_tiles = [tile_fn(i) for i in range(count - tail, count)]
 
-    total_work = {}
-    all_placement = {}
-    unit_group_work = {}
-    for tile_stages, mult in (
-        *((t, 1) for t in head_tiles),
-        (steady_stages, steady_count),
-        *((t, 1) for t in tail_tiles),
-    ):
-        for stage in tile_stages:
-            for lw, lpl in _extract_leaves(stage):
-                for k, v in lw.items():
-                    if v:
-                        total_work[k] = total_work.get(k, 0.0) + v * mult
-                        units = lpl.get(k, ())
-                        unit_group_work[(k, units)] = unit_group_work.get((k, units), 0.0) + v * mult
-                for k, units in lpl.items():
-                    all_placement.setdefault(k, set()).update(units)
-    all_placement = {k: tuple(sorted(u)) for k, u in all_placement.items() if k in total_work}
+    try:
+        summary = _summarize_periodic_tiles(head_tiles, steady_stages, tail_tiles, steady_count)
+    except ValueError:
+        return PipelineProgram(count, slots, tile_fn)
+    if summary is None:
+        return PipelineProgram(count, slots, tile_fn)
+    (
+        total_work, raw_placement, unplaced_res, unit_group_work,
+        pool_units_used, max_lag,
+    ) = summary
+    all_placement = {k: tuple(sorted(u)) for k, u in raw_placement.items() if k in total_work}
     if shared and any(not units for _, units in unit_group_work) and any(
         _stage_has_latency(stage) for group in (*head_tiles, steady_stages, *tail_tiles) for stage in group
     ):
         return PipelineProgram(count, slots, tile_fn)
 
-    pool_units_by_phys = {}
-    for s_stages in (steady_stages, *head_tiles, *tail_tiles):
-        for stage in s_stages:
-            for alloc in stage.acquire:
-                pool_units_by_phys[alloc.pool] = alloc.units
-    phys_pools = sorted(pool_units_by_phys)
-    pool_id = {p: f"p{i}" for i, p in enumerate(phys_pools)}
-    id_to_phys = {f"p{i}": p for i, p in enumerate(phys_pools)}
-    phys_to_role = {v: k for k, v in context.pool_names.items()}
-    resident_by_phys = {}
-    for alloc in resident:
-        resident_by_phys[alloc.pool] = resident_by_phys.get(alloc.pool, 0.0) + alloc.size
-    pools_key = tuple(
-        (pool_id[p], float(context.pool_capacities.get(phys_to_role.get(p),
-                                                     UNDECLARED_POOL_CAPACITY_BYTES))
-         - resident_by_phys.get(p, 0.0))
-        for p in phys_pools
-    )
+    (
+        id_map, unit_maps, resources_key,
+        pool_id, id_to_phys, pool_unit_maps, pool_unit_inv, pools_key, resident_key,
+    ) = _build_probe_keys(context, total_work, all_placement, unplaced_res, pool_units_used, resident)
 
-    names = sorted(total_work)
-    id_map = {name: str(i) for i, name in enumerate(names)}
-    declared = _units(context)
-    resources_key = tuple(
-        (id_map[k], context.rates[k] * (len(all_placement[k]) / declared[k] if k in all_placement else 1.0))
-        for k in names
+    encoded_head = tuple(
+        _encode_periodic_stages(t, id_map, unit_maps, pool_id, pool_unit_maps) for t in head_tiles
     )
+    encoded_steady = _encode_periodic_stages(steady_stages, id_map, unit_maps, pool_id, pool_unit_maps)
+    encoded_tail = tuple(
+        _encode_periodic_stages(t, id_map, unit_maps, pool_id, pool_unit_maps) for t in tail_tiles
+    )
+    if encoded_steady is None or any(e is None for e in encoded_head) or any(e is None for e in encoded_tail):
+        return PipelineProgram(count, slots, tile_fn)
+    if not _interior_tiles_homogeneous(
+        tile_fn, head, tail, count, step, encoded_steady,
+        id_map, unit_maps, pool_id, pool_unit_maps,
+    ):
+        return PipelineProgram(count, slots, tile_fn)
 
-    w, t0, slope, peaks, converged = _periodic_pair(
-        resources_key, pools_key, slots,
-        tuple(_encode_periodic_stages(t, id_map, pool_id) for t in head_tiles),
-        _encode_periodic_stages(steady_stages, id_map, pool_id),
-        tuple(_encode_periodic_stages(t, id_map, pool_id) for t in tail_tiles),
-        # This bound includes both verification periods, not just the base
-        # warm-up. Passing the base alone rejected otherwise valid probes.
-        steady_count,
-    )
+    try:
+        w, t0, slope, peaks, converged = _periodic_pair(
+            resources_key, pools_key, resident_key, slots,
+            encoded_head, encoded_steady, encoded_tail,
+            steady_count, max_lag,
+        )
+    except ExecutionError:
+        return PipelineProgram(count, slots, tile_fn)
     if not converged:
         return PipelineProgram(count, slots, tile_fn)
-    slot_allocs = tuple(
-        Allocation(f"compact_{id_to_phys[pid]}", id_to_phys[pid], size, pool_units_by_phys[id_to_phys[pid]])
-        for pid, size in peaks if size > 0
-    )
-    span_ms = t0 + (steady_count - w) * slope
-    caps = {k: v / span_ms for k, v in total_work.items()} if span_ms > 0 else {}
 
+    slot_allocs = _build_slot_allocations(peaks, id_to_phys, pool_unit_inv)
+    span_ms = t0 + (steady_count - w) * slope
+    if not total_work:
+        return KernelProgram((
+            Stage("setup", acquire=slot_allocs),
+            Stage("steady_pipeline", {}, after=("setup",), latency=span_ms, free=slot_allocs),
+        ))
+    caps = {k: v / span_ms for k, v in total_work.items()} if span_ms > 0 else {}
     by_res = {}
     for (k, units), val in unit_group_work.items():
         by_res.setdefault(k, []).append((units, val))
     max_groups = max((len(v) for v in by_res.values()), default=1)
     if max_groups <= 1:
         return KernelProgram((
-            Stage("setup", latency=context.setup_ms, acquire=slot_allocs),
+            Stage("setup", acquire=slot_allocs),
             Stage("steady_pipeline", total_work, after=("setup",), caps=caps,
                   placement=all_placement, coupled=True, free=slot_allocs),
         ))
-    return _build_grouped_steady_program(context, by_res, max_groups, span_ms, slot_allocs)
+    return _build_grouped_steady_program(by_res, max_groups, span_ms, slot_allocs)
 
 
 @dataclass(frozen=True, slots=True)
@@ -533,7 +856,12 @@ def _steady_stage_demand(stage):
         children = tuple(map(_steady_stage_demand, program.stages))
     elif isinstance(program, ParallelProgram):
         children = tuple(tuple(map(_steady_stage_demand, branch.stages)) for branch in program.programs)
-    return stage.work, stage.latency, stage.caps, children
+    return (
+        stage.work, stage.latency, stage.caps, stage.after, stage.previous,
+        stage.previous_lags, stage.coupled, stage.latency_from_first_service,
+        stage.priority, stage.cohort_size, stage.cohort_widened,
+        stage.deliveries, children,
+    )
 
 
 def _joint_recurrence_matches(context, specs, candidates) -> bool:

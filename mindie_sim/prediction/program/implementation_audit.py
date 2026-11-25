@@ -36,10 +36,11 @@ def capture_partition(ops, runtime, replay_scope=None):
             return None
         if not tuple(getattr(runtime, "piecewise_capture_keys", ())):
             return None
-    split = set(getattr(runtime, "splitting_ops", None) or {
+    splitting_ops = getattr(runtime, "splitting_ops", None)
+    split = set(splitting_ops) if splitting_ops is not None else {
         "attention", "attention_qk", "attention_pv", "attention_softmax",
         "attention_merge",
-    })
+    }
     state, segment, last_stage, last_captured = {}, 0, None, False
     for op in ops:
         captured = bool(replay_scope == "full"

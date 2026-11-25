@@ -164,6 +164,7 @@ def _compile_stages(stages: Sequence[Stage], *, class_id: int,
         if stage.name in local:
             raise ModelingError(f"program_catalog_duplicate_stage:{stage.name}")
         local[stage.name] = index
+        streams.setdefault(stage.name, len(streams))
     specs: list[StageSpec] = []
     for index, stage in enumerate(stages):
         edges: list[EdgeSpec] = []
@@ -172,15 +173,23 @@ def _compile_stages(stages: Sequence[Stage], *, class_id: int,
                 raise ModelingError(
                     f"program_catalog_unknown_predecessor:{stage.name}:{key}")
             edges.append(EdgeSpec(source_node=local[key]))
-        previous_seen: set[int] = set()
+        previous_seen: set[tuple[int, int]] = set()
         for key in stage.previous:
-            if key not in local:
+            if key not in streams:
                 raise ModelingError(
                     f"program_catalog_unknown_previous:{stage.name}:{key}")
-            source = local[key]
-            if source not in previous_seen:
+            source = streams[key]
+            if (source, -1) not in previous_seen:
                 edges.append(EdgeSpec(source_node=source, iteration_delta=-1))
-                previous_seen.add(source)
+                previous_seen.add((source, -1))
+        for key, lag in stage.previous_lags:
+            if key not in streams:
+                raise ModelingError(
+                    f"program_catalog_unknown_previous:{stage.name}:{key}")
+            source = streams[key]
+            if (source, -lag) not in previous_seen:
+                edges.append(EdgeSpec(source_node=source, iteration_delta=-lag))
+                previous_seen.add((source, -lag))
         work = tuple(WorkTerm(
             physical_resource_role=str(role), issued=float(amount),
             useful=float(amount), unit="ms", service_conversion=1.0)
@@ -217,6 +226,7 @@ def _compile_stages(stages: Sequence[Stage], *, class_id: int,
             coupled=bool(stage.coupled),
             priority=int(stage.priority),
             cohort_size=int(stage.cohort_size),
+            cohort_widened=stage.cohort_widened,
             placement=placement,
             acquire=tuple(acquire),
             release=tuple(release),
@@ -303,6 +313,21 @@ def _freeze_catalog(*, implementation_id: str,
 # Ordinary kernel DAG
 
 
+def _stage_requires_stage_runtime(stage: Stage) -> bool:
+    return bool(
+        stage.deliveries or stage.latency_from_first_service
+        or stage.cohort_members or stage.metadata or stage.keep_empty
+        or stage.previous_lags
+    )
+
+
+def _iter_template_groups(template: PipelineTemplate):
+    yield template.setup
+    yield template.drain
+    for phase in template.phases:
+        yield from (phase.residue_stages or (phase.stages,))
+
+
 def catalog_compilable(program) -> bool:
     """True when a declaration has no opaque producer boundary.
 
@@ -316,7 +341,10 @@ def catalog_compilable(program) -> bool:
         # without the parent stage's dependencies today, so nested producers
         # must use the public Stage.submit path until that is fixed. Never run
         # nested work before its declared ready boundary.
-        if any(stage.program is not None for stage in program.stages):
+        if any(
+            stage.program is not None or _stage_requires_stage_runtime(stage)
+            for stage in program.stages
+        ):
             return False
         # Cross-stage release identity is owned by the repeating/Engine public
         # submit path today; a catalog release must bind the same live grant.
@@ -333,9 +361,14 @@ def catalog_compilable(program) -> bool:
         # The causal Engine's finite node loop currently executes flat class
         # stages only, and a release must bind the same live grant across
         # stages/panels. Keep the repeating consumer's Stage.submit path for
-        # nested programs and allocation lifecycles.
+        # nested programs, allocation lifecycles, setup_ms, deliveries,
+        # first-service latency, and colliding multi-class local streams.
         return (not _template_has_nested(program.template)
-                and not _template_has_allocations(program.template))
+                and not _template_has_allocations(program.template)
+                and not program.template.setup_ms
+                and not _template_requires_stage_runtime(program.template)
+                and not _has_cross_stage_previous(program.template)
+                and not _has_multi_class_stream_collision(program.template))
     if isinstance(program, PipelineProgram):
         # A callback producer may encode per-wave tail geometry; only its
         # explicit template/index catalog can prove a bounded class mapping.
@@ -349,17 +382,19 @@ def catalog_compilable(program) -> bool:
 def _template_has_allocations(template: PipelineTemplate) -> bool:
     return any(
         stage.acquire or stage.free
-        for stage in (*template.setup, *template.drain,
-                      *(stage for phase in template.phases
-                        for stage in phase.stages)))
+        for group in _iter_template_groups(template) for stage in group)
 
 
 def _template_has_nested(template: PipelineTemplate) -> bool:
     return any(
         stage.program is not None
-        for stage in (*template.setup, *template.drain,
-                      *(stage for phase in template.phases
-                        for stage in phase.stages)))
+        for group in _iter_template_groups(template) for stage in group)
+
+
+def _template_requires_stage_runtime(template: PipelineTemplate) -> bool:
+    return any(
+        _stage_requires_stage_runtime(stage)
+        for group in _iter_template_groups(template) for stage in group)
 
 
 def _compile_nested(program, *, generation: CatalogGeneration) -> ProgramCatalog:
@@ -451,6 +486,11 @@ def _compile_template(template: PipelineTemplate, *,
     symbols: dict[str, int] = {}
     specifications: list[AllocationSpec] = []
     streams: dict[str, int] = {}
+    for phase in template.phases:
+        for group in (phase.residue_stages or (phase.stages,)):
+            for stage in group:
+                if isinstance(stage, Stage):
+                    streams.setdefault(stage.name, len(streams))
 
     classes: list[StageClass] = []
     phase_classes: list[tuple[int, ...]] = []
@@ -532,8 +572,20 @@ def _compile_template(template: PipelineTemplate, *,
             return (class_id, _ends[phase_id], 0, index,
                     index % max(1, int(template.slots)))
 
-        body_stages = len(classes[0].stages) if classes else 0
-        selected = total * body_stages
+        selected = 0
+        cursor = 0
+        for phase in template.phases:
+            if phase.residue_stages:
+                period = len(phase.residue_stages)
+                full, rem = divmod(int(phase.count), period)
+                selected += full * sum(len(group) for group in phase.residue_stages)
+                selected += sum(
+                    len(phase.residue_stages[(cursor + offset) % period])
+                    for offset in range(rem)
+                )
+            else:
+                selected += int(phase.count) * len(phase.stages)
+            cursor += int(phase.count)
 
     finite = FiniteProgramSpec(
         total=total,
@@ -752,16 +804,28 @@ def submit_program_catalog(engine, catalog: ProgramCatalog, *,
 
 def submit_program(engine, program, *, name: str, ready,
                    owner: str = ""):
+    if isinstance(program, PipelineTemplateProgram):
+        return submit_template(
+            engine, program.template, name=name, ready=ready, owner=owner)
+    if isinstance(program, PipelineProgram) and program.homogeneous:
+        return submit_template(
+            engine, program.template(), name=name, ready=ready, owner=owner)
+    if (
+        isinstance(program, (KernelProgram, ParallelProgram))
+        and not catalog_compilable(program)
+    ):
+        from mindie_sim.prediction.runtime.contracts import Submission
+        done = program.start(engine, name, ready, owner=owner)
+        return Submission(
+            occurrence=_occurrence(engine), start=ready, done=done,
+            ports={}, allocations={}, selected_program_id=type(program).__name__)
     catalog = compile_program(program, generation=_generation(engine))
     return submit_program_catalog(
         engine, catalog, name=name, after=(ready,), owner=owner)
 
 
 def _has_cross_stage_previous(template: PipelineTemplate) -> bool:
-    groups = [template.setup, template.drain]
-    for phase in template.phases:
-        groups.extend(phase.residue_stages or (phase.stages,))
-    for group in groups:
+    for group in _iter_template_groups(template):
         names = {stage.name for stage in group}
         for stage in group:
             if any(dep != stage.name or dep not in names for dep in stage.previous):
@@ -769,9 +833,35 @@ def _has_cross_stage_previous(template: PipelineTemplate) -> bool:
     return False
 
 
+def _has_multi_class_stream_collision(template: PipelineTemplate) -> bool:
+    """True when distinct phase classes place different stage names at one local_id."""
+    local_names: dict[int, str] = {}
+    for phase in template.phases:
+        for group in (phase.residue_stages or (phase.stages,)):
+            for local_id, stage in enumerate(group):
+                seen = local_names.get(local_id)
+                if seen is not None and seen != stage.name:
+                    return True
+                local_names[local_id] = stage.name
+    return False
+
+
 def submit_template(engine, template: PipelineTemplate, *, name: str, ready,
                     owner: str = ""):
-    if _has_cross_stage_previous(template):
+    from .pipeline import _start_template_direct, _template_needs_direct
+
+    if _template_needs_direct(template):
+        from mindie_sim.prediction.runtime.contracts import Submission
+        done = _start_template_direct(engine, template, name, ready, owner)
+        return Submission(
+            occurrence=_occurrence(engine), start=ready, done=done,
+            ports={}, allocations={}, selected_program_id="finite-pipeline")
+    if (
+        _has_cross_stage_previous(template)
+        or _has_multi_class_stream_collision(template)
+        or template.setup_ms
+        or _template_requires_stage_runtime(template)
+    ):
         from mindie_sim.prediction.runtime.contracts import Submission
         from mindie_sim.prediction.scheduling import start_pipeline_template
         done = start_pipeline_template(
