@@ -24,8 +24,9 @@ import importlib
 from importlib import metadata as importlib_metadata
 import json
 from pathlib import Path
+import re
 import threading
-from typing import Any
+from typing import Any, Literal
 
 from mindie_sim.catalog.checkpoint_reader import resolve_checkpoint_tensor_tag
 from mindie_sim.schema.checkpoint import CheckpointQuantMap, TensorQuantRule
@@ -81,6 +82,12 @@ STACK_MANIFEST_SCHEMA = "mindie-sim.stack-manifest/1"
 STACK_ENTRY_POINT_GROUP = "mindie_sim.stacks"
 MAX_MANIFEST_BYTES = 50 * 1024 * 1024
 DEFAULT_KV_BLOCK_SIZE = 128
+DEFAULT_LATENT_PATCHES = 4096
+DEFAULT_CFG_BRANCHES = 2
+DEFAULT_TEXT_ENCODE_TOKENS = 256
+DEFAULT_FULL_CAPTURE_BUCKETS: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)
+DEFAULT_PIECEWISE_BUCKETS: tuple[int, ...] = (64, 128, 256, 512, 1024, 2048)
+EXPERT_FULL_ENUM_LIMIT = 16
 MX_BLOCK_ELEMENTS = 32
 FP8_BLOCK_ELEMENTS = 128
 INT4_GROUP_ELEMENTS = 128
@@ -89,6 +96,7 @@ FP16_SCALE_BYTES = 2
 E8M0_SCALE_BYTES = 1
 KV_CACHE_PLANES = 2
 DIFFUSION_PHASES = frozenset({"denoise_step", "vae_decode", "text_encode"})
+_EXPERT_ID_RE = re.compile(r"\.experts\.(\d+)\.")
 
 DEFAULT_DOMAIN_WORK_UNITS: Mapping[WorkloadDomain, WorkUnitKind] = {
     "llm": "prefill_decode_step",
@@ -145,7 +153,38 @@ _DIT_LAYER_ROLES: tuple[str, ...] = (
     "attn.o_proj",
     "ffn.fc1",
     "ffn.fc2",
+    "adaln.modulation",
 )
+_GQA_ATTN_ROLES: tuple[str, ...] = (
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "self_attn.o_proj",
+)
+_MLA_Q_LORA_ATTN_ROLES: tuple[str, ...] = (
+    "self_attn.q_a_proj",
+    "self_attn.q_b_proj",
+    "self_attn.kv_a_proj_with_mqa",
+    "self_attn.kv_b_proj",
+    "self_attn.o_proj",
+)
+_MLA_DIRECT_ATTN_ROLES: tuple[str, ...] = (
+    "self_attn.q_proj",
+    "self_attn.kv_a_proj_with_mqa",
+    "self_attn.kv_b_proj",
+    "self_attn.o_proj",
+)
+_DENSE_MLP_ROLES: tuple[str, ...] = (
+    "mlp.gate_proj",
+    "mlp.up_proj",
+    "mlp.down_proj",
+)
+_SHARED_EXPERT_ROLES: tuple[str, ...] = (
+    "mlp.shared_experts.gate_proj",
+    "mlp.shared_experts.up_proj",
+    "mlp.shared_experts.down_proj",
+)
+_EXPERT_PROJECTION_SUFFIXES: tuple[str, ...] = ("gate_proj", "up_proj", "down_proj")
 
 
 def normalize_hardware_backend(hardware_family: str | None) -> str | None:
@@ -186,6 +225,170 @@ def _validate_adapter(adapter: Any) -> StackCapabilitySpec:
 
 
 _manifest_abi_for_tag = resolve_checkpoint_tensor_abi
+
+
+def _resolve_tag_and_rule(
+    checkpoint: CheckpointQuantMap,
+    tensor_path: str,
+    *,
+    scope: str = "target",
+    source_native_layer_id: int | None = None,
+    expert_id: int | None = None,
+) -> tuple[str, TensorQuantRule | None]:
+    raw = str(tensor_path or "").strip()
+    mod_path = raw[:-len(".weight")] if raw.endswith(".weight") else raw
+    exc_or_ign = checkpoint.resolve_exception_or_ignored(
+        mod_path, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
+    )
+    if exc_or_ign is not None:
+        return exc_or_ign, None
+    for rule in checkpoint.rules:
+        if rule.matches(
+            mod_path, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
+        ):
+            return rule.raw_tag, rule
+    if mod_path != raw:
+        exc_raw = checkpoint.resolve_exception_or_ignored(
+            raw, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
+        )
+        if exc_raw is not None:
+            return exc_raw, None
+        for rule in checkpoint.rules:
+            if rule.matches(
+                raw, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
+            ):
+                return rule.raw_tag, rule
+    if checkpoint.source_format == "unquantized_native":
+        return "FLOAT", None
+    if checkpoint.source_format == "hf_quantization_config":
+        parts = set(mod_path.lower().split("."))
+        if "experts" in parts:
+            for rule in checkpoint.rules:
+                if rule.pattern == "*.experts.*":
+                    return rule.raw_tag, rule
+        for rule in checkpoint.rules:
+            if rule.pattern == "*":
+                return rule.raw_tag, rule
+    tag = resolve_checkpoint_tensor_tag(
+        checkpoint, tensor_path, scope=scope, source_native_layer_id=source_native_layer_id, expert_id=expert_id,  # type: ignore[arg-type]
+    )
+    return (tag if tag is not None else (checkpoint.model_quant_type or "FLOAT")), None
+
+
+def _expert_boundary_ids(checkpoint: CheckpointQuantMap, num_experts: int) -> tuple[int, ...]:
+    count = max(1, int(num_experts))
+    if count <= EXPERT_FULL_ENUM_LIMIT:
+        return tuple(range(count))
+    ids: set[int] = {0, 1, count - 1}
+    for exc in checkpoint.layer_exceptions:
+        for val in exc.expert_indices:
+            if 0 <= val < count:
+                ids.add(val)
+        for m in _EXPERT_ID_RE.findall(exc.pattern):
+            val = int(m)
+            if 0 <= val < count:
+                ids.add(val)
+    for entry in checkpoint.ignored_modules:
+        for m in _EXPERT_ID_RE.findall(entry):
+            val = int(m)
+            if 0 <= val < count:
+                ids.add(val)
+    for rule in checkpoint.rules:
+        for m in _EXPERT_ID_RE.findall(rule.pattern):
+            val = int(m)
+            if 0 <= val < count:
+                ids.add(val)
+        if rule.presence is not None and rule.presence.expert_indices:
+            present = [v for v in rule.presence.expert_indices if 0 <= v < count]
+            if present:
+                ids.add(min(present))
+                ids.add(max(present))
+    return tuple(sorted(ids))
+
+
+def _layer_prefix_for(checkpoint: CheckpointQuantMap, *, is_diffusion: bool) -> str:
+    if is_diffusion:
+        return "transformer_blocks"
+    for candidate in ("model.language_model.layers", "language_model.model.layers", "model.layers"):
+        marker = candidate + "."
+        if any(r.pattern.startswith(marker) for r in checkpoint.rules) or any(
+            e.pattern.startswith(marker) for e in checkpoint.layer_exceptions
+        ):
+            return candidate
+    return "model.layers"
+
+
+def _layer_roles_for(
+    plan: LayerPlan, checkpoint: CheckpointQuantMap, *, is_diffusion: bool,
+) -> list[tuple[str, int | None]]:
+    if is_diffusion:
+        return [(role, None) for role in _DIT_LAYER_ROLES]
+    attn_roles = (
+        (_MLA_Q_LORA_ATTN_ROLES if int(plan.q_lora_rank or 0) > 0 else _MLA_DIRECT_ATTN_ROLES)
+        if str(plan.attention or "").lower() == "mla"
+        else _GQA_ATTN_ROLES
+    )
+    roles: list[tuple[str, int | None]] = [(role, None) for role in attn_roles]
+    if str(plan.ffn or "").lower() == "moe" and int(plan.num_experts or 0) > 0:
+        for eid in _expert_boundary_ids(checkpoint, int(plan.num_experts)):
+            for suffix in _EXPERT_PROJECTION_SUFFIXES:
+                roles.append((f"mlp.experts.{eid}.{suffix}", eid))
+        if int(plan.num_shared_experts or 0) > 0:
+            roles.extend((role, None) for role in _SHARED_EXPERT_ROLES)
+    else:
+        roles.extend((role, None) for role in _DENSE_MLP_ROLES)
+    return roles
+
+
+def _synthesize_layer_plans(model: ModelSpec) -> tuple[LayerPlan, ...]:
+    if model.layer_plans:
+        return model.layer_plans
+    mla = model.mla
+    return tuple(
+        LayerPlan(
+            index=idx,
+            native_layer_id=idx,
+            attention=model.attention,
+            ffn=model.ffn,
+            num_heads=model.num_heads,
+            num_kv_heads=model.num_kv_heads or model.num_heads,
+            head_dim=model.head_dim,
+            q_lora_rank=mla.q_lora_rank if mla is not None else 0,
+            kv_lora_rank=mla.kv_lora_rank if mla is not None else 0,
+            qk_nope_head_dim=mla.qk_nope_head_dim if mla is not None else 0,
+            qk_rope_head_dim=mla.qk_rope_head_dim if mla is not None else 0,
+            v_head_dim=mla.v_head_dim if mla is not None else 0,
+            num_experts=model.num_experts,
+            top_k=model.top_k,
+            num_shared_experts=model.num_shared_experts,
+        )
+        for idx in range(model.layers)
+    )
+
+
+def _stars_replay_mode(
+    capture_rule: CaptureBucketRule | None, fallback_mode: CaptureMode,
+) -> Literal["eager", "captured_segment", "full_graph"]:
+    mode = capture_rule.mode if capture_rule is not None else fallback_mode
+    has_full = bool(capture_rule.full_keys) if capture_rule is not None else (mode in {"full", "full_decode_only", "full_and_piecewise"})
+    has_pw = bool(capture_rule.piecewise_keys) if capture_rule is not None else (mode in {"piecewise", "full_and_piecewise"})
+    if mode == "none":
+        return "eager"
+    if mode in {"full", "full_decode_only"}:
+        return "full_graph" if has_full else "eager"
+    if mode in {"piecewise", "full_and_piecewise"}:
+        if has_pw:
+            return "captured_segment"
+        if mode == "full_and_piecewise" and has_full:
+            return "full_graph"
+        return "eager"
+    return "eager"
+
+
+def _positive_option_int(value: Any, code: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ModelingError(f"{code}:{value!r}")
+    return int(value)
 
 
 def _parse_manifest_capture_mode(raw: Any) -> tuple[CaptureMode, str]:
@@ -400,13 +603,35 @@ class ManifestStackAdapter:
             )
         req = dict(requested_options)
         cap_mode: CaptureMode = "none" if track == "eager" else self._spec["capture_mode"]
-        capture_rule = CaptureBucketRule(mode=cap_mode, fallback_mode="eager")
+        full_keys = () if cap_mode in {"none", "piecewise"} else DEFAULT_FULL_CAPTURE_BUCKETS
+        pw_keys = () if cap_mode in {"none", "full", "full_decode_only"} else DEFAULT_PIECEWISE_BUCKETS
+        capture_rule = CaptureBucketRule(
+            mode=cap_mode,
+            full_keys=full_keys,
+            piecewise_keys=pw_keys,
+            fallback_mode="piecewise" if cap_mode == "full_and_piecewise" else "eager",
+        )
+        raw_kv_block = req.get("kv_block_size")
+        kv_block_size = (
+            _positive_option_int(raw_kv_block, "manifest_kv_block_size_invalid")
+            if raw_kv_block is not None
+            else DEFAULT_KV_BLOCK_SIZE
+        )
         dispositions = tuple((k, "accepted", "manifest_option_applied") for k in sorted(req))
         effective: dict[str, Any] = {
             "capture_mode": "eager" if cap_mode == "none" else self._spec["capture_mode_label"],
+            "kv_block_size": kv_block_size,
             "role": role,
             "manifest_source": self._spec["source_label"],
         }
+        if any(k in req for k in ("latent_patches", "cfg_branches", "text_encode_tokens")):
+            patches = _positive_option_int(req.get("latent_patches", DEFAULT_LATENT_PATCHES), "diffusion_latent_patches_invalid")
+            cfg = _positive_option_int(req.get("cfg_branches", DEFAULT_CFG_BRANCHES), "diffusion_cfg_branches_invalid")
+            text_toks = _positive_option_int(req.get("text_encode_tokens", DEFAULT_TEXT_ENCODE_TOKENS), "diffusion_text_tokens_invalid")
+            effective["latent_patches"] = patches
+            effective["cfg_branches"] = cfg
+            effective["text_encode_tokens"] = text_toks
+            effective["tokens_per_denoise_step"] = patches * cfg
         return ResolvedStackOptions(
             stack_id=self._capabilities.stack_id,
             track=track,
@@ -415,6 +640,8 @@ class ManifestStackAdapter:
             dispositions=dispositions,
             capture_rule=capture_rule,
             graph_capture_mode=cap_mode,
+            graph_capture_keys=full_keys,
+            piecewise_capture_keys=pw_keys,
         )
 
     def resolve_quant_instantiation(
@@ -428,46 +655,28 @@ class ManifestStackAdapter:
         role: str,
         phase: str,
     ) -> RuntimeQuantPlan:
-        del hardware, options
+        del hardware
         if phase not in self._capabilities.supported_phases:
             raise ModelingError(
                 f"stack_phase_unsupported:stack={self._capabilities.stack_id}:phase={phase}"
             )
         native_dtype = (checkpoint.native_float_dtype or model.activation_dtype or "bf16").strip().lower()
         is_diffusion = phase in DIFFUSION_PHASES
-        roles = _DIT_LAYER_ROLES if is_diffusion else _STANDARD_LAYER_ROLES
-        prefix = "transformer_blocks" if is_diffusion else "model.layers"
-        rule_by_pattern = {rule.pattern: rule for rule in checkpoint.rules}
+        prefix = _layer_prefix_for(checkpoint, is_diffusion=is_diffusion)
         port_abis: list[tuple[tuple[str, int, str], TensorPrecisionABI]] = []
         dispositions: list[tuple[str, str, str]] = []
-        layers: tuple[LayerPlan, ...] = model.layer_plans or tuple(
-            LayerPlan(
-                index=idx,
-                native_layer_id=idx,
-                attention=model.attention,
-                ffn=model.ffn,
-                num_heads=model.num_heads,
-                num_kv_heads=model.num_kv_heads or model.num_heads,
-                head_dim=model.head_dim,
-            )
-            for idx in range(model.layers)
-        )
+        layers = _synthesize_layer_plans(model)
         for plan in layers:
             native_id = plan.native_layer_id if plan.native_layer_id >= 0 else plan.index
-            for logical_role in roles:
+            for logical_role, expert_id in _layer_roles_for(plan, checkpoint, is_diffusion=is_diffusion):
                 tensor_path = f"{prefix}.{native_id}.{logical_role}"
-                raw_tag = resolve_checkpoint_tensor_tag(
+                tag, matched = _resolve_tag_and_rule(
                     checkpoint,
                     tensor_path,
                     scope="target",
                     source_native_layer_id=native_id,
+                    expert_id=expert_id,
                 )
-                matched = (
-                    rule_by_pattern.get(f"{prefix}.*.{logical_role}")
-                    or (rule_by_pattern.get("*.experts.*") if "experts." in logical_role else None)
-                    or rule_by_pattern.get("*")
-                )
-                tag = raw_tag if raw_tag is not None else (checkpoint.model_quant_type or "FLOAT")
                 abi = _manifest_abi_for_tag(tag, native_dtype, matched)
                 port_abis.append((("target", plan.index, logical_role), abi))
                 dispositions.append((tensor_path, tag, "manifest_checkpoint_precision_honored"))
@@ -480,9 +689,11 @@ class ManifestStackAdapter:
             idx_abis: tuple[CacheStateABI, ...] = ()
             rec_abis: tuple[CacheStateABI, ...] = ()
         else:
+            eff = dict(options.effective_mechanisms)
+            kv_block = int(eff.get("kv_block_size") or DEFAULT_KV_BLOCK_SIZE)
             kv_abis, idx_abis, rec_abis = resolve_checkpoint_cache_abis(
                 layers, checkpoint, parallel, native_dtype,
-                role=role, phase=phase, kv_block_size=DEFAULT_KV_BLOCK_SIZE,
+                role=role, phase=phase, kv_block_size=kv_block,
             )
         return RuntimeQuantPlan(
             checkpoint_digest=checkpoint.digest(),
@@ -525,7 +736,7 @@ class ManifestStackAdapter:
                     die_id=0,
                     stream_id="main",
                     owner_kind="aic",
-                    replay_mode="eager" if options.graph_capture_mode == "none" else "full_graph",
+                    replay_mode=_stars_replay_mode(options.capture_rule, options.graph_capture_mode),
                 ),
             ),
             chunked_prefill_enabled=not set(self._capabilities.supported_domains).issubset({"diffusion"}),
@@ -550,7 +761,7 @@ class ManifestStackAdapter:
         *,
         phase: str,
     ) -> IterationDecision:
-        del model, options
+        del model
         if phase not in self._capabilities.supported_phases:
             raise ModelingError(
                 f"stack_phase_unsupported:stack={self._capabilities.stack_id}:phase={phase}"
@@ -560,19 +771,95 @@ class ManifestStackAdapter:
                 next_ms = min(ts for _, ts in state.in_flight_completions)
                 return WaitForEvent(reason="completion", until_ms=next_ms)
             return SchedulerDone(completed_requests=len(state.request_progress))
+        eff = dict(options.effective_mechanisms)
+        priorities = dict(state.request_priorities)
         progress = {rid: (ctx, rem) for rid, ctx, rem in state.request_progress}
-        is_diffusion = phase in DIFFUSION_PHASES
-        views = tuple(
-            RequestView(
-                request_id=rid,
-                q_len=1 if phase == "decode" else max(1, progress.get(rid, (0, 1))[1]),
-                context=0 if is_diffusion else progress.get(rid, (0, 1))[0],
-                samples=(phase == "decode"),
-                phase=phase,
+        views: list[RequestView] = []
+        batch_budget = state.max_num_batched_tokens
+        used_tokens = 0
+        if phase in DIFFUSION_PHASES:
+            if phase == "denoise_step":
+                q_len = int(eff.get("tokens_per_denoise_step", DEFAULT_LATENT_PATCHES * DEFAULT_CFG_BRANCHES))
+                exec_mode = "denoise_timestep"
+            elif phase == "text_encode":
+                q_len = int(eff.get("text_encode_tokens", DEFAULT_TEXT_ENCODE_TOKENS))
+                exec_mode = "text_encode"
+            else:
+                q_len = int(eff.get("latent_patches", DEFAULT_LATENT_PATCHES))
+                exec_mode = "vae_decode"
+            for rid in state.ready_request_ids:
+                if len(views) >= state.max_num_seqs:
+                    break
+                if used_tokens + q_len > batch_budget:
+                    continue
+                views.append(
+                    RequestView(
+                        request_id=rid,
+                        q_len=q_len,
+                        context=0,
+                        samples=False,
+                        phase=phase,
+                        semantic_phase=phase,
+                        execution_mode=exec_mode,
+                        priority=priorities.get(rid, 0),
+                        draft_verify=False,
+                        draft_prepare=False,
+                    )
+                )
+                used_tokens += q_len
+        else:
+            input_budget = (
+                min(batch_budget, state.max_num_input_tokens)
+                if state.max_num_input_tokens is not None
+                else batch_budget
             )
-            for rid in state.ready_request_ids[: state.max_num_seqs]
-        )
-        return IterationPlan(requests=views, reason="scheduled", all_request_ids=state.ready_request_ids)
+            used_input_tokens = 0
+            for rid in state.ready_request_ids:
+                if len(views) >= state.max_num_seqs or used_tokens >= batch_budget:
+                    break
+                ctx, rem = progress.get(rid, (0, 0 if phase == "decode" else 1))
+                is_decode_req = phase == "decode" or (phase == "mixed" and rem <= 0)
+                if is_decode_req:
+                    q_len = 1
+                    if used_tokens + q_len > batch_budget:
+                        continue
+                    req_phase = "decode"
+                    samples = True
+                else:
+                    raw_q = max(1, rem)
+                    avail = min(batch_budget - used_tokens, input_budget - used_input_tokens)
+                    if avail <= 0:
+                        continue
+                    if state.chunked_prefill:
+                        q_len = min(raw_q, avail)
+                    elif raw_q <= avail:
+                        q_len = raw_q
+                    else:
+                        continue
+                    req_phase = "prefill"
+                    samples = q_len >= raw_q
+                    used_input_tokens += q_len
+                views.append(
+                    RequestView(
+                        request_id=rid,
+                        q_len=q_len,
+                        context=ctx,
+                        samples=samples,
+                        phase=req_phase,
+                        priority=priorities.get(rid, 0),
+                        draft_verify=False,
+                        draft_prepare=False,
+                    )
+                )
+                used_tokens += q_len
+        if not views:
+            if state.in_flight_completions:
+                next_ms = min(ts for _, ts in state.in_flight_completions)
+                return WaitForEvent(reason="completion", until_ms=next_ms)
+            raise ModelingError(
+                f"iteration_step_exceeds_token_budget:stack={self._capabilities.stack_id}:phase={phase}:budget={batch_budget}"
+            )
+        return IterationPlan(requests=tuple(views), reason="scheduled", all_request_ids=state.ready_request_ids)
 
     @property
     def launch_codec(self) -> LaunchConfigCodec | None:

@@ -32,7 +32,7 @@ from mindie_sim.prediction.operators.diffusion import (
 from mindie_sim.schema.checkpoint import CheckpointQuantMap, TensorQuantRule
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
-from mindie_sim.schema.model import ModelSpec
+from mindie_sim.schema.model import LayerPlan, ModelSpec
 from mindie_sim.schema.operators import KernelReadiness, TensorPrecisionABI
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.stack import (
@@ -229,6 +229,49 @@ def _native_float_dtype(model: ModelSpec, checkpoint: CheckpointQuantMap) -> str
 
 
 _abi_for_diffusion_tag = resolve_checkpoint_tensor_abi
+_A5_UNSUPPORTED_SPARSE_OPS = frozenset({"ada_bsa"})
+
+
+def _resolve_tag_and_rule(
+    checkpoint: CheckpointQuantMap,
+    tensor_path: str,
+    *,
+    scope: str = "target",
+    source_native_layer_id: int | None = None,
+) -> tuple[str, TensorQuantRule | None]:
+    raw = str(tensor_path or "").strip()
+    mod_path = raw[:-len(".weight")] if raw.endswith(".weight") else raw
+    exc_or_ign = checkpoint.resolve_exception_or_ignored(
+        mod_path, scope=scope, source_native_layer_id=source_native_layer_id,  # type: ignore[arg-type]
+    )
+    if exc_or_ign is not None:
+        return exc_or_ign, None
+    for rule in checkpoint.rules:
+        if rule.matches(
+            mod_path, scope=scope, source_native_layer_id=source_native_layer_id,  # type: ignore[arg-type]
+        ):
+            return rule.raw_tag, rule
+    if mod_path != raw:
+        exc_raw = checkpoint.resolve_exception_or_ignored(
+            raw, scope=scope, source_native_layer_id=source_native_layer_id,  # type: ignore[arg-type]
+        )
+        if exc_raw is not None:
+            return exc_raw, None
+        for rule in checkpoint.rules:
+            if rule.matches(
+                raw, scope=scope, source_native_layer_id=source_native_layer_id,  # type: ignore[arg-type]
+            ):
+                return rule.raw_tag, rule
+    if checkpoint.source_format == "unquantized_native":
+        return "FLOAT", None
+    if checkpoint.source_format == "hf_quantization_config":
+        for rule in checkpoint.rules:
+            if rule.pattern == "*":
+                return rule.raw_tag, rule
+    tag = checkpoint.resolve_raw_tag(
+        tensor_path, scope=scope, source_native_layer_id=source_native_layer_id,  # type: ignore[arg-type]
+    )
+    return (tag if tag is not None else (checkpoint.model_quant_type or "FLOAT")), None
 
 
 def _is_a5_hardware(hardware: Hardware) -> bool:
@@ -283,13 +326,17 @@ class DiffusionNativeStackAdapter:
         requested_options: Mapping[str, Any],
         field_origins: Mapping[str, str],
     ) -> ResolvedStackOptions:
-        del model, hardware, parallel, field_origins
+        del model, parallel, field_origins
         if track not in self._capabilities.supported_tracks:
             raise ModelingError(
                 f"stack_track_unsupported:stack={self._capabilities.stack_id}:track={track}"
             )
         req = dict(requested_options)
         cfg = DiffusionWorkloadConfig.from_options(req)
+        if track != "target" and _is_a5_hardware(hardware) and cfg.sparse_attention_op in _A5_UNSUPPORTED_SPARSE_OPS:
+            raise ModelingError(
+                f"diffusion_sparse_attention_op_unsupported_on_hardware:a5:{cfg.sparse_attention_op}"
+            )
         dispositions: list[tuple[str, str, str]] = []
         for key in sorted(req):
             if key in _LLM_ONLY_OPTION_KEYS:
@@ -354,22 +401,32 @@ class DiffusionNativeStackAdapter:
                 f"stack_phase_unsupported:stack={self._capabilities.stack_id}:phase={phase}"
             )
         native_dtype = _native_float_dtype(model, checkpoint)
-        rule_by_pattern = {rule.pattern: rule for rule in checkpoint.rules}
+        layers: tuple[LayerPlan, ...] = model.layer_plans or tuple(
+            LayerPlan(
+                index=idx,
+                native_layer_id=idx,
+                attention=model.attention,
+                ffn=model.ffn,
+                num_heads=model.num_heads,
+                num_kv_heads=model.num_kv_heads or model.num_heads,
+                head_dim=model.head_dim,
+            )
+            for idx in range(model.layers)
+        )
         port_abis: list[tuple[tuple[str, int, str], TensorPrecisionABI]] = []
         dispositions: list[tuple[str, str, str]] = []
-        for idx in range(model.layers):
+        for plan in layers:
+            native_id = plan.native_layer_id if plan.native_layer_id >= 0 else plan.index
             for logical_role in _DIT_LAYER_ROLES:
-                tensor_path = f"transformer_blocks.{idx}.{logical_role}"
-                raw_tag = checkpoint.resolve_raw_tag(
+                tensor_path = f"transformer_blocks.{native_id}.{logical_role}"
+                raw_tag, matched_rule = _resolve_tag_and_rule(
+                    checkpoint,
                     tensor_path,
                     scope="target",
-                    source_native_layer_id=idx,
+                    source_native_layer_id=native_id,
                 )
-                matched_rule = rule_by_pattern.get(f"transformer_blocks.*.{logical_role}")
-                if raw_tag is None:
-                    raw_tag = checkpoint.model_quant_type or "FLOAT"
                 abi = _abi_for_diffusion_tag(raw_tag, native_dtype, matched_rule)
-                port_abis.append((("target", idx, logical_role), abi))
+                port_abis.append((("target", plan.index, logical_role), abi))
                 dispositions.append((tensor_path, raw_tag, "diffusion_checkpoint_precision_honored"))
         for rule in checkpoint.rules:
             _abi_for_diffusion_tag(rule.raw_tag, native_dtype, rule)
@@ -412,6 +469,14 @@ class DiffusionNativeStackAdapter:
                 ("eagle_ffn", "mindie_sd_eagle_ffn", ()),
             ))
             sparse_op = str(eff.get("sparse_attention_op", "") or "").strip().lower()
+            if (
+                options.track != "target"
+                and _is_a5_hardware(hardware)
+                and sparse_op in _A5_UNSUPPORTED_SPARSE_OPS
+            ):
+                raise ModelingError(
+                    f"diffusion_sparse_attention_op_unsupported_on_hardware:a5:{sparse_op}"
+                )
             if sparse_op and sparse_op in MINDIE_SD_CUSTOM_OPS:
                 bindings.append((
                     sparse_op,
@@ -502,24 +567,38 @@ class DiffusionNativeStackAdapter:
             exec_mode = "vae_decode"
         priorities = dict(state.request_priorities)
         ordered = sorted(state.ready_request_ids, key=lambda rid: (-priorities.get(rid, 0), rid))
-        selected = ordered[: state.max_num_seqs]
-        views = tuple(
-            RequestView(
-                request_id=rid,
-                q_len=q_len,
-                context=0,
-                samples=False,
-                phase=phase,
-                semantic_phase=phase,
-                execution_mode=exec_mode,
-                priority=priorities.get(rid, 0),
-                draft_verify=False,
-                draft_prepare=False,
+        budget = state.max_num_batched_tokens
+        used_tokens = 0
+        views: list[RequestView] = []
+        for rid in ordered:
+            if len(views) >= state.max_num_seqs:
+                break
+            if used_tokens + q_len > budget:
+                continue
+            views.append(
+                RequestView(
+                    request_id=rid,
+                    q_len=q_len,
+                    context=0,
+                    samples=False,
+                    phase=phase,
+                    semantic_phase=phase,
+                    execution_mode=exec_mode,
+                    priority=priorities.get(rid, 0),
+                    draft_verify=False,
+                    draft_prepare=False,
+                )
             )
-            for rid in selected
-        )
+            used_tokens += q_len
+        if not views:
+            if state.in_flight_completions:
+                next_ms = min(ts for _, ts in state.in_flight_completions)
+                return WaitForEvent(reason="completion", until_ms=next_ms)
+            raise ModelingError(
+                f"iteration_step_exceeds_token_budget:stack={self._capabilities.stack_id}:phase={phase}:required={q_len}:budget={budget}"
+            )
         return IterationPlan(
-            requests=views,
+            requests=tuple(views),
             reason="scheduled_diffusion",
             all_request_ids=state.ready_request_ids,
         )
