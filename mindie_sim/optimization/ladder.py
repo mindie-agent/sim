@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Mapping
+import copy
 from dataclasses import dataclass, replace
 import hashlib
 import json
@@ -555,6 +556,183 @@ def solve_unified_regions(
     )
 
 
+_DIFFUSION_DOMAIN_TOKENS = (
+    "dit", "diffusion", "unet", "hunyuan_video", "hunyuan-video",
+    "wan", "flux", "sd3", "cogvideo", "sora",
+)
+
+
+def _infer_case_workload_domain(case: Case) -> str:
+    """Infer canonical ``WorkloadDomain`` structurally without importing ``compose``."""
+    meta = dict(case.runtime.metadata)
+    declared = str(meta.get("workload_domain") or "").strip().lower()
+    if declared in {"llm", "vlm", "diffusion", "custom"}:
+        return declared
+    model = case.model
+    model_meta = dict(getattr(model, "metadata", ()) or ())
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    explicit = str(model_meta.get("domain") or facts.get("workload_domain") or "").strip().lower()
+    if explicit in {"llm", "vlm", "diffusion", "custom"}:
+        return explicit
+    for plan in getattr(model, "layer_plans", ()) or ():
+        arch = str(getattr(plan, "architecture", "") or "").lower()
+        if any(tok in arch for tok in _DIFFUSION_DOMAIN_TOKENS):
+            return "diffusion"
+    model_type = str(facts.get("model_type") or facts.get("family") or "").strip().lower()
+    if any(tok in model_type for tok in _DIFFUSION_DOMAIN_TOKENS):
+        return "diffusion"
+    if getattr(model, "vision", None) is not None or bool(facts.get("vision_present")):
+        return "vlm"
+    return "llm"
+
+
+def _hardware_backend_for_case(case: Case) -> str:
+    from mindie_sim.stacks.registry import normalize_hardware_backend
+
+    machine = case.machine
+    arch_family = str(getattr(machine, "arch_family", "") or "").strip()
+    if arch_family and arch_family.lower() not in {"generic", "unknown", "other"}:
+        norm = normalize_hardware_backend(arch_family)
+        return norm if norm in {"ascend", "nvidia"} else "generic"
+    assumptions = dict(getattr(machine, "assumptions", ()) or ())
+    if "generic_accelerator" in str(assumptions.get("custom_hardware", "") or "").lower():
+        return "generic"
+    die_arch = getattr(machine.dies[0], "arch_family", None) if getattr(machine, "dies", ()) else None
+    for raw in (die_arch, getattr(machine, "sku", None), getattr(machine, "name", None)):
+        norm = normalize_hardware_backend(raw)
+        if norm in {"ascend", "nvidia"}:
+            return norm
+    return "generic"
+
+
+def _canonicalize_stack_id(raw_id: str) -> str:
+    cleaned = raw_id.strip()
+    low = cleaned.lower()
+    if low == "cann93_va_main" or Path(cleaned).expanduser().is_file():
+        return cleaned
+    from mindie_sim.stacks.registry import default_registry
+
+    try:
+        return default_registry().get(cleaned).capabilities().stack_id
+    except ModelingError:
+        return cleaned
+
+
+def _resolve_ladder_stack_id(case: Case, stack_id: str | None) -> str:
+    """Resolve canonical stack identity from explicit arg, bound case metadata, or domain/hardware registry."""
+    if stack_id is not None and str(stack_id).strip():
+        return _canonicalize_stack_id(str(stack_id))
+    from mindie_sim.prediction.spine import _bound_stack_id_for_case
+    from mindie_sim.stacks.registry import DEFAULT_DOMAIN_WORK_UNITS, resolve_stack_for_scenario
+
+    bound = _bound_stack_id_for_case(case)
+    if bound:
+        return _canonicalize_stack_id(bound)
+    domain = _infer_case_workload_domain(case)
+    work_unit = DEFAULT_DOMAIN_WORK_UNITS.get(domain, "prefill_decode_step")  # type: ignore[arg-type]
+    adapter = resolve_stack_for_scenario(
+        requested_stack=None,
+        workload_domain=domain,  # type: ignore[arg-type]
+        work_unit=work_unit,
+        hardware_family=_hardware_backend_for_case(case),
+    )
+    return adapter.capabilities().stack_id
+
+
+def _normalize_case_for_stack_override(case: Case, eff_stack_id: str) -> Case:
+    """Strip inherited vendor fusion/capture state when caller explicitly selects ``raw-eager``."""
+    if eff_stack_id.strip().lower() not in {"raw-eager", "raw_eager"}:
+        return case
+    kernels = copy.deepcopy(dict(case.runtime.kernels))
+    kernels.pop("lowerings", None)
+    meta = copy.deepcopy(dict(case.runtime.metadata))
+    meta["stack_id"] = "raw-eager"
+    policy = dict(meta.get("execution_policy") or {})
+    policy["raw_eager"] = True
+    policy["automatic_optional_fusions"] = False
+    policy["graph_capture_mode"] = "none"
+    meta["execution_policy"] = policy
+    origins = meta.get("recipe_binding_origins")
+    if isinstance(origins, dict):
+        origins = dict(origins)
+        origins.pop("lowerings", None)
+        meta["recipe_binding_origins"] = origins
+    kept_passes = tuple(
+        p for p in case.runtime.lowering_passes if p == "activation_quantization"
+    )
+    runtime = replace(
+        case.runtime,
+        kernels=kernels,
+        lowering_passes=kept_passes,
+        graph_capture_mode="none",
+        graph_capture_keys=(),
+        metadata=tuple(meta.items()),
+    )
+    return replace(case, runtime=runtime)
+
+
+def _ensure_spine_for_stack(spine: Any, stack_id: str) -> Any:
+    """Return a call-scoped spine recognizing registered non-vendor stacks without mutating globals."""
+    from mindie_sim.feature_mechanisms import (
+        RUNTIME_STACKS,
+        RuntimeStackProfile,
+        SoftwareStackRegistry,
+        SoftwareStackSpec,
+    )
+    from mindie_sim.prediction.spine import PredictionSpine
+    from mindie_sim.stacks.registry import default_registry
+
+    key = stack_id.strip().lower()
+    if key in {"cann93_va_main", "raw-eager"} or key in RUNTIME_STACKS or Path(stack_id).expanduser().is_file():
+        return spine
+    if spine is not None and not isinstance(spine, PredictionSpine):
+        return spine
+    base = PredictionSpine() if spine is None else spine
+    if not isinstance(getattr(base, "stacks", None), SoftwareStackRegistry):
+        return spine
+    if key in base.stacks.list_stacks():
+        return spine
+    try:
+        cap = default_registry().get(stack_id).capabilities()
+    except ModelingError:
+        return spine
+    specs = [base.stacks.get(name) for name in base.stacks.list_stacks()]
+    is_ideal = cap.stack_id == "ideal-target"
+    default_track = (
+        "eager" if cap.supported_tracks == ("eager",)
+        else ("target" if is_ideal or ("target" in cap.supported_tracks and "shipping" not in cap.supported_tracks)
+              else "shipping")
+    )
+    capture_mode = (
+        "none"
+        if (is_ideal or cap.supported_tracks == ("eager",) or "decode" not in cap.supported_phases)
+        else "full"
+    )
+    specs.append(SoftwareStackSpec(
+        name=cap.stack_id,
+        repository=cap.stack_id,
+        description=f"Registered stack adapter {cap.stack_id}",
+        profile=RuntimeStackProfile(
+            name=cap.stack_id,
+            repository=cap.stack_id,
+            description=f"Registered stack adapter {cap.stack_id}",
+            bindings=(),
+        ),
+        default_track=default_track,
+        decode_capture_mode=capture_mode,
+    ))
+    new_stacks = SoftwareStackRegistry(specs)
+    if type(base) is PredictionSpine:
+        return PredictionSpine(
+            stacks=new_stacks,
+            rewrite=base.rewrite,
+            families=base.families,
+        )
+    cloned = copy.copy(base)
+    cloned.stacks = new_stacks
+    return cloned
+
+
 def solve_five_level_ladder(
     case,
     request: StepRequest,
@@ -563,18 +741,22 @@ def solve_five_level_ladder(
     replay: ReplayOptions = ReplayOptions(),
     primitives=None,
     primitive_table: CapacityTable | None = None,
-    stack_id: str = "cann93_va_main",
+    stack_id: str | None = None,
     max_trials: int = DEFAULT_LADDER_TRIALS,
     allow_unbound_formula: bool = False,
 ) -> FiveLevelReport:
     from mindie_sim.rewrite.oracle import EvalBudget, ScenarioRequest, _baseline, prepare_scenario
     from mindie_sim.rewrite.verify import SoundnessInversionError
 
-    scenario_request = ScenarioRequest(case, request, stack_id, replay, primitive_table=primitive_table)
+    parsed_case = Case.from_mapping(case)
+    eff_stack_id = _resolve_ladder_stack_id(parsed_case, stack_id)
+    eff_case = _normalize_case_for_stack_override(parsed_case, eff_stack_id)
+    eff_spine = _ensure_spine_for_stack(spine, eff_stack_id)
+    scenario_request = ScenarioRequest(eff_case, request, eff_stack_id, replay, primitive_table=primitive_table)
     dossier = prepare_scenario(
         scenario_request,
         budget=EvalBudget(deadline_mono=replay.deadline_mono),
-        spine=spine,
+        spine=eff_spine,
         primitives=primitives,
         primitive_table=primitive_table,
         allow_unbound_formula=bool(allow_unbound_formula),
@@ -636,11 +818,14 @@ def solve_five_level_ladder(
         (100 * deltas[-1] / lower_bound) if lower_bound else None,
     )
 
-    evaluations = (
-        _step(_field(dossier, "unmerge_eval", "unmerge")),
-        _step(_field(dossier, "mainline_eval", "mainline")),
-        _step(framework.best_eval),
-        _step(dsl.best_eval),
+    evaluations = tuple(
+        replace(ev, stack_id=ev.stack_id or eff_stack_id)
+        for ev in (
+            _step(_field(dossier, "unmerge_eval", "unmerge")),
+            _step(_field(dossier, "mainline_eval", "mainline")),
+            _step(framework.best_eval),
+            _step(dsl.best_eval),
+        )
     )
     regions = _by_region(evaluations)
     reconciliation = tuple(
@@ -719,94 +904,155 @@ def _resolve_primitive_table_digest(handle: Any, case: Case, explicit_table: Any
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _accumulate_die_cache_pools(base_die: Any, delta_die: Any, zero_die: Any) -> Any:
-    """Add dynamic cache-pool deltas from ``delta_die - zero_die`` onto ``base_die``."""
-    d_kv_a = int(delta_die.kv_cache_allocated_bytes) - int(zero_die.kv_cache_allocated_bytes)
-    d_kv_v = int(delta_die.kv_cache_valid_bytes) - int(zero_die.kv_cache_valid_bytes)
-    d_idx_a = int(delta_die.index_cache_allocated_bytes) - int(zero_die.index_cache_allocated_bytes)
-    d_idx_v = int(delta_die.index_cache_valid_bytes) - int(zero_die.index_cache_valid_bytes)
-    d_rec = int(delta_die.recurrent_state_bytes) - int(zero_die.recurrent_state_bytes)
-    d_drf = int(delta_die.draft_cache_bytes) - int(zero_die.draft_cache_bytes)
-    d_live = d_kv_a + d_idx_a + d_rec + d_drf
-    new_live = int(base_die.simultaneous_live_hbm_bytes) + d_live
-    new_peak = max(new_live, int(base_die.simultaneous_peak_hbm_bytes) + d_live)
-    load_delta = int(base_die.load_peak_hbm_bytes) - int(base_die.simultaneous_peak_hbm_bytes)
-    return replace(
-        base_die,
-        kv_cache_allocated_bytes=int(base_die.kv_cache_allocated_bytes) + d_kv_a,
-        kv_cache_valid_bytes=int(base_die.kv_cache_valid_bytes) + d_kv_v,
-        index_cache_allocated_bytes=int(base_die.index_cache_allocated_bytes) + d_idx_a,
-        index_cache_valid_bytes=int(base_die.index_cache_valid_bytes) + d_idx_v,
-        recurrent_state_bytes=int(base_die.recurrent_state_bytes) + d_rec,
-        draft_cache_bytes=int(base_die.draft_cache_bytes) + d_drf,
-        simultaneous_live_hbm_bytes=new_live,
-        simultaneous_peak_hbm_bytes=new_peak,
-        load_peak_hbm_bytes=new_peak + max(0, load_delta),
-        free_hbm_headroom_bytes=int(base_die.usable_hbm_bytes) - new_peak,
+def _replica_batch_counts(case: Case, seqs: Any) -> int | tuple[int, ...]:
+    """Map scalar or cohort sequence counts onto physical DP replicas via canonical ``cohorts``."""
+    if not (isinstance(seqs, (tuple, list)) and seqs):
+        return max(0, int(seqs)) if seqs is not None else 1
+    per_rep = tuple(max(0, int(s)) for s in seqs)
+    dp = max(1, int(case.runtime.parallel.dp))
+    if len(per_rep) == dp:
+        return per_rep
+    if len(set(per_rep)) == 1:
+        return per_rep[0]
+    from mindie_sim.prediction.execution.dispatch import cohorts
+
+    groups = tuple(tuple(int(r) for r in g) for g in cohorts(case.runtime.parallel, case.machine))
+    if groups and all(len(g) == len(per_rep) for g in groups):
+        by_rep = [0] * dp
+        for group in groups:
+            for pos, rep in enumerate(group):
+                if 0 <= rep < dp:
+                    by_rep[rep] = per_rep[pos]
+        return tuple(by_rep)
+    return tuple(
+        per_rep[rep] if rep < len(per_rep) else per_rep[-1]
+        for rep in range(dp)
     )
 
 
-def _compute_resident_memory_receipt(case: Case, request: StepRequest) -> Any:
-    """Compute canonical ``ResidentMemoryReceipt`` from resolved request views / per-replica batches."""
+def _scalar_shared_prefix_views(
+    case: Case,
+    request: StepRequest,
+    batch_per_dp: int | tuple[int, ...],
+    *,
+    ctx: int,
+    q_tok: int,
+) -> tuple[tuple[Any, ...] | None, dict[int, tuple[Any, ...]] | None]:
+    """Preserve shared-prefix identity from ``case.workload.requests`` on scalar-batch steps."""
+    if getattr(case.runtime, "prefix_cache_mode", "private") != "shared":
+        return None, None
+    wl_reqs = tuple(getattr(getattr(case, "workload", None), "requests", ()) or ())
+    if not wl_reqs:
+        return None, None
+    if not any(
+        (max(0, min(ctx, int(getattr(spec, "prefix_tokens", 0) or 0))) > 0)
+        or str(getattr(spec, "prefix_cache_key", "") or "")
+        for spec in wl_reqs
+    ):
+        return None, None
+    from mindie_sim.schema.workload import RequestView
+
+    def _make_views(rep: int, count: int) -> tuple[RequestView, ...]:
+        views: list[RequestView] = []
+        for idx in range(max(0, count)):
+            spec = wl_reqs[idx % len(wl_reqs)]
+            p_tok = max(0, min(ctx, int(getattr(spec, "prefix_tokens", 0) or 0)))
+            p_key = str(getattr(spec, "prefix_cache_key", "") or "")
+            views.append(RequestView(
+                request_id=f"analysis{rep}:{idx}",
+                q_len=q_tok,
+                context=ctx,
+                samples=(request.phase == "decode"),
+                phase=request.phase,
+                prefix_tokens=p_tok,
+                prefix_cache_key=p_key,
+            ))
+        return tuple(views)
+
+    if isinstance(batch_per_dp, tuple):
+        return None, {rep: _make_views(rep, count) for rep, count in enumerate(batch_per_dp)}
+    return _make_views(0, batch_per_dp), None
+
+
+def _compute_resident_memory_receipt(
+    case: Case,
+    request: StepRequest,
+    *,
+    lowered_views: Mapping[int, Any] | None = None,
+) -> Any:
+    """Forward original request views / per-replica batches directly to ``Memory.resident_memory_receipt``."""
     mem = Memory(case)
-    raw_views = tuple(getattr(request, "requests", ()) or ())
-    if raw_views:
-        views = tuple(v for v in raw_views if not getattr(v, "padding", False))
-        if not views:
-            return mem.resident_memory_receipt(
-                phase=request.phase, sequence_tokens=1, batch_per_dp=0, query_tokens=1,
-            )
-        buckets: dict[tuple[int, int], int] = {}
-        for view in views:
-            q_v = max(1, int(view.q_len) + int(getattr(view, "draft_proposal_tokens", 0) or 0))
-            seq_v = max(1, max(0, int(view.context)) + q_v)
-            buckets[(seq_v, q_v)] = buckets.get((seq_v, q_v), 0) + 1
-        if len(buckets) == 1:
-            (seq_v, q_v), count = next(iter(buckets.items()))
-            return mem.resident_memory_receipt(
-                phase=request.phase, sequence_tokens=seq_v, batch_per_dp=count, query_tokens=q_v,
-            )
-        zero_rec = mem.resident_memory_receipt(
-            phase=request.phase, sequence_tokens=1, batch_per_dp=0, query_tokens=1,
+    raw_by_replica = getattr(request, "request_views_by_replica", None)
+    if raw_by_replica is None:
+        raw_by_replica = getattr(request, "requests_by_replica", None)
+    if raw_by_replica is not None:
+        return mem.resident_memory_receipt(
+            phase=request.phase,
+            request_views_by_replica=raw_by_replica,
         )
-        acc_dies = list(zero_rec.dies)
-        for (seq_v, q_v), count in buckets.items():
-            sub_rec = mem.resident_memory_receipt(
-                phase=request.phase, sequence_tokens=seq_v, batch_per_dp=count, query_tokens=q_v,
+    raw_requests = getattr(request, "requests", ()) or ()
+    if isinstance(raw_requests, Mapping):
+        return mem.resident_memory_receipt(
+            phase=request.phase,
+            request_views_by_replica=raw_requests,
+        )
+    raw_views = tuple(raw_requests)
+    if raw_views:
+        if isinstance(raw_views[0], (tuple, list)):
+            return mem.resident_memory_receipt(
+                phase=request.phase,
+                request_views_by_replica=raw_views,
             )
-            acc_dies = [
-                _accumulate_die_cache_pools(cur, sub_d, z_d)
-                for cur, sub_d, z_d in zip(acc_dies, sub_rec.dies, zero_rec.dies, strict=True)
-            ]
-        return replace(zero_rec, dies=tuple(acc_dies))
+        return mem.resident_memory_receipt(
+            phase=request.phase,
+            request_views=raw_views,
+        )
+
+    dp = max(1, int(case.runtime.parallel.dp))
+    if isinstance(lowered_views, Mapping) and lowered_views:
+        if all(rep in lowered_views for rep in range(dp)):
+            return mem.resident_memory_receipt(
+                phase=request.phase,
+                request_views_by_replica=lowered_views,
+            )
+        from mindie_sim.prediction.execution.dispatch import cohorts
+
+        groups = tuple(tuple(int(r) for r in g) for g in cohorts(case.runtime.parallel, case.machine))
+        src_group = next((g for g in groups if g and all(r in lowered_views for r in g)), None)
+        if src_group is not None and all(len(g) == len(src_group) for g in groups):
+            expanded = {
+                rep: tuple(lowered_views[src_group[pos]])
+                for group in groups
+                for pos, rep in enumerate(group)
+                if 0 <= rep < dp
+            }
+            if len(expanded) == dp:
+                return mem.resident_memory_receipt(
+                    phase=request.phase,
+                    request_views_by_replica=expanded,
+                )
 
     ctx = max(0, int(request.context or 0))
     q_tok = max(1, int(request.tokens or 1))
     seq_len = max(1, ctx + q_tok)
-    seqs = request.sequences
-    if isinstance(seqs, (tuple, list)) and seqs:
-        per_rep = tuple(max(0, int(s)) for s in seqs)
-        if len(set(per_rep)) == 1:
-            return mem.resident_memory_receipt(
-                phase=request.phase, sequence_tokens=seq_len, batch_per_dp=per_rep[0], query_tokens=q_tok,
-            )
-        by_batch = {
-            b: mem.resident_memory_receipt(
-                phase=request.phase, sequence_tokens=seq_len, batch_per_dp=b, query_tokens=q_tok,
-            )
-            for b in set(per_rep)
-        }
-        template = by_batch[per_rep[0]]
-        dies = []
-        for idx, die in enumerate(template.dies):
-            rep_b = per_rep[die.replica] if 0 <= die.replica < len(per_rep) else per_rep[-1]
-            dies.append(by_batch[rep_b].dies[idx])
-        return replace(template, dies=tuple(dies))
-    batch = max(0, int(seqs)) if seqs is not None else 1
+    batch_per_dp = _replica_batch_counts(case, request.sequences)
+    shared_views, shared_by_rep = _scalar_shared_prefix_views(
+        case, request, batch_per_dp, ctx=ctx, q_tok=q_tok,
+    )
+    if shared_by_rep is not None:
+        return mem.resident_memory_receipt(
+            phase=request.phase,
+            request_views_by_replica=shared_by_rep,
+        )
+    if shared_views is not None:
+        return mem.resident_memory_receipt(
+            phase=request.phase,
+            request_views=shared_views,
+        )
     return mem.resident_memory_receipt(
         phase=request.phase,
         sequence_tokens=seq_len,
-        batch_per_dp=batch,
+        batch_per_dp=batch_per_dp,
         query_tokens=q_tok,
     )
 
@@ -842,6 +1088,7 @@ def _build_stage_receipt(
     plan_digest: str,
     l_star_ns: int,
     memory_receipt: Any,
+    stack_id: str = "",
     status: StageCommitStatus = "committed",
     rejection_reason: str = "",
 ) -> StageReceipt:
@@ -851,7 +1098,8 @@ def _build_stage_receipt(
         raise ModelingError(
             f"stage_receipt_primitive_table_digest_mismatch:{stage_id}:{existing_pt}!={primitive_table_digest}"
         )
-    bound_eval = replace(step_eval, primitive_table_digest=primitive_table_digest)
+    eff_eval_stack = str(getattr(step_eval, "stack_id", "") or "").strip() or stack_id
+    bound_eval = replace(step_eval, primitive_table_digest=primitive_table_digest, stack_id=eff_eval_stack)
     by_occ: dict[str, int] = defaultdict(int)
     idle_ns = 0
     for owner, duration in _partition(bound_eval):
@@ -945,6 +1193,7 @@ def _evaluate_stage1_ops_config(
     pt_digest: str,
     mem_receipt: Any,
     max_trials: int,
+    stack_id: str = "",
 ) -> tuple[StageReceipt, FrameworkSolveResult | None, DualSubgradientReport | None]:
     """Stage 1: optimize merged shipping stack ops/config/collective/stream/prefetch switches."""
     from mindie_sim.rewrite.oracle import _baseline
@@ -981,6 +1230,7 @@ def _evaluate_stage1_ops_config(
         plan_digest=plan_sha256(ship_result.best_plan),
         l_star_ns=l_star_1,
         memory_receipt=mem_receipt,
+        stack_id=stack_id,
     )
     return stage1, ship_result, pricing
 
@@ -999,6 +1249,7 @@ def _evaluate_stage2_framework(
     pt_digest: str,
     mem_receipt: Any,
     max_trials: int,
+    stack_id: str = "",
 ) -> tuple[StageReceipt, FrameworkSolveResult | None, DualSubgradientReport | None]:
     """Stage 2: evaluate unmerged PR ``ManifestBinding`` switches on top of Stage 1."""
     from mindie_sim.rewrite.oracle import _baseline
@@ -1041,6 +1292,7 @@ def _evaluate_stage2_framework(
         plan_digest=plan_sha256(framework_result.best_plan),
         l_star_ns=l_star_2,
         memory_receipt=mem_receipt,
+        stack_id=stack_id,
     )
     return stage2, framework_result, eff_pricing
 
@@ -1060,6 +1312,7 @@ def _evaluate_stage3_target(
     mem_receipt: Any,
     max_trials: int,
     allow_unbound_formula: bool,
+    stack_id: str = "",
 ) -> StageReceipt:
     from mindie_sim.rewrite.oracle import _baseline, finalize_plan
     from mindie_sim.rewrite.schema import plan_sha256
@@ -1116,6 +1369,7 @@ def _evaluate_stage3_target(
             plan_digest=plan_sha256(ext_plan),
             l_star_ns=l_star_3,
             memory_receipt=mem_receipt,
+            stack_id=stack_id,
         )
     if framework_result is None:
         raise ModelingError("target_stage_requires_framework_seed")
@@ -1146,6 +1400,7 @@ def _evaluate_stage3_target(
         plan_digest=plan_sha256(unified.best_plan),
         l_star_ns=l_star_3,
         memory_receipt=mem_receipt,
+        stack_id=stack_id,
     )
 
 
@@ -1157,7 +1412,7 @@ def solve_target_step_receipt(
     replay: ReplayOptions = ReplayOptions(),
     primitives=None,
     primitive_table: CapacityTable | None = None,
-    stack_id: str = "cann93_va_main",
+    stack_id: str | None = None,
     stack_track: StackTrack = "target",
     comparison_policy: ComparisonPolicy = "monotonic_optimization",
     rewrite_plan: RewritePlan | Mapping[str, Any] | str | Path | None = None,
@@ -1169,18 +1424,20 @@ def solve_target_step_receipt(
     from mindie_sim.rewrite.schema import load_rewrite_plan, plan_sha256
 
     parsed_case = Case.from_mapping(case)
+    eff_stack_id = _resolve_ladder_stack_id(parsed_case, stack_id)
+    eff_case = _normalize_case_for_stack_override(parsed_case, eff_stack_id)
+    eff_spine = _ensure_spine_for_stack(spine, eff_stack_id)
     ext_plan = load_rewrite_plan(rewrite_plan) if rewrite_plan is not None else None
     budget = EvalBudget(deadline_mono=replay.deadline_mono)
     dossier = prepare_scenario(
-        ScenarioRequest(parsed_case, request, stack_id, replay, primitive_table=primitive_table),
+        ScenarioRequest(eff_case, request, eff_stack_id, replay, primitive_table=primitive_table),
         budget=budget,
-        spine=spine,
+        spine=eff_spine,
         primitives=primitives,
         primitive_table=primitive_table,
         allow_unbound_formula=bool(allow_unbound_formula),
     )
-    pt_digest = _resolve_primitive_table_digest(dossier.handle, parsed_case, primitive_table)
-    mem_receipt = _compute_resident_memory_receipt(parsed_case, request)
+    pt_digest = _resolve_primitive_table_digest(dossier.handle, eff_case, primitive_table)
     unmerge_plan, mainline_plan = _seed_plans(dossier)
 
     base_track: StackTrack = "eager" if stack_track == "eager" else "shipping"
@@ -1191,6 +1448,8 @@ def solve_target_step_receipt(
         else _field(dossier, "mainline_eval", "mainline")
     )
     base_resolved = _baseline(dossier.handle, base_plan).scenario
+    lowered_views = getattr(getattr(getattr(base_resolved, "atomic_step", None), "graph", None), "request_views", None)
+    mem_receipt = _compute_resident_memory_receipt(eff_case, request, lowered_views=lowered_views)
     l_star_0 = _certify_stage_l_star(base_resolved, primitive_table=primitive_table)
     stage0 = _build_stage_receipt(
         stage_id="before_merged",
@@ -1201,6 +1460,7 @@ def solve_target_step_receipt(
         plan_digest=plan_sha256(base_plan),
         l_star_ns=l_star_0,
         memory_receipt=mem_receipt,
+        stack_id=eff_stack_id,
     )
     stage1, stage1_result, pricing = _evaluate_stage1_ops_config(
         dossier,
@@ -1213,6 +1473,7 @@ def solve_target_step_receipt(
         pt_digest=pt_digest,
         mem_receipt=mem_receipt,
         max_trials=max_trials,
+        stack_id=eff_stack_id,
     )
     stage2, framework_result, pricing = _evaluate_stage2_framework(
         dossier,
@@ -1227,6 +1488,7 @@ def solve_target_step_receipt(
         pt_digest=pt_digest,
         mem_receipt=mem_receipt,
         max_trials=max_trials,
+        stack_id=eff_stack_id,
     )
     stage3 = _evaluate_stage3_target(
         dossier,
@@ -1242,6 +1504,7 @@ def solve_target_step_receipt(
         mem_receipt=mem_receipt,
         max_trials=max_trials,
         allow_unbound_formula=allow_unbound_formula,
+        stack_id=eff_stack_id,
     )
     last_committed = stage3 if stage3.status == "committed" else stage2
     return EngineStepReceipt(

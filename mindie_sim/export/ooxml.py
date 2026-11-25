@@ -151,6 +151,7 @@ class Worksheet:
         self.title = str(title)
         self._cells: dict[tuple[int, int], _CellRecord] = {}
         self._merges: list[tuple[int, int, int, int, str]] = []
+        self._merged_non_anchors: dict[tuple[int, int], str] = {}
         self._validations: list[_DataValidation] = []
         self._col_widths: dict[int, float] = {}
         self._row_heights: dict[int, float] = {}
@@ -202,6 +203,11 @@ class Worksheet:
         r_idx, c_idx = int(row), int(col)
         if r_idx < 1 or c_idx < 1:
             raise ValueError(f"invalid_xlsx_cell_coord:({r_idx},{c_idx})")
+        merge_ref = self._merged_non_anchors.get((r_idx, c_idx))
+        if merge_ref is not None and (value is not None or formula is not None):
+            raise ValueError(
+                f"merged_non_anchor_cell_operand_write:{cell_ref(r_idx, c_idx)}:{merge_ref}"
+            )
         if value is not None and not isinstance(value, (bool, int, float, str)):
             raise TypeError(
                 f"non_primitive_xlsx_cell_value:{r_idx}:{c_idx}:{type(value).__name__}"
@@ -239,8 +245,12 @@ class Worksheet:
         anchor_style = anchor.style if anchor is not None else STYLE_MERGED
         for r in range(r1, r2 + 1):
             for c in range(c1, c2 + 1):
-                if (r, c) != (r1, c1) and (r, c) not in self._cells:
-                    self._cells[(r, c)] = _CellRecord(value=None, style=anchor_style)
+                if (r, c) == (r1, c1):
+                    continue
+                self._merged_non_anchors[(r, c)] = canonical
+                existing_cell = self._cells.get((r, c))
+                cell_style = existing_cell.style if existing_cell is not None else anchor_style
+                self._cells[(r, c)] = _CellRecord(value=None, formula=None, style=cell_style)
 
     def merge_range(self, r1: int, c1: int, r2: int, c2: int) -> None:
         if r1 == r2 and c1 == c2:
