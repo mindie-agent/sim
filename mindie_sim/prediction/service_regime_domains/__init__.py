@@ -26,8 +26,6 @@ from ..response_functions import (
     ResponseFunction,
     nonnegative,
     positive,
-    provenance_roles,
-    same_declared_value,
 )
 
 from .geometry import (
@@ -66,35 +64,6 @@ from .geometry import (
     _response,
     _shared_face,
 )
-from .work import (
-    _attr,
-    _evaluate_work_reference,
-    _fragment_for,
-    _owner_units,
-    _resolve_actual_work,
-    _resource_identity,
-    _service_stage_overlap,
-    _stage,
-    _stage_resource_aliases,
-    _stage_work,
-    _undelivered_stage_work,
-)
-from .migration import (
-    evaluate_migration_binding,
-    _FIXED_EVIDENCE_KINDS,
-    _MISSING,
-    _actual_native,
-    _condition_check,
-    _first_invocation_stage,
-    _fixed_check_stage,
-    _fixed_effect_text,
-    _fixed_occurrence_stage,
-    _fixed_rows,
-    _identification_problems,
-    _invocation_evidence,
-    _invocation_fixed_occurrence,
-    _service_problem,
-)
 
 
 __all__ = [
@@ -112,14 +81,11 @@ __all__ = [
     "annotations",
     "compile_service_regime_domains",
     "dataclass",
-    "evaluate_migration_binding",
     "json",
     "math",
     "nonnegative",
     "positive",
     "product",
-    "provenance_roles",
     "rules_overlap",
-    "same_declared_value",
     "validate_service_regime_domains",
 ]

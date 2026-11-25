@@ -34,32 +34,9 @@ from .evaluation import (
     _pairs,
     _value,
 )
-from .migration import (
-    MIGRATION_FIXED_FIELDS,
-    MIGRATION_PLAN_FIELDS,
-    MIGRATION_REPLACEMENT_KINDS,
-    MIGRATION_SCOPES,
-    MIGRATION_WORK_FIELDS,
-    normalize_migration_plan,
-    provenance_roles,
-    same_declared_value,
-    _OTHER_SOURCE_FIELDS,
-    _TRAINING_FIELDS,
-    _VALIDATION_FIELDS,
-    _WORK_SCOPES,
-    _fragment_evidence,
-    _plan_text,
-    _program_view,
-    _role_tokens,
-)
 
 
 __all__ = [
-    "MIGRATION_FIXED_FIELDS",
-    "MIGRATION_PLAN_FIELDS",
-    "MIGRATION_REPLACEMENT_KINDS",
-    "MIGRATION_SCOPES",
-    "MIGRATION_WORK_FIELDS",
     "Mapping",
     "ModelingError",
     "ResponseFunction",
@@ -68,10 +45,7 @@ __all__ = [
     "dataclass",
     "math",
     "nonnegative",
-    "normalize_migration_plan",
     "positive",
     "product",
-    "provenance_roles",
-    "same_declared_value",
     "scaled_coordinate",
 ]

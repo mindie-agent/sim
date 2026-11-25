@@ -103,7 +103,6 @@ _DOMAIN_COPY_OPERATORS = frozenset({
 })
 _LEGACY_SHARD_FILES = frozenset()
 _LEGACY_PRIVATE_SHARD_FILES = frozenset({
-    "mindie_sim/optimization/_dual_obligations.py",
     "mindie_sim/prediction/operators/attention/_cp_tiling.py",
     "mindie_sim/prediction/operators/attention/_fia.py",
     "mindie_sim/prediction/operators/linear_attention/_gdn_decode_programs.py",
