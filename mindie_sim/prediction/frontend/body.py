@@ -287,7 +287,7 @@ class _FrontendBody:
         views, mode, tokens, requests, p, sp, attn_state, residual,
         caches, indices, topks, candidates, stages, reuse_index_selection,
         dcp_cohort_views, dcp_local_pos, has_dcp_decode, rank_ledger, physical_rank,
-        explicit_physical_rank, machine, gbsa_metadata_cache=None,
+        explicit_physical_rank, machine, replica=None, gbsa_metadata_cache=None,
     ):
         saved = None
         if tokens:
@@ -358,7 +358,8 @@ class _FrontendBody:
             if sp_attn:
                 attention_ops, attention_last = _frontend.sequence_parallel.close_output(
                     attention.ops, attention.last, plan=sp, width=model.hidden_size,
-                    dtype=model.activation_dtype, input_rows=sp.attention_tokens)
+                    dtype=model.activation_dtype, input_rows=sp.attention_tokens,
+                    machine=machine, replica=replica, physical_rank=physical_rank)
                 attention = _frontend.replace(attention, ops=attention_ops, last=attention_last)
             ops.extend(_frontend._scope(attention.ops, "attention"))
             for mapping, result in ((caches, attention.cache_store_id), (indices, attention.index_store_id),
@@ -434,6 +435,7 @@ class _FrontendBody:
         model, runtime, views, mode, tokens, requests, p, sp, attn_state, residual,
         routing_global_tokens, global_tokens, routing_views, rank_ledger,
         physical_rank, replica, query_position,
+        explicit_physical_rank=False, machine=None,
     ):
         if tokens or layer.ffn == "moe":
             routing_tokens = (routing_global_tokens
@@ -455,7 +457,8 @@ class _FrontendBody:
                 valid_source_tokens=sp.valid_global if sp_entry else None, replica=replica,
                 views=realization_views, source_geometry=rank_ledger,
                 physical_rank=(rank_ledger.owner if rank_ledger is not None else physical_rank),
-                query_position=query_position)
+                query_position=query_position,
+                explicit_physical_rank=bool(explicit_physical_rank), machine=machine)
                 if layer.ffn == "moe" else None)
             ffn_tokens = tokens
             if sp_dense and layer.ffn == "dense":
@@ -479,7 +482,8 @@ class _FrontendBody:
             if sp_dense and layer.ffn == "dense":
                 ffn_ops, previous = _frontend.sequence_parallel.close_output(
                     ffn_ops, previous, plan=sp, width=model.hidden_size,
-                    dtype=model.activation_dtype)
+                    dtype=model.activation_dtype,
+                    machine=machine, replica=replica, physical_rank=physical_rank)
             ops.extend(_frontend._scope(ffn_ops, "ffn"))
         if tokens:
             if attn_state is not None:
@@ -708,7 +712,7 @@ class _FrontendBody:
                 dcp_cohort_views=dcp_cohort_views, dcp_local_pos=dcp_local_pos,
                 has_dcp_decode=has_dcp_decode, rank_ledger=rank_ledger,
                 physical_rank=physical_rank, explicit_physical_rank=explicit_physical_rank,
-                machine=machine, gbsa_metadata_cache=gbsa_metadata_cache,
+                machine=machine, replica=replica, gbsa_metadata_cache=gbsa_metadata_cache,
             )
             previous = self._lower_body_ffn(
                 ops, previous, hidden, saved, common=common, name=name, layer=layer,
@@ -717,6 +721,7 @@ class _FrontendBody:
                 attn_state=attn_state, residual=residual, routing_global_tokens=routing_global_tokens,
                 global_tokens=global_tokens, routing_views=routing_views, rank_ledger=rank_ledger,
                 physical_rank=physical_rank, replica=replica, query_position=query_position,
+                explicit_physical_rank=explicit_physical_rank, machine=machine,
             )
             if attn_state is None and layer.residual_block_size and (index + 1) % layer.residual_block_size == 0:
                 residual_sources.append(previous)
