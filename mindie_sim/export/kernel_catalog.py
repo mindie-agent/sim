@@ -29,6 +29,7 @@ from mindie_sim.schema.abi import AbiQueryKey, AbiSupportVerdict, ProbedAbiEntry
 from mindie_sim.schema.case import Case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import KernelBinding, OpSpec
+from mindie_sim.schema.parallel import local_kv_heads
 from mindie_sim.structure_implementations import operator_birth_certificate
 
 from .models import (
@@ -398,12 +399,13 @@ def classify_task_type(
     family: str, flops: float, vector_ops: float, link_bytes: float,
 ) -> str:
     """Classify task core type (``HCCL``, ``MIX_AIC``, ``AI_CORE``, ``AI_VECTOR_CORE``)."""
-    if str(family or "").strip().lower() in COLLECTIVE_FAMILIES or link_bytes > 0.0:
-        return "HCCL"
+    is_collective = str(family or "").strip().lower() in COLLECTIVE_FAMILIES
     if flops > 0.0 and vector_ops > 0.0:
         return "MIX_AIC"
     if flops > 0.0:
         return "AI_CORE"
+    if is_collective or link_bytes > 0.0:
+        return "HCCL"
     return "AI_VECTOR_CORE"
 
 
@@ -653,6 +655,51 @@ def resolve_operator_display_dtype(
     return base_dt
 
 
+def _resolve_local_kv_heads(
+    op_id: str, meta: Mapping[str, Any], case: Case, layer_plan: Any | None, local_q_heads: int,
+) -> int:
+    """Resolve rank-local KV head count for 4D GQA/MHA/MQA attention contracts."""
+    explicit = int(meta.get("local_kv_heads") or 0)
+    if explicit > 0:
+        return explicit
+    for view_key in ("attention_tensor_view", "attention_view"):
+        attn_view = meta.get(view_key)
+        if isinstance(attn_view, Mapping):
+            view_kv = int(attn_view.get("local_kv_heads") or 0)
+            if view_kv > 0:
+                return view_kv
+    draft_spec = None
+    if layer_plan is None and op_id.lower().startswith("draft"):
+        aux = getattr(case.model, "auxiliary", None)
+        draft_spec = (
+            getattr(aux, "draft", None)
+            or getattr(aux, "mtp", None)
+            or getattr(aux, "dspark", None)
+        ) if aux is not None else None
+    raw_kv = (
+        int(getattr(layer_plan, "num_kv_heads", 0) or 0)
+        if layer_plan is not None
+        else int(getattr(draft_spec, "num_kv_heads", 0) or 0)
+    )
+    if raw_kv <= 0:
+        raw_kv = int(getattr(case.model, "kv_heads", 0) or 0)
+    if raw_kv <= 0:
+        return max(1, int(local_q_heads))
+    attn_tp = max(1, int(case.runtime.parallel.tp))
+    raw_q = (
+        int(getattr(layer_plan, "num_heads", 0) or 0)
+        if layer_plan is not None
+        else int(getattr(draft_spec, "num_heads", 0) or 0)
+    )
+    if raw_q <= 0:
+        raw_q = int(getattr(case.model, "heads", 0) or 0)
+    if raw_q > 0 and local_q_heads > 0 and raw_q % local_q_heads == 0:
+        attn_tp = max(1, raw_q // local_q_heads)
+    if (raw_kv >= attn_tp and raw_kv % attn_tp == 0) or (raw_kv < attn_tp and attn_tp % raw_kv == 0):
+        return local_kv_heads(raw_kv, attn_tp)
+    return max(1, raw_kv // attn_tp)
+
+
 def _format_tensor_contract(
     op_id: str, family: str, recipe: str, shape: Sequence[int],
     dtype: str, meta: Mapping[str, Any], case: Case, layer_plan: Any | None,
@@ -702,7 +749,14 @@ def _format_tensor_contract(
             return f"Q:[{q_tok},{nh},{dqk}] {act_dt} × KV:[{ctx},1,{dqk}] -> O:[{q_tok},{nh},{dv}] {out_dt}"
         if len(dims) == ATTN_4D_RANK:
             q_tok, ctx, nh, hd = dims
-            return f"Q:[{q_tok},{nh},{hd}] {act_dt} × KV:[{ctx},{hd}] -> O:[{q_tok},{nh},{hd}] {out_dt}"
+            n_kv = _resolve_local_kv_heads(op_id, meta, case, layer_plan, nh)
+            v_hd = int(
+                meta.get("v_head_dim")
+                or (getattr(layer_plan, "v_head_dim", 0) if layer_plan is not None else 0)
+                or getattr(case.model, "v_head_dim", 0)
+                or hd
+            )
+            return f"Q:[{q_tok},{nh},{hd}] {act_dt} × KV:[{ctx},{n_kv},{hd}] -> O:[{q_tok},{nh},{v_hd}] {out_dt}"
         if len(dims) == GEMM_SHAPE_RANK:
             q_tok, nh, dv = dims
             topk = int(getattr(layer_plan, "index_topk", 0) or 0) if layer_plan is not None else 0
@@ -914,7 +968,9 @@ _QUANT_ABI_DTYPES = frozenset({
 })
 _ABI_DTYPE_NORM_MAP: dict[str, str] = {
     "bfloat16": "bf16", "float16": "fp16", "float32": "fp32",
-    "fp8_e4m3fn": "fp8_e4m3", "mx_fp8": "mxfp8", "mx_fp4": "mxfp4",
+    "fp8_e4m3fn": "fp8_e4m3", "float8_e4m3fn": "fp8_e4m3",
+    "mx_fp8": "mxfp8", "mx_fp4": "mxfp4", "fp4": "mxfp4", "fp4_e2m1": "mxfp4",
+    "e8m0": "fp8_e8m0",
 }
 _TRACK_NORM_MAP: dict[str, str] = {
     "merged": "shipping", "current_merged": "shipping",
@@ -924,8 +980,20 @@ _TRACK_NORM_MAP: dict[str, str] = {
 _PROPOSED_READINESS_TOKENS = frozenset({"proposed_pr", "unmerged_pr"})
 _ABI_TUPLE_DTYPE_IDX = 1
 _ABI_TUPLE_QUANT_IDX = 3
+_ABI_TUPLE_GROUP_IDX = 4
+_ABI_TUPLE_SCALE_IDX = 5
 _ABI_TUPLE_MIN_DTYPE_PARTS = 2
 _ABI_TUPLE_MIN_QUANT_PARTS = 4
+_ABI_TUPLE_MIN_GROUP_PARTS = 5
+_ABI_TUPLE_MIN_SCALE_PARTS = 6
+_ABI_ACT_PORT_ROLES = frozenset({
+    "x", "x1", "token_x", "hidden_states", "expand_x", "input", "self", "q", "query", "a",
+})
+_ABI_WT_PORT_ROLES = frozenset({
+    "weight", "weight1", "w", "x2", "weight_dq", "w_up", "w_down",
+    "proj_weight", "q_weight", "k_weight", "weights", "b",
+})
+_ABI_MX_QMODES = frozenset({"mx_fp8", "mx_fp4", "hif8_mx"})
 
 
 def _norm_abi_dtype(raw: str) -> str:
@@ -944,28 +1012,93 @@ def _normalize_kernel_track(rt_meta: Mapping[str, Any]) -> str:
     return _TRACK_NORM_MAP.get(raw, raw)
 
 
+def _parse_abi_spec_ports(
+    spec_tuple: Sequence[str],
+) -> tuple[list[tuple[str, str, str, tuple[int, ...], str]], int | None, int | None]:
+    """Parse structured port tokens and resolve canonical ``(act_idx, wt_idx)``."""
+    ports: list[tuple[str, str, str, tuple[int, ...], str]] = []
+    act_idx: int | None = None
+    wt_idx: int | None = None
+    for idx, tok in enumerate(spec_tuple):
+        parts = str(tok).split(":")
+        role = parts[0].strip().lower() if len(parts) >= _ABI_TUPLE_MIN_DTYPE_PARTS else ""
+        dt = _norm_abi_dtype(parts[_ABI_TUPLE_DTYPE_IDX] if len(parts) >= _ABI_TUPLE_MIN_DTYPE_PARTS else parts[0])
+        qmode = parts[_ABI_TUPLE_QUANT_IDX].strip().lower() if len(parts) >= _ABI_TUPLE_MIN_QUANT_PARTS else ""
+        grp_raw = parts[_ABI_TUPLE_GROUP_IDX].strip().lower() if len(parts) >= _ABI_TUPLE_MIN_GROUP_PARTS else ""
+        grp = tuple(int(v) for v in grp_raw.split("x") if v.isdigit()) if grp_raw else ()
+        scale = _norm_abi_dtype(parts[_ABI_TUPLE_SCALE_IDX]) if len(parts) >= _ABI_TUPLE_MIN_SCALE_PARTS else ""
+        ports.append((role, dt, qmode, grp, scale))
+        if act_idx is None and role in _ABI_ACT_PORT_ROLES:
+            act_idx = idx
+        elif wt_idx is None and role in _ABI_WT_PORT_ROLES:
+            wt_idx = idx
+    if act_idx is None and ports:
+        act_idx = 0
+    if wt_idx is None and len(ports) >= _ABI_TUPLE_MIN_DTYPE_PARTS:
+        for idx in range(len(ports)):
+            if idx != act_idx:
+                wt_idx = idx
+                break
+    return ports, act_idx, wt_idx
+
+
+def _abi_port_quant_matches(
+    port: tuple[str, str, str, tuple[int, ...], str],
+    *,
+    req_mode: str,
+    req_scale: str,
+    req_block: tuple[int, ...],
+) -> bool:
+    _, _dt, qmode, grp, scale = port
+    if scale and scale != "none" and req_scale and scale != req_scale:
+        return False
+    if grp and req_block:
+        if grp != req_block and not (len(grp) == 1 and grp[0] == req_block[-1]):
+            return False
+    port_is_mx = qmode in _ABI_MX_QMODES
+    req_is_mx = ("mx" in req_mode) or (req_scale == "fp8_e8m0")
+    if port_is_mx and req_mode and not req_is_mx:
+        return False
+    if req_is_mx and qmode and qmode not in {"", "none", "dense"} and not port_is_mx and scale not in {"", "none", "fp8_e8m0"}:
+        return False
+    return True
+
+
 def _abi_spec_tuple_matches(
     spec_tuple: Sequence[str],
     req_act: str,
     req_wt: str,
     is_quant_req: bool,
+    *,
+    req_mode: str = "",
+    req_wt_scale: str = "",
+    req_act_scale: str = "",
+    req_wt_block: tuple[int, ...] = (),
+    req_act_group: int = 0,
 ) -> bool:
-    dtypes: list[str] = []
-    qmodes: list[str] = []
-    for tok in spec_tuple:
-        parts = str(tok).split(":")
-        dtypes.append(_norm_abi_dtype(parts[_ABI_TUPLE_DTYPE_IDX] if len(parts) >= _ABI_TUPLE_MIN_DTYPE_PARTS else parts[0]))
-        qmodes.append(parts[_ABI_TUPLE_QUANT_IDX].strip().lower() if len(parts) >= _ABI_TUPLE_MIN_QUANT_PARTS else "")
-    if is_quant_req and all(qm == "dense" for qm in qmodes if qm):
+    ports, act_idx, wt_idx = _parse_abi_spec_ports(spec_tuple)
+    if not ports or act_idx is None:
         return False
-    if not is_quant_req and req_act in _DENSE_ABI_DTYPES and req_wt in _DENSE_ABI_DTYPES:
-        if any(dt in _QUANT_ABI_DTYPES for dt in dtypes):
+    act_p = ports[act_idx]
+    wt_p = ports[wt_idx] if wt_idx is not None else None
+    if wt_p is not None and req_act and req_wt:
+        if act_p[1] != req_act or wt_p[1] != req_wt:
             return False
-    if len(dtypes) >= _ABI_TUPLE_MIN_DTYPE_PARTS and req_act and req_wt:
-        return dtypes[0] == req_act and dtypes[1] == req_wt
-    if len(dtypes) == 1:
-        return dtypes[0] in {req_act, req_wt}
-    return bool(req_act and req_act in dtypes) or bool(req_wt and req_wt in dtypes)
+        if is_quant_req and act_p[2] == "dense" and wt_p[2] == "dense":
+            return False
+        if not is_quant_req and req_act in _DENSE_ABI_DTYPES and req_wt in _DENSE_ABI_DTYPES:
+            if act_p[1] in _QUANT_ABI_DTYPES or wt_p[1] in _QUANT_ABI_DTYPES:
+                return False
+        if is_quant_req:
+            if not _abi_port_quant_matches(wt_p, req_mode=req_mode, req_scale=req_wt_scale, req_block=req_wt_block):
+                return False
+            act_blk = (req_act_group,) if req_act_group > 0 else ()
+            if not _abi_port_quant_matches(act_p, req_mode=req_mode, req_scale=req_act_scale, req_block=act_blk):
+                return False
+        return True
+    if not is_quant_req and req_act in _DENSE_ABI_DTYPES and act_p[1] in _QUANT_ABI_DTYPES:
+        return False
+    return act_p[1] in {req_act, req_wt}
 
 
 def _entry_matches_op_precision(entry: ProbedAbiEntry, precision_abi: Any, dtype: str) -> bool:
@@ -977,13 +1110,23 @@ def _entry_matches_op_precision(entry: ProbedAbiEntry, precision_abi: Any, dtype
         req_mode = str(
             getattr(precision_abi, "linear_method", "") or getattr(precision_abi, "mode", "") or ""
         ).strip().lower()
+        req_wt_scale = _norm_abi_dtype(getattr(precision_abi, "weight_scale_dtype", ""))
+        req_act_scale = _norm_abi_dtype(getattr(precision_abi, "act_scale_dtype", ""))
+        raw_blk = getattr(precision_abi, "weight_block", ()) or ()
+        req_wt_block = tuple(int(v) for v in raw_blk if int(v) > 0)
+        req_act_group = int(getattr(precision_abi, "act_group_size", 0) or 0)
         is_quant_req = (
             req_mode not in {"", "dense", "bf16", "fp16", "fp32"}
             or req_act in _QUANT_ABI_DTYPES
             or req_wt in _QUANT_ABI_DTYPES
         )
         return any(
-            _abi_spec_tuple_matches(st, req_act, req_wt, is_quant_req)
+            _abi_spec_tuple_matches(
+                st, req_act, req_wt, is_quant_req,
+                req_mode=req_mode, req_wt_scale=req_wt_scale,
+                req_act_scale=req_act_scale, req_wt_block=req_wt_block,
+                req_act_group=req_act_group,
+            )
             for st in entry.dtype_tuple
         )
     dt_norm = _norm_abi_dtype(dtype)
@@ -995,7 +1138,7 @@ def _entry_matches_op_precision(entry: ProbedAbiEntry, precision_abi: Any, dtype
     return True
 
 
-def _lookup_probed_abi_entry(
+def _lookup_probed_abi_entry_with_status(
     symbol: str,
     arch_family: str,
     track: str,
@@ -1004,9 +1147,9 @@ def _lookup_probed_abi_entry(
     dtype: str = "",
     birth_readiness: str = "",
     source_ref: Any = None,
-) -> ProbedAbiEntry | None:
+) -> tuple[ProbedAbiEntry | None, bool]:
     if not symbol:
-        return None
+        return None, False
     registry = default_abi_registry()
     candidates = list(registry.lookup(symbol, arch_family, available_only=False))
     if not candidates and not symbol.startswith("aclnn"):
@@ -1015,15 +1158,15 @@ def _lookup_probed_abi_entry(
         snap = registry.get_snapshot(arch_family)
         candidates = [e for e in snap.entries if symbol in e.device_kernel_expansion]
     if not candidates:
-        return None
+        return None, False
     if all(not e.available_on_device for e in candidates):
-        return candidates[0]
+        return candidates[0], False
     if precision_abi is not None or _norm_abi_dtype(dtype) in _QUANT_ABI_DTYPES:
         matched = [e for e in candidates if _entry_matches_op_precision(e, precision_abi, dtype)]
         if matched:
             candidates = matched
-        elif birth_readiness in _PROPOSED_READINESS_TOKENS or len(candidates) > 1:
-            return None
+        else:
+            return None, True
     src_str = _format_source_entry(source_ref)
 
     def _pick(pool: Sequence[ProbedAbiEntry]) -> ProbedAbiEntry | None:
@@ -1038,19 +1181,37 @@ def _lookup_probed_abi_entry(
     if birth_readiness in _PROPOSED_READINESS_TOKENS:
         unmerged = [e for e in candidates if e.vllm_ascend_track == "unmerged_pr"]
         avail = [e for e in unmerged if e.available_on_device]
-        return _pick(avail) or _pick(unmerged)
+        return (_pick(avail) or _pick(unmerged)), False
 
     allow_unmerged = track in {"proposed", "target"}
     merged_avail = [e for e in candidates if e.available_on_device and e.vllm_ascend_track == "merged"]
     hit = _pick(merged_avail)
     if hit is not None:
-        return hit
+        return hit, False
     if allow_unmerged:
         avail = [e for e in candidates if e.available_on_device]
         hit = _pick(avail)
         if hit is not None:
-            return hit
-    return _pick(candidates)
+            return hit, False
+    return _pick(candidates), False
+
+
+def _lookup_probed_abi_entry(
+    symbol: str,
+    arch_family: str,
+    track: str,
+    *,
+    precision_abi: Any = None,
+    dtype: str = "",
+    birth_readiness: str = "",
+    source_ref: Any = None,
+) -> ProbedAbiEntry | None:
+    entry, _ = _lookup_probed_abi_entry_with_status(
+        symbol, arch_family, track,
+        precision_abi=precision_abi, dtype=dtype,
+        birth_readiness=birth_readiness, source_ref=source_ref,
+    )
+    return entry
 
 
 def _extract_struct_provenance(
@@ -1177,6 +1338,7 @@ def _resolve_abi_readiness_state(
     meta: Mapping[str, Any],
     subgraph_info: Mapping[str, Any] | None,
     preserve_declared_symbol: bool = False,
+    abi_precision_rejected: bool = False,
 ) -> tuple[str, str, str, bool, str, bool, str, str]:
     """Compute ``(kernel, backend_raw, status, needs_new, new_spec, is_shipping_abi, abi_entry_id, abi_source)``."""
     is_shipping_abi = False
@@ -1209,6 +1371,11 @@ def _resolve_abi_readiness_state(
             needs_new = True
             new_spec = abi_entry.probe_domain_note or f"unavailable_on_{arch_family}:{abi_entry.abi_id}"
             status = f"{KERNEL_STATUS_NEW_OP} ({new_spec})"
+    elif abi_precision_rejected:
+        is_shipping_abi = False
+        needs_new = True
+        new_spec = f"abi_precision_unsupported:{declared_sym}:{arch_family}"
+        status = f"{KERNEL_STATUS_NEW_OP} ({new_spec})"
     elif eff_readiness in _BIRTH_READINESS_MAP:
         status, needs_new = _BIRTH_READINESS_MAP[eff_readiness]
         is_shipping_abi = (status == KERNEL_STATUS_EXISTING and not needs_new)
@@ -1312,10 +1479,10 @@ def resolve_ascend_kernel_identity(
     is_target_fused = bool(meta.get("target_rewrite_fused"))
     declared_sym = birth_sym or nb_sym or meta_sym or st_sym
     eff_readiness = birth_readiness or nb_readiness
-    abi_entry = (
-        None
+    abi_entry, abi_precision_rejected = (
+        (None, False)
         if (is_target_fused or (has_birth and birth_readiness in {"synthesized_target", "tiler_extension"}))
-        else _lookup_probed_abi_entry(
+        else _lookup_probed_abi_entry_with_status(
             declared_sym, arch_family, track,
             precision_abi=getattr(spec, "precision_abi", None) if spec is not None else None,
             dtype=dtype,
@@ -1338,6 +1505,7 @@ def resolve_ascend_kernel_identity(
             meta=meta,
             subgraph_info=subgraph_info,
             preserve_declared_symbol=nb_preserve_sym,
+            abi_precision_rejected=abi_precision_rejected,
         )
     )
 

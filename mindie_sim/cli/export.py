@@ -107,7 +107,7 @@ def _add_oneshot_export_command(subparsers) -> None:
     cmd.add_argument("--model", required=True, help="catalog model, alias, HF config.json, or model directory")
     cmd.add_argument("--hardware", required=True, help="hardware SKU or alias (e.g. 950dt, a5-pod, a3, a2)")
     cmd.add_argument("--topology-preset", default=None, help="optional topology preset override (e.g. a5_pod, a3_16p)")
-    cmd.add_argument("--phase", choices=("prefill", "decode"), default="decode")
+    cmd.add_argument("--phase", choices=("prefill", "decode"), default=None)
     cmd.add_argument("--dp", type=int, default=1)
     cmd.add_argument("--tp", type=int, default=1)
     cmd.add_argument("--dcp", type=int, default=1)
@@ -219,16 +219,10 @@ def _run_oneshot_export(args: argparse.Namespace) -> dict[str, Any]:
         indexer_kv_dtype=eff_idx,
         deployment_mode=dep_mode,
         runtime_stack=getattr(args, "stack", None),
+        phase=getattr(args, "phase", None),
     )
-    raw_before, auto_req = compose_export_case(
+    raw_before, step_req = compose_export_case(
         args.model, args.hardware, feature_track=str(args.compare_track or "shipping"), **common_kw,
-    )
-    step_req = StepRequest(
-        phase=args.phase,
-        tokens=auto_req.tokens if args.phase == "decode" else int(args.prompt_tokens),
-        context=auto_req.context if args.phase == "decode" else 0,
-        sequences=auto_req.sequences,
-        scope="model",
     )
     # Both Cases were just composed with ``eff_quant``; the ledger reads their resolved QuantSpec,
     # so a catalog preset name (``w8a8_dynamic``) is never re-passed as a storage-format override.

@@ -623,7 +623,7 @@ def _reaggregate_slice_ops(
         mean_dur = float(tot_dur_ns) / denom_us
         mean_exp = float(tot_exp_ns) / denom_us
         mean_lstar = float(tot_lstar_ns) / denom_us
-        fully_hidden = mean_dur > OVERLAP_EXPOSED_EPS_US and mean_exp <= OVERLAP_EXPOSED_EPS_US
+        fully_hidden = tot_dur_ns > 0 and tot_exp_ns == 0
         eff = min(1.0, mean_lstar / mean_dur) if (mean_dur > 0.0 and mean_lstar > 0.0) else None
         base_contract = _DEPTH_NOTE_STRIP_RE.sub("", op.tensor_contract or "").strip(" |")
         depth_note = format_attnres_depth_note(

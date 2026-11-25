@@ -75,6 +75,8 @@ BYTES_PER_GB = 1_000_000_000.0
 #: Percentage scale factor (100.0%) and midpoint ratio for per-layer counter sampling.
 PCT_SCALE = 100.0
 MIDPOINT_FRACTION = 0.5
+_SPAN_GAP_EPS_US = 1e-6
+_WORK_TUPLE_LEN = 10
 
 #: Top-level Host Framework process ID (always sorted above Ascend Hardware).
 PID_FRAMEWORK = 0
@@ -630,7 +632,11 @@ def _emit_op_and_pipes(
         })
         flow_id += 1
 
-    if include_pipe_lanes and op.task_type != "HCCL":
+    has_pipe_work = (
+        op.flops > 0.0 or op.vector_ops > 0.0
+        or op.mte2_bytes > 0.0 or op.mte3_bytes > 0.0 or op.fixpipe_bytes > 0.0
+    )
+    if include_pipe_lanes and (op.task_type != "HCCL" or has_pipe_work):
         hw_pid = base_pid + PID_OFFSET_HARDWARE
         for p_tid, p_name, p_ts, p_dur, p_args in _physical_pipe_spans(op, ts_start, pipe_info, k_name):
             events.append({
@@ -675,21 +681,26 @@ def _iter_overlap_from_intervals(
 def _iter_counter_events_from_samples(
     bundle: ExportBundle,
     samples_by_die: Mapping[int, Sequence[tuple[float, float, float, float, float]]],
+    *,
+    stage_by_die: Mapping[int, int] | None = None,
 ) -> Iterator[dict[str, Any]]:
     peaks = bundle.hardware_peaks
     hbm_peak_gbps = float(peaks.get("hbm_peak_bytes_per_s", 0.0) or 0.0) / BYTES_PER_GB
     mem_ledger = bundle.memory_ledger
-    resident_gib = (
-        (mem_ledger.max_stage_hbm_bytes - sum(b.workspace_peak_bytes for b in mem_ledger.stage_budgets[:1]))
-        / float(GIB_BYTES)
-        if mem_ledger.stage_budgets else 0.0
-    )
-    resident_gib = max(0.0, resident_gib)
+    budget_by_stage = {int(b.stage): b for b in mem_ledger.stage_budgets}
 
     for d_idx, samples in sorted(samples_by_die.items()):
         pid = _pid_base(d_idx) + PID_OFFSET_METRICS
         if not samples:
             continue
+        stage = int(stage_by_die.get(d_idx, 0)) if stage_by_die is not None else 0
+        sb = budget_by_stage.get(stage)
+        if sb is None and mem_ledger.stage_budgets:
+            sb = mem_ledger.stage_budgets[0]
+        resident_gib = (
+            max(0.0, (float(sb.total_hbm_bytes) - float(sb.workspace_peak_bytes)) / float(GIB_BYTES))
+            if sb is not None else 0.0
+        )
         stride = max(1, (len(samples) + MAX_COUNTER_SAMPLES - 1) // MAX_COUNTER_SAMPLES)
         for idx, (ts_us, bw_gbps, cube_pct, vec_pct, ws_gib) in enumerate(samples):
             if idx % stride != 0 and idx != len(samples) - 1:
@@ -718,19 +729,229 @@ def _iter_counter_events_from_samples(
 
 
 def _layer_metric_sample(
-    ops: Sequence[OperatorExportRow], ts_mid: float, span_us: float, peaks: Mapping[str, float],
+    ops: Sequence[OperatorExportRow | tuple[OperatorExportRow, int]],
+    ts_mid: float,
+    span_us: float,
+    peaks: Mapping[str, float],
 ) -> tuple[float, float, float, float, float]:
     dur_s = max(span_us / US_PER_SECOND, MIN_POSITIVE_SECONDS)
     cube_peak = float(peaks.get("cube_peak_flops_per_s", 0.0) or 0.0)
     vec_peak = float(peaks.get("vector_peak_ops_per_s", 0.0) or 0.0)
-    hbm_tot = sum(op.hbm_total_bytes for op in ops)
-    flops = sum(op.flops for op in ops)
-    vec_ops = sum(op.vector_ops for op in ops)
-    ws_gib = max((op.hbm_write_bytes + op.mte3_bytes for op in ops), default=0.0) / float(GIB_BYTES)
+    hbm_tot = 0.0
+    cube_busy_s = 0.0
+    vec_ops = 0.0
+    ws_peak_bytes = 0.0
+    for item in ops:
+        if isinstance(item, tuple):
+            op, mult = item
+        else:
+            op, mult = item, 1
+        scale = float(max(1, int(mult)))
+        hbm_tot += op.hbm_total_bytes * scale
+        vec_ops += op.vector_ops * scale
+        if op.flops > 0.0:
+            op_peak = float(op.cube_peak_flops_per_s) if float(op.cube_peak_flops_per_s) > 0.0 else cube_peak
+            if op_peak > 0.0:
+                cube_busy_s += (op.flops * scale) / op_peak
+        ws_peak_bytes = max(ws_peak_bytes, max(op.hbm_write_bytes, op.mte3_bytes))
+    ws_gib = ws_peak_bytes / float(GIB_BYTES)
     bw_gbps = (hbm_tot / dur_s) / BYTES_PER_GB
-    cube_pct = (PCT_SCALE * (flops / dur_s) / cube_peak) if cube_peak > 0.0 else 0.0
+    cube_pct = PCT_SCALE * cube_busy_s / dur_s
     vec_pct = (PCT_SCALE * (vec_ops / dur_s) / vec_peak) if vec_peak > 0.0 else 0.0
     return ts_mid, bw_gbps, cube_pct, vec_pct, ws_gib
+
+
+def _phase_work_demand_us(
+    phase: Any, op: OperatorExportRow, peaks: Mapping[str, float],
+) -> tuple[float, bool, bool]:
+    """Estimate one ``PipelinePhase`` duration (us) and ``(has_comp, has_comm)``."""
+    cube_peak = float(op.cube_peak_flops_per_s or peaks.get("cube_peak_flops_per_s") or 0.0)
+    vec_peak = float(peaks.get("vector_peak_ops_per_s") or 0.0)
+    hbm_peak = float(peaks.get("hbm_peak_bytes_per_s") or 0.0)
+    link_peak = float(peaks.get("link_peak_bytes_per_s") or 0.0)
+    best_us = 0.0
+    has_comp = False
+    has_comm = False
+    for item in getattr(phase, "work", ()) or ():
+        res = str(getattr(item, "resource", "") or "").strip().lower()
+        amt = float(getattr(item, "amount", 0.0) or 0.0)
+        if amt <= 0.0:
+            continue
+        if "link" in res or "hccl" in res or "comm" in res:
+            has_comm = True
+            if link_peak > 0.0:
+                best_us = max(best_us, (amt / link_peak) * US_PER_SECOND)
+        elif "cube" in res or "aic" in res:
+            has_comp = True
+            if cube_peak > 0.0:
+                best_us = max(best_us, (amt / cube_peak) * US_PER_SECOND)
+        elif "vec" in res or "aiv" in res:
+            has_comp = True
+            if vec_peak > 0.0:
+                best_us = max(best_us, (amt / vec_peak) * US_PER_SECOND)
+        elif "hbm" in res or "mem" in res or "mte" in res:
+            if hbm_peak > 0.0:
+                best_us = max(best_us, (amt / hbm_peak) * US_PER_SECOND)
+    return best_us, has_comp, has_comm
+
+
+def _schedule_pipeline_phase_intervals(
+    pipeline_desc: Any,
+    op: OperatorExportRow,
+    ts_start: float,
+    span_us: float,
+    peaks: Mapping[str, float],
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]] | None:
+    phases = tuple(getattr(pipeline_desc, "phases", ()) or ())
+    if not phases:
+        return None
+    starts: dict[str, float] = {}
+    ends: dict[str, float] = {}
+    phase_flags: list[tuple[str, bool, bool]] = []
+    for ph in phases:
+        name = str(getattr(ph, "phase_id", "") or getattr(ph, "name", "") or "")
+        dur_u, has_comp, has_comm = _phase_work_demand_us(ph, op, peaks)
+        s0 = max((ends[dep] for dep in (getattr(ph, "after", ()) or ()) if dep in ends), default=0.0)
+        starts[name] = s0
+        ends[name] = s0 + max(dur_u, PIPE_MIN_SUBSPAN_US if (has_comp or has_comm) else 0.0)
+        phase_flags.append((name, has_comp, has_comm))
+    total_end = max(ends.values(), default=0.0)
+    if total_end <= 0.0:
+        return None
+    scale = span_us / total_end
+    comp_ivs: list[tuple[float, float]] = []
+    comm_ivs: list[tuple[float, float]] = []
+    for name, has_comp, has_comm in phase_flags:
+        lo = ts_start + starts[name] * scale
+        hi = ts_start + ends[name] * scale
+        if hi <= lo:
+            continue
+        if has_comp:
+            comp_ivs.append((lo, hi))
+        if has_comm:
+            comm_ivs.append((lo, hi))
+    return (comp_ivs, comm_ivs) if (comp_ivs or comm_ivs) else None
+
+
+def _trim_subspans_to_budget(
+    parts: Sequence[tuple[float, float]], budget_us: float,
+) -> list[tuple[float, float]]:
+    if budget_us <= 0.0 or not parts:
+        return []
+    total = sum(hi - lo for lo, hi in parts if hi > lo)
+    if total <= budget_us + _SPAN_GAP_EPS_US:
+        return [(lo, hi) for lo, hi in parts if hi > lo]
+    rem = budget_us
+    out: list[tuple[float, float]] = []
+    for lo, hi in parts:
+        if hi <= lo or rem <= 0.0:
+            continue
+        take = min(hi - lo, rem)
+        out.append((lo, lo + take))
+        rem -= take
+    return out
+
+
+def _op_comp_comm_intervals(
+    op: OperatorExportRow,
+    ts_start: float,
+    span_us: float,
+    peaks: Mapping[str, float],
+    *,
+    pipeline_desc: Any = None,
+    other_spans: Sequence[tuple[float, float]] = (),
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+    """Project an operator's compute and communication overlap intervals without over-overlap."""
+    if span_us <= 0.0:
+        return [], []
+    if pipeline_desc is not None:
+        phased = _schedule_pipeline_phase_intervals(pipeline_desc, op, ts_start, span_us, peaks)
+        if phased is not None:
+            return phased
+    if (op.end_us - op.start_us) > (span_us + _SPAN_GAP_EPS_US) and other_spans:
+        cut = _merge_intervals(other_spans)
+        parts = _trim_subspans_to_budget(_subtract_intervals([(op.start_us, op.end_us)], cut), span_us)
+        if parts:
+            if op.task_type == "HCCL":
+                return [], parts
+            return parts, (list(parts) if op.link_bytes > 0.0 else [])
+    if op.task_type == "HCCL":
+        comm_ivs = [(ts_start, ts_start + span_us)]
+        comp_ivs: list[tuple[float, float]] = []
+        if op.flops > 0.0 or op.vector_ops > 0.0:
+            pipe_info = _compute_physical_pipe_times(op, peaks)
+            comp_dur = min(span_us, max(pipe_info["cube_us"], pipe_info["vec_us"]))
+            if comp_dur > 0.0:
+                comp_ivs.append((ts_start, ts_start + comp_dur))
+        return comp_ivs, comm_ivs
+    comp_ivs = [(ts_start, ts_start + span_us)]
+    comm_ivs = []
+    if op.link_bytes > 0.0:
+        link_peak = float(peaks.get("link_peak_bytes_per_s") or 0.0)
+        comm_dur = min(span_us, (op.link_bytes / link_peak) * US_PER_SECOND) if link_peak > 0.0 else span_us
+        if comm_dur > 0.0:
+            comm_ivs.append((ts_start, ts_start + comm_dur))
+    return comp_ivs, comm_ivs
+
+
+def _sweep_direct_counter_samples(
+    die_ops: Sequence[tuple[float, float, OperatorExportRow]],
+    peaks: Mapping[str, float],
+) -> list[tuple[float, float, float, float, float]]:
+    """Aggregate concurrent direct-trace operators via piecewise-constant timestamp sweep."""
+    if not die_ops:
+        return []
+    points = sorted({t for lo, hi, _ in die_ops for t in (lo, hi) if hi > lo})
+    if len(points) < 2:
+        return []
+    cube_peak = float(peaks.get("cube_peak_flops_per_s", 0.0) or 0.0)
+    vec_peak = float(peaks.get("vector_peak_ops_per_s", 0.0) or 0.0)
+    samples: list[tuple[float, float, float, float, float]] = []
+    for idx in range(len(points) - 1):
+        t0, t1 = points[idx], points[idx + 1]
+        if t1 <= t0:
+            continue
+        mid = t0 + (t1 - t0) * MIDPOINT_FRACTION
+        bw_gbps = 0.0
+        cube_pct = 0.0
+        vec_pct = 0.0
+        ws_peak_bytes = 0.0
+        for lo, hi, op in die_ops:
+            if lo <= mid < hi:
+                op_dur_s = max((hi - lo) / US_PER_SECOND, MIN_POSITIVE_SECONDS)
+                bw_gbps += (op.hbm_total_bytes / op_dur_s) / BYTES_PER_GB
+                if op.flops > 0.0:
+                    op_pk = float(op.cube_peak_flops_per_s) if float(op.cube_peak_flops_per_s) > 0.0 else cube_peak
+                    if op_pk > 0.0:
+                        cube_pct += PCT_SCALE * (op.flops / op_pk) / op_dur_s
+                if op.vector_ops > 0.0 and vec_peak > 0.0:
+                    vec_pct += PCT_SCALE * (op.vector_ops / op_dur_s) / vec_peak
+                ws_peak_bytes = max(ws_peak_bytes, max(op.hbm_write_bytes, op.mte3_bytes))
+        samples.append((t0, bw_gbps, cube_pct, vec_pct, ws_peak_bytes / float(GIB_BYTES)))
+    return samples
+
+
+def _apply_exact_op_work(
+    op: OperatorExportRow,
+    work_map: Mapping[str, tuple[float, ...]],
+    strip_fn: Any,
+) -> OperatorExportRow:
+    hit = _lookup_entry_op_timing(op, work_map, strip_fn)
+    if hit is None or len(hit) < _WORK_TUPLE_LEN:
+        return op
+    return replace(
+        op,
+        flops=float(hit[0]),
+        vector_ops=float(hit[1]),
+        hbm_read_bytes=float(hit[2]),
+        hbm_write_bytes=float(hit[3]),
+        hbm_total_bytes=float(hit[4]),
+        mte2_bytes=float(hit[5]),
+        mte3_bytes=float(hit[6]),
+        fixpipe_bytes=float(hit[7]),
+        link_bytes=float(hit[8]),
+        cube_peak_flops_per_s=float(hit[9]),
+    )
 
 
 def _resolve_host_launch_spec(
@@ -886,6 +1107,7 @@ def _iter_scheduled_full_model_trace(
     include_pipe_lanes: bool,
     include_counters: bool,
     include_overlap: bool,
+    pipeline_desc_by_occ: Mapping[Any, Any] = (),
 ) -> Iterator[dict[str, Any]]:
     """Stream full multi-layer Target + Draft schedule using native per-layer timings when recorded."""
     from .kernel_catalog import strip_op_prefix
@@ -920,6 +1142,7 @@ def _iter_scheduled_full_model_trace(
 
     for entry, tpl, l_start, layer_span, layer_rec in entry_windows:
         layer_ops_map = layer_rec.get("ops", {}) if isinstance(layer_rec, Mapping) else {}
+        layer_work_map = layer_rec.get("ops_work", {}) if isinstance(layer_rec, Mapping) else {}
         l_end = l_start + layer_span
         if entry.scope not in scope_bounds:
             scope_bounds[entry.scope] = [l_start, l_end]
@@ -947,6 +1170,9 @@ def _iter_scheduled_full_model_trace(
         op_placement: dict[Any, tuple[int, int, float, str]] = {}
         first_op_for_scope = entry.scope not in launched_scopes
         entry_sched_cnt = max(1, int(sched_counts.get(entry.archetype_id, 1)))
+        entry_comp: dict[int, list[tuple[float, float]]] = defaultdict(list)
+        entry_comm: dict[int, list[tuple[float, float]]] = defaultdict(list)
+        entry_ops_by_die: dict[int, list[tuple[OperatorExportRow, int]]] = defaultdict(list)
         for op in tpl.ops:
             coord = (op.occurrence.replica, op.occurrence.stage, int(op.occurrence.rank or 0))
             d_idx = die_map.get(coord, 0)
@@ -957,6 +1183,8 @@ def _iter_scheduled_full_model_trace(
             if exact_timing is not None:
                 op_ts = l_start + float(exact_timing[0])
                 op_eff = replace(op, dur_us=float(exact_timing[1]), end_us=op.start_us + float(exact_timing[1]))
+                if layer_work_map:
+                    op_eff = _apply_exact_op_work(op_eff, layer_work_map, strip_op_prefix)
             else:
                 op_ts = l_start + max(0.0, op.start_us - tpl.min_start_us)
                 op_eff = op
@@ -985,15 +1213,27 @@ def _iter_scheduled_full_model_trace(
                 op_placement=op_placement,
             )
             yield from events
+            op_span = op_eff.dur_us * float(in_reps)
+            if op_span > 0.0:
+                c_ivs, m_ivs = _op_comp_comm_intervals(
+                    op_eff, op_ts, op_span, bundle.hardware_peaks,
+                    pipeline_desc=pipeline_desc_by_occ.get(op_eff.occurrence),
+                )
+                entry_comp[d_idx].extend(c_ivs)
+                entry_comm[d_idx].extend(m_ivs)
+            if include_counters:
+                entry_ops_by_die[d_idx].append((op_eff, in_reps))
 
-        # Accumulate compact per-layer overlap intervals & counter samples (O(1) per layer).
-        d0 = die_map.get((tpl.ops[0].occurrence.replica, tpl.ops[0].occurrence.stage, int(tpl.ops[0].occurrence.rank or 0)), 0)
-        for r_lo, r_hi in tpl.comp_intervals:
-            comp_by_die[d0].append((l_start + r_lo * scale_span, l_start + r_hi * scale_span))
-        for r_lo, r_hi in tpl.comm_intervals:
-            comm_by_die[d0].append((l_start + r_lo * scale_span, l_start + r_hi * scale_span))
+        # Accumulate compact per-layer overlap intervals & counter samples strictly from emitted ops.
+        for d_k, ivs in entry_comp.items():
+            comp_by_die[d_k].extend(_merge_intervals(ivs))
+        for d_k, ivs in entry_comm.items():
+            comm_by_die[d_k].extend(_merge_intervals(ivs))
         if include_counters and layer_span > 0.0:
-            samples_by_die[d0].append(_layer_metric_sample(tpl.ops, l_start + layer_span * MIDPOINT_FRACTION, layer_span, bundle.hardware_peaks))
+            for d_k, emitted_ops in entry_ops_by_die.items():
+                samples_by_die[d_k].append(
+                    _layer_metric_sample(emitted_ops, l_start + layer_span * MIDPOINT_FRACTION, layer_span, bundle.hardware_peaks)
+                )
 
     for sc_key, (s_lo, s_hi) in scope_bounds.items():
         if s_hi > s_lo:
@@ -1008,10 +1248,11 @@ def _iter_scheduled_full_model_trace(
                 "args": {"Scope": sc_key},
             }
 
+    stage_by_die = {idx: int(coord[1]) for coord, idx in die_map.items()}
     if include_overlap:
         yield from _iter_overlap_from_intervals(comp_by_die, comm_by_die, sorted(set(die_map.values())), total_span_us)
     if include_counters:
-        yield from _iter_counter_events_from_samples(bundle, samples_by_die)
+        yield from _iter_counter_events_from_samples(bundle, samples_by_die, stage_by_die=stage_by_die)
 
 
 def _iter_direct_trace(
@@ -1022,6 +1263,7 @@ def _iter_direct_trace(
     include_pipe_lanes: bool,
     include_counters: bool,
     include_overlap: bool,
+    pipeline_desc_by_occ: Mapping[Any, Any] = (),
 ) -> Iterator[dict[str, Any]]:
     """Fallback single-pass streamer when caller passed an explicit ``step_eval``."""
     yield {
@@ -1032,7 +1274,13 @@ def _iter_direct_trace(
     }
     comp_by_die: dict[int, list[tuple[float, float]]] = defaultdict(list)
     comm_by_die: dict[int, list[tuple[float, float]]] = defaultdict(list)
-    samples_by_die: dict[int, list[tuple[float, float, float, float, float]]] = defaultdict(list)
+    active_ops_by_die: dict[int, list[tuple[float, float, OperatorExportRow]]] = defaultdict(list)
+    spans_by_die: dict[int, list[tuple[int, float, float]]] = defaultdict(list)
+    for idx_op, op_item in enumerate(bundle.operators):
+        if op_item.dur_us > 0.0:
+            coord_i = (op_item.occurrence.replica, op_item.occurrence.stage, int(op_item.occurrence.rank or 0))
+            d_i = die_map.get(coord_i, 0)
+            spans_by_die[d_i].append((idx_op, op_item.start_us, op_item.start_us + op_item.dur_us))
     op_placement: dict[Any, tuple[int, int, float, str]] = {}
     layer_spans: list[tuple[str, float, float]] = []
     sub_spans: list[tuple[str, str, float, float]] = []
@@ -1066,12 +1314,24 @@ def _iter_direct_trace(
         yield from events
         op_placement[op.occurrence] = placement
         if op.dur_us > 0.0:
-            if op.task_type == "HCCL":
-                comm_by_die[d_idx].append((op.start_us, op.end_us))
-            else:
-                comp_by_die[d_idx].append((op.start_us, op.end_us))
+            other_ivs = (
+                [
+                    (s_lo, s_hi)
+                    for o_idx, s_lo, s_hi in spans_by_die.get(d_idx, ())
+                    if o_idx != (task_id - 1) and s_lo >= op.start_us and s_hi <= op.end_us
+                ]
+                if (op.end_us - op.start_us) > (op.dur_us + _SPAN_GAP_EPS_US)
+                else ()
+            )
+            c_ivs, m_ivs = _op_comp_comm_intervals(
+                op, op.start_us, op.dur_us, bundle.hardware_peaks,
+                pipeline_desc=pipeline_desc_by_occ.get(op.occurrence),
+                other_spans=other_ivs,
+            )
+            comp_by_die[d_idx].extend(c_ivs)
+            comm_by_die[d_idx].extend(m_ivs)
             if include_counters:
-                samples_by_die[d_idx].append(_layer_metric_sample((op,), op.start_us, op.dur_us, bundle.hardware_peaks))
+                active_ops_by_die[d_idx].append((op.start_us, op.start_us + op.dur_us, op))
         if layer_spans and layer_spans[-1][0] == lbl:
             layer_spans[-1] = (lbl, min(layer_spans[-1][1], op.start_us), max(layer_spans[-1][2], op.end_us))
         else:
@@ -1095,10 +1355,15 @@ def _iter_direct_trace(
                 "ts": _round_us(lo), "dur": _round_us(hi - lo),
                 "pid": PID_FRAMEWORK, "tid": TID_FW_SUBMODULE_MSTX, "args": {"Submodule": sub, "Layer": lbl},
             }
+    stage_by_die = {idx: int(coord[1]) for coord, idx in die_map.items()}
     if include_overlap:
         yield from _iter_overlap_from_intervals(comp_by_die, comm_by_die, sorted(set(die_map.values())), bundle.step_span_us)
     if include_counters:
-        yield from _iter_counter_events_from_samples(bundle, samples_by_die)
+        samples_by_die = {
+            d_k: _sweep_direct_counter_samples(d_ops, bundle.hardware_peaks)
+            for d_k, d_ops in active_ops_by_die.items()
+        }
+        yield from _iter_counter_events_from_samples(bundle, samples_by_die, stage_by_die=stage_by_die)
 
 
 def iter_msprof_trace_events(
@@ -1132,12 +1397,14 @@ def iter_msprof_trace_events(
         pipe.owner: (len(pipe.phases), pipe.member_op_ids)
         for pipe in bundle.pipelines
     }
+    pipeline_desc_by_occ = {pipe.owner: pipe for pipe in bundle.pipelines}
     if bundle.full_trace_schedule:
         yield from _iter_scheduled_full_model_trace(
             bundle, die_map, pipeline_by_occ,
             include_pipe_lanes=include_pipe_lanes,
             include_counters=include_counters,
             include_overlap=include_overlap,
+            pipeline_desc_by_occ=pipeline_desc_by_occ,
         )
     else:
         yield from _iter_direct_trace(
@@ -1145,6 +1412,7 @@ def iter_msprof_trace_events(
             include_pipe_lanes=include_pipe_lanes,
             include_counters=include_counters,
             include_overlap=include_overlap,
+            pipeline_desc_by_occ=pipeline_desc_by_occ,
         )
 
 
