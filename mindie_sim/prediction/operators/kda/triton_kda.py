@@ -83,9 +83,14 @@ TRITON_KDA_SOURCES: tuple[SourceRef, ...] = SOURCES[:3]
 TRITON_RECURRENT_SOURCES: tuple[SourceRef, ...] = (SOURCES[0], SOURCES[3])
 
 # Upstream vllm_ascend/ops/triton/kda tiling & op-count constants (zero fitted timings)
+FP32_DTYPES = frozenset({"fp32", "float32"})
 STATE_TILE_BV = 64
 STATE_PANEL_BK = 64
+OUT_TILE_BV = 128  # kda.py:1156: chunk_gla_fwd_kernel_o triton.Config({"BK": 64, "BV": 128})
 CUMSUM_BLOCK_BS = 32  # cumsum.py:118: triton.Config({"BS": 32})
+L2NORM_TILED_MBLOCK = 32  # l2norm.py:75: l2norm_fwd_tiled_kernel MBLOCK = 32
+L2NORM_TILED_LOAD_ALU_OPS = 2  # l2norm.py:46-49: square, add-eps (+1 cast-in if non-FP32)
+L2NORM_TILED_STORE_ALU_OPS = 1  # l2norm.py:50: mul-rsqrt (+1 cast-out if non-FP32)
 RECURRENT_MAX_BV = 8  # kda.py:67: BV = min(next_power_of_2(V), 8)
 STATE_VEC_U_PASSES = 3
 TRITON_CHUNK_LAUNCH_COUNT = 11  # 7 Triton kernels + 4 eager ops (Mul, 3x ZerosLike)
@@ -93,6 +98,9 @@ CV_ROUNDTRIP_PAIRED_SYNCS = 1  # p13_paired_ms already measures one AIC<->AIV ro
 STATE_MASK_CAST_PASSES = 6  # chunk_delta_h.py:161-244: b_w/b_k masks+casts, b_v mask+cast, gk exp2
 REC_FLAGS_PER_TOKEN = 16  # 6 MTE2 + 2 l2norm V_S/S_V + 6 PIPE_V barriers + 2 MTE3 stores
 SOLVE_TRIL_ROW_OPS_MULT = 4  # solve_tril.py:221-236: neg-load, bcast+mul, reduce, where
+TRITON_SOLVE_SKIP_ROWS = 2  # solve_tril.py:221-236: range(block_start + 2, min(block_end, rows))
+BETA_SIGMOID_LOAD_ALU_OPS = 1  # kda.py:169: eager sigmoid pre-exp ALU op (neg)
+BETA_SIGMOID_STORE_ALU_OPS = 2  # kda.py:169: eager sigmoid post-exp ALU ops (add-1, rcp)
 INTER_AIV_WRITTEN_K_TILES = 3  # kda.py:736-746: AIV writes b_q, b_k_i, b_k_j to CV workspace
 INTER_AIC_READ_K_TILES = 4  # kda.py:745-746: 2 FP32 dots read 2 LHS + 2 RHS K tiles
 DOT_WS_TENSORS_PER_MM = 3  # Triton CV workspace per dot: A + B (AIV->AIC) + C (AIC->AIV)
@@ -120,7 +128,6 @@ REC_ASYNC_GROUPS = 2  # Two staggered AIV halves overlap global HBM while keepin
 REC_SMALL_GM_LOADS = 5  # q, k, v, gk, beta separate GM loads per token
 TRITON_DIAG_BLOCK = 16
 TRITON_INV_MERGE_DOTS = 16  # solve_tril.py:255-287: 16 IEEE FP32 16x16x16 dots
-TRITON_SOLVE_DEP_ROWS = 4 * 14  # solve_tril.py:221-236: 4 blocks x 14 dependent row updates
 TRITON_OUT_CV_HANDOFFS = 1  # chunk_gla_fwd_kernel_o num_stages=4 fuses 3 dots before 1 final store
 MS_PER_S_KDA = 1000.0
 COMPACT_THRESHOLD = 4
@@ -197,87 +204,229 @@ def _cap_vec_stage(st: Stage, rc: RecipeContext, ratio: float) -> Stage:
     return replace(st, caps={**st.caps, vec_key: cap_rate})
 
 
-def _owner_chunk_bands(
-    lengths: tuple[int, ...], bt: int, hv: int, v_tiles: int, n_owners: int,
-) -> tuple[tuple[int, int], ...]:
-    """Assign each state program to a core round-robin and return ``(steps, active_count)`` bands."""
-    owner_chunks = [0] * n_owners
-    idx = 0
-    for length in lengths:
-        n_chunks = ceil_div(length, bt)
-        for _ in range(hv * v_tiles):
-            owner_chunks[idx % n_owners] += n_chunks
-            idx += 1
-    owner_chunks.sort(reverse=True)
-    levels = sorted({cnt for cnt in owner_chunks if cnt > 0})
-    bands: list[tuple[int, int]] = []
-    prev = 0
-    for level in levels:
-        active = sum(1 for cnt in owner_chunks if cnt >= level)
-        bands.append((level - prev, active))
-        prev = level
-    return tuple(bands)
+def _pair_owners(
+    pairs: tuple[tuple[int, tuple[int, ...]], ...], progs: int,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Return active ``(aics, aivs)`` capped to ``min(len(pairs), progs)`` launched programs."""
+    active = pairs[:min(len(pairs), max(1, progs))]
+    return (
+        tuple(aic for aic, _ in active),
+        tuple(aiv for _, peers in active for aiv in peers),
+    )
 
 
-def _state_unit_works(
+def _chunk_live_stats(c: LinearAttentionContract) -> dict[str, object]:
+    """Derive exact per-chunk live-row iteration, store, and serial-run stats from ``c.lengths``."""
+    bt = c.bt
+    bc = min(TRITON_DIAG_BLOCK, bt)
+
+    def _one_chunk(rows: int) -> tuple[int, int, int, int, int, int, int, int, int]:
+        n_sub = ceil_div(rows, bc)
+        offdiag_blocks = (n_sub * (n_sub - 1)) // 2
+        inter_active = int(rows > bc)
+        inter_rows = rows if rows > bc else 0
+        inter_qb_rows = max(0, rows - bc)
+        inter_live_elems = sum(
+            i_i * min(bc, rows - i_i * bc) * bc for i_i in range(1, n_sub)
+        )
+        intra_live_elems = sum(
+            min(bc, rows - i_i * bc) ** 2 for i_i in range(n_sub)
+        )
+        solve_live_elems = sum(
+            (i_i + 1) * min(bc, rows - i_i * bc) * bc for i_i in range(n_sub)
+        )
+        solve_dep_rows = sum(
+            max(0, min(bc, rows - b_idx * bc) - TRITON_SOLVE_SKIP_ROWS)
+            for b_idx in range(n_sub)
+        )
+        return (
+            offdiag_blocks, inter_active, inter_rows, inter_qb_rows,
+            inter_live_elems, n_sub, intra_live_elems, solve_live_elems, solve_dep_rows,
+        )
+
+    full_stats = _one_chunk(bt)
+    totals = [0] * len(full_stats)
+    total_chunks = 0
+    inter_runs: list[tuple[int, int]] = []
+    solve_runs: list[tuple[int, int]] = []
+    for length in c.lengths:
+        full, tail = divmod(length, bt)
+        if full > 0:
+            total_chunks += full
+            for idx, val in enumerate(full_stats):
+                totals[idx] += full * val
+            if full_stats[0] > 0:
+                inter_runs.append((full, full_stats[0]))
+            solve_runs.append((full, full_stats[8]))
+        if tail > 0:
+            total_chunks += 1
+            t_stats = _one_chunk(tail)
+            for idx, val in enumerate(t_stats):
+                totals[idx] += val
+            if t_stats[0] > 0:
+                inter_runs.append((1, t_stats[0]))
+            solve_runs.append((1, t_stats[8]))
+    return {
+        "total_chunks": total_chunks,
+        "total_offdiag_blocks": totals[0],
+        "inter_active_chunks": totals[1],
+        "inter_rows": totals[2],
+        "inter_qb_rows": totals[3],
+        "inter_live_elems": totals[4],
+        "active_diag_blocks": totals[5],
+        "intra_live_elems": totals[6],
+        "solve_live_elems": totals[7],
+        "solve_dep_rows": totals[8],
+        "inter_runs": tuple(inter_runs),
+        "solve_runs": tuple(solve_runs),
+    }
+
+
+def _max_owner_serial(
+    runs: tuple[tuple[int, int], ...], hv: int, n_owners: int,
+) -> int:
+    """Return peak serial count across ``n_owners`` AICs under round-robin dispatch."""
+    if not runs or n_owners <= 0:
+        return 0
+    loads = [0] * n_owners
+    cursor = 0
+    for count, weight in runs:
+        total_progs = count * hv
+        if total_progs <= 0:
+            continue
+        full_waves, rem = divmod(total_progs, n_owners)
+        if full_waves > 0 and weight > 0:
+            delta = full_waves * weight
+            for idx in range(n_owners):
+                loads[idx] += delta
+        if weight > 0:
+            for _ in range(rem):
+                loads[cursor] += weight
+                cursor = (cursor + 1) % n_owners
+        else:
+            cursor = (cursor + rem) % n_owners
+    return max(loads)
+
+
+def _state_chunk_works(
     c: LinearAttentionContract, ctx: OperatorPlanningContext,
+    rows: int, tile_bv: int,
 ) -> tuple[Work, Work, Work, Work]:
     """Return exact per-program-chunk ``(store_h, ws_dot, res_dec, kv_dot)`` sub-works."""
     elem = element_bytes(c.dtype)
-    gate_elem = element_bytes(c.gate_dtype)
     bt = c.bt
-    prog_bv = min(c.dv, STATE_TILE_BV)
-    prog_h_bf16 = prog_bv * c.dk * elem
-    prog_h_fp32 = prog_bv * c.dk * FP32_BYTES
-    prog_w_bytes = bt * c.dk * elem
-    prog_w_fp32 = bt * c.dk * FP32_BYTES
-    prog_u_bytes = bt * prog_bv * elem
-    prog_v_fp32 = bt * prog_bv * FP32_BYTES
-    prog_gk_bytes = c.dk * gate_elem
-    prog_dot_flops = 2 * bt * prog_bv * c.dk
+    # chunk_delta_h.py:32,78-84 always issues static [BV=64, 64] Cube panels per K-block;
+    # boundary_check=(0, 1) masks GM loads/stores to live (rows, tile_bv, dk).
+    cube_bv = STATE_TILE_BV
+    cube_k = ceil_div(c.dk, STATE_PANEL_BK) * STATE_PANEL_BK
+    live_h_bf16 = tile_bv * c.dk * elem
+    prog_h_fp32 = cube_bv * cube_k * FP32_BYTES
+    live_w_bytes = rows * c.dk * elem
+    prog_w_bytes = bt * cube_k * elem
+    prog_w_fp32 = bt * cube_k * FP32_BYTES
+    live_u_bytes = rows * tile_bv * elem
+    prog_u_bytes = bt * cube_bv * elem
+    prog_v_fp32 = bt * cube_bv * FP32_BYTES
+    # gk is produced by chunk_local_cumsum in FP32 (cumsum.py:201).
+    prog_gk_bytes = c.dk * FP32_BYTES
+    prog_dot_flops = 2 * bt * cube_bv * cube_k
     cv_mem = "l2" if "l2" in ctx.geometry.rates else "hbm"
     ws_cv_bytes = 2 * (prog_w_fp32 + prog_h_fp32 + prog_v_fp32)
     kv_cv_bytes = 2 * (prog_w_bytes + prog_u_bytes + prog_h_fp32)
-    w_store_h = transfer(ctx, write=prog_h_bf16) + Work(resources={"vector": 2 * prog_bv * c.dk})
-    w_ws_dot = transfer(ctx, read=prog_w_bytes) + Work(
+    w_store_h = transfer(ctx, write=live_h_bf16) + Work(resources={"vector": 2 * tile_bv * c.dk})
+    w_ws_dot = transfer(ctx, read=live_w_bytes) + Work(
         {"fp32": prog_dot_flops},
         {"mte2_aic": prog_w_fp32 + prog_h_fp32, "mte1": prog_w_fp32 + prog_h_fp32,
          "fixpipe": prog_v_fp32, "mte3": prog_w_fp32 + prog_h_fp32, "mte2_aiv": prog_v_fp32,
-         "vector": STATE_MASK_CAST_PASSES * bt * c.dk, cv_mem: ws_cv_bytes},
+         "vector": STATE_MASK_CAST_PASSES * bt * cube_k, cv_mem: ws_cv_bytes},
     )
-    w_res_dec = transfer(ctx, read=prog_u_bytes + prog_gk_bytes, write=prog_u_bytes) + Work(
-        resources={"vector": STATE_MASK_CAST_PASSES * prog_bv * c.dk + STATE_VEC_U_PASSES * bt * prog_bv + c.dk},
+    w_res_dec = transfer(ctx, read=live_u_bytes + prog_gk_bytes, write=live_u_bytes) + Work(
+        resources={"vector": STATE_MASK_CAST_PASSES * cube_bv * cube_k + STATE_VEC_U_PASSES * bt * cube_bv + c.dk},
     )
-    w_kv_dot = transfer(ctx, read=prog_w_bytes) + Work(
+    w_kv_dot = transfer(ctx, read=live_w_bytes) + Work(
         {c.dtype: prog_dot_flops},
         {"mte2_aic": prog_w_bytes + prog_u_bytes, "mte1": prog_w_bytes + prog_u_bytes,
          "fixpipe": prog_h_fp32, "mte2_aiv": prog_h_fp32,
-         "vector": STATE_MASK_CAST_PASSES * bt * c.dk + prog_bv * c.dk,
+         "vector": STATE_MASK_CAST_PASSES * bt * cube_k + cube_bv * cube_k,
          cv_mem: kv_cv_bytes},
     )
     return w_store_h, w_ws_dot, w_res_dec, w_kv_dot
 
 
+def _assign_state_programs(
+    c: LinearAttentionContract, n_owners: int,
+) -> tuple[tuple[tuple[int, int, int], ...], ...]:
+    """Assign ``(length, tile_bv)`` programs round-robin and group consecutive identical runs."""
+    v_widths = tuple(
+        min(STATE_TILE_BV, c.dv - offset) for offset in range(0, c.dv, STATE_TILE_BV)
+    )
+    raw: list[list[tuple[int, int]]] = [[] for _ in range(n_owners)]
+    idx = 0
+    for length in c.lengths:
+        for _ in range(c.hv):
+            for tile_bv in v_widths:
+                raw[idx % n_owners].append((length, tile_bv))
+                idx += 1
+    grouped: list[tuple[tuple[int, int, int], ...]] = []
+    for progs in raw:
+        runs: list[tuple[int, int, int]] = []
+        for length, tile_bv in progs:
+            if runs and runs[-1][1] == length and runs[-1][2] == tile_bv:
+                runs[-1] = (runs[-1][0] + 1, length, tile_bv)
+            else:
+                runs.append((1, length, tile_bv))
+        grouped.append(tuple(runs))
+    return tuple(grouped)
+
+
+def _qk_l2norm_works(
+    c: LinearAttentionContract, ctx: OperatorPlanningContext, total_tokens: int,
+) -> dict[str, Work]:
+    """Return causal Q and K tiled L2-norm works (kda.py:1402-1404, l2norm.py:38-84)."""
+    elem = element_bytes(c.dtype)
+    bd = _next_power_of_2(c.dk)
+    needs_cast = c.dtype.lower() not in FP32_DTYPES
+    load_mult = L2NORM_TILED_LOAD_ALU_OPS + int(needs_cast)
+    store_mult = L2NORM_TILED_STORE_ALU_OPS + int(needs_cast)
+    works: dict[str, Work] = {}
+    for prefix, rows in (("q", total_tokens * c.hq), ("k", total_tokens * c.hk)):
+        progs = ceil_div(rows, L2NORM_TILED_MBLOCK)
+        padded_rows = progs * L2NORM_TILED_MBLOCK
+        nbytes = rows * c.dk * elem
+        works[f"{prefix}_load"] = transfer(ctx, read=nbytes) + Work(
+            resources={"vector": padded_rows * bd * load_mult},
+        )
+        works[f"{prefix}_red"] = Work(resources={"vector": padded_rows * bd})
+        works[f"{prefix}_sfu"] = Work(resources={"vector": padded_rows})
+        works[f"{prefix}_store"] = transfer(ctx, write=nbytes) + Work(
+            resources={"vector": padded_rows * bd * store_mult},
+        )
+    return works
+
+
 def _prepare_kernel_works(
     c: LinearAttentionContract, ctx: OperatorPlanningContext,
-    total_tokens: int, head_chunks: int, total_offdiag_blocks: int,
+    total_tokens: int, stats: dict[str, object],
 ) -> dict[str, Work]:
-    """Partition pre-recurrence work cleanly across the 6 sequential pre-state kernels."""
+    """Partition pre-recurrence work cleanly across the sequential pre-state kernels."""
     elem = element_bytes(c.dtype)
     gate_elem = element_bytes(c.gate_dtype)
     beta_elem = element_bytes(c.beta_dtype)
     bt = c.bt
     bc = min(TRITON_DIAG_BLOCK, bt)
-    nc = ceil_div(bt, bc)
     k_panels = ceil_div(c.dk, STATE_PANEL_BK)
     v_tiles = ceil_div(c.dv, STATE_TILE_BV)
+    head_chunks = int(stats["total_chunks"]) * c.hv
     token_heads = total_tokens * c.hv
-    g_bytes = token_heads * c.dk * gate_elem
+    g_in_bytes = token_heads * c.dk * gate_elem
+    # chunk_local_cumsum always outputs FP32 (cumsum.py:201, 213, 242).
+    g_fp32_bytes = token_heads * c.dk * FP32_BYTES
     qk_bytes = token_heads * c.dk * elem
     v_bytes = token_heads * c.dv * elem
     beta_bytes = token_heads * beta_elem
-    score_fp32 = head_chunks * bt * bt * FP32_BYTES
-    score_bf16 = head_chunks * bt * bt * elem
+    # A, Aqk, Ai are allocated as (B, T, H, BT) in live token rows (kda.py:914-915, solve_tril.py:384).
+    score_fp32 = token_heads * bt * FP32_BYTES
+    score_bf16 = token_heads * bt * elem
     cv_mem = "l2" if "l2" in ctx.geometry.rates else "hbm"
     burst = _hbm_burst_granule(ctx)
     # Strided 64B sub-block writes across H*BT*4 stride amplify HBM write bursts on Arch22.
@@ -285,63 +434,80 @@ def _prepare_kernel_works(
     sub_row_bytes = bc * FP32_BYTES
     strided_burst_amp = max(1, min(burst, row_stride) // max(1, sub_row_bytes))
 
-    # 1. chunk_local_cumsum_vector_kernel (cumsum.py:122): BS=32, 1 FP32 dot per program.
+    # 1. chunk_local_cumsum_vector_kernel (cumsum.py:122): BS=32, 1 FP32 dot per program, FP32 output.
     cumsum_progs = ceil_div(c.dk, CUMSUM_BLOCK_BS) * head_chunks
     cumsum_ws = cumsum_progs * (bt * bt + 2 * bt * CUMSUM_BLOCK_BS) * FP32_BYTES
-    w_cumsum = transfer(ctx, read=g_bytes, write=g_bytes) + Work(
+    w_cumsum = transfer(ctx, read=g_in_bytes, write=g_fp32_bytes) + Work(
         {"fp32": head_chunks * 2 * bt * bt * c.dk},
         {"mte2_aic": cumsum_progs * (bt * bt + bt * CUMSUM_BLOCK_BS) * FP32_BYTES,
          "mte1": cumsum_progs * (bt * bt + bt * CUMSUM_BLOCK_BS) * FP32_BYTES,
-         "fixpipe": g_bytes, "mte3": cumsum_progs * bt * bt * FP32_BYTES,
+         "fixpipe": g_fp32_bytes, "mte3": cumsum_progs * bt * bt * FP32_BYTES,
          "vector": cumsum_progs * bt * bt, cv_mem: cumsum_ws},
     )
 
-    # 2. Eager ops: g * RCP_LN2 + zeros(A) + zeros(Aqk) + zeros(Ai).
+    # 2. Pre-inter eager ops: g * RCP_LN2 (FP32) + zeros(A) + zeros(Aqk) (kda.py:1327, 914-915).
     w_eager = transfer(
-        ctx, read=g_bytes, write=g_bytes + ZERO_INIT_FP32_MATRICES * score_fp32 + score_bf16,
+        ctx, read=g_fp32_bytes, write=g_fp32_bytes + ZERO_INIT_FP32_MATRICES * score_fp32,
     ) + Work(resources={"vector": token_heads * c.dk})
 
     # 3. chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_inter (kda.py:631):
-    # 6 off-diag (i_i, i_j) pairs x k_panels x 2 FP32 dots + 3 exp2 + GM workspace.
-    offdiag_head_pairs = c.hv * total_offdiag_blocks
+    # Off-diag (i_i, i_j) pairs for chunks with rows > BC; i_i >= 1 loads q/beta on rows - BC only.
+    offdiag_head_pairs = c.hv * int(stats["total_offdiag_blocks"])
     offdiag_tile = bc * bc
-    inter_fp32_flops = offdiag_head_pairs * 2 * 2 * offdiag_tile * c.dk
-    inter_k_tile = bc * min(c.dk, STATE_PANEL_BK) * FP32_BYTES
     inter_out_tile = offdiag_tile * FP32_BYTES
-    inter_ws = offdiag_head_pairs * k_panels * (2 * (INTER_AIV_WRITTEN_K_TILES * inter_k_tile) + 2 * (2 * inter_out_tile))
-    inter_alu = offdiag_head_pairs * INTER_PAIR_ALU_MULT * bc * c.dk
-    inter_exp2 = offdiag_head_pairs * INTER_PAIR_EXP2_MULT * bc * c.dk
-    inter_a_write = (ZERO_INIT_FP32_MATRICES * score_fp32 * (nc - 1)) // max(1, 2 * nc)
-    w_inter_io = transfer(
-        ctx, read=2 * qk_bytes + g_bytes + beta_bytes,
-        write=inter_a_write * min(2, strided_burst_amp),
-    ) + Work(
-        {"fp32": inter_fp32_flops},
-        {"mte2_aic": offdiag_head_pairs * k_panels * INTER_AIC_READ_K_TILES * inter_k_tile,
-         "mte1": offdiag_head_pairs * k_panels * INTER_AIC_READ_K_TILES * inter_k_tile,
-         "fixpipe": offdiag_head_pairs * k_panels * 2 * inter_out_tile,
-         "mte3": offdiag_head_pairs * k_panels * INTER_AIV_WRITTEN_K_TILES * inter_k_tile,
-         "mte2_aiv": offdiag_head_pairs * k_panels * 2 * inter_out_tile,
-         "vector": inter_alu, cv_mem: inter_ws},
-    )
+    if offdiag_head_pairs > 0:
+        inter_fp32_flops = offdiag_head_pairs * 2 * 2 * offdiag_tile * c.dk
+        inter_k_tile = bc * min(c.dk, STATE_PANEL_BK) * FP32_BYTES
+        inter_ws = offdiag_head_pairs * k_panels * (
+            2 * (INTER_AIV_WRITTEN_K_TILES * inter_k_tile) + 2 * (2 * inter_out_tile)
+        )
+        inter_alu = offdiag_head_pairs * INTER_PAIR_ALU_MULT * bc * c.dk
+        inter_exp2 = offdiag_head_pairs * INTER_PAIR_EXP2_MULT * bc * c.dk
+        inter_read = (
+            c.hv * int(stats["inter_qb_rows"]) * (c.dk * elem + beta_elem)
+            + c.hv * int(stats["inter_rows"]) * (c.dk * elem + c.dk * FP32_BYTES)
+        )
+        inter_a_write = ZERO_INIT_FP32_MATRICES * c.hv * int(stats["inter_live_elems"]) * FP32_BYTES
+        w_inter_io = transfer(
+            ctx, read=inter_read, write=inter_a_write * min(2, strided_burst_amp),
+        ) + Work(
+            {"fp32": inter_fp32_flops},
+            {"mte2_aic": offdiag_head_pairs * k_panels * INTER_AIC_READ_K_TILES * inter_k_tile,
+             "mte1": offdiag_head_pairs * k_panels * INTER_AIC_READ_K_TILES * inter_k_tile,
+             "fixpipe": offdiag_head_pairs * k_panels * 2 * inter_out_tile,
+             "mte3": offdiag_head_pairs * k_panels * INTER_AIV_WRITTEN_K_TILES * inter_k_tile,
+             "mte2_aiv": offdiag_head_pairs * k_panels * 2 * inter_out_tile,
+             "vector": inter_alu, cv_mem: inter_ws},
+        )
+    else:
+        inter_exp2 = 0
+        w_inter_io = Work()
 
     # 4. chunk_kda_scaled_dot_kkt_fwd_kernel_intra_sub_intra (kda.py:782): pure AIV.
-    diag_blocks = head_chunks * nc
-    intra_alu = diag_blocks * (bc * c.dk + bc * INTRA_STEP_ALU_MULT * bc * c.dk)
-    intra_exp2 = diag_blocks * bc * bc * c.dk
-    intra_reduce = diag_blocks * bc * 2 * bc * c.dk
-    intra_a_write = (ZERO_INIT_FP32_MATRICES * score_fp32) // max(1, nc)
+    # kda.py:815-816 early-returns inactive 16-row blocks; BK = max(next_pow2(K), 16) (kda.py:913).
+    intra_bk = max(_next_power_of_2(c.dk), TRITON_DIAG_BLOCK)
+    active_diag_blocks = c.hv * int(stats["active_diag_blocks"])
+    intra_alu = active_diag_blocks * bc * intra_bk + token_heads * INTRA_STEP_ALU_MULT * bc * intra_bk
+    intra_exp2 = token_heads * bc * intra_bk
+    intra_reduce = token_heads * 2 * bc * intra_bk
+    intra_a_write = ZERO_INIT_FP32_MATRICES * c.hv * int(stats["intra_live_elems"]) * FP32_BYTES
     w_intra_io = transfer(
-        ctx, read=2 * qk_bytes + g_bytes + beta_bytes,
+        ctx, read=2 * qk_bytes + g_fp32_bytes + beta_bytes,
         write=intra_a_write * strided_burst_amp,
     ) + Work(resources={"vector": intra_alu})
 
-    # 5. merge_16x16_to_64x64_inverse_kernel_kda (solve_tril.py:175): 16 FP32 dots + 56 dep rows.
+    # 5. solve_tril_kda (solve_tril.py:175, 384): zeros_like(A) before merge kernel;
+    # kernel reads/stores only the 10 lower-triangular 16x16 blocks with boundary_check.
+    w_solve_zero_ai = transfer(ctx, write=score_bf16)
+    total_solve_dep_rows = c.hv * int(stats["solve_dep_rows"])
     solve_fp32_flops = head_chunks * TRITON_INV_MERGE_DOTS * 2 * offdiag_tile * bc
     solve_ws = head_chunks * TRITON_INV_MERGE_DOTS * (2 * DOT_WS_TENSORS_PER_MM * inter_out_tile)
-    solve_alu = head_chunks * TRITON_SOLVE_DEP_ROWS * SOLVE_TRIL_ROW_OPS_MULT * offdiag_tile
-    solve_red = head_chunks * TRITON_SOLVE_DEP_ROWS * offdiag_tile
-    w_solve_io = transfer(ctx, read=score_fp32, write=score_bf16) + Work(
+    solve_alu = total_solve_dep_rows * SOLVE_TRIL_ROW_OPS_MULT * offdiag_tile
+    solve_red = total_solve_dep_rows * offdiag_tile
+    solve_live_elems = c.hv * int(stats["solve_live_elems"])
+    w_solve_io = transfer(
+        ctx, read=solve_live_elems * FP32_BYTES, write=solve_live_elems * elem,
+    ) + Work(
         {"fp32": solve_fp32_flops},
         {"mte2_aic": head_chunks * TRITON_INV_MERGE_DOTS * 2 * inter_out_tile,
          "mte1": head_chunks * TRITON_INV_MERGE_DOTS * 2 * inter_out_tile,
@@ -351,19 +517,23 @@ def _prepare_kernel_works(
          "vector": solve_alu, cv_mem: solve_ws},
     )
 
-    # 6. recompute_w_u_fwd_kernel (kda.py:968): v_tiles FP32 + k_panels BF16 dots + 2*exp2.
-    recomp_bf16_flops = head_chunks * 2 * bt * bt * (c.dk + c.dv)
-    recomp_dot_out = head_chunks * bt * (c.dv + c.dk) * FP32_BYTES
-    recomp_ws = head_chunks * ((v_tiles + k_panels) * bt * bt * elem + 2 * recomp_dot_out // max(1, head_chunks))
+    # 6. recompute_w_u_fwd_kernel (kda.py:968): Cube dots issue full [BT,BT]@[BT,BV/BK] tiles.
+    recomp_k = k_panels * STATE_PANEL_BK
+    recomp_v = v_tiles * STATE_TILE_BV
+    recomp_bf16_flops = head_chunks * 2 * bt * bt * (recomp_k + recomp_v)
+    recomp_a_tile = head_chunks * bt * bt * elem
+    recomp_b_tiles = head_chunks * bt * (recomp_v + recomp_k) * elem
+    recomp_dot_out = head_chunks * bt * (recomp_v + recomp_k) * FP32_BYTES
+    recomp_ws = head_chunks * (v_tiles + k_panels) * bt * bt * elem + 2 * recomp_dot_out
     recomp_alu = RECOMPUTE_GATE_ALU_MULT * token_heads * c.dk + token_heads * c.dv
     recomp_exp2 = RECOMPUTE_GATE_EXP2_MULT * token_heads * c.dk
     w_recomp_io = transfer(
-        ctx, read=qk_bytes + v_bytes + beta_bytes + score_bf16 + g_bytes,
+        ctx, read=qk_bytes + v_bytes + beta_bytes + score_bf16 + g_fp32_bytes,
         write=2 * qk_bytes + v_bytes,
     ) + Work(
         {c.dtype: recomp_bf16_flops},
-        {"mte2_aic": score_bf16 + qk_bytes + v_bytes, "mte1": score_bf16 + qk_bytes + v_bytes,
-         "fixpipe": recomp_dot_out, "mte3": qk_bytes + v_bytes, "mte2_aiv": recomp_dot_out,
+        {"mte2_aic": recomp_a_tile + recomp_b_tiles, "mte1": recomp_a_tile + recomp_b_tiles,
+         "fixpipe": recomp_dot_out, "mte3": recomp_b_tiles, "mte2_aiv": recomp_dot_out,
          "vector": recomp_alu, cv_mem: recomp_ws},
     )
 
@@ -371,135 +541,247 @@ def _prepare_kernel_works(
         "cumsum": w_cumsum,
         "eager": w_eager,
         "inter_io": w_inter_io,
-        "inter_exp2": Work(resources={"vector": inter_exp2}),
+        "inter_exp2": Work(resources={"vector": inter_exp2}) if inter_exp2 else Work(),
         "intra_io": w_intra_io,
         "intra_exp2": Work(resources={"vector": intra_exp2}),
         "intra_red": Work(resources={"vector": intra_reduce}),
+        "solve_zero_ai": w_solve_zero_ai,
         "solve_io": w_solve_io,
-        "solve_red": Work(resources={"vector": solve_red}),
+        "solve_red": Work(resources={"vector": solve_red}) if solve_red else Work(),
         "recomp_io": w_recomp_io,
         "recomp_exp2": Work(resources={"vector": recomp_exp2}),
     }
 
 
+def _lower_qk_l2norm_stages(
+    c: LinearAttentionContract, ctx: OperatorPlanningContext, rc: RecipeContext,
+    all_aivs: tuple[int, ...], l2_works: dict[str, Work],
+    total_tokens: int, reduce_ratio: float, sfu_ratio: float,
+) -> tuple[list[Stage], str]:
+    """Lower Q and K tiled L2-norm kernels in causal load -> reduce -> rsqrt -> store order."""
+    stages: list[Stage] = []
+    prev = ""
+    for prefix, rows in (("q", total_tokens * c.hq), ("k", total_tokens * c.hk)):
+        progs = ceil_div(rows, L2NORM_TILED_MBLOCK)
+        aivs = all_aivs[:min(len(all_aivs), max(1, progs))]
+        after = (prev,) if prev else ()
+        s_load = bind_phase(Phase(f"kda_{prefix}_l2norm_load", l2_works[f"{prefix}_load"], after), rc, ctx, (), aivs)
+        s_red = _cap_vec_stage(
+            bind_phase(Phase(f"kda_{prefix}_l2norm_reduce", l2_works[f"{prefix}_red"], (s_load.name,)), rc, ctx, (), aivs),
+            rc, reduce_ratio,
+        )
+        s_sfu = _cap_vec_stage(
+            bind_phase(Phase(f"kda_{prefix}_l2norm_sfu", l2_works[f"{prefix}_sfu"], (s_red.name,)), rc, ctx, (), aivs),
+            rc, sfu_ratio,
+        )
+        s_store = bind_phase(
+            Phase(f"kda_{prefix}_l2norm_store", l2_works[f"{prefix}_store"], (s_sfu.name,)), rc, ctx, (), aivs,
+        )
+        stages.extend((s_load, s_red, s_sfu, s_store))
+        prev = s_store.name
+    return stages, prev
+
+
+def _lower_state_program(
+    c: LinearAttentionContract, ctx: OperatorPlanningContext, rc: RecipeContext,
+    length: int, tile_bv: int,
+    b_aics: tuple[int, ...], b_aivs: tuple[int, ...],
+    owner_cap: dict[str, float], cv_sync_per_step_ms: float,
+    chunk_cache: dict[tuple[int, int], tuple[Work, Work, Work, Work]],
+) -> KernelProgram:
+    """Lower one ``chunk_delta_h`` program ``init_load -> chunk loop -> final_store``."""
+    state_elem = element_bytes(c.state_dtype)
+    bt = c.bt
+    full, tail = divmod(length, bt)
+
+    def _cap(st: Stage) -> Stage:
+        applied = {k: v for k, v in owner_cap.items() if k in st.work}
+        return replace(st, caps={**st.caps, **applied}) if applied else st
+
+    def _chunk_stages(rows: int) -> tuple[Stage, ...]:
+        key = (rows, tile_bv)
+        if key not in chunk_cache:
+            chunk_cache[key] = _state_chunk_works(c, ctx, rows, tile_bv)
+        w0, w1, w2, w3 = chunk_cache[key]
+        s0 = _cap(bind_phase(Phase("h_store_enter", w0), rc, ctx, b_aics, b_aivs))
+        s1 = _cap(bind_phase(Phase("h_ws_fp32_dot", w1, ("h_store_enter",)), rc, ctx, b_aics, b_aivs))
+        s2 = _cap(bind_phase(Phase("h_res_decay", w2, ("h_ws_fp32_dot",)), rc, ctx, b_aics, b_aivs))
+        s3 = _cap(bind_phase(Phase("h_kv_bf16_dot", w3, ("h_res_decay",)), rc, ctx, b_aics, b_aivs))
+        if cv_sync_per_step_ms > 0.0:
+            return (s0, s1, s2, s3, _fixed_stage("h_chunk_cv_sync", cv_sync_per_step_ms, after=("h_kv_bf16_dot",)))
+        return (s0, s1, s2, s3)
+
+    stages: list[Stage] = []
+    prev: tuple[str, ...] = ()
+    if c.use_initial_state:
+        init_w = transfer(ctx, read=tile_bv * c.dk * state_elem)
+        s_init = bind_phase(Phase("state_init_load", init_w), rc, ctx, b_aics, b_aivs)
+        stages.append(s_init)
+        prev = (s_init.name,)
+    if full > 0:
+        body = (
+            KernelProgram(_chunk_stages(bt))
+            if full == 1
+            else compact_periodic_pipeline(
+                rc, full, 1, lambda _i: _chunk_stages(bt),
+                head=COMPACT_WINDOW, tail=COMPACT_WINDOW, threshold=COMPACT_THRESHOLD,
+            )
+        )
+        st_full = Stage("state_chunks_full", after=prev, program=body)
+        stages.append(st_full)
+        prev = (st_full.name,)
+    if tail > 0:
+        st_tail = Stage("state_chunks_tail", after=prev, program=KernelProgram(_chunk_stages(tail)))
+        stages.append(st_tail)
+        prev = (st_tail.name,)
+    if c.output_final_state:
+        # chunk_delta_h.py:302 always allocates final_state as torch.float32.
+        final_w = transfer(ctx, write=tile_bv * c.dk * FP32_BYTES)
+        stages.append(bind_phase(Phase("state_final_store", final_w, prev), rc, ctx, b_aics, b_aivs))
+    return KernelProgram(tuple(stages))
+
+
+def _lower_state_owners(
+    c: LinearAttentionContract, ctx: OperatorPlanningContext, rc: RecipeContext,
+    active_state_pairs: tuple[tuple[int, tuple[int, ...]], ...],
+    owner_runs: tuple[tuple[tuple[int, int, int], ...], ...],
+    cv_sync_per_step_ms: float, prev: str,
+) -> Stage:
+    """Lower per-owner ``chunk_delta_h`` schedules preserving physical owner identity and epilogue order."""
+    n_owners = len(active_state_pairs)
+    group_cap = p01_cold_hbm_group_cap(rc, n_owners, include_l2=False)
+    owner_cap = {k: v / float(n_owners) for k, v in group_cap.items()}
+    chunk_cache: dict[tuple[int, int], tuple[Work, Work, Work, Work]] = {}
+    owner_stages: list[Stage] = []
+    for owner_idx, ((aic, peers), runs) in enumerate(zip(active_state_pairs, owner_runs)):
+        if not runs:
+            continue
+        b_aics = (aic,)
+        b_aivs = (peers[0],)
+        seq_stages: list[Stage] = []
+        seq_prev: tuple[str, ...] = ()
+        for run_idx, (count, length, tile_bv) in enumerate(runs):
+            prog = _lower_state_program(
+                c, ctx, rc, length, tile_bv, b_aics, b_aivs,
+                owner_cap, cv_sync_per_step_ms, chunk_cache,
+            )
+            run_prog = (
+                prog if count == 1
+                else compact_periodic_pipeline(
+                    rc, count, 1, lambda _i, p=prog: (Stage("prog", program=p),),
+                    head=COMPACT_WINDOW, tail=COMPACT_WINDOW, threshold=COMPACT_THRESHOLD,
+                )
+            )
+            run_st = Stage(f"prog_{run_idx}", after=seq_prev, program=run_prog)
+            seq_stages.append(run_st)
+            seq_prev = (run_st.name,)
+        owner_stages.append(Stage(f"state_owner_{owner_idx}", program=KernelProgram(tuple(seq_stages))))
+    return Stage("triton_kda_state_recurrence", after=(prev,), program=KernelProgram(tuple(owner_stages)))
+
+
 def _lower_chunk_kda(
     c: LinearAttentionContract, ctx: OperatorPlanningContext, rc: RecipeContext,
     pairs: tuple[tuple[int, tuple[int, ...]], ...],
+    all_aivs: tuple[int, ...],
     active_state_pairs: tuple[tuple[int, tuple[int, ...]], ...],
-    prep_works: dict[str, Work], head_chunks: int, total_offdiag_blocks: int,
-    state_init_work: Work, unit_works: tuple[Work, Work, Work, Work],
-    bands: tuple[tuple[int, int], ...], out_phase: Phase,
+    l2_works: dict[str, Work] | None, prep_works: dict[str, Work],
+    total_tokens: int, stats: dict[str, object],
+    owner_runs: tuple[tuple[tuple[int, int, int], ...], ...],
+    out_phase: Phase,
 ) -> KernelProgram:
-    """Lower all 7 Triton chunk KDA kernels + eager ops with exact work conservation."""
-    all_aics = tuple(aic for aic, _ in pairs)
-    all_aivs = tuple(aiv for _, peers in pairs for aiv in peers)
-    n_aics = max(1, len(all_aics))
+    """Lower all Triton chunk KDA kernels + eager ops with exact per-grid placement & conservation."""
     reduce_ratio = _reduce_rate_ratio(rc)
     sfu_ratio = _sfu_rate_ratio(rc)
     cv_ms = p13_paired_ms(rc)
     fix_ms = p03_fixpipe_setup_ms(rc)
     k_panels = ceil_div(c.dk, STATE_PANEL_BK)
     v_tiles = ceil_div(c.dv, STATE_TILE_BV)
+    head_chunks = int(stats["total_chunks"]) * c.hv
     stages: list[Stage] = []
 
     def _push(st: Stage) -> str:
         stages.append(st)
         return st.name
 
-    # 1. chunk_local_cumsum_vector_kernel
-    prev = _push(bind_phase(Phase("kda_cumsum", prep_works["cumsum"]), rc, ctx, all_aics, all_aivs))
-    cumsum_waves = ceil_div(ceil_div(c.dk, CUMSUM_BLOCK_BS) * head_chunks, n_aics)
-    cumsum_sync = cumsum_waves * (cv_ms + fix_ms)
+    prev_after: tuple[str, ...] = ()
+    if l2_works is not None:
+        l2_stages, l2_last = _lower_qk_l2norm_stages(
+            c, ctx, rc, all_aivs, l2_works, total_tokens, reduce_ratio, sfu_ratio,
+        )
+        stages.extend(l2_stages)
+        prev_after = (l2_last,)
+
+    # 1. chunk_local_cumsum_vector_kernel: grid=(cdiv(K, BS=32), NT, B*H)
+    cumsum_progs = ceil_div(c.dk, CUMSUM_BLOCK_BS) * head_chunks
+    cumsum_aics, cumsum_aivs = _pair_owners(pairs, cumsum_progs)
+    prev = _push(bind_phase(Phase("kda_cumsum", prep_works["cumsum"], prev_after), rc, ctx, cumsum_aics, cumsum_aivs))
+    cumsum_sync = ceil_div(cumsum_progs, max(1, len(cumsum_aics))) * (cv_ms + fix_ms)
     if cumsum_sync > 0.0:
         prev = _push(_fixed_stage("kda_cumsum_cv", cumsum_sync, after=(prev,)))
 
-    # 2. Eager RCP_LN2 + zero-inits
+    # 2. Pre-inter eager ops: g * RCP_LN2 + zeros(A) + zeros(Aqk)
     prev = _push(bind_phase(Phase("kda_eager_scale_zeros", prep_works["eager"], (prev,)), rc, ctx, (), all_aivs))
 
-    # 3. intra_sub_inter (6 pairs x k_panels x 2 dots)
-    prev = _push(bind_phase(Phase("kda_inter_io", prep_works["inter_io"], (prev,)), rc, ctx, all_aics, all_aivs))
+    # 3. intra_sub_inter: grid=(NT, B*H); only chunks with rows > BC do work
+    inter_active_progs = c.hv * int(stats["inter_active_chunks"])
+    inter_aics, inter_aivs = _pair_owners(pairs, inter_active_progs)
+    prev = _push(bind_phase(Phase("kda_inter_io", prep_works["inter_io"], (prev,)), rc, ctx, inter_aics, inter_aivs))
     prev = _push(_cap_vec_stage(
-        bind_phase(Phase("kda_inter_exp2", prep_works["inter_exp2"], (prev,)), rc, ctx, (), all_aivs),
+        bind_phase(Phase("kda_inter_exp2", prep_works["inter_exp2"], (prev,)), rc, ctx, (), inter_aivs),
         rc, sfu_ratio,
     ))
-    inter_dots_per_wave = ceil_div(c.hv * total_offdiag_blocks, n_aics) * k_panels * 2
-    inter_sync = inter_dots_per_wave * (cv_ms + fix_ms)
-    if inter_sync > 0.0:
-        prev = _push(_fixed_stage("kda_inter_cv", inter_sync, after=(prev,)))
+    if int(stats["total_offdiag_blocks"]) > 0:
+        inter_peak_blocks = _max_owner_serial(stats["inter_runs"], c.hv, len(inter_aics))
+        inter_sync = inter_peak_blocks * k_panels * 2 * (cv_ms + fix_ms)
+        if inter_sync > 0.0:
+            prev = _push(_fixed_stage("kda_inter_cv", inter_sync, after=(prev,)))
 
-    # 4. intra_sub_intra (pure AIV)
-    prev = _push(bind_phase(Phase("kda_intra_io_alu", prep_works["intra_io"], (prev,)), rc, ctx, (), all_aivs))
+    # 4. intra_sub_intra: grid=(NT, NC, B*H); pure AIV capped to active diag blocks
+    active_diag_blocks = c.hv * int(stats["active_diag_blocks"])
+    intra_aivs = all_aivs[:min(len(all_aivs), max(1, active_diag_blocks))]
+    prev = _push(bind_phase(Phase("kda_intra_io_alu", prep_works["intra_io"], (prev,)), rc, ctx, (), intra_aivs))
     prev = _push(_cap_vec_stage(
-        bind_phase(Phase("kda_intra_exp2", prep_works["intra_exp2"], (prev,)), rc, ctx, (), all_aivs),
+        bind_phase(Phase("kda_intra_exp2", prep_works["intra_exp2"], (prev,)), rc, ctx, (), intra_aivs),
         rc, sfu_ratio,
     ))
     prev = _push(_cap_vec_stage(
-        bind_phase(Phase("kda_intra_reduce", prep_works["intra_red"], (prev,)), rc, ctx, (), all_aivs),
+        bind_phase(Phase("kda_intra_reduce", prep_works["intra_red"], (prev,)), rc, ctx, (), intra_aivs),
         rc, reduce_ratio,
     ))
 
-    # 5. solve_tril (16 FP32 dots + 56 dep rows)
-    prev = _push(bind_phase(Phase("kda_solve_io_alu", prep_works["solve_io"], (prev,)), rc, ctx, all_aics, all_aivs))
+    # 5. solve_tril: eager zeros_like(A) for Ai, then merge kernel grid=(NT, B*H)
+    prev = _push(bind_phase(Phase("kda_solve_zero_ai", prep_works["solve_zero_ai"], (prev,)), rc, ctx, (), all_aivs))
+    solve_aics, solve_aivs = _pair_owners(pairs, head_chunks)
+    prev = _push(bind_phase(Phase("kda_solve_io_alu", prep_works["solve_io"], (prev,)), rc, ctx, solve_aics, solve_aivs))
     prev = _push(_cap_vec_stage(
-        bind_phase(Phase("kda_solve_reduce", prep_works["solve_red"], (prev,)), rc, ctx, (), all_aivs),
+        bind_phase(Phase("kda_solve_reduce", prep_works["solve_red"], (prev,)), rc, ctx, (), solve_aivs),
         rc, reduce_ratio,
     ))
-    solve_waves = ceil_div(head_chunks, n_aics)
-    solve_sync = (
-        solve_waves * TRITON_INV_MERGE_DOTS * (cv_ms + fix_ms)
-        + ceil_div(head_chunks, max(1, len(all_aivs))) * TRITON_SOLVE_DEP_ROWS * p12_flag_ms(rc)
-    )
+    solve_waves = ceil_div(head_chunks, max(1, len(solve_aics)))
+    solve_peak_dep_rows = _max_owner_serial(stats["solve_runs"], c.hv, len(solve_aics))
+    solve_sync = solve_waves * TRITON_INV_MERGE_DOTS * (cv_ms + fix_ms) + solve_peak_dep_rows * p12_flag_ms(rc)
     if solve_sync > 0.0:
         prev = _push(_fixed_stage("kda_solve_cv", solve_sync, after=(prev,)))
 
-    # 6. recompute_w_u (v_tiles + k_panels dots + 2*exp2)
-    prev = _push(bind_phase(Phase("kda_recomp_io_alu", prep_works["recomp_io"], (prev,)), rc, ctx, all_aics, all_aivs))
+    # 6. recompute_w_u: grid=(NT, B*H)
+    prev = _push(bind_phase(Phase("kda_recomp_io_alu", prep_works["recomp_io"], (prev,)), rc, ctx, solve_aics, solve_aivs))
     prev = _push(_cap_vec_stage(
-        bind_phase(Phase("kda_recomp_exp2", prep_works["recomp_exp2"], (prev,)), rc, ctx, (), all_aivs),
+        bind_phase(Phase("kda_recomp_exp2", prep_works["recomp_exp2"], (prev,)), rc, ctx, (), solve_aivs),
         rc, sfu_ratio,
     ))
     recomp_sync = solve_waves * (v_tiles + k_panels) * (cv_ms + fix_ms)
     if recomp_sync > 0.0:
         prev = _push(_fixed_stage("kda_recomp_cv", recomp_sync, after=(prev,)))
 
-    # 7. chunk_delta_h (grid=(ceil(V/64), N*H) serial recurrence; only HBM capped to active cores)
-    st_aics = tuple(aic for aic, _ in active_state_pairs)
-    st_aivs = tuple(peers[0] for _, peers in active_state_pairs)
-    prev = _push(bind_phase(Phase("state_init_final_io", state_init_work, (prev,)), rc, ctx, st_aics, st_aivs))
+    # 7. chunk_delta_h: per-owner sequential programs (init -> chunk recurrence -> FP32 final store)
     cv_sync_per_step_ms = (2 * k_panels) * (CV_ROUNDTRIP_PAIRED_SYNCS * cv_ms + fix_ms)
-    w_store_h, w_ws_dot, w_res_dec, w_kv_dot = unit_works
+    prev = _push(_lower_state_owners(c, ctx, rc, active_state_pairs, owner_runs, cv_sync_per_step_ms, prev))
 
-    for band_idx, (steps, k_active) in enumerate(bands):
-        b_pairs = active_state_pairs[:k_active]
-        b_aics = tuple(aic for aic, _ in b_pairs)
-        b_aivs = tuple(peers[0] for _, peers in b_pairs)
-        caps = p01_cold_hbm_group_cap(rc, k_active, include_l2=False)
-        ws0 = w_store_h.scaled(k_active)
-        ws1 = w_ws_dot.scaled(k_active)
-        ws2 = w_res_dec.scaled(k_active)
-        ws3 = w_kv_dot.scaled(k_active)
-
-        def _cap(st: Stage, cap_map=caps) -> Stage:
-            applied = {k: v for k, v in cap_map.items() if k in st.work}
-            return replace(st, caps={**st.caps, **applied}) if applied else st
-
-        def _band_step(_idx: int, ws0=ws0, ws1=ws1, ws2=ws2, ws3=ws3, b_aics=b_aics, b_aivs=b_aivs, _cap=_cap):
-            s0 = _cap(bind_phase(Phase("h_store_enter", ws0), rc, ctx, b_aics, b_aivs))
-            s1 = _cap(bind_phase(Phase("h_ws_fp32_dot", ws1, ("h_store_enter",)), rc, ctx, b_aics, b_aivs))
-            s2 = _cap(bind_phase(Phase("h_res_decay", ws2, ("h_ws_fp32_dot",)), rc, ctx, b_aics, b_aivs))
-            s3 = _cap(bind_phase(Phase("h_kv_bf16_dot", ws3, ("h_res_decay",)), rc, ctx, b_aics, b_aivs))
-            if cv_sync_per_step_ms > 0.0:
-                return (s0, s1, s2, s3, _fixed_stage("h_chunk_cv_sync", cv_sync_per_step_ms, after=("h_kv_bf16_dot",)))
-            return (s0, s1, s2, s3)
-
-        b_prog = compact_periodic_pipeline(
-            rc, steps, 1, _band_step, head=COMPACT_WINDOW, tail=COMPACT_WINDOW, threshold=COMPACT_THRESHOLD,
-        )
-        prev = _push(Stage(f"state_recurrence_band_{band_idx}", after=(prev,), program=b_prog))
-
-    # 8. chunk_gla_fwd_kernel_o
-    prev = _push(bind_phase(Phase(out_phase.name, out_phase.work, (prev,)), rc, ctx, all_aics, all_aivs))
-    out_sync = solve_waves * TRITON_OUT_CV_HANDOFFS * (cv_ms + fix_ms)
+    # 8. chunk_gla_fwd_kernel_o: grid=(cdiv(V, BV=128), NT, B*H)
+    out_progs = ceil_div(c.dv, OUT_TILE_BV) * head_chunks
+    out_aics, out_aivs = _pair_owners(pairs, out_progs)
+    prev = _push(bind_phase(Phase(out_phase.name, out_phase.work, (prev,)), rc, ctx, out_aics, out_aivs))
+    out_sync = ceil_div(out_progs, max(1, len(out_aics))) * TRITON_OUT_CV_HANDOFFS * (cv_ms + fix_ms)
     if out_sync > 0.0:
         _push(_fixed_stage("kda_out_cv", out_sync, after=(prev,)))
     return KernelProgram(tuple(stages))
@@ -508,7 +790,7 @@ def _lower_chunk_kda(
 def build_triton_chunk_kda(
     c: LinearAttentionContract, ctx: OperatorPlanningContext,
 ) -> OperatorPlan:
-    """Lower vllm_ascend.ops.triton.kda.kda.chunk_kda (7 kernels + 4 eager ops)."""
+    """Lower vllm_ascend.ops.triton.kda.kda.chunk_kda (7 kernels + 4 eager ops + optional Q/K L2-norm)."""
     if c.dk > TRITON_CHUNK_KDA_MAX_K:
         raise missing(
             "triton_chunk_kda_head_dim_k_unsupported",
@@ -524,28 +806,22 @@ def build_triton_chunk_kda(
 
     elem = element_bytes(c.dtype)
     state_elem = element_bytes(c.state_dtype)
-    gate_elem = element_bytes(c.gate_dtype)
     bt = c.bt
     total_tokens = sum(c.lengths)
-    total_chunks = sum(ceil_div(length, bt) for length in c.lengths)
+    stats = _chunk_live_stats(c)
+    total_chunks = int(stats["total_chunks"])
     head_chunks = total_chunks * c.hv
     token_heads = total_tokens * c.hv
+    use_qk_l2norm = bool(c.metadata.get("use_qk_l2norm_in_kernel", False))
+    l2_works = _qk_l2norm_works(c, ctx, total_tokens) if use_qk_l2norm else None
 
-    total_offdiag_blocks = 0
-    for length in c.lengths:
-        rem = length
-        while rem > 0:
-            rows = min(bt, rem)
-            n_sub = ceil_div(rows, TRITON_DIAG_BLOCK)
-            total_offdiag_blocks += (n_sub * (n_sub - 1)) // 2
-            rem -= rows
-
-    prep_works = _prepare_kernel_works(c, ctx, total_tokens, head_chunks, total_offdiag_blocks)
-    cumsum_phase = Phase("triton_kda_cumsum", prep_works["cumsum"])
+    prep_works = _prepare_kernel_works(c, ctx, total_tokens, stats)
+    cumsum_after = ("triton_kda_qk_l2norm",) if use_qk_l2norm else ()
+    cumsum_phase = Phase("triton_kda_cumsum", prep_works["cumsum"], cumsum_after)
     prep_body_work = (
         prep_works["eager"] + prep_works["inter_io"] + prep_works["inter_exp2"]
         + prep_works["intra_io"] + prep_works["intra_exp2"] + prep_works["intra_red"]
-        + prep_works["solve_io"] + prep_works["solve_red"]
+        + prep_works["solve_zero_ai"] + prep_works["solve_io"] + prep_works["solve_red"]
         + prep_works["recomp_io"] + prep_works["recomp_exp2"]
     )
     pre_phase = Phase("triton_kda_prepare_alu", prep_body_work, ("triton_kda_cumsum",))
@@ -553,31 +829,48 @@ def build_triton_chunk_kda(
     v_tiles = ceil_div(c.dv, STATE_TILE_BV)
     state_progs = v_tiles * len(c.lengths) * c.hv
     active_state_pairs = pairs[:min(len(pairs), state_progs)]
-    bands = _owner_chunk_bands(c.lengths, bt, c.hv, v_tiles, len(active_state_pairs))
-    unit_works = _state_unit_works(c, ctx)
-    one_chunk_state_work = unit_works[0] + unit_works[1] + unit_works[2] + unit_works[3]
-    init_state_bytes = len(c.lengths) * c.hv * c.dk * c.dv * state_elem
-    state_init_work = transfer(
-        ctx, read=init_state_bytes * c.use_initial_state,
-        write=init_state_bytes * c.output_final_state,
-    )
-    total_state_chunks = total_chunks * c.hv * v_tiles
+    owner_runs = _assign_state_programs(c, len(active_state_pairs))
+    chunk_cache: dict[tuple[int, int], tuple[Work, Work, Work, Work]] = {}
+    state_total_work = Work()
+    for runs in owner_runs:
+        for count, length, tile_bv in runs:
+            prog_w = Work()
+            if c.use_initial_state:
+                prog_w += transfer(ctx, read=tile_bv * c.dk * state_elem)
+            full, tail = divmod(length, bt)
+            if full > 0:
+                if (bt, tile_bv) not in chunk_cache:
+                    chunk_cache[(bt, tile_bv)] = _state_chunk_works(c, ctx, bt, tile_bv)
+                w0, w1, w2, w3 = chunk_cache[(bt, tile_bv)]
+                prog_w += (w0 + w1 + w2 + w3).scaled(full)
+            if tail > 0:
+                if (tail, tile_bv) not in chunk_cache:
+                    chunk_cache[(tail, tile_bv)] = _state_chunk_works(c, ctx, tail, tile_bv)
+                w0, w1, w2, w3 = chunk_cache[(tail, tile_bv)]
+                prog_w += w0 + w1 + w2 + w3
+            if c.output_final_state:
+                prog_w += transfer(ctx, write=tile_bv * c.dk * FP32_BYTES)
+            state_total_work += prog_w.scaled(count)
     state_phase = Phase(
         "triton_kda_state_recurrence",
-        state_init_work + one_chunk_state_work.scaled(total_state_chunks),
+        state_total_work,
         ("triton_kda_prepare_alu",),
     )
 
-    g_bytes = token_heads * c.dk * gate_elem
-    score_fp32 = head_chunks * bt * bt * FP32_BYTES
-    score_bf16 = head_chunks * bt * bt * elem
+    g_fp32_bytes = token_heads * c.dk * FP32_BYTES
+    score_fp32 = token_heads * bt * FP32_BYTES
+    score_bf16 = token_heads * bt * elem
     entering_bank_bytes = head_chunks * c.dk * c.dv * elem
-    out_read = token_heads * (c.dk + c.dv) * elem + g_bytes + score_fp32 + entering_bank_bytes
+    out_v_tiles = ceil_div(c.dv, OUT_TILE_BV)
+    out_shared_read = token_heads * c.dk * elem + g_fp32_bytes + score_fp32
+    out_private_read = token_heads * c.dv * elem + entering_bank_bytes
+    out_mte2_aiv = out_v_tiles * out_shared_read + out_private_read
+    out_l2_hits = (out_v_tiles - 1) * out_shared_read
     out_write = token_heads * c.dv * elem
     out_cube_flops = head_chunks * 2 * (bt * c.dk * c.dv + bt * bt * c.dv)
     out_phase = Phase(
         "triton_kda_output_o",
-        transfer(ctx, read=out_read, write=out_write) + Work(
+        transfer(ctx, read=out_mte2_aiv, write=out_write, hits=out_l2_hits) + Work(
             {c.dtype: out_cube_flops},
             {"mte1": token_heads * (c.dk + c.dv) * elem + entering_bank_bytes + score_bf16,
              "fixpipe": out_write, "vector": 2 * token_heads * c.dk},
@@ -585,18 +878,25 @@ def build_triton_chunk_kda(
         ("triton_kda_state_recurrence",),
     )
 
-    totals = (cumsum_phase, pre_phase, state_phase, out_phase)
+    totals: list[Phase] = []
+    if l2_works is not None:
+        l2_total = (
+            l2_works["q_load"] + l2_works["q_red"] + l2_works["q_sfu"] + l2_works["q_store"]
+            + l2_works["k_load"] + l2_works["k_red"] + l2_works["k_sfu"] + l2_works["k_store"]
+        )
+        totals.append(Phase("triton_kda_qk_l2norm", l2_total))
+    totals.extend((cumsum_phase, pre_phase, state_phase, out_phase))
+    launch_count = TRITON_CHUNK_LAUNCH_COUNT + (L2NORM_VECTORS if use_qk_l2norm else 0)
 
     def lower(rc: RecipeContext) -> KernelProgram:
         return _lower_chunk_kda(
-            c, ctx, rc, pairs, active_state_pairs, prep_works,
-            head_chunks, total_offdiag_blocks, state_init_work,
-            unit_works, bands, out_phase,
+            c, ctx, rc, pairs, aivs, active_state_pairs, l2_works, prep_works,
+            total_tokens, stats, owner_runs, out_phase,
         )
 
     return make_plan(
-        ctx, TRITON_CHUNK_KDA_ABI, totals, sources=TRITON_KDA_SOURCES,
-        launch_count=TRITON_CHUNK_LAUNCH_COUNT, program=lower,
+        ctx, TRITON_CHUNK_KDA_ABI, tuple(totals), sources=TRITON_KDA_SOURCES,
+        launch_count=launch_count, program=lower,
         metadata={
             "template": "triton_chunk_kda", "chunk_tokens": bt,
             "total_chunks": total_chunks, "state_programs": state_progs,
@@ -625,6 +925,8 @@ def _lower_recurrent_kda(
     update_alu: float,
     dot2_red: float,
     ht_mte3_total: float,
+    beta_prep_works: tuple[Work, Work, Work, Work] | None = None,
+    beta_elems: int = 0,
 ) -> KernelProgram:
     reduce_ratio = _reduce_rate_ratio(rc)
     sfu_ratio = _sfu_rate_ratio(rc)
@@ -690,34 +992,57 @@ def _lower_recurrent_kda(
         return KernelProgram(tuple(stages_g))
 
     if active_aivs < REC_ASYNC_GROUPS or waves <= 1:
-        return _group_prog(aivs[:active_aivs], total_progs, "g0_")
-    # Two independent AIV halves keep T=1 load->vec->store serial per AIV while staggering HBM.
-    mid = active_aivs // REC_ASYNC_GROUPS
-    a_aivs, b_aivs = aivs[:mid], aivs[mid:active_aivs]
-    a_progs = (total_progs * len(a_aivs)) // active_aivs
-    b_progs = total_progs - a_progs
-    a_head = _block_stages(len(a_aivs), a_aivs, "ga0_")
-    a_rem_progs = a_progs - len(a_aivs)
-    if a_rem_progs <= 0:
-        return KernelProgram((
-            Stage("triton_rec_half_a", program=KernelProgram(a_head)),
-            Stage("triton_rec_half_b", program=_group_prog(b_aivs, b_progs, "gb_")),
-        ))
-    return KernelProgram((
-        *a_head,
-        Stage("triton_rec_half_a_rest", after=(a_head[-1].name,), program=_group_prog(a_aivs, a_rem_progs, "ga_")),
-        Stage("triton_rec_half_b", after=(a_head[0].name,), program=_group_prog(b_aivs, b_progs, "gb_")),
-    ))
+        rec_prog = _group_prog(aivs[:active_aivs], total_progs, "g0_")
+    else:
+        # Two independent AIV halves keep T=1 load->vec->store serial per AIV while staggering HBM.
+        mid = active_aivs // REC_ASYNC_GROUPS
+        a_aivs, b_aivs = aivs[:mid], aivs[mid:active_aivs]
+        a_progs = (total_progs * len(a_aivs)) // active_aivs
+        b_progs = total_progs - a_progs
+        a_head = _block_stages(len(a_aivs), a_aivs, "ga0_")
+        a_rem_progs = a_progs - len(a_aivs)
+        if a_rem_progs <= 0:
+            rec_prog = KernelProgram((
+                Stage("triton_rec_half_a", program=KernelProgram(a_head)),
+                Stage("triton_rec_half_b", program=_group_prog(b_aivs, b_progs, "gb_")),
+            ))
+        else:
+            rec_prog = KernelProgram((
+                *a_head,
+                Stage("triton_rec_half_a_rest", after=(a_head[-1].name,), program=_group_prog(a_aivs, a_rem_progs, "ga_")),
+                Stage("triton_rec_half_b", after=(a_head[0].name,), program=_group_prog(b_aivs, b_progs, "gb_")),
+            ))
+
+    if beta_prep_works is None:
+        return rec_prog
+    beta_cast_w, beta_sig_load_w, beta_sig_sfu_w, beta_sig_store_w = beta_prep_works
+    beta_aivs = aivs[:min(len(aivs), max(1, ceil_div(beta_elems, REC_SIMD_WIDTH)))]
+    pre_stages: list[Stage] = []
+    beta_after: tuple[str, ...] = ()
+    if beta_cast_w.resources:
+        s_cast = bind_phase(Phase("rec_beta_cast", beta_cast_w), rc, ctx, (), beta_aivs)
+        pre_stages.append(s_cast)
+        beta_after = (s_cast.name,)
+    s_sig_load = bind_phase(Phase("rec_beta_sigmoid_load", beta_sig_load_w, beta_after), rc, ctx, (), beta_aivs)
+    s_sig_sfu = _cap_vec_stage(
+        bind_phase(Phase("rec_beta_sigmoid_sfu", beta_sig_sfu_w, (s_sig_load.name,)), rc, ctx, (), beta_aivs),
+        rc, sfu_ratio,
+    )
+    s_sig_store = bind_phase(
+        Phase("rec_beta_sigmoid_store", beta_sig_store_w, (s_sig_sfu.name,)), rc, ctx, (), beta_aivs,
+    )
+    pre_stages.extend((s_sig_load, s_sig_sfu, s_sig_store))
+    return KernelProgram((*pre_stages, Stage("triton_rec_kernel", after=(s_sig_store.name,), program=rec_prog)))
 
 
-def _resolve_triton_recurrent_state_counts(c: LinearAttentionContract) -> tuple[int, int]:
-    """Return ``(loaded_initial_seqs, stored_checkpoint_tokens)`` per fused_recurrent_kda.py."""
+def _resolve_triton_recurrent_state_counts(c: LinearAttentionContract) -> tuple[int, int, int]:
+    """Return ``(loaded_initial_seqs, active_tokens, stored_checkpoint_tokens)`` per fused_recurrent_kda.py."""
     n_seqs = len(c.lengths)
     total_tokens = sum(c.lengths)
     inplace_final_state = bool(c.metadata.get("inplace_final_state", True))
     raw_indices = c.metadata.get("ssm_state_indices")
     if not isinstance(raw_indices, (tuple, list)):
-        return (n_seqs if c.use_initial_state else 0), total_tokens
+        return (n_seqs if c.use_initial_state else 0), total_tokens, total_tokens
     if raw_indices and isinstance(raw_indices[0], (tuple, list)):
         rows = tuple(tuple(int(v) for v in row) for row in raw_indices)
     elif len(raw_indices) == total_tokens and n_seqs > 0:
@@ -732,6 +1057,7 @@ def _resolve_triton_recurrent_state_counts(c: LinearAttentionContract) -> tuple[
         rows = tuple((int(v),) for v in raw_indices)
     num_accepted = c.metadata.get("num_accepted_tokens")
     loaded_seqs = 0
+    active_tokens = 0
     stored_tokens = 0
     for seq_idx, seq_len in enumerate(c.lengths):
         row = rows[seq_idx] if seq_idx < len(rows) else ()
@@ -746,11 +1072,12 @@ def _resolve_triton_recurrent_state_counts(c: LinearAttentionContract) -> tuple[
             if init_slot <= 0:
                 continue
             loaded_seqs += 1
+        active_tokens += seq_len
         if inplace_final_state:
             stored_tokens += sum(1 for v in row[:seq_len] if v > 0)
         else:
             stored_tokens += seq_len
-    return loaded_seqs, stored_tokens
+    return loaded_seqs, active_tokens, stored_tokens
 
 
 def build_triton_recurrent_kda(
@@ -773,6 +1100,14 @@ def build_triton_recurrent_kda(
     total_tokens = sum(c.lengths)
     max_q = max(c.lengths)
     use_l2norm = bool(c.metadata.get("use_qk_l2norm_in_kernel", True))
+    sigmoid_beta = bool(c.metadata.get("sigmoid_beta", False))
+    is_beta_headwise = bool(c.metadata.get("is_beta_headwise", False))
+    beta_width = c.dv if is_beta_headwise else 1
+    beta_prog_width = bv if is_beta_headwise else 1
+    needs_beta_cast = sigmoid_beta and c.beta_dtype.lower() not in FP32_DTYPES
+    # kda.py:168-169: eager beta.float().sigmoid() precedes fused_recurrent_kda_fwd.
+    effective_beta_elem = FP32_BYTES if sigmoid_beta else beta_elem
+    launch_count = 1 + int(needs_beta_cast) + int(sigmoid_beta)
 
     total_progs = nk * nv * n_seqs * c.hv
     active_aivs = min(len(aivs), total_progs)
@@ -782,32 +1117,35 @@ def build_triton_recurrent_kda(
     # fused_recurrent_kda.py:99-148: kernel stores every token checkpoint to ht
     # whenever INPLACE_FINAL_STATE=False, or for every positive ssm_state_idx when True,
     # independent of the wrapper return flag output_final_state; state_idx <= 0 early-returns.
-    loaded_seqs, stored_tokens = _resolve_triton_recurrent_state_counts(c)
+    loaded_seqs, active_tokens, stored_tokens = _resolve_triton_recurrent_state_counts(c)
 
     head_state_bytes = c.dk * c.dv * state_elem
     h0_read_total = loaded_seqs * c.hv * head_state_bytes
     ht_write_total = stored_tokens * c.hv * head_state_bytes
-    qkvgb_per_tok_head = (2 * c.dk + c.dv) * elem + c.dk * gate_elem + beta_elem
-    qkvgb_hbm_total = total_tokens * c.hv * qkvgb_per_tok_head
+    qkvgb_per_tok_head = (2 * c.dk + c.dv) * elem + c.dk * gate_elem + beta_width * effective_beta_elem
+    qkvgb_hbm_total = active_tokens * c.hv * qkvgb_per_tok_head
     # Each program issues 5 separate small vector GM loads (q, k, v, gk, beta) -> min burst per load on MTE2.
-    qkvgb_mte2_per_prog = max(2 * c.dk * elem + c.dk * gate_elem + beta_elem + bv * elem, REC_SMALL_GM_LOADS * burst)
-    qkvgb_mte2_total = total_tokens * c.hv * nv * qkvgb_mte2_per_prog
-    out_write_total = total_tokens * c.hv * c.dv * elem
-    ht_mte3_total = ht_write_total + total_tokens * c.hv * nv * burst
+    qkvgb_mte2_per_prog = max(
+        2 * c.dk * elem + c.dk * gate_elem + beta_prog_width * effective_beta_elem + bv * elem,
+        REC_SMALL_GM_LOADS * burst,
+    )
+    qkvgb_mte2_total = active_tokens * c.hv * nv * qkvgb_mte2_per_prog
+    out_write_total = active_tokens * c.hv * c.dv * elem
+    ht_mte3_total = ht_write_total + active_tokens * c.hv * nv * burst
 
     # Exact per-program vector/SFU/reduce op counts grounded in fused_recurrent_kda.py:76-149.
     prog_state = bv * bk
     prologue_alu = total_progs * REC_PROLOGUE_OPS_PER_STATE * prog_state
-    l2norm_alu = (total_tokens * c.hv * nv * L2NORM_VECTORS * L2NORM_ALU_MULT * bk) if use_l2norm else 0
-    l2norm_red = (total_tokens * c.hv * nv * L2NORM_VECTORS * L2NORM_TREE_STEPS * bk) if use_l2norm else 0
-    l2norm_sfu = (total_tokens * c.hv * nv * L2NORM_VECTORS * bk) if use_l2norm else 0
-    short_vec_alu = total_tokens * c.hv * nv * REC_SHORT_VEC_OPS * max(bv, REC_SIMD_WIDTH)
-    decay_alu = prologue_alu + l2norm_alu + short_vec_alu + total_tokens * c.hv * nv * (REC_DECAY_OPS_PER_STATE * prog_state + bk)
+    l2norm_alu = (active_tokens * c.hv * nv * L2NORM_VECTORS * L2NORM_ALU_MULT * bk) if use_l2norm else 0
+    l2norm_red = (active_tokens * c.hv * nv * L2NORM_VECTORS * L2NORM_TREE_STEPS * bk) if use_l2norm else 0
+    l2norm_sfu = (active_tokens * c.hv * nv * L2NORM_VECTORS * bk) if use_l2norm else 0
+    short_vec_alu = active_tokens * c.hv * nv * REC_SHORT_VEC_OPS * max(bv, REC_SIMD_WIDTH)
+    decay_alu = prologue_alu + l2norm_alu + short_vec_alu + active_tokens * c.hv * nv * (REC_DECAY_OPS_PER_STATE * prog_state + bk)
     # fused_recurrent_kda.py:127-128: tl.exp(b_gk[None, :]) evaluates exp on [1, BK] before broadcasting across BV.
-    sfu_ops = total_tokens * c.hv * nv * bk + l2norm_sfu
-    dot1_red = l2norm_red + total_tokens * c.hv * nv * prog_state
-    update_alu = total_tokens * c.hv * nv * (REC_UPDATE_OPS_PER_STATE + REC_EPILOGUE_OPS_PER_STATE) * prog_state
-    dot2_red = total_tokens * c.hv * nv * prog_state
+    sfu_ops = active_tokens * c.hv * nv * bk + l2norm_sfu
+    dot1_red = l2norm_red + active_tokens * c.hv * nv * prog_state
+    update_alu = active_tokens * c.hv * nv * (REC_UPDATE_OPS_PER_STATE + REC_EPILOGUE_OPS_PER_STATE) * prog_state
+    dot2_red = active_tokens * c.hv * nv * prog_state
     total_vec = decay_alu + sfu_ops + dot1_red + update_alu + dot2_red
 
     total_hbm_read = h0_read_total + qkvgb_hbm_total
@@ -816,10 +1154,37 @@ def build_triton_recurrent_kda(
     total_l2_hits = max(0, qkvgb_mte2_total - qkvgb_hbm_total)
     has_l2_rate = "l2" in ctx.geometry.rates
 
-    phases = (
+    beta_elems = total_tokens * c.hv * beta_width
+    beta_prep_works: tuple[Work, Work, Work, Work] | None = None
+    phase_list: list[Phase] = []
+    init_after: tuple[str, ...] = ()
+    if sigmoid_beta:
+        beta_in_bytes = beta_elems * beta_elem
+        beta_fp32_bytes = beta_elems * FP32_BYTES
+        beta_cast_w = (
+            transfer(ctx, read=beta_in_bytes, write=beta_fp32_bytes) + Work(resources={"vector": beta_elems})
+            if needs_beta_cast else Work()
+        )
+        beta_sig_load_w = (
+            transfer(ctx, read=beta_fp32_bytes)
+            + Work(resources={"vector": BETA_SIGMOID_LOAD_ALU_OPS * beta_elems})
+        )
+        beta_sig_sfu_w = Work(resources={"vector": beta_elems})
+        beta_sig_store_w = (
+            transfer(ctx, write=beta_fp32_bytes)
+            + Work(resources={"vector": BETA_SIGMOID_STORE_ALU_OPS * beta_elems})
+        )
+        beta_prep_works = (beta_cast_w, beta_sig_load_w, beta_sig_sfu_w, beta_sig_store_w)
+        phase_list.append(Phase(
+            "sigmoid_beta_preprocess",
+            beta_cast_w + beta_sig_load_w + beta_sig_sfu_w + beta_sig_store_w,
+        ))
+        init_after = ("sigmoid_beta_preprocess",)
+
+    phase_list.extend((
         Phase("load_initial_state", Work(resources={
             "hbm": h0_read_total, "mte2_aiv": h0_read_total,
-        })),
+        }), init_after),
         Phase("recurrent_token_loop", Work(resources={
             "hbm": qkvgb_hbm_total + total_hbm_write,
             "mte2_aiv": qkvgb_mte2_total,
@@ -827,7 +1192,7 @@ def build_triton_recurrent_kda(
             "vector": total_vec,
             **({"l2": total_l2_hits} if (total_l2_hits and has_l2_rate) else {}),
         }), ("load_initial_state",)),
-    )
+    ))
 
     def lower(rc: RecipeContext) -> KernelProgram:
         return _lower_recurrent_kda(
@@ -837,11 +1202,12 @@ def build_triton_recurrent_kda(
             total_mte2_aiv=total_mte2_aiv, total_l2_hits=total_l2_hits, has_l2_rate=has_l2_rate,
             decay_alu=decay_alu, sfu_ops=sfu_ops, dot1_red=dot1_red,
             update_alu=update_alu, dot2_red=dot2_red, ht_mte3_total=ht_mte3_total,
+            beta_prep_works=beta_prep_works, beta_elems=beta_elems,
         )
 
     return make_plan(
-        ctx, TRITON_RECURRENT_KDA_ABI, phases, sources=TRITON_RECURRENT_SOURCES,
-        owners=active_aivs, program=lower,
+        ctx, TRITON_RECURRENT_KDA_ABI, tuple(phase_list), sources=TRITON_RECURRENT_SOURCES,
+        launch_count=launch_count, owners=active_aivs, program=lower,
         metadata={
             "template": "triton_recurrent_kda", "bk": bk, "bv": bv,
             "total_programs": total_progs, "active_aivs": active_aivs, "waves": waves,
