@@ -16,9 +16,11 @@ from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction as Fraction
 from itertools import count as _count
 import math
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
-from .matrix import DEFAULT_COMPUTE_TILE_MN, HierarchicalMatmul
+from mindie_sim.schema.datapath import SourceRef
+from .matrix import DEFAULT_COMPUTE_TILE_MN, HierarchicalMatmul, plain_store_role
 from .matrix_epilogue import MatrixEpilogue
 from .matrix_mapping_owners import (
     MS_PER_SECOND,
@@ -43,6 +45,22 @@ from .matrix_mapping_owners import (
 )
 from mindie_sim.prediction.mechanism import Work as _Work
 from mindie_sim.prediction.ownership import read_role
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_OPS_TRANSFORMER_REV = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "cann/ops-transformer", _OPS_TRANSFORMER_REV,
+        "mc2/3rd/mat_mul_v3/op_host/op_tiling/arch35/matmul_v3_basic_streamk_tiling.cpp",
+        "1a1ba337c283965aa9495220b1df8b868c082591768c4b82e6c1d251b2def497",
+    ),
+    SourceRef(
+        "cann/ops-transformer", _OPS_TRANSFORMER_REV,
+        "mc2/3rd/mat_mul_v3/op_host/op_tiling/matmul_v3_base_tiling.cpp",
+        "472db5c1bb12fd01289005f636dfa7b86cb0d49c9ce8ee77313fe8c430d618a0",
+    ),
+)
+
 FP32_BYTES = 4
 
 GEMM_SHAPE_AXES = 3
@@ -465,6 +483,25 @@ def _split_k_bound(context, recipe, geometry, *, bound, split_k, output_tiles):
             + (merge_ops / vec_r if vec_r > 0.0 else 0.0) + fixup_ms)
 
 
+def splitk_executable(context, recipe) -> bool:
+    """True iff Split-K > 1 can execute legally on ``context``."""
+    if getattr(recipe, "k_splits", 1) <= 1:
+        return False
+    pools = getattr(context, "pool_capacities", None) or {}
+    if "l0c" in pools:
+        shape = getattr(context.op, "local_shape", ()) or ()
+        if len(shape) >= GEMM_SHAPE_AXES:
+            groups = max(1, int(dict(context.op.metadata).get("matrix_groups", 1) or 1))
+            eff_m = min(int(recipe.tile_m), max(1, int(shape[-GEMM_SHAPE_AXES]) // groups))
+            eff_n = min(int(recipe.tile_n), max(1, int(shape[-2])))
+        else:
+            eff_m, eff_n = int(recipe.tile_m), int(recipe.tile_n)
+        tile_l0c = eff_m * eff_n * FP32_BYTES
+        if float(pools["l0c"]) < float(tile_l0c):
+            return False
+    return True
+
+
 def mapping_bound(context, recipe, *, geometry=None, allow_unequal_groups=False,
                   ignore_l2_hits=False):
     """Resource-only lower bound with private copies and actual owner tails."""
@@ -488,6 +525,17 @@ def mapping_bound(context, recipe, *, geometry=None, allow_unequal_groups=False,
               for _, a, b, _ in owners]
     width = dtype_bytes(meta.get("compute_format", context.op.dtype or "bf16"))
     if len(set(geometry.group_rows)) == 1:
+        canonical_owners = owner_tiles(
+            m, n, recipe.tile_m, recipe.tile_n, context.core_count, groups)
+    else:
+        canonical_owners = grouped_owner_tiles(
+            geometry.group_rows, n, recipe.tile_m, recipe.tile_n, context.core_count)
+    if owners != canonical_owners:
+        left = tuple((0, 0, 0, max(a_sum, area_sum / recipe.compute_n))
+                     for _, a_sum, _, area_sum in owners)
+        right = tuple((0, 0, 0, max(b_sum, area_sum / recipe.compute_m))
+                      for _, _, b_sum, area_sum in owners)
+    elif len(set(geometry.group_rows)) == 1:
         left = owner_tiles(m, math.ceil(n / recipe.compute_n), recipe.tile_m,
                            recipe.tile_n // recipe.compute_n, context.core_count, groups)
         right = owner_tiles(math.ceil(m / recipe.compute_m), n,
@@ -501,13 +549,19 @@ def mapping_bound(context, recipe, *, geometry=None, allow_unequal_groups=False,
             n, recipe.tile_m // recipe.compute_m, recipe.tile_n, context.core_count)
     inner = [a[3] * max(inputs / total_m, k * width) + b[3] * max(weight / (n * groups), k * width)
              for a, b in zip(left, right)]
-    if recipe.reuse_inputs and recipe.reuse_weights:
-        hbm_reads = inputs + weight + epilogue.row_scale_bytes + epilogue.column_scale_bytes
+    input_hbm_factor = 1 if recipe.reuse_inputs else math.ceil(n / recipe.tile_n)
+    if recipe.reuse_weights:
+        active_groups = sum(1 for row in geometry.group_rows if row > 0)
+        weight_hbm_factor = active_groups / groups
     else:
-        hbm_reads = (((inputs + epilogue.row_scale_bytes) *
-                      (1 if recipe.reuse_inputs else math.ceil(n / recipe.tile_n)))
-                     + ((weight + epilogue.column_scale_bytes) *
-                        (1 if recipe.reuse_weights else math.ceil(m / recipe.tile_m))))
+        weight_hbm_factor = (
+            sum(math.ceil(row / recipe.tile_m) for row in geometry.group_rows if row > 0)
+            / groups
+        )
+    hbm_reads = (
+        (inputs + epilogue.row_scale_bytes) * input_hbm_factor
+        + (weight + epilogue.column_scale_bytes) * weight_hbm_factor
+    )
     admitted_l2_hit = (
         0.0 if ignore_l2_hits
         else max(0.0, float(meta.get("admitted_l2_read_hit_bytes", 0.0) or 0.0))
@@ -518,8 +572,8 @@ def mapping_bound(context, recipe, *, geometry=None, allow_unequal_groups=False,
     active_cores = max(1, min(int(context.core_count), int(geometry.tiles)))
     if pt is not None and hbm_reads > 0.0:
         miss_frac = hbm_miss_reads / hbm_reads
-        a_hbm = (inputs + epilogue.row_scale_bytes) * (1 if recipe.reuse_inputs else math.ceil(n / recipe.tile_n)) * miss_frac
-        b_hbm = (weight + epilogue.column_scale_bytes) * (1 if recipe.reuse_weights else math.ceil(m / recipe.tile_m)) * miss_frac
+        a_hbm = (inputs + epilogue.row_scale_bytes) * input_hbm_factor * miss_frac
+        b_hbm = (weight + epilogue.column_scale_bytes) * weight_hbm_factor * miss_frac
         a_cold = primitive_p01_scaling_bps(context, active_cores, warm=False)
         a_rate = min(hbm_declared, a_cold / MS_PER_SECOND) if a_cold else hbm_declared
         b_rate = _calibrated_hbm_rate_ms(
@@ -536,11 +590,12 @@ def mapping_bound(context, recipe, *, geometry=None, allow_unequal_groups=False,
     )
     demands = {}
     read_op_role = read_role(names)
+    store_role = plain_store_role(names, epilogue)
     for role, values in (
         (read_op_role, private),
         (read_role(names, aiv=0), scales),
         ("mte1", inner),
-        ("mte3", [context.op.mte3_bytes * area / (total_m * n) for _, _, _, area in owners]),
+        (store_role, [context.op.mte3_bytes * area / (total_m * n) for _, _, _, area in owners]),
         ("cube", [context.work.get(names["cube"], 0) * area / (total_m * n)
                   for _, _, _, area in owners]),
         ("vector", [epilogue.operations_per_output * area for _, _, _, area in owners]),
@@ -694,6 +749,9 @@ def _evaluate_select_candidate(
         tm, tn, tk, cm, cn,
         mapper.slots, mapper.compute_slots, mapper.reuse_inputs,
         mapper.reuse_weights, split_k)
+    if split_k > 1 and not splitk_executable(host_ctx, recipe):
+        split_k = 1
+        recipe = replace(recipe, k_splits=1)
     if min(tm, tn, tk, mapper.compute_m, mapper.compute_n,
            mapper.slots, mapper.compute_slots) < 1:
         raise ModelingError("matrix_tile_dimensions_and_slots_must_be_positive")
@@ -889,6 +947,12 @@ class MappedMatmul:
 
     def lower(self, context):
         recipe, record = self.select(context)
+        if getattr(recipe, "k_splits", 1) > 1 and splitk_executable(context, recipe):
+            from .matrix_splitk import splitk_program
+            program = splitk_program(context, recipe.k_splits, recipe=recipe, record=record)
+            if context.record_mapping is not None:
+                context.record_mapping(record)
+            return program
         if context.record_mapping is not None:
             context.record_mapping(record)
         return recipe.lower(context)

@@ -12,9 +12,20 @@
 """
 from dataclasses import dataclass, replace
 import math
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_OPS_NN_REV = "238f76a06d0cfc5ee90071e2c08310e2b517c3a6"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "cann/ops-nn", _OPS_NN_REV,
+        "matmul/quant_batch_matmul_v3/op_host/op_tiling/quant_batch_matmul_v3_basic_tiling.cpp",
+        "36d2ce67bcf638ae37dbebd3c6a08e86a797661aa2b1446a8804e17d0cf0abdb",
+    ),
+)
 
 TOLERANCE = 1e-12
 SUPPORTED_EPILOGUES = ("row_column_scale",)
@@ -201,6 +212,26 @@ def _check_producer_scale(producer, typed):
             f"{typed['row_scale_bytes']}")
 
 
+def _reconciled_precision_abi(op, typed):
+    """Rebuild ``op.precision_abi`` atomically for reconciled runtime scale storage."""
+    abi = getattr(op, "precision_abi", None)
+    if abi is None:
+        return None
+    w_fmt = typed["weight_scale_format"]
+    a_fmt = typed["activation_scale_format"]
+    w_bytes = max(0, int(round(float(dtype_bytes(w_fmt)))))
+    w_meta = dict(abi.weight_metadata)
+    w_meta["int8_weight_metadata"] = "scale_only"
+    return replace(
+        abi,
+        weight_scale_dtype=w_fmt,
+        weight_scale_bytes=w_bytes,
+        weight_metadata=tuple(w_meta.items()),
+        act_scale_dtype=a_fmt,
+        weight_offset_dtype="",
+    )
+
+
 def reconcile_native_scale_storage(op, *, producer=None):
     """Bind a native typed scale ABI to the common matrix epilogue record.
 
@@ -222,7 +253,15 @@ def reconcile_native_scale_storage(op, *, producer=None):
     row = typed["row_scale_bytes"]
     column = typed["column_scale_bytes"]
     metadata = dict(op.metadata)
-    if _runtime_scale_matches(metadata, typed, declared):
+    reconciled_abi = _reconciled_precision_abi(op, typed)
+    abi_matches = (
+        reconciled_abi == getattr(op, "precision_abi", None)
+        and (
+            reconciled_abi is None
+            or metadata.get("precision_abi_signature") == reconciled_abi.abi_signature
+        )
+    )
+    if _runtime_scale_matches(metadata, typed, declared) and abi_matches:
         return op
     old_activation_format = metadata.get("activation_scale_format")
     old_activation_bytes = metadata.get("activation_scale_bytes")
@@ -256,6 +295,8 @@ def reconcile_native_scale_storage(op, *, producer=None):
         "weight_bytes": new_packed,
         **({"weight_payload_bytes": payload}
            if "weight_payload_bytes" in metadata else {}),
+        **({"precision_abi_signature": reconciled_abi.abi_signature}
+           if reconciled_abi is not None else {}),
         "native_scale_reconciliation": {
             "basis": "native_call.typed.attrs.input_dtypes",
             "input_dtypes": typed["input_dtypes"],
@@ -273,8 +314,11 @@ def reconcile_native_scale_storage(op, *, producer=None):
             "source": "T12 normalized typed input slots",
         },
     })
-    return replace(op, hbm_bytes=new_hbm, mte2_bytes=new_mte2,
-                   metadata=tuple(metadata.items()))
+    return replace(
+        op, hbm_bytes=new_hbm, mte2_bytes=new_mte2,
+        precision_abi=reconciled_abi,
+        metadata=tuple(metadata.items()),
+    )
 
 
 

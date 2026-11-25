@@ -29,16 +29,31 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
-from typing import Any, Mapping, Sequence
+from typing import Any, Literal, Mapping, Sequence
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_OPS_NN_REV = "238f76a06d0cfc5ee90071e2c08310e2b517c3a6"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "cann/ops-nn", _OPS_NN_REV,
+        "matmul/quant_batch_matmul_v3/op_host/op_tiling/quant_batch_matmul_v3_basic_tiling.cpp",
+        "36d2ce67bcf638ae37dbebd3c6a08e86a797661aa2b1446a8804e17d0cf0abdb",
+    ),
+)
 
 PACKED_FP4_FORMATS = frozenset({"mxfp4", "fp4", "fp4_e2m1"})
 FP4_ACTIVATION_FORMATS = frozenset({"fp4", "fp4_e2m1", "mxfp4"})
 FP8_ACTIVATION_FORMATS = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8"})
 NATIVE_LOW_PRECISION_FORMATS = frozenset({"fp4_e2m1", "mxfp4", "hifloat8", "mxfp8"})
+MXFP4_SCALE_FORMATS = frozenset({"e8m0", "fp8_e8m0", "ue8m0"})
+MXFP4_PACKED_SCALE_TAGS = frozenset({"pack2", "2", "pair", "paired"})
+MXFP4_SCALE_GROUP_SIZE = 32
+MXFP4_SCALE_PACK_WIDTH = 2
+MXFP4_PACKED_SCALE_RANK = 3
 E4M3_ACTIVATIONS = frozenset({"fp8", "fp8_e4m3", "mxfp8"})
 E5M2_ACTIVATIONS = frozenset({"fp8_e5m2"})
 CATALOG_DEFAULT = "catalog_default"
@@ -47,7 +62,7 @@ ORIGIN_RESOLVED_FP4 = "resolved_native_fp4"
 RESOLVED_ORIGINS = frozenset({ORIGIN_RESOLVED_FP8, ORIGIN_RESOLVED_FP4})
 EXPLICIT_ORIGINS = frozenset({"explicit", "source", "typed", "calibrated"})
 EXPLICIT_METADATA_KEYS = frozenset({
-    "native_operator", "native_kind", "source_implementation",
+    "native_call", "native_operator", "native_kind", "source_implementation",
     "compute_format_override", "calibrated_service",
 })
 REASON_UNAVAILABLE = "fp8_unavailable"
@@ -72,7 +87,9 @@ def _declared_activation(meta: Mapping[str, Any]) -> str:
 def _explicit_identity(op: OpSpec, meta: Mapping[str, Any], recipe: Any) -> bool:
     if op.source_boundary:
         return True
-    if op.matrix_flops:
+    if op.matrix_flops and (
+        len(op.matrix_flops) > 1 or op.matrix_flops[0][0] != op.dtype
+    ):
         return True
     origin = str(meta.get("compute_format_origin", ""))
     if origin in EXPLICIT_ORIGINS:
@@ -86,6 +103,84 @@ def _explicit_identity(op: OpSpec, meta: Mapping[str, Any], recipe: Any) -> bool
     if recipe is not None and bool(getattr(recipe, "source_bound", False)):
         return True
     return False
+
+
+def _validate_native_call_precision(
+    op: OpSpec, meta: Mapping[str, Any], devices: Sequence[Any],
+) -> None:
+    """Reject explicitly declared native calls whose precision is unsupported on executing dies."""
+    native = meta.get("native_call")
+    if not isinstance(native, Mapping) or not devices:
+        return
+    typed = native.get("typed")
+    declared = (
+        str(typed.get("dtype") or "").strip().lower()
+        if isinstance(typed, Mapping) else ""
+    ) or str(op.dtype or "").strip().lower()
+    if not declared:
+        return
+    if not op.flops and declared not in (NATIVE_LOW_PRECISION_FORMATS | PACKED_FP4_FORMATS):
+        return
+    if not _all_dies_support(devices, declared):
+        raise ModelingError(f"matrix_native_call_precision_unsupported:{declared}")
+
+
+def _is_native_mxfp4_eligible(op: OpSpec, meta: Mapping[str, Any]) -> bool:
+    """Gate native MXFP4 Cube rate on group=32, fp8_e8m0 scales, and paired layout."""
+    abi = op.precision_abi
+    w_scale = str(
+        (abi.weight_scale_dtype if abi is not None else "")
+        or meta.get("weight_scale_format")
+        or meta.get("scale_format")
+        or ""
+    ).strip().lower()
+    a_scale = str(
+        (abi.act_scale_dtype if abi is not None else "")
+        or meta.get("activation_scale_format")
+        or ""
+    ).strip().lower()
+    if w_scale not in MXFP4_SCALE_FORMATS or a_scale not in MXFP4_SCALE_FORMATS:
+        return False
+    w_block = abi.weight_block if (abi is not None and abi.weight_block) else ()
+    if w_block:
+        if int(w_block[-1]) != MXFP4_SCALE_GROUP_SIZE:
+            return False
+    else:
+        raw_block = meta.get("weight_block") or meta.get("expert_block")
+        if isinstance(raw_block, (tuple, list)) and raw_block:
+            if int(raw_block[-1]) != MXFP4_SCALE_GROUP_SIZE:
+                return False
+        elif raw_block is not None and int(raw_block) != MXFP4_SCALE_GROUP_SIZE:
+            return False
+    act_group = int(
+        meta.get("activation_group_size")
+        or (abi.act_group_size if abi is not None else 0)
+        or 0
+    )
+    if act_group != MXFP4_SCALE_GROUP_SIZE:
+        return False
+    act_pack = str(
+        (abi.act_scale_pack if abi is not None else "")
+        or meta.get("activation_scale_pack")
+        or ""
+    ).strip().lower()
+    if act_pack in MXFP4_PACKED_SCALE_TAGS:
+        return True
+    act_shape = meta.get("activation_scale_shape")
+    return (
+        isinstance(act_shape, (tuple, list))
+        and len(act_shape) == MXFP4_PACKED_SCALE_RANK
+        and int(act_shape[-1]) == MXFP4_SCALE_PACK_WIDTH
+    )
+
+
+def _sync_precision_abi(op: OpSpec, meta: dict[str, Any], dtype: str):
+    abi = op.precision_abi
+    if abi is None or abi.compute_dtype == dtype:
+        return abi
+    updated = replace(abi, compute_dtype=dtype)
+    meta["precision_abi_signature"] = updated.abi_signature
+    return updated
 
 
 def _native_peak_checked(device: Any, dtype: str) -> float:
@@ -135,13 +230,15 @@ def _with_reason(op: OpSpec, reason: str) -> OpSpec:
     return replace(op, metadata=tuple(sorted(meta.items())))
 
 
-def _fallback_bf16_with_reason(op: OpSpec, devices: Sequence[Any], reason: str) -> OpSpec:
+def _fallback_bf16_with_reason(
+    op: OpSpec, devices: Sequence[Any], reason: str, *, force: bool = False,
+) -> OpSpec:
     meta = _metadata(op)
     origin = str(meta.get("compute_format_origin", ""))
     if (
         (origin in ("", CATALOG_DEFAULT) or origin in RESOLVED_ORIGINS)
         and op.dtype in (PACKED_FP4_FORMATS | FP8_ACTIVATION_FORMATS)
-        and not _all_dies_support(devices, str(op.dtype))
+        and (force or not _all_dies_support(devices, str(op.dtype)))
         and _all_dies_support(devices, "bf16")
     ):
         meta["precision_resolution_reason"] = reason
@@ -149,7 +246,11 @@ def _fallback_bf16_with_reason(op: OpSpec, devices: Sequence[Any], reason: str) 
         meta.pop("execution_compute_format", None)
         if origin in RESOLVED_ORIGINS:
             meta["compute_format_origin"] = CATALOG_DEFAULT
-        return replace(op, dtype="bf16", matrix_flops=(), metadata=tuple(sorted(meta.items())))
+        abi = _sync_precision_abi(op, meta, "bf16")
+        return replace(
+            op, dtype="bf16", matrix_flops=(), precision_abi=abi,
+            metadata=tuple(sorted(meta.items())),
+        )
     return _with_reason(op, reason)
 
 
@@ -164,6 +265,7 @@ def resolve_matrix_precision(
     if not op.metadata:
         return op
     meta = _metadata(op)
+    _validate_native_call_precision(op, meta, devices)
     weight = _declared_weight_format(meta).strip().lower()
     if weight not in PACKED_FP4_FORMATS:
         return op
@@ -175,19 +277,21 @@ def resolve_matrix_precision(
     origin = str(meta.get("compute_format_origin", ""))
     if origin not in RESOLVED_ORIGINS and _explicit_identity(op, meta, recipe):
         return _with_reason(op, REASON_SOURCE)
+    if is_fp4_act and not _is_native_mxfp4_eligible(op, meta):
+        return _fallback_bf16_with_reason(op, devices, REASON_FP4_UNAVAILABLE, force=True)
     target = _supported_precision(devices, activation)
     if target is None:
         reason = REASON_FP4_UNAVAILABLE if is_fp4_act else REASON_UNAVAILABLE
         return _fallback_bf16_with_reason(op, devices, reason)
     expected_mflops = (
         ((target, op.flops),)
-        if (op.flops and (not op.matrix_flops or origin in RESOLVED_ORIGINS))
-        else op.matrix_flops
+        if op.flops else op.matrix_flops
     )
     if (
         op.dtype == target
         and meta.get("execution_compute_format") == target
         and op.matrix_flops == expected_mflops
+        and (op.precision_abi is None or op.precision_abi.compute_dtype == target)
     ):
         return op
     declared = str(meta.get("declared_compute_format") or meta.get("compute_format") or op.dtype or "")
@@ -197,10 +301,12 @@ def resolve_matrix_precision(
     updated["compute_format"] = target
     updated["compute_format_origin"] = ORIGIN_RESOLVED_FP4 if is_fp4_act else ORIGIN_RESOLVED_FP8
     updated["precision_resolution_reason"] = REASON_NATIVE_FP4 if is_fp4_act else REASON_GENERIC_FP8
+    abi = _sync_precision_abi(op, updated, target)
     return replace(
         op,
         dtype=target,
         matrix_flops=expected_mflops,
+        precision_abi=abi,
         metadata=tuple(sorted(updated.items())),
     )
 
@@ -229,11 +335,16 @@ def execution_compute_peaks(
                for key, value in dict(getattr(device, "compute_peak_aliases", ()) or ()).items()}
     if op.dtype and str(op.dtype) in aliases:
         raise ModelingError(f"matrix_precision_not_native:{op.dtype}")
+    if not devices:
+        return base_peaks if isinstance(base_peaks, dict) else dict(base_peaks)
     metadata = dict(op.metadata)
     dtypes: list[str] = []
     resolved = str(metadata.get("execution_compute_format", ""))
-    if op.dtype and (op.dtype in base_peaks or resolved == str(op.dtype)
-                     or (op.flops and op.dtype in NATIVE_LOW_PRECISION_FORMATS)):
+    if op.dtype and (
+        op.dtype in base_peaks
+        or resolved == str(op.dtype)
+        or op.flops
+    ):
         dtypes.append(str(op.dtype))
     dtypes.extend(str(dtype) for dtype, _amount in op.matrix_flops)
     seen: set[str] = set()

@@ -11,10 +11,31 @@ from collections.abc import Mapping
 from fractions import Fraction
 from functools import lru_cache
 import math
+from typing import Literal
 
 from mindie_sim.prediction.runtime.memory_physics import AddressRun
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+_OPS_TRANSFORMER_REV = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "cann/ops-transformer", _OPS_TRANSFORMER_REV,
+        "gmm/grouped_matmul/op_host/op_tiling/arch35/grouped_no_quant_matmul_tiling.cpp",
+        "f1c1a40e70a11e475467c923698af3297fc55b90588ab8a0bd7ee1b4110d3c5b",
+    ),
+    SourceRef(
+        "cann/ops-transformer", _OPS_TRANSFORMER_REV,
+        "gmm/grouped_matmul/op_kernel/grouped_matmul_kernel.h",
+        "b5d4e80ce395887f5d95db83e5f36b6f13edf170208c9a7cf0f927858b0c1025",
+    ),
+    SourceRef(
+        "cann/ops-transformer", _OPS_TRANSFORMER_REV,
+        "mc2/3rd/mat_mul_v3/op_host/op_tiling/arch35/matmul_v3_basic_streamk_tiling.cpp",
+        "1a1ba337c283965aa9495220b1df8b868c082591768c4b82e6c1d251b2def497",
+    ),
+)
 
 _FRACTAL_ROWS = 16
 #: L2 cache sector widths for DAV_2201 (512 B) and DAV_3510 (128 B).
@@ -524,27 +545,46 @@ def weight_l2_cache_disabled(
     - Dense MatMulV3 (arch35/matmul_v3_base_tiling_advanced.h:146-189):
       requires total GM >= L2 capacity, single M-tile (baseM >= M and mCnt <= 1),
       and 128B alignment on both inner stride and tile row.
-    - GroupedMatmul (grouped_matmul_kernel.h:566 /
-      arch35/grouped_no_quant_matmul_tiling.cpp:193): honors explicit
-      ``l2_weight_cache_disable`` metadata when set, else A5 total GM >= L2
-      or single M-tile + 128B alignment.
+    - A3/DAV_2201 GroupedMatmul (grouped_matmul_kernel.h:566):
+      disables weight L2 cache whenever ``blockDimM == 1`` regardless of L2 size.
+    - A5/DAV_3510 GroupedMatmul (arch35/grouped_no_quant_matmul_tiling.cpp:186-200):
+      requires total GM >= L2 capacity AND (FRACTAL_NZ OR 128B-aligned ND
+      stride and panel width).
     """
     op = getattr(context, "op", None)
     meta = dict(getattr(op, "metadata", ()) or ()) if op is not None else {}
     if "l2_weight_cache_disable" in meta:
         return bool(meta["l2_weight_cache_disable"])
+    is_arch35 = is_arch35_context(context)
+    if is_grouped and not is_arch35:
+        if m_tiles is not None:
+            return int(m_tiles) == 1
+        if op is not None:
+            shape = getattr(op, "local_shape", ()) or ()
+            if len(shape) >= _GEMM_SHAPE_AXES:
+                groups = max(1, int(meta.get("matrix_groups", 1) or 1))
+                return (int(shape[-_GEMM_SHAPE_AXES]) // groups) <= MAX_SINGLE_M_TILE
+        return False
     l2_bytes, _ = primitive_l2_params(context)
     if l2_bytes <= 0:
         return False
     op_hbm_bytes = float(getattr(op, "hbm_bytes", 0.0) or 0.0) if op is not None else 0.0
     if op_hbm_bytes < float(l2_bytes):
         return False
-    if is_grouped and is_arch35_context(context):
-        return True
+    weight_nz = str(meta.get("weight_layout", "ND")).strip().upper() == "FRACTAL_NZ"
+    if is_grouped and is_arch35:
+        if weight_nz:
+            return True
+        if int(stride_bytes) <= 0 or int(row_bytes) <= 0:
+            return False
+        return (
+            (int(stride_bytes) % DAV3510_L2_SECTOR_BYTES) == 0
+            and (int(row_bytes) % DAV3510_L2_SECTOR_BYTES) == 0
+        )
     if m_tiles is not None:
         if int(m_tiles) > 1:
             return False
-    elif op is not None and not is_grouped:
+    elif op is not None:
         shape = getattr(op, "local_shape", ()) or ()
         if len(shape) >= _GEMM_SHAPE_AXES:
             groups = max(1, int(meta.get("matrix_groups", 1) or 1))
