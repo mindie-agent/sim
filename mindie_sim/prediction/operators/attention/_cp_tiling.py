@@ -122,17 +122,43 @@ def _history_head_group(plan):
     return "tp", plan.distinct_head_ranks
 
 
-def _history_decode(contract):
-    return next((p for p in contract.cp_plan or () if p.caller_site == HISTORY_DECODE_SITE), None)
+HISTORY_SITES = frozenset({HISTORY_DECODE_SITE, HISTORY_PREFILL_SITE})
+
+
+def _history_binding(contract):
+    return next((p for p in contract.cp_plan or () if p.caller_site in HISTORY_SITES), None)
+
+
+def history_output_shape(contract) -> tuple[int, int, int]:
+    """Return the rank-local output shape for a CP history call (or contract shape)."""
+    binding = _history_binding(contract)
+    if binding is None:
+        return (contract.query_tokens, contract.num_heads, contract.v_head_dim)
+    _, head_ranks = _history_head_group(binding)
+    local_heads = contract.num_heads // head_ranks
+    if binding.caller_site == HISTORY_PREFILL_SITE and binding.pcp_size > 1:
+        local_q = min(
+            binding.tensors[0][1][0],
+            (contract.query_tokens + binding.pcp_size - 1) // binding.pcp_size,
+        )
+    else:
+        local_q = contract.query_tokens
+    return (local_q, local_heads, contract.v_head_dim)
 
 
 def history_decode_contract(contract):
-    binding = _history_decode(contract)
+    binding = _history_binding(contract)
     if binding is None:
         return contract
     _, ranks = _history_head_group(binding)
     name, shape, _ = binding.tensors[0]
-    if (len(binding.tensors) != 1 or name != "query" or len(shape) != 3 or shape[0] != contract.query_tokens
+    is_prefill_pcp = binding.caller_site == HISTORY_PREFILL_SITE and binding.pcp_size > 1
+    q_capacity = shape[0] * (binding.pcp_size if is_prefill_pcp else 1)
+    q_valid = (
+        0 < contract.query_tokens <= q_capacity
+        if is_prefill_pcp else contract.query_tokens == q_capacity
+    )
+    if (len(binding.tensors) != 1 or name != "query" or len(shape) != 3 or not q_valid
             or shape[-1] != contract.head_dim or not shape[1]):
         raise ModelingError("attention_cp_history_decode_query_shape_invalid")
     heads = shape[1] * ranks
@@ -144,6 +170,7 @@ def history_decode_contract(contract):
 def lower_cp_collectives(
     plan: ContextParallelPlan, *, op_id: str = "attention_cp", deps: tuple[str, ...] = (),
     stage: int = 0, layer: int = 0, requests: tuple[str, ...] = (),
+    restored_query_tokens: int | None = None,
 ) -> tuple[OpSpec, ...]:
     """Emit topology-bound all-gathers with tensor-level ownership metadata."""
     case = plan.case
@@ -186,15 +213,23 @@ def lower_cp_collectives(
         ops.append(op)
         deps = (op.op_id,)
         tensors = tuple((name, shape, size) for (_, _, size), (name, shape) in zip(tensors, out_shapes))
+        if restore == "query_restore" and restored_query_tokens is not None:
+            tensors = tuple((name, (restored_query_tokens, *shape[1:]), size) for name, shape, size in tensors)
     return tuple(ops)
 
 
-def cp_operators(op: OpSpec, bindings: tuple[ContextParallelPlan, ...]) -> tuple[OpSpec, ...]:
+def cp_operators(
+    op: OpSpec, bindings: tuple[ContextParallelPlan, ...], *, restored_query_tokens: int | None = None,
+) -> tuple[OpSpec, ...]:
     collectives = []
     deps = ()
     for binding in bindings:
-        gathered = lower_cp_collectives(binding, op_id=f"gather{len(collectives)}", deps=deps,
-                                        stage=op.stage, layer=op.layer, requests=op.requests)
+        restored = restored_query_tokens if binding.caller_site == HISTORY_PREFILL_SITE else None
+        gathered = lower_cp_collectives(
+            binding, op_id=f"gather{len(collectives)}", deps=deps,
+            stage=op.stage, layer=op.layer, requests=op.requests,
+            restored_query_tokens=restored,
+        )
         if gathered:
             collectives.extend(gathered)
             deps = (gathered[-1].op_id,)
@@ -202,11 +237,12 @@ def cp_operators(op: OpSpec, bindings: tuple[ContextParallelPlan, ...]) -> tuple
 
 
 def cp_decode_suffix(op, contract):
-    binding = _history_decode(contract)
+    binding = _history_binding(contract)
     if binding is None or binding.dcp_size == 1:
         return ()
     group, head_ranks = _history_head_group(binding)
     q, heads, width = contract.query_tokens, contract.num_heads // head_ranks, contract.v_head_dim
+    is_prefill = binding.caller_site == HISTORY_PREFILL_SITE
     dtype = op.dtype or "bf16"
     if dtype in {"bf16", "bfloat16", "fp16", "float16"}:
         lse_lanes = DCP_NARROW_LSE_LANES
@@ -240,20 +276,29 @@ def cp_decode_suffix(op, contract):
         ))
         deps = (ops[-1].op_id,)
     if binding.pcp_size > 1:
+        # dcp_a2a.py:572 & attention_cp.py:711: [PCP * TP, local H, T, packed D].
         ops.append(comm_op(
             op_id="output_lse_pcp_gather", deps=deps, **arguments, family="allgather", recipe="ring_allgather",
             link_bytes=payload * head_ranks * (binding.pcp_size - 1),
-            shape=(binding.dcp_size, *packed_shape),
+            shape=(binding.dcp_size, heads, q, width + lse_lanes),
             metadata=(("group_axis", "pcp"), ("comm_group_size", int(binding.pcp_size)),
                       ("steps", binding.pcp_size - 1), *payload_metadata),
         ))
         deps = (ops[-1].op_id,)
+    q_merge = history_output_shape(contract)[0]
+    merge_payload = q_merge * heads * (width + lse_lanes) * element_bytes
+    merge_out_bytes = q_merge * heads * width * element_bytes
+    merge_sources = binding.dcp_size
+    merge_read_bytes = merge_payload * merge_sources
+    merge_meta = (("partial_reduction", "logsumexp"), *payload_metadata)
+    if is_prefill:
+        merge_meta = (*merge_meta, ("defer_combine", True), ("partial_count", merge_sources))
     ops.append(vector_op(
         op_id="output_lse_merge", deps=deps, **arguments, family="attention_merge", recipe="dcp_lse_merge",
-        shape=(q, heads, width), dtype="fp32", semantic_family="dcp_logsumexp_attention_update",
-        elements=int(merge_update_elements(q, heads, width, binding.dcp_size)), ops_per_element=MERGE_OPS_PER_ELEM,
-        read_bytes_override=payload * binding.dcp_size, write_bytes_override=out_bytes,
-        metadata=(("partial_reduction", "logsumexp"), *payload_metadata),
+        shape=(q_merge, heads, width), dtype=dtype, semantic_family="dcp_logsumexp_attention_update",
+        elements=int(merge_update_elements(q_merge, heads, width, merge_sources)), ops_per_element=MERGE_OPS_PER_ELEM,
+        read_bytes_override=merge_read_bytes, write_bytes_override=merge_out_bytes,
+        metadata=merge_meta,
     ))
     return tuple(ops)
 

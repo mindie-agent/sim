@@ -533,7 +533,83 @@ def _plan_from_ranges(ranges, indices, sizes, *, kind: str = "nofd"):
     }
 
 
-def owner_s2_plan(spec, cores: int, *, fd_tolerance: int = DEFAULT_FD_TOLERANCE):
+def split_fd_assignments(
+    fd_items: tuple[tuple[int, int, int], ...],
+    *,
+    used_cores: int,
+    vec_cube_ratio: int = 2,
+    max_vectors: int | None = None,
+) -> tuple[dict[str, int], ...]:
+    """CANN ``split_core_v2.cpp:625-664`` ``SplitFD`` per-AIV row-interval assignment.
+
+    Each item in ``fd_items`` is ``(task_index, writer_count, row_count)`` in
+    task order.  Returns one record per active reduction AIV lane with
+    ``(task, fragment, aiv_lane, writers, row_start, row_count)``.
+    """
+    if not fd_items:
+        return ()
+    total_fd_load = sum(writers * rows for _ti, writers, rows in fd_items)
+    max_vec = max(1, int(used_cores)) * max(1, int(vec_cube_ratio))
+    if max_vectors is not None:
+        max_vec = min(max_vec, max(1, int(max_vectors)))
+    max_vec = max(max_vec, len(fd_items))
+    empty_vec = max_vec - len(fd_items)
+    avg_load = max(1, (total_fd_load + max_vec - 1) // max_vec)
+    assignments: list[dict[str, int]] = []
+    lane = 0
+    for task_index, writers, rows in fd_items:
+        if rows <= 0:
+            continue
+        if empty_vec == 0:
+            assignments.append({
+                "task": task_index, "fragment": 0, "aiv_lane": lane,
+                "writers": writers, "row_start": 0, "row_count": rows,
+            })
+            lane += 1
+            continue
+        cur_vecs = max((writers * rows) // avg_load, 1)
+        cur_avg_m = (rows + cur_vecs - 1) // cur_vecs
+        cur_vecs = (rows + cur_avg_m - 1) // cur_avg_m
+        cur_vecs = min(cur_vecs, empty_vec + 1)
+        for vid in range(cur_vecs):
+            row_start = vid * cur_avg_m
+            row_count = cur_avg_m if vid < cur_vecs - 1 else (rows - row_start)
+            assignments.append({
+                "task": task_index, "fragment": vid, "aiv_lane": lane,
+                "writers": writers, "row_start": row_start, "row_count": row_count,
+            })
+            lane += 1
+        empty_vec -= cur_vecs - 1
+    return tuple(assignments)
+
+
+def _attach_fd_assignments(
+    plan: dict, rows_by_task: dict[int, int], *, vec_cube_ratio: int, max_vectors: int | None,
+) -> dict:
+    task_owners: dict[int, list[int]] = {}
+    for core, ranges in enumerate(plan["ranges"]):
+        for ti, _lo, _hi in ranges:
+            task_owners.setdefault(ti, []).append(core)
+    fd_items = tuple(
+        (ti, len(owners), rows_by_task[ti])
+        for ti, owners in sorted(task_owners.items())
+        if len(owners) >= 2
+    )
+    used_cores = sum(1 for load in plan["loads"] if load > 0)
+    plan["fd_assignments"] = split_fd_assignments(
+        fd_items, used_cores=used_cores, vec_cube_ratio=vec_cube_ratio, max_vectors=max_vectors,
+    )
+    return plan
+
+
+def owner_s2_plan(
+    spec,
+    cores: int,
+    *,
+    fd_tolerance: int = DEFAULT_FD_TOLERANCE,
+    vec_cube_ratio: int = 2,
+    max_vectors: int | None = None,
+):
     """Contiguous S2 ownership.
 
     Native causal FIA uses the host core search for both the no-FD whole-row
@@ -547,11 +623,14 @@ def owner_s2_plan(spec, cores: int, *, fd_tolerance: int = DEFAULT_FD_TOLERANCE)
     entries = tuple(_time_major_tasks(spec))
     tasks = tuple(task for _index, task in entries)
     indices = tuple(index for index, _task in entries)
+    rows_by_task = {index: task.rows for index, task in entries}
     sizes = tuple(task.key_tiles for task in tasks)
     total = sum(sizes)
     sourced, kind = _host_owner(spec, cores, indices, sizes, fd_tolerance)
     if kind in ("nofd", "fd") and sourced is not None:
-        return sourced
+        return _attach_fd_assignments(
+            sourced, rows_by_task, vec_cube_ratio=vec_cube_ratio, max_vectors=max_vectors,
+        )
     if total <= cores * max(1, int(fd_tolerance)):
         loads = [0] * cores
         ranges = [[] for _ in range(cores)]
@@ -573,6 +652,7 @@ def owner_s2_plan(spec, cores: int, *, fd_tolerance: int = DEFAULT_FD_TOLERANCE)
             "tasks": tuple(tuple(item[0] for item in row) for row in ranges),
             "ranges": tuple(tuple(row) for row in ranges),
             "fd_splits": 0, "fd_fragments": 0, "total": total,
+            "fd_assignments": (),
         }
     chunk = _ceil_div(total, cores) if total else 0
     loads, ranges = [], []
@@ -599,12 +679,15 @@ def owner_s2_plan(spec, cores: int, *, fd_tolerance: int = DEFAULT_FD_TOLERANCE)
         ranges.append(tuple(entries))
     split_tasks = sum(1 for owners in task_owners.values() if len(owners) > 1)
     fragments = sum(len(row) for row in ranges) - len(tasks)
-    return {
-        "loads": tuple(loads),
-        "tasks": tuple(tuple(item[0] for item in row) for row in ranges),
-        "ranges": tuple(ranges),
-        "fd_splits": split_tasks, "fd_fragments": fragments, "total": total,
-    }
+    return _attach_fd_assignments(
+        {
+            "loads": tuple(loads),
+            "tasks": tuple(tuple(item[0] for item in row) for row in ranges),
+            "ranges": tuple(ranges),
+            "fd_splits": split_tasks, "fd_fragments": fragments, "total": total,
+        },
+        rows_by_task, vec_cube_ratio=vec_cube_ratio, max_vectors=max_vectors,
+    )
 
 
 def _prefill_task_builder(context, recipe, spec, counts, task_at):
@@ -700,7 +783,25 @@ class _PrefillProgram:
             return engine.submit(name + ":complete", after=tuple(events),
                                  owner=owner)
 
-        plan = owner_s2_plan(self.spec, cores)
+        read = _read_role(self.context, vector=True)
+        vector_units = int(
+            self.context.resource_units.get("vector")
+            or self.context.resource_units.get("mte3")
+            or self.context.resource_units.get(read)
+            or 1
+        )
+        cube_units_raw = self.context.resource_units.get("cube")
+        if cube_units_raw is not None:
+            cube_units = int(cube_units_raw)
+        elif self.context.core_count:
+            cube_units = int(self.context.core_count)
+        else:
+            cube_units = cores
+        # CANN split_core_v2.cpp:634 uses physical platformInfo_.cvRatio; stream
+        # quotas cap total admitted vectors without inflating the ratio.
+        cv_ratio = max(1, vector_units // max(1, cube_units))
+        avail_aiv = int(stream_owners.aiv_limit) if stream_owners is not None else vector_units
+        plan = owner_s2_plan(self.spec, cores, vec_cube_ratio=cv_ratio, max_vectors=avail_aiv)
         events = []
         owner_event = {}
         # The writer owner set is immutable source-plan data.  It must exist
@@ -744,48 +845,52 @@ class _PrefillProgram:
             owner_event[core] = event
 
         fd_events = []
-        read = _read_role(self.context, vector=True)
-        vector_units = self.context.resource_units.get("vector", 1)
-        lane = 0
-        for ti, owners in sorted(task_owners.items()):
-            if len(owners) < 2:
-                continue
-            base = _task_at_for(self.spec, ti)
-            rows, dim = base.rows, self.spec.head_dim
-            # Arch35 emits two 64-row FD fragments per split-M task, on
-            # distinct AIV lanes.  Each fragment reads the matching partial
-            # rows from every S2 writer (numerator + LSE denominator).
-            fragments = len(owners)
-            frag_rows = _ceil_div(rows, 2)
-            for fragment in range(2):
-                this_rows = min(frag_rows, rows - fragment * frag_rows)
-                if this_rows <= 0:
+        v_dim = getattr(self.spec, "v_head_dim", self.spec.head_dim)
+        out_elem = getattr(self.spec, "output_bytes", self.spec.query_bytes)
+
+        def _lane_placement(roles: tuple[str, ...], lane_idx: int) -> dict:
+            placed = {}
+            for role in roles:
+                physical = self.context.resource_names.get(role)
+                if physical is None:
                     continue
-                part = fragments * this_rows * (dim * _FP32_BYTES
-                                                + 2 * _FP32_BYTES)
-                out = this_rows * dim * self.spec.query_bytes
-                placement = {}
-                # One AIV lane reads, reduces and stores this fragment; a bound
-                # stream maps the lane into its own AIV partition.
-                for role in ("vector", read, "mte3"):
-                    physical = self.context.resource_names.get(role)
-                    if physical is None:
-                        continue
-                    pool = stream_pool_for_role(stream_owners, role) if stream_owners is not None else ()
-                    units = self.context.resource_units.get(role, vector_units)
-                    placement[physical] = (pool[lane % len(pool)],) if pool else (lane % units,)
-                fd_events.append(engine.submit(
-                    f"{name}:fd{ti}:{fragment}",
-                    work=self.context.bind(Work(resources={
-                        "hbm": part + out, read: part, "mte3": out,
-                        "vector": fragments * this_rows * (dim + 2),
-                    })),
-                    after=tuple(owner_event[core] for core in owners),
-                    placement=placement,
-                    owner=(f"{owner}:fd{ti}:{fragment}" if owner
-                           else f"fd{ti}:{fragment}"),
-                ))
-                lane += 1
+                pool = stream_pool_for_role(stream_owners, role) if stream_owners is not None else ()
+                units = self.context.resource_units.get(role, vector_units)
+                placed[physical] = (pool[lane_idx % len(pool)],) if pool else (lane_idx % units,)
+            return placed
+
+        for entry in plan["fd_assignments"]:
+            ti = entry["task"]
+            fragment = entry["fragment"]
+            lane = entry["aiv_lane"]
+            this_rows = entry["row_count"]
+            owners = task_owners[ti]
+            fragments = len(owners)
+            part = fragments * this_rows * (v_dim * _FP32_BYTES + 2 * _FP32_BYTES)
+            out = this_rows * v_dim * out_elem
+            lane_meta = {"row_start": entry["row_start"], "row_count": this_rows}
+            lane_owner = f"{owner}:fd{ti}:{fragment}" if owner else f"fd{ti}:{fragment}"
+            # CANN fia_block_vec_flashdecode_arch35.h:498-516 reduces all partial
+            # fragments before writing the final output rows via MTE3.
+            reduce_ev = engine.submit(
+                f"{name}:fd_reduce{ti}:{fragment}",
+                work=self.context.bind(Work(resources={
+                    "hbm": part, read: part,
+                    "vector": fragments * this_rows * (v_dim + 2),
+                })),
+                after=tuple(owner_event[core] for core in owners),
+                placement=_lane_placement(("vector", read), lane),
+                metadata=lane_meta,
+                owner=lane_owner,
+            )
+            fd_events.append(engine.submit(
+                f"{name}:fd{ti}:{fragment}",
+                work=self.context.bind(Work(resources={"hbm": out, "mte3": out})),
+                after=(reduce_ev,),
+                placement=_lane_placement(("mte3",), lane),
+                metadata=lane_meta,
+                owner=lane_owner,
+            ))
         return engine.submit(name + ":complete",
                              after=tuple(events) + tuple(fd_events),
                              owner=owner)
