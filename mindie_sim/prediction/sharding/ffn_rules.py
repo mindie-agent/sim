@@ -1097,7 +1097,8 @@ def _exact_slot_realization(routing_realization, slot_plan, num_experts: int):
 
 
 def bind_expert_slots(ops, *, model, plan, parallel, routing, runtime_routing,
-                      routing_realization, group_tokens, expert_width, latent):
+                      routing_realization, group_tokens, expert_width, latent,
+                      barrier: bool = False):
     """Bind each routed matrix's active weight read to its physical slot plan."""
     _, slot_routing = split_routing_features(runtime_routing)
     slot_plan = expert_slot_plan(model, plan, parallel, routing=slot_routing)
@@ -1139,11 +1140,11 @@ def bind_expert_slots(ops, *, model, plan, parallel, routing, runtime_routing,
     gate_bound = {
         op.op_id: op for op in bind_expert_slot_work(
             tuple(op for op in ops if kinds[op.op_id] == "gate_up"),
-            slot_work=gate_work)
+            slot_work=gate_work, barrier=barrier)
     }
     down_bound = {
         op.op_id: op for op in bind_expert_slot_work(
             tuple(op for op in ops if kinds[op.op_id] == "down"),
-            slot_work=down_work)
+            slot_work=down_work, barrier=barrier)
     }
     return [gate_bound.get(op.op_id, down_bound.get(op.op_id, op)) for op in ops]
