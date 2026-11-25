@@ -11,14 +11,14 @@ from dataclasses import dataclass, replace
 from itertools import islice
 
 from mindie_sim.schema.common import ModelingError
-
-
-_GEOMETRY = {"valid_tokens", "padded_tokens", "sequences", "min_query_tokens", "max_query_tokens",
-             "max_context_tokens", "min_context_tokens"}
-_STATIC_SELECTORS = {"mla_prolog", "mx_matrix"}
-_CATEGORIES = {"phases": {"prefill", "decode"},
-               "replay_scopes": {"none", "full", "piecewise"},
-               "model_scopes": {"target", "draft"}}
+from .program.implementation_registry import (
+    _CATEGORIES,
+    _GEOMETRY,
+    _STATIC_SELECTORS,
+    _validate_domain,
+    alternatives,
+    is_policy,
+)
 
 
 AUTOMATIC_LOWERINGS_KEY = "automatic_lowerings"
@@ -191,50 +191,6 @@ def merge_selection_summaries(base, extra):
     merged["selection_warnings"] = [
         f"{item['family']}->{item['fallback']}:{item['reason']}" for item in degraded]
     return merged
-
-
-def is_policy(raw):
-    return isinstance(raw, dict) and "cases" in raw
-
-
-def alternatives(raw, selector):
-    """Enumerate all declared recipe providers without executing their planners."""
-    if not is_policy(raw):
-        yield raw
-        return
-    if selector in _STATIC_SELECTORS and not all(
-            isinstance(case, dict) and set(case.get("domain") or ()) == {"model_scopes"}
-            for case in (raw.get("cases") or ())):
-        raise ModelingError(f"implementation_policy_requires_static_model_preparation:{selector}")
-    if set(raw) - {"cases", "otherwise"} or not raw["cases"]:
-        raise ModelingError(f"implementation_policy_requires_cases:{selector}")
-    for case in raw["cases"]:
-        if set(case) != {"domain", "binding"}:
-            raise ModelingError(f"implementation_case_requires_domain_and_binding:{selector}")
-        _validate_domain(case["domain"], selector)
-        if is_policy(case["binding"]) or case["binding"] == "error":
-            raise ModelingError(f"implementation_case_requires_leaf_binding:{selector}")
-        yield case["binding"]
-    otherwise = raw.get("otherwise", "error")
-    if is_policy(otherwise):
-        raise ModelingError(f"implementation_case_requires_leaf_binding:{selector}")
-    if otherwise != "error":
-        yield otherwise
-
-
-def _validate_domain(domain, selector):
-    if not domain or set(domain) - (_GEOMETRY | _CATEGORIES.keys()):
-        raise ModelingError(f"implementation_domain_unknown_or_empty:{selector}")
-    for key, value in domain.items():
-        if key in _CATEGORIES:
-            allowed = _CATEGORIES[key]
-            if (not isinstance(value, (tuple, list)) or not value
-                    or set(value) - allowed or len(set(value)) != len(value)):
-                raise ModelingError(f"implementation_domain_invalid:{selector}:{key}")
-        elif (not isinstance(value, dict) or not value or set(value) - {"min", "max"}
-              or any(type(bound) is not int or bound < 0 for bound in value.values())
-              or value.get("min", 0) > value.get("max", float("inf"))):
-            raise ModelingError(f"implementation_domain_invalid:{selector}:{key}")
 
 
 def prepared_selection(bindings, selector):

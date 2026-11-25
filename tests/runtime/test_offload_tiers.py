@@ -549,9 +549,14 @@ def test_memfabric_entry_gather_scales_with_rows_and_wide_ub():
         assert execution_meta["ub_bytes_per_owner"] == 122880
     assert 0.0 < durs[0] < durs[1]
 def test_sparse_mla_offload_decode_and_host_dram_budget():
-    assert copy_sfa_pool_capacity(16) == 16; assert copy_sfa_pool_capacity(17) == 32
+    from mindie_sim.prediction.implementations import select
+    from mindie_sim.schema.common import ModelingError
+
+    assert copy_sfa_pool_capacity(16) == 18; assert copy_sfa_pool_capacity(17) == 19
+    with pytest.raises(ModelingError, match="implementation_not_registered:sparse_kv_offload:hisparse_kv_offload"):
+        select({"sparse_kv_offload": "hisparse_kv_offload"}, "sparse_kv_offload")
     short_raw = sparse_mla_case(context_tokens=1024, offloading={
-        "implementation": "hisparse_kv_offload", "options": {"miss_rate": 0.2}})
+        "implementation": "vllm_ascend_sparse_kv_offload", "options": {"miss_rate": 0.2}})
     short = predict(short_raw, scope="body", phase="decode", tokens=1,
                     context=1024, sequences=[1])
     short_recipes = [op["recipe"] for op in short["timeline"]]
@@ -566,7 +571,7 @@ def test_sparse_mla_offload_decode_and_host_dram_budget():
                              context=8192, sequences=[1], scope="body")[0]
     h2d_ops = [op for op in long_ops if op.recipe == "memfabric_sparse_copy_h2d"]; layer0 = dict(h2d_ops[0].metadata)
     layer1 = dict(h2d_ops[1].metadata)
-    assert layer0["memfabric_call"]["tokens"] == math.ceil(2048 * 0.2); assert layer0["shared_indexer_reuse"] is False and layer1["shared_indexer_reuse"] is True; assert layer1["skip_topk"] is True; assert layer0["hardware_support"]["memfabric_acc_offload"] == "host_gva_dma_modeled"; assert layer0["hardware_support"]["abi_verification"] == "verified_via_probed_abi_registry"; assert layer0["hardware_support"]["copy_sfa_attention"] == "analytical_model"
+    assert layer0["memfabric_call"]["tokens"] == 2048; assert layer0["shared_indexer_reuse"] is False and layer1["shared_indexer_reuse"] is True; assert layer1["skip_topk"] is True; assert layer0["hardware_support"]["memfabric_acc_offload"] == "host_gva_dma_modeled"; assert layer0["hardware_support"]["abi_verification"] == "verified_via_probed_abi_registry"; assert layer0["hardware_support"]["copy_sfa_attention"] == "analytical_model"
     base_raw = sparse_mla_case(context_tokens=4096); offload_raw = sparse_mla_case(context_tokens=4096, offloading={
         "implementation": "vllm_ascend_sparse_kv_offload",
         "options": {"dram_size_per_dp_gb": 0.02, "keep_device_kv_cache": False}})

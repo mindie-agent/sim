@@ -30,7 +30,8 @@
     "mindie_sd_norm_rope_concat",
     "mindie_sd_laurel",
     "mindie_sd_quant_four_over_six_a5",
-    "mindie_sd_eagle_ffn"
+    "mindie_sd_eagle_ffn",
+    "mindie_sd_custom_ops"
   ],
   "lowering_passes": [],
   "recipe_bindings": [

@@ -433,7 +433,7 @@ def test_start_observer_resolves_across_python_and_native_backends(backend: str)
 
 def test_ring_buffer_producer_extra_after_roundtrips_through_native_abi() -> None:
     """Native ABI ring validator must accept DEP_KIND_EXTRA edges from producer_extra_after."""
-    from mindie_sim.prediction.runtime.accel_terms import PreparedTermsRunner
+    from _support.prepared_terms_parity import PreparedTermsRunner
     from mindie_sim.prediction.runtime.ring_buffer import DEP_KIND_EXTRA, RingBuffer, lower_generation
 
     ring = RingBuffer(occurrence=1, die=0, owner=0, pool="ub", allocation="r", slot_bytes=1024, depth=2)

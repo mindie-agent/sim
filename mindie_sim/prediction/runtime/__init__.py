@@ -22,9 +22,7 @@ from .memory_physics import (
     burst_turnaround_efficiency,
 )
 from .prepared_terms import (
-    BoundVectorOp, PreparedCapacityRow, PreparedDelivery, PreparedProgress,
-    PreparedTerm, VectorInstructionGroup, allocate_prepared_epoch,
-    bind_vector_groups, integrate_prepared_epoch,
+    BoundVectorOp, VectorInstructionGroup, bind_vector_groups,
 )
 from .ring_buffer import (
     DepRecord, GenerationEvents, RingBuffer, SlotGenRecord, SlotGenerationId,
@@ -46,9 +44,6 @@ def __getattr__(name):
     if name in _ENGINE_NAMES:
         from . import engine
         return getattr(engine, name)
-    if name == "PreparedTermsRunner":
-        from .accel_terms import PreparedTermsRunner
-        return PreparedTermsRunner
     raise AttributeError(name)
 
 
@@ -63,8 +58,7 @@ __all__ = [
     "GrantResult", "HbmBusSpec", "HostProgramSpec",
     "LiveBufferSpec", "MemoryAccessPattern", "OccurrenceKey",
     "OwnerPoolPeak", "PlacementSpec", "PoolKey",
-    "PortBinding", "PortSpec", "PreparedCapacityRow", "PreparedDelivery",
-    "PreparedProgress", "PreparedStage", "PreparedTerm", "PreparedTermsRunner",
+    "PortBinding", "PortSpec", "PreparedStage",
     "ProgramCatalog", "ReaderKey", "ReleaseResult",
     "ReleaseSpec", "Resource", "ReuseKey", "RingBuffer",
     "SlotGenRecord", "SlotGenerationId", "Submission", "SubtileWaveSpec",
@@ -72,7 +66,7 @@ __all__ = [
     "TileRejection", "TileShape", "TileSolution",
     "TranslationCertificate", "VectorInstructionGroup", "VersionBinding",
     "VisibilityContract", "WorkTerm",
-    "allocate_prepared_epoch", "bind_memory_access", "bind_vector_groups",
-    "burst_turnaround_efficiency", "integrate_prepared_epoch",
+    "bind_memory_access", "bind_vector_groups",
+    "burst_turnaround_efficiency",
     "lower_generation", "solve_tiles",
 ]

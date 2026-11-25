@@ -29,12 +29,14 @@ from mindie_sim.prediction.operators.diffusion import (
     MINDIE_SD_CUSTOM_OPS,
     compute_mindie_sd_effective_denoising_steps,
 )
+from mindie_sim.prediction.program.implementation_registry import IMPLEMENTATIONS, select
 from mindie_sim.schema.checkpoint import CheckpointQuantMap, TensorQuantRule
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.model import LayerPlan, ModelSpec
 from mindie_sim.schema.operators import KernelReadiness, TensorPrecisionABI
 from mindie_sim.schema.parallel import ParallelSpec
+from mindie_sim.schema.physical_mechanisms import DAV_2201_PRESET, DAV_3510_PRESET
 from mindie_sim.schema.stack import (
     CaptureBucketRule,
     FrameworkRewriteKind,
@@ -118,6 +120,56 @@ def _nonneg_int(value: Any, code: str) -> int:
     return int(value)
 
 
+def _normalize_custom_ops(
+    raw: Any,
+) -> tuple[tuple[str, tuple[tuple[str, Any], ...]], ...]:
+    """Validate optional ``mindie_sd_custom_ops`` selector bindings through ``select()``."""
+    if not raw:
+        return ()
+    entries = list(raw.items()) if isinstance(raw, Mapping) else list(raw)
+    normalized: list[tuple[str, tuple[tuple[str, Any], ...]]] = []
+    seen: set[str] = set()
+    for selector_raw, opts_raw in entries:
+        selector = str(selector_raw or "").strip()
+        if not selector or selector in seen:
+            raise ModelingError(f"diffusion_custom_op_selector_invalid:{selector_raw!r}")
+        if not isinstance(opts_raw, Mapping) and not isinstance(opts_raw, (tuple, list)):
+            raise ModelingError(f"diffusion_custom_op_options_invalid:{selector}")
+        opts_dict = dict(opts_raw)
+        op_name = opts_dict.get("op_name")
+        if op_name is not None:
+            clean = str(op_name).strip().lower().removeprefix("mindie_sd_")
+            if clean not in MINDIE_SD_CUSTOM_OPS:
+                raise ModelingError(f"diffusion_custom_op_unknown:{op_name!r}")
+            opts_dict["op_name"] = clean
+        elif selector.lower().removeprefix("mindie_sd_") not in MINDIE_SD_CUSTOM_OPS:
+            raise ModelingError(f"diffusion_custom_op_requires_op_name:{selector}")
+        select(
+            {selector: {"implementation": "mindie_sd_custom_ops", "options": opts_dict}},
+            selector,
+        )
+        seen.add(selector)
+        normalized.append((selector, tuple(sorted(opts_dict.items()))))
+    return tuple(sorted(normalized, key=lambda item: item[0]))
+
+
+def _validate_custom_ops_for_hardware(
+    custom_ops: tuple[tuple[str, tuple[tuple[str, Any], ...]], ...],
+    hardware: Hardware,
+    *,
+    track: StackTrack,
+) -> None:
+    if track == "target" or not _is_a5_hardware(hardware):
+        return
+    for selector, opt_pairs in custom_ops:
+        opts_dict = dict(opt_pairs)
+        op_short = str(opts_dict.get("op_name") or selector).strip().lower().removeprefix("mindie_sd_")
+        if op_short in _A5_UNSUPPORTED_SPARSE_OPS:
+            raise ModelingError(
+                f"diffusion_sparse_attention_op_unsupported_on_hardware:a5:{op_short}"
+            )
+
+
 @dataclass(frozen=True, slots=True)
 class DiffusionWorkloadConfig:
     """Explicit diffusion / DiT work-unit contract (no fabricated LLM KV-Cache)."""
@@ -136,6 +188,8 @@ class DiffusionWorkloadConfig:
     step_cache_warmup: int = 0
     step_cache_interval: int = 1
     step_cache_hit_ratio: float | None = None
+    custom_ops: tuple[tuple[str, tuple[tuple[str, Any], ...]], ...] = ()
+    kv_dtype: str | None = None
 
     def __post_init__(self) -> None:
         steps = _pos_int(self.denoise_timesteps, "diffusion_denoise_timesteps_invalid")
@@ -157,6 +211,10 @@ class DiffusionWorkloadConfig:
         op_short = str(self.sparse_attention_op or "").strip().lower().removeprefix("mindie_sd_")
         if op_short and op_short not in _SPARSE_ATTENTION_OPS:
             raise ModelingError(f"diffusion_sparse_attention_op_unknown:{self.sparse_attention_op!r}")
+        custom_ops = _normalize_custom_ops(self.custom_ops)
+        kv_dtype = str(self.kv_dtype).strip().lower() if self.kv_dtype is not None else None
+        if kv_dtype == "":
+            kv_dtype = None
         object.__setattr__(self, "denoise_timesteps", steps)
         object.__setattr__(self, "effective_denoise_timesteps", eff_steps)
         object.__setattr__(self, "latent_patches", patches)
@@ -168,6 +226,8 @@ class DiffusionWorkloadConfig:
         object.__setattr__(self, "laurel_low_rank", laurel)
         object.__setattr__(self, "step_cache_warmup", warmup)
         object.__setattr__(self, "step_cache_interval", interval)
+        object.__setattr__(self, "custom_ops", custom_ops)
+        object.__setattr__(self, "kv_dtype", kv_dtype)
 
     @property
     def tokens_per_denoise_step(self) -> int:
@@ -214,6 +274,8 @@ class DiffusionWorkloadConfig:
             step_cache_warmup=warmup,
             step_cache_interval=cache_interval,
             step_cache_hit_ratio=float(cache_hit) if cache_hit is not None else None,
+            custom_ops=_normalize_custom_ops(requested.get("custom_ops")),
+            kv_dtype=requested.get("kv_dtype"),
         )
 
 
@@ -274,9 +336,36 @@ def _resolve_tag_and_rule(
     return (tag if tag is not None else (checkpoint.model_quant_type or "FLOAT")), None
 
 
+def _soc_family_for_hardware(hardware: Hardware) -> str | None:
+    target = hardware.dies[0] if getattr(hardware, "dies", None) else hardware
+    arch_obj = getattr(target, "compute_arch", None)
+    arch_id = str(
+        getattr(arch_obj, "arch_id", "") or getattr(arch_obj, "preset", "") or ""
+    ).strip().lower()
+    tokens = " ".join(
+        str(getattr(obj, attr, "") or "")
+        for obj in (hardware, target)
+        for attr in ("arch_family", "sku", "name")
+    ).lower()
+    if (
+        arch_id in {DAV_3510_PRESET, "arch35", "a5"}
+        or "3510" in arch_id
+        or any(tok in tokens for tok in ("a5", "arch35", "dav_3510", "ascend950", "950"))
+    ):
+        return "Ascend950"
+    if any(tok in tokens for tok in ("910b", "a2")) or arch_id == "a2":
+        return "Ascend910B"
+    if (
+        arch_id in {DAV_2201_PRESET, "arch22", "a3"}
+        or "2201" in arch_id
+        or any(tok in tokens for tok in ("910_93", "9391", "9382", "9362", "a3", "arch22", "2201"))
+    ):
+        return "Ascend910_93"
+    return None
+
+
 def _is_a5_hardware(hardware: Hardware) -> bool:
-    tokens = f"{hardware.arch_family} {hardware.sku} {hardware.name}".lower()
-    return any(tok in tokens for tok in ("a5", "arch35", "dav_3510", "ascend950", "950"))
+    return _soc_family_for_hardware(hardware) == "Ascend950"
 
 
 class DiffusionNativeStackAdapter:
@@ -288,7 +377,10 @@ class DiffusionNativeStackAdapter:
         raw = dict(_load_manifest()) if manifest is None else dict(manifest)
         self._manifest = raw
         declared_recipes = frozenset(raw.get("supported_recipe_ids", ()))
-        known_diffusion_recipes = frozenset(f"mindie_sd_{name}" for name in MINDIE_SD_CUSTOM_OPS)
+        known_diffusion_recipes = (
+            frozenset(f"mindie_sd_{name}" for name in MINDIE_SD_CUSTOM_OPS)
+            | {"mindie_sd_custom_ops"}
+        )
         if not declared_recipes.issubset(known_diffusion_recipes):
             unknown = sorted(declared_recipes - known_diffusion_recipes)
             raise ModelingError(f"diffusion_native_unknown_recipes:{unknown}")
@@ -337,10 +429,16 @@ class DiffusionNativeStackAdapter:
             raise ModelingError(
                 f"diffusion_sparse_attention_op_unsupported_on_hardware:a5:{cfg.sparse_attention_op}"
             )
+        if track != "eager":
+            _validate_custom_ops_for_hardware(cfg.custom_ops, hardware, track=track)
         dispositions: list[tuple[str, str, str]] = []
         for key in sorted(req):
             if key in _LLM_ONLY_OPTION_KEYS:
                 dispositions.append((key, "rejected", "diffusion_forbids_llm_kv_cache_and_speculation"))
+            elif key in {"custom_ops", "kv_dtype"} and track == "eager":
+                dispositions.append((key, "rejected", "diffusion_eager_track_disables_custom_ops"))
+            elif key == "kv_dtype" and cfg.sparse_attention_op != "eagle_qbsa":
+                dispositions.append((key, "rejected", "diffusion_kv_dtype_requires_eagle_qbsa"))
             else:
                 dispositions.append((key, "accepted", "diffusion_workload_option_applied"))
         is_eager = track == "eager" or bool(req.get("enforce_eager", False))
@@ -369,6 +467,10 @@ class DiffusionNativeStackAdapter:
             "capture_mode": "eager" if is_eager else "full",
             "role": role,
         }
+        if track != "eager" and cfg.kv_dtype is not None and cfg.sparse_attention_op == "eagle_qbsa":
+            effective["kv_dtype"] = cfg.kv_dtype
+        if track != "eager" and cfg.custom_ops:
+            effective["custom_ops"] = cfg.custom_ops
         return ResolvedStackOptions(
             stack_id=self._capabilities.stack_id,
             track=track,
@@ -463,6 +565,7 @@ class DiffusionNativeStackAdapter:
         eff = dict(options.effective_mechanisms)
         bindings: list[tuple[str, str, tuple[tuple[str, Any], ...]]] = []
         if options.track != "eager":
+            hw_soc = _soc_family_for_hardware(hardware)
             bindings.extend((
                 ("adalayernorm", "mindie_sd_adalayernorm", ()),
                 ("norm_rope_concat", "mindie_sd_norm_rope_concat", ()),
@@ -478,13 +581,16 @@ class DiffusionNativeStackAdapter:
                     f"diffusion_sparse_attention_op_unsupported_on_hardware:a5:{sparse_op}"
                 )
             if sparse_op and sparse_op in MINDIE_SD_CUSTOM_OPS:
+                sparse_opts: list[tuple[str, Any]] = [
+                    ("sparsity_ratio", float(eff.get("sparsity_ratio", DEFAULT_SPARSITY_RATIO))),
+                    ("block_size", int(eff.get("block_size", DEFAULT_SPARSE_BLOCK_SIZE))),
+                ]
+                if sparse_op == "eagle_qbsa" and eff.get("kv_dtype") is not None:
+                    sparse_opts.append(("kv_dtype", str(eff["kv_dtype"])))
                 bindings.append((
                     sparse_op,
                     f"mindie_sd_{sparse_op}",
-                    (
-                        ("sparsity_ratio", float(eff.get("sparsity_ratio", DEFAULT_SPARSITY_RATIO))),
-                        ("block_size", int(eff.get("block_size", DEFAULT_SPARSE_BLOCK_SIZE))),
-                    ),
+                    tuple(sparse_opts),
                 ))
             laurel_rank = int(eff.get("laurel_low_rank", 0) or 0)
             if laurel_rank > 0:
@@ -492,6 +598,29 @@ class DiffusionNativeStackAdapter:
             uses_mxfp4 = any(abi.linear_method == "mx_fp4" for _, abi in quant_plan.port_abis)
             if uses_mxfp4 and _is_a5_hardware(hardware):
                 bindings.append(("quant_four_over_six_a5", "mindie_sd_quant_four_over_six_a5", ()))
+            custom_ops = _normalize_custom_ops(eff.get("custom_ops"))
+            _validate_custom_ops_for_hardware(custom_ops, hardware, track=options.track)
+            if custom_ops and "mindie_sd_custom_ops" in IMPLEMENTATIONS:
+                binding_idx = {sel: idx for idx, (sel, _, _) in enumerate(bindings)}
+                for selector, opt_pairs in custom_ops:
+                    merged_opts: dict[str, Any] = (
+                        dict(bindings[binding_idx[selector]][2])
+                        if selector in binding_idx
+                        else {}
+                    )
+                    merged_opts.update(opt_pairs)
+                    if hw_soc is not None and "soc_family" not in merged_opts:
+                        merged_opts["soc_family"] = hw_soc
+                    select(
+                        {selector: {"implementation": "mindie_sd_custom_ops", "options": merged_opts}},
+                        selector,
+                    )
+                    entry = (selector, "mindie_sd_custom_ops", tuple(sorted(merged_opts.items())))
+                    if selector in binding_idx:
+                        bindings[binding_idx[selector]] = entry
+                    else:
+                        binding_idx[selector] = len(bindings)
+                        bindings.append(entry)
         if options.track == "eager":
             allowed_tracks: tuple[RewriteTrack, ...] = ()
             allowed_classes: frozenset[KernelReadiness] = frozenset({"shipping"})

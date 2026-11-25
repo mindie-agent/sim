@@ -42,9 +42,6 @@ IMPLEMENTATIONS = {
     "vllm_ascend_cann_keypool_caller": Implementation(
         "mindie_sim.prediction.operators.sparse_indexer.index_pool_native", blocks=("pool_key_indexer",),
         options=("score_mode", "tail_capacity", "block_table_columns")),
-    "causal_pool_indexer_analytic": Implementation(
-        "mindie_sim.prediction.operators.sparse_indexer.index_pool", blocks=("pool_key_indexer",),
-        options=("score_mode",)),
     "vllm_ascend_sparse_mla_metadata": Implementation(
         "mindie_sim.prediction.operators.sparse_indexer.sparse_mla_metadata", blocks=("sparse_mla_metadata",),
         options=("layer_groups", "schedule")),
@@ -151,7 +148,7 @@ IMPLEMENTATIONS = {
             "indexed_attention", "gqa_attention", "rmsnorm", "add_rmsnorm",
             "elementwise", "quantize", "gemm", "ffn",
         ),
-        options=("op_name", "soc_family", "sparsity_ratio", "low_rank", "block_size")),
+        options=("op_name", "soc_family", "sparsity_ratio", "low_rank", "block_size", "kv_dtype")),
     "mindie_sd_rainfusion": Implementation(
         "mindie_sim.prediction.operators.diffusion",
         operators=("rainfusion", "mindie_sd_rainfusion", "indexed_attention", "gqa_attention"),
@@ -167,7 +164,7 @@ IMPLEMENTATIONS = {
     "mindie_sd_eagle_qbsa": Implementation(
         "mindie_sim.prediction.operators.diffusion",
         operators=("eagle_qbsa", "mindie_sd_eagle_qbsa", "indexed_attention", "gqa_attention"),
-        options=("op_name", "soc_family", "sparsity_ratio", "block_size")),
+        options=("op_name", "soc_family", "sparsity_ratio", "block_size", "kv_dtype")),
     "mindie_sd_adalayernorm": Implementation(
         "mindie_sim.prediction.operators.diffusion",
         operators=("adalayernorm", "mindie_sd_adalayernorm", "rmsnorm", "add_rmsnorm"),
@@ -203,22 +200,59 @@ IMPLEMENTATIONS = {
             "store_index_k_on_host", "layerwise_kv_offload", "num_shared_layers",
             "soc_family", "page_size",
         )),
-    "hisparse_kv_offload": Implementation(
-        "mindie_sim.prediction.operators.sparse_indexer.sparse_kv_offload",
-        blocks=("sparse_kv_offload",),
-        operators=(
-            "memfabric_sparse_copy_d2h", "memfabric_sparse_copy_h2d",
-            "memfabric_kv_exchange", "memfabric_entry_gather",
-            "fused_lightning_indexer_manage", "copy_sfa_attention",
-            "fused_sparse_attention_overlap",
-        ),
-        options=(
-            "dram_size_per_dp_gb", "topk_buffer_size", "miss_rate",
-            "use_fused_copy_sfa", "use_fused_overlap", "keep_device_kv_cache",
-            "store_index_k_on_host", "layerwise_kv_offload", "num_shared_layers",
-            "soc_family", "page_size",
-        )),
 }
+
+
+_GEOMETRY = {"valid_tokens", "padded_tokens", "sequences", "min_query_tokens", "max_query_tokens",
+             "max_context_tokens", "min_context_tokens"}
+_STATIC_SELECTORS = {"mla_prolog", "mx_matrix"}
+_CATEGORIES = {"phases": {"prefill", "decode"},
+               "replay_scopes": {"none", "full", "piecewise"},
+               "model_scopes": {"target", "draft"}}
+
+
+def is_policy(raw):
+    return isinstance(raw, dict) and "cases" in raw
+
+
+def _validate_domain(domain, selector):
+    if not domain or set(domain) - (_GEOMETRY | _CATEGORIES.keys()):
+        raise ModelingError(f"implementation_domain_unknown_or_empty:{selector}")
+    for key, value in domain.items():
+        if key in _CATEGORIES:
+            allowed = _CATEGORIES[key]
+            if (not isinstance(value, (tuple, list)) or not value
+                    or set(value) - allowed or len(set(value)) != len(value)):
+                raise ModelingError(f"implementation_domain_invalid:{selector}:{key}")
+        elif (not isinstance(value, dict) or not value or set(value) - {"min", "max"}
+              or any(type(bound) is not int or bound < 0 for bound in value.values())
+              or value.get("min", 0) > value.get("max", float("inf"))):
+            raise ModelingError(f"implementation_domain_invalid:{selector}:{key}")
+
+
+def alternatives(raw, selector):
+    """Enumerate all declared recipe providers without executing their planners."""
+    if not is_policy(raw):
+        yield raw
+        return
+    if selector in _STATIC_SELECTORS and not all(
+            isinstance(case, dict) and set(case.get("domain") or ()) == {"model_scopes"}
+            for case in (raw.get("cases") or ())):
+        raise ModelingError(f"implementation_policy_requires_static_model_preparation:{selector}")
+    if set(raw) - {"cases", "otherwise"} or not raw["cases"]:
+        raise ModelingError(f"implementation_policy_requires_cases:{selector}")
+    for case in raw["cases"]:
+        if set(case) != {"domain", "binding"}:
+            raise ModelingError(f"implementation_case_requires_domain_and_binding:{selector}")
+        _validate_domain(case["domain"], selector)
+        if is_policy(case["binding"]) or case["binding"] == "error":
+            raise ModelingError(f"implementation_case_requires_leaf_binding:{selector}")
+        yield case["binding"]
+    otherwise = raw.get("otherwise", "error")
+    if is_policy(otherwise):
+        raise ModelingError(f"implementation_case_requires_leaf_binding:{selector}")
+    if otherwise != "error":
+        yield otherwise
 
 
 def implementation(name):
@@ -230,8 +264,7 @@ def select(bindings, selector):
     raw = bindings.get(selector)
     if raw is None:
         return None
-    if isinstance(raw, dict) and "cases" in raw:
-        from mindie_sim.prediction.implementation_selection import alternatives
+    if is_policy(raw):
         tuple(alternatives(raw, selector))
         raise ModelingError(f"implementation_policy_requires_batch_geometry:{selector}")
     declaration = {"implementation": raw} if isinstance(raw, str) else raw
@@ -260,8 +293,6 @@ def select(bindings, selector):
 
 
 def recipes(bindings):
-    from mindie_sim.prediction.implementation_selection import alternatives
-
     result, loaded = {}, set()
     for selector, raw in bindings.items():
         for binding in alternatives(raw, selector):

@@ -213,27 +213,53 @@ def test_causal_pool_scan_and_expansion_match_scalar_selections():
     (batch, eager, LONG_CONTEXT, False) for batch, eager in product((1, 3, 4, 8), (False, True))
 ] + [(1, False, 4096, False), (1, False, LONG_CONTEXT, True)])
 def test_index_pool_graph_preserves_valid_scan_and_cache_write_geometry(batch, eager, context, per_head):
+    from mindie_sim.prediction.implementations import select
+
     raw = index_pool_case()
     raw["runtime"].setdefault("metadata", {})["raw_eager"] = eager
-    if per_head:
-        raw["runtime"]["kernels"].setdefault("lowerings", {})["pool_key_indexer"] = {
-            "implementation": "causal_pool_indexer_analytic", "options": {"score_mode": "per_head_relu"}}
-    ops = {op.recipe: op for op in index_pool_layer(raw, batch, context=context)}
     pools = [ctx // POOL_SIZE for ctx in range(context + 1, context + 7)]
     scanned, unique = batch * sum(pools), batch * pools[-1]
+    selected = batch * sum(HISTORY_ROWS + n % POOL_SIZE for n in range(context + 1, context + 7))
+    if per_head:
+        with pytest.raises(ModelingError, match="implementation_not_registered:pool_key_indexer:causal_pool_indexer_analytic"):
+            select({"pool_key_indexer": "causal_pool_indexer_analytic"}, "pool_key_indexer")
+        case = parse_case(raw)
+        plan = case.model.layer_plans[3]
+        views = tuple(RequestView(f"r{i}", 6, context, False, "decode") for i in range(batch))
+        builder = Builder("s0.l3", plan, 0, views, case.model, "decode")
+        cache, _ = index_pool.producer(
+            builder, source="hidden", views=views, plan=plan, model=case.model,
+            quant=builder.quant, padded_tokens=batch * 6,
+        )
+        q_id = builder.work("index_q", ("hidden",), (batch * 6, plan.index_heads, POOL_WIDTH),
+                            family="gemm", dtype=builder.quant.index_dtype)
+        w_id = builder.work("index_w", ("hidden",), (batch * 6, plan.index_heads),
+                            family="gemm", dtype=builder.quant.index_dtype)
+        index_pool.selection(
+            builder, query=q_id, weights=w_id, cache=cache, views=views, plan=plan,
+            quant=builder.quant, padded_tokens=batch * 6, score_mode="per_head_relu",
+            runtime=case.runtime,
+        )
+        ops = {op.recipe: op for op in builder.ops}
+        scores, packed = ops["index_pool_scores"], ops["index_topk"]
+        metadata = dict(scores.metadata)
+        assert metadata["scanned_pools"] == scanned and metadata["valid_query_rows"] == batch * 6
+        assert scores.vector_ops == scanned * (3 * plan.index_heads - 1)
+        assert packed.local_shape == (metadata["padded_query_rows"], HISTORY_ROWS + POOL_SIZE - 1)
+        assert dict(packed.metadata)["selected_token_rows"] == selected
+        return
+    ops = {op.recipe: op for op in index_pool_layer(raw, batch, context=context)}
     scores, packed = ops["index_pool_scores"], ops["index_topk"]
     metadata = dict(scores.metadata)
     assert metadata["scanned_pools"] == scanned and metadata["valid_query_rows"] == batch * 6
-    assert scores.vector_ops == scanned * (32 if per_head else POOL_WIDTH) * 2
-    if not per_head:
-        assert metadata["score_l2_hit_bytes"] == (scanned - unique) * POOL_WIDTH * 2
-        score_bytes = scanned * 4 if eager else 0
-        assert scores.hbm_bytes == scores.mte2_bytes - (scanned - unique) * POOL_WIDTH * 2 + score_bytes
-        assert ops["index_pool_topk"].mte2_bytes == score_bytes
+    assert scores.vector_ops == scanned * POOL_WIDTH * 2
+    assert metadata["score_l2_hit_bytes"] == (scanned - unique) * POOL_WIDTH * 2
+    score_bytes = scanned * 4 if eager else 0
+    assert scores.hbm_bytes == scores.mte2_bytes - (scanned - unique) * POOL_WIDTH * 2 + score_bytes
+    assert ops["index_pool_topk"].mte2_bytes == score_bytes
     padded = metadata["padded_query_rows"]
     assert packed.local_shape == (padded, HISTORY_ROWS + POOL_SIZE - 1)
     attention = next(op for op in ops.values() if op.family == "attention")
-    selected = batch * sum(HISTORY_ROWS + n % POOL_SIZE for n in range(context + 1, context + 7))
     assert dict(attention.metadata)["indexed_gather_rows"] == dict(packed.metadata)["selected_token_rows"] == selected
 
 def test_index_pool_residency_and_projection_formats_follow_checkpoint_ownership():
