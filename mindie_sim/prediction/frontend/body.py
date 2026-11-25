@@ -153,7 +153,37 @@ def _strip_recover_intents(ops):
     return tuple(result)
 
 
-def _dcp_cohort_context(parallel, replica, views, cohort_views_by_replica):
+def _verify_query_len(view) -> int:
+    """Expand decode query length by proposal count ONCE without double-counting."""
+    q_len = int(getattr(view, "q_len", 0) or 0)
+    if getattr(view, "padding", False):
+        return q_len
+    prop = int(getattr(view, "draft_proposal_tokens", 0) or 0)
+    if getattr(view, "phase", "") == "decode" and prop > 0:
+        if q_len <= 1:
+            return 1 + prop
+        return max(q_len, 1 + prop)
+    return q_len + prop
+
+
+def _expand_target_cohort_views(cohort_views_by_replica, *, include_spec_tokens: bool = True):
+    """Expand speculative verification rows once across every DP cohort member."""
+    if cohort_views_by_replica is None:
+        return None
+    if not include_spec_tokens:
+        return {member: tuple(grp) for member, grp in cohort_views_by_replica.items()}
+    return {
+        member: tuple(
+            _frontend.replace(view, q_len=_verify_query_len(view))
+            for view in grp
+        )
+        for member, grp in cohort_views_by_replica.items()
+    }
+
+
+def _dcp_cohort_context(
+    parallel, replica, views, cohort_views_by_replica, *, include_spec_tokens: bool = True,
+):
     """Resolve cross-DP DCP cohort member views and local position for one replica."""
     if not bool(getattr(parallel, "cp_spans_dp", False)):
         return None, 0, False
@@ -161,13 +191,35 @@ def _dcp_cohort_context(parallel, replica, views, cohort_views_by_replica):
     first = (int(replica) // dp_w) * dp_w
     members = tuple(range(first, min(int(parallel.dp), first + dp_w)))
     if cohort_views_by_replica is not None:
-        by_member = tuple(tuple(cohort_views_by_replica.get(m, ())) for m in members)
+        expanded = _expand_target_cohort_views(
+            cohort_views_by_replica, include_spec_tokens=include_spec_tokens,
+        )
+        by_member = tuple(tuple(expanded.get(m, ())) for m in members)
         pos = members.index(int(replica)) if int(replica) in members else 0
     else:
         by_member = tuple(tuple(views) for _ in members)
         pos = 0
     has_decode = any(v.phase != "prefill" for grp in by_member for v in grp)
     return by_member, pos, has_decode
+
+
+def _resolve_hc_final_collapse(model) -> tuple[int, str]:
+    """Return ``(hc_mult, collapse_mode)`` across active hyper-connection layers."""
+    hc_plans = [
+        plan for plan in model.layer_plans
+        if getattr(plan, "hyper_connections", False) and int(getattr(plan, "hc_mult", 1) or 1) > 1
+    ]
+    hc_mult = max((int(getattr(plan, "hc_mult", 1) or 1) for plan in hc_plans), default=1)
+    collapse_modes = {
+        str(getattr(plan, "hc_final_collapse", "learned") or "learned").strip().lower()
+        for plan in hc_plans
+    }
+    collapse_mode = (
+        "none" if "none" in collapse_modes
+        else "mean" if "mean" in collapse_modes
+        else "learned"
+    )
+    return hc_mult, collapse_mode
 
 
 def _select_body_sp(runtime, model, views, *, tokens, global_tokens, rank_ledger, cohort_valid, mode):
@@ -186,19 +238,31 @@ def _close_body_sp(
 ):
     """Emit optional pre-gather mHC collapse, SP output AllGather, and trim."""
     stage_end = stages[-1] if stages else 0
-    hc_plans = [
-        plan for plan in model.layer_plans
-        if getattr(plan, "hyper_connections", False) and int(getattr(plan, "hc_mult", 1) or 1) > 1
-    ]
-    hc_mult = max((int(getattr(plan, "hc_mult", 1) or 1) for plan in hc_plans), default=1)
+    hc_mult, collapse_mode = _resolve_hc_final_collapse(model)
+    has_lowrank = any(getattr(plan, "hc_lowrank", 0) > 0 for plan in model.layer_plans)
     gather_width = model.hidden_size
-    if hc_mult > 1 and mode == "draft":
+    if hc_mult > 1:
         if hc_collapse_before_sp_gather:
-            c_ops, previous = _mhc_stream_collapse_ops(
-                model, previous, prefix=prefix, mode=mode, stage=stage_end,
-                tokens=sp.tokens_local, requests=requests, hc_mult=hc_mult,
-            )
-            ops.extend(c_ops)
+            if has_lowrank:
+                c_ops, previous = _frontend.lowrank_hyper_final_mixer(
+                    prefix=prefix + "final", deps=previous, stage=stage_end,
+                    requests=requests, tokens=sp.tokens_local, model=model, mode=mode,
+                )
+                ops.extend(c_ops)
+            elif collapse_mode == "mean":
+                c_ops, previous = _mhc_mean_collapse_ops(
+                    model, previous, prefix=prefix, mode=mode, stage=stage_end,
+                    tokens=sp.tokens_local, requests=requests, hc_mult=hc_mult,
+                )
+                ops.extend(c_ops)
+            elif collapse_mode == "learned":
+                c_ops, previous = _mhc_stream_collapse_ops(
+                    model, previous, prefix=prefix, mode=mode, stage=stage_end,
+                    tokens=sp.tokens_local, requests=requests, hc_mult=hc_mult,
+                )
+                ops.extend(c_ops)
+            else:
+                gather_width = hc_mult * model.hidden_size
         else:
             gather_width = hc_mult * model.hidden_size
     gathered = _frontend.sequence_parallel.allgather(
@@ -434,57 +498,102 @@ class _FrontendBody:
     @staticmethod
     def _transfer_body_stage(
         ops, previous, residual_sources, *, name, layer, stage, index, stages,
-        requests, mode, tokens, model, attn_state,
+        requests, mode, tokens, model, attn_state, sp=None, prefix="",
     ):
-        transfer = _frontend.comm_op(
-            op_id=name + ".pp", deps=(previous,), stage=stage, layer=index,
-            requests=requests, family="pp_p2p", phase=mode, recipe="pipeline_send",
-            link_bytes=tokens * model.hidden_size * _frontend.dtype_bytes(model.activation_dtype)
-                       * max(1, layer.hc_mult), shape=(tokens, model.hidden_size),
-            metadata=(("group_axis", "pp"), ("destination_stage", stages[index + 1])),
+        next_stage = stages[index + 1]
+        hc_mult = (
+            max(1, int(getattr(layer, "hc_mult", 1) or 1))
+            if getattr(layer, "hyper_connections", False) else 1
         )
-        ops.append(transfer)
-        previous = transfer.op_id
+        act_bytes = _frontend.dtype_bytes(model.activation_dtype)
+
+        def _transfer_tensor(
+            dep_id, *, pp_op_id, recipe, channel_mult, gather_prefix, shard_op_id,
+        ):
+            cur = dep_id
+            width = model.hidden_size * channel_mult
+            if sp is not None and tokens > 0:
+                gathered = _frontend.sequence_parallel.allgather(
+                    plan=sp, op_id=f"{gather_prefix}sp_output_gather", deps=(cur,),
+                    stage=stage, layer=index, requests=requests, phase=mode,
+                    width=model.hidden_size, dtype=model.activation_dtype,
+                    channel_multiplier=channel_mult,
+                )
+                ops.append(gathered)
+                cur = gathered.op_id
+                if sp.physical_global > sp.input_rows:
+                    trimmed = _frontend.sequence_parallel.output_trim(
+                        plan=sp, op_id=f"{gather_prefix}sp_output_trim", deps=(cur,),
+                        stage=stage, layer=index, requests=requests, phase=mode,
+                        width=width, dtype=model.activation_dtype,
+                    )
+                    ops.append(trimmed)
+                    cur = trimmed.op_id
+                pp_tokens = sp.input_rows
+            else:
+                pp_tokens = tokens
+            transfer = _frontend.comm_op(
+                op_id=pp_op_id, deps=(cur,), stage=stage, layer=index,
+                requests=requests, family="pp_p2p", phase=mode, recipe=recipe,
+                link_bytes=pp_tokens * width * act_bytes,
+                shape=(pp_tokens, width),
+                metadata=(("group_axis", "pp"), ("destination_stage", next_stage)),
+            )
+            ops.append(transfer)
+            cur = transfer.op_id
+            if sp is not None and tokens > 0:
+                shard = _frontend.sequence_parallel.input_shard(
+                    plan=sp, op_id=shard_op_id, deps=(cur,),
+                    stage=next_stage, layer=-1, requests=requests, phase=mode,
+                    width=model.hidden_size, dtype=model.activation_dtype,
+                    channel_multiplier=channel_mult,
+                )
+                ops.append(shard)
+                cur = shard.op_id
+            return cur
+
+        orig_previous = previous
+        previous = _transfer_tensor(
+            previous, pp_op_id=f"{name}.pp", recipe="pipeline_send",
+            channel_mult=hc_mult, gather_prefix=f"{name}.",
+            shard_op_id=f"{prefix}s{next_stage}.sp_shard",
+        )
+        transferred = {orig_previous: previous} if hc_mult == 1 else {}
         if attn_state is not None:
             if attn_state.pending_mlp_id is not None:
                 attn_state.pending_mlp_id = previous
-                ptx = _frontend.comm_op(
-                    op_id=f"{name}.prefix_pp", deps=(attn_state.prefix_id,),
-                    stage=stage, layer=index, requests=requests, family="pp_p2p",
-                    phase=mode, recipe="pipeline_residual_send",
-                    link_bytes=tokens * model.hidden_size * _frontend.dtype_bytes(model.activation_dtype),
-                    shape=(tokens, model.hidden_size),
-                    metadata=(("group_axis", "pp"), ("destination_stage", stages[index + 1])))
-                ops.append(ptx)
-                attn_state.prefix_id = ptx.op_id
+                attn_state.prefix_id = _transfer_tensor(
+                    attn_state.prefix_id, pp_op_id=f"{name}.prefix_pp",
+                    recipe="pipeline_residual_send", channel_mult=1,
+                    gather_prefix=f"{name}.prefix_",
+                    shard_op_id=f"{prefix}s{next_stage}.prefix_sp_shard",
+                )
             else:
                 attn_state.prefix_id = previous
             moved_banks = list(attn_state.bank_ids)
             for slot_idx, bank_id in enumerate(moved_banks):
                 if bank_id is not None:
-                    btx = _frontend.comm_op(
-                        op_id=f"{name}.residual_pp{slot_idx}", deps=(bank_id,),
-                        stage=stage, layer=index, requests=requests, family="pp_p2p",
-                        phase=mode, recipe="pipeline_residual_send",
-                        link_bytes=tokens * model.hidden_size * _frontend.dtype_bytes(model.activation_dtype),
-                        shape=(tokens, model.hidden_size),
-                        metadata=(("group_axis", "pp"), ("destination_stage", stages[index + 1])))
-                    ops.append(btx)
-                    moved_banks[slot_idx] = btx.op_id
+                    moved_banks[slot_idx] = _transfer_tensor(
+                        bank_id, pp_op_id=f"{name}.residual_pp{slot_idx}",
+                        recipe="pipeline_residual_send", channel_mult=1,
+                        gather_prefix=f"{name}.residual{slot_idx}_",
+                        shard_op_id=f"{prefix}s{next_stage}.residual{slot_idx}_sp_shard",
+                    )
             attn_state.bank_ids = tuple(moved_banks)
         moved = []
         for source_index, source in enumerate(residual_sources):
-            transfer = _frontend.comm_op(
-                op_id=f"{name}.residual_pp{source_index}", deps=(source,),
-                stage=stage, layer=index, requests=requests, family="pp_p2p",
-                phase=mode, recipe="pipeline_residual_send",
-                link_bytes=tokens * model.hidden_size * _frontend.dtype_bytes(model.activation_dtype),
-                shape=(tokens, model.hidden_size),
-                metadata=(("group_axis", "pp"), ("destination_stage", stages[index + 1])))
-            ops.append(transfer)
-            moved.append(transfer.op_id)
-        residual_sources = moved
-        return previous, residual_sources
+            if source in transferred:
+                moved.append(transferred[source])
+                continue
+            moved_id = _transfer_tensor(
+                source, pp_op_id=f"{name}.residual_pp{source_index}",
+                recipe="pipeline_residual_send", channel_mult=1,
+                gather_prefix=f"{name}.residual{source_index}_",
+                shard_op_id=f"{prefix}s{next_stage}.residual{source_index}_sp_shard",
+            )
+            transferred[source] = moved_id
+            moved.append(moved_id)
+        return previous, moved
 
     def body(self, model, runtime, views, *, prefix="", ready="", tokens=None,
              mode="prefill", global_tokens=None, stages=None, replica=0,
@@ -506,12 +615,20 @@ class _FrontendBody:
         # An explicit mechanism exclusion owns every selector it can install,
         # including the structural body default resolved before this call.
         runtime = _frontend.strip_excluded_native_kda(runtime)
-        if (rank_ledger is None and cohort_views_by_replica is not None and views
+        include_spec_tokens = mode not in {"draft", "draft_prefill"}
+        target_cohort_views = _expand_target_cohort_views(
+            cohort_views_by_replica, include_spec_tokens=include_spec_tokens,
+        )
+        if (rank_ledger is None and target_cohort_views is not None and views
                 and (runtime.parallel.rank_table is not None
                      or runtime.parallel.pcp > 1 or runtime.kernels.get("force_eplb_source"))):
             from mindie_sim.prediction.execution.rank_ledger import rank_ledger_for
+            ledger_peers = {
+                m: tuple(_frontend.replace(v, draft_proposal_tokens=0) for v in grp)
+                for m, grp in target_cohort_views.items()
+            }
             parent = rank_ledger_for(self, model, runtime, views, tokens,
-                                     cohort_views_by_replica, replica, machine,
+                                     ledger_peers, replica, machine,
                                      physical_rank, routing_views)
             if parent is not None:
                 rank_ledger = parent
@@ -527,21 +644,13 @@ class _FrontendBody:
             tokens, _ = pcp_uniform_peer_rows(views, p.pcp, local_rows=0)
         stages = stages or _frontend.stage_map(model, runtime)
         ops, previous = [], ready
-        include_spec_tokens = mode not in {"draft", "draft_prefill"}
         cohort_valid = (
             sum(
-                int(getattr(view, "global_q_len", 0) or 0)
-                or (
-                    int(view.q_len)
-                    + (
-                        int(getattr(view, "draft_proposal_tokens", 0) or 0)
-                        if include_spec_tokens else 0
-                    )
-                )
-                for grp in cohort_views_by_replica.values()
+                int(getattr(view, "global_q_len", 0) or 0) or int(view.q_len)
+                for grp in target_cohort_views.values()
                 for view in grp if not getattr(view, "padding", False)
             )
-            if cohort_views_by_replica is not None else None
+            if target_cohort_views is not None else None
         )
         sp = _select_body_sp(
             runtime, model, views, tokens=tokens,
@@ -578,7 +687,7 @@ class _FrontendBody:
                 mode=mode, requests=requests,
                 optimize_prefill=attnres["optimize_prefill"])
         dcp_cohort_views, dcp_local_pos, has_dcp_decode = _dcp_cohort_context(
-            p, replica, views, cohort_views_by_replica)
+            p, replica, views, target_cohort_views, include_spec_tokens=include_spec_tokens)
         for index, layer in enumerate(model.layer_plans):
             stage = stages[index]
             name = f"{prefix}s{stage}.l{index}"
@@ -616,6 +725,7 @@ class _FrontendBody:
                     ops, previous, residual_sources, name=name, layer=layer,
                     stage=stage, index=index, stages=stages, requests=requests,
                     mode=mode, tokens=tokens, model=model, attn_state=attn_state,
+                    sp=sp if sp_entry else None, prefix=prefix,
                 )
         if attn_state is not None:
             last = model.layer_plans[-1]
@@ -642,31 +752,19 @@ class _FrontendBody:
     ):
         """Emit low-rank or full-stream mHC collapse before final norm, or plain final norm."""
         if any(getattr(plan, "hc_lowrank", 0) > 0 for plan in model.layer_plans):
+            if already_hc_collapsed:
+                return [], ready
             return _frontend.lowrank_hyper_final_mixer(
                 prefix=prefix + "final", deps=ready, stage=stage,
                 requests=requests, tokens=tokens, model=model, mode=mode)
-        hc_plans = [
-            plan for plan in model.layer_plans
-            if getattr(plan, "hyper_connections", False) and int(getattr(plan, "hc_mult", 1) or 1) > 1
-        ]
-        hc_mult = max((int(getattr(plan, "hc_mult", 1) or 1) for plan in hc_plans), default=1)
-        collapse_modes = {
-            str(getattr(plan, "hc_final_collapse", "learned") or "learned").strip().lower()
-            for plan in hc_plans
-        }
-        collapse_mode = (
-            "none" if "none" in collapse_modes
-            else "mean" if "mean" in collapse_modes
-            else "learned"
-        )
+        hc_mult, collapse_mode = _resolve_hc_final_collapse(model)
         prefix_ops = []
         if hc_mult > 1 and tokens > 0 and not already_hc_collapsed:
             if collapse_mode == "mean":
-                if mode not in {"draft", "draft_prefill"}:
-                    prefix_ops, ready = _mhc_mean_collapse_ops(
-                        model, ready, prefix=prefix, mode=mode, stage=stage,
-                        tokens=tokens, requests=requests, hc_mult=hc_mult,
-                    )
+                prefix_ops, ready = _mhc_mean_collapse_ops(
+                    model, ready, prefix=prefix, mode=mode, stage=stage,
+                    tokens=tokens, requests=requests, hc_mult=hc_mult,
+                )
             elif collapse_mode == "learned":
                 prefix_ops, ready = _mhc_stream_collapse_ops(
                     model, ready, prefix=prefix, mode=mode, stage=stage,
@@ -702,8 +800,22 @@ class _FrontendBody:
         if not rows:
             return ops, last
         if rows != input_tokens:
+            hc_mult, collapse_mode = _resolve_hc_final_collapse(model)
+            has_lowrank = any(getattr(plan, "hc_lowrank", 0) > 0 for plan in model.layer_plans)
+            select_width = (
+                hc_mult * model.hidden_size
+                if (
+                    not normalized
+                    and runtime.final_norm_scope == "selected"
+                    and not hc_collapsed
+                    and hc_mult > 1
+                    and (has_lowrank or collapse_mode != "none")
+                )
+                else model.hidden_size
+            )
             select = self.select_hidden(
-                model, views, last, prefix=prefix, mode=mode, stage=stage, selected_rows=rows,
+                model, views, last, prefix=prefix, mode=mode, stage=stage,
+                selected_rows=rows, width=select_width,
             )
             ops.append(select)
             last = select.op_id
@@ -756,19 +868,23 @@ class _FrontendBody:
         return ops, sample.op_id
 
     @staticmethod
-    def select_hidden(model, views, ready, *, prefix="", mode="decode", stage=0, selected_rows: int | None = None):
+    def select_hidden(
+        model, views, ready, *, prefix="", mode="decode", stage=0,
+        selected_rows: int | None = None, width: int | None = None,
+    ):
         sampled = tuple(view for view in views if view.samples)
         rows = (
             int(selected_rows)
             if selected_rows is not None
             else sum(view.q_len if view.phase == "decode" else 1 for view in sampled)
         )
-        payload = rows * model.hidden_size * _frontend.dtype_bytes(model.activation_dtype)
+        row_width = model.hidden_size if width is None else int(width)
+        payload = rows * row_width * _frontend.dtype_bytes(model.activation_dtype)
         return _frontend.vector_op(
             op_id=prefix + "select_hidden", deps=(ready,), stage=stage, layer=-1,
-            requests=tuple(view.request_id for view in sampled), elements=rows * model.hidden_size,
+            requests=tuple(view.request_id for view in sampled), elements=rows * row_width,
             ops_per_element=0, dtype=model.activation_dtype, family="tensor_select", phase=mode,
-            recipe="select_hidden", shape=(rows, model.hidden_size),
+            recipe="select_hidden", shape=(rows, row_width),
             read_bytes_override=payload + rows * _HIDDEN_SELECTION_INDEX_BYTES, write_bytes_override=payload,
             metadata=(("selection", "all_verify_rows_or_last_prefill_row"),))
 
@@ -776,7 +892,7 @@ class _FrontendBody:
 def _representative_attention(
     frontend, residual, *, layer, rep_idx, local_views, local_requests, local_tokens,
     mode, model, runtime, parallel, features, source_rows_by_replica, machine, ready,
-    attention_state, physical_rank=None,
+    attention_state, physical_rank=None, gbsa_metadata_cache=None,
 ):
     """Build the attention portion of a representative layer, including residuals."""
     caches, indices_map, topks, candidates = attention_state
@@ -803,6 +919,8 @@ def _representative_attention(
     if physical_rank is not None:
         attn_kwargs["physical_rank"] = int(physical_rank)
         attn_kwargs["explicit_physical_rank"] = True
+    if lyr.attention == "gqa":
+        attn_kwargs["gbsa_metadata_cache"] = gbsa_metadata_cache
     attn = frontend.attention[lyr.attention](
         prefix=name, plan=lyr, views=local_views, stage=0,
         deps=norm1.op_id, model=model, parallel=p, quant=model.quant,
@@ -848,6 +966,7 @@ def _build_representative_body(
     local_requests = tuple(v.request_id for v in local_views)
     residual = frontend.residuals["plain"]
     attention_state = ({}, {}, {}, {})
+    gbsa_metadata_cache: dict = {}
     p = parallel
     for rep_idx in active_rep_indices:
         lyr = layers[rep_idx]
@@ -860,6 +979,7 @@ def _build_representative_body(
             runtime=runtime, parallel=p, features=features,
             source_rows_by_replica=source_rows_by_replica, machine=machine,
             ready=in_id, attention_state=attention_state, physical_rank=physical_rank,
+            gbsa_metadata_cache=gbsa_metadata_cache,
         )
         name = common["prefix"]
         if lyr.attention not in {"gdn", "kda", "projection_only", "unmodeled"}:

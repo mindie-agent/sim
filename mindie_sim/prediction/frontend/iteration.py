@@ -8,6 +8,11 @@
 from __future__ import annotations
 
 from mindie_sim.prediction import frontend as _frontend
+from mindie_sim.prediction.frontend.body import (
+    _expand_target_cohort_views,
+    _resolve_hc_final_collapse,
+    _verify_query_len,
+)
 
 
 _SPECULATIVE_ACCEPTANCE_OPS_PER_PROPOSAL = 6
@@ -28,15 +33,76 @@ def _is_non_neural_spec(runtime) -> bool:
     return _spec_method(runtime) in _NON_NEURAL_SPEC_METHODS
 
 
-def _verify_query_len(view) -> int:
-    """Expand decode query length by proposal count ONCE without double-counting."""
-    prop = int(getattr(view, "draft_proposal_tokens", 0) or 0)
-    q_len = int(getattr(view, "q_len", 0) or 0)
-    if getattr(view, "phase", "") == "decode" and prop > 0:
-        if q_len <= 1:
-            return 1 + prop
-        return max(q_len, 1 + prop)
-    return q_len + prop
+def _restore_target_pcp_hidden(
+    frontend, ops, previous, *, views, model, runtime, mode, local_tokens, padded, requests,
+) -> tuple[str, int]:
+    """Gather and unpermute full physical PCP rows before target logits row selection."""
+    from mindie_sim.prediction.sharding.context_parallel import (
+        emit_pcp_hidden_gather_restore,
+        pcp_uniform_peer_rows,
+    )
+    final_stage = runtime.parallel.pp + _frontend.FINAL_LAYER
+    if runtime.final_norm_scope == "all":
+        finals, previous = frontend.final_mixer(
+            model, previous, prefix="", mode=mode,
+            stage=final_stage, tokens=local_tokens, requests=requests,
+        )
+        ops.extend(finals)
+    pcp = int(runtime.parallel.pcp)
+    per_peer_rows, global_rows = pcp_uniform_peer_rows(
+        views, pcp, local_rows=local_tokens,
+    )
+    restored_rows = max(global_rows, int(padded))
+    extra = max(0, int(padded) - sum(int(v.q_len) for v in views))
+    if extra > 0:
+        decode_rows = sum(int(v.q_len) for v in views if v.phase != "prefill")
+        prefill_views = tuple(v for v in views if v.phase == "prefill")
+        rank_totals = (
+            decode_rows
+            + sum(
+                sum(hi - lo for lo, hi in _frontend.pcp_rank_chunk_ranges(
+                    int(getattr(v, "global_q_len", 0) or v.q_len), pcp, r))
+                for v in prefill_views
+            )
+            + sum(hi - lo for lo, hi in _frontend.pcp_rank_chunk_ranges(extra, pcp, r))
+            for r in range(pcp)
+        )
+        per_peer_rows = max(per_peer_rows, max(rank_totals, default=0))
+    per_peer_rows = max(per_peer_rows, (restored_rows + pcp - 1) // pcp)
+    hc_mult, collapse_mode = _resolve_hc_final_collapse(model)
+    has_lowrank = any(getattr(plan, "hc_lowrank", 0) > 0 for plan in model.layer_plans)
+    gather_hidden = (
+        hc_mult * model.hidden_size
+        if runtime.final_norm_scope != "all" and hc_mult > 1 and (has_lowrank or collapse_mode != "none")
+        else model.hidden_size
+    )
+    pcp_ops: list = []
+    previous = emit_pcp_hidden_gather_restore(
+        pcp_ops, prefix="", gather_name="pcp_hidden_gather",
+        restore_name="pcp_hidden_restore", stage=final_stage,
+        layer=_frontend.FINAL_LAYER, requests=requests, mode=mode,
+        dep=previous, local_rows=local_tokens, global_rows=restored_rows,
+        hidden=gather_hidden, pcp=int(runtime.parallel.pcp),
+        act_dtype=model.activation_dtype, runtime=runtime,
+        source="vllm_ascend.attention.context_parallel.pcp_manager",
+        per_peer_rows=per_peer_rows,
+    )
+    rename = {
+        op.op_id: op.op_id.lstrip(".")
+        for op in pcp_ops if op.op_id.startswith(".")
+    }
+    if rename:
+        pcp_ops = [
+            _frontend.replace(
+                op,
+                op_id=rename.get(op.op_id, op.op_id),
+                deps=tuple(rename.get(dep, dep) for dep in op.deps),
+            )
+            for op in pcp_ops
+        ]
+        previous = rename.get(previous, previous)
+    ops.extend(pcp_ops)
+    return previous, restored_rows
 
 
 def _is_view_eos(view, output_tokens_by_req: dict[str, int]) -> bool:
@@ -563,7 +629,7 @@ class _FrontendIteration:
         local_views, local_tokens, pcp_prefill = self.partition_views(
             views, runtime, padded, model=model,
             lane=selected_lane(runtime.parallel, machine, replica, requested_rank))
-        if valid:
+        if valid or (scope == "full" and local_tokens > 0):
             embedding = _frontend.vector_op(
                 op_id="embedding", deps=(previous,), stage=0, layer=-1, requests=requests,
                 elements=local_tokens * model.hidden_size, ops_per_element=1,
@@ -571,36 +637,42 @@ class _FrontendIteration:
             )
             ops.append(embedding)
             previous = embedding.op_id
+            tp = int(runtime.parallel.tp)
+            if tp > 1 and local_tokens > 0:
+                reduction = _frontend.replace(
+                    _frontend.comm_op(
+                        op_id="embedding_allreduce", deps=(previous,), stage=0, layer=-1,
+                        requests=requests, family="allreduce", phase=mode, recipe="ring_allreduce",
+                        link_bytes=(
+                            2 * (tp - 1) / tp * local_tokens * model.hidden_size
+                            * _frontend.dtype_bytes(model.activation_dtype)
+                        ),
+                        shape=(local_tokens, model.hidden_size),
+                        metadata=(("group_axis", "tp"), ("steps", 2 * (tp - 1))),
+                    ),
+                    dtype=model.activation_dtype,
+                )
+                ops.append(reduction)
+                previous = reduction.op_id
         return entry, before, ops, previous, local_views, local_tokens, pcp_prefill
 
     def _lower_iteration_outputs(
         self, ops, previous, *, entry, plan, views, model, runtime, declared_runtime,
-        machine, before, assembly, replica, scope, mode, valid, padded, bucket,
+        machine, before, assembly, replica, requested_rank, scope, mode, valid, padded, bucket,
         local_tokens, requests, pcp_prefill, deferred_commits, has_prefill_draft,
         has_decode_draft, decode_proposal_views, global_decode_proposals,
         preparation_views, global_views, global_preparation, selections, resource_fusion,
         next_proposal_widths, ngram_propose_views,
     ):
+        restored_rows = padded
         if pcp_prefill:
-            if runtime.final_norm_scope == "all":
-                finals, previous = self.final_mixer(model, previous, prefix="", mode=mode,
-                    stage=runtime.parallel.pp + _frontend.FINAL_LAYER, tokens=local_tokens, requests=requests)
-                ops.extend(finals)
-            select = self.select_hidden(model, views, previous, mode=mode, stage=runtime.parallel.pp - 1)
-            ops.append(select)
-            previous = select.op_id
-            rows = sum(v.q_len if v.phase == "decode" else 1 for v in views if v.samples)
-            gather = _frontend.comm_op(
-                op_id="pcp_hidden_gather", deps=(previous,), stage=runtime.parallel.pp - 1,
-                layer=-1, requests=requests, family="allgather", phase=mode,
-                recipe="pcp_hidden_gather", link_bytes=rows * model.hidden_size * _frontend.dtype_bytes(model.activation_dtype)
-                * (runtime.parallel.pcp - 1) / runtime.parallel.pcp,
-                shape=(rows, model.hidden_size), metadata=(("group_axis", "pcp"),))
-            ops.append(gather)
-            previous = gather.op_id
+            previous, restored_rows = _restore_target_pcp_hidden(
+                self, ops, previous, views=views, model=model, runtime=runtime,
+                mode=mode, local_tokens=local_tokens, padded=padded, requests=requests,
+            )
         heads, previous = self.logits(
             model, runtime, views, previous, mode=mode,
-            input_tokens=rows if pcp_prefill else padded,
+            input_tokens=restored_rows if pcp_prefill else padded,
             normalized=pcp_prefill and runtime.final_norm_scope == "all")
         ops.extend(heads)
         proposal_count, committed = _append_service_tail(
@@ -668,7 +740,8 @@ class _FrontendIteration:
                     self, model, declared_runtime, decode_proposal_views, decode_ready,
                     global_views=global_decode_proposals if global_views else None,
                     prefill=False, replica=replica, replay_scope=scope, machine=machine,
-                    assembly=assembly, next_proposal_widths=next_proposal_widths)
+                    assembly=assembly, next_proposal_widths=next_proposal_widths,
+                    physical_rank=requested_rank)
                 base_idx = len(after)
                 after.extend(dec_regions)
                 if dec_last is not None:
@@ -680,7 +753,8 @@ class _FrontendIteration:
                     self, model, declared_runtime, preparation_views, committed.op_id,
                     global_views=global_preparation if global_views else None, prefill=True,
                     replica=replica, replay_scope=scope, machine=machine,
-                    assembly=assembly, next_proposal_widths=next_proposal_widths)
+                    assembly=assembly, next_proposal_widths=next_proposal_widths,
+                    physical_rank=requested_rank)
                 base_idx = len(after)
                 after.extend(pre_regions)
                 if pre_last is not None:
@@ -818,6 +892,7 @@ class _FrontendIteration:
                 else view for index, view in enumerate(plan.requests)))
         views = tuple(_frontend.replace(view, q_len=_verify_query_len(view))
                       for view in plan.requests)
+        cohort_target_views = _expand_target_cohort_views(cohort_views_by_replica)
         valid = sum(view.logical_q_len for view in views)
         physical = sum(view.q_len for view in views)
         bucket, scope = self.graph.select(views, runtime) if views else (None, "none")
@@ -885,7 +960,7 @@ class _FrontendIteration:
                                    source_rows_by_replica=source_rows_by_replica,
                                    routing_global_tokens=routing_global_tokens,
                                    routing_views=eff_routing_views,
-                                   cohort_views_by_replica=cohort_views_by_replica,
+                                   cohort_views_by_replica=cohort_target_views,
                                    physical_rank=physical_rank,
                                    explicit_physical_rank=(explicit_physical_rank or requested_rank is not None),
                                    query_position=eff_query_pos,
@@ -896,7 +971,8 @@ class _FrontendIteration:
         return self._lower_iteration_outputs(
             ops, previous, entry=entry, plan=plan, views=views, model=model,
             runtime=runtime, declared_runtime=declared_runtime, machine=machine,
-            before=before, assembly=assembly, replica=replica, scope=scope,
+            before=before, assembly=assembly, replica=replica,
+            requested_rank=requested_rank, scope=scope,
             mode=mode, valid=valid, padded=padded, bucket=bucket,
             local_tokens=local_tokens, requests=requests, pcp_prefill=pcp_prefill,
             deferred_commits=deferred_commits, has_prefill_draft=has_prefill_draft,
