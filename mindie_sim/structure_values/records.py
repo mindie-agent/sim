@@ -103,22 +103,56 @@ def _value(name, role, *, producer="", output=None, dtype=None, shape=None,
 
 
 def _tensor_record(name, role, spec, path, *, attrs=None, producer="",
-                   output=None, layout_kind=None):
+                   output=None, layout_kind=None, storage_unknown=False):
     shape, dtype, layout = spec
     record_attrs = {"source": path}
     if attrs:
         record_attrs.update(attrs)
     return _value(
         name, role, producer=producer, output=output, dtype=dtype, shape=shape,
-        storage_shape=shape, layout_kind=layout if layout_kind is None else layout_kind,
-        attrs=record_attrs, contract="native_tensor_contract")
-
+        storage_shape=None if storage_unknown else shape,
+        layout_kind=layout if layout_kind is None else layout_kind,
+        attrs=record_attrs, contract="native_tensor_contract",
+        storage_unknown=storage_unknown)
 
 
 def _named_tensors(prefix, role, specs, path):
     return [_tensor_record(f"{prefix}{index}", role, spec, f"{path}[{index}]")
             for index, spec in enumerate(specs)
             if not (spec[1] is None and spec[2] is None)]
+
+
+def _cache_head_tensors(prefix, role, specs, path, *, paged_page=False):
+    """Project partial cache descriptors without claiming total backing storage."""
+    records = []
+    for index, spec in enumerate(specs):
+        if spec[1] is None and spec[2] is None:
+            continue
+        desc_shape = _shape(spec[0])
+        if paged_page and desc_shape and len(desc_shape) >= 2:
+            row_shape = [1, *desc_shape[1:]]
+            attrs = {
+                "page_shape": desc_shape,
+                "page_bytes": _nbytes(spec[1], desc_shape),
+                "page_tokens": desc_shape[0],
+                "row_shape": row_shape,
+                "row_bytes": _nbytes(spec[1], row_shape),
+                "shape_basis": "cache_page_descriptor_only",
+                "capacity_basis": "capacity_not_declared",
+            }
+        else:
+            attrs = {
+                "row_shape": desc_shape,
+                "row_bytes": _nbytes(spec[1], desc_shape),
+                "shape_basis": "cache_head_row_descriptor_only",
+                "capacity_basis": "capacity_not_declared",
+            }
+        records.append(_tensor_record(
+            f"{prefix}{index}", role, spec, f"{path}[{index}]",
+            storage_unknown=True,
+            attrs=attrs,
+        ))
+    return records
 
 
 def _matrix_values(contract):
@@ -195,7 +229,7 @@ def _common_attention_values(contract):
         if len(contract) == 5 and _is_tensor_seq(contract[2]) \
                 and _is_tensor_seq(contract[3]) and _is_tensor(contract[4]):
             inputs = (_named_tensors("input", "input", contract[2], "contract[2]")
-                      + _named_tensors("cache", "input", contract[3], "contract[3]"))
+                      + _cache_head_tensors("cache", "input", contract[3], "contract[3]"))
             outputs = [_tensor_record("output", "output", contract[4], "contract[4]")]
             return inputs, outputs, [], {}
         return None
@@ -203,7 +237,9 @@ def _common_attention_values(contract):
         if (len(contract) == 6 and _is_tensor(contract[2])
                 and _is_tensor_seq(contract[3]) and _is_tensor(contract[4])):
             inputs = [_tensor_record("query", "input", contract[2], "contract[2]")]
-            inputs += _named_tensors("cache", "input", contract[3], "contract[3]")
+            inputs += _cache_head_tensors(
+                "cache", "input", contract[3], "contract[3]", paged_page=True,
+            )
             outputs = [_tensor_record("output", "output", contract[4], "contract[4]")]
             return inputs, outputs, [], {"batch_count": contract[5]}
         return None
@@ -211,7 +247,7 @@ def _common_attention_values(contract):
         if (len(contract) == 6 and _is_tensor_seq(contract[2])
                 and _is_tensor_seq(contract[3]) and _is_tensor(contract[4])):
             inputs = (_named_tensors("query", "input", contract[2], "contract[2]")
-                      + _named_tensors("cache", "input", contract[3], "contract[3]"))
+                      + _cache_head_tensors("cache", "input", contract[3], "contract[3]"))
             outputs = [_tensor_record("output", "output", contract[4], "contract[4]")]
             return inputs, outputs, [], {"batch_count": contract[5]}
         return None
@@ -221,20 +257,71 @@ def _common_attention_values(contract):
                 and _is_tensor_seq(contract[5])):
             inputs = ([_tensor_record("input", "input", contract[2], "contract[2]")]
                       + _named_tensors("parameter", "input", contract[3], "contract[3]")
-                      + _named_tensors("cache", "input", contract[4], "contract[4]"))
+                      + _cache_head_tensors("cache", "input", contract[4], "contract[4]"))
             outputs = _named_tensors("output", "output", contract[5], "contract[5]")
             return inputs, outputs, [], {}
         return None
     return None
 
 
-def _common_values(contract):
+_NATIVE_NORM_SLOTS = {
+    "AddRmsNormBias": (
+        (("x", False), ("residual", False), ("gamma", True), ("beta", True)),
+        ("norm", "rstd", "residual"),
+    ),
+    "AddRmsNorm": (
+        (("x", False), ("residual", False), ("gamma", True), ("beta", True)),
+        ("norm", "rstd", "residual"),
+    ),
+    "GemmaRmsNorm": (
+        (("x", False), ("gamma", True)),
+        ("norm", "rstd"),
+    ),
+    "_layer_norm_fwd_1pass_kernel_npu": (
+        (("x", False), ("gamma", True), ("gate", False)),
+        ("output", "rstd"),
+    ),
+}
+
+
+def _native_tensor_abi_values(contract):
+    native = str(contract[1])
+    slot_spec = _NATIVE_NORM_SLOTS.get(native)
+    if slot_spec is None:
+        return (_named_tensors("input", "input", contract[2], "contract[2]"),
+                _named_tensors("output", "output", contract[3], "contract[3]"), [], {})
+    in_specs, out_names = slot_spec
+    inputs = []
+    for index, spec in enumerate(contract[2]):
+        if spec[1] is None and spec[2] is None:
+            continue
+        if index < len(in_specs):
+            slot_name, is_param = in_specs[index]
+        else:
+            slot_name, is_param = f"input{index}", False
+        inputs.append(_tensor_record(
+            slot_name, "parameter" if is_param else "input", spec, f"contract[2][{index}]",
+            attrs={"abi_ordinal": index, "abi_role": slot_name, "parameter": is_param},
+        ))
+    outputs = []
+    for index, spec in enumerate(contract[3]):
+        if spec[1] is None and spec[2] is None:
+            continue
+        slot_name = out_names[index] if index < len(out_names) else f"output{index}"
+        outputs.append(_tensor_record(
+            slot_name, "output", spec, f"contract[3][{index}]",
+            output=slot_name,
+            attrs={"abi_ordinal": index, "abi_role": slot_name},
+        ))
+    return inputs, outputs, [], {}
+
+
+def _common_values(contract, operator=None):
     """Project the contract shapes that share an unambiguous tensor order."""
     kind = contract[0]
     if kind == "native_tensor_abi":
         if len(contract) == 4 and _is_tensor_seq(contract[2]) and _is_tensor_seq(contract[3]):
-            return (_named_tensors("input", "input", contract[2], "contract[2]"),
-                    _named_tensors("output", "output", contract[3], "contract[3]"), [], {})
+            return _native_tensor_abi_values(contract)
         return None
     if kind == "layernorm_active":
         # x, weight, bias, output; the native boundary is one row-wise call.
@@ -294,8 +381,30 @@ def _common_values(contract):
     if kind == "transpose_batchmatmul_active":
         if len(contract) == 6:
             batch, rows, n, k = contract[2]
+            view = ((operator or {}).get("metadata") or {}).get("native_tensor_view") or {}
+            if view.get("kind") == "transpose_batchmatmul":
+                in_shape = _shape(view.get("input_shape"))
+                wt_shape = _shape(view.get("weight_shape"))
+                out_shape = _shape(view.get("output_shape"))
+            else:
+                in_shape = wt_shape = out_shape = None
+            if in_shape is not None and wt_shape is not None and out_shape is not None:
+                in_attrs = {"shape_basis": "declared_native_tensor_view"}
+                if view.get("input_permutation"):
+                    in_attrs["permutation"] = list(view["input_permutation"])
+                out_attrs = {"shape_basis": "declared_native_tensor_view"}
+                if view.get("output_permutation"):
+                    out_attrs["permutation"] = list(view["output_permutation"])
+                return (
+                    [_tensor_record("input", "input", (in_shape, contract[3], "ND"),
+                                    "contract[2:5]", attrs=in_attrs),
+                     _tensor_record("weight", "input", (wt_shape, contract[4], "ND"),
+                                    "contract[2:5]", attrs={"shape_basis": "declared_native_tensor_view"})],
+                    [_tensor_record("output", "output", (out_shape, contract[5], "ND"),
+                                    "contract[2:5]", attrs=out_attrs)], [], {},
+                )
             activation = ([batch, rows, k], contract[3], "ND")
-            weight = ([batch, n, k], contract[4], "ND")
+            weight = ([batch, k, n], contract[4], "ND")
             output = ([batch, rows, n], contract[5], "ND")
             return ([_tensor_record("input", "input", activation, "contract[2:5]",
                                     attrs={"shape_basis": "batch_rows_n_k_convention"}),

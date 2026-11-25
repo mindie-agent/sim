@@ -352,6 +352,8 @@ def _merge_produced_outputs(operator, contract, values, produced):
         return
     outputs = values["outputs"]
     op_id = operator.get("op_id", "")
+    produced_names = {record.get("output") or "output" for record in produced}
+    generic_pattern = r"output\d+" if "output" in produced_names else r"output\d*"
     for index, record in enumerate(produced):
         actual = _typed_record_value(record, "output",
                                      name=record.get("output") or "output",
@@ -363,7 +365,7 @@ def _merge_produced_outputs(operator, contract, values, produced):
             _fill_from_produced(match, actual, contract=contract)
             continue
         generic = next((value for value in outputs
-                        if re.fullmatch(r"output\d+", str(value.get("name")))),
+                        if re.fullmatch(generic_pattern, str(value.get("name")))),
                        None)
         if generic is not None:
             generic["attrs"]["abi_ordinal"] = outputs.index(generic)
@@ -384,6 +386,113 @@ def _merge_produced_outputs(operator, contract, values, produced):
                         value["name"] = value["output"] = "rstd"
 
 
+def _reconcile_native_abi_slots(values, projected_inputs, projected_outputs):
+    """Fill missing native ABI input/output slots without erasing bound records."""
+    changed = False
+    existing_inputs = values["inputs"]
+    orig_inputs = list(existing_inputs)
+    used_inputs = set()
+    slot_matches: list[tuple[dict, dict | None]] = []
+    for slot in projected_inputs:
+        role_name = slot["attrs"].get("abi_role") or slot["name"]
+        matched_idx = next(
+            (idx for idx, item in enumerate(orig_inputs)
+             if idx not in used_inputs
+             and (item["name"] == role_name or item["output"] == role_name)),
+            None,
+        )
+        if matched_idx is not None:
+            used_inputs.add(matched_idx)
+            slot_matches.append((slot, orig_inputs[matched_idx]))
+        else:
+            slot_matches.append((slot, None))
+
+    unused_non_param = [
+        idx for idx, item in enumerate(orig_inputs)
+        if idx not in used_inputs
+        and (item.get("producer")
+             or (item.get("role") != "parameter"
+                 and item.get("attrs", {}).get("parameter") is not True))
+    ]
+    non_param_cursor = 0
+    for pos, (slot, matched) in enumerate(slot_matches):
+        is_param = bool(slot["attrs"].get("parameter")) or slot["role"] == "parameter"
+        if matched is None and not is_param and non_param_cursor < len(unused_non_param):
+            idx = unused_non_param[non_param_cursor]
+            non_param_cursor += 1
+            used_inputs.add(idx)
+            slot_matches[pos] = (slot, orig_inputs[idx])
+
+    for slot, matched in slot_matches:
+        ordinal = slot["attrs"].get("abi_ordinal")
+        role_name = slot["attrs"].get("abi_role") or slot["name"]
+        is_param = bool(slot["attrs"].get("parameter")) or slot["role"] == "parameter"
+        if matched is not None:
+            if ordinal is not None:
+                matched["attrs"].setdefault("abi_ordinal", ordinal)
+            matched["attrs"].setdefault("abi_role", role_name)
+            matched["attrs"]["parameter"] = False if matched.get("producer") else is_param
+        else:
+            existing_inputs.append(slot)
+            changed = True
+    if changed:
+        existing_inputs.sort(
+            key=lambda item: (
+                0 if isinstance(item["attrs"].get("abi_ordinal"), int) else 1,
+                item["attrs"].get("abi_ordinal", 0),
+            )
+        )
+
+    existing_outputs = values["outputs"]
+    orig_outputs = list(existing_outputs)
+    used_outputs = set()
+    out_matches: list[tuple[dict, dict | None]] = []
+    for slot in projected_outputs:
+        role_name = slot["attrs"].get("abi_role") or slot["output"]
+        matched_idx = next(
+            (idx for idx, item in enumerate(orig_outputs)
+             if idx not in used_outputs
+             and (item["output"] == role_name or item["name"] == role_name)),
+            None,
+        )
+        if matched_idx is not None:
+            used_outputs.add(matched_idx)
+            out_matches.append((slot, orig_outputs[matched_idx]))
+        else:
+            out_matches.append((slot, None))
+
+    out_changed = False
+    for slot, matched in out_matches:
+        ordinal = slot["attrs"].get("abi_ordinal")
+        role_name = slot["attrs"].get("abi_role") or slot["output"]
+        if matched is None and re.fullmatch(r"output\d*", str(role_name or "")):
+            cand_idx = (
+                ordinal
+                if isinstance(ordinal, int) and 0 <= ordinal < len(orig_outputs)
+                and ordinal not in used_outputs
+                else next((idx for idx in range(len(orig_outputs)) if idx not in used_outputs), None)
+            )
+            if cand_idx is not None:
+                used_outputs.add(cand_idx)
+                matched = orig_outputs[cand_idx]
+        if matched is not None:
+            if ordinal is not None:
+                matched["attrs"].setdefault("abi_ordinal", ordinal)
+            matched["attrs"].setdefault("abi_role", role_name)
+        else:
+            existing_outputs.append(slot)
+            out_changed = True
+            changed = True
+    if out_changed:
+        existing_outputs.sort(
+            key=lambda item: (
+                0 if isinstance(item["attrs"].get("abi_ordinal"), int) else 1,
+                item["attrs"].get("abi_ordinal", 0),
+            )
+        )
+    return changed
+
+
 def _bind_value_ports(operator, contract, values, context, gaps, op_id):
     for value in values["outputs"]:
         if not value["producer"]:
@@ -395,12 +504,22 @@ def _bind_value_ports(operator, contract, values, context, gaps, op_id):
     native_norm = (contract is not None and contract[0] == "native_tensor_abi"
                    and ("RmsNorm" in str(contract[1])
                         or "LayerNorm" in str(contract[1])))
-    for index, value in enumerate(values["inputs"]):
+    for value in values["inputs"]:
+        is_declared_param = (
+            not value["producer"]
+            and (
+                value["role"] == "parameter"
+                or value["name"] in {"gamma", "beta", "weight", "bias"}
+                or value["attrs"].get("parameter") is True
+            )
+        )
+        if native_norm and value["producer"]:
+            value["attrs"]["parameter"] = False
         if (value["producer"] or value["role"] not in {"input", "activation"}
-                or value["name"] in {"weight", "bias", "state", "key_cache",
-                                     "value_cache"}
-                or (native_norm and index > 0)):
-            if native_norm and index > 0:
+                or value["name"] in {"weight", "bias", "gamma", "beta", "state",
+                                     "key_cache", "value_cache"}
+                or is_declared_param):
+            if native_norm and is_declared_param:
                 value["attrs"]["parameter"] = True
             continue
         value["attrs"]["producer_unresolved"] = True
@@ -449,7 +568,7 @@ def _project_non_boundary_values(operator, contract, context, meta, gaps):
         inputs, outputs = _declared_metadata_values(operator)
         basis = "operator_metadata" if inputs or outputs else "unavailable"
         return {"inputs": inputs, "outputs": outputs, "declared": [], "basis": basis}, None, [], []
-    projected = (_matrix_values(contract) or _common_values(contract)
+    projected = (_matrix_values(contract) or _common_values(contract, operator=operator)
                  if contract is not None else None)
     if projected is not None:
         inputs, outputs, declared, _extra = projected
@@ -507,14 +626,18 @@ def typed_values(operator, contract, *, context=None):
         external_consumers = audit["external_consumers"]
         field_dispositions = audit["field_dispositions"]
         selection = audit["selection"]
-        if contract is not None and (not values["inputs"] or not values["outputs"]):
-            projected = _matrix_values(contract) or _common_values(contract)
+        if contract is not None:
+            projected = _matrix_values(contract) or _common_values(contract, operator=operator)
             if projected is not None:
-                extra = {"inputs": projected[0], "outputs": projected[1],
-                         "declared": projected[2]}
-                _merge_values(values, extra)
-                if projected[0] or projected[1]:
-                    values["basis"] = "typed_records+contract"
+                if not values["inputs"] or not values["outputs"]:
+                    extra = {"inputs": projected[0], "outputs": projected[1],
+                             "declared": projected[2]}
+                    _merge_values(values, extra)
+                    if projected[0] or projected[1]:
+                        values["basis"] = "typed_records+contract"
+                elif contract[0] == "native_tensor_abi":
+                    if _reconcile_native_abi_slots(values, projected[0], projected[1]):
+                        values["basis"] = "typed_records+contract"
     else:
         values, attention_data, semantic_attrs, external_outputs = (
             _project_non_boundary_values(operator, contract, context, meta, gaps)

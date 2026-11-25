@@ -7,6 +7,8 @@
 [Side-Effect Policy] Pure read-only projections."""
 from __future__ import annotations
 
+import math
+
 def mxfp4_reference_coverage():
     """Packed payload accounting does not supply native MXFP4 execution."""
     return {
@@ -141,13 +143,13 @@ def matrix_comparison_scope(op):
     return scope
 
 
-import math
-
-#: CANN 9.2.1 official mixed-quant sparse MLA.
+#: CANN 9.2.1 official mixed-quant sparse MLA vs folded 544/320 DSL ABI.
 MQSMLA_RECIPE = "aclnn_mixed_quant_sparse_flash_mla"
+MQSMLA_SOURCE_RECIPE = "mixed_quant_sparse_flash_mla"
 MQSMLA_NATIVE_KIND = "aclnnMixedQuantSparseFlashMla"
-MQSMLA_RECIPES = frozenset({MQSMLA_RECIPE})
-MQSMLA_NATIVE_KINDS = frozenset({MQSMLA_NATIVE_KIND})
+DSL_MQSMLA_NATIVE_KIND = "tilelang_dsl.mixed_quant_sparse_flash_mla"
+MQSMLA_RECIPES = frozenset({MQSMLA_RECIPE, MQSMLA_SOURCE_RECIPE})
+MQSMLA_NATIVE_KINDS = frozenset({MQSMLA_NATIVE_KIND, DSL_MQSMLA_NATIVE_KIND})
 MIXED_QUANT_NATIVE_KIND = "MixedQuantSparseFlashMla"
 SPARSE_FLASH_ATTENTION_NATIVE = "SparseFlashAttention"
 SPARSE_MLA_NATIVE_KIND = "SparseFlashMla"
@@ -161,17 +163,22 @@ MQSMLA_WINDOW_ROW_BYTES = 544
 MQSMLA_COMPRESSED_ROW_BYTES = 320
 MQSMLA_FP8_ROW_BYTES = 608
 MQSMLA_MXFP8_ROW_BYTES = 584
+MQSMLA_CANN_PACKED_WIDTHS = frozenset({MQSMLA_FP8_ROW_BYTES, MQSMLA_MXFP8_ROW_BYTES})
 MQSMLA_ORIGINAL_ROW_WIDTHS = frozenset({
     MQSMLA_WINDOW_ROW_BYTES, MQSMLA_FP8_ROW_BYTES, MQSMLA_MXFP8_ROW_BYTES,
 })
-MQSMLA_ROW_WIDTH_PAIRS = frozenset({
-    (MQSMLA_WINDOW_ROW_BYTES, MQSMLA_COMPRESSED_ROW_BYTES),
+MQSMLA_DSL_ROW_WIDTH_PAIR = (MQSMLA_WINDOW_ROW_BYTES, MQSMLA_COMPRESSED_ROW_BYTES)
+MQSMLA_CANN_ROW_WIDTH_PAIRS = frozenset({
     (MQSMLA_FP8_ROW_BYTES, MQSMLA_FP8_ROW_BYTES),
     (MQSMLA_MXFP8_ROW_BYTES, MQSMLA_MXFP8_ROW_BYTES),
 })
+MQSMLA_ROW_WIDTH_PAIRS = frozenset({MQSMLA_DSL_ROW_WIDTH_PAIR}) | MQSMLA_CANN_ROW_WIDTH_PAIRS
+MQSMLA_KV_QUANT_MODE_WIDTHS = {1: MQSMLA_FP8_ROW_BYTES, 2: MQSMLA_MXFP8_ROW_BYTES}
 MQSMLA_HEAD_WIDTH = 512
 MQSMLA_QUERY_RANK = 3
-MQSMLA_CACHE_DTYPE = "uint8"
+MQSMLA_CANN_CACHE_DTYPE = "fp8_e4m3"
+MQSMLA_DSL_CACHE_DTYPE = "uint8"
+MQSMLA_CACHE_DTYPE = MQSMLA_DSL_CACHE_DTYPE
 
 
 def shared_kv_native_name(view):
@@ -325,17 +332,33 @@ def _mqsmla_attention_contract(op, view):
             or orig_bytes not in MQSMLA_ORIGINAL_ROW_WIDTHS
             or type(view.get("compressed_cache")) is not bool):
         return None
+    kv_quant_mode = view.get("kv_quant_mode")
+    if orig_bytes in MQSMLA_CANN_PACKED_WIDTHS:
+        if native_kind != MQSMLA_NATIVE_KIND:
+            return None
+        if (kv_quant_mode is not None
+                and MQSMLA_KV_QUANT_MODE_WIDTHS.get(kv_quant_mode) != orig_bytes):
+            return None
+        contract_kind = MQSMLA_NATIVE_KIND
+        cache_dtype = MQSMLA_CANN_CACHE_DTYPE
+        allowed_pairs = MQSMLA_CANN_ROW_WIDTH_PAIRS
+    else:
+        if kv_quant_mode is not None:
+            return None
+        contract_kind = DSL_MQSMLA_NATIVE_KIND
+        cache_dtype = MQSMLA_DSL_CACHE_DTYPE
+        allowed_pairs = frozenset({MQSMLA_DSL_ROW_WIDTH_PAIR})
     compressed = ((), None, None)
     if view["compressed_cache"]:
         comp_bytes = view.get("compressed_cache_row_bytes")
         if (type(comp_bytes) is not int
-                or (orig_bytes, comp_bytes) not in MQSMLA_ROW_WIDTH_PAIRS):
+                or (orig_bytes, comp_bytes) not in allowed_pairs):
             return None
-        compressed = (((1, comp_bytes), MQSMLA_CACHE_DTYPE, "ND"))
+        compressed = ((1, comp_bytes), cache_dtype, "ND")
     query = (shape, "bf16", "ND")
     return (
-        "sparse_attention_active", native_kind, (query,),
-        (((1, orig_bytes), MQSMLA_CACHE_DTYPE, "ND"), compressed),
+        "sparse_attention_active", contract_kind, (query,),
+        (((1, orig_bytes), cache_dtype, "ND"), compressed),
         query,
     )
 

@@ -89,9 +89,10 @@ def _subgraph_arch(declaration, ordered_nodes, explicit_arch: str | None) -> str
         if isinstance(meta, dict):
             candidates.append(meta.get("arch_family"))
     for item in candidates:
-        norm = str(item or "").strip().upper()
-        if norm in SOC_ARCHS:
-            return norm
+        raw = str(item or "").strip()
+        if raw:
+            upper = raw.upper()
+            return upper if upper in SOC_ARCHS else raw
     return None
 
 
@@ -265,6 +266,8 @@ def _extract_subgraph_contract(declaration, ordered_nodes) -> dict:
         first_meta.get("activation"), first_meta.get("ffn_activation"),
         _SUBGRAPH_ROLE_ACTIVATION.get(role),
     )
+    if isinstance(act_raw, dict):
+        act_raw = act_raw.get("activation_kind") or act_raw.get("kind")
     act_kind = str(act_raw or "none").strip().lower()
     has_bias = bool(
         view.get("has_bias") or declaration.get("has_bias") or impl.get("has_bias")
@@ -396,8 +399,6 @@ def _build_subgraph_abi_query(entry, target_arch: str, contract: dict) -> AbiQue
             group_shape=(), scale_dtype="none", scale_shape=(),
         ))
     act_kind = contract["act_kind"]
-    if act_kind == "none" and entry.allowed_activations and "none" not in entry.allowed_activations:
-        act_kind = entry.allowed_activations[0]
     return AbiQueryKey(
         soc_arch=target_arch,  # type: ignore[arg-type]
         sku_id="generic_sku",
@@ -443,8 +444,14 @@ def _probe_subgraph_abi(
     """Verify candidate symbols against sealed ``ProbedAbiRegistry.verify()``."""
     if not symbols:
         return "unshipped", ""
+    if arch is not None and str(arch).strip():
+        norm_arch = str(arch).strip().upper()
+        if norm_arch not in SOC_ARCHS:
+            return "unshipped", f"non_ascend_arch:{str(arch).strip()}"
+        archs = (norm_arch,)
+    else:
+        archs = ("A5", "A3", "A2")
     registry = default_abi_registry()
-    archs = (arch,) if arch in SOC_ARCHS else ("A5", "A3", "A2")
     contract = _extract_subgraph_contract(declaration or {}, ordered_nodes or ())
     proposed_match = ""
     last_rejection = ""
@@ -452,6 +459,12 @@ def _probe_subgraph_abi(
         for target_arch in archs:
             entries = registry.lookup(sym, target_arch, available_only=True)
             for entry in entries:
+                if (
+                    entry.allowed_activations
+                    and contract["act_kind"] not in entry.allowed_activations
+                ):
+                    last_rejection = f"rejected_dtype:activation={contract['act_kind']}"
+                    continue
                 query = _build_subgraph_abi_query(entry, target_arch, contract)
                 verdict = registry.verify(query)
                 if verdict.status == "admitted_shipping":
