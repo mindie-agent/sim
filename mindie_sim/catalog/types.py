@@ -111,13 +111,106 @@ def _ceil_div(value: int, divisor: int) -> int:
     return (int(value) + int(divisor) - 1) // int(divisor)
 
 
+_CATEGORY_OVERRIDE_FIELDS = frozenset({
+    "weight_format", "activation_format", "weight_block", "expert_block",
+    "scale_format", "scale_bytes", "activation_group_size",
+    "activation_scale_format", "activation_scale_pack",
+    "int8_weight_metadata", "output_format",
+    "runtime_weight_scale_format", "runtime_weight_scale_bytes",
+    "runtime_activation_scale_format", "runtime_int8_weight_metadata",
+    "weight_symmetric",
+})
+_CATEGORY_OVERRIDE_ALLOWED = _CATEGORY_OVERRIDE_FIELDS | frozenset({
+    "expert_quant_count", "expert_quant_overrides",
+})
+
+
+def _normalize_override_fields(raw: Any, allowed: frozenset[str]) -> tuple[tuple[str, Any], ...]:
+    fields = dict(raw)
+    unknown = fields.keys() - allowed
+    if unknown:
+        raise ModelingError("quant_category_fields_unsupported:" + ",".join(sorted(unknown)))
+    if "weight_block" in fields:
+        fields["weight_block"] = tuple(fields["weight_block"])
+    if "expert_quant_count" in fields:
+        cnt = int(fields["expert_quant_count"])
+        if cnt < 0:
+            raise ModelingError("quant_expert_count_invalid")
+        fields["expert_quant_count"] = cnt
+    if "expert_quant_overrides" in fields:
+        fields["expert_quant_overrides"] = _normalize_expert_quant_overrides(
+            fields["expert_quant_overrides"], int(fields.get("expert_quant_count", 0) or 0),
+        )
+    return tuple(sorted(fields.items()))
+
+
+def _normalize_expert_quant_overrides(
+    raw: Any, expert_count: int = 0,
+) -> tuple[tuple[tuple[int, ...], tuple[tuple[str, Any], ...]], ...]:
+    if not raw:
+        return ()
+    if expert_count <= 0:
+        raise ModelingError("quant_expert_count_required")
+    entries = [((int(k),), v) for k, v in raw.items()] if isinstance(raw, Mapping) else raw
+    seen: set[int] = set()
+    normalized: list[tuple[tuple[int, ...], tuple[tuple[str, Any], ...]]] = []
+    for entry in entries:
+        if isinstance(entry, Mapping):
+            raw_ids, raw_fields = entry.get("expert_indices", ()), entry.get("fields", {})
+        elif isinstance(entry, (tuple, list)) and len(entry) == 2:
+            raw_ids, raw_fields = entry[0], entry[1]
+        else:
+            raise ModelingError("quant_expert_override_entry_invalid")
+        indices = tuple(sorted({int(i) for i in raw_ids}))
+        if not indices or indices[0] < 0:
+            raise ModelingError("quant_expert_indices_invalid")
+        if indices[-1] >= expert_count:
+            raise ModelingError(f"quant_expert_index_out_of_range:{indices[-1]}>={expert_count}")
+        if seen.intersection(indices):
+            raise ModelingError("quant_expert_indices_duplicate")
+        seen.update(indices)
+        normalized.append((indices, _normalize_override_fields(raw_fields, _CATEGORY_OVERRIDE_FIELDS)))
+    normalized.sort(key=lambda item: item[0])
+    return tuple(normalized)
+
+
+def _serialize_expert_quant_overrides(
+    entries: tuple[tuple[tuple[int, ...], tuple[tuple[str, Any], ...]], ...],
+) -> list[dict[str, Any]]:
+    return [
+        {"expert_indices": list(indices), "fields": dict(fields)}
+        for indices, fields in entries
+    ]
+
+
+def _serialize_category_fields(fields: tuple[tuple[str, Any], ...]) -> dict[str, Any]:
+    out = dict(fields)
+    if "expert_quant_overrides" in out:
+        out["expert_quant_overrides"] = _serialize_expert_quant_overrides(out["expert_quant_overrides"])
+    if "weight_block" in out:
+        out["weight_block"] = list(out["weight_block"])
+    return out
+
+
+def _apply_override_fields(spec: "QuantSpec", fields: tuple[tuple[str, Any], ...]) -> "QuantSpec":
+    changes = dict(fields)
+    if "weight_format" in changes:
+        changes["expert_weight_format"] = changes["weight_format"]
+        if spec.exclusions:
+            changes["exclusions"] = tuple(
+                ex for ex in spec.exclusions
+                if ex.split(".", 1)[0] not in _EXPERT_CATEGORIES
+            )
+    return replace(spec, **changes)
+
+
 @dataclass(frozen=True)
 class QuantSpec:
     """Explicit representation plan; never a single global activation dtype."""
 
     name: str
     weight_format: str = "bf16"
-    activation_format: str = "bf16"
+    activation_format: str = ""
     expert_weight_format: str = "bf16"
     weight_block: tuple[int, int] = (0, 0)
     expert_block: int = 32
@@ -151,6 +244,16 @@ class QuantSpec:
     norm_storage: tuple[tuple[str, str], ...] = ()
     norm_runtime: tuple[tuple[str, str], ...] = ()
     layer_quant_overrides: tuple[tuple[str, Any], ...] = ()
+    #: Symmetric integer quantization omits checkpoint zero-point/offset tensors
+    #: on disk (``source=True``); runtime residency (``source=False``) keeps any
+    #: kernel-materialized offset.
+    weight_symmetric: bool = True
+    #: Per-expert mixed-quantization overrides for routed-expert categories.
+    #: ``expert_quant_count`` records total experts in the mixed layer/category
+    #: (0 infers from covered indices); each override binds disjoint sorted
+    #: expert indices to field overrides over the base expert representation.
+    expert_quant_count: int = 0
+    expert_quant_overrides: tuple[tuple[tuple[int, ...], tuple[tuple[str, Any], ...]], ...] = ()
 
     @staticmethod
     def _freeze_override_value(value: Any) -> Any:
@@ -176,6 +279,13 @@ class QuantSpec:
         return dict(thawed) if isinstance(thawed, Mapping) else {}
 
     def __post_init__(self):
+        if not self.activation_format:
+            wf = str(self.weight_format or "").strip().lower()
+            default_act = "int8" if wf in {"int8", "w8a8"} else (self.native_format or "bf16")
+            object.__setattr__(self, "activation_format", default_act)
+        if int(self.expert_quant_count) < 0:
+            raise ModelingError("quant_expert_count_invalid")
+        object.__setattr__(self, "expert_quant_count", int(self.expert_quant_count))
         if self.int8_weight_metadata not in {"scale_only", "scale_offset"}:
             raise ModelingError("int8_weight_metadata_requires_scale_only_or_scale_offset")
         if self.runtime_int8_weight_metadata not in {"", "scale_only", "scale_offset"}:
@@ -193,26 +303,18 @@ class QuantSpec:
             object.__setattr__(self, key, tuple(getattr(self, key)))
         if isinstance(self.source, Mapping):
             object.__setattr__(self, "source", tuple(sorted(self.source.items())))
-        allowed = {
-            "weight_format", "activation_format", "weight_block", "expert_block",
-            "scale_format", "scale_bytes", "activation_group_size",
-            "activation_scale_format", "activation_scale_pack",
-            "int8_weight_metadata", "output_format",
-            "runtime_weight_scale_format", "runtime_weight_scale_bytes",
-            "runtime_activation_scale_format", "runtime_int8_weight_metadata",
-        }
         entries = (self.category_overrides.items() if isinstance(self.category_overrides, Mapping)
                    else self.category_overrides)
-        normalized = []
-        for category, raw in entries:
-            fields = dict(raw)
-            unknown = fields.keys() - allowed
-            if unknown:
-                raise ModelingError("quant_category_fields_unsupported:" + ",".join(sorted(unknown)))
-            if "weight_block" in fields:
-                fields["weight_block"] = tuple(fields["weight_block"])
-            normalized.append((str(category), tuple(sorted(fields.items()))))
+        normalized = [
+            (str(category), _normalize_override_fields(raw, _CATEGORY_OVERRIDE_ALLOWED))
+            for category, raw in entries
+        ]
         object.__setattr__(self, "category_overrides", tuple(sorted(normalized)))
+        object.__setattr__(
+            self,
+            "expert_quant_overrides",
+            _normalize_expert_quant_overrides(self.expert_quant_overrides, self.expert_quant_count),
+        )
         for key in ("norm_storage", "norm_runtime"):
             raw = getattr(self, key)
             records = raw.items() if isinstance(raw, Mapping) else raw
@@ -257,6 +359,17 @@ class QuantSpec:
         except TypeError:
             return _resolve_quant_category.__wrapped__(self, cat)
 
+    def for_expert(self, expert_id: int) -> "QuantSpec":
+        """Resolve representation for one specific routed expert ID."""
+        if not self.expert_quant_overrides:
+            return self
+        idx = int(expert_id)
+        base = replace(self, expert_quant_overrides=(), expert_quant_count=0)
+        for indices, fields in self.expert_quant_overrides:
+            if idx in indices:
+                return _apply_override_fields(base, fields)
+        return base
+
     _MX_METHODS = frozenset({"mx_fp8", "mx_fp4"})
     _FOUR_BIT_WEIGHT_FORMATS = frozenset({
         "mxfp4", "mx_fp4", "mxfp4_e2m1", "fp4", "fp4_e2m1",
@@ -285,7 +398,11 @@ class QuantSpec:
             return "mx_fp8"
         if wf in {"int4", "w4a8", "int4_weight"}:
             return "w4a8" if af == "int8" else "w4a16"
-        if wf in {"int8", "w8a8"} or af in {"int8"}:
+        if wf == "w8a8":
+            return "w8a8"
+        if wf == "int8":
+            return "w8a8" if af == "int8" else "w8a16"
+        if af == "int8":
             return "w8a8"
         return "fp8" if wf in {"fp8", "fp8_e4m3", "fp8_e5m2"} else "dense"
 
@@ -299,12 +416,14 @@ class QuantSpec:
             return prequant or resolved.native_format or default
         return default
 
-    def format_for(self, category: str, *, source: bool = False) -> str:
+    def format_for(self, category: str, *, source: bool = False, expert_id: int | None = None) -> str:
         resolved = self.for_category(category)
         if resolved is not self:
-            return resolved.format_for(category, source=source)
+            return resolved.format_for(category, source=source, expert_id=expert_id)
         cat = str(category)
         family = cat.split(".", 1)[0]
+        if expert_id is not None and self.expert_quant_overrides and family in _EXPERT_CATEGORIES:
+            return self.for_expert(expert_id).format_for(category, source=source)
         if source and family == "norm" and self.norm_gamma_declared("norm"):
             return self.norm_gamma_format("norm", source=True)
         if family in _FP32_CATEGORIES:
@@ -329,12 +448,14 @@ class QuantSpec:
             return "fp32"
         return self.weight_format if self.weight_format != "bf16" else "bf16"
 
-    def source_format_for(self, category: str) -> str:
+    def source_format_for(self, category: str, *, expert_id: int | None = None) -> str:
         """Checkpoint representation before an explicit runtime conversion."""
         resolved = self.for_category(category)
         if resolved is not self:
-            return resolved.source_format_for(category)
+            return resolved.source_format_for(category, expert_id=expert_id)
         cat = str(category)
+        if expert_id is not None and self.expert_quant_overrides and cat.split(".", 1)[0] in _EXPERT_CATEGORIES:
+            return self.for_expert(expert_id).source_format_for(category)
         if cat == "norm" and self.norm_gamma_declared("norm"):
             return self.norm_gamma_format("norm", source=True)
         if cat in {"compressor_fp32_runtime", "compressor_bf16_runtime"}:
@@ -388,8 +509,59 @@ class QuantSpec:
     def execution_int8_weight_metadata(self) -> str:
         return self.runtime_int8_weight_metadata or self.int8_weight_metadata
 
+    def expert_subset_bytes(
+        self,
+        rows: int,
+        cols: int,
+        category: str,
+        expert_ids: Sequence[int],
+        *,
+        source: bool = False,
+        include_scales: bool = True,
+    ) -> float:
+        """Exact byte sum across concrete routed ``expert_ids`` (e.g. one EP rank)."""
+        resolved = self.for_category(category)
+        if resolved is not self:
+            return resolved.expert_subset_bytes(
+                rows, cols, category, expert_ids, source=source, include_scales=include_scales,
+            )
+        method = "matrix_bytes" if include_scales else "matrix_payload_bytes"
+        if not self.expert_quant_overrides or str(category).split(".", 1)[0] not in _EXPERT_CATEGORIES:
+            return float(len(expert_ids)) * getattr(self, method)(rows, cols, category, source=source)
+        return float(sum(
+            getattr(self, method)(rows, cols, category, source=source, expert_id=int(eid))
+            for eid in expert_ids
+        ))
+
+    def _expert_weighted_bytes(
+        self,
+        rows: int,
+        cols: int,
+        category: str,
+        *,
+        source: bool,
+        include_scales: bool,
+        expert_id: int | None,
+    ) -> float:
+        method = "matrix_bytes" if include_scales else "matrix_payload_bytes"
+        if expert_id is not None:
+            return getattr(self.for_expert(expert_id), method)(rows, cols, category, source=source)
+        base = replace(self, expert_quant_overrides=(), expert_quant_count=0)
+        covered = 0
+        weighted_total = 0.0
+        for indices, fields in self.expert_quant_overrides:
+            count = len(indices)
+            covered += count
+            expert_spec = _apply_override_fields(base, fields)
+            weighted_total += count * getattr(expert_spec, method)(rows, cols, category, source=source)
+        total_experts = max(int(self.expert_quant_count or 0), covered)
+        if total_experts > covered:
+            weighted_total += (total_experts - covered) * getattr(base, method)(rows, cols, category, source=source)
+        return weighted_total / float(total_experts)
+
     def matrix_payload_bytes(
         self, rows: int, cols: int, category: str, *, source: bool = False,
+        expert_id: int | None = None,
     ) -> float:
         """Packed payload bytes only (scales/zero-points excluded).
 
@@ -399,14 +571,15 @@ class QuantSpec:
         """
         resolved = self.for_category(category)
         if resolved is not self:
-            return resolved.matrix_payload_bytes(rows, cols, category, source=source)
+            return resolved.matrix_payload_bytes(rows, cols, category, source=source, expert_id=expert_id)
         rows, cols = int(rows), int(cols)
         if rows <= 0 or cols <= 0:
             raise ModelingError(f"catalog_weight_shape_invalid:{category}:{rows}x{cols}")
+        if self.expert_quant_overrides and str(category).split(".", 1)[0] in _EXPERT_CATEGORIES:
+            return self._expert_weighted_bytes(
+                rows, cols, category, source=source, include_scales=False, expert_id=expert_id,
+            )
         fmt = self.source_format_for(category) if source else self.format_for(category)
-        scale_bytes = self.scale_bytes if source else self.execution_weight_scale_bytes()
-        metadata_columns = (1 if self.int8_weight_metadata == "scale_only" else 2) if source else (
-            1 if self.execution_int8_weight_metadata() == "scale_only" else 2)
         if str(category) == "engram_table":
             mode = "host_fp8_e8m0" if source else self.engram_table_mode
             return float(rows * cols * (2 if mode == "device_bf16" else 1))
@@ -420,13 +593,20 @@ class QuantSpec:
             return float(rows * _ceil_div(cols, 2))
         raise ModelingError(f"catalog_weight_format_unsupported:{fmt}")
 
-    def matrix_bytes(self, rows: int, cols: int, category: str, *, source: bool = False) -> float:
+    def matrix_bytes(
+        self, rows: int, cols: int, category: str, *, source: bool = False,
+        expert_id: int | None = None,
+    ) -> float:
         resolved = self.for_category(category)
         if resolved is not self:
-            return resolved.matrix_bytes(rows, cols, category, source=source)
+            return resolved.matrix_bytes(rows, cols, category, source=source, expert_id=expert_id)
         rows, cols = int(rows), int(cols)
         if rows <= 0 or cols <= 0:
             raise ModelingError(f"catalog_weight_shape_invalid:{category}:{rows}x{cols}")
+        if self.expert_quant_overrides and str(category).split(".", 1)[0] in _EXPERT_CATEGORIES:
+            return self._expert_weighted_bytes(
+                rows, cols, category, source=source, include_scales=True, expert_id=expert_id,
+            )
         fmt = self.source_format_for(category) if source else self.format_for(category)
         scale_bytes = self.scale_bytes if source else self.execution_weight_scale_bytes()
         metadata_columns = (1 if self.int8_weight_metadata == "scale_only" else 2) if source else (
@@ -463,7 +643,8 @@ class QuantSpec:
             # W4A8_DYNAMIC packs two int4 values per byte and keeps one fp32
             # scale per output row (per-channel, ``expert_block=1``).  Groupwise
             # W4A16 (``wna16``, BF16/FP16 activations with ``group > 1``)
-            # allocates both ``weight_scale`` and ``weight_offset`` per group.
+            # stores scales only on disk when symmetric (``source=True``) and
+            # allocates both ``weight_scale`` and ``weight_offset`` at runtime.
             group = max(1, int(self.expert_block))
             data = float(rows * _ceil_div(cols, 2))
             scale_count = rows if group <= 1 else rows * _ceil_div(cols, group)
@@ -473,12 +654,24 @@ class QuantSpec:
                 and act_fmt in {"bf16", "bfloat16", "fp16", "float16"}
                 and group > 1
             )
-            scale_tensors = 2 if is_w4a16_groupwise else 1
+            scale_tensors = (
+                (1 if self.weight_symmetric else 2) if source else 2
+            ) if is_w4a16_groupwise else 1
             return data + float(scale_tensors * scale_count) * float(scale_bytes)
         if str(category) == "shared_expert_payload":
             # Payload only; the shared expert's scale is charged once.
             return float(rows * cols)
         if fmt in {"int8", "w8a8"}:
+            act_fmt = str(self.activation_format or "").strip().lower()
+            if fmt == "int8" and act_fmt in {"bf16", "bfloat16", "fp16", "float16"}:
+                group = (
+                    int(self.weight_block[1])
+                    if (len(self.weight_block) > 1 and int(self.weight_block[1]) > 1)
+                    else max(1, int(self.expert_block))
+                )
+                scale_count = rows if group <= 1 else rows * _ceil_div(cols, group)
+                scale_tensors = (1 if self.weight_symmetric else 2) if source else metadata_columns
+                return float(rows * cols) + float(scale_tensors * scale_count) * float(scale_bytes)
             # Native INT8 callers may provide one scale or a scale/offset pair.
             # This declaration also owns residency; an absent offset has no bytes.
             return float(rows * cols + rows * float(scale_bytes) * metadata_columns)
@@ -507,8 +700,12 @@ class QuantSpec:
             "runtime_activation_scale_format": self.runtime_activation_scale_format,
             "runtime_int8_weight_metadata": self.runtime_int8_weight_metadata, "output_format": self.output_format,
             "norm_storage": dict(self.norm_storage), "norm_runtime": dict(self.norm_runtime),
-            "category_overrides": {cat: dict(fields) for cat, fields in self.category_overrides},
+            "category_overrides": {cat: _serialize_category_fields(fields) for cat, fields in self.category_overrides},
             **({"layer_quant_overrides": self.layer_quant_overrides_dict()} if self.layer_quant_overrides else {}),
+            **({"weight_symmetric": self.weight_symmetric} if not self.weight_symmetric else {}),
+            **({"expert_quant_count": self.expert_quant_count} if self.expert_quant_count else {}),
+            **({"expert_quant_overrides": _serialize_expert_quant_overrides(self.expert_quant_overrides)}
+               if self.expert_quant_overrides else {}),
             "source": dict(self.source), "notes": list(self.notes),
         }
 
@@ -530,6 +727,7 @@ class VisionSpec:
     aligner_hidden_size: int = 0
     pos_embed_tokens: int = 0
     deepstack: bool = False
+    deepstack_visual_indexes: tuple[int, ...] = ()
     gated_mlp: bool = False
     activation: str = "gelu"
     norm_type: str = "layernorm"
@@ -538,6 +736,14 @@ class VisionSpec:
     image_token_id: int = 0
     video_token_id: int = 0
     source: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        indexes = tuple(int(idx) for idx in self.deepstack_visual_indexes)
+        object.__setattr__(self, "deepstack_visual_indexes", indexes)
+        if indexes and not self.deepstack:
+            object.__setattr__(self, "deepstack", True)
+        if isinstance(self.source, Mapping):
+            object.__setattr__(self, "source", tuple(sorted((str(k), str(v)) for k, v in self.source.items())))
 
     @property
     def patch_input_width(self) -> int:
@@ -571,13 +777,16 @@ class VisionSpec:
                 raise ModelingError(f"catalog_vision_field_invalid:{name}")
         if self.qkv_width % 3 != 0 or self.query_width % self.num_heads != 0:
             raise ModelingError(f"catalog_vision_qkv_not_divisible:{self.qkv_width}%3/{self.query_width}%{self.num_heads}")
+        for idx in self.deepstack_visual_indexes:
+            if idx < 0 or idx >= int(self.layers):
+                raise ModelingError(f"catalog_vision_deepstack_index_invalid:{idx}:{self.layers}")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "kind": self.kind, "layers": self.layers, "hidden_size": self.hidden_size, "intermediate_size": self.intermediate_size, "num_heads": self.num_heads, "head_dim": self.head_dim,
             "query_width": self.query_width, "qkv_width": self.qkv_width, "qkv_packed_rows": self.qkv_width, "patch_size": self.patch_size, "in_channels": self.in_channels, "temporal_patch": self.temporal_patch,
             "merge_area": self.merge_area, "downsample_ratio": self.downsample_ratio, "out_hidden_size": self.out_hidden_size, "aligner_hidden_size": self.aligner_hidden_size, "aligner_input_width": self.aligner_input_width, "patch_input_width": self.patch_input_width,
-            "pos_embed_tokens": self.pos_embed_tokens, "deepstack": self.deepstack, "gated_mlp": self.gated_mlp, "activation": self.activation, "norm_type": self.norm_type, "norm_eps": self.norm_eps, "bias": self.bias, "image_token_id": self.image_token_id, "video_token_id": self.video_token_id, "source": dict(self.source),
+            "pos_embed_tokens": self.pos_embed_tokens, "deepstack": self.deepstack, "deepstack_visual_indexes": list(self.deepstack_visual_indexes), "gated_mlp": self.gated_mlp, "activation": self.activation, "norm_type": self.norm_type, "norm_eps": self.norm_eps, "bias": self.bias, "image_token_id": self.image_token_id, "video_token_id": self.video_token_id, "source": dict(self.source),
         }
 
 
