@@ -17,7 +17,7 @@ from typing import Any, Literal
 
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError, dtype_bytes
-from mindie_sim.schema.datapath import DatapathCapabilitySpec, SourceRef
+from mindie_sim.schema.datapath import ArchId, DatapathCapabilitySpec, SourceRef
 from mindie_sim.schema.operators import (
     KernelBinding,
     OpSpec,
@@ -38,11 +38,43 @@ from ...runtime.tile_solver import LiveBufferSpec, TileCandidate, TilePipelineSp
 from ..contracts import OperatorPlanningContext
 from .gdn_domain import GDN_CHUNK32_TOKENS, GDN_CHUNK64_GQA_RATIOS, GDN_CHUNK64_TOKENS
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/chunk_gated_delta_rule/op_host/op_api/aclnn_chunk_gated_delta_rule.h",
+        source_sha256="5cf63c099df4280a3874e9c547ce6ec2ddf2bf6733df4909749d68a1345d785c",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/recurrent_gated_delta_rule/op_host/recurrent_gated_delta_rule_def.cpp",
+        source_sha256="fe3963e93efcfe41eed696f4709462caa8862b413067cbc5d73d45393c63068b",
+    ),
+)
+
 FP32_BYTES = 4
 MASK_OPS_PER_PAIR = 4
 DIAG_BLOCK_WIDTH = GDN_CHUNK32_TOKENS
 DEFAULT_VALUE_TILE = 128
 DEFAULT_KEY_TILE = 64
+NATIVE_CHUNK_GDN_MAX_HEADS = 64
+NATIVE_CHUNK_GDN_MAX_HEAD_DIM = 128
+NATIVE_RECURRENT_GDN_MAX_HEADS = 256
+NATIVE_RECURRENT_GDN_MAX_HEAD_DIM = 512
+NATIVE_RECURRENT_GDN_MAX_SEQ_LEN = 8
+_ARCH22_ID = ArchId("npu_arch_2201")
+_ARCH35_ID = ArchId("npu_arch_3510")
+_ARCH_ID_TO_SOC: dict[ArchId, Literal["A2", "A3", "A5"]] = {
+    _ARCH22_ID: "A2",
+    _ARCH35_ID: "A5",
+}
+_SOC_DEFAULT_SKU: dict[str, str] = {
+    "A2": "Ascend910B1",
+    "A3": "Ascend910_9391",
+    "A5": "Ascend950DT_9581",
+}
 REPLAY_OPS_PER_STATE_ELEMENT = 4
 SILU_OPS_PER_ELEMENT = 4
 CONV_CHANNEL_TILE_WIDTH = 256
@@ -323,8 +355,8 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> LinearAttenti
 
     pinned = abi in CHUNK32_ABIS or metadata.get("chunk32") is True
     hv = metadata.get("hv", metadata.get("heads", 1))
-    hq = metadata.get("hq", metadata.get("q_heads", hv))
     hk = next((metadata[key] for key in ("key_heads", "hk", "num_k_heads", "q_heads") if key in metadata), hv)
+    hq = metadata.get("hq", metadata.get("q_heads", hk))
     dk = metadata.get("dk", metadata.get("head_dim", DEFAULT_VALUE_TILE))
     dv = metadata.get("dv", metadata.get("value_dim", dk))
     fields = {key: metadata[key] for key in (
@@ -337,6 +369,13 @@ def validate_contract(op: OpSpec, ctx: OperatorPlanningContext) -> LinearAttenti
                                   ("save_chunk_states", "save_intermediate_state")):
             if alias in metadata:
                 fields[field_name] = metadata[alias]
+    if (
+        "state_dtype" not in fields
+        and operation == "gdn_prefill"
+        and abi not in FLA_GDN_ABIS
+        and ctx.compute_arch.arch_id == _ARCH22_ID
+    ):
+        fields["state_dtype"] = "bf16"
     bt = metadata.get("bt", metadata.get("chunk_size", DIAG_BLOCK_WIDTH if pinned else GDN_CHUNK64_TOKENS))
     return LinearAttentionContract(
         operation, lengths, hq, hk, hv, dk, dv, bt,
@@ -673,6 +712,131 @@ def missing(code: str, message: str) -> UnmodeledCapabilityError:
     return UnmodeledCapabilityError(capability="linear_attention", entry="linear_attention.build",
                                     code=code, message=message)
 
+
+def verify_native_gdn_abi(
+    c: LinearAttentionContract,
+    ctx: OperatorPlanningContext,
+    *,
+    abi_id: str,
+) -> None:
+    """Enforce sealed ProbedAbiRegistry dtypes and CANN host tiling bounds for native GDN."""
+    from mindie_sim.backends.abi_registry import default_abi_registry
+    from mindie_sim.schema.abi import AbiQueryKey, OperandPortSig
+
+    soc_arch = _ARCH_ID_TO_SOC.get(ctx.compute_arch.arch_id)
+    if soc_arch is None:
+        raise missing("linear_attention_arch_unsupported", f"Unsupported ISA {ctx.compute_arch.arch_id}")
+    dtype = c.dtype.lower()
+    beta_dtype = c.beta_dtype.lower()
+    gate_dtype = c.gate_dtype.lower()
+    state_dtype = c.state_dtype.lower()
+    tokens = max(1, sum(c.lengths))
+    seqs = max(1, len(c.lengths))
+    is_chunk = abi_id == CANN_GDN_ABI
+    if c.hq != c.hk:
+        raise missing(
+            "linear_attention_gdn_heads_unsupported",
+            f"{abi_id} requires hq == hk (got hq={c.hq}, hk={c.hk})",
+        )
+    if is_chunk:
+        graph_motif = "chunk_gdn"
+        operands = (
+            OperandPortSig("query", dtype, "ND", False, (tokens, c.hk, c.dk), "dense", (), "none", ()),
+            OperandPortSig("key", dtype, "ND", False, (tokens, c.hk, c.dk), "dense", (), "none", ()),
+            OperandPortSig("value", dtype, "ND", False, (tokens, c.hv, c.dv), "dense", (), "none", ()),
+            OperandPortSig("beta", beta_dtype, "ND", False, (tokens, c.hv), "dense", (), "none", ()),
+            OperandPortSig("initial_state", state_dtype, "ND", False, (seqs, c.hv, c.dv, c.dk), "dense", (), "none", ()),
+            OperandPortSig("actual_seq_lengths", "int32", "ND", False, (seqs,), "none", (), "none", ()),
+        )
+        outputs = (
+            OperandPortSig("out", dtype, "ND", False, (tokens, c.hv, c.dv), "dense", (), "none", ()),
+            OperandPortSig("final_state", state_dtype, "ND", False, (seqs, c.hv, c.dv, c.dk), "dense", (), "none", ()),
+        )
+    else:
+        if max(c.lengths, default=0) > NATIVE_RECURRENT_GDN_MAX_SEQ_LEN:
+            raise missing(
+                "linear_attention_gdn_seq_len_unsupported",
+                f"{abi_id} supports per-request sequence length up to {NATIVE_RECURRENT_GDN_MAX_SEQ_LEN} (got max={max(c.lengths)})",
+            )
+        state_blocks = int(c.metadata.get("state_blocks", c.metadata.get("state_capacity", tokens)))
+        if state_blocks < tokens:
+            raise missing(
+                "linear_attention_gdn_state_blocks_insufficient",
+                f"{abi_id} requires state BlockNum >= T (got BlockNum={state_blocks}, T={tokens})",
+            )
+        graph_motif = "recurrent_gdn"
+        operands = (
+            OperandPortSig("query", dtype, "ND", False, (tokens, c.hk, c.dk), "dense", (), "none", ()),
+            OperandPortSig("key", dtype, "ND", False, (tokens, c.hk, c.dk), "dense", (), "none", ()),
+            OperandPortSig("value", dtype, "ND", False, (tokens, c.hv, c.dv), "dense", (), "none", ()),
+            OperandPortSig("beta", beta_dtype, "ND", False, (tokens, c.hv), "dense", (), "none", ()),
+            OperandPortSig("state", state_dtype, "ND", False, (state_blocks, c.hv, c.dv, c.dk), "dense", (), "none", ()),
+            OperandPortSig("actual_seq_lengths", "int32", "ND", False, (seqs,), "none", (), "none", ()),
+            OperandPortSig("ssm_state_indices", "int32", "ND", False, (tokens,), "none", (), "none", ()),
+        )
+        outputs = (
+            OperandPortSig("out", dtype, "ND", False, (tokens, c.hv, c.dv), "dense", (), "none", ()),
+            OperandPortSig("state", state_dtype, "ND", False, (state_blocks, c.hv, c.dv, c.dk), "dense", (), "none", ()),
+        )
+    verdict = default_abi_registry().verify(
+        AbiQueryKey(
+            soc_arch=soc_arch,
+            sku_id=_SOC_DEFAULT_SKU[soc_arch],
+            abi_id=abi_id,
+            graph_motif=graph_motif,
+            model_scope="target",
+            draft_quant_mode="none",
+            pr_track="shipping",
+            operands=operands,
+            outputs=outputs,
+            rank_placement="local",
+            world_size=1,
+            comm_group_id="none",
+            comm_domain_width=1,
+            comm_dtype="none",
+            reduction_kind="none",
+            activation_kind="none",
+            activation_params=(),
+            has_bias=False,
+            has_active_mask=False,
+            dispatch_quant_mode=0,
+            shared_experts_per_rank=0,
+            top_k=0,
+            moe_expert_num=0,
+            qk_rope_head_dim=0,
+            mla_variant="none",
+            sfa_dcp_active=False,
+            pcp_size=1,
+            kv_cache_dtype="none",
+            has_kpool_indexer=False,
+            dcp_size=1,
+            is_act_and_mul=False,
+            enabled_stack_passes=frozenset(),
+        )
+    )
+    if verdict.status != "admitted_shipping":
+        raise missing(
+            f"linear_attention_native_abi_unsupported:{abi_id}",
+            f"{abi_id} rejected on {soc_arch} (dtype={dtype}, state_dtype={state_dtype}): {verdict.status}",
+        )
+    if gate_dtype != "fp32":
+        raise missing(
+            f"linear_attention_native_abi_unsupported:{abi_id}",
+            f"{abi_id} requires fp32 gate_dtype (got {c.gate_dtype})",
+        )
+    max_dim = NATIVE_CHUNK_GDN_MAX_HEAD_DIM if is_chunk else NATIVE_RECURRENT_GDN_MAX_HEAD_DIM
+    max_heads = NATIVE_CHUNK_GDN_MAX_HEADS if is_chunk else NATIVE_RECURRENT_GDN_MAX_HEADS
+    if max(c.dk, c.dv) > max_dim:
+        raise missing(
+            "linear_attention_gdn_dimension_unsupported",
+            f"{abi_id} supports dk and dv up to {max_dim} (got dk={c.dk}, dv={c.dv})",
+        )
+    if max(c.hk, c.hv) > max_heads:
+        raise missing(
+            "linear_attention_gdn_heads_unsupported",
+            f"{abi_id} supports hk and hv up to {max_heads} (got hk={c.hk}, hv={c.hv})",
+        )
+
 def owner_units(ctx: OperatorPlanningContext) -> tuple[tuple[int, ...], tuple[int, ...]]:
     if ctx.stream_owners is not None:
         owners = ctx.stream_owners
@@ -878,8 +1042,12 @@ def _resolve_recover_ssm_accepted_per_request(
         committed = m["committed_tokens"]
         if not isinstance(committed, (tuple, list)):
             raise ModelingError("recover_ssm_requires_integer_acceptance")
+        if not committed and type(m.get("active_sequences")) is int and m["active_sequences"] == 0:
+            return (0,) * seq_count
         vals = [item[1] if isinstance(item, (tuple, list)) and len(item) >= 2 else item for item in committed]
         return _validate_per_request_acceptance(vals, per_req_bounds, q)
+    if type(m.get("active_sequences")) is int and m["active_sequences"] == 0:
+        return (0,) * seq_count
     views = [
         v for v in (getattr(ctx, "requests", ()) or getattr(ctx, "request_views", ()) or ())
         if not getattr(v, "padding", False)
@@ -907,7 +1075,7 @@ def _resolve_recover_ssm_commit_totals(
     base_ver: int,
     options: Mapping[str, Any],
     replay_bytes: Callable[[RecoverSsmCommitPlan, int], int] | None,
-) -> tuple[RecoverSsmCommitPlan, tuple[int, ...], int, int, int, int, int, int, int, int, int, int]:
+) -> tuple[RecoverSsmCommitPlan, tuple[int, ...], int, int, int, int, int, int, int, int, int, int, int, int, int, int]:
     """Compute unified G4 RecoverSSM commit work, HBM byte totals, and Triton tile geometry."""
     from ..recurrent.recover_ssm_commit import compute_recover_ssm_commit_work, resolve_commit_tile_geometry
 
@@ -923,8 +1091,22 @@ def _resolve_recover_ssm_commit_totals(
         )
         raise ModelingError("recover_ssm_commit_requires_accepted_prefix")
     per_req = accepted_raw
+    use_per_req_q = (
+        "q" not in m
+        and len(c.lengths) == len(per_req)
+        and (max(c.lengths, default=0) > 1 or q == 1)
+    )
+    req_qs = c.lengths if use_per_req_q else (q,) * len(per_req)
+    checkpoint_seqs = sum(
+        1 for rq, a_i in zip(req_qs, per_req, strict=True) if rq == 1 and a_i > 0
+    )
+    replay_per_req = tuple(
+        a_i if rq > 1 else 0 for rq, a_i in zip(req_qs, per_req, strict=True)
+    )
+    replay_seqs = sum(1 for a_i in replay_per_req if a_i > 0)
+    active_seqs = checkpoint_seqs + replay_seqs
     max_depth = max(per_req, default=0)
-    active_seqs = sum(1 for a_i in per_req if a_i > 0)
+    replay_max_depth = max(replay_per_req, default=0)
     commit = build_recover_ssm_commit(
         family, c.dk, c.dv, a=max_depth, base_version=base_ver,
         boundary_checkpoints=boundaries, **{**options, "sequences": max(1, active_seqs)},
@@ -935,6 +1117,13 @@ def _resolve_recover_ssm_commit_totals(
     rec_override = float(rec_override_raw) if rec_override_raw is not None else None
     state_override_raw = m.get("state_bytes")
     state_override = float(state_override_raw) if state_override_raw is not None else None
+    per_seq_state = (
+        int(round(state_override))
+        if state_override is not None
+        else c.hv * c.dk * c.dv * element_bytes(c.state_dtype)
+    )
+    checkpoint_read = checkpoint_seqs * per_seq_state * num_layers
+    checkpoint_write = checkpoint_seqs * per_seq_state * num_layers
     if family in {"gdn", "kda"}:
         eff_align_tiling = bool(m.get("align_mode", False)) and (
             family == "gdn" or bool(m.get("recover_ssm_commit_kind") == "boundary")
@@ -947,31 +1136,26 @@ def _resolve_recover_ssm_commit_totals(
         explicit_vt = m.get("v_tiles")
         v_tiles = int(explicit_vt) if (explicit_vt is not None and int(explicit_vt) > 0) else geom_v_tiles
         work = compute_recover_ssm_commit_work(
-            family_kind=family, accepted_per_request=per_req,
+            family_kind=family, accepted_per_request=replay_per_req,
             heads=c.hv, dk=c.dk, dv=c.dv, state_dtype=c.state_dtype,
             kg_dtype=str(m.get("record_kg_dtype", m.get("kg_dtype", "bf16"))),
             v_tiles=v_tiles, boundary_ops=0, boundary_write_bytes=0.0,
             record_bytes_override=rec_override, state_bytes_override=state_override,
         )
         total_replay = int(work["total_tokens"])
-        state_read = int(round(work["state_read_bytes"])) * num_layers
-        state_write = int(round(work["state_write_bytes"])) * num_layers + int(round(boundary_write))
+        replay_state_read = int(round(work["state_read_bytes"])) * num_layers
+        replay_state_write = int(round(work["state_write_bytes"])) * num_layers + int(round(boundary_write))
         record_read = int(round(work["physical_tiled_record_read_bytes"])) * num_layers
         if replay_bytes and total_replay > 0:
             record_read = replay_bytes(
                 replace(commit, record_read_bytes=int(round(work["unique_record_read_bytes"]))),
                 total_replay,
             ) * num_layers
-        vector_ops = (int(work["vector_ops"]) * num_layers + boundary_ops) if q > 1 else 0
+        vector_ops = (int(work["vector_ops"]) * num_layers + boundary_ops) if total_replay > 0 else 0
     else:
-        total_replay = sum(per_req)
-        per_seq_state = (
-            int(round(state_override))
-            if state_override is not None
-            else c.hv * c.dk * c.dv * element_bytes(c.state_dtype)
-        )
-        state_read = active_seqs * per_seq_state * num_layers
-        state_write = active_seqs * per_seq_state * num_layers + int(round(boundary_write))
+        total_replay = sum(replay_per_req)
+        replay_state_read = replay_seqs * per_seq_state * num_layers
+        replay_state_write = replay_seqs * per_seq_state * num_layers + int(round(boundary_write))
         per_tok_rec = (
             int(round(rec_override))
             if rec_override is not None
@@ -984,14 +1168,14 @@ def _resolve_recover_ssm_commit_totals(
             ) * num_layers
         vector_ops = (
             (REPLAY_OPS_PER_STATE_ELEMENT + (family == "gla")) * total_replay * c.hv * c.dk * c.dv * num_layers
-            + (boundary_ops if q > 1 else 0)
-            if q > 1 else 0
+            + boundary_ops
+            if total_replay > 0 else 0
         )
     published_ver = commit.base_version + int(active_seqs > 0)
     return (
-        commit, per_req, active_seqs, total_replay, max_depth,
-        state_read, state_write, record_read, vector_ops, published_ver,
-        v_tiles, head_groups,
+        commit, per_req, active_seqs, checkpoint_seqs, total_replay, max_depth, replay_max_depth,
+        checkpoint_read, checkpoint_write, replay_state_read, replay_state_write,
+        record_read, vector_ops, published_ver, v_tiles, head_groups,
     )
 
 
@@ -1028,40 +1212,42 @@ def _build_recover_ssm_commit_phases(
         base_ver = 0 if base_ver_raw is None else base_ver_raw
     arch_id = str(ctx.compute_arch.arch_id)
     (
-        commit, per_req, active_seqs, total_replay, max_depth,
-        state_read, state_write, record_read, vector_ops, published_ver,
-        v_tiles, head_groups,
+        commit, per_req, active_seqs, checkpoint_seqs, total_replay, max_depth, replay_max_depth,
+        checkpoint_read, checkpoint_write, replay_state_read, replay_state_write,
+        record_read, vector_ops, published_ver, v_tiles, head_groups,
     ) = _resolve_recover_ssm_commit_totals(
         c, family=family, q=q, arch_id=arch_id, accepted_raw=accepted_raw,
         base_ver=base_ver, options=options, replay_bytes=replay_bytes,
     )
 
     phases: list[Phase] = []
-    if c.abi == "commit_recurrent_kda" or (q == 1 and total_replay > 0):
+    if c.abi == "commit_recurrent_kda" or (checkpoint_seqs > 0 and total_replay == 0):
         phases.append(Phase("read_acceptance", transfer(ctx, read=len(c.lengths) * ACCEPTANCE_WORD_BYTES)))
     accepted_after = ("read_acceptance",) if phases else ()
-    if q == 1 and total_replay > 0:
+    if checkpoint_seqs > 0:
+        ckpt_publish = "publish" if total_replay == 0 else "publish_checkpoint"
         phases.extend((
-            Phase("read_checkpoint", transfer(ctx, read=state_read), accepted_after),
-            Phase("publish", transfer(ctx, write=state_write), ("read_checkpoint",)),
+            Phase("read_checkpoint", transfer(ctx, read=checkpoint_read), accepted_after),
+            Phase(ckpt_publish, transfer(ctx, write=checkpoint_write), ("read_checkpoint",)),
         ))
-    elif total_replay > 0:
+    if total_replay > 0:
         phases.extend((
-            Phase("read_base_state", transfer(ctx, read=state_read), accepted_after),
+            Phase("read_base_state", transfer(ctx, read=replay_state_read), accepted_after),
             Phase("read_records", transfer(ctx, read=record_read), accepted_after),
         ))
         after, previous = ("read_base_state", "read_records"), 0
-        for end in dict.fromkeys((*commit.boundary_checkpoints, max_depth)):
-            name = f"replay_to_{end}" if commit.boundary_checkpoints else "replay"
-            share = (end - previous) / float(max(1, max_depth))
-            replay_ops = int(round(vector_ops * share)) if commit.boundary_checkpoints else vector_ops
+        replay_boundaries = tuple(point for point in commit.boundary_checkpoints if point <= replay_max_depth)
+        for end in dict.fromkeys((*replay_boundaries, replay_max_depth)):
+            name = f"replay_to_{end}" if replay_boundaries else "replay"
+            share = (end - previous) / float(max(1, replay_max_depth))
+            replay_ops = int(round(vector_ops * share)) if replay_boundaries else vector_ops
             phases.append(Phase(name, Work(resources={"vector": replay_ops}), after))
             after, previous = (name,), end
-            if end < max_depth:
+            if end < replay_max_depth:
                 checkpoint = f"publish_boundary_{end}"
-                phases.append(Phase(checkpoint, transfer(ctx, write=state_read), after))
+                phases.append(Phase(checkpoint, transfer(ctx, write=replay_state_read), after))
                 after = (checkpoint,)
-        publish_bytes = state_write if not commit.boundary_checkpoints else state_read
+        publish_bytes = replay_state_write if not replay_boundaries else replay_state_read
         phases.append(Phase("publish", transfer(ctx, write=publish_bytes), after))
     is_triton_family = family in {"gdn", "kda"}
     kb_id = (
@@ -1080,12 +1266,12 @@ def _build_recover_ssm_commit_phases(
         "accepted_per_request": per_req,
         "active_sequences": active_seqs,
         "total_replay_tokens": total_replay,
-        "max_replay_depth": max_depth,
+        "max_replay_depth": replay_max_depth,
         "published_version": None if het_versions else published_ver,
         "base_version": None if het_versions else commit.base_version,
         "heterogeneous_state_versions": het_versions,
         "request_state_transitions": req_transitions,
-        "skipped_zero_accept": total_replay == 0,
+        "skipped_zero_accept": active_seqs == 0,
         "boundary_checkpoints": commit.boundary_checkpoints,
         "physical_record_read_bytes": record_read,
         "v_tiles": v_tiles,
@@ -1127,7 +1313,10 @@ def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlann
     owners = len(c.lengths) * c.hv * ceil_div(c.dv, c.bv)
     if c.operation == "recover_ssm_verify":
         verify = build_recover_ssm_verify(family, c.dk, c.dv, **options)
-        tokens = verify.output_tokens if "q" in m else sum(c.lengths)
+        req_lengths = (q,) * len(c.lengths) if "q" in m else c.lengths
+        tokens = sum(req_lengths)
+        single_count = sum(1 for length in req_lengths if length == 1)
+        spec_tokens = sum(length for length in req_lengths if length > 1)
         gate_width = c.dk if family in {"kda", "gla"} else 1
         gate_width += c.dv if family == "gla" else 0
         inputs = tokens * (
@@ -1135,13 +1324,18 @@ def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlann
             + c.hv * (gate_width * element_bytes(c.gate_dtype) + element_bytes(c.beta_dtype))
         )
         output = tokens * c.hv * c.dv * element_bytes(c.dtype)
-        checkpoint = verify.single_checkpoint
-        state_or_rec = (
-            Phase("write_state_checkpoint", transfer(ctx, write=verify.state_read_bytes), ("verify_tokens",))
-            if checkpoint
-            else Phase("write_records", transfer(ctx, write=tokens * c.hv * verify.transition.record_bytes),
-                       ("verify_tokens",))
-        )
+        single_checkpoint = spec_tokens == 0 and single_count > 0
+        checkpoint_bytes = single_count * c.hv * c.dk * c.dv * element_bytes(c.state_dtype)
+        record_write_bytes = spec_tokens * c.hv * verify.transition.record_bytes
+        write_phases: list[Phase] = []
+        if checkpoint_bytes > 0:
+            write_phases.append(
+                Phase("write_state_checkpoint", transfer(ctx, write=checkpoint_bytes), ("verify_tokens",))
+            )
+        if record_write_bytes > 0:
+            write_phases.append(
+                Phase("write_records", transfer(ctx, write=record_write_bytes), ("verify_tokens",))
+            )
         phases = (
             Phase("read_base_state", transfer(ctx, read=verify.state_read_bytes)),
             Phase("verify_inputs", transfer(ctx, read=inputs)),
@@ -1149,9 +1343,15 @@ def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlann
                                                    * tokens * c.hv * c.dk * c.dv}),
                   ("read_base_state", "verify_inputs")),
             Phase("verify_outputs", transfer(ctx, write=output), ("verify_tokens",)),
-            state_or_rec,
+            *write_phases,
         )
-        result = {"q": q, "single_checkpoint": checkpoint, "output_tokens": tokens}
+        result = {
+            "q": q,
+            "single_checkpoint": single_checkpoint,
+            "output_tokens": tokens,
+            "checkpoint_write_bytes": checkpoint_bytes,
+            "record_write_bytes": record_write_bytes,
+        }
         transition = verify.transition
     else:
         phases, result, transition = _build_recover_ssm_commit_phases(
@@ -1162,8 +1362,9 @@ def build_recover_ssm_plan(contract: LinearAttentionContract, ctx: OperatorPlann
         eff_v_tiles = int(result.get("v_tiles", ceil_div(c.dv, c.bv)) or 1)
         eff_layers = int(result.get("num_layers", 1) or 1)
         owners = max(1, active_seqs * eff_layers * eff_head_groups * eff_v_tiles) if active_seqs > 0 else 0
+    launch_count = int(bool(phases) or m.get("recover_ssm_commit_kind") == "ordinary")
     return make_plan(ctx, c.abi or c.operation, phases, sources=sources, family="recover_ssm",
-                     launch_count=int(bool(phases)), owners=owners if owners > 0 else None, metadata={
+                     launch_count=launch_count, owners=owners if owners > 0 else None, metadata={
                          **result, "owners": owners, "ssm_family": family, "record_bytes": transition.record_bytes,
                          "upstream_verified": transition.upstream_verified,
                      })

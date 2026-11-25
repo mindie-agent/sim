@@ -9,9 +9,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
-from mindie_sim.schema.datapath import GENERIC_ARCH_ID, ArchId
+from mindie_sim.schema.datapath import GENERIC_ARCH_ID, ArchId, SourceRef
 from mindie_sim.schema.operators import OpSpec
 from ...mechanism import Geometry, OperatorPlan
 from ...program import RecipeContext
@@ -48,6 +49,21 @@ from .common import (
     validate_contract,
 )
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/chunk_gated_delta_rule/op_kernel/arch22/chunk_gated_delta_rule_arch22.h",
+        source_sha256="56c72f3db58221fa12763e10c0d2925ac4d8f5679891851e5249e07ffd376419",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/chunk_gated_delta_rule/op_kernel/arch35/chunk_gated_delta_rule_arch35.h",
+        source_sha256="914151d3e01c167dc7f62f51c049fff9850b681039c4744e9cb68bf4067360da",
+    ),
+)
 _STRATEGIES = {_ARCH22.arch_id: _ARCH22, _ARCH35.arch_id: _ARCH35}
 
 
@@ -82,7 +98,17 @@ def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedO
     if op.recipe in gdn_decode.RECIPE_IDS:
         plan = gdn_decode.build(op, ctx.geometry, ctx=ctx)
         return ResolvedOperator(ctx.occurrence, op, plan, op.recipe)
+    strategy = _STRATEGIES.get(ctx.compute_arch.arch_id)
+    if strategy is None:
+        raise missing("linear_attention_arch_unsupported", f"Unsupported ISA {ctx.compute_arch.arch_id}")
     if op.recipe in CHUNK32_KERNELS:
+        if strategy is not _ARCH35:
+            code = (
+                "linear_attention_arch22_abi_unsupported"
+                if strategy is _ARCH22
+                else "linear_attention_arch35_abi_required"
+            )
+            raise missing(code, f"{op.recipe} requires Arch35")
         from . import gdn_chunk32
         from ...physical_recipe_registry import uses_retained_source_plan
 
@@ -98,9 +124,6 @@ def resolve_operator_plan(op: OpSpec, ctx: OperatorPlanningContext) -> ResolvedO
             if ctx.requests:
                 plan = replace(plan, metadata={**plan.metadata, **request_layout_metadata(ctx)})
             return ResolvedOperator(ctx.occurrence, op, plan, op.recipe)
-    strategy = _STRATEGIES.get(ctx.compute_arch.arch_id)
-    if strategy is None:
-        raise missing("linear_attention_arch_unsupported", f"Unsupported ISA {ctx.compute_arch.arch_id}")
     contract = validate_contract(op, ctx)
     abi = ctx.requested_abi or dict(op.metadata).get("abi") or op.recipe or op.family
     if isinstance(contract, CausalConvContract):

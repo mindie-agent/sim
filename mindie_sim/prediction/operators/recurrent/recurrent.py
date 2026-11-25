@@ -9,9 +9,11 @@
 import math
 from dataclasses import replace
 from itertools import accumulate
+from typing import Literal
 
 from mindie_sim.catalog.attention_common import AttentionResult
 from mindie_sim.schema.common import dtype_bytes, ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
 from mindie_sim.prediction.operators.linear_attention import gdn_recurrent
 from mindie_sim.prediction.operators.kda import kda_state_selection as pcp_state_selection
@@ -26,6 +28,22 @@ from mindie_sim.prediction.sharding.context_parallel import (
     emit_pcp_restore_unpermute,
 )
 from mindie_sim.prediction.operators.kda.kda_source import serial_context_parallel, serving_source
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/chunk_gated_delta_rule/op_kernel/arch35/chunk_gated_delta_rule_arch35.h",
+        source_sha256="914151d3e01c167dc7f62f51c049fff9850b681039c4744e9cb68bf4067360da",
+    ),
+    SourceRef(
+        repository="vllm-project/vllm-ascend",
+        revision="0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        relative_path="vllm_ascend/ops/triton/kda/kda.py",
+        source_sha256="1e45592a0675af7dfcc879368f3d1f4ec0065455b2f49109c27a11a586516d5e",
+    ),
+)
 
 DEFAULT_RECURRENT_CHUNK_TOKENS = 64
 QKV_PROJECTION_INPUTS = 3
@@ -627,7 +645,8 @@ def _bind_kda_decode(b, *, decode_source, views, parallel, projection_group, bet
             scans, lengths=tuple(view.q_len for view in views), heads=heads,
             key_heads=key_heads, dk=dk, dv=dv, dtype=model.activation_dtype,
             state_dtype=plan.recurrent_state_dtype, requests=b.common["requests"],
-            deps=tuple(dict.fromkeys((conv, decay, supplied_beta))), **options)
+            deps=tuple(dict.fromkeys((conv, decay, supplied_beta))), views=views,
+            **options)
         if projection_group:
             decode_core = replace(decode_core, metadata=decode_core.metadata + (
                 ("projection_input_views", projection_group["views"]),))
@@ -678,16 +697,16 @@ def _bind_kda_prefill(b, *, kda_source, kda_caps, prefill_source, prefill_scan_i
             # One source call owns every prefill sequence's FWD_H stage.  The
             # generic decode scans, caller gates and output members stay put.
             scans = tuple(op for op in b.ops if op.op_id in set(prefill_scan_ids))
+            prefill_views = tuple(view for view in views if view.phase == "prefill")
             fused = binder(
                 scans,
-                lengths=tuple(view.q_len for view in views if view.phase == "prefill"),
+                lengths=tuple(view.q_len for view in prefill_views),
                 heads=heads, key_heads=key_heads, dk=dk, dv=dv, chunk=chunk,
                 dtype=model.activation_dtype, state_dtype=plan.recurrent_state_dtype,
-                requests=tuple(dict.fromkeys(
-                    view.request_id for view in views if view.phase == "prefill")),
+                requests=tuple(dict.fromkeys(view.request_id for view in prefill_views)),
                 pcp=parallel.pcp,
-                speculative=any(view.draft_proposal_tokens
-                                for view in views if view.phase == "prefill"),
+                speculative=any(view.draft_proposal_tokens for view in prefill_views),
+                state_contexts=tuple(int(view.context) for view in prefill_views),
             )
             ids = {op.op_id for op in scans}
             anchor = scans[-1].op_id

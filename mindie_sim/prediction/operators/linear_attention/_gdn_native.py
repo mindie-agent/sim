@@ -16,6 +16,7 @@ Upstream-ABI: aclnnRecurrentGatedDeltaRule
 from __future__ import annotations
 
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.datapath import SourceRef
 
@@ -42,12 +43,14 @@ from .common import (
     missing,
     owner_units,
     transfer,
+    verify_native_gdn_abi,
 )
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 OPS_REV = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
 RECURRENT_GDN_ABI = "aclnnRecurrentGatedDeltaRule"
 
-RECURRENT_GDN_SOURCES: tuple[SourceRef, ...] = (
+SOURCES: tuple[SourceRef, ...] = (
     SourceRef(
         repository="cann/ops-transformer",
         revision=OPS_REV,
@@ -61,6 +64,7 @@ RECURRENT_GDN_SOURCES: tuple[SourceRef, ...] = (
         source_sha256="5590f9a236f83660df7b216af2d535c4cb07a8ccd96fa07ebc6be3f78c9a03c2",
     ),
 )
+RECURRENT_GDN_SOURCES = SOURCES
 
 # Arch35 VectorCompute (chunk_gated_delta_rule_vector_compute.h & stage{1,2}_vf.h)
 # Exact 64-FP32-lane SIMD issue counts per AIV per full 64-token chunk (2 AIVs/head):
@@ -190,6 +194,7 @@ def build_native_recurrent_gdn(
     c: LinearAttentionContract, ctx: OperatorPlanningContext,
 ) -> OperatorPlan:
     """Lower native CANN aclnnRecurrentGatedDeltaRule (BF16 or FP32 state, Arch22/Arch35)."""
+    verify_native_gdn_abi(c, ctx, abi_id=RECURRENT_GDN_ABI)
     _, aivs = owner_units(ctx)
     if not aivs:
         raise missing("linear_attention_no_physical_owner", "Recurrent GDN requires AIV owners")

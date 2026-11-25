@@ -6,11 +6,22 @@
 [Timeouts & Locks] Arithmetic and metadata construction over the supplied slots.
 [Side-Effect Policy] Returns contract data and leaves caller values intact.
 """
-from typing import Mapping
+from typing import Literal, Mapping
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import StateEffect
 from .gdn_domain import GDN_CHUNK64_TOKENS
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/recurrent_gated_delta_rule/op_kernel/arch35/recurrent_gated_delta_rule_arch35.h",
+        source_sha256="5590f9a236f83660df7b216af2d535c4cb07a8ccd96fa07ebc6be3f78c9a03c2",
+    ),
+)
 
 
 def _state_effect(target, action, version, condition, arbiter="", decision="",
