@@ -10,9 +10,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping
+from typing import Literal, Mapping
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.prediction.instructions import REGISTER_WORK_ROLES
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, Work
@@ -21,11 +22,13 @@ from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.operators.vector.mixed_core import read_role, split_reads
 from mindie_sim.prediction.operators.causal_conv import native_conv_registers as registers
 from .native_causal_conv_spec import (
-    IMPLEMENTATION, MAX_WIDTH, PAIR_TOKENS,
+    IMPLEMENTATION, MAX_WIDTH, PAIR_TOKENS, SOURCE_REFS,
     TOKEN_PIPELINE_SLOTS, UB_RESIDENT_BYTES, _ceil_div, _config_from_op,
     _dtype_width, _host_tiling, _parse_params, _resolve_cores_and_ub,
     host_tiling, make_op,
 )
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 
 SILU_OPS_PER_ELEMENT = 4
 GENERIC_TAP_OPS_PER_ELEMENT = 3

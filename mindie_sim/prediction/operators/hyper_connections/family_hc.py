@@ -9,13 +9,32 @@
 """
 from collections import defaultdict
 from dataclasses import dataclass
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.ownership import read_role, unit_group
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
-from .common import FP32_BYTES, MHC_COEFFICIENT_SCALARS
+from .common import ARCH22, FP32_BYTES, MHC_COEFFICIENT_SCALARS, VLLM_REVISION
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+ALLOWED_ARCHS: frozenset[str] = frozenset({str(ARCH22)})
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        VLLM_REVISION,
+        "csrc/moe/hc_pre/op_host/hc_pre_tiling.cpp",
+        "29bd7606b274d6a9289ce02b6e6cc03ff947c3a163850263cfea622b53b5d26c",
+    ),
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        VLLM_REVISION,
+        "csrc/moe/hc_post/op_kernel/hc_post.cpp",
+        "c735e1e4534bc2d701fbd06636e42082567c81ea3f0ed24e4e10b9a71867eda4",
+    ),
+)
 
 
 PRE_PROFILE = "hc_pre_m_k_split_175ef4d4"
@@ -138,8 +157,21 @@ def _pre_owner_groups(rows, aiv):
     )
 
 
+def _require_arch22(geometry, profile: str) -> None:
+    dp_arch = getattr(getattr(geometry, "datapath", None), "compute_arch", None)
+    compute_arch = dp_arch or getattr(geometry, "compute_arch", None)
+    arch_id = str(
+        getattr(compute_arch, "arch_id", "")
+        or getattr(compute_arch, "preset", "")
+        or ""
+    ).strip().lower()
+    if arch_id and arch_id not in ALLOWED_ARCHS:
+        raise ModelingError(f"{profile}_requires_arch22:{arch_id}")
+
+
 def pre_geometry(view, geometry):
     """The source fixes N=24 and uses 256-row / 256-K-aligned partitions."""
+    _require_arch22(geometry, PRE_PROFILE)
     rows, width = view["tokens"], view["hc"] * view["hidden"]
     if view["dtype"] != "bf16" or view["hc"] != _PRE_STREAMS or width % _PRE_K_ALIGNMENT:
         raise ModelingError("hc_pre_source_requires_bf16_hc4_and_k_multiple32")
@@ -385,6 +417,7 @@ def post_buffer_bytes(view, *, tile=_POST_D_TILE):
 
 
 def _post_plan(op, geometry):
+    _require_arch22(geometry, POST_PROFILE)
     view = _view(op)
     if view.get("coefficient_dtype", "fp32") != "fp32":
         raise ModelingError("hc_post_source_plan_requires_fp32_coefficients")

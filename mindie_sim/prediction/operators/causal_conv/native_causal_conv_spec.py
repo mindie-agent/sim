@@ -11,11 +11,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Literal, Mapping
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.prediction.mechanism import Geometry
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        "cann/ops-transformer",
+        "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "mamba/causal_conv1d/op_host/causal_conv1d_def.cpp",
+        "64bf22417c81cbefa0ec0827673d654e5c341a395145c8ef2ffe0d6cd19878fb",
+    ),
+)
+_ARCH35_IDS = frozenset({"npu_arch_3510", "dav_3510"})
 
 FP32_ACCUMULATOR_BYTES = int(dtype_bytes("fp32"))
 VARLEN_QUERY_INDEX_BITS = 32
@@ -510,7 +522,22 @@ def _require_positive_hw_int(value, reason: str) -> int:
     return number
 
 
+def _require_arch35(geometry) -> None:
+    if geometry is None:
+        return
+    dp_arch = getattr(getattr(geometry, "datapath", None), "compute_arch", None)
+    compute_arch = dp_arch or getattr(geometry, "compute_arch", None)
+    arch_id = str(
+        getattr(compute_arch, "arch_id", "")
+        or getattr(compute_arch, "preset", "")
+        or ""
+    ).strip().lower()
+    if arch_id and arch_id not in _ARCH35_IDS:
+        raise ModelingError(f"causal_conv1d_arch35_fn_requires_arch35:{arch_id}")
+
+
 def _resolve_cores_and_ub(geometry, core_num, ub_bytes) -> tuple[int, int]:
+    _require_arch35(geometry)
     if geometry is not None:
         raw_cores = geometry.resource_units.get("vector", geometry.compute_units)
         raw_ub = geometry.buffers.get("ub") if hasattr(geometry, "buffers") else None

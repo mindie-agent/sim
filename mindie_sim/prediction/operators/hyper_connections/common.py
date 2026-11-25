@@ -28,6 +28,8 @@ from ...runtime.memory_physics import AddressRun, AddressRunPlan, ReuseKey
 from ..contracts import OperatorPlanningContext
 from .lowering import FAMILY, PhaseGraph, gap
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+
 ARCH22 = ArchId("npu_arch_2201")
 ARCH35 = ArchId("npu_arch_3510")
 FP32_BYTES = 4
@@ -39,6 +41,7 @@ ENGRAM_PRODUCT_OPS_PER_ELEMENT = 5
 ENGRAM_GATE_SCALAR_OPS = 19
 ATTNRES_SOFTMAX_OPS_PER_ROW = 5
 HC_SINKHORN_STREAMS = 4
+HC_PRE_SUPPORTED_STREAMS = 4
 SINKHORN_DEFAULT_ITERS = 20
 SINKHORN_INIT_ENTRY_OPS = 3
 SILU_OPS_PER_ELEMENT = 4
@@ -66,6 +69,7 @@ ATTNRES_UB_ALIGNMENT_BYTES = 32
 ATTNRES_FP32_VECTOR_LANES = 64
 ATTNRES_FP32_ALIGNED_SCRATCH_ROWS = 3
 ATTNRES_FP32_SCRATCH_ROWS = 4
+ATTNRES_RELOAD_BF16_ROWS = 3
 MAX_OWNER_SERIAL_PHASES = 8
 UINT32_MAX = (1 << 32) - 1
 ENGRAM_REDUCTIONS = 3
@@ -75,6 +79,18 @@ VLLM_REVISION = "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb"
 HC_PRE_TILING_SOURCE = SourceRef(
     "vllm-ascend", VLLM_REVISION, "csrc/moe/hc_pre/op_host/hc_pre_tiling.cpp",
     "29bd7606b274d6a9289ce02b6e6cc03ff947c3a163850263cfea622b53b5d26c",
+)
+HC_PRE_DEF_SOURCE = SourceRef(
+    "vllm-ascend", VLLM_REVISION, "csrc/moe/hc_pre/op_host/hc_pre_def.cpp",
+    "051e9b4f722a3b36f1bb447cafd7700e1e37cdd14648d417b66b3f7db03af109",
+)
+HC_PRE_CUBE_ARCH35_SOURCE = SourceRef(
+    "vllm-ascend", VLLM_REVISION, "csrc/moe/hc_pre/op_kernel/hc_pre_cube_compute_arch35.h",
+    "cf197ddead3807f57c4791e173eee8de4c1116c19bea6a17ddae12b40d9a2b3b",
+)
+HC_POST_SOURCE = SourceRef(
+    "vllm-ascend", VLLM_REVISION, "csrc/moe/hc_post/op_kernel/hc_post.cpp",
+    "c735e1e4534bc2d701fbd06636e42082567c81ea3f0ed24e4e10b9a71867eda4",
 )
 ATTNRES_CALLER_SOURCES: tuple[SourceRef, ...] = (
     SourceRef("vllm-ascend", VLLM_REVISION, "csrc/attention/attn_res_fwd/op_host/attn_res_fwd_tiling.cpp",
@@ -92,6 +108,9 @@ ENGRAM_GATE_SOURCES: tuple[SourceRef, ...] = (
 )
 VLLM_CALLER_SOURCES: tuple[SourceRef, ...] = (
     HC_PRE_TILING_SOURCE,
+    HC_PRE_DEF_SOURCE,
+    HC_PRE_CUBE_ARCH35_SOURCE,
+    HC_POST_SOURCE,
     *ATTNRES_CALLER_SOURCES,
     *ENGRAM_GATE_SOURCES,
 )
@@ -103,6 +122,7 @@ SHARED_SOURCES: tuple[SourceRef, ...] = (
               "mhc/text_gated_residual/op_kernel/catlass_hc_forward_mul_sum_tiling_data.h",
               "392ea8212ca6ec2ce53d8a8e5704194ca6e7f1b177ab25f4b12e1fac18f43788"),
 )
+SOURCE_REFS: tuple[SourceRef, ...] = (*VLLM_CALLER_SOURCES, *SHARED_SOURCES)
 
 
 def sources_for_kind(kind: str, strategy_sources: tuple[SourceRef, ...]) -> tuple[SourceRef, ...]:
@@ -115,6 +135,9 @@ def sources_for_kind(kind: str, strategy_sources: tuple[SourceRef, ...]) -> tupl
         ops_tx = tuple(ref for ref in strategy_sources if "text_gated_residual" in ref.relative_path)
         shared_tx = tuple(ref for ref in SHARED_SOURCES if "text_gated_residual" in ref.relative_path)
         return ops_tx + shared_tx or strategy_sources
+    if kind in {"hc_post", "mhc_post_collapse"}:
+        hc_post_strategy = tuple(ref for ref in strategy_sources if "hc_post" in ref.relative_path)
+        return (*hc_post_strategy, HC_POST_SOURCE)
     hc_strategy = tuple(ref for ref in strategy_sources if "hc_pre" in ref.relative_path)
     hc_shared = tuple(ref for ref in SHARED_SOURCES if "hc_pre" in ref.relative_path)
     return (hc_strategy or strategy_sources) + hc_shared + (HC_PRE_TILING_SOURCE,)
@@ -311,6 +334,38 @@ class AttnResContract:
             raise ModelingError("attnres_history_out_of_capacity")
 
 
+def attnres_ub_bytes(
+    hidden: int, rows: int, *, resident: bool, fuse_add: bool = True,
+    ub_overhead_bytes: int = ATTNRES_UB_OVERHEAD_BYTES,
+    regbase: bool = True, fused_chain: bool = False,
+    need_backward: bool = False, cache_output_norm: bool = False,
+    cached_rows: int = 0,
+) -> int:
+    """Aligned UB footprint matching upstream ``AttnResFwd::LegacyUbBytes``."""
+    _integer("hidden_size", hidden, 1)
+    _integer("rows", rows)
+    _integer("ub_overhead_bytes", ub_overhead_bytes)
+    _integer("cached_rows", cached_rows)
+    b16 = int(dtype_bytes("bf16"))
+    align = ATTNRES_UB_ALIGNMENT_BYTES
+    meta_block = align // FP32_BYTES
+    aligned_b16 = _ceil(hidden * b16, align) * align
+    aligned_fp32 = _ceil(hidden * FP32_BYTES, align) * align
+    lanes = ATTNRES_FP32_VECTOR_LANES
+    fused_prefix = fuse_add or fused_chain
+    meta = _ceil(rows, meta_block) * meta_block
+    scores = _ceil(meta, lanes) * lanes if regbase and rows > 2 * lanes else meta
+    scratch = meta if regbase else max(meta, lanes)
+    resident_rows = rows - int(fused_prefix and rows > 0)
+    bf16_rows = (2 + resident_rows) if resident else (ATTNRES_RELOAD_BF16_ROWS + cached_rows)
+    buffers = (bf16_rows + int(fused_prefix) + int(cache_output_norm)) * aligned_b16
+    buffers += ATTNRES_FP32_ALIGNED_SCRATCH_ROWS * aligned_fp32
+    scalars = scores + scratch + meta * meta_block + meta_block
+    if need_backward:
+        scalars += meta_block + meta
+    return ub_overhead_bytes + buffers + scalars * FP32_BYTES
+
+
 def attnres_max_resident_rows(
     hidden: int, ub_bytes: int, *, fuse_add: bool = True,
     ub_overhead_bytes: int = ATTNRES_UB_OVERHEAD_BYTES,
@@ -323,29 +378,17 @@ def attnres_max_resident_rows(
     _integer("ub_overhead_bytes", ub_overhead_bytes)
     b16 = int(dtype_bytes("bf16"))
     align = ATTNRES_UB_ALIGNMENT_BYTES
-    meta_block = align // FP32_BYTES
     row = hidden * b16
     aligned_b16 = _ceil(row, align) * align
-    aligned_fp32 = _ceil(hidden * FP32_BYTES, align) * align
-    lanes = ATTNRES_FP32_VECTOR_LANES
-    fused_prefix = fuse_add or fused_chain
-
-    def resident_bytes(rows: int) -> int:
-        meta = _ceil(rows, meta_block) * meta_block
-        scores = _ceil(meta, lanes) * lanes if regbase and rows > 2 * lanes else meta
-        scratch = meta if regbase else max(meta, lanes)
-        resident_rows = rows - int(fused_prefix and rows > 0)
-        buffers = (2 + resident_rows + int(fused_prefix)) * aligned_b16
-        buffers += ATTNRES_FP32_ALIGNED_SCRATCH_ROWS * aligned_fp32
-        scalars = scores + scratch + meta * meta_block + meta_block
-        if need_backward:
-            scalars += meta_block + meta
-        return ub_overhead_bytes + buffers + scalars * FP32_BYTES
 
     low, high = 0, min(ub_bytes // aligned_b16, UINT32_MAX)
     while low < high:
         mid = (low + high + 1) // 2
-        if resident_bytes(mid) <= ub_bytes:
+        if attnres_ub_bytes(
+            hidden, mid, resident=True, fuse_add=fuse_add,
+            ub_overhead_bytes=ub_overhead_bytes, regbase=regbase,
+            fused_chain=fused_chain, need_backward=need_backward,
+        ) <= ub_bytes:
             low = mid
         else:
             high = mid - 1
@@ -394,11 +437,17 @@ def sinkhorn_vector_ops(tokens: int, hc_mult: int, iters: int) -> int:
     half_steps = 2 * iters
     return tokens * (initialization + half_steps * (adds + entries) + max(0, half_steps - 1) * hc_mult)
 
-def _matrix(graph, name, m, k, n, dtype, after, owners, *, gram=0) -> str:
-    elt = int(dtype_bytes(dtype))
+def _matrix(
+    graph, name, m, k, n, dtype, after, owners, *,
+    gram=0, act_elt: int | None = None, weight_elt: int | None = None,
+    compute_dtype: str | None = None,
+) -> str:
+    a_elt = int(dtype_bytes(dtype)) if act_elt is None else int(act_elt)
+    w_elt = int(dtype_bytes(dtype)) if weight_elt is None else int(weight_elt)
+    mat_dtype = dtype if compute_dtype is None else compute_dtype
     l1 = graph.add(f"{name}_operands", after, aic=True, owners=owners,
-                   work=Work(resources={"mte1": (m + n) * k * elt}))
-    work = Work(matrix={dtype: 2 * m * k * n})
+                   work=Work(resources={"mte1": (m * a_elt + n * w_elt) * k}))
+    work = Work(matrix={mat_dtype: 2 * m * k * n})
     if gram:
         work += Work(matrix={"fp32": gram})
     return graph.add(name, (l1,), aic=True, owners=owners, work=work)
@@ -446,19 +495,28 @@ def model_pre_sinkhorn(graph: PhaseGraph, t: MhcContract) -> dict:
             "mhc_aux_cores": 0, "primary_aiv_cores": len(owners)}
 
 
-def model_mhc(graph: PhaseGraph, kind: str, t: MhcContract) -> dict:
+def model_mhc(
+    graph: PhaseGraph, kind: str, t: MhcContract, *, requested_abi: str | None = None,
+) -> dict:
     m, c, h = t.rows, t.hc_mult, t.hidden_size
     pre = kind == "hc_pre"
+    native_hc_pre_abi = pre and requested_abi in ABI_NAMES["hc_pre"]
+    if native_hc_pre_abi and c != HC_PRE_SUPPORTED_STREAMS:
+        raise gap("hc_pre_unsupported_stream_count", f"{requested_abi}:hc_mult={c}")
     sink_ops = sinkhorn_vector_ops(m, c, t.sinkhorn_iters) if pre else 0
     mix = t.n_mix
+    weight_dtype = "fp32" if native_hc_pre_abi else t.dtype
+    compute_dtype = "hf32" if native_hc_pre_abi else t.dtype
     metadata = {"split_k": t.split_k, "sinkhorn_ops": sink_ops,
-                "projection_flops": 2 * m * c * h * mix if pre else 0}
+                "projection_flops": 2 * m * c * h * mix if pre else 0,
+                "weight_dtype": weight_dtype, "compute_dtype": compute_dtype}
     if not m:
         return {**metadata, "mhc_aux_cores": 0, "primary_aiv_cores": 0}
     primary, aux = _partition(graph, t, pre)
     primary = primary[:m]
     metadata.update(mhc_aux_cores=len(aux), primary_aiv_cores=len(graph.aiv) - len(aux))
     elt = int(dtype_bytes(t.dtype))
+    weight_elt = FP32_BYTES if native_hc_pre_abi else elt
     x_bytes = m * c * h * elt
     coefficients = m * c * (c + 1) * FP32_BYTES
     if not pre:
@@ -476,11 +534,13 @@ def model_mhc(graph: PhaseGraph, kind: str, t: MhcContract) -> dict:
         return metadata
 
     aic = graph.aic[:m * t.split_k]
-    load = graph.transfer("projection_inputs", x_bytes + c * h * mix * elt, aic=True, owners=aic)
+    load = graph.transfer("projection_inputs", x_bytes + c * h * mix * weight_elt, aic=True, owners=aic)
     split = t.split_k
     projection = _matrix(
         graph, "split_k_partials" if split > 1 else "mix_projection", m, c * h, mix,
         t.dtype, (load,), aic, gram=m * (2 * c * h - split),
+        act_elt=(FP32_BYTES if native_hc_pre_abi else elt),
+        weight_elt=weight_elt, compute_dtype=compute_dtype,
     )
     partials = m * (mix + 1) * split * FP32_BYTES
     publish = graph.transfer("projection_workspace_write", partials, (projection,), aic=True, write=True, owners=aic)
@@ -570,12 +630,21 @@ def model_attnres(graph: PhaseGraph, t: AttnResContract, ub: int, physical_cap: 
                                      regbase=regbase, fused_chain=t.fused_chain, need_backward=t.need_backward)
     resident = j + 1 <= limit
     cached = j if resident else t.cached_rows
+    ub_required = attnres_ub_bytes(
+        h, j + 1, resident=resident, fuse_add=t.fuse_add,
+        ub_overhead_bytes=t.ub_overhead_bytes, regbase=regbase,
+        fused_chain=t.fused_chain, need_backward=t.need_backward,
+        cached_rows=(0 if resident else cached),
+    )
+    if m and ub_required > ub:
+        raise gap("attnres_ub_capacity_exceeded", f"{ub_required}>{ub}")
     template = "resident" if resident else "cooperative_reload" if 0 < cached < j else "reload"
     elt = int(dtype_bytes(t.dtype))
     row = elt * h
     prefix_reload_bytes = row if not (resident or t.fuse_add or t.fused_chain) else 0
     reload_inputs = "history_and_prefix" if prefix_reload_bytes else "history"
     metadata = {"resident_row_limit": limit, "selected_template": template,
+                "ub_bytes_per_owner": ub_required,
                 "reread_bytes": m * (j - cached) * row, "history_read_bytes": m * j * row}
     if m and not graph.aiv:
         raise gap("hyper_connections_requires_aiv_owners", "attn_res_fwd")
@@ -753,7 +822,7 @@ class HyperConnectionsStrategy:
         if kind == "hc_pre_sinkhorn":
             metadata = model_pre_sinkhorn(graph, contract)
         elif kind in MHC_KINDS:
-            metadata = model_mhc(graph, kind, contract)
+            metadata = model_mhc(graph, kind, contract, requested_abi=ctx.requested_abi)
         elif kind == "text_gated_residual":
             decision = evaluate_text_gated_guard(contract, self.arch_id, len(graph.aic))
             if ctx.requested_abi == "fusedSmall" and decision.selected_template not in {"native_a5_small", "empty_noop"}:
@@ -797,12 +866,18 @@ def build_governed_bindings(
         "engram_gate": ("fused_engram_gate", "Triton", "engram_gate"),
     }
     kernel_id, backend, submodule = kernel_map.get(kind, (kind, "CANN", FAMILY))
+    readiness: Literal["shipping", "synthesized_target"] = "shipping"
+    if kind == "hc_pre" and ctx.requested_abi not in ABI_NAMES["hc_pre"]:
+        # Generic unpinned hc_pre uses dtype-parametric analytical weights/compute;
+        # concrete shipping npu_hc_pre binds FP32 hc_fn + HF32 cube + C==4.
+        kernel_id = "hc_pre_analytical"
+        readiness = "synthesized_target"
     precision_abi = TensorPrecisionABI(
         linear_method="dense" if plan.work.matrix else "none",
         input_dtype=dtype,
-        weight_dtype=dtype,
+        weight_dtype=str(meta.get("weight_dtype") or dtype),
         output_dtype=dtype,
-        compute_dtype="fp32" if kind == "attn_res_fwd" else dtype,
+        compute_dtype=str(meta.get("compute_dtype") or ("fp32" if kind == "attn_res_fwd" else dtype)),
         accum_dtype="fp32",
     )
     kernel_binding = KernelBinding(
@@ -811,7 +886,7 @@ def build_governed_bindings(
         arch_family=arch_str,
         submodule=submodule,
         macro_module="residual",
-        readiness="shipping",
+        readiness=readiness,
         source_ref=sources[0] if sources else None,
         recipe_id=kind,
         template_id=str(meta.get("selected_template") or ""),

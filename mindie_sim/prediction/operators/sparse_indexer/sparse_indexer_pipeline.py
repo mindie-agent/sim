@@ -16,17 +16,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
+from typing import Literal
 
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.physical_recipe_base import (IO_HBM_CATEGORY, Phase, build_plan,
                                    io_weight, tiled_phased_program)
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import (
     KERNEL_READINESS_VALUES,
     KernelBinding,
     OwnerMemoryResidency,
     OwnerScheduleSpec,
     SerialPhaseSpec,
+)
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        "cann/ops-transformer",
+        "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "attention/quant_lightning_indexer_v2/op_kernel/arch35/quant_lightning_indexer_v2_kernel_arch35.h",
+        "37b78aab1ddb5eb0139e8a8c710610bbbccdc32359c4352ec302057153ed8945",
+    ),
 )
 
 PIPELINE_SLOTS = 2
@@ -270,6 +282,98 @@ def _matrix_free(values, dtype):
     return {key: value for key, value in values.items() if key != dtype}
 
 
+_AIC_EXECUTION_ROLES = frozenset({"cube", "mte1", "mte2_aic", "fixpipe"})
+
+
+def _stream_owner_placement(
+    context,
+    stream,
+    active_owners: int,
+    total_owners: int,
+    roles: tuple[str, ...],
+) -> dict[str, tuple[int, ...]]:
+    dp = getattr(context, "datapath", None)
+    if dp is not None and hasattr(stream, "paired_owners"):
+        pairs = stream.paired_owners(dp)
+        if pairs:
+            active = max(1, min(int(active_owners), len(pairs)))
+            selected_aic = tuple(sorted({aic_id for aic_id, _ in pairs[:active]}))
+            selected_aiv = tuple(sorted({aiv_id for _, aivs in pairs[:active] for aiv_id in aivs}))
+            merged: dict[str, tuple[int, ...]] = {}
+            for role in roles:
+                phys = context.physical_role(role)
+                name = context.resource_names.get(phys)
+                if not name:
+                    continue
+                if phys in _AIC_EXECUTION_ROLES:
+                    units = selected_aic
+                else:
+                    pool = stream.pool_for_role(phys, datapath=dp)
+                    units = selected_aiv if selected_aiv else pool[:active]
+                if units:
+                    merged[name] = units
+            if merged:
+                return merged
+    aic_pool = stream.units_for("aic")
+    aiv_pool = stream.units_for("aiv")
+    active = max(1, min(int(active_owners), max(1, len(aic_pool) if aic_pool else total_owners)))
+    aiv_per_aic = max(1, len(aiv_pool) // max(1, len(aic_pool))) if (aic_pool and aiv_pool) else 1
+    merged_pool: dict[str, tuple[int, ...]] = {}
+    for role in roles:
+        phys = context.physical_role(role)
+        name = context.resource_names.get(phys)
+        if not name:
+            continue
+        if phys in _AIC_EXECUTION_ROLES and aic_pool:
+            units = tuple(sorted(aic_pool[:active]))
+        elif aiv_pool:
+            units = tuple(sorted(aiv_pool[:active * aiv_per_aic]))
+        else:
+            continue
+        if units:
+            merged_pool[name] = units
+    return merged_pool
+
+
+def _active_owner_placement(
+    context,
+    active_owners: int,
+    total_owners: int,
+    roles: tuple[str, ...],
+) -> dict[str, tuple[int, ...]]:
+    """Bind per-owner resources strictly to the active owner slice of this stream."""
+    total = max(1, int(total_owners))
+    stream = getattr(context, "stream_owners", None)
+    if stream is not None:
+        stream_place = _stream_owner_placement(context, stream, active_owners, total, roles)
+        if stream_place:
+            return stream_place
+    active = max(1, min(int(active_owners), total))
+    merged: dict[str, set[int]] = {}
+    for owner in range(active):
+        for name, units in context.owned(owner, total, roles).items():
+            merged.setdefault(name, set()).update(units)
+    return {name: tuple(sorted(units)) for name, units in merged.items() if units}
+
+
+def _resolve_quant_ledger(ledger: dict, core_count: int) -> dict:
+    """Resolve physical wave width/count from die AIC count rather than hardcoded 32."""
+    if core_count <= 0 or "query_rows" not in ledger:
+        return ledger
+    wave_rows = int(core_count)
+    query_rows = int(ledger.get("query_rows", 0) or 0)
+    waves = indexer_waves(query_rows, wave_rows)
+    old_wave_rows = int(ledger.get("wave_rows", 0) or 0)
+    if old_wave_rows == wave_rows and int(ledger.get("waves", 0) or 0) == waves:
+        return ledger
+    updated = {**ledger, "wave_rows": wave_rows, "waves": waves}
+    if old_wave_rows != wave_rows:
+        # Precomputed per-wave key unions belong to the old wave boundary; drop them
+        # so _quant_tile_work rebuilds key coverage at the resolved wave_rows boundary.
+        updated.pop("wave_key_ranges", None)
+    return updated
+
+
 def _pool_wave_work(ledger, index):
     """Declared per-wave service of one 32-AIC window, in physical units."""
     rows = _wave_rows(int(ledger["query_rows"]), index, int(ledger["wave_rows"]))
@@ -400,26 +504,37 @@ class PoolKeyIndexerRecipe:
             _primitive_ms(context, "P15_rts_stars", "aic_first_issue_ns")
             + int(ledger["blocks"]) * _primitive_ms(context, "P13_crosscore_sync", "mode4_intra_block_ns")
         )
+        aic_owners = max(1, int(context.core_count))
+        owner_budget = max(1, min(aic_owners, int(context.effective_aic_cores or aic_owners)))
 
         def wave(index):
             parts = _pool_wave_work(ledger, index)
             stream = dict(parts["stream"])
             stream["hbm"] = (stream["hbm"] - float(ledger["wave_cache_bytes"])
                              + wave_hbm_cache)
+            active = max(1, min(int(parts["rows"]), owner_budget))
+            stream_place = _active_owner_placement(
+                context, active, aic_owners, ("mte2", "mte2_aic", "mte2_aiv"),
+            )
+            tiles_place = _active_owner_placement(
+                context, active, aic_owners, ("cube", "mte1", "vector"),
+            )
             return (
-                Stage("stream", context.bind(Work({}, stream))),
+                Stage("stream", context.bind(Work({}, stream)), placement=stream_place),
                 Stage("tiles", context.bind(Work(
                     {parts["dtype"]: parts["tiles"][parts["dtype"]]},
                     _matrix_free(parts["tiles"], parts["dtype"]))),
-                    after=("stream",)),
+                    after=("stream",), placement=tiles_place),
                 Stage("handoff", after=("tiles",), latency=handoff_ms),
             )
 
         selection = _pool_selection_work(ledger)
+        sel_active = max(1, min(int(ledger.get("query_rows", 1) or 1), owner_budget))
+        sel_place = _active_owner_placement(context, sel_active, aic_owners, ("vector", "mte3"))
         return KernelProgram((
             Stage("waves", program=PipelineProgram(waves, SERIAL_SLOTS, wave)),
             Stage("selection", context.bind(Work({}, dict(selection))),
-                  after=("waves",), latency=floor),
+                  after=("waves",), latency=floor, placement=sel_place),
         ))
 
 
@@ -464,13 +579,18 @@ def _quant_tile_work(ledger, index):
     start = block * POOL_KEY_BLOCK
     stop = start + POOL_KEY_BLOCK
     ranges = ledger.get("wave_key_ranges")
-    fragments = ranges[wave] if ranges is not None else ((0, start + valid),)
+    fragments = (
+        ranges[wave]
+        if ranges is not None and len(ranges) == int(ledger["waves"])
+        else ((0, start + valid),)
+    )
     unique = sum(max(0, min(hi, stop) - max(lo, start)) for lo, hi in fragments)
     query_heads = active_rows * heads if block == 0 else 0
     cube_input = (query_heads + unique) * width
     vector_input = (2 * query_heads + unique) * FP32_ELEMENT_BYTES
     return {
         "rows": rows,
+        "active_rows": active_rows,
         "valid_keys": valid,
         "cube": {
             "fp8_e4m3": float(tile_pairs) * 2.0 * heads * width,
@@ -524,11 +644,13 @@ class Arch35QuantIndexerRecipe:
             **context.service_modes, "hbm": mode})
 
     def build(self, op, geometry):
-        ledger = dict(dict(op.metadata).get(QUANT_LEDGER, {}))
+        raw_ledger = dict(dict(op.metadata).get(QUANT_LEDGER, {}))
+        core_count = int(getattr(geometry, "compute_units", 0) or 0)
+        ledger = _resolve_quant_ledger(raw_ledger, core_count)
         work = arch35_indexer_work(ledger)
         ub_cap = _geometry_ub_capacity(geometry)
         total_owners = int(
-            getattr(geometry, "compute_units", 0)
+            core_count
             or ledger.get("wave_rows", INDEXER_WAVE_ROWS)
             or INDEXER_WAVE_ROWS
         )
@@ -548,6 +670,7 @@ class Arch35QuantIndexerRecipe:
         return OperatorPlan(work, self.lower, metadata={
             "schedule": "quant_lightning_indexer_v2_arch35_blocks",
             "native_dispatch_reconstructed": False,
+            "wave_rows": ledger.get("wave_rows"),
             "waves": ledger.get("waves"),
             "blocks": ledger.get("blocks"),
             "owner_schedule": owner_schedule.to_dict(),
@@ -560,12 +683,16 @@ class Arch35QuantIndexerRecipe:
         })
 
     def lower(self, context):
-        ledger = dict(dict(context.op.metadata).get(QUANT_LEDGER, {}))
+        aic_owners = max(1, int(context.core_count))
+        owner_budget = max(1, min(aic_owners, int(context.effective_aic_cores or aic_owners)))
+        ledger = _resolve_quant_ledger(dict(dict(context.op.metadata).get(QUANT_LEDGER, {})), aic_owners)
         tiles = int(ledger["waves"]) * int(ledger["blocks"])
         floor = _primitive_ms(context, "P15_rts_stars", "aic_first_issue_ns")
         payload = int(ledger.get("payload_keys",
                                  ledger.get("completed_keys", ledger["keys"])))
         fill = float(payload) * int(ledger["key_row_bytes"])
+        indices_active = max(1, min(int(ledger.get("query_rows", 1) or 1), owner_budget))
+        indices_place = _active_owner_placement(context, indices_active, aic_owners, ("mte3",))
         if tiles == 0:
             # No completed key owns a block: only the INT32 index store runs.
             stages = []
@@ -574,18 +701,23 @@ class Arch35QuantIndexerRecipe:
                     "hbm": fill}))))
             stages.append(Stage("indices", context.bind(Work({}, {
                 "mte3": float(ledger["output_bytes"]),
-                "hbm": float(ledger["output_bytes"])})), latency=floor))
+                "hbm": float(ledger["output_bytes"])})), latency=floor, placement=indices_place))
             return KernelProgram(tuple(stages))
 
         def tile(index):
             parts = _quant_tile_work(ledger, index)
             cube, reduce = parts["cube"], parts["reduce"]
+            active = max(1, min(int(parts["active_rows"]), owner_budget))
+            operands_place = _active_owner_placement(
+                context, active, aic_owners, ("cube", "mte2_aic", "mte2_aiv"),
+            )
+            merge_place = _active_owner_placement(context, active, aic_owners, ("vector",))
             return (
                 Stage("operands", context.bind(Work(
                     {"fp8_e4m3": cube["fp8_e4m3"]},
-                    _matrix_free(cube, "fp8_e4m3")))),
+                    _matrix_free(cube, "fp8_e4m3"))), placement=operands_place),
                 Stage("topk_merge", context.bind(Work({}, dict(reduce))),
-                      after=("operands",)),
+                      after=("operands",), placement=merge_place),
             )
 
         return KernelProgram((
@@ -598,7 +730,7 @@ class Arch35QuantIndexerRecipe:
             Stage("indices", context.bind(Work({}, {
                 "mte3": float(ledger["output_bytes"]),
                 "hbm": float(ledger["output_bytes"])})),
-                after=("blocks",), latency=floor),
+                after=("blocks",), latency=floor, placement=indices_place),
         ))
 
 

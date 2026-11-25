@@ -12,11 +12,24 @@
 """
 from __future__ import annotations
 
+from typing import Literal
+
 from mindie_sim.primitives.loader import resolve_dispatch_envelope
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, Stage
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "vllm_ascend/ops/triton/qwen4_exp/hc.py",
+        "28c6c8c6f26ff6c92023334eaed86d3c8606200dd27a67446cef1d624a0c1f91",
+    ),
+)
 
 LOWRANK_HC_RECIPES: tuple[str, ...] = (
     "hc_gate_mix",
@@ -26,6 +39,7 @@ LOWRANK_HC_RECIPES: tuple[str, ...] = (
 )
 _ARCH35_IDS = frozenset({"npu_arch_3510", "dav_3510"})
 FP32_WORKING_BYTES = 4
+LOWRANK_HC_HIDDEN_TILE = 512
 _MS_PER_SECOND = 1000.0
 
 
@@ -46,6 +60,55 @@ def _op_rows(op: OpSpec) -> int:
     return rows
 
 
+def _ceil_div(value: int, divisor: int) -> int:
+    return (value + divisor - 1) // divisor
+
+
+def _hc_grid_dims(op: OpSpec) -> tuple[int, int]:
+    """Resolve ``(hc_mult, hidden_dim)`` from declared op metadata and shape."""
+    meta = dict(op.metadata)
+    view: dict = {}
+    for subgraph in meta.get("structure_subgraphs", ()) or ():
+        if isinstance(subgraph, dict) and isinstance(subgraph.get("tensor_view"), dict):
+            view = subgraph["tensor_view"]
+            break
+    raw_hc = view.get("hc") or meta.get("hc_mult") or meta.get("num_groups") or meta.get("hc") or 1
+    hc_mult = max(1, int(raw_hc))
+    raw_hidden = view.get("hidden") or meta.get("hidden") or meta.get("hidden_size") or 0
+    if raw_hidden:
+        hidden = max(1, int(raw_hidden))
+    elif len(op.local_shape) >= 2:
+        width = max(1, int(op.local_shape[-1]))
+        hidden = max(1, width // hc_mult) if op.recipe != "hc_gate_mix" else width
+    else:
+        hidden = 1
+    return hc_mult, hidden
+
+
+def _tile_weights(op: OpSpec, rows: int) -> tuple[int, ...]:
+    """Per-program active element counts matching upstream masked Triton tiles."""
+    hc_mult, hidden = _hc_grid_dims(op)
+    if op.recipe in {"grouped_gemma_rmsnorm", "hc_combine_rmsnorm"}:
+        return (hidden,) * (rows * hc_mult)
+    if op.recipe in {"hc_gate_mix", "hc_combine"}:
+        hidden_tiles = _ceil_div(hidden, LOWRANK_HC_HIDDEN_TILE)
+        col_widths = tuple(
+            min(LOWRANK_HC_HIDDEN_TILE, hidden - idx * LOWRANK_HC_HIDDEN_TILE)
+            for idx in range(hidden_tiles)
+        )
+        repeats = rows * (hc_mult if op.recipe == "hc_combine" else 1)
+        return col_widths * repeats
+    return (1,) * rows
+
+
+def _owner_shares(weights: tuple[int, ...], active_aiv: int) -> tuple[float, ...]:
+    total = float(sum(weights))
+    return tuple(
+        float(sum(weights[aiv_idx::active_aiv])) / total
+        for aiv_idx in range(active_aiv)
+    )
+
+
 def _build_fused_ub_resident_hc(op: OpSpec, geometry: Geometry, base: Work) -> OperatorPlan:
     """UB-resident fused low-rank HC plan conserving ``work_from_op``."""
     rows = _op_rows(op)
@@ -62,8 +125,10 @@ def _build_fused_ub_resident_hc(op: OpSpec, geometry: Geometry, base: Work) -> O
     hbm = float(op.hbm_bytes)
     vector = float(op.vector_ops)
     aiv_units = max(1, int((geometry.resource_units or {}).get("vector", 1)))
-    active_aiv = min(aiv_units, rows)
-    share = 1.0 / float(active_aiv)
+    weights = _tile_weights(op, rows)
+    programs = len(weights)
+    active_aiv = min(aiv_units, programs)
+    shares = _owner_shares(weights, active_aiv)
     matrix_work = dict(base.matrix)
 
     def program(context):
@@ -81,6 +146,7 @@ def _build_fused_ub_resident_hc(op: OpSpec, geometry: Geometry, base: Work) -> O
             if aiv_idx >= active_aiv:
                 branches.append(KernelProgram(()))
                 continue
+            share = shares[aiv_idx]
             owned = context.owned(aiv_idx, aiv_units, ("mte2_aiv", "vector", "mte3"))
             res: dict[str, float] = {}
             if hbm:
@@ -102,6 +168,7 @@ def _build_fused_ub_resident_hc(op: OpSpec, geometry: Geometry, base: Work) -> O
         "execution_class": "vector_aiv",
         "hc_variant": str(op.recipe),
         "fused_ub_resident": True,
+        "logical_programs": programs,
         "ub_compute_dtype": "fp32",
         "ub_working_bytes_per_elem": FP32_WORKING_BYTES,
     })
@@ -130,8 +197,11 @@ def build_lowrank_hc_vector(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     hbm = float(op.hbm_bytes)
     vector = float(op.vector_ops)
     aiv_units = max(1, int((geometry.resource_units or {}).get("vector", 1)))
-    active_aiv = min(aiv_units, rows)
-    share = 1.0 / float(active_aiv)
+    weights = _tile_weights(op, rows)
+    programs = len(weights)
+    active_aiv = min(aiv_units, programs)
+    shares = _owner_shares(weights, active_aiv)
+    concurrent_share = 1.0 / float(active_aiv)
 
     def program(context):
         caps: dict[str, float] = {}
@@ -148,7 +218,7 @@ def build_lowrank_hc_vector(op: OpSpec, geometry: Geometry) -> OperatorPlan:
                 if band.p50 is not None and float(band.p50) > 0.0:
                     strided_bps = float(band.p50)
             if strided_bps is not None and float(strided_bps) > 0.0:
-                caps[hbm_phys] = (float(strided_bps) / _MS_PER_SECOND) * share
+                caps[hbm_phys] = (float(strided_bps) / _MS_PER_SECOND) * concurrent_share
         setup_ms = 0.0
         if tbl is not None and dp is not None:
             env = resolve_dispatch_envelope(tbl, dp)
@@ -158,6 +228,7 @@ def build_lowrank_hc_vector(op: OpSpec, geometry: Geometry) -> OperatorPlan:
         def per_aiv(aiv_idx: int):
             if aiv_idx >= active_aiv:
                 return KernelProgram(())
+            share = shares[aiv_idx]
             owned = context.owned(aiv_idx, aiv_units, ("mte2_aiv", "vector", "mte3"))
             res: dict[str, float] = {}
             if hbm:
@@ -184,6 +255,7 @@ def build_lowrank_hc_vector(op: OpSpec, geometry: Geometry) -> OperatorPlan:
     return OperatorPlan(base, program, {
         "execution_class": "vector_aiv",
         "hc_variant": str(op.recipe),
+        "logical_programs": programs,
         "ub_compute_dtype": "fp32",
         "ub_working_bytes_per_elem": FP32_WORKING_BYTES,
     })

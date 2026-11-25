@@ -8,8 +8,10 @@
 """
 from collections.abc import Mapping
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import ProgramFragment, SemanticAttr, StateEffect
 from mindie_sim.schema.subgraphs import PortSet
 from mindie_sim.schema.tensors import TensorLayout, TensorValue
@@ -17,6 +19,16 @@ from mindie_sim.schema.tensors import TensorLayout, TensorValue
 from mindie_sim.prediction.operators.kda.kda_state_selection import (
     bind_state_value, binding_record, binding_value, decision_ports,
     state_ports, state_records, state_value,
+)
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "vllm_ascend/ops/kimi_kda.py",
+        "af37687463f9b34ca4797bdcefb14c333d3b70b2956d6aa1f15217815d5fbc10",
+    ),
 )
 
 _STATE_DTYPE_BYTES = {"bf16": 2, "fp16": 2, "fp32": 4}
@@ -60,19 +72,26 @@ def _conv_bindings(*, views, active, targets, contexts, history_slots, width,
     ready = _per_sequence(ready, count)
     grants = _per_sequence(grants, count)
     shape = (history_slots, width)
+    active_set = set(active)
     if values is None:
         produced = [None] * count
     elif isinstance(values, TensorValue):
         layout = tuple(values.layout.shape)
         if layout == shape and count == 1:
             produced = [values]
-        elif len(layout) == 3 and layout[0] == count and layout[1:] == shape:
-            produced = [values.narrow(0, index, 1) for index in range(count)]
-        elif (len(layout) == 3 and layout[1:] == shape
-              and all(slot is not None and slot < layout[0] for slot in slots
-                      if slot is not None)):
-            produced = [_narrow_window(values, slot, 1)
-                        for slot in slots]
+        elif len(layout) == 3 and layout[1:] == shape:
+            produced = []
+            for index in range(count):
+                if index not in active_set:
+                    produced.append(None)
+                    continue
+                slot = slots[index]
+                if slot is None and layout[0] == count:
+                    slot = index
+                if slot is None or slot < 0 or slot >= layout[0]:
+                    raise ModelingError(
+                        f"causal_conv_state_slot_out_of_bounds:{slot}:{layout[0]}")
+                produced.append(values.narrow(0, slot, 1))
         else:
             raise ModelingError(
                 f"causal_conv_state_pool_shape_mismatch:{layout}:{shape}")
@@ -164,6 +183,7 @@ def _candidate_bindings(*, read_bindings, records, active_targets, active_slots,
                         slots, layer_target, q_lens, speculative, kernel_width, width):
     write_bindings = []
     by_target = {binding["target"]: binding for binding in read_bindings}
+    committed_pairs = set(records["commit_records"])
     for target, version, record_slot in records["write_records"]:
         source = by_target[target]
         sequence = active_targets.index(target)
@@ -177,14 +197,13 @@ def _candidate_bindings(*, read_bindings, records, active_targets, active_slots,
             state_version=version, binding="static", binding_name="")
         write_rows = (2 + int(q_lens[view_index]) if speculative
                       else kernel_width - 1)
+        is_committed = (target, version) in committed_pairs
         write_bindings.append(bind_state_value(
             write_value, target=target, owner=source.get("owner", layer_target),
             slot=slot, version=version, ready=source.get("ready"),
             grant=source.get("grant"), generation=version,
-            decision=("token_commit" if version in records["commit_versions"]
-                      else None),
-            last_use=("next_conv_read" if version in records["commit_versions"]
-                      else "last_reader"),
+            decision=("token_commit" if is_committed else None),
+            last_use=("next_conv_read" if is_committed else "last_reader"),
             representation="history", required=True,
             span=((0, write_rows), (0, width))))
     return write_bindings
@@ -386,8 +405,14 @@ def state_fragments(op):
         attrs=(SemanticAttr("state_bindings", tuple(
             binding_record(binding) for binding in write_bindings)),)
         if write_bindings else ())
+    target_index = {
+        target: pos
+        for pos, target in enumerate(contract.get("targets", ()))
+        if target is not None
+    }
     commits = []
     for index, (target, version) in enumerate(contract["commit_records"]):
+        decision_idx = target_index.get(target, index)
         commits.append(ProgramFragment(
             f"{op.op_id}:state_commit:{index}",
             state_effects=(StateEffect(target, "commit", version, "",
@@ -395,9 +420,10 @@ def state_fragments(op):
             ports=decision_ports(target=target, version=version, owner=owner),
             attrs=(SemanticAttr("decision", {
                 "action": "commit", "target": target, "version": version,
-                "event": _decision_name(contract, index)}),)))
+                "event": _decision_name(contract, decision_idx)}),)))
     rollbacks = []
     for index, (target, version) in enumerate(contract["rollback_records"]):
+        decision_idx = target_index.get(target, index)
         rollbacks.append(ProgramFragment(
             f"{op.op_id}:state_rollback:{index}",
             state_effects=(StateEffect(target, "rollback", version, "",
@@ -406,7 +432,7 @@ def state_fragments(op):
                                 action="rollback"),
             attrs=(SemanticAttr("decision", {
                 "action": "rollback", "target": target, "version": version,
-                "event": _decision_name(contract, index)}),)))
+                "event": _decision_name(contract, decision_idx)}),)))
     return {"read": read, "write": write,
             "commits": tuple(commits), "rollbacks": tuple(rollbacks)}
 
@@ -429,8 +455,6 @@ def state_accesses(op):
         return ()
     width = int(contract.get("conv_width", 0) or 0)
     byte = _STATE_DTYPE_BYTES.get(str(contract.get("state_dtype", "bf16")), 2)
-    rebase = dict(op.metadata).get("history_rebase_op")
-    ready = tuple(contract.get("state_ready", ()))
     grants = tuple(contract.get("state_grants", ()))
     read_bindings = tuple(contract.get("read_bindings", ()))
     targets = tuple(contract["targets"])
@@ -466,7 +490,7 @@ def state_accesses(op):
             "grant_ready": binding.get("grant"),
             "last_use_event": "before_short_convolution",
         }
-        if rebase:
+        if history.get("rebase"):
             rows = int(contract["kernel_width"]) - 1
             start_row = 0
             result.append({
@@ -506,41 +530,52 @@ def state_accesses(op):
                 "window": (0, reload_rows),
                 "decision_event": None,
             })
-    committed = set(contract.get("commit_versions", ()))
+    committed_pairs = {
+        (target, version)
+        for target, version in contract.get("commit_records", ())
+    }
     decisions = tuple(contract.get("state_decisions", ()))
+    write_groups: dict[str, list[dict]] = {}
     for binding in tuple(contract.get("write_bindings", ())):
-        index = target_index[binding["target"]]
+        write_groups.setdefault(binding["target"], []).append(binding)
+    for target, group in write_groups.items():
+        primary = next(
+            (item for item in group if (target, item["state_version"]) in committed_pairs),
+            group[-1],
+        )
+        index = target_index[target]
         request = str(getattr(op, "requests", ())[index]) if index < len(
             getattr(op, "requests", ())) else str(index)
         q = int(contract["queries"][index])
-        version = binding["state_version"]
+        version = primary["state_version"]
         rows = 2 + q if bool(contract["speculative"]) else (
             int(contract["kernel_width"]) - 1)
-        slot = binding.get("slot")
-        commit = version in committed
+        slot = primary.get("slot")
+        commit = (target, version) in committed_pairs
         decision_event = decisions[index] if index < len(decisions) else None
         result.append({
             "occurrence": f"{op.op_id}:write:{index}:{version}",
-            "producer": binding["producer"], "request": request,
+            "producer": primary["producer"], "request": request,
             "stage": op.stage, "layer": op.layer, "direction": "write",
-            "position": "state", "output": binding["target"],
-            "storage": binding["storage"],
-            "owner": binding.get("owner", f"kda.layer[{op.layer}]"),
+            "position": "state", "output": target,
+            "storage": primary["storage"],
+            "owner": primary.get("owner", f"kda.layer[{op.layer}]"),
             "representation": "history", "persistent": True,
             "temporary": False, "state_version": version,
+            "candidate_versions": tuple(item["state_version"] for item in group),
             "span": ((0, rows), (0, width)),
             "bytes": float(rows * width * byte),
-            "source": binding["producer"], "reader": "",
-            "grant": binding.get("grant") or "",
+            "source": primary["producer"], "reader": "",
+            "grant": primary.get("grant") or "",
             "decision": ("token_commit" if commit else "candidate_hold"),
             "last_use": ("next_conv_read" if commit else "last_reader"),
             "rank": None, "scope": "target", "generation": version,
-            "slot": slot, "offset": binding.get("offset"),
-            "physical_key": f"{binding['storage']}:slot:{slot}",
+            "slot": slot, "offset": primary.get("offset"),
+            "physical_key": _slot_storage(primary["storage"], slot),
             "request_slot": slot, "rows": rows, "row_stride": width,
-            "tier": binding.get("tier", "hbm"),
-            "source_ready": binding.get("ready"),
-            "grant_ready": binding.get("grant"),
+            "tier": primary.get("tier", "hbm"),
+            "source_ready": primary.get("ready"),
+            "grant_ready": primary.get("grant"),
             "decision_event": decision_event,
             "window": (0, rows),
             "last_use_event": ("next_conv_read" if commit else "last_reader"),

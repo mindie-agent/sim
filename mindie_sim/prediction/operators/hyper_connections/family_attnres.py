@@ -18,10 +18,11 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from typing import Any, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 from mindie_sim.backends.abi_registry import default_abi_registry
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import (
     KernelBinding,
     OpSpec,
@@ -45,6 +46,9 @@ from .common import (
     attnres_spec_terms,
 )
 
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCE_REFS: tuple[SourceRef, ...] = ATTNRES_CALLER_SOURCES
 
 IMPLEMENTATION = "vllm_ascend_attn_res_prefix"
 RECIPE = "attn_res_fwd"
@@ -307,7 +311,7 @@ def _cache_output_norm(view, ub_bytes):
     if view["tokens_per_core"] <= 1:
         return False
     fit = estimate_ub_bytes(view["valid_blocks"] + 1, view["hidden"],
-                            view["resident"], True)
+                            view["resident"], bool(view["fuse_add"]))
     return fit + _align(view["hidden"], ELEM_BF16_BLOCK) * 2 <= ub_bytes
 
 
@@ -582,8 +586,11 @@ def point_metrics(view, ub_bytes, aiv, *, arch_family: str = ""):
     )
     ranges = dispatch["core_ranges"]
     per_core = dispatch["tokens_per_core"]
-    resident = max_resident_rows(hidden, ub_bytes, True)
-    resident = valid + 1 <= resident
+    fuse_add = bool(view["fuse_add"])
+    resident = valid + 1 <= max_resident_rows(hidden, ub_bytes, fuse_add)
+    if resident and estimate_ub_bytes(valid + 1, hidden, True, fuse_add) > ub_bytes:
+        # Exact aligned UB exceeds capacity on the boundary; fall back to reload.
+        resident = False
     ready = dict(view, resident=resident, used_cores=len(ranges),
                  launched_owners=dispatch["launched_owners"],
                  active_owners=dispatch["active_owners"],
@@ -591,7 +598,7 @@ def point_metrics(view, ub_bytes, aiv, *, arch_family: str = ""):
                  token_group_size=dispatch["token_group_size"],
                  tokens_per_core=per_core, core_ranges=ranges)
     ready["output_norm_cached"] = _cache_output_norm(ready, ub_bytes)
-    footprint = estimate_ub_bytes(valid + 1, hidden, resident)
+    footprint = estimate_ub_bytes(valid + 1, hidden, resident, fuse_add)
     if ready["output_norm_cached"]:
         footprint += _align(hidden, ELEM_BF16_BLOCK) * 2
     if footprint > ub_bytes:
@@ -611,29 +618,44 @@ def point_metrics(view, ub_bytes, aiv, *, arch_family: str = ""):
     vector = _vector_work(hidden, valid, mixing=mixing,
                           fuse_add=view["fuse_add"], output_norm=view["output_norm"])
     ready["vector_work_basis"] = vector
+    owners_per_token: dict[int, int] = {}
+    for start, _ in ranges:
+        owners_per_token[start] = owners_per_token.get(start, 0) + 1
+    token_rank: dict[int, int] = {}
+    row_mix_ops = (_SCORE_OPS_PER_ELEMENT + _WEIGHTED_MIX_OPS_PER_ELEMENT) * hidden + 2
     cores = []
-    seen_token_starts: set[int] = set()
     for start, count in ranges:
-        writes_output = start not in seen_token_starts
-        seen_token_starts.add(start)
-        read = (_BF16_BYTES * count * hidden
-                + (_BF16_BYTES * count * hidden if view["fuse_add"] else 0)
-                + ((_BF16_BYTES if resident else 2 * _BF16_BYTES) * count * valid * hidden
-                   if mixing else 0)
-                + (2 * _BF16_BYTES * hidden if mixing else 0)
-                + (_BF16_BYTES * hidden if ready["output_norm_cached"]
-                   else (_BF16_BYTES * count * hidden if view["output_norm"] else 0)))
+        rank = token_rank.get(start, 0)
+        token_rank[start] = rank + 1
+        primary = rank == 0
+        group_k = owners_per_token[start]
+        base_h, rem_h = divmod(valid, group_k)
+        owner_valid = base_h + (1 if rank < rem_h else 0)
+        read = (
+            (_BF16_BYTES * count * hidden if primary else 0)
+            + (_BF16_BYTES * count * hidden if (primary and view["fuse_add"]) else 0)
+            + ((_BF16_BYTES if resident else 2 * _BF16_BYTES) * count * owner_valid * hidden
+               if mixing else 0)
+            + (2 * _BF16_BYTES * hidden if mixing else 0)
+            + (_BF16_BYTES * hidden if ready["output_norm_cached"]
+               else (_BF16_BYTES * count * hidden if (primary and view["output_norm"]) else 0))
+        )
         write = (
             _BF16_BYTES * count * hidden * (
                 1 + int(view["fuse_add"]) + int(view["block_write_idx"] >= 0)
                 + int(view["save_materialized"]))
-            if writes_output else 0
+            if primary else 0
         )
+        if primary:
+            owner_token_vec = vector["per_token"] - ((valid - owner_valid) * row_mix_ops if mixing else 0)
+        else:
+            owner_token_vec = owner_valid * row_mix_ops if mixing else 0
         cores.append({
             "token_start": start, "token_count": count,
-            "writes_output": writes_output,
+            "writes_output": primary, "is_primary": primary,
+            "owner_valid_blocks": owner_valid,
             "read_bytes": read, "write_bytes": write,
-            "vector_ops": count * vector["per_token"] + vector["per_owner"],
+            "vector_ops": count * owner_token_vec + vector["per_owner"],
         })
     total_read = prefix_read + addend_read + bank_read + score_weights + gamma
     resources = {
@@ -1081,30 +1103,108 @@ class _AttnResPrefixProgram:
                       after=("reload_row",), previous=("mix_row",), placement=placement),
             )
 
-        stages = [
-            Stage(
+        stages: list[Stage] = []
+        if valid > 0:
+            stages.append(Stage(
                 "pass1_history", after=(prev,),
                 program=PipelineProgram(valid, ATTNRES_RELOAD_PIPELINE_SLOTS, _score_step),
-            ),
+            ))
+            pass1_prev = "pass1_history"
+        else:
+            pass1_prev = prev
+        stages.extend([
             Stage(
                 "pass1_prefix_score", score_one, latency=s_lat,
-                after=("pass1_history",), placement=placement,
+                after=(pass1_prev,), placement=placement,
             ),
             Stage(
                 "softmax",
                 context.bind(Work({}, {"vector": softmax_ops})),
                 latency=timings["softmax_ms"], after=("pass1_prefix_score",), placement=placement,
             ),
-            Stage(
+        ])
+        if valid > 0:
+            stages.append(Stage(
                 "pass2_history", after=("softmax",),
                 program=PipelineProgram(valid, ATTNRES_RELOAD_PIPELINE_SLOTS, _mix_step),
-            ),
-            Stage(
-                "pass2_prefix_mix", mix_one, latency=m_lat,
-                after=("pass2_history",), placement=placement,
-            ),
-        ]
+            ))
+            pass2_prev = "pass2_history"
+        else:
+            pass2_prev = "softmax"
+        stages.append(Stage(
+            "pass2_prefix_mix", mix_one, latency=m_lat,
+            after=(pass2_prev,), placement=placement,
+        ))
         return stages, "pass2_prefix_mix"
+
+    def _build_coop_secondary_stages(
+        self,
+        context: Any,
+        placement: dict[str, tuple[int, ...]],
+        timings: dict[str, Any],
+        *,
+        local_valid: int,
+        resident: bool,
+        row_bytes: float,
+        score_ops: float,
+        mix_ops: float,
+    ) -> tuple[Stage, ...]:
+        if local_valid <= 0:
+            return ()
+        read_caps = timings["read_caps"]
+        if resident:
+            hist_bytes = float(local_valid) * row_bytes
+            return (
+                Stage(
+                    "history_load",
+                    context.bind(Work({}, {"hbm": hist_bytes, self.role: hist_bytes})),
+                    placement=placement, caps=read_caps, coupled=True,
+                ),
+                Stage(
+                    "history_ub_copy",
+                    latency=float(local_valid) * timings["ub_copy_row_ms"],
+                    after=("history_load",), placement=placement,
+                ),
+                Stage(
+                    "score_rows",
+                    context.bind(Work({}, {"vector": float(local_valid) * score_ops})),
+                    latency=float(local_valid) * timings["score_row_ms"],
+                    after=("history_ub_copy",), placement=placement,
+                ),
+                Stage(
+                    "mix_rows",
+                    context.bind(Work({}, {"vector": float(local_valid) * mix_ops})),
+                    latency=float(local_valid) * timings["mix_row_ms"],
+                    after=("score_rows",), placement=placement,
+                ),
+            )
+        load_one = context.bind(Work({}, {"hbm": row_bytes, self.role: row_bytes}))
+        score_one = context.bind(Work({}, {"vector": score_ops}))
+        mix_one = context.bind(Work({}, {"vector": mix_ops}))
+        s_lat, m_lat = timings["score_row_ms"], timings["mix_row_ms"]
+
+        def _score_step(_i: int):
+            return (
+                Stage("load_row", load_one, previous=("load_row",),
+                      placement=placement, caps=read_caps, coupled=True),
+                Stage("score_row", score_one, latency=s_lat,
+                      after=("load_row",), previous=("score_row",), placement=placement),
+            )
+
+        def _mix_step(_i: int):
+            return (
+                Stage("reload_row", load_one, previous=("reload_row",),
+                      placement=placement, caps=read_caps, coupled=True),
+                Stage("mix_row", mix_one, latency=m_lat,
+                      after=("reload_row",), previous=("mix_row",), placement=placement),
+            )
+
+        return (
+            Stage("pass1_history", program=PipelineProgram(
+                local_valid, ATTNRES_RELOAD_PIPELINE_SLOTS, _score_step)),
+            Stage("pass2_history", after=("pass1_history",), program=PipelineProgram(
+                local_valid, ATTNRES_RELOAD_PIPELINE_SLOTS, _mix_step)),
+        )
 
     def _build_token_stages(
         self,
@@ -1113,10 +1213,13 @@ class _AttnResPrefixProgram:
         timings: dict[str, Any],
         *,
         writes_output: bool = True,
+        is_primary: bool = True,
+        owner_valid: int | None = None,
     ) -> tuple[Stage, ...]:
         view = self.view
         hidden = int(view["hidden"])
         valid = int(view["valid_blocks"])
+        local_valid = valid if owner_valid is None else int(owner_valid)
         mixing = bool(view["mix"] and valid > 0)
         resident = bool(view["resident"])
         fuse_add = bool(view["fuse_add"])
@@ -1135,6 +1238,14 @@ class _AttnResPrefixProgram:
         # while total declared vector work stays strictly conserved.
         score_ops = float((_SCORE_OPS_PER_ELEMENT + 1) * hidden + 2)
         mix_ops = float((_WEIGHTED_MIX_OPS_PER_ELEMENT - 1) * hidden)
+        if not is_primary:
+            if not mixing:
+                return ()
+            return self._build_coop_secondary_stages(
+                context, placement, timings,
+                local_valid=local_valid, resident=resident, row_bytes=row_bytes,
+                score_ops=score_ops, mix_ops=mix_ops,
+            )
         softmax_ops = float(ATTNRES_SOFTMAX_OPS_PER_ROW * (valid + 1) - 1)
         norm_ops = float(_OUTPUT_NORM_OPS_PER_ELEMENT * hidden + _OUTPUT_NORM_SCALAR_OPS)
         add_ops = float(_FUSED_ADD_OPS_PER_ELEMENT * hidden)
@@ -1154,22 +1265,24 @@ class _AttnResPrefixProgram:
             ))
             prev = "fused_add"
         if mixing and resident:
-            hist_bytes = float(valid) * row_bytes
-            stages.append(Stage(
-                "history_load",
-                context.bind(Work({}, {"hbm": hist_bytes, self.role: hist_bytes})),
-                after=(prev,), placement=placement, caps=read_caps, coupled=True,
-            ))
-            stages.append(Stage(
-                "history_ub_copy",
-                latency=float(valid) * timings["ub_copy_row_ms"],
-                after=("history_load",), placement=placement,
-            ))
+            if local_valid > 0:
+                hist_bytes = float(local_valid) * row_bytes
+                stages.append(Stage(
+                    "history_load",
+                    context.bind(Work({}, {"hbm": hist_bytes, self.role: hist_bytes})),
+                    after=(prev,), placement=placement, caps=read_caps, coupled=True,
+                ))
+                stages.append(Stage(
+                    "history_ub_copy",
+                    latency=float(local_valid) * timings["ub_copy_row_ms"],
+                    after=("history_load",), placement=placement,
+                ))
+                prev = "history_ub_copy"
             stages.append(Stage(
                 "score_rows",
-                context.bind(Work({}, {"vector": float(valid + 1) * score_ops})),
-                latency=float(valid + 1) * timings["score_row_ms"],
-                after=("history_ub_copy",), placement=placement,
+                context.bind(Work({}, {"vector": float(local_valid + 1) * score_ops})),
+                latency=float(local_valid + 1) * timings["score_row_ms"],
+                after=(prev,), placement=placement,
             ))
             stages.append(Stage(
                 "softmax",
@@ -1178,15 +1291,15 @@ class _AttnResPrefixProgram:
             ))
             stages.append(Stage(
                 "mix_rows",
-                context.bind(Work({}, {"vector": float(valid + 1) * mix_ops})),
-                latency=float(valid + 1) * timings["mix_row_ms"],
+                context.bind(Work({}, {"vector": float(local_valid + 1) * mix_ops})),
+                latency=float(local_valid + 1) * timings["mix_row_ms"],
                 after=("softmax",), placement=placement,
             ))
             prev = "mix_rows"
         elif mixing:
             reload_stages, prev = self._build_reload_stages(
                 context, placement, timings,
-                prev=prev, valid=valid, row_bytes=row_bytes,
+                prev=prev, valid=local_valid, row_bytes=row_bytes,
                 score_ops=score_ops, mix_ops=mix_ops, softmax_ops=softmax_ops,
             )
             stages.extend(reload_stages)
@@ -1263,13 +1376,17 @@ class _AttnResPrefixProgram:
             token_stages = self._build_token_stages(
                 context, placement, timings,
                 writes_output=bool(core.get("writes_output", True)),
+                is_primary=bool(core.get("is_primary", True)),
+                owner_valid=core.get("owner_valid_blocks"),
             )
             count = int(core["token_count"])
-            stages.append(Stage(
-                "tokens", after=(prev,),
-                program=PipelineProgram(count, 1, lambda _idx, ts=token_stages: ts),
-            ))
-            stages.append(Stage("ub_release", after=("tokens",), free=allocation))
+            if token_stages and count > 0:
+                stages.append(Stage(
+                    "tokens", after=(prev,),
+                    program=PipelineProgram(count, 1, lambda _idx, ts=token_stages: ts),
+                ))
+                prev = "tokens"
+            stages.append(Stage("ub_release", after=(prev,), free=allocation))
             programs.append(KernelProgram(tuple(stages)))
         return ParallelProgram(tuple(programs))
 

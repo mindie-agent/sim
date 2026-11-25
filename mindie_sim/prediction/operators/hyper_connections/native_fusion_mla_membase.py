@@ -13,10 +13,23 @@
 [Side-Effect Policy] Returns plans/metadata only; no device or file access.
 """
 from dataclasses import dataclass
+from typing import Literal
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+ALLOWED_ARCHS: frozenset[str] = frozenset({"npu_arch_2201"})
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        "cann/ops-transformer",
+        "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "attention/mla_prolog_v3/op_kernel/mla_prolog_v3.cpp",
+        "d3c82f11d11de218b21687efa80ab20e64a9038d06da8e42061b7ec02a66f0cb",
+    ),
+)
 
 
 PROFILE = "mla_prolog_arch22_fullquant_a3925fd4"
@@ -215,8 +228,21 @@ class SourceGeometry:
         return tuple(runs)
 
 
+def _require_arch22(device) -> None:
+    dp_arch = getattr(getattr(device, "datapath", None), "compute_arch", None)
+    compute_arch = dp_arch or getattr(device, "compute_arch", None)
+    arch_id = str(
+        getattr(compute_arch, "arch_id", "")
+        or getattr(compute_arch, "preset", "")
+        or ""
+    ).strip().lower()
+    if arch_id and arch_id not in ALLOWED_ARCHS:
+        raise ModelingError(f"{PROFILE}_requires_arch22:{arch_id}")
+
+
 def geometry(view, device):
     """Reproduce FillMatmul1..4Tiling and the vector-block ownership."""
+    _require_arch22(device)
     sizes = validate_declared_view(view)
     tokens = sizes["tokens"]
     if tokens < 1:
