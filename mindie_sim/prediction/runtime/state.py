@@ -58,14 +58,6 @@ class _LazyTraceDeque:
             "coupled": coupled,
         }
 
-    def _materialize_all(self):
-        dq = self._dq
-        for i in range(len(dq)):
-            r = dq[i]
-            if r.__class__ is not dict:
-                dq[i] = self._to_dict(r)
-        return dq
-
     def append(self, item) -> None:
         self._dq.append(item)
 
@@ -79,18 +71,13 @@ class _LazyTraceDeque:
         return bool(self._dq)
 
     def __iter__(self):
-        return iter(self._materialize_all())
+        return (self._to_dict(r) for r in self._dq)
 
     def __reversed__(self):
-        return reversed(self._materialize_all())
+        return (self._to_dict(r) for r in reversed(self._dq))
 
     def __getitem__(self, index):
-        dq = self._dq
-        r = dq[index]
-        if r.__class__ is not dict:
-            r = self._to_dict(r)
-            dq[index] = r
-        return r
+        return self._to_dict(self._dq[index])
 
     def __eq__(self, other):
         if isinstance(other, (_LazyTraceDeque, deque, list)):
@@ -98,7 +85,7 @@ class _LazyTraceDeque:
         return NotImplemented
 
     def __repr__(self) -> str:
-        return repr(self._materialize_all())
+        return repr(deque((self._to_dict(r) for r in self._dq), maxlen=self.maxlen))
 
 
 class _LazyAllocTraceDeque:
@@ -125,14 +112,6 @@ class _LazyAllocTraceDeque:
             "task": tname,
         }
 
-    def _materialize_all(self):
-        dq = self._dq
-        for i in range(len(dq)):
-            r = dq[i]
-            if r.__class__ is not dict:
-                dq[i] = self._to_dict(r)
-        return dq
-
     def append(self, item) -> None:
         self._dq.append(item)
 
@@ -146,18 +125,13 @@ class _LazyAllocTraceDeque:
         return bool(self._dq)
 
     def __iter__(self):
-        return iter(self._materialize_all())
+        return (self._to_dict(r) for r in self._dq)
 
     def __reversed__(self):
-        return reversed(self._materialize_all())
+        return (self._to_dict(r) for r in reversed(self._dq))
 
     def __getitem__(self, index):
-        dq = self._dq
-        r = dq[index]
-        if r.__class__ is not dict:
-            r = self._to_dict(r)
-            dq[index] = r
-        return r
+        return self._to_dict(self._dq[index])
 
     def __eq__(self, other):
         if isinstance(other, (_LazyAllocTraceDeque, deque, list)):
@@ -165,7 +139,7 @@ class _LazyAllocTraceDeque:
         return NotImplemented
 
     def __repr__(self) -> str:
-        return repr(self._materialize_all())
+        return repr(deque((self._to_dict(r) for r in self._dq), maxlen=self.maxlen))
 
 
 class RuntimeState:

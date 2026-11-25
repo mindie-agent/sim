@@ -15,6 +15,11 @@ import heapq
 from typing import Callable, Sequence
 
 from . import frontier
+from ._engine_hbm_bus import (
+    _hbm_bus_split_start_hook,
+    _hbm_split_child_names,
+    _task_needs_hbm_bus_split,
+)
 from .contracts import OccurrenceKey
 from .engine_prepare import _refresh_prepared_for_hbm_bus
 from .engine_types import (
@@ -22,9 +27,28 @@ from .engine_types import (
     _chain_callbacks,
 )
 from .memory_physics import (
-    AdmissionMemoryView, CACHE_POLICY_DISABLE, CACHE_POLICY_LAST_USE, SectorCoverage, bind_memory_access,
+    AddressRun, AddressRunPlan, AdmissionMemoryView, CACHE_POLICY_DISABLE,
+    CACHE_POLICY_LAST_USE, PeriodicSectorRun, SectorCoverage, _align_up,
+    _measure_byte_intervals, _merge_byte_intervals, _run_is_sector_contiguous,
+    _subtract_byte_intervals, bind_memory_access, burst_turnaround_efficiency,
 )
-from .l2_residency import _coverage_overlap, _coverage_runs, _merged_bytes, _residency_runs
+from .l2_residency import (
+    _ResidentL2Entry, _access_plan, _cov_bytes, _cov_overlap,
+    _coverage_runs, _residency_runs,
+)
+
+
+def _coalesce_deliveries(deliveries) -> tuple[tuple[str, float], ...]:
+    """Sum duplicate delivery counter declarations while preserving first-seen order."""
+    if not deliveries:
+        return ()
+    totals: dict[str, float] = {}
+    for cid, amt in deliveries:
+        val = float(amt)
+        if val > 0.0:
+            key = str(cid)
+            totals[key] = totals.get(key, 0.0) + val
+    return tuple(totals.items())
 
 
 def _backing_identity(pattern) -> tuple[int, str, int]:
@@ -90,10 +114,7 @@ class _EngineSubmitMixin:
         event = Event(self._sequence, name, runtime_uid=self.uid)
         waiting_count = (1 if pending_one is not None
                          else (0 if pending is None else len(pending)))
-        deliv_tuple = (
-            tuple((str(cid), float(amt)) for cid, amt in deliveries if float(amt) > 0.0)
-            if deliveries else ()
-        )
+        deliv_tuple = _coalesce_deliveries(deliveries)
         wave_rec = self._wave_recorder
         task = _Task(
             event, prepared.demand.copy() if prepared.demand else {},
@@ -115,6 +136,9 @@ class _EngineSubmitMixin:
             prepared.hbm_accounting,
             {} if prepared.hbm_accounting else None,
         )
+        needs_hbm_split = _task_needs_hbm_bus_split(task)
+        if needs_hbm_split and task.start_callback is None:
+            task.start_callback = _hbm_bus_split_start_hook
         tasks[event.sequence] = task
         if deliv_tuple:
             self._delivery_live += 1
@@ -126,12 +150,29 @@ class _EngineSubmitMixin:
                 else (tuple(p.sequence for p in pending) if pending is not None else ())
             )
             occ = the_metadata.get("occurrence") if the_metadata else None
+            op_occ = the_metadata.get("op_occ") if the_metadata else None
             wave_rec.on_submit(
                 event.sequence, name,
                 aliases=(owner,) if owner else (),
                 predecessors=preds,
                 occurrence=occ,
+                op_occ=op_occ,
             )
+            if needs_hbm_split:
+                pre_children = []
+                for c_name in _hbm_split_child_names(name, task.remaining, task.hbm_accounting):
+                    self._sequence += 1
+                    c_ev = Event(self._sequence, c_name, runtime_uid=self.uid)
+                    pre_children.append(c_ev)
+                    wave_rec.on_submit(
+                        c_ev.sequence, c_name,
+                        aliases=(owner,) if owner else (),
+                        predecessors=preds,
+                        occurrence=occ,
+                        op_occ=op_occ,
+                        parent_task_id=event.sequence,
+                    )
+                task.split_children = tuple(pre_children)
         if self.task_uses_fifo(task):
             self._fifo_live += 1
         if self.task_blocks_native(task):
@@ -162,6 +203,7 @@ class _EngineSubmitMixin:
             return event
         if (accel is not None
                 and accel.eligible(self, task)
+                and not _task_needs_hbm_bus_split(task)
                 and len(self._native_seqs) == len(tasks) - 1):
             pending_tup = ((pending_one,) if pending_one is not None
                            else (tuple(pending) if pending is not None else ()))
@@ -511,12 +553,12 @@ class _EngineSubmitMixin:
         if bound.l2_row_id and bound.l2_row_id in self.resources:
             res_rates[bound.l2_row_id] = self.resources[bound.l2_row_id].rate
         raw_work = bound.stage_work(resource_rates=res_rates)
-        if bound.l2_row_id and bound.l2_row_id not in self.resources:
-            raw_work.pop(bound.l2_row_id, None)
+        for row_id in raw_work:
+            if row_id not in self.resources:
+                raise ExecutionError(f"resource_missing:{row_id}")
         place = {k: tuple(v) for k, v in bound.stage_placement().items() if k in raw_work}
-        delivs = tuple(
-            (str(c.counter_id), float(c.work_per_progress))
-            for c in bound.deliveries if float(c.work_per_progress) > 0.0
+        delivs = _coalesce_deliveries(
+            (c.counter_id, c.work_per_progress) for c in bound.deliveries
         )
         return raw_work, place, delivs
 
@@ -553,19 +595,24 @@ class _EngineSubmitMixin:
                                             owner=owner, priority=priority)
 
         if not isinstance(memory_state, AdmissionMemoryView) or bound.bind_config is None:
-            return self._submit_custom_access(name, bound, memory_state, pattern, after, release, owner, priority)
+            return self._submit_custom_access(
+                name, bound, memory_state, pattern, after, release, owner, priority,
+                on_delivery=on_delivery,
+            )
 
         done = self.future(name)
         aligned = bound.ledger.aligned_transfer_bytes
         bus = bound.bind_config[0]
+        burst_rules = bound.bind_config[6]
         admit_extra = 0
 
         def admit(event, pat=None):
             nonlocal admit_extra
             if pat is None:
                 pat = pattern() if callable(pattern) else pattern
-            resident = memory_state.resident_coverage_for(pat, aligned)
-            coverage = pat.runs.sector_coverage()
+            pat_aligned = pat.runs.aligned_copy_bytes() if callable(pattern) else aligned
+            resident = memory_state.resident_coverage_for(pat, pat_aligned)
+            coverage, working_set = memory_state.access_geometry(pat, pat_aligned)
             wb_die, wb_alloc, wb_ver = _backing_identity(pat)
             if pat.direction == "read" and not coverage.empty:
                 pending_wbs = memory_state.pop_matching_writebacks(wb_die, wb_alloc, wb_ver, coverage)
@@ -579,7 +626,7 @@ class _EngineSubmitMixin:
                     admit_extra += sum(item.bytes for item in pending_wbs)
                     self._launch_access_writebacks(
                         name + ":dirty_writeback", wb_entries, (event,),
-                        memory_state, bus, owner, priority)
+                        memory_state, bus, owner, priority, burst_rules=burst_rules)
                 wbs = getattr(self, "_inflight_writebacks", None)
                 wb_pending = wbs.get((memory_state, wb_die, wb_alloc, wb_ver)) if wbs else None
                 wb_waits = _overlapping_writebacks(wb_pending, coverage, resident) if wb_pending else ()
@@ -598,15 +645,17 @@ class _EngineSubmitMixin:
 
             key = pat.reuse_key
             identity = None
-            cacheable = key is not None and aligned > 0 and pat.cache_policy != CACHE_POLICY_DISABLE
+            cacheable = key is not None and pat_aligned > 0 and pat.cache_policy != CACHE_POLICY_DISABLE
             if cacheable and key.die == pat.die and pat.direction == "read":
                 identity = memory_state, key.die, key.backing_allocation, key.tensor_version
             fills = getattr(self, "_inflight_l2_fills", None)
             pending = fills.get(identity) if fills else None
-            working_set = max(aligned if pat.reuse_distance_bytes is None else pat.reuse_distance_bytes,
-                              _merged_bytes(coverage))
-            waits = (_overlapping_fills(pending, coverage, resident)
-                     if pending and working_set <= memory_state._preview_effective_l2(key) else ())
+            eff_l2 = memory_state._preview_effective_l2(key) if key is not None else 0
+            can_fill = (
+                eff_l2 > 0
+                and memory_state._hit_fraction(working_set, eff_l2, die=key.die) > 0.0
+            ) if key is not None else False
+            waits = _overlapping_fills(pending, coverage, resident) if pending and can_fill else ()
             if waits:
                 def retry(ready):
                     # Primitive callers may name different reuse streams for
@@ -630,8 +679,10 @@ class _EngineSubmitMixin:
             if not ledger.l2_hit_bytes:
                 resident = SectorCoverage()
             fill = None
-            if identity is not None and ledger.dram_sector_bytes and pat.cache_policy != CACHE_POLICY_LAST_USE:
-                if working_set <= memory_state._preview_effective_l2(key):
+            retains_fill = not (memory_state.arch_id is None and pat.cache_policy == CACHE_POLICY_LAST_USE)
+            if identity is not None and ledger.dram_sector_bytes and retains_fill:
+                eff_post = memory_state._preview_effective_l2(key)
+                if eff_post > 0 and memory_state._hit_fraction(working_set, eff_post, die=key.die) > 0.0:
                     fill = self.future(name + ":l2_fill")
                     if fills is None:
                         fills = self._inflight_l2_fills = {}
@@ -661,7 +712,7 @@ class _EngineSubmitMixin:
                 if entries:
                     self._launch_access_writebacks(
                         name + ":dirty_writeback", entries, (transfer,),
-                        memory_state, bus, owner, priority,
+                        memory_state, bus, owner, priority, burst_rules=burst_rules,
                         on_done=lambda: publish(admit_extra + extra))
                 else:
                     publish(admit_extra)
@@ -674,9 +725,17 @@ class _EngineSubmitMixin:
         return done
 
     def _launch_access_writebacks(
-        self, tag, entries, after_events, memory_state, bus, owner, priority, on_done=None,
+        self, tag, entries, after_events, memory_state, bus, owner, priority,
+        *, burst_rules=(), on_done=None,
     ):
-        total = sum(amt for _, _, _, _, amt in entries)
+        total_payload = sum(amt for _, _, _, _, amt in entries)
+        total_service = 0.0
+        for die, _, _, cov, amt in entries:
+            spec = bus.memory_access or (
+                memory_state.memory_access_for(die)
+                if isinstance(memory_state, AdmissionMemoryView) else None
+            )
+            total_service += _writeback_service_bytes(cov, amt, spec, burst_rules)
         wb_done = self.future(tag + ":done")
         wbs = getattr(self, "_inflight_writebacks", None)
         if wbs is None:
@@ -700,22 +759,39 @@ class _EngineSubmitMixin:
             if on_done is not None:
                 on_done()
 
-        work = {term.row_id: term.ms_per_progress for term in bus.terms_for("write", total)
+        work = {term.row_id: term.ms_per_progress for term in bus.terms_for("write", total_service)
                 if term.ms_per_progress}
         self.submit(tag, work, after=after_events, owner=owner, priority=priority,
-                    coupled=len(work) > 1, deliveries=((bus.ctr_w, total),),
+                    coupled=len(work) > 1, deliveries=((bus.ctr_w, total_payload),),
                     on_complete=finish, native_hook=True)
         return wb_done
 
-    def _submit_custom_access(self, name, bound, state, pattern, after, release, owner, priority):
-        """Keep caller-owned admission protocols at their original start boundary."""
+    def _submit_custom_access(
+        self, name, bound, state, pattern, after, release, owner, priority, *, on_delivery=None,
+    ):
+        """Preview custom admission state at start and settle residency strictly at completion."""
         work, placement, deliveries = self._bound_access_work_and_place(bound)
+        is_view = isinstance(state, AdmissionMemoryView)
+        live_pat = None
+        live_ledger = bound.ledger
+        live_resident = SectorCoverage()
+        live_cov = SectorCoverage()
+        done = self.future(name) if is_view else None
 
         def admit(event):
+            nonlocal live_pat, live_ledger, live_resident, live_cov
+            pat = pattern() if callable(pattern) else pattern
+            live_pat = pat
+            if is_view:
+                pat_aligned = pat.runs.aligned_copy_bytes() if callable(pattern) else bound.ledger.aligned_transfer_bytes
+                live_resident = state.resident_coverage_for(pat, pat_aligned)
+                live_cov, _ = state.access_geometry(pat, pat_aligned)
+                if not bound.ledger.l2_hit_bytes:
+                    live_resident = SectorCoverage()
             if bound.bind_config is None:
-                state.admit_access(pattern, bound.ledger.aligned_transfer_bytes)
                 return
-            live = _rebind_access(bound, pattern, state, commit=True)
+            live = _rebind_access(bound, pat, state, commit=False)
+            live_ledger = live.ledger
             live_work, live_place, live_deliveries = self._bound_access_work_and_place(live)
             task = self._tasks[event.sequence]
             had_fifo, had_deliveries = self.task_uses_fifo(task), bool(task.deliveries)
@@ -725,10 +801,52 @@ class _EngineSubmitMixin:
             self._fifo_live += self.task_uses_fifo(task) - had_fifo
             self._delivery_live += bool(live_deliveries) - had_deliveries
 
-        return self.submit(
+        def settle(transfer):
+            pat = live_pat if live_pat is not None else (pattern() if callable(pattern) else pattern)
+            if not is_view:
+                state.admit_access(pat, live_ledger.aligned_transfer_bytes)
+                if on_delivery is not None:
+                    on_delivery(live_ledger, SectorCoverage(), 0)
+                return
+            extra_self = _settle_access(state, pat, live_ledger, live_resident, live_cov)
+            drained = state.drain_writebacks(pat.die)
+            wb_die, wb_alloc, wb_ver = _backing_identity(pat)
+            entries = []
+            if extra_self:
+                entries.append((wb_die, wb_alloc, wb_ver, live_cov, extra_self))
+            for item in drained:
+                item_cov = item.coverage if not item.coverage.empty else SectorCoverage(intervals=item.ranges)
+                entries.append((item.die, item.key.backing_allocation, item.key.tensor_version, item_cov, item.bytes))
+            extra = sum(amt for _, _, _, _, amt in entries)
+            if entries:
+                bus = next((b for b in self._hbm_bus_aliases.values() if b.die == pat.die), None)
+                if bus is None:
+                    raise ExecutionError(f"dirty_writeback_requires_hbm_bus:d{pat.die}:{extra}")
+                self._launch_access_writebacks(
+                    name + ":dirty_writeback", entries, (transfer,),
+                    state, bus, owner, priority,
+                    on_done=lambda: _finish_custom_view(extra),
+                )
+            else:
+                _finish_custom_view(0)
+
+        def _finish_custom_view(extra):
+            if on_delivery is not None:
+                on_delivery(live_ledger, live_resident, extra)
+            self.resolve(done)
+
+        needs_start = is_view or bound.bind_config is not None or callable(pattern)
+        ev = self.submit(
             name, work=work, after=after, release=release, owner=owner, priority=priority,
-            placement=placement, coupled=bool(work), on_start=admit, deliveries=deliveries,
+            placement=placement, coupled=bool(work),
+            on_start=admit if needs_start else None,
+            on_complete=settle,
+            native_hook=not needs_start,
+            deliveries=deliveries,
         )
+        if done is not None:
+            return done
+        return ev
 
     def _submit_access_flow(self, name, bound, *, after, owner, priority, release=None, callback=None):
         work, placement, deliveries = self._bound_access_work_and_place(bound)
@@ -757,16 +875,61 @@ def _rebind_access(bound, pattern, state, *, commit):
     )
 
 
+def _writeback_service_bytes(cov: SectorCoverage, payload_amt: int, spec, burst_rules) -> float:
+    """Compute representation-invariant burst-aligned HBM write service bytes."""
+    burst = int(getattr(spec, "hbm_burst_granule_bytes", 0) or 0)
+    if cov.empty or (burst <= 0 and not burst_rules):
+        return float(payload_amt)
+    has_gaps = bool(cov.periodic) or len(cov.intervals) > 1
+    payload_svc = 0.0
+    if has_gaps and burst > 0:
+        burst_ivs = [((lo // burst) * burst, _align_up(hi, burst)) for lo, hi in cov.intervals]
+        burst_per: list[PeriodicSectorRun] = []
+        for pr in cov.periodic:
+            run = AddressRun(pr.base_byte, pr.rows, pr.row_bytes, pr.stride_bytes)
+            if _run_is_sector_contiguous(run, burst):
+                end_b = pr.base_byte + (pr.rows - 1) * pr.stride_bytes + pr.row_bytes
+                burst_ivs.append(((pr.base_byte // burst) * burst, _align_up(end_b, burst)))
+            else:
+                burst_per.append(
+                    PeriodicSectorRun(pr.base_byte, pr.rows, pr.row_bytes, pr.stride_bytes, burst).canonical()
+                )
+        burst_cov = SectorCoverage(
+            intervals=_merge_byte_intervals(burst_ivs) if burst_ivs else (),
+            periodic=tuple(dict.fromkeys(burst_per)),
+        )
+        payload_svc = float(burst_cov.measure_bytes())
+    elif cov.intervals:
+        payload_svc = float(_measure_byte_intervals(cov.intervals))
+    if burst_rules:
+        rule_svc = 0.0
+        for pr in cov.periodic:
+            eff = burst_turnaround_efficiency(pr.row_bytes, pr.stride_bytes, burst_rules)
+            rule_svc += pr.total_bytes() / eff
+        ivs = cov.intervals
+        n_ivs = len(ivs)
+        for idx, (lo, hi) in enumerate(ivs):
+            width = hi - lo
+            stride = (
+                (ivs[idx + 1][0] - lo) if idx + 1 < n_ivs
+                else ((lo - ivs[idx - 1][0]) if idx > 0 else width)
+            )
+            rule_svc += width / burst_turnaround_efficiency(width, stride, burst_rules)
+        payload_svc = max(payload_svc, rule_svc)
+    scale_svc = float(_measure_byte_intervals(cov.scale_intervals)) if cov.scale_intervals else 0.0
+    return max(float(payload_amt), payload_svc + scale_svc)
+
+
 def _overlapping_writebacks(pending, requested, resident):
     waits = []
     for done, wb_cov in pending.items():
-        overlap = _coverage_overlap(requested, wb_cov)
+        overlap = _cov_overlap(requested, wb_cov)
         if overlap:
             if resident.empty:
                 waits.append(done)
             else:
-                excluded = (_coverage_overlap(requested, resident) + _coverage_overlap(wb_cov, resident)
-                            - _coverage_overlap(requested.union(wb_cov), resident))
+                excluded = (_cov_overlap(requested, resident) + _cov_overlap(wb_cov, resident)
+                            - _cov_overlap(requested.union(wb_cov), resident))
                 if overlap > excluded:
                     waits.append(done)
     return tuple(waits)
@@ -775,33 +938,96 @@ def _overlapping_writebacks(pending, requested, resident):
 def _overlapping_fills(pending, requested, resident):
     waits = []
     for done, (filling, previously_resident) in pending.items():
-        overlap = _coverage_overlap(requested, filling)
+        overlap = _cov_overlap(requested, filling)
         if overlap:
             available = resident.union(previously_resident)
-            excluded = (_coverage_overlap(requested, available) + _coverage_overlap(filling, available)
-                        - _coverage_overlap(requested.union(filling), available))
+            excluded = (_cov_overlap(requested, available) + _cov_overlap(filling, available)
+                        - _cov_overlap(requested.union(filling), available))
             if overlap > excluded:
                 waits.append(done)
     return tuple(waits)
+
+
+def _admit_cold_scale_intervals(state, pattern, scale_ivs, aligned) -> None:
+    """Admit cold scale-only sectors when payload sectors were warm and evicted in flight."""
+    key = state._key(pattern, aligned)
+    if key is None:
+        return
+    state._activate_key(key)
+    eff = state.effective_l2_bytes(key.die)
+    legacy_last = state.arch_id is None and pattern.cache_policy == CACHE_POLICY_LAST_USE
+    scale_cov = SectorCoverage(scale_intervals=scale_ivs, _canonical=True)
+    scale_bytes = _measure_byte_intervals(scale_ivs)
+    spec = state.memory_access_for(pattern.die)
+    line = (
+        pattern.runs.l2_line_bytes or getattr(spec, "l2_line_bytes", None)
+        or pattern.runs.l2_sector_bytes or getattr(spec, "l2_sector_bytes", None)
+    )
+    footprint = state._footprint(scale_cov, line)
+    ws = footprint if pattern.reuse_distance_bytes is None else max(pattern.reuse_distance_bytes, footprint)
+    if eff <= 0 or legacy_last or not state._hit_fraction(ws, eff, die=key.die):
+        return
+    existing = state._existing(pattern, key, eff, preview=False)
+    if existing is not None:
+        ov = _cov_overlap(scale_cov, existing.coverage_snapshot())
+        if state._merge_entry_inplace(
+            existing, pattern, scale_cov, ws, eff,
+            True, False, SectorCoverage(), scale_bytes, ov,
+        ):
+            state._evict_over_capacity(key.die, protect_key=key)
+            return
+    previous = state._resident.get(key)
+    if previous is not None and not previous.evicted:
+        state._settle_eviction(previous)
+    state._touch_resident(_ResidentL2Entry(
+        key=key, working_set_bytes=ws, version=pattern.version,
+        dirty=False, private_workspace=pattern.visibility.private_workspace,
+        resident_coverage=scale_cov, resident_bytes=scale_bytes,
+        cache_policy=pattern.cache_policy,
+        resident_scale_intervals=scale_ivs,
+    ))
+    state._evict_over_capacity(key.die, protect_key=key)
 
 
 def _settle_access(state, pattern, ledger, resident, coverage):
     aligned = ledger.aligned_transfer_bytes
     if pattern.direction == "read" and not resident.empty:
         current = state.resident_coverage_for(pattern, aligned)
-        if current != resident and _coverage_overlap(coverage, current.union(resident)) > _coverage_overlap(coverage, current):
+        if current != resident and _cov_overlap(coverage, current.union(resident)) > _cov_overlap(coverage, current):
             # Previously warm sectors that were evicted in flight were never
-            # fetched. Only the cold part can return to L2.
-            cold = tuple(run for warm, run in _residency_runs(tuple(_coverage_runs(coverage)),
-                                                              tuple(_coverage_runs(resident))) if not warm)
-            if not cold:
+            # fetched. Only the cold part (payload and/or scales) can return to L2.
+            cold_payload = tuple(
+                run for warm, run in _residency_runs(
+                    tuple(_coverage_runs(coverage)), tuple(_coverage_runs(resident)),
+                ) if not warm
+            )
+            cold_scale_ivs = (
+                _subtract_byte_intervals(coverage.scale_intervals, resident.scale_intervals)
+                if (coverage.scale_intervals and resident.scale_intervals)
+                else coverage.scale_intervals
+            )
+            if not cold_payload and not cold_scale_ivs:
                 return 0
-            pattern = replace(pattern, runs=replace(pattern.runs, runs=cold))
+            if not cold_payload:
+                _admit_cold_scale_intervals(state, pattern, cold_scale_ivs, aligned)
+                return 0
+            plan = _access_plan(pattern.runs, state.memory_access_for(pattern.die))
+            if cold_scale_ivs:
+                lo0, hi0 = cold_scale_ivs[0]
+                cold_plan = replace(
+                    plan, runs=cold_payload, scale_bytes=hi0 - lo0, scale_base_byte=lo0,
+                )
+            else:
+                cold_plan = replace(plan, runs=cold_payload, scale_bytes=0, scale_base_byte=None)
+            state.admit_access(replace(pattern, runs=cold_plan), aligned)
+            if len(cold_scale_ivs) > 1:
+                _admit_cold_scale_intervals(state, pattern, cold_scale_ivs[1:], aligned)
+            return 0
     if pattern.direction == "write" and ledger.dram_sector_bytes:
         # The original flow already published these bytes to HBM.
         pattern = replace(pattern, visibility=replace(pattern.visibility, live_out=True))
     _, miss = state.admit_access(pattern, aligned)
     if pattern.direction == "write" and ledger.l2_hit_bytes and miss:
         # Reservation or stream pressure can remove capacity during the write.
-        return _merged_bytes(coverage)
+        return _cov_bytes(coverage)
     return 0
