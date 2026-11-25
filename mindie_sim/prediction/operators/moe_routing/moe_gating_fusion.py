@@ -31,15 +31,21 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-import math
 from typing import Literal
 
 from mindie_sim.backends.abi_registry import default_abi_registry
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.primitives.loader import resolve_dispatch_envelope
+from mindie_sim.primitives.lowering import (
+    MERGE_FAN_IN,
+    SORTALL_LENGTHS,
+    SORT_BLOCK_ELEMS,
+    lower_primitive,
+)
+from mindie_sim.prediction.engine import Allocation
 from mindie_sim.prediction.runtime.tile_solver import LiveBufferSpec
 from mindie_sim.schema.abi import AbiQueryKey, OperandPortSig
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import (
     KernelBinding,
@@ -91,9 +97,7 @@ def _native_gating_dispatch(plan, *, hash_table: bool, noaux_tc: bool) -> tuple[
     """Select CANN fused gating symbol and norm_type from the declared score mode."""
     raw_mode = getattr(plan, "router_mode", "")
     mode = str(raw_mode or "").strip().lower()
-    if hash_table or mode == "hash":
-        return HASH_NATIVE_KIND, NORM_TYPE_SOFTMAX
-    if mode == "sqrtsoftplus":
+    if hash_table or mode in {"hash", "sqrtsoftplus"}:
         return HASH_NATIVE_KIND, NORM_TYPE_SQRTSOFTPLUS
     if mode == "sigmoid" or noaux_tc:
         return TOPK_NATIVE_KIND, NORM_TYPE_SIGMOID
@@ -102,12 +106,16 @@ def _native_gating_dispatch(plan, *, hash_table: bool, noaux_tc: bool) -> tuple[
     raise ModelingError(f"moe_gating_router_mode_unsupported:{mode}")
 #: One FP32 selected weight per routed slot beside its INT32 id.
 SELECTED_WEIGHT_BYTES = 4
-#: ``quant_mode=1`` carries MXFP8 (group-32 E8M0) or dynamic per-token INT8
-#: (one FP32 row scale); a coarser block-scale FP8 row keeps its own quantizer.
+#: CANN ``aclnnMoeInitRoutingV3`` ``quant_mode``: ``3`` for MXFP8 E4M3,
+#: ``2`` for MXFP8 E5M2 (group-32 E8M0), and ``1`` for per-token INT8 (FP32 row scale).
+INIT_ROUTING_QUANT_MODE_INT8 = 1
+INIT_ROUTING_QUANT_MODE_MXFP8_E5M2 = 2
+INIT_ROUTING_QUANT_MODE_MXFP8_E4M3 = 3
 MX_SCALE_GROUP = 32
-_MX_PAYLOADS = frozenset({"fp8_e4m3", "fp8_e5m2"})
+_MX_INPUT_DTYPES = frozenset({"bf16", "fp16", "bfloat16", "float16"})
 _E8M0_SCALES = frozenset({"fp8_e8m0", "e8m0"})
 _PER_ROW_SCALES = frozenset({"fp32", "float32"})
+_NON_FUSED_INIT_ROUTING_BACKENDS = frozenset({"alltoall", "alltoallv"})
 _ROUTING_RECIPES = frozenset({
     "router_topk", "router_group_topk", "route_normalize", "route_pack",
     "hash_routing", "router_sigmoid_scores", "router_group_score_top2",
@@ -137,6 +145,20 @@ GATING_SOFTMAX_WAVE_STAGES = (
 GATING_SIGMOID_WAVE_STAGES = (
     "logits_load", "sigmoid_score", "expert_topk", "renorm_store",
 )
+GATING_SIGMOID_GROUPED_WAVE_STAGES = (
+    "logits_load", "sigmoid_score", "group_top2_scan", "group_mask",
+    "expert_topk", "renorm_store",
+)
+GATING_SQRTSOFTPLUS_WAVE_STAGES = (
+    "logits_load", "sqrtsoftplus_score", "expert_topk", "renorm_store",
+)
+GATING_SQRTSOFTPLUS_GROUPED_WAVE_STAGES = (
+    "logits_load", "sqrtsoftplus_score", "group_top2_scan", "group_mask",
+    "expert_topk", "renorm_store",
+)
+GATING_HASH_WAVE_STAGES = (
+    "logits_load", "sqrtsoftplus_score", "tid2eid_lookup", "renorm_store",
+)
 GATING_WAVE_STAGES = (
     "logits_bias_load", "sigmoid_bias", "group_top2_scan", "group_mask",
     "expert_topk", "renorm_store",
@@ -146,6 +168,8 @@ NS_PER_MS = 1_000_000.0
 _ARCH35_IDS = frozenset({"npu_arch_3510", "dav_3510"})
 _SIGMOID_SFU_OPS_PER_EXPERT = 4
 _SOFTMAX_SFU_OPS_PER_EXPERT = 5
+_SQRTSOFTPLUS_SFU_OPS_PER_EXPERT = 5
+_HASH_LOOKUP_OPS_PER_SLOT = 1
 _RENORM_OPS_PER_SLOT = 4
 #: Arch35 ``moe_gating_top_k_tiling_arch35.cpp`` UB queue and host sizing constants.
 _GATING_ARCH35_STATIC_EXPERT_BUFFERS = 18
@@ -153,6 +177,12 @@ _GATING_ARCH35_RESERVE_EXPERT_BUFFERS = 17
 _GATING_ARCH35_ROW_EXPERT_BUFFERS = 2
 _GATING_ARCH35_ROW_OVERHEAD_BYTES = 128
 _GATING_ARCH35_MAX_ROW_BATCH = 128
+#: Arch35 ``moe_gating_top_k_hash_tiling_arch35.h`` / ``_regbase.h`` limits and UB sizing.
+_GATING_HASH_MAX_EXPERTS = 2048
+_GATING_HASH_MAX_TOPK = 64
+_GATING_UB_ALIGN_BYTES = 32
+_GATING_HASH_SCRATCH_FP32_BUFFERS = 7
+_GATING_HASH_GROUP_FP32_BUFFERS = 3
 _GATING_ABI_DTYPE_ALIASES = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}
 
 
@@ -194,16 +224,76 @@ def _is_sigmoid_router(meta) -> bool:
     return mode == "sigmoid" or norm_type == NORM_TYPE_SIGMOID
 
 
-def _general_topk_kind(op) -> str | None:
-    """Return ``'softmax'`` or ``'sigmoid'`` for non-noaux_tc row-wave gating, else ``None``."""
+def _is_hash_routing(meta) -> bool:
+    return (
+        meta.get("selection_mode") in {HASH_SELECTION_MODE, CONTRACT_HASH}
+        or bool(meta.get("hash_table"))
+        or str(meta.get("score_function") or "").strip().lower() == "hash"
+    )
+
+
+def _is_sqrtsoftplus_router(meta) -> bool:
+    mode = str(meta.get("score_function") or meta.get("router_mode") or "").strip().lower()
+    return mode == "sqrtsoftplus" or meta.get("norm_type") == NORM_TYPE_SQRTSOFTPLUS
+
+
+def _validate_gating_contract(op) -> None:
+    """Reject host-illegal CANN gating parameter and shape combinations."""
     meta = dict(op.metadata)
-    if meta.get("selection_mode") == CONTRACT_HASH or meta.get("hash_table"):
-        return None
+    if meta.get("norm_type") == NORM_TYPE_SQRTSOFTPLUS and bool(meta.get("renorm")):
+        raise ModelingError("moe_gating_topk_hash_rejects_renorm_with_sqrtsoftplus")
+    is_hash_native = (
+        meta.get("native_kind") == HASH_NATIVE_KIND
+        or _is_hash_routing(meta)
+        or _is_sqrtsoftplus_router(meta)
+    )
+    if is_hash_native:
+        experts = int(meta.get("num_experts", 0) or 0)
+        top_k = int(meta.get("top_k", 0) or 0)
+        if experts > _GATING_HASH_MAX_EXPERTS:
+            raise ModelingError(
+                f"moe_gating_topk_hash_experts_exceed_limit:{experts}:{_GATING_HASH_MAX_EXPERTS}"
+            )
+        if _is_hash_routing(meta) and top_k > _GATING_HASH_MAX_TOPK:
+            raise ModelingError(
+                f"moe_gating_topk_hash_topk_exceeds_limit:{top_k}:{_GATING_HASH_MAX_TOPK}"
+            )
+
+
+def _general_topk_kind(op) -> str | None:
+    """Return ``'hash'``, ``'sqrtsoftplus'``, ``'sigmoid'``, or ``'softmax'`` for non-noaux_tc row-wave gating."""
+    meta = dict(op.metadata)
     if (int(meta.get("num_experts", 0) or 0) <= 0
             or int(meta.get("top_k", 0) or 0) <= 0
             or bool(meta.get("noaux_tc"))):
         return None
+    if _is_hash_routing(meta):
+        return "hash"
+    if _is_sqrtsoftplus_router(meta):
+        return "sqrtsoftplus"
     return "sigmoid" if _is_sigmoid_router(meta) else "softmax"
+
+
+def _wave_stage_names(*, is_group: bool, general_kind: str | None, meta) -> tuple[str, ...]:
+    if is_group:
+        return GATING_WAVE_STAGES
+    if general_kind == "hash":
+        return GATING_HASH_WAVE_STAGES
+    grouped_router = (
+        _effective_groups(meta) > GATING_MIN_GROUPS
+        and int(meta.get("group_topk", 0) or 0) > 0
+    )
+    if general_kind == "sqrtsoftplus":
+        return (
+            GATING_SQRTSOFTPLUS_GROUPED_WAVE_STAGES
+            if grouped_router else GATING_SQRTSOFTPLUS_WAVE_STAGES
+        )
+    if general_kind == "sigmoid":
+        return (
+            GATING_SIGMOID_GROUPED_WAVE_STAGES
+            if grouped_router else GATING_SIGMOID_WAVE_STAGES
+        )
+    return GATING_SOFTMAX_WAVE_STAGES
 
 
 def _effective_gating_aiv_budget(geometry, *, is_group: bool) -> tuple[int, tuple[int, ...]]:
@@ -248,6 +338,34 @@ def _arch35_gating_ub_live_bytes(experts: int, ub_cap: int, geometry) -> int:
     return ub_live
 
 
+def _arch35_hash_gating_ub_live_bytes(
+    experts: int, top_k: int, groups: int, elem_bytes: int, geometry,
+) -> int:
+    """Compute Arch35 ``MoeGatingTopKHash`` per-AIV UB reservation (``regbase.h:1500-1515``)."""
+    eff_groups = max(GATING_MIN_GROUPS, groups)
+    per_group = -(-experts // eff_groups)
+    per_group_align = ((per_group + _GATING_UB_ALIGN_BYTES - 1) // _GATING_UB_ALIGN_BYTES) * _GATING_UB_ALIGN_BYTES
+    expert_group_align = eff_groups * per_group_align
+    group_align = ((eff_groups + _GATING_UB_ALIGN_BYTES - 1) // _GATING_UB_ALIGN_BYTES) * _GATING_UB_ALIGN_BYTES
+    in_bytes = max(2, int(elem_bytes))
+    x_in_scale = max(1, SELECTED_WEIGHT_BYTES // in_bytes)
+    y_align = ((top_k * in_bytes + _GATING_UB_ALIGN_BYTES - 1) // _GATING_UB_ALIGN_BYTES) * _GATING_UB_ALIGN_BYTES
+    idx_align = ((top_k * SELECTED_ID_BYTES + _GATING_UB_ALIGN_BYTES - 1) // _GATING_UB_ALIGN_BYTES) * _GATING_UB_ALIGN_BYTES
+    ub_live = (
+        2 * expert_group_align * SELECTED_WEIGHT_BYTES * x_in_scale
+        + 2 * y_align
+        + 2 * idx_align
+        + 2 * expert_group_align * SELECTED_WEIGHT_BYTES
+        + expert_group_align * in_bytes
+        + _GATING_HASH_SCRATCH_FP32_BUFFERS * expert_group_align * SELECTED_WEIGHT_BYTES
+        + _GATING_HASH_GROUP_FP32_BUFFERS * group_align * SELECTED_WEIGHT_BYTES
+    )
+    LiveBufferSpec(
+        "moe_gating_ub", "ub", ub_live, 0, 1, owner_kind="aiv",
+    ).check_capacity(geometry)
+    return ub_live
+
+
 def _gating_owner_schedule(
     op, geometry, *, tokens: int, waves: int, launched: int, stage_names: tuple[str, ...],
     read: float, bias_bytes: float, write: float, logical_vector: float, aiv_units: int,
@@ -257,7 +375,15 @@ def _gating_owner_schedule(
     ub_cap = int(ub_raw) if ub_raw is not None else 0
     meta = dict(op.metadata)
     experts = max(1, int(meta.get("num_experts", 1) or 1))
-    ub_live = _arch35_gating_ub_live_bytes(experts, ub_cap, geometry)
+    top_k = max(1, int(meta.get("top_k", 1) or 1))
+    if meta.get("native_kind") == HASH_NATIVE_KIND or _is_hash_routing(meta) or _is_sqrtsoftplus_router(meta):
+        in_fmt = str(meta.get("input_format") or "fp32").strip().lower()
+        in_dtype = _GATING_ABI_DTYPE_ALIASES.get(in_fmt, in_fmt)
+        ub_live = _arch35_hash_gating_ub_live_bytes(
+            experts, top_k, _effective_groups(meta), int(dtype_bytes(in_dtype)), geometry,
+        )
+    else:
+        ub_live = _arch35_gating_ub_live_bytes(experts, ub_cap, geometry)
     logits_read = max(0.0, float(read) - float(bias_bytes))
     row_logits = logits_read / float(max(1, tokens))
     row_write = float(write) / float(max(1, tokens))
@@ -303,7 +429,8 @@ def _gating_kernel_binding(op, *, group_limited: bool, geometry) -> KernelBindin
         raise ModelingError("moe_gating_compute_arch_unresolved")
     is_sig = _is_sigmoid_router(meta)
     native = str(meta.get("native_kind") or (
-        TOPK_NATIVE_KIND if (group_limited or is_sig) else SOFTMAX_NATIVE_KIND
+        HASH_NATIVE_KIND if (_is_hash_routing(meta) or _is_sqrtsoftplus_router(meta))
+        else (TOPK_NATIVE_KIND if (group_limited or is_sig) else SOFTMAX_NATIVE_KIND)
     ))
     reg = default_abi_registry()
     shipping = reg.is_shipping_available(native, arch_family)
@@ -395,6 +522,28 @@ def _gating_kernel_binding(op, *, group_limited: bool, geometry) -> KernelBindin
     )
 
 
+def _p10_sort_duration_ms(tbl, dp, experts: int, sort_ms: float) -> float:
+    """Compute AIV sort duration in ms from canonical ``P10_sort_topk`` element-passes."""
+    if sort_ms <= 0.0:
+        return 0.0
+    if experts in SORTALL_LENGTHS:
+        return float(
+            lower_primitive(
+                "P10_sort_topk", {"n": int(experts), "algorithm": "sort32_mrgsort4"}, tbl,
+                datapath=dp, allow_uncalibrated_declaration=True,
+            ).analytical_ms
+        )
+    groups = (int(experts) + SORT_BLOCK_ELEMS - 1) // SORT_BLOCK_ELEMS
+    padded = groups * SORT_BLOCK_ELEMS
+    merge_passes = 0
+    remaining = groups
+    while remaining > 1:
+        remaining = (remaining + MERGE_FAN_IN - 1) // MERGE_FAN_IN
+        merge_passes += 1
+    total_passes = 1 + merge_passes + (1 if merge_passes > 0 and merge_passes % 2 == 0 else 0)
+    return float(padded * total_passes) / sort_ms
+
+
 def _primitive_stage_latencies_ms(
     context, geometry, stage_names: tuple[str, ...], *, experts: int, top_k: int,
 ) -> tuple[float, tuple[float, ...], tuple[str, ...]]:
@@ -422,18 +571,21 @@ def _primitive_stage_latencies_ms(
         ("P07_vec_alu", alu_ms),
         ("P08_vec_sfu", sfu_ms),
         ("P09_vec_reduce_cast", red_ms),
-        ("P10_sort_topk", sort_ms),
+        *((("P10_sort_topk", sort_ms),) if "expert_topk" in stage_names else ()),
     ):
         if rate <= 0.0:
             missing.append(pid)
     flag_ms = flag_ns / NS_PER_MS
-    sort_work = float(experts) * math.log2(max(2, experts))
     per_stage: list[float] = []
     for name in stage_names:
         if name in {"logits_load", "logits_bias_load"}:
             per_stage.append(mte2_v_ns / NS_PER_MS)
+        elif name == "tid2eid_lookup":
+            per_stage.append((float(top_k * _HASH_LOOKUP_OPS_PER_SLOT) / alu_ms + flag_ms) if alu_ms > 0.0 else 0.0)
         elif name in {"sigmoid_bias", "sigmoid_score"}:
             per_stage.append((float(experts * _SIGMOID_SFU_OPS_PER_EXPERT) / sfu_ms + flag_ms) if sfu_ms > 0.0 else 0.0)
+        elif name == "sqrtsoftplus_score":
+            per_stage.append((float(experts * _SQRTSOFTPLUS_SFU_OPS_PER_EXPERT) / sfu_ms + flag_ms) if sfu_ms > 0.0 else 0.0)
         elif name == "softmax_reduce":
             if sfu_ms > 0.0 and red_ms > 0.0:
                 per_stage.append(
@@ -445,7 +597,7 @@ def _primitive_stage_latencies_ms(
         elif name in {"group_top2_scan", "group_mask"}:
             per_stage.append((float(experts) / red_ms + flag_ms) if red_ms > 0.0 else 0.0)
         elif name == "expert_topk":
-            per_stage.append((sort_work / sort_ms + flag_ms) if sort_ms > 0.0 else 0.0)
+            per_stage.append((_p10_sort_duration_ms(tbl, dp, experts, sort_ms) + flag_ms) if sort_ms > 0.0 else 0.0)
         elif name == "renorm_store":
             per_stage.append((float(top_k * _RENORM_OPS_PER_SLOT) / alu_ms + v_mte3_ns / NS_PER_MS) if alu_ms > 0.0 else 0.0)
         else:
@@ -459,12 +611,13 @@ def build_moe_gating_topk(op, geometry):
     from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
     from mindie_sim.prediction.mechanism import OperatorPlan, Work
     from mindie_sim.prediction.operators.vector.vector_pipeline import AIVTiledVectorAndGatherRecipe
+    _validate_gating_contract(op)
     is_group = _group_limited(op)
     general_kind = _general_topk_kind(op)
     if _geometry_arch_family(geometry) and (is_group or general_kind is not None):
         _gating_kernel_binding(op, group_limited=is_group, geometry=geometry)
     if not (_is_arch35_geometry(geometry) and (is_group or general_kind is not None)):
-        # A2/A3 and hash/unstructured routing keep their Class D vector recipe.
+        # A2/A3 and unstructured routing keep their Class D vector recipe.
         return build_plan(AIVTiledVectorAndGatherRecipe(), op, geometry)
     meta = dict(op.metadata)
     wave_width, aiv_pool = _effective_gating_aiv_budget(geometry, is_group=is_group)
@@ -482,10 +635,7 @@ def build_moe_gating_topk(op, geometry):
     logits_read = max(0.0, read - bias_bytes)
     total_mte2 = logits_read + float(launched) * bias_bytes
     logical_vector = float(op.vector_ops)
-    stage_names = (
-        GATING_WAVE_STAGES if is_group
-        else (GATING_SIGMOID_WAVE_STAGES if general_kind == "sigmoid" else GATING_SOFTMAX_WAVE_STAGES)
-    )
+    stage_names = _wave_stage_names(is_group=is_group, general_kind=general_kind, meta=meta)
     kernel_binding = _gating_kernel_binding(op, group_limited=is_group, geometry=geometry)
     owner_schedule = _gating_owner_schedule(
         op, geometry, tokens=tokens, waves=waves, launched=launched, stage_names=stage_names,
@@ -534,14 +684,27 @@ def build_moe_gating_topk(op, geometry):
                 previous = (name,)
             return tuple(stages)
 
+        ub_alloc = ()
+        if "ub" in context.pool_names and owner_schedule.residency.ub_live_bytes > 0:
+            ub_units = int(context.pool_units.get("ub", len(aiv_pool)))
+            ub_owners = tuple(u for u in aiv_pool[:launched] if u < ub_units) or tuple(range(max(1, ub_units)))
+            ub_alloc = (
+                Allocation(
+                    "moe_gating_ub",
+                    context.pool_names["ub"],
+                    owner_schedule.residency.ub_live_bytes,
+                    ub_owners,
+                ),
+            )
         if prologue_ms > 0.0:
             return KernelProgram((
                 Stage("kernel_prologue_drain", latency=prologue_ms),
                 Stage("row_waves", after=("kernel_prologue_drain",),
+                      acquire=ub_alloc, free=ub_alloc,
                       program=PipelineProgram(waves, GATING_PIPELINE_SLOTS, tile)),
             ))
         return KernelProgram((
-            Stage("row_waves",
+            Stage("row_waves", acquire=ub_alloc, free=ub_alloc,
                   program=PipelineProgram(waves, GATING_PIPELINE_SLOTS, tile)),
         ))
 
@@ -562,6 +725,7 @@ class ScopedGatingRecipe(PlannedRecipe):
     """Register the Arch35 row planner for both group-limited and general top-k gating."""
 
     def prepare(self, op, geometry):
+        _validate_gating_contract(op)
         is_group = _group_limited(op)
         general_kind = _general_topk_kind(op)
         if _geometry_arch_family(geometry) and (is_group or general_kind is not None):
@@ -576,10 +740,7 @@ class ScopedGatingRecipe(PlannedRecipe):
         experts = max(1, int(meta.get("num_experts", 1) or 1))
         waves = max(1, -(-tokens // wave_width))
         launched = max(1, -(-tokens // waves))
-        stage_names = (
-            GATING_WAVE_STAGES if is_group
-            else (GATING_SIGMOID_WAVE_STAGES if general_kind == "sigmoid" else GATING_SOFTMAX_WAVE_STAGES)
-        )
+        stage_names = _wave_stage_names(is_group=is_group, general_kind=general_kind, meta=meta)
         read = float(op.hbm_bytes) - float(op.mte3_bytes)
         write = float(op.mte3_bytes)
         bias_bytes = float(
@@ -666,20 +827,35 @@ def cann_native_active(runtime) -> bool:
 
 def _fused_gating(*, prefix, plan, logits_input, members, stage, requests,
                   tokens, mode, weight_dtype, weight_bytes, hash_table, noaux_tc,
-                  cann_kind=None, norm_type=None):
+                  cann_kind=None, norm_type=None, routed_scale_in_kernel=None):
     """One ``moe_gating_topk`` call conserving the whole member expression."""
     experts, selected = int(plan.num_experts), int(plan.top_k)
     resolved_kind, resolved_norm_type = _native_gating_dispatch(
         plan, hash_table=hash_table, noaux_tc=noaux_tc)
     native_kind = cann_kind or resolved_kind
     effective_norm_type = resolved_norm_type if norm_type is None else int(norm_type)
+    owns_routed_scale = (
+        bool(routed_scale_in_kernel)
+        if routed_scale_in_kernel is not None
+        else (
+            bool(noaux_tc)
+            or native_kind == HASH_NATIVE_KIND
+            or any(getattr(m, "recipe", None) == ROUTED_SCALE_RECIPE for m in members)
+        )
+    )
+    effective_routed_scale = float(plan.routed_scaling_factor) if owns_routed_scale else 1.0
+    renorm = bool(
+        plan.router_norm_topk
+        and not hash_table
+        and effective_norm_type != NORM_TYPE_SQRTSOFTPLUS
+    )
     vector = sum(float(member.vector_ops) for member in members)
     read = float(tokens * experts) * float(weight_bytes)
     if noaux_tc:
         read += float(experts * NOAUX_BIAS_BYTES)
     if hash_table:
         read += float(tokens) * float(HASH_ROW_ID_BYTES + plan.top_k * SELECTED_ID_BYTES)
-    write = float(tokens * selected) * float(SELECTED_ID_BYTES + SELECTED_WEIGHT_BYTES)
+    write = float(tokens * selected) * (float(SELECTED_ID_BYTES) + float(weight_bytes))
     return vector_op(
         op_id=prefix + ".moe_gating_topk", deps=(logits_input,), stage=stage,
         layer=plan.index, requests=requests, elements=tokens * experts,
@@ -690,16 +866,16 @@ def _fused_gating(*, prefix, plan, logits_input, members, stage, requests,
         returns=("weights", "ids"),
         metadata=(("native_kind", native_kind),
                   ("norm_type", effective_norm_type),
-                  ("input_format", weight_dtype), ("output_format", "fp32"),
-                  ("topk_ids_dtype", "int32"), ("router_weight_dtype", "fp32"),
+                  ("input_format", weight_dtype), ("output_format", weight_dtype),
+                  ("topk_ids_dtype", "int32"), ("router_weight_dtype", weight_dtype),
                   ("score_function", plan.router_mode),
                   ("selection_mode", HASH_SELECTION_MODE if hash_table
                    else SCORE_SELECTION_MODE),
                   ("fused_from", tuple(member.recipe for member in members)),
                   ("fused_member_count", len(members)),
-                  ("renorm", bool(plan.router_norm_topk and not hash_table)),
+                  ("renorm", renorm),
                   ("noaux_tc", noaux_tc),
-                  ("routed_scaling_factor", float(plan.routed_scaling_factor)),
+                  ("routed_scaling_factor", effective_routed_scale),
                   ("groups", int(plan.router_groups)),
                   ("group_topk", int(plan.router_group_topk)),
                   ("top_k", selected), ("num_experts", experts),
@@ -713,20 +889,17 @@ def _fused_gating(*, prefix, plan, logits_input, members, stage, requests,
     )
 
 
-def _fused_boundary(ops, *, hash_table, noaux_tc):
+def _fused_boundary(ops, *, hash_table, noaux_tc, cann_kind=None):
     """Index where the one fused gating call ends and external consumers start.
 
-    A hash call has no in-kernel renormalization, so its declared top-k
-    normalization stays an external consumer.  The ``noaux_tc`` chain owns its
-    normalization *and* routed scale in-kernel; every other score gating call
-    owns the renorm and keeps the declared post-selection scale external.
+    ``MoeGatingTopKHash`` (hash layers and ``sqrtsoftplus``) owns its
+    normalization and routed scale in-kernel (with ``norm_type=2, renorm=False``).
+    The ``noaux_tc`` chain owns its normalization *and* routed scale in-kernel;
+    other score gating calls keep any declared post-selection scale external.
     """
-    if hash_table:
-        return next((index for index, op in enumerate(ops)
-                     if op.recipe == ROUTE_NORMALIZE_RECIPE), len(ops))
-    if noaux_tc:
+    if hash_table or noaux_tc or cann_kind == HASH_NATIVE_KIND:
         return len(ops)
-    return len(ops) - int(str(ops[-1].recipe) == ROUTED_SCALE_RECIPE)
+    return len(ops) - int(bool(ops) and str(ops[-1].recipe) == ROUTED_SCALE_RECIPE)
 
 
 def build_selection(*, prefix, plan, logits_input, weight_dtype, weight_bytes,
@@ -750,25 +923,38 @@ def build_selection(*, prefix, plan, logits_input, weight_dtype, weight_bytes,
         # CANN ``aclnnMoeGatingTopK`` requires matching x/bias dtypes; an FP32
         # ``noaux_tc`` correction bias with non-FP32 logits keeps the raw graph.
         fused = False
+    if fused and cann_kind == SOFTMAX_NATIVE_KIND and int(plan.router_groups) > 1:
+        # ``aclnnMoeGatingTopKSoftmaxV2`` has no group-limited selection; keep
+        # the decomposed group-select + topk chain.
+        fused = False
+    if (fused and norm_type in {NORM_TYPE_SIGMOID, NORM_TYPE_SQRTSOFTPLUS}
+            and not bool(plan.router_norm_topk)):
+        # Both ``norm_type=1`` (sigmoid) and ``norm_type=2`` (sqrtsoftplus/hash)
+        # divide selected scores by their sum in-kernel; unnormalized plans stay decomposed.
+        fused = False
     if fused:
-        split = _fused_boundary(ops, hash_table=hash_table, noaux_tc=noaux_tc)
+        split = _fused_boundary(ops, hash_table=hash_table, noaux_tc=noaux_tc, cann_kind=cann_kind)
+        members = tuple(ops[:split])
         gating = _fused_gating(
             prefix=prefix, plan=plan, logits_input=logits_input,
-            members=tuple(ops[:split]), stage=stage, requests=requests,
+            members=members, stage=stage, requests=requests,
             tokens=tokens, mode=mode, weight_dtype=weight_dtype,
             weight_bytes=weight_bytes, hash_table=hash_table, noaux_tc=noaux_tc,
-            cann_kind=cann_kind, norm_type=norm_type)
-        replaced = {op.op_id for op in ops[:split]}
+            cann_kind=cann_kind, norm_type=norm_type,
+            routed_scale_in_kernel=(
+                bool(noaux_tc)
+                or cann_kind == HASH_NATIVE_KIND
+                or any(m.recipe == ROUTED_SCALE_RECIPE for m in members)
+            ))
+        replaced = {op.op_id for op in members}
         tail = [replace(op, deps=tuple(
             gating.op_id if dependency in replaced else dependency
             for dependency in op.deps)) for op in ops[split:]]
         ops = [gating, *tail]
         select = ops[-1]
         ids_producer, weights_producer = gating.op_id, select.op_id
-    # A hash call owns no renormalization: its declared top-k normalization is
-    # an external consumer, so it stays outside the kernel boundary.
     boundary = len(ops)
-    if hash_table:
+    if hash_table and not fused:
         boundary = next((index for index, op in enumerate(ops)
                          if op.recipe == ROUTE_NORMALIZE_RECIPE), len(ops))
     declare_router_selection(
@@ -791,36 +977,74 @@ def dispatch_quantizes_internally(runtime) -> bool:
     return str(protocol.get("dispatch_quant") or "none") != "none"
 
 
-def _routing_quantizable(meta) -> bool:
-    """True for the MXFP8 / dynamic INT8 payloads ``quant_mode=1`` publishes."""
-    payload = str(meta.get("output_format") or "")
-    scale = str(meta.get("activation_scale_format") or "")
+def _routing_quant_mode(meta, *, row_width: int = 0, input_format: str = "") -> int | None:
+    """Return CANN ``MoeInitRoutingV3`` ``quant_mode`` (3=E4M3, 2=E5M2, 1=INT8) or ``None``."""
+    payload = str(meta.get("output_format") or "").strip().lower()
+    scale = str(meta.get("activation_scale_format") or "").strip().lower()
     group = int(meta.get("activation_group_size") or 0)
-    if payload in _MX_PAYLOADS:
-        return group == MX_SCALE_GROUP and scale in _E8M0_SCALES
-    if payload == "int8":
-        return scale in _PER_ROW_SCALES
-    return False
+    src = str(meta.get("input_format") or input_format or "").strip().lower()
+    if payload in {"fp8_e4m3", "fp8_e5m2"}:
+        if src and src not in _MX_INPUT_DTYPES:
+            return None
+        if group != MX_SCALE_GROUP or scale not in _E8M0_SCALES:
+            return None
+        return (
+            INIT_ROUTING_QUANT_MODE_MXFP8_E4M3
+            if payload == "fp8_e4m3" else INIT_ROUTING_QUANT_MODE_MXFP8_E5M2
+        )
+    if payload == "int8" and scale in _PER_ROW_SCALES:
+        scale_shape = tuple(meta.get("activation_scale_shape") or ())
+        if group > 0:
+            per_row_width = row_width > 0 and group == row_width
+            per_row_shape = bool(scale_shape) and (len(scale_shape) == 1 or int(scale_shape[-1]) == 1)
+            if not (per_row_width or (row_width <= 0 and per_row_shape)):
+                return None
+        return INIT_ROUTING_QUANT_MODE_INT8
+    return None
 
 
-def absorb_init_routing(*, pack, quantizer, ep, dispatch_owns_quant=False):
+def _resolve_all2all_backend(runtime=None, all2all_backend=None) -> str:
+    if all2all_backend is not None:
+        return str(all2all_backend).strip().lower()
+    if runtime is None:
+        return ""
+    direct = getattr(runtime, "all2all_backend", None)
+    if direct is not None:
+        return str(direct).strip().lower()
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    return str(meta.get("all2all_backend") or "").strip().lower()
+
+
+def absorb_init_routing(
+    *, pack, quantizer, ep, dispatch_owns_quant=False,
+    runtime=None, all2all_backend=None,
+):
     """Fold one EP dispatch quantizer into ``aclnnMoeInitRoutingV3``.
 
     The init-routing kernel owns the permutation and the dynamic quantization
-    (``quant_mode=1``): that work and the quantized payload write are billed
-    once on the pack and the separate node is retired.  A dispatch that
-    quantizes received rows itself keeps its declared separate quantizer.
+    (``quant_mode=3`` for MXFP8 E4M3, ``quant_mode=2`` for MXFP8 E5M2, and
+    ``quant_mode=1`` for per-token INT8): that work and the quantized payload
+    write are billed once on the pack and the separate node is retired.
+    Backends that keep a standalone dynamic quantizer after permutation (e.g.
+    ``alltoall`` / ``alltoallv``) or dispatches that quantize received rows
+    themselves retain the separate quantizer node.
     """
     if ep <= 1 or quantizer is None or pack is None or dispatch_owns_quant:
+        return pack, None
+    if _resolve_all2all_backend(runtime, all2all_backend) in _NON_FUSED_INIT_ROUTING_BACKENDS:
         return pack, None
     meta = dict(quantizer.metadata)
     if str(meta.get("quantization_scope", "")) != "moe_dispatch_expert_input":
         return pack, None
-    if not _routing_quantizable(meta):
+    row_width = int(quantizer.local_shape[-1]) if getattr(quantizer, "local_shape", ()) else 0
+    quant_mode = _routing_quant_mode(
+        meta, row_width=row_width, input_format=str(getattr(pack, "dtype", "") or ""),
+    )
+    if quant_mode is None:
         return pack, None
     routing = {
         "native_kind": INIT_ROUTING_NATIVE_KIND,
-        "quant_mode": 1,
+        "quant_mode": quant_mode,
         "input_format": meta.get("input_format"),
         "payload_format": meta.get("output_format"),
         "scale_format": meta.get("activation_scale_format"),
