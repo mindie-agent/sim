@@ -795,6 +795,35 @@ def _resolve_automatic_mla_preprocess_mode(
     num_kv_heads = int(getattr(plan, "num_kv_heads", 1) or 1)
     num_q_heads = int(getattr(plan, "num_heads", 0) or getattr(model, "num_heads", 0) or 0)
     qk_nope_dim = int(getattr(plan, "qk_nope_head_dim", 0) or 0)
+    if "is_kv_consumer" in rt_meta and rt_meta["is_kv_consumer"] is not None:
+        is_kv_consumer = bool(rt_meta["is_kv_consumer"])
+    else:
+        kv_cfg = rt_meta.get("kv_transfer_config")
+        kv_explicit = isinstance(kv_cfg, Mapping) and (
+            kv_cfg.get("kv_role") is not None
+            or "is_kv_consumer" in kv_cfg
+            or "is_kv_producer" in kv_cfg
+        )
+        if kv_explicit:
+            kv_role = kv_cfg.get("kv_role")
+            is_kv_consumer = (
+                kv_role == "kv_consumer"
+                if kv_role is not None
+                else bool(kv_cfg.get("is_kv_consumer", False) and not kv_cfg.get("is_kv_producer", False))
+            )
+        else:
+            single_spine = (
+                rt_meta.get("single_spine")
+                if isinstance(rt_meta.get("single_spine"), Mapping) else {}
+            )
+            role_val = (
+                rt_meta.get("deployment_role")
+                or rt_meta.get("role")
+                or single_spine.get("deployment_mode")
+                or single_spine.get("role")
+                or ""
+            )
+            is_kv_consumer = str(role_val).strip().lower() == "pd_decode"
     return resolve_mla_preprocess_mode(
         arch=arch,
         phase=phase_str,
@@ -804,11 +833,16 @@ def _resolve_automatic_mla_preprocess_mode(
         qk_rope_head_dim=int(plan.qk_rope_head_dim or 0),
         has_rope=bool(plan.mla_do_rope),
         is_sparse_sfa=bool(is_sparse),
+        is_kv_consumer=is_kv_consumer,
         dcp_size=int(eff_dcp),
         pcp_size=int(getattr(parallel, "pcp", 1) or 1),
         enable_mlapo=bool(rt_meta.get("enable_mlapo", False)),
         enable_mla_prolog=True,
-        qkv_a_gate_fused=bool(getattr(plan, "qkv_a_gate_fused", False)),
+        qkv_a_gate_fused=bool(
+            getattr(plan, "qkv_a_gate_fused", False)
+            or getattr(plan, "mla_qkv_a_gate_fused", False)
+            or getattr(plan, "mla_output_gate", False)
+        ),
         is_w4a8=("w4a8" in w_dt or "int4" in w_dt or "w4a16" in w_dt),
         is_int8_kv=(str(getattr(quant, "kv_dtype", "") or "").lower() == "int8"),
         has_kv_scale=bool(rt_meta.get("has_kv_scale", True)),

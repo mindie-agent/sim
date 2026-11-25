@@ -638,7 +638,59 @@ def _finalize_weight_ledger_rows(
             stage_payload[st] += int(rec["unit_p"]) * st_r
             stage_scale_aux[st] += (int(rec["unit_s"]) + int(rec["unit_a"])) * st_r
 
+    for st in range(pp):
+        off_tot = float(mem.expert_hbm_saved[st]) if st < len(mem.expert_hbm_saved) else 0.0
+        if off_tot > 0.0:
+            off_pay = float(
+                mem.expert_payload_hbm_saved[st]
+                if st < len(mem.expert_payload_hbm_saved) else off_tot
+            )
+            off_tot_i = int(round(off_tot))
+            off_pay_i = min(off_tot_i, max(0, int(round(off_pay))))
+            off_meta_i = max(0, off_tot_i - off_pay_i)
+            stage_payload[st] = max(0, stage_payload[st] - off_pay_i)
+            stage_scale_aux[st] = max(0, stage_scale_aux[st] - off_meta_i)
+
     return tuple(rows_out), stage_payload, stage_scale_aux, stage_engram_raw, peak_stage
+
+
+def _split_mixed_quant_expert_term(
+    term: WeightTerm,
+    quant: QuantSpec,
+) -> tuple[WeightTerm, ...]:
+    """Split heterogeneous mixed-quant routed-expert banks into exact uniform-quant buckets."""
+    if not term.expert_ids:
+        return (term,)
+    cat_head = str(term.category or "").split(".", 1)[0]
+    if cat_head not in _EXPERT_CATEGORIES:
+        return (term,)
+    eff_quant = term.runtime_quant or term.quant or quant
+    cat_quant = eff_quant.for_category(term.category)
+    if not getattr(cat_quant, "expert_quant_overrides", ()):
+        return (term,)
+    buckets: dict[QuantSpec, list[int]] = {}
+    for eid in term.expert_ids:
+        ex_q = cat_quant.for_expert(int(eid))
+        buckets.setdefault(ex_q, []).append(int(eid))
+    if len(buckets) <= 1:
+        only_q = next(iter(buckets))
+        return (replace(
+            term,
+            quant=only_q,
+            runtime_quant=(only_q if term.runtime_quant is not None else None),
+        ),)
+    out: list[WeightTerm] = []
+    for ex_q, bucket_ids in buckets.items():
+        ids_tuple = tuple(bucket_ids)
+        out.append(replace(
+            term,
+            count=len(ids_tuple),
+            resident_count=len(ids_tuple),
+            expert_ids=ids_tuple,
+            quant=ex_q,
+            runtime_quant=(ex_q if term.runtime_quant is not None else None),
+        ))
+    return tuple(out)
 
 
 def _collect_weight_ledger_entries(
@@ -656,15 +708,35 @@ def _collect_weight_ledger_entries(
     pp = max(1, int(p.pp))
     quant = require_model_quant(model)
     checkpoint = resolve_default_checkpoint(model.name, hw_family=hw_family)
-    all_stage_terms = stage_weight_terms(
-        model, p,
-        include_draft=bool(mem.draft_kind),
-        draft_kind=mem.draft_kind or None,
-        include_engram_tables=True,
-        include_vision=True,
-        layer_partition=mem.layers,
-        slot_plans=mem.slot_plans,
-    )
+    bottleneck_eps = tuple(getattr(mem, "bottleneck_ep_rank_by_stage", ()) or ())
+    if mem.slot_plans is not None and len(bottleneck_eps) == pp and len(set(bottleneck_eps)) > 1:
+        all_stage_terms = [
+            stage_weight_terms(
+                model, p,
+                include_draft=bool(mem.draft_kind),
+                draft_kind=mem.draft_kind or None,
+                include_engram_tables=True,
+                include_vision=True,
+                layer_partition=mem.layers,
+                slot_plans=mem.slot_plans,
+                ep_rank=int(bottleneck_eps[st]),
+                runtime=case.runtime,
+            )[st]
+            for st in range(pp)
+        ]
+    else:
+        ep_rank = int(bottleneck_eps[0]) if (mem.slot_plans is not None and bottleneck_eps) else None
+        all_stage_terms = stage_weight_terms(
+            model, p,
+            include_draft=bool(mem.draft_kind),
+            draft_kind=mem.draft_kind or None,
+            include_engram_tables=True,
+            include_vision=True,
+            layer_partition=mem.layers,
+            slot_plans=mem.slot_plans,
+            ep_rank=ep_rank,
+            runtime=case.runtime,
+        )
     shared_dp = bool(getattr(mem, "enable_shared_expert_dp", False))
     pcp_o_proj = bool(getattr(mem, "enable_pcp_o_proj_weight_sharding", False))
     dcp_q_rep = bool(getattr(mem, "dcp_q_replicate", False))
@@ -682,50 +754,59 @@ def _collect_weight_ledger_entries(
                 dcp_q_replicate=dcp_q_rep,
                 model=model,
             )
-            for t_sub, placed in expanded:
-                if not t_sub.runtime_owned:
+            for t_expanded, placed in expanded:
+                if not t_expanded.runtime_owned:
                     continue
-                g_rows, g_cols = int(t_sub.rows), int(t_sub.cols)
-                l_rows, l_cols, l_count = _sharded_shape(t_sub, placed, node_ranks)
-                if l_count <= 0:
-                    continue
-                q_fmt, q_rule, is_excl, q_note = _classify_term_format_and_rule(
-                    t_sub, quant, resolved_wq, hw_family, checkpoint, apply_preset_to_ignored,
-                )
-                tot_b = int(round(term_bytes(t_sub, quant, placed, node_ranks)))
-                pay_b = int(round(term_payload_bytes(t_sub, quant, placed, node_ranks)))
-                unit_total = tot_b // l_count
-                unit_payload = pay_b // l_count
-                unit_meta = max(0, unit_total - unit_payload)
-                spec = WEIGHT_QUANT_FORMATS.get(q_fmt, WEIGHT_QUANT_FORMATS["BF16"])
-                unit_scale, unit_aux = (unit_meta, 0) if int(spec["group"]) > 0 else (0, unit_meta)
-                axis, rule_str = _resolve_shard_axis_and_rule(
-                    t_sub, placed, g_rows, g_cols, l_rows, l_cols,
-                )
-                is_engram = str(t_sub.category or "").lower() in _ENGRAM_CATEGORIES
-                is_vis = _is_vision_term(t_sub)
-                key = (
-                    _weight_group_label(t_sub.category, t_sub.name),
-                    str(t_sub.name), str(t_sub.category),
-                    g_rows, g_cols, rule_str, axis, l_rows, l_cols,
-                    q_fmt, q_rule, is_engram, is_vis, unit_payload, unit_scale, unit_aux,
-                )
-                rec = grouped.get(key)
-                if rec is None:
-                    rec = {
-                        "group": key[0], "name": key[1], "category": key[2],
-                        "g_rows": g_rows, "g_cols": g_cols, "rule": rule_str,
-                        "axis": axis, "l_rows": l_rows, "l_cols": l_cols,
-                        "q_fmt": q_fmt, "q_rule": q_rule,
-                        "is_excl": is_excl, "q_note": q_note,
-                        "is_engram": is_engram, "is_vis": is_vis,
-                        "unit_p": unit_payload, "unit_s": unit_scale, "unit_a": unit_aux,
-                        "unit_bf16": l_rows * l_cols * BF16_BYTES,
-                        "stage_reps": [0] * pp,
-                    }
-                    grouped[key] = rec
-                    order.append(key)
-                rec["stage_reps"][st] += int(l_count)
+                for t_sub in _split_mixed_quant_expert_term(t_expanded, quant):
+                    g_rows, g_cols = int(t_sub.rows), int(t_sub.cols)
+                    l_rows, l_cols, l_count = _sharded_shape(t_sub, placed, node_ranks)
+                    if l_count <= 0:
+                        continue
+                    q_fmt, q_rule, is_excl, q_note = _classify_term_format_and_rule(
+                        t_sub, quant, resolved_wq, hw_family, checkpoint, apply_preset_to_ignored,
+                    )
+                    tot_b = int(round(term_bytes(t_sub, quant, placed, node_ranks)))
+                    pay_b = int(round(term_payload_bytes(t_sub, quant, placed, node_ranks)))
+                    if l_count > 1 and (tot_b % l_count != 0 or pay_b % l_count != 0):
+                        rep_inc = 1
+                        unit_total = tot_b
+                        unit_payload = pay_b
+                        unit_bf16 = l_rows * l_cols * BF16_BYTES * l_count
+                    else:
+                        rep_inc = int(l_count)
+                        unit_total = tot_b // l_count
+                        unit_payload = pay_b // l_count
+                        unit_bf16 = l_rows * l_cols * BF16_BYTES
+                    unit_meta = max(0, unit_total - unit_payload)
+                    spec = WEIGHT_QUANT_FORMATS.get(q_fmt, WEIGHT_QUANT_FORMATS["BF16"])
+                    unit_scale, unit_aux = (unit_meta, 0) if int(spec["group"]) > 0 else (0, unit_meta)
+                    axis, rule_str = _resolve_shard_axis_and_rule(
+                        t_sub, placed, g_rows, g_cols, l_rows, l_cols,
+                    )
+                    is_engram = str(t_sub.category or "").lower() in _ENGRAM_CATEGORIES
+                    is_vis = _is_vision_term(t_sub)
+                    key = (
+                        _weight_group_label(t_sub.category, t_sub.name),
+                        str(t_sub.name), str(t_sub.category),
+                        g_rows, g_cols, rule_str, axis, l_rows, l_cols,
+                        q_fmt, q_rule, is_engram, is_vis, unit_payload, unit_scale, unit_aux,
+                    )
+                    rec = grouped.get(key)
+                    if rec is None:
+                        rec = {
+                            "group": key[0], "name": key[1], "category": key[2],
+                            "g_rows": g_rows, "g_cols": g_cols, "rule": rule_str,
+                            "axis": axis, "l_rows": l_rows, "l_cols": l_cols,
+                            "q_fmt": q_fmt, "q_rule": q_rule,
+                            "is_excl": is_excl, "q_note": q_note,
+                            "is_engram": is_engram, "is_vis": is_vis,
+                            "unit_p": unit_payload, "unit_s": unit_scale, "unit_a": unit_aux,
+                            "unit_bf16": unit_bf16,
+                            "stage_reps": [0] * pp,
+                        }
+                        grouped[key] = rec
+                        order.append(key)
+                    rec["stage_reps"][st] += rep_inc
 
     _append_prepared_weight_entries(grouped, order, mem, prepared_weights, pp)
     return grouped, order
@@ -1487,7 +1568,11 @@ def compute_memory_quant_ledger(
         if not (r.is_engram_or_ple and offload_engram)
         and not (r.is_vision and not include_vit)
     ]
-    w_footprint = float(sum(r.per_die_bytes for r in hbm_w_rows))
+    expert_offload_b = float(
+        mem.expert_hbm_saved[peak_w_stage]
+        if 0 <= peak_w_stage < len(mem.expert_hbm_saved) else 0.0
+    )
+    w_footprint = max(0.0, float(sum(r.per_die_bytes for r in hbm_w_rows)) - expert_offload_b)
     native_bf16_w = float(sum(r.native_bf16_bytes for r in hbm_w_rows))
     vis_w = float(sum(r.per_die_bytes for r in weight_rows if r.is_vision)) if include_vit else 0.0
     pcp_deg = max(1, int(getattr(p, "pcp", 1) or 1))

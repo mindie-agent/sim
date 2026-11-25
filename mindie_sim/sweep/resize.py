@@ -378,7 +378,11 @@ def resolve_ranks_per_node(
     native = _sku_native_ranks_per_node(parsed)
     if isinstance(raw_case, Mapping) and isinstance(
             raw_case.get("machine"), Mapping):
-        raw_rpn = raw_case["machine"].get("ranks_per_node")
+        raw_machine = raw_case["machine"]
+        raw_explicit = raw_machine.get("ranks_per_node_explicit")
+        if raw_explicit is False:
+            return min(num_devices, native)
+        raw_rpn = raw_machine.get("ranks_per_node")
         if raw_rpn is not None:
             return min(num_devices, max(1, int(raw_rpn)))
         return min(num_devices, native)
@@ -472,7 +476,11 @@ def materialize_machine_for_devices(
 ) -> Hardware:
     """Materialize a Hardware descriptor for exactly ``num_devices`` dies."""
     original_count = len(parsed.machine.dies)
-    if original_count == num_devices:
+    ranks_per_node = resolve_ranks_per_node(parsed, num_devices, raw_case=raw_case)
+    if original_count == num_devices and (
+        not parsed.machine.homogeneous
+        or int(parsed.machine.ranks_per_node) == int(ranks_per_node)
+    ):
         return parsed.machine
     if not parsed.machine.homogeneous:
         if num_devices > original_count:
@@ -484,15 +492,12 @@ def materialize_machine_for_devices(
             link for link in parsed.machine.links
             if link.members and all(int(m) in selected_ranks for m in link.members)
         )
-        ranks_per_node = min(
-            num_devices, resolve_ranks_per_node(parsed, num_devices, raw_case=raw_case))
         return replace(
             parsed.machine, dies=selected_dies, links=induced_links,
-            ranks_per_node=ranks_per_node)
+            ranks_per_node=min(num_devices, ranks_per_node))
     base_device = deepcopy(parsed.machine.dies[0].to_dict())
     for key in ("rank", "node", "package"):
         base_device.pop(key, None)
-    ranks_per_node = resolve_ranks_per_node(parsed, num_devices, raw_case=raw_case)
     sku = parsed.machine.sku
     assumptions = dict(getattr(parsed.machine, "assumptions", ()) or ())
     profiles = ascend_profiles()
@@ -513,9 +518,19 @@ def materialize_machine_for_devices(
     raw_machine.update({key: deepcopy(value) for key, value in
                         getattr(parsed.machine, "topology_options", ())})
     if (isinstance(raw_case, Mapping)
-            and isinstance(raw_case.get("machine"), Mapping)
-            and raw_case["machine"].get("ranks_per_node") is None):
-        raw_machine.pop("ranks_per_node_explicit", None)
+            and isinstance(raw_case.get("machine"), Mapping)):
+        src_machine = raw_case["machine"]
+        src_explicit = src_machine.get("ranks_per_node_explicit")
+        if src_explicit is not None:
+            raw_machine["ranks_per_node_explicit"] = bool(src_explicit)
+        else:
+            raw_machine["ranks_per_node_explicit"] = src_machine.get("ranks_per_node") is not None
+    elif "ranks_per_node_explicit" not in raw_machine:
+        original = int(parsed.machine.ranks_per_node)
+        native = _sku_native_ranks_per_node(parsed)
+        raw_machine["ranks_per_node_explicit"] = bool(
+            original >= 1 and not (original == len(parsed.machine.dies) and original < native)
+        )
     links = _first_link_by_channel(parsed.machine)
     channels: dict[str, dict[str, Any]] = {}
     for name, value in getattr(parsed.machine, "transfer_channels", ()):

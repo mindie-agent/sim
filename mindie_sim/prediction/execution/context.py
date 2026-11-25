@@ -31,6 +31,7 @@ import hashlib
 import json
 import math
 from typing import Any, Mapping
+import weakref
 
 from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.common import ModelingError, dtype_bytes
@@ -634,6 +635,31 @@ class _ContextMixin:
         view = getattr(engine, "admission_memory_view", None) if engine is not None else None
         return view if view is not None else getattr(self, "admission_memory_view", None)
 
+    def _admission_view_identity(self, view: Any) -> int | None:
+        """Return a monotonic per-Execution identity token immune to Python id() reuse."""
+        if view is None:
+            return None
+        tokens = getattr(self, "_admission_view_tokens", None)
+        if tokens is None:
+            tokens = weakref.WeakKeyDictionary()
+            self._admission_view_tokens = tokens
+        try:
+            token = tokens.get(view)
+        except TypeError:
+            current = getattr(self, "_last_admission_view", None)
+            if current is view:
+                return int(self._last_admission_view_token)
+            token = int(getattr(self, "_next_admission_view_token", 0)) + 1
+            self._next_admission_view_token = token
+            self._last_admission_view = view
+            self._last_admission_view_token = token
+            return token
+        if token is None:
+            token = int(getattr(self, "_next_admission_view_token", 0)) + 1
+            self._next_admission_view_token = token
+            tokens[view] = token
+        return int(token)
+
     def prepare(self, op, replica=0):
         from ..efficiency.unmodeled_gate import assert_timing_supported
         assert_timing_supported(None, (op,), entry="execution_prepare")
@@ -663,8 +689,9 @@ class _ContextMixin:
         startup_mode = self.case.runtime.collective_startup_mode
         die_id = 0 if getattr(geom, "rank", None) is None else int(geom.rank)
         l2_state_key = _admission_l2_cache_key(admission_view, die_id)
+        view_token = self._admission_view_identity(admission_view)
         prep_key = (
-            id(self.recipes), frozen_geom, l2_state_key, stream_owners, startup_mode, op.stage,
+            id(self.recipes), frozen_geom, view_token, l2_state_key, stream_owners, startup_mode, op.stage,
             op.family, op.recipe, op.phase, op.dtype, op.layout, op.requests,
             op.semantic_shape, op.local_shape, op.padded_shape,
             op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
@@ -864,9 +891,13 @@ class _ContextMixin:
             selected = _apply_calibrated_dispatch_floor(context, dies, selected, envelope)
         if selected is not None:
             timing, record = selected
-            self._last_invocation_record = record
-            self.cost.record_invocation(record)
-            context = replace(context, invocation_timing=timing)
+            from ..program.invocation import _declared_launch_count
+            launch_count = _declared_launch_count(context.program_recipe or recipe, context)
+            if launch_count > 0:
+                self._last_invocation_record = record
+                for _ in range(launch_count):
+                    self.cost.record_invocation(record)
+                context = replace(context, invocation_timing=timing)
         if response is not None:
             if response.mode == "mac_service":
                 context = replace(context, service_regime=response.diagnostics())

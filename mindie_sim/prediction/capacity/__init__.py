@@ -67,6 +67,8 @@ from .reporting import _MemoryReportingMixin
 from .requests import _MemoryRequestsMixin
 from .residency import (
     _MemoryWorkspaceMixin,
+    _ep_rank_weight_signature,
+    _model_has_expert_quant_overrides,
     _resolve_offload_ratios,
     _routed_expert_bytes_by_stage,
     _weight_ledger_by_stage,
@@ -196,7 +198,9 @@ class Memory(
         self.enable_pcp_o_proj_weight_sharding = pcp_o_proj_shard
         self.dcp_q_replicate = dcp_q_rep
         self.slot_plans = None
+        mixed_expert_quant = _model_has_expert_quant_overrides(case.model)
         if (int(getattr(p, "redundant_experts_per_rank", 0) or 0) > 0
+                or mixed_expert_quant
                 or any(plan.ffn == "moe" and int(plan.num_experts) > 0
                        and int(plan.num_experts) % max(1, int(p.ep)) != 0
                        for plan in case.model.layer_plans)):
@@ -204,12 +208,16 @@ class Memory(
             from mindie_sim.schema.runtime_features import split_routing_features
             _logical, slot_routing = split_routing_features(
                 dict(case.runtime.routing or {}))
-            self.slot_plans = {
-                plan.index: expert_slot_plan(
-                    case.model, plan, p, routing=slot_routing)
-                for plan in case.model.layer_plans
+            moe_plans = [
+                plan for plan in case.model.layer_plans
                 if plan.ffn == "moe" and int(plan.num_experts) > 0
-            }
+            ]
+            if moe_plans:
+                self.slot_plans = {
+                    plan.index: expert_slot_plan(
+                        case.model, plan, p, routing=slot_routing)
+                    for plan in moe_plans
+                }
         self.vision_accounting = str(
             meta.get("vision_accounting")
             or (
@@ -221,63 +229,17 @@ class Memory(
             )
         )
         include_vision_opt = self.vision_accounting == "full_checkpoint"
-        self.gross_weights = stage_weight_bytes(
-            case.model, p, case.machine.ranks_per_node, include_draft=draft,
-            include_engram_tables=not case.runtime.engram_cpu_offload,
-            include_vision=include_vision_opt,
-            layer_partition=self.layers, draft_kind=self.draft_kind or None,
-            enable_shared_expert_dp=shared_expert_dp,
-            enable_pcp_o_proj_weight_sharding=pcp_o_proj_shard,
-            dcp_q_replicate=dcp_q_rep,
-            slot_plans=self.slot_plans,
-            runtime=case.runtime,
-        )
-        weight_totals, weight_payloads = _weight_ledger_by_stage(
-            case, self.layers, draft_kind=self.draft_kind,
-            include_draft=draft,
-            include_engram_tables=not case.runtime.engram_cpu_offload,
-            include_vision=include_vision_opt,
-            enable_shared_expert_dp=shared_expert_dp,
-            enable_pcp_o_proj_weight_sharding=pcp_o_proj_shard,
-            dcp_q_replicate=dcp_q_rep,
-            slot_plans=self.slot_plans,
-        )
-        if any(abs(total - gross) > max(1.0, abs(gross) * 1e-9)
-               for total, gross in zip(weight_totals, self.gross_weights)):
-            raise ValueError("memory_weight_decomposition_inconsistent")
         resolved_ws_tokens = self._resolve_workspace_tokens(workspace_tokens)
-        if self.offload["expert_ddr_ratio"] > 0.0:
-            (self.routed_expert_bytes, self.routed_expert_payload_bytes,
-             stage_staging_base) = _routed_expert_bytes_by_stage(
-                case, self.layer_stage, workspace_tokens=max(1, resolved_ws_tokens),
-                slot_plans=self.slot_plans,
-            )
-            self.expert_staging_workspace = [
-                self.offload["expert_ddr_ratio"] * value for value in stage_staging_base
-            ]
-        else:
-            self.routed_expert_bytes = [0.0] * p.pp
-            self.routed_expert_payload_bytes = [0.0] * p.pp
-            self.expert_staging_workspace = [0.0] * p.pp
-        self.expert_hbm_saved = [
-            self.offload["expert_ddr_ratio"] * value for value in self.routed_expert_bytes
-        ]
-        self.expert_payload_hbm_saved = [
-            self.offload["expert_ddr_ratio"] * value
-            for value in self.routed_expert_payload_bytes
-        ]
-        self.weights = [
-            max(0.0, gross - saved)
-            for gross, saved in zip(self.gross_weights, self.expert_hbm_saved)
-        ]
-        self.weights_payload = [
-            max(0.0, payload - saved)
-            for payload, saved in zip(weight_payloads, self.expert_payload_hbm_saved)
-        ]
-        self.weights_quant_metadata = [
-            max(0.0, total - payload)
-            for total, payload in zip(self.weights, self.weights_payload)
-        ]
+        self._init_stage_weight_ledgers(
+            case, p,
+            draft=draft,
+            include_vision_opt=include_vision_opt,
+            shared_expert_dp=shared_expert_dp,
+            pcp_o_proj_shard=pcp_o_proj_shard,
+            dcp_q_rep=dcp_q_rep,
+            resolved_ws_tokens=resolved_ws_tokens,
+            mixed_expert_quant=mixed_expert_quant,
+        )
         if case.runtime.engram_cpu_offload and case.model.engram is not None:
             from mindie_sim.catalog.draft_weights import require_model_quant
             from mindie_sim.catalog.weights import (
@@ -309,6 +271,180 @@ class Memory(
         self.c8_static_channel_scale_by_stage = self._resolve_c8_static_channel_scale_by_stage(
             case, p,
         )
+
+    def _compute_single_ep_weight_ledger(
+        self,
+        case,
+        p,
+        *,
+        ep_rank: int | None,
+        draft: bool,
+        include_vision_opt: bool,
+        shared_expert_dp: bool,
+        pcp_o_proj_shard: bool,
+        dcp_q_rep: bool,
+        resolved_ws_tokens: int,
+    ) -> dict[str, list[float]]:
+        gross = stage_weight_bytes(
+            case.model, p, case.machine.ranks_per_node, include_draft=draft,
+            include_engram_tables=not case.runtime.engram_cpu_offload,
+            include_vision=include_vision_opt,
+            layer_partition=self.layers, draft_kind=self.draft_kind or None,
+            enable_shared_expert_dp=shared_expert_dp,
+            enable_pcp_o_proj_weight_sharding=pcp_o_proj_shard,
+            dcp_q_replicate=dcp_q_rep,
+            slot_plans=self.slot_plans,
+            ep_rank=ep_rank,
+            runtime=case.runtime,
+        )
+        totals, payloads = _weight_ledger_by_stage(
+            case, self.layers, draft_kind=self.draft_kind,
+            include_draft=draft,
+            include_engram_tables=not case.runtime.engram_cpu_offload,
+            include_vision=include_vision_opt,
+            enable_shared_expert_dp=shared_expert_dp,
+            enable_pcp_o_proj_weight_sharding=pcp_o_proj_shard,
+            dcp_q_replicate=dcp_q_rep,
+            slot_plans=self.slot_plans,
+            ep_rank=ep_rank,
+        )
+        if any(abs(total - gross_v) > max(1.0, abs(gross_v) * 1e-9)
+               for total, gross_v in zip(totals, gross)):
+            raise ValueError("memory_weight_decomposition_inconsistent")
+        off_ratio = self.offload["expert_ddr_ratio"]
+        if off_ratio > 0.0:
+            routed, routed_pay, stage_stg = _routed_expert_bytes_by_stage(
+                case, self.layer_stage, workspace_tokens=max(1, resolved_ws_tokens),
+                slot_plans=self.slot_plans, ep_rank=ep_rank,
+            )
+            stg_ws = [off_ratio * v for v in stage_stg]
+        else:
+            routed = [0.0] * p.pp
+            routed_pay = [0.0] * p.pp
+            stg_ws = [0.0] * p.pp
+        saved = [off_ratio * v for v in routed]
+        saved_pay = [off_ratio * v for v in routed_pay]
+        net = [max(0.0, g - s) for g, s in zip(gross, saved)]
+        net_pay = [max(0.0, pay - sp) for pay, sp in zip(payloads, saved_pay)]
+        net_meta = [max(0.0, tot - pay) for tot, pay in zip(net, net_pay)]
+        return {
+            "gross": gross, "net": net, "payload": net_pay, "meta": net_meta,
+            "routed": routed, "routed_payload": routed_pay,
+            "saved": saved, "saved_payload": saved_pay, "staging": stg_ws,
+        }
+
+    def _init_stage_weight_ledgers(
+        self,
+        case,
+        p,
+        *,
+        draft: bool,
+        include_vision_opt: bool,
+        shared_expert_dp: bool,
+        pcp_o_proj_shard: bool,
+        dcp_q_rep: bool,
+        resolved_ws_tokens: int,
+        mixed_expert_quant: bool,
+    ) -> None:
+        ep = max(1, int(p.ep))
+        if self.slot_plans is not None and ep > 1:
+            from mindie_sim.catalog.weight_layer_terms import _layer_resolved_quant
+            layer_quants = (
+                {plan.index: _layer_resolved_quant(case.model, plan)
+                 for plan in case.model.layer_plans if plan.index in self.slot_plans}
+                if mixed_expert_quant else None
+            )
+            sig_cache: dict[tuple, dict[str, list[float]]] = {}
+            per_ep: list[dict[str, list[float]]] = []
+            for rank_i in range(ep):
+                sig = _ep_rank_weight_signature(
+                    case.model, self.slot_plans, rank_i,
+                    mixed_quant=mixed_expert_quant, layer_quants=layer_quants,
+                )
+                entry = sig_cache.get(sig)
+                if entry is None:
+                    entry = self._compute_single_ep_weight_ledger(
+                        case, p, ep_rank=rank_i, draft=draft,
+                        include_vision_opt=include_vision_opt,
+                        shared_expert_dp=shared_expert_dp,
+                        pcp_o_proj_shard=pcp_o_proj_shard,
+                        dcp_q_rep=dcp_q_rep,
+                        resolved_ws_tokens=resolved_ws_tokens,
+                    )
+                    sig_cache[sig] = entry
+                per_ep.append(entry)
+            derive_ws = bool(self.policy.derive_workspace)
+            worst_ep = tuple(
+                max(
+                    range(ep),
+                    key=lambda r: (
+                        per_ep[r]["net"][st] + (per_ep[r]["staging"][st] if derive_ws else 0.0),
+                        per_ep[r]["net"][st],
+                    ),
+                )
+                for st in range(p.pp)
+            )
+            self.bottleneck_ep_rank_by_stage = worst_ep
+            self.gross_weights_by_ep_rank = tuple(list(row["gross"]) for row in per_ep)
+            self.weights_by_ep_rank = tuple(list(row["net"]) for row in per_ep)
+            self.expert_staging_by_ep_rank = tuple(list(row["staging"]) for row in per_ep)
+            self.gross_weights = [per_ep[worst_ep[st]]["gross"][st] for st in range(p.pp)]
+            self.weights = [per_ep[worst_ep[st]]["net"][st] for st in range(p.pp)]
+            self.weights_payload = [per_ep[worst_ep[st]]["payload"][st] for st in range(p.pp)]
+            self.weights_quant_metadata = [per_ep[worst_ep[st]]["meta"][st] for st in range(p.pp)]
+            self.routed_expert_bytes = [per_ep[worst_ep[st]]["routed"][st] for st in range(p.pp)]
+            self.routed_expert_payload_bytes = [per_ep[worst_ep[st]]["routed_payload"][st] for st in range(p.pp)]
+            self.expert_hbm_saved = [per_ep[worst_ep[st]]["saved"][st] for st in range(p.pp)]
+            self.expert_payload_hbm_saved = [per_ep[worst_ep[st]]["saved_payload"][st] for st in range(p.pp)]
+            self.expert_staging_workspace = [
+                per_ep[worst_ep[st]]["staging"][st] for st in range(p.pp)
+            ]
+            return
+
+        single = self._compute_single_ep_weight_ledger(
+            case, p, ep_rank=(0 if self.slot_plans is not None else None), draft=draft,
+            include_vision_opt=include_vision_opt,
+            shared_expert_dp=shared_expert_dp,
+            pcp_o_proj_shard=pcp_o_proj_shard,
+            dcp_q_rep=dcp_q_rep,
+            resolved_ws_tokens=resolved_ws_tokens,
+        )
+        self.bottleneck_ep_rank_by_stage = (0,) * p.pp
+        self.gross_weights_by_ep_rank = (list(single["gross"]),)
+        self.weights_by_ep_rank = (list(single["net"]),)
+        self.expert_staging_by_ep_rank = (list(single["staging"]),)
+        self.gross_weights = single["gross"]
+        self.weights = single["net"]
+        self.weights_payload = single["payload"]
+        self.weights_quant_metadata = single["meta"]
+        self.routed_expert_bytes = single["routed"]
+        self.routed_expert_payload_bytes = single["routed_payload"]
+        self.expert_hbm_saved = single["saved"]
+        self.expert_payload_hbm_saved = single["saved_payload"]
+        self.expert_staging_workspace = single["staging"]
+
+    def _ep_rank_for_die(self, replica: int, stage: int, local_rank: int, placement=None) -> int:
+        p = self.case.runtime.parallel
+        ep = max(1, int(p.ep))
+        if ep <= 1 or len(self.weights_by_ep_rank) <= 1:
+            return 0
+        if placement is not None:
+            from mindie_sim.schema.common import ModelingError
+            try:
+                local = placement.stage_ranks(replica, stage)
+                group = placement.ep_group_ranks(replica, stage, lane=local_rank)
+                return int(group.index(local[local_rank]))
+            except ModelingError:
+                pass
+        if not (p.ep_spans_dp or p.ep_spans_pcp):
+            return int(local_rank) % ep
+        width = max(1, int(p.tp) // max(1, int(p.etp)))
+        copy, tp_lane = divmod(int(local_rank), max(1, int(p.tp)))
+        copy_count = min(int(p.pcp), max(1, ep // width)) if p.ep_spans_pcp else 1
+        rep_in_ep = int(replica) % max(1, int(p.ep_dp_width))
+        copy_in_ep = copy % max(1, copy_count)
+        tp_in_ep = tp_lane % width
+        return min(ep - 1, max(0, ((rep_in_ep * copy_count) + copy_in_ep) * width + tp_in_ep))
 
     def _resolve_c8_static_channel_scale_by_stage(self, case, p) -> tuple[int, ...]:
         """Resolve fixed per-die load-time GQA static C8/FAQuant scale/offset planes."""
@@ -438,10 +574,61 @@ class Memory(
             for stage in range(p.pp)
         ]
         self.fixed_per_rank = fixed_per_rank
+        placement = None
+        if len(self.weights_by_ep_rank) > 1:
+            from mindie_sim.schema.common import ModelingError
+            try:
+                placement = case.machine.validate_placement(p)
+            except ModelingError:
+                placement = None
+        rank_ep_ids = [
+            [
+                [
+                    self._ep_rank_for_die(replica, stage, local_rank, placement)
+                    for local_rank in range(len(self._stage_dies(replica, stage)))
+                ]
+                for stage in range(p.pp)
+            ]
+            for replica in range(p.dp)
+        ]
+        self.rank_weights = [
+            [
+                [
+                    self.weights_by_ep_rank[rank_ep_ids[replica][stage][local_rank]][stage]
+                    for local_rank in range(len(rank_ep_ids[replica][stage]))
+                ]
+                for stage in range(p.pp)
+            ]
+            for replica in range(p.dp)
+        ]
+        self.rank_workspace = [
+            [
+                [
+                    self.workspace_base[stage] + self.async_workspace[stage]
+                    + (
+                        self.expert_staging_by_ep_rank[rank_ep_ids[replica][stage][local_rank]][stage]
+                        if self.policy.derive_workspace else 0.0
+                    )
+                    + self.workspace_static_offload[stage]
+                    for local_rank in range(len(rank_ep_ids[replica][stage]))
+                ]
+                for stage in range(p.pp)
+            ]
+            for replica in range(p.dp)
+        ]
         self.rank_capacity = [
             [
-                [die.hbm_bytes * case.runtime.gpu_memory_utilization
-                 - fixed_per_rank[stage] for die in self._stage_dies(replica, stage)]
+                [
+                    die.hbm_bytes * case.runtime.gpu_memory_utilization
+                    - (
+                        self.rank_weights[replica][stage][local_rank]
+                        + self.policy.reserved
+                        + self.rank_workspace[replica][stage][local_rank]
+                        + self.temporary_dequant[stage]
+                        + float(self.c8_static_channel_scale_by_stage[stage])
+                    )
+                    for local_rank, die in enumerate(self._stage_dies(replica, stage))
+                ]
                 for stage in range(p.pp)
             ]
             for replica in range(p.dp)

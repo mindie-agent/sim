@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 from collections.abc import Mapping
 
@@ -23,6 +24,95 @@ from .contracts import MemoryPolicy
 
 _FFN_INTERMEDIATE_TENSORS = 3
 _VISION_SCORE_ELEMENT_BYTES = 4
+
+
+def _quant_has_expert_overrides(quant: QuantSpec | None) -> bool:
+    if quant is None:
+        return False
+    if getattr(quant, "expert_quant_overrides", ()):
+        return True
+    for _cat, fields in getattr(quant, "category_overrides", ()) or ():
+        if dict(fields).get("expert_quant_overrides"):
+            return True
+    return False
+
+
+def _model_has_expert_quant_overrides(model) -> bool:
+    """Return True when top-level or per-layer quantization carries per-expert overrides."""
+    quant = getattr(model, "quant", None)
+    if _quant_has_expert_overrides(quant):
+        return True
+    has_layer_ov = bool(
+        (quant is not None and getattr(quant, "layer_quant_overrides", ()))
+        or dict(getattr(model, "metadata", ()) or ()).get("layer_quant_overrides")
+    )
+    if not has_layer_ov:
+        return False
+    from mindie_sim.catalog.weight_layer_terms import _layer_resolved_quant
+    for plan in getattr(model, "layer_plans", ()) or ():
+        if plan.ffn == "moe" and int(plan.num_experts) > 0:
+            if _quant_has_expert_overrides(_layer_resolved_quant(model, plan)):
+                return True
+    return False
+
+
+def _expert_override_bucket_key(quant: QuantSpec | None, eid: int) -> tuple[int, ...]:
+    """Classify one expert ID into its exact override bucket tuple for bit-exact rank deduplication."""
+    if quant is None:
+        return ()
+    buckets: list[int] = []
+    idx = -1
+    for pos, (indices, _fields) in enumerate(getattr(quant, "expert_quant_overrides", ()) or ()):
+        if eid in indices:
+            idx = pos
+            break
+    buckets.append(idx)
+    for _cat, fields in getattr(quant, "category_overrides", ()) or ():
+        ov = dict(fields).get("expert_quant_overrides")
+        if not ov:
+            continue
+        c_idx = -1
+        for pos, (indices, _cfields) in enumerate(ov):
+            if eid in indices:
+                c_idx = pos
+                break
+        buckets.append(c_idx)
+    return tuple(buckets)
+
+
+def _ep_rank_weight_signature(
+    model,
+    slot_plans: Mapping[int, object],
+    ep_rank: int,
+    *,
+    mixed_quant: bool,
+    layer_quants: Mapping[int, QuantSpec] | None = None,
+) -> tuple:
+    """Bit-exact deduplication signature for one EP rank's routed-expert weight profile."""
+    sig: list = []
+    for layer_idx in sorted(slot_plans):
+        slots = slot_plans[layer_idx]
+        base_n = int(slots.base_slots_by_rank[ep_rank])
+        extra_n = int(slots.redundant_slots_by_rank[ep_rank])
+        if not mixed_quant:
+            sig.append((layer_idx, base_n, extra_n))
+            continue
+        lquant = (layer_quants or {}).get(layer_idx) or getattr(model, "quant", None)
+        base_ids, extra_ids = slots.split_expert_ids(ep_rank)
+        base_hist: dict[tuple[int, ...], int] = {}
+        for eid in base_ids:
+            bk = _expert_override_bucket_key(lquant, int(eid))
+            base_hist[bk] = base_hist.get(bk, 0) + 1
+        extra_hist: dict[tuple[int, ...], int] = {}
+        for eid in extra_ids:
+            bk = _expert_override_bucket_key(lquant, int(eid))
+            extra_hist[bk] = extra_hist.get(bk, 0) + 1
+        sig.append((
+            layer_idx, base_n, extra_n,
+            tuple(sorted(base_hist.items())),
+            tuple(sorted(extra_hist.items())),
+        ))
+    return tuple(sig)
 
 
 def _offload_ratio(name: str, value) -> float:
@@ -58,61 +148,127 @@ def _resolve_offload_ratios(case: CaseSpec, policy: MemoryPolicy) -> dict[str, f
     return ratios
 
 
+def _layer_routed_bytes_for_rank(
+    base_terms,
+    slots,
+    ep_rank: int,
+    quant: QuantSpec,
+    parallel,
+    node_ranks: int,
+    *,
+    routed_budget: int,
+    mixed_quant: bool,
+) -> tuple[float, float, float]:
+    from mindie_sim.catalog.expert_slots import routed_expert_weight_terms
+
+    terms = list(routed_expert_weight_terms(base_terms, slots, ep_rank=ep_rank))
+    routed = float(sum(term_bytes(term, quant, parallel, node_ranks) for term in terms))
+    routed_payload = float(sum(term_payload_bytes(term, quant, parallel, node_ranks) for term in terms))
+    base_ids, extra_ids = slots.split_expert_ids(ep_rank)
+    all_ids = (*base_ids, *extra_ids)
+    local_slots = max(1, len(all_ids))
+    active_slots = min(len(all_ids), routed_budget)
+    if active_slots <= 0 or routed <= 0.0:
+        active_bytes = 0.0
+    elif mixed_quant and active_slots < len(all_ids):
+        per_expert = sorted(
+            (
+                float(sum(
+                    term_bytes(
+                        replace(t, count=1, resident_count=1, expert_ids=(int(eid),)),
+                        quant, parallel, node_ranks,
+                    )
+                    for t in base_terms
+                ))
+                for eid in all_ids
+            ),
+            reverse=True,
+        )
+        active_bytes = min(routed, sum(per_expert[:active_slots]))
+    else:
+        active_bytes = min(routed, (routed / float(local_slots)) * float(active_slots))
+    return routed, routed_payload, active_bytes
+
+
 def _routed_expert_bytes_by_stage(
     case: CaseSpec, layer_stage: tuple[int, ...], *, workspace_tokens: int = 1,
-    slot_plans=None,
+    slot_plans=None, ep_rank: int | None = None,
 ) -> tuple[list[float], list[float], list[float]]:
     """Routed-expert total, payload and active staging bytes per PP stage."""
     parallel = case.runtime.parallel
     quant = case.model.quant or QuantSpec("bf16")
-    result = [0.0] * max(1, parallel.pp)
-    payload = [0.0] * max(1, parallel.pp)
-    staging = [0.0] * max(1, parallel.pp)
+    pp = max(1, parallel.pp)
     ep = max(1, int(parallel.ep))
     tokens = max(1, int(workspace_tokens))
+    mixed_quant = _model_has_expert_quant_overrides(case.model)
+    if slot_plans and ep_rank is None and ep > 1:
+        from mindie_sim.catalog.weight_layer_terms import _layer_resolved_quant
+        layer_quants = (
+            {plan.index: _layer_resolved_quant(case.model, plan)
+             for plan in case.model.layer_plans if plan.index in slot_plans}
+            if mixed_quant else None
+        )
+        sig_cache: dict[tuple, tuple[list[float], list[float], list[float]]] = {}
+        by_rank: list[tuple[list[float], list[float], list[float]]] = []
+        for rank_i in range(ep):
+            sig = _ep_rank_weight_signature(
+                case.model, slot_plans, rank_i,
+                mixed_quant=mixed_quant, layer_quants=layer_quants,
+            )
+            cached = sig_cache.get(sig)
+            if cached is None:
+                cached = _routed_expert_bytes_by_stage(
+                    case, layer_stage, workspace_tokens=tokens,
+                    slot_plans=slot_plans, ep_rank=rank_i,
+                )
+                sig_cache[sig] = cached
+            by_rank.append(cached)
+        best_res: list[float] = []
+        best_pay: list[float] = []
+        best_stg: list[float] = []
+        for st in range(pp):
+            lead = max(range(ep), key=lambda r: by_rank[r][0][st])
+            best_res.append(by_rank[lead][0][st])
+            best_pay.append(by_rank[lead][1][st])
+            best_stg.append(max(by_rank[r][2][st] for r in range(ep)))
+        return best_res, best_pay, best_stg
+
+    result = [0.0] * pp
+    payload = [0.0] * pp
+    staging = [0.0] * pp
+    target_ep = 0 if ep_rank is None else int(ep_rank)
     for plan in case.model.layer_plans:
         if plan.ffn != "moe" or int(plan.num_experts) <= 0 or int(plan.moe_intermediate_size) <= 0:
             continue
         stage = layer_stage[plan.index] if plan.index < len(layer_stage) else 0
         terms = [term for term in layer_weight_terms(plan, case.model)
                  if term.category == "routed_expert"]
-        slots = (slot_plans or {}).get(plan.index)
-        base_count = extra_count = 0
-        if slots is not None:
-            from mindie_sim.catalog.expert_slots import routed_expert_weight_terms
-            terms = list(routed_expert_weight_terms(terms, slots, ep_rank=0))
-            base_count = int(slots.base_slots_by_rank[0])
-            extra_count = int(slots.redundant_slots_by_rank[0])
-        routed = float(sum(
-            term_bytes(term, quant, parallel, case.machine.ranks_per_node)
-            for term in terms
-        ))
-        routed_payload = float(sum(
-            term_payload_bytes(term, quant, parallel, case.machine.ranks_per_node)
-            for term in terms
-        ))
-        result[stage] += routed
-        payload[stage] += routed_payload
         num_exp = int(plan.num_experts)
         k = min(num_exp, max(1, int(plan.top_k)))
         ep_dp = max(1, int(getattr(parallel, "ep_dp_width", 1) or 1))
         routed_budget = tokens * ep_dp * k
+        slots = (slot_plans or {}).get(plan.index)
         if slots is not None:
-            # Hard per-rank staging capacity must cover the worst-case integral
-            # count of local expert slots that can be routed in one step.
-            local_slots = max(1, base_count + extra_count)
-            per_slot = routed / float(local_slots)
-            worst_slots = max(
-                (min(len(ids), routed_budget) for ids in slots.expert_ids_by_rank),
-                default=0,
+            routed, routed_payload, active_layer_bytes = _layer_routed_bytes_for_rank(
+                terms, slots, target_ep, quant, parallel, case.machine.ranks_per_node,
+                routed_budget=routed_budget, mixed_quant=mixed_quant,
             )
-            active_layer_bytes = min(routed, per_slot * float(worst_slots))
         else:
+            routed = float(sum(
+                term_bytes(term, quant, parallel, case.machine.ranks_per_node)
+                for term in terms
+            ))
+            routed_payload = float(sum(
+                term_payload_bytes(term, quant, parallel, case.machine.ranks_per_node)
+                for term in terms
+            ))
             local_exp = max(1, (num_exp + ep - 1) // ep)
             worst_local = min(local_exp, routed_budget)
             active_layer_bytes = min(
                 routed, float(worst_local) * (routed / float(local_exp)),
             )
+        result[stage] += routed
+        payload[stage] += routed_payload
         staging[stage] = max(staging[stage], min(routed, active_layer_bytes))
     return result, payload, staging
 
