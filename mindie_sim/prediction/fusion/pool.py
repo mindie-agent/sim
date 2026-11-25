@@ -27,10 +27,11 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 import re
 import weakref
-from typing import Any, Mapping
+from typing import Any
 
 from mindie_sim.prediction.engine import Allocation
 from mindie_sim.prediction.execution.weight_prefetch import PREFETCH_TASK_PRIORITY
@@ -46,8 +47,13 @@ def clone_book(book: RecipeBook) -> RecipeBook:
     clone.programs = dict(book.programs)
     clone._explicit_recipes = frozenset(book._explicit_recipes)
     clone._caller_recipes = frozenset(book._caller_recipes)
+    clone._caller_programs = frozenset(getattr(book, "_caller_programs", ()))
     clone._explicit_families = frozenset(book._explicit_families)
     clone._family_kinds = dict(getattr(book, "_family_kinds", {}))
+    clone._select_id_cache = {}
+    clone._expand_id_cache = {}
+    clone._governed_recipes = {}
+    clone._prev_expand = None
     return clone
 
 
@@ -378,14 +384,37 @@ class PrefetchPoolProgram:
 
     def __init__(self, holder: PoolHolder, amount: float, units: int,
                  *, caps: Mapping[str, float] | None = None, priority: int = PREFETCH_TASK_PRIORITY,
-                 work_resource: str = "hbm", pool_name: str = "l1",
-                 lease_token: str | None = None):
+                 work_resource: str | Sequence[str] | Mapping[str, float] = "hbm",
+                 pool_name: str = "l1",
+                 lease_token: str | None = None,
+                 unit_ids: Sequence[int] | None = None):
         self.holder = holder
         self.amount = float(amount)
-        self.units = max(1, int(units))
-        self.caps = dict(caps or {})
+        if unit_ids:
+            self._unit_ids = tuple(dict.fromkeys(int(u) for u in unit_ids))
+            self.units = max(1, len(self._unit_ids))
+        else:
+            self.units = max(1, int(units))
+            self._unit_ids = pool_units(self.units)
+        self._caps = tuple((str(key), float(val)) for key, val in (caps or {}).items())
+        self.caps = dict(self._caps)
         self.priority = int(priority)
-        self.work_resource = str(work_resource)
+        if isinstance(work_resource, Mapping):
+            self._work_items = tuple(
+                (str(res), float(val))
+                for res, val in work_resource.items()
+                if float(val) > 0.0
+            )
+            self.work_resource = self._work_items[0][0] if self._work_items else "hbm"
+        elif isinstance(work_resource, (tuple, list, set, frozenset)):
+            names = tuple(dict.fromkeys(str(res) for res in work_resource if str(res)))
+            self._work_items = (
+                tuple((res, self.amount) for res in names) if self.amount > 0.0 else ()
+            )
+            self.work_resource = names[0] if names else "hbm"
+        else:
+            self.work_resource = str(work_resource)
+            self._work_items = ((self.work_resource, self.amount),) if self.amount > 0.0 else ()
         self.pool_name = str(pool_name)
         self.lease_token = lease_token
 
@@ -396,19 +425,21 @@ class PrefetchPoolProgram:
             raise ValueError(f"prefetch_invocation_name_reserved:{name}")
         per_unit = (self.amount / self.units) if self.amount > 0 else 0.0
         allocation = (Allocation(f"{name}:pool", self.pool_name, per_unit,
-                                 pool_units(self.units))
+                                 self._unit_ids)
                       if per_unit > 0 else None)
         grant = None
         if allocation is not None:
             grant = self.holder.allocate(
                 engine, allocation, scope=self.pool_name, name=name,
                 token=self.lease_token)
+        copy_work = {res: amt for res, amt in self._work_items if amt > 0.0}
+        copy_caps = dict(self._caps)
         committed = False
         try:
             event = engine.submit(
                 name + ":copy",
-                {self.work_resource: self.amount} if self.amount else {},
-                after=(ready,), caps=self.caps, priority=self.priority,
+                copy_work,
+                after=(ready,), caps=copy_caps, priority=self.priority,
                 owner=owner,
                 acquire=(allocation,) if allocation is not None else ())
             committed = True

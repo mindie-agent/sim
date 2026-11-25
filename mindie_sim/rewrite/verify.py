@@ -33,10 +33,11 @@ from mindie_sim.schema.abi import validate_fusion_tier_verdict
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.templates.contracts import DslKernelSpec
 
+from ._oracle_prefetch import _displaced_weight_mte2
 from .algebra import AlgebraicTrait, _resolve_soc_arch, classify_op_traits
 from .apply import (
-    AppliedPlan, ResolvedScenario, _check_stream, _convex, _dependencies, _die, _path,
-    _solve_tiles, _successors, _topological,
+    AppliedPlan, ResolvedScenario, _check_stream, _convex, _dependencies, _die,
+    _lane_pool_unit_ids, _path, _solve_tiles, _successors, _topological,
 )
 from .catalog_replay import (
     _canon_digest_value,
@@ -393,7 +394,10 @@ def _verify_region_summary_bindings(
                 die = _die(scenario, rank.replica, op.stage).rank
                 bound[op.op_id, members[op.op_id]].add((rank.replica, op.stage, die))
     memo = {} if catalog_memo is None else catalog_memo
-    templates = {binding.target_op: binding for binding in applied.template_bindings}
+    templates = {
+        (getattr(binding, "replica", 0), binding.target_op): binding
+        for binding in applied.template_bindings
+    }
     atomic = {entry.replica: entry for entry in scenario.atomic_ops}
     streams = {stream.rank: stream for stream in applied.streams}
     needed_ids = {s.region_id for s in summaries}
@@ -407,7 +411,7 @@ def _verify_region_summary_bindings(
             if op.op_id not in needed_ids:
                 continue
             resolved = _memoized_catalog_lowering(
-                scenario, rank_atomic, op, templates.get(op.op_id), applied, stream, memo,
+                scenario, rank_atomic, op, templates.get((entry.replica, op.op_id)), applied, stream, memo,
                 need_program=False,
             )
             if resolved is not None:
@@ -945,11 +949,14 @@ def _capacity_checks(scenario, applied, step_eval):
     rows = {(row.occurrence.replica, row.occurrence.op_id): row
             for row in getattr(step_eval, "operators", ())}
     streams = {stream.rank: stream for stream in applied.streams}
-    candidates = {binding.target_op: binding.tile_spec for binding in applied.tile_bindings
-                  if isinstance(binding.tile_spec, TilePipelineSpec)}
+    candidates = {
+        (getattr(binding, "replica", 0), binding.target_op): binding.tile_spec
+        for binding in applied.tile_bindings
+        if isinstance(binding.tile_spec, TilePipelineSpec)
+    }
     leases = defaultdict(list)
     for lease in applied.prefetch_leases:
-        leases[lease.target_op].append(lease)
+        leases[(getattr(lease, "replica", 0), lease.target_op)].append(lease)
     scope = {}
     liveness = defaultdict(list)
     for rank in applied.executable:
@@ -959,7 +966,8 @@ def _capacity_checks(scenario, applied, step_eval):
             die = _die(scenario, rank.replica, stage)
             path = _path(scenario, rank.replica, stage)
             simt = any(
-                dict(op.metadata).get("tile_uses_simt")
+                dict(op.metadata).get("uses_simt")
+                or dict(op.metadata).get("tile_uses_simt")
                 or dict(op.metadata).get("template_param_uses_simt")
                 or "simt" in str(dict(op.metadata).get("template_id", "")).lower()
                 for op in rank.ops if op.stage == stage
@@ -975,8 +983,9 @@ def _capacity_checks(scenario, applied, step_eval):
             lane = op.stream or MAIN_STREAM
             fallback = (ordinal, ordinal + 1) if rank.replica not in streams else (0, 1)
             start, end = _span(row, default=fallback)
-            if op.op_id in candidates:
-                solved, _ = _solve_tiles(scenario, rank.replica, op, candidates[op.op_id],
+            site = (rank.replica, op.op_id)
+            if site in candidates:
+                solved, _ = _solve_tiles(scenario, rank.replica, op, candidates[site],
                                          streams.get(rank.replica))
                 owners_by_lane = (bind_stream_owners(streams[rank.replica], path)
                                   if rank.replica in streams else {})
@@ -988,15 +997,36 @@ def _capacity_checks(scenario, applied, step_eval):
                         owner = (peak.owner_kind, lane)
                     # Include aliases of the same physical owner in the same sweep.
                     liveness[ident, peak.pool, owner].append((start, end, peak.peak_bytes))
-            for lease in leases.get(op.op_id, ()):
+            for lease in leases.get(site, ()):
                 if lease.window_anchor_op not in all_ops:
                     raise ModelingError(f"MULTI_POOL_CAPACITY:missing_prefetch_anchor:{op.op_id}")
                 anchor = rows.get((rank.replica, lease.window_anchor_op))
                 anchor_end = 0 if anchor is None else _span(anchor, default=(0, 0))[1]
-                owner = ("aic", lane) if rank.replica in streams and (
-                    bind_stream_owners(streams[rank.replica], path)[lane].isolation == "disjoint"
-                ) else "aic"
-                liveness[ident, lease.pool, owner].append((anchor_end, end, lease.max_bytes))
+                lane_owners = (
+                    bind_stream_owners(streams[rank.replica], path).get(lane)
+                    if rank.replica in streams else None
+                )
+                owner_kind = "aiv" if lease.pool == "ub" else "aic"
+                owner = (
+                    (owner_kind, lane)
+                    if lane_owners is not None and lane_owners.isolation == "disjoint"
+                    else owner_kind
+                )
+                lane_ids = _lane_pool_unit_ids(lane_owners, lease.pool, max(1, int(die.pool_units(lease.pool))))
+                declared_ids = tuple(int(u) for u in (getattr(lease, "physical_unit_ids", ()) or ()))
+                if declared_ids:
+                    if not set(declared_ids) <= set(lane_ids):
+                        raise ModelingError(
+                            f"MULTI_POOL_CAPACITY:prefetch_unit_outside_lane:{ident}:{lease.pool}:{lane}"
+                        )
+                    units = len(declared_ids)
+                else:
+                    declared_units = int(getattr(lease, "physical_units", 0) or 0)
+                    lane_cap_units = len(lane_ids)
+                    units = min(declared_units, lane_cap_units) if declared_units > 0 else lane_cap_units
+                units = max(1, units)
+                per_unit_bytes = (int(lease.max_bytes) + units - 1) // units
+                liveness[ident, lease.pool, owner].append((anchor_end, end, per_unit_bytes))
     for (ident, pool, owner), intervals in liveness.items():
         die, path, simt = scope[ident]
         peak, _ = residency_peak(tuple(intervals))
@@ -1127,9 +1157,15 @@ def _core_and_overlap(scenario, applied, step_eval):
     cohort_replicas = getattr(step_eval, "cohort_replicas", None)
     for tile in applied.tile_bindings:
         if tile.cohort_split == "dbo_2cohort":
-            intervals = ([cohort_replicas.get((replica, tile.target_op), {}) for replica, ops in by_rank.items()
-                          if any(op.op_id == tile.target_op for op in ops)]
-                         if cohort_replicas is not None else [cohort_intervals.get(tile.target_op, {})])
+            tile_rep = getattr(tile, "replica", 0)
+            if cohort_replicas is not None:
+                intervals = (
+                    [cohort_replicas.get((tile_rep, tile.target_op), {})]
+                    if tile_rep in by_rank and any(op.op_id == tile.target_op for op in by_rank[tile_rep])
+                    else []
+                )
+            else:
+                intervals = [cohort_intervals.get(tile.target_op, {})]
             percentages.extend(compute_overlap_pct(groups.get(0, ()), groups.get(1, ()))
                                for groups in intervals or ({},))
     if any(value is None for value in percentages):
@@ -1575,14 +1611,116 @@ def _verify_summary_lineage_work(summary, atomic_by_site):
                 raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{summary.region_id}:dtype:{key[0]}:{key[1]}")
 
 
+_PREFETCH_BYTES_TOL = 1e-6
+
+
+def _row_resource_amount(row, resources: frozenset[str]) -> float:
+    return fsum(
+        float(item.amount) for item in getattr(row, "work", ())
+        if item.resource in resources
+    )
+
+
+def _verify_applied_prefetch_dmas(
+    applied, step_eval, baseline_eval=None,
+) -> tuple[dict[tuple[int, str], float], float, float]:
+    """Reconcile every applied ``PrefetchLease`` with its executed DMA, release, and consumer rows."""
+    rows_by_site = {
+        (row.occurrence.replica, row.occurrence.op_id): row
+        for row in getattr(step_eval, "operators", ())
+    }
+    base_by_site = {
+        (row.occurrence.replica, row.occurrence.op_id): row
+        for row in getattr(baseline_eval, "operators", ())
+    } if baseline_eval is not None else {}
+    exec_by_site = {(entry.replica, op.op_id): op for entry in applied.executable for op in entry.ops}
+    displaced: dict[tuple[int, str], float] = defaultdict(float)
+    total_dma_hbm = 0.0
+    total_dma_mte2 = 0.0
+    mte2_res = frozenset({"mte2", "mte2_aic", "mte2_aiv"})
+    hbm_res = frozenset({"hbm"})
+    for lease in applied.prefetch_leases:
+        if lease.max_bytes <= 0:
+            continue
+        replica = getattr(lease, "replica", 0)
+        prefetch_row = rows_by_site.get((replica, f"prefetch_W_{lease.target_op}"))
+        release_row = rows_by_site.get((replica, f"release_W_{lease.target_op}"))
+        if prefetch_row is None or prefetch_row.family != "prefetch":
+            raise ModelingError(
+                f"WORK_CONSERVATION_MISMATCH:missing_prefetch_dma:{replica}:{lease.target_op}"
+            )
+        if release_row is None or release_row.family != "release":
+            raise ModelingError(
+                f"WORK_CONSERVATION_MISMATCH:missing_prefetch_release:{replica}:{lease.target_op}"
+            )
+        executed_bytes = _row_resource_amount(prefetch_row, hbm_res)
+        if executed_bytes + _PREFETCH_BYTES_TOL < float(lease.max_bytes):
+            raise ModelingError(
+                f"WORK_CONSERVATION_MISMATCH:prefetch_dma_underexecuted:{replica}:{lease.target_op}"
+            )
+        target_op = exec_by_site.get((replica, lease.target_op))
+        expected_mte2 = (
+            _displaced_weight_mte2(target_op, lease.max_bytes)[0]
+            if target_op is not None else 0.0
+        )
+        executed_mte2 = _row_resource_amount(prefetch_row, mte2_res)
+        if expected_mte2 > 0.0 and executed_mte2 + _PREFETCH_BYTES_TOL < expected_mte2:
+            raise ModelingError(
+                f"WORK_CONSERVATION_MISMATCH:prefetch_dma_mte2_underexecuted:{replica}:{lease.target_op}"
+            )
+        target_row = rows_by_site.get((replica, lease.target_op))
+        base_row = base_by_site.get((replica, lease.target_op))
+        if target_row is not None and base_row is not None:
+            if _dropped(executed_bytes + _row_resource_amount(target_row, hbm_res), _row_resource_amount(base_row, hbm_res)):
+                raise ModelingError(
+                    f"WORK_CONSERVATION_MISMATCH:prefetch_hbm_conservation_dropped:{replica}:{lease.target_op}"
+                )
+            if _dropped(executed_mte2 + _row_resource_amount(target_row, mte2_res), _row_resource_amount(base_row, mte2_res)):
+                raise ModelingError(
+                    f"WORK_CONSERVATION_MISMATCH:prefetch_mte2_conservation_dropped:{replica}:{lease.target_op}"
+                )
+        total_dma_hbm += float(lease.max_bytes)
+        total_dma_mte2 += expected_mte2
+        displaced[replica, lease.target_op] += min(float(lease.max_bytes), executed_bytes)
+    return displaced, total_dma_hbm, total_dma_mte2
+
+
 def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, service_replay, summaries, *, scope="full"):
     edits = applied.plan.edits
     has_rebind = any(isinstance(edit.operation, (FuseRegion, SelectTemplate)) for edit in edits)
+    has_prefetch = any(lease.max_bytes > 0 for lease in applied.prefetch_leases)
     if step_eval is None:
-        if scope == "full" and has_rebind:
+        if scope == "full" and (has_rebind or has_prefetch):
             raise ModelingError("WORK_CONSERVATION_MISMATCH:missing_step_eval")
         return
+    leases: dict[tuple[int, str], float] = defaultdict(float)
+    total_dma_hbm = 0.0
+    total_dma_mte2 = 0.0
+    if has_prefetch and (scope == "full" or has_rebind):
+        leases, total_dma_hbm, total_dma_mte2 = _verify_applied_prefetch_dmas(
+            applied, step_eval, baseline_eval,
+        )
     if not has_rebind:
+        if has_prefetch and scope == "full":
+            got_srv = _execution_evidence(step_eval).get("serviced")
+            if not isinstance(got_srv, dict):
+                raise ModelingError("WORK_CONSERVATION_MISMATCH:missing_executed_service")
+            hbm_res, mte2_res = frozenset({"hbm"}), frozenset({"mte2", "mte2_aic", "mte2_aiv"})
+            got_ops = getattr(step_eval, "operators", ())
+            got_op_hbm = fsum(_row_resource_amount(row, hbm_res) for row in got_ops)
+            got_op_mte2 = fsum(_row_resource_amount(row, mte2_res) for row in got_ops)
+            if _dropped(_service_amount(got_srv, _TRANSFER_SERVICE["hbm"]), max(total_dma_hbm, got_op_hbm)):
+                raise ModelingError("WORK_CONSERVATION_MISMATCH:executed_memory_service_dropped")
+            if _dropped(_service_amount(got_srv, _TRANSFER_SERVICE["mte2"]), max(total_dma_mte2, got_op_mte2)):
+                raise ModelingError("WORK_CONSERVATION_MISMATCH:executed_mte2_service_dropped")
+            base_ops = getattr(baseline_eval, "operators", ()) if baseline_eval is not None else ()
+            if base_ops:
+                base_op_hbm = fsum(_row_resource_amount(row, hbm_res) for row in base_ops)
+                base_op_mte2 = fsum(_row_resource_amount(row, mte2_res) for row in base_ops)
+                if _dropped(got_op_hbm, base_op_hbm):
+                    raise ModelingError("WORK_CONSERVATION_MISMATCH:executed_memory_service_dropped")
+                if _dropped(got_op_mte2, base_op_mte2):
+                    raise ModelingError("WORK_CONSERVATION_MISMATCH:executed_mte2_service_dropped")
         return
     exec_by_site = {(entry.replica, op.op_id): op for entry in applied.executable for op in entry.ops}
     for row in getattr(step_eval, "operators", ()):
@@ -1597,10 +1735,6 @@ def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, 
     base_serviced = _execution_evidence(baseline_eval or scenario.atomic_step).get("serviced")
     if not isinstance(got_serviced, dict) or not isinstance(base_serviced, dict):
         raise ModelingError("WORK_CONSERVATION_MISMATCH:missing_executed_service")
-    leases = Counter()
-    for lease in applied.prefetch_leases:
-        if lease.max_bytes > 0:
-            leases[lease.target_op] += lease.max_bytes
     catalog_sites = {(summary.semantic_work[0].replica, summary.region_id) for summary in summaries
                      if summary.semantic_work}
     catalog = {(summary.semantic_work[0].replica, summary.region_id): summary for summary in summaries
@@ -1616,13 +1750,15 @@ def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, 
     quantized = {op_id for receipt in applied.edit_receipts
                  if receipt.opcode == QuantizeContract.__name__ and receipt.status == "applied"
                  for op_id in receipt.affected_ops}
-    rebound = {binding.target_op for binding in applied.template_bindings}
+    rebound = {(getattr(binding, "replica", 0), binding.target_op) for binding in applied.template_bindings}
     base_rows = {(row.occurrence.replica, row.occurrence.op_id): row
                  for row in getattr(baseline_eval or scenario.atomic_step, "operators", ())
-                 if isinstance(row, OperatorSequenceRow) and row.occurrence.op_id in rebound
+                 if isinstance(row, OperatorSequenceRow)
+                 and (row.occurrence.replica, row.occurrence.op_id) in rebound
                  and (row.occurrence.replica, row.occurrence.op_id) in exec_by_site}
     actual_rows = {(row.occurrence.replica, row.occurrence.op_id): row
-                   for row in getattr(step_eval, "operators", ()) if row.occurrence.op_id in rebound}
+                   for row in getattr(step_eval, "operators", ())
+                   if (row.occurrence.replica, row.occurrence.op_id) in rebound}
     if base_rows.keys() - actual_rows.keys():
         raise ModelingError("WORK_CONSERVATION_MISMATCH:missing_template_work")
     targets = base_rows.keys() | catalog.keys()
@@ -1656,7 +1792,7 @@ def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, 
     for occurrence, row in base_rows.items():
         if occurrence in catalog_sites:
             continue
-        _, op_id = occurrence
+        replica, op_id = occurrence
         actual = Counter()
         expected = Counter()
         for item in actual_rows[occurrence].work:
@@ -1664,7 +1800,7 @@ def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, 
         for item in row.work:
             expected[item.resource] += item.amount
         for role, prefixes in _TEMPLATE_SERVICE.items():
-            allowance = leases[op_id] if role in _TRANSFER_SERVICE else 0
+            allowance = leases.get((replica, op_id), 0.0) if role in _TRANSFER_SERVICE else 0.0
             if op_id in quantized and role in {"hbm", "mte2", "mte3"}:
                 continue
             if _dropped(actual[role], expected[role], allowance):
@@ -1675,27 +1811,38 @@ def _executed_service_conservation(scenario, applied, step_eval, baseline_eval, 
                     raise ModelingError(f"WORK_CONSERVATION_MISMATCH:{op_id}:executed_{role}")
 
 
+def _hoisted_sites(scenario, applied) -> set[tuple[int, str]]:
+    scoped = getattr(applied, "hoisted_load_time_sites", ())
+    if scoped:
+        return {(int(rep), str(oid)) for rep, oid in scoped}
+    if not applied.hoisted_load_time:
+        return set()
+    return {(entry.replica, oid) for entry in scenario.atomic_ops for oid in applied.hoisted_load_time}
+
+
 def _conservation(scenario, applied, summaries, step_eval=None, baseline_eval=None, baseline_work=None,
                   service_replay=None, *, scope="full", catalog_memo=None):
     _verify_fuse_region_witnesses(scenario, applied, scope, step_eval=step_eval, baseline_eval=baseline_eval)
     _verify_region_summary_bindings(scenario, applied, summaries, catalog_memo=catalog_memo)
-    hoists = set(applied.hoisted_load_time)
+    hoist_sites = _hoisted_sites(scenario, applied)
+    cse_ids: set[str] = set()
     cse = {edit.edit_id for edit in applied.plan.edits
            if isinstance(edit.operation, HoistOrDeduplicate) and edit.operation.scope == "intra_step"}
     for receipt in applied.edit_receipts:
         if receipt.edit_id in cse and receipt.status == "applied":
-            hoists.update(receipt.affected_ops)
+            cse_ids.update(receipt.affected_ops)
     retained = {entry.replica: entry.ops for entry in applied.executable}
     if retained.keys() != {entry.replica for entry in scenario.atomic_ops}:
         raise ModelingError("WORK_CONSERVATION_MISMATCH:replica_domain")
     for entry in scenario.atomic_ops:
         after = retained.get(entry.replica, ())
-        if baseline_work is not None and not hoists:
+        rank_hoists = {oid for rep, oid in hoist_sites if rep == entry.replica} | cse_ids
+        if baseline_work is not None and not rank_hoists:
             expected = baseline_work[entry.replica]
         else:
             retained_ids = {op.op_id for op in after}
             expected = _work_totals(op for op in entry.ops
-                                    if op.op_id not in hoists or op.op_id in retained_ids)
+                                    if op.op_id not in rank_hoists or op.op_id in retained_ids)
         actual = _work_totals(after)
         for key in expected.keys() | actual.keys():
             if not isclose(expected.get(key, 0), actual.get(key, 0), rel_tol=1e-12, abs_tol=1e-9):
@@ -1742,10 +1889,11 @@ def _bound(scenario, applied, summaries, primitive_table, rate_mode, certificate
             )
         canonical_program, canonical_dag, _ = build_dual_inputs_from_scenario(
             scenario,
-            applied=(None if summaries else applied),
+            applied=applied,
             region_summaries=summaries,
             primitive_table=primitive_table,
             rate_mode=rate_mode,
+            verify_summaries=not summaries,
         )
         if (program is not None and program != canonical_program) or (dag is not None and dag != canonical_dag):
             raise ModelingError("LEAN_CERTIFICATE_INVALID:certificate_unbound_to_scenario")
@@ -1773,6 +1921,15 @@ def _bound(scenario, applied, summaries, primitive_table, rate_mode, certificate
     return l_star
 
 
+def _elided_d2h_sites(scenario, applied) -> set[tuple[int, str]]:
+    scoped = getattr(applied, "elided_d2h_sites", ())
+    if scoped:
+        return {(int(rep), str(oid)) for rep, oid in scoped}
+    if not applied.elided_d2h_ops:
+        return set()
+    return {(entry.replica, oid) for entry in scenario.atomic_ops for oid in applied.elided_d2h_ops}
+
+
 def _verify_step_eval_binding(scenario, applied, step_eval) -> None:
     """Bind full-step Engine replay strictly to ``scenario``, ``step``, ``applied``, and occurrences."""
     if getattr(step_eval, "request", None) != scenario.step:
@@ -1786,13 +1943,14 @@ def _verify_step_eval_binding(scenario, applied, step_eval) -> None:
         raise ModelingError("LEAN_CERTIFICATE_INVALID:step_eval_plan_mismatch")
     rows = getattr(step_eval, "operators", ()) or ()
     if rows or applied.plan.edits:
-        excluded = set(applied.hoisted_load_time) | set(applied.elided_d2h_ops)
+        hoist_sites = _hoisted_sites(scenario, applied)
+        elided_sites = _elided_d2h_sites(scenario, applied)
         row_meta = {(row.occurrence.replica, row.occurrence.op_id): (row.shape, row.family) for row in rows}
         for entry in applied.executable:
             for op in entry.ops:
-                if op.op_id in excluded:
-                    continue
                 site = (entry.replica, op.op_id)
+                if site in hoist_sites or site in elided_sites:
+                    continue
                 if site not in row_meta or row_meta[site] != (op.local_shape, op.family):
                     raise ModelingError(f"LEAN_CERTIFICATE_INVALID:step_eval_occurrence_mismatch:{op.op_id}")
 

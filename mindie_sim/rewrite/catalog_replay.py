@@ -105,6 +105,30 @@ def _weight_allocation_id(meta: Mapping[str, object]) -> str | None:
     ), None)
 
 
+_CATLASS_DTYPE_ALIASES: Mapping[str, str] = {
+    "bfloat16": "bf16",
+    "float16": "fp16",
+    "float32": "fp32",
+    "float8_e4m3fn": "fp8_e4m3",
+    "float8_e4m3": "fp8_e4m3",
+    "fp8_e4m3fn": "fp8_e4m3",
+    "fp8_e4m3": "fp8_e4m3",
+    "float8_e5m2": "fp8_e5m2",
+    "float4_e2m1": "fp4_e2m1",
+    "fp4": "fp4_e2m1",
+    "ue8m0": "fp8_e8m0",
+}
+_ABI_METHOD_MX_MODES: Mapping[str, str] = {
+    "mx_fp8": "mxfp8",
+    "mx_fp4": "mxfp4",
+}
+
+
+def _norm_catlass_dtype(raw: object) -> str:
+    tok = str(raw or "").strip().lower()
+    return _CATLASS_DTYPE_ALIASES.get(tok, tok)
+
+
 def _weight_backing_offset(meta: Mapping[str, object]) -> int:
     ranges = meta.get("weight_ranges", meta.get("ranges"))
     if not isinstance(ranges, Sequence) or isinstance(ranges, (str, bytes)) or not ranges:
@@ -112,18 +136,74 @@ def _weight_backing_offset(meta: Mapping[str, object]) -> int:
     spans = []
     for item in ranges:
         if not isinstance(item, Sequence) or len(item) != _PAIR_LEN:
-            return 0
+            raise ModelingError("rewrite_catlass_invalid_weight_ranges")
         lo, hi = item
         if type(lo) is not int or type(hi) is not int or lo < 0 or hi <= lo:
-            return 0
+            raise ModelingError("rewrite_catlass_invalid_weight_ranges")
         spans.append((lo, hi))
     merged = _merge_byte_intervals(spans)
-    return merged[0][0] if len(merged) == 1 else 0
+    if len(merged) > 1:
+        raise ModelingError("rewrite_catlass_disjoint_weight_ranges")
+    return merged[0][0]
 
 
 def _weight_backing_version(meta: Mapping[str, object]) -> int:
     version = meta.get("weight_tensor_version", meta.get("tensor_version", 0))
     return version if type(version) is int and version >= 0 else 0
+
+
+def _resolve_catlass_precisions(op: OpSpec, meta: Mapping[str, object]) -> tuple[str, str, str, str, str | None]:
+    """Derive ``(dtype_a, dtype_b, dtype_c, dtype_acc, mx_mode)`` from ``precision_abi`` + validated meta."""
+    p_abi = getattr(op, "precision_abi", None)
+    if p_abi is not None:
+        dtype_a = _norm_catlass_dtype(p_abi.input_dtype or op.dtype)
+        dtype_b = _norm_catlass_dtype(p_abi.weight_dtype or p_abi.input_dtype or op.dtype)
+        dtype_c = _norm_catlass_dtype(p_abi.output_dtype or op.dtype)
+        dtype_acc = _norm_catlass_dtype(
+            p_abi.accum_dtype or ("int32" if dtype_a == "int8" else "fp32")
+        )
+        for field_name, expected, keys in (
+            ("dtype_a", dtype_a, ("dtype_a", "activation_format")),
+            ("dtype_b", dtype_b, ("dtype_b", "weight_format")),
+            ("dtype_c", dtype_c, ("dtype_c", "output_format")),
+            ("dtype_acc", dtype_acc, ("dtype_acc",)),
+        ):
+            for key in keys:
+                raw_val = meta.get(key)
+                if raw_val is not None and str(raw_val).strip():
+                    if _norm_catlass_dtype(raw_val) != expected:
+                        raise ModelingError(
+                            f"rewrite_catlass_precision_abi_conflict:{op.op_id}:{field_name}"
+                        )
+        scale_fmt = _norm_catlass_dtype(
+            p_abi.weight_scale_dtype or meta.get("weight_scale_format") or ""
+        )
+        mode = meta.get("native_matrix_mode")
+        abi_method_mode = _ABI_METHOD_MX_MODES.get(p_abi.linear_method)
+        mx_mode = mode if mode in _MX_MODES else None
+        needs_mx = mx_mode is None and (scale_fmt == "fp8_e8m0" or abi_method_mode is not None)
+    else:
+        dtype_a = _norm_catlass_dtype(meta.get("dtype_a", meta.get("activation_format", op.dtype)))
+        dtype_b = _norm_catlass_dtype(meta.get("dtype_b", meta.get("weight_format", op.dtype)))
+        dtype_c = _norm_catlass_dtype(meta.get("dtype_c", meta.get("output_format", op.dtype)))
+        dtype_acc = _norm_catlass_dtype(
+            meta.get("dtype_acc", "int32" if dtype_a == "int8" else "fp32")
+        )
+        scale_fmt = _norm_catlass_dtype(meta.get("weight_scale_format") or "")
+        mode = meta.get("native_matrix_mode", op.dtype)
+        abi_method_mode = None
+        mx_mode = mode if mode in _MX_MODES else None
+        needs_mx = mx_mode is None and scale_fmt == "fp8_e8m0"
+    if needs_mx:
+        if dtype_a in _FP8_FORMATS and dtype_b in _FP8_FORMATS:
+            mx_mode = "mxfp8"
+        elif dtype_a in _FP4_FORMATS and dtype_b in _FP4_FORMATS:
+            mx_mode = "mxfp4"
+        elif dtype_a in (_FP8_FORMATS | {"int8"}) and dtype_b in (_FP4_FORMATS | {"int4"}):
+            mx_mode = "a8w4_mx"
+        elif abi_method_mode is not None:
+            mx_mode = abi_method_mode
+    return dtype_a, dtype_b, dtype_c, dtype_acc, mx_mode
 
 
 def _matrix_problem(op: OpSpec, meta: Mapping[str, object]) -> CatlassProblem | None:
@@ -151,22 +231,16 @@ def _matrix_problem(op: OpSpec, meta: Mapping[str, object]) -> CatlassProblem | 
     groups = tuple(meta.get("group_rows", ()))
     if op.family in _GROUPED_FAMILIES and not groups:
         return None
-    mode = meta.get("native_matrix_mode", op.dtype)
-    dtype_a = meta.get("dtype_a", meta.get("activation_format", op.dtype))
-    dtype_b = meta.get("dtype_b", meta.get("weight_format", op.dtype))
-    mx_mode = mode if mode in _MX_MODES else None
-    if mx_mode is None and meta.get("weight_scale_format") == "fp8_e8m0":
-        if dtype_a in _FP8_FORMATS and dtype_b in _FP8_FORMATS:
-            mx_mode = "mxfp8"
-        elif dtype_a in _FP4_FORMATS and dtype_b in _FP4_FORMATS:
-            mx_mode = "mxfp4"
-        elif dtype_a in (_FP8_FORMATS | {"int8"}) and dtype_b in (_FP4_FORMATS | {"int4"}):
-            mx_mode = "a8w4_mx"
-    if (dtype_a != dtype_b and not mx_mode) or (meta.get("weight_scale_format") and not mx_mode):
+    dtype_a, dtype_b, dtype_c, dtype_acc, mx_mode = _resolve_catlass_precisions(op, meta)
+    p_abi = getattr(op, "precision_abi", None)
+    has_weight_scale = bool(
+        meta.get("weight_scale_format")
+        or (p_abi is not None and p_abi.weight_scale_dtype)
+    )
+    if (dtype_a != dtype_b and not mx_mode) or (has_weight_scale and not mx_mode):
         return None
     return CatlassProblem(
-        *shape, dtype_a, dtype_b, meta.get("dtype_c", meta.get("output_format", op.dtype)),
-        meta.get("dtype_acc", "int32" if dtype_a == "int8" else "fp32"),
+        *shape, dtype_a, dtype_b, dtype_c, dtype_acc,
         groups=groups, a_id=f"{op.op_id}:a", b_id=weight_id or f"{op.op_id}:b",
         c_id=f"{op.op_id}:c", has_bias=bool(meta.get("has_bias")), mx_mode=mx_mode,
         b_base_byte=b_base_byte, b_version=b_version,
@@ -205,9 +279,37 @@ def select_catlass_candidates(
         return ()
 
 
+def _freeze_dsl_field_value(value: object) -> object:
+    if isinstance(value, list):
+        return tuple(_freeze_dsl_field_value(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze_dsl_field_value(item) for item in value)
+    return value
+
+
+def _dsl_problem_kwargs(
+    problem_cls: type, meta: Mapping[str, object], *, exclude: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    """Extract every declared dataclass field present in ``meta`` with frozen tuple sequences."""
+    kw: dict[str, object] = {}
+    for field_spec in fields(problem_cls):
+        name = field_spec.name
+        if name in exclude or name not in meta:
+            continue
+        raw = meta[name]
+        if raw is None and field_spec.default is not None:
+            continue
+        kw[name] = _freeze_dsl_field_value(raw)
+    return kw
+
+
 def _infer_dsl_problem(op: OpSpec, meta: Mapping[str, object], kernel: str):
     if kernel == ATTN_RES and len(op.local_shape) >= _PAIR_LEN and op.layout == "contiguous":
-        return AttnResProblem(prod(op.local_shape[:-1]), int(op.local_shape[-1]), op.dtype)
+        tokens = int(meta.get("tokens") or meta.get("rows") or prod(op.local_shape[:-1]))
+        hidden_size = int(meta.get("hidden_size") or meta.get("hidden") or op.local_shape[-1])
+        kw = _dsl_problem_kwargs(AttnResProblem, meta, exclude=frozenset({"tokens", "hidden_size"}))
+        kw.setdefault("dtype", op.dtype)
+        return AttnResProblem(tokens, hidden_size, **kw)
     if kernel == QSLI:
         q_rows = int(meta.get("query_rows") or (op.local_shape[0] if op.local_shape else 0))
         topk = int(meta.get("topk") or meta.get("selected_token_rows") or 0)
@@ -218,35 +320,44 @@ def _infer_dsl_problem(op: OpSpec, meta: Mapping[str, object], kernel: str):
             if est > 0 and est * denom == int(op.flops):
                 cands = est
         if q_rows > 0 and cands > 0 and topk > 0:
-            splits = max(1, int(meta.get("index_context_partitions") or 1))
-            return QsliProblem(q_rows, cands, topk, split_parts=splits)
+            kw = _dsl_problem_kwargs(
+                QsliProblem, meta, exclude=frozenset({"query_rows", "candidates", "topk"}),
+            )
+            if "split_parts" not in kw and meta.get("index_context_partitions") is not None:
+                kw["split_parts"] = max(1, int(meta["index_context_partitions"]))
+            return QsliProblem(q_rows, cands, topk, **kw)
     if kernel == MLA_PROLOG:
         tokens = int(meta.get("tokens") or (op.local_shape[0] if op.local_shape else 0))
         dim = int(meta.get("dim") or (op.local_shape[-1] if len(op.local_shape) >= _PAIR_LEN else 0))
         if tokens > 0 and dim > 0:
-            kw = {k: meta[k] for k in ("q_lora", "kvr", "heads", "q_nope", "rope", "mode") if k in meta}
+            kw = _dsl_problem_kwargs(MlaPrologProblem, meta, exclude=frozenset({"tokens", "dim"}))
             return MlaPrologProblem(tokens, dim=dim, **kw)
     if kernel == MQSMLA and ("n_ori" in meta or "n_cmp" in meta):
         n_ori, n_cmp = int(meta.get("n_ori", 0)), int(meta.get("n_cmp", 0))
         queries = int(meta.get("queries") or (op.local_shape[0] if op.local_shape else 1))
         if n_ori > 0 or n_cmp > 0:
-            return MixedQuantSparseMlaProblem(n_ori, n_cmp, queries=queries)
+            kw = _dsl_problem_kwargs(
+                MixedQuantSparseMlaProblem, meta, exclude=frozenset({"n_ori", "n_cmp", "queries"}),
+            )
+            return MixedQuantSparseMlaProblem(n_ori, n_cmp, queries=queries, **kw)
     if kernel == FLASH_KDA and meta.get("lengths"):
-        return FlashKdaProblem(
-            tuple(int(v) for v in meta["lengths"]),
-            value_heads=int(meta.get("value_heads", 1)),
-            query_heads=int(meta.get("query_heads", 1)),
-        )
+        lengths = tuple(int(v) for v in meta["lengths"])
+        kw = _dsl_problem_kwargs(FlashKdaProblem, meta, exclude=frozenset({"lengths"}))
+        return FlashKdaProblem(lengths, **kw)
     if kernel == MEGA_KDA and {"batch", "tp", "sequence", "num_heads", "hidden_size"} <= meta.keys():
+        kw = _dsl_problem_kwargs(
+            MegaRecurrentKdaProblem, meta,
+            exclude=frozenset({"batch", "tp", "sequence", "num_heads", "hidden_size"}),
+        )
         return MegaRecurrentKdaProblem(
             int(meta["batch"]), int(meta["tp"]), int(meta["sequence"]),
             int(meta["num_heads"]), int(meta["hidden_size"]),
+            **kw,
         )
     if kernel == COMMIT_KDA and meta.get("accepted"):
-        return CommitRecurrentKdaProblem(
-            tuple(int(v) for v in meta["accepted"]),
-            heads=int(meta.get("heads", 1)),
-        )
+        accepted = tuple(int(v) for v in meta["accepted"])
+        kw = _dsl_problem_kwargs(CommitRecurrentKdaProblem, meta, exclude=frozenset({"accepted"}))
+        return CommitRecurrentKdaProblem(accepted, **kw)
     return None
 
 
@@ -559,7 +670,10 @@ def replay_catalog_binding(scenario, entry, op, binding, applied, stream):
 
 def canonical_region_summaries(scenario, applied):
     """Derive canonical per-site summaries for all catalog-bound regions in ``applied``."""
-    templates = {binding.target_op: binding for binding in applied.template_bindings}
+    templates = {
+        (getattr(binding, "replica", 0), binding.target_op): binding
+        for binding in applied.template_bindings
+    }
     atomic = {entry.replica: entry for entry in scenario.atomic_ops}
     streams = {stream.rank: stream for stream in applied.streams}
     canonical = {}
@@ -570,7 +684,7 @@ def canonical_region_summaries(scenario, applied):
         stream = streams.get(entry.replica)
         for op in entry.ops:
             bound = replay_catalog_binding(
-                scenario, rank_atomic, op, templates.get(op.op_id), applied, stream,
+                scenario, rank_atomic, op, templates.get((entry.replica, op.op_id)), applied, stream,
             )
             if bound is not None:
                 canonical[entry.replica, op.stage, op.op_id] = bound[1]
