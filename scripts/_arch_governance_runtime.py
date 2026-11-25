@@ -169,7 +169,6 @@ _LEGACY_PACKAGE_SCCS: frozenset[frozenset[str]] = frozenset({
         "mindie_sim.prediction.runtime",
     }),
     frozenset({"mindie_sim.prediction.operators", "mindie_sim.prediction.sharding"}),
-    frozenset({"mindie_sim.optimization", "mindie_sim.rewrite"}),
     frozenset({"mindie_sim.compose", "mindie_sim.sweep"}),
 })
 #: Ratcheted legacy intra-schema module SCCs (zero new schema cycles allowed).
