@@ -571,18 +571,21 @@ def _lower_qsli(lower, p, ready):
     workspace = qsli_workspace_sizes(p, spec.aic_budget)
     meta = lower.access("qsli:metadata_load", "qsli:metadata", QSLI_METADATA_BYTES, after=(ready,), private=True)
     q_payload = QSLI_PACKED_D + QSLI_SCALE_ROW_BYTES
-    query_ready = (meta,)
+    core_done: dict[int, tuple[str, ...]] = {}
+    partial_slot_free: dict[int, tuple[str, ...]] = {}
+    owner_done: dict[int, tuple[str, ...]] = {}
     for query in range(p.query_rows):
         owner = query % spec.aiv_budget
         parts = []
         for split in range(p.split_parts if p.candidates else 0):
             core = (query * p.split_parts + split) % spec.aic_budget
+            core_after = core_done.get(core, (meta,))
             pair = lower.paired(core)
             name = f"qsli:{query}:{split}"
             first = p.candidates * split // p.split_parts
             end = p.candidates * (split + 1) // p.split_parts
             q = lower.access(name + ":query", "qsli:query", QSLI_TILE_M * q_payload, cube=True, owner=core,
-                             after=query_ready, offset=query * QSLI_TILE_M * q_payload)
+                             after=core_after, offset=query * QSLI_TILE_M * q_payload)
             q_l0 = lower.local(name + ":query_l0a", "mte1", QSLI_TILE_M * q_payload, (q,), core)
             k_l1, l0b, l0c, staging = (
                 RingBuffer(die=lower.plan.die, owner=core, pool=pool, depth=depth, allocation=f"{name}:{tag}")
@@ -594,7 +597,7 @@ def _lower_qsli(lower, p, ready):
                 real = min(QSLI_TILE_N, end - pos)
                 n = f"{name}:tile{tile}"
                 gather = lower.access(n + ":gather_pa", "qsli:key", real * q_payload, owner=pair[0],
-                                      after=(*query_ready, ring_credit(staging, tile)), offset=pos * q_payload)
+                                      after=(*core_after, ring_credit(staging, tile)), offset=pos * q_payload)
                 staging_slot = (core * QSLI_STAGING_DEPTH + tile % QSLI_STAGING_DEPTH) * QSLI_TILE_N
                 packed = lower.spill(n + ":publish_packed_k", "staging_key", real * QSLI_PACKED_D, (gather,),
                                      src_owner=pair[0], dst_owner=core, cube_dst=True,
@@ -621,7 +624,7 @@ def _lower_qsli(lower, p, ready):
                     scores.append(lower.vector(f"{n}:score_reduce{sub}", QSLI_TILE_M * count, (fix,), lane, "vec_reduce"))
                 lower.stage(n + ":fix_done", fixes)
             for ring in (k_l1, l0b, l0c, staging):
-                lower.plan.add_ring(ring, after=query_ready)
+                lower.plan.add_ring(ring, after=core_after)
             counts = end - first
             score_bytes = counts * BF16_BYTES
             published = lower.spill(name + ":select_keys", "key_workspace", score_bytes,
@@ -642,25 +645,33 @@ def _lower_qsli(lower, p, ready):
                                     owner=pair[0], offset=core * p.topk * INT32_BYTES)
             part = (positions,)
             if p.split_parts > 1:
+                write_after = (positions, *partial_slot_free.get(core, ()))
                 for tensor, elem in (("partial_indices", INT32_BYTES), ("partial_values", BF16_BYTES)):
                     part += (lower.access(f"{name}:{tensor}", tensor, partial_size * elem, owner=pair[0],
-                                          after=(positions,), private=True, write=True, offset=core * p.topk * elem),)
+                                          after=write_after, private=True, write=True, offset=core * p.topk * elem),)
+            core_done[core] = part
             parts.append((core, partial_size, part))
-        deps = tuple(dep for _, _, group in parts for dep in group) if p.candidates else query_ready
+        deps = tuple(dep for _, _, group in parts for dep in group) if p.candidates else owner_done.get(owner, (meta,))
         if p.split_parts > 1:
             barrier = lower.stage(f"qsli:{query}:ld_barrier", deps, launch_wide=True)
-            reads = [
-                lower.access(f"qsli:{query}:{core}:{tensor}_read", tensor, count * elem, owner=owner,
-                             after=(barrier,), private=True, offset=core * p.topk * elem)
-                for core, count, _ in parts
-                for tensor, elem in (("partial_indices", INT32_BYTES), ("partial_values", BF16_BYTES))
-            ]
+            reads = []
+            for core, count, _ in parts:
+                core_reads = tuple(
+                    lower.access(f"qsli:{query}:{core}:{tensor}_read", tensor, count * elem, owner=owner,
+                                 after=(barrier,), private=True, offset=core * p.topk * elem)
+                    for tensor, elem in (("partial_indices", INT32_BYTES), ("partial_values", BF16_BYTES))
+                )
+                partial_slot_free[core] = core_reads
+                reads.extend(core_reads)
+            merge_after = tuple(reads) + owner_done.get(owner, ())
             deps = (lower.vector(f"qsli:{query}:LdMergeStage", sum(part[1] for part in parts),
-                                 tuple(reads), owner, "sort_topk"),)
+                                 merge_after, owner, "sort_topk"),)
+        elif p.candidates and owner in owner_done:
+            deps = (*deps, *owner_done[owner])
         if p.topk > p.candidates:
             deps = (lower.vector(f"qsli:{query}:pad_topk", 2 * (p.topk - p.candidates), deps, owner,
                                  index=-1, value="-inf"),)
-        query_ready = tuple(lower.access(
+        owner_done[owner] = tuple(lower.access(
             f"qsli:{query}:{tensor}", f"qsli:{tensor}", p.topk * elem, owner=owner, after=deps,
             write=True, offset=query * p.topk * elem,
         ) for tensor, elem in (("indices", INT32_BYTES), ("values", BF16_BYTES)))
