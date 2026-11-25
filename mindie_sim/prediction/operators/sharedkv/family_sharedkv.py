@@ -8,13 +8,24 @@
 [Side-Effect Policy] Returns immutable operators and recipes; no device work.
 """
 from dataclasses import replace
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.prediction.mechanism import PlannedRecipe
 from .sharedkv_metadata import OWNER_SCHEDULE
 
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "csrc/attention/sparse_attn_sharedkv/op_host/sparse_attn_sharedkv_tiling.cpp",
+        "98fb6d201fd7657fe44c4ebe9a2445af377cb4b5db47861f0b52db2a8b8dacf1",
+    ),
+)
 IMPLEMENTATION = "vllm_ascend_sharedkv_scfa"
 RECIPE = "vllm_ascend_sharedkv_scfa"
 

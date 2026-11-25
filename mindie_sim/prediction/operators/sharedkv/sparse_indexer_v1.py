@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
@@ -42,9 +43,40 @@ from ..sparse_indexer.common import (
     SCORE_SLOTS,
     SparseIndexerContract,
     request_contracts,
+    unsupported,
 )
 from .l0_sync import p03_fixpipe_setup_ms, p10_sort_to_alu_op_ratio, p12_flag_ms, p13_paired_ms, p13_syncall_ms
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "cann/ops-transformer",
+        "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "attention/lightning_indexer/op_kernel/arch35/lightning_indexer_service_cube_arch35.h",
+        "66b9f91fc76c84b048ddcbec39b6c03217786fcf7fd2fdd1c22e19e324c0ec77",
+    ),
+    SourceRef(
+        "cann/ops-transformer",
+        "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "attention/lightning_indexer/op_kernel/arch22/lightning_indexer_service_cube_arch22.h",
+        "edc95c482dbe7147cc00c1c432ca25c469594ac17f26daf8fd10154abf3f6699",
+    ),
+    SourceRef(
+        "cann/ops-transformer",
+        "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "attention/lightning_indexer/op_kernel/arch22/lightning_indexer_kernel_arch22.h",
+        "2f1fb5b9c245e5387d6866f77ee423d4e9cb4ad1869fa0a740a6d243b890728a",
+    ),
+    SourceRef(
+        "cann/ops-transformer",
+        "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "attention/lightning_indexer/op_kernel/arch22/lightning_indexer_service_vector_arch22.h",
+        "33bb65e7a0731dcddadd9ef5d75e7d73dcdfcf67cd28adb6f943310f73249e87",
+    ),
+)
+
+ARCH35_V1_AIVS_PER_AIC = 2
+V1_AIVS_PER_AIC = 2
 ARCH35_V1_TILE_ROWS = 128
 ARCH35_V1_S1_BASE = 4
 ARCH35_V1_PIPE_SLOTS = 3
@@ -303,7 +335,13 @@ def build_arch35_v1_lightning(
 ) -> OperatorPlan:
     """Build native Arch35 aclnnLightningIndexer v1 (isLDOpen=false, 8192-trunk TopK)."""
     q_groups = _q_groups_with_kv(op, contract, ARCH35_V1_S1_BASE, ctx)
-    active = min(len(owners), max(1, len(q_groups)))
+    paired_owners = tuple((aic, aivs) for aic, aivs in owners if len(aivs) >= ARCH35_V1_AIVS_PER_AIC)
+    if q_groups and not paired_owners:
+        raise unsupported(
+            "missing_owners",
+            "Arch35 aclnnLightningIndexer requires at least one complete (1 AIC, 2 AIV) owner group",
+        )
+    active = min(len(paired_owners), max(1, len(q_groups)))
     score_ws = active * max((qr * kv for qr, kv in q_groups), default=1) * FP32_BYTES
     l2_cap = _l2_capacity(ctx)
     score_l2 = l2_cap > 0 and score_ws <= l2_cap
@@ -311,7 +349,7 @@ def build_arch35_v1_lightning(
     aic_r = read_role(ctx.geometry.resource_units)
     aiv_r = read_role(ctx.geometry.resource_units, aiv=0)
     prog = _Arch35V1Program(
-        contract, owners, q_groups, aic_r, aiv_r,
+        contract, paired_owners, q_groups, aic_r, aiv_r,
         ctx.datapath.aic_count, ctx.datapath.aiv_count, score_l2, has_l2,
     )
     totals: dict[str, Work] = {}
@@ -661,7 +699,13 @@ def build_arch22_v1_lightning(
         if rem > 0:
             runs.append((gid, 1, rem, qr))
         total_blocks += n_full + int(rem > 0)
-    active = min(len(owners), total_blocks) if total_blocks > 0 else 0
+    valid_owners = tuple((aic, aivs) for aic, aivs in owners if len(aivs) >= V1_AIVS_PER_AIC)
+    if total_blocks > 0 and not valid_owners:
+        raise unsupported(
+            "missing_owners",
+            "Arch22 aclnnLightningIndexer requires at least one complete (1 AIC, 2 AIV) owner group",
+        )
+    active = min(len(valid_owners), total_blocks) if total_blocks > 0 else 0
     core_runs, core_seen_groups, core_q_rows, group_s2_owners = _assign_block_runs(runs, active, n_q_groups)
     core_split_q_rows = tuple(
         sum(group_q_rows[gid] for gid in seen if group_s2_owners[gid] > 1)
@@ -678,7 +722,7 @@ def build_arch22_v1_lightning(
     aic_r = read_role(ctx.geometry.resource_units)
     aiv_r = read_role(ctx.geometry.resource_units, aiv=0)
     prog = _Arch22V1Program(
-        contract, owners, core_runs, core_q_rows, core_split_q_rows,
+        contract, valid_owners, core_runs, core_q_rows, core_split_q_rows,
         group_q_rows, group_s2_owners, s2_owners_per_group,
         aic_r, aiv_r, ctx.datapath.aic_count, ctx.datapath.aiv_count, score_l2, has_l2,
     )

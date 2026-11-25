@@ -13,25 +13,31 @@ Upstream-ABI: aclnnKvQuantSparseFlashAttention
 """
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, replace
 from math import ceil
+from typing import Literal
 
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.operators import OpSpec
 
 from ...mechanism import OperatorPlan, Work
+from ...ownership import unit_group
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from ...runtime.l2_residency import AdmissionMemoryView, bind_memory_access
 from ...runtime.memory_physics import AddressRun, AddressRunPlan, HbmBusSpec, MemoryAccessPattern, ReuseKey
 from ..attention.common import (
     BF16_BYTES,
+    C8_ABI,
     C8_MODES,
+    C8_V1_ABI,
     FP32_BYTES,
     INDEX_BYTES,
     PAGED_LAYOUTS,
     QUANT_MODE_BF16,
     QUANT_MODE_TQ4,
     SECTOR_BYTES,
+    SFA_V1_ABI,
     SOFTMAX_OPS,
     AttentionContract,
     AttentionPhase,
@@ -46,6 +52,38 @@ from ..attention.common import (
 )
 from ..contracts import OperatorPlanningContext
 
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SFA_TILING_SOURCE = SourceRef(
+    "cann/ops-transformer",
+    "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+    "attention/sparse_flash_attention/op_host/sparse_flash_attention_tiling.cpp",
+    "e87df78987dabb50064fc8361b51463dbd3490f7ba1c5d66a0b85c9721df0259",
+)
+SFA_KERNEL_SOURCE = SourceRef(
+    "cann/ops-transformer",
+    "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+    "attention/sparse_flash_attention/op_kernel/arch35/sparse_flash_attention_kernel_mla_arch35.h",
+    "651400b9a8aa23290fb5646c38aa7c9ebca85e352f484ce409b7fe426f52ec66",
+)
+C8_TILING_SOURCE = SourceRef(
+    "cann/ops-transformer",
+    "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+    "attention/kv_quant_sparse_flash_attention/op_host/kv_quant_sparse_flash_attention_tiling.cpp",
+    "2c75acce70974165d5b087416d724bcd0d09909b2e8dd693370b5860de9dbc6e",
+)
+C8_KERNEL_SOURCE = SourceRef(
+    "cann/ops-transformer",
+    "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+    "attention/kv_quant_sparse_flash_attention/op_kernel/arch35/kv_quant_sparse_flash_attention_kernel_mla_arch35.h",
+    "89f70d3db0344bdd44bef92b3108007225a84f342e0995ed724654dbada278fa",
+)
+SOURCES: tuple[SourceRef, ...] = (
+    SFA_TILING_SOURCE,
+    SFA_KERNEL_SOURCE,
+    C8_TILING_SOURCE,
+    C8_KERNEL_SOURCE,
+)
+
 SFA_TILE_ROWS = 128
 SFA_RING_SLOTS = 3
 SFA_SPLIT_G_HEADS = 64
@@ -56,6 +94,10 @@ SFA_OUTPUT_MERGE_OPS_PER_ELEM = 3
 SFA_SSMAX_EXTRA_OPS = 2
 FLOPS_PER_FMA = 2
 SPLIT_G_AICS_PER_QUERY = 2
+SPLIT_G_AIVS_PER_QUERY = 4
+NON_SPLIT_G_AIVS_PER_QUERY = 2
+NON_SPLIT_G_ROWS_PER_LOOP = 2
+HALF_DIVISOR = 2
 
 
 def _l2_capacity_bytes(ctx: OperatorPlanningContext) -> int:
@@ -63,11 +105,144 @@ def _l2_capacity_bytes(ctx: OperatorPlanningContext) -> int:
 
 
 def _packed_row_bytes(contract: AttentionContract) -> int:
+    if contract.abi == SFA_V1_ABI:
+        if contract.quant_mode != QUANT_MODE_BF16:
+            raise unmodeled(
+                "attention_sfa_v1_quant_mode_unsupported",
+                f"{SFA_V1_ABI} requires non-quantized quant_mode={QUANT_MODE_BF16}, got {contract.quant_mode}",
+            )
+        return contract.head_dim * BF16_BYTES
     if contract.quant_mode == QUANT_MODE_BF16:
         return contract.head_dim * BF16_BYTES
     if contract.quant_mode == QUANT_MODE_TQ4:
         return TQ4_PACKED_ROW_BYTES
-    return C8_PACKED_ROW_BYTES
+    if contract.quant_mode in C8_MODES:
+        return C8_PACKED_ROW_BYTES
+    raise unmodeled(
+        "attention_sfa_quant_mode_unsupported",
+        f"{contract.abi} does not support quant_mode={contract.quant_mode}",
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _SfaSelectionRead:
+    pattern: MemoryAccessPattern
+    bound: object
+    capacity: int
+    hbm: str
+    ctx: OperatorPlanningContext
+
+    def start(self, engine, name, ready, *, owner=""):
+        view = getattr(engine, "admission_memory_view", None)
+        if view is None:
+            views = getattr(engine, "_fia_admission", None)
+            if views is None:
+                views = engine._fia_admission = {}
+            die = self.pattern.die
+            key = (self.hbm, die)
+            view = views.get(key)
+            if view is None:
+                if self.ctx.admission_memory_view is not None:
+                    view = copy.deepcopy(self.ctx.admission_memory_view)
+                else:
+                    view = AdmissionMemoryView(
+                        {die: self.capacity}, arch_id=str(self.ctx.compute_arch.arch_id),
+                    )
+                views[key] = view
+        return engine.submit_bound_access(
+            name, self.bound, after=(ready,), owner=owner, memory_state=view, pattern=self.pattern,
+        )
+
+
+def _partition_tile_rows(
+    n_rows: int, aivs: tuple[int, ...], aics_per_group: int,
+) -> tuple[tuple[int, int, int], ...]:
+    """Partition selected tile rows across AIVs matching ``CalSparseCalSize``."""
+    if n_rows <= 0 or not aivs:
+        return ()
+    if aics_per_group > 1 and len(aivs) >= SPLIT_G_AIVS_PER_QUERY:
+        first_aic = ceil(n_rows / HALF_DIVISOR)
+        second_aic = n_rows - first_aic
+        v0_end = ceil(first_aic / HALF_DIVISOR)
+        v2_end = first_aic + ceil(second_aic / HALF_DIVISOR)
+        spans = (
+            (aivs[0], 0, v0_end),
+            (aivs[1], v0_end, first_aic),
+            (aivs[2], first_aic, v2_end),
+            (aivs[3], v2_end, n_rows),
+        )
+    elif len(aivs) >= NON_SPLIT_G_AIVS_PER_QUERY:
+        s2_loops = ceil(ceil(n_rows / NON_SPLIT_G_AIVS_PER_QUERY) / NON_SPLIT_G_ROWS_PER_LOOP)
+        split = min(s2_loops * NON_SPLIT_G_ROWS_PER_LOOP, n_rows)
+        spans = ((aivs[0], 0, split), (aivs[1], split, n_rows))
+    else:
+        spans = ((aivs[0], 0, n_rows),)
+    return tuple((aiv, lo, hi) for aiv, lo, hi in spans if hi > lo)
+
+
+def _selection_aiv_steps(
+    selection_slice: tuple[int, ...], contract: AttentionContract, is_quant: bool, row_bytes: int,
+) -> tuple[tuple[str, int, AddressRunPlan], ...]:
+    """Build per-AIV tensor read steps; BF16 separates ``keyGm`` and ``keyRopeGm``."""
+    if not selection_slice:
+        return ()
+    if is_quant:
+        plans = tuple(packed_gather_run_plans(packed_selection_runs(selection_slice, row_bytes)))
+        return tuple((contract.kv_tensor_id, row_bytes, plan) for plan in plans)
+    latent_b = contract.v_head_dim * BF16_BYTES
+    rope_b = max(0, contract.head_dim - contract.v_head_dim) * BF16_BYTES
+    lat_plans = tuple(packed_gather_run_plans(packed_selection_runs(selection_slice, latent_b)))
+    if rope_b <= 0:
+        return tuple((contract.kv_tensor_id, latent_b, plan) for plan in lat_plans)
+    rope_addrs = tuple((addr // latent_b) * rope_b for addr in selection_slice)
+    rope_plans = tuple(packed_gather_run_plans(packed_selection_runs(rope_addrs, rope_b)))
+    rope_tid = f"{contract.kv_tensor_id}:rope"
+    steps: list[tuple[str, int, AddressRunPlan]] = []
+    for idx in range(max(len(lat_plans), len(rope_plans))):
+        if idx < len(lat_plans):
+            steps.append((contract.kv_tensor_id, latent_b, lat_plans[idx]))
+        if idx < len(rope_plans):
+            steps.append((rope_tid, rope_b, rope_plans[idx]))
+    return tuple(steps)
+
+
+def _lower_selection_gather(
+    context, selection_slice: tuple[int, ...], grp_aivs: tuple[int, ...],
+    aics_per_group: int, contract: AttentionContract, is_quant: bool, row_bytes: int,
+    ctx: OperatorPlanningContext,
+):
+    """Lower per-AIV partitioned selection gathers onto Engine completion-time L2."""
+    die = int(ctx.geometry.rank or 0)
+    hbm_name = context.resource_names["hbm"]
+    pipe_role = "mte2_aiv" if "mte2_aiv" in context.resource_names else "mte2"
+    pipe_units = context.resource_units.get(pipe_role, 1)
+    bus = HbmBusSpec(die, 1, 1, 0, row_r=hbm_name, row_w=hbm_name, ctr_r=hbm_name, ctr_w=hbm_name)
+    l2_cap = _l2_capacity_bytes(ctx)
+    aiv_programs = []
+    for aiv_id, lo, hi in _partition_tile_rows(len(selection_slice), grp_aivs, aics_per_group):
+        owner = unit_group(aiv_id, ctx.datapath.aiv_count, pipe_units)[0]
+        steps = _selection_aiv_steps(selection_slice[lo:hi], contract, is_quant, row_bytes)
+        read_stages = []
+        prev_name: str | None = None
+        for idx, (alloc_id, width, plan) in enumerate(steps):
+            key = ReuseKey(die, alloc_id, contract.kv_version)
+            pat = MemoryAccessPattern(
+                key.backing_allocation, key.tensor_version, die, owner, "read", pipe_role,
+                plan.runs[0].rows * width, plan, reuse_key=key,
+            )
+            bound = context.bind_access(pat, hbm_bus=bus)
+            st_name = "read" if idx == 0 else f"read-{idx}"
+            read_stages.append(Stage(
+                st_name,
+                after=(prev_name,) if prev_name is not None else (),
+                program=_SfaSelectionRead(pat, bound, l2_cap, hbm_name, ctx),
+            ))
+            prev_name = st_name
+        if read_stages:
+            aiv_programs.append(KernelProgram(tuple(read_stages)))
+    if len(aiv_programs) == 1:
+        return aiv_programs[0]
+    return ParallelProgram(tuple(aiv_programs))
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,16 +257,17 @@ class _Arch35SfaProgram:
     ring_l2_resident: bool
     has_l2_rate: bool
     phases: tuple[AttentionPhase, ...] = ()
-    tile_gathers: tuple[tuple[tuple[int, int, int], ...], ...] = ()
+    tile_gathers: tuple[tuple[tuple[int, int, int, int], ...], ...] = ()
 
     def _tile_phases(
         self, rows: int, heads_per_aic: int, aics_per_group: int,
-        *, gather_override: tuple[int, int, int] | None = None,
+        *, gather_override: tuple[int, int, int, int] | None = None,
     ) -> tuple[AttentionPhase, ...]:
         c, ctx = self.contract, self.ctx
         gather_l2 = 0
+        gather_miss = 0
         if gather_override is not None:
-            gather_copy, gather_hbm, gather_l2 = gather_override
+            gather_copy, gather_hbm, gather_l2, gather_miss = gather_override
         elif self.is_quant:
             stride = ceil(self.row_bytes / SECTOR_BYTES) * SECTOR_BYTES
             run = AddressRunPlan((AddressRun(0, rows, self.row_bytes, stride),))
@@ -116,11 +292,20 @@ class _Arch35SfaProgram:
             pages = ceil(rows / max(1, c.block_size))
             out.append(AttentionPhase("block_table", read_work(ctx, pages * INDEX_BYTES, aiv=True), ()))
             gather_deps += ("block_table",)
-        out.append(AttentionPhase(
-            "packed_kv_gather",
-            read_work(ctx, gather_copy, aiv=True, hbm=gather_hbm, l2=gather_l2 if self.has_l2_rate else 0),
-            gather_deps,
-        ))
+        if gather_override is not None and gather_miss > 0 and "mte2_aiv_dram" in ctx.geometry.resource_units:
+            gather_hit = max(0, gather_copy - gather_miss)
+            g_res: dict[str, int] = {"hbm": gather_hbm, "mte2_aiv_dram": gather_miss}
+            if gather_hit > 0:
+                g_res["mte2_aiv"] = gather_hit
+            if gather_l2 and self.has_l2_rate:
+                g_res["l2"] = gather_l2
+            gather_work = Work(resources=g_res)
+        else:
+            gather_work = read_work(
+                ctx, gather_copy, aiv=True, hbm=gather_hbm,
+                l2=gather_l2 if self.has_l2_rate else 0,
+            )
+        out.append(AttentionPhase("packed_kv_gather", gather_work, gather_deps))
         prev = "packed_kv_gather"
         if self.is_quant:
             out.append(AttentionPhase(
@@ -225,13 +410,31 @@ class _Arch35SfaProgram:
                 return KernelProgram((q_st, *f_st))
 
             q_gathers = self.tile_gathers[q_idx] if q_idx < len(self.tile_gathers) else ()
+            q_selection = (
+                self.contract.selection_lists[q_idx]
+                if (self.contract.selection_lists and self.contract.kv_tensor_id
+                    and self.has_l2_rate and "hbm" in context.resource_names
+                    and q_idx < len(self.contract.selection_lists))
+                else ()
+            )
+            grp_aivs = tuple(v for p in self.groups[grp_idx] for v in p[1])
 
-            def tile_fn(t_idx: int, total_rows=rows, pl=place, qg=q_gathers):
-                t_rows = min(SFA_TILE_ROWS, total_rows - t_idx * SFA_TILE_ROWS)
+            def tile_fn(t_idx: int, total_rows=rows, pl=place, qg=q_gathers, qsel=q_selection, gaivs=grp_aivs):
+                t_start = t_idx * SFA_TILE_ROWS
+                t_rows = min(SFA_TILE_ROWS, total_rows - t_start)
                 ov = qg[t_idx] if t_idx < len(qg) else None
                 stages = []
                 for ph in self._tile_phases(t_rows, heads_per_aic, aics_per_group, gather_override=ov):
-                    st = _stage(context, ph, pl)
+                    if ph.name == "packed_kv_gather" and qsel:
+                        st = Stage(
+                            ph.name, after=ph.after,
+                            program=_lower_selection_gather(
+                                context, qsel[t_start : t_start + t_rows], gaivs,
+                                aics_per_group, self.contract, self.is_quant, self.row_bytes, self.ctx,
+                            ),
+                        )
+                    else:
+                        st = _stage(context, ph, pl)
                     if ph.name in {"kv_ring_read", "kv_to_l1"}:
                         st = replace(st, previous=("pv",))
                     stages.append(st)
@@ -253,36 +456,87 @@ class _Arch35SfaProgram:
         ))
 
 
-def _admit_selection_tile(
-    selection: tuple[int, ...], row_bytes: int, contract: AttentionContract,
-    ctx: OperatorPlanningContext, view: AdmissionMemoryView,
-) -> tuple[int, int, int]:
+def _preview_selection_gathers(
+    counts: tuple[int, ...],
+    groups: tuple[tuple[tuple[int, tuple[int, ...]], ...], ...],
+    aics_per_query: int,
+    contract: AttentionContract,
+    is_quant: bool,
+    row_bytes: int,
+    ctx: OperatorPlanningContext,
+    view: AdmissionMemoryView,
+) -> tuple[tuple[tuple[int, int, int, int], ...], ...]:
+    """Preview tile gather L2 hits/misses in wave-step lockstep matching Engine execution."""
     die = int(ctx.geometry.rank or 0)
-    runs = packed_selection_runs(selection, row_bytes)
-    key = ReuseKey(die, contract.kv_tensor_id, contract.kv_version, reuse_stream="sfa_selection")
     bus = HbmBusSpec(die, 1, 1, 0)
-    gather_copy = gather_hbm = gather_l2 = 0
-    for plan in packed_gather_run_plans(runs):
-        pat = MemoryAccessPattern(
-            key.backing_allocation, key.tensor_version, die, 0, "read", "mte2_aiv",
-            plan.runs[0].rows * row_bytes, plan, reuse_key=key,
-        )
-        led = bind_memory_access(
-            pat, view, hbm_bus=bus, copy_hit_bytes_per_ms=1, copy_miss_bytes_per_ms=1,
-            l2_bytes_per_ms=1, pipe_row_id="mte2_aiv", l2_row_id="l2", commit=True,
-        ).ledger
-        gather_copy += led.aligned_transfer_bytes
-        gather_hbm += led.dram_sector_bytes
-        gather_l2 += led.l2_hit_bytes
-    return gather_copy, gather_hbm, gather_l2
+    n_groups = len(groups)
+    per_q_tiles: list[list[list[int]]] = [
+        [[0, 0, 0, 0] for _ in range(0, rows, SFA_TILE_ROWS)] for rows in counts
+    ]
+    for wave_start in range(0, len(counts), n_groups):
+        wave = range(wave_start, min(len(counts), wave_start + n_groups))
+        max_tiles = max((len(per_q_tiles[q_idx]) for q_idx in wave), default=0)
+        for t_idx in range(max_tiles):
+            t_start = t_idx * SFA_TILE_ROWS
+            q_aiv_steps: list[tuple[int, tuple[tuple[tuple[str, int, AddressRunPlan], ...], ...]]] = []
+            max_aivs = max_steps = 0
+            for q_idx in wave:
+                if t_idx >= len(per_q_tiles[q_idx]):
+                    continue
+                t_rows = min(SFA_TILE_ROWS, counts[q_idx] - t_start)
+                sr = contract.selection_lists[q_idx][t_start : t_start + t_rows]
+                grp_aivs = tuple(v for p in groups[q_idx % n_groups] for v in p[1])
+                aiv_lists = tuple(
+                    _selection_aiv_steps(sr[lo:hi], contract, is_quant, row_bytes)
+                    for _, lo, hi in _partition_tile_rows(len(sr), grp_aivs, aics_per_query)
+                )
+                max_aivs = max(max_aivs, len(aiv_lists))
+                max_steps = max(max_steps, max((len(s) for s in aiv_lists), default=0))
+                q_aiv_steps.append((q_idx, aiv_lists))
+            for step_idx in range(max_steps):
+                for aiv_slot in range(max_aivs):
+                    for q_idx, aiv_lists in q_aiv_steps:
+                        if aiv_slot >= len(aiv_lists) or step_idx >= len(aiv_lists[aiv_slot]):
+                            continue
+                        alloc_id, width, plan = aiv_lists[aiv_slot][step_idx]
+                        key = ReuseKey(die, alloc_id, contract.kv_version)
+                        pat = MemoryAccessPattern(
+                            key.backing_allocation, key.tensor_version, die, 0, "read", "mte2_aiv",
+                            plan.runs[0].rows * width, plan, reuse_key=key,
+                        )
+                        led = bind_memory_access(
+                            pat, view, hbm_bus=bus, copy_hit_bytes_per_ms=1, copy_miss_bytes_per_ms=1,
+                            l2_bytes_per_ms=1, pipe_row_id="mte2_aiv", l2_row_id="l2", commit=True,
+                        ).ledger
+                        acc = per_q_tiles[q_idx][t_idx]
+                        acc[0] += led.aligned_transfer_bytes
+                        acc[1] += led.dram_sector_bytes
+                        acc[2] += led.l2_hit_bytes
+                        acc[3] += led.dram_miss_copy_bytes
+    return tuple(tuple((a[0], a[1], a[2], a[3]) for a in q_list) for q_list in per_q_tiles)
 
 
 def build_arch35_split_g_sfa(
     op: OpSpec, contract: AttentionContract, ctx: OperatorPlanningContext, sources: tuple[SourceRef, ...],
 ) -> OperatorPlan:
     """Build split-G 2-AIC/4-AIV 3-slot pipelined SFA plan (BF16 or C8) on npu_arch_3510."""
+    if contract.num_kv_heads != 1:
+        raise unmodeled(
+            "attention_sfa_kv_heads_unsupported",
+            f"{contract.abi} requires num_kv_heads == 1, got {contract.num_kv_heads}",
+        )
+    if contract.abi == SFA_V1_ABI and contract.quant_mode != QUANT_MODE_BF16:
+        raise unmodeled(
+            "attention_sfa_v1_quant_mode_unsupported",
+            f"{SFA_V1_ABI} requires non-quantized quant_mode={QUANT_MODE_BF16}, got {contract.quant_mode}",
+        )
     if contract.quant_mode == QUANT_MODE_TQ4:
         raise unmodeled("attention_arch35_tq4_unsupported", "TQ4 packed latent cache is supported on Arch22 only, not Arch35")
+    if contract.abi in {C8_ABI, C8_V1_ABI} and contract.quant_mode not in C8_MODES:
+        raise unmodeled(
+            "attention_c8_quant_mode_unsupported",
+            f"{contract.abi} requires a C8 quant_mode, got {contract.quant_mode}",
+        )
     is_quant = contract.quant_mode in C8_MODES
     row_bytes = _packed_row_bytes(contract)
     counts = tuple(contract.row_counts())
@@ -312,23 +566,26 @@ def build_arch35_split_g_sfa(
     q_load = prog._query_head_load()
     fin = prog._query_finish()
     die = int(ctx.geometry.rank or 0)
-    sel_l2 = (
-        ctx.admission_memory_view if ctx.admission_memory_view is not None
-        else (AdmissionMemoryView({die: l2_cap}, arch_id=str(ctx.compute_arch.arch_id)) if l2_cap > 0 else None)
-    ) if (contract.selection_lists and contract.kv_tensor_id) else None
-    tile_gathers: list[tuple[tuple[int, int, int], ...]] = []
+    # Planning must never mutate the live AdmissionMemoryView; preview on a private
+    # scratch snapshot while Engine delivery settles fills at transfer completion.
+    sel_l2: AdmissionMemoryView | None = None
+    if contract.selection_lists and contract.kv_tensor_id and has_l2:
+        if ctx.admission_memory_view is not None:
+            sel_l2 = copy.deepcopy(ctx.admission_memory_view)
+        elif l2_cap > 0:
+            sel_l2 = AdmissionMemoryView({die: l2_cap}, arch_id=str(ctx.compute_arch.arch_id))
+    tile_gathers: tuple[tuple[tuple[int, int, int, int], ...], ...] = ()
+    if sel_l2 is not None and contract.selection_lists:
+        tile_gathers = _preview_selection_gathers(
+            counts, groups, aics_per_query, contract, is_quant, row_bytes, ctx, sel_l2,
+        )
     for q_idx, rows in enumerate(counts):
         _acc(q_load)
-        if sel_l2 is not None and contract.selection_lists:
-            sr = contract.selection_lists[q_idx]
-            q_tiles: list[tuple[int, int, int]] = []
-            for start in range(0, rows, SFA_TILE_ROWS):
-                t_rows = min(SFA_TILE_ROWS, rows - start)
-                ov = _admit_selection_tile(sr[start : start + t_rows], row_bytes, contract, ctx, sel_l2)
-                q_tiles.append(ov)
+        if tile_gathers and q_idx < len(tile_gathers):
+            for t_idx, ov in enumerate(tile_gathers[q_idx]):
+                t_rows = min(SFA_TILE_ROWS, rows - t_idx * SFA_TILE_ROWS)
                 for ph in prog._tile_phases(t_rows, heads_per_aic, aics_per_query, gather_override=ov):
                     _acc(ph, 1)
-            tile_gathers.append(tuple(q_tiles))
         else:
             full, rem = divmod(rows, SFA_TILE_ROWS)
             if full:
@@ -346,8 +603,10 @@ def build_arch35_split_g_sfa(
     l2_shared = int(bucket["kv_ring_read"].work.resources.get("mte2_aic", 0)) if (
         ring_l2_resident and "kv_ring_read" in bucket
     ) else 0
+    leaf_sources = (C8_KERNEL_SOURCE, C8_TILING_SOURCE) if is_quant else (SFA_KERNEL_SOURCE, SFA_TILING_SOURCE)
+    plan_sources = leaf_sources + tuple(src for src in sources if src not in leaf_sources)
     metadata = {
-        "source_program": sources[0].to_dict(),
+        "source_program": leaf_sources[0].to_dict(),
         "kv_logical_bytes": total_rows * row_bytes,
         "kv_sector_bytes": cold_hbm,
         "kv_dram_sector_bytes": cold_hbm,
@@ -358,6 +617,6 @@ def build_arch35_split_g_sfa(
         "ring_l2_resident": ring_l2_resident,
     }
     return make_plan(
-        op, contract, ctx, phases, sources, metadata=metadata,
-        program=replace(prog, phases=phases, tile_gathers=tuple(tile_gathers)),
+        op, contract, ctx, phases, plan_sources, metadata=metadata,
+        program=replace(prog, phases=phases, tile_gathers=tile_gathers),
     )

@@ -11,6 +11,7 @@
 """
 from dataclasses import replace
 import math
+from typing import Literal
 
 from mindie_sim.catalog.cache import completed_rows, index_row_bytes, index_selection_cost
 from mindie_sim.catalog.cache_format import cache_format
@@ -27,6 +28,7 @@ from mindie_sim.prediction.sharding.context_parallel import (
     sharded_indexer_tile_rows,
 )
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 
 from .generic_latent_attention import (
     index_cache_dtype, index_cache_is_packed, owned_completed_rows,
@@ -36,6 +38,44 @@ from mindie_sim.prediction.implementations import produced_values, select, set_i
 from mindie_sim.prediction.operators.sparse_indexer.indexer_representation import index_representation
 from .mla_native import index_layer_norm
 from .mla_structure import declare_indexer
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "vllm_ascend/models/deepseek_v41/indexer.py",
+        "45ec4290a41c25497d3cadfdb40c7466b5a40ae467a76200d82d4fa34b15fa02",
+    ),
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "vllm_ascend/attention/sfa_v1.py",
+        "058aeb723a4ef3cdb0e07a5fc0180ec53f8227f62d98710144ecffb9cc66678f",
+    ),
+    SourceRef(
+        "cann/ops-transformer",
+        "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "attention/indexer_quant_cache/op_host/indexer_quant_cache_contract.h",
+        "c62bd82555308117e4a601865253ddbdd6c223cc8cd907be28090270816fac4c",
+    ),
+    SourceRef(
+        "cann/ops-transformer",
+        "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "attention/quant_lightning_indexer/op_host/quant_lightning_indexer_tiling.cpp",
+        "54fb29851ffb840eb80c92bdf1592c995a3cf7388cefbc6e5ce89ee17753b3fa",
+    ),
+)
+
+_IQC_INPUT_DTYPES = frozenset({"fp16", "bf16"})
+_IQC_FP8_DTYPES = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2"})
+_IQC_NORMAL_DTYPES = _IQC_FP8_DTYPES | frozenset({"hifloat8", "hif8", "uint8"})
+_IQC_FP4_DTYPES = frozenset({"fp4", "fp4_e2m1", "fp4_e1m2"})
+_IQC_HIFP4_DTYPES = frozenset({"hifp4", "hifloat4"})
+_IQC_E8M0_SCALES = frozenset({"fp8_e8m0", "e8m0", "uint8"})
+_IQC_FP32_SCALES = frozenset({"fp32", "float32"})
+_IQC_HIFP4_SCALES = frozenset({"hifp4_scale", "hifloat4_scale", "uint8"})
+_PACKED_FP4_ELEMENTS = 2
 
 INDEXER_QUANT_CACHE = "aclnnIndexerQuantCache"
 INDEXER_TOP_K_KIND = "aclnnQuantLightningIndexerV2"
@@ -387,7 +427,7 @@ def native_indexer_active(runtime, machine=None):
     return native_fusion_active(runtime, machine)
 
 
-def kv_cache_epilog(op, fmt, region, *, native):
+def kv_cache_epilog(op, fmt, region, *, native, row_bytes=None):
     """Name the grouped KV quantize+scatter epilog without re-deducting bytes.
 
     ``cache_representation.store`` already writes the grouped quantized row in
@@ -398,14 +438,18 @@ def kv_cache_epilog(op, fmt, region, *, native):
     kind = KV_COMPRESS_EPILOG if fmt.dtype != op.dtype else KV_SCATTER_EPILOG
     width = int(op.local_shape[1]) if len(op.local_shape) > 1 else 0
     metadata = dict(op.metadata)
-    row_bytes = (metadata.get("cache_row_bytes")
-                 or dict(metadata.get("cache_representation") or {}).get("row_bytes")
-                 or fmt.row_bytes(width)) if width else 0
+    resolved_row_bytes = (
+        int(row_bytes) if row_bytes is not None else (
+            metadata.get("cache_row_bytes")
+            or dict(metadata.get("cache_representation") or {}).get("row_bytes")
+            or fmt.row_bytes(width)
+        ) if width else 0
+    )
     return replace(op, family=KV_COMPRESS_EPILOG_FAMILY, metadata=op.metadata + (
         ("native_kind", kind),
         ("cache_epilog", {
             "kind": kind, "region": region,
-            "row_bytes": row_bytes,
+            "row_bytes": resolved_row_bytes,
             "quantized_payload_dtype": fmt.dtype,
             "scale_dtype": fmt.scale_dtype,
             "group_size": fmt.group_size,
@@ -415,21 +459,21 @@ def kv_cache_epilog(op, fmt, region, *, native):
     ))
 
 
-def block_quant_epilog(op, fmt, region, *, native, width):
+def block_quant_epilog(op, fmt, region, *, native, width, row_bytes=None):
     """Name the NoPE C8 block-quantized cache write without changing bytes."""
     if not native or fmt.dtype != "fp8_e4m3" or fmt.group_size != BLOCK_QUANT_TILE:
         return op
-    row_bytes = fmt.row_bytes(width)
+    resolved_row_bytes = int(row_bytes) if row_bytes is not None else fmt.row_bytes(width)
     return replace(op, family=KV_COMPRESS_EPILOG_FAMILY, metadata=op.metadata + (
         ("native_kind", BLOCK_QUANT_KIND),
         ("cache_epilog", {
             "kind": BLOCK_QUANT_KIND, "scatter": KV_SCATTER_EPILOG,
             "region": region, "tile": BLOCK_QUANT_TILE,
-            "row_bytes": row_bytes,
-            "row_components": {"fp8_payload": width, "scale": row_bytes - width},
+            "row_bytes": resolved_row_bytes,
+            "row_components": {"fp8_payload": width, "scale": resolved_row_bytes - width},
             "group_size": fmt.group_size, "scale_dtype": fmt.scale_dtype,
         }),
-        ("cache_row_bytes", row_bytes),
+        ("cache_row_bytes", resolved_row_bytes),
     ))
 
 
@@ -446,7 +490,58 @@ def native_cache_store(op, *, native):
                    metadata=op.metadata + (("native_cache_store", True),))
 
 
-def index_row_quantization(builder, store_id, quantize_id, *, width, native):
+def _resolve_arch(runtime, machine=None) -> str:
+    if machine is not None:
+        m_fam = str(getattr(machine, "arch_family", "") or "").strip().upper()
+        if m_fam in ASCEND_ARCH_FAMILIES:
+            return m_fam
+        dies = getattr(machine, "dies", ()) or ()
+        if dies:
+            ca = getattr(dies[0], "compute_arch", None)
+            arch_id = str(getattr(ca, "arch_id", "") or getattr(ca, "preset", "") or "").strip().lower()
+            if "3510" in arch_id or arch_id == "a5":
+                return "A5"
+            if "910b" in arch_id or arch_id == "a2":
+                return "A2"
+            if "2201" in arch_id or arch_id == "a3":
+                sku_low = str(getattr(machine, "sku", "") or "").lower()
+                return "A2" if "910b" in sku_low else "A3"
+    if runtime is not None:
+        meta = dict(getattr(runtime, "metadata", ()) or ())
+        fam = str(meta.get("arch_family") or meta.get("device_arch") or "").strip().upper()
+        if fam in ASCEND_ARCH_FAMILIES:
+            return fam
+    return ""
+
+
+def _indexer_quant_cache_available(arch: str) -> bool:
+    if not arch:
+        return True
+    from mindie_sim.backends.abi_registry import default_abi_registry
+    return default_abi_registry().is_shipping_available(INDEXER_QUANT_CACHE, arch)
+
+
+def _indexer_quant_cache_operands_supported(
+    input_dtype: str, payload_dtype: str, scale_dtype: str, *, packed_elements: int = 1,
+) -> bool:
+    """Enforce CANN ``indexer_quant_cache_contract.h::IsValidQuantTypes``."""
+    x = str(input_dtype or "").strip().lower()
+    cache = str(payload_dtype or "").strip().lower()
+    scale = str(scale_dtype or "").strip().lower()
+    if x not in _IQC_INPUT_DTYPES:
+        return False
+    if cache in _IQC_FP8_DTYPES and scale in _IQC_E8M0_SCALES:
+        return True
+    if packed_elements == 1 and cache in _IQC_NORMAL_DTYPES and scale in _IQC_FP32_SCALES:
+        return True
+    if (cache in _IQC_FP4_DTYPES or (cache == "uint8" and packed_elements == _PACKED_FP4_ELEMENTS)) and scale in _IQC_E8M0_SCALES:
+        return True
+    if cache in _IQC_HIFP4_DTYPES and scale in _IQC_HIFP4_SCALES:
+        return True
+    return False
+
+
+def index_row_quantization(builder, store_id, quantize_id, *, width, native, arch=None):
     """Fuse index-key quantization and cache scatter into one epilog.
 
     The quantization producer already writes exactly one cache row per row
@@ -457,6 +552,9 @@ def index_row_quantization(builder, store_id, quantize_id, *, width, native):
     """
     if not native or store_id is None or quantize_id is None:
         return store_id
+    arch_norm = str(arch or "").strip().upper()
+    if arch_norm and not _indexer_quant_cache_available(arch_norm):
+        return store_id
     by_id = {op.op_id: op for op in builder.ops}
     store = by_id.get(store_id)
     quantize = by_id.get(quantize_id)
@@ -464,9 +562,15 @@ def index_row_quantization(builder, store_id, quantize_id, *, width, native):
         return store_id
     if quantize.family != "quantize" or quantize_id not in store.deps:
         return store_id
+    metadata = dict(quantize.metadata)
+    packed = int(metadata.get("packed_elements") or 1)
+    if not _indexer_quant_cache_operands_supported(
+        quantize.dtype, metadata.get("output_format"), metadata.get("scale_format"),
+        packed_elements=packed,
+    ):
+        return store_id
     inputs = tuple(quantize.deps)
     extra = tuple(dep for dep in store.deps if dep != quantize_id)
-    metadata = dict(quantize.metadata)
     fused = replace(
         store, deps=tuple(dict.fromkeys((*inputs, *extra))),
         family=INDEXER_QUANT_CACHE_FAMILY,
@@ -526,38 +630,70 @@ def index_head_weights(builder, *, plan, model, quant, deps, pool_weights, token
     weights = pool_weights or builder.matrix(
         "index_weights", (weights_input,), tokens, plan.index_heads, model.hidden_size,
         category="indexer.weights")
+    w_op = next((item for item in reversed(builder.ops) if item.op_id == weights), None)
+    w_out_dtype = (
+        str(dict(w_op.metadata).get("output_format") or w_op.dtype or weights_dtype).strip().lower()
+        if w_op is not None else weights_dtype
+    )
+    phase = builder.common.get("phase")
     mode1 = native and plan.index_kpool == 1 and quant.index_dtype in {"fp8", "fp8_e4m3"}
-    if native and not mode1:
-        # ``aclnnQuantLightningIndexerV2`` / ``aclnnPoolKeyIndexer`` consume the
-        # checkpoint head-weight projection directly.  Any external cast would
-        # be a launch the production graph does not execute.
+    packed_fp32 = index_cache_is_packed(model, plan=plan, phase=phase)
+    int8_qli_fp16 = (
+        plan.index_kpool <= 1 and quant.index_dtype == "int8" and not packed_fp32
+    )
+    if native and not mode1 and not packed_fp32 and not int8_qli_fp16:
+        # ``aclnnPoolKeyIndexer`` and BF16/FP8 non-mode1 consumers consume the
+        # checkpoint head-weight projection directly.
         return weights
-    if mode1 or index_cache_is_packed(model):
-        if weights_dtype != FP32_WEIGHT_DTYPE:
-            return builder.vector(
+    if mode1 or packed_fp32:
+        if w_out_dtype != FP32_WEIGHT_DTYPE:
+            weights = builder.vector(
                 "index_weights_fp32", (weights,), tokens * plan.index_heads, 1,
                 family="cast", dtype=FP32_WEIGHT_DTYPE,
                 shape=(tokens, plan.index_heads),
-                read_bytes_override=tokens * plan.index_heads * dtype_bytes(weights_dtype),
+                read_bytes_override=tokens * plan.index_heads * dtype_bytes(w_out_dtype),
                 write_bytes_override=tokens * plan.index_heads * FP32_BYTES,
-                metadata=(("source_semantics", "packed_indexer_weights_float32"),))
+                metadata=(
+                    ("input_format", w_out_dtype),
+                    ("output_format", FP32_WEIGHT_DTYPE),
+                    ("source_semantics", "packed_indexer_weights_float32"),
+                ))
+        if packed_fp32:
+            # deepseek_v41/indexer.py:184: self._output(weights_proj, hidden).float() * self.weights_scale
+            weights = builder.vector(
+                "index_weights_scale", (weights,), tokens * plan.index_heads, 1,
+                family="elementwise", dtype=FP32_WEIGHT_DTYPE,
+                shape=(tokens, plan.index_heads),
+                read_bytes_override=tokens * plan.index_heads * FP32_BYTES,
+                write_bytes_override=tokens * plan.index_heads * FP32_BYTES,
+                metadata=(
+                    ("input_format", FP32_WEIGHT_DTYPE),
+                    ("output_format", FP32_WEIGHT_DTYPE),
+                    ("source_semantics", "packed_indexer_weights_scale_float32"),
+                ))
         return weights
     if quant.index_dtype == "int8":
+        if w_out_dtype == "fp16":
+            return weights
         return builder.vector(
             "index_weights_fp16", (weights,), tokens * plan.index_heads, 1,
             family="cast", dtype="fp16", shape=(tokens, plan.index_heads),
-            read_bytes_override=tokens * plan.index_heads * dtype_bytes(weights_dtype),
+            read_bytes_override=tokens * plan.index_heads * dtype_bytes(w_out_dtype),
             write_bytes_override=tokens * plan.index_heads * FP16_BYTES,
-            metadata=(("source_semantics", "quant_indexer_weights_float16"),))
+            metadata=(
+                ("input_format", w_out_dtype),
+                ("output_format", "fp16"),
+                ("source_semantics", "quant_indexer_weights_float16"),
+            ))
     if plan.index_kpool > 1:
-        if weights_dtype != quant.index_dtype:
+        if w_out_dtype != quant.index_dtype:
             weights = builder.vector(
                 "index_weights_cast", (weights,), tokens * plan.index_heads, 1,
                 family="cast", dtype=quant.index_dtype,
                 shape=(tokens, plan.index_heads),
-                read_bytes_override=tokens * plan.index_heads * dtype_bytes(weights_dtype),
+                read_bytes_override=tokens * plan.index_heads * dtype_bytes(w_out_dtype),
                 write_bytes_override=tokens * plan.index_heads * dtype_bytes(quant.index_dtype),
-                metadata=(("input_format", weights_dtype),
+                metadata=(("input_format", w_out_dtype),
                           ("output_format", quant.index_dtype))
                 + ((("input_column_slice",
                      (plan.index_dim, plan.index_dim + plan.index_heads)),)
@@ -699,6 +835,70 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
     return (index_store, _selection_reference(b, topk), candidate, pool_weights)
 
 
+def _emit_decomposed_index_quant_store(
+    b, quantize_op, *, normalized, index_rows, index_store_rows, total_row_b, quant,
+):
+    """Emit dynamic-quant FP32 scale output + scale cast + two slot-indexed scatters."""
+    q_meta = dict(quantize_op.metadata)
+    scale_fmt = str(q_meta.get("scale_format") or "none").strip().lower()
+    scale_cnt = int(q_meta.get("scale_count") or 0)
+    scale_row_b = (
+        scale_cnt * dtype_bytes(scale_fmt)
+        if (scale_cnt > 0 and scale_fmt not in {"", "none"}) else 0
+    )
+    payload_row_b = max(0, total_row_b - scale_row_b)
+    payload_dtype = str(q_meta.get("output_format") or quant.index_dtype).strip().lower()
+    scale_dep = normalized
+    # DynamicQuantKernelNpuOpApi.cpp:188 always writes FP32 scale before caller casts to target.
+    if payload_dtype == "int8" and scale_cnt > 0 and scale_fmt not in {"", "none", "fp32", "float32"}:
+        fp32_scale_row_b = scale_cnt * FP32_BYTES
+        dq_write = float(index_rows * (payload_row_b + fp32_scale_row_b))
+        dq_meta = {**q_meta, "scale_format": "fp32", "physical_row_bytes": payload_row_b + fp32_scale_row_b}
+        b.ops[-1] = replace(
+            quantize_op,
+            mte3_bytes=dq_write,
+            hbm_bytes=quantize_op.mte2_bytes + dq_write,
+            metadata=tuple(dq_meta.items()),
+        )
+        scale_dep = b.vector(
+            "index_scale_cast", (normalized,), index_rows * scale_cnt, 1,
+            family="cast", dtype=scale_fmt, shape=(index_rows, scale_cnt),
+            read_bytes_override=index_rows * fp32_scale_row_b,
+            write_bytes_override=index_rows * scale_row_b,
+            metadata=(
+                ("input_format", "fp32"),
+                ("output_format", scale_fmt),
+                ("source_semantics", "dynamic_quant_scale_cast"),
+            ),
+        )
+    slots_bytes = float(index_store_rows * INT32_BYTES)
+    store_deps: tuple[str, ...] = (normalized,)
+    if scale_row_b > 0:
+        scale_store = b.store(
+            "index_scale_store", (scale_dep,), index_store_rows, scale_row_b, scale_fmt,
+        )
+        s_op = b.ops[-1]
+        b.ops[-1] = replace(
+            s_op,
+            mte2_bytes=s_op.mte2_bytes + slots_bytes,
+            hbm_bytes=s_op.hbm_bytes + slots_bytes,
+            metadata=s_op.metadata + (("scatter_slot_bytes", slots_bytes),),
+        )
+        store_deps = (normalized, scale_store)
+    index_store = b.store(
+        "index_store", store_deps, index_store_rows,
+        payload_row_b if scale_row_b > 0 else total_row_b, payload_dtype,
+    )
+    k_op = b.ops[-1]
+    b.ops[-1] = replace(
+        k_op,
+        mte2_bytes=k_op.mte2_bytes + slots_bytes,
+        hbm_bytes=k_op.hbm_bytes + slots_bytes,
+        metadata=k_op.metadata + (("scatter_slot_bytes", slots_bytes),),
+    )
+    return index_store
+
+
 def _produce_index_cache(
     b, plan, pool_binding, views, deps, model, quant, q, long_store, compressed_latent, ratio,
     valid, fused_compressor, runtime, native_indexer, index_rope, parallel, idx_block,
@@ -811,29 +1011,49 @@ def _produce_index_cache(
                         contexts=index_starts)
             if sharded_index and index_rows else index_rows
         )
-        index_store = b.store("index_store", (normalized,), index_store_rows,
-                              index_row_bytes(model, plan.index_dim), quant.index_dtype)
-        if quantize_id is not None:
-            index_store = index_row_quantization(
-                b, index_store, quantize_id, width=plan.index_dim, native=native_indexer)
-        elif native_indexer:
-            from mindie_sim.prediction.operators.sparse_indexer.index_cache_writer import SCATTER_PA_KV_RECIPE, SCATTER_PA_KV_SOURCE
-            store_op = next((item for item in reversed(b.ops)
-                             if item.op_id == index_store), None)
-            if store_op is not None and store_op.family == "cache_store":
-                upgraded = replace(
-                    store_op,
-                    family="kv_cache_write",
-                    recipe=SCATTER_PA_KV_RECIPE,
-                    metadata=store_op.metadata + (
-                        ("native_kind", KV_SCATTER_EPILOG),
-                        ("native_cache_store", True),
-                        ("zero_external_casts", True),
-                        ("native_source", SCATTER_PA_KV_SOURCE),
-                    ),
-                )
-                b.ops = [upgraded if item.op_id == index_store else item
-                         for item in b.ops]
+        total_row_b = index_row_bytes(model, plan.index_dim)
+        arch = _resolve_arch(runtime, machine)
+        q_meta = dict(last.metadata) if quantize_id is not None else {}
+        iqc_supported = (
+            quantize_id is not None
+            and _indexer_quant_cache_available(arch)
+            and _indexer_quant_cache_operands_supported(
+                last.dtype, q_meta.get("output_format"), q_meta.get("scale_format"),
+                packed_elements=int(q_meta.get("packed_elements") or 1),
+            )
+        )
+        if quantize_id is not None and native_indexer and not iqc_supported:
+            # Target arch or operand tuple lacks shipping aclnnIndexerQuantCache:
+            # keep dynamic quant (FP32 scale) + scale cast + two slot-indexed scatters.
+            index_store = _emit_decomposed_index_quant_store(
+                b, last, normalized=normalized, index_rows=index_rows,
+                index_store_rows=index_store_rows, total_row_b=total_row_b, quant=quant,
+            )
+        else:
+            index_store = b.store("index_store", (normalized,), index_store_rows,
+                                  total_row_b, quant.index_dtype)
+            if quantize_id is not None:
+                index_store = index_row_quantization(
+                    b, index_store, quantize_id, width=plan.index_dim,
+                    native=native_indexer, arch=arch)
+            elif native_indexer:
+                from mindie_sim.prediction.operators.sparse_indexer.index_cache_writer import SCATTER_PA_KV_RECIPE, SCATTER_PA_KV_SOURCE
+                store_op = next((item for item in reversed(b.ops)
+                                 if item.op_id == index_store), None)
+                if store_op is not None and store_op.family == "cache_store":
+                    upgraded = replace(
+                        store_op,
+                        family="kv_cache_write",
+                        recipe=SCATTER_PA_KV_RECIPE,
+                        metadata=store_op.metadata + (
+                            ("native_kind", KV_SCATTER_EPILOG),
+                            ("native_cache_store", True),
+                            ("zero_external_casts", True),
+                            ("native_source", SCATTER_PA_KV_SOURCE),
+                        ),
+                    )
+                    b.ops = [upgraded if item.op_id == index_store else item
+                             for item in b.ops]
     return index_store, pool_weights
 
 

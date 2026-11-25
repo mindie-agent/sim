@@ -11,6 +11,7 @@ from collections.abc import Mapping
 import math
 from dataclasses import replace
 from functools import partial
+from typing import Literal
 
 from mindie_sim.catalog.attention_common import (
     AttentionResult, _group_plan,
@@ -21,6 +22,7 @@ from mindie_sim.catalog.context_parallel import (
     layer_dcp_factors, owned_positions,
 )
 from mindie_sim.schema.common import dtype_bytes, ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.operators.attention.batch_prefix_attention import (
     annotate_sparse_prefix_unknown, apply_attention_prefix_reads,
     apply_sparse_prefix_reads,
@@ -76,6 +78,22 @@ from .generic_latent_attention_views import (
 
 # Shared private alias retained strictly for cross-wave attention callers.
 _attention_tensor_view = attention_tensor_view
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "vllm_ascend/attention/mla_v1.py",
+        "f7f672e001651a748d2e88ef0f36797ef78db63321ac657f1c7a944c0f561c22",
+    ),
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "vllm_ascend/attention/sfa_v1.py",
+        "058aeb723a4ef3cdb0e07a5fc0180ec53f8227f62d98710144ecffb9cc66678f",
+    ),
+)
 
 DEFAULT_INTERLEAVE = 128
 DEFAULT_BLOCK_SIZE = 128
@@ -170,12 +188,13 @@ def _apply_mla_dcp_prefill_kv_gather(
             default=0,
         )
         if pf_kv_rows > 0:
-            kv_fmt = cache_format(model, "mla_kv")
+            kv_fmt = cache_format(model, "mla_kv", plan=plan, phase=mode)
             store = emit_sfa_prefill_kv_gather(
                 b.ops, prefix=prefix, stage=stage, layer=plan.index,
                 requests=b.common["requests"], mode=mode, store_dep=store,
                 prefill_context_rows=pf_kv_rows,
-                kv_row_bytes=kv_fmt.row_bytes(plan.cache_row_elements),
+                kv_row_bytes=packed_region_row_bytes(
+                    model, "mla_kv", plan.cache_row_elements, plan=plan, phase=mode),
                 layer_dcp=layer_dcp, kv_dtype=kv_fmt.dtype,
                 recipe="sfa_dcp_prefill_kv_gather")
             if plan.cache_kind == "dense":
@@ -193,12 +212,13 @@ def _apply_mla_dcp_prefill_kv_gather(
             default=0,
         )
         if pf_ctx_padded > 0:
-            kv_fmt = cache_format(model, "mla_kv")
+            kv_fmt = cache_format(model, "mla_kv", plan=plan, phase=mode)
             store = emit_sfa_prefill_kv_gather(
                 b.ops, prefix=prefix, stage=stage, layer=plan.index,
                 requests=b.common["requests"], mode=mode, store_dep=store,
                 prefill_context_rows=pf_ctx_padded,
-                kv_row_bytes=kv_fmt.row_bytes(plan.cache_row_elements),
+                kv_row_bytes=packed_region_row_bytes(
+                    model, "mla_kv", plan.cache_row_elements, plan=plan, phase=mode),
                 layer_dcp=layer_dcp, kv_dtype=kv_fmt.dtype,
                 recipe="dcp_prefill_kv_gather")
             if plan.cache_kind == "dense":
@@ -730,6 +750,52 @@ def _select_mla_lowerings(
     return prolog, partial_rotary, paged, selected, mixed_quant
 
 
+_GROUP_QUANT_OPS_PER_ELEMENT = 4
+
+
+def _reconcile_kv_store_format(op, *, model, cache_fmt, cache_region, rows, width, row_bytes):
+    """Align kv_store byte accounting with the resolved layer/phase CacheFormat."""
+    meta = dict(op.metadata)
+    stored = rows * row_bytes
+    current_row = meta.get("cache_row_bytes") or dict(meta.get("cache_representation") or {}).get("row_bytes")
+    if int(op.mte3_bytes) == stored and current_row == row_bytes:
+        return op
+    source = rows * width * dtype_bytes(model.activation_dtype)
+    if cache_fmt.group_size:
+        groups = (width + cache_fmt.group_size - 1) // cache_fmt.group_size
+        shape = (rows, width)
+        mte2 = float(source)
+        vec_ops = float(rows * (_GROUP_QUANT_OPS_PER_ELEMENT * width + groups))
+        dtype = model.activation_dtype
+    else:
+        shape = (max(1, rows), max(1, row_bytes))
+        mte2 = float(stored)
+        vec_ops = float(stored)
+        dtype = cache_fmt.dtype
+    meta["cache_row_bytes"] = row_bytes
+    meta["cache_format"] = {
+        "region": cache_region, "dtype": cache_fmt.dtype,
+        "group_size": cache_fmt.group_size, "scale_dtype": cache_fmt.scale_dtype,
+        "suffix_elements": cache_fmt.suffix_elements,
+        "suffix_dtype": cache_fmt.suffix_dtype,
+        "packed_elements": cache_fmt.packed_elements,
+    }
+    if isinstance(meta.get("cache_representation"), dict):
+        meta["cache_representation"] = {
+            **meta["cache_representation"],
+            "dtype": cache_fmt.dtype,
+            "group_size": cache_fmt.group_size,
+            "scale_dtype": cache_fmt.scale_dtype,
+            "row_bytes": row_bytes,
+        }
+    return replace(
+        op,
+        semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
+        dtype=dtype, vector_ops=vec_ops, mte2_bytes=mte2, mte3_bytes=float(stored),
+        hbm_bytes=mte2 + float(stored), metadata=tuple(meta.items()),
+    )
+
+
 def _produce_mla_cache(
     b, views, parallel, own_block, rotary, kv, kv_a, do_rope, prolog, native_cache_epilogs,
     pcp_prefill, *, is_v41=False, padded_tokens=0,
@@ -769,16 +835,23 @@ def _produce_mla_cache(
         b, "kv_store", cache_deps, store_rows, plan.cache_row_elements,
         cache_region))
     if store is not None and packed_store is None:
-        cache_fmt = cache_format(model, cache_region)
+        store_phase = b.common["phase"]
+        cache_fmt = cache_format(model, cache_region, plan=plan, phase=store_phase)
+        expected_row_b = packed_region_row_bytes(
+            model, cache_region, plan.cache_row_elements, plan=plan, phase=store_phase)
         for position, item in enumerate(b.ops):
             if item.op_id != store:
                 continue
+            item = _reconcile_kv_store_format(
+                item, model=model, cache_fmt=cache_fmt, cache_region=cache_region,
+                rows=store_rows, width=plan.cache_row_elements, row_bytes=expected_row_b,
+            )
             written = kv_cache_epilog(item, cache_fmt, cache_region,
-                                      native=native_cache_epilogs)
+                                      native=native_cache_epilogs, row_bytes=expected_row_b)
             if plan.qk_rope_head_dim == 0:
                 written = block_quant_epilog(
                     written, cache_fmt, cache_region, native=native_cache_epilogs,
-                    width=plan.cache_row_elements)
+                    width=plan.cache_row_elements, row_bytes=expected_row_b)
             b.ops[position] = written
             store = written.op_id
             break
@@ -798,8 +871,8 @@ def _produce_mla_cache(
             kv_dtype = "int8"
         else:
             kv_row = packed_region_row_bytes(
-                model, cache_region, plan.cache_row_elements)
-            kv_dtype = cache_format(model, cache_region).dtype
+                model, cache_region, plan.cache_row_elements, plan=plan, phase=b.common["phase"])
+            kv_dtype = cache_format(model, cache_region, plan=plan, phase=b.common["phase"]).dtype
         store = b.communicate(
             "pcp_kv_gather", (produced,),
             rows * kv_row * (parallel.pcp - 1) / parallel.pcp,
@@ -1571,6 +1644,11 @@ def _attach_mla_dcp_metadata(
             ) + sparse_meta)
 
 
+def _mla_view_kv_row_bytes(model, plan, view_phase: str) -> int:
+    return packed_region_row_bytes(
+        model, "mla_kv", plan.cache_row_elements, plan=plan, phase=view_phase)
+
+
 def _append_mla_attention(
     b, outputs, views, runtime, selected, parallel, dsa_prefill, model, plan, quant, query_tile,
     cp_interleave_size, topk, local_heads, dcp_heads, latent_dim, qk_dim, reuse_index_selection,
@@ -1586,26 +1664,28 @@ def _append_mla_attention(
     layer_dcp = layer_dcp_degree(plan, parallel)
     has_dp_decode = (not sfa_replicated_prefill_path and dp_width > 1
                      and layer_dcp > 1 and bool(cohort_decode_views))
-    phase_groups: list[tuple[int, list[tuple[int, object]]]] = []
-    grp_map: dict[int, list[tuple[int, object]]] = {}
+    phase_groups: list[tuple[int, int, list[tuple[int, object]]]] = []
+    grp_map: dict[tuple[int, int], list[tuple[int, object]]] = {}
     for index, view in enumerate(() if selected else views):
         if has_dp_decode and view.phase != "prefill":
             continue
         eff_cp = (1 if sfa_replicated_prefill_path else
                   active_layer_dcp(plan, parallel, view.phase, sharded_indexer=sharded_indexer))
-        if eff_cp not in grp_map:
+        grp_key = (eff_cp, _mla_view_kv_row_bytes(model, plan, view.phase))
+        if grp_key not in grp_map:
             bucket: list[tuple[int, object]] = []
-            grp_map[eff_cp] = bucket
-            phase_groups.append((eff_cp, bucket))
-        grp_map[eff_cp].append((index, view))
+            grp_map[grp_key] = bucket
+            phase_groups.append((eff_cp, grp_key[1], bucket))
+        grp_map[grp_key].append((index, view))
     if not selected and has_dp_decode:
         next_view_idx = max(
-            (idx for _, bucket in phase_groups for idx, _ in bucket),
+            (idx for _, _, bucket in phase_groups for idx, _ in bucket),
             default=-1,
         ) + 1
-        phase_groups.append((layer_dcp, list(enumerate(cohort_decode_views, start=next_view_idx))))
+        decode_row_b = _mla_view_kv_row_bytes(model, plan, "decode")
+        phase_groups.append((layer_dcp, decode_row_b, list(enumerate(cohort_decode_views, start=next_view_idx))))
     multi_group = len(phase_groups) > 1
-    for grp_idx, (eff_cp, indexed_views) in enumerate(phase_groups):
+    for grp_idx, (eff_cp, kv_row_b, indexed_views) in enumerate(phase_groups):
         grp_views = tuple(view for _, view in indexed_views)
         grp_prefix = f"{b.prefix}.phase{grp_idx}" if multi_group else b.prefix
         grp_dsa = dsa_prefill and any(view.phase == "prefill" for view in grp_views)
@@ -1672,7 +1752,6 @@ def _append_mla_attention(
         kv_hbm_total = 0.0
         kv_mte2_total = 0.0
         kv_components: dict[str, tuple[float, float]] = {}
-        kv_row_b = cache_format(model, "mla_kv").row_bytes(plan.cache_row_elements)
         for rec in view_records:
             local_sweeps = rec["v_sweeps"][sel_sweeps_r]
             sweeps_by_view.append(local_sweeps)

@@ -10,11 +10,25 @@
 from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache, partial
+from typing import Literal
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from .sharedkv_metadata import OWNER_SCHEDULE, SOURCE as METADATA_SOURCE, query_partitions
+
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+ARCH22_ARCH_ID = "npu_arch_2201"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "csrc/attention/sparse_attn_sharedkv/op_host/sparse_attn_sharedkv_tiling.cpp",
+        "98fb6d201fd7657fe44c4ebe9a2445af377cb4b5db47861f0b52db2a8b8dacf1",
+    ),
+)
 
 
 CUBE_FRACTAL_ROWS = 16
@@ -174,7 +188,22 @@ class _OwnerStream:
                                    engine, name, ready, owner=owner)
 
 
+def _declared_arch_id(geometry) -> str:
+    datapath = getattr(geometry, "datapath", None)
+    if datapath is not None and getattr(datapath, "compute_arch", None) is not None:
+        arch_id = str(getattr(datapath.compute_arch, "arch_id", "") or "").strip()
+        if arch_id:
+            return arch_id
+    compute_arch = getattr(geometry, "compute_arch", None)
+    if compute_arch is not None:
+        return str(getattr(compute_arch, "preset", "") or getattr(compute_arch, "arch_id", "") or "").strip()
+    return ""
+
+
 def build(op, geometry, *, scratch_policy="offchip", slots=2):
+    arch_id = _declared_arch_id(geometry)
+    if arch_id and arch_id != ARCH22_ARCH_ID:
+        raise ModelingError(f"sharedkv_attention_requires_arch22:{arch_id}")
     meta = dict(op.metadata)
     shape = meta.get("sharedkv_attention_geometry")
     if not shape:
@@ -239,6 +268,9 @@ def _plan(query, context, window, ratio, topk, heads, width, compute_units,
                 total += phase.scaled(count)
 
     def lower(ctx):
+        arch_id = _declared_arch_id(ctx)
+        if arch_id and arch_id != ARCH22_ARCH_ID:
+            raise ModelingError(f"sharedkv_attention_requires_arch22:{arch_id}")
         required = {"mte2_aic", "mte2_aiv", "mte1", "mte3", "fixpipe"}
         if scratch_policy == "resident":
             required |= {"mte2_aic_cached", "mte2_aiv_cached", "l2_read", "l2_write"}

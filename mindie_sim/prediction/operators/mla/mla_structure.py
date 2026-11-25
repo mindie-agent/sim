@@ -6,14 +6,46 @@
 [Timeouts & Locks] Linear metadata updates within one layer; no I/O or locks.
 [Side-Effect Policy] Replaces records only in the caller-owned operator list.
 """
+from typing import Literal
+
 from mindie_sim.prediction.structure_groups import declare_group
+from mindie_sim.schema.datapath import SourceRef
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "vllm-project/vllm-ascend",
+        "0c99d3fc5ef471224a2109ebb6b6ab848a7e66bb",
+        "vllm_ascend/models/deepseek_v41/indexer.py",
+        "45ec4290a41c25497d3cadfdb40c7466b5a40ae467a76200d82d4fa34b15fa02",
+    ),
+)
+
+
+def _resolve_indexer_weight_dtype(ops, scores_op, sel_meta, quant, model) -> str:
+    for ledger_key in ("lightning_indexer_work", "quant_indexer_work", "native_tensor_view"):
+        ledger = sel_meta.get(ledger_key)
+        if isinstance(ledger, dict) and ledger.get("weight_dtype"):
+            return str(ledger["weight_dtype"]).strip().lower()
+    if sel_meta.get("weight_dtype"):
+        return str(sel_meta["weight_dtype"]).strip().lower()
+    if scores_op is not None and len(scores_op.deps) > 1:
+        by_id = {op.op_id: op for op in ops}
+        w_op = by_id.get(scores_op.deps[1])
+        if w_op is not None and (w_op.recipe.startswith("index_weights") or "index_weights" in w_op.op_id):
+            resolved = str(dict(w_op.metadata).get("output_format") or w_op.dtype or "").strip().lower()
+            if resolved:
+                return resolved
+    return "fp16" if quant.index_dtype == "int8" else model.activation_dtype
 
 
 def declare_indexer(ops, *, prefix, plan, parallel, model, quant, views,
                     padded_tokens, scores, topk):
     """Unconditionally declare the DSA indexer subgraph over rank-local KV."""
     selection = next(op for op in ops if op.op_id == topk)
+    scores_op = selection if scores == topk else next((op for op in ops if op.op_id == scores), selection)
     sel_meta = dict(selection.metadata)
+    weight_dtype = _resolve_indexer_weight_dtype(ops, scores_op, sel_meta, quant, model)
     quantized = quant.index_dtype not in {"bf16", "fp16"}
     role = "quant_lightning_indexer" if quantized else "lightning_indexer"
     partition = tuple({"query": view.q_len, "context": view.context,
@@ -49,7 +81,7 @@ def declare_indexer(ops, *, prefix, plan, parallel, model, quant, views,
             "sequence_partition": partition, "compression_ratio": max(1, plan.compress_ratio),
             "heads": plan.index_heads, "width": plan.index_dim,
             "topk": plan.index_topk, "query_dtype": quant.index_dtype,
-            "weight_dtype": "fp16" if quant.index_dtype == "int8" else model.activation_dtype,
+            "weight_dtype": weight_dtype,
             "cache_dtype": quant.index_dtype,
             "selection_output_dtype": sel_meta.get("selection_output_dtype", "int32"),
             "scale_dtype": quant.index_scale_dtype,

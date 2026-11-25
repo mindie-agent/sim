@@ -15,6 +15,25 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from math import ceil, gcd, isqrt
 import sys
+from typing import Literal
+
+from mindie_sim.schema.datapath import SourceRef
+
+TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        "cann/ops-transformer",
+        "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "attention/common/op_host/split_core.cpp",
+        "356fd86453726d363ecdf9db2cd8ff3ee37dfc1daadfd60feaa51bb2fdba20c8",
+    ),
+    SourceRef(
+        "cann/ops-transformer",
+        "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        "attention/common/op_host/split_core_v2.cpp",
+        "73fc473f37677d43f718ea68a3ff8d4c248f4d7de6808ee68363351759ca8c1c",
+    ),
+)
 
 COST_M_WEIGHT = 6
 COST_M_GRANULARITY = 16
@@ -658,7 +677,7 @@ def p01_cold_mte2_aic_cap(
             # rate at the highest unsaturated knee rather than dividing saturated HBM by active_owners.
             caps[mte2_name] = per_core_bps / MS_PER_SECOND_SC
     if (include_hbm or hbm_only) and hbm_name and (die_hbm_bps <= 0.0 or total_bps < die_hbm_bps):
-        hbm_per_core = (total_bps / float(active_owners)) if hbm_only else per_core_bps
+        hbm_per_core = total_bps / float(active_owners)
         caps[hbm_name] = hbm_per_core / MS_PER_SECOND_SC
     return caps
 
