@@ -11,32 +11,107 @@ from bisect import bisect_right
 from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
+from typing import Literal
 
+from mindie_sim.backends.abi_registry import default_abi_registry
 from mindie_sim.primitives.loader import resolve_dispatch_envelope
+from mindie_sim.schema.abi import AbiQueryKey, AbiSupportVerdict, OperandPortSig
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.instructions import PrimitiveInventory
+from .common import DSL_MQS_ABI
 
-
+TARGET_BACKEND: Literal["ascend"] = "ascend"
 CUBE_FRACTAL_ROWS = 16
 MIN_MQS_PAGE_ROWS = 16
 MQS_TILE_KEYS = 128
+MQS_GM_WORKSPACE_SLOTS = 3
 OFFSET_ENTRY_BYTES = 4
 ARCH22_PRESET = "npu_arch_2201"
 
-#: CANN 9.2.1 official source (`aclnnMixedQuantSparseFlashMla`).
+SOURCE_REFS: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/mixed_quant_sparse_flash_mla/op_api/aclnn_mixed_quant_sparse_flash_mla.h",
+        source_sha256="4b613b72ec6cb36209328b084b74aa76e32ec86ad872976e564d9e4eea60e671",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/mixed_quant_sparse_flash_mla/op_kernel/arch35/mixed_quant_sparse_flash_mla_csa_block_vector.h",
+        source_sha256="f60e4f44294b0677522bdeec766f6bb66f61fdc3375ac95f547000eff7c10237",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/mixed_quant_sparse_flash_mla/op_kernel/arch35/mixed_quant_sparse_flash_mla_csa_block_cube.h",
+        source_sha256="df3f7ca12e1bad28f2f52d4bdfe5d43326a176af88d00c7d1121d4cc4e62290e",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/mixed_quant_sparse_flash_mla/README_en.md",
+        source_sha256="e5f013aca264fd192f5780455eeb4fa9d378a03d9576e34bb31488cdf39e75c0",
+    ),
+    SourceRef(
+        repository="tilelang-ascend/kernels",
+        revision="5e7ace8cdcc16a5b062ba69d8fdf93d4f1d62223",
+        relative_path="samples/attention/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",
+        source_sha256="9fd0ad943a677e630ffb13df255b73a7b8889de0ed5a032996c2a3be6fc5ee36",
+    ),
+    SourceRef(
+        repository="tilelang-ascend/kernels",
+        revision="5e7ace8cdcc16a5b062ba69d8fdf93d4f1d62223",
+        relative_path="samples/attention/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla_metadata.py",
+        source_sha256="51e13bd02d35704f99298dd9fdff36ddd82c941a8106c07d8e668d29664ad40a",
+    ),
+)
+
+#: CANN 9.3 official source (`aclnnMixedQuantSparseFlashMla`).
 SOURCE = {
-    "repository": "vllm-ascend",
+    "repository": "cann/ops-transformer",
+    "revision": "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
     "base_revision": "nightly-ci-main-a5-openeuler-cann9.2.1-20261111",
     "source_state": "committed",
-    "path": "vllm_ascend/attention/mixed_quant_sparse_flash_mla.py",
-    "symbol": "mixed_quant_sparse_flash_mla",
+    "path": "attention/mixed_quant_sparse_flash_mla/op_api/aclnn_mixed_quant_sparse_flash_mla.h",
+    "source_sha256": "4b613b72ec6cb36209328b084b74aa76e32ec86ad872976e564d9e4eea60e671",
+    "symbol": "aclnnMixedQuantSparseFlashMla",
     "scope": "independent_source_semantics; not_capture_binary_identity",
+}
+DSL_SOURCE = {
+    "repository": "tilelang-ascend/kernels",
+    "revision": "5e7ace8cdcc16a5b062ba69d8fdf93d4f1d62223",
+    "source_state": "unmerged_pr",
+    "path": "samples/attention/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",
+    "source_sha256": "9fd0ad943a677e630ffb13df255b73a7b8889de0ed5a032996c2a3be6fc5ee36",
+    "symbol": DSL_MQS_ABI,
+    "scope": "tilelang_dsl_544_320; unmerged_pr_requires_manifest_binding",
 }
 RECIPE = "aclnn_mixed_quant_sparse_flash_mla"
 NATIVE_KIND = "aclnnMixedQuantSparseFlashMla"
+DSL_NATIVE_KIND = DSL_MQS_ABI
 SUPPORTED_PHASES = frozenset({"decode", "draft"})
+SUPPORTED_ADDRESSING = frozenset({"scalar"})
+_MQS_CANN_MOTIF = "mixed_quant_sparse_flash_mla"
+_MQS_DSL_MOTIF = "mixed_quant_sparse_flash_mla_dsl"
+_MQS_CANN_PACKED_GROUP = 64
+_MQS_DSL_FP8_GROUP = 32
+_MQS_DSL_FP4_GROUP = 16
+_MQS_DEFAULT_PAGE_SIZE = 128
+_MQS_KV_HEADS = 1
+_MQS_METADATA_ELEMS = 2048
+_MQS_PAIRED_AIV_COUNT = 2
+_AIV_ROLES = frozenset({"vector", "mte2_aiv", "mte3"})
+_MQS_ADMITTED_STATUSES = frozenset({"admitted_shipping", "admitted_proposed_pr"})
+_SOC_DEFAULT_SKU = {
+    "A2": "ascend910b2",
+    "A3": "ascend910_9392",
+    "A5": "ascend950dt_9582",
+}
+_A3_SKU_MARKERS = ("9362", "9372", "9382", "9391", "9392")
 
 # Source Channel depths. BF16 output aliases the FP32 accumulator. The P NZ
 # buffers include one 16-element pad per N1 face; all scalar state is FP32.
@@ -246,14 +321,330 @@ def quant_row_bytes(quant_mode):
             KV_QUANT_MXFP8: KV_QUANT_MXFP8_ROW_BYTES}[quant_mode]
 
 
-def quant_tile_phases(valid, first, last, *, heads, quant_mode, window_bytes=0):
+def is_abi_admitted(verdict: AbiSupportVerdict) -> bool:
+    """Return True iff the sealed ABI registry admitted the query."""
+    return verdict.status in _MQS_ADMITTED_STATUSES
+
+
+def _soc_arch_from_geometry(geometry, sku_override: str | None = None) -> tuple[str, str]:
+    compute_arch = getattr(geometry, "compute_arch", None) or getattr(
+        getattr(geometry, "datapath", None), "compute_arch", None
+    )
+    preset = str(getattr(compute_arch, "preset", "") or getattr(compute_arch, "arch_id", "") or "").strip()
+    sku_id = str(
+        sku_override or getattr(geometry, "sku_id", "")
+        or getattr(getattr(geometry, "datapath", None), "sku_id", "") or ""
+    ).strip().lower()
+    arch_family = str(
+        getattr(compute_arch, "arch_family", "") or getattr(geometry, "arch_family", "") or ""
+    ).strip().upper()
+    mem_hier = getattr(getattr(geometry, "physical_mechanisms", None), "memory_hierarchy", None)
+    prov = getattr(mem_hier, "provenance", None)
+    prov_arch = str(prov.get("arch") or "").strip().upper() if isinstance(prov, dict) else ""
+    if arch_family in _SOC_DEFAULT_SKU:
+        soc = arch_family
+    elif prov_arch in _SOC_DEFAULT_SKU:
+        soc = prov_arch
+    elif prov_arch in _ARCH35_PRESETS or preset in _ARCH35_PRESETS:
+        soc = "A5"
+    elif any(marker in sku_id for marker in _A3_SKU_MARKERS):
+        soc = "A3"
+    elif preset == ARCH22_PRESET:
+        soc = "A2"
+    else:
+        soc = "A5"
+    return soc, (sku_id or _SOC_DEFAULT_SKU[soc])
+
+
+def _has_dsl_cache_contract(meta: dict) -> bool:
+    view = meta.get("attention_tensor_view")
+    if not isinstance(view, dict):
+        return False
+    regions = view.get("cache_representations")
+    if not isinstance(regions, dict):
+        return False
+    win = regions.get("window")
+    cmp_kv = regions.get("compressed_kv")
+    if not (isinstance(win, dict) and isinstance(cmp_kv, dict)):
+        return False
+    return (
+        win.get("dtype") == "fp8_e4m3"
+        and win.get("group_size") == _MQS_DSL_FP8_GROUP
+        and win.get("scale_dtype") == "bf16"
+        and cmp_kv.get("dtype") == "fp4_e2m1"
+        and cmp_kv.get("group_size") == _MQS_DSL_FP4_GROUP
+        and cmp_kv.get("scale_dtype") == "bf16"
+    )
+
+
+def _resolve_owner_pairs(geometry) -> tuple[tuple[int, tuple[int, int]], ...]:
+    """Resolve active physical (aic, (aiv0, aiv1)) pairs honoring ``stream_owners``."""
+    total_cores = int(geometry.compute_units)
+    datapath = getattr(geometry, "datapath", None)
+    raw_pairs = getattr(datapath, "aic_aiv_pairs", None) if datapath is not None else None
+    all_pairs = (
+        tuple((int(aic), tuple(int(aiv) for aiv in siblings)) for aic, siblings in raw_pairs)
+        if raw_pairs
+        else tuple((aic, (2 * aic, 2 * aic + 1)) for aic in range(total_cores))
+    )
+    owners = getattr(geometry, "stream_owners", None)
+    if owners is None:
+        return tuple((aic, (aivs[0], aivs[1])) for aic, aivs in all_pairs[:total_cores]
+                     if len(aivs) == _MQS_PAIRED_AIV_COUNT)
+    aic_list = tuple(owners.aic or owners.pool_aic or ())
+    aiv_list = tuple(owners.aiv or owners.pool_aiv or ())
+    aic_limit = (
+        int(owners.aic_limit) if getattr(owners, "aic_limit", None) is not None
+        else (len(aic_list) if aic_list else total_cores)
+    )
+    aiv_limit = (
+        int(owners.aiv_limit) if getattr(owners, "aiv_limit", None) is not None
+        else (len(aiv_list) if aiv_list else int(geometry.resource_units.get("vector", 2 * total_cores)))
+    )
+    active_aic = tuple((aic_list or tuple(range(total_cores)))[:aic_limit])
+    active_aiv_set = frozenset((aiv_list or tuple(range(2 * total_cores)))[:aiv_limit])
+    by_aic = {aic: tuple(aiv for aiv in siblings if aiv in active_aiv_set) for aic, siblings in all_pairs}
+    pairs = tuple(
+        (int(aic), (matched[0], matched[1]))
+        for aic in active_aic
+        if len(matched := by_aic.get(int(aic), ())) == _MQS_PAIRED_AIV_COUNT
+    )
+    if not pairs:
+        raise ModelingError("mqsmla_requires_paired_aiv:stream_owners")
+    return pairs
+
+
+def _pair_placement(context, aic: int, aivs: tuple[int, int], roles) -> dict[str, tuple[int, ...]]:
+    placed: dict[str, tuple[int, ...]] = {}
+    for role in roles:
+        if role in ("hbm", "l2"):
+            continue
+        phys = context.physical_role(role)
+        if phys in context.resource_names:
+            placed[context.resource_names[phys]] = aivs if role in _AIV_ROLES else (aic,)
+    return placed
+
+
+def _abi_port(
+    role: str,
+    dtype: str,
+    layout: str,
+    shape: tuple[int, ...],
+    quant_mode: str = "none",
+    group_shape: tuple[int, ...] = (),
+    scale_dtype: str = "none",
+) -> OperandPortSig:
+    return OperandPortSig(
+        role=role,
+        dtype=dtype,
+        layout=layout,
+        transposed=False,
+        shape=shape,
+        quant_mode=quant_mode,
+        group_shape=group_shape,
+        scale_dtype=scale_dtype,
+        scale_shape=(),
+    )
+
+
+def _mqsmla_kv_ports(
+    quant_mode: int | None,
+    pages: int,
+    page_size: int,
+) -> tuple[str, str, str, OperandPortSig, OperandPortSig]:
+    if quant_mode is None:
+        ori_kv = _abi_port(
+            "ori_kv", "fp8_e4m3fn", "PA_BBND",
+            (pages, page_size, _MQS_KV_HEADS, ORIGINAL_CACHE_ROW_BYTES),
+            "per_group_fp8", (_MQS_DSL_FP8_GROUP,), "bf16",
+        )
+        cmp_kv = _abi_port(
+            "cmp_kv", "fp4_e2m1", "PA_BBND",
+            (pages, page_size, _MQS_KV_HEADS, COMPRESSED_CACHE_ROW_BYTES),
+            "per_group_fp4", (_MQS_DSL_FP4_GROUP,), "bf16",
+        )
+        return DSL_NATIVE_KIND, _MQS_DSL_MOTIF, "fp8_e4m3fn", ori_kv, cmp_kv
+    if quant_mode == KV_QUANT_FP8:
+        ori_kv = _abi_port(
+            "ori_kv", "fp8_e4m3fn", "PA_BBND",
+            (pages, page_size, _MQS_KV_HEADS, KV_QUANT_FP8_ROW_BYTES),
+            "packed_kv_608", (_MQS_CANN_PACKED_GROUP,), "bf16",
+        )
+        cmp_kv = _abi_port(
+            "cmp_kv", "fp8_e4m3fn", "PA_BBND",
+            (pages, page_size, _MQS_KV_HEADS, KV_QUANT_FP8_ROW_BYTES),
+            "packed_kv_608", (_MQS_CANN_PACKED_GROUP,), "bf16",
+        )
+        return NATIVE_KIND, _MQS_CANN_MOTIF, "fp8_e4m3fn", ori_kv, cmp_kv
+    if quant_mode == KV_QUANT_MXFP8:
+        ori_kv = _abi_port(
+            "ori_kv", "fp8_e4m3fn", "PA_BBND",
+            (pages, page_size, _MQS_KV_HEADS, KV_QUANT_MXFP8_ROW_BYTES),
+            "packed_kv_584", (_MQS_CANN_PACKED_GROUP,), "fp8_e8m0",
+        )
+        cmp_kv = _abi_port(
+            "cmp_kv", "fp8_e4m3fn", "PA_BBND",
+            (pages, page_size, _MQS_KV_HEADS, KV_QUANT_MXFP8_ROW_BYTES),
+            "packed_kv_584", (_MQS_CANN_PACKED_GROUP,), "fp8_e8m0",
+        )
+        return NATIVE_KIND, _MQS_CANN_MOTIF, "fp8_e4m3fn", ori_kv, cmp_kv
+    ori_kv = _abi_port(
+        "ori_kv", "bf16", "PA_BBND",
+        (pages, page_size, _MQS_KV_HEADS, KV_QUANT_BF16_ROW_BYTES),
+        "dense", (), "none",
+    )
+    cmp_kv = _abi_port(
+        "cmp_kv", "bf16", "PA_BBND",
+        (pages, page_size, _MQS_KV_HEADS, KV_QUANT_BF16_ROW_BYTES),
+        "dense", (), "none",
+    )
+    return NATIVE_KIND, _MQS_CANN_MOTIF, "bf16", ori_kv, cmp_kv
+
+
+def build_mqsmla_abi_query(
+    *,
+    soc_arch: str = "A5",
+    sku_id: str | None = None,
+    quant_mode: int | None,
+    active_q: int,
+    heads: int,
+    batch: int,
+    compressed_cache: bool,
+    topk_present: bool,
+    topk: int = 0,
+    page_size: int = _MQS_DEFAULT_PAGE_SIZE,
+    pages: int = 1,
+    return_softmax_lse: bool = False,
+    pr_track: str = "shipping",
+    model_scope: str = "target",
+) -> AbiQueryKey:
+    """Build the exact 1:1 positional ``AbiQueryKey`` for CANN or TileLang DSL MQSMLA."""
+    eff_pages = max(1, int(pages))
+    eff_page_size = max(1, int(page_size))
+    eff_batch = max(1, int(batch))
+    eff_q = max(1, int(active_q))
+    eff_heads = max(1, int(heads))
+    abi_id, motif, kv_dtype, ori_kv, cmp_kv = _mqsmla_kv_ports(
+        quant_mode, eff_pages, eff_page_size,
+    )
+    q_port = _abi_port("q", "bf16", "ND", (eff_q, eff_heads, MQSMLA_HEAD_WIDTH), "dense")
+    cu_seqlens_q_port = _abi_port("cu_seqlens_q", "int32", "ND", (eff_batch + 1,))
+    sinks_port = _abi_port("sinks", "fp32", "ND", (eff_heads,), "dense")
+    meta_port = _abi_port("metadata", "int32", "ND", (_MQS_METADATA_ELEMS,))
+    if compressed_cache:
+        operands = [q_port, ori_kv, cmp_kv]
+        if topk_present:
+            operands.append(_abi_port(
+                "cmp_sparse_indices", "int32", "ND", (eff_q, _MQS_KV_HEADS, max(1, int(topk))),
+            ))
+        operands.extend((
+            _abi_port("ori_block_table", "int32", "ND", (eff_batch, eff_pages)),
+            _abi_port("cmp_block_table", "int32", "ND", (eff_batch, eff_pages)),
+            cu_seqlens_q_port,
+            _abi_port("seqused_ori_kv", "int32", "ND", (eff_batch,)),
+            _abi_port("seqused_cmp_kv", "int32", "ND", (eff_batch,)),
+            sinks_port,
+            meta_port,
+        ))
+    else:
+        operands = [
+            q_port,
+            ori_kv,
+            _abi_port("ori_block_table", "int32", "ND", (eff_batch, eff_pages)),
+            cu_seqlens_q_port,
+            _abi_port("seqused_ori_kv", "int32", "ND", (eff_batch,)),
+            sinks_port,
+            meta_port,
+        ]
+    outputs = [_abi_port("attn_out", "bf16", "ND", (eff_q, eff_heads, MQSMLA_HEAD_WIDTH), "dense")]
+    if return_softmax_lse:
+        outputs.append(_abi_port("softmax_lse", "fp32", "ND", (eff_q, eff_heads), "dense"))
+    arch_norm = str(soc_arch).strip().upper()
+    return AbiQueryKey(
+        soc_arch=arch_norm,
+        sku_id=sku_id or _SOC_DEFAULT_SKU.get(arch_norm, "ascend950dt_9582"),
+        abi_id=abi_id,
+        graph_motif=motif,
+        model_scope=model_scope,
+        draft_quant_mode="none",
+        pr_track=pr_track,
+        operands=tuple(operands),
+        outputs=tuple(outputs),
+        rank_placement="local",
+        world_size=1,
+        comm_group_id="none",
+        comm_domain_width=1,
+        comm_dtype="none",
+        reduction_kind="none",
+        activation_kind="none",
+        activation_params=(),
+        has_bias=False,
+        has_active_mask=False,
+        dispatch_quant_mode=-1,
+        shared_experts_per_rank=0,
+        top_k=max(0, int(topk)),
+        moe_expert_num=0,
+        qk_rope_head_dim=MQSMLA_ROPE_WIDTH,
+        mla_variant="latent_mla",
+        sfa_dcp_active=False,
+        pcp_size=1,
+        kv_cache_dtype=kv_dtype,
+        has_kpool_indexer=False,
+        dcp_size=1,
+        is_act_and_mul=False,
+        enabled_stack_passes=frozenset(),
+    )
+
+
+def verify_mqsmla_abi(
+    *,
+    soc_arch: str = "A5",
+    sku_id: str | None = None,
+    quant_mode: int | None,
+    active_q: int,
+    heads: int,
+    batch: int,
+    compressed_cache: bool,
+    topk_present: bool,
+    topk: int = 0,
+    page_size: int = _MQS_DEFAULT_PAGE_SIZE,
+    pages: int = 1,
+    return_softmax_lse: bool = False,
+    pr_track: str = "shipping",
+    model_scope: str = "target",
+    track_spec=None,
+    manifest_bindings: tuple = (),
+    registry=None,
+) -> AbiSupportVerdict:
+    """Verify an MQSMLA invocation against the sealed per-SoC ``ProbedAbiRegistry``."""
+    query = build_mqsmla_abi_query(
+        soc_arch=soc_arch,
+        sku_id=sku_id,
+        quant_mode=quant_mode,
+        active_q=active_q,
+        heads=heads,
+        batch=batch,
+        compressed_cache=compressed_cache,
+        topk_present=topk_present,
+        topk=topk,
+        page_size=page_size,
+        pages=pages,
+        return_softmax_lse=return_softmax_lse,
+        pr_track=pr_track,
+        model_scope=model_scope,
+    )
+    reg = registry if registry is not None else default_abi_registry()
+    return reg.verify(query, track_spec=track_spec, manifest_bindings=tuple(manifest_bindings))
+
+
+def quant_tile_phases(valid, first, last, *, heads, quant_mode, window_bytes=0,
+                      ws_hbm=False, ws_l2=False):
     """One 128-key tile of the arch35 double-buffered inter-tile pipeline.
 
-    Address/gather/dequant/publish of tile ``i+1`` overlap the AIC ``QK ->
-    Fixpipe -> online softmax -> PV`` chain of tile ``i``; the copy, vector and
-    publish pipes of the ``2-AIV`` block are separate stages so the engine can
-    interleave them across the live slots.  ``window_bytes`` is the private SWA
-    ring a query token re-reads; the shared TopK union is a cold fill instead.
+    Address/gather/dequant/publish of tile ``i+1`` overlap the AIC ``kv_refill ->
+    QK -> Fixpipe -> online softmax -> PV`` chain of tile ``i``; CANN 950
+    ``aclnnMixedQuantSparseFlashMla`` publishes dequantized BF16 KV from AIV UB
+    through a 3-slot GM workspace (``mte3``) and refills AIC L1 via ``mte2_aic``.
     """
     row_bytes = quant_row_bytes(quant_mode)
     dequant_ops = KV_QUANT_DEQUANT_OPS[quant_mode]
@@ -266,6 +657,18 @@ def quant_tile_phases(valid, first, last, *, heads, quant_mode, window_bytes=0):
                                       "mte2_aiv": sinks_bytes if first else 0}), ()),
             ("empty", Work(resources={"vector": heads * MQSMLA_HEAD_WIDTH}), ()),
         )
+    publish_bytes = valid * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES
+    # mixed_quant_sparse_flash_mla_csa_block_cube.h:203 aligns refill DMA rows up to 16.
+    refill_rows = ((valid + CUBE_FRACTAL_ROWS - 1) // CUBE_FRACTAL_ROWS) * CUBE_FRACTAL_ROWS
+    refill_bytes = refill_rows * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES
+    publish_res = {"mte3": publish_bytes}
+    refill_res = {"mte2_aic": refill_bytes}
+    if ws_hbm:
+        publish_res["hbm"] = publish_bytes
+        refill_res["hbm"] = refill_bytes
+    elif ws_l2:
+        publish_res["l2"] = publish_bytes
+        refill_res["l2"] = refill_bytes
     return (
         ("sinks", Work(resources={"hbm": sinks_bytes if first else 0,
                                   "mte2_aiv": sinks_bytes if first else 0}), ()),
@@ -275,14 +678,14 @@ def quant_tile_phases(valid, first, last, *, heads, quant_mode, window_bytes=0):
             "mte2_aiv": valid * row_bytes + window_bytes}), ("address",)),
         ("dequant", Work(resources={
             "vector": valid * MQSMLA_HEAD_WIDTH * dequant_ops}), ("gather",)),
-        ("publish", Work(resources={
-            "mte3": valid * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES}), ("dequant",)),
+        ("publish", Work(resources=publish_res), ("dequant",)),
+        ("kv_refill", Work(resources=refill_res), ("publish",)),
         ("qk", Work(matrix={
             "bf16": BF16_ELEMENT_BYTES * cube_heads * valid * MQSMLA_HEAD_WIDTH},
             resources={"mte1": (cube_heads + valid) * MQSMLA_HEAD_WIDTH
                               * BF16_ELEMENT_BYTES,
                        "fixpipe": cube_heads * valid * FP32_ELEMENT_BYTES}),
-         ("publish",)),
+         ("kv_refill",)),
         ("softmax", Work(resources={
             "vector": SOFTMAX_PAIR_OPS * heads * valid
                       + SOFTMAX_ROW_REDUCE_OPS * heads}), ("qk", "sinks")),
@@ -299,10 +702,12 @@ def quant_tile_phases(valid, first, last, *, heads, quant_mode, window_bytes=0):
 
 
 @lru_cache(maxsize=TILE_PHASE_CACHE_SIZE)
-def quant_tile_phases_cached(valid, first, last, heads, quant_mode, window_bytes=0):
+def quant_tile_phases_cached(valid, first, last, heads, quant_mode, window_bytes=0,
+                             ws_hbm=False, ws_l2=False):
     """Bounded cache of the pure quant-mode tile payloads."""
     return quant_tile_phases(valid, first, last, heads=heads,
-                             quant_mode=quant_mode, window_bytes=window_bytes)
+                             quant_mode=quant_mode, window_bytes=window_bytes,
+                             ws_hbm=ws_hbm, ws_l2=ws_l2)
 
 
 def _mqsmla_stage_after(name: str, previous: str | None) -> tuple[str, ...]:
@@ -323,7 +728,7 @@ def _mqsmla_stage_after(name: str, previous: str | None) -> tuple[str, ...]:
     return (previous,) if previous else ()
 
 
-def _mqsmla_owner_program(context, owner, stream, head_counts, *, cores: int, addressing: str):
+def _mqsmla_owner_program(context, aic, aivs, stream, head_counts, *, addressing: str):
     @lru_cache(maxsize=OWNER_STAGE_CACHE_SIZE)
     def cached_stages(key):
         result = []
@@ -341,7 +746,7 @@ def _mqsmla_owner_program(context, owner, stream, head_counts, *, cores: int, ad
             roles = set(work.resources) - {"hbm"} | ({"cube"} if work.matrix else set())
             result.append(Stage(
                 name, context.bind(work), after=after, previous=prior,
-                placement=context.owned(owner, cores, roles)))
+                placement=_pair_placement(context, aic, aivs, roles)))
             previous = name
         return tuple(result)
 
@@ -349,8 +754,8 @@ def _mqsmla_owner_program(context, owner, stream, head_counts, *, cores: int, ad
         return cached_stages(_phase_key(stream, head_counts, index))
 
     allocations = tuple(context.allocate(
-        f"mqsmla{owner}_{pool}", pool, amount,
-        (2 * owner, 2 * owner + 1) if pool == "ub" else (owner,))
+        f"mqsmla{aic}_{pool}", pool, amount,
+        aivs if pool == "ub" else (aic,))
         for pool, amount in BUFFERS.items())
     return KernelProgram((
         Stage("reserve", acquire=allocations),
@@ -370,35 +775,28 @@ def build(op, geometry):
     if (not supported_heads(heads) or shape["width"] != MQSMLA_HEAD_WIDTH
             or shape["metadata_support_fd"]):
         raise ModelingError("mqsmla_source_geometry_or_branch_unsupported")
-    if requested == "scalar":
-        addressing = "scalar"
+    if requested in SUPPORTED_ADDRESSING:
+        addressing = requested
     else:
         raise ModelingError("mqsmla_addressing_mode_unsupported")
     rows = tuple(query_rows(shape))
     cores = geometry.compute_units
     if not rows or not 1 <= cores <= MAX_MQSMLA_AIC_CORES:
         raise ModelingError("mqsmla_requires_positive_rows_and_at_most36_aic")
-    head_groups = tuple(min(DEFAULT_MQSMLA_HEADS, heads - start)
-                        for start in range(HEAD_GROUP_START, heads, DEFAULT_MQSMLA_HEADS))
-    row_heads = tuple(group for _ in rows for group in head_groups)
-    rows = tuple(row for row in rows for _ in head_groups)
-    ownership = owner_ranges(len(rows), cores)
-    streams = tuple((owner, OwnerTiles.create(rows[start:end]), row_heads[start:end])
-                    for owner, start, end in ownership)
     quant_mode = shape.get("kv_quant_mode")
+    if quant_mode is None and not _has_dsl_cache_contract(meta):
+        raise ModelingError("mqsmla_cache_representation_contract_required")
     compute_arch = getattr(geometry, "compute_arch", None) or getattr(
         getattr(geometry, "datapath", None), "compute_arch", None
     )
     preset = str(getattr(compute_arch, "preset", "") or getattr(compute_arch, "arch_id", "") or "").strip()
-    if quant_mode is not None and quant_mode != KV_QUANT_BF16:
+    if quant_mode is None or quant_mode != KV_QUANT_BF16:
         if preset == ARCH22_PRESET:
             raise ModelingError("mqsmla_fp8_fp4_unsupported_on_arch22")
         if preset not in _ARCH35_PRESETS:
             raise ModelingError(f"mqsmla_fp8_fp4_requires_arch35:{preset or 'unset'}")
-    if quant_mode is not None:
-        if quant_mode not in KV_QUANT_MODES:
-            raise ModelingError("mqsmla_kv_quant_mode_unsupported")
-        return _quant_plan(shape, streams, int(quant_mode), addressing)
+    if quant_mode is not None and quant_mode not in KV_QUANT_MODES:
+        raise ModelingError("mqsmla_kv_quant_mode_unsupported")
     for pool, amount in BUFFERS.items():
         units = geometry.resource_units.get("vector", cores) if pool == "ub" else cores
         if (geometry.buffers.get(pool, 0) < amount
@@ -410,25 +808,63 @@ def build(op, geometry):
     for role in ("mte1", "mte2_aic", "fixpipe"):
         if geometry.resource_units.get(role) != cores:
             raise ModelingError("mqsmla_requires_private_aic:" + role)
+    owner_pairs = _resolve_owner_pairs(geometry)
+    head_groups = tuple(min(DEFAULT_MQSMLA_HEADS, heads - start)
+                        for start in range(HEAD_GROUP_START, heads, DEFAULT_MQSMLA_HEADS))
+    row_heads = tuple(group for _ in rows for group in head_groups)
+    rows = tuple(row for row in rows for _ in head_groups)
+    ownership = owner_ranges(len(rows), len(owner_pairs))
+    streams = tuple(
+        (owner_pairs[slot][0], owner_pairs[slot][1], OwnerTiles.create(rows[start:end]), row_heads[start:end])
+        for slot, start, end in ownership
+    )
+    physical_ownership = tuple((owner_pairs[slot][0], start, end) for slot, start, end in ownership)
+    soc_arch, sku_id = _soc_arch_from_geometry(geometry, sku_override=meta.get("abi_sku_id"))
+    sequences = tuple(shape["sequences"])
+    active_q = sum(int(q) for q, _ in sequences)
+    abi_verdict = verify_mqsmla_abi(
+        soc_arch=soc_arch,
+        sku_id=sku_id,
+        quant_mode=int(quant_mode) if quant_mode is not None else None,
+        active_q=active_q,
+        heads=heads,
+        batch=len(sequences),
+        compressed_cache=bool(shape.get("ratio")),
+        topk_present=bool(shape.get("topk")),
+        topk=int(shape.get("topk") or 0),
+        pr_track=str(meta.get("abi_pr_track") or "shipping"),
+        track_spec=meta.get("abi_track_spec"),
+        manifest_bindings=tuple(meta.get("abi_manifest_bindings") or ()),
+    )
+    if not is_abi_admitted(abi_verdict):
+        raise ModelingError(f"mqsmla_abi_not_admitted:{abi_verdict.status}:{abi_verdict.rejection_reason}")
+    if quant_mode is not None:
+        return _quant_plan(shape, streams, int(quant_mode), addressing, geometry, abi_verdict)
     total = Work()
     counts = Counter(_phase_key(stream, head_counts, index)
-                     for _, stream, head_counts in streams for index in range(stream.count))
+                     for _, _, stream, head_counts in streams for index in range(stream.count))
     for key, count in counts.items():
         for _, work in tile_phases(*key[:4], addressing=addressing, heads=key[-1]):
             total += work.scaled(count)
 
     def program(context):
         return ParallelProgram(tuple(
-            _mqsmla_owner_program(context, owner, stream, head_counts,
-                                  cores=cores, addressing=addressing)
-            for owner, stream, head_counts in streams
+            _mqsmla_owner_program(context, aic, aivs, stream, head_counts,
+                                  addressing=addressing)
+            for aic, aivs, stream, head_counts in streams
         ))
 
     return OperatorPlan(total, program, {
         "source_execution_domain": "mixed",
-        "source_program": SOURCE,
-        "native_kind": NATIVE_KIND,
-        "mqsmla_owner_ranges": ownership, "mqsmla_buffers_per_owner": BUFFERS,
+        "source_program": DSL_SOURCE,
+        "native_kind": DSL_NATIVE_KIND,
+        "aclnn_symbol": DSL_NATIVE_KIND,
+        "abi_registry_verified": is_abi_admitted(abi_verdict),
+        "abi_verdict_status": abi_verdict.status,
+        "abi_entry_id": abi_verdict.matched_entry_id,
+        "abi_symbol": abi_verdict.symbol_or_kernel or DSL_NATIVE_KIND,
+        "abi_rejection_reason": abi_verdict.rejection_reason,
+        "mqsmla_owner_ranges": physical_ownership, "mqsmla_buffers_per_owner": BUFFERS,
         "mqsmla_schedule": "whole_query_rows;metadata_SUPPORT_FD_false;two_live_phase_tiles",
         "mqsmla_approximation": "coarse_source_phase_DAG;register_operations_not_instruction_latency",
         "mqsmla_addressing": addressing,
@@ -479,23 +915,32 @@ def quant_external_fill(shape, quant_mode):
     return (private + union) * quant_row_bytes(quant_mode), union
 
 
-def _quant_plan(shape, streams, quant_mode, addressing):
+def _quant_plan(shape, streams, quant_mode, addressing, geometry, abi_verdict):
     """Arch35 ``aclnnMixedQuantSparseFlashMla``: overlapped 128-key tile DAG."""
     row_bytes = quant_row_bytes(quant_mode)
+    ws_bytes = (
+        MQS_GM_WORKSPACE_SLOTS * MQS_TILE_KEYS * MQSMLA_HEAD_WIDTH
+        * BF16_ELEMENT_BYTES * len(streams)
+    )
+    l2_cap = int(geometry.buffers.get("l2", 0) or 0)
+    ws_l2_resident = l2_cap > 0 and ws_bytes <= l2_cap
+    ws_hbm = not ws_l2_resident
+    ws_l2 = ws_l2_resident and "l2" in geometry.rates
     counts = Counter(_phase_key(stream, head_counts, index)
-                     for _, stream, head_counts in streams
+                     for _, _, stream, head_counts in streams
                      for index in range(stream.count))
     total = Work()
     for key, count in counts.items():
         for _name, work, _after in quant_tile_phases_cached(
-                key[1], key[2], key[3], key[-1], quant_mode, 0):
+                key[1], key[2], key[3], key[-1], quant_mode, 0,
+                ws_hbm=ws_hbm, ws_l2=ws_l2):
             total += work.scaled(count)
     external, shared_rows = quant_external_fill(shape, quant_mode)
     fill = Work(resources={"hbm": external} if external else {})
     # Each head-group stream reads only its own query-head slice. Summing the
     # per-stream head counts charges the single query tensor once, not once
     # per head group.
-    streamed = sum(sum(head_counts) for _owner, _stream, head_counts in streams) \
+    streamed = sum(sum(head_counts) for _aic, _aivs, _stream, head_counts in streams) \
         * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES
     stream_work = Work(resources={"hbm": 2 * streamed, "mte2_aic": streamed,
                                   "mte3": streamed})
@@ -503,31 +948,41 @@ def _quant_plan(shape, streams, quant_mode, addressing):
     def program(context):
         from .indexed_attention import bind_sustained_dram
         context = bind_sustained_dram(context)
+        has_l2 = "l2" in context.resource_names
 
-        def one(owner, stream, head_counts):
+        def bind_work(work):
+            if not has_l2 and "l2" in work.resources:
+                work = Work(
+                    matrix=work.matrix,
+                    resources={k: v for k, v in work.resources.items() if k != "l2"},
+                )
+            return context.bind(work)
+
+        def one(aic, aivs, stream, head_counts):
             @lru_cache(maxsize=OWNER_STAGE_CACHE_SIZE)
             def stages(key):
                 result = []
                 for name, work, after in quant_tile_phases_cached(
-                        key[1], key[2], key[3], key[-1], quant_mode, 0):
-                    roles = set(work.resources) - {"hbm"}
+                        key[1], key[2], key[3], key[-1], quant_mode, 0,
+                        ws_hbm=ws_hbm, ws_l2=ws_l2):
+                    roles = set(work.resources) - {"hbm", "l2"}
                     if work.matrix:
                         roles |= {"cube"}
                     result.append(Stage(
-                        name, context.bind(work), after=tuple(after),
+                        name, bind_work(work), after=tuple(after),
                         previous=("accumulate",) if name == "accumulate" and not key[2] else (),
-                        placement=context.owned(owner, context.core_count, roles)))
+                        placement=_pair_placement(context, aic, aivs, roles)))
                 return tuple(result)
 
             allocations = tuple(context.allocate(
-                f"mqsmla{owner}_{pool}", pool, amount,
-                (2 * owner, 2 * owner + 1) if pool == "ub" else (owner,))
+                f"mqsmla{aic}_{pool}", pool, amount,
+                aivs if pool == "ub" else (aic,))
                 for pool, amount in BUFFERS.items())
             query_bytes = sum(head_counts) * MQSMLA_HEAD_WIDTH * BF16_ELEMENT_BYTES
             q_load = Stage("q_load", context.bind(Work(
                 resources={"hbm": query_bytes, "mte2_aic": query_bytes})),
                 after=("reserve",),
-                placement=context.owned(owner, context.core_count, {"mte2_aic"}))
+                placement=_pair_placement(context, aic, aivs, ("mte2_aic",)))
             tiles = Stage(
                 "tiles", after=("q_load",),
                 program=PipelineProgram(
@@ -538,7 +993,7 @@ def _quant_plan(shape, streams, quant_mode, addressing):
             output_store = Stage("output_store", context.bind(Work(
                 resources={"hbm": query_bytes, "mte3": query_bytes})),
                 after=("tiles",),
-                placement=context.owned(owner, context.core_count, {"mte3"}))
+                placement=_pair_placement(context, aic, aivs, ("mte3",)))
             return KernelProgram((
                 Stage("reserve", acquire=allocations),
                 q_load,
@@ -546,8 +1001,8 @@ def _quant_plan(shape, streams, quant_mode, addressing):
                 output_store,
                 Stage("release", after=("output_store",), free=allocations)))
 
-        owners = ParallelProgram(tuple(one(owner, stream, head_counts)
-                                       for owner, stream, head_counts in streams))
+        owners = ParallelProgram(tuple(one(aic, aivs, stream, head_counts)
+                                       for aic, aivs, stream, head_counts in streams))
         tbl = getattr(context, "primitive_table", None)
         dp = getattr(context, "datapath", None)
         env = resolve_dispatch_envelope(tbl, dp) if (tbl is not None and dp is not None) else None
@@ -568,9 +1023,18 @@ def _quant_plan(shape, streams, quant_mode, addressing):
         "source_execution_domain": "mixed",
         "source_program": SOURCE,
         "native_kind": NATIVE_KIND,
-        "mqsmla_owner_ranges": tuple((owner, stream.rows) for owner, stream, _h in streams),
+        "aclnn_symbol": NATIVE_KIND,
+        "abi_registry_verified": is_abi_admitted(abi_verdict),
+        "abi_verdict_status": abi_verdict.status,
+        "abi_entry_id": abi_verdict.matched_entry_id,
+        "abi_symbol": abi_verdict.symbol_or_kernel or NATIVE_KIND,
+        "abi_rejection_reason": abi_verdict.rejection_reason,
+        "workspace_slots": MQS_GM_WORKSPACE_SLOTS,
+        "workspace_bytes": ws_bytes,
+        "workspace_l2_resident": ws_l2_resident,
+        "mqsmla_owner_ranges": tuple((aic, stream.rows) for aic, _aivs, stream, _h in streams),
         "mqsmla_buffers_per_owner": BUFFERS,
-        "mqsmla_schedule": "arch35_overlapped_tile_dag;two_live_kv_and_accumulator_slots",
+        "mqsmla_schedule": "arch35_overlapped_tile_dag;gm_3slot_kv_workspace;two_live_kv_and_accumulator_slots",
         "mqsmla_approximation": "coarse_source_phase_DAG;register_operations_not_instruction_latency",
         "mqsmla_addressing": addressing,
         "mqsmla_kv_quant_mode": quant_mode,

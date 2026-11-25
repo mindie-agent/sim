@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
+from typing import Literal
 
 from mindie_sim.schema.common import dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
@@ -25,14 +26,17 @@ from ._lowering import SOFTMAX_STATE_SCALARS, PipelineLayout, RowCuts, fixpipe_r
 from .common import (
     DSL_FLASH_ABI, DSL_MQS_ABI, FIA_ABI, FP32_BYTES, MQS_ABI,
     MQS_ORIGINAL_ROW_BYTES, SUPPORTED_ABIS, PagedMlaContract, align_bytes, capability_gap, ceil_div, contract_for,
+    validate_dense_cann_geometry,
 )
 
+TARGET_BACKEND: Literal["ascend"] = "ascend"
 ARCH_ID = "npu_arch_3510"
 UPSTREAM_ABI = "aclnnFlashMla"
 FIA_M_TILE = 64
 FIA_S2_TILE = 128
 FLASH_M_TILE = 96
 FLASH_S2_TILE = 112
+FLASH_FIXED_L0C_BYTES = 262_144
 MQS_M_TILE = 64
 MQS_S2_TILE = 128
 Q_DEPTH = 1
@@ -58,7 +62,7 @@ FD_SELECTIVE_CUT_STRIDE = 11
 FD_SELECTIVE_CMP_TILES = 4
 PV_L0C_WIDTH = 256
 CLOCKS = (
-    ("q_load", "kv_load", "dequant", "kv_to_l1", "qk_operands", "qk", "score_store"),
+    ("q_load", "kv_load", "dequant", "kv_to_l1", "kv_refill", "qk_operands", "qk", "score_store"),
     ("softmax", "probability", "pv_load", "pv_operands", "pv", "partial"),
     ("output_update", "split_write"),
 )
@@ -129,11 +133,17 @@ SOURCES: tuple[SourceRef, ...] = (
         relative_path="attention/mixed_quant_sparse_flash_mla/README_en.md",
         source_sha256="e5f013aca264fd192f5780455eeb4fa9d378a03d9576e34bb31488cdf39e75c0",
     ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision="2d3f4f6db0231ac2e9e487cf62e94f6e173eb946",
+        relative_path="attention/mixed_quant_sparse_flash_mla/op_kernel/arch35/mixed_quant_sparse_flash_mla_csa_block_cube.h",
+        source_sha256="df3f7ca12e1bad28f2f52d4bdfe5d43326a176af88d00c7d1121d4cc4e62290e",
+    ),
 )
 ABI_SOURCES = {
     FIA_ABI: SOURCES[:2],
     UPSTREAM_ABI: (SOURCES[2], SOURCES[6]),
-    MQS_ABI: (SOURCES[3], SOURCES[7], SOURCES[9]),
+    MQS_ABI: (SOURCES[3], SOURCES[7], SOURCES[9], SOURCES[10]),
     DSL_FLASH_ABI: (SOURCES[4],),
     DSL_MQS_ABI: (SOURCES[5], SOURCES[8]),
 }
@@ -256,20 +266,38 @@ def _solve(op, ctx, c, keys, head_tile, mm1_depth, resident, result_alignment, p
     elem = int(dtype_bytes(op.dtype or "bf16"))
     aiv_count = min(len(aivs) for _, aivs in pairs)
     candidates = []
+    is_flash = c.abi == UPSTREAM_ABI
+    is_fia = c.abi == FIA_ABI
+    fixed_cube_alloc = is_flash or is_fia
     while head_tile:
         heads = min(head_tile, c.physical_heads)
         vec_heads = ceil_div(heads, aiv_count)
         pv_columns = min(c.dv, PV_L0C_WIDTH)
-        scores = (fixpipe_rectangle_bytes(heads, keys) // aiv_count if c.abi == UPSTREAM_ABI
+        scores = (fixpipe_rectangle_bytes(heads, keys) // aiv_count if is_flash
                   else vec_heads * keys * FP32_BYTES)
         pv = vec_heads * pv_columns * FP32_BYTES
-        l0c = heads * max(keys, pv_columns) * FP32_BYTES
-        # The retired rope area can hold P before PV consumes the resident V.
-        kvp = keys * max(c.dqk, c.dv + heads) * elem
+        # Compiled Arch35 FlashMLA (M96/S2_112, 519,168 B L1) and FIA (M64/S2_128,
+        # 516,096 B L1) reserve fixed cube L1 and 256 KiB L0C regardless of live
+        # heads/keys (flash_mla_block_cube.h:62-135; fia_kernel_noquant_mla.h:165;
+        # fia_block_cube_noquant_mla.h:103-113).
+        q_l1 = (FLASH_M_TILE if is_flash else FIA_M_TILE if is_fia else heads) * c.dqk * elem
+        kvp = (
+            FLASH_S2_TILE * max(c.dqk, c.dv + FLASH_M_TILE) * elem
+            if is_flash
+            else FIA_S2_TILE * c.dqk * elem
+            if is_fia
+            else keys * max(c.dqk, c.dv + heads) * elem
+        )
+        l0c = (
+            (FLASH_FIXED_L0C_BYTES // 2)
+            if fixed_cube_alloc
+            else (heads * max(keys, pv_columns) * FP32_BYTES)
+        )
         state = vec_heads * (c.dv + 2) * FP32_BYTES
         buffers = (
-            LiveBufferSpec("query", "l1", heads * c.dqk * elem, 0, PIPELINE_DRAIN, "aic", slots=Q_DEPTH),
-            LiveBufferSpec("kvp", "l1", kvp, 0, PIPELINE_DRAIN, "aic", slots=KVP_DEPTH if resident else 2),
+            LiveBufferSpec("query", "l1", q_l1, 0, PIPELINE_DRAIN, "aic", slots=Q_DEPTH),
+            LiveBufferSpec("kvp", "l1", kvp, 0, PIPELINE_DRAIN, "aic",
+                           slots=KVP_DEPTH if (resident or is_fia) else 2),
             LiveBufferSpec("mm1", "ub", scores, 0, 2, alignment_bytes=result_alignment, slots=mm1_depth),
             LiveBufferSpec("mm2", "ub", pv, 1, PIPELINE_DRAIN,
                            alignment_bytes=result_alignment, slots=MM2_DEPTH),
@@ -289,7 +317,7 @@ def _solve(op, ctx, c, keys, head_tile, mm1_depth, resident, result_alignment, p
             KVP_DEPTH, (ctx.effective_aic_cores, ctx.effective_aiv_cores), 1, 1,
             buffers, issued_flops=2 * heads * keys * (c.dqk + c.dv), source_guard=c.abi,
         ))
-        if heads == 1 or c.sinks:
+        if heads == 1 or c.sinks or fixed_cube_alloc:
             break
         head_tile = heads // 2
     try:
@@ -311,6 +339,7 @@ class _DirectStrategy:
         c = contract_for(op, ctx)
         if ctx.compute_arch.arch_id != self.arch_id or c.atomic_split_decode:
             raise capability_gap("paged_mla_unsupported_abi_or_atomic_mode", c.abi, ctx.compute_arch.arch_id)
+        validate_dense_cann_geometry(c, self.arch_id)
         if c.abi == FIA_ABI:
             heads, mm1_depth = FIA_M_TILE, FIA_MM1_DEPTH
             key_tile = min(FIA_S2_TILE, c.s2_base_size)
@@ -372,6 +401,7 @@ class _DirectStrategy:
             *result_rings,
             ("kvp", kvp_depth, "kv_load", "pv1" if panel_width else "pv"),
             ("probability", kvp_depth, "probability", "pv_operands"),
+            *((("kv_ws", KVP_DEPTH, "kv_to_l1", "kv_refill"),) if c.abi == MQS_ABI else ()),
         )
         clocks = FLASH_CLOCKS if panel_width else DSL_MQS_CLOCKS if c.sinks else CLOCKS
         if (c.abi == FIA_ABI and c.splits == 1
@@ -385,15 +415,38 @@ class _DirectStrategy:
             eff_splits = min(tiling.fd_splits_per_row, max_splits_per_group)
             if eff_splits > 1:
                 c = replace(c, splits=eff_splits)
+        elem_b = int(dtype_bytes(op.dtype or "bf16"))
+        l2_cap = int(ctx.geometry.buffers.get("l2", dict(ctx.datapath.buffers).get("l2", 0)))
+        head_groups_cnt = ceil_div(c.physical_heads, heads)
+        total_groups = sum(q for q, _ in c.sequences) * head_groups_cnt
+        most_splits = min(ceil_div(max_extent, key_tile), c.splits) if max_extent else 0
+        lanes = min(len(pairs), max(1, most_splits))
+        groups_per_wave = len(pairs) // lanes
+        active_owners = (
+            min(len(pairs), min(groups_per_wave, total_groups) * min(lanes, max(1, most_splits)))
+            if total_groups
+            else 0
+        )
+        mqs_ws_per_core = KVP_DEPTH * key_tile * c.dqk * elem_b
+        mqs_ws_bytes = max(1, active_owners) * mqs_ws_per_core if active_owners else 0
+        mqs_ws_l2_resident = (
+            c.abi == MQS_ABI and l2_cap > 0 and active_owners > 0 and mqs_ws_bytes <= l2_cap
+        )
         layout = PipelineLayout(
             clocks, rings, heads, key_tile, resident_latent=resident,
             matrix_output=(direct.path.unit, direct.path.alignment_bytes),
             probability_output=(probability.path.unit, probability.path.alignment_bytes),
-            pv_panel_width=panel_width,
+            pv_panel_width=panel_width, ws_l2_resident=mqs_ws_l2_resident,
         )
         workspace = {}
         row_cuts = None
-        if c.abi == DSL_MQS_ABI:
+        if c.abi == MQS_ABI:
+            workspace = dict(
+                workspace_slots_per_core=KVP_DEPTH,
+                workspace_bytes_per_core=mqs_ws_per_core,
+                workspace_bytes=mqs_ws_bytes,
+            )
+        elif c.abi == DSL_MQS_ABI:
             slot_bytes = c.physical_heads * (c.dv + SOFTMAX_STATE_SCALARS) * FP32_BYTES
             per_core = DSL_MQS_SPLIT_SLOTS_PER_CORE * slot_bytes
             workspace = dict(workspace_slots_per_core=DSL_MQS_SPLIT_SLOTS_PER_CORE,
