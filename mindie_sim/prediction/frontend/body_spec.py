@@ -505,20 +505,41 @@ def _declared_graphs(case, *, phase, tokens, context, sequences, scope,
     return parsed, graphs
 
 
-def physical_global_ranks(runtime, replicas):
-    """Global rank scope for DP replicas under the declared DP-outer/TP-inner layout.
+def physical_global_ranks(runtime, replicas, *, machine=None, stages=None):
+    """Global rank scope for DP replicas across declared stages via ``Topology.ranks``.
 
     The value is a scope, not an observed-owner substitution: W18F/W19F select
     the actual TP member (for example TP0 or TP2) from source provenance.
     """
-    tp = max(1, int(runtime.parallel.tp))
-    dp = max(1, int(runtime.parallel.dp))
+    p = runtime.parallel
+    tp = max(1, int(p.tp))
+    dp = max(1, int(p.dp))
+    pp = max(1, int(p.pp))
+    pcp = max(1, int(p.pcp))
+    stage_list = tuple(range(pp)) if stages is None else tuple(int(s) for s in stages)
+    for stage in stage_list:
+        if stage < 0 or stage >= pp:
+            raise ModelingError(f"body_stage_outside_declared_pp:{stage}:{pp}")
+    topo = None
+    if machine is not None:
+        from mindie_sim.prediction.topology import Topology
+        topo = Topology(machine, p)
+    width = tp * pcp
     out = {}
     for replica in replicas:
         replica = int(replica)
         if replica < 0 or replica >= dp:
             raise ModelingError(f"body_replica_outside_declared_dp:{replica}:{dp}")
-        out[replica] = tuple(replica * tp + tp_rank for tp_rank in range(tp))
+        if topo is not None:
+            out[replica] = tuple(
+                rank for stage in stage_list for rank in topo.ranks(replica, stage)
+            )
+        else:
+            out[replica] = tuple(
+                (replica * pp + stage) * width + offset
+                for stage in stage_list
+                for offset in range(width)
+            )
     return out
 
 
@@ -583,6 +604,18 @@ def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
     padded = capacity["padded_query_tokens_by_replica"]
     graph_rows = capacity["graph_query_tokens_by_replica"]
     included = describe_included_components(case, scope=scope)
+    active_stages = tuple(sorted({
+        int(op.stage) for ops in graphs.values() for op in ops
+    })) or None
+    p = case.runtime.parallel
+    canonical_ranks = all(
+        int(die.rank) == idx for idx, die in enumerate(case.machine.dies)
+    )
+    rank_basis = (
+        "dp_replica * tp + tp_rank"
+        if int(p.pp) == 1 and int(p.pcp) == 1 and canonical_ranks
+        else "machine.dies[((dp_replica * pp + stage) * pcp + pcp_rank) * tp + tp_rank].rank"
+    )
     return {
         **result, "schema": "mindie-sim.body-forward/1", "status": "modeled",
         "scope": scope, "body_forward_ms": result["duration_ms"],
@@ -598,9 +631,10 @@ def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
                      "graph_query_tokens_by_replica": graph_rows,
                      "graph_query_tokens": sum(graph_rows.values()),
                      "padded_query_tokens_by_replica": padded,
-                     "physical_global_rank_basis": "dp_replica * tp + tp_rank",
+                     "physical_global_rank_basis": rank_basis,
                      "physical_global_ranks_by_replica": physical_global_ranks(
-                         case.runtime, tuple(graphs)),
+                         case.runtime, tuple(graphs),
+                         machine=case.machine, stages=active_stages),
                      "padding_basis": "graph_bucket_then_declared_sequence_parallel_padding",
                      "valid_query_tokens": tokens * sum(counts.values()),
                      "padded_query_tokens": sum(padded.values())},

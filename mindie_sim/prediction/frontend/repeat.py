@@ -78,6 +78,54 @@ def _layer_quant_signature(model, layer_index: int, *, native_layer_id: int = -1
     return tuple(sorted(matched))
 
 
+def _gbsa_reuse_roles(layers, *, mode, local_views, runtime, machine) -> tuple[str, ...]:
+    """Tag first producer vs reusing consumers when A3/A5 uniform decode reuses GBSA metadata."""
+    from mindie_sim.catalog.cache import local_kv_heads
+    from mindie_sim.prediction.operators.attention.attention import _supports_gbsa_metadata_reuse
+    from mindie_sim.prediction.operators.sparse_indexer.gqa_indexer import is_block_msa_indexer
+
+    non_pad = tuple(v for v in local_views if not getattr(v, "padding", False))
+    reuse_active = (
+        mode == "decode"
+        and bool(non_pad)
+        and len({int(v.q_len) for v in non_pad}) <= 1
+        and all(v.phase == "decode" for v in non_pad)
+        and _supports_gbsa_metadata_reuse(runtime, machine)
+    )
+    if not reuse_active:
+        return ("",) * len(layers)
+    seen: set[tuple[int, int, int, int]] = set()
+    roles: list[str] = []
+    tp = runtime.parallel.tp
+    for lyr in layers:
+        if lyr.attention == "gqa" and is_block_msa_indexer(lyr):
+            cand_topk = int(getattr(lyr, "candidate_topk_blocks", 0) or 0)
+            eff_topk = int(getattr(lyr, "index_topk", 0) or 0)
+            idx_ratio = max(
+                1,
+                int(getattr(lyr, "compress_ratio", 1) or 1),
+                int(getattr(lyr, "index_kpool", 1) or 1),
+            )
+            sel_topk = (
+                cand_topk if cand_topk > 0
+                else (max(1, eff_topk // idx_ratio) if idx_ratio > 1 else eff_topk)
+            )
+            key = (
+                lyr.num_heads // tp,
+                local_kv_heads(lyr.num_kv_heads, tp),
+                lyr.head_dim,
+                sel_topk,
+            )
+            if key not in seen:
+                seen.add(key)
+                roles.append("producer")
+            else:
+                roles.append("consumer")
+        else:
+            roles.append("")
+    return tuple(roles)
+
+
 class _FrontendRepeat:
     def _resolve_homogeneous_archetypes(
         self, layers, *, model, runtime, mode, local_views, local_tokens, body_global_tokens,
@@ -139,6 +187,9 @@ class _FrontendRepeat:
                 self._prev_homo_env = (model, runtime, static_env_key, False, None)
                 return None
 
+            gbsa_roles = _gbsa_reuse_roles(
+                layers, mode=mode, local_views=local_views, runtime=runtime, machine=machine,
+            )
             arch_for_layer_list = []
             unique_archs = {}
             realizations_list = []
@@ -174,6 +225,7 @@ class _FrontendRepeat:
                     _layer_quant_signature(
                         model, lyr.index, native_layer_id=int(getattr(lyr, "native_layer_id", -1)),
                     ),
+                    gbsa_roles[idx],
                 )
                 arch_for_layer_list.append(akey)
                 if akey not in unique_archs:
@@ -207,6 +259,7 @@ class _FrontendRepeat:
         local_requests = tuple(v.request_id for v in local_views)
         residual = self.residuals["plain"]
         attention_state = ({}, {}, {}, {})
+        gbsa_metadata_cache: dict = {}
         new_arch_templates = dict(prev_tmpls_fast)
         new_attn_splits = dict(prev_attn_splits)
         changed_by_arch = {}
@@ -221,6 +274,7 @@ class _FrontendRepeat:
                 model=model, runtime=runtime, parallel=p, features=features,
                 source_rows_by_replica=source_rows_by_replica, machine=machine,
                 ready=in_id, attention_state=attention_state,
+                gbsa_metadata_cache=gbsa_metadata_cache,
             )
             if (done_id != expected_done_id
                     or any(dict(op.metadata).get("metadata_schedule") == "pre_forward"

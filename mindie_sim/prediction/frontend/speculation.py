@@ -760,6 +760,7 @@ def _append_ar_decode_head(
     ops, frontend, model, draft, step_model, draft_model,
     selected_runtime, proposal_views, previous, *,
     prefix, stage, requests, body_input_rows, phase="draft",
+    normalized: bool = False,
 ):
     sampled_views = tuple(
         v for v in proposal_views
@@ -771,6 +772,7 @@ def _append_ar_decode_head(
         step_model, selected_runtime, proposal_views, previous,
         prefix=prefix, mode=phase, stage=stage, sample=False,
         input_tokens=body_input_rows,
+        normalized=normalized,
         selected_logit_rows=selected_rows,
     )
     ops.extend(heads)
@@ -1169,12 +1171,15 @@ def _lower_dspark_draft_program(
     )
     ops.extend(body)
     per_req_ks = tuple(_req_k(v) for v in active)
+    did_early_hc_collapse = bool(
+        hc_collapse_before and any(op.op_id == prefix + "sp_output_gather" for op in body)
+    )
     previous = _append_dspark_decode_head(
         ops, frontend, model, draft, draft_model, draft_model,
         runtime, selected_runtime, proposal_views, previous,
         prefix=prefix, stage=stage, requests=requests,
         body_input_rows=q_phys, k_steps=k_steps,
-        spec_method=spec_method, hc_collapsed=(use_draft_sp and hc_collapse_before),
+        spec_method=spec_method, hc_collapsed=did_early_hc_collapse,
         base_rows_override=sum(per_req_ks), per_req_ks=per_req_ks,
     )
     rows_by_request = {v.request_id: v.q_len for v in proposal_views}
@@ -1194,6 +1199,49 @@ def _lower_dspark_draft_program(
     return [region], previous, last_active
 
 
+def _restore_draft_pcp_hidden(
+    frontend, ops, previous, *, step_model, selected_runtime, proposal_views,
+    rows: int, prefix: str, stage: int, requests: tuple[str, ...], phase_name: str,
+) -> tuple[str, int, bool]:
+    """Gather and unpermute PCP-sharded draft prefill hidden states before bootstrap logits."""
+    from mindie_sim.prediction.frontend.body import _resolve_hc_final_collapse
+    from mindie_sim.prediction.sharding.context_parallel import (
+        emit_pcp_hidden_gather_restore,
+        pcp_uniform_peer_rows,
+    )
+    per_peer_rows, restored_rows = pcp_uniform_peer_rows(
+        proposal_views, selected_runtime.parallel.pcp, local_rows=rows,
+    )
+    if restored_rows <= 0:
+        return previous, rows, False
+    pcp_normalized = selected_runtime.final_norm_scope == "all"
+    if pcp_normalized:
+        finals, previous = frontend.final_mixer(
+            step_model, previous, prefix=prefix, mode=phase_name,
+            stage=stage, tokens=rows, requests=requests,
+        )
+        ops.extend(finals)
+    hc_mult, collapse_mode = _resolve_hc_final_collapse(step_model)
+    has_lowrank = any(getattr(plan, "hc_lowrank", 0) > 0 for plan in step_model.layer_plans)
+    gather_hidden = (
+        hc_mult * step_model.hidden_size
+        if not pcp_normalized and hc_mult > 1 and (has_lowrank or collapse_mode != "none")
+        else step_model.hidden_size
+    )
+    previous = emit_pcp_hidden_gather_restore(
+        ops, prefix=prefix.rstrip("."),
+        gather_name="pcp_hidden_gather",
+        restore_name="pcp_hidden_restore",
+        stage=stage, layer=-1, requests=requests, mode=phase_name,
+        dep=previous, local_rows=rows, global_rows=restored_rows,
+        hidden=gather_hidden, pcp=int(selected_runtime.parallel.pcp),
+        act_dtype=step_model.activation_dtype, runtime=selected_runtime,
+        source="vllm_ascend.spec_decode.mtp_proposer",
+        per_peer_rows=per_peer_rows,
+    )
+    return previous, restored_rows, pcp_normalized
+
+
 def _append_prefill_bootstrap(
     regions, ops, previous, *, frontend, model, draft, step_model, draft_model,
     plans, runtime, selected_runtime, proposal_views, selected, all_active, rows,
@@ -1201,6 +1249,7 @@ def _append_prefill_bootstrap(
     step_extra, bootstrap_k: int, eff_scope: str, replay_scope: str,
     external_context: bool, draft_cap: int, widths: Mapping[str, int],
     cyclic: bool = False, multi_module: bool = False,
+    body_input_rows: int | None = None, normalized: bool = False,
 ):
     """Seed all K >= 1 initial step-1 proposals on a final prompt chunk (samples=True)."""
     def _wants_bootstrap(view) -> bool:
@@ -1224,7 +1273,8 @@ def _append_prefill_bootstrap(
             ops, frontend, model, draft, step_model, draft_model,
             selected_runtime, head_views,
             previous, prefix=prefix, stage=stage, requests=requests,
-            body_input_rows=rows, phase="draft_prefill",
+            body_input_rows=rows if body_input_rows is None else body_input_rows,
+            phase="draft_prefill", normalized=normalized,
         )
         regions[-1] = LoweringRegion(
             _tag_draft_ops(ops, rows_by_request, step=0, extra_meta=step_extra),
@@ -1354,6 +1404,7 @@ def _lower_ar_draft_steps(
     prefill: bool, external_context: bool, replica: int, replay_scope: str,
     machine, assembly: str, widths: Mapping[str, int],
     contract: _draft_spec_mod.SpeculativeExecutionContract | None = None,
+    physical_rank=None,
 ):
     """Lower serial MTP/EAGLE/EAGLE3 draft steps (including prefill bootstrap and multi-module MTP)."""
     meta = dict(getattr(runtime, "metadata", ()) or ())
@@ -1422,8 +1473,10 @@ def _lower_ar_draft_steps(
         )
         pcp_prefill = bool(prefill and selected_runtime.parallel.pcp > 1)
         if pcp_prefill:
+            from mindie_sim.prediction.execution.rank_ledger import selected_lane
             proposal_views, rows, _ = frontend.partition_views(
-                proposal_views, selected_runtime, rows, model=step_model)
+                proposal_views, selected_runtime, rows, model=step_model,
+                lane=selected_lane(selected_runtime.parallel, machine, replica, physical_rank))
         requests = tuple(v.request_id for v in proposal_views)
         prefix = "draft_prefill." if prefill else f"draft{step}."
         phase_name = "draft_prefill" if prefill else "draft"
@@ -1452,6 +1505,14 @@ def _lower_ar_draft_steps(
             reuse_index_selection=can_reuse_topk,
         )
         ops.extend(body)
+        body_output_rows, pcp_normalized = rows, False
+        if pcp_prefill:
+            previous, body_output_rows, pcp_normalized = _restore_draft_pcp_hidden(
+                frontend, ops, previous, step_model=step_model,
+                selected_runtime=selected_runtime, proposal_views=proposal_views,
+                rows=rows, prefix=prefix, stage=stage, requests=requests,
+                phase_name=phase_name,
+            )
         step_extra = sparse_meta + (
             (("spec_module_idx", step % len(plans)), ("stale_kv_reprefill", step > 0))
             if multi_module else ()
@@ -1480,6 +1541,7 @@ def _lower_ar_draft_steps(
                         replay_scope=replay_scope, external_context=external_context,
                         draft_cap=draft_cap, widths=widths,
                         cyclic=cyclic, multi_module=multi_module,
+                        body_input_rows=body_output_rows, normalized=pcp_normalized,
                     )
             continue
         previous = _append_ar_decode_head(
@@ -1567,7 +1629,7 @@ def _enforce_draft_execution_contracts(
 def lower_draft_regions(
     frontend, model, runtime, views, ready, *, global_views=None, prefill=False,
     replica=0, replay_scope="none", machine=None, assembly="service",
-    next_proposal_widths: Mapping[str, int] | None = None,
+    next_proposal_widths: Mapping[str, int] | None = None, physical_rank=None,
 ):
     """Lower draft regions without emitting the PP proposal transfer yet."""
     rt_meta = dict(runtime.metadata)
@@ -1625,17 +1687,18 @@ def lower_draft_regions(
         frontend, model, draft, draft_model, plans, runtime, active, all_active, ready,
         prefill=prefill, external_context=external_context, replica=replica,
         replay_scope=replay_scope, machine=machine, assembly=assembly, widths=widths,
-        contract=contract,
+        contract=contract, physical_rank=physical_rank,
     )
 
 
 def draft_program(frontend, model, runtime, views, ready, *, global_views=None, prefill=False,
                   replica=0, replay_scope="none", machine=None, assembly="service",
-                  next_proposal_widths: Mapping[str, int] | None = None):
+                  next_proposal_widths: Mapping[str, int] | None = None, physical_rank=None):
     regions, previous, last_active = lower_draft_regions(
         frontend, model, runtime, views, ready, global_views=global_views,
         prefill=prefill, replica=replica, replay_scope=replay_scope, machine=machine,
         assembly=assembly, next_proposal_widths=next_proposal_widths,
+        physical_rank=physical_rank,
     )
     if regions:
         previous = _transfer_draft_proposals(
