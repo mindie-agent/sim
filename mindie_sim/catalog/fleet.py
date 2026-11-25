@@ -292,6 +292,7 @@ def _gemma4(key: str, config: Mapping[str, Any]) -> ModelSpec:
         donor_by_kind[kinds[donor_idx]] = donor_idx
     from mindie_sim.catalog.hf_config import rotary_dimensions
     rope_params = c.get("rope_parameters") if isinstance(c.get("rope_parameters"), Mapping) else {}
+    double_wide_mlp = bool(c.get("use_double_wide_mlp", False))
     plans = []
     for index, kind in enumerate(kinds):
         full = kind == "full_attention"
@@ -304,17 +305,26 @@ def _gemma4(key: str, config: Mapping[str, Any]) -> ModelSpec:
         kv_owner = donor_by_kind[kind] if shares_kv else index
         # Two cache planes are retained on KV-owning layers even when V=v_norm(K).
         factor = KV_CACHE_PLANES
+        double_wide = bool(double_wide_mlp and shares_kv)
+        mlp_scale = 2 if double_wide else 1
+        # Native Gemma-4 (vllm gemma4.py:619) always doubles config.intermediate_size
+        # on KV-sharing layers for its dense / parallel shared MLP branch.
+        shared_layer_i = (
+            (intermediate * mlp_scale if intermediate > 0 else shared_i * mlp_scale)
+            if (moe and double_wide)
+            else shared_i
+        )
         plans.append(LayerPlan(
             index=index, attention="gqa", architecture="gemma4",
             ffn="moe" if moe else "dense",
             window=0 if full else window,
             num_heads=heads, num_kv_heads=layer_kv, head_dim=layer_hd,
             qk_rope_head_dim=rope_dim, qk_nope_head_dim=nope_dim,
-            intermediate_size=0 if moe else intermediate,
+            intermediate_size=0 if moe else intermediate * mlp_scale,
             num_experts=experts,
             top_k=top_k, moe_intermediate_size=moe_i,
             num_shared_experts=shared,
-            shared_intermediate_size=shared_i, qk_norm=True,
+            shared_intermediate_size=shared_layer_i, qk_norm=True,
             ffn_activation="gelu",
             kv_cache_elements=0 if shares_kv else factor * layer_kv * layer_hd,
             kv_owner_layer_id=kv_owner, owns_long_kv=not shares_kv,

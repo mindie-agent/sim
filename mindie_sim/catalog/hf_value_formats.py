@@ -284,9 +284,16 @@ def model_value_formats(model: Any) -> dict[str, Any]:
     for plan in plans:
         attention = str(getattr(plan, "attention", "") or "gqa")
         head_dim = int(getattr(plan, "head_dim", 0) or model_head_dim)
+        rope_dim = int(getattr(plan, "qk_rope_head_dim", 0) or 0)
+        nope_dim = int(getattr(plan, "qk_nope_head_dim", 0) or 0)
         if attention == "mla":
-            dim = int(getattr(plan, "qk_rope_head_dim", 0)
-                      or (mla.qk_rope_head_dim if mla is not None else 0))
+            dim = rope_dim if (rope_dim > 0 or nope_dim > 0) else (
+                int(mla.qk_rope_head_dim) if mla is not None else 0
+            )
+        elif rope_dim > 0 or nope_dim > 0:
+            dim = rope_dim
+        elif attention in {"gdn", "kda", "mamba"}:
+            dim = 0
         elif 0.0 < partial < 1.0:
             dim = int(round(head_dim * partial))
         else:
