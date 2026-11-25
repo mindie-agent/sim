@@ -366,6 +366,88 @@ class RecipeContext:
         )
         return {aic_name: aic_sub, aiv_name: aiv_sub}
 
+    def stream_owner_units(self, role: str, *, buffer_pool: bool = False) -> tuple[int, ...]:
+        """Return physical core IDs owned by the active stream for ``role``."""
+        owners = self.stream_owners
+        if owners is None:
+            return ()
+        return owners.pool_for_role(role, datapath=self.datapath, buffer_pool=buffer_pool)
+
+    def stream_aic_aiv_pairs(
+        self, *, require_full_pair: bool = False,
+    ) -> tuple[tuple[int, tuple[int, ...]], ...]:
+        """Resolve physical ``(aic, paired_aivs)`` groups from ``datapath.aic_aiv_pairs``."""
+        if self.datapath is None:
+            return ()
+        from ..streams import resolve_aic_aiv_pairs
+
+        return resolve_aic_aiv_pairs(
+            self.datapath, self.stream_owners, require_full_pair=require_full_pair,
+        )
+
+    def validate_stage_placement(
+        self, stage: Stage, *, stream_owners: Any = None, require_placement: bool = True,
+    ) -> None:
+        """Validate post-binding per-owner placement and private buffer units on one ``Stage``."""
+        from ..streams import MAIN_STREAM, validate_stage_owners
+
+        owners = self.stream_owners if stream_owners is None else stream_owners
+        stream_id = getattr(self.op, "stream", None) or MAIN_STREAM
+        validate_stage_owners(
+            stage,
+            self.datapath,
+            resource_names=self.resource_names,
+            resource_units=self.resource_units,
+            owners=owners,
+            stream_id=stream_id,
+            pool_names=self.pool_names,
+            pool_units=self.pool_units,
+            require_placement=require_placement,
+        )
+
+    def validate_program_placement(
+        self, program: Any, *, stream_owners: Any = None, require_placement: bool = True,
+    ) -> None:
+        """Validate post-binding per-owner placements and grant/release pairs on a ``Program``."""
+        from ..streams import MAIN_STREAM, validate_program_owners
+
+        owners = self.stream_owners if stream_owners is None else stream_owners
+        stream_id = getattr(self.op, "stream", None) or MAIN_STREAM
+        validate_program_owners(
+            program,
+            self.datapath,
+            resource_names=self.resource_names,
+            resource_units=self.resource_units,
+            owners=owners,
+            stream_id=stream_id,
+            pool_names=self.pool_names,
+            pool_units=self.pool_units,
+            require_placement=require_placement,
+        )
+
+    def check_live_buffers(
+        self,
+        buffers: Sequence[Any],
+        *,
+        family: str = "",
+        uses_simt: bool = False,
+        fused: bool = False,
+        kernel_abi: str = "",
+        simt_ub_carveout_bytes: int = 0,
+    ) -> tuple[Any, ...]:
+        """Verify live on-chip/L2 buffer peaks via ``tile_solver.check_live_buffers``."""
+        from ..runtime.tile_solver import check_live_buffers
+
+        return check_live_buffers(
+            buffers,
+            self,
+            family=family or str(getattr(self.op, "family", "") or "buffers"),
+            uses_simt=uses_simt,
+            fused=fused,
+            kernel_abi=kernel_abi,
+            simt_ub_carveout_bytes=simt_ub_carveout_bytes,
+        )
+
     def _datacopy_cell(self):
         cell = getattr(self.primitive_table, "cell", None)
         if cell is not None:

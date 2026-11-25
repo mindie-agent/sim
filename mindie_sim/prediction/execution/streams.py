@@ -392,6 +392,7 @@ def apply_stream_owners(stream_quota_by_res, context, program):
         MAIN_STREAM,
         apply_stream_owners_to_program,
         check_work_against_stream_budget,
+        validate_program_owners,
     )
     stream_id = getattr(context.op, "stream", None) or MAIN_STREAM
     check_work_against_stream_budget(
@@ -400,13 +401,14 @@ def apply_stream_owners(stream_quota_by_res, context, program):
         resource_names=context.resource_names,
         stream_id=stream_id,
         label=str(getattr(context.op, "op_id", "op")),
+        datapath=context.datapath,
     )
     quota_map = {
         phys: stream_quota_by_res[(phys, stream_id)]
         for phys in context.resource_names.values()
         if (phys, stream_id) in stream_quota_by_res
     }
-    return apply_stream_owners_to_program(
+    bound = apply_stream_owners_to_program(
         program,
         owners,
         context.datapath,
@@ -418,6 +420,18 @@ def apply_stream_owners(stream_quota_by_res, context, program):
         pool_names=context.pool_names,
         pool_units=context.pool_units,
     )
+    validate_program_owners(
+        bound,
+        context.datapath,
+        resource_names=context.resource_names,
+        resource_units=context.resource_units,
+        owners=owners,
+        stream_id=stream_id,
+        pool_names=context.pool_names,
+        pool_units=context.pool_units,
+        require_placement=False,
+    )
+    return bound
 
 
 class ResourceRates(Mapping):
