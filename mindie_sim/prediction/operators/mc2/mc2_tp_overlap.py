@@ -29,6 +29,24 @@ from dataclasses import replace
 from mindie_sim.prediction.fusion_regions import fold_region_metadata
 from mindie_sim.prediction.implementations import rewire_replacements
 from mindie_sim.prediction.rewrite_mhc_rules import users_map
+from mindie_sim.schema.datapath import SourceRef
+
+TARGET_BACKEND = "ascend"
+_OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/all_gather_matmul_v2/op_kernel/arch35/all_gather_matmul_fp16_bf16.h",
+        source_sha256="fe27d0c153368f57396c14bcab681e7a12c8a8b5f732bc45be4c393eb74d82a7",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/matmul_reduce_scatter_v2/op_kernel/arch35/matmul_reduce_scatter_fp16_bf16.h",
+        source_sha256="121ad9870776e27c1986e612b047817267e0de8976236df7eac748ef1643eff3",
+    ),
+)
 
 _AGMM_CONSUMER_FAMILIES = frozenset({
     "gemm", "qkv_projection", "gate_up_projection", "projection",
@@ -37,10 +55,59 @@ _MMRS_PRODUCER_FAMILIES = frozenset({
     "gemm", "output_projection", "o_projection", "down_projection", "projection",
 })
 _FLOAT_DTYPES = frozenset({"bf16", "fp16"})
+_FLOAT_DTYPE_ALIASES = {"bfloat16": "bf16", "float16": "fp16"}
 _GEMM_SHAPE_RANK = 3
 _SINGLE_CHUNK = 1
 _MIN_TP_WORLD = 2
 _NO_PORTS: dict = {}
+
+
+def _canonical_dtype(raw) -> str:
+    norm = str(raw or "").strip().lower()
+    return _FLOAT_DTYPE_ALIASES.get(norm, norm)
+
+
+def _native_float_gemm_dtypes(
+    gemm, gemm_meta: dict, *, comm_dtype: str | None = None,
+) -> tuple[str, str] | None:
+    """Return ``(compute_dtype, output_dtype)`` iff all GEMM operands are matching FP16/BF16."""
+    if int(gemm_meta.get("matrix_groups", 1) or 1) != 1:
+        return None
+    pabi = getattr(gemm, "precision_abi", None)
+    comp_dt = _canonical_dtype(
+        gemm_meta.get("compute_format")
+        or (getattr(pabi, "compute_dtype", None) if pabi is not None else None)
+        or gemm.dtype
+        or "bf16"
+    )
+    out_dt = _canonical_dtype(
+        gemm_meta.get("output_format")
+        or (getattr(pabi, "output_dtype", None) if pabi is not None else None)
+        or comp_dt
+    )
+    act_dt = _canonical_dtype(
+        gemm_meta.get("activation_format")
+        or (getattr(pabi, "input_dtype", None) if pabi is not None else None)
+        or comp_dt
+    )
+    weight_dt = _canonical_dtype(
+        gemm_meta.get("weight_format")
+        or (getattr(pabi, "weight_dtype", None) if pabi is not None else None)
+        or comp_dt
+    )
+    if (
+        comp_dt not in _FLOAT_DTYPES
+        or out_dt != comp_dt
+        or act_dt != comp_dt
+        or weight_dt != comp_dt
+    ):
+        return None
+    for mf_dt, mf_val in getattr(gemm, "matrix_flops", ()) or ():
+        if mf_val and _canonical_dtype(mf_dt) != comp_dt:
+            return None
+    if comm_dtype and _canonical_dtype(comm_dtype) != comp_dt:
+        return None
+    return comp_dt, out_dt
 
 
 def _tp_world_size(comm_meta: dict, m_dim: int) -> int:
@@ -113,11 +180,10 @@ def tp_mc2_overlap_fusion(ops, source_dtype):
         if world < _MIN_TP_WORLD or m_dim % world != 0:
             continue
         gemm_meta = dict(gemm.metadata)
-        comp_dt = str(gemm_meta.get("compute_format") or gemm.dtype or "bf16").lower()
-        out_dt = str(gemm_meta.get("output_format") or comp_dt).lower()
-        act_dt = str(gemm_meta.get("activation_format") or comp_dt).lower()
-        if comp_dt not in _FLOAT_DTYPES or out_dt not in _FLOAT_DTYPES or act_dt not in _FLOAT_DTYPES:
+        dtypes = _native_float_gemm_dtypes(gemm, gemm_meta, comm_dtype=ag.dtype)
+        if dtypes is None:
             continue
+        comp_dt, out_dt = dtypes
         new_deps = tuple(dict.fromkeys(
             dep for d in gemm.deps for dep in (ag.deps if d == ag.op_id else (d,))
         ))
@@ -170,10 +236,10 @@ def tp_mc2_overlap_fusion(ops, source_dtype):
         if world < _MIN_TP_WORLD or m_dim % world != 0:
             continue
         gemm_meta = dict(gemm.metadata)
-        comp_dt = str(gemm_meta.get("compute_format") or gemm.dtype or "bf16").lower()
-        out_dt = str(gemm_meta.get("output_format") or comp_dt).lower()
-        if comp_dt not in _FLOAT_DTYPES or out_dt not in _FLOAT_DTYPES:
+        dtypes = _native_float_gemm_dtypes(gemm, gemm_meta, comm_dtype=rs.dtype)
+        if dtypes is None:
             continue
+        comp_dt, out_dt = dtypes
         contract = _build_mc2_contract(
             abi="matmul_reduce_scatter", world=world, m_dim=m_dim, k_dim=k_dim, n_dim=n_dim,
             compute_dtype=comp_dt, output_dtype=out_dt,

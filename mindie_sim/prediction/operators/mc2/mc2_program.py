@@ -30,8 +30,26 @@ from types import SimpleNamespace
 from typing import Any, Mapping
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.program import KernelProgram
+
+TARGET_BACKEND = "ascend"
+_OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/moe_distribute_dispatch_v2/op_kernel/arch35/moe_distribute_dispatch_v2_a5_full_mesh.h",
+        source_sha256="3194ed49e10aab74976053840a5e771051be946d0945664fd5a3ca34a32bdb6b",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/moe_distribute_combine_v2/op_kernel/arch35/moe_distribute_combine_v2_a5_mte.h",
+        source_sha256="4e2a3f571df2e0e3718c8e61145638483be15445383ed77c3873381874ffb5a9",
+    ),
+)
 
 __all__ = [
     "Mc2LaunchView", "native_program_from_contract",
@@ -86,7 +104,7 @@ def _link_work(plan, ep: int, node_ranks: int = 0):
     phases = []
     peers = max(0, int(ep) - 1)
     local_peers = (max(0, min(int(ep), int(node_ranks)) - 1)
-                   if node_ranks and int(node_ranks) > 1 else peers)
+                   if node_ranks and int(node_ranks) >= 1 else peers)
     remote_peers = peers - local_peers
     for phase in plan.phases:
         work = dict(phase.work)
@@ -206,7 +224,7 @@ def _mapped_work(work: dict[str, Any], rates: dict[str, float]) -> dict[str, Fra
 def _native_program(raw_items, aiv, rates_items, units_items, service_items,
                     latencies, node_ranks, peer_weights, rank, peer_classes,
                     resource_names, payload_frames, payload_basis,
-                    payload_local_frames, exact_payload):
+                    payload_local_frames, exact_payload, rank_nodes=()):
     """Build the real native phase program without running a private Engine.
 
     ``raw_items`` is the complete phase contract: source and received
@@ -214,6 +232,7 @@ def _native_program(raw_items, aiv, rates_items, units_items, service_items,
     from a capacity token count.  The shared Execution launches the returned
     program on its own Engine through ``launch_native_cohort``.
     """
+    from .mc2_fullmesh import EXPERT_STATUS_RECORD_BYTES
     from .mc2_phase import build, contract
     from .mc2_program_launch import _Mc2Program
     raw = dict(raw_items)
@@ -242,20 +261,53 @@ def _native_program(raw_items, aiv, rates_items, units_items, service_items,
             if pipe in {"link", "link_hccs", "link_roce"} and amount}
         if links:
             link_by_phase[phase.name] = links
+    node_map = dict(rank_nodes or ())
+    ep_size = max(1, int(raw["ep"]))
+
+    def edge_class(src_rank: int, idx: int, dst_rank: int) -> str:
+        if src_rank in node_map and dst_rank in node_map:
+            return "hccs" if node_map[src_rank] == node_map[dst_rank] else "roce"
+        return _peer_class_for(
+            src_rank, idx, dst_rank, node_ranks=int(node_ranks),
+            peer_count=ep_size, classes=peer_classes if src_rank == int(rank) else (),
+        )
+
+    if "count_status_exchange" in link_by_phase and ep_size > 1 and 0 <= int(rank) < ep_size:
+        per_peer_count = Fraction(max(0, int(raw.get("experts", 0)) // ep_size) * EXPERT_STATUS_RECORD_BYTES)
+        if per_peer_count > 0:
+            count_totals: dict[str, Fraction] = {}
+            count_peers = tuple(p for p in range(ep_size) if p != int(rank))
+            for idx, peer in enumerate(count_peers):
+                klass = edge_class(int(rank), idx, peer)
+                key = "link_hccs" if klass == "hccs" else "link_roce"
+                count_totals[key] = count_totals.get(key, Fraction(0)) + per_peer_count
+            if count_totals:
+                link_by_phase["count_status_exchange"] = count_totals
     if exact_payload:
         # The public payload ledger is the same concrete route frame count
         # times the physical packet width used by the launch sends below.
         packet = int(plan.layout.packet_bytes)
         totals = {}
         for index, (peer, frames) in enumerate(payload_frames):
-            klass = _peer_class_for(
-                int(rank), index, int(peer), node_ranks=int(node_ranks),
-                peer_count=max(1, int(raw["ep"])), classes=peer_classes)
+            klass = edge_class(int(rank), index, int(peer))
             key = "link_hccs" if klass == "hccs" else "link_roce"
             totals[key] = (totals.get(key, Fraction(0))
                            + Fraction(int(frames) * packet))
         # Keep the named phase present even for a zero-frame representative
         # rank: another replica still owns directed frames in this cohort.
+        link_by_phase["payload_exchange"] = totals or {"link": Fraction(0)}
+    elif raw.get("route_matrix_bytes"):
+        matrix_bytes = raw["route_matrix_bytes"]
+        totals = {}
+        if 0 <= int(rank) < len(matrix_bytes):
+            peers = tuple(p for p in range(len(matrix_bytes[int(rank)])) if p != int(rank))
+            for index, peer in enumerate(peers):
+                useful = float(matrix_bytes[int(rank)][peer])
+                if useful <= 0.0:
+                    continue
+                klass = edge_class(int(rank), index, peer)
+                key = "link_hccs" if klass == "hccs" else "link_roce"
+                totals[key] = totals.get(key, Fraction(0)) + _as_fraction(useful)
         link_by_phase["payload_exchange"] = totals or {"link": Fraction(0)}
     elif not payload_frames and "unknown" in str(payload_basis).lower():
         # No scoped source route: no invented directed payload wire.
@@ -317,7 +369,8 @@ def _native_program(raw_items, aiv, rates_items, units_items, service_items,
         route_matrix_bytes=raw.get("route_matrix_bytes"),
         uniform_payload_bytes=raw.get("uniform_payload_bytes", 0),
         experts=raw.get("experts", 0),
-        transport_basis=raw.get("payload_basis", payload_basis))
+        transport_basis=raw.get("payload_basis", payload_basis),
+        rank_nodes=rank_nodes)
     program._phase_work = phase_work
     program.work = tuple(sorted(work.items()))
     return program, program.work
@@ -362,10 +415,10 @@ def _transport_latencies(context, ep: int) -> tuple[Fraction, Fraction]:
     return intra, inter
 
 
-def _transport_peer_classes(context, rank, ep):
+def _transport_rank_nodes(context) -> tuple[tuple[int, int], ...]:
     transport = _transport_identity(context)
     placements = transport.get("placements") or ()
-    nodes = {}
+    nodes: dict[int, int] = {}
     for placement in placements:
         if not isinstance(placement, Mapping):
             continue
@@ -373,6 +426,11 @@ def _transport_peer_classes(context, rank, ep):
             nodes[int(placement["rank"])] = int(placement.get("node", 0))
         except (KeyError, TypeError, ValueError):
             continue
+    return tuple(sorted(nodes.items()))
+
+
+def _transport_peer_classes(context, rank, ep):
+    nodes = dict(_transport_rank_nodes(context))
     if rank not in nodes:
         return None
     return tuple(sorted(
@@ -427,5 +485,6 @@ def native_program_from_contract(raw, context):
     program, _work = _native_program(
         tuple(sorted(data.items())), aiv, rates, units, services, latencies,
         node_ranks, None, rank, _transport_peer_classes(context, rank, ep),
-        resources, frames, basis, local_frames, exact)
+        resources, frames, basis, local_frames, exact,
+        _transport_rank_nodes(context))
     return program

@@ -24,9 +24,27 @@ from fractions import Fraction
 from typing import Mapping
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.program import KernelProgram
 from .mc2_program import Mc2LaunchView, _peer_class_for
 from .mc2_program_state import Mc2ProgramState
+
+TARGET_BACKEND = "ascend"
+_OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/moe_distribute_dispatch_v2/op_kernel/arch35/moe_distribute_dispatch_v2_a5_full_mesh.h",
+        source_sha256="3194ed49e10aab74976053840a5e771051be946d0945664fd5a3ca34a32bdb6b",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/moe_distribute_combine_v2/op_kernel/arch35/moe_distribute_combine_v2_a5_mte.h",
+        source_sha256="4e2a3f571df2e0e3718c8e61145638483be15445383ed77c3873381874ffb5a9",
+    ),
+)
 
 
 class _Mc2Program(Mc2ProgramState):
@@ -56,6 +74,7 @@ class _Mc2Program(Mc2ProgramState):
         work = {}
         peer_events = {}
         parent_events = []
+        incoming_arrivals = []
         frames = 0
         edges = 0
         tx_bytes = 0.0
@@ -117,6 +136,8 @@ class _Mc2Program(Mc2ProgramState):
                     on_complete=lambda _event, item=promise:
                     engine.resolve(item))
             parent_events.append(final)
+            if _di in local_indices and _si != _di:
+                incoming_arrivals.append(final)
             frames += int(cell_frames)
             edges += 1
             useful_bytes += float(useful)
@@ -154,6 +175,7 @@ class _Mc2Program(Mc2ProgramState):
             or (prerequisite,))
         return {
             "event": complete, "peer_events": peer_events, "work": work,
+            "incoming_arrivals": tuple(incoming_arrivals),
             "frames": frames, "edges": edges, "tx_bytes": tx_bytes,
             "rx_bytes": rx_bytes, "useful_bytes": useful_bytes,
             "group": group, "sources": tuple(transport.get("sources") or ()),
@@ -237,13 +259,18 @@ class _Mc2Program(Mc2ProgramState):
                     + ",".join(map(str, sorted(unknown))))
             return dict(value)
         local_count_event = None
+        local_payload_event = None
+        payload_transport_arrivals: tuple = ()
         for phase in self.phases:
             phase_ready, event = self._start_local_phase(
                 engine, name, phase, ready, events, view, transport,
-                placeholder_map, handles, local_count_event,
+                placeholder_map, handles, local_count_event, local_payload_event,
+                payload_transport_arrivals,
             )
             if phase.name == "count_status_exchange":
                 local_count_event = event
+            elif phase.name == "payload_exchange":
+                local_payload_event = event
             link = self.link_by_phase.get(phase.name)
             ready_by_peer = phase_map(ready_map, phase.name)
             send_by_peer = phase_map(send_map, phase.name)
@@ -251,6 +278,10 @@ class _Mc2Program(Mc2ProgramState):
                 engine, name, phase, event, view, transport, link, handles,
                 ready_by_peer, send_by_peer, source_map, placeholder_map,
             )
+            if phase.name == "payload_exchange":
+                payload_transport_arrivals = tuple(
+                    (handles.get("_transport_arrivals") or {}).get("payload_exchange") or ()
+                )
             # Authored per-owner primitive stages already execute above.
             # Do not replay the same inventory as an aggregate job.
             handles["phase_complete"].setdefault(phase.name, event)
@@ -268,7 +299,23 @@ class _Mc2Program(Mc2ProgramState):
         handles["operators"] = {"mc2": {"start": ready, "complete": parent}}
         return parent, handles
 
-    def _receive_flag_attempts(self, phase, plan, program, events, view, transport, placeholder_map, handles):
+    def _has_local_payload(self, local_destinations: set[int]) -> bool:
+        """Return True when local rank self-routes nonzero diagonal payload."""
+        if self.route_matrix is not None:
+            return any(self.local_frames_for(dst) > 0 for dst in local_destinations)
+        if self.route_matrix_bytes is not None:
+            return any(
+                0 <= dst < len(self.route_matrix_bytes)
+                and dst < len(self.route_matrix_bytes[dst])
+                and float(self.route_matrix_bytes[dst][dst]) > 0.0
+                for dst in local_destinations
+            )
+        return True
+
+    def _receive_flag_attempts(
+        self, phase, plan, program, events, view, transport, placeholder_map, handles,
+        local_payload_event=None, payload_transport_arrivals=(),
+    ):
         # The real MTE2/Compare success chain starts after the
         # selected inbound payload arrivals and local prerequisites.
         # Gather them before phase_ready/program.start so the actual
@@ -295,6 +342,10 @@ class _Mc2Program(Mc2ProgramState):
                 if destination in local_destinations
                 and phase_name == "payload_exchange"
                 and source != destination))
+            if payload_transport_arrivals:
+                incoming = tuple(dict.fromkeys((*incoming, *payload_transport_arrivals)))
+            if local_payload_event is not None and self._has_local_payload(local_destinations):
+                incoming = tuple(dict.fromkeys((*incoming, local_payload_event)))
         # One genuinely source-shaped complete branch: combine
         # success-flag retry with exactly one active owner.  Other
         # owners/unsupported phases keep the existing causal wait.
@@ -531,7 +582,8 @@ class _Mc2Program(Mc2ProgramState):
 
     def _start_local_phase(
         self, engine, name, phase, ready, events, view, transport,
-        placeholder_map, handles, local_count_event,
+        placeholder_map, handles, local_count_event, local_payload_event=None,
+        payload_transport_arrivals=(),
     ):
         plan = self.plans[phase.name]
         program = plan.program(self._context(view))
@@ -545,9 +597,20 @@ class _Mc2Program(Mc2ProgramState):
         if phase.name == "receive_flags":
             deps, incoming, flag_programs = self._receive_flag_attempts(
                 phase, plan, program, events, view, transport, placeholder_map, handles,
+                local_payload_event=local_payload_event,
+                payload_transport_arrivals=payload_transport_arrivals,
             )
         else:
-            deps = tuple(events[dependency] for dependency in phase.after)
+            deps = tuple(
+                local_count_event
+                if (
+                    phase.name == "send_read_quantize"
+                    and dependency == "count_status_exchange"
+                    and local_count_event is not None
+                )
+                else events[dependency]
+                for dependency in phase.after
+            )
 
         count_specs = []
         if phase.name == "receive_counts":
@@ -752,7 +815,9 @@ class _Mc2Program(Mc2ProgramState):
             event = details["event"]
             handles["transport"][phase.name] = {
                 key: value for key, value in details.items()
-                if key not in {"event", "peer_events"}}
+                if key not in {"event", "peer_events", "incoming_arrivals"}}
+            if details.get("incoming_arrivals"):
+                handles.setdefault("_transport_arrivals", {})[phase.name] = details["incoming_arrivals"]
             for key, amount in details["work"].items():
                 handles["transport_work"][key] = (
                     handles["transport_work"].get(key, 0.0) + amount)

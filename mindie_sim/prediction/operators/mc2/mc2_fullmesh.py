@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass
 import math
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.datapath import SourceRef
 from .common import (
     FRAME_PAYLOAD_BYTES, FRAME_WIRE_BYTES, GROUP_QUANT_SIZE, MX_ALIGN_BYTES, MX_GROUP_SIZE,
 )
@@ -23,6 +24,22 @@ from .lowering import (
 )
 from .mc2_mx_quant import MX32_TILE_ELEMS, mx32_work, SOURCE as MX_SOURCE
 
+TARGET_BACKEND = "ascend"
+_OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/moe_distribute_dispatch_v2/op_kernel/arch35/moe_distribute_dispatch_v2_a5_full_mesh.h",
+        source_sha256="3194ed49e10aab74976053840a5e771051be946d0945664fd5a3ca34a32bdb6b",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/moe_distribute_combine_v2/op_kernel/arch35/moe_distribute_combine_v2_a5_mte.h",
+        source_sha256="4e2a3f571df2e0e3718c8e61145638483be15445383ed77c3873381874ffb5a9",
+    ),
+)
 
 SOURCE = {
     "repository": "cann/ops-transformer",
@@ -46,6 +63,8 @@ _COUNT_SYNC_RECORD_BYTES = UB_ALIGN_BYTES
 _COUNT_SYNC_RECORD_ELEMS = _COUNT_SYNC_RECORD_BYTES // INT32_BYTES
 _EXPERTS_PER_COUNT_CORE_TARGET = 16
 _MAX_COUNT_CORES = 8
+_SERIAL_MODE_MAX_BS_PER_RANK = 32
+_SERIAL_MODE_MAX_EP_WORLD_SIZE = 16
 _COUNT_STATUS_INIT_OPS_PER_EXPERT = 9
 _COUNT_PIPE_V_OPS_PER_EXPERT = 4
 _COUNT_VECTOR_OPS_PER_ID = _COUNT_PIPE_V_OPS_PER_EXPERT + 1  # Includes software ReduceSum.
@@ -259,8 +278,103 @@ def _dispatch_quant_details(layout, source_tokens, top_k, rows, ids, send, unkno
     return prefix_total, quant_steps, quant_details
 
 
+def _is_serial_mode(
+    source_tokens, ep, *, global_bs: int | float = 0,
+    is_scaling_down: bool = False, shared_expert_ranks: int = 0,
+) -> bool:
+    """Native A5 fullmesh serial-mode tiling guard (``moe_distribute_dispatch_v2_a5_full_mesh.h:441,453``)."""
+    del shared_expert_ranks
+    axis_max_bs = float(global_bs) / float(ep) if global_bs and int(ep) > 0 else float(source_tokens)
+    return (
+        not is_scaling_down
+        and int(ep) < _SERIAL_MODE_MAX_EP_WORLD_SIZE
+        and axis_max_bs <= _SERIAL_MODE_MAX_BS_PER_RANK
+    )
+
+
+def directed_cell_payload(
+    source: int,
+    destination: int,
+    *,
+    peer_count: int,
+    packet_bytes: int = 0,
+    route_matrix=None,
+    route_reverse: bool = False,
+    route_matrix_bytes=None,
+    uniform_payload_bytes: float = 0.0,
+) -> tuple[float, int]:
+    """Return ``(useful_bytes, frame_count)`` for one directed ``source -> destination`` cell."""
+    source, destination = int(source), int(destination)
+    if source == destination:
+        return 0.0, 0
+    if route_matrix:
+        frames = int(
+            route_matrix[destination][source]
+            if route_reverse
+            else route_matrix[source][destination]
+        )
+        return float(frames) * float(packet_bytes), frames
+    if route_matrix_bytes:
+        return float(route_matrix_bytes[source][destination]), 0
+    ep = max(1, int(peer_count))
+    return (float(uniform_payload_bytes) / ep if ep > 1 else 0.0), 0
+
+
+def directed_transport_cells(
+    *,
+    group: tuple[int, ...],
+    sources: tuple[int, ...],
+    experts: int = 0,
+    packet_bytes: int = 0,
+    route_matrix=None,
+    route_reverse: bool = False,
+    route_matrix_bytes=None,
+    uniform_payload_bytes: float = 0.0,
+    count: bool = False,
+) -> tuple[tuple[int, int, int, int, float, int], ...]:
+    """Canonical directed payload or count cells owned by ``sources`` over ``group``."""
+    group_size = len(group)
+    if group_size <= 1:
+        return ()
+    cells = []
+    for source in sources:
+        if not 0 <= source < group_size:
+            continue
+        if count:
+            experts_per_peer = max(0, int(experts) // group_size)
+            payload = float(experts_per_peer * EXPERT_STATUS_RECORD_BYTES)
+            if payload > 0.0:
+                for destination in range(group_size):
+                    if destination == source:
+                        continue
+                    cells.append((
+                        source, destination, group[source], group[destination], payload, 0,
+                    ))
+            continue
+        for destination in range(group_size):
+            if destination == source:
+                continue
+            payload, frames = directed_cell_payload(
+                source,
+                destination,
+                peer_count=group_size,
+                packet_bytes=packet_bytes,
+                route_matrix=route_matrix,
+                route_reverse=route_reverse,
+                route_matrix_bytes=route_matrix_bytes,
+                uniform_payload_bytes=uniform_payload_bytes,
+            )
+            if payload <= 0.0:
+                continue
+            cells.append((
+                source, destination, group[source], group[destination], payload, frames,
+            ))
+    return tuple(cells)
+
+
 def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
-                  received_assignments, experts, ep, aiv_count):
+                  received_assignments, experts, ep, aiv_count,
+                  global_bs=0, is_scaling_down=False, shared_expert_ranks=0):
     """Source rows include local destinations; peer routing removes diagonals.
 
     Fractional counts are expected work. Their eligible owner domain must not
@@ -270,6 +384,14 @@ def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
     all_cores = tuple(range(aiv_count))
     if source_tokens < 0 or top_k < 1 or source_assignments > source_tokens * top_k:
         raise ModelingError("mc2_assignment_count_exceeds_source_ids")
+    serial = _is_serial_mode(
+        source_tokens, ep, global_bs=global_bs,
+        is_scaling_down=is_scaling_down, shared_expert_ranks=shared_expert_ranks,
+    )
+    if serial:
+        send = all_cores
+        count = tuple(range(min(aiv_count, experts)))
+    send_after = ("count_status_exchange",) if serial else ("routing_metadata",)
     rows, recv = source_assignments, received_assignments
     ids = source_tokens * top_k
     unknown = ["scalar GetValue/SetValue, scalar prefix arithmetic and extra flag polling iteration service",
@@ -290,20 +412,11 @@ def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
             ("initialize", (("vector", id_init_work),)),
             ("read", _read(a * ids * INT32_BYTES)),
         ), details=(("replicated_id_arrays", a),)),
-        _staged("send_read_quantize", ("routing_metadata",), send,
-                "assignment_index_mod_payload_AIV", (
-                    ("assignment_prefix_scan", (("vector", prefix_total),)),
-                    ("read", _read(rows * (layout.input_bytes + layout.input_scale_bytes))),
-                    *quant_steps,
-                ), owner_basis="assignment_rows", details=quant_details),
-        ProtocolPhase("frame_payload", ("send_read_quantize",), send,
-                      "same_assignment_owner", (("vector", rows * layout.data_region_bytes / INT32_BYTES),),
-                      (("per_row_packet_bytes", layout.packet_bytes),
-                       ("reserved_flags_initialization", "UB buffers once per active owner; separately unresolved"))),
         ProtocolPhase("count_compute", ("routing_metadata",), count, "contiguous_expert_intervals", (
             ("vector", count_vector),), (
                 ("includes_zero_count_experts", True),
                 ("scalar_count_stores", experts),
+                ("serial_mode", serial),
                 ("cal_expert_cnt", {
                     "source": "CalExpertCnt:808-820",
                     "tensor_dtype": "int32 indices; Abs/ReduceSum reinterpret float",
@@ -326,6 +439,16 @@ def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
             ("bytes_per_expert_record", EXPERT_STATUS_RECORD_BYTES), ("records_per_source", experts),
             ("bytes_per_source_including_local", experts * EXPERT_STATUS_RECORD_BYTES),
             ("remote_bytes_per_source", experts * EXPERT_STATUS_RECORD_BYTES * (ep - 1) / ep)), "domain"),
+        _staged("send_read_quantize", send_after, send,
+                "assignment_index_mod_payload_AIV", (
+                    ("assignment_prefix_scan", (("vector", prefix_total),)),
+                    ("read", _read(rows * (layout.input_bytes + layout.input_scale_bytes))),
+                    *quant_steps,
+                ), owner_basis="assignment_rows", details=quant_details),
+        ProtocolPhase("frame_payload", ("send_read_quantize",), send,
+                      "same_assignment_owner", (("vector", rows * layout.data_region_bytes / INT32_BYTES),),
+                      (("per_row_packet_bytes", layout.packet_bytes),
+                       ("reserved_flags_initialization", "UB buffers once per active owner; separately unresolved"))),
         ProtocolPhase("payload_exchange", ("frame_payload",), send,
                       "declared_peer_assignment_cells", (
             ("mte3", rows * layout.packet_bytes),
@@ -340,26 +463,26 @@ def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
                     ("check_status", (("vector", experts - c),)),
                     ("zero_status", (("vector", experts),)),
                     ("clear_status", _write(experts * EXPERT_STATUS_RECORD_BYTES)),
-                    ("sum_counts", (("vector", 2 * experts - c + 2 * c * c),)),
-                    ("publish_sums", _write(c * c * _COUNT_SYNC_RECORD_BYTES)),
+                    ("sum_counts", (("vector", 2 * experts - c + (0 if serial else 2 * c * c)),)),
+                    ("publish_sums", _write((c if serial else c * c) * _COUNT_SYNC_RECORD_BYTES)),
                 ), details=(("polls_counted", 1), ("additional_spin_polls", "unmodeled"))),
         _staged("prefix_counts", ("receive_counts",), count,
                 "count_core_prefix_exchange_and_replicated_offsets", (
-                    ("read_sums", _read(c * c * _COUNT_SYNC_RECORD_BYTES)),
-                    ("check_and_prefix", (("vector", c * (2 * c - 1) + (c - 1) ** 2),)),
-                    ("zero_sums", (("vector", c * _align(c, _COUNT_SYNC_RECORD_ELEMS) * _COUNT_SYNC_RECORD_ELEMS),)),
-                    ("clear_sums", _write(c * c * _COUNT_SYNC_RECORD_BYTES)),
+                    ("read_sums", _read((c if serial else c * c) * _COUNT_SYNC_RECORD_BYTES)),
+                    ("check_and_prefix", (("vector", c * (c - 1) if serial else c * (2 * c - 1) + (c - 1) ** 2),)),
+                    ("zero_sums", (("vector", c * _COUNT_SYNC_RECORD_ELEMS if serial else c * _align(c, _COUNT_SYNC_RECORD_ELEMS) * _COUNT_SYNC_RECORD_ELEMS),)),
+                    ("clear_sums", _write((c if serial else c * c) * _COUNT_SYNC_RECORD_BYTES)),
                     ("publish_offsets", _write((a + 1) * experts * INT32_BYTES)),
-                    ("initialize_ready", (("vector", c * _align(a, _COUNT_SYNC_RECORD_ELEMS) * _COUNT_SYNC_RECORD_ELEMS),)),
-                    ("publish_ready", _write(c * a * _COUNT_SYNC_RECORD_BYTES)),
+                    ("initialize_ready", (("vector", 0 if serial else c * _align(a, _COUNT_SYNC_RECORD_ELEMS) * _COUNT_SYNC_RECORD_ELEMS),)),
+                    ("publish_ready", _write((0 if serial else c * a) * _COUNT_SYNC_RECORD_BYTES)),
                 ), details=(("prefix_output_copies", a + 1),
                             ("scalar_prefix_additions", experts))),
         _staged("prefix_ready", ("prefix_counts",), all_cores,
                 "every_AIV_checks_and_clears_its_count_core_ready_flags", (
-                    ("read_ready", _read(a * c * _COUNT_SYNC_RECORD_BYTES)),
-                    ("check_ready", (("vector", a * (c * _COUNT_SYNC_RECORD_ELEMS - 1)),)),
-                    ("zero_ready", (("vector", a * c * _COUNT_SYNC_RECORD_ELEMS),)),
-                    ("clear_ready", _write(a * c * _COUNT_SYNC_RECORD_BYTES)),
+                    ("read_ready", _read((0 if serial else a * c) * _COUNT_SYNC_RECORD_BYTES)),
+                    ("check_ready", (("vector", 0 if serial else a * (c * _COUNT_SYNC_RECORD_ELEMS - 1)),)),
+                    ("zero_ready", (("vector", 0 if serial else a * c * _COUNT_SYNC_RECORD_ELEMS),)),
+                    ("clear_ready", _write((0 if serial else a * c) * _COUNT_SYNC_RECORD_BYTES)),
                 ), details=(("polls_counted", 1),)),
         _staged("receive_metadata", ("prefix_ready",), prefix_owners,
                 "each_nonempty_source_expert_interval_reads_all_prefix_offsets", (

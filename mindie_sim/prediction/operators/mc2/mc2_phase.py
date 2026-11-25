@@ -14,9 +14,29 @@ import math
 from types import MappingProxyType, SimpleNamespace
 
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
+from mindie_sim.schema.datapath import SourceRef
 from .mc2_instructions import phase_events, SOURCE_RANGES
 from mindie_sim.prediction.program import KernelProgram, PipelineProgram, Stage
-from .mc2_fullmesh import dispatch_layout, combine_layout, dispatch_plan, combine_plan
+from .mc2_fullmesh import (
+    combine_layout, combine_plan, directed_transport_cells, dispatch_layout, dispatch_plan,
+)
+
+TARGET_BACKEND = "ascend"
+_OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/moe_distribute_dispatch_v2/op_kernel/arch35/moe_distribute_dispatch_v2_a5_full_mesh.h",
+        source_sha256="3194ed49e10aab74976053840a5e771051be946d0945664fd5a3ca34a32bdb6b",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/moe_distribute_combine_v2/op_kernel/arch35/moe_distribute_combine_v2_a5_mte.h",
+        source_sha256="4e2a3f571df2e0e3718c8e61145638483be15445383ed77c3873381874ffb5a9",
+    ),
+)
 
 RECIPE = "arch35_fullmesh_resource_phase"
 _PHASE_TEMPLATE_CACHE_ENTRIES = 128
@@ -58,6 +78,13 @@ def contract(raw, aiv_count):
             ("source_assignments", "received_assignments", "experts", "ep")}
     args["aiv_count"] = aiv_count
     args.update(source_tokens=raw["source_tokens"], top_k=raw["top_k"])
+    if kind == "dispatch":
+        if "global_bs" in raw:
+            args["global_bs"] = raw["global_bs"]
+        if "is_scaling_down" in raw:
+            args["is_scaling_down"] = bool(raw["is_scaling_down"])
+        if "shared_expert_ranks" in raw:
+            args["shared_expert_ranks"] = int(raw["shared_expert_ranks"])
     return (dispatch_plan if kind == "dispatch" else combine_plan)(layout, **args)
 
 
@@ -103,21 +130,39 @@ def _native_plan(raw, geometry):
     for phase in plan.phases:
         for role, amount in phase.work:
             resources[role] = resources.get(role, 0.0) + float(amount)
-    link = 0.0
-    matrix = raw.get("route_matrix")
-    if matrix is not None:
-        rank = int(raw.get("route_rank", 0))
-        reverse = bool(raw.get("route_reverse", False))
-        if 0 <= rank < len(matrix):
-            link = float(sum(
-                (matrix[peer][rank] if reverse else matrix[rank][peer])
-                for peer in range(len(matrix)) if peer != rank)
-                * plan.layout.packet_bytes)
-    else:
-        from .mc2_program import _link_work
-        for phase in _link_work(plan, max(1, int(raw["ep"])), 0):
-            link += sum(float(amount) for pipe, amount in phase.work
-                        if pipe in {"link", "link_hccs", "link_roce"})
+    ep = max(1, int(raw["ep"]))
+    rank = int(raw["route_rank"]) if "route_rank" in raw else int(getattr(geometry, "rank", 0) or 0)
+    group = tuple(range(ep))
+    sources = (rank,) if 0 <= rank < ep else ()
+    uniform_bytes = (
+        float(raw["uniform_payload_bytes"])
+        if "uniform_payload_bytes" in raw
+        else float(raw["source_assignments"]) * float(plan.layout.packet_bytes)
+    )
+    payload_cells = directed_transport_cells(
+        group=group,
+        sources=sources,
+        packet_bytes=plan.layout.packet_bytes,
+        route_matrix=raw.get("route_matrix"),
+        route_reverse=bool(raw.get("route_reverse", False)),
+        route_matrix_bytes=raw.get("route_matrix_bytes"),
+        uniform_payload_bytes=uniform_bytes,
+        count=False,
+    )
+    count_cells = (
+        directed_transport_cells(
+            group=group,
+            sources=sources,
+            experts=int(raw.get("experts", 0)),
+            count=True,
+        )
+        if raw["kind"] == "dispatch"
+        else ()
+    )
+    link = float(
+        sum(useful for _si, _di, _src, _dst, useful, _frames in payload_cells)
+        + sum(useful for _si, _di, _src, _dst, useful, _frames in count_cells)
+    )
     if link:
         resources["link"] = resources.get("link", 0.0) + link
     kind = str(raw["kind"])

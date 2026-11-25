@@ -27,13 +27,14 @@ from ..contracts import ArchStrategy, OperatorPlanningContext
 from mindie_sim.prediction.operators.mc2.mc2_fullmesh import SOURCE, combine_layout, dispatch_layout
 from mindie_sim.prediction.operators.mc2.mc2_mx_quant import mx32_work
 from .common import (
-    COLLECTIVES, COMBINE, FLOAT_ROWS, FP4_ROWS, MMAR, MMRS, Mc2Contract, PeerRoute, Transport,
-    build_transport_stages, capability_gap,
-    contract_fields, make_plan, native_protocol_peer_transport, topology_hops,
+    A5_AI_CPU, COLLECTIVES, COMBINE, FLOAT_ROWS, FP4_ROWS, FP8_ROWS, MMAR, MMRS, Mc2Contract,
+    PeerRoute, Transport, build_transport_stages, capability_gap, contract_fields,
+    geometry_has_l2, make_plan, native_protocol_peer_transport, topology_hops,
     validate_contract, validate_native_dispatch_quant,
 )
 from .lowering import A5_ROCE, CCU, SHMEM, declared_incoming_routes
 
+TARGET_BACKEND = "ascend"
 _OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
 _SKILLS_REVISION = "750045df251d031bf708de9dc1614c2202eed6dd"
 _XLLM_REVISION = "c77a313bfdd59c0f6e312558808c0de7d2a8d019"
@@ -49,6 +50,12 @@ SOURCES: tuple[SourceRef, ...] = (
         revision=_OPS_REVISION,
         relative_path="mc2/matmul_reduce_scatter_v2/op_kernel/arch35/matmul_reduce_scatter_fp16_bf16.h",
         source_sha256="121ad9870776e27c1986e612b047817267e0de8976236df7eac748ef1643eff3",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/matmul_all_reduce/op_api/aclnn_matmul_all_reduce.cpp",
+        source_sha256="b31deb6900ce4a750aecfdb446188ab0b7780ea6b4116b4e9085dbe0a04c8425",
     ),
     SourceRef(
         repository="cann/ops-transformer",
@@ -104,7 +111,9 @@ SOURCES: tuple[SourceRef, ...] = (
 MTE_WINDOW = "a5_mte"
 URMA_ALIGN_BYTES = 512
 MESH_RANK_LIMIT = 8
-ARCH_TRANSPORTS = frozenset({SHMEM, MTE_WINDOW, CCU, A5_ROCE})
+ARCH_TRANSPORTS = frozenset({SHMEM, MTE_WINDOW, CCU, A5_ROCE, A5_AI_CPU})
+_ARCH35_COLLECTIVE_WORLD_SIZES = frozenset({1, 2, 4, 8, 16, 32, 64})
+_ARCH35_COLLECTIVE_DTYPES = FLOAT_ROWS | FP8_ROWS | FP4_ROWS | {"hifloat8"}
 
 NATIVE_PROTOCOL_KIND = "arch35_fullmesh"
 NETWORK = "arch35_fullmesh_peer_channel"
@@ -112,6 +121,14 @@ NO_ASSIGNMENTS = 0
 MX_DISPATCH_GROUP = 32
 FUSED_MC2_ROUTED_MODE = 2
 FUSED_MC2_SHARED_MODE = 3
+
+
+def _validate_arch35_contract(contract: Mc2Contract, op: OpSpec, ctx: OperatorPlanningContext) -> None:
+    if contract.abi in COLLECTIVES:
+        if contract.world_size not in _ARCH35_COLLECTIVE_WORLD_SIZES:
+            raise capability_gap(op, ctx, f"arch35_collective_world_size_unsupported:{contract.world_size}")
+        if contract.dtype not in _ARCH35_COLLECTIVE_DTYPES:
+            raise capability_gap(op, ctx, f"arch35_collective_dtype_unsupported:{contract.dtype}")
 
 
 def _transport(contract: Mc2Contract, op: OpSpec, ctx: OperatorPlanningContext) -> Transport:
@@ -124,12 +141,16 @@ def _transport(contract: Mc2Contract, op: OpSpec, ctx: OperatorPlanningContext) 
     if abi == "auto":
         if caller in {"shmem", "aclshmem", SHMEM}:
             abi = SHMEM
+        elif contract.abi == MMAR or (caller in {"ai_cpu", "aicpu", A5_AI_CPU} and contract.abi in COLLECTIVES):
+            abi = A5_AI_CPU
         elif caller in {"ccu", "hcomm", CCU} or contract.abi in COLLECTIVES:
             abi = CCU
         else:
             abi = MTE_WINDOW
     if abi not in ARCH_TRANSPORTS or op.recipe == "arch22_v2_caller_local":
         raise capability_gap(op, ctx, f"transport_unsupported:{abi}")
+    if contract.abi == MMAR and abi != A5_AI_CPU:
+        raise capability_gap(op, ctx, "matmul_all_reduce_requires_ai_cpu_transport")
     algorithm = contract.topology_algorithm or ("direct_peer" if abi == SHMEM else "fullmesh")
     rank = contract.rank
     peers = tuple(peer for peer in contract.ranks if peer != rank)
@@ -165,7 +186,7 @@ def _transport(contract: Mc2Contract, op: OpSpec, ctx: OperatorPlanningContext) 
         raise capability_gap(op, ctx, "mte_window_requires_gm_ub_paths")
     if algorithm in {"ring", "two_tier"} and any((rank, peer) not in hops for peer in peers):
         raise capability_gap(op, ctx, "algorithm_requires_group_hops")
-    native_chunking = abi == CCU and contract.abi in COLLECTIVES
+    native_chunking = abi in {CCU, A5_AI_CPU} and contract.abi in COLLECTIVES
     if contract.internal_chunks >= 2 and not all(
         binding.get(key, fields.get(key, native_chunking)) is True
         for key in ("independent_buffers", "independent_handles")
@@ -202,7 +223,9 @@ class _Strategy:
         if ctx.compute_arch.arch_id != self.arch_id:
             return False
         try:
-            _transport(validate_contract(op, ctx), op, ctx)
+            contract = validate_contract(op, ctx)
+            _validate_arch35_contract(contract, op, ctx)
+            _transport(contract, op, ctx)
         except ModelingError:
             return False
         return True
@@ -211,11 +234,14 @@ class _Strategy:
         if ctx.compute_arch.arch_id != self.arch_id:
             raise capability_gap(op, ctx, "unsupported_compute_architecture")
         contract = validate_contract(op, ctx)
+        _validate_arch35_contract(contract, op, ctx)
         transport = _transport(contract, op, ctx)
         scatter = contract.abi in {MMRS, MMAR} and contract.world_size > 1
         temp_gm = scatter and contract.dtype in FLOAT_ROWS
         ub_output = contract.abi == MMRS and scatter and not temp_gm and ctx.datapath.has_l0c_to_ub
-        phases = build_transport_stages(contract, transport, ub_output=ub_output, temp_gm=temp_gm)
+        phases = build_transport_stages(
+            contract, transport, ub_output=ub_output, temp_gm=temp_gm, has_l2=geometry_has_l2(ctx.geometry),
+        )
         return make_plan(contract, transport, phases, self.sources, arch_id=self.arch_id)
 
 

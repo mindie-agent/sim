@@ -24,13 +24,32 @@ from fractions import Fraction
 from typing import Mapping
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.prediction.program import RecipeContext
 from .mc2_program import (
     MIN_MC2_AIV_UNITS, Mc2LaunchView, _as_fraction, _peer_class_for,
     _resolve_aiv_units, _subtract_endpoint_hbm,
 )
-from .mc2_fullmesh import EXPERT_STATUS_RECORD_BYTES
+from .mc2_fullmesh import (
+    EXPERT_STATUS_RECORD_BYTES, directed_cell_payload, directed_transport_cells,
+)
 
+TARGET_BACKEND = "ascend"
+_OPS_REVISION = "2d3f4f6db0231ac2e9e487cf62e94f6e173eb946"
+SOURCES: tuple[SourceRef, ...] = (
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/moe_distribute_dispatch_v2/op_kernel/arch35/moe_distribute_dispatch_v2_a5_full_mesh.h",
+        source_sha256="3194ed49e10aab74976053840a5e771051be946d0945664fd5a3ca34a32bdb6b",
+    ),
+    SourceRef(
+        repository="cann/ops-transformer",
+        revision=_OPS_REVISION,
+        relative_path="mc2/moe_distribute_combine_v2/op_kernel/arch35/moe_distribute_combine_v2_a5_mte.h",
+        source_sha256="4e2a3f571df2e0e3718c8e61145638483be15445383ed77c3873381874ffb5a9",
+    ),
+)
 
 
 class Mc2ProgramState:
@@ -44,7 +63,7 @@ class Mc2ProgramState:
                  payload_local_frames=0, route_matrix=None,
                  route_reverse=False, exact_payload=False,
                  route_matrix_bytes=None, uniform_payload_bytes=0,
-                 experts=0, transport_basis=None):
+                 experts=0, transport_basis=None, rank_nodes=None):
         self.phases = tuple(phases)
         self.plans = dict(plans)
         self.link_by_phase = dict(link_by_phase)
@@ -113,6 +132,9 @@ class Mc2ProgramState:
         #: when other EP sources are active; that does not make the operation a
         #: known-zero source.
         self.transport_basis = str(transport_basis or payload_basis)
+        self.rank_nodes: dict[int, int] = {
+            int(r): int(n) for r, n in dict(rank_nodes or ()).items()
+        }
         #: Mapped phase service work, excluding peer link bytes.  A launch-local
         #: rank adds its own exact directed link work below.
         self._phase_work = {}
@@ -159,18 +181,17 @@ class Mc2ProgramState:
 
     def payload_bytes(self, source, destination):
         """Useful payload bytes for one directed source->destination cell."""
-        source, destination = int(source), int(destination)
-        if source == destination:
-            return 0.0
-        if self.route_matrix:
-            count = (self.route_matrix[destination][source]
-                     if self.route_reverse else self.route_matrix[source][destination])
-            return float(count) * float(self.view.payload_packet_bytes)
-        if self.route_matrix_bytes:
-            return float(self.route_matrix_bytes[source][destination])
-        ep = max(1, self.peer_count)
-        return (self.uniform_payload_bytes / ep
-                if ep > 1 else 0.0)
+        useful, _frames = directed_cell_payload(
+            source,
+            destination,
+            peer_count=self.peer_count,
+            packet_bytes=self.view.payload_packet_bytes,
+            route_matrix=self.route_matrix,
+            route_reverse=self.route_reverse,
+            route_matrix_bytes=self.route_matrix_bytes,
+            uniform_payload_bytes=self.uniform_payload_bytes,
+        )
+        return useful
 
     def frame_count(self, source, destination):
         if not self.route_matrix or source == destination:
@@ -186,37 +207,17 @@ class Mc2ProgramState:
 
     def transport_cells(self, transport, count=False):
         """Directed cells this launch owns under its actual EP membership."""
-        group = tuple(transport.get("group") or ())
-        sources = tuple(transport.get("sources") or ())
-        if len(group) <= 1:
-            return ()
-        cells = []
-        for source in sources:
-            if not 0 <= source < len(group):
-                continue
-            if count:
-                # Contiguous expert intervals: every remote peer receives its
-                # own (experts/ep) status record, not the whole count on a ring
-                # neighbour.  The directed arrivals stay independent.
-                experts_per_peer = max(0, self.experts // len(group))
-                payload = float(experts_per_peer * EXPERT_STATUS_RECORD_BYTES)
-                if payload > 0:
-                    for destination in range(len(group)):
-                        if destination == source:
-                            continue
-                        cells.append((source, destination, group[source],
-                                      group[destination], payload, 0))
-                continue
-            for destination in range(len(group)):
-                if destination == source:
-                    continue
-                payload = self.payload_bytes(source, destination)
-                if payload <= 0:
-                    continue
-                cells.append((source, destination, group[source],
-                              group[destination], payload,
-                              self.frame_count(source, destination)))
-        return tuple(cells)
+        return directed_transport_cells(
+            group=tuple(transport.get("group") or ()),
+            sources=tuple(transport.get("sources") or ()),
+            experts=self.experts,
+            packet_bytes=self.view.payload_packet_bytes,
+            route_matrix=self.route_matrix,
+            route_reverse=self.route_reverse,
+            route_matrix_bytes=self.route_matrix_bytes,
+            uniform_payload_bytes=self.uniform_payload_bytes,
+            count=count,
+        )
 
     def transport_account(self, transport):
         """Physical coupled work for every directed cell this launch owns."""
@@ -280,6 +281,21 @@ class Mc2ProgramState:
             count["useful_bytes"] += float(useful)
         return payload, count
 
+    def _edge_class(self, source_rank: int, index: int, peer: int) -> str:
+        """Classify directed ``(source_rank, peer)`` edge from physical node placement."""
+        src, dst = int(source_rank), int(peer)
+        if src in self.rank_nodes and dst in self.rank_nodes:
+            return "hccs" if self.rank_nodes[src] == self.rank_nodes[dst] else "roce"
+        classes = self.peer_classes if src == self.view.rank else ()
+        return _peer_class_for(
+            src,
+            index,
+            dst,
+            node_ranks=self.view.node_ranks,
+            peer_count=self.peer_count,
+            classes=classes,
+        )
+
     def _directed_link(self, rank):
         totals = {}
         labels = tuple(peer for peer in range(self.peer_count) if peer != rank)
@@ -292,18 +308,14 @@ class Mc2ProgramState:
                     useful = self.payload_bytes(rank, peer)
                     if useful <= 0:
                         continue
-                    klass = _peer_class_for(
-                        rank, index, peer, node_ranks=self.view.node_ranks,
-                        peer_count=self.peer_count, classes=self.peer_classes)
+                    klass = self._edge_class(rank, index, peer)
                     key = "link_hccs" if klass == "hccs" else "link_roce"
                     totals[key] = totals.get(key, Fraction(0)) + Fraction(useful)
             return totals or {"link": Fraction(0)}
         frames = self.frames_for(rank)
         packet = self.view.payload_packet_bytes
         for index, (peer, count) in enumerate(frames):
-            klass = _peer_class_for(
-                rank, index, peer, node_ranks=self.view.node_ranks,
-                peer_count=self.peer_count, classes=self.peer_classes)
+            klass = self._edge_class(rank, index, peer)
             key = "link_hccs" if klass == "hccs" else "link_roce"
             totals[key] = totals.get(key, Fraction(0)) + Fraction(count * packet)
         # A zero-frame rank still owns the named payload phase.  The empty
@@ -311,9 +323,27 @@ class Mc2ProgramState:
         # has no peers at all; launch_native_cohort allocates the real edges.
         return totals or {"link": Fraction(0)}
 
+    def _directed_count_link(self, rank):
+        totals = {}
+        if self.peer_count <= 1 or not 0 <= int(rank) < self.peer_count:
+            return totals
+        per_peer = Fraction(max(0, self.experts // self.peer_count) * EXPERT_STATUS_RECORD_BYTES)
+        if per_peer <= 0:
+            return totals
+        labels = tuple(peer for peer in range(self.peer_count) if peer != int(rank))
+        for index, peer in enumerate(labels):
+            klass = self._edge_class(rank, index, peer)
+            key = "link_hccs" if klass == "hccs" else "link_roce"
+            totals[key] = totals.get(key, Fraction(0)) + per_peer
+        return totals
+
     def link_by_phase_for(self, rank):
         links = {phase: dict(values)
                  for phase, values in self.link_by_phase.items()}
+        if "count_status_exchange" in links:
+            count_links = self._directed_count_link(rank)
+            if count_links:
+                links["count_status_exchange"] = count_links
         if self.route_matrix or self.route_matrix_bytes:
             links["payload_exchange"] = self._directed_link(rank)
         return links
@@ -363,17 +393,28 @@ class Mc2ProgramState:
             int(rank): str(name) for rank, name in
             (dict(transport or {}).get("destination_memory") or {}).items()
             if name}
-        group = tuple((transport or {}).get("group") or ())
-        destination = int((view or self.view).rank)
-        if not endpoints or destination not in group or not endpoints.get(destination):
+        group = tuple(int(member) for member in ((transport or {}).get("group") or ()))
+        if not endpoints or not group:
             return 0.0
-        destination_index = group.index(destination)
+        rank_value = int((view or self.view).rank)
+        sources = tuple(int(item) for item in ((transport or {}).get("sources") or ()))
+        if len(sources) == 1 and 0 <= sources[0] < len(group):
+            destination_index = sources[0]
+        elif 0 <= rank_value < len(group):
+            destination_index = rank_value
+        elif rank_value in group:
+            destination_index = group.index(rank_value)
+        else:
+            return 0.0
+        physical_dest = group[destination_index]
+        if not endpoints.get(physical_dest):
+            return 0.0
         total = 0.0
         for source_index in range(len(group)):
-            if source_index == destination_index:
+            if source_index == destination_index or group[source_index] == physical_dest:
                 continue
             if count:
-                useful = float(self.experts * EXPERT_STATUS_RECORD_BYTES / max(1, len(group)))
+                useful = float(max(0, self.experts // len(group)) * EXPERT_STATUS_RECORD_BYTES)
             else:
                 useful = self.payload_bytes(source_index, destination_index)
             if useful > 0:
