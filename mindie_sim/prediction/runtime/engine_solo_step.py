@@ -19,6 +19,28 @@ from .engine_types import ExecutionError, _Task
 from .prepared_terms import RESIDUAL_SNAP_ULPS
 
 
+def _emit_wave_service(
+    wave_rec, key: int, rname: str, placement,
+    t0_ms: float, t1_ms: float, used: float,
+) -> None:
+    """Publish service across explicitly placed unit owners with exact work conservation."""
+    pl_u = placement.get(rname) if placement else None
+    if not pl_u:
+        wave_rec.on_service(key, rname, 0, t0_ms, t1_ms, used)
+        return
+    n_u = len(pl_u)
+    if n_u == 1:
+        wave_rec.on_service(key, rname, pl_u[0], t0_ms, t1_ms, used)
+        return
+    prev = 0.0
+    denom = float(n_u)
+    for idx, owner_u in enumerate(pl_u, 1):
+        cur = used if idx == n_u else used * (float(idx) / denom)
+        share = cur - prev
+        prev = cur
+        wave_rec.on_service(key, rname, owner_u, t0_ms, t1_ms, share)
+
+
 class _EngineSoloStepMixin:
     def _step_solo_fast(
         self, key: int, task: _Task, now: float, horizon: float,
@@ -121,8 +143,7 @@ class _EngineSoloStepMixin:
         serviced[rname] += used
         wave_rec = self._wave_recorder
         if wave_rec is not None and dt > 0.0:
-            pl_u = task.placement.get(rname) if task.placement else None
-            wave_rec.on_service(key, rname, pl_u[0] if pl_u else 0, now, next_time, used)
+            _emit_wave_service(wave_rec, key, rname, task.placement, now, next_time, used)
         if residual:
             rem[rname] = residual
         else:
@@ -184,8 +205,7 @@ class _EngineSoloStepMixin:
                 service[rname] = service.get(rname, 0.0) + remaining
                 serviced[rname] += remaining
                 if wave_rec is not None and wdt > 0.0:
-                    pl_u = task.placement.get(rname) if task.placement else None
-                    wave_rec.on_service(key, rname, pl_u[0] if pl_u else 0, now, now + wdt, remaining)
+                    _emit_wave_service(wave_rec, key, rname, task.placement, now, now + wdt, remaining)
             rem.clear()
             if task.latency <= 0.0:
                 completable_seen.add(key)
@@ -214,8 +234,7 @@ class _EngineSoloStepMixin:
             service[rname] = service.get(rname, 0.0) + used
             serviced[rname] += used
             if wave_rec is not None and dt > 0.0:
-                pl_u = task.placement.get(rname) if task.placement else None
-                wave_rec.on_service(key, rname, pl_u[0] if pl_u else 0, now, next_time, used)
+                _emit_wave_service(wave_rec, key, rname, task.placement, now, next_time, used)
             if residual:
                 rem[rname] = residual
             else:
@@ -303,8 +322,7 @@ class _EngineSoloStepMixin:
             service[rname] = service.get(rname, 0.0) + used
             serviced[rname] += used
             if wave_rec is not None and dt > 0.0:
-                pl_u = task.placement.get(rname) if task.placement else None
-                wave_rec.on_service(key, rname, pl_u[0] if pl_u else 0, now, next_time, used)
+                _emit_wave_service(wave_rec, key, rname, task.placement, now, next_time, used)
             if residual:
                 rem[rname] = residual
             else:
@@ -345,8 +363,7 @@ class _EngineSoloStepMixin:
                 for rn, post in t.service.items():
                     delta = post - prev_svc.get(rn, 0.0)
                     if delta > 0.0:
-                        pl_u = t.placement.get(rn) if t.placement else None
-                        wave_rec.on_service(k, rn, pl_u[0] if pl_u else 0, now, next_time, delta)
+                        _emit_wave_service(wave_rec, k, rn, t.placement, now, next_time, delta)
             if t.hbm_accounting:
                 _sync_task_hbm_accounting(self, t)
             if t.deliveries:

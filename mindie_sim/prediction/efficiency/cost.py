@@ -39,6 +39,54 @@ class OpCost:
         return "analytic_work"
 
 
+def _scope_heterogeneous_hardware(
+    case: CaseSpec,
+    op: OpSpec,
+    metadata: Mapping[str, Any],
+    hardware: Mapping[str, Any],
+) -> tuple[Mapping[str, Any], str]:
+    machine = case.machine
+    architecture = machine.arch_family
+    if getattr(machine, "homogeneous", True):
+        return hardware, architecture
+    exec_dies = ()
+    rank_val = metadata.get("physical_rank", metadata.get("rank"))
+    if rank_val is not None:
+        target_rank = int(rank_val)
+        matched = tuple(die for die in machine.dies if int(die.rank) == target_rank)
+        if matched:
+            exec_dies = (matched[0],)
+    if not exec_dies:
+        parallel = case.runtime.parallel
+        replica = int(metadata.get("replica", metadata.get("dp_replica", 0)) or 0)
+        stage = int(op.stage)
+        total_replicas = max(1, int(parallel.external_dp) * int(parallel.dp))
+        if 0 <= replica < total_replicas and 0 <= stage < int(parallel.pp):
+            placement = machine.validate_placement(parallel)
+            ranks = placement.stage_ranks(replica, stage)
+            exec_dies = tuple(placement.die_for_rank(rank) for rank in ranks)
+    if not exec_dies:
+        return hardware, architecture
+    by_rank = {
+        int(entry["rank"]): entry
+        for entry in hardware.get("dies", ())
+        if isinstance(entry, Mapping) and "rank" in entry
+    }
+    exec_payloads = [
+        {k: v for k, v in (by_rank.get(int(die.rank)) or die.to_dict()).items() if k != "rank"}
+        for die in exec_dies
+    ]
+    scoped_hardware = {
+        **hardware,
+        "execution_dies": exec_payloads,
+        "execution_compute_peaks": [dict(die.compute_peaks) for die in exec_dies],
+    }
+    exec_arches = {str(die.arch_family) for die in exec_dies if getattr(die, "arch_family", "")}
+    if len(exec_arches) == 1:
+        architecture = next(iter(exec_arches))
+    return scoped_hardware, architecture
+
+
 def primitive_key(case: CaseSpec, op: OpSpec, replay_scope: str, *, hardware=None) -> PrimitiveKey:
     metadata = dict(op.metadata)
     implementation = {
@@ -56,13 +104,13 @@ def primitive_key(case: CaseSpec, op: OpSpec, replay_scope: str, *, hardware=Non
         implementation["peer_traffic"] = metadata["peer_traffic"]
     if metadata.get("pr_source"):
         implementation["pr_source"] = metadata["pr_source"]
+    if not hardware:
+        from mindie_sim.prediction.evaluation import FrozenHardwareView
+        hardware = FrozenHardwareView.from_machine(case.machine).payload()
+    hardware, architecture = _scope_heterogeneous_hardware(case, op, metadata, hardware)
     return PrimitiveKey.from_mapping({
-        "hardware": hardware or {
-            "identity": case.machine.hardware_key or case.machine.sku,
-            "dies": [die.to_dict() for die in case.machine.dies],
-            "compute_peaks": dict(case.machine.compute_peaks),
-        },
-        "architecture": case.machine.arch_family,
+        "hardware": hardware,
+        "architecture": architecture,
         "implementation": implementation,
         "kernel": metadata.get("kernel", metadata.get("kernel_name", op.recipe)),
         "family": op.family,

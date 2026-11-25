@@ -508,9 +508,11 @@ class _EnginePeriodicMixin:
 
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 import ctypes
 import heapq
 import math
+import time
 from typing import Any, Mapping, Sequence
 
 from ..runtime.coupled import coupled_rates, _coupled_pair_fast
@@ -526,7 +528,7 @@ from .engine_lifecycle import _EngineLifecycleMixin
 from .engine_pair_cached import _EnginePairCachedMixin
 from .engine_pair_fast import _EnginePairFastMixin
 from .engine_prepare import _EnginePrepareMixin
-from .engine_solo_step import _EngineSoloStepMixin
+from .engine_solo_step import _EngineSoloStepMixin, _emit_wave_service
 from .engine_submit import _EngineSubmitMixin
 from .engine_types import (
     Allocation, Event, ExecutionError, PreparedStage, Resource,
@@ -588,6 +590,18 @@ def _completed_targets(until_tuple, until_two_0, until_two_1, first):
 
 
 DEADLINE_POLL_MASK = 255
+#: Cooperative per-candidate/outer sweep deadline.  Every pricing loop polls
+#: this value; no signal handler, thread or subprocess is involved.
+ACTIVE_DEADLINE_MONO: ContextVar[float | None] = ContextVar(
+    "mindie_sim_deadline_mono", default=None)
+
+
+def check_active_deadline() -> None:
+    deadline = ACTIVE_DEADLINE_MONO.get()
+    if deadline is not None and time.monotonic() > deadline:
+        raise TimeoutError("simulation_deadline_exceeded")
+
+
 _CACHED_MIXED_PLAN_KIND = 3
 _CACHED_MIXED_REM_IDX = 6
 _TRIPLE_ACTIVE_COUNT = 3
@@ -941,10 +955,8 @@ class Engine(
         _settle = self._settle
         _step_solo_fast = self._step_solo_fast
         while True:
-            if (steps & DEADLINE_POLL_MASK) == 0:
-                from ..evaluation import ACTIVE_DEADLINE_MONO, check_active_deadline
-                if ACTIVE_DEADLINE_MONO.get() is not None:
-                    check_active_deadline()
+            if (steps & DEADLINE_POLL_MASK) == 0 and ACTIVE_DEADLINE_MONO.get() is not None:
+                check_active_deadline()
             accel = self._accel
             if accel is not None and accel.start_conflict(self, until_tuple):
                 accel.disable(self, "start_boundary")
@@ -1229,9 +1241,9 @@ class Engine(
                 service[name] = service.get(name, 0.0) + used
                 serviced[name] += used
                 if wave_rec is not None and dt > 0.0:
-                    pl_units = task.placement.get(name) if task.placement else None
-                    owner_u = pl_units[0] if pl_units else 0
-                    wave_rec.on_service(key, name, owner_u, now, next_time, used)
+                    _emit_wave_service(
+                        wave_rec, key, name, task.placement, now, next_time, used,
+                    )
                 if residual:
                     task.remaining[name] = residual
                 else:
@@ -1322,9 +1334,10 @@ class Engine(
 
 
 __all__ = [
-    "Allocation", "AllocationBinding", "AllocationKey", "BindingFrame",
-    "Engine", "Event", "EventKey", "ExecutionError", "OccurrenceKey",
-    "PortBinding", "PreparedStage", "Resource", "Submission", "unit_rates",
+    "ACTIVE_DEADLINE_MONO", "Allocation", "AllocationBinding", "AllocationKey",
+    "BindingFrame", "Engine", "Event", "EventKey", "ExecutionError",
+    "OccurrenceKey", "PortBinding", "PreparedStage", "Resource", "Submission",
+    "check_active_deadline", "unit_rates",
     "_EMPTY_CAPS", "_EMPTY_FROZENSET", "_EMPTY_METADATA", "_EMPTY_PLACEMENT",
     "_EMPTY_TASK", "_FULL_FINITE_PREFLIGHT", "_PreparedTask", "_Task",
     "_binding_for", "_chain_callbacks", "_compute_pool_unit_masks",

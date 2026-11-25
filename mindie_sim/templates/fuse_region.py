@@ -71,6 +71,8 @@ _VALID_FUSE_BACKENDS = frozenset({"catlass_evg", "dsl_mix", "dsl_vec", "tla_simt
 _TILELANG_DISPATCH_MODES = frozenset({"aclgraph", "eager_prealloc", "eager_callee_alloc"})
 _TILELANG_DMA_PATTERNS = frozenset({"rw11", "rw21"})
 _TILELANG_CUBE_EPILOGUES = frozenset({"fixpipe", "dual_copy", "atomic_add"})
+_TILELANG_EXP_MODES = frozenset({"ub_exp", "sfu_exp", "reg_exp", "exp"})
+_SEMANTIC_VECTOR_KINDS = frozenset({"vector_alu", "vector_sfu", "vector_reduce"})
 _OPS_PER_MS_PER_GOP = TILELANG_OPS_PER_GOP / 1000.0
 
 
@@ -715,6 +717,13 @@ def _lower_region_passes(
             item for item in routed
             if item[1].src_op in declarations and item[1].dst_op in declarations
         )
+        res_names = context.resource_names if context else {}
+        phys_vec = _VECTOR_PIPES | {res_names.get(p, p) for p in _VECTOR_PIPES}
+        all_op_ids = frozenset(declarations)
+        single_vec_op = sum(
+            1 for st in declarations.values()
+            if any(amt and role in phys_vec for role, amt in st.work.items())
+        ) == 1
         releases, moved = _barrier_storage(pass_routed, declarations, context)
         rings = _make_pass_rings(pass_routed, declarations, pass_idx=pass_idx, die=die, context=context)
         completions = []
@@ -796,7 +805,10 @@ def _lower_region_passes(
                     if obligation.initial_residency == "onchip_resident":
                         continue
                     after.append(_obligation_access(plan, scope, op, index, obligation, tile, tile_count, "read", tuple(after)))
-                stage = _bind_declared_work(plan, stage, semantic_work)
+                stage = _bind_declared_work(
+                    plan, stage, semantic_work, op_id=op,
+                    all_op_ids=all_op_ids, single_vector_op=single_vec_op,
+                )
                 freed = tuple(a for a in stage.free if (op, a.name) not in moved)
                 run = plan.add(replace(stage, name=f"{scope}:{op}", after=tuple(dict.fromkeys(after)),
                                        acquire=scoped(stage.acquire), free=scoped(freed)))
@@ -974,22 +986,102 @@ def _apply_tilelang_cube_attainment(
     return bound / eta
 
 
+def _semantic_item_vector_mode(
+    profile: TileLangLoweringProfile,
+    item: SemanticWorkItem,
+) -> str:
+    if item.kind == "vector_reduce":
+        if profile.uses_simt or "aiv_simd" not in item.admitted_engines:
+            return "reduce"
+        return profile.vector_mode
+    if item.kind == "vector_sfu":
+        if profile.vector_mode in _TILELANG_EXP_MODES:
+            return profile.vector_mode
+        return "ub_exp" if profile.uses_simt else "sfu_exp"
+    return profile.vector_mode
+
+
+def _resolve_semantic_vector_rate(
+    profile: TileLangLoweringProfile,
+    cal: TileLangCalibration,
+    semantic: Sequence[SemanticWorkItem],
+    stage: Stage,
+    *,
+    op_id: str | None = None,
+    all_op_ids: frozenset[str] = frozenset(),
+    single_vector_op: bool = False,
+) -> tuple[str, float]:
+    stage_keys = {key for key in (op_id, stage.name) if key}
+    stage_items = tuple(item for item in semantic if item.work_id in stage_keys)
+    if stage_items:
+        cand = tuple(item for item in stage_items if item.kind in _SEMANTIC_VECTOR_KINDS)
+    else:
+        other_op_ids = all_op_ids - stage_keys
+        unscoped = tuple(
+            item for item in semantic
+            if item.kind in _SEMANTIC_VECTOR_KINDS and item.work_id not in other_op_ids
+        )
+        if unscoped and (single_vector_op or len({item.kind for item in unscoped}) == 1):
+            cand = unscoped
+        else:
+            cand = ()
+    if not cand:
+        mode = profile.vector_mode
+        return mode, cal.vector_gops_per_aiv(uses_simt=profile.uses_simt, op_kind=mode)
+    evaluated = tuple(
+        (
+            item,
+            mode := _semantic_item_vector_mode(profile, item),
+            cal.vector_gops_per_aiv(uses_simt=profile.uses_simt, op_kind=mode),
+        )
+        for item in cand
+    )
+    unique_modes = {mode for _, mode, _ in evaluated}
+    if len(unique_modes) == 1:
+        _, mode, rate = evaluated[0]
+        return mode, rate
+    weighted = tuple((float(item.logical_ops), rate) for item, _, rate in evaluated if item.logical_ops > 0)
+    if weighted:
+        total_ops = sum(ops for ops, _ in weighted)
+        total_time = sum(ops / rate for ops, rate in weighted)
+        eff_gops = total_ops / total_time
+    else:
+        eff_gops = min(rate for _, _, rate in evaluated)
+    return "mixed:" + "+".join(sorted(unique_modes)), eff_gops
+
+
 def _apply_tilelang_vector_rate(
     plan: Lowering, stage: Stage, pipe: str, role_for_binding: str, row: str,
     amount: float, bound: float, stage_meta: dict[str, Any],
+    semantic: Sequence[SemanticWorkItem] = (),
+    *,
+    op_id: str | None = None,
+    all_op_ids: frozenset[str] = frozenset(),
+    single_vector_op: bool = False,
 ) -> float:
     profile, cal = plan.tilelang_profile, plan.tilelang_calibration
     if profile is None or cal is None:
         return bound
     vec_mode = stage.metadata.get("tilelang_vector_mode")
+    tl_gops: float | None = None
     if vec_mode is None:
         if pipe == "vec_sfu":
-            vec_mode = "ub_exp" if profile.uses_simt else "sfu_exp"
+            vec_mode = (
+                profile.vector_mode
+                if profile.vector_mode in _TILELANG_EXP_MODES
+                else ("ub_exp" if profile.uses_simt else "sfu_exp")
+            )
         elif pipe == "vec_reduce":
             vec_mode = "reduce"
+        elif pipe in {"vector", "aiv_simt"}:
+            vec_mode, tl_gops = _resolve_semantic_vector_rate(
+                profile, cal, semantic, stage,
+                op_id=op_id, all_op_ids=all_op_ids, single_vector_op=single_vector_op,
+            )
         else:
             vec_mode = profile.vector_mode
-    tl_gops = cal.vector_gops_per_aiv(uses_simt=profile.uses_simt, op_kind=str(vec_mode))
+    if tl_gops is None:
+        tl_gops = cal.vector_gops_per_aiv(uses_simt=profile.uses_simt, op_kind=str(vec_mode))
     stage_meta["tilelang_api_tier"] = profile.api_tier
     stage_meta["tilelang_vector_mode"] = str(vec_mode)
     stage_meta["tilelang_vector_gops_per_aiv"] = tl_gops
@@ -1002,13 +1094,24 @@ def _apply_tilelang_vector_rate(
     return bound
 
 
-def _bind_declared_work(plan, stage, semantic):
+def _bind_declared_work(
+    plan, stage, semantic, *,
+    op_id: str | None = None,
+    all_op_ids: frozenset[str] = frozenset(),
+    single_vector_op: bool = False,
+):
     context = plan.context
     resource_names = context.resource_names if context else {}
     cube_row = resource_names.get("cube", "cube")
     work, placement, caps, units = Counter(), {}, {}, {}
     stage_meta = dict(stage.metadata)
-    physical_pipes = {resource_names.get(pipe, pipe): pipe for pipe in _VECTOR_PIPES}
+    physical_pipes: dict[str, str] = {}
+    for pipe_name in sorted(_VECTOR_PIPES):
+        phys = resource_names.get(pipe_name, pipe_name)
+        if phys in physical_pipes and physical_pipes[phys] != pipe_name:
+            physical_pipes[phys] = "vector"
+        else:
+            physical_pipes[phys] = pipe_name
     for role, amount in stage.work.items():
         if not amount:
             continue
@@ -1034,7 +1137,7 @@ def _bind_declared_work(plan, stage, semantic):
             bound = _apply_tilelang_cube_attainment(plan, stage, dtype, bound, stage_meta)
             unit = "peak_ms"
         else:
-            pipe = physical_pipes.get(role)
+            pipe = role if role in _VECTOR_PIPES else physical_pipes.get(role)
             if pipe is not None:
                 plan.vector[pipe] += stage.metadata.get(f"issued_{pipe}_ops", amount)
             bound = amount
@@ -1049,6 +1152,7 @@ def _bind_declared_work(plan, stage, semantic):
             if pipe is not None:
                 bound = _apply_tilelang_vector_rate(
                     plan, stage, pipe, role_for_binding, row, amount, bound, stage_meta,
+                    semantic, op_id=op_id, all_op_ids=all_op_ids, single_vector_op=single_vector_op,
                 )
             if unit is None:
                 unit = "ops" if pipe is not None else NATIVE_WORK_UNITS.get(role)

@@ -35,9 +35,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from contextvars import ContextVar
 from functools import lru_cache
-import time
 import hashlib
 import json
 from typing import Any, Mapping
@@ -216,16 +214,8 @@ def _runtime_signature(case: CaseSpec) -> tuple:
     )
 
 
-#: Cooperative per-candidate/outer sweep deadline.  Every pricing loop polls
-#: this value; no signal handler, thread or subprocess is involved.
-ACTIVE_DEADLINE_MONO: ContextVar[float | None] = ContextVar(
-    "mindie_sim_deadline_mono", default=None)
-
-
-def check_active_deadline() -> None:
-    deadline = ACTIVE_DEADLINE_MONO.get()
-    if deadline is not None and time.monotonic() > deadline:
-        raise TimeoutError("simulation_deadline_exceeded")
+#: Canonical cooperative per-candidate/outer sweep deadline (owned in L2 runtime).
+from .runtime.engine import ACTIVE_DEADLINE_MONO, check_active_deadline
 
 
 @dataclass(frozen=True)

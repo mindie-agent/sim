@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping
@@ -40,6 +40,7 @@ from mindie_sim.coverage import model_coverage
 from mindie_sim.catalog.config import flatten_config
 from mindie_sim.catalog.hf_config import model_value_formats
 from mindie_sim.catalog.specs import build_model_spec as _build_model_spec
+from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.fleet import (
     ARCHITECTURE_PRESET_ALIASES, ARCHITECTURE_PRESET_CATALOG,
     CORE_CATALOG_ENTRIES as CATALOG, CORE_MODEL_ALIASES as MODEL_ALIASES,
@@ -331,14 +332,51 @@ def _refresh_catalog_facts(spec: ModelSpec) -> ModelSpec:
     return spec
 
 
+def normalize_model(model: ModelSpec) -> ModelSpec:
+    quant = model.quant or QuantSpec(
+        name=model.quantization, weight_format=model.weight_dtype,
+        expert_weight_format=model.weight_dtype, activation_format=model.activation_dtype,
+        kv_dtype=model.kv_dtype,
+    )
+    if model.layer_plans:
+        if len(model.layer_plans) != model.layers:
+            raise ModelingError("layer_plan_count_differs_from_layers")
+        from mindie_sim.catalog.paired_sfa import normalize_formats
+        return normalize_formats(replace(model, quant=quant))
+    dimensions = {
+        "num_heads": model.num_heads, "num_kv_heads": model.num_kv_heads or model.num_heads,
+        "head_dim": model.head_dim, "intermediate_size": model.intermediate_size,
+        "num_experts": model.num_experts, "top_k": model.top_k,
+        "moe_intermediate_size": model.moe_intermediate_size,
+        "num_shared_experts": model.num_shared_experts,
+    }
+    if model.mla:
+        dimensions.update({
+            name: getattr(model.mla, name) for name in
+            ("q_lora_rank", "kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim",
+             "o_lora_rank", "o_groups")
+        })
+        dimensions.update(mla_variant="latent_mla", index_heads=model.mla.index_n_heads,
+                          index_dim=model.mla.index_head_dim, index_topk=model.mla.index_topk,
+                          indexer=bool(model.mla.index_topk), owns_index_k=bool(model.mla.index_topk),
+                          index_query_per_layer=bool(model.mla.index_topk))
+        dimensions.update(compress_ratio=model.mla.compress_ratio, window=model.mla.sliding_window,
+                          cache_kind="window_compressed" if model.mla.compress_ratio else "dense",
+                          compressor_kind="weighted_pool" if model.mla.compress_ratio else "none",
+                          compressor_state_rows=model.mla.compress_ratio)
+    attention = {"mha": "gqa", "dsa": "mla", "csa": "mla"}.get(model.attention, model.attention)
+    plans = tuple(LayerPlan(
+        index=index, attention=attention, ffn=model.ffn, architecture=attention,
+        kv_owner_layer_id=index, index_k_owner_layer_id=index, owns_long_kv=True, **dimensions,
+    ) for index in range(model.layers))
+    return replace(model, quant=quant, layer_plans=plans)
+
+
 def derive_expert_pruned(
     base_key: str | ModelSpec, *, num_experts: int, top_k: int,
     moe_intermediate_size: int | None = None, model_id: str | None = None,
 ) -> ModelSpec:
     """Immutable per-layer expert-prune of a catalog model."""
-    from dataclasses import replace
-    from mindie_sim.prediction.structure import normalize_model
-
     base = base_key if isinstance(base_key, ModelSpec) else load_model(base_key)
     base = normalize_model(base)
     e, k = int(num_experts), int(top_k)
@@ -374,9 +412,6 @@ def customize_model_spec(
     promote_dense_to_moe: bool = False,
 ) -> ModelSpec:
     """Deterministically scale body layer count and MoE expert geometry."""
-    from dataclasses import replace
-    from mindie_sim.prediction.structure import normalize_model
-
     base = (model if isinstance(model, ModelSpec)
             else ModelSpec.from_mapping(model) if isinstance(model, Mapping)
             else load_model(str(model)))
@@ -528,7 +563,6 @@ def sharded_weight_bytes(
 ) -> float:
     """Largest actual PP-stage per-rank weight footprint."""
     parallel.validate(model)
-    from mindie_sim.prediction.structure import normalize_model
     return _sharded(normalize_model(model), parallel, node_ranks, include_draft=include_draft, include_engram=include_engram)
 
 
@@ -564,6 +598,6 @@ def list_models() -> list[dict[str, Any]]:
 
 __all__ = [
     "CATALOG", "MODEL_ALIASES", "ARCHITECTURE_PRESET_CATALOG", "ARCHITECTURE_PRESET_ALIASES", "CONFIG_DIR", "LayerPlan",
-        "derive_expert_pruned", "customize_model_spec", "load_model", "list_models",
+    "normalize_model", "derive_expert_pruned", "customize_model_spec", "load_model", "list_models",
     "sharded_weight_bytes", "model_weight_detail", "stage_weight_terms", "body_weight_bytes", "body_parameter_count",
 ]
