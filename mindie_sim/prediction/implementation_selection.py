@@ -449,19 +449,20 @@ def _inherit_capture(ops, state, original):
                 value = dep_values[0]
         if value[0] is not None:
             generated[op.op_id] = value
-    result, segment, last_stage, last_captured = [], 0, None, False
+    result, segment, last_key = [], 0, None
     for op in ops:
-        captured, _ = generated.get(op.op_id, (None, None))
+        captured, orig_segment = generated.get(op.op_id, (None, None))
         if captured is None:
             result.append(op)
             continue
-        if op.stage != last_stage or bool(captured) != last_captured:
+        key = (op.stage, bool(captured), orig_segment)
+        if key != last_key:
             segment += 1
         metadata = dict(op.metadata)
         metadata["graph_captured"] = bool(captured)
         metadata["graph_segment"] = segment
         result.append(replace(op, metadata=tuple(metadata.items())))
-        last_stage, last_captured = op.stage, bool(captured)
+        last_key = key
     return tuple(result)
 
 
@@ -494,11 +495,66 @@ def _offset_segments(ops, offset: int) -> tuple[tuple, int]:
     return tuple(result), max_seg
 
 
+_DEFAULT_SPLITTING_OPS = frozenset({
+    "attention", "attention_qk", "attention_pv", "attention_softmax", "attention_merge",
+})
+
+
 def _capture_policy_key(scope: str, runtime) -> tuple[str, frozenset[str] | None]:
     raw_split = getattr(runtime, "splitting_ops", None)
     if raw_split is None and runtime is not None:
         raw_split = dict(getattr(runtime, "metadata", ()) or ()).get("splitting_ops")
     return (str(scope), None if raw_split is None else frozenset(raw_split))
+
+
+def _resolve_region_capture(
+    lowered_ops, pre_selected, selected, *, reg_scope, runtime, region_base, next_segment,
+):
+    """Assign region-local capture state to every lowered/generated op before joining regions."""
+    if not lowered_ops or all(op.op_id in pre_selected for op in lowered_ops):
+        return next_segment
+    raw_split = getattr(runtime, "splitting_ops", None)
+    split = set(raw_split) if raw_split is not None else _DEFAULT_SPLITTING_OPS
+    entries: list[tuple[object, bool, int | None]] = []
+    for op in lowered_ops:
+        if op.op_id in pre_selected:
+            cap, seg = pre_selected[op.op_id]
+            entries.append((op, bool(cap), seg))
+            continue
+        meta = dict(op.metadata)
+        members = meta.get("fusion_semantic_ids")
+        if members:
+            m_vals = [pre_selected[m] for m in members if m in pre_selected]
+            if m_vals and all(item == m_vals[0] for item in m_vals):
+                entries.append((op, bool(m_vals[0][0]), m_vals[0][1]))
+                continue
+        if meta.get("graph_captured") is not None and meta.get("graph_segment") is not None:
+            entries.append((op, bool(meta["graph_captured"]), int(meta["graph_segment"])))
+            continue
+        if op.op_id in selected and selected[op.op_id][0] is not None and selected[op.op_id][1] is not None:
+            cap, seg = selected[op.op_id]
+            entries.append((op, bool(cap), int(seg) + region_base))
+            continue
+        cap = (reg_scope == "full") or (op.family not in split and op.recipe not in split)
+        entries.append((op, bool(cap), None))
+    # Fill unresolved segments strictly within this region's contiguous (stage, captured) runs.
+    idx = 0
+    while idx < len(entries):
+        stage, cap = entries[idx][0].stage, entries[idx][1]
+        end = idx + 1
+        while end < len(entries) and entries[end][0].stage == stage and entries[end][1] == cap:
+            end += 1
+        known = [entries[j][2] for j in range(idx, end) if entries[j][2] is not None]
+        if known:
+            fallback_seg = known[0]
+        else:
+            fallback_seg = next_segment
+            next_segment += 1
+        for j in range(idx, end):
+            op_j, cap_j, seg_j = entries[j]
+            selected[op_j.op_id] = (cap_j, fallback_seg if seg_j is None else seg_j)
+        idx = end
+    return next_segment
 
 
 def lower_regions(regions, *, graph, replay_scope, runtime, prefix=(),
@@ -523,6 +579,7 @@ def lower_regions(regions, *, graph, replay_scope, runtime, prefix=(),
         for region, reg_scope in zip(regions, region_scopes)
     ]
     heterogeneous_scopes = any(key != base_key for key in region_keys)
+    any_captured = replay_scope != "none" or any(sc != "none" for sc in region_scopes)
     if not heterogeneous_scopes:
         actual = tuple(prefix_ops) + tuple(
             op for ops, _ in inserted_regions for op in ops)
@@ -533,7 +590,16 @@ def lower_regions(regions, *, graph, replay_scope, runtime, prefix=(),
         annotated_regions = [tuple(islice(annotated_iter, len(ops)))
                              for ops, _ in inserted_regions]
     else:
-        annotated_prefix = graph.apply(prefix_ops, replay_scope, runtime) if prefix_ops else ()
+        join_prefix_with_first = (
+            bool(prefix_ops)
+            and bool(regions)
+            and replay_scope != "none"
+            and region_keys[0] == base_key
+        )
+        annotated_prefix = (
+            () if join_prefix_with_first
+            else (graph.apply(prefix_ops, replay_scope, runtime) if prefix_ops else ())
+        )
         seg_offset = max(
             (int(dict(op.metadata).get("graph_segment") or 0) for op in annotated_prefix),
             default=0,
@@ -545,36 +611,56 @@ def lower_regions(regions, *, graph, replay_scope, runtime, prefix=(),
             reg_key = region_keys[idx]
             if reg_scope == "none":
                 ops_i = inserted_regions[idx][0]
-                annotated_regions[idx] = _mark_eager_region_ops(ops_i) if replay_scope != "none" else tuple(ops_i)
+                annotated_regions[idx] = _mark_eager_region_ops(ops_i) if any_captured else tuple(ops_i)
                 idx += 1
                 continue
             group_end = idx + 1
             while group_end < len(regions) and region_keys[group_end] == reg_key:
                 group_end += 1
-            group_ops = tuple(op for j in range(idx, group_end) for op in inserted_regions[j][0])
+            lead_prefix = prefix_ops if (idx == 0 and join_prefix_with_first) else ()
+            group_ops = lead_prefix + tuple(
+                op for j in range(idx, group_end) for op in inserted_regions[j][0]
+            )
             ann_group = graph.apply(group_ops, reg_scope, regions[idx].runtime) if group_ops else ()
             ann_group, seg_offset = _offset_segments(ann_group, seg_offset)
             g_iter = iter(ann_group)
+            if lead_prefix:
+                annotated_prefix = tuple(islice(g_iter, len(lead_prefix)))
             for j in range(idx, group_end):
                 annotated_regions[j] = tuple(islice(g_iter, len(inserted_regions[j][0])))
             idx = group_end
         annotated_actual = annotated_prefix + tuple(op for ann in annotated_regions for op in ann)
         state = _capture_values(annotated_actual)
+    next_segment = max(
+        (int(seg) for _cap, seg in state.values() if seg is not None),
+        default=0,
+    ) + 1
     lowered = []
     for region, (_, preactivated), annotated, reg_scope in zip(
             regions, inserted_regions, annotated_regions, region_scopes):
         selected = {op.op_id: state[op.op_id] for op in annotated
                     if op.op_id in state}
+        pre_selected = dict(selected)
+        region_base = min(
+            (int(seg) for _cap, seg in pre_selected.values() if seg is not None),
+            default=1,
+        ) - 1
         lowered_ops = lower_implementations(
             annotated, region.runtime, region.source_dtype,
             resource_fusion=False, local_tokens=region.local_tokens,
             replay_scope=reg_scope, capture_state=selected,
             skip_passes=("activation_quantization",),
             preactivated=preactivated)
-        if reg_scope == "none" and replay_scope != "none":
+        if reg_scope == "none" and any_captured:
             lowered_ops = _mark_eager_region_ops(lowered_ops)
             for op in lowered_ops:
                 selected[op.op_id] = (False, None)
+        elif reg_scope != "none":
+            next_segment = _resolve_region_capture(
+                lowered_ops, pre_selected, selected,
+                reg_scope=reg_scope, runtime=region.runtime,
+                region_base=region_base, next_segment=next_segment,
+            )
         lowered.append(lowered_ops)
         state.update(selected)
     lowered = [apply_capture_state(ops, state) for ops in lowered]
@@ -596,7 +682,7 @@ def lower_regions(regions, *, graph, replay_scope, runtime, prefix=(),
     else:
         for ops in lowered:
             result.extend(ops)
-    if replay_scope != "none" or any(sc != "none" for sc in region_scopes):
+    if any_captured:
         result = apply_capture_inheritance(tuple(result), state, annotated_actual)
     selections = selection_delivery(
         tuple(result), tuple(record for region in regions
