@@ -116,12 +116,10 @@ def assignments(cfg, owner):
         if cfg.special:
             if group != cursor:
                 continue
+            cursor += cfg.blocks
             if not rows:
-                if any(cfg.rows[g] for g in range(group + cfg.blocks, len(cfg.rows), cfg.blocks)):
-                    raise ModelingError('arch35_dequant_zero_group_stalls_later_source_owner')
                 continue
             count = rows
-            cursor += cfg.blocks
         else:
             count = max(0, min(ceildiv(rows, cfg.blocks), rows - owner*ceildiv(rows, cfg.blocks)))
         if count:

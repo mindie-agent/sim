@@ -102,8 +102,14 @@ SOURCES: tuple[SourceRef, ...] = (
 
 ARCH_ID = ArchId("npu_arch_3510")
 GMM2_LAG_MIN_TOKEN_NUM = 4096
+GMM2_LAG_SPECIALIZATIONS = frozenset({
+    "MegaMoeA16W16Wave", "MegaMoeA8W8Wave", "MegaMoeA8W4Wave",
+})
 MEGA_MOE_WAVE_TILE = 256
+MEGA_MOE_PREFETCH_SUBTILE_M = 128
 GMM1_WAVE_N_TILES_PER_CORE = 4
+MEGA_MOE_META_INFO_ELEMENTS = 8
+MEGA_MOE_META_INFO_BYTES = MEGA_MOE_META_INFO_ELEMENTS * INT32_HANDOFF_BYTES_PER_ELEM
 FP4_DTYPES = frozenset({"fp4", "fp4_e2m1", "mxfp4"})
 FP8_E4M3_COMPAT_DTYPES = frozenset({"fp8", "fp8_e4m3", "mxfp8", "hif8"})
 A8W4_NZ_LAYOUTS = frozenset({"FRACTAL_NZ_C0_32", "FRACTAL_NZ", "NZ"})
@@ -231,6 +237,18 @@ def _validate(op, ctx, contract):
             raise capability_gap(op, ctx, f"arch35_dequant_input:{contract.handoff_dtype}")
 
 
+def _is_a8w4_routed(contract) -> bool:
+    return (
+        contract.mode in ROUTED_MODES
+        and contract.dtype_a in FP8_E4M3_COMPAT_DTYPES
+        and contract.dtype_b in FP4_DTYPES
+    )
+
+
+def _uses_gm_handoff(contract) -> bool:
+    return contract.mode in ROUTED_MODES and (contract.topk_weights_type == 1 or _is_a8w4_routed(contract))
+
+
 def fit_ub(contract, ctx):
     """Reserve the largest AIV share of a handoff and leave room for DBO credits."""
     capacity = ctx.datapath.usable_bytes("ub")
@@ -239,21 +257,42 @@ def fit_ub(contract, ctx):
     # Ascend AIV upcasts BF16/FP16 handoffs to FP32 (4B/elem) inside UB for
     # gated activations and quantization scale math.
     working_elem = max(INT32_HANDOFF_BYTES_PER_ELEM, element_bytes(1, contract.handoff_dtype))
-    accum_bytes = contract.activation_divisor * working_elem
-    columns = min(contract.intermediate, contract.base_n)
-    # Reduce M before N so independently stored MX scales remain group aligned.
-    if columns < contract.intermediate and contract.uses_mx_scales:
-        columns = columns // MX_SCALE_GROUP_SIZE * MX_SCALE_GROUP_SIZE
+    full_n_tiling = contract.mode in ROUTED_MODES
+    gm_handoff = _uses_gm_handoff(contract)
+    if full_n_tiling:
+        columns = min(contract.n, contract.base_n)
+        col_align = contract.activation_divisor * (MX_SCALE_GROUP_SIZE if contract.uses_mx_scales else 1)
+        if columns < contract.n:
+            columns = columns // col_align * col_align
+        row_bytes = columns * working_elem + (
+            MEGA_MOE_META_INFO_BYTES if contract.topk_weights_type == 1 else 0
+        )
+        consumers = 1
+    else:
+        accum_bytes = contract.activation_divisor * working_elem
+        columns = min(contract.intermediate, contract.base_n)
+        # Reduce M before N so independently stored MX scales remain group aligned.
+        if columns < contract.intermediate and contract.uses_mx_scales:
+            columns = columns // MX_SCALE_GROUP_SIZE * MX_SCALE_GROUP_SIZE
+        row_bytes = columns * accum_bytes
+        consumers = MX_AIVS_PER_AIC
     if not columns:
         raise ModelingError("grouped_moe_arch35_ub_tile_width_invalid")
     rows = min(contract.base_m, max(contract.group_rows, default=1) or 1)
-    consumers = MX_AIVS_PER_AIC if contract.mode == "gmm_swiglu_quant" else 1
-    limit = consumers * (capacity // (accum_bytes * columns))
+    if gm_handoff:
+        # When AIC publishes GMM1 output to GM (topk_weights_type=1 or A8W4),
+        # AIV reads back in bounded subtiles without shrinking the AIC cube grid.
+        max_aiv_rows = capacity // row_bytes
+        if max_aiv_rows < 1:
+            raise ModelingError("grouped_moe_arch35_ub_tile_does_not_fit")
+        sub_cap = MEGA_MOE_PREFETCH_SUBTILE_M if contract.topk_weights_type == 1 else rows
+        return replace(contract, base_m=rows, base_n=columns), min(rows, sub_cap, max_aiv_rows) * row_bytes
+    limit = consumers * (capacity // row_bytes)
     if rows > limit:
         rows = limit // FRACTAL_M_DIM * FRACTAL_M_DIM
     if not rows:
         raise ModelingError("grouped_moe_arch35_ub_tile_does_not_fit")
-    return replace(contract, base_m=rows, base_n=columns), ceil_div(rows, consumers) * columns * accum_bytes
+    return replace(contract, base_m=rows, base_n=columns), ceil_div(rows, consumers) * row_bytes
 
 
 def _gated_stages(
@@ -262,8 +301,12 @@ def _gated_stages(
 ):
     """Lower paired MMADs with a UB credit and an AIV acknowledgement per tile."""
     tiled, slot_bytes = fit_ub(contract, ctx)
-    n_alignment = MX_SCALE_GROUP_SIZE if contract.uses_mx_scales else 1
-    schedule = matrix_schedule(tiled, ctx, contract.group_rows, contract.intermediate,
+    full_n_tiling = contract.mode in ROUTED_MODES
+    is_a8w4 = _is_a8w4_routed(contract)
+    divisor = contract.activation_divisor
+    schedule_n = contract.n if full_n_tiling else contract.intermediate
+    n_alignment = (divisor if full_n_tiling else 1) * (MX_SCALE_GROUP_SIZE if contract.uses_mx_scales else 1)
+    schedule = matrix_schedule(tiled, ctx, contract.group_rows, schedule_n,
                                contract.k, start_core=start_core, n_tail_alignment=n_alignment)
     gmm, activation = name + "gmm1", name + "swiglu_quant"
     gmm_ends, stores, stages = [], [], []
@@ -272,7 +315,7 @@ def _gated_stages(
     for group in schedule.groups:
         split_group = group if tiled.tail_split else replace(group, tail_tiles=0)
         for task, rows, columns, column in blaze_tasks(
-            split_group, contract.intermediate, tiled.base_m, tiled.base_n,
+            split_group, schedule_n, tiled.base_m, tiled.base_n,
             tiled.m_tail_cnt, tiled.n_tail_cnt, n_alignment,
         ):
             owner = (group.start_core + task) % ctx.effective_aic_cores
@@ -281,6 +324,10 @@ def _gated_stages(
                 if len(paired) != MX_AIVS_PER_AIC or max(paired) >= ctx.effective_aiv_cores:
                     raise ModelingError("grouped_moe_arch35_mx_requires_paired_aivs")
                 consumers = paired
+            elif is_a8w4:
+                # A8W4 uses AIV0 for FP4->FP8 weight prologue and AIV1 for activation epilogue.
+                fallback = owner * ctx.effective_aiv_cores // ctx.effective_aic_cores
+                consumers = (paired[1] if len(paired) >= MX_AIVS_PER_AIC else (paired[0] if paired else fallback),)
             else:
                 consumers = (paired[0] if paired else owner * ctx.effective_aiv_cores // ctx.effective_aic_cores,)
             key = f"e{group.expert}:t{task}"
@@ -288,15 +335,16 @@ def _gated_stages(
             body, fixpipe, done = _paired_tile(
                 contract, gmm, activation, key, deps, rows, columns, column,
                 owner, consumers, slot_bytes, metadata,
-                pertoken_v2=pertoken_v2, weight_scale_dtype=weight_scale_dtype,
+                full_n_tiling=full_n_tiling, pertoken_v2=pertoken_v2, weight_scale_dtype=weight_scale_dtype,
             )
             stages.extend(body)
             gmm_ends.append(fixpipe)
             stores.extend(done)
             previous[owner] = done
-    divisor = contract.activation_divisor
+    flops_scale = 1 if full_n_tiling else divisor
     stages.append(StageDemand(gmm, tuple(gmm_ends) or after, metadata=(*metadata,
-        ("useful_flops", divisor * schedule.useful_flops), ("issued_fractals", divisor * schedule.issued_fractals),
+        ("useful_flops", flops_scale * schedule.useful_flops),
+        ("issued_fractals", flops_scale * schedule.issued_fractals),
         ("max_waves", schedule.max_waves), ("wave_tail_imbalance", schedule.wave_tail_imbalance),
     )))
     if pertoken_v2 and contract.m:
@@ -329,54 +377,62 @@ def _gated_stages(
 
 def _paired_tile(contract, gmm, activation, key, after, rows, columns, column,
                  owner, consumers, slot_bytes, metadata, *,
-                 pertoken_v2: bool = False, weight_scale_dtype: str = "fp32"):
+                 full_n_tiling: bool = False, pertoken_v2: bool = False, weight_scale_dtype: str = "fp32"):
     divisor = contract.activation_divisor
+    gm_handoff = full_n_tiling and _uses_gm_handoff(contract)
+    prefetch_weights = full_n_tiling and contract.topk_weights_type == 1
+    full_cols = columns if full_n_tiling else columns * divisor
+    out_cols = columns // divisor if full_n_tiling else columns
+    out_col = column // divisor if full_n_tiling else column
     input_scaled = contract.dtype_a == "int8" and (contract.mode in ROUTED_MODES or pertoken_v2)
-    weight_k, weight_n = contract.k, columns
+    weight_k, weight_n = contract.k, out_cols
     if contract.padded_weight:
         k0 = fractal_k0(contract.dtype_b)
         k_align, n_align = (k0, FRACTAL_N_DIM) if contract.transpose_weight else (FRACTAL_M_DIM, k0)
         weight_k = ceil_div(weight_k, k_align) * k_align
         weight_n = ceil_div(weight_n, n_align) * n_align
-    operand_bytes = divisor * (
-        tensor_bytes(
-            rows, contract.k, contract.dtype_a, scaled=input_scaled,
-            mx_scaled=contract.act_mx_scaled, mx_padded=contract.act_mx_padded,
-        )
-        + tensor_bytes(
-            weight_n, weight_k, contract.dtype_b,
-            mx_scaled=contract.weight_mx_scaled, mx_padded=contract.weight_mx_padded,
-        )
+    a_bytes = tensor_bytes(
+        rows, contract.k, contract.dtype_a, scaled=input_scaled,
+        mx_scaled=contract.act_mx_scaled, mx_padded=contract.act_mx_padded,
     )
-    _, issued = fractal_issues(rows, columns, contract.k, contract.compute_dtype)
-    fix_bytes = rows * element_bytes(columns * divisor, contract.handoff_dtype)
+    b_bytes = tensor_bytes(
+        weight_n, weight_k, contract.dtype_b,
+        mx_scaled=contract.weight_mx_scaled, mx_padded=contract.weight_mx_padded,
+    )
+    operand_bytes = (a_bytes + divisor * b_bytes) if full_n_tiling else divisor * (a_bytes + b_bytes)
+    if full_n_tiling:
+        _, issued_flops = fractal_issues(rows, full_cols, contract.k, contract.compute_dtype)
+    else:
+        _, issued = fractal_issues(rows, out_cols, contract.k, contract.compute_dtype)
+        issued_flops = divisor * issued
+    fix_row_bytes = element_bytes(full_cols, contract.handoff_dtype)
+    fix_bytes = rows * fix_row_bytes
     quantized = contract.quant_dtype not in FLOAT_EPILOGUE_DTYPES
     if pertoken_v2:
         # Pass 1 dequantizes with channel scales + SwiGLU and writes FP32 GM workspace.
-        ops_per_row = columns * ACTIVATION_OPS[contract.activation]
-        output_per_row = columns * INT32_HANDOFF_BYTES_PER_ELEM
+        ops_per_row = out_cols * ACTIVATION_OPS[contract.activation]
+        output_per_row = out_cols * INT32_HANDOFF_BYTES_PER_ELEM
     else:
-        ops_per_row = columns * (
-            ACTIVATION_OPS[contract.activation] + (QUANT_OPS_PER_ELEMENT if quantized else 0)
-        )
-        output_per_row = element_bytes(columns, contract.quant_dtype)
+        extra_ops = (QUANT_OPS_PER_ELEMENT if quantized else 0) + (1 if prefetch_weights else 0)
+        ops_per_row = out_cols * (ACTIVATION_OPS[contract.activation] + extra_ops)
+        output_per_row = element_bytes(out_cols, contract.quant_dtype)
         if contract.uses_mx_scales:
-            end_column = column + columns
+            end_column = out_col + out_cols
             # Interior tiles write valid groups; only the last tile writes row padding.
             output_per_row += mx_scale_bytes(end_column, padded=end_column == contract.intermediate)
-            output_per_row -= mx_scale_bytes(column, padded=False)
+            output_per_row -= mx_scale_bytes(out_col, padded=False)
     base = f"{gmm}:{key}"
     read, cube, flag = (f"{base}:{phase}" for phase in ("read", "cube", "fixpipe"))
     stages = [
         StageDemand(read, after, Work(resources={
             "hbm": operand_bytes, "l2": operand_bytes, "mte2_aic": operand_bytes,
         }), "aic", owner, metadata),
-        StageDemand(cube, (read,), Work({contract.compute_dtype: divisor * issued},
-                                       {"mte1": operand_bytes}), "aic", owner, metadata),
+        StageDemand(cube, (read,), Work({contract.compute_dtype: issued_flops},
+                                        {"mte1": operand_bytes}), "aic", owner, metadata),
     ]
     credits, done, epilogue = [], [], []
     rows_per_aiv = ceil_div(rows, len(consumers))
-    tile_ch_scale_bytes = element_bytes(columns * divisor, weight_scale_dtype) if pertoken_v2 else 0
+    tile_ch_scale_bytes = element_bytes(full_cols, weight_scale_dtype) if pertoken_v2 else 0
     for subblock, aiv in enumerate(consumers):
         prefix = f"{activation}:{key}:aiv{aiv}"
         credit, vector, store, sync = (f"{prefix}:{phase}" for phase in ("credit", "vector", "store", "sync"))
@@ -384,15 +440,26 @@ def _paired_tile(contract, gmm, activation, key, after, rows, columns, column,
         slot = (f"{gmm}:aic{owner}:handoff:aiv{aiv}", slot_bytes)
         tag = (*metadata, ("aiv_consumer", aiv), ("subblock", subblock), ("rows", active))
         if active:
-            stages.append(StageDemand(credit, after, kind="aiv", owner=aiv, metadata=tag, ub_acquire=slot))
-            credits.append(credit)
-            vec_deps = (flag,)
-            if pertoken_v2 and tile_ch_scale_bytes:
-                scale_stage = f"{prefix}:weight_scale"
-                epilogue.append(StageDemand(scale_stage, (flag,), Work(resources={
-                    "hbm": tile_ch_scale_bytes, "l2": tile_ch_scale_bytes, "mte2_aiv": tile_ch_scale_bytes,
-                }), "aiv", aiv, tag))
-                vec_deps = (scale_stage,)
+            if gm_handoff:
+                gm_read = f"{prefix}:read"
+                rd_bytes = active * (fix_row_bytes + (MEGA_MOE_META_INFO_BYTES if prefetch_weights else 0))
+                epilogue.extend((
+                    StageDemand(credit, (flag,), kind="aiv", owner=aiv, metadata=tag, ub_acquire=slot),
+                    StageDemand(gm_read, (credit,), Work(resources={
+                        "hbm": rd_bytes, "l2": rd_bytes, "mte2_aiv": rd_bytes,
+                    }), "aiv", aiv, tag),
+                ))
+                vec_deps = (gm_read,)
+            else:
+                stages.append(StageDemand(credit, after, kind="aiv", owner=aiv, metadata=tag, ub_acquire=slot))
+                credits.append(credit)
+                vec_deps = (flag,)
+                if pertoken_v2 and tile_ch_scale_bytes:
+                    scale_stage = f"{prefix}:weight_scale"
+                    epilogue.append(StageDemand(scale_stage, (flag,), Work(resources={
+                        "hbm": tile_ch_scale_bytes, "l2": tile_ch_scale_bytes, "mte2_aiv": tile_ch_scale_bytes,
+                    }), "aiv", aiv, tag))
+                    vec_deps = (scale_stage,)
             output = active * output_per_row
             epilogue.extend((
                 StageDemand(vector, vec_deps, Work(resources={"vector": active * ops_per_row}), "aiv", aiv, tag),
@@ -404,13 +471,21 @@ def _paired_tile(contract, gmm, activation, key, after, rows, columns, column,
         epilogue.append(StageDemand(sync, (store if active else flag,), kind="aiv", owner=aiv,
                                     metadata=tag, ub_release=slot if active else None))
         done.append(sync)
-    # Join the independent UB grants before publishing one accumulator tile.
-    admitted = f"{base}:admitted"
-    stages.extend((
-        StageDemand(admitted, tuple(credits), metadata=metadata),
-        StageDemand(flag, (cube, admitted), Work(resources={"fixpipe": fix_bytes}), "aic", owner, metadata),
-        *epilogue,
-    ))
+    if gm_handoff:
+        stages.extend((
+            StageDemand(flag, (cube,), Work(resources={
+                "hbm": fix_bytes, "l2": fix_bytes, "fixpipe": fix_bytes,
+            }), "aic", owner, metadata),
+            *epilogue,
+        ))
+    else:
+        # Join the independent UB grants before publishing one accumulator tile.
+        admitted = f"{base}:admitted"
+        stages.extend((
+            StageDemand(admitted, tuple(credits), metadata=metadata),
+            StageDemand(flag, (cube, admitted), Work(resources={"fixpipe": fix_bytes}), "aic", owner, metadata),
+            *epilogue,
+        ))
     return stages, flag, tuple(done)
 
 
@@ -418,7 +493,7 @@ def _wave_histograms(contract, aic_cores):
     """Cut expert rows at the common GMM1 M-group budget for a wave."""
     m_group = 1 if contract.wave_rows else MEGA_MOE_WAVE_TILE
     groups_per_wave = contract.wave_rows or max(
-        ceil_div(aic_cores * GMM1_WAVE_N_TILES_PER_CORE, ceil_div(contract.intermediate, MEGA_MOE_WAVE_TILE)),
+        ceil_div(aic_cores * GMM1_WAVE_N_TILES_PER_CORE, ceil_div(contract.n, MEGA_MOE_WAVE_TILE)),
         ceil_div(aic_cores, ceil_div(contract.k, MEGA_MOE_WAVE_TILE)),
     )
     batch = [0] * len(contract.group_rows)
@@ -463,6 +538,30 @@ def _routed_stages(ctx, specialization, contract, name, after, metadata, transpo
     owner_ready = {}
     gmm1_core = gmm2_core = 0
     gmm1_ends, activation_ends, waves = [], [], []
+    gmm2_ends, wave_combines = [], []
+    lag = specialization in GMM2_LAG_SPECIALIZATIONS and contract.tokens >= GMM2_LAG_MIN_TOKEN_NUM
+
+    def emit_gmm2(wave_idx, extra_deps=()):
+        nonlocal gmm2_core
+        w_prefix, w_active, w_route_md = waves[wave_idx]
+        deps = (activation_ends[wave_idx], *gmm2_ends[-1:], *extra_deps)
+        schedule = matrix_schedule(
+            contract, ctx, w_active.group_rows, contract.k, contract.intermediate, start_core=gmm2_core,
+            n_tail_alignment=_nz_tail_alignment(contract),
+        )
+        gmm2_core = schedule.groups[-1].end_block % ctx.effective_aic_cores
+        gmm2_ends.append(w_prefix + "gmm2")
+        stages.extend(matrix_stages(
+            gmm2_ends[-1], deps, contract, schedule, contract.intermediate,
+            contract.output_dtype, input_dtype=contract.quant_dtype,
+            input_scaled=contract.quant_dtype == "int8", metadata=(*cohort, ("wave", wave_idx)),
+        ))
+        if wave_count > 1 and not batch_combine:
+            wave_combines.append(w_prefix + "combine")
+            stages.extend(routing_stages(wave_combines[-1], (gmm2_ends[-1],), w_active,
+                                         w_route_md, transport_builder,
+                                         publish_output=False, read_counts=False))
+
     offset = 0
     for wave, rows in enumerate(_wave_histograms(contract, ctx.effective_aic_cores)):
         prefix = name if wave_count == 1 else f"{name}wave{wave}_"
@@ -481,36 +580,23 @@ def _routed_stages(ctx, specialization, contract, name, after, metadata, transpo
             last_dispatch = (ready,)
             dispatch_ends.append(ready)
         wave_metadata = (*cohort, ("wave", wave))
+        gmm1_after = (ready, gmm2_ends[-1]) if (lag and gmm2_ends) else (ready,)
         body, schedule = _gated_stages(
-            active, ctx, prefix, (ready,), wave_metadata, start_core=gmm1_core, owner_ready=owner_ready,
+            active, ctx, prefix, gmm1_after, wave_metadata, start_core=gmm1_core, owner_ready=owner_ready,
         )
         gmm1_core = schedule.groups[-1].end_block % ctx.effective_aic_cores
         stages.extend(body)
         gmm1_ends.append(prefix + "gmm1")
         activation_ends.append(prefix + "swiglu_quant")
         waves.append((prefix, active, route_metadata))
-    gmm2_ends, wave_combines = [], []
-    lag = specialization == "MegaMoeA8W8Wave" and contract.tokens >= GMM2_LAG_MIN_TOKEN_NUM
-    for wave, (prefix, active, route_metadata) in enumerate(waves):
-        deps = (activation_ends[wave], *gmm2_ends[-1:])
-        if lag and wave + 1 < wave_count:
-            deps += (gmm1_ends[wave + 1],)
-        schedule = matrix_schedule(
-            contract, ctx, active.group_rows, contract.k, contract.intermediate, start_core=gmm2_core,
-            n_tail_alignment=_nz_tail_alignment(contract),
-        )
-        gmm2_core = schedule.groups[-1].end_block % ctx.effective_aic_cores
-        gmm2_ends.append(prefix + "gmm2")
-        stages.extend(matrix_stages(
-            gmm2_ends[-1], deps, contract, schedule, contract.intermediate,
-            contract.output_dtype, input_dtype=contract.quant_dtype,
-            input_scaled=contract.quant_dtype == "int8", metadata=(*cohort, ("wave", wave)),
-        ))
-        if wave_count > 1 and not batch_combine:
-            wave_combines.append(prefix + "combine")
-            stages.extend(routing_stages(wave_combines[-1], (gmm2_ends[-1],), active,
-                                         route_metadata, transport_builder,
-                                         publish_output=False, read_counts=False))
+        if lag and wave > 0:
+            # CANN wave loop: GMM1(w) -> GMM2(w-1) -> GMM1(w+1).
+            emit_gmm2(wave - 1, (gmm1_ends[wave],))
+    if lag:
+        emit_gmm2(wave_count - 1)
+    else:
+        for wave in range(wave_count):
+            emit_gmm2(wave)
     if wave_count == 1:
         combine_after = (name + "gmm2",)
     else:
@@ -548,6 +634,7 @@ def _shared_stages(stages, ctx, contract, name, after, metadata):
         weight_mx_scaled=contract.shared_weight_dtype in MX_DTYPES,
         act_mx_padded=True,
         weight_mx_padded=True,
+        topk_weights_type=0,
     )
     prefix = name + "shared_"
     body, _ = _gated_stages(shared, ctx, prefix, after, metadata)
@@ -789,7 +876,16 @@ class _Arch35Strategy:
                     contract.m or contract.tokens or any(contract.transport_bytes) or transport_builder
                 ) else []
             metadata["wave_specialization"] = specialization
-            metadata["gm_handoff_eliminated_bytes"] = 2 * contract.m * contract.n * INT32_HANDOFF_BYTES_PER_ELEM
+            metadata["topk_weights_type"] = contract.topk_weights_type
+            if _uses_gm_handoff(contract):
+                metadata["gm_handoff_bytes"] = (
+                    _GATED_ACTIVATION_DIVISOR * contract.m * element_bytes(contract.n, contract.handoff_dtype)
+                )
+                metadata["gm_handoff_eliminated_bytes"] = 0
+            else:
+                metadata["gm_handoff_eliminated_bytes"] = (
+                    _GATED_ACTIVATION_DIVISOR * contract.m * contract.n * INT32_HANDOFF_BYTES_PER_ELEM
+                )
             implementation = self.abi
         return make_plan(implementation, ctx, stages, self.sources, metadata=metadata)
 

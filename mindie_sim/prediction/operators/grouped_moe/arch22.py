@@ -18,11 +18,11 @@ from mindie_sim.schema.operators import OpSpec
 from ...mechanism import OperatorPlan, Work
 from ..contracts import ArchStrategy, OperatorPlanningContext
 from .common import (
-    FUSED_MC2_SHARED_MODE, GEMM_MODES, INT32_HANDOFF_BYTES_PER_ELEM, MX_DTYPES,
-    ROUTED_MODES, SHIPPING_MEGAMOE_ACTIVATIONS, SHIPPING_SWIGLU_QUANT_ACTIVATIONS,
-    activation_stages, capability_gap,
-    PER_TOKEN_SCALE_BYTES, StageDemand, contract_fields, element_bytes, make_plan, matrix_schedule,
-    matrix_stages, validate_contract, vector_stages,
+    ACTIVATION_OPS, FUSED_MC2_SHARED_MODE, GEMM_MODES, INT32_HANDOFF_BYTES_PER_ELEM, MX_DTYPES,
+    PER_TOKEN_SCALE_BYTES, QUANT_OPS_PER_ELEMENT, ROUTED_MODES, SHIPPING_MEGAMOE_ACTIVATIONS,
+    SHIPPING_SWIGLU_QUANT_ACTIVATIONS, StageDemand, activation_stages, capability_gap,
+    contract_fields, element_bytes, make_plan, matrix_schedule, matrix_stages, tensor_bytes,
+    validate_contract, vector_stages,
 )
 
 from .lowering import DualBatchMoEPipeline, routing_stages
@@ -79,7 +79,11 @@ MATRIX_DTYPES = frozenset({"fp32", "bf16", "fp16", "int8", "w4a8", "int4"})
 ROUTED_DTYPES = frozenset({"bf16", "int8", "w4a8"})
 ARCH22_MEGAMOE_EP_WORLD_SIZES = frozenset({2, 4, 8, 16, 32, 48, 64, 96, 128})
 AIV_INPUT_DTYPES = frozenset({"int32", "fp16", "bf16", "fp32"})
+A8W8_WEIGHT_SCALE_DTYPES = frozenset({"fp32", "fp16", "bf16"})
 XLLM_GATED_ABI = "aclnnMoeGroupedMatmulSwigluQuant"
+V2_GATED_ABI = "aclnnGroupedMatmulSwigluQuantV2"
+_V1_USER_WORKSPACE_LIMIT_BYTES = 64 * 1024 * 1024
+_V1_DOUBLE_WORKSPACE_SPLIT = 2
 _GATED_ACTIVATION_DIVISOR = 2
 _MSD_ROW_MULTIPLIER = 2
 _MSD_SPLIT_OPS_PER_ELEMENT = 2
@@ -177,6 +181,9 @@ def _validate(op, ctx, contract):
             raise capability_gap(op, ctx, "arch22_gated_int32_accumulator")
         if contract.matrix_weight_dtype == "int8" and not contract.padded_weight:
             raise capability_gap(op, ctx, "arch22_a8w8_swiglu_quant_requires_nz_weight")
+        if (contract.abi != XLLM_GATED_ABI and not _is_a8w4_msd(contract)
+                and contract.weight_scale_dtype not in A8W8_WEIGHT_SCALE_DTYPES):
+            raise capability_gap(op, ctx, f"arch22_a8w8_weight_scale_dtype:{contract.weight_scale_dtype}")
     if contract.mode in ROUTED_MODES | {"gmm_swiglu_quant"}:
         if fields.get("mask_routing") or fields.get("mask_blocked_output"):
             raise capability_gap(op, ctx, "arch22_mask_routing")
@@ -202,6 +209,81 @@ def _validate(op, ctx, contract):
             max_width = _dequant_max_input_width(ub_bytes, fields)
             if contract.n > max_width:
                 raise capability_gap(op, ctx, f"arch22_dequant_ub_width_exceeds_limit:{contract.n}:{max_width}")
+
+
+def _chunk_group_rows(rows: tuple[int, ...], max_rows: int) -> list[tuple[int, ...]]:
+    chunks, current, used = [], [], 0
+    for count in rows:
+        rem = count
+        while rem > 0:
+            take = min(rem, max_rows - used)
+            current.append(take)
+            used += take
+            rem -= take
+            if used == max_rows:
+                chunks.append(tuple(current))
+                current, used = [], 0
+    if current:
+        chunks.append(tuple(current))
+    return chunks
+
+
+def _v1_a8w8_activation_stages(name, preload_after, barrier_after, ctx, contract, metadata):
+    if not contract.m:
+        return [StageDemand(name, barrier_after, metadata=metadata)]
+    scale_bytes = element_bytes(contract.n, contract.weight_scale_dtype)
+    cast_ops = 0 if contract.weight_scale_dtype == "fp32" else contract.n
+    row_read = element_bytes(contract.n, contract.handoff_dtype) + PER_TOKEN_SCALE_BYTES
+    width = contract.intermediate
+    quantized = contract.quant_dtype not in {"bf16", "fp16"}
+    row_compute = width * (ACTIVATION_OPS[contract.activation] + (QUANT_OPS_PER_ELEMENT if quantized else 0))
+    row_write = tensor_bytes(1, width, contract.quant_dtype, scaled=quantized)
+    m_limit = (_V1_USER_WORKSPACE_LIMIT_BYTES // _V1_DOUBLE_WORKSPACE_SPLIT // INT32_HANDOFF_BYTES_PER_ELEM) // contract.n
+    chunks = (
+        _chunk_group_rows(contract.group_rows, m_limit)
+        if m_limit > 0 and contract.m > m_limit * _V1_DOUBLE_WORKSPACE_SPLIT
+        else [contract.group_rows]
+    )
+    cores = ctx.effective_aiv_cores
+    stages, owner_prev = [], {}
+    for chunk_idx, chunk_rows in enumerate(chunks):
+        total = sum(chunk_rows)
+        used = min(cores, total)
+        quotient, tail = divmod(total, used)
+        intervals, offset = [], 0
+        for group_rows in chunk_rows:
+            if group_rows:
+                intervals.append((offset, offset + group_rows))
+                offset += group_rows
+        row_start = 0
+        for owner in range(used):
+            count = quotient + (owner < tail)
+            row_end = row_start + count
+            touched = sum(1 for g_start, g_end in intervals if g_start < row_end and g_end > row_start)
+            row_start = row_end
+            base = f"{name}:{owner}" if len(chunks) == 1 else f"{name}:c{chunk_idx}:{owner}"
+            pre_deps = (owner_prev[owner],) if owner in owner_prev else preload_after
+            preload_res = {"hbm": scale_bytes, "l2": scale_bytes, "mte2_aiv": scale_bytes}
+            if cast_ops:
+                preload_res["vector"] = cast_ops
+            preload = base + ":scale_preload"
+            extra_scales = (touched - 1) * scale_bytes
+            rd = count * row_read + extra_scales
+            vec = count * row_compute + (touched - 1) * cast_ops
+            wr = count * row_write
+            stages.extend((
+                StageDemand(preload, pre_deps, Work(resources=preload_res), "aiv", owner, metadata),
+                StageDemand(base + ":read", (*barrier_after, preload),
+                            Work(resources={"hbm": rd, "l2": rd, "mte2_aiv": rd}), "aiv", owner, metadata),
+                StageDemand(base + ":vector", (base + ":read",),
+                            Work(resources={"vector": vec}), "aiv", owner, metadata),
+                StageDemand(base + ":store", (base + ":vector",),
+                            Work(resources={"hbm": wr, "l2": wr, "mte3": wr}), "aiv", owner, metadata),
+            ))
+            owner_prev[owner] = base + ":store"
+    final_deps = tuple(owner_prev.values()) or barrier_after
+    stages.append(StageDemand(name, final_deps, metadata=metadata))
+    return stages
 
 
 def _gated_stages(contract, ctx, name, after, metadata):
@@ -246,9 +328,20 @@ def _gated_stages(contract, ctx, name, after, metadata):
             "hbm": scales, "l2": scales, "mte2_aiv": scales,
         }), metadata=metadata))
         ready = (scale_read,)
-    stages.extend(activation_stages(
-        name + "swiglu_quant", ready, ctx, contract, contract.group_rows, metadata
-    ))
+    ordinary_a8w8 = (
+        contract.mode == "gmm_swiglu_quant"
+        and contract.abi != XLLM_GATED_ABI
+        and not _is_a8w4_msd(contract)
+    )
+    if ordinary_a8w8 and contract.abi != V2_GATED_ABI:
+        stages.extend(_v1_a8w8_activation_stages(
+            name + "swiglu_quant", after, ready, ctx, contract, metadata,
+        ))
+    else:
+        stages.extend(activation_stages(
+            name + "swiglu_quant", ready, ctx, contract, contract.group_rows, metadata,
+            weight_scale_dtype=contract.weight_scale_dtype if ordinary_a8w8 else None,
+        ))
     return stages, schedule, useful_flops
 
 
