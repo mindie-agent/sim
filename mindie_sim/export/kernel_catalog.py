@@ -994,6 +994,8 @@ _ABI_WT_PORT_ROLES = frozenset({
     "proj_weight", "q_weight", "k_weight", "weights", "b",
 })
 _ABI_MX_QMODES = frozenset({"mx_fp8", "mx_fp4", "hif8_mx"})
+_RAW_BYTE_COLLECTIVE_ABIS = frozenset({"hcom_alltoall", "hcom_alltoallv", "hcom_allGather"})
+_SINGLE_BYTE_FP8_DTYPES = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2"})
 
 
 def _norm_abi_dtype(raw: str) -> str:
@@ -1120,7 +1122,7 @@ def _entry_matches_op_precision(entry: ProbedAbiEntry, precision_abi: Any, dtype
             or req_act in _QUANT_ABI_DTYPES
             or req_wt in _QUANT_ABI_DTYPES
         )
-        return any(
+        if any(
             _abi_spec_tuple_matches(
                 st, req_act, req_wt, is_quant_req,
                 req_mode=req_mode, req_wt_scale=req_wt_scale,
@@ -1128,13 +1130,39 @@ def _entry_matches_op_precision(entry: ProbedAbiEntry, precision_abi: Any, dtype
                 req_act_group=req_act_group,
             )
             for st in entry.dtype_tuple
-        )
+        ):
+            return True
+        req_out = _norm_abi_dtype(getattr(precision_abi, "output_dtype", ""))
+        if (
+            entry.role == "collective"
+            and entry.abi_id in _RAW_BYTE_COLLECTIVE_ABIS
+            and req_act in _SINGLE_BYTE_FP8_DTYPES
+            and not req_wt
+            and req_out in {"", req_act}
+            and req_mode in {"", "none", "dense"}
+        ):
+            return any(
+                _abi_spec_tuple_matches(st, "int8", "int8", True)
+                for st in entry.dtype_tuple
+            )
+        return False
     dt_norm = _norm_abi_dtype(dtype)
     if dt_norm in _QUANT_ABI_DTYPES:
-        return any(
+        if any(
             _abi_spec_tuple_matches(st, dt_norm, dt_norm, True)
             for st in entry.dtype_tuple
-        )
+        ):
+            return True
+        if (
+            entry.role == "collective"
+            and entry.abi_id in _RAW_BYTE_COLLECTIVE_ABIS
+            and dt_norm in _SINGLE_BYTE_FP8_DTYPES
+        ):
+            return any(
+                _abi_spec_tuple_matches(st, "int8", "int8", True)
+                for st in entry.dtype_tuple
+            )
+        return False
     return True
 
 

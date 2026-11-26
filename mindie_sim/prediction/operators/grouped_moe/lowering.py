@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from functools import partial
 from typing import TYPE_CHECKING, Literal
@@ -117,6 +117,33 @@ def _ring_slot(pool, label, size, owner):
     return ring.to_stages(release_slots_at_end=False)[0].acquire[0]
 
 
+def _resolve_demand_work(
+    demand: StageDemand, context: RecipeContext, dir_link_totals: Mapping[str, float],
+) -> dict[str, float]:
+    resources = demand.work.resources
+    if "link" not in resources:
+        return context.bind(demand.work)
+    phase_links = getattr(context, "phase_link_work", None)
+    direction = dict(demand.metadata).get("transport_direction")
+    wire_map = (
+        dict(phase_links[direction])
+        if isinstance(phase_links, Mapping) and direction and phase_links.get(direction)
+        else {}
+    )
+    if not wire_map:
+        return context.bind(demand.work)
+    link_amount = float(resources.get("link", 0.0) or 0.0)
+    total_dir = float(dir_link_totals.get(str(direction), 0.0) or 0.0)
+    share = (link_amount / total_dir) if total_dir > 0.0 else 1.0
+    other = {role: amount for role, amount in resources.items() if role != "link"}
+    bound = context.bind(Work(demand.work.matrix, other)) if (demand.work.matrix or other) else {}
+    for res_name, value in wire_map.items():
+        scaled = float(value) * share
+        if scaled > 0.0:
+            bound[str(res_name)] = bound.get(str(res_name), 0.0) + scaled
+    return bound
+
+
 @dataclass(frozen=True, slots=True)
 class GroupedMoeProgram:
     demands: tuple[StageDemand, ...]
@@ -126,8 +153,17 @@ class GroupedMoeProgram:
     def __call__(self, context: RecipeContext) -> Program:
         stages = []
         encoded_rows: dict[int, str] = {}
+        dir_link_totals: dict[str, float] = {}
+        if getattr(context, "phase_link_work", None):
+            for demand in self.demands:
+                link_amt = float(demand.work.resources.get("link", 0.0) or 0.0)
+                if link_amt > 0.0:
+                    direction = dict(demand.metadata).get("transport_direction")
+                    if direction:
+                        key = str(direction)
+                        dir_link_totals[key] = dir_link_totals.get(key, 0.0) + link_amt
         for demand in self.demands:
-            work = context.bind(demand.work)
+            work = _resolve_demand_work(demand, context, dir_link_totals)
             placement = {}
             if demand.kind:
                 roles = AIC_ROLES if demand.kind == "aic" else AIV_ROLES

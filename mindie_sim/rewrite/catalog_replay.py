@@ -41,6 +41,7 @@ _RECIPE_DIGEST_LEN = 16
 _PAIR_LEN = 2
 _GROUPED_FAMILIES = frozenset({"grouped_gemm", "grouped_matmul", "grouped_moe", "mc2"})
 _MX_MODES = frozenset({"mxfp8", "mxfp4", "a8w4_mx"})
+_MX_SCALE_GROUP_SIZE = 32
 _FP8_FORMATS = frozenset({"fp8", "fp8_e4m3", "fp8_e4m3fn", "fp8_e5m2"})
 _FP4_FORMATS = frozenset({"fp4", "fp4_e2m1"})
 _WEIGHT_ID_KEYS = ("weight_allocation_id", "allocation_id")
@@ -152,6 +153,33 @@ def _weight_backing_version(meta: Mapping[str, object]) -> int:
     return version if type(version) is int and version >= 0 else 0
 
 
+def _is_mx_weight_block(wt_block: object) -> bool:
+    """Return True iff ``wt_block`` is a 1D ``(32,)`` or 2D ``(1, ..., 32)`` MX32 microscaling block."""
+    if not isinstance(wt_block, Sequence) or isinstance(wt_block, (str, bytes)) or not wt_block:
+        return False
+    dims = tuple(int(dim) for dim in wt_block)
+    return dims[-1] == _MX_SCALE_GROUP_SIZE and all(dim == 1 for dim in dims[:-1])
+
+
+def _is_mx_group_size(meta: Mapping[str, object], p_abi=None) -> bool:
+    """True when declared activation/weight microscaling group size matches hardware MX32."""
+    mx_group = int(meta.get("mx_scale_group") or 0)
+    if mx_group == _MX_SCALE_GROUP_SIZE:
+        return True
+    if p_abi is not None:
+        wt_block = p_abi.weight_block or meta.get("weight_block") or ()
+        act_group = int(p_abi.act_group_size or meta.get("activation_group_size") or 0)
+    else:
+        wt_block = meta.get("weight_block") or ()
+        act_group = int(meta.get("activation_group_size") or meta.get("group_size") or 0)
+    has_wt_block = isinstance(wt_block, Sequence) and not isinstance(wt_block, (str, bytes)) and bool(wt_block)
+    if has_wt_block and not _is_mx_weight_block(wt_block):
+        return False
+    if act_group and act_group != _MX_SCALE_GROUP_SIZE:
+        return False
+    return act_group == _MX_SCALE_GROUP_SIZE or _is_mx_weight_block(wt_block)
+
+
 def _resolve_catlass_precisions(op: OpSpec, meta: Mapping[str, object]) -> tuple[str, str, str, str, str | None]:
     """Derive ``(dtype_a, dtype_b, dtype_c, dtype_acc, mx_mode)`` from ``precision_abi`` + validated meta."""
     p_abi = getattr(op, "precision_abi", None)
@@ -181,7 +209,10 @@ def _resolve_catlass_precisions(op: OpSpec, meta: Mapping[str, object]) -> tuple
         mode = meta.get("native_matrix_mode")
         abi_method_mode = _ABI_METHOD_MX_MODES.get(p_abi.linear_method)
         mx_mode = mode if mode in _MX_MODES else None
-        needs_mx = mx_mode is None and (scale_fmt == "fp8_e8m0" or abi_method_mode is not None)
+        needs_mx = mx_mode is None and (
+            abi_method_mode is not None
+            or (scale_fmt == "fp8_e8m0" and _is_mx_group_size(meta, p_abi))
+        )
     else:
         dtype_a = _norm_catlass_dtype(meta.get("dtype_a", meta.get("activation_format", op.dtype)))
         dtype_b = _norm_catlass_dtype(meta.get("dtype_b", meta.get("weight_format", op.dtype)))
@@ -191,9 +222,12 @@ def _resolve_catlass_precisions(op: OpSpec, meta: Mapping[str, object]) -> tuple
         )
         scale_fmt = _norm_catlass_dtype(meta.get("weight_scale_format") or "")
         mode = meta.get("native_matrix_mode", op.dtype)
-        abi_method_mode = None
+        abi_method_mode = _ABI_METHOD_MX_MODES.get(str(meta.get("linear_method") or ""))
         mx_mode = mode if mode in _MX_MODES else None
-        needs_mx = mx_mode is None and scale_fmt == "fp8_e8m0"
+        needs_mx = mx_mode is None and (
+            abi_method_mode is not None
+            or (scale_fmt == "fp8_e8m0" and _is_mx_group_size(meta))
+        )
     if needs_mx:
         if dtype_a in _FP8_FORMATS and dtype_b in _FP8_FORMATS:
             mx_mode = "mxfp8"

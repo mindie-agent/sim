@@ -41,6 +41,7 @@ from .periodic_runs import (
 )
 
 _MEBIBYTE = 1024 * 1024
+_RECT_LEDGER_CACHE_LIMIT = 256
 _CACHE_EVICTION_ORDER = {CACHE_POLICY_NORMAL: 0, CACHE_POLICY_LAST_USE: 1, CACHE_POLICY_PERSISTENT: 2}
 
 
@@ -136,9 +137,17 @@ class _ResidentL2Entry:
     line_footprint_bytes: int | None = None
     resident_intervals_mut: list[tuple[int, int]] | None = None
     resident_scale_intervals: tuple[tuple[int, int], ...] = ()
+    resident_bands: Any = None
 
     def coverage_snapshot(self) -> SectorCoverage:
         """Return an immutable ``SectorCoverage`` snapshot for external inspection."""
+        if self.resident_bands is not None:
+            return SectorCoverage(
+                intervals=tuple(self.resident_bands.to_intervals()),
+                scale_intervals=self.resident_scale_intervals,
+                _canonical=True,
+                _bytes=self.resident_bytes,
+            )
         if self.resident_intervals_mut is None:
             return self.resident_coverage
         return SectorCoverage(
@@ -147,6 +156,12 @@ class _ResidentL2Entry:
             _canonical=True,
             _bytes=self.resident_bytes,
         )
+
+
+def _materialize_entry_bands(entry: _ResidentL2Entry) -> None:
+    if entry.resident_bands is not None:
+        entry.resident_intervals_mut = entry.resident_bands.to_intervals()
+        entry.resident_bands = None
 
 
 def _payload_only(cov: SectorCoverage) -> SectorCoverage:
@@ -183,6 +198,8 @@ def _entry_payload_overlap_bytes(req_cov: SectorCoverage, entry: _ResidentL2Entr
     scale_b = _measure_byte_intervals(entry.resident_scale_intervals)
     if (not req_cov.intervals and not req_cov.periodic) or entry.resident_bytes <= scale_b:
         return 0
+    if entry.resident_bands is not None and not req_cov.periodic:
+        return sum(entry.resident_bands.overlap_interval(lo, hi) for lo, hi in req_cov.intervals)
     if entry.resident_intervals_mut is not None and not req_cov.periodic:
         from ._periodic_stream import _overlap_canonical_intervals
         return _overlap_canonical_intervals(req_cov.intervals, entry.resident_intervals_mut)
@@ -192,6 +209,8 @@ def _entry_payload_overlap_bytes(req_cov: SectorCoverage, entry: _ResidentL2Entr
 def _entry_interval_overlap(lo: int, hi: int, entry: _ResidentL2Entry) -> int:
     if hi <= lo:
         return 0
+    if entry.resident_bands is not None:
+        return entry.resident_bands.overlap_interval(lo, hi)
     if entry.resident_intervals_mut is not None:
         from ._periodic_stream import _overlap_canonical_intervals
         return _overlap_canonical_intervals(((lo, hi),), entry.resident_intervals_mut)
@@ -367,10 +386,12 @@ class AdmissionMemoryView:
         self._reserved: dict[int, dict[str, int]] = {}
         self._active_streams: dict[int, set[str]] = {}
         self._active_keys: dict[int, set[ReuseKey]] = {}
+        self._active_stream_counts: dict[int, int] = {}
         self._template_key_users: dict[ReuseKey, int] = {}
         self._resident: dict[ReuseKey, _ResidentL2Entry] = {}
         self._pending_writebacks: dict[int, list[DirtyWriteback]] = {}
         self._last_prior_coverage: SectorCoverage = SectorCoverage()
+        self._rect_ledger_cache: dict[tuple[int, int, float, int, int, int], ByteLedger] = {}
         units_map = dict(l2_buffer_units_by_die or {})
         sweeps = ws_sweep_by_die or {}
         default_sweep = ws_sweep or {}
@@ -410,9 +431,26 @@ class AdmissionMemoryView:
         return self._memory_access_by_die.get(die, self._memory_access_default)
 
     def active_stream_count(self, die: int) -> int:
-        streams = set(self._active_streams.get(die, ()))
-        streams.update(k.reuse_stream for k in self._active_keys.get(die, ()))
-        return len(streams)
+        cached = self._active_stream_counts.get(die)
+        if cached is not None:
+            return cached
+        active_s = self._active_streams.get(die)
+        active_k = self._active_keys.get(die)
+        if not active_s:
+            if not active_k:
+                count = 0
+            elif len(active_k) == 1:
+                count = 1
+            else:
+                count = len({k.reuse_stream for k in active_k})
+        elif not active_k:
+            count = len(active_s)
+        else:
+            streams = set(active_s)
+            streams.update(k.reuse_stream for k in active_k)
+            count = len(streams)
+        self._active_stream_counts[die] = count
+        return count
 
     def residency_fingerprint(self, die: int | None = None) -> str:
         """Fingerprint the admission state, including the order of LRU entries."""
@@ -452,24 +490,29 @@ class AdmissionMemoryView:
             record("resident", key, entry.version, entry.cache_policy, entry.working_set_bytes, entry.resident_bytes,
                    entry.evicted, entry.dirty, entry.has_future_reader, entry.private_workspace,
                    entry.line_footprint_bytes)
-            intervals = entry.resident_intervals_mut
-            coverage(entry.resident_coverage.intervals if intervals is None else intervals,
-                     entry.resident_coverage.periodic if intervals is None else (),
-                     entry.resident_scale_intervals)
+            if entry.resident_bands is not None:
+                coverage(entry.resident_bands.to_intervals(), (), entry.resident_scale_intervals)
+            else:
+                intervals = entry.resident_intervals_mut
+                coverage(entry.resident_coverage.intervals if intervals is None else intervals,
+                         entry.resident_coverage.periodic if intervals is None else (),
+                         entry.resident_scale_intervals)
             record("dirty")
             coverage(entry.dirty_coverage.intervals or entry.dirty_ranges,
                      entry.dirty_coverage.periodic, entry.dirty_coverage.scale_intervals)
         return digest.hexdigest()
 
     def reserved_bytes(self, die: int) -> int:
-        return sum(self._reserved.get(die, {}).values())
+        reserved = self._reserved.get(die)
+        return sum(reserved.values()) if reserved else 0
 
     def available_l2_bytes(self, die: int) -> int:
         """Physical capacity minus live reservations, before stream sharing."""
         cap = self._l2_capacity.get(die)
         if cap is None:
             raise ModelingError(f"l2_die_undeclared:{die}")
-        return max(0, cap - self.reserved_bytes(die))
+        reserved = self._reserved.get(die)
+        return cap if not reserved else max(0, cap - sum(reserved.values()))
 
     def effective_l2_bytes(self, die: int) -> int:
         """Return per-stream capacity in strict mode and the shared budget in smooth mode."""
@@ -582,25 +625,51 @@ class AdmissionMemoryView:
             total_die -= charge(victim)
         return victims
 
-    def _evict_over_capacity(self, die: int, *, protect_key: ReuseKey | None = None) -> None:
-        eff = self.effective_l2_bytes(die)
-        avail = max(0, self._l2_capacity[die] - self.reserved_bytes(die))
+    def _evict_over_capacity_known(
+        self, die: int, eff: int, avail: int, *, protect_key: ReuseKey | None = None,
+    ) -> None:
         for victim in self._eviction_victims(die, eff, avail, protect_key=protect_key):
             self._settle_eviction(victim)
+
+    def _evict_over_capacity(self, die: int, *, protect_key: ReuseKey | None = None) -> None:
+        avail = self.available_l2_bytes(die)
+        n_active = 1 if self._knee_curves_by_die[die] else max(1, self.active_stream_count(die))
+        granule = self._granule_by_die[die]
+        eff = granule * (avail // (granule * n_active))
+        self._evict_over_capacity_known(die, eff, avail, protect_key=protect_key)
+
+    def _cached_rect_ledger(
+        self, logical: int, aligned: int, service: float, hit: int, miss: int, sectors: int,
+    ) -> ByteLedger:
+        cache = self._rect_ledger_cache
+        lkey = (logical, aligned, service, hit, miss, sectors)
+        ledger = cache.get(lkey)
+        if ledger is None:
+            ledger = ByteLedger(
+                logical_tensor_bytes=logical, aligned_transfer_bytes=aligned,
+                dram_bus_transaction_bytes=service, l2_hit_bytes=hit,
+                dram_miss_copy_bytes=miss, dram_sector_bytes=sectors,
+            )
+            if len(cache) < _RECT_LEDGER_CACHE_LIMIT:
+                cache[lkey] = ledger
+        return ledger
 
     def _activate_key(self, key: ReuseKey) -> None:
         keys = self._active_keys[key.die]
         if key not in keys:
             keys.add(key)
+            self._active_stream_counts.pop(key.die, None)
             self._evict_over_capacity(key.die)
 
     def pending_writebacks(self, die: int) -> tuple[DirtyWriteback, ...]:
         return tuple(self._pending_writebacks.get(die, ()))
 
     def drain_writebacks(self, die: int) -> tuple[DirtyWriteback, ...]:
-        items = tuple(self._pending_writebacks.get(die, ()))
-        if die in self._pending_writebacks:
-            self._pending_writebacks[die].clear()
+        queue = self._pending_writebacks.get(die)
+        if not queue:
+            return ()
+        items = tuple(queue)
+        queue.clear()
         return items
 
     def pop_matching_writebacks(
@@ -629,6 +698,7 @@ class AdmissionMemoryView:
         if die not in self._l2_capacity:
             raise ModelingError(f"l2_die_undeclared:{die}")
         self._active_streams[die].add(stream_id)
+        self._active_stream_counts.pop(die, None)
         self._evict_over_capacity(die)
         return self.effective_l2_bytes(die)
 
@@ -640,6 +710,7 @@ class AdmissionMemoryView:
         self._active_keys[die] = {
             k for k in self._active_keys[die] if k.reuse_stream != stream_id
         }
+        self._active_stream_counts.pop(die, None)
         return self.effective_l2_bytes(die)
 
     def release_key(self, key: ReuseKey) -> int:
@@ -647,6 +718,7 @@ class AdmissionMemoryView:
         if key.die not in self._l2_capacity:
             raise ModelingError(f"l2_die_undeclared:{key.die}")
         self._active_keys[key.die].discard(key)
+        self._active_stream_counts.pop(key.die, None)
         return self.effective_l2_bytes(key.die)
 
     def resolve_reuse_key(self, fallback: ReuseKey) -> ReuseKey:
@@ -699,6 +771,7 @@ class AdmissionMemoryView:
         """Terminate dead private workspace residency without DRAM writeback."""
         if key.die in self._active_keys:
             self._active_keys[key.die].discard(key)
+            self._active_stream_counts.pop(key.die, None)
         entry = self._resident.pop(key, None)
         if entry is not None:
             entry.has_future_reader = False
@@ -950,6 +1023,7 @@ class AdmissionMemoryView:
         """Attempt exact merge into ``existing``; returns True if updated in-place."""
         if eff <= 0:
             return False
+        _materialize_entry_bands(existing)
         from ._periodic_stream import _aligned_intervals_bytes, _merge_canonical_pairs
         merged_scale_ivs = _merge_canonical_pairs(existing.resident_scale_intervals, coverage.scale_intervals)
         merged_scale_bytes = _measure_byte_intervals(merged_scale_ivs)
@@ -1017,6 +1091,315 @@ class AdmissionMemoryView:
         self._touch_resident(existing)
         return True
 
+    def _try_merge_strided_band(
+        self, existing: _ResidentL2Entry, die: int, eff: int, avail: int, key: ReuseKey,
+        stride: int, line: int | None, r_lo: int, r_hi: int, c_lo: int, c_hi: int,
+        working_set: int, merged_span: int, policy: CachePolicy,
+    ) -> bool:
+        """Attempt exact in-place strided-band merge; return True if merged into ``existing``."""
+        eb = existing.resident_bands
+        assert eb is not None
+        if existing.dirty:
+            if merged_span > eff:
+                return False
+        elif not self._hit_fraction(merged_span, eff, die=die):
+            return False
+        line_aligned = bool(line and stride % line == 0 and c_lo % line == 0 and c_hi % line == 0)
+        if not line or (eb.line_aligned_to == line and line_aligned):
+            payload_fp = merged_span
+            merged_ws = max(existing.working_set_bytes, working_set, payload_fp)
+            can_merge = (
+                bool(self._hit_fraction(merged_ws, eff, die=die))
+                if not existing.dirty else merged_ws <= eff
+            )
+            if not can_merge:
+                return False
+            eb.merge_inplace(r_lo, r_hi, c_lo, c_hi)
+            if not line_aligned:
+                eb.line_aligned_to = None
+        elif stride % line == 0:
+            lo_idx, hi_idx, mid, payload_fp = eb.plan_merge_slice(r_lo, r_hi, c_lo, c_hi, line)
+            merged_ws = max(existing.working_set_bytes, working_set, payload_fp)
+            can_merge = (
+                bool(self._hit_fraction(merged_ws, eff, die=die))
+                if not existing.dirty else merged_ws <= eff
+            )
+            if not can_merge:
+                return False
+            eb.bands[lo_idx:hi_idx] = mid
+            eb.line_aligned_to = None
+            eb.aligned_cache = (line, payload_fp)
+        else:
+            from ._periodic_stream import _strided_bands_aligned_bytes
+
+            new_bands = eb.planned_merge(r_lo, r_hi, c_lo, c_hi)
+            payload_fp = _strided_bands_aligned_bytes(new_bands, stride, line)
+            merged_ws = max(existing.working_set_bytes, working_set, payload_fp)
+            can_merge = (
+                bool(self._hit_fraction(merged_ws, eff, die=die))
+                if not existing.dirty else merged_ws <= eff
+            )
+            if not can_merge:
+                return False
+            eb.bands = new_bands
+            eb.line_aligned_to = None
+            eb.aligned_cache = None
+        existing.working_set_bytes = merged_ws
+        existing.resident_bytes = merged_span
+        existing.line_footprint_bytes = payload_fp if line else None
+        existing.cache_policy = policy
+        self._touch_resident(existing)
+        self._evict_over_capacity_known(die, eff, avail, protect_key=key)
+        return True
+
+    def _admit_strided_band_read(
+        self, pattern: MemoryAccessPattern, aligned_bytes: int, key: ReuseKey, eff: int,
+    ) -> tuple[int, int, SectorCoverage] | None:
+        """O(bands) exact read admission for single-run strided 2D row bands."""
+        spec = self.memory_access_for(pattern.die)
+        plan = _access_plan(pattern.runs, spec)
+        if len(plan.runs) != 1 or plan.scale_bytes:
+            return None
+        sec = plan.sector_bytes
+        line = plan.l2_line_bytes or plan.l2_sector_bytes
+        if line == sec:
+            line = None
+        from ._periodic_stream import _StridedBandSet, _band_aligned_bytes, _strided_band_from_run
+        band = _strided_band_from_run(plan.runs[0], sec, line, _MAX_EXPLICIT_SECTOR_INTERVALS)
+        if band is None:
+            return None
+        stride, _, r_lo, r_hi, c_lo, c_hi = band
+        n_rows = r_hi - r_lo
+        existing = self._existing(pattern, key, eff, preview=False)
+        if existing is None:
+            if n_rows <= 1:
+                return None
+        else:
+            eb = existing.resident_bands
+            if eb is None or eb.stride != stride or eb.sector_bytes != sec or existing.resident_scale_intervals:
+                return None
+        resident_span = n_rows * (c_hi - c_lo)
+        line_aligned = bool(line and stride % line == 0 and c_lo % line == 0 and c_hi % line == 0)
+        span = resident_span if (not line or line_aligned) else _band_aligned_bytes(r_lo, r_hi, stride, ((c_lo, c_hi),), line)
+        rd = pattern.reuse_distance_bytes
+        working_set = span if rd is None else (rd if rd > span else span)
+        hit, miss, ov_b = 0, aligned_bytes, 0
+        prior_out = SectorCoverage()
+        if eff > 0 and existing is not None:
+            ws_eff = working_set if working_set >= existing.working_set_bytes else existing.working_set_bytes
+            fraction = self._hit_fraction(ws_eff, eff, die=pattern.die)
+            if fraction:
+                ov_b = existing.resident_bands.overlap_rect(r_lo, r_hi, c_lo, c_hi)
+                if ov_b >= resident_span:
+                    hit = aligned_bytes if fraction == 1.0 else round(aligned_bytes * fraction)
+                    miss = aligned_bytes - hit
+                elif ov_b > 0:
+                    hit = _plan_hit_bytes(
+                        plan, lambda _rc: ov_b, existing.resident_bands.overlap_interval, (), aligned_bytes,
+                    )
+                    if fraction != 1.0:
+                        hit = round(hit * fraction)
+                    hit = max(0, min(aligned_bytes, hit))
+                    miss = aligned_bytes - hit
+                if hit > 0 and miss > 0:
+                    prior_out = existing.coverage_snapshot()
+        self._last_prior_coverage = prior_out
+        legacy_last = self.arch_id is None and pattern.cache_policy == CACHE_POLICY_LAST_USE
+        if legacy_last and existing is not None and eff > 0 and working_set <= eff:
+            if not existing.dirty:
+                existing.evicted = True
+            return hit, miss, prior_out
+        previous = self._resident.get(key)
+        if eff <= 0 or legacy_last or not self._hit_fraction(working_set, eff, die=key.die):
+            if previous is not None and not previous.evicted:
+                self._settle_eviction(previous)
+            return hit, miss, prior_out
+        avail = self.available_l2_bytes(key.die)
+        if existing is not None:
+            if not miss:
+                existing.cache_policy = pattern.cache_policy
+                self._touch_resident(existing)
+                return hit, miss, prior_out
+            if self._try_merge_strided_band(
+                existing, key.die, eff, avail, key, stride, line,
+                r_lo, r_hi, c_lo, c_hi, working_set,
+                existing.resident_bytes + resident_span - ov_b, pattern.cache_policy,
+            ):
+                return hit, miss, prior_out
+        if previous is not None and not previous.evicted:
+            self._settle_eviction(previous)
+        if n_rows > 1:
+            fresh = _ResidentL2Entry(
+                key=key, working_set_bytes=working_set, version=pattern.version,
+                dirty=False, private_workspace=pattern.visibility.private_workspace,
+                resident_coverage=SectorCoverage(), resident_bytes=resident_span,
+                cache_policy=pattern.cache_policy, line_footprint_bytes=None,
+                resident_bands=_StridedBandSet(
+                    stride, sec, [(r_lo, r_hi, ((c_lo, c_hi),))],
+                    line if line_aligned else None,
+                    (line, span) if (line and stride % line == 0) else None,
+                ),
+            )
+        else:
+            iv = (r_lo * stride + c_lo, r_lo * stride + c_hi)
+            fresh = _ResidentL2Entry(
+                key=key, working_set_bytes=working_set, version=pattern.version,
+                dirty=False, private_workspace=pattern.visibility.private_workspace,
+                resident_coverage=SectorCoverage(intervals=(iv,), _canonical=True, _bytes=resident_span),
+                resident_bytes=resident_span, cache_policy=pattern.cache_policy,
+                line_footprint_bytes=None,
+            )
+        self._touch_resident(fresh)
+        self._evict_over_capacity_known(key.die, eff, avail, protect_key=key)
+        return hit, miss, prior_out
+
+    def admit_rect_read_ledger(
+        self,
+        die: int,
+        key: ReuseKey | None,
+        version: int,
+        base_byte: int,
+        rows: int,
+        row_bytes: int,
+        row_stride: int,
+        *,
+        alignment_bytes: int,
+        sector_bytes: int,
+        l2_line_bytes: int | None,
+        l2_sector_bytes: int | None,
+        burst_granule: int,
+        burst_rules: Sequence[BurstTurnRule] = (),
+    ) -> ByteLedger | None:
+        """Zero-allocation exact ``ByteLedger`` admission for single-run RowMajor reads."""
+        if rows <= 0 or row_bytes <= 0 or row_stride < row_bytes or rows > _MAX_EXPLICIT_SECTOR_INTERVALS:
+            return None
+        logical_bytes = rows * row_bytes
+        if row_stride == row_bytes:
+            aligned_bytes = _align_up(logical_bytes, alignment_bytes)
+        else:
+            aligned_bytes = rows * _align_up(row_bytes, alignment_bytes)
+        if aligned_bytes == 0:
+            return self._cached_rect_ledger(logical_bytes, 0, 0.0, 0, 0, 0)
+        sec = sector_bytes
+        line = l2_line_bytes or l2_sector_bytes
+        if line == sec:
+            line = None
+        if line is not None and line < sec:
+            return None
+        is_contiguous = rows == 1 or row_stride == row_bytes
+        line_aligned = False
+        if is_contiguous:
+            s_lo = (base_byte // sec) * sec
+            s_hi = ((base_byte + logical_bytes + sec - 1) // sec) * sec
+            resident_span = s_hi - s_lo
+            span = ((((s_hi + line - 1) // line) - (s_lo // line)) * line) if line else resident_span
+            stride = r_lo = r_hi = c_lo = c_hi = 0
+        else:
+            from ._periodic_stream import _band_aligned_bytes, _strided_band_from_ints
+
+            band = _strided_band_from_ints(
+                base_byte, rows, row_bytes, row_stride, sec, line, _MAX_EXPLICIT_SECTOR_INTERVALS,
+            )
+            if band is None:
+                return None
+            stride, _, r_lo, r_hi, c_lo, c_hi = band
+            resident_span = rows * (c_hi - c_lo)
+            line_aligned = bool(line and stride % line == 0 and c_lo % line == 0 and c_hi % line == 0)
+            span = resident_span if (not line or line_aligned) else _band_aligned_bytes(
+                r_lo, r_hi, stride, ((c_lo, c_hi),), line,
+            )
+
+        if key is None:
+            service = _rect_dram_service_bytes(
+                resident_span, rows, row_bytes, row_stride, burst_granule, burst_rules,
+            )
+            return self._cached_rect_ledger(logical_bytes, aligned_bytes, service, 0, aligned_bytes, resident_span)
+        if key.die != die:
+            raise ModelingError(f"reuse_key_die_mismatch:{key.die}!={die}")
+        if die not in self._l2_capacity:
+            raise ModelingError(f"l2_die_undeclared:{die}")
+        if self.arch_id is not None and cache_policy_for_arch(self.arch_id, CACHE_POLICY_NORMAL) == _L2_CACHE_DISABLE:
+            return None
+        self._activate_key(key)
+        avail = self.available_l2_bytes(die)
+        n_active = 1 if self._knee_curves_by_die[die] else max(1, self.active_stream_count(die))
+        granule = self._granule_by_die[die]
+        eff = granule * (avail // (granule * n_active))
+        existing = self._resident.get(key)
+        if existing is not None and (existing.evicted or existing.version != version):
+            existing = None
+
+        if is_contiguous:
+            if (
+                eff <= 0 or existing is None or existing.resident_bands is not None
+                or existing.resident_scale_intervals
+            ):
+                return None
+            ivs = existing.resident_intervals_mut
+            if ivs is None:
+                if existing.resident_coverage.periodic:
+                    return None
+                ivs = existing.resident_coverage.intervals
+            if len(ivs) != 1 or ivs[0][0] > s_lo or s_hi > ivs[0][1]:
+                return None
+            ws_eff = span if span >= existing.working_set_bytes else existing.working_set_bytes
+            if self._hit_fraction(ws_eff, eff, die=die) != 1.0:
+                return None
+            self._last_prior_coverage = SectorCoverage()
+            existing.cache_policy = CACHE_POLICY_NORMAL
+            self._touch_resident(existing)
+            return self._cached_rect_ledger(logical_bytes, aligned_bytes, 0.0, aligned_bytes, 0, 0)
+
+        if existing is not None:
+            eb = existing.resident_bands
+            if eb is None or eb.stride != stride or eb.sector_bytes != sec or existing.resident_scale_intervals:
+                return None
+            if eff > 0:
+                ws_eff = span if span >= existing.working_set_bytes else existing.working_set_bytes
+                fraction = self._hit_fraction(ws_eff, eff, die=die)
+                if fraction:
+                    ov_b = eb.overlap_rect(r_lo, r_hi, c_lo, c_hi)
+                    if ov_b >= resident_span and fraction == 1.0:
+                        self._last_prior_coverage = SectorCoverage()
+                        existing.cache_policy = CACHE_POLICY_NORMAL
+                        self._touch_resident(existing)
+                        return self._cached_rect_ledger(logical_bytes, aligned_bytes, 0.0, aligned_bytes, 0, 0)
+                    if ov_b > 0:
+                        return None
+        self._last_prior_coverage = SectorCoverage()
+        previous = self._resident.get(key)
+        service = _rect_dram_service_bytes(
+            resident_span, rows, row_bytes, row_stride, burst_granule, burst_rules,
+        )
+        miss_ledger = self._cached_rect_ledger(logical_bytes, aligned_bytes, service, 0, aligned_bytes, resident_span)
+        if eff <= 0 or not self._hit_fraction(span, eff, die=die):
+            if previous is not None and not previous.evicted:
+                self._settle_eviction(previous)
+            return miss_ledger
+        if existing is not None and self._try_merge_strided_band(
+            existing, die, eff, avail, key, stride, line,
+            r_lo, r_hi, c_lo, c_hi, span, existing.resident_bytes + resident_span, CACHE_POLICY_NORMAL,
+        ):
+            return miss_ledger
+        if previous is not None and not previous.evicted:
+            self._settle_eviction(previous)
+        from ._periodic_stream import _StridedBandSet
+
+        fresh = _ResidentL2Entry(
+            key=key, working_set_bytes=span, version=version,
+            dirty=False, private_workspace=False,
+            resident_coverage=SectorCoverage(), resident_bytes=resident_span,
+            cache_policy=CACHE_POLICY_NORMAL, line_footprint_bytes=None,
+            resident_bands=_StridedBandSet(
+                stride, sec, [(r_lo, r_hi, ((c_lo, c_hi),))],
+                line if line_aligned else None,
+                (line, span) if (line and stride % line == 0) else None,
+            ),
+        )
+        self._touch_resident(fresh)
+        self._evict_over_capacity_known(die, eff, avail, protect_key=key)
+        return miss_ledger
+
     def _admit_access_with_prior(
         self, pattern: MemoryAccessPattern, aligned_bytes: int,
     ) -> tuple[int, int, SectorCoverage]:
@@ -1026,6 +1409,10 @@ class AdmissionMemoryView:
             return 0, max(0, aligned_bytes), SectorCoverage()
         self._activate_key(key)
         eff = self.effective_l2_bytes(key.die)
+        if pattern.direction == "read":
+            fast = self._admit_strided_band_read(pattern, aligned_bytes, key, eff)
+            if fast is not None:
+                return fast
         coverage, working_set = self._geometry(pattern, aligned_bytes)
         existing = self._existing(pattern, key, eff, preview=False)
         hit, miss, ov_cached = self._classify_access_with_overlap(
@@ -1077,6 +1464,23 @@ class AdmissionMemoryView:
         ))
         self._evict_over_capacity(key.die, protect_key=key)
         return hit, miss, prior_out
+
+
+def _rect_dram_service_bytes(
+    sectors: int, rows: int, row_bytes: int, row_stride: int,
+    burst_granule: int, rules: Sequence[BurstTurnRule],
+) -> float:
+    granule = float(burst_granule) if row_stride > row_bytes else 0.0
+    if rules:
+        eff = burst_turnaround_efficiency(row_bytes, row_stride, rules)
+        if granule <= 0.0:
+            return sectors / eff
+        if eff < 1.0:
+            granule = max(granule, row_bytes / eff)
+    if granule <= row_bytes:
+        return float(sectors)
+    eff_rows = rows if row_stride else 1
+    return sectors * max(1.0, eff_rows * granule / sectors)
 
 
 def _burst_service_bytes(plan: AddressRunPlan, sectors: int, run: AddressRun, rules: Sequence[BurstTurnRule],
@@ -1201,56 +1605,27 @@ def _missed_dram_sector_and_service(
     return sector_total, service_total
 
 
-def bind_memory_access(
+def admit_memory_ledger(
     pattern: MemoryAccessPattern,
     state: AdmissionMemoryView | None,
     *,
-    hbm_bus: HbmBusSpec,
-    copy_hit_bytes_per_ms: float,
-    copy_miss_bytes_per_ms: float,
-    l2_bytes_per_ms: float,
-    pipe_row_id: str,
-    l2_row_id: str,
+    bus_memory_access: MemoryAccessSpec | None = None,
     burst_rules: Sequence[BurstTurnRule] = (),
     commit: bool = False,
-    nominal_pipe_bytes_per_ms: float | None = None,
-) -> BoundAccess:
-    """Bind one ``MemoryAccessPattern`` into exact 3-ledger audit and row terms."""
-    if hbm_bus.die != pattern.die:
-        raise ModelingError(f"hbm_bus_die_mismatch:{hbm_bus.die}!={pattern.die}")
-    if copy_hit_bytes_per_ms <= 0.0 or copy_miss_bytes_per_ms <= 0.0 or l2_bytes_per_ms <= 0.0:
-        raise ModelingError("bind_access_pipe_rate_nonpositive")
-    nom_pipe = (
-        float(nominal_pipe_bytes_per_ms)
-        if nominal_pipe_bytes_per_ms is not None else float(copy_hit_bytes_per_ms)
-    )
-    if nom_pipe <= 0.0:
-        raise ModelingError("bind_access_pipe_rate_nonpositive")
-    bind_cfg = (
-        hbm_bus, float(copy_hit_bytes_per_ms), float(copy_miss_bytes_per_ms),
-        float(l2_bytes_per_ms), pipe_row_id, l2_row_id, tuple(burst_rules), nom_pipe,
-    )
-
-    # Explicit synthetic views set their own L2 geometry. Bus geometry still
-    # applies to DRAM transactions independently of the residency footprint.
+) -> tuple[ByteLedger, MemoryAccessPattern, SectorCoverage]:
+    """Resolve and admit one ``MemoryAccessPattern`` into an exact ``ByteLedger``."""
     access = state.memory_access_for(pattern.die) if isinstance(state, AdmissionMemoryView) else None
     plan = _access_plan(pattern.runs, access)
     if plan is not pattern.runs:
         pattern = replace(pattern, runs=plan)
-    plan = _access_plan(plan, hbm_bus.memory_access)
+    plan = _access_plan(plan, bus_memory_access)
     aligned_bytes = plan.aligned_copy_bytes()
     if aligned_bytes == 0:
-        ledger = ByteLedger(
+        return ByteLedger(
             logical_tensor_bytes=pattern.logical_bytes, aligned_transfer_bytes=0,
             dram_bus_transaction_bytes=0.0, l2_hit_bytes=0,
             dram_miss_copy_bytes=0, dram_sector_bytes=0,
-        )
-        after = (pattern.visibility.producer_event,) if pattern.visibility.producer_event else ()
-        return BoundAccess(
-            ledger=ledger, constraints=(), deliveries=(), after=after,
-            owner=pattern.owner, pipe_row_id=pipe_row_id, l2_row_id=l2_row_id,
-            bind_config=bind_cfg,
-        )
+        ), pattern, SectorCoverage()
 
     res_cov = SectorCoverage()
     if state is None:
@@ -1300,6 +1675,55 @@ def bind_memory_access(
         dram_miss_copy_bytes=miss_bytes,
         dram_sector_bytes=sector_bytes,
     )
+    return ledger, pattern, res_cov
+
+
+def bind_memory_access(
+    pattern: MemoryAccessPattern,
+    state: AdmissionMemoryView | None,
+    *,
+    hbm_bus: HbmBusSpec,
+    copy_hit_bytes_per_ms: float,
+    copy_miss_bytes_per_ms: float,
+    l2_bytes_per_ms: float,
+    pipe_row_id: str,
+    l2_row_id: str,
+    burst_rules: Sequence[BurstTurnRule] = (),
+    commit: bool = False,
+    nominal_pipe_bytes_per_ms: float | None = None,
+) -> BoundAccess:
+    """Bind one ``MemoryAccessPattern`` into exact 3-ledger audit and row terms."""
+    if hbm_bus.die != pattern.die:
+        raise ModelingError(f"hbm_bus_die_mismatch:{hbm_bus.die}!={pattern.die}")
+    if copy_hit_bytes_per_ms <= 0.0 or copy_miss_bytes_per_ms <= 0.0 or l2_bytes_per_ms <= 0.0:
+        raise ModelingError("bind_access_pipe_rate_nonpositive")
+    nom_pipe = (
+        float(nominal_pipe_bytes_per_ms)
+        if nominal_pipe_bytes_per_ms is not None else float(copy_hit_bytes_per_ms)
+    )
+    if nom_pipe <= 0.0:
+        raise ModelingError("bind_access_pipe_rate_nonpositive")
+    bind_cfg = (
+        hbm_bus, float(copy_hit_bytes_per_ms), float(copy_miss_bytes_per_ms),
+        float(l2_bytes_per_ms), pipe_row_id, l2_row_id, tuple(burst_rules), nom_pipe,
+    )
+
+    ledger, pattern, _ = admit_memory_ledger(
+        pattern, state, bus_memory_access=hbm_bus.memory_access,
+        burst_rules=burst_rules, commit=commit,
+    )
+    aligned_bytes = ledger.aligned_transfer_bytes
+    if aligned_bytes == 0:
+        after = (pattern.visibility.producer_event,) if pattern.visibility.producer_event else ()
+        return BoundAccess(
+            ledger=ledger, constraints=(), deliveries=(), after=after,
+            owner=pattern.owner, pipe_row_id=pipe_row_id, l2_row_id=l2_row_id,
+            bind_config=bind_cfg,
+        )
+    hit_bytes = ledger.l2_hit_bytes
+    miss_bytes = ledger.dram_miss_copy_bytes
+    sector_bytes = ledger.dram_sector_bytes
+    dram_service_bytes = ledger.dram_bus_transaction_bytes
 
     constraints: list[ConstraintTerm] = []
     pipe_ms = (

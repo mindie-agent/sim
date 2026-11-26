@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from bisect import bisect_left
 from collections.abc import Sequence
+from dataclasses import dataclass
 import math
 
 from .memory_physics import PeriodicSectorRun
@@ -21,6 +22,7 @@ _PAIR_RUNS = 2
 _TRIPLE_RUNS = 3
 _HALF_MOD_DIVISOR = 2
 _BISECT_OVERLAP_RATIO = 16
+_MAX_BAND_LINE_PERIOD = 64
 
 
 def _aligned_intervals_bytes(
@@ -188,6 +190,327 @@ def _overlap_canonical_intervals(
         else:
             j += 1
     return total
+
+
+def _strided_band_from_ints(
+    base_byte: int, rows: int, row_bytes: int, stride: int,
+    sec: int, line_bytes: int | None, max_rows: int,
+) -> tuple[int, int, int, int, int, int] | None:
+    """Return ``(stride, sec, r_lo, r_hi, c_lo, c_hi)`` when ``(base, rows, row_bytes, stride)`` is an exact 2D row band."""
+    if rows <= 0 or rows > max_rows or row_bytes <= 0 or stride <= row_bytes or stride % sec != 0:
+        return None
+    if line_bytes is not None:
+        if line_bytes < sec or stride < line_bytes or (line_bytes // math.gcd(stride, line_bytes)) > _MAX_BAND_LINE_PERIOD:
+            return None
+    r_lo, off = divmod(base_byte, stride)
+    c_lo = (off // sec) * sec
+    c_hi = ((off + row_bytes + sec - 1) // sec) * sec
+    if c_hi > stride or c_hi <= c_lo:
+        return None
+    return stride, sec, r_lo, r_lo + rows, c_lo, c_hi
+
+
+def _strided_band_from_run(
+    run, sec: int, line_bytes: int | None, max_rows: int,
+) -> tuple[int, int, int, int, int, int] | None:
+    """Return ``(stride, sec, r_lo, r_hi, c_lo, c_hi)`` when ``run`` is an exact 2D row band."""
+    return _strided_band_from_ints(
+        run.base_byte, run.rows, run.row_bytes, run.stride_bytes, sec, line_bytes, max_rows,
+    )
+
+
+def _row_pair_line_overlap(
+    r_prev: int, stride: int, prev_end: int, next_start: int, line_bytes: int,
+) -> int:
+    """Exact shared ``line_bytes`` overlap between row ``r_prev`` end and row ``r_prev + 1`` start."""
+    end_al = ((r_prev * stride + prev_end + line_bytes - 1) // line_bytes) * line_bytes
+    next_al = (((r_prev + 1) * stride + next_start) // line_bytes) * line_bytes
+    ov = end_al - next_al
+    return ov if ov > 0 else 0
+
+
+def _shifted_aligned_bytes(
+    cols: tuple[tuple[int, int], ...], shift: int, line_bytes: int,
+) -> int:
+    """Exact ``line_bytes``-aligned byte span of ``cols`` shifted by ``shift``."""
+    if not cols:
+        return 0
+    total = 0
+    cur_lo = cur_hi = -1
+    step = line_bytes - 1
+    for c_lo, c_hi in cols:
+        al = ((shift + c_lo) // line_bytes) * line_bytes
+        ah = ((shift + c_hi + step) // line_bytes) * line_bytes
+        if al <= cur_hi:
+            if ah > cur_hi:
+                cur_hi = ah
+        else:
+            if cur_hi > cur_lo:
+                total += cur_hi - cur_lo
+            cur_lo, cur_hi = al, ah
+    return total + (cur_hi - cur_lo if cur_hi > cur_lo else 0)
+
+
+def _band_aligned_bytes(
+    r_lo: int, r_hi: int, stride: int, cols: tuple[tuple[int, int], ...], line_bytes: int,
+) -> int:
+    """Exact ``line_bytes``-aligned byte span of one row band ``[r_lo, r_hi) x cols``."""
+    n_rows = r_hi - r_lo
+    if n_rows <= 0 or not cols:
+        return 0
+    if stride % line_bytes == 0:
+        return n_rows * _aligned_intervals_bytes(cols, line_bytes)
+    period = line_bytes // math.gcd(stride, line_bytes)
+    limit = n_rows if n_rows < period else period
+    full, rem = divmod(n_rows, period)
+    row_period = row_rem = 0
+    for p in range(limit):
+        val = _shifted_aligned_bytes(cols, ((r_lo + p) * stride) % line_bytes, line_bytes)
+        row_period += val
+        if p < rem:
+            row_rem += val
+    total = full * row_period + row_rem
+    n_pairs = n_rows - 1
+    if n_pairs > 0:
+        c_first, c_last = cols[0][0], cols[-1][1]
+        p_limit = n_pairs if n_pairs < period else period
+        p_full, p_rem = divmod(n_pairs, period)
+        ov_period = ov_rem = 0
+        for p in range(p_limit):
+            ov = _row_pair_line_overlap(r_lo + p, stride, c_last, c_first, line_bytes)
+            ov_period += ov
+            if p < p_rem:
+                ov_rem += ov
+        total -= p_full * ov_period + ov_rem
+    return total
+
+
+def _strided_bands_aligned_bytes(
+    bands: Sequence[tuple[int, int, tuple[tuple[int, int], ...]]], stride: int, line_bytes: int,
+) -> int:
+    """Exact ``line_bytes``-aligned byte span across sorted disjoint row bands (``stride >= line_bytes``)."""
+    if not bands:
+        return 0
+    if stride % line_bytes == 0:
+        return sum((r_hi - r_lo) * _aligned_intervals_bytes(cols, line_bytes) for r_lo, r_hi, cols in bands)
+    total = 0
+    prev_hi = -1
+    prev_last = 0
+    for r_lo, r_hi, cols in bands:
+        if r_hi <= r_lo or not cols:
+            continue
+        total += _band_aligned_bytes(r_lo, r_hi, stride, cols, line_bytes)
+        if prev_hi == r_lo:
+            total -= _row_pair_line_overlap(prev_hi - 1, stride, prev_last, cols[0][0], line_bytes)
+        prev_hi = r_hi
+        prev_last = cols[-1][1]
+    return total
+
+
+def _append_coalesced_band(
+    dst: list[tuple[int, int, tuple[tuple[int, int], ...]]],
+    r_lo: int,
+    r_hi: int,
+    cols: tuple[tuple[int, int], ...],
+) -> None:
+    if r_hi <= r_lo or not cols:
+        return
+    if dst and dst[-1][1] == r_lo and dst[-1][2] == cols:
+        dst[-1] = (dst[-1][0], r_hi, cols)
+    else:
+        dst.append((r_lo, r_hi, cols))
+
+
+@dataclass(slots=True)
+class _StridedBandSet:
+    """Exact 2D row-band store for canonical sector intervals under fixed ``stride``."""
+
+    stride: int
+    sector_bytes: int
+    bands: list[tuple[int, int, tuple[tuple[int, int], ...]]]
+    line_aligned_to: int | None = None
+    aligned_cache: tuple[int, int] | None = None
+
+    def overlap_rect(self, r_lo: int, r_hi: int, c_lo: int, c_hi: int) -> int:
+        bands = self.bands
+        if not bands or r_hi <= r_lo or c_hi <= c_lo:
+            return 0
+        if bands[-1][1] <= r_lo or r_hi <= bands[0][0]:
+            return 0
+        idx = bisect_left(bands, (r_lo, 0, ()))
+        if idx > 0 and bands[idx - 1][1] > r_lo:
+            idx -= 1
+        req = ((c_lo, c_hi),)
+        total = 0
+        n = len(bands)
+        while idx < n:
+            b_lo, b_hi, b_cols = bands[idx]
+            if b_lo >= r_hi:
+                break
+            ov_rows = (r_hi if r_hi < b_hi else b_hi) - (r_lo if r_lo > b_lo else b_lo)
+            if ov_rows > 0:
+                total += ov_rows * _overlap_canonical_intervals(req, b_cols)
+            idx += 1
+        return total
+
+    def overlap_interval(self, lo: int, hi: int) -> int:
+        bands = self.bands
+        if hi <= lo or not bands:
+            return 0
+        stride = self.stride
+        r0, off0 = divmod(lo, stride)
+        r1, off1 = divmod(hi - 1, stride)
+        off1_end = off1 + 1
+        if r0 == r1:
+            return self.overlap_rect(r0, r0 + 1, off0, off1_end)
+        total = self.overlap_rect(r0, r0 + 1, off0, stride) + self.overlap_rect(r1, r1 + 1, 0, off1_end)
+        mid_lo = r0 + 1
+        if mid_lo < r1 and bands[-1][1] > mid_lo and bands[0][0] < r1:
+            idx = bisect_left(bands, (mid_lo, 0, ()))
+            if idx > 0 and bands[idx - 1][1] > mid_lo:
+                idx -= 1
+            n = len(bands)
+            while idx < n:
+                b_lo, b_hi, b_cols = bands[idx]
+                if b_lo >= r1:
+                    break
+                ov_rows = (r1 if r1 < b_hi else b_hi) - (mid_lo if mid_lo > b_lo else b_lo)
+                if ov_rows > 0:
+                    total += ov_rows * sum(y - x for x, y in b_cols)
+                idx += 1
+        return total
+
+    def planned_merge(
+        self, r_lo: int, r_hi: int, c_lo: int, c_hi: int,
+    ) -> list[tuple[int, int, tuple[tuple[int, int], ...]]]:
+        bands = self.bands
+        req = ((c_lo, c_hi),)
+        if not bands:
+            return [(r_lo, r_hi, req)]
+        if len(bands) == 1 and bands[0][0] == r_lo and bands[0][1] == r_hi:
+            return [(r_lo, r_hi, _merge_canonical_pairs(bands[0][2], req))]
+        lo_idx = bisect_left(bands, (r_lo, 0, ()))
+        if lo_idx > 0 and bands[lo_idx - 1][1] >= r_lo:
+            lo_idx -= 1
+        hi_idx = bisect_left(bands, (r_hi + 1, 0, ()), lo_idx)
+        mid: list[tuple[int, int, tuple[tuple[int, int], ...]]] = []
+        cur = r_lo
+        for b_lo, b_hi, b_cols in bands[lo_idx:hi_idx]:
+            if b_lo < r_lo:
+                _append_coalesced_band(mid, b_lo, r_lo if r_lo < b_hi else b_hi, b_cols)
+            if cur < b_lo and cur < r_hi:
+                gap_hi = b_lo if b_lo < r_hi else r_hi
+                _append_coalesced_band(mid, cur, gap_hi, req)
+                cur = gap_hi
+            ov_lo = b_lo if b_lo > cur else cur
+            ov_hi = b_hi if b_hi < r_hi else r_hi
+            if ov_hi > ov_lo:
+                _append_coalesced_band(mid, ov_lo, ov_hi, _merge_canonical_pairs(b_cols, req))
+                cur = ov_hi
+            if b_hi > r_hi:
+                _append_coalesced_band(mid, b_lo if b_lo > r_hi else r_hi, b_hi, b_cols)
+        if cur < r_hi:
+            _append_coalesced_band(mid, cur, r_hi, req)
+        return bands[:lo_idx] + mid + bands[hi_idx:]
+
+    def plan_merge_slice(
+        self, r_lo: int, r_hi: int, c_lo: int, c_hi: int, line_bytes: int,
+    ) -> tuple[int, int, list[tuple[int, int, tuple[tuple[int, int], ...]]], int]:
+        """Compute only the touched band slice and exact new ``line_bytes``-aligned total (requires ``stride % line_bytes == 0``)."""
+        bands = self.bands
+        req = ((c_lo, c_hi),)
+        cache = self.aligned_cache
+        if cache is not None and cache[0] == line_bytes:
+            old_total = cache[1]
+        else:
+            old_total = _strided_bands_aligned_bytes(bands, self.stride, line_bytes)
+            self.aligned_cache = (line_bytes, old_total)
+        if not bands:
+            new_total = (r_hi - r_lo) * _aligned_intervals_bytes(req, line_bytes)
+            return 0, 0, [(r_lo, r_hi, req)], new_total
+        if len(bands) == 1 and bands[0][0] == r_lo and bands[0][1] == r_hi:
+            merged_cols = _merge_canonical_pairs(bands[0][2], req)
+            new_total = (r_hi - r_lo) * _aligned_intervals_bytes(merged_cols, line_bytes)
+            return 0, 1, [(r_lo, r_hi, merged_cols)], new_total
+        lo_idx = bisect_left(bands, (r_lo, 0, ()))
+        if lo_idx > 0 and bands[lo_idx - 1][1] >= r_lo:
+            lo_idx -= 1
+        hi_idx = bisect_left(bands, (r_hi + 1, 0, ()), lo_idx)
+        old_mid = 0
+        mid: list[tuple[int, int, tuple[tuple[int, int], ...]]] = []
+        cur = r_lo
+        for b_lo, b_hi, b_cols in bands[lo_idx:hi_idx]:
+            old_mid += (b_hi - b_lo) * _aligned_intervals_bytes(b_cols, line_bytes)
+            if b_lo < r_lo:
+                _append_coalesced_band(mid, b_lo, r_lo if r_lo < b_hi else b_hi, b_cols)
+            if cur < b_lo and cur < r_hi:
+                gap_hi = b_lo if b_lo < r_hi else r_hi
+                _append_coalesced_band(mid, cur, gap_hi, req)
+                cur = gap_hi
+            ov_lo = b_lo if b_lo > cur else cur
+            ov_hi = b_hi if b_hi < r_hi else r_hi
+            if ov_hi > ov_lo:
+                _append_coalesced_band(mid, ov_lo, ov_hi, _merge_canonical_pairs(b_cols, req))
+                cur = ov_hi
+            if b_hi > r_hi:
+                _append_coalesced_band(mid, b_lo if b_lo > r_hi else r_hi, b_hi, b_cols)
+        if cur < r_hi:
+            _append_coalesced_band(mid, cur, r_hi, req)
+        new_mid = 0
+        for m_lo, m_hi, m_cols in mid:
+            new_mid += (m_hi - m_lo) * _aligned_intervals_bytes(m_cols, line_bytes)
+        return lo_idx, hi_idx, mid, old_total - old_mid + new_mid
+
+    def merge_inplace(self, r_lo: int, r_hi: int, c_lo: int, c_hi: int) -> None:
+        self.aligned_cache = None
+        bands = self.bands
+        req = ((c_lo, c_hi),)
+        if not bands:
+            bands.append((r_lo, r_hi, req))
+            return
+        if len(bands) == 1 and bands[0][0] == r_lo and bands[0][1] == r_hi:
+            bands[0] = (r_lo, r_hi, _merge_canonical_pairs(bands[0][2], req))
+            return
+        lo_idx = bisect_left(bands, (r_lo, 0, ()))
+        if lo_idx > 0 and bands[lo_idx - 1][1] >= r_lo:
+            lo_idx -= 1
+        hi_idx = bisect_left(bands, (r_hi + 1, 0, ()), lo_idx)
+        mid: list[tuple[int, int, tuple[tuple[int, int], ...]]] = []
+        cur = r_lo
+        for b_lo, b_hi, b_cols in bands[lo_idx:hi_idx]:
+            if b_lo < r_lo:
+                _append_coalesced_band(mid, b_lo, r_lo if r_lo < b_hi else b_hi, b_cols)
+            if cur < b_lo and cur < r_hi:
+                gap_hi = b_lo if b_lo < r_hi else r_hi
+                _append_coalesced_band(mid, cur, gap_hi, req)
+                cur = gap_hi
+            ov_lo = b_lo if b_lo > cur else cur
+            ov_hi = b_hi if b_hi < r_hi else r_hi
+            if ov_hi > ov_lo:
+                _append_coalesced_band(mid, ov_lo, ov_hi, _merge_canonical_pairs(b_cols, req))
+                cur = ov_hi
+            if b_hi > r_hi:
+                _append_coalesced_band(mid, b_lo if b_lo > r_hi else r_hi, b_hi, b_cols)
+        if cur < r_hi:
+            _append_coalesced_band(mid, cur, r_hi, req)
+        bands[lo_idx:hi_idx] = mid
+
+    def to_intervals(self) -> list[tuple[int, int]]:
+        out: list[tuple[int, int]] = []
+        stride = self.stride
+        for r_lo, r_hi, cols in self.bands:
+            if not cols:
+                continue
+            for r in range(r_lo, r_hi):
+                base = r * stride
+                for c_lo, c_hi in cols:
+                    lo, hi = base + c_lo, base + c_hi
+                    if out and lo <= out[-1][1]:
+                        if hi > out[-1][1]:
+                            out[-1] = (out[-1][0], hi)
+                    else:
+                        out.append((lo, hi))
+        return out
 
 
 def _row_index_bounds(
