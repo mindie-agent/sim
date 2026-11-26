@@ -888,6 +888,9 @@ class Engine(
         self._stage_proto_prepared: dict[tuple, tuple] = {}
         self._compiled_programs: dict[int, tuple[Any, Any]] = {}
         self._seen_floor_peaks: set[int] = set()
+        self._next_static_id: int = 0
+        self._partial_placed_live: dict[str, int] = {}
+        self._validated_placements: dict[int, tuple[Any, dict[str, tuple[int, ...]], bool]] = {}
         self._empty_task: _PreparedTask = _EMPTY_TASK
         self.memory_ledger_error: str | None = None
         from .accel_bridge import make_backend
@@ -980,6 +983,14 @@ class Engine(
         status["python_steps"] = max(0, int(self.advance_steps) - native)
         status.setdefault("requested", self._accel_telemetry.get("requested"))
         return status
+
+    def close(self) -> None:
+        """Release the native accelerator arena and transient scheduler caches immediately."""
+        if self._accel is not None:
+            self._accel_telemetry = self.accel_status()
+            self._accel.close()
+            self._accel = None
+        self._clear_prepared_caches()
 
     def _frontier_next_release(self) -> float:
         return self._releases[0][0] if self._releases else math.inf

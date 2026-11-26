@@ -205,9 +205,13 @@ class _PreparedTask:
     latency_from_first_service: bool = False
     hbm_bus_epoch: int = 0
     hbm_accounting: tuple[tuple[str, float, float, float, float | None, str, float, str, float, str], ...] = ()
+    partial_placed_resources: frozenset[str] = _EMPTY_FROZENSET
+    static_stable: bool = False
+    explicit_units: int = 0
+    effective_units: int = 0
 
 
-_EMPTY_TASK = _PreparedTask({}, 0.0, {}, (), (), {}, False, (), 0)
+_EMPTY_TASK = _PreparedTask({}, 0.0, {}, (), (), {}, False, (), 0, static_stable=True)
 
 _MEMORY_FIELDS = (
     "owner", "storage", "tier", "rank", "stage", "generation", "ranges",

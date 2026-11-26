@@ -243,12 +243,13 @@ class DirectPeerGroup(PairwiseGroup):
                     issue(src)
 
                 engine.submit(prefix + ":received", after=(previous,),
-                              owner=owner, on_complete=arrive)
+                              owner=owner, on_complete=arrive, native_hook=True)
             retire(index)
 
         for index, rank in enumerate(self.ranks):
             engine.submit(f"{name}:rank{rank}:entry", after=(initial[rank],),
-                          owner=owner, on_complete=lambda _, i=index: issue(i))
+                          owner=owner, on_complete=lambda _, i=index: issue(i),
+                          native_hook=True)
         return complete
 
     def _start_peer_message(
@@ -404,7 +405,7 @@ class DirectPeerGroup(PairwiseGroup):
                 service = engine.submit(
                     f"{prefix}:chunk{chunk_index}:hop{hop_index}:service",
                     hop.demand, after=tuple(dependencies), owner=owner,
-                    coupled=True,
+                    coupled=True, native_hook=hop_index == 0,
                     on_complete=(
                         (lambda event, ci=chunk_index: on_hop0_done(event, ci))
                         if hop_index == 0
@@ -422,7 +423,7 @@ class DirectPeerGroup(PairwiseGroup):
                     metadata={"startup_boundary": "destination_receipt_once"})
             received_event = engine.submit(
                 f"{prefix}:chunk{chunk_index}:received", after=(previous,),
-                owner=owner,
+                owner=owner, native_hook=True,
                 on_complete=lambda event, ci=chunk_index, p=prefix,
                 a=allocation, hc=len(chunk): arrived(event, ci, p, a, hc))
 

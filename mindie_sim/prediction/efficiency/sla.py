@@ -45,6 +45,12 @@ SLA_SENSITIVITY_FULL = "full"
 #: A per-sequence marginal step below this is flat (or negative): no secant.
 SECANT_MIN_SLOPE_MS = 1e-9
 _MIN_ROW_LEADING_DIMS = 2
+_US_PER_MS = 1000.0
+_DUPLEX_HALF_DIVISOR = 2.0
+_MIN_COLL_GROUP_SIZE = 2
+_MIN_COLL_PAIR_GROUP = (0, 1)
+_BAND_FLOOR_COLLECTIVES = ("allgather", "reduce_scatter", "allreduce")
+_BAND_RING_ALGOS = frozenset({"ring", "pairwise"})
 
 DEFAULT_SLA_SCENARIOS: tuple[dict[str, Any], ...] = (
     {"id": "baseline", "label": "1x HBM, 1x Compute", "hbm_bw_scale": 1.0, "cube_flops_scale": 1.0, "vector_ops_scale": 1.0, "link_bw_scale": 1.0},
@@ -853,6 +859,77 @@ class _SLASizingRun:
             secant_estimate, certified_optimal=certified_optimal, hi_cut=hi_cut)
 
     @staticmethod
+    def _collective_band_floor_info(eff_case: CaseSpec, eval_ctx: Any, links: Sequence[Any]):
+        """Return ``(band_floor_ms_by_family, recipe_book, topology)`` sound across all ``b' >= b``."""
+        bindings = getattr(eval_ctx, "bindings", eval_ctx) if eval_ctx is not None else None
+        topo = getattr(bindings, "topology", None) if bindings is not None else None
+        if topo is None or not getattr(topo, "_has_primitive_table", False):
+            return {}, None, None
+        kernels = getattr(eff_case.runtime, "kernels", None) or {}
+        pos_links = [
+            lk for lk in links
+            if float(getattr(lk, "capacity_bytes_per_ms", 0.0) or 0.0) > 0.0
+            and len(getattr(lk, "members", ()) or ()) >= _MIN_COLL_GROUP_SIZE
+        ]
+        if not pos_links:
+            return {}, None, None
+        all_bands = []
+        for lk in pos_links:
+            bands = tuple(topo.link_protocol_bands(lk.name))
+            if not bands:
+                return {}, None, None
+            all_bands.extend(bands)
+        if not all_bands:
+            return {}, None, None
+        p18_col = str(getattr(topo, "_p18_measured_collective", "") or "").strip().lower()
+        p18_cands_us: list[float] = []
+        for attr in ("p18_startup_us", "p18_eager_startup_us"):
+            val = float(getattr(topo, attr, 0.0) or 0.0)
+            if val > 0.0:
+                p18_cands_us.append(val)
+        p19_cands_us: list[float] = []
+        uncoalesced = bool(getattr(topo, "_p19_uncoalesced_duplex", False))
+        host_sub_us = float(getattr(topo, "_p15_host_submit_us", 0.0) or 0.0)
+        p19_blk = float(getattr(topo, "_p19_duplex_blocked_us", 0.0) or 0.0)
+        if p19_blk > 0.0:
+            p19_cands_us.append(p19_blk / _DUPLEX_HALF_DIVISOR if uncoalesced else p19_blk)
+        p19_egr = float(getattr(topo, "_p19_duplex_eager_us", 0.0) or 0.0)
+        if p19_egr > 0.0:
+            egr_floor = (
+                p19_egr / _DUPLEX_HALF_DIVISOR
+                if uncoalesced
+                else max(0.0, p19_egr - host_sub_us)
+            )
+            if egr_floor > 0.0:
+                p19_cands_us.append(egr_floor)
+        oneshot_us = float(topo._oneshot_startup_ms()) * _US_PER_MS
+        floors_ms: dict[str, float] = {}
+        for fam in _BAND_FLOOR_COLLECTIVES:
+            min_ds_us = min(
+                float(topo.collective_device_step_us(
+                    fam, _MIN_COLL_PAIR_GROUP,
+                    alpha_us=float(getattr(band, "startup_us", 0.0) or 0.0),
+                    stack="graph", phase_count=1, total_rounds=1,
+                    startup_scope=str(getattr(band, "startup_scope", "step") or "step"),
+                ))
+                for band in all_bands
+            )
+            if min_ds_us <= 0.0:
+                continue
+            cands = [min_ds_us, *p19_cands_us]
+            if p18_cands_us and (not p18_col or p18_col == fam):
+                cands.extend(p18_cands_us)
+            if fam == "allreduce" and oneshot_us > 0.0:
+                cands.append(oneshot_us)
+            floor_us = min(cands)
+            if floor_us > 0.0:
+                floors_ms[fam] = floor_us / _US_PER_MS
+        if not floors_ms:
+            return {}, None, None
+        from ..program import RecipeBook
+        return floors_ms, RecipeBook.from_mapping(kernels), topo
+
+    @staticmethod
     def _hardware_floor_caps(eff_case: CaseSpec, eval_ctx: Any = None, *, dies: Sequence[Any] | None = None):
         dies = tuple(dies) if dies is not None else (getattr(getattr(eff_case, "machine", None), "dies", ()) or ())
         pt = getattr(eval_ctx, "primitive_table", None) if eval_ctx is not None else None
@@ -923,9 +1000,10 @@ class _SLASizingRun:
                 per_rank_egress[int(r)] = per_rank_egress.get(int(r), 0.0) + cap * float(mult)
         max_link_ms = max(per_rank_egress.values(), default=0.0)
         hop_lat_ms = 0.0 if not math.isfinite(min_link_lat_ms) else min_link_lat_ms
+        coll_floor_info = _SLASizingRun._collective_band_floor_info(eff_case, eval_ctx, links)
         return (
             max_hbm_ms, max_vec_ms, cube_peaks_ms, max(cube_peaks_ms.values(), default=0.0),
-            max_link_ms, hop_lat_ms, max_l2_bytes, min_inv_by_class, links,
+            max_link_ms, hop_lat_ms, max_l2_bytes, min_inv_by_class, links, coll_floor_info,
         )
 
     @staticmethod
@@ -952,8 +1030,9 @@ class _SLASizingRun:
         """Accumulate one op's stage work floors and return ``(a_op, c_op, used_gg)``."""
         (
             max_hbm_ms, max_vec_ms, cube_peaks_ms, max_cube_ms,
-            max_link_ms, hop_lat_ms, _max_l2_bytes, min_inv_by_class, _links,
+            max_link_ms, hop_lat_ms, _max_l2_bytes, min_inv_by_class, _links, coll_floor_info,
         ) = caps
+        coll_band_floor_ms, floor_recipes, floor_topo = coll_floor_info
         min_cube_inv = min_inv_by_class.get("cube", 0.0)
         min_vec_inv = min_inv_by_class.get("vector", 0.0)
         st = int(getattr(op, "stage", 0) or 0)
@@ -977,10 +1056,15 @@ class _SLASizingRun:
             # Unpadded multi-dim ops (attention, logits) keep leading dim <= active_rows
             # and tokens_global <= active_rows; captured and SP-padded ops carry padded rows.
             op_unpadded = (
-                len(sem) >= _MIN_ROW_LEADING_DIMS
-                and float(sem[0]) <= float(active_rows)
-                and (not loc or float(loc[0]) <= float(active_rows))
+                int(md.get("graph_physical_query_rows") or 0) <= active_rows
                 and tokens_global <= active_rows
+                if fam == "grouped_gemm"
+                else (
+                    len(sem) >= _MIN_ROW_LEADING_DIMS
+                    and float(sem[0]) <= float(active_rows)
+                    and (not loc or float(loc[0]) <= float(active_rows))
+                    and tokens_global <= active_rows
+                )
             )
             if not op_unpadded:
                 sem_scale = min(sem_scale, float(active_rows) / float(phys_rows))
@@ -1055,8 +1139,22 @@ class _SLASizingRun:
             # Full-duplex compulsory send volume across all incident peer links of a die.
             compulsory_link_ms = (0.5 * lbytes * sem_scale) / max_link_ms
             stage_link[st] = stage_link.get(st, 0.0) + compulsory_link_ms
-            if hop_lat_ms + compulsory_link_ms > a_op + c_op * float(b):
-                a_op, c_op = hop_lat_ms, compulsory_link_ms * inv_b
+            coll_fixed_ms = hop_lat_ms
+            band_ms = coll_band_floor_ms.get(fam, 0.0)
+            if (band_ms > coll_fixed_ms and floor_recipes is not None and floor_topo is not None
+                    and not md.get("collective_startup_mode") and not md.get("megamoe_geometry")):
+                from ..collectives import plan_options as collective_options
+                rec = floor_recipes.select(op)
+                exp_algo = getattr(rec, "algorithm", None)
+                is_band_rec = (
+                    exp_algo in _BAND_RING_ALGOS
+                    or (exp_algo is None and bool(getattr(rec, "mesh_capable", False))
+                        and not floor_topo.declares_direct_mesh(op, 0))
+                )
+                if is_band_rec and not collective_options(rec, op):
+                    coll_fixed_ms = band_ms
+            if coll_fixed_ms + compulsory_link_ms > a_op + c_op * float(b):
+                a_op, c_op = coll_fixed_ms, compulsory_link_ms * inv_b
         if (lbytes <= 0.0 and fam not in non_kernel_fams
                 and getattr(op, "coverage", "") != "pool_release"
                 and getattr(op, "source_boundary", "") != "host"

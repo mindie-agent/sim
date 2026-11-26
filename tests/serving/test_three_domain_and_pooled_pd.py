@@ -1433,3 +1433,50 @@ def test_pd_shared_l2_namespace_dcp_replica_scope_and_recoverssm_stride():
     sp_none = speculative_state_plan(c_kda.model, kda_layer, ParallelSpec(tp=1), query_tokens=2, recover_ssm=True, capacity_padded=False, runtime=rt_none)
     assert sp_none.replay_bytes == pytest.approx(sp_q4.replay_bytes * 0.5)
 
+
+def test_pd_prefill_prefix_cache_monotonically_reduces_ttft():
+    """Standalone pd_prefill must honor prefix_tokens / prefix hit ratio and reduce TTFT monotonically."""
+    from mindie_sim.sweep.pd import _evaluate_pd_prefill_candidate
+
+    prompt_tokens = 2048
+    output_tokens = 64
+    ttft_sla_ms = 5000.0
+    ratios = (0.0, 0.5, 0.9)
+    rows = []
+    for ratio in ratios:
+        prefix_tokens = int(prompt_tokens * ratio)
+        raw = compose_case(
+            "qwen3-32b", "a3", dp=1, tp=2, ep=1, layers=2,
+            prompt_tokens=prompt_tokens, output_tokens=output_tokens,
+            prefix_tokens=prefix_tokens, role="pd_prefill", ttft_slo_ms=ttft_sla_ms,
+        )
+        rows.append(_evaluate_pd_prefill_candidate(
+            raw, prompt_tokens=prompt_tokens, output_tokens=output_tokens,
+            ttft_sla_ms=ttft_sla_ms, mtp_tokens=0,
+        ))
+    assert all(r["feasible"] for r in rows)
+    assert rows[2]["ttft_ms"] < rows[1]["ttft_ms"] < rows[0]["ttft_ms"]
+    assert rows[2]["prefill_rps_per_die"] > rows[1]["prefill_rps_per_die"] > rows[0]["prefill_rps_per_die"]
+
+    # End-to-end solve_optimal_deployment honors both compose_overrides.prefix_tokens and pool_prefix_hit_ratio.
+    common = dict(
+        num_devices=2, prompt_tokens=prompt_tokens, output_tokens=output_tokens,
+        ttft_sla_ms=ttft_sla_ms, deployment_mode="pd_prefill",
+        layers=2, pinned_parallel={"dp": 1, "tp": 2, "ep": 1, "pp": 1},
+        granted_workers=1,
+    )
+    sol_0 = solve_optimal_deployment("qwen3-32b", "a3", **common)
+    sol_90_override = solve_optimal_deployment(
+        "qwen3-32b", "a3", compose_overrides={"prefix_tokens": int(prompt_tokens * 0.9)}, **common,
+    )
+    sol_90_ratio = solve_optimal_deployment(
+        "qwen3-32b", "a3", pool_prefix_hit_ratio=0.9, **common,
+    )
+    ttft_0 = float(sol_0["best_configuration"]["ttft_ms"])
+    ttft_90_ov = float(sol_90_override["best_configuration"]["ttft_ms"])
+    ttft_90_rat = float(sol_90_ratio["best_configuration"]["ttft_ms"])
+    assert ttft_90_ov == pytest.approx(rows[2]["ttft_ms"], rel=1e-9)
+    assert ttft_90_rat == pytest.approx(rows[2]["ttft_ms"], rel=1e-9)
+    assert ttft_90_ov < ttft_0
+
+

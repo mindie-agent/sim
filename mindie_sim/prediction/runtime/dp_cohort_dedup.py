@@ -354,12 +354,183 @@ def _dag_reachability_masks(ops: Sequence[Any]) -> tuple[list[int], list[int]]:
     return anc, desc
 
 
-def _has_unsynced_peer_die_overlap(execution: Any, w0: Any, r0: int) -> bool:
+def _bytes_close(lhs: float, rhs: float) -> bool:
+    return abs(lhs - rhs) <= _BYTE_RECIPROCITY_REL_TOL * max(1.0, abs(lhs), abs(rhs))
+
+
+def _replica_pair_blocks_reciprocal(
+    matrix: Sequence[Mapping[int, int]],
+    byte_rows: Sequence[Mapping[int, float]],
+    has_byte_matrix: bool,
+    base1: int,
+    base2: int,
+    local_k: int,
+) -> bool:
+    """True when cross-replica directed block (r1 -> r2) matches (r2 -> r1) by local position."""
+    for u0 in range(local_k):
+        src12 = base1 + u0
+        src21 = base2 + u0
+        for v0 in range(local_k):
+            dst12 = base2 + v0
+            dst21 = base1 + v0
+            if matrix[src12].get(dst12, 0) != matrix[src21].get(dst21, 0):
+                return False
+            if has_byte_matrix and not _bytes_close(
+                byte_rows[src12].get(dst12, 0.0), byte_rows[src21].get(dst21, 0.0),
+            ):
+                return False
+    return True
+
+
+def _intra_replica_block_matches(
+    matrix: Sequence[Mapping[int, int]],
+    byte_rows: Sequence[Mapping[int, float]],
+    has_byte_matrix: bool,
+    base: int,
+    local_k: int,
+) -> bool:
+    """True when replica ``base`` has the same intra-replica directed flows as replica 0."""
+    for u0 in range(local_k):
+        for v0 in range(local_k):
+            if u0 == v0:
+                continue
+            if matrix[base + u0].get(base + v0, 0) != matrix[u0].get(v0, 0):
+                return False
+            if has_byte_matrix and not _bytes_close(
+                byte_rows[base + u0].get(base + v0, 0.0), byte_rows[u0].get(v0, 0.0),
+            ):
+                return False
+    return True
+
+
+def _matrices_are_replica_reciprocal(
+    matrix: Sequence[Mapping[int, int]],
+    byte_rows: Sequence[Mapping[int, float]],
+    has_byte_matrix: bool,
+    width: int,
+    local_k: int,
+) -> bool:
+    """True when cross-replica blocks are strictly reciprocal and intra-blocks isomorphic."""
+    if width <= 0 or local_k <= 0 or width % local_k != 0:
+        return False
+    n_replicas = width // local_k
+    for r1 in range(n_replicas):
+        base1 = r1 * local_k
+        for r2 in range(r1 + 1, n_replicas):
+            if not _replica_pair_blocks_reciprocal(
+                matrix, byte_rows, has_byte_matrix, base1, r2 * local_k, local_k,
+            ):
+                return False
+    if local_k > 1:
+        for rep in range(1, n_replicas):
+            if not _intra_replica_block_matches(
+                matrix, byte_rows, has_byte_matrix, rep * local_k, local_k,
+            ):
+                return False
+    return True
+
+
+def _raw_mc2_matrices_reciprocal(mc2_phase: Mapping[str, Any], ep_width: int, local_k: int) -> bool:
+    """Pure read-only replica-block reciprocity check directly over raw ``mc2_phase`` metadata."""
+    route_matrix = mc2_phase.get("route_matrix")
+    route_bytes = mc2_phase.get("route_matrix_bytes")
+    if not route_matrix and not route_bytes:
+        return True
+    if route_matrix and len(route_matrix) != ep_width:
+        return False
+    if route_bytes and len(route_bytes) != ep_width:
+        return False
+    reverse = bool(mc2_phase.get("route_reverse", False))
+    matrix: list[dict[int, int]] = [{} for _ in range(ep_width)]
+    if route_matrix:
+        for u in range(ep_width):
+            row = route_matrix[u]
+            if len(row) != ep_width:
+                return False
+            for v in range(ep_width):
+                val = int(route_matrix[v][u] if reverse else row[v])
+                if u != v and val > 0:
+                    matrix[u][v] = val
+    byte_rows: list[dict[int, float]] = [{} for _ in range(ep_width)]
+    if route_bytes:
+        for u in range(ep_width):
+            row_b = route_bytes[u]
+            if len(row_b) != ep_width:
+                return False
+            for v in range(ep_width):
+                b_val = float(row_b[v] or 0.0)
+                if u != v and b_val > 0.0:
+                    byte_rows[u][v] = b_val
+    return _matrices_are_replica_reciprocal(
+        matrix, byte_rows, bool(route_bytes), ep_width, local_k,
+    )
+
+
+def _mc2_op_can_run_canonical(
+    execution: Any,
+    op: Any,
+    r0: int,
+    source_stage: int,
+    *,
+    can_r0_only: bool,
+    replicas: tuple[int, ...],
+) -> bool:
+    """True only when a multi-rank MC2 op is guaranteed to execute canonical r0-only."""
+    if not can_r0_only or len(replicas) < _MIN_DEDUP_REPLICAS:
+        return False
+    if not getattr(execution.topology, "links", None):
+        return False
+    if not hasattr(execution, "_verify_canonical_cohort_reciprocity"):
+        return False
+    meta = op.metadata
+    mc2_phase = None
+    if meta:
+        items = meta.items() if isinstance(meta, Mapping) else meta
+        for key, value in items:
+            if key == "mc2_phase":
+                mc2_phase = value
+                break
+    if not isinstance(mc2_phase, Mapping):
+        return False
+    ep_width = int(mc2_phase.get("ep", 0) or 0)
+    r0_ranks = tuple(execution.topology.ranks(r0, source_stage))
+    local_k = len(r0_ranks)
+    if ep_width <= 1 or local_k <= 0 or ep_width % local_k != 0:
+        return False
+    peer_replicas = replicas
+    ep_groups = tuple(execution.topology.groups("ep", r0, source_stage)) if hasattr(execution.topology, "groups") else ()
+    r0_rank_set = set(r0_ranks)
+    ep_group = next((grp for grp in ep_groups if r0_rank_set & set(grp)), ())
+    if ep_group:
+        ep_rank_set = {int(rk) for rk in ep_group}
+        matched = tuple(
+            r for r in replicas
+            if any(int(rk) in ep_rank_set for rk in execution.topology.ranks(r, source_stage))
+        )
+        if matched:
+            peer_replicas = matched
+    if len(peer_replicas) * local_k != ep_width:
+        return False
+    for rep in peer_replicas:
+        if len(execution.topology.ranks(rep, source_stage)) != local_k:
+            return False
+    return _raw_mc2_matrices_reciprocal(mc2_phase, ep_width, local_k)
+
+
+def _has_unsynced_peer_die_overlap(
+    execution: Any,
+    w0: Any,
+    r0: int,
+    *,
+    replicas: tuple[int, ...] = (),
+) -> bool:
     """True when multi-stream r0 ops can genuinely overlap synthesized peer cohorts.
 
     A multi-stream replica can still deduplicate bit-identically whenever every
     non-barrier op on another stream in the same PP stage is strictly ordered
-    (ancestor or descendant in the op DAG) with every non-r0-only collective.
+    (ancestor or descendant in the op DAG) with every non-r0-only collective,
+    or when an overlapping MC2 op is provably eligible for canonical r0-only
+    cohort execution (zero synthesized peer replicas).
     """
     ops0 = w0.ops
     if len({op.stream for op in ops0}) <= 1:
@@ -388,8 +559,12 @@ def _has_unsynced_peer_die_overlap(execution: Any, w0: Any, r0: int) -> bool:
                 elif key == "source_stage" and value is not None:
                     source_stage = int(value)
         is_mc2 = op.family in _NATIVE_MC2_FAMILIES or has_mc2_phase
+        multi_rank_mc2 = is_mc2 and len(execution.topology.ranks(r0, source_stage)) > 1
         needs_peer_sync = (
-            (is_mc2 and len(execution.topology.ranks(r0, source_stage)) > 1)
+            (multi_rank_mc2 and not _mc2_op_can_run_canonical(
+                execution, op, r0, source_stage,
+                can_r0_only=can_r0_only, replicas=replicas,
+            ))
             or (not can_r0_only and (is_mc2 or has_group_axis))
         )
         if needs_peer_sync:
@@ -475,7 +650,7 @@ def evaluate_dp_cohort_dedup(
     if w0.mode != "graph":
         return CohortDedupEligibility(False, reason="non_graph_mode")
     requires_peer_collectives = _has_megamoe_cross_dp_group(w0.ops)
-    if _has_unsynced_peer_die_overlap(execution, w0, r0):
+    if _has_unsynced_peer_die_overlap(execution, w0, r0, replicas=replicas):
         return CohortDedupEligibility(False, reason="unsynced_peer_die_overlap")
 
     w0_sig = _work_symmetry_signature(w0)
@@ -582,7 +757,8 @@ def is_symmetric_native_program(
         [_row_frame_map(frames_for(rk), width) for rk in range(width)]
         if route_matrix else [{} for _ in range(width)]
     )
-    # 1) Strict directed reciprocity M[u][v] == M[v][u] (both frames and expected bytes).
+    # 1) Replica-block reciprocity M[r1*K+u0][r2*K+v0] == M[r2*K+u0][r1*K+v0]
+    #    (reduces to M[u][v] == M[v][u] when local_k == 1; rejects directed cycles).
     byte_rows: list[dict[int, float]] = [{} for _ in range(width)]
     if has_byte_matrix:
         for u in range(width):
@@ -595,15 +771,8 @@ def is_symmetric_native_program(
                     b_uv = float(route_bytes[u][v] or 0.0)
                 if b_uv > 0.0:
                     byte_rows[u][v] = b_uv
-    for u in range(width):
-        for v in range(u + 1, width):
-            if matrix[u].get(v, 0) != matrix[v].get(u, 0):
-                return False
-            if has_byte_matrix:
-                b_uv = byte_rows[u].get(v, 0.0)
-                b_vu = byte_rows[v].get(u, 0.0)
-                if abs(b_uv - b_vu) > _BYTE_RECIPROCITY_REL_TOL * max(1.0, abs(b_uv), abs(b_vu)):
-                    return False
+    if not _matrices_are_replica_reciprocal(matrix, byte_rows, has_byte_matrix, width, local_k):
+        return False
 
     # 2) Identical per-rank basis, local frames, and off-diagonal frame/byte histograms.
     def _rank_sig(rk: int) -> tuple[Any, ...]:
@@ -614,7 +783,7 @@ def is_symmetric_native_program(
             if dst != rk and rep_base <= dst < rep_end
         ))
         cross = tuple(sorted(
-            f for dst, f in matrix[rk].items()
+            (dst % local_k, f) for dst, f in matrix[rk].items()
             if dst != rk and not (rep_base <= dst < rep_end)
         ))
         intra_b = tuple(sorted(
@@ -622,7 +791,7 @@ def is_symmetric_native_program(
             if dst != rk and rep_base <= dst < rep_end
         ))
         cross_b = tuple(sorted(
-            round(b, _BYTE_SIG_ROUND_DIGITS) for dst, b in byte_rows[rk].items()
+            (dst % local_k, round(b, _BYTE_SIG_ROUND_DIGITS)) for dst, b in byte_rows[rk].items()
             if dst != rk and not (rep_base <= dst < rep_end)
         ))
         basis = str(basis_for(rk)) if callable(basis_for) else ""

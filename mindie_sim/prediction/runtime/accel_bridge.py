@@ -73,6 +73,7 @@ _INITIAL_AUTO_REASONS = frozenset({
 _TRANSIENT_AUTO_REASONS = frozenset({
     "auto_mixed_frontier", "auto_busy", "periodic_frontier", "mixed_frontier",
     "start_boundary", "trace_retention", "mixed_priority", "alloc_boundary",
+    "cohort_symmetry_break",
 })
 _TRANSIENT_C_REASONS = frozenset({"alloc_boundary"})
 
@@ -82,6 +83,28 @@ EPOCH_ENABLED = os.environ.get("MINDIE_SIM_ACCEL_EPOCH", "1") != "0"
 
 def _remaining_shapes_valid(engine, task) -> bool:
     """Validate remaining work, caps and unit placements for C11 mirroring."""
+    prep = task.prepared
+    if (prep is not None and prep.static_stable
+            and task.caps is prep.caps and task.placement is prep.placement
+            and len(task.remaining) == len(prep.demand)
+            and not task.service):
+        resources = engine.resources
+        placement = task.placement
+        if placement:
+            for name in task.remaining:
+                units = placement.get(name)
+                if units is None:
+                    continue
+                n_u = len(units)
+                if n_u < 1 or n_u > MAX_U:
+                    return False
+                res_obj = resources[name]
+                if res_obj.policy == "fifo" and n_u < res_obj.units:
+                    return False
+        if task.coupled and placement and len(task.remaining) > 1:
+            from .accel_terms import coupled_placement_proportional
+            return coupled_placement_proportional(engine, task)
+        return True
     resources = engine.resources
     placement = task.placement
     caps = task.caps
@@ -164,6 +187,8 @@ class NativeBackend:
         "window_rearm_after", "window_rearm_cooldown", "pending_ext_seqs",
         "start_obs_seqs", "cohort_seqs", "cohort_checked_seq",
         "_prep_ok_cache", "_prep_cache_ver",
+        "_trace_dq_id", "_trace_seen_appends", "_trace_seen_ext_mut",
+        "_trace_seen_len", "_trace_has_non_inert", "_cohort_stop_key",
     )
     def __init__(self, status: dict | None, mode: str = "auto", *,
                  eager_attach: bool = False) -> None:
@@ -230,6 +255,12 @@ class NativeBackend:
         self.cohort_seqs: set[int] = set()
         self.cohort_checked_seq = 0
         self._prep_ok_cache: dict[int, tuple[object, bool]] = {}
+        self._trace_dq_id: int = 0
+        self._trace_seen_appends: int = 0
+        self._trace_seen_ext_mut: int = 0
+        self._trace_seen_len: int = 0
+        self._trace_has_non_inert: bool = False
+        self._cohort_stop_key = None
         self._prep_cache_ver = -1
     # -- lifecycle -----------------------------------------------------
     def try_attach(self, engine) -> bool:
@@ -275,6 +306,7 @@ class NativeBackend:
                 return self._attach_failed(error)
         else:
             self.arena.reset()
+            self._cohort_stop_key = None
             self.seeded = False
             reuse_config = (
                 bool(self.res_names)
@@ -296,6 +328,7 @@ class NativeBackend:
                 self.arena.configure(rates, units, policy)
             except (KernelFault, MemoryError) as error:
                 return self._attach_failed(error)
+            self._cohort_stop_key = None
             self.res_names = tuple(engine.resources)
             self.res_index = {name: i for i, name in enumerate(self.res_names)}
             self.res_version = engine._resource_version
@@ -376,8 +409,11 @@ class NativeBackend:
         )
         self.disabled_reason = reason
         self.needs_settle = False
-        self.window_rearm_after = 0
-        self.window_rearm_cooldown = 0
+        if reason == "cohort_symmetry_break":
+            self._bump_window_cooldown(engine)
+        else:
+            self.window_rearm_after = 0
+            self.window_rearm_cooldown = 0
         self.pending_handback = True
         finish_handback(self, engine)
     def _sync_back(self, engine) -> None:
@@ -569,7 +605,7 @@ class NativeBackend:
         from . import accel_terms as _at
         if self._trace_blocks_epoch(engine):
             return False
-        if self._has_live_cohorts(engine) and _at.has_asymmetric_cohort(engine):
+        if self._has_live_cohorts(engine) and _at.has_asymmetric_cohort(engine, self.cohort_seqs):
             return False
         collected = self._collect_window_candidates(engine)
         if collected is None:
@@ -617,10 +653,11 @@ class NativeBackend:
                     continue
                 if self.has_fair_res and self.fair_prio is not None and w_obj.priority != self.fair_prio:
                     continue
-                if not _task_c11_compatible(
-                    engine, w_obj, started=False, allow_non_hook_cb=allow_cb,
-                    allow_free_only=allow_cb,
-                ):
+                if (self._fast_prepared_c11_compatible(engine, w_obj) is not True
+                        and not _task_c11_compatible(
+                            engine, w_obj, started=False, allow_non_hook_cb=allow_cb,
+                            allow_free_only=allow_cb,
+                        )):
                     continue
                 in_batch.add(wseq)
                 preds_by_seq[wseq] = hits
@@ -629,6 +666,8 @@ class NativeBackend:
         return promoted, in_batch, preds_by_seq
     def _promote_hybrid_tasks(self, engine) -> bool:
         """Incrementally admit newly Python-started tasks into the STILL-LIVE C11 arena."""
+        if len(engine._active) <= engine._native_active:
+            return True
         tasks = engine._tasks
         mirrored = engine._native_seqs
         new_active = [tasks[seq] for seq in sorted(engine._active) if seq not in mirrored]
@@ -739,16 +778,30 @@ class NativeBackend:
                 or not _inert_pool_set(task.memory_pools, engine)):
             return False
         ev = task.event
+        waiters = ev._waiters
         if (type(ev.name) is not str or type(ev.sequence) is not int
                 or ev.time is not None or ev.started is not None
-                or ev._callbacks is not None or type(ev._waiters) is not list
-                or ev._waiters):
+                or ev._callbacks is not None or type(waiters) is not list):
             return None
+        for w in waiters:
+            if type(w) is not int:
+                return None
         if (task.demand is not prep.demand or task.caps is not prep.caps
                 or task.placement is not prep.placement
                 or task.cohort_widened is not prep.cohort_widened
-                or task.cohort_members is not prep.cohort_members
-                or task.remaining != prep.demand):
+                or task.cohort_members is not prep.cohort_members):
+            return None
+        rem = task.remaining
+        pd = prep.demand
+        if type(rem) is not dict or len(rem) != len(pd):
+            return None
+        for rk, rv in rem.items():
+            rt = type(rv)
+            if type(rk) is not str or (rt is not float and rt is not int):
+                return None
+            if pd.get(rk) != rv:
+                return None
+        if prep.coupled and prep.placement and engine._partial_placed_live:
             return None
         ver = engine._resource_version
         if self._prep_cache_ver != ver:
@@ -1045,7 +1098,45 @@ class NativeBackend:
         """
         if not engine._trace_maxlen:
             return False
-        if not any(not is_inert_trace_entry(row) for row in engine._trace_dq):
+        dq = engine._trace_dq
+        cur_id = id(dq)
+        cur_appends = engine._trace_appends
+        cur_ext = engine._trace_view._ext_mut
+        cur_len = len(dq)
+        if not cur_len:
+            self._trace_dq_id = cur_id
+            self._trace_seen_appends = cur_appends
+            self._trace_seen_ext_mut = cur_ext
+            self._trace_seen_len = 0
+            self._trace_has_non_inert = False
+            return False
+        if (not self._trace_has_non_inert
+                and cur_id == self._trace_dq_id
+                and cur_ext == self._trace_seen_ext_mut):
+            delta = cur_appends - self._trace_seen_appends
+            if delta == 0 and cur_len == self._trace_seen_len:
+                return False
+            if 0 < delta <= cur_len and cur_len <= self._trace_seen_len + delta:
+                non_inert = False
+                for idx in range(cur_len - delta, cur_len):
+                    if not is_inert_trace_entry(dq[idx]):
+                        non_inert = True
+                        break
+                self._trace_seen_appends = cur_appends
+                self._trace_seen_len = cur_len
+                if not non_inert:
+                    return False
+                self._trace_has_non_inert = True
+                self.disable(engine, "trace_retention")
+                self.made_progress = True
+                return True
+        non_inert = any(not is_inert_trace_entry(row) for row in dq)
+        self._trace_dq_id = cur_id
+        self._trace_seen_appends = cur_appends
+        self._trace_seen_ext_mut = cur_ext
+        self._trace_seen_len = cur_len
+        self._trace_has_non_inert = non_inert
+        if not non_inert:
             return False
         self.disable(engine, "trace_retention")
         self.made_progress = True
@@ -1092,6 +1183,7 @@ class NativeBackend:
         # A nested program can declare its directional rows after its ready
         # event was queued. Unflushed rows have no native resource indices yet.
         self.arena.configure(rates, units, policy)
+        self._cohort_stop_key = None
         self.res_names = names
         self.res_index = {name: i for i, name in enumerate(names)}
         self.res_version = engine._resource_version
@@ -1227,8 +1319,11 @@ class NativeBackend:
             return 0
         from . import accel_terms as _at
         has_cohorts = self._has_live_cohorts(engine)
-        if has_cohorts and _at.has_asymmetric_cohort(engine):
-            self.disable(engine, "cohort_symmetry_break")
+        if has_cohorts and _at.has_asymmetric_cohort(engine, self.cohort_seqs):
+            if self._hybrid_allowed(engine):
+                self._release_window(engine, "cohort_symmetry_break")
+            else:
+                self.disable(engine, "cohort_symmetry_break")
             self.made_progress = True
             return 0
         if not self._refresh_resources(engine):
@@ -1259,7 +1354,9 @@ class NativeBackend:
             self.seeded = True
         has_cohorts = self._has_live_cohorts(engine)
         if has_cohorts:
-            stop = _at.stop_slots_for_epoch(engine, until)
+            stop = _at.stop_slots_for_epoch(
+                engine, until, cohort_seqs=self.cohort_seqs, backend=self,
+            )
         else:
             slots = engine._native_slots
             stop = [slots[e.sequence] for e in until if not e.done and e.sequence in slots]
@@ -1269,7 +1366,10 @@ class NativeBackend:
         track_window = self.partial_window or self.window_has_non_hook_cb
         alloc_ver_before = engine._alloc_state_version if track_window else 0
         ready_seen_before = set(engine._ready_seen) if track_window else set()
-        cohort_horizon = _at.cohort_break_horizon(engine, horizon) if has_cohorts else horizon
+        cohort_horizon = (
+            _at.cohort_break_horizon(engine, horizon, cohort_seqs=self.cohort_seqs)
+            if has_cohorts else horizon
+        )
         next_rel = engine._frontier_next_release()
         eff_horizon = min(cohort_horizon, next_rel)
         if track_window and next_rel <= engine.now:
@@ -1345,61 +1445,82 @@ class NativeBackend:
         tasks, slots = engine._tasks, engine._native_slots
         self.applying = True
         try:
-            for seq, moment in self.arena.starts(nstart):
-                task = tasks.get(seq)
-                if task is None:
-                    continue
-                task.start = task.event.started = moment
-                engine._active.add(seq)
-                engine._native_active += 1
-                if task.coupled:
-                    engine._coupled_active += 1
-                if task.placement:
-                    engine._placed_active += 1
-                if task.latency > 0.0:
-                    engine._latency_active.add(seq)
-                if len(tasks) > engine.peak_tasks:
-                    engine.peak_tasks = len(tasks)
-                obs1 = task.start_observer
-                if obs1 is not None:
-                    task.start_observer = None
-                    self.start_obs_seqs.discard(seq)
-                    obs1.started = obs1.time = moment
-                    engine._promises.pop(obs1.sequence, None)
-                    engine._wake(obs1)
-                    for callback in obs1._callbacks or ():
-                        callback(obs1)
-                    obs1._callbacks = None
-                for observer in engine._start_waiters.pop(seq, ()):
-                    observer.started = observer.time = moment
-                    engine._promises.pop(observer.sequence, None)
-                    engine._wake(observer)
-                    for callback in observer._callbacks or ():
-                        callback(observer)
-                    observer._callbacks = None
-            for seq, moment, svc_start in self.arena.completions(ncomp):
-                use = self.usage.pop(seq, None)
-                if use is not None:
-                    self.links -= use[0]
-                    self.units -= use[1]
-                    self.edges -= use[2]
-                    self.storage -= use[3]
-                self.deps.pop(seq, None)
-                self.coupled_seqs.discard(seq)
-                self.start_obs_seqs.discard(seq)
-                if slots.pop(seq, None) is None:
-                    continue
-                task = tasks.get(seq)
-                if task is None:
-                    continue
-                if moment != engine.now and task.callback:
-                    # no observer with a future clock/counter pair.
-                    raise KernelFault(E_STATE, "causal_publication")
-                nlink = len(task.remaining)
-                for res, amount in self.arena.services(svc_start, nlink):
-                    name = self.res_names[res]
-                    task.service[name] = task.service.get(name, 0.0) + amount
-                engine._complete_native(task, moment)
+            if nstart > 0:
+                for seq, moment in self.arena.starts(nstart):
+                    task = tasks.get(seq)
+                    if task is None:
+                        continue
+                    task.start = task.event.started = moment
+                    engine._active.add(seq)
+                    engine._native_active += 1
+                    if task.coupled:
+                        engine._coupled_active += 1
+                    if task.placement:
+                        engine._placed_active += 1
+                    if task.latency > 0.0:
+                        engine._latency_active.add(seq)
+                    if len(tasks) > engine.peak_tasks:
+                        engine.peak_tasks = len(tasks)
+                    obs1 = task.start_observer
+                    if obs1 is not None:
+                        task.start_observer = None
+                        self.start_obs_seqs.discard(seq)
+                        obs1.started = obs1.time = moment
+                        engine._promises.pop(obs1.sequence, None)
+                        engine._wake(obs1)
+                        for callback in obs1._callbacks or ():
+                            callback(obs1)
+                        obs1._callbacks = None
+                    if engine._start_waiters:
+                        for observer in engine._start_waiters.pop(seq, ()):
+                            observer.started = observer.time = moment
+                            engine._promises.pop(observer.sequence, None)
+                            engine._wake(observer)
+                            for callback in observer._callbacks or ():
+                                callback(observer)
+                            observer._callbacks = None
+            if ncomp > 0:
+                comp_buf = self.arena.comp
+                svc_buf = self.arena.svc
+                res_names = self.res_names
+                usage_pop = self.usage.pop
+                deps_pop = self.deps.pop
+                coupled_discard = self.coupled_seqs.discard
+                start_obs_discard = self.start_obs_seqs.discard
+                slots_pop = slots.pop
+                tasks_get = tasks.get
+                complete_native = engine._complete_native
+                from .accel_tables import COMP_STRIDE, SVC_STRIDE, _PACK_U64, _U64_MASK, _UNPACK_F64
+                for idx in range(ncomp):
+                    base = idx * COMP_STRIDE
+                    seq = int(comp_buf[base])
+                    moment = _UNPACK_F64(_PACK_U64(int(comp_buf[base + 1]) & _U64_MASK))[0]
+                    svc_start = int(comp_buf[base + 2])
+                    use = usage_pop(seq, None)
+                    if use is not None:
+                        self.links -= use[0]
+                        self.units -= use[1]
+                        self.edges -= use[2]
+                        self.storage -= use[3]
+                    deps_pop(seq, None)
+                    coupled_discard(seq)
+                    start_obs_discard(seq)
+                    if slots_pop(seq, None) is None:
+                        continue
+                    task = tasks_get(seq)
+                    if task is None:
+                        continue
+                    if moment != engine.now and task.callback:
+                        # no observer with a future clock/counter pair.
+                        raise KernelFault(E_STATE, "causal_publication")
+                    nlink = len(task.remaining)
+                    if nlink:
+                        t_svc = task.service
+                        for j in range(nlink):
+                            sbase = (svc_start + j) * SVC_STRIDE
+                            r_name = res_names[int(svc_buf[sbase])]
+                            t_svc[r_name] = t_svc.get(r_name, 0.0) + float(svc_buf[sbase + 1])
+                    complete_native(task, moment)
             self.live = len(slots)
             # never overwrite an earlier chunk's hold with False.
             self.needs_settle = self.needs_settle or bool(self.arena.last_held)

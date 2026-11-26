@@ -228,6 +228,15 @@ class _EngineLifecycleMixin:
             self._fifo_live -= 1
         if self._inline_blocked and self.task_blocks_native(task):
             self._inline_blocked -= 1
+        prep = task.prepared
+        if prep is not None and prep.partial_placed_resources:
+            live_partial = self._partial_placed_live
+            for rname in prep.partial_placed_resources:
+                rem_cnt = live_partial.get(rname, 0) - 1
+                if rem_cnt > 0:
+                    live_partial[rname] = rem_cnt
+                else:
+                    live_partial.pop(rname, None)
         del self._tasks[key]
         if not task.is_split_child:
             self.completed_count += 1
@@ -258,6 +267,7 @@ class _EngineLifecycleMixin:
                     task.demand, task.service, task.metadata,
                     task.placement, task.coupled,
                 ))
+                self._trace_appends += 1
         if native:
             self._native_slots.pop(key, None)
             self._native_seqs.discard(key)

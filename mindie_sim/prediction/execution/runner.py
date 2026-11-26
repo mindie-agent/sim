@@ -1337,6 +1337,9 @@ class Execution(_ContextMixin, _CohortMixin, _LazySubmitMixin):
         from ..capacity import Memory
         from ..efficiency.cost import CostLedger
 
+        old_engine = getattr(self, "engine", None)
+        if old_engine is not None and hasattr(old_engine, "close"):
+            old_engine.close()
         memory = None if self.memory is None else Memory(self.memory.case, self.memory.policy)
         ledger = CostLedger()
         cost = _LedgerBoundCost(self.cost_model, ledger)

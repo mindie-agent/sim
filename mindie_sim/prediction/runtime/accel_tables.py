@@ -21,7 +21,10 @@ import math
 import struct
 import weakref
 
-from .engine_types import _EMPTY_FROZENSET as _ENGINE_EMPTY_FROZENSET
+from .engine_types import (
+    _EMPTY_FROZENSET as _ENGINE_EMPTY_FROZENSET,
+    _EMPTY_METADATA as _ENGINE_EMPTY_METADATA,
+)
 
 ABI_VERSION = 2
 HDR_CELLS = 16
@@ -106,7 +109,11 @@ def _inert_mapping(mapping) -> bool:
 
 def _eligible_metadata(metadata) -> bool:
     """True when native metadata is ``None`` or an all-inert exact dict."""
-    return metadata is None or _inert_mapping(metadata)
+    if metadata is None:
+        return True
+    if metadata is _ENGINE_EMPTY_METADATA and not metadata:
+        return True
+    return _inert_mapping(metadata)
 
 
 def _inert_scalar_mapping(mapping) -> bool:
@@ -216,6 +223,27 @@ def metadata_is_stable(metadata) -> bool:
     return True
 
 
+def _prepared_static_match(task) -> bool:
+    """True when ``task`` still carries its pre-validated inert ``_PreparedTask`` fields."""
+    prep = task.prepared
+    if prep is None or not prep.static_stable or task.service:
+        return False
+    return (
+        task.demand is prep.demand
+        and task.caps is prep.caps
+        and task.placement is prep.placement
+        and task.acquire is prep.acquire
+        and task.free is prep.free
+        and task.allocation_demands is prep.allocation_demands
+        and task.cohort_widened is prep.cohort_widened
+        and task.cohort_members is prep.cohort_members
+        and task.coupled is prep.coupled
+        and type(task.latency) in (float, int)
+        and type(task.priority) is int
+        and type(task.cohort_size) is int
+    )
+
+
 def _stable_task_payloads(task, engine=None) -> bool:
     """Audit *every* retained ``_Task`` payload for exact built-in types.
 
@@ -231,23 +259,9 @@ def _stable_task_payloads(task, engine=None) -> bool:
         return False
     if task.owner is not None and type(task.owner) is not str:
         return False
-    if type(task.priority) is not int or type(task.cohort_size) is not int:
-        return False
     if type(task.waiting) is not int or task.waiting < 0:
         return False
-    if not _inert_scalar_mapping(task.remaining):
-        return False
-    if not _inert_scalar_mapping(task.demand):
-        return False
-    if not _inert_scalar_mapping(task.caps):
-        return False
-    if not _inert_scalar_mapping(task.service):
-        return False
     if not _exact_number_or_none(task.release):
-        return False
-    if not _exact_number_or_none(task.latency):
-        return False
-    if type(task.coupled) is not bool:
         return False
     if task.start is not None and type(task.start) is not float:
         return False
@@ -263,7 +277,23 @@ def _stable_task_payloads(task, engine=None) -> bool:
         return False
     if task.memory_bindings is not None:
         return False
-    if not _inert_str_tuple(task.memory_grant_names):
+    if task.memory_grant_names and not _inert_str_tuple(task.memory_grant_names):
+        return False
+    if not _inert_scalar_mapping(task.remaining):
+        return False
+    if _prepared_static_match(task):
+        return True
+    if type(task.priority) is not int or type(task.cohort_size) is not int:
+        return False
+    if not _inert_scalar_mapping(task.demand):
+        return False
+    if not _inert_scalar_mapping(task.caps):
+        return False
+    if not _inert_scalar_mapping(task.service):
+        return False
+    if not _exact_number_or_none(task.latency):
+        return False
+    if type(task.coupled) is not bool:
         return False
     if type(task.acquire) is not tuple or type(task.free) is not tuple:
         return False
@@ -281,6 +311,67 @@ def _stable_task_payloads(task, engine=None) -> bool:
 
 def callback_capable(task, engine=None) -> bool:
     """True when releasing this row may run user-controlled finalization."""
+    prep = task.prepared
+    if (prep is not None and prep.static_stable and task.start is None
+            and not task.service
+            and task.metadata is _ENGINE_EMPTY_METADATA and not task.metadata
+            and task.memory_pools is _ENGINE_EMPTY_FROZENSET
+            and weakref.getweakrefcount(_ENGINE_EMPTY_FROZENSET) == 0
+            and task.memory_ledger is None and task.memory_bindings is None
+            and not task.memory_grant_names
+            and (task.owner is None or type(task.owner) is str)
+            and type(task.waiting) is int
+            and (type(task.release) is float or type(task.release) is int)
+            and type(task.memory_granted) is bool
+            and type(task.memory_replica) is int
+            and type(task.memory_stage) is int
+            and task.demand is prep.demand and task.caps is prep.caps
+            and task.placement is prep.placement
+            and task.acquire is prep.acquire and task.free is prep.free
+            and task.allocation_demands is prep.allocation_demands
+            and task.cohort_widened is prep.cohort_widened
+            and task.cohort_members is prep.cohort_members
+            and task.coupled is prep.coupled
+            and (type(task.latency) is float or type(task.latency) is int)
+            and type(task.priority) is int
+            and type(task.cohort_size) is int):
+        ev = task.event
+        if (type(ev.name) is str and type(ev.sequence) is int
+                and ev.time is None and ev.started is None
+                and ev._callbacks is None and type(ev._waiters) is list):
+            waiters_ok = True
+            for wk in ev._waiters:
+                if type(wk) is not int:
+                    waiters_ok = False
+                    break
+            if waiters_ok:
+                rem = task.remaining
+                if type(rem) is dict:
+                    rem_ok = True
+                    for rk, rv in rem.items():
+                        rt = type(rv)
+                        if type(rk) is not str or (rt is not float and rt is not int):
+                            rem_ok = False
+                            break
+                    if rem_ok:
+                        return False
+    if _prepared_static_match(task):
+        return not (
+            _event_is_stable(task.event)
+            and _eligible_metadata(task.metadata)
+            and (task.owner is None or type(task.owner) is str)
+            and type(task.waiting) is int
+            and _exact_number_or_none(task.release)
+            and (task.start is None or type(task.start) is float)
+            and type(task.memory_granted) is bool
+            and task.memory_ledger is None
+            and type(task.memory_replica) is int
+            and type(task.memory_stage) is int
+            and _inert_pool_set(task.memory_pools, engine)
+            and task.memory_bindings is None
+            and (not task.memory_grant_names or _inert_str_tuple(task.memory_grant_names))
+            and _inert_scalar_mapping(task.remaining)
+        )
     return not (
         _event_is_stable(task.event)
         and _eligible_metadata(task.metadata)
@@ -456,12 +547,21 @@ class KernelFault(RuntimeError):
         self.has_prefix = bool(has_prefix)
 
 
+_PACK_F64 = struct.Struct("<d").pack
+_UNPACK_U64 = struct.Struct("<Q").unpack
+_PACK_U64 = struct.Struct("<Q").pack
+_UNPACK_F64 = struct.Struct("<d").unpack
+_BITS_ZERO = _UNPACK_U64(_PACK_F64(0.0))[0]
+_BITS_INF = _UNPACK_U64(_PACK_F64(math.inf))[0]
+_U64_MASK = 0xFFFFFFFFFFFFFFFF
+
+
 def bits(value: float) -> int:
-    return struct.unpack("<Q", struct.pack("<d", value))[0]
+    return _UNPACK_U64(_PACK_F64(value))[0]
 
 
 def from_bits(value: int) -> float:
-    return struct.unpack("<d", struct.pack("<Q", int(value) & 0xFFFFFFFFFFFFFFFF))[0]
+    return _UNPACK_F64(_PACK_U64(int(value) & _U64_MASK))[0]
 
 
 def install_signatures(library: ctypes.CDLL) -> None:
@@ -638,62 +738,94 @@ class Arena:
         nrows = len(tasks)
         if not nrows:
             return []
-        nlinks = sum(len(row[8]) for row in tasks)
-        nplace = sum(len(link[3]) for row in tasks for link in row[8])
-        self.rows = _grow(self.rows, nrows * TASK_STRIDE, U64_T)
-        self.links = _grow(self.links, nlinks * LINK_STRIDE, U64_T)
-        self.place = _grow(self.place, nplace + 1, U32_T)
-        self.out_slots = _grow(self.out_slots, nrows, I32_T)
+        nlinks = 0
+        nplace = 0
+        for row in tasks:
+            rlinks = row[8]
+            nlinks += len(rlinks)
+            for link in rlinks:
+                nplace += len(link[3])
+        rows_buf = self.rows = _grow(self.rows, nrows * TASK_STRIDE, U64_T)
+        links_buf = self.links = _grow(self.links, nlinks * LINK_STRIDE, U64_T)
+        place_buf = self.place = _grow(self.place, nplace + 1, U32_T)
+        out_slots = self.out_slots = _grow(self.out_slots, nrows, I32_T)
+        pack_f64 = _PACK_F64
+        unpack_u64 = _UNPACK_U64
+        bits_zero = _BITS_ZERO
+        bits_inf = _BITS_INF
+        inf_val = math.inf
+        int_t = int
         place = 0
         li = 0
+        last_start = None
+        last_start_b = 0
+        last_rel = None
+        last_rel_b = 0
         for i, row in enumerate(tasks):
             seq, flags, prio, cohort, waiting, start, latency, release, links = row[:9]
             widened_mask = int(row[9]) if len(row) > 9 else 0
             # Representable bounds are enforced *before* ctypes packing so a
             # wide Python integer can never wrap into a valid-looking cell.
-            if not isinstance(prio, int) or isinstance(prio, bool) or prio < 0 \
-                    or prio > 0x7FFFFFFFFFFFFFFF:
+            if type(prio) is not int_t or prio < 0 or prio > INT64_MAX:
                 raise KernelFault(E_RANGE, "submit", "priority_out_of_range")
-            if not isinstance(cohort, int) or isinstance(cohort, bool) \
-                    or cohort < 1 or cohort > 0xFFFFFFFFFFFFFFFE:
+            if type(cohort) is not int_t or cohort < 1 or cohort > UINT64_MAX - 1:
                 raise KernelFault(E_RANGE, "submit", "cohort_out_of_range")
-            if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0 \
-                    or seq > 0xFFFFFFFFFFFFFFFF:
+            if type(seq) is not int_t or seq < 0 or seq > UINT64_MAX:
                 raise KernelFault(E_RANGE, "submit", "sequence_out_of_range")
+            if start == last_start:
+                start_b = last_start_b
+            else:
+                last_start = start
+                start_b = last_start_b = (
+                    bits_zero if start == 0.0 else unpack_u64(pack_f64(start))[0]
+                )
+            lat_b = bits_zero if latency == 0.0 else unpack_u64(pack_f64(latency))[0]
+            if release == last_rel:
+                rel_b = last_rel_b
+            else:
+                last_rel = release
+                rel_b = last_rel_b = (
+                    bits_zero if release == 0.0 else unpack_u64(pack_f64(release))[0]
+                )
             base = i * TASK_STRIDE
-            self.rows[base + 0] = seq
-            self.rows[base + 1] = flags
-            self.rows[base + 2] = prio
-            self.rows[base + 3] = cohort
-            self.rows[base + 4] = waiting
-            self.rows[base + 5] = widened_mask
-            self.rows[base + 6] = bits(start)
-            self.rows[base + 7] = bits(latency)
-            self.rows[base + 8] = bits(release)
-            self.rows[base + 9] = len(links)
-            self.rows[base + 10] = li
-            self.rows[base + 11] = 0
+            rows_buf[base + 0] = seq
+            rows_buf[base + 1] = flags
+            rows_buf[base + 2] = prio
+            rows_buf[base + 3] = cohort
+            rows_buf[base + 4] = waiting
+            rows_buf[base + 5] = widened_mask
+            rows_buf[base + 6] = start_b
+            rows_buf[base + 7] = lat_b
+            rows_buf[base + 8] = rel_b
+            rows_buf[base + 9] = len(links)
+            rows_buf[base + 10] = li
+            rows_buf[base + 11] = 0
             for link in links:
                 res, remaining, cap, units = link[:4]
                 wid = 1 if (len(link) > 4 and link[4]) else 0
                 off = li * LINK_STRIDE
-                self.links[off + 0] = i
-                self.links[off + 1] = res
-                self.links[off + 2] = bits(remaining)
-                self.links[off + 3] = bits(cap)
-                self.links[off + 4] = place
-                self.links[off + 5] = len(units) | (wid << LINK_WIDENED_BIT_SHIFT)
-                for u in units:
-                    self.place[place] = u
-                    place += 1
+                links_buf[off + 0] = i
+                links_buf[off + 1] = res
+                links_buf[off + 2] = (
+                    bits_zero if remaining == 0.0 else unpack_u64(pack_f64(remaining))[0]
+                )
+                links_buf[off + 3] = (
+                    bits_inf if cap == inf_val else unpack_u64(pack_f64(cap))[0]
+                )
+                links_buf[off + 4] = place
+                links_buf[off + 5] = len(units) | (wid << LINK_WIDENED_BIT_SHIFT)
+                if units:
+                    for u in units:
+                        place_buf[place] = u
+                        place += 1
                 li += 1
         rc = self.library.msim_ctx_submit(
-            self.ctx, self.rows, nrows, TASK_STRIDE, self.links, nlinks,
-            LINK_STRIDE, self.place, place, None, None, 0,
-            self.out_slots, nrows, self.st, ST_CELLS)
+            self.ctx, rows_buf, nrows, TASK_STRIDE, links_buf, nlinks,
+            LINK_STRIDE, place_buf, place, None, None, 0,
+            out_slots, nrows, self.st, ST_CELLS)
         if rc != 0:
             raise KernelFault(int(self.st[1]), "submit", f"nrows={nrows}")
-        return [int(self.out_slots[i]) for i in range(nrows)]
+        return [int(out_slots[i]) for i in range(nrows)]
 
     def link(self, edges) -> None:
         """``edges`` is a list of ``(pred_slot, succ_slot, succ_seq)`` triples."""

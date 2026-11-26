@@ -2335,84 +2335,88 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         non_body_by_replica=non_body_by_rep,
         tracked_by_replica=tracked_by_rep,
         cohort_layer_deltas_out=cohort_layer_deltas)
-    end = max((step.completion.time for step in steps.values()), default=input_ready_ms)
-    duration = end - input_ready_ms
-    replica_bounds_map = (
-        {
-            rep_i: {
-                lyr: (evs[0][0], min(float(r.time) for _, r, _ in evs), max(float(c.time) for _, _, c in evs))
-                for lyr, evs in rep_map.items() if evs
+    try:
+        end = max((step.completion.time for step in steps.values()), default=input_ready_ms)
+        duration = end - input_ready_ms
+        replica_bounds_map = (
+            {
+                rep_i: {
+                    lyr: (evs[0][0], min(float(r.time) for _, r, _ in evs), max(float(c.time) for _, _, c in evs))
+                    for lyr, evs in rep_map.items() if evs
+                }
+                for rep_i, rep_map in layer_events_by_rep.items()
             }
-            for rep_i, rep_map in layer_events_by_rep.items()
-        }
-        if layer_events_by_rep is not None else None
-    )
-    replica_non_body_map = (
-        {rep_i: [(float(r.time), float(c.time)) for r, c in evs]
-         for rep_i, evs in non_body_by_rep.items()}
-        if non_body_by_rep is not None else None
-    )
-    replica_complete_map = {int(r): float(step.completion.time) for r, step in steps.items()}
-    if fast_span_only:
-        return _build_fast_span_result(
-            case, execution, engine, graphs, replay_scope,
-            scopes=scopes, steps=steps,
-            include_submission=include_submission, input_ready_ms=input_ready_ms,
-            end=end, duration=duration, replica_bounds_map=replica_bounds_map,
-            replica_non_body_map=replica_non_body_map, replica_complete_map=replica_complete_map,
-            tracked_by_rep=tracked_by_rep, l2_fingerprints=l2_fingerprints,
-            cohort_layer_deltas=cohort_layer_deltas,
+            if layer_events_by_rep is not None else None
         )
-    joins = _bind_collective_readiness(case, records, group_for, execution, replica_observer=replica_observer)
-    costs, durations, warm_durations, isolated_sum, cohort_cache = [], {}, {}, 0.0, {}
-    if isolated:
-        costs, durations, warm_durations, isolated_sum, cohort_cache = _price_isolated_graph(
-            case, graphs, joins, scopes, book, primitives, ctx, stream_plans)
-    cold_roots = (
-        _annotate_isolated_precedence(records, durations, warm_durations, stream_plans)
-        if isolated else frozenset()
-    )
-    row_records = (
-        [record for record in records if not record.get("_peer_only") and record["replica"] in keep_replicas]
-        if (keep_replicas is not None and not compact) else records
-    )
-    rows, profile = _graph_operator_rows(
-        row_records, duration, compact, isolated, durations, warm_durations, stream_plans,
-        cold_roots=cold_roots,
-    )
-    isolated_profile = None
-    if compact and isolated:
-        isolated_profile = _isolated_operator_profile(costs, isolated_sum)
-        costs = []
-    resources = [{
-        "resource": name, "work": amount, "unit": engine.resources[name].unit,
-        "capacity_per_ms": engine.resources[name].rate,
-        "capacity_bound_ms": amount / engine.resources[name].rate,
-        "busy_ms": engine.busy_ms[name],
-    } for name, amount in engine.serviced.items() if amount and "stream_quota@" not in name]
-    resources.sort(key=lambda row: row["capacity_bound_ms"], reverse=True)
-    accel_view = engine.accel_status()
-    head = {
-        "schema": "mindie-sim.graph/1", **model_coverage(case.model),
-        "engine_backend": accel_view.get("accel_backend"),
-        "accel_status": accel_status(accel_view),
-        "boundary": "submitted_device_graph" if include_submission else "device_graph",
-        "input_ready_ms": input_ready_ms, "complete_ms": end, "duration_ms": duration,
-        "replicas": list(graphs), "replay_scope": replay_scope, "replay_scope_by_replica": scopes,
-        "operator_occurrences": sum(
-            record["op"].family != "barrier" and not record.get("_peer_only") for record in records
-        ) + skipped_occurrences,
-    }
-    assembled = _assemble_graph_result(
-        case, graphs, records, steps, execution, engine, rows, profile,
-        resources, head, compact=compact, isolated=isolated, costs=costs,
-        isolated_sum=isolated_sum, isolated_profile=isolated_profile,
-        cohort_cache=cohort_cache, external_times=external_times,
-        input_ready_ms=input_ready_ms, duration=duration, audit_allocations=audit_allocations,
-    )
-    return _attach_cohort_graph_metadata(
-        assembled, graphs, records, execution, body_id_map,
-        l2_fingerprints, replica_bounds_map, replica_non_body_map,
-        replica_complete_map, cohort_layer_deltas,
-        tracked_by_rep=tracked_by_rep, steps=steps,
-    )
+        replica_non_body_map = (
+            {rep_i: [(float(r.time), float(c.time)) for r, c in evs]
+             for rep_i, evs in non_body_by_rep.items()}
+            if non_body_by_rep is not None else None
+        )
+        replica_complete_map = {int(r): float(step.completion.time) for r, step in steps.items()}
+        if fast_span_only:
+            return _build_fast_span_result(
+                case, execution, engine, graphs, replay_scope,
+                scopes=scopes, steps=steps,
+                include_submission=include_submission, input_ready_ms=input_ready_ms,
+                end=end, duration=duration, replica_bounds_map=replica_bounds_map,
+                replica_non_body_map=replica_non_body_map, replica_complete_map=replica_complete_map,
+                tracked_by_rep=tracked_by_rep, l2_fingerprints=l2_fingerprints,
+                cohort_layer_deltas=cohort_layer_deltas,
+            )
+        joins = _bind_collective_readiness(case, records, group_for, execution, replica_observer=replica_observer)
+        costs, durations, warm_durations, isolated_sum, cohort_cache = [], {}, {}, 0.0, {}
+        if isolated:
+            costs, durations, warm_durations, isolated_sum, cohort_cache = _price_isolated_graph(
+                case, graphs, joins, scopes, book, primitives, ctx, stream_plans)
+        cold_roots = (
+            _annotate_isolated_precedence(records, durations, warm_durations, stream_plans)
+            if isolated else frozenset()
+        )
+        row_records = (
+            [record for record in records if not record.get("_peer_only") and record["replica"] in keep_replicas]
+            if (keep_replicas is not None and not compact) else records
+        )
+        rows, profile = _graph_operator_rows(
+            row_records, duration, compact, isolated, durations, warm_durations, stream_plans,
+            cold_roots=cold_roots,
+        )
+        isolated_profile = None
+        if compact and isolated:
+            isolated_profile = _isolated_operator_profile(costs, isolated_sum)
+            costs = []
+        resources = [{
+            "resource": name, "work": amount, "unit": engine.resources[name].unit,
+            "capacity_per_ms": engine.resources[name].rate,
+            "capacity_bound_ms": amount / engine.resources[name].rate,
+            "busy_ms": engine.busy_ms[name],
+        } for name, amount in engine.serviced.items() if amount and "stream_quota@" not in name]
+        resources.sort(key=lambda row: row["capacity_bound_ms"], reverse=True)
+        accel_view = engine.accel_status()
+        head = {
+            "schema": "mindie-sim.graph/1", **model_coverage(case.model),
+            "engine_backend": accel_view.get("accel_backend"),
+            "accel_status": accel_status(accel_view),
+            "boundary": "submitted_device_graph" if include_submission else "device_graph",
+            "input_ready_ms": input_ready_ms, "complete_ms": end, "duration_ms": duration,
+            "replicas": list(graphs), "replay_scope": replay_scope, "replay_scope_by_replica": scopes,
+            "operator_occurrences": sum(
+                record["op"].family != "barrier" and not record.get("_peer_only") for record in records
+            ) + skipped_occurrences,
+        }
+        assembled = _assemble_graph_result(
+            case, graphs, records, steps, execution, engine, rows, profile,
+            resources, head, compact=compact, isolated=isolated, costs=costs,
+            isolated_sum=isolated_sum, isolated_profile=isolated_profile,
+            cohort_cache=cohort_cache, external_times=external_times,
+            input_ready_ms=input_ready_ms, duration=duration, audit_allocations=audit_allocations,
+        )
+        return _attach_cohort_graph_metadata(
+            assembled, graphs, records, execution, body_id_map,
+            l2_fingerprints, replica_bounds_map, replica_non_body_map,
+            replica_complete_map, cohort_layer_deltas,
+            tracked_by_rep=tracked_by_rep, steps=steps,
+        )
+    finally:
+        if hasattr(engine, "close"):
+            engine.close()

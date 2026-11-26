@@ -322,12 +322,19 @@ def head_work(p, q, parts, read, *, include_beta=True, delta_broadcast=False):
 
 
 def _head_stages(p, q, repeat, profile, context, placement, read,
-                 *, beta_repetitions=None, delta_broadcast=False):
+                 *, beta_repetitions=None, delta_broadcast=False,
+                 cohort_size=1, cohort_widened=(), cohort_members=None):
     """Source queue order; delayed exports preserve their finite slot reuse."""
     stages = []
+    c_members = cohort_members or {}
     def add(name, work=Work(), after=(), count=None):
-        stages.append(Stage(name, context.bind(work.scaled(repeat if count is None else count)),
-                            after=tuple(after), placement=placement))
+        scale = (repeat if count is None else count) * cohort_size
+        stages.append(Stage(
+            name, context.bind(work.scaled(scale)),
+            after=tuple(after), placement=placement,
+            cohort_size=cohort_size, cohort_widened=cohort_widened,
+            cohort_members=c_members,
+        ))
         return name
     def vec(name, amount, *after, count=None):
         return add(name, Work(resources={"vector": amount}), after, count)
@@ -447,14 +454,46 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
     cycles = tuple(cycles)
     fragments = state_fragments(op)
     def program(context):
+        def _disjoint_cohort_binding(cohort_owners):
+            """Merge ``cohort_owners`` into one exact symmetric cohort when placements & UB units are disjoint."""
+            roles = ("vector", read, "mte3")
+            per_owner_pl = [context.owned(o, units, roles) for o in cohort_owners]
+            pl_keys = tuple(per_owner_pl[0].keys())
+            merged_pl: dict[str, tuple[int, ...]] = {}
+            widened: list[str] = []
+            members: dict[str, tuple[tuple[int, ...], ...]] = {}
+            for rk in pl_keys:
+                rows = tuple(tuple(pl[rk]) for pl in per_owner_pl)
+                if len({len(r) for r in rows}) != 1:
+                    return None
+                flat = tuple(u for r in rows for u in r)
+                if len(set(flat)) != len(flat):
+                    return None
+                merged_pl[rk] = flat
+                widened.append(rk)
+                members[rk] = rows
+            ub_pool_units = context.pool_units.get("ub", units)
+            ub_rows = tuple(tuple(unit_group(o, units, ub_pool_units)) for o in cohort_owners)
+            ub_flat = tuple(u for r in ub_rows for u in r)
+            if len(set(ub_flat)) != len(ub_flat):
+                return None
+            return merged_pl, tuple(widened), members, tuple(sorted(ub_flat))
+
         def owner_program(owner):
             placement = context.owned(owner, units, ("vector", read, "mte3"))
             pending = tuple(runs(owner))
+            stage_cache: dict[tuple[int, int, int], tuple[Stage, ...]] = {}
             def head(index):
-                q, count, beta_count = pending[index]
-                return _head_stages(p, q, count, profile, context, placement, read,
-                                    beta_repetitions=beta_count,
-                                    delta_broadcast=execution.delta_broadcast)
+                key = pending[index]
+                cached = stage_cache.get(key)
+                if cached is not None:
+                    return cached
+                q, count, beta_count = key
+                built = _head_stages(p, q, count, profile, context, placement, read,
+                                     beta_repetitions=beta_count,
+                                     delta_broadcast=execution.delta_broadcast)
+                stage_cache[key] = built
+                return built
             heads = PipelineProgram(cycles[owner], 1, head, interior_fold=False)
             allocation = (Allocation("kda_buffers", context.pool_names["ub"],
                                      profile["ub_bytes_per_owner"],
@@ -462,7 +501,115 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
             return KernelProgram((Stage("buffers", acquire=allocation),
                                   Stage("heads", after=("buffers",), program=heads),
                                   Stage("release", after=("heads",), free=allocation)))
-        owners = ParallelProgram(tuple(owner_program(owner) for owner in range(blocks)))
+
+        def _wave_cohort_program():
+            """Fold lockstep owner waves into one active symmetric cohort at a time.
+
+            When every wave ``w`` has identical ``(q, count, beta_count)`` across
+            all active owners and disjoint per-owner pipe/UB placements, running
+            wave ``w`` as a single ``cohort_size = len(active_owners)`` task
+            preserves exact per-unit UB release times, fair-share HBM weight,
+            and zero-ULP duration while avoiding concurrent multi-cohort breaks.
+            """
+            per_owner_runs = [tuple(runs(o)) for o in range(blocks)]
+            max_waves = max((len(r) for r in per_owner_runs), default=0)
+            if max_waves <= 0:
+                return None
+            # Every wave must be homogeneous across all owners still active in that wave.
+            wave_specs: list[tuple[tuple[int, int, int], tuple[int, ...]]] = []
+            for w_idx in range(max_waves):
+                active = [o for o in range(blocks) if w_idx < len(per_owner_runs[o])]
+                keys = {per_owner_runs[o][w_idx] for o in active}
+                if len(keys) != 1:
+                    return None
+                wave_specs.append((next(iter(keys)), tuple(active)))
+            full_bound = _disjoint_cohort_binding(tuple(range(blocks)))
+            if full_bound is None:
+                return None
+            # Group owners by retirement wave so each owner's UB frees at its exact last wave.
+            by_retire: dict[int, list[int]] = {}
+            for o in range(blocks):
+                by_retire.setdefault(len(per_owner_runs[o]) - 1, []).append(o)
+            ub_pool = context.pool_names["ub"]
+            ub_pool_units = context.pool_units.get("ub", units)
+            ub_bytes = profile["ub_bytes_per_owner"]
+            retire_allocs: dict[int, tuple[Allocation, ...]] = {}
+            all_allocs: list[Allocation] = []
+            for r_wave, r_owners in sorted(by_retire.items()):
+                ub_u = tuple(sorted(
+                    u for o in r_owners for u in unit_group(o, units, ub_pool_units)
+                ))
+                alloc = Allocation(f"kda_buffers_w{r_wave}", ub_pool, ub_bytes, ub_u)
+                retire_allocs[r_wave] = (alloc,)
+                all_allocs.append(alloc)
+            # Group consecutive waves with identical active owners into one PipelineProgram.
+            binding_cache: dict[tuple[int, ...], tuple] = {tuple(range(blocks)): full_bound}
+            prog_stages: list[Stage] = [Stage("buffers", acquire=tuple(all_allocs))]
+            prev_stage = "buffers"
+            w_pos = 0
+            seg_idx = 0
+            while w_pos < max_waves:
+                seg_owners = wave_specs[w_pos][1]
+                seg_start = w_pos
+                while w_pos < max_waves and wave_specs[w_pos][1] == seg_owners:
+                    w_pos += 1
+                seg_keys = tuple(wave_specs[i][0] for i in range(seg_start, w_pos))
+                bound = binding_cache.get(seg_owners)
+                if bound is None:
+                    bound = _disjoint_cohort_binding(seg_owners)
+                    if bound is None:
+                        return None
+                    binding_cache[seg_owners] = bound
+                pl_s, wid_s, mem_s, _ = bound
+                c_size = len(seg_owners)
+                stage_cache: dict[tuple[int, int, int], tuple[Stage, ...]] = {}
+                def _make_head(keys_t, pl_t, wid_t, mem_t, cs_t, cache_t):
+                    def _head(index):
+                        key = keys_t[index]
+                        cached = cache_t.get(key)
+                        if cached is not None:
+                            return cached
+                        q, count, beta_count = key
+                        built = _head_stages(
+                            p, q, count, profile, context, pl_t, read,
+                            beta_repetitions=beta_count,
+                            delta_broadcast=execution.delta_broadcast,
+                            cohort_size=cs_t,
+                            cohort_widened=wid_t if cs_t > 1 else (),
+                            cohort_members=mem_t if cs_t > 1 else None,
+                        )
+                        cache_t[key] = built
+                        return built
+                    return _head
+                seg_pipe = PipelineProgram(
+                    len(seg_keys), 1,
+                    _make_head(seg_keys, pl_s, wid_s, mem_s, c_size, stage_cache),
+                    interior_fold=False,
+                )
+                seg_name = f"heads_seg{seg_idx}"
+                prog_stages.append(Stage(seg_name, after=(prev_stage,), program=seg_pipe))
+                prev_stage = seg_name
+                last_wave = w_pos - 1
+                if last_wave in retire_allocs:
+                    rel_name = f"release_seg{seg_idx}"
+                    prog_stages.append(Stage(rel_name, after=(seg_name,), free=retire_allocs[last_wave]))
+                    if w_pos >= max_waves:
+                        prev_stage = rel_name
+                seg_idx += 1
+            return KernelProgram(tuple(prog_stages))
+
+        if compact and blocks > 1:
+            wave_prog = _wave_cohort_program()
+            if wave_prog is not None:
+                owners = wave_prog
+            else:
+                owners = ParallelProgram(tuple(owner_program(owner) for owner in range(blocks)))
+        else:
+            owners = (
+                owner_program(0)
+                if blocks == 1
+                else ParallelProgram(tuple(owner_program(owner) for owner in range(blocks)))
+            )
         stages = []
         if fragments["read"] is not None and fragments["read"].state_effects:
             stages.append(Stage("state_read", fragment=fragments["read"]))

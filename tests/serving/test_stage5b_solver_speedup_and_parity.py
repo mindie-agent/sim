@@ -561,3 +561,29 @@ def test_integer_pd_handoff_draft_kv_asymmetric_tp_and_cohort_reciprocity() -> N
         local_frames_for=lambda _rk: 0,
     )
     assert is_symmetric_native_program(SimpleNamespace(program=cyc_inner), 3) is False
+
+
+def test_linear_attention_candidate_generator_filters_non_divisible_tp():
+    """Hybrid linear-attention models (e.g. kimi-k3.1, 96 KDA heads) omit tp not dividing linear_state_heads."""
+    from mindie_sim.catalog import load_model
+    from mindie_sim.sweep.pd import _build_colocated_candidates, _build_pd_stage_candidates
+
+    kimi_spec = load_model("kimi-k3.1")
+    for role in ("pd_prefill", "pd_decode"):
+        cands = _build_pd_stage_candidates(
+            role=role, max_dies=64, is_moe=True, layers=4,
+            prompt_tokens=4096, rec_topo=None, pinned={}, model_spec=kimi_spec,
+        )
+        assert cands and all(96 % int(c["tp"]) == 0 for c in cands)
+        assert not any(int(c["tp"]) == 64 for c in cands)
+    coloc = _build_colocated_candidates(
+        num_devices=64, is_moe=True, layers=4, rec_topo=None, pinned={},
+        model_spec=kimi_spec, prompt_tokens=4096, role="pd_decode",
+    )
+    assert coloc and all(96 % int(c["tp"]) == 0 for c in coloc)
+    assert not any(int(c["tp"]) == 64 for c in coloc)
+    pinned_64 = _build_pd_stage_candidates(
+        role="pd_decode", max_dies=64, is_moe=True, layers=4,
+        prompt_tokens=4096, rec_topo=None, pinned={"tp": 64}, model_spec=kimi_spec,
+    )
+    assert any(int(c["tp"]) == 64 for c in pinned_64)

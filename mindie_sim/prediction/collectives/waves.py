@@ -161,12 +161,14 @@ class WaveGroup:
             after=(run.send_completions[0],),
             owner=owner,
             on_complete=on_send_done,
+            native_hook=True,
         )
         engine.submit(
             prefix + ":received",
             after=(run.completions[0], dest_ready),
             owner=owner,
             on_complete=on_recv_done,
+            native_hook=True,
         )
 
     def _payload(self, source_index: int, destination_index: int, count: int) -> float:
@@ -280,6 +282,7 @@ class WaveGroup:
                     service = engine.submit(
                         f"{prefix}:hop{hop_index}:service", hop.demand,
                         after=(previous,), owner=owner, coupled=True,
+                        native_hook=hop_index == 0,
                         on_complete=((lambda arrival: send_done(index, arrival))
                                      if hop_index == 0 else None),
                     )
@@ -289,15 +292,18 @@ class WaveGroup:
                 received_after.append(previous)
                 if not message.hops:
                     engine.submit(prefix + ":done", after=(ready,), owner=owner,
-                                  on_complete=lambda arrival: send_done(index, arrival))
+                                  on_complete=lambda arrival: send_done(index, arrival),
+                                  native_hook=True)
             else:
                 engine.submit(prefix + ":done", after=(ready,), owner=owner,
-                              on_complete=lambda arrival: send_done(index, arrival))
+                              on_complete=lambda arrival: send_done(index, arrival),
+                              native_hook=True)
             engine.submit(
                 prefix + ":received",
                 after=tuple(received_after) + (initial[destination],),
                 owner=owner,
                 on_complete=lambda arrival: deliver(destination_index, wave, arrival),
+                native_hook=True,
             )
 
         def begin(index: int) -> None:

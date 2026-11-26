@@ -36,6 +36,45 @@ from .streams import _collective_native_basis
 ISOLATED_SCRIPT_CACHE_LIMIT = 1024
 
 
+def _remap_canonical_rx_resource(res_key: str, dst_rank: int, canonical_dst: int) -> str:
+    """Map peer RX port/injection resource ``dst_rank`` onto canonical ``canonical_dst``."""
+    if dst_rank == canonical_dst:
+        return res_key
+    dst_str = str(dst_rank)
+    port_sfx = f":rx:port{dst_str}"
+    if res_key.endswith(port_sfx):
+        return f"{res_key[:-len(dst_str)]}{canonical_dst}"
+    ub_sfx = f"ub_inj:rx:r{dst_str}"
+    if res_key.endswith(ub_sfx):
+        return f"{res_key[:-len(dst_str)]}{canonical_dst}"
+    return res_key
+
+
+def _remap_routed_hop(
+    hop: Any,
+    dst_rank: int,
+    canonical_dst: int,
+    engine_resources: _AbcMapping[str, Any],
+) -> tuple[bool, Any]:
+    """Remap peer RX resources on one ``RoutedHop`` onto canonical r0 ranks, failing closed."""
+    all_orig = (str(hop.resource), *(str(r) for r in hop.additional_resources))
+    all_new = tuple(
+        _remap_canonical_rx_resource(name, dst_rank, canonical_dst)
+        for name in all_orig
+    )
+    if len(set(all_new)) != len(all_new):
+        return False, hop
+    for orig_k, new_k in zip(all_orig, all_new):
+        if new_k != orig_k:
+            orig_res = engine_resources.get(orig_k)
+            new_res = engine_resources.get(new_k)
+            if orig_res is None or new_res is None or float(orig_res.rate) != float(new_res.rate):
+                return False, hop
+    if all_new == all_orig:
+        return True, hop
+    return True, replace(hop, resource=all_new[0], additional_resources=all_new[1:])
+
+
 @dataclass(frozen=True)
 class CollectiveParticipant:
     replica: int
@@ -362,6 +401,29 @@ class _CohortMixin(_CohortNativeMixin):
             is_symmetric_fn=is_symmetric_fn,
         )
 
+    def _canonical_replica_maps(self, group, peer_replicas, source_stage, local_k):
+        """Return per-replica sorted ranks, group indices, and rank/index position maps."""
+        group_rank_to_idx = {rk: idx for idx, rk in enumerate(group)}
+        rep_ranks_map: dict[int, tuple[int, ...]] = {}
+        rep_indices_map: dict[int, tuple[int, ...]] = {}
+        rank_to_rep_pos: dict[int, tuple[int, int]] = {}
+        idx_to_rep_pos: dict[int, tuple[int, int]] = {}
+        for rep in peer_replicas:
+            rep_ranks = tuple(sorted({int(rk) for rk in self.topology.ranks(rep, source_stage)}))
+            if len(rep_ranks) != local_k:
+                return None
+            rep_indices = tuple(
+                group_rank_to_idx[rk] for rk in rep_ranks if rk in group_rank_to_idx
+            )
+            if len(rep_indices) != local_k:
+                return None
+            rep_ranks_map[rep] = rep_ranks
+            rep_indices_map[rep] = rep_indices
+            for pos, (rk, idx) in enumerate(zip(rep_ranks, rep_indices)):
+                rank_to_rep_pos[rk] = (rep, pos)
+                idx_to_rep_pos[idx] = (rep, pos)
+        return rep_ranks_map, rep_indices_map, rank_to_rep_pos, idx_to_rep_pos
+
     def _verify_canonical_cohort_reciprocity(
         self, prog0, transport, peer_replicas, source_stage, is_symmetric_fn,
     ) -> tuple[bool, int, tuple[int, ...]]:
@@ -376,61 +438,84 @@ class _CohortMixin(_CohortNativeMixin):
         # Part 1: Isomorphic membership (ep_group_width == n_replicas * len(local_sources)).
         if n_reps * local_k != ep_width:
             return False, 0, ()
-        for rep in peer_replicas:
-            if len(self.topology.ranks(rep, source_stage)) != local_k:
-                return False, 0, ()
-        # Part 2: Strict directed matrix reciprocity & replica isomorphism.
+        rep_maps = self._canonical_replica_maps(group, peer_replicas, source_stage, local_k)
+        if rep_maps is None:
+            return False, 0, ()
+        rep_ranks_map, rep_indices_map, rank_to_rep_pos, _ = rep_maps
+        # Part 2: Replica-block directed reciprocity & replica isomorphism.
         if is_symmetric_fn is not None and not is_symmetric_fn(
             prog0, ep_width, local_rank_count=local_k,
         ):
             return False, 0, ()
-        # Part 3: Symmetric routed reverse path + cross-replica wire/latency/rate isomorphism.
+        # Part 3: Symmetric routed twin path + cross-replica wire/latency/rate isomorphism.
         route = transport.get("route")
         inner = prog0.program
         if callable(route) and hasattr(inner, "transport_cells"):
-            from ..communication import MessageFlow
+            if not self._verify_canonical_route_symmetry(
+                inner, route, transport, peer_replicas,
+                rep_ranks_map, rep_indices_map, rank_to_rep_pos,
+            ):
+                return False, 0, ()
+        return True, ep_width, local_sources
 
-            def _hop_sig(routed) -> tuple[tuple[float, float, tuple[float, ...]], ...]:
-                return tuple(
-                    (
-                        float(hop.wire_bytes),
-                        float(hop.latency_ms),
-                        tuple(sorted(
-                            float(self.engine.resources[r].rate)
-                            for r in hop.demand if r in self.engine.resources
-                        )),
-                    )
-                    for hop in routed.hops
+    def _verify_canonical_route_symmetry(
+        self, inner, route, transport, peer_replicas,
+        rep_ranks_map, rep_indices_map, rank_to_rep_pos,
+    ) -> bool:
+        """Verify replica-twin hop symmetry, cross-replica isomorphism, and RX remap safety."""
+        from ..communication import MessageFlow
+
+        engine_res = self.engine.resources
+
+        def _hop_sig(routed) -> tuple[tuple[float, float, tuple[float, ...]], ...]:
+            return tuple(
+                (
+                    float(hop.wire_bytes),
+                    float(hop.latency_ms),
+                    tuple(sorted(
+                        float(engine_res[r].rate) for r in hop.demand if r in engine_res
+                    )),
                 )
+                for hop in routed.hops
+            )
 
-            group_rank_to_idx = {rk: idx for idx, rk in enumerate(group)}
+        phases_set = {p.name for p in getattr(inner, "phases", ())}
+        count_modes = (False, True) if "count_status_exchange" in phases_set else (False,)
+        for is_count in count_modes:
             ref_sigs: list[tuple[tuple[float, float, tuple[float, ...]], ...]] | None = None
             for rep in peer_replicas:
-                rep_ranks = tuple(sorted({int(rk) for rk in self.topology.ranks(rep, source_stage)}))
-                if len(rep_ranks) != local_k:
-                    return False, 0, ()
-                rep_sources = tuple(
-                    group_rank_to_idx[rk] for rk in rep_ranks if rk in group_rank_to_idx
-                )
-                if len(rep_sources) != local_k:
-                    return False, 0, ()
-                rep_transport = {**transport, "sources": rep_sources}
+                rep_ranks = rep_ranks_map[rep]
                 rep_set = set(rep_ranks)
+                rep_transport = {**transport, "sources": rep_indices_map[rep]}
                 rep_sigs: list[tuple[tuple[float, float, tuple[float, ...]], ...]] = []
-                for _si, _di, src, dst, useful, _frames in inner.transport_cells(rep_transport, count=False):
+                for _si, _di, src, dst, useful, _frames in inner.transport_cells(
+                    rep_transport, count=is_count,
+                ):
                     if useful <= 0 or src == dst or (src in rep_set and dst in rep_set):
                         continue
-                    fwd_sig = _hop_sig(route(MessageFlow(src, dst, float(useful))))
-                    rev_sig = _hop_sig(route(MessageFlow(dst, src, float(useful))))
-                    if fwd_sig != rev_sig:
-                        return False, 0, ()
+                    src_info = rank_to_rep_pos.get(int(src))
+                    dst_info = rank_to_rep_pos.get(int(dst))
+                    if src_info is None or dst_info is None:
+                        return False
+                    twin_src = rep_ranks_map[dst_info[0]][src_info[1]]
+                    twin_dst = rep_ranks[dst_info[1]]
+                    routed_fwd = route(MessageFlow(src, dst, float(useful)))
+                    routed_twin = route(MessageFlow(twin_src, twin_dst, float(useful)))
+                    fwd_sig = _hop_sig(routed_fwd)
+                    if fwd_sig != _hop_sig(routed_twin):
+                        return False
+                    if rep == peer_replicas[0]:
+                        for hop in routed_fwd.hops:
+                            ok_rx, _ = _remap_routed_hop(hop, int(dst), int(twin_dst), engine_res)
+                            if not ok_rx:
+                                return False
                     rep_sigs.append(fwd_sig)
                 rep_sigs.sort()
                 if ref_sigs is None:
                     ref_sigs = rep_sigs
                 elif rep_sigs != ref_sigs:
-                    return False, 0, ()
-        return True, ep_width, local_sources
+                    return False
+        return True
 
     def _build_canonical_launch_view(
         self, bound, source_view, rank0: int, ep_width: int, res_names,
@@ -558,16 +643,71 @@ class _CohortMixin(_CohortNativeMixin):
         if not ok or not 0 <= rank0 < ep_width:
             return False
 
-        r0_ranks = tuple(int(rk) for rk in self.topology.ranks(item0.replica, source_stage))
-        r0_hbm = self.destination_window_resource(r0_ranks[0], source_stage) if r0_ranks else None
+        r0_ranks = tuple(sorted({int(rk) for rk in self.topology.ranks(item0.replica, source_stage)}))
+        group = tuple(int(rk) for rk in (transport.get("group") or ()))
+        local_k = len(local_sources)
+        rep_maps = self._canonical_replica_maps(group, peer_replicas, source_stage, local_k)
+        if rep_maps is None or item0.replica not in rep_maps[0]:
+            return False
+        rep_ranks_map, rep_indices_map, rank_to_rep_pos, idx_to_rep_pos = rep_maps
+        r0_ranks = rep_ranks_map[item0.replica]
+        r0_indices = rep_indices_map[item0.replica]
+        r0_rank_set = set(r0_ranks)
+        r0_idx_set = set(r0_indices)
+
         orig_dest_mem = dict(transport.get("destination_memory") or {})
-        if r0_hbm and orig_dest_mem:
-            r0_rank_set = set(r0_ranks)
-            transport["destination_memory"] = {
-                int(rk): (mem_name if int(rk) in r0_rank_set else r0_hbm)
-                for rk, mem_name in orig_dest_mem.items()
-                if mem_name
+        if r0_ranks and orig_dest_mem:
+            r0_hbm_by_pos = tuple(
+                self.destination_window_resource(rk, source_stage) for rk in r0_ranks
+            )
+            mapped_dest_mem = {}
+            for rk, mem_name in orig_dest_mem.items():
+                if not mem_name:
+                    continue
+                rk_i = int(rk)
+                if rk_i in r0_rank_set:
+                    mapped_dest_mem[rk_i] = mem_name
+                else:
+                    info = rank_to_rep_pos.get(rk_i)
+                    pos = info[1] if info is not None else 0
+                    mapped_dest_mem[rk_i] = r0_hbm_by_pos[pos] or r0_hbm_by_pos[0]
+            transport["destination_memory"] = mapped_dest_mem
+
+        orig_route = transport.get("route")
+        if callable(orig_route):
+            engine_res = self.engine.resources
+            peer_to_r0_rank = {
+                int(rk): int(r0_ranks[pos])
+                for rk, (rep_id, pos) in rank_to_rep_pos.items()
+                if rep_id != item0.replica
             }
+
+            def _canonical_route(flow):
+                routed = orig_route(flow)
+                dst_i = int(flow.destination)
+                canon_dst = peer_to_r0_rank.get(dst_i)
+                if canon_dst is None:
+                    return routed
+                new_hops = []
+                changed = False
+                for hop in routed.hops:
+                    ok_rx, new_hop = _remap_routed_hop(hop, dst_i, canon_dst, engine_res)
+                    if ok_rx and new_hop is not hop:
+                        new_hops.append(new_hop)
+                        changed = True
+                    else:
+                        new_hops.append(hop)
+                return replace(routed, hops=tuple(new_hops)) if changed else routed
+
+            transport["route"] = _canonical_route
+
+        canonical_mirror: dict[tuple[int, int], tuple[int, int]] = {}
+        for src_pos, si in enumerate(r0_indices):
+            for di, (dst_rep, dst_pos) in idx_to_rep_pos.items():
+                if di not in r0_idx_set:
+                    canonical_mirror[(si, di)] = (rep_indices_map[dst_rep][src_pos], r0_indices[dst_pos])
+        transport["canonical_mirror"] = canonical_mirror
+        transport["canonical_frame_mirror"] = True
 
         res_names = self.native_resource_names(
             item0.context, prog0, rank=rank0, replica=item0.replica)
@@ -580,70 +720,12 @@ class _CohortMixin(_CohortNativeMixin):
         )
         name0 = f"group:{key}:r{item0.replica}"
         phase_names = tuple(p.name for p in getattr(bound.program, "phases", ()))
-        group = tuple(int(rk) for rk in (transport.get("group") or ()))
-        local_idx_set = {idx for idx in local_sources if 0 <= idx < len(group)}
 
         def _launch(_event=None):
-            placeholders = {}
-            inner_prog = bound.program
-            phases_set = set(phase_names)
-            has_route = callable(transport.get("route"))
-            handled_payload = False
-            if has_route and hasattr(inner_prog, "transport_cells"):
-                has_payload_policy = bool(getattr(inner_prog, "has_payload_policy", False))
-                for pname, is_count in (
-                    ("payload_exchange", False),
-                    ("count_status_exchange", True),
-                ):
-                    if pname not in phases_set or (not is_count and not has_payload_policy):
-                        continue
-                    if not is_count:
-                        handled_payload = True
-                    for si, di, _src, _dst, useful, _frames in inner_prog.transport_cells(
-                        transport, count=is_count,
-                    ):
-                        if useful <= 0 or si == di or si not in local_idx_set:
-                            continue
-                        if di in local_idx_set:
-                            placeholders.setdefault(
-                                (si, di, pname),
-                                self.engine.future(f"{name0}:intra:{si}->{di}:{pname}"),
-                            )
-                        else:
-                            tx_fut = placeholders.setdefault(
-                                (si, di, pname),
-                                self.engine.future(f"{name0}:tx:{si}->{di}:{pname}"),
-                            )
-                            if (di, si, pname) not in placeholders:
-                                rx_fut = self.engine.future(f"{name0}:rx:{di}->{si}:{pname}")
-                                placeholders[(di, si, pname)] = rx_fut
-                                self.engine.on_complete(
-                                    tx_fut,
-                                    lambda _e, target=rx_fut: None if target.done else self.engine.resolve(target),
-                                    native_hook=True,
-                                )
-            if not handled_payload and p_frames and "payload_exchange" in phases_set:
-                pname = "payload_exchange"
-                peer_set = set(view.peer_labels)
-                for peer_idx, frames in p_frames:
-                    if frames <= 0 or peer_idx == rank0 or peer_idx not in peer_set:
-                        continue
-                    tx_fut = placeholders.setdefault(
-                        (rank0, peer_idx, pname),
-                        self.engine.future(f"{name0}:tx:{rank0}->{peer_idx}:{pname}"),
-                    )
-                    if (peer_idx, rank0, pname) not in placeholders:
-                        rx_fut = self.engine.future(f"{name0}:rx:{peer_idx}->{rank0}:{pname}")
-                        placeholders[(peer_idx, rank0, pname)] = rx_fut
-                        self.engine.on_complete(
-                            tx_fut,
-                            lambda _e, target=rx_fut: None if target.done else self.engine.resolve(target),
-                            native_hook=True,
-                        )
             rank_eng = _RankEngine(self.engine, res_names)
             finish, _handles = bound.start_with_handles(
                 rank_eng, name0, item0.ready,
-                launch=view, send_placeholders=placeholders, transport=transport,
+                launch=view, send_placeholders={}, transport=transport,
             )
             self.engine.on_complete(
                 finish,
