@@ -609,3 +609,37 @@ def test_efficiency_curves_mte2_ceiling_and_core_mapping_bound_derivation():
                      (Link("fabric", 1e6, (0, 1), latency_us=0.0),), ranks_per_node=2)
     with pytest.raises(ModelingError, match="requires_per_device_core_mapping"):
         derive_hardware_sku(mixed, sku="H", aic_count=4)
+
+
+def test_chained_hbm_efficiency_derivation_avoids_double_application_and_resets_on_new_peak():
+    base = machine(REPRESENTATIVE_SKUS["a5"])
+    first = derive_hardware_sku(base, sku="H1", hbm_peak_bytes_per_s=4e12, hbm_efficiency=0.8)
+    assert dict(first.dies[0].rates)["hbm"] == pytest.approx(3.2e12)
+    noop = derive_hardware_sku(first, sku="H2")
+    assert dict(noop.dies[0].rates)["hbm"] == pytest.approx(3.2e12)
+    re_eff = derive_hardware_sku(first, sku="H3", hbm_efficiency=0.5)
+    assert dict(re_eff.dies[0].rates)["hbm"] == pytest.approx(2.0e12)
+    re_peak = derive_hardware_sku(first, sku="H4", hbm_peak_bytes_per_s=2e12)
+    assert dict(re_peak.dies[0].rates)["hbm"] == pytest.approx(2.0e12)
+    base_rates = dict(base.dies[0].rates)
+    d0 = replace(base.dies[0], rank=0, package=0, rates=tuple({**base_rates, "hbm": 1e12}.items()))
+    d1 = replace(base.dies[0], rank=1, package=1, rates=tuple({**base_rates, "hbm": 2e12}.items()))
+    het = replace(base, name="het_hbm", sku="het_hbm", dies=(d0, d1),
+                  links=(Link("fabric", 1e6, (0, 1), latency_us=0.0),), ranks_per_node=2)
+    het1 = derive_hardware_sku(het, sku="HET1", hbm_efficiency=0.8)
+    het2 = derive_hardware_sku(het1, sku="HET2", hbm_efficiency=0.5)
+    assert [dict(d.rates)["hbm"] for d in het2.dies] == pytest.approx([0.5e12, 1.0e12])
+
+
+def test_superpod_without_superpod_bandwidth_retains_per_pod_inter_node_links():
+    spec = {
+        **MOCK, "ranks_per_node": 2, "superpod_size": 4,
+        "superpod_bw_gbps": 0.0, "inter_node_bw_gbps": 100.0,
+    }
+    built = ch.build_custom_hardware_machine(spec, num_devices=8)
+    links = ch.parse_hardware(built).links
+    inter_nodes = [l for l in links if l.channel == "inter_node"]
+    inter_pods = [l for l in links if l.channel == "inter_pod"]
+    assert not any(l.channel == "superpod" for l in links)
+    assert sorted(len(l.members) for l in inter_nodes) == [4, 4]
+    assert len(inter_pods) == 1 and len(inter_pods[0].members) == 8

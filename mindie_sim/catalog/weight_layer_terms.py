@@ -307,14 +307,14 @@ def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
         if plan.mla_variant == "latent_mqa":
             if plan.q_lora_rank:
                 terms.extend([
-                    _t("q_a", plan.q_lora_rank, h, "mla"),
-                    _t("q_b", heads * qk, plan.q_lora_rank, "mla", "out_tp"),
-                    _t("wkv", plan.kv_lora_rank, h, "mla"),
+                    _t("q_a", plan.q_lora_rank, h, "mla.q_a"),
+                    _t("q_b", heads * qk, plan.q_lora_rank, "mla.q_b", "out_tp"),
+                    _t("wkv", plan.kv_lora_rank, h, "mla.kv_a"),
                 ])
             else:
                 terms.extend([
                     _t("q_proj", heads * qk, h, "mla.q_proj", "out_tp"),
-                    _t("wkv", plan.kv_lora_rank, h, "mla"),
+                    _t("wkv", plan.kv_lora_rank, h, "mla.kv_a"),
                 ])
             if plan.o_groups > 0:
                 group_width = heads * plan.head_dim // plan.o_groups
@@ -325,7 +325,7 @@ def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
                        "mla.o_b", "group_in", groups=plan.o_groups),
                 ])
             else:
-                terms.append(_t("o_proj", h, heads * plan.head_dim, "mla", "in_tp"))
+                terms.append(_t("o_proj", h, heads * plan.head_dim, "mla.o", "in_tp"))
         else:
             if plan.q_lora_rank:
                 terms.extend([
@@ -387,7 +387,8 @@ def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
                     units=plan.num_kv_heads, unit_width=v_dim)
         terms.append(replace(v_term, source_owned=False) if plan.k_eq_v else v_term)
         if gate_separate:
-            terms.append(_t("g_proj", heads, h, "attn.gate", "out_tp"))
+            gate_rows = heads if plan.q_output_gate_kind == "headwise" else heads * v_dim
+            terms.append(_t("g_proj", gate_rows, h, "attn.gate", "out_tp"))
         terms.append(_t("o_proj", h, heads * v_dim, "attn.o", "in_tp"))
         if 0 <= plan.kv_owner_layer_id < plan.index:
             terms = [term for term in terms if term.name not in {"k_proj", "v_proj"}]
@@ -474,7 +475,7 @@ def _ffn_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
         terms.append(_t("router_correction_bias", plan.num_experts, 1, "param_fp32"))
     if plan.router_precast_weight_copy and plan.router_dtype:
         terms.append(replace(
-            _t("router_precast", plan.num_experts, plan.router_input_size or h, "router"),
+            _t("router_precast", router_rows, plan.router_input_size or h, "router"),
             source_owned=False, runtime_dtype=plan.router_dtype))
     if plan.expert_latent_size:
         r = plan.expert_latent_size

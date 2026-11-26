@@ -27,6 +27,7 @@ from mindie_sim.prediction.runtime.tile_solver import DEFAULT_INST_BLOCK_DIM
 from mindie_sim.public.errors import UnmodeledCapabilityError
 from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
 from mindie_sim.schema.datapath import GENERIC_ARCH_ID, DatapathCapabilitySpec
+from mindie_sim.schema.device_input import MemoryAccessSpec
 
 from ._lowering_comms import (
     _aicpu, _collective, _crosscore, _dma, _intracore, _mutex, _peer, _stars, _streams,
@@ -245,6 +246,7 @@ class _Lowering:
         caps: dict[str, float] = {}
         max_owner: dict[str, int] = {}
         pools: dict[str, float] = {}
+        pool_units: dict[str, int] = {}
         ctx_rates = getattr(self.ctx, "rates", {}) if self.ctx is not None else {}
         ctx_units = getattr(self.ctx, "resource_units", {}) if self.ctx is not None else {}
         role_by_row = (
@@ -265,11 +267,19 @@ class _Lowering:
                     max_owner[row] = max(max_owner.get(row, 0), max(owners))
             for alloc in stage.acquire:
                 pools[alloc.pool] = pools.get(alloc.pool, 0.0) + float(alloc.size)
-        if self.ctx is not None and getattr(self.ctx, "pool_names", None) and getattr(self.ctx, "pool_capacities", None):
-            for role, cap in self.ctx.pool_capacities.items():
-                pname = self.ctx.pool_names.get(role)
-                if pname:
-                    pools[pname] = float(cap)
+                if alloc.units:
+                    pool_units[alloc.pool] = max(pool_units.get(alloc.pool, 1), max(int(u) for u in alloc.units) + 1)
+        if self.ctx is not None:
+            pnames = getattr(self.ctx, "pool_names", None) or {}
+            if getattr(self.ctx, "pool_capacities", None):
+                for role, cap in self.ctx.pool_capacities.items():
+                    pname = pnames.get(role)
+                    if pname:
+                        pools[pname] = float(cap)
+            if getattr(self.ctx, "pool_units", None):
+                for role, count in self.ctx.pool_units.items():
+                    pname = pnames.get(role, role)
+                    pool_units[pname] = max(pool_units.get(pname, 1), int(count))
         resources = []
         for row in dict.fromkeys(rows):
             if row in ctx_rates:
@@ -281,7 +291,7 @@ class _Lowering:
             else:
                 units = max_owner[row] + 1 if row in max_owner else 1
                 resources.append(Resource(row, float(caps[row]) * units, units=units))
-        scratch = Engine(resources, backend="python", pools=pools or None)
+        scratch = Engine(resources, backend="python", pools=pools or None, pool_units=pool_units or None)
         done = program.start(scratch, "span", scratch.submit("span:start"))
         scratch.advance(until=(done,))
         return float(done.time)
@@ -304,6 +314,43 @@ class _Lowering:
         object.__setattr__(result, "_stars_plan", self.stars_plan)
         object.__setattr__(result, "_required_resources", tuple(self.req_res.values()))
         return result
+
+
+def _pos_param_int(mapping: Mapping[str, Any], key: str) -> int | None:
+    value = mapping.get(key)
+    if type(value) is int and value > 0:
+        return value
+    return None
+
+
+def _table_memory_access(table: PrimitiveTable) -> MemoryAccessSpec | None:
+    """Derive memory-access geometry from P01/P05 parameters when datapath is absent."""
+    p01 = table.cell("P01_datacopy").parameters
+    p05 = table.cell("P05_l2_residency_reuse").parameters
+    has_geom = (
+        any(key in p01 for key in ("hbm_burst_granule_bytes", "hbm_scatter_row_open_bytes"))
+        or any(key in p05 for key in ("l2_line_bytes", "l2_sector_bytes"))
+    )
+    if not has_geom:
+        return None
+    raw: dict[str, Any] = {}
+    sector = _pos_param_int(p01, "sector_bytes")
+    if sector is not None:
+        raw["sector_bytes"] = sector
+    burst = _pos_param_int(p01, "hbm_burst_granule_bytes")
+    if burst is not None:
+        raw["hbm_burst_granule_bytes"] = burst
+    scatter = p01.get("hbm_scatter_row_open_bytes")
+    if type(scatter) is int and scatter >= 0:
+        raw["hbm_scatter_row_open_bytes"] = scatter
+    l2_line = _pos_param_int(p05, "l2_line_bytes")
+    if l2_line is not None:
+        raw["l2_line_bytes"] = l2_line
+    l2_sector = _pos_param_int(p05, "l2_sector_bytes") or _pos_param_int(p05, "granule_bytes")
+    effective_l2_line = l2_line if l2_line is not None else MemoryAccessSpec().l2_line_bytes
+    if l2_sector is not None and effective_l2_line % l2_sector == 0:
+        raw["l2_sector_bytes"] = l2_sector
+    return MemoryAccessSpec.from_mapping(raw)
 
 
 def _memory(b, name, pipe, direction, owner, plan, copy_rate, after=(), *,
@@ -331,9 +378,12 @@ def _memory(b, name, pipe, direction, owner, plan, copy_rate, after=(), *,
     if atomic_rate is not None:
         read, write, alpha = min(read, atomic_rate), min(write, atomic_rate), 1.0
     hbm = b.row("hbm")
+    mem_access = getattr(b.dp, "memory_access", None)
+    if mem_access is None:
+        mem_access = _table_memory_access(b.table)
     bus = HbmBusSpec(die, read, write, alpha, *((
         f"{hbm}:r", f"{hbm}:w", f"{hbm}:ctr_r", f"{hbm}:ctr_w",
-    ) if hbm != "hbm" else ()), memory_access=getattr(b.dp, "memory_access", None))
+    ) if hbm != "hbm" else ()), memory_access=mem_access)
     l2 = b.speed("l2_die_bytes_per_s", pid="P05_l2_residency_reuse")
     profile_rules = getattr(bus.memory_access, "burst_turn_penalty", ())
     rules = b.p.get("burst_turn_penalty", profile_rules or b.table.cell("P01_datacopy").parameters.get("burst_turn_penalty", ()))

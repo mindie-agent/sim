@@ -16,6 +16,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal
+from weakref import WeakKeyDictionary
 
 from mindie_sim.prediction.collectives.protocol import frame_wire_bytes as _protocol_frame_wire_bytes
 from mindie_sim.prediction.runtime.memory_physics import (
@@ -499,40 +500,61 @@ class _FramedCollectiveBand(CollectiveBandSpec):
         return {**CollectiveBandSpec.to_dict(self), "short_final_frame_policy": self.short_final_frame_policy}
 
 
+_ENGINE_STARS_QUEUES: WeakKeyDictionary[Any, dict[tuple[str, str], Any]] = WeakKeyDictionary()
+
+
 def _submit_stars_plan(engine, stars_spec, stars_plan, after, name):
     """Submit a descriptor sequence through production ``StarsDescriptorQueue``."""
     from mindie_sim.prediction.execution.runner import StarsDescriptorQueue
 
     die, ns, desc_rows = stars_plan
-    queue = StarsDescriptorQueue(stars_spec, die_id=die, namespace=ns)
+    scope_key = f"die{int(die)}" if stars_spec.queue_scope == "die" else str(stars_spec.queue_scope)
+    queue_key = (str(ns), scope_key)
+    per_engine = _ENGINE_STARS_QUEUES.setdefault(engine, {})
+    queue = per_engine.get(queue_key)
+    if queue is None:
+        queue = StarsDescriptorQueue(stars_spec, die_id=die, namespace=ns)
+        per_engine[queue_key] = queue
+    elif queue.spec != stars_spec:
+        queue.spec = stars_spec
+        if int(stars_spec.lanes) > len(queue.lane_names):
+            queue.lane_names = tuple(
+                f"{queue.namespace}stars:{queue.scope_key}:lane{idx}"
+                for idx in range(int(stars_spec.lanes))
+            )
     queue.ensure_engine_resources(engine)
     prev_host, done_events = tuple(after), []
+    base_occ = queue.descriptor_count
     for occ, (replay_id, stream_id, host_ms, work) in enumerate(desc_rows):
         ready = engine.submit(f"{name}:host_submit:{occ}", after=prev_host, latency=host_ms)
         prev_host = (ready,)
         k_done, _ = queue.submit_kernel(
-            engine, replay=replay_id, stream=stream_id, kernel_occurrence=occ,
+            engine, replay=replay_id, stream=stream_id, kernel_occurrence=base_occ + occ,
             descriptor_ready=ready, work=work, owner=name, die=die,
         )
         done_events.append(k_done)
     return done_events[-1] if len(done_events) == 1 else engine.boundary(f"{name}:complete", after=tuple(done_events))
 
 
-def _scratch_resources(rows, ctx, caps=None):
+def _scratch_resources(rows, ctx, caps=None, max_owner=None):
     from mindie_sim.prediction.runtime.engine import Resource
 
     role_by_row = {v: k for k, v in getattr(ctx, "resource_names", {}).items()} if ctx is not None else {}
     rates = getattr(ctx, "rates", {}) if ctx is not None else {}
     units_map = getattr(ctx, "resource_units", {}) if ctx is not None else {}
     caps = caps or {}
+    owners_map = max_owner or {}
     out = []
     for row in dict.fromkeys(rows):
         if row in rates:
             role = role_by_row.get(row, row)
-            units = units_map.get(row, units_map.get(role, 1))
-            out.append(Resource(row, float(rates[row]), units=int(units)))
+            units = int(units_map.get(row, units_map.get(role, 1)))
+            if row in owners_map:
+                units = max(units, int(owners_map[row]) + 1)
+            out.append(Resource(row, float(rates[row]), units=units))
         elif row in caps:
-            out.append(Resource(row, float(caps[row])))
+            units = int(owners_map[row]) + 1 if row in owners_map else 1
+            out.append(Resource(row, float(caps[row]) * units, units=units))
         else:
             raise ModelingError(f"missing_resource_rate:{row}")
     return out
@@ -548,28 +570,88 @@ def _stars_plan_span_ms(stars_spec, stars_plan, *, ctx=None) -> float:
     return float(done.time)
 
 
+def _collect_stage_resources(
+    stages: Sequence[Any],
+    rows: list[str],
+    caps: dict[str, float],
+    max_owner: dict[str, int],
+    pools: dict[str, float],
+    pool_units: dict[str, int],
+    walk_fn: Any,
+) -> None:
+    for st in stages:
+        for row in st.work:
+            rows.append(row)
+            if row in st.caps:
+                caps[row] = max(caps.get(row, 0.0), float(st.caps[row]))
+            owners = st.placement.get(row, ())
+            if owners:
+                max_owner[row] = max(max_owner.get(row, 0), max(owners))
+        for alloc in getattr(st, "acquire", ()):
+            pool, sz = (alloc.pool, alloc.size) if hasattr(alloc, "pool") else alloc
+            pools[pool] = pools.get(pool, 0.0) + float(sz)
+            units = getattr(alloc, "units", ())
+            if units:
+                pool_units[pool] = max(pool_units.get(pool, 1), max(int(u) for u in units) + 1)
+        for alloc in getattr(st, "free", ()):
+            if hasattr(alloc, "pool"):
+                units = getattr(alloc, "units", ())
+                if units:
+                    pool_units[alloc.pool] = max(pool_units.get(alloc.pool, 1), max(int(u) for u in units) + 1)
+        if st.program is not None:
+            walk_fn(st.program)
+
+
 def _program_span_ms(program: KernelProgram, ctx: Any) -> float:
     """Derive exact isolated span of a nested ``KernelProgram`` via ``Engine``."""
     from mindie_sim.prediction.runtime.engine import Engine
 
-    rows, caps, pools = [], {}, {}
-    def _walk(prog):
-        for st in prog.stages:
-            for row in st.work:
-                rows.append(row)
-                if row in st.caps:
-                    caps[row] = max(caps.get(row, 0.0), float(st.caps[row]))
-            for pool, sz in getattr(st, "acquire", ()):
-                pools[pool] = pools.get(pool, 0.0) + float(sz)
-            if st.program is not None:
-                _walk(st.program)
+    rows: list[str] = []
+    caps: dict[str, float] = {}
+    max_owner: dict[str, int] = {}
+    pools: dict[str, float] = {}
+    pool_units: dict[str, int] = {}
+
+    def _walk(prog: Any) -> None:
+        if hasattr(prog, "programs"):
+            for child in prog.programs:
+                _walk(child)
+            return
+        if hasattr(prog, "branches"):
+            for branch in prog.branches:
+                _walk(branch)
+            return
+        if hasattr(prog, "program") and prog.program is not None:
+            _walk(prog.program)
+            return
+        if hasattr(prog, "tile") and hasattr(prog, "count"):
+            for idx in range(int(prog.count)):
+                _collect_stage_resources(
+                    tuple(prog.tile(idx)), rows, caps, max_owner, pools, pool_units, _walk,
+                )
+            return
+        _collect_stage_resources(
+            getattr(prog, "stages", ()), rows, caps, max_owner, pools, pool_units, _walk,
+        )
+
     _walk(program)
-    if ctx is not None and getattr(ctx, "pool_names", None) and getattr(ctx, "pool_capacities", None):
-        for role, cap in ctx.pool_capacities.items():
-            pname = ctx.pool_names.get(role)
-            if pname:
-                pools[pname] = float(cap)
-    scratch = Engine(_scratch_resources(rows, ctx, caps), backend="python", pools=pools or None)
+    if ctx is not None:
+        pnames = getattr(ctx, "pool_names", None) or {}
+        if getattr(ctx, "pool_capacities", None):
+            for role, cap in ctx.pool_capacities.items():
+                pname = pnames.get(role)
+                if pname:
+                    pools[pname] = float(cap)
+        if getattr(ctx, "pool_units", None):
+            for role, count in ctx.pool_units.items():
+                pname = pnames.get(role, role)
+                pool_units[pname] = max(pool_units.get(pname, 1), int(count))
+    scratch = Engine(
+        _scratch_resources(rows, ctx, caps, max_owner),
+        backend="python",
+        pools=pools or None,
+        pool_units=pool_units or None,
+    )
     done = program.start(scratch, "span", scratch.submit("span:start"))
     scratch.advance(until=(done,))
     return float(done.time)

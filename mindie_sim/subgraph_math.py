@@ -95,6 +95,7 @@ BOUNDARY_LEDGER_UNAVAILABLE = "boundary_access_ledger_unavailable"
 REALIZED_BELOW_BOUNDARY = "realized_hbm_below_minimal_boundary"
 ROLLUP_SCOPE = "declared_semantic_subgraph_union"
 COMM_UNATTRIBUTED = "unattributed"
+_PERSISTENT_STATE_WRITE_FAMILIES = frozenset({"cache_store", "kv_cache_write"})
 
 
 class SubgraphEfficiencyReport(TypedDict):
@@ -367,6 +368,20 @@ def _typed_edge_bytes(
     return None
 
 
+def _writes_persistent_state(node: Mapping[str, Any]) -> bool:
+    """True when a node writes persistent cross-step state (e.g. KV or index cache)."""
+    op = node.get("operator") if isinstance(node.get("operator"), Mapping) else {}
+    family = str(node.get("family") or op.get("family") or "").strip().lower()
+    if family in _PERSISTENT_STATE_WRITE_FAMILIES:
+        return True
+    meta = op.get("metadata")
+    if not isinstance(meta, Mapping):
+        return False
+    if bool(meta.get("cache_visible")):
+        return True
+    return str(meta.get("state_value_output") or "").strip().lower() == "persistent_cache"
+
+
 def _shared_external_input_reuse(
     nodes: Mapping[str, Mapping[str, Any]],
     members: Sequence[str],
@@ -475,11 +490,18 @@ def semantic_subgraph_ledger(
             or not internal_consumers[member]
         }
 
+    persistent_writers = {
+        member for member in members
+        if _writes_persistent_state(nodes[member])
+    }
+
     unfused_hbm = sum(
         float(nodes[member]["physical_work"]["hbm_bytes"]) for member in members)
     write_eliminable = {
         member for member in members
-        if member not in ext_out and internal_consumers[member]
+        if member not in ext_out
+        and member not in persistent_writers
+        and internal_consumers[member]
     }
     read_eliminable = {
         member for member in members

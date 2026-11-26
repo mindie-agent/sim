@@ -542,3 +542,47 @@ def test_ordinary_aiv_floor_is_p15_only_and_sync_barrier_is_explicit():
     d_sync = graph_costs(cs, {0: [add_sync]}, evaluation=ev, include_submission=False, isolated=True)["duration_ms"]
     assert d_plain == pytest.approx(env.aiv_floor_ms(39), rel=1e-4) and d_plain < 0.00304
     assert d_sync == pytest.approx(env.aiv_sync_floor_ms(39), rel=1e-4) and d_sync > d_plain
+
+
+def test_sealer_withholds_unphysical_hbm_alpha_and_seals_cube_and_core_cells():
+    from mindie_sim.primitives import build_primitive_table_payload as pkg_build
+    from mindie_sim.primitives import parse_primitive_table
+
+    sku = CALIBRATED_FLEET_SKUS[-1]
+    pdir = default_primitives_dir()
+    entry = load_manifest()["tables"][sku]
+    shipped = json.loads((pdir / entry["file"]).read_text(encoding="utf-8"))
+    cap_raw = json.loads((pdir / "captures" / entry["file"].replace(".json", ".capture.json")).read_text(encoding="utf-8"))
+    raw = unwrap_raw_measurements(cap_raw)
+    resealed = pkg_build(
+        sku=sku,
+        cann_version=shipped["cann_version"],
+        endpoint_alias="lab",
+        campaign_id="reseal-verify",
+        raw_measurements=raw,
+    )
+    table = parse_primitive_table(resealed)
+    dp = _dp(sku)
+    assert table.cell("P01_datacopy").band("hbm_rw_alpha").p50 is None
+    strided_params = {"runs": (AddressRun(0, 2, 64, 8192),)}
+    with_dp = lower_primitive("P01_datacopy", strided_params, table, datapath=dp, allow_uncalibrated_declaration=True)
+    table_only = lower_primitive("P01_datacopy", strided_params, table, allow_uncalibrated_declaration=True)
+    assert table_only.bound_access.ledger.dram_bus_transaction_bytes == with_dp.bound_access.ledger.dram_bus_transaction_bytes
+    assert table.cell("P02_load_data").band("l1_to_l0b_transpose_bytes_per_s_per_aic").p50 is None
+    assert table.cell("P02_load_data").band("l1_to_l0b_transpose_bytes_per_s_per_aic").certified_upper_capacity == pytest.approx(
+        shipped["primitives"]["P02_load_data"]["metrics"]["l1_to_l0b_transpose_bytes_per_s_per_aic"]["certified_upper_capacity"]
+    )
+    assert table.cell("P06_mmad").status == "calibrated"
+    assert table.cell("P06_mmad").modes["bf16"]["cube_only_rate"].p50 == pytest.approx(
+        shipped["primitives"]["P06_mmad"]["modes"]["bf16"]["cube_only_rate"]["p50"]
+    )
+    for pid, metric in (
+        ("P02_load_data", "l1_to_l0a_bytes_per_s_per_aic"),
+        ("P03_fixpipe", "fixpipe_in_bytes_per_s_per_aic"),
+        ("P12_intracore_flag", "flag_ns"),
+        ("P14_mutex_block_mmad", "mutex_overhead_ns"),
+    ):
+        assert table.cell(pid).status == "calibrated"
+        assert table.cell(pid).band(metric).p50 == pytest.approx(
+            shipped["primitives"][pid]["metrics"][metric]["p50"]
+        )

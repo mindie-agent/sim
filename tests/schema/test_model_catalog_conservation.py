@@ -610,3 +610,158 @@ def test_expert_routing_histogram_normalizes_large_finite_weights_without_overfl
     assert skewed == pytest.approx((0.4, 0.0, 0.4, 0.2))
     empty, uniform_src = _normalize_routing([0.0, 0.0], 2)
     assert (empty, uniform_src) == ((), "uniform")
+
+
+def test_latent_mqa_and_separate_elementwise_gate_weight_shapes_and_quant() -> None:
+    from mindie_sim.catalog.types import QuantSpec
+    from mindie_sim.catalog.weight_layer_terms import layer_weight_terms
+    from mindie_sim.catalog.weight_terms import term_bytes
+    from mindie_sim.schema.model import LayerPlan, ModelSpec
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    mqa_plan = LayerPlan(
+        index=0, attention="mla", ffn="dense", num_heads=16, num_kv_heads=1,
+        head_dim=64, intermediate_size=1024, mla_variant="latent_mqa",
+        q_lora_rank=128, kv_lora_rank=256, qk_nope_head_dim=64, qk_rope_head_dim=64,
+        v_head_dim=64,
+    )
+    mqa_quant = QuantSpec(
+        name="mqa_mixed", weight_format="fp8_e4m3", activation_format="fp8_e4m3",
+        category_overrides=(("mla.q_a", (("weight_format", "bf16"),)),
+                            ("mla.kv_a", (("weight_format", "bf16"),))),
+    )
+    mqa_model = ModelSpec(
+        name="mqa_syn", layers=1, hidden_size=512, num_heads=16, num_kv_heads=1,
+        head_dim=64, intermediate_size=1024, vocab_size=1024,
+        layer_plans=(mqa_plan,), quant=mqa_quant,
+    )
+    mqa_terms = {t.name: t for t in layer_weight_terms(mqa_plan, mqa_model)}
+    assert (mqa_terms["q_a"].category, mqa_terms["q_b"].category) == ("mla.q_a", "mla.q_b")
+    assert (mqa_terms["wkv"].category, mqa_terms["o_proj"].category) == ("mla.kv_a", "mla.o")
+    par = ParallelSpec()
+    assert term_bytes(mqa_terms["q_a"], mqa_quant, par) == pytest.approx(128 * 512 * 2)
+    assert term_bytes(mqa_terms["wkv"], mqa_quant, par) == pytest.approx(256 * 512 * 2)
+
+    elem_plan = LayerPlan(
+        index=0, attention="gqa", ffn="dense", num_heads=8, num_kv_heads=2,
+        head_dim=64, v_head_dim=64, intermediate_size=1024,
+        q_output_gate=True, q_output_gate_kind="elementwise",
+        q_gate_projection="separate",
+    )
+    head_plan = replace(elem_plan, q_output_gate_kind="headwise")
+    gate_model = ModelSpec(
+        name="gate_syn", layers=1, hidden_size=512, num_heads=8, num_kv_heads=2,
+        head_dim=64, intermediate_size=1024, vocab_size=1024,
+        layer_plans=(elem_plan, head_plan), quant=QuantSpec("bf16"),
+    )
+    elem_g = next(t for t in layer_weight_terms(elem_plan, gate_model) if t.name == "g_proj")
+    head_g = next(t for t in layer_weight_terms(head_plan, gate_model) if t.name == "g_proj")
+    assert elem_g.rows == 8 * 64 and head_g.rows == 8
+
+
+def test_normalize_model_preserves_native_fp32_zero_experts_and_pruned_layer_widths() -> None:
+    from mindie_sim.catalog.weight_layer_terms import layer_weight_terms
+    from mindie_sim.catalog.weight_terms import term_bytes
+    from mindie_sim.model_catalog import derive_expert_pruned, normalize_model
+    from mindie_sim.schema.model import LayerPlan, ModelSpec
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    raw = ModelSpec(
+        name="fp32_zero_syn", layers=1, hidden_size=512, num_heads=8, num_kv_heads=2,
+        head_dim=64, intermediate_size=1024, vocab_size=2048, ffn="moe",
+        num_experts=16, top_k=2, moe_intermediate_size=256, zero_expert_num=4,
+        weight_dtype="fp32", activation_dtype="fp32", compute_dtype="fp32",
+    )
+    norm = normalize_model(raw)
+    assert norm.quant.native_format == "fp32"
+    assert norm.zero_expert_num == 4 and norm.layer_plans[0].zero_expert_num == 4
+    router = next(t for t in layer_weight_terms(norm.layer_plans[0], norm) if t.name == "router")
+    assert router.rows == 20
+    assert term_bytes(router, norm.quant, ParallelSpec()) == pytest.approx(20 * 512 * 4)
+
+    raw_alias = replace(raw, weight_dtype="float32", activation_dtype="float32", compute_dtype="float32")
+    norm_alias = normalize_model(raw_alias)
+    assert norm_alias.quant.native_format == "fp32"
+    router_alias = next(t for t in layer_weight_terms(norm_alias.layer_plans[0], norm_alias) if t.name == "router")
+    assert term_bytes(router_alias, norm_alias.quant, ParallelSpec()) == pytest.approx(20 * 512 * 4)
+
+    hetero = normalize_model(ModelSpec(
+        name="hetero_moe", layers=2, hidden_size=512, num_heads=8, num_kv_heads=2,
+        head_dim=64, intermediate_size=1024, vocab_size=1024, ffn="moe",
+        num_experts=16, top_k=2, moe_intermediate_size=256,
+        layer_plans=(
+            LayerPlan(index=0, attention="gqa", ffn="moe", num_heads=8, num_kv_heads=2,
+                      head_dim=64, intermediate_size=1024, num_experts=16, top_k=2,
+                      moe_intermediate_size=256),
+            LayerPlan(index=1, attention="gqa", ffn="moe", num_heads=8, num_kv_heads=2,
+                      head_dim=64, intermediate_size=1024, num_experts=16, top_k=2,
+                      moe_intermediate_size=512),
+        ),
+    ))
+    pruned = derive_expert_pruned(hetero, num_experts=8, top_k=2)
+    assert [p.moe_intermediate_size for p in pruned.layer_plans] == [256, 512]
+    overridden = derive_expert_pruned(hetero, num_experts=8, top_k=2, moe_intermediate_size=192)
+    assert [p.moe_intermediate_size for p in overridden.layer_plans] == [192, 192]
+
+
+def test_redundant_expert_slots_unnormalized_detail_and_ngram_stage_placement() -> None:
+    from mindie_sim.catalog.weights import sharded_weight_bytes, stage_weight_terms
+    from mindie_sim.model_catalog import model_weight_detail
+    from mindie_sim.schema.model import ModelSpec
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    moe = ModelSpec(
+        name="red_moe", layers=2, hidden_size=512, num_heads=8, num_kv_heads=2,
+        head_dim=64, intermediate_size=1024, vocab_size=1024, ffn="moe",
+        num_experts=8, top_k=2, moe_intermediate_size=256,
+    )
+    par_base = ParallelSpec(tp=1, ep=4, pp=1, redundant_experts_per_rank=0)
+    par_red = ParallelSpec(tp=1, ep=4, pp=1, redundant_experts_per_rank=1)
+    detail_base = model_weight_detail(moe, par_base)
+    detail_red = model_weight_detail(moe, par_red)
+    norm_moe = load_model("deepseek-v2-lite")
+    assert detail_red["largest_stage_bytes"] > detail_base["largest_stage_bytes"]
+    assert sharded_weight_bytes(norm_moe, ParallelSpec(tp=1, ep=8, redundant_experts_per_rank=1)) > (
+        sharded_weight_bytes(norm_moe, ParallelSpec(tp=1, ep=8, redundant_experts_per_rank=0))
+    )
+    from mindie_sim.catalog.types import QuantSpec
+    from mindie_sim.model_catalog import normalize_model
+    mixed_q = QuantSpec(
+        name="mixed_ep", weight_format="bf16", expert_weight_format="bf16",
+        activation_format="bf16",
+        expert_quant_overrides=(((3,), (("weight_format", "fp32"),)),),
+        expert_quant_count=4,
+    )
+    mixed_layer_q = QuantSpec(
+        name="mixed_ep_layer", weight_format="bf16", expert_weight_format="bf16",
+        activation_format="bf16", expert_quant_count=4,
+        layer_quant_overrides={
+            "0": {"category_overrides": {
+                "routed_expert": {
+                    "expert_quant_count": 4,
+                    "expert_quant_overrides": [{"expert_indices": [3], "fields": {"weight_format": "fp32"}}],
+                },
+            }},
+        },
+    )
+    for q in (mixed_q, mixed_layer_q):
+        mixed_moe = normalize_model(ModelSpec(
+            name="mixed_ep_moe", layers=1, hidden_size=64, num_heads=4, num_kv_heads=2,
+            head_dim=16, intermediate_size=64, vocab_size=64, ffn="moe",
+            num_experts=4, top_k=1, moe_intermediate_size=32, quant=q,
+        ))
+        for red in (0, 1):
+            par_ep = ParallelSpec(tp=1, ep=2, pp=1, redundant_experts_per_rank=red)
+            r0 = sharded_weight_bytes(mixed_moe, par_ep, ep_rank=0)
+            r1 = sharded_weight_bytes(mixed_moe, par_ep, ep_rank=1)
+            peak = sharded_weight_bytes(mixed_moe, par_ep)
+            detail_ep = model_weight_detail(mixed_moe, par_ep)
+            assert r1 > r0 and peak == pytest.approx(r1)
+            assert detail_ep["largest_stage_bytes"] == pytest.approx(peak)
+
+    ngram_model = load_model("longcat-flash-lite")
+    stages = stage_weight_terms(ngram_model, ParallelSpec(tp=1, ep=1, pp=4))
+    s0_names = {t.name for t in stages[0]}
+    s3_names = {t.name for t in stages[3]}
+    assert {"embedding", "ngram_embedding", "ngram_post_proj"} <= s0_names
+    assert "ngram_embedding" not in s3_names and "ngram_post_proj" not in s3_names

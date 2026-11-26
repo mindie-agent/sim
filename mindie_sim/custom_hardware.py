@@ -518,12 +518,20 @@ def _materialize_links(
     superpod_size = int(superpod) if superpod is not None else 0
     if superpod_size > 0:
         superpod_bw = merged.get("superpod_bw_gbps")
+        has_superpod_bw = superpod_bw is not None and float(superpod_bw) > 0.0
         _append_group_links(
             links, channel="superpod", group_size=min(superpod_size, num_devices),
             bw_gbps=superpod_bw, utilization=inter_util,
             latency_us=node_latency, num_devices=num_devices,
         )
         if num_devices > superpod_size:
+            if not has_superpod_bw:
+                _append_group_links(
+                    links, channel="inter_node", group_size=superpod_size,
+                    bw_gbps=merged.get("inter_node_bw_gbps"), utilization=inter_util,
+                    latency_us=node_latency, num_devices=num_devices,
+                    name_prefix="z_fallback:inter_node",
+                )
             _append_group_links(
                 links, channel="inter_pod", group_size=num_devices,
                 bw_gbps=merged.get("inter_pod_bw_gbps"), utilization=inter_util,
@@ -532,8 +540,7 @@ def _materialize_links(
             )
         else:
             inter_bw = merged.get("inter_node_bw_gbps")
-            if (inter_bw is not None and superpod_bw is not None
-                    and float(superpod_bw) > 0.0):
+            if inter_bw is not None and has_superpod_bw:
                 inter_bw = min(float(inter_bw), float(superpod_bw))
             _append_group_links(
                 links, channel="inter_node", group_size=num_devices,

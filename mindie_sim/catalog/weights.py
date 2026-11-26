@@ -67,6 +67,9 @@ PLE_STORAGE_KIND = "ple_ngram_conv"
 TARGET_ALIAS_CATEGORIES = frozenset({
     "target_alias_embedding", "target_alias_lm_head",
 })
+_STAGE0_BODY_HEAD_TERMS = frozenset({
+    "embedding", "ngram_embedding", "ngram_post_proj",
+})
 
 
 def _require_model_quant(model: ModelSpec) -> QuantSpec:
@@ -723,7 +726,7 @@ def stage_weight_terms(
                 layer_terms, slots, ep_rank=0 if ep_rank is None else int(ep_rank))
         stages[stage_of(layer_idx)].extend(terms)
     for term in body_head_terms(model):
-        stages[0 if term.name == "embedding" else pp - 1].append(term)
+        stages[0 if term.name in _STAGE0_BODY_HEAD_TERMS else pp - 1].append(term)
     if pp > 1 and not model.is_standalone_draft and model.tie_word_embeddings:
         stages[pp - 1].append(
             replace(_t("lm_head", model.vocab_size, model.hidden_size, "lm_head", "out_tp"),
@@ -823,6 +826,45 @@ def stage_weight_bytes(
     return result
 
 
+def _has_expert_quant_overrides(model: ModelSpec) -> bool:
+    for plan in model.layer_plans:
+        if plan.ffn != "moe" or int(plan.num_experts) <= 0:
+            continue
+        resolved = _layer_resolved_quant(model, plan)
+        if getattr(resolved, "expert_quant_overrides", ()) or getattr(
+            resolved.for_category("routed_expert"), "expert_quant_overrides", ()
+        ):
+            return True
+    quant = getattr(model, "quant", None)
+    if quant is not None and (
+        getattr(quant, "expert_quant_overrides", ())
+        or getattr(quant.for_category("routed_expert"), "expert_quant_overrides", ())
+    ):
+        return True
+    return False
+
+
+def _default_slot_plans(
+    model: ModelSpec, parallel: ParallelSpec, *, ep_rank: int | None = None,
+) -> dict[int, Any] | None:
+    """Build per-layer expert slot plans when redundancy or rank-sensitive EP placement applies."""
+    redundant = int(getattr(parallel, "redundant_experts_per_rank", 0) or 0)
+    ep = max(1, int(getattr(parallel, "ep", 1) or 1))
+    need_slots = redundant > 0 or (
+        ep > 1 and (ep_rank is not None or _has_expert_quant_overrides(model))
+    )
+    if not need_slots:
+        return None
+    moe_plans = [
+        plan for plan in model.layer_plans
+        if plan.ffn == "moe" and int(plan.num_experts) > 0
+    ]
+    if not moe_plans:
+        return None
+    from mindie_sim.catalog.expert_slots import expert_slot_plan
+    return {plan.index: expert_slot_plan(model, plan, parallel) for plan in moe_plans}
+
+
 def sharded_weight_bytes(
     model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
     include_draft: bool = False, include_engram: bool = True,
@@ -830,18 +872,36 @@ def sharded_weight_bytes(
     enable_shared_expert_dp: bool = False,
     enable_pcp_o_proj_weight_sharding: bool = False,
     dcp_q_replicate: bool = False,
+    slot_plans: Mapping[int, Any] | None = None,
+    ep_rank: int | None = None,
     runtime: Any = None,
 ) -> float:
-    return float(max(stage_weight_bytes(
-        model, parallel, node_ranks, include_draft=include_draft,
-        include_engram=include_engram,
-        include_engram_tables=include_engram_tables,
-        include_vision=include_vision,
-        enable_shared_expert_dp=enable_shared_expert_dp,
-        enable_pcp_o_proj_weight_sharding=enable_pcp_o_proj_weight_sharding,
-        dcp_q_replicate=dcp_q_replicate,
-        runtime=runtime,
-    )))
+    resolved_slots = (
+        slot_plans if slot_plans is not None
+        else _default_slot_plans(model, parallel, ep_rank=ep_rank)
+    )
+    ep = max(1, int(getattr(parallel, "ep", 1) or 1))
+    if resolved_slots and ep_rank is None and ep > 1 and _has_expert_quant_overrides(model):
+        ranks = range(ep)
+    else:
+        ranks = (ep_rank,)
+    peak = 0.0
+    for rank in ranks:
+        stage_peak = max(stage_weight_bytes(
+            model, parallel, node_ranks, include_draft=include_draft,
+            include_engram=include_engram,
+            include_engram_tables=include_engram_tables,
+            include_vision=include_vision,
+            enable_shared_expert_dp=enable_shared_expert_dp,
+            enable_pcp_o_proj_weight_sharding=enable_pcp_o_proj_weight_sharding,
+            dcp_q_replicate=dcp_q_replicate,
+            slot_plans=resolved_slots,
+            ep_rank=rank,
+            runtime=runtime,
+        ), default=0.0)
+        if stage_peak > peak:
+            peak = stage_peak
+    return float(peak)
 
 
 def cache_row_bytes_by_layer(model: ModelSpec) -> tuple[tuple[int, int], ...]:
@@ -883,13 +943,20 @@ def weight_breakdown(
     include_engram_tables: bool | None = None,
     layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,
+    slot_plans: Mapping[int, Any] | None = None,
+    ep_rank: int | None = None,
 ) -> dict[str, float]:
     quant = _require_model_quant(model)
+    resolved_slots = (
+        slot_plans if slot_plans is not None
+        else _default_slot_plans(model, parallel, ep_rank=ep_rank)
+    )
     groups: dict[str, float] = {}
     byte_memo: dict[Any, float] = {}
     for terms in stage_weight_terms(
         model, parallel, include_engram=True,
         include_engram_tables=include_engram_tables, layer_partition=layer_partition,
+        slot_plans=resolved_slots, ep_rank=ep_rank,
     ):
         for term in terms:
             ck = _cache_key(term)

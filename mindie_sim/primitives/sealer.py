@@ -84,6 +84,7 @@ _TILE_32 = 32
 _TILE_64 = 64
 _DOUBLE_FACTOR = 2.0
 _DEFAULT_UNIT_ONE = 1
+_MAX_HBM_RW_ALPHA = 1.0
 
 PRIVATE_CAPTURE_RE = re.compile(
     r"(?<![\d.])(?:\d{1,3}[._-]){3}\d{1,3}(?![\d.])|/(?:Users|home|root)/[^\s\"']*|[^\s\"']*@[^\s\"']+|\$\{?HOME\}?"
@@ -135,6 +136,7 @@ def summarize_samples_with_reason(
     *,
     certified_bound: float,
     bound_kind: str = "rate_upper",
+    max_admissible: float | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Compute band statistics plus explicit status/conflict reason."""
     clean = sorted(float(x) for x in samples if math.isfinite(x) and x >= 0.0)
@@ -169,6 +171,11 @@ def summarize_samples_with_reason(
         return (
             {"certified_upper_capacity": nom, "bound_kind": bound_kind},
             f"p05_below_floor:p05={round(p05, _ROUND_CV_DIGITS)}:floor={nom}",
+        )
+    if max_admissible is not None and p99 > float(max_admissible):
+        return (
+            {"certified_upper_capacity": nom, "bound_kind": bound_kind},
+            f"p99_exceeds_admissible:p99={round(p99, _ROUND_CV_DIGITS)}:max={round(float(max_admissible), _ROUND_STAT_DIGITS)}",
         )
     band = {
         "p05": round(p05, _ROUND_STAT_DIGITS),
@@ -227,6 +234,7 @@ def load_sku_hardware_spec(sku: str) -> dict[str, Any]:
     d2h_rc = float(d2h.get("node_peak_bw_gbps") or 0.0) * _GBPS_TO_BPS or d2h_solo
     link_uni = float(d2d.get("uni_peak_bw_gbps") or d2d.get("effective_uni_bw_gbps") or 0.0) * _GBPS_TO_BPS
     peaks_raw = die_dict.get("compute_peaks") if isinstance(die_dict.get("compute_peaks"), Mapping) else {}
+    ma = getattr(dp, "memory_access", None)
     return {
         "sku": sku,
         "arch_preset": str(die.compute_arch.preset or _ARCH_PRESET_22),
@@ -239,6 +247,11 @@ def load_sku_hardware_spec(sku: str) -> dict[str, Any]:
         "l0a_bytes": int(bufs.get("l0a", 0)),
         "l0b_bytes": int(bufs.get("l0b", 0)),
         "l0c_bytes": int(bufs.get("l0c", 0)),
+        "sector_bytes": int(ma.sector_bytes) if ma is not None else _DEFAULT_SECTOR_BYTES,
+        "hbm_burst_granule_bytes": int(ma.hbm_burst_granule_bytes) if ma is not None else None,
+        "hbm_scatter_row_open_bytes": int(ma.hbm_scatter_row_open_bytes) if ma is not None else None,
+        "l2_line_bytes": int(ma.l2_line_bytes) if ma is not None else None,
+        "l2_sector_bytes": int(ma.l2_sector_bytes) if ma is not None else _DEFAULT_GRANULE_BYTES,
         "has_l0c_to_ub": bool(dp.has_l0c_to_ub),
         "has_ub_to_l1": bool(dp.has_ub_to_l1),
         "simt_ub_carveout_bytes": int(dp.simt_ub_carveout_bytes),
@@ -323,6 +336,7 @@ def _build_p06_mmad_modes(
         ("bf16", _TILE_16, _TILE_16, _TILE_16, _TILE_16, spec["peaks"].get("bf16", 0.0) / aic),
         ("fp16", _TILE_16, _TILE_16, _TILE_16, _TILE_16, spec["peaks"].get("fp16", 0.0) / aic),
         ("fp32", _TILE_16, _TILE_16, _TILE_8, _TILE_16, spec["peaks"].get("fp32", 0.0) / aic),
+        ("hf32", _TILE_16, _TILE_16, _TILE_8, _TILE_16, spec["peaks"].get("hf32", 0.0) / aic),
         ("int8", _TILE_16, _TILE_16, _TILE_32, _TILE_16, spec["peaks"].get("int8", 0.0) / aic),
     ]
     if is_arch35:
@@ -330,14 +344,17 @@ def _build_p06_mmad_modes(
             cap = spec["peaks"].get(mode, 0.0) / aic
             mode_defs.append((mode, _TILE_16, _TILE_16, _TILE_32, _TILE_16, cap))
         mx_cap = spec["peaks"].get("fp8_e4m3", spec["peaks"].get("int8", 0.0)) / aic
+        hif8_cap = spec["peaks"].get("hifloat8", mx_cap * aic) / aic
         mode_defs.extend([
+            ("hifloat8", _TILE_16, _TILE_16, _TILE_32, _TILE_16, hif8_cap),
             ("mxfp8", _TILE_16, _TILE_16, _TILE_32, _TILE_16, mx_cap),
             ("mxfp4", _TILE_16, _TILE_16, _TILE_64, _TILE_16, mx_cap * _DOUBLE_FACTOR),
         ])
+    raw_cube_modes = p06r.get("cube_only_modes") or p06r.get("modes") or {}
     for m_name, tm, tn, tk, miss, cap in mode_defs:
         if cap <= 0.0:
             continue
-        b = band_fn("P06_mmad", "cube_only_rate", p06r.get("modes", {}).get(m_name), cap, allow_meas=allow, mode=m_name)
+        b = band_fn("P06_mmad", "cube_only_rate", raw_cube_modes.get(m_name), cap, allow_meas=allow, mode=m_name)
         ms = _cell_status({"r": b})
         any_p06 = any_p06 or (ms == "calibrated")
         entry: dict[str, Any] = {
@@ -428,33 +445,65 @@ def _assemble_primitive_cells(
     make_cell_fn: Any,
 ) -> dict[str, Any]:
     p: dict[str, Any] = {}
-    p01r, p04r, p05r, p06r = (raw.get(k, {}) for k in ("P01_datacopy", "P04_mte3_store", "P05_l2_residency_reuse", "P06_mmad"))
-    p09r, p15r, p20r = (raw.get(k, {}) for k in ("P09_vec_reduce_cast", "P15_rts_stars", "P20_host_dma_sync"))
+    p01r, p02r, p03r, p04r, p05r, p06r = (
+        raw.get(k, {})
+        for k in ("P01_datacopy", "P02_load_data", "P03_fixpipe", "P04_mte3_store", "P05_l2_residency_reuse", "P06_mmad")
+    )
+    p09r, p12r, p14r, p15r, p20r = (
+        raw.get(k, {})
+        for k in ("P09_vec_reduce_cast", "P12_intracore_flag", "P14_mutex_block_mmad", "P15_rts_stars", "P20_host_dma_sync")
+    )
+    p01_params: dict[str, Any] = {
+        "sector_bytes": spec.get("sector_bytes", _DEFAULT_SECTOR_BYTES),
+        "l2_cache_ctl_supported": is_arch35,
+        "burst_turn_penalty": [],
+        **conflict_meta,
+    }
+    if spec.get("hbm_burst_granule_bytes") is not None:
+        p01_params["hbm_burst_granule_bytes"] = spec["hbm_burst_granule_bytes"]
+    if spec.get("hbm_scatter_row_open_bytes") is not None:
+        p01_params["hbm_scatter_row_open_bytes"] = spec["hbm_scatter_row_open_bytes"]
     p["P01_datacopy"] = make_cell_fn(
         "P01_datacopy", {"rate": "bytes_per_s", "penalty": "bytes", "alpha": "dimensionless"},
-        {"sector_bytes": _DEFAULT_SECTOR_BYTES, "l2_cache_ctl_supported": is_arch35, "burst_turn_penalty": [], **conflict_meta},
+        p01_params,
         {
             "hbm_read_bytes_per_s": band_fn("P01_datacopy", "hbm_read_bytes_per_s", p01r.get("hbm_read_bytes_per_s"), spec["hbm_read_bytes_per_s"], allow_meas=allow),
             "hbm_write_bytes_per_s": band_fn("P01_datacopy", "hbm_write_bytes_per_s", p01r.get("hbm_write_bytes_per_s"), spec["hbm_write_bytes_per_s"], allow_meas=allow),
             "mte2_aiv_hit_bytes_per_s_per_core": band_fn("P01_datacopy", "mte2_aiv_hit_bytes_per_s_per_core", p01r.get("mte2_aiv_hit_bytes_per_s_per_core"), spec["mte2_aiv_bytes_per_s"] / aiv, allow_meas=allow),
         },
         {
-            "hbm_rw_alpha": band_fn("P01_datacopy", "hbm_rw_alpha", p01r.get("hbm_rw_alpha"), 0.0, kind="latency_lower", allow_meas=allow),
-            "mte2_aic_hit_bytes_per_s_per_core": _bound_only(spec["mte2_aic_bytes_per_s"] / aic),
+            "hbm_rw_alpha": band_fn("P01_datacopy", "hbm_rw_alpha", p01r.get("hbm_rw_alpha"), 0.0, kind="latency_lower", allow_meas=allow, max_admissible=_MAX_HBM_RW_ALPHA),
+            "mte2_aic_hit_bytes_per_s_per_core": band_fn("P01_datacopy", "mte2_aic_hit_bytes_per_s_per_core", p01r.get("mte2_aic_hit_bytes_per_s_per_core"), spec["mte2_aic_bytes_per_s"] / aic, allow_meas=allow),
         },
     )
+    l0b_trans_cap = (spec["mte1_l0b_bytes_per_s"] / aic) / (_DOUBLE_FACTOR if is_arch35 else 1.0)
     p["P02_load_data"] = make_cell_fn(
         "P02_load_data", {"rate": "bytes_per_s_per_aic", "latency": "ns"},
-        {"fractal_bytes": _DEFAULT_FRACTAL_BYTES, "mx_scale_supported": is_arch35, "transpose_factor": 1.0}, {},
-        {"l1_to_l0a_bytes_per_s_per_aic": _bound_only(spec["mte1_l0a_bytes_per_s"] / aic), "l1_to_l0b_bytes_per_s_per_aic": _bound_only(spec["mte1_l0b_bytes_per_s"] / aic), "setup_ns": _bound_only(0.0, "latency_lower")},
-        status_override="unmeasured",
+        {"fractal_bytes": _DEFAULT_FRACTAL_BYTES, "mx_scale_supported": is_arch35,
+         "transpose_factor": max(1.0, float(p02r.get("transpose_factor", 1.0))), **conflict_meta},
+        {
+            "l1_to_l0a_bytes_per_s_per_aic": band_fn("P02_load_data", "l1_to_l0a_bytes_per_s_per_aic", p02r.get("l1_to_l0a_bytes_per_s_per_aic"), spec["mte1_l0a_bytes_per_s"] / aic, allow_meas=allow),
+            "l1_to_l0b_bytes_per_s_per_aic": band_fn("P02_load_data", "l1_to_l0b_bytes_per_s_per_aic", p02r.get("l1_to_l0b_bytes_per_s_per_aic"), spec["mte1_l0b_bytes_per_s"] / aic, allow_meas=allow),
+        },
+        {
+            "l1_to_l0a_transpose_bytes_per_s_per_aic": band_fn("P02_load_data", "l1_to_l0a_transpose_bytes_per_s_per_aic", p02r.get("l1_to_l0a_transpose_bytes_per_s_per_aic"), spec["mte1_l0a_bytes_per_s"] / aic, allow_meas=allow),
+            "l1_to_l0b_transpose_bytes_per_s_per_aic": band_fn("P02_load_data", "l1_to_l0b_transpose_bytes_per_s_per_aic", p02r.get("l1_to_l0b_transpose_bytes_per_s_per_aic"), l0b_trans_cap, allow_meas=allow),
+            "setup_ns": band_fn("P02_load_data", "setup_ns", p02r.get("setup_ns"), 0.0, kind="latency_lower", allow_meas=allow),
+        },
     )
-    fixp_aic = spec["fixpipe_bytes_per_s"] / aic
+    fixp_out_aic = spec["fixpipe_bytes_per_s"] / aic
+    fixp_in_aic = fixp_out_aic * _DOUBLE_FACTOR
     p["P03_fixpipe"] = make_cell_fn(
         "P03_fixpipe", {"rate": "bytes_per_s_per_aic", "latency": "ns"},
-        {"has_l0c_to_ub": spec["has_l0c_to_ub"], "has_l0c_to_l1": True, "ub_split_n_align_elems": _DEFAULT_SECTOR_BYTES}, {},
-        {"fixpipe_in_bytes_per_s_per_aic": _bound_only(fixp_aic), "fixpipe_out_bytes_per_s_per_aic": _bound_only(fixp_aic), "setup_ns": _bound_only(0.0, "latency_lower")},
-        status_override="unmeasured",
+        {"has_l0c_to_ub": spec["has_l0c_to_ub"], "has_l0c_to_l1": True,
+         "ub_split_n_align_elems": _DEFAULT_SECTOR_BYTES, **conflict_meta},
+        {
+            "fixpipe_in_bytes_per_s_per_aic": band_fn("P03_fixpipe", "fixpipe_in_bytes_per_s_per_aic", p03r.get("fixpipe_in_bytes_per_s_per_aic"), fixp_in_aic, allow_meas=allow),
+            "fixpipe_out_bytes_per_s_per_aic": band_fn("P03_fixpipe", "fixpipe_out_bytes_per_s_per_aic", p03r.get("fixpipe_out_bytes_per_s_per_aic"), fixp_out_aic, allow_meas=allow),
+        },
+        {
+            "setup_ns": band_fn("P03_fixpipe", "setup_ns", p03r.get("setup_ns"), 0.0, kind="latency_lower", allow_meas=allow),
+        },
     )
     p["P04_mte3_store"] = make_cell_fn(
         "P04_mte3_store", {"rate": "bytes_per_s", "latency": "ns"}, {"has_ub_to_l1": spec["has_ub_to_l1"], **conflict_meta},
@@ -464,9 +513,21 @@ def _assemble_primitive_cells(
         },
         {"setup_ns": _bound_only(0.0, "latency_lower"), "atomic_contention_ns": _bound_only(0.0, "latency_lower")},
     )
+    p05_params: dict[str, Any] = {
+        "l2_bytes": spec["l2_bytes"],
+        "granule_bytes": spec.get("l2_sector_bytes", _DEFAULT_GRANULE_BYTES),
+        "buffer_units_l2": _DEFAULT_UNIT_ONE,
+        "cache_disable_supported": is_arch35,
+        "ws_sweep_bytes_per_s": p05r.get("ws_sweep_bytes_per_s", {}),
+        **conflict_meta,
+    }
+    if spec.get("l2_line_bytes") is not None:
+        p05_params["l2_line_bytes"] = spec["l2_line_bytes"]
+    if spec.get("l2_sector_bytes") is not None:
+        p05_params["l2_sector_bytes"] = spec["l2_sector_bytes"]
     p["P05_l2_residency_reuse"] = make_cell_fn(
         "P05_l2_residency_reuse", {"rate": "bytes_per_s", "fraction": "dimensionless", "capacity": "bytes"},
-        {"l2_bytes": spec["l2_bytes"], "granule_bytes": _DEFAULT_GRANULE_BYTES, "buffer_units_l2": _DEFAULT_UNIT_ONE, "cache_disable_supported": is_arch35, "ws_sweep_bytes_per_s": p05r.get("ws_sweep_bytes_per_s", {}), **conflict_meta},
+        p05_params,
         {
             "l2_die_bytes_per_s": band_fn("P05_l2_residency_reuse", "l2_die_bytes_per_s", p05r.get("l2_die_bytes_per_s"), spec["l2_bytes_per_s"], allow_meas=allow),
             "l2_effective_fraction": band_fn("P05_l2_residency_reuse", "l2_effective_fraction", p05r.get("l2_effective_fraction"), 1.0, allow_meas=allow),
@@ -478,7 +539,7 @@ def _assemble_primitive_cells(
     p["P06_mmad"] = make_cell_fn(
         "P06_mmad", {"rate": "flops_per_s_per_aic", "latency": "ns"},
         {"pipe_m_barrier_fractal_threshold": _DEFAULT_PIPE_M_FRACTAL_THRESH, "small_m_bf16_ns": p06r.get("small_m_bf16_ns", {}), **conflict_meta}, {},
-        {"pipe_m_barrier_ns": _bound_only(0.0, "latency_lower")},
+        {"pipe_m_barrier_ns": band_fn("P06_mmad", "pipe_m_barrier_ns", p06r.get("pipe_m_barrier_ns"), 0.0, kind="latency_lower", allow_meas=allow)},
         status_override="calibrated" if any_p06 else "unmeasured", modes=p06_modes,
     )
     p["P07_vec_alu"] = make_cell_fn("P07_vec_alu", {"rate": "ops_per_s_per_aiv"}, {"vector_width_bytes": _DEFAULT_VEC_WIDTH_BYTES, "fp32_lanes": _DEFAULT_FP32_LANES, "bf16_lanes": _DEFAULT_BF16_LANES, **conflict_meta}, {"vec_alu_ops_per_s_per_aiv": band_fn("P07_vec_alu", "vec_alu_ops_per_s_per_aiv", raw.get("P07_vec_alu", {}).get("vec_alu_ops_per_s_per_aiv"), spec["vec_alu_ops_per_s"] / aiv, allow_meas=allow)}, {"raw_latency_cycles": _bound_only(0.0, "latency_lower")})
@@ -490,9 +551,32 @@ def _assemble_primitive_cells(
     )
     vec_cap = max(1.0, spec["vector_ops_per_s"] / aiv)
     p["P11_simt"] = make_cell_fn("P11_simt", {"rate": "ops_per_s_per_aiv", "latency": "ns"}, {"supported": is_arch35, "simt_ub_carveout_bytes": spec["simt_ub_carveout_bytes"], "tla_max_threads": _DEFAULT_TLA_THREADS_35 if is_arch35 else 0, "catlass_max_threads": _DEFAULT_CATLASS_THREADS_35 if is_arch35 else 0, "warp_size": _DEFAULT_WARP_SIZE}, {}, {"simt_ops_per_s_per_aiv": _bound_only(vec_cap if is_arch35 else 0.0), "syncthreads_ns": _bound_only(0.0, "latency_lower"), "simt_launch_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured" if is_arch35 else "unsupported")
-    p["P12_intracore_flag"] = make_cell_fn("P12_intracore_flag", {"latency": "ns"}, {"event_ids": _DEFAULT_EVENT_IDS, "unit_flag_requires_single_l0c_stage": True}, {}, {"flag_ns": _bound_only(0.0, "latency_lower"), "unitflag_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured")
+    p["P12_intracore_flag"] = make_cell_fn(
+        "P12_intracore_flag", {"latency": "ns"},
+        {"event_ids": _DEFAULT_EVENT_IDS, "unit_flag_requires_single_l0c_stage": True, **conflict_meta},
+        {"flag_ns": band_fn("P12_intracore_flag", "flag_ns", p12r.get("flag_ns"), 0.0, kind="latency_lower", allow_meas=allow)},
+        {
+            "unitflag_ns": band_fn("P12_intracore_flag", "unitflag_ns", p12r.get("unitflag_ns"), 0.0, kind="latency_lower", allow_meas=allow),
+            "flag_mte2_v_ns": band_fn("P12_intracore_flag", "flag_mte2_v_ns", p12r.get("flag_mte2_v_ns"), 0.0, kind="latency_lower", allow_meas=allow),
+            "flag_v_mte3_ns": band_fn("P12_intracore_flag", "flag_v_mte3_ns", p12r.get("flag_v_mte3_ns"), 0.0, kind="latency_lower", allow_meas=allow),
+            "flag_m_fix_ns": band_fn("P12_intracore_flag", "flag_m_fix_ns", p12r.get("flag_m_fix_ns"), 0.0, kind="latency_lower", allow_meas=allow),
+            "pipe_v_barrier_ns": band_fn("P12_intracore_flag", "pipe_v_barrier_ns", p12r.get("pipe_v_barrier_ns"), 0.0, kind="latency_lower", allow_meas=allow),
+        },
+    )
     p["P13_crosscore_sync"] = make_cell_fn("P13_crosscore_sync", {"latency": "ns"}, {"aiv_inter_block_barrier_id": _DEFAULT_BARRIER_AIV, "aic_inter_block_barrier_id": _DEFAULT_BARRIER_AIC, "intra_subblock_barrier_id": _DEFAULT_BARRIER_SUB, "ffts_max_flag_id": _DEFAULT_FFTS_MAX_FLAG, "reverse_depth": _DEFAULT_REVERSE_DEPTH}, {}, {"mode2_paired_ns": _bound_only(0.0, "latency_lower"), "mode1_subblock_ns": _bound_only(0.0, "latency_lower"), "mode0_aic_barrier_ns": _bound_only(0.0, "latency_lower"), "mode0_aiv_barrier_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured")
-    p["P14_mutex_block_mmad"] = make_cell_fn("P14_mutex_block_mmad", {"latency": "ns"}, {"max_mutex_ids": _DEFAULT_MAX_MUTEX_IDS, "unit_flag_requires_single_l0c_stage": True}, {}, {"mutex_overhead_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured")
+    p14_extra = (
+        {"mutex_xpipe_handoff_ns": band_fn("P14_mutex_block_mmad", "mutex_xpipe_handoff_ns", p14r.get("mutex_xpipe_handoff_ns"), 0.0, kind="latency_lower", allow_meas=allow)}
+        if (is_arch35 and p14r.get("mutex_xpipe_handoff_ns")) else (
+            {} if is_arch35 else {"mutex_overhead_ns": _bound_only(0.0, "latency_lower")}
+        )
+    )
+    p["P14_mutex_block_mmad"] = make_cell_fn(
+        "P14_mutex_block_mmad", {"latency": "ns"},
+        {"max_mutex_ids": _DEFAULT_MAX_MUTEX_IDS if is_arch35 else 0, "unit_flag_requires_single_l0c_stage": True, **conflict_meta},
+        {"mutex_overhead_ns": band_fn("P14_mutex_block_mmad", "mutex_overhead_ns", p14r.get("mutex_overhead_ns"), 0.0, kind="latency_lower", allow_meas=allow)} if is_arch35 else {},
+        p14_extra,
+        status_override=None if is_arch35 else "unsupported",
+    )
     p["P15_rts_stars"] = make_cell_fn("P15_rts_stars", {"latency": "ns"}, {"queue_scope": "die", "queue_depth": _DEFAULT_QUEUE_DEPTH, "lanes": _DEFAULT_UNIT_ONE, **conflict_meta}, {"issue_interval_ns": band_fn("P15_rts_stars", "issue_interval_ns", p15r.get("issue_interval_ns"), 0.0, kind="latency_lower", allow_meas=allow), "aiv_first_issue_ns": band_fn("P15_rts_stars", "aiv_first_issue_ns", p15r.get("aiv_first_issue_ns"), 0.0, kind="latency_lower", allow_meas=allow), "aic_first_issue_ns": band_fn("P15_rts_stars", "aic_first_issue_ns", p15r.get("aic_first_issue_ns"), 0.0, kind="latency_lower", allow_meas=allow)}, {"host_submit_ns": band_fn("P15_rts_stars", "host_submit_ns", p15r.get("host_submit_ns"), 0.0, kind="latency_lower", allow_meas=allow)})
     p["P16_multistream_core_control"] = make_cell_fn("P16_multistream_core_control", {"latency": "ns"}, {"modes": ["disjoint", "shared_cap"], **conflict_meta}, {"stream_event_ns": band_fn("P16_multistream_core_control", "stream_event_ns", raw.get("P16_multistream_core_control", {}).get("stream_event_ns"), 0.0, kind="latency_lower", allow_meas=allow)}, {"set_limit_ns": _bound_only(0.0, "latency_lower")})
     p["P17_aicpu_metadata_launch"] = make_cell_fn("P17_aicpu_metadata_launch", {"latency": "ns"}, {"aclgraph_cacheable": True}, {}, {"host_select_ns": _bound_only(0.0, "latency_lower"), "aicpu_base_ns": _bound_only(0.0, "latency_lower"), "gm_pub_ns": _bound_only(0.0, "latency_lower"), "eager_d2h_sync_ns": _bound_only(0.0, "latency_lower")}, status_override="unmeasured")
@@ -550,6 +634,7 @@ def build_primitive_table_with_diagnostics(
     def _band(
         pid: str, metric: str, samples: Sequence[float] | None, bound: float | None,
         *, kind: str = "rate_upper", allow_meas: bool = True, mode: str = "",
+        max_admissible: float | None = None,
     ) -> dict[str, Any] | None:
         if bound is None:
             reason = "undeclared_hardware_bound"
@@ -561,7 +646,9 @@ def build_primitive_table_with_diagnostics(
             reason = "missing_samples"
             out = _bound_only(bound, kind)
         else:
-            out, reason = summarize_samples_with_reason(samples, certified_bound=bound, bound_kind=kind)
+            out, reason = summarize_samples_with_reason(
+                samples, certified_bound=bound, bound_kind=kind, max_admissible=max_admissible,
+            )
         coverage_rows.append({
             "sku": sku, "cann_version": cann_version, "primitive": pid,
             "mode": mode, "metric": metric, "status": "calibrated" if reason == "calibrated" else "unmeasured",
