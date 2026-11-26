@@ -126,7 +126,8 @@ class ChunkSequence(Sequence):
         size = chunk_size_at(
             self.flow.payload_bytes, self.chunk_bytes, chunk_index)
         return self.topology.route_message(MessageFlow(
-            self.flow.source, self.flow.destination, size, 1))
+            self.flow.source, self.flow.destination, size, 1,
+            rail_id=self.flow.rail_id))
 
 
 @dataclass(frozen=True)
@@ -141,8 +142,23 @@ class TransportOptions:
     receive_buffer_id: str | None = None
     max_inflight_per_rank: int | None = None
     max_physical_chunks: int | None = DEFAULT_MAX_PHYSICAL_CHUNKS
+    rail_id: int | str | None = None
 
     def __post_init__(self):
+        if self.rail_id is not None:
+            if isinstance(self.rail_id, bool):
+                raise ModelingError(f"transport_rail_id_invalid:{self.rail_id!r}")
+            if isinstance(self.rail_id, int):
+                if self.rail_id < 0:
+                    raise ModelingError(f"transport_rail_id_invalid:{self.rail_id!r}")
+            elif isinstance(self.rail_id, str):
+                stripped = self.rail_id.strip()
+                if not stripped:
+                    raise ModelingError(f"transport_rail_id_invalid:{self.rail_id!r}")
+                if stripped != self.rail_id:
+                    object.__setattr__(self, "rail_id", stripped)
+            else:
+                raise ModelingError(f"transport_rail_id_invalid:{self.rail_id!r}")
         if self.chunk_bytes is not None:
             if isinstance(self.chunk_bytes, bool):
                 raise ModelingError("transport_chunk_bytes_invalid")
@@ -190,7 +206,7 @@ class TransportOptions:
         allowed = {"chunk_bytes", "hop_startup_us", "receive_capacity_bytes",
                    "receive_buffer_ids", "receive_capacity_bytes_per_peer",
                    "receive_buffer_id", "max_physical_chunks",
-                   "max_inflight_per_rank"}
+                   "max_inflight_per_rank", "rail_id"}
         unknown = set(raw) - allowed
         if unknown:
             raise ModelingError(
@@ -220,6 +236,7 @@ class TransportOptions:
             max_inflight_per_rank=raw.get("max_inflight_per_rank"),
             max_physical_chunks=raw.get(
                 "max_physical_chunks", DEFAULT_MAX_PHYSICAL_CHUNKS),
+            rail_id=raw.get("rail_id"),
         )
 
     def plan_kwargs(self):
@@ -237,6 +254,8 @@ class TransportOptions:
                 self.receive_capacity_bytes_per_peer)
         if self.receive_buffer_id is not None:
             result["receive_buffer_id"] = self.receive_buffer_id
+        if self.rail_id is not None:
+            result["rail_id"] = self.rail_id
         result["max_inflight_per_rank"] = self.max_inflight_per_rank
         return result
 

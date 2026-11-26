@@ -1348,7 +1348,13 @@ def _prepare_collective_resources(
     ub_rx_res: dict[int, str] = {}
     if lowered.die_injection_ceiling_bytes_per_ms is not None:
         ceil = float(lowered.die_injection_ceiling_bytes_per_ms)
-        for rank in lowered.group:
+        inj_ranks = set(lowered.group)
+        for phase in lowered.phases:
+            for transfer in phase.transfers:
+                for hop in transfer.hops:
+                    inj_ranks.add(int(hop.source))
+                    inj_ranks.add(int(hop.destination))
+        for rank in sorted(inj_ranks):
             tx_name = die_injection_resource_name(rank, "tx", namespace=ns)
             rx_name = die_injection_resource_name(rank, "rx", namespace=ns)
             ub_tx_res[rank] = tx_name

@@ -64,6 +64,23 @@ def resolve_transport_options(recipe, op):
     return TransportOptions.from_mapping(raw)
 
 
+def _validate_rail_id(rail_id: int | str | None) -> int | str | None:
+    if rail_id is None:
+        return None
+    if isinstance(rail_id, bool):
+        raise ModelingError("direct_peer_rail_id_invalid")
+    if isinstance(rail_id, int):
+        if rail_id < 0:
+            raise ModelingError("direct_peer_rail_id_invalid")
+        return int(rail_id)
+    if isinstance(rail_id, str):
+        stripped = rail_id.strip()
+        if not stripped:
+            raise ModelingError("direct_peer_rail_id_invalid")
+        return stripped
+    raise ModelingError("direct_peer_rail_id_invalid")
+
+
 @dataclass(frozen=True)
 class DirectPeerGroup(PairwiseGroup):
     # None means the physical bound is the actual remote peer count: one
@@ -76,8 +93,12 @@ class DirectPeerGroup(PairwiseGroup):
     max_physical_chunks: int | None = DEFAULT_MAX_PHYSICAL_CHUNKS
     receive_capacity_bytes: tuple[tuple[int, float], ...] = ()
     receive_buffer_ids: tuple[tuple[int, str], ...] = ()
+    rail_id: int | str | None = None
 
     def __post_init__(self):
+        normalized_rail = _validate_rail_id(self.rail_id)
+        if normalized_rail != self.rail_id:
+            object.__setattr__(self, "rail_id", normalized_rail)
         if self.max_physical_chunks is not None and (
                 isinstance(self.max_physical_chunks, bool)
                 or not isinstance(self.max_physical_chunks, int)
@@ -207,7 +228,7 @@ class DirectPeerGroup(PairwiseGroup):
                     metadata={"source_rank": source, "destination_rank": destination,
                               "transport_schedule": "direct_peer"})
                 for hop_index, hop in enumerate(self.topology.route_message(
-                        MessageFlow(source, destination, payload)).hops):
+                        MessageFlow(source, destination, payload, rail_id=self.rail_id)).hops):
                     service = engine.submit(
                         f"{prefix}:hop{hop_index}:service",
                         hop.demand, after=(previous,), owner=owner, coupled=True)
@@ -329,7 +350,7 @@ class DirectPeerGroup(PairwiseGroup):
             useful = chunk_size_at(
                 float(payload), self.chunk_bytes, chunk_index)
             chunk = self.topology.route_message(MessageFlow(
-                source, destination, useful)).hops
+                source, destination, useful, rail_id=self.rail_id)).hops
             dependencies = [message_ready]
             previous_services = services.get(chunk_index - 1)
             if previous_services is not None:
@@ -770,9 +791,13 @@ class DirectPeerCollective(PairwiseCollective):
         default=None, kw_only=True)
     receive_buffer_id: str | None = field(default=None, kw_only=True)
     max_physical_chunks: int | None = field(default=DEFAULT_MAX_PHYSICAL_CHUNKS, kw_only=True)
+    rail_id: int | str | None = field(default=None, kw_only=True)
     algorithm: ClassVar[str] = "direct_peer"
 
     def __post_init__(self):
+        normalized_rail = _validate_rail_id(self.rail_id)
+        if normalized_rail != self.rail_id:
+            object.__setattr__(self, "rail_id", normalized_rail)
         if self.max_inflight_per_rank is not None and (
                 not isinstance(self.max_inflight_per_rank, int)
                 or isinstance(self.max_inflight_per_rank, bool)
@@ -818,6 +843,8 @@ class DirectPeerCollective(PairwiseCollective):
                 self.receive_capacity_bytes_per_peer)
         if self.receive_buffer_id is not None:
             result["receive_buffer_id"] = self.receive_buffer_id
+        if self.rail_id is not None:
+            result["rail_id"] = self.rail_id
         result["max_physical_chunks"] = self.max_physical_chunks
         return result
 

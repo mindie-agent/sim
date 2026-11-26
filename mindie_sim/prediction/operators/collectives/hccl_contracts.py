@@ -40,6 +40,22 @@ def exact_positive_int(value, label):
     return number
 
 
+def validate_rail_id(value, error_code="hccl_phase_rail_id_invalid"):
+    """Validate an optional physical rail selector (non-negative int or non-empty str)."""
+    if isinstance(value, bool):
+        raise ModelingError(error_code)
+    if isinstance(value, int):
+        if value < 0:
+            raise ModelingError(error_code)
+        return value
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise ModelingError(error_code)
+        return stripped
+    raise ModelingError(error_code)
+
+
 @dataclass(frozen=True)
 class HcclSelection:
     expansion: str
@@ -67,6 +83,9 @@ class HcclSelection:
     # Explicit level-1 channel byte-share weights (channels = 1 + len).
     # Required by z_axis_detour_*; not a hardware bandwidth inventory.
     level1_weights: tuple[int, ...] = ()
+    # Optional explicit physical rail selector per detour channel
+    # (length = 1 + len(level1_weights)); defaults to (0, 1, ..., channels - 1).
+    channel_rails: tuple[int | str, ...] = ()
 
     def to_dict(self):
         value = asdict(self)
@@ -76,6 +95,8 @@ class HcclSelection:
             value.pop("segments", None)
         if not self.level1_weights:
             value.pop("level1_weights", None)
+        if not self.channel_rails:
+            value.pop("channel_rails", None)
         return value
 
 
@@ -96,10 +117,16 @@ class HcclPhase:
     # Native primitive view: send/write, read, or local-only.  The exchange
     # matrix stays a physical send matrix; this field is provenance.
     native_direction: str = "send"
+    # Optional declared physical rail/channel selector for multi-rail exchanges.
+    rail_id: int | str | None = None
 
     def __post_init__(self):
         if self.native_direction not in {"send", "read", "local"}:
             raise ModelingError("hccl_phase_native_direction_unknown")
+        if self.rail_id is not None:
+            normalized = validate_rail_id(self.rail_id, "hccl_phase_rail_id_invalid")
+            if normalized != self.rail_id:
+                object.__setattr__(self, "rail_id", normalized)
 
 
 @dataclass(frozen=True)
@@ -118,7 +145,7 @@ def select(raw, *, collective, ranks, payload_bytes):
     allowed = {"expansion", "template", "dtype_bytes", "topology", "topology_levels",
                "source_revision", "block_limit", "buffer_mode", "level0_size",
                "max_loop_bytes", "signal_bytes", "channel_die_map",
-               "segments", "level1_weights"}
+               "segments", "level1_weights", "channel_rails"}
     if set(raw) - allowed or not {"expansion", "template"} <= set(raw):
         raise ModelingError("hccl_source_requires_explicit_expansion_and_template")
     raw = dict(raw)
@@ -129,6 +156,14 @@ def select(raw, *, collective, ranks, payload_bytes):
             raw[name] = tuple(raw[name])
             raw[name] = tuple(exact_positive_int(value, 'hccl_' + name)
                               for value in raw[name])
+    if 'channel_rails' in raw:
+        raw_rails = raw['channel_rails']
+        if not isinstance(raw_rails, (list, tuple)) or not raw_rails:
+            raise ModelingError('hccl_source_channel_rails_requires_nonempty_sequence')
+        raw['channel_rails'] = tuple(
+            validate_rail_id(value, 'hccl_source_channel_rail_invalid')
+            for value in raw_rails
+        )
     result = HcclSelection(collective=collective, ranks=ranks, payload_bytes=payload_bytes, **raw)
     if (isinstance(ranks, bool) or not isinstance(ranks, int) or ranks < 1
             or not isinstance(payload_bytes, int) or payload_bytes < 0
@@ -170,6 +205,10 @@ def select(raw, *, collective, ranks, payload_bytes):
         raise ModelingError('hccl_source_requires_explicit_segments')
     if result.template in weighted and not result.level1_weights:
         raise ModelingError('hccl_source_requires_explicit_level1_weights')
+    if result.channel_rails and result.template not in weighted:
+        raise ModelingError('hccl_source_channel_rails_not_supported_by_template')
+    if result.channel_rails and len(result.channel_rails) != 1 + len(result.level1_weights):
+        raise ModelingError('hccl_z_detour_channel_rails_count_mismatch')
     return result
 
 

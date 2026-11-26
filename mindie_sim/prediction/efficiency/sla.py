@@ -257,7 +257,8 @@ def _cohort_hw_signature(case: CaseSpec, group: tuple[int, ...]) -> tuple[Any, .
         sig = (
             link_alias.setdefault(name, len(link_alias)),
             str(lk.channel), str(lk.protocol), str(lk.semantics),
-            str(lk.scope), float(lk.capacity_at(src)), float(lk.capacity_at(dst)),
+            str(lk.scope), repr(topo.link_rail(name)),
+            float(lk.capacity_at(src)), float(lk.capacity_at(dst)),
             float(lk.capacity_bytes_per_ms), lk.peak_capacity_bytes_per_ms,
             float(lk.bw_utilization), float(lk.propagation_us),
             lk.switch_capacity_bytes_per_ms, lk.transaction_bytes,
@@ -267,19 +268,24 @@ def _cohort_hw_signature(case: CaseSpec, group: tuple[int, ...]) -> tuple[Any, .
         hop_cache[key] = sig
         return sig
 
-    route_sigs: list[tuple[int, int, tuple[Any, ...]]] = []
+    distinct_rails = topo.distinct_rails
+    rail_selectors: tuple[int | str | None, ...] = (
+        (None, *distinct_rails) if len(distinct_rails) > 1 else (None,)
+    )
+    route_sigs: list[tuple[int, int, str, tuple[Any, ...]]] = []
     for i, src in enumerate(ranks):
         for j, dst in enumerate(ranks):
             if i == j:
                 continue
-            try:
-                hops = tuple(
-                    _hop_sig(name, h_src, h_dst)
-                    for name, h_src, h_dst in topo.route(src, dst)
-                )
-            except ValueError:
-                hops = (("missing",),)
-            route_sigs.append((i, j, hops))
+            for rail_id in rail_selectors:
+                try:
+                    hops = tuple(
+                        _hop_sig(name, h_src, h_dst)
+                        for name, h_src, h_dst in topo.route(src, dst, rail_id=rail_id)
+                    )
+                except ValueError:
+                    hops = (("missing",),)
+                route_sigs.append((i, j, repr(rail_id), hops))
 
     host_sigs = tuple(sorted(
         (
@@ -310,14 +316,22 @@ def _external_worker_transit_ranks(
         return ()
     from ..collectives.topology import Topology
     topo = Topology(case.machine, case.runtime.parallel)
+    distinct_rails = topo.distinct_rails
+    rail_selectors: tuple[int | str | None, ...] = (
+        (None, *distinct_rails) if len(distinct_rails) > 1 else (None,)
+    )
     seen: set[int] = {int(rk) for rk in worker_ranks}
     transit: list[GlobalRank] = []
-    for src in worker_ranks:
-        for dst in worker_ranks:
-            if src == dst:
-                continue
+    pairs = tuple(
+        (int(src), int(dst))
+        for src in worker_ranks
+        for dst in worker_ranks
+        if src != dst
+    )
+    for src, dst in pairs:
+        for rail_id in rail_selectors:
             try:
-                hops = topo.route(int(src), int(dst))
+                hops = topo.route(src, dst, rail_id=rail_id)
             except ValueError:
                 continue
             for _link_name, hop_src, hop_dst in hops:

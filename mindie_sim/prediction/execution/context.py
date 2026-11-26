@@ -970,6 +970,8 @@ class _ContextMixin:
             except ModelingError as exc:
                 if not str(exc).startswith("joint_collective_group_membership"):
                     raise
+        if band_plan is not None:
+            band_plan.register_die_injection_resources(self.engine)
         if (band_plan is not None
                 and not set(band_plan.accounting().wire_by_resource).issubset(self.engine.resources)):
             local_ranks = frozenset(
@@ -1070,6 +1072,8 @@ class _ContextMixin:
                 except ModelingError as exc:
                     if not str(exc).startswith("joint_collective_group_membership"):
                         raise
+            if band_plan is not None:
+                band_plan.register_die_injection_resources(self.engine)
             if (band_plan is not None
                     and not set(band_plan.accounting().wire_by_resource).issubset(self.engine.resources)):
                 local_ranks = frozenset(

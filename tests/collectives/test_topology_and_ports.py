@@ -874,3 +874,183 @@ def test_shared_link_explicit_endpoint_port_and_fifo_credit_arbitration():
         eng_fifo.advance()
         fifo_times.append((done.time, peer.time))
     assert fifo_times == [(5.0, 2.0), (5.0, 2.0)]
+
+
+def test_ub_mesh_die_injection_accounting_and_mixed_cap_cohort_replay():
+    from _support.collective_cases import case as coll_case, exchange as coll_exchange
+    from mindie_sim import graph_costs, operator_costs
+    from mindie_sim.prediction.execution.operator_replay import cohort_operator_costs
+    from mindie_sim.prediction.program import RecipeBook
+    from mindie_sim.prediction.structure import parse_case
+
+    # 1. Standalone ub_mesh band accounting publishes ub_inj:* matching Engine byte service.
+    hw_ub = _make_machine(DIRECT_MESH_SKU, num_devices=4, ranks_per_node=4)
+    topo_ub = Topology(hw_ub, ParallelSpec(tp=4))
+    plan_ub = topo_ub.band_collective_plan(coll_exchange(6144, family="allreduce"), {0: 6144})
+    eng_ub = Engine(topo_ub.resources())
+    plan_ub.start(eng_ub, "ar", eng_ub.submit("ready"))
+    eng_ub.advance()
+    ledger = plan_ub.accounting()
+    eng_byte_service = sum(
+        v for k, v in eng_ub.serviced.items() if eng_ub.resources[k].unit == "bytes"
+    )
+    assert ledger.physical_wire_bytes == pytest.approx(49152.0)
+    assert ledger.to_dict()["capacity_byte_service"] == pytest.approx(eng_byte_service)
+    assert eng_byte_service == pytest.approx(147456.0)
+    assert ledger.wire_by_resource["ub_inj:tx:r0"] == pytest.approx(eng_ub.serviced["ub_inj:tx:r0"])
+    assert ledger.wire_by_resource["ub_inj:tx:r0"] == pytest.approx(12288.0)
+    assert ledger.to_dict()["resources"]["ub_inj:tx:r0"]["peak_bytes_per_ms"] == pytest.approx(280_000_000.0)
+
+    # 2. Cross-DP cohort_operator_costs, cohort band execution, and isolated tp=4 all conserve ub_inj:*.
+    raw_dp = coll_case(dp=4, tp=1)
+    raw_dp["machine"] = ascend({"sku": DIRECT_MESH_SKU, "num_devices": 4, "ranks_per_node": 4})
+    raw_dp["runtime"]["kernels"] = {"families": {"allreduce": {"kind": "ring_collective"}}}
+    parsed_dp = parse_case(raw_dp)
+    op_dp = coll_exchange(6144, family="allreduce", axis="dp")
+    coh_ub = cohort_operator_costs(
+        parsed_dp, {r: op_dp for r in range(4)},
+        recipes=RecipeBook.from_mapping(parsed_dp.runtime.kernels),
+    )
+    assert coh_ub["serviced"]["ub_inj:tx:r0"] == pytest.approx(12288.0)
+    assert all(row["service_delta"] == {} for row in coh_ub["operators"])
+
+    raw_band = coll_case(dp=4, tp=1)
+    raw_band["machine"] = ascend({"sku": DIRECT_MESH_SKU, "num_devices": 4, "ranks_per_node": 4})
+    rep_band = graph_costs(raw_band, {r: (op_dp,) for r in range(4)}, isolated=False, trace_limit=0)
+    assert rep_band["execution"]["serviced"]["ub_inj:tx:r0"] == pytest.approx(12288.0)
+
+    raw_tp = coll_case(dp=1, tp=4)
+    raw_tp["machine"] = ascend({"sku": DIRECT_MESH_SKU, "num_devices": 4, "ranks_per_node": 4})
+    iso_row = operator_costs(raw_tp, (coll_exchange(6144, family="allreduce", axis="tp"),))["operators"][0]
+    assert iso_row["serviced"]["ub_inj:tx:r0"] == pytest.approx(12288.0)
+    assert iso_row["communication"]["capacity_byte_service"] == pytest.approx(147456.0)
+    assert iso_row["communication"]["wire_bytes"] == pytest.approx(49152.0)
+    assert not any(key.startswith("ub_inj:") for key in iso_row["service_delta"])
+
+    # 3. Mixed-cap multi-hop cohort replay charges SDMA flow cap only on the capping hop.
+    raw_cap = coll_case(dp=3)
+    cap_band = {
+        "collective": "alltoallv", "algorithm": "direct",
+        "payload_bytes_per_frame": 64, "wire_bytes_per_frame": 64,
+    }
+    raw_cap["machine"]["links"] = [
+        {"name": name, "channel": name, "scope": "node", "members": [idx, idx + 1],
+         "capacity_bytes_per_ms": 65536, "semantics": "per_pair", "protocol_bands": [cap_band]}
+        for idx, name in enumerate(("fast", "slow"))
+    ]
+    raw_cap["machine"]["transfer_channels"] = {"slow": {"single_peer_flow_cap_bytes_per_ms": 64}}
+    raw_cap["runtime"]["kernels"] = {
+        "families": {"alltoallv": {"kind": "pairwise_collective", "path_model": "store_forward"}}
+    }
+    parsed_cap = parse_case(raw_cap)
+    mat_cap = ((0, 0, 64), (0, 0, 0), (0, 0, 0))
+    ops_cap = {
+        r: coll_exchange(
+            64 if r == 0 else 0, family="alltoallv", axis="dp",
+            metadata=(("peer_traffic", {"kind": "matrix", "payload_bytes": mat_cap}),),
+        )
+        for r in range(3)
+    }
+    coh_cap = cohort_operator_costs(
+        parsed_cap, ops_cap, recipes=RecipeBook.from_mapping(parsed_cap.runtime.kernels),
+    )
+    assert "sdma_flow:tx:r0" not in coh_cap["serviced"]
+    assert coh_cap["serviced"]["sdma_flow:tx:r1"] == pytest.approx(1.0)
+    assert coh_cap["serviced"]["sdma_flow:rx:r2"] == pytest.approx(1.0)
+    assert coh_cap["duration_ms"] == pytest.approx(64.0 / 65536.0 + 64.0 / 64.0)
+
+    # 4. Multi-hop store_forward UB collective accounts & executes forwarding die r1 RX/TX.
+    from mindie_sim.prediction.collectives.band_plan import BandCollectiveGroup, BandCollectivePlan
+
+    raw_hop = coll_case(dp=3)
+    ub_hop_band = {
+        "collective": "all", "algorithm": "ring", "protocol": "ub_mesh_large",
+        "startup_scope": "hop", "startup_us": 0.0,
+        "payload_bytes_per_frame": 64, "wire_bytes_per_frame": 64, "credit_bytes": 0,
+    }
+    raw_hop["machine"]["links"] = [
+        {"name": f"ub{i}{i+1}", "channel": "d2d_intra_node", "scope": "node",
+         "members": [i, i + 1], "capacity_bytes_per_ms": 47_500_000.0,
+         "semantics": "per_pair", "protocol_bands": [ub_hop_band]}
+        for i in (0, 1)
+    ]
+    parsed_hop = parse_case(raw_hop)
+    topo_hop = Topology(parsed_hop.machine, parsed_hop.runtime.parallel)
+    lowered_hop = lower_collective("allgather", (0, 2), topo_hop, 64.0)
+    plan_hop = BandCollectivePlan("allgather", (BandCollectiveGroup((0, 2), lowered_hop, topo_hop),), topo_hop)
+    acc_hop = plan_hop.accounting(source_ranks={0})
+    assert acc_hop.physical_wire_bytes == pytest.approx(128.0)
+    assert acc_hop.to_dict()["capacity_byte_service"] == pytest.approx(384.0)
+    assert acc_hop.wire_by_resource["ub_inj:rx:r1"] == pytest.approx(64.0)
+    assert acc_hop.wire_by_resource["ub_inj:tx:r1"] == pytest.approx(64.0)
+    eng_hop = Engine(topo_hop.resources())
+    plan_hop.start(eng_hop, "hop_ub", eng_hop.submit("ready"))
+    eng_hop.advance()
+    assert eng_hop.serviced["ub_inj:rx:r1"] == pytest.approx(128.0)
+    assert eng_hop.serviced["ub_inj:tx:r1"] == pytest.approx(128.0)
+
+    # 5. Rail-pinned DirectPeerGroup on 8-die K8 UB mesh enforces the 280 GB/s die injection ceiling.
+    hw_k8 = _make_machine(DIRECT_MESH_SKU, num_devices=8, ranks_per_node=8)
+    topo_k8 = Topology(hw_k8, ParallelSpec(tp=8))
+    vol_k8 = 7 * 47_500_000.0
+    op_k8 = coll_exchange(vol_k8, family="alltoall")
+    plan_k8 = topo_k8.joint_plan(op_k8, {0: vol_k8}, algorithm="direct_peer", max_inflight_per_rank=7, rail_id="ub_r0")
+    eng_k8 = Engine(topo_k8.resources())
+    done_k8 = plan_k8.start(eng_k8, "dp_k8", eng_k8.submit("ready"))
+    eng_k8.advance()
+    assert done_k8.time >= vol_k8 / 280_000_000.0 - 1e-9
+    assert eng_k8.serviced["ub_inj:tx:r0"] == pytest.approx(vol_k8)
+    assert topo_k8.accounting(op_k8, 0).wire_by_resource["ub_inj:tx:r0"] == pytest.approx(vol_k8)
+
+    # 6. Dedup mirror isolates distinct equal-rate rails & mirrors ub_inj; SLA/dedup preserve rails & relays.
+    from mindie_sim.prediction.efficiency.sla import _cohort_hw_signature, _external_worker_transit_ranks
+    from mindie_sim.prediction.runtime.dp_cohort_dedup import _mirror_replica_resources, _rank_topology_profile
+    from mindie_sim.schema.parallel import GlobalRank
+
+    raw_m = coll_case(dp=2, tp=2)
+    raw_m["machine"]["links"] = [
+        {"name": name, "channel": "c", "scope": "node", "members": [0, 1, 2, 3],
+         "capacity_bytes_per_ms": 128.0, "semantics": "per_pair", "rail_id": idx}
+        for idx, name in enumerate(("zero", "one"))
+    ]
+    parsed_m = parse_case(raw_m)
+    topo_m = Topology(parsed_m.machine, parsed_m.runtime.parallel)
+    eng_m = Engine(topo_m.resources())
+    eng_m.serviced["link:one:pair0>1"] = 128.0
+    eng_m.serviced["link:one:pair1>0"] = 128.0
+    _mirror_replica_resources(eng_m, topo_m, 0, (1,), 1, mirror_links=False)
+    assert eng_m.serviced["link:zero:pair0>1"] == 0.0 and eng_m.serviced["link:zero:pair2>3"] == 0.0
+    assert eng_m.serviced["link:one:pair2>3"] == pytest.approx(128.0)
+    assert sum(eng_m.serviced.values()) == pytest.approx(512.0)
+
+    hw_ub_dp = _make_machine(DIRECT_MESH_SKU, num_devices=4, ranks_per_node=4)
+    topo_ub_dp = Topology(hw_ub_dp, ParallelSpec(dp=2, tp=2))
+    eng_ub_dp = Engine(topo_ub_dp.resources())
+    for rk in (0, 1):
+        eng_ub_dp.serviced[f"ub_inj:tx:r{rk}"] = 4096.0
+        eng_ub_dp.serviced[f"ub_inj:rx:r{rk}"] = 4096.0
+    _mirror_replica_resources(eng_ub_dp, topo_ub_dp, 0, (1,), 1, mirror_links=False)
+    assert eng_ub_dp.serviced["ub_inj:tx:r2"] == pytest.approx(4096.0)
+    assert eng_ub_dp.serviced["ub_inj:rx:r3"] == pytest.approx(4096.0)
+
+    raw_swap = coll_case(dp=2, tp=2)
+    raw_swap["machine"]["links"] = [
+        {"name": "w0_r0", "channel": "c", "scope": "node", "members": [0, 1], "capacity_bytes_per_ms": 1.0, "semantics": "shared", "rail_id": 0},
+        {"name": "w0_r1", "channel": "c", "scope": "node", "members": [0, 1], "capacity_bytes_per_ms": 128.0, "semantics": "shared", "rail_id": 1},
+        {"name": "w1_r0", "channel": "c", "scope": "node", "members": [2, 3], "capacity_bytes_per_ms": 128.0, "semantics": "shared", "rail_id": 0},
+        {"name": "w1_r1", "channel": "c", "scope": "node", "members": [2, 3], "capacity_bytes_per_ms": 1.0, "semantics": "shared", "rail_id": 1},
+    ]
+    parsed_swap = parse_case(raw_swap)
+    topo_swap = Topology(parsed_swap.machine, parsed_swap.runtime.parallel)
+    eng_swap = Engine(topo_swap.resources())
+    assert _rank_topology_profile(topo_swap, eng_swap, (0, 1)) != _rank_topology_profile(topo_swap, eng_swap, (2, 3))
+    assert _cohort_hw_signature(parsed_swap, (0,)) != _cohort_hw_signature(parsed_swap, (1,))
+
+    raw_relay = coll_case(dp=1, tp=2)
+    raw_relay["machine"]["num_devices"] = 3
+    raw_relay["machine"]["links"] = [
+        {"name": "r0_direct", "channel": "c", "scope": "node", "members": [0, 1], "capacity_bytes_per_ms": 100.0, "semantics": "per_pair", "rail_id": 0},
+        {"name": "r1_a", "channel": "c", "scope": "node", "members": [0, 2], "capacity_bytes_per_ms": 100.0, "semantics": "per_pair", "rail_id": 1},
+        {"name": "r1_b", "channel": "c", "scope": "node", "members": [2, 1], "capacity_bytes_per_ms": 100.0, "semantics": "per_pair", "rail_id": 1},
+    ]
+    assert _external_worker_transit_ranks(parse_case(raw_relay), (GlobalRank(0), GlobalRank(1))) == (GlobalRank(2),)
