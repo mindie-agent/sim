@@ -1221,6 +1221,31 @@ def _resolve_model_scope(ops: Sequence[OpSpec]) -> Literal["target", "draft"]:
     return "target"
 
 
+def _packed_mla_slice_width(src_op: OpSpec, role_keys: tuple[str, ...]) -> int | None:
+    """Return the combined output width of packed projection slices matching ``role_keys``."""
+    meta = dict(src_op.metadata) if src_op.metadata else {}
+    slices = meta.get("packed_projection_slices")
+    if not isinstance(slices, Sequence) or isinstance(slices, (str, bytes)):
+        return None
+    target_roles = {rk for rk in role_keys if rk != "qkv_a"}
+    if not target_roles:
+        return None
+    total = 0
+    for item in slices:
+        if not isinstance(item, Mapping):
+            continue
+        s_role = _TYPED_MLA_ROLE_MAP.get(str(item.get("role") or "").strip().lower(), "")
+        s_cat = _TYPED_MLA_ROLE_MAP.get(str(item.get("category") or "").strip().lower(), "")
+        if s_role not in target_roles and s_cat not in target_roles:
+            continue
+        shape = item.get("shape")
+        if isinstance(shape, Sequence) and not isinstance(shape, (str, bytes)) and shape:
+            dim = int(shape[-1])
+            if dim > 0:
+                total += dim
+    return total if total > 0 else None
+
+
 def _build_mla_prolog_ports(
     ordered_m: Sequence[OpSpec],
     role_of: Mapping[str, str],
@@ -1257,10 +1282,12 @@ def _build_mla_prolog_ports(
             src_op, traits[src_op.op_id],
             default_layout="ND" if port_name == "weight_uk" else "FRACTAL_NZ",
         )
-        sh = (
-            (int(src_op.local_shape[2]), int(src_op.local_shape[1]))
-            if len(src_op.local_shape) == MATMUL_SHAPE_RANK else (h_dim, h_dim)
-        )
+        if len(src_op.local_shape) == MATMUL_SHAPE_RANK:
+            slice_w = _packed_mla_slice_width(src_op, role_keys)
+            out_dim = slice_w if slice_w is not None else int(src_op.local_shape[1])
+            sh = (int(src_op.local_shape[2]), out_dim)
+        else:
+            sh = (h_dim, h_dim)
         return _port(port_name, w_dt, sh, layout=w_layout, quant_mode=q_mode, group_shape=g_sh, scale_dtype=s_dt)
 
     w_dq = _weight_port("weight_dq", ("q_a", "qkv_a"))

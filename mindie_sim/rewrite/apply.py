@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from collections import Counter, OrderedDict
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from graphlib import CycleError, TopologicalSorter
 from heapq import heappop, heappush
@@ -17,6 +18,7 @@ from math import inf, isfinite, prod
 from types import SimpleNamespace
 from typing import Any, Literal
 
+from mindie_sim.compose.inputs import infer_workload_domain
 from mindie_sim.feature_mechanisms import RUNTIME_STACKS
 from mindie_sim.prediction.body_defaults import consume_target_declaration
 from mindie_sim.prediction.fusion.control_rewrite import (
@@ -26,6 +28,9 @@ from mindie_sim.prediction.fusion.ports import (
     CONTROL_METADATA_KEYS, INPUT_PORTS_KEY, control_dependency_names, control_value_names,
     declared_control_order, full_operand_ports, input_port_entries, metadata_pairs,
     replace_input_ports,
+)
+from mindie_sim.prediction.implementation_selection import (
+    AUTOMATIC_LOWERINGS_KEY, RECIPE_BINDING_ORIGINS_KEY, binding_origin,
 )
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.results import DEFAULT_STACK_NAME, LoweringRequest, RankOps, StepRequest
@@ -199,10 +204,8 @@ def _infer_workload_domain_and_hw(case: Case, request: StepRequest) -> tuple[str
         model_meta.get("model_family") or ""
     ).strip().lower() in {"dit", "diffusion"}:
         domain = "diffusion"
-    elif getattr(case.model, "vision", None) is not None:
-        domain = "vlm"
     else:
-        domain = "llm"
+        domain = infer_workload_domain(case.model)
     hw_family: str | None = None
     machine = case.machine
     dies = getattr(machine, "dies", ()) or ()
@@ -242,6 +245,230 @@ def _lowering_stack_name(stack_id: str) -> str:
     )
 
 
+_RAW_EAGER_STRIPPED_META_KEYS = frozenset({
+    "captured_execution_mode",
+    "enable_torch_compile",
+    "va_recommended",
+    "va_profile",
+    "va_env",
+    "shipping_collective_policy",
+    "operator_selection_summary",
+    "va_recommended_mtp_proposal_tokens",
+    "multistream_overlap_shared_expert",
+    "qsa_gbsa_fused",
+    "msa_index_score_v2",
+    "packed_qkvg_indexer",
+    "csa2_epilogue_engram_overlap",
+    "latent_moe_dspark_c8_mla",
+    "tp_mc2_overlap",
+    "moe_mega_moe_supported",
+})
+_RAW_EAGER_STRIPPED_ADDITIONAL_KEYS = frozenset({
+    "enable_mega_moe",
+    "enable_fused_mc2",
+    "enable_flashcomm1",
+    "enable_prefill_mc2",
+    "enable_weight_nz_layout",
+    "enable_static_kernel",
+    "enable_super_kernel",
+})
+_RAW_EAGER_TRACKED_KERNEL_SECTIONS = ("families", "recipes", "lowerings", "programs")
+_RAW_EAGER_STALE_SPINE_KEYS = frozenset({
+    "quant_plan_digest",
+    "quant_provenance",
+    "prepared_weights",
+    "packed_groups_count",
+    "lowering_plan_digest",
+    "allowed_rewrite_tracks",
+    "recipe_bindings_count",
+    "scenario_contract_digest",
+})
+_SHIPPING_MOE_GATING_BINDING = {"implementation": "vllm_ascend_cann_gating"}
+
+
+def _is_caller_kernel_binding(rt: Any, origins: Any, section: str, key: str) -> bool:
+    """Apply canonical ``binding_origin`` rules plus nested origin fallback."""
+    if binding_origin(rt, section, key) != "caller":
+        return False
+    if isinstance(origins, Mapping):
+        nested = origins.get(section)
+        if isinstance(nested, Mapping) and nested.get(key) in {"stack_profile", "body_default"}:
+            return False
+    return True
+
+
+def _strip_non_caller_lowerings(
+    rt: Any, kernels: dict[str, Any], meta: dict[str, Any],
+) -> None:
+    """Retain caller-owned kernel bindings (including unstamped explicit pins) under ``raw-eager``."""
+    origins = meta.get(RECIPE_BINDING_ORIGINS_KEY)
+    for section in _RAW_EAGER_TRACKED_KERNEL_SECTIONS:
+        sec_map = kernels.get(section)
+        if not isinstance(sec_map, Mapping):
+            continue
+        kept = {
+            k: v for k, v in sec_map.items()
+            if _is_caller_kernel_binding(rt, origins, section, str(k))
+        }
+        if kept:
+            kernels[section] = kept
+        else:
+            kernels.pop(section, None)
+    meta.pop(AUTOMATIC_LOWERINGS_KEY, None)
+    if not isinstance(origins, Mapping):
+        return
+    cleaned: dict[str, Any] = {}
+    for k, v in origins.items():
+        if isinstance(v, Mapping):
+            kept_nested = {nk: nv for nk, nv in v.items() if nv == "caller"}
+            if kept_nested:
+                cleaned[k] = kept_nested
+        elif v == "caller":
+            cleaned[k] = v
+    if cleaned:
+        meta[RECIPE_BINDING_ORIGINS_KEY] = cleaned
+    else:
+        meta.pop(RECIPE_BINDING_ORIGINS_KEY, None)
+
+
+def _refresh_raw_eager_single_spine(
+    eager_case: Case, single_spine: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Recompute ``single_spine`` receipt from the resolved ``raw-eager`` contracts."""
+    raw_inputs = single_spine.get("contract_inputs")
+    if not isinstance(raw_inputs, Mapping):
+        refreshed = {k: v for k, v in single_spine.items() if k not in _RAW_EAGER_STALE_SPINE_KEYS}
+        refreshed["stack_id"] = "raw-eager"
+        refreshed["stack_track"] = "eager"
+        return refreshed
+    from mindie_sim.compose.runtime import (
+        _rehydrate_checkpoint_from_metadata, resolve_case_contracts, summarize_single_spine_metadata,
+    )
+
+    inputs = deepcopy(dict(raw_inputs))
+    inputs["canonical_track"] = "eager"
+    req_opts = dict(inputs.get("requested_options") or {})
+    req_opts["sp"] = False
+    req_opts["cudagraph_mode"] = "NONE"
+    req_opts["enforce_eager"] = True
+    req_opts["optimization_mode"] = "simulation"
+    inputs["requested_options"] = req_opts
+    provisional_ss = {
+        **dict(single_spine),
+        "stack_id": "raw-eager",
+        "stack_track": "eager",
+        "contract_inputs": inputs,
+    }
+    prov_meta = {**dict(eager_case.runtime.metadata), "single_spine": provisional_ss}
+    prov_case = replace(eager_case, runtime=replace(eager_case.runtime, metadata=tuple(prov_meta.items())))
+    scenario_contract, quant_plan, lowering_plan = resolve_case_contracts(prov_case)
+    if quant_plan is None or lowering_plan is None:
+        return provisional_ss
+    checkpoint_map = _rehydrate_checkpoint_from_metadata(inputs["checkpoint"])
+    return summarize_single_spine_metadata(
+        stack_id="raw-eager",
+        stack_track="eager",
+        workload_domain=str(single_spine.get("workload_domain") or "llm"),
+        work_unit_kind=str(single_spine.get("work_unit_kind") or "prefill_decode_step"),
+        deployment_mode=str(single_spine.get("deployment_mode") or "colocated"),
+        deployment_mode_origin=str(single_spine.get("deployment_mode_origin") or "api_argument"),
+        checkpoint_map=checkpoint_map,
+        quant_plan=quant_plan,
+        lowering_plan=lowering_plan,
+        scenario_contract=scenario_contract,
+        contract_inputs=inputs,
+    )
+
+
+def _apply_resolved_stack_override(case: Case, resolved_stack_id: str) -> Case:
+    """Align ``case.runtime`` with an explicit ``raw-eager`` stack override."""
+    if resolved_stack_id != "raw-eager":
+        return case
+    rt = case.runtime
+    kernels = deepcopy(dict(rt.kernels))
+    meta = deepcopy(dict(rt.metadata))
+    prev_stack = str(meta.get("stack_id") or "").strip().lower()
+    prev_policy = meta.get("execution_policy") if isinstance(meta.get("execution_policy"), Mapping) else {}
+    sp_source = str(prev_policy.get("sp_source") or "").strip().lower()
+    strip_stack_sp = (
+        prev_stack not in {"", "raw-eager", "raw_eager"}
+        or bool(meta.get("va_recommended"))
+        or bool(prev_policy.get("production"))
+        or sp_source in {"production", "profile", "structural", "default"}
+    )
+    _strip_non_caller_lowerings(rt, kernels, meta)
+    if strip_stack_sp:
+        kernels.pop("sequence_parallel", None)
+        if kernels.get("moe_gating") == _SHIPPING_MOE_GATING_BINDING:
+            kernels.pop("moe_gating", None)
+        kernels.pop("fusion_domains", None)
+        meta["sp"] = False
+    for key in _RAW_EAGER_STRIPPED_META_KEYS:
+        meta.pop(key, None)
+    additional = meta.get("additional_config")
+    if isinstance(additional, Mapping):
+        cleaned_add = {
+            k: v for k, v in additional.items() if k not in _RAW_EAGER_STRIPPED_ADDITIONAL_KEYS
+        }
+        if cleaned_add:
+            meta["additional_config"] = cleaned_add
+        else:
+            meta.pop("additional_config", None)
+    meta["raw_eager"] = True
+    meta["stack_id"] = "raw-eager"
+    policy = dict(meta.get("execution_policy") or {})
+    policy.update({
+        "raw_eager": True,
+        "production": False,
+        "automatic_optional_fusions": False,
+        "graph_capture_mode": "none",
+        "captured_execution_mode": "NONE",
+        "enable_torch_compile": False,
+        "enable_npugraph_ex": False,
+        "enable_static_kernel": False,
+        "enable_super_kernel": False,
+        "mlapo": False,
+        "multistream_overlap_shared_expert": False,
+    })
+    if strip_stack_sp:
+        policy["sp"] = False
+        policy["sp_source"] = "raw_eager"
+    meta["execution_policy"] = policy
+    report = meta.get("feature_track_report")
+    if isinstance(report, Mapping):
+        meta["feature_track_report"] = {
+            **dict(report),
+            "stack": "raw_eager",
+            "feature_track": "eager",
+            "active_mechanisms": [],
+        }
+    single_spine = meta.get("single_spine")
+    eager_rt = replace(
+        rt,
+        graph_mode="none",
+        graph_capture_mode="none",
+        graph_capture_keys=(),
+        piecewise_capture_keys=(),
+        enable_torch_compile=False,
+        enable_npugraph_ex=False,
+        enable_static_kernel=False,
+        enable_super_kernel=False,
+        multistream_overlap_shared_expert=False,
+        enable_dbo=False,
+        multistream_kda_proj=False,
+        multistream_attention_indexer=False,
+        multistream_window_compressed=False,
+        lowering_passes=("activation_quantization",),
+        kernels=kernels,
+        metadata=tuple(meta.items()),
+    )
+    eager_case = replace(case, runtime=eager_rt)
+    if isinstance(single_spine, Mapping):
+        meta["single_spine"] = _refresh_raw_eager_single_spine(eager_case, single_spine)
+        eager_case = replace(eager_case, runtime=replace(eager_rt, metadata=tuple(meta.items())))
+    return eager_case
+
+
 def _resolve_rewrite_stack(
     case: Case, request: StepRequest, stack_id: str | None,
 ) -> tuple[str, str]:
@@ -254,26 +481,28 @@ def _resolve_rewrite_stack(
         else:
             return DEFAULT_STACK_NAME, DEFAULT_STACK_NAME
     if raw:
-        return raw, _lowering_stack_name(raw)
+        adapter = resolve_stack_for_scenario(
+            raw,
+            workload_domain=domain,  # type: ignore[arg-type]
+            hardware_family=hw_family,
+        )
+        resolved_id = adapter.capabilities().stack_id
+        return resolved_id, _lowering_stack_name(resolved_id)
     rt_meta = dict(getattr(case.runtime, "metadata", ()) or ())
     explicit_rt = str(rt_meta.get("stack_id") or "").strip()
     if explicit_rt and explicit_rt != _LEGACY_ASCEND_STACK_ALIAS:
-        if domain == "diffusion" or hw_family == "generic":
-            adapter = resolve_stack_for_scenario(
-                explicit_rt,
-                workload_domain=domain,  # type: ignore[arg-type]
-                hardware_family=hw_family,
-            )
-            resolved_id = adapter.capabilities().stack_id
-            return resolved_id, _lowering_stack_name(resolved_id)
-        return explicit_rt, _lowering_stack_name(explicit_rt)
+        adapter = resolve_stack_for_scenario(
+            explicit_rt,
+            workload_domain=domain,  # type: ignore[arg-type]
+            hardware_family=hw_family,
+        )
+        resolved_id = adapter.capabilities().stack_id
+        return resolved_id, _lowering_stack_name(resolved_id)
     report = rt_meta.get("feature_track_report")
     report_stack = str(
         report.get("stack") if isinstance(report, Mapping) else ""
     ).strip()
     if report_stack and report_stack != _LEGACY_ASCEND_STACK_ALIAS:
-        if domain != "diffusion" and hw_family != "generic":
-            return report_stack, _lowering_stack_name(report_stack)
         try:
             adapter = resolve_stack_for_scenario(
                 report_stack,
@@ -301,6 +530,7 @@ def resolve_scenario(case, request: StepRequest, *, spine=None,
     case = parse_case(case)
     spine = PredictionSpine() if spine is None else spine
     resolved_stack_id, stack = _resolve_rewrite_stack(case, request, stack_id)
+    case = _apply_resolved_stack_override(case, resolved_stack_id)
     atomic = _lower_prepared_step_for_rewrite(
         spine, case, LoweringRequest(step=request, tier="unmerge", apply_body_defaults=False, stack=stack),
     )
@@ -579,18 +809,36 @@ def _ports(op):
                     version = port.get("version", port.get("state_version"))
                     result.add((name, 0 if version is None else int(version)))
     return result
+def _handoff_row_width(source: OpSpec, target: OpSpec, *, is_row: bool) -> int:
+    """Return physical intermediate row width (output ``N`` for rank-3 GEMM ``(M, N, K)``)."""
+    src_is_mat = bool(source.flops or source.matrix_flops)
+    tgt_is_mat = bool(target.flops or target.matrix_flops)
+    if src_is_mat and len(source.local_shape) == _GEMM_SHAPE_RANK:
+        src_shape: tuple[int, ...] = (int(source.local_shape[0]), int(source.local_shape[1]))
+    else:
+        src_shape = tuple(int(d) for d in (source.local_shape or ()))
+    if tgt_is_mat and len(target.local_shape) == _GEMM_SHAPE_RANK:
+        tgt_shape: tuple[int, ...] = (int(target.local_shape[0]), int(target.local_shape[2]))
+    else:
+        tgt_shape = tuple(int(d) for d in (target.local_shape or ()))
+    shape = src_shape or tgt_shape
+    inner = max(1, int(shape[-1])) if shape else _POINTWISE_TILE_ELEMS
+    if is_row and tgt_shape and not tgt_is_mat:
+        inner = max(inner, int(tgt_shape[-1]))
+    return inner
+
+
 def _tile_fits_resident_pool(
     source: OpSpec, target: OpSpec, pool: str, path: DatapathCapabilitySpec,
 ) -> bool:
     """Verify per-tile SRAM fit via TileSolver (Ascend FP32 4B/elem UB upcast)."""
-    shape = tuple(source.local_shape or target.local_shape or ())
-    inner = max(1, int(shape[-1])) if shape else _POINTWISE_TILE_ELEMS
     sfam, tfam = str(source.family or "").lower(), str(target.family or "").lower()
     srec, trec = str(source.recipe or "").lower(), str(target.recipe or "").lower()
     is_row = (
         sfam in _ROW_REDUCTION_FAMILIES or tfam in _ROW_REDUCTION_FAMILIES
         or any(tok in srec or tok in trec for tok in ("norm", "softmax", "quant"))
     )
+    inner = _handoff_row_width(source, target, is_row=is_row)
     smeta = dict(source.metadata)
     tmeta = dict(target.metadata)
     group_sz = int(tmeta.get("quant_group_size") or tmeta.get("group_size") or 0)

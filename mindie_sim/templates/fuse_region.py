@@ -802,10 +802,13 @@ def _lower_region_passes(
                             pipe=f"mte2_{edge.dst_owner_axis}", after=tuple(initial),
                             private=True, owner=owners[1], offset=src_tile * size, version=0,
                         ))
+                raw_stage = stage
                 for index, obligation in enumerate(reads.get(op, ())):
                     if obligation.initial_residency == "onchip_resident":
                         continue
-                    after.append(_obligation_access(plan, scope, op, index, obligation, tile, tile_count, "read", tuple(after)))
+                    after.extend(_obligation_access(
+                        plan, scope, op, index, obligation, tile, tile_count, "read", tuple(after), stage=raw_stage,
+                    ))
                 stage = _bind_declared_work(
                     plan, stage, semantic_work, op_id=op,
                     all_op_ids=all_op_ids, single_vector_op=single_vec_op,
@@ -816,7 +819,9 @@ def _lower_region_passes(
                 done = [run]
                 if pass_idx == last_pass_for_op[op]:
                     for index, obligation in enumerate(writes.get(op, ())):
-                        done.append(_obligation_access(plan, scope, op, index, obligation, tile, tile_count, "write", (run,)))
+                        done.extend(_obligation_access(
+                            plan, scope, op, index, obligation, tile, tile_count, "write", (run,), stage=raw_stage,
+                        ))
                 completions.append(plan.add(Stage(final_names[op], after=tuple(done))))
         ring_after = (launch,) if pass_idx == 0 else initial
         for ring in rings.values():
@@ -1172,17 +1177,75 @@ def _bind_declared_work(
     return replace(stage, work=work, placement=placement, caps=caps, work_units=units)
 
 
-def _obligation_access(plan, scope, op, index, entry, tile, tiles, direction, after):
+_AIC_PLACEMENT_PREF = ("cube", "matrix", "mte1", "mte2_aic", "fixpipe")
+_AIV_PLACEMENT_PREF = ("vector", "vec_alu", "vec_sfu", "vec_reduce", "aiv_simt", "sort_topk", "mte2_aiv", "mte3")
+
+
+def _obligation_pipe_and_owners(
+    plan: Lowering, stage: Stage | None, direction: str,
+) -> tuple[str, tuple[int, ...]]:
+    """Resolve boundary DMA pipe and core owner set from the consuming/producing stage."""
+    if stage is None:
+        return ("mte2_aiv" if direction == "read" else "mte3"), (0,)
+    res_names = plan.context.resource_names if plan.context is not None else {}
+    aic_roles = _AIC_RESOURCES | {"matrix"} | {res_names.get(r, r) for r in _AIC_RESOURCES}
+    aiv_roles = _AIV_RESOURCES | {res_names.get(r, r) for r in _AIV_RESOURCES}
+    has_aic_work = any(amt and role in aic_roles for role, amt in stage.work.items())
+    has_aiv_work = any(amt and role in aiv_roles for role, amt in stage.work.items())
+    if has_aic_work and not has_aiv_work:
+        is_aic = True
+    elif has_aiv_work:
+        is_aic = False
+    else:
+        has_aic_pl = any(role in aic_roles and ids for role, ids in stage.placement.items())
+        has_aiv_pl = any(role in aiv_roles and ids for role, ids in stage.placement.items())
+        is_aic = has_aic_pl and not has_aiv_pl
+    pipe = ("mte2_aic" if direction == "read" else "fixpipe") if is_aic else (
+        "mte2_aiv" if direction == "read" else "mte3"
+    )
+    pref = (pipe, *_AIC_PLACEMENT_PREF) if is_aic else (pipe, *_AIV_PLACEMENT_PREF)
+    resolved: tuple[int, ...] = (0,)
+    for role in pref:
+        owners = stage.placement.get(role) or stage.placement.get(res_names.get(role, role))
+        if owners:
+            resolved = tuple(dict.fromkeys(int(owner) for owner in owners))
+            break
+    return pipe, resolved
+
+
+def _obligation_access(plan, scope, op, index, entry, tile, tiles, direction, after, *, stage=None) -> tuple[str, ...]:
     if entry.die != plan.die:
         raise ModelingError(f"fuse_region_cross_die_access_requires_collective:{entry.allocation_id}")
     runs = tuple(segment for run in _obligation_runs(entry) for segment in _tile_address_run(run, tile, tiles))
-    return plan.access(
-        f"{scope}:{op}:{direction}:{index}", entry.allocation_id, sum(run.rows * run.row_bytes for run in runs),
-        direction=direction, pipe="mte2_aiv" if direction == "read" else "mte3",
-        after=after, runs=runs, version=entry.tensor_version,
-        private=entry.required_final_visibility in {"owner", "die"} and direction == "write",
-        obligation=False,
-    )
+    pipe, owners = _obligation_pipe_and_owners(plan, stage, direction)
+    is_private = entry.required_final_visibility in {"owner", "die"} and direction == "write"
+    if len(owners) == 1:
+        return (plan.access(
+            f"{scope}:{op}:{direction}:{index}", entry.allocation_id, sum(run.rows * run.row_bytes for run in runs),
+            direction=direction, pipe=pipe, owner=owners[0],
+            after=after, runs=runs, version=entry.tensor_version,
+            private=is_private, obligation=False,
+        ),)
+    emitted: list[str] = []
+    for idx, owner in enumerate(owners):
+        owner_runs = tuple(seg for run in runs for seg in _tile_address_run(run, idx, len(owners)))
+        if not owner_runs:
+            continue
+        emitted.append(plan.access(
+            f"{scope}:{op}:{direction}:{index}:owner{owner}", entry.allocation_id,
+            sum(run.rows * run.row_bytes for run in owner_runs),
+            direction=direction, pipe=pipe, owner=owner,
+            after=after, runs=owner_runs, version=entry.tensor_version,
+            private=is_private, obligation=False,
+        ))
+    if not emitted:
+        return (plan.access(
+            f"{scope}:{op}:{direction}:{index}", entry.allocation_id, 0,
+            direction=direction, pipe=pipe, owner=owners[0],
+            after=after, runs=(), version=entry.tensor_version,
+            private=is_private, obligation=False,
+        ),)
+    return tuple(emitted)
 
 
 def _tile_address_run(run, tile, tiles):
@@ -1372,6 +1435,8 @@ class FusedPipelineRecipe:
                 else:
                     preds = ("mte2_load",)
             if st.pipe_kind == "cube":
+                if split_load and has_load and not any(kind_by_name.get(p) == "cube" for p in raw_preds):
+                    preds = tuple(dict.fromkeys((*preds, "mte2_aic_load")))
                 cube_w = {role: norm_share for role in ("cube", "mte1") if role in categories}
                 phases.append(Phase(st.name, cube_w, after=preds))
                 term_name[st.name] = st.name
@@ -1384,7 +1449,7 @@ class FusedPipelineRecipe:
                     fp_name = "fixpipe_handoff" if len(handoff_names) == 1 else f"{st.name}_fixpipe"
                     phases.append(Phase(fp_name, {"fixpipe": handoff_weights[st.name]}, after=cube_preds))
                     preds = tuple(dict.fromkeys((*other_preds, fp_name)))
-                if split_load and not any(kind_by_name.get(p) == "vector" for p in raw_preds):
+                if split_load and has_load and not any(kind_by_name.get(p) == "vector" for p in raw_preds):
                     preds = tuple(dict.fromkeys((*preds, "mte2_aiv_load")))
                 if st.row_reduction:
                     r_name = "aiv_reduce" if st.name == "aiv_fp32" else f"{st.name}_reduce"

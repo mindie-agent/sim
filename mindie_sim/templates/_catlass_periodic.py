@@ -758,28 +758,35 @@ def _make_rect_pattern(
 
 
 def _make_scale_pattern(
-    p, die: int, sector: int, tensor: str, row: int, col: int, rows: int, cols: int,
+    spec, p, die: int, sector: int, tensor: str, row: int, col: int, rows: int, cols: int,
     width: int, owner: int, *, is_a: bool, bypass: bool = False, memo: _PatternMemo | None = None,
 ) -> MemoryAccessPattern:
-    from .catlass_lower import _mx_scale_group_span
+    from .catlass_lower import _mx_scale_group_span, _mx_scale_runs
 
-    per_row = ceil_div(width, MX_SCALE_GROUP) if is_a else ceil_div(p.k, MX_SCALE_GROUP)
+    del width
+    k_scales_total = ceil_div(p.k, MX_SCALE_GROUP)
     g_lo, sc = _mx_scale_group_span(col, cols) if is_a else _mx_scale_group_span(row, rows)
-    sr = rows if is_a else cols
-    off = row * per_row + g_lo if is_a else col * per_row + g_lo
+    outer_start, outer_count, outer_total = (row, rows, p.m) if is_a else (col, cols, p.n)
+    k_contiguous = (spec.layout_a == "RowMajor") if is_a else (spec.layout_b == "ColumnMajor")
+    runs = _mx_scale_runs(
+        outer_start, outer_count, outer_total, g_lo, sc, k_scales_total,
+        k_contiguous=k_contiguous,
+    )
     tid = tensor + ":scale"
     if memo is not None:
         key = None if bypass else (memo.key_sa if is_a else memo.key_sb)
         run_plan = AddressRunPlan(
-            (AddressRun(off, sr, sc, per_row),),
+            runs,
             sector_bytes=memo.sector, l2_line_bytes=memo.l2_line, l2_sector_bytes=memo.l2_sector,
             hbm_burst_granule_bytes=memo.burst_granule, hbm_scatter_row_open_bytes=memo.scatter_open,
         )
-        return MemoryAccessPattern(tid, 0, die, owner, "read", "mte2_aic", sr * sc, run_plan, key, None, _VIS_READ)
+        return MemoryAccessPattern(
+            tid, 0, die, owner, "read", "mte2_aic", outer_count * sc, run_plan, key, None, _VIS_READ,
+        )
     key = None if bypass else ReuseKey(die, tid, 0, reuse_stream=f"{tid}:0")
     return MemoryAccessPattern(
-        tid, 0, die, owner, "read", "mte2_aic", sr * sc,
-        AddressRunPlan((AddressRun(off, sr, sc, per_row),), sector_bytes=sector), key, None, _VIS_READ,
+        tid, 0, die, owner, "read", "mte2_aic", outer_count * sc,
+        AddressRunPlan(runs, sector_bytes=sector), key, None, _VIS_READ,
     )
 
 
@@ -828,25 +835,36 @@ def _make_partial_pattern(
     return MemoryAccessPattern(scratch, 0, die, owner, direction, pipe, size, run_plan, key, None, _VIS_PRIVATE)
 
 
-def _exact_tile_stage_count(spec, gk: int, total_micros: int, has_ctx: bool) -> int:
+def _scale_panel_count(spec, k_start: int, k_stop: int) -> int:
+    """Count K panels in ``range(k_start, k_stop)`` that fetch MX scales from GM."""
+    if not spec.mx_scale_group or k_stop <= k_start:
+        return 0
+    factor = spec.l1_scale_factor_k
+    return ceil_div(k_stop, factor) - ceil_div(k_start, factor)
+
+
+def _exact_tile_stage_count(
+    spec, gk: int, total_micros: int, has_ctx: bool, *, scale_panels: int | None = None,
+) -> int:
     """Exact unrolled stage count for one double-buffered dataparallel ordinary tile."""
-    fills_per_panel = _OPERAND_PAIR_COUNT * (1 + int(bool(spec.mx_scale_group)))
+    sc_panels = _scale_panel_count(spec, 0, gk) if scale_panels is None else scale_panels
+    fill_stages = _OPERAND_PAIR_COUNT * (gk + sc_panels)
     ring_gens = (gk, gk, total_micros, total_micros, _L0C_DEPTH)
     ring_stages = 0
     for depth, gens in zip(spec.stages, ring_gens):
         slots_used = min(depth, gens)
         ring_stages += slots_used + _RING_GEN_STAGES * gens + (slots_used if has_ctx else 0)
-    return fills_per_panel * gk + _MICRO_WORK_STAGES * total_micros + _TILE_FINISH_STAGES + ring_stages
+    return fill_stages + _MICRO_WORK_STAGES * total_micros + _TILE_FINISH_STAGES + ring_stages
 
 
 def _exact_mutex_stage_count(
     spec, core_tile_counts: Counter[int], gk: int, total_micros: int, has_ctx: bool,
 ) -> int:
     """Exact unrolled stage count for persistent-ring ``MmadPingpongMutex`` across all tiles."""
-    fills_per_panel = _OPERAND_PAIR_COUNT * (1 + int(bool(spec.mx_scale_group)))
+    fill_stages = _OPERAND_PAIR_COUNT * (gk + _scale_panel_count(spec, 0, gk))
     per_tile_gens = _OPERAND_PAIR_COUNT * gk + _OPERAND_PAIR_COUNT * total_micros + _L0C_DEPTH
     per_tile = (
-        fills_per_panel * gk
+        fill_stages
         + _MICRO_WORK_STAGES * total_micros
         + _TILE_FINISH_STAGES
         + _RING_GEN_STAGES * per_tile_gens
@@ -939,9 +957,19 @@ def _whole_tensor_obligations(spec, p, die: int, sector: int) -> tuple[list[Any]
         if ob := _logical_obligation(pat):
             reads.append(ob)
     if spec.mx_scale_group:
+        from .catlass_lower import _mx_scale_runs
+
         sa_w = ceil_div(p.k, MX_SCALE_GROUP)
-        for tid, rows in ((p.a_id + ":scale", p.m), (p.b_id + ":scale", p.n)):
-            if ob := _logical_obligation(_pat(tid, 0, "read", "mte2_aic", 0, rows, sa_w, _VIS_READ)):
+        for tid, rows, k_contig in (
+            (p.a_id + ":scale", p.m, spec.layout_a == "RowMajor"),
+            (p.b_id + ":scale", p.n, spec.layout_b == "ColumnMajor"),
+        ):
+            s_runs = _mx_scale_runs(0, rows, rows, 0, sa_w, sa_w, k_contiguous=k_contig)
+            s_pat = MemoryAccessPattern(
+                tid, 0, die, 0, "read", "mte2_aic", rows * sa_w,
+                AddressRunPlan(s_runs, sector_bytes=sector), None, None, _VIS_READ,
+            )
+            if ob := _logical_obligation(s_pat):
                 reads.append(ob)
     c_stride, c_rows = (
         (packed_bytes(p.n, spec.dtype_c), p.m) if spec.layout_c == "RowMajor"
@@ -1042,21 +1070,28 @@ def _count_wave_compute(tiles, spec, p, datapath, low, plan, resource_work, cube
 
 def _panel_patterns(spec, p, tile, ks, kl, die, sector, memo: _PatternMemo | None = None):
     bypass_b = spec.l2_cache_hint_b == "disable"
+    tk = spec.l1_tile_shape[-1]
+    load_scales = bool(spec.mx_scale_group and (ks // tk) % spec.l1_scale_factor_k == 0)
+    scale_kl = min(tk * spec.l1_scale_factor_k, p.k - ks) if load_scales else 0
     gm_a = _make_rect_pattern(
         spec, p, die, sector, p.a_id, spec.dtype_a, tile.row, ks, tile.m, kl, p.k, tile.owner, memo=memo,
     )
     sc_a = (_make_scale_pattern(
-        p, die, sector, p.a_id, tile.row, ks, tile.m, kl, p.k, tile.owner, is_a=True, memo=memo,
-    ) if spec.mx_scale_group else None)
+        spec, p, die, sector, p.a_id, tile.row, ks, tile.m, scale_kl, p.k, tile.owner, is_a=True, memo=memo,
+    ) if load_scales else None)
     gm_b = _make_rect_pattern(
         spec, p, die, sector, p.b_id, spec.dtype_b, ks, tile.col, kl, tile.n, p.n, tile.owner,
         bypass=bypass_b, memo=memo,
     )
     sc_b = (_make_scale_pattern(
-        p, die, sector, p.b_id, ks, tile.col, kl, tile.n, p.n, tile.owner, is_a=False,
+        spec, p, die, sector, p.b_id, ks, tile.col, scale_kl, tile.n, p.n, tile.owner, is_a=False,
         bypass=bypass_b, memo=memo,
-    ) if spec.mx_scale_group else None)
+    ) if load_scales else None)
     return gm_a, sc_a, gm_b, sc_b
+
+
+def _admit_optional(admit, pat: MemoryAccessPattern | None) -> _AccessRecord | None:
+    return admit(pat) if pat is not None else None
 
 
 def _check_init_order_safe(
@@ -1176,13 +1211,13 @@ def _lower_periodic_wave(
             for t_idx, rows in enumerate(init_pats):
                 if has_ctx:
                     for p_idx in range(init_count):
-                        init_gm[t_idx][p_idx][1] = admit(rows[p_idx][2][1])
+                        init_gm[t_idx][p_idx][1] = _admit_optional(admit, rows[p_idx][2][1])
                     for p_idx in range(init_count):
-                        init_gm[t_idx][p_idx][3] = admit(rows[p_idx][2][3])
+                        init_gm[t_idx][p_idx][3] = _admit_optional(admit, rows[p_idx][2][3])
                 else:
                     for p_idx in range(init_count):
-                        init_gm[t_idx][p_idx][1] = admit(rows[p_idx][2][1])
-                        init_gm[t_idx][p_idx][3] = admit(rows[p_idx][2][3])
+                        init_gm[t_idx][p_idx][1] = _admit_optional(admit, rows[p_idx][2][1])
+                        init_gm[t_idx][p_idx][3] = _admit_optional(admit, rows[p_idx][2][3])
         for t_idx, (tile, encoder) in enumerate(zip(tiles, encoders)):
             for p_idx in range(init_count):
                 ks, kl, _ = init_pats[t_idx][p_idx]
@@ -1211,8 +1246,8 @@ def _lower_periodic_wave(
             if has_scales:
                 for t_idx, rows in enumerate(batch_pats):
                     for b_pos, (_, _, pats) in enumerate(rows):
-                        batch_recs[t_idx][b_pos][1] = admit(pats[1])
-                        batch_recs[t_idx][b_pos][3] = admit(pats[3])
+                        batch_recs[t_idx][b_pos][1] = _admit_optional(admit, pats[1])
+                        batch_recs[t_idx][b_pos][3] = _admit_optional(admit, pats[3])
             for t_idx, (tile, encoder) in enumerate(zip(tiles, encoders)):
                 for b_pos, (ks, kl, _) in enumerate(batch_pats[t_idx]):
                     encoder.append(_PanelDescriptor(
@@ -1420,13 +1455,13 @@ def _admit_init_panels_for_task(
     if has_scales:
         if has_ctx:
             for i in range(init_n):
-                gm[i][1] = admit(pats_list[i][2][1])
+                gm[i][1] = _admit_optional(admit, pats_list[i][2][1])
             for i in range(init_n):
-                gm[i][3] = admit(pats_list[i][2][3])
+                gm[i][3] = _admit_optional(admit, pats_list[i][2][3])
         else:
             for i in range(init_n):
-                gm[i][1] = admit(pats_list[i][2][1])
-                gm[i][3] = admit(pats_list[i][2][3])
+                gm[i][1] = _admit_optional(admit, pats_list[i][2][1])
+                gm[i][3] = _admit_optional(admit, pats_list[i][2][3])
     return [
         _PanelDescriptor(
             tile.m, tile.n, pats_list[i][1], *gm[i],
@@ -1474,7 +1509,9 @@ def _lower_splitk_waves(
             direction="write", pipe="fixpipe", owner=owner, memo=memo,
         )
         micros = _count_slice_compute(tile, st_k, en_k, spec, p, datapath, low, plan, resource_work, cube_dt)
-        stage_count += _exact_tile_stage_count(spec, n_panels, micros, has_ctx)
+        stage_count += _exact_tile_stage_count(
+            spec, n_panels, micros, has_ctx, scale_panels=_scale_panel_count(spec, st_k, en_k),
+        )
         encoders.append(_PanelPhases(periods))
         task_tiles.append(tile)
         d_init, p_depths, d_partial = _partial_kahn_depths(n_panels, full_mc, owner_depth.get(owner, 0), has_ctx)
@@ -1590,7 +1627,9 @@ def _lower_streamk_partials(
                 direction="write", pipe="fixpipe", owner=core, memo=memo,
             )
             micros = _count_slice_compute(tile, panel, k_stop, spec, p, datapath, low, plan, resource_work, cube_dt)
-            stage_count += _exact_tile_stage_count(spec, n_panels, micros, has_ctx)
+            stage_count += _exact_tile_stage_count(
+                spec, n_panels, micros, has_ctx, scale_panels=_scale_panel_count(spec, panel, k_stop),
+            )
             core_encs[core].append(_PanelPhases(periods))
             d_init, p_depths, d_partial = _partial_kahn_depths(n_panels, full_mc, base_depth, has_ctx)
             init_n = min(_PAIR_DEPTH, n_panels)
@@ -1693,9 +1732,13 @@ def lower_catlass_periodic(
     blocks, cores = ceil_div(p.m, low.tm) * ceil_div(p.n, low.tn), spec.aic_budget
     lifetimes = _ReuseLifetimes(plan.state, ())
     first_tile = low.tile(0)
-    for pattern in _panel_patterns(spec, p, first_tile, 0, low.tk, die, plan.sector, memo):
+    scale_panel_total = _scale_panel_count(spec, 0, low.gk)
+    for pattern, count in zip(
+        _panel_patterns(spec, p, first_tile, 0, low.tk, die, plan.sector, memo),
+        (low.gk, scale_panel_total, low.gk, scale_panel_total),
+    ):
         if pattern is not None and pattern.reuse_key is not None:
-            lifetimes.pending[pattern.reuse_key] += blocks * low.gk
+            lifetimes.pending[pattern.reuse_key] += blocks * count
     lifetimes.pending[_make_output_pattern(spec, p, first_tile, die, plan.sector, memo=memo).reuse_key] += blocks
     partition = streamk_partition(blocks, low.gk, cores) if spec.scheduler == "streamk" else None
     if partition is not None and partition.b_sk:
