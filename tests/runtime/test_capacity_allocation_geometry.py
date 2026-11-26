@@ -790,3 +790,46 @@ def test_draft_kv_separates_dcp_interleave_from_physical_page_block_size():
     c_sk = parse_case(raw_sk)
     mem_sk = Memory(replace(c_sk, model=replace(c_sk.model, auxiliary=AuxiliarySpec(mtp=mla_draft))))
     assert mem_sk._non_inherited_draft_cache_bytes(mem_sk.case.model, 256, padded=True, rank=None)[0] == 256 * 1152
+
+
+def test_grant_reader_release_and_holder_identity_isolation():
+    """Verify release_grant_reader leaves same-named request holds intact and composite grant/consumer keys never collide."""
+    from _support.memory_cases import budget_memory
+
+    mem = budget_memory(8192)
+    assert mem.resize(0, "r1", 16)
+    assert mem.hold_for_async_consumer(0, "r1", "copy")
+    assert mem.grant_batch(0, [dict(name="r1", bytes=4096, stage=0, physical_key="scratch")])
+    assert mem.hold_for_async_consumer(0, "r1", "copy", grant="r1")
+    mem.release(0, "r1")
+    assert mem.release_grant(0, "r1")
+    assert mem.release_grant_reader(0, "r1", "copy")
+    assert int(mem.occupied_bytes(0, 0)) == int(mem.cache_bytes(16)[0])
+    assert mem.pending_async_consumers(0, "r1") == ("copy",) and not mem.grant_readers
+
+    mem_sep = budget_memory(8192)
+    for grant_name, reader_name in (("decode::kv", "copy"), ("decode", "kv::copy")):
+        assert mem_sep.grant_batch(0, [dict(name=grant_name, bytes=4096, stage=0, physical_key=grant_name)])
+        assert mem_sep.hold_for_async_consumer(0, grant_name, reader_name, grant=grant_name)
+    for grant_name in ("decode::kv", "decode"):
+        assert mem_sep.release_grant(0, grant_name)
+    assert int(mem_sep.occupied_bytes(0, 0)) == 8192
+    assert not mem_sep.grant_batch(0, [dict(name="extra", bytes=4096, stage=0)])
+
+    # Event-bound grant reader reclaimability uses the same structured 4-tuple holder key.
+    from mindie_sim.prediction.runtime.engine import Event
+    mem_ev = budget_memory(8192)
+    ev = Event(1, "copy_done")
+    assert mem_ev.grant_batch(0, [dict(name="decode::kv", bytes=4096, stage=0, physical_key="decode::kv")])
+    assert mem_ev.hold_for_async_consumer(0, "decode::kv", "copy", grant="decode::kv", event=ev)
+    assert mem_ev.release_grant(0, "decode::kv")
+    drop_holders, _ = mem_ev._collect_reclaimable_holders_and_events()
+    assert (0, "grant_reader", "decode::kv", "copy") in drop_holders
+    backings = mem_ev._collect_non_request_backings()
+    assert not backings[0][0][0]["ret_ranges"] and backings[0][0][0]["all_ranges"]
+
+    # Releasing the final reader of a host-tier grant records freed host bytes.
+    mem_host = budget_memory(8192)
+    assert mem_host.grant_batch(0, [dict(name="hg", bytes=0, host_bytes=4096, tier="host", stage=0, physical_key="hg")])
+    assert mem_host.hold_for_async_consumer(0, "hg", "rd", grant="hg") and mem_host.release_grant(0, "hg")
+    assert mem_host.release_grant_reader(0, "hg", "rd") and mem_host.release_events[-1]["released_bytes"] == 4096.0

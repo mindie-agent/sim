@@ -381,6 +381,12 @@ class _MemoryRequestsMixin:
             return None
         return tuple(retained)
 
+    @staticmethod
+    def _grant_reader_holder(
+        replica: int, grant: str, consumer: str,
+    ) -> tuple[int, str, str, str]:
+        return (replica, "grant_reader", str(grant), str(consumer))
+
     def hold_for_async_consumer(
         self, replica: int, request: str, consumer: str, *,
         storage: str | None = None, ranges=None, generation: int | None = None,
@@ -428,7 +434,7 @@ class _MemoryRequestsMixin:
                     and existing.get("storage") == storage
                     and tuple(existing.get("ranges") or ())
                     == tuple(ref_ranges or ()))
-            holder = (replica, "grant_reader", f"{grant}::{consumer}")
+            holder = self._grant_reader_holder(replica, str(grant), consumer)
             hbm, host = self._state_usage(extra_holders=[(holder, (ref,))])
             if not self._usage_budget_ok(hbm, host):
                 return False
@@ -541,49 +547,59 @@ class _MemoryRequestsMixin:
                     0.0, before - self._replica_occupied(replica)),
             })
             return True
-        readers = self.grant_readers.get((replica, str(request)))
-        if readers and consumer in readers:
-            snapshot = readers[consumer]
-            if rank is not None and int(snapshot["ref"].rank) != int(rank):
-                return False
-            bound_generation = snapshot.get("generation")
-            if (generation is not None and bound_generation is not None
-                    and int(generation) != int(bound_generation)):
-                return False
-            bound_event = snapshot.get("event")
-            if event is not None and event != bound_event:
-                return False
-            if self.ledger_domain is not None:
-                from ..runtime.ledger import Ledger as _Ledger, LedgerError
-                for reader_key in snapshot.get("readers", ()):
-                    try:
-                        _Ledger.retire_reader(self.runtime_state, reader_key)
-                    except LedgerError:
-                        pass
-            before = self._replica_occupied(replica)
-            self._set_ref((replica, "grant_reader", f"{request}::{consumer}"), ())
-            del readers[consumer]
-            if not readers:
-                del self.grant_readers[(replica, str(request))]
-            self._sync_usage()
-            self.release_events.append({
-                "kind": "grant_reader", "replica": replica,
-                "grant": request, "consumer": consumer,
-                "binding": snapshot,
-                "released_bytes": max(
-                    0.0, before - self._replica_occupied(replica)),
-            })
-            self.budget_version += 1
-            return True
-        return False
+        return self.release_grant_reader(
+            replica, request, consumer, generation=generation, event=event,
+            rank=rank)
 
     def release_grant_reader(
         self, replica: int, grant: str, consumer: str, *,
         generation: int | None = None, event=None, rank: int | None = None,
     ) -> bool:
-        return self.release_async_consumer(
-            replica, grant, consumer, generation=generation, event=event,
-            rank=rank)
+        """Complete one explicit grant reader without disturbing request holds."""
+        readers = self.grant_readers.get((replica, str(grant)))
+        if not readers or consumer not in readers:
+            return False
+        snapshot = readers[consumer]
+        if rank is not None and int(snapshot["ref"].rank) != int(rank):
+            return False
+        bound_generation = snapshot.get("generation")
+        if (generation is not None and bound_generation is not None
+                and int(generation) != int(bound_generation)):
+            return False
+        bound_event = snapshot.get("event")
+        if event is not None and event != bound_event:
+            return False
+        if self.ledger_domain is not None:
+            from ..runtime.ledger import Ledger as _Ledger, LedgerError
+            for reader_key in snapshot.get("readers", ()):
+                try:
+                    _Ledger.retire_reader(self.runtime_state, reader_key)
+                except LedgerError:
+                    pass
+        before_hbm, before_host = self._state_usage()
+        self._set_ref(self._grant_reader_holder(replica, str(grant), consumer), ())
+        del readers[consumer]
+        if not readers:
+            del self.grant_readers[(replica, str(grant))]
+        self._sync_usage()
+        after_hbm, after_host = self._state_usage()
+        freed_fn = getattr(self, "_freed_total_bytes", None)
+        if callable(freed_fn):
+            released_bytes = float(freed_fn(before_hbm, before_host, after_hbm, after_host))
+        else:
+            released_bytes = max(
+                0.0,
+                sum(float(v) for rep_h in before_hbm for row in rep_h for v in row)
+                - sum(float(v) for rep_h in after_hbm for row in rep_h for v in row),
+            ) + sum(max(0.0, float(bh) - float(ah)) for bh, ah in zip(before_host, after_host))
+        self.release_events.append({
+            "kind": "grant_reader", "replica": replica,
+            "grant": grant, "consumer": consumer,
+            "binding": snapshot,
+            "released_bytes": released_bytes,
+        })
+        self.budget_version += 1
+        return True
 
     def is_retired(self, replica: int, request: str) -> bool:
         return (replica, request) in self.retired_requests

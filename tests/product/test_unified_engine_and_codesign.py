@@ -263,7 +263,7 @@ def test_typed_codesign_opportunities_mega_fusion_space_time_and_cross_hw() -> N
     assert mf_opps[0].tiled_engine_ms >= mf_opps[0].boundary_lower_bound_ms - 1e-9
     assert mf_opps[0].ub_live_bytes <= mf_opps[0].ub_capacity_bytes
 
-    # Sparse MLA + Engram
+    # Sparse MQSMLA + Engram (wkv only, no kv_b) vs standard MLA with kv_b weights
     raw_mla = compose_case(
         "deepseek-v4.1-flash", GEN5_DT_SKU, layers=TEST_COMPACT_LAYERS,
         dp=1, tp=1, ep=1, mtp_proposal_tokens=0, prompt_tokens=32, output_tokens=1, concurrency=1,
@@ -277,7 +277,20 @@ def test_typed_codesign_opportunities_mega_fusion_space_time_and_cross_hw() -> N
         for o in opps_mla
         if o.kind == "space_time_tradeoff" and o.space_time is not None
     }
-    assert "absorbed_kv_projection" in mla_mechs
+    assert "absorbed_kv_projection" not in mla_mechs
+    raw_kvb = compose_case(
+        "deepseek-v3", GEN5_DT_SKU, layers=TEST_COMPACT_LAYERS,
+        dp=1, tp=1, ep=1, mtp_proposal_tokens=0, prompt_tokens=32, output_tokens=1, concurrency=1,
+    )
+    parsed_kvb = parse_case(raw_kvb)
+    rec_kvb = solve_target_step_receipt(parsed_kvb, req_mla, stack_track="target", max_trials=2)
+    opps_kvb = collect_codesign_opportunities(parsed_kvb, step_request=req_mla, step_receipt=rec_kvb)
+    kvb_mechs = {
+        o.space_time.mechanism
+        for o in opps_kvb
+        if o.kind == "space_time_tradeoff" and o.space_time is not None
+    }
+    assert "absorbed_kv_projection" in kvb_mechs
     wall = evaluate_macro_wall_trigger(tpot_ms=65.0, tpot_slo_ms=50.0, hbm_used_bytes=20e9, hbm_usable_bytes=64e9, hbm_headroom_bytes=44e9)
     assert wall.wall_kind == "LATENCY_WALL"
 
@@ -585,3 +598,22 @@ def test_catlass_mx_span_resident_requests_and_codesign_honesty() -> None:
     simt_g, simd_g, _ = _dual_tier_from_receipt(r_dual)
     assert simt_g == pytest.approx(0.4) and simd_g == pytest.approx(0.3)
     assert len(LINEAR_ATTENTION_KINDS) >= 6
+
+    # Engram offload projection matches canonical TP-sharded packed H2D transfer bytes.
+    from mindie_sim.catalog.engram import lower_engram
+    from mindie_sim.optimization.codesign import _project_step_engram_transfers
+
+    eng_case = parse_case(compose_case(
+        "deepseek-v4.1-flash", "a3", tp=2, dp=1, ep=1, layers=2,
+        prompt_tokens=8, output_tokens=2, engram_cpu_offload=True,
+    ))
+    eng_ops, _ = lower_engram(
+        prefix="s0.l1", plan=eng_case.model.layer_plans[1], stage=0, deps="input",
+        model=eng_case.model, parallel=eng_case.runtime.parallel, quant=eng_case.model.quant,
+        mode="decode", padded_tokens=1, views=(), runtime=eng_case.runtime,
+    )
+    dma_op = next(op for op in eng_ops if op.family == "engram_rh2d")
+    proj_ev, = _project_step_engram_transfers(
+        eng_case, StepRequest("decode", tokens=1, context=8), [1], eng_case.model.engram.tables,
+    )
+    assert int(proj_ev.payload_bytes) == int(dict(dma_op.metadata)["resource_work"]["h2d"]) == 6144

@@ -597,3 +597,69 @@ def test_producer_end_to_end_report_assembly_boundary_and_precision(tmp_path: Pa
     with pytest.raises(ModelingError, match="producer_manifest_split_conflict"):
         prod._LineageSplitResolver({"acquisitions": [{"acquisition_uid": f"acq-{tag}", "raw_sha256": digest, "split": split}
             for tag, digest, split in (("x", _sha("a"), "train"), ("y", _sha("a").upper(), "heldout"))]})
+
+
+def test_rank_local_clock_parity_paired_rung_and_host_rank_separation():
+    """Verify longest-rank clock alignment, paired-rung signed deltas, host-PID filtering, and rank/device separation."""
+    import io
+    import zipfile
+    from mindie_sim.observations import multilevel as m
+    from mindie_sim.prediction.runtime.engine import Engine, Resource
+
+    # Longest-rank clock matches capture elapsed_span under inter-rank release skew.
+    eng = Engine([Resource(f"hbm@d{r}", 1) for r in (0, 1)], trace_limit=12)
+    start = eng.submit("A")
+    a_jobs = [eng.submit("A", {f"hbm@d{r}": 0.5}, release=2 * r, after=(start,)) for r in (0, 1)]
+    b_jobs = [eng.submit("B", {f"hbm@d{r}": 0.5}, after=(j,)) for r, j in enumerate(a_jobs)]
+    end = eng.submit("B", after=tuple(b_jobs))
+    eng.advance()
+    rows = [dict(name=j.name, rank=r, start_ms=j.started, end_ms=j.time) for jobs in (a_jobs, b_jobs) for r, j in enumerate(jobs)]
+    with zipfile.ZipFile(io.BytesIO(), "w") as z:
+        z.writestr("raw.json", json.dumps(rows))
+        p = zipfile.Path(z, "raw.json")
+        bd = m.CaptureBoundary(m.digest_file_streaming(p), "acq", "run", (), ("A", "B"), (0, 1), "device", "A", "B", "fx_region", "ms")
+        ck = m.CohortKey("L2", "region", "a5", "decode", "eager", "small", "tp2")
+        gc = m.GateCase("skew", "L2", "heldout", bd, "input", "stack", "region", ck, 1_000_000)
+        assert len(m._verify_case_capture(gc, p).selected_kernels) == 4
+        assert m.bind_engine_interval(gc, eng, start, end).predicted_ns == 1_000_000
+
+    # Paired rung negative delta verifies both arms rather than total enclosing span.
+    pair_rows = [dict(name="A", rank=0, start_ns=0, duration_ns=100_000), dict(name="B", rank=0, start_ns=100_000, duration_ns=60_000)]
+    with zipfile.ZipFile(io.BytesIO(), "w") as z:
+        z.writestr("raw.json", json.dumps(pair_rows))
+        p = zipfile.Path(z, "raw.json")
+        b_doc = dict(raw_sha256=m.digest_file_streaming(p), acquisition_uid="acq", run_uid="run", event_ids=["A", "B"], device_ranks=[0], clock_domain="device", start_event="A", end_event="B", boundary_kind="paired_rung_delta", unit="ns")
+        k_doc = dict(cohort_name="pair", sku="a5", phase="decode", mode="eager", shape_regime="small", parallel_topology="tp1")
+        gc_pair = m.parse_gate_case(dict(case_id="pair", level="L2", split="heldout", boundary=b_doc, cohort=k_doc, implementation="K", input_digest="input", stack_digest="stack", rung_arm_a_measured_ns=100_000, rung_arm_b_measured_ns=60_000))
+        assert gc_pair.measured_ns == -40_000 and len(m._verify_case_capture(gc_pair, p).selected_kernels) == 2
+        gc_bad = m.parse_gate_case(dict(case_id="pair", level="L2", split="heldout", boundary=b_doc, cohort=k_doc, implementation="K", input_digest="input", stack_digest="stack", rung_arm_a_measured_ns=99_000, rung_arm_b_measured_ns=59_000))
+        with pytest.raises(ValueError, match="capture_duration_mismatch"):
+            m._verify_case_capture(gc_bad, p)
+
+    # Host Python PID events (including rank-stamped process_name) do not contaminate device busy_union.
+    tr_host = [dict(ph="M", name="process_name", pid=1, args={"name": "Device 0"}), dict(ph="M", name="process_name", pid=2, args={"name": "Python", "rank": 0})]
+    tr_host += [dict(ph="X", pid=pid, tid=1, name=kn, ts=ts, dur=dur, args={"rank": 0}) for pid, kn, ts, dur in ((1, "A", 0, 10), (2, "CPU", 5, 90), (1, "B", 90, 10))]
+    with zipfile.ZipFile(io.BytesIO(), "w") as z:
+        z.writestr("trace.json", json.dumps({"traceEvents": tr_host}))
+        path_h = zipfile.Path(z, "trace.json")
+        b_h = m.CaptureBoundary(m.digest_file_streaming(path_h), "acq", "run", (), ("A", "B"), (0,), "device", "A", "B", "fx_region", "us", clock_operator="busy_union")
+        gc_h = m.GateCase("busy", "L2", "heldout", b_h, "input", "stack", "region", m.CohortKey("L2", "region", "a5", "decode", "eager", "small", "tp1"), 20_000)
+        assert len(m._verify_case_capture(gc_h, path_h).selected_kernels) == 2
+
+    # Fractional-nanosecond endpoints quantize consistently before subtraction.
+    eng_frac = Engine([Resource("hbm@d0", 1e6)], trace_limit=16)
+    s_f = eng_frac.submit("s", release=0.0100006)
+    w_f = eng_frac.submit("w", {"hbm@d0": 9999.6}, after=(s_f,))
+    eng_frac.advance()
+    gc_f = m.GateCase("frac", "L1", "heldout", m.CaptureBoundary("0" * 64, "acq", "run", (), ("s", "w"), (0,), "device", "s", "w", "fx_region", "ns"), "in", "st", "w", m.CohortKey("L1", "w", "a5", "decode", "eager", "small", "tp1"), 9999)
+    assert m.bind_engine_interval(gc_f, eng_frac, s_f, w_f).elapsed_span_ns == 9999
+
+    # Distinct global rank_id vs local device_id verifies cleanly on both placements.
+    for dev in (1, 0):
+        tr_rk = [dict(ph="M", name="process_name", pid=20, args={"name": f"Device {dev}"}), dict(ph="X", name="K", pid=20, tid=1, ts=10, dur=40, args={"rank_id": 1, "device_id": dev})]
+        with zipfile.ZipFile(io.BytesIO(), "w") as z:
+            z.writestr("trace.json", json.dumps({"traceEvents": tr_rk}))
+            path_r = zipfile.Path(z, "trace.json")
+            b_r = m.CaptureBoundary(m.digest_file_streaming(path_r), "acq", "run", (), ("K",), (1,), "device", "K", "K", "device_kernel", "us")
+            gc_r = m.GateCase("kernel", "L1", "heldout", b_r, "input", "stack", "K", m.CohortKey("L1", "kernel", "a5", "decode", "eager", "small", "tp2"), 40_000)
+            assert len(m._verify_case_capture(gc_r, path_r).selected_kernels) == 1

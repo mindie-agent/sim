@@ -570,10 +570,16 @@ def _validate_live_engine_events(
             raise ModelingError(f"engine_event_not_owned_by_engine:{case.case_id}:cross_engine_handle")
     if engine._trace_maxlen <= 0 and clock_op == "elapsed_span":
         raise ModelingError(f"engine_event_not_owned_by_engine:{case.case_id}:trace_required")
-    busy_ns = _busy_union_ns(
+    start_is_marker = (
+        start_event.name.endswith(":start")
+        or start_event.started is None
+        or abs(float(start_event.time) - float(start_event.started)) <= _CLOCK_EPS_MS
+    )
+    rank_elapsed_ns, busy_ns = _rank_clock_metrics_ns(
         engine, start_event.time, end_event.time,
         device_ranks=case.boundary.device_ranks,
         start_event_name=start_event.name, end_event_name=end_event.name,
+        start_is_marker=start_is_marker,
     )
     if clock_op == "busy_union" and busy_ns is None:
         raise ModelingError(f"busy_union_trace_incomplete:{case.case_id}")
@@ -589,7 +595,9 @@ def _validate_live_engine_events(
         while len(_EVENT_OWNER_REGISTRY) > _EVENT_OWNER_MAX_ENTRIES:
             _EVENT_OWNER_REGISTRY.popitem(last=False)
     start_ns, end_ns = int(round(start_event.time * MS_TO_NS)), int(round(end_event.time * MS_TO_NS))
-    if (elapsed_span_ns := end_ns - start_ns) <= 0:
+    global_span_ns = end_ns - start_ns
+    elapsed_span_ns = rank_elapsed_ns if rank_elapsed_ns is not None else global_span_ns
+    if global_span_ns <= 0 or elapsed_span_ns <= 0 or elapsed_span_ns > global_span_ns:
         raise ModelingError(f"interval_span_or_duration_invalid:{case.case_id}")
     if busy_ns is not None:
         busy_ns = min(busy_ns, elapsed_span_ns)
@@ -699,13 +707,13 @@ def _demand_ranks(
     return set(participating_set)
 
 
-def _boundary_time(row: Mapping[str, Any], event_name: str) -> float | None:
+def _boundary_time(row: Mapping[str, Any], event_name: str, *, use_start: bool = False) -> float | None:
     task_name = str(row.get("task", ""))
     if event_name.endswith(":start") and task_name == event_name.removesuffix(":start"):
         val = row.get("start_ms")
         return None if val is None else float(val)
     if task_name == event_name:
-        val = row.get("end_ms")
+        val = row.get("start_ms") if use_start else row.get("end_ms")
         return None if val is None else float(val)
     return None
 
@@ -713,26 +721,43 @@ def _boundary_time(row: Mapping[str, Any], event_name: str) -> float | None:
 def _rank_windows(
     trace: Iterable[Mapping[str, Any]], start_ms: float, end_ms: float, participating: tuple[int, ...],
     start_event_name: str | None, end_event_name: str | None,
-    resolve_tagged: Callable[[Mapping[str, float]], set[int]],
+    resolve_tagged: Callable[[Mapping[str, float]], set[int]], *,
+    start_is_marker: bool = False,
 ) -> dict[int, tuple[float, float]]:
     windows = {rank: (start_ms, end_ms) for rank in participating}
     if not (start_event_name and end_event_name):
         return windows
     starts: dict[int, list[float]] = {rank: [] for rank in participating}
     ends: dict[int, list[float]] = {rank: [] for rank in participating}
+    rank_min: dict[int, float] = {}
+    rank_max: dict[int, float] = {}
     for row in trace:
         demand = row.get("demand")
         if not demand or not (ranks := resolve_tagged(demand)):
             continue
-        if (t_s := _boundary_time(row, start_event_name)) is not None and start_ms - _CLOCK_EPS_MS <= t_s <= end_ms + _CLOCK_EPS_MS:
+        r_start, r_end = row.get("start_ms"), row.get("end_ms")
+        if r_start is not None and r_end is not None:
+            fs, fe = float(r_start), float(r_end)
+            if fs >= start_ms - _CLOCK_EPS_MS and fe <= end_ms + _CLOCK_EPS_MS and fe >= fs:
+                for rank in ranks:
+                    rank_min[rank] = fs if rank not in rank_min else min(rank_min[rank], fs)
+                    rank_max[rank] = fe if rank not in rank_max else max(rank_max[rank], fe)
+        if (t_s := _boundary_time(row, start_event_name, use_start=start_is_marker)) is not None and start_ms - _CLOCK_EPS_MS <= t_s <= end_ms + _CLOCK_EPS_MS:
             for rank in ranks:
                 starts[rank].append(t_s)
         if (t_e := _boundary_time(row, end_event_name)) is not None and start_ms - _CLOCK_EPS_MS <= t_e <= end_ms + _CLOCK_EPS_MS:
             for rank in ranks:
                 ends[rank].append(t_e)
+    matched_any = False
     for rank in participating:
         if len(starts[rank]) == 1 and len(ends[rank]) == 1 and starts[rank][0] <= ends[rank][0]:
             windows[rank] = (starts[rank][0], ends[rank][0])
+            matched_any = True
+    if not matched_any and len(participating) > 1 and all(r in rank_min and r in rank_max for r in participating):
+        for rank in participating:
+            lo, hi = max(start_ms, rank_min[rank]), min(end_ms, rank_max[rank])
+            if hi >= lo:
+                windows[rank] = (lo, hi)
     return windows
 
 
@@ -753,17 +778,18 @@ def _union_spans_ns(spans: list[tuple[float, float]]) -> int:
     return int(round(math.fsum(merged) * MS_TO_NS))
 
 
-def _busy_union_ns(
+def _rank_clock_metrics_ns(
     engine: Any, start_ms: float, end_ms: float,
     device_ranks: Sequence[int] | None = None, *,
     start_event_name: str | None = None, end_event_name: str | None = None,
-) -> int | None:
-    """Union settled device work spans per participating rank and take the max."""
+    start_is_marker: bool = False,
+) -> tuple[int | None, int | None]:
+    """Compute per-rank longest local elapsed span and busy union in nanoseconds."""
     if engine._trace_maxlen <= 0 or engine.trace_dropped or len(engine.trace) != engine.completed_count:
-        return None
+        return None, None
     participating = tuple(dict.fromkeys(device_ranks)) if device_ranks is not None else (0,)
     if not participating:
-        return None
+        return None, None
     participating_set = set(participating)
     host_resources = {name for name in engine.resources if _is_host_resource(name)}
     stage_map, replica_map, has_any_rank_tag = _replica_stage_maps(engine.resources, host_resources, participating)
@@ -773,25 +799,38 @@ def _busy_union_ns(
     )
     windows = _rank_windows(
         engine.trace, start_ms, end_ms, participating, start_event_name, end_event_name,
-        partial(resolve, tagged_only=True),
+        partial(resolve, tagged_only=True), start_is_marker=start_is_marker,
     )
+    elapsed_ns = max(int(round(right * MS_TO_NS)) - int(round(left * MS_TO_NS)) for left, right in windows.values())
     for task in engine._tasks.values():
         if task.start is not None and any(task.start < windows[rank][1] for rank in resolve(task.demand)):
-            return None
+            return elapsed_ns, None
     spans_by_rank: dict[int, list[tuple[float, float]]] = {rank: [] for rank in participating}
     for row in engine.trace:
         if (demand := row.get("demand")) is None:
-            return None
+            return elapsed_ns, None
         if not (targets := resolve(demand)):
             continue
         start, end = row.get("start_ms"), row.get("end_ms")
         if start is None or end is None:
-            return None
+            return elapsed_ns, None
         for rank in targets:
             left, right = windows[rank]
             if (clipped_s := max(left, start)) < (clipped_e := min(right, end)):
                 spans_by_rank[rank].append((clipped_s, clipped_e))
-    return max(_union_spans_ns(spans) for spans in spans_by_rank.values())
+    return elapsed_ns, max(_union_spans_ns(spans) for spans in spans_by_rank.values())
+
+
+def _busy_union_ns(
+    engine: Any, start_ms: float, end_ms: float,
+    device_ranks: Sequence[int] | None = None, *,
+    start_event_name: str | None = None, end_event_name: str | None = None,
+) -> int | None:
+    """Union settled device work spans per participating rank and take the max."""
+    return _rank_clock_metrics_ns(
+        engine, start_ms, end_ms, device_ranks=device_ranks,
+        start_event_name=start_event_name, end_event_name=end_event_name,
+    )[1]
 
 
 def bind_engine_interval(
@@ -887,8 +926,11 @@ def validate_engine_interval(case: Any, interval: EngineInterval, *, expected_le
             raise ModelingError(f"rung_delta_prediction_invalid:{case.case_id}")
     else:
         span_ns = interval.end_ns - interval.start_ns
-        duration_ns = interval.busy_union_ns if clock_op == "busy_union" else span_ns
-        if interval.predicted_ns != duration_ns or not 0 < interval.predicted_ns <= span_ns:
+        elapsed_ns = interval.elapsed_span_ns if interval.elapsed_span_ns is not None else span_ns
+        duration_ns = interval.busy_union_ns if clock_op == "busy_union" else elapsed_ns
+        if (interval.predicted_ns != duration_ns
+                or not 0 < elapsed_ns <= span_ns
+                or not 0 < interval.predicted_ns <= elapsed_ns):
             raise ModelingError(f"interval_span_or_duration_invalid:{case.case_id}")
     rcpt = interval.run_receipt
     if not isinstance(rcpt, EngineRunReceipt):
@@ -1345,6 +1387,8 @@ def _verify_case_capture(case: GateCase, path: Path) -> CaptureVerificationRecei
         case.case_id, case.boundary, path, measured_ns=case.measured_ns, ijson_mod=ijson,
         digest_fn=digest_file_streaming, stream_chunk_bytes=STREAM_CHUNK_BYTES,
         extract_meta_fn=_extract_capture_meta,
+        arm_a_measured_ns=case.rung_arm_a_measured_ns,
+        arm_b_measured_ns=case.rung_arm_b_measured_ns,
     )
 
 

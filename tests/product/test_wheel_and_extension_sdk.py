@@ -598,3 +598,61 @@ def test_two_layer_operator_sdk_simulation_honesty_lock_and_layer2_binding():
     sim_res = simulate_operator(env, (unbound_op,), extensions=ctx)
     assert sim_res["schema"] == "mindie-sim.operators/1" and sim_res["operator_sum_ms"] > 0.0
 
+
+def test_standalone_cohort_serviced_binding_deps_repeat_calls_and_recipe_isolation():
+    """Verify per-replica cohort link attribution, dependency inheritance on bound kernels, repeated bound calls, and immediate recipe restoration."""
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.program import KernelProgram, RecipeBook, Stage
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.public import (
+        ExecutionEnvironment,
+        bind_kernel_implementation,
+        load_extensions,
+        simulate_graph,
+        simulate_operator,
+    )
+    from mindie_sim.schema.operators import OpSpec
+
+    case = parse_case(compose_case("qwen3-30b-a3b", "a5", layers=1, tp=1, dp=2, ep=2, prompt_tokens=8, output_tokens=1))
+    env_ep = ExecutionEnvironment.from_hardware(case.machine, runtime=case.runtime)
+    comm_op = OpSpec("x", "alltoall", "decode", 0, 0, (), *((1,),) * 4, dtype="bf16", link_bytes=4096, metadata=(("group_axis", "ep"),))
+    cohort_ops = {0: (comm_op,), 1: (comm_op,)}
+    wire = lambda d: sum(v for k, v in d.items() if k.startswith("link:"))
+    env_rep = simulate_operator(env_ep, cohort_ops)
+    assert [wire(o["serviced"]) for o in env_rep["operators"]] == [4096.0, 4096.0]
+    assert sum(env_rep["operators"][0]["basis"]["operator_occurrences"].values()) == 2
+    assert [wire(o["serviced"]) for o in simulate_operator(case, cohort_ops)["operators"]] == [4096.0, 4096.0]
+    assert wire(simulate_graph(env_ep, cohort_ops)["execution"]["serviced"]) == 8192.0
+    pt_meta = (("group_axis", "ep"), ("peer_traffic", {"kind": "uniform_peers", "source_bytes": (4096.0, 0.0)}))
+    zero_send_op = OpSpec("x", "alltoallv", "decode", 0, 0, (), *((1,),) * 4, dtype="bf16", link_bytes=0, metadata=pt_meta)
+    send_op = OpSpec("x", "alltoallv", "decode", 0, 0, (), *((1,),) * 4, dtype="bf16", link_bytes=4096, metadata=pt_meta)
+    zs_rep = simulate_operator(env_ep, {0: (send_op,), 1: (zero_send_op,)})
+    assert [wire(o["serviced"]) for o in zs_rep["operators"]] == [4096.0, 0.0]
+
+    env = ExecutionEnvironment.from_hardware({"backend": "ascend", "sku": "Ascend950DT_9582"})
+    mk_op = lambda name, recipe="", deps=(): OpSpec(name, "vector", "decode", 0, 0, (), *((64,),) * 4, dtype="bf16", hbm_bytes=256, vector_ops=64, recipe=recipe, deps=deps)
+    ext_same = bind_kernel_implementation("norm", implementation={"ops": (mk_op("norm"),)}, capability="graph")
+    res_dep = simulate_graph(env, (mk_op("norm", deps=("input",)),), extensions=load_extensions(extensions=[ext_same]), external_inputs={"input": 5.0})
+    assert res_dep["timeline"][0]["ready_ms"] == pytest.approx(5.0) and res_dep["operators"][0]["deps"] == ["input"]
+
+    ext_rep = bind_kernel_implementation("norm", implementation={"ops": (mk_op("body"),)}, capability="graph")
+    res_rep = simulate_graph(env, (mk_op("first", "norm"), mk_op("second", "norm", ("first",))), extensions=load_extensions(extensions=[ext_rep]))
+    assert res_rep["operator_events"] == 2 and res_rep["timeline"][1]["ready_ms"] >= res_rep["timeline"][0]["complete_ms"] - 1e-12
+
+    class _ConstRecipe:
+        def __init__(self, ms: float) -> None:
+            self.ms = ms
+
+        def lower(self, ctx):
+            del ctx
+            return KernelProgram((Stage("work", latency=self.ms),))
+
+    for overlap in (False, True):
+        ex = env.execution(recipes=RecipeBook({"v": _ConstRecipe(1.0)}))
+        step_a = env.submit_graph((mk_op("a", "v"),), execution=ex, recipes=RecipeBook({"v": _ConstRecipe(10.0)}))[0]
+        if not overlap:
+            ex.engine.advance(until=(step_a.completion,))
+        step_b = env.submit_graph((mk_op("b", "v"),), execution=ex, input_ready_ms=50.0)[0]
+        ex.engine.advance(until=(step_a.completion, step_b.completion), first=False)
+        assert (step_a.device_complete.time, step_b.device_complete.time) == (pytest.approx(10.0), pytest.approx(51.0))
+

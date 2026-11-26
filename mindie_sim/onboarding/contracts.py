@@ -510,6 +510,7 @@ class OperatorCliffParameters:
     context_max: int = CONTEXT_MAX_TOKENS
     tiling_axes: TilingAxes | None = None
     vector_core_count: int | None = None
+    local_kv_heads: int = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -625,6 +626,21 @@ def _axis_core_unit(family: str, c_axis: str, axes: TilingAxes) -> Literal["aic"
     return "aiv" if ((family == "sku_suite" and c_axis == "tokens") or family in _AIV_OPERATOR_FAMILIES) else "aic"
 
 
+def _align_wave_value(prod: int, direction: int, axis: str, axes: TilingAxes, arch_preset: str) -> int | None:
+    val = prod + direction
+    max_vals = [r.max_value for r in axes.abi_divisibility if r.applies_to(arch_preset) and r.axis == axis and r.max_value is not None]
+    cap = min(max_vals) if max_vals else None
+    while val >= 1:
+        if cap is not None and direction > 0 and val > cap:
+            return None
+        divs = [r.divisor for r in axes.abi_divisibility if r.applies_to(arch_preset) and r.axis == axis and r.divisor > 1 and val > r.above_threshold]
+        step = math.lcm(*divs) if divs else 1
+        if val % step == 0:
+            return val
+        val = (val // step) * step if direction < 0 else ((val + step - 1) // step) * step
+    return None
+
+
 def _next_admissible_divisible(axis: str, value: int, axes: TilingAxes, arch_preset: str) -> int | None:
     divs = [r.divisor for r in axes.abi_divisibility if r.applies_to(arch_preset) and r.axis == axis and r.divisor > 1 and value > r.above_threshold]
     if not divs:
@@ -639,7 +655,12 @@ def synthesize_operator_cliff_plan(
     arch_preset: str = "", profile_override: Mapping[str, Any] | None = None,
 ) -> CliffBenchPlan:
     resolved_arch = _resolve_plan_arch_preset(sku, arch_preset, profile_override)
+    kv_heads = params.local_kv_heads
+    if type(kv_heads) is not int or kv_heads < 1:
+        raise ModelingError(f"cliff_plan_local_kv_heads_invalid:{kv_heads}")
     axes = params.tiling_axes or family_default_tiling_axes(params.family, tile_dim=int(params.tile_dim), arch_preset=resolved_arch, topk_threshold=params.topk_threshold)
+    if kv_heads > 1:
+        axes = replace(axes, abi_divisibility=(*axes.abi_divisibility, AbiDivisibilityRule("batch_x_kv_heads", 0, kv_heads)))
     clean_camp = sanitize_public_campaign_id(campaign_id, "camp-onboard")
     train_root = f"{clean_camp}-{sha256_bytes(f'train:{sku}:{params.operator_id}:{clean_camp}'.encode('utf-8'))[:SHORT_DIGEST_LEN]}"
     held_root = f"{clean_camp}-{sha256_bytes(f'heldout:{sku}:{params.operator_id}:{clean_camp}'.encode('utf-8'))[:SHORT_DIGEST_LEN]}"
@@ -687,9 +708,10 @@ def synthesize_operator_cliff_plan(
         for c_axis in axes.core_product_axes:
             unit = _axis_core_unit(params.family, c_axis, axes)
             prod = (aiv_cores if unit == "aiv" else aic_cores) * td
-            for delta, suffix in ((-1, "minus1"), (1, "plus1")):
-                if prod + delta >= 1:
-                    _add(f"cores_wave_{c_axis}_{td}_{suffix}_{prod + delta}", c_axis, prod + delta, "core_wave_boundary", f"Core wave ({unit.upper()}) {prod}{delta:+d}")
+            for direction, suffix in ((-1, "minus1"), (1, "plus1")):
+                if (val := _align_wave_value(prod, direction, c_axis, axes, resolved_arch)) is not None:
+                    b_wave = (val // kv_heads) if (c_axis == "batch_x_kv_heads" and kv_heads > 1 and val % kv_heads == 0) else 1
+                    _add(f"cores_wave_{c_axis}_{td}_{suffix}_{val}", c_axis, val, "core_wave_boundary", f"Core wave ({unit.upper()}) {prod}{val - prod:+d}", b=b_wave)
     for p_axis, thr in axes.phase_thresholds:
         for delta, suffix in ((-1, "minus1"), (1, "plus1")):
             if (v := thr + delta) >= 1:
@@ -702,19 +724,8 @@ def synthesize_operator_cliff_plan(
             over, is_tk = rule.max_value + 1, rule.axis == "topk"
             _add(f"{rule.axis}_over_max_{over}", "context_len" if is_tk else rule.axis, max(over, CONTEXT_MIN_TOKENS) if is_tk else over, "abi_max_boundary", f"ABI max+1 ({over})", tk=over if is_tk else None)
 
-    draft = {
-        "target_id": params.operator_id, "sku": sku, "family": params.family, "arch_preset": resolved_arch,
-        "train_lineage_root": train_root, "heldout_lineage_root": held_root,
-        "train_points": [p.to_dict() for p in train_pts],
-        "heldout_points": [p.to_dict() for p in held_pts],
-        "abi_rejection_points": [p.to_dict() for p in abi_rejs],
-    }
-    return CliffBenchPlan(
-        target_id=params.operator_id, sku=sku, train_lineage_root=train_root, heldout_lineage_root=held_root,
-        train_points=tuple(train_pts), heldout_points=tuple(held_pts), abi_rejection_points=tuple(abi_rejs),
-        plan_sha256=sha256_bytes(canonical_json_bytes(draft)), arch_preset=resolved_arch,
-        tiling_axes=axes, family=params.family, campaign_id=clean_camp,
-    )
+    draft = {"target_id": params.operator_id, "sku": sku, "family": params.family, "arch_preset": resolved_arch, "train_lineage_root": train_root, "heldout_lineage_root": held_root, "train_points": [p.to_dict() for p in train_pts], "heldout_points": [p.to_dict() for p in held_pts], "abi_rejection_points": [p.to_dict() for p in abi_rejs]}
+    return CliffBenchPlan(target_id=params.operator_id, sku=sku, train_lineage_root=train_root, heldout_lineage_root=held_root, train_points=tuple(train_pts), heldout_points=tuple(held_pts), plan_sha256=sha256_bytes(canonical_json_bytes(draft)), abi_rejection_points=tuple(abi_rejs), arch_preset=resolved_arch, tiling_axes=axes, family=params.family, campaign_id=clean_camp)
 
 
 def synthesize_sku_512_400k_plan(
@@ -739,20 +750,16 @@ def evaluate_abi_rejections(
     by_id = {str(r.get("point_id") or r.get("case_id") or ""): r for r in (observed_rejections or ()) if isinstance(r, Mapping)}
     missing, mismatches, verified = [], [], 0
     for pt in planned_rejections:
-        pid = str(pt.get("point_id") or "")
-        exp = str(pt.get("abi_expected_error") or "").strip()
+        pid, exp = str(pt.get("point_id") or ""), str(pt.get("abi_expected_error") or "").strip()
         obs = by_id.get(pid)
         if obs is None:
             missing.append(pid)
-            continue
-        if not bool(obs.get("rejected")):
+        elif not bool(obs.get("rejected")):
             mismatches.append(f"{pid}:not_rejected")
-            continue
-        err = str(obs.get("abi_error") or "").strip()
-        if exp and exp not in err:
+        elif exp and exp not in (err := str(obs.get("abi_error") or "").strip()):
             mismatches.append(f"{pid}:expected={exp}:got={err}")
-            continue
-        verified += 1
+        else:
+            verified += 1
     return {"ok": not missing and not mismatches, "required": len(planned_rejections), "verified": verified, "missing": missing, "mismatches": mismatches}
 
 
@@ -1052,11 +1059,7 @@ def _parse_certificate_witness(row: Mapping[str, Any]) -> tuple[ResourceChoicePr
         return None
     if not (isinstance(p_raw, Mapping) and isinstance(d_raw, Mapping) and isinstance(c_raw, Mapping)):
         raise ModelingError("lean_certificate_witness_incomplete")
-    prog = ResourceChoiceProgram(
-        _strict_int(p_raw["num_resources"], "num_resources"),
-        tuple(_strict_int(v, "global_work") for v in p_raw["global_work"]),
-        tuple(tuple(tuple(_strict_int(x, "site_modes") for x in m) for m in s) for s in p_raw.get("site_modes", ())),
-    )
+    prog = ResourceChoiceProgram(_strict_int(p_raw["num_resources"], "num_resources"), tuple(_strict_int(v, "global_work") for v in p_raw["global_work"]), tuple(tuple(tuple(_strict_int(x, "site_modes") for x in m) for m in s) for s in p_raw.get("site_modes", ())))
     quanta = tuple(_strict_int(v, "node_quantum_ns") for v in d_raw["node_quantum_ns"])
     edges = tuple(DagEdge(_strict_int(e["src"], "src"), _strict_int(e["dst"], "dst"), _strict_int(e["wire_ns"], "wire_ns")) for e in d_raw.get("edges", ()))
     f_raw = c_raw["farkas"]
@@ -1064,8 +1067,7 @@ def _parse_certificate_witness(row: Mapping[str, Any]) -> tuple[ResourceChoicePr
     sink = _strict_int(c_raw["sink_node_id"], "sink_node_id")
     if sink < 0 or sink >= len(quanta):
         raise ModelingError(f"lean_certificate_sink_out_of_range:{sink}")
-    cert = OptimalityCertificate(farkas, tuple(_strict_int(v, "path_edges") for v in c_raw.get("path_edges", ())), sink, _strict_int(c_raw["l_star_lean_ns"], "l_star_lean_ns"))
-    return prog, EventDagSpec(quanta, edges), cert
+    return prog, EventDagSpec(quanta, edges), OptimalityCertificate(farkas, tuple(_strict_int(v, "path_edges") for v in c_raw.get("path_edges", ())), sink, _strict_int(c_raw["l_star_lean_ns"], "l_star_lean_ns"))
 
 
 def check_lean_non_inversion(
@@ -1281,23 +1283,9 @@ def finalize_stage4_certification(
     plan_sku = str(plan_obj.get("sku") or "").strip() if plan_obj is not None else ""
     foreign_rows = [str(r.get("case_id") or "") for r in residuals if str(r.get("sku") or "").strip() != sku]
     sku_ok = (score_sku == sku) and (not plan_sku or plan_sku == sku) and not foreign_rows
-    sku_detail = (
-        f"sku={sku}"
-        if sku_ok
-        else f"target_sku_mismatch:expected={sku}:score_sku={score_sku or 'missing'}:foreign_rows={len(foreign_rows)}"
-    )
-    heldout = [
-        r for r in residuals
-        if r.get("split") == "heldout" and str(r.get("status") or "ok") == "ok" and str(r.get("sku") or "").strip() == sku
-    ]
-    failing = [
-        r for r in heldout
-        if exceeds_physical_tolerance(
-            int(r.get("predicted_ns") or 0), int(r.get("measured_ns") or 0),
-            threshold_pct=cap_pct, atol_ns=eff_atol,
-            allow_signed=(str(r.get("boundary_kind") or "") == "paired_rung_delta"),
-        )
-    ]
+    sku_detail = f"sku={sku}" if sku_ok else f"target_sku_mismatch:expected={sku}:score_sku={score_sku or 'missing'}:foreign_rows={len(foreign_rows)}"
+    heldout = [r for r in residuals if r.get("split") == "heldout" and str(r.get("status") or "ok") == "ok" and str(r.get("sku") or "").strip() == sku]
+    failing = [r for r in heldout if exceeds_physical_tolerance(int(r.get("predicted_ns") or 0), int(r.get("measured_ns") or 0), threshold_pct=cap_pct, atol_ns=eff_atol, allow_signed=(str(r.get("boundary_kind") or "") == "paired_rung_delta"))]
     ape_ok = sku_ok and bool(score_doc.get("ok")) and bool(heldout) and not failing
     gates: list[GateCheckOutcome] = [
         *pre_gates,
@@ -1315,16 +1303,13 @@ def finalize_stage4_certification(
     lean_ok, lean_checked, lean_viols = check_lean_non_inversion(lean_rows, expected_case_timings=exp_timings)
     gates.append(GateCheckOutcome("lean_optimality_non_inversion", lean_ok, "pass" if lean_ok else "fail", "0 inversions" if lean_ok else "; ".join(lean_viols[:_PREVIEW_LINES]), (("checked", len(lean_checked)), ("violations", len(lean_viols)))))
     if run_repo_gates:
-        gates.append(run_arch_governance_gate(repo_root=repo_root, strict=True))
-        gates.append(run_test_orthogonality_gate(repo_root=repo_root, strict=(orthogonality_base is None), base=orthogonality_base))
+        gates.extend((run_arch_governance_gate(repo_root=repo_root, strict=True), run_test_orthogonality_gate(repo_root=repo_root, strict=(orthogonality_base is None), base=orthogonality_base)))
     diagnosis = run_tail_cluster_diagnosis(residuals, repo_root=repo_root, threshold_pct=cap_pct, output_path=diagnosis_out) if failing else None
-    all_ok = all(g.passed for g in gates)
-    acq_mode = str(score_doc.get("acquisition_mode") or "offline_reverify")
+    all_ok, acq_mode = all(g.passed for g in gates), str(score_doc.get("acquisition_mode") or "offline_reverify")
     status = ("silicon_certified" if acq_mode == "live_silicon" else "offline_reverify") if all_ok else "failed"
     rec_u, rec_w = collect_receipt_warnings(score_doc, *extra_warning_records)
     receipt = seal_onboarding_receipt(
-        schema=schema, target_kind=target_kind, target_id=target_id, sku=sku, status=status, ok=all_ok,
-        gates=gates, artifacts=eff_artifacts,
+        schema=schema, target_kind=target_kind, target_id=target_id, sku=sku, status=status, ok=all_ok, gates=gates, artifacts=eff_artifacts,
         summary={"heldout_count": len(heldout), "failing_count": len(failing), "threshold_pct": cap_pct, "atol_ns": eff_atol, "acquisition_mode": acq_mode},
         receipt_unconfirmed=rec_u, receipt_warning=rec_w,
     ).to_dict()

@@ -46,13 +46,8 @@ from typing import Any, Literal
 from mindie_sim.backends import ascend
 from mindie_sim.observations.multilevel import SHA256_HEX_LENGTH
 from mindie_sim.optimization.dual_bound import (
-    NS_PER_SECOND,
-    DagEdge,
-    EventDagSpec,
-    ResourceChoiceProgram,
-    certify_lower_bound,
-    check_optimality_certificate,
-    inward_floor_ns,
+    NS_PER_SECOND, DagEdge, EventDagSpec, ResourceChoiceProgram,
+    certify_lower_bound, check_optimality_certificate, inward_floor_ns,
 )
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan
 from mindie_sim.prediction.operators.contracts import OperatorPlanningContext
@@ -311,9 +306,27 @@ class _ScopedStage:
     repeat: int = 1
 
 
-def _collect_stages(
-    obj: Any, depth: int = 0, scope: tuple[str | int, ...] = (), repeat: int = 1,
-) -> list[_ScopedStage]:
+def _collect_phase_stages(ph: Any, depth: int, scope: tuple[str | int, ...], repeat: int, offset: int = 0) -> tuple[list[_ScopedStage], int]:
+    cnt = int(getattr(ph, "count", 1) or 0)
+    if cnt <= 0:
+        return [], 0
+    found: list[_ScopedStage] = []
+    res = getattr(ph, "residue_stages", None)
+    if isinstance(res, (tuple, list)) and res:
+        period = len(res)
+        q, rem = divmod(cnt, period)
+        for r, grp in enumerate(res):
+            r_cnt = q + (1 if ((r - offset) % period) < rem else 0)
+            if r_cnt > 0:
+                for c in (grp if isinstance(grp, (tuple, list)) else (grp,)):
+                    found.extend(_collect_stages(c, depth + 1, (*scope, "residue", r), repeat * r_cnt))
+    elif isinstance(getattr(ph, "stages", None), (tuple, list)):
+        for c in ph.stages:
+            found.extend(_collect_stages(c, depth + 1, (*scope, "phase"), repeat * cnt))
+    return found, cnt
+
+
+def _collect_stages(obj: Any, depth: int = 0, scope: tuple[str | int, ...] = (), repeat: int = 1) -> list[_ScopedStage]:
     if obj is None or depth > _MAX_STAGE_DEPTH or repeat <= 0 or isinstance(obj, (tuple, list, dict, str, bytes, int, float, bool)):
         return []
     found: list[_ScopedStage] = []
@@ -322,16 +335,30 @@ def _collect_stages(
         if getattr(obj, "program", None) is not None:
             found.extend(_collect_stages(obj.program, depth + 1, (*scope, "sub"), repeat))
         return found
-    if hasattr(obj, "stages") and hasattr(obj, "count"):
-        cnt = int(getattr(obj, "count", 1) or 0)
-        if cnt > 0 and isinstance(obj.stages, (tuple, list)):
-            for c in obj.stages:
-                found.extend(_collect_stages(c, depth + 1, (*scope, "phase"), repeat * cnt))
-        res = getattr(obj, "residue_stages", None)
-        if isinstance(res, (tuple, list)):
-            for c in res:
-                found.extend(_collect_stages(c, depth + 1, (*scope, "residue"), repeat))
+    if hasattr(obj, "phases") and hasattr(obj, "setup") and hasattr(obj, "drain"):
+        for attr in ("setup", "drain"):
+            for c in (getattr(obj, attr, ()) or ()):
+                found.extend(_collect_stages(c, depth + 1, (*scope, attr), repeat))
+        idx_panels = getattr(obj, "indexed_panels", None)
+        if idx_panels is not None and callable(getattr(obj, "index_of", None)):
+            counts: dict[tuple[int, int], int] = {}
+            for i in range(int(idx_panels)):
+                pid = int(obj.index_of(i)[0])
+                res = getattr(obj.phases[pid], "residue_stages", ()) or ()
+                counts[(pid, i % len(res) if res else -1)] = counts.get((pid, i % len(res) if res else -1), 0) + 1
+            for (pid, r), r_cnt in counts.items():
+                grp = obj.phases[pid].residue_stages[r] if r >= 0 else obj.phases[pid].stages
+                for c in grp:
+                    found.extend(_collect_stages(c, depth + 1, (*scope, "phases", pid, "residue" if r >= 0 else "phase", r), repeat * r_cnt))
+            return found
+        offset = 0
+        for pidx, ph in enumerate(obj.phases or ()):
+            p_found, cnt = _collect_phase_stages(ph, depth + 1, (*scope, "phases", pidx), repeat, offset)
+            found.extend(p_found)
+            offset += cnt
         return found
+    if hasattr(obj, "stages") and hasattr(obj, "count"):
+        return _collect_phase_stages(obj, depth, scope, repeat)[0]
     for attr in _SHARED_STAGE_LIST_ATTRS:
         ch = getattr(obj, attr, None)
         if isinstance(ch, (tuple, list)):
@@ -620,11 +647,11 @@ def generate_operator_cliff_plan(
     *, operator_id: str, family: str, sku: str, tile_dim: int, core_count: int, l2_bytes: int,
     bytes_per_token: int = 0, topk_threshold: int | None = None,
     context_min: int = CONTEXT_MIN_TOKENS, context_max: int = CONTEXT_MAX_TOKENS,
-    campaign_id: str = "onboard-op", plan_out: str | Path | None = None,
+    campaign_id: str = "onboard-op", plan_out: str | Path | None = None, local_kv_heads: int = 1,
 ) -> dict[str, Any]:
     """Stage 2: Synthesize disjoint Anchor + Off-Grid Cliff + ABI-rejection plan for an operator."""
     plan = synthesize_operator_cliff_plan(
-        OperatorCliffParameters(operator_id, family, int(tile_dim), int(core_count), int(l2_bytes), int(bytes_per_token), topk_threshold, int(context_min), int(context_max)),
+        OperatorCliffParameters(operator_id, family, int(tile_dim), int(core_count), int(l2_bytes), int(bytes_per_token), topk_threshold, int(context_min), int(context_max), local_kv_heads=int(local_kv_heads)),
         sku=sku, campaign_id=campaign_id,
     ).to_dict()
     if plan_out is not None:

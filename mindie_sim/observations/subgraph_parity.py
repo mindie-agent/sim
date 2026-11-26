@@ -73,14 +73,24 @@ _GDN_PREPARE_ARITY = 7
 _RANK_3D = 3
 _RANK_4D = 4
 _NZ_R0 = 16
-_NZ_C0_1B = 32
+_NZ_C0_4B = 8
 _NZ_C0_2B = 16
+_NZ_C0_1B = 32
+_NZ_C0_4BIT = 64
+_NZ_C0_LABEL_RE = re.compile(r"C0_(8|16|32|64)(?!\d)")
 _GROUPED_MATMUL_FIXED_SLOTS = 8
 _GROUPED_MATMUL_BIAS_SLOT = 2
 _GROUPED_MATMUL_WEIGHT_SCALE_SLOT = 3
 _GROUPED_MATMUL_GROUP_LIST_SLOT = 7
+_HOST_CANN_API_PREFIXES: tuple[str, ...] = ("aclnn", "aclop", "hccl", "Hccl")
+_FOUR_BYTE_DTYPES: frozenset[str] = frozenset({
+    "fp32", "float32", "float", "dt_float", "int32", "uint32", "s32", "u32", "dt_int32", "dt_uint32",
+})
 _ONE_BYTE_DTYPES: frozenset[str] = frozenset({
     "int8", "uint8", "s8", "u8", "fp8", "fp8_e4m3", "fp8_e4m3fn", "fp8_e5m2", "hif8", "hifloat8", "mxfp8",
+})
+_FOUR_BIT_DTYPES: frozenset[str] = frozenset({
+    "int4", "uint4", "s4", "u4", "fp4", "fp4_e2m1", "mxfp4",
 })
 _GEMM_OP_FAMILIES: frozenset[str] = frozenset({
     "qkv_projection",
@@ -681,11 +691,14 @@ class _CausalFlowState:
         rec, resolved_fid, invalid_flow = self._resolve_flow(dev)
         if rec is not None:
             if scope and rec.vllm_scope and scope != rec.vllm_scope:
-                return "ambiguous_proximity", resolved_fid, cann_api or rec.cann_api, cpu_op or rec.cpu_op, scope
+                return "ambiguous_proximity", resolved_fid, rec.cann_api or cann_api, cpu_op or rec.cpu_op, scope
+            if cann_api and rec.cann_api and not _cann_api_compatible(cann_api, rec.cann_api):
+                return "ambiguous_proximity", resolved_fid, rec.cann_api, cpu_op or rec.cpu_op, scope or rec.vllm_scope
+            eff_api = rec.cann_api if _is_host_api_symbol(rec.cann_api) else (cann_api or rec.cann_api)
             return (
                 "exact_flow_id",
                 resolved_fid,
-                cann_api or rec.cann_api,
+                eff_api,
                 cpu_op or rec.cpu_op,
                 scope or rec.vllm_scope,
             )
@@ -693,10 +706,13 @@ class _CausalFlowState:
             gkey = (dev.stream_id, dev.gid)
             g_rec = self.graph_nodes.get(gkey)
             if g_rec is not None:
+                if cann_api and g_rec.cann_api and not _cann_api_compatible(cann_api, g_rec.cann_api):
+                    return "ambiguous_proximity", "", g_rec.cann_api, cpu_op or g_rec.cpu_op, scope or g_rec.vllm_scope
+                eff_g_api = g_rec.cann_api if _is_host_api_symbol(g_rec.cann_api) else (cann_api or g_rec.cann_api)
                 return (
                     "aclgraph_node_table",
                     "",
-                    cann_api or g_rec.cann_api,
+                    eff_g_api,
                     cpu_op or g_rec.cpu_op,
                     scope or g_rec.vllm_scope,
                 )
@@ -990,6 +1006,22 @@ def _expected_expansion_for(
     return exp if exp else (pred.api_or_symbol,)
 
 
+def _host_api_stem(symbol: str) -> str:
+    return str(symbol or "").strip().rsplit("@", 1)[-1]
+
+
+def _is_host_api_symbol(symbol: str) -> bool:
+    return _host_api_stem(symbol).startswith(_HOST_CANN_API_PREFIXES)
+
+
+def _cann_api_compatible(expected_symbol: str, observed_cann_api: str) -> bool:
+    exp_stem = _host_api_stem(expected_symbol)
+    obs_stem = _host_api_stem(observed_cann_api)
+    if not exp_stem.startswith(_HOST_CANN_API_PREFIXES) or not obs_stem.startswith(_HOST_CANN_API_PREFIXES):
+        return True
+    return exp_stem == obs_stem
+
+
 def _stage_attrs_strict_ok(
     pred: PredictedKernelNode,
     node: ObservedKernelNode,
@@ -997,6 +1029,8 @@ def _stage_attrs_strict_ok(
     *,
     is_offline_summary: bool,
 ) -> bool:
+    if not is_offline_summary and not _cann_api_compatible(pred.api_or_symbol, node.cann_api):
+        return False
     if pred.stream_lane:
         if is_offline_summary:
             if node.stream_lane and node.stream_lane != pred.stream_lane:
@@ -1019,9 +1053,10 @@ def _candidate_preference_key(
     pred: PredictedKernelNode,
     item: tuple[int, ObservedKernelNode],
     exp_shape: str = "",
-) -> tuple[int, int, int, int]:
-    """Prefer exact ``vllm_scope``, normalized ``input_shapes``, and ``stream_lane`` before earliest pos."""
+) -> tuple[int, int, int, int, int]:
+    """Prefer matching CANN host API, ``vllm_scope``, normalized ``input_shapes``, and ``stream_lane`` before earliest pos."""
     pos, node = item
+    api_miss = 0 if _cann_api_compatible(pred.api_or_symbol, node.cann_api) else 1
     scope_miss = 0 if (pred.vllm_scope and node.vllm_scope and node.vllm_scope == pred.vllm_scope) else (
         1 if (pred.vllm_scope and node.vllm_scope) else 0
     )
@@ -1034,7 +1069,7 @@ def _candidate_preference_key(
         0 if (not pred.stream_lane or node.stream_lane == pred.stream_lane)
         else (1 if not node.stream_lane else 2)
     )
-    return (scope_miss, shape_miss, lane_miss, pos)
+    return (api_miss, scope_miss, shape_miss, lane_miss, pos)
 
 
 def _match_live_multi_from_anchor(
@@ -1357,6 +1392,24 @@ def _verify_matched_node_attributes(
                 detail=f"incomplete 1-to-many expansion for {pred.api_or_symbol}: missing {missing_parts}",
                 expected=",".join(expected_kernels),
                 observed=",".join(sorted(present)),
+            ))
+
+    if not is_offline_summary and _is_host_api_symbol(pred.api_or_symbol):
+        mismatched_apis = sorted({
+            _host_api_stem(n.cann_api) for _, n in hits
+            if not _cann_api_compatible(pred.api_or_symbol, n.cann_api)
+        })
+        if mismatched_apis:
+            exp_diffs.append(ParityDiff(
+                code="EXPANSION_MISMATCH",
+                rank_id=rank_id,
+                node_id=pred.node_id,
+                detail=(
+                    f"cann_api mismatch for {pred.api_or_symbol}: "
+                    f"expected {_host_api_stem(pred.api_or_symbol)}, got {mismatched_apis}"
+                ),
+                expected=_host_api_stem(pred.api_or_symbol),
+                observed=",".join(mismatched_apis),
             ))
 
     if pred.stream_lane:
@@ -2968,10 +3021,16 @@ def _gemm_operand_shapes(op: OpSpec, meta: Mapping[str, Any]) -> str:
             or ""
         ).strip().lower()
         if w_layout.startswith("FRACTAL_NZ"):
-            if "C0_16" in w_layout:
-                c0 = _NZ_C0_2B
-            elif "C0_32" in w_layout or w_dtype in _ONE_BYTE_DTYPES:
+            c0_match = _NZ_C0_LABEL_RE.search(w_layout)
+            w_norm = w_dtype.removeprefix("dt_").removeprefix("torch.")
+            if c0_match is not None:
+                c0 = int(c0_match.group(1))
+            elif w_norm in _FOUR_BYTE_DTYPES or w_norm in {"float", "float32", "uint32"}:
+                c0 = _NZ_C0_4B
+            elif w_norm in _ONE_BYTE_DTYPES or w_norm in {"uint8", "float8_e4m3fn", "float8_e5m2", "hifloat8"}:
                 c0 = _NZ_C0_1B
+            elif w_norm in _FOUR_BIT_DTYPES or w_norm in {"uint4", "float4_e2m1"}:
+                c0 = _NZ_C0_4BIT
             else:
                 c0 = _NZ_C0_2B
             if raw_tb is True:
@@ -3181,18 +3240,22 @@ def _collective_group_and_ranks(
     rank_id: int,
 ) -> tuple[str, tuple[int, ...]]:
     axis = str(meta.get("group_axis") or "").strip()
-    group_label = axis or str(op.link_scope or "").strip()
     raw_ranks = meta.get("comm_ranks")
     if isinstance(raw_ranks, Sequence) and not isinstance(raw_ranks, (str, bytes)):
         parsed = tuple(int(r) for r in raw_ranks)
         if parsed:
+            group_label = axis or str(op.link_scope or "").strip()
             return group_label, parsed
     if topo is not None and axis and axis in _VALID_TOPO_AXES:
         groups = topo.groups(axis, replica, int(op.stage), metadata=meta)
         for grp in groups:
             if rank_id in grp:
                 return axis, tuple(int(r) for r in grp)
-    return group_label, ()
+    if axis and axis != "local":
+        return axis, ()
+    if float(getattr(op, "link_bytes", 0.0) or 0.0) > 0.0:
+        return str(op.link_scope or "").strip(), ()
+    return "", ()
 
 
 def build_predicted_nodes_from_prepared_step(

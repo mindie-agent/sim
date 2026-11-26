@@ -606,3 +606,39 @@ def test_lazy_package_imports_and_reexport_identity():
     assert all("communication" not in (n.module or "") and "a5_comm" not in (n.module or "")
                for n in cal_tree.body if isinstance(n, ast.ImportFrom))
     assert all(n in comm.__all__ and getattr(obs_cal, n) is getattr(comm, n) for n in obs_cal._A5_REEXPORTS)
+
+
+def test_communication_ingest_preserves_legs_boundaries_scopes_pairs_and_wire_dtypes():
+    """Verify MC2 grouped_matmul legs, raw-point boundary isolation, explicit placement/pair defaults, and streaming comm_dtype."""
+    import io
+    from mindie_sim.observations.communication.ingest import _iter_json_events, _read_stream_value
+    from mindie_sim.observations.communication.schema import _fallback_measurement
+
+    legs = dict(dispatch=1.0, grouped_matmul=8.0, swiglu=1.0, combine=1.0)
+    chain_row = dict(condition="bf16-ep2", dtype="bf16", ep=2, experts=2, global_tokens=8, status="ok", chain_ms=11.0, legs_ms=legs)
+    chain_res, = comm.evaluate_a5_mc2_chains(dict(label="chain", hardware_key="a5", chains=[chain_row]))["chains"]
+    assert chain_res["sum_leg_p50_ms"] == pytest.approx(11.0) and chain_res["overlap_ratio"] == pytest.approx(1.0)
+
+    whole = _fallback_measurement("all_gather", None)
+    child = dict(whole, kind="native_target_call", phase="aicpu_child", resource="aicpu_child", work_coordinate="per_rank_input_bytes", source_kind="native_ai_cpu_child", service_semantics="aicpu_child_collective_phase", complete_collective_call=False, explicit=True)
+    for order in ([(whole, 0.100), (child, 0.010)], [(child, 0.010), (whole, 0.100)]):
+        pts = [dict(collective="all_gather", ep=2, link_bytes=n, ms=t * f, measurement=m_desc) for n, f in ((1024, 0.5), (4096, 1.0)) for m_desc, t in order]
+        with pytest.raises(ValueError, match="a5_measurement_boundary_mixed_sources"):
+            comm.fit_a5_service_curves(dict(label="mixed", hardware_key="a5", observed_expansion_mode="aicpu", raw_points=pts))
+
+    scope_docs = [dict(label=sc, world_size=2, placement_scope=sc, mc2_comm_series=[("mc2_dispatch", "dispatch", "int8", "bf16", 2, [(1024, ms / 2), (4096, ms)])]) for sc, ms in (("intra_node_ub", 0.010), ("cross_node_urma", 0.100))]
+    scope_fits = {(c.identity["placement_scope"], c.identity["transport"]): round(c.estimate(4096).duration_ms, 3) for c in comm.fit_a5_service_curves(scope_docs).curves.values()}
+    assert scope_fits == {("intra_node_ub", "ub_mesh"): 0.01, ("cross_node_urma", "urma"): 0.1}
+
+    p2p_docs = [dict(label=pair, hardware_key="a5", world_size=2, placement_scope="intra_node_ub", p2p_pair=pair, conditions=[dict(collective="p2p", payload_bytes=n, per_op_ms=t) for n, t in ((1024, ms / 2), (4096, ms))]) for pair, ms in (("0->1", 0.010), ("1->0", 0.100))]
+    p2p_fits = {c.identity["p2p_pair"]: round(c.estimate(4096).duration_ms, 3) for c in comm.fit_a5_service_curves(p2p_docs).curves.values()}
+    assert p2p_fits == {"0->1": 0.01, "1->0": 0.1}
+    p2p_series_docs = [dict(label=pair, hardware_key="a5", world_size=2, placement_scope="intra_node_ub", p2p_pair=pair, series=[("p2p", 2, "intra_node_ub", None, [(1024, ms / 2), (4096, ms)])]) for pair, ms in (("0->1", 0.010), ("1->0", 0.100))]
+    assert {c.identity["p2p_pair"]: round(c.estimate(4096).duration_ms, 3) for c in comm.fit_a5_service_curves(p2p_series_docs).curves.values()} == {"0->1": 0.01, "1->0": 0.1}
+
+    wire_rows = [dict(collective="mc2_combine", payload_bytes=n, samples=[dict(repeat_index=i, comm_dtype=dt, per_op_ms=t * factor) for i, (dt, t) in enumerate((("int8", 0.010), ("bf16", 0.100)))]) for n, factor in ((1024, 0.5), (4096, 1.0))]
+    wire_doc = dict(label="wire", hardware_key="a5", world_size=2, dtype="bf16", conditions=wire_rows)
+    streamed_doc = _read_stream_value(_iter_json_events(io.BytesIO(json.dumps(wire_doc).encode("utf-8"))))
+    for src in (wire_doc, streamed_doc):
+        got = sorted((c.identity["dtype"], round(c.estimate(4096).duration_ms, 3)) for c in comm.fit_a5_service_curves(src).curves.values())
+        assert got == [("bf16", 0.1), ("int8", 0.01)]

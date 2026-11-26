@@ -40,6 +40,7 @@ import tempfile
 from typing import Any
 
 from mindie_sim.backends import ascend_profiles
+from mindie_sim.backends.ascend import apply_observed_aicore_clock
 from mindie_sim.observations.multilevel import FrozenFitManifest
 from mindie_sim.primitives import sealer as _canonical_sealer
 from mindie_sim.primitives.loader import default_primitives_dir
@@ -216,6 +217,16 @@ def _ssh_exec(endpoint_alias: str, remote_cmd: str, *, timeout_s: int, endpoints
         raise ModelingError(f"onboarding_ssh_failed:{exc}") from exc
 
 
+def _profile_reference_clock_mhz(entry: Mapping[str, Any]) -> float | None:
+    dev = entry.get("device") if isinstance(entry.get("device"), Mapping) else {}
+    raw = dev.get("aicore_freq_mhz")
+    if raw is None:
+        src = entry.get("source") if isinstance(entry.get("source"), Mapping) else {}
+        decl = src.get("declaration") if isinstance(src.get("declaration"), Mapping) else {}
+        raw = decl.get("configured_clock_mhz")
+    return float(raw) if raw is not None else None
+
+
 def _validate_profile_against_probe(
     probe: SocProbeRecord, entry: Mapping[str, Any], *, observed_fields: frozenset[str] | None = None,
 ) -> tuple[list[SiliconProfileConflict], dict[str, Any]]:
@@ -238,6 +249,9 @@ def _validate_profile_against_probe(
     if entry.get("ranks_per_node") is not None:
         _cmp("ranks_per_node", probe.ranks_per_node, int(entry["ranks_per_node"]))
     _cmp("hbm_bytes", probe.hbm_bytes, int(die.memory_bytes))
+    decl_mhz = _profile_reference_clock_mhz(entry)
+    if decl_mhz is not None and probe.aicore_freq_mhz > 0:
+        _cmp("aicore_freq_mhz", int(probe.aicore_freq_mhz), int(round(decl_mhz)))
     for fname, val, bk in (("l2_bytes", probe.l2_bytes, "l2"), ("ub_bytes", probe.ub_bytes, "ub"), ("l1_bytes", probe.l1_bytes, "l1"), ("l0a_bytes", probe.l0a_bytes, "l0a"), ("l0b_bytes", probe.l0b_bytes, "l0b"), ("l0c_bytes", probe.l0c_bytes, "l0c")):
         _cmp(fname, val, int(bufs.get(bk, 0)))
     if int(dict(die.buffer_units).get("l2", 1)) != 1:
@@ -250,13 +264,17 @@ def _validate_profile_against_probe(
             decl_bw = float(chans[cname].get("uni_peak_bw_gbps") or 0.0)
             if decl_bw > 0.0 and not (_FABRIC_BW_MIN_RATIO * decl_bw <= bw <= _FABRIC_BW_MAX_RATIO * decl_bw):
                 conflicts.append(SiliconProfileConflict(f"fabric_channels.{cname}", bw, decl_bw, f"silicon_profile_conflict:fabric_bw_drift:{cname}"))
-    return conflicts, {"arch_id": str(dp.arch_id), "aic_count": int(dp.aic_count), "aiv_count": int(dp.aiv_count), "l2_bytes": int(bufs.get("l2", 0)), "hbm_bytes": int(die.memory_bytes), "fabric_channels": sorted(chans)}
+    summary = {"arch_id": str(dp.arch_id), "aic_count": int(dp.aic_count), "aiv_count": int(dp.aiv_count), "l2_bytes": int(bufs.get("l2", 0)), "hbm_bytes": int(die.memory_bytes), "fabric_channels": sorted(chans)}
+    if decl_mhz is not None:
+        summary["aicore_freq_mhz"] = decl_mhz
+    return conflicts, summary
 
 
 def _scaffold_sku_profile(probe: SocProbeRecord, all_profiles: Mapping[str, Any], *, base_template_sku: str) -> dict[str, Any]:
     if base_template_sku not in all_profiles:
         raise ModelingError(f"silicon_template_sku_unknown:{base_template_sku}")
-    base = deepcopy(all_profiles[base_template_sku])
+    tmpl_prof = all_profiles[base_template_sku]
+    base = deepcopy(tmpl_prof)
     dev = base["device"]
     base_preset = str(dev.get("compute_arch", {}).get("preset") or "")
     if base_preset != probe.arch_preset:
@@ -265,6 +283,16 @@ def _scaffold_sku_profile(probe: SocProbeRecord, all_profiles: Mapping[str, Any]
     base_aiv = int(dev["resource_units"].get("vector", base_aic * 2))
     dev["compute_units"], dev["resource_units"]["vector"] = probe.aic_count, probe.aiv_count
     scale_explicit_placement_device(dev, {"compute_units": probe.aic_count, "resource_units": {"vector": probe.aiv_count}}, probe.aic_count, base_aic, base_aiv)
+    tmpl_decl = dict((tmpl_prof.get("source") or {}).get("declaration") or {})
+    if probe.aicore_freq_mhz > 0:
+        ref_mhz = _profile_reference_clock_mhz(tmpl_prof)
+        if ref_mhz is not None:
+            dev = apply_observed_aicore_clock({**dev, "observed_aicore_freq_mhz": float(probe.aicore_freq_mhz)}, tmpl_prof, reference_mhz=ref_mhz)
+            dev.pop("observed_aicore_freq_mhz", None)
+            base["device"] = dev
+        else:
+            dev["aicore_freq_mhz"] = float(probe.aicore_freq_mhz)
+        tmpl_decl["configured_clock_mhz"] = float(probe.aicore_freq_mhz)
     dev["memory_bytes"] = probe.hbm_bytes
     for pool, val in (("l2", probe.l2_bytes), ("ub", probe.ub_bytes), ("l1", probe.l1_bytes), ("l0a", probe.l0a_bytes), ("l0b", probe.l0b_bytes), ("l0c", probe.l0c_bytes)):
         if val > 0:
@@ -281,7 +309,10 @@ def _scaffold_sku_profile(probe: SocProbeRecord, all_profiles: Mapping[str, Any]
     for cname, bw in probe.fabric_channels:
         if cname in base.get("transfer_channels", {}) and bw > 0.0:
             base["transfer_channels"][cname]["uni_peak_bw_gbps"] = float(bw)
-    base["source"] = {"calibration": {"calibrated": False, "rate_provenance": "declared_nominal", "source_sku": probe.soc_name, "anchor_sku": base_template_sku, "capture_uri": probe.capture_uri}}
+    src: dict[str, Any] = {"calibration": {"calibrated": False, "rate_provenance": "declared_nominal", "source_sku": probe.soc_name, "anchor_sku": base_template_sku, "capture_uri": probe.capture_uri}}
+    if tmpl_decl:
+        src["declaration"] = tmpl_decl
+    base["source"] = src
     return base
 
 
@@ -571,49 +602,28 @@ def validate_512_400k(
     cap_pct, eff_atol = validate_strict_threshold_pct(threshold_pct), validate_strict_atol_ns(atol_ns)
     hw = materialize_sku_hardware(sku, profile_override=profile_override)
     die = hw.dies[0]
-    plan_doc = synthesize_sku_512_400k_plan(
-        sku=sku, core_count=int(die.compute_units), l2_bytes=int(dict(die.buffers).get("l2", 0)),
-        campaign_id=campaign_id, profile_override=profile_override,
-        vector_core_count=int(dict(die.resource_units).get("vector", 0)) or None,
-    ).to_dict()
+    plan_doc = synthesize_sku_512_400k_plan(sku=sku, core_count=int(die.compute_units), l2_bytes=int(dict(die.buffers).get("l2", 0)), campaign_id=campaign_id, profile_override=profile_override, vector_core_count=int(dict(die.resource_units).get("vector", 0)) or None).to_dict()
     if plan_out is not None:
         write_atomic_json(plan_out, plan_doc)
-    prim_tbl: PrimitiveTable | None = None
-    if primitives_json is not None:
-        prim_tbl = parse_primitive_table(read_bounded_json(primitives_json) if isinstance(primitives_json, (str, Path)) else primitives_json)
+    prim_tbl = parse_primitive_table(read_bounded_json(primitives_json) if isinstance(primitives_json, (str, Path)) else primitives_json) if primitives_json is not None else None
     ext_train: list[str] = [str(plan_doc["train_lineage_root"])]
     if train_manifest_json is not None:
         tm = read_bounded_json(train_manifest_json) if isinstance(train_manifest_json, (str, Path)) else train_manifest_json
         if isinstance(tm, Mapping) and tm.get("train_lineage_root"):
             ext_train.append(str(tm["train_lineage_root"]))
 
-    rows, abi_obs, lease_pub, req_npus = acquire_stage3_observations(
-        plan_doc, sku=sku, raw_source=observations_json, custom_runner=profiler_runner,
-        live_profiler=live_profiler, endpoint_alias=endpoint_alias, profiler_root=profiler_root,
-        coordinator_bin=coordinator_bin, capture_root=capture_root, profile_override=profile_override,
-        abi_rejection_results=abi_rejection_results, lease_acquirer=lease_acquirer,
-    )
+    rows, abi_obs, lease_pub, req_npus = acquire_stage3_observations(plan_doc, sku=sku, raw_source=observations_json, custom_runner=profiler_runner, live_profiler=live_profiler, endpoint_alias=endpoint_alias, profiler_root=profiler_root, coordinator_bin=coordinator_bin, capture_root=capture_root, profile_override=profile_override, abi_rejection_results=abi_rejection_results, lease_acquirer=lease_acquirer)
     exp_levels = {str(p["point_id"]): assign_plan_point_level(plan_doc, p) for sk in ("train_points", "heldout_points") for p in plan_doc[sk]}
-    scored = score_sealed_gate_cases(
-        rows, sku=sku, runner=runner, threshold_pct=cap_pct, atol_ns=eff_atol,
-        primitive_table=prim_tbl, profile_override=profile_override, external_train_roots=ext_train,
-        manifest_lineage_edges=lineage_edges, fits_manifest=fits_json, expected_points=plan_doc["heldout_points"],
-        expected_train_points=plan_doc["train_points"], expected_levels=exp_levels,
-        capture_root=capture_root, require_capture_files=require_capture_files,
-    )
+    scored = score_sealed_gate_cases(rows, sku=sku, runner=runner, threshold_pct=cap_pct, atol_ns=eff_atol, primitive_table=prim_tbl, profile_override=profile_override, external_train_roots=ext_train, manifest_lineage_edges=lineage_edges, fits_manifest=fits_json, expected_points=plan_doc["heldout_points"], expected_train_points=plan_doc["train_points"], expected_levels=exp_levels, capture_root=capture_root, require_capture_files=require_capture_files)
     abi_chk = evaluate_abi_rejections(plan_doc.get("abi_rejection_points") or (), abi_obs)
     ok = bool(scored["ok"]) and bool(abi_chk["ok"])
     status = "insufficient_evidence" if scored["status"] == "insufficient_evidence" else ("pass" if ok else "fail")
     report: dict[str, Any] = {
-        "stage": "validate-512-400k", "ok": ok, "status": status, "sku": sku,
-        "threshold_pct": cap_pct, "atol_ns": eff_atol, "plan_sha256": plan_doc["plan_sha256"],
-        "required_ranks": req_npus, "acquisition_mode": "live_silicon" if live_profiler else "offline_reverify",
-        "capture_files_verified": bool(scored["capture_files_verified"]), "lease": lease_pub,
-        "primitives_envelope_sha256": prim_tbl.envelope_sha256 if prim_tbl else "",
-        "fits_sha256": str(scored.get("fits_sha256") or ""),
-        "missing_heldout_points": scored["missing_plan_points"], "missing_train_points": scored["missing_train_points"],
-        "over_budget_points": scored["over_budget_points"], "failing_cases": scored["failing_cases"],
-        "abi_rejection_check": abi_chk, "lineage": scored["lineage"],
+        "stage": "validate-512-400k", "ok": ok, "status": status, "sku": sku, "threshold_pct": cap_pct, "atol_ns": eff_atol,
+        "plan_sha256": plan_doc["plan_sha256"], "required_ranks": req_npus, "acquisition_mode": "live_silicon" if live_profiler else "offline_reverify",
+        "capture_files_verified": bool(scored["capture_files_verified"]), "lease": lease_pub, "primitives_envelope_sha256": prim_tbl.envelope_sha256 if prim_tbl else "",
+        "fits_sha256": str(scored.get("fits_sha256") or ""), "missing_heldout_points": scored["missing_plan_points"], "missing_train_points": scored["missing_train_points"],
+        "over_budget_points": scored["over_budget_points"], "failing_cases": scored["failing_cases"], "abi_rejection_check": abi_chk, "lineage": scored["lineage"],
         "heldout_summary": scored["heldout_summary"], "train_summary": scored["train_summary"], "residuals": scored["residuals"],
     }
     rec_u, rec_w = collect_receipt_warnings(lease_pub)
@@ -650,11 +660,7 @@ def verify_sku_gates(
         if expected_cann_version.strip() and str(prim_tbl.cann_version or "").strip() != expected_cann_version.strip():
             raise ModelingError(f"primitives_cann_version_mismatch:expected={expected_cann_version}:got={prim_tbl.cann_version}")
 
-    fits_obj, fits_sha = (
-        load_frozen_fit_manifest(fits_json, default_fit_id=f"onboarding-fits-{sanitize_public_alias(sku, 'sku')}")
-        if fits_json is not None
-        else (None, "")
-    )
+    fits_obj, fits_sha = (load_frozen_fit_manifest(fits_json, default_fit_id=f"onboarding-fits-{sanitize_public_alias(sku, 'sku')}") if fits_json is not None else (None, ""))
     if validation_report_json is not None:
         val_doc = dict(read_bounded_json(validation_report_json) if isinstance(validation_report_json, (str, Path)) else validation_report_json)
         report_fits_sha = str(val_doc.get("fits_sha256") or "").strip().lower()
@@ -665,30 +671,13 @@ def verify_sku_gates(
     else:
         mf = read_bounded_json(multilevel_manifest_json) if isinstance(multilevel_manifest_json, (str, Path)) else multilevel_manifest_json
         assert isinstance(mf, Mapping)
-        mf_edges = parse_lineage_edges(mf.get("lineage_edges") or ())
-        val_doc = validate_512_400k(sku=sku, observations_json=list(mf.get("cases") or ()), abi_rejection_results=list(mf.get("abi_rejection_results") or ()), primitives_json=primitives_json, fits_json=fits_obj, lineage_edges=mf_edges, capture_root=capture_root, require_capture_files=require_capture_files, profile_override=profile_override, runner=runner, threshold_pct=cap_pct, atol_ns=eff_atol)
+        val_doc = validate_512_400k(sku=sku, observations_json=list(mf.get("cases") or ()), abi_rejection_results=list(mf.get("abi_rejection_results") or ()), primitives_json=primitives_json, fits_json=fits_obj, lineage_edges=parse_lineage_edges(mf.get("lineage_edges") or ()), capture_root=capture_root, require_capture_files=require_capture_files, profile_override=profile_override, runner=runner, threshold_pct=cap_pct, atol_ns=eff_atol)
 
-    artifacts = {
-        "primitives_envelope_sha256": prim_tbl.envelope_sha256 if prim_tbl else str(val_doc.get("primitives_envelope_sha256") or ""),
-        "plan_sha256": str(val_doc.get("plan_sha256") or ""),
-    }
-    eff_fits_sha = fits_sha or str(val_doc.get("fits_sha256") or "")
-    if eff_fits_sha:
+    artifacts = {"primitives_envelope_sha256": prim_tbl.envelope_sha256 if prim_tbl else str(val_doc.get("primitives_envelope_sha256") or ""), "plan_sha256": str(val_doc.get("plan_sha256") or "")}
+    if (eff_fits_sha := fits_sha or str(val_doc.get("fits_sha256") or "")):
         artifacts["fits_sha256"] = eff_fits_sha
-    all_ok, status, receipt, diagnosis = finalize_stage4_certification(
-        schema=SKU_ONBOARDING_RECEIPT_SCHEMA, target_kind="sku", target_id=f"sku:{sku}", sku=sku,
-        score_doc=val_doc, lean_bounds_json=lean_bounds_json, cap_pct=cap_pct, eff_atol=eff_atol,
-        ape_gate_name="multilevel_512_400k",
-        artifacts=artifacts,
-        extra_warning_records=(sanitize_lease_for_receipt(stage2_lease),),
-        capture_root=capture_root, require_capture_files=require_capture_files,
-        repo_root=repo_root, run_repo_gates=run_repo_gates, orthogonality_base=orthogonality_base,
-        out_receipt=out_receipt, diagnosis_out=diagnosis_out,
-    )
-    out: dict[str, Any] = {"stage": "verify-gates", "ok": all_ok, "status": status, "sku": sku, "receipt": receipt}
-    if diagnosis is not None:
-        out["diagnosis"] = diagnosis
-    return out
+    all_ok, status, receipt, diagnosis = finalize_stage4_certification(schema=SKU_ONBOARDING_RECEIPT_SCHEMA, target_kind="sku", target_id=f"sku:{sku}", sku=sku, score_doc=val_doc, lean_bounds_json=lean_bounds_json, cap_pct=cap_pct, eff_atol=eff_atol, ape_gate_name="multilevel_512_400k", artifacts=artifacts, extra_warning_records=(sanitize_lease_for_receipt(stage2_lease),), capture_root=capture_root, require_capture_files=require_capture_files, repo_root=repo_root, run_repo_gates=run_repo_gates, orthogonality_base=orthogonality_base, out_receipt=out_receipt, diagnosis_out=diagnosis_out)
+    return {"stage": "verify-gates", "ok": all_ok, "status": status, "sku": sku, "receipt": receipt, **({"diagnosis": diagnosis} if diagnosis is not None else {})}
 
 
 def run_sku_onboarding(

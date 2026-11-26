@@ -1884,7 +1884,7 @@ class _MemoryLedgerMixin:
                 ev_desc = self._describe_release_event(snap.get("event"))
                 if not ev_desc:
                     continue
-                holder = (rep, "grant_reader", f"{grant}::{consumer}")
+                holder = self._grant_reader_holder(rep, grant, consumer)
                 drop_holders.add(holder)
                 for ref in self._refs.get(holder, ()):
                     if ref.tier in {"hbm", ""} and ref.ranges:
@@ -2067,7 +2067,7 @@ class _MemoryLedgerMixin:
             for consumer, snap in readers.items():
                 ev_desc = self._describe_release_event(snap.get("event"))
                 if ev_desc:
-                    holder_ev_label[(rep, "grant_reader", f"{grant}::{consumer}")] = (
+                    holder_ev_label[self._grant_reader_holder(rep, grant, consumer)] = (
                         f"grant_reader:{grant}:{consumer}:{ev_desc}"
                     )
         for (rep, st, name), binding in self.effect_bindings.items():

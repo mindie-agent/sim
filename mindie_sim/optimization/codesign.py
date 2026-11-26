@@ -34,6 +34,7 @@ from mindie_sim.catalog.context_parallel import (
     dcp_q_replicate_enabled,
     pcp_rank_chunk_ranges,
 )
+from mindie_sim.catalog.engram import _engram_shard_dims
 from mindie_sim.catalog.qwen4_exp import (
     _ple_owned_hits,
     _ple_read_bytes,
@@ -496,7 +497,8 @@ def _node_engram_h2d_payload_bytes(node: Any, case: Case | None = None) -> float
                 lookup_format = ple_lookup_format(case.model, case.runtime)
                 hits_local = _ple_owned_hits(lookups, case.runtime.parallel.tp)
                 return _ple_read_bytes(hits_local, int(engram.width), lookup_format)
-            return float(int(shape[0]) * int(engram.host_response_bytes))
+            row_b = float(getattr(engram, "row_bytes", 0.0) or 0.0) or float(engram.host_response_bytes)
+            return float(int(shape[0])) * row_b
     if h2d <= 0.0:
         h2d = max(
             float(getattr(node, "hbm_read_bytes", 0.0) or 0.0),
@@ -1268,6 +1270,9 @@ def _append_engram_table_events(
     ple_row_b: int,
     lane_tokens: Sequence[int],
     placement: Any,
+    edp: int = 1,
+    local_heads: int | None = None,
+    edp_slot_tokens: int | None = None,
 ) -> None:
     """Append projected per-stage or per-rank H2D transfer events for one Engram/PLE table."""
     lpt = int(engram_cfg.lookups_per_token_per_table)
@@ -1296,17 +1301,32 @@ def _append_engram_table_events(
         ))
         return
 
-    resp_b = int(engram_cfg.host_response_bytes)
-    if uneven_lanes and placement is not None:
+    # Canonical Engram lowering (catalog/engram.py:_lower_engram_table) shards
+    # lookup heads uniformly across tp * edp and transfers packed rows over H2D.
+    eff_edp = max(1, int(edp))
+    eff_heads = int(local_heads) if local_heads is not None else max(1, lpt // max(1, tp))
+    sharded_lookups = tuple(
+        max(
+            0,
+            (max(int(tok), edp_slot_tokens) if (eff_edp > 1 and edp_slot_tokens is not None) else int(tok))
+            * eff_edp * eff_heads,
+        )
+        for tok in lane_tokens
+    )
+    row_b = float(getattr(engram_cfg, "row_bytes", 0.0) or 0.0) or float(engram_cfg.host_response_bytes)
+    if len(set(sharded_lookups)) > 1 and placement is not None:
         ranks = placement.stage_ranks(rep, stage)
-        for pcp_idx, lk in enumerate(lane_lookups):
-            payload = float(lk * resp_b)
+        for pcp_idx, lk in enumerate(sharded_lookups):
+            payload = float(lk) * row_b
+            if payload <= 0.0:
+                continue
             for tp_idx in range(tp):
                 slot = pcp_idx * tp + tp_idx
                 if slot < len(ranks):
                     events.append(_H2dTransferEvent(rep, stage, int(ranks[slot]), payload, None))
         return
-    events.append(_H2dTransferEvent(rep, stage, None, float(lane_lookups[0] * resp_b), None))
+    if sharded_lookups and sharded_lookups[0] > 0:
+        events.append(_H2dTransferEvent(rep, stage, None, float(sharded_lookups[0]) * row_b, None))
 
 
 def _project_step_engram_transfers(
@@ -1351,6 +1371,19 @@ def _project_step_engram_transfers(
     is_ple = engram_cfg is not None and is_ple_engram(engram_cfg)
     lookup_format = ple_lookup_format(case.model, case.runtime) if is_ple else ""
     ple_row_b = _ple_row_bytes(int(engram_cfg.width), lookup_format) if is_ple else 0
+    edp, local_heads, edp_slot_tokens = 1, None, None
+    if engram_cfg is not None and active_tables and not is_ple:
+        meta = dict(getattr(case.runtime, "metadata", ()) or ())
+        raw_slot = meta.get("engram_edp_slot_tokens")
+        edp_slot_tokens = int(raw_slot) if raw_slot is not None else None
+        offload_rt = (
+            case.runtime if bool(getattr(case.runtime, "engram_cpu_offload", False))
+            else replace(case.runtime, engram_cpu_offload=True)
+        )
+        node_ranks = int(getattr(case.machine, "ranks_per_node", 0) or 0) or None
+        _tp_eff, edp, local_heads = _engram_shard_dims(
+            engram_cfg, case.runtime.parallel, offload_rt, node_ranks=node_ranks,
+        )
     try:
         placement = case.machine.validate_placement(case.runtime.parallel)
     except ModelingError:
@@ -1391,6 +1424,9 @@ def _project_step_engram_transfers(
                     ple_row_b=ple_row_b,
                     lane_tokens=lane_tokens,
                     placement=placement,
+                    edp=edp,
+                    local_heads=local_heads,
+                    edp_slot_tokens=edp_slot_tokens,
                 )
         else:
             padded_tokens = sp_active_tokens if sp_active_tokens is not None else tok_lane0
