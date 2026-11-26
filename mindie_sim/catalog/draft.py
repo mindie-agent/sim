@@ -5,13 +5,53 @@
 [Timeouts & Locks] Pure computation.
 [Side-Effect Policy] No I/O.
 """
+from collections.abc import Mapping
+from dataclasses import replace
+
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.catalog.types import DraftSpec
-from dataclasses import replace
 
 ZERO_EXPERTS = 0
 FLOAT_WEIGHT_FORMATS = frozenset({"bf16", "fp16", "fp32", "bfloat16", "float16", "float32"})
+
+
+def _draft_layer_quant_overrides(model, quant, draft) -> dict[str, dict[str, object]]:
+    """Keep only draft-scoped ``native_layers``/``draft_layers`` overrides matching declared draft plans."""
+    if not getattr(quant, "layer_quant_overrides", ()):
+        return {}
+    plans = tuple(getattr(draft, "layer_plans", ()) or ())
+    draft_native_ids = {
+        str(int(getattr(plan, "native_layer_id", -1)))
+        for plan in plans
+        if getattr(plan, "scope", "") == "draft" and int(getattr(plan, "native_layer_id", -1)) >= 0
+    }
+    if not draft_native_ids:
+        return {}
+    target_native_ids = {
+        str(int(getattr(plan, "native_layer_id", -1)))
+        for plan in (getattr(model, "layer_plans", ()) or ())
+        if getattr(plan, "scope", "") != "draft" and int(getattr(plan, "native_layer_id", -1)) >= 0
+    }
+    raw = quant.layer_quant_overrides_dict()
+    kept: dict[str, dict[str, object]] = {}
+    for bucket in ("native_layers", "draft_layers"):
+        bucket_map = raw.get(bucket)
+        if not isinstance(bucket_map, Mapping):
+            continue
+        allowed_ids = (
+            draft_native_ids - target_native_ids
+            if bucket == "native_layers"
+            else draft_native_ids
+        )
+        matched = {
+            str(k): v
+            for k, v in bucket_map.items()
+            if str(k) in allowed_ids and v is not None
+        }
+        if matched:
+            kept[bucket] = matched
+    return kept
 
 
 def _draft_scoped_overrides(quant, draft) -> dict[str, dict[str, object]]:
@@ -85,7 +125,8 @@ def draft_quant(model, draft):
             expert_quant_overrides=(),
         )
     if not draft.weight_category:
-        return replace(quant, layer_quant_overrides=()) if quant.layer_quant_overrides else quant
+        draft_layer_ov = _draft_layer_quant_overrides(model, quant, draft)
+        return replace(quant, layer_quant_overrides=draft_layer_ov or ()) if quant.layer_quant_overrides else quant
     fmt = str(quant.format_for(draft.weight_category)).strip().lower()
     if fmt in FLOAT_WEIGHT_FORMATS:
         draft_overrides = _draft_scoped_overrides(quant, draft)
@@ -129,13 +170,14 @@ def draft_quant(model, draft):
             else str(quant.kv_dtype)
         ),
     )
+    draft_layer_ov = _draft_layer_quant_overrides(model, quant, draft)
     return replace(
         quant,
         weight_format=fmt,
         expert_weight_format=expert_fmt,
         activation_format=act_fmt,
         kv_dtype=kv_dt,
-        layer_quant_overrides=(),
+        layer_quant_overrides=draft_layer_ov or (),
     )
 
 

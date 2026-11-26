@@ -133,11 +133,17 @@ def test_busiest_ep_rank_straggler_enforces_integer_floor_and_no_fractional_bank
     )
     e_loc = experts // ep
     total_real = float(tokens * top_k) * (float(experts) / float(experts + zero_experts))
-    assert r_max == float(int(r_max))
-    assert r_max >= math.ceil(total_real / ep - 1e-12)
-    assert r_max <= tokens * min(top_k, e_loc)
-    assert a_max >= 1.0
-    assert a_max <= min(float(e_loc), r_max)
+    if zero_experts == 0:
+        assert r_max == float(int(r_max))
+        assert r_max >= math.ceil(total_real / ep - 1e-12)
+        assert r_max <= tokens * min(top_k, e_loc)
+        assert a_max >= 1.0
+        assert a_max <= min(float(e_loc), r_max)
+    else:
+        p_any = 1.0 - (math.comb(zero_experts, top_k) / math.comb(experts + zero_experts, top_k)) ** tokens
+        assert p_any - 1e-12 <= r_max <= min(total_real, p_any * tokens * min(top_k, e_loc)) + 1e-12
+        assert r_max >= total_real / ep - 1e-12
+        assert p_any - 1e-12 <= a_max <= min(float(e_loc), r_max) + 1e-12
     # Verify verify-step E=256, EP=64, top-8, T=6 exceeds the naive 0.75 / 0.694 mean.
     if (ep, tokens, experts, top_k, zero_experts) == (64, 6, 256, 8, 0):
         assert r_max >= 2.0 and a_max >= 2.0

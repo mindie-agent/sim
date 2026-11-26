@@ -365,6 +365,9 @@ def _verify_dequant_situ_quant_abi(
     even_w = max(2, int(width) if int(width) % 2 == 0 else int(width) + 1)
     norm_in = str(input_dtype or "bf16").strip().lower().replace("-", "_")
     eff_in = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}.get(norm_in, norm_in or "bf16")
+    in_qmode = "per_token_int8" if eff_in in {"int8", "int32"} else "dense"
+    in_scale = "fp32" if eff_in in {"int8", "int32"} else "none"
+    in_scale_shape = (1,) if in_scale != "none" else ()
     query = AbiQueryKey(
         soc_arch=arch,  # type: ignore[arg-type]
         sku_id=sku_map[arch],
@@ -375,8 +378,8 @@ def _verify_dequant_situ_quant_abi(
         pr_track="shipping",
         operands=(OperandPortSig(
             role="x", dtype=eff_in, layout="ND", transposed=False,
-            shape=(1, even_w), quant_mode="dense", group_shape=(),
-            scale_dtype="none", scale_shape=(),
+            shape=(1, even_w), quant_mode=in_qmode, group_shape=(),
+            scale_dtype=in_scale, scale_shape=in_scale_shape,
         ),),
         outputs=(
             OperandPortSig(

@@ -22,7 +22,9 @@ from mindie_sim.export.xlsx_summary import populate_summary_sheet
 from mindie_sim.optimization.ladder import solve_target_step_receipt
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.collectives.topology import Topology
-from mindie_sim.prediction.efficiency.sla import _cohort_die_ranks, _distinct_eval_cohorts
+from mindie_sim.prediction.efficiency.sla import (
+    _cohort_die_ranks, _cohort_hw_signature, _distinct_eval_cohorts,
+)
 from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators import paged_mla, sparse_indexer
@@ -160,7 +162,7 @@ def test_law1_cross_rank_capacity_and_coordinate_partition(seed: int) -> None:
                 assert int(coord.global_rank) >= offset
     if ep > 1:
         ep_groups = {
-            placement.ep_group_ranks(rep, 0, ReplicaLocalRank(local))
+            placement.ep_group_ranks(rep, 0, lane=ReplicaLocalRank(local))
             for rep in range(dp) for local in range(width)
         }
         assert all(len(group) == ep for group in ep_groups)
@@ -190,10 +192,19 @@ def test_law1_cross_rank_capacity_and_coordinate_partition(seed: int) -> None:
             w_alloc = sum(a.bytes for a in plan.allocations if a.category == "weights")
             assert w_alloc == pytest.approx(mem.rank_weights[0][stage][local], rel=1e-9)
 
-    # 3. Physical rank offset invariance on _distinct_eval_cohorts & _cohort_die_ranks.
+    # 3. Physical rank offset invariance & equivalence-class completeness on _distinct_eval_cohorts & _cohort_die_ranks.
     cohorts = _distinct_eval_cohorts(case)
     assert cohorts == _distinct_eval_cohorts(case_zero)
-    assert {r for group in cohorts for r in group} == set(range(dp * external_dp))
+    covered = [r for group in cohorts for r in group]
+    assert cohorts and len(covered) == len(set(covered)) and set(covered) <= set(range(dp * external_dp))
+    rep_sigs = {_cohort_hw_signature(case, group) for group in cohorts}
+    assert len(rep_sigs) == len(cohorts)
+    group_size = len(cohorts[0])
+    assert all(len(group) == group_size for group in cohorts)
+    assert all(
+        _cohort_hw_signature(case, tuple(range(base, base + group_size))) in rep_sigs
+        for base in range(0, dp * external_dp, group_size)
+    )
     for group in cohorts:
         ranks = _cohort_die_ranks(case, group)
         assert len(ranks) == len(group) * pp * width and all(int(rk) >= offset for rk in ranks)
