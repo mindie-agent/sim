@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from mindie_sim.backends.abi_registry import default_abi_registry
+from mindie_sim.catalog.context_parallel import is_v41_replicated_cache_model
 from mindie_sim.catalog.draft_spec import validate_fia_speculative_tokens
 from mindie_sim.prediction.operators.linear_attention.gdn_domain import (
     GDN_CHUNK32_TOKENS,
@@ -576,11 +577,14 @@ def _source_attention_and_moe_mechanisms() -> tuple[OptimizationMechanism, ...]:
             summary="Non-CANN TileLang DSL MixedQuantSparseFlashMla (544B FP8 + 320B FP4 packed KV) on A5",
             eligible=lambda ctx: (
                 ctx.arch == "a5"
-                and any(
-                    p.mla_variant == "latent_mqa"
-                    and p.cache_kind == "window_compressed"
-                    and int(p.compress_ratio or 0) > 0
-                    for p in ctx.model.layer_plans
+                and (
+                    any(
+                        p.mla_variant == "latent_mqa"
+                        and p.cache_kind == "window_compressed"
+                        and int(p.compress_ratio or 0) > 0
+                        for p in ctx.model.layer_plans
+                    )
+                    or is_v41_replicated_cache_model(ctx.model)
                 )
             ),
             apply=lambda rt, _ctx: _update_meta(rt, mqsmla_dsl_544_320_active=True),

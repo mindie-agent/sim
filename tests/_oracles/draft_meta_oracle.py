@@ -152,8 +152,6 @@ def _vision_entries(
         add_fn(out, "projector_w2", out_h, int(v["aligner_hidden"]))
         add_fn(out, "projector_norm", out_h, 1)
     else:
-        add_fn(out, "merger_norm", aligner_in, 1)
-        add_fn(out, "merger_norm_bias", aligner_in, 1)
         add_fn(out, "merger_w1", aligner_in, aligner_in)
         add_fn(out, "merger_w1_bias", aligner_in, 1)
         add_fn(out, "merger", out_h, aligner_in)

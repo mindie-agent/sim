@@ -29,7 +29,7 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.structure import export_structure
 
-from _support.axes import BODY_DEFAULT_SKUS as SKUS, KDA_ONLY_SKUS, KDA_SKUS, WIDE_SKUS  # noqa: E402
+from _support.axes import BODY_DEFAULT_SKUS as SKUS, GEN5_DT_SKU, KDA_ONLY_SKUS, KDA_SKUS, WIDE_SKUS  # noqa: E402
 
 pytestmark = pytest.mark.tier0
 RESIDUAL_RECIPES = ("residual_values_fp32", "attention_residual_scores", "attention_residual_softmax", "attention_residual_mix", "attention_residual_output_cast")
@@ -146,9 +146,16 @@ def test_rope_free_indexed_body_defaults_execute_declared_cache_representation(s
     result = predict(raw, scope="body", tokens=4, context=128, sequences=3)
     assert result["execution"]["serviced"]["mte2_aiv@r0:s0"] > 0
     selected = next(row for row in result["default_mechanisms"]["selections"] if row["family"] == "indexed_mla")
-    assert selected["selection"] == "default_installed"
     effective, _ = attention_defaults(parse_case(raw), "decode", tokens=4)
-    assert effective.runtime.kernels["programs"]["indexed_attention"]["kind"] == ("indexed_attention_packed_int8" if kv_dtype == "int8" else "indexed_attention_pipeline")
+    if sku == GEN5_DT_SKU and kv_dtype == "int8":
+        assert selected["selection"] == "preserved"
+        assert selected["reason"] == "packed_int8_indexed_attention_arch35_requires_rope64"
+        assert "indexed_attention" not in effective.runtime.kernels.get("programs", {})
+    else:
+        assert selected["selection"] == "default_installed"
+        assert effective.runtime.kernels["programs"]["indexed_attention"]["kind"] == (
+            "indexed_attention_packed_int8" if kv_dtype == "int8" else "indexed_attention_pipeline"
+        )
     assert result["execution"]["live_tasks"] == result["execution"]["live_programs"] == 0
 @pytest.mark.parametrize("model", ("bailing-v3", "deepseek-v2-lite", "longcat-flash-lite", "kimi-k3"))
 @pytest.mark.parametrize("sku", WIDE_SKUS)

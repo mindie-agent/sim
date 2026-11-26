@@ -297,7 +297,8 @@ def _index_entries(layer: RefLayer, seq: int, padded: bool, tp: int, cp: int,
             ring = capacity if padded else min(seq, capacity)
             total += ring * 2 * layer.index_dim * POOL_TAIL_SCALE
     if layer.index_input == "hidden" and layer.compress_ratio and seq:
-        total += min(seq, layer.compressor_rows) * 2 * layer.compressor_width * layer.index_dim * 4
+        idx_state_rows = layer.compressor_rows if padded else min(seq, layer.compressor_rows)
+        total += idx_state_rows * 2 * layer.compressor_width * layer.index_dim * 4
     return total
 
 

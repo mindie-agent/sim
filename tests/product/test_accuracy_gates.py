@@ -26,6 +26,7 @@ from mindie_sim.prediction.scheduler import DraftPolicy
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.model_catalog import list_models, load_model
 from mindie_sim.prediction.body_defaults import effective_body_declaration
+from mindie_sim.prediction.operators.paged_mla.family_mqsmla import DSL_NATIVE_KIND as MQSMLA_DSL_NATIVE
 from mindie_sim.prediction.operators.paged_mla.family_mqsmla import FORMATS as MQSMLA_FORMATS
 from mindie_sim.prediction.operators.paged_mla.family_mqsmla import RECIPE as MQSMLA_RECIPE
 from mindie_sim.prediction.operator_analysis import target_graphs
@@ -69,21 +70,27 @@ def selection_summary(raw_case):
 @pytest.mark.parametrize("tp", (1, 2, 4, 8))
 def test_packed_cache_selects_mixed_quant_mla_across_tensor_parallel(tp: int):
     dp = max(1, 8 // tp)
-    raw = _packed_case(tp=tp, dp=dp, ep=8, concurrency=dp)
-    declared = raw["model"]["metadata"]["cache_representations"]
+    shipping = _packed_case(tp=tp, dp=dp, ep=8, concurrency=dp)
+    declared = shipping["model"]["metadata"]["cache_representations"]
     assert tuple(declared) == V41_CACHE_KEYS
     index = {"dtype": "uint8", "packed_elements": 2, "group_size": 32, "scale_dtype": "uint8"}
     assert declared == {**MQSMLA_FORMATS, "index_k": index}
-    parsed = parse_case(raw)
+    parsed = parse_case(shipping)
     actual = {region: cache_format(parsed.model, region).row_bytes(width)
               for region, width in REGION_WIDTH.items()}
     assert actual == PACKED_ROW_BYTES
     assert actual["index_k"] < REGION_WIDTH["index_k"]
-    assert attention_recipes(raw, sequences=dp) == {MQSMLA_RECIPE}
-    assert attention_natives(raw, sequences=dp) == {MQSMLA_NATIVE}
+    assert attention_recipes(shipping, sequences=dp) == {"latent_attention0"}
+    assert attention_natives(shipping, sequences=dp) == {MIXED_QUANT_NATIVE}
+    proposed = _packed_case(tp=tp, dp=dp, ep=8, concurrency=dp, feature_track="proposed")
+    assert attention_recipes(proposed, sequences=dp) == {MQSMLA_RECIPE}
+    assert attention_natives(proposed, sequences=dp) == {MQSMLA_DSL_NATIVE}
 
 def test_mixed_quant_mla_preserves_idle_replicas_and_verify_rows():
-    raw = _packed_case(tp=2, dp=4, ep=8, concurrency=3, mtp_proposal_tokens=2, mtp_acceptance_length=2.0)
+    raw = _packed_case(
+        tp=2, dp=4, ep=8, concurrency=3, mtp_proposal_tokens=2, mtp_acceptance_length=2.0,
+        feature_track="proposed",
+    )
     parsed = parse_case(raw)
     graphs = target_graphs(parsed, phase="decode", tokens=1, context=DEFAULT_CONTEXT,
         sequences=(3, 1, 0, 0), scope="body", padded_idle=True)
@@ -96,13 +103,16 @@ def test_mixed_quant_mla_preserves_idle_replicas_and_verify_rows():
     assert result["duration_ms"] > 0
 
 def test_expert_quantization_preserves_packed_cache_binding():
-    fp8 = _packed_case(quant="fp8")
-    default = _packed_case()
-    assert (fp8["model"]["metadata"]["cache_representations"]
-            == default["model"]["metadata"]["cache_representations"])
-    assert fp8["model"]["quant"]["expert_weight_format"] != "mxfp4"
-    assert attention_natives(fp8, sequences=4) == {MQSMLA_NATIVE}
-    assert attention_recipes(fp8, sequences=4) == {MQSMLA_RECIPE}
+    fp8_ship = _packed_case(quant="fp8")
+    default_ship = _packed_case()
+    assert (fp8_ship["model"]["metadata"]["cache_representations"]
+            == default_ship["model"]["metadata"]["cache_representations"])
+    assert fp8_ship["model"]["quant"]["expert_weight_format"] != "mxfp4"
+    assert attention_natives(fp8_ship, sequences=4) == {MIXED_QUANT_NATIVE}
+    assert attention_recipes(fp8_ship, sequences=4) == {"latent_attention0"}
+    fp8_prop = _packed_case(quant="fp8", feature_track="proposed")
+    assert attention_natives(fp8_prop, sequences=4) == {MQSMLA_DSL_NATIVE}
+    assert attention_recipes(fp8_prop, sequences=4) == {MQSMLA_RECIPE}
 
 def test_attention_head_tiling_rejection_has_explicit_reason():
     raw = _packed_case(tp=16, dp=1, ep=1, concurrency=1, sp=False)
@@ -228,12 +238,18 @@ def test_all_catalog_models_compose_and_lower_on_every_sku(hardware: str):
     assert checked > 0
 
 def test_entry_points_agree_on_the_selected_operator_stack():
-    raw = _packed_case()
-    parsed = parse_case(raw)
     geometry = dict(phase="decode", tokens=1, context=DEFAULT_CONTEXT, sequences=4)
+    shipping = parse_case(_packed_case())
+    ship_bodies = target_graphs(shipping, scope="body", **geometry)
+    ship_models = target_graphs(shipping, scope="model", **geometry)
+    assert {op.recipe for op in ship_bodies[0] if op.family == "attention"} == {"latent_attention0"}
+    assert {op.recipe for op in ship_models[0] if op.family == "attention"} == {"latent_attention0"}
+    assert attention_natives(shipping, **geometry) == {MIXED_QUANT_NATIVE}
+
+    parsed = parse_case(_packed_case(feature_track="proposed"))
     declared = dict(parsed.runtime.metadata)["operator_selection_summary"]
     assert {note["binding"] for note in declared["selected_native"]} >= {MQSMLA_RECIPE}
-    effective, selection = effective_body_declaration(parsed, "decode", tokens=1)
+    _effective, selection = effective_body_declaration(parsed, "decode", tokens=1)
     body_selected = {note["binding"] for note in selection["operator_selection_summary"]["selected_native"]}
     assert MQSMLA_RECIPE in body_selected
     bodies = target_graphs(parsed, scope="body", **geometry)
@@ -241,7 +257,7 @@ def test_entry_points_agree_on_the_selected_operator_stack():
     body_recipes = {op.recipe for op in bodies[0] if op.family == "attention"}
     model_recipes = {op.recipe for op in models[0] if op.family == "attention"}
     assert body_recipes == model_recipes == {MQSMLA_RECIPE}
-    assert attention_natives(parsed, **geometry) == {MQSMLA_NATIVE}
+    assert attention_natives(parsed, **geometry) == {MQSMLA_DSL_NATIVE}
     resolved = {record["family"]: record["selection"] for record in models.default_selection["selections"]}
     assert resolved["mqsmla_decode"] == "default_installed"
     assert models.scope == "model" and bodies.scope == "body"

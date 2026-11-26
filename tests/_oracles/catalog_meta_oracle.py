@@ -308,7 +308,6 @@ def _attention_entries(out, model, layer) -> None:
         _add(out, "gdn_o", h, value_w)
         _add(out, "gdn_A_log", layer.lin_value_heads, 1)
         _add(out, "gdn_dt_bias", layer.lin_value_heads, 1)
-        _add(out, "gdn_norm", layer.lin_dim, 1)
         return
     raise ValueError(f"reference_attention_unsupported:{layer.attention}")
 

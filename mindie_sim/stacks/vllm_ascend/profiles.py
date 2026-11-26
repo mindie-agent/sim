@@ -22,6 +22,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from mindie_sim.catalog.context_parallel import is_v41_replicated_cache_model
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
 from mindie_sim.schema.hardware import Hardware
@@ -415,9 +416,12 @@ def extract_model_capabilities(
         "has_gqa": bool(gqa_plans),
         "has_mla_indexer": has_mla_idx,
         "has_kpool_indexer": any(p.indexer and int(p.index_kpool) > 1 for p in mla_plans),
-        "has_csa2_compressed_indexer": any(
-            p.mla_variant == "latent_mqa" and p.cache_kind == "window_compressed" and int(p.compress_ratio) > 0
-            for p in mla_plans
+        "has_csa2_compressed_indexer": (
+            any(
+                p.mla_variant == "latent_mqa" and p.cache_kind == "window_compressed" and int(p.compress_ratio) > 0
+                for p in mla_plans
+            )
+            or is_v41_replicated_cache_model(model)
         ),
         "has_qsa_indexed_gbsa": any(
             p.indexer and int(p.index_kpool) == QSA_GROUP_KPOOL_RATIO and bool(p.q_output_gate)

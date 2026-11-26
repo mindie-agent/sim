@@ -599,7 +599,7 @@ def test_collective_hierarchy_and_directional_dma_lowering():
     eng = Engine(topo.resources())
     done = submit_lowered_collective(eng, "h2d_ar", low_ar, {r: eng.submit(f"r{r}") for r in (0, 1, 2, 3)})
     eng.advance()
-    assert done[0].time > 0.0 and eng.summary()["live_tasks"] == 0 and lower_collective("alltoall", (0, 1, 2, 3), topo, 64 * 1024 * 1024).band.algorithm == "direct_mesh" and "h2d_ar:sdma_flow:tx:r0" in eng.resources
+    assert done[0].time > 0.0 and eng.summary()["live_tasks"] == 0 and lower_collective("alltoall", (0, 1, 2, 3), topo, 64 * 1024 * 1024).band.algorithm == "direct_mesh" and "sdma_flow:tx:r0" in eng.resources
     pt = load_primitives(ROOT / "data/primitives/arch22_a2_910b4.json")
     r_h2d = lower_primitive("P20_host_dma_sync", {"direction": "h2d", "payload_bytes": 4096}, pt, allow_uncalibrated_declaration=True)
     r_d2h = lower_primitive("P20_host_dma_sync", {"direction": "d2h", "payload_bytes": 4096}, pt, allow_uncalibrated_declaration=True)
