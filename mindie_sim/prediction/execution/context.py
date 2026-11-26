@@ -113,26 +113,46 @@ def _is_catalog_vector_baseline(timing: InvocationTiming) -> bool:
     return True
 
 
+_MAPPED_INVOCATION_CACHE_MAX = 64
+_MAPPED_INVOCATION_CACHE: dict[tuple, tuple[tuple, tuple[InvocationTiming, dict[str, Any]] | None]] = {}
+_UPGRADED_INVOCATION_CACHE_MAX = 128
+_UPGRADED_INVOCATION_CACHE: dict[tuple, tuple[InvocationTiming, dict[str, Any]]] = {}
+
+
 def _resolve_mapped_hardware_invocation(dies, roles: tuple[str, ...]):
     """Resolve hardware invocation timing across ``dies`` for canonical role aliases."""
+    dies_tuple = tuple(dies)
+    cache_key = (tuple((device.rank, id(device), id(device.kernel_invocations)) for device in dies_tuple), roles)
+    cached = _MAPPED_INVOCATION_CACHE.get(cache_key)
+    if cached is not None:
+        _, result = cached
+        return None if result is None else (result[0], dict(result[1]))
     selected = [
         {"rank": device.rank, "class": role, **timing.to_dict()}
-        for device in dies for role, timing in device.kernel_invocations if role in roles
+        for device in dies_tuple for role, timing in device.kernel_invocations if role in roles
     ]
     if not selected:
-        return None
-    timing = InvocationTiming(
-        startup_ms=max(row["startup_ms"] for row in selected),
-        minimum_ms=max(row["minimum_ms"] for row in selected),
-        provenance={"basis": "hardware_execution_class", "declarations": selected},
-    )
-    payload = json.dumps(timing.to_dict(), sort_keys=True, separators=(",", ":"))
-    return timing, {
-        "id": hashlib.sha256(payload.encode()).hexdigest(),
-        "match": {"execution_classes": roles},
-        "source": "device.kernel_invocations",
-        **timing.to_dict(),
-    }
+        result = None
+    else:
+        timing = InvocationTiming(
+            startup_ms=max(row["startup_ms"] for row in selected),
+            minimum_ms=max(row["minimum_ms"] for row in selected),
+            provenance={"basis": "hardware_execution_class", "declarations": selected},
+        )
+        payload = json.dumps(timing.to_dict(), sort_keys=True, separators=(",", ":"))
+        result = (
+            timing,
+            {
+                "id": hashlib.sha256(payload.encode()).hexdigest(),
+                "match": {"execution_classes": roles},
+                "source": "device.kernel_invocations",
+                **timing.to_dict(),
+            },
+        )
+    if len(_MAPPED_INVOCATION_CACHE) >= _MAPPED_INVOCATION_CACHE_MAX:
+        _MAPPED_INVOCATION_CACHE.pop(next(iter(_MAPPED_INVOCATION_CACHE)))
+    _MAPPED_INVOCATION_CACHE[cache_key] = (dies_tuple, result)
+    return None if result is None else (result[0], dict(result[1]))
 
 
 def _active_aiv_blocks(op, meta: Mapping[str, Any], envelope) -> int:
@@ -228,19 +248,27 @@ def _apply_calibrated_dispatch_floor(context, dies, selected, envelope):
     if target_min_ms == timing.minimum_ms and target_startup_ms <= timing.startup_ms:
         return selected
     evidence = f"p15_p13:{envelope.sku}:{envelope.envelope_sha256[:DIGEST_PREFIX_CHARS]}:{kind}"
+    up_key = (record.get("id"), target_startup_ms, target_min_ms, evidence)
+    cached_up = _UPGRADED_INVOCATION_CACHE.get(up_key)
+    if cached_up is not None:
+        return cached_up[0], dict(cached_up[1])
     upgraded = InvocationTiming(
         startup_ms=target_startup_ms,
         minimum_ms=target_min_ms,
         provenance={**dict(timing.provenance), "dispatch_envelope": evidence},
     )
     payload = json.dumps(upgraded.to_dict(), sort_keys=True, separators=(",", ":"))
-    return upgraded, {
+    upgraded_record = {
         **record,
         "id": hashlib.sha256(payload.encode()).hexdigest(),
         "startup_ms": target_startup_ms,
         "minimum_ms": target_min_ms,
         "provenance": upgraded.provenance,
     }
+    if len(_UPGRADED_INVOCATION_CACHE) >= _UPGRADED_INVOCATION_CACHE_MAX:
+        _UPGRADED_INVOCATION_CACHE.pop(next(iter(_UPGRADED_INVOCATION_CACHE)))
+    _UPGRADED_INVOCATION_CACHE[up_key] = (upgraded, upgraded_record)
+    return upgraded, dict(upgraded_record)
 
 
 def _execution_geometry(device):
