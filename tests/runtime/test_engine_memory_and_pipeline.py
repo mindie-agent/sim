@@ -616,3 +616,254 @@ def test_isolated_read_replay_rebinds_prepared_recipe_to_cold_cache():
     traffic.clear()
     operator_costs(case, (op, replace(op, op_id="second", hbm_bytes=size + 1)), recipes=recipes)
     assert traffic == [(672, 0), (672, 0)]
+
+
+def test_service_grant_observer_conserves_skipped_periodic_cycles_and_rejects_silent_drop():
+    """Skipped periodic cycles conserve observed grants in O(1) entries and fail loud if empty."""
+    from mindie_sim.prediction.engine import ExecutionError
+    from mindie_sim.prediction.program import PipelinePhase, PipelineTemplate
+    from mindie_sim.prediction.runtime.exposed_observer import ObservedInterval, attribute_stream0_intervals
+    from mindie_sim.prediction.scheduling.templates import start_pipeline_template
+
+    eng = Engine([Resource("cube", 1)], backend="python")
+    obs = ServiceGrantObserver()
+    obs.current_node_idx = 0
+    eng.attach_wave_recorder(obs)
+    phase = PipelinePhase("body", (Stage("tile", {"cube": 1}),), 1000)
+    done = start_pipeline_template(eng, PipelineTemplate(0, 1, (phase,)), "op", eng.submit("ready"))
+    eng.advance(until=(done,))
+    assert eng._periodic_detector.stats()["skipped_cycles"] == 997
+    grants = obs.to_observed_grants(["op"])
+    assert sum(g.delivered for g in grants) == pytest.approx(1000.0)
+    assert sum(amt for *_, amt in obs.grants) == pytest.approx(1000.0)
+    assert len(obs._grant_acc) <= 10
+    exp = attribute_stream0_intervals(
+        [ObservedInterval("op", "main", 0, 0, round(done.time * 1e6))],
+        start_ns=0, terminal_ns=round(done.time * 1e6), grants=grants,
+    )
+    assert exp.exposed_ns_by_op == {"op": 1_000_000_000} and exp.conservation_delta_ns == 0
+
+    class _EmptyPatternRecorder:
+        def register_pipe(self, _name: str) -> int:
+            return 0
+        def on_submit(self, *_a, **_kw) -> None:
+            return None
+        def on_admit(self, *_a, **_kw) -> None:
+            return None
+        def on_service(self, *_a, **_kw) -> None:
+            return None
+        def allocate_slot_generation(self, *_a, **_kw) -> tuple[int, int]:
+            return 0, 1
+        def release_slot_generation(self, *_a, **_kw) -> tuple[int, int]:
+            return 0, 1
+        def on_allocation(self, *_a, **_kw) -> None:
+            return None
+        def extract_cycle_pattern(self, *_a, **_kw):
+            return (), ()
+        def on_period(self, *_a, **_kw) -> None:
+            return None
+
+    eng_bad = Engine([Resource("cube", 1)], backend="python")
+    eng_bad.attach_wave_recorder(_EmptyPatternRecorder())
+    done_bad = start_pipeline_template(eng_bad, PipelineTemplate(0, 1, (phase,)), "op", eng_bad.submit("ready"))
+    with pytest.raises(ExecutionError, match="periodic_skip_missing_proved_cycle_pattern"):
+        eng_bad.advance(until=(done_bad,))
+    # Rejection must be atomic: clock stays aligned with actual serviced work and resumes cleanly.
+    assert eng_bad.now == pytest.approx(eng_bad.serviced["cube"])
+    eng_bad.detach_wave_recorder()
+    eng_bad.advance(until=(done_bad,))
+    assert done_bad.time == pytest.approx(1000.0)
+
+    # Alternating p->q / q->p periodic cycles preserve disjoint within-cycle phases (zero false contention).
+    eng_alt = Engine([Resource("p", 1), Resource("q", 1)], backend="python")
+    obs_alt = ServiceGrantObserver()
+    eng_alt.attach_wave_recorder(obs_alt)
+    r_alt = eng_alt.submit("ready")
+    m_st = (Stage("mp", {"p": 1}), Stage("mq", {"q": 1}, after=("mp",)))
+    a_st = (Stage("aq", {"q": 1}), Stage("ap", {"p": 1}, after=("aq",)))
+    obs_alt.current_node_idx = 0
+    d_main = start_pipeline_template(eng_alt, PipelineTemplate(0, 1, (PipelinePhase("m", m_st, 20),)), "main", r_alt)
+    obs_alt.current_node_idx = 1
+    d_aux = start_pipeline_template(eng_alt, PipelineTemplate(0, 1, (PipelinePhase("a", a_st, 20),)), "aux", r_alt)
+    eng_alt.advance(until=(d_main, d_aux), first=False)
+    assert eng_alt._periodic_detector.stats()["skipped_cycles"] >= 15
+    alt_exp = attribute_stream0_intervals(
+        [
+            ObservedInterval("main", "main", 0, 0, round(d_main.time * 1e6)),
+            ObservedInterval("aux", "aux", 1, 0, round(d_aux.time * 1e6)),
+        ],
+        start_ns=0, terminal_ns=round(eng_alt.now * 1e6),
+        grants=obs_alt.to_observed_grants(("main", "aux")),
+    )
+    assert alt_exp.exposed_ns_by_op == {"main": 40_000_000, "aux": 0}
+
+
+@pytest.mark.parametrize("backend", ["python", "c"])
+def test_implicit_full_width_placement_matches_explicit_owners_across_backends(backend: str):
+    """Implicit placement distributes service across active owners matching explicit placement & capacity."""
+    from mindie_sim.prediction.runtime.exposed_observer import ObservedInterval, attribute_stream0_intervals
+
+    results = []
+    for wide_place in (None, {"aiv": (0, 1)}):
+        eng = Engine([Resource("aiv", 2, units=2)], backend=backend)
+        obs = ServiceGrantObserver()
+        eng.attach_wave_recorder(obs)
+        ids, events = ("wide", "narrow"), []
+        for idx, place in enumerate((wide_place, {"aiv": (1,)})):
+            obs.current_node_idx = idx
+            events.append(eng.submit(ids[idx], {"aiv": 1}, placement=place))
+        eng.advance()
+        if backend == "c":
+            assert eng.accel_status()["native_steps"] > 0
+        intervals = [
+            ObservedInterval(ids[i], ("main", "aux")[i], i, 0, round(ev.time * 1e6))
+            for i, ev in enumerate(events)
+        ]
+        grants = obs.to_observed_grants(ids)
+        exposure = attribute_stream0_intervals(
+            intervals, start_ns=0, terminal_ns=round(eng.now * 1e6), grants=grants,
+        )
+        wide_owners = sorted(
+            (g.owner, round(g.delivered, 6)) for g in grants if g.occurrence_id == "wide"
+        )
+        results.append((round(eng.now, 6), exposure.exposed_ns_by_op, wide_owners))
+    assert results[0] == results[1] == (1.5, {"wide": 500_000, "narrow": 1_000_000}, [(0, 0.5), (1, 0.5)])
+
+    # Lower-priority unplaced work must emit on residual owner 0, never over-subscribing saturated owner 1.
+    if backend == "python":
+        eng_t = Engine([Resource("aiv", 4, units=2)], backend="python")
+        obs_t = ServiceGrantObserver()
+        eng_t.attach_wave_recorder(obs_t)
+        obs_t.current_node_idx = 0
+        eng_t.submit("hi", {"aiv": 2}, priority=0, placement={"aiv": (1,)})
+        obs_t.current_node_idx = 1
+        eng_t.submit("lo", {"aiv": 2}, priority=1)
+        eng_t.advance()
+        totals: dict[int | None, float] = {}
+        for gr in obs_t.to_observed_grants(("hi", "lo")):
+            totals[gr.owner] = totals.get(gr.owner, 0.0) + gr.delivered
+        assert totals == {0: 2.0, 1: 2.0}
+
+
+def test_coalesce_preserves_cross_tile_previous_cohort_and_fifo_boundaries():
+    """Coalescing must preserve cross-tile previous targets, cohort barriers, and FIFO boundaries."""
+    tiles = (
+        (Stage("convert", {"vector": 4}), Stage("pack", {"vector": 4}, after=("convert",))),
+        (Stage("store", {"hbm": 8}, previous=("pack",)),),
+    )
+    pipe = PipelineProgram(2, 2, tiles.__getitem__)
+    for body in (pipe, coalesce_execution_program(pipe), coalesce_execution_program(pipe, fair_resources={"vector"})):
+        eng = Engine([Resource("vector", 1), Resource("hbm", 1)], backend="python")
+        done = body.start(eng, "kernel", eng.submit("ready"))
+        eng.advance(until=(done,))
+        assert done.time == pytest.approx(16.0) and eng.serviced == {"vector": 8.0, "hbm": 8.0}
+
+    for policy, cohort, release, expected in (("fair", 4, 4, 22.0), ("fifo", 1, 1, 20.0)):
+        prog = KernelProgram((
+            Stage("head", {"vector": 4}),
+            Stage("tail", {"vector": 8}, after=("head",), cohort_size=cohort),
+        ))
+        variants = (prog, coalesce_execution_program(prog)) + (
+            (coalesce_execution_program(prog, fair_resources={"vector"}),) if policy == "fair" else ()
+        )
+        for body in variants:
+            eng = Engine([Resource("vector", 1, policy=policy), Resource("hbm", 1)], backend="python")
+            done = body.start(eng, "kernel", eng.submit("ready"))
+            peer = eng.submit("peer", {"vector": 8}, release=release)
+            copy = eng.submit("copy", {"hbm": 8}, after=(done if policy == "fair" else peer,))
+            end = eng.submit("end", after=(done, peer, copy))
+            eng.advance(until=(end,))
+            assert end.time == pytest.approx(expected)
+
+    # Identical cohort_size > 1 stages still carry an inter-stage barrier and must never merge.
+    coh_prog = KernelProgram((
+        Stage("s1", {"u": 2}, placement={"u": (0, 1)}, cohort_size=2,
+              cohort_widened=("u",), cohort_members={"u": ((0,), (1,))}),
+        Stage("s2", {"u": 2}, after=("s1",), placement={"u": (0, 1)}, cohort_size=2,
+              cohort_widened=("u",), cohort_members={"u": ((0,), (1,))}),
+    ))
+    for body in (coh_prog, coalesce_execution_program(coh_prog, fair_resources={"u"})):
+        eng_c = Engine([Resource("u", 2, units=2)], backend="python")
+        done_c = body.start(eng_c, "k", eng_c.submit("r"))
+        eng_c.submit("p0", {"u": 1}, placement={"u": (0,)}, release=0)
+        eng_c.submit("p1", {"u": 1}, placement={"u": (1,)}, release=2)
+        eng_c.advance(until=(done_c,))
+        assert done_c.time == pytest.approx(4.0)
+
+
+def test_interior_fold_rejects_multistage_pipeline_and_preserves_dma_overlap():
+    """Interior folding only batches single-stage non-cohort fair tiles and is fail-closed."""
+    def multi_tile(i):
+        n = (4, 4, 1, 2)[i]
+        return Stage("load", {"hbm": n}), Stage("compute", {"vector": n}, after=("load",))
+
+    assert prog_pkg.interior_fold_plan(
+        PipelineProgram(4, 1, multi_tile, interior_fold=True), fair_resources={"hbm", "vector"},
+    ) is None
+    for fold in (False, True):
+        eng = Engine([Resource("hbm", 1), Resource("vector", 1)], backend="python")
+        done = PipelineProgram(4, 1, multi_tile, interior_fold=fold).start(eng, "kernel", eng.submit("ready"))
+        eng.submit("dma", {"hbm": 4}, release=4)
+        eng.advance(until=(done,))
+        assert done.time == pytest.approx(22.0) and eng.serviced == {"hbm": 15.0, "vector": 11.0}
+
+    # Direct calls without fair_resources fail closed (protecting FIFO); verified fair single-stage still folds.
+    def single_tile(i):
+        n = (3, 3, 1, 2)[i]
+        return (Stage("vec", {"vector": n}),)
+
+    single_prog = PipelineProgram(4, 1, single_tile, interior_fold=True)
+    assert prog_pkg.fold_interior_pipeline(single_prog) is None
+    assert prog_pkg.interior_fold_plan(single_prog, fair_resources={"vector"}) is not None
+    times = []
+    for fold in (False, True):
+        eng = Engine([Resource("vector", 1)], backend="python")
+        done = PipelineProgram(4, 1, single_tile, interior_fold=fold).start(eng, "kernel", eng.submit("ready"))
+        eng.submit("peer", {"vector": 4}, release=2)
+        eng.advance(until=(done,))
+        times.append(done.time)
+    assert times[0] == pytest.approx(times[1])
+
+    # Cohort tiles (cohort_size > 1) keep inter-tile synchronization barriers unmerged.
+    def coh_tile(i):
+        if i < 2:
+            return (Stage("s", {"u": 2}, placement={"u": (0, 1)}, cohort_size=2,
+                          cohort_widened=("u",), cohort_members={"u": ((0,), (1,))}),)
+        return (Stage("t", {"v": 1 if i == 2 else 2}),)
+
+    assert prog_pkg.interior_fold_plan(
+        PipelineProgram(4, 1, coh_tile, interior_fold=True), fair_resources={"u", "v"},
+    ) is None
+    for fold in (False, True):
+        eng_cf = Engine([Resource("u", 2, units=2), Resource("v", 1)], backend="python")
+        done_cf = PipelineProgram(4, 1, coh_tile, interior_fold=fold).start(eng_cf, "p", eng_cf.submit("r"))
+        eng_cf.submit("p0", {"u": 1}, placement={"u": (0,)}, release=0)
+        eng_cf.submit("p1", {"u": 1}, placement={"u": (1,)}, release=2)
+        eng_cf.advance(until=(done_cf,))
+        assert done_cf.time == pytest.approx(7.0)
+
+
+def test_refill_steady_compaction_matches_literal_replay_after_heavy_prologue():
+    """Periodic compaction proves full prologue drain without retaining probe trace caches."""
+    from _support.matrix_cases import matrix_setup
+
+    assert not hasattr(refill_steady._periodic_probe, "cache_info")
+    _, ctx = matrix_setup(cores=1)
+
+    def tile(idx):
+        load = (1 if idx == 0 else 1.25) * ctx.rates["mte2"]
+        cube = (20 if idx == 0 else 1) * ctx.rates["cube"]
+        return (
+            Stage("load", {"mte2": load}),
+            Stage("compute", {"cube": cube}, previous=("load",)),
+        )
+
+    def span(program):
+        eng, _ = matrix_setup(cores=1)
+        done = program.start(eng, "pipe", eng.submit("ready"))
+        eng.advance(until=(done,))
+        return round(done.time, 6)
+
+    compacted = refill_steady.compact_periodic_pipeline(ctx, 100, 4, tile)
+    literal = PipelineProgram(100, 4, tile)
+    assert span(compacted) == span(literal) == 140.0

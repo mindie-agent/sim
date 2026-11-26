@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+from collections.abc import Set as AbstractSet
 from dataclasses import dataclass, replace
 
 from ..engine import Allocation, Engine, Event
@@ -159,17 +160,14 @@ class _FloorParallelProgram:
         )
 
 
-def _is_fair_compute_resource(name: str) -> bool:
-    return (
-        name in {"vector", "aic", "cube"}
-        or name.startswith(("vector@", "aic@", "cube@"))
-        or ":vector@" in name or ":aic@" in name or ":cube@" in name
-    )
-
-
-def _fold_kernel_stages(stages: tuple[Stage, ...]) -> tuple[Stage, ...]:
-    """Fold zero-work acquire/free wrappers and strictly serial integer compute chains."""
-    if len(stages) < 2 or any(s.previous or s.keep_empty or s.fragment is not None for s in stages):
+def _fold_kernel_stages(
+    stages: tuple[Stage, ...],
+    *,
+    protected_names: AbstractSet[str] = frozenset(),
+    fair_resources: AbstractSet[str] | None = None,
+) -> tuple[Stage, ...]:
+    """Fold zero-work acquire/free wrappers and verified-fair serial integer compute chains."""
+    if len(stages) < 2 or any(s.previous or s.previous_lags or s.keep_empty or s.fragment is not None for s in stages):
         return stages
     cur = list(stages)
     while len(cur) >= 2:
@@ -189,7 +187,10 @@ def _fold_kernel_stages(stages: tuple[Stage, ...]) -> tuple[Stage, ...]:
                 and s.latency <= 0.0 and not s.coupled and s.priority == 0
                 and not s.metadata and not s.deliveries
             )
-            if empty_ctrl and s.acquire and not s.free and len(consumers[s.name]) == 1:
+            if (
+                empty_ctrl and s.name not in protected_names
+                and s.acquire and not s.free and len(consumers[s.name]) == 1
+            ):
                 succ_idx = consumers[s.name][0]
                 succ = cur[succ_idx]
                 if succ.program is None and succ.after == (s.name,) and not succ.acquire:
@@ -198,7 +199,8 @@ def _fold_kernel_stages(stages: tuple[Stage, ...]) -> tuple[Stage, ...]:
                     changed = True
                     break
             if (
-                empty_ctrl and s.free and not s.acquire and not consumers[s.name]
+                empty_ctrl and s.name not in protected_names
+                and s.free and not s.acquire and not consumers[s.name]
                 and len(s.after) == 1 and s.after[0] in by_name
             ):
                 pred_idx = by_name[s.after[0]]
@@ -212,27 +214,32 @@ def _fold_kernel_stages(stages: tuple[Stage, ...]) -> tuple[Stage, ...]:
                     changed = True
                     break
             if (
-                s.program is None and not s.coupled and s.latency <= 0.0
+                fair_resources is not None
+                and s.program is None and not s.coupled and s.latency <= 0.0
                 and not s.acquire and not s.free and len(s.work) == 1
                 and len(consumers[s.name]) == 1
             ):
                 succ_idx = consumers[s.name][0]
                 succ = cur[succ_idx]
+                rname = next(iter(s.work))
                 if (
-                    succ.program is None and not succ.coupled and succ.latency <= 0.0
+                    rname in fair_resources
+                    and succ.name not in protected_names
+                    and succ.program is None and not succ.coupled and succ.latency <= 0.0
                     and not succ.acquire and not succ.free and succ.after == (s.name,)
                     and len(succ.work) == 1 and s.work.keys() == succ.work.keys()
                     and s.caps == succ.caps and s.placement == succ.placement
                     and s.priority == succ.priority and s.work_units == succ.work_units
+                    and s.cohort_size <= 1 and succ.cohort_size <= 1
+                    and not s.cohort_widened and not succ.cohort_widened
+                    and not s.cohort_members and not succ.cohort_members
                     and s.metadata == succ.metadata
                     and not s.deliveries and not succ.deliveries
                     and not s.latency_from_first_service and not succ.latency_from_first_service
                 ):
-                    rname = next(iter(s.work))
                     w1, w2 = s.work[rname], succ.work[rname]
                     if (
-                        _is_fair_compute_resource(rname)
-                        and w1 == int(w1) and w2 == int(w2)
+                        w1 == int(w1) and w2 == int(w2)
                         and abs(w1) + abs(w2) < _EXACT_INT_SUM_LIMIT
                     ):
                         merged_name = s.name
@@ -265,10 +272,17 @@ def is_pure_static_program(program) -> bool:
     return False
 
 
-def coalesce_execution_program(program, *, unroll_limit: int = PIPELINE_UNROLL_LIMIT):
+def coalesce_execution_program(
+    program,
+    *,
+    unroll_limit: int = PIPELINE_UNROLL_LIMIT,
+    fair_resources: AbstractSet[str] | None = None,
+):
     """Unwrap single-tile pipelines and coalesce symmetric cohorts for Execution."""
     if type(program).__name__ == "_FloorJoinProgram":
-        body = coalesce_execution_program(program.body, unroll_limit=unroll_limit)
+        body = coalesce_execution_program(
+            program.body, unroll_limit=unroll_limit, fair_resources=fair_resources,
+        )
         eff_min = (
             program.effective_minimum()
             if hasattr(program, "effective_minimum") else program.minimum_ms
@@ -306,12 +320,19 @@ def coalesce_execution_program(program, *, unroll_limit: int = PIPELINE_UNROLL_L
         return program if body is program.body else replace(program, body=body)
 
     if type(program).__name__ == "NativeProgram":
-        inner = coalesce_execution_program(program.program, unroll_limit=unroll_limit)
+        inner = coalesce_execution_program(
+            program.program, unroll_limit=unroll_limit, fair_resources=fair_resources,
+        )
         return program if inner is program.program else replace(program, program=inner)
 
     if isinstance(program, KernelProgram):
-        unwrapped = tuple(_unwrap_stage(stage, unroll_limit=unroll_limit) for stage in program.stages)
-        inlined = _fold_kernel_stages(_inline_wrapper_stages(unwrapped))
+        unwrapped = tuple(
+            _unwrap_stage(stage, unroll_limit=unroll_limit, fair_resources=fair_resources)
+            for stage in program.stages
+        )
+        inlined = _fold_kernel_stages(
+            _inline_wrapper_stages(unwrapped), fair_resources=fair_resources,
+        )
         if program.minimum_ms == 0.0 and len(inlined) == 1:
             s0 = inlined[0]
             if (
@@ -324,11 +345,15 @@ def coalesce_execution_program(program, *, unroll_limit: int = PIPELINE_UNROLL_L
         return program if inlined == program.stages else KernelProgram(inlined, program.minimum_ms)
 
     if isinstance(program, PipelineProgram):
-        return _coalesce_pipeline(program, unroll_limit=unroll_limit)
+        return _coalesce_pipeline(
+            program, unroll_limit=unroll_limit, fair_resources=fair_resources,
+        )
 
     if isinstance(program, ParallelProgram):
         children = tuple(
-            coalesce_execution_program(child, unroll_limit=unroll_limit)
+            coalesce_execution_program(
+                child, unroll_limit=unroll_limit, fair_resources=fair_resources,
+            )
             for child in program.programs
         )
         merged = coalesce_programs(children, widen_pipelines=True)
@@ -350,7 +375,9 @@ def coalesce_execution_program(program, *, unroll_limit: int = PIPELINE_UNROLL_L
         ):
             child_limit = unroll_limit // max(1, len(program.programs))
             children = tuple(
-                coalesce_execution_program(child, unroll_limit=child_limit)
+                coalesce_execution_program(
+                    child, unroll_limit=child_limit, fair_resources=fair_resources,
+                )
                 for child in program.programs
             )
             merged = children if reverted_unplaced else coalesce_programs(children, widen_pipelines=True)
@@ -364,7 +391,12 @@ def coalesce_execution_program(program, *, unroll_limit: int = PIPELINE_UNROLL_L
     return program
 
 
-def _unwrap_stage(stage: Stage, *, unroll_limit: int) -> Stage:
+def _unwrap_stage(
+    stage: Stage,
+    *,
+    unroll_limit: int,
+    fair_resources: AbstractSet[str] | None = None,
+) -> Stage:
     if stage.program is None:
         return stage
     if (
@@ -373,11 +405,18 @@ def _unwrap_stage(stage: Stage, *, unroll_limit: int) -> Stage:
         and not stage.placement and stage.fragment is None
     ):
         return replace(stage, program=None)
-    nested = coalesce_execution_program(stage.program, unroll_limit=unroll_limit)
+    nested = coalesce_execution_program(
+        stage.program, unroll_limit=unroll_limit, fair_resources=fair_resources,
+    )
     return stage if nested is stage.program else replace(stage, program=nested)
 
 
-def _coalesce_pipeline(program: PipelineProgram, *, unroll_limit: int):
+def _coalesce_pipeline(
+    program: PipelineProgram,
+    *,
+    unroll_limit: int,
+    fair_resources: AbstractSet[str] | None = None,
+):
     if (
         program.homogeneous or program.setup_ms or program.minimum_ms
         or program.producer_bindings is not None
@@ -393,22 +432,32 @@ def _coalesce_pipeline(program: PipelineProgram, *, unroll_limit: int):
                 valid = False
                 break
             seen.add(stage.name)
-            flat.append(_unwrap_stage(replace(stage, previous=()), unroll_limit=unroll_limit))
+            flat.append(_unwrap_stage(
+                replace(stage, previous=()),
+                unroll_limit=unroll_limit,
+                fair_resources=fair_resources,
+            ))
         if valid:
-            return KernelProgram(_fold_kernel_stages(_inline_wrapper_stages(flat)))
+            return KernelProgram(_fold_kernel_stages(
+                _inline_wrapper_stages(flat), fair_resources=fair_resources,
+            ))
     if 1 < program.count <= PIPELINE_COHORT_WINDOW:
         raw_tiles = [tuple(program.tile(i)) for i in range(program.count)]
         if (
             program.slots == 1
-            and program.count * len(raw_tiles[0]) <= unroll_limit
+            and sum(len(tile) for tile in raw_tiles) <= unroll_limit
             and all(len({s.name for s in tile}) == len(tile) for tile in raw_tiles)
         ):
             unrolled: list[Stage] = []
             prev_sinks: tuple[str, ...] = ()
             for t_idx, tile in enumerate(raw_tiles):
-                t_stages = _fold_kernel_stages(_inline_wrapper_stages(
-                    tuple(_unwrap_stage(s, unroll_limit=unroll_limit) for s in tile)
-                ))
+                t_stages = _fold_kernel_stages(
+                    _inline_wrapper_stages(tuple(
+                        _unwrap_stage(s, unroll_limit=unroll_limit, fair_resources=fair_resources)
+                        for s in tile
+                    )),
+                    fair_resources=fair_resources,
+                )
                 if not t_stages:
                     continue
                 local_both = (
@@ -442,17 +491,27 @@ def _coalesce_pipeline(program: PipelineProgram, *, unroll_limit: int):
                 prev_sinks = tuple(
                     pfx + s.name for s in t_stages if s.name not in consumed_t
                 ) or prev_sinks
-            return KernelProgram(_fold_kernel_stages(tuple(unrolled)))
-        protected = {p for tile in raw_tiles for s in tile for p in s.previous}
-        protected.update(s.name for tile in raw_tiles for s in tile)
-        allow_inline = (
-            {p for tile in raw_tiles for s in tile for p in s.previous}
-            if program.slots == 1 else protected
-        )
-        new_tiles = tuple(
-            _fold_kernel_stages(_inline_wrapper_stages(
-                tuple(_unwrap_stage(s, unroll_limit=unroll_limit) for s in tile), protected_names=allow_inline
+            return KernelProgram(_fold_kernel_stages(
+                tuple(unrolled), fair_resources=fair_resources,
             ))
+        cross_tile_refs = {p for tile in raw_tiles for s in tile for p in s.previous}
+        cross_tile_refs.update(
+            p for tile in raw_tiles for s in tile for p, _ in s.previous_lags
+        )
+        protected = cross_tile_refs | {s.name for tile in raw_tiles for s in tile}
+        allow_inline = cross_tile_refs if program.slots == 1 else protected
+        new_tiles = tuple(
+            _fold_kernel_stages(
+                _inline_wrapper_stages(
+                    tuple(
+                        _unwrap_stage(s, unroll_limit=unroll_limit, fair_resources=fair_resources)
+                        for s in tile
+                    ),
+                    protected_names=allow_inline,
+                ),
+                protected_names=allow_inline,
+                fair_resources=fair_resources,
+            )
             for tile in raw_tiles
         )
         return PipelineProgram(
