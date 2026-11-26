@@ -403,13 +403,15 @@ def test_index_history_is_sharded_but_recurrent_heads_are_not():
     assert not any((op.recipe in {'index_scores', 'index_topk'} for op in graph))
     assert dict(scan.metadata)['native_kind'] == 'aclnnQuantLightningIndexerV2'
     assert dict(scan.metadata)['selection_output_dtype'] == 'int32'
+    assert dict(scan.metadata)['selection_emits_scores'] is True
+    assert dict(scan.metadata)['selection_score_dtype'] == 'bf16'
     owned = [sum((owned_positions(0, 131072 + offset, 8, 1536, rank) for _ in range(2) for offset in range(1, 5))) for rank in range(8)]
     assert scan.flops == 2 * max(owned) * 32 * 128
     tile_rows = [2 * owned_positions(0, 131072 + 4 - 1, 8, 1536, rank) for rank in range(8)]
     by_id = {op.op_id: op for op in graph}
     operand_bytes = sum((by_id[dep].mte3_bytes for dep in scan.deps[:2]))
     assert scan.mte2_bytes == operand_bytes + max(tile_rows) * 130
-    assert scan.mte3_bytes == 4 * 2 * 2048 * 4
+    assert scan.mte3_bytes == 4 * 2 * 2048 * (4 + 2)
     candidate = next((op for op in graph if op.recipe == 'candidate_gather'))
     assert candidate.link_bytes == 8 * 2048 * 8 * 7
     kda = [op for op in graph if op.family in {'recurrent_vector', 'recurrent_scan'}]

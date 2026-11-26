@@ -23,7 +23,7 @@ import pytest
 
 from _support.captures import captured_report
 from _support.collective_cases import case, exchange
-from _support.operator_cases import hardware_case, mla_case
+from _support.operator_cases import hardware_case
 from mindie_sim import Case
 from mindie_sim.catalog.cache import layer_cache_components
 from mindie_sim.catalog.ops import gemm_op
@@ -37,6 +37,8 @@ from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.graph import GraphPolicy
 from mindie_sim.prediction.operator_analysis import (
     model_graphs, model_program, operator_costs, target_operators)
+from mindie_sim.prediction.operators.attention import AttentionContract, ContextParallelPlan, make_attention_op
+from mindie_sim.prediction.operators.attention._cp_tiling import HISTORY_DECODE_SITE, VLLM_REVISION
 from mindie_sim.prediction.structure import parse_case, parse_model
 from mindie_sim.prediction.structure_groups import declare_group
 from mindie_sim.schema.common import ModelingError
@@ -228,6 +230,15 @@ def test_region_and_native_candidates_require_an_explicit_selection():
     _same((chosen["native_execution"]["kind"],
            {c["native"]: c["selected"] for c in chosen["native_candidates"]}),
           ("source_selected_native", {"NativeA": True, "NativeB": False}))
+def _cp_attention_call_op():
+    history = ContextParallelPlan(
+        VLLM_REVISION, HISTORY_DECODE_SITE, "decode", "history_attention",
+        (("query", (1, 1, 128), 2),), dcp_size=2,
+    )
+    contract = AttentionContract(1, 1, 1, 128, 128, selected_tokens=33, cp_plan=history)
+    return make_attention_op(contract, op_id="s0.l0.attention", deps=("input",), dtype="bf16")
+
+
 def test_real_lower_fusion_and_source_call_identity():
     case = _source_case("v4f-a3-w8a8-tp8", ["hc_pre"], "hc_pre_m_k_split_175ef4d4",
                         peaks={"hf32": 2.0e14})
@@ -237,13 +248,14 @@ def test_real_lower_fusion_and_source_call_identity():
     _same((len(group["node_ids"]) > 1, group["resource_boundary"]["kind"],
            all(member["native_execution"]["kind"] == "covered_by_fused_region"
                for member in members)), (True, "selected_native_fusion", True))
-    calls = export_structure(mla_case(), phase="decode", tokens=1, context=16,
-                             sequences=2, native_evidence=True)
+    calls = export_op_structure((_cp_attention_call_op(),), model={},
+                                execution={"phase": "decode"}, native_evidence=True)
     call = next(row for row in calls["source_calls"])
     children = [node for node in calls["nodes"] if node["node_id"] in call["children"]]
-    selected = [child["native_execution"]["selected"] for child in children]
-    _same((call["operator"]["source_boundary"], {item["native"] for item in selected}),
-          ("call", {"decode_attention_fwd_grouped"}))
+    kernel_children = [child for child in children if child["boundary"] == "kernel"]
+    _same((call["operator"]["source_boundary"], [child["recipe"] for child in kernel_children],
+           all(child["lineage"]["source_call_id"] == call["node_id"] for child in children)),
+          ("call", ["fused_infer_attention_score"], True))
 
 def test_index_and_pure_model_projection_preserve_values():
     raw = json.loads(DECLARED_CASE.read_text())
@@ -294,7 +306,7 @@ def test_compressor_precision_override_preserves_source_bytes_and_valid_row_work
     before, after = _report(baseline), _report(selected)
     observed = _observed("fusion_contracts", "a3_v4f.csv", "Compressor")
     old_groups, groups = _groups(before, "compressor"), _groups(after, "compressor")
-    assert observed and all(group["contract"] not in observed for group in old_groups)
+    assert observed and old_groups and all(group["contract"] in observed for group in old_groups)
     assert all(group["contract"] in observed for group in groups)
     assert {group["contract"][-1][0][-1] for group in groups} == {128, 512}
     plan = next(plan for plan in selected.model.layer_plans
@@ -463,12 +475,12 @@ def test_absorption_bytes_and_group_expansion_conserve_declared_work():
             for plan in selected.model.layer_plans
         )
         assert (sum(stage_weight_bytes(selected.model, parallel, source=source)) - sum(stage_weight_bytes(baseline.model, parallel, source=source))) == expected_delta
-    case = parse_case(mla_case())
-    ops = list(target_operators(case, phase="decode", tokens=1, context=16))
-    call = next(op for op in ops if op.source_boundary == "call")
-    expansion = next(op for op in ops if op.op_id.endswith(".v_expand"))
-    declaration = dict(model=case.model.to_dict(), execution={"phase": "decode"},
-                       kernels=case.runtime.kernels)
+    call = _cp_attention_call_op()
+    expansion = gemm_op(op_id="s0.l0.v_expand", deps=(call.op_id,), stage=0, layer=0,
+                        requests=("r0",), m=1, n=128, k=128, quant=quant_preset("bf16"),
+                        category="dense", phase="decode", recipe="v_expand", family="projection")
+    ops = [call, expansion]
+    declaration = dict(model={}, execution={"phase": "decode"})
     original = export_op_structure(ops, **declaration)
     declare_group(ops, key="s0.l0.decode", role="declared_decode", family="mla",
                   members=(call.op_id, expansion.op_id), entries=(call.op_id,),
@@ -523,7 +535,8 @@ def test_down_source_program_removes_only_its_implemented_epilogue_gap(profiler_
     _same((row["target_kind"], row["observed"]["activity_sum_ns"]), ("node", events[0].duration_ns))
     if source_down:
         assert row["status"] == "compared" and down["contract_scope"]["implemented_quantized_epilogue"]["program"] == recipe
-        assert down["physical_work"]["matrix_flops"] == {"int4": 4 * 8 * 6144 * 256}
+        # 8 active experts x m_tile=2 (double_rows) padded to Arch22 INT4 subtile_m=16.
+        assert down["physical_work"]["matrix_flops"] == {"int4": 2 * 16 * 8 * 6144 * 256}
     else:
         _same((row["status"], row["reason"], row["comparison"]), ("reference_only", "quantized_epilogue_unmodeled", None))
 

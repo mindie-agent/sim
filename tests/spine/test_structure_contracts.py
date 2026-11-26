@@ -24,9 +24,11 @@ import pytest
 from _support.collective_cases import case
 from _support.kernel_invocation import copy_op, curve
 from _support.moe_hc_mc2_fixtures import mc2_case
-from _support.operator_cases import hardware_case, mla_case
+from _support.operator_cases import hardware_case, paged_mla_case
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs, target_operators
+from mindie_sim.prediction.operators.attention import AttentionContract, ContextParallelPlan, make_attention_op
+from mindie_sim.prediction.operators.attention._cp_tiling import HISTORY_DECODE_SITE, VLLM_REVISION
 from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.service_regime_domains.services import service_identity
 from mindie_sim.prediction.structure import parse_case
@@ -130,15 +132,24 @@ def test_index_preserves_peer_bound_work_and_detects_projected_record_changes():
     assert index_digest(changed) != index["index_id"]
     assert export_structure_index(raw, **{**args, "sequences": [1, 5]})["graph_id"] != index["graph_id"]
 
+def _cp_attention_call_op():
+    history = ContextParallelPlan(
+        VLLM_REVISION, HISTORY_DECODE_SITE, "decode", "history_attention",
+        (("query", (1, 1, 128), 2),), dcp_size=2,
+    )
+    contract = AttentionContract(1, 1, 1, 128, 128, selected_tokens=33, cp_plan=history)
+    return make_attention_op(contract, op_id="s0.l0.attention", deps=("input",), dtype="bf16")
+
+
 def test_source_plan_is_omitted_but_native_contract_and_physical_identity_remain():
-    raw = mla_case()
-    raw["runtime"]["kernels"]["lowerings"] = {"mla_decode": {
-        "implementation": "vllm_triton_mla_decode_tuple", "options": {"num_kv_splits": 2}}}
+    raw = paged_mla_case(splits=2)
     original = deepcopy(raw)
     args = dict(phase="decode", tokens=1, context=33, scope="body", sequences=2)
     full, index = export_structure(raw, **args), export_structure_index(raw, **args)
     assert index["graph_id"] == full["graph_id"]
-    assert index["source_calls"] and index["record_counts"]["source_calls"] == len(full["source_calls"])
+    assert index["record_counts"] == {key: len(full[key]) for key in index["record_counts"]}
+    assert any("program_execution" in node["operator"]["metadata"] for node in full["nodes"])
+    assert all("program_execution" not in node["operator"]["metadata"] for node in index["nodes"])
     for expected, actual in zip(full["nodes"], index["nodes"], strict=True):
         assert {field: actual[field] for field in INDEX_FIELDS} == {
             field: expected[field] for field in INDEX_FIELDS}
@@ -405,17 +416,21 @@ def test_real_shared_kv_attention_distinguishes_compressed_cache_presence(profil
     assert all(predicted_contract(op.to_dict()) != actual for op in glm if op.family == "attention")
 
 def test_source_attention_call_keeps_children_instead_of_becoming_one_kernel_contract():
-    raw = mla_case()
-    unexpanded = export_structure(raw, phase="decode", tokens=1, context=16, expand_calls=False)
-    expanded = export_structure(raw, phase="decode", tokens=1, context=16)
-    parent_id = "rank:0/s0.l0.latent_attention_decode"
+    call_op = _cp_attention_call_op()
+    unexpanded = export_op_structure((call_op,), model={}, execution={"phase": "decode"}, expand_calls=False)
+    expanded = export_op_structure((call_op,), model={}, execution={"phase": "decode"})
+    parent_id = "rank:0/s0.l0.attention"
     parent = next(node for node in unexpanded["nodes"] if node["node_id"] == parent_id)
     assert parent["contract"] is None
     assert parent["contract_scope"] == "source_call; expand_to_kernel_boundaries_before_tensor_comparison"
     call = next(row for row in expanded["source_calls"] if row["node_id"] == parent_id)
     children = [node for node in expanded["nodes"] if node["node_id"] in call["children"]]
-    assert [node["operator"]["metadata"]["kernel_phase"] for node in children] == ["stage1", "stage2"]
-    assert set(children[1]["deps"]) == {children[0]["node_id"], *parent["deps"]}
+    assert [node["recipe"] for node in children] == [
+        "ring_allgather", "fused_infer_attention_score", "dcp_output_pack",
+        "attention_cp_output_lse_exchange", "dcp_lse_merge",
+    ]
+    assert children[1]["boundary"] == "kernel"
+    assert all(before["node_id"] in after["deps"] for before, after in zip(children, children[1:]))
     assert all(node["lineage"]["source_call_id"] == parent_id for node in children)
 
 def test_occurrence_annotations_do_not_split_resource_identical_layers():
@@ -586,15 +601,15 @@ def test_full_identity_is_preserved_without_retaining_unselected_replicas(sequen
     assert altered["graph_id"] != reduced["graph_id"]
 
 def test_source_native_fusion_and_calls_preserve_full_hash_and_boundaries():
-    raw = mla_case()
-    raw["runtime"]["kernels"]["lowerings"] = {"mla_decode": {
-        "implementation": "vllm_triton_mla_decode_tuple", "options": {"num_kv_splits": 2}}}
-    original = deepcopy(raw)
-    args = dict(phase="decode", tokens=1, context=33, scope="body", sequences=2)
-    full = export_structure(raw, **args)
+    case_spec = _msd_block(layers=1)
+    original = deepcopy(case_spec)
+    args = dict(phase="decode", tokens=1, context=33, scope="body", sequences=1)
+    full = export_structure(case_spec, **args)
     wanted = {row["node_id"] for row in full["nodes"]} | {row["subgraph_id"] for row in full["subgraphs"]}
-    selected = select_structure_targets(raw, wanted, **args)
+    selected = select_structure_targets(case_spec, wanted, **args)
     assert selected["graph_id"] == full["graph_id"]
-    assert selected["record_counts"]["source_calls"] == len(full["source_calls"]) > 0
-    assert selected["record_counts"]["resource_operators"] == len(full["resource_operators"])
-    assert raw == original
+    assert selected["record_counts"]["source_calls"] == len(full["source_calls"])
+    assert selected["record_counts"]["resource_operators"] == len(full["resource_operators"]) > 0
+    assert case_spec == original
+    call_report = export_op_structure((_cp_attention_call_op(),), model={}, execution={"phase": "decode"})
+    assert len(call_report["source_calls"]) == 1

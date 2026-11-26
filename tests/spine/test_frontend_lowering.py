@@ -204,6 +204,7 @@ def test_target_graph_retains_frontend_capture_scope_and_padding():
     assert captured["duration_ms"] < eager["duration_ms"]
 def test_media_geometry_is_explicit_and_preserves_actual_frontend_tower_work():
     raw = json.loads(MEDIA_CASE.read_text())
+    raw["workload"]["requests"][0]["prompt_tokens"] = 5
     with pytest.raises(ValueError, match="analysis_requires_explicit_media_tokens_per_sequence"): target_graphs(raw, phase="prefill", tokens=5)
     graphs = target_graphs(raw, phase="prefill", tokens=5, media_tokens_per_sequence=4)
     language = target_graphs(raw, phase="prefill", tokens=5, media_tokens_per_sequence=0)
@@ -270,7 +271,8 @@ def test_encoded_media_keeps_sequence_positions_and_skips_only_the_tower():
     assert parsed.workload.requests[0].prompt_tokens == 8
     patches = parsed.model.vision.patch_tokens_for_media(4)
     qk = next(item for item in a.ops if item.op_id == "media0:vision.l0.qk"); pv = next(item for item in a.ops if item.op_id == "media0:vision.l0.pv")
-    assert qk.flops == pv.flops == 2 * patches ** 2 * parsed.model.vision.query_width
+    local_query_width = parsed.model.vision.query_width // parsed.runtime.parallel.tp
+    assert qk.flops == pv.flops == 2 * patches ** 2 * local_query_width
     assert pv.hbm_bytes == pv.mte2_bytes + pv.mte3_bytes
 def test_draft_quantization_and_projection_shards_match_resident_weights():
     parsed, quant = draft_case(), quant_preset("w8a8_dynamic"); draft = replace(parsed.model.auxiliary.mtp, weight_category="mtp")
@@ -466,6 +468,9 @@ def test_model_scope_keeps_service_matrix_defaults_and_explicit_choices():
         disabled, _ = effective_body_declaration(parsed, "decode", scope="model", enabled=False); assert disabled is parsed
 def test_stage_memoization_keeps_engine_duration_bit_exact():
     parsed, attention = _mq_case(); from mindie_sim.prediction.operators.paged_mla import mqsmla
+    meta = dict(attention.metadata)
+    meta["mqsmla_geometry"] = {**dict(meta["mqsmla_geometry"]), "kv_quant_mode": mqsmla.KV_QUANT_FP8}
+    attention = replace(attention, metadata=tuple(meta.items()))
     cached = operator_costs(parsed, (attention,))["operators"][0]
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(mqsmla, "lru_cache", lambda **_: lambda function: function); uncached = operator_costs(parsed, (attention,))["operators"][0]
@@ -482,7 +487,7 @@ def test_fused_draft_identity_preserves_offsets_and_namespaces():
     assert physical_key(scoped(1, 2)) != physical_key(scoped(1, 2, draft=""))
     assert physical_key(scoped(1, 2, draft="draft_prefill.")) == physical_key(scoped(3, 9, draft="draft_prefill."))
 def test_draft_cache_uses_bf16_rows_and_context_block_ownership():
-    parsed = _kimi_case(); draft = optional_draft_spec(parsed.model, "dspark"); assert cache_format(parsed.model, "mla_kv").row_bytes(576) == 656
+    parsed = _kimi_case(); draft = optional_draft_spec(parsed.model, "dspark"); assert cache_format(parsed.model, "mla_kv").row_bytes(576) == 648
     for tokens in (0, 1, 1536 * 8, 1536 * 8 + 1, 131588):
         for padded in (False, True):
             parts = stage_cache_components(parsed.model, parsed.runtime.parallel, tokens, draft_kind="dspark", capacity_padded=padded, interleave=1536, runtime=parsed.runtime)

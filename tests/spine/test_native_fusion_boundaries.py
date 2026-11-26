@@ -46,7 +46,7 @@ from mindie_sim.prediction.runtime.contracts import CatalogGeneration
 from mindie_sim.prediction.runtime.engine import Engine, Resource
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.transforms import activation_quantization, lower_implementations, norm_quant
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.schema.workload import RequestView
 from mindie_sim.structure.physical import node_physical
@@ -430,8 +430,10 @@ def test_w4a16_dequant_work_follows_active_packed_weight_bytes():
     case = _case('kimi-k2-thinking', tp=1, dp=16, ep=16, num_devices=16)
     expert = next(op for op in _ops(case, phase='decode', tokens=1, context=128) if op.layer == 1 and op.op_id.endswith('expert_up'))
     metadata = dict(expert.metadata)
+    active_experts = float(metadata['expected_active_experts'])
+    assert active_experts > 6.0 and metadata['dequant_weight_elements'] == pytest.approx(active_experts * 4096 * 7168)
     expected = float(metadata['dequant_weight_elements']) * float(metadata['dequant_ops_per_weight'])
-    assert (expert.vector_ops, expert.vector_ops) == pytest.approx((expected, 44_040_192))
+    assert expert.vector_ops == pytest.approx(expected)
 def by_id(ops):
     return {op.op_id: op for op in ops}
 def outputs(ports_or_values):
@@ -441,7 +443,7 @@ def test_quantized_ports_attach_only_to_the_matrix_activation_operand():
         _case('deepseek-v3.2', ep=1, quant='w8a8', exclude_optimizations=('mla_prolog_fusion',)),
         phase='decode', tokens=1, context=128,
     ))
-    assert outputs(input_ports(ops['s0.l1.q_a.quantize'])) == {'residual'}
+    assert outputs(input_ports(ops['s0.l1.q_a.quantize'])) == {'norm'}
     assert {'payload', 'activation_scales'} <= outputs(input_ports(ops['s0.l1.q_a']))
 def test_moe_routing_accounts_for_the_inverse_permutation():
     case = _case('kimi-k3', tp=1, dp=2, ep=2, num_devices=4, quant='w8a8')
@@ -498,7 +500,7 @@ def test_shared_prefix_keypool_plan_matches_the_published_op_bytes():
     assert (prepared.hbm_bytes, plan.work.resources['hbm']) == pytest.approx((scored.hbm_bytes,) * 2)
     serviced = operator_costs(case, (scored,))['operators'][0]['serviced']
     assert (scored.mte2_bytes, serviced['memory@r0:s0']) == pytest.approx((prepared.mte2_bytes, prepared.hbm_bytes))
-    assert prepared.mte2_bytes == pytest.approx(ledger['waves'] * ledger['wave_cache_bytes'] + ledger['waves'] * ledger['wave_descale_bytes'] + ledger['query_rows'] * ledger['heads'] * ledger['width'])
+    assert prepared.mte2_bytes == pytest.approx(ledger['waves'] * ledger['wave_cache_bytes'] + ledger['waves'] * ledger['wave_descale_bytes'] + ledger['query_rows'] * ledger['heads'] * ledger['width'] * dtype_bytes(ledger['score_dtype']))
 def test_row_shard_option_accepts_the_generic_alias():
     runtime = type('Runtime', (), {'metadata': {'row_shard_tp': 4}, 'parallel': type('Parallel', (), {'o_proj_tp': 8, 'linear_proj_tp': 1})()})()
     assert [row_shard_tp(options=options, runtime=runtime) for options in ({'row_shard_tp': 2}, {})] == [2, 4]
@@ -519,7 +521,8 @@ def test_packed_compressor_feeds_the_indexer_from_its_latent_port():
     ops = by_id(_ops(case, phase='decode', tokens=2, context=2048))
     assert 's0.l2.compress_compress' not in ops
     assert dict(ops['s0.l2.compress_pool'].metadata)['native_kinds'] == ('ZerosLike', '_pool_kernel')
-    assert 's0.l2.compress_norm' in ops['s0.l2.index_k.quantize'].deps
+    assert 's0.l2.index_k.quantize' not in ops and ops['s0.l2.index_k'].dtype == 'bf16'
+    assert 's0.l2.compress_norm' in ops['s0.l2.index_k'].deps
     assert 's0.l2.compress_rotary' in ops['s0.l2.compressed_store'].deps
     assert 's0.l2.compress_norm' not in ops['s0.l2.compressed_store'].deps
 @pytest.mark.parametrize('ranges,completed', [(((0, 1), (3, 4)), 1), (((0, 2),), 0)])
@@ -537,7 +540,10 @@ def test_pcp_store_and_gather_account_for_completed_rows(model, layers, tokens, 
     writes, wire = ops[prefix + store].mte3_bytes, ops[prefix + gather].link_bytes
     assert writes == pytest.approx(expected)
     if store == 'compressed_store':
-        assert ops[prefix + 'index_store'].mte3_bytes == pytest.approx(130) and wire > 0
+        payload_store = ops[prefix + 'index_store'].mte3_bytes
+        scale_store = ops[prefix + 'index_scale_store'].mte3_bytes
+        assert payload_store == pytest.approx(128) and scale_store == pytest.approx(2)
+        assert payload_store + scale_store == pytest.approx(130) and wire > 0
     else:
         assert wire == pytest.approx(writes)
 @pytest.mark.parametrize('override', [{'do_rope': False}, {'parallel_cp': 2}])
