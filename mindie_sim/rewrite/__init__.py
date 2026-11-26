@@ -5,6 +5,7 @@
 [Timeouts & Locks] Imports use normal Python module initialization.
 [Side-Effect Policy] No execution, device access, or external writes on import.
 """
+from ._oracle_prefetch import primitive_table_digest_token
 from .algebra import (
     AlgebraicCandidate, AlgebraicRewriteResult, AlgebraicTrait,
     OpTraitInfo, SemanticAuditTrigger, classify_op_traits,
@@ -53,5 +54,6 @@ __all__ = [
     "encode_rewrite_plan", "load_rewrite_plan", "plan_sha256", "ACCEL_MAX_L", "ACCEL_MAX_R", "ACCEL_MAX_T",
     "ACCEL_MAX_U", "FAKE_OVERLAP_THRESHOLD_PCT", "SHIPPING_REGRESSION_TOLERANCE_NS",
     "GateReceipt", "ShippingRegression",
-    "SoundnessInversionError", "VerificationReceipt", "compute_overlap_pct", "verify_plan",
+    "SoundnessInversionError", "VerificationReceipt", "compute_overlap_pct",
+    "primitive_table_digest_token", "verify_plan",
 ]

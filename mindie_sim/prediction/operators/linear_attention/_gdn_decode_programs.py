@@ -14,184 +14,28 @@ import math
 from mindie_sim.schema.common import dtype_bytes
 
 from ...mechanism import OperatorPlan, Work
-from ...engine import Allocation
 from ...ownership import read_role, unit_group
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from ...transactions import QueuedStore
+from mindie_sim.prediction.operators.causal_conv import (
+    CONV as CONV,
+    CONV_SOURCE as CONV_SOURCE,
+    CONV_SPECULATIVE_WIDTH as CONV_SPECULATIVE_WIDTH,
+    CONV_SUPPORTED_WIDTHS as CONV_SUPPORTED_WIDTHS,
+    conv_plan as conv_plan,
+    conv_schedule as conv_schedule,
+    conv_spec_terms as conv_spec_terms,
+    conv_task_runs as conv_task_runs,
+    conv_token_ops as conv_token_ops,
+    update_geometry as update_geometry,
+)
 
 GATING = "ascend_gdn_decode_gating"
-CONV = "ascend_causal_conv1d_update"
 BF16_BYTES = int(dtype_bytes("bf16"))
 FP32_BYTES = int(dtype_bytes("fp32"))
-CONV_TILE_CHANNELS = (4096, 2048, 1024, 512, 384, 192)
-CONV_MAX_TILE_CHANNELS = CONV_TILE_CHANNELS[0]
-CONV_SPECULATIVE_WIDTH = 4
-CONV_SUPPORTED_WIDTHS = frozenset({2, 3, CONV_SPECULATIVE_WIDTH})
-CONV_RING_SLOTS = 5
-CONV_FP32_SCRATCH_SLOTS = 8
 GATING_TILE_ROWS = 64
 GATING_TILE_HEADS = 8
 GATING_PER_ELEMENT_OPS = 13
-#: A rolling state ring is single-buffered: token i+1 reads what token i wrote.
-CONV_TOKEN_SLOTS = 1
-#: Per-token vector expression: three window taps, the Silu/bias fixed term and
-#: the optional two-op bias add, each over the owned channel width.
-CONV_TOKEN_TAP_OPS = 3
-CONV_TOKEN_FIXED_OPS = 5
-CONV_TOKEN_BIAS_OPS = 2
-NS_TO_MS = 1e-6
-
-
-def _primitive_latency_ms(context, primitive_id: str, metric: str) -> float:
-    """Read a calibrated primitive latency in ms from ``context.primitive_table``."""
-    table = getattr(context, "primitive_table", None)
-    if table is None or primitive_id not in getattr(table, "primitives", ()):
-        return 0.0
-    cell = table.cell(primitive_id)
-    band = cell.metrics.get(metric)
-    if band is None or band.p50 is None or band.p50 <= 0.0:
-        return 0.0
-    return float(band.p50) * NS_TO_MS
-CONV_SOURCE = {
-    "path": "data/observations/sources/native-causal-conv-a4a7958",
-    "revision": "a4a795857868729fbdbb0118c1e06c8655a7b31b",
-    "kernel": "op_kernel/causal_conv1d.h",
-    "ranges": ((310, 405), (463, 548), (888, 910), (1008, 1097), (1216, 1288)),
-    "dispatch": "op_host/causal_conv1d_tiling_planner.h:25-73",
-}
-
-
-def update_geometry(batch, dim, units):
-    """Exact-divisor candidates take precedence over candidates with a tail."""
-    for exact in (True, False):
-        choices = [(tile, math.ceil(dim / tile)) for tile in CONV_TILE_CHANNELS
-                   if not exact or dim % tile == 0]
-        if choices:
-            over = [item for item in choices if batch * item[1] >= units]
-            tile, columns = (min(over, key=lambda item: batch * item[1] - units)
-                             if over else max(choices, key=lambda item: (batch * item[1], -item[0])))
-            return tile, columns, min(units, batch * columns)
-
-
-def _state_slots(lengths, padding_slots):
-    slots = set(padding_slots)
-    return tuple(slot not in slots for slot in range(len(lengths)))
-
-
-def _conv_traffic(q, width, bias, speculative, has_state):
-    """Payload descriptors for one physical sequence slot.
-
-    A graph-padded slot retains its physical query rows (the captured graph
-    still executes them) but owns no state row, so it neither reloads prior
-    history nor writes a checkpoint.  The source CacheSkipped branch removes
-    exactly those history descriptors, not the convolution itself.
-    """
-    history = width - 1 if has_state else 0
-    spec_read = (2 + q) if (speculative and has_state) else 0
-    spec_write = (2 + q) if (speculative and has_state) else history
-    return width + int(bias) + history + q + spec_read, q + spec_write
-
-
-def _conv_runs(lengths, dim, tile_width, columns, blocks, owner, *, compact,
-               has_state):
-    """Yield (query rows, channel width, repetitions, state_owned)."""
-    count = (len(lengths) * columns - 1 - owner) // blocks + 1
-    if compact and (columns == 1 or dim % tile_width == 0) and all(
-            q == lengths[0] for q in lengths) and all(has_state):
-        yield lengths[0], min(tile_width, dim), count, True
-        return
-    previous, repeat = None, 0
-    for task in range(owner, len(lengths) * columns, blocks):
-        seq, col = divmod(task, columns)
-        # Source ResolveSeqTaskWindow rejects repeated offsets and
-        # ResolveSeqCacheIndex rejects null/pad slots before LoadWeight, RunSeq
-        # and writeback. The slot still participates in the host grid only.
-        if lengths[seq] == 0 or not has_state[seq]:
-            continue
-        descriptor = (lengths[seq], min(tile_width, dim - col * tile_width),
-                      has_state[seq])
-        if previous is not None and (not compact or descriptor != previous):
-            yield previous[0], previous[1], repeat, previous[2]
-            repeat = 0
-        previous = descriptor
-        repeat += 1
-    if previous is not None:
-        yield previous[0], previous[1], repeat, previous[2]
-
-
-def conv_task_runs(lengths, dim, tile_width, columns, blocks, owner, *, compact=True):
-    """Yield (query rows, channel width, repetitions) in this owner's order.
-
-    Repetitions retain distinct weights, input and state addresses. Only their
-    equal resource cycles are compacted; no cache reuse or DMA coalescing follows
-    from equal geometry. Ragged/tail runs stay bounded to one pending descriptor.
-    ``conv_plan`` retains the per-slot state flag through the private
-    ``_conv_runs`` iterator; this public diagnostic keeps its published shape.
-    """
-    for q, n, repeat, _ in _conv_runs(
-            lengths, dim, tile_width, columns, blocks, owner, compact=compact,
-            has_state=(True,) * len(lengths)):
-        yield q, n, repeat
-
-
-def conv_schedule(lengths, dim, units, *, width, bias, speculative, compact=True,
-                  padding_slots=()):
-    """Source task/transfer diagnostics; descriptor counts are not latencies."""
-    tile_width, columns, blocks = update_geometry(len(lengths), dim, units)
-    has_state = _state_slots(lengths, padding_slots)
-    counts = tuple(sum(1 for _ in _conv_runs(
-        lengths, dim, tile_width, columns, blocks, owner, compact=compact,
-        has_state=has_state)) for owner in range(blocks))
-    traffic = [_conv_traffic(q, width, bias, speculative, own)
-               for q, own in zip(lengths, has_state) if q > 0 and own]
-    return {
-        "kind": "causal_conv1d_serial_runs", "compact": compact,
-        "logical_tasks": len(lengths) * columns, "resource_cycles": sum(counts),
-        "owner_cycles": counts, "active_aiv": blocks, "tile_channels": tile_width,
-        "channel_tiles": columns,
-        "padding_slots": tuple(sorted(int(slot) for slot in padding_slots)),
-        "read_descriptors": columns * sum(read for read, _ in traffic),
-        "write_descriptors": columns * sum(write for _, write in traffic),
-        "contention_approximation": "serial_cycle_fluid_rephasing" if compact else "none",
-    }
-
-
-def conv_spec_terms(lengths, padding_slots, width, dim, bias, speculative):
-    """Geometry-free ``(external_hbm, reads, writes, vector)`` of the update kernel.
-
-    Shared by ``conv_plan`` and the lowering so the declared ``OpSpec`` carries
-    exactly the executed descriptors (never a zero-work placeholder).
-    """
-    has_state = _state_slots(lengths, padding_slots)
-    traffic = [_conv_traffic(q, width, bias, speculative, own)
-               for q, own in zip(lengths, has_state) if q > 0 and own]
-    reads = sum(amount for amount, _ in traffic) * dim * 2
-    writes = sum(amount for _, amount in traffic) * dim * 2
-    # Externally observed envelope of `causal_conv1d_update` on the paired
-    # `#62` SKUs: `q` current tokens plus `width - 1` prior history rows are
-    # read cold, and `q` outputs plus `state_write` (`2 + q` speculative via
-    # `WriteBackStateSpec`, `width - 1` non-speculative) dirty rows are written
-    # back. The `width` weight taps stay L2-resident across per-sequence
-    # repetitions, and speculative reload re-reads already-fetched rows.
-    external = sum(
-        ((q + width - 1) + (q + (2 + q if speculative else width - 1))) * dim * BF16_BYTES
-        for q, own in zip(lengths, has_state) if q > 0 and own
-    )
-    vector = sum((width + 1 + q * conv_token_ops(width, bias)) * dim
-                 for q, own in zip(lengths, has_state) if q > 0 and own)
-    return external, reads, writes, vector
-
-
-def conv_token_ops(width, bias):
-    # Source recasts each window tap before the multiply/add; SiLU is
-    # neg/exp/add/div/multiply.
-    return CONV_TOKEN_TAP_OPS * width + CONV_TOKEN_FIXED_OPS + CONV_TOKEN_BIAS_OPS * int(bias)
-
-
-def _conv_work(lengths, padding_slots, width, dim, bias, speculative, read):
-    external, reads, writes, vector = conv_spec_terms(lengths, padding_slots, width, dim, bias, speculative)
-    work = Work(resources={"hbm": external, read: reads, "mte3": writes, "vector": vector})
-    return work, conv_token_ops(width, bias)
 
 
 def gating_spec_terms(rows, heads):
@@ -204,152 +48,6 @@ def gating_spec_terms(rows, heads):
     reads = elements * 2 * BF16_BYTES + heads * 2 * FP32_BYTES
     writes = elements * (FP32_BYTES + BF16_BYTES)
     return reads, writes, elements * GATING_PER_ELEMENT_OPS
-
-
-def conv_plan(op, geometry, *, compact=True):
-    meta = dict(op.metadata)
-    lengths = tuple(meta.get("physical_sequence_tokens", meta["sequence_tokens"]))
-    width = meta["kernel_width"]
-    dim, dtype = op.local_shape[1], op.dtype
-    if dtype not in {"bf16", "fp16"} or width not in CONV_SUPPORTED_WIDTHS:
-        raise ValueError("gdn_decode_convolution_requires_16bit_width2to4")
-    padding_slots = tuple(int(slot) for slot in meta.get("padding_slots", ()))
-    if len(set(padding_slots)) != len(padding_slots) or any(
-            slot < 0 or slot >= len(lengths) for slot in padding_slots):
-        raise ValueError("gdn_decode_convolution_padding_slot_outside_partition")
-    has_state = _state_slots(lengths, padding_slots)
-    speculative = bool(meta["speculative"])
-    bias = meta.get("bias", False)
-    if not any(q > 0 and own for q, own in zip(lengths, has_state)):
-        # A capacity/padding probe can retain physical buffer descriptors with
-        # zero active rows.  The UPDATE source skips null/pad slots before
-        # RunSeq, so no convolution or state work executes; the host grid and
-        # tensor extents remain with an explicit empty program.
-        return OperatorPlan(Work(), lambda context: KernelProgram(()),
-                            metadata={"empty_active_sequences": True})
-    max_query = max((q for q, own in zip(lengths, has_state) if q > 0 and own),
-                    default=1)
-    if speculative and (width != CONV_SPECULATIVE_WIDTH or meta["state_history_slots"] < 2 + max_query):
-        raise ValueError("gdn_decode_speculative_convolution_requires_width4_history")
-    if not speculative and meta["state_history_slots"] < width - 1:
-        raise ValueError("gdn_decode_convolution_requires_history_width_minus_one")
-    units = geometry.resource_units.get("vector", geometry.compute_units)
-    schedule = conv_schedule(lengths, dim, units, width=width, bias=bias,
-                             speculative=speculative, compact=compact,
-                             padding_slots=padding_slots)
-    tile_width, columns, blocks = schedule["tile_channels"], schedule["channel_tiles"], schedule["active_aiv"]
-
-    def runs(owner):
-        return _conv_runs(lengths, dim, tile_width, columns, blocks, owner,
-                          compact=compact, has_state=has_state)
-    run_counts = schedule["owner_cycles"]
-    read = read_role(geometry.resource_units, aiv=0)
-    work, token_ops = _conv_work(lengths, padding_slots, width, dim, bias, speculative, read)
-
-    def program(context):
-        def task(q, n, repeat, owns_state, owner):
-            owned = context.owned(owner, units, ("vector", read, "mte3"))
-            def memory(amount, role):
-                return context.bind(Work(resources={role: amount}).scaled(repeat))
-            def token(index):
-                stages = [
-                    Stage("input", memory(n * 2, read), placement=owned),
-                    Stage("convolution", context.bind(Work(resources={"vector": n * token_ops}).scaled(repeat)),
-                          after=("input",), previous=("convolution",), placement=owned),
-                    Stage("output", memory(n * 2, "mte3"),
-                          after=("convolution",), placement=owned),
-                ]
-                if speculative and owns_state:
-                    stages.append(Stage("state_write",
-                                        memory(n * 2, "mte3"),
-                                        after=("input",), placement=owned))
-                elif state_write and index == q - 1:
-                    # ``causal_conv1d.h`` writes the last ``W-1`` history rows
-                    # from the ring updated by the final token input, so the
-                    # write follows that input load; it still overlaps the last
-                    # token's convolution/output instead of extending the task.
-                    stages.append(Stage("state_write",
-                                        memory(state_write * n * 2, "mte3"),
-                                        after=("input",), placement=owned))
-                return tuple(stages)
-            history = width - 1 if owns_state else 0
-            state_write = (2 + q) if (speculative and owns_state) else history
-            state_resolve_ms = _primitive_latency_ms(context, "P12_intracore_flag", "flag_v_mte3_ns")
-            stages = [
-                # `ResolveSeqCacheIndex` + `ResolveSeqTaskWindow` run once per
-                # task on this owner before any tap is issued, so the resolve
-                # latency repeats with every equal-geometry compaction step.
-                Stage("state_resolve", placement=owned,
-                      latency=state_resolve_ms * repeat),
-                Stage("weights_history",
-                      memory((width + int(bias) + history) * n * 2, read),
-                      after=("state_resolve",), placement=owned),
-                Stage("weights_cast", context.bind(Work(resources={"vector": (width + 1) * n}).scaled(repeat)),
-                      after=("weights_history",), placement=owned),
-                Stage("tokens", after=("weights_cast",),
-                      program=PipelineProgram(q, CONV_TOKEN_SLOTS, token)),
-            ]
-            # The streamed token/history rows leave the core through the
-            # shared HBM bus as one address stream, double-buffered against the
-            # token convolution rather than extending the token-critical path.
-            if owns_state:
-                stream_rows = (q + history) + (q + state_write)
-                stages.append(Stage("external_stream", context.bind(Work(
-                    resources={"hbm": stream_rows * n * BF16_BYTES}).scaled(repeat)),
-                    after=("weights_cast",), placement=owned))
-            # The retained-history reload is a prefetch for the speculative
-            # restore; it may double-buffer against the token convolution.
-            if speculative and owns_state:
-                stages.append(Stage("state_reload",
-                                    memory((2 + q) * n * 2, read),
-                                    after=("weights_cast",), placement=owned))
-                stages.append(Stage("state_retained_write",
-                                    memory(2 * n * 2, "mte3"),
-                                    after=("weights_cast",), placement=owned))
-            return (Stage("sequence", program=KernelProgram(tuple(stages))),)
-        def owner_program(owner):
-            # Source drains MTE3 between tasks. Equal cycles on one owner are a
-            # time-dilated serial run, not overlapping sequences. Work and each
-            # owner's fixed buffers remain exact; external contention can be
-            # rephased by compaction. compact=False is the detailed oracle.
-            pending = tuple(runs(owner))
-            tiles = PipelineProgram(run_counts[owner], 1,
-                                    lambda index, pending=pending: task(*pending[index], owner))
-            pool = context.pool_names.get("ub")
-            if pool is None:
-                return tiles
-            # InitSharedBuffersAndEvents reserves the fixed ring, two outputs,
-            # and eight FP32 calculation slots once per executing AIV.
-            storage = CONV_MAX_TILE_CHANNELS * (
-                (CONV_RING_SLOTS + 2) * BF16_BYTES + CONV_FP32_SCRATCH_SLOTS * FP32_BYTES
-            )
-            owned_pool = unit_group(owner, units, context.pool_units.get("ub", units))
-            allocation = (Allocation("conv_buffers", pool, storage, owned_pool),)
-            return KernelProgram((Stage("buffers", acquire=allocation),
-                                  Stage("tasks", after=("buffers",), program=tiles),
-                                  Stage("release", after=("tasks",), free=allocation)))
-        # One program per physical AIV owner, as the convolution contract
-        # requires: each demand-carrying task keeps its own single unit. The
-        # launch-level setup is finite and precedes every owner's first task.
-        call_setup_ms = _primitive_latency_ms(context, "P15_rts_stars", "aiv_first_issue_ns")
-        return KernelProgram((
-            Stage("descriptor_setup", latency=call_setup_ms),
-            Stage("owners", after=("descriptor_setup",), program=ParallelProgram(
-                tuple(owner_program(owner) for owner in range(blocks)))),
-        ))
-    plan_meta = {
-        "padding_slots": padding_slots,
-        "state_slots": tuple(slot for slot, own in enumerate(has_state) if own),
-        "free_state_slots": tuple(slot for slot, own in enumerate(has_state) if not own),
-        "state_write_bytes": sum(
-            (2 + q if speculative else width - 1) * dim * 2
-            for q, own in zip(lengths, has_state) if q > 0 and own),
-    }
-    if "gdn_state_contract" in meta:
-        plan_meta["state_contract"] = meta["gdn_state_contract"]
-    if "gdn_state_effects" in meta:
-        plan_meta["state_effects"] = meta["gdn_state_effects"]
-    return OperatorPlan(work, program, metadata=plan_meta)
 
 
 def gating_plan(op, geometry):
