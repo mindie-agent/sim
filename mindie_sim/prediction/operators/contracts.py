@@ -33,6 +33,12 @@ from mindie_sim.schema.workload import RequestView
 from ..mechanism import Geometry, OperatorPlan
 from ..program import Recipe, RecipeBook
 from ..results import FusedPipelineDescriptor, OpOccurrence
+from ..runtime.l2_residency import (
+    AdmissionMemoryView,
+    RawDieL2Bytes,
+    UsableL2Bytes,
+    resolve_usable_l2_bytes,
+)
 from ..streams import StreamOwners
 
 
@@ -46,7 +52,7 @@ class OperatorPlanningContext:
     recipe_book: RecipeBook | None = None
     requested_abi: str | None = None
     stream_owners: StreamOwners | None = None
-    admission_memory_view: Any = None
+    admission_memory_view: AdmissionMemoryView | None = None
     allocation_versions: tuple[tuple[str, int], ...] = ()
     requests: tuple[RequestView, ...] = ()
     padded_tokens: int = 0
@@ -69,6 +75,29 @@ class OperatorPlanningContext:
             self.stream_owners.aiv_limit
             if self.stream_owners is not None else self.datapath.aiv_count
         )
+
+    @property
+    def usable_l2_bytes(self) -> UsableL2Bytes:
+        """Live usable L2 capacity on this occurrence's die."""
+        die = (
+            int(self.occurrence.rank)
+            if self.occurrence.rank is not None
+            else (int(self.geometry.rank) if self.geometry.rank is not None else 0)
+        )
+        view = (
+            self.admission_memory_view
+            if self.admission_memory_view is not None
+            else self.geometry.admission_memory_view
+        )
+        if "l2" in self.geometry.buffers:
+            raw = RawDieL2Bytes(max(0, int(self.geometry.buffers["l2"])))
+        else:
+            dp_buffers = dict(self.datapath.buffers)
+            if "l2" in dp_buffers:
+                raw = RawDieL2Bytes(max(0, int(dp_buffers["l2"])))
+            else:
+                raw = self.geometry.raw_l2_bytes
+        return resolve_usable_l2_bytes(view, die, fallback_raw_l2=raw)
 
 
 @dataclass(frozen=True, slots=True)

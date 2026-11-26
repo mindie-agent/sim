@@ -18,6 +18,12 @@ from mindie_sim.schema.datapath import DatapathCapabilitySpec, datapath_for_devi
 from mindie_sim.schema.operators import OpSpec
 from .program.binding import RecipeContext
 from .program.stages import KernelProgram, Program, Stage
+from .runtime.l2_residency import (
+    AdmissionMemoryView,
+    RawDieL2Bytes,
+    UsableL2Bytes,
+    resolve_usable_l2_bytes,
+)
 
 
 @dataclass(frozen=True)
@@ -124,10 +130,31 @@ class Geometry:
     replica: int = 0
     rank: int | None = None
     stream_owners: object = None
-    admission_memory_view: object = None
+    admission_memory_view: AdmissionMemoryView | None = None
     requests: tuple = ()
     padded_tokens: int = 0
     layout: str = ""
+
+    @property
+    def raw_l2_bytes(self) -> RawDieL2Bytes:
+        """Installed physical L2 capacity on this die before reservations or stream sharing."""
+        if "l2" in self.buffers:
+            return RawDieL2Bytes(max(0, int(self.buffers["l2"])))
+        if self.datapath is not None:
+            dp_buffers = dict(self.datapath.buffers)
+            if "l2" in dp_buffers:
+                return RawDieL2Bytes(max(0, int(dp_buffers["l2"])))
+        hierarchy = getattr(self.physical_mechanisms, "memory_hierarchy", None)
+        if hierarchy is not None and hasattr(hierarchy, "l2_capacity_bytes"):
+            return RawDieL2Bytes(max(0, int(hierarchy.l2_capacity_bytes)))
+        return RawDieL2Bytes(0)
+
+    def usable_l2_bytes(self, die: int | None = None) -> UsableL2Bytes:
+        """Live usable L2 capacity bounded by ``admission_memory_view`` and ``raw_l2_bytes``."""
+        resolved_die = (0 if self.rank is None else int(self.rank)) if die is None else int(die)
+        return resolve_usable_l2_bytes(
+            self.admission_memory_view, resolved_die, fallback_raw_l2=self.raw_l2_bytes,
+        )
 
     @classmethod
     def from_devices(cls, devices, *, links=(), transfer_channels=()):

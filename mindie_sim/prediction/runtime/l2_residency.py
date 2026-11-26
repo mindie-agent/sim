@@ -8,10 +8,11 @@
 """
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from hashlib import sha256
 import math
+from typing import Any, NewType, cast
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.device_input import MemoryAccessSpec
@@ -22,7 +23,7 @@ from .memory_physics import (
     CachePolicy, VALID_CACHE_POLICIES,
     ConstraintTerm, CounterTerm,
     DEFAULT_L2_GRANULE_BYTES,
-    HbmBusSpec, MemoryAccessPattern,
+    HbmBusSpec, MemoryAccessPattern, PeriodicSectorRun,
     ReuseKey, SectorCoverage,
     _L2_CACHE_DISABLE, _MAX_EXPLICIT_SECTOR_INTERVALS,
     _align_up, _intersect_byte_intervals, _measure_byte_intervals,
@@ -43,9 +44,20 @@ from .periodic_runs import (
 _MEBIBYTE = 1024 * 1024
 _RECT_LEDGER_CACHE_LIMIT = 256
 _CACHE_EVICTION_ORDER = {CACHE_POLICY_NORMAL: 0, CACHE_POLICY_LAST_USE: 1, CACHE_POLICY_PERSISTENT: 2}
+_NORMAL_CACHE_POLICY: CachePolicy = "normal"
+
+RawDieL2Bytes = NewType("RawDieL2Bytes", int)
+UsableL2Bytes = NewType("UsableL2Bytes", int)
 
 
 _LEGACY_CACHE_POLICIES = frozenset({CACHE_POLICY_NORMAL, CACHE_POLICY_DISABLE})
+
+
+def _plan_sector_bytes(plan: AddressRunPlan) -> int:
+    sec = plan.sector_bytes
+    if sec is None:
+        raise ModelingError("address_run_plan_sector_bytes_unset")
+    return sec
 
 
 def cache_policy_for_arch(arch_id: str, policy: CachePolicy) -> CachePolicy:
@@ -85,15 +97,16 @@ def _p05_knee(ws_sweep: Mapping[int | str, float], capacity: int) -> tuple[tuple
     return tuple(points)
 
 
-def primitive_working_set_sweep(table) -> Mapping[int | str, float]:
+def primitive_working_set_sweep(table: Any) -> Mapping[int | str, float]:
     """Read the working-set sweep from the declared primitive table."""
     cell = getattr(table, "cell", None)
     if cell is None:
         return {}
-    return cell("P05_l2_residency_reuse").parameters.get("ws_sweep_bytes_per_s", {})
+    sweep: Mapping[int | str, float] = cell("P05_l2_residency_reuse").parameters.get("ws_sweep_bytes_per_s", {})
+    return sweep
 
 
-def _access_plan(plan: AddressRunPlan, spec) -> AddressRunPlan:
+def _access_plan(plan: AddressRunPlan, spec: MemoryAccessSpec | None) -> AddressRunPlan:
     if spec is None or (
         not plan._default_sector and plan.l2_line_bytes and plan.l2_sector_bytes
         and plan.hbm_burst_granule_bytes
@@ -133,7 +146,7 @@ class _ResidentL2Entry:
     dirty_ranges: tuple[tuple[int, int], ...] = ()
     dirty_coverage: SectorCoverage = SectorCoverage()
     has_future_reader: bool = True
-    cache_policy: str = CACHE_POLICY_NORMAL
+    cache_policy: CachePolicy = _NORMAL_CACHE_POLICY
     line_footprint_bytes: int | None = None
     resident_intervals_mut: list[tuple[int, int]] | None = None
     resident_scale_intervals: tuple[tuple[int, int], ...] = ()
@@ -202,7 +215,9 @@ def _entry_payload_overlap_bytes(req_cov: SectorCoverage, entry: _ResidentL2Entr
         return sum(entry.resident_bands.overlap_interval(lo, hi) for lo, hi in req_cov.intervals)
     if entry.resident_intervals_mut is not None and not req_cov.periodic:
         from ._periodic_stream import _overlap_canonical_intervals
-        return _overlap_canonical_intervals(req_cov.intervals, entry.resident_intervals_mut)
+        return _overlap_canonical_intervals(
+            req_cov.intervals, cast(tuple[tuple[int, int], ...], entry.resident_intervals_mut),
+        )
     return _coverage_overlap(_payload_only(req_cov), _payload_only(entry.coverage_snapshot()))
 
 
@@ -213,7 +228,9 @@ def _entry_interval_overlap(lo: int, hi: int, entry: _ResidentL2Entry) -> int:
         return entry.resident_bands.overlap_interval(lo, hi)
     if entry.resident_intervals_mut is not None:
         from ._periodic_stream import _overlap_canonical_intervals
-        return _overlap_canonical_intervals(((lo, hi),), entry.resident_intervals_mut)
+        return _overlap_canonical_intervals(
+            ((lo, hi),), cast(tuple[tuple[int, int], ...], entry.resident_intervals_mut),
+        )
     if not entry.resident_coverage.periodic:
         from ._periodic_stream import _overlap_canonical_intervals
         return _overlap_canonical_intervals(((lo, hi),), entry.resident_coverage.intervals)
@@ -249,7 +266,8 @@ def _materialize_runs(runs: Iterable[AddressRun]) -> tuple[tuple[int, int], ...]
 
 
 def _single_span_hit_bytes(
-    base: int, logical_len: int, aligned_len: int, sec: int, align: int, interval_overlap_fn,
+    base: int, logical_len: int, aligned_len: int, sec: int, align: int,
+    interval_overlap_fn: Callable[[int, int], int],
 ) -> int:
     s_lo = (base // sec) * sec
     s_hi = _align_up(base + logical_len, sec)
@@ -266,7 +284,8 @@ def _single_span_hit_bytes(
 
 def _run_hit_bytes(
     run: AddressRun, rows_eff: int, run_aligned: int, sec: int, align: int,
-    overlap_fn, interval_overlap_fn,
+    overlap_fn: Callable[[SectorCoverage], int],
+    interval_overlap_fn: Callable[[int, int], int],
 ) -> int:
     run_cov = AddressRunPlan((run,), sector_bytes=sec).sector_coverage()
     run_req = _cov_payload_bytes(run_cov)
@@ -298,14 +317,17 @@ def _run_hit_bytes(
 
 
 def _plan_hit_bytes(
-    plan: AddressRunPlan, overlap_fn, interval_overlap_fn,
-    resident_scale_intervals: tuple[tuple[int, int], ...], aligned_bytes: int,
+    plan: AddressRunPlan,
+    overlap_fn: Callable[[SectorCoverage], int],
+    interval_overlap_fn: Callable[[int, int], int],
+    resident_scale_intervals: tuple[tuple[int, int], ...],
+    aligned_bytes: int,
 ) -> int:
     """Weighted aligned copy hit bytes across per-row/run payload spans and disjoint scale sectors."""
     seen_aliases: set[str] = set()
     plan_aligned = 0
     plan_hit = 0
-    sec = plan.sector_bytes
+    sec = _plan_sector_bytes(plan)
     align = plan.alignment_bytes
     for run in plan.runs:
         if run.rows == 0 or run.row_bytes == 0:
@@ -427,6 +449,10 @@ class AdmissionMemoryView:
             raise ModelingError(f"l2_granule_invalid:{self.granule_bytes!r}")
         self._knee_curve = next(filter(None, self._knee_curves_by_die.values()), ())
 
+    def has_die(self, die: int) -> bool:
+        """Return True when ``die`` is declared in this admission view."""
+        return die in self._l2_capacity
+
     def memory_access_for(self, die: int) -> MemoryAccessSpec | None:
         return self._memory_access_by_die.get(die, self._memory_access_default)
 
@@ -456,11 +482,15 @@ class AdmissionMemoryView:
         """Fingerprint the admission state, including the order of LRU entries."""
         digest = sha256()
 
-        def record(*fields):
+        def record(*fields: object) -> None:
             digest.update(repr(fields).encode())
             digest.update(b"\n")
 
-        def coverage(intervals, periodic, scale_intervals=()):
+        def coverage(
+            intervals: Sequence[tuple[int, int]],
+            periodic: Sequence[PeriodicSectorRun],
+            scale_intervals: Sequence[tuple[int, int]] = (),
+        ) -> None:
             for interval in intervals:
                 record("interval", interval)
             for run in periodic:
@@ -586,10 +616,10 @@ class AdmissionMemoryView:
         victims: list[_ResidentL2Entry] = []
         evicted: set[ReuseKey] = set()
 
-        def priority(entry):
+        def priority(entry: _ResidentL2Entry) -> tuple[int, bool]:
             return _CACHE_EVICTION_ORDER[entry.cache_policy], entry.key == protect_key
 
-        def charge(entry):
+        def charge(entry: _ResidentL2Entry) -> int:
             return (min(entry.working_set_bytes, avail)
                     if smooth and not entry.dirty else entry.working_set_bytes)
 
@@ -725,7 +755,7 @@ class AdmissionMemoryView:
         """Find the latest resident producer, then an active key for this allocation version."""
         identity = fallback.die, fallback.backing_allocation, fallback.tensor_version
 
-        def matches(key):
+        def matches(key: ReuseKey) -> bool:
             return (key.die, key.backing_allocation, key.tensor_version) == identity
 
         for key in reversed(self._resident):
@@ -853,7 +883,7 @@ class AdmissionMemoryView:
         lines = AddressRunPlan(tuple(_coverage_runs(coverage)), sector_bytes=line_bytes)
         return _cov_payload_bytes(lines.sector_coverage()) + scale_fp
 
-    def _policy(self, pattern: MemoryAccessPattern) -> str:
+    def _policy(self, pattern: MemoryAccessPattern) -> CachePolicy:
         return (pattern.cache_policy if self.arch_id is None
                 else cache_policy_for_arch(self.arch_id, pattern.cache_policy))
 
@@ -868,7 +898,9 @@ class AdmissionMemoryView:
                 raise ModelingError(f"l2_die_undeclared:{key.die}")
         return key
 
-    def _existing(self, pattern, key, eff, *, preview):
+    def _existing(
+        self, pattern: MemoryAccessPattern, key: ReuseKey, eff: int, *, preview: bool,
+    ) -> _ResidentL2Entry | None:
         entry = self._resident.get(key)
         if entry is None or entry.evicted or entry.version != pattern.version:
             return None
@@ -879,7 +911,13 @@ class AdmissionMemoryView:
         return entry
 
     def _classify_access_with_overlap(
-        self, pattern, aligned_bytes, eff, coverage, working_set, entry,
+        self,
+        pattern: MemoryAccessPattern,
+        aligned_bytes: int,
+        eff: int,
+        coverage: SectorCoverage,
+        working_set: int,
+        entry: _ResidentL2Entry | None,
     ) -> tuple[int, int, int | None]:
         """Return ``(hit, miss, overlap_bytes_or_None)`` using one overlap scan."""
         if eff <= 0:
@@ -887,14 +925,15 @@ class AdmissionMemoryView:
         if pattern.direction == "read":
             if entry is None:
                 return 0, aligned_bytes, None
-            fraction = self._hit_fraction(max(working_set, entry.working_set_bytes), eff, die=pattern.die)
+            live_entry = entry
+            fraction = self._hit_fraction(max(working_set, live_entry.working_set_bytes), eff, die=pattern.die)
             if not fraction:
                 return 0, aligned_bytes, None
             plan = _access_plan(pattern.runs, self.memory_access_for(pattern.die))
             ov_cached: int | None = None
             if len(plan.runs) == 1 and not coverage.scale_intervals:
                 req_b = _cov_payload_bytes(coverage)
-                ov_b = 0 if req_b <= 0 else _entry_payload_overlap_bytes(coverage, entry)
+                ov_b = 0 if req_b <= 0 else _entry_payload_overlap_bytes(coverage, live_entry)
                 if ov_b <= 0:
                     return 0, aligned_bytes, 0
                 if ov_b >= req_b:
@@ -903,9 +942,9 @@ class AdmissionMemoryView:
                 ov_cached = ov_b
             hit = _plan_hit_bytes(
                 plan,
-                lambda rc: _entry_payload_overlap_bytes(rc, entry),
-                lambda lo, hi: _entry_interval_overlap(lo, hi, entry),
-                entry.resident_scale_intervals,
+                lambda rc: _entry_payload_overlap_bytes(rc, live_entry),
+                lambda lo, hi: _entry_interval_overlap(lo, hi, live_entry),
+                live_entry.resident_scale_intervals,
                 aligned_bytes,
             )
             if fraction != 1.0:
@@ -918,7 +957,15 @@ class AdmissionMemoryView:
             return aligned_bytes, 0, None
         return 0, aligned_bytes, None
 
-    def _classify_access(self, pattern, aligned_bytes, eff, coverage, working_set, entry):
+    def _classify_access(
+        self,
+        pattern: MemoryAccessPattern,
+        aligned_bytes: int,
+        eff: int,
+        coverage: SectorCoverage,
+        working_set: int,
+        entry: _ResidentL2Entry | None,
+    ) -> tuple[int, int]:
         """Share the hit/miss decision between preview and commit."""
         hit, miss, _ = self._classify_access_with_overlap(
             pattern, aligned_bytes, eff, coverage, working_set, entry,
@@ -1160,7 +1207,7 @@ class AdmissionMemoryView:
         plan = _access_plan(pattern.runs, spec)
         if len(plan.runs) != 1 or plan.scale_bytes:
             return None
-        sec = plan.sector_bytes
+        sec = _plan_sector_bytes(plan)
         line = plan.l2_line_bytes or plan.l2_sector_bytes
         if line == sec:
             line = None
@@ -1318,7 +1365,7 @@ class AdmissionMemoryView:
             raise ModelingError(f"reuse_key_die_mismatch:{key.die}!={die}")
         if die not in self._l2_capacity:
             raise ModelingError(f"l2_die_undeclared:{die}")
-        if self.arch_id is not None and cache_policy_for_arch(self.arch_id, CACHE_POLICY_NORMAL) == _L2_CACHE_DISABLE:
+        if self.arch_id is not None and cache_policy_for_arch(self.arch_id, _NORMAL_CACHE_POLICY) == _L2_CACHE_DISABLE:
             return None
         self._activate_key(key)
         avail = self.available_l2_bytes(die)
@@ -1335,7 +1382,7 @@ class AdmissionMemoryView:
                 or existing.resident_scale_intervals
             ):
                 return None
-            ivs = existing.resident_intervals_mut
+            ivs: Sequence[tuple[int, int]] | None = existing.resident_intervals_mut
             if ivs is None:
                 if existing.resident_coverage.periodic:
                     return None
@@ -1346,7 +1393,7 @@ class AdmissionMemoryView:
             if self._hit_fraction(ws_eff, eff, die=die) != 1.0:
                 return None
             self._last_prior_coverage = SectorCoverage()
-            existing.cache_policy = CACHE_POLICY_NORMAL
+            existing.cache_policy = _NORMAL_CACHE_POLICY
             self._touch_resident(existing)
             return self._cached_rect_ledger(logical_bytes, aligned_bytes, 0.0, aligned_bytes, 0, 0)
 
@@ -1361,7 +1408,7 @@ class AdmissionMemoryView:
                     ov_b = eb.overlap_rect(r_lo, r_hi, c_lo, c_hi)
                     if ov_b >= resident_span and fraction == 1.0:
                         self._last_prior_coverage = SectorCoverage()
-                        existing.cache_policy = CACHE_POLICY_NORMAL
+                        existing.cache_policy = _NORMAL_CACHE_POLICY
                         self._touch_resident(existing)
                         return self._cached_rect_ledger(logical_bytes, aligned_bytes, 0.0, aligned_bytes, 0, 0)
                     if ov_b > 0:
@@ -1378,7 +1425,7 @@ class AdmissionMemoryView:
             return miss_ledger
         if existing is not None and self._try_merge_strided_band(
             existing, die, eff, avail, key, stride, line,
-            r_lo, r_hi, c_lo, c_hi, span, existing.resident_bytes + resident_span, CACHE_POLICY_NORMAL,
+            r_lo, r_hi, c_lo, c_hi, span, existing.resident_bytes + resident_span, _NORMAL_CACHE_POLICY,
         ):
             return miss_ledger
         if previous is not None and not previous.evicted:
@@ -1389,7 +1436,7 @@ class AdmissionMemoryView:
             key=key, working_set_bytes=span, version=version,
             dirty=False, private_workspace=False,
             resident_coverage=SectorCoverage(), resident_bytes=resident_span,
-            cache_policy=CACHE_POLICY_NORMAL, line_footprint_bytes=None,
+            cache_policy=_NORMAL_CACHE_POLICY, line_footprint_bytes=None,
             resident_bands=_StridedBandSet(
                 stride, sec, [(r_lo, r_hi, ((c_lo, c_hi),))],
                 line if line_aligned else None,
@@ -1438,10 +1485,9 @@ class AdmissionMemoryView:
             return hit, miss, prior_out
 
         dirty = not read and hit > 0
-        merge = existing is not None and (read or dirty)
         dirty_cov = coverage if dirty else SectorCoverage()
         resident_span = _cov_bytes(coverage)
-        if merge:
+        if existing is not None and (read or dirty):
             if read and not miss:
                 existing.cache_policy = pattern.cache_policy
                 self._touch_resident(existing)
@@ -1501,7 +1547,7 @@ def _burst_service_bytes(plan: AddressRunPlan, sectors: int, run: AddressRun, ru
     if granule <= run.row_bytes:
         return float(sectors)
     # Sector fills may already pay for part or all of the service granule.
-    wire = run.sector_union_bytes(plan.sector_bytes)
+    wire = run.sector_union_bytes(_plan_sector_bytes(plan))
     rows = run.rows if run.stride_bytes else 1
     return sectors * max(1.0, rows * granule / wire)
 
@@ -1531,7 +1577,7 @@ def _canonical_dram_runs(
     if len(deduped) <= 1:
         return tuple(deduped)
 
-    sec = plan.sector_bytes
+    sec = _plan_sector_bytes(plan)
 
     def _order_key(run: AddressRun) -> tuple[float, int, int, int, int, int, str]:
         wire = run.sector_union_bytes(sec)
@@ -1549,7 +1595,7 @@ def _dram_segments(
 ) -> Iterator[tuple[int, int, int, AddressRun | None]]:
     covered_payload = _payload_only(covered)
     partial = not covered_payload.empty
-    sec = plan.sector_bytes
+    sec = _plan_sector_bytes(plan)
     ordered = _canonical_dram_runs(plan, burst_rules)
     for run in ordered:
         if not partial and len(ordered) == 1:
@@ -1749,8 +1795,223 @@ def bind_memory_access(
     )
 
 
+def resolve_usable_l2_bytes(
+    admission_memory_view: AdmissionMemoryView | None,
+    die: int,
+    *,
+    fallback_raw_l2: RawDieL2Bytes = RawDieL2Bytes(0),
+) -> UsableL2Bytes:
+    """Resolve live usable L2 bytes without ever falling back to raw capacity when effective L2 is 0."""
+    raw_cap = int(fallback_raw_l2)
+    if admission_memory_view is not None:
+        effective = int(admission_memory_view.effective_l2_bytes(die))
+        if raw_cap > 0:
+            return UsableL2Bytes(max(0, min(raw_cap, effective)))
+        return UsableL2Bytes(max(0, effective))
+    return UsableL2Bytes(max(0, raw_cap))
+
+
+def resolve_engine_admission_view(
+    engine: Any,
+    *,
+    die: int,
+    raw_l2: RawDieL2Bytes,
+    l2_units: int = 1,
+) -> AdmissionMemoryView:
+    """Return ``engine.admission_memory_view`` when attached and covering ``die``; construct a fallback only when None."""
+    if type(l2_units) is not int or l2_units != 1:
+        raise ModelingError("shared_l2_buffer_requires_one_die_owner")
+    attached = getattr(engine, "admission_memory_view", None)
+    if attached is not None:
+        if not isinstance(attached, AdmissionMemoryView):
+            raise ModelingError(f"engine_admission_memory_view_invalid:{type(attached).__name__}")
+        if not attached.has_die(die):
+            raise ModelingError(f"l2_die_undeclared:{die}")
+        return attached
+    return AdmissionMemoryView(
+        {die: max(0, int(raw_l2))},
+        l2_buffer_units_by_die={die: l2_units},
+    )
+
+
+def _extract_memory_hierarchy(source: Any) -> Any:
+    """Resolve a ``MemoryHierarchySpec`` (or mapping) from a context, geometry, device, or spec."""
+    cur: Any = source
+    if cur is None:
+        return None
+    if isinstance(cur, Mapping):
+        if "write_allocate" in cur:
+            return cur
+        if "geometry" in cur:
+            cur = cur["geometry"]
+    else:
+        if hasattr(cur, "write_allocate"):
+            return cur
+        geometry = getattr(cur, "geometry", None)
+        if geometry is not None:
+            cur = geometry
+    if cur is None:
+        return None
+    if isinstance(cur, Mapping):
+        if "write_allocate" in cur:
+            return cur
+        if "physical_mechanisms" in cur:
+            cur = cur["physical_mechanisms"]
+    else:
+        mechanisms = getattr(cur, "physical_mechanisms", None)
+        if mechanisms is not None:
+            cur = mechanisms
+    if cur is None:
+        return None
+    if isinstance(cur, Mapping):
+        if "write_allocate" in cur:
+            return cur
+        return cur.get("memory_hierarchy")
+    if hasattr(cur, "write_allocate"):
+        return cur
+    return getattr(cur, "memory_hierarchy", None)
+
+
+def l2_write_allocate_enabled(source: Any) -> bool:
+    """Read declared ``MemoryHierarchySpec.write_allocate`` without assuming ``True``."""
+    hierarchy = _extract_memory_hierarchy(source)
+    if hierarchy is None:
+        return False
+    if isinstance(hierarchy, Mapping):
+        return bool(hierarchy.get("write_allocate", False))
+    return bool(getattr(hierarchy, "write_allocate", False))
+
+
+@dataclass(slots=True)
+class _LruLineSpan:
+    """Mutable LRU queue node representing contiguous resident lines ``[start, end)``."""
+
+    stream_key: object
+    start: int
+    end: int
+
+
+class LineSegmentLruCache:
+    """Exact sequential line-eviction LRU cache over disjoint ``[start_line, end_line)`` spans."""
+
+    __slots__ = ("capacity_lines", "line_bytes", "_segments", "_total_lines")
+
+    def __init__(self, capacity_bytes: int, line_bytes: int) -> None:
+        self.line_bytes: int = max(1, int(line_bytes))
+        self.capacity_lines: int = max(0, int(capacity_bytes)) // self.line_bytes
+        self._segments: list[tuple[object, int, int]] = []
+        self._total_lines: int = 0
+
+    def access_lines(
+        self, stream_key: object, start_line: int, end_line: int,
+    ) -> tuple[tuple[int, int], ...]:
+        """Access ``[start_line, end_line)`` sequentially, returning missed spans and updating LRU."""
+        if end_line <= start_line:
+            return ()
+        if self.capacity_lines <= 0:
+            return ((start_line, end_line),)
+
+        lru: list[_LruLineSpan] = []
+        req_spans: list[tuple[int, int, _LruLineSpan]] = []
+        for seg_key, seg_start, seg_end in self._segments:
+            if seg_key != stream_key or seg_end <= start_line or seg_start >= end_line:
+                lru.append(_LruLineSpan(seg_key, seg_start, seg_end))
+                continue
+            ov_start = max(seg_start, start_line)
+            ov_end = min(seg_end, end_line)
+            if seg_start < ov_start:
+                lru.append(_LruLineSpan(seg_key, seg_start, ov_start))
+            node = _LruLineSpan(seg_key, ov_start, ov_end)
+            lru.append(node)
+            req_spans.append((ov_start, ov_end, node))
+            if ov_end < seg_end:
+                lru.append(_LruLineSpan(seg_key, ov_end, seg_end))
+
+        req_spans.sort(key=lambda item: item[0])
+        free = max(0, self.capacity_lines - self._total_lines)
+        head = 0
+        n_lru = len(lru)
+
+        def evict(count: int) -> None:
+            nonlocal free, head
+            if free:
+                take = min(free, count)
+                free -= take
+                count -= take
+            while count > 0 and head < n_lru:
+                cur = lru[head]
+                seg_len = cur.end - cur.start
+                if seg_len <= 0:
+                    head += 1
+                    continue
+                if seg_len <= count:
+                    cur.start = cur.end
+                    head += 1
+                    count -= seg_len
+                else:
+                    cur.start += count
+                    count = 0
+
+        misses: list[tuple[int, int]] = []
+
+        def add_miss(lo: int, hi: int) -> None:
+            if misses and misses[-1][1] == lo:
+                misses[-1] = (misses[-1][0], hi)
+            else:
+                misses.append((lo, hi))
+
+        cursor = start_line
+        for u0, v0, node in req_spans:
+            if u0 > cursor:
+                add_miss(cursor, u0)
+                evict(u0 - cursor)
+                cursor = u0
+            if node.start == u0 and node.start < node.end:
+                node.start = node.end
+            else:
+                add_miss(u0, v0)
+                evict(v0 - u0)
+            cursor = v0
+        if cursor < end_line:
+            add_miss(cursor, end_line)
+            evict(end_line - cursor)
+
+        req_lines = end_line - start_line
+        if req_lines >= self.capacity_lines:
+            keep_start = end_line - self.capacity_lines
+            self._segments = [(stream_key, keep_start, end_line)]
+            self._total_lines = self.capacity_lines
+            return tuple(misses)
+
+        merged: list[tuple[object, int, int]] = []
+        total = 0
+        for idx in range(head, n_lru):
+            cur = lru[idx]
+            if cur.start >= cur.end:
+                continue
+            if merged and merged[-1][0] == cur.stream_key and merged[-1][2] == cur.start:
+                merged[-1] = (cur.stream_key, merged[-1][1], cur.end)
+            else:
+                merged.append((cur.stream_key, cur.start, cur.end))
+            total += cur.end - cur.start
+        if merged and merged[-1][0] == stream_key and merged[-1][2] == start_line:
+            merged[-1] = (stream_key, merged[-1][1], end_line)
+        else:
+            merged.append((stream_key, start_line, end_line))
+        total += req_lines
+        self._segments = merged
+        self._total_lines = total
+        return tuple(misses)
+
+
 __all__ = [
     "AdmissionMemoryView",
     "DirtyWriteback",
+    "LineSegmentLruCache",
+    "RawDieL2Bytes",
+    "UsableL2Bytes",
     "bind_memory_access",
+    "l2_write_allocate_enabled",
+    "resolve_engine_admission_view",
+    "resolve_usable_l2_bytes",
 ]
