@@ -40,6 +40,7 @@ from mindie_sim.prediction.operators.grouped_moe.grouped_dequant import Config, 
 from mindie_sim.prediction.operators.sparse_indexer.index_pool_native import IMPLEMENTATION as KEYPOOL_IMPL
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.operators.moe_routing.moe_init_mxfp8 import RECIPE as MXFP8_INIT_RECIPE
+from mindie_sim.prediction.operators.moe_transport.moe_callers import RoutingPolicy
 from mindie_sim.prediction.operators.paged_mla.paged_mla import build as build_paged_mla
 from mindie_sim.prediction.collectives.peer_traffic import PeerTraffic
 from mindie_sim.prediction.program import KernelProgram, PipelinePhase, PipelineProgram, PipelineTemplateProgram, RecipeContext, Stage
@@ -99,7 +100,10 @@ def _unequal_graphs(case, rows):
     return bind_cohort_traffic(case, graphs)
 def _check_structure(case, graphs, rows, *, phase="prefill"):
     """Recompute local, global and unique expert rows from the declaration."""
-    parallel, model, width = case.runtime.parallel, case.model, case.model.hidden_size; expected = sum(rows) * model.layer_plans[1].top_k / parallel.ep; result = []
+    parallel, model, width = case.runtime.parallel, case.model, case.model.hidden_size
+    mean_rows = sum(rows) * model.layer_plans[1].top_k / parallel.ep
+    expected, _ = RoutingPolicy(**dict(case.runtime.routing)).local(model, model.layer_plans[1], parallel, sum(rows), runtime=case.runtime)
+    assert expected >= mean_rows; result = []
     for replica, ops in graphs.items():
         local = rows[replica] // parallel.tp; points = [op for op in ops if op.recipe == "attn_res_fwd"]; by_id = {op.op_id: op for op in ops}
         if not local: assert not points and not any(dict(op.metadata).get("group_axis") == "tp" for op in ops); assert not any(op.recipe in {"latent_projection", "router"} for op in ops) and not any(op.op_id in {"sp_shard", "sp_output_gather"} for op in ops)
@@ -125,7 +129,7 @@ def _check_structure(case, graphs, rows, *, phase="prefill"):
         forward = PeerTraffic.from_mapping(dict(dispatch.metadata)["peer_traffic"], parallel.ep); backward = PeerTraffic.from_mapping(dict(combine.metadata)["peer_traffic"], parallel.ep)
         assert all(forward.payload(source, destination) == backward.payload(destination, source) for source in range(parallel.ep) for destination in range(parallel.ep))
         if not local: assert dispatch.link_bytes == 0 < combine.link_bytes and expected > 0
-        result.append({"replica": replica, "global_rows": rows[replica], "local_rows": local, "attnres_points": len(points), "expert_rows_per_layer": expected, "operators": len(ops), "dispatch_bytes": dispatch.link_bytes, "combine_bytes": combine.link_bytes})
+        result.append({"replica": replica, "global_rows": rows[replica], "local_rows": local, "attnres_points": len(points), "expert_rows_per_layer": expected, "mean_expert_rows_per_layer": mean_rows, "operators": len(ops), "dispatch_bytes": dispatch.link_bytes, "combine_bytes": combine.link_bytes})
     return result
 def _execute(case, graphs):
     report = graph_costs(case, graphs, external_inputs={"analysis_input": 13}, input_ready_ms=7, isolated=False, trace_limit=512)
@@ -166,25 +170,27 @@ def full_body_graphs():
     parsed = _padding_case(); return parsed, {q: target_graphs(parsed, phase="decode", tokens=q, context=4096, scope="body", resource_fusion=False) for q in (1, 4)}
 def test_hybrid_pcp_prefill_with_ple_host_offload_and_dcp_decode():
     for pcp in (2, 4):
-        case = compose_case("qwen3.8-flash-next", hardware="a5", tp=4, ep=4, pcp=pcp, layers=4, engram_cpu_offload=True)
-        assert int(case["runtime"]["parallel"]["pcp"]) == pcp and case["runtime"]["engram_cpu_offload"] is True
-        rates = case["machine"]["device"]["rates"]; assert rates["host_memory"] > 0.0 and rates["host_vector"] > 0.0 and rates["h2d"] > 0.0
-        _graph, recipes = _recipes(case, phase="prefill", tokens=64, context=128); assert "pcp_ple_conv_state_step" in recipes and "pcp_index_gather" in recipes
+        with pytest.raises(ModelingError, match="shared_slab_requires_dcp_1_pcp_1"):
+            compose_case("qwen3.8-flash-next", hardware="a5", tp=4, ep=4, pcp=pcp, layers=4, engram_cpu_offload=True)
+    offload = compose_case("qwen3.8-flash-next", hardware="a5", tp=4, ep=4, pcp=1, layers=4, engram_cpu_offload=True)
+    assert offload["runtime"]["engram_cpu_offload"] is True
+    rates = offload["machine"]["device"]["rates"]; assert rates["host_memory"] > 0.0 and rates["host_vector"] > 0.0 and rates["h2d"] > 0.0
     prefill = compose_case("kimi-k3.1", hardware="a5", tp=4, ep=4, pcp=4, layers=4); assert int(prefill["runtime"]["parallel"]["pcp"]) == 4; _graph, recipes = _recipes(prefill, phase="prefill", tokens=16, context=128); assert "pcp_index_gather" in recipes and {"kda_pcp_gather", "kda_pcp_restore"} <= recipes
     decode = compose_case("kimi-k3.1", hardware="a5", tp=4, ep=4, dcp=4, layers=4); assert int(decode["runtime"]["parallel"]["cp"]) == 4; _graph, recipes = _recipes(decode, phase="decode", tokens=1, context=1024); assert {"dcp_lse_merge", "catalog_dcp_lse_merge"} & recipes
 @pytest.mark.parametrize("model", ["deepseek-v3.2", "glm-5.3-flash"])
 def test_pooled_indexer_and_hybrid_kda_decode_context_parallelism(model):
-    case = compose_case(model, hardware="a5", tp=4, ep=4, dcp=2, layers=4); assert int(case["runtime"]["parallel"]["cp"]) == 2
     if model == "glm-5.3-flash":
-        # M10 shipping legality: Glm5NextKPoolIndexerBackend forbids DCP > 1 (indexer_kpool.py:789).
-        with pytest.raises(ModelingError, match="m10_kpool_requires_dcp_eq_1"):
-            _recipes(case, phase="decode", tokens=1, context=1024)
-        case = compose_case(model, hardware="a5", tp=4, ep=4, dcp=2, layers=4, va_recommended=False)
+        with pytest.raises(ModelingError, match="kpool_indexer_requires_dcp_1"):
+            compose_case(model, hardware="a5", tp=4, ep=4, dcp=2, layers=4)
+        case = compose_case(model, hardware="a5", tp=4, ep=4, dcp=1, layers=4)
+        assert int(case["runtime"]["parallel"]["cp"]) == 1
+        _graph, recipes = _recipes(case, phase="decode", tokens=1, context=1024); assert recipes
+        return
+    case = compose_case(model, hardware="a5", tp=4, ep=4, dcp=2, layers=4); assert int(case["runtime"]["parallel"]["cp"]) == 2
     _graph, recipes = _recipes(case, phase="decode", tokens=1, context=1024); assert {"dcp_lse_merge", "catalog_dcp_lse_merge"} & recipes
-    if model == "deepseek-v3.2":
-        mtp_case = compose_case(model, hardware="a5", tp=4, ep=4, layers=4, mtp_proposal_tokens=3); auxiliary = mtp_case["model"]["auxiliary"]; assert auxiliary is not None; mtp = auxiliary["mtp"]
-        assert mtp["kind"] == "mtp" and int(mtp["layers"]) == 1 and mtp["attention_kind"] == "mla"
-        assert mtp_case["runtime"]["metadata"]["draft_mode"] == "mtp" and int(mtp_case["runtime"]["metadata"]["draft_proposal_tokens"]) == 3
+    mtp_case = compose_case(model, hardware="a5", tp=4, ep=4, layers=4, mtp_proposal_tokens=3); auxiliary = mtp_case["model"]["auxiliary"]; assert auxiliary is not None; mtp = auxiliary["mtp"]
+    assert mtp["kind"] == "mtp" and int(mtp["layers"]) == 1 and mtp["attention_kind"] == "mla"
+    assert mtp_case["runtime"]["metadata"]["draft_mode"] == "mtp" and int(mtp_case["runtime"]["metadata"]["draft_proposal_tokens"]) == 3
 def test_periodic_pipeline_compaction_matches_exact_pipeline_program():
     import mindie_sim.prediction.operators.attention.attention_pipeline as ad
     op = gqa_decode_op([(1, 131072)] * 8, heads=16, kv_heads=2, dim=128); recipe = StagedGQADecode(key_tile=128, query_tile=16)
@@ -283,9 +289,9 @@ def test_grouped_dequant_handles_sparse_zero_expert_groups_in_special_mode():
     rows = [0] * 64; rows[32] = 5; rows[33] = 7; rows[63] = 4; cfg = Config(tuple(rows), 512, 64, 64, 253952)
     by_bank = [sum(n for owner in [assignments(cfg, owner) for owner in range(cfg.blocks)] for g, n in owner if g == bank) for bank in range(64)]
     assert cfg.special and by_bank == rows
-    # For E = 128 > 64 AIVs, an empty first-wave group followed by a non-empty second-wave group on the same owner stalls in the source kernel.
+    # For E = 128 > 64 AIVs, advancing cursor before skipping empty groups lets the second wave execute cleanly.
     stalled = [0] * 128; stalled[64] = 8
-    with pytest.raises(Exception, match="arch35_dequant_zero_group_stalls_later_source_owner"): assignments(Config(tuple(stalled), 512, 64, 64, 253952), 0)
+    assert assignments(Config(tuple(stalled), 512, 64, 64, 253952), 0) == ((64, 8),)
     trailing = [0] * 128; trailing[0] = 8; assert assignments(Config(tuple(trailing), 512, 64, 64, 253952), 0) == ((0, 8),)
 @pytest.mark.parametrize("sku", A2_SKUS)
 def test_arch2201_skus_declare_complete_pipeline_and_precision_rates(sku):
@@ -395,7 +401,7 @@ def test_real_source_case_retains_tp_shards_and_unique_cross_dp_rows():
     assert (plans[0].tp, plans[0].ep, plans[0].dp) == (8, 32, 4) and [plan.tokens_local for plan in plans] == [1024, 2048, 1024, 0]
     assert sum(plan.tokens_local * plan.tp for plan in plans) == 32768 and {plan.cohort_tokens for plan in plans} == {32768} and {plan.source_partitions for plan in plans} == {1}
 def test_source_selected_branch_rejects_context_parallel_and_accepts_pipeline_and_prefill_context_parallel():
-    parsed = _source_case(tp=2); runtime = replace(parsed.runtime, parallel=replace(parsed.runtime.parallel, cp=2))
+    parsed = _source_case(tp=2); runtime = replace(parsed.runtime, parallel=replace(parsed.runtime.parallel, cp=2, cp_plan="dcp"))
     with pytest.raises(ModelingError, match="requires_cp1"): select(runtime, parsed.model, _views(8), tokens=8)
     plan = select(replace(parsed.runtime, parallel=replace(parsed.runtime.parallel, pp=2)), parsed.model, _views(8), tokens=8)
     assert plan.tp == 2 and plan.tokens_local == 4 and plan.tokens_global == 8
@@ -462,7 +468,8 @@ def test_full_cohort_work_survives_sequence_shards_and_idle_source(counts):
         dispatch = _one(ops, lambda op: op.recipe == "expert_dispatch"); combine = _one(ops, lambda op: op.recipe == "expert_combine"); assert dict(dispatch.metadata)["source_assignment_partitions"] == 1 and dispatch.link_bytes == local * 2 * 32 * 2 * 3 / 4 and dict(combine.metadata)["peer_traffic"]["direction"] == "transpose"
         if not full:
             assert combine.link_bytes > 0 and not any(op.family in {"allgather", "reduce_scatter"} for op in ops) and not any(dict(op.metadata).get("ffn_category") == "shared_expert" for op in ops); continue
-        assert not any(op.family == "allreduce" for op in ops)
+        assert {op.op_id for op in ops if op.family == "allreduce"} == {"embedding_allreduce"}
+        assert not any(op.family == "allreduce" and op.layer >= 0 for op in ops)
         assert all(op.local_shape[0] == full for op in ops if dict(op.metadata).get("ffn_category") == "shared_expert")
         assert _one(ops, lambda op: op.recipe == "router").local_shape[0] == local
         assert all(op.local_shape[0] == full for op in ops if op.recipe == "dense_gate_up") and sum(op.recipe == "dense_gate_up" for op in ops) == 2
@@ -492,14 +499,14 @@ def test_complete_source_graph_slices_attention_and_preserves_padded_ffn(batch):
         first = by_id[prefix + (".q_a" if is_mla else ".linear_q" if prefix + ".linear_q" in by_id else ".linear_qkvbfg_a")]; assert first.local_shape[0] == batch
         if not is_mla: assert by_id[prefix + ".short_convolution"].local_shape == (batch * 4608,) and dict(by_id[prefix + ".recurrent_scan0"].metadata)["kda_recurrent_params"]["lengths"] == (1,) * batch
         gather = by_id[prefix + ".attention.sp_gather"]; assert gather.local_shape == (physical, 7168) and gather.link_bytes == physical * 7168 * 2 * 7 / 8
-        sliced = by_id.get(prefix + ".attention.sp_input_view"); pad = [op for op in ops if op.recipe == "sequence_parallel_reduce_scatter_pad"]
+        sliced = by_id.get(prefix + ".attention.sp_input_view"); pad = [op for op in ops if op.recipe == "sequence_parallel_cat_zeros_pad"]
         if batch < physical:
             assert sliced.local_shape == (batch, 7168) and sliced.deps == (gather.op_id,) and first.deps == (sliced.op_id,) and sliced.hbm_bytes == sliced.link_bytes == 0
             has_shared_scatter = any(op.op_id == prefix + ".shared.sp_scatter" for op in ops)
             expected_pads = 2 if has_shared_scatter else 1
             assert len(pad) == expected_pads
             for pad_op in pad:
-                assert pad_op.mte2_bytes == batch * 7168 * 2 and pad_op.mte3_bytes == physical * 7168 * 2 and pad_op.vector_ops == (physical - batch) * 7168
+                assert pad_op.mte2_bytes == physical * 7168 * 2 and pad_op.mte3_bytes == (2 * physical - batch) * 7168 * 2 and pad_op.vector_ops == (physical - batch) * 7168
                 scatter = next(op for op in ops if op.deps == (pad_op.op_id,)); assert scatter.family == "reduce_scatter" and scatter.link_bytes == gather.link_bytes
         else: assert sliced is None and pad == [] and first.deps == (gather.op_id,)
     # FFN and residual tensors are still SP-local, while shared/dense TP matrices execute their physical allgather rows.
@@ -513,7 +520,7 @@ def test_graph_bucket_rows_are_preserved_but_sp_rows_do_not_reach_attention():
     assert (plan.valid_global, plan.attention_tokens, plan.physical_global) == (1, 4, 8)
     graph, _ = Frontend().body(parsed.model, parsed.runtime, views, ready="input", tokens=4, mode="decode", global_tokens=8, machine=parsed.machine); by_id = {op.op_id: op for op in graph}
     assert (by_id.get("s0.l0.linear_q") or by_id["s0.l0.linear_qkvbfg_a"]).local_shape[0] == 4 and by_id["s0.l3.q_a"].local_shape[0] == 4 and by_id["s0.l0.attention.sp_input_view"].local_shape == (4, 7168)
-    pad = by_id["s0.l0.linear_reduce.reduce_scatter.pad"]; assert (pad.mte2_bytes, pad.mte3_bytes) == (4 * 7168 * 2, 8 * 7168 * 2) and dict(by_id["s0.l0.recurrent_scan0"].metadata)["sequence_tokens"] == (1,)
+    pad = by_id["s0.l0.linear_reduce.reduce_scatter.pad"]; assert (pad.mte2_bytes, pad.mte3_bytes) == (8 * 7168 * 2, 12 * 7168 * 2) and dict(by_id["s0.l0.recurrent_scan0"].metadata)["sequence_tokens"] == (1,)
 @pytest.mark.parametrize("batch", [1, 8])
 def test_real_source_view_and_repad_wait_for_input_and_release_engine_state(batch):
     graph = target_graphs(_sp_case(batch), scope="body", phase="decode", tokens=1, sequences=batch, context=4096, apply_body_defaults=True)[0]
@@ -523,9 +530,10 @@ def test_real_source_view_and_repad_wait_for_input_and_release_engine_state(batc
 def test_full_depth_public_cohort_keeps_local_attnres_global_attention_and_experts():
     case = _combined_case(); assert case.model.layers == 93
     evidence = _check_structure(case, target_graphs(case, phase="prefill", tokens=8192, scope="body"), (8192,) * 4)
-    assert {row["attnres_points"] for row in evidence} == {187} and {row["local_rows"] for row in evidence} == {1024} and {row["expert_rows_per_layer"] for row in evidence} == {16384}
+    straggler_rows = {row["expert_rows_per_layer"] for row in evidence}
+    assert {row["attnres_points"] for row in evidence} == {187} and {row["local_rows"] for row in evidence} == {1024} and {row["mean_expert_rows_per_layer"] for row in evidence} == {16384} and len(straggler_rows) == 1 and next(iter(straggler_rows)) > 16384
     rows = (8192, 16384, 8192, 0); unequal = _check_structure(case, _unequal_graphs(case, rows), rows)
-    assert [row["attnres_points"] for row in unequal] == [187, 187, 187, 0] and [row["local_rows"] for row in unequal] == [1024, 2048, 1024, 0] and {row["expert_rows_per_layer"] for row in unequal} == {16384}
+    assert [row["attnres_points"] for row in unequal] == [187, 187, 187, 0] and [row["local_rows"] for row in unequal] == [1024, 2048, 1024, 0] and {row["mean_expert_rows_per_layer"] for row in unequal} == {16384} and {row["expert_rows_per_layer"] for row in unequal} == straggler_rows
 @pytest.mark.parametrize("unequal", [False, True])
 def test_actual_complete_small_graph_preserves_bank_shard_and_transport_dependencies(unequal):
     case = _combined_case(layers=2, bounded=True); rows = (8, 16, 8, 0) if unequal else (8,) * 4

@@ -53,7 +53,8 @@ from mindie_sim.schema.operators import OpSpec
 from mindie_sim.prediction.results import LoweringRequest
 from mindie_sim.schema.workload import RequestView
 from scripts._arch_governance_runtime import (
-    _NON_DEVICE_INFRA_RECIPES, _OWNER_MODULE_PREFIXES, _binding_module, _is_governed_module,
+    _NON_DEVICE_INFRA_RECIPES, _OWNER_MODULE_PREFIXES, _binding_module,
+    _is_governed_module, _is_shared_transport_lowering,
 )
 
 pytestmark = pytest.mark.tier0
@@ -95,7 +96,8 @@ def _is_allowed_recipe_owner(recipe) -> bool:
     cls = recipe if isinstance(recipe, type) else type(recipe)
     if (cls.__module__, cls.__name__) in _NON_DEVICE_INFRA_RECIPES:
         return True
-    return _binding_module(recipe).startswith(_OWNER_MODULE_PREFIXES)
+    module = _binding_module(recipe)
+    return module.startswith(_OWNER_MODULE_PREFIXES) or _is_shared_transport_lowering(recipe, module)
 
 
 def _program_owners(program, probe):

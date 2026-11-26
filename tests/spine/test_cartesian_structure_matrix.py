@@ -37,6 +37,7 @@ from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.lowering import Builder
 from mindie_sim.prediction.operators.mla.mla_native import index_layer_norm
 from mindie_sim.prediction.structure import parse_case
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.structure import export_structure
 from mindie_sim.structure_implementations import (
     BANNED_SUBMODULES,
@@ -314,6 +315,15 @@ def test_hybrid_gdn_gqa_ple_parallel_grid_preserves_subgraphs_and_mappings() -> 
         ("prefill", PREFILL_TOKENS, 0, TP_LARGE, DP_QUAD, TP_UNIT, EP_THIRTY_TWO, EP_THIRTY_TWO),
     )
     for phase, tok, ctx, tp, dp, dcp, ep, nd in configs:
+        if dcp > 1:
+            with pytest.raises(ModelingError, match="shared_slab_requires_dcp_1_pcp_1"):
+                compose_case(
+                    "qwen3.8-flash-next", hardware=PRIMARY_A5_SKU, dp=dp, tp=tp, dcp=dcp, ep=ep,
+                    num_devices=nd, layers=HYBRID_SAMPLE_LAYERS, feature_track="target",
+                    prompt_tokens=PROMPT_LEN, output_tokens=OUTPUT_LEN,
+                    mtp_proposal_tokens=MTP_PROPOSALS,
+                )
+            continue
         case = compose_case(
             "qwen3.8-flash-next", hardware=PRIMARY_A5_SKU, dp=dp, tp=tp, dcp=dcp, ep=ep,
             num_devices=nd, layers=HYBRID_SAMPLE_LAYERS, feature_track="target",
