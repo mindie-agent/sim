@@ -1030,3 +1030,74 @@ def test_launch_codec_honest_ep_bijection_short_flags_and_human_int_suffixes() -
         limits = dict(ing.runtime_limits)
         assert limits["max_model_len"] == expected
         assert limits["max_num_batched_tokens"] == 16384
+
+
+def test_pd_transfer_recoverssm_draft_cap_w4a8_scales_and_spec_forwarding() -> None:
+    """PD handoff conserves RecoverSSM state and draft cap; W4A8 scales and compose options stay exact."""
+    from mindie_sim.compose.runtime import resolve_case_contracts
+    from mindie_sim.prediction.capacity.ledger import prepared_weight_bytes
+    from mindie_sim.prediction.scheduler.progress import DraftPolicy
+
+    # 1. RecoverSSM committed recurrent state is never divided by (1 + rollback_slots) on PD transfer.
+    pd_kw = dict(
+        tp=2, ep=2, layers=4, role="pd_prefill", ttft_slo_ms=5000,
+        prompt_tokens=128, output_tokens=64, quant="bf16",
+    )
+    for rec_flag in (True, False):
+        edges_by_k = {}
+        for k in (0, 3):
+            _, q_p, l_p = resolve_case_contracts(compose_case(
+                "kimi-k3.1", "a5", **pd_kw, recover_ssm=rec_flag, mtp_proposal_tokens=k,
+            ))
+            rec_abi = next(a for a in q_p.recurrent_state_abi if a.component_role == "recurrent_state")
+            edge = next(e for e in l_p.scheduling.pd_kv_transfer.layer_edges if e.source_abi_key == rec_abi.producer_key)
+            edges_by_k[k] = edge.byte_range[1] - edge.byte_range[0]
+        assert edges_by_k[0] == edges_by_k[3] == 3_256_320, (rec_flag, edges_by_k)
+
+    # 2. Draft PD transfer is bounded by draft_context_cap.
+    cap_raw = compose_case(
+        "kimi-k3.1", "a5", tp=2, ep=2, layers=4, role="pd_prefill", ttft_slo_ms=5000,
+        prompt_tokens=128, output_tokens=64, mtp_proposal_tokens=3, draft_max_model_len=64,
+    )
+    _, q_cap, l_cap = resolve_case_contracts(cap_raw)
+    d_abi = next(a for a in q_cap.kv_cache_abi if a.scope == "draft")
+    d_edge = next(e for e in l_cap.scheduling.pd_kv_transfer.layer_edges if e.source_abi_key == d_abi.producer_key)
+    expected_draft = d_abi.draft_context_cap * sum(pl.exact_bytes() for pl in d_abi.planes)
+    assert d_edge.byte_range[1] - d_edge.byte_range[0] == expected_draft == 73_728
+
+    # 3. W4A8 post-load INT64 scale + FP32 bias bills (2*(moe_inter//etp) + hidden) channels at 12 B/ch.
+    for tp_val in (1, 2):
+        w4_sc, w4_q, _ = resolve_case_contracts(compose_case("qwen3-30b-a3b", "a3", tp=tp_val, ep=1, layers=1, quant="w4a8"))
+        w4_prep = next(p for p in w4_q.prepared_weights if p.allocation_id == "w4a8.post_load_int64_scale_and_bias")
+        m = w4_sc.model
+        expected_w4 = m.num_experts * (2 * (m.moe_intermediate_size // w4_sc.parallel.etp) + m.hidden_size) * 12
+        assert prepared_weight_bytes(w4_prep) == expected_w4, tp_val
+
+    # 4. Compose forwards acceptance length, chunked prefill, async scheduling, and draft_enforce_eager,
+    #    and proposal clipping matches stack acceptance marginals.
+    from mindie_sim.prediction.efficiency.capacity_window import _resolve_speculative_tokens
+
+    fwd_case = parse_case(compose_case(
+        "qwen3.5-35b-a3b", "a5", tp=1, layers=4, quant="bf16",
+        prompt_tokens=32, output_tokens=16, mtp_proposal_tokens=3, mtp_acceptance_length=4.0,
+        enable_chunked_prefill=False, async_scheduling=True, draft_enforce_eager=True,
+    ))
+    sc_f, _, lp_f = resolve_case_contracts(fwd_case)
+    assert DraftPolicy.for_request(fwd_case, fwd_case.workload.requests[0]).mean == pytest.approx(4.0)
+    assert sc_f.stack_options.speculative is not None
+    assert sc_f.stack_options.speculative.expected_committed_tokens() == pytest.approx(4.0)
+    assert lp_f.scheduling.chunked_prefill_enabled is False
+    assert lp_f.scheduling.async_scheduling is True
+    assert sc_f.stack_options.capture_rule.select_bucket(scope="draft", phase="decode", active_tokens=4) == (None, "none")
+
+    clip_case = parse_case(compose_case(
+        "qwen3-32b", "a3", layers=1, quant="bf16", prompt_tokens=8, output_tokens=8,
+        spec_method="ngram", mtp_proposal_tokens=3, mtp_acceptance_length=2.0,
+        max_num_batched_tokens=2,
+    ))
+    clip_sc, _, _ = resolve_case_contracts(clip_case)
+    clip_q, clip_emit = _resolve_speculative_tokens(
+        clip_case, output_budget=8, tokens_per_seq=None, emitted_tokens_per_seq=None,
+    )
+    assert clip_q == 2 and clip_sc.stack_options.speculative is not None
+    assert clip_emit == pytest.approx(1.0 + sum(clip_sc.stack_options.speculative.acceptance_marginals()[:clip_q - 1]))

@@ -29,7 +29,7 @@
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import replace as dc_replace
 import importlib
 import json
@@ -52,10 +52,13 @@ from mindie_sim.export import (
 )
 from mindie_sim.export.action_plan import build_comparison_plan
 from mindie_sim.export.models import NS_PER_MS, bundle_step_int_ns
+from mindie_sim.prediction.efficiency.sla import _prefill_chunk_schedule
 from mindie_sim.prediction.results import ReplayOptions, StepRequest
+from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.scenario import validate_deployment_mode
 from mindie_sim.schema.stack import STACK_TRACKS, LaunchConfigIngress
+from mindie_sim.schema.workload import RequestView
 from mindie_sim.stacks.registry import resolve_stack_for_scenario
 
 REPORT_COMMANDS = frozenset({"report", "quickstart"})
@@ -424,13 +427,14 @@ def _report_column(
             output_tokens=output_tokens, scope="model", phase=phase,
         )
     col_kw = dict(common_kw)
+    col_kw.pop("phase", None)
     if spec_tokens is not None:
         col_kw["mtp_proposal_tokens"] = int(spec_tokens)
     if accept_len is not None:
         col_kw["mtp_acceptance_length"] = float(accept_len)
     raw, req = compose_export_case(
         model, sku, feature_track=track, concurrency=max(1, int(conc)),
-        quant=quant, kv_cache_dtype=kv, indexer_kv_dtype=idx_kv, **dict(par), **col_kw,
+        quant=quant, kv_cache_dtype=kv, indexer_kv_dtype=idx_kv, phase=phase, **dict(par), **col_kw,
     )
     step = StepRequest(
         phase=phase, tokens=req.tokens if phase == "decode" else prompt_tokens,
@@ -848,6 +852,160 @@ def _build_infeasible_report_result(
     return receipt
 
 
+def _colocated_prefill_requests(
+    raw_case: Mapping[str, Any], request: StepRequest,
+) -> tuple[StepRequest, ...]:
+    """Expand a chunked prefill request into ordered legal chunk ``StepRequest``s."""
+    parsed = parse_case(raw_case)
+    chunks = _prefill_chunk_schedule(
+        parsed, phase="prefill", context=int(request.context), q_tokens=int(request.tokens),
+    )
+    if len(chunks) <= 1:
+        return (request,)
+    last_idx = len(chunks) - 1
+    out: list[StepRequest] = []
+    for idx, (chunk_ctx, chunk_tok) in enumerate(chunks):
+        view = RequestView(
+            request_id="prefill_ttft",
+            q_len=chunk_tok,
+            context=chunk_ctx,
+            phase="prefill",
+            samples=(idx == last_idx),
+        )
+        out.append(StepRequest(
+            phase="prefill", tokens=chunk_tok, context=chunk_ctx,
+            sequences=1, scope=request.scope, requests=(view,),
+        ))
+    return tuple(out)
+
+
+def _evaluate_prefill_case_bundles(
+    raw_case: Mapping[str, Any],
+    request: StepRequest,
+    build_kwargs: Mapping[str, Any],
+) -> tuple[Any, ...]:
+    """Evaluate one prefill case across all legal prefill chunks."""
+    reqs = _colocated_prefill_requests(raw_case, request)
+    return tuple(build_export_bundle(raw_case, request=req, **build_kwargs) for req in reqs)
+
+
+def _resolve_colocated_prefill_eval(
+    *,
+    args: argparse.Namespace,
+    after_bundle: Any,
+    prefill_bundle: Any = None,
+    prefill_bundles: Sequence[Any] | None = None,
+    prefill_case: Mapping[str, Any] | None = None,
+    prefill_request: StepRequest | None = None,
+    prefill_build_kwargs: Mapping[str, Any] | None = None,
+    mode: str = MODE_SIMULATION,
+    dep_mode: str = "colocated",
+) -> tuple[float, bool]:
+    """Resolve colocated prefill ``(ttft_ms, fits_hbm)`` honoring chunked prefill schedules."""
+    if prefill_bundles:
+        total_ns = sum(bundle_step_int_ns(b) for b in prefill_bundles)
+        fits_hbm = all(bool(b.memory_ledger.fits_hbm) for b in prefill_bundles)
+        return float(total_ns) / float(NS_PER_MS), fits_hbm
+    if prefill_case is not None:
+        req = prefill_request
+        if req is None:
+            p_tok = int(
+                getattr(after_bundle, "prompt_tokens", 0)
+                or getattr(args, "prompt_tokens", 0)
+                or DEFAULT_REPORT_PROMPT_TOKENS
+            )
+            scope = str(getattr(after_bundle, "scope", "model") or "model")
+            req = StepRequest(phase="prefill", tokens=p_tok, context=0, sequences=1, scope=scope)
+        chunk_reqs = _colocated_prefill_requests(prefill_case, req)
+        if len(chunk_reqs) == 1 and prefill_bundle is not None:
+            return (
+                float(bundle_step_int_ns(prefill_bundle)) / float(NS_PER_MS),
+                bool(prefill_bundle.memory_ledger.fits_hbm),
+            )
+        bkw = dict(prefill_build_kwargs or {})
+        bkw.setdefault("apply_target_envelope", bool(getattr(after_bundle, "target_envelope_applied", False)))
+        bkw.setdefault("allow_unbound_formula", mode == MODE_MODELING)
+        bundles = tuple(build_export_bundle(prefill_case, request=cr, **bkw) for cr in chunk_reqs)
+        total_ns = sum(bundle_step_int_ns(b) for b in bundles)
+        fits_hbm = all(bool(b.memory_ledger.fits_hbm) for b in bundles)
+        return float(total_ns) / float(NS_PER_MS), fits_hbm
+    if prefill_bundle is not None:
+        return (
+            float(bundle_step_int_ns(prefill_bundle)) / float(NS_PER_MS),
+            bool(prefill_bundle.memory_ledger.fits_hbm),
+        )
+    eff_cfg = getattr(after_bundle, "effective_config", None)
+    if isinstance(eff_cfg, Mapping) and eff_cfg.get("prefill_ttft_ms") is not None:
+        return float(eff_cfg["prefill_ttft_ms"]), bool(eff_cfg.get("prefill_fits_hbm", True))
+    mem = after_bundle.memory_ledger
+    model_ref = getattr(args, "model", None) or after_bundle.model_name
+    hw_ref = getattr(after_bundle, "hardware_sku", None) or getattr(args, "hardware", "a3")
+    prompt_tokens = int(
+        getattr(after_bundle, "prompt_tokens", 0) or getattr(args, "prompt_tokens", 0) or DEFAULT_REPORT_PROMPT_TOKENS
+    )
+    output_tokens = int(
+        getattr(after_bundle, "output_tokens", 0) or getattr(args, "output_tokens", 0) or DEFAULT_SCENARIO_OUTPUT_TOKENS
+    )
+    conc = max(1, int(getattr(mem, "concurrency", 0) or getattr(after_bundle, "sequences", 1) or 1))
+    req_quant = getattr(args, "weight_quant", None)
+    quant_arg = req_quant if req_quant is not None else (getattr(mem, "weight_quant", None) or None)
+    kv_arg = getattr(args, "cache_dtype", None)
+    p_raw, p_req = compose_export_case(
+        str(model_ref),
+        str(hw_ref),
+        topology_preset=(getattr(after_bundle, "topology_preset", None) or getattr(args, "topology_preset", None) or None),
+        dp=max(1, int(getattr(mem, "dp", 1) or 1)),
+        tp=max(1, int(getattr(mem, "tp", 1) or 1)),
+        ep=max(1, int(getattr(mem, "ep", 1) or 1)),
+        pp=max(1, int(getattr(mem, "pp", 1) or 1)),
+        dcp=max(1, int(getattr(mem, "dcp", 1) or 1)),
+        pcp=max(1, int(getattr(mem, "pcp", 1) or 1)),
+        prompt_tokens=prompt_tokens,
+        output_tokens=output_tokens,
+        concurrency=conc,
+        ttft_slo_ms=after_bundle.ttft_slo_ms,
+        tpot_slo_ms=after_bundle.tpot_slo_ms,
+        mtp_proposal_tokens=int(getattr(after_bundle, "spec_proposals", 0) or 0),
+        mtp_acceptance_length=max(1.0, float(getattr(after_bundle, "avg_accepted_tokens", 1.0) or 1.0)),
+        feature_track=str(getattr(after_bundle, "feature_track", "") or "shipping"),
+        quant=quant_arg,
+        kv_cache_dtype=kv_arg,
+        engram_cpu_offload=getattr(args, "engram_offload", None),
+        deployment_mode=dep_mode,
+        runtime_stack=getattr(args, "stack", None),
+        phase="prefill",
+    )
+    bkw = dict(prefill_build_kwargs or {})
+    bkw.setdefault("apply_target_envelope", bool(getattr(after_bundle, "target_envelope_applied", False)))
+    bkw.setdefault("allow_unbound_formula", mode == MODE_MODELING)
+    bundles = _evaluate_prefill_case_bundles(p_raw, p_req, bkw)
+    total_ns = sum(bundle_step_int_ns(b) for b in bundles)
+    fits_hbm = all(bool(b.memory_ledger.fits_hbm) for b in bundles)
+    return float(total_ns) / float(NS_PER_MS), fits_hbm
+
+
+def _evaluate_colocated_prefill_ttft_ms(
+    *,
+    args: argparse.Namespace,
+    after_bundle: Any,
+    prefill_bundle: Any = None,
+    prefill_bundles: Sequence[Any] | None = None,
+    prefill_case: Mapping[str, Any] | None = None,
+    prefill_request: StepRequest | None = None,
+    prefill_build_kwargs: Mapping[str, Any] | None = None,
+    mode: str = MODE_SIMULATION,
+    dep_mode: str = "colocated",
+) -> float:
+    """Resolve colocated prefill TTFT (ms) from supplied prefill bundle(s) or exact chunked replay."""
+    ttft_ms, _ = _resolve_colocated_prefill_eval(
+        args=args, after_bundle=after_bundle,
+        prefill_bundle=prefill_bundle, prefill_bundles=prefill_bundles,
+        prefill_case=prefill_case, prefill_request=prefill_request,
+        prefill_build_kwargs=prefill_build_kwargs, mode=mode, dep_mode=dep_mode,
+    )
+    return ttft_ms
+
+
 def _assemble_report_receipt(
     *,
     args: argparse.Namespace,
@@ -858,31 +1016,66 @@ def _assemble_report_receipt(
     mode: str,
     resolved_stack_id: str,
     dep_mode: str,
+    prefill_bundle: Any = None,
+    prefill_bundles: Sequence[Any] | None = None,
+    prefill_case: Mapping[str, Any] | None = None,
+    prefill_request: StepRequest | None = None,
+    prefill_build_kwargs: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Compute canonical SLA/HBM feasibility and assemble the CLI report receipt."""
     is_decode = after_bundle.phase == "decode"
     after_step_ms = float(bundle_step_int_ns(after_bundle)) / float(NS_PER_MS)
+    acc = float(after_bundle.avg_accepted_tokens)
     eff_tpot_ms = (
-        (after_step_ms / max(1.0, float(after_bundle.avg_accepted_tokens)))
+        ((after_step_ms / acc) if acc > 0.0 else after_step_ms)
         + float(getattr(after_bundle, "handoff_tpot_ms", 0.0) or 0.0)
         if is_decode else after_step_ms
     )
     tpot_slo = after_bundle.tpot_slo_ms if is_decode else None
-    ttft_slo = after_bundle.ttft_slo_ms if not is_decode else None
+    prefill_ttft_ms: float | None = None
+    prefill_fits_hbm = True
+    if not is_decode:
+        ttft_slo = after_bundle.ttft_slo_ms
+        if prefill_bundles or prefill_case is not None:
+            prefill_ttft_ms, prefill_fits_hbm = _resolve_colocated_prefill_eval(
+                args=args, after_bundle=after_bundle,
+                prefill_bundle=after_bundle, prefill_bundles=prefill_bundles,
+                prefill_case=prefill_case, prefill_request=prefill_request,
+                prefill_build_kwargs=prefill_build_kwargs, mode=mode, dep_mode=dep_mode,
+            )
+        else:
+            prefill_ttft_ms = after_step_ms
+    elif dep_mode == "colocated" and after_bundle.ttft_slo_ms is not None:
+        ttft_slo = after_bundle.ttft_slo_ms
+        prefill_ttft_ms, prefill_fits_hbm = _resolve_colocated_prefill_eval(
+            args=args, after_bundle=after_bundle,
+            prefill_bundle=prefill_bundle, prefill_bundles=prefill_bundles,
+            prefill_case=prefill_case, prefill_request=prefill_request,
+            prefill_build_kwargs=prefill_build_kwargs, mode=mode, dep_mode=dep_mode,
+        )
+    elif dep_mode == "colocated" and (prefill_bundles or prefill_bundle is not None):
+        ttft_slo = None
+        prefill_fits_hbm = (
+            all(bool(b.memory_ledger.fits_hbm) for b in prefill_bundles)
+            if prefill_bundles else bool(prefill_bundle.memory_ledger.fits_hbm)
+        )
+    else:
+        ttft_slo = None
     tpot_met = (tpot_slo is None) or (eff_tpot_ms <= float(tpot_slo))
-    ttft_met = (ttft_slo is None) or (after_step_ms <= float(ttft_slo))
+    ttft_met = (ttft_slo is None) or (prefill_ttft_ms is not None and prefill_ttft_ms <= float(ttft_slo))
     all_slas_met = bool(
         tpot_met
         and ttft_met
         and str(after_bundle.sla_regime or "").upper() != "SLA_VIOLATED"
     )
-    hbm_feasible = bool(after_bundle.memory_ledger.fits_hbm)
+    hbm_feasible = bool(after_bundle.memory_ledger.fits_hbm and prefill_fits_hbm)
     feasible = bool(all_slas_met and hbm_feasible)
     receipt: dict[str, Any] = {
         "ok": True,
         "feasible": feasible,
         "status": "feasible" if feasible else "infeasible",
         "all_slas_met": all_slas_met,
+        "ttft_met": ttft_met,
         "hbm_feasible": hbm_feasible,
         "sla_regime": after_bundle.sla_regime,
         "command": "report",
@@ -896,6 +1089,8 @@ def _assemble_report_receipt(
         "agent_brief": brief_dict,
         **summary,
     }
+    if prefill_ttft_ms is not None:
+        receipt["prefill_ttft_ms"] = round(prefill_ttft_ms, STEP_MS_ROUND_DIGITS)
     if args.concurrency is not None:
         receipt["requested_concurrency"] = int(args.concurrency)
     if not getattr(args, "emit_json", False):
@@ -1024,6 +1219,45 @@ def run_report_command(args: argparse.Namespace) -> dict[str, Any]:
         serve_script_supplied=script_supplied,
         solver_feasible=(bool(cols["layout_after"].get("solver_feasible", True)) if cols["layout_after"] is not None else None),
     )
+    prefill_after_bundles: tuple[Any, ...] = ()
+    prefill_after_case: Mapping[str, Any] | None = None
+    prefill_after_req: StepRequest | None = None
+    prefill_build_kw: dict[str, Any] | None = None
+    if dep_mode == "colocated" and after_bundle.phase == "decode" and after_bundle.ttft_slo_ms is not None:
+        raw_prefill_after, step_prefill_a, meta_prefill_a = _report_column(
+            cols["layout_after"],
+            model=model_arg, sku=policy["sku"], phase="prefill",
+            track=after_track, quant=after_quant, kv=after_kv, idx_kv=after_idx_kv,
+            par=cols["after_par"], conc=cols["conc"], common_kw=common_kw,
+        )
+        prefill_after_case = raw_prefill_after
+        prefill_after_req = step_prefill_a
+        prefill_build_kw = dict(
+            replay=replay, cache_dtype=after_kv,
+            engram_host_offload=args.engram_offload,
+            apply_target_envelope=cols["has_target_after"],
+            rewrite_plan=rewrite_plan if cols["has_target_after"] else None,
+            allow_unbound_formula=(mode == MODE_MODELING), **meta_prefill_a,
+        )
+        prefill_after_bundles = _evaluate_prefill_case_bundles(
+            raw_prefill_after, step_prefill_a, prefill_build_kw,
+        )
+    elif after_bundle.phase == "prefill":
+        prefill_after_case = raw_after
+        prefill_after_req = step_a
+        prefill_build_kw = dict(
+            replay=replay, cache_dtype=after_kv,
+            engram_host_offload=args.engram_offload,
+            apply_target_envelope=cols["has_target_after"],
+            rewrite_plan=rewrite_plan if cols["has_target_after"] else None,
+            allow_unbound_formula=(mode == MODE_MODELING), **meta_a,
+        )
+        chunk_reqs = _colocated_prefill_requests(raw_after, step_a)
+        if len(chunk_reqs) > 1:
+            prefill_after_bundles = tuple(
+                build_export_bundle(raw_after, request=cr, **prefill_build_kw)
+                for cr in chunk_reqs
+            )
     summary, brief_dict, digest_md = _emit_report_artifacts(
         before_bundle=before_bundle, after_bundle=after_bundle, tuned_bundle=tuned_bundle,
         args=args, script_info=script_info, dep_mode=dep_mode,
@@ -1031,6 +1265,8 @@ def run_report_command(args: argparse.Namespace) -> dict[str, Any]:
     return _assemble_report_receipt(
         args=args, after_bundle=after_bundle, summary=summary, brief_dict=brief_dict,
         digest_md=digest_md, mode=mode, resolved_stack_id=resolved_stack_id, dep_mode=dep_mode,
+        prefill_bundles=prefill_after_bundles, prefill_case=prefill_after_case,
+        prefill_request=prefill_after_req, prefill_build_kwargs=prefill_build_kw,
     )
 
 
