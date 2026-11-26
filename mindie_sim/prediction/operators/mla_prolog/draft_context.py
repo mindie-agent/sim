@@ -372,9 +372,9 @@ def _masked_rows_by_view(rows_by_view, valid_rows: int) -> tuple[int, ...]:
 
 
 def _owned_masked_rows(valid_flags, rows_by_view, views, contexts, parallel, block) -> int:
-    """Intersect per-row validity flags with DCP block ownership across views."""
-    from mindie_sim.catalog.attention_common import active_dcp_degree
-    degrees = [active_dcp_degree(parallel, view.phase) for view in views]
+    """Intersect per-row validity flags with DCP cache-store block ownership across views."""
+    from mindie_sim.catalog.attention_common import store_dcp_degree
+    degrees = [store_dcp_degree(parallel, view.phase) for view in views]
     max_degree = max(degrees, default=UNIT_CONTEXT_PARALLEL)
     interleave = max(UNIT_CONTEXT_PARALLEL, int(block))
     per_rank = [0] * max_degree

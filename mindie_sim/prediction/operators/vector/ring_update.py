@@ -49,6 +49,7 @@ INPUT_ATTN_TENSORS = 2
 INPUT_STATS_TENSORS = 4
 OUTPUT_STATS_TENSORS = 2
 ATTN_ELEM_OPS = 6  # 2 FP32 upcasts + 2 muls + 1 add + 1 BF16 downcast (ring_attention_update_tnd.h:298)
+ATTN_ELEM_OPS_FP32_ARCH35 = 3  # 2 muls + 1 add; Arch35 regbase FP32 skips 3 casts (ring_attention_update_regbase_common.h:173-177)
 STATS_LANE_OPS = 10  # max + 2*(sub+exp+mul) + add + 2*div (ring_attention_update_tnd.h:230-271)
 _RING_UPDATE_SUPPORTED_DTYPES = frozenset({"fp16", "bf16", "fp32"})
 _ARCH22_TND_HEAD_DIM_ALIGN = 64
@@ -194,7 +195,12 @@ def build_ring_update(op: OpSpec, geometry: Geometry | OperatorPlanningContext) 
     stats_write = OUTPUT_STATS_TENSORS * STATS_WIDTH * FP32_BYTES
     read_per_th = attn_read + stats_read
     write_per_th = attn_write + stats_write
-    vec_per_th = contract.head_dim * ATTN_ELEM_OPS + STATS_WIDTH * STATS_LANE_OPS
+    attn_elem_ops = (
+        ATTN_ELEM_OPS_FP32_ARCH35
+        if (is_arch35 and contract.dtype == "fp32")
+        else ATTN_ELEM_OPS
+    )
+    vec_per_th = contract.head_dim * attn_elem_ops + STATS_WIDTH * STATS_LANE_OPS
     total_th = contract.tokens * contract.num_heads
     has_l2_rate = "l2" in ctx.geometry.rates
     die = int(ctx.geometry.rank or 0)
@@ -300,7 +306,8 @@ def make_ring_update_op(
     total_th = contract.tokens * contract.num_heads
     total_read = float(total_th * (INPUT_ATTN_TENSORS * contract.head_dim * elem_b + INPUT_STATS_TENSORS * STATS_WIDTH * FP32_BYTES))
     total_write = float(total_th * (contract.head_dim * elem_b + OUTPUT_STATS_TENSORS * STATS_WIDTH * FP32_BYTES))
-    total_vec = float(total_th * (contract.head_dim * ATTN_ELEM_OPS + STATS_WIDTH * STATS_LANE_OPS))
+    attn_elem_ops = ATTN_ELEM_OPS_FP32_ARCH35 if contract.dtype == "fp32" else ATTN_ELEM_OPS
+    total_vec = float(total_th * (contract.head_dim * attn_elem_ops + STATS_WIDTH * STATS_LANE_OPS))
     return OpSpec(
         op_id=op_id, deps=deps, stage=stage, layer=layer, requests=requests,
         family="attention_merge", phase="prefill", recipe=RING_UPDATE_RECIPE,

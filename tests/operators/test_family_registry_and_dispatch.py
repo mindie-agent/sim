@@ -669,3 +669,136 @@ def test_aiv_tiled_vector_calibration_uses_stage_caps_without_inflating_work():
     assert max(aiv_done.time, aic_done.time) == pytest.approx(
         (hbm_bytes + aic_bytes) / hbm_peak_ms, rel=1e-3,
     )
+
+
+def test_ring_update_fp32_skips_casts_on_regbase_arch_and_conserves_compulsory_floor():
+    from mindie_sim.prediction.operators.vector.ring_update import build_ring_update, make_ring_update_op
+
+    t, h, d = 64, 16, 128
+    op_fp32 = make_ring_update_op(t, h, d, dtype="fp32", op_id="ru_fp32")
+    op_bf16 = make_ring_update_op(t, h, d, dtype="bf16", op_id="ru_bf16")
+    geom_gen5 = Geometry.from_devices(sku_case(REPRESENTATIVE_SKUS["a5"]).machine.dies[:1])
+    geom_gen2 = Geometry.from_devices(sku_case(REPRESENTATIVE_SKUS["a2"]).machine.dies[:1])
+
+    def _ctx(geom, op):
+        return OperatorPlanningContext(OpOccurrence(0, op.stage, 0, op.op_id), geom, geom.datapath)
+
+    plan_g5_fp32 = build_ring_update(op_fp32, _ctx(geom_gen5, op_fp32))
+    plan_g5_bf16 = build_ring_update(op_bf16, _ctx(geom_gen5, op_bf16))
+    plan_g2_fp32 = build_ring_update(op_fp32, _ctx(geom_gen2, op_fp32))
+
+    # Regbase FP32 skips 3 casts per attention element vs BF16; TND FP32 keeps 6 UB-copy/compute ops.
+    assert plan_g5_bf16.work.resources["vector"] - plan_g5_fp32.work.resources["vector"] == pytest.approx(3.0 * t * h * d)
+    assert plan_g2_fp32.work.resources["vector"] == pytest.approx(plan_g5_bf16.work.resources["vector"])
+    assert op_fp32.vector_ops <= plan_g5_fp32.work.resources["vector"]
+    assert op_fp32.vector_ops <= plan_g2_fp32.work.resources["vector"]
+    assert op_bf16.vector_ops <= plan_g5_bf16.work.resources["vector"]
+
+
+def test_quantization_vector_pipeline_preserves_full_group_reduction_barrier():
+    from mindie_sim.prediction.operators.vector.vector_pipeline import AIVTiledVectorAndGatherRecipe
+
+    recipe = AIVTiledVectorAndGatherRecipe()
+    rates = {"hbm": 1e9, "mte2": 1024.0, "mte3": 1e9, "vector": 1e9}
+    names = {role: role for role in rates}
+    units = {"hbm": 1, "mte2": 1, "mte3": 1, "vector": 1}
+
+    # Single per-token quantization group (1, 8192) must finish full row load before scale/cast/store,
+    # even when multiple AIV cores are available (core_count=4).
+    single_op = replace(
+        simple_op("dyn_quant_single", "vector"),
+        family="quantize", local_shape=(1, 8192),
+        hbm_bytes=24576.0, mte2_bytes=16384.0, mte3_bytes=8192.0, vector_ops=32768.0,
+        metadata=(("activation_group_size", 8192),),
+    )
+    single_ctx = RecipeContext(
+        single_op,
+        {"hbm": 24576.0, "mte2": 16384.0, "mte3": 8192.0, "vector": 32768.0},
+        names, rates, 4,
+    )
+    eng_single = Engine([Resource(k, v, units=units[k]) for k, v in rates.items()], trace_limit=64)
+    done_single = recipe.lower(single_ctx).start(eng_single, "q", eng_single.submit("in"))
+    eng_single.advance(until=(done_single,))
+    by_task = {row["task"]: row for row in eng_single.trace}
+    assert by_task["q:scale_cast_store"]["start_ms"] >= by_task["q:row_load"]["end_ms"]
+    assert by_task["q:row_load"]["end_ms"] == pytest.approx(16.0)
+    assert eng_single.serviced["mte2"] == pytest.approx(16384.0)
+    assert eng_single.serviced["mte3"] == pytest.approx(8192.0)
+
+    # Multi-row quantization with non-divisible group count (3 rows across 2 units) aligns on whole rows.
+    multi_op = replace(
+        simple_op("dyn_quant_multi", "vector"),
+        family="quantize", local_shape=(3, 8192),
+        hbm_bytes=3 * 24576.0, mte2_bytes=3 * 16384.0, mte3_bytes=3 * 8192.0, vector_ops=3 * 32768.0,
+        metadata=(("activation_group_size", 8192),),
+    )
+    multi_ctx = RecipeContext(
+        multi_op,
+        {"hbm": 3 * 24576.0, "mte2": 3 * 16384.0, "mte3": 3 * 8192.0, "vector": 3 * 32768.0},
+        names, rates, 2, resource_units={"hbm": 1, "mte2": 2, "mte3": 2, "vector": 2},
+    )
+    eng_multi = Engine([Resource(k, v, units=multi_ctx.resource_units[k]) for k, v in rates.items()], trace_limit=64)
+    done_multi = recipe.lower(multi_ctx).start(eng_multi, "qm", eng_multi.submit("in"))
+    eng_multi.advance(until=(done_multi,))
+    assert eng_multi.serviced["mte2"] == pytest.approx(3 * 16384.0)
+    assert eng_multi.serviced["mte3"] == pytest.approx(3 * 8192.0)
+    assert eng_multi.serviced["vector"] == pytest.approx(3 * 32768.0)
+
+    # Sub-row MXFP8 group size (32 elements per group -> 256 independent groups on 1 row) still pipelines.
+    mxfp8_op = replace(
+        simple_op("dyn_quant_mx", "vector"),
+        family="quantize", local_shape=(1, 8192),
+        hbm_bytes=24576.0, mte2_bytes=16384.0, mte3_bytes=8192.0, vector_ops=32768.0,
+        metadata=(("activation_group_size", 32),),
+    )
+    mxfp8_ctx = RecipeContext(
+        mxfp8_op,
+        {"hbm": 24576.0, "mte2": 16384.0, "mte3": 8192.0, "vector": 32768.0},
+        names, rates, 4,
+    )
+    eng_mx = Engine([Resource(k, v, units=units[k]) for k, v in rates.items()], trace_limit=64)
+    done_mx = recipe.lower(mxfp8_ctx).start(eng_mx, "qmx", eng_mx.submit("in"))
+    eng_mx.advance(until=(done_mx,))
+    mx_stores = [row for row in eng_mx.trace if row["task"].endswith(":scale_cast_store")]
+    assert len(mx_stores) > 1 and min(row["start_ms"] for row in mx_stores) < 16.0
+    assert eng_mx.serviced["mte2"] == pytest.approx(16384.0)
+
+    # Ragged tail group: (1, 1984) with group_size=128 has 15 full groups + 64-elem tail (16 groups).
+    # Across 2 tiles, tile 0 owns 8 full groups (1024 elems -> 2048 B) and tile 1 owns 960 elems (1920 B).
+    ragged_op = replace(
+        simple_op("dyn_quant_ragged", "vector"),
+        family="quantize", local_shape=(1, 1984),
+        hbm_bytes=3968.0 + 2048.0, mte2_bytes=3968.0, mte3_bytes=2048.0, vector_ops=7936.0,
+        metadata=(("activation_group_size", 128), ("output_format", "int8"),
+                  ("scale_format", "fp32"), ("scale_shape", (1, 16))),
+    )
+    ragged_ctx = RecipeContext(
+        ragged_op,
+        {"hbm": 6016.0, "mte2": 3968.0, "mte3": 2048.0, "vector": 7936.0},
+        names, rates, 2,
+    )
+    ragged_prog = recipe.lower(ragged_ctx)
+    tile0 = {st.name: st for st in ragged_prog.stages[1].program.tile(0)}
+    tile1 = {st.name: st for st in ragged_prog.stages[1].program.tile(1)}
+    assert tile0["row_load"].work["mte2"] == pytest.approx(2048.0)
+    assert tile1["row_load"].work["mte2"] == pytest.approx(1920.0)
+    assert tile0["scale_cast_store"].work["mte3"] == pytest.approx(1024.0 + 32.0)
+    assert tile1["scale_cast_store"].work["mte3"] == pytest.approx(960.0 + 32.0)
+
+    # Precomputed-scale quantization (quant_allreduce_quantize) streams without single-row serialization.
+    precomp_op = replace(
+        simple_op("precomp_q", "quant_allreduce_quantize"),
+        family="quantize", local_shape=(1, 8192),
+        hbm_bytes=24576.0, mte2_bytes=16384.0, mte3_bytes=8192.0, vector_ops=16384.0,
+        metadata=(("quantized_allreduce", True),),
+    )
+    precomp_ctx = RecipeContext(
+        precomp_op,
+        {"hbm": 24576.0, "mte2": 16384.0, "mte3": 8192.0, "vector": 16384.0},
+        names, rates, 4,
+    )
+    eng_pre = Engine([Resource(k, v, units=units[k]) for k, v in rates.items()], trace_limit=64)
+    done_pre = recipe.lower(precomp_ctx).start(eng_pre, "qp", eng_pre.submit("in"))
+    eng_pre.advance(until=(done_pre,))
+    pre_stores = [row for row in eng_pre.trace if row["task"].endswith(":scale_cast_store")]
+    assert len(pre_stores) > 1 and min(row["start_ms"] for row in pre_stores) < 16.0

@@ -11,9 +11,22 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from math import prod
 
-from mindie_sim.prediction.physical_recipe_base import (IO_HBM_CATEGORY, Phase, build_plan,
-                                   io_weight, tiled_phased_program)
+from mindie_sim.prediction.physical_recipe_base import (
+    IO_HBM_CATEGORY,
+    Phase,
+    _phase_amounts,
+    _phase_caps,
+    _tile_count,
+    build_plan,
+    io_weight,
+    phased_program,
+    tiled_phased_program,
+)
+from mindie_sim.prediction.program.pipeline import PipelineProgram
+from mindie_sim.prediction.program.stages import KernelProgram, Stage
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 MS_PER_SECOND = 1000
 HALF_SHARE = 0.5
@@ -31,9 +44,129 @@ NON_STREAMING_VECTOR_SUBMODES = frozenset({"broadcast_elementwise", "outer_axis_
 NORM_FAMILIES = frozenset({"rmsnorm", "layernorm", "mhc"})
 REDUCTION_FAMILIES = frozenset({"attention_residual", "softmax"})
 QUANT_FAMILIES = frozenset({"quantize"})
+PRECOMPUTED_SCALE_QUANT_RECIPES = frozenset({"quant_allreduce_quantize"})
 SCATTER_RECIPES = frozenset({"route_unpack"})
 WRITE_ONLY_RECIPES = frozenset({"core_output_zero"})
 RECURRENCE_FAMILIES = frozenset({"conv1d", "gdn_gating"})
+
+
+def _quantization_group_geometry(op) -> tuple[int, int, int, int, int] | None:
+    """Return ``(rows, width, group_size, groups_per_row, total_groups)`` for dynamic quantization."""
+    recipe = str(getattr(op, "recipe", "") or "")
+    metadata = dict(getattr(op, "metadata", ()) or ())
+    if (recipe in PRECOMPUTED_SCALE_QUANT_RECIPES
+            or bool(metadata.get("precomputed_scale", False))
+            or str(metadata.get("activation_scheme", "") or "").strip().lower() == "static"):
+        return None
+    shape = tuple(getattr(op, "local_shape", ()) or getattr(op, "semantic_shape", ()) or ())
+    if not shape:
+        return None
+    dims = tuple(int(dim) for dim in shape)
+    if any(dim <= 0 for dim in dims):
+        return None
+    width = dims[-1]
+    rows = 1
+    for dim in dims[:-1]:
+        rows *= dim
+    raw_group = metadata.get("activation_group_size")
+    if raw_group is None:
+        raw_group = metadata.get("group_size")
+    if raw_group is None:
+        group_size = width
+    else:
+        group_size = int(raw_group)
+        if group_size <= 0:
+            return rows, width, rows * width, 1, 1
+    if rows > 1 and group_size >= rows * width:
+        return rows, width, rows * width, 1, 1
+    eff_group = min(group_size, width)
+    groups_per_row = max(1, (width + eff_group - 1) // eff_group)
+    return rows, width, eff_group, groups_per_row, rows * groups_per_row
+
+
+def _quantization_scale_write_bytes(op, total_elems: int, total_mte3: float) -> float:
+    """Infer scale-tensor write bytes inside ``mte3`` when declared."""
+    if total_mte3 <= 0.0:
+        return 0.0
+    metadata = dict(getattr(op, "metadata", ()) or ())
+    scale_fmt = str(metadata.get("scale_format") or metadata.get("activation_scale_format") or "").strip().lower()
+    scale_shape = metadata.get("scale_shape")
+    if scale_fmt and scale_fmt != "none" and isinstance(scale_shape, (tuple, list)) and scale_shape:
+        try:
+            s_bytes = float(prod(int(dim) for dim in scale_shape) * dtype_bytes(scale_fmt))
+        except (ModelingError, TypeError, ValueError):
+            s_bytes = 0.0
+        if 0.0 < s_bytes < total_mte3:
+            return s_bytes
+    out_fmt = str(metadata.get("output_format") or "").strip().lower()
+    if out_fmt:
+        try:
+            payload = float(total_elems) * float(dtype_bytes(out_fmt))
+        except (ModelingError, TypeError, ValueError):
+            payload = 0.0
+        if 0.0 < payload < total_mte3:
+            return total_mte3 - payload
+    return 0.0
+
+
+def _group_aligned_pipeline(context, phases, *, slots: int, cap: int, geom: tuple[int, int, int, int, int]):
+    """Run reduction-bearing quantization phases on complete group boundaries."""
+    rows, width, group_size, groups_per_row, group_count = geom
+    count = min(_tile_count(context, cap=cap), group_count)
+    if count <= 1:
+        return phased_program(context, phases)
+    uniform_groups = (width % group_size == 0) if group_size < width else True
+    if group_count % count == 0 and uniform_groups:
+        return tiled_phased_program(context, phases, slots=slots, cap=count)
+    amounts = _phase_amounts(context, phases)
+    eff_slots = max(1, int(slots))
+    pipelined = eff_slots > 1
+    head_caps = _phase_caps(context, amounts, pipelined=pipelined, tile_index=0, tile_count=count)
+    mid_caps = _phase_caps(context, amounts, pipelined=pipelined, tile_index=1, tile_count=count)
+    tail_caps = _phase_caps(context, amounts, pipelined=pipelined, tile_index=count - 1, tile_count=count)
+    total_elems = rows * width
+    store_mte3 = next(
+        (float(amount.get("mte3", 0.0)) for phase, amount in zip(phases, amounts) if phase.name == "scale_cast_store"),
+        0.0,
+    )
+    scale_write_bytes = _quantization_scale_write_bytes(context.op, total_elems, store_mte3)
+    base, rem = divmod(group_count, count)
+
+    def _prefix_elems(group_idx: int) -> int:
+        if group_count == 1:
+            return total_elems if group_idx >= 1 else 0
+        row_idx, rem_group = divmod(group_idx, groups_per_row)
+        return row_idx * width + min(rem_group * group_size, width)
+
+    def tile(index: int):
+        tile_caps = head_caps if index == 0 else (tail_caps if index == count - 1 else mid_caps)
+        g0 = index * base + min(index, rem)
+        g1 = (index + 1) * base + min(index + 1, rem)
+        elem_share = float(_prefix_elems(g1) - _prefix_elems(g0)) / float(total_elems)
+        group_share = float(g1 - g0) / float(group_count)
+        store_io_share = (
+            ((store_mte3 - scale_write_bytes) * elem_share + scale_write_bytes * group_share) / store_mte3
+            if (0.0 < scale_write_bytes < store_mte3)
+            else elem_share
+        )
+        stages = []
+        for phase, amount, caps in zip(phases, amounts, tile_caps):
+            work = {}
+            for name, value in amount.items():
+                if value <= 0.0:
+                    continue
+                if phase.name == "scale_cast_store" and name != context.resource_names.get("vector", "vector"):
+                    work[name] = value * store_io_share
+                else:
+                    work[name] = value * elem_share
+            stages.append(Stage(phase.name, work, after=phase.after, caps=caps, keep_empty=True))
+        return stages
+
+    pipeline = PipelineProgram(count, eff_slots, tile, minimum_ms=context.minimum_ms)
+    return KernelProgram(
+        (Stage("setup", latency=context.setup_ms), Stage("tiles", after=("setup",), program=pipeline)),
+        minimum_ms=context.minimum_ms,
+    )
 
 
 @dataclass(frozen=True)
@@ -252,6 +385,12 @@ class AIVTiledVectorAndGatherRecipe:
                 or (context.service_caps and len(phases) >= THREE_STAGE_PIPELINE_SLOTS))
             else self.slots
         )
+        if submode == "quantization":
+            geom = _quantization_group_geometry(context.op)
+            if geom is not None:
+                return _group_aligned_pipeline(
+                    context, phases, slots=slots, cap=self.tile_cap, geom=geom,
+                )
         return tiled_phased_program(
             context, phases, slots=slots, cap=self.tile_cap)
 

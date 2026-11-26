@@ -153,7 +153,8 @@ def validate(*, plan, parallel, model, quant, lowering_passes,
         raise ModelingError("mla_prolog_v3_cache_layout_dtype_mismatch")
     if packed:
         # DCP keeps one rank-owned row slice; it does not change the C8 row ABI.
-        view(plan.kv_lora_rank, plan.qk_rope_head_dim, cache_group_size, query_format=proj_act)
+        view(plan.kv_lora_rank, plan.qk_rope_head_dim, cache_group_size,
+             query_format=proj_act, cache_dtype=quant.kv_dtype)
         if proj_w not in SUPPORTED_QUERY_FORMATS or proj_act != proj_w:
             raise ModelingError("mla_prolog_packed_requires_declared_projection_operands")
     if (plan.mla_variant != "latent_mla" or plan.cache_kind != "dense"
@@ -184,11 +185,31 @@ def validate(*, plan, parallel, model, quant, lowering_passes,
             raise ModelingError("mla_prolog_v3_query_norm_indexer_activation_mismatch")
 
 
-def _native_kind(packed, quant):
-    from .mla_prolog_packed import NATIVE_KIND_V3, NATIVE_KIND_V4, MXFP8_QUERY_FORMAT
+def _is_mxfp8_projection(quant) -> bool:
+    """Return True only for true MXFP8 (E4M3 + group-32 E8M0 scales), not FP32-scaled FP8."""
+    w_ports, act_ports = _prolog_port_formats(quant)
+    if not (all(fmt == MXFP8_FORMAT for fmt in w_ports) and all(fmt == MXFP8_FORMAT for fmt in act_ports)):
+        return False
+    for category in ("mla.q_a", "mla.q_b", "mla.kv_a"):
+        resolved = quant.for_category(category)
+        w_scale = str(getattr(resolved, "scale_format", "") or "").strip().lower()
+        act_scale = str(getattr(resolved, "activation_scale_format", "") or w_scale).strip().lower()
+        if w_scale != "fp8_e8m0" or act_scale != "fp8_e8m0":
+            return False
+        w_block = getattr(resolved, "weight_block", ()) or ()
+        w_group = int(w_block[-1]) if w_block else 0
+        act_group = int(getattr(resolved, "activation_group_size", 0) or 0)
+        if act_group != E8M0_GROUP_SIZE and w_group != E8M0_GROUP_SIZE:
+            return False
+    return True
+
+
+def _native_kind(packed, quant, *, do_rope: bool = True):
+    from .mla_prolog_packed import NATIVE_KIND_V3, NATIVE_KIND_V4
     del packed
-    w_ports, _ = _prolog_port_formats(quant)
-    if all(fmt == MXFP8_QUERY_FORMAT for fmt in w_ports):
+    if not do_rope:
+        return NATIVE_KIND_V4
+    if _is_mxfp8_projection(quant):
         return NATIVE_KIND_V4
     return NATIVE_KIND_V3
 
@@ -203,10 +224,11 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
     packed = cache_layout == LAYOUT
     by_id = {op.op_id: op for op in ops}
     qa, qb, kva, absorb = (dict(by_id[key].metadata) for key in (q_a, q_b, kv_a, q_absorb))
-    proj_act = _resolved_projection_format(quant)[1]
+    proj_w, proj_act = _resolved_projection_format(quant)
     local_heads = plan.num_heads // parallel.tp
     cache = (
-        packed_view(plan.kv_lora_rank, plan.qk_rope_head_dim, cache_group_size, query_format=proj_act)
+        packed_view(plan.kv_lora_rank, plan.qk_rope_head_dim, cache_group_size,
+                    query_format=proj_act, cache_dtype=quant.kv_dtype)
         if packed else None
     )
     packed_scales: dict[str, object] = {}
@@ -223,19 +245,20 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
             "projection_scale_dtype": proj_s_dt, "projection_scale_shapes": proj_s_sh,
         }
     do_rope = bool(plan.mla_do_rope)
-    native_kind = _native_kind(packed, quant)
-    mxfp8_query = native_kind.endswith("V4WeightNz")
+    native_kind = _native_kind(packed, quant, do_rope=do_rope)
+    is_v4 = native_kind.endswith("V4WeightNz")
+    mxfp8_query = _is_mxfp8_projection(quant)
     query_norm_output = bool(
         plan.indexer or plan.owns_topk or plan.index_query_per_layer)
-    # V4 quantizes the normalized query with group-32 E8M0 scales; V3 keeps
-    # one FP32 scale per row (or no scale at all without an index consumer).
+    # MXFP8 quantizes the normalized query with group-32 E8M0 scales; INT8/BF16
+    # keeps one FP32 scale per row (or no scale at all without an index consumer).
     query_norm_scale_dtype = "fp8_e8m0" if mxfp8_query else "fp32"
     query_norm_scale_shape = (
         () if not query_norm_output
         else (tokens, plan.q_lora_rank // E8M0_GROUP_SIZE) if mxfp8_query
         else (tokens, 1))
     source = SOURCE
-    if mxfp8_query:
+    if is_v4:
         source = SOURCE_V4
     elif packed:
         source = PACKED_SOURCE
@@ -267,7 +290,7 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
             "native_kind": native_kind,
             "native_kinds": (
                 (native_kind, "MlaPrologV4WeightNz", "MlaPrologV4")
-                if native_kind.endswith("V4WeightNz")
+                if is_v4
                 else (native_kind, "MlaPrologV3")
             ),
             "selection": IMPLEMENTATION,
@@ -275,7 +298,7 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
                 "cache_mode": "PA_BSND", "quantized_kv_cache": packed,
                 **({"packed_cache": cache} if packed else {}),
                 **({"mxfp8_query": True, "e8m0_group": E8M0_GROUP_SIZE}
-                   if native_kind.endswith("V4WeightNz") else {}),
+                   if mxfp8_query else {}),
                 "do_rope": do_rope,
                 "query_rope_member": do_rope,
                 "data_parallel_context": int(parallel.cp),
@@ -287,7 +310,7 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
         source=source,
         fusion_status="fused_framework_enable",
         fusion_reason=("mla_prolog_v4_selected_lowering"
-                       if mxfp8_query else "mla_prolog_v3_selected_lowering"),
+                       if is_v4 else "mla_prolog_v3_selected_lowering"),
     )
 
 
@@ -306,7 +329,8 @@ def declare_semantic(ops, *, prefix, plan, model, parallel, quant, tokens, membe
     qb = dict(by_id[q_b].metadata) if q_b in by_id else {}
     kva = dict(by_id[kv_a].metadata) if kv_a in by_id else {}
     absorb = dict(by_id[q_absorb].metadata) if q_absorb and q_absorb in by_id else {}
-    native_kind = _native_kind(False, quant)
+    do_rope = bool(plan.mla_do_rope)
+    native_kind = _native_kind(False, quant, do_rope=do_rope)
     query_norm_output = bool(
         plan.indexer or plan.owns_topk or plan.index_query_per_layer)
     default_fmt = quant.format_for("mla")
@@ -363,7 +387,7 @@ def cache_store(builder, *, deps, rows, plan, cache_layout=None, cache_group_siz
     if cache_layout == LAYOUT:
         _, proj_act = _resolved_projection_format(builder.quant)
         return store(builder, "kv_store", deps, rows, plan,
-                     query_format=proj_act)
+                     query_format=proj_act, cache_dtype=builder.quant.kv_dtype)
     return None
 
 

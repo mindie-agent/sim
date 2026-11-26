@@ -77,12 +77,29 @@ SOURCE_V4 = {
 }
 
 
-def view(latent, rope, group_size=PACKED_KV_GROUP_SIZE, *, query_format=INT8_QUERY_FORMAT):
+def view(
+    latent,
+    rope,
+    group_size=PACKED_KV_GROUP_SIZE,
+    *,
+    query_format=INT8_QUERY_FORMAT,
+    cache_dtype=None,
+):
     if latent != PACKED_KV_LATENT_DIM or rope != PACKED_KV_ROPE_DIM or group_size != PACKED_KV_GROUP_SIZE:
         raise ModelingError('mla_prolog_packed_int8_requires_latent512_rope64_tile128')
     if query_format not in SUPPORTED_QUERY_FORMATS:
         raise ModelingError('mla_prolog_packed_query_format_unsupported')
-    latent_dtype = MXFP8_QUERY_FORMAT if query_format == MXFP8_QUERY_FORMAT else INT8_QUERY_FORMAT
+    allowed_cache = (
+        {INT8_QUERY_FORMAT, MXFP8_QUERY_FORMAT}
+        if query_format == MXFP8_QUERY_FORMAT
+        else {INT8_QUERY_FORMAT}
+    )
+    if cache_dtype is None:
+        latent_dtype = INT8_QUERY_FORMAT
+    else:
+        latent_dtype = str(cache_dtype).strip().lower()
+        if latent_dtype not in allowed_cache:
+            raise ModelingError('mla_prolog_v3_cache_layout_dtype_mismatch')
     return {'layout': LAYOUT, 'latent_dtype': latent_dtype, 'rope_dtype': 'bf16',
             'scale_dtype': 'fp32', 'group_size': group_size,
             'payload_bytes': latent, 'rope_bytes': rope * 2,
@@ -120,8 +137,11 @@ def packed_operand_scales(
     )
 
 
-def _packed_plan(*, plan, rows, query_format=INT8_QUERY_FORMAT):
-    cache = view(plan.kv_lora_rank, plan.qk_rope_head_dim, query_format=query_format)
+def _packed_plan(*, plan, rows, query_format=INT8_QUERY_FORMAT, cache_dtype=None):
+    cache = view(
+        plan.kv_lora_rank, plan.qk_rope_head_dim,
+        query_format=query_format, cache_dtype=cache_dtype,
+    )
     if type(rows) is not int or isinstance(rows, bool) or rows < 0:
         raise ModelingError('mla_prolog_packed_requires_nonnegative_rows')
     if query_format not in SUPPORTED_QUERY_FORMATS:
@@ -148,11 +168,11 @@ def _packed_plan(*, plan, rows, query_format=INT8_QUERY_FORMAT):
     }
 
 
-def packed_contract(*, plan, rows, occurrence=None, query_format=INT8_QUERY_FORMAT):
+def packed_contract(*, plan, rows, occurrence=None, query_format=INT8_QUERY_FORMAT, cache_dtype=None):
     """Typed packed-cache writer contract with component offsets and scales."""
     if occurrence is not None and not isinstance(occurrence, Occurrence):
         raise ModelingError('mla_prolog_packed_occurrence_invalid')
-    spec = _packed_plan(plan=plan, rows=rows, query_format=query_format)
+    spec = _packed_plan(plan=plan, rows=rows, query_format=query_format, cache_dtype=cache_dtype)
     cache = spec['cache']
     return ProgramFragment(
         'mla_prolog_packed_cache',
@@ -192,7 +212,7 @@ def packed_contract(*, plan, rows, occurrence=None, query_format=INT8_QUERY_FORM
             ),
             tensor_out=(
                 TensorPortSpec('packed_cache', 'out', 'packed_latent_cache',
-                               dtype='mixed_int8_bf16',
+                               dtype=('mixed_fp8_bf16' if cache['latent_dtype'] == MXFP8_QUERY_FORMAT else 'mixed_int8_bf16'),
                                layout_kind=cache['cache_mode'], scope='cohort'),
                 TensorPortSpec('packed_scale', 'out', 'quant_scale',
                                dtype=cache['scale_dtype'], layout_kind='ND',
@@ -218,7 +238,7 @@ def packed_contract(*, plan, rows, occurrence=None, query_format=INT8_QUERY_FORM
         ),
         field_effects=(
             FieldDisposition('kv_latent.dtype', 'rewrite',
-                             source='bf16 normalized latent -> int8 payload'),
+                             source=f"bf16 normalized latent -> {cache['latent_dtype']} payload"),
             FieldDisposition('rope.dtype', 'preserve'),
             FieldDisposition('scale.dtype', 'rewrite',
                              source='fp32 group scale written in packed row'),
@@ -226,13 +246,19 @@ def packed_contract(*, plan, rows, occurrence=None, query_format=INT8_QUERY_FORM
             FieldDisposition('cache.alias', 'preserve',
                              source='cache_output_alias'),
         ),
-        notes=('D=656 is int8 payload + bf16 rope + fp32 scales, not one dtype',
+        notes=('D=656 is 1-byte latent payload + bf16 rope + fp32 scales, not one dtype',
                'work is the actual packed writer traffic and quantization ops'),
     )
 
 
-def store(builder, name, deps, rows, plan, query_format=INT8_QUERY_FORMAT):
-    spec = _packed_plan(plan=plan, rows=rows, query_format=query_format)
+def store(builder, name, deps, rows, plan, query_format=INT8_QUERY_FORMAT, *, cache_dtype=None):
+    resolved_cache_dtype = (
+        cache_dtype if cache_dtype is not None
+        else getattr(getattr(builder, 'quant', None), 'kv_dtype', None)
+    )
+    spec = _packed_plan(
+        plan=plan, rows=rows, query_format=query_format, cache_dtype=resolved_cache_dtype,
+    )
     cache = spec['cache']
     return builder.work(
         name, deps, (rows, cache['row_bytes']), family='cache_store', dtype=cache['latent_dtype'],
@@ -251,14 +277,20 @@ def validate_view(declaration):
     if token not in SUPPORTED_QUERY_FORMATS:
         raise ModelingError(
             'mla_prolog_packed_requires_declared_token_projections_bf16_uk_and_tile128_cache')
-    expected = view(declaration['latent_rank'], declaration['rope_width'], query_format=token)
     allowed_cache = {'int8', 'fp8_e4m3'} if token == MXFP8_QUERY_FORMAT else {'int8'}
+    cache_dtype = declaration.get('cache_dtype')
+    if cache_dtype not in allowed_cache:
+        raise ModelingError(
+            'mla_prolog_packed_requires_declared_token_projections_bf16_uk_and_tile128_cache')
+    expected = view(
+        declaration['latent_rank'], declaration['rope_width'],
+        query_format=token, cache_dtype=cache_dtype,
+    )
     if (declaration.get('packed_cache') != expected
             or tuple(declaration.get('projection_weight_dtypes', ())
                      ) != (token,) * TOKEN_PROJECTION_COUNT
             or declaration.get('absorbed_weight_dtype') != 'bf16'
             or declaration.get('norm_dtype') != 'bf16'
-            or declaration.get('cache_dtype') not in allowed_cache
             or declaration.get('query_norm_dtype') != token):
         raise ModelingError(
             'mla_prolog_packed_requires_declared_token_projections_bf16_uk_and_tile128_cache')

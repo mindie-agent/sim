@@ -3,7 +3,7 @@
   "device_arch": "A5",
   "sku_id": "ascend950dt_9582",
   "stack_or_cann_version": "cann-9.3.0+vllm-ascend@0c99d3fc",
-  "payload_sha256": "df6f5d4bd68bfee68e16834bb9aeef8674752b7389ba22cbf61052c057d2a1fe",
+  "payload_sha256": "22e9d9ee3c11d407f79a76558f44b9b4a527d12bb9f95b87e7b38a0e527a6399",
   "entries": [
     {
       "entry_id": "a5_hccl_agmm_v2_dense",
@@ -4558,7 +4558,7 @@
           "kr_cache_ref:bf16:ND:dense::none"
         ],
         [
-          "token_x:bf16:ND:dense::none",
+          "token_x:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0",
           "weight_dq:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
           "weight_uq_qr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
           "weight_uk:bf16:ND:dense::none",
@@ -4669,7 +4669,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "d78f362b6df1e026f0ea4d55e0c7eb8fee054902a668988960a82b2c8e847bd3",
+      "probe_signature_sha256": "fd4ebe7625ea6be8685e092331193ba0f61207ccc192efaddaa36a8ca5bd4975",
       "probe_domain_note": "Exact 11-input/4-output signature (aclnn_mla_prolog_v3_weight_nz.cpp:195); A5 BF16/MXFP8/INT8 (rejects FP16); A2/A3 INT8 NZ; live_silicon_observed=MlaPrologV3"
     },
     {
@@ -4683,7 +4683,7 @@
       "role": "mla_prolog",
       "dtype_tuple": [
         [
-          "token_x:bf16:ND:dense::none",
+          "token_x:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0",
           "weight_dq:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
           "weight_uq_qr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
           "weight_uk:bf16:ND:dense::none",
@@ -4709,7 +4709,7 @@
           "kr_cache_ref:bf16:ND:dense::none"
         ],
         [
-          "token_x:bf16:ND:dense::none",
+          "token_x:fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0",
           "weight_dq:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
           "weight_uq_qr:fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0",
           "weight_uk:bf16:ND:dense::none",
@@ -4822,7 +4822,7 @@
       ],
       "allow_bias": true,
       "require_no_bias": false,
-      "probe_signature_sha256": "8aedd3e5351a1f0b50b64edeb24d993a8d45ccc93ab4ee6209e037a7e6552405",
+      "probe_signature_sha256": "51e69c850c264b3325b1bf78f1d68495bfd6586ab1d733d1f4a4ca62420b8027",
       "probe_domain_note": "A5 MLA Prolog V4 NZ: exact 11-input (doRope=true) and 9-input (doRope=false) signatures -> 4 outputs; live_silicon_observed=MlaPrologV3"
     },
     {
