@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 from typing import AbstractSet, Mapping
 
-from ..ownership import unit_rates
+from ..ownership import _unit_mask, unit_rates
 from .arbiter_fast_coupled import fast_single_tier_coupled
 from .arbiter_tiered import (
     _FLOW_UNPLACED_IDX, _SAT_ULPS, _expand_simple_tier, _fifo_rank,
@@ -653,6 +653,78 @@ def _solve_coupled_component(
     return _independent_component_rates(resources, tasks, active, placed_active)
 
 
+def _task_res_unit_mask(task, rname: str, full_mask: int) -> int:
+    """Physical unit bitmask occupied by ``task`` on ``rname``."""
+    cohort = max(1, int(getattr(task, "cohort_size", 1) or 1))
+    if not task.coupled and cohort > 1:
+        mask = 0
+        for m_units in _member_placements(task, rname, cohort):
+            if m_units is None:
+                return full_mask
+            mask |= _unit_mask(m_units)
+        return mask
+    pl = task.placement
+    units = pl.get(rname) if pl else None
+    return full_mask if units is None else _unit_mask(units)
+
+
+def _coupled_uncoupled_links(
+    resources, tasks, active, coupled_res_all: AbstractSet[str], placed_active,
+) -> dict[str, set[int]]:
+    """Return per-resource uncoupled task keys sharing physical units with coupled flows."""
+    coupled_on_res: dict[str, list[int]] = {}
+    uncoupled_on_res: dict[str, list[int]] = {}
+    for key in active:
+        task = tasks[key]
+        rem = task.remaining
+        if not rem:
+            continue
+        target = coupled_on_res if task.coupled else uncoupled_on_res
+        for rname, amt in rem.items():
+            if amt > 0.0 and rname in coupled_res_all:
+                target.setdefault(rname, []).append(key)
+    promoted: dict[str, set[int]] = {}
+    probe_placed = placed_active != 0
+    for rname, u_keys in uncoupled_on_res.items():
+        res = resources[rname]
+        if res.policy == "fifo" or res.units <= 1 or not probe_placed:
+            promoted[rname] = set(u_keys)
+            continue
+        full_mask = (1 << res.units) - 1
+        hot_mask = 0
+        for c_key in coupled_on_res.get(rname, ()):
+            hot_mask |= _task_res_unit_mask(tasks[c_key], rname, full_mask)
+            if hot_mask == full_mask:
+                break
+        if hot_mask == full_mask:
+            promoted[rname] = set(u_keys)
+            continue
+        if not hot_mask:
+            continue
+        remaining_u = [
+            (k, _task_res_unit_mask(tasks[k], rname, full_mask))
+            for k in u_keys
+        ]
+        hit_keys: set[int] = set()
+        while remaining_u:
+            next_rem = []
+            grew = False
+            for k, mask in remaining_u:
+                if hot_mask & mask:
+                    hit_keys.add(k)
+                    if mask & ~hot_mask:
+                        hot_mask |= mask
+                        grew = True
+                else:
+                    next_rem.append((k, mask))
+            if not grew:
+                break
+            remaining_u = next_rem
+        if hit_keys:
+            promoted[rname] = hit_keys
+    return promoted
+
+
 def component_rates(
     resources, tasks, active, *, coupled_solver=None,
     coupled_active: int | None = None,
@@ -676,6 +748,9 @@ def component_rates(
         coupled_comps[0] if len(coupled_comps) == 1
         else {r for comp in coupled_comps for r in comp}
     )
+    coupled_u_links = _coupled_uncoupled_links(
+        resources, tasks, active, coupled_res_all, placed_active,
+    )
     uncoupled_contenders: dict[str, dict[int, float]] = {}
     for key in sorted(active):
         task = tasks[key]
@@ -683,7 +758,9 @@ def component_rates(
             continue
         caps = task.caps
         for name, amt in task.remaining.items():
-            if amt <= 0.0 or name in coupled_res_all:
+            if amt <= 0.0:
+                continue
+            if name in coupled_res_all and key in coupled_u_links.get(name, ()):
                 continue
             row = uncoupled_contenders.get(name)
             val = caps.get(name, math.inf) if caps else math.inf
@@ -722,18 +799,18 @@ def component_rates(
                     comp_keys.add(key)
                     sub_tasks[key] = task
                 continue
-            touches = False
+            keep_res: set[str] = set()
             outside = False
             for rname, amt in rem.items():
                 if amt <= 0.0:
                     continue
-                if rname in comp_res:
-                    touches = True
+                if rname in comp_res and key in coupled_u_links.get(rname, ()):
+                    keep_res.add(rname)
                 else:
                     outside = True
-            if touches:
+            if keep_res:
                 comp_keys.add(key)
-                sub_tasks[key] = _ProjectedTask(task, comp_res) if outside else task
+                sub_tasks[key] = _ProjectedTask(task, keep_res) if outside else task
         if not comp_keys:
             continue
         sub_res = {r: resources[r] for r in comp_res}
