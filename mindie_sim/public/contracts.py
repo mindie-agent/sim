@@ -284,22 +284,6 @@ def _workspace_module_file(module: Any, root: Path) -> bool:
         return False
 
 
-def _sibling_names(root: Path) -> tuple[str, ...]:
-    names = []
-    try:
-        children = tuple(root.iterdir())
-    except TimeoutError:
-        raise
-    except OSError:
-        return ()
-    for child in children:
-        if child.is_file() and child.suffix == ".py":
-            names.append(child.stem)
-        elif child.is_dir() and (child / "__init__.py").is_file():
-            names.append(child.name)
-    return tuple(sorted(set(name for name in names if name.isidentifier())))
-
-
 def _workspace_snapshot(root: Path) -> dict[str, bytes]:
     """Read one bounded source snapshot used for both identity and execution."""
     snapshot: dict[str, bytes] = {}

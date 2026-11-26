@@ -114,15 +114,6 @@ def _unknown(mapping: Mapping[str, Any], allowed: set[str], context: str) -> Non
                 and not str(key).startswith("x_")):
             raise ModelingError(f"unknown_field:{context}.{key}")
 
-def _float(value: Any, reason: str, *, minimum: float = 0.0) -> float:
-    try:
-        result = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ModelingError(reason) from exc
-    if not math.isfinite(result) or result < minimum:
-        raise ModelingError(reason)
-    return result
-
 def _int(value: Any, reason: str, *, minimum: int = 0) -> int:
     if isinstance(value, bool):
         raise ModelingError(reason)
@@ -144,11 +135,6 @@ def _positive_float(value: Any, reason: str, *, allow_zero: bool = False) -> flo
     if not math.isfinite(result) or result < 0 or (result == 0 and not allow_zero):
         raise ModelingError(reason)
     return result
-
-def _bool(value: Any, reason: str) -> bool:
-    if not isinstance(value, bool):
-        raise ModelingError(reason)
-    return value
 
 def _text(value: Any, reason: str, *, default: str | None = None) -> str:
     if value is None and default is not None:

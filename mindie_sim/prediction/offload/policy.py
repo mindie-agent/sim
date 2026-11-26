@@ -147,14 +147,6 @@ def _profile_channel(sku: str, channel_name: str) -> Mapping[str, Any] | None:
     return ch if isinstance(ch, Mapping) else None
 
 
-def _profile_channel_default_gbps(sku: str, channel_name: str) -> float | None:
-    """Return the registered Ascend profile's baseline effective BW for override detection."""
-    ch = _profile_channel(sku, channel_name)
-    if ch is None:
-        return None
-    return _pos_bw_gbps(ch.get("effective_uni_bw_gbps"))
-
-
 def _as_channel_dict(raw: Any) -> dict[str, Any] | None:
     if isinstance(raw, Mapping):
         return {str(k): v for k, v in raw.items()}

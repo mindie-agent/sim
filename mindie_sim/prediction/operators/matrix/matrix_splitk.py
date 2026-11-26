@@ -101,18 +101,6 @@ ROUTER_K_GRANULE = 1
 A5_AIC_UNITS = 32
 
 
-def _require_clock_hz(context, geometry) -> float:
-    for owner in (
-        getattr(context, "compute_arch", None),
-        getattr(context, "datapath", None),
-        getattr(geometry, "compute_arch", None),
-    ):
-        val = getattr(owner, "clock_hz", None)
-        if val is not None and not isinstance(val, bool) and float(val) > 0.0:
-            return float(val)
-    raise ModelingError("router_splitk_clock_hz_missing")
-
-
 def _allocate(total: float, weights: list[float]) -> list[float]:
     """Allocate ``total`` by normalized weight, closing rounding last."""
     if not weights:

@@ -76,18 +76,6 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical(value).encode("utf-8")).hexdigest()
 
 
-def _runtime_features(runtime: Any) -> tuple:
-    return (
-        bool(getattr(runtime, "engram_cpu_offload", False)),
-        bool(getattr(runtime, "multistream_overlap_shared_expert", False)),
-        bool(getattr(runtime, "enable_dbo", False)),
-        str(dict(getattr(runtime, "metadata", ()) or {}).get("moe_comm_mode", "")),
-        str(getattr(runtime, "graph_capture_mode", "none")),
-        str(getattr(runtime, "collective_startup_mode", "legacy")),
-        bool(getattr(runtime, "async_scheduling", False)),
-    )
-
-
 def _derivation(parsed: CaseSpec) -> dict[str, Any] | None:
     assumptions = dict(getattr(parsed.machine, "assumptions", ()) or ())
     base = assumptions.get("derivation.base")
@@ -427,25 +415,6 @@ def validate_candidate_statically(
         "b_vram_max_sync": max(0, int(min(b_sync, max_sequences_per_dp))),
         "b_vram_max_async": max(0, int(min(b_async, max_sequences_per_dp))),
         "b_vram_max_joint": max(0, int(min(b_joint, max_sequences_per_dp))),
-    }
-
-
-def _row_common(*, candidate_id: str, cand_p: ParallelSpec, devices: int,
-                ranks_per_node: int, phase: str, scope: str, context: int,
-                output_budget: int, emit_tokens: float, sla_ms: float,
-                two_stage: bool) -> dict[str, Any]:
-    return {
-        CANDIDATE_ID_KEY: candidate_id,
-        "parallel": _parallel_short(cand_p),
-        "parallel_spec": parallel_report(cand_p),
-        "num_devices": int(devices), "ranks_per_node": int(ranks_per_node),
-        "sweep_meta": {
-            "num_devices": int(devices), "sla_ms": float(sla_ms),
-            "context": int(context), "phase": phase, "scope": scope,
-            "output_budget": int(output_budget),
-            "emitted_tokens_per_seq": float(emit_tokens),
-            "two_stage": bool(two_stage),
-        },
     }
 
 

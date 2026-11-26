@@ -174,11 +174,6 @@ def _extract_compose_and_parallel(
     return kwargs, post_parallel
 
 
-def _compose_kwargs(model: str, options: Mapping[str, Any]) -> dict[str, Any]:
-    kwargs, _ = _extract_compose_and_parallel(options, strict=True)
-    return {"model": model, **kwargs}
-
-
 def _apply_post_parallel(
     composed: dict[str, Any], post_parallel: Mapping[str, Any],
 ) -> dict[str, Any]:

@@ -401,12 +401,6 @@ def _candidate_keys(views, ratio, maxima=None):
     return scan, payload
 
 
-def _wave_key_ranges(row_sets, views, ratio, shared, wave_rows=INDEXER_WAVE_ROWS):
-    """Distinct interval fragments in each wave, in logical key coordinates."""
-    request_spans = _request_key_spans(row_sets, views, ratio, shared)
-    return _wave_key_ranges_from_spans(request_spans, wave_rows)
-
-
 def _request_key_spans(row_sets, views, ratio, shared):
     """Compact per-request (rle_row_keys, prefix_extent, prefix_key) spans."""
     spans = []

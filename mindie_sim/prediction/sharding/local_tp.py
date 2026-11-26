@@ -533,13 +533,6 @@ def _is_replicated_slice(item: Mapping[str, Any], width: int) -> bool:
     return False
 
 
-def _replicated_local_width(metadata: Mapping[str, Any], width: int) -> int:
-    """Local output columns every owner already holds without a collective."""
-    slices = metadata.get("packed_projection_slices") or ()
-    return sum(int(tuple(item.get("shape", (0, 0)))[-1])
-               for item in slices if _is_replicated_slice(item, width))
-
-
 def _remote_exchange_width(
     metadata: Mapping[str, Any], width: int, local_n: int, full_n: int,
     quant: Any = None, *, is_logits: bool = False,

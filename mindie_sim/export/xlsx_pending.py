@@ -590,10 +590,6 @@ def _format_megafusion_tilelang_and_ub(mf: Any) -> tuple[str, str]:
 def _matching_megafusion_notes(item: PendingKernelItem, target_bundle: ExportBundle) -> str:
     """Surface matching A5 TileLang dual-tier / UB-wall guidance on a Pending Kernel Card."""
     notes: list[str] = []
-    synth = getattr(item, "synthesis_spec", None)
-    synth_ub = _sanitize_backend_text(str(getattr(synth, "ub_wall_warning", "") or "").strip())
-    if synth_ub:
-        notes.append(f"[UB-Wall 预警] {synth_ub}")
     item_tokens = {
         str(item.kernel_key or "").strip().lower(),
         str(item.target_kernel or "").strip().lower(),

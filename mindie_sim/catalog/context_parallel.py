@@ -419,39 +419,6 @@ def _sparse_sequence_moments(
     return (caps, pinned, sem_means, variances, residual_caps, weight * sel, hard_pinned)
 
 
-def _waterfill_with_floors(
-    remaining: float,
-    floors: Sequence[float],
-    caps: Sequence[float],
-    *,
-    exclude: int = -1,
-) -> list[float]:
-    """Waterfill ``remaining`` movable rows to minimize peak ``floor[r] + add[r] <= cap[r]``."""
-    cp = len(caps)
-    alloc = [0.0 if r == exclude else float(floors[r]) for r in range(cp)]
-    rem = max(0.0, float(remaining))
-    movable = [r for r in range(cp) if r != exclude and alloc[r] < float(caps[r]) - 1e-12]
-    while rem > 1e-12 and movable:
-        min_lvl = min(alloc[r] for r in movable)
-        lowest = [r for r in movable if alloc[r] <= min_lvl + 1e-12]
-        upper_cands = [float(caps[r]) for r in lowest] + [
-            alloc[r] for r in movable if alloc[r] > min_lvl + 1e-12
-        ]
-        next_lvl = min(upper_cands)
-        step = (next_lvl - min_lvl) * float(len(lowest))
-        if rem <= step + 1e-12:
-            share = rem / float(len(lowest))
-            for r in lowest:
-                alloc[r] = min(float(caps[r]), alloc[r] + share)
-            rem = 0.0
-            break
-        for r in lowest:
-            alloc[r] = next_lvl
-        rem = max(0.0, rem - step)
-        movable = [r for r in movable if alloc[r] < float(caps[r]) - 1e-12]
-    return alloc
-
-
 def _waterfill_sequence_on_batch(
     alloc_i: list[float],
     batch_load: list[float],

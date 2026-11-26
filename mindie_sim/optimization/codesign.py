@@ -1645,17 +1645,6 @@ def _simulate_engram_h2d_transfers(
     return max(0.0, overall_finish - overall_start), by_replica
 
 
-def _compute_engram_h2d_transfer_ms(
-    case: Case,
-    events: Sequence[_H2dTransferEvent],
-    *,
-    primitive_table: Any,
-) -> float:
-    """Price concurrent Engram/PLE H2D transfers per physical die port and shared root complex."""
-    overall_ms, _ = _simulate_engram_h2d_transfers(case, events, primitive_table=primitive_table)
-    return overall_ms
-
-
 def _collect_cross_hw_offload_opportunities(
     case: Case,
     nodes: Sequence[Any],
@@ -1911,11 +1900,6 @@ def collect_codesign_opportunities(
     datapath = datapath_for_die(case.machine.dies[0])
     default_cube_dtype = str(getattr(case.model, "compute_dtype", "") or "").strip()
 
-    node_by_spec_id: dict[str, Any] = {}
-    for n in eff_nodes:
-        syn = getattr(n, "synthesis_spec", None)
-        if syn is not None and getattr(syn, "spec_id", ""):
-            node_by_spec_id[str(syn.spec_id)] = n
     region_by_members: dict[tuple[str, ...], FuseRegion] = {
         tuple(ref.id for ref in reg.members): reg for reg in fuse_regions
     }
@@ -1933,17 +1917,13 @@ def collect_codesign_opportunities(
         l_star_ms = max(0.0, float(spec.l_star_us) / 1000.0)
         ub_live = max(0, int(spec.ub_peak_bytes))
         ub_cap = max(0, int(spec.ub_budget_bytes))
-        matched = node_by_spec_id.get(spec.spec_id)
-        has_cube = (
-            AlgebraicTrait.BILINEAR_MATMUL.value in spec.constituent_traits
-            or (matched is not None and float(getattr(matched, "flops", 0.0) or 0.0) > 0.0)
-        )
+        has_cube = AlgebraicTrait.BILINEAR_MATMUL.value in spec.constituent_traits
         has_aiv = any(t != AlgebraicTrait.BILINEAR_MATMUL.value for t in spec.constituent_traits) or not has_cube
         matched_receipt = receipt_by_region.get(spec.spec_id)
         if matched_receipt is not None:
             simt_gain_ms, simd_gain_ms, ub_warn = _dual_tier_from_receipt(matched_receipt)
         else:
-            cube_dt = str(getattr(matched, "dtype", "") or default_cube_dtype).strip() if has_cube else ""
+            cube_dt = default_cube_dtype if has_cube else ""
             simt_gain_ms, simd_gain_ms, ub_warn = resolve_tilelang_dual_tier_bounds(
                 datapath=datapath,
                 before_ms=before_ms,
@@ -1953,7 +1933,7 @@ def collect_codesign_opportunities(
                 has_cube=has_cube,
                 has_aiv=has_aiv,
                 cube_dtype=cube_dt,
-                vector_ops=float(getattr(matched, "vector_ops", 0.0) or 0.0) if matched is not None else 0.0,
+                vector_ops=0.0,
                 is_vector_or_norm_region=has_aiv,
             )
         matched_region = region_by_members.get(tuple(spec.constituent_op_ids))

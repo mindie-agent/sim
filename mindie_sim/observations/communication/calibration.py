@@ -932,12 +932,6 @@ def _chain_leg_breakdown(chain: Mapping) -> tuple[float, float, float, float, fl
     return dispatch_ms, gate_up_ms, quant_ms, down_ms, combine_ms
 
 
-def _chain_stage_durations_ms(chain: Mapping) -> tuple[float, float, float]:
-    """Return ``(quant_ms, gmm_ms, comm_ms)`` from canonical stage or raw leg maps."""
-    dispatch_ms, gate_up_ms, quant_ms, down_ms, combine_ms = _chain_leg_breakdown(chain)
-    return quant_ms, gate_up_ms + down_ms, dispatch_ms + combine_ms
-
-
 def _chain_overlap_split(dispatch_ms: float, gate_up_ms: float, quant_ms: float,
                          down_ms: float, combine_ms: float,
                          observed_overlap_ms: float) -> tuple[float, float]:
