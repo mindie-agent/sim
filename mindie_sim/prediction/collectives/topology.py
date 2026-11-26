@@ -508,7 +508,6 @@ class Topology(_TopologyPlansMixin):
         scope: str = "",
     ) -> bool:
         """True only when P18 AllReduce rate calibration priced this group's scope."""
-        del algorithm
         if not self.has_calibrated_p18_allreduce_rate():
             return False
         if collective not in {"allreduce", "reduce_scatter"}:
@@ -518,7 +517,23 @@ class Topology(_TopologyPlansMixin):
         resolved_scope = scope or self.scope_for_group(group)
         if not self._p18_measured_scope:
             return False
-        return resolved_scope == self._p18_measured_scope
+        if resolved_scope == self._p18_measured_scope:
+            return True
+        group_set = set(group)
+        return bool(
+            resolved_scope == "node"
+            and self._p18_measured_scope == "package"
+            and str(algorithm or "").strip().lower() == "double_ring"
+            and (
+                len({self._package_key(r) for r in group}) < len(group)
+                or any(
+                    self._link_scope.get(name) == "node"
+                    and len(group_set.intersection(self.links[name].members)) > 1
+                    and self.single_peer_flow_cap_bytes_per_ms(name) is not None
+                    for name in self.links
+                )
+            )
+        )
 
     def single_peer_flow_cap_bytes_per_ms(self, link_name: str) -> float | None:
         """Per-die SDMA rate cap bound explicitly from Hardware/PrimitiveTable declarations."""
@@ -1070,10 +1085,10 @@ class Topology(_TopologyPlansMixin):
             if "destination_stage" in metadata:
                 stage = int(metadata["destination_stage"])
             else:
-                stage = int(op.stage) + 1
-            if not 0 <= stage < p.pp or stage == int(op.stage):
+                stage = source_stage + 1
+            if not 0 <= source_stage < p.pp or not 0 <= stage < p.pp or stage == source_stage:
                 raise ModelingError(
-                    f"pp_p2p_invalid_terminal_stage:source={op.stage}:dest={stage}:pp={p.pp}"
+                    f"pp_p2p_invalid_terminal_stage:source={source_stage}:dest={stage}:pp={p.pp}"
                 )
             for source, destination in zip(sources, self.ranks(replica, stage)):
                 if source != destination:

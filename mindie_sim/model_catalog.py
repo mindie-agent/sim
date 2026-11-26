@@ -247,7 +247,9 @@ def _prune_draft_spec(
     return replace(draft, **updates) if updates else draft
 
 
-def _refresh_catalog_facts(spec: ModelSpec) -> ModelSpec:
+def _refresh_catalog_facts(
+    spec: ModelSpec, *, source_plans: Sequence[LayerPlan] | None = None,
+) -> ModelSpec:
     """Recompute all geometry-dependent ``catalog_facts`` from the final ``ModelSpec``."""
     from mindie_sim.catalog.specs import _model_weight_totals, _set_facts
     from mindie_sim.catalog.weights import (
@@ -257,9 +259,22 @@ def _refresh_catalog_facts(spec: ModelSpec) -> ModelSpec:
     )
 
     plans = spec.layer_plans
+    full_plans = tuple(source_plans) if source_plans else plans
     params, weights, draft_p, draft_w = _model_weight_totals(spec)
     row_bytes = cache_row_bytes_by_layer(spec)
     facts = dict(spec.catalog_facts)
+    if "full_model_compress_ratios" not in facts:
+        facts["full_model_compress_ratios"] = (
+            facts["compress_ratios"]
+            if "compress_ratios" in facts
+            else tuple(int(p.compress_ratio) for p in full_plans)
+        )
+    if "full_model_attention_types" not in facts:
+        facts["full_model_attention_types"] = (
+            facts["attention_types"]
+            if "attention_types" in facts
+            else _counts(p.architecture or p.attention for p in full_plans)
+        )
     facts.update({
         "body_layers": len(plans),
         "parameter_count_body": params,
@@ -401,7 +416,7 @@ def derive_expert_pruned(
         expert_routing=base.expert_routing if keep else (),
         expert_routing_source=base.expert_routing_source if keep else "uniform", auxiliary=aux,
     )
-    return _refresh_catalog_facts(spec)
+    return _refresh_catalog_facts(spec, source_plans=base.layer_plans)
 
 
 def customize_model_spec(
@@ -506,7 +521,7 @@ def customize_model_spec(
         state_bytes_per_request=float(sum(p.state_bytes_total for p in plans)),
         auxiliary=aux, engram=engram,
     )
-    return _refresh_catalog_facts(spec)
+    return _refresh_catalog_facts(spec, source_plans=base.layer_plans)
 
 
 @lru_cache(maxsize=None)

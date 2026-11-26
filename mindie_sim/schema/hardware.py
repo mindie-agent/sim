@@ -44,7 +44,9 @@ from .hardware_links import (
     _PRESERVED_TOPOLOGY_KEYS,
     _collective_protocols,
     _link_bandwidth,
+    _network_override_keys,
     _neutral_transfer_channel_links,
+    apply_network_overrides,
     calibration_warnings,
 )
 from .invocation import InvocationTiming
@@ -576,7 +578,28 @@ class Hardware:
         if len(set(ranks)) != count:
             raise ModelingError("device_rank_duplicate")
         if "links" in raw:
-            links = tuple(Link.from_mapping(link, default_members=ranks) for link in raw["links"])
+            raw_links = list(raw["links"])
+            links = tuple(Link.from_mapping(link, default_members=ranks) for link in raw_links)
+            override_keys = _network_override_keys(raw) if "links" in raw_in else set()
+            if override_keys:
+                updated_links = []
+                for raw_link, link in zip(raw_links, links):
+                    link_keys = set(raw_link.keys()) if isinstance(raw_link, Mapping) else set()
+                    filtered: dict[str, Any] = {}
+                    for key in override_keys:
+                        if key.endswith("_bw_util"):
+                            if not ({"bw_utilization", "bw_ratio", "utilization"} & link_keys):
+                                filtered[key] = raw[key]
+                        elif key.endswith("_latency_us"):
+                            if not ({"latency_us", "alpha_us"} & link_keys):
+                                filtered[key] = raw[key]
+                    updated_links.append(
+                        apply_network_overrides(
+                            (link,), filtered, gbps_to_bytes_per_ms=GBPS_TO_BYTES_PER_MS,
+                        )[0]
+                        if filtered else link
+                    )
+                links = tuple(updated_links)
         else:
             links = _neutral_transfer_channel_links(raw, placements)
         for link in links:

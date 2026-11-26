@@ -388,8 +388,18 @@ def _rebind_ep_owner(ops, owner):
     result = []
     for op in ops:
         metadata = dict(op.metadata)
+        changed = False
         if "ep_rank" in metadata:
             metadata["ep_rank"] = int(owner)
+            changed = True
+        if (
+            "routing_price_owner" in metadata
+            and isinstance(metadata["routing_price_owner"], int)
+            and not isinstance(metadata["routing_price_owner"], bool)
+        ):
+            metadata["routing_price_owner"] = int(owner)
+            changed = True
+        if changed:
             op = replace(op, metadata=tuple(sorted(metadata.items())))
         result.append(op)
     return tuple(result)
@@ -592,6 +602,8 @@ def _can_reuse_replica_graph(
              or int(getattr(case.runtime.parallel, "ep", 1) or 1) <= 0
              or int(case.model.num_experts)
              % max(1, int(case.runtime.parallel.ep)) == 0)
+        and (int(getattr(case.runtime.parallel, "ep", 1) or 1) <= UNIFORM_COUNT_CARDINALITY
+             or len(set(getattr(case.model, "expert_routing", ()) or ())) <= UNIFORM_COUNT_CARDINALITY)
         and not explicit_routing
         and not any(
             isinstance(item, Mapping) and "replica" in item

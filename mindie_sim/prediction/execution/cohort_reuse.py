@@ -97,7 +97,7 @@ def _ops(value: Any) -> tuple:
     return tuple(value)
 
 
-_SKIP_NORM_META_KEYS = frozenset({"rank", "ep_rank", "group_ranks", "replica"})
+_SKIP_NORM_META_KEYS = frozenset({"rank", "ep_rank", "routing_price_owner", "group_ranks", "replica"})
 _REBIND_ATOMIC = (int, float, bool, type(None))
 
 
@@ -693,6 +693,35 @@ def _rebind_group_ranks(
     return topology
 
 
+def _ep_owner_map(
+    case: Any,
+    rank_map: Mapping[int, int],
+    replica: int,
+) -> dict[int, int]:
+    """Map template EP-local ordinals to target replica EP-local ordinals."""
+    if case is None or not rank_map:
+        return dict(rank_map)
+    from mindie_sim.prediction.execution.rank_ledger import ep_groups
+
+    parallel = case.runtime.parallel
+    ep_degree = max(1, int(getattr(parallel, "ep", 1) or 1))
+    owner_by_rank: dict[int, int] = {}
+    for stage in range(max(1, int(getattr(parallel, "pp", 1) or 1))):
+        try:
+            _, groups = ep_groups(parallel, case.machine, replica, stage)
+        except (ModelingError, ValueError, KeyError, IndexError):
+            continue
+        for group in groups:
+            for ordinal, phys_rank in enumerate(group):
+                owner_by_rank[int(phys_rank)] = int(ordinal)
+    mapping: dict[int, int] = {}
+    for left, right in rank_map.items():
+        left_owner = owner_by_rank.get(int(left), int(left) % ep_degree)
+        right_owner = owner_by_rank.get(int(right), int(right) % ep_degree)
+        mapping[left_owner] = right_owner
+    return mapping
+
+
 def rebind_replica_graph(
     template: Sequence[Any], *, replica: int, placement: Any,
     request_binding: Mapping[str, str] | None,
@@ -705,6 +734,7 @@ def rebind_replica_graph(
 ) -> tuple[Any, ...]:
     """Rebind rank/request/state identities of one semantic template."""
     rank_map = {int(key): int(value) for key, value in dict(placement or {}).items()}
+    ep_map = _ep_owner_map(case, rank_map, replica)
     fallback = int(replica if physical_rank is None else physical_rank)
     requests = {str(key): str(value)
                 for key, value in dict(request_binding or {}).items()}
@@ -738,9 +768,15 @@ def rebind_replica_graph(
         )
         metadata = dict(raw_meta)
         meta_changed = False
-        for key in ("rank", "ep_rank", "destination_rank", "source_rank"):
-            if key in metadata and isinstance(metadata[key], int):
+        for key in ("rank", "destination_rank", "source_rank"):
+            if key in metadata and isinstance(metadata[key], int) and not isinstance(metadata[key], bool):
                 nv = rank_map.get(int(metadata[key]), metadata[key])
+                if nv != metadata[key]:
+                    metadata[key] = nv
+                    meta_changed = True
+        for key in ("ep_rank", "routing_price_owner"):
+            if key in metadata and isinstance(metadata[key], int) and not isinstance(metadata[key], bool):
+                nv = ep_map.get(int(metadata[key]), metadata[key])
                 if nv != metadata[key]:
                     metadata[key] = nv
                     meta_changed = True

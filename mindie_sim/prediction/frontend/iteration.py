@@ -860,7 +860,7 @@ class _FrontendIteration:
                  resource_fusion=None, replica=0, source_rows_by_replica=None,
                  routing_global_tokens=None, routing_views=None,
                  cohort_views_by_replica=None,
-                 physical_rank=None, explicit_physical_rank: bool = False,
+                 physical_rank=None, explicit_physical_rank: bool | None = None,
                  query_position=None, assembly="service",
                  dispatch_binding=None, dispatch_fast_step: bool = False):
         # ``dispatch_binding`` is the T14 PP/EP microbatch envelope (original
@@ -868,6 +868,11 @@ class _FrontendIteration:
         # ``plan``; a cached template owner can read this envelope without
         # inferring a slot from local list positions.
         requested_rank = physical_rank
+        resolved_explicit_rank = (
+            requested_rank is not None
+            if explicit_physical_rank is None
+            else bool(explicit_physical_rank)
+        )
         _frontend._reject_unmodeled_dbo(runtime, "frontend")
         if assembly not in {"model", "service"}:
             raise _frontend.ModelingError(f"assembly_scope_unknown:{assembly}")
@@ -933,24 +938,27 @@ class _FrontendIteration:
             plan, runtime, declared_runtime, global_views, assembly,
         )
         has_after_draft = has_prefill_draft or has_decode_draft or has_ngram_propose
-        fast_result = None if deferred_commits else self._try_lower_homogeneous(
-            entry=entry, pre_ops=tuple(ops), body_ready=previous,
-            plan=plan, model=model, runtime=runtime,
-            views=views, local_views=local_views,
-            valid=valid, padded=padded, local_tokens=local_tokens,
-            bucket=bucket, scope=scope, mode=mode, requests=requests,
-            selections=selections, resource_fusion=resource_fusion,
-            assembly=assembly, replica=replica, features=features,
-            body_global_tokens=body_global_tokens,
-            source_rows_by_replica=source_rows_by_replica,
-            routing_global_tokens=routing_global_tokens,
-            routing_views=eff_routing_views,
-            physical_rank=physical_rank,
-            query_position=eff_query_pos,
-            before=before, has_after_draft=has_after_draft,
-            pcp_prefill=pcp_prefill,
-            dispatch_fast_step=dispatch_fast_step,
-            machine=machine,
+        fast_result = (
+            None if (deferred_commits or resolved_explicit_rank)
+            else self._try_lower_homogeneous(
+                entry=entry, pre_ops=tuple(ops), body_ready=previous,
+                plan=plan, model=model, runtime=runtime,
+                views=views, local_views=local_views,
+                valid=valid, padded=padded, local_tokens=local_tokens,
+                bucket=bucket, scope=scope, mode=mode, requests=requests,
+                selections=selections, resource_fusion=resource_fusion,
+                assembly=assembly, replica=replica, features=features,
+                body_global_tokens=body_global_tokens,
+                source_rows_by_replica=source_rows_by_replica,
+                routing_global_tokens=routing_global_tokens,
+                routing_views=eff_routing_views,
+                physical_rank=physical_rank,
+                query_position=eff_query_pos,
+                before=before, has_after_draft=has_after_draft,
+                pcp_prefill=pcp_prefill,
+                dispatch_fast_step=dispatch_fast_step,
+                machine=machine,
+            )
         )
         if fast_result is not None:
             return fast_result
@@ -962,7 +970,7 @@ class _FrontendIteration:
                                    routing_views=eff_routing_views,
                                    cohort_views_by_replica=cohort_target_views,
                                    physical_rank=physical_rank,
-                                   explicit_physical_rank=(explicit_physical_rank or requested_rank is not None),
+                                   explicit_physical_rank=resolved_explicit_rank,
                                    query_position=eff_query_pos,
                                    include_recover_commits=(assembly == "service" or any(
                                        view.draft_proposal_tokens for view in plan.requests)),

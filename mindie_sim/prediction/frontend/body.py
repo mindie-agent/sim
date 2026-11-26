@@ -284,6 +284,15 @@ def _close_body_sp(
     return previous
 
 
+def _has_nonuniform_expert_routing(model, layer, parallel) -> bool:
+    """True when declared expert routing assigns unequal probability across EP ranks."""
+    ep = int(getattr(parallel, "ep", 1) or 1)
+    if ep <= 1 or layer.ffn != "moe" or int(layer.num_experts) <= 0:
+        return False
+    routing = tuple(getattr(model, "expert_routing", ()) or ())
+    return len(routing) > 1 and len(set(routing)) > 1
+
+
 class _FrontendBody:
     def _lower_body_attention(
         self, ops, previous, *, common, name, layer, stage, index, model, runtime,
@@ -343,7 +352,8 @@ class _FrontendBody:
                 selection_kwargs["dcp_local_pos"] = dcp_local_pos
             if layer.attention in {"gqa", "mla", "gdn", "kda"}:
                 selection_kwargs["physical_rank"] = (
-                    rank_ledger.owner if rank_ledger is not None else physical_rank
+                    physical_rank if physical_rank is not None
+                    else (rank_ledger.owner if rank_ledger is not None else None)
                 )
                 selection_kwargs["explicit_physical_rank"] = bool(explicit_physical_rank)
             if layer.attention == "gqa":
@@ -423,7 +433,10 @@ class _FrontendBody:
                 policy=self.attention_policy, machine=machine,
                 dcp_cohort_views_by_member=dcp_cohort_views,
                 dcp_local_pos=dcp_local_pos,
-                physical_rank=(rank_ledger.owner if rank_ledger is not None else physical_rank),
+                physical_rank=(
+                    physical_rank if physical_rank is not None
+                    else (rank_ledger.owner if rank_ledger is not None else None)
+                ),
                 explicit_physical_rank=bool(explicit_physical_rank),
             )
             ops.extend(_frontend._scope(attention.ops, "attention"))
@@ -438,7 +451,7 @@ class _FrontendBody:
         model, runtime, views, mode, tokens, requests, p, sp, attn_state, residual,
         routing_global_tokens, global_tokens, routing_views, rank_ledger,
         physical_rank, replica, query_position,
-        explicit_physical_rank=False, machine=None,
+        explicit_physical_rank=False, multi_replica_ep=False, machine=None,
     ):
         if tokens or layer.ffn == "moe":
             routing_tokens = (routing_global_tokens
@@ -476,6 +489,13 @@ class _FrontendBody:
                 _balanced_ep_owner(p, int(physical_rank), replica=replica, machine=machine)
                 if physical_rank is not None else None
             )
+            per_owner_ep_pricing = bool(
+                resolved_ep_owner is not None
+                and (
+                    explicit_physical_rank
+                    or (multi_replica_ep and _has_nonuniform_expert_routing(model, layer, p))
+                )
+            )
             ffn_ops, previous = self.ffn[layer.ffn](
                 **{**common, "tokens": ffn_tokens},
                 deps=hidden, parallel=p, global_tokens=global_tokens,
@@ -485,7 +505,7 @@ class _FrontendBody:
                 runtime=runtime, sequence_plan=(sp if (sp_moe if layer.ffn == "moe" else sp_dense) else None),
                 ep_owner=resolved_ep_owner,
                 price_owner=(rank_ledger.owner if rank_ledger is not None else
-                             resolved_ep_owner if explicit_physical_rank else None),
+                             resolved_ep_owner if per_owner_ep_pricing else None),
             )
             if sp_dense and layer.ffn == "dense":
                 ffn_ops, previous = _frontend.sequence_parallel.close_output(
@@ -729,7 +749,9 @@ class _FrontendBody:
                 attn_state=attn_state, residual=residual, routing_global_tokens=routing_global_tokens,
                 global_tokens=global_tokens, routing_views=routing_views, rank_ledger=rank_ledger,
                 physical_rank=physical_rank, replica=replica, query_position=query_position,
-                explicit_physical_rank=explicit_physical_rank, machine=machine,
+                explicit_physical_rank=explicit_physical_rank,
+                multi_replica_ep=bool(target_cohort_views and len(target_cohort_views) > 1 and p.ep_spans_dp),
+                machine=machine,
             )
             if attn_state is None and layer.residual_block_size and (index + 1) % layer.residual_block_size == 0:
                 residual_sources.append(previous)
@@ -932,7 +954,7 @@ def _representative_attention(
     attn_kwargs: dict = {}
     if physical_rank is not None:
         attn_kwargs["physical_rank"] = int(physical_rank)
-        attn_kwargs["explicit_physical_rank"] = True
+        attn_kwargs["explicit_physical_rank"] = False
     if lyr.attention == "gqa":
         attn_kwargs["gbsa_metadata_cache"] = gbsa_metadata_cache
     attn = frontend.attention[lyr.attention](
