@@ -72,7 +72,7 @@ class StateLedger:
         self._event_preds: dict[int, tuple[int, ...]] = {}
         self._introduced_commits: dict[tuple[str, float, int], set[int]] = {}
         self._read_ancestors: dict[int, set[int]] = {}
-        self._causal_stack: list[tuple[frozenset[int], set[int]]] = []
+        self._causal_stack: list[tuple[frozenset[int], set[int], int]] = []
         self._read_stack: list[int] = []
         for target, version in dict(initial or {}).items():
             if not isinstance(target, str) or not target:
@@ -146,6 +146,66 @@ class StateLedger:
         if ancestors:
             self._record_event_commits(event_sequence, ancestors, at=at)
 
+    def _inherit_event_commits(
+        self, event_sequence: int, after: Any, *, at: float,
+    ) -> None:
+        """Propagate active same-timestamp commits from completed predecessors."""
+        if not after or (not self._event_commits and not self._causal_stack):
+            return
+        self._prune(at)
+        if not self._event_commits and not self._causal_stack:
+            return
+        active_seq = self._causal_stack[-1][2] if self._causal_stack else -1
+        ancestors: set[int] = set()
+        if hasattr(after, "sequence"):
+            seq = after.sequence
+            tokens = self._event_commits.get(seq)
+            if tokens:
+                ancestors.update(tokens)
+            elif seq == active_seq:
+                anc, emitted, _ = self._causal_stack[-1]
+                ancestors.update(anc)
+                ancestors.update(emitted)
+        else:
+            for pred in after:
+                seq = getattr(pred, "sequence", None)
+                if seq is None:
+                    continue
+                tokens = self._event_commits.get(seq)
+                if tokens:
+                    ancestors.update(tokens)
+                elif seq == active_seq:
+                    anc, emitted, _ = self._causal_stack[-1]
+                    ancestors.update(anc)
+                    ancestors.update(emitted)
+        if ancestors:
+            self._record_event_commits(event_sequence, ancestors, at=at)
+
+    def _propagate_to_waiters(
+        self, event_sequence: int, waiters: Sequence[int], *, at: float,
+    ) -> None:
+        """Push same-timestamp commit tokens forward to awakened waiting sequences."""
+        if not self._event_commits and not self._causal_stack:
+            return
+        self._prune(at)
+        tokens: set[int] = set()
+        own = self._event_commits.get(event_sequence)
+        if own:
+            tokens.update(own)
+        if self._causal_stack:
+            anc, emitted, _ = self._causal_stack[-1]
+            if anc:
+                tokens.update(anc)
+            if emitted:
+                tokens.update(emitted)
+        if not tokens:
+            return
+        if own is None:
+            self._record_event_commits(event_sequence, tokens, at=at)
+        if waiters:
+            for wseq in waiters:
+                self._record_event_commits(wseq, tokens, at=at)
+
     def _collect_causal_ancestors(
         self, predecessors: Sequence[Any], *, at: float,
     ) -> frozenset[int]:
@@ -177,7 +237,7 @@ class StateLedger:
     ) -> None:
         if not self._causal_stack:
             return
-        ancestors, emitted = self._causal_stack[-1]
+        ancestors, emitted, _ = self._causal_stack[-1]
         combined = ancestors | emitted
         if not combined:
             return
@@ -196,7 +256,7 @@ class StateLedger:
     ) -> frozenset[int]:
         self._prune(at)
         emitted: set[int] = set()
-        self._causal_stack.append((ancestors, emitted))
+        self._causal_stack.append((ancestors, emitted, int(event.sequence)))
         try:
             callback(event)
         finally:
@@ -387,24 +447,35 @@ class StateLedger:
         self._live[target] = keep
 
     def _prune(self, at: float) -> None:
-        stale = [key for key in self._pending if key[1] < at]
-        for key in stale:
-            for tok in self._pending.pop(key):
-                self._retire_token(tok)
-        stale_hist = [key for key in self._committed_at_t if key[1] < at]
-        for key in stale_hist:
-            del self._committed_at_t[key]
-        stale_base = [key for key in self._commit_base if key[1] < at]
-        for key in stale_base:
-            target, _ = key
-            previous = self._commit_base.pop(key)
-            committed = self._committed.get(target)
-            if committed is not None:
-                self._retain(target, committed, previous, closing=True)
+        if (self._causal_time == at and not self._pending
+                and not self._committed_at_t and not self._commit_base):
+            return
+        if self._pending:
+            stale = [key for key in self._pending if key[1] < at]
+            for key in stale:
+                for tok in self._pending.pop(key):
+                    self._retire_token(tok)
+        if self._committed_at_t:
+            stale_hist = [key for key in self._committed_at_t if key[1] < at]
+            for key in stale_hist:
+                del self._committed_at_t[key]
+        if self._commit_base:
+            stale_base = [key for key in self._commit_base if key[1] < at]
+            for key in stale_base:
+                target, _ = key
+                previous = self._commit_base.pop(key)
+                committed = self._committed.get(target)
+                if committed is not None:
+                    self._retain(target, committed, previous, closing=True)
         if self._causal_time is None or at > self._causal_time:
-            self._live_tokens.clear()
-            self._event_commits.clear()
-            self._events_by_token.clear()
-            self._introduced_commits.clear()
-            self._read_ancestors.clear()
+            if self._live_tokens:
+                self._live_tokens.clear()
+            if self._event_commits:
+                self._event_commits.clear()
+            if self._events_by_token:
+                self._events_by_token.clear()
+            if self._introduced_commits:
+                self._introduced_commits.clear()
+            if self._read_ancestors:
+                self._read_ancestors.clear()
             self._causal_time = at

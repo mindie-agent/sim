@@ -46,6 +46,7 @@ from mindie_sim.catalog.checkpoint_reader import (
     FP8_DEFAULT_BLOCK_SIZE as FP8_BLOCK_SIZE,
     MXFP_GROUP_SIZE,
     TAG_SPEC_TABLE as _TAG_SPEC_TABLE,
+    _arch_flags_for_checkpoint_map,
     classify_tensor_categories,
     curated_weight_pattern_map,
     infer_arch_flags_from_patterns,
@@ -1106,8 +1107,7 @@ def classify_weight_tensor_quant(
     """Resolve the exact weight/activation/ledger dtype for one tensor key or role name."""
     name = str(tensor_or_role_name or "").strip()
     if isinstance(desc_or_quant_spec, CheckpointQuantMap):
-        pats = tuple(r.pattern for r in desc_or_quant_spec.rules)
-        has_mla, has_kda, _ = infer_arch_flags_from_patterns(pats)
+        has_mla, has_kda, _ = _arch_flags_for_checkpoint_map(desc_or_quant_spec)
         cats = classify_tensor_categories(name, has_mla=has_mla, has_kda=has_kda)
         cat = cats[0] if cats else name
         eff_native = desc_or_quant_spec.native_float_dtype or native_format
