@@ -144,11 +144,14 @@ def test_hc_fusion_runs_one_launch_with_source_gram_and_external_outputs():
     assert_fields(selected['timeline'][0], fusion_role='hc_pre', fusion_group_key=dict(fused.metadata)['fusion_group_key'],
                   physical_source_program=HC_PROFILE, native_implementation=declaration['implementation'])
     assert before['host@r0:s0'] == pytest.approx(6 * after['host@r0:s0'])
+    from mindie_sim.prediction.execution.context import build_stage_profiles
+    from mindie_sim.primitives.loader import load_primitives
     device = case.machine.dies[0]
+    peaks = build_stage_profiles(case, primitive_table=load_primitives(device.sku))[0].compute_peaks
     source = pre_phase_work(declaration['tensor_view'], Geometry(device.compute_units, {'vector': device.units('vector')}))
     for resource, key in (('memory', 'hbm'), ('vector', 'vector')):
         assert after[f'{resource}@r0:s0'] == pytest.approx(sum(work.resources.get(key, 0) for work in source.values()))
-    assert after['matrix@r0:s0'] == pytest.approx(sum((1000 * amount / device.peak(dtype) for work in source.values() for dtype, amount in work.matrix.items())))
+    assert after['matrix@r0:s0'] == pytest.approx(sum((1000 * amount / peaks[dtype] for work in source.values() for dtype, amount in work.matrix.items())))
     assert after['matrix@r0:s0'] > before['matrix@r0:s0']
     assert_fields(selected['execution'], live_tasks=0, live_programs=0)
     affine = find(members, recipe='hc_normalize_scale_bias_gate')

@@ -1194,12 +1194,19 @@ def _obligation_pipe_and_owners(
     has_aiv_work = any(amt and role in aiv_roles for role, amt in stage.work.items())
     if has_aic_work and not has_aiv_work:
         is_aic = True
+    elif has_aic_work and has_aiv_work:
+        is_aic = direction == "read"
     elif has_aiv_work:
         is_aic = False
     else:
         has_aic_pl = any(role in aic_roles and ids for role, ids in stage.placement.items())
         has_aiv_pl = any(role in aiv_roles and ids for role, ids in stage.placement.items())
-        is_aic = has_aic_pl and not has_aiv_pl
+        if has_aic_pl and not has_aiv_pl:
+            is_aic = True
+        elif has_aic_pl and has_aiv_pl:
+            is_aic = direction == "read"
+        else:
+            is_aic = False
     pipe = ("mte2_aic" if direction == "read" else "fixpipe") if is_aic else (
         "mte2_aiv" if direction == "read" else "mte3"
     )

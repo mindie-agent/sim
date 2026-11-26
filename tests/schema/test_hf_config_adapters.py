@@ -935,13 +935,19 @@ def test_lm_head_quantization_respects_exclusions_and_category_overrides() -> No
         name="w8a8", weight_format="int8", activation_format="int8",
         exclusions=("norm", "router", "lm_head"),
     )
-    q_overridden = QuantSpec(
+    q_excluded_wins = QuantSpec(
         name="w8a8", weight_format="int8", activation_format="int8",
         exclusions=("norm", "router", "lm_head"),
         category_overrides={"lm_head": {"weight_format": "int8"}},
     )
+    q_overridden = QuantSpec(
+        name="bf16_lm_int8", weight_format="bf16", activation_format="bf16",
+        exclusions=("norm", "router"),
+        category_overrides={"lm_head": {"weight_format": "int8"}},
+    )
     assert q_unexcluded.format_for("lm_head") == "int8"
     assert q_excluded.format_for("lm_head") == "bf16"
+    assert q_excluded_wins.format_for("lm_head") == "bf16"
     assert q_overridden.format_for("lm_head") == "int8"
     assert q_overridden.source_format_for("lm_head") == "int8"
 

@@ -239,6 +239,8 @@ class Mc2ProgramState:
                     payload["work"][str(name)] = (
                         payload["work"].get(str(name), 0.0) + float(amount))
                     lowered = str(name).lower()
+                    if lowered.startswith("ub_inj:") or ":ub_inj:" in lowered:
+                        continue
                     if ":tx:" in lowered:
                         payload["tx_bytes"] += float(amount)
                     elif ":rx:" in lowered:
@@ -269,6 +271,8 @@ class Mc2ProgramState:
                     count["work"][str(name)] = (
                         count["work"].get(str(name), 0.0) + float(amount))
                     lowered = str(name).lower()
+                    if lowered.startswith("ub_inj:") or ":ub_inj:" in lowered:
+                        continue
                     if ":tx:" in lowered:
                         count["tx_bytes"] += float(amount)
                     elif ":rx:" in lowered:

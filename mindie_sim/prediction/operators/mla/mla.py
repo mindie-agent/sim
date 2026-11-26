@@ -599,6 +599,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         machine=None, hierarchy=None, reuse_index_selection=False, shared_topk=None,
         dcp_cohort_views_by_member=None, dcp_local_pos=0,
         physical_rank=None, explicit_physical_rank=False):
+    """[Cohesive-Pipeline] Lower one MLA layer across prolog, KV/indexer cache, attention, and output projection."""
     (views, pcp_factor, tp_gather, dp_width,
      cohort_dec_views, peer_dec_rows, local_dp_pos) = _prepare_mla_views(
         plan, model, runtime, mode, parallel, views,
@@ -2081,6 +2082,7 @@ def _append_mla_attention(
     sfa_replicated_prefill_path=False, has_unabsorbed_prefill=False,
     unabsorbed_qk_dim=None, unabsorbed_v_dim=None,
 ) -> set[str]:
+    """[Cohesive-Pipeline] Append per-phase MLA attention ops, DCP/PCP gathers, and unabsorbed outputs."""
     block_size = max(1, int(getattr(runtime, "kv_block_size", DEFAULT_BLOCK_SIZE)
                               or DEFAULT_BLOCK_SIZE))
     layer_dcp = layer_dcp_degree(plan, parallel)

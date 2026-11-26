@@ -809,14 +809,10 @@ def _resolve_quant_category(spec: QuantSpec, cat: str) -> QuantSpec:
         return spec
     if "weight_format" in changes and changes["weight_format"]:
         changes["expert_weight_format"] = changes["weight_format"]
-        matched = set(names)
-        changes["explicit_weight_categories"] = tuple(
-            sorted(set(spec.explicit_weight_categories) | matched)
-        )
-        if spec.exclusions:
-            changes["exclusions"] = tuple(
-                ex for ex in spec.exclusions
-                if ex not in matched and ex.split(".", 1)[0] not in matched
+        bf16_matched = {name for name in names if name.split(".", 1)[0] in _BF16_CATEGORIES}
+        if bf16_matched:
+            changes["explicit_weight_categories"] = tuple(
+                sorted(set(spec.explicit_weight_categories) | bf16_matched)
             )
     return replace(spec, **changes, category_overrides=())
 

@@ -954,7 +954,7 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                      cache_hidden_dep=None, cache_views=None,
                      cache_padded_tokens=None, skip_pcp_index_gather=False,
                      machine=None, store_rank_candidates=None, physical_rank=None):
-    """Produce the index cache and (optionally) its TopK selection."""
+    """[Cohesive-Pipeline] Produce the index cache and (optionally) its TopK selection."""
     b = builder
     q = padded_tokens
     native_indexer = native_indexer_active(runtime, machine)

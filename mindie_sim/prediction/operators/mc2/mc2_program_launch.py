@@ -113,6 +113,8 @@ class _Mc2Program(Mc2ProgramState):
                     if key in endpoint_resources:
                         continue
                     lowered = key.lower()
+                    if lowered.startswith("ub_inj:") or ":ub_inj:" in lowered:
+                        continue
                     if ":tx:" in lowered:
                         tx_bytes += amount
                     elif ":rx:" in lowered:

@@ -440,7 +440,7 @@ def _compose(model, **options):
     return parse_case(compose_case(model=model, hardware=SKUS[-1].id, tp=1, layers=4, **options))
 
 @pytest.mark.parametrize("model,mode,members", [
-    ("deepseek-v4-flash-0731", "hash", 2), ("deepseek-v4-flash-0731", "sqrtsoftplus", 2),
+    ("deepseek-v4-flash-0731", "hash", 2), ("deepseek-v4-flash-0731", "sqrtsoftplus", 3),
     ("deepseek-v3", "noaux_tc", 9),
 ])
 def test_gating_conserves_score_work_and_preserves_external_hash_normalization(model, mode, members):
