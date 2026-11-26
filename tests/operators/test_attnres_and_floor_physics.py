@@ -139,7 +139,10 @@ def test_attnres_prefix_matches_measured_curve_and_owner_waves() -> None:
             tokens_local=tokens, bank_capacity=ATTNRES_CAPACITY,
             block_token_stride=ATTNRES_CAPACITY * ATTNRES_HIDDEN,
         )
-        ops.append(res.ops[0])
+        op = res.ops[0]
+        md = dict(op.metadata)
+        md["attn_res_view"] = {**md["attn_res_view"], "tiling_mode": "token_local"}
+        ops.append(replace(op, metadata=tuple(md.items())))
 
     results = operator_costs(case, tuple(ops))
     apes = []
@@ -148,13 +151,28 @@ def test_attnres_prefix_matches_measured_curve_and_owner_waves() -> None:
         pred_us = float(rec["duration_ms"]) * 1000.0
         by_point[(tokens, valid)] = pred_us
         assert pred_us > DECODE_FLOOR_US
-        # Compare device-side prediction against eager Python Triton measurement
+        # Compare token-local device prediction against eager Python Triton measurement
         # (80 Python kernel[grid] calls inside one Event pair saturate at the
         # 25.3 us host-launch plateau; inside ACLGraph, device duration stays 4..24 us).
         audit_us = max(pred_us, ATTNRES_AUDIT_PLATEAU_US)
         apes.append(abs(audit_us - meas) / meas * 100.0)
         for delta in rec["service_delta"].values():
             assert abs(float(delta)) < 1e-4
+
+    # Default auto cooperative dispatch (MakeParallelPlan) beats token-local on small batch (14, 12).
+    auto_op = attn_res_point(
+        {"prefix": "p_14_12_auto", "stage": 0, "layer": 0,
+         "model": model, "mode": "decode", "tokens": COOP_SMALL_BATCH},
+        prefix_id="prefix0", addend_id=None,
+        bank_ids=tuple(f"b{idx}" for idx in range(ATTNRES_CAPACITY)),
+        valid_blocks=ATTNRES_CAPACITY, write_slot=None, output_norm=True, mix=True,
+        materialize=False, tokens_local=COOP_SMALL_BATCH, bank_capacity=ATTNRES_CAPACITY,
+        block_token_stride=ATTNRES_CAPACITY * ATTNRES_HIDDEN,
+    ).ops[0]
+    auto_rec = operator_costs(case, (auto_op,))["operators"][0]
+    assert float(auto_rec["duration_ms"]) * 1000.0 < by_point[(COOP_SMALL_BATCH, ATTNRES_CAPACITY)]
+    for delta in auto_rec["service_delta"].values():
+        assert abs(float(delta)) < 1e-4
 
     from mindie_sim.prediction.operators.hyper_connections import family_attnres as _fa
     assert not hasattr(_fa, "ATTNRES_RESIDENT_TREE_DELTA_NS")
@@ -364,7 +382,8 @@ def test_mixed_precision_projections_reject_cross_precision_and_price_splitv() -
 
 
 def test_decode_floor_escapes_and_recover_ssm_per_request_abi() -> None:
-    # General MoE gating top-k escapes the 1.686 us streaming floor.
+    # General MoE gating top-k uses canonical P10 sort32_mrgsort4 primitive rates
+    # (no 1.686 us streaming floor clamp) and scales monotonically across AIV waves.
     case = parse_case(compose_case("qwen3.8-flash-next", REPRESENTATIVE_SKUS["a5"], tp=2, concurrency=MOE_TOKENS))
     layer = SimpleNamespace(
         num_experts=EXPERT_COUNT, top_k=TOP_K_EXPERTS, router_mode="softmax",
@@ -377,8 +396,19 @@ def test_decode_floor_escapes_and_recover_ssm_per_request_abi() -> None:
         requests=(), tokens=MOE_TOKENS, mode="decode", weight_dtype="fp32",
         weight_bytes=4, hash_table=False, noaux_tc=False,
     )
-    gating_res = operator_costs(case, (gating_op,))
-    assert float(gating_res["operators"][0]["duration_ms"]) * 1000.0 > DECODE_FLOOR_US
+    two_wave_tokens = 2 * COOP_AIV_COUNT
+    members_2w = tuple(SimpleNamespace(vector_ops=two_wave_tokens * EXPERT_COUNT, recipe=r) for r in ("score", "select"))
+    gating_2w = _fused_gating(
+        prefix="r2w", plan=layer, logits_input="logits", members=members_2w, stage=0,
+        requests=(), tokens=two_wave_tokens, mode="decode", weight_dtype="fp32",
+        weight_bytes=4, hash_table=False, noaux_tc=False,
+    )
+    gating_res = operator_costs(case, (gating_op, gating_2w))
+    gating_1w_us = float(gating_res["operators"][0]["duration_ms"]) * 1000.0
+    gating_2w_us = float(gating_res["operators"][1]["duration_ms"]) * 1000.0
+    assert gating_res["operators"][0]["program"] == "OperatorPlan"
+    assert gating_1w_us > 1.0 and gating_1w_us != pytest.approx(DECODE_FLOOR_US, abs=1e-3)
+    assert gating_2w_us > gating_1w_us and gating_2w_us > DECODE_FLOOR_US
 
     # PLE table marker BF16 gives 0 dequant ops and non-floor device lookup & gate.
     ckpt = resolve_default_checkpoint("qwen3.8-flash-next", "Ascend950DT_9582")
