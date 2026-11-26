@@ -183,16 +183,17 @@ def cache_component_parts(
             payload, scale, padding = float(p_b), float(s_b), float(pad_b)
     elif component == "gqa_kv":
         heads = local_kv_heads(plan.num_kv_heads, parallel.tp)
+        k_dim = int(plan.head_dim)
+        v_dim = int(getattr(plan, "v_head_dim", 0) or k_dim)
         key_fmt, val_fmt, is_shared = gqa_kv_formats(model, plan=plan, phase=phase)
-        if is_shared:
+        if is_shared and k_dim == v_dim:
             p_b, s_b, pad_b = cache_row_parts(
-                model, "gqa_kv", 2 * heads * plan.head_dim, plan=plan, phase=phase,
+                model, "gqa_kv", 2 * heads * k_dim, plan=plan, phase=phase,
             )
             payload, scale, padding = float(p_b), float(s_b), float(pad_b)
         else:
-            side_width = heads * plan.head_dim
-            kp, ks, kpad = key_fmt.row_parts(side_width)
-            vp, vs, vpad = val_fmt.row_parts(side_width)
+            kp, ks, kpad = key_fmt.row_parts(heads * k_dim)
+            vp, vs, vpad = val_fmt.row_parts(heads * v_dim)
             payload, scale, padding = float(kp + vp), float(ks + vs), float(kpad + vpad)
     elif component == "index_k":
         p_b, s_b, pad_b = index_row_parts(model, plan.index_dim, plan=plan, phase=phase)
@@ -371,14 +372,20 @@ def _local_cache_rows(
     return float(rows) if cp <= 1 else rows / cp
 
 
-def _window_cache_rows(seq: int, window: int | None, *, padded: bool, block: int) -> int:
-    """Sliding-window row count, adding +1 active write page when padded and seq > window."""
+def _window_cache_span(seq: int, window: int | None, *, padded: bool, block: int) -> tuple[int, int]:
+    """Sliding-window ``(start, rows)`` span using monotonic page-aligned allocation."""
     if not window or window <= 0:
-        return seq
+        return 0, seq
+    if seq <= 0:
+        return 0, 0
     if padded and seq > window:
         blk = max(1, int(block))
-        return (_ceil_div(window, blk) + 1) * blk
-    return min(seq, window)
+        pages = min(_ceil_div(seq, blk), _ceil_div(window - 1, blk) + 1)
+        end_page = (seq - 1) // blk
+        start_page = max(0, end_page - pages + 1)
+        return start_page * blk, pages * blk
+    live = min(seq, window)
+    return max(0, seq - live), live
 
 
 def _gqa_layer_row_bytes(
@@ -448,8 +455,7 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
         return result
     if plan.attention in {"gqa", "projection_only"}:
         if not 0 <= plan.kv_owner_layer_id < plan.index:
-            rows = _window_cache_rows(seq, plan.window, padded=capacity_padded, block=page_block)
-            start = max(0, seq - min(seq, plan.window)) if plan.window else 0
+            start, rows = _window_cache_span(seq, plan.window, padded=capacity_padded, block=page_block)
             row_bytes = _gqa_layer_row_bytes(
                 model, plan, tp, int8_fa3=int8_fa3, phase=phase,
             )
@@ -457,8 +463,7 @@ def layer_cache_components(model: Any, plan: Any, parallel: ParallelSpec,
     elif plan.attention != "mla":
         raise ModelingError(f"cache_attention_unknown:{plan.attention}")
     elif plan.cache_kind == "dense":
-        rows = _window_cache_rows(seq, plan.window, padded=capacity_padded, block=page_block)
-        start = max(0, seq - min(seq, plan.window)) if plan.window else 0
+        start, rows = _window_cache_span(seq, plan.window, padded=capacity_padded, block=page_block)
         result["mla_kv"] = local_rows(rows, start=start) * _packed_mla_row_bytes(
             model, plan, phase=phase,
         )

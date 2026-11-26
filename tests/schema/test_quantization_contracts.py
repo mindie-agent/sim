@@ -793,3 +793,143 @@ def test_dict_and_quantspec_mixed_dense_expert_and_explicit_kv_dtype_parity() ->
         p_inv = dict(resolve_case_contracts(c_inv)[1].port_abis)
         assert p_inv[("target", 0, "self_attn.q_proj")].weight_dtype == "int4", stack
         assert p_inv[("target", 0, "mlp.experts.0.gate_proj")].weight_dtype == "int8", stack
+
+
+def test_checkpoint_cache_scope_tie_break_inline_quant_and_draft_isolation() -> None:
+    """Checkpoint reader keeps draft/target cache scopes isolated, honors defaults, ties, inline tags, and draft isolation."""
+    from mindie_sim.catalog.checkpoint_reader import quant_spec_from_checkpoint_map, read_checkpoint_quant_map
+    from mindie_sim.catalog.draft import draft_quant
+    from mindie_sim.catalog.quant import projection_quant
+    from mindie_sim.schema.common import dtype_bytes
+    from mindie_sim.schema.model import LayerPlan
+    from mindie_sim.schema.stack import resolve_checkpoint_cache_abis
+
+    # Draft layer 0 cache tag never overwrites target layer 0 regardless of insertion order.
+    items = [("model.layers.0.self_attn.quant_type", "C8"), ("mtp.layers.0.self_attn.quant_type", "FLOAT")]
+    lp0 = LayerPlan(index=0, native_layer_id=0, attention="gqa", ffn="dense", num_heads=2, num_kv_heads=1, head_dim=64)
+    for order in (items, items[::-1]):
+        abis, _, _ = resolve_checkpoint_cache_abis(
+            (lp0,), read_checkpoint_quant_map(dict(order)), ParallelSpec(), "bf16",
+            role="colocated", phase="decode", kv_block_size=16,
+        )
+        assert sum(p.exact_bytes() for p in abis[0].planes if p.plane_kind == "payload") == 2 * 16 * 64
+
+    # Single layer exception preserves checkpoint-wide KV default on untouched layers.
+    qmap_def = read_checkpoint_quant_map({"kv_cache_type": "C8", "model.layers.1.self_attn.quant_type": "FLOAT"})
+    lps = tuple(
+        LayerPlan(index=i, native_layer_id=i, attention="gqa", ffn="dense",
+                  num_heads=2, num_kv_heads=1, head_dim=64, kv_owner_layer_id=i)
+        for i in range(2)
+    )
+    abis_def, _, _ = resolve_checkpoint_cache_abis(
+        lps, qmap_def, ParallelSpec(), "bf16", role="colocated", phase="decode", kv_block_size=16,
+    )
+    assert [sum(p.exact_bytes() for p in abi.planes if p.plane_kind == "payload") for abi in abis_def] == [2048, 4096]
+
+    # Equal-frequency BF16 vs INT8 projections preserve both layers without dropping BF16 on tie.
+    tie_desc = {f"model.layers.{i}.self_attn.o_proj.weight": tag for i, tag in enumerate(("FLOAT", "W8A8_DYNAMIC"))}
+    q_tie = quant_spec_from_checkpoint_map(read_checkpoint_quant_map(tie_desc, base_config={"torch_dtype": "bfloat16"}))
+    plans_tie = [
+        LayerPlan(index=i, native_layer_id=i, attention="gqa", ffn="dense", num_heads=4, num_kv_heads=2, head_dim=16)
+        for i in range(2)
+    ]
+    assert [int(projection_quant(q_tie, p).matrix_payload_bytes(64, 64, "attn.o")) for p in plans_tie] == [8192, 4096]
+
+    # Inline and metadata-only quant_method="ascend" resolve INT8 instead of degrading to BF16.
+    for qc in (
+        {"quant_method": "ascend", "model_quant_type": "W8A8_DYNAMIC", "model.layers.0.mlp.down_proj.weight": "W8A8_DYNAMIC"},
+        {"quant_method": "ascend", "model_quant_type": "W8A8_DYNAMIC"},
+    ):
+        q_asc = quant_spec_from_checkpoint_map(read_checkpoint_quant_map({"torch_dtype": "bfloat16", "quantization_config": qc}))
+        assert q_asc.weight_format == "int8"
+        assert int(q_asc.matrix_payload_bytes(128, 128, "dense_mlp", source=True)) == 128 * 128
+
+    # W4A4_DYNAMIC publishes packed 4-bit activation ABI.
+    q_w4a4 = quant_spec_from_checkpoint_map(
+        read_checkpoint_quant_map({"model.layers.0.self_attn.o_proj.weight": "W4A4_DYNAMIC"})
+    ).for_category("attn.o")
+    assert q_w4a4.activation_format == "int4" and int(128 * dtype_bytes(q_w4a4.activation_format)) == 64
+
+    # Weight-only compressed-tensors FP8 preserves native BF16 activations and resolves tensor ABI cleanly.
+    from mindie_sim.schema.stack import resolve_checkpoint_tensor_abi
+    w8a16_cfg = dict(
+        quant_method="compressed-tensors",
+        format="float-quantized",
+        config_groups={"g": dict(
+            targets=["Linear"],
+            weights=dict(type="float", num_bits=8, strategy="channel", dynamic=False, symmetric=True),
+            input_activations=None,
+        )},
+    )
+    qmap_w8a16 = read_checkpoint_quant_map(w8a16_cfg, base_config={"torch_dtype": "bfloat16"})
+    q_w8a16 = quant_spec_from_checkpoint_map(qmap_w8a16)
+    assert q_w8a16.activation_format == "bf16" and int(128 * dtype_bytes(q_w8a16.activation_format)) == 256
+    abi_w8a16 = resolve_checkpoint_tensor_abi(qmap_w8a16.rules[0].raw_tag, "bf16", qmap_w8a16.rules[0])
+    assert abi_w8a16.weight_dtype == "fp8_e4m3" and abi_w8a16.input_dtype == "bf16"
+
+    # Layer-scoped FLOAT KV exception projects onto QuantSpec so capacity matches ABI, inline Ascend keeps
+    # modules_to_not_convert, and minority FLOAT inside QKV does not downgrade majority-INT8 attn.qkv.
+    from mindie_sim.catalog.cache import layer_cache_components
+    from mindie_sim.schema.model import ModelSpec
+    qmap_mix_kv = read_checkpoint_quant_map({
+        "kv_cache_type": "C8", "model.layers.1.self_attn.quant_type": "FLOAT",
+    })
+    m_mix_kv = ModelSpec("mix", 2, 256, 2, 128, 256, 128, num_kv_heads=1,
+                         quant=quant_spec_from_checkpoint_map(qmap_mix_kv))
+    p_l1 = LayerPlan(index=1, native_layer_id=1, num_heads=2, num_kv_heads=1, head_dim=128, kv_owner_layer_id=1)
+    assert layer_cache_components(m_mix_kv, p_l1, ParallelSpec(), 16, capacity_padded=False)["gqa_kv"] == 8192.0
+
+    qmap_ign = read_checkpoint_quant_map({"torch_dtype": "bfloat16", "quantization_config": {
+        "quant_method": "ascend", "model_quant_type": "W8A8_DYNAMIC",
+        "model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC",
+        "modules_to_not_convert": ["model.layers.0.self_attn.o_proj"],
+    }})
+    p_l0 = LayerPlan(index=0, native_layer_id=0, num_heads=1, num_kv_heads=1, head_dim=64)
+    assert qmap_ign.ignored_modules == ("model.layers.0.self_attn.o_proj",)
+    assert int(projection_quant(quant_spec_from_checkpoint_map(qmap_ign), p_l0).matrix_payload_bytes(64, 64, "attn.o")) == 8192
+
+    qmap_qkv = read_checkpoint_quant_map({
+        "model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.0.self_attn.k_proj.weight": "FLOAT",
+        "model.layers.0.self_attn.v_proj.weight": "W8A8_DYNAMIC",
+    })
+    assert int(projection_quant(quant_spec_from_checkpoint_map(qmap_qkv), p_l0).matrix_payload_bytes(192, 64, "attn.qkv")) == 192 * 64
+
+    # Target-layer quantization overrides do not cross into an independent BF16 draft by layer index.
+    raw_draft = compose_case("kimi-k3.1", hardware=REPRESENTATIVE_SKUS["a5"], tp=8, ep=8, layers=4, quant="bf16")
+    raw_draft["model"]["quant"]["layer_quant_overrides"] = {
+        "layers": {"0": {"weight_format": "int8", "activation_format": "int8"}}
+    }
+    m_draft = parse_case(raw_draft).model
+    d_spec = m_draft.auxiliary.dspark
+    qd = projection_quant(draft_quant(m_draft, d_spec), d_spec.layer_plans[0])
+    assert qd.format_for("dense_mlp") == "bf16"
+    assert int(qd.matrix_payload_bytes(d_spec.intermediate_size, d_spec.hidden_size, "dense_mlp")) == (
+        2 * d_spec.intermediate_size * d_spec.hidden_size
+    )
+
+    # Explicitly quantized lm_head is not silently dropped via default unquantized exclusions.
+    q_lm = quant_spec_from_checkpoint_map(read_checkpoint_quant_map(
+        {"model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC", "lm_head.weight": "W8A8_DYNAMIC"},
+        base_config={"torch_dtype": "bfloat16"},
+    ))
+    assert "lm_head" not in q_lm.exclusions
+    assert "lm_head" in dict(q_lm.category_overrides)
+    assert q_lm.for_category("lm_head").weight_format == "int8"
+
+    q_lm_float = quant_spec_from_checkpoint_map(read_checkpoint_quant_map(
+        {"model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC", "lm_head.weight": "FLOAT"},
+        base_config={"torch_dtype": "bfloat16"},
+    ))
+    assert "lm_head" in q_lm_float.exclusions and "lm_head" not in dict(q_lm_float.category_overrides)
+
+    q_lm_hf = quant_spec_from_checkpoint_map(read_checkpoint_quant_map({
+        "torch_dtype": "bfloat16",
+        "quantization_config": {
+            "quant_method": "ascend",
+            "model_quant_type": "W8A8_DYNAMIC",
+            "model.layers.0.self_attn.q_proj.weight": "W8A8_DYNAMIC",
+            "lm_head.weight": "W8A8_DYNAMIC",
+        },
+    }))
+    assert "lm_head" not in q_lm_hf.exclusions and q_lm_hf.for_category("lm_head").weight_format == "int8"

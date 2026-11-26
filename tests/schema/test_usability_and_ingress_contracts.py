@@ -613,3 +613,147 @@ def test_diffusion_domain_detection_uses_token_boundaries_and_causal_arch() -> N
         )
         assert diff_case["runtime"]["metadata"]["workload_domain"] == "diffusion", diff_type
         assert diff_case["runtime"]["metadata"]["stack_id"] == "diffusion-native", diff_type
+
+
+def test_nominal_product_clocks_derived_clocks_sort_scaling_and_abi_shape_equations() -> None:
+    """Product nominal clocks (1650/1855 MHz), sort preset clock scaling, and CANN ABI shape equations hold."""
+    from mindie_sim.backends.abi_registry import default_abi_registry
+    from mindie_sim.backends.ascend import apply_observed_aicore_clock, profiles
+    from mindie_sim.prediction.structure import parse_case
+    from mindie_sim.schema.abi import AbiQueryKey, OperandPortSig
+    from mindie_sim.schema.hardware import Hardware
+
+    # Nominal 1650 MHz SKUs yield exact 270.336 TFLOPS BF16, unchanged HBM/DRAM ceilings, and 1.0 observed ratio.
+    all_profs = profiles()
+    for sku, exp_hbm, exp_mem in (
+        ("Ascend910B4", 0.8e12, 34359738368),
+        ("Ascend910B4-1", 0.8e12, 68719476736),
+        ("Ascend910_9362", 1.6e12, 68719476736),
+    ):
+        prof = all_profs[sku]
+        assert prof["source"]["declaration"]["configured_clock_mhz"] == pytest.approx(1650.0)
+        assert prof["device"]["compute_peaks"]["bf16"] == pytest.approx(270.336e12)
+        assert prof["device"]["rates"]["hbm"] == pytest.approx(exp_hbm)
+        assert prof["device"]["memory_bytes"] == exp_mem
+        obs = apply_observed_aicore_clock({**prof["device"], "observed_aicore_freq_mhz": 1650.0}, prof)
+        assert obs["compute_peaks"]["bf16"] == pytest.approx(prof["device"]["compute_peaks"]["bf16"])
+        assert obs["rates"]["mte2_aic"] == pytest.approx(prof["device"]["rates"]["mte2_aic"])
+
+    # Derived commercial SKUs retain nominal 1650 MHz Cube clock with 4.0 TB/s HBM and scaled core counts.
+    for sku, aic, mem_gib in (
+        ("Ascend950DT_425_96", 28, 96),
+        ("Ascend950DT_486_96", 32, 96),
+        ("Ascend950DT_547_96", 36, 96),
+        ("Ascend950DT_547_144", 36, 144),
+    ):
+        die = parse_case(compose_case("qwen3-32b", sku, layers=1, tp=1)).machine.dies[0]
+        assert dict(die.compute_peaks)["bf16"] == pytest.approx(aic * 1.65e9 * 8192)
+        assert die.compute_arch.clock_hz == pytest.approx(1.65e9)
+        assert dict(die.rates)["hbm"] == pytest.approx(4.0e12)
+        assert die.memory_bytes == mem_gib * 1024 ** 3
+
+    # Restating preset cycles_per_unit without an explicit clock still scales with observed frequency.
+    for services in ({}, {"vbitsort32": {"cycles_per_unit": 16}}):
+        die = Hardware.from_mapping({
+            "backend": "ascend", "sku": "Ascend910_9391", "num_devices": 1,
+            "device": {"observed_aicore_freq_mhz": 925,
+                       "compute_arch": {"presets": ["ascend_sort32_spec"], "instruction_services": services}},
+        }).dies[0]
+        svc = next(s for s in die.compute_arch.instruction_services if s.name == "vbitsort32")
+        assert svc.per_owner_rate == pytest.approx(die.compute_arch.clock_hz / svc.cycles_per_unit)
+
+    # Physical 4D FRACTAL_NZ weight in QuantMatmulV4, TBMM batch % split, and rank-3 MoeTokenPermute.
+    reg = default_abi_registry()
+    x1 = OperandPortSig("x1", "int8", "ND", False, (16, 128), "per_token_int8", (), "fp32", (16,))
+    x2 = OperandPortSig("x2", "int8", "FRACTAL_NZ", True, (4, 4, 16, 32), "per_channel_int8", (), "fp32", (64,))
+    y_out = OperandPortSig("y", "bf16", "ND", False, (16, 64), "dense", (), "none", ())
+    q_nz = AbiQueryKey("A3", "Ascend910_9391", "aclnnQuantMatmulV4", "quant_matmul", "target", "none", "shipping",
+                       (x1, x2), (y_out,), "local", 1, "local", 1, "none", "none", "none", (), False, False,
+                       -1, 0, 0, 0, 0, "none", False, 1, "bf16", False, 1, False, frozenset())
+    assert reg.verify(q_nz).status == "admitted_shipping"
+    for bad_shape in ((2, 4, 16, 64), (3, 4, 4, 16, 32)):
+        bad_x2 = OperandPortSig("x2", "int8", "FRACTAL_NZ", True, bad_shape, "per_channel_int8", (), "fp32", (64,))
+        q_bad = AbiQueryKey("A3", "Ascend910_9391", "aclnnQuantMatmulV4", "quant_matmul", "target", "none", "shipping",
+                            (x1, bad_x2), (y_out,), "local", 1, "local", 1, "none", "none", "none", (), False, False,
+                            -1, 0, 0, 0, 0, "none", False, 1, "bf16", False, 1, False, frozenset())
+        assert reg.verify(q_bad).status == "rejected_abi", bad_shape
+
+    def _bf16_port(role: str, shape: tuple[int, ...]) -> OperandPortSig:
+        return OperandPortSig(role, "bf16", "ND", False, shape, "dense", (), "none", ())
+
+    for batch, expected in ((4, "admitted_shipping"), (3, "rejected_abi")):
+        q_tbmm = AbiQueryKey(
+            "A3", "Ascend910_9391", "aclnnTransposeBatchMatMul", "transpose_batch_matmul", "target", "none", "shipping",
+            (_bf16_port("x1", (batch, 16, 64)), _bf16_port("x2", (batch, 64, 32))),
+            (_bf16_port("y", (2, 16, batch * 32 // 2)),), "local", 1, "local", 1, "none", "none", "none",
+            (("batch_split_factor", 2.0),), False, False, -1, 0, 0, 0, 0, "none", False, 1, "bf16", False, 1, False, frozenset(),
+        )
+        assert reg.verify(q_tbmm).status == expected
+
+    for tail in ((64,), (2, 32)):
+        tok_in = OperandPortSig("x", "bf16", "ND", False, (4, *tail), "dense", (), "none", ())
+        idx_in = OperandPortSig("idx", "int32", "ND", False, (4, 2), "none", (), "none", ())
+        tok_out = OperandPortSig("permute_tokens", "bf16", "ND", False, (8, *tail), "dense", (), "none", ())
+        idx_out = OperandPortSig("sorted_indices", "int32", "ND", False, (8,), "none", (), "none", ())
+        q_perm = AbiQueryKey(
+            "A3", "Ascend910_9391", "aclnnMoeTokenPermute", "moe_token_permute", "target", "none", "shipping",
+            (tok_in, idx_in), (tok_out, idx_out), "local", 1, "local", 1, "none", "none", "none", (), False, False,
+            -1, 0, 2, 4, 0, "none", False, 1, "bf16", False, 1, False, frozenset(),
+        )
+        assert reg.verify(q_perm).status == "admitted_shipping"
+        q_perm_bad = AbiQueryKey(
+            "A3", "Ascend910_9391", "aclnnMoeTokenPermute", "moe_token_permute", "target", "none", "shipping",
+            (tok_in, idx_in), (tok_out, idx_out), "local", 1, "local", 1, "none", "none", "none",
+            (("num_out_tokens", 3.0),), False, False, -1, 0, 2, 4, 0, "none", False, 1, "bf16", False, 1, False, frozenset(),
+        )
+        assert reg.verify(q_perm_bad).status == "rejected_abi"
+
+
+def test_structural_linear_attention_dispatch_projected_draft_width_and_explicit_schedules() -> None:
+    """Unseen GDN configs preserve recurrent state, projected_concat draft width matches taps, and schedules parse."""
+    import json
+    from pathlib import Path
+    from mindie_sim.catalog.draft_spec import SpeculativeExecutionContract
+    from mindie_sim.catalog.minimax_draft import build_minimax_auxiliary
+    from mindie_sim.model_catalog import build_model_spec, load_model
+    from mindie_sim.prediction.sharding.ffn_rules import raw_selection
+
+    # Unseen model_type with full GDN geometry preserves recurrent and convolution state.
+    gdn_cfg = dict(
+        num_hidden_layers=1, hidden_size=64, num_attention_heads=4, num_key_value_heads=2,
+        head_dim=16, intermediate_size=128, vocab_size=256, layer_types=["linear_attention"],
+        linear_num_key_heads=2, linear_num_value_heads=4, linear_key_head_dim=16,
+        linear_value_head_dim=16, linear_conv_kernel_dim=4, torch_dtype="bfloat16",
+    )
+    for model_type in ("qwen3_5", "unseen_gated_delta"):
+        lp = build_model_spec("synthetic-gdn", dict(gdn_cfg, model_type=model_type)).layer_plans[0]
+        assert (lp.attention, lp.recurrent_state_elements, lp.conv_state_elements) == ("gdn", 1024, 384)
+
+    # projected_concat draft uses len(target_layer_ids) * hidden_size even when kind="mtp".
+    d_cfg = dict(num_mtp_modules=2, dspark_target_layer_ids=[0], hidden_size=64,
+                 num_attention_heads=4, num_key_value_heads=2, head_dim=16, intermediate_size=128, vocab_size=256)
+    draft = build_minimax_auxiliary(d_cfg, body_layers=1).dspark
+    plan = SpeculativeExecutionContract("dspark", "dspark", 2, True).build_prepare_plan(8, draft_spec=draft)
+    assert draft.input_width == 64 and plan.exact_gemm_flops == 2 * 8 * 64 * (64 + 2 * (64 + 2 * 32))
+
+    # DeepSeek V4 routed_scaling_factor, explicit mlp_layer_types hash schedule, and HF layer_types/compress_rates.
+    cfg_path = Path(__file__).resolve().parents[2] / "mindie_sim/model_configs/deepseek-v4-pro-0813.json"
+    v4_raw = json.loads(cfg_path.read_text(encoding="utf-8"))
+    v4_model = load_model("deepseek-v4-pro")
+    learned = next(p for p in v4_model.layer_plans if p.router_mode != "hash")
+    ops, *_ = raw_selection(prefix="r", plan=learned, logits_input="logits", weight_dtype="fp32",
+                            weight_bytes=4, stage=0, requests=("r",), tokens=1, mode="decode")
+    assert learned.routed_scaling_factor == pytest.approx(v4_raw["routed_scaling_factor"])
+    assert sum(op.vector_ops for op in ops if op.recipe == "router_routed_scale") == learned.top_k
+
+    cfg_hash = dict(v4_raw)
+    cfg_hash.pop("num_hash_layers")
+    cfg_hash["mlp_layer_types"] = ["hash_moe" if i in (0, 2, 4) else "moe" for i in range(cfg_hash["num_hidden_layers"])]
+    assert [p.index for p in build_model_spec("v4-hash-sched", cfg_hash).layer_plans if p.router_mode == "hash"] == [0, 2, 4]
+
+    cfg_lt = dict(v4_raw)
+    names = {0: "sliding_attention", 4: "compressed_sparse_attention", 128: "heavily_compressed_attention"}
+    cfg_lt["layer_types"] = [names[r] for r in cfg_lt.pop("compress_ratios")[:cfg_lt["num_hidden_layers"]]]
+    cfg_lt["compress_rates"] = {names[4]: 4, names[128]: 128}
+    m_lt = build_model_spec("v4-layer-types", cfg_lt)
+    assert [p.compress_ratio for p in m_lt.layer_plans] == [p.compress_ratio for p in v4_model.layer_plans]

@@ -80,9 +80,12 @@ def draft_quant(model, draft):
             scale_bytes=0.0,
             output_format="",
             category_overrides=(),
+            layer_quant_overrides=(),
+            expert_quant_count=0,
+            expert_quant_overrides=(),
         )
     if not draft.weight_category:
-        return quant
+        return replace(quant, layer_quant_overrides=()) if quant.layer_quant_overrides else quant
     fmt = str(quant.format_for(draft.weight_category)).strip().lower()
     if fmt in FLOAT_WEIGHT_FORMATS:
         draft_overrides = _draft_scoped_overrides(quant, draft)
@@ -112,6 +115,9 @@ def draft_quant(model, draft):
                 scale_bytes=0.0,
                 output_format="",
                 category_overrides=draft_overrides,
+                layer_quant_overrides=(),
+                expert_quant_count=0,
+                expert_quant_overrides=(),
             )
     expert_fmt = quant.expert_weight_format if draft.num_experts > ZERO_EXPERTS else fmt
     act_fmt = fmt if fmt in FLOAT_WEIGHT_FORMATS else quant.activation_format
@@ -129,6 +135,7 @@ def draft_quant(model, draft):
         expert_weight_format=expert_fmt,
         activation_format=act_fmt,
         kv_dtype=kv_dt,
+        layer_quant_overrides=(),
     )
 
 

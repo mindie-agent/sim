@@ -75,6 +75,30 @@ _MOE_ACT_AND_MUL_ABIS = frozenset({
 _PORT_SPEC_FIELDS_MAX = 6
 _EVEN_DIVISOR = 2
 _PAIR_LEN = 2
+_FRACTAL_NZ_CUBE_ROWS = 16
+_FRACTAL_NZ_C0_1B = 32
+_FRACTAL_NZ_C0_2B = 16
+_FRACTAL_NZ_C0_4B = 8
+_FRACTAL_NZ_C0_4BIT = 64
+_FRACTAL_NZ_C0_BY_DTYPE: dict[str, tuple[int, ...]] = {
+    "int8": (_FRACTAL_NZ_C0_1B,),
+    "uint8": (_FRACTAL_NZ_C0_1B,),
+    "fp8": (_FRACTAL_NZ_C0_1B,),
+    "fp8_e4m3": (_FRACTAL_NZ_C0_1B,),
+    "fp8_e4m3fn": (_FRACTAL_NZ_C0_1B,),
+    "fp8_e5m2": (_FRACTAL_NZ_C0_1B,),
+    "hifloat8": (_FRACTAL_NZ_C0_1B,),
+    "fp16": (_FRACTAL_NZ_C0_2B,),
+    "bf16": (_FRACTAL_NZ_C0_2B,),
+    "int16": (_FRACTAL_NZ_C0_2B,),
+    "uint16": (_FRACTAL_NZ_C0_2B,),
+    "fp32": (_FRACTAL_NZ_C0_4B,),
+    "int32": (_FRACTAL_NZ_C0_4B,),
+    "uint32": (_FRACTAL_NZ_C0_4B,),
+    "int4": (_FRACTAL_NZ_C0_1B, _FRACTAL_NZ_C0_4BIT),
+    "int4_x2": (_FRACTAL_NZ_C0_1B, _FRACTAL_NZ_C0_4BIT),
+    "fp4_e2m1": (_FRACTAL_NZ_C0_1B, _FRACTAL_NZ_C0_4BIT),
+}
 _SHAPE_CONSTRAINT_KEYS = frozenset({
     "k_min",
     "k_max_exclusive",
@@ -521,10 +545,11 @@ def _extract_mkn(query: AbiQueryKey) -> tuple[int, int, int]:
             raw_hidden = wt_port.shape[-2] if query.soc_arch == "A5" else wt_port.shape[-1]
             act_div = 1 if query.activation_kind == "gelu" else _EVEN_DIVISOR
             n_dim = raw_hidden // act_div if raw_hidden > 0 else 0
-        elif wt_port.layout.startswith("FRACTAL_NZ") and len(wt_port.shape) == _RANK_5D:
-            n_dim = wt_port.shape[1] * wt_port.shape[_RANK_4D]
-        elif wt_port.layout.startswith("FRACTAL_NZ") and len(wt_port.shape) == _RANK_4D:
-            n_dim = wt_port.shape[0] * wt_port.shape[_RANK_3D]
+        elif wt_port.layout.startswith("FRACTAL_NZ") and len(wt_port.shape) in {_RANK_4D, _RANK_5D}:
+            if wt_port.transposed:
+                n_dim = wt_port.shape[-3] * wt_port.shape[-2]
+            else:
+                n_dim = wt_port.shape[-4] * wt_port.shape[-1]
         else:
             n_dim = wt_port.shape[-2] if wt_port.transposed else wt_port.shape[-1]
     elif query.outputs and query.outputs[0].shape:
@@ -619,8 +644,8 @@ def _check_transpose_batch_matmul_equations(
         return f"rejected_shape_or_align:tbmm_batch_mismatch:a_b={a_b}!=b_b={b_b}"
     if a_k != b_k:
         return f"rejected_shape_or_align:matmul_k_mismatch:a_k={a_k}!=b_k={b_k}"
-    if split > 1 and (a_b * b_n) % split != 0:
-        return f"rejected_shape_or_align:tbmm_split_indivisible:b*n={a_b * b_n}%split={split}"
+    if split > 1 and a_b % split != 0:
+        return f"rejected_shape_or_align:tbmm_split_indivisible:b={a_b}%split={split}"
     if not query.outputs:
         return None
     out_shape = query.outputs[0].shape
@@ -636,6 +661,15 @@ def _check_transpose_batch_matmul_equations(
     return None
 
 
+def _allowed_fractal_nz_c0(layout: str, dtype: str) -> tuple[int, ...]:
+    if layout == "FRACTAL_NZ_C0_16":
+        return (_FRACTAL_NZ_C0_2B,)
+    if layout == "FRACTAL_NZ_C0_32":
+        return (_FRACTAL_NZ_C0_1B,)
+    canon = _DTYPE_ALIASES.get(dtype.lower(), dtype.lower())
+    return _FRACTAL_NZ_C0_BY_DTYPE.get(canon, ())
+
+
 def _check_matmul_shape_equations(entry: ProbedAbiEntry, query: AbiQueryKey) -> str | None:
     """Enforce rank, transpose, empty-tensor, INT32 bounds, K, and output (M, N) matmul equations."""
     if entry.role not in _MATMUL_ROLES or len(query.operands) < _RANK_2D:
@@ -648,7 +682,11 @@ def _check_matmul_shape_equations(entry: ProbedAbiEntry, query: AbiQueryKey) -> 
 
     strict_a_roles = _STRICT_2D_MATMUL_ROLES | {"moe_grouped_matmul", "catlass_template"}
     allowed_a_ranks = {_RANK_2D} if entry.role in strict_a_roles else {_RANK_2D, _RANK_3D}
-    allowed_b_ranks = {_RANK_2D} if entry.role in _STRICT_2D_MATMUL_ROLES else {_RANK_2D, _RANK_3D}
+    is_nz_b = b_port.layout.startswith("FRACTAL_NZ")
+    if entry.role in _STRICT_2D_MATMUL_ROLES:
+        allowed_b_ranks = {_RANK_2D, _RANK_4D} if is_nz_b else {_RANK_2D}
+    else:
+        allowed_b_ranks = {_RANK_2D, _RANK_3D, _RANK_4D, _RANK_5D} if is_nz_b else {_RANK_2D, _RANK_3D}
     # Reject 0-D scalars (shape == ()) and any unsupported operand rank unconditionally.
     if len(a_port.shape) not in allowed_a_ranks:
         return f"rejected_shape_or_align:x1_rank_invalid:{len(a_port.shape)}D_not_in_{sorted(allowed_a_ranks)}"
@@ -657,10 +695,39 @@ def _check_matmul_shape_equations(entry: ProbedAbiEntry, query: AbiQueryKey) -> 
 
     a_m = a_port.shape[-1] if a_port.transposed else a_port.shape[-2]
     a_k = a_port.shape[-2] if a_port.transposed else a_port.shape[-1]
-    b_k = b_port.shape[-1] if b_port.transposed else b_port.shape[-2]
-    b_n = b_port.shape[-2] if b_port.transposed else b_port.shape[-1]
-    if a_k <= 0 or b_k <= 0 or a_k != b_k:
-        return f"rejected_shape_or_align:matmul_k_mismatch:a_k={a_k}!=b_k={b_k}"
+    is_physical_nz_b = is_nz_b and len(b_port.shape) in {_RANK_4D, _RANK_5D}
+    expected_nz_batch: int | None = None
+    if is_physical_nz_b:
+        if b_port.transposed:
+            k1, n1, n0, k0 = b_port.shape[-4], b_port.shape[-3], b_port.shape[-2], b_port.shape[-1]
+        else:
+            n1, k1, k0, n0 = b_port.shape[-4], b_port.shape[-3], b_port.shape[-2], b_port.shape[-1]
+        allowed_c0 = _allowed_fractal_nz_c0(b_port.layout, b_port.dtype)
+        if b_port.shape[-2] != _FRACTAL_NZ_CUBE_ROWS or (allowed_c0 and b_port.shape[-1] not in allowed_c0):
+            return (
+                f"rejected_shape_or_align:matmul_nz_tile_invalid:"
+                f"shape={b_port.shape},dtype={b_port.dtype},layout={b_port.layout}"
+            )
+        b_k = k1 * k0
+        b_n = n1 * n0
+        if a_k <= 0 or k0 <= 0 or n0 <= 0 or k1 <= 0 or n1 <= 0 or ((a_k + k0 - 1) // k0) != k1:
+            return f"rejected_shape_or_align:matmul_k_mismatch:a_k={a_k}!=b_nz_k={b_k}"
+        if len(b_port.shape) == _RANK_5D and entry.role != "moe_grouped_matmul":
+            b_batch = b_port.shape[0]
+            if b_batch <= 0:
+                return f"rejected_shape_or_align:matmul_nz_batch_invalid:b_batch={b_batch}"
+            if len(a_port.shape) == _RANK_3D:
+                a_batch = a_port.shape[0]
+                if a_batch <= 0 or (a_batch != b_batch and a_batch != 1 and b_batch != 1):
+                    return f"rejected_shape_or_align:matmul_batch_mismatch:a_batch={a_batch}!=b_batch={b_batch}"
+                expected_nz_batch = max(a_batch, b_batch)
+            else:
+                expected_nz_batch = b_batch
+    else:
+        b_k = b_port.shape[-1] if b_port.transposed else b_port.shape[-2]
+        b_n = b_port.shape[-2] if b_port.transposed else b_port.shape[-1]
+        if a_k <= 0 or b_k <= 0 or a_k != b_k:
+            return f"rejected_shape_or_align:matmul_k_mismatch:a_k={a_k}!=b_k={b_k}"
 
     allow_empty_mn = _allow_empty_matmul_mn(entry, a_port.dtype, b_port.dtype)
     if not allow_empty_mn and (a_m <= 0 or b_n <= 0):
@@ -674,8 +741,17 @@ def _check_matmul_shape_equations(entry: ProbedAbiEntry, query: AbiQueryKey) -> 
     allowed_out_ranks = {_RANK_2D} if entry.role in strict_a_roles else {_RANK_2D, _RANK_3D}
     if len(out_shape) not in allowed_out_ranks:
         return f"rejected_shape_or_align:out_rank_invalid:{len(out_shape)}D_not_in_{sorted(allowed_out_ranks)}"
+    if expected_nz_batch is not None and (len(out_shape) != _RANK_3D or out_shape[0] != expected_nz_batch):
+        return (
+            f"rejected_shape_or_align:matmul_nz_out_batch_mismatch:"
+            f"out={out_shape},expected_batch={expected_nz_batch}"
+        )
     out_m, out_n = out_shape[-2], out_shape[-1]
-    if out_n != b_n or (not allow_empty_mn and out_n <= 0):
+    n_matches = (
+        (out_n > 0 and ((out_n + n0 - 1) // n0) == n1) if is_physical_nz_b
+        else (out_n == b_n)
+    )
+    if not n_matches or (not allow_empty_mn and out_n <= 0):
         return f"rejected_shape_or_align:matmul_n_mismatch:out_n={out_n}!=b_n={b_n}"
     ws = max(1, int(query.world_size))
     if entry.abi_id in _ALLGATHER_MM_IDS:
@@ -961,15 +1037,22 @@ def _check_op_specific_shapes(entry: ProbedAbiEntry, query: AbiQueryKey) -> str 
     if entry.abi_id == "aclnnMoeTokenPermute" and len(query.operands) >= _RANK_2D and len(query.outputs) >= _RANK_2D:
         tok_s, idx_s = query.operands[0].shape, query.operands[1].shape
         out_tok_s, sorted_idx_s = query.outputs[0].shape, query.outputs[1].shape
-        if len(tok_s) != _RANK_2D or len(idx_s) not in {1, _RANK_2D} or idx_s[0] != tok_s[0]:
+        if (len(tok_s) < _RANK_2D or any(dim < 0 for dim in tok_s)
+                or len(idx_s) not in {1, _RANK_2D} or idx_s[0] != tok_s[0]):
             return f"rejected_shape_or_align:moe_token_permute_in_invalid:tokens={tok_s},indices={idx_s}"
         total = tok_s[0] * (idx_s[1] if len(idx_s) == _RANK_2D else 1)
         if len(sorted_idx_s) != 1 or sorted_idx_s[0] != total:
             return f"rejected_shape_or_align:moe_token_permute_sorted_idx_mismatch:{sorted_idx_s}!=({total},)"
-        if len(out_tok_s) != _RANK_2D or out_tok_s[1] != tok_s[1] or (
-            "num_out_tokens" not in dict(query.activation_params) and out_tok_s[0] != total
-        ):
-            return f"rejected_shape_or_align:moe_token_permute_out_mismatch:{out_tok_s}_vs_total={total}"
+        params = dict(query.activation_params)
+        if "num_out_tokens" in params:
+            raw_out = int(params["num_out_tokens"])
+            expected_out = max(0, min(raw_out + total if raw_out <= 0 else raw_out, total))
+        else:
+            expected_out = total
+        if (len(out_tok_s) < _RANK_2D or any(dim < 0 for dim in out_tok_s)
+                or math.prod(out_tok_s[1:]) != math.prod(tok_s[1:])
+                or out_tok_s[0] != expected_out):
+            return f"rejected_shape_or_align:moe_token_permute_out_mismatch:{out_tok_s}_vs_expected={expected_out}"
     if entry.abi_id == "aclnnTextGatedResidual" and len(query.operands) >= _RANK_3D:
         x_s, wd_s, wu_s = query.operands[0].shape, query.operands[1].shape, query.operands[2].shape
         if len(x_s) != _RANK_3D or len(wd_s) != _RANK_2D or len(wu_s) != _RANK_2D:

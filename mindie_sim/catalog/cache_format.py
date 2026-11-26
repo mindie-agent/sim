@@ -494,9 +494,26 @@ def _parse_format_dict(raw: Mapping[str, Any], region: str) -> CacheFormat:
     return CacheFormat(dtype, group, scale, suffix, suffix_dtype, packed, alignment)
 
 
-def _declared_kv_tag(model: Any) -> str:
+def _layer_quant(model: Any, plan: Any = None) -> tuple[Any, bool]:
+    """Resolve effective per-layer ``QuantSpec``, reporting whether a layer override matched."""
+    base = getattr(model, "quant", None)
+    if base is None or plan is None or not getattr(base, "layer_quant_overrides", ()):
+        return base, False
+    from mindie_sim.catalog.quant import apply_layer_quant_override
+
+    resolved = apply_layer_quant_override(base, plan)
+    return resolved, (resolved is not base)
+
+
+def _declared_kv_tag(model: Any, *, plan: Any = None) -> str:
     metadata = dict(getattr(model, "metadata", ()) or ())
-    quant = getattr(model, "quant", None)
+    base_quant = getattr(model, "quant", None)
+    quant, has_override = _layer_quant(model, plan)
+    if has_override:
+        base_kv = str(getattr(base_quant, "kv_dtype", "") if base_quant is not None else "").strip()
+        layer_kv = str(getattr(quant, "kv_dtype", "") if quant is not None else "").strip()
+        if layer_kv and layer_kv != base_kv:
+            return layer_kv
     for raw in (
         metadata.get("kv_cache_tag"),
         metadata.get("kv_cache_type"),
@@ -523,8 +540,8 @@ def cache_format(
         raw = _lookup_region_decl(metadata, "gqa_kv", plan=plan, phase=phase)
     if raw is not None:
         return _parse_format_dict(raw, region)
-    quant = getattr(model, "quant", None)
-    raw_tag = _declared_kv_tag(model)
+    quant, _ = _layer_quant(model, plan)
+    raw_tag = _declared_kv_tag(model, plan=plan)
     upper_tag = raw_tag.upper().replace("-", "_")
     if upper_tag == MXFP_KV_TAG and region in {"gqa_kv", "gqa_kv_key", "gqa_kv_value"}:
         return CacheFormat(MXFP_KV_PAYLOAD_DTYPE, MXFP_KV_GROUP_SIZE, MXFP_KV_SCALE_DTYPE)
@@ -589,7 +606,7 @@ def gqa_kv_formats(
             cache_format(model, "gqa_kv_value", plan=plan, phase=phase),
             False,
         )
-    upper_tag = _declared_kv_tag(model).upper().replace("-", "_")
+    upper_tag = _declared_kv_tag(model, plan=plan).upper().replace("-", "_")
     if upper_tag == MXFP_KV_TAG:
         fmt = CacheFormat(MXFP_KV_PAYLOAD_DTYPE, MXFP_KV_GROUP_SIZE, MXFP_KV_SCALE_DTYPE)
         return fmt, fmt, False
@@ -833,10 +850,10 @@ def _layer_checkpoint_for_cache(
     phase: str,
 ) -> tuple[CheckpointQuantMap, str, bool]:
     metadata = dict(getattr(model, "metadata", ()) or ())
-    quant = getattr(model, "quant", None)
+    quant, _ = _layer_quant(model, plan)
     orig_native = str((getattr(quant, "native_format", "") if quant is not None else "") or "bf16").strip().lower()
     native_dtype = orig_native
-    raw_kv = _declared_kv_tag(model).upper().replace("-", "_")
+    raw_kv = _declared_kv_tag(model, plan=plan).upper().replace("-", "_")
     kv_scale = str(
         metadata.get("kv_scale_dtype")
         or (getattr(quant, "kv_scale_dtype", "") if quant is not None else "")
@@ -948,7 +965,7 @@ def _overlay_explicit_kv_planes(
                 fmt, int(plan.cache_row_elements), prefix=f"l{abi.native_layer}.{region}", block_size=block,
             ))]
         return [abi]
-    upper_tag = _declared_kv_tag(model).upper().replace("-", "_")
+    upper_tag = _declared_kv_tag(model, plan=plan).upper().replace("-", "_")
     has_gqa_override = (
         upper_tag not in {MXFP_KV_TAG, C8_KV_TAG, FAQUANT_KV_TAG}
         and any(
@@ -962,9 +979,20 @@ def _overlay_explicit_kv_planes(
 
     tp = max(1, int(getattr(parallel, "tp", 1) or 1))
     local_heads = local_kv_heads(plan.num_kv_heads or plan.num_heads or 1, tp)
-    key_fmt, val_fmt, _shared = gqa_kv_formats(model, plan=plan, phase=phase)
+    key_fmt, val_fmt, is_shared = gqa_kv_formats(model, plan=plan, phase=phase)
     kd = int(plan.head_dim)
     vd = int(getattr(plan, "v_head_dim", 0) or kd)
+    if is_shared and kd == vd:
+        return [
+            replace(
+                abi,
+                component_role="kv_combined",
+                producer_key=f"{abi.scope}.l{abi.native_layer}.kv_combined",
+                planes=_row_planes_from_format(
+                    key_fmt, 2 * local_heads * kd, prefix=f"l{abi.native_layer}.kv", block_size=block,
+                ),
+            )
+        ]
     return [
         replace(
             abi,
@@ -1081,7 +1109,7 @@ def _resolve_index_cache_format(model: Any, plan: Any, *, phase: str | None = No
     raw = _lookup_region_decl(metadata, "index_k", plan=plan, phase=phase)
     if raw is not None:
         return _parse_format_dict(raw, "index_k")
-    quant = getattr(model, "quant", None)
+    quant, _ = _layer_quant(model, plan)
     idx_dtype = str((getattr(quant, "index_dtype", "") if quant is not None else "") or "bf16").strip().lower()
     idx_scale = str((getattr(quant, "index_scale_dtype", "") if quant is not None else "") or "none").strip().lower()
     if idx_scale and idx_scale != "none" and int(plan.index_dim) > 0:

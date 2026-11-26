@@ -50,7 +50,7 @@ from mindie_sim.structure_contracts import predicted_contract
 from mindie_sim.structure_subgraphs import subgraph_contract
 pytestmark = pytest.mark.tier0
 ROOT = Path(__file__).resolve().parents[2]
-SORT_SKUS = (("Ascend910B4", 1.5e9), ("Ascend910_9391", 1.85e9), ("Ascend950DT_9581", 1.65e9))
+SORT_SKUS = (("Ascend910B4", 1.65e9), ("Ascend910_9391", 1.85e9), ("Ascend950DT_9581", 1.65e9))
 PACKET = json.loads((ROOT / "data/observations/a5-copy-joint-service-20261030/parameters.json").read_text())
 def _selected(op, **kwargs):
     return family_ascend_norm.lower_op(op, **kwargs)[-1]
