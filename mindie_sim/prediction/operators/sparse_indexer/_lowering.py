@@ -37,14 +37,6 @@ def sort_ops(items: int) -> int:
     return items * (max(1, items) - 1).bit_length()
 
 
-def ceil_div(n: int, d: int) -> int:
-    return (n + d - 1) // d
-
-
-def align(n: int, granule: int) -> int:
-    return ceil_div(n, granule) * granule
-
-
 @dataclass(frozen=True, slots=True)
 class S1Partition:
     """Query blocks over the balanced request lengths implied by aggregate S1."""
@@ -120,3 +112,6 @@ class S2Partition:
         if self.owners - extra > 1:
             yield base * self.tile_size, self.owners - extra - 1, False
         yield self.owner_rows(self.owners - 1), 1, True
+
+
+from .common import align as align, ceil_div as ceil_div

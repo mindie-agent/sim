@@ -27,9 +27,9 @@ from ...mechanism import OperatorPlan, Work
 from ...ownership import read_role
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, RecipeContext, Stage
 from ...results import FusedPipelineSpec, PipelinePhase, WorkItem
+from ...runtime.l2_residency import RawDieL2Bytes, UsableL2Bytes, resolve_usable_l2_bytes
 from ..contracts import OperatorPlanningContext
 from ..matrix.refill_steady import compact_periodic_pipeline
-from ..sparse_indexer._lowering import align, ceil_div
 from ..sparse_indexer.common import (
     ARCH22_FLUSH_BLOCKS,
     ARCH22_SMALL_QUERY_MAX,
@@ -45,6 +45,8 @@ from ..sparse_indexer.common import (
     SCORE_SLOTS,
     SparseIndexerContract,
     _span_scanned_rows,
+    align,
+    ceil_div,
     request_contracts,
     unsupported,
 )
@@ -88,6 +90,7 @@ ARCH35_V1_CUBE_M_BLOCK = 16
 ARCH35_V1_FIXPIPE_N_ALIGN = 8
 ARCH35_V1_GM_ALIGN_BYTES = 512
 ARCH22_V1_S1_BASE = 8
+ARCH22_CUBE_N_BLOCK = 16
 ARCH22_SPARSE_COUNT_8K = 8192
 ARCH22_L0_M_BLOCK = 128  # lightning_indexer_service_cube_arch22.h:58 M_BASIC_BLOCK_L0
 ARCH22_GM_ALIGN_BYTES = 512  # lightning_indexer_kernel_arch22.h:89 GM_ALIGN_BYTES
@@ -117,9 +120,28 @@ ARCH22_INIT_OPS_PER_SLOT = 4  # index seed + padded topk buffer init (service_ve
 ARCH22_ENTRY_EXIT_CREDITS = 2  # Cube/Vector entry+exit credits (kernel_arch22.h:665)
 
 
-def _l2_capacity(ctx: OperatorPlanningContext) -> int:
+def _l2_capacity(ctx: OperatorPlanningContext) -> UsableL2Bytes:
+    occ = ctx.occurrence
+    die = (
+        int(occ.rank)
+        if (occ is not None and occ.rank is not None)
+        else (int(ctx.geometry.rank) if ctx.geometry.rank is not None else 0)
+    )
+    view = (
+        ctx.admission_memory_view
+        if ctx.admission_memory_view is not None
+        else ctx.geometry.admission_memory_view
+    )
     hierarchy = getattr(ctx.geometry.physical_mechanisms, "memory_hierarchy", None)
-    return int(getattr(hierarchy, "effective_l2_bytes", ctx.geometry.buffers.get("l2", 0)) or 0)
+    if hierarchy is not None and getattr(hierarchy, "effective_l2_bytes", None) is not None:
+        ceiling = RawDieL2Bytes(max(0, int(hierarchy.effective_l2_bytes)))
+        if int(ceiling) <= 0:
+            return UsableL2Bytes(0)
+    elif "l2" in ctx.geometry.buffers:
+        ceiling = RawDieL2Bytes(max(0, int(ctx.geometry.buffers["l2"] or 0)))
+    else:
+        ceiling = ctx.geometry.raw_l2_bytes
+    return resolve_usable_l2_bytes(view, die, fallback_raw_l2=ceiling)
 
 
 def _has_l2_rate(ctx: OperatorPlanningContext) -> bool:
@@ -357,7 +379,8 @@ class _Arch35V1Program:
         # service_cube_arch35.h:182, 198-210, 363, 378: L1 pads M to 2*gSize; L0A/L0B/Mmad align to 16.
         aligned_m = align(q_rows, 2) * c.index_heads
         issued_m = align(aligned_m, ARCH35_V1_CUBE_M_BLOCK)
-        key_l0b_b = align(valid, ARCH35_V1_CUBE_M_BLOCK) * c.cache_row_bytes
+        issued_n = align(valid, ARCH35_V1_CUBE_M_BLOCK)
+        key_l0b_b = issued_n * c.cache_row_bytes
         # service_cube_arch35.h:401-403: Fixpipe dualDstCtl writes align(m, 2) x align(n, 8) FP32 scores.
         score_b = align(aligned_m, 2) * align(valid, ARCH35_V1_FIXPIPE_N_ALIGN) * FP32_BYTES
         # lightning_indexer_vector1.h:174-232: MulWeightAndReduceSum executes both 64-lane halves (128 elems).
@@ -367,7 +390,7 @@ class _Arch35V1Program:
         works: dict[str, Work] = {
             "key_load": Work(resources={self.aic_read: key_b, "hbm": key_b}),
             "cube_mma": Work(
-                matrix={c.matrix_dtype: FLOPS_PER_FMA * valid * issued_m * c.index_dim},
+                matrix={c.matrix_dtype: FLOPS_PER_FMA * issued_n * issued_m * c.index_dim},
                 resources={"mte1": key_l0b_b + issued_m * c.cache_row_bytes},
             ),
             "score_handoff": Work(resources={"fixpipe": score_b}),
@@ -658,10 +681,11 @@ class _Arch22V1Program:
             sort_passes = ARCH22_SORT512_PASSES * DEFAULT_S2_TILE + flush_sort_passes
         alu_ops = valid * (ARCH22_VEC_OPS_PER_HEAD * heads - qr) + qr * copy_ops
         vec_ops = alu_ops + int(round(qr * sort_passes * sort_ratio))
+        issued_n = align(valid, ARCH22_CUBE_N_BLOCK)
         return {
             "key_load": Work(resources={self.aic_read: key_b, "hbm": key_b}),
             "cube_mma": Work(
-                matrix={c.matrix_dtype: FLOPS_PER_FMA * valid * heads * c.index_dim},
+                matrix={c.matrix_dtype: FLOPS_PER_FMA * issued_n * heads * c.index_dim},
                 resources={"mte1": m_l0_panels * key_b + heads * c.cache_row_bytes},
             ),
             "score_handoff": Work(resources={
@@ -747,10 +771,23 @@ class _Arch22V1Program:
         )
         vec_after = ("score_read", "tile_sync") if sync_stages else ("score_read",)
         if valid > ARCH22_K_PANEL_ROWS:
-            frac0 = ARCH22_K_PANEL_ROWS / float(valid)
+            n0 = ARCH22_K_PANEL_ROWS
+            n1 = valid - ARCH22_K_PANEL_ROWS
+            frac0 = n0 / float(valid)
             frac1 = 1.0 - frac0
+            issued_n0 = align(n0, ARCH22_CUBE_N_BLOCK)
+            issued_n1 = align(n1, ARCH22_CUBE_N_BLOCK)
+            issued_total = float(issued_n0 + issued_n1)
             k0, k1 = ws["key_load"].scaled(frac0), ws["key_load"].scaled(frac1)
-            m0, m1 = ws["cube_mma"].scaled(frac0), ws["cube_mma"].scaled(frac1)
+            base_mma = ws["cube_mma"]
+            m0 = Work(
+                matrix={dt: val * (issued_n0 / issued_total) for dt, val in base_mma.matrix.items()},
+                resources={res: val * frac0 for res, val in base_mma.resources.items()},
+            )
+            m1 = Work(
+                matrix={dt: val * (issued_n1 / issued_total) for dt, val in base_mma.matrix.items()},
+                resources={res: val * frac1 for res, val in base_mma.resources.items()},
+            )
             s0 = Stage("key_load_0", ctx.bind(k0), placement=_place_aic(ctx, aic, self.aic_count, k0))
             s1 = Stage("cube_mma_0", ctx.bind(m0), after=("key_load_0",), placement=_place_aic(ctx, aic, self.aic_count, m0))
             s2 = Stage("key_load_1", ctx.bind(k1), after=("key_load_0",), placement=_place_aic(ctx, aic, self.aic_count, k1))

@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
+import re
 from typing import TYPE_CHECKING, Any, Literal
 
 from mindie_sim.prediction.capacity import Memory
@@ -556,10 +557,31 @@ def solve_unified_regions(
     )
 
 
-_DIFFUSION_DOMAIN_TOKENS = (
-    "dit", "diffusion", "unet", "hunyuan_video", "hunyuan-video",
-    "wan", "flux", "sd3", "cogvideo", "sora",
+_DIFFUSION_ARCH_SUFFIX = r"(?:transformer(?:\d+d)?|condition|diffusion|model|pipeline)"
+_DIFFUSION_DOMAIN_RE = re.compile(
+    r"(?:^|[^a-z0-9])(?:"
+    r"(?:mm|st|u)?dit(?:\d+(?:\.\d+)?)?|pixart(?:[-_]?alpha|[-_]?sigma)?|"
+    r"diffusion|unet(?:\d+d)?|hunyuan[-_]?video|wan(?:\d+(?:\.\d+)?)?|"
+    r"flux(?:\d+(?:\.\d+)?)?|sd3(?:\.\d+)?|sdxl|cogvideox?|(?:open[-_]?)?sora"
+    r")(?:$|[^a-z0-9]|" + _DIFFUSION_ARCH_SUFFIX + r")"
 )
+_CAUSAL_LM_ARCH_SUFFIXES = ("forcausallm", "lmheadmodel")
+
+
+def _matches_diffusion_domain(text: str) -> bool:
+    norm = str(text or "").strip().lower()
+    return bool(norm) and (_DIFFUSION_DOMAIN_RE.search(norm) is not None)
+
+
+def _declares_causal_lm_architecture(facts: Mapping[str, Any]) -> bool:
+    raw_arches = facts.get("architectures")
+    if isinstance(raw_arches, str):
+        arches = (raw_arches,)
+    elif isinstance(raw_arches, (tuple, list)):
+        arches = tuple(str(a or "") for a in raw_arches)
+    else:
+        return False
+    return any(arch.strip().lower().endswith(_CAUSAL_LM_ARCH_SUFFIXES) for arch in arches)
 
 
 def _infer_case_workload_domain(case: Case) -> str:
@@ -576,11 +598,12 @@ def _infer_case_workload_domain(case: Case) -> str:
         return explicit
     for plan in getattr(model, "layer_plans", ()) or ():
         arch = str(getattr(plan, "architecture", "") or "").lower()
-        if any(tok in arch for tok in _DIFFUSION_DOMAIN_TOKENS):
+        if _matches_diffusion_domain(arch):
             return "diffusion"
-    model_type = str(facts.get("model_type") or facts.get("family") or "").strip().lower()
-    if any(tok in model_type for tok in _DIFFUSION_DOMAIN_TOKENS):
-        return "diffusion"
+    if not _declares_causal_lm_architecture(facts):
+        model_type = str(facts.get("model_type") or facts.get("family") or "").strip().lower()
+        if _matches_diffusion_domain(model_type):
+            return "diffusion"
     if getattr(model, "vision", None) is not None or bool(facts.get("vision_present")):
         return "vlm"
     return "llm"
@@ -883,7 +906,7 @@ def solve_five_level_ladder(
 
 
 def _resolve_primitive_table_digest(handle: Any, case: Case, explicit_table: Any) -> str:
-    from mindie_sim.rewrite._oracle_prefetch import primitive_table_digest_token
+    from mindie_sim.rewrite import primitive_table_digest_token
 
     eval_ctx = getattr(handle, "evaluation_context", None)
     bindings = getattr(eval_ctx, "bindings", None)
@@ -974,6 +997,30 @@ def _scalar_shared_prefix_views(
     return _make_views(0, batch_per_dp), None
 
 
+def _lowered_views_match_batches(
+    views_by_replica: Mapping[int, Any],
+    total_replicas: int,
+    expected_batches: int | tuple[int, ...] | None,
+) -> bool:
+    """Verify per-replica lowered views agree with explicit ``StepRequest.sequences`` counts."""
+    if expected_batches is None:
+        return True
+    for rep in range(total_replicas):
+        if rep not in views_by_replica:
+            return False
+        expected = (
+            expected_batches[rep % len(expected_batches)]
+            if isinstance(expected_batches, tuple) else expected_batches
+        )
+        active_views = sum(
+            1 for v in views_by_replica[rep]
+            if not getattr(v, "padding", False)
+        )
+        if active_views != expected:
+            return False
+    return True
+
+
 def _compute_resident_memory_receipt(
     case: Case,
     request: StepRequest,
@@ -1009,8 +1056,17 @@ def _compute_resident_memory_receipt(
         )
 
     dp = max(1, int(case.runtime.parallel.dp))
+    ext_dp = max(1, int(getattr(case.runtime.parallel, "external_dp", 1) or 1))
+    total_replicas = dp * ext_dp
+    expected_batches = (
+        _replica_batch_counts(case, request.sequences)
+        if request.sequences is not None else None
+    )
     if isinstance(lowered_views, Mapping) and lowered_views:
-        if all(rep in lowered_views for rep in range(dp)):
+        if (
+            all(rep in lowered_views for rep in range(total_replicas))
+            and _lowered_views_match_batches(lowered_views, total_replicas, expected_batches)
+        ):
             return mem.resident_memory_receipt(
                 phase=request.phase,
                 request_views_by_replica=lowered_views,
@@ -1024,9 +1080,9 @@ def _compute_resident_memory_receipt(
                 rep: tuple(lowered_views[src_group[pos]])
                 for group in groups
                 for pos, rep in enumerate(group)
-                if 0 <= rep < dp
+                if 0 <= rep < total_replicas
             }
-            if len(expanded) == dp:
+            if len(expanded) == total_replicas and _lowered_views_match_batches(expanded, total_replicas, expected_batches):
                 return mem.resident_memory_receipt(
                     phase=request.phase,
                     request_views_by_replica=expanded,
@@ -1035,7 +1091,7 @@ def _compute_resident_memory_receipt(
     ctx = max(0, int(request.context or 0))
     q_tok = max(1, int(request.tokens or 1))
     seq_len = max(1, ctx + q_tok)
-    batch_per_dp = _replica_batch_counts(case, request.sequences)
+    batch_per_dp = expected_batches if expected_batches is not None else _replica_batch_counts(case, request.sequences)
     shared_views, shared_by_rep = _scalar_shared_prefix_views(
         case, request, batch_per_dp, ctx=ctx, q_tok=q_tok,
     )

@@ -672,6 +672,21 @@ tier = "tier0"
 owns = ["mindie_sim/prediction/spine.py", "mindie_sim/prediction/program/implementation_registry.py", "mindie_sim/prediction/physical_recipe_registry.py", "mindie_sim/schema/workload.py"]
 
 [[module]]
+path = "spine/test_universal_conservation_laws.py"
+tier = "tier0"
+owns = [
+  "mindie_sim/schema/parallel.py",
+  "mindie_sim/schema/hardware.py",
+  "mindie_sim/prediction/runtime/l2_residency.py",
+  "mindie_sim/prediction/runtime/memory_physics.py",
+  "mindie_sim/prediction/runtime/exposed_observer.py",
+  "mindie_sim/prediction/operators/contracts.py",
+  "mindie_sim/stacks/vllm_ascend/launch_codec.py",
+  "mindie_sim/optimization/ladder.py",
+  "scripts/check_arch_governance.py",
+]
+
+[[module]]
 path = "hygiene/test_spine_bounds_and_wiring_locks.py"
 tier = "tier0"
 owns = ["mindie_sim/primitives/loader.py", "mindie_sim/rewrite/_oracle_prefetch.py"]

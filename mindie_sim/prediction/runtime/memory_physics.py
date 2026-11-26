@@ -38,13 +38,13 @@ HBM_DIR_READ = 0
 HBM_DIR_WRITE = 1
 VALID_COPY_PIPES = frozenset({"mte2_aic", "mte2_aiv", "mte3", "fixpipe"})
 VALID_VISIBILITY_SCOPES = frozenset({"owner", "die", "device", "host"})
-_L2_CACHE_DISABLE = "disable"
-CACHE_POLICY_NORMAL = "normal"
-CACHE_POLICY_LAST_USE = "last_use"
-CACHE_POLICY_DISABLE = _L2_CACHE_DISABLE
 CachePolicy = Literal["normal", "last_use", "disable", "persistent"]
-CACHE_POLICY_PERSISTENT = "persistent"
-VALID_CACHE_POLICIES = frozenset({
+_L2_CACHE_DISABLE: CachePolicy = "disable"
+CACHE_POLICY_NORMAL: CachePolicy = "normal"
+CACHE_POLICY_LAST_USE: CachePolicy = "last_use"
+CACHE_POLICY_DISABLE: CachePolicy = _L2_CACHE_DISABLE
+CACHE_POLICY_PERSISTENT: CachePolicy = "persistent"
+VALID_CACHE_POLICIES: frozenset[CachePolicy] = frozenset({
     CACHE_POLICY_NORMAL, CACHE_POLICY_LAST_USE, CACHE_POLICY_DISABLE, CACHE_POLICY_PERSISTENT,
 })
 
@@ -483,13 +483,23 @@ class AddressRunPlan:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "_default_sector", self.sector_bytes is None)
+        resolved_sector = (
+            (self.l2_sector_bytes or DEFAULT_SECTOR_BYTES)
+            if self.sector_bytes is None else self.sector_bytes
+        )
         if self.sector_bytes is None:
-            object.__setattr__(self, "sector_bytes", self.l2_sector_bytes or DEFAULT_SECTOR_BYTES)
-        if (self.alignment_bytes < 1 or self.sector_bytes < 1 or self.scale_bytes < 0
+            object.__setattr__(self, "sector_bytes", resolved_sector)
+        if (self.alignment_bytes < 1 or resolved_sector < 1 or self.scale_bytes < 0
                 or any(g is not None and g < 1 for g in (self.l2_line_bytes, self.l2_sector_bytes))
                 or min(self.hbm_burst_granule_bytes, self.hbm_scatter_row_open_bytes) < 0
                 or (self.scale_base_byte is not None and self.scale_base_byte < 0)):
             raise ModelingError("address_run_plan_invalid_parameters")
+
+    def _resolved_sector_bytes(self) -> int:
+        sec = self.sector_bytes
+        if sec is None:
+            raise ModelingError("address_run_plan_sector_bytes_unset")
+        return sec
 
     def scale_span(self) -> tuple[int, int] | None:
         """Logical half-open byte interval on the disjoint scale plane, or ``None``."""
@@ -518,7 +528,7 @@ class AddressRunPlan:
         span = self.scale_span()
         if span is None:
             return ()
-        sec = self.sector_bytes if sector_bytes is None else sector_bytes
+        sec = self._resolved_sector_bytes() if sector_bytes is None else sector_bytes
         lo, hi = span
         return (((lo // sec) * sec, _align_up(hi, sec)),)
 
@@ -546,29 +556,30 @@ class AddressRunPlan:
         covered = SectorCoverage()
         sector_total, service_total = 0, 0.0
         single_run = len(ordered) == 1
+        sec = self._resolved_sector_bytes()
         for run in ordered:
             if single_run:
-                sec_bytes = run.sector_union_bytes(self.sector_bytes)
+                sec_bytes = run.sector_union_bytes(sec)
             else:
-                run_cov = AddressRunPlan((run,), alignment_bytes=self.alignment_bytes, sector_bytes=self.sector_bytes).sector_coverage()
+                run_cov = AddressRunPlan((run,), alignment_bytes=self.alignment_bytes, sector_bytes=sec).sector_coverage()
                 sec_bytes = max(0, run_cov.measure_bytes() - run_cov.overlap_bytes(covered))
                 covered = covered.union(run_cov)
             if sec_bytes > 0:
                 sector_total += sec_bytes
                 service_total += _burst_service_bytes(self, sec_bytes, run, burst_rules)
         if sector_total > 0 and self.scale_bytes > 0:
-            scale_sec = _measure_byte_intervals(self.scale_sector_intervals(self.sector_bytes))
+            scale_sec = _measure_byte_intervals(self.scale_sector_intervals(sec))
             sector_total += scale_sec
             service_total += float(scale_sec)
         return sector_total, service_total
 
     def sector_intervals(self) -> tuple[tuple[int, int], ...]:
         """Return canonical disjoint ``[lo, hi)`` sector-aligned byte intervals."""
-        return _cached_sector_intervals(self.runs, self.sector_bytes)
+        return _cached_sector_intervals(self.runs, self._resolved_sector_bytes())
 
     def periodic_sector_runs(self) -> tuple[PeriodicSectorRun, ...]:
         """Return exact compact periodic descriptors for gapped runs with ``rows > 4096``."""
-        sec = self.sector_bytes
+        sec = self._resolved_sector_bytes()
         return tuple(dict.fromkeys(
             PeriodicSectorRun(run.base_byte, run.rows, run.row_bytes, run.stride_bytes, sec).canonical()
             for run in self.runs
@@ -577,10 +588,11 @@ class AddressRunPlan:
 
     def sector_coverage(self) -> SectorCoverage:
         """Exact sector coverage retaining periodic strided sets and disjoint scale sectors."""
-        scale_ivs = self.scale_sector_intervals(self.sector_bytes)
+        sec = self._resolved_sector_bytes()
+        scale_ivs = self.scale_sector_intervals(sec)
         scale_sec = _measure_byte_intervals(scale_ivs)
         known_bytes = (
-            self.runs[0].sector_union_bytes(self.sector_bytes) + scale_sec
+            self.runs[0].sector_union_bytes(sec) + scale_sec
             if len(self.runs) == 1 else None
         )
         return SectorCoverage(

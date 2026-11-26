@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Architecture governance gate (AG001..AG015) for ``mindie_sim``.
+"""Architecture governance gate (AG001..AG016) for ``mindie_sim``.
 
 [Role] Enforce governed ``mindie_sim/prediction/operators/<family>/`` package
   boundaries, forbid flat ISA/CANN filename sprawl under ``mindie_sim/**/*.py``,
@@ -8,12 +8,13 @@
   and physical work conservation, reject silent physical hardware defaults,
   enforce unidirectional layer imports, ensure operator Engine reachability,
   detect per-model-name branching across executable ``mindie_sim/`` +
-  ``manifest.json`` (AG014), and enforce zero-allowlist UML bijection,
-  production-root reachability, and Ascend/neutral hardware targets (AG015).
+  ``manifest.json`` (AG014), enforce zero-allowlist UML bijection,
+  production-root reachability, and Ascend/neutral hardware targets (AG015),
+  and ban cross-subpackage imports of private ``_*.py`` modules (AG016).
 [Invariants] ``AG001`` scans strictly ``mindie_sim/**/*.py`` so model catalog
   JSON files (e.g. ``qwen3.5-35b-a3b.json``) are never flagged. Governed
-  ``operators/<family>/**`` modules, ``AG014``, and ``AG015`` allow zero
-  violations in every mode and bypass ``--base`` differential subtraction.
+  ``operators/<family>/**`` modules, ``AG014``, ``AG015``, and ``AG016`` allow
+  zero violations in every mode and bypass ``--base`` differential subtraction.
 [Timeouts & Locks] Bounded local AST scans and git ls-tree/show calls; no locks
   or network access.
 [Side-Effect Policy] Read-only; never modifies repository files or git state.
@@ -154,6 +155,9 @@ CANONICAL_CONCEPT_OWNERS: Mapping[str, tuple[str, ...]] = MappingProxyType({
     "StageReceipt": ("mindie_sim/prediction/results.py",),
     "EngineStepReceipt": ("mindie_sim/prediction/results.py",),
     "NativeCallBinding": ("mindie_sim/prediction/native_binding.py",),
+    "RawDieL2Bytes": ("mindie_sim/prediction/runtime/l2_residency.py",),
+    "UsableL2Bytes": ("mindie_sim/prediction/runtime/l2_residency.py",),
+    "RankCoord": ("mindie_sim/schema/parallel.py",),
 })
 
 def _is_allowed_isa_leaf(rel: PurePosixPath) -> bool:
@@ -1262,6 +1266,100 @@ def scan_ag014(
     return tuple(violations)
 
 
+def _is_private_module_segment(segment: str) -> bool:
+    return segment.startswith("_") and not (segment.startswith("__") and segment.endswith("__"))
+
+
+def _tracked_module_parts(rels: Sequence[PurePosixPath]) -> frozenset[tuple[str, ...]]:
+    tracked: set[tuple[str, ...]] = set()
+    for rel in rels:
+        parts = tuple(rel.with_suffix("").parts)
+        if not parts or parts[0] != SIM_PACKAGE_ROOT:
+            continue
+        mod = parts[:-1] if parts[-1] == "__init__" else parts
+        if mod:
+            tracked.add(mod)
+        for idx in range(1, len(mod)):
+            tracked.add(mod[:idx])
+    return frozenset(tracked)
+
+
+def _private_module_targets(
+    parts: tuple[str, ...], tracked_modules: frozenset[tuple[str, ...]],
+) -> tuple[tuple[tuple[str, ...], tuple[str, ...]], ...]:
+    if len(parts) < 2 or parts[0] != SIM_PACKAGE_ROOT:
+        return ()
+    hits: list[tuple[tuple[str, ...], tuple[str, ...]]] = []
+    for idx in range(1, len(parts)):
+        if _is_private_module_segment(parts[idx]):
+            prefix = parts[: idx + 1]
+            if prefix in tracked_modules:
+                hits.append((parts[:idx], prefix))
+    return tuple(hits)
+
+
+def _check_ag016_private_module_encapsulation(
+    rel: PurePosixPath,
+    tree: ast.Module,
+    parents: dict[ast.AST, ast.AST],
+    tracked_modules: frozenset[tuple[str, ...]],
+) -> list[Violation]:
+    """Ban cross-subpackage imports of private ``_*.py`` modules (zero allowlist)."""
+    src_pkg = _package_parts(rel)
+    violations: list[Violation] = []
+    seen: set[tuple[int, tuple[str, ...]]] = set()
+
+    def check_target(parts: tuple[str, ...], node: ast.AST) -> bool:
+        for target_pkg, target_mod in _private_module_targets(parts, tracked_modules):
+            if src_pkg == target_pkg or src_pkg[: len(target_mod)] == target_mod:
+                continue
+            lineno = int(getattr(node, "lineno", 1))
+            key = (lineno, target_mod)
+            if key not in seen:
+                seen.add(key)
+                scope = _enclosing_symbol(node, parents)
+                raw_fp = f"AG016|{rel.as_posix()}|{scope}|{'.'.join(target_mod)}|{ast.dump(node, include_attributes=False)}"
+                fp = hashlib.sha256(raw_fp.encode("utf-8")).hexdigest()[:FINGERPRINT_HEX_LEN]
+                msg = (
+                    f"cross-subpackage import of private module {'.'.join(target_mod)!r} "
+                    f"from package {'.'.join(src_pkg)!r} is forbidden; import via public package API"
+                )
+                violations.append(Violation("AG016", rel, lineno, fp, msg))
+            return True
+        return False
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                check_target(tuple(alias.name.split(".")), node)
+        elif isinstance(node, ast.ImportFrom):
+            base = _resolve_import_from(rel, node.module, node.level)
+            if not check_target(base, node):
+                for alias in node.names:
+                    if alias.name != "*":
+                        check_target(base + (alias.name,), node)
+    return violations
+
+
+def scan_ag016(
+    root: Path, /, *, revision: str | None = None,
+) -> tuple[Violation, ...]:
+    """Scan ``mindie_sim/**/*.py`` for AG016 cross-subpackage private module imports."""
+    files = _enumerate_py_files(root, revision=revision)
+    tracked_modules = _tracked_module_parts([rel for rel, _ in files])
+    violations: list[Violation] = []
+    for rel, text in files:
+        try:
+            tree = ast.parse(text, filename=rel.as_posix())
+        except SyntaxError:
+            continue
+        violations.extend(
+            _check_ag016_private_module_encapsulation(rel, tree, _parents(tree), tracked_modules)
+        )
+    violations.sort(key=lambda v: (v.path.as_posix(), v.line, v.rule, v.message))
+    return tuple(violations)
+
+
 def scan_repository(
     root: Path, /, *, revision: str | None = None,
     refs_root: Path | None = None, repo_map: Mapping[str, Path] | None = None,
@@ -1270,6 +1368,7 @@ def scan_repository(
     """Return the sorted static findings under ``mindie_sim/**/*.py``."""
     violations: list[Violation] = []
     files = _enumerate_py_files(root, revision=revision)
+    tracked_modules = _tracked_module_parts([rel for rel, _ in files])
     parsed_files: list[tuple[PurePosixPath, ast.Module]] = []
     texts: dict[PurePosixPath, str] = {}
     for rel, text in files:
@@ -1294,6 +1393,9 @@ def scan_repository(
         violations.extend(_check_ag009_silent_physical_defaults(rel, tree))
         violations.extend(_check_ag010_layer_dag(rel, tree))
         violations.extend(_check_ag013_anti_hardcoding(rel, tree))
+        violations.extend(
+            _check_ag016_private_module_encapsulation(rel, tree, parents, tracked_modules)
+        )
         if include_ag014:
             violations.extend(_check_ag014_zero_model_name_branches(rel, tree))
     violations.extend(_check_ag008_repo_bounds([rel for rel, _ in files], texts=texts))
@@ -1310,13 +1412,13 @@ def scan_repository(
 
 
 def filter_allowlisted(violations: Sequence[Violation], /) -> tuple[Violation, ...]:
-    """Drop only tracked pre-Stage-3 legacy violations; never waive governed operators, AG014, or AG015."""
+    """Drop only tracked pre-Stage-3 legacy violations; never waive governed operators, AG014, AG015, or AG016."""
     kept: list[Violation] = []
     for item in violations:
         in_pkg, _family, _fname = _is_governed_family_path(item.path)
         if (
             in_pkg
-            or item.rule == "AG014"
+            or item.rule in {"AG014", "AG016"}
             or item.rule.startswith("AG015")
             or item.rule not in LEGACY_ALLOWLIST.get(item.path.as_posix(), frozenset())
         ):
@@ -1327,14 +1429,14 @@ def filter_allowlisted(violations: Sequence[Violation], /) -> tuple[Violation, .
 def new_violations(
     current: Sequence[Violation], baseline: Sequence[Violation], /
 ) -> tuple[Violation, ...]:
-    """Multiset differential subtraction preserving governed-package, AG014, and AG015 strictness."""
+    """Multiset differential subtraction preserving governed-package, AG014, AG015, and AG016 strictness."""
     remaining: Counter[tuple[str, str, str]] = Counter(
         (v.rule, v.path.as_posix(), v.fingerprint) for v in baseline
     )
     added: list[Violation] = []
     for item in current:
         in_pkg, _family, _fname = _is_governed_family_path(item.path)
-        if in_pkg or item.rule == "AG014" or item.rule.startswith("AG015"):
+        if in_pkg or item.rule in {"AG014", "AG016"} or item.rule.startswith("AG015"):
             added.append(item)
             continue
         key = (item.rule, item.path.as_posix(), item.fingerprint)

@@ -26,10 +26,21 @@ from ...mechanism import OperatorPlan, Work
 from ...ownership import read_role
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, RecipeContext, Stage
 from ...results import FusedPipelineDescriptor, FusedPipelineSpec, PipelinePhase, WorkItem
+from ...runtime.l2_residency import RawDieL2Bytes, resolve_usable_l2_bytes
 from ...runtime.ring_buffer import RingBuffer
 from ..attention.common import planning_sequence_spans, sequence_layout_metadata
 from ..contracts import OperatorPlanningContext
-from ._lowering import S1Partition, S2Partition, _DisjointOwnerProgram, align, ceil_div, request_program, sort_ops
+
+
+def ceil_div(n: int, d: int) -> int:
+    return (n + d - 1) // d
+
+
+def align(n: int, granule: int) -> int:
+    return ceil_div(n, granule) * granule
+
+
+from ._lowering import S1Partition, S2Partition, _DisjointOwnerProgram, request_program, sort_ops
 
 TARGET_BACKEND: Literal["ascend", "hardware_neutral"] = "ascend"
 FAMILY = "sparse_indexer"
@@ -184,11 +195,15 @@ def _causal_active_queries(
 
 def _causal_block_rows(
     req_q: int, block_end: int, scanned_rows: int, compress_ratio: int, residual_tokens: int,
+    *, exclude_current: bool = False,
 ) -> int:
     """Causally visible compressed S2 extent for a query block ending at ``block_end``."""
     if scanned_rows <= 0 or block_end <= 0:
         return 0
     total_orig = scanned_rows * compress_ratio + residual_tokens
+    if exclude_current:
+        history_base = max(0, total_orig - req_q)
+        return min(scanned_rows, (history_base + block_end - 1) // compress_ratio)
     end_orig = total_orig - (req_q - block_end)
     if end_orig <= 0:
         return 0
@@ -508,9 +523,20 @@ def indexer_contract(op: OpSpec, ctx: OperatorPlanningContext, default_abi: str)
     return contract
 
 
+def _effective_scanned_rows(contract: SparseIndexerContract) -> int:
+    """Maximum S2 rows visible to any query under the uniform contract."""
+    if contract.abi == REGION_ABI and contract.causal and contract.scanned_rows > 0:
+        total_orig = contract.scanned_rows * contract.compress_ratio + contract.residual_tokens
+        max_q = ceil_div(contract.query_tokens, contract.batch_size) if contract.query_tokens > 0 else 0
+        max_pos = max(total_orig, max_q) - 1
+        return min(contract.scanned_rows, max(0, max_pos) // contract.compress_ratio)
+    return contract.scanned_rows
+
+
 def _has_varying_causal_rows(contract: SparseIndexerContract, query_block_size: int) -> bool:
-    """True iff causal right-aligned masking reduces visible rows on earlier query blocks."""
-    if not contract.causal or contract.scanned_rows <= 0:
+    """True iff causal right-aligned masking varies visible rows across query blocks."""
+    eff_rows = _effective_scanned_rows(contract)
+    if not contract.causal or eff_rows <= 0:
         return False
     max_q = ceil_div(contract.query_tokens, contract.batch_size)
     if max_q <= query_block_size:
@@ -518,7 +544,8 @@ def _has_varying_causal_rows(contract: SparseIndexerContract, query_block_size: 
     return _causal_block_rows(
         max_q, query_block_size, contract.scanned_rows,
         contract.compress_ratio, contract.residual_tokens,
-    ) < contract.scanned_rows
+        exclude_current=(contract.abi == REGION_ABI),
+    ) < eff_rows
 
 
 def _request_contract_spans(contract: SparseIndexerContract, ctx: OperatorPlanningContext):
@@ -868,8 +895,12 @@ class _SparseIndexerProgramBuilder:
         return g.flush_period
 
     @property
+    def _uniform_scanned_rows(self) -> int:
+        return _effective_scanned_rows(self.contract)
+
+    @property
     def partition(self) -> S2Partition:
-        return S2Partition(self.contract.scanned_rows, self.lowering.tile_size, self.contract.s2_splits)
+        return S2Partition(self._uniform_scanned_rows, self.lowering.tile_size, self.contract.s2_splits)
 
     @property
     def query_blocks(self) -> S1Partition:
@@ -1052,11 +1083,15 @@ class _SparseIndexerProgramBuilder:
         c = self.contract
         g = self.lowering
         part = self.partition if partition is None else partition
-        score_items = c.score_items if block_rows is None else ceil_div(block_rows, c.block_size)
+        score_rows = self._uniform_scanned_rows if block_rows is None else block_rows
+        score_items = ceil_div(score_rows, c.block_size)
         msa = c.abi in MSA_ABIS
         stages = []
         if msa and not score_items:
             stages.append(self._msa_score_store(0, self._msa_score_stride))
+        elif not c.fused_topk and not score_items and c.score_items > 0:
+            out_size = c.score_items * FP32_BYTES
+            stages.append(PhaseWork("score_row_store", Work(resources={"hbm": out_size, "mte3": out_size})))
         if not c.fused_topk:
             return tuple(stages)
         score_heads = c.msa_score_heads if msa else 1
@@ -1100,7 +1135,7 @@ class _SparseIndexerProgramBuilder:
         c = self.contract
         qb = self.lowering.query_block_size
         if not self._has_varying_causal_rows:
-            return self.query_blocks.live_rows(block), c.scanned_rows
+            return self.query_blocks.live_rows(block), self._uniform_scanned_rows
         rem = block
         for req_q, requests in self.query_blocks._request_groups():
             tiles = ceil_div(req_q, qb)
@@ -1111,6 +1146,7 @@ class _SparseIndexerProgramBuilder:
                 live_q = min(qb, req_q - start)
                 rows = _causal_block_rows(
                     req_q, start + live_q, c.scanned_rows, c.compress_ratio, c.residual_tokens,
+                    exclude_current=(c.abi == REGION_ABI),
                 )
                 return live_q, rows
             rem -= group_blocks
@@ -1401,10 +1437,11 @@ class _SparseIndexerProgramBuilder:
             and g.tile_size % c.block_size == 0
             and (c.s2_splits == 1 or (g.owner_selection is None and g.score_path == "l0c->gm->ub"))
         )
+        is_region = c.abi == REGION_ABI
         for req_q, req_count in self.query_blocks._request_groups():
             full_blocks, rem_q = divmod(req_q, qb)
             if full_blocks:
-                base = total_orig - req_q + qb
+                base = (max(0, total_orig - req_q) + qb - 1) if is_region else (total_orig - req_q + qb)
                 lo = _first_ge(0, full_blocks, base, qb, step, 1)
                 hi = _first_ge(lo, full_blocks, base, qb, step, c.scanned_rows)
                 if lo:
@@ -1419,7 +1456,7 @@ class _SparseIndexerProgramBuilder:
                 if full_blocks > hi:
                     self._add_block_totals(add, entry, tiles, owner_exit, query_exit, entry_phases, tile_cache, c.scanned_rows, qb, req_count * (full_blocks - hi))
             if rem_q:
-                tail_rows = _causal_block_rows(req_q, req_q, c.scanned_rows, step, c.residual_tokens)
+                tail_rows = _causal_block_rows(req_q, req_q, c.scanned_rows, step, c.residual_tokens, exclude_current=is_region)
                 self._add_block_totals(add, entry, tiles, owner_exit, query_exit, entry_phases, tile_cache, tail_rows, rem_q, req_count)
         return merge_buckets()
 
@@ -1592,17 +1629,24 @@ def build_plan(
         raise unsupported("missing_owners", "Sparse index scoring needs reachable AIC and AIV owners")
     geometry = ctx.geometry
     hierarchy = getattr(geometry.physical_mechanisms, "memory_hierarchy", None)
-    l2_capacity = getattr(hierarchy, "effective_l2_bytes", geometry.buffers.get("l2", 0))
-    if (ctx.requests or contract.request_spans) and ctx.admission_memory_view is not None and "l2" in geometry.resource_units:
-        l2_capacity = ctx.admission_memory_view.effective_l2_bytes(geometry.rank or 0)
+    admission_view = ctx.admission_memory_view
+    if admission_view is None:
+        admission_view = getattr(geometry, "admission_memory_view", None)
+    raw_l2 = int(getattr(hierarchy, "effective_l2_bytes", geometry.buffers.get("l2", 0)) or 0)
+    l2_capacity = (
+        int(resolve_usable_l2_bytes(admission_view, int(geometry.rank or 0), fallback_raw_l2=RawDieL2Bytes(raw_l2)))
+        if "l2" in geometry.resource_units
+        else 0
+    )
 
     batch_msa_stride = contract.msa_score_stride if contract.abi in MSA_ABIS else None
 
     def bind(request, owners_, offsets=None):
+        eff_rows = _effective_scanned_rows(request)
         uniform_rows = not _has_varying_causal_rows(request, lowering.query_block_size)
-        reuse = (uniform_rows and request.shared_prefix and request.query_tokens > 1 and request.scanned_rows > 0
+        reuse = (uniform_rows and request.shared_prefix and request.query_tokens > 1 and eff_rows > 0
                  and "l2" in geometry.resource_units
-                 and request.scanned_rows * request.cache_row_bytes <= l2_capacity)
+                 and eff_rows * request.cache_row_bytes <= l2_capacity)
         return _SparseIndexerProgramBuilder(
             request, lowering, owners_, reuse, read_role(geometry.resource_units),
             read_role(geometry.resource_units, aiv=0), ctx.datapath.aic_count, ctx.datapath.aiv_count,

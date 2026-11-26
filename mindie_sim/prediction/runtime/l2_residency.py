@@ -12,7 +12,7 @@ from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from hashlib import sha256
 import math
-from typing import Any, NewType, cast
+from typing import Any, Literal, NewType, cast
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.device_input import MemoryAccessSpec
@@ -151,6 +151,9 @@ class _ResidentL2Entry:
     resident_intervals_mut: list[tuple[int, int]] | None = None
     resident_scale_intervals: tuple[tuple[int, int], ...] = ()
     resident_bands: Any = None
+    read_admitted: bool = True
+    write_admitted: bool = False
+    read_admitted_coverage: SectorCoverage | None = None
 
     def coverage_snapshot(self) -> SectorCoverage:
         """Return an immutable ``SectorCoverage`` snapshot for external inspection."""
@@ -169,6 +172,32 @@ class _ResidentL2Entry:
             _canonical=True,
             _bytes=self.resident_bytes,
         )
+
+    def read_eligible_coverage(self) -> SectorCoverage:
+        """Return resident sector coverage eligible for reads when ``write_allocate=False``."""
+        if self.private_workspace:
+            return self.coverage_snapshot()
+        if not self.read_admitted:
+            base = SectorCoverage()
+        elif self.read_admitted_coverage is None:
+            base = self.coverage_snapshot()
+        else:
+            base = self.read_admitted_coverage
+        if self.dirty and not self.dirty_coverage.empty:
+            return self.dirty_coverage if base.empty else base.union(self.dirty_coverage)
+        return base
+
+    def mark_read_coverage(self, coverage: SectorCoverage) -> None:
+        """Record that ``coverage`` has been filled/accessed by a read operation."""
+        if self.read_admitted and self.read_admitted_coverage is None:
+            return
+        updated = (
+            coverage
+            if self.read_admitted_coverage is None or self.read_admitted_coverage.empty
+            else self.read_admitted_coverage.union(coverage)
+        )
+        self.read_admitted = True
+        self.read_admitted_coverage = None if _cov_bytes(updated) >= self.resident_bytes else updated
 
 
 def _materialize_entry_bands(entry: _ResidentL2Entry) -> None:
@@ -191,6 +220,23 @@ def _cov_payload_bytes(cov: SectorCoverage) -> int:
 
 def _cov_bytes(cov: SectorCoverage) -> int:
     return _cov_payload_bytes(cov) + _measure_byte_intervals(cov.scale_intervals)
+
+
+def _subtract_coverage(base: SectorCoverage, cut: SectorCoverage) -> SectorCoverage:
+    """Subtract ``cut`` sectors from ``base`` sectors."""
+    if base.empty or cut.empty:
+        return base
+    base_ivs: Sequence[tuple[int, int]] = base.intervals
+    if base.periodic:
+        expanded_b = tuple(iv for run in base.periodic for iv in run._window_intervals(*run._bounds()))
+        base_ivs = _merge_byte_intervals((*base.intervals, *expanded_b)) if base.intervals else _merge_byte_intervals(expanded_b)
+    cut_ivs: Sequence[tuple[int, int]] = cut.intervals
+    if cut.periodic:
+        expanded_c = tuple(iv for run in cut.periodic for iv in run._window_intervals(*run._bounds()))
+        cut_ivs = _merge_byte_intervals((*cut.intervals, *expanded_c)) if cut.intervals else _merge_byte_intervals(expanded_c)
+    rem_ivs = _subtract_byte_intervals(base_ivs, cut_ivs)
+    rem_scales = _subtract_byte_intervals(base.scale_intervals, cut.scale_intervals)
+    return SectorCoverage(intervals=rem_ivs, scale_intervals=rem_scales, _canonical=True)
 
 
 def _cov_overlap(left: SectorCoverage, right: SectorCoverage) -> int:
@@ -390,9 +436,15 @@ class AdmissionMemoryView:
         ws_sweep_by_die: Mapping[int, Mapping[int | str, float]] | None = None,
         arch_id: str | None = None,
         pool_namespace: str = "",
+        write_allocate: bool = True,
+        write_allocate_by_die: Mapping[int, bool] | None = None,
     ) -> None:
         self._memory_access_default = memory_access
         self._memory_access_by_die = dict(memory_access_by_die or {})
+        self._write_allocate_default: bool = bool(write_allocate)
+        self._write_allocate_by_die: dict[int, bool] = {
+            die: bool(flag) for die, flag in (write_allocate_by_die or {}).items()
+        }
         self.arch_id = arch_id
         self.pool_namespace: str = _normalize_pool_namespace(pool_namespace)
         if not math.isfinite(knee_ratio) or knee_ratio <= 1:
@@ -458,6 +510,21 @@ class AdmissionMemoryView:
     def memory_access_for(self, die: int) -> MemoryAccessSpec | None:
         return self._memory_access_by_die.get(die, self._memory_access_default)
 
+    def write_allocate_for(self, die: int) -> bool:
+        """Return whether non-private writes allocate L2 lines on ``die``."""
+        return self._write_allocate_by_die.get(die, self._write_allocate_default)
+
+    def entry_provenance(self, key: ReuseKey) -> Literal["none", "read", "write", "read_write"]:
+        """Return admission provenance for a live resident ``ReuseKey``."""
+        entry = self._resident.get(key)
+        if entry is None or entry.evicted:
+            return "none"
+        if entry.read_admitted and entry.write_admitted:
+            return "read_write"
+        if entry.read_admitted:
+            return "read"
+        return "write"
+
     def active_stream_count(self, die: int) -> int:
         cached = self._active_stream_counts.get(die)
         if cached is not None:
@@ -509,6 +576,7 @@ class AdmissionMemoryView:
                 continue
             record("die", rank, capacity, self._granule_by_die[rank],
                    self.memory_access_for(rank), self._knee_curves_by_die[rank],
+                   self.write_allocate_for(rank),
                    sorted(self._reserved[rank].items()),
                    sorted(self._active_streams[rank]),
                    sorted(map(repr, self._active_keys[rank])))
@@ -521,7 +589,7 @@ class AdmissionMemoryView:
                 continue
             record("resident", key, entry.version, entry.cache_policy, entry.working_set_bytes, entry.resident_bytes,
                    entry.evicted, entry.dirty, entry.has_future_reader, entry.private_workspace,
-                   entry.line_footprint_bytes)
+                   entry.line_footprint_bytes, entry.read_admitted, entry.write_admitted)
             if entry.resident_bands is not None:
                 coverage(entry.resident_bands.to_intervals(), (), entry.resident_scale_intervals)
             else:
@@ -529,6 +597,13 @@ class AdmissionMemoryView:
                 coverage(entry.resident_coverage.intervals if intervals is None else intervals,
                          entry.resident_coverage.periodic if intervals is None else (),
                          entry.resident_scale_intervals)
+            if entry.read_admitted_coverage is not None:
+                record("read_admitted")
+                coverage(
+                    entry.read_admitted_coverage.intervals,
+                    entry.read_admitted_coverage.periodic,
+                    entry.read_admitted_coverage.scale_intervals,
+                )
             record("dirty")
             coverage(entry.dirty_coverage.intervals or entry.dirty_ranges,
                      entry.dirty_coverage.periodic, entry.dirty_coverage.scale_intervals)
@@ -753,7 +828,9 @@ class AdmissionMemoryView:
         self._active_stream_counts.pop(key.die, None)
         return self.effective_l2_bytes(key.die)
 
-    def resolve_reuse_key(self, fallback: ReuseKey) -> ReuseKey:
+    def resolve_reuse_key(
+        self, fallback: ReuseKey, *, write_allocate: bool | None = None,
+    ) -> ReuseKey:
         """Find the latest resident producer, then an active key for this allocation version."""
         identity = fallback.die, fallback.backing_allocation, fallback.tensor_version
 
@@ -761,7 +838,7 @@ class AdmissionMemoryView:
             return (key.die, key.backing_allocation, key.tensor_version) == identity
 
         for key in reversed(self._resident):
-            if matches(key) and self.is_resident(key):
+            if matches(key) and self.is_resident(key, write_allocate=write_allocate):
                 return key
         active = self._active_keys.get(fallback.die, ())
         return min((key for key in active if matches(key)), key=lambda key: key.reuse_stream, default=fallback)
@@ -809,9 +886,14 @@ class AdmissionMemoryView:
             entry.has_future_reader = False
             entry.dirty = False
 
-    def is_resident(self, key: ReuseKey) -> bool:
+    def is_resident(self, key: ReuseKey, *, write_allocate: bool | None = None) -> bool:
         entry = self._resident.get(key)
-        return entry is not None and not entry.evicted
+        if entry is None or entry.evicted:
+            return False
+        eff_wa = self.write_allocate_for(key.die) if write_allocate is None else bool(write_allocate)
+        if not eff_wa and not entry.private_workspace and not entry.read_admitted:
+            return False
+        return True
 
     @staticmethod
     def _coverage_hit_miss(
@@ -920,6 +1002,8 @@ class AdmissionMemoryView:
         coverage: SectorCoverage,
         working_set: int,
         entry: _ResidentL2Entry | None,
+        *,
+        write_allocate: bool = True,
     ) -> tuple[int, int, int | None]:
         """Return ``(hit, miss, overlap_bytes_or_None)`` using one overlap scan."""
         if eff <= 0:
@@ -928,6 +1012,40 @@ class AdmissionMemoryView:
             if entry is None:
                 return 0, aligned_bytes, None
             live_entry = entry
+            if not write_allocate and not live_entry.private_workspace:
+                has_dirty = live_entry.dirty and not live_entry.dirty_coverage.empty
+                if not live_entry.read_admitted and not has_dirty:
+                    return 0, aligned_bytes, 0
+                if live_entry.read_admitted_coverage is not None or not live_entry.read_admitted:
+                    read_cov = live_entry.read_eligible_coverage()
+                    if read_cov.empty:
+                        return 0, aligned_bytes, 0
+                    fraction = self._hit_fraction(max(working_set, live_entry.working_set_bytes), eff, die=pattern.die)
+                    if not fraction:
+                        return 0, aligned_bytes, None
+                    plan = _access_plan(pattern.runs, self.memory_access_for(pattern.die))
+                    read_payload = _payload_only(read_cov)
+                    if len(plan.runs) == 1 and not coverage.scale_intervals:
+                        req_b = _cov_payload_bytes(coverage)
+                        ov_b = 0 if req_b <= 0 else _cov_overlap(coverage, read_payload)
+                        if ov_b <= 0:
+                            return 0, aligned_bytes, None
+                        if ov_b >= req_b:
+                            hit = aligned_bytes if fraction == 1.0 else round(aligned_bytes * fraction)
+                            return hit, aligned_bytes - hit, None
+                    hit = _plan_hit_bytes(
+                        plan,
+                        lambda rc: _cov_overlap(rc, read_payload),
+                        lambda lo, hi: _cov_overlap(
+                            SectorCoverage(intervals=((lo, hi),), _canonical=True), read_payload,
+                        ),
+                        read_cov.scale_intervals,
+                        aligned_bytes,
+                    )
+                    if fraction != 1.0:
+                        hit = round(hit * fraction)
+                    hit = max(0, min(aligned_bytes, hit))
+                    return hit, aligned_bytes - hit, None
             fraction = self._hit_fraction(max(working_set, live_entry.working_set_bytes), eff, die=pattern.die)
             if not fraction:
                 return 0, aligned_bytes, None
@@ -967,15 +1085,22 @@ class AdmissionMemoryView:
         coverage: SectorCoverage,
         working_set: int,
         entry: _ResidentL2Entry | None,
+        *,
+        write_allocate: bool = True,
     ) -> tuple[int, int]:
         """Share the hit/miss decision between preview and commit."""
         hit, miss, _ = self._classify_access_with_overlap(
             pattern, aligned_bytes, eff, coverage, working_set, entry,
+            write_allocate=write_allocate,
         )
         return hit, miss
 
     def preview_access(
-        self, pattern: MemoryAccessPattern, aligned_bytes: int | None = None,
+        self,
+        pattern: MemoryAccessPattern,
+        aligned_bytes: int | None = None,
+        *,
+        write_allocate: bool | None = None,
     ) -> tuple[int, int]:
         """Pure read-only addressed hit and miss copy bytes."""
         if aligned_bytes is None:
@@ -988,10 +1113,18 @@ class AdmissionMemoryView:
             return 0, aligned_bytes
         coverage, working_set = self._geometry(pattern, aligned_bytes)
         entry = self._existing(pattern, key, eff, preview=True)
-        return self._classify_access(pattern, aligned_bytes, eff, coverage, working_set, entry)
+        eff_wa = self.write_allocate_for(key.die) if write_allocate is None else bool(write_allocate)
+        return self._classify_access(
+            pattern, aligned_bytes, eff, coverage, working_set, entry,
+            write_allocate=eff_wa,
+        )
 
     def resident_coverage_for(
-        self, pattern: MemoryAccessPattern, aligned_bytes: int | None = None,
+        self,
+        pattern: MemoryAccessPattern,
+        aligned_bytes: int | None = None,
+        *,
+        write_allocate: bool | None = None,
     ) -> SectorCoverage:
         """Return eligible address coverage before applying any statistical spill."""
         if aligned_bytes is None:
@@ -1007,16 +1140,21 @@ class AdmissionMemoryView:
                 if not coverage.empty and self._hit_fraction(
                     max(working_set, existing.working_set_bytes), eff, die=key.die,
                 ):
-                    return existing.coverage_snapshot()
+                    eff_wa = self.write_allocate_for(key.die) if write_allocate is None else bool(write_allocate)
+                    return existing.coverage_snapshot() if eff_wa else existing.read_eligible_coverage()
         return SectorCoverage()
 
     def resident_intervals_for(
-        self, pattern: MemoryAccessPattern, aligned_bytes: int | None = None,
+        self,
+        pattern: MemoryAccessPattern,
+        aligned_bytes: int | None = None,
+        *,
+        write_allocate: bool | None = None,
     ) -> tuple[tuple[int, int], ...]:
         """Return currently resident L2 sector intervals applicable to ``pattern``."""
         if aligned_bytes is None:
             aligned_bytes = pattern.runs.aligned_copy_bytes()
-        res_cov = self.resident_coverage_for(pattern, aligned_bytes)
+        res_cov = self.resident_coverage_for(pattern, aligned_bytes, write_allocate=write_allocate)
         if not res_cov.intervals and not res_cov.periodic:
             return ()
         plan = _access_plan(pattern.runs, self.memory_access_for(pattern.die))
@@ -1033,7 +1171,11 @@ class AdmissionMemoryView:
         return _materialize_runs(warm)
 
     def miss_intervals(
-        self, pattern: MemoryAccessPattern, aligned_bytes: int | None = None,
+        self,
+        pattern: MemoryAccessPattern,
+        aligned_bytes: int | None = None,
+        *,
+        write_allocate: bool | None = None,
     ) -> tuple[tuple[int, int], ...]:
         """Return exact missed sector byte intervals for ``pattern`` against current L2."""
         if aligned_bytes is None:
@@ -1042,7 +1184,7 @@ class AdmissionMemoryView:
         req_cov = plan.sector_coverage()
         if not req_cov.intervals and not req_cov.periodic:
             return ()
-        res_cov = self.resident_coverage_for(pattern, aligned_bytes)
+        res_cov = self.resident_coverage_for(pattern, aligned_bytes, write_allocate=write_allocate)
         if not req_cov.periodic and not res_cov.periodic:
             return _subtract_byte_intervals(req_cov.intervals, res_cov.intervals) if res_cov.intervals else req_cov.intervals
         if not res_cov.intervals and not res_cov.periodic:
@@ -1107,12 +1249,23 @@ class AdmissionMemoryView:
             if not (self._hit_fraction(merged_ws, eff, die=pattern.die)
                     if read and not existing.dirty else merged_ws <= eff):
                 return False
+            prior_read_cov = (
+                existing.coverage_snapshot()
+                if (not read and existing.read_admitted and existing.read_admitted_coverage is None)
+                else None
+            )
             ivs[lo_idx:hi_idx] = merged_mid
             existing.working_set_bytes = merged_ws
             existing.resident_bytes = merged_span
             existing.resident_scale_intervals = merged_scale_ivs
             existing.line_footprint_bytes = new_fp
             existing.cache_policy = pattern.cache_policy
+            if read:
+                existing.mark_read_coverage(coverage)
+            else:
+                existing.write_admitted = True
+                if prior_read_cov is not None:
+                    existing.read_admitted_coverage = prior_read_cov
             if dirty:
                 existing.dirty = True
                 existing.dirty_coverage = existing.dirty_coverage.union(dirty_cov)
@@ -1126,6 +1279,11 @@ class AdmissionMemoryView:
         if not (self._hit_fraction(merged_ws, eff, die=pattern.die)
                 if read and not existing.dirty else merged_ws <= eff):
             return False
+        prior_read_cov = (
+            base_cov
+            if (not read and existing.read_admitted and existing.read_admitted_coverage is None)
+            else None
+        )
         existing.resident_intervals_mut = None
         existing.resident_coverage = base_cov.union(coverage) if merged is None else merged
         existing.working_set_bytes = merged_ws
@@ -1133,6 +1291,12 @@ class AdmissionMemoryView:
         existing.resident_scale_intervals = merged_scale_ivs
         existing.line_footprint_bytes = (footprint - scale_fp) if line else None
         existing.cache_policy = pattern.cache_policy
+        if read:
+            existing.mark_read_coverage(coverage)
+        else:
+            existing.write_admitted = True
+            if prior_read_cov is not None:
+                existing.read_admitted_coverage = prior_read_cov
         if dirty:
             existing.dirty = True
             existing.dirty_coverage = existing.dirty_coverage.union(dirty_cov)
@@ -1225,7 +1389,12 @@ class AdmissionMemoryView:
                 return None
         else:
             eb = existing.resident_bands
-            if eb is None or eb.stride != stride or eb.sector_bytes != sec or existing.resident_scale_intervals:
+            if (
+                eb is None or eb.stride != stride or eb.sector_bytes != sec
+                or existing.resident_scale_intervals
+                or not existing.read_admitted
+                or existing.read_admitted_coverage is not None
+            ):
                 return None
         resident_span = n_rows * (c_hi - c_lo)
         line_aligned = bool(line and stride % line == 0 and c_lo % line == 0 and c_hi % line == 0)
@@ -1377,6 +1546,10 @@ class AdmissionMemoryView:
         existing = self._resident.get(key)
         if existing is not None and (existing.evicted or existing.version != version):
             existing = None
+        if existing is not None and (
+            not existing.read_admitted or existing.read_admitted_coverage is not None
+        ):
+            return None
 
         if is_contiguous:
             if (
@@ -1464,11 +1637,13 @@ class AdmissionMemoryView:
                 return fast
         coverage, working_set = self._geometry(pattern, aligned_bytes)
         existing = self._existing(pattern, key, eff, preview=False)
+        eff_wa = self.write_allocate_for(key.die)
         hit, miss, ov_cached = self._classify_access_with_overlap(
             pattern, aligned_bytes, eff, coverage, working_set, existing,
+            write_allocate=eff_wa,
         )
         prior_out = (
-            existing.coverage_snapshot()
+            (existing.coverage_snapshot() if eff_wa else existing.read_eligible_coverage())
             if (existing is not None and pattern.direction == "read" and hit > 0 and miss > 0)
             else SectorCoverage()
         )
@@ -1481,17 +1656,33 @@ class AdmissionMemoryView:
             return hit, miss, prior_out
 
         previous = self._resident.get(key)
-        if eff <= 0 or legacy_last or not (self._hit_fraction(working_set, eff, die=key.die) if read else working_set <= eff):
+        if eff <= 0:
             if previous is not None and not previous.evicted:
                 self._settle_eviction(previous)
             return hit, miss, prior_out
 
         dirty = not read and hit > 0
+        if not read and not dirty and not eff_wa:
+            if previous is not None and not previous.evicted:
+                if previous.version != pattern.version:
+                    self._settle_eviction(previous)
+                elif previous.dirty:
+                    rem_dirty = _subtract_coverage(previous.dirty_coverage, coverage)
+                    previous.dirty_coverage = rem_dirty
+                    previous.dirty_ranges = rem_dirty.intervals
+                    previous.dirty = not rem_dirty.empty
+            return hit, miss, prior_out
+
+        if legacy_last or not (self._hit_fraction(working_set, eff, die=key.die) if read else working_set <= eff):
+            if previous is not None and not previous.evicted:
+                self._settle_eviction(previous)
+            return hit, miss, prior_out
         dirty_cov = coverage if dirty else SectorCoverage()
         resident_span = _cov_bytes(coverage)
         if existing is not None and (read or dirty):
             if read and not miss:
                 existing.cache_policy = pattern.cache_policy
+                existing.mark_read_coverage(coverage)
                 self._touch_resident(existing)
                 return hit, miss, prior_out
             overlap = _entry_overlap_bytes(coverage, existing) if ov_cached is None else ov_cached
@@ -1509,6 +1700,8 @@ class AdmissionMemoryView:
             resident_coverage=coverage, resident_bytes=resident_span,
             dirty_ranges=dirty_cov.intervals, dirty_coverage=dirty_cov, cache_policy=pattern.cache_policy,
             line_footprint_bytes=None, resident_scale_intervals=coverage.scale_intervals,
+            read_admitted=read, write_admitted=not read,
+            read_admitted_coverage=None if read else SectorCoverage(),
         ))
         self._evict_over_capacity(key.die, protect_key=key)
         return hit, miss, prior_out
@@ -1850,6 +2043,7 @@ def resolve_engine_admission_view(
     raw_l2: RawDieL2Bytes,
     l2_units: int = 1,
     pool_namespace: str = "",
+    write_allocate: bool | None = None,
 ) -> AdmissionMemoryView:
     """Return ``engine.admission_memory_view`` when attached, namespace-compatible, and covering ``die``.
 
@@ -1869,10 +2063,21 @@ def resolve_engine_admission_view(
             if not attached.has_die(die):
                 raise ModelingError(f"l2_die_undeclared:{die}")
             return attached
+    if write_allocate is not None:
+        fallback_wa = bool(write_allocate)
+    elif isinstance(attached, AdmissionMemoryView):
+        fallback_wa = (
+            attached.write_allocate_for(die)
+            if attached.has_die(die)
+            else attached._write_allocate_default
+        )
+    else:
+        fallback_wa = True
     return AdmissionMemoryView(
         {die: max(0, int(raw_l2))},
         l2_buffer_units_by_die={die: l2_units},
         pool_namespace=req_ns,
+        write_allocate=fallback_wa,
     )
 
 
