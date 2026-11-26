@@ -389,10 +389,12 @@ class AdmissionMemoryView:
         ws_sweep: Mapping[int | str, float] | None = None,
         ws_sweep_by_die: Mapping[int, Mapping[int | str, float]] | None = None,
         arch_id: str | None = None,
+        pool_namespace: str = "",
     ) -> None:
         self._memory_access_default = memory_access
         self._memory_access_by_die = dict(memory_access_by_die or {})
         self.arch_id = arch_id
+        self.pool_namespace: str = _normalize_pool_namespace(pool_namespace)
         if not math.isfinite(knee_ratio) or knee_ratio <= 1:
             raise ModelingError(f"l2_knee_ratio_invalid:{knee_ratio}")
         if knee_curve and spill_curve:
@@ -1811,26 +1813,66 @@ def resolve_usable_l2_bytes(
     return UsableL2Bytes(max(0, raw_cap))
 
 
+def _row_pool_namespace(row_name: str) -> str:
+    """Return the pool namespace prefix (e.g. ``'prefill:'`` / ``'decode:'``) from a resource row."""
+    head = row_name.split("@", 1)[0]
+    if ":" not in head:
+        return ""
+    return head.rsplit(":", 1)[0] + ":"
+
+
+def _normalize_pool_namespace(pool_namespace: str) -> str:
+    """Normalize either a bare pool namespace (``'decode'``) or resource row (``'decode:l2@r0:s0'``)."""
+    text = pool_namespace.strip()
+    if not text:
+        return ""
+    if "@" in text:
+        return _row_pool_namespace(text)
+    return text if text.endswith(":") else text + ":"
+
+
+def _engine_primary_pool_namespace(engine: Any) -> str | None:
+    """Infer the owning pool namespace for ``engine.admission_memory_view`` from declared die resources."""
+    resources = getattr(engine, "resources", None)
+    if not resources:
+        return None
+    for rname in resources:
+        name = str(rname)
+        if "l2@" in name or "hbm@" in name or name in ("l2", "hbm"):
+            return _row_pool_namespace(name)
+    return None
+
+
 def resolve_engine_admission_view(
     engine: Any,
     *,
     die: int,
     raw_l2: RawDieL2Bytes,
     l2_units: int = 1,
+    pool_namespace: str = "",
 ) -> AdmissionMemoryView:
-    """Return ``engine.admission_memory_view`` when attached and covering ``die``; construct a fallback only when None."""
+    """Return ``engine.admission_memory_view`` when attached, namespace-compatible, and covering ``die``.
+
+    In disaggregated PD engines sharing one ``Engine`` across separate pools (e.g.
+    ``prefill:`` vs ``decode:``), ``engine.admission_memory_view`` belongs only to its
+    owning pool namespace so reservations in one pool never bleed into another.
+    """
     if type(l2_units) is not int or l2_units != 1:
         raise ModelingError("shared_l2_buffer_requires_one_die_owner")
+    req_ns = _normalize_pool_namespace(pool_namespace)
     attached = getattr(engine, "admission_memory_view", None)
     if attached is not None:
         if not isinstance(attached, AdmissionMemoryView):
             raise ModelingError(f"engine_admission_memory_view_invalid:{type(attached).__name__}")
-        if not attached.has_die(die):
-            raise ModelingError(f"l2_die_undeclared:{die}")
-        return attached
+        owner_ns: str | None = attached.pool_namespace or _engine_primary_pool_namespace(engine)
+        if not req_ns or owner_ns is None or owner_ns == req_ns:
+            if not attached.has_die(die):
+                raise ModelingError(f"l2_die_undeclared:{die}")
+            return attached
     return AdmissionMemoryView(
         {die: max(0, int(raw_l2))},
         l2_buffer_units_by_die={die: l2_units},
+        pool_namespace=req_ns,
     )
 
 
