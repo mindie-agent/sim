@@ -85,6 +85,7 @@ MAX_ONBOARDING_LOC = 5200
 COHESIVE_SOFT_MAX_LINES = 1800
 MAX_FUNCTION_LINES = 150
 MAX_NESTING_DEPTH = 6
+_COHESIVE_PIPELINE_RE = re.compile(r"(?<![A-Za-z0-9_])\[Cohesive-Pipeline\]\s*:?\s*\S")
 
 PARALLEL_CONCEPT_CLASS_RE = re.compile(
     r"^(?:Ragged\w*Batch|SequenceBatch|StepBatch|RequestBatch"
@@ -395,10 +396,12 @@ def _check_cohesive_readability(rel: PurePosixPath, text: str, tree: ast.Module)
             end_line = node.end_lineno or node.lineno
             eff = max(1, (end_line - node.lineno + 1) - _declarative_extra_lines(node))
             depth = max((0, *(_max_nesting_depth(stmt, 0) for stmt in node.body)))
-            if eff > MAX_FUNCTION_LINES:
+            doc = ast.get_docstring(node, clean=False)
+            cohesive_pipeline = bool(doc and _COHESIVE_PIPELINE_RE.search(doc))
+            if eff > MAX_FUNCTION_LINES and not cohesive_pipeline:
                 violations.append(Violation(
                     "AG008", rel, node.lineno, f"AG008:fn_lines:{pos}:{node.name}",
-                    f"function {node.name} has {eff} non-table lines (limit {MAX_FUNCTION_LINES})",
+                    f"function {node.name} has {eff} non-table lines (soft limit {MAX_FUNCTION_LINES}; declare [Cohesive-Pipeline] in docstring when genuinely cohesive)",
                 ))
             if depth > MAX_NESTING_DEPTH:
                 violations.append(Violation(

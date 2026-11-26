@@ -908,3 +908,41 @@ def test_ag014_hardened_ast_edges_base_non_waiver_and_manifest_top_level(
     # Differential --base subtraction must NEVER waive AG014 violations.
     assert arch_gov.new_violations(findings, findings) == findings
 
+
+def test_ag008_cohesive_pipeline_allows_long_shallow_function_but_blocks_unmarked_or_deep(tmp_path):
+    proj = tmp_path / "repo"
+    pred = proj / "mindie_sim" / "prediction"
+    pred.mkdir(parents=True)
+    padding = "\n".join(f"x_{idx} = {idx}" for idx in range(1810))
+    body = "\n".join(f"    v = v + {idx}" for idx in range(155))
+    deep_body = (
+        "    if a:\n"
+        "        for _ in b:\n"
+        "            if c:\n"
+        "                for _ in d:\n"
+        "                    if e:\n"
+        "                        for _ in f:\n"
+        "                            if g:\n"
+        "                                return 1\n"
+        "    return 0\n"
+    )
+    (pred / "cohesive_mod.py").write_text(
+        '"""[Role] Cohesive pipeline test module."""\n'
+        f"{padding}\n"
+        "def unmarked_long(v):\n"
+        f"{body}\n"
+        "    return v\n"
+        "def marked_long(v):\n"
+        '    """[Cohesive-Pipeline] Single-pass lowering pipeline."""\n'
+        f"{body}\n"
+        "    return v\n"
+        "def marked_but_deep(a, b, c, d, e, f, g):\n"
+        '    """[Cohesive-Pipeline] Deeply nested loop."""\n'
+        f"{deep_body}",
+        encoding="utf-8",
+    )
+    findings = arch_gov.scan_repository(proj)
+    fps = {item.fingerprint for item in findings if item.rule == "AG008"}
+    assert "AG008:fn_lines:mindie_sim/prediction/cohesive_mod.py:unmarked_long" in fps
+    assert "AG008:fn_lines:mindie_sim/prediction/cohesive_mod.py:marked_long" not in fps
+    assert "AG008:fn_depth:mindie_sim/prediction/cohesive_mod.py:marked_but_deep" in fps
