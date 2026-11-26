@@ -68,6 +68,7 @@ class SourceMeshPeers(PairwiseCollective):
             ('transport_hop_startup_us', 'hop_startup_us'),
             ('transport_receive_capacity_bytes_per_peer',
              'receive_capacity_bytes_per_peer'),
+            ('transport_rail_id', 'rail_id'),
         ):
             if meta.get(source) is not None:
                 result[target] = meta[source]
@@ -235,7 +236,9 @@ def lower(ops, runtime, source_dtype):
                 'device_kernel_group':info(),
                 'hccl_phase':{'selection':selection.to_dict(),'rank':0,
                               'phase':phase.name,
-                              'native_direction':native_direction},
+                              'native_direction':native_direction,
+                              **({'rail_id':phase.rail_id}
+                                 if phase.rail_id is not None else {})},
                 **({'invocation_class':'vector'} if selection.expansion == 'AIV' else {}),
             },family='hccl_local',recipe=module.RECIPE,source_boundary='kernel',
                 stream=ids[phase.name]))
@@ -243,7 +246,9 @@ def lower(ops, runtime, source_dtype):
                 network_meta = {**common,'device_kernel_group':info(),
                     'collective':'alltoallv','collective_id':netids[phase.name],
                     'steps':r-1,'peer_volume_basis':'group_mean',
-                    'peer_traffic':{'kind':'matrix','payload_bytes':phase.exchange}}
+                    'peer_traffic':{'kind':'matrix','payload_bytes':phase.exchange},
+                    **({'transport_rail_id':phase.rail_id}
+                       if phase.rail_id is not None else {})}
                 is_aiv_ub_read = (
                     (module is hccl_aiv_gather
                      and (phase.name == 'gather' or phase.name.startswith('gather_copy_')))

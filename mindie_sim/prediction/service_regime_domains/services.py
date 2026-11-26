@@ -31,7 +31,7 @@ _COMMUNICATION_KEYS = (
     "collective", "a5_collective", "comm_dtype", "group_axis", "steps",
     "world_size", "comm_group_size", "group_size", "ranks", "group_ranks",
     "placement_scope", "p2p_pair", "expansion_mode", "expansion_regime",
-    "algorithm", "protocol", "stack", "cann")
+    "algorithm", "protocol", "stack", "cann", "transport_rail_id")
 _TOPOLOGY_GROUP_AXES = frozenset({
     "tp", "ep", "dp", "cp", "dcp", "pcp", "dcp_tp", "dcp_pcp", "dcp_dp",
     "dcp_a2a", "etp", "local_tp",
@@ -173,6 +173,7 @@ def _resolved_transport_route(case, op, metadata: Mapping, device, *,
         or "peer_traffic" in metadata
         or getattr(op, "recipe", "") in _PAIRWISE_RECIPES
     )
+    rail_id = metadata.get("transport_rail_id")
     routes = []
     for grp in groups:
         peer_pairs = _peer_traffic_pairs(grp, metadata)
@@ -185,7 +186,7 @@ def _resolved_transport_route(case, op, metadata: Mapping, device, *,
         for src, dst, share in weighted_pairs:
             if src not in linked_ranks or dst not in linked_ranks:
                 continue
-            path = topo.route(src, dst)
+            path = topo.route(src, dst, rail_id=rail_id)
             entry = {
                 "source": int(src),
                 "destination": int(dst),
@@ -201,10 +202,13 @@ def _resolved_transport_route(case, op, metadata: Mapping, device, *,
             if share is not None:
                 entry["share"] = share
             routes.append(entry)
-    return {
+    result = {
         "groups": [[int(rank) for rank in grp] for grp in groups],
         "routes": routes,
     }
+    if rail_id is not None:
+        result["rail_id"] = rail_id
+    return result
 
 
 def _zero_resource_node(op) -> bool:

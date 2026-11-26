@@ -533,27 +533,23 @@ def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_m
 
 
 def _band_plan_aux_service(plan) -> dict[str, float]:
-    """Derive die-injection and SDMA-flow engine service for a ``BandCollectivePlan``."""
-    from ..collectives.ports import die_injection_resource_name, sdma_flow_resource_name
+    """Derive SDMA-flow engine ms-service for a ``BandCollectivePlan``."""
+    from ..collectives.ports import sdma_flow_resource_name
+    from ..collectives.protocol import _effective_hop_flow_cap
 
     aux: dict[str, float] = {}
     for group in plan.groups:
         lowered = group.lowered
         ns = str(getattr(lowered, "namespace", "") or "")
-        group_ranks = frozenset(lowered.group)
-        has_inj = lowered.die_injection_ceiling_bytes_per_ms is not None
         for phase in lowered.phases:
             for transfer in phase.transfers:
+                has_per_hop_caps = any(
+                    hop.flow_cap_bytes_per_ms is not None for hop in transfer.hops
+                )
                 for hop in transfer.hops:
-                    if has_inj:
-                        if hop.source in group_ranks:
-                            tx = die_injection_resource_name(hop.source, "tx", namespace=ns)
-                            aux[tx] = aux.get(tx, 0.0) + transfer.wire_bytes
-                        if hop.destination in group_ranks:
-                            rx = die_injection_resource_name(hop.destination, "rx", namespace=ns)
-                            aux[rx] = aux.get(rx, 0.0) + transfer.wire_bytes
-                    if transfer.flow_cap_bytes_per_ms is not None:
-                        sdma_ms = transfer.wire_bytes / float(transfer.flow_cap_bytes_per_ms)
+                    hop_cap = _effective_hop_flow_cap(transfer, hop, has_per_hop_caps)
+                    if hop_cap is not None:
+                        sdma_ms = transfer.wire_bytes / hop_cap
                         stx = sdma_flow_resource_name(hop.source, "tx", namespace=ns)
                         srx = sdma_flow_resource_name(hop.destination, "rx", namespace=ns)
                         aux[stx] = aux.get(stx, 0.0) + sdma_ms

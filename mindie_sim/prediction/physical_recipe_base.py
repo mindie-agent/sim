@@ -61,6 +61,9 @@ CATEGORY_BY_ROLE = {
 }
 
 
+_TOPOLOGY_LINK_TOKENS = frozenset({"link", "port", "switch", "ub_inj"})
+
+
 def _category(role: str) -> str | None:
     """One canonical phase category per physical resource, or ``None``."""
     if role in CATEGORY_BY_ROLE:
@@ -72,10 +75,10 @@ def _category(role: str) -> str | None:
         if role.startswith(prefix):
             return category
     # Topology-owned link resources carry a namespace and endpoint identity
-    # (``<scope>:link:<channel>:<rank>:<endpoint>``); their category is the
-    # link token, not the caller's namespace.
+    # (``<scope>:link:...``, ``port:...``, ``switch:...``, ``ub_inj:...``);
+    # their category is the topology link token, not the caller's namespace.
     tokens = role.split(":")
-    if "link" in tokens:
+    if any(tok in _TOPOLOGY_LINK_TOKENS for tok in tokens):
         return "link"
     return None
 

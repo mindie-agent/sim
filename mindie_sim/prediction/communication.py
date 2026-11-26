@@ -13,6 +13,8 @@ from dataclasses import dataclass
 import math
 from typing import Mapping
 
+from mindie_sim.schema.common import ModelingError
+
 
 @dataclass(frozen=True)
 class MessageFlow:
@@ -20,6 +22,25 @@ class MessageFlow:
     destination: int
     payload_bytes: float
     messages: int = 1
+    rail_id: int | str | None = None
+
+    def __post_init__(self):
+        if self.rail_id is None:
+            return
+        if isinstance(self.rail_id, bool):
+            raise ModelingError(f"message_flow_rail_id_invalid:{self.rail_id!r}")
+        if isinstance(self.rail_id, int):
+            if self.rail_id < 0:
+                raise ModelingError(f"message_flow_rail_id_invalid:{self.rail_id!r}")
+            return
+        if isinstance(self.rail_id, str):
+            stripped = self.rail_id.strip()
+            if not stripped:
+                raise ModelingError(f"message_flow_rail_id_invalid:{self.rail_id!r}")
+            if stripped != self.rail_id:
+                object.__setattr__(self, "rail_id", stripped)
+            return
+        raise ModelingError(f"message_flow_rail_id_invalid:{self.rail_id!r}")
 
     @property
     def useful_bytes(self):

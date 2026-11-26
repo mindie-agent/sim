@@ -38,6 +38,7 @@ _NATIVE_MC2_FAMILIES = frozenset({"mc2_protocol", "mc2_transport"})
 _RANK_LABEL_METADATA_KEYS = frozenset({"ep_rank", "dp_rank", "replica", "rank_id"})
 _PAIR_RE = re.compile(r"^(?P<pfx>.+):pair(?P<src>\d+)>(?P<dst>\d+)$")
 _PORT_RE = re.compile(r"^(?P<pfx>.+):(?P<dir>tx|rx):port(?P<rk>\d+)$")
+_UB_INJ_RE = re.compile(r"^(?P<pfx>.*)ub_inj:(?P<dir>tx|rx):r(?P<rk>\d+)$")
 
 
 def dp_dedup_enabled() -> bool:
@@ -271,7 +272,7 @@ def _work_symmetry_signature(work: Any) -> tuple[Any, ...]:
 
 
 def _rank_topology_profile(topology: Any, engine: Any, ranks: tuple[int, ...]) -> tuple[Any, ...]:
-    """Per-replica interconnect profile verifying identical link rates & fanout."""
+    """Per-replica interconnect profile verifying identical link rates, rails & fanout."""
     rank_set = set(ranks)
     entries = []
     for link in topology.links.values():
@@ -287,8 +288,15 @@ def _rank_topology_profile(topology: Any, engine: Any, ranks: tuple[int, ...]) -
             rx_r = engine.resources.get(rx_name)
             tx_rates.append(None if tx_r is None else (tx_r.rate, tx_r.units, tx_r.policy))
             rx_rates.append(None if rx_r is None else (rx_r.rate, rx_r.units, rx_r.policy))
+        rail_val = (
+            topology.link_rail(link.name)
+            if hasattr(topology, "link_rail")
+            else getattr(link, "rail_id", None)
+        )
         entries.append((
             link.semantics,
+            str(getattr(link, "channel", "") or ""),
+            repr(rail_val),
             len(link.members),
             len(touched),
             float(link.capacity_bytes_per_ms),
@@ -704,11 +712,35 @@ def scale_dedup_accounting(
             execution.cost.counts[key] = cur + delta * extra
 
 
+def _link_mirror_class(
+    pfx: str,
+    topology: Any,
+    r0_rank_set: frozenset[int],
+    peer_rank_set: frozenset[int],
+) -> tuple[str, str, str, str]:
+    """Classify a link resource prefix preserving channel, rail, and shared-link identity."""
+    if "link:" not in pfx:
+        return (pfx, "", "", "")
+    ns_part, link_name = pfx.rsplit("link:", 1)
+    link = topology.links.get(link_name)
+    if link is None:
+        return (ns_part, "", "", link_name)
+    channel = str(getattr(link, "channel", "") or "")
+    rail_val = (
+        topology.link_rail(link_name)
+        if hasattr(topology, "link_rail")
+        else getattr(link, "rail_id", None)
+    )
+    members = set(link.members)
+    shared = bool((members & r0_rank_set) and (members & peer_rank_set))
+    return (ns_part, channel, repr(rail_val), link_name if shared else "")
+
+
 def _mirror_replica_resources(
     engine: Any, topology: Any, r0: int, peers: tuple[int, ...],
     pp: int, *, mirror_links: bool,
 ) -> None:
-    """Mirror canonical die-local and symmetric link counters onto peer ranks."""
+    """Mirror canonical die-local, UB die-injection, and symmetric link counters onto peer ranks."""
     src_tag = f"@r{r0}:"
     serviced = engine.serviced
     busy = engine.busy_ms
@@ -730,9 +762,12 @@ def _mirror_replica_resources(
         rep: tuple(rk for s in range(pp) for rk in topology.ranks(rep, s))
         for rep in (r0, *peers)
     }
-    port_by_class: dict[tuple[str, str, int, float], tuple[float, float]] = {}
-    pair_by_class: dict[tuple[str, float], tuple[float, float]] = {}
-    intra_pair_by_pos: dict[tuple[str, int, int, float], tuple[float, float]] = {}
+    r0_rank_set = frozenset(r0_ranks)
+    peer_rank_set = frozenset(rk for rep in peers for rk in all_ranks_by_rep[rep])
+    port_by_class: dict[tuple[Any, str, int, float], tuple[float, float]] = {}
+    pair_by_class: dict[tuple[Any, float], tuple[float, float]] = {}
+    intra_pair_by_pos: dict[tuple[Any, int, int, float], tuple[float, float]] = {}
+    ub_inj_by_pos: dict[tuple[str, str, int, float], tuple[float, float]] = {}
     resources = engine.resources
     rank_to_rep_pos = {
         rk: (rep, pos)
@@ -741,27 +776,41 @@ def _mirror_replica_resources(
     }
     r0_pos = {rk: pos for pos, rk in enumerate(r0_ranks)}
     for res_name, amt in list(serviced.items()):
-        if not amt or "link:" not in res_name:
+        if not amt:
             continue
         res_obj = resources.get(res_name)
         rate_val = float(res_obj.rate) if res_obj is not None else 0.0
+        b_val = busy.get(res_name, 0.0)
+        m_ub = _UB_INJ_RE.match(res_name)
+        if m_ub:
+            pfx = m_ub.group("pfx")
+            direction = m_ub.group("dir")
+            rk_id = int(m_ub.group("rk"))
+            if direction == "rx" and mirror_links:
+                info = rank_to_rep_pos.get(rk_id)
+                if info is not None:
+                    ukey = (pfx, "rx", info[1], rate_val)
+                    prev_amt, prev_busy = ub_inj_by_pos.get(ukey, (0.0, 0.0))
+                    ub_inj_by_pos[ukey] = (prev_amt + amt, prev_busy + b_val)
+            elif rk_id in r0_pos:
+                ub_inj_by_pos[(pfx, direction, r0_pos[rk_id], rate_val)] = (amt, b_val)
+            continue
+        if "link:" not in res_name:
+            continue
         m_port = _PORT_RE.match(res_name)
         if m_port:
             pfx = m_port.group("pfx")
             direction = m_port.group("dir")
             rk_id = int(m_port.group("rk"))
-            lclass = pfx.rsplit(":", 1)[0] if ":" in pfx else pfx
-            b_val = busy.get(res_name, 0.0)
+            lclass = _link_mirror_class(pfx, topology, r0_rank_set, peer_rank_set)
             if direction == "rx" and mirror_links:
                 info = rank_to_rep_pos.get(rk_id)
                 if info is not None:
-                    _, pos = info
-                    pkey = (lclass, "rx", pos, rate_val)
+                    pkey = (lclass, "rx", info[1], rate_val)
                     prev_amt, prev_busy = port_by_class.get(pkey, (0.0, 0.0))
                     port_by_class[pkey] = (prev_amt + amt, prev_busy + b_val)
             elif rk_id in r0_pos:
-                pos = r0_pos[rk_id]
-                port_by_class[(lclass, direction, pos, rate_val)] = (amt, b_val)
+                port_by_class[(lclass, direction, r0_pos[rk_id], rate_val)] = (amt, b_val)
             continue
         m_pair = _PAIR_RE.match(res_name)
         if m_pair:
@@ -769,49 +818,65 @@ def _mirror_replica_resources(
             src_rk = int(m_pair.group("src"))
             dst_rk = int(m_pair.group("dst"))
             if src_rk in r0_pos:
-                lclass = pfx.rsplit(":", 1)[0] if ":" in pfx else pfx
+                lclass = _link_mirror_class(pfx, topology, r0_rank_set, peer_rank_set)
                 if dst_rk in r0_pos:
                     intra_pair_by_pos[(lclass, r0_pos[src_rk], r0_pos[dst_rk], rate_val)] = (
-                        amt, busy.get(res_name, 0.0),
+                        amt, b_val,
                     )
                 elif mirror_links:
-                    pair_by_class.setdefault((lclass, rate_val), (amt, busy.get(res_name, 0.0)))
-    if port_by_class or pair_by_class or intra_pair_by_pos:
-        for res_name in list(serviced):
-            if "link:" not in res_name:
+                    pair_by_class.setdefault((lclass, rate_val), (amt, b_val))
+    if not (port_by_class or pair_by_class or intra_pair_by_pos or ub_inj_by_pos):
+        return
+    for res_name in list(serviced):
+        res_obj = resources.get(res_name)
+        rate_val = float(res_obj.rate) if res_obj is not None else 0.0
+        m_ub = _UB_INJ_RE.match(res_name)
+        if m_ub:
+            pfx = m_ub.group("pfx")
+            direction = m_ub.group("dir")
+            rk_id = int(m_ub.group("rk"))
+            info = rank_to_rep_pos.get(rk_id)
+            if info is None or (info[0] == r0 and not (direction == "rx" and mirror_links)):
                 continue
-            res_obj = resources.get(res_name)
-            rate_val = float(res_obj.rate) if res_obj is not None else 0.0
-            m_port = _PORT_RE.match(res_name)
-            if m_port:
-                pfx = m_port.group("pfx")
-                direction = m_port.group("dir")
-                rk_id = int(m_port.group("rk"))
-                info = rank_to_rep_pos.get(rk_id)
-                if info is not None:
-                    _, pos = info
-                    lclass = pfx.rsplit(":", 1)[0] if ":" in pfx else pfx
-                    val = port_by_class.get((lclass, direction, pos, rate_val))
-                    if val is not None:
-                        serviced[res_name], busy[res_name] = val
+            val = ub_inj_by_pos.get((pfx, direction, info[1], rate_val))
+            if val is not None:
+                serviced[res_name], busy[res_name] = val
+            continue
+        if "link:" not in res_name:
+            continue
+        m_port = _PORT_RE.match(res_name)
+        if m_port:
+            pfx = m_port.group("pfx")
+            direction = m_port.group("dir")
+            rk_id = int(m_port.group("rk"))
+            info = rank_to_rep_pos.get(rk_id)
+            if info is None or (info[0] == r0 and not (direction == "rx" and mirror_links)):
                 continue
-            m_pair = _PAIR_RE.match(res_name)
-            if m_pair and serviced[res_name] == 0.0:
-                pfx = m_pair.group("pfx")
-                src_rk = int(m_pair.group("src"))
-                dst_rk = int(m_pair.group("dst"))
-                src_info = rank_to_rep_pos.get(src_rk)
-                dst_info = rank_to_rep_pos.get(dst_rk)
-                if src_info is not None and dst_info is not None:
-                    lclass = pfx.rsplit(":", 1)[0] if ":" in pfx else pfx
-                    if src_info[0] == dst_info[0]:
-                        val = intra_pair_by_pos.get((lclass, src_info[1], dst_info[1], rate_val))
-                    elif mirror_links:
-                        val = pair_by_class.get((lclass, rate_val))
-                    else:
-                        val = None
-                    if val is not None:
-                        serviced[res_name], busy[res_name] = val
+            lclass = _link_mirror_class(pfx, topology, r0_rank_set, peer_rank_set)
+            val = port_by_class.get((lclass, direction, info[1], rate_val))
+            if val is not None:
+                serviced[res_name], busy[res_name] = val
+            continue
+        m_pair = _PAIR_RE.match(res_name)
+        if m_pair and serviced[res_name] == 0.0:
+            pfx = m_pair.group("pfx")
+            src_rk = int(m_pair.group("src"))
+            dst_rk = int(m_pair.group("dst"))
+            src_info = rank_to_rep_pos.get(src_rk)
+            dst_info = rank_to_rep_pos.get(dst_rk)
+            if src_info is None or dst_info is None:
+                continue
+            if src_info[0] == r0 and dst_info[0] == r0:
+                continue
+            lclass = _link_mirror_class(pfx, topology, r0_rank_set, peer_rank_set)
+            if src_info[0] == dst_info[0]:
+                val = intra_pair_by_pos.get((lclass, src_info[1], dst_info[1], rate_val))
+            elif mirror_links:
+                val = pair_by_class.get((lclass, rate_val))
+            else:
+                val = None
+            if val is not None:
+                serviced[res_name], busy[res_name] = val
 
 
 def expand_dedup_graph_artifacts(

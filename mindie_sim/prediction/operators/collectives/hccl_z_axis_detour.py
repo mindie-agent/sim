@@ -11,11 +11,13 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Literal
 
 from mindie_sim.schema.datapath import SourceRef
 from .hccl_contracts import (
     HCCL_64BIT_ELEMENT_BYTES, HcclPlan, ModelingError, exact_positive_int,
+    validate_rail_id,
 )
 from .hccl_source_shapes import (
     copy_phase, detour_split, exchange_phase, reduce_phase, sync_phase,
@@ -84,6 +86,15 @@ def contract(selection, rank=0):
     if s.collective == "reduce_scatter" and len(segments) > 1:
         raise ModelingError("hccl_z_detour_rs_multi_segment_not_implemented")
     channels = 1 + len(weights)
+    if s.channel_rails:
+        if len(s.channel_rails) != channels:
+            raise ModelingError("hccl_z_detour_channel_rails_count_mismatch")
+        channel_rails = tuple(
+            validate_rail_id(rail, "hccl_source_channel_rail_invalid")
+            for rail in s.channel_rails
+        )
+    else:
+        channel_rails = tuple(range(channels))
     split_by_segment = tuple(
         detour_split(segment, dtype, r - 1, weights) for segment in segments)
     if any(len(chunks) != channels for chunks in split_by_segment):
@@ -107,9 +118,12 @@ def contract(selection, rank=0):
                     tuple(chunk if source != destination else 0
                           for destination in range(r))
                     for source in range(r))
-                phase = exchange_phase(
-                    f"seg{segment_index}_ch{channel_index}", (pre.name,),
-                    matrix, rank, native_direction="read")
+                phase = replace(
+                    exchange_phase(
+                        f"seg{segment_index}_ch{channel_index}", (pre.name,),
+                        matrix, rank, native_direction="read"),
+                    rail_id=channel_rails[channel_index],
+                )
                 phases.append(phase)
                 channel_names.append(phase.name)
             post = sync_phase(f"seg{segment_index}_post_sync",
@@ -128,9 +142,12 @@ def contract(selection, rank=0):
                     tuple(chunk if source != destination else 0
                           for destination in range(r))
                     for source in range(r))
-                phase = exchange_phase(
-                    f"seg{segment_index}_ch{channel_index}", (pre.name,),
-                    matrix, rank, native_direction="send")
+                phase = replace(
+                    exchange_phase(
+                        f"seg{segment_index}_ch{channel_index}", (pre.name,),
+                        matrix, rank, native_direction="send"),
+                    rail_id=channel_rails[channel_index],
+                )
                 phases.append(phase)
                 channel_names.append(phase.name)
         post = sync_phase("post_sync", tuple(channel_names),

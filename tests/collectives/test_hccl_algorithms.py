@@ -110,6 +110,13 @@ def _chunk_case(ranks, collective, template, **options):
         hbm=4e12, hccl_copy=1.5e12, hccl_reduce=1e12)
     raw["model"]["num_heads"] = ranks
     raw["model"]["num_kv_heads"] = max(1, ranks // 2)
+    if template in {"z_axis_detour_allgather", "z_axis_detour_reduce_scatter"} and options.get("level1_weights"):
+        base_link = raw["machine"]["links"][0]
+        channels = 1 + len(options["level1_weights"])
+        raw["machine"]["links"] = [
+            {**base_link, "name": f"level{i}", "channel": f"level{i}", "rail_id": i, "scope": "node"}
+            for i in range(channels)
+        ]
     raw["runtime"]["kernels"] = {"hccl": {
         collective: {"expansion": "AICPU_TS", "template": template, **options}}}
     return raw
@@ -515,3 +522,136 @@ def test_nhr_reduce_scatter_fuses_notify_and_handshakes_order_record_signal_wait
     rep_ccu = graph_costs(raw_ccu_order, lower((op_ag,), parse_case(raw_ccu_order).runtime, "bf16"), isolated=False, trace_limit=200)
     pw_ccu = next(ev for ev in rep_ccu["timeline"] if ev["op_id"].endswith(".peer_write"))
     assert pw_ccu["ready_ms"] >= 13.0 - 1e-9
+
+
+def test_z_axis_detour_routes_each_channel_share_to_its_declared_rail():
+    from _support.collective_cases import topology
+    from mindie_sim.prediction.communication import MessageFlow
+    from mindie_sim.prediction.engine import Engine
+    from mindie_sim.prediction.operators.collectives.hccl_source_shapes import detour_split
+    from mindie_sim.schema.operators import OpSpec
+
+    shape = (2, 4096)
+    base = case(tp=2)
+    base_link = base["machine"]["links"][0]
+    two_rails = [
+        {**base_link, "name": f"level{i}", "channel": f"level{i}", "rail_id": i, "scope": "node"}
+        for i in (0, 1)
+    ]
+
+    # 1. Equal-weight AG detour splits [8192, 8192] across level0/level1 with zero isolated service_delta.
+    raw_ag = deepcopy(base)
+    raw_ag["machine"]["links"] = deepcopy(two_rails)
+    raw_ag["runtime"]["kernels"] = {"hccl": {"allgather": {
+        "expansion": "AICPU_TS", "template": "z_axis_detour_allgather",
+        "segments": [8192], "level1_weights": [1],
+    }}}
+    op_ag = OpSpec("g", "allgather", "decode", 0, 0, (), shape, shape, shape, shape, dtype="bf16", link_bytes=8192)
+    ops_ag = lower((op_ag,), parse_case(raw_ag).runtime, "bf16")
+    for isolated in (False, True):
+        rep = graph_costs(raw_ag, ops_ag, isolated=isolated, trace_limit=0)
+        serviced = rep["execution"]["serviced"]
+        assert [serviced.get(f"link:level{i}", 0) for i in (0, 1)] == [8192.0, 8192.0]
+        if isolated:
+            assert all(row["service_delta"] == {} for row in rep["isolated"]["operators"])
+
+    # 2. Equal-weight RS detour splits [8192, 8192] across level0/level1.
+    raw_rs = deepcopy(base)
+    raw_rs["machine"]["links"] = deepcopy(two_rails)
+    raw_rs["runtime"]["kernels"] = {"hccl": {"reduce_scatter": {
+        "expansion": "AICPU_TS", "template": "z_axis_detour_reduce_scatter",
+        "segments": [8192], "level1_weights": [1],
+    }}}
+    op_rs = OpSpec("rs", "reduce_scatter", "decode", 0, 0, (), shape, shape, shape, shape, dtype="bf16", link_bytes=8192)
+    ops_rs = lower((op_rs,), parse_case(raw_rs).runtime, "bf16")
+    rep_rs = graph_costs(raw_rs, ops_rs, isolated=False, trace_limit=0)
+    assert [rep_rs["execution"]["serviced"].get(f"link:level{i}", 0) for i in (0, 1)] == [8192.0, 8192.0]
+
+    # 3. Three-rail AG detour delivers each channel's exact detour_split share onto its own rail.
+    raw_3r = _chunk_case(4, "allgather", "z_axis_detour_allgather", segments=(32768,), level1_weights=(2, 1))
+    ops_3r = lower((exchange(32768 * 3, family="allgather"),), parse_case(raw_3r).runtime, "bf16")
+    rep_3r = graph_costs(raw_3r, ops_3r, isolated=False, trace_limit=0)
+    expected_3r = [float(4 * 3 * chunk) for chunk in detour_split(32768, 2, 3, (2, 1))]
+    assert [rep_3r["execution"]["serviced"].get(f"link:level{i}", 0) for i in range(3)] == pytest.approx(
+        expected_3r, rel=1e-12
+    )
+
+    # 4. Missing declared detour rail fails loudly rather than collapsing onto rail 0.
+    raw_missing = deepcopy(base)
+    raw_missing["runtime"]["kernels"] = raw_ag["runtime"]["kernels"]
+    with pytest.raises(ValueError, match="physical_route_missing:.*rail=1"):
+        graph_costs(raw_missing, ops_ag, isolated=False, trace_limit=0)
+
+    # 5. Chunked TransportPlan and DirectPeerGroup honor explicit rail_id on MessageFlow / options.
+    topo_rails = topology(raw_ag)
+    plan_tp = topo_rails.transport_plan([MessageFlow(0, 1, 128, rail_id=1)], chunk_bytes=64)
+    eng_tp = Engine(plan_tp.resources())
+    plan_tp.start(eng_tp, "rail1", {r: eng_tp.submit(str(r)) for r in plan_tp.ranks})
+    eng_tp.advance()
+    assert eng_tp.serviced["link:level1"] == 128.0 and eng_tp.serviced["link:level0"] == 0.0
+    dp_plan = topo_rails.joint_plan(
+        exchange(128, family="alltoall"), {0: 128}, algorithm="direct_peer",
+        chunk_bytes=64, rail_id=1,
+    )
+    dp_plan.validate_path_model("direct")
+    eng_dp = Engine(topo_rails.resources())
+    dp_plan.start(eng_dp, "dp_rail1", eng_dp.submit("ready"))
+    eng_dp.advance()
+    assert eng_dp.serviced["link:level1"] == 256.0 and eng_dp.serviced["link:level0"] == 0.0
+
+    # 6. TransportOptions.rail_id, per-replica accounting isolation, named channel_rails, & service_identity.
+    from mindie_sim.prediction.collectives.topology import TransportOptions
+    from mindie_sim.prediction.service_regime_domains.services import service_identity
+
+    raw_asym = deepcopy(base)
+    raw_asym["machine"]["links"] = [
+        {**base_link, "name": "fast0", "channel": "c", "capacity_bytes_per_ms": 1024.0, "rail_id": 0, "scope": "node"},
+        {**base_link, "name": "slow1", "channel": "c", "capacity_bytes_per_ms": 64.0, "rail_id": 1, "scope": "node"},
+    ]
+    topo_asym = topology(raw_asym)
+    tp_opts = topo_asym.transport_plan(
+        [MessageFlow(0, 1, 128)], transport=TransportOptions(chunk_bytes=64, rail_id=1),
+    )
+    assert tp_opts.lower_bound()["service_ms"] == pytest.approx(2.0)
+
+    raw_dp2 = case(dp=2, tp=2)
+    dp2_base = raw_dp2["machine"]["links"][0]
+    raw_dp2["machine"]["links"] = [
+        {**dp2_base, "name": "r0", "channel": "c", "members": [0, 1, 2, 3], "capacity_bytes_per_ms": 1024.0,
+         "semantics": "per_pair", "rail_id": 0, "scope": "node"},
+        {**dp2_base, "name": "r1", "channel": "c", "members": [0, 1, 2, 3], "capacity_bytes_per_ms": 64.0,
+         "semantics": "per_pair", "rail_id": 1, "scope": "node"},
+    ]
+    topo_dp2 = topology(raw_dp2)
+    op_dp2 = exchange(128, family="alltoall")
+    topo_dp2.joint_plan(op_dp2, {0: 128}, algorithm="direct_peer", rail_id=0)
+    topo_dp2.joint_plan(op_dp2, {1: 128}, algorithm="direct_peer", rail_id=1)
+    assert set(topo_dp2.accounting(op_dp2, 0).wire_by_resource) == {"link:r0:pair0>1", "link:r0:pair1>0"}
+    assert set(topo_dp2.accounting(op_dp2, 1).wire_by_resource) == {"link:r1:pair2>3", "link:r1:pair3>2"}
+
+    raw_named = deepcopy(base)
+    raw_named["machine"]["links"] = [
+        {**base_link, "name": name, "channel": name, "rail_id": name, "scope": "node"}
+        for name in ("east", "west")
+    ]
+    raw_named["runtime"]["kernels"] = {"hccl": {"allgather": {
+        "expansion": "AICPU_TS", "template": "z_axis_detour_allgather",
+        "segments": [8192], "level1_weights": [1], "channel_rails": ["east", "west"],
+    }}}
+    ops_named = lower((op_ag,), parse_case(raw_named).runtime, "bf16")
+    rep_named = graph_costs(raw_named, ops_named, isolated=False, trace_limit=0)
+    assert [rep_named["execution"]["serviced"].get(f"link:{n}", 0) for n in ("east", "west")] == [8192.0, 8192.0]
+
+    parsed_asym = parse_case(raw_asym)
+    id_r0 = service_identity(
+        parsed_asym, exchange(128, family="alltoall", metadata=(("transport_rail_id", 0),)),
+        scope="graph", device=parsed_asym.machine.dies[0],
+    )
+    id_r1 = service_identity(
+        parsed_asym, exchange(128, family="alltoall", metadata=(("transport_rail_id", 1),)),
+        scope="graph", device=parsed_asym.machine.dies[0],
+    )
+    assert id_r0 != id_r1
+    assert id_r0["transport"]["transport_rail_id"] == 0
+    assert id_r1["transport"]["transport_rail_id"] == 1
+    assert id_r1["transport"]["routes"][0]["hops"][0]["link"] == "slow1"

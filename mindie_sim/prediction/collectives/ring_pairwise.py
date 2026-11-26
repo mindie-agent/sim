@@ -374,6 +374,7 @@ class PairwisePlan:
         if path_model == "direct":
             for group in self.groups:
                 volumes = dict(group.volumes)
+                group_rail = getattr(group, "rail_id", None)
                 if group.peer_traffic is not None:
                     if group.peer_traffic.size != len(group.ranks):
                         raise ModelingError(
@@ -385,7 +386,7 @@ class PairwisePlan:
                             payload = group.peer_traffic.payload(
                                 source_index, destination_index)
                             if (payload and len(group.topology.route(
-                                    source, destination)) != 1):
+                                    source, destination, rail_id=group_rail)) != 1):
                                 raise ModelingError(
                                     "pairwise_collective_multihop_requires_"
                                     "store_forward_declaration")
@@ -397,7 +398,8 @@ class PairwisePlan:
                         continue
                     for destination in group.ranks:
                         if (source != destination
-                                and len(group.topology.route(source, destination)) != 1):
+                                and len(group.topology.route(
+                                    source, destination, rail_id=group_rail)) != 1):
                             raise ModelingError(
                                 "pairwise_collective_multihop_requires_"
                                 "store_forward_declaration")

@@ -723,6 +723,7 @@ class _CohortMixin(_CohortNativeMixin):
                 dict(item.metadata).get("steps"),
                 dict(item.metadata).get("peer_traffic"),
                 dict(item.metadata).get("peer_volume_basis", "per_rank"),
+                dict(item.metadata).get("transport_rail_id"),
             )
 
         for item in participants:
@@ -862,6 +863,8 @@ class _CohortMixin(_CohortNativeMixin):
             if str(exc).startswith("joint_collective_group_membership"):
                 return False
             raise
+        if band_plan is not None:
+            band_plan.register_die_injection_resources(self.engine)
         if band_plan is None or not set(band_plan.accounting().wire_by_resource).issubset(self.engine.resources):
             return False
         active_items = (first,) if symmetric_canonical_only else tuple(participants)

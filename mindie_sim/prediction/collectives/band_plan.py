@@ -31,6 +31,7 @@ import math
 from mindie_sim.schema.common import ModelingError
 from ..communication import CommunicationWork
 from ..mechanism import Work
+from .ports import die_injection_resource_name
 from .protocol import (
     MS_PER_S,
     LoweredCollective,
@@ -216,6 +217,28 @@ def api_bytes_from_link_volume(
     return vol
 
 
+def _hop_accounting_resources(
+    hop,
+    namespace: str,
+    inj_ceiling: float | None,
+    extra_rates: dict[str, float],
+) -> tuple[str, ...]:
+    """Return simultaneous byte-denominated resources occupied by one lowered hop."""
+    if inj_ceiling is None:
+        return hop.resources
+    out = list(hop.resources)
+    ceil = float(inj_ceiling)
+    tx_name = die_injection_resource_name(hop.source, "tx", namespace=namespace)
+    if tx_name not in out:
+        out.append(tx_name)
+    extra_rates[tx_name] = ceil
+    rx_name = die_injection_resource_name(hop.destination, "rx", namespace=namespace)
+    if rx_name not in out:
+        out.append(rx_name)
+    extra_rates[rx_name] = ceil
+    return tuple(out)
+
+
 @dataclass(frozen=True)
 class BandCollectiveGroup:
     """One physical group inside a ``BandCollectivePlan``."""
@@ -285,13 +308,60 @@ class BandCollectivePlan:
                                 "ring_collective_multihop_requires_store_forward_declaration"
                             )
 
-    def accounting(self):
+    def register_die_injection_resources(self, engine) -> None:
+        """Ensure ``engine`` owns declared ``ub_inj:*`` rows for hops whose links exist."""
+        from ..engine import Resource
+        from .protocol import UB_DIE_INJECTION_CEILING_BYTES_PER_MS
+
+        new_res = []
+        seen: set[str] = set()
+        for group in self.groups:
+            lowered = group.lowered
+            ceil = lowered.die_injection_ceiling_bytes_per_ms
+            ns = str(getattr(lowered, "namespace", "") or "")
+            hops = (
+                hop
+                for phase in lowered.phases
+                for transfer in phase.transfers
+                for hop in transfer.hops
+            )
+            for hop in hops:
+                link_resources = {
+                    res for res in hop.resources
+                    if not (res.startswith("ub_inj:") or ":ub_inj:" in res)
+                }
+                if not link_resources.issubset(engine.resources):
+                    continue
+                hop_inj_rate = ceil
+                if hop_inj_rate is None and any(
+                    res.startswith("ub_inj:") or ":ub_inj:" in res
+                    for res in hop.resources
+                ):
+                    hop_inj_rate = UB_DIE_INJECTION_CEILING_BYTES_PER_MS
+                if hop_inj_rate is None:
+                    continue
+                for rank, direction in ((hop.source, "tx"), (hop.destination, "rx")):
+                    rname = die_injection_resource_name(rank, direction, namespace=ns)
+                    if rname not in engine.resources and rname not in seen:
+                        seen.add(rname)
+                        new_res.append(Resource(rname, float(hop_inj_rate), "bytes"))
+        if new_res:
+            engine.extend(tuple(new_res))
+
+    def accounting(self, *, source_ranks=None):
         """Derive wire, useful, framing, and setup accounting from this plan."""
+        sources = (
+            None if source_ranks is None
+            else frozenset(int(rank) for rank in source_ranks)
+        )
+        if sources is not None and set(self.ranks) <= sources:
+            sources = None
         useful_by_rank: dict[int, float] = {}
         useful_by_res: dict[str, float] = {}
         wire_by_res: dict[str, float] = {}
         transactions: dict[str, int] = {}
         transaction_frames: dict[str, tuple[int, int]] = {}
+        extra_rates: dict[str, float] = {}
         message_count = 0
         routed_useful = 0.0
         physical_wire = 0.0
@@ -301,6 +371,8 @@ class BandCollectivePlan:
         for group in self.groups:
             lowered = group.lowered
             band = lowered.band
+            ns = str(getattr(lowered, "namespace", "") or "")
+            inj_ceil = lowered.die_injection_ceiling_bytes_per_ms
             frame_pair = (
                 int(band.payload_bytes_per_frame),
                 int(band.wire_bytes_per_frame),
@@ -311,10 +383,15 @@ class BandCollectivePlan:
                 else (band.startup_us / MS_PER_S if band.startup_scope == "hop" else 0.0)
             )
             group_setup = lowered.collective_startup_us / MS_PER_S
+            group_matched = sources is None
             for phase in lowered.phases:
-                group_setup += phase.startup_us / MS_PER_S
                 round_latencies: dict[int, float] = {}
+                phase_matched = sources is None
                 for transfer in phase.transfers:
+                    if sources is not None and transfer.source not in sources:
+                        continue
+                    group_matched = True
+                    phase_matched = True
                     message_count += 1
                     useful_by_rank[transfer.source] = (
                         useful_by_rank.get(transfer.source, 0.0)
@@ -324,7 +401,10 @@ class BandCollectivePlan:
                     for hop in transfer.hops:
                         routed_useful += transfer.payload_bytes
                         physical_wire += transfer.wire_bytes
-                        for res in hop.resources:
+                        hop_resources = _hop_accounting_resources(
+                            hop, ns, inj_ceil, extra_rates,
+                        )
+                        for res in hop_resources:
                             useful_by_res[res] = (
                                 useful_by_res.get(res, 0.0) + transfer.payload_bytes
                             )
@@ -346,8 +426,11 @@ class BandCollectivePlan:
                     round_latencies[transfer.round_index] = max(
                         round_latencies.get(transfer.round_index, 0.0), path_lat
                     )
-                group_setup += sum(round_latencies.values())
-            setup_ms = max(setup_ms, group_setup)
+                if phase_matched:
+                    group_setup += phase.startup_us / MS_PER_S
+                    group_setup += sum(round_latencies.values())
+            if group_matched:
+                setup_ms = max(setup_ms, group_setup)
 
         work = CommunicationWork(
             useful_by_rank,
@@ -361,7 +444,9 @@ class BandCollectivePlan:
             physical_wire,
             max_path_latency,
         )
-        return self.topology._work_with_capacity(work)
+        return self.topology._work_with_capacity(
+            work, extra_rates=extra_rates or None,
+        )
 
     def cache_key(self) -> tuple:
         """Return a stable structural key for Execution program caching."""

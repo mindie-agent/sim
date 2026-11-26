@@ -47,8 +47,10 @@ from .ports import (
     PairKey,
     PortKey,
     SwitchKey,
+    _resolved_rail_id,
     build_shared_port_resources,
     build_shared_switch_resources,
+    die_injection_resource_name,
     find_shared_port_keys,
     find_shared_switch_keys,
     link_pair_key,
@@ -116,6 +118,45 @@ class _LinkHyperedge:
     link_name: str
     members: tuple[int, ...]
     member_nodes: tuple[int, ...] | None = None
+
+
+def _normalize_rail_id(rail_id: int | str | None) -> int | str | None:
+    if rail_id is None:
+        return None
+    if isinstance(rail_id, bool):
+        raise ModelingError(f"route_rail_id_invalid:{rail_id!r}")
+    if isinstance(rail_id, int):
+        if rail_id < 0:
+            raise ModelingError(f"route_rail_id_invalid:{rail_id!r}")
+        return int(rail_id)
+    if isinstance(rail_id, str):
+        stripped = rail_id.strip()
+        if not stripped:
+            raise ModelingError(f"route_rail_id_invalid:{rail_id!r}")
+        return stripped
+    raise ModelingError(f"route_rail_id_invalid:{rail_id!r}")
+
+
+def _trace_sssp_closure(
+    parents: Mapping[int, tuple[int, str]],
+    src: int,
+    active: frozenset[int],
+    routed_links: set[str],
+    routed_pairs: dict[str, set[tuple[int, int]]],
+    routed_endpoints: dict[str, set[int]],
+) -> None:
+    traced = {src}
+    for dst in active:
+        cur = dst
+        while cur not in traced and cur in parents:
+            traced.add(cur)
+            prev, link_name = parents[cur]
+            routed_links.add(link_name)
+            routed_pairs.setdefault(link_name, set()).add((prev, cur))
+            endpoints = routed_endpoints.setdefault(link_name, set())
+            endpoints.add(prev)
+            endpoints.add(cur)
+            cur = prev
 
 
 def _is_cross_node_link(link, channel_decl: Mapping | None = None) -> bool:
@@ -288,11 +329,21 @@ class Topology(_TopologyPlansMixin):
             self._node_of,
             channel_decls=self._channel_decls,
         )
+        self._link_rail: dict[str, int | str] = {
+            name: _resolved_rail_id(link, self._channel_decls.get(link.channel))
+            for name, link in self.links.items()
+        }
         self._resource_cache = None
         self._resource_rates = None
         self._rank_hyperedges: dict[int, tuple[tuple[_LinkHyperedge, int | None], ...]] | None = None
         self._sssp_parents: dict[int, dict[int, tuple[int, str]]] = {}
         self._sssp_entry_count = 0
+        self._rail_hyperedges: dict[
+            int | str, dict[int, tuple[tuple[_LinkHyperedge, int | None], ...]]
+        ] = {}
+        self._rail_sssp_parents: dict[tuple[int | str, int], dict[int, tuple[int, str]]] = {}
+        self._rail_sssp_entry_count = 0
+        self._rail_routes: dict[tuple[int | str, int, int], tuple[tuple[str, int, int], ...]] = {}
         self._transport_bindings = {}
         self._mesh_plans = {}
         self._oneshot_plans = {}
@@ -743,19 +794,27 @@ class Topology(_TopologyPlansMixin):
             return launch_us / MS_PER_S
         return self._vector_invocation_us / MS_PER_S
 
-    def _work_with_capacity(self, work) -> TopologyCommunicationWork:
+    def _work_with_capacity(
+        self, work, *, extra_rates: Mapping[str, float] | None = None,
+    ) -> TopologyCommunicationWork:
         rates = self._resource_rates
         if rates is None:
             self.resources()
             rates = self._resource_rates
+        cap_map = {
+            name: rates[name] for name in work.wire_by_resource
+            if name in rates
+        }
+        if extra_rates is not None:
+            for name, rate in extra_rates.items():
+                if name in work.wire_by_resource and name not in cap_map:
+                    cap_map[name] = float(rate)
         return TopologyCommunicationWork(
             work.useful_by_rank, work.useful_by_resource, work.wire_by_resource,
             work.transactions_by_resource, work.transaction_frames, work.messages,
             work.setup_ms, work.routed_useful_bytes, work.physical_wire_bytes,
             work.path_latency_ms,
-            capacity_by_resource={
-                name: rates[name] for name in work.wire_by_resource
-                if name in rates})
+            capacity_by_resource=cap_map)
 
     def location(self, rank: int) -> dict:
         """Return the declared die/package/node placement of one rank."""
@@ -782,6 +841,23 @@ class Topology(_TopologyPlansMixin):
     def _has_endpoint_rate(self, link, rank: int) -> bool:
         return link.endpoint_capacity_bytes_per_ms(int(rank)) is not None
 
+    def _is_ub_mesh_per_pair(self, link) -> bool:
+        if link.semantics != "per_pair":
+            return False
+        return any(
+            band.protocol.rsplit("_", 1)[0] == "ub_mesh"
+            for band in self.link_protocol_bands(link.name)
+        )
+
+    @property
+    def distinct_rails(self) -> tuple[int | str, ...]:
+        """Declared distinct physical rail identifiers across topology links."""
+        return tuple(dict.fromkeys(self._link_rail.values()))
+
+    def link_rail(self, link_name: str) -> int | str:
+        """Return the normalized physical rail identifier for ``link_name``."""
+        return self._link_rail[link_name]
+
     def _active_route_closure(
         self, active: frozenset[int],
     ) -> tuple[set[str], dict[str, set[tuple[int, int]]], dict[str, set[int]]]:
@@ -790,26 +866,26 @@ class Topology(_TopologyPlansMixin):
         routed_endpoints: dict[str, set[int]] = {}
         if len(active) <= 1:
             return routed_links, routed_pairs, routed_endpoints
+        distinct_rails = self.distinct_rails
+        multi_rail = len(distinct_rails) > 1
         for src in active:
-            parents = self._sssp_for(src)
-            traced = {src}
-            for dst in active:
-                cur = dst
-                while cur not in traced and cur in parents:
-                    traced.add(cur)
-                    prev, link_name = parents[cur]
-                    routed_links.add(link_name)
-                    routed_pairs.setdefault(link_name, set()).add((prev, cur))
-                    endpoints = routed_endpoints.setdefault(link_name, set())
-                    endpoints.add(prev)
-                    endpoints.add(cur)
-                    cur = prev
+            _trace_sssp_closure(
+                self._sssp_for(src), src, active,
+                routed_links, routed_pairs, routed_endpoints,
+            )
+            if multi_rail:
+                for rail in distinct_rails:
+                    _trace_sssp_closure(
+                        self._sssp_for(src, rail_id=rail), src, active,
+                        routed_links, routed_pairs, routed_endpoints,
+                    )
         return routed_links, routed_pairs, routed_endpoints
 
     def _build_resources(self, active: frozenset[int] | None = None):
         result = []
         included_shared_ports: dict[PortKey, float] = {}
         included_shared_switches: dict[SwitchKey, float] = {}
+        ub_inj_ranks: set[int] = set()
         if active is not None:
             routed_links, routed_pairs, routed_endpoints = self._active_route_closure(active)
         else:
@@ -823,13 +899,21 @@ class Topology(_TopologyPlansMixin):
             if link.semantics == "per_pair":
                 link_routed_pairs = routed_pairs.get(link.name, ())
                 link_routed_endpoints = routed_endpoints.get(link.name, ())
+                emitted_pairs = [
+                    (source, destination)
+                    for source in link.members for destination in link.members
+                    if source != destination
+                    and (active is None or source in active or destination in active
+                         or (source, destination) in link_routed_pairs)
+                ]
                 result.extend(Resource(
                     f"{self.namespace}link:{link.name}:pair{source}>{destination}",
                     link.capacity_bytes_per_ms, "bytes",
-                ) for source in link.members for destination in link.members
-                    if source != destination
-                    and (active is None or source in active or destination in active
-                         or (source, destination) in link_routed_pairs))
+                ) for source, destination in emitted_pairs)
+                if self._is_ub_mesh_per_pair(link):
+                    for source, destination in emitted_pairs:
+                        ub_inj_ranks.add(int(source))
+                        ub_inj_ranks.add(int(destination))
                 result.extend(self._endpoint_resource(link, direction, rank)
                               for rank in endpoint_ranks
                               if active is None or rank in active or rank in link_routed_endpoints
@@ -891,6 +975,16 @@ class Topology(_TopologyPlansMixin):
                     included_shared_switches, namespace=self.namespace
                 )
             )
+        if ub_inj_ranks:
+            from .protocol import UB_DIE_INJECTION_CEILING_BYTES_PER_MS
+
+            for rank in sorted(ub_inj_ranks):
+                for direction in ("tx", "rx"):
+                    result.append(Resource(
+                        die_injection_resource_name(rank, direction, namespace=self.namespace),
+                        UB_DIE_INJECTION_CEILING_BYTES_PER_MS,
+                        "bytes",
+                    ))
         return tuple(result)
 
     def resources(self):
@@ -913,7 +1007,7 @@ class Topology(_TopologyPlansMixin):
         return cache[active]
 
     def _build_hyperedges(
-        self,
+        self, *, rail_id: int | str | None = None,
     ) -> dict[int, tuple[tuple[_LinkHyperedge, int | None], ...]]:
         rank_edges: dict[int, list[tuple[_LinkHyperedge, int | None]]] = {}
         node_cache: dict[int, int] = {}
@@ -948,6 +1042,8 @@ class Topology(_TopologyPlansMixin):
                     rank_edges.setdefault(member, []).append(entry)
 
         for link in self._ordered_links:
+            if rail_id is not None and self._link_rail.get(link.name) != rail_id:
+                continue
             scope = self._link_scope[link.name]
             if scope in _NON_FABRIC_EXPLICIT_SCOPES:
                 continue
@@ -984,13 +1080,25 @@ class Topology(_TopologyPlansMixin):
                 _register_clique(link_name, members)
         return {rank: tuple(entries) for rank, entries in rank_edges.items()}
 
-    def _sssp_for(self, source: int) -> dict[int, tuple[int, str]]:
-        parents = self._sssp_parents.get(source)
-        if parents is not None:
-            return parents
-        if self._rank_hyperedges is None:
-            self._rank_hyperedges = self._build_hyperedges()
-        rank_edges = self._rank_hyperedges
+    def _sssp_for(
+        self, source: int, *, rail_id: int | str | None = None,
+    ) -> dict[int, tuple[int, str]]:
+        if rail_id is None:
+            parents = self._sssp_parents.get(source)
+            if parents is not None:
+                return parents
+            if self._rank_hyperedges is None:
+                self._rank_hyperedges = self._build_hyperedges()
+            rank_edges = self._rank_hyperedges
+        else:
+            rkey = (rail_id, source)
+            parents = self._rail_sssp_parents.get(rkey)
+            if parents is not None:
+                return parents
+            rank_edges = self._rail_hyperedges.get(rail_id)
+            if rank_edges is None:
+                rank_edges = self._build_hyperedges(rail_id=rail_id)
+                self._rail_hyperedges[rail_id] = rank_edges
         parents = {}
         seen = {source}
         expanded_cliques: set[int] = set()
@@ -1022,24 +1130,37 @@ class Topology(_TopologyPlansMixin):
                             queue.append(neighbor)
         entry_len = len(parents) + 1
         if entry_len <= MAX_SSSP_CACHE_ENTRIES and MAX_ROUTE_CACHE_ENTRIES > 0:
-            if (len(self._sssp_parents) >= MAX_ROUTE_CACHE_ENTRIES
-                    or self._sssp_entry_count + entry_len > MAX_SSSP_CACHE_ENTRIES):
-                self._sssp_parents.clear()
-                self._sssp_entry_count = 0
-            self._sssp_parents[source] = parents
-            self._sssp_entry_count += entry_len
+            if rail_id is None:
+                if (len(self._sssp_parents) >= MAX_ROUTE_CACHE_ENTRIES
+                        or self._sssp_entry_count + entry_len > MAX_SSSP_CACHE_ENTRIES):
+                    self._sssp_parents.clear()
+                    self._sssp_entry_count = 0
+                self._sssp_parents[source] = parents
+                self._sssp_entry_count += entry_len
+            else:
+                if (len(self._rail_sssp_parents) >= MAX_ROUTE_CACHE_ENTRIES
+                        or self._rail_sssp_entry_count + entry_len > MAX_SSSP_CACHE_ENTRIES):
+                    self._rail_sssp_parents.clear()
+                    self._rail_sssp_entry_count = 0
+                self._rail_sssp_parents[(rail_id, source)] = parents
+                self._rail_sssp_entry_count += entry_len
         return parents
 
     def _try_route(
-        self, source: int, destination: int,
+        self, source: int, destination: int, *, rail_id: int | str | None = None,
     ) -> tuple[tuple[str, int, int], ...] | None:
+        rail_id = _normalize_rail_id(rail_id)
         if source == destination:
             return ()
-        key = (source, destination)
-        cached = self.routes.get(key)
+        if rail_id is None:
+            key = (source, destination)
+            cached = self.routes.get(key)
+        else:
+            rkey = (rail_id, source, destination)
+            cached = self._rail_routes.get(rkey)
         if cached is not None:
             return cached
-        parents = self._sssp_for(source)
+        parents = self._sssp_for(source, rail_id=rail_id)
         if destination not in parents:
             return None
         hops: list[tuple[str, int, int]] = []
@@ -1050,19 +1171,30 @@ class Topology(_TopologyPlansMixin):
             cur = prev
         hops.reverse()
         path = tuple(hops)
-        if len(self.routes) < MAX_ROUTE_CACHE_ENTRIES:
-            self.routes[key] = path
+        if rail_id is None:
+            if len(self.routes) < MAX_ROUTE_CACHE_ENTRIES:
+                self.routes[key] = path
+        elif len(self._rail_routes) < MAX_ROUTE_CACHE_ENTRIES:
+            self._rail_routes[rkey] = path
         return path
 
-    def route(self, source, destination):
-        key = (source, destination)
-        cached = self.routes.get(key)
+    def route(self, source, destination, *, rail_id=None):
+        rail_id = _normalize_rail_id(rail_id)
+        if rail_id is None:
+            key = (source, destination)
+            cached = self.routes.get(key)
+        else:
+            cached = self._rail_routes.get((rail_id, source, destination))
         if cached is not None:
             return cached
-        path = self._try_route(source, destination)
+        path = self._try_route(source, destination, rail_id=rail_id)
         if path is None:
+            if rail_id is not None:
+                raise ValueError(
+                    f"physical_route_missing:{source}->{destination}:rail={rail_id}"
+                )
             raise ValueError(f"physical_route_missing:{source}->{destination}")
-        if source == destination and len(self.routes) < MAX_ROUTE_CACHE_ENTRIES:
+        if rail_id is None and source == destination and len(self.routes) < MAX_ROUTE_CACHE_ENTRIES:
             self.routes[key] = path
         return path
 
@@ -1222,6 +1354,7 @@ class Topology(_TopologyPlansMixin):
         family = metadata.get("collective", op.family)
         axis = metadata.get("group_axis", "tp")
         source_stage = int(metadata.get("source_stage", op.stage))
+        rail_id = _normalize_rail_id(metadata.get("transport_rail_id"))
         sources = self.ranks(replica, source_stage)
         alltoall = str(family).strip().lower() in {"alltoall", "alltoallv"}
         if alltoall:
@@ -1256,7 +1389,7 @@ class Topology(_TopologyPlansMixin):
                         payload = peer.payload(index, destination_index)
                         if payload:
                             yield MessageFlow(
-                                source, destination, payload), rounds
+                                source, destination, payload, rail_id=rail_id), rounds
             return
         if family == "alltoallv":
             raise ModelingError(
@@ -1274,7 +1407,7 @@ class Topology(_TopologyPlansMixin):
                 )
             for source, destination in zip(sources, self.ranks(replica, stage)):
                 if source != destination:
-                    yield MessageFlow(source, destination, volume), 1
+                    yield MessageFlow(source, destination, volume, rail_id=rail_id), 1
             return
         for group in self.groups(axis, replica, source_stage, metadata=metadata):
             if len(group) <= 1:
@@ -1291,10 +1424,14 @@ class Topology(_TopologyPlansMixin):
                 if family in {"alltoall", "alltoallv"}:
                     for destination in group:
                         if source != destination:
-                            yield MessageFlow(source, destination, volume / (len(group) - 1)), rounds
+                            yield MessageFlow(
+                                source, destination, volume / (len(group) - 1),
+                                rail_id=rail_id,
+                            ), rounds
                 else:
                     yield MessageFlow(
                         source, group[(index + 1) % len(group)], volume / rounds, rounds,
+                        rail_id=rail_id,
                     ), rounds
 
     def resource(self, link, source, destination):
@@ -1320,6 +1457,9 @@ class Topology(_TopologyPlansMixin):
         rx_shared = self._link_shared_ports.get((link.name, int(destination), "rx"))
         if rx_shared is not None:
             names.append(rx_shared.resource_name(self.namespace))
+        if self._is_ub_mesh_per_pair(link):
+            names.append(die_injection_resource_name(source, "tx", namespace=self.namespace))
+            names.append(die_injection_resource_name(destination, "rx", namespace=self.namespace))
         if link.switch_capacity_bytes_per_ms is not None:
             sw_key = self._link_shared_switches.get(link.name)
             if sw_key is not None:
@@ -1331,7 +1471,9 @@ class Topology(_TopologyPlansMixin):
     def route_message(self, flow):
         """Frame each physical hop once, shared by accounting and execution."""
         hops = []
-        for name, source, destination in self.route(flow.source, flow.destination):
+        for name, source, destination in self.route(
+            flow.source, flow.destination, rail_id=flow.rail_id,
+        ):
             link = self.links[name]
             wire, transactions = flow.on_link(link)
             frame = ((link.transaction_bytes, link.transaction_bytes + link.protocol_overhead_bytes)
