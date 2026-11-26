@@ -121,7 +121,7 @@ def _weighted_contiguous_rect_partition(rects: tuple[_FiaRect, ...], owners: int
     n_rects = len(rects)
     if n_rects <= 0 or owners <= 0:
         return ()
-    weights = [max(1, r.end - r.first) for r in rects]
+    weights = [max(1, r.tile_count) for r in rects]
     total = sum(weights)
     out: list[tuple[int, ...]] = []
     idx = 0
@@ -173,6 +173,18 @@ class _FiaRect:
     rects_per_head: int = 1
     prev_touched_start: int = 0
     prev_touched_end: int = 0
+    tile_ranges: tuple[tuple[int, int], ...] = ()
+    prev_touched_spans: tuple[tuple[int, int], ...] = ()
+
+    @property
+    def tile_spans(self) -> tuple[tuple[int, int], ...]:
+        if self.tile_ranges:
+            return self.tile_ranges
+        return ((self.first, self.end),) if self.end > self.first else ()
+
+    @property
+    def tile_count(self) -> int:
+        return sum(hi - lo for lo, hi in self.tile_spans)
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,33 +252,34 @@ def _balanced_core_segments(
     rects: tuple[_FiaRect, ...], num_owners: int,
 ) -> tuple[tuple[_CoreSegment, ...], tuple[int, ...]]:
     """Partition all S2 tiles across num_owners AICs evenly, matching split_core balance."""
-    total_tiles = sum(max(0, r.end - r.first) for r in rects)
+    spans = [(r_idx, lo, hi) for r_idx, r in enumerate(rects) for lo, hi in r.tile_spans if hi > lo]
+    total_tiles = sum(hi - lo for _, lo, hi in spans)
     if total_tiles <= 0 or num_owners <= 0:
         return (), (1,) * len(rects)
     base, extra = divmod(total_tiles, num_owners)
     segments: list[_CoreSegment] = []
     splits_by_rect = [0] * len(rects)
-    r_idx = 0
-    t_cursor = rects[0].first if rects else 0
+    s_idx = 0
+    t_cursor = spans[0][1]
     for owner_idx in range(num_owners):
         quota = base + (1 if owner_idx < extra else 0)
-        while quota > 0 and r_idx < len(rects):
-            r = rects[r_idx]
-            avail = r.end - t_cursor
+        while quota > 0 and s_idx < len(spans):
+            r_idx, _, s_hi = spans[s_idx]
+            avail = s_hi - t_cursor
             if avail <= 0:
-                r_idx += 1
-                if r_idx < len(rects):
-                    t_cursor = rects[r_idx].first
+                s_idx += 1
+                if s_idx < len(spans):
+                    t_cursor = spans[s_idx][1]
                 continue
             take = min(quota, avail)
             segments.append(_CoreSegment(owner_idx, r_idx, t_cursor, t_cursor + take))
             splits_by_rect[r_idx] += 1
             t_cursor += take
             quota -= take
-            if t_cursor >= r.end:
-                r_idx += 1
-                if r_idx < len(rects):
-                    t_cursor = rects[r_idx].first
+            if t_cursor >= s_hi:
+                s_idx += 1
+                if s_idx < len(spans):
+                    t_cursor = spans[s_idx][1]
     return tuple(segments), tuple(max(1, s) for s in splits_by_rect)
 
 
@@ -275,6 +288,96 @@ def _compact_s2_pipeline(context, n_tiles: int, slots: int, tile_fn: Callable[[i
     return compact_periodic_pipeline(
         context, n_tiles, slots, tile_fn, head=1, tail=1, threshold=COMPACT_TILE_THRESHOLD,
     )
+
+
+def _merge_intervals(intervals: list[tuple[int, int]]) -> tuple[tuple[int, int], ...]:
+    """Merge sorted/unsorted half-open ``[lo, hi)`` intervals into disjoint spans."""
+    ordered = sorted((lo, hi) for lo, hi in intervals if hi > lo)
+    if not ordered:
+        return ()
+    merged: list[tuple[int, int]] = [ordered[0]]
+    for lo, hi in ordered[1:]:
+        prev_lo, prev_hi = merged[-1]
+        if lo <= prev_hi:
+            merged[-1] = (prev_lo, max(prev_hi, hi))
+        else:
+            merged.append((lo, hi))
+    return tuple(merged)
+
+
+def _slice_query_spans(
+    spans: tuple[tuple[int, int], ...], first: int, last: int,
+) -> tuple[tuple[int, int], ...]:
+    """Return half-open KV coordinate spans covered by local query slice ``[first, last]``."""
+    out: list[tuple[int, int]] = []
+    offset = 0
+    for s_lo, s_hi in spans:
+        width = s_hi - s_lo
+        ov_lo = max(first, offset)
+        ov_hi = min(last + 1, offset + width)
+        if ov_hi > ov_lo:
+            out.append((s_lo + (ov_lo - offset), s_lo + (ov_hi - offset)))
+        offset += width
+    return tuple(out)
+
+
+def _kv_intervals_for_spans(
+    q_spans: tuple[tuple[int, int], ...],
+    *,
+    kv: int,
+    causal: bool,
+    visible: int,
+    window_size: int,
+    selected_tokens: int | None,
+) -> tuple[tuple[int, int], ...]:
+    """Map query position spans ``[p_lo, p_hi)`` to merged visible KV intervals."""
+    if visible <= 0 or not q_spans:
+        return ()
+    raw: list[tuple[int, int]] = []
+    if causal:
+        for p_lo, p_hi in q_spans:
+            lo = max(0, p_lo + 1 - visible)
+            hi = min(kv, max(0, p_hi))
+            if hi > lo:
+                raw.append((lo, hi))
+        return _merge_intervals(raw)
+    if window_size:
+        if selected_tokens is not None and 0 < selected_tokens < 2 * window_size - 1:
+            left = min(window_size - 1, (selected_tokens - 1) // 2)
+            right = min(window_size, selected_tokens - left)
+        else:
+            left = window_size - 1
+            right = window_size
+        for p_lo, p_hi in q_spans:
+            lo = max(0, p_lo - left)
+            hi = min(kv, (p_hi - 1) + right)
+            if hi > lo:
+                raw.append((lo, hi))
+        return _merge_intervals(raw)
+    return ((kv - visible, kv),) if visible > 0 else ()
+
+
+def _merge_tile_ranges(
+    kv_intervals: tuple[tuple[int, int], ...], s2_tile: int,
+) -> tuple[tuple[int, int], ...]:
+    """Project KV token intervals ``[lo, hi)`` onto merged S2 tile ranges."""
+    return _merge_intervals([
+        (lo // s2_tile, ceil(hi / s2_tile)) for lo, hi in kv_intervals if hi > lo
+    ])
+
+
+def _tile_query_bounds(
+    row: int, m: int, queries: int, group: int, token_major: bool,
+) -> tuple[int, int, int]:
+    """Return ``(first, last, prev_last)`` local query indices for a tile row."""
+    if token_major:
+        first, last = row // group, (row + m - 1) // group
+        prev_last = (row - 1) // group if row > 0 else 0
+        return first, last, prev_last
+    prev_last = min(queries - 1, row - 1) if row > 0 else 0
+    if row // queries == (row + m - 1) // queries:
+        return row % queries, (row + m - 1) % queries, prev_last
+    return 0, queries - 1, prev_last
 
 
 @dataclass(frozen=True, slots=True)
@@ -311,34 +414,40 @@ class _FiaLoop:
         row = tile * self.m_tile
         m = min(self.m_tile, queries * group - row)
         visible = min(kv, kv if c.selected_tokens is None else c.selected_tokens, c.window_size or kv)
-        prev_start, prev_end = 0, 0
-        if c.causal and c.sequences:
-            token_major = (self.ctx.layout or c.kv_layout) in TOKEN_MAJOR_LAYOUTS
-            if token_major:
-                first, last = row // group, (row + m - 1) // group
-            elif row // queries == (row + m - 1) // queries:
-                first, last = row % queries, (row + m - 1) % queries
-            else:
-                first, last = 0, queries - 1
-            start = max(0, kv - queries + first + 1 - visible)
-            end = max(0, kv - queries + last + 1)
+        spans = (
+            c.sequence_query_spans[sequence]
+            if (c.sequences and sequence < len(c.sequence_query_spans)) else ()
+        )
+        prev_spans: tuple[tuple[int, int], ...] = ()
+        if c.sequences and (c.causal or c.window_size):
+            token_major = (self.ctx.layout or c.kv_layout) != "BNSD"
+            first, last, prev_last = _tile_query_bounds(row, m, queries, group, token_major)
+            eff_spans = spans if spans else ((kv - queries, kv),)
+            cur_q_spans = _slice_query_spans(eff_spans, first, last)
+            kv_intervals = _kv_intervals_for_spans(
+                cur_q_spans, kv=kv, causal=c.causal, visible=visible,
+                window_size=c.window_size, selected_tokens=c.selected_tokens,
+            )
             if tile > 0:
-                prev_start = max(0, kv - queries + 1 - visible)
-                if token_major:
-                    prev_end = max(0, kv - queries + ((row - 1) // group) + 1)
-                elif (row - 1) // queries == row // queries:
-                    prev_end = max(0, kv - queries + ((row - 1) % queries) + 1)
-                else:
-                    prev_end = kv
+                prev_q_spans = _slice_query_spans(eff_spans, 0, prev_last)
+                prev_spans = _kv_intervals_for_spans(
+                    prev_q_spans, kv=kv, causal=c.causal, visible=visible,
+                    window_size=c.window_size, selected_tokens=c.selected_tokens,
+                )
         else:
-            start, end = kv - visible, kv
+            kv_intervals = ((kv - visible, kv),) if visible > 0 else ()
             if tile > 0:
-                prev_start, prev_end = start, end
+                prev_spans = kv_intervals
+        tile_ranges = _merge_tile_ranges(kv_intervals, self.s2_tile) if visible else ()
+        t_first = tile_ranges[0][0] if tile_ranges else 0
+        t_end = tile_ranges[-1][1] if tile_ranges else t_first
+        prev_start = prev_spans[0][0] if prev_spans else 0
+        prev_end = prev_spans[-1][1] if prev_spans else 0
         return _FiaRect(
-            sequence, m, head, kv, row, start // self.s2_tile,
-            ceil(end / self.s2_tile) if visible else start // self.s2_tile,
+            sequence, m, head, kv, row, t_first, t_end,
             rect_in_head=tile, rects_per_head=rects_per_head,
             prev_touched_start=prev_start, prev_touched_end=prev_end,
+            tile_ranges=tile_ranges, prev_touched_spans=prev_spans,
         )
 
     def _kv(self, rect, start, n, dim, width, offset, tensor):
@@ -377,7 +486,15 @@ class _FiaLoop:
         known_addresses = c.block_table or (c.kv_layout not in PAGED_LAYOUTS and self.kv_offsets)
         memory = (plan, hbm_rules, tensor) if c.kv_tensor_id and known_addresses else None
         if memory is None and rect.rect_in_head > 0 and self.kv_reuse_hit_frac > 0.0 and orig_n > 0:
-            reused_toks = max(0, min(orig_start + orig_n, rect.prev_touched_end) - max(orig_start, rect.prev_touched_start))
+            prev_spans = (
+                rect.prev_touched_spans
+                if rect.prev_touched_spans
+                else ((rect.prev_touched_start, rect.prev_touched_end),)
+            )
+            reused_toks = sum(
+                max(0, min(orig_start + orig_n, p_hi) - max(orig_start, p_lo))
+                for p_lo, p_hi in prev_spans
+            )
             eff_hit_frac = (reused_toks / float(orig_n)) * self.kv_reuse_hit_frac
             if eff_hit_frac > 0.0:
                 hit_bytes = int(round(copy * eff_hit_frac))
@@ -490,12 +607,22 @@ class _FiaLoop:
         return tuple(stages)
 
     def ranges(self, rect):
-        tiles = rect.end - rect.first
+        spans = rect.tile_spans
+        tiles = rect.tile_count
         splits = min(self.effective_splits, max(1, tiles))
         if self.ctx.requests:
             splits = min(splits, len(self.owners))
+        if not spans:
+            yield range(0, 0)
+            return
+        if len(spans) == 1:
+            t_lo, _ = spans[0]
+            for split in range(splits):
+                yield range(t_lo + tiles * split // splits, t_lo + tiles * (split + 1) // splits)
+            return
+        all_tiles = tuple(t for lo, hi in spans for t in range(lo, hi))
         for split in range(splits):
-            yield range(rect.first + tiles * split // splits, rect.first + tiles * (split + 1) // splits)
+            yield all_tiles[tiles * split // splits:tiles * (split + 1) // splits]
 
     def query_load(self, rect, tiles):
         c = self.contract
@@ -565,17 +692,21 @@ class _FiaLoop:
         paged = self.contract.kv_layout in PAGED_LAYOUTS
         page = self.contract.block_size if paged else self.s2_tile
         has_live_mem = bool(self.contract.kv_tensor_id and (self.contract.block_table or self.ctx.requests))
+        contiguous_tiles = (n_tiles <= 1) or (tiles[-1] - tiles[0] + 1 == n_tiles)
         reuse_uniform = True
         if (not has_live_mem and rect.rect_in_head > 0
                 and self.kv_reuse_hit_frac > 0.0 and n_tiles > 2):
+            prev_spans = (
+                rect.prev_touched_spans
+                if rect.prev_touched_spans
+                else ((rect.prev_touched_start, rect.prev_touched_end),)
+            )
             inner_start = tiles[1] * self.s2_tile
             inner_end = min((tiles[-2] + 1) * self.s2_tile, rect.kv)
-            all_inside = (rect.prev_touched_start <= inner_start
-                          and inner_end <= rect.prev_touched_end)
-            all_outside = (inner_end <= rect.prev_touched_start
-                           or inner_start >= rect.prev_touched_end)
+            all_inside = any(p_lo <= inner_start and inner_end <= p_hi for p_lo, p_hi in prev_spans)
+            all_outside = all(inner_end <= p_lo or inner_start >= p_hi for p_lo, p_hi in prev_spans)
             reuse_uniform = all_inside or all_outside
-        uniform_interior = (not has_live_mem) and reuse_uniform and (
+        uniform_interior = contiguous_tiles and (not has_live_mem) and reuse_uniform and (
             (not paged) or (page % self.s2_tile == 0 or self.s2_tile % page == 0)
         )
         if n_tiles > COMPACT_TILE_THRESHOLD and uniform_interior:
@@ -786,12 +917,36 @@ class _FiaLoop:
 def _visible_sequences(
     contract: AttentionContract, sequences: tuple[tuple[int, int], ...],
 ) -> tuple[tuple[int, int], ...]:
-    """Bound per-sequence KV spans by selected_tokens and sliding window for tiling/L2 math."""
+    """Bound per-sequence KV spans by selected_tokens, query spans, and sliding window for tiling/L2 math."""
     capped: list[tuple[int, int]] = []
-    for q, kv in sequences:
+    for idx, (q, kv) in enumerate(sequences):
         selected = kv if contract.selected_tokens is None else contract.selected_tokens
-        win = (contract.window_size + max(0, q - 1)) if contract.window_size else kv
-        capped.append((q, min(kv, selected, win)))
+        spans = (
+            contract.sequence_query_spans[idx]
+            if idx < len(contract.sequence_query_spans) else ()
+        )
+        eff_kv = (
+            min(kv, max((hi for _, hi in spans), default=0))
+            if (contract.causal and spans) else kv
+        )
+        if not contract.window_size:
+            win = eff_kv
+        elif not spans:
+            win = contract.window_size + max(0, q - 1)
+        elif contract.causal:
+            merged = _merge_intervals([
+                (max(0, s_lo + 1 - contract.window_size), min(eff_kv, s_hi))
+                for s_lo, s_hi in spans
+            ])
+            win = sum(hi - lo for lo, hi in merged)
+        else:
+            radius = contract.window_size - 1
+            merged = _merge_intervals([
+                (max(0, s_lo - radius), min(kv, s_hi + radius))
+                for s_lo, s_hi in spans
+            ])
+            win = sum(hi - lo for lo, hi in merged)
+        capped.append((q, min(eff_kv, selected, win)))
     return tuple(capped)
 
 
@@ -965,23 +1120,32 @@ def dense_fia(
 
     for index, rect in enumerate(rects):
         ranges = rect_ranges[index]
-        tiles += rect.end - rect.first
         for span in ranges:
             collect(queries, loop.query_load(rect, span))
             for phase in loop.partial(rect, len(ranges) > 1):
                 collect(partials, phase)
-        full_end = min(rect.end, rect.kv // s2_tile)
-        non_periodic = bool(contract.block_table) or (
-            rect.rect_in_head > 0 and kv_reuse_hit_frac > 0.0
-            and (rect.prev_touched_start > rect.first * s2_tile or rect.prev_touched_end < full_end * s2_tile)
+        prev_spans = (
+            rect.prev_touched_spans
+            if rect.prev_touched_spans
+            else ((rect.prev_touched_start, rect.prev_touched_end),)
         )
-        periodic_end = full_end if non_periodic else min(full_end, rect.first + period)
-        for tile in range(rect.first, periodic_end):
-            for phase in loop.s2_phases(rect, tile):
-                collect(s2, phase, 1 if non_periodic else ceil((full_end - tile) / period))
-        if rect.first <= full_end < rect.end:
-            for phase in loop.s2_phases(rect, full_end):
-                collect(s2, phase)
+        for t_lo, t_hi in rect.tile_spans:
+            tiles += t_hi - t_lo
+            full_end = min(t_hi, rect.kv // s2_tile)
+            non_periodic = bool(contract.block_table) or (
+                rect.rect_in_head > 0 and kv_reuse_hit_frac > 0.0
+                and not (
+                    any(p_lo <= t_lo * s2_tile and full_end * s2_tile <= p_hi for p_lo, p_hi in prev_spans)
+                    or all(full_end * s2_tile <= p_lo or t_lo * s2_tile >= p_hi for p_lo, p_hi in prev_spans)
+                )
+            )
+            periodic_end = full_end if non_periodic else min(full_end, t_lo + period)
+            for tile in range(t_lo, periodic_end):
+                for phase in loop.s2_phases(rect, tile):
+                    collect(s2, phase, 1 if non_periodic else ceil((full_end - tile) / period))
+            if t_lo <= full_end < t_hi:
+                for phase in loop.s2_phases(rect, full_end):
+                    collect(s2, phase)
         for phase in loop.finish(rect, len(ranges)):
             collect(outputs if phase.name == "output" else partials, phase)
 

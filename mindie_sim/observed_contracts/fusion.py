@@ -294,8 +294,8 @@ def _mla(raw_kind, inputs, outputs):
     is_v4 = raw_kind in MLA_PROLOG_V4_KINDS
     canonical_kind = (MLA_PROLOG_V4_CANONICAL_KIND if is_v4
                       else MLA_PROLOG_V3_KIND)
-    expected_packed_dtype = "fp8_e4m3" if is_v4 else "int8"
-    # The source's tile-128 packed cache stores 512 INT8 latent bytes, 64
+    allowed_packed_dtypes = {"int8", "fp8_e4m3"} if is_v4 else {"int8"}
+    # The source's tile-128 packed cache stores 512 1-byte latent elements, 64
     # BF16 rotary values and four FP32 scales in one 656-byte row. Its second
     # cache descriptor is explicitly empty, not missing floating cache data.
     packed = _tensor(inputs[MLA_PACKED_CACHE_INPUT_INDEX], MLA_PACKED_CACHE_RANK, {"int8"})
@@ -342,20 +342,24 @@ def _mla(raw_kind, inputs, outputs):
         return None, _issue(
             raw_kind, "inconsistent_mla_active_parameters",
             "MLA projection, RMS, absorption, output and cache dimensions do not agree.")
+    packed_operand_dtype = token[1] if token[1] in allowed_packed_dtypes else None
     if packed:
         if (latent != MLA_PACKED_LATENT_WIDTH or rope_width != MLA_PACKED_ROPE_WIDTH
                 or cache[0][2:] != (1, MLA_PACKED_CACHE_ROW_WIDTH)
                 or rope_cache not in {((), "bf16", "ND"), _EMPTY}
-                or any(slot[1] != expected_packed_dtype
-                       for slot in (token, dq, uq, dkv))
+                or packed_operand_dtype is None
+                or any(slot[1] != packed_operand_dtype
+                       for slot in (dq, uq, dkv))
                 or query[1] != "bf16"):
             return None, _issue(raw_kind, "unsupported_mla_packed_cache",
-                                "The retained packed ABI requires 512 INT8 latent bytes, "
+                                "The retained packed ABI requires 512 latent bytes, "
                                 "64 BF16 rotary values, four FP32 scales and an empty second cache.")
         cache_heads = (((1, MLA_PACKED_CACHE_ROW_WIDTH), "int8", "ND"), _EMPTY)
     else:
-        if (is_v4 or cache[0][2:] != (1, latent) or rope_cache[0][2:] != (1, rope_width)
-                or cache[1] != rope_cache[1] or cache[1] != query[1]):
+        if (cache[0][2:] != (1, latent) or rope_cache[0][2:] != (1, rope_width)
+                or cache[1] != rope_cache[1] or cache[1] != query[1]
+                or len({dq[1], uq[1], dkv[1]}) != 1
+                or (is_v4 and (token[1] != dq[1] or dq[1] not in {"bf16", "int8", "fp8_e4m3"}))):
             return None, _issue(raw_kind, "inconsistent_mla_active_parameters",
                                 "Floating cache dimensions and precision must match their query outputs.")
         cache_heads = tuple((slot[0][2:], slot[1], slot[2]) for slot in (cache, rope_cache))
@@ -363,7 +367,7 @@ def _mla(raw_kind, inputs, outputs):
     if query_norm[0]:
         if (query_norm[0] not in {(tokens, gamma_q[0][0]), (*leading, gamma_q[0][0])}
                 or not _tensor(query_norm, len(query_norm[0]),
-                               {expected_packed_dtype} if packed else _ACTIVATION)):
+                               {packed_operand_dtype} if packed else _ACTIVATION)):
             return None, _issue(raw_kind, "unsupported_mla_query_norm",
                                 "The recorded optional query-norm output must retain its row/rank axes.")
         query_norm = ((tokens, gamma_q[0][0]), query_norm[1], query_norm[2])

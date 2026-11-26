@@ -1083,6 +1083,7 @@ def _port(
     quant_mode: str = "dense",
     group_shape: tuple[int, ...] = (),
     scale_dtype: str = "none",
+    scale_shape: tuple[int, ...] = (),
 ) -> OperandPortSig:
     return OperandPortSig(
         role=role,
@@ -1093,8 +1094,26 @@ def _port(
         quant_mode=quant_mode,
         group_shape=group_shape,
         scale_dtype=scale_dtype,
-        scale_shape=(),
+        scale_shape=scale_shape,
     )
+
+
+def _mla_port_scale_shape(
+    port_name: str,
+    shape: tuple[int, ...],
+    quant_mode: str,
+    group_shape: tuple[int, ...],
+) -> tuple[int, ...]:
+    if quant_mode == "mx_fp8" and group_shape and len(shape) >= 2:
+        grp = max(1, int(group_shape[0]))
+        if port_name == "token_x":
+            return (int(shape[0]), max(1, int(shape[1]) // grp))
+        return (int(shape[1]), max(1, int(shape[0]) // grp))
+    if quant_mode == "per_token_int8" and port_name == "token_x" and shape:
+        return (int(shape[0]), 1)
+    if quant_mode == "per_channel_int8" and len(shape) >= 2:
+        return (1, int(shape[1]))
+    return ()
 
 
 def _resolve_placement(arch: SocArch, world_size: int, meta: Mapping[str, Any]) -> RankPlacement:
@@ -1253,6 +1272,7 @@ def _build_mla_prolog_ports(
     *,
     soc_arch: SocArch | None,
     rope_dim: int,
+    include_rope: bool = True,
 ) -> tuple[str, tuple[OperandPortSig, ...], tuple[OperandPortSig, ...]] | None:
     """Build independent per-projection MLA prolog operand and output port signatures."""
     entry_op = next((op for op in ordered_m if role_of[op.op_id] in {"qkv_a", "q_a"}), ordered_m[0])
@@ -1288,7 +1308,11 @@ def _build_mla_prolog_ports(
             sh = (int(src_op.local_shape[2]), out_dim)
         else:
             sh = (h_dim, h_dim)
-        return _port(port_name, w_dt, sh, layout=w_layout, quant_mode=q_mode, group_shape=g_sh, scale_dtype=s_dt)
+        s_sh = _mla_port_scale_shape(port_name, sh, q_mode, g_sh)
+        return _port(
+            port_name, w_dt, sh, layout=w_layout, quant_mode=q_mode,
+            group_shape=g_sh, scale_dtype=s_dt, scale_shape=s_sh,
+        )
 
     w_dq = _weight_port("weight_dq", ("q_a", "qkv_a"))
     w_uq_qr = _weight_port("weight_uq_qr", ("q_b",))
@@ -1310,14 +1334,17 @@ def _build_mla_prolog_ports(
         kv_lora_dim = uk_kv_lora
         w_uk = replace(w_uk_raw, shape=(n_heads, uk_nope, kv_lora_dim))
     w_dt = w_dq.dtype
-    in_dt = _norm_abi_dtype(tr.input_dtype)
-    iq, ig, is_dt = _quant_contract_for_port(in_dt, tr.scale_format, tr.group_size, is_weight=False)
-    token_dt = "bf16" if w_dt == "fp8_e4m3fn" else in_dt
-    tok_q, tok_g, tok_s = ("dense", (), "none") if token_dt == "bf16" else (iq, ig, is_dt)
+    token_dt, tok_q, tok_g, tok_s = _resolve_op_act_port_contract(entry_op, tr)
+    explicit_nope = any(
+        bool(dict(op_m.metadata).get("mla_use_nope"))
+        or dict(op_m.metadata).get("do_rope") is False
+        for op_m in ordered_m if op_m.metadata
+    )
+    do_rope = bool(include_rope) and not explicit_nope
     all_w_dts = {w_dq.dtype, w_uq_qr.dtype, w_uk.dtype, w_dkv_kr.dtype}
     abi_id = (
         "aclnnMlaPrologV4WeightNz"
-        if (soc_arch == "A5" and "fp8_e4m3fn" in all_w_dts)
+        if (soc_arch == "A5" and ("fp8_e4m3fn" in all_w_dts or not do_rope))
         else "aclnnMlaPrologV3WeightNz"
     )
     q_norm_op = by_role.get("q_norm")
@@ -1326,8 +1353,9 @@ def _build_mla_prolog_ports(
     q_gamma_dt = _norm_abi_dtype(traits[q_norm_op.op_id].weight_dtype) if q_norm_op is not None else "bf16"
     kv_gamma_dt = _norm_abi_dtype(traits[kv_norm_op.op_id].weight_dtype) if kv_norm_op is not None else "bf16"
     kv_cache_dt = _norm_abi_dtype(traits[kv_store_op.op_id].output_dtype) if kv_store_op is not None else "bf16"
+    is_mxfp8 = (w_dt == "fp8_e4m3fn" and w_dq.quant_mode == "mx_fp8")
     q_norm_out_dt = "fp8_e4m3fn" if w_dt == "fp8_e4m3fn" else ("int8" if w_dt == "int8" else "bf16")
-    q_norm_scale_dt = "fp8_e8m0" if w_dt == "fp8_e4m3fn" else "fp32"
+    q_norm_scale_dt = "fp8_e8m0" if is_mxfp8 else "fp32"
     if q_norm_op is not None and q_norm_op.local_shape:
         q_lora_dim = max(1, int(q_norm_op.local_shape[-1]))
     elif len(w_uq_qr.shape) >= 2 and int(w_uq_qr.shape[0]) > 0:
@@ -1360,21 +1388,33 @@ def _build_mla_prolog_ports(
         )
         kv_cache_shape = (cache_tokens, n_kv, kv_lora_dim)
         kr_cache_shape = (cache_tokens, n_kv, rope_dim)
+    tok_scale_sh = _mla_port_scale_shape("token_x", (m_dim, h_dim), tok_q, tok_g)
+    rope_ports = (
+        (_port("rope_sin", "bf16", (m_dim, rope_dim)), _port("rope_cos", "bf16", (m_dim, rope_dim)))
+        if do_rope else ()
+    )
     operands = (
-        _port("token_x", token_dt, (m_dim, h_dim), quant_mode=tok_q, group_shape=tok_g, scale_dtype=tok_s),
+        _port(
+            "token_x", token_dt, (m_dim, h_dim), quant_mode=tok_q,
+            group_shape=tok_g, scale_dtype=tok_s, scale_shape=tok_scale_sh,
+        ),
         w_dq, w_uq_qr, w_uk, w_dkv_kr,
         _port("rmsnorm_gamma_cq", q_gamma_dt, (q_lora_dim,)),
         _port("rmsnorm_gamma_ckv", kv_gamma_dt, (kv_lora_dim,)),
-        _port("rope_sin", "bf16", (m_dim, rope_dim)),
-        _port("rope_cos", "bf16", (m_dim, rope_dim)),
+        *rope_ports,
         _port("kv_cache_ref", kv_cache_dt, kv_cache_shape),
         _port("kr_cache_ref", "bf16", kr_cache_shape),
+    )
+    q_norm_scale_shape = (
+        (m_dim, max(1, q_lora_dim // MX_GROUP_SIZE))
+        if is_mxfp8
+        else (m_dim, 1)
     )
     outputs = (
         _port("query_out", "bf16", (m_dim, n_heads, kv_lora_dim)),
         _port("query_rope_out", "bf16", (m_dim, n_heads, rope_dim)),
         _port("query_norm_out", q_norm_out_dt, (m_dim, q_lora_dim)),
-        _port("dequant_scale_q_norm_out", q_norm_scale_dt, (m_dim, 1)),
+        _port("dequant_scale_q_norm_out", q_norm_scale_dt, q_norm_scale_shape),
     )
     return abi_id, operands, outputs
 
@@ -1452,8 +1492,13 @@ def _match_law4_mla_prolog(
             continue
         if any(bool(m.get("sfa_c8_w4a8_bypass")) for m in metas):
             continue
+        do_rope_match = (
+            ("rotary" in roles)
+            and not any(bool(m.get("mla_use_nope")) or m.get("do_rope") is False for m in metas)
+        )
         built = _build_mla_prolog_ports(
             ordered_m, role_of, traits, soc_arch=soc_arch, rope_dim=rope_dim,
+            include_rope=do_rope_match,
         )
         if built is None:
             continue

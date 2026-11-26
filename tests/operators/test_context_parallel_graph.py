@@ -679,3 +679,95 @@ def test_dsa_cp_rank_exact_prefill_and_sharded_indexer_pcp_noncausal_empty_shard
     r_ig["model"]["metadata"] = {"layer_cache_representations": {"0": {"index_k:prefill": fmt_scoped}}}
     ops_ig = target_operators(r_ig, phase="prefill", tokens=1, physical_rank=0)
     assert int(next(o for o in ops_ig if o.op_id.endswith(".pcp_index_gather")).link_bytes) == 68
+
+
+def test_mixed_mtp_current_row_conservation_and_index_owner_resolution():
+    from mindie_sim.catalog.cache_index import index_row_bytes, index_selection_cost
+    from mindie_sim.prediction.sharding.context_parallel import (
+        GENERIC_LSE_WIRE_BYTES,
+        MERGE_OPS,
+        emit_dcp_output_exchange_combine,
+        emit_mtp_current_attention,
+    )
+    from mindie_sim.schema.model import LayerPlan, ModelSpec
+
+    ops_cp: list = []
+    mix_views = (
+        RequestView("a", 2, 1, True, "decode"),
+        RequestView("b", 1, 1, True, "decode"),
+        RequestView("pad", 2, 1, False, "decode", padding=True),
+    )
+    cur_id = emit_mtp_current_attention(
+        ops_cp, prefix="l0", stage=0, layer=0, requests=("a", "b"), mode="decode",
+        deps=("h0",), views=mix_views, local_heads=8, qk_dim=576, v_dim=512,
+        kv_row_bytes=1152.0, act_dtype="bf16",
+    )
+    merge_id = emit_dcp_output_exchange_combine(
+        ops_cp, prefix="l0", stage=0, layer=0, requests=("a", "b"), mode="decode",
+        deps=("h0",), rows=3, local_heads=8, v_dim=512, act_dtype="bf16",
+        pcp_factor=1, tp_gather=2, dp_width=1, local_current_dep=cur_id,
+    )
+    cur_op = next(o for o in ops_cp if o.op_id == cur_id)
+    merge_op = next(o for o in ops_cp if o.op_id == merge_id)
+    history_read = float(2 * 3 * 8) * float(512 * 2 + GENERIC_LSE_WIRE_BYTES)
+    assert cur_op.local_shape[0] == 2
+    assert cur_op.mte3_bytes == float(2 * 8) * float(512 * 2 + 4)
+    assert merge_op.mte2_bytes == history_read + cur_op.mte3_bytes
+    assert merge_op.vector_ops == float(MERGE_OPS * 8 * 512 * (3 * 2 + 2))
+
+    owner_lp = LayerPlan(
+        index=4, native_layer_id=4, attention="mla", indexer=True, owns_index_k=True,
+        index_k_owner_layer_id=4, index_dim=128, index_kpool=4, index_topk=2048,
+    )
+    consumer_lp = LayerPlan(
+        index=5, native_layer_id=5, attention="mla", indexer=True, owns_index_k=False,
+        index_k_owner_layer_id=4, index_dim=0, index_kpool=1, index_topk=2048,
+    )
+    fmt_fp4 = {"dtype": "uint8", "packed_elements": 2, "group_size": 32, "scale_dtype": "fp8_e8m0"}
+    sliced_model = ModelSpec(
+        "m", 2, 5120, 64, 192, 0, 1000, attention="mla",
+        layer_plans=(owner_lp, consumer_lp),
+        metadata=(("layer_cache_representations", {"4": {"index_k:decode": fmt_fp4}}),),
+    )
+    c_own = index_selection_cost(sliced_model, owner_lp, sequence_tokens=4000, phase="decode")
+    c_con = index_selection_cost(sliced_model, consumer_lp, sequence_tokens=4000, phase="decode")
+    assert (c_con.scored_rows, c_con.selected_rows, c_con.index_row_bytes, c_con.index_read_bytes) == (
+        c_own.scored_rows, c_own.selected_rows, c_own.index_row_bytes, c_own.index_read_bytes,
+    ) == (1000, 512, 68.0, 68000.0)
+    assert c_con.cache_write_rows == 0 and c_own.cache_write_rows == 1000
+    assert index_row_bytes(sliced_model, 128, plan=consumer_lp, phase="decode") == 68.0
+
+    # Per-layer owner quantization override governs index_row_bytes and index_selection_cost without region decl.
+    from mindie_sim.catalog.types import QuantSpec
+    q_idx_ov = QuantSpec(
+        name="bf16", index_dtype="bf16", index_scale_dtype="none",
+        layer_quant_overrides=(("4", (("index_dtype", "int8"), ("index_scale_dtype", "fp32"))),),
+    )
+    m_ov = ModelSpec("m", 2, 5120, 64, 192, 0, 1000, attention="mla",
+                     layer_plans=(owner_lp, consumer_lp), quant=q_idx_ov)
+    assert index_row_bytes(m_ov, 128, plan=consumer_lp) == 132.0
+    assert index_selection_cost(m_ov, consumer_lp, sequence_tokens=4000).index_read_bytes == 132_000.0
+
+    # Ragged cross-DP MLA decode emits CURRENT attention only on the DP rank with local q_len > 1 rows.
+    from mindie_sim.prediction.operators.mla.mla import mla
+    c_rdp = parse_case(compose_case(
+        "deepseek-v2-lite", hardware="a2", layers=1, tp=1, dp=2, ep=1, dcp=2,
+        num_devices=2, prompt_tokens=4, output_tokens=3, va_recommended=False,
+    ))
+    cohort = ((RequestView("r0", 2, 1, True, "decode"),), (RequestView("r1", 1, 1, True, "decode"),))
+    res_dp0 = mla(
+        prefix="l0", plan=c_rdp.model.layer_plans[0], views=cohort[0], stage=0, deps="in",
+        model=c_rdp.model, parallel=c_rdp.runtime.parallel, quant=c_rdp.model.quant,
+        mode="decode", padded_tokens=2, cache_ids={}, topk_ids={}, index_cache_ids={},
+        candidate_ids={}, stage_of=lambda _: 0, runtime=c_rdp.runtime, machine=c_rdp.machine,
+        dcp_cohort_views_by_member=cohort, dcp_local_pos=0,
+    )
+    res_dp1 = mla(
+        prefix="l0", plan=c_rdp.model.layer_plans[0], views=cohort[1], stage=0, deps="in",
+        model=c_rdp.model, parallel=c_rdp.runtime.parallel, quant=c_rdp.model.quant,
+        mode="decode", padded_tokens=1, cache_ids={}, topk_ids={}, index_cache_ids={},
+        candidate_ids={}, stage_of=lambda _: 0, runtime=c_rdp.runtime, machine=c_rdp.machine,
+        dcp_cohort_views_by_member=cohort, dcp_local_pos=1,
+    )
+    assert any(o.recipe == "dcp_mtp_current_attention" and o.local_shape[0] == 2 for o in res_dp0.ops)
+    assert not any(o.recipe == "dcp_mtp_current_attention" for o in res_dp1.ops)

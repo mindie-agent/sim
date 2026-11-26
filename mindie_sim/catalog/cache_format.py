@@ -1117,14 +1117,72 @@ def _resolve_index_cache_format(model: Any, plan: Any, *, phase: str | None = No
     return CacheFormat(idx_dtype)
 
 
+_DRAFT_CACHE_SCOPES = frozenset({"draft", "mtp", "dspark", "standalone_draft"})
+_UNPACKED_DRAFT_MLA_DTYPES = frozenset({"bf16", "fp8", "fp8_e4m3"})
+
+
+def _packed_mla_payload_dtype(raw_kv: str) -> str:
+    return (
+        NOPE_BLOCK_PAYLOAD_DTYPE
+        if raw_kv in NOPE_FP8_PAYLOAD_DTYPES | {"fp8_e4m3fn"}
+        else "int8"
+    )
+
+
 def with_packed_mla_cache(model: Any, rope: int):
     """Install the selected source's mixed row ABI in capacity accounting."""
     from dataclasses import replace
     metadata = dict(model.metadata)
     regions = dict(metadata.get("cache_representations", {}))
-    declaration = {"dtype": "int8", "group_size": C8_MLA_SCALE_GROUP, "scale_dtype": C8_MLA_SCALE_DTYPE,
+    quant = getattr(model, "quant", None)
+    raw_kv = str(
+        (getattr(quant, "kv_dtype", "") if quant is not None else "")
+        or getattr(model, "kv_dtype", "")
+        or ""
+    ).strip().lower()
+    global_packed_dtype = _packed_mla_payload_dtype(raw_kv)
+    declaration = {"dtype": global_packed_dtype, "group_size": C8_MLA_SCALE_GROUP, "scale_dtype": C8_MLA_SCALE_DTYPE,
                    "suffix_elements": rope, "suffix_dtype": C8_MLA_ROTARY_DTYPE}
     if "mla_kv" in regions and regions["mla_kv"] != declaration:
         raise ModelingError("packed_mla_cache_conflicts_with_declared_representation")
     regions["mla_kv"] = declaration
-    return replace(model, metadata=tuple({**metadata, "cache_representations": regions}.items()))
+    raw_layer_regions = metadata.get("layer_cache_representations")
+    layer_regions: dict[str, dict[str, Any]] = (
+        {str(k): dict(v) for k, v in raw_layer_regions.items() if isinstance(v, Mapping)}
+        if isinstance(raw_layer_regions, Mapping) else {}
+    )
+    updated_layers = False
+    for plan in getattr(model, "layer_plans", ()):
+        if getattr(plan, "attention", "") != "mla":
+            continue
+        layer_q, _ = _layer_quant(model, plan)
+        layer_kv = str(
+            (getattr(layer_q, "kv_dtype", "") if layer_q is not None else "")
+            or getattr(model, "kv_dtype", "")
+            or ""
+        ).strip().lower()
+        layer_rope = int(getattr(plan, "qk_rope_head_dim", 0) or rope)
+        if getattr(plan, "scope", "body") in _DRAFT_CACHE_SCOPES and layer_kv in _UNPACKED_DRAFT_MLA_DTYPES:
+            layer_decl = (
+                {"dtype": "bf16"}
+                if layer_kv == "bf16"
+                else {"dtype": NOPE_BLOCK_PAYLOAD_DTYPE, "group_size": NOPE_BLOCK_QUANT_TILE,
+                      "scale_dtype": NOPE_BLOCK_SCALE_DTYPE, "suffix_elements": layer_rope,
+                      "suffix_dtype": C8_MLA_ROTARY_DTYPE}
+            )
+        else:
+            layer_packed_dtype = _packed_mla_payload_dtype(layer_kv)
+            if layer_packed_dtype == global_packed_dtype and layer_rope == rope:
+                continue
+            layer_decl = {**declaration, "dtype": layer_packed_dtype, "suffix_elements": layer_rope}
+        lkey = str(plan.index)
+        entry = dict(layer_regions.get(lkey, {}))
+        if "mla_kv" in entry and entry["mla_kv"] != layer_decl:
+            raise ModelingError("packed_mla_cache_conflicts_with_declared_representation")
+        entry["mla_kv"] = layer_decl
+        layer_regions[lkey] = entry
+        updated_layers = True
+    next_meta = {**metadata, "cache_representations": regions}
+    if updated_layers:
+        next_meta["layer_cache_representations"] = layer_regions
+    return replace(model, metadata=tuple(next_meta.items()))

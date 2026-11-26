@@ -1219,6 +1219,7 @@ def _cann_attention_and_linear_entries(
     p_low = arch.lower()
     bf16_tok = "bf16:ND:dense::none"
     bf16_w = "bf16:FRACTAL_NZ:dense::none"
+    mxfp8_tok = "fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0"
     mxfp8_w = "fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0"
     int8_tok = "int8:ND:per_token_int8::fp32"
     int8_w = "int8:FRACTAL_NZ:per_channel_int8::fp32"
@@ -1233,7 +1234,7 @@ def _cann_attention_and_linear_entries(
                     # 11 required inputs; A5 supports weightQuantMode {0..5} (BF16/INT8/MXFP8),
                     # A2/A3 support {0,1,2} (BF16/INT8); FP16 is rejected.
                     _mla_prolog_in_row(bf16_tok, bf16_w),
-                    _mla_prolog_in_row(bf16_tok, mxfp8_w),
+                    _mla_prolog_in_row(mxfp8_tok, mxfp8_w),
                     _mla_prolog_in_row(int8_tok, int8_w),
                 ) if is_a5 else (
                     _mla_prolog_in_row(bf16_tok, bf16_w),
@@ -1265,9 +1266,9 @@ def _cann_attention_and_linear_entries(
             available=is_a5, backend="cann_aclnn", symbol="aclnnMlaPrologV4WeightNz", arch=arch,
             role="mla_prolog", graph_motif="mla_prolog",
             dtype_tuple=(
-                _mla_prolog_in_row(bf16_tok, mxfp8_w, include_rope=True),
+                _mla_prolog_in_row(mxfp8_tok, mxfp8_w, include_rope=True),
                 _mla_prolog_in_row(bf16_tok, bf16_w, include_rope=True),
-                _mla_prolog_in_row(bf16_tok, mxfp8_w, include_rope=False),
+                _mla_prolog_in_row(mxfp8_tok, mxfp8_w, include_rope=False),
                 _mla_prolog_in_row(bf16_tok, bf16_w, include_rope=False),
             ),
             outputs=(
