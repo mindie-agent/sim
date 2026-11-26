@@ -69,7 +69,7 @@ static void rates_fifo(msim_ctx *c, const int32_t *idx, int32_t n, double capaci
     int32_t best = idx[0], i;
     for (i = 1; i < n; i++) {
         int32_t cand = idx[i];
-        if (proxy_less(c, c->link[cand].task, c->link[best].task)) best = cand;
+        if (fifo_link_less(c, cand, best)) best = cand;
     }
     c->link[best].rate = capacity <= c->link[best].cap ? capacity : c->link[best].cap;
 }
@@ -262,7 +262,7 @@ static int32_t rates_coupled(msim_ctx *c)
         if (t->nlink <= 0) continue;
         for (k = 0; k < (int32_t)t->nlink; k++) {
             int32_t li = (int32_t)t->lstart + k, rr;
-            if (L[li].rem <= 0.0) continue;
+            if (L[li].rem <= 0.0 || !L[li].coupled_comp) continue;
             rr = L[li].res;
             if (c->res[rr].policy == 1) {
                 int32_t prev = (c->res_fifo_ep[rr] == c->fifo_epoch)
@@ -285,7 +285,7 @@ static int32_t rates_coupled(msim_ctx *c)
             return MSIM_E_ARITH;
         for (k = 0; k < (int32_t)t->nlink; k++) {
             int32_t li = (int32_t)t->lstart + k;
-            if (L[li].rem > 0.0) c->act_links[na++] = li;
+            if (L[li].rem > 0.0 && L[li].coupled_comp) c->act_links[na++] = li;
         }
         if (na == 0) continue;
         groups = (t->flags & MSIM_F_COUPLED) ? 1 : na;
@@ -581,31 +581,34 @@ static int32_t compute_rates(msim_ctx *c)
         return MSIM_E_ARITH;
     for (a = 0; a < c->act_n; a++) {
         msim_task *t = &c->task[c->act[a]];
-        int32_t has_rem = 0;
+        int32_t has_rem = 0, is_c = (t->flags & MSIM_F_COUPLED) ? 1 : 0;
         t->coupled_comp = 0;
         if (t->state != 1) continue;
         for (k = 0; k < (int32_t)t->nlink; k++) {
             msim_link *l = &c->link[t->lstart + k];
             l->rate = 0.0;
             l->mode = -1;
-            if (l->rem > 0.0) has_rem = 1;
+            l->coupled_comp = 0;
+            if (l->rem > 0.0) {
+                has_rem = 1;
+                if (is_c) l->coupled_comp = 1;
+            }
         }
         if (!has_rem) continue;
-        if (t->flags & MSIM_F_COUPLED) { t->coupled_comp = 1; any_c = 1; }
+        if (is_c) { t->coupled_comp = 1; any_c = 1; }
         else any_u = 1;
     }
     if (any_c && any_u) {
-        int32_t qh = 0, qt = 0;
-        if (c->act_n > 0 && !msim_grow((void **)&c->comp_q, &c->comp_q_cap,
-                                       c->act_n, sizeof(int32_t)))
-            return MSIM_E_ARITH;
+        /* Per-link unit-granularity closure: uncoupled links only join a coupled
+         * component when they overlap coupled-hot units (or FIFO) on the SAME
+         * resource, never bridging across distinct resources of an uncoupled task. */
+        int32_t n_ctouch = 0, ti;
         msim_next_epoch(&c->ord_epoch, c->res_ord_ep, c->nres);
         msim_next_epoch(&c->comp_epoch, c->res_comp_ep, c->nres);
         for (a = 0; a < c->act_n; a++) {
             int32_t slot = c->act[a];
             msim_task *t = &c->task[slot];
             if (t->state != 1) continue;
-            if (t->coupled_comp) c->comp_q[qt++] = slot;
             for (k = 0; k < (int32_t)t->nlink; k++) {
                 int32_t li = (int32_t)t->lstart + k;
                 msim_link *l = &c->link[li];
@@ -620,65 +623,66 @@ static int32_t compute_rates(msim_ctx *c)
                     c->link_rnext[c->res_ltail[r]] = li;
                     c->res_ltail[r] = li;
                 }
+                if (l->coupled_comp && c->res_comp_ep[r] != c->comp_epoch) {
+                    c->res_comp_ep[r] = c->comp_epoch;
+                    c->touched_res[n_ctouch++] = r;
+                }
             }
         }
-        while (qh < qt) {
-            int32_t slot = c->comp_q[qh++];
-            msim_task *t = &c->task[slot];
-            for (k = 0; k < (int32_t)t->nlink; k++) {
-                msim_link *l = &c->link[t->lstart + k];
-                msim_res *res;
-                int32_t count, lj;
-                if (l->rem <= 0.0) continue;
-                r = l->res;
-                res = &c->res[r];
-                count = res->units;
-                if (count < 1 || count > MSIM_MAX_U) return MSIM_E_ARITH;
-                if (res->policy == 1) {
-                    if (c->res_comp_ep[r] == c->comp_epoch) continue;
-                    c->res_comp_ep[r] = c->comp_epoch;
-                    for (lj = c->res_lhead[r]; lj >= 0; lj = c->link_rnext[lj]) {
-                        int32_t tj = c->link[lj].task;
-                        if (!c->task[tj].coupled_comp) {
-                            c->task[tj].coupled_comp = 1;
-                            c->comp_q[qt++] = tj;
-                        }
-                    }
-                } else {
-                    msim_ubits mask;
-                    int32_t u, w, len = unit_len(c, l);
-                    bool added = false;
-                    msim_ubits_clear(&mask);
-                    for (u = 0; u < len; u++) {
-                        int32_t uid = unit_at(c, l, u);
-                        if (uid < 0 || uid >= count) return MSIM_E_ARITH;
-                        msim_ubits_set(&mask, uid);
-                    }
-                    if (c->res_comp_ep[r] != c->comp_epoch) {
-                        c->res_comp_ep[r] = c->comp_epoch;
-                        msim_ubits_clear(&c->res_hot_units[r]);
-                    }
-                    for (w = 0; w < (int32_t)MSIM_UNIT_WORDS; w++) {
-                        if ((mask.w[w] & ~c->res_hot_units[r].w[w]) != 0u) {
-                            c->res_hot_units[r].w[w] |= mask.w[w];
-                            added = true;
-                        }
-                    }
-                    if (!added) continue;
+        for (ti = 0; ti < n_ctouch; ti++) {
+            msim_res *res;
+            int32_t count, lj;
+            r = c->touched_res[ti];
+            res = &c->res[r];
+            count = res->units;
+            if (count < 1 || count > MSIM_MAX_U) return MSIM_E_ARITH;
+            if (res->policy == 1) {
+                for (lj = c->res_lhead[r]; lj >= 0; lj = c->link_rnext[lj]) {
+                    c->link[lj].coupled_comp = 1;
+                    c->task[c->link[lj].task].coupled_comp = 1;
+                }
+                continue;
+            }
+            msim_ubits_clear(&c->res_hot_units[r]);
+            for (lj = c->res_lhead[r]; lj >= 0; lj = c->link_rnext[lj]) {
+                msim_link *l = &c->link[lj];
+                int32_t u, len;
+                if (!l->coupled_comp) continue;
+                len = unit_len(c, l);
+                for (u = 0; u < len; u++) {
+                    int32_t uid = unit_at(c, l, u);
+                    if (uid < 0 || uid >= count) return MSIM_E_ARITH;
+                    msim_ubits_set(&c->res_hot_units[r], uid);
+                }
+            }
+            {
+                bool grew = true;
+                while (grew) {
+                    grew = false;
                     for (lj = c->res_lhead[r]; lj >= 0; lj = c->link_rnext[lj]) {
                         msim_link *l2 = &c->link[lj];
-                        int32_t tj = l2->task, len2 = unit_len(c, l2);
+                        int32_t u, len2;
                         bool hit = false;
-                        if (c->task[tj].coupled_comp) continue;
+                        if (l2->coupled_comp) continue;
+                        len2 = unit_len(c, l2);
                         for (u = 0; u < len2; u++) {
-                            if (msim_ubits_test(&c->res_hot_units[r], unit_at(c, l2, u))) {
+                            int32_t uid = unit_at(c, l2, u);
+                            if (uid < 0 || uid >= count) return MSIM_E_ARITH;
+                            if (msim_ubits_test(&c->res_hot_units[r], uid)) {
                                 hit = true;
                                 break;
                             }
                         }
                         if (hit) {
-                            c->task[tj].coupled_comp = 1;
-                            c->comp_q[qt++] = tj;
+                            l2->coupled_comp = 1;
+                            c->task[l2->task].coupled_comp = 1;
+                            for (u = 0; u < len2; u++) {
+                                int32_t uid = unit_at(c, l2, u);
+                                if (!msim_ubits_test(&c->res_hot_units[r], uid)) {
+                                    msim_ubits_set(&c->res_hot_units[r], uid);
+                                    grew = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -693,7 +697,7 @@ static int32_t compute_rates(msim_ctx *c)
             if (t->state != 1 || !t->coupled_comp) continue;
             for (k = 0; k < (int32_t)t->nlink; k++) {
                 msim_link *l = &c->link[t->lstart + k];
-                if (l->rem > 0.0) msim_res_mode_set(c, l->res, 4);
+                if (l->rem > 0.0 && l->coupled_comp) msim_res_mode_set(c, l->res, 4);
             }
         }
         rc = rates_coupled(c);
@@ -704,11 +708,11 @@ static int32_t compute_rates(msim_ctx *c)
     msim_next_epoch(&c->ord_epoch, c->res_ord_ep, c->nres);
     for (a = 0; a < c->act_n; a++) {
         msim_task *t = &c->task[c->act[a]];
-        if (t->state != 1 || t->coupled_comp) continue;
+        if (t->state != 1 || (t->flags & MSIM_F_COUPLED)) continue;
         for (k = 0; k < (int32_t)t->nlink; k++) {
             int32_t li = (int32_t)t->lstart + k;
             msim_link *l = &c->link[li];
-            if (l->rem <= 0.0) continue;
+            if (l->rem <= 0.0 || l->coupled_comp) continue;
             r = l->res;
             if (c->res_seen_ep[r] != c->seen_epoch) {
                 c->res_seen_ep[r] = c->seen_epoch;

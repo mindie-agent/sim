@@ -578,6 +578,58 @@ def _replica_local_rank_slots(case: Any, replica: int, topology: Any = None) -> 
         return None
 
 
+def _collect_rank_tokens(value: Any, out: set[int]) -> None:
+    """Collect integer rank ids cited via ``@r<N>`` in normalized fields."""
+    t = type(value)
+    if t in _REBIND_ATOMIC:
+        return
+    if t is str:
+        if "@r" in value:
+            for match in RANK_TOKEN.finditer(value):
+                out.add(int(match.group(RANK_GROUP)))
+        return
+    if t is tuple or t is list:
+        for item in value:
+            _collect_rank_tokens(item, out)
+        return
+    if t is dict:
+        for key, item in value.items():
+            if str(key) not in _SKIP_NORM_META_KEYS:
+                _collect_rank_tokens(item, out)
+        return
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            if str(key) not in _SKIP_NORM_META_KEYS:
+                _collect_rank_tokens(item, out)
+        return
+    if isinstance(value, (set, frozenset)):
+        for item in value:
+            _collect_rank_tokens(item, out)
+
+
+def _graph_rank_tokens(ops: Sequence[Any]) -> set[int]:
+    """Scan one replica graph for any ``@r<N>`` rank tokens in structural fields."""
+    tokens: set[int] = set()
+    for op in ops:
+        op_id = getattr(op, "op_id", "")
+        if op_id and "@r" in str(op_id):
+            _collect_rank_tokens(str(op_id), tokens)
+        for dep in getattr(op, "deps", ()) or ():
+            s_dep = str(dep)
+            if "@r" in s_dep:
+                _collect_rank_tokens(s_dep, tokens)
+        mf = getattr(op, "matrix_flops", ()) or ()
+        if mf:
+            _collect_rank_tokens(mf, tokens)
+        raw_m = getattr(op, "metadata", ()) or ()
+        if raw_m:
+            items = raw_m.items() if isinstance(raw_m, Mapping) else raw_m
+            for key, item in items:
+                if str(key) not in _SKIP_NORM_META_KEYS:
+                    _collect_rank_tokens(item, tokens)
+    return tokens
+
+
 def prove_homogeneous_cohort(
     case: Any, plans: Mapping[int, Any], *, selected_implementations: Any = None,
     initial_cache_states: Any = None,
@@ -594,14 +646,17 @@ def prove_homogeneous_cohort(
     elif len(ordered) > 1:
         base_ops = ordered[0]
         slots0, pat0, pfx0 = _request_slot_map(base_ops)
+        tokens0 = _graph_rank_tokens(base_ops)
         shared_topo = None
+        rank_slots0 = None
         if case is not None and getattr(case, "machine", None) is not None and getattr(case, "runtime", None) is not None:
             from mindie_sim.prediction.topology import Topology
             try:
                 shared_topo = Topology(case.machine, case.runtime.parallel)
             except (ModelingError, ValueError, KeyError, IndexError):
                 shared_topo = None
-        rank_slots0 = _replica_local_rank_slots(case, int(ordered_keys[0]), shared_topo)
+            if shared_topo is not None:
+                rank_slots0 = _replica_local_rank_slots(case, int(ordered_keys[0]), shared_topo)
         for rep_key, graph in zip(ordered_keys[1:], ordered[1:]):
             slots_r, pat_r, pfx_r = _request_slot_map(graph)
             if len(slots0) != len(slots_r):
@@ -614,7 +669,24 @@ def prove_homogeneous_cohort(
                 meta_pfx_r = _common_prefix(meta_tokens_r)
             else:
                 meta_pat_r, meta_pfx_r = pat_r, pfx_r
-            rank_slots_r = _replica_local_rank_slots(case, int(rep_key), shared_topo)
+            tokens_r = _graph_rank_tokens(graph)
+            if not tokens0 and not tokens_r:
+                eff_rank_slots0 = None
+                eff_rank_slots_r = None
+            else:
+                rank_slots_r = _replica_local_rank_slots(case, int(rep_key), shared_topo)
+                eff_rank_slots0 = rank_slots0
+                if (
+                    rank_slots0 is not None
+                    and rank_slots_r is not None
+                    and rank_slots0 != rank_slots_r
+                    and tokens_r
+                    and not (tokens_r & rank_slots_r.keys())
+                    and (tokens_r & rank_slots0.keys())
+                ):
+                    eff_rank_slots_r = rank_slots0
+                else:
+                    eff_rank_slots_r = rank_slots_r
             seen0: dict[str, int] = {}
             seen_r: dict[str, int] = {}
             is_iso = True
@@ -623,7 +695,7 @@ def prove_homogeneous_cohort(
                     o0, o_r, pat0, slots0, pfx0,
                     meta_pat_r, meta_slots_r, meta_pfx_r,
                     req_slots_r=slots_r, seen0=seen0, seen_r=seen_r,
-                    rank_slots0=rank_slots0, rank_slots_r=rank_slots_r,
+                    rank_slots0=eff_rank_slots0, rank_slots_r=eff_rank_slots_r,
                 ):
                     is_iso = False
                     break

@@ -624,7 +624,7 @@ drain_compl_snapshot:
                     int32_t li = (int32_t)t->lstart + k;
                     msim_link *l = &c->link[li];
                     if (l->rem <= 0.0 || l->rate > 0.0) continue;
-                    if (t->coupled_comp) {
+                    if (l->coupled_comp) {
                         if (l->mode != 1) continue;
                     } else if (c->res[l->res].policy == 1) {
                         continue;

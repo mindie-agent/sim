@@ -70,6 +70,19 @@ static bool proxy_less(const msim_ctx *c, int32_t a, int32_t b)
     return x->seq < y->seq;
 }
 
+/* Python fifo_winner(caps, tasks, resource_name): active holder on this
+ * resource (svc > 0), then priority, then actual start, then sequence. */
+static bool fifo_link_less(const msim_ctx *c, int32_t la, int32_t lb)
+{
+    const msim_link *xa = &c->link[la], *xb = &c->link[lb];
+    bool ha = xa->svc > 0.0, hb = xb->svc > 0.0;
+    const msim_task *ta = &c->task[xa->task], *tb = &c->task[xb->task];
+    if (ha != hb) return ha;
+    if (ta->prio != tb->prio) return ta->prio < tb->prio;
+    if (ta->start != tb->start) return ta->start < tb->start;
+    return ta->seq < tb->seq;
+}
+
 /* -- bounded index heaps ------------------------------------------------ */
 enum { HEAP_READY = 0, HEAP_RELEASE = 1, HEAP_COMPL = 2 };
 
@@ -138,7 +151,7 @@ static bool is_consumer(const msim_ctx *c, const msim_link *l)
 {
     if (l->rem <= 0.0) return false;
     if (c->task[l->task].state != 1) return false;
-    if (msim_res_mode_get(c, l->res) == 4 && l->rate <= 0.0) return false;
+    if (l->coupled_comp && l->rate <= 0.0) return false;
     return true;
 }
 

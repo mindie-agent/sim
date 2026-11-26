@@ -155,6 +155,7 @@ typedef struct {
     int32_t pstart;
     int32_t mode;           /* partition group id, -1 otherwise */
     uint8_t widened;        /* 1 when placement is disjointly widened over cohort */
+    uint8_t coupled_comp;   /* scratch: 1 if link is in a coupled owner component */
     double rem;
     double cap;
     double rate;

@@ -712,28 +712,56 @@ def scale_dedup_accounting(
             execution.cost.counts[key] = cur + delta * extra
 
 
+def _build_link_mirror_classes(
+    topology: Any,
+    cohort_ranks: frozenset[int],
+) -> dict[str, tuple[str, str, str, str, int, str]]:
+    """Map each topology link name to its symmetric mirror equivalence class."""
+    by_partition: dict[tuple[frozenset[int], str, str, str, str], list[str]] = {}
+    meta_by_name: dict[str, tuple[frozenset[int], str, str, str, str]] = {}
+    for link_name, link in topology.links.items():
+        channel = str(getattr(link, "channel", "") or "")
+        scope = str(getattr(link, "scope", "") or "")
+        semantics = str(getattr(link, "semantics", "") or "")
+        rail_val = (
+            topology.link_rail(link_name)
+            if hasattr(topology, "link_rail")
+            else getattr(link, "rail_id", None)
+        )
+        members = frozenset(int(m) for m in link.members)
+        part_key = (members, channel, scope, semantics, repr(rail_val))
+        meta_by_name[link_name] = part_key
+        by_partition.setdefault(part_key, []).append(link_name)
+    for names in by_partition.values():
+        if len(names) > 1:
+            names.sort()
+    classes: dict[str, tuple[str, str, str, str, int, str]] = {}
+    for link_name, (members, channel, scope, semantics, rail_repr) in meta_by_name.items():
+        if cohort_ranks and cohort_ranks <= members:
+            # Global link covering every participating cohort rank: keep exact link identity
+            # so parallel cluster-wide links never cross-contaminate one another.
+            tag = link_name
+        else:
+            # Partitioned link (e.g. intra-package D2D or intra-node slice): match symmetric
+            # sibling partitions by (channel, scope, semantics, rail, fanout, parallel ordinal).
+            siblings = by_partition[(members, channel, scope, semantics, rail_repr)]
+            tag = f"part:{siblings.index(link_name)}"
+        classes[link_name] = (channel, scope, semantics, rail_repr, len(members), tag)
+    return classes
+
+
 def _link_mirror_class(
     pfx: str,
-    topology: Any,
-    r0_rank_set: frozenset[int],
-    peer_rank_set: frozenset[int],
-) -> tuple[str, str, str, str]:
-    """Classify a link resource prefix preserving channel, rail, and shared-link identity."""
+    link_classes: Mapping[str, tuple[str, str, str, str, int, str]],
+) -> tuple[Any, ...]:
+    """Classify a link resource prefix preserving channel, scope, rail, and partition identity."""
     if "link:" not in pfx:
-        return (pfx, "", "", "")
+        return (pfx,)
     ns_part, link_name = pfx.rsplit("link:", 1)
-    link = topology.links.get(link_name)
-    if link is None:
-        return (ns_part, "", "", link_name)
-    channel = str(getattr(link, "channel", "") or "")
-    rail_val = (
-        topology.link_rail(link_name)
-        if hasattr(topology, "link_rail")
-        else getattr(link, "rail_id", None)
-    )
-    members = set(link.members)
-    shared = bool((members & r0_rank_set) and (members & peer_rank_set))
-    return (ns_part, channel, repr(rail_val), link_name if shared else "")
+    cls = link_classes.get(link_name)
+    if cls is None:
+        return (ns_part, link_name)
+    return (ns_part, *cls)
 
 
 def _mirror_replica_resources(
@@ -762,8 +790,8 @@ def _mirror_replica_resources(
         rep: tuple(rk for s in range(pp) for rk in topology.ranks(rep, s))
         for rep in (r0, *peers)
     }
-    r0_rank_set = frozenset(r0_ranks)
-    peer_rank_set = frozenset(rk for rep in peers for rk in all_ranks_by_rep[rep])
+    cohort_ranks = frozenset(rk for rk_list in all_ranks_by_rep.values() for rk in rk_list)
+    link_classes = _build_link_mirror_classes(topology, cohort_ranks)
     port_by_class: dict[tuple[Any, str, int, float], tuple[float, float]] = {}
     pair_by_class: dict[tuple[Any, float], tuple[float, float]] = {}
     intra_pair_by_pos: dict[tuple[Any, int, int, float], tuple[float, float]] = {}
@@ -802,7 +830,7 @@ def _mirror_replica_resources(
             pfx = m_port.group("pfx")
             direction = m_port.group("dir")
             rk_id = int(m_port.group("rk"))
-            lclass = _link_mirror_class(pfx, topology, r0_rank_set, peer_rank_set)
+            lclass = _link_mirror_class(pfx, link_classes)
             if direction == "rx" and mirror_links:
                 info = rank_to_rep_pos.get(rk_id)
                 if info is not None:
@@ -818,7 +846,7 @@ def _mirror_replica_resources(
             src_rk = int(m_pair.group("src"))
             dst_rk = int(m_pair.group("dst"))
             if src_rk in r0_pos:
-                lclass = _link_mirror_class(pfx, topology, r0_rank_set, peer_rank_set)
+                lclass = _link_mirror_class(pfx, link_classes)
                 if dst_rk in r0_pos:
                     intra_pair_by_pos[(lclass, r0_pos[src_rk], r0_pos[dst_rk], rate_val)] = (
                         amt, b_val,
@@ -852,7 +880,7 @@ def _mirror_replica_resources(
             info = rank_to_rep_pos.get(rk_id)
             if info is None or (info[0] == r0 and not (direction == "rx" and mirror_links)):
                 continue
-            lclass = _link_mirror_class(pfx, topology, r0_rank_set, peer_rank_set)
+            lclass = _link_mirror_class(pfx, link_classes)
             val = port_by_class.get((lclass, direction, info[1], rate_val))
             if val is not None:
                 serviced[res_name], busy[res_name] = val
@@ -868,7 +896,7 @@ def _mirror_replica_resources(
                 continue
             if src_info[0] == r0 and dst_info[0] == r0:
                 continue
-            lclass = _link_mirror_class(pfx, topology, r0_rank_set, peer_rank_set)
+            lclass = _link_mirror_class(pfx, link_classes)
             if src_info[0] == dst_info[0]:
                 val = intra_pair_by_pos.get((lclass, src_info[1], dst_info[1], rate_val))
             elif mirror_links:
