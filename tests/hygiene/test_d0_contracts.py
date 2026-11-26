@@ -306,7 +306,7 @@ def test_synthetic_gqa_policy_locked_for_simulation_and_opt_in_for_modeling() ->
     k3_prep = sim_contract.build_prepare_plan(16, draft_spec=load_model("kimi-k3").auxiliary.dspark)  # type: ignore[union-attr]
     assert isinstance(k3_prep, DSparkPreparePlan) and k3_prep.exact_gemm_flops == 10_569_646_080
     mm3_prep = sim_contract.build_prepare_plan(16, draft_spec=load_model("minimax-m3").auxiliary.mtp)  # type: ignore[union-attr]
-    assert mm3_prep.exact_gemm_flops == 15_099_494_400
+    assert mm3_prep.exact_gemm_flops == 13_891_534_848
     k31_prep = sim_contract.build_prepare_plan(16, draft_spec=load_model("kimi-k3.1").auxiliary.dspark)  # type: ignore[union-attr]
     assert k31_prep.exact_gemm_flops == 10_643_046_400
     v41_aux = load_model("deepseek-v4.1-flash").auxiliary

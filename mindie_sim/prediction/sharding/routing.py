@@ -14,6 +14,7 @@ from functools import lru_cache
 from typing import Mapping
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.runtime_features import split_routing_features
 
 
 def _rank_rows(counts, ep, rank):
@@ -349,9 +350,10 @@ def select(runtime, layer, *, tokens, valid_tokens, global_tokens,
     if raw is None:
         return None
     p = runtime.parallel
+    logical_routing, _ = split_routing_features(runtime.routing or {})
     wrapper = runtime.kernels.get("moe_token_partition")
     if raw == {"kind": "vllm_ascend_mc2_tp", "global_bs": 0}:
-        if (runtime.routing != {"policy": "balanced"} or p.dp < 1 or p.ep < p.tp
+        if (logical_routing != {"policy": "balanced"} or p.dp < 1 or p.ep < p.tp
                 or p.ep % p.tp != 0 or p.ep < 2 or p.cp != 1 or p.pcp < 1
                 or p.pp < 1 or replica < 0
                 or runtime.moe_recipe != "alltoall" or token_shards != 1
@@ -369,7 +371,7 @@ def select(runtime, layer, *, tokens, valid_tokens, global_tokens,
                       (tokens + p.tp - 1) // p.tp, valid_tokens * (p.ep // p.tp), p.tp)
     if raw != {"kind": "vllm_ascend_sp_mc2", "global_bs": 0}:
         raise ModelingError("force_eplb_source_requires_explicit_vllm_ascend_sp_mc2_global_bs0")
-    if (runtime.routing != {"policy": "balanced"} or p.dp < 1 or p.ep < p.tp
+    if (logical_routing != {"policy": "balanced"} or p.dp < 1 or p.ep < p.tp
             or p.ep % p.tp != 0 or p.ep < 2 or p.cp != 1 or p.pcp < 1
             or p.pp < 1 or replica < 0
             or runtime.moe_recipe != "alltoall" or token_shards != p.tp
@@ -504,7 +506,7 @@ def select_realization(runtime, layer, *, phase, tokens, valid_tokens, global_to
                        token_shards=1, valid_source_tokens=None, replica=0, views=None,
                        physical_rank=None, query_position=None, source_geometry=None,
                        explicit_physical_rank: bool = False, machine=None):
-    raw = runtime.routing
+    raw, _ = split_routing_features(runtime.routing or {})
     from mindie_sim.prediction.sharding.routing import select as source_realization
     selected = source_realization(
         runtime, layer, tokens=tokens, valid_tokens=valid_tokens,

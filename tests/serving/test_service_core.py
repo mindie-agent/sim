@@ -490,11 +490,17 @@ def test_alltoallv_receive_rows_follow_destination_assignments():
     assert experts and experts[0].local_shape[0] == 36
     assert dict(by_recipe(graphs[1], "expert_dispatch")[0].metadata)["payload_rows"] == 0
 def test_redundant_expert_slot_binding_uses_the_replica_owner():
-    graphs = target_graphs(parse_case(compose_case( "glm-5.3-flash", hardware="a5", tp=1, dp=32, ep=32, num_devices=32, layers=4, o_proj_tp=8, linear_proj_tp=8, lm_head_tp=8, redundant_experts_per_rank=1, prompt_tokens=8, output_tokens=2)), phase="decode", tokens=1, context=0, sequences=1, scope="body")
-    def gate(replica):
+    raw = compose_case( "glm-5.3-flash", hardware="a5", tp=1, dp=32, ep=32, num_devices=32, layers=4, o_proj_tp=8, linear_proj_tp=8, lm_head_tp=8, redundant_experts_per_rank=1, prompt_tokens=8, output_tokens=2)
+    def gate(graphs, replica):
         return next(op for op in graphs[replica] if op.recipe == "grouped_gate_up" and op.layer == 3)
-    assert {replica: dict(gate(replica).metadata)["ep_rank"] for replica in (0, 2)} == {0: 0, 2: 2}
-    assert (dict(gate(0).metadata)["routed_weight_read_bytes"] != dict(gate(2).metadata)["routed_weight_read_bytes"])
+    balanced = target_graphs(parse_case(raw), phase="decode", tokens=1, context=0, sequences=1, scope="body")
+    assert {replica: dict(gate(balanced, replica).metadata)["ep_rank"] for replica in (0, 2)} == {0: 0, 2: 2}
+    assert dict(gate(balanced, 0).metadata)["routed_weight_read_bytes"] == pytest.approx(dict(gate(balanced, 2).metadata)["routed_weight_read_bytes"])
+    # Asymmetric explicit slot placement: ranks 1..31 replicate expert 0 (32 copies), while rank 2's base experts keep 1 copy.
+    raw["runtime"]["routing"] = {"expert_slot_policy": "explicit", "expert_slot_map": {"3": [list(range(r * 9, (r + 1) * 9)) + [9 if r == 0 else 0] for r in range(32)]}}
+    asymmetric = target_graphs(parse_case(raw), phase="decode", tokens=1, context=0, sequences=1, scope="body")
+    assert {replica: dict(gate(asymmetric, replica).metadata)["ep_rank"] for replica in (0, 2)} == {0: 0, 2: 2}
+    assert dict(gate(asymmetric, 0).metadata)["routed_weight_read_bytes"] < dict(gate(asymmetric, 2).metadata)["routed_weight_read_bytes"]
 def test_local_tp_quantizer_and_gemm_derive_the_same_scale_geometry():
     graphs = target_graphs(parse_case(compose_case( "glm-5.3-flash", hardware="a5", tp=1, dp=8, ep=8, num_devices=8, layers=4, o_proj_tp=8, linear_proj_tp=8, lm_head_tp=8, quant="w8a8_mxfp8", prompt_tokens=8, output_tokens=2)), phase="decode", tokens=6, context=0, sequences=1, scope="body")
     quantizers = {op.op_id: dict(op.metadata).get("activation_scale_shape") for op in graphs[0] if op.layer == 3 and op.family == "quantize"}

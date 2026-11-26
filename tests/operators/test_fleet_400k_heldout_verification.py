@@ -344,10 +344,10 @@ def test_whitebox_operator_physics_conservation_regressions_13_to_21() -> None:
     assert v_flat["status"] == "passed" and v_req["status"] == "passed"
     assert abs(v_flat["result"]["duration_ms"] - v_req["result"]["duration_ms"]) / v_flat["result"]["duration_ms"] < 0.05
 
-    # #16: SparseIndexer consumes canonical RequestView kv_lens (67.1M vs 134.2M) and charges 128 independent queries.
+    # #16: SparseIndexer consumes canonical RequestView kv_lens (67.4M N=16-aligned vs 134.2M) and charges 128 independent queries.
     op_idx1 = sparse_indexer.make_indexer_op(SparseIndexerContract(query_tokens=1, scanned_rows=8192, index_heads=64, index_dim=128, topk_items=2048, batch_size=1, native_split_core=True), op_id="idx1")
     rv_idx = RequestView(request_id="r0", q_len=1, context=4096, samples=True, phase="decode")
-    assert sparse_indexer.build(op_idx1, _ctx(c9362, op_idx1, requests=(rv_idx,))).work.matrix["bf16"] == 67125248
+    assert sparse_indexer.build(op_idx1, _ctx(c9362, op_idx1, requests=(rv_idx,))).work.matrix["bf16"] == 67371008
     op_idx128 = sparse_indexer.make_indexer_op(SparseIndexerContract(query_tokens=128, scanned_rows=4096, index_heads=64, index_dim=128, topk_items=2048, batch_size=128, native_split_core=True), op_id="idx128")
     v_idx128 = verify_operator(c9362, op_idx128, sparse_indexer.build)
     assert v_idx128["status"] == "passed" and v_idx128["result"]["serviced"]["mte2_aic@r0:s0"] >= 134217728 + 2097152
