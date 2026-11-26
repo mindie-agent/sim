@@ -95,8 +95,8 @@ def _capacity_fixture(monkeypatch, *, async_scheduling: bool = True,
     raw["machine"]["device"]["memory_bytes"] = int(fixed + budget_kib * 1024)
     parsed = parse_case(raw)
 
-    def page_bytes(self, tokens, *, padded=True, query_tokens=None):
-        _ = query_tokens
+    def page_bytes(self, tokens, *, padded=True, query_tokens=None, phase="decode"):
+        _ = query_tokens, phase
         rows = (math.ceil(max(1, int(tokens)) / 128) * 128
                 if padded else max(1, int(tokens)))
         return tuple([float(rows * 1024)]
@@ -488,7 +488,7 @@ def test_public_sla_prefill_binds_lifecycle_to_decode_commit(monkeypatch):
     assert scenario["prefill_tokens_per_seq"] == 512
     assert scenario["decode_emitted_tokens_per_seq"] == 1.0
     assert scenario["emitted_tokens_per_seq"] == 512.0
-    assert scenario["joint_capacity"]["lifecycle_active_kv_bytes"] == pytest.approx(1536 * 1024)
+    assert scenario["joint_capacity"]["lifecycle_active_kv_bytes"] == pytest.approx(1280 * 1024)
     assert scenario["joint_capacity"]["lifecycle_retiring_kv_bytes"] == pytest.approx(640 * 1024)
     assert scenario["joint_capacity"]["lifecycle_peak_bytes"] == pytest.approx(2560 * 1024)
     assert scenario["joint_capacity"]["lifecycle_headroom_bytes"] == pytest.approx(140 * 1024)

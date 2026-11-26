@@ -230,8 +230,8 @@
               "hc_post"
             ],
             "traffic_profile": {
-              "hc_pre": "hc_pre_m_k_split_175ef4d4",
-              "hc_post": "hc_post_d_split_175ef4d4"
+              "hc_pre": "hc_pre_arch35_mk_175ef4d4",
+              "hc_post": "hc_post_arch35_bf16_175ef4d4"
             }
           }
         }
