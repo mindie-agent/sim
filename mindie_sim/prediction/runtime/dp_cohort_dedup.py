@@ -403,6 +403,85 @@ def _intra_replica_block_matches(
     return True
 
 
+def _replica_traffic_histograms_match(
+    matrix: Sequence[Mapping[int, int]],
+    byte_rows: Sequence[Mapping[int, float]],
+    has_byte_matrix: bool,
+    width: int,
+    local_k: int,
+) -> bool:
+    """Verify identical per-rank outgoing/incoming traffic histograms and row/col totals across replicas."""
+    n_replicas = width // local_k
+    if n_replicas <= 1:
+        return True
+    in_matrix: list[dict[int, int]] = [{} for _ in range(width)]
+    for src, row in enumerate(matrix):
+        for dst, frames in row.items():
+            if src != dst and frames > 0:
+                in_matrix[dst][src] = frames
+    in_bytes: list[dict[int, float]] = [{} for _ in range(width)]
+    if has_byte_matrix:
+        for src, row_b in enumerate(byte_rows):
+            for dst, b_val in row_b.items():
+                if src != dst and b_val > 0.0:
+                    in_bytes[dst][src] = b_val
+
+    def _hist_and_totals(rk: int) -> tuple[tuple[Any, ...], float, float]:
+        rep_base = (rk // local_k) * local_k
+        rep_end = rep_base + local_k
+        out_intra = tuple(sorted(
+            (dst - rep_base, f) for dst, f in matrix[rk].items()
+            if dst != rk and rep_base <= dst < rep_end
+        ))
+        out_cross = tuple(sorted(
+            (dst % local_k, f) for dst, f in matrix[rk].items()
+            if dst != rk and not (rep_base <= dst < rep_end)
+        ))
+        in_intra = tuple(sorted(
+            (src - rep_base, f) for src, f in in_matrix[rk].items()
+            if src != rk and rep_base <= src < rep_end
+        ))
+        in_cross = tuple(sorted(
+            (src % local_k, f) for src, f in in_matrix[rk].items()
+            if src != rk and not (rep_base <= src < rep_end)
+        ))
+        out_intra_b = tuple(sorted(
+            (dst - rep_base, round(b, _BYTE_SIG_ROUND_DIGITS)) for dst, b in byte_rows[rk].items()
+            if dst != rk and rep_base <= dst < rep_end
+        ))
+        out_cross_b = tuple(sorted(
+            (dst % local_k, round(b, _BYTE_SIG_ROUND_DIGITS)) for dst, b in byte_rows[rk].items()
+            if dst != rk and not (rep_base <= dst < rep_end)
+        ))
+        in_intra_b = tuple(sorted(
+            (src - rep_base, round(b, _BYTE_SIG_ROUND_DIGITS)) for src, b in in_bytes[rk].items()
+            if src != rk and rep_base <= src < rep_end
+        ))
+        in_cross_b = tuple(sorted(
+            (src % local_k, round(b, _BYTE_SIG_ROUND_DIGITS)) for src, b in in_bytes[rk].items()
+            if src != rk and not (rep_base <= src < rep_end)
+        ))
+        row_f = sum(matrix[rk].values())
+        col_f = sum(in_matrix[rk].values())
+        row_b = sum(byte_rows[rk].values()) if has_byte_matrix else 0.0
+        col_b = sum(in_bytes[rk].values()) if has_byte_matrix else 0.0
+        sig = (
+            row_f, col_f, out_intra, out_cross, in_intra, in_cross,
+            out_intra_b, out_cross_b, in_intra_b, in_cross_b,
+        )
+        return sig, row_b, col_b
+
+    for pos in range(local_k):
+        ref_sig, ref_rb, ref_cb = _hist_and_totals(pos)
+        for rep in range(1, n_replicas):
+            sig, rb, cb = _hist_and_totals(rep * local_k + pos)
+            if sig != ref_sig:
+                return False
+            if has_byte_matrix and not (_bytes_close(rb, ref_rb) and _bytes_close(cb, ref_cb)):
+                return False
+    return True
+
+
 def _matrices_are_replica_reciprocal(
     matrix: Sequence[Mapping[int, int]],
     byte_rows: Sequence[Mapping[int, float]],
@@ -410,7 +489,7 @@ def _matrices_are_replica_reciprocal(
     width: int,
     local_k: int,
 ) -> bool:
-    """True when cross-replica blocks are strictly reciprocal and intra-blocks isomorphic."""
+    """True when cross-replica blocks are strictly reciprocal, intra-blocks isomorphic, and per-rank histograms identical."""
     if width <= 0 or local_k <= 0 or width % local_k != 0:
         return False
     n_replicas = width // local_k
@@ -427,11 +506,13 @@ def _matrices_are_replica_reciprocal(
                 matrix, byte_rows, has_byte_matrix, rep * local_k, local_k,
             ):
                 return False
-    return True
+    return _replica_traffic_histograms_match(
+        matrix, byte_rows, has_byte_matrix, width, local_k,
+    )
 
 
 def _raw_mc2_matrices_reciprocal(mc2_phase: Mapping[str, Any], ep_width: int, local_k: int) -> bool:
-    """Pure read-only replica-block reciprocity check directly over raw ``mc2_phase`` metadata."""
+    """Pure read-only replica-block reciprocity and histogram check directly over raw ``mc2_phase`` metadata."""
     route_matrix = mc2_phase.get("route_matrix")
     route_bytes = mc2_phase.get("route_matrix_bytes")
     if not route_matrix and not route_bytes:
@@ -451,6 +532,13 @@ def _raw_mc2_matrices_reciprocal(mc2_phase: Mapping[str, Any], ep_width: int, lo
                 val = int(route_matrix[v][u] if reverse else row[v])
                 if u != v and val > 0:
                     matrix[u][v] = val
+        n_replicas = ep_width // local_k
+        for pos in range(local_k):
+            ref_diag = int(route_matrix[pos][pos])
+            for rep in range(1, n_replicas):
+                rk = rep * local_k + pos
+                if int(route_matrix[rk][rk]) != ref_diag:
+                    return False
     byte_rows: list[dict[int, float]] = [{} for _ in range(ep_width)]
     if route_bytes:
         for u in range(ep_width):
@@ -466,6 +554,77 @@ def _raw_mc2_matrices_reciprocal(mc2_phase: Mapping[str, Any], ep_width: int, lo
     )
 
 
+class _PreflightPhaseStub:
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _PreflightTransportProbe:
+    """Read-only adapter exposing ``transport_cells`` from raw ``mc2_phase`` metadata."""
+
+    __slots__ = (
+        "phases", "_route_matrix", "_route_reverse", "_route_bytes",
+        "_packet_bytes", "_uniform_bytes", "_experts",
+    )
+
+    def __init__(self, mc2_phase: Mapping[str, Any], ep_width: int) -> None:
+        raw_matrix = mc2_phase.get("route_matrix")
+        raw_bytes = mc2_phase.get("route_matrix_bytes")
+        raw_experts = int(mc2_phase.get("experts", 0) or 0)
+        raw_pkt = int(mc2_phase.get("packet_bytes", 0) or 0)
+        raw_unif = float(mc2_phase.get("uniform_payload_bytes", 0.0) or 0.0)
+        self.phases = (_PreflightPhaseStub("count_status_exchange"),) if raw_experts > 0 else ()
+        self._route_matrix = raw_matrix
+        self._route_reverse = bool(mc2_phase.get("route_reverse", False))
+        self._route_bytes = raw_bytes
+        self._packet_bytes = raw_pkt if raw_pkt > 0 else 1
+        self._uniform_bytes = (
+            raw_unif if raw_unif > 0.0
+            else (0.0 if (raw_matrix or raw_bytes) else float(ep_width))
+        )
+        self._experts = raw_experts
+
+    def transport_cells(
+        self, transport: Mapping[str, Any], *, count: bool = False,
+    ) -> tuple[tuple[int, int, int, int, float, int], ...]:
+        group = tuple(transport.get("group") or ())
+        sources = tuple(transport.get("sources") or ())
+        gsize = len(group)
+        if gsize <= 1:
+            return ()
+        cells: list[tuple[int, int, int, int, float, int]] = []
+        for si in sources:
+            if not 0 <= si < gsize:
+                continue
+            if count:
+                payload = float(max(0, self._experts) // gsize)
+                if payload > 0.0:
+                    for di in range(gsize):
+                        if di != si:
+                            cells.append((si, di, group[si], group[di], payload, 0))
+                continue
+            for di in range(gsize):
+                if di == si:
+                    continue
+                if self._route_matrix:
+                    frames = int(
+                        self._route_matrix[di][si] if self._route_reverse
+                        else self._route_matrix[si][di]
+                    )
+                    useful = float(frames * self._packet_bytes)
+                elif self._route_bytes:
+                    frames = 0
+                    useful = float(self._route_bytes[si][di] or 0.0)
+                else:
+                    frames = 0
+                    useful = self._uniform_bytes / float(gsize)
+                if useful > 0.0:
+                    cells.append((si, di, group[si], group[di], useful, frames))
+        return tuple(cells)
+
+
 def _mc2_op_can_run_canonical(
     execution: Any,
     op: Any,
@@ -475,7 +634,7 @@ def _mc2_op_can_run_canonical(
     can_r0_only: bool,
     replicas: tuple[int, ...],
 ) -> bool:
-    """True only when a multi-rank MC2 op is guaranteed to execute canonical r0-only."""
+    """True only when an MC2 op is guaranteed to execute canonical r0-only."""
     if not can_r0_only or len(replicas) < _MIN_DEDUP_REPLICAS:
         return False
     if not getattr(execution.topology, "links", None):
@@ -514,7 +673,28 @@ def _mc2_op_can_run_canonical(
     for rep in peer_replicas:
         if len(execution.topology.ranks(rep, source_stage)) != local_k:
             return False
-    return _raw_mc2_matrices_reciprocal(mc2_phase, ep_width, local_k)
+    if not _raw_mc2_matrices_reciprocal(mc2_phase, ep_width, local_k):
+        return False
+    if (hasattr(execution, "native_transport")
+            and hasattr(execution, "_canonical_replica_maps")
+            and hasattr(execution, "_verify_canonical_route_symmetry")):
+        transport = dict(execution.native_transport(op, r0))
+        group = tuple(int(rk) for rk in (transport.get("group") or ()))
+        route = transport.get("route")
+        if len(group) != ep_width:
+            return False
+        rep_maps = execution._canonical_replica_maps(group, peer_replicas, source_stage, local_k)
+        if rep_maps is None:
+            return False
+        if callable(route):
+            rep_ranks_map, rep_indices_map, rank_to_rep_pos, _ = rep_maps
+            probe = _PreflightTransportProbe(mc2_phase, ep_width)
+            if not execution._verify_canonical_route_symmetry(
+                probe, route, transport, peer_replicas,
+                rep_ranks_map, rep_indices_map, rank_to_rep_pos,
+            ):
+                return False
+    return True
 
 
 def _has_unsynced_peer_die_overlap(
@@ -538,7 +718,7 @@ def _has_unsynced_peer_die_overlap(
     can_r0_only = can_dedup_collective_to_canonical(execution.topology, execution.engine)
     stage_non_barrier: dict[int, int] = {}
     stage_stream_non_barrier: dict[tuple[int, Any], int] = {}
-    candidate_collectives: list[tuple[int, int, Any]] = []
+    collectives: list[tuple[int, Any, int, Any, bool, bool]] = []
     for idx, op in enumerate(ops0):
         if op.family != "barrier":
             bit = 1 << idx
@@ -559,25 +739,24 @@ def _has_unsynced_peer_die_overlap(
                 elif key == "source_stage" and value is not None:
                     source_stage = int(value)
         is_mc2 = op.family in _NATIVE_MC2_FAMILIES or has_mc2_phase
-        multi_rank_mc2 = is_mc2 and len(execution.topology.ranks(r0, source_stage)) > 1
-        needs_peer_sync = (
-            (multi_rank_mc2 and not _mc2_op_can_run_canonical(
-                execution, op, r0, source_stage,
-                can_r0_only=can_r0_only, replicas=replicas,
-            ))
-            or (not can_r0_only and (is_mc2 or has_group_axis))
-        )
-        if needs_peer_sync:
-            candidate_collectives.append((idx, source_stage, op.stream))
-    if not candidate_collectives:
+        if is_mc2 or has_group_axis:
+            collectives.append((idx, op, source_stage, op.stream, is_mc2, has_group_axis))
+    if not collectives:
         return False
     anc, desc = _dag_reachability_masks(ops0)
-    for idx, source_stage, stream in candidate_collectives:
+    for idx, op, source_stage, stream, is_mc2, has_group_axis in collectives:
         other_mask = (
             stage_non_barrier.get(source_stage, 0)
             & ~stage_stream_non_barrier.get((source_stage, stream), 0)
         )
-        if other_mask & ~(anc[idx] | desc[idx] | (1 << idx)):
+        if not (other_mask & ~(anc[idx] | desc[idx] | (1 << idx))):
+            continue
+        if not can_r0_only and (is_mc2 or has_group_axis):
+            return True
+        if is_mc2 and not _mc2_op_can_run_canonical(
+            execution, op, r0, source_stage,
+            can_r0_only=can_r0_only, replicas=replicas,
+        ):
             return True
     return False
 

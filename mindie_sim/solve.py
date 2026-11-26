@@ -579,11 +579,17 @@ def _extract_bottleneck_roofline(
     tokens: int,
     scope: str,
     phase: str = "decode",
+    context: int | None = None,
     summary_sink: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    eff_ctx = (
+        max(0, int(context))
+        if context is not None
+        else (0 if phase == "prefill" else prompt_tokens)
+    )
     eff = _analyze_case_bounded(
         raw_case, phase=phase, tokens=tokens,
-        context=(0 if phase == "prefill" else prompt_tokens),
+        context=eff_ctx,
         sequences=max(1, int(sequences)), scope=scope,
     )
     if summary_sink is not None:
@@ -667,8 +673,9 @@ def _bundle_inputs_for_solution(
     seq = max(1, int(best.get("b_feasible", 1) or 1))
     mtp_n = int(best.get("mtp_proposal_tokens", 0) or 0)
     if is_prefill_only:
+        p_tokens, p_context = _prefill_prefix_split(parse_case(rec_case), int(prompt_tokens))
         req = StepRequest(
-            phase="prefill", tokens=max(1, int(prompt_tokens)), context=0,
+            phase="prefill", tokens=p_tokens, context=p_context,
             sequences=1, scope=scope,
         )
     else:
@@ -869,7 +876,7 @@ def _evaluate_winner_analysis(
     if ablate_prs:
         bottleneck = _extract_bottleneck_roofline(
             rec_case, prompt_tokens=prompt, sequences=win_seq,
-            tokens=win_tokens, scope=win_scope, phase=win_phase,
+            tokens=win_tokens, context=win_context, scope=win_scope, phase=win_phase,
         )
         waterfall = compare_feature_tracks(
             model, hardware=hardware, runtime_stack=runtime_stack,

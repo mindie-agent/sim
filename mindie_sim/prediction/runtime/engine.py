@@ -1099,7 +1099,8 @@ class Engine(
                    and getattr(memory, "runtime_state", None) is self)
         self.memory = memory
         self.memory_pools.update(str(pool) for pool in pools)
-        self._memory_pools_frozen = frozenset(self.memory_pools)
+        if self.memory_pools:
+            self._memory_pools_frozen = self._intern_pool_set(self.memory_pools)
         self._memory_ledgers[id(memory)] = memory
         if already:
             # Re-binding the same ledger to the same root is a no-op: the
@@ -1120,6 +1121,21 @@ class Engine(
                 self.memory_ledger_error = str(error)
         return True
 
+    def _intern_pool_set(self, pools: Sequence[str]) -> frozenset[str]:
+        """Return an Engine-owned exact ``frozenset[str]`` safe for native admission."""
+        raw_items = (pools,) if isinstance(pools, str) else tuple(pools)
+        if not raw_items:
+            return _EMPTY_FROZENSET
+        if any(type(pool) is not str for pool in raw_items):
+            return frozenset(str(pool) for pool in raw_items)
+        pool_key = tuple(sorted(set(raw_items)))
+        pools_frozen = self._engine_pool_sets.get(pool_key)
+        if pools_frozen is None:
+            pools_frozen = frozenset(pool_key)
+            self._engine_pool_sets[pool_key] = pools_frozen
+            self._engine_pool_set_ids.add(id(pools_frozen))
+        return pools_frozen
+
     @contextmanager
     def memory_scope(self, memory=None, *, replica: int = 0, stage: int = 0,
                      pools: Sequence[str] = ("hbm",), bindings=None):
@@ -1138,15 +1154,7 @@ class Engine(
         if pools.__class__ is frozenset:
             pools_frozen = pools
         else:
-            pool_key = tuple(sorted({str(pool) for pool in pools}))
-            if not pool_key:
-                pools_frozen = _EMPTY_FROZENSET
-            else:
-                pools_frozen = self._engine_pool_sets.get(pool_key)
-                if pools_frozen is None:
-                    pools_frozen = frozenset(pool_key)
-                    self._engine_pool_sets[pool_key] = pools_frozen
-                    self._engine_pool_set_ids.add(id(pools_frozen))
+            pools_frozen = self._intern_pool_set(pools)
         norm_bindings = dict(bindings) if bindings else {}
         rep_i = int(replica)
         stg_i = int(stage)

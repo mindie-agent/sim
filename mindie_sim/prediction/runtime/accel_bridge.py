@@ -217,7 +217,7 @@ class NativeBackend:
         "window_rearm_after", "window_rearm_cooldown", "pending_ext_seqs",
         "start_obs_seqs", "cohort_seqs", "cohort_checked_seq",
         "_prep_ok_cache", "_prep_cache_ver",
-        "_trace_dq_id", "_trace_seen_appends", "_trace_seen_ext_mut",
+        "_trace_dq_id", "_trace_seen_gen", "_trace_seen_appends", "_trace_seen_ext_mut",
         "_trace_seen_len", "_trace_has_non_inert", "_cohort_stop_key",
     )
     def __init__(self, status: dict | None, mode: str = "auto", *,
@@ -286,6 +286,7 @@ class NativeBackend:
         self.cohort_checked_seq = 0
         self._prep_ok_cache: dict[int, tuple[object, bool]] = {}
         self._trace_dq_id: int = 0
+        self._trace_seen_gen: int = -1
         self._trace_seen_appends: int = 0
         self._trace_seen_ext_mut: int = 0
         self._trace_seen_len: int = 0
@@ -336,11 +337,12 @@ class NativeBackend:
                             return False
                         self.status_dict = dict(status)
                         self.library = load_library(status)
-                    if cache_key is not None and status.get("cache_path") in accel_loader._LOADED:
+                    post_key = _attach_cache_key()
+                    if post_key is not None and status.get("cache_path") in accel_loader._LOADED:
                         with _PROCESS_ATTACH_LOCK:
                             if len(_PROCESS_ATTACH_CACHE) >= accel_loader.MAX_LOADED_LIBRARIES:
                                 _PROCESS_ATTACH_CACHE.pop(next(iter(_PROCESS_ATTACH_CACHE)))
-                            _PROCESS_ATTACH_CACHE[cache_key] = (dict(status), self.library)
+                            _PROCESS_ATTACH_CACHE[post_key] = (dict(status), self.library)
                 except TimeoutError:
                     raise
                 except (AccelUnavailable, OSError, MemoryError, KernelFault) as error:
@@ -1148,11 +1150,13 @@ class NativeBackend:
             return False
         dq = engine._trace_dq
         cur_id = id(dq)
+        cur_gen = engine._trace_gen
         cur_appends = engine._trace_appends
         cur_ext = engine._trace_view._ext_mut
         cur_len = len(dq)
         if not cur_len:
             self._trace_dq_id = cur_id
+            self._trace_seen_gen = cur_gen
             self._trace_seen_appends = cur_appends
             self._trace_seen_ext_mut = cur_ext
             self._trace_seen_len = 0
@@ -1160,6 +1164,7 @@ class NativeBackend:
             return False
         if (not self._trace_has_non_inert
                 and cur_id == self._trace_dq_id
+                and cur_gen == self._trace_seen_gen
                 and cur_ext == self._trace_seen_ext_mut):
             delta = cur_appends - self._trace_seen_appends
             if delta == 0 and cur_len == self._trace_seen_len:
@@ -1180,6 +1185,7 @@ class NativeBackend:
                 return True
         non_inert = any(not is_inert_trace_entry(row) for row in dq)
         self._trace_dq_id = cur_id
+        self._trace_seen_gen = cur_gen
         self._trace_seen_appends = cur_appends
         self._trace_seen_ext_mut = cur_ext
         self._trace_seen_len = cur_len

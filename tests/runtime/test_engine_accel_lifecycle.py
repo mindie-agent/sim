@@ -626,3 +626,38 @@ def test_process_attach_memo_avoids_repeated_cache_lock_across_engines(monkeypat
     assert accel_bridge._attach_cache_key() not in accel_bridge._PROCESS_ATTACH_CACHE
     accel_loader._LOADED.clear()
 
+
+def test_forced_rebuild_publishes_new_generation_attached_by_next_engine(monkeypatch, tmp_path):
+    """Publishing generation G2 via build_accel(force=True) invalidates G1 process attach reuse."""
+    monkeypatch.setenv("MINDIE_SIM_CC", _compiler())
+    monkeypatch.setenv("MINDIE_CACHE_HOME", str(tmp_path / "cache_gen"))
+    accel_build.reset_build_memo()
+    accel_loader._LOADED.clear()
+    accel_bridge._PROCESS_ATTACH_CACHE.clear()
+
+    first = Engine([Resource("r", 100.0)], backend="c")
+    try:
+        first.submit("t0", work={"r": 10.0})
+        first.advance()
+        path_g1 = first.accel_status()["cache_path"]
+        lib_g1 = first._accel.library
+    finally:
+        first.close()
+
+    rebuilt = accel_build.build_accel(force=True)
+    assert rebuilt["ok"] is True
+    path_g2 = rebuilt["cache_path"]
+    assert path_g2 != path_g1
+
+    second = Engine([Resource("r", 100.0)], backend="c")
+    try:
+        second.submit("t1", work={"r": 10.0})
+        second.advance()
+        assert second.accel_status()["cache_path"] == path_g2
+        assert second._accel.library is not lib_g1
+    finally:
+        second.close()
+    accel_build.reset_build_memo()
+    accel_loader._LOADED.clear()
+    accel_bridge._PROCESS_ATTACH_CACHE.clear()
+

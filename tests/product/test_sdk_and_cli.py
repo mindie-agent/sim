@@ -1039,5 +1039,102 @@ def test_cli_body_graph_view_and_zero_context_export_parsing(tmp_path):
         assert ns_exp.context == 0
 
 
+def test_report_monotonicity_guard_uses_operators_and_preserves_disaggregated_pools(tmp_path, monkeypatch):
+    """Monotonicity guard iterates ExportBundle.operators and preserves solved PD pools/handoff on retry."""
+    from dataclasses import replace as dc_replace
+    from mindie_sim.cli.parser import build_parser
+    from mindie_sim.cli import report as report_mod
+    from mindie_sim.sweep import pd as pd_mod
 
+    p_case = compose_raw_case(
+        "qwen3-32b", "a3", tp=1, dp=1, ep=1, layers=1,
+        prompt_tokens=128, output_tokens=32, quant="w8a8_dynamic",
+        role="pd_prefill", ttft_slo_ms=5000.0,
+    )
+    d_case = compose_raw_case(
+        "qwen3-32b", "a3", tp=1, dp=1, ep=1, layers=1,
+        prompt_tokens=128, output_tokens=32, quant="w8a8_dynamic",
+        role="pd_decode", tpot_slo_ms=50.0,
+    )
+    d_case["runtime"].setdefault("metadata", {})["mqsmla_dsl_544_320_active"] = False
+    pd_summary = {
+        "pd_ratio": "1P:1D",
+        "pd_transfer_mode": "layerwise_overlap_d2d",
+        "prefill_instances": 1,
+        "decode_instances": 1,
+        "prefill_used_dies": 1,
+        "decode_used_dies": 1,
+        "used_dies": 2,
+        "handoff_tpot_ms": 1.25,
+        "prefill_kv_rps": 20.0,
+        "e2e_total_tps": 400.0,
+    }
+
+    def _fake_solve(*_a, **kw):
+        return {
+            "feasible": True,
+            "winner_mode": "pd_disaggregated",
+            "best_configuration": {
+                "deployment_mode": "pd_disaggregated",
+                "pd_transfer_mode": "layerwise_overlap_d2d",
+                "prefill_parallel": {"dp": 1, "tp": 1, "ep": 1, "pp": 1, "pcp": 1, "cp": 1},
+                "decode_parallel": {"dp": 1, "tp": 1, "ep": 1, "pp": 1, "pcp": 1, "cp": 1},
+                "b_feasible": 2,
+                "b_vram_max": 4,
+                "mtp_proposal_tokens": 0,
+                "handoff_tpot_ms": 1.25,
+                "used_dies": 2,
+                "e2e_total_tps": 400.0,
+                "prefill_kv_rps": 20.0,
+            },
+            "prefill_case": p_case,
+            "decode_case": d_case,
+            "recommended_case": d_case,
+            "pd_pool_summary": dict(pd_summary),
+        }
+
+    orig_build = report_mod.build_export_bundle
+    seen_retry_calls: list[dict[str, object]] = []
+    call_idx = {"n": 0}
+
+    def _stub_build_bundle(raw_case, **kw):
+        bundle = orig_build(raw_case, **kw)
+        call_idx["n"] += 1
+        rt_meta = (raw_case.get("runtime") or {}).get("metadata") or {}
+        excluded = tuple(rt_meta.get("exclude_optimizations") or ())
+        if call_idx["n"] == 1:
+            return dc_replace(bundle, step_span_us=10.0)
+        if call_idx["n"] == 2:
+            dsl_op = dc_replace(bundle.operators[0], ascend_kernel="tilelang_dsl.mixed_quant_sparse_flash_mla")
+            return dc_replace(bundle, step_span_us=11.0, operators=(dsl_op, *bundle.operators[1:]))
+        seen_retry_calls.append({
+            "excluded": excluded,
+            "handoff": kw.get("handoff_tpot_ms"),
+            "total_dies": kw.get("deployment_total_dies"),
+            "pd_pool_summary": kw.get("pd_pool_summary"),
+            "request": kw.get("request"),
+        })
+        return dc_replace(bundle, step_span_us=9.5)
+
+    parser = build_parser()
+    args = parser.parse_args([
+        "report", "--model", "qwen3-32b", "--hardware", "a3", "--num-devices", "2",
+        "--prompt-tokens", "128", "--output-tokens", "32", "--tpot-ms", "50",
+        "--weight-quant", "w8a8_dynamic", "--deployment-mode", "pd_disaggregated",
+        "--mode", "modeling", "--no-xlsx", "--no-trace", "--json",
+        "--out-dir", str(tmp_path / "pd_mono"),
+    ])
+    with monkeypatch.context() as mp:
+        mp.setattr(pd_mod, "solve_optimal_deployment", _fake_solve)
+        mp.setattr(report_mod, "build_export_bundle", _stub_build_bundle)
+        receipt = report_mod.run_report_command(args)
+
+    assert receipt["ok"] is True
+    assert len(seen_retry_calls) == 1
+    retry = seen_retry_calls[0]
+    assert retry["handoff"] == pytest.approx(1.25)
+    assert retry["total_dies"] == 2
+    assert isinstance(retry["pd_pool_summary"], dict)
+    assert retry["pd_pool_summary"]["used_dies"] == 2
+    assert retry["request"].sequences == 2
 

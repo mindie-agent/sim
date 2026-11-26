@@ -181,6 +181,7 @@ class _EnginePrepareMixin:
                 )
                 if len(cache) >= _STAGE_PREPARATION_CACHE_LIMIT:
                     cache.clear()
+                    self._seen_floor_peaks.clear()
                 cache[ukey] = prepared
                 return prepared
         return self._prepare(
@@ -772,6 +773,7 @@ class _EnginePrepareMixin:
                     )
                     if len(cache) >= _STAGE_PREPARATION_CACHE_LIMIT:
                         cache.clear()
+                        self._seen_floor_peaks.clear()
                     cache[ukey] = static
                 if len(id_cache) >= _STAGE_PREPARATION_CACHE_LIMIT:
                     id_cache.clear()
@@ -839,6 +841,7 @@ class _EnginePrepareMixin:
                     static_id=self._next_static_id)
                 if len(cache) >= _STAGE_PREPARATION_CACHE_LIMIT:
                     cache.clear()
+                    self._seen_floor_peaks.clear()
                 cache[key] = static_base
             if len(proto_cache) >= _STAGE_PREPARATION_CACHE_LIMIT:
                 proto_cache.clear()

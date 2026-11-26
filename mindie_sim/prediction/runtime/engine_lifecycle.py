@@ -17,6 +17,7 @@ from ._engine_hbm_bus import (
     _task_needs_hbm_bus_split,
 )
 from .contracts import OccurrenceKey
+from .engine_prepare import _STAGE_PREPARATION_CACHE_LIMIT
 from .engine_types import (
     Allocation, Event, ExecutionError, _Task, _binding_for, _memory_binding,
     _units_to_mask,
@@ -547,6 +548,8 @@ class _EngineLifecycleMixin:
                 self.allocation_event_count += n_acq
                 self._alloc_state_version += n_acq
                 if empty_pools:
+                    if len(self._seen_floor_peaks) >= _STAGE_PREPARATION_CACHE_LIMIT:
+                        self._seen_floor_peaks.clear()
                     self._seen_floor_peaks.add(sid)
             admit_gen = 0
             wave_rec = self._wave_recorder

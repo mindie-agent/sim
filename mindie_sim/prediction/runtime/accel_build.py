@@ -531,6 +531,7 @@ def build_accel(*, check_only: bool = False, force: bool = False) -> dict:
     compiler and never writes the cache.  ``force`` publishes a *new*
     generation instead of replacing a path that a process may have loaded.
     """
+    global _MEMO_GENERATION
     try:
         data, files = source_snapshot()
     except TimeoutError:
@@ -601,7 +602,10 @@ def build_accel(*, check_only: bool = False, force: bool = False) -> dict:
                     "toolchain_ready": True, "library_ready": True,
                 }
                 with _MEMO_LOCK:
+                    prev = _STATUS_MEMO.get(key)
                     _STATUS_MEMO[key] = status
+                    if prev is None or prev.get("cache_path") != status.get("cache_path"):
+                        _MEMO_GENERATION += 1
                 return dict(status)
     built, detail, candidate = _publish(compiler, flags, cache_root(), files,
                                         digest_hex)
@@ -620,6 +624,7 @@ def build_accel(*, check_only: bool = False, force: bool = False) -> dict:
     }
     with _MEMO_LOCK:
         _STATUS_MEMO[key] = status
+        _MEMO_GENERATION += 1
     return dict(status)
 
 

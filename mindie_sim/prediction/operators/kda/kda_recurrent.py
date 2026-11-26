@@ -11,7 +11,7 @@
 [Timeouts & Locks] O(sequences * active owners) bounded runs; q <= 8. No locks.
 [Side-Effect Policy] Pure plans and virtual resource tasks; no runtime/source I/O.
 """
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 import math
 from typing import Literal
@@ -433,6 +433,63 @@ def summarize_work(params, geometry, *, execution=SourceExecution()):
     return work
 
 
+@dataclass(frozen=True)
+class _AdaptiveWaveCohortProgram:
+    """Run lockstep wave cohort iff every owner's UB admits simultaneously without contention."""
+
+    folded: KernelProgram
+    literal_factory: Callable[[], ParallelProgram]
+    ub_pool: str
+    ub_bytes: float
+    ub_units: tuple[int, ...]
+
+    def _can_admit_lockstep(self, engine) -> bool:
+        cap = engine.pools.get(self.ub_pool)
+        if cap is None or self.ub_bytes > cap:
+            return False
+        if self.ub_pool in getattr(engine, "memory_pools", ()):
+            return False
+        pool_mask = getattr(engine, "_pool_unit_masks", {}).get(self.ub_pool, 0)
+        if pool_mask:
+            unit_alloc = engine.unit_allocated
+            for unit in self.ub_units:
+                if unit_alloc.get((self.ub_pool, unit), 0.0) + self.ub_bytes > cap:
+                    return False
+        ub_set = set(self.ub_units)
+        for task in engine._tasks.values():
+            if task.start is None and task.acquire:
+                for alloc in task.acquire:
+                    if alloc.pool == self.ub_pool and ub_set.intersection(alloc.units):
+                        return False
+        return True
+
+    def bind_stream_owners(self, owners, datapath, **kwargs):
+        from mindie_sim.prediction.streams import apply_stream_owners_to_program
+
+        return apply_stream_owners_to_program(
+            self.literal_factory(), owners, datapath, **kwargs,
+        )
+
+    def start(self, engine, name: str, ready, *, owner: str = ""):
+        if ready.done and ready.time <= engine.now and not self._can_admit_lockstep(engine):
+            return self.literal_factory().start(engine, name, ready, owner=owner)
+        complete = engine.future(name + ":kda_complete")
+
+        def _dispatch(trigger) -> None:
+            chosen = self.folded if self._can_admit_lockstep(engine) else self.literal_factory()
+            finish = chosen.start(engine, name, trigger, owner=owner)
+            engine.on_complete(finish, lambda _ev: engine.resolve(complete), native_hook=True)
+
+        if ready.done and ready.time <= engine.now:
+            engine.submit(
+                name + ":admit", after=(ready,), owner=owner,
+                on_complete=_dispatch, native_hook=True,
+            )
+            return complete
+        engine.on_complete(ready, _dispatch, native_hook=True)
+        return complete
+
+
 def build(op, geometry, *, compact=True, execution=SourceExecution()):
     p = Params.parse(dict(op.metadata)["kda_recurrent_params"])
     units = geometry.resource_units.get("vector", geometry.compute_units)
@@ -596,12 +653,19 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
                     if w_pos >= max_waves:
                         prev_stage = rel_name
                 seg_idx += 1
-            return KernelProgram(tuple(prog_stages))
+            return KernelProgram(tuple(prog_stages)), ub_pool, ub_bytes, full_bound[3]
 
         if compact and blocks > 1:
-            wave_prog = _wave_cohort_program()
-            if wave_prog is not None:
-                owners = wave_prog
+            wave_result = _wave_cohort_program()
+            if wave_result is not None:
+                wave_prog, ub_pool, ub_bytes, ub_units = wave_result
+                owners = _AdaptiveWaveCohortProgram(
+                    wave_prog,
+                    lambda: ParallelProgram(tuple(owner_program(owner) for owner in range(blocks))),
+                    ub_pool,
+                    ub_bytes,
+                    ub_units,
+                )
             else:
                 owners = ParallelProgram(tuple(owner_program(owner) for owner in range(blocks)))
         else:

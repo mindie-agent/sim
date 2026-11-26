@@ -1345,3 +1345,44 @@ def test_recurrent_permuted_die_pcp_lane_and_kda_record_stride():
     ops_spec = Frontend()(IterationPlan(views_spec), c_spec.model, c_spec.runtime, c_spec.machine).ops
     core_spec = next(op for op in ops_spec if "kda_recurrent_params" in dict(op.metadata))
     assert dict(core_spec.metadata)["kda_recurrent_params"]["record_stride"] == 4
+
+
+def test_kda_folded_preserves_independent_owner_ub_admission():
+    """Lockstep KDA wave folding must not block a free UB unit behind contention on another unit."""
+    ub_cap = 253_952
+    ub_reserved = 8192
+    units = 64
+    values = {"lengths": (1,), "heads": 2, "key_heads": 2, "dk": 128, "dv": 128, "state_dtype": "fp32"}
+    op = kda_recurrent.make_op(values, deps=("input",))
+    physical = {"hbm": 1e6, "mte2_aiv": 1e8, "mte2_aic": 1e8, "mte2": 1e8, "vector": 1e8, "mte3": 1e8}
+    units_by_pipe = {role: units if role != "hbm" else 1 for role in physical}
+    geom = Geometry(units // 2, units_by_pipe, {"ub": ub_cap}, {"ub": units})
+
+    def _run(*, compact: bool, reserve_unit0: bool) -> tuple[float, int]:
+        plan = kda_recurrent.build(op, geom, compact=compact)
+        engine = Engine(
+            [Resource(role, rate, units=units_by_pipe[role]) for role, rate in physical.items()],
+            pools=geom.buffers, pool_units=geom.buffer_units,
+        )
+        ctx = RecipeContext(
+            plan.work.apply(op), {}, {role: role for role in physical}, physical, 1,
+            resource_units=units_by_pipe, pool_names={"ub": "ub"}, pool_units=geom.buffer_units,
+        )
+        if reserve_unit0:
+            held = Allocation("bg_ub", "ub", ub_reserved, (0,))
+            engine.submit("bg_ub", acquire=(held,), free=(held,), latency=1.0)
+        ready = engine.submit("ready")
+        done = plan.lower(ctx).start(engine, "kda", ready)
+        engine.advance(until=(done,))
+        assert not engine.allocations
+        return float(done.time), int(engine.completed_count)
+
+    lit_ms, _ = _run(compact=False, reserve_unit0=True)
+    fold_ms, _ = _run(compact=True, reserve_unit0=True)
+    assert fold_ms == pytest.approx(lit_ms, rel=1e-12, abs=1e-12)
+    assert fold_ms == pytest.approx(1.1633072, rel=1e-6)
+
+    lit_free_ms, lit_free_tasks = _run(compact=False, reserve_unit0=False)
+    fold_free_ms, fold_free_tasks = _run(compact=True, reserve_unit0=False)
+    assert fold_free_ms == pytest.approx(lit_free_ms, rel=1e-12, abs=1e-12)
+    assert fold_free_tasks < lit_free_tasks

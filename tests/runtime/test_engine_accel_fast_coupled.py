@@ -682,3 +682,156 @@ def test_coupled_unplaced_multi_unit_bus_runs_native_and_hands_back_on_partial_p
         finally:
             eng.close()
     assert out_mix["c"] == pytest.approx(out_mix["python"], rel=0.0, abs=1e-12)
+
+
+def test_lazy_stage_memory_pool_set_interning_admits_native_and_rejects_foreign() -> None:
+    """Engine-interned pool sets from stage_memory_info and tuple submit pass _inert_pool_set."""
+    from mindie_sim.prediction.execution.lazy_dag import stage_memory_info
+    from mindie_sim.prediction.runtime import accel_tables as tables
+    from mindie_sim.prediction.runtime.engine import Engine, Resource
+
+    eng = Engine((Resource("vector", 64.0),), backend="python")
+    try:
+        stub_exec = SimpleNamespace(
+            engine=eng,
+            memory=None,
+            stage_names={(0, 0): {"vector": "vector"}},
+            stage_pools={(0, 0): {"hbm": "@r0:s0:hbm"}},
+        )
+        info = stage_memory_info(stub_exec, 0)
+        _phbm, _mctx, mfast = info[0]
+        assert mfast is not None
+        pfroz = mfast[1]
+        assert tables._inert_pool_set(pfroz, eng) is True
+
+        ev_tup = eng.submit("t_tup", {"vector": 1.0}, memory_pools=("@r0:s0:hbm",))
+        assert tables._inert_pool_set(eng._tasks[ev_tup.sequence].memory_pools, eng) is True
+
+        foreign = frozenset({"@r0:s0:hbm"})
+        ev_foreign = eng.submit("t_foreign", {"vector": 1.0}, memory_pools=foreign)
+        assert tables._inert_pool_set(eng._tasks[ev_foreign.sequence].memory_pools, eng) is False
+    finally:
+        eng.close()
+
+
+def test_mc2_dedup_rejects_non_uniform_reciprocal_totals_with_concurrent_stream() -> None:
+    """Reciprocal pair blocks with unequal per-rank totals (3,5,5,3 KiB) must not dedup overlapping streams."""
+    from mindie_sim.prediction.runtime.dp_cohort_dedup import (
+        _has_unsynced_peer_die_overlap,
+        _raw_mc2_matrices_reciprocal,
+        is_symmetric_native_program,
+    )
+    from mindie_sim.schema.operators import IterationWork, OpSpec
+    from mindie_sim.schema.workload import IterationPlan
+
+    # DP=4, TP=2, EP=8: 1024 B between corresponding TP ranks in every replica pair,
+    # except 3072 B both ways between replicas 1 and 2 -> per-rank totals (3, 5, 5, 3) KiB.
+    rows = [[0.0] * 8 for _ in range(8)]
+    for r1 in range(4):
+        for r2 in range(4):
+            if r1 == r2:
+                continue
+            amt = 3072.0 if {r1, r2} == {1, 2} else 1024.0
+            for tp_pos in range(2):
+                rows[r1 * 2 + tp_pos][r2 * 2 + tp_pos] = amt
+    mc2_phase = {"ep": 8, "route_matrix_bytes": tuple(tuple(r) for r in rows)}
+    assert _raw_mc2_matrices_reciprocal(mc2_phase, 8, 2) is False
+    inner = SimpleNamespace(
+        peer_count=8,
+        route_matrix=None,
+        route_matrix_bytes=mc2_phase["route_matrix_bytes"],
+        start_with_handles=lambda *_a, **_kw: None,
+        payload_basis_for=lambda _rk: "expected",
+        local_frames_for=lambda _rk: 0,
+    )
+    assert is_symmetric_native_program(SimpleNamespace(program=inner), 8, local_rank_count=2) is False
+
+    op_mc2 = OpSpec(
+        "s0.l0.mc2", "mc2_protocol", "decode", 0, 0, (), (8, 64), (8, 64), (8, 64), (8, 64),
+        dtype="bf16", stream="main", metadata=(("mc2_phase", mc2_phase), ("group_axis", "ep")),
+    )
+    op_gemm = OpSpec(
+        "s0.l0.gemm", "gemm", "decode", 0, 0, (), (8, 64), (8, 64), (8, 64), (8, 64),
+        dtype="bf16", stream="aux",
+    )
+    w0 = IterationWork((op_mc2, op_gemm), IterationPlan(()), 1, 8, 8, None, "graph", "declared_graph")
+    link = SimpleNamespace(name="hccs", semantics="fully_connected", members=tuple(range(8)))
+    topo = SimpleNamespace(
+        namespace="dp_test:",
+        links={"hccs": link},
+        ranks=lambda rep, _stg: (rep * 2, rep * 2 + 1),
+        groups=lambda _axis, _rep, _stg: (tuple(range(8)),),
+    )
+    eng = SimpleNamespace(resources={})
+    ex = SimpleNamespace(
+        topology=topo,
+        engine=eng,
+        _verify_canonical_cohort_reciprocity=lambda *_a, **_kw: (True, 8, (0, 1)),
+    )
+    assert _has_unsynced_peer_die_overlap(ex, w0, 0, replicas=(0, 1, 2, 3)) is True
+
+
+def test_seen_floor_peaks_stays_bounded_across_prepared_cache_rollover(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Preparation-cache rollover clears _seen_floor_peaks while preserving exact peak_allocated."""
+    from mindie_sim.prediction.program.stages import Stage
+    from mindie_sim.prediction.runtime import engine_lifecycle, engine_prepare
+    from mindie_sim.prediction.runtime.engine import Allocation, Engine, Resource
+
+    limit = 64
+    monkeypatch.setattr(engine_prepare, "_STAGE_PREPARATION_CACHE_LIMIT", limit)
+    monkeypatch.setattr(engine_lifecycle, "_STAGE_PREPARATION_CACHE_LIMIT", limit)
+    eng = Engine((Resource("mte2", 1024.0),), pools={"ub": 1024.0}, pool_units={"ub": 1}, backend="python")
+    try:
+        for _pass in range(2):
+            for size in range(1, limit + 2):
+                alloc = Allocation(f"a_{_pass}_{size}", "ub", float(size), (0,))
+                stg = Stage(f"k_{size}", work={"mte2": 1.0}, acquire=(alloc,), free=(alloc,))
+                prep = eng._prepare_static_stage(stg)
+                eng._submit_prepared(prep, f"t_{_pass}_{size}")
+                eng.advance()
+            assert eng.allocated["ub"] == 0.0
+            assert len(eng._seen_floor_peaks) <= limit
+        assert eng.peak_allocated["ub"] == float(limit + 1)
+    finally:
+        eng.close()
+
+
+def test_trace_replacement_generation_blocks_epoch_on_deque_address_reuse() -> None:
+    """Replacing engine.trace bumps _trace_gen so _trace_blocks_epoch cannot miss non-inert rows on id() reuse."""
+    from collections import deque
+    from mindie_sim.prediction.runtime.engine import Engine, Resource
+
+    class _FinalizerCarrier:
+        def __del__(self) -> None:
+            pass
+
+    eng = Engine((Resource("r0", 1.0),), trace_limit=1, backend="c")
+    try:
+        eng.submit("t0", {"r0": 1.0})
+        eng.advance()
+        assert eng._accel is not None
+        assert eng._accel._trace_blocks_epoch(eng) is False
+        gen_before = eng._trace_gen
+
+        non_inert_row = {
+            "task": "t_bad",
+            "owner": "",
+            "start_ms": 0.0,
+            "end_ms": 1.0,
+            "demand": {"r0": 1.0},
+            "serviced": {"r0": 1.0},
+            "metadata": {"carrier": _FinalizerCarrier()},
+            "placement": {},
+            "coupled": False,
+        }
+        eng.trace = deque([non_inert_row], maxlen=1)
+        assert eng._trace_gen == gen_before + 1
+        # Simulate CPython reusing the exact previous deque address with matching len/appends/ext_mut.
+        eng._accel._trace_dq_id = id(eng._trace_dq)
+        eng._accel._trace_seen_len = len(eng._trace_dq)
+        eng._accel._trace_seen_appends = eng._trace_appends
+        eng._accel._trace_seen_ext_mut = eng._trace_view._ext_mut
+        eng._accel._trace_has_non_inert = False
+        assert eng._accel._trace_blocks_epoch(eng) is True
+    finally:
+        eng.close()

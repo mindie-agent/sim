@@ -255,6 +255,7 @@ class RuntimeState:
         self._trace_dq = self._trace_view._dq
         self._trace_maxlen = 0 if trace_limit is None else int(trace_limit)
         self._trace_appends = 0
+        self._trace_gen = 0
         self.trace_dropped = 0
         self._evicted_service_spans: dict[str, list[tuple[float, float]]] = {}
         # One authoritative typed state ledger. FragmentConductor and
@@ -315,6 +316,7 @@ class RuntimeState:
         ml = self._trace_view.maxlen
         self._trace_maxlen = -1 if ml is None else int(ml)
         self._trace_appends = 0
+        self._trace_gen += 1
 
     @property
     def allocation_trace(self):

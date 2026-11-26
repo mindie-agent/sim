@@ -337,9 +337,7 @@ class _EngineSubmitMixin:
             elif memory_pools.__class__ is frozenset:
                 pools = memory_pools
             elif memory_pools:
-                if isinstance(memory_pools, str):
-                    memory_pools = (memory_pools,)
-                pools = frozenset(str(pool) for pool in memory_pools)
+                pools = self._intern_pool_set(memory_pools)
             else:
                 pools = _EMPTY_FROZENSET
             if not memory_bindings:

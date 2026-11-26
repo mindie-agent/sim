@@ -263,15 +263,25 @@ class PipelineProgram:
             engine.submit(name + ":span", after=(setup,), latency=self.minimum_ms, owner=owner)
             if self.minimum_ms else None
         )
-        static_done = self._try_start_static_dag(engine, name, setup, observation, scoped, owner)
-        if static_done is not None:
-            return static_done
+        static_result = self._try_start_static_dag(engine, name, setup, observation, scoped, owner)
+        if isinstance(static_result, Event):
+            return static_result
         complete = engine.future(name + ":pipeline_complete")
-        stage_tail: dict[str, Event] = {}
-        tile_events: dict[int, dict[str, Event]] = {}
-        live_tiles: set[int] = set()
+        if static_result is None:
+            stage_tail: dict[str, Event] = {}
+            tile_events: dict[int, dict[str, Event]] = {}
+            live_tiles: set[int] = set()
+            next_tile, finished = 0, 0
+            prefetched: dict[int, tuple[Stage, ...]] = {}
+            static_tail: list[tuple[int, Event]] = []
+        else:
+            next_tile, prefetched_stages, stage_tail, tile_events, tile_retires = static_result
+            prefetched = {next_tile: prefetched_stages}
+            tail_start = max(0, next_tile - self.slots)
+            finished = tail_start
+            live_tiles = set(range(tail_start, next_tile)) if self.slots > 1 else set()
+            static_tail = [(idx, tile_retires[idx]) for idx in range(tail_start, next_tile)]
         max_lag = 1
-        next_tile, finished = 0, 0
         serial_single_slot = self.slots == 1
 
         def retire(_event=None, tile_idx: int | None = None) -> None:
@@ -283,6 +293,7 @@ class PipelineProgram:
                 stage_tail.clear()
                 tile_events.clear()
                 live_tiles.clear()
+                prefetched.clear()
                 engine.resolve(complete)
             else:
                 issue()
@@ -294,7 +305,9 @@ class PipelineProgram:
                 next_tile += 1
                 local: dict[str, Event] = {}
                 previous = dict(stage_tail)
-                stages = tuple(self.tile(index))
+                stages = prefetched.pop(index, None)
+                if stages is None:
+                    stages = tuple(self.tile(index))
                 for st in stages:
                     for _, lag in st.previous_lags:
                         if lag > max_lag:
@@ -326,13 +339,13 @@ class PipelineProgram:
                         engine, task_name, tuple(deps) or (setup,), scoped, owner
                     )
                     local[stage.name] = stage_tail[stage.name] = event
-                if not serial_single_slot or max_lag > 1:
-                    tile_events[index] = local
+                if not serial_single_slot:
                     live_tiles.add(index)
-                    cutoff = index - max(self.slots, max_lag)
-                    for old_idx in tuple(tile_events):
-                        if old_idx < cutoff and old_idx not in live_tiles:
-                            del tile_events[old_idx]
+                tile_events[index] = local
+                cutoff = index + 1 - max(self.slots, max_lag)
+                for old_idx in tuple(tile_events):
+                    if old_idx < cutoff and old_idx not in live_tiles:
+                        del tile_events[old_idx]
                 sinks = tuple(dict.fromkeys(
                     local[stage.name] for stage in stages if stage.name not in consumed
                 )) or (setup,)
@@ -343,6 +356,7 @@ class PipelineProgram:
                         if finished == self.count:
                             stage_tail.clear()
                             tile_events.clear()
+                            prefetched.clear()
                             engine.resolve(complete)
                             return
                         continue
@@ -355,14 +369,25 @@ class PipelineProgram:
                 )
                 return
 
+        initial_slots = max(0, min(self.slots, self.count) - len(static_tail))
+
         def begin(_: Event) -> None:
             if not self.count:
                 engine.resolve(complete)
                 return
-            for _ in range(min(self.slots, self.count)):
+            for _ in range(initial_slots):
                 issue()
 
-        if serial_single_slot:
+        for prev_idx, prev_ev in static_tail:
+            engine.on_complete(
+                prev_ev,
+                lambda ev, _idx=prev_idx: retire(ev, _idx),
+                native_hook=True,
+            )
+        if initial_slots == 0:
+            if observation is None:
+                return complete
+        elif serial_single_slot:
             if setup.done and setup.time <= engine.now:
                 begin(setup)
             else:
@@ -380,98 +405,104 @@ class PipelineProgram:
             owner=owner,
         )
 
-    def _can_static_unroll(
-        self, engine: Engine, tiles: Sequence[tuple[Stage, ...]],
-    ) -> bool:
-        """True when all tiles can be submitted statically as a callback-free DAG."""
-        if engine.memory is not None or engine._periodic_runs:
-            return False
-        fifo_names = engine.fifo_resource_names() if hasattr(engine, "fifo_resource_names") else frozenset()
-        first_sinks: tuple[str, ...] | None = None
-        for stages in tiles:
-            consumed: set[str] = set()
-            for stage in stages:
-                if (
-                    stage.program is not None or stage.fragment is not None
-                    or stage.acquire or stage.free or stage.deliveries
-                    or stage.latency_from_first_service
-                ):
-                    return False
-                if fifo_names and stage.work and any(r in fifo_names for r in stage.work):
-                    return False
-                if stage.after:
-                    consumed.update(stage.after)
-            if self.slots > 1 and self.slots < self.count:
-                sinks = tuple(stage.name for stage in stages if stage.name not in consumed)
-                if not sinks:
-                    return False
-                if first_sinks is None:
-                    first_sinks = sinks
-                elif sinks != first_sinks:
-                    return False
-        return True
+    @staticmethod
+    def _tile_static_sinks(
+        stages: tuple[Stage, ...], fifo_names: frozenset[str],
+    ) -> tuple[bool, tuple[str, ...]]:
+        """Check whether one tile's stages can submit statically without retire callbacks."""
+        consumed: set[str] = set()
+        for stage in stages:
+            if (
+                stage.program is not None or stage.fragment is not None
+                or stage.acquire or stage.free or stage.deliveries
+                or stage.latency_from_first_service
+            ):
+                return False, ()
+            if fifo_names and stage.work and any(r in fifo_names for r in stage.work):
+                return False, ()
+            if stage.after:
+                consumed.update(stage.after)
+        sinks = tuple(stage.name for stage in stages if stage.name not in consumed)
+        return True, sinks
+
+    @staticmethod
+    def _submit_static_tile(
+        engine: Engine, name: str, index: int, stages: tuple[Stage, ...],
+        slot_gate: Event, setup: Event, stage_tail: dict[str, Event],
+        tile_events: dict[int, dict[str, Event]], scoped: Callable, owner: str,
+    ) -> Event:
+        """Submit one static-eligible tile and drop its Stage refs on return."""
+        local: dict[str, Event] = {}
+        previous = dict(stage_tail)
+        consumed: set[str] = set()
+        for stage in stages:
+            if stage.after:
+                consumed.update(stage.after)
+            deps = [local[key] for key in stage.after]
+            if not stage.after and slot_gate is not setup:
+                deps.append(slot_gate)
+            deps.extend(previous[key] for key in stage.previous if key in previous)
+            for dep_name, lag in stage.previous_lags:
+                target = index - lag
+                if target >= 0:
+                    prior_tile = tile_events.get(target)
+                    if prior_tile is not None and dep_name in prior_tile:
+                        deps.append(prior_tile[dep_name])
+            if stage.name in stage_tail:
+                deps.append(stage_tail[stage.name])
+            task_name = f"{name}:tile{index}:{stage.name}"
+            if _declares_no_work(stage):
+                ev = _zero_work_alias(engine, deps, slot_gate)
+                if ev is not None:
+                    local[stage.name] = stage_tail[stage.name] = ev
+                    continue
+            event = stage.submit(
+                engine, task_name, tuple(deps) or (slot_gate,), scoped, owner,
+            )
+            local[stage.name] = stage_tail[stage.name] = event
+        tile_events[index] = local
+        sinks = tuple(dict.fromkeys(
+            local[stage.name] for stage in stages if stage.name not in consumed
+        )) or (slot_gate,)
+        return (
+            sinks[0]
+            if len(sinks) == 1
+            else engine.submit(f"{name}:tile{index}:retire", after=sinks, owner=owner)
+        )
 
     def _try_start_static_dag(
         self, engine: Engine, name: str, setup: Event,
         observation: Event | None, scoped: Callable, owner: str,
-    ) -> Event | None:
-        """Submit bounded allocation-free tiles statically with zero retire callbacks."""
+    ):
+        """Stream bounded allocation-free tiles statically with zero Stage retention."""
         if not (_MIN_STATIC_UNROLL_TILES <= self.count <= _STATIC_UNROLL_MAX_TILES):
             return None
-        tiles = [tuple(self.tile(index)) for index in range(self.count)]
-        if not self._can_static_unroll(engine, tiles):
+        if engine.memory is not None or engine._periodic_runs:
             return None
+        fifo_names = engine.fifo_resource_names() if hasattr(engine, "fifo_resource_names") else frozenset()
+        first_sinks: tuple[str, ...] | None = None
         stage_tail: dict[str, Event] = {}
         tile_events: dict[int, dict[str, Event]] = {}
         tile_retires: list[Event] = []
-        max_lag = 1
-        for index, stages in enumerate(tiles):
-            for st in stages:
-                for _, lag in st.previous_lags:
-                    if lag > max_lag:
-                        max_lag = lag
+        check_sinks = self.slots > 1 and self.slots < self.count
+        for index in range(self.count):
+            stages = tuple(self.tile(index))
+            ok, sink_names = self._tile_static_sinks(stages, fifo_names)
+            if ok and check_sinks:
+                if not sink_names:
+                    ok = False
+                elif first_sinks is None:
+                    first_sinks = sink_names
+                elif sink_names != first_sinks:
+                    ok = False
+            if not ok:
+                return (index, stages, stage_tail, tile_events, tile_retires)
             slot_gate = tile_retires[index - self.slots] if index >= self.slots else setup
-            local: dict[str, Event] = {}
-            previous = dict(stage_tail)
-            consumed: set[str] = set()
-            for stage in stages:
-                if stage.after:
-                    consumed.update(stage.after)
-                deps = [local[key] for key in stage.after]
-                if not stage.after and slot_gate is not setup:
-                    deps.append(slot_gate)
-                deps.extend(previous[key] for key in stage.previous if key in previous)
-                for dep_name, lag in stage.previous_lags:
-                    target = index - lag
-                    if target >= 0:
-                        prior_tile = tile_events.get(target)
-                        if prior_tile is not None and dep_name in prior_tile:
-                            deps.append(prior_tile[dep_name])
-                if stage.name in stage_tail:
-                    deps.append(stage_tail[stage.name])
-                task_name = f"{name}:tile{index}:{stage.name}"
-                if _declares_no_work(stage):
-                    ev = _zero_work_alias(engine, deps, slot_gate)
-                    if ev is not None:
-                        local[stage.name] = stage_tail[stage.name] = ev
-                        continue
-                event = stage.submit(
-                    engine, task_name, tuple(deps) or (slot_gate,), scoped, owner,
-                )
-                local[stage.name] = stage_tail[stage.name] = event
-            if max_lag > 1:
-                tile_events[index] = local
-                cutoff = index - max_lag
-                if cutoff in tile_events:
-                    del tile_events[cutoff]
-            sinks = tuple(dict.fromkeys(
-                local[stage.name] for stage in stages if stage.name not in consumed
-            )) or (slot_gate,)
-            tile_retire = (
-                sinks[0]
-                if len(sinks) == 1
-                else engine.submit(f"{name}:tile{index}:retire", after=sinks, owner=owner)
+            tile_retire = self._submit_static_tile(
+                engine, name, index, stages, slot_gate, setup,
+                stage_tail, tile_events, scoped, owner,
             )
+            stages = ()
             tile_retires.append(tile_retire)
         tail_deps = list(dict.fromkeys(tile_retires[-min(self.slots, self.count):]))
         if observation is not None:

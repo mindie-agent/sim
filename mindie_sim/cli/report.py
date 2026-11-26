@@ -1236,19 +1236,32 @@ def run_report_command(args: argparse.Namespace) -> dict[str, Any]:
             bool(after_rt_meta.get("mqsmla_dsl_544_320_active"))
             or any(
                 "tilelang_dsl.mixed_quant_sparse_flash_mla" in str(getattr(r, "ascend_kernel", ""))
-                for r in after_bundle.rows
+                for r in after_bundle.operators
             )
         ) and not bool(before_rt_meta.get("mqsmla_dsl_544_320_active")):
             extra_exclusions.append("mqsmla_dsl_544_320")
         for excl_id in extra_exclusions:
             alt_common = dict(common_kw)
             prev_excl = tuple(alt_common.get("exclude_optimizations") or ())
-            alt_common["exclude_optimizations"] = tuple(dict.fromkeys((*prev_excl, excl_id)))
+            next_excl = tuple(dict.fromkeys((*prev_excl, excl_id)))
+            alt_common["exclude_optimizations"] = next_excl
+            if dep_mode == "pd_disaggregated":
+                alt_common["deployment_mode"] = "pd_prefill" if eff_phase == "prefill" else "pd_decode"
+                if eff_phase == "prefill":
+                    alt_common["tpot_slo_ms"] = None
+                else:
+                    alt_common["ttft_slo_ms"] = None
+            solved_after_accept = (raw_after.get("runtime") or {}).get("mtp_acceptance_length")
             alt_col_kw = dict(column_kw, common_kw=alt_common)
             raw_after_alt, step_a_alt, meta_a_alt = _report_column(
                 None, track=after_track, quant=after_quant, kv=after_kv,
-                idx_kv=after_idx_kv, par=cols["after_par"], conc=cols["conc"], **alt_col_kw,
+                idx_kv=after_idx_kv, par=cols["after_par"], conc=cols["conc"],
+                accept_len=(float(solved_after_accept) if solved_after_accept is not None else None),
+                **alt_col_kw,
             )
+            if cols["layout_after"] is not None:
+                step_a_alt = step_a
+                meta_a_alt = dict(meta_a)
             alt_bundle = _attach_bundle_context(
                 build_export_bundle(
                     raw_after_alt, request=step_a_alt, replay=replay, cache_dtype=after_kv,
@@ -1261,8 +1274,8 @@ def run_report_command(args: argparse.Namespace) -> dict[str, Any]:
                 solver_feasible=(bool(cols["layout_after"].get("solver_feasible", True)) if cols["layout_after"] is not None else None),
             )
             if alt_bundle.step_span_us < after_bundle.step_span_us:
-                common_kw = alt_common
-                column_kw = alt_col_kw
+                common_kw = dict(common_kw, exclude_optimizations=next_excl)
+                column_kw = dict(column_kw, common_kw=common_kw)
                 raw_after, step_a, meta_a, after_bundle = raw_after_alt, step_a_alt, meta_a_alt, alt_bundle
     prefill_after_bundles: tuple[Any, ...] = ()
     prefill_after_case: Mapping[str, Any] | None = None

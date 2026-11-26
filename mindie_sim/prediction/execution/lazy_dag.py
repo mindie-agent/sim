@@ -353,7 +353,11 @@ def stage_memory_info(execution, replica: int):
             continue
         phbm = execution.stage_pools.get((rep, stg), {}).get("hbm", "hbm")
         if has_fast_mem:
-            pfroz = frozenset((str(phbm),))
+            pfroz = (
+                engine._intern_pool_set((phbm,))
+                if hasattr(engine, "_intern_pool_set")
+                else frozenset((str(phbm),))
+            )
             rep_i, stg_i = int(replica), int(stg)
             mctx = {
                 "memory": default_ledger, "pools": pfroz,

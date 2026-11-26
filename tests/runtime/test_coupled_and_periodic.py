@@ -283,6 +283,50 @@ def test_generated_stages_leave_only_the_live_slot_window():
     assert not any(ref() is not None for ref in refs)
 
 
+def test_pipeline_previous_lag_one_orders_adjacent_tiles():
+    """Both static DAG unrolling and dynamic slot windows honor previous_lags=(('p', 1),)."""
+    # 1. Two slots, two tiles (static unroll path): tile 0 runs 'p' (3 ms), tile 1 runs 'c' (5 ms) with lag 1 on 'p'.
+    for slots in (2, 1):
+        engine = Engine([Resource("r0", 1.0), Resource("r1", 1.0)])
+        tiles = (
+            (Stage("p", {"r0": 3.0}),),
+            (Stage("c", {"r1": 5.0}, previous_lags=(("p", 1),)),),
+        )
+        done = PipelineProgram(2, slots, lambda idx, _t=tiles: _t[idx]).start(
+            engine, "lag1", engine.submit("ready"),
+        )
+        engine.advance(until=(done,))
+        assert done.time == pytest.approx(8.0, rel=1e-12)
+
+    # 2. Dynamic multi-slot window (count=3 > slots=2): lag 1 chains across tile 0 -> 1 -> 2.
+    engine3 = Engine([Resource("r0", 1.0), Resource("r1", 1.0), Resource("r2", 1.0)])
+    tiles3 = (
+        (Stage("p", {"r0": 3.0}),),
+        (Stage("c", {"r1": 5.0}, previous_lags=(("p", 1),)),),
+        (Stage("d", {"r2": 2.0}, previous_lags=(("c", 1),)),),
+    )
+    done3 = PipelineProgram(3, 2, lambda idx, _t=tiles3: _t[idx]).start(
+        engine3, "lag1_dyn", engine3.submit("ready"),
+    )
+    engine3.advance(until=(done3,))
+    assert done3.time == pytest.approx(10.0, rel=1e-12)
+
+    # 3. Mid-stream static-to-dynamic handoff (tile 0..1 static, tile 2 acquires buffer) keeps lag=1 exact.
+    alloc = Allocation("buf", "ub", 4)
+    engine4 = Engine([Resource("r0", 1.0), Resource("r1", 1.0)], pools={"ub": 8})
+    tiles4 = (
+        (Stage("p", {"r0": 3.0}),),
+        (Stage("p", {"r0": 2.0}),),
+        (Stage("c", {"r1": 4.0}, acquire=(alloc,), free=(alloc,), previous_lags=(("p", 1),)),),
+    )
+    done4 = PipelineProgram(3, 2, lambda idx, _t=tiles4: _t[idx]).start(
+        engine4, "lag1_handoff", engine4.submit("ready"),
+    )
+    engine4.advance(until=(done4,))
+    assert done4.time == pytest.approx(9.0, rel=1e-12)
+    assert not engine4.allocations
+
+
 # --- Periodic finite-panel matrix cycles -----------------------------------
 
 

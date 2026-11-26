@@ -587,3 +587,65 @@ def test_linear_attention_candidate_generator_filters_non_divisible_tp():
         prompt_tokens=4096, rec_topo=None, pinned={"tp": 64}, model_spec=kimi_spec,
     )
     assert any(int(c["tp"]) == 64 for c in pinned_64)
+
+
+def test_prefill_prefix_cache_threads_query_and_context_to_export_and_ablation(monkeypatch: pytest.MonkeyPatch):
+    """Prefill winner with 2048 prompt and 1024 cached prefix passes (1024, 1024) to export and ablation."""
+    from mindie_sim import solve as solve_mod
+
+    raw = compose_case(
+        "qwen3-32b", "a3", dp=1, tp=2, ep=1, layers=2,
+        prompt_tokens=2048, output_tokens=64, prefix_tokens=1024,
+        role="pd_prefill", ttft_slo_ms=5000.0,
+    )
+    solved = {
+        "feasible": True,
+        "winner_mode": "pd_prefill",
+        "deployment_mode": "pd_prefill",
+        "best_configuration": {"used_dies": 2, "b_feasible": 1, "mtp_proposal_tokens": 0},
+        "prefill_case": raw,
+        "recommended_case": raw,
+    }
+    _rec_case, req, _meta = solve_mod._bundle_inputs_for_solution(
+        solved, model="qwen3-32b", hardware="a3", runtime_stack="vllm-ascend",
+        base_kw={}, feature_track="shipping", prompt_tokens=2048, output_tokens=64, scope="model",
+    )
+    assert req.phase == "prefill"
+    assert req.tokens == 1024 and req.context == 1024
+
+    captured_analyze: list[tuple[str, int, int]] = []
+    captured_wf: list[tuple[str, int, int]] = []
+
+    def _spy_analyze(_case, *, phase, tokens, context, **_kw):
+        captured_analyze.append((phase, int(tokens), int(context)))
+        return {
+            "geometry": {"dp": 1, "tp": 2, "ep": 1},
+            "included_components": {},
+            "graph_duration_ms": 1.0,
+            "network_cube_mfu": 0.5,
+            "network_vec_mfu": 0.2,
+            "network_mbu": 0.4,
+            "network_link_util": 0.1,
+            "network_cv_overlap": 0.3,
+            "network_roofline_efficiency": 0.5,
+            "breakdown_by_family": [],
+        }
+
+    def _spy_compare(*_a, phase, tokens, context, **_kw):
+        captured_wf.append((phase, int(tokens), int(context)))
+        return {"waterfall": {}}
+
+    with monkeypatch.context() as mp:
+        mp.setattr(solve_mod, "_analyze_case_bounded", _spy_analyze)
+        mp.setattr(solve_mod, "compare_feature_tracks", _spy_compare)
+        solve_mod._evaluate_winner_analysis(
+            solved=solved, before_solved=solved, after_solved=solved,
+            model="qwen3-32b", hardware="a3", runtime_stack="vllm-ascend",
+            prompt=2048, output=64, ttft_slo_ms=5000.0, tpot_slo_ms=None,
+            layers=2, quant=None, kv_cache_dtype=None, indexer_kv_dtype=None,
+            topology_preset=None, ranks_per_node=None, mtp_accept=None,
+            ablate_prs=True, xlsx_path=None, trace_path=None,
+            compare_track="shipping", target_track="target", mode="simulation",
+        )
+    assert captured_analyze == [("prefill", 1024, 1024)]
+    assert captured_wf == [("prefill", 1024, 1024)]
