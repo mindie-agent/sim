@@ -1222,34 +1222,48 @@ def run_report_command(args: argparse.Namespace) -> dict[str, Any]:
         serve_script_supplied=script_supplied,
         solver_feasible=(bool(cols["layout_after"].get("solver_feasible", True)) if cols["layout_after"] is not None else None),
     )
-    if (
-        cols["has_target_after"]
-        and after_bundle.step_span_us > before_bundle.step_span_us
-        and bool(before_bundle.effective_config.get("multistream_overlap_shared_expert", False))
-        and int(after_bundle.effective_config.get("enable_fused_mc2", 0) or 0) > 0
-        and not bool(after_bundle.effective_config.get("multistream_overlap_shared_expert", False))
-    ):
-        alt_common = dict(common_kw)
-        prev_excl = tuple(alt_common.get("exclude_optimizations") or ())
-        alt_common["exclude_optimizations"] = tuple(dict.fromkeys((*prev_excl, "cann_megamoe_fusion")))
-        alt_col_kw = dict(column_kw, common_kw=alt_common)
-        raw_after_mso, step_a_mso, meta_a_mso = _report_column(
-            None, track=after_track, quant=after_quant, kv=after_kv,
-            idx_kv=after_idx_kv, par=cols["after_par"], conc=cols["conc"], **alt_col_kw,
-        )
-        alt_bundle = _attach_bundle_context(
-            build_export_bundle(
-                raw_after_mso, request=step_a_mso, replay=replay, cache_dtype=after_kv,
-                engram_host_offload=args.engram_offload,
-                apply_target_envelope=cols["has_target_after"],
-                rewrite_plan=rewrite_plan if cols["has_target_after"] else None,
-                allow_unbound_formula=(mode == MODE_MODELING), **meta_a_mso,
-            ),
-            serve_script_supplied=script_supplied,
-            solver_feasible=(bool(cols["layout_after"].get("solver_feasible", True)) if cols["layout_after"] is not None else None),
-        )
-        if alt_bundle.step_span_us < after_bundle.step_span_us:
-            raw_after, step_a, meta_a, after_bundle = raw_after_mso, step_a_mso, meta_a_mso, alt_bundle
+    if cols["has_target_after"] and after_bundle.step_span_us > before_bundle.step_span_us:
+        extra_exclusions: list[str] = []
+        if (
+            bool(before_bundle.effective_config.get("multistream_overlap_shared_expert", False))
+            and int(after_bundle.effective_config.get("enable_fused_mc2", 0) or 0) > 0
+            and not bool(after_bundle.effective_config.get("multistream_overlap_shared_expert", False))
+        ):
+            extra_exclusions.append("cann_megamoe_fusion")
+        after_rt_meta = (raw_after.get("runtime") or {}).get("metadata") or {}
+        before_rt_meta = (raw_before.get("runtime") or {}).get("metadata") or {}
+        if (
+            bool(after_rt_meta.get("mqsmla_dsl_544_320_active"))
+            or any(
+                "tilelang_dsl.mixed_quant_sparse_flash_mla" in str(getattr(r, "ascend_kernel", ""))
+                for r in after_bundle.rows
+            )
+        ) and not bool(before_rt_meta.get("mqsmla_dsl_544_320_active")):
+            extra_exclusions.append("mqsmla_dsl_544_320")
+        for excl_id in extra_exclusions:
+            alt_common = dict(common_kw)
+            prev_excl = tuple(alt_common.get("exclude_optimizations") or ())
+            alt_common["exclude_optimizations"] = tuple(dict.fromkeys((*prev_excl, excl_id)))
+            alt_col_kw = dict(column_kw, common_kw=alt_common)
+            raw_after_alt, step_a_alt, meta_a_alt = _report_column(
+                None, track=after_track, quant=after_quant, kv=after_kv,
+                idx_kv=after_idx_kv, par=cols["after_par"], conc=cols["conc"], **alt_col_kw,
+            )
+            alt_bundle = _attach_bundle_context(
+                build_export_bundle(
+                    raw_after_alt, request=step_a_alt, replay=replay, cache_dtype=after_kv,
+                    engram_host_offload=args.engram_offload,
+                    apply_target_envelope=cols["has_target_after"],
+                    rewrite_plan=rewrite_plan if cols["has_target_after"] else None,
+                    allow_unbound_formula=(mode == MODE_MODELING), **meta_a_alt,
+                ),
+                serve_script_supplied=script_supplied,
+                solver_feasible=(bool(cols["layout_after"].get("solver_feasible", True)) if cols["layout_after"] is not None else None),
+            )
+            if alt_bundle.step_span_us < after_bundle.step_span_us:
+                common_kw = alt_common
+                column_kw = alt_col_kw
+                raw_after, step_a, meta_a, after_bundle = raw_after_alt, step_a_alt, meta_a_alt, alt_bundle
     prefill_after_bundles: tuple[Any, ...] = ()
     prefill_after_case: Mapping[str, Any] | None = None
     prefill_after_req: StepRequest | None = None

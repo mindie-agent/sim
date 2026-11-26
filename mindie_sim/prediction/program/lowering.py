@@ -43,10 +43,10 @@ def _allocation_signature(items):
     return tuple(sorted((item.name, item.pool, item.size, len(item.units)) for item in items))
 
 
-def _stage_signature(stage, *, widen_pipelines: bool = False):
+def _stage_signature(stage, *, widen_pipelines: bool = False, _memo: dict | None = None):
     program = (
         None if stage.program is None
-        else program_signature(stage.program, widen_pipelines=widen_pipelines)
+        else program_signature(stage.program, widen_pipelines=widen_pipelines, _memo=_memo)
     )
     if stage.program is not None and program is None:
         return None
@@ -67,7 +67,7 @@ def _stage_signature(stage, *, widen_pipelines: bool = False):
     )
 
 
-def _template_signature(program):
+def _template_signature(program, *, _memo: dict | None = None):
     template = program.template
     if (
         template.setup or template.drain or template.bindings
@@ -79,14 +79,14 @@ def _template_signature(program):
     for phase in template.phases:
         if phase.residue_stages or len(phase.stages) != 1:
             return None
-        signature = _stage_signature(phase.stages[0])
+        signature = _stage_signature(phase.stages[0], _memo=_memo)
         if signature is None:
             return None
         phases.append((phase.kind, phase.count, phase.key, signature))
     return ("template", template.slots, tuple(phases))
 
 
-def _pipeline_signature(program, *, widen_pipelines: bool = False):
+def _pipeline_signature(program, *, widen_pipelines: bool = False, _memo: dict | None = None):
     """Structural identity of one bounded non-homogeneous tile window."""
     if program.homogeneous or program.setup_ms or program.minimum_ms:
         return None
@@ -96,7 +96,7 @@ def _pipeline_signature(program, *, widen_pipelines: bool = False):
     for index in range(program.count):
         row = []
         for stage in tuple(program.tile(index)):
-            signature = _stage_signature(stage, widen_pipelines=widen_pipelines)
+            signature = _stage_signature(stage, widen_pipelines=widen_pipelines, _memo=_memo)
             if signature is None:
                 return None
             row.append(signature)
@@ -104,21 +104,31 @@ def _pipeline_signature(program, *, widen_pipelines: bool = False):
     return ("pipeline", program.count, program.slots, tuple(tiles))
 
 
-def program_signature(program, *, widen_pipelines: bool = False):
+def program_signature(program, *, widen_pipelines: bool = False, _memo: dict | None = None):
     """Unit-agnostic structural identity for cohort coalescing, or ``None``."""
+    memo = {} if _memo is None else _memo
+    key = (id(program), widen_pipelines)
+    cached = memo.get(key)
+    if cached is not None:
+        return cached[1]
+    sig = None
     if isinstance(program, KernelProgram):
         stages = []
+        valid = True
         for stage in program.stages:
-            signature = _stage_signature(stage, widen_pipelines=widen_pipelines)
+            signature = _stage_signature(stage, widen_pipelines=widen_pipelines, _memo=memo)
             if signature is None:
-                return None
+                valid = False
+                break
             stages.append(signature)
-        return ("kernel", program.minimum_ms, tuple(stages))
-    if isinstance(program, PipelineTemplateProgram):
-        return _template_signature(program)
-    if widen_pipelines and isinstance(program, PipelineProgram):
-        return _pipeline_signature(program, widen_pipelines=True)
-    return None
+        if valid:
+            sig = ("kernel", program.minimum_ms, tuple(stages))
+    elif isinstance(program, PipelineTemplateProgram):
+        sig = _template_signature(program, _memo=memo)
+    elif widen_pipelines and isinstance(program, PipelineProgram):
+        sig = _pipeline_signature(program, widen_pipelines=True, _memo=memo)
+    memo[key] = (program, sig)
+    return sig
 
 
 def _merge_allocations(groups):
@@ -518,13 +528,14 @@ def _last_signature_positions(sigs: list) -> dict | None:
     return last
 
 
-def coalesce_programs(programs, *, widen_pipelines: bool = False):
+def coalesce_programs(programs, *, widen_pipelines: bool = False, _sig_memo: dict | None = None):
     """Combine symmetric owners into cohort programs; keep the exact fallback."""
     programs = tuple(programs)
     n = len(programs)
     if n < 2:
         return programs
-    sigs = [program_signature(p, widen_pipelines=widen_pipelines) for p in programs]
+    sig_memo = {} if _sig_memo is None else _sig_memo
+    sigs = [program_signature(p, widen_pipelines=widen_pipelines, _memo=sig_memo) for p in programs]
     sig_last = _last_signature_positions(sigs)
     footprints: list | None = None
     consumed = [False] * n

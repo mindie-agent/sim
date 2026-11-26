@@ -933,3 +933,38 @@ def test_coalesce_programs_linear_intervening_conflict_parity():
     assert len(coalesce_programs((a0, b_conflict, a2))) == 3
     assert len(coalesce_programs((a0, b_unplaced, a2))) == 3
 
+
+def test_coalesce_execution_program_zero_unroll_limit_no_exponential_blowup_and_memo_parity():
+    """Nested ParallelProgram trees never double-recurse at unroll_limit==0 and keep exact signatures."""
+    import time
+    from mindie_sim.prediction.program.coalesce import coalesce_execution_program
+    from mindie_sim.prediction.program.lowering import program_signature
+    from mindie_sim.prediction.program.stages import ParallelProgram
+
+    # Build a 20-level binary tree of distinct ParallelPrograms: without the unroll_limit>0 guard,
+    # unroll_limit=0 triggers 2^20 = 1,048,576 recursive visits; with the guard it finishes in <20ms.
+    leaf_a = KernelProgram((Stage("a", {"vec": 1.0}, placement={"vec": (0,)}),))
+    leaf_b = KernelProgram((Stage("b", {"vec": 2.0}, placement={"vec": (1,)}),))
+    node = ParallelProgram((leaf_a, leaf_b))
+    for depth in range(20):
+        # Asymmetric side leaf prevents merging across siblings, keeping len(merged) == 2 at every level.
+        side = KernelProgram((Stage(f"s{depth}", {"vec": float(depth + 3)}, placement={"vec": (depth + 2,)}),))
+        node = ParallelProgram((node, side))
+
+    t0 = time.perf_counter()
+    coalesced = coalesce_execution_program(node, unroll_limit=0)
+    elapsed = time.perf_counter() - t0
+    assert isinstance(coalesced, ParallelProgram)
+    assert elapsed < 0.5
+
+    # Verify memoized program_signature matches fresh unmemoized calls bit-identically on nested pipelines.
+    tile_k = KernelProgram((Stage("t", {"cube": 4.0}, placement={"cube": (0,)}),))
+    pipe = PipelineProgram(4, 1, lambda _idx, k=tile_k: (Stage("w", program=k),))
+    memo: dict = {}
+    sig_first = program_signature(pipe, widen_pipelines=True, _memo=memo)
+    sig_cached = program_signature(pipe, widen_pipelines=True, _memo=memo)
+    sig_fresh = program_signature(pipe, widen_pipelines=True)
+    assert sig_first is not None
+    assert sig_first == sig_cached == sig_fresh
+
+

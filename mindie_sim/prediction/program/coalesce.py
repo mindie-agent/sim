@@ -277,11 +277,13 @@ def coalesce_execution_program(
     *,
     unroll_limit: int = PIPELINE_UNROLL_LIMIT,
     fair_resources: AbstractSet[str] | None = None,
+    _sig_memo: dict | None = None,
 ):
     """Unwrap single-tile pipelines and coalesce symmetric cohorts for Execution."""
+    sig_memo = {} if _sig_memo is None else _sig_memo
     if type(program).__name__ == "_FloorJoinProgram":
         body = coalesce_execution_program(
-            program.body, unroll_limit=unroll_limit, fair_resources=fair_resources,
+            program.body, unroll_limit=unroll_limit, fair_resources=fair_resources, _sig_memo=sig_memo,
         )
         eff_min = (
             program.effective_minimum()
@@ -321,13 +323,13 @@ def coalesce_execution_program(
 
     if type(program).__name__ == "NativeProgram":
         inner = coalesce_execution_program(
-            program.program, unroll_limit=unroll_limit, fair_resources=fair_resources,
+            program.program, unroll_limit=unroll_limit, fair_resources=fair_resources, _sig_memo=sig_memo,
         )
         return program if inner is program.program else replace(program, program=inner)
 
     if isinstance(program, KernelProgram):
         unwrapped = tuple(
-            _unwrap_stage(stage, unroll_limit=unroll_limit, fair_resources=fair_resources)
+            _unwrap_stage(stage, unroll_limit=unroll_limit, fair_resources=fair_resources, _sig_memo=sig_memo)
             for stage in program.stages
         )
         inlined = _fold_kernel_stages(
@@ -346,17 +348,17 @@ def coalesce_execution_program(
 
     if isinstance(program, PipelineProgram):
         return _coalesce_pipeline(
-            program, unroll_limit=unroll_limit, fair_resources=fair_resources,
+            program, unroll_limit=unroll_limit, fair_resources=fair_resources, _sig_memo=sig_memo,
         )
 
     if isinstance(program, ParallelProgram):
         children = tuple(
             coalesce_execution_program(
-                child, unroll_limit=unroll_limit, fair_resources=fair_resources,
+                child, unroll_limit=unroll_limit, fair_resources=fair_resources, _sig_memo=sig_memo,
             )
             for child in program.programs
         )
-        merged = coalesce_programs(children, widen_pipelines=True)
+        merged = coalesce_programs(children, widen_pipelines=True, _sig_memo=sig_memo)
         reverted_unplaced = (
             len(merged) < len(children) and any(
                 isinstance(m, KernelProgram)
@@ -370,17 +372,22 @@ def coalesce_execution_program(
         if reverted_unplaced:
             merged = children
         if (
-            len(merged) > 1
+            unroll_limit > 0
+            and len(merged) > 1
             and sum(len(m.stages) for m in merged if isinstance(m, KernelProgram)) > unroll_limit
         ):
             child_limit = unroll_limit // max(1, len(program.programs))
-            children = tuple(
-                coalesce_execution_program(
-                    child, unroll_limit=child_limit, fair_resources=fair_resources,
+            if child_limit < unroll_limit:
+                children = tuple(
+                    coalesce_execution_program(
+                        child, unroll_limit=child_limit, fair_resources=fair_resources, _sig_memo=sig_memo,
+                    )
+                    for child in program.programs
                 )
-                for child in program.programs
-            )
-            merged = children if reverted_unplaced else coalesce_programs(children, widen_pipelines=True)
+                merged = (
+                    children if reverted_unplaced
+                    else coalesce_programs(children, widen_pipelines=True, _sig_memo=sig_memo)
+                )
         if (
             len(merged) == 1 and isinstance(merged[0], KernelProgram)
             and not any(s.acquire or s.free for s in merged[0].stages)
@@ -396,6 +403,7 @@ def _unwrap_stage(
     *,
     unroll_limit: int,
     fair_resources: AbstractSet[str] | None = None,
+    _sig_memo: dict | None = None,
 ) -> Stage:
     if stage.program is None:
         return stage
@@ -406,7 +414,7 @@ def _unwrap_stage(
     ):
         return replace(stage, program=None)
     nested = coalesce_execution_program(
-        stage.program, unroll_limit=unroll_limit, fair_resources=fair_resources,
+        stage.program, unroll_limit=unroll_limit, fair_resources=fair_resources, _sig_memo=_sig_memo,
     )
     return stage if nested is stage.program else replace(stage, program=nested)
 
@@ -416,6 +424,7 @@ def _coalesce_pipeline(
     *,
     unroll_limit: int,
     fair_resources: AbstractSet[str] | None = None,
+    _sig_memo: dict | None = None,
 ):
     if (
         program.homogeneous or program.setup_ms or program.minimum_ms
@@ -436,6 +445,7 @@ def _coalesce_pipeline(
                 replace(stage, previous=()),
                 unroll_limit=unroll_limit,
                 fair_resources=fair_resources,
+                _sig_memo=_sig_memo,
             ))
         if valid:
             return KernelProgram(_fold_kernel_stages(
@@ -453,7 +463,9 @@ def _coalesce_pipeline(
             for t_idx, tile in enumerate(raw_tiles):
                 t_stages = _fold_kernel_stages(
                     _inline_wrapper_stages(tuple(
-                        _unwrap_stage(s, unroll_limit=unroll_limit, fair_resources=fair_resources)
+                        _unwrap_stage(
+                            s, unroll_limit=unroll_limit, fair_resources=fair_resources, _sig_memo=_sig_memo,
+                        )
                         for s in tile
                     )),
                     fair_resources=fair_resources,
@@ -504,7 +516,9 @@ def _coalesce_pipeline(
             _fold_kernel_stages(
                 _inline_wrapper_stages(
                     tuple(
-                        _unwrap_stage(s, unroll_limit=unroll_limit, fair_resources=fair_resources)
+                        _unwrap_stage(
+                            s, unroll_limit=unroll_limit, fair_resources=fair_resources, _sig_memo=_sig_memo,
+                        )
                         for s in tile
                     ),
                     protected_names=allow_inline,
