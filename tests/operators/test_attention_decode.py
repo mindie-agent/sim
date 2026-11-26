@@ -714,6 +714,8 @@ def test_gqa_asymmetric_value_head_dim_scales_kv_bytes_and_output_gate():
     by_id = {op.op_id: op for op in res.ops}
     by_suffix = {op.op_id.rsplit(".", 1)[-1]: op for op in res.ops}
     assert by_id[res.cache_store_id].mte3_bytes == 2 * 2 * (128 + 64) * 2
+    assert asym_plan.q_projection_width(8, 128) == 8 * 128 + 8 * 64
+    assert by_suffix["qkv"].local_shape[1] == (8 * 128 + 8 * 64) + 2 * (128 + 64)
     assert by_suffix["output_gate"].local_shape == (2 * 8 * 64,)
     assert by_suffix["output"].flops == 2 * 2 * gqa_model.hidden_size * (8 * 64)
 
@@ -1150,3 +1152,75 @@ def test_generic_latent_decode_subtile_cube_dcp_lse_and_mtp_history_conservation
     ops_r1 = target_operators(c_mtp, phase="decode", tokens=2, context=1, physical_rank=1)
     hist_r1 = next(o for o in ops_r1 if "latent_attention" in o.op_id)
     assert int(dict(hist_r1.metadata)["attention_traffic_plan"]["private_refill_bytes"]) == 0
+
+
+def test_fia_tiler_honors_pcp_query_spans_for_causal_and_windowed_tiles():
+    from mindie_sim.prediction.graph_analysis import verify_operator
+
+    a5_case = sku_case(REPRESENTATIVE_SKUS["a5"])
+    g_a5 = Geometry.from_devices(a5_case.machine.dies)
+    c_early = governed.AttentionContract(
+        64, 1, 1, 64, 64, sequences=((64, 256),), phase="prefill", causal=True,
+        sequence_query_spans=(((0, 64),),),
+    )
+    c_late = governed.AttentionContract(
+        64, 1, 1, 64, 64, sequences=((64, 256),), phase="prefill", causal=True,
+        sequence_query_spans=(((192, 256),),),
+    )
+    op_early = governed.make_attention_op(c_early, op_id="fia_pcp_early")
+    op_late = governed.make_attention_op(c_late, op_id="fia_pcp_late")
+    p_early = governed.build(op_early, g_a5)
+    p_late = governed.build(op_late, g_a5)
+    assert p_early.metadata["s2_tiles"] < p_late.metadata["s2_tiles"]
+    assert verify_operator(a5_case, op_early, governed.build)["work_mismatches"] == {}
+    assert verify_operator(a5_case, op_late, governed.build)["work_mismatches"] == {}
+
+    c_nc_win = governed.AttentionContract(
+        64, 1, 1, 64, 64, sequences=((64, 512),), phase="prefill", causal=False,
+        window_size=32, sequence_query_spans=(((0, 64),),),
+    )
+    op_nc = governed.make_attention_op(c_nc_win, op_id="fia_pcp_nc_win")
+    p_nc = governed.build(op_nc, g_a5)
+    assert p_nc.metadata["s2_tiles"] == 1
+    assert verify_operator(a5_case, op_nc, governed.build)["work_mismatches"] == {}
+
+    # Disjoint PCP windows skip interior gap tiles and compress _visible_sequences to distinct rows.
+    from mindie_sim.prediction.operators.attention._fia import _visible_sequences
+    c_gap = governed.AttentionContract(
+        128, 1, 1, 64, 64, sequences=((128, 2048),), phase="prefill", causal=True,
+        window_size=1, sequence_query_spans=(((0, 64), (1984, 2048)),),
+    )
+    op_gap = governed.make_attention_op(c_gap, op_id="fia_gap")
+    p_gap = governed.build(op_gap, g_a5)
+    assert p_gap.metadata["s2_tiles"] == 2
+    assert verify_operator(a5_case, op_gap, governed.build)["work_mismatches"] == {}
+    c_gap_4k = governed.AttentionContract(
+        256, 1, 1, 64, 64, sequences=((256, 4096),), phase="prefill", causal=True,
+        window_size=1, sequence_query_spans=(((0, 128), (3968, 4096)),),
+    )
+    assert _visible_sequences(c_gap_4k, c_gap_4k.sequences) == ((256, 256),)
+
+    # Implicit and explicit noncausal windows read identical tiles, and selected_tokens caps span width.
+    c_imp = governed.AttentionContract(256, 1, 1, 64, 64, sequences=((256, 512),), phase="prefill", causal=False, window_size=1)
+    c_exp = replace(c_imp, sequence_query_spans=(((256, 512),),))
+    p_imp = governed.build(governed.make_attention_op(c_imp, op_id="fia_imp"), g_a5)
+    p_exp = governed.build(governed.make_attention_op(c_exp, op_id="fia_exp"), g_a5)
+    assert p_imp.metadata["s2_tiles"] == p_exp.metadata["s2_tiles"] == 2
+    c_sel = governed.AttentionContract(
+        1, 1, 1, 64, 64, sequences=((1, 1024),), selected_tokens=1, phase="prefill",
+        causal=False, window_size=257, sequence_query_spans=(((512, 513),),),
+    )
+    assert governed.build(governed.make_attention_op(c_sel, op_id="fia_sel"), g_a5).metadata["s2_tiles"] == 1
+
+    # BNSD head-straddling rect preserves compulsory HBM miss on [128, 192); PA_BLK_BHSD matches token-major order.
+    c_bnsd = governed.AttentionContract(
+        192, 2, 1, 128, 128, sequences=((192, 192),), phase="prefill", causal=True, kv_layout="BNSD",
+    )
+    p_bnsd = governed.build(governed.make_attention_op(c_bnsd, op_id="fia_bnsd"), g_a5)
+    assert p_bnsd.program.rectangle(1).prev_touched_end == 128
+    c_pbhsd = governed.AttentionContract(
+        256, 2, 1, 64, 64, sequences=((256, 320),), phase="prefill", causal=True,
+        kv_layout="PA_BLK_BHSD", sequence_query_spans=(((64, 320),),),
+    )
+    p_pbhsd = governed.build(governed.make_attention_op(c_pbhsd, op_id="fia_pbhsd"), g_a5)
+    assert p_pbhsd.program.rectangle(0).tile_count == 1

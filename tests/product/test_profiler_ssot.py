@@ -573,7 +573,21 @@ def test_mla_prolog_native_identity_matches_weight_representation():
     v3_outputs = [*v4_outputs[:5], ((2, 1536), "int8", "ND"), v4_outputs[6]]
     assert (v3_contract := observed_contract(_observed_row("MlaPrologV3", v3_inputs, v3_outputs))) is not None
     assert v3_contract[:2] == ("mla_prolog_active", "MlaPrologV3")
-    assert observed_contract(_observed_row("aclnnMlaPrologV4WeightNz", v3_inputs, v3_outputs)) is None
+    v4_int8 = observed_contract(_observed_row("aclnnMlaPrologV4WeightNz", v3_inputs, v3_outputs))
+    assert v4_int8 is not None and v4_int8[:2] == ("mla_prolog_active", "aclnnMlaPrologV4WeightNz")
+    mixed_inputs = [v3_inputs[0], v4_inputs[1], *v3_inputs[2:]]
+    assert observed_contract(_observed_row("aclnnMlaPrologV4WeightNz", mixed_inputs, v3_outputs)) is None
+    bf16_packed_inputs = [((2, 7168), "bf16", "ND"), ((7168, 1536), "bf16", "FRACTAL_NZ"),
+        ((1536, 3072), "bf16", "FRACTAL_NZ"), *v4_inputs[3:4], ((7168, 576), "bf16", "FRACTAL_NZ"), *v4_inputs[5:]]
+    bf16_packed_outputs = [*v4_outputs[:5], ((2, 1536), "bf16", "ND"), v4_outputs[6]]
+    assert observed_contract(_observed_row("aclnnMlaPrologV4WeightNz", bf16_packed_inputs, bf16_packed_outputs)) is None
+    float_cache = ((16, 128, 1, 512), "bf16", "ND")
+    float_rope = ((16, 128, 1, 64), "bf16", "ND")
+    v4_float_in = [*bf16_packed_inputs[:9], float_cache, float_rope, *bf16_packed_inputs[11:]]
+    v4_float_out = [*bf16_packed_outputs[:2], float_cache, float_rope, *bf16_packed_outputs[4:]]
+    assert observed_contract(_observed_row("aclnnMlaPrologV4WeightNz", v4_float_in, v4_float_out)) is not None
+    v4_float_mixed = [v4_float_in[0], ((7168, 1536), "int8", "FRACTAL_NZ"), *v4_float_in[2:]]
+    assert observed_contract(_observed_row("aclnnMlaPrologV4WeightNz", v4_float_mixed, v4_float_out)) is None
 
 def test_explicit_cache_epilog_native_kind_is_a_candidate():
     op = {"op_id": "cache", "family": "cache_store", "recipe": "indexer_cache",

@@ -1324,3 +1324,111 @@ def test_flash_kda_replay_infers_head_counts_and_zero_aic_dsl_discovery():
     assert len(discovered) == 1
     assert discovered[0][0].kernel_id == "dsl.block_attn_res_update_rms_norm.inplace"
     assert discovered[0][0].aic_budget == 0 and discovered[0][0].aiv_budget == 2
+
+
+def test_mxfp8_mla_prolog_ports_abi_generator_nope_tail_and_packed_fp8_cache():
+    import json
+    from pathlib import Path
+    from types import SimpleNamespace
+    from mindie_sim.catalog.cache_format import cache_format, with_packed_mla_cache
+    from mindie_sim.catalog.types import QuantSpec
+    from mindie_sim.prediction.operators.mla.mla import _resolve_automatic_mla_preprocess_mode
+    from mindie_sim.rewrite.algebra import _build_mla_prolog_ports, _verify_abi_query, classify_op_traits
+    from mindie_sim.schema.model import LayerPlan, ModelSpec
+    from mindie_sim.schema.operators import OpSpec
+    from mindie_sim.schema.parallel import ParallelSpec
+    from mindie_sim.schema.workload import RequestView
+    import tools.probe_shipping_abi as psa
+
+    def _mx_op(oid, shape, cat):
+        meta = (("quant_category", cat), ("weight_format", "fp8_e4m3"), ("activation_format", "fp8_e4m3"),
+                ("weight_scale_format", "fp8_e8m0"), ("activation_scale_format", "fp8_e8m0"),
+                ("weight_group_size", 32), ("activation_group_size", 32))
+        return OpSpec(oid, "gemm", "decode", 0, 0, (), shape, shape, shape, shape, dtype="fp8_e4m3", metadata=meta)
+
+    ops_mx = [
+        _mx_op("qa", (4, 1536, 7168), "mla.q_a"),
+        _mx_op("kva", (4, 576, 7168), "mla.kv_a"),
+        _mx_op("qb", (4, 24576, 1536), "mla.q_b"),
+        OpSpec("uk", "gemm", "decode", 0, 0, (), (128, 128, 512), (128, 128, 512), (128, 128, 512), (128, 128, 512),
+               dtype="bf16", metadata=(("role", "key_absorption"), ("weight_format", "bf16"), ("activation_format", "bf16"))),
+    ]
+    roles_mx = {"qa": "q_a", "kva": "kv_a", "qb": "q_b", "uk": "q_absorb"}
+    traits_mx = {o.op_id: classify_op_traits(o) for o in ops_mx}
+    abi_id, operands, outputs = _build_mla_prolog_ports(ops_mx, roles_mx, traits_mx, soc_arch="A5", rope_dim=64)
+    assert abi_id == "aclnnMlaPrologV4WeightNz"
+    assert (operands[0].dtype, operands[0].quant_mode, operands[0].group_shape, operands[0].scale_dtype) == (
+        "fp8_e4m3fn", "mx_fp8", (32,), "fp8_e8m0",
+    )
+    assert operands[0].scale_shape == (4, 7168 // 32)
+    assert (outputs[-1].dtype, outputs[-1].shape) == ("fp8_e8m0", (4, 1536 // 32))
+    verdict, _ = _verify_abi_query(
+        abi_id=abi_id, soc_arch="A5", sku_id=REPRESENTATIVE_SKUS["a5"], graph_motif="mla_prolog",
+        operands=operands, outputs=outputs, pr_track="shipping", track_spec=None,
+        manifest_bindings=(), enabled_stack_passes=frozenset(), qk_rope_head_dim=64, mla_variant="latent_mla",
+    )
+    assert verdict.status == "admitted_shipping"
+
+    nope_ops = [replace(o, metadata=o.metadata + (("mla_use_nope", True),)) for o in ops_mx]
+    nope_traits = {o.op_id: classify_op_traits(o) for o in nope_ops}
+    nope_abi, nope_in, nope_out = _build_mla_prolog_ports(nope_ops, roles_mx, nope_traits, soc_arch="A5", rope_dim=64)
+    assert nope_abi == "aclnnMlaPrologV4WeightNz" and len(nope_in) == 9
+    nope_verdict, _ = _verify_abi_query(
+        abi_id=nope_abi, soc_arch="A5", sku_id=REPRESENTATIVE_SKUS["a5"], graph_motif="mla_prolog",
+        operands=nope_in, outputs=nope_out, pr_track="shipping", track_spec=None,
+        manifest_bindings=(), enabled_stack_passes=frozenset(), qk_rope_head_dim=64, mla_variant="latent_mla",
+    )
+    assert nope_verdict.status == "admitted_shipping"
+
+    sealed = {
+        e["entry_id"]: e
+        for e in json.loads(Path("data/abi/cann93_shipping_abi_a5.json").read_text())["entries"]
+    }
+    mx_tok = "fp8_e4m3fn:ND:mx_fp8:32:fp8_e8m0"
+    mx_w = "fp8_e4m3fn:FRACTAL_NZ:mx_fp8:32:fp8_e8m0"
+    assert list(psa._mla_prolog_in_row(mx_tok, mx_w)) == sealed["a5_cann_mla_prolog_v3"]["dtype_tuple"][1]
+    assert list(psa._mla_prolog_in_row(mx_tok, mx_w)) == sealed["a5_cann_mla_prolog_v4"]["dtype_tuple"][0]
+    assert list(psa._mla_prolog_in_row(mx_tok, mx_w, include_rope=False)) == sealed["a5_cann_mla_prolog_v4"]["dtype_tuple"][2]
+
+    nope_plan = LayerPlan(
+        index=0, attention="mla", num_heads=64, num_kv_heads=1, head_dim=192,
+        q_lora_rank=1536, kv_lora_rank=512, qk_nope_head_dim=128, qk_rope_head_dim=64,
+        v_head_dim=128, mla_variant="latent_mla", mla_use_nope=True, cache_kind="dense",
+    )
+    mdl = SimpleNamespace(activation_dtype="bf16", hidden_size=7168, num_heads=64)
+    q_bf16 = QuantSpec(name="bf16", weight_format="bf16", activation_format="bf16", kv_dtype="bf16")
+    views = (RequestView("r", 4, 32, True, "decode"),)
+    rt_a5 = SimpleNamespace(metadata=(("arch_family", "A5"), ("is_strided_kv_cache", True)))
+    rt_a3 = SimpleNamespace(metadata=(("arch_family", "A3"), ("is_strided_kv_cache", True)))
+    assert _resolve_automatic_mla_preprocess_mode(
+        runtime=rt_a5, plan=nope_plan, parallel=ParallelSpec(), model=mdl, quant=q_bf16,
+        views=views, padded_tokens=4, machine=None,
+    ) == "prolog_v3_learned_rope_tail"
+    assert _resolve_automatic_mla_preprocess_mode(
+        runtime=rt_a3, plan=nope_plan, parallel=ParallelSpec(), model=mdl, quant=q_bf16,
+        views=views, padded_tokens=4, machine=None,
+    ) == "native_decomposed"
+    q_mxfp8 = QuantSpec(name="w8a8_mxfp8", weight_format="fp8_e4m3", activation_format="fp8_e4m3", kv_dtype="bf16")
+    assert _resolve_automatic_mla_preprocess_mode(
+        runtime=rt_a5, plan=nope_plan, parallel=ParallelSpec(), model=mdl, quant=q_mxfp8,
+        views=views, padded_tokens=4, machine=None,
+    ) == "prolog_v3_learned_rope_tail"
+
+    l0 = LayerPlan(index=0, attention="mla", kv_lora_rank=512, qk_rope_head_dim=64, scope="body")
+    l1 = LayerPlan(index=1, attention="mla", kv_lora_rank=512, qk_rope_head_dim=64, scope="body")
+    ld = LayerPlan(index=2, attention="mla", kv_lora_rank=512, qk_rope_head_dim=64, scope="draft")
+    q_het = QuantSpec(
+        name="w8a8_mxfp8", kv_dtype="fp8_e4m3",
+        layer_quant_overrides=(("1", (("kv_dtype", "int8"),)), ("2", (("kv_dtype", "bf16"),))),
+    )
+    m_fp8 = ModelSpec("m", 3, 5120, 64, 192, 0, 1000, attention="mla", kv_dtype="fp8_e4m3",
+                      layer_plans=(l0, l1, ld), quant=q_het)
+    packed_fp8 = with_packed_mla_cache(m_fp8, 64)
+    assert cache_format(packed_fp8, "mla_kv", plan=l0).dtype == "fp8_e4m3"
+    assert cache_format(packed_fp8, "mla_kv", plan=l1).dtype == "int8"
+    assert cache_format(packed_fp8, "mla_kv", plan=ld).dtype == "bf16"
+    assert (
+        cache_format(packed_fp8, "mla_kv", plan=l0).row_bytes(576),
+        cache_format(packed_fp8, "mla_kv", plan=l1).row_bytes(576),
+        cache_format(packed_fp8, "mla_kv", plan=ld).row_bytes(576),
+    ) == (656, 656, 1152)

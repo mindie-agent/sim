@@ -856,12 +856,15 @@ def emit_mtp_current_attention(
 ) -> str:
     """CURRENT FIA on ``stream`` (local heads, disjoint causal current-token pairs)."""
     min_q = 1 if allow_q1 else 2
-    q_tokens = sum(int(v.q_len) for v in views if int(v.q_len) >= min_q and int(v.context) > 0)
+    q_tokens = 0
     tri_pairs = 0.0
     for v in views:
-        qv = int(v.q_len)
+        if getattr(v, "padding", False):
+            continue
+        qv = int(getattr(v, "logical_q_len", v.q_len))
         if qv < min_q or int(v.context) <= 0:
             continue
+        q_tokens += qv
         ranges = tuple(getattr(v, "query_ranges", ()) or ())
         if ranges and allow_q1:
             for lo_q, hi_q in ranges:
@@ -924,11 +927,21 @@ def _emit_dcp_lse_merge(
         )
     else:
         merge_read = float(dcp_total * out_rows * local_heads) * row_packed_bytes
+    current_rows = 0
     if local_current_dep is not None:
-        merge_read += float(out_rows * local_heads) * (float(v_dim) * elem_bytes + float(FP32_BYTES))
+        curr_op = next((op for op in reversed(ops) if op.op_id == local_current_dep), None)
+        if curr_op is not None and curr_op.local_shape:
+            current_rows = min(out_rows, max(0, int(curr_op.local_shape[0])))
+        else:
+            current_rows = out_rows
+    if current_rows > 0:
+        merge_read += float(current_rows * local_heads) * (float(v_dim) * elem_bytes + float(FP32_BYTES))
     merge_out_dtype = "fp32" if fast else act_dtype
     merge_write = elements * (float(FP32_BYTES) if fast else elem_bytes)
     merge_kernel = "_fused_merge_kernel" if fast else "_fused_dcp_lse_combine_kernel"
+    merge_vector_ops = (
+        float(MERGE_OPS) * float(local_heads * v_dim) * float(out_rows * dcp_total + current_rows)
+    )
     merge_op = OpSpec(
         op_id=f"{prefix}.dcp_lse_merge", deps=merge_deps,
         stage=stage, layer=layer, requests=requests, phase=mode,
@@ -937,7 +950,7 @@ def _emit_dcp_lse_merge(
         local_shape=(out_rows, local_heads, v_dim),
         padded_shape=(out_rows, local_heads, v_dim),
         launch_shape=(out_rows, local_heads, v_dim),
-        vector_ops=float(MERGE_OPS) * elements * float(partial_count),
+        vector_ops=merge_vector_ops,
         hbm_bytes=merge_read + merge_write, mte2_bytes=merge_read, mte3_bytes=merge_write,
         dtype=merge_out_dtype,
         metadata=(

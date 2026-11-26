@@ -24,7 +24,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from mindie_sim.catalog.cache_format import _lookup_region_decl, cache_format
+from mindie_sim.catalog.cache_format import _layer_quant, _lookup_region_decl, cache_format
 from mindie_sim.catalog.cache_pools import exact_element_bytes
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
@@ -150,6 +150,59 @@ def index_scale_bytes(model: Any) -> float:
     return dtype_bytes(str(scale))
 
 
+def _resolve_layer_plan(
+    model: Any,
+    layer_id: int,
+    *,
+    scope: str | None = None,
+    fallback: Any = None,
+) -> Any:
+    """Resolve a layer plan by ``index`` or ``native_layer_id`` (safe on sliced models)."""
+    target = int(layer_id)
+    if target < 0:
+        return fallback
+    layer_plans = getattr(model, "layer_plans", ()) or ()
+    for attr in ("index", "native_layer_id"):
+        same_scope = next(
+            (cand for cand in layer_plans
+             if int(getattr(cand, attr, -1)) == target
+             and (scope is None or getattr(cand, "scope", None) == scope)),
+            None,
+        )
+        if same_scope is not None:
+            return same_scope
+    for attr in ("index", "native_layer_id"):
+        any_scope = next(
+            (cand for cand in layer_plans if int(getattr(cand, attr, -1)) == target),
+            None,
+        )
+        if any_scope is not None:
+            return any_scope
+    if 0 <= target < len(layer_plans):
+        return layer_plans[target]
+    return fallback
+
+
+def _resolve_index_k_owner_plan(model: Any, plan: Any) -> Any:
+    """Resolve the owning layer plan for ``index_k`` via ``index_k_owner_layer_id``."""
+    if plan is None:
+        return None
+    cur = plan
+    seen: set[int] = set()
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        owner_id = int(getattr(cur, "index_k_owner_layer_id", -1))
+        if owner_id < 0:
+            return cur
+        nxt = _resolve_layer_plan(
+            model, owner_id, scope=getattr(cur, "scope", None), fallback=cur,
+        )
+        if nxt is cur or nxt is None:
+            return cur
+        cur = nxt
+    return cur
+
+
 def index_row_parts(
     model: Any,
     index_dim: int,
@@ -158,10 +211,11 @@ def index_row_parts(
     phase: str | None = None,
 ) -> tuple[int, int, int]:
     """Exact ``(payload_bytes, scale_bytes, padding_bytes)`` per index-K row."""
+    owner_plan = _resolve_index_k_owner_plan(model, plan) if plan is not None else None
     metadata = dict(getattr(model, "metadata", ()) or ())
-    if _lookup_region_decl(metadata, "index_k", plan=plan, phase=phase) is not None:
-        return cache_format(model, "index_k", plan=plan, phase=phase).row_parts(int(index_dim))
-    quant = _quant(model)
+    if _lookup_region_decl(metadata, "index_k", plan=owner_plan, phase=phase) is not None:
+        return cache_format(model, "index_k", plan=owner_plan, phase=phase).row_parts(int(index_dim))
+    quant = _layer_quant(model, owner_plan)[0] if owner_plan is not None else _quant(model)
     idx_dtype = str((getattr(quant, "index_dtype", "") if quant is not None else "") or "bf16").strip().lower()
     idx_scale = str((getattr(quant, "index_scale_dtype", "") if quant is not None else "") or "none").strip().lower()
     payload = exact_element_bytes(int(index_dim), idx_dtype)
@@ -212,8 +266,7 @@ def index_selection_cost(
     """
     if not (plan.indexer or plan.owns_topk or plan.index_query_per_layer):
         return IndexReadCost(0, 0, 0, 0.0, 0.0, 0, 0.0, 0, 0.0)
-    owner = plan.index_k_owner_layer_id
-    producer = model.layer_plans[owner] if 0 <= owner < len(model.layer_plans) else plan
+    producer = _resolve_index_k_owner_plan(model, plan)
     ratio = max(1, int(producer.compress_ratio or 1), int(producer.index_kpool or 1))
     if context_tokens is not None or query_tokens is not None:
         q = max(0, int(query_tokens if query_tokens is not None else 0))
@@ -230,14 +283,20 @@ def index_selection_cost(
     rows = completed_rows(seq, ratio)
     candidates = 0
     if plan.candidate_filter:
-        source = model.layer_plans[plan.candidate_source_layer_id]
+        source = _resolve_layer_plan(
+            model, plan.candidate_source_layer_id,
+            scope=getattr(plan, "scope", None), fallback=producer,
+        )
         candidates = candidate_valid_rows(
             completed_rows(seq, max(1, source.compress_ratio)),
             blocks=plan.candidate_topk_blocks, block_size=plan.candidate_block_size)
     scored = min(rows, candidates) if plan.candidate_filter else rows
-    limit = plan.index_topk // max(1, plan.index_kpool)
-    selected = min(scored, limit) if plan.index_topk else scored
-    width = index_row_bytes(model, producer.index_dim, plan=producer, phase=phase)
+    eff_kpool = max(1, int(producer.index_kpool or 1), int(plan.index_kpool or 1))
+    eff_topk = int(plan.index_topk or producer.index_topk or 0)
+    limit = eff_topk // eff_kpool
+    selected = min(scored, limit) if eff_topk else scored
+    eff_index_dim = int(producer.index_dim or plan.index_dim or 0)
+    width = index_row_bytes(model, eff_index_dim, plan=producer, phase=phase)
     writes = new_completed_rows(ctx, q, ratio) if plan.owns_index_k else 0
     tail_rows = 0
     tail_bytes = 0.0

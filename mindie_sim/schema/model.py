@@ -301,7 +301,10 @@ class LayerPlan:
         width = local_heads * head_dim
         if self.q_gate_separate or self.q_output_gate_kind == "none":
             return width
-        return width + (local_heads if self.q_output_gate_kind == "headwise" else width)
+        if self.q_output_gate_kind == "headwise":
+            return width + local_heads
+        v_dim = int(self.v_head_dim or head_dim)
+        return width + local_heads * v_dim
 
     @property
     def q_gate_separate(self) -> bool:

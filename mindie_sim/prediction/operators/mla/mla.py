@@ -794,8 +794,8 @@ def _resolve_automatic_mla_preprocess_mode(
         or ""
     ).strip().lower()
     act_dt = str(
-        getattr(q_attn, "activation_format", "")
-        or getattr(model, "activation_dtype", "")
+        getattr(model, "activation_dtype", "")
+        or getattr(q_attn, "activation_format", "")
         or ""
     ).strip().lower()
     if not w_dt:
@@ -863,6 +863,9 @@ def _resolve_automatic_mla_preprocess_mode(
         is_w4a8=("w4a8" in w_dt or "int4" in w_dt or "w4a16" in w_dt),
         is_int8_kv=(str(getattr(quant, "kv_dtype", "") or "").lower() == "int8"),
         has_kv_scale=bool(rt_meta.get("has_kv_scale", True)),
+        has_learned_rope_tail=bool(
+            getattr(plan, "mla_use_nope", False) and int(plan.qk_rope_head_dim or 0) > 0
+        ),
         is_strided_kv_cache=bool(rt_meta.get("is_strided_kv_cache", False)),
         is_draft_model=(str(getattr(plan, "scope", "target")) == "draft"),
         act_dtype=act_dt,
@@ -2035,7 +2038,7 @@ def _group_mla_attention_views(
     unabsorbed_qk_dim, unabsorbed_v_dim, layer_dcp, has_dp_decode, cohort_decode_views,
     sfa_replicated_prefill_path, sharded_indexer, has_unabsorbed_prefill,
 ):
-    phase_groups: list[tuple[int, int, bool, list[tuple[int, object]]]] = []
+    phase_groups: list[tuple[int, int, bool, bool, list[tuple[int, object]]]] = []
     grp_map: dict[tuple[int, int, bool], list[tuple[int, object]]] = {}
     for index, view in enumerate(() if selected else views):
         if has_dp_decode and view.phase != "prefill":
@@ -2053,16 +2056,16 @@ def _group_mla_attention_views(
         if grp_key not in grp_map:
             bucket: list[tuple[int, object]] = []
             grp_map[grp_key] = bucket
-            phase_groups.append((eff_cp, grp_key[1], view_unabsorbed, bucket))
+            phase_groups.append((eff_cp, grp_key[1], view_unabsorbed, False, bucket))
         grp_map[grp_key].append((index, view))
     if not selected and has_dp_decode:
         next_view_idx = max(
-            (idx for _, _, _, bucket in phase_groups for idx, _ in bucket),
+            (idx for _, _, _, _, bucket in phase_groups for idx, _ in bucket),
             default=-1,
         ) + 1
         decode_row_b = _mla_view_kv_row_bytes(model, plan, "decode")
         phase_groups.append(
-            (layer_dcp, decode_row_b, False, list(enumerate(cohort_decode_views, start=next_view_idx)))
+            (layer_dcp, decode_row_b, False, True, list(enumerate(cohort_decode_views, start=next_view_idx)))
         )
     return phase_groups
 
@@ -2097,7 +2100,7 @@ def _append_mla_attention(
     )
     multi_group = len(phase_groups) > 1
     unabsorbed_outputs: set[str] = set()
-    for grp_idx, (eff_cp, kv_row_b, grp_unabsorbed, indexed_views) in enumerate(phase_groups):
+    for grp_idx, (eff_cp, kv_row_b, grp_unabsorbed, grp_is_dp_cohort, indexed_views) in enumerate(phase_groups):
         grp_views = tuple(view for _, view in indexed_views)
         grp_prefix = f"{b.prefix}.phase{grp_idx}" if multi_group else b.prefix
         grp_dsa = dsa_prefill and any(view.phase == "prefill" for view in grp_views)
@@ -2219,13 +2222,18 @@ def _append_mla_attention(
         if eff_cp > 1 and grp_outputs and not paired_sfa_mode:
             current_dep = None
             if mtp_split:
-                current_dep = emit_mtp_current_attention(
-                    b.ops, prefix=grp_prefix, stage=stage, layer=plan.index,
-                    requests=b.common["requests"], mode=mode,
-                    deps=tuple(dict.fromkeys((*grp_outputs, q_local, store))),
-                    views=grp_views, local_heads=logical_heads, qk_dim=grp_qk_dim,
-                    v_dim=grp_v_dim, kv_row_bytes=kv_row_b,
-                    act_dtype=model.activation_dtype)
+                cur_views = (
+                    tuple(v for v in views if v.phase in {"decode", "draft"})
+                    if grp_is_dp_cohort else grp_views
+                )
+                if should_split_mtp_dcp(plan, cur_views, layer_dcp=eff_cp, sparse=is_sparse):
+                    current_dep = emit_mtp_current_attention(
+                        b.ops, prefix=grp_prefix, stage=stage, layer=plan.index,
+                        requests=b.common["requests"], mode=mode,
+                        deps=tuple(dict.fromkeys((*grp_outputs, q_local, store))),
+                        views=cur_views, local_heads=logical_heads, qk_dim=grp_qk_dim,
+                        v_dim=grp_v_dim, kv_row_bytes=kv_row_b,
+                        act_dtype=model.activation_dtype)
             grp_rows = max(1, sum(int(v.q_len) for v in grp_views) or max(0, q))
             merged_last = emit_dcp_output_exchange_combine(
                 b.ops, prefix=grp_prefix, stage=stage, layer=plan.index,
