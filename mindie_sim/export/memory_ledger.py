@@ -451,7 +451,7 @@ def _weight_group_label(category: str, name: str = "") -> str:
         return "MoE Shared Experts"
     if low_c in {"router", "router_bias"}:
         return "MoE Router"
-    if low_c in {"dense_mlp", "dense_ffn", "ffn"}:
+    if low_c in {"dense_mlp", "dense_ffn", "ffn"} or low_c.startswith("dense_mlp."):
         return "Dense FFN"
     if "draft" in low_c or "dspark" in low_c or "mtp" in low_c:
         return "Speculative Draft"

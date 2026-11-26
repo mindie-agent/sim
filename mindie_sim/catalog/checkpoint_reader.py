@@ -713,8 +713,14 @@ def _build_cache_quant_rule(
     top_fa: str,
     top_idx: str,
     aux_buffers: set[str],
+    *,
+    draft_kv_explicit: Mapping[int, str] | None = None,
+    draft_kv_aux: Mapping[int, str] | None = None,
+    draft_idx_explicit: Mapping[int, str] | None = None,
 ) -> CacheQuantRule:
     merged_kv_layers = {**layer_kv_aux, **layer_kv_explicit}
+    merged_draft_kv = {**(draft_kv_aux or {}), **(draft_kv_explicit or {})}
+    merged_draft_idx = dict(draft_idx_explicit or {})
     kv_tag = _select_dominant_kv_tag(merged_kv_layers, top_kv, top_fa)
     index_tag = (
         top_idx
@@ -729,7 +735,10 @@ def _build_cache_quant_rule(
         )
     )
     kv_scale, idx_scale, kv_offset = _infer_cache_scale_dtypes(kv_tag, index_tag, aux_buffers)
-    has_cache = bool(kv_tag or index_tag or merged_kv_layers or layer_idx_explicit)
+    has_cache = bool(
+        kv_tag or index_tag or merged_kv_layers or layer_idx_explicit
+        or merged_draft_kv or merged_draft_idx
+    )
     return CacheQuantRule(
         kv_tag=kv_tag,
         index_tag=index_tag,
@@ -739,6 +748,8 @@ def _build_cache_quant_rule(
         layer_scoped_kv=tuple(sorted(merged_kv_layers.items())),
         layer_scoped_index=tuple(sorted(layer_idx_explicit.items())),
         provenance="checkpoint" if has_cache else "native",
+        draft_layer_scoped_kv=tuple(sorted(merged_draft_kv.items())),
+        draft_layer_scoped_index=tuple(sorted(merged_draft_idx.items())),
     )
 
 
@@ -757,6 +768,9 @@ def _reduce_modelslim_stream(
     layer_kv_explicit: dict[int, str] = {}
     layer_kv_aux: dict[int, str] = {}
     layer_idx_explicit: dict[int, str] = {}
+    draft_kv_explicit: dict[int, str] = {}
+    draft_kv_aux: dict[int, str] = {}
+    draft_idx_explicit: dict[int, str] = {}
     pat_coords: dict[tuple[ModelScope, str], dict[str, set[tuple[int | None, int | None]]]] = defaultdict(
         lambda: defaultdict(set)
     )
@@ -781,12 +795,19 @@ def _reduce_modelslim_stream(
 
         tag = _validate_known_tag(raw_v.strip())
         module_key, suffix, had_weight = _split_tensor_suffix(key)
-        if suffix:
-            aux_buffers.add(suffix)
         scope = _infer_scope(key)
+        if suffix and (
+            scope == "target"
+            or (suffix not in _KV_AUX_SUFFIXES and suffix not in _FA_AUX_SUFFIXES)
+        ):
+            aux_buffers.add(suffix)
         norm_pat, layer_id, expert_id = _extract_pattern_and_coords(module_key)
 
         if suffix in _KV_AUX_SUFFIXES or suffix in _FA_AUX_SUFFIXES:
+            if scope == "draft":
+                if layer_id is not None:
+                    draft_kv_aux[layer_id] = tag
+                continue
             if scope != "target":
                 continue
             if layer_id is not None:
@@ -795,6 +816,10 @@ def _reduce_modelslim_stream(
                 meta_tags["kv"] = meta_tags["kv"] or tag
             continue
         if key.endswith(".indexer.quant_type"):
+            if scope == "draft":
+                if layer_id is not None:
+                    draft_idx_explicit[layer_id] = tag
+                continue
             if scope != "target":
                 continue
             if layer_id is not None:
@@ -803,6 +828,10 @@ def _reduce_modelslim_stream(
                 meta_tags["idx"] = meta_tags["idx"] or tag
             continue
         if key.endswith(".self_attn.quant_type") or key.endswith(".attn.quant_type"):
+            if scope == "draft":
+                if layer_id is not None:
+                    draft_kv_explicit[layer_id] = tag
+                continue
             if scope != "target":
                 continue
             if layer_id is not None:
@@ -821,6 +850,9 @@ def _reduce_modelslim_stream(
     cache_rule = _build_cache_quant_rule(
         layer_kv_explicit, layer_kv_aux, layer_idx_explicit,
         meta_tags["kv"], meta_tags["fa"], meta_tags["idx"], aux_buffers,
+        draft_kv_explicit=draft_kv_explicit,
+        draft_kv_aux=draft_kv_aux,
+        draft_idx_explicit=draft_idx_explicit,
     )
     provenance = CheckpointProvenance(
         checkpoint_id=_sanitize_checkpoint_id(checkpoint_id),
@@ -996,40 +1028,98 @@ def _build_hf_mxfp4_rules(
     return "MXFP4", rules, CacheQuantRule()
 
 
+_HF_EXPERT_DTYPE_ALIASES: dict[str, str] = {
+    "fp4": "mxfp4",
+    "mxfp4": "mxfp4",
+    "fp4_e2m1": "mxfp4",
+    "fp8": "fp8_e4m3",
+    "e4m3": "fp8_e4m3",
+    "e4m3fn": "fp8_e4m3",
+    "fp8_e4m3": "fp8_e4m3",
+    "float8_e4m3": "fp8_e4m3",
+    "float8_e4m3fn": "fp8_e4m3",
+    "e5m2": "fp8_e5m2",
+    "fp8_e5m2": "fp8_e5m2",
+    "float8_e5m2": "fp8_e5m2",
+    "bf16": "bf16",
+    "bfloat16": "bf16",
+    "fp16": "fp16",
+    "float16": "fp16",
+    "fp32": "fp32",
+    "float32": "fp32",
+}
+
+
+def _normalize_hf_dtype_token(raw: Any) -> str:
+    text = str(raw or "").strip().lower().replace("-", "_")
+    if text.startswith("torch."):
+        text = text[len("torch."):]
+    return text
+
+
 def _build_hf_fp8_rules(
     qcfg: Mapping[str, Any],
     base_config: Mapping[str, Any] | None,
 ) -> tuple[str, tuple[TensorQuantRule, ...], CacheQuantRule]:
-    fmt = str(qcfg.get("fmt") or "e4m3").strip().lower()
-    if fmt not in {"e4m3", "e4m3fn", "fp8_e4m3", "e5m2"}:
+    fmt = _normalize_hf_dtype_token(qcfg.get("fmt") or "e4m3")
+    if fmt in {"e4m3", "e4m3fn", "fp8_e4m3", "float8_e4m3", "float8_e4m3fn"}:
+        weight_dtype = "fp8_e4m3"
+    elif fmt in {"e5m2", "fp8_e5m2", "float8_e5m2"}:
+        weight_dtype = "fp8_e5m2"
+    else:
         raise ModelingError(f"unknown_checkpoint_quant_tag:fp8:{fmt}")
-    weight_dtype = "fp8_e5m2" if fmt == "e5m2" else "fp8_e4m3"
     block = _hf_block_tuple(
         qcfg.get("weight_block_size"), (FP8_DEFAULT_BLOCK_SIZE, FP8_DEFAULT_BLOCK_SIZE),
     )
     scale = _hf_scale_dtype(qcfg.get("scale_fmt"), "fp32")
-    expert_raw = str(
+    expert_raw = _normalize_hf_dtype_token(
         qcfg.get("expert_dtype")
         or (base_config.get("expert_dtype") if isinstance(base_config, Mapping) else "")
         or ""
-    ).strip().lower()
+    )
     rules: list[TensorQuantRule] = []
     model_qtype = "FP8_DYNAMIC"
-    if expert_raw in {"fp4", "mxfp4", "fp4_e2m1"}:
-        model_qtype = "FP8_DYNAMIC+MXFP4_EXPERTS"
-        rules.append(
-            TensorQuantRule(
-                pattern="*.experts.*",
-                raw_tag="W4A8_MXFP",
-                weight_dtype="mxfp4",
-                activation_dtype=weight_dtype,
-                scale_dtype="fp8_e8m0",
-                group_size=(1, MXFP_GROUP_SIZE),
-                symmetric=True,
+    if expert_raw:
+        expert_canon = _HF_EXPERT_DTYPE_ALIASES.get(expert_raw)
+        if expert_canon is None:
+            raise ModelingError(f"unknown_checkpoint_quant_tag:expert_dtype:{expert_raw}")
+        if expert_canon == "mxfp4":
+            model_qtype = "FP8_DYNAMIC+MXFP4_EXPERTS"
+            rules.append(
+                TensorQuantRule(
+                    pattern="*.experts.*",
+                    raw_tag="W4A8_MXFP",
+                    weight_dtype="mxfp4",
+                    activation_dtype=weight_dtype,
+                    scale_dtype="fp8_e8m0",
+                    group_size=(1, MXFP_GROUP_SIZE),
+                    symmetric=True,
+                )
             )
-        )
-    elif expert_raw and expert_raw not in {"fp8", "fp8_e4m3", "bf16", "fp16"}:
-        raise ModelingError(f"unknown_checkpoint_quant_tag:expert_dtype:{expert_raw}")
+        elif expert_canon in {"bf16", "fp16", "fp32"}:
+            model_qtype = f"FP8_DYNAMIC+{expert_canon.upper()}_EXPERTS"
+            rules.append(
+                TensorQuantRule(
+                    pattern="*.experts.*",
+                    raw_tag=expert_canon.upper(),
+                    weight_dtype=expert_canon,
+                    activation_dtype=expert_canon,
+                    scale_dtype="none",
+                )
+            )
+        elif expert_canon != weight_dtype:
+            model_qtype = f"FP8_DYNAMIC+{expert_canon.upper()}_EXPERTS"
+            rules.append(
+                TensorQuantRule(
+                    pattern="*.experts.*",
+                    raw_tag=expert_canon.upper(),
+                    weight_dtype=expert_canon,
+                    activation_dtype=expert_canon,
+                    scale_dtype=scale,
+                    group_size=block,
+                    symmetric=True,
+                )
+            )
     rules.append(
         TensorQuantRule(
             pattern="*",
@@ -1180,7 +1270,7 @@ def _build_hf_awq_or_gptq_rules(
     default_bits = AWQ_DEFAULT_BITS if method == "awq" else GPTQ_DEFAULT_BITS
     default_group = AWQ_DEFAULT_GROUP_SIZE if method == "awq" else GPTQ_DEFAULT_GROUP_SIZE
     bits = int(qcfg.get("bits") or qcfg.get("w_bit") or default_bits)
-    gsize = int(qcfg.get("group_size") or default_group)
+    gsize = int(qcfg.get("group_size") or qcfg.get("q_group_size") or default_group)
     if bits not in {INT4_BITS, INT8_BITS}:
         raise ModelingError(f"unknown_checkpoint_quant_tag:{method}:bits={bits}")
     w_dtype = "int4" if bits == INT4_BITS else "int8"
@@ -1429,6 +1519,15 @@ def serialize_curated_entry(
         entry["auxiliary_buffers"] = list(qmap.auxiliary_buffers)
     if qmap.source_format == "hf_quantization_config":
         entry["hf_quant_config"] = _unfreeze_json_value(qmap.hf_quant_config)
+        cr = qmap.cache_rule
+        if (
+            cr.scope != "target"
+            or cr.draft_layer_scoped_kv
+            or cr.draft_layer_scoped_index
+            or cr.layer_scoped_kv
+            or cr.layer_scoped_index
+        ):
+            entry["cache_rule"] = _serialize_curated_cache_rule(cr)
         return entry
 
     all_pats = [r.pattern for r in qmap.rules] + [e.pattern for e in qmap.layer_exceptions]
@@ -1472,24 +1571,55 @@ def serialize_curated_entry(
         entry["layer_exceptions"] = exc_list
 
     cr = qmap.cache_rule
-    if cr.provenance != "native" or cr.kv_tag or cr.index_tag or cr.layer_scoped_kv or cr.layer_scoped_index:
-        cache_obj: dict[str, Any] = {"provenance": cr.provenance}
-        if cr.kv_tag:
-            cache_obj["kv_tag"] = cr.kv_tag
-        if cr.index_tag:
-            cache_obj["index_tag"] = cr.index_tag
-        if cr.kv_scale_dtype:
-            cache_obj["kv_scale_dtype"] = cr.kv_scale_dtype
-        if cr.index_scale_dtype:
-            cache_obj["index_scale_dtype"] = cr.index_scale_dtype
-        if cr.kv_offset_dtype:
-            cache_obj["kv_offset_dtype"] = cr.kv_offset_dtype
-        if cr.layer_scoped_kv:
-            cache_obj["layer_scoped_kv"] = _encode_layer_tag_map(cr.layer_scoped_kv)
-        if cr.layer_scoped_index:
-            cache_obj["layer_scoped_index"] = _encode_layer_tag_map(cr.layer_scoped_index)
-        entry["cache_rule"] = cache_obj
+    if (
+        cr.provenance != "native" or cr.kv_tag or cr.index_tag
+        or cr.layer_scoped_kv or cr.layer_scoped_index
+        or cr.draft_layer_scoped_kv or cr.draft_layer_scoped_index
+        or cr.scope != "target"
+    ):
+        entry["cache_rule"] = _serialize_curated_cache_rule(cr)
     return entry
+
+
+def _serialize_curated_cache_rule(cr: CacheQuantRule) -> dict[str, Any]:
+    cache_obj: dict[str, Any] = {"provenance": cr.provenance}
+    if cr.scope != "target":
+        cache_obj["scope"] = cr.scope
+    if cr.kv_tag:
+        cache_obj["kv_tag"] = cr.kv_tag
+    if cr.index_tag:
+        cache_obj["index_tag"] = cr.index_tag
+    if cr.kv_scale_dtype:
+        cache_obj["kv_scale_dtype"] = cr.kv_scale_dtype
+    if cr.index_scale_dtype:
+        cache_obj["index_scale_dtype"] = cr.index_scale_dtype
+    if cr.kv_offset_dtype:
+        cache_obj["kv_offset_dtype"] = cr.kv_offset_dtype
+    if cr.layer_scoped_kv:
+        cache_obj["layer_scoped_kv"] = _encode_layer_tag_map(cr.layer_scoped_kv)
+    if cr.layer_scoped_index:
+        cache_obj["layer_scoped_index"] = _encode_layer_tag_map(cr.layer_scoped_index)
+    if cr.draft_layer_scoped_kv:
+        cache_obj["draft_layer_scoped_kv"] = _encode_layer_tag_map(cr.draft_layer_scoped_kv)
+    if cr.draft_layer_scoped_index:
+        cache_obj["draft_layer_scoped_index"] = _encode_layer_tag_map(cr.draft_layer_scoped_index)
+    return cache_obj
+
+
+def _deserialize_curated_cache_rule(raw_cache: Mapping[str, Any]) -> CacheQuantRule:
+    return CacheQuantRule(
+        kv_tag=str(raw_cache.get("kv_tag") or ""),
+        index_tag=str(raw_cache.get("index_tag") or ""),
+        kv_scale_dtype=str(raw_cache.get("kv_scale_dtype") or ""),
+        index_scale_dtype=str(raw_cache.get("index_scale_dtype") or ""),
+        kv_offset_dtype=str(raw_cache.get("kv_offset_dtype") or ""),
+        layer_scoped_kv=_decode_layer_tag_map(raw_cache.get("layer_scoped_kv") or {}),
+        layer_scoped_index=_decode_layer_tag_map(raw_cache.get("layer_scoped_index") or {}),
+        provenance=raw_cache.get("provenance") or "native",
+        scope=raw_cache.get("scope") or "target",
+        draft_layer_scoped_kv=_decode_layer_tag_map(raw_cache.get("draft_layer_scoped_kv") or {}),
+        draft_layer_scoped_index=_decode_layer_tag_map(raw_cache.get("draft_layer_scoped_index") or {}),
+    )
 
 
 def _encode_layer_tag_map(items: Sequence[tuple[int, str]]) -> dict[str, list[int | list[int]]]:
@@ -1531,6 +1661,9 @@ def deserialize_curated_entry(
             source_sha256=str(entry.get("source_sha256") or ""),
             descriptor_path=str(entry.get("descriptor_path") or "config.json"),
         )
+        raw_cache_hf = entry.get("cache_rule")
+        if isinstance(raw_cache_hf, Mapping) and raw_cache_hf:
+            qmap = replace(qmap, cache_rule=_deserialize_curated_cache_rule(raw_cache_hf))
         return qmap, frozenset()
 
     prefixes = tuple(str(p) for p in (entry.get("prefixes") or ()))
@@ -1593,16 +1726,7 @@ def deserialize_curated_entry(
         )
 
     raw_cache = entry.get("cache_rule") or {}
-    cache_rule = CacheQuantRule(
-        kv_tag=str(raw_cache.get("kv_tag") or ""),
-        index_tag=str(raw_cache.get("index_tag") or ""),
-        kv_scale_dtype=str(raw_cache.get("kv_scale_dtype") or ""),
-        index_scale_dtype=str(raw_cache.get("index_scale_dtype") or ""),
-        kv_offset_dtype=str(raw_cache.get("kv_offset_dtype") or ""),
-        layer_scoped_kv=_decode_layer_tag_map(raw_cache.get("layer_scoped_kv") or {}),
-        layer_scoped_index=_decode_layer_tag_map(raw_cache.get("layer_scoped_index") or {}),
-        provenance=raw_cache.get("provenance") or "native",
-    )
+    cache_rule = _deserialize_curated_cache_rule(raw_cache)
     origin: CheckpointOrigin = entry.get("origin") or "verified_checkpoint_descriptor"
     provenance = CheckpointProvenance(
         checkpoint_id=checkpoint_id,
@@ -1767,6 +1891,41 @@ def _read_local_checkpoint_path(
             desc_path, checkpoint_id=cid, base_config=cfg or None,
             chunk_size=chunk_size, force_stdlib=force_stdlib,
         )
+    text_cfg = cfg.get("text_config") if isinstance(cfg, Mapping) else None
+    has_inline_qcfg = bool(
+        (isinstance(cfg.get("quantization_config"), Mapping) and cfg.get("quantization_config"))
+        or (
+            isinstance(text_cfg, Mapping)
+            and isinstance(text_cfg.get("quantization_config"), Mapping)
+            and text_cfg.get("quantization_config")
+        )
+    )
+    qcfg_path: Path | None = None
+    if local.is_file() and local.name == "quantize_config.json":
+        qcfg_path = local
+    elif not has_inline_qcfg and (base_dir / "quantize_config.json").is_file():
+        qcfg_path = base_dir / "quantize_config.json"
+    if qcfg_path is not None:
+        try:
+            raw_qcfg = json.loads(qcfg_path.read_text(encoding="utf-8"))
+        except TimeoutError:
+            raise
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ModelingError(
+                f"checkpoint_quantize_config_invalid:{qcfg_path.name}:{type(exc).__name__}"
+            ) from exc
+        if isinstance(raw_qcfg, Mapping) and raw_qcfg:
+            qcfg_dict = dict(raw_qcfg)
+            if not str(qcfg_dict.get("quant_method") or "").strip():
+                if any(k in qcfg_dict for k in ("w_bit", "q_group_size", "zero_point")):
+                    qcfg_dict["quant_method"] = "awq"
+                elif any(k in qcfg_dict for k in ("bits", "group_size", "sym")):
+                    qcfg_dict["quant_method"] = "gptq"
+            merged_cfg = dict(cfg) if isinstance(cfg, Mapping) else {}
+            merged_cfg["quantization_config"] = qcfg_dict
+            return read_hf_quantization_config(
+                merged_cfg, checkpoint_id=cid, descriptor_path=qcfg_path.name,
+            )
     return read_hf_quantization_config(
         cfg, checkpoint_id=cid, descriptor_path=cfg_path.name if cfg_path.is_file() else "config.json",
     )
@@ -1944,8 +2103,15 @@ def _classify_attn_mlp_component(
                 return ("kda.q", "kda.k", "kda.v")
             return ("kda.q",) if last == "q_proj" else (("kda.k",) if last == "k_proj" else ("kda.v",))
         return ("attn.qkv",)
-    if ({"mlp", "ffn"} & parts) and last in {"gate_proj", "up_proj", "down_proj", "gate_up_proj", "w1", "w2", "w3"}:
-        return ("dense_mlp",)
+    if {"mlp", "ffn"} & parts:
+        if last in {"gate_proj", "w1"}:
+            return ("dense_mlp.gate",)
+        if last in {"up_proj", "w3"}:
+            return ("dense_mlp.up",)
+        if last in {"down_proj", "w2"}:
+            return ("dense_mlp.down",)
+        if last == "gate_up_proj":
+            return ("dense_mlp.gate", "dense_mlp.up")
     return ()
 
 
@@ -2046,6 +2212,42 @@ def _override_fields_for_hf_rule(rule: TensorQuantRule, native: str) -> dict[str
     }
 
 
+_DENSE_MLP_SUB_CATS: tuple[str, ...] = (
+    "dense_mlp.gate", "dense_mlp.up", "dense_mlp.down",
+)
+
+
+def _expand_simple_regex_variants(text: str) -> tuple[str, ...]:
+    open_idx = text.find("(")
+    close_idx = text.find(")", open_idx + 1) if open_idx >= 0 else -1
+    if open_idx < 0 or close_idx < 0:
+        return (text,)
+    prefix, body, suffix = text[:open_idx], text[open_idx + 1:close_idx], text[close_idx + 1:]
+    if any(ch in prefix or ch in suffix for ch in "()|") or "(" in body or ")" in body:
+        return (text,)
+    parts = [part.strip() for part in body.split("|") if part.strip()]
+    return tuple(f"{prefix}{part}{suffix}" for part in parts) if parts else (text,)
+
+
+def _coalesce_dense_mlp_layer_overrides(
+    native_layers: dict[str, dict[str, Any]],
+    *,
+    keep_children: bool = False,
+) -> None:
+    """Coalesce identical ``dense_mlp.{gate,up,down}`` layer overrides onto ``dense_mlp``."""
+    sub_set = set(_DENSE_MLP_SUB_CATS)
+    for entry in native_layers.values():
+        cat_map = entry.get("category_overrides")
+        if not isinstance(cat_map, dict) or not sub_set.issubset(cat_map):
+            continue
+        first = cat_map[_DENSE_MLP_SUB_CATS[0]]
+        if all(cat_map[sub] == first for sub in _DENSE_MLP_SUB_CATS[1:]):
+            if not keep_children:
+                for sub in _DENSE_MLP_SUB_CATS:
+                    cat_map.pop(sub, None)
+            cat_map["dense_mlp"] = dict(first)
+
+
 def _classify_hf_target_categories(
     raw_pat: str,
     *,
@@ -2054,35 +2256,47 @@ def _classify_hf_target_categories(
     allow_lm_head: bool = False,
 ) -> tuple[str, ...]:
     cleaned = str(raw_pat or "").strip()
-    if cleaned.startswith("re:"):
+    is_regex = cleaned.startswith("re:")
+    if is_regex:
         cleaned = (
             cleaned[len("re:"):]
             .replace("\\.", ".")
             .replace(".*", ".")
             .strip("^$")
         )
-    lower = cleaned.lower()
-    if lower.endswith(".weight"):
-        lower = lower[:-len(".weight")]
-    raw_parts = [p for p in lower.split(".") if p]
-    last = raw_parts[-1] if raw_parts else ""
-    if last in {"self_attn", "attention", "attn"}:
-        if has_mla:
-            return ("mla", "mla_absorb")
-        return ("kda",) if has_kda else ("attn",)
-    if last == "linear_attn":
-        return ("gdn",)
-    if last in {"mlp", "ffn"}:
-        return ("dense_mlp", "shared_expert", "routed_expert")
-    if last == "experts":
-        return ("routed_expert",)
-    if last in {"shared_experts", "shared_expert", "share_expert"}:
-        return ("shared_expert",)
+    variants = _expand_simple_regex_variants(cleaned) if is_regex else (cleaned,)
     skip = _SKIP_OVERRIDE_CATS - {"lm_head"} if allow_lm_head else _SKIP_OVERRIDE_CATS
-    return tuple(
-        c for c in classify_tensor_categories(cleaned, has_mla=has_mla, has_kda=has_kda)
-        if c not in skip
-    )
+    collected: list[str] = []
+    for variant in variants:
+        lower = variant.lower()
+        if lower.endswith(".weight"):
+            lower = lower[:-len(".weight")]
+        raw_parts = [p for p in lower.split(".") if p]
+        last = raw_parts[-1] if raw_parts else ""
+        if last in {"self_attn", "attention", "attn"}:
+            v_cats: tuple[str, ...] = ("mla", "mla_absorb") if has_mla else (("kda",) if has_kda else ("attn",))
+        elif last == "linear_attn":
+            v_cats = ("gdn",)
+        elif last in {"mlp", "ffn"}:
+            v_cats = ("dense_mlp", "shared_expert", "routed_expert")
+        elif last == "experts":
+            v_cats = ("routed_expert",)
+        elif last in {"shared_experts", "shared_expert", "share_expert"}:
+            v_cats = ("shared_expert",)
+        else:
+            v_cats = tuple(
+                c for c in classify_tensor_categories(variant, has_mla=has_mla, has_kda=has_kda)
+                if c not in skip
+            )
+        for c in v_cats:
+            if c not in collected:
+                collected.append(c)
+    if set(_DENSE_MLP_SUB_CATS).issubset(collected):
+        collapsed = [c for c in collected if c not in _DENSE_MLP_SUB_CATS]
+        if "dense_mlp" not in collapsed:
+            collapsed.append("dense_mlp")
+        return tuple(collapsed)
+    return tuple(collected)
 
 
 def _extract_expert_count_hint(base_config: Mapping[str, Any] | None) -> int:
@@ -2095,6 +2309,28 @@ def _extract_expert_count_hint(base_config: Mapping[str, Any] | None) -> int:
             if isinstance(val, int) and not isinstance(val, bool) and val > 0:
                 return int(val)
     return 0
+
+
+def _extract_hf_pattern_coords(raw: str) -> tuple[int | None, int | None]:
+    """Extract literal ``(layer_id, expert_id)`` from a literal or anchored ``re:`` HF pattern."""
+    if not raw.startswith("re:"):
+        _, lid, eid = _extract_pattern_and_coords(raw)
+        return lid, eid
+    body = raw[len("re:"):].strip()
+    if body.startswith("^"):
+        body = body[1:]
+    if body.endswith("$"):
+        body = body[:-1]
+    depth = 0
+    for ch in body:
+        if ch == "(":
+            depth += 1
+        elif ch == ")" and depth > 0:
+            depth -= 1
+        elif ch == "|" and depth == 0:
+            return None, None
+    _, lid, eid = _extract_pattern_and_coords(body.replace(r"\.", "."))
+    return lid, eid
 
 
 def _apply_ignored_modules_to_overrides(
@@ -2117,8 +2353,7 @@ def _apply_ignored_modules_to_overrides(
             extra_exclusions.append("mtp")
         if _infer_scope(mod) != "target":
             continue
-        is_regex = mod.startswith("re:")
-        _, lid, eid = (None, None, None) if is_regex else _extract_pattern_and_coords(mod)
+        lid, eid = _extract_hf_pattern_coords(mod)
         cats = _classify_hf_target_categories(
             mod, has_mla=has_mla, has_kda=has_kda, allow_lm_head=True,
         )
@@ -2166,8 +2401,7 @@ def _hf_layer_and_category_overrides(
         scope = _infer_scope(rule.pattern)
         if scope != "target":
             continue
-        is_regex = rule.pattern.startswith("re:")
-        _, lid, eid = (None, None, None) if is_regex else _extract_pattern_and_coords(rule.pattern)
+        lid, eid = _extract_hf_pattern_coords(rule.pattern)
         cats = _classify_hf_target_categories(
             rule.pattern, has_mla=has_mla, has_kda=has_kda, allow_lm_head=True,
         )
@@ -2210,6 +2444,10 @@ def _hf_layer_and_category_overrides(
         expert_count_hint=expert_count_hint,
     )
     _attach_partial_expert_overrides(native_layers, partial_by_layer_cat, expert_count_by_layer_cat)
+    _coalesce_dense_mlp_layer_overrides(
+        native_layers,
+        keep_children=any(sub in cat_overrides for sub in _DENSE_MLP_SUB_CATS),
+    )
     layer_ov = {"native_layers": native_layers} if native_layers else {}
     return cat_overrides, layer_ov, extra_exclusions
 
@@ -2225,12 +2463,13 @@ def _quant_spec_from_hf_map(
 ) -> QuantSpec:
     default_rule = next((r for r in qmap.rules if r.pattern == "*"), None)
     expert_rule = next((r for r in qmap.rules if r.pattern == "*.experts.*"), None)
-    kv_c, idx_c, idx_scale = _cache_dtypes_from_rule(qmap.cache_rule)
+    target_cache_rule = qmap.cache_rule if qmap.cache_rule.scope == "target" else CacheQuantRule()
+    kv_c, idx_c, idx_scale = _cache_dtypes_from_rule(target_cache_rule)
     kv_dtype = kv_override or kv_c or native
     index_dtype = index_override or idx_c or native
     if index_dtype not in {"int8", "fp8", "fp8_e4m3"}:
         idx_scale = "none"
-    elif index_dtype != idx_c or not idx_c or not qmap.cache_rule.index_scale_dtype:
+    elif index_dtype != idx_c or not idx_c or not target_cache_rule.index_scale_dtype:
         idx_scale = "fp8_e8m0" if "fp8" in index_dtype else "fp16"
 
     if default_rule is not None:
@@ -2266,19 +2505,15 @@ def _quant_spec_from_hf_map(
     overrides, layer_overrides, extra_exclusions = _hf_layer_and_category_overrides(
         qmap, native=native, expert_count_hint=_extract_expert_count_hint(base_config),
     )
-    if expert_rule is not None:
-        overrides["routed_expert"] = {
-            "weight_format": expert_rule.weight_dtype,
-            "activation_format": expert_rule.activation_dtype,
-            "weight_block": (1, eb),
-            "expert_block": eb,
-            "scale_format": expert_rule.scale_dtype or "fp8_e8m0",
-            "scale_bytes": MXFP_SCALE_BYTES if (expert_rule.scale_dtype or "fp8_e8m0") == "fp8_e8m0" else FP32_SCALE_BYTES,
-            "activation_group_size": eb,
-            "activation_scale_format": expert_rule.scale_dtype or "fp8_e8m0",
-            "activation_scale_pack": MXFP_SCALE_PACK,
-            "weight_symmetric": True if expert_rule.symmetric is None else bool(expert_rule.symmetric),
-        }
+    if expert_rule is not None and "routed_expert" not in overrides:
+        exp_w = str(expert_rule.weight_dtype or "").strip().lower()
+        if exp_w in _FLOAT_DTYPE_TOKENS:
+            overrides["routed_expert"] = {
+                "weight_format": expert_rule.weight_dtype,
+                "activation_format": expert_rule.activation_dtype or expert_rule.weight_dtype,
+            }
+        else:
+            overrides["routed_expert"] = _override_fields_for_hf_rule(expert_rule, native)
 
     exclusions = list(STANDARD_UNQUANTIZED_EXCLUSIONS) + extra_exclusions
     if "lm_head" in overrides:
@@ -2383,6 +2618,7 @@ def _layer_quant_overrides_from_exceptions(
     mla_layers: frozenset[int] = frozenset(),
     kda_layers: frozenset[int] = frozenset(),
     category_defaults: Mapping[str, str] | None = None,
+    keep_dense_mlp_children: bool = False,
 ) -> dict[str, Any]:
     """Project target-scope per-layer and partial-expert exceptions onto ``native_layers``."""
     per_layer_arch = bool(mla_layers or kda_layers)
@@ -2465,6 +2701,7 @@ def _layer_quant_overrides_from_exceptions(
                 cat_map[cat] = dict(fields)
 
     _attach_partial_expert_overrides(native_layers, partial_by_layer_cat, expert_count_by_layer_cat)
+    _coalesce_dense_mlp_layer_overrides(native_layers, keep_children=keep_dense_mlp_children)
     return {"native_layers": native_layers} if native_layers else {}
 
 
@@ -2552,7 +2789,9 @@ def quant_spec_from_checkpoint_map(
         t
         for c in (
             "attn.qkv", "attn.o", "mla.q_a", "mla.q_b", "mla.kv_a", "mla.o",
-            "kda.q", "kda.k", "kda.v", "dense_mlp", "shared_expert", "latent_moe", "indexer_fp8",
+            "kda.q", "kda.k", "kda.v",
+            "dense_mlp", *_DENSE_MLP_SUB_CATS,
+            "shared_expert", "latent_moe", "indexer_fp8",
         )
         for t in cat_tags.get(c, ())
     ]
@@ -2572,13 +2811,33 @@ def quant_spec_from_checkpoint_map(
         if cat_tags.get(opt) and all(normalize_quant_tag_strict(t) == "FLOAT" for t in cat_tags[opt]):
             if opt not in exclusions:
                 exclusions.append(opt)
+    dense_all_tags = [t for c in _DENSE_MLP_SUB_CATS for t in cat_tags.get(c, ())] + cat_tags.get("dense_mlp", [])
+    if dense_all_tags and all(normalize_quant_tag_strict(t) == "FLOAT" for t in dense_all_tags):
+        if "dense_mlp" not in exclusions:
+            exclusions.append("dense_mlp")
     attn_tags = cat_tags.get("attn.qkv", []) + cat_tags.get("attn.o", [])
     if attn_tags and all(normalize_quant_tag_strict(t) == "FLOAT" for t in attn_tags) and "attn" not in exclusions:
         exclusions.append("attn")
 
     overrides: dict[str, dict[str, Any]] = {}
     category_defaults: dict[str, str] = {}
-    skip = set(exclusions) | (set(_SKIP_OVERRIDE_CATS) - {"lm_head"})
+    dense_sub_targets = {
+        sub: _pick_category_majority_tag(cat_tags[sub])
+        for sub in _DENSE_MLP_SUB_CATS
+        if cat_tags.get(sub)
+    }
+    if dense_sub_targets and "dense_mlp" not in exclusions:
+        parent_dense_tag = _pick_category_majority_tag(list(dense_sub_targets.values()))
+        category_defaults["dense_mlp"] = parent_dense_tag
+        if parent_dense_tag != linear_tag:
+            overrides["dense_mlp"] = _override_fields_for_tag(parent_dense_tag, native)
+        for sub, sub_tag in dense_sub_targets.items():
+            category_defaults[sub] = sub_tag
+            if all(normalize_quant_tag_strict(t) == "FLOAT" for t in cat_tags[sub]) and sub not in exclusions:
+                exclusions.append(sub)
+            if sub_tag != parent_dense_tag:
+                overrides[sub] = _override_fields_for_tag(sub_tag, native)
+    skip = set(exclusions) | (set(_SKIP_OVERRIDE_CATS) - {"lm_head"}) | set(dense_sub_targets)
     for cat, tags_here in sorted(cat_tags.items()):
         if cat in skip:
             continue
@@ -2592,17 +2851,18 @@ def quant_spec_from_checkpoint_map(
         if needs_override:
             overrides[cat] = _override_fields_for_tag(target, native)
 
-    kv_c, idx_c, idx_scale = _cache_dtypes_from_rule(qmap.cache_rule)
+    target_cache_rule = qmap.cache_rule if qmap.cache_rule.scope == "target" else CacheQuantRule()
+    kv_c, idx_c, idx_scale = _cache_dtypes_from_rule(target_cache_rule)
     kv_dtype = kv_dtype_override or kv_c or native
     index_from_kv = (not index_dtype_override and not idx_c and kv_dtype in {"int8", "fp8", "fp8_e4m3"})
     index_unspecified = (not index_dtype_override and not idx_c and not index_from_kv)
     index_dtype = index_dtype_override or idx_c or (kv_dtype if index_from_kv else native)
     if index_dtype not in {"int8", "fp8", "fp8_e4m3"}:
         idx_scale = "none"
-    elif index_dtype != idx_c or not idx_c or not qmap.cache_rule.index_scale_dtype:
+    elif index_dtype != idx_c or not idx_c or not target_cache_rule.index_scale_dtype:
         idx_scale = "fp8_e8m0" if index_dtype in {"fp8", "fp8_e4m3"} else "fp16"
 
-    kv_tag_upper = qmap.cache_rule.kv_tag.strip().upper().replace("-", "_")
+    kv_tag_upper = target_cache_rule.kv_tag.strip().upper().replace("-", "_")
     scoped_kv_tags = {
         str(tag).strip().upper().replace("-", "_")
         for _, tag in qmap.cache_rule.layer_scoped_kv
@@ -2629,6 +2889,7 @@ def quant_spec_from_checkpoint_map(
         qmap, has_mla=has_mla, has_kda=has_kda, native=native,
         mla_layers=mla_layers, kda_layers=kda_layers,
         category_defaults=category_defaults,
+        keep_dense_mlp_children=any(sub in overrides for sub in _DENSE_MLP_SUB_CATS),
     )
     if qmap.ignored_modules:
         ign_native = dict(layer_overrides.get("native_layers") or {})
@@ -2653,15 +2914,15 @@ def quant_spec_from_checkpoint_map(
                 exclusions.append(ex)
         if ign_native:
             layer_overrides["native_layers"] = ign_native
-    if not kv_dtype_override and qmap.cache_rule.layer_scoped_kv:
-        for lid, ltag in qmap.cache_rule.layer_scoped_kv:
+    if not kv_dtype_override and target_cache_rule.layer_scoped_kv:
+        for lid, ltag in target_cache_rule.layer_scoped_kv:
             l_kv_c, _, _ = _cache_dtypes_from_rule(CacheQuantRule(kv_tag=ltag))
             eff_l_kv = l_kv_c or native
             if eff_l_kv != kv_dtype:
                 nl = layer_overrides.setdefault("native_layers", {})
                 nl.setdefault(str(int(lid)), {})["kv_dtype"] = eff_l_kv
-    if not index_dtype_override and qmap.cache_rule.layer_scoped_index:
-        for lid, ltag in qmap.cache_rule.layer_scoped_index:
+    if not index_dtype_override and target_cache_rule.layer_scoped_index:
+        for lid, ltag in target_cache_rule.layer_scoped_index:
             _, l_idx_c, l_idx_scale = _cache_dtypes_from_rule(CacheQuantRule(index_tag=ltag))
             eff_l_idx = l_idx_c or native
             if eff_l_idx != index_dtype:

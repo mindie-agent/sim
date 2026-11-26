@@ -162,8 +162,9 @@ _W8A8_DYNAMIC_TAGS = frozenset({
 _W8A8_STATIC_TAGS = frozenset({"W8A8", "W8A8_STATIC", "INT8"})
 _W8A8_MIX_TAGS = frozenset({"W8A8_MIX", "W8A8_PDMIX"})
 _W4A8_TAGS = frozenset({
-    "W4A8_DYNAMIC", "W4A8", "W4A8_COMPRESSED", "INT4", "W4A4_DYNAMIC", "W4A4",
+    "W4A8_DYNAMIC", "W4A8", "W4A8_COMPRESSED", "INT4",
 })
+_W4A4_INT_TAGS = frozenset({"W4A4_DYNAMIC", "W4A4"})
 _W4A16_TAGS = frozenset({
     "W4A16", "W4A16_DYNAMIC", "W4A16_AWQ", "W4A16_GPTQ", "W8A16_GPTQ", "W4A16_COMPRESSED",
 })
@@ -412,6 +413,24 @@ def _resolve_int_tag_to_abi(
             weight_scale_bytes=SCALE_BYTES_FP32,
             weight_metadata=meta,
             act_scale_dtype="fp32",
+        )
+    if tag in _W4A4_INT_TAGS:
+        nz_active = _w4a8_nz_eligible(is_moe=is_moe, use_nz=use_nz, k_dim=k_dim, n_dim=n_dim)
+        blk = group_size if group_size else (1, W4A8_DEFAULT_GROUP_SIZE)
+        return TensorPrecisionABI(
+            linear_method="w4a4_laos",
+            input_dtype="int4",
+            weight_dtype="int4",
+            output_dtype=nat,
+            compute_dtype="int4",
+            accum_dtype="int32",
+            weight_layout="FRACTAL_NZ" if nz_active else "ND",
+            weight_block=blk,
+            weight_scale_dtype="fp32",
+            weight_scale_bytes=SCALE_BYTES_FP32,
+            weight_metadata=(("packed_int4_per_byte", INT4_PACKED_PER_BYTE), ("dynamic_act", True)),
+            act_scale_dtype="fp32",
+            activation_quant_mode="dynamic_per_token",
         )
     if tag in _W4A8_TAGS:
         nz_active = _w4a8_nz_eligible(is_moe=is_moe, use_nz=use_nz, k_dim=k_dim, n_dim=n_dim)
@@ -979,7 +998,7 @@ def _resolve_role_tag(
 
 
 def _layer_role_descriptors(
-    plan: LayerPlan, *, model: ModelSpec,
+    plan: LayerPlan, *, model: ModelSpec, checkpoint_format: str = "",
 ) -> tuple[list[tuple[str, tuple[str, ...], bool]], list[tuple[str, tuple[str, ...]]]]:
     """Return structural ``(role_specs, candidate_pack_groups)`` for one target layer."""
     idx = int(plan.index)
@@ -1073,7 +1092,13 @@ def _layer_role_descriptors(
             ))
         roles.append((
             "mlp.gate",
-            (f"{mlp_p}.gate.weight", f"{bsm_p}.gate.weight", f"{moe_p}.gate.weight", f"{ffn_p}.gate.weight"),
+            (
+                f"{mlp_p}.gate.weight",
+                f"{bsm_p}.gate.weight",
+                f"{moe_p}.gate.weight",
+                f"{ffn_p}.gate.weight",
+                f"model.layers.{idx}.router.proj.weight",
+            ),
             False,
         ))
         roles.append((
@@ -1089,6 +1114,8 @@ def _layer_role_descriptors(
                 f"{ffn_p}.experts.0.w3.weight",
                 f"{moe_p}.gate_proj.weight",
                 f"{moe_p}.up_proj.weight",
+                f"model.layers.{idx}.experts.0.gate_proj.weight",
+                f"model.layers.{idx}.experts.0.up_proj.weight",
             ),
             True,
         ))
@@ -1101,18 +1128,53 @@ def _layer_role_descriptors(
                 f"{moe_p}.experts.w2_weight",
                 f"{ffn_p}.experts.0.w2.weight",
                 f"{moe_p}.down_proj.weight",
+                f"model.layers.{idx}.experts.0.down_proj.weight",
             ),
             True,
         ))
         if int(plan.num_shared_experts or 0) > 0 or int(model.num_shared_experts or 0) > 0:
             se_p = f"model.layers.{idx}.share_expert"
-            roles.append(("mlp.shared_expert.gate_proj", (f"{mlp_p}.shared_experts.gate_proj.weight", f"{mlp_p}.shared_expert.gate_proj.weight", f"{bsm_p}.shared_experts.gate_proj.weight", f"{se_p}.gate_proj.weight", f"{ffn_p}.shared_experts.w1.weight"), False))
-            roles.append(("mlp.shared_expert.up_proj", (f"{mlp_p}.shared_experts.up_proj.weight", f"{mlp_p}.shared_expert.up_proj.weight", f"{bsm_p}.shared_experts.up_proj.weight", f"{se_p}.up_proj.weight", f"{ffn_p}.shared_experts.w3.weight"), False))
-            roles.append(("mlp.shared_expert.down_proj", (f"{mlp_p}.shared_experts.down_proj.weight", f"{mlp_p}.shared_expert.down_proj.weight", f"{bsm_p}.shared_experts.down_proj.weight", f"{se_p}.down_proj.weight", f"{ffn_p}.shared_experts.w2.weight"), False))
+            parallel_mlp = checkpoint_format == "modelslim_description"
+            roles.append((
+                "mlp.shared_expert.gate_proj",
+                (
+                    f"{mlp_p}.shared_experts.gate_proj.weight",
+                    f"{mlp_p}.shared_expert.gate_proj.weight",
+                    f"{bsm_p}.shared_experts.gate_proj.weight",
+                    f"{se_p}.gate_proj.weight",
+                    f"{ffn_p}.shared_experts.w1.weight",
+                    *((f"{mlp_p}.gate_proj.weight",) if parallel_mlp else ()),
+                ),
+                False,
+            ))
+            roles.append((
+                "mlp.shared_expert.up_proj",
+                (
+                    f"{mlp_p}.shared_experts.up_proj.weight",
+                    f"{mlp_p}.shared_expert.up_proj.weight",
+                    f"{bsm_p}.shared_experts.up_proj.weight",
+                    f"{se_p}.up_proj.weight",
+                    f"{ffn_p}.shared_experts.w3.weight",
+                    *((f"{mlp_p}.up_proj.weight",) if parallel_mlp else ()),
+                ),
+                False,
+            ))
+            roles.append((
+                "mlp.shared_expert.down_proj",
+                (
+                    f"{mlp_p}.shared_experts.down_proj.weight",
+                    f"{mlp_p}.shared_expert.down_proj.weight",
+                    f"{bsm_p}.shared_experts.down_proj.weight",
+                    f"{se_p}.down_proj.weight",
+                    f"{ffn_p}.shared_experts.w2.weight",
+                    *((f"{mlp_p}.down_proj.weight",) if parallel_mlp else ()),
+                ),
+                False,
+            ))
             packs.append(("shared_expert.gate_up_proj", ("mlp.shared_expert.gate_proj", "mlp.shared_expert.up_proj")))
     else:
-        roles.append(("mlp.gate_proj", (f"{mlp_p}.gate_proj.weight",), False))
-        roles.append(("mlp.up_proj", (f"{mlp_p}.up_proj.weight",), False))
+        roles.append(("mlp.gate_proj", (f"{mlp_p}.gate_proj.weight", f"{mlp_p}.gate_up_proj.weight"), False))
+        roles.append(("mlp.up_proj", (f"{mlp_p}.up_proj.weight", f"{mlp_p}.gate_up_proj.weight"), False))
         roles.append(("mlp.down_proj", (f"{mlp_p}.down_proj.weight",), False))
         packs.append(("gate_up_proj", ("mlp.gate_proj", "mlp.up_proj")))
 
@@ -1294,7 +1356,8 @@ def _detect_kv_mode(
     elif use_explicit_kv:
         raw_source = opt_kv_raw
     else:
-        raw_source = checkpoint.cache_rule.kv_tag or effective_opts.get("kv_cache_dtype") or ""
+        ckpt_kv = checkpoint.cache_rule.kv_tag if checkpoint.cache_rule.scope == "target" else ""
+        raw_source = ckpt_kv or effective_opts.get("kv_cache_dtype") or ""
     raw_kv = str(raw_source or effective_opts.get("kv_cache_dtype") or "").strip().upper()
     aux_low = " ".join(checkpoint.auxiliary_buffers).lower()
     has_faquant = (
@@ -1319,7 +1382,14 @@ def _detect_kv_mode(
     if raw_kv in _MLA_FP8_KV_TAGS:
         if hw in A2_A3_INT_ONLY_FAMILIES:
             raise ModelingError(f"hw_isa_incompatible:{hw}:kv_cache={raw_kv}:A2/A3_requires_bf16_or_c8")
-        scale_dtype, _ = _normalize_scale_dtype(checkpoint.cache_rule.kv_scale_dtype, default_dtype="fp32")
+        if raw_kv in {"MXFP8", "MXFP8_DYNAMIC", "W8A8_MXFP8"}:
+            scale_dtype = "e8m0"
+        else:
+            raw_scale = str(checkpoint.cache_rule.kv_scale_dtype or "").strip().lower()
+            if raw_scale in {"e8m0", "fp8_e8m0"}:
+                scale_dtype = "fp32"
+            else:
+                scale_dtype, _ = _normalize_scale_dtype(checkpoint.cache_rule.kv_scale_dtype, default_dtype="fp32")
         return "fp8_e4m3", scale_dtype, has_faquant, disps
 
     if raw_kv in _INT8_KV_TAGS:
@@ -1327,7 +1397,11 @@ def _detect_kv_mode(
             raise ModelingError(
                 f"kv_cache_int8_unsupported_on_window_compressed_mla:{hw}:kv_cache={raw_kv}"
             )
-        scale_dtype, _ = _normalize_scale_dtype(checkpoint.cache_rule.kv_scale_dtype, default_dtype="fp32")
+        raw_scale = str(checkpoint.cache_rule.kv_scale_dtype or "").strip().lower()
+        if raw_scale in {"e8m0", "fp8_e8m0"}:
+            scale_dtype = "fp32"
+        else:
+            scale_dtype, _ = _normalize_scale_dtype(checkpoint.cache_rule.kv_scale_dtype, default_dtype="fp32")
         return "int8", scale_dtype, has_faquant, disps
 
     if raw_kv in _NATIVE_KV_TAGS:
@@ -1687,7 +1761,7 @@ def _schema_kv_tag(
     if kv_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel":
         return "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL"
     if kv_mode == "fp8_e4m3":
-        return "MXFP8" if (is_mla and kv_scale_dtype == "e8m0") else "FP8_E4M3"
+        return "MXFP8" if kv_scale_dtype == "e8m0" else "FP8_E4M3"
     if kv_mode == "int8":
         if is_mla:
             return "INT8_DYNAMIC"
@@ -1695,6 +1769,19 @@ def _schema_kv_tag(
     if kv_mode == "fp32" or kv_mode == native_float:
         return "FLOAT"
     return kv_mode.upper()
+
+
+def _resolve_layer_index_scale_dtype(
+    raw_tag: str | None, *, resolved_dtype: str, default_scale: str,
+) -> str:
+    up = str(raw_tag or "").strip().upper()
+    if "MXFP8" in up:
+        return "e8m0"
+    if resolved_dtype == "int8":
+        return "fp16" if default_scale in {"", "e8m0"} else default_scale
+    if resolved_dtype == "fp8_e4m3" and up and default_scale == "e8m0":
+        return "fp32"
+    return default_scale
 
 
 def _schema_index_tag(index_dtype: str, index_scale_dtype: str, *, native_float: str) -> str:
@@ -1831,8 +1918,16 @@ def _collect_delegated_cache_rules(
     explicit_idx = bool(effective_opts.get("indexer_kv_dtype_explicit", False))
     opt_idx_raw = str(effective_opts.get("indexer_kv_dtype") or "").strip().upper()
     use_explicit_idx = explicit_idx and bool(opt_idx_raw) and opt_idx_raw not in {"AUTO", "NONE"}
-    has_layer_kv = bool(checkpoint.cache_rule.layer_scoped_kv) and not use_explicit_kv
-    has_layer_idx = bool(checkpoint.cache_rule.layer_scoped_index) and not use_explicit_idx
+    has_layer_kv = (
+        checkpoint.cache_rule.scope == "target"
+        and bool(checkpoint.cache_rule.layer_scoped_kv)
+        and not use_explicit_kv
+    )
+    has_layer_idx = (
+        checkpoint.cache_rule.scope == "target"
+        and bool(checkpoint.cache_rule.layer_scoped_index)
+        and not use_explicit_idx
+    )
     c8_producer_recorded = False
     any_faquant = has_faquant
     any_mxfp_gqa = (kv_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel")
@@ -1890,14 +1985,21 @@ def _collect_delegated_cache_rules(
                     _schema_kv_tag(l_mode, l_scale, is_mla=(attn == "mla"), has_faquant=l_faq, native_float=native_float),
                 ))
         if p.indexer and (p.owns_index_k or p.index_k_owner_layer_id < 0 or p.index_k_owner_layer_id == n_id):
+            raw_l_idx = (
+                checkpoint.cache_rule.index_tag_for_layer(n_id) or effective_opts.get("indexer_kv_dtype")
+                if has_layer_idx else None
+            )
             l_idx = (
                 _resolve_index_dtype(
-                    checkpoint.cache_rule.index_tag_for_layer(n_id) or effective_opts.get("indexer_kv_dtype"),
+                    raw_l_idx,
                     hw=hw, native_float=native_float, fallback_kv_mode=l_mode,
                 )
                 if has_layer_idx else default_idx_dtype
             )
-            layer_idx_tags.append((n_id, _schema_index_tag(l_idx, index_scale_dtype, native_float=native_float)))
+            l_idx_scale = _resolve_layer_index_scale_dtype(
+                raw_l_idx, resolved_dtype=l_idx, default_scale=index_scale_dtype,
+            )
+            layer_idx_tags.append((n_id, _schema_index_tag(l_idx, l_idx_scale, native_float=native_float)))
 
     rule = CacheQuantRule(
         kv_tag=_schema_kv_tag(kv_mode, eff_kv_scale, is_mla=has_mla, has_faquant=has_faquant, native_float=native_float),
@@ -2234,24 +2336,60 @@ def _append_draft_cache_abis(
     d_cap_val = effective_draft_context_cap(draft_spec, cap_hint)
     d_cap = d_cap_val if d_cap_val > 0 else None
 
+    explicit_kv = bool(effective_opts.get("kv_cache_dtype_explicit", False))
+    opt_kv_raw = str(effective_opts.get("kv_cache_dtype") or "").strip().upper()
+    use_explicit_kv = explicit_kv and bool(opt_kv_raw) and opt_kv_raw not in {"AUTO", "NONE"}
+    explicit_idx = bool(effective_opts.get("indexer_kv_dtype_explicit", False))
+    opt_idx_raw = str(effective_opts.get("indexer_kv_dtype") or "").strip().upper()
+    use_explicit_idx = explicit_idx and bool(opt_idx_raw) and opt_idx_raw not in {"AUTO", "NONE"}
+    draft_scoped_kv = (
+        {
+            **(dict(checkpoint.cache_rule.layer_scoped_kv) if checkpoint.cache_rule.scope == "draft" else {}),
+            **dict(checkpoint.cache_rule.draft_layer_scoped_kv),
+        }
+        if not use_explicit_kv else {}
+    )
+    draft_scoped_idx = (
+        {
+            **(dict(checkpoint.cache_rule.layer_scoped_index) if checkpoint.cache_rule.scope == "draft" else {}),
+            **dict(checkpoint.cache_rule.draft_layer_scoped_index),
+        }
+        if not use_explicit_idx else {}
+    )
     d_tag_override = _resolve_draft_kv_tag(
         model, draft_kind=draft_kind, draft_spec=draft_spec, hw=hw,
         parallel=parallel, kv_mode=kv_mode, speculative_k=speculative_k,
         checkpoint=checkpoint, effective_opts=effective_opts,
     )
     d_has_mla = any(str(p.attention or model.attention).lower() == "mla" for p in d_plans)
+    d_has_unscoped_wc_mla = any(
+        _is_window_compressed_mla(p)
+        and (p.native_layer_id if p.native_layer_id >= 0 else p.index) not in draft_scoped_kv
+        and p.index not in draft_scoped_kv
+        for p in d_plans
+    )
     d_kv_mode, d_kv_scale, d_has_faq, _ = _detect_kv_mode(
         checkpoint, hw=hw, native_float=native_float, effective_opts=effective_opts,
-        is_mla=d_has_mla, kv_tag_override=d_tag_override,
+        is_mla=d_has_mla, is_window_compressed_mla=d_has_unscoped_wc_mla,
+        kv_tag_override=d_tag_override,
     )
     d_eff_scale = "" if d_kv_mode == "qk_mxfp8_dynamic_v_mxfp8_per_channel" else d_kv_scale
     d_layer_tags: list[tuple[int, str]] = []
     d_layer_meta: dict[int, tuple[str, str, bool]] = {}
     d_unaligned: set[int] = set()
+    d_idx_tags: list[tuple[int, str]] = []
     for p in d_plans:
         dn = p.native_layer_id if p.native_layer_id >= 0 else p.index
         d_is_mla = str(p.attention or model.attention).lower() == "mla"
         dm, ds, df = d_kv_mode, d_eff_scale, d_has_faq
+        scoped_tag = draft_scoped_kv.get(dn, draft_scoped_kv.get(p.index))
+        if scoped_tag is not None:
+            dm, raw_ds, df, _ = _detect_kv_mode(
+                checkpoint, hw=hw, native_float=native_float, effective_opts=effective_opts,
+                is_mla=d_is_mla, is_window_compressed_mla=_is_window_compressed_mla(p),
+                kv_tag_override=scoped_tag,
+            )
+            ds = "" if dm == "qk_mxfp8_dynamic_v_mxfp8_per_channel" else raw_ds
         if (not d_is_mla) and dm == "int8" and str(role).lower() == "pd_prefill":
             dm = native_float
             disps.append(("kv_cache_c8_producer", "downgraded", f"scope=draft:layer={dn}:kv_c8_producer_role_keeps_native_{native_float}"))
@@ -2265,12 +2403,27 @@ def _append_draft_cache_abis(
             d_layer_tags.append((dn, "FLOAT"))
         else:
             d_layer_tags.append((dn, _schema_kv_tag(dm, ds, is_mla=d_is_mla, has_faquant=df, native_float=native_float)))
+        if p.indexer and (p.owns_index_k or p.index_k_owner_layer_id < 0 or p.index_k_owner_layer_id == dn):
+            scoped_idx_tag = draft_scoped_idx.get(dn, draft_scoped_idx.get(p.index))
+            if scoped_idx_tag is not None:
+                d_idx_dt = _resolve_index_dtype(
+                    scoped_idx_tag, hw=hw, native_float=native_float, fallback_kv_mode=dm,
+                )
+                d_idx_scale = _resolve_layer_index_scale_dtype(
+                    scoped_idx_tag, resolved_dtype=d_idx_dt, default_scale=delegated_rule.index_scale_dtype,
+                )
+                d_idx_tags.append((
+                    dn, _schema_index_tag(d_idx_dt, d_idx_scale, native_float=native_float),
+                ))
     draft_rule = replace(
         delegated_rule,
+        scope="draft",
         kv_tag=_schema_kv_tag(d_kv_mode, d_eff_scale, is_mla=d_has_mla, has_faquant=d_has_faq, native_float=native_float),
         kv_scale_dtype=d_eff_scale,
         layer_scoped_kv=tuple(d_layer_tags),
-        layer_scoped_index=(),
+        layer_scoped_index=tuple(d_idx_tags),
+        draft_layer_scoped_kv=(),
+        draft_layer_scoped_index=(),
     )
     d_raw_kv, d_raw_idx, d_raw_rec = resolve_checkpoint_cache_abis(
         d_plans, replace(checkpoint, cache_rule=draft_rule), parallel, native_float,
@@ -2337,7 +2490,11 @@ def build_cache_state_abis(
     del model_type
     plans = model.layer_plans
     native_float = _normalize_native_float(checkpoint, model)
-    scoped_kv_layers = {int(lid) for lid, _ in checkpoint.cache_rule.layer_scoped_kv}
+    scoped_kv_layers = (
+        {int(lid) for lid, _ in checkpoint.cache_rule.layer_scoped_kv}
+        if checkpoint.cache_rule.scope == "target"
+        else set()
+    )
     has_mla = any(str(p.attention).lower() == "mla" for p in plans)
     has_unscoped_wc_mla = any(
         _is_window_compressed_mla(p)
@@ -2353,10 +2510,11 @@ def build_cache_state_abis(
     engram_offload = bool(effective_opts.get("engram_cpu_offload", False))
     explicit_idx = bool(effective_opts.get("indexer_kv_dtype_explicit", False))
     opt_idx_val = str(effective_opts.get("indexer_kv_dtype") or "").strip()
+    ckpt_idx = checkpoint.cache_rule.index_tag if checkpoint.cache_rule.scope == "target" else ""
     idx_source = (
         opt_idx_val
         if (explicit_idx and opt_idx_val and opt_idx_val.lower() not in {"auto", "none"})
-        else (checkpoint.cache_rule.index_tag or effective_opts.get("indexer_kv_dtype"))
+        else (ckpt_idx or effective_opts.get("indexer_kv_dtype"))
     )
     default_idx_dtype = _resolve_index_dtype(
         idx_source,
@@ -2594,7 +2752,9 @@ def _resolve_port_abis_and_packs(
     for plan in model.layer_plans:
         native_layer = plan.native_layer_id if plan.native_layer_id >= 0 else plan.index
         layer_ids = (plan.index, native_layer) if native_layer != plan.index else (plan.index,)
-        role_specs, candidate_packs = _layer_role_descriptors(plan, model=model)
+        role_specs, candidate_packs = _layer_role_descriptors(
+            plan, model=model, checkpoint_format=checkpoint.source_format,
+        )
         layer_abi_map: dict[str, TensorPrecisionABI] = {}
         for role_name, cands, is_expert in role_specs:
             tag, blk, did_proj, matched_rule = _resolve_role_tag(

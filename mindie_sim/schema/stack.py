@@ -1894,6 +1894,33 @@ def _mxfp8_page(heads: int, block: int, kd: int, vd: int) -> tuple[CachePlaneABI
     return tuple(packet)
 
 
+def _cache_scale_family(tag: str) -> str:
+    upper = tag.strip().upper()
+    if upper in _MX_CACHE or upper in _MX_GQA_PACKET_TAGS:
+        return "mx"
+    if upper in _FP8_CACHE:
+        return "fp8"
+    if upper in _STATIC_INT8_CACHE or upper == "INT8_DYNAMIC":
+        return "int8"
+    return "float"
+
+
+def _effective_cache_scale_dtype(
+    tag: str,
+    global_tag: str,
+    declared_scale: str,
+    default_scale: str,
+) -> str:
+    if tag in _MX_CACHE:
+        return "e8m0"
+    if declared_scale and (
+        not global_tag.strip()
+        or _cache_scale_family(tag) == _cache_scale_family(global_tag)
+    ):
+        return declared_scale
+    return default_scale
+
+
 def _resolve_gqa_kv_planes(plan: LayerPlan, tag: str, rule: CacheQuantRule, native_dtype: str,
                            heads: int, tp: int, block: int) -> tuple[CachePlaneABI, ...]:
     kd, vd = plan.head_dim, plan.v_head_dim or plan.head_dim
@@ -1908,7 +1935,7 @@ def _resolve_gqa_kv_planes(plan: LayerPlan, tag: str, rule: CacheQuantRule, nati
     planes = [_plane(f"{side}_payload", "payload", ("head", "token", "dim"),
                      (heads, block, width), dtype, "page") for side, width in sides]
     if tag in _STATIC_INT8_CACHE:
-        scale = rule.kv_scale_dtype or "fp32"
+        scale = _effective_cache_scale_dtype(tag, rule.kv_tag, rule.kv_scale_dtype, "fp32")
         offset = rule.kv_offset_dtype or "int8"
         aux_kinds: tuple[tuple[CachePlaneKind, str], ...] = (("scale", scale), ("offset", offset))
         for kind, dt in aux_kinds:
@@ -1919,13 +1946,16 @@ def _resolve_gqa_kv_planes(plan: LayerPlan, tag: str, rule: CacheQuantRule, nati
             q_heads = max(1, plan.num_heads // tp)
             planes.append(_plane("q_scale", "scale", ("head", "dim"), (q_heads, kd), scale, "layer"))
     elif tag in _FP8_CACHE:
-        planes.extend(_plane(f"{side}_scale", "scale", ("tensor",), (1,), rule.kv_scale_dtype or "fp32",
+        scale = _effective_cache_scale_dtype(tag, rule.kv_tag, rule.kv_scale_dtype, "fp32")
+        planes.extend(_plane(f"{side}_scale", "scale", ("tensor",), (1,), scale,
                              "checkpoint") for side, _ in sides)
     elif tag in _MX_CACHE or tag == "INT8_DYNAMIC":
+        scale = _effective_cache_scale_dtype(
+            tag, rule.kv_tag, rule.kv_scale_dtype, "e8m0" if tag in _MX_CACHE else "fp32",
+        )
         for side, width in sides:
             group = _MX_BLOCK_ELEMENTS if tag in _MX_CACHE else width
             groups = (width + group - 1) // group
-            scale = rule.kv_scale_dtype or ("e8m0" if tag in _MX_CACHE else "fp32")
             planes.append(_plane(f"{side}_scale", "scale", ("head", "group"), (heads, groups),
                                  scale, "token", group_axes=(1,), group_extents=(group,)))
     return tuple(planes)
@@ -1941,15 +1971,18 @@ def _resolve_mla_cache_planes(plan: LayerPlan, tag: str, rule: CacheQuantRule,
     dtype = _cache_dtype(tag, native_dtype)
     planes = [_plane("mla_latent", "payload", ("dim",), (latent,), dtype, "token")]
     if tag in _STATIC_INT8_CACHE:
+        scale = _effective_cache_scale_dtype(tag, rule.kv_tag, rule.kv_scale_dtype, "fp32")
         planes.append(_plane("mla_latent_scale", "scale", ("kv_head",), (1,),
-                             rule.kv_scale_dtype or "fp32", "checkpoint"))
+                             scale, "checkpoint"))
         if rule.kv_offset_dtype and rule.kv_offset_dtype != "none":
             planes.append(_plane("mla_latent_offset", "offset", ("kv_head",), (1,),
                                  rule.kv_offset_dtype, "checkpoint"))
     elif tag in _MX_CACHE or tag in _FP8_CACHE or tag == "INT8_DYNAMIC":
         group = _MX_BLOCK_ELEMENTS if tag in _MX_CACHE else _MLA_SCALE_GROUP_SIZE
         groups = (latent + group - 1) // group
-        scale = rule.kv_scale_dtype or ("e8m0" if tag in _MX_CACHE else "fp32")
+        scale = _effective_cache_scale_dtype(
+            tag, rule.kv_tag, rule.kv_scale_dtype, "e8m0" if tag in _MX_CACHE else "fp32",
+        )
         planes.append(_plane("mla_latent_scale", "scale", ("group",), (groups,), scale, "token",
                              group_axes=(0,), group_extents=(group,)))
     if rope:
@@ -1959,12 +1992,14 @@ def _resolve_mla_cache_planes(plan: LayerPlan, tag: str, rule: CacheQuantRule,
 
 
 def _resolve_index_cache_planes(tag: str, native_dtype: str, width: int,
-                                scale_dtype: str) -> tuple[CachePlaneABI, ...]:
+                                scale_dtype: str, global_tag: str = "") -> tuple[CachePlaneABI, ...]:
     dtype = _cache_dtype(tag, native_dtype)
     payload = _plane("index_k", "payload", ("dim",), (width,), dtype, "token")
     if tag in {"", "AUTO", "NONE", "FLOAT"} or tag in _FLOAT_CACHE_DTYPES:
         return (payload,)
-    scale = scale_dtype or ("e8m0" if tag in _MX_CACHE else "fp32")
+    scale = _effective_cache_scale_dtype(
+        tag, global_tag, scale_dtype, "e8m0" if tag in _MX_CACHE else "fp32",
+    )
     groups = (width + _MX_BLOCK_ELEMENTS - 1) // _MX_BLOCK_ELEMENTS if tag in _MX_CACHE else 1
     return payload, _plane("index_k_scale", "scale", ("group",), (groups,), scale, "token")
 
@@ -2186,7 +2221,11 @@ def resolve_checkpoint_cache_abis(
         owns_kv = owner_id(scope, plan.kv_owner_layer_id, native) == native
         windowed_mla = plan.attention == "mla" and plan.cache_kind == "window_compressed"
         if owns_kv or windowed_mla:
-            tag = fallback_kv if explicit_kv else (rule.kv_tag_for_layer(native).strip() or fallback_kv).upper()
+            tag = (
+                fallback_kv
+                if explicit_kv
+                else (rule.kv_tag_for_layer(native, scope=scope).strip() or fallback_kv).upper()
+            )
             components: list[CacheComponentRole]
             if plan.attention == "mla":
                 planes = _resolve_mla_cache_planes(plan, tag, rule, native_dtype)
@@ -2209,14 +2248,19 @@ def resolve_checkpoint_cache_abis(
                 ))
         if (plan.indexer or plan.owns_index_k) and owner_id(scope, plan.index_k_owner_layer_id, native) == native:
             pool = max(1, plan.index_kpool)
-            idx_tag = fallback_idx if explicit_idx else (rule.index_tag_for_layer(native).strip() or fallback_idx).upper()
+            idx_tag = (
+                fallback_idx
+                if explicit_idx
+                else (rule.index_tag_for_layer(native, scope=scope).strip() or fallback_idx).upper()
+            )
             idx_abis.append(CacheStateABI(
                 scope=scope, native_layer=native, phase=phase, deployment_role=role,
                 checkpoint_digest=digest, kv_block_size=block, kernel_block_size=block,
                 cp_interleave_size=interleave, placement=placement,
                 component_role="index_k", producer_key=f"{scope}.l{native}.index_k",
-                planes=_resolve_index_cache_planes(idx_tag, native_dtype,
-                                                   plan.index_dim, rule.index_scale_dtype),
+                planes=_resolve_index_cache_planes(
+                    idx_tag, native_dtype, plan.index_dim, rule.index_scale_dtype, rule.index_tag,
+                ),
                 compression_ratio=ratio, pooling_ratio=pool, tail_slots=2 * pool if pool > 1 else 0,
                 consumer_keys=tuple(consumers.get((scope, native, "index_k"), ())),
             ))

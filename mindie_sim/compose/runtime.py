@@ -135,6 +135,9 @@ def _checkpoint_map_from_dict(raw: Mapping[str, Any]) -> CheckpointQuantMap:
         layer_scoped_kv=tuple((int(k), str(v)) for k, v in (cr.get("layer_scoped_kv") or ())),
         layer_scoped_index=tuple((int(k), str(v)) for k, v in (cr.get("layer_scoped_index") or ())),
         provenance=cr.get("provenance", "native"),
+        scope=cr.get("scope", "target"),
+        draft_layer_scoped_kv=tuple((int(k), str(v)) for k, v in (cr.get("draft_layer_scoped_kv") or ())),
+        draft_layer_scoped_index=tuple((int(k), str(v)) for k, v in (cr.get("draft_layer_scoped_index") or ())),
     )
     hf_pairs = tuple((str(k), v) for k, v in (raw.get("hf_quant_config") or ()))
     return CheckpointQuantMap(

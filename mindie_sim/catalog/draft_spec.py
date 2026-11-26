@@ -253,10 +253,10 @@ class DraftSpec:
         if isinstance(self.max_position_embeddings, bool) or int(self.max_position_embeddings) < 0:
             raise ModelingError("catalog_draft_max_position_embeddings_invalid")
         if self.confidence_enabled:
-            expected = self.hidden_size + self.markov_rank
-            if self.confidence_input_width not in {0, expected}:
+            allowed = {0, self.hidden_size, self.hidden_size + self.markov_rank}
+            if self.confidence_input_width not in allowed:
                 raise ModelingError(
-                    f"catalog_dspark_confidence_width_invalid:{self.confidence_input_width}!={expected}"
+                    f"catalog_dspark_confidence_width_invalid:{self.confidence_input_width}not_in:{sorted(allowed)}"
                 )
 
     def to_dict(self) -> dict[str, Any]:

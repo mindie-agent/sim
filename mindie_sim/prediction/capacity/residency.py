@@ -23,7 +23,6 @@ from .contracts import MemoryPolicy
 
 
 _FFN_INTERMEDIATE_TENSORS = 3
-_VISION_SCORE_ELEMENT_BYTES = 4
 
 
 def _quant_has_expert_overrides(quant: QuantSpec | None) -> bool:
@@ -456,9 +455,8 @@ class _MemoryWorkspaceMixin:
                     continue
                 patches, *_ = media_geometry(runtime, model.vision, request.media_tokens)
                 vision = model.vision
-                # The default vision recipe materializes FP32 attention scores.
-                scores = 2 * patches * patches * vision.num_heads * _VISION_SCORE_ELEMENT_BYTES
+                # Fused on-chip vision attention keeps score tiles off HBM (media.py).
                 tensors = patches * (vision.qkv_width + 2 * vision.hidden_size
                                      + 2 * vision.intermediate_size) * dtype_bytes(model.activation_dtype)
-                result[0] = max(result[0], scores + tensors)
+                result[0] = max(result[0], tensors)
         return result

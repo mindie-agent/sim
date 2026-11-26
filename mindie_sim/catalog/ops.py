@@ -97,7 +97,7 @@ def compute_dtype_for(quant: QuantSpec, category: str) -> tuple[str, str]:
 
 
 _LOW_OUTPUT_ACTIVATIONS = frozenset({
-    "int8", "fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8", "fp4", "fp4_e2m1", "mxfp4",
+    "int8", "int4", "fp8", "fp8_e4m3", "fp8_e5m2", "mxfp8", "fp4", "fp4_e2m1", "mxfp4",
 })
 
 
@@ -237,7 +237,12 @@ def precision_abi_for_gemm(
     else:
         raw_method = resolved.linear_method(category)
         if fmt in {"int4", "w4a8"}:
-            raw_method = "w4a8" if act == "int8" else "w4a16"
+            if act == "int4":
+                raw_method = "w4a4_laos"
+            elif act == "int8":
+                raw_method = "w4a8"
+            else:
+                raw_method = "w4a16"
         elif fmt == "int8":
             raw_method = "w8a8" if act == "int8" else "w8a16"
         method = raw_method  # type: ignore[assignment]
@@ -271,7 +276,7 @@ def precision_abi_for_gemm(
             if act_scale_format is not None
             else (
                 resolved.execution_activation_scale_format(act)
-                if act == "int8"
+                if act in {"int8", "int4"}
                 else (resolved.activation_scale_format or resolved.scale_format)
             )
         )
@@ -289,7 +294,7 @@ def precision_abi_for_gemm(
         weight_dtype=fmt,
         output_dtype=out_dt,
         compute_dtype=compute,
-        accum_dtype="int32" if compute == "int8" else "fp32",
+        accum_dtype="int32" if compute in {"int8", "int4"} else "fp32",
         weight_layout=_layout_name(fmt, resolved),
         weight_block=weight_block,
         weight_scale_dtype=scale_dtype,
@@ -298,6 +303,7 @@ def precision_abi_for_gemm(
         act_group_size=max(0, eff_act_group),
         act_scale_dtype=eff_act_scale,
         act_scale_pack=eff_act_pack,
+        activation_quant_mode="dynamic_per_token" if (method == "w4a4_laos" and act == "int4") else "none",
     )
 
 
@@ -416,7 +422,7 @@ def gemm_op(
 
 def activation_scales(quant, dtype, rows, cols):
     """Activation scales follow the declared quantization, not weight bytes."""
-    if dtype == "int8":
+    if dtype in {"int8", "int4"}:
         group = quant.activation_group_size or cols
         groups = (cols + group - 1) // group
         scale_format = quant.execution_activation_scale_format(dtype)

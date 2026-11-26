@@ -10,7 +10,7 @@ from __future__ import annotations
 from dataclasses import replace
 import math
 from types import SimpleNamespace
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, NamedTuple, Sequence
 
 from mindie_sim.catalog.ops import (
     W4A16_DEQUANT_OPS_PER_WEIGHT,
@@ -888,11 +888,44 @@ def _row_pre_quantizer(op: OpSpec, by_id: Mapping[str, OpSpec],
     return producer
 
 
+class _PairedFfn(NamedTuple):
+    """Matched Megatron-style FFN block (fused ``gate_up`` or split ``(gate, up)``)."""
+
+    producers: tuple[OpSpec, ...]
+    branch_casts: tuple[OpSpec | None, ...]
+    act_op: OpSpec
+    pre_quant: OpSpec | None
+    down_op: OpSpec
+
+
+def _resolve_split_branch(
+    dep_id: str,
+    *,
+    cat: str,
+    by_id: Mapping[str, OpSpec],
+    users: Mapping[str, list[str]],
+) -> tuple[OpSpec, OpSpec | None] | None:
+    dep_op = by_id.get(dep_id)
+    if dep_op is None:
+        return None
+    bcast: OpSpec | None = None
+    prod: OpSpec | None = dep_op
+    if dep_op.family == "cast" and len(dep_op.deps) == 1 and len(users.get(dep_op.op_id) or ()) == 1:
+        bcast = dep_op
+        prod = by_id.get(dep_op.deps[0])
+    if prod is None or len(users.get(prod.op_id) or ()) != 1:
+        return None
+    p_meta = dict(prod.metadata)
+    if p_meta.get("ffn_role") != "gate_up" or str(p_meta.get("ffn_category", "")) != cat:
+        return None
+    return prod, bcast
+
+
 def _match_paired_ffn(
     op: OpSpec, role: str, by_id: Mapping[str, OpSpec],
     users: Mapping[str, list[str]],
-) -> tuple[OpSpec, OpSpec | None, OpSpec] | None:
-    """Match ``gate_up -> activation [-> quant] -> down`` for single-block Megatron Local-TP."""
+) -> _PairedFfn | None:
+    """Match ``(gate_up | gate+up) -> activation [-> quant] -> down`` for Megatron Local-TP."""
     if role not in {ROLE_DENSE_MLP_UP, ROLE_SHARED_EXPERT_UP}:
         return None
     meta = dict(op.metadata)
@@ -902,8 +935,37 @@ def _match_paired_ffn(
     act_users = users.get(op.op_id) or []
     if len(act_users) != 1:
         return None
-    act_op = by_id.get(act_users[0])
+    first_user = by_id.get(act_users[0])
+    if first_user is None:
+        return None
+    first_cast: OpSpec | None = None
+    if first_user.family == "cast":
+        cast_users = users.get(first_user.op_id) or []
+        if len(cast_users) != 1:
+            return None
+        first_cast = first_user
+        act_op = by_id.get(cast_users[0])
+    else:
+        act_op = first_user
     if act_op is None or dict(act_op.metadata).get("ffn_role") != "activation":
+        return None
+    if len(act_op.deps) == 1:
+        producers: tuple[OpSpec, ...] = (op,)
+        branch_casts: tuple[OpSpec | None, ...] = (first_cast,)
+    elif len(act_op.deps) == 2:
+        b0 = _resolve_split_branch(act_op.deps[0], cat=cat, by_id=by_id, users=users)
+        b1 = _resolve_split_branch(act_op.deps[1], cat=cat, by_id=by_id, users=users)
+        if b0 is None or b1 is None:
+            return None
+        p0, c0 = b0
+        p1, c1 = b1
+        if p0.op_id == p1.op_id or p0.deps != p1.deps or p0.stage != p1.stage:
+            return None
+        if op.op_id != p0.op_id:
+            return None
+        producers = (p0, p1)
+        branch_casts = (c0, c1)
+    else:
         return None
     next_users = users.get(act_op.op_id) or []
     if len(next_users) != 1:
@@ -925,17 +987,23 @@ def _match_paired_ffn(
             return None
     if str(dict(down.metadata).get("ffn_category", "")) != cat:
         return None
-    return act_op, pre_quant, down
+    return _PairedFfn(
+        producers=producers,
+        branch_casts=branch_casts,
+        act_op=act_op,
+        pre_quant=pre_quant,
+        down_op=down,
+    )
 
 
 def _scale_activation_op(
     act_op: OpSpec, *, rows: int, local_w: int, old_rows: int, old_w: int,
-    dep_id: str, width: int,
+    dep_ids: tuple[str, ...], width: int,
 ) -> OpSpec:
     ratio = (float(rows) * float(local_w)) / float(max(1, old_rows * old_w))
     meta = {**dict(act_op.metadata), "local_tp_applied": True, "local_tp_width": int(width)}
     return replace(
-        act_op, deps=(dep_id,),
+        act_op, deps=dep_ids,
         local_shape=(int(rows), int(local_w)),
         padded_shape=(align_up(int(rows), ALIGN_ELEMENT), align_up(int(local_w), ALIGN_ELEMENT)),
         launch_shape=(int(rows), int(local_w)),
@@ -949,12 +1017,16 @@ def _scale_activation_op(
 
 
 def _rewrite_paired_ffn(
-    gate_up: OpSpec, act_op: OpSpec, pre_quant: OpSpec | None, down: OpSpec,
+    paired: _PairedFfn,
     *, role: str, down_role: str, factor: int, stride: int,
     group: Sequence[int], total_tok: int, pad_tok: int,
     quant: Any, op_scope: str,
 ) -> tuple[OpSpec, ...]:
-    """Emit one Megatron-style FFN block: AllGather -> gate_up -> act -> [quant] -> down -> RS."""
+    """Emit one Megatron-style FFN block: AllGather -> (gate_up | gate+up) -> act -> [quant] -> down -> RS."""
+    gate_up = paired.producers[0]
+    act_op = paired.act_op
+    pre_quant = paired.pre_quant
+    down = paired.down_op
     g_meta = dict(gate_up.metadata)
     d_meta = dict(down.metadata)
     m, _, hidden = (int(gate_up.local_shape[0]), int(gate_up.local_shape[1]),
@@ -970,20 +1042,36 @@ def _rewrite_paired_ffn(
         shape=(gathered_tok, hidden), role=role, group=group, width=factor,
         deps=gate_up.deps, scope=op_scope, dtype=act_dt, stride=stride,
     )
-    g_meta["local_tp_partition"] = ROLE_COLUMN
-    gate_gemm = _rewrite_matrix(
-        gate_up, gemm_id=f"{gate_up.op_id}:local_tp:gemm",
-        rows=gathered_tok, cols=2 * local_w, reduced=hidden,
-        role=role, width=factor, dep_ids=(gather.op_id,),
-        weight_ratio=float(local_w) / float(max(1, inter_w)),
-        quant=quant, extra_metadata=g_meta,
-    )
+    emitted: list[OpSpec] = [gather]
+    is_split = len(paired.producers) > 1
+    act_dep_ids: list[str] = []
+    for prod, bcast in zip(paired.producers, paired.branch_casts):
+        p_meta = dict(prod.metadata)
+        p_meta["local_tp_partition"] = ROLE_COLUMN
+        p_gemm = _rewrite_matrix(
+            prod, gemm_id=f"{prod.op_id}:local_tp:gemm",
+            rows=gathered_tok, cols=local_w if is_split else 2 * local_w, reduced=hidden,
+            role=role, width=factor, dep_ids=(gather.op_id,),
+            weight_ratio=float(local_w) / float(max(1, inter_w)),
+            quant=quant, extra_metadata=p_meta,
+        )
+        emitted.append(p_gemm)
+        if bcast is not None:
+            bc_old_rows = max(1, int(dict(bcast.metadata).get("local_tp_template_rows") or m))
+            scaled_bc = _scale_activation_op(
+                bcast, rows=gathered_tok, local_w=local_w, old_rows=bc_old_rows, old_w=inter_w,
+                dep_ids=(p_gemm.op_id,), width=factor,
+            )
+            emitted.append(scaled_bc)
+            act_dep_ids.append(scaled_bc.op_id)
+        else:
+            act_dep_ids.append(p_gemm.op_id)
     act_old_rows = max(1, int(dict(act_op.metadata).get("local_tp_template_rows") or m))
     scaled_act = _scale_activation_op(
         act_op, rows=gathered_tok, local_w=local_w, old_rows=act_old_rows, old_w=inter_w,
-        dep_id=gate_gemm.op_id, width=factor,
+        dep_ids=tuple(act_dep_ids), width=factor,
     )
-    emitted: list[OpSpec] = [gather, gate_gemm, scaled_act]
+    emitted.append(scaled_act)
     down_dep = scaled_act.op_id
     scale_ratio: float | None = None
     if pre_quant is not None:
@@ -1154,7 +1242,7 @@ def lower_local_projection_tp(
     for consumer in ops:
         for dependency in consumer.deps:
             users.setdefault(dependency, []).append(consumer.op_id)
-    paired_blocks: dict[str, tuple[OpSpec, OpSpec | None, OpSpec]] = {}
+    paired_blocks: dict[str, _PairedFfn] = {}
     paired_members: set[str] = set()
     retire: set[str] = set()
     dep_aliases: dict[str, str] = {}
@@ -1174,10 +1262,14 @@ def lower_local_projection_tp(
         matched = _match_paired_ffn(candidate, candidate_role, by_id, users)
         if matched is not None:
             paired_blocks[candidate.op_id] = matched
-            act_op, pre_q, down_op = matched
-            paired_members.update((act_op.op_id, down_op.op_id))
-            if pre_q is not None:
-                paired_members.add(pre_q.op_id)
+            for extra_prod in matched.producers[1:]:
+                paired_members.add(extra_prod.op_id)
+            for bcast in matched.branch_casts:
+                if bcast is not None:
+                    paired_members.add(bcast.op_id)
+            paired_members.update((matched.act_op.op_id, matched.down_op.op_id))
+            if matched.pre_quant is not None:
+                paired_members.add(matched.pre_quant.op_id)
             continue
         if (candidate.op_id not in paired_members
                 and _partition_kind(candidate_role, candidate_meta) == ROLE_ROW):
@@ -1221,15 +1313,17 @@ def lower_local_projection_tp(
         if total_tok <= 0:
             rewritten.append(_empty_passthrough(op, metadata, factor))
             if op.op_id in paired_blocks:
-                act_op, pre_q, down_op = paired_blocks[op.op_id]
-                rewritten.append(_empty_passthrough(down_op, dict(down_op.metadata), factor))
+                matched = paired_blocks[op.op_id]
+                for extra_prod in matched.producers[1:]:
+                    rewritten.append(_empty_passthrough(extra_prod, dict(extra_prod.metadata), factor))
+                rewritten.append(_empty_passthrough(matched.down_op, dict(matched.down_op.metadata), factor))
             continue
         if op.op_id in paired_blocks:
-            act_op, pre_q, down_op = paired_blocks[op.op_id]
+            matched = paired_blocks[op.op_id]
             down_role = (ROLE_DENSE_MLP_DOWN if role == ROLE_DENSE_MLP_UP
                          else ROLE_SHARED_EXPERT_DOWN)
             rewritten.extend(_rewrite_paired_ffn(
-                op, act_op, pre_q, down_op, role=role, down_role=down_role,
+                matched, role=role, down_role=down_role,
                 factor=factor, stride=stride, group=group,
                 total_tok=total_tok, pad_tok=pad_tok, quant=quant,
                 op_scope=op_scope,
@@ -1245,29 +1339,52 @@ def lower_local_projection_tp(
 
 
 def _synth_idle_block(
-    tmpl: OpSpec, paired: tuple[OpSpec, OpSpec | None, OpSpec] | None,
+    tmpl: OpSpec, paired: _PairedFfn | None,
     dep_ids: tuple[str, ...],
 ) -> list[OpSpec]:
     """Build zero-row template ops for an idle peer, keeping paired FFN structure intact."""
-    z_local = (0, int(tmpl.local_shape[1]), int(tmpl.local_shape[2]))
-    z_pad = (0, int(tmpl.padded_shape[1]), int(tmpl.padded_shape[2]))
-    z_launch = (0, int(tmpl.launch_shape[1]), int(tmpl.launch_shape[2]))
-    gate = replace(tmpl, requests=(), deps=dep_ids, local_shape=z_local, padded_shape=z_pad,
-                   launch_shape=z_launch, flops=0.0, matrix_flops=(), vector_ops=0.0,
-                   hbm_bytes=0.0, mte2_bytes=0.0, mte3_bytes=0.0)
     if paired is None:
-        return [gate]
-    act_tmpl, pq_tmpl, down_tmpl = paired
+        z_local = (0, int(tmpl.local_shape[1]), int(tmpl.local_shape[2]))
+        z_pad = (0, int(tmpl.padded_shape[1]), int(tmpl.padded_shape[2]))
+        z_launch = (0, int(tmpl.launch_shape[1]), int(tmpl.launch_shape[2]))
+        return [replace(tmpl, requests=(), deps=dep_ids, local_shape=z_local, padded_shape=z_pad,
+                        launch_shape=z_launch, flops=0.0, matrix_flops=(), vector_ops=0.0,
+                        hbm_bytes=0.0, mte2_bytes=0.0, mte3_bytes=0.0)]
+    chain: list[OpSpec] = []
+    act_dep_ids: list[str] = []
+    for prod, bcast in zip(paired.producers, paired.branch_casts):
+        z_local = (0, int(prod.local_shape[1]), int(prod.local_shape[2]))
+        z_pad = (0, int(prod.padded_shape[1]), int(prod.padded_shape[2]))
+        z_launch = (0, int(prod.launch_shape[1]), int(prod.launch_shape[2]))
+        z_prod = replace(prod, requests=(), deps=dep_ids, local_shape=z_local, padded_shape=z_pad,
+                         launch_shape=z_launch, flops=0.0, matrix_flops=(), vector_ops=0.0,
+                         hbm_bytes=0.0, mte2_bytes=0.0, mte3_bytes=0.0)
+        chain.append(z_prod)
+        if bcast is not None:
+            bc_rows = max(1, int(bcast.local_shape[0]))
+            bc_meta = tuple(sorted({
+                **dict(bcast.metadata), "local_tp_template_rows": bc_rows,
+            }.items(), key=lambda pair: pair[0]))
+            bc_shape = (0, *tuple(int(d) for d in bcast.local_shape[1:]))
+            z_bc = replace(bcast, requests=(), deps=(z_prod.op_id,),
+                           local_shape=bc_shape, padded_shape=bc_shape,
+                           launch_shape=bc_shape, semantic_shape=bc_shape,
+                           metadata=bc_meta)
+            chain.append(z_bc)
+            act_dep_ids.append(z_bc.op_id)
+        else:
+            act_dep_ids.append(z_prod.op_id)
+    act_tmpl, pq_tmpl, down_tmpl = paired.act_op, paired.pre_quant, paired.down_op
     act_rows = max(1, int(act_tmpl.local_shape[0]))
     act_meta = tuple(sorted({
         **dict(act_tmpl.metadata), "local_tp_template_rows": act_rows,
     }.items(), key=lambda pair: pair[0]))
     act_shape = (0, *tuple(int(d) for d in act_tmpl.local_shape[1:]))
-    synth_act = replace(act_tmpl, requests=(), deps=(gate.op_id,),
+    synth_act = replace(act_tmpl, requests=(), deps=tuple(act_dep_ids),
                         local_shape=act_shape, padded_shape=act_shape,
                         launch_shape=act_shape, semantic_shape=act_shape,
                         metadata=act_meta)
-    chain: list[OpSpec] = [gate, synth_act]
+    chain.append(synth_act)
     down_dep = synth_act.op_id
     if pq_tmpl is not None:
         pq_rows = max(1, int(pq_tmpl.local_shape[0]))
@@ -1328,7 +1445,12 @@ def lower_local_projection_tp_cohort(
             if key not in template_by_occ:
                 paired = _match_paired_ffn(op, role, r_by_id, r_users)
                 if paired is not None:
-                    paired_down_keys.add((int(op.stage), paired[2].op_id))
+                    for extra_prod in paired.producers[1:]:
+                        paired_down_keys.add((int(op.stage), extra_prod.op_id))
+                    for bcast in paired.branch_casts:
+                        if bcast is not None:
+                            paired_down_keys.add((int(op.stage), bcast.op_id))
+                    paired_down_keys.add((int(op.stage), paired.down_op.op_id))
                 ordered_occ.append(key)
                 template_by_occ[key] = (
                     op, frozenset() if homogeneous else
@@ -1348,13 +1470,15 @@ def lower_local_projection_tp_cohort(
         tmpl, after_ids, factor, stride, paired = template_by_occ[(stage, op_id)]
         for r in sorted(augmented):
             if op_id in op_maps[r]:
-                prev_synth[(r, stage)] = paired[2].op_id if paired is not None else op_id
+                prev_synth[(r, stage)] = paired.down_op.op_id if paired is not None else op_id
                 continue
             group = _groups_for(machine, runtime, r, stage, factor, stride=stride)
             for rk in topo.ranks(r, stage):
                 peer_rows.setdefault((stage, op_id), {}).setdefault(int(rk), 0)
                 if paired is not None:
-                    peer_rows.setdefault((stage, paired[2].op_id), {}).setdefault(int(rk), 0)
+                    for extra_prod in paired.producers[1:]:
+                        peer_rows.setdefault((stage, extra_prod.op_id), {}).setdefault(int(rk), 0)
+                    peer_rows.setdefault((stage, paired.down_op.op_id), {}).setdefault(int(rk), 0)
             if sum(peer_rows[(stage, op_id)].get(int(rk), 0) for rk in group) <= 0:
                 continue
             existing_ids = {item.op_id for item in augmented[r]}

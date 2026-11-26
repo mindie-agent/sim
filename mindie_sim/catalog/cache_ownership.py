@@ -606,7 +606,7 @@ def _paired_sfa_batch_footprint(
         (max(1, int(getattr(v, "q_len", 1) or 1)) for v in requests),
         default=1,
     )
-    groups = page_groups(case, layer_stages, query_tokens)
+    groups = page_groups(case, layer_stages, query_tokens, phase=phase)
     covered_layers, covered_members = _paired_group_covered_members(groups)
     shared_once = [0.0] * stages
     private = [0.0] * stages

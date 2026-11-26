@@ -1101,3 +1101,204 @@ def test_pd_transfer_recoverssm_draft_cap_w4a8_scales_and_spec_forwarding() -> N
     )
     assert clip_q == 2 and clip_sc.stack_options.speculative is not None
     assert clip_emit == pytest.approx(1.0 + sum(clip_sc.stack_options.speculative.acceptance_marginals()[:clip_q - 1]))
+
+
+def test_int4_dynamic_activation_and_scoped_mxfp8_cache_abis() -> None:
+    """W4A4_DYNAMIC resolves int4 inputs; draft cache scope and per-layer MXFP8 e8m0 stay exact."""
+    from dataclasses import replace
+    from mindie_sim.catalog.checkpoint_reader import read_modelslim_description_mapping
+    from mindie_sim.catalog.draft_spec import DraftSpec
+    from mindie_sim.catalog.types import AuxiliarySpec
+    from mindie_sim.schema.model import LayerPlan, ModelSpec
+    from mindie_sim.stacks.vllm_ascend.quant_policy import resolve_raw_tag_to_abi
+
+    for tag in ("W4A4_DYNAMIC", "W4A4"):
+        abi = resolve_raw_tag_to_abi(tag, hw_family="a3", native_float_dtype="bf16")
+        assert abi.input_dtype == "int4"
+        assert abi.weight_dtype == "int4"
+        assert abi.compute_dtype == "int4"
+        assert abi.linear_method == "w4a4_laos"
+        assert abi.activation_quant_mode == "dynamic_per_token"
+
+    adapter = VllmAscendStackAdapter()
+    par1 = ParallelSpec(tp=1)
+    d_lp = LayerPlan(
+        index=0, native_layer_id=0, scope="draft", attention="gqa", ffn="dense",
+        num_heads=4, num_kv_heads=2, head_dim=64, intermediate_size=512, kv_owner_layer_id=0,
+    )
+    d_spec = DraftSpec(
+        kind="eagle3", layers=1, hidden_size=256, intermediate_size=512,
+        num_heads=4, num_kv_heads=2, head_dim=64, q_width=256, kv_width=128,
+        target_layer_ids=(0,), layer_plans=(d_lp,), vocab_size=1024, independent_context=True,
+    )
+    t_lp0 = LayerPlan(
+        index=0, native_layer_id=0, scope="target", attention="gqa", ffn="dense",
+        num_heads=4, num_kv_heads=2, head_dim=64, intermediate_size=512, kv_owner_layer_id=0,
+    )
+    t_lp1 = LayerPlan(
+        index=1, native_layer_id=1, scope="target", attention="gqa", ffn="dense",
+        num_heads=4, num_kv_heads=2, head_dim=64, intermediate_size=512, kv_owner_layer_id=1,
+    )
+    model = ModelSpec(
+        "synth-scoped-cache", 2, 256, 4, 64, 512, 1024,
+        num_kv_heads=2, layer_plans=(t_lp0, t_lp1), auxiliary=AuxiliarySpec(mtp=d_spec),
+    )
+    base_weights = {
+        f"model.layers.{lid}.{sub}.weight": "W8A8_DYNAMIC"
+        for lid in (0, 1)
+        for sub in (
+            "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+            "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj",
+        )
+    }
+    qmap_draft = read_modelslim_description_mapping(
+        {
+            "kv_cache_type": "C8",
+            "model.layers.0.self_attn.quant_type": "C8",
+            "model.layers.1.self_attn.quant_type": "C8",
+            "mtp.layers.0.self_attn.quant_type": "FLOAT",
+            **base_weights,
+        },
+        base_config={"torch_dtype": "bfloat16"},
+    )
+    hw_gen3 = _hw(GEN3_SKU)
+    opts_gen3 = adapter.resolve_options(
+        model, hw_gen3, par1, role="colocated", track="shipping",
+        requested_options={"num_speculative_tokens": 1},
+        field_origins={"num_speculative_tokens": "cli_flag"},
+    )
+    plan_gen3 = adapter.resolve_quant_instantiation(
+        model, qmap_draft, hw_gen3, par1, opts_gen3, role="colocated", phase="decode",
+    )
+    target_kv = [a for a in plan_gen3.kv_cache_abi if a.scope == "target"]
+    draft_kv = [a for a in plan_gen3.kv_cache_abi if a.scope == "draft"]
+    assert len(target_kv) == 2 and all(a.planes[0].dtype == "int8" for a in target_kv)
+    assert len(draft_kv) == 1 and draft_kv[0].planes[0].dtype == "bf16"
+
+    # Per-layer MXFP8_DYNAMIC under global C8 keeps e8m0 scale planes on target layer 1.
+    qmap_mx = read_modelslim_description_mapping(
+        {
+            "kv_cache_type": "C8",
+            "model.layers.0.self_attn.quant_type": "C8",
+            "model.layers.1.self_attn.quant_type": "MXFP8_DYNAMIC",
+            **base_weights,
+        },
+        base_config={"torch_dtype": "bfloat16"},
+    )
+    hw_gen5 = _hw(GEN5_DT_SKU)
+    opts_gen5 = adapter.resolve_options(
+        model, hw_gen5, par1, role="colocated", track="shipping",
+        requested_options={}, field_origins={},
+    )
+    plan_gen5 = adapter.resolve_quant_instantiation(
+        model, qmap_mx, hw_gen5, par1, opts_gen5, role="colocated", phase="decode",
+    )
+    kv_by_layer = {a.native_layer: a for a in plan_gen5.kv_cache_abi if a.scope == "target"}
+    assert kv_by_layer[0].planes[0].dtype == "int8"
+    assert kv_by_layer[1].planes[0].dtype == "fp8_e4m3"
+    assert [p.dtype for p in kv_by_layer[1].planes if p.plane_kind == "scale"] == ["e8m0", "e8m0"]
+
+    # Reverse: per-layer plain FP8_DYNAMIC under global MXFP8/e8m0 uses scalar fp32 scales,
+    # and per-layer MXFP8_DYNAMIC index under global INT8/fp16 uses 8 E8M0 scales at dim=256.
+    from mindie_sim.schema.checkpoint import CacheQuantRule, CheckpointProvenance, CheckpointQuantMap, TensorQuantRule
+
+    qmap_rev = CheckpointQuantMap(
+        provenance=CheckpointProvenance("synthetic/rev-mx-fp8", "modelslim_description"),
+        native_float_dtype="bf16",
+        cache_rule=CacheQuantRule(
+            kv_tag="MXFP8_DYNAMIC", kv_scale_dtype="e8m0",
+            layer_scoped_kv=((0, "MXFP8_DYNAMIC"), (1, "FP8_DYNAMIC")),
+            provenance="checkpoint",
+        ),
+    )
+    plan_rev = adapter.resolve_quant_instantiation(
+        model, qmap_rev, hw_gen5, par1, opts_gen5, role="colocated", phase="decode",
+    )
+    rev_kv = {a.native_layer: a for a in plan_rev.kv_cache_abi if a.scope == "target"}
+    assert [p.dtype for p in rev_kv[1].planes if p.plane_kind == "scale"] == ["fp32", "fp32"]
+
+    lp_idx = LayerPlan(
+        index=0, native_layer_id=0, scope="target", attention="mla", ffn="dense",
+        num_heads=4, num_kv_heads=1, head_dim=128, kv_lora_rank=512,
+        qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128,
+        kv_cache_elements=576, kv_owner_layer_id=0, indexer=True,
+        owns_index_k=True, index_k_owner_layer_id=0, index_heads=4, index_dim=256,
+    )
+    m_idx = ModelSpec("synth-idx", 1, 256, 4, 128, 512, 1024, num_kv_heads=1, layer_plans=(lp_idx,))
+    qmap_idx = CheckpointQuantMap(
+        provenance=CheckpointProvenance("synthetic/idx-mx", "modelslim_description"),
+        native_float_dtype="bf16",
+        cache_rule=CacheQuantRule(
+            kv_tag="FLOAT", index_tag="INT8", index_scale_dtype="fp16",
+            layer_scoped_index=((0, "MXFP8_DYNAMIC"),), provenance="checkpoint",
+        ),
+    )
+    plan_idx = adapter.resolve_quant_instantiation(
+        m_idx, qmap_idx, hw_gen5, par1, opts_gen5, role="colocated", phase="decode",
+    )
+    idx_scales = [p for p in plan_idx.index_cache_abi[0].planes if p.plane_kind == "scale"]
+    assert len(idx_scales) == 1 and idx_scales[0].dtype == "e8m0" and idx_scales[0].bytes_per_unit == 8
+
+    # Draft-scoped CacheQuantRule applies to draft only and enforces window-compressed MLA guard on GEN3.
+    qmap_dscope = CheckpointQuantMap(
+        provenance=CheckpointProvenance("synthetic/draft-scope", "modelslim_description"),
+        native_float_dtype="bf16",
+        cache_rule=CacheQuantRule(
+            scope="draft", kv_tag="FLOAT", layer_scoped_kv=((0, "C8"),), provenance="checkpoint",
+        ),
+    )
+    plan_ds = adapter.resolve_quant_instantiation(
+        model, qmap_dscope, hw_gen3, par1, opts_gen3, role="colocated", phase="decode",
+    )
+    assert all(a.planes[0].dtype == "bf16" for a in plan_ds.kv_cache_abi if a.scope == "target")
+    assert next(a for a in plan_ds.kv_cache_abi if a.scope == "draft").planes[0].dtype == "int8"
+
+    d_wc_lp = LayerPlan(
+        index=0, native_layer_id=0, scope="draft", attention="mla", ffn="dense",
+        num_heads=4, num_kv_heads=1, head_dim=128, kv_lora_rank=512,
+        qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128,
+        kv_cache_elements=576, kv_owner_layer_id=0, window=128, compress_ratio=4,
+    )
+    m_dwc = replace(model, auxiliary=AuxiliarySpec(mtp=replace(d_spec, layer_plans=(d_wc_lp,))))
+    with pytest.raises(ModelingError, match="kv_cache_int8_unsupported_on_window_compressed_mla"):
+        adapter.resolve_quant_instantiation(
+            m_dwc, qmap_dscope, hw_gen3, par1, opts_gen3, role="colocated", phase="decode",
+        )
+
+    # Gemma-4 26B parallel-MLP/direct-experts curated checkpoint & packed dense gate_up_proj resolve non-FLOAT.
+    from mindie_sim.catalog.checkpoint_reader import lookup_curated_checkpoint
+
+    g26_qmap = lookup_curated_checkpoint("Eco-Tech/gemma-4-26B-A4B-it-w4a4-mxfp4")
+    g26_lp = LayerPlan(
+        index=0, native_layer_id=0, scope="target", attention="gqa", ffn="moe",
+        num_heads=4, num_kv_heads=2, head_dim=64, intermediate_size=512,
+        moe_intermediate_size=128, num_experts=128, top_k=8, num_shared_experts=1,
+    )
+    m_g26 = ModelSpec(
+        "gemma4-26b-synth", 1, 256, 4, 64, 512, 1024, num_kv_heads=2,
+        num_experts=128, top_k=8, num_shared_experts=1, moe_intermediate_size=128,
+        layer_plans=(g26_lp,), metadata=(("model_type", "gemma4"),),
+    )
+    g26_plan = adapter.resolve_quant_instantiation(
+        m_g26, g26_qmap, hw_gen5, par1, opts_gen5, role="colocated", phase="decode",
+    )
+    g26_ports = dict(g26_plan.port_abis)
+    assert g26_ports[("target", 0, "mlp.experts.w13")].weight_dtype == "fp4_e2m1"
+    assert g26_ports[("target", 0, "mlp.experts.w13")].linear_method == "mx_fp4"
+    assert g26_ports[("target", 0, "mlp.experts.w2")].weight_dtype == "fp4_e2m1"
+    assert g26_ports[("target", 0, "mlp.shared_expert.down_proj")].weight_dtype == "fp8_e4m3"
+
+    qmap_packed = read_modelslim_description_mapping(
+        {"model.layers.0.mlp.gate_up_proj.weight": "W8A8_DYNAMIC", "model.layers.0.mlp.down_proj.weight": "FLOAT"},
+        base_config={"torch_dtype": "bfloat16"},
+    )
+    plan_packed = adapter.resolve_quant_instantiation(
+        ModelSpec("synth-packed", 1, 256, 4, 64, 512, 1024, num_kv_heads=2, layer_plans=(t_lp0,)),
+        qmap_packed, hw_gen3, par1,
+        adapter.resolve_options(model, hw_gen3, par1, role="colocated", track="shipping", requested_options={}, field_origins={}),
+        role="colocated", phase="decode",
+    )
+    packed_ports = dict(plan_packed.port_abis)
+    assert packed_ports[("target", 0, "mlp.gate_proj")].weight_dtype == "int8"
+    assert packed_ports[("target", 0, "mlp.up_proj")].weight_dtype == "int8"
+    assert packed_ports[("target", 0, "mlp.down_proj")].weight_dtype == "bf16"

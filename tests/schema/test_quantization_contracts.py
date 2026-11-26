@@ -933,3 +933,473 @@ def test_checkpoint_cache_scope_tie_break_inline_quant_and_draft_isolation() -> 
         },
     }))
     assert "lm_head" not in q_lm_hf.exclusions and q_lm_hf.for_category("lm_head").weight_format == "int8"
+
+
+def test_dense_mlp_projection_exclusions_and_expert_dtype_aliases() -> None:
+    """Excluding mlp.down_proj exempts only down_proj while preserving flat dense_mlp compat and expert_dtype aliases."""
+    from mindie_sim.catalog.checkpoint_reader import (
+        lookup_curated_checkpoint,
+        quant_spec_from_checkpoint_map,
+        read_checkpoint_quant_map,
+    )
+    from mindie_sim.catalog.hf_config import resolve_quant, resolve_role_exclusions
+    from mindie_sim.catalog.weight_layer_terms import _layer_resolved_quant
+    from mindie_sim.prediction.feedforward import dense
+    from mindie_sim.schema.model import LayerPlan, ModelSpec
+
+    roles_down, unres_down = resolve_role_exclusions((r"re:.*mlp\.down_proj.*",))
+    assert roles_down == ("dense_mlp.down",) and unres_down == ()
+    roles_gu, unres_gu = resolve_role_exclusions((r"re:.*mlp\.(gate|up)_proj.*",))
+    assert roles_gu == ("dense_mlp.gate", "dense_mlp.up") and unres_gu == ()
+    roles_all, unres_all = resolve_role_exclusions((r"re:.*mlp\.(gate|up|down)_proj.*",))
+    assert roles_all == ("dense_mlp",) and unres_all == ()
+
+    int4_cfg = {
+        "torch_dtype": "bfloat16",
+        "quantization_config": {
+            "quant_method": "compressed-tensors",
+            "format": "pack-quantized",
+            "ignore": ["lm_head", r"re:.*mlp\.down_proj.*"],
+            "config_groups": {
+                "g0": {
+                    "targets": ["Linear"],
+                    "format": "pack-quantized",
+                    "weights": {
+                        "num_bits": 4, "type": "int", "strategy": "group",
+                        "group_size": 128, "symmetric": True, "dynamic": False,
+                    },
+                    "input_activations": None,
+                },
+            },
+        },
+    }
+    q_int4, gaps = resolve_quant(int4_cfg)
+    assert gaps == []
+    assert q_int4.format_for("dense_mlp.gate") == "int4"
+    assert q_int4.format_for("dense_mlp.up") == "int4"
+    assert q_int4.format_for("dense_mlp.down") == "bf16"
+    assert q_int4.format_for("dense_mlp") == "int4"
+
+    q_hf_reader = quant_spec_from_checkpoint_map(read_checkpoint_quant_map(int4_cfg))
+    assert q_hf_reader.format_for("dense_mlp.gate") == "int4"
+    assert q_hf_reader.format_for("dense_mlp.up") == "int4"
+    assert q_hf_reader.format_for("dense_mlp.down") == "bf16"
+
+    plan0 = LayerPlan(
+        index=0, native_layer_id=0, attention="gqa", ffn="dense",
+        num_heads=4, num_kv_heads=2, head_dim=64, intermediate_size=512,
+    )
+    model_int4 = ModelSpec(
+        "synth-dense-split", 1, 256, 4, 64, 512, 1024,
+        num_kv_heads=2, layer_plans=(plan0,), quant=q_int4,
+    )
+    par1 = ParallelSpec(tp=1)
+    terms = {term.name: term for term in layer_weight_terms(plan0, model_int4)}
+    assert int(term_payload_bytes(terms["dense_gate"], q_int4, par1)) == 512 * 256 // 2
+    assert int(term_payload_bytes(terms["dense_up"], q_int4, par1)) == 512 * 256 // 2
+    assert int(term_payload_bytes(terms["dense_down"], q_int4, par1)) == 256 * 512 * 2
+
+    ops, _ = dense(
+        prefix="s0.l0", plan=plan0, deps="in", stage=0, requests=("r0",),
+        tokens=8, model=model_int4, parallel=par1, mode="prefill",
+    )
+    by_id = {op.op_id: op for op in ops}
+    assert dict(by_id["s0.l0.gate_up"].metadata)["weight_format"] == "int4"
+    assert dict(by_id["s0.l0.down"].metadata)["weight_format"] == "bf16"
+
+    # Asymmetric gate vs up precision splits gate and up GEMMs with exact FLOP conservation.
+    q_gate_only = QuantSpec("w4", weight_format="int4", activation_format="bf16", exclusions=("dense_mlp.gate",))
+    m_gate_only = ModelSpec(
+        "synth-gate-split", 1, 256, 4, 64, 512, 1024,
+        num_kv_heads=2, layer_plans=(plan0,), quant=q_gate_only,
+    )
+    split_ops, _ = dense(
+        prefix="s0.l0", plan=plan0, deps="in", stage=0, requests=("r0",),
+        tokens=8, model=m_gate_only, parallel=par1, mode="prefill",
+    )
+    split_by_id = {op.op_id: op for op in split_ops}
+    assert dict(split_by_id["s0.l0.gate"].metadata)["weight_format"] == "bf16"
+    assert dict(split_by_id["s0.l0.up"].metadata)["weight_format"] == "int4"
+    assert dict(split_by_id["s0.l0.down"].metadata)["weight_format"] == "int4"
+    assert split_by_id["s0.l0.gate"].flops + split_by_id["s0.l0.up"].flops == by_id["s0.l0.gate_up"].flops
+
+    # Flat dense_mlp exclusion/override remains backward-compatible across all three sub-projections.
+    q_flat = QuantSpec("w4", weight_format="int4", activation_format="bf16", exclusions=("dense_mlp",))
+    assert (
+        q_flat.format_for("dense_mlp.gate")
+        == q_flat.format_for("dense_mlp.up")
+        == q_flat.format_for("dense_mlp.down")
+        == "bf16"
+    )
+
+    # ModelSlim per-layer down_proj exception isolates down_proj while whole-MLP exceptions coalesce.
+    q_mix_layer = quant_spec_from_checkpoint_map(read_checkpoint_quant_map({
+        "model.layers.0.mlp.gate_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.0.mlp.up_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.0.mlp.down_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.1.mlp.gate_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.1.mlp.up_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.1.mlp.down_proj.weight": "FLOAT",
+    }, base_config={"torch_dtype": "bfloat16"}))
+    plan1 = replace(plan0, index=1, native_layer_id=1)
+    m_mix = ModelSpec(
+        "synth-mix", 2, 256, 4, 64, 512, 1024,
+        num_kv_heads=2, layer_plans=(plan0, plan1), quant=q_mix_layer,
+    )
+    q_l1 = _layer_resolved_quant(m_mix, plan1)
+    assert q_l1.format_for("dense_mlp.gate") == "int8"
+    assert q_l1.format_for("dense_mlp.up") == "int8"
+    assert q_l1.format_for("dense_mlp.down") == "bf16"
+
+    g4_spec = quant_spec_from_checkpoint_map(lookup_curated_checkpoint("Eco-Tech/gemma-4-31B-it-w4a4-mxfp4"))
+    plan9 = replace(plan0, index=9, native_layer_id=9)
+    m_g4 = ModelSpec(
+        "synth-g4", 10, 256, 4, 64, 512, 1024,
+        num_kv_heads=2, layer_plans=(plan9,), quant=g4_spec,
+    )
+    assert g4_spec.format_for("dense_mlp") == "mxfp4"
+    assert _layer_resolved_quant(m_g4, plan9).format_for("dense_mlp") == "bf16"
+
+    # HF FP8 expert_dtype aliases normalize cleanly without rejecting canonical dtype spellings.
+    for raw_exp, expected in (
+        ("bfloat16", "bf16"), ("float16", "fp16"), ("fp32", "fp32"), ("fp8_e5m2", "fp8_e5m2"),
+    ):
+        qm_exp = read_checkpoint_quant_map({
+            "torch_dtype": "bfloat16",
+            "quantization_config": {"quant_method": "fp8", "fmt": "e4m3", "expert_dtype": raw_exp},
+        })
+        assert quant_spec_from_checkpoint_map(qm_exp).format_for("routed_expert") == expected
+
+    # Regex ignore matches runtime tensor lookup and preserves anchored layer coordinates.
+    qm_re_down = read_checkpoint_quant_map(int4_cfg)
+    assert qm_re_down.resolve_exception_or_ignored("model.layers.0.mlp.down_proj.weight", source_native_layer_id=0) == "FLOAT"
+    assert qm_re_down.resolve_exception_or_ignored("model.layers.0.mlp.gate_proj.weight", source_native_layer_id=0) is None
+    anchored_cfg = {
+        "torch_dtype": "bfloat16",
+        "quantization_config": {
+            **int4_cfg["quantization_config"],
+            "ignore": ["lm_head", r"re:^model\.layers\.0\.mlp\.down_proj$"],
+        },
+    }
+    qm_anc = read_checkpoint_quant_map(anchored_cfg)
+    assert qm_anc.resolve_exception_or_ignored("model.layers.0.mlp.down_proj.weight", source_native_layer_id=0) == "FLOAT"
+    assert qm_anc.resolve_exception_or_ignored("model.layers.1.mlp.down_proj.weight", source_native_layer_id=1) is None
+    q_anc = quant_spec_from_checkpoint_map(qm_anc)
+    m_anc = ModelSpec("synth-anc", 2, 256, 4, 64, 512, 1024, num_kv_heads=2, layer_plans=(plan0, plan1), quant=q_anc)
+    assert _layer_resolved_quant(m_anc, plan0).format_for("dense_mlp.down") == "bf16"
+    assert _layer_resolved_quant(m_anc, plan1).format_for("dense_mlp.down") == "int4"
+
+    # Three equal child exclusions do not collapse to an INT4 parent; asymmetric output dtypes emit an explicit cast.
+    q_three = QuantSpec(
+        "w4", weight_format="int4", activation_format="bf16",
+        exclusions=("dense_mlp.gate", "dense_mlp.up", "dense_mlp.down"),
+    )
+    m_three = ModelSpec("synth-three", 1, 64, 2, 32, 64, 512, num_kv_heads=1, layer_plans=(
+        LayerPlan(index=0, native_layer_id=0, attention="gqa", ffn="dense", num_heads=2, num_kv_heads=1, head_dim=32, intermediate_size=64),
+    ), quant=q_three)
+    three_ops, _ = dense(
+        prefix="s0.l0", plan=m_three.layer_plans[0], deps="in", stage=0, requests=("r0",),
+        tokens=1, model=m_three, parallel=par1, mode="decode",
+    )
+    assert all(dict(op.metadata).get("weight_format") == "bf16" for op in three_ops if op.family in {"gate_up_projection", "down_projection"})
+
+    q_fp32_gate = QuantSpec(
+        "bf16", weight_format="bf16", activation_format="bf16",
+        category_overrides=(("dense_mlp.gate", (("output_format", "fp32"),)),),
+    )
+    m_cast = replace(m_three, quant=q_fp32_gate)
+    cast_ops, _ = dense(
+        prefix="s0.l0", plan=m_cast.layer_plans[0], deps="in", stage=0, requests=("r0",),
+        tokens=1, model=m_cast, parallel=par1, mode="decode",
+    )
+    cast_by_id = {op.op_id: op for op in cast_ops}
+    assert "s0.l0.gate.cast" in cast_by_id
+    assert cast_by_id["s0.l0.gate.cast"].mte2_bytes == 64 * 4
+    assert cast_by_id["s0.l0.gate.cast"].mte3_bytes == 64 * 2
+    assert cast_by_id["s0.l0.swiglu"].mte2_bytes == 2 * 64 * 2
+
+    # Expert ignore wins over expert_dtype default; W4A4_DYNAMIC ops emit w4a4_laos + int32 accum + act scales.
+    qm_exp_ign = read_checkpoint_quant_map({
+        "torch_dtype": "bfloat16",
+        "quantization_config": {
+            "quant_method": "fp8", "fmt": "e4m3", "expert_dtype": "fp8_e5m2",
+            "ignore": ["model.layers.*.mlp.experts"],
+        },
+    })
+    assert quant_spec_from_checkpoint_map(qm_exp_ign).format_for("routed_expert") == "bf16"
+
+    from types import SimpleNamespace
+    from mindie_sim.catalog.draft_spec import DraftSpec
+    from mindie_sim.catalog.draft_weights import draft_terms
+    from mindie_sim.catalog.ops import gemm_op
+    from mindie_sim.export.memory_ledger import _weight_group_label
+    from mindie_sim.prediction.sharding.local_tp import lower_local_projection_tp
+
+    q_w4a4 = QuantSpec("w4a4_dynamic", weight_format="int4", activation_format="int4", scale_format="fp32")
+    w4_op = gemm_op(
+        op_id="t.w4", deps=(), stage=0, layer=0, requests=("r0",), m=4, n=64, k=64,
+        quant=q_w4a4, category="dense_mlp.down", phase="decode",
+    )
+    assert w4_op.precision_abi is not None and w4_op.precision_abi.linear_method == "w4a4_laos"
+    assert w4_op.precision_abi.accum_dtype == "int32"
+    assert w4_op.precision_abi.activation_quant_mode == "dynamic_per_token"
+    assert dict(w4_op.metadata)["activation_scale_bytes"] > 0.0
+
+    # Draft dense FFN terms and memory ledger honor per-projection dense_mlp.{gate,up,down}.
+    d_spec = DraftSpec(
+        kind="mtp", layers=1, hidden_size=64, intermediate_size=64,
+        num_heads=2, num_kv_heads=1, head_dim=32, q_width=64, kv_width=32,
+    )
+    m_d = replace(m_three, quant=QuantSpec("w4", weight_format="int4", activation_format="bf16", exclusions=("dense_mlp.down",)))
+    d_terms = {t.name: t for t in draft_terms(d_spec, m_d)}
+    assert int(term_payload_bytes(d_terms["draft_down"], m_d.quant, par1)) == 64 * 64 * 2
+    assert int(term_payload_bytes(d_terms["draft_gate"], m_d.quant, par1)) == 64 * 64 // 2
+    assert _weight_group_label("dense_mlp.down") == "Dense FFN"
+
+    # Local-TP rewrites an asymmetric split (gate, up) dense FFN once without duplicating down.
+    lp_moe = LayerPlan(
+        index=1, native_layer_id=1, attention="gqa", ffn="moe", num_heads=4, num_kv_heads=2,
+        head_dim=64, intermediate_size=512, moe_intermediate_size=128, num_experts=4, top_k=2,
+    )
+    m_ltp = ModelSpec(
+        "synth-ltp-split", 2, 256, 4, 64, 512, 1024,
+        num_kv_heads=2, num_experts=4, top_k=2, moe_intermediate_size=128,
+        layer_plans=(plan0, lp_moe), quant=q_gate_only,
+    )
+    par_ltp = ParallelSpec(tp=1, dp=2, mlp_tp=2)
+    rt_ltp = SimpleNamespace(parallel=par_ltp, metadata=())
+    mach_ltp = hardware(2)
+    rew = lower_local_projection_tp(
+        split_ops, model=m_ltp, runtime=rt_ltp, machine=mach_ltp, replica=0, cohort_views={}, scope="target",
+    )
+    rew_ids = [op.op_id for op in rew]
+    assert len(rew_ids) == len(set(rew_ids))
+    assert sum(1 for op in rew if op.family == "allgather") == 1
+    assert sum(1 for op in rew if op.family == "reduce_scatter") == 1
+    assert sum(1 for op in rew if op.family == "down_projection") == 1
+    assert [op.local_shape[1] for op in rew if op.family == "gate_up_projection"] == [256, 256]
+
+
+def test_cache_rule_scope_mxfp8_scale_and_catalog_composition_followups(tmp_path: Path) -> None:
+    """Draft cache scope, per-layer MXFP8 e8m0 scales, phase forwarding, fused vision workspace, draft validation, and standalone quantize_config."""
+    from types import SimpleNamespace
+    from mindie_sim.catalog import paired_sfa as psfa
+    from mindie_sim.catalog.cache_ownership import _paired_sfa_batch_footprint
+    from mindie_sim.catalog.checkpoint_reader import read_checkpoint_quant_map
+    from mindie_sim.catalog.draft_spec import DraftSpec
+    from mindie_sim.catalog.media import media_geometry
+    from mindie_sim.catalog.types import VisionSpec
+    from mindie_sim.compose.runtime import resolve_case_contracts
+    from mindie_sim.prediction.capacity.residency import _MemoryWorkspaceMixin
+    from mindie_sim.schema.checkpoint import CacheQuantRule, CheckpointProvenance, CheckpointQuantMap
+    from mindie_sim.schema.model import LayerPlan, ModelSpec
+    from mindie_sim.schema.stack import resolve_checkpoint_cache_abis
+
+    # 1. CacheQuantRule scope keeps target/draft layer overrides isolated regardless of key order.
+    par1 = ParallelSpec(tp=1)
+    lp_target = LayerPlan(
+        index=0, native_layer_id=0, scope="target", attention="gqa", ffn="dense",
+        num_heads=2, num_kv_heads=1, head_dim=64, kv_owner_layer_id=0,
+    )
+    lp_draft = replace(lp_target, scope="draft")
+    items = [
+        ("kv_cache_type", "C8"),
+        ("model.layers.0.self_attn.quant_type", "C8"),
+        ("mtp.layers.0.self_attn.quant_type", "FLOAT"),
+    ]
+    for ordered in (items, items[::-1]):
+        qmap_sc = read_checkpoint_quant_map(dict(ordered))
+        abis, _, _ = resolve_checkpoint_cache_abis(
+            (lp_target, lp_draft), qmap_sc, par1, "bf16",
+            role="colocated", phase="decode", kv_block_size=16,
+        )
+        assert abis[0].scope == "target" and abis[0].planes[0].dtype == "int8"
+        assert abis[1].scope == "draft" and abis[1].planes[0].dtype == "bf16"
+
+    # Target-only FLOAT override never bleeds onto draft scope.
+    qmap_target_only = read_checkpoint_quant_map({
+        "kv_cache_type": "C8", "model.layers.0.self_attn.quant_type": "FLOAT",
+    })
+    abis_to, _, _ = resolve_checkpoint_cache_abis(
+        (lp_target, lp_draft), qmap_target_only, par1, "bf16",
+        role="colocated", phase="decode", kv_block_size=16,
+    )
+    assert abis_to[0].planes[0].dtype == "bf16" and abis_to[1].planes[0].dtype == "int8"
+
+    # 2. Per-layer MXFP8_DYNAMIC uses e8m0 scales instead of inheriting global fp32/fp16.
+    lp_g0 = replace(lp_target, index=0, native_layer_id=0, kv_owner_layer_id=0)
+    lp_g1 = replace(lp_target, index=1, native_layer_id=1, kv_owner_layer_id=1)
+    qmap_mx = CheckpointQuantMap(
+        provenance=CheckpointProvenance("synthetic/mixed-mxfp8-kv", "modelslim_description"),
+        native_float_dtype="bf16",
+        cache_rule=CacheQuantRule(
+            kv_tag="C8", kv_scale_dtype="fp32", index_tag="INT8", index_scale_dtype="fp16",
+            layer_scoped_kv=((1, "MXFP8_DYNAMIC"),), layer_scoped_index=((1, "MXFP8_DYNAMIC"),),
+            provenance="checkpoint",
+        ),
+    )
+    mx_kv, _, _ = resolve_checkpoint_cache_abis(
+        (lp_g0, lp_g1), qmap_mx, par1, "bf16", role="colocated", phase="decode", kv_block_size=16,
+    )
+    assert [p.dtype for p in mx_kv[1].planes if p.plane_kind == "scale"] == ["e8m0", "e8m0"]
+    lp_mla1 = LayerPlan(
+        index=1, native_layer_id=1, attention="mla", ffn="dense",
+        num_heads=4, num_kv_heads=1, head_dim=128, kv_lora_rank=512,
+        qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128,
+        kv_cache_elements=576, kv_owner_layer_id=1, indexer=True,
+        owns_index_k=True, index_k_owner_layer_id=1, index_heads=4, index_dim=128,
+    )
+    mla_kv, mla_idx, _ = resolve_checkpoint_cache_abis(
+        (lp_mla1,), qmap_mx, par1, "bf16", role="colocated", phase="decode", kv_block_size=16,
+    )
+    assert [p.dtype for p in mla_kv[0].planes if p.plane_kind == "scale"] == ["e8m0"]
+    assert [p.dtype for p in mla_idx[0].planes if p.plane_kind == "scale"] == ["e8m0"]
+
+    # 3. _paired_sfa_batch_footprint forwards explicit phase to page_groups.
+    seen_phases: list[str | None] = []
+    orig_page_groups = psfa.page_groups
+
+    def _spy_page_groups(case, ls, qt, *, phase=None):
+        seen_phases.append(phase)
+        return orig_page_groups(case, ls, qt, phase=phase)
+
+    psfa.page_groups = _spy_page_groups
+    try:
+        c_psfa = parse_case(compose_case(
+            "kimi-k3", REPRESENTATIVE_SKUS["a5"], tp=4, ep=4, layers=4,
+            prompt_tokens=32, output_tokens=8,
+        ))
+        _paired_sfa_batch_footprint(
+            c_psfa,
+            requests=(SimpleNamespace(request_id="r0", kv_len=32, q_len=32, prefix_tokens=0, generation=0),),
+            phase="prefill", padded=True, layer_stages={i: 0 for i in range(4)},
+            stages=1, shared_mode=False,
+        )
+        assert seen_phases == ["prefill"]
+    finally:
+        psfa.page_groups = orig_page_groups
+
+    # 4. Vision workspace omits stale materialized FP32 score bytes (matches fused media.py).
+    vis = VisionSpec(
+        kind="qwen_vl", layers=2, hidden_size=256, intermediate_size=512,
+        num_heads=8, qkv_width=768, patch_size=14, merge_area=4, out_hidden_size=256,
+    )
+    m_vis = ModelSpec(
+        "synth-vis-ws", 1, 256, 4, 64, 512, 1024,
+        num_kv_heads=2, layer_plans=(lp_g0,), vision=vis,
+    )
+    vis_case = SimpleNamespace(
+        model=m_vis,
+        runtime=SimpleNamespace(
+            parallel=ParallelSpec(tp=1, pp=1), max_num_batched_tokens=64,
+            max_num_input_tokens=0, max_num_seqs=1, metadata=(), mtp_acceptance_length=1.0,
+        ),
+        workload=SimpleNamespace(
+            requests=(SimpleNamespace(prompt_tokens=16, output_tokens=1, media_tokens=64, media_encoded=False),),
+        ),
+    )
+
+    class _WorkspaceProbe(_MemoryWorkspaceMixin):
+        def __init__(self, target_case):
+            self.case = target_case
+            self.draft_kind = ""
+            self.layer_stage = (0,)
+            self.async_workspace_buffer_multiplier = 1.0
+
+    patches, *_ = media_geometry(vis_case.runtime, vis, 64)
+    expected_tensors = patches * (vis.qkv_width + 2 * vis.hidden_size + 2 * vis.intermediate_size) * 2
+    assert _WorkspaceProbe(vis_case)._workspace(16)[0] == expected_tensors
+
+    # 5. DraftSpec.validate() admits hidden_size and DSpark lowering uses confidence_input_width.
+    d_conf = DraftSpec(
+        kind="dspark", layers=1, hidden_size=256, intermediate_size=512,
+        num_heads=4, num_kv_heads=2, head_dim=64, q_width=256, kv_width=128,
+        block_size=4, markov_rank=64, confidence_enabled=True, confidence_executes=True,
+        confidence_input_width=256, vocab_size=1024,
+    )
+    d_conf.validate()
+    from mindie_sim.prediction.frontend.speculation import _append_dspark_decode_head
+
+    conf_ops: list = []
+    stub_fe = SimpleNamespace(logits=lambda *a, **kw: ([], "logits"))
+    stub_rt = SimpleNamespace(parallel=par1, metadata=(), dspark=None)
+    m_dconf = replace(m_vis, quant=QuantSpec("bf16"))
+    _append_dspark_decode_head(
+        conf_ops, stub_fe, m_dconf, d_conf, m_dconf, m_dconf, stub_rt, stub_rt,
+        (SimpleNamespace(q_len=1),), "prev", prefix="d.", stage=0, requests=("r0",),
+        body_input_rows=1, k_steps=1, spec_method="dspark", hc_collapsed=False,
+    )
+    conf_op = next(op for op in conf_ops if op.family == "confidence")
+    assert conf_op.local_shape == (256,) and conf_op.vector_ops == 512.0
+    with pytest.raises(ModelingError, match="catalog_dspark_confidence_width_invalid"):
+        DraftSpec(
+            kind="dspark", layers=1, hidden_size=256, intermediate_size=512,
+            num_heads=4, num_kv_heads=2, head_dim=64, q_width=256, kv_width=128,
+            block_size=4, markov_rank=64, confidence_enabled=True, confidence_input_width=128,
+        ).validate()
+
+    # 6. Local composition & public reader both read standalone quantize_config.json;
+    #    draft cache metadata survives compose_case -> resolve_case_contracts rehydration;
+    #    explicit SDK QuantSpec exclusions emit runtime down_proj FLOAT exceptions.
+    (tmp_path / "config.json").write_text(json.dumps({
+        "model_type": "llama", "num_hidden_layers": 1, "hidden_size": 256,
+        "num_attention_heads": 4, "num_key_value_heads": 2, "intermediate_size": 512,
+        "vocab_size": 1024, "torch_dtype": "bfloat16",
+    }), encoding="utf-8")
+    (tmp_path / "quantize_config.json").write_text(
+        json.dumps({"w_bit": 4, "q_group_size": 32, "zero_point": True}), encoding="utf-8",
+    )
+    qmap_dir = read_checkpoint_quant_map(tmp_path)
+    assert qmap_dir.rules[0].weight_dtype == "int4" and qmap_dir.rules[0].group_size == (1, 32)
+    for model_ref in (tmp_path, tmp_path / "config.json"):
+        composed = parse_case(compose_case(
+            model_ref, hardware=REPRESENTATIVE_SKUS["a3"], tp=1, prompt_tokens=16, output_tokens=4,
+        ))
+        assert composed.model.quant.weight_format == "int4"
+        assert composed.model.quant.weight_block == (1, 32)
+        _, q_plan, _ = resolve_case_contracts(composed)
+        ports = dict(q_plan.port_abis)
+        assert ports[("target", 0, "mlp.down_proj")].weight_dtype == "int4"
+        assert ports[("target", 0, "mlp.down_proj")].weight_block == (1, 32)
+
+    ms_dir = tmp_path / "ms_draft_cache"
+    ms_dir.mkdir()
+    (ms_dir / "config.json").write_text((tmp_path / "config.json").read_text(encoding="utf-8"), encoding="utf-8")
+    (ms_dir / "quant_model_description.json").write_text(json.dumps({
+        "model_quant_type": "W8A8_DYNAMIC",
+        "kv_cache_type": "C8",
+        "model.layers.0.mlp.gate_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.0.mlp.up_proj.weight": "W8A8_DYNAMIC",
+        "model.layers.0.mlp.down_proj.weight": "W8A8_DYNAMIC",
+        "mtp.layers.0.self_attn.quant_type": "FLOAT",
+        "mtp.layers.0.self_attn.fa_q.scale": "FAQuant",
+    }), encoding="utf-8")
+    qmap_ms = read_checkpoint_quant_map(ms_dir)
+    assert "fa_q.scale" not in qmap_ms.auxiliary_buffers
+    rehyd_case = parse_case(compose_case(
+        ms_dir, hardware=REPRESENTATIVE_SKUS["a3"], tp=1, prompt_tokens=16, output_tokens=4,
+    ))
+    _, rehyd_plan, _ = resolve_case_contracts(rehyd_case)
+    assert rehyd_plan.kv_cache_abi[0].planes[0].dtype == "int8"
+
+    sdk_down_ex = QuantSpec(
+        name="w8a8_dynamic", weight_format="int8", expert_weight_format="int8",
+        activation_format="int8", exclusions=("dense_mlp.down",),
+    )
+    sdk_case = parse_case(compose_case(
+        "qwen3-32b", hardware=REPRESENTATIVE_SKUS["a3"], tp=1, layers=1,
+        quant=sdk_down_ex, prompt_tokens=16, output_tokens=4,
+    ))
+    _, sdk_plan, _ = resolve_case_contracts(sdk_case)
+    sdk_ports = dict(sdk_plan.port_abis)
+    assert sdk_ports[("target", 0, "mlp.gate_proj")].weight_dtype == "int8"
+    assert sdk_ports[("target", 0, "mlp.down_proj")].weight_dtype == "bf16"
+
+    # Draft-scoped CacheQuantRule never leaks kv_dtype into target QuantSpec.
+    qmap_d_only = CheckpointQuantMap(
+        provenance=CheckpointProvenance("synthetic/draft-only-cache", "modelslim_description"),
+        native_float_dtype="bf16",
+        cache_rule=CacheQuantRule(scope="draft", kv_tag="FLOAT", layer_scoped_kv=((0, "C8"),), provenance="checkpoint"),
+    )
+    from mindie_sim.catalog.checkpoint_reader import quant_spec_from_checkpoint_map
+    assert quant_spec_from_checkpoint_map(qmap_d_only).layer_quant_overrides == ()
