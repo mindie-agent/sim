@@ -341,6 +341,31 @@ def _infer_stream_lane(stream_id: str, kernel_name: str, task_type: str) -> str:
     return "main"
 
 
+def _parse_stream_id(raw: Any) -> str:
+    """Normalize a capture stream identifier without dropping numeric zero."""
+    if raw is None or isinstance(raw, bool):
+        return ""
+    return str(raw).strip()
+
+
+def _resolve_offline_stream_lane(
+    raw_sid: str,
+    raw_lane: str,
+    kernel_name: str,
+    task_type: str,
+    explicit_lanes_by_sid: Mapping[str, set[str]],
+) -> str:
+    """Resolve an offline node's stream lane without fabricating conflicting lanes per stream ID."""
+    if raw_lane:
+        return raw_lane
+    if not raw_sid:
+        return ""
+    declared = explicit_lanes_by_sid.get(raw_sid)
+    if declared:
+        return next(iter(declared)) if len(declared) == 1 else ""
+    return _infer_stream_lane(raw_sid, kernel_name, task_type)
+
+
 def _normalize_task_type(raw: str) -> str:
     upper = str(raw or "").strip().upper()
     if upper in {"AI_CORE", "AIC", "AICORE"}:
@@ -972,8 +997,12 @@ def _stage_attrs_strict_ok(
     *,
     is_offline_summary: bool,
 ) -> bool:
-    if pred.stream_lane and node.stream_lane != pred.stream_lane:
-        return False
+    if pred.stream_lane:
+        if is_offline_summary:
+            if node.stream_lane and node.stream_lane != pred.stream_lane:
+                return False
+        elif node.stream_lane != pred.stream_lane:
+            return False
     if pred.vllm_scope and not is_offline_summary and node.vllm_scope != pred.vllm_scope:
         return False
     if exp_shape:
@@ -1001,7 +1030,10 @@ def _candidate_preference_key(
     shape_miss = 0 if (
         target_shape and has_obs_shape and _shapes_match(target_shape, node.input_shapes)
     ) else (1 if (target_shape and has_obs_shape) else 0)
-    lane_miss = 0 if (not pred.stream_lane or node.stream_lane == pred.stream_lane) else 1
+    lane_miss = (
+        0 if (not pred.stream_lane or node.stream_lane == pred.stream_lane)
+        else (1 if not node.stream_lane else 2)
+    )
     return (scope_miss, shape_miss, lane_miss, pos)
 
 
@@ -1127,33 +1159,28 @@ def _consume_offline_multi(
         for sub_idx, tok in enumerate(expected_kernels):
             exp_tt = _subkernel_task_type(pred, sub_idx)
             exp_shape = stage_expected[sub_idx] if sub_idx < len(stage_expected) else ""
-            picked: tuple[int, ObservedKernelNode] | None = None
-            for pos, node in enumerate(obs_dag.nodes):
-                if remaining_counts.get(pos, 0) - spent.get(pos, 0) <= 0:
-                    continue
-                if not _token_matches_node(node, tok):
-                    continue
-                if not _task_type_compatible(
+            sub_candidates: list[tuple[int, ObservedKernelNode]] = [
+                (pos, node)
+                for pos, node in enumerate(obs_dag.nodes)
+                if remaining_counts.get(pos, 0) - spent.get(pos, 0) > 0
+                and _token_matches_node(node, tok)
+                and _task_type_compatible(
                     pred, node, expected_override=exp_tt, is_offline_summary=True,
                     unknown_task_budget=unknown_task_budget,
-                ):
-                    continue
-                if (
+                )
+                and not (
                     unknown_task_budget is not None
                     and _normalize_task_type(node.task_type) == "UNKNOWN"
                     and exp_tt
                     and unknown_task_budget.get(exp_tt, 0) - unknown_spent.get(exp_tt, 0) <= 0
-                ):
-                    continue
-                if strict_attrs and not _stage_attrs_strict_ok(
-                    pred, node, exp_shape, is_offline_summary=True,
-                ):
-                    continue
-                picked = (pos, node)
-                break
-            if picked is None:
+                )
+                and (not strict_attrs or _stage_attrs_strict_ok(pred, node, exp_shape, is_offline_summary=True))
+            ]
+            if not sub_candidates:
                 complete = False
                 break
+            sub_candidates.sort(key=lambda item: _candidate_preference_key(pred, item, exp_shape))
+            picked = sub_candidates[0]
             spent[picked[0]] = spent.get(picked[0], 0) + 1
             if unknown_task_budget is not None and _normalize_task_type(picked[1].task_type) == "UNKNOWN" and exp_tt:
                 unknown_spent[exp_tt] = unknown_spent.get(exp_tt, 0) + 1
@@ -1210,8 +1237,7 @@ def _consume_single_occurrences(
             or _stage_attrs_strict_ok(pred, node, exp_shape, is_offline_summary=obs_dag.is_offline_summary)
         )
     ]
-    if not obs_dag.is_offline_summary:
-        candidates.sort(key=lambda item: _candidate_preference_key(pred, item, exp_shape))
+    candidates.sort(key=lambda item: _candidate_preference_key(pred, item, exp_shape))
     need = limit
     invocations: list[tuple[tuple[int, ObservedKernelNode], ...]] = []
     consumed = 0
@@ -1333,16 +1359,18 @@ def _verify_matched_node_attributes(
                 observed=",".join(sorted(present)),
             ))
 
-    if pred.stream_lane and not all(n.stream_lane == pred.stream_lane for _, n in hits):
-        obs_lanes = sorted({n.stream_lane for _, n in hits})
-        lane_diffs.append(ParityDiff(
-            code="WRONG_STREAM_LANE",
-            rank_id=rank_id,
-            node_id=pred.node_id,
-            detail=f"lane mismatch for {pred.api_or_symbol}: expected {pred.stream_lane}, got {obs_lanes}",
-            expected=pred.stream_lane,
-            observed=",".join(obs_lanes),
-        ))
+    if pred.stream_lane:
+        lane_hits = [n for _, n in hits if (not is_offline_summary or bool(n.stream_lane))]
+        if lane_hits and not all(n.stream_lane == pred.stream_lane for n in lane_hits):
+            obs_lanes = sorted({n.stream_lane for n in lane_hits})
+            lane_diffs.append(ParityDiff(
+                code="WRONG_STREAM_LANE",
+                rank_id=rank_id,
+                node_id=pred.node_id,
+                detail=f"lane mismatch for {pred.api_or_symbol}: expected {pred.stream_lane}, got {obs_lanes}",
+                expected=pred.stream_lane,
+                observed=",".join(obs_lanes),
+            ))
 
     if pred.collective_group or pred.comm_ranks:
         group_ok = (not pred.collective_group) or all(
@@ -1963,31 +1991,53 @@ def load_offline_a3_capture_dags(
         exec_mode: ExecModeKind = "aclgraph" if cfg.get("aclgraph") else "eager"
         rep = entry.get("representative_decode_step") or entry.get("representative_prefill_step") or {}
         phase: PhaseKind = "decode" if entry.get("representative_decode_step") else "prefill"
-        sig_meta: dict[str, tuple[str, str, float]] = {}
-        sig_rows: list[tuple[str, str, str, int, float]] = []
-        for sig in entry.get("top_op_signatures") or ():
+        raw_sigs = tuple(entry.get("top_op_signatures") or ())
+        explicit_lanes_by_sid: dict[str, set[str]] = {}
+        for sig in raw_sigs:
+            sid_s = _parse_stream_id(sig.get("stream_id"))
+            lane_s = str(sig.get("stream_lane", "") or "").strip()
+            if sid_s and lane_s:
+                explicit_lanes_by_sid.setdefault(sid_s, set()).add(lane_s)
+        sig_by_kernel: dict[str, list[tuple[str, str, float, str, str]]] = {}
+        sig_rows: list[tuple[str, str, str, int, float, str, str]] = []
+        for sig in raw_sigs:
             parts = str(sig.get("signature", "")).split("|")
             kname = parts[0] if parts else ""
             cann_api = parts[1] if len(parts) > 1 else ""
             ttype = _normalize_task_type(parts[2] if len(parts) > 2 else "")
             cnt = int(sig.get("count", 1))
             dur = float(sig.get("total_dur_us", 0.0))
+            raw_sid = _parse_stream_id(sig.get("stream_id"))
+            raw_lane = str(sig.get("stream_lane", "") or "").strip()
+            obs_lane = _resolve_offline_stream_lane(raw_sid, raw_lane, kname, ttype, explicit_lanes_by_sid)
             if kname:
-                sig_rows.append((kname, cann_api, ttype, cnt, dur))
-                sig_meta.setdefault(kname, (cann_api, ttype, dur))
+                sig_rows.append((kname, cann_api, ttype, cnt, dur, raw_sid, obs_lane))
+                sig_by_kernel.setdefault(kname, []).append((cann_api, ttype, dur, raw_sid, obs_lane))
 
         nodes: list[ObservedKernelNode] = []
         idx = 0
         rep_by_type = rep.get("by_type") or {}
         if rep_by_type:
-            # Prefer exact 1-step representative step histogram (enriched with CANN/task_type metadata).
+            # Prefer exact 1-step representative step histogram (order-independent signature enrichment).
             for kname, cnt in rep_by_type.items():
-                cann_api, ttype, dur = sig_meta.get(kname, ("", _infer_offline_task_type(kname), 0.0))
+                entries = sig_by_kernel.get(kname)
+                if entries:
+                    apis = sorted({item[0] for item in entries if item[0]})
+                    ttypes = sorted({item[1] for item in entries if item[1]})
+                    sids = {item[3] for item in entries}
+                    lanes = {item[4] for item in entries}
+                    cann_api = apis[0] if len(apis) == 1 else ""
+                    ttype = ttypes[0] if len(ttypes) == 1 else _infer_offline_task_type(kname)
+                    dur = sum(item[2] for item in entries)
+                    raw_sid = next(iter(sids)) if len(sids) == 1 else ""
+                    obs_lane = next(iter(lanes)) if len(lanes) == 1 else ""
+                else:
+                    cann_api, ttype, dur, raw_sid, obs_lane = ("", _infer_offline_task_type(kname), 0.0, "", "")
                 nodes.append(ObservedKernelNode(
                     node_id=f"a3.{tag}.rep{idx}",
                     rank_id=0,
-                    stream_id="0",
-                    stream_lane=_infer_stream_lane("0", kname, ttype),
+                    stream_id=raw_sid,
+                    stream_lane=obs_lane,
                     task_type=ttype,
                     kernel_name=kname,
                     cann_api=cann_api,
@@ -1997,12 +2047,12 @@ def load_offline_a3_capture_dags(
                 ))
                 idx += 1
         else:
-            for kname, cann_api, ttype, cnt, dur in sig_rows:
+            for kname, cann_api, ttype, cnt, dur, raw_sid, obs_lane in sig_rows:
                 nodes.append(ObservedKernelNode(
                     node_id=f"a3.{tag}.k{idx}",
                     rank_id=0,
-                    stream_id="0",
-                    stream_lane=_infer_stream_lane("0", kname, ttype),
+                    stream_id=raw_sid,
+                    stream_lane=obs_lane,
                     task_type=ttype,
                     kernel_name=kname,
                     cann_api=cann_api,
@@ -2047,19 +2097,28 @@ def load_offline_a5_capture_dags(
 
     for tag, entry in (raw.get("captures") or {}).items():
         exec_mode: ExecModeKind = "aclgraph" if "aclgraph" in tag else "eager"
-        seq = entry.get("decode_op_sequence_summary") or entry.get("prefill_op_sequence_summary") or ()
+        seq = tuple(entry.get("decode_op_sequence_summary") or entry.get("prefill_op_sequence_summary") or ())
         phase: PhaseKind = "decode" if entry.get("decode_op_sequence_summary") else "prefill"
+        explicit_lanes_by_sid: dict[str, set[str]] = {}
+        for item in seq:
+            sid_s = _parse_stream_id(item.get("stream_id"))
+            lane_s = str(item.get("stream_lane", "") or "").strip()
+            if sid_s and lane_s:
+                explicit_lanes_by_sid.setdefault(sid_s, set()).add(lane_s)
         nodes: list[ObservedKernelNode] = []
         prev_id = ""
         for idx, item in enumerate(seq):
             kname = str(item.get("kernel", "")).strip()
             ttype = _normalize_task_type(str(item.get("core", "")))
+            raw_sid = _parse_stream_id(item.get("stream_id"))
+            raw_lane = str(item.get("stream_lane", "") or "").strip()
+            obs_lane = _resolve_offline_stream_lane(raw_sid, raw_lane, kname, ttype, explicit_lanes_by_sid)
             nid = f"a5.{tag}.k{idx}"
             nodes.append(ObservedKernelNode(
                 node_id=nid,
                 rank_id=0,
-                stream_id="0",
-                stream_lane=_infer_stream_lane("0", kname, ttype),
+                stream_id=raw_sid,
+                stream_lane=obs_lane,
                 task_type=ttype,
                 kernel_name=kname,
                 cann_api=str(item.get("cann_api", "")),
@@ -3459,7 +3518,7 @@ def _aggregate_step_nodes_for_offline_audit(
     if not rank_nodes:
         raise ModelingError(f"offline_parity_empty_rank_nodes:{tag}:rank={rank_id}")
     grouped: dict[
-        tuple[tuple[str, ...], tuple[str, ...], str, bool, str, tuple[str, ...]],
+        tuple[tuple[str, ...], tuple[str, ...], str, bool, str, tuple[str, ...], str],
         list[PredictedKernelNode],
     ] = {}
     for node in rank_nodes:
@@ -3470,6 +3529,7 @@ def _aggregate_step_nodes_for_offline_audit(
             node.is_ai_cpu_metadata,
             node.input_shapes,
             node.expected_input_shapes,
+            node.stream_lane,
         )
         grouped.setdefault(key, []).append(node)
     if not grouped:
@@ -3477,7 +3537,10 @@ def _aggregate_step_nodes_for_offline_audit(
 
     out: list[PredictedKernelNode] = []
     has_sp_pad = False
-    for idx, ((kernels, exp_tts, ttype, is_aicpu, in_shapes, exp_in_shapes), items) in enumerate(sorted(grouped.items())):
+    for idx, (
+        (kernels, exp_tts, ttype, is_aicpu, in_shapes, exp_in_shapes, stream_lane),
+        items,
+    ) in enumerate(sorted(grouped.items())):
         if kernels == _PAD_MULTI_KERNEL or "PadV3" in kernels:
             has_sp_pad = True
         per_step_count = len(items)
@@ -3485,7 +3548,7 @@ def _aggregate_step_nodes_for_offline_audit(
         out.append(PredictedKernelNode(
             node_id=f"{tag}.agg{idx}.{first.api_or_symbol}",
             rank_id=rank_id,
-            stream_lane=first.stream_lane,
+            stream_lane=stream_lane,
             task_type=ttype,
             api_or_symbol=first.api_or_symbol,
             expected_kernels=kernels,

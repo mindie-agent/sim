@@ -34,8 +34,8 @@ def analysis_view(case, request_id, tokens, context, scope, phase, *,
     if scope == "model" and phase == "decode" and tokens > DECODE_BASE_ROWS:
         from .efficiency import _resolve_speculative_tokens
         configured, policy_mean = _resolve_speculative_tokens(
-            case, output_budget=DECODE_BASE_ROWS, tokens_per_seq=None,
-            emitted_tokens_per_seq=None)
+            case, output_budget=None, tokens_per_seq=None,
+            emitted_tokens_per_seq=None, request_id=request_id)
         if configured > DECODE_BASE_ROWS and tokens == configured:
             proposal = configured - DECODE_BASE_ROWS
             mean = min(float(tokens),

@@ -94,7 +94,7 @@ def resolve_efficiency_scope(case: CaseSpec | Mapping[str, Any], scope: str | No
 
     parsed = parse_case(case)
     query_tokens, _ = _resolve_speculative_tokens(
-        parsed, output_budget=1, tokens_per_seq=None, emitted_tokens_per_seq=None)
+        parsed, output_budget=None, tokens_per_seq=None, emitted_tokens_per_seq=None)
     return "model" if query_tokens > 1 else "body"
 
 

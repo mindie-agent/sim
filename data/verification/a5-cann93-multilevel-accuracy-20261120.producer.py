@@ -693,7 +693,12 @@ def _eval_model_run(task: tuple[dict[str, Any], str, str, str, str, str]) -> dic
     dcp = int(r.get("dcp") or pt.get("decode_context_parallel_size") or 1)
     world = dp * tp * max(1, pcp)
     ep = world if bool(r.get("ep") if r.get("ep") is not None else pt.get("enable_expert_parallel", False)) else 1
-    track = "unmerged_pr" if "unmerged_pr" in rung else ("raw_eager" if "raw_eager" in rung else "merged")
+    track = (
+        "proposed" if ("unmerged_pr" in rung or "proposed" in rung)
+        else ("eager" if ("raw_eager" in rung or "eager" in rung) else "shipping")
+    )
+    if not l3_blocked and track == "eager":
+        l3_blocked = "raw_eager_step_boundary_unsupported"
     fx = r.get("fx_compilation_summary") or {}
     pre_ops = (fx.get("pre_split_full_graph_summary") or {}).get("op_counts") or {}
     orig_L = int(r.get("orig_layers") or L)
@@ -730,9 +735,12 @@ def _eval_model_run(task: tuple[dict[str, Any], str, str, str, str, str]) -> dic
             if not (has_l2_capture and (lkey in l2_timings or scalar_l2 is not None and (lkey in t or mkey in t))):
                 continue
         sched_toks = tok * seqs
-        cap_mode = "piecewise" if (cg_mode == "PIECEWISE" or "piecewise" in rung or sched_toks > cg_max) else "full"
+        cap_mode = (
+            "none" if (cg_mode == "NONE" or track == "eager")
+            else ("piecewise" if (cg_mode == "PIECEWISE" or "piecewise" in rung or sched_toks > cg_max) else "full")
+        )
         use_fmoe = mso and is_hybrid_60 and ph == "prefill"
-        sp_arg = None if (rung != "raw_eager" and (ep == 1 or use_fmoe or "vllm.sequence_parallel_chunk_impl" in pre_ops)) else False
+        sp_arg = None if (track != "eager" and (ep == 1 or use_fmoe or "vllm.sequence_parallel_chunk_impl" in pre_ops)) else False
         excl = ([] if use_fmoe else (["cann_megamoe_fusion"] if rc.get("mega_moe_max_tokens", 0) == 0 else [])) + (["dynamic_mc2_dispatch", "tp_mc2_overlap"] if rc.get("enable_fused_mc2", 1) == 0 else [])
         raw = compose_case(
             mod, hardware=sku, feature_track=track, _stack_phase=ph, dp=dp, tp=tp, ep=ep, dcp=dcp, pcp=pcp,
@@ -768,7 +776,7 @@ def _eval_model_run(task: tuple[dict[str, Any], str, str, str, str, str]) -> dic
         drilldown = evaluate_vertical_drilldown(round(pred_ms * scale), round(meas * scale), ())
         phase_result.update(
             cap_mode=cap_mode, measured_ms=round(meas, 3), predicted_ms=round(pred_ms, 3),
-            predicted_replays=max(1, int(rep["execution"]["submission"]["graph_replays"]) // max(1, dp)),
+            predicted_replays=0 if cap_mode == "none" else max(1, int(rep["execution"]["submission"]["graph_replays"]) // max(1, dp)),
             vertical_drilldown=drilldown,
         )
     unscoped_l2 = None
@@ -807,7 +815,7 @@ def build_report(
             if not reason:
                 if r.get("status") != "ok":
                     reason = "capture_row_unsuccessful"
-                elif r.get("rung") == "raw_eager":
+                elif r.get("rung") in ("raw_eager", "eager") or "raw_eager" in str(r.get("rung") or ""):
                     reason = "raw_eager_step_boundary_unsupported"
             if reason:
                 l3[sp or "unassigned"].append({

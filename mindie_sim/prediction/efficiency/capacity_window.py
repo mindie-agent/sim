@@ -16,6 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from typing import Any
 
+from mindie_sim.catalog.speculative_state import resolve_speculative_proposals
 from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.model import RequestSpec
 from mindie_sim.schema.speculative import SpeculativeSpec
@@ -439,8 +440,9 @@ def _vram_max_sequences_per_dp(
 
 
 def _resolve_speculative_tokens(
-    case: CaseSpec, *, output_budget: int, tokens_per_seq: int | None,
+    case: CaseSpec, *, output_budget: int | None = None, tokens_per_seq: int | None,
     emitted_tokens_per_seq: float | None, phase: str = "decode",
+    request_id: str | None = None,
 ) -> tuple[int, float]:
     """Resolve query tokens per sequence and committed tokens per step aligned with DraftPolicy."""
     if phase == "prefill":
@@ -457,13 +459,44 @@ def _resolve_speculative_tokens(
         if isinstance(tokens_per_seq, bool) or resolved_q < 1:
             raise ValueError(f"tokens_per_seq_must_be_positive_int:{tokens_per_seq}")
         return resolved_q, float(resolved_q)
-    req = RequestSpec(request_id="sla", prompt_tokens=1, output_tokens=max(1, output_budget), arrival_ms=0.0)
+    if isinstance(output_budget, bool):
+        raise ValueError(f"output_budget_must_be_int_or_none:{output_budget}")
+    bounded_output = int(output_budget) if (output_budget is not None and int(output_budget) >= 1) else None
+    reqs = tuple(getattr(getattr(case, "workload", None), "requests", ()) or ())
+    matched_req = (
+        next((r for r in reqs if getattr(r, "request_id", None) == request_id), None)
+        if request_id is not None else None
+    )
+    if matched_req is not None:
+        req_out = (
+            bounded_output if bounded_output is not None
+            else max(1, int(getattr(matched_req, "output_tokens", 1) or 1))
+        )
+        req = replace(matched_req, output_tokens=req_out)
+    else:
+        if bounded_output is not None:
+            req_out = bounded_output
+        else:
+            req_out = (
+                max(1, int(getattr(reqs[0], "output_tokens", 1) or 1))
+                if reqs and reqs[0].request_id != "__structure_probe__"
+                else 1
+            )
+        req = RequestSpec(request_id=request_id or "sla", prompt_tokens=1, output_tokens=req_out, arrival_ms=0.0)
     dp_pol = DraftPolicy.for_request(case, req)
     policy_proposal = dp_pol.proposal if dp_pol.proposal > 0 else 0
     policy_mean = dp_pol.mean if dp_pol.proposal > 0 else 1.0
+    if policy_proposal == 0:
+        contract_prop = resolve_speculative_proposals(case.runtime, phase="decode")
+        if contract_prop > 0:
+            policy_proposal = contract_prop
+            raw_mean = dict(case.runtime.mtp_acceptance_by_output_tokens).get(
+                req.output_tokens, case.runtime.mtp_acceptance_length,
+            )
+            policy_mean = min(float(policy_proposal + 1), max(1.0, float(raw_mean)))
     max_prop = (
-        min(policy_proposal, max(0, int(output_budget) - 1))
-        if int(output_budget) >= 1 else policy_proposal
+        min(policy_proposal, max(0, bounded_output - 1))
+        if bounded_output is not None else policy_proposal
     )
     resolved_q = int(tokens_per_seq) if tokens_per_seq is not None else (1 + max_prop if max_prop > 0 else 1)
     if isinstance(tokens_per_seq, bool) or resolved_q < 1:
