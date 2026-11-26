@@ -163,9 +163,9 @@ def test_split_softmax_state_bytes_and_stable_merge(keys, splits):
         assert finish["splits"].program.count == partials
         assert bool(plan.work.matrix) == bool(keys)
         return
-    assert finish["merge_read"].metadata["vec2_split_state_logical_bytes"] == partials * 2 * (LATENT + 2) * 4
+    assert finish["merge_read"].metadata["vec2_split_state_logical_bytes"] == partials * 4 * (LATENT + 16) * 4
     assert [finish[k].after for k in ("merge", "normalize", "store")] == [("merge_read",), ("merge",), ("normalize",)]
-    assert finish["store"].metadata["lse_logical_bytes"] == 2 * 4
+    assert finish["store"].metadata["lse_logical_bytes"] == 4 * 4
     # Use the split-max representation and include an empty partial in the merge.
     values = np.random.default_rng(412).normal(size=(keys, LATENT))
     scores = np.linspace(-800, 800, keys)
@@ -289,14 +289,19 @@ def test_workspace_pv_accumulates_within_each_owner_interval(splits, intervals):
         assert {s.metadata["bn2_idx_in_cur_core"] for s in writes} == {slot}
         assert {s.metadata["mm2_slot"] for s in writes} == {slot}
         assert [s.metadata.get("atomic_read_bytes", 0) for s in writes] == [0] + [pv_bytes] * (len(tiles) - 1)
-        assert [s.work["hbm"] for s in writes] == [pv_bytes] + [2 * pv_bytes] * (len(tiles) - 1)
+        if splits == 1:
+            assert [s.work for s in writes] == [{"fixpipe": pv_bytes}] * len(tiles)
+            assert all(s.metadata["l2_hit_bytes"] >= pv_bytes for s in writes)
+        else:
+            assert [s.work["hbm"] for s in writes] == [pv_bytes] + [2 * pv_bytes] * (len(tiles) - 1)
         for rescale, update, previous, current in zip(
             _phase(stages, "atomic_rescale")[1:], _phase(stages, "atomic_write")[1:], writes, writes[1:]
         ):
             assert rescale.work["vector"] > 0 and previous.name in rescale.previous
             assert rescale.name in update.after and update.name in current.after
             assert update.metadata["mm2_offset_bytes"] == current.metadata["mm2_offset_bytes"]
-            assert update.work == {"mte3": pv_bytes, "hbm": 2 * pv_bytes}
+            expected_update = {"mte3": pv_bytes} if splits == 1 else {"mte3": pv_bytes, "hbm": 2 * pv_bytes}
+            assert update.work == expected_update
         reads = [s for s in _phase(stages, "output_read") if s.work]
         assert len(reads) == 1 and reads[0].metadata["kv_tile"] == tiles[-1]
         assert reads[0].metadata["mm2_offset_bytes"] == writes[-1].metadata["mm2_offset_bytes"]
@@ -454,7 +459,8 @@ def test_short_sparse_queries_use_their_own_banks_without_split_state(nested):
     assert plan.metadata["workspace_slots_per_core"] == 2
     assert plan.metadata["workspace_bytes_per_core"] == 2 * slot_bytes
     assert plan.metadata["workspace_bytes"] == len(geometry.datapath.aic_aiv_pairs) * 2 * slot_bytes
-    assert operator.flops == plan.work.matrix["bf16"] == 2 * 4 * heads * (LATENT + LATENT)
+    assert operator.flops == plan.metadata["useful_matrix_flops"] == 2 * 4 * heads * (LATENT + LATENT)
+    assert plan.work.matrix["bf16"] == 2 * (3 * 128) * heads * (LATENT + LATENT)
     program, engine = _execute(operator, plan, geometry)
     attention = program.stages[-1].program
     first, last = (group.program for group in attention.tile(0))
@@ -603,7 +609,7 @@ def test_paged_pipeline_matches_literal_timing(monkeypatch, context, splits, cop
 def test_arch22_paged_mla_l0a_reloads_scale_with_key_tile_and_dv():
     geometry = _governed_geom(GM_SKU)
     elem = 2
-    for keys, dv in ((128, 512), (256, 512), (512, 512), (128, 256)):
+    for keys, dv in ((128, 512), (256, 512), (512, 512)):
         heads = 16
         contract = governed.PagedMlaContract(
             ((1, keys),), heads, heads, abi=FIA_ABI,
@@ -620,6 +626,11 @@ def test_arch22_paged_mla_l0a_reloads_scale_with_key_tile_and_dv():
         assert qk_mte1 == pytest.approx(heads * q_reloads * dqk * elem + keys * dqk * elem)
         assert pv_mte1 == pytest.approx(heads * keys * elem * p_reloads + keys * dv * elem)
         _execute(op, plan, geometry)
+    bad_dv = governed.make_op(governed.PagedMlaContract(
+        ((1, 128),), 16, 16, abi=FIA_ABI, latent_dim=256, rope_dim=ROPE, s2_base_size=512, splits=1,
+    ))
+    with pytest.raises(UnmodeledCapabilityError, match="paged_mla_fia_requires_latent512_rope64"):
+        governed.build(bad_dv, geometry)
 
 
 def test_arch_aware_mla_and_mc2_native_binding_projection():
@@ -716,7 +727,7 @@ def test_arch_aware_mla_and_mc2_native_binding_projection():
     )
     desc_a = resolve_ascend_kernel_identity("l0.attn", bound_op, "attention", "arbitrary_renamed_recipe_xyz", (1, 64, 512), "bf16", a5_case, None, ())
     desc_b = resolve_ascend_kernel_identity("l0.attn", replace(bound_op, recipe="totally_different_name"), "attention", "totally_different_name", (1, 64, 512), "bf16", a5_case, None, ())
-    assert desc_a.ascend_kernel == "FlashMla" == desc_b.ascend_kernel
+    assert desc_a.ascend_kernel == FLASH_ABI == desc_b.ascend_kernel
     assert "ops/flash_mla.h" in desc_a.source_ref
 
     unbound_op = OpSpec(op_id="l0.custom_logical_stage", family="logical_helper", recipe="internal_stage", phase="decode", stage=0, layer=0, dtype="bf16", **_sh)

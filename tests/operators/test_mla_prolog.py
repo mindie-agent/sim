@@ -63,13 +63,13 @@ def _context(sku, op, device=None):
     return OperatorPlanningContext(OpOccurrence(0, op.stage, 0, op.op_id), geom, geom.datapath)
 def _prolog(tokens=5, **overrides):
     fields = dict(op_id="prolog", tokens=tokens, hidden_size=5120, num_heads=16,
-                  q_lora_rank=1280, kv_lora_rank=512, qk_nope_head_dim=128, qk_rope_head_dim=64)
+                  q_lora_rank=1536, kv_lora_rank=512, qk_nope_head_dim=128, qk_rope_head_dim=64)
     return governed.make_op(**(fields | overrides))
 @pytest.mark.parametrize("sku", SKUS)
 def test_four_products_conserve_work_through_execution_and_projection(sku):
     op = _prolog(weight_quant_mode=WEIGHT_QUANT_BF16, kv_cache_quant_mode=0)
-    assert op.flops == 2 * 5 * (5120 * 1280 + 5120 * (512 + 64)
-                               + 1280 * 16 * (128 + 64) + 16 * 128 * 512)
+    assert op.flops == 2 * 5 * (5120 * 1536 + 5120 * (512 + 64)
+                               + 1536 * 16 * (128 + 64) + 16 * 128 * 512)
     ctx = _context(sku, op)
     resolved = governed.resolve_operator_plan(op, ctx)
     plan, descriptor = resolved.recipe, resolved.descriptor
@@ -94,17 +94,17 @@ def test_absorption_assigns_every_head_to_one_matrix_owner(heads, ownership):
     assert (plan.metadata["heads_per_owner"], plan.metadata["w_uk_owners"]) == governed.w_uk_ownership(heads, 32) == ownership
     cube = next(p for p in plan.program.groups[0][0].phases if p.name == "mm4_w_uk_cube")
     assert {d.owner: dict(d.audit)["heads"] for d in cube.demands} == dict.fromkeys(range(ownership[1]), ownership[0])
-@pytest.mark.parametrize("nope,step,slot", [(128, 128, 3_182_592), (192, 64, 1_984_512)])
+@pytest.mark.parametrize("nope,step,slot", [(128, 128, 3_575_808), (192, 64, 2_181_120)])
 def test_cq_scale_slot_is_published_and_gathered_across_chunk_tails(nope, step, slot):
     op = _prolog(step + 1, hidden_size=7168, q_lora_rank=1536, qk_nope_head_dim=nope,
                  weight_quant_mode=WEIGHT_QUANT_INT8, kv_cache_quant_mode=0)
     ctx = _context(SPLIT_N_SKU, op)
     plan = governed.build(op, ctx)
     assert plan.metadata["step_batch"] == step
-    bytes_per_row = 4 * (1536 + 512 + 64 + 16 * (nope + 64)) + 2 * 16 * nope
+    bytes_per_row = 1536 * (4 + 2) + (512 + 64) * 4 + 16 * (nope + 64) * 4 + 16 * nope * 2
     full, tail = plan.program.groups[0]
     assert full.workspace_bytes == plan.metadata["workspace_slot_bytes"] == step * (bytes_per_row + 32) == slot
-    assert (full.count, tail.count, tail.workspace_bytes) == (1, 1, bytes_per_row + step * 32)
+    assert (full.count, tail.count, tail.workspace_bytes) == (1, 1, slot)
     for chunk, rows in ((full, step), (tail, 1)):
         phases = {phase.name: phase for phase in chunk.phases}
         writes = phases["mm1_cq_fixpipe_gm"]
@@ -186,20 +186,28 @@ def test_projection_outputs_use_native_gm_element_widths(sku, abi, mode, size):
     for name, expected in zip(("mm1_cq", "mm2_ckv_kr", "mm3_qc_qr"), (cq, kv, query), strict=True):
         write = phases[name + "_fixpipe_gm"]
         assert _logical_bytes(write) == _service_bytes(write, "fixpipe") == expected
+    int8 = mode == WEIGHT_QUANT_INT8
+    mxfp8 = mode == WEIGHT_QUANT_MXFP8
     norm = tuple(d for d in phases["cq_norm_mte2_aiv"].demands if dict(d.audit)["tensor"] == "cq_norm")
-    assert sum(d.work.resources["mte2_aiv"] for d in norm) == cq
-    rope_tables = 2 * 64 * 4 if mode != WEIGHT_QUANT_BF16 else 0
-    assert _logical_bytes(phases["kv_cache_mte2_aiv"]) == kv + 512 * 2 + rope_tables
-    assert _logical_bytes(phases["query_rope_mte2_aiv"]) == 4 * 64 * size + rope_tables
-    cast_bytes = 0 if mode == WEIGHT_QUANT_BF16 else 4 * 128 * 2
-    if cast_bytes:
-        assert _service_bytes(phases["qc_dequant_mte2_aiv"], "mte2_aiv") == 4 * 128 * size
-    assert _execute(op, plan, ctx.geometry) == plan.metadata["workspace_slot_bytes"] == cq + kv + query + cast_bytes
+    assert sum(d.work.resources["mte2_aiv"] for d in norm) == cq + (32 if int8 else 0)
+    rope_tables = 2 * 64 * 2 if mode != WEIGHT_QUANT_BF16 else 0
+    kv_scales = (4 + (512 + 64) * 4) if int8 else 0
+    assert _logical_bytes(phases["kv_cache_mte2_aiv"]) == kv + 512 * 2 + kv_scales + (rope_tables if mxfp8 else 0)
+    qr_scales = 4 * 64 * 4 if int8 else 0
+    qr_tables = rope_tables * (4 if mxfp8 else 1)
+    assert _logical_bytes(phases["query_rope_mte2_aiv"]) == 4 * 64 * size + qr_scales + qr_tables
+    if mode != WEIGHT_QUANT_BF16:
+        assert _service_bytes(phases["qc_dequant_mte2_aiv"], "mte2_aiv") == 4 * 128 * size + (4 * 128 * 4 if int8 else 0)
+    cq_norm_buf, query_ws, qc_buf = 1536 * 2, 4 * (128 + 64) * 4, 4 * 128 * 2
+    scale_slot = 64 if mxfp8 else 0
+    assert _execute(op, plan, ctx.geometry) == plan.metadata["workspace_slot_bytes"] == (
+        cq + cq_norm_buf + kv + query_ws + qc_buf + scale_slot
+    )
 @pytest.mark.parametrize("tokens,padded,splits,ub_kib,workspace", (
     (17, 32, 4, None, 917_504), (4096, 4128, 1, None, 29_589_504), (4096, 4128, 20, 72, 591_790_080)))
 def test_dsl_split_k_exchanges_fp32_partials_and_retains_local_query(tokens, padded, splits, ub_kib, workspace):
     resident = tokens < 256
-    op = _prolog(tokens, abi=ABI_DSL, dsl_d_width=512, phase="decode" if resident else "prefill")
+    op = _prolog(tokens, abi=ABI_DSL, q_lora_rank=1280, dsl_d_width=512, phase="decode" if resident else "prefill")
     assert op.flops == 2 * tokens * (5120 * (1280 + 512) + 1280 * 16 * 512)
     ctx = _context(SPLIT_M_SKU, op, {"buffers": {"ub": ub_kib * 1024}} if ub_kib else None)
     plan = governed.build(op, ctx)
@@ -237,7 +245,7 @@ def test_dsl_split_k_exchanges_fp32_partials_and_retains_local_query(tokens, pad
         with pytest.raises(ModelingError, match="l0c.*ub"):
             governed.build(op, replace(ctx, datapath=replace(ctx.datapath, usable_paths=paths)))
 def test_disjoint_stream_uses_reachable_physical_owner_ids():
-    op = replace(_prolog(17, abi=ABI_DSL, dsl_d_width=512), stream="prolog")
+    op = replace(_prolog(17, abi=ABI_DSL, q_lora_rank=1280, dsl_d_width=512), stream="prolog")
     streams = StreamPlan(0, (StreamLane("main", StreamCoreBudget(7, 14)),
                              StreamLane("prolog", StreamCoreBudget(3, 5)), StreamLane("rest")))
     report = _graph(sku_case(SPLIT_M_SKU), (op,), recipes=RecipeBook(governed.recipes()),
@@ -343,7 +351,7 @@ def test_packed_store_matches_governed_row_and_persistent_capacity():
     op = next(op for op in target_operators(case, phase="decode", tokens=6, context=4104, resource_fusion=False)
               if op.recipe == "kv_store")
     attrs = dict(op.metadata)["packed_cache"]
-    governed_op = _prolog(6, abi=ABI_V3_NZ, weight_quant_mode=WEIGHT_QUANT_INT8)
+    governed_op = _prolog(6, abi=ABI_V3_NZ, weight_quant_mode=WEIGHT_QUANT_INT8, kv_cache_quant_mode=3)
     c = governed.validate_contract(governed_op)
     assert attrs["row_bytes"] == c.kv_row_bytes == cache_format(case.model, "mla_kv").row_bytes(576) == 656
     assert attrs["component_offsets"] == {"latent": 0, "rope": 512, "scales": 640}
@@ -505,13 +513,14 @@ def test_compressor_prunes_gate_at_unit_ratio_and_fuses_valid_rows(ratio):
         assert ready == builder.ops[-1].op_id and builder.ops[0].flops == 2 * 8 * 576 * 4096
     else:
         assert [op.recipe for op in builder.ops] == [
-            "compress_values", "compress_gates", "compress_pool", "compress_norm", "compress_rotary"
+            "compress_input_cast", "compress_values", "compress_gates", "compress_pool",
+            "compress_ring_cache_update", "compress_norm", "compress_rotary",
         ]
-        assert ready == (builder.ops[3].op_id, builder.ops[4].op_id)
-        pool_meta = dict(builder.ops[2].metadata)
+        assert ready == (builder.ops[5].op_id, builder.ops[6].op_id)
+        pool_meta = dict(builder.ops[3].metadata)
         assert pool_meta["native_kinds"] == ("ZerosLike", "_pool_kernel")
         assert sum(op.flops for op in builder.ops) == 4 * 8 * 576 * 4096
-        assert sum(op.vector_ops for op in builder.ops) == 6 * 8 * 576 + 5 * 2 * 576 + 6 * 2 * 64
+        assert sum(op.vector_ops for op in builder.ops) == 8 * 4096 + 6 * 8 * 576 + 5 * 8 * 576 + 6 * 8 * 64
 def test_native_indexer_epilogs_keep_parameters_and_remove_intermediate_bytes():
     model = parse_case(_caller_case()).model
     plan = model.layer_plans[3]
@@ -531,24 +540,45 @@ def test_native_indexer_epilogs_keep_parameters_and_remove_intermediate_bytes():
     builder = Builder("s0.l0", plan, 0, (), model, "decode")
     quant = builder.vector("index_key_quantize", ("index_norm",), 8 * 128, 4, family="quantize",
                            shape=(8, 128), read_bytes_override=8 * 128 * 2, write_bytes_override=8 * 132,
-                           metadata=(("output_format", "int8"), ("scale_format", "fp16"),
+                           metadata=(("output_format", "fp8_e4m3"), ("scale_format", "fp32"),
                                      ("scale_shape", (8, 1)), ("scale_count", 1)))
-    write = builder.store("index_store", (quant,), 8, 132, "int8")
+    write = builder.store("index_store", (quant,), 8, 132, "fp8_e4m3")
     index_row_quantization(builder, write, quant, width=128, native=True)
     op, = builder.ops
     assert op.deps == ("index_norm",) and op.hbm_bytes == op.mte2_bytes + op.mte3_bytes
     assert (op.mte2_bytes, op.mte3_bytes, op.vector_ops) == (8 * 128 * 2, 8 * 132, 8 * 128 * 4)
+    # CANN IsValidQuantTypes rejects int8+fp16 scale tuples; keep quantize+store unfused.
+    unfused = Builder("s0.l0", plan, 0, (), model, "decode")
+    bad_q = unfused.vector("index_key_quantize", ("index_norm",), 8 * 128, 4, family="quantize",
+                           shape=(8, 128), read_bytes_override=8 * 128 * 2, write_bytes_override=8 * 132,
+                           metadata=(("output_format", "int8"), ("scale_format", "fp16"),
+                                     ("scale_shape", (8, 1)), ("scale_count", 1)))
+    bad_w = unfused.store("index_store", (bad_q,), 8, 132, "int8")
+    index_row_quantization(unfused, bad_w, bad_q, width=128, native=True)
+    assert len(unfused.ops) == 2
 def test_draft_context_prolog_shards_persisted_rows_and_orders_query_readiness():
     draft = SimpleNamespace(layers=2, hidden_size=4096, q_lora_rank=512, kv_lora_rank=512,
                             qk_rope_head_dim=64, activation_dtype="bf16")
     shape = (8, 4096, 4096)
     projection = OpSpec("projection", "gemm", "decode", 0, 0, (), shape, shape, shape, shape, dtype="bf16")
+    model = parse_case(_caller_case()).model
+    direct_ops = []
+    direct_ready = draft_context.prepare(
+        direct_ops, projection=projection, model=model, draft=draft, rows=8,
+        query_rows=3, prefix="d:", stage=0, requests=(), parallel=ParallelSpec(cp=2),
+    )
+    assert [op.recipe for op in direct_ops] == ["draft_context_norm"] + [
+        "dynamic_quantize", draft_context.PROLOG_RECIPE] * 2 + ["draft_query_embedding", "draft_context_query_ready"]
+    assert direct_ready == direct_ops[-1].op_id
     ops = []
-    ready = draft_context.prepare(ops, projection=projection, model=parse_case(_caller_case()).model, draft=draft, rows=8,
-                                  query_rows=3, prefix="d:", stage=0, requests=(), parallel=ParallelSpec(cp=2))
+    ready = draft_context.prepare(
+        ops, projection=projection, model=model, draft=draft, rows=8, query_rows=3,
+        prefix="d:", stage=0, requests=(), parallel=ParallelSpec(cp=2), requires_staging_scatter=True,
+    )
     assert [op.recipe for op in ops] == ["draft_context_norm"] + [
-        draft_context.PROLOG_RECIPE, draft_context.SCATTER_RECIPE] * 2 + ["draft_query_embedding", "draft_context_query_ready"]
-    for prolog, scatter in ((ops[1], ops[2]), (ops[3], ops[4])):
+        "dynamic_quantize", draft_context.PROLOG_RECIPE, draft_context.SCATTER_RECIPE] * 2 + [
+            "draft_query_embedding", "draft_context_query_ready"]
+    for prolog, scatter in ((ops[2], ops[3]), (ops[5], ops[6])):
         assert dict(prolog.metadata)["native_kind"] == ABI_V3_NZ and dict(prolog.metadata)["do_rope"]
         assert scatter.local_shape[0] == 4 and dict(scatter.metadata)["cache_epilog"]["kv_row_bytes"] == (512 + 64) * 2
     assert ready == ops[-1].op_id
@@ -613,7 +643,7 @@ def test_draft_mla_prolog_accepts_bf16_kv_with_target_packed_layout_and_v4_mxfp8
 
     case = parse_case(_caller_case())
     target_plan = replace(case.model.layer_plans[3], scope="body", mla_variant="latent_mla",
-                          cache_kind="dense", q_lora_rank=1536, qk_rope_head_dim=64)
+                          cache_kind="dense", q_lora_rank=1536, qk_nope_head_dim=128, qk_rope_head_dim=64)
     bf16_quant = QuantSpec("bf16", kv_dtype="bf16")
     for draft_scope in ("draft", "dspark", "mtp"):
         family_mla_prolog.validate(

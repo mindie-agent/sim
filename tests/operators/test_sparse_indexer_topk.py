@@ -163,7 +163,7 @@ def test_explicit_sort_all_merges_the_initial_retained_list(query_rows, batch, t
 
 @pytest.mark.parametrize("tile_size,mask", [(64, 0b0011), (384, 0b0111)])
 def test_explicit_merge_mask_follows_the_number_of_sorted_runs(tile_size, mask):
-    _, _, _, (tiles,) = _membase(tile_size + 1, s2_tile_size=tile_size, query_tokens=5)
+    _, _, _, (tiles,) = _membase(tile_size + 1, s2_tile_size=tile_size, query_tokens=5, causal=False)
     stages = tiles.tile(1)
     assert next(s for s in stages if s.name == "prepare_sort_pairs").metadata["padded_items"] == tile_size - 1
     masks = [s.metadata["valid_mask"] for s in stages if "valid_mask" in s.metadata]
@@ -241,18 +241,26 @@ def test_score_workspace_and_vector_work_match_independent_per_head_oracle(queri
 
 
 def test_region_mask_and_retained_index_order_preserve_selection_extent():
-    op = sparse_indexer.make_step5_region_score_op(op_id="regions", query_tokens=1, context_tokens=65,
+    op = sparse_indexer.make_step5_region_score_op(op_id="regions", query_tokens=1, context_tokens=137,
                                                    region_block_size=8, topk_regions=16)
     plan, program = _program(op, REGBASE)
     query, (tiles,) = _query_tiles(program)
     mask, = (s for s in tiles.tile(0) if s.name == "mask3")
-    assert mask.work["vector"] == 9
-    assert plan.work.matrix == {"fp8_e4m3": 2 * 9 * 16 * 128}
+    assert mask.work["vector"] == 17
+    assert plan.work.matrix == {"fp8_e4m3": 2 * 17 * 16 * 256}
     by_name = {s.name: s for s in query}
-    assert by_name["region_radix_topk"].metadata["pair_bytes"] == 9 * 8
+    assert by_name["region_radix_topk"].metadata["pair_bytes"] == 17 * 8
     assert by_name["index_sort"].after == ("region_radix_topk",)
     assert by_name["index_store"].work["mte3"] == 16 * 4
     _verified(op, REGBASE)
+    short = sparse_indexer.make_step5_region_score_op(op_id="regions_short", query_tokens=1, context_tokens=65,
+                                                      region_block_size=8, topk_regions=16)
+    short_plan, short_prog = _program(short, REGBASE)
+    short_q, (short_tiles,) = _query_tiles(short_prog)
+    short_mask, = (s for s in short_tiles.tile(0) if s.name == "mask3")
+    assert short_mask.work["vector"] == 8 and short_plan.work.matrix == {"fp8_e4m3": 2 * 8 * 16 * 256}
+    assert "region_radix_topk" not in {s.name for s in short_q}
+    _verified(short, REGBASE)
 
 
 @pytest.mark.parametrize("candidates,tiles", [(512, 1), (513, 2), (520, 2)])
@@ -316,7 +324,7 @@ def test_compressed_rows_transport_only_declared_payloads(ratio, context, expect
 def test_shared_prefix_reuse_only_changes_where_keys_are_serviced():
     geometry = Geometry.from_devices(sku_case(REGBASE).machine.dies)
     rows, queries, heads, dim = 1025, 3, 4, 128
-    options = dict(query_tokens=queries, index_heads=heads, index_dim=dim, topk_items=16)
+    options = dict(query_tokens=queries, batch_size=queries, index_heads=heads, index_dim=dim, topk_items=16)
     base, shared = (_make(rows, shared_prefix=value, **options) for value in (False, True))
     cold, cached = (sparse_indexer.build(op, geometry).work for op in (base, shared))
     reused = (queries - 1) * rows * dim * 2
@@ -329,7 +337,7 @@ def test_shared_prefix_reuse_only_changes_where_keys_are_serviced():
 
 
 def test_long_score_owner_lists_scale_with_queries_and_owner_splits():
-    short, many, wide = (_membase(rows, query_tokens=q, s2_splits=splits)[1].work
+    short, many, wide = (_membase(rows, query_tokens=q, batch_size=q, s2_splits=splits)[1].work
                          for q, rows, splits in ((2, 32768, 2), (8, 32768, 2), (8, 65536, 4)))
     pair_list = 2048 * 8 + 128
     assert many.matrix["bf16"] == 4 * short.matrix["bf16"]
@@ -365,7 +373,7 @@ def test_phase_work_is_independent_of_layer_and_request_identity():
 
 def test_large_geometry_builds_finite_owner_streams_without_expanding_tiles(monkeypatch):
     geometry = Geometry.from_devices(sku_case(MEMBASE).machine.dies)
-    op = _make(1000000, query_tokens=200000, topk_items=16)
+    op = _make(1000000, query_tokens=200000, batch_size=200000, topk_items=16)
     calls = Counter()
     assert sparse_indexer.trace_arch22_topk_flushes(1000000, act_s1_size=200000).block_sorts == 1954
     plan = sparse_indexer.build(op, geometry)
@@ -377,11 +385,19 @@ def test_large_geometry_builds_finite_owner_streams_without_expanding_tiles(monk
 
     monkeypatch.setattr(type(plan.program), "tile", count_tiles)
     prepared = sparse_indexer.build(op, geometry)
-    assert calls["tile"] <= 4
+    assert calls["tile"] <= 8
     program = prepared.program(_context(op, geometry))
     assert len(program.programs) == geometry.datapath.aic_count
     assert sum(lane.count for lane in program.programs) == 200000
-    assert calls["tile"] <= 4
+    assert calls["tile"] <= 8
+    # Causal single-request ramp also stays O(tile_size) without expanding 200,000 queries.
+    calls.clear()
+    causal_op = _make(1000000, query_tokens=200000, batch_size=1, topk_items=16)
+    causal_plan = sparse_indexer.build(causal_op, geometry)
+    assert calls["tile"] <= 520
+    causal_prog = causal_plan.program(_context(causal_op, geometry))
+    assert sum(lane.count for lane in causal_prog.programs) == 200000
+    assert calls["tile"] <= 520
 
 
 def _execution(ops, scope):

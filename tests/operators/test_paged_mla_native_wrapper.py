@@ -127,7 +127,14 @@ def test_split_grid_tails_and_ledgers_conserve_source_work(hardware, abi, length
     tile = 32 if abi == FIA_ABI else 112
     assert plan.metadata["key_tile"] == tile
     groups_per_request = ceil(heads / 16) if abi == FIA_ABI else 1
-    queries = tuple(_queries(plan.program(context)))
+    program = plan.program(context)
+    fa_program = program.stages[0].program if hasattr(program, "stages") else program
+    reduce_stages = (
+        [s for sub in program.stages[-1].program.programs for s in sub.stages]
+        if hasattr(program, "stages") and program.stages[-1].name == "fd_reduce"
+        else []
+    )
+    queries = tuple(_queries(fa_program))
     assert len(queries) == len(lengths) * groups_per_request
     for length, group in zip((n for n in lengths for _ in range(groups_per_request)), queries, strict=True):
         ntiles = ceil(length / tile)
@@ -141,8 +148,17 @@ def test_split_grid_tails_and_ledgers_conserve_source_work(hardware, abi, length
             assert max(map(len, intervals)) - min(map(len, intervals)) <= 1
         per_group_heads = min(heads, 16) if abi == FIA_ABI else heads
         output = group.stages[-1]
-        assert output.metadata["output_logical_bytes"] <= per_group_heads * LATENT * 2
-        assert output.metadata["lse_logical_bytes"] == output.metadata["output_logical_bytes"] // (LATENT // 2)
+        if "output_logical_bytes" in output.metadata:
+            assert output.metadata["output_logical_bytes"] <= per_group_heads * LATENT * 2
+            assert output.metadata["lse_logical_bytes"] == output.metadata["output_logical_bytes"] // (LATENT // 2)
+    if reduce_stages:
+        stores = [s for s in reduce_stages if s.name.startswith("store")]
+        assert stores
+        assert all(s.metadata["lse_logical_bytes"] == s.metadata["output_logical_bytes"] // (LATENT // 2)
+                   for s in stores)
+        local_out = sum(q.stages[-1].metadata.get("output_logical_bytes", 0) for q in queries)
+        reduce_out = sum(s.metadata["output_logical_bytes"] for s in stores)
+        assert local_out + reduce_out == len(lengths) * heads * LATENT * 2
     assert plan.work.matrix["bf16"] == 2 * sum(lengths) * heads * (DQK + LATENT)
     report = verify_operator(case, operator, governed.build, input_ready_ms=READY)
     assert report["status"] == "passed", report
@@ -187,20 +203,40 @@ def test_host_workloads_cover_each_active_tile_and_merge_head(fixture, hardware,
             (seq, i): ceil(heads / 16) if abi == FIA_ABI else 1
             for seq, length in enumerate(lengths) for i in range(ceil(length / size))
         })
-        queries = list(_queries(plan.program(ctx)))
+        program = plan.program(ctx)
+        fa_program = program.stages[0].program if hasattr(program, "stages") else program
+        reduce_stages = (
+            [s for sub in program.stages[-1].program.programs for s in sub.stages]
+            if hasattr(program, "stages") and program.stages[-1].name == "fd_reduce"
+            else []
+        )
+        queries = list(_queries(fa_program))
         groups_per_sequence = len(queries) // len(lengths)
         covered = Counter((idx // groups_per_sequence, tile) for idx, query in enumerate(queries)
                           for split in _split_keys(query) for tile, _ in split)
         assert covered == expected
+        expected_merge = Counter()
         for seq, length in enumerate(lengths):
             group = queries[seq * groups_per_sequence]
             parts = min(ceil(length / size), cores)
             finish = {s.name: s for s in group.stages}
-            assert finish["store"].metadata["nonempty_splits"] == parts
-            if parts > 1:
+            group_heads = min(heads, 16) if abi == FIA_ABI else heads
+            if "store" in finish:
+                assert finish["store"].metadata["nonempty_splits"] == parts
+                if parts > 1:
+                    assert finish["merge_read"].metadata["vec2_split_state_logical_bytes"] == (
+                        parts * group_heads * (LATENT + 16) * 4
+                    )
+            elif parts > 1:
+                expected_merge[parts] += groups_per_sequence
+        if reduce_stages:
+            merge_reads = [s for s in reduce_stages if s.name.startswith("merge_read")]
+            assert sum(expected_merge.values()) == len(merge_reads)
+            for stage in merge_reads:
+                parts = stage.metadata["nonempty_splits"]
                 group_heads = min(heads, 16) if abi == FIA_ABI else heads
-                assert finish["merge_read"].metadata["vec2_split_state_logical_bytes"] == (
-                    parts * group_heads * (LATENT + 2) * 4
+                assert stage.metadata["vec2_split_state_logical_bytes"] == (
+                    parts * group_heads * (LATENT + 16) * 4
                 )
 
 

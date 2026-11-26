@@ -55,7 +55,7 @@ POST_OP = replace(simple_op("post", "npu_hc_post_arch35"), family="hyper_connect
                   local_shape=(1, 4, 128), source_boundary="kernel")
 OPS = {
     rotary.register_family(): replace(simple_op("rotation", "rotary"), family="rotary", local_shape=(2, 8, 64)),
-    mla_prolog.register_family(): mla_prolog.make_op(op_id="prolog", tokens=2, hidden_size=1024, num_heads=8, weight_quant_mode=0),
+    mla_prolog.register_family(): mla_prolog.make_op(op_id="prolog", tokens=2, hidden_size=1024, num_heads=8, weight_quant_mode=0, kv_cache_quant_mode=0),
     paged_mla.register_family(): paged_mla.make_op(sequences=((1, 128),), logical_heads=16, physical_heads=16),
     attention.register_family(): attention.make_attention_op(
         attention.AttentionContract(1, 8, 1, 128, 128, sequences=((1, 128),)), op_id="attention"),

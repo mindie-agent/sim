@@ -162,7 +162,7 @@ def test_quant_fixpipe_aligns_m_and_switches_nd_width(abi, rows, columns):
 ])
 def test_quant_fixpipe_aligns_live_queries_inside_each_request(queries, batches, topk, padded_queries):
     op = _scorer(QLI, rows=65, cache_dtype="int8", index_heads=64,
-                 query_tokens=queries, batch_size=batches, topk_items=topk)
+                 query_tokens=queries, batch_size=batches, topk_items=topk, causal=False)
     plan = scorer.build(op, _geometry())
     transfers = [stage.work["fixpipe"] for stage in _conserved(plan, op) if stage.name == "score_handoff"]
     assert sorted(transfers) == sorted(rows * 64 * 128 * 4 for rows in padded_queries)
@@ -342,8 +342,9 @@ def test_block_score_stride_and_head_pooling_are_independent_of_s2_partitions(si
                                             return_choice=0, s2_splits=2)
     op = scorer.make_indexer_op(contract)
     stages = _conserved(scorer.build(op, _geometry()), op)
+    causal_pairs = sum(129 - i for i in range(3))
     assert sum(s.work.get("vector", 0) for s in stages if s.name == "head_maxima") == (
-        3 * 129 * (16 - 1) if size == 16 else 0)
+        causal_pairs * (16 - 1) if size == 16 else 0)
     heads = 1 if size == 16 else 16
     assert op.padded_shape == (heads, 3, 16)
     assert sum(s.work.get("mte3", 0) for s in stages) == heads * 3 * 16 * 4
@@ -382,7 +383,7 @@ def test_membase_datapath_rejects_register_only_abis(abi):
 @pytest.mark.parametrize("ratio", (2, 4, 8))
 def test_compressed_causal_partitions_conserve_matrix_and_selection_work(rows, context, ratio):
     lengths = Counter((context + q + 1) // ratio for q in range(rows))
-    ops = [_scorer(LIGHTNING, count, query_tokens=queries) for count, queries in lengths.items()]
+    ops = [_scorer(LIGHTNING, count, query_tokens=queries, causal=False) for count, queries in lengths.items()]
     expected_pairs = sum((context + q + 1) // ratio for q in range(rows))
     assert sum(op.flops for op in ops) == 2 * expected_pairs * 4 * 128
     for op in ops[:1] + ops[-1:]:
@@ -438,7 +439,8 @@ def test_empty_quant_scan_only_services_sentinel_outputs(queries):
 
 def test_packed_prolog_cache_retains_group_scale_and_rope_payload():
     op = mla_prolog.make_op(op_id="projection", tokens=8, hidden_size=4096, num_heads=8,
-                            q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, tile_size=128)
+                            q_lora_rank=1536, kv_lora_rank=512, qk_rope_head_dim=64, tile_size=128,
+                            kv_cache_quant_mode=3)
     contract = mla_prolog.validate_contract(op)
     assert contract.kv_row_bytes == 512 + 2 * 64 + 4 * (512 // 128)
     plan = mla_prolog.build(op, _geometry())
@@ -532,7 +534,7 @@ def test_indexed_reader_matches_expanded_matrix_program(shape, panels, slots):
     assert sum(template.indexed_panels for template in templates) == panels
     if shape[2] == 160:
         assert tuple(sum(getattr(t, field) for t in templates)
-                     for field in ("phase_objects", "stage_objects", "tile_factory_calls")) == (6, 18, 6)
+                     for field in ("phase_objects", "stage_objects", "tile_factory_calls")) == (6, 24, 6)
         for owner, (template, pipe) in enumerate(zip(templates, expanded.programs, strict=True)):
             reference = pipe.template(owner=owner, panels_per_output=5, k_tail=False)
             for i in range(template.tiles):
