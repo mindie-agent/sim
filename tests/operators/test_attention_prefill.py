@@ -777,3 +777,158 @@ def test_partitioned_native_prefill_keeps_split_reduction_and_zero_core_guard():
     idle = _partition_halves(geom_a3, aux_aic=0)["aux"]
     with pytest.raises(ModelingError, match="stream_zero_aic_budget:.*:gqa_prefill"):
         _run_partitioned_prefill(geom_a3, op_cur, StagedGQAPrefill(query_tile=tile, key_tile=tile), idle)
+
+
+def test_attention_contract_idle_io_floor_noncausal_band_and_pcp_spans():
+    from mindie_sim.catalog.context_parallel import pcp_rank_chunk_ranges
+    from mindie_sim.prediction.operators.attention.attention_prefill import StagedGQAPrefill
+
+    g_a5 = Geometry.from_devices(sku_case(REPRESENTATIVE_SKUS["a5"]).machine.dies)
+    # Zero-query idle sequence contributes zero KV bytes to the minimum-IO lower bound.
+    c_idle = governed.AttentionContract(1, 1, 1, 64, 64, sequences=((0, 128), (1, 1)), batch_size=2, causal=True)
+    op_idle = governed.make_attention_op(c_idle, op_id="active")
+    assert int(op_idle.hbm_bytes) == int(governed.build(op_idle, g_a5).work.resources["hbm"]) == 512
+
+    # Noncausal sliding-window attention admits symmetric |q - k| < W band clipped at boundaries.
+    n_tok, win, head_d = 128, 8, 64
+    c_band = governed.AttentionContract(
+        n_tok, 1, 1, head_d, head_d, sequences=((n_tok, n_tok),), phase="prefill",
+        causal=False, window_size=win,
+    )
+    op_band = governed.make_attention_op(c_band, op_id="band")
+    expected_pairs = sum(abs(q - k) < win for q in range(n_tok) for k in range(n_tok))
+    assert int(op_band.flops) == 2 * expected_pairs * (head_d + head_d)
+
+    # Both governed FIA and StagedGQAPrefill preserve global PCP query positions across all lanes.
+    c_pcp = dense_case(layers=1, dp=4)
+    p4 = replace(c_pcp.runtime.parallel, dp=1, pcp=4, cp_plan="auto")
+    rt4 = replace(c_pcp.runtime, parallel=p4)
+    total_native = total_staged = 0
+    for lane in range(4):
+        vs, n_loc, _ = Frontend.partition_views((RequestView("r", 128, 0, True, "prefill"),), rt4, 128, lane=lane)
+        ops_p = gqa(
+            prefix="x", plan=c_pcp.model.layer_plans[0], views=vs, stage=0, deps="in",
+            model=c_pcp.model, parallel=p4, quant=c_pcp.model.quant, mode="prefill",
+            padded_tokens=n_loc, runtime=rt4, machine=c_pcp.machine,
+        ).ops
+        op_p = next(x for x in ops_p if x.family == "attention")
+        lane_exp = 4 * sum(i + 1 for lo, hi in vs[0].query_ranges for i in range(lo, hi))
+        lane_staged = StagedGQAPrefill().report(op_p, cores=1)["logical_pairs"]
+        ac = governed.AttentionContract(n_loc, 4, 2, 16, 16, sequences=((n_loc, 128),), phase="prefill", causal=True)
+        lane_native = governed.build(governed.make_attention_op(ac, op_id="a", requests=("r",)), replace(g_a5, requests=vs)).metadata["useful_flops"] // 64
+        assert lane_native == lane_staged == lane_exp
+        total_native += lane_native
+        total_staged += lane_staged
+    assert total_native == total_staged == 4 * (128 * 129 // 2)
+
+    # Ragged PCP batch with one zero-row non-padding member plans live pairs without raising.
+    rag_views = tuple(
+        RequestView(
+            name, sum(b - a for a, b in pcp_rank_chunk_ranges(length, 2, 1)), 0, True, "prefill",
+            global_q_len=length, query_ranges=pcp_rank_chunk_ranges(length, 2, 1),
+        )
+        for name, length in (("a", 1), ("b", 4))
+    )
+    c_rag = governed.AttentionContract(
+        2, 1, 1, 64, 64, sequences=tuple((v.q_len, v.kv_len) for v in rag_views),
+        batch_size=2, phase="prefill", causal=True,
+    )
+    p_rag = governed.build(governed.make_attention_op(c_rag, op_id="rag", requests=("a", "b")), replace(g_a5, requests=rag_views))
+    assert p_rag.metadata["useful_flops"] // (2 * (64 + 64)) == 5
+
+    # Overlapping PCP sliding windows merge distinct KV rows in the HBM lower bound (95, not 126).
+    c_ov = governed.AttentionContract(
+        64, 1, 1, 64, 64, sequences=((64, 256),), phase="prefill", causal=True,
+        window_size=32, sequence_query_spans=(((160, 192), (192, 224)),),
+    )
+    op_ov = governed.make_attention_op(c_ov, op_id="overlap")
+    assert int(op_ov.hbm_bytes) == (64 * 64 + 64 * 64 + 95 * 2 * 64) * 2
+
+    # Physical padding requests carrying query_ranges do not invalidate live PCP prefill spans.
+    pad_views = (
+        RequestView("real", 2, 0, True, "prefill", global_q_len=4, query_ranges=((0, 1), (3, 4))),
+        RequestView("pad", 1, 0, False, "prefill", padding=True, query_ranges=((0, 1),)),
+    )
+    c_pad = governed.AttentionContract(2, 1, 1, 64, 64, sequences=((2, 4), (0, 0)), batch_size=2, phase="prefill", causal=True)
+    p_pad = governed.build(governed.make_attention_op(c_pad, op_id="pad_pcp", requests=("real", "pad")), replace(g_a5, requests=pad_views))
+    assert p_pad.metadata["useful_flops"] // (2 * 128) == 5
+
+    # Cacheless PCP prefill publishes an explicit empty persistent access ledger.
+    plan_cl = replace(c_pcp.model.layer_plans[0], cache_kind="none")
+    m_cl = replace(c_pcp.model, layer_plans=(plan_cl,))
+    vs_cl, n_cl, _ = Frontend.partition_views((RequestView("r", 8, 0, True, "prefill"),), rt4, 8, lane=0)
+    ops_cl = gqa(
+        prefix="cl", plan=plan_cl, views=vs_cl, stage=0, deps="in",
+        model=m_cl, parallel=p4, quant=m_cl.quant, mode="prefill",
+        padded_tokens=n_cl, runtime=rt4, machine=c_pcp.machine,
+    ).ops
+    assert dict(next(o for o in ops_cl if o.family == "attention").metadata).get("memory_accesses") == ()
+
+
+def test_gqa_headwise_packed_gate_shared_kv_transfer_and_pcp_kv_gather():
+    from _support.hf_configs import config as hf_config, run_case
+    from _support.memory_cases import case as mem_case
+
+    # Packed headwise Q+gate keeps 1 gate scalar per head in layout pitch, V offset, and gate I/O.
+    r_gate = mem_case(prompt=2)
+    r_gate["machine"] = {"backend": "ascend", "sku": REPRESENTATIVE_SKUS["a2"], "num_devices": 1}
+    plan_gate = dense_layer(0, qk_norm=True, q_output_gate_kind="headwise", q_gate_projection="packed_q", head_dim=8)
+    r_gate["model"].update(layers=1, layer_plans=[plan_gate.to_dict()])
+    ops_gate = target_operators(r_gate, phase="prefill", tokens=2)
+    qkv = next(o for o in ops_gate if o.op_id.endswith(".qkv"))
+    val = next(o for o in ops_gate if o.op_id.endswith(".qkv.value"))
+    gate_copy = next(o for o in ops_gate if o.op_id.endswith(".qkv.gate"))
+    out_gate = next(o for o in ops_gate if o.op_id.endswith(".output_gate"))
+    val_layout = dict(val.metadata)["source_layout"]
+    assert (val_layout["strides"][0], val_layout["offset"], int(gate_copy.mte3_bytes)) == (qkv.semantic_shape[1], 4 * 8 + 4 + 2 * 8, 2 * 4 * 2)
+    assert int(out_gate.mte2_bytes) == (2 * 4 * 8 + 2 * 4) * 2
+
+    # Separate gate projection sizes g_proj/g_sigmoid/output_gate to heads*v_width for elementwise vs heads for headwise.
+    for kind, expected_gate_n in (("elementwise", 4 * 8), ("headwise", 4)):
+        r_sep = mem_case(prompt=2)
+        r_sep["machine"] = {"backend": "ascend", "sku": REPRESENTATIVE_SKUS["a2"], "num_devices": 1}
+        plan_sep = dense_layer(0, q_output_gate=True, q_output_gate_kind=kind, q_gate_projection="separate", head_dim=8)
+        r_sep["model"].update(layers=1, layer_plans=[plan_sep.to_dict()])
+        ops_sep = target_operators(r_sep, phase="prefill", tokens=2)
+        g_proj = next(o for o in ops_sep if o.op_id.endswith(".g_proj"))
+        g_sig = next(o for o in ops_sep if o.op_id.endswith(".g_sigmoid"))
+        g_apply = next(o for o in ops_sep if o.op_id.endswith(".output_gate"))
+        assert g_proj.semantic_shape[1] == expected_gate_n
+        assert g_sig.semantic_shape == (2, expected_gate_n)
+        assert int(g_apply.mte2_bytes) == 2 * 4 * 8 * 2 + 2 * expected_gate_n * 4
+
+    # Cross-stage shared KV transfer matches packed producer cache format row bytes.
+    fmt = {"dtype": "int8", "group_size": 32, "scale_dtype": "fp32"}
+    r_pp = run_case(
+        {"hf_config": hf_config(kv_source_layer_ids=[0, 0]), "metadata": {"cache_representations": {"gqa_kv": fmt}}},
+        pp=2, prompt=8,
+    )
+    r_pp["machine"] = {"backend": "ascend", "sku": REPRESENTATIVE_SKUS["a2"], "num_devices": 2}
+    ops_pp = target_graphs(r_pp, phase="prefill", tokens=8)[0]
+    xfer = next(o for o in ops_pp if o.recipe == "shared_kv_transfer")
+    producer = next(o for o in ops_pp if o.op_id == xfer.deps[0])
+    assert int(xfer.link_bytes) == int(producer.mte3_bytes) == 8 * (32 + 4)
+
+    # PCP KV all-gather bills uniform padded peer rows rather than fractional global_q / pcp.
+    c_p2 = dense_case(layers=1, dp=2)
+    p2 = replace(c_p2.runtime.parallel, dp=1, pcp=2, cp_plan="auto")
+    rt2 = replace(c_p2.runtime, parallel=p2)
+    vs2, n2, _ = Frontend.partition_views((RequestView("r", 1, 0, True, "prefill"),), rt2, 1, lane=0)
+    ops_p2 = gqa(
+        prefix="a", plan=c_p2.model.layer_plans[0], views=vs2, stage=0, deps="in",
+        model=c_p2.model, parallel=p2, quant=c_p2.model.quant, mode="prefill",
+        padded_tokens=n2, machine=c_p2.machine, runtime=rt2,
+    ).ops
+    gather = next(x for x in ops_p2 if x.recipe == "pcp_kv_gather")
+    assert int(gather.link_bytes) == n2 * 2 * c_p2.model.num_kv_heads * c_p2.model.head_dim * 2
+
+
+def test_chunked_mla_prefill_emits_kv_b_over_cached_and_current_rows():
+    c = compose_case(
+        "deepseek-v2-lite", hardware="a2", layers=1, tp=1, dp=1, ep=1,
+        num_devices=1, prompt_tokens=40, output_tokens=1, va_recommended=False,
+    )
+    for ctx in (0, 32):
+        ops = target_operators(c, phase="prefill", tokens=8, context=ctx)
+        kv_b_flops = sum(int(o.flops) for o in ops if o.op_id.endswith(".kv_b"))
+        assert kv_b_flops == 2 * (ctx + 8) * 512 * 16 * (128 + 128)

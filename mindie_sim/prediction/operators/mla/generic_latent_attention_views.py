@@ -83,19 +83,40 @@ BF16_OPERAND_FORMAT = "bf16"
 BF16_INDEXER_NATIVE_KIND = "npu_lightning_indexer"
 
 
-def index_operands_quantized(quant, model=None):
+def _index_k_owner_plan(model, plan):
+    """Resolve the owning layer plan for ``index_k`` when a layer shares another layer's cache."""
+    if plan is None:
+        return None
+    owner_id = int(getattr(plan, "index_k_owner_layer_id", -1))
+    layer_plans = getattr(model, "layer_plans", ()) or ()
+    if 0 <= owner_id < len(layer_plans):
+        return layer_plans[owner_id]
+    return plan
+
+
+def _resolve_index_phase(phase, views=()):
+    """Resolve ``mixed`` batch phase to the active request phase when uniform."""
+    if phase == "mixed" and views:
+        phases = {getattr(v, "phase", None) for v in views if getattr(v, "phase", None)}
+        if len(phases) == 1:
+            return next(iter(phases))
+        if "decode" in phases:
+            return "decode"
+    return phase
+
+
+def index_operands_quantized(quant, model=None, *, plan=None, phase=None):
     """True ONLY when index_q / index_k operands are actually quantized.
 
     An unquantized BF16/FP16 index_k / index_q pair must dispatch to
     ``npu_lightning_indexer`` (not ``aclnnQuantLightningIndexerV2``), even
     when the surrounding model weights or main KV cache are quantized.
     """
-    if model is not None:
-        raw = dict(getattr(model, "metadata", ())).get("cache_representations", {})
-        if "index_k" in raw:
-            fmt = str((raw["index_k"] or {}).get("dtype") or "").strip().lower()
-            if fmt:
-                return fmt not in UNQUANTIZED_INDEX_DTYPES
+    owner_plan = _index_k_owner_plan(model, plan)
+    if model is not None and _has_declared_index_k(model, plan=owner_plan, phase=phase):
+        fmt = str(index_cache_format(model, plan=owner_plan, phase=phase).dtype or "").strip().lower()
+        if fmt:
+            return fmt not in UNQUANTIZED_INDEX_DTYPES
     index_dtype = str(getattr(quant, "index_dtype", "") or "").strip().lower()
     return bool(index_dtype) and index_dtype not in UNQUANTIZED_INDEX_DTYPES
 
@@ -117,13 +138,14 @@ def stack_compressor_kind(model, plan):
 
 def _has_declared_index_k(model, *, plan=None, phase=None) -> bool:
     meta = dict(getattr(model, "metadata", ()) or ())
+    owner_plan = _index_k_owner_plan(model, plan)
     keys = (f"index_k:{phase}", "index_k") if phase else ("index_k",)
-    if plan is not None:
+    if owner_plan is not None:
         per_layer = meta.get("layer_cache_representations")
         if isinstance(per_layer, Mapping):
-            layer_map = per_layer.get(str(plan.index))
+            layer_map = per_layer.get(str(owner_plan.index))
             if layer_map is None:
-                layer_map = per_layer.get(plan.index)
+                layer_map = per_layer.get(owner_plan.index)
             if isinstance(layer_map, Mapping) and any(layer_map.get(k) is not None for k in keys):
                 return True
     global_regions = meta.get("cache_representations")
@@ -137,8 +159,9 @@ def index_cache_format(model, *, plan=None, phase=None):
     declare one, the fallback is the declared *indexer* dtype, never the
     attention KV dtype: those are separate cache regions of the same case.
     """
-    if _has_declared_index_k(model, plan=plan, phase=phase):
-        return cache_format(model, "index_k", plan=plan, phase=phase)
+    owner_plan = _index_k_owner_plan(model, plan)
+    if _has_declared_index_k(model, plan=owner_plan, phase=phase):
+        return cache_format(model, "index_k", plan=owner_plan, phase=phase)
     declared = str(getattr(getattr(model, "quant", None), "index_dtype", "") or "int8")
     return CacheFormat(declared)
 
@@ -152,6 +175,11 @@ def index_arithmetic_dtype(model, quant, *, plan=None, phase=None):
     """Logical indexer arithmetic dtype, distinct from packed row storage."""
     if index_cache_is_packed(model, plan=plan, phase=phase):
         return PACKED_INDEX_ARITHMETIC_DTYPE
+    owner_plan = _index_k_owner_plan(model, plan)
+    if model is not None and _has_declared_index_k(model, plan=owner_plan, phase=phase):
+        declared = str(index_cache_format(model, plan=owner_plan, phase=phase).dtype or "").strip().lower()
+        if declared:
+            return declared
     return quant.index_dtype
 
 
@@ -260,8 +288,16 @@ def _compressed_causal_pairs_by_rank(parts, compression, eff_cp, interleave):
     return totals
 
 
-def _index_owner_rows(tokens, compression, cp, interleave):
+def _index_owner_rows(tokens, compression, cp, interleave, *, rank_candidates=None):
     degree = max(INDEX_IDENTITY_COMPRESSION, int(cp))
+    if rank_candidates is not None:
+        ranks = tuple(int(r) for r in rank_candidates if 0 <= int(r) < degree)
+        if not ranks:
+            return INDEX_NO_ROWS
+        return max(
+            _owned_completed_rows_for_rank(tokens, compression, degree, interleave, rank)
+            for rank in ranks
+        )
     return max(
         _owned_completed_rows_for_rank(tokens, compression, degree, interleave, rank)
         for rank in range(degree)
@@ -271,7 +307,8 @@ def _index_owner_rows(tokens, compression, cp, interleave):
 def index_key_window(parts, *, query_tile=INDEX_QUERY_TILE, noncausal=False,
                      kv_len=None, cp=INDEX_IDENTITY_COMPRESSION,
                      interleave=INDEX_QUERY_TILE,
-                     compression=INDEX_IDENTITY_COMPRESSION):
+                     compression=INDEX_IDENTITY_COMPRESSION,
+                     rank_candidates=None):
     """Union rows and per-query-tile refills in compressed, rank-owned rows."""
     tile = max(INDEX_IDENTITY_COMPRESSION, int(query_tile))
     union_rows = refill_rows = INDEX_NO_ROWS
@@ -282,7 +319,8 @@ def index_key_window(parts, *, query_tile=INDEX_QUERY_TILE, noncausal=False,
             horizon = int(context) + (query if noncausal else end)
             if kv_len is not None:
                 horizon = int(kv_len) if noncausal else min(horizon, int(kv_len))
-            owner_rows = _index_owner_rows(horizon, compression, int(cp), interleave)
+            owner_rows = _index_owner_rows(
+                horizon, compression, int(cp), interleave, rank_candidates=rank_candidates)
             union_rows = max(union_rows, owner_rows)
             refill_rows += owner_rows
     return union_rows, refill_rows
@@ -292,7 +330,8 @@ def unique_index_key_rows(views, *, query_tile=INDEX_QUERY_TILE, noncausal=False
                           cp=INDEX_IDENTITY_COMPRESSION,
                           interleave=INDEX_QUERY_TILE,
                           compression=INDEX_IDENTITY_COMPRESSION, share_prefix=True,
-                          prefix_block_size: int | None = None):
+                          prefix_block_size: int | None = None,
+                          rank_candidates=None):
     """Deduplicate HBM prefixes only; private suffixes and tile refills add.
 
     Aligns raw prefix once using ``prefix_block_size`` (falling back to
@@ -308,14 +347,15 @@ def unique_index_key_rows(views, *, query_tile=INDEX_QUERY_TILE, noncausal=False
         union_rows, view_refills = index_key_window(
             visible_parts(view), query_tile=query_tile, noncausal=noncausal,
             kv_len=view.kv_len, cp=cp, interleave=interleave,
-            compression=compression)
+            compression=compression, rank_candidates=rank_candidates)
         refills += view_refills
         prefix = min(int(getattr(view, "prefix_tokens", INDEX_NO_ROWS)
                          or INDEX_NO_ROWS),
                      int(view.context)) if share_prefix else INDEX_NO_ROWS
         prefix = (max(INDEX_NO_ROWS, prefix) // align_block) * align_block
         shared = min(union_rows,
-                     _index_owner_rows(prefix, compression, cp, interleave))
+                     _index_owner_rows(
+                         prefix, compression, cp, interleave, rank_candidates=rank_candidates))
         key = str(getattr(view, "prefix_key", "")
                   or getattr(view, "prefix_cache_key", ""))
         groups[key] = max(groups.get(key, INDEX_NO_ROWS), shared)
@@ -334,7 +374,7 @@ def _prefix_reuse_meta(private_rows, hbm_rows, refill_rows, row_b, divisor, *, i
     )
 
 
-def _resolve_native_indexer_mode(runtime, machine, quant, model) -> tuple[bool, bool]:
+def _resolve_native_indexer_mode(runtime, machine, quant, model, *, plan=None, phase=None) -> tuple[bool, bool]:
     if runtime is None:
         return False, False
     # Imported lazily: the epilog module imports this builder for the
@@ -349,13 +389,14 @@ def _resolve_native_indexer_mode(runtime, machine, quant, model) -> tuple[bool, 
                        and not claimed_role
                        and select(lowerings, "lightning_indexer") is None
                        and select(lowerings, "quant_lightning_indexer") is None)
-    return native_eligible, index_operands_quantized(quant, model)
+    return native_eligible, index_operands_quantized(quant, model, plan=plan, phase=phase)
 
 
 def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                             shard, prefix, padded_tokens, runtime=None,
                             score_rows=None, l2_bytes=None, machine=None,
-                            cp_interleave_size=None):
+                            cp_interleave_size=None, rank_candidates=None,
+                            sharded_dcp=None):
     """[Cohesive-Pipeline] Declare the indexer score/TopK pair with local sharded row accounting."""
     valid = sum(view.q_len for view in views)
     cand_window = (
@@ -389,10 +430,15 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
     rows = max(float(EMPTY_INDEX_ROWS), float(score_rows)) if local \
         else float(sum(pairs_by_view))
     divisor = 1 if local else max(1, int(shard))
-    row_b = index_row_bytes(model, plan.index_dim)
+    sel_phase = _resolve_index_phase(b.common.get("phase"), views)
+    owner_plan = _index_k_owner_plan(model, plan)
+    row_b = index_row_bytes(model, plan.index_dim, plan=owner_plan, phase=sel_phase)
     # External HBM is the physical union of the tile key sets (deduplicated
     # only across a shared prefix); MTE2 keeps each tile's fetch service.
-    cp = int(parallel.cp) if local else INDEX_IDENTITY_COMPRESSION
+    cp = (
+        int(sharded_dcp) if (local and sharded_dcp is not None)
+        else (int(parallel.cp) if local else INDEX_IDENTITY_COMPRESSION)
+    )
     cfg_fam = runtime.kernels.get("families", {}) if runtime else {}
     cfg_rec = runtime.kernels.get("recipes", {}) if runtime else {}
     pinned = "indexer" in cfg_fam or "index_scores" in cfg_rec
@@ -400,7 +446,8 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                     and runtime.prefix_read_mode != "per_sequence" and not pinned)
     read_args = dict(noncausal=bool(plan.noncausal_attention), cp=cp,
                      interleave=eff_interleave, compression=ratio,
-                     prefix_block_size=block_size)
+                     prefix_block_size=block_size,
+                     rank_candidates=(rank_candidates if local else None))
     private_rows, refill_rows = unique_index_key_rows(
         views, share_prefix=False, **read_args)
     union_rows, _ = unique_index_key_rows(
@@ -411,9 +458,9 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
         if working > float(l2_bytes):
             spill = max(0.0, 1 - float(l2_bytes) / working)
             hbm_rows += max(0.0, float(refill_rows) - hbm_rows) * spill
-    native_fused, quantized_index = _resolve_native_indexer_mode(runtime, machine, quant, model)
-    sel_phase = b.common.get("phase")
-    packed_index = index_cache_is_packed(model, plan=plan, phase=sel_phase)
+    native_fused, quantized_index = _resolve_native_indexer_mode(
+        runtime, machine, quant, model, plan=owner_plan, phase=sel_phase)
+    packed_index = index_cache_is_packed(model, plan=owner_plan, phase=sel_phase)
     # Query and head-weight operands are real reads in both lowerings.
     by_id = {op.op_id: op for op in b.ops}
     operand_bytes = sum(float(by_id[dep].mte3_bytes)
@@ -423,7 +470,8 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
         str(dict(weight_op.metadata).get("output_format") or weight_op.dtype or "").strip().lower()
         if weight_op is not None else ""
     )
-    if native_fused and quantized_index and quant.index_dtype == "int8" and not packed_index:
+    arith_dtype = index_arithmetic_dtype(model, quant, plan=owner_plan, phase=sel_phase)
+    if native_fused and quantized_index and arith_dtype == "int8" and not packed_index:
         # quant_lightning_indexer_tiling.cpp:468-491 requires fp16 weights for INT8 Q/K.
         weight_dtype = "fp16"
     weight_meta = (("weight_dtype", weight_dtype),) if weight_dtype else ()
@@ -484,7 +532,7 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                     read=operand_bytes + float(refill_rows) * row_b / divisor,
                     hbm_read=operand_bytes + hbm_rows * row_b / divisor,
                     write=rows * FP32_BYTES / divisor, family="indexer",
-                    dtype=index_arithmetic_dtype(model, quant),
+                    dtype=index_arithmetic_dtype(model, quant, plan=plan, phase=sel_phase),
                     metadata=(("index_score_shards", max(MIN_INDEX_FACTOR, int(shard))),
                               ("index_context_partitions", cp),
                               ("index_candidate_filter", bool(plan.candidate_filter)),
@@ -649,11 +697,13 @@ def _merge_intervals(spans: list[tuple[int, int]]) -> list[tuple[int, int]]:
 
 def _causal_horizon(parts, view, plan) -> int:
     """Maximum KV position visible across this rank's owned query parts."""
+    if not parts:
+        return 0
     if plan.noncausal_attention:
         return int(view.kv_len)
     return max(
         (int(c_part) + int(q_part) for q_part, c_part in parts),
-        default=int(view.kv_len),
+        default=0,
     )
 
 
@@ -799,7 +849,10 @@ def _partition_sparse_view(
         else:
             v_pairs = [win_pairs[r] + p_split.per_rank[r] for r in range(eff_cp)]
     else:
-        v_rows = [owned_positions(0, max_horizon - 1, eff_cp, interleave, rank) for rank in range(eff_cp)]
+        v_rows = (
+            [owned_positions(0, max_horizon - 1, eff_cp, interleave, rank) for rank in range(eff_cp)]
+            if max_horizon > 0 else [0] * eff_cp
+        )
         v_pairs = [win_pairs[r] + p_split.per_rank[r] for r in range(eff_cp)]
     v_sweeps = [win_sweeps[r] + s_ints[r] for r in range(eff_cp)]
     v_shared = [0] * eff_cp
@@ -903,6 +956,8 @@ def _single_rank_view_rows(
     view, plan, parts, dense_unindexed, win_spans_single, eff_cp, query_tile, interleave,
 ):
     """Unique row counts for the single-CP or fallback branch."""
+    if not parts:
+        return [0] * eff_cp
     if dense_unindexed:
         return _window_unique_rows(win_spans_single, view, plan, eff_cp, interleave)
     if plan.cache_kind == "window_compressed":
@@ -922,10 +977,19 @@ def _single_rank_view_rows(
 
 def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block,
                           interleave, tp, dsa, topk_present, heads, latent_dim,
-                          shared_selection=None, runtime=None):
+                          shared_selection=None, runtime=None,
+                          dsa_rank: int | None = None,
+                          dsa_batch_tokens: int | None = None,
+                          dsa_token_offset: int = 0):
     """Per-view logical pairs, owned sweeps and batch row vectors."""
     context, query = view.context, view.q_len
-    parts = dsa_cp_prefill_parts(view, tp) if dsa else visible_parts(view)
+    parts = (
+        dsa_cp_prefill_parts(
+            view, tp, rank=dsa_rank,
+            batch_tokens=dsa_batch_tokens, token_offset=dsa_token_offset,
+        )
+        if dsa else visible_parts(view)
+    )
     eff_q = (sum(q_part for q_part, _ in parts)
              if dsa and view.phase == "prefill" else query)
     selected_rows = (shared_selection.rows_for(view.request_id)
@@ -1123,20 +1187,63 @@ def window_cache_read(plan, view, parts, sweeps, eff_cp, query_tile, elements, m
     return full / eff_cp
 
 
-def dsa_cp_prefill_parts(view, tp):
-    """Worst-rank prefill query span under DSA-CP query-token SP."""
+def _dsa_cp_batch_span(
+    q_len: int, context: int, total_q: int, token_offset: int, tp: int, rank: int,
+) -> tuple[tuple[int, int], ...]:
+    """Intersect rank's batch-flattened DSA-CP query interval with one request's token slice."""
+    g_lo, g_hi, _, _ = dsa_cp_token_ranges(total_q, tp, int(rank) % int(tp))
+    live_hi = min(int(g_hi), total_q)
+    lo = max(0, int(g_lo) - token_offset)
+    hi = min(q_len, live_hi - token_offset)
+    if hi <= lo:
+        return ()
+    return ((hi - lo, context + lo),)
+
+
+def worst_dsa_cp_rank(views, tp: int) -> int:
+    """Heaviest TP rank across the flattened DSA-CP prefill batch."""
+    if tp <= 1:
+        return 0
+    prefill = [v for v in views if v.phase == "prefill" and int(v.q_len) > 0]
+    total_q = sum(int(v.q_len) for v in prefill)
+    if total_q <= 0:
+        return 0
+    best_rank = 0
+    best_cost = -1
+    for cand in range(tp):
+        offset = 0
+        cost = 0
+        for view in prefill:
+            q_len = int(view.q_len)
+            for span_q, span_c in _dsa_cp_batch_span(q_len, int(view.context), total_q, offset, tp, cand):
+                cost += span_q * span_c + span_q * (span_q + 1) // 2
+            offset += q_len
+        if cost > best_cost:
+            best_cost, best_rank = cost, cand
+    return best_rank
+
+
+def dsa_cp_prefill_parts(
+    view, tp, *, rank: int | None = None, batch_tokens: int | None = None, token_offset: int = 0,
+):
+    """Rank-exact (or worst-rank) prefill query span under DSA-CP query-token SP."""
     if view.phase != "prefill" or tp <= 1 or view.q_len <= 0:
         return visible_parts(view)
+    q_len = int(view.q_len)
+    total_q = q_len if batch_tokens is None else max(q_len, int(batch_tokens))
+    offset = max(0, int(token_offset))
+    if rank is not None:
+        return _dsa_cp_batch_span(q_len, int(view.context), total_q, offset, tp, rank)
     best_parts = ()
     best_cost = -1
-    for rank in range(tp):
-        lo, hi, _, _ = dsa_cp_token_ranges(view.q_len, tp, rank)
-        if hi <= lo:
+    for cand in range(tp):
+        parts = _dsa_cp_batch_span(q_len, int(view.context), total_q, offset, tp, cand)
+        if not parts:
             continue
-        span_q, span_c = hi - lo, view.context + lo
+        span_q, span_c = parts[0]
         cost = span_q * span_c + span_q * (span_q + 1) // 2
         if cost > best_cost:
-            best_cost, best_parts = cost, ((span_q, span_c),)
+            best_cost, best_parts = cost, parts
     return best_parts
 
 
@@ -1279,8 +1386,60 @@ def owned_store_rows(
     return best
 
 
+def _add_sharded_view_rows(
+    per_rank: list[int], view, degree: int, block: int, ratio: int, *, noncausal: bool,
+) -> None:
+    parts = visible_parts(view)
+    q_total = sum(max(0, int(q_part)) for q_part, _ in parts)
+    if q_total <= 0:
+        return
+    if noncausal:
+        kv_len = max(0, int(view.kv_len))
+        if kv_len <= 0:
+            return
+        if degree <= 1:
+            rows = q_total * (kv_len if ratio == 1 else completed_rows(kv_len, ratio))
+            for rank in range(len(per_rank)):
+                per_rank[rank] += rows
+            return
+        for rank in range(degree):
+            owned = (
+                owned_positions(0, kv_len - 1, degree, block, rank)
+                if ratio == 1
+                else _owned_completed_rows_for_rank(kv_len, ratio, degree, block, rank)
+            )
+            per_rank[rank] += q_total * owned
+        return
+    for q_part, c_part in parts:
+        q_i, c_i = max(0, int(q_part)), max(0, int(c_part))
+        if q_i <= 0:
+            continue
+        if ratio == 1:
+            if degree <= 1:
+                rows = int(_causal_pairs(q_i, c_i, 0))
+                for rank in range(len(per_rank)):
+                    per_rank[rank] += rows
+            else:
+                split = split_causal_pairs(q_i, c_i, degree, block)
+                for rank in range(degree):
+                    per_rank[rank] += int(split.per_rank[rank])
+            continue
+        if degree <= 1:
+            rows = int(
+                _compressed_causal_pairs_prefix(c_i + q_i, ratio, 1, block, 0)
+                - _compressed_causal_pairs_prefix(c_i, ratio, 1, block, 0)
+            )
+            for rank in range(len(per_rank)):
+                per_rank[rank] += rows
+        else:
+            totals = _compressed_causal_pairs_by_rank(((q_i, c_i),), ratio, degree, block)
+            for rank in range(degree):
+                per_rank[rank] += int(totals[rank])
+
+
 def sharded_index_visible_rows(
     views, parallel, block, ratio, *, sharded_dcp=None, rank_candidates=None,
+    noncausal: bool = False,
 ):
     """Rank-exact (or worst-rank) visible index rows under a sharded indexer."""
     if sharded_dcp is not None:
@@ -1292,28 +1451,9 @@ def sharded_index_visible_rows(
     ratio = max(1, int(ratio))
     per_rank = [0] * max_degree
     for view, degree in zip(views, degrees):
-        q_len = max(0, int(view.q_len))
-        if q_len <= 0:
-            continue
-        if ratio == 1:
-            if degree <= 1:
-                rows = int(_causal_pairs(q_len, int(view.context), 0))
-                per_rank = [value + rows for value in per_rank]
-            else:
-                split = split_causal_pairs(q_len, int(view.context), degree, block)
-                for rank in range(degree):
-                    per_rank[rank] += int(split.per_rank[rank])
-            continue
-        for offset in range(q_len):
-            horizon = view.context + offset + 1
-            if completed_rows(horizon, ratio) <= 0:
-                continue
-            if degree <= 1:
-                per_rank = [value + completed_rows(horizon, ratio) for value in per_rank]
-            else:
-                for rank in range(degree):
-                    per_rank[rank] += _owned_completed_rows_for_rank(
-                        horizon, ratio, degree, block, rank)
+        _add_sharded_view_rows(
+            per_rank, view, degree, block, ratio, noncausal=bool(noncausal),
+        )
     if rank_candidates is not None:
         return max(
             (per_rank[int(r)] for r in rank_candidates if 0 <= int(r) < max_degree),

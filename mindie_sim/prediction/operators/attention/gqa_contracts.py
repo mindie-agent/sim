@@ -111,18 +111,23 @@ def _declare_ordinary_qk_norm_rope(ops, qkv, norm_ids, rope, views, dtype):
     )
 
 
-def _qkv_views(tokens, heads, kv_heads, width, has_gate, k_eq_v=False, *, v_width: int | None = None):
+def _qkv_views(
+    tokens, heads, kv_heads, width, has_gate, k_eq_v=False, *,
+    v_width: int | None = None, gate_width: int | None = None,
+):
     """Q and gate alternate by head; all slices retain the projected row pitch."""
     eff_v_width = width if v_width is None else int(v_width)
+    eff_gate_width = (width if gate_width is None else int(gate_width)) if has_gate else 0
     query, key = heads * width, kv_heads * width
     value = kv_heads * eff_v_width
-    gate = query if has_gate else 0
+    gate = heads * eff_gate_width if has_gate else 0
     pitch = query + gate + key + (0 if k_eq_v else value)
     storage = (tokens, pitch)
     val_dim = width if k_eq_v else eff_v_width
+    q_head_stride = width + eff_gate_width if has_gate else width
     views = {
         "query": TensorLayout(
-            (tokens, heads, width), (pitch, width * (2 if has_gate else 1), 1),
+            (tokens, heads, width), (pitch, q_head_stride, 1),
             storage_shape=storage),
         "key": TensorLayout(
             (tokens, kv_heads, width), (pitch, width, 1),
@@ -133,7 +138,7 @@ def _qkv_views(tokens, heads, kv_heads, width, has_gate, k_eq_v=False, *, v_widt
     }
     if has_gate:
         views["gate"] = TensorLayout(
-            (tokens, heads, width), (pitch, 2 * width, 1),
+            (tokens, heads, eff_gate_width), (pitch, q_head_stride, 1),
             offset=width, storage_shape=storage)
     return views
 
@@ -367,6 +372,28 @@ def _decode_contract(views, heads, kv_heads, width, model, quant, parallel, plan
     }),)
 
 
+def _prefill_request_spans(views) -> tuple[tuple[int, int], ...]:
+    """Expand per-view PCP ``query_ranges`` into ``(q_span, global_context)`` pairs."""
+    spans: list[tuple[int, int]] = []
+    for view in views:
+        q_len = int(view.logical_q_len)
+        if q_len <= 0:
+            spans.append((0, 0))
+            continue
+        context = int(view.context)
+        ranges = tuple(
+            (int(lo), int(hi))
+            for lo, hi in (getattr(view, "query_ranges", ()) or ())
+            if int(hi) > int(lo)
+        )
+        if ranges:
+            for lo, hi in ranges:
+                spans.append((hi - lo, context + lo))
+        else:
+            spans.append((q_len, context))
+    return tuple(spans)
+
+
 def _prefill_contract(views, heads, kv_heads, width, model, quant, parallel, plan, mode, *, window=None, cp=None):
     """Declare per-request prefill geometry; the explicit recipe validates it."""
     if plan.cache_kind != "none" and mode not in {"prefill", "draft_prefill"}:
@@ -375,10 +402,7 @@ def _prefill_contract(views, heads, kv_heads, width, model, quant, parallel, pla
     eff_cp = int(parallel.cp) if cp is None else int(cp)
     v_width = int(getattr(plan, "v_head_dim", 0) or width)
     return (("gqa_prefill", {
-        "requests": tuple(
-            (int(view.logical_q_len), int(view.context) if int(view.logical_q_len) > 0 else 0)
-            for view in views
-        ),
+        "requests": _prefill_request_spans(views),
         "query_heads": heads, "kv_heads": kv_heads, "head_dim": width, "v_head_dim": v_width,
         "query_dtype": model.activation_dtype, "kv_dtype": quant.kv_dtype,
         "causal": not plan.noncausal_attention, "window": eff_win, "cp": eff_cp,
@@ -661,7 +685,9 @@ def gqa_kv_memory_accesses(
     sparse Top-K selection bounds and shared-prefix deduplication while excluding
     padding views and current-token ``cache_store`` writes ``[context, context + q)``.
     """
-    if cacheless or not views or kv_heads <= 0 or width <= 0 or v_width <= 0:
+    if cacheless:
+        return (("memory_accesses", ()),)
+    if not views or kv_heads <= 0 or width <= 0 or v_width <= 0:
         return ()
     if shared_format:
         planes = (("gqa_kv", float(key_fmt.row_bytes(kv_heads * (width + v_width)))),)

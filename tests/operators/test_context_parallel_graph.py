@@ -552,3 +552,130 @@ def test_kda_gdn_pcp_contracts_and_pcp_o_proj_weight_sharding():
     out_gemm = next(op for op in g_tok[0] if op.recipe == "output")
     out_rs = next(op for op in g_tok[0] if op.recipe == "pcp_o_proj_reduce_scatter")
     assert out_ag.link_bytes == 131_072 and out_gemm.local_shape[0] == 8 and out_rs.link_bytes == 57_344
+
+
+def test_dsa_cp_rank_exact_prefill_and_sharded_indexer_pcp_noncausal_empty_shard_and_scoped_format():
+    from _support.memory_cases import sparse_mla_case
+    from mindie_sim.catalog.cache import index_row_bytes
+
+    # DSA-CP respects explicit physical rank and excludes padded tail tokens from causal pairs.
+    for n_tok in (1, 4):
+        r_dsa = sparse_mla_case(context_tokens=n_tok, tp=2)
+        r_dsa["runtime"].update(cp_plan="dsa_cp", enable_dsa_cp=True)
+        counts = []
+        for rank in (0, 1):
+            ops = target_operators(r_dsa, phase="prefill", tokens=n_tok, physical_rank=rank)
+            attn = next(o for o in ops if o.layer == 0 and "latent_attention" in o.op_id)
+            counts.append(int(dict(attn.metadata)["logical_pairs"]))
+        span = (n_tok + 1) // 2
+        expected = [sum(q + 1 for q in range(rank * span, min(n_tok, (rank + 1) * span))) for rank in (0, 1)]
+        assert counts == expected
+
+    # Sharded indexer preserves absolute PCP query_ranges on causal prefill.
+    r_pcp = sparse_mla_case(context_tokens=8)
+    r_pcp["machine"]["num_devices"] = 2
+    r_pcp["runtime"].update(
+        pcp=2, dcp=2,
+        metadata={"enable_sfa_dcp_sharded_indexer": True, "cp_kv_cache_interleave_size": 1},
+    )
+    ops_pcp = target_operators(r_pcp, phase="prefill", tokens=8, physical_rank=1)
+    ix_pcp = next(o for o in ops_pcp if o.layer == 0 and o.family == "indexer")
+    assert int(ix_pcp.flops) // (2 * 32 * 128) == sum(k <= q for q in (2, 3, 4, 5) for k in (1, 3, 5, 7))
+
+    # Noncausal sharded index scoring conserves full Q * KV pairs across DCP degrees.
+    for degree in (1, 2):
+        r_nc = sparse_mla_case(context_tokens=8, tp=degree)
+        r_nc["model"]["layer_plans"][0]["noncausal_attention"] = True
+        r_nc["runtime"].update(
+            dcp=degree,
+            metadata={"enable_sfa_dcp_sharded_indexer": True, "cp_kv_cache_interleave_size": 1},
+        )
+        rank_pairs = []
+        for rank in range(degree):
+            ops_nc = target_operators(r_nc, phase="prefill", tokens=8, physical_rank=rank)
+            ix_nc = next(o for o in ops_nc if o.layer == 0 and o.family == "indexer")
+            rank_pairs.append(int(ix_nc.flops) // (2 * 32 * 128))
+        assert sum(rank_pairs) == 8 * 8
+
+    # An empty DCP index shard incurs zero score FLOPs and zero index-cache MTE2/HBM reads.
+    r_empty = sparse_mla_case(context_tokens=65, tp=2)
+    r_empty["runtime"].update(
+        dcp=2,
+        metadata={"enable_sfa_dcp_sharded_indexer": True, "cp_kv_cache_interleave_size": 128},
+    )
+    ops_empty = target_operators(r_empty, phase="decode", tokens=1, context=64, physical_rank=1)
+    ix_empty = next(o for o in ops_empty if o.layer == 0 and o.family == "indexer")
+    by_empty = {o.op_id: o for o in ops_empty}
+    input_bytes = sum(by_empty[d].mte3_bytes for d in ix_empty.deps[:2])
+    assert int(ix_empty.flops) == 0
+    assert int(ix_empty.mte2_bytes - input_bytes) == 0
+    assert int(ix_empty.hbm_bytes - ix_empty.mte3_bytes - input_bytes) == 0
+
+    # Layer- and phase-scoped index_k representation governs both decode writes and reads.
+    r_scoped = sparse_mla_case(context_tokens=65)
+    fmt_scoped = {"dtype": "uint8", "packed_elements": 2, "group_size": 32, "scale_dtype": "fp8_e8m0"}
+    r_scoped["model"]["metadata"] = {"layer_cache_representations": {"0": {"index_k:decode": fmt_scoped}}}
+    c_scoped = parse_case(r_scoped)
+    ops_scoped = target_operators(c_scoped, phase="decode", tokens=1, context=64)
+    ix_scoped = next(o for o in ops_scoped if o.layer == 0 and o.family == "indexer")
+    by_scoped = {o.op_id: o for o in ops_scoped}
+    read_keys = ix_scoped.mte2_bytes - sum(by_scoped[d].mte3_bytes for d in ix_scoped.deps[:2])
+    row_b = index_row_bytes(c_scoped.model, 128, plan=c_scoped.model.layer_plans[0], phase="decode")
+    stored = sum(
+        o.mte3_bytes for o in ops_scoped
+        if o.layer == 0 and o.op_id.endswith((".index_store", ".index_scale_store"))
+    )
+    assert (int(stored), int(read_keys)) == (int(row_b), 65 * int(row_b)) == (68, 4420)
+
+    # Multi-request DSA-CP partitions the flattened batch once, and chunked DCP MLA orders kv_b after kv gather.
+    from mindie_sim.prediction.operators.mla.mla import mla
+
+    r_flat = sparse_mla_case(context_tokens=65, tp=2)
+    r_flat["runtime"].update(cp_plan="dsa_cp", enable_dsa_cp=True)
+    c_flat = parse_case(r_flat)
+    flat_views = (RequestView("a", 1, 0, True, "prefill"), RequestView("b", 1, 64, True, "prefill"))
+    flat_pairs = []
+    for rank in (0, 1):
+        res_f = mla(
+            prefix="l0", plan=c_flat.model.layer_plans[0], views=flat_views, stage=0, deps="in",
+            model=c_flat.model, parallel=c_flat.runtime.parallel, quant=c_flat.model.quant,
+            mode="prefill", padded_tokens=2, cache_ids={}, topk_ids={}, index_cache_ids={},
+            candidate_ids={}, stage_of=lambda _: 0, runtime=c_flat.runtime, machine=c_flat.machine,
+            physical_rank=rank, explicit_physical_rank=True,
+        )
+        flat_pairs.append(sum(int(dict(o.metadata).get("logical_pairs", 0)) for o in res_f.ops if "latent_attention" in o.op_id))
+    assert flat_pairs == [1, 65]
+
+    c_dcp_pf = compose_case(
+        "deepseek-v2-lite", hardware="a2", layers=1, tp=2, dcp=2, dp=1, ep=1,
+        num_devices=2, prompt_tokens=264, output_tokens=1, va_recommended=False,
+    )
+    ops_dcp_pf = target_operators(c_dcp_pf, phase="prefill", tokens=8, context=256)
+    g_idx = next(i for i, o in enumerate(ops_dcp_pf) if o.recipe == "dcp_prefill_kv_gather")
+    k_idx = next(i for i, o in enumerate(ops_dcp_pf) if o.op_id.endswith(".kv_b"))
+    assert g_idx < k_idx and ops_dcp_pf[g_idx].op_id in ops_dcp_pf[k_idx].deps
+
+    # Compressed sharded indexer aligns score and cache-read ownership without double-dividing interleave.
+    r_comp = sparse_mla_case(context_tokens=64, tp=2)
+    r_comp["model"]["layer_plans"][0].update(cache_kind="window_compressed", compress_ratio=4, owns_long_kv=True, window=0)
+    r_comp["runtime"].update(dcp=2, metadata={"enable_sfa_dcp_sharded_indexer": True, "cp_kv_cache_interleave_size": 128})
+    for rank, exp_r in ((0, 16), (1, 0)):
+        ops_c = target_operators(r_comp, phase="decode", tokens=1, context=63, physical_rank=rank)
+        ix_c = next(o for o in ops_c if o.layer == 0 and o.family == "indexer")
+        by_c = {o.op_id: o for o in ops_c}
+        in_c = sum(by_c[d].mte3_bytes for d in ix_c.deps[:2])
+        assert (int(ix_c.flops) // (2 * 32 * 128), int(ix_c.mte2_bytes - in_c) // 130) == (exp_r, exp_r)
+
+    # Scoped unpacked BF16 index_k aligns arithmetic dtype and skips INT8->FP16 weight cast; PCP index gather pads whole rows.
+    r_bf16 = sparse_mla_case(context_tokens=65)
+    r_bf16["model"]["metadata"] = {"layer_cache_representations": {"0": {"index_k:decode": {"dtype": "bf16"}}}}
+    ops_bf16 = target_operators(r_bf16, phase="decode", tokens=1, context=64)
+    assert next(o for o in ops_bf16 if o.layer == 0 and o.family == "indexer").dtype == "bf16"
+    assert not any(o.op_id.endswith(".index_weights_fp16") for o in ops_bf16)
+
+    r_ig = sparse_mla_case(context_tokens=1)
+    r_ig["machine"]["num_devices"] = 2
+    r_ig["runtime"].update(pcp=2, dcp=1)
+    r_ig["model"]["metadata"] = {"layer_cache_representations": {"0": {"index_k:prefill": fmt_scoped}}}
+    ops_ig = target_operators(r_ig, phase="prefill", tokens=1, physical_rank=0)
+    assert int(next(o for o in ops_ig if o.op_id.endswith(".pcp_index_gather")).link_bytes) == 68

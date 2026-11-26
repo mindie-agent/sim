@@ -8,26 +8,88 @@
 """
 from mindie_sim.catalog.attention_common import AttentionResult, _allreduce
 from mindie_sim.catalog.cache import local_kv_heads
+from mindie_sim.catalog.cache_format import gqa_kv_formats
 from mindie_sim.catalog.context_parallel import DEFAULT_CP_INTERLEAVE, layer_dcp_degree, owned_positions
 from mindie_sim.catalog.ops import barrier_op, cache_store_op, comm_op, gemm_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 
-def _max_dcp_rank_tokens(ranges, dcp: int, parallel) -> int:
-    """Critical-path (heaviest DCP rank) owned KV row count across [lo, hi] spans."""
+_MX_SCALE_GROUP_SIZE = 32
+_MX_V_SCALE_TOKEN_GROUP = 32
+_MX_SCALE_DTYPES = frozenset({"fp8_e8m0", "e8m0"})
+_FP8_E4M3_DTYPES = frozenset({"fp8_e4m3", "mxfp8"})
+
+
+def _is_mxfp8_fmt(fmt) -> bool:
+    if fmt is None:
+        return False
+    return (
+        str(getattr(fmt, "dtype", "") or "").strip().lower() in _FP8_E4M3_DTYPES
+        and int(getattr(fmt, "group_size", 0) or 0) == _MX_SCALE_GROUP_SIZE
+        and str(getattr(fmt, "scale_dtype", "") or "").strip().lower() in _MX_SCALE_DTYPES
+        and int(getattr(fmt, "suffix_elements", 0) or 0) == 0
+        and int(getattr(fmt, "packed_elements", 1) or 1) == 1
+    )
+
+
+def _gqa_kv_row_bytes(model, plan, kv_heads: int, v_dim: int, quant, mode: str) -> float:
+    """Resolve physical per-token GQA KV cache row bytes matching the cache producer."""
+    if model is not None:
+        key_fmt, value_fmt, shared_format = gqa_kv_formats(model, plan=plan, phase=mode)
+        if shared_format:
+            return float(key_fmt.row_bytes(kv_heads * (plan.head_dim + v_dim)))
+        return float(
+            key_fmt.row_bytes(kv_heads * plan.head_dim)
+            + value_fmt.row_bytes(kv_heads * v_dim)
+        )
+    return float(kv_heads * (plan.head_dim + v_dim) * dtype_bytes(quant.kv_dtype))
+
+
+def _gqa_kv_transfer_bytes(
+    model, plan, kv_heads: int, v_dim: int, quant, mode: str, tokens: int,
+) -> float:
+    """Physical bytes for ``tokens`` of GQA KV cache, preserving MXFP8 V token-group scales."""
+    if tokens <= 0:
+        return 0.0
+    if model is not None:
+        key_fmt, value_fmt, _shared = gqa_kv_formats(model, plan=plan, phase=mode)
+        if _is_mxfp8_fmt(key_fmt) and _is_mxfp8_fmt(value_fmt):
+            k_scale_groups = -(-plan.head_dim // _MX_SCALE_GROUP_SIZE)
+            v_scale_groups = -(-tokens // _MX_V_SCALE_TOKEN_GROUP)
+            return float(
+                tokens * kv_heads * (plan.head_dim + v_dim + k_scale_groups)
+                + v_scale_groups * kv_heads * v_dim
+            )
+    return float(tokens) * _gqa_kv_row_bytes(model, plan, kv_heads, v_dim, quant, mode)
+
+
+def _max_dcp_rank_tokens(
+    ranges, dcp: int, parallel, *, rank_candidates=None, interleave: int | None = None,
+) -> int:
+    """Rank-exact (when ``rank_candidates`` is given) or heaviest-rank owned KV row count."""
     if dcp <= 1:
         return sum(hi - lo + 1 for lo, hi in ranges if hi >= lo)
-    interleave = max(
-        1, int(getattr(parallel, "cp_interleave", DEFAULT_CP_INTERLEAVE) or DEFAULT_CP_INTERLEAVE)
+    eff_interleave = max(
+        1,
+        int(interleave)
+        if interleave is not None
+        else int(getattr(parallel, "cp_interleave", DEFAULT_CP_INTERLEAVE) or DEFAULT_CP_INTERLEAVE),
+    )
+    ranks = (
+        tuple(int(r) for r in rank_candidates if 0 <= int(r) < dcp)
+        if rank_candidates is not None else tuple(range(dcp))
     )
     return max(
-        (sum(owned_positions(lo, hi, dcp, interleave, rank) for lo, hi in ranges if hi >= lo)
-         for rank in range(dcp)),
+        (sum(owned_positions(lo, hi, dcp, eff_interleave, rank) for lo, hi in ranges if hi >= lo)
+         for rank in ranks),
         default=0,
     )
 
 
-def shared_kv_input(*, prefix, plan, stage, views, cache_ids, stage_of, parallel, quant, mode):
+def shared_kv_input(
+    *, prefix, plan, stage, views, cache_ids, stage_of, parallel, quant, mode, model=None,
+    rank_candidates=None, cp_interleave_size: int | None = None,
+):
     owner = plan.kv_owner_layer_id
     if owner not in cache_ids:
         raise ModelingError(f"shared_kv_producer_missing:{plan.index}:{owner}")
@@ -40,9 +102,12 @@ def shared_kv_input(*, prefix, plan, stage, views, cache_ids, stage_of, parallel
     dcp = max(1, layer_dcp_degree(plan, parallel))
     kv_tokens = sum(view.kv_len for view in views)
     rank_tokens = _max_dcp_rank_tokens(
-        tuple((0, view.kv_len - 1) for view in views if view.kv_len > 0), dcp, parallel,
+        tuple((0, view.kv_len - 1) for view in views if view.kv_len > 0),
+        dcp, parallel, rank_candidates=rank_candidates, interleave=cp_interleave_size,
     )
-    volume = rank_tokens * kv_heads * (plan.head_dim + v_dim) * dtype_bytes(quant.kv_dtype)
+    owner_plans = getattr(model, "layer_plans", ()) if model is not None else ()
+    owner_plan = owner_plans[owner] if 0 <= owner < len(owner_plans) else plan
+    volume = _gqa_kv_transfer_bytes(model, owner_plan, kv_heads, v_dim, quant, mode, rank_tokens)
     op = comm_op(
         op_id=prefix + ".shared_kv_transfer", deps=(ready,), stage=stage, layer=plan.index,
         requests=tuple(view.request_id for view in views), family="cache_transfer",
@@ -86,7 +151,7 @@ def projection_only(*, prefix, deps, stage, plan, views, mode, model, parallel,
         if shared:
             extra, cache = shared_kv_input(
                 prefix=prefix, plan=plan, stage=stage, views=views, cache_ids=cache_ids,
-                stage_of=stage_of, parallel=parallel, quant=quant, mode=mode)
+                stage_of=stage_of, parallel=parallel, quant=quant, mode=mode, model=model)
             ops.extend(extra)
         else:
             store_rows = _max_dcp_rank_tokens(
@@ -97,7 +162,7 @@ def projection_only(*, prefix, deps, stage, plan, views, mode, model, parallel,
                 op_id=prefix + ".known_cache", deps=(projected.op_id,), stage=stage,
                 layer=plan.index, requests=requests, phase=mode, recipe="kv_store",
                 rows=store_rows,
-                row_bytes=kv * (plan.head_dim + v_dim) * dtype_bytes(quant.kv_dtype),
+                row_bytes=_gqa_kv_row_bytes(model, plan, kv, v_dim, quant, mode),
                 dtype=quant.kv_dtype, kind="gqa",
             )
             ops.append(store)

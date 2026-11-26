@@ -30,6 +30,7 @@ _PAGE_TABLE_BYTES = 4
 _DTYPE_CANONICAL = {
     "bfloat16": "bf16", "float16": "fp16", "float32": "fp32",
     "fp8": "fp8_e4m3", "fp4": "fp4_e2m1",
+    "mxfp8": "fp8_e4m3", "qk_mxfp8_dynamic_v_mxfp8_per_channel": "fp8_e4m3",
 }
 
 

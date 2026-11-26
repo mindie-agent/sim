@@ -48,6 +48,16 @@ NORMALIZE_SHARE = 0.65
 PIPELINE_SLOTS = 2
 ATTENTION_TILE_CAP = 64
 ATTENTION_SHAPE_WITH_VALUE_DIM = 5
+_MX_SCALE_GROUP_SIZE = 32
+_MX_V_SCALE_TOKEN_GROUP = 32
+
+
+def _mxfp8_v_scale_groups(tile_start: int, valid: int) -> int:
+    """Count distinct 32-token E8M0 V-scale groups intersecting ``[tile_start, tile_start + valid)``."""
+    if valid <= 0:
+        return 0
+    tile_end = tile_start + valid
+    return (tile_end - 1) // _MX_V_SCALE_TOKEN_GROUP - tile_start // _MX_V_SCALE_TOKEN_GROUP + 1
 
 
 def _matrix_phase_weights(op) -> tuple[int, int]:
@@ -392,7 +402,11 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
     v_dim = getattr(spec, "v_head_dim", dim)
     out_elem = getattr(spec, "output_bytes", spec.query_bytes)
     rows = output.rows
-    q_bytes = rows * dim * spec.query_bytes
+    q_scale_row = (
+        -(-dim // _MX_SCALE_GROUP_SIZE)
+        if getattr(spec, "mxfp8_qfa", False) else 0
+    )
+    q_bytes = rows * (dim * spec.query_bytes + q_scale_row)
     read = _read_role(context)
     write = _write_role(context)
     operand = _operand_role(context)
@@ -462,21 +476,25 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
         valid = max(0, end - start)
         pairs, active_rows = _tile_counts(
             output, context_len, spec.group, start, end)
-        return valid, pairs, active_rows, index % recipe.slots
+        v_scale_groups = (
+            _mxfp8_v_scale_groups(start, valid)
+            if getattr(spec, "mxfp8_qfa", False) else 0
+        )
+        return valid, pairs, active_rows, index % recipe.slots, v_scale_groups
 
     def tile(index: int):
-        valid, pairs, active_rows, slot = key_of(index)
-        return template(valid, pairs, active_rows, slot)
+        valid, pairs, active_rows, slot, v_scale_groups = key_of(index)
+        return template(valid, pairs, active_rows, slot, v_scale_groups)
 
     handoff = gqa_fixpipe_policy(
         context, decode_handoff_workspace_bytes(spec, context.core_count),
     )
 
     @lru_cache(maxsize=TEMPLATE_CACHE_SLOTS_FACTOR * recipe.slots + tail_count)
-    def template(valid: int, pairs: int, active_rows: int, slot: int):
+    def template(valid: int, pairs: int, active_rows: int, slot: int, v_scale_groups: int):
         return _decode_tile_stages(
             valid, pairs, active_rows, slot, context, core, spec, cache, rows, dim, max_tile,
-            read, write, operand, vector_copy_in, handoff)
+            read, write, operand, vector_copy_in, handoff, v_scale_groups=v_scale_groups)
 
     contributions = len(output.contributions)
     use_compact = len(set(spec.requests)) <= 1 and contributions == 1
@@ -652,6 +670,7 @@ def _append_decode_key_load(
 def _decode_tile_stages(
     valid, pairs, active_rows, slot, context, core, spec, cache, rows, dim, max_tile, read,
     write, operand, vector_copy_in, handoff: FixpipeHandoffPolicy = FixpipeHandoffPolicy(),
+    *, v_scale_groups: int = 0,
 ):
     """[Cohesive-Pipeline] Build paired AIC/AIV decode attention tile stages for one KV slice."""
     copy_in = (read,)
@@ -664,15 +683,18 @@ def _decode_tile_stages(
     # every tile still submits its original finite stages and dependencies.
     key_needs = cache.key_needs_conversion
     value_needs = cache.value_needs_conversion
+    v_dim = getattr(spec, "v_head_dim", dim) or dim
     key_payload = valid * cache.key_payload_row
     value_payload = valid * cache.value_payload_row
+    if getattr(spec, "mxfp8_qfa", False) and valid > 0:
+        groups = v_scale_groups if v_scale_groups > 0 else -(-valid // _MX_V_SCALE_TOKEN_GROUP)
+        value_payload += groups * v_dim
     key_operand = valid * cache.key_operand_row
     value_operand = valid * cache.value_operand_row
     key_scale = (valid * cache.key_scale_row
                  if cache.scale_scope == "row" else 0)
     value_scale = (valid * cache.value_scale_row
                    if cache.scale_scope == "row" else 0)
-    v_dim = getattr(spec, "v_head_dim", dim)
     suffix = f"s{slot}"
     scores = _allocation(context, core, "l0c", f"scores_{suffix}",
                          rows * max_tile * _FP32_BYTES)

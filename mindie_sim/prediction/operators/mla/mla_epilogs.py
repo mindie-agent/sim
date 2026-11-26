@@ -15,7 +15,9 @@ from typing import Literal
 
 from mindie_sim.catalog.cache import completed_rows, index_row_bytes, index_selection_cost
 from mindie_sim.catalog.cache_format import cache_format
-from mindie_sim.catalog.context_parallel import dcp_indexer_sharded, layer_dcp_degree
+from mindie_sim.catalog.context_parallel import (
+    dcp_indexer_sharded, layer_dcp_degree, pcp_rank_chunk_ranges,
+)
 from mindie_sim.catalog.ops import compute_dtype_for, gemm_op
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction.sharding.context_parallel import (
@@ -32,9 +34,11 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
 
 from .generic_latent_attention import (
-    index_cache_dtype, index_cache_is_packed, owned_completed_rows,
+    index_arithmetic_dtype, index_cache_dtype, index_cache_is_packed,
+    index_operands_quantized, owned_completed_rows,
     owned_store_rows, sharded_index_visible_rows, semantic_index_selection,
 )
+from .generic_latent_attention_views import _index_k_owner_plan, _resolve_index_phase
 from mindie_sim.prediction.implementations import produced_values, select, set_input_ports
 from mindie_sim.prediction.operators.sparse_indexer.indexer_representation import index_representation
 from .mla_native import index_layer_norm, index_rms_norm
@@ -824,10 +828,13 @@ def index_head_weights(builder, *, plan, model, quant, deps, pool_weights, token
         if w_op is not None else weights_dtype
     )
     phase = builder.common.get("phase")
-    mode1 = native and plan.index_kpool == 1 and quant.index_dtype in {"fp8", "fp8_e4m3"}
-    packed_fp32 = index_cache_is_packed(model, plan=plan, phase=phase)
+    owner_plan = _index_k_owner_plan(model, plan)
+    eff_index_dtype = index_arithmetic_dtype(model, quant, plan=owner_plan, phase=phase)
+    operands_quantized = index_operands_quantized(quant, model, plan=owner_plan, phase=phase)
+    mode1 = native and plan.index_kpool == 1 and operands_quantized and eff_index_dtype in {"fp8", "fp8_e4m3"}
+    packed_fp32 = index_cache_is_packed(model, plan=owner_plan, phase=phase)
     int8_qli_fp16 = (
-        plan.index_kpool <= 1 and quant.index_dtype == "int8" and not packed_fp32
+        plan.index_kpool <= 1 and operands_quantized and eff_index_dtype == "int8" and not packed_fp32
     )
     if native and not mode1 and not packed_fp32 and not int8_qli_fp16:
         # ``aclnnPoolKeyIndexer`` and BF16/FP8 non-mode1 consumers consume the
@@ -860,7 +867,7 @@ def index_head_weights(builder, *, plan, model, quant, deps, pool_weights, token
                     ("source_semantics", "packed_indexer_weights_scale_float32"),
                 ))
         return weights
-    if quant.index_dtype == "int8":
+    if operands_quantized and eff_index_dtype == "int8":
         if w_out_dtype == "fp16":
             return weights
         return builder.vector(
@@ -981,15 +988,27 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
     if (pcp_prefill and not skip_pcp_index_gather and plan.index_kpool <= 1
             and plan.indexer and plan.owns_index_k and index_store is not None):
         # One stored index vector is index_dim wide, not index_heads copies of it.
-        rows = sum(completed_rows(
-            view.context + (view.global_q_len or view.q_len), ratio)
-            - completed_rows(view.context, ratio)
-            for view in views if view.phase == "prefill")
+        gather_phase = _resolve_index_phase(b.common.get("phase"), views)
+        pcp_deg = max(1, int(parallel.pcp))
+        per_peer_idx_rows = max(
+            (
+                sum(
+                    completed_rows(view.context + hi, ratio) - completed_rows(view.context + lo, ratio)
+                    for view in views if view.phase == "prefill"
+                    for lo, hi in pcp_rank_chunk_ranges(
+                        int(view.global_q_len or view.q_len), pcp_deg, pcp_rank,
+                    )
+                    if hi > lo
+                )
+                for pcp_rank in range(pcp_deg)
+            ),
+            default=0,
+        )
         index_store = b.communicate(
             "pcp_index_gather", (index_store,),
-            rows * index_row_bytes(model, plan.index_dim)
-            * (parallel.pcp - 1) / parallel.pcp,
-            "allgather", "pcp", dtype=quant.index_dtype)
+            per_peer_idx_rows * index_row_bytes(model, plan.index_dim, plan=plan, phase=gather_phase)
+            * (pcp_deg - 1),
+            "allgather", "pcp", dtype=index_cache_dtype(model, plan=plan, phase=gather_phase))
     if reuse_selection:
         if shared_topk is None or plan.index not in shared_topk:
             raise ModelingError("mtp_shared_topk_selection_missing")
@@ -999,10 +1018,12 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
             if plan.scope == "draft" and plan.index_k_owner_layer_id < 0:
                 index_store = deps
             else:
+                owner_plan = _index_k_owner_plan(model, plan)
                 index_store = owner(
                     index_cache_ids, plan.index_k_owner_layer_id, "index_cache",
-                    sum(index_selection_cost(model, plan, view.kv_len).index_read_bytes
-                        for view in views))
+                    sum(index_selection_cost(
+                        model, owner_plan, view.kv_len, phase=getattr(view, "phase", None) or b.common.get("phase")
+                    ).index_read_bytes for view in views))
         shard_sizes, score_q = None, q
         if (plan.index_kpool > 1 and pool_binding
                 and pool_binding.name == NATIVE_KEYPOOL_IMPLEMENTATION):
@@ -1046,18 +1067,22 @@ def lower_index_path(builder, *, plan, model, quant, parallel, views, deps, runt
                     valid * plan.candidate_topk_blocks * INT32_BYTES))
         shard = (parallel.tp if dsa_prefill
                  else eff_dcp if sharded_index else 1)
+        score_interleave = own_block if ratio > 1 else idx_block
         score_rows = (
             sharded_index_visible_rows(
-                views, parallel, own_block if ratio > 1 else idx_block, ratio,
+                views, parallel, score_interleave, ratio,
                 sharded_dcp=eff_dcp, rank_candidates=store_rank_candidates,
+                noncausal=bool(plan.noncausal_attention),
             )
             if sharded_index else None
         )
         topk = _select_index_rows(
             b, plan, pool_binding, views, model, quant, q_index, weights, index_store, q,
             runtime, hierarchy, shard_sizes, selection_deps, parallel, stage, ratio, shard,
-            score_rows, machine=machine, cp_interleave_size=idx_block,
-            physical_rank=physical_rank)
+            score_rows, machine=machine, cp_interleave_size=score_interleave,
+            physical_rank=physical_rank,
+            rank_candidates=(store_rank_candidates if sharded_index else None),
+            sharded_dcp=(eff_dcp if sharded_index else None))
         if shard > 1 and not dsa_prefill:
             return_local = int(getattr(parallel, "pcp", 1) or 1) <= 1 or not any(
                 v.phase == "prefill" for v in views
@@ -1234,7 +1259,8 @@ def _emit_index_cache_store(
             )
     else:
         index_store_rows = index_rows
-    total_row_b = index_row_bytes(model, plan.index_dim)
+    store_phase = b.common.get("phase")
+    total_row_b = index_row_bytes(model, plan.index_dim, plan=plan, phase=store_phase)
     arch = _resolve_arch(runtime, machine)
     q_meta = dict(last.metadata) if quantize_id is not None else {}
     packed_elems = int(q_meta.get("packed_elements") or 1)
@@ -1262,7 +1288,7 @@ def _emit_index_cache_store(
             c2_token_aligned=c2_token_aligned,
         )
     index_store = b.store("index_store", (normalized,), index_store_rows,
-                          total_row_b, quant.index_dtype)
+                          total_row_b, index_cache_dtype(model, plan=plan, phase=store_phase))
     if quantize_id is not None:
         return index_row_quantization(
             b, index_store, quantize_id, width=plan.index_dim,
@@ -1401,6 +1427,7 @@ def _select_index_rows(
     b, plan, pool_binding, views, model, quant, q_index, weights, index_store, q, runtime,
     hierarchy, shard_sizes, selection_deps, parallel, stage, ratio, shard, score_rows,
     *, machine=None, cp_interleave_size=None, physical_rank=None,
+    rank_candidates=None, sharded_dcp=None,
 ):
     if plan.index_kpool > 1:
         from mindie_sim.prediction.operators.sparse_indexer import index_pool
@@ -1467,7 +1494,8 @@ def _select_index_rows(
                 page_size=int(getattr(runtime, "kv_block_size", 0)
                               or DEFAULT_BLOCK_SIZE),
                 kv_heads=1, query_dtype=model.activation_dtype,
-                cache_dtype=index_cache_dtype(model), weight_dtype=w_out_dtype,
+                cache_dtype=index_cache_dtype(model, plan=plan, phase=b.common["phase"]),
+                weight_dtype=w_out_dtype,
                 query_lengths=(view.q_len,), context_lengths=(view.context,),
                 binding_revision=str(getattr(runtime, "vllm_version", "unknown")),
                 runtime_version=str(getattr(runtime, "vllm_version", "unknown")),
@@ -1482,5 +1510,6 @@ def _select_index_rows(
                 quant=quant, parallel=parallel, shard=shard, prefix=b.prefix,
                 padded_tokens=q, runtime=runtime, score_rows=score_rows,
                 l2_bytes=getattr(b, "l2_bytes", None), machine=machine,
-                cp_interleave_size=cp_interleave_size)
+                cp_interleave_size=cp_interleave_size,
+                rank_candidates=rank_candidates, sharded_dcp=sharded_dcp)
     return topk

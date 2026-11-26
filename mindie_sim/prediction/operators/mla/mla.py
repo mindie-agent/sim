@@ -77,7 +77,7 @@ from .generic_latent_attention import (
     visible_parts, window_cache_read,
 )
 from .generic_latent_attention_views import (
-    pool_sparse_view_records, window_cache_read_by_rank,
+    pool_sparse_view_records, window_cache_read_by_rank, worst_dsa_cp_rank,
 )
 
 # Shared private alias retained strictly for cross-wave attention callers.
@@ -120,8 +120,8 @@ def _store_rows(
     )
 
 
-def _is_fresh_dense_prefill_view(view) -> bool:
-    return view.phase == "prefill" and int(view.context) == 0
+def _is_unabsorbed_dense_prefill_view(view) -> bool:
+    return view.phase == "prefill"
 
 
 def _unabsorbed_mla_eligible(
@@ -144,14 +144,14 @@ def _is_unabsorbed_mla_prefill(
     plan, views, *, is_sparse: bool, dsa_prefill: bool = False,
     selected=None, head_contract=None, prolog=None,
 ) -> bool:
-    """True when every local view is a fresh dense non-sparse latent_mla prefill."""
+    """True when every local view is a dense non-sparse latent_mla prefill."""
     return bool(
         _unabsorbed_mla_eligible(
             plan, is_sparse=is_sparse, dsa_prefill=dsa_prefill,
             selected=selected, head_contract=head_contract, prolog=prolog,
         )
         and bool(views)
-        and all(_is_fresh_dense_prefill_view(view) for view in views)
+        and all(_is_unabsorbed_dense_prefill_view(view) for view in views)
     )
 
 
@@ -159,13 +159,13 @@ def _has_unabsorbed_mla_prefill(
     plan, views, *, is_sparse: bool, dsa_prefill: bool = False,
     selected=None, head_contract=None, prolog=None,
 ) -> bool:
-    """True when at least one local view runs unabsorbed fresh dense MLA prefill."""
+    """True when at least one local view runs unabsorbed dense MLA prefill."""
     return bool(
         _unabsorbed_mla_eligible(
             plan, is_sparse=is_sparse, dsa_prefill=dsa_prefill,
             selected=selected, head_contract=head_contract, prolog=prolog,
         )
-        and any(_is_fresh_dense_prefill_view(view) for view in views)
+        and any(_is_unabsorbed_dense_prefill_view(view) and int(view.q_len) > 0 for view in views)
     )
 
 
@@ -646,7 +646,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     is_v41 = is_v41_replicated_cache_model(model)
     (q_local, q_unabsorbed, rotary_local, q_dcp, rotary_dcp, q_norm, valid, pcp_prefill,
      store, dcp_heads, cache_hidden, cache_views, cache_q, v4_hidden_gathered,
-     kpool_gathered, kv_b_dep) = _project_mla_inputs(
+     kpool_gathered, kv_norm_id, kv_b_heads) = _project_mla_inputs(
         b, q, h, heads, width, kv_width, deps, prolog, do_rope, partial_rotary, views,
         parallel, own_block, native_cache_epilogs, latent, quant,
         decode_dcp=decode_dcp, pcp_factor=pcp_factor, tp_gather=tp_gather,
@@ -670,6 +670,22 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         is_sparse=is_sparse, layer_dcp=layer_dcp, has_prefill=has_prefill,
         cp_interleave_size=cp_interleave_size,
         dcp_cohort_views_by_member=dcp_cohort_views_by_member)
+    unabs_views = (
+        tuple(v for v in views if _is_unabsorbed_dense_prefill_view(v) and int(v.q_len) > 0)
+        if has_unabsorbed_prefill else ()
+    )
+    unabs_kv_b_rows = sum(int(v.kv_len) for v in unabs_views)
+    has_unabs_prefix = any(int(v.context) > 0 for v in unabs_views) or pcp_prefill
+    kv_b_deps = tuple(dict.fromkeys(
+        dep for dep in (kv_norm_id, store if has_unabs_prefix else None) if dep
+    ))
+    kv_b_dep = (
+        _emit_unabsorbed_kv_b(
+            b, kv_deps=kv_b_deps, rows=unabs_kv_b_rows,
+            heads=kv_b_heads, plan=plan, model=model,
+        )
+        if unabs_kv_b_rows > 0 else None
+    )
     pool_binding, v41_comp_gathered, idx_hidden, idx_views, idx_q = _resolve_mla_index_inputs(
         runtime=runtime, plan=plan, is_v41=is_v41, pcp_prefill=pcp_prefill,
         kpool_gathered=kpool_gathered, v4_hidden_gathered=v4_hidden_gathered,
@@ -1207,7 +1223,7 @@ def _declare_mla_prolog_or_semantic(
 
 
 def _emit_unabsorbed_kv_b(
-    b, *, kv_src: str, rows: int, heads: int, plan, model,
+    b, *, kv_deps: tuple[str, ...], rows: int, heads: int, plan, model,
 ) -> str:
     """Emit dense BF16 ``kv_b_proj`` and contiguous K_nope/V split copies (mla_v1.py:1301,3219)."""
     act_dtype = model.activation_dtype
@@ -1217,7 +1233,7 @@ def _emit_unabsorbed_kv_b(
         activation_format=act_dtype, native_format=act_dtype,
     )
     kv_b_id = b.add(gemm_op(
-        op_id=b.prefix + ".kv_b", deps=(kv_src,), m=rows, n=out_width,
+        op_id=b.prefix + ".kv_b", deps=kv_deps, m=rows, n=out_width,
         k=plan.kv_lora_rank, quant=dense_quant, category="mla_absorb",
         recipe="kv_b", activation_dtype=act_dtype, output_dtype=act_dtype,
         metadata=(("native_kind", "kv_b_proj"), ("unabsorbed_mla_prefill", True)),
@@ -1322,13 +1338,14 @@ def _project_mla_inputs(
         is_v41=is_v41, padded_tokens=q, layer_dcp=layer_dcp,
         store_rank_candidates=store_rank_candidates)
     q_unabsorbed = q_ready
-    unabsorbed_rows = (
-        sum(int(v.q_len) for v in views if _is_fresh_dense_prefill_view(v))
-        if has_unabsorbed_prefill else 0
+    unabsorbed_views = (
+        tuple(v for v in views if _is_unabsorbed_dense_prefill_view(v) and int(v.q_len) > 0)
+        if has_unabsorbed_prefill else ()
     )
-    has_local_absorbed = any(not _is_fresh_dense_prefill_view(v) for v in views)
+    unabsorbed_q_rows = sum(int(v.q_len) for v in unabsorbed_views)
+    has_local_absorbed = any(not _is_unabsorbed_dense_prefill_view(v) for v in views)
     absorbed_rows = (
-        max(0, q - unabsorbed_rows)
+        max(0, q - unabsorbed_q_rows)
         if (has_unabsorbed_prefill and has_local_absorbed)
         else (0 if has_unabsorbed_prefill else q)
     )
@@ -1340,12 +1357,6 @@ def _project_mla_inputs(
                            metadata=batched_matrix_metadata(
                                tokens=abs_m, heads=post_q_heads, input_width=plan.qk_nope_head_dim,
                                output_width=plan.kv_lora_rank, role="key_absorption"))
-    kv_b_dep = (
-        _emit_unabsorbed_kv_b(
-            b, kv_src=kv, rows=unabsorbed_rows, heads=post_q_heads, plan=plan, model=model,
-        )
-        if unabsorbed_rows > 0 else None
-    )
     preprocess_mode = (
         _resolve_automatic_mla_preprocess_mode(
             runtime=runtime, plan=plan, parallel=parallel, model=model, quant=quant,
@@ -1384,7 +1395,7 @@ def _project_mla_inputs(
             q_dcp, rotary_dcp = gathered, gathered
     return (q_local, q_unabsorbed, rotary_local, q_dcp, rotary_dcp, q_norm, valid, pcp_prefill,
             store, dcp_heads, cache_hidden, cache_views, cache_q, v4_hidden_gathered,
-            kpool_gathered, kv_b_dep)
+            kpool_gathered, kv, post_q_heads)
 
 
 def _emit_v41_pcp_c2_pool_stage(
@@ -1726,7 +1737,7 @@ def _append_mla_request(
     query_tile, hierarchy, topk, q_local, rotary_local, q_dcp, rotary_dcp,
     store, long_store, metadata_ready, machine, head_contract, offload_info,
     unabsorbed_qk_dim=None, unabsorbed_v_dim=None, q_unabsorbed=None,
-    kv_b_dep=None, view_unabsorbed=False,
+    kv_b_dep=None, view_unabsorbed=False, emit_dcp_lse=False,
 ):
     plan, model = b.plan, b.model
     mode = b.common["phase"]
@@ -1750,7 +1761,8 @@ def _append_mla_request(
     eff_kv_b = kv_b_dep if view_unabsorbed else None
     q_eff = eff_q
     q_read = q_eff * attn_heads * eff_qk_dim * dtype_bytes(model.activation_dtype)
-    lse_write = (q_eff * attn_heads * FP32_BYTES) if view_unabsorbed else 0
+    return_lse = bool(view_unabsorbed or emit_dcp_lse)
+    lse_write = (q_eff * attn_heads * FP32_BYTES) if return_lse else 0
     out_write = q_eff * attn_heads * eff_v_dim * dtype_bytes(model.activation_dtype) + lse_write
     interleave = int(getattr(runtime, "cp_interleave_size", DEFAULT_INTERLEAVE) or DEFAULT_INTERLEAVE)
     traffic, local_cache_read = _plan_rank_attention_traffic(
@@ -1776,8 +1788,11 @@ def _append_mla_request(
     tensor_view_meta = (
         (("mla_attention_mode", "unabsorbed_prefill"), ("lse_write_bytes", float(lse_write)))
         if view_unabsorbed
-        else attention_tensor_view(plan, view, attn_heads, model, quant,
-                                   parallel, eff_cp=eff_cp, machine=machine)
+        else (
+            attention_tensor_view(plan, view, attn_heads, model, quant,
+                                  parallel, eff_cp=eff_cp, machine=machine)
+            + ((("lse_write_bytes", float(lse_write)),) if lse_write > 0 else ())
+        )
     )
     last = b.work(
         f"latent_attention{orig_idx}", tuple(dict.fromkeys(
@@ -1805,6 +1820,7 @@ def _append_mla_request(
                      "kv_row_bytes": kv_row_b,
                      "kv_unique_bytes": kv_row_b * max(0, vis_keys),
                      "output_bytes": out_write,
+                     "return_lse": return_lse,
                      "owners": max(1, min(
                          MAX_GENERIC_OWNERS,
                          math.ceil(max(1, vis_keys) / DEFAULT_QUERY_TILE))),
@@ -1947,16 +1963,37 @@ def _batch_mla_attention(
     return grp_outputs
 
 
-def _history_only_pairs(view, eff_cp, interleave, window):
-    """Exact history-only KV pairs per DCP rank for MTP dual-stream split."""
+def _history_only_metrics(view, parts, eff_cp, interleave, window, query_tile, block_size):
+    """Exact history-only pairs, sweeps, shared sweeps, and unique rows per DCP rank for MTP split."""
     if view.q_len <= 1 or view.context <= 0:
         return None
     hi = view.context - 1
     lo = max(0, view.context - window + 1) if window > 0 else 0
-    return [
-        float(view.q_len * owned_positions(lo, hi, eff_cp, interleave, rank))
+    if hi < lo:
+        return [0.0] * eff_cp, [0] * eff_cp, [0] * eff_cp, [0] * eff_cp
+    tiles = sum(
+        max(1, math.ceil(int(q_part) / max(1, int(query_tile))))
+        for q_part, _ in parts if int(q_part) > 0
+    ) or max(1, math.ceil(int(view.q_len) / max(1, int(query_tile))))
+    owned_rows = [owned_positions(lo, hi, eff_cp, interleave, rank) for rank in range(eff_cp)]
+    if window > 0:
+        hist_pairs = [0.0] * eff_cp
+        for token_idx in range(int(view.q_len)):
+            t_lo = max(0, view.context + token_idx + 1 - window)
+            if hi >= t_lo:
+                for rank in range(eff_cp):
+                    hist_pairs[rank] += float(owned_positions(t_lo, hi, eff_cp, interleave, rank))
+    else:
+        hist_pairs = [float(view.q_len * owned_rows[rank]) for rank in range(eff_cp)]
+    hist_sweeps = [tiles * owned_rows[rank] for rank in range(eff_cp)]
+    raw_pref = max(0, min(int(getattr(view, "prefix_tokens", 0) or 0), int(view.context)))
+    aligned_pref = (raw_pref // max(1, int(block_size))) * max(1, int(block_size))
+    sh_hi = min(hi + 1, aligned_pref)
+    hist_shared = [
+        tiles * owned_positions(lo, sh_hi - 1, eff_cp, interleave, rank) if sh_hi > lo else 0
         for rank in range(eff_cp)
     ]
+    return hist_pairs, hist_sweeps, hist_shared, owned_rows
 
 
 def _attach_mla_dcp_metadata(
@@ -2005,7 +2042,7 @@ def _group_mla_attention_views(
             continue
         eff_cp = (1 if sfa_replicated_prefill_path else
                   active_layer_dcp(plan, parallel, view.phase, sharded_indexer=sharded_indexer))
-        view_unabsorbed = bool(has_unabsorbed_prefill and _is_fresh_dense_prefill_view(view))
+        view_unabsorbed = bool(has_unabsorbed_prefill and _is_unabsorbed_dense_prefill_view(view))
         view_kv_row_b = (
             (dcp_heads if eff_cp > 1 else local_heads) * (unabsorbed_qk_dim + unabsorbed_v_dim)
             * int(dtype_bytes(model.activation_dtype))
@@ -2064,6 +2101,16 @@ def _append_mla_attention(
         grp_views = tuple(view for _, view in indexed_views)
         grp_prefix = f"{b.prefix}.phase{grp_idx}" if multi_group else b.prefix
         grp_dsa = dsa_prefill and any(view.phase == "prefill" for view in grp_views)
+        dsa_rank = (
+            int(physical_rank) % max(1, int(parallel.tp))
+            if (grp_dsa and explicit_physical_rank and physical_rank is not None)
+            else (worst_dsa_cp_rank(grp_views, parallel.tp) if grp_dsa else None)
+        )
+        dsa_batch_tokens = (
+            sum(int(view.q_len) for _, view in indexed_views if view.phase == "prefill")
+            if grp_dsa else None
+        )
+        dsa_token_offset = 0
         mtp_split = should_split_mtp_dcp(plan, grp_views, layer_dcp=eff_cp, sparse=is_sparse)
         grp_heads = dcp_heads if eff_cp > 1 else local_heads
         grp_v_dim = eff_unabs_v if grp_unabsorbed else latent_dim
@@ -2083,11 +2130,27 @@ def _append_mla_attention(
                 shared_selection=(topk if (reuse_index_selection
                                            and isinstance(topk, SharedSelectionRef))
                                   else None),
-                runtime=runtime)
+                runtime=runtime, dsa_rank=dsa_rank,
+                dsa_batch_tokens=dsa_batch_tokens,
+                dsa_token_offset=dsa_token_offset)
+            if grp_dsa and view.phase == "prefill":
+                dsa_token_offset += max(0, int(view.q_len))
             if mtp_split:
-                hist = _history_only_pairs(view, eff_cp, cp_interleave_size, int(plan.window or 0))
+                hist = _history_only_metrics(
+                    view, rec["parts"], eff_cp, cp_interleave_size,
+                    int(plan.window or 0), query_tile, block_size,
+                )
                 if hist is not None:
-                    rec = {**rec, "v_pairs": hist, "pairs": float(sum(hist))}
+                    h_pairs, h_sweeps, h_shared, h_rows = hist
+                    rec = {
+                        **rec,
+                        "v_pairs": h_pairs,
+                        "pairs": float(sum(h_pairs)),
+                        "v_sweeps": h_sweeps,
+                        "sweeps": int(sum(h_sweeps)),
+                        "v_shared": h_shared,
+                        "v_rows": h_rows,
+                    }
             view_records.append({"orig_idx": orig_idx, **rec})
         if eff_cp > 1 and sparse_phase:
             pool_sparse_view_records(
@@ -2129,13 +2192,14 @@ def _append_mla_attention(
         kv_hbm_total = 0.0
         kv_mte2_total = 0.0
         kv_components: dict[str, tuple[float, float]] = {}
+        emit_dcp_lse = bool(eff_cp > 1 and not paired_sfa_mode)
         for rec in view_records:
             local_sweeps = rec["v_sweeps"][sel_sweeps_r]
             sweeps_by_view.append(local_sweeps)
             shared_by_view.append(min(local_sweeps, rec["v_shared"][sel_sweeps_r]))
             last, kv_hbm_component, kv_mte2_component = request_op(
                 rec, grp_views, grp_dsa, eff_cp, sel_pairs_r, sel_sweeps_r, kv_row_b,
-                view_unabsorbed=grp_unabsorbed)
+                view_unabsorbed=grp_unabsorbed, emit_dcp_lse=emit_dcp_lse)
             kv_hbm_total += kv_hbm_component
             kv_mte2_total += kv_mte2_component
             kv_components[last] = kv_hbm_component, kv_mte2_component
@@ -2162,7 +2226,7 @@ def _append_mla_attention(
                     views=grp_views, local_heads=logical_heads, qk_dim=grp_qk_dim,
                     v_dim=grp_v_dim, kv_row_bytes=kv_row_b,
                     act_dtype=model.activation_dtype)
-            grp_rows = max(1, sum(v.q_len for v in grp_views) if multi_group else max(0, q))
+            grp_rows = max(1, sum(int(v.q_len) for v in grp_views) or max(0, q))
             merged_last = emit_dcp_output_exchange_combine(
                 b.ops, prefix=grp_prefix, stage=stage, layer=plan.index,
                 requests=b.common["requests"], mode=mode,
@@ -2190,9 +2254,9 @@ def _project_mla_output(
     unabsorbed_set = set(unabsorbed_outputs)
     unabsorbed_list = [op_id for op_id in outputs if op_id in unabsorbed_set]
     absorbed_list = [op_id for op_id in outputs if op_id not in unabsorbed_set]
-    has_local_absorbed = any(not _is_fresh_dense_prefill_view(v) for v in views)
+    has_local_absorbed = any(not _is_unabsorbed_dense_prefill_view(v) for v in views)
     unabsorbed_rows = (
-        sum(int(v.q_len) for v in views if _is_fresh_dense_prefill_view(v))
+        sum(int(v.q_len) for v in views if _is_unabsorbed_dense_prefill_view(v))
         if has_unabsorbed_prefill else 0
     )
     v_expand_rows = (
