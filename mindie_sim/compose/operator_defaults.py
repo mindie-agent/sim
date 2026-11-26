@@ -25,11 +25,22 @@ from mindie_sim.prediction.implementation_selection import (
     with_automatic_lowering,
 )
 from mindie_sim.prediction.operators.paged_mla.family_mqsmla import (
+    DEFAULT_PAGE_SIZE as MQSMLA_DEFAULT_PAGE_SIZE,
+    DSL_NATIVE_KIND as MQSMLA_DSL_NATIVE,
     FORMATS as MQSMLA_CACHE_FORMATS,
+    KV_QUANT_FP8,
+    KV_QUANT_MXFP8,
     NATIVE_KIND as MQSMLA_NATIVE,
     RECIPE as MQSMLA_RECIPE,
     UNIT_CONTEXT_PARALLEL,
+    quant_mode_of as mqsmla_quant_mode_of,
+    resolve_abi_options as mqsmla_resolve_abi_options,
     supported_heads as mqsmla_supported_heads,
+)
+from mindie_sim.prediction.operators.paged_mla.mqsmla import (
+    DSL_MAX_PAGE_SIZE as MQSMLA_DSL_MAX_PAGE_SIZE,
+    is_abi_admitted as mqsmla_abi_admitted,
+    verify_mqsmla_abi,
 )
 from mindie_sim.catalog.cache_format import CacheFormat, cache_format
 from mindie_sim.schema.common import ModelingError
@@ -208,9 +219,50 @@ def automatic_mqsmla_reason(*, tp, cp, layer_plans) -> str | None:
 
 def packed_cache_reason(model) -> str | None:
     """First declared cache region that is not the A5 packed V4.1 ABI."""
+    if mqsmla_quant_mode_of(model, V41_HEAD_DIM) in {KV_QUANT_FP8, KV_QUANT_MXFP8}:
+        return None
     for region, declaration in MQSMLA_CACHE_FORMATS.items():
         if cache_format(model, region) != CacheFormat(**declaration):
             return CACHE_REASON_PREFIX + region
+    return None
+
+
+def mqsmla_abi_admission_reason(
+    *, arch, tp, layer_plans, runtime_metadata=None, quant_mode=None,
+    page_size=MQSMLA_DEFAULT_PAGE_SIZE, sku_id=None,
+) -> str | None:
+    """Verify MQSMLA ABI/track admission before installing an automatic policy."""
+    plans = tuple(layer_plans or ())
+    if not plans:
+        return None
+    soc_arch, resolved_sku, pr_track, track_spec, bindings = mqsmla_resolve_abi_options(
+        runtime_metadata, arch=arch, sku_id=sku_id,
+    )
+    degree = max(int(tp), 1)
+    heads = max(1, int(plans[0].num_heads) // degree)
+    has_compressed = any(int(getattr(p, "compress_ratio", 0) or 0) > 0 for p in plans)
+    has_topk = any(int(getattr(p, "index_topk", 0) or 0) > 0 for p in plans)
+    topk = max((int(getattr(p, "index_topk", 0) or 0) for p in plans), default=0)
+    eff_page_size = max(1, int(page_size or MQSMLA_DEFAULT_PAGE_SIZE))
+    if quant_mode is None and eff_page_size > MQSMLA_DSL_MAX_PAGE_SIZE:
+        return f"mqsmla_dsl_page_size_exceeds_limit:{eff_page_size}>{MQSMLA_DSL_MAX_PAGE_SIZE}"
+    verdict = verify_mqsmla_abi(
+        soc_arch=soc_arch,
+        sku_id=resolved_sku,
+        quant_mode=quant_mode,
+        active_q=MIN_ACTIVE_DECODE_TOKENS,
+        heads=heads,
+        batch=1,
+        compressed_cache=has_compressed,
+        topk_present=has_topk,
+        topk=topk,
+        page_size=eff_page_size,
+        pr_track=pr_track,
+        track_spec=track_spec,
+        manifest_bindings=bindings,
+    )
+    if not mqsmla_abi_admitted(verdict):
+        return f"mqsmla_abi_not_admitted:{verdict.status}:{verdict.rejection_reason}"
     return None
 
 
@@ -314,12 +366,19 @@ def apply_compose_v41_a5_defaults(*, model_dict, lowerings, backend, arch,
     if reason is not None:
         notes.append(fallback_note(MQSMLA_FAMILY, reason))
         return notes
+    abi_reason = mqsmla_abi_admission_reason(
+        arch=arch, tp=tp, layer_plans=layer_plans,
+        runtime_metadata=runtime_metadata, quant_mode=None,
+    )
+    if abi_reason is not None:
+        notes.append(fallback_note(MQSMLA_FAMILY, abi_reason))
+        return notes
     lowerings[MQSMLA_SELECTOR] = mqsmla_decode_policy()
     if runtime_metadata is not None:
         runtime_metadata[AUTOMATIC_LOWERINGS_KEY] = tuple(
             with_automatic_lowering(runtime_metadata, MQSMLA_SELECTOR)
             [AUTOMATIC_LOWERINGS_KEY])
-    notes.append(selected_note(MQSMLA_FAMILY, MQSMLA_RECIPE, MQSMLA_NATIVE,
+    notes.append(selected_note(MQSMLA_FAMILY, MQSMLA_RECIPE, MQSMLA_DSL_NATIVE,
                                SELECTED_REASON))
     return notes
 
@@ -348,14 +407,24 @@ def mqsmla_default(case, kernels):
     lowerings = kernels.setdefault("lowerings", {})
     automatic = installed_automatically(case.runtime.metadata, MQSMLA_SELECTOR)
     parallel = case.runtime.parallel
+    quant_mode = mqsmla_quant_mode_of(case.model, V41_HEAD_DIM)
+    native_kind = MQSMLA_DSL_NATIVE if quant_mode is None else MQSMLA_NATIVE
     reason = static_mqsmla_reason(
         arch=case.machine.arch_family, cp=parallel.cp, tp=parallel.tp,
         layer_plans=layers, model=case.model)
+    if reason is None:
+        reason = mqsmla_abi_admission_reason(
+            arch=case.machine.arch_family, tp=parallel.tp, layer_plans=layers,
+            runtime_metadata=case.runtime.metadata, quant_mode=quant_mode,
+            page_size=int(getattr(case.runtime, "kv_block_size", 0) or MQSMLA_DEFAULT_PAGE_SIZE),
+            sku_id=getattr(case.machine, "sku", None),
+        )
     if MQSMLA_SELECTOR in lowerings:
         eff_mqsmla = _effective_binding_name(lowerings[MQSMLA_SELECTOR])
         if automatic and reason is not None:
+            lowerings.pop(MQSMLA_SELECTOR, None)
             return {"family": MQSMLA_FAMILY, "selection": "preserved",
-                    "reason": reason, "degraded": True, "installed": True}
+                    "reason": reason, "degraded": True, "installed": False}
         if eff_mqsmla is None or eff_mqsmla == "analytical":
             return {"family": MQSMLA_FAMILY, "selection": "preserved",
                     "binding": "analytical",
@@ -367,7 +436,7 @@ def mqsmla_default(case, kernels):
                     "binding": MQSMLA_RECIPE,
                     "reason": SELECTED_REASON if automatic
                               else "explicit_implementation_preserved",
-                    "native_kind": MQSMLA_NATIVE, "degraded": False,
+                    "native_kind": native_kind, "degraded": False,
                     "installed": automatic}
         return {"family": MQSMLA_FAMILY, "selection": "preserved",
                 "binding": eff_mqsmla,
@@ -380,7 +449,7 @@ def mqsmla_default(case, kernels):
     lowerings[MQSMLA_SELECTOR] = mqsmla_decode_policy()
     return {"family": MQSMLA_FAMILY, "selection": "default_installed",
             "binding": MQSMLA_RECIPE, "reason": SELECTED_REASON,
-            "native_kind": MQSMLA_NATIVE, "degraded": False, "installed": True}
+            "native_kind": native_kind, "degraded": False, "installed": True}
 
 
 def index_probe_rows(case):

@@ -747,6 +747,88 @@ def _region_csa_reload_rows(views, *, idx_ratio: int, sel_topk: int) -> tuple[in
     return max_regions, reload_rows
 
 
+def _build_region_csa_score_op(
+    *,
+    prefix: str,
+    plan,
+    views,
+    stage: int,
+    requests: tuple[str, ...],
+    mode: str,
+    valid: int,
+    idx_heads: int,
+    idx_dim: int,
+    row_bytes: float,
+    rows_by_view: list[int],
+    shared_idx_by_view: list[int],
+    scored_rows: int,
+    idx_wq_id: str,
+    idx_ready: str,
+    idx_ratio: int,
+    sel_topk: int,
+    user_pinned_idx: bool,
+    runtime,
+    idx_weights_id: str | None,
+    l2_bounded_index_read: float,
+    topk_write_bytes: float,
+    shape: tuple[int, int, int],
+) -> tuple[tuple[OpSpec, ...], str, str, bool]:
+    # Upstream indexer_region_score.cpp:52-70 + select.h:474-503 allocates a
+    # minimum 8-float stride workspace, writes FP32 scores, and reloads for
+    # radix TopK only on rows with history > topk (FillUnderKIds otherwise).
+    region_dtype = "fp8_e4m3"
+    region_q_bytes = float(valid * idx_heads * idx_dim) * dtype_bytes(region_dtype) if scored_rows else 0.0
+    weights_read_bytes = float(valid * idx_heads * FP32_SCORE_BYTES) if scored_rows else 0.0
+    max_req_regions, reload_score_rows = _region_csa_reload_rows(
+        views, idx_ratio=idx_ratio, sel_topk=sel_topk,
+    )
+    ws_stride = max(REGION_WS_MIN_STRIDE, align_up(max_req_regions, REGION_WS_MIN_STRIDE))
+    score_ws_capacity = float(valid * ws_stride * FP32_SCORE_BYTES)
+    score_write_bytes = float(scored_rows * FP32_SCORE_BYTES)
+    score_reload_bytes = float(reload_score_rows * FP32_SCORE_BYTES)
+    score_flops = float(2 * scored_rows * idx_heads * idx_dim)
+    score_deps = tuple(dep for dep in (idx_wq_id, idx_weights_id, idx_ready) if dep)
+    fused_meta: tuple[tuple[str, object], ...] = (
+        ("score_materialization", "gm_score_workspace_then_radix_topk"),
+        ("gm_score_workspace_bytes", score_ws_capacity),
+        ("gm_score_reload_bytes", score_reload_bytes),
+        ("selection_output_dtype", "int32"),
+        ("fused_topk", True),
+        ("indexer_kind", "region_csa_score"),
+        ("native_kind", "npu_indexer_region_score"),
+    )
+    idx_scores = OpSpec(
+        op_id=prefix + ".index_scores", family="indexer", phase=mode, stage=stage,
+        layer=plan.index, requests=requests, semantic_shape=shape, local_shape=shape,
+        padded_shape=shape, launch_shape=shape,
+        flops=score_flops,
+        matrix_flops=((region_dtype, score_flops),) if score_flops else (),
+        vector_ops=float(
+            INDEX_SCORE_VECTOR_OPS_PER_ROW * idx_heads * scored_rows
+            + TOPK_OPS_PER_ELEMENT * reload_score_rows
+        ),
+        hbm_bytes=float(
+            l2_bounded_index_read + region_q_bytes + weights_read_bytes
+            + score_write_bytes + score_reload_bytes + topk_write_bytes
+        ),
+        mte2_bytes=float(
+            scored_rows * row_bytes + region_q_bytes + weights_read_bytes + score_reload_bytes
+        ),
+        mte3_bytes=float(score_write_bytes + topk_write_bytes),
+        deps=score_deps, recipe="index_scores",
+        dtype=region_dtype, metadata=fused_meta,
+    )
+    idx_scores = apply_indexer_prefix_reads(
+        idx_scores, views=views, rows_by_view=rows_by_view,
+        shared_rows_by_view=shared_idx_by_view, row_bytes=float(row_bytes),
+        layer_index=plan.index, runtime=runtime, compression_ratio=idx_ratio,
+        kernel_reuse=("native_per_sequence" if user_pinned_idx or plan.candidate_filter else "tile"),
+        allow_recipe_rebind=not user_pinned_idx,
+        hbm_component=l2_bounded_index_read, mte2_component=float(scored_rows) * row_bytes,
+    )
+    return (idx_scores,), idx_scores.op_id, idx_scores.op_id, True
+
+
 def _build_index_score_and_topk_ops(
     *,
     prefix: str,
@@ -835,60 +917,17 @@ def _build_index_score_and_topk_ops(
         )
     topk_write_bytes = float(valid * sel_topk * INT32_INDEX_BYTES)
     if is_region:
-        # Upstream indexer_region_score.cpp:52-70 + select.h:474-503 allocates a
-        # minimum 8-float stride workspace, writes FP32 scores, and reloads for
-        # radix TopK only on rows with history > topk (FillUnderKIds otherwise).
-        region_dtype = "fp8_e4m3"
-        region_q_bytes = float(valid * idx_heads * idx_dim) * dtype_bytes(region_dtype) if scored_rows else 0.0
-        weights_read_bytes = float(valid * idx_heads * FP32_SCORE_BYTES) if scored_rows else 0.0
-        max_req_regions, reload_score_rows = _region_csa_reload_rows(
-            views, idx_ratio=idx_ratio, sel_topk=sel_topk,
+        return _build_region_csa_score_op(
+            prefix=prefix, plan=plan, views=views, stage=stage, requests=requests,
+            mode=mode, valid=valid, idx_heads=idx_heads, idx_dim=idx_dim,
+            row_bytes=row_bytes, rows_by_view=rows_by_view,
+            shared_idx_by_view=shared_idx_by_view, scored_rows=scored_rows,
+            idx_wq_id=idx_wq_id, idx_ready=idx_ready, idx_ratio=idx_ratio,
+            sel_topk=sel_topk, user_pinned_idx=user_pinned_idx, runtime=runtime,
+            idx_weights_id=idx_weights_id,
+            l2_bounded_index_read=l2_bounded_index_read,
+            topk_write_bytes=topk_write_bytes, shape=shape,
         )
-        ws_stride = max(REGION_WS_MIN_STRIDE, align_up(max_req_regions, REGION_WS_MIN_STRIDE))
-        score_ws_capacity = float(valid * ws_stride * FP32_SCORE_BYTES)
-        score_write_bytes = float(scored_rows * FP32_SCORE_BYTES)
-        score_reload_bytes = float(reload_score_rows * FP32_SCORE_BYTES)
-        score_flops = float(2 * scored_rows * idx_heads * idx_dim)
-        score_deps = tuple(dep for dep in (idx_wq_id, idx_weights_id, idx_ready) if dep)
-        fused_meta: tuple[tuple[str, object], ...] = (
-            ("score_materialization", "gm_score_workspace_then_radix_topk"),
-            ("gm_score_workspace_bytes", score_ws_capacity),
-            ("gm_score_reload_bytes", score_reload_bytes),
-            ("selection_output_dtype", "int32"),
-            ("fused_topk", True),
-            ("indexer_kind", "region_csa_score"),
-            ("native_kind", "npu_indexer_region_score"),
-        )
-        idx_scores = OpSpec(
-            op_id=prefix + ".index_scores", family="indexer", phase=mode, stage=stage,
-            layer=plan.index, requests=requests, semantic_shape=shape, local_shape=shape,
-            padded_shape=shape, launch_shape=shape,
-            flops=score_flops,
-            matrix_flops=((region_dtype, score_flops),) if score_flops else (),
-            vector_ops=float(
-                INDEX_SCORE_VECTOR_OPS_PER_ROW * idx_heads * scored_rows
-                + TOPK_OPS_PER_ELEMENT * reload_score_rows
-            ),
-            hbm_bytes=float(
-                l2_bounded_index_read + region_q_bytes + weights_read_bytes
-                + score_write_bytes + score_reload_bytes + topk_write_bytes
-            ),
-            mte2_bytes=float(
-                scored_rows * row_bytes + region_q_bytes + weights_read_bytes + score_reload_bytes
-            ),
-            mte3_bytes=float(score_write_bytes + topk_write_bytes),
-            deps=score_deps, recipe="index_scores",
-            dtype=region_dtype, metadata=fused_meta,
-        )
-        idx_scores = apply_indexer_prefix_reads(
-            idx_scores, views=views, rows_by_view=rows_by_view,
-            shared_rows_by_view=shared_idx_by_view, row_bytes=float(row_bytes),
-            layer_index=plan.index, runtime=runtime, compression_ratio=idx_ratio,
-            kernel_reuse=("native_per_sequence" if user_pinned_idx or plan.candidate_filter else "tile"),
-            allow_recipe_rebind=not user_pinned_idx,
-            hbm_component=l2_bounded_index_read, mte2_component=float(scored_rows) * row_bytes,
-        )
-        return (idx_scores,), idx_scores.op_id, idx_scores.op_id, True
     score_bytes = float(scored_rows * FP32_SCORE_BYTES)
     topk_read_bytes = score_bytes
     score_meta: tuple[tuple[str, object], ...] = (
@@ -1249,7 +1288,7 @@ def _region_csa_prep_ops(
         dtype=act_dtype,
         family="rotary",
         phase=mode,
-        recipe="index_qk_rope",
+        recipe="rotary",
         read_bytes_override=float(qk_elems) * act_bytes + float(padded_tokens * rope_dim) * act_bytes,
         write_bytes_override=float(qk_elems) * act_bytes,
         shape=(padded_tokens, idx_heads + local_k_heads, idx_dim),

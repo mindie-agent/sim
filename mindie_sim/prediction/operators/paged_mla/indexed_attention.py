@@ -693,6 +693,92 @@ def _dequant_cast_scale(ctx) -> float:
     return (INDEXED_DEQUANT_NONCAST_OPS + INDEXED_DEQUANT_CAST_OPS * cast_ratio) / total
 
 
+def _compute_compact_nominal(
+    ctx, owner, all_work, all_placement, bind, tile_keys, phases, slots,
+    phase_caps, duration, _vector_weights, compute_units, empty_phase, empty_key,
+):
+    vec_res = ctx.resource_names.get("vector")
+    dq_scale = _dequant_cast_scale(ctx)
+    phase_times = {}
+    stream_tail = {}
+    retired = [0.0] * slots
+    end = 0.0
+    for count, key in enumerate(tile_keys(owner)):
+        if key not in phase_times:
+            times = []
+            for name, phase in phases(key):
+                work, placement = bind(phase, name, key)
+                caps = phase_caps(work, name, key)
+                eff_work = (
+                    {r: (v * dq_scale if r == vec_res else v) for r, v in work.items()}
+                    if (name == "dequantize" and dq_scale < 1.0 and vec_res in work)
+                    else work
+                )
+                base_dur = max(
+                    duration(eff_work, placement),
+                    max((eff_work[r] / cap for r, cap in caps.items()), default=0.0),
+                )
+                times.append((name, base_dur + _indexed_phase_sync_ms(ctx, name, key[0])))
+            phase_times[key] = tuple(times)
+        ready = retired[count % slots]
+        prior_partial = stream_tail.get("partial", 0)
+        for name, elapsed in phase_times[key]:
+            if name == "nupdate" and not key[1]:
+                ready = max(ready, prior_partial)
+            ready = max(ready, stream_tail.get(name, 0)) + elapsed
+            stream_tail[name] = ready
+        retired[count % slots] = ready
+        end = max(end, ready)
+    if empty_phase is not None:
+        e_work, e_place = bind(empty_phase, "output", empty_key)
+        e_caps = phase_caps(e_work, "output", empty_key)
+        end += max(
+            duration(e_work, e_place),
+            max((e_work[r] / cap for r, cap in e_caps.items()), default=0.0),
+        )
+    unit_demand = Counter()
+    eff_unit_demand = Counter()
+    for key, count in Counter(tile_keys(owner)).items():
+        for name, phase in phases(key):
+            work, placement = bind(phase, name, key)
+            weights = {ctx.resource_names[ctx.physical_role(role)]: tuple(
+                value for value in fractions if value)
+                for role, fractions in _vector_weights(name, key).items()}
+            for resource, units in placement.items():
+                raw_amt = work.get(resource, 0) * count
+                eff_amt = (
+                    raw_amt * dq_scale
+                    if (name == "dequantize" and resource == vec_res and dq_scale < 1.0)
+                    else raw_amt
+                )
+                fractions = weights.get(resource, (1 / len(units),) * len(units))
+                for unit, fraction in zip(units, fractions):
+                    unit_demand[resource, unit] += raw_amt * fraction
+                    eff_unit_demand[resource, unit] += eff_amt * fraction
+    if empty_phase is not None:
+        e_work, e_place = bind(empty_phase, "output", empty_key)
+        e_weights = {ctx.resource_names[ctx.physical_role(role)]: tuple(
+            value for value in fractions if value)
+            for role, fractions in _vector_weights("output", empty_key).items()}
+        for resource, units in e_place.items():
+            raw_amt = e_work.get(resource, 0)
+            fractions = e_weights.get(resource, (1 / len(units),) * len(units))
+            for unit, fraction in zip(units, fractions):
+                unit_demand[resource, unit] += raw_amt * fraction
+                eff_unit_demand[resource, unit] += raw_amt * fraction
+    for (resource, _), amount in eff_unit_demand.items():
+        role = next(role for role, name in ctx.resource_names.items()
+                    if name == resource)
+        end = max(end, amount * ctx.resource_units.get(
+            role, compute_units) / ctx.rates[resource])
+    eff_all_work = {
+        r: (sum(v for (res, _), v in eff_unit_demand.items() if res == r)
+            if r == vec_res and dq_scale < 1.0 else amt)
+        for r, amt in all_work.items()
+    }
+    return max(end, duration(eff_all_work, all_placement)), dict(unit_demand)
+
+
 def _compact_owner_program(
     ctx, owner, owner_work, bind, phase_unit_weights, heads, tile_keys, phases, nominal, slots,
     phase_caps, duration, _vector_weights, compute_units, buffers,
@@ -725,66 +811,10 @@ def _compact_owner_program(
         all_placement = {resource: tuple(sorted(units))
                          for resource, units in actual_units.items()}
     if owner not in nominal:
-        phase_times = {}
-        stream_tail = {}
-        retired = [0.0] * slots
-        end = 0.0
-        for count, key in enumerate(tile_keys(owner)):
-            if key not in phase_times:
-                times = []
-                for name, phase in phases(key):
-                    work, placement = bind(phase, name, key)
-                    caps = phase_caps(work, name, key)
-                    base_dur = max(
-                        duration(work, placement),
-                        max((work[r] / cap for r, cap in caps.items()), default=0.0),
-                    )
-                    times.append((name, base_dur + _indexed_phase_sync_ms(ctx, name, key[0])))
-                phase_times[key] = tuple(times)
-            ready = retired[count % slots]
-            prior_partial = stream_tail.get("partial", 0)
-            for name, elapsed in phase_times[key]:
-                if name == "nupdate" and not key[1]:
-                    ready = max(ready, prior_partial)
-                ready = max(ready, stream_tail.get(name, 0)) + elapsed
-                stream_tail[name] = ready
-            retired[count % slots] = ready
-            end = max(end, ready)
-        if empty_phase is not None:
-            e_work, e_place = bind(empty_phase, "output", empty_key)
-            e_caps = phase_caps(e_work, "output", empty_key)
-            end += max(
-                duration(e_work, e_place),
-                max((e_work[r] / cap for r, cap in e_caps.items()), default=0.0),
-            )
-        unit_demand = Counter()
-        for key, count in Counter(tile_keys(owner)).items():
-            for name, phase in phases(key):
-                work, placement = bind(phase, name, key)
-                weights = {ctx.resource_names[ctx.physical_role(role)]: tuple(
-                    value for value in fractions if value)
-                    for role, fractions in _vector_weights(name, key).items()}
-                for resource, units in placement.items():
-                    raw_amt = work.get(resource, 0) * count
-                    fractions = weights.get(resource, (1 / len(units),) * len(units))
-                    for unit, fraction in zip(units, fractions):
-                        unit_demand[resource, unit] += raw_amt * fraction
-        if empty_phase is not None:
-            e_work, e_place = bind(empty_phase, "output", empty_key)
-            e_weights = {ctx.resource_names[ctx.physical_role(role)]: tuple(
-                value for value in fractions if value)
-                for role, fractions in _vector_weights("output", empty_key).items()}
-            for resource, units in e_place.items():
-                raw_amt = e_work.get(resource, 0)
-                fractions = e_weights.get(resource, (1 / len(units),) * len(units))
-                for unit, fraction in zip(units, fractions):
-                    unit_demand[resource, unit] += raw_amt * fraction
-        for (resource, _), amount in unit_demand.items():
-            role = next(role for role, name in ctx.resource_names.items()
-                        if name == resource)
-            end = max(end, amount * ctx.resource_units.get(
-                role, compute_units) / ctx.rates[resource])
-        nominal[owner] = (max(end, duration(all_work, all_placement)), dict(unit_demand))
+        nominal[owner] = _compute_compact_nominal(
+            ctx, owner, all_work, all_placement, bind, tile_keys, phases, slots,
+            phase_caps, duration, _vector_weights, compute_units, empty_phase, empty_key,
+        )
     end, u_demand = nominal[owner]
     caps = {key: amount / end for key, amount in all_work.items()} if end else {}
     has_two_vector_aivs = len(all_placement.get(ctx.resource_names.get("vector", "vector"), ())) == 2
@@ -989,7 +1019,7 @@ def _lower_indexed_attention(
         *tuple(tuple(sorted(mapping.items())) for mapping in (
             ctx.rates, ctx.resource_names, ctx.resource_units,
             ctx.service_modes, ctx.compute_peaks)),
-        p13_paired_ms(ctx), p03_fixpipe_setup_ms(ctx),
+        p13_paired_ms(ctx), p03_fixpipe_setup_ms(ctx), _dequant_cast_scale(ctx),
     )
     if signature not in nominal_cache:
         nominal_cache[signature] = {}

@@ -8,12 +8,14 @@
 [Timeouts & Locks] O(active query rows), no file or device access.
 [Side-Effect Policy] Returns immutable operators and a shared Engine recipe.
 """
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Literal
 
 from mindie_sim.catalog.cache_format import CacheFormat, cache_format
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.datapath import SourceRef
+from mindie_sim.schema.stack import ManifestBinding
 from mindie_sim.prediction.mechanism import PlannedRecipe
 from .mqsmla import (
     COMPRESSED_CACHE_ROW_BYTES,
@@ -206,14 +208,111 @@ def _layout_contract(quant_mode: int | None) -> str:
     return "aclnn_dense_bf16"
 
 
-def _abi_options_from_runtime(runtime) -> tuple[str, str | None, str, object | None, tuple]:
-    rt_meta = dict(getattr(runtime, "metadata", ()) or ()) if runtime is not None else {}
-    soc_arch = str(rt_meta.get("soc_arch") or getattr(runtime, "arch_family", "") or "A5").strip().upper()
-    sku_id = str(rt_meta.get("sku_id") or "").strip().lower() or None
+def manifest_binding_from_dict(item) -> ManifestBinding | None:
+    if isinstance(item, ManifestBinding):
+        return item
+    if not isinstance(item, Mapping):
+        return None
+    mid = str(item.get("mechanism_id") or "").strip()
+    state = str(item.get("state") or "unmerged_pr").strip()
+    ref = str(item.get("ref") or "").strip()
+    if not mid or state not in {"merged", "unmerged_pr"} or not ref:
+        return None
+    prov_raw = item.get("provenance")
+    prov_map = prov_raw if isinstance(prov_raw, Mapping) else {}
+    prov = SourceRef(
+        repository=str(prov_map.get("repository") or ""),
+        revision=str(prov_map.get("revision") or ""),
+        relative_path=str(prov_map.get("relative_path") or ""),
+        source_sha256=str(prov_map.get("source_sha256") or ""),
+    )
+    raw_opts = item.get("options") or ()
+    opts = tuple(
+        (str(k), v)
+        for k, v in (raw_opts.items() if isinstance(raw_opts, Mapping) else raw_opts)
+    )
+    return ManifestBinding(
+        mechanism_id=mid,
+        state=state,  # type: ignore[arg-type]
+        ref=ref,
+        lowering_pass_id=str(item.get("lowering_pass_id") or ""),
+        provenance=prov,
+        archs=tuple(str(a) for a in (item.get("archs") or ())),
+        models=tuple(str(m) for m in (item.get("models") or ())),
+        options=opts,
+        capability_predicates=tuple(str(p) for p in (item.get("capability_predicates") or ())),
+        phase_scope=tuple(str(p) for p in (item.get("phase_scope") or ())),
+        notes=str(item.get("notes") or ""),
+    )
+
+
+def _serialize_manifest_binding(binding) -> dict:
+    if hasattr(binding, "to_dict"):
+        return dict(binding.to_dict())
+    if isinstance(binding, Mapping):
+        return dict(binding)
+    return {
+        "mechanism_id": str(getattr(binding, "mechanism_id", "") or ""),
+        "state": str(getattr(binding, "state", "unmerged_pr") or "unmerged_pr"),
+        "ref": str(getattr(binding, "ref", "") or ""),
+        "lowering_pass_id": str(getattr(binding, "lowering_pass_id", "") or ""),
+    }
+
+
+def resolve_abi_options(
+    runtime_metadata, *, arch: str | None = None, sku_id: str | None = None,
+) -> tuple[str, str | None, str, object | None, tuple]:
+    rt_meta = dict(runtime_metadata or ()) if runtime_metadata else {}
+    soc_arch = str(
+        rt_meta.get("soc_arch") or rt_meta.get("arch_family") or arch or "A5"
+    ).strip().upper()
+    resolved_sku = str(rt_meta.get("sku_id") or sku_id or "").strip().lower() or None
     track_spec = rt_meta.get("abi_track_spec")
-    pr_track = str(getattr(track_spec, "track", "") or rt_meta.get("abi_pr_track") or "shipping")
-    bindings = tuple(rt_meta.get("abi_manifest_bindings") or ())
-    return soc_arch, sku_id, pr_track, track_spec, bindings
+    report = rt_meta.get("feature_track_report")
+    report_map = report if isinstance(report, Mapping) else {}
+    single_spine = rt_meta.get("single_spine")
+    spine_map = single_spine if isinstance(single_spine, Mapping) else {}
+    explicit_track = getattr(track_spec, "track", "") or rt_meta.get("abi_pr_track")
+    if explicit_track:
+        pr_track = str(explicit_track).strip().lower()
+    elif rt_meta.get("raw_eager"):
+        pr_track = "eager"
+    else:
+        pr_track = str(
+            report_map.get("feature_track")
+            or spine_map.get("stack_track")
+            or "shipping"
+        ).strip().lower()
+    raw_bindings = rt_meta.get("abi_manifest_bindings")
+    if raw_bindings:
+        bindings = tuple(
+            manifest_binding_from_dict(item) if isinstance(item, Mapping) else item
+            for item in raw_bindings
+        )
+        bindings = tuple(b for b in bindings if b is not None)
+    elif track_spec is not None and getattr(track_spec, "active_bindings", None):
+        bindings = tuple(track_spec.active_bindings)
+    elif pr_track in {"proposed", "target"} and report_map:
+        active_ids = {
+            str(entry.get("id") or "").strip()
+            for entry in (report_map.get("active_mechanisms") or ())
+            if isinstance(entry, Mapping) and str(entry.get("id") or "").strip()
+        }
+        parsed = []
+        for item in (report_map.get("unmerged_pr_mechanisms") or ()):
+            binding = manifest_binding_from_dict(item)
+            if binding is not None and binding.mechanism_id in active_ids:
+                parsed.append(binding)
+        bindings = tuple(parsed)
+    else:
+        bindings = ()
+    return soc_arch, resolved_sku, pr_track, track_spec, bindings
+
+
+def _abi_options_from_runtime(runtime) -> tuple[str, str | None, str, object | None, tuple]:
+    rt_meta = getattr(runtime, "metadata", None) if runtime is not None else None
+    arch = getattr(runtime, "arch_family", "") if runtime is not None else ""
+    return resolve_abi_options(rt_meta, arch=arch)
 
 
 def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefix,
@@ -285,12 +384,13 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
     api_payload = {"namespace": api_namespace, "entry": api_entry}
     if not is_dsl:
         api_payload["aclnn_symbol"] = native_kind
+    serialized_bindings = tuple(_serialize_manifest_binding(b) for b in bindings)
     meta = {**dict(members[0].metadata), "mqsmla_geometry": shape,
             "logical_pairs": sum(dict(op.metadata).get("logical_pairs", 0) for op in members),
             "kv_sweeps": sum(dict(op.metadata).get("kv_sweeps", 0) for op in members),
             "abi_pr_track": pr_track,
-            **({"abi_track_spec": track_spec} if track_spec is not None else {}),
-            **({"abi_manifest_bindings": bindings} if bindings else {}),
+            "abi_page_size": page_size,
+            **({"abi_manifest_bindings": serialized_bindings} if serialized_bindings else {}),
             **({"abi_sku_id": sku_id} if sku_id else {}),
             "implementation_binding": {
                 "selector": "mqsmla_attention", "implementation": implementation,
