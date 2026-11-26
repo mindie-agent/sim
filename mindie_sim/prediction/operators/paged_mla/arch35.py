@@ -414,11 +414,12 @@ class _DirectStrategy:
             host = resolve_fia_host_plan(
                 sequences=c.sequences, physical_heads=c.physical_heads,
                 aic_count=len(pairs), aiv_per_aic=aiv_per_aic, is_arch35=True,
+                s2_tile=key_tile,
             )
             if host.fd_enabled:
                 host_plan = host
         elem_b = int(dtype_bytes(op.dtype or "bf16"))
-        l2_cap = int(ctx.geometry.buffers.get("l2", dict(ctx.datapath.buffers).get("l2", 0)))
+        l2_cap = ctx.usable_l2_bytes if c.abi == MQS_ABI else 0
         if c.abi in DENSE_CANN_ABIS:
             total_groups = sum(ceil_div(q * c.physical_heads, heads) for q, _ in c.sequences if q)
         else:

@@ -867,3 +867,42 @@ def test_refill_steady_compaction_matches_literal_replay_after_heavy_prologue():
     compacted = refill_steady.compact_periodic_pipeline(ctx, 100, 4, tile)
     literal = PipelineProgram(100, 4, tile)
     assert span(compacted) == span(literal) == 140.0
+
+
+def test_vector_groups_causal_span_lower_bound_and_zero_count_raw_dependencies():
+    """Concurrent RAW-tailed vector groups honor causal prefix lower bounds and skip empty :raw deps."""
+    from mindie_sim.prediction.runtime.prepared_terms import bind_vector_groups
+
+    # Two concurrent 10-inst SFU groups share vec_issue (1 inst/ns): 18 prefix insts + 20 ns RAW = 38 ns.
+    pair = tuple(VectorInstructionGroup(s, "vec_sfu", 10, result_latency_cycles=20) for s in ("x", "y"))
+    bound = bind_vector_groups(pair, issue_rate_per_ms=1e6, pipe_rates_per_ms={"vec_sfu": 1e6}, clock_hz=1e9)
+    eng = Engine([Resource("vec_issue", 1e6), Resource("vec_sfu", 1e6)], backend="python")
+    done = KernelProgram(bound.stages).start(eng, "vector", eng.submit("ready"))
+    eng.advance(until=(done,))
+    assert round(bound.span_ms * 1e6) == round(done.time * 1e6) == 38
+
+    # Downstream consumer depending on both concurrent RAW-tailed groups adds cleanly after 38 ns.
+    chained = (*pair, VectorInstructionGroup("z", "vec_alu", 5, dependencies=("x", "y")))
+    b_chain = bind_vector_groups(
+        chained, issue_rate_per_ms=1e6, pipe_rates_per_ms={"vec_sfu": 1e6, "vec_alu": 1e6}, clock_hz=1e9,
+    )
+    e_chain = Engine(
+        [Resource("vec_issue", 1e6), Resource("vec_sfu", 1e6), Resource("vec_alu", 1e6)], backend="python",
+    )
+    d_chain = KernelProgram(b_chain.stages).start(e_chain, "chain", e_chain.submit("ready"))
+    e_chain.advance(until=(d_chain,))
+    assert round(b_chain.span_ms * 1e6) == round(d_chain.time * 1e6) == 43
+
+    # A zero-count group with positive result_latency_cycles emits no :raw stage and keeps deps valid.
+    for cycles in (0, 8):
+        groups = (
+            VectorInstructionGroup("src", "vec_alu", 4),
+            VectorInstructionGroup("tail", "vec_alu", 0, result_latency_cycles=cycles, dependencies=("src",)),
+            VectorInstructionGroup("use", "vec_alu", 1, dependencies=("tail",)),
+        )
+        b_zero = bind_vector_groups(groups, issue_rate_per_ms=1e6, pipe_rates_per_ms={"vec_alu": 1e6}, clock_hz=1e9)
+        e_zero = Engine([Resource("vec_issue", 1e6), Resource("vec_alu", 1e6)], backend="python")
+        d_zero = KernelProgram(b_zero.stages).start(e_zero, "vec", e_zero.submit("ready"))
+        e_zero.advance(until=(d_zero,))
+        assert b_zero.raw_latency_ms == 0.0
+        assert round(b_zero.span_ms * 1e6) == round(d_zero.time * 1e6) == 5

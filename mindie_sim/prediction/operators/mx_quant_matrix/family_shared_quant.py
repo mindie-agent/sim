@@ -19,6 +19,10 @@ from mindie_sim.catalog.ops import vector_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.datapath import SourceRef
 
+from mindie_sim.prediction.fusion.ports import (
+    control_dependency_names,
+    input_port_entries,
+)
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
 from mindie_sim.prediction.ownership import read_role, unit_group
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
@@ -306,7 +310,10 @@ def _roles(op):
     return meta.get("ffn_category"), meta.get("ffn_role")
 
 
-def _build_dequant_swiglu_consumer(gate, activation, down, scale_source, metadata, rows, width, gate_width):
+def _build_dequant_swiglu_consumer(
+    gate, activation, down, scale_source, metadata, rows, width, gate_width,
+    *, extra_deps=(), extra_control_deps=(),
+):
     config = {
         "rows": rows, "width": width, "gate_width": gate_width,
         "activation_quant_mode": "dynamic", "swiglu_mode": 1,
@@ -340,8 +347,14 @@ def _build_dequant_swiglu_consumer(gate, activation, down, scale_source, metadat
             "down_consumer": down.op_id}},
         "semantic_recipe": activation.recipe, "semantic_family": activation.family,
     }
+    if extra_control_deps:
+        existing_controls = tuple(consumer_meta.get("control_deps", ()) or ())
+        consumer_meta["control_deps"] = tuple(dict.fromkeys((*existing_controls, *extra_control_deps)))
+    consumer_deps = tuple(dict.fromkeys((
+        gate.op_id, scale_source.op_id, *activation.deps, *extra_deps,
+    )))
     consumer = vector_op(
-        op_id=activation.op_id, deps=(gate.op_id, scale_source.op_id),
+        op_id=activation.op_id, deps=consumer_deps,
         stage=activation.stage, layer=activation.layer,
         requests=activation.requests, elements=rows * width, ops_per_element=0,
         dtype="int8", family="dequant_swiglu_quant", phase=activation.phase,
@@ -364,9 +377,21 @@ def _build_dequant_swiglu_consumer(gate, activation, down, scale_source, metadat
 def _rewrite(ops, gate):
     by_id = {op.op_id: op for op in ops}
     users = {op.op_id: [] for op in ops}
+    data_users = {op.op_id: [] for op in ops}
     for op in ops:
+        controls = control_dependency_names(op, by_id)
+        seen_data: set[str] = set()
         for dep in op.deps:
             users.setdefault(dep, []).append(op.op_id)
+            if dep not in controls:
+                data_users.setdefault(dep, []).append(op.op_id)
+                seen_data.add(dep)
+        for dep, _port in input_port_entries(op.metadata):
+            if dep not in seen_data:
+                data_users.setdefault(dep, []).append(op.op_id)
+                seen_data.add(dep)
+            if op.op_id not in users.setdefault(dep, []):
+                users[dep].append(op.op_id)
     metadata = dict(gate.metadata)
     rows, gate_width, hidden = gate.local_shape
     if gate_width % 2:
@@ -380,6 +405,8 @@ def _rewrite(ops, gate):
         raise ModelingError(
             f"shared_quant_requires_one_activation_consumer:{len(activations)}")
     activation = activations[0]
+    if set(data_users.get(gate.op_id, ())) != {activation.op_id}:
+        raise ModelingError("shared_quant_gate_has_other_consumers")
     if activation.family == "situ":
         raise ModelingError("shared_quant_situ_unsupported")
     if activation.family != "swiglu":
@@ -476,8 +503,25 @@ def _rewrite(ops, gate):
         )
         new_gate = rebind_op_precision(new_gate, new_gate_abi, metadata=gate_updates)
 
+    quant_extra_deps = (
+        tuple(dep for dep in quant.deps if dep != activation.op_id)
+        if quant is not None else ()
+    )
+    act_data_deps = (
+        {gate.op_id, scale_source.op_id}
+        | (set(activation.deps) - set(control_dependency_names(activation, by_id)))
+        | {dep for dep, _port in input_port_entries(activation.metadata)}
+    )
+    quant_controls = control_dependency_names(quant, by_id) if quant is not None else frozenset()
+    quant_extra_controls = tuple(
+        dep for dep in quant_extra_deps
+        if dep in quant_controls and dep not in act_data_deps
+    )
     consumer = _build_dequant_swiglu_consumer(
-        gate, activation, down, scale_source, metadata, rows, width, gate_width)
+        gate, activation, down, scale_source, metadata, rows, width, gate_width,
+        extra_deps=quant_extra_deps,
+        extra_control_deps=quant_extra_controls,
+    )
 
     down_meta = {
         **dict(down.metadata),
@@ -492,9 +536,10 @@ def _rewrite(ops, gate):
         if op.op_id == gate.op_id:
             result.append(new_gate)
         elif op.op_id == activation.op_id:
-            result.append(consumer)
+            if quant is None:
+                result.append(consumer)
         elif quant is not None and op.op_id == quant.op_id:
-            continue
+            result.append(consumer)
         elif op.op_id == down.op_id:
             result.append(new_down)
         else:

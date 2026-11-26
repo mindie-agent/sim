@@ -617,3 +617,120 @@ def test_source_wrapper_identity_and_protected_programs():
     assert identity["basis"] == wrapper["source_basis"] == "declared_source_wrapper_not_capture_dispatch_proof"
     assert all(token not in json.dumps(wrapper) for token in ("b57207c2", "measured"))
     assert wrapper["proven_predicates"]["active_forward_rows"] == 1
+
+
+def test_shared_expert_int32_fusion_preserves_activation_deps_and_rejects_fanout():
+    from _support.axes import REPRESENTATIVE_SKUS
+    from mindie_sim.catalog.ops import vector_op
+    from mindie_sim.prediction.feedforward import dense
+    from mindie_sim.prediction.operators.mx_quant_matrix import family_shared_quant
+    from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView
+    from mindie_sim.prediction.transforms import lower_implementations
+
+    raw = json.loads((REPO_ROOT / "examples/calls/quantized-grouped-small.json").read_text())
+    raw["machine"] = dict(backend="ascend", sku=REPRESENTATIVE_SKUS["a3"], num_devices=1)
+    raw["model"]["quant"] = dict(name="w8a8", weight_format="int8", activation_format="int8")
+    raw["runtime"]["kernels"] = {"lowerings": {"shared_expert": "ascend_shared_gate_up_int32"}}
+    case = parse_case(raw)
+    ops, _ = dense(
+        prefix="s", plan=case.model.layer_plans[0], deps="input", stage=0, requests=(),
+        tokens=4, model=case.model, parallel=case.runtime.parallel, mode="prefill",
+        category="shared_expert", runtime=case.runtime,
+    )
+    gate, act, down = ops
+    with_barrier = (gate, replace(act, deps=(*act.deps, "barrier")), down)
+    lowered = lower_implementations(with_barrier, case.runtime, "bf16")
+    fused_act = next(op for op in lowered if op.op_id == act.op_id)
+    assert "barrier" in fused_act.deps
+    unfused_ms = graph_costs(
+        case, with_barrier, external_inputs={"input": 0, "barrier": 100}, isolated=False,
+    )["complete_ms"]
+    lowered_ms = graph_costs(
+        case, lowered, external_inputs={"input": 0, "barrier": 100}, isolated=False,
+    )["complete_ms"]
+    assert unfused_ms >= 100.0 and lowered_ms >= 100.0
+
+    # Preserves W1B-S1 usable-L2 accounting: full L2 reservation zeroes scale L2 hit credit.
+    a5_raw = {**raw, "machine": dict(backend="ascend", sku=REPRESENTATIVE_SKUS["a5"], num_devices=1)}
+    a5_case = parse_case(a5_raw)
+    a5_ops, _ = dense(
+        prefix="s_l2", plan=a5_case.model.layer_plans[0], deps="input", stage=0, requests=(),
+        tokens=256, model=a5_case.model, parallel=a5_case.runtime.parallel, mode="prefill",
+        category="shared_expert", runtime=a5_case.runtime,
+    )
+    a5_fused = next(
+        op for op in lower_implementations(a5_ops, a5_case.runtime, "bf16")
+        if op.family == "dequant_swiglu_quant"
+    )
+    geom = Geometry.from_devices(a5_case.machine.dies[:1])
+    full_l2 = int(geom.buffers["l2"])
+    zero_view = AdmissionMemoryView({0: full_l2})
+    zero_view.grant_reservation(0, "peer", full_l2)
+    free_plan = family_shared_quant.build(a5_fused, geom)
+    zero_plan = family_shared_quant.build(a5_fused, replace(geom, admission_memory_view=zero_view))
+    assert free_plan.work.resources["l2"] > 0
+    assert zero_plan.work.resources.get("l2", 0) == 0
+    assert zero_plan.work.resources["hbm"] == free_plan.work.resources["hbm"] + free_plan.work.resources["l2"]
+
+    tap = vector_op(
+        op_id="tap", deps=(gate.op_id,), stage=0, layer=0, requests=(), phase="prefill",
+        elements=512, ops_per_element=1, dtype="bf16", family="relu", recipe="relu", shape=(4, 128),
+    )
+    with pytest.raises(ModelingError, match="shared_quant_gate_has_other_consumers"):
+        lower_implementations((*ops, tap), case.runtime, "bf16")
+
+    # Control-only ordering edge on gate_up (not reading its INT32 tensor) remains valid.
+    ctrl_user = vector_op(
+        op_id="ctrl", deps=("input", gate.op_id), stage=0, layer=0, requests=(), phase="prefill",
+        elements=512, ops_per_element=1, dtype="bf16", family="relu", recipe="relu", shape=(4, 128),
+        metadata=(("control_deps", (gate.op_id,)),),
+    )
+    lowered_ctrl = lower_implementations((*ops, ctrl_user), case.runtime, "bf16")
+    assert any(op.op_id == "ctrl" and gate.op_id in op.deps for op in lowered_ctrl)
+
+    # External prerequisite on down.quantize must gate the fused dequant_swiglu_quant store itself.
+    from mindie_sim.prediction.fusion.ports import control_dependency_names, full_operand_ports
+
+    quant_ops = lower_implementations(ops, replace(case.runtime, kernels={}), "bf16")
+    with_q_barrier = tuple(
+        replace(op, deps=(*op.deps, "q_barrier")) if op.family == "quantize" and act.op_id in op.deps else op
+        for op in quant_ops
+    )
+    fused_q = family_shared_quant.lower_shared_experts(with_q_barrier, case.runtime.kernels["lowerings"])
+    fused_act_q = next(op for op in fused_q if op.op_id == act.op_id)
+    assert "q_barrier" in fused_act_q.deps
+    q_report = graph_costs(
+        case, fused_q, external_inputs={"input": 0, "q_barrier": 100}, isolated=False,
+    )
+    fused_row = next(row for row in q_report["timeline"] if row["op_id"] == act.op_id)
+    assert fused_row["ready_ms"] >= 100.0 and fused_row["complete_ms"] >= 100.0
+
+    # Cross-stream BF16 tap behind an event wait with fusion_input_ports must still reject fanout.
+    xstream_tap = vector_op(
+        op_id="xstream_tap", deps=(f"event:wait:{gate.op_id}",), stage=0, layer=0,
+        requests=(), phase="prefill", elements=512, ops_per_element=1, dtype="bf16",
+        family="relu", recipe="relu", shape=(4, 128),
+        metadata=(("fusion_input_ports", ((gate.op_id, f"{gate.op_id}:out"),)),),
+    )
+    with pytest.raises(ModelingError, match="shared_quant_gate_has_other_consumers"):
+        lower_implementations((*ops, xstream_tap), case.runtime, "bf16")
+
+    # Same-stream prerequisite sitting between activation and quantize must not form a cycle,
+    # and a control-only quantizer prerequisite must stay a control edge rather than a data port.
+    side = vector_op(
+        op_id="side", deps=("input",), stage=0, layer=0, requests=(), phase="prefill",
+        elements=512, ops_per_element=1, dtype="bf16", family="relu", recipe="relu", shape=(4, 128),
+    )
+    q_idx = next(idx for idx, op in enumerate(quant_ops) if op.family == "quantize" and act.op_id in op.deps)
+    quant_with_side = replace(
+        quant_ops[q_idx],
+        deps=(*quant_ops[q_idx].deps, side.op_id),
+        metadata=(*quant_ops[q_idx].metadata, ("control_deps", (side.op_id,))),
+    )
+    ordered_ops = (*quant_ops[:q_idx], side, quant_with_side, *quant_ops[q_idx + 1:])
+    fused_side = family_shared_quant.lower_shared_experts(ordered_ops, case.runtime.kernels["lowerings"])
+    fused_side_act = next(op for op in fused_side if op.op_id == act.op_id)
+    side_by_id = {op.op_id: op for op in fused_side}
+    assert side.op_id in control_dependency_names(fused_side_act, side_by_id)
+    assert all(dep != side.op_id for dep, _ in full_operand_ports(fused_side_act, side_by_id))
+    assert graph_costs(case, fused_side, external_inputs={"input": 0}, isolated=False)["complete_ms"] > 0.0

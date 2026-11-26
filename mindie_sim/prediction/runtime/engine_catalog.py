@@ -341,6 +341,10 @@ class _EngineCatalogMixin:
             return dep
         if boundary == "start":
             target = start_event if start_event is not None else dep
+            if target.started is None and target.sequence not in self._tasks:
+                if (any(target is obs for waiters in self._start_waiters.values() for obs in waiters)
+                        or any(task.start_observer is target for task in self._tasks.values())):
+                    return target
             return self.start_boundary(target, f"{dep.name}:started")
         raise ExecutionError(f"catalog_boundary_unknown:{boundary}")
 
@@ -389,6 +393,11 @@ class _EngineCatalogMixin:
                 if dep.sequence not in self._tasks and dep.sequence not in self._promises:
                     raise ExecutionError(f"dependency_not_submitted:{dep.name}")
 
+        for port_spec in getattr(catalog, "ports", ()):
+            boundary = str(getattr(port_spec, "producer_boundary", "done") or "done")
+            if boundary not in ("done", "start"):
+                raise ExecutionError(f"catalog_boundary_unknown:{boundary}")
+
         def check(stage, frame):
             if not self._stage_active(stage, frame):
                 return
@@ -416,12 +425,26 @@ class _EngineCatalogMixin:
                 if self._scalar(amount_expr, frame) < 0:
                     raise ExecutionError(f"catalog_delivery_negative:{stage.label}")
             for spec in getattr(stage, "acquire", ()):
+                if not self._stage_active(spec, frame):
+                    continue
                 _, allocation = self._allocation_for(frame, spec)
                 if allocation.pool not in self.pools:
                     raise ExecutionError(f"pool_missing:{allocation.pool}")
                 if allocation.size > self.pools[allocation.pool]:
                     raise ExecutionError(
                         f"allocation_exceeds_capacity:{allocation.name}")
+            for spec in getattr(stage, "release", ()):
+                if not self._stage_active(spec, frame):
+                    continue
+                reader_port = getattr(spec, "last_reader_port", None)
+                if reader_port:
+                    port_binding = frame.values.get(reader_port)
+                    if port_binding is not None:
+                        dep = getattr(port_binding, "ready", port_binding)
+                        if (dep.time is None
+                                and dep.sequence not in self._tasks
+                                and dep.sequence not in self._promises):
+                            raise ExecutionError(f"dependency_not_submitted:{dep.name}")
             for spec in getattr(stage, "placement", ()):
                 role = self._resource_role(frame, spec.physical_resource_role)
                 if role not in self.resources:
@@ -492,9 +515,40 @@ class _EngineCatalogMixin:
         from types import MappingProxyType
         return replace(binding, coordinates=MappingProxyType(coordinates))
 
+    def _flush_pending_releases(
+        self, pending_releases: list, ports: Mapping[str, PortBinding], *,
+        only_resolved: bool = False,
+    ) -> None:
+        """Emit deferred allocation releases once forward internal reader ports are materialized."""
+        remaining: list = []
+        for entry in pending_releases:
+            event, spec, allocation, reader_port, name, owner, frame, stage = entry
+            binding = ports.get(reader_port)
+            if binding is None and only_resolved:
+                remaining.append(entry)
+                continue
+            reader_ev = getattr(binding, "ready", binding) if binding is not None else None
+            after_ev = (
+                (event, reader_ev)
+                if (reader_ev is not None and reader_ev.time is None)
+                else (event,)
+            )
+            self.submit(
+                f"{name}:release:{spec.symbol}",
+                after=after_ev,
+                free=(allocation,),
+                owner=owner,
+                metadata={"occurrence": frame.occurrence, "catalog_stage": stage.label},
+            )
+        pending_releases[:] = remaining
+
     def _submit_catalog_node(self, stage: StageSpec, frame: BindingFrame, *,
                              name: str, deps, owner: str, register, ports,
-                             allocations, effects, unit=None, acquired=None):
+                             allocations, effects, unit=None, acquired=None,
+                             port_specs: Mapping[str, Any] | None = None,
+                             start_event: Event | None = None,
+                             pending_releases: list | None = None,
+                             declared_output_ports: Sequence[str] = ()):
         if not self._stage_active(stage, frame):
             event = self.submit(
                 name, after=tuple(deps), owner=owner,
@@ -518,6 +572,8 @@ class _EngineCatalogMixin:
             placement[role] = tuple(spec.units)
         acquire = []
         for spec in getattr(stage, "acquire", ()):
+            if not self._stage_active(spec, frame):
+                continue
             key, allocation = self._allocation_for(frame, spec, unit=unit)
             acquire.append(allocation)
             if acquired is not None:
@@ -527,12 +583,35 @@ class _EngineCatalogMixin:
                 acquired[int(key.symbol)] = allocation
             allocations[str(key.symbol)] = key
         free = []
+        deferred_releases = []
+        unresolved_releases = []
         for spec in getattr(stage, "release", ()):
+            if not self._stage_active(spec, frame):
+                continue
             allocation = None
             if acquired is not None:
                 allocation = acquired.pop(int(spec.symbol), None)
-            if allocation is not None:
-                free.append(allocation)
+            if allocation is None:
+                continue
+            reader_port = getattr(spec, "last_reader_port", None)
+            if reader_port:
+                binding = frame.values.get(reader_port)
+                if binding is None:
+                    binding = ports.get(reader_port)
+                if binding is not None:
+                    reader_ev = getattr(binding, "ready", binding)
+                    if reader_ev is not None and reader_ev.time is None:
+                        deferred_releases.append((spec, allocation, reader_ev))
+                    else:
+                        free.append(allocation)
+                    continue
+                if (pending_releases is not None
+                        and port_specs is not None
+                        and reader_port in port_specs
+                        and getattr(port_specs[reader_port], "direction", "in") == "out"):
+                    unresolved_releases.append((spec, allocation, reader_port))
+                    continue
+            free.append(allocation)
         deliveries = tuple(
             (str(counter_id), amount)
             for counter_id, amount_expr in getattr(stage, "deliveries", ())
@@ -567,11 +646,38 @@ class _EngineCatalogMixin:
             metadata={"occurrence": frame.occurrence,
                       "catalog_stage": stage.label})
         register(stage, event)
-        for port in getattr(stage, "output_ports", ()):
+        for spec, allocation, reader_ev in deferred_releases:
+            self.submit(
+                f"{name}:release:{spec.symbol}",
+                after=(event, reader_ev),
+                free=(allocation,),
+                owner=owner,
+                metadata={"occurrence": frame.occurrence,
+                          "catalog_stage": stage.label},
+            )
+        if pending_releases is not None:
+            for spec, allocation, reader_port in unresolved_releases:
+                pending_releases.append(
+                    (event, spec, allocation, reader_port, name, owner, frame, stage)
+                )
+        stage_output_ports = (
+            tuple(dict.fromkeys((*getattr(stage, "output_ports", ()), *declared_output_ports)))
+            if declared_output_ports else getattr(stage, "output_ports", ())
+        )
+        for port in stage_output_ports:
             if port in ports:
                 raise ExecutionError(f"catalog_port_redefined:{port}")
+            port_spec = port_specs.get(port) if port_specs else None
+            boundary = str(getattr(port_spec, "producer_boundary", "done") or "done")
+            if boundary == "done":
+                ready_event = event
+            elif boundary == "start":
+                target = start_event if start_event is not None else event
+                ready_event = self.start_boundary(target, f"{event.name}:started")
+            else:
+                raise ExecutionError(f"catalog_boundary_unknown:{boundary}")
             ports[port] = PortBinding(
-                ready=event, producer=frame.occurrence,
+                ready=ready_event, producer=frame.occurrence,
                 access="write", output=port)
         return event
 
@@ -649,6 +755,15 @@ class _EngineCatalogMixin:
         if host_spec is not None:
             device_root = self._submit_catalog_host_launch(
                 host_spec, binding, name=name, start=start, owner=owner)
+        port_specs = {
+            spec.name: spec for spec in getattr(catalog, "ports", ())
+        }
+        out_ports_by_node: dict[int, list[str]] = {}
+        if getattr(catalog, "finite", None) is None:
+            for spec in getattr(catalog, "ports", ()):
+                if (getattr(spec, "direction", "in") == "out"
+                        and getattr(spec, "producer_node", None) is not None):
+                    out_ports_by_node.setdefault(int(spec.producer_node), []).append(spec.name)
         ports: dict[str, PortBinding] = {}
         allocations: dict[str, AllocationKey] = {}
         nodes: dict[int, Event] = {}
@@ -669,8 +784,10 @@ class _EngineCatalogMixin:
         def stage_events(stages, frame, prefix, roots, acquired=None,
                          previous=None, previous_starts=None,
                          panel_history=None, panel_start_history=None,
-                         panel_index=0):
+                         panel_index=0, pending_out=None, declared_ports=None):
             created = []
+            pending_releases: list = [] if pending_out is None else pending_out
+            ports_by_node = out_ports_by_node if declared_ports is None else declared_ports
             group_nodes: dict[int, Event] = {}
             group_starts: dict[int, Event] = {}
             for local, stage in self._order_catalog_stages(stages):
@@ -730,7 +847,9 @@ class _EngineCatalogMixin:
                     stage, frame, name=f"{name}:{prefix}:{stage.label}",
                     deps=tuple(dict.fromkeys(deps)), owner=owner,
                     register=register, ports=ports, allocations=allocations,
-                    effects={}, acquired=acquired)
+                    effects={}, acquired=acquired, port_specs=port_specs,
+                    start_event=nested_start, pending_releases=pending_releases,
+                    declared_output_ports=ports_by_node.get(local, ()))
                 group_nodes[local] = event
                 if nested_start is not None:
                     group_starts[local] = nested_start
@@ -738,6 +857,10 @@ class _EngineCatalogMixin:
                 else:
                     starts.pop(local, None)
                 created.append(event)
+            if pending_out is None and pending_releases:
+                self._flush_pending_releases(pending_releases, ports)
+            elif pending_out is not None and pending_releases:
+                self._flush_pending_releases(pending_releases, ports, only_resolved=True)
             return tuple(created)
 
         finite = getattr(catalog, "finite", None)
@@ -834,7 +957,43 @@ class _EngineCatalogMixin:
         starts = cursor["starts"]
         ports = cursor["ports"]
         allocations = cursor["allocations"]
+        port_specs = {
+            spec.name: spec for spec in getattr(catalog, "ports", ())
+        }
+        explicit_out_ports = {
+            port
+            for st in (*(finite.setup or ()), *(finite.drain or ()),
+                       *(s for item in finite.classes for s in item.stages))
+            for port in getattr(st, "output_ports", ())
+        }
+        setup_ids = {int(s.local_id) for s in (finite.setup or ())}
+        drain_ids = {int(s.local_id) for s in (finite.drain or ())}
+        body_ids = (
+            {int(s.local_id) for item in finite.classes for s in item.stages}
+            if int(finite.total) > 0 else set()
+        )
+        setup_out_ports: dict[int, list[str]] = {}
+        drain_out_ports: dict[int, list[str]] = {}
+        body_first_out_ports: dict[int, list[str]] = {}
+        body_last_out_ports: dict[int, list[str]] = {}
+        for spec in getattr(catalog, "ports", ()):
+            if (getattr(spec, "direction", "in") != "out"
+                    or getattr(spec, "producer_node", None) is None
+                    or spec.name in explicit_out_ports):
+                continue
+            pid = int(spec.producer_node)
+            if (pid in setup_ids) + (pid in body_ids) + (pid in drain_ids) != 1:
+                continue
+            if pid in setup_ids:
+                setup_out_ports.setdefault(pid, []).append(spec.name)
+            elif pid in drain_ids:
+                drain_out_ports.setdefault(pid, []).append(spec.name)
+            else:
+                boundary = str(getattr(spec, "producer_boundary", "done") or "done")
+                target_map = body_first_out_ports if boundary == "start" else body_last_out_ports
+                target_map.setdefault(pid, []).append(spec.name)
         invocation_acquired: dict[int, Allocation] = {}
+        invocation_pending_releases: list = []
         setup_ms = self._scalar(getattr(finite, "setup_ms", 0.0), binding)
         setup_root = (
             self.submit(f"{name}:setup_ms", latency=setup_ms,
@@ -843,7 +1002,9 @@ class _EngineCatalogMixin:
         )
         setup = tuple(stage_events(
             finite.setup or (), binding, "setup", (setup_root,),
-            acquired=invocation_acquired))
+            acquired=invocation_acquired,
+            pending_out=invocation_pending_releases,
+            declared_ports=setup_out_ports))
         cursor["setup"] = setup
         if not setup:
             post_setup = setup_root
@@ -898,6 +1059,7 @@ class _EngineCatalogMixin:
             tile_starts: dict[int, Event] = {}
             tile_history: dict[Any, Event] = {}
             tile_start_history: dict[Any, Event] = {}
+            pending_releases: list = []
             tails = []
             for local, stage in ordered:
                 deps = list(self._resolve_finite_stage_deps(
@@ -920,13 +1082,19 @@ class _EngineCatalogMixin:
                         after=tuple(dict.fromkeys(deps)))
                     nested_start = sub.start
                     deps.append(sub.done)
+                body_declared = [
+                    *(body_first_out_ports.get(local, ()) if index == 0 else ()),
+                    *(body_last_out_ports.get(local, ()) if index == total - 1 else ()),
+                ]
                 event = self._submit_catalog_node(
                     stage, frame, name=f"{name}:u{index}:{stage.label}",
                     deps=tuple(dict.fromkeys(deps)), owner=owner,
                     register=lambda _stage, _event, _local=local:
                         nodes.__setitem__(_local, _event),
                     ports=ports, allocations=allocations, effects={},
-                    unit=index, acquired=acquired)
+                    unit=index, acquired=acquired, port_specs=port_specs,
+                    start_event=nested_start, pending_releases=pending_releases,
+                    declared_output_ports=body_declared)
                 stream_sym = getattr(stage, "stream_symbol", None)
                 stream_key = (
                     int(stream_sym) if stream_sym is not None
@@ -947,6 +1115,14 @@ class _EngineCatalogMixin:
                 tile_nodes[local] = event
                 nodes[local] = event
                 tails.append(event)
+            if pending_releases:
+                self._flush_pending_releases(pending_releases, ports, only_resolved=True)
+                if pending_releases:
+                    invocation_pending_releases.extend(pending_releases)
+            if invocation_pending_releases:
+                self._flush_pending_releases(
+                    invocation_pending_releases, ports, only_resolved=True,
+                )
             if max_lag > 1:
                 panel_history[index] = tile_history
                 if tile_start_history:
@@ -993,9 +1169,13 @@ class _EngineCatalogMixin:
                     acquired=dict(invocation_acquired),
                     previous=prev_snap, previous_starts=prev_starts_snap,
                     panel_history=hist_snap, panel_start_history=hist_starts_snap,
-                    panel_index=total))
+                    panel_index=total,
+                    pending_out=invocation_pending_releases,
+                    declared_ports=drain_out_ports))
             elif total <= 0:
                 tails.append(post_setup)
+            if invocation_pending_releases:
+                self._flush_pending_releases(invocation_pending_releases, ports)
             if minimum_event is not None:
                 tails.append(minimum_event)
             if tails:

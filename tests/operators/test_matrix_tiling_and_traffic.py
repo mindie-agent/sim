@@ -692,3 +692,52 @@ def test_contiguous_narrow_matrix_panel_avoids_strided_subsector_penalty():
         total_tiles=2, is_grouped=False, panel_rows=128,
     )
     assert shared_sector_bps == pytest.approx(0.5 * full_512_bps)
+
+
+def test_splitk_charges_unreused_hbm_operands_and_reserves_operand_buffers():
+    base = json.loads((REPO_ROOT / "examples/calls/quantized-grouped-small.json").read_text())
+    m, n, k = 64, 288, 4096
+    op = matrix_setup(m, n, k)[1].op
+    for reuse_inputs, reuse_weights, expected_hbm in (
+        (False, False, 2 * (5 * m * k + n * k + m * n)),
+        (True, True, 2 * (m * k + n * k + m * n)),
+    ):
+        case = json.loads(json.dumps(base))
+        case["runtime"]["kernels"] = {"programs": {"matmul": dict(
+            kind="steady_matmul", candidates=[[64, 64, 128]],
+            underfilled_candidates=[], narrow_candidates=[],
+            reuse_inputs=reuse_inputs, reuse_weights=reuse_weights,
+        )}}
+        report = graph_costs(case, (op,), isolated=False)
+        mapping = report["parameters"]["matrix_mappings"][0]
+        assert mapping["selected"]["k_splits"] == 6
+        assert mapping["split_k_traffic"]["workspace_residency"] == "l2"
+        assert report["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(expected_hbm)
+        assert mapping["split_k_traffic"]["issued_hbm_work"] == pytest.approx(expected_hbm)
+        declared_fp = mapping["candidates"][0]["footprint_bytes_per_owner"]
+        for pool in ("l1", "l0a", "l0b", "l0c"):
+            assert report["execution"]["peak_allocated"][pool + "@r0:s0"] == pytest.approx(declared_fp[pool])
+        assert report["execution"]["live_tasks"] == 0
+
+    # Admitted L2 read hit credit must be applied strictly once even when op.hbm_bytes is pre-discounted.
+    half_reads = float(m * k + n * k)
+    op_warm = replace(
+        op, hbm_bytes=float(op.hbm_bytes) - half_reads,
+        metadata=(*op.metadata, ("admitted_l2_read_hit_bytes", half_reads)),
+    )
+    case_warm = json.loads(json.dumps(base))
+    case_warm["runtime"]["kernels"] = {"programs": {"matmul": dict(
+        kind="steady_matmul", candidates=[[64, 64, 128]],
+        underfilled_candidates=[], narrow_candidates=[],
+    )}}
+    rep_warm = graph_costs(case_warm, (op_warm,), isolated=False)
+    expected_warm_hbm = float(op.hbm_bytes) - half_reads
+    assert rep_warm["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(expected_warm_hbm)
+
+    # Extra independent HBM traffic on top of a pre-discounted admitted L2 hit must be conserved.
+    extra_hbm = 262_144.0
+    op_warm_extra = replace(op_warm, hbm_bytes=float(op_warm.hbm_bytes) + extra_hbm)
+    rep_warm_extra = graph_costs(case_warm, (op_warm_extra,), isolated=False)
+    assert rep_warm_extra["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(
+        expected_warm_hbm + extra_hbm
+    )

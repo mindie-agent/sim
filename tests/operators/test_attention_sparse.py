@@ -894,3 +894,108 @@ def test_bf16_lightning_line_cache_matches_sequential_lru_eviction():
             for idx in range(2 * panel["key_start"], 2 * panel["key_end"]):
                 line(idx)
     assert key_access["hbm_bytes"] == line.cache_info().misses * 128 == 8_398_848
+
+
+def test_quant_lightning_indexer_ragged_owners_noncausal_and_visible_query_loads():
+    from mindie_sim.prediction.operators.sparse_indexer import family_quant_indexer as qi
+    from mindie_sim.prediction.structure import parse_case
+
+    raw = compose_case(
+        "deepseek-v4-flash", "a3", tp=1, dp=1, ep=1, layers=4,
+        quant="int8", max_model_len=32768,
+    )
+    raw["runtime"].setdefault("kernels", {}).setdefault("lowerings", {})["quant_lightning_indexer"] = qi.IMPLEMENTATION
+    case = parse_case(raw)
+    views = tuple(RequestView(str(n), 1, n, False, "decode") for n in (3, 32767))
+    ops = target_graphs(case, phase="decode", tokens=1, requests=views, scope="body")[0]
+    op = next(o for o in ops if o.recipe == qi.RECIPE)
+    plan, geom = case.model.layer_plans[op.layer], Geometry.from_devices(case.machine.dies[:1])
+    ctx = RecipeContext(
+        op, {}, {r: r for r in geom.resource_units}, geom.rates, geom.compute_units,
+        resource_units=geom.resource_units, compute_peaks=geom.compute_peaks,
+    )
+    lanes = qi.recipes()[qi.RECIPE].build(op, geom).program(ctx).programs
+    got_flops = [round(lane.stages[1].work["cube"] * geom.compute_peaks["int8"] / 1000) for lane in lanes]
+    exp_flops = [2 * ((v.context + 1) // plan.compress_ratio) * plan.index_heads * plan.index_dim for v in views]
+    assert got_flops == exp_flops == [16384, 134_217_728]
+
+    for contexts in ([32767, 32767] + [3] * 23, [3] * 23 + [32767, 32767]):
+        bal_views = tuple(RequestView(str(i), 1, n, False, "decode") for i, n in enumerate(contexts))
+        bal_ops = target_graphs(case, phase="decode", tokens=1, requests=bal_views, scope="body")[0]
+        bal_op = next(o for o in bal_ops if o.recipe == qi.RECIPE)
+        bal_ctx = RecipeContext(
+            bal_op, {}, {r: r for r in geom.resource_units}, geom.rates, geom.compute_units,
+            resource_units=geom.resource_units, compute_peaks=geom.compute_peaks,
+        )
+        bal_plan = qi.recipes()[qi.RECIPE].build(bal_op, geom)
+        bal_flops = [
+            round(lane.stages[1].work["cube"] * geom.compute_peaks["int8"] / 1000)
+            for lane in bal_plan.program(bal_ctx).programs
+        ]
+        assert max(bal_flops) == 134_217_728
+        assert sum(bal_flops) == round(bal_plan.work.matrix["int8"])
+
+    nc_raw = compose_case(
+        "deepseek-v4-flash", "a3", layers=4, tp=1, dp=1, ep=1,
+        quant="int8", prompt_tokens=128, output_tokens=2,
+    )
+    nc_raw["runtime"].setdefault("kernels", {}).setdefault("lowerings", {})["quant_lightning_indexer"] = qi.IMPLEMENTATION
+    nc_raw["model"]["layer_plans"][2]["noncausal_attention"] = True
+    nc_case = parse_case(nc_raw)
+    nc_ops = target_graphs(nc_case, phase="prefill", tokens=128, sequences=1, context=0, scope="body")[0]
+    nc_op = next(o for o in nc_ops if o.recipe == qi.RECIPE)
+    assert dict(nc_op.metadata)["quant_indexer_work"]["query_key_pairs"] == 128 * (
+        128 // nc_case.model.layer_plans[2].compress_ratio
+    )
+
+    vis_raw = compose_case(
+        "deepseek-v4-flash", "a3", layers=4, tp=1, dp=1, ep=1,
+        quant="int8", prompt_tokens=128, output_tokens=2,
+    )
+    vis_raw["runtime"].setdefault("kernels", {}).setdefault("lowerings", {})["quant_lightning_indexer"] = qi.IMPLEMENTATION
+    for ratio in (4, 128):
+        vis_raw["model"]["layer_plans"][2]["compress_ratio"] = ratio
+        vis_case = parse_case(vis_raw)
+        vis_ops = target_graphs(vis_case, phase="prefill", tokens=ratio, sequences=1, context=0, scope="body")[0]
+        vis_op = next(o for o in vis_ops if o.recipe == qi.RECIPE)
+        work = dict(vis_op.metadata)["quant_indexer_work"]
+        layer_plan = vis_case.model.layer_plans[vis_op.layer]
+        assert work["visible_query_rows"] == 1
+        assert int(work["query_bytes"]) == layer_plan.index_heads * layer_plan.index_dim
+
+
+def test_region_summary_cache_update_scales_private_tail_with_batch_and_zeroes_on_close():
+    from mindie_sim.prediction.structure import parse_case
+
+    raw = compose_case(
+        "step-5-preview", "a5", tp=4, ep=4, dp=1, layers=4, concurrency=64,
+        max_num_seqs=64, prompt_tokens=32, output_tokens=2,
+    )
+    case = parse_case(raw)
+    for count in (1, 64):
+        ops = target_graphs(case, phase="decode", tokens=1, sequences=count, context=32, scope="body")[0]
+        op = next(o for o in ops if o.recipe == "region_summary_cache_update")
+        assert int(op.mte3_bytes) == count * case.model.layer_plans[op.layer].index_dim * 2
+    close_ops = target_graphs(case, phase="decode", tokens=1, sequences=64, context=31, scope="body")[0]
+    close_op = next(o for o in close_ops if o.recipe == "region_summary_cache_update")
+    assert int(close_op.mte3_bytes) == 64 * case.model.layer_plans[close_op.layer].index_dim == 16_384
+
+    # PCP rank slices compute completed regions and unfinished tail from global_q_len and query_ranges.
+    from mindie_sim.catalog.context_parallel import pcp_rank_chunk_ranges
+    from mindie_sim.prediction.operators.sparse_indexer.index_cache_writer import emit_index_cache_write
+
+    pcp_tails, pcp_summaries = [], []
+    for rank in range(2):
+        pcp_view = RequestView(
+            "p", 16, 16, False, "prefill",
+            global_q_len=32, query_ranges=pcp_rank_chunk_ranges(32, 2, rank),
+        )
+        pcp_op, = emit_index_cache_write(
+            mode="region_summary_update", rows=16, views=(pcp_view,),
+            dim=256, block_size=32, input_dtype="bf16", cache_dtype="int8", scale_dtype="none",
+        )
+        pcp_meta = dict(pcp_op.metadata)
+        pcp_tails.append(int(pcp_meta["tail_rows"]))
+        pcp_summaries.append(int(pcp_meta["summary_rows"]))
+    assert pcp_tails == [8, 8]
+    assert pcp_summaries == [0, 1]
