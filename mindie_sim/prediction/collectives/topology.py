@@ -31,6 +31,7 @@ import math
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware_links import parse_collective_bands
+from mindie_sim.schema.parallel import ReplicaLocalRank
 from ..communication import CommunicationWork, MessageFlow, RoutedHop, RoutedMessage
 from ..engine import Resource
 from .plans import (
@@ -68,6 +69,7 @@ from .transport import (
 )
 
 MAX_ROUTE_CACHE_ENTRIES = 8192
+MAX_SSSP_CACHE_ENTRIES = 65536
 UNDECLARED_SCOPE_PRIORITY = 3
 NS_PER_US_TOPO = 1000.0
 P15_PRIMITIVE_ID = "P15_rts_stars"
@@ -104,6 +106,16 @@ _DECLARED_CHANNEL_SCOPES: Mapping[str, str] = {
 }
 
 _PORT_SEMANTICS = {"per_port", "fully_connected", "mesh"}
+
+
+@dataclass(frozen=True, slots=True)
+class _LinkHyperedge:
+    """Compact linear-memory incidence entry for one admitting link partition."""
+
+    edge_id: int
+    link_name: str
+    members: tuple[int, ...]
+    member_nodes: tuple[int, ...] | None = None
 
 
 def _is_cross_node_link(link, channel_decl: Mapping | None = None) -> bool:
@@ -278,6 +290,9 @@ class Topology(_TopologyPlansMixin):
         )
         self._resource_cache = None
         self._resource_rates = None
+        self._rank_hyperedges: dict[int, tuple[tuple[_LinkHyperedge, int | None], ...]] | None = None
+        self._sssp_parents: dict[int, dict[int, tuple[int, str]]] = {}
+        self._sssp_entry_count = 0
         self._transport_bindings = {}
         self._mesh_plans = {}
         self._oneshot_plans = {}
@@ -767,24 +782,57 @@ class Topology(_TopologyPlansMixin):
     def _has_endpoint_rate(self, link, rank: int) -> bool:
         return link.endpoint_capacity_bytes_per_ms(int(rank)) is not None
 
+    def _active_route_closure(
+        self, active: frozenset[int],
+    ) -> tuple[set[str], dict[str, set[tuple[int, int]]], dict[str, set[int]]]:
+        routed_links: set[str] = set()
+        routed_pairs: dict[str, set[tuple[int, int]]] = {}
+        routed_endpoints: dict[str, set[int]] = {}
+        if len(active) <= 1:
+            return routed_links, routed_pairs, routed_endpoints
+        for src in active:
+            parents = self._sssp_for(src)
+            traced = {src}
+            for dst in active:
+                cur = dst
+                while cur not in traced and cur in parents:
+                    traced.add(cur)
+                    prev, link_name = parents[cur]
+                    routed_links.add(link_name)
+                    routed_pairs.setdefault(link_name, set()).add((prev, cur))
+                    endpoints = routed_endpoints.setdefault(link_name, set())
+                    endpoints.add(prev)
+                    endpoints.add(cur)
+                    cur = prev
+        return routed_links, routed_pairs, routed_endpoints
+
     def _build_resources(self, active: frozenset[int] | None = None):
         result = []
         included_shared_ports: dict[PortKey, float] = {}
         included_shared_switches: dict[SwitchKey, float] = {}
+        if active is not None:
+            routed_links, routed_pairs, routed_endpoints = self._active_route_closure(active)
+        else:
+            routed_links, routed_pairs, routed_endpoints = set(), {}, {}
         for link in self.links.values():
             endpoint_ranks = sorted({int(rank) for rank, _ in link.endpoint_rates})
-            if active is not None and not (set(link.members) & active):
+            if (active is not None
+                    and link.name not in routed_links
+                    and not (set(link.members) & active)):
                 continue
             if link.semantics == "per_pair":
+                link_routed_pairs = routed_pairs.get(link.name, ())
+                link_routed_endpoints = routed_endpoints.get(link.name, ())
                 result.extend(Resource(
                     f"{self.namespace}link:{link.name}:pair{source}>{destination}",
                     link.capacity_bytes_per_ms, "bytes",
                 ) for source in link.members for destination in link.members
                     if source != destination
-                    and (active is None or source in active or destination in active))
+                    and (active is None or source in active or destination in active
+                         or (source, destination) in link_routed_pairs))
                 result.extend(self._endpoint_resource(link, direction, rank)
                               for rank in endpoint_ranks
-                              if active is None or rank in active
+                              if active is None or rank in active or rank in link_routed_endpoints
                               for direction in ("tx", "rx"))
                 for rank in link.members:
                     for direction in ("tx", "rx"):
@@ -855,29 +903,159 @@ class Topology(_TopologyPlansMixin):
             cache[active] = self._build_resources(active)
         return cache[active]
 
-    def route(self, source, destination):
-        key = source, destination
-        if key in self.routes:
-            return self.routes[key]
-        queue, seen = deque([(source, ())]), {source}
-        while queue:
-            rank, path = queue.popleft()
-            if rank == destination:
-                if len(self.routes) < MAX_ROUTE_CACHE_ENTRIES:
-                    self.routes[key] = path
-                return path
-            for link in self._ordered_links:
-                if rank not in link.members:
+    def _build_hyperedges(
+        self,
+    ) -> dict[int, tuple[tuple[_LinkHyperedge, int | None], ...]]:
+        rank_edges: dict[int, list[tuple[_LinkHyperedge, int | None]]] = {}
+        node_cache: dict[int, int] = {}
+        pkg_cache: dict[int, tuple[int, int]] = {}
+        next_edge_id = 0
+
+        def _cached_node(rank: int) -> int:
+            val = node_cache.get(rank)
+            if val is None:
+                val = self._node_of(rank)
+                node_cache[rank] = val
+            return val
+
+        def _cached_pkg(rank: int) -> tuple[int, int]:
+            val = pkg_cache.get(rank)
+            if val is None:
+                val = self._package_key(rank)
+                pkg_cache[rank] = val
+            return val
+
+        def _register_clique(link_name: str, members: tuple[int, ...]) -> None:
+            nonlocal next_edge_id
+            if len(members) < 2:
+                return
+            he = _LinkHyperedge(next_edge_id, link_name, members)
+            next_edge_id += 1
+            entry = (he, None)
+            seen_in_group: set[int] = set()
+            for member in members:
+                if member not in seen_in_group:
+                    seen_in_group.add(member)
+                    rank_edges.setdefault(member, []).append(entry)
+
+        for link in self._ordered_links:
+            scope = self._link_scope[link.name]
+            if scope in _NON_FABRIC_EXPLICIT_SCOPES:
+                continue
+            if scope not in _ROUTABLE_EXPLICIT_SCOPES:
+                raise ModelingError(f"link_scope_unknown:{scope}")
+            members = link.members
+            if len(members) < 2:
+                continue
+            link_name = link.name
+            if scope == "package":
+                by_pkg: dict[tuple[int, int], list[int]] = {}
+                for member in members:
+                    by_pkg.setdefault(_cached_pkg(member), []).append(member)
+                for group in by_pkg.values():
+                    _register_clique(link_name, tuple(group))
+            elif scope == "node":
+                by_node: dict[int, list[int]] = {}
+                for member in members:
+                    by_node.setdefault(_cached_node(member), []).append(member)
+                for group in by_node.values():
+                    _register_clique(link_name, tuple(group))
+            elif scope == "cross_node":
+                member_nodes = tuple(_cached_node(member) for member in members)
+                if len(set(member_nodes)) < 2:
                     continue
-                scope = self._link_scope[link.name]
-                for neighbor in link.members:
-                    if neighbor in seen:
+                he = _LinkHyperedge(next_edge_id, link_name, members, member_nodes)
+                next_edge_id += 1
+                seen_in_link: set[int] = set()
+                for member, rank_node in zip(members, member_nodes):
+                    if member not in seen_in_link:
+                        seen_in_link.add(member)
+                        rank_edges.setdefault(member, []).append((he, rank_node))
+            else:
+                _register_clique(link_name, members)
+        return {rank: tuple(entries) for rank, entries in rank_edges.items()}
+
+    def _sssp_for(self, source: int) -> dict[int, tuple[int, str]]:
+        parents = self._sssp_parents.get(source)
+        if parents is not None:
+            return parents
+        if self._rank_hyperedges is None:
+            self._rank_hyperedges = self._build_hyperedges()
+        rank_edges = self._rank_hyperedges
+        parents = {}
+        seen = {source}
+        expanded_cliques: set[int] = set()
+        expanded_cross: dict[int, set[int]] = {}
+        queue = deque([source])
+        while queue:
+            rank = queue.popleft()
+            for he, rank_node in rank_edges.get(rank, ()):
+                if rank_node is None:
+                    if he.edge_id in expanded_cliques:
                         continue
-                    if not self._scope_admits(scope, rank, neighbor):
+                    expanded_cliques.add(he.edge_id)
+                    for neighbor in he.members:
+                        if neighbor not in seen:
+                            seen.add(neighbor)
+                            parents[neighbor] = (rank, he.link_name)
+                            queue.append(neighbor)
+                else:
+                    done_nodes = expanded_cross.setdefault(he.edge_id, set())
+                    member_nodes = he.member_nodes
+                    if (member_nodes is None or len(done_nodes) >= 2
+                            or rank_node in done_nodes):
                         continue
-                    seen.add(neighbor)
-                    queue.append((neighbor, path + ((link.name, rank, neighbor),)))
-        raise ValueError(f"physical_route_missing:{source}->{destination}")
+                    done_nodes.add(rank_node)
+                    for neighbor, nb_node in zip(he.members, member_nodes):
+                        if nb_node != rank_node and neighbor not in seen:
+                            seen.add(neighbor)
+                            parents[neighbor] = (rank, he.link_name)
+                            queue.append(neighbor)
+        entry_len = len(parents) + 1
+        if entry_len <= MAX_SSSP_CACHE_ENTRIES and MAX_ROUTE_CACHE_ENTRIES > 0:
+            if (len(self._sssp_parents) >= MAX_ROUTE_CACHE_ENTRIES
+                    or self._sssp_entry_count + entry_len > MAX_SSSP_CACHE_ENTRIES):
+                self._sssp_parents.clear()
+                self._sssp_entry_count = 0
+            self._sssp_parents[source] = parents
+            self._sssp_entry_count += entry_len
+        return parents
+
+    def _try_route(
+        self, source: int, destination: int,
+    ) -> tuple[tuple[str, int, int], ...] | None:
+        if source == destination:
+            return ()
+        key = (source, destination)
+        cached = self.routes.get(key)
+        if cached is not None:
+            return cached
+        parents = self._sssp_for(source)
+        if destination not in parents:
+            return None
+        hops: list[tuple[str, int, int]] = []
+        cur = destination
+        while cur != source:
+            prev, link_name = parents[cur]
+            hops.append((link_name, prev, cur))
+            cur = prev
+        hops.reverse()
+        path = tuple(hops)
+        if len(self.routes) < MAX_ROUTE_CACHE_ENTRIES:
+            self.routes[key] = path
+        return path
+
+    def route(self, source, destination):
+        key = (source, destination)
+        cached = self.routes.get(key)
+        if cached is not None:
+            return cached
+        path = self._try_route(source, destination)
+        if path is None:
+            raise ValueError(f"physical_route_missing:{source}->{destination}")
+        if source == destination and len(self.routes) < MAX_ROUTE_CACHE_ENTRIES:
+            self.routes[key] = path
+        return path
 
     def _scope_admits(self, scope: str, left: int, right: int) -> bool:
         if scope == "package":
@@ -1007,22 +1185,24 @@ class Topology(_TopologyPlansMixin):
                 members = set(sources)
                 return tuple(tuple(group) for group in p.rank_table
                              if members.intersection(group))
-            if not (p.ep_spans_dp or p.ep_spans_pcp):
-                return tuple(sources[i:i + p.ep] for i in range(0, len(sources), p.ep))
-            ep_tp_w = max(1, p.tp // p.etp)
-            dp_w = max(1, p.ep_dp_width)
-            first = (replica // dp_w) * dp_w
-            copy_count = min(p.pcp, max(1, p.ep // ep_tp_w)) if p.ep_spans_pcp else 1
-            return tuple(
-                tuple(
-                    rank
-                    for r in range(first, first + dp_w)
-                    for copy in range(first_copy, first_copy + copy_count)
-                    for rank in self.ranks(r, stage)[copy * p.tp + off:copy * p.tp + off + ep_tp_w]
-                )
-                for first_copy in range(0, p.pcp, copy_count)
-                for off in range(0, p.tp, ep_tp_w)
-            )
+            rank_cache: dict[tuple[int, int], tuple[int, ...]] = {(replica, stage): sources}
+            seen_groups: set[tuple[int, ...]] = set()
+            groups_out: list[tuple[int, ...]] = []
+            for lane in range(len(sources)):
+                coords = p.ep_group_coords(replica, stage, ReplicaLocalRank(lane))
+                group_ranks: list[int] = []
+                for rep, stg, l_rank in coords:
+                    key = (rep, stg)
+                    stage_ranks = rank_cache.get(key)
+                    if stage_ranks is None:
+                        stage_ranks = self.ranks(rep, stg)
+                        rank_cache[key] = stage_ranks
+                    group_ranks.append(stage_ranks[int(l_rank)])
+                group = tuple(group_ranks)
+                if group not in seen_groups:
+                    seen_groups.add(group)
+                    groups_out.append(group)
+            return tuple(groups_out)
         if axis == "tp":
             return tuple(sources[i:i + p.tp] for i in range(0, len(sources), p.tp))
         raise ModelingError(f"communication_group_axis_unknown:{axis}")

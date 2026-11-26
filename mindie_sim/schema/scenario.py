@@ -51,7 +51,13 @@ from .stack import (
 from .workload import SYNTHETIC_EAGLE3_GQA_PROVENANCE, SpeculativeWorkloadPolicy
 
 DeploymentMode = Literal["colocated", "pd_disaggregated", "pd_prefill", "pd_decode"]
-DEPLOYMENT_MODES = frozenset({"colocated", "pd_disaggregated", "pd_prefill", "pd_decode"})
+_DEPLOYMENT_MODE_LOOKUP: dict[str, DeploymentMode] = {
+    "colocated": "colocated",
+    "pd_disaggregated": "pd_disaggregated",
+    "pd_prefill": "pd_prefill",
+    "pd_decode": "pd_decode",
+}
+DEPLOYMENT_MODES = frozenset(_DEPLOYMENT_MODE_LOOKUP)
 DEPLOYMENT_MODE_LIST_TEXT = "{colocated, pd_disaggregated, pd_prefill, pd_decode}"
 
 DeploymentModeOrigin = Literal[
@@ -120,7 +126,14 @@ DOMAIN_WORK_UNITS: dict[WorkloadDomain, frozenset[WorkUnitKind]] = {
     "llm": frozenset({"prefill_decode_step"}),
     "vlm": frozenset({"prefill_decode_step", "vision_encode"}),
     "diffusion": frozenset({"denoise_timestep", "vae_decode", "text_encode"}),
-    "custom": frozenset(WORK_UNIT_KINDS),
+    "custom": frozenset({
+        "prefill_decode_step",
+        "denoise_timestep",
+        "vae_decode",
+        "text_encode",
+        "vision_encode",
+        "custom_step",
+    }),
 }
 FLOAT_TOL = 1e-9
 MIN_DISAGGREGATED_DEVICES = 2
@@ -183,13 +196,13 @@ def validate_deployment_mode(mode: Any) -> DeploymentMode:
             "pd_prefill (P pool with --ttft-ms; no decode TPOT/ITL), "
             "pd_decode (D pool with --tpot-ms + ReadyStateAssumption; TTFT=None)"
         )
-    normalized = mode.strip().lower()
-    if normalized not in DEPLOYMENT_MODES:
+    normalized = _DEPLOYMENT_MODE_LOOKUP.get(mode.strip().lower())
+    if normalized is None:
         raise ModelingError(
             f"deployment_mode_invalid:{mode!r}: silent guessing/auto mode is forbidden; "
             f"specify explicit --deployment-mode in {DEPLOYMENT_MODE_LIST_TEXT}"
         )
-    return normalized  # type: ignore[return-value]
+    return normalized
 
 
 @dataclass(frozen=True, slots=True)

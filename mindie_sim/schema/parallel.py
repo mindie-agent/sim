@@ -8,7 +8,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import math
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Mapping, NewType, Sequence
 from mindie_sim.schema.common import ModelingError, _int, _mapping, _unknown
 from mindie_sim.schema.runtime_features import (
     LOCAL_PARALLEL_DEFAULTS, LOCAL_TP_AXIS_NAMES, PARALLEL_FEATURE_NAMES,
@@ -17,6 +17,26 @@ from mindie_sim.schema.runtime_features import (
 
 if TYPE_CHECKING:
     from mindie_sim.schema.model import ModelSpec
+
+
+GlobalRank = NewType("GlobalRank", int)
+ReplicaLocalRank = NewType("ReplicaLocalRank", int)
+DieIndex = NewType("DieIndex", int)
+
+
+@dataclass(frozen=True, slots=True)
+class RankCoord:
+    """Strong-typed multi-axis physical and logical rank coordinate."""
+
+    global_rank: GlobalRank
+    die_index: DieIndex
+    replica: int
+    stage: int
+    local_rank: ReplicaLocalRank
+    tp_lane: int
+    pcp_lane: int
+    dcp_lane: int
+    ep_rank: int
 
 def factor_dcp_axes(cp: int, *, pcp: int, tp: int, dp: int) -> tuple[int, int, int]:
     """Canonical 3-axis DCP factorization ``(pcp_factor, tp_gather, dp_width)``."""
@@ -582,6 +602,50 @@ class ParallelSpec:
                 raise ModelingError(f"ep_not_divisor_of_tp_pcp:{local_domain}%{self.ep}")
             if self.ep > local_domain and self.ep % local_domain != 0:
                 raise ModelingError(f"ep_not_multiple_of_tp_pcp:{self.ep}%{local_domain}")
+
+    def ep_group_coords(
+        self,
+        replica: int,
+        stage: int = 0,
+        lane: ReplicaLocalRank = ReplicaLocalRank(0),
+    ) -> tuple[tuple[int, int, ReplicaLocalRank], ...]:
+        """Return ``(replica, stage, local_rank)`` coordinates for one EP group."""
+        if self.rank_table is not None:
+            raise ModelingError("ep_group_coords_requires_implicit_placement")
+        total_replicas = self.external_dp * self.dp
+        width = self.tp * self.pcp
+        lane_int = int(lane)
+        if not (0 <= replica < total_replicas and 0 <= stage < self.pp):
+            raise ModelingError(f"placement_coordinate_unknown:{replica}:{stage}")
+        if not 0 <= lane_int < width:
+            raise ModelingError(f"placement_lane_unknown:{lane_int}")
+        self.validate_expert_placement()
+        if not (self.ep_spans_dp or self.ep_spans_pcp):
+            start = (lane_int // self.ep) * self.ep
+            return tuple(
+                (replica, stage, ReplicaLocalRank(idx))
+                for idx in range(start, start + self.ep)
+            )
+        ep_dp_w = max(1, self.ep_dp_width)
+        ep_tp_w = max(1, self.tp // self.etp)
+        if self.ep_spans_pcp:
+            ep_local = self.ep // ep_dp_w
+            tp_span = math.gcd(ep_local, ep_tp_w)
+            copy_count = ep_local // tp_span
+        else:
+            tp_span = ep_tp_w
+            copy_count = 1
+        copy, tp_lane = divmod(lane_int, self.tp)
+        offset = (tp_lane // tp_span) * tp_span
+        ext_base = (replica // self.dp) * self.dp
+        first_rep = ext_base + ((replica - ext_base) // ep_dp_w) * ep_dp_w
+        first_copy = (copy // copy_count) * copy_count
+        return tuple(
+            (rep, stage, ReplicaLocalRank(c * self.tp + t))
+            for rep in range(first_rep, first_rep + ep_dp_w)
+            for c in range(first_copy, first_copy + copy_count)
+            for t in range(offset, offset + tp_span)
+        )
 
     def validate(
         self, model: "ModelSpec", *,

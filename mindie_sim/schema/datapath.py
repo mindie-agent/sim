@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, NewType
+from typing import TYPE_CHECKING, Any, NewType
 
 from .common import ModelingError
 from .compute_arch import ComputeArchSpec, DataPath, canonical_format
@@ -32,6 +32,9 @@ from .device_input import (
 )
 from .hardware import Device, Link
 from .hardware_links import CollectiveBandSpec, validate_protocol_bands
+
+if TYPE_CHECKING:
+    from mindie_sim.public.errors import UnmodeledCapabilityError
 
 ArchId = NewType("ArchId", str)
 DieSpec = Device
@@ -149,7 +152,7 @@ class DatapathCapabilitySpec:
     def has_ub_to_l1(self) -> bool:
         return self.has_path("ub", "l1")
 
-    def _route_err(self, code: str, message: str):
+    def _route_err(self, code: str, message: str) -> UnmodeledCapabilityError:
         from mindie_sim.public.errors import UnmodeledCapabilityError
         return UnmodeledCapabilityError(
             capability="datapath_route", entry="DatapathCapabilitySpec.route",
@@ -160,7 +163,7 @@ class DatapathCapabilitySpec:
         cross_core = set(path.reach) == {"aic", "aiv"}
         limit = self.aic_count if path.executor == "aic" else self.aiv_count
 
-        def valid(owner, count):
+        def valid(owner: Any, count: int) -> bool:
             return type(owner) is int and 0 <= owner < count
 
         if type(owner_group) is int:
@@ -195,7 +198,13 @@ class DatapathCapabilitySpec:
             f"owner {owner_group!r} cannot reach {src}->{dst} on {self.arch_id}",
         )
 
-    def validate_fixpipe_accumulator(self, tile, representation: str, *, producer_mode: str | None = None) -> None:
+    def validate_fixpipe_accumulator(
+        self,
+        tile: Sequence[int],
+        representation: str,
+        *,
+        producer_mode: str | None = None,
+    ) -> None:
         """Validate an M×N accumulator plane. An optional third extent describes the reduction."""
         if len(tile) not in (PAIR_ARITY, TILE_3D_ARITY):
             raise self._route_err("datapath_route_tile_invalid:l0c",
@@ -266,7 +275,7 @@ class DatapathCapabilitySpec:
                     if declared_arch is not None else {})
         elem_bits = DEFAULT_ELEMENT_BITS
         if rep:
-            if registry and rep not in registry:
+            if declared_arch is not None and registry and rep not in registry:
                 try:
                     rep = declared_arch.representation(rep).name
                 except ModelingError:
@@ -314,16 +323,19 @@ class DatapathCapabilitySpec:
         if capacity is None:
             raise ModelingError(f"datapath_buffer_pool_undeclared:{pool_key}")
         if isinstance(kernel, Mapping):
-            flag, abi = kernel.get, str(kernel.get("abi") or kernel.get("mode") or "").lower()
+            def _flag(key: str) -> Any:
+                return kernel.get(key)
+            abi = str(kernel.get("abi") or kernel.get("mode") or "").lower()
         else:
-            flag = lambda key: getattr(kernel, key, False)
+            def _flag(key: str) -> Any:
+                return getattr(kernel, key, False)
             abi = (kernel if isinstance(kernel, str) else
                    str(getattr(kernel, "abi", "") or getattr(kernel, "name", ""))).lower()
         reserve = 0
-        if pool_key == "ub" and (kernel is True or flag("simt") or "simt" in abi):
+        if pool_key == "ub" and (kernel is True or _flag("simt") or "simt" in abi):
             reserve = self.simt_ub_carveout_bytes
         elif (pool_key == "l1" and self.arch_id == "npu_arch_2201"
-              and (flag("fused") or "fused" in abi)):
+              and (_flag("fused") or "fused" in abi)):
             reserve = DAV_2201_FUSED_L1_RESERVE_BYTES
         return max(0, int(capacity) - reserve)
 
@@ -459,13 +471,13 @@ def device_input_for_die(
     /,
     *,
     links: Sequence[Link] = (),
-    transfer_channels: Mapping[str, object] | Sequence[tuple[str, object]] = (),
+    transfer_channels: Mapping[str, Any] | Sequence[tuple[str, Any]] = (),
     provenance: Mapping[str, object] | None = None,
 ) -> DeviceInput:
     """Build a typed ``DeviceInput`` normalized view for one physical die."""
     edges = ub_peer_edges_for_rank(die.rank, links, transfer_channels)
     datapath = datapath_for_die(die, ub_peer_edges=edges)
-    entries = (
+    entries: tuple[tuple[str, tuple[tuple[str, object], ...]], ...] = (
         tuple((str(k), tuple(sorted(dict(v).items()))) for k, v in transfer_channels.items())
         if isinstance(transfer_channels, Mapping)
         else tuple((str(k), tuple(v)) for k, v in transfer_channels)
@@ -486,19 +498,20 @@ def device_input_for_die(
 def ub_peer_edges_for_rank(
     rank: int,
     links: Sequence[Link] = (),
-    transfer_channels: Mapping[str, object] | Sequence[tuple[str, object]] = (),
+    transfer_channels: Mapping[str, Any] | Sequence[tuple[str, Any]] = (),
 ) -> tuple[tuple[int, int], ...]:
     """Derive sorted directed UB direct-mesh peer edges ``(rank, peer)`` from ``links``."""
     if not links:
         return ()
     target = int(rank)
-    channels = dict(transfer_channels)
+    channels: dict[str, Any] = dict(transfer_channels)
     edges: set[tuple[int, int]] = set()
     for link in links:
         if target not in link.members:
             continue
         chan_low = str(link.channel).lower()
-        record = dict(channels.get(link.channel, ()))
+        raw_record = channels.get(link.channel, ())
+        record: dict[str, Any] = dict(raw_record) if raw_record else {}
         protocol = str(link.protocol or record.get("protocol") or "").strip().upper()
         if link.scope in {"cross_node", "host"} or record.get("scope") in {"cross_node", "host"}:
             continue
@@ -555,7 +568,7 @@ def datapath_for_devices(
     /,
     *,
     links: Sequence[Link] = (),
-    transfer_channels: Mapping[str, object] | Sequence[tuple[str, object]] = (),
+    transfer_channels: Mapping[str, Any] | Sequence[tuple[str, Any]] = (),
 ) -> tuple[ComputeArchSpec, DatapathCapabilitySpec]:
     """Validate homogeneous ``compute_arch``, owner counts, and datapath across stage dies."""
     dies = tuple(devices)
@@ -631,9 +644,14 @@ def scale_explicit_placement_device(
         for k, v in data.get("compute_peaks", {}).items()
     }
     aic_u = {"cube", "mte1", "mte2_aic", "fixpipe"}
+    aiv_r = {"vector", "mte2_aiv", "mte3", "reg_data_writes",
+             "reg_ub_accesses", "reg_ub_stores", "reg_alu_lanes",
+             "reg_special_lanes", "reg_reduce_lanes", "reg_shuffle_lanes",
+             "scalar_store_issue"}
     data["resource_units"] = {
         k: (int(v) if k in explicit_units else max(
-            1, int(round(int(v) * (scale_aic if k in aic_u else scale_aiv)))))
+            1, int(round(int(v) * (scale_aic if k in aic_u
+                                   else (scale_aiv if k in aiv_r else 1.0))))))
         for k, v in cur_units.items()
     }
     explicit_buf_u = {str(key) for key in explicit_decl.get("buffer_units", {})}
@@ -650,10 +668,6 @@ def scale_explicit_placement_device(
     }
     explicit_rates = {str(key) for key in explicit_decl.get("rates", {})}
     aic_r = {"mte1", "mte2_aic", "fixpipe"}
-    aiv_r = {"vector", "mte2_aiv", "mte3", "reg_data_writes",
-             "reg_ub_accesses", "reg_ub_stores", "reg_alu_lanes",
-             "reg_special_lanes", "reg_reduce_lanes", "reg_shuffle_lanes",
-             "scalar_store_issue"}
     scaled_r = {
         k: (float(v) * scale_aic if k in aic_r and k not in explicit_rates
             else (float(v) * scale_aiv if k in aiv_r and k not in explicit_rates
