@@ -511,21 +511,33 @@ def _mixed_quant_contracts(case, context):
     return [node["contract"] for node in report["nodes"] if node.get("recipe") == "aclnn_mixed_quant_sparse_flash_mla"]
 
 def test_observed_mqsmla_spellings_share_the_active_contract():
+    from mindie_sim.observed_contracts.attention import (
+        ACLNN_MQSMLA_CANONICAL_KIND,
+        DSL_MQSMLA_NATIVE_KIND,
+        MQSMLA_FP8_ROW_BYTES,
+        MQSMLA_NATIVE_INPUT_COUNT,
+    )
     query = ((1, 64, 512), "bf16", "ND")
     empty = ((), None, None)
-    inputs = [query, empty, ((16, 1, 1, 544), "uint8", "ND"), ((1, 16), "int32", "ND"), empty, empty, empty,]
-    case = _case("deepseek-v4.1-flash", tp=1, dp=1, ep=1, layers=2)
+    table = ((1, 16), "int32", "ND")
+    dsl_inputs = [query, empty, ((16, 1, 1, 544), "uint8", "ND"), table, empty, empty, empty]
+    cann_inputs = [query, ((16, 1, 1, MQSMLA_FP8_ROW_BYTES), "uint8", "ND"), empty, empty, empty, table, empty]
+    cann_inputs.extend([empty] * (MQSMLA_NATIVE_INPUT_COUNT - len(cann_inputs)))
+    case = _case("deepseek-v4.1-flash", tp=1, dp=1, ep=1, layers=2, feature_track="proposed")
     declared = _mixed_quant_contracts(case, context=2048)
     assert len(declared) == 2
-    for kind, expected in (("MqsmlaKernel___call__", "MqsmlaKernel___call__"),
-        ("MqsmlaKernel", "MqsmlaKernel___call__"), ("aclnnMixedQuantSparseFlashMla", "aclnnMixedQuantSparseFlashMla"),
-        ("MixedQuantSparseFlashMla", "aclnnMixedQuantSparseFlashMla"),):
-        contract = observed_attention_contract(_observed_row(kind, inputs, [query, empty]))
+    for kind in (DSL_MQSMLA_NATIVE_KIND, "MqsmlaKernel___call__", "MqsmlaKernel"):
+        contract = observed_attention_contract(_observed_row(kind, dsl_inputs, [query, empty]))
         assert contract is not None
-        assert contract[:2] == ("sparse_attention_active", expected)
+        assert contract[:2] == ("sparse_attention_active", DSL_MQSMLA_NATIVE_KIND)
         assert contract[2][0][0] == query[0]
-        if expected == "aclnnMixedQuantSparseFlashMla":
-            assert list(contract[:2]) == list(declared[0][:2])
+        assert list(contract[:2]) == list(declared[0][:2])
+    for kind in (ACLNN_MQSMLA_CANONICAL_KIND, "MixedQuantSparseFlashMla"):
+        contract = observed_attention_contract(_observed_row(kind, cann_inputs, [query, empty]))
+        assert contract is not None
+        assert contract[:2] == ("sparse_attention_active", ACLNN_MQSMLA_CANONICAL_KIND)
+        assert contract[2][0][0] == query[0]
+        assert observed_attention_contract(_observed_row(kind, dsl_inputs, [query, empty])) is None
 
 def test_compressor_contract_counts_inputs_by_ratio():
     view = {"tokens": 8, "hidden": 5120, "width": 512, "coff": 2, "dtype": "bf16", "weight_dtype": "bf16", "ape_dtype": "fp32",
