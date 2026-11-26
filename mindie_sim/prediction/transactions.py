@@ -27,6 +27,7 @@ class QueuedStore:
     response_ms: float
     row_control_ms: float = 0.0
     issue_placement: tuple[int, ...] = ()
+    issue_quota_resource: str = ""
 
     def start(self, engine, name, ready, *, owner=""):
         outstanding = int(self.outstanding)
@@ -55,10 +56,14 @@ class QueuedStore:
             address = offset + row * row_stride + col * elem_bytes
             keys = tuple(range(address // granule,
                                (address + elem_bytes - 1) // granule + 1))
+            issue_work = {self.issue_resource: self.participants}
+            if self.issue_quota_resource:
+                issue_work[self.issue_quota_resource] = self.participants
             submitted = engine.submit(
-                f"{name}:request{index}:issue", {self.issue_resource: self.participants},
+                f"{name}:request{index}:issue", issue_work,
                 after=(issue_tail,), caps={self.issue_resource: self.issue_rate * self.participants},
                 placement={self.issue_resource: self.issue_placement} if self.issue_placement else None,
+                coupled=bool(self.issue_quota_resource),
                 owner=owner,
             )
             issue_tail = submitted
@@ -81,7 +86,7 @@ class QueuedStore:
                                   on_complete=lambda _: engine.resolve(complete), owner=owner)
 
             response = engine.submit(
-                f"{name}:request{index}:response",
+                f"{name}:store:request{index}:response",
                 {self.memory_resource: elem_bytes * self.participants},
                 after=dependencies, latency=self.response_ms, on_complete=retire, owner=owner,
             )

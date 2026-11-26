@@ -598,3 +598,196 @@ def test_selection_exposes_candidates_and_chosen_plan(phase, context, selected, 
         assert record["geometry"]["padded_tokens"] == 4
     else:
         assert record["implementation"] == selected and "add_rmsnorm" not in resolved.kernels["lowerings"]
+
+
+def test_exhaustive_multi_output_split_and_dynamic_quant_conserve_write_bytes():
+    from mindie_sim import target_graphs
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.transforms import activation_quantization
+
+    case = compose_case(
+        "qwen3-next-80b-a3b", hardware="a3", tp=1, ep=1,
+        num_devices=1, layers=1, prompt_tokens=4, output_tokens=1,
+    )
+    ops = target_graphs(case, phase="decode", tokens=1, context=4, sequences=1, scope="body")[0]
+    split_op = next(op for op in ops if op.recipe == "fused_qkvzba_split_reshape_cat")
+    split_vals = produced_values(split_op)
+    assert len(split_vals) == dict(split_op.metadata)["output_count"] == 4
+    assert sum(v["write_bytes"] for v in split_vals) == pytest.approx(split_op.mte3_bytes)
+    assert [v["output"] for v in split_vals] == ["mixed_qkv", "z", "beta", "alpha"]
+
+    # Padded full-capture split keeps active logical rows while conserving physical write bytes,
+    # and downstream consumers bind named beta/alpha/z ports instead of defaulting to mixed_qkv.
+    padded_raw = compose_case(
+        "qwen3-next-80b-a3b", hardware="a3", tp=1, ep=1,
+        num_devices=1, layers=1, prompt_tokens=4, output_tokens=1,
+    )
+    padded_raw["runtime"]["graph_capture_mode"] = "full"
+    padded_raw["runtime"]["graph_capture_keys"] = [2]
+    padded_ops = target_graphs(padded_raw, phase="decode", tokens=1, context=4, sequences=1, scope="body")[0]
+    padded_split = next(op for op in padded_ops if op.recipe == "fused_qkvzba_split_reshape_cat")
+    padded_vals = produced_values(padded_split)
+    assert all(v["logical_shape"][0] == 1 and v["storage_shape"][0] == 2 for v in padded_vals)
+    assert sum(v["write_bytes"] for v in padded_vals) == pytest.approx(padded_split.mte3_bytes)
+    assert padded_split.mte3_bytes == pytest.approx(split_op.mte3_bytes * 2.0)
+
+    by_id = {op.op_id: produced_values(op) for op in padded_ops}
+    gates_op = next(op for op in padded_ops if op.family == "gdn_gating")
+    gates_uses = producer_input_values(gates_op, by_id)
+    assert [u["output"] for u in gates_uses if u["producer"] == padded_split.op_id] == ["beta", "alpha"]
+    norm_op = next(op for op in padded_ops if op.op_id.endswith(".linear_output_norm_gate"))
+    norm_uses = producer_input_values(norm_op, by_id)
+    assert [u["output"] for u in norm_uses if u["producer"] == padded_split.op_id] == ["z"]
+
+    gemm = gemm_op(
+        op_id="q", deps=(), stage=0, layer=0, requests=("r",),
+        m=1, n=32, k=32, category="attention", quant=quant_preset("w8a8_int8"), phase="decode",
+    )
+    quant = next(op for op in activation_quantization([gemm], "bf16") if op.family == "quantize")
+    q_vals = produced_values(quant)
+    assert [(v["output"], v["write_bytes"]) for v in q_vals] == [
+        ("payload", 32.0), ("activation_scales", 4.0),
+    ]
+    assert sum(v["write_bytes"] for v in q_vals) == pytest.approx(quant.mte3_bytes)
+
+
+def test_matmul_operand_binding_uses_declared_payload_scale_and_sparse_weight_banks():
+    from _support.moe_hc_mc2_fixtures import transport_case
+    from mindie_sim import target_graphs
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.sharding.ffn_rules import routed_expert_work
+    from mindie_sim.prediction.sharding.routing import RoutingRealization
+    from mindie_sim.prediction.values.rewrite import add_input_ports
+    from mindie_sim.prediction.values.typed import typed_value
+
+    raw = transport_case(tokens=2)
+    raw["machine"] = compose_case(
+        "qwen3-next-80b-a3b", hardware="a3", dp=2, tp=1, ep=2,
+        num_devices=2, layers=1, prompt_tokens=2, output_tokens=1,
+    )["machine"]
+    raw["model"].update(num_experts=2, top_k=1)
+    ops = target_graphs(raw, phase="decode", tokens=1, context=4, sequences=[1, 1], scope="body")[0]
+    gate = next(op for op in ops if op.op_id.endswith(".expert_up"))
+    meta = dict(gate.metadata)
+    outputs = {op.op_id: produced_values(op) for op in ops if op.op_id in gate.deps}
+    bound = producer_input_values(gate, outputs)
+    payload_src = outputs[meta["activation_payload_producer"]][0]
+    scale_src = outputs[meta["activation_scale_producer"]][0]
+    assert (bound[0]["producer"], bound[0]["dtype"], bound[0]["read_bytes"]) == (
+        payload_src["producer"], payload_src["dtype"], payload_src["bytes"],
+    )
+    scale_val = next(v for v in bound if v["role"] == "scale")
+    assert (scale_val["producer"], scale_val["dtype"], scale_val["read_bytes"]) == (
+        scale_src["producer"], scale_src["dtype"], scale_src["bytes"],
+    )
+
+    # Row-view split drops stale inherited activation_payload_producer not in op.deps.
+    row_view_out = typed_value(
+        producer="row_view", dtype="int8", shape=(2, 16), storage_shape=(4, 16),
+        strides=(16, 1), offset=32, output="output", role="activation",
+        source="row_view:output", materialized=False, write_bytes=0,
+    )
+    stale_src = typed_value(
+        producer="dispatch", dtype="int8", shape=(4, 16), storage_shape=(4, 16),
+        offset=0, output="output", role="activation", source="dispatch:output",
+    )
+    tail_base = gemm_op(
+        op_id="tail_up", deps=("row_view",), stage=0, layer=0, requests=("r0", "r1"),
+        m=2, n=16, k=16, category="routed_expert", quant=quant_preset("w8a8_int8"), phase="decode",
+    )
+    tail_gemm = replace(
+        tail_base,
+        metadata=tuple({
+            **dict(tail_base.metadata),
+            "activation_payload_producer": "dispatch",
+            "activation_format": "int8",
+        }.items()),
+    )
+    tail_bound = producer_input_values(tail_gemm, {"row_view": (row_view_out,), "dispatch": (stale_src,)})
+    assert (tail_bound[0]["producer"], tail_bound[0]["layout"]["offset"]) == ("row_view", 32)
+
+    # Explicit input_ports resolve an independent scale producer without metadata hints.
+    indep_payload = typed_value(
+        producer="p_op", dtype="int8", shape=(2, 16), output="payload", role="activation",
+        source="p_op:payload",
+    )
+    indep_scale = typed_value(
+        producer="s_op", dtype="fp32", shape=(2,), output="activation_scales", role="scale",
+        source="s_op:activation_scales",
+    )
+    indep_base = gemm_op(
+        op_id="indep_mm", deps=("p_op", "s_op"), stage=0, layer=0, requests=("r0", "r1"),
+        m=2, n=16, k=16, category="attention", quant=quant_preset("w8a8_int8"), phase="decode",
+    )
+    indep_gemm = add_input_ports(
+        replace(
+            indep_base,
+            metadata=tuple({
+                **dict(indep_base.metadata),
+                "activation_format": "int8",
+                "activation_scale_format": "fp32",
+            }.items()),
+        ),
+        ({"op": "p_op", "output": "payload"}, {"op": "s_op", "output": "activation_scales"}),
+    )
+    indep_bound = producer_input_values(
+        indep_gemm, {"p_op": (indep_payload,), "s_op": (indep_scale,)},
+    )
+    indep_scale_val = next(v for v in indep_bound if v["role"] == "scale")
+    assert (indep_bound[0]["producer"], indep_scale_val["producer"]) == ("p_op", "s_op")
+
+    for rows_hist, token_map in (
+        ((1, 0, 1), ((0,), (2,))),
+        ((1, 0, 1, 1), ((0,), (2,), (3,))),
+    ):
+        routing = RoutingRealization("target", 0, "decode", sum(rows_hist), rows_hist, token_map)
+        expert_gemm = gemm_op(
+            op_id="gate", deps=("x",), stage=0, layer=0, requests=tuple(f"r{i}" for i in range(routing.rows)),
+            m=routing.rows, n=16, k=16, family="grouped_gemm", category="routed_expert",
+            weight_count=routing.active, quant=quant_preset("bf16"), phase="decode",
+        )
+        expert_gemm = routed_expert_work(
+            expert_gemm, n=16, k=16, weights=routing.active * 16 * 16 * 2, weight_kind="gate_up",
+            local_rows=routing.rows, active_experts=routing.active, local_experts=len(rows_hist),
+            local_ep_rank=0, routing_realization=routing, routing_metadata=(), balanced=False,
+        )
+        w_vals = [v for v in producer_input_values(expert_gemm, source_dtype="bf16") if v["role"] == "weight"]
+        addressed = [
+            v["layout"]["offset"] + idx * v["layout"]["strides"][0]
+            for v in w_vals for idx in range(v["layout"]["shape"][0])
+        ]
+        expected = [idx * 16 * 16 for idx, count in enumerate(rows_hist) if count]
+        assert addressed == expected
+        assert sum(v["read_bytes"] for v in w_vals) == pytest.approx(routing.active * 16 * 16 * 2)
+
+    # Column-split sparse expert down-projection preserves both active banks and applies column offset.
+    col_routing = RoutingRealization("target", 0, "decode", 2, (1, 0, 1), ((0,), (2,)))
+    down_base = routed_expert_work(
+        gemm_op(
+            op_id="down", deps=("x",), stage=0, layer=0, requests=("r0", "r1"),
+            m=2, n=64, k=16, family="grouped_gemm", category="routed_expert",
+            weight_count=2, quant=quant_preset("bf16"), phase="decode",
+        ),
+        n=64, k=16, weights=2 * 64 * 16 * 2, weight_kind="down",
+        local_rows=2, active_experts=2, local_experts=3,
+        local_ep_rank=0, routing_realization=col_routing, routing_metadata=(), balanced=False,
+    )
+    for col_start, col_stop in ((0, 32), (32, 64)):
+        col_half = replace(
+            down_base, local_shape=(2, 32, 16),
+            metadata=tuple({
+                **dict(down_base.metadata),
+                "deepep_column_span": (col_start, col_stop),
+                "deepep_column_cut": (32, 32),
+                "deepep_weight_scale": 0.5,
+                "packed_weight_bytes": 2048.0,
+            }.items()),
+        )
+        col_weights = [v for v in producer_input_values(col_half, source_dtype="bf16") if v["role"] == "weight"]
+        assert sum(v["read_bytes"] for v in col_weights) == pytest.approx(2048.0)
+        assert col_weights[0]["storage_shape"] == [3, 64, 16]
+        col_addrs = [
+            v["layout"]["offset"] + idx * v["layout"]["strides"][0]
+            for v in col_weights for idx in range(v["layout"]["shape"][0])
+        ]
+        assert col_addrs == [col_start * 16, 2 * 64 * 16 + col_start * 16]

@@ -28,6 +28,7 @@ from mindie_sim.prediction.operators.recurrent.recover_ssm_work import (
     emit_commit_op, recover_ssm_enabled, rewrite_gdn_analytical_scan, stamp_gdn_kernel_spec,
 )
 from ...tensors import TensorLowering
+from ...values.rewrite import add_input_ports
 from ..contracts import OperatorPlanningContext
 from . import gdn_recurrent
 from ._gdn_decode_programs import (
@@ -231,6 +232,10 @@ def _lower_convolution(b, tensors, *, conv_input, deps, views, active, active_ro
     b.ops[-1] = replace(b.ops[-1], recipe=CONV, source_boundary="kernel",
                         padded_shape=(core_tokens, width), hbm_bytes=float(external),
                         mte2_bytes=float(reads), mte3_bytes=float(writes), vector_ops=float(vector))
+    if isinstance(conv_input.output, str) and conv_input.output:
+        b.ops[-1] = add_input_ports(
+            b.ops[-1], ({"op": conv_input.producer, "output": conv_input.output},),
+        )
     return conv
 
 
@@ -453,7 +458,15 @@ def _lower_gdn_inputs(b, tensors, *, deps, model, plan, tp: int, tokens: int, co
             returns=("mixed_qkv", "z", "beta", "alpha"),
             metadata=(("native_kind", FUSED_QKVZBA_RECIPE),
                       ("interleaved_qkvzba", True),
-                      ("output_count", FUSED_QKVZBA_OUTPUT_COUNT)),
+                      ("output_count", FUSED_QKVZBA_OUTPUT_COUNT),
+                      ("mixed_qkv_shape", (tokens, width)),
+                      ("mixed_qkv_write_bytes", float(tokens * width * elem_bytes)),
+                      ("z_shape", (tokens, value_width)),
+                      ("z_write_bytes", float(tokens * value_width * elem_bytes)),
+                      ("beta_shape", (tokens, heads)),
+                      ("beta_write_bytes", float(tokens * heads * elem_bytes)),
+                      ("alpha_shape", (tokens, heads)),
+                      ("alpha_write_bytes", float(tokens * heads * elem_bytes))),
         )
         conv_input = tensors.result(
             split_id, (tokens, width), output="mixed_qkv").narrow(0, 0, core_tokens)
@@ -551,7 +564,8 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
         heads=heads, width=width, cache_index_row_stride=cache_index_row_stride)
     values = _split_conv_qkv(tensors, conv, core_tokens, heads, keys, dk, dv)
     beta_store = _resolve_beta_store(runtime, gating_beta_store, gating_programs)
-    gated = b.work("delta_gates", tuple(value.producer for value in gate_inputs), (core_tokens, heads),
+    gate_deps = tuple(dict.fromkeys(value.producer for value in gate_inputs))
+    gated = b.work("delta_gates", gate_deps, (core_tokens, heads),
                    family="gdn_gating", dtype="bf16",
                    metadata=(("source", GATING_SOURCE), ("beta_store", beta_store),
                              ("logical_programs", gating_programs),
@@ -562,6 +576,13 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     b.ops[-1] = replace(b.ops[-1], recipe=GATING, source_boundary="kernel",
                         hbm_bytes=float(gate_reads + gate_writes), mte2_bytes=float(gate_reads),
                         mte3_bytes=float(gate_writes), vector_ops=float(gate_vector))
+    gate_ports = tuple(
+        {"op": value.producer, "output": value.output}
+        for value in gate_inputs
+        if isinstance(value.output, str) and value.output
+    )
+    if gate_ports:
+        b.ops[-1] = add_input_ports(b.ops[-1], gate_ports)
     gate_values = (tensors.result(gated, (1, core_tokens, heads), "fp32", output="decay"),
                    tensors.result(gated, (1, core_tokens, heads), "bf16", output="beta"))
     core = _lower_recurrence(
@@ -581,6 +602,10 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
         metadata=(("norm_kind", "rmsnorm"), ("norm_has_weight", True), ("norm_has_bias", False),
                   ("norm_group_width", dv), ("gate_present", True), ("gate_layout", gate.layout.to_dict()),
                   ("recurrent_attention_kind", "gdn"), ("fused_from", ("rmsnorm", "gate"))))
+    if isinstance(gate.output, str) and gate.output:
+        b.ops[-1] = add_input_ports(
+            b.ops[-1], ({"op": gate.producer, "output": gate.output},),
+        )
     _declare_gated_rmsnorm(
         b, normalized=normalized, tokens=tokens, heads=heads, dv=dv, dtype=model.activation_dtype)
     last = b.matrix("linear_output", (normalized,), tokens, model.hidden_size, value_width, category="gdn.o")

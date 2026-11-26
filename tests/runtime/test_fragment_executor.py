@@ -600,3 +600,76 @@ def test_conductor_shares_memory_budget_and_async_reader_generation():
     assert conductor.hold_async_reader("request", "reader", storage="kv/page", ranges=(0, 32), generation=3)
     assert memory.pending_async_consumers(0, "request") == ("reader",)
     assert conductor.release_async_reader("request", "reader") and not memory.pending_async_consumers(0, "request")
+
+
+def test_tensor_input_port_enforces_producer_completion_and_causal_commits_supersede():
+    from mindie_sim.prediction.runtime.contracts import PortBinding
+    from mindie_sim.schema.subgraphs import TensorPortSpec
+
+    port = TensorPortSpec("x", "in", "activation", dtype="bf16", readiness="producer_complete")
+    reader = ProgramFragment(
+        "read_x", ports=PortSet(tensor_in=(port,)),
+        work=WorkSet((WorkItem("cube", 1, "work"),)),
+    )
+    for use_binding in (False, True):
+        engine = Engine([Resource("cube", 1)], backend="python")
+        conductor = FragmentConductor(engine)
+        producer = engine.submit("produce_x", latency=4)
+        port_input = PortBinding(ready=producer) if use_binding else producer
+        done = conductor.submit(reader, inputs={"x": port_input}).event
+        engine.advance(until=(producer, done), first=False)
+        assert (producer.time, done.started, done.time) == pytest.approx((4.0, 4.0, 5.0))
+
+    # Direct causal chain and transitive Engine boundary at t=0 both supersede prior commit.
+    for via_boundary in (False, True):
+        state_engine = Engine([], backend="python")
+        state_conductor = FragmentConductor(state_engine, state={"kv": 0})
+        def commit(version, arbiter, after=()):
+            effects = (
+                StateEffect("kv", "read", version - 1),
+                StateEffect("kv", "write", version),
+                StateEffect("kv", "commit", version, arbiter=arbiter),
+            )
+            return state_conductor.submit(ProgramFragment(str(version), state_effects=effects), after=after).event
+
+        first = commit(1, "z")
+        dep = state_engine.boundary("sync", after=(first,)) if via_boundary else first
+        second = commit(2, "a", after=(dep,))
+        state_conductor.advance(until=(second,))
+        assert (first.time, second.time, state_conductor.state.committed_version("kv")) == (0.0, 0.0, 2)
+
+    # Sibling commits in the same fragment arbitrate symmetrically regardless of tuple order.
+    for commit_pair in (
+        (StateEffect("kv", "commit", 1, arbiter="z"), StateEffect("kv", "commit", 2, arbiter="a")),
+        (StateEffect("kv", "commit", 2, arbiter="a"), StateEffect("kv", "commit", 1, arbiter="z")),
+    ):
+        sib = FragmentConductor(Engine([], backend="python"), state={"kv": 0})
+        ev = sib.submit(ProgramFragment("sib", state_effects=(
+            StateEffect("kv", "write", 1), StateEffect("kv", "write", 2), *commit_pair,
+        ))).event
+        sib.advance(until=(ev,))
+        assert sib.state.committed_version("kv") == 1
+
+    # Serial zero-duration write+commit chain past default version limit reclaims superseded versions,
+    # and repeated same-version causal commits keep event-commit ancestry O(1).
+    chain = FragmentConductor(Engine([], backend="python"), state={"kv": 0})
+    prev = None
+    for ver in range(1, 70):
+        prev = chain.submit(ProgramFragment(f"c{ver}", state_effects=(
+            StateEffect("kv", "write", ver), StateEffect("kv", "commit", ver),
+        )), after=(prev,) if prev is not None else ()).event
+    chain.advance(until=(prev,))
+    assert chain.state.committed_version("kv") == 69
+    assert len(chain.state.live_versions("kv")) <= 2
+
+    same = FragmentConductor(Engine([], backend="python"), state={"kv": 0})
+    same_prev = same.submit(ProgramFragment("init", state_effects=(
+        StateEffect("kv", "write", 1), StateEffect("kv", "commit", 1),
+    ))).event
+    for idx in range(70):
+        same_prev = same.submit(ProgramFragment(f"s{idx}", state_effects=(
+            StateEffect("kv", "commit", 1),
+        )), after=(same_prev,)).event
+    same.advance(until=(same_prev,))
+    assert same.state.committed_version("kv") == 1
+    assert len(same.state._event_commits) <= 2

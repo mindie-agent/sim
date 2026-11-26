@@ -508,3 +508,35 @@ def test_coprime_stride_residency_partitions_exact_bytes_with_bounded_memory():
     counts = {item.initial_residency: sum(hi - lo for lo, hi in item.ranges)
               + sum(run.rows * run.row_bytes for run in item.address_runs) for item in split}
     assert counts == {"l2_warm": sector**2, "hbm_cold": (rows - sector) * sector}  # One visit per stride residue.
+
+
+def test_indexed_pipeline_waits_for_slot_allocation_release_before_reuse():
+    panel_alloc = Allocation("panel", "ub", 16)
+    configs = (
+        ((), {"name": "panel", "scope": "slot"}, 5.0, 32),
+        ((("long", 2),), {"name": "panel", "scope": "slot"}, 5.0, 32),
+        ((("short", 1),), {"name": "panel", "scope": "slot"}, 5.0, 32),
+        ((), {"name": "panel", "scope": "slot", "identity": "ub:shared_panel"}, 6.0, 16),
+        ((("short", 1),), {"name": "panel", "scope": "slot", "identity": "ub:shared_panel"}, 6.0, 16),
+    )
+    for tail_lags, binding, expected_ms, expected_peak in configs:
+        phases = tuple(
+            PipelinePhase(
+                name,
+                (Stage(
+                    name, latency=ms, acquire=(panel_alloc,), free=(panel_alloc,),
+                    previous_lags=tail_lags if name == "tail" else (),
+                ),),
+                1,
+            )
+            for name, ms in (("long", 4), ("short", 1), ("tail", 1))
+        )
+        template = PipelineTemplate(
+            0, 2, phases, bindings=(binding,),
+            indexed_panels=3, index_of=lambda i: (i, i + 1, i, 0, i % 2),
+        )
+        engine = Engine([], pools={"ub": 32}, backend="python")
+        done = PipelineTemplateProgram(template).start(engine, "p", engine.submit("ready"))
+        engine.advance(until=(done,))
+        assert engine.peak_allocated["ub"] == expected_peak and engine.allocated["ub"] == 0
+        assert done.time == pytest.approx(expected_ms)

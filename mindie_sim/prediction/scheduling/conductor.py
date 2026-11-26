@@ -375,6 +375,39 @@ class FragmentConductor:
             return tuple(self._as_event(item, label) for item in value)
         raise FragmentContractError(f"fragment_event_binding_invalid:{label}")
 
+    def _port_events(self, value: Any, label: str) -> tuple[Event, ...]:
+        if isinstance(value, (FragmentHandle, Event)):
+            return (self._as_event(value, label),)
+        ready = getattr(value, "ready", None)
+        if isinstance(ready, (FragmentHandle, Event)):
+            return (self._as_event(ready, label),)
+        if isinstance(value, (tuple, list)):
+            collected: list[Event] = []
+            for item in value:
+                item_events = self._port_events(item, label)
+                if item_events:
+                    collected.extend(item_events)
+            return tuple(dict.fromkeys(collected))
+        if isinstance(value, Mapping):
+            if value.get("event") is not None:
+                return self._as_events(value["event"], label)
+            raw_ready = value.get("ready")
+            if isinstance(raw_ready, (FragmentHandle, Event)):
+                return (self._as_event(raw_ready, label),)
+            if isinstance(raw_ready, (tuple, list)):
+                ready_events = self._port_events(raw_ready, label)
+                if ready_events:
+                    return ready_events
+        binding = getattr(value, "binding", "")
+        binding_name = getattr(value, "binding_name", "")
+        if binding == "event" and isinstance(binding_name, str) and binding_name:
+            recorded = self._find_event(binding_name, None)
+            if recorded is None:
+                raise FragmentContractError(
+                    f"fragment_event_unbound:{binding_name}")
+            return (recorded,)
+        return ()
+
     def _base_dependencies(self, fragment: ProgramFragment,
                            after: Sequence[Event],
                            inputs: Mapping[str, Any] | None) -> tuple[Event, ...]:
@@ -392,7 +425,7 @@ class FragmentConductor:
                         if recorded is not None:
                             events.append(recorded)
                             continue
-                    if port.optional:
+                    if getattr(port, "optional", False):
                         continue
                     raise FragmentContractError(
                         f"fragment_input_unbound:{port.name}")
@@ -401,6 +434,8 @@ class FragmentConductor:
                         f"fragment_input_unbound:{port.name}")
                 if group == "event_in":
                     events.extend(self._as_events(value, port.name))
+                else:
+                    events.extend(self._port_events(value, port.name))
         return tuple(dict.fromkeys(events))
 
     def _find_event(self, name: str, generation: int | None) -> Event | None:
@@ -487,10 +522,26 @@ class FragmentConductor:
                     "memory_event": self.memory_event,
                     "memory_host_bytes": self.memory_host_bytes,
                     "memory_unit": self.memory_unit}
+        predecessors = tuple(after)
+        wrapped_start = None
+        if on_start is not None:
+            def wrapped_start(event: Event) -> None:
+                self.state._run_read_scope(event.sequence, on_start, event)
+        wrapped_complete = None
+        if on_complete is not None:
+            def wrapped_complete(event: Event) -> None:
+                at = event.time if event.time is not None else self.engine.now
+                ancestors = self.state._collect_causal_ancestors(predecessors, at=at)
+                emitted = self.state._run_causal_scope(
+                    ancestors, on_complete, event, at=at,
+                )
+                self.state._record_event_commits(
+                    event.sequence, ancestors | emitted, at=at,
+                )
         return self.engine.submit(
-            name, work, after=tuple(after), acquire=tuple(acquire),
+            name, work, after=predecessors, acquire=tuple(acquire),
             free=tuple(free), priority=priority, coupled=coupled,
-            on_start=on_start, on_complete=on_complete, owner=owner,
+            on_start=wrapped_start, on_complete=wrapped_complete, owner=owner,
             metadata={key: value for key, value in metadata.items()
                       if value is not None},
             memory=self.memory, memory_pools=self.memory_pools,
@@ -653,6 +704,15 @@ class FragmentConductor:
     def _finish(self, record: _LiveRecord, event: Event) -> None:
         handle = record.handle
         completion_event = handle.event if handle is not None else event
+        at = (
+            completion_event.time
+            if completion_event.time is not None
+            else self.engine.now
+        )
+        linked = [completion_event.sequence]
+        if handle is not None:
+            linked.extend(rel.sequence for rel in handle.release_events)
+        self.state._link_active_event_commits(linked, at=at)
         self._live.pop(completion_event.sequence, None)
         fragment = record.fragment
         release_boundaries = len(handle.release_by_name) if handle is not None else 0

@@ -462,35 +462,24 @@ def produced_values(op, *, materialized=None):
     if materialized is not None:
         is_materialized = materialized
     alias_of = str(metadata.get("alias_of") or "")
-    write_bytes = metadata.get("write_bytes")
-    if write_bytes is None and is_materialized:
-        write_bytes = payload_bytes
-    primary = typed_value(
-        producer=op.op_id, dtype=dtype, shape=logical, storage_shape=storage,
-        output=name, role="activation", source=f"{op.op_id}:output_format",
-        quant=quant, materialized=is_materialized,
-        layout_kind=layout_kind, write_bytes=write_bytes,
-        declared_bytes=op.mte3_bytes, alias_of=alias_of,
-        storage=str(metadata.get("storage") or ""),
-        layout=(declared_layout or (metadata.get("output_layout")
-                                    if isinstance(metadata.get("output_layout"), dict) else None)),
-        layout_name=layout_name,
-        source_format=str(metadata.get("source_format") or ""),
-        contract="operator_output_contract")
-    if metadata.get("source_outputs"):
-        primary["source_outputs"] = tuple(metadata["source_outputs"])
-    if metadata.get("source_layouts"):
-        primary["source_layouts"] = tuple(metadata["source_layouts"])
-    if op.family == "tensor_copy" and not (
-            metadata.get("source_layout") or metadata.get("source_layouts")
-            or metadata.get("target_layout") or metadata.get("output_layout")):
-        primary["layout_gap"] = "missing_source_layout"
-    outputs = [primary]
-    secondary_materialized = True if materialized is None else materialized
+    declared_output_count = metadata.get("output_count")
+    returns_are_exhaustive = (
+        bool(op.returns)
+        and isinstance(declared_output_count, int)
+        and not isinstance(declared_output_count, bool)
+        and declared_output_count == len(op.returns)
+        and "primary_output" not in metadata
+        and name not in op.returns
+    )
+    secondary_materialized = (
+        is_materialized if returns_are_exhaustive
+        else (True if materialized is None else materialized)
+    )
     abi_scale = str(abi.act_scale_dtype).strip() if abi is not None and abi.act_scale_dtype else ""
     abi_input = str(abi.input_dtype).strip() if abi is not None and abi.input_dtype else ""
+    secondary = []
     for returned in op.returns:
-        if returned == name:
+        if not returns_are_exhaustive and returned == name:
             continue
         if returned == "activation_scales":
             meta_scale = str(metadata.get("activation_scale_format") or "").strip()
@@ -502,7 +491,7 @@ def produced_values(op, *, materialized=None):
             shape = tuple(metadata.get("activation_scale_shape") or
                           ((logical[0], 1) if logical else ()))
             logical_scale, storage_scale = _row_shape(metadata, shape)
-            outputs.append(typed_value(
+            secondary.append(typed_value(
                 producer=op.op_id, dtype=scale_dtype, shape=logical_scale,
                 storage_shape=storage_scale, output=returned, role="scale",
                 source=f"{op.op_id}:returns.{returned}",
@@ -511,7 +500,7 @@ def produced_values(op, *, materialized=None):
                 contract="declared_scale_value"))
         elif returned == "rstd":
             rows = logical[0] if logical else 0
-            outputs.append(typed_value(
+            secondary.append(typed_value(
                 producer=op.op_id, dtype="fp32", shape=(rows,),
                 storage_shape=(storage[0],) if storage else (rows,),
                 output=returned, role="auxiliary",
@@ -540,7 +529,7 @@ def produced_values(op, *, materialized=None):
             ret_write_bytes = metadata.get(f"{returned}_write_bytes")
             if ret_write_bytes is None:
                 ret_write_bytes = metadata.get(f"{returned}_bytes")
-            outputs.append(typed_value(
+            secondary.append(typed_value(
                 producer=op.op_id, dtype=ret_dtype, shape=ret_logical,
                 storage_shape=ret_storage, output=returned,
                 role=str(metadata.get(f"{returned}_role") or "declared_output"),
@@ -548,7 +537,56 @@ def produced_values(op, *, materialized=None):
                 materialized=secondary_materialized,
                 write_bytes=ret_write_bytes,
                 contract="declared_return_value"))
-    return tuple(outputs)
+    if returns_are_exhaustive:
+        return tuple(secondary)
+    secondary_write_bytes = sum(
+        float(item["write_bytes"])
+        for item in secondary
+        if item.get("write_bytes") is not None
+    )
+    explicit_primary_write = metadata.get("primary_write_bytes")
+    if explicit_primary_write is None:
+        explicit_primary_write = metadata.get(f"{name}_write_bytes")
+    if explicit_primary_write is not None:
+        write_bytes = float(explicit_primary_write)
+    else:
+        raw_write = metadata.get("write_bytes")
+        if raw_write is not None:
+            raw_write_f = float(raw_write)
+            if (
+                secondary_write_bytes > 0.0
+                and op.mte3_bytes > 0.0
+                and math.isclose(raw_write_f, float(op.mte3_bytes))
+                and raw_write_f >= secondary_write_bytes
+            ):
+                write_bytes = raw_write_f - secondary_write_bytes
+            else:
+                write_bytes = raw_write_f
+        elif is_materialized:
+            write_bytes = payload_bytes
+        else:
+            write_bytes = None
+    primary = typed_value(
+        producer=op.op_id, dtype=dtype, shape=logical, storage_shape=storage,
+        output=name, role="activation", source=f"{op.op_id}:output_format",
+        quant=quant, materialized=is_materialized,
+        layout_kind=layout_kind, write_bytes=write_bytes,
+        declared_bytes=op.mte3_bytes, alias_of=alias_of,
+        storage=str(metadata.get("storage") or ""),
+        layout=(declared_layout or (metadata.get("output_layout")
+                                    if isinstance(metadata.get("output_layout"), dict) else None)),
+        layout_name=layout_name,
+        source_format=str(metadata.get("source_format") or ""),
+        contract="operator_output_contract")
+    if metadata.get("source_outputs"):
+        primary["source_outputs"] = tuple(metadata["source_outputs"])
+    if metadata.get("source_layouts"):
+        primary["source_layouts"] = tuple(metadata["source_layouts"])
+    if op.family == "tensor_copy" and not (
+            metadata.get("source_layout") or metadata.get("source_layouts")
+            or metadata.get("target_layout") or metadata.get("output_layout")):
+        primary["layout_gap"] = "missing_source_layout"
+    return (primary, *secondary)
 
 
 def _prepend_source_value_contract(

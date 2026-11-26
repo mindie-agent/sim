@@ -210,9 +210,16 @@ def _normalize_parsed_case(case: Case) -> Case:
     validate_quantized_allreduce_runtime(
         metadata, arch=str(case.machine.arch_family or ""), tp=int(p.tp),
     )
-    media = {request.request_id: request.media_tokens for request in case.workload.requests if request.media_tokens}
-    if media:
-        metadata["media_tokens_by_request"] = media
+    if case.workload.requests:
+        media = {
+            request.request_id: request.media_tokens
+            for request in case.workload.requests
+            if request.media_tokens and not getattr(request, "media_encoded", False)
+        }
+        if media:
+            metadata["media_tokens_by_request"] = media
+        else:
+            metadata.pop("media_tokens_by_request", None)
     moe_cfg = case.runtime.kernels.get("moe_transport")
     deepep_enabled = (
         (isinstance(moe_cfg, Mapping) and moe_cfg.get("mode") == "deepep")

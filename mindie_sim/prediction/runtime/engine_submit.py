@@ -140,6 +140,8 @@ class _EngineSubmitMixin:
         if needs_hbm_split and task.start_callback is None:
             task.start_callback = _hbm_bus_split_start_hook
         tasks[event.sequence] = task
+        if self.state_ledger is not None and after:
+            self.state_ledger._note_event_predecessors(event.sequence, after)
         if deliv_tuple:
             self._delivery_live += 1
         if prepared.hbm_accounting:
@@ -202,6 +204,7 @@ class _EngineSubmitMixin:
             self._complete(task)
             return event
         if (accel is not None
+                and not (self.state_ledger is not None and self.state_ledger._event_commits)
                 and accel.eligible(self, task)
                 and not _task_needs_hbm_bus_split(task)
                 and len(self._native_seqs) == len(tasks) - 1):
@@ -497,6 +500,8 @@ class _EngineSubmitMixin:
     def resolve(self, event: Event) -> None:
         del self._promises[event.sequence]
         event.time = self.now
+        if self.state_ledger is not None:
+            self.state_ledger._propagate_event_commits(event.sequence, at=event.time)
         self._wake(event)
         callbacks = event._callbacks
         if callbacks:

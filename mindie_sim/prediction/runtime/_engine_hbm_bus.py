@@ -34,6 +34,7 @@ _WRITE_NAME_TOKENS = frozenset({
     "write", "store", "spill", "writeback", "evict", "scatter", "out", "output",
 })
 _NAME_SPLIT_RE = re.compile(r"[^a-z0-9]+")
+_QUEUED_STORE_RESPONSE_RE = re.compile(r":store:request\d+:response$")
 _ROW_READ_SUFFIX = ":r"
 _ROW_WRITE_SUFFIX = ":w"
 _UNIT_ROW_RATE = 1.0
@@ -176,6 +177,8 @@ def _classify_hbm_split(
     if read_pipe > 0.0:
         return "read", amount, 0.0
     if write_pipe > 0.0:
+        return "write", 0.0, amount
+    if _QUEUED_STORE_RESPONSE_RE.search(name):
         return "write", 0.0, amount
     tokens = {tok for tok in _NAME_SPLIT_RE.split(name.lower()) if tok}
     has_r = bool(tokens & _READ_NAME_TOKENS)

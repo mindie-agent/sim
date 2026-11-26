@@ -598,3 +598,20 @@ def test_phase_identity_preserves_typed_transport_and_zero_work_join():
     assert encoded["receive_capacity_bytes"] == [[0, 20], [1, 10]]
     assert encoded["receive_buffer_ids"] == [[0, "rx0"], [1, "rx1"]]
     assert (encoded["max_inflight_per_rank"], encoded["max_physical_chunks"], encoded["hop_startup_us"]) == (3, 77, 2.5)
+
+
+def test_queued_store_hbm_direction_is_invariant_to_stage_label():
+    from mindie_sim.prediction.runtime.memory_physics import HbmBusSpec
+    from mindie_sim.prediction.transactions import QueuedStore
+
+    store = QueuedStore(1, 1, 2, 2, 0, 1, "scalar_store_issue", 1, "hbm", 32, 1, 0)
+    for label in ("beta_bf16", "write", "input_beta", "read_load_beta"):
+        engine = Engine([Resource("scalar_store_issue", 1), Resource("hbm", 2)], backend="python")
+        bus = HbmBusSpec(0, 1, 2, 0)
+        engine.add_hbm_bus(bus, base="hbm")
+        done = store.start(engine, label, engine.submit("ready"))
+        engine.advance(until=(done,))
+        assert done.time == pytest.approx(2.0)
+        assert engine.serviced[bus.row_r] == pytest.approx(0.0)
+        assert engine.serviced[bus.row_w] == pytest.approx(1.0)
+        assert engine.serviced["hbm"] == pytest.approx(2.0)

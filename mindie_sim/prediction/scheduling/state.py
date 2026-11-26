@@ -58,12 +58,22 @@ class StateLedger:
         self.runtime_uid: str | None = None
         self.version_limit = max(2, _nonnegative_int(
             "state_version_limit", version_limit))
-        # Same-timestamp commits are grouped before selecting a winner. The
-        # winner is the largest (arbiter, sequence) pair, so container order is
-        # never the authority.
-        self._pending: dict[tuple[str, float], dict[int, tuple[str, int]]] = {}
+        # Same-timestamp concurrent commits compete deterministically by
+        # (arbiter, sequence, version); causally later commits at the same
+        # timestamp supersede their ancestor commits cleanly.
+        self._pending: dict[tuple[str, float], dict[int, tuple[int, str, int]]] = {}
         self._commit_base: dict[tuple[str, float], int | None] = {}
-        self._empty_arbiters: set[tuple[str, float]] = set()
+        self._committed_at_t: dict[tuple[str, float], set[int]] = {}
+        self._commit_counter = 0
+        self._causal_time: float | None = None
+        self._live_tokens: set[int] = set()
+        self._event_commits: dict[int, set[int]] = {}
+        self._events_by_token: dict[int, set[int]] = {}
+        self._event_preds: dict[int, tuple[int, ...]] = {}
+        self._introduced_commits: dict[tuple[str, float, int], set[int]] = {}
+        self._read_ancestors: dict[int, set[int]] = {}
+        self._causal_stack: list[tuple[frozenset[int], set[int]]] = []
+        self._read_stack: list[int] = []
         for target, version in dict(initial or {}).items():
             if not isinstance(target, str) or not target:
                 raise FragmentContractError("state_target_invalid")
@@ -98,6 +108,101 @@ class StateLedger:
     def live_versions(self, target: str) -> tuple[int, ...]:
         return tuple(sorted(self._live.get(target, ())))
 
+    def _retire_token(self, token: int) -> None:
+        self._live_tokens.discard(token)
+        holders = self._events_by_token.pop(token, None)
+        if not holders:
+            return
+        for seq in holders:
+            bucket = self._event_commits.get(seq)
+            if bucket is None:
+                continue
+            bucket.discard(token)
+            if not bucket:
+                del self._event_commits[seq]
+
+    def _note_event_predecessors(self, event_sequence: int, after: Any) -> None:
+        if not after:
+            return
+        if hasattr(after, "sequence"):
+            self._event_preds[event_sequence] = (after.sequence,)
+            return
+        preds = tuple(pred.sequence for pred in after if hasattr(pred, "sequence"))
+        if preds:
+            self._event_preds[event_sequence] = preds
+
+    def _propagate_event_commits(self, event_sequence: int, *, at: float) -> None:
+        preds = self._event_preds.pop(event_sequence, None)
+        if not preds:
+            return
+        self._prune(at)
+        if not self._event_commits:
+            return
+        ancestors: set[int] = set()
+        for pred_seq in preds:
+            tokens = self._event_commits.get(pred_seq)
+            if tokens:
+                ancestors.update(tokens)
+        if ancestors:
+            self._record_event_commits(event_sequence, ancestors, at=at)
+
+    def _collect_causal_ancestors(
+        self, predecessors: Sequence[Any], *, at: float,
+    ) -> frozenset[int]:
+        self._prune(at)
+        if not predecessors or not self._event_commits:
+            return frozenset()
+        ancestors: set[int] = set()
+        for pred in predecessors:
+            tokens = self._event_commits.get(pred.sequence)
+            if tokens:
+                ancestors.update(tokens)
+        return frozenset(ancestors)
+
+    def _record_event_commits(
+        self, event_sequence: int, tokens: frozenset[int] | set[int], *, at: float,
+    ) -> None:
+        self._prune(at)
+        live = {tok for tok in tokens if tok in self._live_tokens}
+        if not live:
+            return
+        bucket = self._event_commits.setdefault(event_sequence, set())
+        for tok in live:
+            if tok not in bucket:
+                bucket.add(tok)
+                self._events_by_token.setdefault(tok, set()).add(event_sequence)
+
+    def _link_active_event_commits(
+        self, event_sequences: Sequence[int], *, at: float,
+    ) -> None:
+        if not self._causal_stack:
+            return
+        ancestors, emitted = self._causal_stack[-1]
+        combined = ancestors | emitted
+        if not combined:
+            return
+        for seq in event_sequences:
+            self._record_event_commits(seq, combined, at=at)
+
+    def _run_read_scope(self, event_sequence: int, callback, event) -> None:
+        self._read_stack.append(event_sequence)
+        try:
+            callback(event)
+        finally:
+            self._read_stack.pop()
+
+    def _run_causal_scope(
+        self, ancestors: frozenset[int], callback, event, *, at: float,
+    ) -> frozenset[int]:
+        self._prune(at)
+        emitted: set[int] = set()
+        self._causal_stack.append((ancestors, emitted))
+        try:
+            callback(event)
+        finally:
+            self._causal_stack.pop()
+        return frozenset(emitted)
+
     def check_read(self, target: str, version: int | None, *, at: float) -> int:
         self._prune(at)
         current = self._committed.get(target)
@@ -107,13 +212,34 @@ class StateLedger:
             return current
         value = _version(version, target)
         if value == current or value in self._live.get(target, ()):
+            if self._read_stack:
+                intro = self._introduced_commits.get((target, at, value))
+                if intro:
+                    live_intro = intro & self._live_tokens
+                    if live_intro:
+                        self._read_ancestors.setdefault(
+                            self._read_stack[-1], set()
+                        ).update(live_intro)
             return value
         raise FragmentContractError(
             f"state_version_unavailable:{target}:{value}:committed={current}")
 
-    def apply(self, effects: Sequence[StateEffect], *, at: float,
-              sequence: int) -> dict[str, Any]:
+    def apply(
+        self, effects: Sequence[StateEffect], *, at: float,
+        sequence: int, causal_ancestors: Sequence[int] = (),
+    ) -> dict[str, Any]:
         self._prune(at)
+        incoming: set[int] = {tok for tok in causal_ancestors if tok in self._live_tokens}
+        if self._causal_stack:
+            incoming.update(tok for tok in self._causal_stack[-1][0] if tok in self._live_tokens)
+        read_tokens = self._read_ancestors.pop(sequence, None)
+        if read_tokens:
+            incoming.update(tok for tok in read_tokens if tok in self._live_tokens)
+        # Sibling commits in the same fragment share the fragment's incoming
+        # ancestry and arbitrate symmetrically instead of superseding by order.
+        incoming_frozen = frozenset(incoming)
+        newly_written: dict[str, set[int]] = {}
+        emitted_tokens: list[tuple[str, int, int]] = []
         for effect in effects:
             action = effect.action
             if action == "read":
@@ -125,6 +251,14 @@ class StateLedger:
                 base = (self._commit_base[key]
                         if key in self._commit_base
                         else self._committed.get(target))
+                records = self._pending.get(key)
+                if records and incoming_frozen:
+                    sup_versions = [
+                        rec[0] for tok, rec in records.items() if tok in incoming_frozen
+                    ]
+                    if sup_versions:
+                        sup_max = max(sup_versions)
+                        base = sup_max if base is None else max(base, sup_max)
                 current = self._committed.get(target)
                 version = effect.version
                 if version is None:
@@ -133,6 +267,8 @@ class StateLedger:
                 if base is not None and version < base:
                     raise FragmentContractError(
                         f"state_write_behind_committed:{target}:{version}:{base}")
+                if version not in live:
+                    newly_written.setdefault(target, set()).add(version)
                 live.add(version)
                 if len(live) > self.version_limit:
                     raise FragmentContractError(
@@ -152,49 +288,91 @@ class StateLedger:
                         f"state_rollback_committed:{target}:{version}")
                 live.discard(version)
                 continue
-            self._commit(target, version, effect.arbiter, sequence, at)
+            token = self._commit(target, version, effect.arbiter, sequence, at, incoming_frozen)
+            emitted_tokens.append((target, version, token))
+        for target, version, token in emitted_tokens:
+            if self._causal_stack:
+                self._causal_stack[-1][1].add(token)
+            if version in newly_written.get(target, ()):
+                self._introduced_commits.setdefault((target, at, version), set()).add(token)
         return self.snapshot()
 
-    def _commit(self, target: str, version: int, arbiter: str,
-                sequence: int, at: float) -> None:
+    def _commit(
+        self, target: str, version: int, arbiter: str,
+        sequence: int, at: float, ancestors: frozenset[int],
+    ) -> int:
         key = target, at
-        if key not in self._commit_base:
-            self._commit_base[key] = self._committed.get(target)
-        previous = self._commit_base[key]
-        if previous is not None and version < previous:
+        existing_records = self._pending.get(key, {})
+        surviving = {
+            tok: rec for tok, rec in existing_records.items() if tok not in ancestors
+        }
+        superseded_toks = [tok for tok in existing_records if tok in ancestors]
+        superseded_versions = [existing_records[tok][0] for tok in superseded_toks]
+        base = (
+            self._commit_base[key]
+            if key in self._commit_base
+            else self._committed.get(target)
+        )
+        effective_prev = base
+        if superseded_versions:
+            sup_max = max(superseded_versions)
+            effective_prev = (
+                sup_max if effective_prev is None else max(effective_prev, sup_max)
+            )
+        if effective_prev is not None and version < effective_prev:
             raise FragmentContractError(
-                f"state_commit_behind_committed:{target}:{version}:{previous}")
-        records = self._pending.setdefault(key, {})
-        competing = len(records) > 1 or (
-            len(records) == 1 and version not in records)
-        if competing and (not arbiter or key in self._empty_arbiters):
+                f"state_commit_behind_committed:{target}:{version}:{effective_prev}")
+        distinct_versions = {rec[0] for rec in surviving.values()} | {version}
+        competing = len(distinct_versions) > 1
+        has_empty_arbiter = (not arbiter) or any(
+            not rec[1] for rec in surviving.values()
+        )
+        if competing and has_empty_arbiter:
             raise FragmentContractError(
                 f"state_effect_conflict_requires_arbiter:{target}")
-        if not arbiter:
-            self._empty_arbiters.add(key)
-        candidate = (arbiter, sequence)
-        existing = records.get(version)
-        if existing is None or candidate > existing:
-            records[version] = candidate
-        if len(records) == 1:
+        if key not in self._commit_base:
+            self._commit_base[key] = base
+        for tok in superseded_toks:
+            self._retire_token(tok)
+        self._commit_counter += 1
+        token = self._commit_counter
+        self._live_tokens.add(token)
+        surviving[token] = (version, arbiter, sequence)
+        self._pending[key] = surviving
+        hist = self._committed_at_t.setdefault(key, set())
+        if base is not None:
+            hist.add(base)
+        hist.add(version)
+        if len(surviving) == 1:
             self._committed[target] = version
-            self._retain(target, version, previous)
-            return
-        winner = max(records.items(),
-                     key=lambda item: (item[1][0], item[1][1], item[0]))
+            if superseded_versions:
+                # Reclaim strictly older superseded committed versions while
+                # preserving the immediate predecessor and uncommitted peers.
+                keep_floor = max(superseded_versions)
+                reclaimed = [v for v in hist if v < keep_floor]
+                live = self._live.setdefault(target, set())
+                for old_v in reclaimed:
+                    live.discard(old_v)
+                    hist.discard(old_v)
+                    self._introduced_commits.pop((target, at, old_v), None)
+            self._retain(target, version, self._commit_base[key])
+            return token
+        winner = max(surviving.values(),
+                     key=lambda rec: (rec[1], rec[2], rec[0]))
         self._committed[target] = winner[0]
-        self._retain(target, winner[0], previous)
+        self._retain(target, winner[0], self._commit_base[key])
+        return token
 
     def _retain(self, target: str, version: int, previous: int | None,
                 *, closing: bool = False) -> None:
         live = self._live.setdefault(target, set())
         keep = {version}
-        if previous is not None:
+        if previous is not None and (closing or previous in live):
             keep.add(previous)
         if closing:
             keep.update(item for item in live if item >= version)
         elif previous is not None:
-            # Keep every version at or ahead of the pre-commit base until a
+            # Keep every live version at or ahead of the pre-commit base until a
             # later timestamp so same-time competing commits stay live.
             keep.update(item for item in live if item >= previous)
         else:
@@ -211,10 +389,11 @@ class StateLedger:
     def _prune(self, at: float) -> None:
         stale = [key for key in self._pending if key[1] < at]
         for key in stale:
-            del self._pending[key]
-        stale_empty = [key for key in self._empty_arbiters if key[1] < at]
-        for key in stale_empty:
-            self._empty_arbiters.discard(key)
+            for tok in self._pending.pop(key):
+                self._retire_token(tok)
+        stale_hist = [key for key in self._committed_at_t if key[1] < at]
+        for key in stale_hist:
+            del self._committed_at_t[key]
         stale_base = [key for key in self._commit_base if key[1] < at]
         for key in stale_base:
             target, _ = key
@@ -222,3 +401,10 @@ class StateLedger:
             committed = self._committed.get(target)
             if committed is not None:
                 self._retain(target, committed, previous, closing=True)
+        if self._causal_time is None or at > self._causal_time:
+            self._live_tokens.clear()
+            self._event_commits.clear()
+            self._events_by_token.clear()
+            self._introduced_commits.clear()
+            self._read_ancestors.clear()
+            self._causal_time = at
