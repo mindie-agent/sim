@@ -837,6 +837,7 @@ def _build_moe_abi_query(
     declared_w1_layout: str = "",
     declared_w2_layout: str = "",
 ) -> AbiQueryKey:
+    """[Cohesive-Pipeline] Build one canonical MoE ABI query key from model, placement, and quantization contracts."""
     w2_dt, wq2, wg2, ws2_dt = w2_contract if w2_contract is not None else (w_dt, wq, wg, ws_dt)
     eff_lp = lp if lp is not None else _resolve_moe_layer_plan(case)
     latent_h = int(getattr(eff_lp, "expert_latent_size", 0) or 0) if eff_lp is not None else 0

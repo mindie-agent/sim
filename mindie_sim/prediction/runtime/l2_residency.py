@@ -1543,15 +1543,6 @@ def _canonical_dram_runs(
     return tuple(deduped)
 
 
-def _dram_service_segments(
-    plan: AddressRunPlan, covered: SectorCoverage,
-    burst_rules: Sequence[BurstTurnRule] = (),
-) -> Iterator[tuple[int, int, int]]:
-    """Yield missed bytes and burst geometry; width zero denotes scale metadata."""
-    for span, width, stride, _ in _dram_segments(plan, covered, burst_rules=burst_rules):
-        yield span, width, stride
-
-
 def _dram_segments(
     plan: AddressRunPlan, covered: SectorCoverage,
     *, burst_rules: Sequence[BurstTurnRule] = (),

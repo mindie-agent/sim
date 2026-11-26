@@ -1224,24 +1224,6 @@ def _lookup_probed_abi_entry_with_status(
     return _pick(candidates), False
 
 
-def _lookup_probed_abi_entry(
-    symbol: str,
-    arch_family: str,
-    track: str,
-    *,
-    precision_abi: Any = None,
-    dtype: str = "",
-    birth_readiness: str = "",
-    source_ref: Any = None,
-) -> ProbedAbiEntry | None:
-    entry, _ = _lookup_probed_abi_entry_with_status(
-        symbol, arch_family, track,
-        precision_abi=precision_abi, dtype=dtype,
-        birth_readiness=birth_readiness, source_ref=source_ref,
-    )
-    return entry
-
-
 def _extract_struct_provenance(
     op_id: str,
     spec: OpSpec | None,
