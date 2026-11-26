@@ -14,6 +14,7 @@ from __future__ import annotations
 from collections import defaultdict
 from collections.abc import Mapping
 from dataclasses import dataclass
+import re
 from types import SimpleNamespace
 from typing import Any
 
@@ -1157,6 +1158,31 @@ def _cohort_stage_ranks(exec_obj: Any, parallel: Any, replica: int, stage: int) 
     return tuple(out)
 
 
+def _cohort_rank_replicas(
+    exec_obj: Any, parallel: Any, replica: int, stage: int,
+) -> dict[int, int]:
+    """Map each physical rank in the DCP-DP stage cohort to its owning DP replica."""
+    topo = exec_obj.topology
+    dcp_dp = max(1, int(getattr(parallel, "dcp_dp_width", 1) or 1))
+    primary = int(replica)
+    if dcp_dp <= 1:
+        return {int(rk): primary for rk in topo.ranks(primary, stage)}
+    first_rep = (primary // dcp_dp) * dcp_dp
+    if isinstance(topo, _CohortStageTopology):
+        all_ranks = tuple(topo.ranks(primary, stage))
+        local_w = max(1, int(parallel.tp) * int(parallel.pcp))
+        return {
+            int(rk): first_rep + min(dcp_dp - 1, idx // local_w)
+            for idx, rk in enumerate(all_ranks)
+        }
+    out: dict[int, int] = {}
+    for dp_off in range(dcp_dp):
+        rep_i = first_rep + dp_off
+        for rk in topo.ranks(rep_i, stage):
+            out[int(rk)] = rep_i
+    return out
+
+
 def _draft_token_runs(
     case: Any,
     parallel: Any,
@@ -1550,6 +1576,22 @@ def _verify_disjoint_integer_partition(
             )
 
 
+_REPLICA_TOKEN_RE = re.compile(r"(?:^|[@:_/-])r(\d+)(?=$|[@:_/-])")
+
+
+def _qualify_published_scope(
+    raw_scope: str, *, multi_replica: bool, rep: int, stage: int, rank: int,
+) -> str:
+    """Keep published tier/scope text while preserving physical replica ownership in DCP-DP cohorts."""
+    text = str(raw_scope)
+    if not multi_replica:
+        return text
+    matches = list(_REPLICA_TOKEN_RE.finditer(text.lower()))
+    if matches and int(matches[-1].group(1)) == rep:
+        return text
+    return f"{text}:r{rep}:s{stage}:rank{rank}"
+
+
 def _make_pd_transfer_emitter(
     *,
     request,
@@ -1558,6 +1600,8 @@ def _make_pd_transfer_emitter(
     decode_mem,
     prefill_rep: int,
     decode_rep: int,
+    src_rank_replica: Mapping[tuple[int, int], int] = (),  # type: ignore[assignment]
+    dst_rank_replica: Mapping[tuple[int, int], int] = (),  # type: ignore[assignment]
     plane_bases: dict[Any, int],
     source_extents: dict[tuple[int, str, int], int],
     destination_planes: dict[Any, int],
@@ -1569,6 +1613,11 @@ def _make_pd_transfer_emitter(
     destination_ranks: set[int],
 ):
     """Build the integer-byte ``PDTransfer`` emitter bound to one handoff plan."""
+    src_rep_map = dict(src_rank_replica) if src_rank_replica else {}
+    dst_rep_map = dict(dst_rank_replica) if dst_rank_replica else {}
+    src_multi_rep = len(set(src_rep_map.values())) > 1
+    dst_multi_rep = len(set(dst_rep_map.values())) > 1
+
     def emit(source_rank, destination_rank, component, payload, *,
              source_stage, destination_stage, layer, source_span,
              destination_span, source_tokens, destination_tokens,
@@ -1586,35 +1635,63 @@ def _make_pd_transfer_emitter(
         dst_comp = destination_component or component
         src_rec = _published_for(published, "prefill", request, layer, src_comp)
         dst_rec = _published_for(published, "decode", request, layer, dst_comp)
+        src_rk = int(source_rank)
+        dst_rk = int(destination_rank)
+        src_st = int(source_stage)
+        dst_st = int(destination_stage)
+        src_rep = src_rep_map.get((src_st, src_rk), prefill_rep)
+        dst_rep = dst_rep_map.get((dst_st, dst_rk), decode_rep)
         producer = (
             str(src_rec.get("output")) if src_rec and src_rec.get("output")
-            else f"prefill:{request}:s{source_stage}:l{layer}:{src_comp}"
+            else f"prefill:{request}:s{src_st}:l{layer}:{src_comp}"
         )
         output = (
             str(dst_rec.get("output")) if dst_rec and dst_rec.get("output")
-            else f"decode:{request}:s{destination_stage}:l{layer}:{dst_comp}"
+            else f"decode:{request}:s{dst_st}:l{layer}:{dst_comp}"
+        )
+        src_ver_rep = (
+            src_rep if (src_rep, request) in getattr(prefill_mem, "request_versions", ())
+            else prefill_rep
+        )
+        dst_ver_rep = (
+            dst_rep if (dst_rep, request) in getattr(decode_mem, "request_versions", ())
+            else decode_rep
         )
         src_version = (
             int(src_rec["version"]) if src_rec and src_rec.get("version") is not None
-            else _component_versions(prefill_mem, prefill_rep, request, layer, src_comp)
+            else _component_versions(prefill_mem, src_ver_rep, request, layer, src_comp)
         )
         dst_version = (
             int(dst_rec["version"]) if dst_rec and dst_rec.get("version") is not None
-            else _component_versions(decode_mem, decode_rep, request, layer, dst_comp)
+            else _component_versions(decode_mem, dst_ver_rep, request, layer, dst_comp)
         )
-        src_stor = str(src_rec["storage"]) if src_rec and src_rec.get("storage") else source_storage
-        dst_stor = str(dst_rec["storage"]) if dst_rec and dst_rec.get("storage") else destination_storage
+        default_src_stor = f"pd:kv:{request}:prefill:r{prefill_rep}:rank{src_rk}"
+        default_dst_stor = f"pd:kv:{request}:decode:r{decode_rep}:rank{dst_rk}"
+        default_host_stor = f"pd:host:{request}:decode:r{decode_rep}"
+        eff_src_stor = (
+            f"pd:kv:{request}:prefill:r{src_rep}:rank{src_rk}"
+            if src_rep != prefill_rep and source_storage == default_src_stor
+            else source_storage
+        )
+        if dst_rep != decode_rep and destination_storage == default_dst_stor:
+            eff_dst_stor = f"pd:kv:{request}:decode:r{dst_rep}:rank{dst_rk}"
+        elif dst_rep != decode_rep and destination_storage == default_host_stor:
+            eff_dst_stor = f"pd:host:{request}:decode:r{dst_rep}"
+        else:
+            eff_dst_stor = destination_storage
+        src_stor = str(src_rec["storage"]) if src_rec and src_rec.get("storage") else eff_src_stor
+        dst_stor = str(dst_rec["storage"]) if dst_rec and dst_rec.get("storage") else eff_dst_stor
         src_offset = address(
-            plane_bases, source_extents, (int(source_rank), src_stor, src_version),
+            plane_bases, source_extents, (src_rk, src_stor, src_version),
             (int(layer), src_comp), src_size_i, src_disp_i, payload_i,
         )
         dst_offset = address(
-            destination_planes, destination_offsets, (int(destination_rank), dst_stor, dst_version),
+            destination_planes, destination_offsets, (dst_rk, dst_stor, dst_version),
             (int(layer), dst_comp), dst_size_i, dst_disp_i, payload_i,
         )
         transfers.append(PDTransfer(
-            int(source_rank), int(destination_rank), payload_i,
-            source_stage=int(source_stage), destination_stage=int(destination_stage),
+            src_rk, dst_rk, payload_i,
+            source_stage=src_st, destination_stage=dst_st,
             source_layers=(int(layer),), destination_layers=(int(layer),),
             component=component,
             source_version=src_version, destination_version=dst_version,
@@ -1625,20 +1702,28 @@ def _make_pd_transfer_emitter(
             source_byte_range=(src_offset, src_offset + payload_i),
             destination_byte_range=(dst_offset, dst_offset + payload_i),
             source_scope=(
-                str(src_rec.get("scope")) if src_rec
-                else f"prefill:r{prefill_rep}:s{source_stage}:rank{source_rank}"
+                _qualify_published_scope(
+                    src_rec["scope"], multi_replica=src_multi_rep,
+                    rep=src_rep, stage=src_st, rank=src_rk,
+                )
+                if src_rec and src_rec.get("scope")
+                else f"prefill:r{src_rep}:s{src_st}:rank{src_rk}"
             ),
             destination_scope=(
-                str(dst_rec.get("scope")) if dst_rec
-                else f"decode:r{decode_rep}:s{destination_stage}:rank{destination_rank}"
+                _qualify_published_scope(
+                    dst_rec["scope"], multi_replica=dst_multi_rep,
+                    rep=dst_rep, stage=dst_st, rank=dst_rk,
+                )
+                if dst_rec and dst_rec.get("scope")
+                else f"decode:r{dst_rep}:s{dst_st}:rank{dst_rk}"
             ),
         ))
         if tier == "host":
-            host_bytes[int(destination_rank)] += payload_i
+            host_bytes[dst_rk] += payload_i
         else:
-            destination_bytes[int(destination_rank)] += payload_i
-        source_ranks.add(int(source_rank))
-        destination_ranks.add(int(destination_rank))
+            destination_bytes[dst_rk] += payload_i
+        source_ranks.add(src_rk)
+        destination_ranks.add(dst_rk)
 
     return emit
 
@@ -1670,10 +1755,22 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
     destination_planes: dict[Any, int] = {}
     destination_offsets: dict[tuple[int, str, int], int] = defaultdict(int)
 
+    src_rank_replica: dict[tuple[int, int], int] = {}
+    for st in range(max(1, int(prefill_p.pp))):
+        for rk, owner_rep in _cohort_rank_replicas(prefill_exec, prefill_p, prefill_rep, st).items():
+            src_rank_replica[(st, rk)] = owner_rep
+    dst_rank_replica: dict[tuple[int, int], int] = {}
+    dst_rep_by_rank: dict[int, int] = {}
+    for st in range(max(1, int(decode_p.pp))):
+        for rk, owner_rep in _cohort_rank_replicas(decode_exec, decode_p, decode_rep, st).items():
+            dst_rank_replica[(st, rk)] = owner_rep
+            dst_rep_by_rank[rk] = owner_rep
+
     emit = _make_pd_transfer_emitter(
         request=request, published=published,
         prefill_mem=prefill_mem, decode_mem=decode_mem,
         prefill_rep=prefill_rep, decode_rep=decode_rep,
+        src_rank_replica=src_rank_replica, dst_rank_replica=dst_rank_replica,
         plane_bases=plane_bases, source_extents=source_extents,
         destination_planes=destination_planes, destination_offsets=destination_offsets,
         transfers=transfers, destination_bytes=destination_bytes,
@@ -1738,7 +1835,10 @@ def _pd_handoff_binding(request, tokens, placement, cases, memory, execution,
     buffers = (
         {rank: f"{shared_buffer_prefix}:rank{rank}" for rank in destination_ranks}
         if shared_buffer_prefix is not None
-        else {rank: f"pd:kv:{request}:decode:r{decode_rep}:rank{rank}" for rank in destination_ranks}
+        else {
+            rank: f"pd:kv:{request}:decode:r{dst_rep_by_rank.get(rank, decode_rep)}:rank{rank}"
+            for rank in destination_ranks
+        }
     )
     pool_caps = (
         {rank: exact_int_bytes(shared_buffer_capacity, "pd_shared_buffer_capacity")

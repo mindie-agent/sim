@@ -27,7 +27,13 @@ from ...mechanism import OperatorPlan, Work
 from ...ownership import unit_group
 from ...program import KernelProgram, ParallelProgram, PipelineProgram, RecipeContext, Stage
 from ...runtime.engine import Engine, Resource
-from ...runtime.l2_residency import AdmissionMemoryView
+from ...runtime.l2_residency import (
+    AdmissionMemoryView,
+    RawDieL2Bytes,
+    _engine_primary_pool_namespace,
+    _row_pool_namespace,
+    resolve_engine_admission_view,
+)
 from ...runtime.memory_physics import AddressRun, AddressRunPlan, HbmBusSpec, MemoryAccessPattern, ReuseKey
 from ..attention.common import (
     BF16_BYTES,
@@ -183,19 +189,49 @@ def _partition_query_groups(
 def _resolve_engine_memory_view(
     engine, die: int, capacity: int, hbm: str, ctx: OperatorPlanningContext,
 ) -> AdmissionMemoryView:
-    view = getattr(engine, "admission_memory_view", None)
-    if view is not None:
-        return view
+    req_ns = _row_pool_namespace(hbm)
+    ctx_view = ctx.admission_memory_view
+    ctx_exact = (
+        bool(req_ns)
+        and isinstance(ctx_view, AdmissionMemoryView)
+        and ctx_view.pool_namespace == req_ns
+        and ctx_view.has_die(die)
+    )
+    attached = getattr(engine, "admission_memory_view", None)
+    if attached is not None:
+        owner_ns = getattr(attached, "pool_namespace", "") or _engine_primary_pool_namespace(engine)
+        attached_compatible = (
+            not req_ns
+            or owner_ns == req_ns
+            or (owner_ns is None and not ctx_exact)
+        )
+        if attached_compatible and attached.has_die(die):
+            return attached
+        if ctx_exact:
+            return ctx_view
+        if isinstance(ctx_view, AdmissionMemoryView) and ctx_view.has_die(die):
+            ctx_ns = ctx_view.pool_namespace
+            if not req_ns or not ctx_ns or ctx_ns == req_ns:
+                return ctx_view
     views = getattr(engine, "_fia_admission", None)
     if views is None:
         views = engine._fia_admission = {}
     key = (hbm, die)
     view = views.get(key)
     if view is None:
-        if ctx.admission_memory_view is not None:
-            view = copy.deepcopy(ctx.admission_memory_view)
-        else:
-            view = AdmissionMemoryView({die: capacity}, arch_id=str(ctx.compute_arch.arch_id))
+        if attached is None and isinstance(ctx_view, AdmissionMemoryView) and ctx_view.has_die(die):
+            ctx_ns = ctx_view.pool_namespace
+            if not req_ns or not ctx_ns or ctx_ns == req_ns:
+                view = copy.deepcopy(ctx_view)
+        if view is None:
+            view = resolve_engine_admission_view(
+                engine,
+                die=die,
+                raw_l2=RawDieL2Bytes(capacity),
+                pool_namespace=req_ns,
+            )
+            if view.arch_id is None:
+                view.arch_id = str(ctx.compute_arch.arch_id)
         views[key] = view
     return view
 

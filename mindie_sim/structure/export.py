@@ -409,6 +409,8 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     allowed_phases = {phase}
     if phase == "mixed":
         allowed_phases.update({"prefill", "decode"})
+    if phase in {"prefill", "decode", "mixed"}:
+        allowed_phases.add("idle")
     if "decode" in allowed_phases:
         allowed_phases.add("draft")
     if "prefill" in allowed_phases and execution.get("draft_prepare", False):

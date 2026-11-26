@@ -1357,3 +1357,79 @@ def test_disaggregated_handoff_dcp_demand_host_only_receiver_and_explicit_owners
     h_sh = compute_pd_handoff_plan(p_sh, p_sh, tokens=1)
     assert sum(h_ns["destination_hbm_rank_bytes"].values()) > sum(h_sh["destination_hbm_rank_bytes"].values())
 
+
+def test_pd_shared_l2_namespace_dcp_replica_scope_and_recoverssm_stride():
+    """Lock SFA PD L2 namespace isolation, DCP-DP per-rank replica tagging, and RecoverSSM buffer stride."""
+    from dataclasses import replace as _replace
+    from types import SimpleNamespace
+    from mindie_sim.catalog.speculative_state import MODE_REPLAY, speculative_state_plan
+    from mindie_sim.prediction.disaggregated.handoff import compute_pd_handoff_plan
+    from mindie_sim.prediction.operators.sharedkv.sfa_native import _resolve_engine_memory_view
+    from mindie_sim.prediction.pd_connector.connector import _transfer_scope
+    from mindie_sim.prediction.runtime.engine import Engine
+    from mindie_sim.prediction.runtime.engine_types import Resource
+    from mindie_sim.prediction.runtime.l2_residency import AdmissionMemoryView
+    from mindie_sim.schema.parallel import ParallelSpec
+
+    # 1. Shared-engine PD: decode: die 2 selects its own namespace view instead of prefill: die 0 view.
+    eng = Engine([Resource("prefill:hbm@r0:s0", 1.0), Resource("decode:hbm@r0:s0", 1.0)])
+    prefill_view = AdmissionMemoryView({0: 64 * 1024 * 1024}, arch_id="npu_arch_3510", pool_namespace="prefill:")
+    decode_view = AdmissionMemoryView({2: 64 * 1024 * 1024}, arch_id="npu_arch_3510", pool_namespace="decode:")
+    eng.attach_admission_memory_view(prefill_view)
+    ctx_dec = SimpleNamespace(admission_memory_view=decode_view, compute_arch=SimpleNamespace(arch_id="npu_arch_3510"))
+    assert _resolve_engine_memory_view(eng, 2, 64 * 1024 * 1024, "decode:hbm@r0:s0", ctx_dec) is decode_view
+    ctx_none = SimpleNamespace(admission_memory_view=None, compute_arch=SimpleNamespace(arch_id="npu_arch_3510"))
+    isolated_dec = _resolve_engine_memory_view(eng, 2, 64 * 1024 * 1024, "decode:hbm@r0:s0", ctx_none)
+    assert isolated_dec is not prefill_view and isolated_dec.pool_namespace == "decode:" and isolated_dec.has_die(2)
+    # Preview / namespaced scratch engine keeps its attached scratch view without mutating live ctx_view.
+    scratch_eng = Engine([Resource("hbm", 1.0)])
+    scratch_view = AdmissionMemoryView({2: 64 * 1024 * 1024}, arch_id="npu_arch_3510", pool_namespace="decode:")
+    scratch_eng.attach_admission_memory_view(scratch_view)
+    assert _resolve_engine_memory_view(scratch_eng, 2, 64 * 1024 * 1024, "hbm", ctx_dec) is scratch_view
+    ns_scratch_eng = Engine([Resource("decode:hbm@r0:s0", 1.0)])
+    ns_scratch_eng.attach_admission_memory_view(scratch_view)
+    assert _resolve_engine_memory_view(ns_scratch_eng, 2, 64 * 1024 * 1024, "decode:hbm@r0:s0", ctx_dec) is scratch_view
+
+    # 2. DCP-DP handoff tags each physical rank with its owning DP replica (even with published component scope).
+    from mindie_sim.prediction.disaggregated.handoff import _qualify_published_scope
+    from mindie_sim.prediction.pd_connector import PDTransfer
+    from mindie_sim.prediction.pd_connector.connector import _matching_transfer_indices
+
+    p_dcp = parse_case(compose_case("deepseek-v3.2", "a5", tp=1, dp=4, dcp=4, ep=1, layers=1, prompt_tokens=128, output_tokens=8))
+    d_dcp = parse_case(compose_case("deepseek-v3.2", "a5", tp=1, dp=4, dcp=4, ep=1, layers=1, prompt_tokens=128, output_tokens=8))
+    plan_dcp = compute_pd_handoff_plan(p_dcp, d_dcp, tokens=128)
+    assert plan_dcp["transfers"]
+    src_reps = {_transfer_scope(t, "source")[0] for t in plan_dcp["transfers"]}
+    dst_reps = {_transfer_scope(t, "destination")[0] for t in plan_dcp["transfers"]}
+    assert src_reps == {0, 1, 2, 3} and dst_reps == {0, 1, 2, 3}
+    for t in plan_dcp["transfers"]:
+        assert f"prefill:r{t.source_rank}:s0:rank{t.source_rank}" == t.source_scope
+        dst_owner = t.destination_rank - plan_dcp["destination_rank_offset"]
+        assert f"decode:r{dst_owner}:s0:rank{t.destination_rank}" == t.destination_scope
+        assert f":prefill:r{t.source_rank}:rank{t.source_rank}" in t.source_storage
+        assert f":decode:r{dst_owner}:rank{t.destination_rank}" in t.destination_storage
+    pub_flows = [
+        PDTransfer(
+            r, r + 2, 64, component="mla_kv", producer="kv", source_storage="kv_pool",
+            source_scope=_qualify_published_scope("hbm", multi_replica=True, rep=r, stage=0, rank=r),
+        )
+        for r in (0, 1)
+    ]
+    assert _matching_transfer_indices(pub_flows, "source", (1, 0, "hbm")) == [1]
+
+    # 3. RecoverSSM admission allocates physical shared buffer stride max(num_spec + 1, q) + kernel override.
+    c_kda = parse_case(compose_case("glm-5.3-flash", "a5", layers=1, tp=1, ep=1, mtp_proposal_tokens=3, recover_ssm=True))
+    kda_layer = next(lp for lp in c_kda.model.layer_plans if lp.attention == "kda")
+    sp_q2 = speculative_state_plan(c_kda.model, kda_layer, ParallelSpec(tp=1), query_tokens=2, recover_ssm=True, capacity_padded=False, runtime=c_kda.runtime)
+    sp_q4 = speculative_state_plan(c_kda.model, kda_layer, ParallelSpec(tp=1), query_tokens=4, recover_ssm=True, capacity_padded=False, runtime=c_kda.runtime)
+    sp_q6 = speculative_state_plan(c_kda.model, kda_layer, ParallelSpec(tp=1), query_tokens=6, recover_ssm=True, capacity_padded=False, runtime=c_kda.runtime)
+    assert sp_q2.mode == MODE_REPLAY and sp_q2.query_tokens == 2
+    assert sp_q2.replay_bytes == pytest.approx(sp_q4.replay_bytes)
+    assert sp_q6.replay_bytes == pytest.approx(sp_q4.replay_bytes * 1.5)
+    rt_stride8 = _replace(c_kda.runtime, kernels={**dict(c_kda.runtime.kernels), "lowerings": {"recurrent_scan": {"options": {"record_stride": 8}}}})
+    sp_s8 = speculative_state_plan(c_kda.model, kda_layer, ParallelSpec(tp=1), query_tokens=2, recover_ssm=True, capacity_padded=False, runtime=rt_stride8)
+    assert sp_s8.replay_bytes == pytest.approx(sp_q4.replay_bytes * 2.0)
+    rt_none = _replace(c_kda.runtime, metadata=tuple({**dict(c_kda.runtime.metadata), "spec_method": "none"}.items()))
+    sp_none = speculative_state_plan(c_kda.model, kda_layer, ParallelSpec(tp=1), query_tokens=2, recover_ssm=True, capacity_padded=False, runtime=rt_none)
+    assert sp_none.replay_bytes == pytest.approx(sp_q4.replay_bytes * 0.5)
+

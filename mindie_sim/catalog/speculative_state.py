@@ -9,8 +9,9 @@
 [Invariants]
   * ``q=1`` is identical under both RecoverSSM settings.
   * ``q>1`` without replay keeps ``q*S`` checkpoint slots; with replay it keeps
-    ``S`` plus ``q*R`` compact records.  The base state is one of the ``q``
-    slots, never an additional copy.
+    ``S`` plus ``max(num_spec + 1, q)*R`` compact records (physical shared
+    buffer stride; active write traffic stays ``q``).  The base state is one
+    of the ``q`` slots, never an additional copy.
   * Convolution history stays per sequence; the default rollback buffer is
     ``(kernel_history + q - 1) * local_conv_width * conv_element_bytes`` and
     ``q=1`` reproduces the historical size exactly.
@@ -144,10 +145,80 @@ def _conv_slice_width(layer: Any, total_shards: int, local_conv: int, kernel: in
     return _ceil_div(local_conv, history_slots)
 
 
+def _configured_spec_proposals(runtime: Any, model: Any = None) -> int:
+    """Resolve declared speculative draft width matching KDA/scheduler precedence."""
+    if runtime is None:
+        return 0
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    spec_method = str(meta.get("spec_method") or "").strip().lower()
+    mode = str(meta.get("draft_mode") or "").strip().lower()
+    if spec_method == "none" or mode == "none":
+        return 0
+    non_neural = spec_method in NON_NEURAL_SPEC_METHODS or mode in NON_NEURAL_SPEC_METHODS
+    dspark = getattr(runtime, "dspark", None)
+    allow_dspark = (
+        dspark is not None
+        and not non_neural
+        and (not spec_method or spec_method in {"dspark", "dflash"})
+        and (not mode or mode in {"dspark", "dflash"})
+    )
+    raw_spec = meta.get("speculative")
+    if allow_dspark:
+        return max(0, int(dspark.step_spec().draft_len))
+    if raw_spec:
+        import json
+        from mindie_sim.schema.speculative import SpeculativeSpec
+        spec_data = json.loads(raw_spec) if isinstance(raw_spec, str) else raw_spec
+        return max(0, int(SpeculativeSpec.from_mapping(spec_data).draft_len))
+    pol_method, pol_k = _declared_speculative_policy(runtime)
+    if pol_method == "none":
+        return 0
+    mtp = getattr(getattr(model, "auxiliary", None), "mtp", None)
+    default_prop = 0 if non_neural else int(getattr(mtp, "proposal_tokens", 0) or 0)
+    raw_prop = meta.get("draft_proposal_tokens")
+    if raw_prop is None or raw_prop == "":
+        raw_prop = meta.get("num_speculative_tokens")
+    if raw_prop is not None and raw_prop != "":
+        return max(0, int(raw_prop))
+    return max(0, pol_k if pol_k > 0 else default_prop)
+
+
+def _declared_kernel_record_stride(runtime: Any) -> int | None:
+    """Read an explicit RecoverSSM ``record_stride`` override from runtime metadata or kernel options."""
+    if runtime is None:
+        return None
+    candidates: list[Any] = []
+    meta = dict(getattr(runtime, "metadata", ()) or ())
+    if "record_stride" in meta and meta["record_stride"] is not None:
+        candidates.append(meta["record_stride"])
+    kernels = getattr(runtime, "kernels", None)
+    if isinstance(kernels, Mapping):
+        for section in ("lowerings", "families", "recipes"):
+            table = kernels.get(section)
+            if not isinstance(table, Mapping):
+                continue
+            for key in ("recurrent_scan", "kda_recurrent", "kda_decode", "linear_attention"):
+                entry = table.get(key)
+                if not isinstance(entry, Mapping):
+                    continue
+                opts = entry.get("options") if isinstance(entry.get("options"), Mapping) else entry
+                val = opts.get("record_stride") if isinstance(opts, Mapping) else None
+                if val is not None:
+                    candidates.append(val)
+    if not candidates:
+        return None
+    resolved: list[int] = []
+    for raw in candidates:
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+            raise ModelingError(f"speculative_state_record_stride_invalid:{raw}")
+        resolved.append(raw)
+    return max(resolved)
+
+
 def speculative_state_plan(
     model: Any, layer: Any, parallel: Any, *, query_tokens: int,
     recover_ssm: bool, capacity_padded: bool, state_contract: Mapping[str, Any] | None = None,
-    runtime: Any = None,
+    runtime: Any = None, record_stride: int | None = None,
 ) -> SpeculativeStatePlan:
     """Resolve one layer's active verify-window state/record residency."""
     del capacity_padded
@@ -214,8 +285,19 @@ def speculative_state_plan(
         record = float(override)
     if record < 0:
         raise ModelingError("speculative_state_record_bytes_invalid")
+    explicit_stride = record_stride if record_stride is not None else contract.get("record_stride")
+    if explicit_stride is not None:
+        if (isinstance(explicit_stride, bool)
+                or not isinstance(explicit_stride, int)
+                or explicit_stride < 1):
+            raise ModelingError(f"speculative_state_record_stride_invalid:{explicit_stride}")
+        stride_slots = max(q, explicit_stride)
+    else:
+        kernel_stride = _declared_kernel_record_stride(runtime)
+        base_stride = max(_configured_spec_proposals(runtime, model) + 1, q)
+        stride_slots = max(base_stride, kernel_stride) if kernel_stride is not None else base_stride
     return SpeculativeStatePlan(
-        q, 1, state_bytes, conv_bytes, record * float(q),
+        q, 1, state_bytes, conv_bytes, record * float(stride_slots),
         transient, MODE_REPLAY)
 
 
