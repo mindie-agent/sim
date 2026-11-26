@@ -1042,3 +1042,118 @@ def test_recover_ssm_bounds_barriers_tiling_and_null_boundary() -> None:
         runtime=rt_glm, state_elements=8 * 128 * 128, state_bytes=8 * 128 * 128 * 4, align_mode=True,
     )
     assert ord_n == [] and bnd_n == [("r0", 3)] and b_cnt_n == 1
+
+
+def test_recurrent_padding_slot_skips_state_writes_and_pcp_sync_batches_by_rank_coord():
+    """KDA null/padding decode slots zero output without state writes, and GDN PCP sync batches by RankCoord.pcp_lane."""
+    from dataclasses import replace
+    from math import prod
+    from mindie_sim import compose_case, parse_case, target_graphs
+    from mindie_sim.prediction.frontend import Frontend
+    from mindie_sim.schema.workload import IterationPlan, RequestView
+
+    # 1. KDA decode null/padding slot emits zero fill and writes zero recovery records.
+    c_kda = parse_case(compose_case(
+        "glm-5.3-flash", "Ascend950DT_9581", layers=1, tp=1, ep=1,
+        mtp_proposal_tokens=1, recover_ssm=True,
+    ))
+    active = RequestView(
+        "a", 2, 128, True, "decode", draft_proposal_tokens=1,
+        draft_accepted_tokens=1, draft_advanced_tokens=2, state_slot=1,
+    )
+    pad = RequestView("pad", 2, 0, False, "decode", padding=True, state_slot=0)
+    ops_kda = Frontend()(IterationPlan((active, pad)), c_kda.model, c_kda.runtime, c_kda.machine).ops
+    kda_core = next(o for o in ops_kda if "kda_recurrent_params" in dict(o.metadata))
+    pad_writes = [
+        w for w in dict(kda_core.metadata)["kda_state_contract"]["write_bindings"]
+        if w["target"].endswith("[pad]")
+    ]
+    assert len(pad_writes) == 0 and sum(2 * prod(w["layout"]["shape"]) for w in pad_writes) == 0
+    assert any(o.family == "tensor_fill" and dict(o.metadata).get("padding_slot") for o in ops_kda)
+
+    # 2. Analytical GDN PCP skips rerun on pcp_lane==0 even when physical stage ranks are permuted (1, 0).
+    for sku in ("Ascend910B4", "Ascend910_9391"):
+        raw_pcp2 = compose_case("qwen3.8-flash-next", sku, layers=1, tp=1, ep=1, pcp=2)
+        reruns = tuple(
+            int(sum(
+                o.flops for o in target_graphs(
+                    raw_pcp2, phase="prefill", tokens=128, scope="body",
+                    physical_rank=rk, apply_body_defaults=True,
+                )[0]
+                if "pcp_gdn_fwd_h_rerun" in o.op_id
+            ))
+            for rk in (0, 1)
+        )
+        assert reruns == (0, 201326592)
+    c_perm = parse_case(compose_case("qwen3.8-flash-next", "Ascend910B4", layers=1, tp=1, ep=1, pcp=2))
+    hw_perm = replace(c_perm.machine, dies=(c_perm.machine.dies[1], c_perm.machine.dies[0]))
+    v_pf = (RequestView("r0", 128, 0, False, "prefill"),)
+    perm_reruns = tuple(
+        int(sum(
+            o.flops for o in Frontend()(
+                IterationPlan(v_pf), c_perm.model, c_perm.runtime, hw_perm, physical_rank=rk,
+            ).ops
+            if "pcp_gdn_fwd_h_rerun" in o.op_id
+        ))
+        for rk in (1, 0)
+    )
+    assert perm_reruns == (0, 201326592)
+
+    # 3. Idle PCP rank (0 local tokens) runs zero hupdate/rerun FLOPs while keeping both collective gathers.
+    for sku in ("Ascend910B4", "Ascend910_9391"):
+        raw_pcp4 = compose_case("qwen3.8-flash-next", sku, layers=1, tp=1, ep=1, pcp=4)
+        ops_idle = target_graphs(
+            raw_pcp4, phase="prefill", tokens=1, scope="body",
+            physical_rank=3, apply_body_defaults=True,
+        )[0]
+        assert next(o.local_shape[0] for o in ops_idle if o.family == "recurrent_output") == 0
+        upd = next(o for o in ops_idle if o.op_id.endswith(".pcp_gdn_hupdate"))
+        rrn = next(o for o in ops_idle if o.op_id.endswith(".pcp_gdn_fwd_h_rerun"))
+        assert int(upd.flops) == 0 and upd.family == "tensor_fill"
+        assert int(rrn.flops) == 0 and rrn.family == "tensor_copy"
+        assert sum(1 for o in ops_idle if "pcp_gdn_" in o.op_id and "gather" in o.op_id) == 2
+
+    # 4. Multi-request GDN PCP emits exactly 2 batched AllGathers per layer across all three hardware generations.
+    for sku in ("Ascend910B4", "Ascend910_9391", "Ascend950DT_9581"):
+        c_batch = parse_case(compose_case("qwen3.8-flash-next", sku, layers=1, tp=1, ep=1, pcp=2))
+        v8 = tuple(RequestView(str(idx), 128, 0, False, "prefill") for idx in range(8))
+        ops_8 = Frontend()(IterationPlan(v8), c_batch.model, c_batch.runtime, c_batch.machine, physical_rank=1).ops
+        gathers = [o for o in ops_8 if "pcp_gdn_" in o.op_id and "gather" in o.op_id]
+        hupds = [o for o in ops_8 if o.op_id.endswith(".pcp_gdn_hupdate")]
+        assert len(gathers) == 2 and int(sum(o.link_bytes for o in gathers)) == 50331648
+        assert len(hupds) == 1 and dict(hupds[0].metadata)["sequence_tokens"] == (64,) * 8
+
+    # 5. Mixed KDA projection keeps linear_bfg under RecoverSSM, exact state_selection projects onto active views,
+    #    and null KDA slots skip convolution history updates.
+    from mindie_sim.prediction.operators.kda.kda_source import serving_source
+
+    c_mix = parse_case(compose_case(
+        "kimi-k3.1", "Ascend950DT_9581", layers=1, tp=1, ep=1,
+        quant="mxfp8_mxfp4", mtp_proposal_tokens=1, recover_ssm=True,
+    ))
+    k_mix = dict(c_mix.runtime.kernels)
+    k_mix["lowerings"] = {**dict(k_mix.get("lowerings", {})), "kda_input_projection": {"implementation": "vllm_ascend_kda_mixed_projection"}}
+    ops_mix = Frontend()(IterationPlan((active, RequestView("pad", 1, 0, False, "decode", padding=True, state_slot=0))), c_mix.model, replace(c_mix.runtime, kernels=k_mix), c_mix.machine).ops
+    mix_ids = {o.op_id for o in ops_mix}
+    assert any(o.op_id.endswith(".linear_bfg") for o in ops_mix)
+    assert all(d in mix_ids for o in ops_mix for d in o.deps if d.startswith("s0.l0."))
+
+    c_sel = parse_case(compose_case("glm-5.3-flash", "Ascend950DT_9581", layers=1, tp=1, ep=1))
+    v_sel = (RequestView("pad", 1, 0, False, "decode", padding=True, state_slot=0), RequestView("live", 1, 16, True, "decode", state_slot=1))
+    rt_no_kda = replace(c_sel.runtime, kernels={**dict(c_sel.runtime.kernels), "lowerings": {k: v for k, v in dict(c_sel.runtime.kernels.get("lowerings", {})).items() if k != "kda"}})
+    sel_src = serving_source(rt_no_kda, c_sel.model, v_sel, c_sel.model.layer_plans[0])
+    k_sel = dict(c_sel.runtime.kernels)
+    k_sel["lowerings"] = {**dict(k_sel.get("lowerings", {})), "kda": {
+        "implementation": sel_src.name,
+        "options": {**dict(sel_src.options), "state_selection": {
+            "kind": "exact", "index_layout": "packed", "index_row_stride": 0,
+            "prefix": (0, 1, 2), "state_indices": (0, 1), "accepted_tokens": (1, 1), "state_capacity": 2,
+        }},
+    }}
+    ops_sel = Frontend()(IterationPlan(v_sel), c_sel.model, replace(c_sel.runtime, kernels=k_sel), c_sel.machine).ops
+    assert dict(next(o for o in ops_sel if "kda_recurrent_params" in dict(o.metadata)).metadata)["kda_recurrent_params"]["lengths"] == (1,)
+
+    c_null = parse_case(compose_case("glm-5.3-flash", "Ascend910B4", layers=1, tp=1, ep=1))
+    ops_null = Frontend()(IterationPlan((RequestView("r", 1, 0, False, "decode", padding=False, state_slot=0),)), c_null.model, c_null.runtime, c_null.machine).ops
+    conv_null = next(o for o in ops_null if o.op_id.endswith(".short_convolution"))
+    assert conv_null.mte2_bytes == 0 and conv_null.mte3_bytes == 0

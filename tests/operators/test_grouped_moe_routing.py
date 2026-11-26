@@ -567,3 +567,70 @@ def test_retained_router_contracts_preserve_distinct_repeated_layer_candidates(c
     matched = sum(any(item[:3] == group["contract"][:3] for group in groups) for item in contracts)
     assert (mapped["status_counts"].get("ambiguous", 0), mapped["status_counts"].get("unmapped", 0)) == (matched, len(rows) - matched)
     assert mapped["windows"][0]["bound_busy_union_ns"] == 0
+
+
+def test_routing_ep_owner_matches_rank_coord_and_honors_request_source_owners():
+    """Balanced EP owner matches RankCoord under tp*pcp/ep and request-scoped routing honors explicit source_owners."""
+    from _support.memory_cases import case
+    from mindie_sim import Case, parse_case
+    from mindie_sim.prediction.sharding.routing import _balanced_ep_owner, select_realization
+    from mindie_sim.schema.parallel import ReplicaLocalRank
+    from mindie_sim.schema.workload import RequestView
+
+    raw_ep = case(tp=2, ep=3)
+    raw_ep["runtime"].update(dp=1, tp=2, pp=1, ep=3, pcp=3)
+    raw_ep["machine"] = dict(backend="ascend", sku="Ascend910B4", num_devices=6)
+    raw_ep["model"].update(ffn="moe", num_experts=6, top_k=2, moe_intermediate_size=128)
+    parsed_ep = parse_case(raw_ep)
+    placement = parsed_ep.machine.validate_placement(parsed_ep.runtime.parallel)
+    assert [_balanced_ep_owner(parsed_ep.runtime.parallel, rk, machine=parsed_ep.machine) for rk in range(6)] == [
+        placement.coord_for(0, 0, ReplicaLocalRank(rk)).ep_rank for rk in range(6)
+    ] == [0, 0, 1, 1, 2, 2]
+
+    raw_req = case(dp=2, ep=2, prompt=2)
+    raw_req["model"].update(ffn="moe", num_experts=2, top_k=1, moe_intermediate_size=32)
+    rows = dict(topk_ids=[[1], [0]], source_owners=[0, 0])
+    peers = []
+    for payload in (rows, {"requests": [dict(request_id="r", q_len=2, **rows)]}):
+        item = dict(scope="body", layer=0, phase="prefill", tokens=2, expert_placement=[0, 1], **payload)
+        raw_req["runtime"]["routing"] = {"realizations": [item]}
+        parsed_req = Case.from_mapping(raw_req)
+        realized = select_realization(
+            parsed_req.runtime, parsed_req.model.layer_plans[0],
+            phase="prefill", tokens=2, valid_tokens=2,
+            views=(RequestView("r", 2, 0, True, "prefill"),),
+        )
+        peers.append(realized.peer_assignments)
+    assert peers[0] == peers[1] == ((1, 1), (0, 0))
+
+    # Missing request owner inherits item default without overwriting sibling explicit owners.
+    mixed_item = dict(
+        scope="body", layer=0, phase="prefill", tokens=2, expert_placement=[0, 1],
+        source_owners=0,
+        requests=[
+            dict(request_id="a", q_len=1, topk_ids=[[1]], source_owners=[1]),
+            dict(request_id="b", q_len=1, topk_ids=[[0]]),
+        ],
+    )
+    raw_req["runtime"]["routing"] = {"realizations": [mixed_item]}
+    parsed_mix = Case.from_mapping(raw_req)
+    mix_res = select_realization(
+        parsed_mix.runtime, parsed_mix.model.layer_plans[0],
+        phase="prefill", tokens=2, valid_tokens=2,
+        views=(RequestView("a", 1, 0, True, "prefill"), RequestView("b", 1, 0, True, "prefill")),
+    )
+    assert mix_res.peer_assignments == ((1, 0), (0, 1))
+
+    # Explicit realization projects offset (8, 9) and permuted (1, 0) physical rank IDs to RankCoord.ep_rank.
+    one_item = dict(scope="body", layer=0, phase="prefill", tokens=1, expert_placement=[0, 1], topk_ids=[[1]], source_owners=[1])
+    for devices, phys in (([{"rank": 8}, {"rank": 9}], 9), ([{"rank": 1}, {"rank": 0}], 0)):
+        raw_p = case(tp=2, ep=2, prompt=1)
+        raw_p["machine"] = dict(backend="ascend", sku="Ascend910B4", num_devices=2, devices=devices)
+        raw_p["model"].update(ffn="moe", num_experts=2, top_k=1, moe_intermediate_size=32)
+        raw_p["runtime"]["routing"] = {"realizations": [one_item]}
+        c_p = parse_case(raw_p)
+        r_p = select_realization(
+            c_p.runtime, c_p.model.layer_plans[0], phase="prefill", tokens=1, valid_tokens=1,
+            views=(RequestView("r0", 1, 0, True, "prefill"),), physical_rank=phys, machine=c_p.machine,
+        )
+        assert r_p.representative_rank == 1

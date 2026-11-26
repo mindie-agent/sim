@@ -486,12 +486,11 @@ def materialize_machine_for_devices(
         if num_devices > original_count:
             raise ModelingError(
                 f"resize_heterogeneous_expansion_undeclared:{original_count}->{num_devices}")
+        from mindie_sim.schema.parallel import GlobalRank
+
         selected_dies = tuple(parsed.machine.dies[:num_devices])
-        selected_ranks = {int(die.rank) for die in selected_dies}
-        induced_links = tuple(
-            link for link in parsed.machine.links
-            if link.members and all(int(m) in selected_ranks for m in link.members)
-        )
+        selected_ranks = frozenset(GlobalRank(int(die.rank)) for die in selected_dies)
+        induced_links = parsed.machine.induced_links_for(selected_ranks)
         return replace(
             parsed.machine, dies=selected_dies, links=induced_links,
             ranks_per_node=min(num_devices, ranks_per_node))

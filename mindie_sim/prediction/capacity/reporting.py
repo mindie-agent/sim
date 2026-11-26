@@ -20,6 +20,46 @@ class _MemoryReportingMixin:
         first = (replica * p.pp + stage) * width
         return self.case.machine.dies[first:first + width]
 
+    def _rank_coord(self, replica: int, stage: int, local_rank: int):
+        from mindie_sim.schema.common import ModelingError
+        from mindie_sim.schema.parallel import ReplicaLocalRank
+
+        placement = getattr(self, "_cached_placement", None)
+        if placement is None:
+            try:
+                placement = self.case.machine.validate_placement(self.case.runtime.parallel)
+            except ModelingError:
+                placement = False
+            self._cached_placement = placement
+        if placement:
+            try:
+                return placement.coord_for(
+                    int(replica), int(stage), ReplicaLocalRank(int(local_rank)),
+                )
+            except ModelingError:
+                return None
+        return None
+
+    def _physical_cache_rank(self, replica: int, stage: int, local_rank: int) -> int:
+        p = self.case.runtime.parallel
+        coord = self._rank_coord(replica, stage, local_rank)
+        eff_rep = coord.replica if coord is not None else int(replica)
+        eff_local = int(coord.local_rank) if coord is not None else int(local_rank)
+        if self.rank_token_owners is not None:
+            return eff_local
+        dp_width = max(1, int(getattr(p, "dcp_dp_width", 1) or 1))
+        spans_dp = bool(getattr(p, "cp_spans_dp", False)) and dp_width > 1
+        if spans_dp:
+            return ((eff_rep % dp_width) * int(p.pp)) * self.width + eff_local
+        if (
+            getattr(p, "cp_plan", "") == "dsa_cp"
+            and int(getattr(p, "cp", 1) or 1) > 1
+            and int(getattr(p, "pcp", 1) or 1) == 1
+            and coord is not None
+        ):
+            return int(coord.dcp_lane)
+        return eff_local
+
     def _rank_allocations(
         self, replica: int, stage: int, *, tokens: int | None, include_cache: bool,
         rank: int | None = None,
@@ -38,11 +78,16 @@ class _MemoryReportingMixin:
             shared = self.shared_rank[replica][stage][best_rk]
             granted = self.granted_rank[replica][stage][best_rk]
             readers = self.reader_rank[replica][stage][best_rk]
+            weight_bytes = self.weights[stage]
+            workspace_bytes = self.workspace[stage]
         else:
-            selected = self.selected_rank[replica][stage][int(rank)]
-            shared = self.shared_rank[replica][stage][int(rank)]
-            granted = self.granted_rank[replica][stage][int(rank)]
-            readers = self.reader_rank[replica][stage][int(rank)]
+            rk_idx = int(rank)
+            selected = self.selected_rank[replica][stage][rk_idx]
+            shared = self.shared_rank[replica][stage][rk_idx]
+            granted = self.granted_rank[replica][stage][rk_idx]
+            readers = self.reader_rank[replica][stage][rk_idx]
+            weight_bytes = self.rank_weights[replica][stage][rk_idx]
+            workspace_bytes = self.rank_workspace[replica][stage][rk_idx]
         prep_persist = float(
             self._prepared_persistent_by_stage[stage]
             if stage < len(getattr(self, "_prepared_persistent_by_stage", ()))
@@ -54,7 +99,7 @@ class _MemoryReportingMixin:
             else 0.0
         )
         allocations = [
-            Allocation("weights", self.weights[stage], "weights",
+            Allocation("weights", weight_bytes, "weights",
                        note="persistent resident weight bytes"),
         ]
         if prep_persist > 0.0:
@@ -68,7 +113,7 @@ class _MemoryReportingMixin:
                 note="fixed per-die GQA C8 static channel scales",
             ))
         allocations.extend([
-            Allocation("activation_workspace", self.workspace[stage], "workspace",
+            Allocation("activation_workspace", workspace_bytes, "workspace",
                        note="simultaneous implementation workspace"),
             Allocation("temporary_dequant", self.temporary_dequant[stage], "temporary",
                        note="declared transient representation"),
@@ -93,8 +138,9 @@ class _MemoryReportingMixin:
                 resident_value = resident[stage]
                 staging_value = staging[stage]
             else:
-                gross = self._rank_cache_bytes(span, padded=True, rank=int(rank))
-                layer_max = self._rank_max_layer_cache_bytes(span, int(rank))
+                phys_rk = self._physical_cache_rank(replica, stage, int(rank))
+                gross = self._rank_cache_bytes(span, padded=True, rank=phys_rk)
+                layer_max = self._rank_max_layer_cache_bytes(span, phys_rk)
                 resident_value = (
                     float(gross[stage]) if self.kvc_hbm_ratio == 1.0
                     else float(gross[stage]) * self.kvc_hbm_ratio)
@@ -171,8 +217,6 @@ class _MemoryReportingMixin:
             ]
             for replica in range(p.dp)
         ]
-        dp_width = max(1, int(getattr(p, "dcp_dp_width", 1) or 1))
-        spans_dp = bool(getattr(p, "cp_spans_dp", False)) and dp_width > 1 and self.rank_token_owners is None
         rank_divergent = self.rank_token_owners is not None or int(getattr(p, "cp", 1) or 1) > 1
         persistent: list[list[float]] = []
         headroom: list[list[float]] = []
@@ -191,9 +235,9 @@ class _MemoryReportingMixin:
                     if stage < len(getattr(self, "c8_static_channel_scale_by_stage", ()))
                     else 0.0
                 )
-                fixed_stage = (
-                    self.weights[stage] + prep_persist + c8_static + self.policy.reserved
-                    + self.workspace[stage] + self.temporary_dequant[stage]
+                fixed_common = (
+                    prep_persist + c8_static + self.policy.reserved
+                    + self.temporary_dequant[stage]
                 )
                 die_residents: list[float] = []
                 die_headrooms: list[float] = []
@@ -205,7 +249,7 @@ class _MemoryReportingMixin:
                         - float(self.staging_rank[replica][stage][rk]),
                     )
                     if rank_divergent:
-                        phys_rk = ((replica % dp_width) * p.pp) * self.width + rk if spans_dp else rk
+                        phys_rk = self._physical_cache_rank(replica, stage, rk)
                         rk_gross = self._rank_cache_bytes(tokens, padded=True, rank=phys_rk)
                         rk_lmax = self._rank_max_layer_cache_bytes(tokens, phys_rk)
                         rk_res = (
@@ -219,7 +263,12 @@ class _MemoryReportingMixin:
                     else:
                         rk_res = float(resident_kv[stage])
                         rk_stg = float(staging_kv[stage])
-                    used_rk = fixed_stage + rk_res + rk_stg + non_req
+                    fixed_rk = (
+                        self.rank_weights[replica][stage][rk]
+                        + self.rank_workspace[replica][stage][rk]
+                        + fixed_common
+                    )
+                    used_rk = fixed_rk + rk_res + rk_stg + non_req
                     cap_rk = stage_dies[rk].hbm_bytes * case.runtime.gpu_memory_utilization
                     die_residents.append(used_rk)
                     die_headrooms.append(cap_rk - used_rk)
@@ -386,7 +435,37 @@ class _MemoryReportingMixin:
                 offload_seq = tuple(int(lid) for lid in self.sparse_offload.get("offload_layers", ()))
                 layerwise = bool(options.get("layerwise_kv_offload", False))
                 num_shared = max(0, int(options.get("num_shared_layers", 0) or 0))
-                zero_layers = set(offload_seq[num_shared:] if layerwise else offload_seq)
+                if layerwise:
+                    raw_stage_groups = self.sparse_offload.get("offload_layers_by_stage")
+                    if raw_stage_groups:
+                        stage_groups = tuple(
+                            tuple(int(lid) for lid in stage_lids)
+                            for stage_lids in raw_stage_groups
+                        )
+                    else:
+                        grouped: list[list[int]] = [[] for _ in range(p.pp)]
+                        for lid in offload_seq:
+                            st = (
+                                self.layer_stage[lid]
+                                if 0 <= lid < len(self.layer_stage) else p.pp - 1
+                            )
+                            grouped[st].append(lid)
+                        stage_groups = tuple(tuple(stage_lids) for stage_lids in grouped)
+                    zero_layers = {
+                        lid
+                        for stage_lids in stage_groups
+                        for lid in sorted(
+                            stage_lids,
+                            key=lambda item: (
+                                -int(row_by_layer.get(
+                                    item, row_by_layer.get(str(item), kv_row_bytes),
+                                )),
+                                item,
+                            ),
+                        )[num_shared:]
+                    }
+                else:
+                    zero_layers = set(offload_seq)
                 stage_per_block_list = [0.0] * p.pp
                 for lid in self.sparse_offload["full_indexer_layers"]:
                     st = (

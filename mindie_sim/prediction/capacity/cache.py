@@ -327,6 +327,23 @@ class _MemoryCacheMixin:
                 return int(cfg_tp)
         return max(1, int(rt.parallel.tp))
 
+    def _draft_dcp_rank(self, rank: int, cp: int) -> int:
+        p = self.case.runtime.parallel
+        pcp_f = max(1, int(getattr(p, "dcp_pcp_factor", 1) or 1))
+        tp_g = max(1, int(getattr(p, "dcp_tp_gather", 1) or 1))
+        dp_w = max(1, int(getattr(p, "dcp_dp_width", 1) or 1))
+        tp_dim = max(1, int(p.tp))
+        pcp_dim = max(1, int(p.pcp))
+        pp_dim = max(1, int(p.pp))
+        dp_dim = max(1, int(p.dp))
+        r_int = int(rank)
+        tp_i = r_int % tp_dim
+        pcp_i = (r_int // tp_dim) % pcp_dim
+        dp_i = (r_int // (tp_dim * pcp_dim * pp_dim)) % dp_dim
+        if dp_w > 1:
+            return ((dp_i % dp_w) * (pcp_f * tp_g) + (pcp_i % pcp_f) * tp_g + (tp_i % tp_g)) % cp
+        return ((tp_i % tp_g) * pcp_f + (pcp_i % pcp_f)) % cp
+
     def _draft_owned_rows(
         self,
         eff_tokens: int,
@@ -335,26 +352,42 @@ class _MemoryCacheMixin:
         *,
         padded: bool,
         rank: int | None,
+        interleave: int | None = None,
     ) -> int:
         """Exact integer token rows owned by one rank for draft KV under CP/T05."""
         tokens_int = max(0, int(eff_tokens))
-        blk = max(1, int(block))
+        page_blk = max(1, int(block))
+        stride = max(1, int(interleave if interleave is not None else page_blk))
         cp = max(1, int(draft_cp))
         if cp <= 1:
-            return int(block_round(tokens_int, blk) if padded else tokens_int)
+            return int(block_round(tokens_int, page_blk) if padded else tokens_int)
         if rank is not None and self.rank_token_owners is not None:
-            base_tokens = block_round(tokens_int, blk) if padded else tokens_int
-            owned = owned_token_rows(base_tokens, self.rank_token_owners, int(rank))
-            return int(owned) if owned is not None else 0
+            owned = owned_token_rows(tokens_int, self.rank_token_owners, int(rank))
+            if owned is None:
+                return 0
+            return int(block_round(owned, page_blk) if padded else owned)
         if rank is not None:
-            cp_rank = int(rank) % cp
-            if padded:
-                blocks = _ceil_div(tokens_int, blk) if tokens_int else 0
-                count = ((blocks - 1 - cp_rank) // cp + 1) if cp_rank < blocks else 0
-                return int(count * blk)
-            return int(owned_positions(0, tokens_int - 1, cp, blk, cp_rank))
+            if tokens_int <= 0:
+                return 0
+            cp_rank = self._draft_dcp_rank(int(rank), cp)
+            exact = owned_positions(0, tokens_int - 1, cp, stride, cp_rank)
+            return int(block_round(exact, page_blk) if padded else exact)
+        if self.rank_token_owners is not None:
+            worst = (
+                max(
+                    (owned_token_rows(tokens_int, self.rank_token_owners, idx) or 0)
+                    for idx in range(len(self.rank_token_owners))
+                )
+                if self.rank_token_owners else 0
+            )
+            return int(block_round(worst, page_blk) if padded else worst)
         if padded:
-            return int(_context_shard_blocks(tokens_int, blk, cp))
+            if tokens_int <= 0:
+                return 0
+            if stride == page_blk:
+                return int(_context_shard_blocks(tokens_int, page_blk, cp))
+            worst = max(owned_positions(0, tokens_int - 1, cp, stride, r) for r in range(cp))
+            return int(block_round(worst, page_blk))
         return int(_ceil_div(tokens_int, cp))
 
     def _non_inherited_draft_cache_bytes(
@@ -367,16 +400,20 @@ class _MemoryCacheMixin:
         draft = optional_draft_spec(model, self.draft_kind)
         draft_cap = self._draft_context_cap(draft)
         eff_tokens = min(int(tokens), draft_cap) if draft_cap > 0 else int(tokens)
-        block = max(1, int(cp_interleave(case.runtime)))
+        interleave = max(1, int(cp_interleave(case.runtime)))
+        page_block = max(1, int(getattr(case.runtime, "kv_block_size", 0) or interleave))
         draft_tp = self._resolve_draft_tp()
         row_bytes = _draft_row_bytes_int(model, draft, tp=draft_tp)
         draft_sharded = _draft_is_dcp_sharded(
             model, p, self.draft_kind,
             dcp=int(getattr(p, "cp", 1) or 1),
-            draft_page=block * row_bytes,
+            draft_page=page_block * row_bytes,
         )
         draft_cp = int(p.cp) if draft_sharded else 1
-        rows = self._draft_owned_rows(eff_tokens, block, draft_cp, padded=padded, rank=rank)
+        rows = self._draft_owned_rows(
+            eff_tokens, page_block, draft_cp,
+            padded=padded, rank=rank, interleave=interleave,
+        )
         return float(rows * row_bytes * int(draft.layers)), draft_sharded
 
     def _uses_inherited_draft_cache(self, model) -> bool:
@@ -553,14 +590,18 @@ class _MemoryCacheMixin:
         eff_tokens = min(eff_tokens, draft_cap) if draft_cap > 0 else eff_tokens
         draft_tp = self._resolve_draft_tp()
         row_bytes = int(draft_row(self.case.model, draft, tp=draft_tp))
-        block = max(1, int(self.case.runtime.kv_block_size or cp_interleave(self.case.runtime)))
+        interleave = max(1, int(cp_interleave(self.case.runtime)))
+        block = max(1, int(self.case.runtime.kv_block_size or interleave))
         sharded = _draft_is_dcp_sharded(
             self.case.model, p, self.draft_kind,
             dcp=int(getattr(p, "cp", 1) or 1),
             draft_page=block * row_bytes,
         )
         draft_cp = int(p.cp) if sharded else 1
-        rows = self._draft_owned_rows(eff_tokens, block, draft_cp, padded=padded, rank=rank)
+        rows = self._draft_owned_rows(
+            eff_tokens, block, draft_cp,
+            padded=padded, rank=rank, interleave=interleave,
+        )
         return float(rows * row_bytes * int(draft.layers))
 
     def _group_token_component(
@@ -954,12 +995,19 @@ class _MemoryCacheMixin:
         """Per-physical-rank allocated/valid/page-tail view (same ledger basis)."""
         p = self.case.runtime.parallel
         stage_world = max(1, int(p.dp)) * max(1, int(p.tp)) * max(1, int(p.pcp))
-        rank_count = (max(self.width, stage_world)
-                      if (self.rank_token_owners is None and p.cp_spans_dp)
-                      else self.width)
+        spans_dp = self.rank_token_owners is None and bool(p.cp_spans_dp)
+        rank_count = max(self.width, stage_world) if spans_dp else self.width
         if self.rank_token_owners is None and int(p.cp) <= 1:
             view = self._allocation_view(tokens, rank=None)
             return tuple(dict(view) for _ in range(rank_count))
+        if spans_dp:
+            return tuple(
+                self._allocation_view(
+                    tokens,
+                    rank=(rank // self.width) * int(p.pp) * self.width + (rank % self.width),
+                )
+                for rank in range(rank_count)
+            )
         return tuple(
             self._allocation_view(tokens, rank=rank)
             for rank in range(rank_count)

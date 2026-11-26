@@ -7,6 +7,7 @@
 [Side-Effect Policy] Creates operators only.
 """
 import math
+from collections.abc import Mapping
 from dataclasses import replace
 from itertools import accumulate
 from typing import Literal
@@ -344,42 +345,84 @@ def _lower_chunk_prepare(b, *, index, q, chunk, chunks, span, heads, dk, dv,
     return pairs, last
 
 
-def _emit_gdn_pcp_prefix_scan(b, *, index, view, dep, heads, dk, dv, pcp, chunk):
-    """Exact ``ops/triton/fla/chunk.py`` GDN PCP: fwd_hupdate + 2 FP32 AGs + prefix scan."""
+def _resolve_null_block_id(runtime) -> int:
+    if runtime is None:
+        return 0
+    rt_meta = dict(getattr(runtime, "metadata", ()) or ())
+    raw = rt_meta.get("null_block_id")
+    return 0 if raw is None else int(raw)
+
+
+def _is_kda_null_or_padding_view(view, null_block_id: int = 0) -> bool:
+    if bool(getattr(view, "padding", False)):
+        return True
+    slot = getattr(view, "state_slot", None)
+    return slot is not None and int(slot) <= int(null_block_id)
+
+
+def _resolve_pcp_lane(parallel, physical_rank, *, machine=None) -> int | None:
+    """Resolve logical PCP lane of ``physical_rank`` via ``RankCoord.pcp_lane``."""
+    if physical_rank is None or int(parallel.pcp) <= 1:
+        return None
+    rank = int(physical_rank)
+    if machine is not None:
+        from mindie_sim.schema.parallel import GlobalRank
+
+        try:
+            return machine.validate_placement(parallel).coord_for_physical_rank(
+                GlobalRank(rank)
+            ).pcp_lane
+        except ModelingError:
+            pass
+    tp = max(1, int(parallel.tp))
+    pcp = int(parallel.pcp)
+    return (rank % (tp * pcp)) // tp
+
+
+def _emit_gdn_pcp_prefix_sync(b, *, prefill_views, scan_deps, heads, dk, dv, pcp, pcp_rank):
+    """Exact ``ops/triton/fla/chunk.py`` batched GDN PCP sync once per layer."""
     from mindie_sim.prediction.operators.linear_attention.gdn_prefill import pcp_gdn_prefix_work
 
-    q_local = max(1, int(view.q_len))
+    active = tuple(view for view in prefill_views if not view.padding)
+    n_pf = len(active)
+    if n_pf == 0:
+        return None, None, ()
+    deps = tuple(dict.fromkeys(scan_deps))
+    scan_seq_lens = tuple(int(view.q_len) for view in active if int(view.q_len) > 0)
+    scan_tok = sum(scan_seq_lens)
     scan_chunk = DEFAULT_RECURRENT_CHUNK_TOKENS
-    chunks = max(1, math.ceil(q_local / scan_chunk))
+    scan_chunks = sum((q_i + scan_chunk - 1) // scan_chunk for q_i in scan_seq_lens)
+    scan_seq_meta = (("sequence_tokens", scan_seq_lens),) if scan_seq_lens else ()
     scan_heads = max(1, int(heads))
     pw = pcp_gdn_prefix_work(
-        n_pf=1, tokens=q_local, chunks=chunks, chunk=scan_chunk,
+        n_pf=n_pf, tokens=scan_tok, chunks=scan_chunks, chunk=scan_chunk,
         heads=scan_heads, dk=dk, dv=dv, pcp=pcp, act_dtype=b.model.activation_dtype,
     )
+    hupdate_family = "recurrent_scan" if scan_chunks > 0 else "tensor_fill"
     hupdate = b.work(
-        f"pcp_gdn_hupdate{index}", (dep,), (1, scan_heads, dk, dk),
+        "pcp_gdn_hupdate", deps, (n_pf, scan_heads, dk, dk),
         flops=pw["hupdate_flops"],
         matrix_flops=pw["hupdate_matrix_flops"],
         vector=pw["hupdate_vector"],
         read=pw["hupdate_read"],
-        write=pw["hupdate_write"], family="recurrent_scan", dtype="fp32",
+        write=pw["hupdate_write"], family=hupdate_family, dtype="fp32",
         metadata=(
-            ("pcp", int(pcp)), ("chunks", chunks), ("chunk", scan_chunk),
-            ("tokens", q_local), ("heads", scan_heads),
+            ("pcp", int(pcp)), ("chunks", scan_chunks), ("chunk", scan_chunk),
+            ("tokens", scan_tok), ("heads", scan_heads),
             ("source", "ops/triton/fla/chunk.py:fwd_hupdate"),
-        ),
+        ) + scan_seq_meta,
     )
     ag_state = b.communicate(
-        f"pcp_gdn_state_gather{index}", (dep,),
+        "pcp_gdn_state_gather", deps,
         pw["st_bytes"] * (pcp - 1), "allgather", "pcp", dtype="fp32",
     )
     ag_phi = b.communicate(
-        f"pcp_gdn_hupdate_gather{index}", (hupdate,),
+        "pcp_gdn_hupdate_gather", (hupdate,),
         pw["phi_bytes"] * (pcp - 1), "allgather", "pcp", dtype="fp32",
     )
     steps = int(pw["prefix_steps"])
     prefix = b.work(
-        f"pcp_gdn_prefix_scan{index}", (ag_state, ag_phi), (steps, scan_heads, dk, dv),
+        "pcp_gdn_prefix_scan", (ag_state, ag_phi), (steps, scan_heads, dk, dv),
         flops=pw["prefix_flops"],
         vector=pw["prefix_vector"],
         read=pw["prefix_read"], write=pw["prefix_write"],
@@ -390,19 +433,47 @@ def _emit_gdn_pcp_prefix_scan(b, *, index, view, dep, heads, dk, dv, pcp, chunk)
             ("source", "ops/triton/fla/chunk.py:prefix_scan"),
         ),
     )
-    rerun = b.work(
-        f"pcp_gdn_fwd_h_rerun{index}", (prefix,), (q_local, scan_heads, dk, dv),
-        flops=float(PREFILL_SCAN_FLOPS_PER_STATE_ELEMENT * q_local * scan_heads * dk * dv),
-        vector=float(chunks * 2 * scan_heads * dk * dv),
-        read=chunks * pw["st_bytes"], write=chunks * pw["st_bytes"],
-        family="recurrent_scan", dtype="fp32",
-        metadata=(
-            ("pcp", int(pcp)), ("chunks", chunks), ("chunk", scan_chunk),
-            ("tokens", q_local), ("heads", scan_heads),
-            ("pcp_rank_gt_zero_rerun", True),
-        ),
-    )
-    return rerun
+    emitted = [hupdate, prefix]
+    rerun = None
+    needs_rerun = pcp_rank is None or int(pcp_rank) > 0
+    if needs_rerun:
+        if scan_chunks > 0:
+            act_bytes = int(dtype_bytes(b.model.activation_dtype))
+            rerun_read = (
+                pw["st_bytes"]
+                + float(scan_tok * scan_heads * ((2 * dk + dv) * act_bytes + FP32_BYTES))
+            )
+            rerun_write = (
+                pw["st_bytes"]
+                + float(scan_chunks * scan_heads * dk * dv * act_bytes)
+                + float(scan_tok * scan_heads * dv * act_bytes)
+            )
+            rerun = b.work(
+                "pcp_gdn_fwd_h_rerun", (prefix,), (scan_tok, scan_heads, dk, dv),
+                flops=float(PREFILL_SCAN_FLOPS_PER_STATE_ELEMENT * scan_tok * scan_heads * dk * dv),
+                vector=float(scan_chunks * 2 * scan_heads * dk * dv),
+                read=rerun_read, write=rerun_write,
+                family="recurrent_scan", dtype="fp32",
+                metadata=(
+                    ("pcp", int(pcp)), ("chunks", scan_chunks), ("chunk", scan_chunk),
+                    ("tokens", scan_tok), ("heads", scan_heads),
+                    ("pcp_rank_gt_zero_rerun", True),
+                ) + scan_seq_meta,
+            )
+        else:
+            rerun = b.work(
+                "pcp_gdn_fwd_h_rerun", (prefix,), (n_pf, scan_heads, dk, dv),
+                flops=0.0, vector=0.0,
+                read=pw["st_bytes"], write=pw["st_bytes"],
+                family="tensor_copy", dtype="fp32",
+                metadata=(
+                    ("pcp", int(pcp)), ("chunks", 0), ("chunk", scan_chunk),
+                    ("tokens", 0), ("heads", scan_heads),
+                    ("pcp_rank_gt_zero_rerun", True),
+                ),
+            )
+        emitted.append(rerun)
+    return prefix, rerun, tuple(emitted)
 
 
 def _lower_segmented_gdn_scan(b, *, view, index, views, last, normalized, chunk,
@@ -448,10 +519,6 @@ def _lower_segmented_gdn_scan(b, *, view, index, views, last, normalized, chunk,
             "state_segment_to_version": version + length}.items()))
         previous = seg
         segment_index += 1
-    if previous is not None and parallel.pcp > 1:
-        previous = _emit_gdn_pcp_prefix_scan(
-            b, index=index, view=view, dep=previous, heads=heads, dk=dk, dv=dv,
-            pcp=parallel.pcp, chunk=chunk)
     return previous
 
 
@@ -523,10 +590,6 @@ def _lower_recurrent_scan(b, *, view, index, q, chunks, span, chunk, heads, dk, 
             "state_remote_inputs": ((remote_port,) if remote_port else ()),
             "gdn_state_contract": contract, "gdn_state_effects": effects,
             "state_value_outputs": state_outputs}.items()))
-        if pcp_segment:
-            last = _emit_gdn_pcp_prefix_scan(
-                b, index=index, view=view, dep=last, heads=heads, dk=dk, dv=dv,
-                pcp=parallel.pcp, chunk=chunk)
     return last, state_bytes
 
 
@@ -587,9 +650,11 @@ def _lower_gdn_decode_scan(b, *, view, index, offset, q, conv, gated, normalized
 
 def _lower_recurrent_views(b, *, views, chunk, heads, key_heads, dk, dv, key_width,
                            value_width, conv_width, tokens, conv, normalized, gated,
-                           parallel, use_recover_ssm, rec_bytes):
+                           parallel, use_recover_ssm, rec_bytes, pcp_rank=None,
+                           null_block_id: int = 0):
     plan = b.plan
     outputs, prefill_scan_ids, prepare_ids = [], [], []
+    gdn_pcp_prefill = []
     view_offsets = tuple(accumulate((view.q_len for view in views), initial=0))
     for index, view in enumerate(views):
         q = view.q_len
@@ -605,7 +670,17 @@ def _lower_recurrent_views(b, *, views, chunk, heads, key_heads, dk, dv, key_wid
                       and parallel.pcp > 1 and len(view.query_ranges) > 1)
         if view.phase == "prefill" or plan.attention != "gdn":
             is_kda_prefill = view.phase == "prefill" and plan.attention == "kda"
-            if pcp_ranges:
+            if (plan.attention == "kda" and view.phase == "decode"
+                    and _is_kda_null_or_padding_view(view, null_block_id)):
+                last = b.work(
+                    f"recurrent_output_zero{index}", (conv,), (q, heads, dv),
+                    flops=0, vector=q * value_width, read=0,
+                    write=q * value_width * dtype_bytes(b.model.activation_dtype),
+                    family="tensor_fill", dtype=b.model.activation_dtype,
+                    metadata=(("tokens", q), ("heads", heads), ("dk", dk), ("dv", dv),
+                              ("padding_slot", True)),
+                )
+            elif pcp_ranges:
                 last = _lower_segmented_gdn_scan(
                     b, view=view, index=index, views=views, last=last, normalized=normalized,
                     chunk=chunk, heads=heads, dk=dk, dv=dv, state_bytes=state_bytes,
@@ -618,6 +693,9 @@ def _lower_recurrent_views(b, *, views, chunk, heads, key_heads, dk, dv, key_wid
                     is_kda_prefill=is_kda_prefill, use_recover_ssm=use_recover_ssm, rec_bytes=rec_bytes)
             if view.phase == "prefill":
                 prefill_scan_ids.append(last)
+                if plan.attention == "gdn" and parallel.pcp > 1:
+                    gdn_pcp_prefill.append((index, view, q, chunks, pairs, state_bytes, last))
+                    continue
                 if parallel.pcp > 1 and not pcp_ranges and plan.attention not in {"gdn", "kda"}:
                     # Non-head-sharded recurrent families keep the single post-scan handoff.
                     state_bytes = heads * dk * dv * dtype_bytes(plan.recurrent_state_dtype or "fp32")
@@ -644,19 +722,84 @@ def _lower_recurrent_views(b, *, views, chunk, heads, key_heads, dk, dv, key_wid
                           vector=out_vec, read=out_read,
                           write=q * value_width * 2, family="recurrent_output")
         outputs.append(last)
+    if gdn_pcp_prefill:
+        prefix_op, rerun_op, sync_scan_ids = _emit_gdn_pcp_prefix_sync(
+            b,
+            prefill_views=tuple(entry[1] for entry in gdn_pcp_prefill),
+            scan_deps=tuple(entry[6] for entry in gdn_pcp_prefill if not entry[1].padding),
+            heads=heads, dk=dk, dv=dv, pcp=parallel.pcp, pcp_rank=pcp_rank,
+        )
+        prefill_scan_ids.extend(sync_scan_ids)
+        for index, _view, q, chunks, pairs, state_bytes, scan_id in gdn_pcp_prefill:
+            if rerun_op is not None:
+                out_deps = (rerun_op, normalized)
+            elif prefix_op is not None:
+                out_deps = tuple(dict.fromkeys((scan_id, prefix_op, normalized)))
+            else:
+                out_deps = (scan_id, normalized)
+            out_read = chunks * state_bytes + q * heads * (2 * dk + dv) * 2
+            outputs.append(b.work(
+                f"recurrent_output{index}", out_deps, (q, heads, dk, dv),
+                flops=2 * q * heads * dk * dv + 2 * pairs * heads * (dk + dv),
+                vector=pairs * heads, read=out_read,
+                write=q * value_width * 2, family="recurrent_output",
+            ))
     return outputs, prefill_scan_ids, prepare_ids
 
 
+def _project_kda_exact_state_selection(options: dict, views, active_indices: tuple[int, ...]) -> None:
+    """Project an exact caller-declared state_selection onto active non-null views."""
+    raw_sel = options.get("state_selection")
+    if not isinstance(raw_sel, Mapping) or raw_sel.get("kind") != "exact":
+        return
+    if len(active_indices) == len(views):
+        return
+    full_prefix = tuple(accumulate((int(v.q_len) for v in views), initial=0))
+    supplied_prefix = tuple(raw_sel.get("prefix", ()))
+    accepted = raw_sel.get("accepted_tokens", ())
+    if supplied_prefix != full_prefix or len(accepted) != len(views):
+        return
+    new_prefix = tuple(accumulate((int(views[i].q_len) for i in active_indices), initial=0))
+    new_accepted = tuple(accepted[i] for i in active_indices)
+    layout = raw_sel.get("index_layout")
+    indices = raw_sel.get("state_indices", ())
+    if layout == "packed":
+        if len(indices) < full_prefix[-1]:
+            return
+        new_indices = tuple(
+            slot for i in active_indices for slot in indices[full_prefix[i]:full_prefix[i + 1]]
+        )
+    elif layout == "speculative":
+        if len(indices) != len(views):
+            return
+        new_indices = tuple(indices[i] for i in active_indices)
+    else:
+        return
+    options["state_selection"] = {
+        **raw_sel,
+        "prefix": new_prefix,
+        "accepted_tokens": new_accepted,
+        "state_indices": new_indices,
+    }
+
+
 def _bind_kda_decode(b, *, decode_source, views, parallel, projection_group, beta, raw_beta,
-                     use_recover_ssm, heads, key_heads, dk, dv, conv, decay, normalized, gated, outputs):
+                     use_recover_ssm, heads, key_heads, dk, dv, conv, decay, normalized, gated, outputs,
+                     null_block_id: int = 0):
     plan, model = b.plan, b.model
     decode_core = None
     decode_binder = (getattr(decode_source.module, "bind_decode_scans", None)
                      if decode_source else None)
-    if decode_binder is not None and views and all(view.phase == "decode" for view in views):
+    active_indices = tuple(
+        idx for idx, view in enumerate(views)
+        if not _is_kda_null_or_padding_view(view, null_block_id)
+    )
+    active_views = tuple(views[idx] for idx in active_indices)
+    if decode_binder is not None and views and active_views and all(view.phase == "decode" for view in views):
         if parallel.pcp > 1 and parallel.cp > 1:
             raise ModelingError("kda_source_recurrent_requires_decode_only_pcp1")
         options = dict(decode_source.options)
+        _project_kda_exact_state_selection(options, views, active_indices)
         # This caller provides raw Q/K and decay. The selected kernel owns
         # normalization and gate evaluation, so their old nodes are removed.
         internal_beta = options.get("use_beta_sigmoid", False)
@@ -677,20 +820,22 @@ def _bind_kda_decode(b, *, decode_source, views, parallel, projection_group, bet
         if options.get("gate_dtype", model.activation_dtype) != model.activation_dtype:
             raise ModelingError("kda_source_raw_gate_dtype_must_match_projection")
         options.update(beta_dtype=beta_dtype, gate_dtype=model.activation_dtype)
-        if use_recover_ssm and any(view.q_len > 1 for view in views):
+        if use_recover_ssm and any(view.q_len > 1 for view in active_views):
             options["recover_ssm"] = True
         scans = tuple(op for op in b.ops if op.family == "recurrent_scan")
+        active_requests = tuple(view.request_id for view in active_views)
         decode_core = decode_binder(
-            scans, lengths=tuple(view.q_len for view in views), heads=heads,
+            scans, lengths=tuple(view.q_len for view in active_views), heads=heads,
             key_heads=key_heads, dk=dk, dv=dv, dtype=model.activation_dtype,
-            state_dtype=plan.recurrent_state_dtype, requests=b.common["requests"],
-            deps=tuple(dict.fromkeys((conv, decay, supplied_beta))), views=views,
+            state_dtype=plan.recurrent_state_dtype, requests=active_requests,
+            deps=tuple(dict.fromkeys((conv, decay, supplied_beta))), views=active_views,
             **options)
         if projection_group:
             decode_core = replace(decode_core, metadata=decode_core.metadata + (
                 ("projection_input_views", projection_group["views"]),))
-        removed = {normalized, gated, *(op.op_id for op in scans)}
-        if internal_beta:
+        scan_ids = {op.op_id for op in scans}
+        removed = {normalized, gated, *scan_ids}
+        if internal_beta and beta != supplied_beta:
             removed.add(beta)
         rewritten = []
         for op in b.ops:
@@ -698,7 +843,10 @@ def _bind_kda_decode(b, *, decode_source, views, parallel, projection_group, bet
                 rewritten.append(decode_core)
             elif op.op_id not in removed:
                 rewritten.append(op)
-        b.ops, outputs = rewritten, [decode_core.op_id]
+        b.ops = rewritten
+        outputs = list(dict.fromkeys(
+            decode_core.op_id if out in scan_ids else out for out in outputs
+        ))
     return decode_core, outputs
 
 
@@ -1002,15 +1150,16 @@ def _lower_output_norm_gate(b, *, outputs, output_gate, tokens, heads, dv, value
 def _declare_recurrent_group(b, tensors, *, views, heads, key_heads, dk, dv, chunk,
                              tokens, output_gate, output_gate_view, prefill_source, decode_source,
                              decode_core, kda_caps, gated, normalized,
-                             prefill_scan_ids=(), prepare_ids=(), runtime=None):
+                             prefill_scan_ids=(), prepare_ids=(), runtime=None,
+                             null_block_id: int = 0):
     prefix, plan, model = b.prefix, b.plan, b.model
     if plan.attention == "gdn":
+        prefill_ids = set(prefill_scan_ids) | set(prepare_ids)
         core = [op for op in b.ops if op.family in {
             "recurrent_local", "triangular_solve", "recurrent_scan",
-            "recurrent_output", "recurrent_vector"}]
+            "recurrent_output", "recurrent_vector"} or op.op_id in prefill_ids]
         has_prefill = any(view.phase == "prefill" for view in views)
         has_decode = any(view.phase == "decode" for view in views)
-        prefill_ids = set(prefill_scan_ids) | set(prepare_ids)
         if has_prefill and has_decode:
             prefill_core = [op for op in core
                             if op.op_id in prefill_ids or op.family in {
@@ -1103,13 +1252,20 @@ def _declare_recurrent_group(b, tensors, *, views, heads, key_heads, dk, dv, chu
                 has_fused_kernel=(decode_core is not None),
                 has_source_binding=(phase_source is not None),
             )
+            core_lengths = (
+                tuple(dict(decode_core.metadata)["kda_recurrent_params"]["lengths"])
+                if decode_core is not None else tuple(
+                    view.q_len for view in views
+                    if prefill or not _is_kda_null_or_padding_view(view, null_block_id)
+                )
+            )
             declare_group(
                 b.ops, key=prefix + ".kda_core", role="kda_chunk" if prefill else "kda_recurrent",
                 family="kda", members=members, entries=entries, anchor=core[-1].op_id,
-                view={"tokens": sum(view.q_len for view in views), "heads": heads,
+                view={"tokens": sum(core_lengths), "heads": heads,
                       "key_heads": key_heads, "key_width": dk, "value_width": dv,
                       "dtype": model.activation_dtype, "state_dtype": plan.recurrent_state_dtype,
-                      "chunk": chunk, "sequence_tokens": tuple(view.q_len for view in views),
+                      "chunk": chunk, "sequence_tokens": core_lengths,
                       "in_kernel_gate_source": bool(
                           phase_source and "in_kernel_gates" in kda_caps),
                       "beta_dtype": (dict(decode_core.metadata)["kda_recurrent_params"]["beta_dtype"]
@@ -1337,7 +1493,7 @@ def _lower_kda_pcp_exit(b, *, last, plan, model, parallel, views, tokens, local_
 
 def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
            padded_tokens, policy=None, runtime=None, physical_rank=None,
-           explicit_physical_rank=False, **_):
+           explicit_physical_rank=False, machine=None, **_):
     from mindie_sim.catalog.paired_sfa import execution
     if execution(model).get("recurrent_context_sharded") is False:
         # Preserve the PCP plan for head-local KDA state.
@@ -1410,6 +1566,9 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     chunk = policy.recurrent_chunk if policy else DEFAULT_RECURRENT_CHUNK_TOKENS
     if not isinstance(chunk, int) or isinstance(chunk, bool) or chunk <= 0:
         raise ModelingError("recurrent_chunk_must_be_positive")
+    effective_rank = physical_rank if explicit_physical_rank else None
+    pcp_rank = _resolve_pcp_lane(parallel, effective_rank, machine=machine)
+    null_block_id = _resolve_null_block_id(runtime)
     conv_input = output_gate_view = output_gate = raw_beta = beta = decay = None
     gate_inputs: list[str] = []
     if plan.attention == "gdn":
@@ -1421,16 +1580,29 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     else:
         has_decode_binder = bool(
             decode_source and getattr(decode_source.module, "bind_decode_scans", None) is not None)
+        active_kda_views = tuple(
+            view for view in views
+            if not _is_kda_null_or_padding_view(view, null_block_id)
+        )
         beta_preprocessed = not (
-            has_decode_binder and use_recover_ssm and bool(views)
-            and all(view.phase == "decode" and view.q_len > 1 for view in views))
+            has_decode_binder and use_recover_ssm and bool(active_kda_views)
+            and all(view.phase == "decode" and view.q_len > 1 for view in active_kda_views))
         sources, output_gate, beta, decay, raw_beta, projection_group = _lower_kda_projections(
             b, tensors, projection_source=projection_source, conv_source=conv_source,
             deps=deps, tokens=tokens, hidden=hidden, key_width=key_width, value_width=value_width,
             heads=heads, dk=dk, beta_preprocessed=beta_preprocessed)
+    conv_views = (
+        tuple(
+            replace(view, padding=True)
+            if (view.phase == "decode" and _is_kda_null_or_padding_view(view, null_block_id))
+            else view
+            for view in views
+        )
+        if plan.attention == "kda" else views
+    )
     conv = _lower_convolution(
         b, tensors, conv_source=conv_source, projection_group=projection_group,
-        conv_input=conv_input, sources=sources, views=views, tokens=tokens, heads=heads,
+        conv_input=conv_input, sources=sources, views=conv_views, tokens=tokens, heads=heads,
         key_width=key_width, value_width=value_width, conv_width=conv_width, parallel=parallel,
         runtime=runtime)
     norm_rows = sum(view.q_len for view in views) if conv_source else tokens
@@ -1444,12 +1616,13 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         b, views=views, chunk=chunk, heads=heads, key_heads=key_heads, dk=dk, dv=dv,
         key_width=key_width, value_width=value_width, conv_width=conv_width, tokens=tokens,
         conv=conv, normalized=normalized, gated=gated, parallel=parallel,
-        use_recover_ssm=use_recover_ssm, rec_bytes=rec_bytes)
+        use_recover_ssm=use_recover_ssm, rec_bytes=rec_bytes, pcp_rank=pcp_rank,
+        null_block_id=null_block_id)
     decode_core, outputs = _bind_kda_decode(
         b, decode_source=decode_source, views=views, parallel=parallel, projection_group=projection_group,
         beta=beta, raw_beta=raw_beta, use_recover_ssm=use_recover_ssm, heads=heads,
         key_heads=key_heads, dk=dk, dv=dv, conv=conv, decay=decay, normalized=normalized,
-        gated=gated, outputs=outputs)
+        gated=gated, outputs=outputs, null_block_id=null_block_id)
     gated, outputs = _bind_kda_prefill(
         b, kda_source=kda_source, kda_caps=kda_caps, prefill_source=prefill_source,
         prefill_scan_ids=prefill_scan_ids, prepare_ids=prepare_ids, views=views, gated=gated,
@@ -1461,12 +1634,37 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         chunk=chunk, tokens=tokens, output_gate=output_gate, output_gate_view=output_gate_view,
         prefill_source=prefill_source, decode_source=decode_source, decode_core=decode_core,
         kda_caps=kda_caps, gated=gated, normalized=normalized,
-        prefill_scan_ids=prefill_scan_ids, prepare_ids=prepare_ids, runtime=runtime)
-    if use_recover_ssm and any(view.phase == "decode" and view.q_len > 1 for view in views):
-        emit_commit_op(b, name="recover_ssm_commit", deps=tuple(outputs), views=views,
-                       heads=heads, dk=dk, dv=dv, state_dtype=plan.recurrent_state_dtype,
-                       kg_dtype=model.activation_dtype, runtime=runtime,
-                       attention_kind=plan.attention)
+        prefill_scan_ids=prefill_scan_ids, prepare_ids=prepare_ids, runtime=runtime,
+        null_block_id=null_block_id)
+    if use_recover_ssm and any(
+        view.phase == "decode" and view.q_len > 1
+        and not _is_kda_null_or_padding_view(view, null_block_id)
+        for view in views
+    ):
+        commit_views = tuple(
+            view for view in views
+            if not _is_kda_null_or_padding_view(view, null_block_id)
+        )
+        zero_ids = {
+            op.op_id for op in b.ops
+            if op.family == "tensor_fill" and dict(op.metadata).get("padding_slot")
+        }
+        commit_deps = (
+            (decode_core.op_id,) if decode_core is not None
+            else tuple(out for out in outputs if out not in zero_ids)
+        )
+        commit_id = emit_commit_op(
+            b, name="recover_ssm_commit", deps=commit_deps, views=commit_views,
+            heads=heads, dk=dk, dv=dv, state_dtype=plan.recurrent_state_dtype,
+            kg_dtype=model.activation_dtype, runtime=runtime,
+            attention_kind=plan.attention)
+        if commit_id is not None and b.ops and b.ops[-1].op_id == commit_id:
+            intent_meta = dict(b.ops[-1].metadata)
+            intent_meta["conv_dim"] = int(conv_width)
+            if int(plan.conv_kernel) > 0:
+                intent_meta["conv_kernel"] = int(plan.conv_kernel)
+                intent_meta["conv_history_len"] = max(0, int(plan.conv_kernel) - 1)
+            b.ops[-1] = replace(b.ops[-1], metadata=tuple(sorted(intent_meta.items())))
     output = _lower_output_norm_gate(
         b, outputs=outputs, output_gate=output_gate, tokens=tokens, heads=heads,
         dv=dv, value_width=value_width, plan=plan, model=model,
