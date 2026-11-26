@@ -1006,7 +1006,10 @@ class VllmAscendLaunchCodec:
         return kv_xfer
 
     def render_launch_config(self, tuned_facts: Mapping[str, Any]) -> str:
-        """Render a clean, hardware-isolated ``vllm serve`` bash script."""
+        """Render a clean, hardware-isolated ``vllm serve`` bash script.
+
+        [Cohesive-Pipeline] Linear CLI/env script assembly from resolved launch facts and hardware isolation flags.
+        """
         model_name = str(tuned_facts.get("model_name") or tuned_facts.get("model_ref") or "model")
         model_target = str(tuned_facts.get("model_ref") or f"/weights/{model_name}")
         hw_sku = str(tuned_facts.get("hardware_sku") or tuned_facts.get("hw_family") or "a5")

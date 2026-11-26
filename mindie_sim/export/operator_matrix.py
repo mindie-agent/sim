@@ -29,6 +29,7 @@ from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
+from functools import lru_cache
 from itertools import accumulate
 import json
 import math
@@ -206,10 +207,25 @@ COLLECTIVE_BUILDERS: frozenset[str] = frozenset({
     "mc2_dispatch_v3", "mc2_combine_v3", "megamoe_fused_mc2", "p2p_send_recv",
 })
 
+@lru_cache(maxsize=1)
+def _unit_offset_rms_norm_binding() -> tuple[str, str]:
+    """Resolve CANN unit-offset RMSNorm ``(builder, abi_symbol)`` from ``ProbedAbiRegistry``."""
+    reg = default_abi_registry()
+    for arch in sorted(reg.archs):
+        for entry in reg.get_snapshot(arch).entries:
+            if (
+                entry.backend_kind == "cann_aclnn"
+                and entry.graph_motif.endswith("_rms_norm")
+                and "unit-offset" in entry.probe_domain_note.lower()
+            ):
+                return (str(entry.graph_motif), str(entry.symbol_or_kernel))
+    return ("rms_norm", "aclnnRmsNorm")
+
+
 BUILDERS: frozenset[str] = frozenset({
     *COLLECTIVE_BUILDERS, BOUNDARY_BUILDER,
     "all_gather_matmul", "matmul_reduce_scatter",
-    "add_rms_norm_quant", "rms_norm_quant", "add_rms_norm", "gemma_rms_norm",
+    "add_rms_norm_quant", "rms_norm_quant", "add_rms_norm", _unit_offset_rms_norm_binding()[0],
     "rms_norm", "layer_norm", "swiglu_oai", "swiglu", "geglu", "gelu",
     "situ_activation", "silu_mul", "sigmoid", "softmax",
     "dequant_swiglu_quant", "swiglu_dynamic_quant", "dequant_situ_quant",
@@ -255,8 +271,8 @@ _UNQUANTIZED_GEMM_ROLES: frozenset[str] = frozenset({
 _ELEMENTWISE_ADD_RECIPES: frozenset[str] = frozenset({
     "residual_add", "expert_add", "draft_feature_add", "vector_add", "add",
     "catalog_engram_residual_add", "markov_bias", "attention_residual_mix",
-    "catalog_aligner_bias", "catalog_qwen_merger_bias", "catalog_vision_bias",
-    "catalog_vision_residual", "gemma_gamma_shift", "router_correction_bias",
+    "catalog_aligner_bias", "catalog_vision_bias",
+    "catalog_vision_residual", "router_correction_bias",
 })
 _ELEMENTWISE_MUL_GATE_RECIPES: frozenset[str] = frozenset({
     "attention_gate", "gated_output", "shared_gate_apply",
@@ -435,7 +451,16 @@ def _resolve_builder_family_rules(
             return ("quantized_all_reduce", "hcclAllReduceInt8")
         return ("all_reduce", "hcclAllReduce")
     if fam == "rmsnorm":
-        return ("gemma_rms_norm", "aclnnGemmaRmsNorm") if "gemma" in rec else ("rms_norm", "aclnnRmsNorm")
+        unit_builder, unit_abi = _unit_offset_rms_norm_binding()
+        unit_native = unit_abi.removeprefix("aclnn")
+        if (
+            float(meta_dict.get("norm_weight_offset") or 0.0) != 0.0
+            or str(meta_dict.get("native_norm_kind") or "") == unit_native
+            or rec == unit_builder
+            or imp in {unit_abi, unit_native}
+        ):
+            return (unit_builder, unit_abi)
+        return ("rms_norm", "aclnnRmsNorm")
     if fam == "swiglu":
         return ("swiglu_oai", "aclnnSwiGluOai") if "oai" in rec else ("swiglu", "aclnnSwiGlu")
     if fam == "activation":
@@ -497,7 +522,7 @@ def _resolve_builder_family_rules(
             return ("quant_matmul", "aclnnQuantMatmulWeightNz")
         return ("matmul", "aclnnMatmul")
     if fam == "elementwise":
-        return _resolve_elementwise_builder(rec)
+        return _resolve_elementwise_builder(rec, meta_dict)
     return None
 
 
@@ -619,7 +644,9 @@ def _resolve_mhc_builder(rec: str) -> tuple[str, str] | None:
     return None
 
 
-def _resolve_elementwise_builder(rec: str) -> tuple[str, str] | None:
+def _resolve_elementwise_builder(
+    rec: str, meta_dict: Mapping[str, Any] | None = None,
+) -> tuple[str, str] | None:
     if rec == "short_convolution":
         return ("causal_conv1d_update", "aclnnCausalConv1dUpdate")
     if rec == "delta_gates":
@@ -630,7 +657,11 @@ def _resolve_elementwise_builder(rec: str) -> tuple[str, str] | None:
         return ("l2_norm", "l2norm_fwd_kernel2")
     if rec == "linear_output_norm_gate":
         return ("rms_norm_gated", "_layer_norm_fwd_1pass_kernel_npu")
-    if rec in _ELEMENTWISE_ADD_RECIPES:
+    if (
+        rec in _ELEMENTWISE_ADD_RECIPES
+        or rec.endswith(("_merger_bias", "_gamma_shift"))
+        or bool((meta_dict or {}).get("weight_offset"))
+    ):
         return ("vector_add", "aclnnAdd")
     if rec in {"muls_add", "moe_muls_add"}:
         return ("muls_add", "muls_add_kernel")
@@ -708,7 +739,7 @@ _ONBOARDING_FAMILY_DEFAULTS: Mapping[str, tuple[str, str]] = {
 _BUILDER_REGISTRY_ABI_IDS: Mapping[str, tuple[str, ...]] = {
     "absorbed_mla": ("aclnnFusedInferAttentionScore",),
     "lightning_indexer": ("aclnnLightningIndexer", "aclnnQuantLightningIndexerV2"),
-    "rms_norm": ("torch_npu.npu_rms_norm", "aclnnGemmaRmsNorm"),
+    "rms_norm": ("torch_npu.npu_rms_norm",),
     "add_rms_norm": ("torch_npu.npu_add_rms_norm", "AddRmsNormBias"),
     "layer_norm": ("_layer_norm_fwd_1pass_kernel_npu",),
     "swiglu": ("aclnnSwiGlu",),

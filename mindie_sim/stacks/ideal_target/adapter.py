@@ -775,6 +775,7 @@ class IdealTargetStackAdapter:
         role: str,
         phase: str,
     ) -> RuntimeQuantPlan:
+        """[Cohesive-Pipeline] Resolve target-stack tensor, cache, and recurrent quantization ABIs in one pass."""
         del hardware
         if phase not in self._capabilities.supported_phases:
             raise ModelingError(

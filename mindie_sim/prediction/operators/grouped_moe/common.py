@@ -870,7 +870,7 @@ def gemm_declared_scale_spec(
 def matrix_stages(
     name, after, contract, schedule, k, output_dtype, *, input_dtype=None, input_scaled=False,
     output_row_divisor: int = 1, useful_flops_override: int | None = None, metadata=(),
-    scale_spec: GemmScaleSpec | None = None, aiv_cores: int = 1,
+    scale_spec: GemmScaleSpec | None = None, aiv_cores: int | None = None,
 ):
     dtype = input_dtype or contract.dtype_a
     stages, ends = [], []
@@ -881,7 +881,6 @@ def matrix_stages(
     weight_k = ceil_div(k, k_alignment) * k_alignment
     act_mx = contract.act_mx_scaled if input_dtype is None else dtype in MX_DTYPES
     act_mx_pad = contract.act_mx_padded if input_dtype is None else True
-    aiv_pool = max(1, int(aiv_cores))
     act_s_dt = scale_spec.act_scale_dtype if scale_spec is not None else None
     wt_s_dt = scale_spec.weight_scale_dtype if scale_spec is not None else None
     act_k_blocks = (
@@ -916,6 +915,9 @@ def matrix_stages(
             ), "aic", owner, metadata),
         ))
         if scale_bytes > 0:
+            if aiv_cores is None or int(aiv_cores) < 1:
+                raise ModelingError("grouped_moe_matrix_stages_requires_explicit_aiv_cores")
+            aiv_pool = int(aiv_cores)
             scale_stage = f"{name}:{owner}:scales"
             stages.append(StageDemand(
                 scale_stage, after,

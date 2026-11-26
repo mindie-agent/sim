@@ -30,6 +30,7 @@ from mindie_sim.catalog.context_parallel import (
     legal_vllm_ascend_dcp_values,
     validate_vllm_ascend_dcp_codomain,
 )
+from mindie_sim.compose import register_auto_deployment_solver
 from mindie_sim.optimization.codesign import evaluate_macro_wall_trigger
 from mindie_sim.optimization.ladder import solve_target_step_receipt
 from mindie_sim.prediction.body_defaults import TargetGraphSet
@@ -6182,6 +6183,13 @@ def solve_optimal_deployment(
         prefill_entries=prefill_entries, max_sequences_per_dp=max_sequences_per_dp,
         search_coverage=coverage,
     )
+
+
+def _dispatch_auto_deployment_solver(**kwargs: Any) -> dict[str, Any]:
+    return solve_optimal_deployment(**kwargs)
+
+
+register_auto_deployment_solver(_dispatch_auto_deployment_solver)
 
 
 __all__ = [

@@ -163,9 +163,9 @@ _DIFFUSION_DOMAIN_TOKENS = (
 _DIFFUSION_DOMAIN_RE = re.compile(
     r"(?:^|[^a-z0-9])(?:"
     r"(?:mm|st|u)?dit(?:\d+(?:\.\d+)?)?|pixart(?:[-_]?alpha|[-_]?sigma)?|"
-    r"diffusion|hunyuan[-_]?video|wan(?:\d+(?:\.\d+)?)?|"
+    r"diffusion|unet(?:\d+d)?|hunyuan[-_]?video|wan(?:\d+(?:\.\d+)?)?|"
     r"flux(?:\d+(?:\.\d+)?)?|sd3(?:\.\d+)?|sdxl|cogvideox?|(?:open[-_]?)?sora"
-    r")(?:$|[^a-z0-9])"
+    r")(?:$|[^a-z0-9]|(?:transformer(?:\d+d)?|condition|diffusion|model|pipeline))"
 )
 _CANONICAL_PROJECTION_PRESETS = frozenset({
     "mxfp8", "mxfp8_mxfp4", "mxfp4_routed_only", "mxfp4_all", "mxfp4",
@@ -1001,6 +1001,7 @@ def _explicit_checkpoint_quant_map(
     lookup_curated: Any,
     model_spec: ModelSpec | None = None,
 ) -> tuple[CheckpointQuantMap, QuantSpec | None, str, str | None, str | None] | None:
+    """[Cohesive-Pipeline] Single-pass explicit quant resolver mapping strings, mappings, and QuantSpec to CheckpointQuantMap."""
     if isinstance(quant, str):
         raw_q_str = quant.strip().lower()
         if raw_q_str in _UNQUANTIZED_QUANT_TOKENS:

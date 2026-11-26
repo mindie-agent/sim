@@ -906,7 +906,10 @@ def _normalize_placement(placement_raw, experts):
 
 def _explicit_routing(item, layer, phase, tokens, views, replica,
                       physical_rank=None, query_position=None):
-    """Build one exact token ledger, or None when this item is not explicit."""
+    """Build one exact token ledger, or None when this item is not explicit.
+
+    [Cohesive-Pipeline] Single-pass explicit routing ledger construction over requests, placement, and owners.
+    """
     if not any(key in item for key in ("requests", "request_views",
                                        "expert_placement", "source_owners",
                                        "source_owner", "query_position")):

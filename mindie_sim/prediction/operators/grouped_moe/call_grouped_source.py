@@ -48,6 +48,7 @@ _SOURCE_GROUP_SCANS_PER_OWNER = 3
 
 
 def build_quantized_grouped_source_call(arguments):
+    """[Cohesive-Pipeline] Build one source-tiled quantized grouped GEMM call with explicit tiling contract."""
     raw = dict(arguments)
     declared_tiling = raw.pop("tiling", None)
     if declared_tiling is None:

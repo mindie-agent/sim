@@ -403,7 +403,10 @@ def _compile_stage_plan(
     before_bundle: ExportBundle | None,
     target_bundle: ExportBundle,
 ) -> _StagePlan:
-    """Compile exact int-ns 4-stage Sheet 4 Waterfall formulas and visible A:N fallback table."""
+    """Compile exact int-ns 4-stage Sheet 4 Waterfall formulas and visible A:N fallback table.
+
+    [Cohesive-Pipeline] Single-pass stage attribution and Excel formula compilation over Sheet 2 spans.
+    """
     ref_before = before_bundle if before_bundle is not None else target_bundle
     same_cfg = is_same_public_config(ref_before, target_bundle)
     b_ntok = max(0.0, float(ref_before.n_tok_per_die or 0.0))

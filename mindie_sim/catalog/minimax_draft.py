@@ -53,7 +53,10 @@ MINIMAX_DSPARK_SOURCE: dict[str, str] = {
 def build_minimax_auxiliary(
     c: Mapping[str, Any], *, body_layers: int,
 ) -> AuxiliarySpec | None:
-    """Build the optional MiniMax-M3 DSpark / Eagle3 ``AuxiliarySpec``."""
+    """Build the optional MiniMax-M3 DSpark / Eagle3 ``AuxiliarySpec``.
+
+    [Cohesive-Pipeline] Single-pass config-to-AuxiliarySpec draft builder preserving exact field coupling.
+    """
     raw_dspark = c.get("dspark_config")
     dspark_cfg: Mapping[str, Any] = raw_dspark if isinstance(raw_dspark, Mapping) else {}
     dspark_modules = _int(c, "num_mtp_modules")

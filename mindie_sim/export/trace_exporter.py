@@ -1156,7 +1156,10 @@ def _iter_scheduled_full_model_trace(
     include_overlap: bool,
     pipeline_desc_by_occ: Mapping[Any, Any] = (),
 ) -> Iterator[dict[str, Any]]:
-    """Stream full multi-layer Target + Draft schedule using native per-layer timings when recorded."""
+    """Stream full multi-layer Target + Draft schedule using native per-layer timings when recorded.
+
+    [Cohesive-Pipeline] Single-pass chronological trace event generator over target and draft layer schedules.
+    """
     from .kernel_catalog import strip_op_prefix
 
     effective_schedule, sched_counts = _expand_effective_trace_schedule(bundle)

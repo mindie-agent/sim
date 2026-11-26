@@ -1099,7 +1099,10 @@ def _assemble_report_receipt(
 
 
 def run_report_command(args: argparse.Namespace) -> dict[str, Any]:
-    """Execute ``mindie-sim report`` with explicit deployment-mode, domain stack routing, and zero TTFT coercion."""
+    """Execute ``mindie-sim report`` with explicit deployment-mode, domain stack routing, and zero TTFT coercion.
+
+    [Cohesive-Pipeline] End-to-end turnkey report orchestration from CLI args through solve, export, and receipt emission.
+    """
     stack_arg = getattr(args, "stack", None)
     script_info = (
         parse_script_for_report(args.from_script, requested_stack=stack_arg, hardware=args.hardware)

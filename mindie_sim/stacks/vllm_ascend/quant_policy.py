@@ -1000,7 +1000,10 @@ def _resolve_role_tag(
 def _layer_role_descriptors(
     plan: LayerPlan, *, model: ModelSpec, checkpoint_format: str = "",
 ) -> tuple[list[tuple[str, tuple[str, ...], bool]], list[tuple[str, tuple[str, ...]]]]:
-    """Return structural ``(role_specs, candidate_pack_groups)`` for one target layer."""
+    """Return structural ``(role_specs, candidate_pack_groups)`` for one target layer.
+
+    [Cohesive-Pipeline] Single-pass layer role and candidate pack-group enumeration across attention/FFN architectures.
+    """
     idx = int(plan.index)
     attn = str(plan.attention or model.attention).lower()
     roles: list[tuple[str, tuple[str, ...], bool]] = []
@@ -2318,7 +2321,10 @@ def _append_draft_cache_abis(
     idx_abis: list[CacheStateABI],
     rec_abis: list[CacheStateABI],
 ) -> str:
-    """Append active neural speculative draft (MTP / DSpark) cache ABIs on the final PP stage."""
+    """Append active neural speculative draft (MTP / DSpark) cache ABIs on the final PP stage.
+
+    [Cohesive-Pipeline] Single-pass speculative draft KV, indexer, and recurrent cache ABI emission.
+    """
     spec_method = str(effective_opts.get("spec_method") or "").strip().lower()
     aux = getattr(model, "auxiliary", None)
     if speculative_k <= 0 or aux is None or spec_method in ZERO_NEURAL_DRAFT_METHODS:

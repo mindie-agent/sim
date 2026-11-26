@@ -20,7 +20,6 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 from pathlib import Path
-import re
 from typing import TYPE_CHECKING, Any, Literal
 
 from mindie_sim.prediction.capacity import Memory
@@ -557,56 +556,15 @@ def solve_unified_regions(
     )
 
 
-_DIFFUSION_ARCH_SUFFIX = r"(?:transformer(?:\d+d)?|condition|diffusion|model|pipeline)"
-_DIFFUSION_DOMAIN_RE = re.compile(
-    r"(?:^|[^a-z0-9])(?:"
-    r"(?:mm|st|u)?dit(?:\d+(?:\.\d+)?)?|pixart(?:[-_]?alpha|[-_]?sigma)?|"
-    r"diffusion|unet(?:\d+d)?|hunyuan[-_]?video|wan(?:\d+(?:\.\d+)?)?|"
-    r"flux(?:\d+(?:\.\d+)?)?|sd3(?:\.\d+)?|sdxl|cogvideox?|(?:open[-_]?)?sora"
-    r")(?:$|[^a-z0-9]|" + _DIFFUSION_ARCH_SUFFIX + r")"
-)
-_CAUSAL_LM_ARCH_SUFFIXES = ("forcausallm", "lmheadmodel")
-
-
-def _matches_diffusion_domain(text: str) -> bool:
-    norm = str(text or "").strip().lower()
-    return bool(norm) and (_DIFFUSION_DOMAIN_RE.search(norm) is not None)
-
-
-def _declares_causal_lm_architecture(facts: Mapping[str, Any]) -> bool:
-    raw_arches = facts.get("architectures")
-    if isinstance(raw_arches, str):
-        arches = (raw_arches,)
-    elif isinstance(raw_arches, (tuple, list)):
-        arches = tuple(str(a or "") for a in raw_arches)
-    else:
-        return False
-    return any(arch.strip().lower().endswith(_CAUSAL_LM_ARCH_SUFFIXES) for arch in arches)
-
-
 def _infer_case_workload_domain(case: Case) -> str:
-    """Infer canonical ``WorkloadDomain`` structurally without importing ``compose``."""
+    """Infer canonical ``WorkloadDomain`` via runtime declaration or ``compose.inputs.infer_workload_domain``."""
     meta = dict(case.runtime.metadata)
     declared = str(meta.get("workload_domain") or "").strip().lower()
     if declared in {"llm", "vlm", "diffusion", "custom"}:
         return declared
-    model = case.model
-    model_meta = dict(getattr(model, "metadata", ()) or ())
-    facts = dict(getattr(model, "catalog_facts", ()) or ())
-    explicit = str(model_meta.get("domain") or facts.get("workload_domain") or "").strip().lower()
-    if explicit in {"llm", "vlm", "diffusion", "custom"}:
-        return explicit
-    for plan in getattr(model, "layer_plans", ()) or ():
-        arch = str(getattr(plan, "architecture", "") or "").lower()
-        if _matches_diffusion_domain(arch):
-            return "diffusion"
-    if not _declares_causal_lm_architecture(facts):
-        model_type = str(facts.get("model_type") or facts.get("family") or "").strip().lower()
-        if _matches_diffusion_domain(model_type):
-            return "diffusion"
-    if getattr(model, "vision", None) is not None or bool(facts.get("vision_present")):
-        return "vlm"
-    return "llm"
+    from mindie_sim.compose.inputs import infer_workload_domain
+
+    return infer_workload_domain(case.model)
 
 
 def _hardware_backend_for_case(case: Case) -> str:

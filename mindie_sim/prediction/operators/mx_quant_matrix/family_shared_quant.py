@@ -375,6 +375,7 @@ def _build_dequant_swiglu_consumer(
 
 
 def _rewrite(ops, gate):
+    """[Cohesive-Pipeline] Single-pass graph rewrite fusing shared MX-quantized matrix producer/consumer chains."""
     by_id = {op.op_id: op for op in ops}
     users = {op.op_id: [] for op in ops}
     data_users = {op.op_id: [] for op in ops}
