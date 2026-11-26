@@ -316,9 +316,14 @@ def test_offline_bundle_non_tautological_pad_removal_fails(tmp_path: Path) -> No
     for pnode in expected:
         if pnode.min_count <= 0:
             continue
-        for kname in pnode.expected_kernels:
+        tts = (
+            pnode.expected_task_types
+            if len(pnode.expected_task_types) == len(pnode.expected_kernels)
+            else (pnode.task_type,) * len(pnode.expected_kernels)
+        )
+        for kname, tt in zip(pnode.expected_kernels, tts):
             by_type[kname] = by_type.get(kname, 0) + pnode.min_count
-            sigs.append({"signature": f"{kname}|{pnode.api_or_symbol}|{pnode.task_type}",
+            sigs.append({"signature": f"{kname}|{pnode.api_or_symbol}|{tt}",
                          "count": pnode.min_count, "total_dur_us": 5.0})
     a3_ok = {
         "environment": {"vllm_ascend_commit": "0c99d3fc5"},

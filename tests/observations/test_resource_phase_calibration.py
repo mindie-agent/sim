@@ -573,7 +573,8 @@ def test_cost_model_keeps_primitive_duration_in_explicit_diagnostics():
         store.record(primitive_key(parsed, op, "none"), duration_ms=10, run_id="measured",
                      repeat_index=0, source="independent timing oracle")
         cost = CostModel(parsed, store)
-        assert cost.price(op, "none").timing is None
+        priced = cost.price(op, "none")
+        assert priced.basis == "analytic_work" and priced.key is None and not hasattr(priced, "timing")
         assert cost.summary()["diagnostic_primitive_hits"] == 0
         assert cost.lookup_diagnostic(op, "none")["timing"].duration_ms == 10
         assert cost.summary()["operator_occurrences"]["measured_primitive"] == 0

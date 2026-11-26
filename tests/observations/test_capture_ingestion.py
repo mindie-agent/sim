@@ -10,6 +10,7 @@ from copy import deepcopy
 import csv
 from decimal import Decimal
 import gzip
+import io
 import json
 from pathlib import Path
 from statistics import mean, median
@@ -556,7 +557,10 @@ def test_json_capture_filters_unrelated_events_while_streaming(tmp_path, monkeyp
         _, peak = tracemalloc.get_traced_memory()
     finally:
         tracemalloc.stop()
-    assert peak < 2 * 1024 * 1024
+    io_buf = max(io.DEFAULT_BUFFER_SIZE, path.stat().st_blksize)
+    assert peak < io_buf + 2 * 1024 * 1024
+    if io_buf < 4 * 1024 * 1024:
+        assert peak < path.stat().st_size
 @pytest.mark.parametrize("level", ("L1", "L2", "L3"))
 def test_native_trace_binds_rank_unique_events_and_duration(tmp_path, level):
     path = tmp_path / "trace_view.json"
@@ -591,9 +595,16 @@ def test_capture_envelope_clock_reaches_canonical_device_configuration():
     path = REPO_ROOT / "data/primitives/captures/arch22_a3_9362.capture.json"
     envelope = json.loads(path.read_text(encoding="utf-8"))
     assert extract_observed_aicore_freq_mhz(envelope) == 1650
-    from mindie_sim.backends.ascend import profiles
+    from mindie_sim.backends.ascend import materialize, profiles
     sku = "Ascend910_9362"
     nominal = profiles()[sku]["device"]
-    updated = apply_capture_observed_clock({"machine": {"sku": sku, "device": nominal}}, envelope)["machine"]["device"]
-    assert updated["observed_aicore_freq_mhz"] == updated["aicore_freq_mhz"] == 1650
-    assert updated["rates"]["mte2_aic"] == pytest.approx(nominal["rates"]["mte2_aic"] * 1650 / 1500)
+    explicit_hbm = 1e12
+    raw = {"machine": {"backend": "ascend", "sku": sku, "num_devices": 1, "ranks_per_node": 1,
+                       "device": {"rates": {"hbm": explicit_hbm}}}}
+    updated = apply_capture_observed_clock(raw, envelope)["machine"]
+    assert updated["device"]["observed_aicore_freq_mhz"] == 1650 and "aicore_freq_mhz" not in updated["device"]
+    assert updated["device"]["rates"] == {"hbm": explicit_hbm}
+    canonical = materialize(updated)["device"]
+    assert canonical["observed_aicore_freq_mhz"] == canonical["aicore_freq_mhz"] == 1650
+    assert canonical["rates"]["hbm"] == pytest.approx(explicit_hbm)
+    assert canonical["rates"]["mte2_aic"] == pytest.approx(nominal["rates"]["mte2_aic"] * 1650 / 1500)

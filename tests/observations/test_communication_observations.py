@@ -329,11 +329,11 @@ def test_device_kernel_and_resource_phase_boundaries_stay_separate():
 def test_wire_factor_binding_identity_regime_and_predict_integration(embedded):
     _, bundle = embedded
     derived = bundle.lookup_curve("all_to_allv", 8, placement_scope="intra_node_ub", dtype="bf16")
-    measured = bundle.lookup_curve("all_to_allv", 2, placement_scope="intra_node_ub", dtype="int8")
+    measured = bundle.lookup_curve("mc2_dispatch", 2, placement_scope="intra_node_ub", dtype="int8")
     assert (comm_bind._wire_factor("all_gather", 8), comm_bind._wire_factor("p2p_send_recv", 8),
-            comm_bind._wire_factor("all_to_allv", 2, measured), comm_bind._wire_factor("all_reduce", 8),
-            comm_bind._wire_factor("all_to_allv", 8, derived)) == (
-        7, 1.0, 1.0, pytest.approx(2 * 7 / 8), pytest.approx(7 / 8))
+            comm_bind._wire_factor("mc2_dispatch", 2, measured), comm_bind._wire_factor("all_to_allv", 2),
+            comm_bind._wire_factor("all_reduce", 8), comm_bind._wire_factor("all_to_allv", 8, derived)) == (
+        7, 1.0, 1.0, 1.0, pytest.approx(2 * 7 / 8), pytest.approx(7 / 8))
     raw = _comm_case()
     op, parsed = _comm_op(raw), parse_case(raw)
     bound = bundle.bind_service_curve(parsed, op)
@@ -407,11 +407,15 @@ def test_contention_slowdown_chained_moe_and_followup_manifest(embedded):
     assert summary["dtypes"] == ["bf16", "fp8-e4m3", "int8"] and summary["overlap_ratio"]["median"] == pytest.approx(0.78, abs=0.01)
     assert all(r["stages"] == CHAIN_STAGES and sum(r["stage_legs_ms"].values()) == pytest.approx(r["sum_leg_p50_ms"])
                and r["overlap_ratio"] == pytest.approx(r["chain_p50_ms"] / r["sum_leg_p50_ms"]) for r in summary["rows"])
+    ov_legs = {"dispatch": 2.0, "gate_up": 0.2, "swiglu_quant": 1.0, "down": 0.2, "combine": 0.5}
     reg = {r["condition"]: r for r in comm.evaluate_a5_mc2_chains(comm.ingest_a5_campaign_data(_campaign("mc", [], chains=[
         _chain("c-aicpu", observed_expansion_mode="aicpu"), _chain("c-aiv", observed_expansion_mode="aiv"),
-        _chain("c-u", requested_expansion_mode="aiv", observed_expansion_mode="not_observed")])))["rows"]}
+        _chain("c-u", requested_expansion_mode="aiv", observed_expansion_mode="not_observed"),
+        _chain("c-aiv-ov", observed_expansion_mode="aiv", chain_ms=2.4, paired_overlap_ms=1.5, legs_ms=ov_legs),
+        _chain("c-aicpu-ov", observed_expansion_mode="aicpu", chain_ms=2.4, paired_overlap_ms=1.5, legs_ms=ov_legs)])))["rows"]}
     assert reg["c-aicpu"]["expansion_regime"] == "aicpu" and reg["c-aicpu"]["vector_slowdown"] == 1.0 and reg["c-u"]["expansion_regime"] == "unspecified"
-    assert reg["c-aiv"]["expansion_regime"] == "aiv" and reg["c-aiv"]["vector_slowdown"] > 1.0
+    assert reg["c-aiv"]["expansion_regime"] == "aiv" and reg["c-aiv"]["vector_slowdown"] == 1.0
+    assert reg["c-aiv-ov"]["expansion_regime"] == "aiv" and reg["c-aiv-ov"]["vector_slowdown"] > 1.0 and reg["c-aicpu-ov"]["vector_slowdown"] == 1.0
     first = comm.build_a5_followup_manifest(ingested)
     assert first == comm.build_a5_followup_manifest(ingested) and set(first["pending_cell_ids"]) == {
         "expansion_regime:aicpu/aiv", "collective:W64-8node",
@@ -546,7 +550,7 @@ def test_native_child_binding_stage_evidence_and_envelope_provenance(native_wave
     assert ev["source"]["capture_uri"].startswith("capture://") and all(tok not in ev_dump for tok in (str(path), "rack08os2", image_id))
     assert all((c.provenance["link_transit_identified"], c.provenance["hop_scaling"],
                 c.provenance["measurement_boundary"]["complete_collective_call"]) == (
-        False, "not_derived", k[0] != "p2p_send_recv") for k, c in embedded[1].curves.items())
+        False, "not_derived", k[0] in COLLECTIVES) for k, c in embedded[1].curves.items())
 
 
 def test_normalized_service_stage_owner_equivalence_and_engine_sharing(native_wave):
