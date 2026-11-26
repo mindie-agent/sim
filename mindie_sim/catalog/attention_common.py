@@ -20,7 +20,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Sequence
 
-from mindie_sim.catalog.cache import local_kv_heads
+from mindie_sim.catalog.cache import local_kv_heads as local_kv_heads
 from mindie_sim.catalog.ops import comm_op
 from mindie_sim.schema.model import LayerPlan, ModelSpec
 from mindie_sim.schema.operators import OpSpec
@@ -76,11 +76,6 @@ class AttentionResult:
     attention_outputs: tuple[str, ...] = ()
     index_store_id: str | None = None
     candidate_id: str | None = None
-
-
-def _triangular(q: int, window: int) -> float:
-    n = min(max(0, q), max(0, window))
-    return n * (n + 1) / 2.0
 
 
 def _causal_pairs(q: int, context: int, window: int) -> float:
@@ -172,13 +167,4 @@ def _group_plan(plan: LayerPlan, parallel: ParallelSpec) -> tuple[bool, int]:
     if groups % tp == 0 and group_heads * (groups // tp) == local_heads:
         return True, groups // tp
     return False, groups
-
-
-def _qkv_widths(plan: LayerPlan, parallel: ParallelSpec) -> tuple[int, int, int, int]:
-    local_heads = max(1, plan.num_heads // parallel.tp)
-    local_kv = local_kv_heads(plan.num_kv_heads, parallel.tp)
-    q_width = plan.q_projection_width(local_heads, plan.head_dim)
-    kv_width = local_kv * plan.head_dim
-    return local_heads, local_kv, q_width, kv_width
-
 

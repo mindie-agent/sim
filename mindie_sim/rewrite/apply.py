@@ -1271,13 +1271,6 @@ def _build_splitv_op(
     )
 
 
-def _resident_savings(members, kernel_for, preserved, external_reads, path, all_ops=None):
-    """Elide on-chip intermediate HBM round-trips verified by datapath + TileSolver."""
-    saved_read, saved_write, _, _, _ = _resident_savings_detail(
-        members, kernel_for, preserved, external_reads, path, all_ops=all_ops,
-    )
-    return saved_read, saved_write
-
 class _RankDraft:
     def __init__(self, entry, stream):
         self.replica = entry.replica

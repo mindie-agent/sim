@@ -511,11 +511,6 @@ def _capture_tensor(name, shape, dtype, layout=None):
     }
 
 
-def _capture_bytes(shapes, dtypes):
-    total, _, _ = _capture_tensor_bytes(shapes, dtypes, "tensor")
-    return total
-
-
 def bind_capture_native_plan(row, *, image_id=None):
     """Bind one captured ABI row to the canonical declared call geometry.
 

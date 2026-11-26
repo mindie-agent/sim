@@ -860,10 +860,6 @@ def lookup_eco_tech_repo(repo_or_name: str) -> str | None:
     return _ECO_TECH_LOWER_INDEX.get(f"eco-tech/{lower}") if "/" not in text else None
 
 
-def _normalize_quant_tag(raw_tag: str) -> str:
-    return normalize_quant_tag_strict(raw_tag)
-
-
 def _extract_native_format(base_config: Mapping[str, Any] | None) -> str:
     if not isinstance(base_config, Mapping):
         return "bf16"
@@ -873,15 +869,6 @@ def _extract_native_format(base_config: Mapping[str, Any] | None) -> str:
     if "16" in raw and "bf" not in raw and "bfloat" not in raw:
         return "fp16"
     return "fp32" if "32" in raw else "bf16"
-
-
-def _infer_arch_flags(keys: Sequence[str]) -> tuple[bool, bool, bool]:
-    return infer_arch_flags_from_patterns(keys)
-
-
-def _tensor_categories(tensor_name: str, *, has_mla: bool, has_kda: bool) -> tuple[str, ...]:
-    """Map one checkpoint tensor key or pattern to simulator QuantSpec category keys."""
-    return classify_tensor_categories(tensor_name, has_mla=has_mla, has_kda=has_kda)
 
 
 def parse_quant_model_description(

@@ -527,12 +527,6 @@ def _ancestor_graph(ops, stream=None) -> tuple[tuple, dict[str, set[str]], dict[
     return ordered, deps_map, bit, anc
 
 
-def _ancestor_masks(ops, stream=None) -> tuple[dict[str, int], dict[str, int]]:
-    """Compute transitive ancestor bitmasks over full canonical dependencies in O(V + E)."""
-    _, _, bit, anc = _ancestor_graph(ops, stream)
-    return bit, anc
-
-
 def _boundary_order_by_region(applied) -> dict[str, dict[str, int]]:
     """Map each ``FuseRegion`` id to atom -> kernel_boundary index."""
     handles = dict(applied.handles)

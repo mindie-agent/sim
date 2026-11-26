@@ -50,7 +50,6 @@ from mindie_sim.schema.stack import ManifestBinding, StackTrack, StackTrackSpec
 
 from .apply import (
     ResolvedScenario,
-    _activation_port_signature,
     _activation_quant_key,
     _convex,
     _dependencies,
@@ -877,17 +876,6 @@ def _same_domain(a: OpSpec, b: OpSpec) -> bool:
     )
 
 
-def _producer_port_key(
-    op: OpSpec, op_ids: set[str], by_id: Mapping[str, OpSpec] | None = None,
-) -> tuple[tuple[str, str, int], ...] | None:
-    sig = _activation_port_signature(op, all_ops=by_id)
-    if not sig:
-        return None
-    if all(prod_id in op_ids for prod_id, _, _ in sig):
-        return sig
-    return None
-
-
 def _is_ancestor(src: str, dst: str, succ: Mapping[str, Sequence[str]]) -> bool:
     stack = list(succ.get(src, ()))
     seen: set[str] = set()
@@ -1667,11 +1655,6 @@ def _discover_law3_mc2(
     return found
 
 
-def _consumer_accepts_strided_view(consumer: OpSpec) -> bool:
-    meta = dict(consumer.metadata) if consumer.metadata else {}
-    return bool(meta.get("accepts_strided_view") or meta.get("packed_view_compatible"))
-
-
 def _splitv_unabsorbed_bytes(
     siblings: Sequence[OpSpec],
     by_id: Mapping[str, OpSpec],
@@ -2061,17 +2044,6 @@ def _locate_moe_dispatch_combine_frame(
                 continue
             return dispatch_ops[0], gmm2, comb
     return None
-
-
-def _has_moe_dispatch_combine_frame(
-    op: OpSpec,
-    tail: OpSpec,
-    by_id: Mapping[str, OpSpec],
-    traits: Mapping[str, OpTraitInfo],
-    succ: Mapping[str, list[str]],
-) -> bool:
-    """Require a complete connected ``dispatch -> GMM1 -> gate [-> quant] -> GMM2 -> combine`` frame."""
-    return _locate_moe_dispatch_combine_frame(op, tail, by_id, traits, succ) is not None
 
 
 def _norm_moe_activation(act: str) -> str:

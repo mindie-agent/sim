@@ -370,25 +370,6 @@ def _deepep_exact_stage_matrices(
     return tuple(tuple(row) for row in inter), tuple(tuple(row) for row in intra)
 
 
-def _deepep_exact_peer_matrix(
-    source_owners, topk_ids, expert_placement, *,
-    ep: int, ranks_per_node: int, row_bytes: float, is_combine: bool,
-) -> tuple[tuple[float, ...], ...]:
-    """Combined exact two-stage deduplicated inter-node + intra-node peer matrix."""
-    stage1, stage2 = _deepep_exact_stage_matrices(
-        source_owners, topk_ids, expert_placement,
-        ep=ep, ranks_per_node=ranks_per_node, row_bytes=row_bytes,
-        is_combine=is_combine,
-    )
-    if stage2 is None:
-        return stage1
-    size = len(stage1)
-    return tuple(
-        tuple(stage1[s][d] + stage2[s][d] for d in range(size))
-        for s in range(size)
-    )
-
-
 def _resolve_exact_row_bytes(op, metadata: Mapping[str, Any]) -> float | None:
     row_bytes = metadata.get("row_bytes", metadata.get("payload_row_bytes"))
     if row_bytes is not None:

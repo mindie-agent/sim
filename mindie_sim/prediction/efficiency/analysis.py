@@ -521,38 +521,6 @@ def _priced_pipes(
     return _build_occurrence_index(operator_rows, graph_report, prefer_executed=True)
 
 
-def _reconciled_pipes(matched: Mapping[str, Any] | None, elapsed: float, wait: float) -> dict[str, float]:
-    """Single-node executed pipe summary without rescaling pipes to elapsed time."""
-    if matched is None:
-        return {
-            "cube_ms": 0.0, "vector_ms": 0.0, "hbm_ms": 0.0, "link_ms": 0.0,
-            "fixed_ms": elapsed + wait, "launch_ms": elapsed + wait,
-        }
-    cube = min(max(0.0, float(matched["cube_ms"])), elapsed)
-    vec = min(max(0.0, float(matched["vector_ms"])), elapsed)
-    hbm = min(max(0.0, float(matched["hbm_ms"])), elapsed)
-    link = min(max(0.0, float(matched["link_ms"])), elapsed)
-    other = min(max(0.0, float(matched.get("other_non_hbm_ms", 0.0) or 0.0)), elapsed)
-    fixed_in = min(max(0.0, float(matched.get("fixed_ms", 0.0) or 0.0)), elapsed)
-    min_in = min(max(0.0, float(matched.get("minimum_ms", 0.0) or 0.0)), elapsed)
-    non_hbm_floor = min(elapsed, max(min_in, fixed_in + max(cube, vec, link, other)))
-    zero_h = min(elapsed, max(non_hbm_floor, elapsed - hbm))
-    exposed_h = max(0.0, elapsed - zero_h)
-    if exposed_h <= _PIPE_EQUIV_TOL:
-        h_eff = min(hbm, max(cube, vec))
-        return {
-            "cube_ms": cube, "vector_ms": vec, "hbm_ms": h_eff, "link_ms": link,
-            "fixed_ms": wait + max(0.0, elapsed - max(cube, vec, link)),
-            "launch_ms": wait + elapsed,
-        }
-    h_eff = max(cube, vec, link) + exposed_h
-    return {
-        "cube_ms": cube, "vector_ms": vec, "hbm_ms": min(hbm, h_eff), "link_ms": link,
-        "fixed_ms": wait + max(0.0, elapsed - max(cube, vec, min(hbm, h_eff), link)),
-        "launch_ms": wait + zero_h,
-    }
-
-
 def _unique_aux_id(base: str, suffix: str, used: set[str]) -> str:
     candidate = f"{base}:{suffix}"
     while candidate in used:

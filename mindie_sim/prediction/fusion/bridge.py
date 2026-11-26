@@ -10,7 +10,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
-from typing import Any, Mapping
 
 from mindie_sim.prediction.execution.weight_prefetch import PrefetchDecision
 from mindie_sim.prediction.fusion.pool import (
@@ -45,16 +44,6 @@ class HardwareProfile:
             hbm_bytes_per_ms=die.total_rate("hbm") / 1000,
             prefetch_units=die.pool_units("l1") if has_l1 else 1,
         )
-
-
-def _canonical_hardware(case, hardware: HardwareProfile | None = None,
-                        options: Mapping[str, Any] | None = None) -> HardwareProfile:
-    del options
-    if hardware is not None:
-        return hardware
-    if not case.machine.dies:
-        raise ValueError("hardware_case_machine_missing")
-    return HardwareProfile.from_die(case.machine.dies[0])
 
 
 @dataclass(frozen=True)
